@@ -7479,6 +7479,58 @@ void check_sm120(const Sm120Case& t, std::function<float(int, int)> A0, std::fun
                   std::to_string(i) + "," + std::to_string(j) + ": " + std::to_string(float(want)));
     }
 }
+
+// shfl without .sync, the pre-Volta form: no member mask, the active lanes
+// shuffle among themselves. PTX written for sm_60 still has it and the driver
+// JIT-compiles it for newer GPUs; an RTX 3060 runs this kernel and gives
+// exactly these values, including half a warp shuffling within itself.
+VTEST(shfl_without_sync_shuffles_among_the_active_lanes) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.lo.u32 %r2, %r1, 10;
+    shfl.up.b32 %r3|%p1, %r2, 2, 0;
+    shfl.down.b32 %r4|%p2, %r2, 3, 31;
+    shfl.bfly.b32 %r5, %r2, 5, 31;
+    shfl.idx.b32 %r6, %r2, 7, 31;
+    selp.u32 %r7, 1, 0, %p1;
+    selp.u32 %r8, 2, 0, %p2;
+    or.b32 %r7, %r7, %r8;
+    mov.u32 %r9, 0;
+    setp.ge.u32 %p3, %r1, 16;
+    @%p3 bra SKIP;
+    shfl.bfly.b32 %r9, %r2, 1, 31;
+SKIP:
+    mul.wide.u32 %rd2, %r1, 24;
+    add.s64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r3;
+    st.global.u32 [%rd3+4], %r4;
+    st.global.u32 [%rd3+8], %r5;
+    st.global.u32 [%rd3+12], %r6;
+    st.global.u32 [%rd3+16], %r7;
+    st.global.u32 [%rd3+20], %r9;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 24);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t l = 0; l < 32; ++l) {
+    const uint64_t want[6] = {10 * (l >= 2 ? l - 2 : l), 10 * (l + 3 <= 31 ? l + 3 : l), 10 * (l ^ 5), 70,
+                              (l >= 2 ? 1u : 0u) | (l + 3 <= 31 ? 2u : 0u), l < 16 ? 10 * (l ^ 1) : 0};
+    for (uint64_t j = 0; j < 6; ++j) VCHECK_EQ(e.mem.load_scalar(out + l * 24 + j * 4, 4), want[j]);
+  }
+}
+
 }  // namespace
 
 // .kind::f8f6f4: e2m1 in bits 2-5 of its byte, e3m2 in bits 0-5.

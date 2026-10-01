@@ -15,10 +15,10 @@
 // go down rather than up, it has to stop at the row's edge, a lane with no
 // lane to read has to contribute a zero, and the row and bank masks have to
 // name the rows and banks the assembler meant. Get any one of them wrong and
-// the sums are wrong. The three kernels after it pin down the rest of the
+// the sums are wrong. The four kernels after it pin down the rest of the
 // form the same way: a broadcast within each four lanes, a row read
-// backwards, and a lane with no lane to read where the instruction says to
-// leave it alone.
+// backwards, a lane with no lane to read where the instruction says to leave
+// it alone, and a shift across the whole wave.
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -148,21 +148,23 @@ VTEST(a_lane_with_no_lane_to_read_keeps_what_it_had) {
   }
 }
 
-VTEST(reading_across_the_whole_wave_is_refused_rather_than_guessed) {
+VTEST(a_shift_across_the_whole_wave_crosses_rows_and_zeroes_the_last_lane) {
   const amd::CodeObject o = object();
   MemoryManager mem(64ull << 20);
-  const std::vector<int32_t> in(kN, 1);
+  std::vector<int32_t> in(kN);
+  for (int i = 0; i < kN; ++i) in[i] = 1000 + i;
   const uint64_t pin = upload(mem, in), pout = mem.alloc(kN * 4);
-  // The shifts that cross rows are spelled out in the listing, since the
-  // decoder reads them, but which way they carry is the one thing the
-  // reduction does not settle, so running one says so.
-  std::string what;
-  try {
-    run(o, "across", mem, {pin, pout, static_cast<uint64_t>(kN)});
-  } catch (const std::exception& e) {
-    what = e.what();
+  // wave_shl:1 moves every lane down by one, the way row_shl does within a
+  // row, but the first lane of each row reads the last of the row above it.
+  // The last lane of the wave has nothing to read, and bound_ctrl makes it 0.
+  run(o, "across", mem, {pin, pout, static_cast<uint64_t>(kN)});
+  const std::vector<int32_t> out = download<int32_t>(mem, pout, kN);
+  for (int i = 0; i < kN; ++i) {
+    const int32_t want = i == kN - 1 ? 0 : in[i + 1];
+    if (out[i] != want)
+      throw vtest::Failure("across[" + std::to_string(i) + "] is " + std::to_string(out[i]) + ", not " +
+                           std::to_string(want));
   }
-  VCHECK_CONTAINS(what, "does not model");
 }
 
 VTEST_MAIN

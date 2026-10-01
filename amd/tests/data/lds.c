@@ -1,5 +1,5 @@
 // The rest of what a kernel does with LDS: values wider and narrower than a
-// word, a float atomic, and the swizzle, where lanes trade values through the
+// word, a float atomic, compare-and-swap, and the swizzle, where lanes trade values through the
 // LDS unit without touching LDS itself. Built for gfx942 by build.sh.
 typedef unsigned char u8;
 typedef unsigned short u16;
@@ -13,6 +13,8 @@ __attribute__((address_space(3))) extern u8 lds_bytes[64];
 __attribute__((address_space(3))) extern u16 lds_shorts[64];
 __attribute__((address_space(3))) extern signed char lds_signed[64];
 __attribute__((address_space(3))) extern float lds_floats[8];
+__attribute__((address_space(3))) extern unsigned lds_words[8];
+__attribute__((address_space(3))) extern unsigned long lds_longs[8];
 
 // two words at a time
 __attribute__((amdgpu_kernel)) void doubles_in_lds(const double* in, double* out, int n) {
@@ -46,6 +48,29 @@ __attribute__((amdgpu_kernel)) void float_sums_in_lds(const float* in, float* ou
   __atomic_fetch_add(&lds_floats[t & 7], in[t], __ATOMIC_RELAXED);
   __builtin_amdgcn_s_barrier();
   out[t] = lds_floats[t & 7];
+}
+// eight slots again, summed by compare-and-swap loops a word and two words
+// at a time (as HIP builds an atomic LDS has no instruction for), and then a
+// compare that cannot match, which stores nothing and hands back the sum
+__attribute__((amdgpu_kernel)) void cas_in_lds(const unsigned* in, unsigned* sums, unsigned long* longs,
+                                                unsigned* missed, int n) {
+  int t = __builtin_amdgcn_workitem_id_x();
+  if (t < 8) lds_words[t] = 0, lds_longs[t] = 0;
+  __builtin_amdgcn_s_barrier();
+  unsigned was = lds_words[t & 7];
+  while (!__atomic_compare_exchange_n(&lds_words[t & 7], &was, was + in[t], 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+  }
+  unsigned long wide = lds_longs[t & 7];
+  const unsigned long add = (unsigned long)in[t] << 32 | in[t];
+  while (!__atomic_compare_exchange_n(&lds_longs[t & 7], &wide, wide + add, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+  }
+  __builtin_amdgcn_s_barrier();
+  unsigned never = 0xdeadbeefu;
+  __atomic_compare_exchange_n(&lds_words[t & 7], &never, 1u, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+  missed[t] = never;
+  __builtin_amdgcn_s_barrier();
+  sums[t] = lds_words[t & 7];
+  longs[t] = lds_longs[t & 7];
 }
 // Each lane adds the lane whose number differs from its own in one bit, for
 // each of the five bits: afterwards every lane holds the sum of its group of

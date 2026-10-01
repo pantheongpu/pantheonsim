@@ -514,6 +514,26 @@ const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t addr) {
+  for (auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    const auto it = lm.symbols.find(name);
+    if (it == lm.symbols.end() || !lm.mod)
+      throw Error::make(Err::NotFound, "module ", module_id, " has no global '", name, "'");
+    it->second = addr;
+    // A global initialised with this one's address now holds the new one.
+    for (const auto& g : lm.mod->globals)
+      for (const auto& si : g.init_symbols)
+        if (si.name == name) {
+          const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
+          const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
+          if (bytes) mem_.write(lm.symbols.at(g.name) + si.offset, &addr, bytes);
+        }
+    return;
+  }
+  throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+}
+
 bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id) continue;
@@ -902,14 +922,14 @@ class FaultHook final : public MemoryManager::AccessFault {
   std::atomic<uint64_t> flips_{0};
 };
 
-Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry)
-    : profile_(std::move(profile)), ordinal_(ordinal),
-      mem_(profile_.vram_bytes, static_cast<uint32_t>(ordinal)), telemetry_(telemetry) {
+Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry, int physical)
+    : profile_(std::move(profile)), ordinal_(ordinal), physical_(physical < 0 ? ordinal : physical),
+      mem_(profile_.vram_bytes, static_cast<uint32_t>(physical_)), telemetry_(telemetry) {
   // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
   // set_page_size says what that lets a kernel read).
   if (profile_.vendor == "amd") mem_.set_page_size(4096);
   if (telemetry_) {
-    int ord = ordinal_;
+    int ord = physical_;
     telemetry::Publisher* pub = telemetry_;
     mem_.set_usage_observer(
         [pub, ord](uint64_t used) { pub->note_memory(static_cast<uint32_t>(ord), used); });
@@ -923,7 +943,7 @@ void Device::install_fault_hook() {
   // Without a writable runtime directory no fault can be armed for this device;
   // everything else works exactly as before.
   try {
-    fault_ = std::make_unique<FaultHook>(profile_, ordinal_);
+    fault_ = std::make_unique<FaultHook>(profile_, physical_);
     mem_.set_access_fault(fault_.get());
   } catch (const std::exception&) {
     fault_.reset();
@@ -949,7 +969,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
   if (fault_) {
     fault_->check_lost(fn.name);
-    fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(ordinal_));
+    fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(physical_));
   }
   try {
     run_kernel(fn, cfg, args, syms);
@@ -986,7 +1006,7 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
   // Utilization is the real fraction of wall time spent executing kernels. The
   // progress hook publishes it *during* the launch so a long kernel still shows
   // live telemetry rather than freezing until it returns.
-  uint32_t ord = static_cast<uint32_t>(ordinal_);
+  uint32_t ord = static_cast<uint32_t>(physical_);
   telemetry::Publisher* pub = telemetry_;
   auto start = std::chrono::steady_clock::now();
   const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
@@ -1005,17 +1025,24 @@ void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {
 }
 
 
-Runtime::Runtime(const DeviceProfile& profile, int device_count) {
+Runtime::Runtime(const DeviceProfile& profile, int device_count, std::vector<int> physical, int machine) {
   if (device_count < 1) throw Error::make(Err::InvalidValue, "device_count must be >= 1");
   // Every device needs an address window of its own (memory.hpp).
   static_assert(telemetry::kMaxDevices <= vgpu::kDeviceVaWindows);
-  if (device_count > telemetry::kMaxDevices)
+  if (physical.empty())
+    for (int i = 0; i < device_count; ++i) physical.push_back(i);
+  if (static_cast<int>(physical.size()) != device_count)
+    throw Error::make(Err::InvalidValue, "a physical device for each of the ", device_count, " devices");
+  for (int p : physical) machine = std::max(machine, p + 1);
+  if (machine > telemetry::kMaxDevices)
     throw Error::make(Err::InvalidValue, "device_count must be <= ", telemetry::kMaxDevices);
-  telemetry_.set_device_count(static_cast<uint32_t>(device_count));
-  for (int i = 0; i < device_count; ++i) {
-    devices_.push_back(std::make_unique<Device>(profile, i, telemetry_.active() ? &telemetry_ : nullptr));
-    publish_identity(profile, i);
-  }
+  // Telemetry describes the whole machine, each device in its own slot;
+  // the devices shown here are what this process makes busy.
+  telemetry_.set_device_count(static_cast<uint32_t>(machine));
+  for (int i = 0; i < machine; ++i) publish_identity(profile, i);
+  for (int i = 0; i < device_count; ++i)
+    devices_.push_back(std::make_unique<Device>(profile, i, telemetry_.active() ? &telemetry_ : nullptr,
+                                                physical[static_cast<size_t>(i)]));
   for (auto& d : devices_) d->set_device_count(device_count);
 }
 

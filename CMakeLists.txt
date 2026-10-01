@@ -135,6 +135,7 @@ add_library(vgpu STATIC
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
+  amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
   # Each vendor's part of the register model and its driver files.
@@ -549,6 +550,27 @@ if(CUDA_ABI_INCLUDE)
   else()
     message(STATUS "NCCL headers not found: skipping libvgpunccl")
   endif()
+
+  # ---------------------------------------------------------------------------
+  # libvgpucustatevec: cuStateVec (cuQuantum), presented as libcustatevec.so.1.
+  # NVIDIA's carries a statically linked CUDA runtime, which cannot reach a
+  # simulated driver, so the simulator answers the documented API itself, from
+  # its own declarations (nvidia/include/vgpu_custatevec.h). NVIDIA's tags its
+  # symbols libcustatevec.so.0, so programs linked against it ask for that.
+  # ---------------------------------------------------------------------------
+  vgpu_version_script(custatevec 0 _custatevec_map)
+  add_library(vgpucustatevec SHARED nvidia/src/custatevec_api.cpp)
+  target_link_libraries(vgpucustatevec PRIVATE vgpucudart)
+  target_include_directories(vgpucustatevec PRIVATE ${CUDA_ABI_INCLUDE})
+  set_target_properties(vgpucustatevec PROPERTIES OUTPUT_NAME custatevec SOVERSION 1 VERSION 1.0)
+  target_link_options(vgpucustatevec PRIVATE "-Wl,--version-script=${_custatevec_map}")
+  add_custom_command(TARGET vgpucustatevec POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcustatevec.so.1.0"
+            "${CMAKE_BINARY_DIR}/shim/libcustatevec.so.1"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcustatevec.so.1.0"
+            "${CMAKE_BINARY_DIR}/shim/libcustatevec.so"
+    COMMENT "Creating cuStateVec shim symlinks (build/shim/libcustatevec.so.1)")
 
   # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
@@ -1219,13 +1241,28 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
     set_tests_properties(e2e_${_name} PROPERTIES
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
+
+  # Driver and runtime entry points CUDA's samples reach for, checked against
+  # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
+  # __managed__ variables (managed_vars.cu). On two devices, so that peer
+  # access and peer copies have a peer, and a managed variable two devices.
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart")
+    string(REPLACE ":" ";" _parts "${_check}")
+    list(POP_FRONT _parts _name)
+    add_test(NAME e2e_${_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    set_tests_properties(e2e_${_name} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_DEVICE_COUNT=2"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
@@ -1402,6 +1439,20 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_div_approx
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_div_approx.sh)
   set_tests_properties(e2e_div_approx PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_printf_formats
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_printf_formats.sh)
+  set_tests_properties(e2e_printf_formats PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_device_last_error
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_last_error.sh)
+  set_tests_properties(e2e_device_last_error PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)

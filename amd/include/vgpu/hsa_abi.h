@@ -514,6 +514,148 @@ typedef struct hsa_ven_amd_loader_1_01_pfn_s {
 hsa_status_t hsa_system_get_major_extension_table(uint16_t extension, uint16_t version_major, size_t table_length,
                                                   void* table);
 
+/* The images extension (hsa_ext_image.h): an image and a sampler are
+   handles, a descriptor names the image's shape and format, and a region a
+   box of texels within it. */
+enum { HSA_EXTENSION_IMAGES = 1 };
+enum {
+  HSA_EXT_STATUS_ERROR_IMAGE_FORMAT_UNSUPPORTED = 0x3000,
+  HSA_EXT_STATUS_ERROR_IMAGE_SIZE_UNSUPPORTED = 0x3001,
+  HSA_EXT_STATUS_ERROR_IMAGE_PITCH_UNSUPPORTED = 0x3002,
+  HSA_EXT_STATUS_ERROR_SAMPLER_DESCRIPTOR_UNSUPPORTED = 0x3003
+};
+enum {
+  HSA_EXT_AGENT_INFO_IMAGE_1D_MAX_ELEMENTS = 0x3000,
+  HSA_EXT_AGENT_INFO_IMAGE_1DA_MAX_ELEMENTS = 0x3001,
+  HSA_EXT_AGENT_INFO_IMAGE_1DB_MAX_ELEMENTS = 0x3002,
+  HSA_EXT_AGENT_INFO_IMAGE_2D_MAX_ELEMENTS = 0x3003,
+  HSA_EXT_AGENT_INFO_IMAGE_2DA_MAX_ELEMENTS = 0x3004,
+  HSA_EXT_AGENT_INFO_IMAGE_2DDEPTH_MAX_ELEMENTS = 0x3005,
+  HSA_EXT_AGENT_INFO_IMAGE_2DADEPTH_MAX_ELEMENTS = 0x3006,
+  HSA_EXT_AGENT_INFO_IMAGE_3D_MAX_ELEMENTS = 0x3007,
+  HSA_EXT_AGENT_INFO_IMAGE_ARRAY_MAX_LAYERS = 0x3008,
+  HSA_EXT_AGENT_INFO_MAX_IMAGE_RD_HANDLES = 0x3009,
+  HSA_EXT_AGENT_INFO_MAX_IMAGE_RORW_HANDLES = 0x300A,
+  HSA_EXT_AGENT_INFO_MAX_SAMPLER_HANDLERS = 0x300B,
+  HSA_EXT_AGENT_INFO_IMAGE_LINEAR_ROW_PITCH_ALIGNMENT = 0x300C
+};
+typedef enum {
+  HSA_ACCESS_PERMISSION_RO = 1,
+  HSA_ACCESS_PERMISSION_WO = 2,
+  HSA_ACCESS_PERMISSION_RW = 3
+} hsa_access_permission_t;
+typedef enum { HSA_EXT_IMAGE_DATA_LAYOUT_OPAQUE = 0, HSA_EXT_IMAGE_DATA_LAYOUT_LINEAR = 1 } hsa_ext_image_data_layout_t;
+typedef struct hsa_ext_image_s { uint64_t handle; } hsa_ext_image_t;
+typedef struct hsa_ext_sampler_s { uint64_t handle; } hsa_ext_sampler_t;
+typedef struct hsa_ext_image_format_s {
+  uint32_t channel_type;   /* hsa_ext_image_channel_type_t */
+  uint32_t channel_order;  /* hsa_ext_image_channel_order_t */
+} hsa_ext_image_format_t;
+typedef struct hsa_ext_image_descriptor_s {
+  uint32_t geometry;  /* hsa_ext_image_geometry_t: 1D, 2D, 3D, 1DA, 2DA, 1DB, 2DDEPTH, 2DADEPTH */
+  size_t width, height, depth, array_size;
+  hsa_ext_image_format_t format;
+} hsa_ext_image_descriptor_t;
+typedef struct hsa_ext_image_data_info_s {
+  size_t size, alignment;
+} hsa_ext_image_data_info_t;
+typedef struct hsa_ext_image_region_s {
+  hsa_dim3_t offset, range;
+} hsa_ext_image_region_t;
+typedef struct hsa_ext_sampler_descriptor_v2_s {
+  uint32_t coordinate_mode;  /* 0 unnormalized, 1 normalized */
+  uint32_t filter_mode;      /* 0 nearest, 1 linear */
+  uint32_t address_modes[3]; /* 0 undefined, 1 clamp to edge, 2 clamp to border, 3 repeat, 4 mirrored repeat */
+} hsa_ext_sampler_descriptor_v2_t;
+hsa_status_t hsa_ext_image_get_capability(hsa_agent_t agent, uint32_t geometry, const hsa_ext_image_format_t* format,
+                                          uint32_t* capability);
+hsa_status_t hsa_ext_image_get_capability_with_layout(hsa_agent_t agent, uint32_t geometry,
+                                                      const hsa_ext_image_format_t* format,
+                                                      hsa_ext_image_data_layout_t layout,
+                                                      uint32_t* capability);
+hsa_status_t hsa_ext_image_data_get_info(hsa_agent_t agent, const hsa_ext_image_descriptor_t* descriptor,
+                                         hsa_access_permission_t access, hsa_ext_image_data_info_t* info);
+hsa_status_t hsa_ext_image_data_get_info_with_layout(hsa_agent_t agent, const hsa_ext_image_descriptor_t* descriptor,
+                                                     hsa_access_permission_t access, hsa_ext_image_data_layout_t layout,
+                                                     size_t row_pitch, size_t slice_pitch,
+                                                     hsa_ext_image_data_info_t* info);
+hsa_status_t hsa_ext_image_create(hsa_agent_t agent, const hsa_ext_image_descriptor_t* descriptor, const void* data,
+                                  hsa_access_permission_t access, hsa_ext_image_t* image);
+hsa_status_t hsa_ext_image_create_with_layout(hsa_agent_t agent, const hsa_ext_image_descriptor_t* descriptor,
+                                              const void* data, hsa_access_permission_t access,
+                                              hsa_ext_image_data_layout_t layout, size_t row_pitch,
+                                              size_t slice_pitch, hsa_ext_image_t* image);
+hsa_status_t hsa_ext_image_destroy(hsa_agent_t agent, hsa_ext_image_t image);
+hsa_status_t hsa_ext_image_copy(hsa_agent_t agent, hsa_ext_image_t src, const hsa_dim3_t* src_offset,
+                                hsa_ext_image_t dst, const hsa_dim3_t* dst_offset, const hsa_dim3_t* range);
+hsa_status_t hsa_ext_image_import(hsa_agent_t agent, const void* src, size_t row_pitch, size_t slice_pitch,
+                                  hsa_ext_image_t image, const hsa_ext_image_region_t* region);
+hsa_status_t hsa_ext_image_export(hsa_agent_t agent, hsa_ext_image_t image, void* dst, size_t row_pitch,
+                                  size_t slice_pitch, const hsa_ext_image_region_t* region);
+hsa_status_t hsa_ext_image_clear(hsa_agent_t agent, hsa_ext_image_t image, const void* data,
+                                 const hsa_ext_image_region_t* region);
+hsa_status_t hsa_ext_sampler_create(hsa_agent_t agent, const uint32_t* descriptor, hsa_ext_sampler_t* sampler);
+hsa_status_t hsa_ext_sampler_create_v2(hsa_agent_t agent, const hsa_ext_sampler_descriptor_v2_t* descriptor,
+                                       hsa_ext_sampler_t* sampler);
+hsa_status_t hsa_ext_sampler_destroy(hsa_agent_t agent, hsa_ext_sampler_t sampler);
+
+/* AMD's virtual memory and IPC (hsa_ext_amd.h). */
+typedef struct hsa_amd_vmem_alloc_handle_s { uint64_t handle; } hsa_amd_vmem_alloc_handle_t;
+typedef enum { MEMORY_TYPE_NONE, MEMORY_TYPE_PINNED } hsa_amd_memory_type_t;
+typedef struct hsa_amd_memory_access_desc_s {
+  hsa_access_permission_t permissions;
+  hsa_agent_t agent_handle;
+} hsa_amd_memory_access_desc_t;
+typedef struct hsa_amd_ipc_memory_s { uint32_t handle[8]; } hsa_amd_ipc_memory_t;
+enum {
+  HSA_AMD_SVM_ATTRIB_GLOBAL_FLAG = 0,
+  HSA_AMD_SVM_ATTRIB_READ_ONLY = 1,
+  HSA_AMD_SVM_ATTRIB_HIVE_LOCAL = 2,
+  HSA_AMD_SVM_ATTRIB_MIGRATION_GRANULARITY = 3,
+  HSA_AMD_SVM_ATTRIB_PREFERRED_LOCATION = 4,
+  HSA_AMD_SVM_ATTRIB_PREFETCH_LOCATION = 5,
+  HSA_AMD_SVM_ATTRIB_READ_MOSTLY = 6,
+  HSA_AMD_SVM_ATTRIB_GPU_EXEC = 7,
+  HSA_AMD_SVM_ATTRIB_AGENT_ACCESSIBLE = 0x200,
+  HSA_AMD_SVM_ATTRIB_AGENT_ACCESSIBLE_IN_PLACE = 0x201,
+  HSA_AMD_SVM_ATTRIB_AGENT_NO_ACCESS = 0x202,
+  HSA_AMD_SVM_ATTRIB_ACCESS_QUERY = 0x203
+};
+typedef struct hsa_amd_svm_attribute_pair_s {
+  uint64_t attribute;  /* hsa_amd_svm_attribute_t */
+  uint64_t value;
+} hsa_amd_svm_attribute_pair_t;
+hsa_status_t hsa_amd_svm_attributes_set(void* ptr, size_t size, hsa_amd_svm_attribute_pair_t* attribute_list,
+                                        size_t attribute_count);
+hsa_status_t hsa_amd_svm_attributes_get(void* ptr, size_t size, hsa_amd_svm_attribute_pair_t* attribute_list,
+                                        size_t attribute_count);
+hsa_status_t hsa_amd_svm_prefetch_async(void* ptr, size_t size, hsa_agent_t agent, uint32_t num_dep_signals,
+                                        const hsa_signal_t* dep_signals, hsa_signal_t completion_signal);
+hsa_status_t hsa_amd_vmem_address_reserve(void** va, size_t size, uint64_t address, uint64_t flags);
+hsa_status_t hsa_amd_vmem_address_reserve_align(void** va, size_t size, uint64_t address, uint64_t alignment,
+                                                uint64_t flags);
+hsa_status_t hsa_amd_vmem_address_free(void* va, size_t size);
+hsa_status_t hsa_amd_vmem_handle_create(hsa_amd_memory_pool_t pool, size_t size, hsa_amd_memory_type_t type,
+                                        uint64_t flags, hsa_amd_vmem_alloc_handle_t* memory_handle);
+hsa_status_t hsa_amd_vmem_handle_release(hsa_amd_vmem_alloc_handle_t memory_handle);
+hsa_status_t hsa_amd_vmem_map(void* va, size_t size, size_t in_offset, hsa_amd_vmem_alloc_handle_t memory_handle,
+                              uint64_t flags);
+hsa_status_t hsa_amd_vmem_unmap(void* va, size_t size);
+hsa_status_t hsa_amd_vmem_set_access(void* va, size_t size, const hsa_amd_memory_access_desc_t* desc,
+                                     size_t desc_cnt);
+hsa_status_t hsa_amd_vmem_get_access(void* va, hsa_access_permission_t* perms, hsa_agent_t agent_handle);
+hsa_status_t hsa_amd_vmem_export_shareable_handle(int* dmabuf_fd, hsa_amd_vmem_alloc_handle_t handle,
+                                                  uint64_t flags);
+hsa_status_t hsa_amd_vmem_import_shareable_handle(int dmabuf_fd, hsa_amd_vmem_alloc_handle_t* handle);
+hsa_status_t hsa_amd_vmem_retain_alloc_handle(hsa_amd_vmem_alloc_handle_t* memory_handle, void* addr);
+hsa_status_t hsa_amd_vmem_get_alloc_properties_from_handle(hsa_amd_vmem_alloc_handle_t memory_handle,
+                                                           hsa_amd_memory_pool_t* pool,
+                                                           hsa_amd_memory_type_t* type);
+hsa_status_t hsa_amd_ipc_memory_create(void* ptr, size_t len, hsa_amd_ipc_memory_t* handle);
+hsa_status_t hsa_amd_ipc_memory_attach(const hsa_amd_ipc_memory_t* handle, size_t len, uint32_t num_agents,
+                                       const hsa_agent_t* mapping_agents, void** mapped_ptr);
+hsa_status_t hsa_amd_ipc_memory_detach(void* mapped_ptr);
+
 #ifdef __cplusplus
 }
 #endif

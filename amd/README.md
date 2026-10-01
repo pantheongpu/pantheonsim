@@ -396,15 +396,43 @@ with what its destination holds after it for lane 0 (or the lane
 
 ## Textures
 
-The GPUs modelled here, the MI300 family (gfx942 and gfx950), have no texture
-units. hipcc refuses the texture API in their device code
-(`__HIP_NO_IMAGE_SUPPORT`), and ROCm's HIP on them reports image support 0
-and answers every call that would make an array, a texture or a surface with
-`hipErrorNotSupported`. The shim gives the same answers, so a program or
-library that calls them is told what it would be told on the card instead of
-failing to load. `tests/hipcc/textures.cpp` prints each answer; its output must
-match `tests/hipcc/rocm/textures.expected` on the shim, for each release's
-build of it, and on ROCm's own HIP over the HSA runtime.
+The Radeon GPUs (RDNA2, RDNA3 and RDNA4: gfx1030, gfx1100, gfx1201) have
+texture units, and the simulator models them from the kernel up:
+
+- **Instructions:** RDNA's image instructions (MIMG on gfx10 and gfx11,
+  VIMAGE and VSAMPLE on gfx12) decode from AMD's ISA XML, and the executor runs
+  loads, stores and atomics, point and bilinear samples with mip selection and
+  the wrap, mirror, clamp and border modes, gathers and `get_resinfo`, and the
+  formatted buffer loads and stores (`buffer_load_format_*`, `tbuffer_*`) that
+  `tex1Dfetch` compiles to.
+- **Resources:** an image resource (T#), a sampler (S#) and a formatted
+  buffer's resource (V#) are laid out as ROCm's image runtime writes them, for
+  each generation (`include/vgpu/amd_image.hpp`), with RDNA's single format
+  codes. HIP's texture functions read some of those fields themselves (the
+  height, the sampler's filter and normalization bits, the width after the
+  resource), and do point-sampling's rounding in the kernel.
+- **HIP:** arrays (1D, 2D, 3D, layered), every copy to and from them, texture
+  objects over arrays, linear and pitched memory (runtime and driver API),
+  texture references (`texture<T, dim, mode>`, bound with `hipBindTexture*`
+  or a module's through `hipTexRef*`), sRGB textures, and surface objects
+  (`src/hip_images.inc`), each check and error as ROCm's HIP makes it.
+  ROCm's HIP on Linux has no mipmaps or cube arrays, so neither does the shim.
+- **HSA:** the images extension (`src/hsa_images.inc`): images and samplers,
+  import, export, copy and clear, and each agent's image limits.
+- **Checks:** `tests/data/asm_images.s` checks each instruction against the
+  host; `tests/hipcc/images.cpp` (20 checks) runs on all three generations, on
+  the shim and on ROCm's own HIP over the HSA runtime; `tests/hsa/hsa_images.c`
+  checks the extension.
+
+The MI300 family (gfx942 and gfx950) has no texture units. hipcc refuses the
+texture API in their device code (`__HIP_NO_IMAGE_SUPPORT`), and ROCm's HIP on
+them reports image support 0 and answers every call that would make an array,
+a texture or a surface with `hipErrorNotSupported`. The shim gives the same
+answers, so a program or library that calls them is told what it would be
+told on the card instead of failing to load. `tests/hipcc/textures.cpp` prints
+each answer; its output must match `tests/hipcc/rocm/textures.expected` on the
+shim, for each release's build of it, and on ROCm's own HIP over the HSA
+runtime.
 
 ## HSA
 
@@ -445,7 +473,9 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Work-group limit:** a packet is held only to the hardware's work-group limit, not the kernel's metadata.
 - **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
-- **Not modelled:** images, virtual memory, HSA's IPC and SVM are refused by name. HIP's IPC is modelled (see RCCL below).
+- **Images, virtual memory and IPC:** HSA's images extension (see Textures), its virtual memory (`hsa_amd_vmem_*`), its IPC handles (`hsa_amd_ipc_memory_*`) and dma-buf export are modelled. The last three are HIP's own (`src/hsa_vmem.inc`), reached by hidden names so that ROCm's libamdhip64 over this runtime does not call itself. ROCm's HIP runs `tests/hipcc/memory.cpp`'s virtual memory, pool IPC and dma-buf checks over it.
+- **Shared virtual memory:** the runtime reports SVM support, as ROCm's does on a machine with HMM. ROCm's HIP then keeps managed memory the way it does there: host pages made accessible to each GPU, advised and prefetched through `hsa_amd_svm_attributes_set`, `_get` and `hsa_amd_svm_prefetch_async` (`src/hsa_svm.inc`). A range given to a GPU is mapped for the devices where it is. Advice, access and the last prefetch's target are kept page by page and read back, uniform or not. A prefetch moves nothing, because there is no second copy of the pages. It waits for its dependencies and completes its signal.
+- **Not modelled:** graphics interop.
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 

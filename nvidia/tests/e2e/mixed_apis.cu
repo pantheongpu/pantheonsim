@@ -175,6 +175,41 @@ int main() {
     cudaFree(counter);
   }
 
+  // One registration, whichever API made it: on the card, memory either API
+  // registered is already registered to the other, either unregisters it, and
+  // both report its flags. The driver shim used to have no cuMemHostRegister
+  // at all, and a second registry would have let the two register it twice.
+  {
+    const size_t bytes = 1 << 16;
+    void* mem = nullptr;
+    expect("posix_memalign", posix_memalign(&mem, 4096, bytes) == 0);
+    char* h = static_cast<char*>(mem);
+    unsigned f = 0;
+    expect("cudaHostRegister", cudaHostRegister(h, bytes, 0) == cudaSuccess);
+    expect("the driver sees the runtime's registration",
+           cuMemHostRegister(h, bytes, 0) == CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED);
+    expect("and its flags", cuMemHostGetFlags(&f, h) == CUDA_SUCCESS && f == CU_MEMHOSTALLOC_DEVICEMAP);
+    expect("the driver unregisters it", cuMemHostUnregister(h) == CUDA_SUCCESS);
+    expect("and then the runtime has nothing to unregister",
+           cudaHostUnregister(h) == cudaErrorHostMemoryNotRegistered);
+    cudaGetLastError();
+    expect("cuMemHostRegister", cuMemHostRegister(h, bytes, CU_MEMHOSTREGISTER_PORTABLE) == CUDA_SUCCESS);
+    expect("the runtime sees the driver's registration",
+           cudaHostRegister(h, bytes, 0) == cudaErrorHostMemoryAlreadyRegistered);
+    cudaGetLastError();
+    void* dp = nullptr;
+    expect("and maps it", cudaHostGetDevicePointer(&dp, h, 0) == cudaSuccess && dp != nullptr);
+    expect("and reports its flags",
+           cudaHostGetFlags(&f, h) == cudaSuccess && f == (cudaHostAllocMapped | cudaHostAllocPortable));
+    cudaPointerAttributes attr{};
+    expect("and calls it host memory",
+           cudaPointerGetAttributes(&attr, h) == cudaSuccess && attr.type == cudaMemoryTypeHost);
+    expect("the runtime unregisters it", cudaHostUnregister(h) == cudaSuccess);
+    expect("and then the driver has nothing to unregister",
+           cuMemHostUnregister(h) == CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED);
+    std::free(h);
+  }
+
   std::printf(fails ? "FAIL\n" : "PASS\n");
   return fails != 0;
 }

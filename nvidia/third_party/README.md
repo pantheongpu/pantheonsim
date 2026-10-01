@@ -18,3 +18,10 @@ Refresh with:
 Video Codec SDK, which NVIDIA licenses under the MIT terms printed at the top of
 the file. It lets `libvgpunvenc` (presented as `libnvidia-encode.so.1`) build
 from this tree alone. Refresh it from the SDK's `Interface/` directory.
+
+`joe_kuo/sobol_directions.inc` packs S. Joe and F. Y. Kuo's Sobol' direction
+numbers (`new-joe-kuo-6.21201`, the first 20,000 dimensions), which cuRAND
+documents as the source of its direction vectors. Unlike the headers above it
+is compiled into `libvgpucurand`, under the BSD-style licence reproduced at the
+top of the file. `joe_kuo/gen_sobol_directions.py` regenerates it from the file
+published at https://web.maths.unsw.edu.au/~fkuo/sobol/.

@@ -35,6 +35,7 @@ __global__ void delay(uint64_t ms, uint64_t ticks_per_ms) {
     while (wall_clock64() - start < ticks_per_ms) __builtin_amdgcn_s_sleep(10);
   }
 }
+__global__ void add_double(double* p, double v) { atomicAdd(p, v); }
 __global__ void iota3d(uint8_t* p, size_t pitch, size_t height, size_t w, size_t h, size_t d) {
   for (size_t z = 0; z < d; ++z)
     for (size_t y = 0; y < h; ++y)
@@ -55,8 +56,9 @@ int main() {
   (void)hipFree(p);
   EXPECT(hipMallocPitch(&p, &pitch, 1, SIZE_MAX), hipErrorOutOfMemory, "a pitched allocation too big to count");
   p = reinterpret_cast<void*>(1);
+  pitch = 7;
   (void)hipMallocPitch(&p, &pitch, 0, 1);
-  check(p == nullptr && pitch == 0, "no bytes is no allocation, and no pitch");
+  check(p == nullptr && pitch == 7, "no bytes is no allocation, and the pitch is left as it was");
   hipPitchedPtr pp{};
   (void)hipMalloc3D(&pp, make_hipExtent(260, 16, 8));
   check(pp.pitch == 512 && pp.xsize == 260 && pp.ysize == 16, "hipMalloc3D gives the pitch and the extent back");
@@ -83,6 +85,24 @@ int main() {
   (void)hipMemcpy3D(&c);
   check(part[0] == uint8_t(5 + 9 + 7) && part[10 * 2 + 10 + 9] == uint8_t(14 + 12 + 14),
         "and starts where its position says");
+  // hipMemcpyDeviceToDeviceNoCU is a direction too, device to device.
+  hipPitchedPtr twin{};
+  (void)hipMalloc3D(&twin, make_hipExtent(w, h, d));
+  hipMemcpy3DParms nocu{};
+  nocu.srcPtr = pp;
+  nocu.dstPtr = twin;
+  nocu.extent = make_hipExtent(w, h, d);
+  nocu.kind = hipMemcpyDeviceToDeviceNoCU;
+  EXPECT(hipMemcpy3D(&nocu), hipSuccess, "a 3D copy from device to device without compute units");
+  std::fill(host.begin(), host.end(), 0);
+  c.srcPos = make_hipPos(0, 0, 0);
+  c.srcPtr = twin;
+  c.dstPtr = make_hipPitchedPtr(host.data(), w, w, h);
+  c.extent = make_hipExtent(w, h, d);
+  (void)hipMemcpy3D(&c);
+  check(host[w * h * (d - 1) + w * (h - 1) + w - 1] == uint8_t(w - 1 + 3 * (h - 1) + 7 * (d - 1)), "copies it all");
+  (void)hipFree(twin.ptr);
+  c.srcPtr = pp;
   c.srcPtr.pitch = INT32_MAX;
   EXPECT(hipMemcpy3D(&c), hipErrorInvalidValue, "a pitch as wide as the widest there is, is refused");
   EXPECT(hipMemcpy3D(nullptr), hipErrorInvalidValue, "and no parameters at all");
@@ -170,6 +190,19 @@ int main() {
   (void)hipMemcpyDtoH(back.data(), other, 1024);
   check(back[255] == 7, "hipMemcpyPeer copies between devices");
   EXPECT(hipMemcpyPeer(other, 2, words, 0, 1024), hipErrorInvalidDevice, "to a device that is not there, it refuses");
+  // A synchronous copy of another device's memory comes after what that
+  // device's null stream was given: here a memset queued behind a delay.
+  // ROCm's HIP leaves this to timing (a card's memset is done long before
+  // the copy starts; hip-tests' peer copies count on it), and a simulated
+  // memset is slow enough to lose that race, so the copy waits here.
+  delay<<<1, 1>>>(300, rate);
+  (void)hipMemset(words, 0x5A, 1024);
+  (void)hipSetDevice(1);
+  (void)hipMemcpy(other, words, 1024, hipMemcpyDeviceToDevice);
+  (void)hipMemcpy(back.data(), other, 1024, hipMemcpyDeviceToHost);
+  (void)hipSetDevice(0);
+  check(back[0] == 0x5A5A5A5Au && back[255] == 0x5A5A5A5Au,
+        "a copy from another device's memory follows the memset queued there before it");
 
   // ---- Managed memory: advice and prefetches, page by page
   char* managed = nullptr;
@@ -336,6 +369,15 @@ int main() {
   close(dmabuf);
   (void)hipFree(dmabuf_src);
 
+  // ---- Pinned memory reached in whole pages, as a card maps it
+  double* small_pinned = nullptr;
+  (void)hipHostMalloc(reinterpret_cast<void**>(&small_pinned), sizeof(float), hipHostMallocCoherent);
+  *small_pinned = 1.5;
+  add_double<<<1, 1>>>(small_pinned, 2.0);
+  EXPECT(hipDeviceSynchronize(), hipSuccess, "an 8-byte atomic on a 4-byte pinned allocation stays in its page");
+  check(*small_pinned == 3.5, "and adds", std::to_string(*small_pinned));
+  (void)hipHostFree(small_pinned);
+
   // ---- Edge sizes
   void* ext = reinterpret_cast<void*>(1);
   EXPECT(hipExtMallocWithFlags(&ext, 0, hipDeviceMallocDefault), hipSuccess, "zero bytes with hipExtMallocWithFlags");
@@ -368,6 +410,22 @@ int main() {
   EXPECT(hipDeviceSetGraphMemAttribute(0, hipGraphMemAttrUsedMemHigh, &one), hipErrorInvalidValue,
          "a high-water mark is set back to zero, or not at all");
   (void)hipGetLastError();
+
+  // Pinned memory starts zeroed, as ROCm's does (fresh pages from the
+  // kernel): hip-tests' atomics read a hipHostMalloc buffer they never
+  // wrote. A buffer dirtied and freed, then allocated again, reads zero.
+  {
+    const size_t n = 3 << 20;
+    for (int round = 0; round < 2; ++round) {
+      unsigned char* h = nullptr;
+      (void)hipHostMalloc(reinterpret_cast<void**>(&h), n);
+      size_t nonzero = 0;
+      for (size_t i = 0; i < n; ++i) nonzero += h[i] != 0;
+      if (round == 1) check(nonzero == 0, "pinned memory starts zeroed", std::to_string(nonzero) + " bytes not zero");
+      for (size_t i = 0; i < n; ++i) h[i] = 0xab;
+      (void)hipHostFree(h);
+    }
+  }
 
   // A fill still queued when the memory is shared: hipMemset of device
   // memory returns before it runs, and sharing moves the bytes into a file,

@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <list>
+#include <map>
 #include <vector>
 
 #include "vgpu/exec/launch.hpp"
@@ -28,12 +29,19 @@ namespace vgpu::runtime {
 class Device {
  public:
   // Defined with the fault hook it installs, which is only complete there.
-  Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry);
+  // `physical` is which of the machine's devices this one is, where a
+  // visible-devices list shows the program only some of them in another
+  // order (-1: the same as its ordinal). It names the device everywhere
+  // outside the program -- its identity, its telemetry, the faults armed for
+  // it, and its address window, so processes shown it differently agree on
+  // where its memory is.
+  Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry, int physical = -1);
 
   ~Device();
 
   const DeviceProfile& profile() const { return profile_; }
   int ordinal() const { return ordinal_; }
+  int physical() const { return physical_; }
   // How many devices the machine has, for device-side cudaGetDeviceCount.
   void set_device_count(int n) { device_count_ = n; }
   MemoryManager& memory() { return mem_; }
@@ -41,12 +49,12 @@ class Device {
   // Reports device-busy time to telemetry without running a kernel. Used by
   // `vgpu serve` to present a rack under a chosen synthetic load.
   void note_busy(double seconds) {
-    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), seconds);
+    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), seconds);
   }
 
   // Reports host<->device traffic to telemetry (bytes and the time it took).
   void note_transfer(uint64_t bytes, double seconds) {
-    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(ordinal_), bytes, seconds);
+    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(physical_), bytes, seconds);
   }
 
   // Destroys everything this device holds -- loaded modules and their globals,
@@ -77,6 +85,12 @@ class Device {
   // A module's global variable by name: its address and its declared size.
   // False when the module declares no global of that name.
   bool global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const;
+  // Points a module's global at `addr` instead of the device memory it was
+  // given at load: a __managed__ variable lives in host memory every device
+  // maps, at one address for the host and all devices, and the runtime moves
+  // each device's copy of the module onto it. Kernels launched afterwards use
+  // the new address, as do globals initialised with this one's address.
+  void rebind_global(uint64_t module_id, const std::string& name, uint64_t addr);
   // Whether the module defines a kernel of that name.
   bool has_kernel(uint64_t module_id, const std::string& name) const;
 
@@ -102,6 +116,7 @@ class Device {
   std::unique_ptr<class FaultHook> fault_;
   DeviceProfile profile_;
   int ordinal_;
+  int physical_;
   int device_count_ = 1;
   MemoryManager mem_;
   telemetry::Publisher* telemetry_ = nullptr;
@@ -129,6 +144,16 @@ class Device {
   mutable std::list<LoadedModule> modules_;
 };
 
+// A range of host memory CUDA knows about, and the device that was current
+// when it was set up (the one whose cudaDeviceReset releases it). `flags` are
+// the ones the caller passed, which cuMemHostGetFlags and cudaHostGetFlags
+// report back.
+struct HostRange {
+  size_t size = 0;
+  int device = 0;
+  unsigned flags = 0;
+};
+
 class Runtime;
 // The process's simulated machine, made from the environment (VGPU_GPU,
 // VGPU_DEVICE_COUNT) the first time either CUDA library asks, and the same
@@ -142,16 +167,26 @@ class Runtime {
  public:
   // Creates `device_count` identical virtual devices of the given profile.
   // (Heterogeneous multi-GPU topologies are a planned profile extension.)
-  explicit Runtime(const DeviceProfile& profile, int device_count = 1);
+  // `physical`, where given, says which machine device each one is (see
+  // Device), and `machine` how many the machine has.
+  explicit Runtime(const DeviceProfile& profile, int device_count = 1, std::vector<int> physical = {},
+                   int machine = 0);
 
   int device_count() const { return static_cast<int>(devices_.size()); }
   Device& device(int ordinal);
+
+  // Host memory registered with cudaHostRegister or cuMemHostRegister, by its
+  // base. One record for both libraries, as the card keeps one: memory either
+  // API registered is already registered to the other, and either may
+  // unregister it. Callers hold shared_api_mutex().
+  std::map<void*, HostRange>& host_registrations() { return host_registrations_; }
 
  private:
   void publish_identity(const DeviceProfile& profile, int ordinal);
 
   telemetry::Publisher telemetry_;
   std::vector<std::unique_ptr<Device>> devices_;
+  std::map<void*, HostRange> host_registrations_;
 };
 
 }  // namespace vgpu::runtime

@@ -739,6 +739,13 @@ void MemoryManager::drop_shared(std::map<uint64_t, SharedRegion>::iterator it) {
   shared_.erase(it);
 }
 
+uint8_t* MemoryManager::host_address(uint64_t addr, uint64_t len) const {
+  if (!host_maps_->may_contain(addr)) return nullptr;
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  const HostMap* m = find_host_map_locked(addr, len);
+  return m ? m->host + (addr - m->base) : nullptr;
+}
+
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
   // Nothing mapped near it: no lock, as before any buffer was mapped at all.
   if (!host_maps_->may_contain(addr)) return false;
