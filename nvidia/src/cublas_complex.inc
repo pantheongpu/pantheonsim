@@ -9,8 +9,9 @@
 //
 // Also geam and gelsBatched, for the real types as well (at the end).
 //
-// Not implemented (still stubs): her/her2/syr/syr2, her2k/syr2k, the rot
-// family and geqrfBatched.
+// Not implemented (still stubs): her/her2/syr/syr2, her2k/syr2k and
+// geqrfBatched. The rot family is in cublas_api.cpp, with the typed level-1
+// Ex routines whose type handling it shares.
 
 #include "complex_linalg.hpp"
 

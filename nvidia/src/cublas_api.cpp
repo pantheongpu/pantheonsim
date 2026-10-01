@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -1767,4 +1768,395 @@ VGPU_EXPORT cublasStatus_t cublasSgemmEx_64(cublasHandle_t h, cublasOperation_t 
     if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;
   return cublasSgemmEx(h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, B, Btype, (int)ldb, beta, C,
                        Ctype, (int)ldc);
+}
+
+/* ---- the rot family: rot, rotg, rotm and rotmg, typed and Ex ----
+   Plane rotations, after reference BLAS, with the arithmetic in the order an
+   RTX 3060's cuBLAS does it, so that real results match it bit for bit:
+
+     rot    x' = fma(c, x, s y), y' = fma(c, y, -(s x)); a complex rotation
+            takes c real (the imaginary part of a complex c is ignored, as the
+            card ignores it), y' = c y - conj(s) x, and is fused the same way
+            part by part (rot_cplx).
+     rotg   r = sigma (scl sqrt((a/scl)^2 + (b/scl)^2)), scl = max(|a|, |b|),
+            sigma the sign of the larger. The larger of c and s is a/r or b/r
+            and the smaller is that times the ratio of the two (s = (b/a) c),
+            and z as BLAS defines it. No shortcut for a zero a or b, so rotg(0,
+            -3) gives c = -0 as the card does; only a and b both zero do. The
+            complex rotg is reference BLAS's crotg, which leaves b alone,
+            computed in double: within a few ulps of the card, whose single-
+            precision order of operations this does not reproduce.
+     rotm   by the flag in param[0]: -1 x' = fma(h11, x, h12 y), y' = fma(h21,
+            x, h22 y); 0 x' = fma(h12, y, x), y' = fma(h21, x, y); 1 x' =
+            fma(h11, x, y), y' = fma(h22, y, -x); -2, or any other value, is
+            the identity.
+     rotmg  reference BLAS's srotmg/drotmg, step for step.
+
+   The Ex forms take the types an RTX 3060 accepts (anything else is
+   NOT_SUPPORTED): x, y, c and s alike in R_16F, R_16BF, R_32F or R_64F, with
+   execution in R_32F (R_64F for doubles); for rot also C_32F and C_64F with c
+   and s that type or its real type. rotg, rotm and rotmg are real only, and
+   rotmg's five operands all one type. Half and bfloat16 values are rotated in
+   single precision and rounded back. A non-positive n does nothing. The
+   scalars, and every operand of rotg and rotmg, are host or device memory by
+   the pointer mode. */
+namespace {
+
+template <class R>
+void rot_real(std::vector<cd>& x, std::vector<cd>& y, R c, R s) {
+  for (size_t i = 0; i < x.size(); ++i) {
+    const R xi = (R)x[i].real(), yi = (R)y[i].real();
+    x[i] = std::fma(c, xi, s * yi);
+    y[i] = std::fma(c, yi, -(s * xi));
+  }
+}
+
+// The complex rotation, c real: s y and conj(s) x are each one complex
+// product, (pr qr - pi qi, pi qr + pr qi) with the first product of each part
+// fused, and c times x (or y) is fused onto it.
+template <class R>
+void rot_cplx(std::vector<cd>& x, std::vector<cd>& y, R c, R sr, R si) {
+  for (size_t i = 0; i < x.size(); ++i) {
+    const R xr = (R)x[i].real(), xi = (R)x[i].imag(), yr = (R)y[i].real(), yi = (R)y[i].imag();
+    const R tr = std::fma(sr, yr, -(si * yi)), ti = std::fma(si, yr, sr * yi);   // s y
+    const R ur = std::fma(sr, xr, si * xi), ui = std::fma(-si, xr, sr * xi);     // conj(s) x
+    x[i] = {std::fma(c, xr, tr), std::fma(c, xi, ti)};
+    y[i] = {std::fma(c, yr, -ur), std::fma(c, yi, -ui)};
+  }
+}
+
+// c is read as `ct` and s as `st`; only c's real part is used.
+cublasStatus_t rot_core(cublasHandle_t h, int n, void* x, cudaDataType xt, int incx, void* y, int incy,
+                        const void* c, cudaDataType ct, const void* s, cudaDataType st, cudaDataType et) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, cv = hold(h, c, ex_bytes(ct)), sv = hold(h, s, ex_bytes(st))] {
+        rot_core(h, n, x, xt, incx, y, incy, cv.get(), ct, sv.get(), st, et);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const double cr = ex_scalar(h, c, ct).real();
+  const cd sv = ex_scalar(h, s, st);
+  auto xv = ex_load(x, xt, n, incx), yv = ex_load(y, xt, n, incy);
+  if (et == CUDA_R_32F) {
+    rot_real<float>(xv, yv, (float)cr, (float)sv.real());
+  } else if (et == CUDA_R_64F) {
+    rot_real<double>(xv, yv, cr, sv.real());
+  } else if (et == CUDA_C_32F) {
+    rot_cplx<float>(xv, yv, (float)cr, (float)sv.real(), (float)sv.imag());
+  } else {
+    rot_cplx<double>(xv, yv, cr, sv.real(), sv.imag());
+  }
+  ex_store(x, xt, n, incx, xv, et);
+  ex_store(y, xt, n, incy, yv, et);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t rot_ex(cublasHandle_t h, int n, void* x, cudaDataType xt, int incx, void* y, cudaDataType yt,
+                      int incy, const void* c, const void* s, cudaDataType cst, cudaDataType et) {
+  if (!ex_known(xt) || yt != xt || et != ex_exec(xt) || (cst != xt && !(ex_complex(xt) && cst == ex_real(xt))))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  return rot_core(h, n, x, xt, incx, y, incy, c, cst, s, cst, et);
+}
+
+// The real types rotg, rotm and rotmg take: R_16F, R_16BF, R_32F, R_64F.
+bool rot_real_type(cudaDataType t) { return ex_known(t) && !ex_complex(t); }
+
+template <class R>
+void rotg_real(R& a, R& b, R& c, R& s) {
+  const R an = std::fabs(a), bn = std::fabs(b);
+  if (an == 0 && bn == 0) {
+    c = 1;
+    s = 0;
+    return;
+  }
+  const R safmin = std::numeric_limits<R>::min(), safmax = 1 / safmin;
+  const R scl = std::min(safmax, std::max(safmin, std::max(an, bn)));
+  const R sigma = an > bn ? std::copysign(R(1), a) : std::copysign(R(1), b);
+  const R p = a / scl, q = b / scl;
+  const R r = sigma * (scl * std::sqrt(p * p + q * q));
+  if (an > bn) {
+    c = a / r;
+    s = (b / a) * c;
+  } else {
+    s = b / r;
+    c = (a / b) * s;
+  }
+  b = an > bn ? s : c != 0 ? 1 / c : R(1);
+  a = r;
+}
+
+// The operands of rotg and rotmg are all host or all device memory.
+cd rot_get(cublasHandle_t h, const void* p, cudaDataType t) { return ex_scalar(h, p, t); }
+void rot_put(cublasHandle_t h, void* p, cudaDataType t, cd v) { ex_result(h, p, t, v, ex_exec(t)); }
+
+cublasStatus_t rotg_ex(cublasHandle_t h, void* a, void* b, cudaDataType abt, void* c, void* s, cudaDataType cst,
+                       cudaDataType et) {
+  if (!rot_real_type(abt) || cst != abt || et != ex_exec(abt)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { rotg_ex(h, a, b, abt, c, s, cst, et); })) return CUBLAS_STATUS_SUCCESS;
+  if (et == CUDA_R_64F) {
+    double av = rot_get(h, a, abt).real(), bv = rot_get(h, b, abt).real(), cv, sv;
+    rotg_real(av, bv, cv, sv);
+    rot_put(h, a, abt, av), rot_put(h, b, abt, bv), rot_put(h, c, cst, cv), rot_put(h, s, cst, sv);
+  } else {
+    float av = (float)rot_get(h, a, abt).real(), bv = (float)rot_get(h, b, abt).real(), cv, sv;
+    rotg_real(av, bv, cv, sv);
+    rot_put(h, a, abt, av), rot_put(h, b, abt, bv), rot_put(h, c, cst, cv), rot_put(h, s, cst, sv);
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// Reference BLAS's crotg/zrotg: c real, s complex, a overwritten by r and b
+// left as it was.
+cublasStatus_t rotg_complex(cublasHandle_t h, void* a, void* b, void* c, void* s, cudaDataType t) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { rotg_complex(h, a, b, c, s, t); })) return CUBLAS_STATUS_SUCCESS;
+  const cudaDataType rt = ex_real(t);
+  const cd ca = rot_get(h, a, t), cb = rot_get(h, b, t);
+  if (std::abs(ca) == 0) {
+    rot_put(h, c, rt, 0), rot_put(h, s, t, 1), rot_put(h, a, t, cb);
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  const double scale = std::abs(ca) + std::abs(cb);
+  const double norm = scale * std::sqrt(std::norm(ca / scale) + std::norm(cb / scale));
+  const cd alpha = ca / std::abs(ca);
+  rot_put(h, c, rt, std::abs(ca) / norm), rot_put(h, s, t, alpha * std::conj(cb) / norm), rot_put(h, a, t, alpha * norm);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class R>
+void rotm_real(std::vector<cd>& x, std::vector<cd>& y, const R* p) {
+  const R flag = p[0], h11 = p[1], h21 = p[2], h12 = p[3], h22 = p[4];
+  for (size_t i = 0; i < x.size(); ++i) {
+    const R xi = (R)x[i].real(), yi = (R)y[i].real();
+    if (flag == -1) {
+      x[i] = std::fma(h11, xi, h12 * yi);
+      y[i] = std::fma(h21, xi, h22 * yi);
+    } else if (flag == 0) {
+      x[i] = std::fma(h12, yi, xi);
+      y[i] = std::fma(h21, xi, yi);
+    } else if (flag == 1) {
+      x[i] = std::fma(h11, xi, yi);
+      y[i] = std::fma(h22, yi, -xi);
+    }
+  }
+}
+
+cublasStatus_t rotm_ex(cublasHandle_t h, int n, void* x, cudaDataType xt, int incx, void* y, cudaDataType yt,
+                       int incy, const void* param, cudaDataType pt, cudaDataType et) {
+  if (!rot_real_type(xt) || yt != xt || pt != xt || et != ex_exec(xt)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, pv = hold(h, param, 5 * ex_bytes(pt))] {
+        rotm_ex(h, n, x, xt, incx, y, yt, incy, pv.get(), pt, et);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  std::vector<uint8_t> raw(5 * ex_bytes(pt));
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) raw = fetch<uint8_t>(param, raw.size());
+  else std::memcpy(raw.data(), param, raw.size());
+  double p[5];
+  for (int i = 0; i < 5; ++i) p[i] = ex_get(pt, raw.data() + i * ex_bytes(pt)).real();
+  if (p[0] != -1 && p[0] != 0 && p[0] != 1) return CUBLAS_STATUS_SUCCESS;
+  auto xv = ex_load(x, xt, n, incx), yv = ex_load(y, yt, n, incy);
+  if (et == CUDA_R_64F) {
+    rotm_real<double>(xv, yv, p);
+  } else {
+    const float pf[5] = {(float)p[0], (float)p[1], (float)p[2], (float)p[3], (float)p[4]};
+    rotm_real<float>(xv, yv, pf);
+  }
+  ex_store(x, xt, n, incx, xv, et);
+  ex_store(y, yt, n, incy, yv, et);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// Reference BLAS's srotmg, step for step; param[] entries the flag does not
+// name are left as they were.
+template <class R>
+void rotmg_real(R& d1, R& d2, R& x1, R y1, R* param, bool* written) {
+  const R gam = 4096, gamsq = gam * gam, rgamsq = 1 / gamsq;
+  R flag, h11 = 0, h12 = 0, h21 = 0, h22 = 0;
+  auto zero_all = [&] {
+    flag = -1;
+    h11 = h12 = h21 = h22 = 0;
+    d1 = d2 = x1 = 0;
+  };
+  for (int i = 0; i < 5; ++i) written[i] = false;
+  if (d1 < 0) {
+    zero_all();
+  } else {
+    const R p2 = d2 * y1;
+    if (p2 == 0) {
+      param[0] = -2;
+      written[0] = true;
+      return;
+    }
+    const R p1 = d1 * x1, q2 = p2 * y1, q1 = p1 * x1;
+    if (std::fabs(q1) > std::fabs(q2)) {
+      h21 = -y1 / x1;
+      h12 = p2 / p1;
+      const R u = 1 - h12 * h21;
+      if (u > 0) {
+        flag = 0;
+        d1 /= u;
+        d2 /= u;
+        x1 *= u;
+      } else {
+        zero_all();
+      }
+    } else if (q2 < 0) {
+      zero_all();
+    } else {
+      flag = 1;
+      h11 = p1 / p2;
+      h22 = x1 / y1;
+      const R u = 1 + h11 * h22, t = d2 / u;
+      d2 = d1 / u;
+      d1 = t;
+      x1 = y1 * u;
+    }
+    // Rescale d1 and d2 into (1/gam^2, gam^2), the matrix becoming a full one.
+    auto full = [&] {
+      if (flag == 0) h11 = h22 = 1;
+      else if (flag == 1) h21 = -1, h12 = 1;
+      flag = -1;
+    };
+    if (d1 != 0)
+      while (d1 <= rgamsq || d1 >= gamsq) {
+        full();
+        if (d1 <= rgamsq) d1 *= gam * gam, x1 /= gam, h11 /= gam, h12 /= gam;
+        else d1 /= gam * gam, x1 *= gam, h11 *= gam, h12 *= gam;
+      }
+    if (d2 != 0)
+      while (std::fabs(d2) <= rgamsq || std::fabs(d2) >= gamsq) {
+        full();
+        if (std::fabs(d2) <= rgamsq) d2 *= gam * gam, h21 /= gam, h22 /= gam;
+        else d2 /= gam * gam, h21 *= gam, h22 *= gam;
+      }
+  }
+  if (flag < 0) param[1] = h11, param[2] = h21, param[3] = h12, param[4] = h22;
+  else if (flag == 0) param[2] = h21, param[3] = h12;
+  else param[1] = h11, param[4] = h22;
+  param[0] = flag;
+  written[0] = true;
+  for (int i = 1; i < 5; ++i) written[i] = flag < 0 || (flag == 0 ? i == 2 || i == 3 : i == 1 || i == 4);
+}
+
+cublasStatus_t rotmg_ex(cublasHandle_t h, void* d1, cudaDataType d1t, void* d2, cudaDataType d2t, void* x1,
+                        cudaDataType x1t, const void* y1, cudaDataType y1t, void* param, cudaDataType pt,
+                        cudaDataType et) {
+  if (!rot_real_type(d1t) || d2t != d1t || x1t != d1t || y1t != d1t || pt != d1t || et != ex_exec(d1t))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { rotmg_ex(h, d1, d1t, d2, d2t, x1, x1t, y1, y1t, param, pt, et); }))
+    return CUBLAS_STATUS_SUCCESS;
+  const size_t e = ex_bytes(pt);
+  auto run = [&](auto zero) {
+    using R = decltype(zero);
+    R a = (R)rot_get(h, d1, d1t).real(), b = (R)rot_get(h, d2, d2t).real(), x = (R)rot_get(h, x1, x1t).real();
+    const R y = (R)rot_get(h, y1, y1t).real();
+    R p[5] = {};
+    bool written[5];
+    rotmg_real(a, b, x, y, p, written);
+    rot_put(h, d1, d1t, a), rot_put(h, d2, d2t, b), rot_put(h, x1, x1t, x);
+    for (int i = 0; i < 5; ++i)
+      if (written[i]) rot_put(h, static_cast<uint8_t*>(param) + i * e, pt, p[i]);
+  };
+  if (et == CUDA_R_64F) run(0.0);
+  else run(0.0f);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasRotEx(cublasHandle_t h, int n, void* x, cudaDataType xType, int incx, void* y,
+                                       cudaDataType yType, int incy, const void* c, const void* s,
+                                       cudaDataType csType, cudaDataType executiontype) {
+  return rot_ex(h, n, x, xType, incx, y, yType, incy, c, s, csType, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasRotEx_64(cublasHandle_t h, int64_t n, void* x, cudaDataType xType, int64_t incx,
+                                          void* y, cudaDataType yType, int64_t incy, const void* c, const void* s,
+                                          cudaDataType csType, cudaDataType executiontype) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return rot_ex(h, (int)n, x, xType, (int)incx, y, yType, (int)incy, c, s, csType, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasRotgEx(cublasHandle_t h, void* a, void* b, cudaDataType abType, void* c, void* s,
+                                        cudaDataType csType, cudaDataType executiontype) {
+  return rotg_ex(h, a, b, abType, c, s, csType, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasRotmEx(cublasHandle_t h, int n, void* x, cudaDataType xType, int incx, void* y,
+                                        cudaDataType yType, int incy, const void* param, cudaDataType paramType,
+                                        cudaDataType executiontype) {
+  return rotm_ex(h, n, x, xType, incx, y, yType, incy, param, paramType, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasRotmEx_64(cublasHandle_t h, int64_t n, void* x, cudaDataType xType, int64_t incx,
+                                           void* y, cudaDataType yType, int64_t incy, const void* param,
+                                           cudaDataType paramType, cudaDataType executiontype) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return rotm_ex(h, (int)n, x, xType, (int)incx, y, yType, (int)incy, param, paramType, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasRotmgEx(cublasHandle_t h, void* d1, cudaDataType d1Type, void* d2,
+                                         cudaDataType d2Type, void* x1, cudaDataType x1Type, const void* y1,
+                                         cudaDataType y1Type, void* param, cudaDataType paramType,
+                                         cudaDataType executiontype) {
+  return rotmg_ex(h, d1, d1Type, d2, d2Type, x1, x1Type, y1, y1Type, param, paramType, executiontype);
+}
+
+// The typed forms, onto the Ex ones (crot's c is real and its s complex).
+#define VGPU_ROT(P, T, CT, ST, XT, CST, SST, ET)                                                                  \
+  VGPU_EXPORT cublasStatus_t cublas##P##rot_v2(cublasHandle_t h, int n, T* x, int incx, T* y, int incy,           \
+                                               const CT* c, const ST* s) {                                        \
+    return rot_core(h, n, x, XT, incx, y, incy, c, CST, s, SST, ET);                                              \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##rot_v2_64(cublasHandle_t h, int64_t n, T* x, int64_t incx, T* y,          \
+                                                  int64_t incy, const CT* c, const ST* s) {                       \
+    if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;                   \
+    return rot_core(h, (int)n, x, XT, (int)incx, y, (int)incy, c, CST, s, SST, ET);                               \
+  }
+VGPU_ROT(S, float, float, float, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F)
+VGPU_ROT(D, double, double, double, CUDA_R_64F, CUDA_R_64F, CUDA_R_64F, CUDA_R_64F)
+VGPU_ROT(C, cuComplex, float, cuComplex, CUDA_C_32F, CUDA_R_32F, CUDA_C_32F, CUDA_C_32F)
+VGPU_ROT(Cs, cuComplex, float, float, CUDA_C_32F, CUDA_R_32F, CUDA_R_32F, CUDA_C_32F)
+VGPU_ROT(Z, cuDoubleComplex, double, cuDoubleComplex, CUDA_C_64F, CUDA_R_64F, CUDA_C_64F, CUDA_C_64F)
+VGPU_ROT(Zd, cuDoubleComplex, double, double, CUDA_C_64F, CUDA_R_64F, CUDA_R_64F, CUDA_C_64F)
+#undef VGPU_ROT
+
+VGPU_EXPORT cublasStatus_t cublasSrotg_v2(cublasHandle_t h, float* a, float* b, float* c, float* s) {
+  return rotg_ex(h, a, b, CUDA_R_32F, c, s, CUDA_R_32F, CUDA_R_32F);
+}
+VGPU_EXPORT cublasStatus_t cublasDrotg_v2(cublasHandle_t h, double* a, double* b, double* c, double* s) {
+  return rotg_ex(h, a, b, CUDA_R_64F, c, s, CUDA_R_64F, CUDA_R_64F);
+}
+VGPU_EXPORT cublasStatus_t cublasCrotg_v2(cublasHandle_t h, cuComplex* a, cuComplex* b, float* c, cuComplex* s) {
+  return rotg_complex(h, a, b, c, s, CUDA_C_32F);
+}
+VGPU_EXPORT cublasStatus_t cublasZrotg_v2(cublasHandle_t h, cuDoubleComplex* a, cuDoubleComplex* b, double* c,
+                                          cuDoubleComplex* s) {
+  return rotg_complex(h, a, b, c, s, CUDA_C_64F);
+}
+VGPU_EXPORT cublasStatus_t cublasSrotm_v2(cublasHandle_t h, int n, float* x, int incx, float* y, int incy,
+                                          const float* param) {
+  return rotm_ex(h, n, x, CUDA_R_32F, incx, y, CUDA_R_32F, incy, param, CUDA_R_32F, CUDA_R_32F);
+}
+VGPU_EXPORT cublasStatus_t cublasDrotm_v2(cublasHandle_t h, int n, double* x, int incx, double* y, int incy,
+                                          const double* param) {
+  return rotm_ex(h, n, x, CUDA_R_64F, incx, y, CUDA_R_64F, incy, param, CUDA_R_64F, CUDA_R_64F);
+}
+VGPU_EXPORT cublasStatus_t cublasSrotm_v2_64(cublasHandle_t h, int64_t n, float* x, int64_t incx, float* y,
+                                             int64_t incy, const float* param) {
+  return cublasRotmEx_64(h, n, x, CUDA_R_32F, incx, y, CUDA_R_32F, incy, param, CUDA_R_32F, CUDA_R_32F);
+}
+VGPU_EXPORT cublasStatus_t cublasDrotm_v2_64(cublasHandle_t h, int64_t n, double* x, int64_t incx, double* y,
+                                             int64_t incy, const double* param) {
+  return cublasRotmEx_64(h, n, x, CUDA_R_64F, incx, y, CUDA_R_64F, incy, param, CUDA_R_64F, CUDA_R_64F);
+}
+VGPU_EXPORT cublasStatus_t cublasSrotmg_v2(cublasHandle_t h, float* d1, float* d2, float* x1, const float* y1,
+                                           float* param) {
+  return rotmg_ex(h, d1, CUDA_R_32F, d2, CUDA_R_32F, x1, CUDA_R_32F, y1, CUDA_R_32F, param, CUDA_R_32F, CUDA_R_32F);
+}
+VGPU_EXPORT cublasStatus_t cublasDrotmg_v2(cublasHandle_t h, double* d1, double* d2, double* x1, const double* y1,
+                                           double* param) {
+  return rotmg_ex(h, d1, CUDA_R_64F, d2, CUDA_R_64F, x1, CUDA_R_64F, y1, CUDA_R_64F, param, CUDA_R_64F, CUDA_R_64F);
 }
