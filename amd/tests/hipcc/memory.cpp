@@ -190,6 +190,19 @@ int main() {
   (void)hipMemcpyDtoH(back.data(), other, 1024);
   check(back[255] == 7, "hipMemcpyPeer copies between devices");
   EXPECT(hipMemcpyPeer(other, 2, words, 0, 1024), hipErrorInvalidDevice, "to a device that is not there, it refuses");
+  // A synchronous copy of another device's memory comes after what that
+  // device's null stream was given: here a memset queued behind a delay.
+  // ROCm's HIP leaves this to timing (a card's memset is done long before
+  // the copy starts; hip-tests' peer copies count on it), and a simulated
+  // memset is slow enough to lose that race, so the copy waits here.
+  delay<<<1, 1>>>(300, rate);
+  (void)hipMemset(words, 0x5A, 1024);
+  (void)hipSetDevice(1);
+  (void)hipMemcpy(other, words, 1024, hipMemcpyDeviceToDevice);
+  (void)hipMemcpy(back.data(), other, 1024, hipMemcpyDeviceToHost);
+  (void)hipSetDevice(0);
+  check(back[0] == 0x5A5A5A5Au && back[255] == 0x5A5A5A5Au,
+        "a copy from another device's memory follows the memset queued there before it");
 
   // ---- Managed memory: advice and prefetches, page by page
   char* managed = nullptr;

@@ -1273,6 +1273,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   int ordinal = 0;
   const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
   RegionSink* const sink = t_sink;
+  const bool called_sync = !async;   // before a device-to-device copy is queued as an asynchronous one
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     d = device(s);
@@ -1313,10 +1314,12 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   const bool to_device = to.mem != nullptr, from_device = from.mem != nullptr;
   // A synchronous copy of another device's memory also comes after what that
   // device's blocking streams were given: it is ordered on the device the
-  // memory is on, as ROCm's HIP orders it, as well as the current one.
-  // A graph's launch runs its copy right here, on its stream's thread.
+  // memory is on, as ROCm's HIP orders it, as well as the current one --
+  // a device-to-device one too, which returns before it is done but not
+  // before what it follows there. A graph's launch runs its copy right here,
+  // on its stream's thread.
   const bool run_here = sink != nullptr;
-  if (!async && !run_here)
+  if (called_sync && !run_here)
     for (const Side* side : {&to, &from})
       if (side->device && side->ordinal != ordinal) drain_device(side->ordinal, true);
   bool wait = !async || run_here;
