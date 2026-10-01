@@ -4929,9 +4929,20 @@ hipError_t hipMemPtrGetInfo(void* ptr, size_t* size) {
 // allocation it falls in.
 // The three yes-or-no attributes are one byte, and the buffer id and range
 // size 32 bits, as ROCm's HIP writes them.
+}  // extern "C"
+namespace {
+bool is_array_handle(const void* p);   // hip_images.inc
+}  // namespace
+extern "C" {
 hipError_t hipPointerGetAttribute(void* data, int attribute, void* ptr) {
   const ApiCall api("hipPointerGetAttribute");
   if (!data || !ptr) return record(state(), hipErrorInvalidValue);
+  // An array's handle, which no allocation holds, is an array: ROCm's HIP
+  // looks the address up among its arrays for the memory type.
+  if (attribute == vgpu::amd::abi::PointerAttributeKind::kPointerMemoryType && is_array_handle(ptr)) {
+    *static_cast<unsigned*>(data) = 10;   // hipMemoryTypeArray
+    return record(state(), hipSuccess);
+  }
   vgpu::amd::abi::PointerAttribute a{};
   if (const hipError_t e = hipPointerGetAttributes(&a, ptr); e != hipSuccess) return e;
   State& s = state();
