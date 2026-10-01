@@ -569,6 +569,30 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating cuStateVec shim symlinks (build/shim/libcustatevec.so.1)")
 
   # ---------------------------------------------------------------------------
+  # libvgpucudss: cuDSS, the sparse direct solver, presented as libcudss.so.0.
+  # Like cuStateVec, NVIDIA's carries a statically linked CUDA runtime that
+  # cannot reach a simulated driver, so the simulator answers the documented
+  # API itself, from its own declarations (nvidia/include/vgpu_cudss.h), and
+  # factors on the host (nvidia/src/cudss_solver.cpp). NVIDIA's exports its
+  # symbols with no version tag, so these carry none: the map only keeps the
+  # solver's internals out of the dynamic symbol table.
+  # ---------------------------------------------------------------------------
+  set(_cudss_map "${CMAKE_BINARY_DIR}/maps/libcudss.so.0.map")
+  file(WRITE "${_cudss_map}" "{\n  global: cudss*;\n  local: *;\n};\n")
+  add_library(vgpucudss SHARED nvidia/src/cudss_api.cpp nvidia/src/cudss_solver.cpp)
+  target_link_libraries(vgpucudss PRIVATE vgpucudart)
+  target_include_directories(vgpucudss PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucudss PROPERTIES OUTPUT_NAME cudss SOVERSION 0 VERSION 0.8)
+  target_link_options(vgpucudss PRIVATE "-Wl,--version-script=${_cudss_map}")
+  add_custom_command(TARGET vgpucudss POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudss.so.0.8"
+            "${CMAKE_BINARY_DIR}/shim/libcudss.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudss.so.0.8"
+            "${CMAKE_BINARY_DIR}/shim/libcudss.so"
+    COMMENT "Creating cuDSS shim symlinks (build/shim/libcudss.so.0)")
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -1240,7 +1264,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
