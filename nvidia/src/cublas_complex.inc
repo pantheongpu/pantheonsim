@@ -7,9 +7,8 @@
 // form, GEMV, the level-1 routines, rank-1 and rank-k updates, triangular
 // multiplies and solves, Hermitian/symmetric products, and batched LU.
 //
-// Also geam and gelsBatched, for the real types as well (at the end).
-//
-// The rank updates her/her2/syr/syr2 and her2k/syr2k too, and the real
+// Also geam, gelsBatched and geqrfBatched, for the real types as well (at the
+// end); the rank updates her/her2/syr/syr2 and her2k/syr2k; and the real
 // level-2 and level-3 routines these templates serve as well (ger, symv,
 // trmv, trsv, symm, syrk, syr2k, trmm). The rot family is in cublas_api.cpp,
 // with the typed level-1 Ex routines whose type handling it shares.
@@ -785,7 +784,7 @@ VGPU_EXPORT cublasStatus_t cublasZdscal_v2(cublasHandle_t h, int n, const double
   });
 }
 
-/* ---- geam and gelsBatched, for all four types ----
+/* ---- geam, gelsBatched and geqrfBatched, for all four types ----
    Written once over std::complex<double>, as the rest of this file is; a real
    matrix is a complex one with no imaginary part, and comes out rounded to its
    own precision. The answers to bad arguments are an RTX 3060's. */
@@ -872,6 +871,37 @@ cublasStatus_t gels_batched(cublasHandle_t h, cublasOperation_t trans, int m, in
   return CUBLAS_STATUS_SUCCESS;
 }
 
+// QR, A = Q R, for each of `batch` m x n matrices, as LAPACK's geqrf
+// leaves it: R on and above the diagonal, the Householder vectors below it
+// (v(0) = 1 implied) and their min(m, n) scalars in the matrix's Tau array.
+// m < n is fine. A bad argument is INVALID_VALUE with *info minus its
+// position as the card numbers it (m -1, n -2, lda -4, the batch size -7);
+// a NULL info is INVALID_VALUE itself.
+template <class T>
+cublasStatus_t geqrf_batched(cublasHandle_t h, int m, int n, T* const Aarray[], int lda, T* const TauArray[],
+                             int* info, int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!info) return CUBLAS_STATUS_INVALID_VALUE;
+  *info = m < 0 ? -1 : n < 0 ? -2 : lda < std::max(1, m) ? -4 : batch < 0 ? -7 : 0;
+  if (*info) return CUBLAS_STATUS_INVALID_VALUE;
+  if (m == 0 || n == 0 || batch == 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=] {
+        int ignored;
+        geqrf_batched<T>(h, m, n, Aarray, lda, TauArray, &ignored, batch);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto pa = fetch<T*>(Aarray, (size_t)batch);
+  const auto pt = fetch<T*>(TauArray, (size_t)batch);
+  for (int b = 0; b < batch; ++b) {
+    CMat a = load_mat(pa[b], lda, n, m);
+    std::vector<cd> tau;
+    vgpu_la::geqrf(a, m, n, &tau);
+    store_mat(pa[b], a, n, m);
+    store_c(pt[b], tau);
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 bool fits_int64(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
 
 }  // namespace
@@ -893,6 +923,10 @@ bool fits_int64(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
                                                     int nrhs, T* const Aarray[], int lda, T* const Carray[],      \
                                                     int ldc, int* info, int* devInfoArray, int batchSize) {       \
     return gels_batched<T>(h, trans, m, n, nrhs, Aarray, lda, Carray, ldc, info, devInfoArray, batchSize);        \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##geqrfBatched(cublasHandle_t h, int m, int n, T* const Aarray[], int lda,   \
+                                                     T* const TauArray[], int* info, int batchSize) {             \
+    return geqrf_batched<T>(h, m, n, Aarray, lda, TauArray, info, batchSize);                                     \
   }
 VGPU_GEAM_GELS(S, float)
 VGPU_GEAM_GELS(D, double)
