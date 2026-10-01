@@ -389,15 +389,18 @@ hipError_t param_2d(const vgpu::amd::abi::Memcpy2D* p, hipStream_t stream, bool 
 // does for a 2D copy to or from an array.
 int memory_type(hipMemcpyKind kind, bool source) {
   using namespace vgpu::amd::abi;
-  switch (kind) {
+  switch (static_cast<int>(kind)) {
     case hipMemcpyHostToHost: return kMemTypeHost;
     case hipMemcpyHostToDevice: return source ? kMemTypeHost : kMemTypeDevice;
     case hipMemcpyDeviceToHost: return source ? kMemTypeDevice : kMemTypeHost;
-    case hipMemcpyDeviceToDevice: return kMemTypeDevice;
+    case hipMemcpyDeviceToDevice:
+    case 1024: return kMemTypeDevice;   // hipMemcpyDeviceToDeviceNoCU
     default: return kMemTypeUnified;
   }
 }
-bool valid_kind(int kind) { return kind >= hipMemcpyHostToHost && kind <= hipMemcpyDefault; }
+// The directions, and hipMemcpyDeviceToDeviceNoCU (1024), a device-to-device
+// copy ROCm's HIP accepts wherever it accepts the others.
+bool valid_kind(int kind) { return (kind >= hipMemcpyHostToHost && kind <= hipMemcpyDefault) || kind == 1024; }
 
 // hipMemcpy2DValidateArray: the rows and bytes inside the array.
 hipError_t check_array_rows(const void* handle, size_t x, size_t y, size_t width, size_t height) {

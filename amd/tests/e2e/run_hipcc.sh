@@ -221,8 +221,8 @@ for run in "gfx1030 rx6900xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/images.$1" 2>&1)
   status=$?
   expect "the $1 image program runs to the end" "0" "$status"
-  expect "every $1 texture and surface check holds" "20 of 20" \
-    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 20"
+  expect "every $1 texture and surface check holds" "21 of 21" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 21"
 done
 
 # RDNA4 on a simulated Radeon RX 9070 XT (hipcc/rdna4.cpp): WMMA in gfx12's

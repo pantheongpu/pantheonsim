@@ -85,6 +85,24 @@ int main() {
   (void)hipMemcpy3D(&c);
   check(part[0] == uint8_t(5 + 9 + 7) && part[10 * 2 + 10 + 9] == uint8_t(14 + 12 + 14),
         "and starts where its position says");
+  // hipMemcpyDeviceToDeviceNoCU is a direction too, device to device.
+  hipPitchedPtr twin{};
+  (void)hipMalloc3D(&twin, make_hipExtent(w, h, d));
+  hipMemcpy3DParms nocu{};
+  nocu.srcPtr = pp;
+  nocu.dstPtr = twin;
+  nocu.extent = make_hipExtent(w, h, d);
+  nocu.kind = hipMemcpyDeviceToDeviceNoCU;
+  EXPECT(hipMemcpy3D(&nocu), hipSuccess, "a 3D copy from device to device without compute units");
+  std::fill(host.begin(), host.end(), 0);
+  c.srcPos = make_hipPos(0, 0, 0);
+  c.srcPtr = twin;
+  c.dstPtr = make_hipPitchedPtr(host.data(), w, w, h);
+  c.extent = make_hipExtent(w, h, d);
+  (void)hipMemcpy3D(&c);
+  check(host[w * h * (d - 1) + w * (h - 1) + w - 1] == uint8_t(w - 1 + 3 * (h - 1) + 7 * (d - 1)), "copies it all");
+  (void)hipFree(twin.ptr);
+  c.srcPtr = pp;
   c.srcPtr.pitch = INT32_MAX;
   EXPECT(hipMemcpy3D(&c), hipErrorInvalidValue, "a pitch as wide as the widest there is, is refused");
   EXPECT(hipMemcpy3D(nullptr), hipErrorInvalidValue, "and no parameters at all");
