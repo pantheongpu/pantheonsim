@@ -4058,7 +4058,10 @@ struct Machine {
     const uint32_t dim = in.dim & 7;
     static const uint32_t kCoords[8] = {1, 2, 3, 3, 2, 3, 3, 4};
     static const uint32_t kSpatial[8] = {1, 2, 3, 2, 1, 2, 2, 2};   // coordinates that are positions, not layers
-    if (dim == 3 || dim >= 6)
+    // A load, store or atomic takes a cube's face as a layer (x, y, face), as
+    // the hardware addresses it; sampling a cube, which picks the face from
+    // a direction, is not modelled (ROCm's HIP makes no cube arrays).
+    if ((dim == 3 && (sample || resinfo)) || dim >= 6)
       throw Error::make(Err::Unsupported, name, " of a cube or multisampled image, which this does not model");
     const uint32_t coords = kCoords[dim], spatial = kSpatial[dim];
     const bool layered = dim == 4 || dim == 5;
@@ -4070,12 +4073,15 @@ struct Machine {
       }
       return false;
     };
+    // What the name says, worked out once rather than per lane.
+    const bool has_o = has("_o"), has_b = has("_b"), has_c = has("_c"), has_d = has("_d"), has_l = has("_l"),
+               has_lz = has("_lz"), has_mip = has("_mip"), has_cl = has("_cl"), has_g16 = has("_g16");
     // Every lane's address words, flattened across the address registers.
     struct Lane {
       uint32_t word[16] = {};
       uint32_t n = 0;
     };
-    std::vector<Lane> lanes(kLanes);
+    std::array<Lane, kLanes> lanes{};
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       for (size_t k = 1; k <= naddr; ++k)
@@ -4092,7 +4098,7 @@ struct Machine {
       double grad[2][3] = {};           // explicit derivatives: d/dx then d/dy of each spatial coordinate
       bool has_grad = false;
     };
-    const bool a16 = in.a16, g16 = in.a16 || has("_g16");
+    const bool a16 = in.a16, g16 = in.a16 || has_g16;
     const auto read_addr = [&](const Lane& l) {
       Addr a;
       uint32_t at = 0;
@@ -4118,16 +4124,16 @@ struct Machine {
       };
       double scratch[8];
       if (sample) {
-        if (has("_o")) group(1, false, false, scratch);   // texel offsets: not modelled yet, and rare
-        if (has("_b")) group(1, a16, true, &a.bias);
-        if (has("_c")) group(1, false, true, scratch);
-        if (has("_d")) {
+        if (has_o) group(1, false, false, scratch);   // texel offsets: not modelled yet, and rare
+        if (has_b) group(1, a16, true, &a.bias);
+        if (has_c) group(1, false, true, scratch);
+        if (has_d) {
           a.has_grad = true;
           for (int v = 0; v < 2; ++v) group(spatial, g16, true, a.grad[v]);
         }
       }
-      const bool lod = has("_l") || has("_mip") || resinfo;
-      const bool cl = has("_cl");
+      const bool lod = has_l || has_mip || resinfo;
+      const bool cl = has_cl;
       double c[6];
       group(resinfo ? 1 : coords + (lod && !resinfo ? 1 : 0) + (cl ? 1 : 0), a16, sample, c);
       if (resinfo) {
@@ -4172,7 +4178,7 @@ struct Machine {
       }
     };
     const uint32_t levels = img.last_level >= img.base_level ? img.last_level - img.base_level + 1 : 1;
-    std::vector<Addr> addrs(kLanes);
+    std::array<Addr, kLanes> addrs{};
     for (uint32_t lane = 0; lane < kLanes; ++lane)
       if (w.exec >> lane & 1) addrs[lane] = read_addr(lanes[lane]);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -4188,7 +4194,7 @@ struct Machine {
       }
       if (!sample) {
         // Whole texel coordinates, and the level for the _mip forms.
-        const uint32_t level = img.base_level + (has("_mip") ? static_cast<uint32_t>(a.lod) : 0);
+        const uint32_t level = img.base_level + (has_mip ? static_cast<uint32_t>(a.lod) : 0);
         const int64_t x = static_cast<int64_t>(a.coord[0]), y = coords > 1 ? static_cast<int64_t>(a.coord[1]) : 0;
         const int64_t z = coords > 2 ? static_cast<int64_t>(a.coord[2]) : 0;
         const int64_t zz = dim == 4 ? y : z, yy = dim == 4 ? 0 : y;   // a 1D array's layer is its second coordinate
@@ -4247,9 +4253,9 @@ struct Machine {
       const bool unnorm = in.unorm || smp.unnormalized;
       const double scale[3] = {unnorm ? 1.0 : double(w0), unnorm ? 1.0 : double(h0), unnorm ? 1.0 : double(d0)};
       double lod = 0;
-      if (has("_l")) {
+      if (has_l) {
         lod = a.lod;
-      } else if (!has("_lz") && !gather) {
+      } else if (!has_lz && !gather) {
         double dx[3] = {}, dy[3] = {};
         if (a.has_grad) {
           for (uint32_t k = 0; k < spatial; ++k) dx[k] = a.grad[0][k], dy[k] = a.grad[1][k];
@@ -4267,7 +4273,7 @@ struct Machine {
       }
       lod += smp.lod_bias + a.bias;
       lod = std::clamp(lod, static_cast<double>(smp.min_lod), static_cast<double>(smp.max_lod));
-      if (has("_cl")) lod = std::max(lod, a.clamp);
+      if (has_cl) lod = std::max(lod, a.clamp);
       const bool linear = lod <= 0 ? smp.mag_linear : smp.min_linear;
       const double top = static_cast<double>(levels - 1);
       const double u = a.coord[0], vv = coords > 1 ? a.coord[1] : 0, r = coords > 2 ? a.coord[2] : 0;

@@ -56,6 +56,7 @@ uint32_t decode_channel(Num n, uint32_t raw, uint32_t width) {
     return width == 32 ? static_cast<int32_t>(v) : static_cast<int32_t>(v << (32 - width)) >> (32 - width);
   };
   switch (n) {
+    case Num::Srgb:
     case Num::Unorm: return as_bits(static_cast<float>(raw) / static_cast<float>(max));
     case Num::Snorm: {
       const float v = static_cast<float>(sign_extend(raw)) / static_cast<float>((uint64_t{1} << (width - 1)) - 1);
@@ -85,6 +86,7 @@ uint32_t encode_channel(Num n, uint32_t v, uint32_t width) {
   const uint64_t max = (uint64_t{1} << width) - 1;
   const uint32_t mask = static_cast<uint32_t>(max);
   switch (n) {
+    case Num::Srgb:
     case Num::Unorm: {
       const float f = std::clamp(as_float(v), 0.0f, 1.0f);
       return static_cast<uint32_t>(std::lround(f * static_cast<float>(max))) & mask;
@@ -166,15 +168,33 @@ const Format kGfx11[] = {
     {Data::D32_32_32_32, Num::Uint}, {Data::D32_32_32_32, Num::Sint}, {Data::D32_32_32_32, Num::Float},
 };
 
+// sRGB's transfer function, each way.
+float srgb_to_linear(float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); }
+float linear_to_srgb(float c) {
+  c = std::clamp(c, 0.0f, 1.0f);
+  return c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// The image formats with sRGB color: 8, 8_8 and 8_8_8_8, at these codes
+// (ROCR-Runtime's resource_nv.h, resource_gfx11.h, resource_gfx12.h).
+uint32_t srgb_base(Gen g) { return g == Gen::Gfx10 ? 128 : 64; }
+
 }  // namespace
 
 Format from_code(uint32_t code, Gen g) {
+  if (code >= srgb_base(g) && code < srgb_base(g) + 3) {
+    static const Data kData[] = {Data::D8, Data::D8_8, Data::D8_8_8_8};
+    return {kData[code - srgb_base(g)], Num::Srgb};
+  }
   const bool gfx11 = g != Gen::Gfx10;
   const Format* t = gfx11 ? kGfx11 : kGfx10;
   const uint32_t n = gfx11 ? std::size(kGfx11) : std::size(kGfx10);
   return code < n ? t[code] : Format{};
 }
 uint32_t code(Format f, Gen g) {
+  if (f.num == Num::Srgb)
+    return f.data == Data::D8 ? srgb_base(g) : f.data == Data::D8_8 ? srgb_base(g) + 1
+           : f.data == Data::D8_8_8_8 ? srgb_base(g) + 2 : 0;
   const bool gfx11 = g != Gen::Gfx10;
   const Format* t = gfx11 ? kGfx11 : kGfx10;
   const uint32_t n = gfx11 ? std::size(kGfx11) : std::size(kGfx10);
@@ -206,6 +226,7 @@ void read_texel(Format f, const uint8_t* bytes, uint32_t out[4]) {
     uint64_t raw = at < 64 ? lo >> at : hi >> (at - 64);
     if (at < 64 && at + w > 64) raw |= hi << (64 - at);
     out[k] = decode_channel(f.num, static_cast<uint32_t>(raw & ((uint64_t{1} << w) - 1)), w);
+    if (f.num == Num::Srgb && k < 3) out[k] = as_bits(srgb_to_linear(as_float(out[k])));
     at += w;
   }
 }
@@ -216,7 +237,8 @@ void write_texel(Format f, const uint32_t in[4], uint8_t* bytes) {
   uint32_t at = 0;
   for (uint32_t k = 0; k < l.count; ++k) {
     const uint32_t w = l.width[k];
-    const uint64_t v = encode_channel(f.num, in[k], w);
+    const uint32_t value = f.num == Num::Srgb && k < 3 ? as_bits(linear_to_srgb(as_float(in[k]))) : in[k];
+    const uint64_t v = encode_channel(f.num, value, w);
     if (at < 64) lo |= v << at;
     if (at + w > 64) hi |= at >= 64 ? v << (at - 64) : v >> (64 - at);
     at += w;

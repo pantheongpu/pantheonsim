@@ -37,8 +37,9 @@ bool texel_format(const hsa_ext_image_format_t& f, im::Format* out, im::Sel sel[
       {S::X, S::Zero, S::Zero, S::Zero}, {S::Y, S::Zero, S::Zero, S::Zero},
   };
   // Channels by order: A R RX RG RGX RA RGB RGBX RGBA BGRA ARGB ABGR, then
-  // the sRGB orders (not modelled), INTENSITY, LUMINANCE, DEPTH.
-  static const int kChannels[20] = {1, 1, 1, 2, 2, 2, 0, 0, 4, 4, 4, 4, 0, 0, 0, 0, 1, 1, 1, 0};
+  // the sRGB orders (of which SRGBA, in 8-bit unorm, is modelled),
+  // INTENSITY, LUMINANCE, DEPTH.
+  static const int kChannels[20] = {1, 1, 1, 2, 2, 2, 0, 0, 4, 4, 4, 4, 0, 0, 4, 0, 1, 1, 1, 0};
   if (f.channel_order >= 20 || !kChannels[f.channel_order]) return false;
   const int n = kChannels[f.channel_order];
   uint32_t bits = 0;
@@ -59,6 +60,10 @@ bool texel_format(const hsa_ext_image_format_t& f, im::Format* out, im::Sel sel[
     default: return false;
   }
   if (f.channel_order == 18 && f.channel_type != 3 && f.channel_type != 15) return false;   // depth: 16-bit unorm or float
+  if (f.channel_order == 14) {   // SRGBA
+    if (f.channel_type != 2) return false;
+    num = im::Num::Srgb;
+  }
   static const im::Data k8[] = {im::Data::D8, im::Data::D8_8, im::Data::Invalid, im::Data::D8_8_8_8};
   static const im::Data k16[] = {im::Data::D16, im::Data::D16_16, im::Data::Invalid, im::Data::D16_16_16_16};
   static const im::Data k32[] = {im::Data::D32, im::Data::D32_32, im::Data::Invalid, im::Data::D32_32_32_32};
