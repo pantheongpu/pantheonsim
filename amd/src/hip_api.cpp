@@ -5515,7 +5515,10 @@ hipError_t hipIpcGetEventHandle(void* handle, hipEvent_t event) {
   const ApiCall api("hipIpcGetEventHandle");
   std::lock_guard<std::mutex> lock(g_event_mutex);
   const Event* e = find_event(event);
-  if (!handle || !e || !e->ipc) return record(state(), hipErrorInvalidValue);
+  if (!handle || !e) return record(state(), hipErrorInvalidValue);
+  // An event made without hipEventInterprocess has no handle; ROCm's HIP says
+  // so as a configuration error (CUDA's says invalid handle).
+  if (!e->ipc) return record(state(), hipErrorInvalidConfiguration);
   IpcEventPayload p{};
   p.magic = kIpcEventMagic;
   p.version = 1;

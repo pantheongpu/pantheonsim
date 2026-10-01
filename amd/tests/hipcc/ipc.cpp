@@ -68,7 +68,7 @@ int main() {
   (void)hipEventCreate(&plain);
   hipIpcEventHandle_t none;
   got = hipIpcGetEventHandle(&none, plain);
-  check(got == hipErrorInvalidValue, "and an event made for this process has none", err(got));
+  check(got == hipErrorInvalidConfiguration, "and an event made for this process has none", err(got));
   hipEvent_t mine = nullptr;
   got = hipIpcOpenEventHandle(&mine, handle);
   check(got == hipErrorInvalidContext, "a process does not open its own event's handle", err(got));
