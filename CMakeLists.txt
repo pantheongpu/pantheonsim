@@ -695,6 +695,11 @@ vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
 target_compile_definitions(test_regs PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_regalloc)
+# cuDSS's sparse direct solver on its own, host arithmetic only: orderings,
+# LU, LDL^T and Cholesky with their pivoting, inertia, on random matrices.
+vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)
+target_sources(test_cudss_solver PRIVATE nvidia/src/cudss_solver.cpp)
+target_include_directories(test_cudss_solver PRIVATE nvidia/src)
 # How many host threads a grid is spread over: the CPUs the process may use,
 # its cgroup's CPU quota included, not the host's count.
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
