@@ -314,6 +314,17 @@ bool gemm_aligned(const void* A, const void* B, const void* C, size_t ab, size_t
   return ok(A, ab) && ok(B, ab) && ok(C, c);
 }
 
+bool known_fill(cublasFillMode_t u) { return u == CUBLAS_FILL_MODE_LOWER || u == CUBLAS_FILL_MODE_UPPER; }
+bool known_side(cublasSideMode_t s) { return s == CUBLAS_SIDE_LEFT || s == CUBLAS_SIDE_RIGHT; }
+bool known_diag(cublasDiagType_t d) { return d == CUBLAS_DIAG_NON_UNIT || d == CUBLAS_DIAG_UNIT; }
+// trsm and trmm: A is m x m from the left, n x n from the right; B is m x n.
+// The card refuses FILL_MODE_FULL here too.
+bool tri3_args_ok(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t t, cublasDiagType_t diag, int m,
+                  int n, int lda, int ldb) {
+  return known_side(side) && known_fill(uplo) && known_op(t) && known_diag(diag) && m >= 0 && n >= 0 &&
+         lda >= std::max(1, side == CUBLAS_SIDE_LEFT ? m : n) && ldb >= std::max(1, m);
+}
+
 template <class T, class Acc>
 cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
                        int m, int n, int k, const Acc* alpha_p, const void* A, int lda,
@@ -505,13 +516,26 @@ VGPU_EXPORT cublasStatus_t cublasDgemm_v2(cublasHandle_t h, cublasOperation_t ta
   return do_gemm<double, double>(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
-VGPU_EXPORT cublasStatus_t cublasSgemmStridedBatched(
-    cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
-    const float* alpha, const float* A, int lda, long long strideA, const float* B, int ldb,
-    long long strideB, const float* beta, float* C, int ldc, long long strideC, int batchCount) {
+// The batched forms: every matrix's arguments are checked once, before any
+// work and even for an empty batch, as the card does.
+namespace {
+
+template <class T>
+cublasStatus_t gemm_one(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                        const T* alpha, const T* A, int lda, const T* B, int ldb, const T* beta, T* C, int ldc) {
+  if constexpr (std::is_same_v<T, float>) return cublasSgemm_v2(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+  else return cublasDgemm_v2(h, ta, tb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+template <class T>
+cublasStatus_t gemm_strided(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                            const T* alpha, const T* A, int lda, long long strideA, const T* B, int ldb,
+                            long long strideB, const T* beta, T* C, int ldc, long long strideC, int batchCount) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!gemm_args_ok(ta, tb, m, n, k, lda, ldb, ldc) || batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
   for (int i = 0; i < batchCount; ++i) {
-    cublasStatus_t s = cublasSgemm_v2(h, ta, tb, m, n, k, alpha, A + i * strideA, lda,
-                                      B + i * strideB, ldb, beta, C + i * strideC, ldc);
+    cublasStatus_t s = gemm_one<T>(h, ta, tb, m, n, k, alpha, A + i * strideA, lda, B + i * strideB, ldb, beta,
+                                   C + i * strideC, ldc);
     if (s != CUBLAS_STATUS_SUCCESS) return s;
   }
   return CUBLAS_STATUS_SUCCESS;
@@ -520,34 +544,60 @@ VGPU_EXPORT cublasStatus_t cublasSgemmStridedBatched(
 // The pointer-array form: each batch entry is an independent matrix rather
 // than a fixed stride apart. The pointers live in device memory, so the array
 // itself has to be read back before it can be walked.
+template <class T>
+cublasStatus_t gemm_batched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                            const T* alpha, const T* const Aarray[], int lda, const T* const Barray[], int ldb,
+                            const T* beta, T* const Carray[], int ldc, int batchCount) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!gemm_args_ok(ta, tb, m, n, k, lda, ldb, ldc) || batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
+  if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(T)), be = hold(h, beta, sizeof(T))] {
+        gemm_batched<T>(h, ta, tb, m, n, k, static_cast<const T*>(al.get()), Aarray, lda, Barray, ldb,
+                        static_cast<const T*>(be.get()), Carray, ldc, batchCount);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto a = fetch<const T*>(Aarray, static_cast<size_t>(batchCount));
+  const auto b = fetch<const T*>(Barray, static_cast<size_t>(batchCount));
+  const auto c = fetch<T*>(Carray, static_cast<size_t>(batchCount));
+  for (int i = 0; i < batchCount; ++i) {
+    cublasStatus_t st = gemm_one<T>(h, ta, tb, m, n, k, alpha, a[i], lda, b[i], ldb, beta, c[i], ldc);
+    if (st != CUBLAS_STATUS_SUCCESS) return st;
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasSgemmStridedBatched(
+    cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+    const float* alpha, const float* A, int lda, long long strideA, const float* B, int ldb,
+    long long strideB, const float* beta, float* C, int ldc, long long strideC, int batchCount) {
+  return gemm_strided<float>(h, ta, tb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC,
+                             batchCount);
+}
+VGPU_EXPORT cublasStatus_t cublasDgemmStridedBatched(
+    cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+    const double* alpha, const double* A, int lda, long long strideA, const double* B, int ldb,
+    long long strideB, const double* beta, double* C, int ldc, long long strideC, int batchCount) {
+  return gemm_strided<double>(h, ta, tb, m, n, k, alpha, A, lda, strideA, B, ldb, strideB, beta, C, ldc, strideC,
+                              batchCount);
+}
 VGPU_EXPORT cublasStatus_t cublasSgemmBatched(cublasHandle_t h, cublasOperation_t ta,
                                               cublasOperation_t tb, int m, int n, int k,
                                               const float* alpha, const float* const Aarray[],
                                               int lda, const float* const Barray[], int ldb,
                                               const float* beta, float* const Carray[], int ldc,
                                               int batchCount) {
-  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (batchCount < 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (batchCount == 0) return CUBLAS_STATUS_SUCCESS;
-  if (!Aarray || !Barray || !Carray) return CUBLAS_STATUS_INVALID_VALUE;
-  if (deferred_to_graph(h, [=, al = hold(h, alpha, sizeof(float)),
-                            be = hold(h, beta, sizeof(float))] {
-        cublasSgemmBatched(h, ta, tb, m, n, k, static_cast<const float*>(al.get()), Aarray, lda,
-                           Barray, ldb, static_cast<const float*>(be.get()), Carray, ldc,
-                           batchCount);
-      }))
-    return CUBLAS_STATUS_SUCCESS;
-  // The three arrays are themselves in device memory; pull the pointers back
-  // before dereferencing them.
-  const auto a = fetch<const float*>(Aarray, static_cast<size_t>(batchCount));
-  const auto b = fetch<const float*>(Barray, static_cast<size_t>(batchCount));
-  const auto c = fetch<float*>(Carray, static_cast<size_t>(batchCount));
-  for (int i = 0; i < batchCount; ++i) {
-    cublasStatus_t st =
-        cublasSgemm_v2(h, ta, tb, m, n, k, alpha, a[i], lda, b[i], ldb, beta, c[i], ldc);
-    if (st != CUBLAS_STATUS_SUCCESS) return st;
-  }
-  return CUBLAS_STATUS_SUCCESS;
+  return gemm_batched<float>(h, ta, tb, m, n, k, alpha, Aarray, lda, Barray, ldb, beta, Carray, ldc, batchCount);
+}
+VGPU_EXPORT cublasStatus_t cublasDgemmBatched(cublasHandle_t h, cublasOperation_t ta,
+                                              cublasOperation_t tb, int m, int n, int k,
+                                              const double* alpha, const double* const Aarray[],
+                                              int lda, const double* const Barray[], int ldb,
+                                              const double* beta, double* const Carray[], int ldc,
+                                              int batchCount) {
+  return gemm_batched<double>(h, ta, tb, m, n, k, alpha, Aarray, lda, Barray, ldb, beta, Carray, ldc, batchCount);
 }
 
 /* ---- batched LU: getrfBatched and getrsBatched ----
@@ -717,8 +767,7 @@ cublasStatus_t trsm_batched(cublasHandle_t h, cublasSideMode_t side, cublasFillM
                             cublasDiagType_t diag, int m, int n, const T* alpha, const T* const Aarray[], int lda,
                             T* const Barray[], int ldb, int batch) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
-  if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, k) || ldb < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!tri3_args_ok(side, uplo, trans, diag, m, n, lda, ldb) || batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
   if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;  // real types
   const T al = scalar(h, alpha);
   if (deferred_to_graph(h, [=] {
@@ -737,8 +786,7 @@ template <class T>
 cublasStatus_t trsm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
                     cublasDiagType_t diag, int m, int n, const T* alpha, const T* A, int lda, T* B, int ldb) {
   if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  const int k = side == CUBLAS_SIDE_LEFT ? m : n;
-  if (m < 0 || n < 0 || lda < std::max(1, k) || ldb < std::max(1, m)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!tri3_args_ok(side, uplo, trans, diag, m, n, lda, ldb)) return CUBLAS_STATUS_INVALID_VALUE;
   if (trans == CUBLAS_OP_C) trans = CUBLAS_OP_T;
   const T al = scalar(h, alpha);
   if (deferred_to_graph(h, [=] { trsm_one<T>(side, uplo, trans, diag, m, n, al, A, lda, B, ldb); }))
@@ -2370,3 +2418,75 @@ VGPU_CHERK_EX(cublasCherk3mEx, float, true)
 VGPU_CHERK_EX(cublasCsyrkEx, cuComplex, false)
 VGPU_CHERK_EX(cublasCsyrk3mEx, cuComplex, false)
 #undef VGPU_CHERK_EX
+
+/* ---- the remaining typed level-1 routines ----
+   copy and swap in single and double precision, i?amin, the complex i?amax
+   and i?amin, and the complex sums of magnitudes and norms (scasum, dzasum,
+   scnrm2, dznrm2), with their _64 forms: each is the Ex routine above at its
+   type, so the conventions are the same (BLAS's walk for a negative
+   increment; nothing for an empty vector, or for a non-positive increment in
+   a reduction). As on the card, none of them refuses a size or an increment. */
+#define VGPU_LEVEL1(P, U, T, XT)                                                                                   \
+  VGPU_EXPORT cublasStatus_t cublasI##P##amin_v2(cublasHandle_t h, int n, const T* x, int incx, int* result) {    \
+    return iamax_ex(h, n, x, XT, incx, result, true);                                                             \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublasI##P##amin_v2_64(cublasHandle_t h, int64_t n, const T* x, int64_t incx,        \
+                                                    int64_t* result) {                                            \
+    if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;                                      \
+    return iamax_ex(h, (int)n, x, XT, (int)incx, result, true);                                                   \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##U##copy_v2_64(cublasHandle_t h, int64_t n, const T* x, int64_t incx, T* y,   \
+                                                   int64_t incy) {                                                \
+    if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;                   \
+    return copy_ex(h, (int)n, x, XT, (int)incx, y, XT, (int)incy, false);                                         \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##U##swap_v2_64(cublasHandle_t h, int64_t n, T* x, int64_t incx, T* y,         \
+                                                   int64_t incy) {                                                \
+    if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;                   \
+    return copy_ex(h, (int)n, x, XT, (int)incx, y, XT, (int)incy, true);                                          \
+  }
+VGPU_LEVEL1(s, S, float, CUDA_R_32F)
+VGPU_LEVEL1(d, D, double, CUDA_R_64F)
+VGPU_LEVEL1(c, C, cuComplex, CUDA_C_32F)
+VGPU_LEVEL1(z, Z, cuDoubleComplex, CUDA_C_64F)
+#undef VGPU_LEVEL1
+
+#define VGPU_REAL_COPY(P, T, XT)                                                                                  \
+  VGPU_EXPORT cublasStatus_t cublas##P##copy_v2(cublasHandle_t h, int n, const T* x, int incx, T* y, int incy) {  \
+    return copy_ex(h, n, x, XT, incx, y, XT, incy, false);                                                        \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##swap_v2(cublasHandle_t h, int n, T* x, int incx, T* y, int incy) {        \
+    return copy_ex(h, n, x, XT, incx, y, XT, incy, true);                                                         \
+  }
+VGPU_REAL_COPY(S, float, CUDA_R_32F)
+VGPU_REAL_COPY(D, double, CUDA_R_64F)
+#undef VGPU_REAL_COPY
+
+#define VGPU_COMPLEX_LEVEL1(P, PR, T, XT, R, RT)                                                                  \
+  VGPU_EXPORT cublasStatus_t cublasI##P##amax_v2(cublasHandle_t h, int n, const T* x, int incx, int* result) {    \
+    return iamax_ex(h, n, x, XT, incx, result, false);                                                            \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublasI##P##amax_v2_64(cublasHandle_t h, int64_t n, const T* x, int64_t incx,        \
+                                                    int64_t* result) {                                            \
+    if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;                                      \
+    return iamax_ex(h, (int)n, x, XT, (int)incx, result, false);                                                  \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##PR##asum_v2(cublasHandle_t h, int n, const T* x, int incx, R* result) {      \
+    return asum_ex(h, n, x, XT, incx, result, RT, XT);                                                            \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##PR##asum_v2_64(cublasHandle_t h, int64_t n, const T* x, int64_t incx,        \
+                                                    R* result) {                                                  \
+    if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;                                      \
+    return asum_ex(h, (int)n, x, XT, (int)incx, result, RT, XT);                                                  \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##PR##nrm2_v2(cublasHandle_t h, int n, const T* x, int incx, R* result) {      \
+    return nrm2_ex(h, n, x, XT, incx, result, RT, RT);                                                            \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##PR##nrm2_v2_64(cublasHandle_t h, int64_t n, const T* x, int64_t incx,        \
+                                                    R* result) {                                                  \
+    if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;                                      \
+    return nrm2_ex(h, (int)n, x, XT, (int)incx, result, RT, RT);                                                  \
+  }
+VGPU_COMPLEX_LEVEL1(c, Sc, cuComplex, CUDA_C_32F, float, CUDA_R_32F)
+VGPU_COMPLEX_LEVEL1(z, Dz, cuDoubleComplex, CUDA_C_64F, double, CUDA_R_64F)
+#undef VGPU_COMPLEX_LEVEL1
