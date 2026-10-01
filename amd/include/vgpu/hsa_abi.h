@@ -607,6 +607,30 @@ typedef struct hsa_amd_memory_access_desc_s {
   hsa_agent_t agent_handle;
 } hsa_amd_memory_access_desc_t;
 typedef struct hsa_amd_ipc_memory_s { uint32_t handle[8]; } hsa_amd_ipc_memory_t;
+enum {
+  HSA_AMD_SVM_ATTRIB_GLOBAL_FLAG = 0,
+  HSA_AMD_SVM_ATTRIB_READ_ONLY = 1,
+  HSA_AMD_SVM_ATTRIB_HIVE_LOCAL = 2,
+  HSA_AMD_SVM_ATTRIB_MIGRATION_GRANULARITY = 3,
+  HSA_AMD_SVM_ATTRIB_PREFERRED_LOCATION = 4,
+  HSA_AMD_SVM_ATTRIB_PREFETCH_LOCATION = 5,
+  HSA_AMD_SVM_ATTRIB_READ_MOSTLY = 6,
+  HSA_AMD_SVM_ATTRIB_GPU_EXEC = 7,
+  HSA_AMD_SVM_ATTRIB_AGENT_ACCESSIBLE = 0x200,
+  HSA_AMD_SVM_ATTRIB_AGENT_ACCESSIBLE_IN_PLACE = 0x201,
+  HSA_AMD_SVM_ATTRIB_AGENT_NO_ACCESS = 0x202,
+  HSA_AMD_SVM_ATTRIB_ACCESS_QUERY = 0x203
+};
+typedef struct hsa_amd_svm_attribute_pair_s {
+  uint64_t attribute;  /* hsa_amd_svm_attribute_t */
+  uint64_t value;
+} hsa_amd_svm_attribute_pair_t;
+hsa_status_t hsa_amd_svm_attributes_set(void* ptr, size_t size, hsa_amd_svm_attribute_pair_t* attribute_list,
+                                        size_t attribute_count);
+hsa_status_t hsa_amd_svm_attributes_get(void* ptr, size_t size, hsa_amd_svm_attribute_pair_t* attribute_list,
+                                        size_t attribute_count);
+hsa_status_t hsa_amd_svm_prefetch_async(void* ptr, size_t size, hsa_agent_t agent, uint32_t num_dep_signals,
+                                        const hsa_signal_t* dep_signals, hsa_signal_t completion_signal);
 hsa_status_t hsa_amd_vmem_address_reserve(void** va, size_t size, uint64_t address, uint64_t flags);
 hsa_status_t hsa_amd_vmem_address_reserve_align(void** va, size_t size, uint64_t address, uint64_t alignment,
                                                 uint64_t flags);

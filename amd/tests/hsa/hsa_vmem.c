@@ -13,10 +13,12 @@
 #include "vgpu/hsa_abi.h"
 #endif
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -141,7 +143,43 @@ int main(void) {
   check("a handle no process made is refused",
         hsa_amd_ipc_memory_attach(&bad, 4096, 1, &gpu, &nothing) != HSA_STATUS_SUCCESS);
   MUST(hsa_amd_memory_pool_free(buf));
-  (void)cpu;
+
+  /* SVM: host pages given to the GPU, advised, queried and prefetched. */
+  bool svm = false;
+  MUST(hsa_system_get_info((hsa_system_info_t)HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, &svm));
+  const size_t page = 4096, pages = 8;
+  char* host = (char*)mmap(NULL, pages * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  hsa_amd_svm_attribute_pair_t set[] = {{HSA_AMD_SVM_ATTRIB_AGENT_ACCESSIBLE, gpu.handle},
+                                        {HSA_AMD_SVM_ATTRIB_READ_MOSTLY, 1},
+                                        {HSA_AMD_SVM_ATTRIB_PREFERRED_LOCATION, gpu.handle}};
+  MUST(hsa_amd_svm_attributes_set(host, 4 * page, set, 3));
+  hsa_amd_svm_attribute_pair_t get[] = {{HSA_AMD_SVM_ATTRIB_READ_MOSTLY, 0},
+                                        {HSA_AMD_SVM_ATTRIB_PREFERRED_LOCATION, 0},
+                                        {HSA_AMD_SVM_ATTRIB_ACCESS_QUERY, gpu.handle},
+                                        {HSA_AMD_SVM_ATTRIB_ACCESS_QUERY, cpu.handle}};
+  MUST(hsa_amd_svm_attributes_get(host, 4 * page, get, 4));
+  check("the runtime has SVM, and a range's advice and access read back as they were set",
+        svm && get[0].value == 1 && get[1].value == gpu.handle && get[2].attribute == HSA_AMD_SVM_ATTRIB_AGENT_ACCESSIBLE &&
+            get[2].value == gpu.handle && get[3].attribute == HSA_AMD_SVM_ATTRIB_AGENT_NO_ACCESS);
+  hsa_amd_svm_attribute_pair_t mixed[] = {{HSA_AMD_SVM_ATTRIB_READ_MOSTLY, 7},
+                                          {HSA_AMD_SVM_ATTRIB_PREFERRED_LOCATION, 7}};
+  MUST(hsa_amd_svm_attributes_get(host + 2 * page, 4 * page, mixed, 2));
+  check("a range advised only in part reads as not uniform", mixed[0].value == 0 && mixed[1].value == 0);
+  hsa_signal_t done;
+  MUST(hsa_signal_create(1, 0, NULL, &done));
+  /* Not page-aligned: the driver keeps whole pages, so every page it touches goes. */
+  MUST(hsa_amd_svm_prefetch_async(host + 100, pages * page - 200, gpu, 0, NULL, done));
+  const hsa_signal_value_t left =
+      hsa_signal_wait_scacquire(done, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
+  hsa_amd_svm_attribute_pair_t where = {HSA_AMD_SVM_ATTRIB_PREFETCH_LOCATION, 0};
+  MUST(hsa_amd_svm_attributes_get(host, pages * page, &where, 1));
+  check("a prefetch completes its signal, and each page it touched says where it went", left == 0 && where.value == gpu.handle);
+  host[3] = 42;   /* host pages given to the GPU stay the host's */
+  uint32_t seen = 0;
+  MUST(hsa_memory_copy(&seen, host, 4));
+  check("host pages given to a GPU are still the host's", (seen >> 24) == 42);
+  MUST(hsa_signal_destroy(done));
+  munmap(host, pages * page);
   MUST(hsa_shut_down());
   return failures ? 1 : 0;
 }
