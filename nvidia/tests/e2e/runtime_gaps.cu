@@ -115,6 +115,9 @@ static void attach() {
   cudaFree(dm);
 }
 
+// CUDA 13 headers: cudaGraphNodeParams arrived in 12.2, and cudaGraphAddNode
+// took its edge-data argument in 13.0, so older toolkits compile none of this.
+#if CUDART_VERSION >= 13000
 // ---- cudaGraphAddNode ----
 static void add_node() {
   cudaGraph_t g, g2, g3;
@@ -233,6 +236,7 @@ static void add_node() {
   cudaEventDestroy(ev);
   cudaFree(d);
 }
+#endif
 
 // ---- 3D peer copies with arrays ----
 static void peer_3d() {
@@ -400,7 +404,9 @@ int main() {
   }
   array_copies();
   attach();
+#if CUDART_VERSION >= 13000
   add_node();
+#endif
   peer_3d();
   host_flags();
   capabilities();
