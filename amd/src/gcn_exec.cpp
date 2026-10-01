@@ -684,11 +684,12 @@ struct Machine {
   // an integer constant is its sign-extended 32 bits, so its high half is
   // their top; a float constant is the half in the low 16 bits with zero
   // above. The compiler asks for a constant in both halves by pointing the
-  // high result at the low half. A literal's second half is not modelled.
-  static uint16_t constant_half(const Inst& in, const Operand& o, uint32_t top) {
+  // high result at the low half. A literal (RDNA's; gfx9's packed
+  // instructions take none) is the whole pair: its top 16 bits are the high
+  // half, as LLVM encodes a packed constant (3.0 in both halves is
+  // 0x42004200).
+  static uint16_t constant_half(const Inst&, const Operand& o, uint32_t top) {
     if (o.kind == OperandKind::InlineFloat) return top ? 0 : as_bits(static_cast<_Float16>(o.fvalue));
-    if (top && o.kind == OperandKind::Literal)
-      throw Error::make(Err::Unsupported, in.name, " takes the second half of a literal, which this does not model");
     return static_cast<uint16_t>(static_cast<uint32_t>(o.value) >> (16 * top));
   }
   // Source k's 16 bits for the low result (half 0) or the high one, as the

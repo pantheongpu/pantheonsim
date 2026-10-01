@@ -460,6 +460,17 @@ VTEST(rdna_shader_cycles_count_up) {
   VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
 }
 
+// RDNA's packed 16-bit instructions take a literal as the whole pair: the
+// high result reads its top 16 bits (hipRTC's fp16 header test builds
+// v_dot2_f32_f16 with 0x42004200, 3.0 in both halves).
+VTEST(rdna_packed_literals_give_each_half_its_own_16_bits) {
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(8);
+  const std::vector<uint32_t> r = run(object("asm_literal", "gfx1100"), "packed_literals", mem, out, 2, {out});
+  VCHECK_EQ(r[0], f(9.0f));
+  VCHECK_EQ(r[1], 0x46004400u);
+}
+
 // Code built for an RDNA generic target (gfx11-generic, gfx12-generic) runs
 // as its family's: hip-tests' hipModuleLoadFatBinary loads such bundles, and
 // they ran as CDNA code before.
