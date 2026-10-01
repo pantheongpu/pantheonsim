@@ -954,6 +954,11 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
         in.offset = static_cast<int32_t>(bits(w, 15, 0));
       }
       in.gds = bits(w, 17, 17);
+      // gfx11 renamed ds_cmpst to ds_cmpstore and swapped its data: DATA0 is
+      // the value stored and DATA1 the one compared, as a buffer or flat
+      // compare-and-swap has them. gfx9's (which the executor runs) compares
+      // with DATA0.
+      if (std::string_view(r.name).rfind("ds_cmpstore", 0) == 0 && in.src.size() == 3) std::swap(in.src[1], in.src[2]);
       break;
     case Enc::Flat: {
       in.offset = static_cast<int32_t>(bits(w, 12, 0) << 19) >> 19;   // 13 bits, signed
@@ -1295,8 +1300,11 @@ std::string one(const Inst& i) {
     return s;
   }
   const bool scratch_no_addr = i.enc == Enc::Flat && i.segment == Inst::Segment::Scratch && !i.has_vaddr;
+  // ds_cmpstore's data were put in gfx9's order for the executor; printed
+  // in the order the instruction has them.
+  const bool cmpstore = i.enc == Enc::Ds && name.rfind("ds_cmpstore", 0) == 0 && i.src.size() == 3;
   for (size_t k = 0; k < i.src.size(); ++k) {
-    const Operand& o = i.src[k];
+    const Operand& o = cmpstore && k ? i.src[3 - k] : i.src[k];
     if (o.hidden) continue;
     if (i.enc == Enc::Flat && k == 0 && scratch_no_addr && (o.kind == OperandKind::Vgpr)) {
       put("off");

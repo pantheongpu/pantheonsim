@@ -129,6 +129,28 @@ VTEST(a_float_atomic_collects_every_lane) {
   for (int i = 0; i < kN; ++i) VCHECK_EQ(out[i], want[i & 7]);
 }
 
+// gfx11 and gfx12 name it ds_cmpstore and take the value stored first and the
+// one compared second, the other way round from gfx9's ds_cmpst: read in
+// gfx9's order, every compare misses and the loops add nothing.
+VTEST(compare_and_swap_loops_collect_every_lane_and_a_miss_stores_nothing) {
+  const amd::CodeObject o = object();
+  MemoryManager mem(64ull << 20);
+  std::vector<uint32_t> in(kN);
+  for (int i = 0; i < kN; ++i) in[i] = 3 * i + 1;
+  const uint64_t pin = upload(mem, in), psums = mem.alloc(kN * 4), plongs = mem.alloc(kN * 8),
+                 pmissed = mem.alloc(kN * 4);
+  run(o, "cas_in_lds", mem, {pin, psums, plongs, pmissed, static_cast<uint64_t>(kN)});
+  uint32_t want[8] = {};
+  for (int i = 0; i < kN; ++i) want[i & 7] += in[i];
+  const std::vector<uint32_t> sums = download<uint32_t>(mem, psums, kN), missed = download<uint32_t>(mem, pmissed, kN);
+  const std::vector<uint64_t> longs = download<uint64_t>(mem, plongs, kN);
+  for (int i = 0; i < kN; ++i) {
+    VCHECK_EQ(sums[i], want[i & 7]);
+    VCHECK_EQ(longs[i], uint64_t{want[i & 7]} << 32 | want[i & 7]);
+    VCHECK_EQ(missed[i], want[i & 7]);
+  }
+}
+
 VTEST(a_butterfly_leaves_every_lane_with_its_groups_sum) {
   const amd::CodeObject o = object();
   MemoryManager mem(64ull << 20);
