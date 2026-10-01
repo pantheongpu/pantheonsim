@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <dlfcn.h>
@@ -34,12 +35,14 @@
 #include <unistd.h>
 #include <vector>
 
+#include "vgpu/amd_image.hpp"
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_chip.hpp"
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "vgpu/amd_kfd.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
@@ -378,14 +381,69 @@ hipError_t ensure_runtime(State& s) {
   int count = 1;
   if (const char* c = std::getenv("VGPU_DEVICE_COUNT"); c && *c) count = std::atoi(c);
   if (count < 1) count = 1;
+  vgpu::DeviceProfile p;
   try {
-    vgpu::DeviceProfile p = vgpu::load_gpu(id);
+    p = vgpu::load_gpu(id);
+  } catch (const std::exception& e) {
+    return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
+  }
+  // The devices a program is shown, as ROCm shows them: ROCR_VISIBLE_DEVICES
+  // picks from the machine's, then HIP_VISIBLE_DEVICES (or
+  // CUDA_VISIBLE_DEVICES) from those -- each a list read up to the first
+  // entry that names no device. An entry is an index, or a UUID: "GPU-" and
+  // the hex of either the HSA agent's UUID or KFD's unique_id, which is what
+  // Ollama passes. None shown is no device.
+  const int machine = count;
+  const auto uuid_of = [&](const std::string& item) -> int {
+    if (item.rfind("GPU-", 0) != 0 || item.size() == 4) return -1;
+    char* end = nullptr;
+    const unsigned long long want = std::strtoull(item.c_str() + 4, &end, 16);
+    if (*end) return -1;
+    for (int i = 0; i < machine; ++i) {
+      vgpu::telemetry::DeviceSample d;
+      vgpu::telemetry::describe_device(p, i, &d);
+      if (want == 0x5647505500000000ull + static_cast<unsigned>(i) || want == vgpu::amd::kfd_unique_id(d.uuid))
+        return i;
+    }
+    return -1;
+  };
+  std::vector<int> visible(static_cast<size_t>(machine));
+  for (int i = 0; i < machine; ++i) visible[static_cast<size_t>(i)] = i;
+  const auto shown = [&](const char* var) {
+    const char* v = std::getenv(var);
+    if (!v) return;
+    std::vector<int> picked;
+    std::stringstream list(v);
+    for (std::string item; std::getline(list, item, ',');) {
+      int at = -1;   // a position in `visible`
+      if (!item.empty() && item.find_first_not_of("0123456789") == std::string::npos) {
+        at = std::atoi(item.c_str());
+        if (at >= static_cast<int>(visible.size())) at = -1;
+      } else if (const int dev = uuid_of(item); dev >= 0) {
+        const auto it = std::find(visible.begin(), visible.end(), dev);
+        if (it != visible.end()) at = static_cast<int>(it - visible.begin());
+      }
+      if (at < 0) break;
+      const int dev = visible[static_cast<size_t>(at)];
+      if (std::find(picked.begin(), picked.end(), dev) != picked.end()) break;
+      picked.push_back(dev);
+    }
+    visible = picked;
+  };
+  shown("ROCR_VISIBLE_DEVICES");
+  shown(std::getenv("HIP_VISIBLE_DEVICES") ? "HIP_VISIBLE_DEVICES" : "CUDA_VISIBLE_DEVICES");
+  count = static_cast<int>(visible.size());
+  if (count < 1) return fail(hipErrorNoDevice, "no device is visible (ROCR_VISIBLE_DEVICES, HIP_VISIBLE_DEVICES)");
+  try {
     if (p.vendor != "amd")
       return fail(hipErrorInvalidDevice, "VGPU_GPU=" + id +
                                              " is not an AMD GPU, and HIP runs on AMD GPUs. Set VGPU_GPU to an "
                                              "amd/ profile (for example VGPU_GPU=amd/mi300x).");
     vgpu::apply_vram_override(p);
-    s.rt = std::make_unique<vgpu::runtime::Runtime>(p, count);
+    // Each device shown is the machine's device the lists picked: logical
+    // device 0 of HIP_VISIBLE_DEVICES=1 is the machine's device 1, with its
+    // identity, telemetry and address window.
+    s.rt = std::make_unique<vgpu::runtime::Runtime>(p, count, visible, machine);
     s.profile_id = p.id;
   } catch (const std::exception& e) {
     return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
@@ -623,23 +681,29 @@ hipError_t drain_device(int device, bool blocking_only = false) {
 hipError_t build_kernargs(const Kernel& k, void** params, void** extra, std::vector<uint8_t>* out) {
   out->assign(k.kernarg_size, 0);
   if (extra) {
+    // The buffer holds the kernel's own arguments, as many bytes of them as
+    // its metadata says -- which is what ROCm's HIP copies, whatever the size
+    // beside it says (hip-tests' RTC reduce passes an int's 4 there, for 28
+    // bytes of arguments, where HIP reads a size_t).
     const void* buffer = nullptr;
-    size_t size = 0;
     for (size_t i = 0; extra[i] != HIP_LAUNCH_PARAM_END; ++i) {
       if (extra[i] == HIP_LAUNCH_PARAM_BUFFER_POINTER) buffer = extra[++i];
-      else if (extra[i] == HIP_LAUNCH_PARAM_BUFFER_SIZE) size = *static_cast<size_t*>(extra[++i]);
+      else if (extra[i] == HIP_LAUNCH_PARAM_BUFFER_SIZE) ++i;
       else return fail(hipErrorInvalidValue, "extra[] holds something that is not a launch parameter");
     }
     if (!buffer) return fail(hipErrorInvalidValue, "extra[] has no argument buffer");
-    if (size > out->size()) out->resize(size);
-    std::memcpy(out->data(), buffer, size ? size : out->size());
+    size_t explicit_bytes = 0;
+    for (const vgpu::amd::KernelArg& a : k.args)
+      if (!a.hidden()) explicit_bytes = std::max<size_t>(explicit_bytes, a.offset + a.size);
+    if (k.args.empty()) explicit_bytes = out->size();   // no metadata to say: all of it
+    std::memcpy(out->data(), buffer, std::min(explicit_bytes, out->size()));
     return hipSuccess;
   }
   if (!params) {
-    // A kernel that takes nothing needs neither.
-    return k.kernarg_size && !k.args.empty()
-               ? fail(hipErrorInvalidValue, "the kernel takes arguments, and the launch passed none")
-               : hipSuccess;
+    // A kernel that takes nothing of the program's needs neither: what the
+    // compiler adds (hidden arguments) the runtime fills in.
+    const bool takes = std::any_of(k.args.begin(), k.args.end(), [](const vgpu::amd::KernelArg& a) { return !a.hidden(); });
+    return takes ? fail(hipErrorInvalidValue, "the kernel takes arguments, and the launch passed none") : hipSuccess;
   }
   for (size_t i = 0; i < k.args.size(); ++i) {
     const vgpu::amd::KernelArg& a = k.args[i];
@@ -686,14 +750,16 @@ const Stream* find_stream(State& s, hipStream_t stream, Stream* null_stream);
 // there, is the wrong value. A packet an HSA program puts on a queue goes to
 // the hardware as it is, and none of this is asked of it. The caller holds
 // s.mutex.
+// `grid_limits` false skips the grid's own limits: hipExtModuleLaunchKernel's
+// grid is counted in work-items, and ROCm's HIP takes any it is given.
 hipError_t check_launch(State& s, int ordinal, const Kernel& kernel, vgpu::amd::abi::Dim3 grid,
-                        vgpu::amd::abi::Dim3 block, size_t shared, hipStream_t stream) {
+                        vgpu::amd::abi::Dim3 block, size_t shared, hipStream_t stream, bool grid_limits = true) {
   if (!block.x || !block.y || !block.z || !grid.x || !grid.y || !grid.z) return hipErrorInvalidConfiguration;
   const vgpu::Limits& lim = s.rt->device(ordinal).profile().limits;
   const uint32_t bdim[3] = {block.x, block.y, block.z}, gdim[3] = {grid.x, grid.y, grid.z};
   for (int i = 0; i < 3; ++i) {
     if (lim.max_block_dim[i] && bdim[i] > lim.max_block_dim[i]) return hipErrorInvalidConfiguration;
-    if (lim.max_grid_dim[i] && gdim[i] > lim.max_grid_dim[i]) return hipErrorInvalidConfiguration;
+    if (grid_limits && lim.max_grid_dim[i] && gdim[i] > lim.max_grid_dim[i]) return hipErrorInvalidConfiguration;
   }
   const uint64_t threads = uint64_t{block.x} * block.y * block.z;
   if (lim.max_threads_per_block && threads > lim.max_threads_per_block) return hipErrorInvalidConfiguration;
@@ -741,8 +807,10 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
   job->cooperative = cooperative;
   job->hostcall = hostcall.get();
   const auto reach = [&](int to) {
-    if (job->peers.size() <= static_cast<size_t>(to)) job->peers.resize(static_cast<size_t>(to) + 1);
-    job->peers[static_cast<size_t>(to)] = &s.rt->device(to).memory();
+    // By the peer's address window: its physical device's (vgpu/memory.hpp).
+    const size_t window = static_cast<size_t>(s.rt->device(to).physical());
+    if (job->peers.size() <= window) job->peers.resize(window + 1);
+    job->peers[window] = &s.rt->device(to).memory();
   };
   for (const auto& [from, to] : s.peers)
     if (from == ordinal) reach(to);
@@ -889,6 +957,7 @@ void place(Module& m, vgpu::MemoryManager& mem) {
   if (m.object.linked) {
     m.code_size = m.object.image.size();
     m.code_base = mem.alloc(m.object.image.empty() ? 1 : m.object.image.size());
+    vgpu::amd::relocate_image(m.object, m.code_base);   // its global offset table, now it has an address
     if (!m.object.image.empty()) mem.write(m.code_base, m.object.image.data(), m.object.image.size());
     m.globals = m.code_base;
     // The device has the image now, and nothing reads the host's copy again:
@@ -1055,7 +1124,13 @@ hipError_t host_alloc(void** ptr, size_t size, std::map<uint64_t, size_t>& m, un
   if (n > (size_t{1} << 47)) return record(s, hipErrorOutOfMemory);   // more than any host has
   void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
   if (!p) return record(s, hipErrorOutOfMemory);
-  map_host_everywhere(s, p, n);
+  // Zeroed, as ROCm's is: its pinned memory is pages the kernel gives the
+  // driver fresh, and programs (hip-tests' atomics among them) read it
+  // before writing it.
+  std::memset(p, 0, (n + 4095) / 4096 * 4096);
+  // Devices reach it in whole pages, as a card maps it: a kernel's 8-byte
+  // atomic on a 4-byte allocation stays inside the page.
+  map_host_everywhere(s, p, (n + 4095) / 4096 * 4096);
   std::lock_guard<std::mutex> host_lock(g_host_mutex);
   m[reinterpret_cast<uint64_t>(p)] = n;
   g_host_flags[reinterpret_cast<uint64_t>(p)] = flags;
@@ -1390,7 +1465,10 @@ hipError_t hipGetDeviceCount(int* count) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!count) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) {
+    if (e == hipErrorNoDevice) *count = 0;
+    return record(s, e);
+  }
   *count = s.rt->device_count();
   return record(s, hipSuccess);
 }
@@ -1691,7 +1769,7 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
 
 hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
   const ApiCall api("hipModuleLoad");
-  if (!path) return hipErrorInvalidValue;
+  if (!module || !path || !*path) return record(state(), hipErrorInvalidValue);
   std::ifstream in(path, std::ios::binary);
   if (!in) return fail(hipErrorFileNotFound, std::string("no code object at ") + path);
   const std::string bytes((std::istreambuf_iterator<char>(in)), {});
@@ -1702,6 +1780,7 @@ hipError_t hipModuleLoad(hipModule_t* module, const char* path) {
 hipError_t hipModuleUnload(hipModule_t module) {
   const ApiCall api("hipModuleUnload");
   State& s = state();
+  if (!module) return record(s, hipErrorInvalidResourceHandle);
   // Its kernels may still be queued or running: unloading waits for the device.
   if (s.rt) {
     int ordinal = 0;
@@ -1750,7 +1829,8 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
   const ApiCall api("hipModuleGetGlobal");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!module || !name) return record(s, hipErrorInvalidValue);
+  if (!module) return record(s, hipErrorInvalidResourceHandle);
+  if (!name || !*name || (!dptr && !bytes)) return record(s, hipErrorInvalidValue);
   Module* m = reinterpret_cast<Module*>(module);
   const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, name);
   if (!g) return record(s, fail(hipErrorNotFound, std::string("the module has no variable named ") + name));
@@ -1780,13 +1860,29 @@ hipError_t module_launch(hipFunction_t f, unsigned int gx, unsigned int gy, unsi
                          void** extra, const uint32_t* grid_items) {
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
-  if (!f) return record(s, hipErrorInvalidValue);
+  if (!f) return record(s, hipErrorInvalidResourceHandle);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
   Function* fn = reinterpret_cast<Function*>(f);
-  if (const hipError_t e = check_launch(s, s.current, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, stream);
-      e != hipSuccess)
-    return record(s, e);
+  // hipModuleLaunchKernel answers a launch the device cannot take as a wrong
+  // value, as ROCm's does; hipExtModuleLaunchKernel (whose grid is in
+  // work-items) as a wrong configuration.
+  hipError_t e = check_launch(s, s.current, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, stream, !grid_items);
+  if (e == hipErrorInvalidConfiguration && !grid_items) e = hipErrorInvalidValue;
+  if (e != hipSuccess) return record(s, e);
+  // The arguments come one way or the other, not both.
+  if (params && extra) return record(s, fail(hipErrorInvalidValue, "a launch passed both kernelParams and extra"));
+  // A stream of another device's is not this device's to launch on.
+  if (stream) {
+    Stream null_stream;
+    if (const Stream* st = find_stream(s, stream, &null_stream); st && st->device != s.current)
+      return record(s, fail(hipErrorInvalidResourceHandle, "the stream belongs to another device"));
+  }
+  // A grid of work-items that is not a whole number of work-groups, for a
+  // kernel built for uniform ones (as clang builds HIP's by default).
+  if (grid_items && fn->kernel->uniform_work_group_size && (grid_items[0] || grid_items[1] || grid_items[2]))
+    return record(s, fail(hipErrorInvalidValue, "the kernel was built for uniform work-groups, and the grid is "
+                                                "not a whole number of them"));
   std::vector<uint8_t> args;
   if (const hipError_t e = build_kernargs(*fn->kernel, params, extra, &args); e != hipSuccess)
     return record(s, e);
@@ -1825,6 +1921,10 @@ const ErrorText* error_text(int e) {
 #undef E
     return t;
   }();
+  // ROCm 7.1's own HIP knows neither texture code its header names
+  // (hipErrorInvalidChannelDescriptor, hipErrorInvalidTexture): to it they
+  // are unknown errors.
+  if (e == 911 || e == 912) return nullptr;
   const auto it = table.find(e);
   return it == table.end() ? nullptr : &it->second;
 }
@@ -2345,7 +2445,48 @@ namespace {
 
 // What a device is, in the layout the HIP headers give it: what
 // hipGetDeviceProperties returns and hipDeviceGetAttribute answers from.
-void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props) {
+// HIP's version of an AMD device is its gfx version's first two parts:
+// gfx942 is 9.4, gfx90a 9.0 ("gfx" + major + minor digit + stepping).
+void hip_version(const vgpu::DeviceProfile& p, int* major, int* minor) {
+  *major = p.cc_major;
+  *minor = p.cc_minor;
+  if (p.gcn_arch.size() >= 6 && p.gcn_arch.rfind("gfx", 0) == 0) {
+    const std::string digits = p.gcn_arch.substr(3);
+    *major = std::atoi(digits.substr(0, digits.size() - 2).c_str());
+    *minor = static_cast<int>(std::strtol(digits.substr(digits.size() - 2, 1).c_str(), nullptr, 16));
+  }
+}
+
+// A Radeon device's texture and surface limits, as ROCm's HIP reports them
+// from its image runtime's (hip_images.inc): no cubemaps, gathers or
+// alternate 3D sizes.
+// Whether a device has texture units: the Radeon targets.
+bool has_images(const vgpu::DeviceProfile& p) {
+  return p.gcn_arch.rfind("gfx10", 0) == 0 || p.gcn_arch.rfind("gfx11", 0) == 0 ||
+         p.gcn_arch.rfind("gfx12", 0) == 0;
+}
+void fill_texture_limits(vgpu::amd::abi::DevicePropR0600* props) {
+  constexpr int k1D = 16384, k2D = 16384, k3D = 16384, k3DDepth = 8192, kLayers = 8192;
+  props->maxTexture1DLinear = props->maxTexture1DMipmap = INT32_MAX;   // 16 bytes x 2^32 - 1 elements, capped
+  props->maxTexture1D = props->maxSurface1D = k1D;
+  props->maxTexture2D[0] = props->maxSurface2D[0] = k2D;
+  props->maxTexture2D[1] = props->maxSurface2D[1] = k2D;
+  props->maxTexture3D[0] = props->maxSurface3D[0] = k3D;
+  props->maxTexture3D[1] = props->maxSurface3D[1] = k3D;
+  props->maxTexture3D[2] = props->maxSurface3D[2] = k3DDepth;
+  props->maxTexture1DLayered[0] = props->maxSurface1DLayered[0] = k1D;
+  props->maxTexture1DLayered[1] = props->maxSurface1DLayered[1] = kLayers;
+  props->maxTexture2DLayered[0] = props->maxSurface2DLayered[0] = k2D;
+  props->maxTexture2DLayered[1] = props->maxSurface2DLayered[1] = k2D;
+  props->maxTexture2DLayered[2] = props->maxSurface2DLayered[2] = kLayers;
+  props->maxTexture2DLinear[0] = k2D;
+  props->maxTexture2DLinear[1] = k2D;
+  props->maxTexture2DLinear[2] = 16 * k2D;
+}
+
+void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0600* props,
+                     int physical = -1) {
+  if (physical < 0) physical = ordinal;
   std::memset(props, 0, sizeof *props);
   std::snprintf(props->name, sizeof props->name, "%s", p.model.c_str());
   std::snprintf(props->gcnArchName, sizeof props->gcnArchName, "%s", p.gcn_arch_full.c_str());
@@ -2372,23 +2513,23 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->maxThreadsPerMultiProcessor = static_cast<int>(p.limits.max_threads_per_sm);
   props->maxBlocksPerMultiProcessor = static_cast<int>(p.limits.max_blocks_per_sm);
   props->l2CacheSize = static_cast<int>(p.limits.l2_cache_bytes);
-  // HIP's version of an AMD device is its gfx version's first two parts:
-  // gfx942 is 9.4, gfx90a 9.0 ("gfx" + major + minor digit + stepping).
-  props->major = p.cc_major;
-  props->minor = p.cc_minor;
-  if (p.gcn_arch.size() >= 6 && p.gcn_arch.rfind("gfx", 0) == 0) {
-    const std::string digits = p.gcn_arch.substr(3);
-    props->major = std::atoi(digits.substr(0, digits.size() - 2).c_str());
-    props->minor = static_cast<int>(std::strtol(digits.substr(digits.size() - 2, 1).c_str(), nullptr, 16));
-  }
+  hip_version(p, &props->major, &props->minor);
   // The PCI address rocm-smi and sysfs give the device (telemetry's
   // describe_device): a bus of its own, ordinal + 1, device 0. Two devices on
   // one bus looked to RCCL like one GPU twice.
   props->pciDomainID = 0;
-  props->pciBusID = ordinal + 1;
+  props->pciBusID = physical + 1;
   props->pciDeviceID = 0;
   props->concurrentKernels = 1;
   props->cooperativeLaunch = 1;
+  // What its code can do, as the compiler's __HIP_ARCH_HAS_*__ macros say
+  // for every AMD target: atomics of each width in global and shared memory,
+  // doubles, the warp functions, a system fence, 3D grids -- and no funnel
+  // shift, extended syncthreads, surface functions or dynamic parallelism.
+  auto& a = props->arch;
+  a.hasGlobalInt32Atomics = a.hasGlobalFloatAtomicExch = a.hasSharedInt32Atomics = 1;
+  a.hasSharedFloatAtomicExch = a.hasFloatAtomicAdd = a.hasGlobalInt64Atomics = a.hasSharedInt64Atomics = 1;
+  a.hasDoubles = a.hasWarpVote = a.hasWarpBallot = a.hasWarpShuffle = a.hasThreadFenceSystem = a.has3dGrid = 1;
   props->unifiedAddressing = 1;
   // Pinned, registered and managed host memory are mapped for every
   // device's kernels (see hipHostMalloc), and allocations come from pools.
@@ -2406,13 +2547,17 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   props->memoryPoolsSupported = 1;
   props->ECCEnabled = p.telemetry.ecc ? 1 : 0;
   // The widest row a 2D or 3D copy takes (the attribute, an int, caps it
-  // there). The texture alignments stay 0, as ROCm's HIP gives them for a
-  // device without image support.
+  // there). The image alignments are 256 bytes on every device: ROCm's HIP
+  // sets them whenever the runtime has the images extension, which ROCm's
+  // does on every GPU, texture units or not.
   props->memPitch = static_cast<size_t>(std::min<uint64_t>(p.vram_bytes, INT32_MAX));
+  props->textureAlignment = props->surfaceAlignment = 256;
+  props->texturePitchAlignment = 256;
+  if (has_images(p)) fill_texture_limits(props);
   // What ROCm's HIP gives as a device's UUID: the sixteen characters after
   // "GPU-" in its HSA agent's UUID (hsa_api.cpp), which rocminfo prints.
   char uuid[17];
-  std::snprintf(uuid, sizeof uuid, "%016llx", 0x5647505500000000ull + static_cast<unsigned>(ordinal));
+  std::snprintf(uuid, sizeof uuid, "%016llx", 0x5647505500000000ull + static_cast<unsigned>(physical));
   std::memcpy(props->uuid.bytes, uuid, 16);
 }
 
@@ -2420,9 +2565,10 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
 // hipGetDevicePropertiesR0000) fills, for a program built to that ABI. Each field is the R0600 one of the same name, so the two cannot
 // disagree; R0000's gcnArch, the number a gfx target was before it had a
 // name, is the target's digits (942).
-void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out) {
+void fill_properties_r0000(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::DevicePropR0000* out,
+                           int physical = -1) {
   vgpu::amd::abi::DevicePropR0600 in;
-  fill_properties(p, ordinal, &in);
+  fill_properties(p, ordinal, &in, physical);
   *out = {};
   std::memcpy(out->name, in.name, sizeof out->name);
   std::memcpy(out->gcnArchName, in.gcnArchName, sizeof out->gcnArchName);
@@ -2497,7 +2643,7 @@ hipError_t hipGetDevicePropertiesR0000(vgpu::amd::abi::DevicePropR0000* props, i
   if (!props) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  fill_properties_r0000(s.rt->device(ordinal).profile(), ordinal, props);
+  fill_properties_r0000(s.rt->device(ordinal).profile(), ordinal, props, s.rt->device(ordinal).physical());
   return record(s, hipSuccess);
 }
 hipError_t hipGetDeviceProperties(hipDeviceProp_t* props, int ordinal) {
@@ -2512,7 +2658,7 @@ hipError_t hipGetDevicePropertiesR0600(vgpu::amd::abi::DevicePropR0600* props, i
   if (!props) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, props);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, props, s.rt->device(ordinal).physical());
   return record(s, hipSuccess);
 }
 
@@ -2528,7 +2674,7 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   const auto clamp = [](size_t v) { return v > 0x7fffffff ? 0x7fffffff : static_cast<int>(v); };
   using A = vgpu::amd::abi::DeviceAttribute;
   switch (static_cast<A>(attribute)) {
@@ -2649,10 +2795,10 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
       break;
     }
     case A::kPciChipId: *value = static_cast<int>(s.rt->device(ordinal).profile().telemetry.pci_device_id); break;
-    // Not here: images and textures -- the MI300 family has no texture units,
-    // and hipcc refuses the texture API for gfx94x and gfx950 -- and
-    // fine-grained host memory.
-    case A::kImageSupport:
+    // Images and textures on the Radeon targets only -- the MI300 family has
+    // no texture units, and hipcc refuses the texture API for gfx94x and
+    // gfx950 -- and no fine-grained host memory.
+    case A::kImageSupport: *value = has_images(s.rt->device(ordinal).profile()) ? 1 : 0; break;
     case A::kFineGrainSupport: *value = 0; break;
     case A::kCanUseStreamWaitValue: *value = 1; break;   // hipStreamWaitValue32/64
     default:
@@ -3213,6 +3359,9 @@ hipError_t hipModuleOccupancyMaxPotentialBlockSize(int* grid, int* block, hipFun
 // cooperative_groups::this_grid().sync()). They all have to be resident at
 // once, so a grid larger than the device holds of this kernel at this block
 // size -- what the occupancy calls say -- is refused, as HIP refuses it.
+hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, unsigned int gy, unsigned int gz,
+                                            unsigned int bx, unsigned int by, unsigned int bz, unsigned int shared,
+                                            hipStream_t stream, void** params);
 }  // extern "C"
 namespace {
 
@@ -3230,8 +3379,20 @@ hipError_t launch_host_function(const void* host_function, vgpu::amd::abi::Dim3 
   vgpu::runtime::Device* d = device(s);
   if (!d) return hipErrorInvalidDevice;
   const auto hf = s.host_functions.find(host_function);
-  if (hf == s.host_functions.end())
-    return fail(hipErrorInvalidDeviceFunction, "no kernel was registered for that function");
+  if (hf == s.host_functions.end()) {
+    // A library's kernel (hipLibraryGetKernel) or a module's function, which
+    // ROCm's hipLaunchKernel takes as well as a host function.
+    const bool module_function = std::any_of(s.functions.begin(), s.functions.end(),
+                                             [&](const auto& f) { return f.get() == host_function; });
+    if (!module_function) return fail(hipErrorInvalidDeviceFunction, "no kernel was registered for that function");
+    lock.unlock();
+    const hipFunction_t f = reinterpret_cast<hipFunction_t>(const_cast<void*>(host_function));
+    if (cooperative)
+      return hipModuleLaunchCooperativeKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                                              static_cast<unsigned>(shared), stream, args);
+    return module_launch(f, grid.x, grid.y, grid.z, block.x, block.y, block.z, static_cast<unsigned>(shared), stream,
+                         args, extra, nullptr);
+  }
   Module* m = nullptr;
   if (const hipError_t e = module_on(s, *hf->second.binary, s.current, &m); e != hipSuccess) return e;
   const Kernel* k = vgpu::amd::find_kernel(m->object, hf->second.kernel);
@@ -3420,7 +3581,7 @@ int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   d.vram_bytes = p.vram_bytes;
   // The bus and UUID the device reports everywhere else: rocm-smi, sysfs.
   vgpu::telemetry::DeviceSample sample{};
-  vgpu::telemetry::describe_device(p, ordinal, &sample);
+  vgpu::telemetry::describe_device(p, s.rt->device(ordinal).physical(), &sample);
   unsigned bus = 0;
   if (std::sscanf(sample.bus_id, "%*x:%x:", &bus) == 1) d.pci_bus = bus;
   // "GPU-xxxxxxxx-xxxx-...": its hex digits, sixteen bytes of them.
@@ -3863,11 +4024,14 @@ hipError_t hipFuncGetAttribute(int* value, int attribute, hipFunction_t f) {
   const ApiCall api("hipFuncGetAttribute");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!value || !f) return record(s, hipErrorInvalidValue);
+  if (!value) return record(s, hipErrorInvalidValue);
+  if (!f) return record(s, hipErrorInvalidResourceHandle);
   vgpu::runtime::Device* d = device(s);
   if (!d) return record(s, hipErrorInvalidDevice);
   const Kernel& k = *reinterpret_cast<Function*>(f)->kernel;
   const vgpu::DeviceProfile& p = d->profile();
+  int major = 0, minor = 0;
+  hip_version(p, &major, &minor);
   switch (attribute) {
     case 0: *value = static_cast<int>(k.max_flat_workgroup_size ? k.max_flat_workgroup_size : 1024); break;
     case 1: *value = static_cast<int>(k.group_segment); break;                          // SHARED_SIZE_BYTES
@@ -3875,7 +4039,7 @@ hipError_t hipFuncGetAttribute(int* value, int attribute, hipFunction_t f) {
     case 3: *value = static_cast<int>(k.private_segment); break;                        // LOCAL_SIZE_BYTES
     case 4: *value = static_cast<int>(k.vgpr_count); break;                             // NUM_REGS
     case 5:                                                                             // PTX_VERSION
-    case 6: *value = p.cc_major * 10 + p.cc_minor; break;                               // BINARY_VERSION
+    case 6: *value = major * 10 + minor; break;                                         // BINARY_VERSION
     case 7: *value = 0; break;                                                          // CACHE_MODE_CA
     case 8: *value = static_cast<int>(p.limits.shared_mem_per_block - k.group_segment); break;
     case 9: *value = -1; break;                                                         // CARVEOUT: none preferred
@@ -3893,7 +4057,8 @@ hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, un
 // runs.
 hipError_t hipDrvLaunchKernelEx(const void* config, hipFunction_t f, void** params, void** extra) {
   const ApiCall api("hipDrvLaunchKernelEx");
-  if (!config || !f) return record(state(), hipErrorInvalidValue);
+  if (!config) return record(state(), hipErrorInvalidValue);
+  if (!f) return record(state(), hipErrorInvalidResourceHandle);
   const auto* c = static_cast<const unsigned char*>(config);
   uint32_t dims[7];
   std::memcpy(dims, c, sizeof dims);   // grid x, y, z; block x, y, z; dynamic LDS
@@ -3932,6 +4097,19 @@ hipError_t hipExtModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, u
                                     hipEvent_t start, hipEvent_t stop, uint32_t) {
   const ApiCall api("hipExtModuleLaunchKernel");
   if (!lx || !ly || !lz || !gx || !gy || !gz) return record(state(), hipErrorInvalidConfiguration);
+  // A work-group wider than the whole grid is cut to the grid, as ROCm's
+  // HIP does -- after the block is checked against the device's limits.
+  {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (const vgpu::runtime::Device* d = device(s)) {
+      const auto& limits = d->profile().limits;
+      if (uint64_t{lx} * ly * lz > limits.max_threads_per_block || lx > limits.max_block_dim[0] ||
+          ly > limits.max_block_dim[1] || lz > limits.max_block_dim[2])
+        return record(s, hipErrorInvalidConfiguration);
+    }
+  }
+  lx = std::min(lx, gx), ly = std::min(ly, gy), lz = std::min(lz, gz);
   if (start)
     if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
   const uint32_t items[3] = {gx % lx ? gx : 0, gy % ly ? gy : 0, gz % lz ? gz : 0};
@@ -4031,6 +4209,11 @@ static_assert(sizeof(IpcPayload) <= sizeof(vgpu::amd::abi::IpcMemHandle), "an IP
 constexpr uint32_t kIpcMagic = 0x48495043;   // "HIPC"
 std::string ipc_path(const char* id) { return vgpu::telemetry::default_path() + "/ipc-hip-" + id; }
 std::map<void*, int> g_ipc_open;   // pointer -> the device it was mapped on
+// This process's exports, numbered: HIP's and HSA's handles share the count.
+uint32_t next_ipc_serial() {
+  static std::atomic<uint32_t> counter{0};
+  return counter.fetch_add(1) + 1;
+}
 static_assert(sizeof(IpcPayload) <= 64, "an IPC payload fits hipMemPoolPtrExportData");
 std::map<uint64_t, IpcPayload> g_pool_exports;   // pool allocation -> how it was exported
 
@@ -4234,7 +4417,7 @@ hipError_t hipDeviceGetPCIBusId(char* bus_id, int len, int ordinal) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   // As snprintf fills it: a buffer too short for the whole string gets what
   // fits, and the call fails.
   const int n = std::snprintf(bus_id, static_cast<size_t>(len), "%04x:%02x:%02x.0", p.pciDomainID, p.pciBusID,
@@ -4251,7 +4434,7 @@ hipError_t hipDeviceGetByPCIBusId(int* ordinal, const char* bus_id) {
   if (std::sscanf(bus_id, "%x:%x:%x", &domain, &bus, &dev) != 3) return record(s, hipErrorInvalidValue);
   for (int i = 0; i < s.rt->device_count(); ++i) {
     vgpu::amd::abi::DevicePropR0600 p;
-    fill_properties(s.rt->device(i).profile(), i, &p);
+    fill_properties(s.rt->device(i).profile(), i, &p, s.rt->device(i).physical());
     if (unsigned(p.pciDomainID) == domain && unsigned(p.pciBusID) == bus && unsigned(p.pciDeviceID) == dev) {
       *ordinal = i;
       return record(s, hipSuccess);
@@ -4346,7 +4529,8 @@ hipError_t hipDeviceGetLimit(size_t* value, int limit) {
 // named "unknown".
 hipError_t hipDrvGetErrorString(hipError_t error, const char** text) {
   const ApiCall api("hipDrvGetErrorString");
-  if (!text || !error_text(error)) return record(state(), hipErrorInvalidValue);
+  // hipErrorTbd has a name and, for the driver, no text.
+  if (!text || !error_text(error) || static_cast<int>(error) == 1054) return record(state(), hipErrorInvalidValue);
   *text = error_text(error)->text;
   return hipSuccess;
 }
@@ -4393,7 +4577,8 @@ hipError_t hipFuncSetAttribute(const void* host_function, int attr, int value) {
   if (attr == 8 && (value < 0 || uint64_t(value) + k->group_segment > p.limits.shared_mem_per_block))
     return record(s, hipErrorInvalidValue);
   if (attr == 9 && (value < -1 || value > 100)) return record(s, hipErrorInvalidValue);
-  if (attr != 8 && attr != 9) return record(s, hipErrorInvalidValue);
+  // hipFuncAttributeMax (10) is taken too, as ROCm's HIP takes it.
+  if (attr != 8 && attr != 9 && attr != 10) return record(s, hipErrorInvalidValue);
   return record(s, hipSuccess);
 }
 
@@ -4411,6 +4596,11 @@ const char* hipKernelNameRefByPtr(const void* host_function, hipStream_t) {
 hipError_t hipExtLaunchKernel(const void* host_function, vgpu::amd::abi::Dim3 grid, vgpu::amd::abi::Dim3 block,
                               void** args, size_t shared, hipStream_t stream, hipEvent_t start, hipEvent_t stop, int) {
   const ApiCall api("hipExtLaunchKernel");
+  // Events that are not there are the wrong value here, before anything runs.
+  {
+    std::lock_guard<std::mutex> lock(g_event_mutex);
+    if ((start && !find_event(start)) || (stop && !find_event(stop))) return record(state(), hipErrorInvalidValue);
+  }
   if (start)
     if (const hipError_t e = hipEventRecord(start, stream); e != hipSuccess) return e;
   if (const hipError_t e = hipLaunchKernel(host_function, grid, block, args, shared, stream); e != hipSuccess) return e;
@@ -4522,7 +4712,11 @@ hipError_t hipStreamCreateWithPriority(hipStream_t* stream, unsigned int flags, 
 hipError_t hipExtStreamCreateWithCUMask(hipStream_t* stream, uint32_t words, const uint32_t* mask) {
   const ApiCall api("hipExtStreamCreateWithCUMask");
   if (!words || !mask) return hipErrorInvalidValue;
-  return create_stream(stream, 0, 0, std::vector<uint32_t>(mask, mask + words));
+  // A mask with no compute unit in it is no mask: the stream gets them all,
+  // as ROCm gives it the default.
+  std::vector<uint32_t> cus(mask, mask + words);
+  if (std::all_of(cus.begin(), cus.end(), [](uint32_t w) { return w == 0; })) cus.clear();
+  return create_stream(stream, 0, 0, std::move(cus));
 }
 hipError_t hipExtStreamGetCUMask(hipStream_t stream, uint32_t words, uint32_t* mask) {
   const ApiCall api("hipExtStreamGetCUMask");
@@ -4583,8 +4777,10 @@ hipError_t hipStreamGetDevice(hipStream_t stream, hipDevice_t* ordinal) {
 // Whatever the event marks has already happened.
 // The stream's later work waits for what the event marks. An event never
 // recorded marks nothing, and the stream does not wait.
-hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int) {
+hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int flags) {
   const ApiCall api("hipStreamWaitEvent");
+  // hipEventWaitDefault (0) and hipEventWaitExternal (1) are the flags there are.
+  if (flags > 1) return record(state(), hipErrorInvalidValue);
   {
     // An event from a capture, or a stream that is capturing: the capture's
     // to handle (a stream joins a capture this way).
@@ -4681,7 +4877,7 @@ hipError_t hipMemGetAddressRange(void** base, size_t* size, void* ptr) {
   const ApiCall api("hipMemGetAddressRange");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr) return record(s, hipErrorInvalidValue);
+  if (!ptr) return record(s, hipErrorNotFound);   // no allocation holds nothing, as ROCm's HIP has it
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const uint64_t va = reinterpret_cast<uint64_t>(ptr);
   uint64_t b = 0, n = 0;
@@ -5140,13 +5336,12 @@ hipError_t hipIpcGetMemHandle(vgpu::amd::abi::IpcMemHandle* handle, void* ptr) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
   if (d < 0) return record(s, hipErrorInvalidDevicePointer);
-  static std::atomic<uint32_t> counter{0};
   IpcPayload p{};
   p.magic = kIpcMagic;
   p.version = 1;
   p.device = static_cast<uint32_t>(d);
   p.pid = static_cast<uint32_t>(::getpid());
-  std::snprintf(p.id, sizeof p.id, "%x-%x", p.pid, counter.fetch_add(1) + 1);
+  std::snprintf(p.id, sizeof p.id, "%x-%x", p.pid, next_ipc_serial());
   try {
     p.size = s.rt->device(d).memory().share(reinterpret_cast<uint64_t>(ptr), ipc_path(p.id));
   } catch (const std::exception& e) {
@@ -5362,142 +5557,7 @@ hipError_t hipIpcOpenEventHandle(hipEvent_t* event, vgpu::amd::abi::IpcMemHandle
 }
 
 // ---- Arrays, textures and surfaces -------------------------------------------
-//
-// The GPUs modelled here (the MI300 family, gfx942 and gfx950) have no
-// texture units: hipcc refuses the texture API in their device code
-// (__HIP_NO_IMAGE_SUPPORT), and ROCm's HIP on them says image support is 0
-// and answers every call that would make an array, a texture or a surface
-// with hipErrorNotSupported. These are its answers, found by asking it
-// (ROCm's libamdhip64 on this HSA runtime, amd/tests/hipcc/textures.cpp), so
-// a program or library that calls them is told what it would be told on the
-// card, rather than failing to load for want of the symbol.
-namespace {
-hipError_t no_images(const char* name) {
-  const ApiCall api(name);
-  return record(state(), hipErrorNotSupported);
-}
-hipError_t no_such_array(const char* name) {   // a handle to what cannot exist
-  const ApiCall api(name);
-  return record(state(), hipErrorInvalidHandle);
-}
-hipError_t freeing_nothing(const char* name) {
-  const ApiCall api(name);
-  return record(state(), hipErrorInvalidValue);
-}
-hipError_t destroying(const char* name, uint64_t object) {   // none is ever made, so only 0 is fine
-  const ApiCall api(name);
-  return record(state(), object ? hipErrorInvalidValue : hipSuccess);
-}
-}  // namespace
-
-// hipChannelFormatDesc, which hipCreateChannelDesc returns by value.
-struct ChannelFormatDesc {
-  int x, y, z, w;
-  int f;
-};
-ChannelFormatDesc hipCreateChannelDesc(int x, int y, int z, int w, int f) { return {x, y, z, w, f}; }
-
-hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* width, const void*, int device) {
-  const ApiCall api("hipDeviceGetTexture1DLinearMaxWidth");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!width) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-  if (device < 0 || device >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  *width = 0;
-  return record(s, hipSuccess);
-}
-
-// What a hipcc-built program registers before main for a texture or surface
-// reference it declares: nothing to keep, since none can be bound.
-void __hipRegisterTexture(void*, void*, char*, const char*, int, int, int) {}
-void __hipRegisterSurface(void*, void*, char*, const char*, int, int) {}
-
-#define VGPU_NO_IMAGES(name) \
-  hipError_t name() { return no_images(#name); }
-#define VGPU_NO_SUCH_ARRAY(name) \
-  hipError_t name() { return no_such_array(#name); }
-#define VGPU_FREEING_NOTHING(name) \
-  hipError_t name() { return freeing_nothing(#name); }
-// Making one, and the texture-reference API, which needs a texture to bind.
-VGPU_NO_IMAGES(hipMallocArray)
-VGPU_NO_IMAGES(hipMalloc3DArray)
-VGPU_NO_IMAGES(hipArrayCreate)
-VGPU_NO_IMAGES(hipArray3DCreate)
-VGPU_NO_IMAGES(hipMallocMipmappedArray)
-VGPU_NO_IMAGES(hipMipmappedArrayCreate)
-VGPU_NO_IMAGES(hipCreateTextureObject)
-VGPU_NO_IMAGES(hipTexObjectCreate)
-VGPU_NO_IMAGES(hipCreateSurfaceObject)
-VGPU_NO_IMAGES(hipGetTextureReference)
-VGPU_NO_IMAGES(hipModuleGetTexRef)
-VGPU_NO_IMAGES(hipBindTexture)
-VGPU_NO_IMAGES(hipBindTexture2D)
-VGPU_NO_IMAGES(hipBindTextureToArray)
-VGPU_NO_IMAGES(hipBindTextureToMipmappedArray)
-VGPU_NO_IMAGES(hipUnbindTexture)
-VGPU_NO_IMAGES(hipGetTextureAlignmentOffset)
-VGPU_NO_IMAGES(hipGetMipmappedArrayLevel)
-VGPU_NO_IMAGES(hipMipmappedArrayGetLevel)
-VGPU_NO_IMAGES(hipMemMapArrayAsync)
-VGPU_NO_IMAGES(hipTexRefGetAddress)
-VGPU_NO_IMAGES(hipTexRefGetAddressMode)
-VGPU_NO_IMAGES(hipTexRefGetArray)
-VGPU_NO_IMAGES(hipTexRefGetBorderColor)
-VGPU_NO_IMAGES(hipTexRefGetFilterMode)
-VGPU_NO_IMAGES(hipTexRefGetFlags)
-VGPU_NO_IMAGES(hipTexRefGetFormat)
-VGPU_NO_IMAGES(hipTexRefGetMaxAnisotropy)
-VGPU_NO_IMAGES(hipTexRefGetMipMappedArray)
-VGPU_NO_IMAGES(hipTexRefGetMipmapFilterMode)
-VGPU_NO_IMAGES(hipTexRefGetMipmapLevelBias)
-VGPU_NO_IMAGES(hipTexRefGetMipmapLevelClamp)
-VGPU_NO_IMAGES(hipTexRefSetAddress)
-VGPU_NO_IMAGES(hipTexRefSetAddress2D)
-VGPU_NO_IMAGES(hipTexRefSetAddressMode)
-VGPU_NO_IMAGES(hipTexRefSetArray)
-VGPU_NO_IMAGES(hipTexRefSetBorderColor)
-VGPU_NO_IMAGES(hipTexRefSetFilterMode)
-VGPU_NO_IMAGES(hipTexRefSetFlags)
-VGPU_NO_IMAGES(hipTexRefSetFormat)
-VGPU_NO_IMAGES(hipTexRefSetMaxAnisotropy)
-VGPU_NO_IMAGES(hipTexRefSetMipmapFilterMode)
-VGPU_NO_IMAGES(hipTexRefSetMipmapLevelBias)
-VGPU_NO_IMAGES(hipTexRefSetMipmapLevelClamp)
-VGPU_NO_IMAGES(hipTexRefSetMipmappedArray)
-// Graphics and external-memory interop, which has no graphics API to share with.
-VGPU_NO_IMAGES(hipGraphicsSubResourceGetMappedArray)
-// Asking about, or copying to or from, an array: there is none to name.
-VGPU_NO_SUCH_ARRAY(hipGetChannelDesc)
-VGPU_NO_SUCH_ARRAY(hipArrayGetDescriptor)
-VGPU_NO_SUCH_ARRAY(hipArray3DGetDescriptor)
-VGPU_NO_SUCH_ARRAY(hipArrayGetInfo)
-VGPU_NO_SUCH_ARRAY(hipMemcpyToArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpyFromArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpyFromArray_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArray_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArrayAsync)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DToArrayAsync_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArray)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArray_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArrayAsync)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DFromArrayAsync_spt)
-VGPU_NO_SUCH_ARRAY(hipMemcpy2DArrayToArray)
-VGPU_NO_SUCH_ARRAY(hipGetTextureObjectResourceDesc)
-VGPU_NO_SUCH_ARRAY(hipGetTextureObjectResourceViewDesc)
-VGPU_NO_SUCH_ARRAY(hipGetTextureObjectTextureDesc)
-VGPU_NO_SUCH_ARRAY(hipTexObjectGetResourceDesc)
-VGPU_NO_SUCH_ARRAY(hipTexObjectGetResourceViewDesc)
-VGPU_NO_SUCH_ARRAY(hipTexObjectGetTextureDesc)
-// Freeing one.
-VGPU_FREEING_NOTHING(hipFreeArray)
-VGPU_FREEING_NOTHING(hipArrayDestroy)
-VGPU_FREEING_NOTHING(hipFreeMipmappedArray)
-VGPU_FREEING_NOTHING(hipMipmappedArrayDestroy)
-hipError_t hipDestroyTextureObject(uint64_t object) { return destroying("hipDestroyTextureObject", object); }
-hipError_t hipTexObjectDestroy(uint64_t object) { return destroying("hipTexObjectDestroy", object); }
-hipError_t hipDestroySurfaceObject(uint64_t object) { return destroying("hipDestroySurfaceObject", object); }
+#include "hip_images.inc"
 
 // ---- The rest of HIP's device, stream and launch API --------------------------
 //
@@ -5524,7 +5584,7 @@ hipError_t hipDeviceGetUuid(vgpu::amd::abi::Uuid* uuid, int ordinal) {
   if (!uuid) return record(s, hipErrorInvalidValue);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   *uuid = p.uuid;
   return record(s, hipSuccess);
 }
@@ -5561,7 +5621,7 @@ hipError_t hipDeviceComputeCapability(int* major, int* minor, int ordinal) {
   if (!major || !minor) return record(s, hipErrorInvalidValue);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p);
+  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
   *major = p.major;
   *minor = p.minor;
   return record(s, hipSuccess);
@@ -5616,7 +5676,7 @@ hipError_t hipDeviceGetP2PAttribute(int* value, int attr, int src, int dst) {
   if (!value || attr < 0 || attr > 3) return record(s, hipErrorInvalidValue);
   if (!valid_device(s, src) || !valid_device(s, dst) || src == dst) return record(s, hipErrorInvalidDevice);
   vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(src).profile(), src, &p);
+  fill_properties(s.rt->device(src).profile(), src, &p, s.rt->device(src).physical());
   const int image = s.rt->device(src).profile().gcn_arch.rfind("gfx9", 0) == 0 ? 0 : 1;
   *value = attr == 0 ? 0 : attr == 3 ? image : 1;
   return record(s, hipSuccess);
@@ -6174,16 +6234,14 @@ hipError_t peer_copy(void* dst, int dst_device, const void* src, int src_device,
 constexpr size_t kMaxPitch = INT32_MAX;
 
 // The pointer a driver-style copy's side names: its memory type says which
-// field. An array is refused -- there are no image units -- unless it is
-// null, which is the wrong value.
-hipError_t side_pointer(int type, const void* host, void* dev, void* array, const void** out) {
+// field. An array is its own kind of side (copy_side).
+hipError_t side_pointer(int type, const void* host, void* dev, const void** out) {
   using namespace vgpu::amd::abi;
   switch (type) {
     case kMemTypeHost: *out = host; break;
     case kMemTypeDevice:
     case kMemTypeManaged:
     case kMemTypeUnified: *out = dev; break;
-    case kMemTypeArray: return array ? hipErrorNotSupported : hipErrorInvalidValue;
     default: return hipErrorInvalidValue;
   }
   return *out ? hipSuccess : hipErrorInvalidValue;
@@ -6196,23 +6254,85 @@ hipError_t row_pitch(size_t pitch, size_t width, size_t* out) {
   *out = pitch;
   return hipSuccess;
 }
+// One side of a pitched copy: where its region starts, its rows' pitch and
+// the bytes from one slice to the next. Memory is as the side says (a slice
+// `height` rows, or the copy's); an array's pitch and slices are its own,
+// and the region has to lie inside it. On a device without image units no
+// array exists, and naming one is refused as unsupported.
+hipError_t copy_side(int type, const void* host, void* dev, void* array, size_t pitch, size_t height,
+                     size_t x, size_t y, size_t z, const Region& r, const uint8_t** start, size_t* out_pitch,
+                     uint64_t* slice) {
+  if (type == vgpu::amd::abi::kMemTypeArray) {
+    if (!array) return hipErrorInvalidValue;
+    const HipArray* a = find_array(array);
+    if (!a) return images_here() ? hipErrorInvalidValue : hipErrorNotSupported;
+    if (x + r.width > a->pitch() || y + r.rows > a->rows() || z + r.depth > a->slices()) return hipErrorInvalidValue;
+    *out_pitch = a->pitch();
+    *slice = uint64_t{a->pitch()} * a->rows();
+    *start = a->data + z * *slice + y * *out_pitch + x;
+    return hipSuccess;
+  }
+  const void* p = nullptr;
+  if (const hipError_t e = side_pointer(type, host, dev, &p); e != hipSuccess) return e;
+  if (const hipError_t e = row_pitch(pitch, r.width, out_pitch); e != hipSuccess) return e;
+  *slice = uint64_t{*out_pitch} * (height ? height : r.rows);
+  *start = static_cast<const uint8_t*>(p) + z * *slice + y * *out_pitch + x;
+  return hipSuccess;
+}
 
 // hipMemcpyParam2D and its kin.
 hipError_t param_2d(const vgpu::amd::abi::Memcpy2D* p, hipStream_t stream, bool async) {
   if (!p) return hipErrorInvalidValue;
-  const void *src = nullptr, *dst = nullptr;
-  if (const hipError_t e = side_pointer(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, &src); e != hipSuccess)
-    return e;
-  if (const hipError_t e = side_pointer(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, &dst); e != hipSuccess)
-    return e;
+  const Region shape{p->WidthInBytes, p->Height, 1, 0, 0};
+  const uint8_t *s0 = nullptr, *d0 = nullptr;
   size_t spitch = 0, dpitch = 0;
-  if (const hipError_t e = row_pitch(p->srcPitch, p->WidthInBytes, &spitch); e != hipSuccess) return e;
-  if (const hipError_t e = row_pitch(p->dstPitch, p->WidthInBytes, &dpitch); e != hipSuccess) return e;
+  uint64_t sslice = 0, dslice = 0;
+  if (const hipError_t e = copy_side(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, p->srcPitch, 0,
+                                     p->srcXInBytes, p->srcY, 0, shape, &s0, &spitch, &sslice);
+      e != hipSuccess)
+    return e;
+  if (const hipError_t e = copy_side(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, p->dstPitch, 0,
+                                     p->dstXInBytes, p->dstY, 0, shape, &d0, &dpitch, &dslice);
+      e != hipSuccess)
+    return e;
   if (!p->WidthInBytes || !p->Height) return hipSuccess;
-  const auto* s0 = static_cast<const uint8_t*>(src) + p->srcY * spitch + p->srcXInBytes;
-  auto* d0 = const_cast<uint8_t*>(static_cast<const uint8_t*>(dst)) + p->dstY * dpitch + p->dstXInBytes;
-  return copy_region(d0, Region{p->WidthInBytes, p->Height, 1, dpitch, 0}, s0,
+  return copy_region(const_cast<uint8_t*>(d0), Region{p->WidthInBytes, p->Height, 1, dpitch, 0}, s0,
                      Region{p->WidthInBytes, p->Height, 1, spitch, 0}, hipMemcpyDefault, stream, async);
+}
+
+// hipMemcpy3D with an array on a side, as the driver's copy (ROCm's HIP's
+// getDrvMemcpy3DDesc): the extent's width and an array side's x are
+// elements of the array, and a 1D layered array's layers are its rows, so
+// its y and z -- and the copy's height and depth -- trade places.
+hipError_t drv_3d(const vgpu::amd::abi::Memcpy3D* p, hipStream_t stream, bool async);
+hipError_t array_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, bool async) {
+  using namespace vgpu::amd::abi;
+  const HipArray* sa = p->srcArray ? find_array(p->srcArray) : nullptr;
+  const HipArray* da = p->dstArray ? find_array(p->dstArray) : nullptr;
+  if ((p->srcArray && !sa) || (p->dstArray && !da)) return images_here() ? hipErrorInvalidValue : hipErrorNotSupported;
+  Memcpy3D d{};
+  const HipArray* a = da ? da : sa;
+  d.WidthInBytes = p->extent.width * a->element();
+  d.Height = p->extent.height, d.Depth = p->extent.depth;
+  d.srcXInBytes = p->srcPos.x * (sa ? sa->element() : 1), d.srcY = p->srcPos.y, d.srcZ = p->srcPos.z;
+  d.dstXInBytes = p->dstPos.x * (da ? da->element() : 1), d.dstY = p->dstPos.y, d.dstZ = p->dstPos.z;
+  const auto kind = static_cast<hipMemcpyKind>(p->kind);
+  if (sa) {
+    d.srcMemoryType = kMemTypeArray, d.srcArray = p->srcArray;
+  } else {
+    d.srcMemoryType = memory_type(kind, true), d.srcHost = p->srcPtr.ptr, d.srcDevice = p->srcPtr.ptr;
+    d.srcPitch = p->srcPtr.pitch, d.srcHeight = p->srcPtr.ysize;
+  }
+  if (da) {
+    d.dstMemoryType = kMemTypeArray, d.dstArray = p->dstArray;
+  } else {
+    d.dstMemoryType = memory_type(kind, false), d.dstHost = p->dstPtr.ptr, d.dstDevice = p->dstPtr.ptr;
+    d.dstPitch = p->dstPtr.pitch, d.dstHeight = p->dstPtr.ysize;
+  }
+  if (sa && sa->layered_1d()) std::swap(d.srcY, d.srcZ);
+  if (da && da->layered_1d()) std::swap(d.dstY, d.dstZ);
+  if ((sa && sa->layered_1d()) || (da && da->layered_1d())) std::swap(d.Height, d.Depth);
+  return drv_3d(&d, stream, async);
 }
 
 // hipMemcpy3D and its kin: each side an array or a pitched pointer, one of
@@ -6227,7 +6347,7 @@ hipError_t copy_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, b
   if (kind != hipMemcpyDefault && kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice &&
       kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice)
     return hipErrorInvalidMemcpyDirection;
-  if (sarr || darr) return hipErrorNotSupported;
+  if (sarr || darr) return array_3d(p, stream, async);
   const auto& e = p->extent;
   size_t spitch = 0, dpitch = 0;
   if (p->srcPtr.pitch >= kMaxPitch || p->dstPtr.pitch >= kMaxPitch) return hipErrorInvalidValue;
@@ -6247,21 +6367,20 @@ hipError_t copy_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, b
 // named by memory type, and whose slice is Height rows unless a side says.
 hipError_t drv_3d(const vgpu::amd::abi::Memcpy3D* p, hipStream_t stream, bool async) {
   if (!p) return hipErrorInvalidValue;
-  const void *src = nullptr, *dst = nullptr;
-  if (const hipError_t e = side_pointer(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, &src); e != hipSuccess)
-    return e;
-  if (const hipError_t e = side_pointer(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, &dst); e != hipSuccess)
-    return e;
+  const Region shape{p->WidthInBytes, p->Height, p->Depth, 0, 0};
+  const uint8_t *s0 = nullptr, *d0 = nullptr;
   size_t spitch = 0, dpitch = 0;
-  if (const hipError_t e = row_pitch(p->srcPitch, p->WidthInBytes, &spitch); e != hipSuccess) return e;
-  if (const hipError_t e = row_pitch(p->dstPitch, p->WidthInBytes, &dpitch); e != hipSuccess) return e;
+  uint64_t sslice = 0, dslice = 0;
+  if (const hipError_t e = copy_side(p->srcMemoryType, p->srcHost, p->srcDevice, p->srcArray, p->srcPitch,
+                                     p->srcHeight, p->srcXInBytes, p->srcY, p->srcZ, shape, &s0, &spitch, &sslice);
+      e != hipSuccess)
+    return e;
+  if (const hipError_t e = copy_side(p->dstMemoryType, p->dstHost, p->dstDevice, p->dstArray, p->dstPitch,
+                                     p->dstHeight, p->dstXInBytes, p->dstY, p->dstZ, shape, &d0, &dpitch, &dslice);
+      e != hipSuccess)
+    return e;
   if (!p->WidthInBytes || !p->Height || !p->Depth) return hipSuccess;
-  const uint64_t sslice = spitch * (p->srcHeight ? p->srcHeight : p->Height);
-  const uint64_t dslice = dpitch * (p->dstHeight ? p->dstHeight : p->Height);
-  const auto* s0 = static_cast<const uint8_t*>(src) + p->srcZ * sslice + p->srcY * spitch + p->srcXInBytes;
-  auto* d0 = const_cast<uint8_t*>(static_cast<const uint8_t*>(dst)) + p->dstZ * dslice + p->dstY * dpitch +
-             p->dstXInBytes;
-  return copy_region(d0, Region{p->WidthInBytes, p->Height, p->Depth, dpitch, dslice}, s0,
+  return copy_region(const_cast<uint8_t*>(d0), Region{p->WidthInBytes, p->Height, p->Depth, dpitch, dslice}, s0,
                      Region{p->WidthInBytes, p->Height, p->Depth, spitch, sslice}, hipMemcpyDefault, stream, async);
 }
 
@@ -6289,12 +6408,12 @@ hipError_t peer_3d(const vgpu::amd::abi::Memcpy3DPeerParms* p, hipStream_t strea
 
 // Memory whose rows are `pitch` bytes apart: each row rounded up to 256
 // bytes, as ROCm's HIP rounds it, and the allocation exactly pitch * height
-// * depth. None at all (a zero dimension) is no allocation.
+// * depth. None at all (a zero dimension) is no allocation, and leaves the
+// pitch as it was, as ROCm's HIP leaves it.
 hipError_t pitched_alloc(void** ptr, size_t* pitch, size_t width, size_t height, size_t depth) {
   if (!ptr || !pitch) return hipErrorInvalidValue;
   if (!width || !height || !depth) {
     *ptr = nullptr;
-    *pitch = 0;
     return hipSuccess;
   }
   if (width > SIZE_MAX - 255) return hipErrorOutOfMemory;
@@ -6495,34 +6614,46 @@ hipError_t hipMemsetD2D32Async(void* dst, size_t pitch, unsigned int value, size
   return record(state(), set_d2d(dst, pitch, &value, 4, width, height, stream, true));
 }
 
-// Copies to and from arrays: there are none on this device.
-hipError_t hipMemcpyAtoA(void* dst, size_t, void* src, size_t, size_t) {
+// Copies of bytes to and from an array's first row (the driver API's):
+// none on a device without image units, where no array exists.
+hipError_t hipMemcpyAtoA(void* dst, size_t dst_offset, void* src, size_t src_offset, size_t bytes) {
   const ApiCall api("hipMemcpyAtoA");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  vgpu::amd::abi::Memcpy2D d{};
+  d.srcXInBytes = src_offset, d.srcMemoryType = vgpu::amd::abi::kMemTypeArray, d.srcArray = src;
+  d.dstXInBytes = dst_offset, d.dstMemoryType = vgpu::amd::abi::kMemTypeArray, d.dstArray = dst;
+  d.WidthInBytes = bytes, d.Height = 1;
+  return record(state(), param_2d(&d, nullptr, false));
 }
-hipError_t hipMemcpyAtoD(void* dst, void* src, size_t, size_t) {
+hipError_t hipMemcpyAtoD(void* dst, void* src, size_t src_offset, size_t bytes) {
   const ApiCall api("hipMemcpyAtoD");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), from_array(dst, 0, src, src_offset, 0, bytes, 1, hipMemcpyDeviceToDevice, nullptr, false));
 }
-hipError_t hipMemcpyAtoH(void* dst, void* src, size_t, size_t) {
+hipError_t hipMemcpyAtoH(void* dst, void* src, size_t src_offset, size_t bytes) {
   const ApiCall api("hipMemcpyAtoH");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), from_array(dst, 0, src, src_offset, 0, bytes, 1, hipMemcpyDeviceToHost, nullptr, false));
 }
-hipError_t hipMemcpyAtoHAsync(void* dst, void* src, size_t, size_t, hipStream_t) {
+hipError_t hipMemcpyAtoHAsync(void* dst, void* src, size_t src_offset, size_t bytes, hipStream_t stream) {
   const ApiCall api("hipMemcpyAtoHAsync");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), from_array(dst, 0, src, src_offset, 0, bytes, 1, hipMemcpyDeviceToHost, stream, true));
 }
-hipError_t hipMemcpyDtoA(void* dst, size_t, void* src, size_t) {
+hipError_t hipMemcpyDtoA(void* dst, size_t dst_offset, void* src, size_t bytes) {
   const ApiCall api("hipMemcpyDtoA");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), to_array(dst, dst_offset, 0, src, 0, bytes, 1, hipMemcpyDeviceToDevice, nullptr, false));
 }
-hipError_t hipMemcpyHtoA(void* dst, size_t, const void* src, size_t) {
+hipError_t hipMemcpyHtoA(void* dst, size_t dst_offset, const void* src, size_t bytes) {
   const ApiCall api("hipMemcpyHtoA");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), to_array(dst, dst_offset, 0, src, 0, bytes, 1, hipMemcpyHostToDevice, nullptr, false));
 }
-hipError_t hipMemcpyHtoAAsync(void* dst, size_t, const void* src, size_t, hipStream_t) {
+hipError_t hipMemcpyHtoAAsync(void* dst, size_t dst_offset, const void* src, size_t bytes, hipStream_t stream) {
   const ApiCall api("hipMemcpyHtoAAsync");
-  return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  if (!images_here()) return record(state(), dst && src ? hipErrorNotSupported : hipErrorInvalidValue);
+  return record(state(), to_array(dst, dst_offset, 0, src, 0, bytes, 1, hipMemcpyHostToDevice, stream, true));
 }
 
 // The per-thread default stream's forms of the 3D copy and the 2D and 3D
@@ -6612,11 +6743,35 @@ hipError_t hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemL
 // hipLibrary_t is CUDA 12's library, which is a module here, loaded on the
 // current device; a hipKernel_t from it is the module's function. JIT and
 // library options change nothing.
+}  // extern "C"
+namespace {
+// Libraries whose image could not be loaded. ROCm's HIP loads a library
+// lazily: loading anything succeeds, and the image is refused when a kernel
+// is first asked of it (hipErrorInvalidImage). These handles stand for such
+// libraries until they are unloaded.
+std::mutex g_unloadable_mutex;
+std::set<void*> g_unloadable;
+bool unloadable(void* library) {
+  std::lock_guard<std::mutex> lock(g_unloadable_mutex);
+  return g_unloadable.count(library) != 0;
+}
+}  // namespace
+extern "C" {
+
 hipError_t hipLibraryLoadData(void** library, const void* code, void*, void*, unsigned int, void*, void*,
                               unsigned int) {
   const ApiCall api("hipLibraryLoadData");
   if (!library || !code) return record(state(), hipErrorInvalidValue);
-  return hipModuleLoadData(reinterpret_cast<hipModule_t*>(library), code);
+  const hipError_t e = hipModuleLoadData(reinterpret_cast<hipModule_t*>(library), code);
+  if (e != hipErrorInvalidImage && e != hipErrorNoBinaryForGpu) return e;
+  static std::atomic<uintptr_t> next{0x7e1b0000};   // apart from any real handle
+  *library = reinterpret_cast<void*>(next.fetch_add(0x10));
+  {
+    std::lock_guard<std::mutex> lock(g_unloadable_mutex);
+    g_unloadable.insert(*library);
+  }
+  (void)hipGetLastError();   // the refusal comes later, from hipLibraryGetKernel
+  return record(state(), hipSuccess);
 }
 hipError_t hipLibraryLoadFromFile(void** library, const char* path, void*, void*, unsigned int, void*, void*,
                                   unsigned int) {
@@ -6628,15 +6783,21 @@ hipError_t hipLibraryLoadFromFile(void** library, const char* path, void*, void*
 hipError_t hipLibraryUnload(void* library) {
   const ApiCall api("hipLibraryUnload");
   if (!library) return record(state(), hipErrorInvalidValue);
+  {
+    std::lock_guard<std::mutex> lock(g_unloadable_mutex);
+    if (g_unloadable.erase(library)) return record(state(), hipSuccess);
+  }
   return hipModuleUnload(static_cast<hipModule_t>(library));
 }
 hipError_t hipLibraryGetKernel(void** kernel, void* library, const char* name) {
   const ApiCall api("hipLibraryGetKernel");
   if (!kernel || !library || !name) return record(state(), hipErrorInvalidValue);
+  if (unloadable(library)) return record(state(), fail(hipErrorInvalidImage, "the library's image is not a code object"));
   return hipModuleGetFunction(reinterpret_cast<hipFunction_t*>(kernel), static_cast<hipModule_t>(library), name);
 }
 hipError_t hipLibraryGetKernelCount(unsigned int* count, void* library) {
   const ApiCall api("hipLibraryGetKernelCount");
+  if (library && unloadable(library)) return record(state(), hipErrorInvalidImage);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!count || !library) return record(s, hipErrorInvalidValue);
@@ -7133,6 +7294,75 @@ bool set_scratch_limit(int ordinal, size_t bytes) {
   std::lock_guard<std::mutex> lock(s.mutex);
   return set_scratch_limit_locked(s, ordinal, bytes);
 }
+bool ipc_share(void* ptr, int* device, uint64_t* size, uint32_t* serial, std::string* why) {
+  settle_before_sharing(ptr);
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) != hipSuccess) return *why = "no devices", false;
+  const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
+  if (d < 0) return *why = "the address is no device's memory", false;
+  *serial = next_ipc_serial();
+  char id[40];
+  std::snprintf(id, sizeof id, "%x-%x", static_cast<unsigned>(::getpid()), *serial);
+  try {
+    *size = s.rt->device(d).memory().share(reinterpret_cast<uint64_t>(ptr), ipc_path(id));
+  } catch (const std::exception& e) {
+    return *why = e.what(), false;
+  }
+  *device = d;
+  return true;
+}
+void* ipc_attach(uint32_t pid, uint32_t serial, uint64_t size, int device, std::string* why) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) != hipSuccess) return *why = "no devices", nullptr;
+  const int d = device >= 0 && device < s.rt->device_count() ? device : s.current;
+  char id[40];
+  std::snprintf(id, sizeof id, "%x-%x", pid, serial);
+  void* p = nullptr;
+  try {
+    p = reinterpret_cast<void*>(s.rt->device(d).memory().adopt(ipc_path(id), size));
+  } catch (const std::exception& e) {
+    return *why = e.what(), nullptr;
+  }
+  g_ipc_open[p] = d;
+  s.ipc_mapped.insert(d);
+  return p;
+}
+bool ipc_detach(void* ptr) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const auto it = g_ipc_open.find(ptr);
+  if (it == g_ipc_open.end()) return false;
+  s.rt->device(it->second).memory().abandon(reinterpret_cast<uint64_t>(ptr));
+  g_ipc_open.erase(it);
+  return true;
+}
+
+hipError_t vgpu_own_hipMemGetHandleForAddressRange(void* handle, void* ptr, size_t size, int type,
+                                                   unsigned long long flags)
+    __attribute__((alias("hipMemGetHandleForAddressRange"), visibility("hidden")));
+bool export_dmabuf(const void* ptr, size_t size, int* fd, uint64_t* offset, std::string* why) {
+  int out = -1;
+  if (vgpu_own_hipMemGetHandleForAddressRange(&out, const_cast<void*>(ptr), size, 1, 0) != hipSuccess)
+    return *why = "the range is not one device allocation's", false;
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  uint64_t base = va;
+  if (const auto m = vmm_mapping(va); m != g_vmm_maps.end()) base = m->first;
+  else if (auto p = g_dmabuf_paths.upper_bound(va); p != g_dmabuf_paths.begin()) base = std::prev(p)->first;
+  *fd = out;
+  *offset = va - base;
+  return true;
+}
+
+int physical(int ordinal) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  return s.rt && ordinal >= 0 && ordinal < s.rt->device_count() ? s.rt->device(ordinal).physical() : ordinal;
+}
+
 int owner(uint64_t address) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
@@ -7182,3 +7412,24 @@ bool copy(void* dst, const void* src, size_t n, std::string* why) {
 }
 
 }  // namespace vgpu::amd::shared
+
+// ---- HIP's virtual memory, for the HSA runtime -------------------------------------
+//
+// hsa_vmem.inc builds HSA's virtual memory on these calls. It reaches them by
+// these hidden names, never the exported ones: a program that loads ROCm's
+// own libamdhip64 over this HSA runtime has that library's hipMem* first in
+// the symbol search, and ROCm's implementations call back into HSA.
+extern "C" {
+hipError_t vgpu_own_hipMemAddressReserve(void** ptr, size_t size, size_t alignment, void*, unsigned long long) __attribute__((alias("hipMemAddressReserve"), visibility("hidden")));
+hipError_t vgpu_own_hipMemAddressFree(void* ptr, size_t size) __attribute__((alias("hipMemAddressFree"), visibility("hidden")));
+hipError_t vgpu_own_hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAllocationProp* prop, unsigned long long flags) __attribute__((alias("hipMemCreate"), visibility("hidden")));
+hipError_t vgpu_own_hipMemRelease(void* handle) __attribute__((alias("hipMemRelease"), visibility("hidden")));
+hipError_t vgpu_own_hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsigned long long flags) __attribute__((alias("hipMemMap"), visibility("hidden")));
+hipError_t vgpu_own_hipMemUnmap(void* ptr, size_t size) __attribute__((alias("hipMemUnmap"), visibility("hidden")));
+hipError_t vgpu_own_hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAccessDesc* desc, size_t count) __attribute__((alias("hipMemSetAccess"), visibility("hidden")));
+hipError_t vgpu_own_hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemLocation* location, void* ptr) __attribute__((alias("hipMemGetAccess"), visibility("hidden")));
+hipError_t vgpu_own_hipMemExportToShareableHandle(void* out, void* handle, int type, unsigned long long flags) __attribute__((alias("hipMemExportToShareableHandle"), visibility("hidden")));
+hipError_t vgpu_own_hipMemImportFromShareableHandle(void** handle, void* os_handle, int type) __attribute__((alias("hipMemImportFromShareableHandle"), visibility("hidden")));
+hipError_t vgpu_own_hipMemRetainAllocationHandle(void** handle, void* addr) __attribute__((alias("hipMemRetainAllocationHandle"), visibility("hidden")));
+hipError_t vgpu_own_hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocationProp* prop, void* handle) __attribute__((alias("hipMemGetAllocationPropertiesFromHandle"), visibility("hidden")));
+}

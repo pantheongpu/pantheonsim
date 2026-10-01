@@ -1,0 +1,97 @@
+# gfx1030 image instructions from HIP's texture and surface functions and hand-written image
+# instructions: the encoding and llvm-objdump's text. Written by amd/tools/isa-corpus.py.
+E0002000 80041200	buffer_load_format_x v18, v0, s[16:19], 0 idxen
+DC708000 0018000A	global_store_dword v10, v0, s[24:25]
+F0441108 00020004	image_atomic_add v0, v[4:5], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+F0443108 00020004	image_atomic_add v0, v[4:5], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc
+F0403308 00020004	image_atomic_cmpswap v[0:1], v[4:5], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm glc
+F1000208 00820004	image_gather4 v[0:3], v[4:5], s[8:15], s[16:19] dmask:0x2 dim:SQ_RSRC_IMG_2D
+F11C0108 00E40202	image_gather4_lz v[2:5], v[2:3], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F0381F08 00020004	image_get_resinfo v[0:3], v4, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+F0001308 80020004	image_load v0, v[4:5], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm d16
+F0001100 00020101	image_load v1, v1, s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm
+F0001108 00021A1F	image_load v26, v[31:32], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+F0001112 00021B07 00002220	image_load v27, [v7, v32, v34], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm
+F0001300 00020001	image_load v[0:1], v1, s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_1D unorm
+F0001F08 00020004	image_load v[0:3], v[4:5], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+F0041308 00020002	image_load_mip v[0:1], v[2:4], s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm
+F0001131 00020004	image_msaa_load v0, v[4:6], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA unorm
+F0800100 00820004	image_sample v0, v4, s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F0800F08 00820004	image_sample v[0:3], v[4:5], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0940F08 00820004	image_sample_b v[0:3], v[4:6], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0BC0108 00820004	image_sample_c_lz v0, v[4:6], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F088010C 00E41503 051D1E04 0000001B	image_sample_d v21, [v3, v4, v30, v29, v5, v27], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F0880100 00E41803	image_sample_d v24, v[3:5], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F0880F08 00820004	image_sample_d v[0:3], v[4:9], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0900108 00E41328	image_sample_l v19, v[40:42], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D
+F0900112 00E41728 002A0629	image_sample_l v23, [v40, v41, v6, v42], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_3D
+F0900102 00E41C28 0000002A	image_sample_l v28, [v40, v42], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F0900F08 00820004	image_sample_l v[0:3], v[4:6], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+F09C0110 00E41025	image_sample_lz v16, v[37:39], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_3D
+F09C012A 00E41125 00002A26	image_sample_lz v17, [v37, v38, v42], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_2D_ARRAY
+F09C0122 00E41425 0000002A	image_sample_lz v20, [v37, v42], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D_ARRAY
+F09C0118 00E4192B	image_sample_lz v25, v[43:45], s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_CUBE
+F09C0100 00E42325	image_sample_lz v35, v37, s[16:23], s[28:31] dmask:0x1 dim:SQ_RSRC_IMG_1D
+F09C0F08 00E40625	image_sample_lz v[6:9], v[37:38], s[16:23], s[28:31] dmask:0xf dim:SQ_RSRC_IMG_2D
+F0201100 0002010E	image_store v1, v14, s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm
+F0201108 00020208	image_store v2, v[8:9], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+F0201F08 00020105	image_store v[1:4], v[5:6], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+F0241108 00020406	image_store_mip v4, v[6:8], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+81078107	s_add_i32 s7, s7, 1
+800A0C0A	s_add_u32 s10, s10, s12
+800CFF0C FFFFEE38	s_add_u32 s12, s12, 0xffffee38
+820B0D0B	s_addc_u32 s11, s11, s13
+820DFF0D FFFFFFFF	s_addc_u32 s13, s13, -1
+8700007E	s_and_b32 s0, exec_lo, s0
+8700FF1C 00008000	s_and_b32 s0, s28, 0x8000
+876A017E	s_and_b32 vcc_lo, exec_lo, s1
+8A6A017E	s_andn2_b32 vcc_lo, exec_lo, s1
+910B9F22	s_ashr_i32 s11, s34, 31
+9387FF12 000E000E	s_bfe_u32 s7, s18, 0xe000e
+BF0C941E	s_bitcmp0_b32 s30, 20
+BFA10001	s_clause 0x1
+BF068000	s_cmp_eq_u32 s0, 0
+BF128000	s_cmp_eq_u64 s[0:1], 0
+BF078422	s_cmp_lg_u32 s34, 4
+BF13800A	s_cmp_lg_u64 s[10:11], 0
+BF9F0000	s_code_end
+850280C1	s_cselect_b32 s2, -1, 0
+BF810000	s_endpgm
+BE8C1F00	s_getpc_b64 s[12:13]
+F40000CD FA000030	s_load_dword s3, s[26:27], 0x30
+F40001C5 FA000000	s_load_dword s7, s[10:11], null
+F4040202 FA000010	s_load_dwordx2 s[8:9], s[4:5], 0x10
+F4080602 FA000000	s_load_dwordx4 s[24:27], s[4:5], null
+F408070D FA000030	s_load_dwordx4 s[28:31], s[26:27], 0x30
+F40C040D FA000000	s_load_dwordx8 s[16:23], s[26:27], null
+8F8A2381	s_lshl_b64 s[10:11], 1, s35
+8F8A820A	s_lshl_b64 s[10:11], s[10:11], 2
+BE810380	s_mov_b32 s1, 0
+BE8A0322	s_mov_b32 s10, s34
+BEEA0300	s_mov_b32 vcc_lo, s0
+BF8CC07F	s_waitcnt lgkmcnt(0)
+BF8C3F70	s_waitcnt vmcnt(0)
+06042D02	v_add_f32_e32 v2, v2, v22
+065008F0	v_add_f32_e32 v40, 0.5, v4
+D4C50001 00020481	v_cmp_ne_u32_e64 s1, 1, v2
+D5010011 001612F2	v_cndmask_b32_e64 v17, 1.0, v9, s5
+D5010002 001D0280	v_cndmask_b32_e64 v2, 0, 1, s7
+D5010025 000A2928	v_cndmask_b32_e64 v37, v40, v20, s2
+D544002D 03FE5328 3E800000	v_cubeid_f32 v45, v40, v41, 0x3e800000
+D5470018 03FE5328 3E800000	v_cubema_f32 v24, v40, v41, 0x3e800000
+D5450012 03FE5328 3E800000	v_cubesc_f32 v18, v40, v41, 0x3e800000
+D546000E 03FE5328 3E800000	v_cubetc_f32 v14, v40, v41, 0x3e800000
+7E0A0B0C	v_cvt_f32_i32_e32 v5, v12
+7E080D00	v_cvt_f32_u32_e32 v4, v0
+7E062306	v_cvt_f32_ubyte0_e32 v3, v6
+7E2E4915	v_floor_f32_e32 v23, v21
+D54B002C 03C2210E	v_fma_f32 v44, v14, v16, 0.5
+34140082	v_lshlrev_b32_e32 v10, 2, v0
+2C041690	v_lshrrev_b32_e32 v2, 16, v11
+2C041407	v_lshrrev_b32_e32 v2, s7, v10
+7E400206	v_mov_b32_e32 v32, s6
+7E5402F2	v_mov_b32_e32 v42, 1.0
+10261EFF 3E800000	v_mul_f32_e32 v19, 0x3e800000, v15
+102A2328	v_mul_f32_e32 v21, v40, v17
+161614FF 00005556	v_mul_u32_u24_e32 v11, 0x5556, v10
+7E285511	v_rcp_f32_e32 v20, v17

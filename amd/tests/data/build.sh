@@ -34,7 +34,7 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
@@ -46,7 +46,7 @@ for src in asm_lds_dma asm_ds_tr; do
 done
 
 # And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
-for src in asm_permlane; do
+for src in asm_permlane asm_images; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -c "$src.s" -o "$src.gfx1100.o"
   echo "wrote $(pwd)/$src.gfx1100.o"
 done
@@ -62,7 +62,7 @@ done
 # it the listing already checked in stays as it is.
 objdump=${2:-$(dirname "$(readlink -f "$(command -v "$clang")")")/llvm-objdump}
 if [[ -x "$objdump" ]]; then
-  for src in $sources asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait; do
+  for src in $sources asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp; do
     "$objdump" -d --mcpu=gfx942 "$src.gfx942.o" |
       sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > "$src.gfx942.dis"
     echo "wrote $(pwd)/$src.gfx942.dis ($(wc -l < "$src.gfx942.dis") instructions)"
@@ -90,6 +90,12 @@ raw = open("bundle.bin", "rb").read()
 packed = zlib.compress(raw, 9)
 head = b"CCOB" + struct.pack("<HHII", 2, 0, 24 + len(packed), len(raw)) + hashlib.md5(raw).digest()[:8]
 open("bundle_zlib.bin", "wb").write(head + packed)'
+  # A bundle with generic code as well as a processor's own: gfx9-4-generic
+  # (asm_sopk) and gfx942 with XNACK off (asm_vector), compressed.
+  targets=host-x86_64-unknown-linux-gnu,hipv4-amdgcn-amd-amdhsa--gfx9-4-generic
+  targets=$targets,hipv4-amdgcn-amd-amdhsa--gfx942:xnack-
+  "$bundler" --type=o --targets=$targets --input=/dev/null --input=asm_sopk.gfx942.o --input=asm_vector.gfx942.o \
+    --output=bundle_generic.bin --compress
   "$lld" -shared asm_scalar.gfx942.o asm_vector.gfx942.o -o linked.gfx942.hsaco
   # And the kernels an HSA program loads (amd/tests/hsa), linked as ROCm's
   # loader wants them.

@@ -16,6 +16,7 @@
 
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
+#include "vgpu/amd_image.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -288,6 +289,70 @@ VTEST(transposing_lds_reads_hand_each_lane_its_column) {
   VCHECK_EQ(wrong, 0);
 }
 
+VTEST(the_instructions_hip_tests_device_library_runs_compute_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_isa_gaps");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(64 * 4), counters(64 * 2);
+  uint32_t seed = 2024;
+  const auto next = [&] {
+    seed = seed * 1103515245u + 12345u;
+    return seed;
+  };
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[4 * l + 0] = l < 8 ? 0xFFFFFFF0u + l : next();   // some sums that saturate
+    in[4 * l + 1] = l < 8 ? 0x40u : next() >> (l & 7);
+    in[4 * l + 2] = f(static_cast<float>(l) * 0.37f - 7.0f);
+    in[4 * l + 3] = next();
+    counters[2 * l] = l % 5;         // at, below and past the limit
+    counters[2 * l + 1] = l % 3 == 0 ? 0 : next() % 200;
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 20 * 4), cnt = mem.alloc(counters.size() * 4);
+  mem.write(in_d, in.data(), in.size() * 4);
+  mem.write(cnt, counters.data(), counters.size() * 4);
+  const std::vector<uint32_t> r = run(o, "gaps", mem, out, 64 * 20, {in_d, out, cnt});
+  std::vector<uint32_t> after(counters.size());
+  mem.read(cnt, after.data(), after.size() * 4);
+  const auto s16 = [](uint32_t x, int h) { return static_cast<int64_t>(static_cast<int16_t>(x >> (16 * h))); };
+  const auto s4 = [](uint32_t x, int k) {
+    int64_t v = (x >> (4 * k)) & 15;
+    return v & 8 ? v - 16 : v;
+  };
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint32_t a = in[4 * l], b = in[4 * l + 1], c = in[4 * l + 2], d = in[4 * l + 3];
+    const uint32_t* got = &r[20 * l];
+    float cf;
+    std::memcpy(&cf, &c, 4);
+    int64_t dot2i = static_cast<int32_t>(d), dot2u = d, dot4u = d, dot8i = static_cast<int32_t>(d), dot8u = d;
+    for (int h = 0; h < 2; ++h) {
+      dot2i += s16(a, h) * s16(b, h);
+      dot2u += int64_t{(a >> (16 * h)) & 0xFFFF} * ((b >> (16 * h)) & 0xFFFF);
+    }
+    for (int k = 0; k < 4; ++k) dot4u += int64_t{(a >> (8 * k)) & 0xFF} * ((b >> (8 * k)) & 0xFF);
+    for (int k = 0; k < 8; ++k) {
+      dot8i += s4(a, k) * s4(b, k);
+      dot8u += int64_t{(a >> (4 * k)) & 15} * ((b >> (4 * k)) & 15);
+    }
+    const uint32_t inc_after = counters[2 * l] >= b ? 0 : counters[2 * l] + 1;
+    const uint32_t dec_before = counters[2 * l + 1];
+    const uint32_t dec_after = dec_before == 0 || dec_before > b ? b : dec_before - 1;
+    const uint32_t lds_inc = a >= b ? 0 : a + 1;
+    const uint32_t want[20] = {
+        uint64_t{a} + b > UINT32_MAX ? UINT32_MAX : a + b,
+        b > a ? 0u : a - b,
+        f(cf - std::floor(cf)),
+        u(dot2i), u(dot2u), u(dot4u), u(dot8i), u(dot8u),
+        u(dot2i), u(dot8i),   // the VOP2 forms add into d the same way (no clamp, no overflow here)
+        l == 63 ? 0xFFFFu : l + 1, l == 0 ? 0xFFFFu : l - 1, (l + 1) % 64, (l + 63) % 64,
+        counters[2 * l], dec_before,
+        a, lds_inc, c, 0};
+    for (int i = 0; i < 20; ++i) wrong += got[i] != want[i];
+    wrong += after[2 * l] != inc_after;
+    wrong += after[2 * l + 1] != dec_after;
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(a_work_group_waiting_for_another_on_the_same_thread_is_released) {
   // One host thread, two groups, group 0 first and waiting for group 1.
   setenv("VGPU_THREADS", "1", 1);
@@ -353,6 +418,178 @@ VTEST(rdna4_gives_each_wave_its_number_in_ttmp8) {
   mem.read(out, r.data(), 128 * 4);
   int wrong = 0;
   for (uint32_t i = 0; i < 128; ++i) wrong += r[i] != i / 32;
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(lds_64_bit_read_modify_writes_and_the_scalar_bit_operations_compute_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_lds64");
+  MemoryManager mem(16ull << 20);
+  // a and b per lane: doubles, so the floating-point forms see numbers, whose
+  // bits the integer forms take as they are; some lanes a == b, some a > b.
+  std::vector<uint64_t> in(128);
+  for (uint32_t l = 0; l < 64; ++l) {
+    const double a = static_cast<double>(l) * 1.25 - 20.0, b = l % 7 == 0 ? a : static_cast<double>(63 - l) * 0.5;
+    std::memcpy(&in[2 * l], &a, 8);
+    std::memcpy(&in[2 * l + 1], &b, 8);
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 8), out = mem.alloc(64 * 68 * 8);
+  mem.write(in_d, in.data(), in.size() * 8);
+  const std::vector<uint32_t> r = run(o, "lds64", mem, out, 64 * 68 * 2, {in_d, out});
+  const auto dbl = [](uint64_t x) {
+    double d;
+    std::memcpy(&d, &x, 8);
+    return d;
+  };
+  const auto bits = [](double d) {
+    uint64_t x;
+    std::memcpy(&x, &d, 8);
+    return x;
+  };
+  const char* names[] = {"add_u64", "sub_u64", "rsub_u64", "inc_u64", "dec_u64", "min_i64", "max_i64", "min_u64",
+                         "max_u64", "and_b64", "or_b64", "xor_b64", "add_f64", "min_f64", "max_f64"};
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint64_t a = in[2 * l], b = in[2 * l + 1];
+    const auto at = [&](uint32_t word) { return uint64_t{r[(68 * l + word) * 2]} | uint64_t{r[(68 * l + word) * 2 + 1]} << 32; };
+    for (uint32_t k = 0; k < 30; ++k) {
+      const std::string what = k < 15 ? names[k] : k == 27 ? "wrxchg_b64" : k < 27 ? names[k - 15] : k == 28 ? "min_f64" : "max_f64";
+      uint64_t now = a;
+      if (what == "add_u64") now = a + b;
+      else if (what == "sub_u64") now = a - b;
+      else if (what == "rsub_u64") now = b - a;
+      else if (what == "inc_u64") now = a >= b ? 0 : a + 1;
+      else if (what == "dec_u64") now = a == 0 || a > b ? b : a - 1;
+      else if (what == "min_i64") now = static_cast<uint64_t>(std::min(static_cast<int64_t>(a), static_cast<int64_t>(b)));
+      else if (what == "max_i64") now = static_cast<uint64_t>(std::max(static_cast<int64_t>(a), static_cast<int64_t>(b)));
+      else if (what == "min_u64") now = std::min(a, b);
+      else if (what == "max_u64") now = std::max(a, b);
+      else if (what == "and_b64") now = a & b;
+      else if (what == "or_b64") now = a | b;
+      else if (what == "xor_b64") now = a ^ b;
+      else if (what == "wrxchg_b64") now = b;
+      else if (what == "add_f64") now = bits(dbl(a) + dbl(b));
+      else if (what == "min_f64") now = bits(std::fmin(dbl(a), dbl(b)));
+      else if (what == "max_f64") now = bits(std::fmax(dbl(a), dbl(b)));
+      const uint64_t handed_back = k >= 15 ? a : 0;
+      wrong += at(2 * k) != handed_back;
+      wrong += at(2 * k + 1) != now;
+    }
+    // The scalar results, on lane 0's a, the same in every lane.
+    const uint64_t s = in[0];
+    uint64_t brev = 0, wqm64 = 0;
+    uint32_t wqm32 = 0;
+    for (int i = 0; i < 64; ++i) brev |= ((s >> i) & 1) << (63 - i);
+    for (int q = 0; q < 16; ++q)
+      if ((s >> (4 * q)) & 0xF) wqm64 |= uint64_t{0xF} << (4 * q);
+    for (int q = 0; q < 8; ++q)
+      if ((s >> (4 * q)) & 0xF) wqm32 |= 0xFu << (4 * q);
+    const uint32_t lo = static_cast<uint32_t>(s);
+    const uint32_t want[14] = {static_cast<uint32_t>(brev), static_cast<uint32_t>(brev >> 32),
+                               static_cast<uint32_t>(64 - __builtin_popcountll(s)), static_cast<uint32_t>(32 - __builtin_popcount(lo)),
+                               ~lo ? static_cast<uint32_t>(__builtin_ctz(~lo)) : 0xFFFFFFFFu,
+                               ~s ? static_cast<uint32_t>(__builtin_ctzll(~s)) : 0xFFFFFFFFu,
+                               static_cast<uint32_t>(wqm64), static_cast<uint32_t>(wqm64 >> 32), wqm32,
+                               lo, static_cast<uint32_t>(s >> 32), 0, 0, 0};
+    for (int i = 0; i < 14; ++i) wrong += r[(68 * l + 60) * 2 + i] != want[i];
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(lds_float_atomics_and_compare_and_stores_compute_what_the_isa_says) {
+  const amd::CodeObject o = object("asm_ldsf32");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(128);
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[2 * l] = f(static_cast<float>(l) * 0.75f - 12.0f);
+    in[2 * l + 1] = f(l % 5 == 0 ? static_cast<float>(l) * 0.75f - 12.0f : static_cast<float>(40 - l) * 0.5f);
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 24 * 4);
+  mem.write(in_d, in.data(), in.size() * 4);
+  const std::vector<uint32_t> r = run(o, "ldsf32", mem, out, 64 * 24, {in_d, out});
+  const auto fl = [](uint32_t x) {
+    float v;
+    std::memcpy(&v, &x, 4);
+    return v;
+  };
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint32_t a = in[2 * l], b = in[2 * l + 1];
+    const uint32_t sum = f(fl(a) + fl(b)), lo = f(std::fmin(fl(a), fl(b))), hi = f(std::fmax(fl(a), fl(b)));
+    const uint32_t keep_or_b = fl(b) == fl(b) && fl(a) == fl(b) ? b : a;   // cmpst_f32 against b
+    const uint32_t want[18] = {0, sum, a, sum, 0, lo, a, lo, 0, hi, a, hi,
+                               0, b,                // cmpst_b32 against a: b stored
+                               0, keep_or_b,        // cmpst_f32 against b: a kept unless a == b
+                               a, b};               // cmpst_rtn_f32 against a: a handed back, b stored
+    const uint32_t* got = &r[24 * l];
+    for (int i = 0; i < 18; ++i) wrong += got[i] != want[i];
+    uint64_t pair = uint64_t{a} | uint64_t{b} << 32;
+    double d;
+    std::memcpy(&d, &pair, 8);
+    d += d;
+    uint64_t twice;
+    std::memcpy(&twice, &d, 8);
+    wrong += got[18] != a || got[19] != b;   // ds_add_rtn_f64 hands back the pair
+    wrong += got[20] != static_cast<uint32_t>(twice) || got[21] != static_cast<uint32_t>(twice >> 32);
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(each_byte_of_a_word_converts_to_its_own_float) {
+  // v_cvt_f32_ubyte1 and 2 read byte 3 until the byte was taken from the
+  // right place in the name: uchar2's divide came out with a zero .y.
+  const amd::CodeObject o = object("asm_cvt_ubyte");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(64);
+  for (uint32_t l = 0; l < 64; ++l) in[l] = 0x01020304u * (l + 1) ^ (l << 11);
+  const uint64_t in_d = mem.alloc(64 * 4), out = mem.alloc(64 * 32);
+  mem.write(in_d, in.data(), 64 * 4);
+  const std::vector<uint32_t> r = run(o, "cvt_ubyte", mem, out, 64 * 8, {in_d, out});
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l)
+    for (uint32_t k = 0; k < 4; ++k) {
+      wrong += r[8 * l + k] != f(static_cast<float>((in[l] >> (8 * k)) & 0xFF));
+      wrong += r[8 * l + 4 + k] != f(static_cast<float>((in[0] >> (8 * k)) & 0xFF));
+    }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(a_half_dot_product_into_a_float_is_not_held_to_one_by_its_clamp) {
+  // amd_mixed_dot({1, 3}, {3, 3}, 2, true) is 14 on a card; the clamp that
+  // holds other float results to [0, 1] does not hold this one.
+  const amd::CodeObject o = object("asm_dot_clamp");
+  MemoryManager mem(16ull << 20);
+  const auto h2 = [](float lo, float hi) {
+    const _Float16 a = static_cast<_Float16>(lo), b = static_cast<_Float16>(hi);
+    uint16_t x, y;
+    std::memcpy(&x, &a, 2);
+    std::memcpy(&y, &b, 2);
+    return uint32_t{x} | uint32_t{y} << 16;
+  };
+  std::vector<uint32_t> in(64 * 3);
+  std::vector<float> al(64), ah(64), bl(64), bh(64), c(64);
+  for (uint32_t l = 0; l < 64; ++l) {
+    al[l] = static_cast<float>(l % 7) - 2.0f, ah[l] = static_cast<float>(l % 5) + 0.5f;
+    bl[l] = static_cast<float>(l % 3) + 1.0f, bh[l] = static_cast<float>(l % 11) - 4.0f;
+    c[l] = static_cast<float>(l) * 0.25f - 3.0f;
+    in[3 * l] = h2(al[l], ah[l]);
+    in[3 * l + 1] = h2(bl[l], bh[l]);
+    in[3 * l + 2] = f(c[l]);
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 32);
+  mem.write(in_d, in.data(), in.size() * 4);
+  const std::vector<uint32_t> r = run(o, "dot_clamp", mem, out, 64 * 8, {in_d, out});
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const auto dot = [&](float a0, float a1, float b0, float b1, float cc) {
+      return f(static_cast<float>(double(a0) * b0 + double(a1) * b1 + cc));
+    };
+    const uint32_t want[8] = {
+        dot(al[l], ah[l], bl[l], bh[l], c[l]),  dot(al[l], ah[l], bl[l], bh[l], c[l]),
+        dot(-al[l], ah[l], bl[l], bh[l], c[l]), dot(al[l], ah[l], bl[l], -bh[l], c[l]),
+        dot(al[l], ah[l], bl[l], bh[l], -c[l]), dot(-al[l], ah[l], bl[l], bh[l], c[l]),
+        dot(al[l], ah[l], bl[l], bh[l], c[l]),  dot(al[l], -ah[l], -bl[l], bh[l], c[l])};
+    for (int i = 0; i < 8; ++i) wrong += r[8 * l + i] != want[i];
+  }
   VCHECK_EQ(wrong, 0);
 }
 
@@ -555,6 +792,127 @@ VTEST(the_real_time_clock_counts_at_the_wall_clock_rate) {
   // The instructions the thread running the wave has retired: a count far
   // below a clock that has been going since the host started.
   VCHECK(shader < realtime / 1000);
+}
+
+// RDNA's image instructions and formatted buffer loads (asm_images.s) on
+// resources written here as the runtime writes a texture's: each result
+// against the texel arithmetic done on the host.
+VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_describe) {
+  namespace im = amd::image;
+  const amd::CodeObject o = object("asm_images", "gfx1100");
+  constexpr im::Gen G = im::Gen::Gfx11;
+  MemoryManager mem(16ull << 20);
+  const auto t0 = [](int64_t x, int64_t y) {
+    x = std::clamp<int64_t>(x, 0, 7), y = std::clamp<int64_t>(y, 0, 3);
+    return static_cast<float>(x + 10 * y) + 0.25f;
+  };
+  std::vector<float> f0(32);
+  for (uint32_t i = 0; i < 32; ++i) f0[i] = t0(i % 8, i / 8);
+  std::vector<uint8_t> rgba(4 * 8), elems(4 * 32);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>((i % 4) * 40), static_cast<uint8_t>((i / 4) * 100), 7, 255};
+    std::memcpy(&rgba[4 * i], b, 4);
+  }
+  for (uint32_t i = 0; i < 32; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>(i), static_cast<uint8_t>(2 * i), static_cast<uint8_t>(3 * i),
+                          static_cast<uint8_t>(255 - i)};
+    std::memcpy(&elems[4 * i], b, 4);
+  }
+  std::vector<float> mips(16 + 4);
+  for (uint32_t i = 0; i < 20; ++i) mips[i] = i < 16 ? 1.0f : 2.0f;
+  const uint64_t d0 = mem.alloc(32 * 4), d1 = mem.alloc(rgba.size()), d2 = mem.alloc(32 * 4),
+                 db = mem.alloc(elems.size()), d3 = mem.alloc(mips.size() * 4);
+  mem.write(d0, f0.data(), 32 * 4);
+  mem.write(d1, rgba.data(), rgba.size());
+  const std::vector<uint32_t> zero(32, 0);
+  mem.write(d2, zero.data(), 32 * 4);
+  mem.write(db, elems.data(), elems.size());
+  mem.write(d3, mips.data(), mips.size() * 4);
+
+  uint32_t desc[48] = {};
+  im::Image i0;
+  i0.base = d0, i0.width = 8, i0.height = 4, i0.format = {im::Data::D32, im::Num::Float};
+  im::encode(i0, G, &desc[0]);
+  im::Image i1;
+  i1.base = d1, i1.width = 4, i1.height = 2, i1.format = {im::Data::D8_8_8_8, im::Num::Unorm};
+  im::encode(i1, G, &desc[8]);
+  im::Image i2 = i0;
+  i2.base = d2, i2.format = {im::Data::D32, im::Num::Uint};
+  im::encode(i2, G, &desc[16]);
+  im::Sampler point, linear, mip;
+  im::encode(point, G, &desc[24]);
+  linear.mag_linear = linear.min_linear = true;
+  im::encode(linear, G, &desc[28]);
+  im::encode_buffer(db, 4, 32, {im::Data::D8_8_8_8, im::Num::Unorm}, G, &desc[32]);
+  im::Image i3;
+  i3.base = d3, i3.width = 4, i3.height = 4, i3.last_level = 1, i3.format = {im::Data::D32, im::Num::Float};
+  im::encode(i3, G, &desc[36]);
+  mip.mip_filter = 2;
+  im::encode(mip, G, &desc[44]);
+  // The resources round-trip, and T3's level 1 sits right after level 0.
+  VCHECK_EQ(im::decode_image(&desc[8], G).width, 4u);
+  VCHECK(im::decode_image(&desc[8], G).format.data == im::Data::D8_8_8_8);
+  VCHECK_EQ(im::texel_offset(i3, 1, 0, 0, 0), uint64_t{64});
+  VCHECK(im::decode_sampler(&desc[28], G).mag_linear);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(800 * 4);
+  mem.write(ddesc, desc, sizeof(desc));
+
+  const amd::Kernel* k = amd::find_kernel(o, "images");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  std::memcpy(&args[0], &out, 8);
+  std::memcpy(&args[8], &ddesc, 8);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 32;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(800);
+  mem.read(out, r.data(), r.size() * 4);
+  const auto f = [&](uint32_t at) {
+    float v;
+    std::memcpy(&v, &r[at], 4);
+    return v;
+  };
+  const auto half = [](float v) {
+    const _Float16 h = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return uint32_t{b};
+  };
+  int wrong[13] = {};
+  for (uint32_t l = 0; l < 32; ++l) {
+    const int64_t x = l % 8, y = l / 8;
+    wrong[0] += f(l) != t0(x, y);
+    wrong[1] += f(32 + l) != t0(x, y);
+    wrong[2] += f(64 + l) != (x == 0 ? t0(0, y) : t0(x, y) - 0.5f);
+    const uint32_t t = (l % 4) + 4 * ((l / 4) % 2);
+    for (uint32_t c = 0; c < 4; ++c) wrong[3] += std::fabs(f(96 + 4 * l + c) - rgba[4 * t + c] / 255.0f) > 1e-6f;
+    const uint32_t level = l % 2;
+    wrong[4] += r[224 + 4 * l] != (4u >> level) || r[225 + 4 * l] != (4u >> level) || r[226 + 4 * l] != 1 ||
+                r[227 + 4 * l] != 2;
+    const float g[4] = {t0(x, y + 1), t0(x + 1, y + 1), t0(x + 1, y), t0(x, y)};
+    for (uint32_t c = 0; c < 4; ++c) wrong[5] += f(352 + 4 * l + c) != g[c];
+    for (uint32_t c = 0; c < 4; ++c) wrong[6] += std::fabs(f(480 + 4 * l + c) - elems[4 * l + c] / 255.0f) > 1e-6f;
+    wrong[7] += r[608 + l] != 0;
+    wrong[8] += f(640 + l) != t0(x, y);
+    const double lod = std::min(1.0, static_cast<double>(static_cast<float>(l) * 0.1f));
+    wrong[9] += std::fabs(f(672 + l) - static_cast<float>(1.0 + lod)) > 1e-6f;
+    wrong[10] += r[704 + l] != (half(rgba[4 * t] / 255.0f) | half(rgba[4 * t + 1] / 255.0f) << 16);
+    wrong[11] += r[736 + l] != 3 * l;
+    float e;
+    std::memcpy(&e, &elems[4 * l], 4);
+    wrong[12] += std::memcmp(&r[768 + l], &e, 4) != 0;
+  }
+  for (int c = 0; c < 13; ++c) VCHECK_EQ(wrong[c], 0);
+  std::vector<uint32_t> stored(32);
+  mem.read(d2, stored.data(), 32 * 4);
+  int bad = 0;
+  for (uint32_t l = 0; l < 32; ++l) bad += stored[l] != 3 * l + 5;
+  VCHECK_EQ(bad, 0);
 }
 
 VTEST_MAIN

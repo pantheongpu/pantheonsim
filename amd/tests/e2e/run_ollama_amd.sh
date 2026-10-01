@@ -66,9 +66,12 @@ fi
 port=$((20000 + RANDOM % 20000))
 api="http://127.0.0.1:$port"
 # serve <log> [env...]: an ollama server with the given environment, ready.
+# CUDA_VISIBLE_DEVICES=-1 keeps ollama's CUDA backends from looking; ROCm's
+# HIP reads it too when HIP_VISIBLE_DEVICES is unset, and would then show no
+# GPU, so HIP_VISIBLE_DEVICES names the one there is.
 serve() {
   local log=$1; shift
-  env OLLAMA_HOST="127.0.0.1:$port" OLLAMA_DEBUG=1 CUDA_VISIBLE_DEVICES=-1 ROCBLAS_USE_HIPBLASLT=0 \
+  env OLLAMA_HOST="127.0.0.1:$port" OLLAMA_DEBUG=1 CUDA_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=0 ROCBLAS_USE_HIPBLASLT=0 \
       OLLAMA_LOAD_TIMEOUT="${OLLAMA_LOAD_TIMEOUT:-60m}" "$@" ollama serve > "$log" 2>&1 &
   serve_pid=$!
   for _ in $(seq 150); do curl -s -m 2 "$api/api/version" >/dev/null && return 0; sleep 0.2; done

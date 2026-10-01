@@ -30,6 +30,11 @@ static std::string err(hipError_t e) { return hipGetErrorName(e); }
     check(got_ == (want), what, "got " + err(got_) + ", want " + err(want)); \
   } while (0)
 
+__global__ void takes_nothing() {}
+// A static __constant__ variable is reached through the code object's global
+// offset table, which the loader fills in when it places the image.
+__device__ static __constant__ float static_const[4];
+__global__ void where_static_const(void** out) { *out = static_cast<void*>(static_const); }
 __global__ void add_one(int* p, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) p[i] += 1;
@@ -315,10 +320,53 @@ int main() {
     (void)hipFree(m);
   }
 
+  EXPECT(hipUnbindTexture(nullptr), hipErrorInvalidValue, "unbinding no texture");
+
   char api_name[64];
   std::snprintf(api_name, sizeof api_name, "%s", hipApiName(1));
   check(std::string(api_name) == "__hipPopCallConfiguration" && std::string(hipApiName(0)) == "unknown",
         "hipApiName names HIP's functions by their trace id");
+
+  // A kernel that takes nothing of the program's is launched with no
+  // arguments at all: what the compiler adds is the runtime's to fill in.
+  EXPECT(hipLaunchKernel(reinterpret_cast<const void*>(takes_nothing), dim3(1), dim3(1), nullptr, 0, nullptr),
+         hipSuccess, "a kernel without parameters launches with no argument array");
+  EXPECT(hipLaunchCooperativeKernel(reinterpret_cast<const void*>(takes_nothing), dim3(1), dim3(1), nullptr, 0,
+                                    nullptr),
+         hipSuccess, "cooperatively too");
+  (void)hipDeviceSynchronize();
+  EXPECT(hipFuncSetAttribute(reinterpret_cast<const void*>(takes_nothing), hipFuncAttributeMax, 90), hipSuccess,
+         "hipFuncAttributeMax is taken, as ROCm takes it");
+  EXPECT(hipFuncSetAttribute(reinterpret_cast<const void*>(takes_nothing), static_cast<hipFuncAttribute>(-1), 90),
+         hipErrorInvalidValue, "an attribute that is none is not");
+  void** where_d = nullptr;
+  (void)hipMalloc(&where_d, sizeof(void*));
+  where_static_const<<<1, 1>>>(where_d);
+  void* seen = nullptr;
+  (void)hipMemcpy(&seen, where_d, sizeof seen, hipMemcpyDeviceToHost);
+  void* named = nullptr;
+  (void)hipGetSymbolAddress(&named, HIP_SYMBOL(static_const));
+  check(seen && seen == named, "a kernel finds a static __constant__ variable where hipGetSymbolAddress says it is");
+  (void)hipFree(where_d);
+  hipEvent_t gone_event = nullptr;
+  (void)hipEventCreate(&gone_event);
+  (void)hipEventDestroy(gone_event);
+  EXPECT(hipExtLaunchKernel(reinterpret_cast<const void*>(takes_nothing), dim3(1), dim3(1), nullptr, 0, nullptr, gone_event,
+                            nullptr, 0),
+         hipErrorInvalidValue, "hipExtLaunchKernel with an event that is gone");
+  (void)hipGetLastError();
+  hipEvent_t waited = nullptr;
+  (void)hipEventCreate(&waited);
+  EXPECT(hipStreamWaitEvent(nullptr, waited, ~0u), hipErrorInvalidValue, "a wait with flags that are none");
+  (void)hipEventDestroy(waited);
+  hipStream_t masked_none = nullptr;
+  const uint32_t no_cus[4] = {0, 0, 0, 0};
+  (void)hipExtStreamCreateWithCUMask(&masked_none, 4, no_cus);
+  uint32_t got_mask[4] = {0, 0, 0, 0};
+  (void)hipExtStreamGetCUMask(masked_none, 4, got_mask);
+  check(got_mask[0] == 0xFFFFFFFFu, "a CU mask with no unit in it gives the stream every unit");
+  (void)hipStreamDestroy(masked_none);
+  (void)hipGetLastError();
 
   std::printf("api: %d checks, %d failed\n", checks, failures);
   return failures ? 1 : 0;

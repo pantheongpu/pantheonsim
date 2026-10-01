@@ -103,6 +103,13 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
     check_against_assembler("asm_logic.gfx942.o", "asm_logic.gfx942.dis");
     check_against_assembler("asm_atomics.gfx942.o", "asm_atomics.gfx942.dis");
     check_against_assembler("asm_bcast.gfx942.o", "asm_bcast.gfx942.dis");
+    // What hip-tests' device library runs beyond those: dot products, fract,
+    // clamped integer adds, whole-wave DPP, increment and decrement atomics.
+    check_against_assembler("asm_isa_gaps.gfx942.o", "asm_isa_gaps.gfx942.dis");
+    check_against_assembler("asm_lds64.gfx942.o", "asm_lds64.gfx942.dis");
+    check_against_assembler("asm_ldsf32.gfx942.o", "asm_ldsf32.gfx942.dis");
+    check_against_assembler("asm_cvt_ubyte.gfx942.o", "asm_cvt_ubyte.gfx942.dis");
+    check_against_assembler("asm_dot_clamp.gfx942.o", "asm_dot_clamp.gfx942.dis");
     // And the hand-written kernels the executor's tests run, instruction by
     // instruction, so a decoder change that misreads one shows up here too.
     for (const char* name : {"asm_sopk", "asm_scalar", "asm_memory", "asm_vector"})
@@ -116,7 +123,8 @@ VTEST(every_instruction_decodes_as_the_assembler_wrote_it) {
 namespace {
 // Decodes every instruction of a corpus (amd/tools/isa-corpus.py) and
 // compares it with llvm-objdump's text for it.
-void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::Target::Gfx942) {
+// `at_least`: how many lines the corpus must have, so an emptied one fails.
+void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::Target::Gfx942, size_t at_least = 1000) {
   const std::vector<std::string> corpus = lines(read(file, false));
   size_t checked = 0;
   std::string wrong;
@@ -140,7 +148,7 @@ void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::T
     ++checked;
     if (got != want && wrong_count++ < 40) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
   }
-  VCHECK(checked > 1000);
+  VCHECK(checked > at_least);
   if (wrong_count)
     throw vtest::Failure(std::to_string(wrong_count) + " of " + std::to_string(checked) + " differ:" + wrong);
 }
@@ -172,6 +180,16 @@ VTEST(every_gfx1100_instruction_shape_decodes_as_llvm_prints_it) {
 // cache policy.
 VTEST(every_gfx1201_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200);
+}
+
+// RDNA's image instructions (MIMG; RDNA4's VIMAGE and VSAMPLE): what HIP's
+// texture and surface functions compile to, and hand-written forms beside
+// them (NSA addresses, d16, a16, tfe, arrays, cubes, atomics), each decoded
+// and printed as llvm-objdump prints it.
+VTEST(every_rdna_image_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_images_gfx1030.txt", amd::gcn::Target::Gfx1030, 40);
+  check_corpus("isa_corpus_images_gfx1100.txt", amd::gcn::Target::Gfx1100, 40);
+  check_corpus("isa_corpus_images_gfx1201.txt", amd::gcn::Target::Gfx1200, 40);
 }
 
 // And gfx1030 (RDNA2): gfx9's names, gfx10's memory bits, M0 and null the

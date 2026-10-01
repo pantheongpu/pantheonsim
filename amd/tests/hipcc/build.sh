@@ -62,9 +62,25 @@ echo "wrote $(pwd)/graphs.gfx942"
 "$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx942 exports_kernel.cpp -o exports_kernel.gfx942.co
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 exports.cpp -o exports.gfx942
 echo "wrote $(pwd)/exports.gfx942 and exports_kernel.gfx942.co"
+# Modules: a code object built for gfx9-4-generic only, which gfx942 runs as
+# a member of that family, and the program that loads it.
+"$rocm/bin/hipcc" -O2 --genco --offload-arch=gfx9-4-generic modules_kernel.cpp -o modules_kernel.generic.co
+"$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 modules.cpp -o modules.gfx942
+echo "wrote $(pwd)/modules.gfx942 and modules_kernel.generic.co"
+# Atomics: a flat one landing in LDS, a kernel's and a host thread's on one
+# pinned counter, and a float max by compare-and-swap.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 atomics.cpp -o atomics.gfx942
+echo "wrote $(pwd)/atomics.gfx942"
 # Events shared with another process, which it forks for.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 ipc.cpp -o ipc.gfx942
 echo "wrote $(pwd)/ipc.gfx942"
+# Every error code's name and text; rocm/errors.expected is the same program
+# on ROCm's own libamdhip64.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 errors.cpp -o errors.gfx942
+echo "wrote $(pwd)/errors.gfx942"
+# How many devices a program is shown, under the visible-devices variables.
+"$rocm/bin/hipcc" -O2 --offload-arch=gfx942 visible.cpp -o visible.gfx942
+echo "wrote $(pwd)/visible.gfx942"
 
 # Streams that run at once: kernels on two streams handing values to each
 # other, events, stream waits, the null stream's ordering, host functions.
@@ -102,6 +118,11 @@ echo "wrote $(pwd)/rdna4.gfx1201"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 rdna2.cpp -o rdna2.gfx1030
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1030 rdna2.cpp -o rdna2.w64.gfx1030
 echo "wrote $(pwd)/rdna2.gfx1030 and rdna2.w64.gfx1030"
+# Arrays, textures and surfaces, for each RDNA generation's image resources.
+for arch in gfx1030 gfx1100 gfx1201; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
+done
+echo "wrote $(pwd)/images.gfx1030, images.gfx1100 and images.gfx1201"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

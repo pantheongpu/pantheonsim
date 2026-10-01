@@ -1,0 +1,74 @@
+0|hipSuccess|no error|hipSuccess|no error
+1|hipErrorInvalidValue|invalid argument|hipErrorInvalidValue|invalid argument
+2|hipErrorOutOfMemory|out of memory|hipErrorOutOfMemory|out of memory
+3|hipErrorNotInitialized|initialization error|hipErrorNotInitialized|initialization error
+4|hipErrorDeinitialized|driver shutting down|hipErrorDeinitialized|driver shutting down
+5|hipErrorProfilerDisabled|profiler disabled while using external profiling tool|hipErrorProfilerDisabled|profiler disabled while using external profiling tool
+6|hipErrorProfilerNotInitialized|profiler is not initialized|hipErrorProfilerNotInitialized|profiler is not initialized
+7|hipErrorProfilerAlreadyStarted|profiler already started|hipErrorProfilerAlreadyStarted|profiler already started
+8|hipErrorProfilerAlreadyStopped|profiler already stopped|hipErrorProfilerAlreadyStopped|profiler already stopped
+9|hipErrorInvalidConfiguration|invalid configuration argument|hipErrorInvalidConfiguration|invalid configuration argument
+12|hipErrorInvalidPitchValue|invalid pitch argument|hipErrorInvalidPitchValue|invalid pitch argument
+13|hipErrorInvalidSymbol|invalid device symbol|hipErrorInvalidSymbol|invalid device symbol
+17|hipErrorInvalidDevicePointer|invalid device pointer|hipErrorInvalidDevicePointer|invalid device pointer
+21|hipErrorInvalidMemcpyDirection|invalid copy direction for memcpy|hipErrorInvalidMemcpyDirection|invalid copy direction for memcpy
+35|hipErrorInsufficientDriver|driver version is insufficient for runtime version|hipErrorInsufficientDriver|driver version is insufficient for runtime version
+52|hipErrorMissingConfiguration|__global__ function call is not configured|hipErrorMissingConfiguration|__global__ function call is not configured
+53|hipErrorPriorLaunchFailure|unspecified launch failure in prior launch|hipErrorPriorLaunchFailure|unspecified launch failure in prior launch
+98|hipErrorInvalidDeviceFunction|invalid device function|hipErrorInvalidDeviceFunction|invalid device function
+100|hipErrorNoDevice|no ROCm-capable device is detected|hipErrorNoDevice|no ROCm-capable device is detected
+101|hipErrorInvalidDevice|invalid device ordinal|hipErrorInvalidDevice|invalid device ordinal
+200|hipErrorInvalidImage|device kernel image is invalid|hipErrorInvalidImage|device kernel image is invalid
+201|hipErrorInvalidContext|invalid device context|hipErrorInvalidContext|invalid device context
+202|hipErrorContextAlreadyCurrent|context is already current context|hipErrorContextAlreadyCurrent|context is already current context
+205|hipErrorMapFailed|mapping of buffer object failed|hipErrorMapFailed|mapping of buffer object failed
+206|hipErrorUnmapFailed|unmapping of buffer object failed|hipErrorUnmapFailed|unmapping of buffer object failed
+207|hipErrorArrayIsMapped|array is mapped|hipErrorArrayIsMapped|array is mapped
+208|hipErrorAlreadyMapped|resource already mapped|hipErrorAlreadyMapped|resource already mapped
+209|hipErrorNoBinaryForGpu|no kernel image is available for execution on the device|hipErrorNoBinaryForGpu|no kernel image is available for execution on the device
+210|hipErrorAlreadyAcquired|resource already acquired|hipErrorAlreadyAcquired|resource already acquired
+211|hipErrorNotMapped|resource not mapped|hipErrorNotMapped|resource not mapped
+212|hipErrorNotMappedAsArray|resource not mapped as array|hipErrorNotMappedAsArray|resource not mapped as array
+213|hipErrorNotMappedAsPointer|resource not mapped as pointer|hipErrorNotMappedAsPointer|resource not mapped as pointer
+214|hipErrorECCNotCorrectable|uncorrectable ECC error encountered|hipErrorECCNotCorrectable|uncorrectable ECC error encountered
+215|hipErrorUnsupportedLimit|limit is not supported on this architecture|hipErrorUnsupportedLimit|limit is not supported on this architecture
+216|hipErrorContextAlreadyInUse|exclusive-thread device already in use by a different thread|hipErrorContextAlreadyInUse|exclusive-thread device already in use by a different thread
+217|hipErrorPeerAccessUnsupported|peer access is not supported between these two devices|hipErrorPeerAccessUnsupported|peer access is not supported between these two devices
+218|hipErrorInvalidKernelFile|invalid kernel file|hipErrorInvalidKernelFile|invalid kernel file
+219|hipErrorInvalidGraphicsContext|invalid OpenGL or DirectX context|hipErrorInvalidGraphicsContext|invalid OpenGL or DirectX context
+300|hipErrorInvalidSource|device kernel image is invalid|hipErrorInvalidSource|device kernel image is invalid
+301|hipErrorFileNotFound|file not found|hipErrorFileNotFound|file not found
+302|hipErrorSharedObjectSymbolNotFound|shared object symbol not found|hipErrorSharedObjectSymbolNotFound|shared object symbol not found
+303|hipErrorSharedObjectInitFailed|shared object initialization failed|hipErrorSharedObjectInitFailed|shared object initialization failed
+304|hipErrorOperatingSystem|OS call failed or operation not supported on this OS|hipErrorOperatingSystem|OS call failed or operation not supported on this OS
+400|hipErrorInvalidHandle|invalid resource handle|hipErrorInvalidHandle|invalid resource handle
+401|hipErrorIllegalState|the operation cannot be performed in the present state|hipErrorIllegalState|the operation cannot be performed in the present state
+500|hipErrorNotFound|named symbol not found|hipErrorNotFound|named symbol not found
+600|hipErrorNotReady|device not ready|hipErrorNotReady|device not ready
+700|hipErrorIllegalAddress|an illegal memory access was encountered|hipErrorIllegalAddress|an illegal memory access was encountered
+701|hipErrorLaunchOutOfResources|too many resources requested for launch|hipErrorLaunchOutOfResources|too many resources requested for launch
+702|hipErrorLaunchTimeOut|the launch timed out and was terminated|hipErrorLaunchTimeOut|the launch timed out and was terminated
+704|hipErrorPeerAccessAlreadyEnabled|peer access is already enabled|hipErrorPeerAccessAlreadyEnabled|peer access is already enabled
+705|hipErrorPeerAccessNotEnabled|peer access has not been enabled|hipErrorPeerAccessNotEnabled|peer access has not been enabled
+708|hipErrorSetOnActiveProcess|cannot set while device is active in this process|hipErrorSetOnActiveProcess|cannot set while device is active in this process
+709|hipErrorContextIsDestroyed|context is destroyed|hipErrorContextIsDestroyed|context is destroyed
+710|hipErrorAssert|device-side assert triggered|hipErrorAssert|device-side assert triggered
+712|hipErrorHostMemoryAlreadyRegistered|part or all of the requested memory range is already mapped|hipErrorHostMemoryAlreadyRegistered|part or all of the requested memory range is already mapped
+713|hipErrorHostMemoryNotRegistered|pointer does not correspond to a registered memory region|hipErrorHostMemoryNotRegistered|pointer does not correspond to a registered memory region
+719|hipErrorLaunchFailure|unspecified launch failure|hipErrorLaunchFailure|unspecified launch failure
+720|hipErrorCooperativeLaunchTooLarge|too many blocks in cooperative launch|hipErrorCooperativeLaunchTooLarge|too many blocks in cooperative launch
+801|hipErrorNotSupported|operation not supported|hipErrorNotSupported|operation not supported
+900|hipErrorStreamCaptureUnsupported|operation not permitted when stream is capturing|hipErrorStreamCaptureUnsupported|operation not permitted when stream is capturing
+901|hipErrorStreamCaptureInvalidated|operation failed due to a previous error during capture|hipErrorStreamCaptureInvalidated|operation failed due to a previous error during capture
+902|hipErrorStreamCaptureMerge|operation would result in a merge of separate capture sequences|hipErrorStreamCaptureMerge|operation would result in a merge of separate capture sequences
+903|hipErrorStreamCaptureUnmatched|capture was not ended in the same stream as it began|hipErrorStreamCaptureUnmatched|capture was not ended in the same stream as it began
+904|hipErrorStreamCaptureUnjoined|capturing stream has unjoined work|hipErrorStreamCaptureUnjoined|capturing stream has unjoined work
+905|hipErrorStreamCaptureIsolation|dependency created on uncaptured work in another stream|hipErrorStreamCaptureIsolation|dependency created on uncaptured work in another stream
+906|hipErrorStreamCaptureImplicit|operation would make the legacy stream depend on a capturing blocking stream|hipErrorStreamCaptureImplicit|operation would make the legacy stream depend on a capturing blocking stream
+907|hipErrorCapturedEvent|operation not permitted on an event last recorded in a capturing stream|hipErrorCapturedEvent|operation not permitted on an event last recorded in a capturing stream
+908|hipErrorStreamCaptureWrongThread|attempt to terminate a thread-local capture sequence from another thread|hipErrorStreamCaptureWrongThread|attempt to terminate a thread-local capture sequence from another thread
+910|hipErrorGraphExecUpdateFailure|the graph update was not performed because it included changes which violated constraints specific to instantiated graph update|hipErrorGraphExecUpdateFailure|the graph update was not performed because it included changes which violated constraints specific to instantiated graph update
+999|hipErrorUnknown|unknown error|hipErrorUnknown|unknown error
+1052|hipErrorRuntimeMemory|runtime memory call returned error|hipErrorRuntimeMemory|runtime memory call returned error
+1053|hipErrorRuntimeOther|runtime call other than memory returned error|hipErrorRuntimeOther|runtime call other than memory returned error
+1054|hipErrorTbd|unknown error|hipErrorTbd|(refused)

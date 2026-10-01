@@ -7,14 +7,21 @@ order the assembler writes them, each with the field that holds it, what
 kind of operand it is, and how many bits wide.
 
   amd/tools/rdna-ops.py <amdgpu_isa_rdna3.xml> <out.inc>
+  amd/tools/rdna-ops.py --images <amdgpu_isa_rdna3.xml> <rdna_images_rdna3.inc>
 
 Only the encodings the decoder handles are kept (not graphics' export,
-interpolation, image or LDS-direct ones). The generated file is checked in,
-so building needs no XML.
+interpolation or LDS-direct ones). The image instructions (MIMG; RDNA4's
+VIMAGE and VSAMPLE) go to a file of their own with --images, as names
+only: their operands' widths come from each instruction's DMASK, DIM and
+modifiers, which the decoder works out itself. The generated files are
+checked in, so building needs no XML.
 """
 import sys
 import xml.etree.ElementTree as ET
 
+images = len(sys.argv) > 1 and sys.argv[1] == '--images'
+if images:
+    sys.argv.pop(1)
 xml_path, out_path = sys.argv[1], sys.argv[2]
 isa = ET.parse(xml_path).getroot().find('ISA')
 arch = isa.find('Architecture').findtext('ArchitectureName')
@@ -46,6 +53,11 @@ KINDS = {
     'OPR_SREG_NONULL': 'Sreg', 'OPR_SRC_NOLDS': 'Src', 'OPR_SSRC_NOLDS': 'Ssrc', 'OPR_VGPR_OR_LDS': 'Src',
     'OPR_ATTR': 'Simm16', 'OPR_PARAM': 'Simm16',
 }
+# The image encodings, for --images: RDNA2 and RDNA3's MIMG, and RDNA4's
+# VIMAGE and VSAMPLE, whose opcodes the segment keeps apart.
+IMAGE_ENCODINGS = {'ENC_MIMG': 0, 'ENC_VIMAGE': 0, 'ENC_VSAMPLE': 1}
+if images:
+    ENCODINGS = {e: 'Mimg' for e in IMAGE_ENCODINGS}
 # Fields the decoder reads itself rather than as operands.
 SKIP_FIELDS = {'LITERAL'}
 
@@ -71,8 +83,10 @@ for inst in isa.find('Instructions'):
         enc = ENCODINGS[enc_xml]
         opcode = int(ie.find('Opcode').text, int(ie.find('Opcode').get('Radix', '10')))
         segment = {'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
+        if images:
+            segment = IMAGE_ENCODINGS[enc_xml]
         ops = []
-        operands = ie.find('Operands')
+        operands = ie.find('Operands') if not images else None
         for o in sorted(operands if operands is not None else [], key=lambda o: int(o.get('Order'))):
             if o.get('IsImplicit') == 'true':
                 continue
@@ -90,15 +104,20 @@ for inst in isa.find('Instructions'):
             rows[key] = (name, ops, priority)
 
 with open(out_path, 'w') as f:
-    f.write(f'// {arch}: every instruction the RDNA decoder handles, from AMD\'s machine-readable\n'
+    what = 'every image instruction' if images else 'every instruction the RDNA decoder handles'
+    f.write(f'// {arch}: {what}, from AMD\'s machine-readable\n'
             '// ISA specification (Copyright (c) Advanced Micro Devices, Inc., MIT license).\n'
             '// Written by amd/tools/rdna-ops.py; do not edit.\n'
             '//\n'
+            + ('// {encoding, segment (RDNA4: 0 VIMAGE, 1 VSAMPLE), opcode, SDST form, name, {}}\n' if images else
             '// {encoding, segment (FLAT: 0 flat, 1 global, 2 scratch), opcode, SDST form,\n'
-            '//  name, {{field, kind, bits, output}...}}\n')
+            '//  name, {{field, kind, bits, output}...}}\n'))
     for (enc, segment, opcode, sdst), (name, ops, _) in sorted(rows.items()):
         o = ', '.join(f'{{"{fl}", K::{k}, {b}, {"true" if out else "false"}}}' for fl, k, b, out in ops)
         f.write(f'{{Enc::{enc}, {segment}, {opcode}, {"true" if sdst else "false"}, "{name}", {{{o}}}}},\n')
+if images:
+    print(f'{len(rows)} image instructions written to {out_path}')
+    sys.exit(0)
 # The older names the specification records for renamed instructions
 # (global_load_b32 was global_load_dword), which the executor knows them by.
 alias_path = out_path.replace('.inc', '_aliases.inc')

@@ -37,6 +37,8 @@
 #include "hip_shared.hpp"
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_chip.hpp"
+#include "vgpu/amd_image.hpp"
+#include "vgpu/hip_abi.hpp"
 #include "vgpu/hsa_abi.h"
 
 namespace {
@@ -449,6 +451,18 @@ void put_string(void* value, const std::string& s, size_t room) {
 
 std::string isa_name(int device) { return "amdgcn-amd-amdhsa--" + shared::profile(device).gcn_arch_full; }
 
+// Whether a GPU has texture units: the Radeon targets (hsa_images.inc).
+bool agent_has_images(int gpu) {
+  const std::string& a = shared::profile(gpu).gcn_arch;
+  return a.rfind("gfx10", 0) == 0 || a.rfind("gfx11", 0) == 0 || a.rfind("gfx12", 0) == 0;
+}
+// The largest image of each HSA geometry (1D, 2D, 3D, 1DA, 2DA, 1DB,
+// 2DDEPTH, 2DADEPTH): width, height, depth, layers -- ROCm's image
+// runtime's for every Radeon target (image_lut_kv.cpp).
+constexpr uint32_t kImageMaxDims[8][4] = {
+    {16384, 1, 1, 1},        {16384, 16384, 1, 1},  {16384, 16384, 8192, 1}, {16384, 1, 1, 8192},
+    {16384, 16384, 1, 8192}, {0xFFFFFFFFu, 1, 1, 1}, {16384, 16384, 1, 1},    {16384, 16384, 1, 8192},
+};
 }  // namespace
 
 extern "C" {
@@ -592,7 +606,7 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AGENT_INFO_QUEUE_MIN_SIZE: put<uint32_t>(value, is_gpu ? 64 : 0); break;
     case HSA_AGENT_INFO_QUEUE_MAX_SIZE: put<uint32_t>(value, is_gpu ? 131072 : 0); break;
     case HSA_AGENT_INFO_QUEUE_TYPE: put<uint32_t>(value, HSA_QUEUE_TYPE_MULTI); break;
-    case HSA_AGENT_INFO_NODE: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(gpu + 1) : 0); break;
+    case HSA_AGENT_INFO_NODE: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::physical(gpu) + 1) : 0); break;
     case HSA_AGENT_INFO_DEVICE: put<uint32_t>(value, is_gpu ? HSA_DEVICE_TYPE_GPU : HSA_DEVICE_TYPE_CPU); break;
     case HSA_AGENT_INFO_CACHE_SIZE: {
       uint32_t sizes[4] = {0, 0, 0, 0};
@@ -606,7 +620,38 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
       break;
     }
     case HSA_AGENT_INFO_ISA: put<hsa_isa_t>(value, {is_gpu ? agent.handle : 0}); break;
-    case HSA_AGENT_INFO_EXTENSIONS: std::memset(value, 0, 128); break;
+    // The images extension on every GPU agent, as ROCm's runtime has it; an
+    // agent without texture units says so in its image limits (all 0).
+    case HSA_AGENT_INFO_EXTENSIONS:
+      std::memset(value, 0, 128);
+      if (is_gpu) static_cast<uint8_t*>(value)[0] |= 1 << HSA_EXTENSION_IMAGES;
+      break;
+    case HSA_EXT_AGENT_INFO_IMAGE_1D_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_1DA_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_1DB_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_2D_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_2DA_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_2DDEPTH_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_2DADEPTH_MAX_ELEMENTS:
+    case HSA_EXT_AGENT_INFO_IMAGE_3D_MAX_ELEMENTS: {
+      // The geometry each asks about, and how many of its sizes it gives.
+      static const int kGeometry[] = {0, 3, 5, 1, 4, 6, 7, 2};
+      static const int kSizes[] = {1, 1, 1, 2, 2, 2, 2, 3};
+      const int k = attr - HSA_EXT_AGENT_INFO_IMAGE_1D_MAX_ELEMENTS;
+      const bool images = is_gpu && agent_has_images(gpu);
+      for (int i = 0; i < kSizes[k]; ++i)
+        static_cast<uint32_t*>(value)[i] = images ? kImageMaxDims[kGeometry[k]][i] : 0;
+      break;
+    }
+    case HSA_EXT_AGENT_INFO_IMAGE_ARRAY_MAX_LAYERS:
+      put<uint32_t>(value, is_gpu && agent_has_images(gpu) ? kImageMaxDims[4][3] : 0);
+      break;
+    case HSA_EXT_AGENT_INFO_MAX_IMAGE_RD_HANDLES: put<uint32_t>(value, is_gpu && agent_has_images(gpu) ? 128 : 0); break;
+    case HSA_EXT_AGENT_INFO_MAX_IMAGE_RORW_HANDLES: put<uint32_t>(value, is_gpu && agent_has_images(gpu) ? 64 : 0); break;
+    case HSA_EXT_AGENT_INFO_MAX_SAMPLER_HANDLERS: put<uint32_t>(value, is_gpu && agent_has_images(gpu) ? 16 : 0); break;
+    case HSA_EXT_AGENT_INFO_IMAGE_LINEAR_ROW_PITCH_ALIGNMENT:
+      put<uint32_t>(value, is_gpu && agent_has_images(gpu) ? 256 : 0);
+      break;
     case HSA_AGENT_INFO_VERSION_MAJOR: put<uint16_t>(value, 1); break;
     case HSA_AGENT_INFO_VERSION_MINOR: put<uint16_t>(value, 1); break;
     case HSA_AMD_AGENT_INFO_CHIP_ID: put<uint32_t>(value, is_gpu ? chip_id(shared::profile(gpu)) : 0); break;
@@ -617,9 +662,13 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_MAX_CLOCK_FREQUENCY:
       put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::profile(gpu).telemetry.sm_clock_max_mhz) : 0);
       break;
-    case HSA_AMD_AGENT_INFO_DRIVER_NODE_ID: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(gpu + 1) : 0); break;
+    case HSA_AMD_AGENT_INFO_DRIVER_NODE_ID:
+      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::physical(gpu) + 1) : 0);
+      break;
     // The PCI location: bus ordinal + 1, device 0, function 0, as HIP reports it.
-    case HSA_AMD_AGENT_INFO_BDFID: put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(gpu + 1) << 8 : 0); break;
+    case HSA_AMD_AGENT_INFO_BDFID:
+      put<uint32_t>(value, is_gpu ? static_cast<uint32_t>(shared::physical(gpu) + 1) << 8 : 0);
+      break;
     case HSA_AMD_AGENT_INFO_DOMAIN: put<uint32_t>(value, 0); break;
     case HSA_AMD_AGENT_INFO_PRODUCT_NAME:
       put_string(value, is_gpu ? shared::profile(gpu).model : "VirtualGPU host CPU", 64);
@@ -629,7 +678,7 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t agent, hsa_agent_info_t attribute, v
     case HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES: put<bool>(value, is_gpu); break;
     case HSA_AMD_AGENT_INFO_UUID: {
       char uuid[21];
-      if (is_gpu) std::snprintf(uuid, sizeof uuid, "GPU-%016llx", 0x5647505500000000ull + static_cast<unsigned>(gpu));
+      if (is_gpu) std::snprintf(uuid, sizeof uuid, "GPU-%016llx", 0x5647505500000000ull + static_cast<unsigned>(shared::physical(gpu)));
       else std::snprintf(uuid, sizeof uuid, "CPU-XX");
       put_string(value, uuid, 21);
       break;
@@ -1552,14 +1601,15 @@ constexpr uint16_t kExtensionAmdLoader = 0x201;
 hsa_status_t hsa_system_extension_supported(uint16_t extension, uint16_t major, uint16_t minor, bool* result) {
   if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
   if (!result) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-  *result = extension == kExtensionAmdLoader && major == 1 && minor <= 3;
+  *result = (extension == kExtensionAmdLoader && major == 1 && minor <= 3) ||
+            (extension == HSA_EXTENSION_IMAGES && major == 1 && minor == 0);
   return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_system_major_extension_supported(uint16_t extension, uint16_t major, uint16_t* minor, bool* result) {
   if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
   if (!result || !minor) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-  *result = extension == kExtensionAmdLoader && major == 1;
-  if (*result) *minor = 3;
+  *result = (extension == kExtensionAmdLoader || extension == HSA_EXTENSION_IMAGES) && major == 1;
+  if (*result) *minor = extension == kExtensionAmdLoader ? 3 : 0;
   return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_agent_extension_supported(uint16_t extension, hsa_agent_t agent, uint16_t major, uint16_t minor,
@@ -1576,6 +1626,21 @@ hsa_status_t hsa_system_get_major_extension_table(uint16_t extension, uint16_t m
                                                   void* table) {
   if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
   if (!table) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  if (extension == HSA_EXTENSION_IMAGES && major == 1) {
+    // hsa_ext_images_1_pfn_t, in its order.
+    void* const images[] = {
+        reinterpret_cast<void*>(hsa_ext_image_get_capability), reinterpret_cast<void*>(hsa_ext_image_data_get_info),
+        reinterpret_cast<void*>(hsa_ext_image_create),         reinterpret_cast<void*>(hsa_ext_image_destroy),
+        reinterpret_cast<void*>(hsa_ext_image_copy),           reinterpret_cast<void*>(hsa_ext_image_import),
+        reinterpret_cast<void*>(hsa_ext_image_export),         reinterpret_cast<void*>(hsa_ext_image_clear),
+        reinterpret_cast<void*>(hsa_ext_sampler_create),       reinterpret_cast<void*>(hsa_ext_sampler_destroy),
+        reinterpret_cast<void*>(hsa_ext_image_get_capability_with_layout),
+        reinterpret_cast<void*>(hsa_ext_image_data_get_info_with_layout),
+        reinterpret_cast<void*>(hsa_ext_image_create_with_layout),
+    };
+    std::memcpy(table, images, std::min(table_length, sizeof images));
+    return HSA_STATUS_SUCCESS;
+  }
   if (extension != kExtensionAmdLoader || major != 1)
     return fail(HSA_STATUS_ERROR_NOT_SUPPORTED, "extension " + std::to_string(extension) + " is not one this has");
   // hsa_ven_amd_loader_1_03_pfn_t, in its order; a caller asking for an
@@ -1593,7 +1658,9 @@ hsa_status_t hsa_system_get_major_extension_table(uint16_t extension, uint16_t m
   return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_system_get_extension_table(uint16_t extension, uint16_t major, uint16_t, void* table) {
-  return hsa_system_get_major_extension_table(extension, major, sizeof(void*) * 7, table);
+  // The loader's version 1.01 table, or the images extension's 1.00 one.
+  return hsa_system_get_major_extension_table(extension, major,
+                                              sizeof(void*) * (extension == HSA_EXTENSION_IMAGES ? 10 : 7), table);
 }
 
 // ---- What an allocation is ---------------------------------------------------------
@@ -1870,40 +1937,23 @@ hsa_status_t hsa_amd_coherency_get_type(hsa_agent_t agent, int* type) {
 hsa_status_t hsa_amd_enable_logging(uint8_t*, void*) { return HSA_STATUS_SUCCESS; }
 hsa_status_t hsa_amd_register_system_event_handler(void*, void*) { return HSA_STATUS_SUCCESS; }
 
-// What this does not model yet, refused by name: images and samplers (the
-// texture path), virtual memory, sharing memory between processes, SVM,
-// graphics interop and DMA-buf.
+// ---- Images and samplers -----------------------------------------------------------
+#include "hsa_images.inc"
+
+// ---- Virtual memory and memory shared between processes --------------------------
+#include "hsa_vmem.inc"
+
+// What this does not model yet, refused by name: images laid out by
+// graphics interop (hsa_amd_image_create), SVM's attributes, graphics
+// interop and DMA-buf export.
 #define VGPU_HSA_REFUSED(name, what) \
   hsa_status_t name() { return fail(HSA_STATUS_ERROR_NOT_SUPPORTED, #name " is not supported: " what); }
-VGPU_HSA_REFUSED(hsa_amd_image_create, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_image_create, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_image_create_with_layout, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_image_data_get_info, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_image_destroy, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_image_export, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_image_import, "images are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_sampler_create_v2, "samplers are not modelled yet")
-VGPU_HSA_REFUSED(hsa_ext_sampler_destroy, "samplers are not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_address_reserve, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_address_free, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_handle_create, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_handle_release, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_map, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_unmap, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_set_access, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_get_access, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_export_shareable_handle, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_import_shareable_handle, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_vmem_retain_alloc_handle, "virtual memory is not modelled yet")
-VGPU_HSA_REFUSED(hsa_amd_ipc_memory_create, "memory is not shared between processes yet")
-VGPU_HSA_REFUSED(hsa_amd_ipc_memory_attach, "memory is not shared between processes yet")
-VGPU_HSA_REFUSED(hsa_amd_ipc_memory_detach, "memory is not shared between processes yet")
+VGPU_HSA_REFUSED(hsa_amd_image_create, "images over another API's layout are not modelled")
 VGPU_HSA_REFUSED(hsa_amd_svm_attributes_get, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_svm_attributes_set, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_svm_prefetch_async, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_interop_map_buffer, "there is no graphics driver to share with")
 VGPU_HSA_REFUSED(hsa_amd_interop_unmap_buffer, "there is no graphics driver to share with")
-VGPU_HSA_REFUSED(hsa_amd_portable_export_dmabuf, "there is no DMA-buf to export")
 VGPU_HSA_REFUSED(hsa_executable_agent_global_variable_define, "external variables are not defined yet")
 
 }  // extern "C"

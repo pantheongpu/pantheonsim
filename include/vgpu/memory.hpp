@@ -291,6 +291,10 @@ class MemoryManager {
   void unmap_host(uint64_t addr);
   // True when `addr` falls in a mapped host buffer rather than device VA.
   bool is_host_mapped(uint64_t addr) const;
+  // Where [addr, addr + len) is in host memory, when one mapped host buffer
+  // holds all of it; null otherwise. An atomic on host memory the host also
+  // updates has to be made with the CPU's own atomics, there.
+  uint8_t* host_address(uint64_t addr, uint64_t len) const;
 
   // Host memory actually backing this device's allocations: chunks that have
   // been materialized, times the chunk size. This is the quantity the sparse
