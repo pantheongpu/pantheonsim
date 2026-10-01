@@ -460,6 +460,36 @@ VTEST(rdna_shader_cycles_count_up) {
   VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
 }
 
+// A kernel that ends where it begins, launched over 64 million work-groups,
+// as hip-tests launches its NOPKernel over the largest grids there are: one
+// group runs, and the dispatch counts what it did once for each group.
+VTEST(an_empty_kernel_over_a_huge_grid_counts_every_wave_without_running_each) {
+  const amd::CodeObject o = object("asm_wave", "gfx1100");
+  MemoryManager mem(16ull << 20);
+  const amd::Kernel* k = amd::find_kernel(o, "empty");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  const auto launch = [&](uint32_t groups) {
+    amd::Dispatch d;
+    d.object = &o;
+    d.kernel = k;
+    d.groups[0] = groups;
+    d.group_size[0] = 64;
+    d.wave_size = 32;
+    return amd::execute(d, mem);
+  };
+  const amd::DispatchStats one = launch(1);
+  const auto start = std::chrono::steady_clock::now();
+  const amd::DispatchStats many = launch(1u << 26);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  VCHECK_EQ(one.waves, 2u);
+  VCHECK_EQ(many.waves, one.waves << 26);
+  VCHECK_EQ(many.instructions, one.instructions << 26);
+  VCHECK_EQ(many.counts.salu, one.counts.salu << 26);
+  VCHECK_EQ(many.waves_lt64, one.waves_lt64 << 26);
+  VCHECK(seconds < 5.0);   // 64 million groups, each run, take minutes
+}
+
 VTEST(lds_64_bit_read_modify_writes_and_the_scalar_bit_operations_compute_what_the_isa_says) {
   const amd::CodeObject o = object("asm_lds64");
   MemoryManager mem(16ull << 20);

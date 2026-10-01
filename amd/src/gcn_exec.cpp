@@ -5939,6 +5939,24 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   DecodeCache* cache = d.decoded;
   if (!cache) cache = (own = std::make_unique<DecodeCache>(d.object->text.size())).get();
   DispatchStats total;
+  // A kernel whose first instruction ends it does the same in every
+  // work-group: each wave starts and stops, and nothing else happens. hip-tests
+  // launches such empty kernels over the largest grids there are (2^31
+  // work-groups and more). One group runs, and what it did is counted once
+  // for each. Where the groups differ in shape (a partial last group), and
+  // under the debugger or the wave trace, every group runs.
+  bool same_shape = true;
+  for (int i = 0; i < 3; ++i) same_shape &= !d.grid_items[i] || d.grid_items[i] % d.group_size[i] == 0;
+  if (groups > 1 && same_shape && !debug::active() && !Machine::tracing()) {
+    Machine m(d, mem, *cache);
+    if (OpName(m.fetch(d.code_base + k.entry).name) == "s_endpgm"_op) {
+      run_groups(m, d, packet, group_segment, 0, 1, group_at, nullptr);
+      total = m.stats;
+      total.scale(groups);
+      if (packet) mem.free(packet);
+      return total;
+    }
+  }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (d.cooperative) {
     // A cooperative launch's work-groups may wait on one another (a grid
