@@ -74,8 +74,6 @@ VGPU_EXPORT int cublasDtrmv_v2() { vgpu_report_unimplemented("cublasDtrmv_v2"); 
 VGPU_EXPORT int cublasDtrsv_v2() { vgpu_report_unimplemented("cublasDtrsv_v2"); return 15; }
 VGPU_EXPORT int cublasDzasum_v2() { vgpu_report_unimplemented("cublasDzasum_v2"); return 15; }
 VGPU_EXPORT int cublasDznrm2_v2() { vgpu_report_unimplemented("cublasDznrm2_v2"); return 15; }
-VGPU_EXPORT int cublasGemmGroupedBatchedEx() { vgpu_report_unimplemented("cublasGemmGroupedBatchedEx"); return 15; }
-VGPU_EXPORT int cublasGemmGroupedBatchedEx_64() { vgpu_report_unimplemented("cublasGemmGroupedBatchedEx_64"); return 15; }
 VGPU_EXPORT int cublasIcamax_v2() { vgpu_report_unimplemented("cublasIcamax_v2"); return 15; }
 VGPU_EXPORT int cublasIcamin_v2() { vgpu_report_unimplemented("cublasIcamin_v2"); return 15; }
 VGPU_EXPORT int cublasIdamin_v2() { vgpu_report_unimplemented("cublasIdamin_v2"); return 15; }

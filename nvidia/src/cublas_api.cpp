@@ -1622,6 +1622,132 @@ VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx_64(cublasHandle_t h, cublasOperat
   return cublasGemmBatchedEx(h, ta, tb, (int)m, (int)n, (int)k, alpha, Aarray, Atype, (int)lda, Barray, Btype,
                              (int)ldb, beta, Carray, Ctype, (int)ldc, (int)batchCount, computeType, algo);
 }
+
+/* ---- grouped batched GEMM ----
+   Group g applies its own transposes, sizes, leading dimensions, alpha[g] and
+   beta[g] to the next group_size[g] problems of the pointer arrays. What an
+   RTX 3060's cuBLAS does, measured:
+     - every group is checked before any runs: a bad last group leaves the
+       first group's C untouched (INVALID_VALUE for a negative count, size or
+       dimension, or a leading dimension too small);
+     - alpha and beta come from the host only: device pointer mode is
+       NOT_SUPPORTED;
+     - the types are 32F with COMPUTE_32F, _32F_PEDANTIC or _32F_FAST_TF32;
+       16F or 16BF throughout with COMPUTE_32F; 64F with COMPUTE_64F. Any
+       other combination is NOT_SUPPORTED, mixed C types included. */
+namespace {
+bool grouped_types_ok(cudaDataType at, cudaDataType bt, cudaDataType ct, cublasComputeType_t cp) {
+  if (at != bt || bt != ct) return false;
+  switch (at) {
+    case CUDA_R_32F:
+      return cp == CUBLAS_COMPUTE_32F || cp == CUBLAS_COMPUTE_32F_PEDANTIC || cp == CUBLAS_COMPUTE_32F_FAST_TF32;
+    case CUDA_R_16F:
+    case CUDA_R_16BF: return cp == CUBLAS_COMPUTE_32F;
+    case CUDA_R_64F: return cp == CUBLAS_COMPUTE_64F;
+    default: return false;
+  }
+}
+
+bool op_ok(cublasOperation_t t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; }
+
+template <typename I>
+cublasStatus_t gemm_grouped(cublasHandle_t h, const cublasOperation_t* ta, const cublasOperation_t* tb, const I* m,
+                            const I* n, const I* k, const void* alpha, const void* const* Aarray, cudaDataType at,
+                            const I* lda, const void* const* Barray, cudaDataType bt, const I* ldb, const void* beta,
+                            void* const* Carray, cudaDataType ct, const I* ldc, I group_count, const I* group_size,
+                            cublasComputeType_t cp) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (group_count < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (group_count == 0) return CUBLAS_STATUS_SUCCESS;
+  if (!grouped_types_ok(at, bt, ct, cp)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (reinterpret_cast<Handle*>(h)->pointer_mode != CUBLAS_POINTER_MODE_HOST) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!ta || !tb || !m || !n || !k || !lda || !ldb || !ldc || !group_size || !alpha || !beta)
+    return CUBLAS_STATUS_INVALID_VALUE;
+  int64_t total = 0;
+  for (I g = 0; g < group_count; ++g) {
+    if (group_size[g] < 0 || !op_ok(ta[g]) || !op_ok(tb[g]) || m[g] < 0 || n[g] < 0 || k[g] < 0)
+      return CUBLAS_STATUS_INVALID_VALUE;
+    const int64_t a_rows = ta[g] == CUBLAS_OP_N ? m[g] : k[g];
+    const int64_t b_rows = tb[g] == CUBLAS_OP_N ? k[g] : n[g];
+    if (lda[g] < std::max<int64_t>(1, a_rows) || ldb[g] < std::max<int64_t>(1, b_rows) ||
+        ldc[g] < std::max<int64_t>(1, m[g]))
+      return CUBLAS_STATUS_INVALID_VALUE;
+    total += group_size[g];
+  }
+  if (total == 0) return CUBLAS_STATUS_SUCCESS;
+  const size_t sb = compute_scalar_bytes(cp);
+  const size_t gc = static_cast<size_t>(group_count);
+  // Under stream capture the call replays at launch: the host arrays are
+  // copied now, the device pointer arrays read then.
+  if (deferred_to_graph(h, [=, vta = std::vector<cublasOperation_t>(ta, ta + gc),
+                            vtb = std::vector<cublasOperation_t>(tb, tb + gc), vm = std::vector<I>(m, m + gc),
+                            vn = std::vector<I>(n, n + gc), vk = std::vector<I>(k, k + gc),
+                            vla = std::vector<I>(lda, lda + gc), vlb = std::vector<I>(ldb, ldb + gc),
+                            vlc = std::vector<I>(ldc, ldc + gc), vgs = std::vector<I>(group_size, group_size + gc),
+                            al = std::vector<uint8_t>(static_cast<const uint8_t*>(alpha),
+                                                      static_cast<const uint8_t*>(alpha) + gc * sb),
+                            be = std::vector<uint8_t>(static_cast<const uint8_t*>(beta),
+                                                      static_cast<const uint8_t*>(beta) + gc * sb)] {
+        gemm_grouped<I>(h, vta.data(), vtb.data(), vm.data(), vn.data(), vk.data(), al.data(), Aarray, at,
+                        vla.data(), Barray, bt, vlb.data(), be.data(), Carray, ct, vlc.data(), group_count,
+                        vgs.data(), cp);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto a = fetch<const void*>(Aarray, static_cast<size_t>(total));
+  const auto b = fetch<const void*>(Barray, static_cast<size_t>(total));
+  const auto c = fetch<void*>(Carray, static_cast<size_t>(total));
+  size_t idx = 0;
+  for (I g = 0; g < group_count; ++g) {
+    const void* al = static_cast<const uint8_t*>(alpha) + static_cast<size_t>(g) * sb;
+    const void* be = static_cast<const uint8_t*>(beta) + static_cast<size_t>(g) * sb;
+    for (I s = 0; s < group_size[g]; ++s, ++idx) {
+      const cublasStatus_t st = cublasGemmEx_64(h, ta[g], tb[g], m[g], n[g], k[g], al, a[idx], at, lda[g], b[idx], bt,
+                                                ldb[g], be, c[idx], ct, ldc[g], cp, CUBLAS_GEMM_DEFAULT);
+      if (st != CUBLAS_STATUS_SUCCESS) return st;
+    }
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasGemmGroupedBatchedEx(
+    cublasHandle_t h, const cublasOperation_t transa_array[], const cublasOperation_t transb_array[],
+    const int m_array[], const int n_array[], const int k_array[], const void* alpha_array, const void* const Aarray[],
+    cudaDataType_t Atype, const int lda_array[], const void* const Barray[], cudaDataType_t Btype,
+    const int ldb_array[], const void* beta_array, void* const Carray[], cudaDataType_t Ctype, const int ldc_array[],
+    int group_count, const int group_size[], cublasComputeType_t computeType) {
+  return gemm_grouped<int>(h, transa_array, transb_array, m_array, n_array, k_array, alpha_array, Aarray, Atype,
+                           lda_array, Barray, Btype, ldb_array, beta_array, Carray, Ctype, ldc_array, group_count,
+                           group_size, computeType);
+}
+
+VGPU_EXPORT cublasStatus_t cublasGemmGroupedBatchedEx_64(
+    cublasHandle_t h, const cublasOperation_t transa_array[], const cublasOperation_t transb_array[],
+    const int64_t m_array[], const int64_t n_array[], const int64_t k_array[], const void* alpha_array,
+    const void* const Aarray[], cudaDataType_t Atype, const int64_t lda_array[], const void* const Barray[],
+    cudaDataType_t Btype, const int64_t ldb_array[], const void* beta_array, void* const Carray[],
+    cudaDataType_t Ctype, const int64_t ldc_array[], int64_t group_count, const int64_t group_size[],
+    cublasComputeType_t computeType) {
+  return gemm_grouped<int64_t>(h, transa_array, transb_array, m_array, n_array, k_array, alpha_array, Aarray, Atype,
+                               lda_array, Barray, Btype, ldb_array, beta_array, Carray, Ctype, ldc_array,
+                               group_count, group_size, computeType);
+}
+
+// The typed forms are the Ex form at the type's own compute type.
+#define VGPU_GROUPED(NAME, T, I, DT, CT)                                                                          \
+  VGPU_EXPORT cublasStatus_t NAME(cublasHandle_t h, const cublasOperation_t ta[], const cublasOperation_t tb[],  \
+                                  const I m[], const I n[], const I k[], const T alpha[], const T* const A[],    \
+                                  const I lda[], const T* const B[], const I ldb[], const T beta[],              \
+                                  T* const C[], const I ldc[], I group_count, const I group_size[]) {            \
+    return gemm_grouped<I>(h, ta, tb, m, n, k, alpha, reinterpret_cast<const void* const*>(A), DT, lda,         \
+                           reinterpret_cast<const void* const*>(B), DT, ldb, beta,                               \
+                           reinterpret_cast<void* const*>(C), DT, ldc, group_count, group_size, CT);             \
+  }
+VGPU_GROUPED(cublasSgemmGroupedBatched, float, int, CUDA_R_32F, CUBLAS_COMPUTE_32F)
+VGPU_GROUPED(cublasSgemmGroupedBatched_64, float, int64_t, CUDA_R_32F, CUBLAS_COMPUTE_32F)
+VGPU_GROUPED(cublasDgemmGroupedBatched, double, int, CUDA_R_64F, CUBLAS_COMPUTE_64F)
+VGPU_GROUPED(cublasDgemmGroupedBatched_64, double, int64_t, CUDA_R_64F, CUBLAS_COMPUTE_64F)
+#undef VGPU_GROUPED
 VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx_64(
     cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int64_t m, int64_t n, int64_t k, const void* alpha,
     const void* A, cudaDataType Atype, int64_t lda, long long strideA, const void* B, cudaDataType Btype, int64_t ldb,
