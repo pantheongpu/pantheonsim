@@ -17,13 +17,19 @@ shopt -u nullglob
 if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
-nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
-     $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcuda
-if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 # The driver case loads both libraries, whose two copies of the core a
-# sanitizer build reports as an ODR violation.
+# sanitizer build reports as an ODR violation; there the runtime cases are
+# built alone, without libcuda.
 cases=(assert trap address launch-ex graph)
-[[ -n "$(shim_sanitizer "$shim")" ]] || cases+=(driver)
+if [[ -n "$(shim_sanitizer "$shim")" ]]; then
+  nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
+       -DDEFERRED_ERRORS_RUNTIME_ONLY $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out"
+else
+  nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
+       $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcuda
+  cases+=(driver)
+fi
+if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 status=0
 for c in "${cases[@]}"; do
   # Kept out of a failing command substitution, so a failure prints its reason.

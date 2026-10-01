@@ -39,7 +39,10 @@ __global__ void fail_trap() { __trap(); }
 __global__ void fail_address(int* p) { *p = 1; }
 __global__ void store(int* p, int v) { *p = v; }
 
-// The driver's kernels, as PTX: a trap, and a harmless one.
+#ifndef DEFERRED_ERRORS_RUNTIME_ONLY
+// The driver's kernels, as PTX: a trap, and a harmless one. A sanitizer build
+// compiles the runtime cases alone (run_deferred_errors.sh), without libcuda:
+// the two libraries' copies of the core are an ODR violation to ASan.
 static const char* kPtx = R"(
 .version 7.0
 .target sm_75
@@ -53,6 +56,7 @@ static const char* kPtx = R"(
   ret;
 }
 )";
+#endif
 
 // What a dead context answers, from the runtime, after the call that first
 // reported the fault. `code` is the fault.
@@ -132,6 +136,7 @@ int main(int argc, char** argv) {
     WANT(cudaStreamSynchronize(s), cudaErrorAssert);
     WANT(cudaGraphLaunch(x, s), cudaErrorAssert);   // the context is dead
     runtime_after(cudaErrorAssert);
+#ifndef DEFERRED_ERRORS_RUNTIME_ONLY
   } else if (!std::strcmp(which, "driver")) {
     // The driver API: cuLaunchKernel succeeds, cuCtxSynchronize reports the
     // trap, and so does the runtime, which shares the context.
@@ -167,6 +172,7 @@ int main(int argc, char** argv) {
     WANT(cudaGetLastError(), cudaSuccess);
     WANT(cudaDeviceSynchronize(), cudaErrorLaunchFailure);
     runtime_after(cudaErrorLaunchFailure);
+#endif
   } else {
     std::printf("FAIL unknown case '%s'\n", which);
     return 1;
