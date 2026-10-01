@@ -251,6 +251,18 @@ struct State {
   std::vector<std::unique_ptr<RegisteredModule>> modules;
   std::unordered_map<const void*, KernelInfo> kernels;  // host stub ptr -> kernel
   std::unordered_map<const void*, VarInfo> vars;        // host shadow ptr -> device symbol
+  // __managed__ variables: the module they live in, their name there, and the
+  // host pointer nvcc's host code reads them through. `storage` is the one
+  // copy, made when the module first loads: host memory every device maps,
+  // like cudaMallocManaged's.
+  struct ManagedVar {
+    RegisteredModule* mod = nullptr;
+    void** host_ptr = nullptr;
+    std::string name;
+    size_t size = 0;
+    void* storage = nullptr;
+  };
+  std::vector<ManagedVar> managed_vars;
   // cudaMallocHost / cudaHostAlloc results. cudaFreeHost consults this before
   // it frees anything: it used to hand whatever it was given to free(), so a
   // malloc'd pointer, a device pointer or a second free took the process down
@@ -682,6 +694,38 @@ bool registered_ptx(State& s, RegisteredModule& m) {
   return m.has_ptx;
 }
 
+// A module's __managed__ variables, moved onto the one copy every device and
+// the host share. The first load of the module makes that copy, from the
+// variable's initial value in the module; each later one, on another device or
+// after a reset, is pointed at it, so the host and every device see one
+// variable. The host pointer nvcc's code reads it through is set here too.
+void bind_managed_vars(State& s, RegisteredModule& m, int dev, uint64_t mid) {
+  vgpu::runtime::Device& d = s.rt->device(dev);
+  for (State::ManagedVar& v : s.managed_vars) {
+    if (v.mod != &m) continue;
+    uint64_t at = 0, size = 0;
+    if (!d.global(mid, v.name, &at, &size)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] __managed__ '%s' is registered but the module defines no such global\n",
+                     v.name.c_str());
+      continue;
+    }
+    // cudaDeviceReset releases it with the device's other managed memory;
+    // the module loads again afresh, and so does the variable.
+    if (v.storage && !s.managed_allocs.count(v.storage)) v.storage = nullptr;
+    if (!v.storage) {
+      const size_t n = std::max<size_t>(std::max<size_t>(v.size, size), 1);
+      v.storage = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
+      if (!v.storage) throw vgpu::Error::make(vgpu::Err::OutOfMemory, "__managed__ '", v.name, "'");
+      d.memory().read(at, v.storage, size);   // the initial value
+      map_host_everywhere(s, v.storage, n);
+      s.managed_allocs[v.storage] = HostRange{n, dev};
+    }
+    d.rebind_global(mid, v.name, reinterpret_cast<uint64_t>(v.storage));
+    if (v.host_ptr) *v.host_ptr = v.storage;
+  }
+}
+
 // Loads (once) the runtime module for a registered fatbin on the current device.
 uint64_t module_on_current(State& s, RegisteredModule& m) {
   int dev = t_current_device;
@@ -692,6 +736,7 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   uint64_t mid = s.rt->device(dev).load_module(m.ptx);
   m.module_per_device[dev] = mid;
   std::string().swap(m.ptx);
+  bind_managed_vars(s, m, dev, mid);
   return mid;
 }
 
@@ -791,7 +836,33 @@ VGPU_EXPORT void** __cudaRegisterFatBinary(void* fatCubin) {
 
 VGPU_EXPORT void __cudaRegisterFatBinaryEnd(void**) {}
 VGPU_EXPORT void __cudaUnregisterFatBinary(void**) {}
-VGPU_EXPORT char __cudaInitModule(void**) { return 1; }
+// nvcc's host code calls this before its first use of a __managed__ variable
+// (through __nv_init_managed_rt): the module has to be loaded for the variable
+// to have its one address, which the host pointer is then set to.
+VGPU_EXPORT char __cudaInitModule(void** fatCubinHandle) {
+  return guard("__cudaInitModule", [&](State& s) {
+    auto* mod = reinterpret_cast<RegisteredModule*>(fatCubinHandle);
+    const bool has_managed = std::any_of(s.managed_vars.begin(), s.managed_vars.end(),
+                                         [&](const State::ManagedVar& v) { return v.mod == mod; });
+    if (mod && has_managed && registered_ptx(s, *mod)) module_on_current(s, *mod);
+    return cudaSuccess;
+  }) == cudaSuccess;
+}
+
+// A __managed__ variable: hostVarPtrAddress is the address of the pointer
+// nvcc's host code dereferences for it, which points at the variable's one
+// copy once the module is loaded (bind_managed_vars).
+VGPU_EXPORT void __cudaRegisterManagedVar(void** fatCubinHandle, void** hostVarPtrAddress, char* /*deviceAddress*/,
+                                          const char* deviceName, int /*ext*/, size_t size, int /*constant*/,
+                                          int /*global*/) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  s.managed_vars.push_back(State::ManagedVar{reinterpret_cast<RegisteredModule*>(fatCubinHandle), hostVarPtrAddress,
+                                             deviceName ? deviceName : "", size, nullptr});
+  if (trace())
+    std::fprintf(stderr, "[vgpu][trace] __cudaRegisterManagedVar: %p -> '%s' (%zu bytes)\n",
+                 (void*)hostVarPtrAddress, deviceName ? deviceName : "?", size);
+}
 
 VGPU_EXPORT void __cudaRegisterFunction(void** fatCubinHandle, const char* hostFun, char* deviceFun,
                                         const char* deviceName, int thread_limit, void* tid,

@@ -1226,9 +1226,10 @@ if(TARGET vgpucublas)
   endforeach()
 
   # Driver and runtime entry points CUDA's samples reach for, checked against
-  # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu). On two
-  # devices, so that peer access and peer copies have a peer.
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart")
+  # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
+  # __managed__ variables (managed_vars.cu). On two devices, so that peer
+  # access and peer copies have a peer, and a managed variable two devices.
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}

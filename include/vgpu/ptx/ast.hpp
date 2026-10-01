@@ -1201,6 +1201,10 @@ struct GlobalVar {
   uint32_t align = 1;
   uint64_t size = 0;
   std::vector<uint8_t> init;  // empty or size bytes
+  // ".attribute(.managed)": a __managed__ variable. The module gives it device
+  // memory like any other global; the runtime, which registers the variable
+  // with the host, moves it to memory the host shares (Device::rebind_global).
+  bool managed = false;
   // A pointer-valued global can be initialised with another symbol's address
   // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
   // table of function pointers is exactly that. Addresses are not known until

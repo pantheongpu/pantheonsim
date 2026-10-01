@@ -82,6 +82,12 @@ class Device {
   // A module's global variable by name: its address and its declared size.
   // False when the module declares no global of that name.
   bool global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const;
+  // Points a module's global at `addr` instead of the device memory it was
+  // given at load: a __managed__ variable lives in host memory every device
+  // maps, at one address for the host and all devices, and the runtime moves
+  // each device's copy of the module onto it. Kernels launched afterwards use
+  // the new address, as do globals initialised with this one's address.
+  void rebind_global(uint64_t module_id, const std::string& name, uint64_t addr);
   // Whether the module defines a kernel of that name.
   bool has_kernel(uint64_t module_id, const std::string& name) const;
 

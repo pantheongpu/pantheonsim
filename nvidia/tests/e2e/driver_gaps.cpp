@@ -20,6 +20,7 @@ static const char* kPtx = R"(
 .version 7.0
 .target sm_80
 .address_size 64
+.global .attribute(.managed) .align 4 .u32 managed_global = 9;
 .visible .entry fill(.param .u64 p, .param .u32 n, .param .f32 v)
 {
   .reg .pred %q;
@@ -963,6 +964,17 @@ int main() {
   IS(cuCtxCreate(&ctx, 0, dev), CUDA_SUCCESS);
 #endif
   check(attr(CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED) == 1, "virtual memory management is supported");
+  {
+    // A module with a __managed__ variable (.attribute(.managed)) loads, and
+    // the variable holds its initial value.
+    CUmodule m;
+    CUdeviceptr g = 0;
+    size_t bytes = 0;
+    unsigned v = 0;
+    check(cuModuleLoadData(&m, kPtx) == CUDA_SUCCESS && cuModuleGetGlobal(&g, &bytes, m, "managed_global") == CUDA_SUCCESS &&
+              bytes == 4 && cuMemcpyDtoH(&v, g, 4) == CUDA_SUCCESS && v == 9 && cuModuleUnload(m) == CUDA_SUCCESS,
+          "a managed global in a module");
+  }
   CUmodule mod;
   CUfunction kfill, kmixed, kbig, ktex, ksurf;
   if (cuModuleLoadData(&mod, kPtx) || cuModuleGetFunction(&kfill, mod, "fill") ||

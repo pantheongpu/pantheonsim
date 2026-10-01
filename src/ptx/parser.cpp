@@ -558,6 +558,21 @@ class Parser {
         g.align = expect_align();
         continue;
       }
+      // ".attribute(.managed)" is what nvcc gives a __managed__ variable; the
+      // other attribute, ".unified(...)", only names the variable across
+      // devices. Neither changes how the module itself lays it out.
+      if (peek().text == ".attribute") {
+        next();
+        expect_punct("(");
+        for (int depth = 1; depth > 0;) {
+          const Token a = next();
+          if (a.kind == Token::Kind::Punct && a.text == "(") ++depth;
+          else if (a.kind == Token::Kind::Punct && a.text == ")") --depth;
+          else if (a.text == ".managed") g.managed = true;
+          else if (a.kind == Token::Kind::End) fail(line, "unterminated .attribute in a .global declaration");
+        }
+        continue;
+      }
       break;
     }
     Type ty = expect_type(".global declaration");
