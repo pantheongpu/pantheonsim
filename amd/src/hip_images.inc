@@ -258,18 +258,27 @@ hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* width, const ChannelForma
   const ApiCall api("hipDeviceGetTexture1DLinearMaxWidth");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
-  if (!width) return record(s, hipErrorInvalidValue);
+  if (!width || !desc) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (device < 0 || device >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  // The widest linear texture, in elements of the format given.
-  const size_t element = desc ? static_cast<size_t>(desc->x + desc->y + desc->z + desc->w) / 8 : 0;
-  *width = has_images(s.rt->device(device).profile()) && element ? static_cast<size_t>(INT32_MAX) / element : 0;
+  // The widest linear texture, in elements of the format given (none is
+  // the wrong value): the properties' widest, in bytes, over the element's.
+  const size_t element = static_cast<size_t>(desc->x + desc->y + desc->z + desc->w) / 8;
+  if (!element) return record(s, hipErrorInvalidValue);
+  *width = has_images(s.rt->device(device).profile()) ? static_cast<size_t>(INT32_MAX) / element : 0;
   return record(s, hipSuccess);
 }
 
 // What a hipcc-built program registers before main for a texture or surface
 // reference it declares: nothing to keep, since none can be bound.
-void __hipRegisterTexture(void*, void*, char*, const char*, int, int, int) {}
+void __hipRegisterTexture(void** modules, void* host_var, char*, const char* device_name, int, int, int) {
+  // A texture reference is a variable of the program's like any other: the
+  // device's copy is what tex1Dfetch and the rest read the bound object from.
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!modules || !host_var || !device_name) return;
+  s.host_vars[host_var] = HostVar{reinterpret_cast<FatBinary*>(modules), device_name, 88 /* textureReference */};
+}
 void __hipRegisterSurface(void*, void*, char*, const char*, int, int) {}
 
 // A mipmapped array: its arguments checked, then refused -- ROCm's HIP on
@@ -580,11 +589,10 @@ struct TextureDesc {
   int mipmapFilterMode;
   float mipmapLevelBias, minMipmapLevelClamp, maxMipmapLevelClamp;
 };
-struct ResourceViewDesc {
+struct ResourceViewDesc {   // no reserved words, unlike the driver API's
   int format;
   size_t width, height, depth;
   unsigned firstMipmapLevel, lastMipmapLevel, firstLayer, lastLayer;
-  unsigned reserved[16];
 };
 
 // A resource view's format (hipResourceViewFormat): a hipArray_Format and
@@ -631,7 +639,7 @@ hipError_t place_object(const uint32_t words[kObjectWords], Object o, void** han
 
 // The image resource of an array, as a texture reads it (in `format`) or a
 // surface writes it (in the array's own); words 8-10 after it.
-void array_resource(const HipArray& a, int format, unsigned channels, bool normalized, im::Gen g,
+void array_resource(const HipArray& a, int format, unsigned channels, bool normalized, bool srgb, im::Gen g,
                     uint32_t words[kObjectWords]) {
   im::Image i;
   i.base = reinterpret_cast<uint64_t>(a.data);
@@ -639,11 +647,12 @@ void array_resource(const HipArray& a, int format, unsigned channels, bool norma
   i.height = static_cast<uint32_t>(a.layered_1d() ? 1 : std::max<size_t>(a.height, 1));
   i.depth = static_cast<uint32_t>(std::max<size_t>(a.depth, 1));
   i.format = image_format(format, channels, normalized);
+  if (srgb) i.format.num = im::Num::Srgb;
   channel_sels(channels, i.sel);
   i.type = a.type();
   im::encode(i, g, words);
   words[8] = hsa_channel_type(format, normalized);
-  words[9] = hsa_channel_order(channels);
+  words[9] = srgb ? 14 /* SRGBA */ : hsa_channel_order(channels);
   words[10] = static_cast<uint32_t>(a.width);
 }
 
@@ -696,7 +705,13 @@ hipError_t create_texture(void** handle, const ResourceDesc* res, const TextureD
       return hipErrorInvalidValue;
   }
   if (tex->maxAnisotropy != 0 || tex->mipmapLevelBias != 0) return hipErrorNotSupported;
-  if (tex->sRGB) return fail(hipErrorNotSupported, "sRGB textures are not modelled");
+  // sRGB: a four-channel 8-bit texture read as normalized floats is sRGBA
+  // (any other four-channel one is no format there is); with fewer channels
+  // it is ignored, as ROCm's HIP does.
+  const auto srgb_of = [&](int format, unsigned channels, bool normalized, bool* srgb) {
+    *srgb = tex->sRGB == 1 && channels == 4;
+    return !*srgb || (format == kU8 && normalized);
+  };
 
   uint32_t words[kObjectWords] = {};
   const bool normalized = tex->readMode == 1;
@@ -705,15 +720,25 @@ hipError_t create_texture(void** handle, const ResourceDesc* res, const TextureD
     if (!a) return hipErrorInvalidValue;
     int format = a->format;
     unsigned channels = a->channels;
-    if (view && view->format && !view_format(view->format, &format, &channels)) return hipErrorInvalidValue;
+    // A view names the format the texels are read in; one naming none
+    // (or one this does not know) is the wrong value, as ROCm's HIP has it.
+    if (view && !view_format(view->format, &format, &channels)) return hipErrorInvalidValue;
+    bool srgb = false;
+    if (!srgb_of(format, channels, normalized, &srgb)) return hipErrorInvalidValue;
     // A 32-bit integer format is never read normalized.
-    array_resource(*a, format, channels, normalized && format != kU32 && format != kS32, g, words);
+    array_resource(*a, format, channels, normalized && format != kU32 && format != kS32, srgb, g, words);
   } else {
     const ChannelFormatDesc& d = res->resType == 2 ? res->res.linear.desc : res->res.pitch2D.desc;
     const int format = array_format(d);
     const unsigned channels = channel_count(d);
     if (!format || !well_formed(d) || channels == 3) return hipErrorInvalidValue;
-    const im::Format f = image_format(format, channels, normalized);
+    bool srgb = false;
+    if (!srgb_of(format, channels, normalized, &srgb)) return hipErrorInvalidValue;
+    // A buffer resource's format field has no room for sRGB's codes on gfx11
+    // and gfx12, so linear memory read as sRGB is not modelled.
+    if (srgb && res->resType == 2) return fail(hipErrorNotSupported, "sRGB over linear memory is not modelled");
+    im::Format f = image_format(format, channels, normalized);
+    if (srgb) f.num = im::Num::Srgb;
     const uint32_t element = channel_bytes(format) * channels;
     if (res->resType == 2) {
       // Linear memory: a buffer resource, one element to a record, which
@@ -741,7 +766,7 @@ hipError_t create_texture(void** handle, const ResourceDesc* res, const TextureD
       words[10] = static_cast<uint32_t>(p.width);
     }
     words[8] = hsa_channel_type(format, normalized && format != kU32 && format != kS32);
-    words[9] = hsa_channel_order(channels);
+    words[9] = srgb ? 14 /* SRGBA */ : hsa_channel_order(channels);
   }
   sampler_resource(*tex, res->resType == 2, g, words + 12);
   Object o;
@@ -815,8 +840,12 @@ struct DrvTextureDesc {
   float borderColor[4];
   int reserved[12];
 };
-// HIP_RESOURCE_VIEW_DESC has hipResourceViewDesc's fields in its order.
-using DrvResourceViewDesc = ResourceViewDesc;
+// HIP_RESOURCE_VIEW_DESC: hipResourceViewDesc's fields, and 16 reserved
+// words after them.
+struct DrvResourceViewDesc {
+  ResourceViewDesc view;
+  unsigned reserved[16];
+};
 
 ResourceDesc resource_from_driver(const DrvResourceDesc& d) {
   ResourceDesc r{};
@@ -907,7 +936,7 @@ hipError_t hipTexObjectCreate(void** object, const DrvResourceDesc* res, const D
   if (!object || !res || !tex) return record(state(), hipErrorInvalidValue);
   const ResourceDesc r = resource_from_driver(*res);
   const TextureDesc t = texture_from_driver(*tex);
-  return record(state(), create_texture(object, &r, &t, view));
+  return record(state(), create_texture(object, &r, &t, view ? &view->view : nullptr));
 }
 hipError_t hipDestroyTextureObject(void* object) {
   if (!images_here()) return destroying("hipDestroyTextureObject", reinterpret_cast<uint64_t>(object));
@@ -971,7 +1000,7 @@ hipError_t hipTexObjectGetResourceViewDesc(DrvResourceViewDesc* out, void* objec
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
-  *out = o.view;
+  *out = DrvResourceViewDesc{o.view, {}};
   return record(state(), hipSuccess);
 }
 
@@ -991,7 +1020,7 @@ hipError_t hipCreateSurfaceObject(void** object, const ResourceDesc* res) {
     g = image_gen(device(s)->profile());
   }
   uint32_t words[kObjectWords] = {};
-  array_resource(*a, a->format, a->channels, false, g, words);
+  array_resource(*a, a->format, a->channels, false, false, g, words);
   Object o;
   o.texture = false;
   o.res = *res;
@@ -1003,53 +1032,404 @@ hipError_t hipDestroySurfaceObject(void* object) {
   return record(state(), destroy_object(object, false));
 }
 
+
+// ---- Texture references ----------------------------------------------------------
+//
+// A texture<T, dim, mode> variable is a textureReference: how to sample, the
+// format, and the texture object it is bound to. The program's host copy is
+// what these calls change; binding makes the object and copies the whole
+// reference to the device's copy of the variable, where the kernel reads the
+// object from. A reference from hipModuleGetTexRef is the runtime's own,
+// standing for a module's variable. Each check and answer is ROCm 7.1's
+// HIP's -- including its getters that write their value and still answer
+// hipErrorInvalidValue.
+
+namespace {
+struct TextureReference {
+  int normalized;
+  int readMode;
+  int filterMode;
+  int addressMode[3];
+  ChannelFormatDesc channelDesc;
+  int sRGB;
+  unsigned maxAnisotropy;
+  int mipmapFilterMode;
+  float mipmapLevelBias, minMipmapLevelClamp, maxMipmapLevelClamp;
+  void* textureObject;
+  int numChannels;
+  int format;   // hipArray_Format
+};
+static_assert(sizeof(TextureReference) == 88, "textureReference's layout");
+
+// hipModuleGetTexRef's references: the module and variable each stands for.
+std::map<const TextureReference*, std::pair<const void*, std::string>> g_module_refs;   // under s.mutex
+std::vector<std::unique_ptr<TextureReference>> g_module_ref_storage;                      // under s.mutex
+
+// Where a reference's device copy is: a variable the program registered
+// (`module_ref` false), or one of a loaded module's.
+hipError_t reference_on_device(const TextureReference* t, bool module_ref, uint64_t* address) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  size_t size = 0;
+  if (!module_ref) return symbol_on(s, t, address, &size);
+  auto it = g_module_refs.find(t);
+  if (it == g_module_refs.end()) return hipErrorNotFound;
+  for (const auto& m : s.modules)
+    if (m.get() == it->second.first) {
+      const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, it->second.second);
+      if (!g) return hipErrorNotFound;
+      *address = m->globals + g->offset;
+      return hipSuccess;
+    }
+  return hipErrorNotFound;
+}
+hipError_t publish_reference(const TextureReference* t, uint64_t address) {
+  return hipMemcpy(reinterpret_cast<void*>(address), t, sizeof *t, hipMemcpyHostToDevice);
+}
+
+TextureDesc reference_desc(const TextureReference* t) {
+  TextureDesc d{};
+  for (int k = 0; k < 3; ++k) d.addressMode[k] = t->addressMode[k];
+  d.filterMode = t->filterMode;
+  d.readMode = t->readMode;
+  d.sRGB = t->sRGB;
+  d.normalizedCoords = t->normalized;
+  d.maxAnisotropy = t->maxAnisotropy;
+  d.mipmapFilterMode = t->mipmapFilterMode;
+  d.mipmapLevelBias = t->mipmapLevelBias;
+  d.minMipmapLevelClamp = t->minMipmapLevelClamp;
+  d.maxMipmapLevelClamp = t->maxMipmapLevelClamp;
+  return d;
+}
+// The view an array is bound through: its size, in the format the binding
+// names (hipResourceViewFormat for 1, 2 or 4 channels of 8, 16 or 32 bits).
+ResourceViewDesc array_view(const HipArray& a, const ChannelFormatDesc& desc) {
+  ResourceViewDesc v{};
+  const int format = array_format(desc);
+  const unsigned channels = channel_count(desc);
+  static const int kFormats[] = {kU8, kS8, kU16, kS16, kU32, kS32, kHalf, kFloat};
+  for (int i = 0; i < 8; ++i)
+    if (kFormats[i] == format && (channels == 1 || channels == 2 || channels == 4))
+      v.format = 1 + 3 * i + (channels == 1 ? 0 : channels == 2 ? 1 : 2);
+  v.width = a.width, v.height = a.height, v.depth = a.depth;
+  return v;
+}
+// Replaces the object a reference is bound to.
+hipError_t rebind(TextureReference* t, const ResourceDesc& res, const ResourceViewDesc* view) {
+  if (const hipError_t e = destroy_object(t->textureObject, true); e != hipSuccess) return e;
+  t->textureObject = nullptr;
+  const TextureDesc d = reference_desc(t);
+  return create_texture(&t->textureObject, &res, &d, view);
+}
+// The offset from an address up to the next image alignment, which a
+// binding takes the base down by; with none to say it in, it has to be 0.
+hipError_t alignment_offset(size_t* offset, const void* p) {
+  const uint64_t a = reinterpret_cast<uint64_t>(p);
+  const size_t off = (kImageAlignment - a % kImageAlignment) % kImageAlignment;
+  if (off && !offset) return hipErrorInvalidValue;
+  if (offset) *offset = off;
+  return hipSuccess;
+}
+}  // namespace
+
+hipError_t hipGetTextureReference(const TextureReference** texref, const void* symbol) {
+  if (!images_here()) return no_images("hipGetTextureReference");
+  const ApiCall api("hipGetTextureReference");
+  if (!texref) return record(state(), hipErrorInvalidValue);
+  *texref = static_cast<const TextureReference*>(symbol);
+  return record(state(), hipSuccess);
+}
+
+hipError_t hipModuleGetTexRef(TextureReference** texref, hipModule_t module, const char* name) {
+  if (!images_here()) return no_images("hipModuleGetTexRef");
+  const ApiCall api("hipModuleGetTexRef");
+  if (!texref || !name || !*name) return record(state(), hipErrorInvalidValue);
+  if (!module) return record(state(), hipErrorInvalidResourceHandle);
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const Module* m = nullptr;
+  for (const auto& owned : s.modules)
+    if (owned.get() == reinterpret_cast<const Module*>(module)) m = owned.get();
+  const vgpu::amd::GlobalVar* g = m ? vgpu::amd::find_global(m->object, name) : nullptr;
+  if (!g || g->size != sizeof(TextureReference))
+    return record(s, fail(hipErrorNotFound, std::string("the module has no texture named ") + name));
+  // As texture<char>() makes one, then read as normalized floats, one
+  // float channel.
+  auto t = std::make_unique<TextureReference>();
+  std::memset(t.get(), 0, sizeof *t);
+  t->addressMode[0] = t->addressMode[1] = t->addressMode[2] = 1;   // clamp
+  t->channelDesc = {8, 0, 0, 0, 0};
+  t->readMode = 1;
+  t->format = kFloat;
+  t->numChannels = 1;
+  *texref = t.get();
+  g_module_refs[t.get()] = {m, name};
+  g_module_ref_storage.push_back(std::move(t));
+  return record(s, hipSuccess);
+}
+
+hipError_t hipBindTexture(size_t* offset, TextureReference* texref, const void* ptr, const ChannelFormatDesc* desc,
+                          size_t size) {
+  if (!images_here()) return no_images("hipBindTexture");
+  const ApiCall api("hipBindTexture");
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
+  if (!texref) return record(state(), hipErrorUnknown);
+  if (!ptr) return record(state(), hipErrorNotFound);
+  if (!desc) return record(state(), hipErrorInvalidValue);
+  if (const hipError_t e = destroy_object(texref->textureObject, true); e != hipSuccess) return record(state(), e);
+  texref->textureObject = nullptr;
+  if (const hipError_t e = alignment_offset(offset, ptr); e != hipSuccess) return record(state(), e);
+  ResourceDesc res{};
+  res.resType = 2;
+  res.res.linear.devPtr = static_cast<char*>(const_cast<void*>(ptr)) - (offset ? *offset : 0);
+  res.res.linear.desc = *desc;
+  res.res.linear.sizeInBytes = size;
+  if (const hipError_t e = rebind(texref, res, nullptr); e != hipSuccess) return record(state(), e);
+  return record(state(), publish_reference(texref, at));
+}
+
+hipError_t hipBindTexture2D(size_t* offset, TextureReference* texref, const void* ptr, const ChannelFormatDesc* desc,
+                            size_t width, size_t height, size_t pitch) {
+  if (!images_here()) return no_images("hipBindTexture2D");
+  const ApiCall api("hipBindTexture2D");
+  if (!texref) return record(state(), hipErrorUnknown);
+  if (!ptr) return record(state(), hipErrorNotFound);
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
+  if (!desc || !pitch) return record(state(), hipErrorInvalidValue);
+  if (const hipError_t e = destroy_object(texref->textureObject, true); e != hipSuccess) return record(state(), e);
+  texref->textureObject = nullptr;
+  if (const hipError_t e = alignment_offset(offset, ptr); e != hipSuccess) return record(state(), e);
+  ResourceDesc res{};
+  res.resType = 3;
+  res.res.pitch2D.devPtr = static_cast<char*>(const_cast<void*>(ptr)) - (offset ? *offset : 0);
+  res.res.pitch2D.desc = *desc;
+  res.res.pitch2D.width = width;
+  res.res.pitch2D.height = height;
+  res.res.pitch2D.pitchInBytes = pitch;
+  if (const hipError_t e = rebind(texref, res, nullptr); e != hipSuccess) return record(state(), e);
+  return record(state(), publish_reference(texref, at));
+}
+
+hipError_t hipBindTextureToArray(TextureReference* texref, const void* array, const ChannelFormatDesc* desc) {
+  if (!images_here()) return no_images("hipBindTextureToArray");
+  const ApiCall api("hipBindTextureToArray");
+  if (!texref || !array || !desc) return record(state(), hipErrorInvalidValue);
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
+  const HipArray* a = find_array(array);
+  if (!a) return record(state(), hipErrorInvalidValue);
+  ResourceDesc res{};
+  res.resType = 0;
+  res.res.array.array = const_cast<void*>(array);
+  const ResourceViewDesc view = array_view(*a, *desc);
+  if (const hipError_t e = rebind(texref, res, &view); e != hipSuccess) return record(state(), e);
+  return record(state(), publish_reference(texref, at));
+}
+
+// A mipmapped array: there are none to bind (see hipMallocMipmappedArray).
+hipError_t hipBindTextureToMipmappedArray(TextureReference* texref, const void* array, const ChannelFormatDesc* desc) {
+  if (!images_here()) return no_images("hipBindTextureToMipmappedArray");
+  const ApiCall api("hipBindTextureToMipmappedArray");
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
+  if (!texref || !array || !desc) return record(state(), hipErrorInvalidValue);
+  return record(state(), hipErrorNotSupported);
+}
+
+// No texture is no value to unbind; one is unbound by destroying its
+// object (the device's copy keeps the stale handle, as ROCm's HIP leaves it).
+hipError_t hipUnbindTexture(TextureReference* texref) {
+  if (!texref) return record(state(), hipErrorInvalidValue);
+  if (!images_here()) return no_images("hipUnbindTexture");
+  const ApiCall api("hipUnbindTexture");
+  if (const hipError_t e = destroy_object(texref->textureObject, true); e != hipSuccess) return record(state(), e);
+  texref->textureObject = nullptr;
+  return record(state(), hipSuccess);
+}
+
+hipError_t hipGetTextureAlignmentOffset(size_t* offset, const TextureReference* texref) {
+  if (!images_here()) return no_images("hipGetTextureAlignmentOffset");
+  const ApiCall api("hipGetTextureAlignmentOffset");
+  if (!texref) return record(state(), hipErrorInvalidTexture);
+  if (!offset) return record(state(), hipErrorInvalidValue);
+  *offset = 0;
+  return record(state(), hipSuccess);
+}
+
+// The driver API's form: a module's reference, bound to memory or an array.
+hipError_t hipTexRefSetAddress(size_t* offset, TextureReference* texref, void* ptr, size_t bytes) {
+  if (!images_here()) return no_images("hipTexRefSetAddress");
+  const ApiCall api("hipTexRefSetAddress");
+  if (!texref) return record(state(), hipErrorInvalidValue);
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
+  if (const hipError_t e = destroy_object(texref->textureObject, true); e != hipSuccess) return record(state(), e);
+  texref->textureObject = nullptr;
+  if (const hipError_t e = alignment_offset(offset, ptr); e != hipSuccess) return record(state(), e);
+  ResourceDesc res{};
+  res.resType = 2;
+  res.res.linear.devPtr = static_cast<char*>(ptr) - (offset ? *offset : 0);
+  res.res.linear.desc = channel_desc(texref->numChannels, texref->format);
+  res.res.linear.sizeInBytes = bytes;
+  if (const hipError_t e = rebind(texref, res, nullptr); e != hipSuccess) return record(state(), e);
+  return record(state(), publish_reference(texref, at));
+}
+hipError_t hipTexRefSetAddress2D(TextureReference* texref, const ArrayDescriptor* desc, void* ptr, size_t pitch) {
+  if (!images_here()) return no_images("hipTexRefSetAddress2D");
+  const ApiCall api("hipTexRefSetAddress2D");
+  if (!texref || !desc) return record(state(), hipErrorInvalidValue);
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
+  ResourceDesc res{};
+  res.resType = 3;
+  res.res.pitch2D.devPtr = ptr;
+  res.res.pitch2D.desc = channel_desc(desc->NumChannels, desc->Format);
+  res.res.pitch2D.width = desc->Width;
+  res.res.pitch2D.height = desc->Height;
+  res.res.pitch2D.pitchInBytes = pitch;
+  if (const hipError_t e = rebind(texref, res, nullptr); e != hipSuccess) return record(state(), e);
+  return record(state(), publish_reference(texref, at));
+}
+hipError_t hipTexRefSetArray(TextureReference* texref, const void* array, unsigned flags) {
+  if (!images_here()) return no_images("hipTexRefSetArray");
+  const ApiCall api("hipTexRefSetArray");
+  if (!texref || !array) return record(state(), hipErrorInvalidValue);
+  if (flags != 1 /* HIP_TRSA_OVERRIDE_FORMAT */) return record(state(), hipErrorInvalidValue);
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
+  const HipArray* a = find_array(array);
+  if (!a) return record(state(), hipErrorInvalidValue);
+  texref->format = a->format;
+  texref->numChannels = static_cast<int>(a->channels);
+  ResourceDesc res{};
+  res.resType = 0;
+  res.res.array.array = const_cast<void*>(array);
+  const ResourceViewDesc view = array_view(*a, channel_desc(a->channels, a->format));
+  if (const hipError_t e = rebind(texref, res, &view); e != hipSuccess) return record(state(), e);
+  return record(state(), publish_reference(texref, at));
+}
+hipError_t hipTexRefSetMipmappedArray(TextureReference* texref, void* array, unsigned flags) {
+  if (!images_here()) return no_images("hipTexRefSetMipmappedArray");
+  const ApiCall api("hipTexRefSetMipmappedArray");
+  if (!texref || !array || flags != 1) return record(state(), hipErrorInvalidValue);
+  uint64_t at = 0;
+  if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
+  return record(state(), hipErrorNotSupported);
+}
+
+// What a reference is bound to.
+namespace {
+hipError_t bound_resource(const TextureReference* t, ResourceDesc* res) {
+  if (!t->textureObject) return hipErrorInvalidValue;
+  Object o;
+  if (const hipError_t e = object_of(t->textureObject, true, &o); e != hipSuccess) return e;
+  *res = o.res;
+  return hipSuccess;
+}
+}  // namespace
+hipError_t hipTexRefGetAddress(void** ptr, const TextureReference* texref) {
+  if (!images_here()) return no_images("hipTexRefGetAddress");
+  const ApiCall api("hipTexRefGetAddress");
+  if (!ptr || !texref) return record(state(), hipErrorInvalidValue);
+  ResourceDesc res{};
+  if (const hipError_t e = bound_resource(texref, &res); e != hipSuccess) return record(state(), e);
+  if (res.resType == 2) *ptr = res.res.linear.devPtr;
+  else if (res.resType == 3) *ptr = res.res.pitch2D.devPtr;
+  else return record(state(), hipErrorInvalidValue);
+  return record(state(), hipSuccess);
+}
+hipError_t hipTexRefGetArray(void** array, const TextureReference* texref) {
+  if (!images_here()) return no_images("hipTexRefGetArray");
+  const ApiCall api("hipTexRefGetArray");
+  if (!array || !texref) return record(state(), hipErrorInvalidValue);
+  ResourceDesc res{};
+  if (const hipError_t e = bound_resource(texref, &res); e != hipSuccess) return record(state(), e);
+  if (res.resType != 0) return record(state(), hipErrorInvalidValue);
+  *array = res.res.array.array;
+  return record(state(), hipSuccess);
+}
+hipError_t hipTexRefGetMipMappedArray(void** array, const TextureReference* texref) {
+  if (!images_here()) return no_images("hipTexRefGetMipMappedArray");
+  const ApiCall api("hipTexRefGetMipMappedArray");
+  if (!array || !texref) return record(state(), hipErrorInvalidValue);
+  ResourceDesc res{};
+  if (const hipError_t e = bound_resource(texref, &res); e != hipSuccess) return record(state(), e);
+  return record(state(), hipErrorInvalidValue);   // nothing is ever bound to a mipmapped array
+}
+
+// The reference's own fields.
+#define VGPU_TEXREF_CALL(name, args, cond, body, answer)                  \
+  hipError_t name args {                                                    \
+    if (!images_here()) return no_images(#name);                            \
+    const ApiCall api(#name);                                               \
+    if (cond) return record(state(), hipErrorInvalidValue);                 \
+    body;                                                                   \
+    return record(state(), answer);                                         \
+  }
+VGPU_TEXREF_CALL(hipTexRefSetFormat, (TextureReference* t, int format, int channels), !t,
+                 (t->format = format, t->numChannels = channels), hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetFormat, (int* format, int* channels, const TextureReference* t),
+                 !format || !channels || !t, (*format = t->format, *channels = t->numChannels), hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefSetFilterMode, (TextureReference* t, int mode), !t, t->filterMode = mode, hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetFilterMode, (int* mode, const TextureReference* t), !mode || !t,
+                 *mode = t->filterMode, hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefSetMaxAnisotropy, (TextureReference* t, unsigned ratio), !t, t->maxAnisotropy = ratio,
+                 hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetMaxAnisotropy, (int* ratio, const TextureReference* t), !ratio || !t,
+                 *ratio = static_cast<int>(t->maxAnisotropy), hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefSetMipmapFilterMode, (TextureReference* t, int mode), !t, t->mipmapFilterMode = mode,
+                 hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetMipmapFilterMode, (int* mode, const TextureReference* t), !mode || !t,
+                 *mode = t->mipmapFilterMode, hipErrorInvalidValue)
+VGPU_TEXREF_CALL(hipTexRefSetMipmapLevelBias, (TextureReference* t, float bias), !t, t->mipmapLevelBias = bias,
+                 hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetMipmapLevelBias, (float* bias, const TextureReference* t), !bias || !t,
+                 *bias = t->mipmapLevelBias, hipErrorInvalidValue)
+VGPU_TEXREF_CALL(hipTexRefSetMipmapLevelClamp, (TextureReference* t, float lo, float hi), !t,
+                 (t->minMipmapLevelClamp = lo, t->maxMipmapLevelClamp = hi), hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetMipmapLevelClamp, (float* lo, float* hi, const TextureReference* t), !lo || !hi || !t,
+                 (*lo = t->minMipmapLevelClamp, *hi = t->maxMipmapLevelClamp), hipErrorInvalidValue)
+// The reference has no border color to keep: ROCm's HIP answers success
+// and touches nothing.
+VGPU_TEXREF_CALL(hipTexRefSetBorderColor, (TextureReference* t, float* color), !t || !color, (void)0, hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetBorderColor, (float* color, const TextureReference* t), !color || !t, (void)0,
+                 hipSuccess)
+// Flags: read as integers (1), normalized coordinates (2), sRGB (0x10).
+VGPU_TEXREF_CALL(hipTexRefSetFlags, (TextureReference* t, unsigned flags), !t,
+                 (t->readMode = (flags & 1) ? 0 : 1, t->normalized = (flags & 2) ? 1 : 0,
+                  t->sRGB = (flags & 0x10) ? 1 : 0),
+                 hipSuccess)
+VGPU_TEXREF_CALL(hipTexRefGetFlags, (unsigned* flags, const TextureReference* t), !flags || !t,
+                 *flags = (t->readMode == 0 ? 1u : 0u) | (t->normalized == 1 ? 2u : 0u) | (t->sRGB == 1 ? 0x10u : 0u),
+                 hipSuccess)
+#undef VGPU_TEXREF_CALL
+// An axis's address mode: three to set, two to ask about (as ROCm's HIP has it).
+hipError_t hipTexRefSetAddressMode(TextureReference* t, int dim, int mode) {
+  if (!images_here()) return no_images("hipTexRefSetAddressMode");
+  const ApiCall api("hipTexRefSetAddressMode");
+  if (!t || dim < 0 || dim > 2) return record(state(), hipErrorInvalidValue);
+  t->addressMode[dim] = mode;
+  return record(state(), hipSuccess);
+}
+hipError_t hipTexRefGetAddressMode(int* mode, const TextureReference* t, int dim) {
+  if (!images_here()) return no_images("hipTexRefGetAddressMode");
+  const ApiCall api("hipTexRefGetAddressMode");
+  if (!mode || !t || (dim != 0 && dim != 1)) return record(state(), hipErrorInvalidValue);
+  *mode = t->addressMode[dim];
+  return record(state(), hipSuccess);
+}
+
 // ---- What stays refused ------------------------------------------------------------
 //
-// Texture references (removed from HIP's device code in ROCm 7), mipmaps
-// (which ROCm's HIP on Linux does not have) and graphics interop.
+// Mipmaps (which ROCm's HIP on Linux does not have) and graphics interop.
 #define VGPU_NO_IMAGES(name) \
   hipError_t name() { return no_images(#name); }
 VGPU_NO_IMAGES(hipMipmappedArrayCreate)
-VGPU_NO_IMAGES(hipGetTextureReference)
-VGPU_NO_IMAGES(hipModuleGetTexRef)
-VGPU_NO_IMAGES(hipBindTexture)
-VGPU_NO_IMAGES(hipBindTexture2D)
-VGPU_NO_IMAGES(hipBindTextureToArray)
-VGPU_NO_IMAGES(hipBindTextureToMipmappedArray)
-// No texture is no value to unbind, before there being no textures at all.
-hipError_t hipUnbindTexture(const void* tex) {
-  if (!tex) return record(state(), hipErrorInvalidValue);
-  return no_images("hipUnbindTexture");
-}
-VGPU_NO_IMAGES(hipGetTextureAlignmentOffset)
 VGPU_NO_IMAGES(hipGetMipmappedArrayLevel)
 VGPU_NO_IMAGES(hipMipmappedArrayGetLevel)
 VGPU_NO_IMAGES(hipMemMapArrayAsync)
-VGPU_NO_IMAGES(hipTexRefGetAddress)
-VGPU_NO_IMAGES(hipTexRefGetAddressMode)
-VGPU_NO_IMAGES(hipTexRefGetArray)
-VGPU_NO_IMAGES(hipTexRefGetBorderColor)
-VGPU_NO_IMAGES(hipTexRefGetFilterMode)
-VGPU_NO_IMAGES(hipTexRefGetFlags)
-VGPU_NO_IMAGES(hipTexRefGetFormat)
-VGPU_NO_IMAGES(hipTexRefGetMaxAnisotropy)
-VGPU_NO_IMAGES(hipTexRefGetMipMappedArray)
-VGPU_NO_IMAGES(hipTexRefGetMipmapFilterMode)
-VGPU_NO_IMAGES(hipTexRefGetMipmapLevelBias)
-VGPU_NO_IMAGES(hipTexRefGetMipmapLevelClamp)
-VGPU_NO_IMAGES(hipTexRefSetAddress)
-VGPU_NO_IMAGES(hipTexRefSetAddress2D)
-VGPU_NO_IMAGES(hipTexRefSetAddressMode)
-VGPU_NO_IMAGES(hipTexRefSetArray)
-VGPU_NO_IMAGES(hipTexRefSetBorderColor)
-VGPU_NO_IMAGES(hipTexRefSetFilterMode)
-VGPU_NO_IMAGES(hipTexRefSetFlags)
-VGPU_NO_IMAGES(hipTexRefSetFormat)
-VGPU_NO_IMAGES(hipTexRefSetMaxAnisotropy)
-VGPU_NO_IMAGES(hipTexRefSetMipmapFilterMode)
-VGPU_NO_IMAGES(hipTexRefSetMipmapLevelBias)
-VGPU_NO_IMAGES(hipTexRefSetMipmapLevelClamp)
-VGPU_NO_IMAGES(hipTexRefSetMipmappedArray)
 VGPU_NO_IMAGES(hipGraphicsSubResourceGetMappedArray)
 #undef VGPU_NO_IMAGES
 #define VGPU_FREEING_NOTHING(name) \

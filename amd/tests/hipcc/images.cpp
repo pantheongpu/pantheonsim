@@ -30,6 +30,20 @@
     }                                                                          \
   } while (0)
 
+// Texture references, bound to linear memory and to an array. At file
+// scope, as a program declares them: in an anonymous namespace the device
+// compiler would take the never-written variable as a constant.
+texture<float, 1, hipReadModeElementType> g_linear_ref;
+texture<float, 2, hipReadModeElementType> g_array_ref;
+__global__ void fetch_reference(float* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = tex1Dfetch(g_linear_ref, i);
+}
+__global__ void sample_reference(float* out, int w, int h) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < w * h) out[i] = tex2D(g_array_ref, i % w + 0.5f, i / w + 0.5f);
+}
+
 namespace {
 
 void report(const char* what, int wrong, int of) { std::printf("%s: %d of %d wrong\n", what, wrong, of); }
@@ -88,6 +102,15 @@ __global__ void surface_read(hipSurfaceObject_t s, float* out) {
   const int x = threadIdx.x, y = blockIdx.x;
   float v;
   surf2Dread(&v, s, x * 4, y);
+  out[y * blockDim.x + x] = v;
+}
+
+// A cube's face addressed as a layer: face 0 of a 2D surface is the surface.
+__global__ void surface_cube_face(hipSurfaceObject_t s, float* out) {
+  const int x = threadIdx.x, y = blockIdx.x;
+  surfCubemapwrite(static_cast<float>(x - y), s, x * 4, y, 0);
+  float v;
+  surfCubemapread(&v, s, x * 4, y, 0);
   out[y * blockDim.x + x] = v;
 }
 
@@ -294,6 +317,23 @@ int main() {
     for (int i = 0; i < n; ++i)
       wrong += ri[i].x != px[i].x || ri[i].y != px[i].y || ri[i].z != px[i].z || ri[i].w != px[i].w;
     report("8-bit texels read as integers", wrong, n);
+    // sRGB: the color channels come back linear, alpha as it is.
+    hipTextureObject_t ts = 0;
+    d.readMode = hipReadModeNormalizedFloat;
+    d.sRGB = 1;
+    CHECK(hipCreateTextureObject(&ts, &r8, &d, nullptr));
+    sample2d_norm<<<1, 64>>>(ts, d_at, reinterpret_cast<float4*>(d_out), n);
+    const std::vector<float4> rs = host_copy(reinterpret_cast<float4*>(d_out), n);
+    const auto linear = [](unsigned char b) {
+      const float c = b / 255.0f;
+      return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    };
+    wrong = 0;
+    for (int i = 0; i < n; ++i)
+      wrong += std::fabs(rs[i].x - linear(px[i].x)) > 1e-5f || std::fabs(rs[i].y - linear(px[i].y)) > 1e-5f ||
+               std::fabs(rs[i].z - linear(px[i].z)) > 1e-5f || std::fabs(rs[i].w - px[i].w / 255.0f) > 1e-6f;
+    report("8-bit sRGB texels read as linear floats", wrong, n);
+    CHECK(hipDestroyTextureObject(ts));
     CHECK(hipDestroyTextureObject(tf));
     CHECK(hipDestroyTextureObject(ti));
     CHECK(hipFreeArray(a8));
@@ -370,6 +410,32 @@ int main() {
     CHECK(hipFree(d_lin));
     CHECK(hipFree(d_pairs));
     CHECK(hipFree(d_pitched));
+  }
+
+  // ---- Texture references ----
+  {
+    std::vector<float> lin(48);
+    for (int i = 0; i < 48; ++i) lin[i] = i * 2.5f - 1;
+    float* d_lin = device_copy(lin);
+    size_t offset = 1;
+    CHECK(hipBindTexture(&offset, g_linear_ref, d_lin, 48 * sizeof(float)));
+    fetch_reference<<<1, 64>>>(d_out, 48);
+    std::vector<float> r = host_copy(d_out, 48);
+    int wrong = offset != 0;
+    for (int i = 0; i < 48; ++i) wrong += r[i] != lin[i];
+    CHECK(hipUnbindTexture(g_linear_ref));
+    CHECK(hipBindTextureToArray(g_array_ref, arr, fdesc));
+    sample_reference<<<1, 64>>>(d_out, W, H);
+    r = host_copy(d_out, n);
+    for (int i = 0; i < n; ++i) wrong += r[i] != f2d(i % W, i / W);
+    hipArray_t bound = nullptr;
+    const textureReference* ref = nullptr;
+    CHECK(hipGetTextureReference(&ref, &g_array_ref));
+    wrong += ref != &g_array_ref;
+    CHECK(hipUnbindTexture(g_array_ref));
+    wrong += hipTexRefGetArray(&bound, &g_array_ref) != hipErrorInvalidValue;   // bound to nothing now
+    report("texture references bound to memory and to an array", wrong, 48 + n + 3);
+    CHECK(hipFree(d_lin));
   }
 
   // ---- 3D and layered arrays, filled by hipMemcpy3D ----
@@ -463,7 +529,10 @@ int main() {
       const float want = static_cast<float>((i % W) * 100 + i / W);
       wrong += r[i] != want || back[i] != want;
     }
-    report("a surface written and read", wrong, n);
+    surface_cube_face<<<H, W>>>(s, d_out);
+    const std::vector<float> rc = host_copy(d_out, n);
+    for (int i = 0; i < n; ++i) wrong += rc[i] != static_cast<float>(i % W - i / W);
+    report("a surface written and read, and through a cube face", wrong, 2 * n);
     CHECK(hipDestroySurfaceObject(s));
     CHECK(hipFreeArray(as));
   }

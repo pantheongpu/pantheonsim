@@ -22,7 +22,9 @@ enum class Data : uint8_t {
   D2_10_10_10 = 9, D8_8_8_8 = 10, D32_32 = 11, D16_16_16_16 = 12, D32_32_32 = 13, D32_32_32_32 = 14,
 };
 // And the number formats (BUF_NUM_FORMAT_*): what a channel's bits mean.
-enum class Num : uint8_t { Unorm = 0, Snorm = 1, Uscaled = 2, Sscaled = 3, Uint = 4, Sint = 5, Float = 7 };
+// Srgb: 8-bit unorm whose color channels (not alpha) are sRGB-encoded, read
+// back as linear values.
+enum class Num : uint8_t { Unorm = 0, Snorm = 1, Uscaled = 2, Sscaled = 3, Uint = 4, Sint = 5, Float = 7, Srgb = 9 };
 
 struct Format {
   Data data = Data::Invalid;
