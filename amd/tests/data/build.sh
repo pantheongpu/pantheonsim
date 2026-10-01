@@ -27,6 +27,13 @@ for src in vector_add ops math memory globals grid bytes int64 atomics mixed hal
   echo "wrote $(pwd)/$src.gfx1100.o, $src.gfx1201.o and $src.gfx1030.o"
 done
 
+# vector_add for the RDNA generic targets (test_amd_gcn_asm), which need a
+# clang that knows them (ROCm's; LLVM 19 and later).
+for t in gfx11-generic gfx12-generic; do
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=$t -nogpulib -O2 -c vector_add.c -o vector_add.$t.o ||
+    echo "this clang has no $t: keeping vector_add.$t.o as it is"
+done
+
 # The scratch kernel for gfx90a too, which reaches its private memory through
 # a buffer resource rather than flat scratch (test_amd_gcn_memory).
 "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx90a -nogpulib -O2 -c memory.c -o memory.gfx90a.o

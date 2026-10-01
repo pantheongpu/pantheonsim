@@ -460,6 +460,26 @@ VTEST(rdna_shader_cycles_count_up) {
   VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
 }
 
+// Code built for an RDNA generic target (gfx11-generic, gfx12-generic) runs
+// as its family's: hip-tests' hipModuleLoadFatBinary loads such bundles, and
+// they ran as CDNA code before.
+VTEST(rdna_generic_code_objects_run_as_their_family) {
+  for (const char* target : {"gfx11-generic", "gfx12-generic"}) {
+    const amd::CodeObject o = object("vector_add", target);
+    VCHECK(amd::gcn::is_rdna(amd::gcn::target_of_mach(o.mach)));
+    MemoryManager mem(16ull << 20);
+    std::vector<float> a(64), b(64);
+    for (int i = 0; i < 64; ++i) a[i] = static_cast<float>(i), b[i] = 0.5f * static_cast<float>(i);
+    const uint64_t pa = mem.alloc(256), pb = mem.alloc(256), out = mem.alloc(256);
+    mem.write(pa, a.data(), 256);
+    mem.write(pb, b.data(), 256);
+    const std::vector<uint32_t> r = run(o, "vector_add", mem, out, 64, {pa, pb, out, 64});
+    int wrong = 0;
+    for (int i = 0; i < 64; ++i) wrong += r[i] != f(1.5f * static_cast<float>(i));
+    VCHECK_EQ(wrong, 0);
+  }
+}
+
 // A kernel that ends where it begins, launched over 64 million work-groups,
 // as hip-tests launches its NOPKernel over the largest grids there are: one
 // group runs, and the dispatch counts what it did once for each group.
