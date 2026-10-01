@@ -88,8 +88,11 @@ struct Warp {
 
   Mask runnable() const { return alive & ~exited & ~waiting; }
   uint32_t& reg(unsigned n, unsigned lane) {
-    if (n >= nregs) throw std::out_of_range("register R" + std::to_string(n) + " past the warp's " + std::to_string(nregs));
+    if (n >= nregs) [[unlikely]] past_file(n);
     return r[n * 32 + lane];
+  }
+  [[noreturn, gnu::cold, gnu::noinline]] void past_file(unsigned n) const {
+    throw std::out_of_range("register R" + std::to_string(n) + " past the warp's " + std::to_string(nregs));
   }
 };
 
@@ -220,14 +223,13 @@ class Runner {
   void run_block(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
-  void execute(Block& blk, Warp& w, const Instr& ins, Mask group);
+  void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
+  bool fast_alu(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc
 
   // ---- state access ----
   const Instr& fetch(uint64_t addr, const Code** code_out = nullptr);
   uint32_t cbank32(unsigned bank, uint64_t offset) const;
-  uint32_t read32(Warp& w, const Operand& o, unsigned lane);
   uint64_t read64(Warp& w, const Operand& o, unsigned lane);
-  void write32(Warp& w, const Operand& o, unsigned lane, uint32_t v);
   void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v);
   bool pred(Warp& w, const Operand& o, unsigned lane) const;
   void set_pred(Warp& w, const Operand& o, unsigned lane, bool v);
@@ -266,6 +268,21 @@ class Runner {
   void cluster_barrier_check(Block& blk);                // UCGABAR: complete the phase if all are in
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
+  // Operand access, inline for the common case -- a register -- since every
+  // instruction makes it once per lane per operand; the rest out of line.
+  uint32_t read32(Warp& w, const Operand& o, unsigned lane) {
+    if (o.kind == Kind::Reg) [[likely]] return o.reg == kRZ ? 0 : w.reg(o.reg, lane);
+    return read32_slow(w, o, lane);
+  }
+  void write32(Warp& w, const Operand& o, unsigned lane, uint32_t v) {
+    if (o.kind == Kind::Reg) [[likely]] {
+      if (o.reg != kRZ) w.reg(o.reg, lane) = v;
+      return;
+    }
+    write32_slow(w, o, lane, v);
+  }
+  uint32_t read32_slow(Warp& w, const Operand& o, unsigned lane);
+  void write32_slow(Warp& w, const Operand& o, unsigned lane, uint32_t v);
 
   const Module& m_;
   const CubinKernel& k_;
@@ -416,7 +433,7 @@ const Instr& Runner::fetch(uint64_t addr, const Code** code_out) {
   return c->instr((addr - c->base) / 16);
 }
 
-uint32_t Runner::read32(Warp& w, const Operand& o, unsigned lane) {
+uint32_t Runner::read32_slow(Warp& w, const Operand& o, unsigned lane) {
   switch (o.kind) {
     case Kind::Reg: return o.reg == kRZ ? 0 : w.reg(o.reg, lane);
     case Kind::UReg: return o.reg >= (m_.sm >= 100 ? 255u : 63u) ? 0 : w.ur[o.reg];
@@ -454,11 +471,8 @@ uint64_t Runner::read64(Warp& w, const Operand& o, unsigned lane) {
   }
 }
 
-void Runner::write32(Warp& w, const Operand& o, unsigned lane, uint32_t v) {
-  if (o.kind == Kind::Reg) {
-    if (o.reg == kRZ) return;
-    w.reg(o.reg, lane) = v;
-  } else if (o.kind == Kind::UReg) {
+void Runner::write32_slow(Warp& w, const Operand& o, unsigned /*lane*/, uint32_t v) {
+  if (o.kind == Kind::UReg) {
     if (o.reg >= (m_.sm >= 100 ? 255u : 63u)) return;
     w.ur[o.reg] = v;
   }
@@ -824,32 +838,100 @@ void Runner::run_cluster(uint64_t k) {
   for (Block& blk : blocks) stats_.add(blk.st);
 }
 
+exec::InstClass inst_class(Op op);   // exec_ops.inc
+bool straight(const Instr& ins);
+
 // One instruction for one group of lanes. False when no lane can run.
 bool Runner::step_warp(Block& blk, Warp& w) {
   const Mask run = w.runnable();
   if (!run) return false;
   // The group at the lowest address -- or, when the running group has been
-  // spinning, the next group up, so it gives the others a turn.
-  uint64_t lo = ~uint64_t{0}, cur = w.pc[std::countr_zero(run)];
-  for (unsigned l = 0; l < 32; ++l)
-    if ((run >> l) & 1) lo = std::min(lo, w.pc[l]);
+  // spinning, the next group up, so it gives the others a turn. One pass
+  // over the runnable lanes finds the lowest address and its lanes (every
+  // instruction comes through here, so it is kept short).
+  const uint64_t cur = w.pc[std::countr_zero(run)];
+  uint64_t lo = cur;
+  Mask group = 0;
+  for (Mask m = run; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t p = w.pc[l];
+    if (p < lo) {
+      lo = p;
+      group = 0;
+    }
+    if (p == lo) group |= Mask{1} << l;
+  }
   uint64_t pick = lo;
   if (w.give_way) {
-    uint64_t next = ~uint64_t{0};
-    for (unsigned l = 0; l < 32; ++l)
-      if (((run >> l) & 1) && w.pc[l] > cur) next = std::min(next, w.pc[l]);
-    pick = next != ~uint64_t{0} ? next : lo;
     w.give_way = false;
+    uint64_t next = ~uint64_t{0};
+    for (Mask m = run; m; m &= m - 1) {
+      const uint64_t p = w.pc[std::countr_zero(m)];
+      if (p > cur) next = std::min(next, p);
+    }
+    if (next != ~uint64_t{0}) {
+      pick = next;
+      group = 0;
+      for (Mask m = run; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        if (w.pc[l] == pick) group |= Mask{1} << l;
+      }
+    }
   }
-  Mask group = 0;
-  for (unsigned l = 0; l < 32; ++l)
-    if (((run >> l) & 1) && w.pc[l] == pick) group |= Mask{1} << l;
-  const Instr& ins = fetch(pick);
-  if (++w.steps > cfg_.max_steps)
-    throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
-                                  " instructions (an infinite loop?)");
-  execute(blk, w, ins, group);
-  return true;
+  // A straight-line run: arithmetic, conversions and plain loads and stores
+  // leave the lanes' program counters alone, so the group runs on through
+  // them without coming back here or moving its 32 counters each time; they
+  // are set once, where the run stops. Control flow, waits and anything that
+  // reads its own pc (LEPC) end the run and take the general path.
+  uint64_t pc = pick;
+  const Code* code = nullptr;
+  const Instr* ins = &fetch(pc, &code);
+  const uint64_t end = code->base + 16 * code->count;
+  for (unsigned n = 0;; ++n) {
+    if (++w.steps > cfg_.max_steps)
+      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
+                                    " instructions (an infinite loop?)");
+    if (n < 256 && pc + 16 < end && straight(*ins)) {
+      execute(blk, w, *ins, group, /*advance=*/false);
+      pc += 16;
+      ins = &code->instr((pc - code->base) / 16);
+      continue;
+    }
+    if (pc != pick)
+      for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = pc;
+    execute(blk, w, *ins, group);
+    return true;
+  }
+}
+
+// Whether an instruction leaves every lane's pc to its caller (see step_warp).
+bool straight(const Instr& ins) {
+  switch (ins.op) {
+    case Op::Unknown:
+    // control flow, barriers and waits
+    case Op::BRA: case Op::BRX: case Op::JMP: case Op::CALL: case Op::RET: case Op::EXIT:
+    case Op::BSSY: case Op::BSYNC: case Op::BREAK: case Op::WARPSYNC: case Op::BAR:
+    case Op::NOP: case Op::YIELD: case Op::NANOSLEEP: case Op::BPT: case Op::DEPBAR:
+    case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::BMOV: case Op::ENDCOLLECTIVE: case Op::UCGABAR:
+    // what waits on, or wakes, other lanes or warps
+    case Op::ATOMS: case Op::SYNCS: case Op::ARRIVES: case Op::LDGDEPBAR:
+    case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MATCH: case Op::REDUX:
+      return false;
+    case Op::MOV:
+      return ins.mnemonic != "LEPC";
+    default:
+      break;
+  }
+  // The arithmetic, conversion and memory families only.
+  switch (ins.op) {
+    case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL:
+    case Op::LD: case Op::ST: case Op::LDC:
+      return true;
+    default:
+      return inst_class(ins.op) == exec::InstClass::Integer || inst_class(ins.op) == exec::InstClass::Fp32 ||
+             inst_class(ins.op) == exec::InstClass::Fp64 || inst_class(ins.op) == exec::InstClass::Fp16 ||
+             inst_class(ins.op) == exec::InstClass::BitConvert;
+  }
 }
 
 // Mask of the group's lanes whose guard predicate holds.

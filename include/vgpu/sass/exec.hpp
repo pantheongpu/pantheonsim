@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -51,6 +52,7 @@ struct Code {
  private:
   struct Decoded {
     std::once_flag once;
+    std::atomic<bool> ready{false};   // set once decoding is done: the fast check before call_once
     std::vector<Instr> instrs;
   };
   std::unique_ptr<Decoded> decoded_ = std::make_unique<Decoded>();

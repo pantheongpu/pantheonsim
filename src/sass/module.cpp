@@ -24,6 +24,9 @@ const Code* Module::code_at(uint64_t addr) const {
 // An instruction the decoder does not know is kept as an unknown one and
 // reported if it is ever reached -- a kernel may carry code no launch executes.
 const Instr& Code::instr(size_t i) const {
+  // Every fetch comes through here; once decoded, an acquire load is all it
+  // costs (std::call_once's own fast path showed in profiles).
+  if (decoded_->ready.load(std::memory_order_acquire)) [[likely]] return decoded_->instrs[i];
   std::call_once(decoded_->once, [&] {
     std::vector<Instr>& out = decoded_->instrs;
     out.reserve(count);
@@ -43,6 +46,7 @@ const Instr& Code::instr(size_t i) const {
         out.push_back(std::move(bad));
       }
     }
+    decoded_->ready.store(true, std::memory_order_release);
   });
   return decoded_->instrs[i];
 }
