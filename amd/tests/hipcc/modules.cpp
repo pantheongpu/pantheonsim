@@ -66,6 +66,16 @@ int main(int argc, char** argv) {
          "a module launch of a block wider than the device's");
   EXPECT(hipExtModuleLaunchKernel(f, 64, 1, 1, 2048, 1, 1, 0, nullptr, args, nullptr, nullptr, nullptr, 0),
          hipErrorInvalidConfiguration, "an extended launch of a block wider than the device's");
+  // A cooperative module launch checks its block, LDS and grid first, each
+  // a wrong value, and only then its function, as a bad handle.
+  EXPECT(hipModuleLaunchCooperativeKernel(nullptr, 1, 1, 1, 1, 1, 1, 0, nullptr, args), hipErrorInvalidResourceHandle,
+         "a cooperative launch of no function");
+  EXPECT(hipModuleLaunchCooperativeKernel(nullptr, 0, 1, 1, 1, 1, 1, 0, nullptr, args), hipErrorInvalidValue,
+         "a cooperative launch of no function over an empty grid is a wrong value first");
+  EXPECT(hipModuleLaunchCooperativeKernel(f, 1, 1, 1, 0, 1, 1, 0, nullptr, args), hipErrorInvalidValue,
+         "a cooperative launch of an empty block");
+  EXPECT(hipModuleLaunchCooperativeKernel(f, 1, 1, 1, 1, 1, 1, 1u << 20, nullptr, args), hipErrorInvalidValue,
+         "a cooperative launch asking for more LDS than there is");
   void* extra[] = {HIP_LAUNCH_PARAM_END};
   EXPECT(hipModuleLaunchKernel(f, 1, 1, 1, 64, 1, 1, 0, nullptr, args, extra), hipErrorInvalidValue,
          "a launch passing both kernelParams and extra");

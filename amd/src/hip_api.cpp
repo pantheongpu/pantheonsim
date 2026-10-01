@@ -4620,8 +4620,19 @@ hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, un
   const ApiCall api("hipModuleLaunchCooperativeKernel");
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
-  if (!f) return record(s, hipErrorInvalidValue);
   if (!device(s)) return record(s, hipErrorInvalidDevice);
+  // ROCm's HIP checks these first, in this order, each an invalid value:
+  // a destroyed stream; empty or too large a block; more LDS than a
+  // compute unit has; an empty grid. Only then the function.
+  Stream null_stream;
+  if (!find_stream(s, stream, &null_stream)) return record(s, hipErrorContextIsDestroyed);
+  const vgpu::Limits& lim = s.rt->device(s.current).profile().limits;
+  const uint64_t threads = uint64_t{bx} * by * bz;
+  if (!bx || !by || !bz || (lim.max_threads_per_block && threads > lim.max_threads_per_block))
+    return record(s, hipErrorInvalidValue);
+  if (lim.shared_mem_per_block && shared > lim.shared_mem_per_block) return record(s, hipErrorInvalidValue);
+  if (!gx || !gy || !gz) return record(s, hipErrorInvalidValue);
+  if (!f) return record(s, hipErrorInvalidResourceHandle);
   Function* fn = reinterpret_cast<Function*>(f);
   if (const hipError_t e = check_launch(s, s.current, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, stream);
       e != hipSuccess)
