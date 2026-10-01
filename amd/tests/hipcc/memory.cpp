@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -203,6 +204,22 @@ int main() {
   (void)hipSetDevice(0);
   check(back[0] == 0x5A5A5A5Au && back[255] == 0x5A5A5A5Au,
         "a copy from another device's memory follows the memset queued there before it");
+  // But a device-to-device copy waits only for the device it reads from: one
+  // into another device's memory returns before the work queued there is
+  // done (hip-tests' hipMemcpyPeer synchronization check expects it back
+  // while that work runs).
+  (void)hipSetDevice(1);
+  delay<<<1, 1>>>(1000, rate);
+  (void)hipSetDevice(0);
+  const auto copy_start = std::chrono::steady_clock::now();
+  (void)hipMemcpyPeer(other, 1, words, 0, 1024);
+  const double copy_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count();
+  check(copy_ms < 500, "a peer copy into another device's memory does not wait for the work queued there",
+        std::to_string(static_cast<int>(copy_ms)) + " ms");
+  (void)hipSetDevice(1);
+  (void)hipDeviceSynchronize();
+  (void)hipSetDevice(0);
 
   // ---- Managed memory: advice and prefetches, page by page
   char* managed = nullptr;

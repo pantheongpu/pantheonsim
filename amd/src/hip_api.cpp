@@ -1362,14 +1362,16 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   const bool to_device = to.mem != nullptr, from_device = from.mem != nullptr;
   // A synchronous copy of another device's memory also comes after what that
   // device's blocking streams were given: it is ordered on the device the
-  // memory is on, as ROCm's HIP orders it, as well as the current one --
-  // a device-to-device one too, which returns before it is done but not
-  // before what it follows there. A graph's launch runs its copy right here,
-  // on its stream's thread.
+  // memory is on, as ROCm's HIP orders it, as well as the current one. A
+  // device-to-device one, which is queued and returned from at once, waits
+  // only for the device it reads from, so that it reads what was queued there
+  // before it, and still returns before the work queued where it writes is
+  // done (hip-tests' hipMemcpyPeer synchronization check). A graph's launch
+  // runs its copy right here, on its stream's thread.
   const bool run_here = sink != nullptr;
   if (called_sync && !run_here)
     for (const Side* side : {&to, &from})
-      if (side->device && side->ordinal != ordinal) drain_device(side->ordinal, true);
+      if (side->device && side->ordinal != ordinal && (!async || side == &from)) drain_device(side->ordinal, true);
   bool wait = !async || run_here;
   if (async && (!to.mem || (!to.device && !from.device))) wait = true;
   const uint64_t w = dr.width, rows = dr.rows, depth = dr.depth;
