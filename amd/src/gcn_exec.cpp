@@ -310,8 +310,8 @@ struct Machine {
       } catch (...) {
         const uint32_t valid = word_tail(m, addr, size);
         if (!valid) throw;
-        uint64_t v = 0;
-        m.read(addr, &v, valid);
+        uint64_t v = 0;   // byte by byte, each atomically, as every device access is
+        for (uint32_t b = 0; b < valid; ++b) v |= m.load_scalar(addr + b, 1) << (8 * b);
         return v;
       }
     }
@@ -4702,12 +4702,23 @@ struct Machine {
     const auto guard = atomic_guard(addr);
     uint64_t before = 0;
     uint32_t valid = a.bytes;   // fewer on the last word of an allocation (word_tail)
+    // The bytes of a word that runs past the allocation's end, one at a time
+    // and each atomically, as every other access to device memory is: a
+    // plain copy here raced with another work-group's load of the same word.
+    const auto load_bytes = [&](uint32_t n) {
+      uint64_t x = 0;
+      for (uint32_t i = 0; i < n; ++i) x |= m.load_scalar(addr + i, 1) << (8 * i);
+      return x;
+    };
+    const auto store_bytes = [&](uint64_t x, uint32_t n) {
+      for (uint32_t i = 0; i < n; ++i) m.store_scalar(addr + i, 1, (x >> (8 * i)) & 0xFF);
+    };
     try {
       before = m.load_scalar(addr, a.bytes);
     } catch (...) {
       valid = word_tail(m, addr, a.bytes);
       if (!valid) throw;
-      m.read(addr, &before, valid);
+      before = load_bytes(valid);
     }
     const uint64_t after = atomic_result(a, before, v, expected);
     if (after != before) {
@@ -4717,10 +4728,10 @@ struct Machine {
         } catch (...) {
           valid = word_tail(m, addr, a.bytes);
           if (!valid) throw;
-          m.write(addr, &after, valid);
+          store_bytes(after, valid);
         }
       } else {
-        m.write(addr, &after, valid);
+        store_bytes(after, valid);
       }
     }
     return before;
