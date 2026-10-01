@@ -4655,19 +4655,32 @@ bool holds_graph_memory(const GraphRec& g) {
 // The nodes in an order that runs every node after everything it depends on.
 // Empty when the dependencies contain a cycle, which is how adding one is
 // refused.
+//
+// Of the nodes ready to run, the one added first runs first. Any order is a
+// correct execution, but an RTX 3060 runs nodes nothing orders in the order
+// they were added, and a program can come to depend on that without knowing:
+// CUDA Samples' graphConditionalNodes, built against CUDA 13, passes its
+// kernel as the conditional node's dependency with a count of 0 (the edge-data
+// argument moved it), and on the card the kernel still sets the condition
+// before the conditional node reads it. Taking the latest-added first ran the
+// conditional node first, on the previous launch's value.
 std::vector<GraphNodeRec*> topological_order(const GraphRec& g) {
-  std::map<const GraphNodeRec*, size_t> remaining;
-  for (const auto& up : g.nodes) remaining[up.get()] = up->deps.size();
-  std::vector<GraphNodeRec*> out, ready;
-  for (const auto& up : g.nodes)
-    if (up->deps.empty()) ready.push_back(up.get());
+  std::map<const GraphNodeRec*, size_t> remaining, index;
+  for (size_t i = 0; i < g.nodes.size(); ++i) {
+    remaining[g.nodes[i].get()] = g.nodes[i]->deps.size();
+    index[g.nodes[i].get()] = i;
+  }
+  std::vector<GraphNodeRec*> out;
+  std::set<size_t> ready;   // by the order the nodes were added
+  for (size_t i = 0; i < g.nodes.size(); ++i)
+    if (g.nodes[i]->deps.empty()) ready.insert(i);
   while (!ready.empty()) {
-    GraphNodeRec* n = ready.back();
-    ready.pop_back();
+    GraphNodeRec* n = g.nodes[*ready.begin()].get();
+    ready.erase(ready.begin());
     out.push_back(n);
     for (const auto& up : g.nodes) {
       if (std::find(up->deps.begin(), up->deps.end(), n) == up->deps.end()) continue;
-      if (--remaining[up.get()] == 0) ready.push_back(up.get());
+      if (--remaining[up.get()] == 0) ready.insert(index[up.get()]);
     }
   }
   if (out.size() != g.nodes.size()) return {};   // a cycle
