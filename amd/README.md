@@ -412,13 +412,15 @@ texture units, and the simulator models them from the kernel up:
   height, the sampler's filter and normalization bits, the width after the
   resource), and do point-sampling's rounding in the kernel.
 - **HIP:** arrays (1D, 2D, 3D, layered), every copy to and from them, texture
-  objects over arrays, linear and pitched memory (runtime and driver API), and
-  surface objects (`src/hip_images.inc`), each check and error as ROCm's HIP
-  makes it. ROCm's HIP on Linux has no mipmaps, so neither does the shim.
+  objects over arrays, linear and pitched memory (runtime and driver API),
+  texture references (`texture<T, dim, mode>`, bound with `hipBindTexture*`
+  or a module's through `hipTexRef*`), sRGB textures, and surface objects
+  (`src/hip_images.inc`), each check and error as ROCm's HIP makes it.
+  ROCm's HIP on Linux has no mipmaps or cube arrays, so neither does the shim.
 - **HSA:** the images extension (`src/hsa_images.inc`): images and samplers,
   import, export, copy and clear, and each agent's image limits.
 - **Checks:** `tests/data/asm_images.s` checks each instruction against the
-  host; `tests/hipcc/images.cpp` (18 checks) runs on all three generations, on
+  host; `tests/hipcc/images.cpp` (20 checks) runs on all three generations, on
   the shim and on ROCm's own HIP over the HSA runtime; `tests/hsa/hsa_images.c`
   checks the extension.
 
