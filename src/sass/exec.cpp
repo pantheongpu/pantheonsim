@@ -29,6 +29,7 @@
 #include <thread>
 
 #include "vgpu/error.hpp"
+#include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"

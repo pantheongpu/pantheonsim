@@ -3058,78 +3058,38 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
 
 void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name) {
   // The CUDA ABI: arguments in R4, R5, R6, R7...; a result in R4 (and R5).
-  if (name == "vprintf") {
-    std::lock_guard<std::mutex> g(stats_mu_);
+  if (name == "vprintf") {   // R4:R5 the format, R6:R7 the argument buffer
     each_lane(ex, [&](unsigned l) {
       const uint64_t fmt = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
-      uint64_t args = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
-      const auto read_bytes = [&](uint64_t g, void* out, uint32_t n) {
-        uint64_t off;
-        const Space sp = classify(g, &off);
-        mem_read(blk, w, l, sp, off, out, n);
+      const uint64_t args = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
+      const auto cstring = [&](uint64_t a) {
+        std::string str;
+        for (;; ++a) {
+          uint64_t off;
+          const Space sp = classify(a, &off);
+          char c;
+          mem_read(blk, w, l, sp, off, &c, 1);
+          if (!c) break;
+          str += c;
+        }
+        return str;
       };
-      std::string f;
-      for (uint64_t a = fmt;; ++a) {
-        char c;
-        read_bytes(a, &c, 1);
-        if (!c) break;
-        f += c;
-      }
-      std::string out;
-      for (size_t i = 0; i < f.size(); ++i) {
-        if (f[i] != '%') {
-          out += f[i];
-          continue;
-        }
-        size_t j = i + 1;
-        while (j < f.size() && std::strchr("-+ #0123456789.*", f[j])) ++j;
-        std::string lenmod;
-        while (j < f.size() && std::strchr("hlLqjzt", f[j])) lenmod += f[j++];
-        if (j >= f.size()) break;
-        const char conv = f[j];
-        std::string spec = f.substr(i, j - i + 1);
-        char buf[512];
-        if (conv == '%') {
-          out += '%';
-        } else if (conv == 's') {
-          args = (args + 7) & ~7ull;
-          uint64_t p = 0;
-          read_bytes(args, &p, 8);
-          args += 8;
-          std::string str;
-          for (uint64_t a = p; p; ++a) {
-            char c;
-            read_bytes(a, &c, 1);
-            if (!c) break;
-            str += c;
-          }
-          std::snprintf(buf, sizeof buf, spec.c_str(), str.c_str());
-          out += buf;
-        } else if (std::strchr("fFeEgGaA", conv)) {
-          args = (args + 7) & ~7ull;
-          double d = 0;
-          read_bytes(args, &d, 8);
-          args += 8;
-          std::snprintf(buf, sizeof buf, spec.c_str(), d);
-          out += buf;
-        } else {
-          const bool wide = lenmod.find('l') != std::string::npos || lenmod == "j" || lenmod == "z" || lenmod == "t" ||
-                            conv == 'p';
-          const uint32_t n = wide ? 8 : 4;
-          args = (args + n - 1) & ~static_cast<uint64_t>(n - 1);
-          uint64_t v = 0;
-          read_bytes(args, &v, n);
-          args += n;
-          if (wide) std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<unsigned long long>(v));
-          else std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<unsigned>(v));
-          out += buf;
-        }
-        i = j;
-      }
-      std::fwrite(out.data(), 1, out.size(), stdout);
+      uint64_t cursor = 0;
+      const auto fetch = [&](uint32_t size) -> uint64_t {
+        cursor = (cursor + size - 1) / size * size;   // natural alignment in the buffer
+        if (args == 0)
+          throw Error(Err::InvalidValue, "printf format consumes arguments but no argument buffer was passed");
+        uint64_t off, v = 0;
+        const Space sp = classify(args + cursor, &off);
+        mem_read(blk, w, l, sp, off, &v, size);
+        cursor += size;
+        return v;
+      };
+      const std::string out = exec::format_device_printf(
+          cstring(fmt), fetch, cstring, [](Err e, const char* why) { throw Error(e, why); });
+      exec::emit_device_printf(out);
       w.reg(4, l) = static_cast<uint32_t>(out.size());
     });
-    std::fflush(stdout);
     return;
   }
   if (name == "malloc" || name == "free") {

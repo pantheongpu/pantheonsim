@@ -44,6 +44,7 @@
 #include <optional>
 #include <unordered_map>
 
+#include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -10824,7 +10825,6 @@ class Interpreter {
       std::string fmt = read_cstring(w, ctx, ins, lane, fmt_it->second.read(lane, 0, 8));
       uint64_t valist = va_it->second.read(lane, 0, 8);
       uint64_t cursor = 0;
-      std::string out;
 
       auto fetch = [&](uint32_t size) -> uint64_t {
         cursor = (cursor + size - 1) / size * size;  // natural alignment in the valist
@@ -10836,122 +10836,10 @@ class Interpreter {
         return v;
       };
 
-      // The format is the C one, formatted the way an RTX 3060's host side
-      // formats it: glibc's text for every conversion (so "(nil)", "(null)",
-      // "-nan"), and a conversion it does not know printed as written,
-      // consuming no argument. What the card does wrong is refused by name
-      // rather than imitated: a `*` precision, hh, %Lf and %n.
-      auto format = [&](const std::string& spec, auto value) {
-        const int n = std::snprintf(nullptr, 0, spec.c_str(), value);
-        std::string text(n > 0 ? static_cast<size_t>(n) : 0, '\0');
-        if (n > 0) std::snprintf(text.data(), text.size() + 1, spec.c_str(), value);
-        out += text;
-      };
-      for (size_t i = 0; i < fmt.size(); ++i) {
-        if (fmt[i] != '%') {
-          out += fmt[i];
-          continue;
-        }
-        const size_t start = i++;
-        std::string spec = "%";   // flags, width and precision, lengths removed
-        while (i < fmt.size() && std::string("-+ #0").find(fmt[i]) != std::string::npos) spec += fmt[i++];
-        if (i < fmt.size() && fmt[i] == '*') {
-          // A `*` width is an int argument before the value.
-          spec += std::to_string(static_cast<int32_t>(fetch(4)));
-          ++i;
-        }
-        while (i < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[i]))) spec += fmt[i++];
-        if (i < fmt.size() && fmt[i] == '.') {
-          spec += fmt[i++];
-          if (i < fmt.size() && fmt[i] == '*')
-            ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                     "printf's `*` precision: an RTX 3060 prints the value as 0 and misreads every "
-                     "argument after it, so it is not imitated");
-          while (i < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[i]))) spec += fmt[i++];
-        }
-        // Length: hh and h narrow an int, l, ll, z, j and t make it 8 bytes.
-        int narrow = 0;          // how many h's
-        bool wide = false, long_double = false, lflag = false;
-        while (i < fmt.size() && std::string("hlzjtL").find(fmt[i]) != std::string::npos) {
-          const char c = fmt[i++];
-          if (c == 'h') ++narrow;
-          else if (c == 'L') long_double = true;
-          else {
-            wide = true;
-            if (c == 'l') lflag = true;
-          }
-        }
-        if (i >= fmt.size())
-          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue, "printf format ends inside a % specifier");
-        const char conv = fmt[i];
-        if (narrow >= 2)
-          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                   "printf's hh length: an RTX 3060 reads the value from the wrong bytes (the format "
-                   "text's), so it is not imitated");
-        switch (conv) {
-          case '%':
-            out += '%';   // "%5%" too
-            break;
-          case 'd': case 'i': {
-            const uint64_t v = fetch(wide ? 8 : 4);
-            const std::string sp = spec + "lld";
-            const long long x = wide     ? static_cast<long long>(v)
-                                : narrow ? static_cast<short>(v)
-                                         : static_cast<int32_t>(v);
-            format(sp, x);
-            break;
-          }
-          case 'u': case 'o': case 'x': case 'X': {
-            const uint64_t v = fetch(wide ? 8 : 4);
-            const std::string sp = spec + "ll" + conv;
-            const unsigned long long x = wide     ? v
-                                         : narrow ? static_cast<unsigned short>(v)
-                                                  : static_cast<uint32_t>(v);
-            format(sp, x);
-            break;
-          }
-          case 'c':
-            format(spec + 'c', static_cast<int>(static_cast<unsigned char>(fetch(4))));
-            break;
-          case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
-            if (long_double)
-              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                       "printf's %L: long double is not a device type, and an RTX 3060 prints nan and "
-                       "misreads the arguments after it");
-            format(spec + conv, f64(fetch(8)));
-            break;
-          }
-          case 'p':
-            format(spec + 'p', reinterpret_cast<void*>(static_cast<uintptr_t>(fetch(8))));
-            break;
-          case 's': {
-            const uint64_t v = fetch(8);
-            if (v == 0) {
-              format(spec + 's', "(null)");
-            } else if (lflag) {
-              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                       "printf's %ls with a wide string is not implemented");
-            } else {
-              const std::string str = read_cstring(w, ctx, ins, lane, v);
-              format(spec + 's', str.c_str());
-            }
-            break;
-          }
-          case 'n':
-            ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx, "printf's %n is not implemented");
-          default:
-            // Not a conversion: the card prints it as written and moves on.
-            out.append(fmt, start, i - start + 1);
-        }
-      }
-      // One lock for the whole line: blocks run on several threads, and
-      // interleaving two device printfs mid-line makes both unreadable.
-      {
-        static std::mutex printf_mu;
-        std::lock_guard<std::mutex> guard(printf_mu);
-        std::fwrite(out.data(), 1, out.size(), stdout);
-        std::fflush(stdout);
-      }
+      const std::string out = vgpu::exec::format_device_printf(
+          fmt, fetch, [&](uint64_t a) { return read_cstring(w, ctx, ins, lane, a); },
+          [&](Err e, const char* why) { ctx_fail(ins, static_cast<int>(lane), e, why); });
+      vgpu::exec::emit_device_printf(out);
       counts[lane] = out.size();
     }
     if (!op.retval_slot.empty()) {
