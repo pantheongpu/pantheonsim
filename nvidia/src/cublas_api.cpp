@@ -1278,3 +1278,367 @@ VGPU_EXPORT cublasStatus_t cublasHgemm(cublasHandle_t h, cublasOperation_t ta,
 }
 
 #include "cublas_complex.inc"
+
+/* ---- the typed level-1 routines (cublas*Ex) ----
+   One routine for every element type, over std::complex<double> like the
+   complex half of this file: each element is read in its own type and the
+   answer rounded to the execution type and then to its own. Which
+   combinations of types are accepted is the table an RTX 3060's cuBLAS keeps
+   (any other is NOT_SUPPORTED):
+
+     x (and y)        Dot/Dotc result, exec   Nrm2 result   Asum result, exec   Axpy/Scal alpha = exec
+     R_16F, R_16BF    same as x, R_32F        same as x     R_32F, R_32F        R_32F
+     R_32F            R_32F, R_32F            R_32F         R_32F, R_32F        R_32F
+     R_64F            R_64F, R_64F            R_64F         R_64F, R_64F        R_64F
+     C_32F            C_32F, C_32F            R_32F         R_32F, C_32F        C_32F
+     C_64F            C_64F, C_64F            R_64F         R_64F, C_64F        C_64F
+
+   Nrm2's execution type is the real one (R_32F or R_64F). Iamax, Iamin, Copy
+   and Swap take any of the six, x and y alike. Increments follow BLAS: a
+   negative one walks its vector from the far end, and the reductions and Scal
+   do nothing for one that is not positive. */
+namespace {
+
+bool ex_known(cudaDataType t) {
+  return t == CUDA_R_16F || t == CUDA_R_16BF || t == CUDA_R_32F || t == CUDA_R_64F || t == CUDA_C_32F ||
+         t == CUDA_C_64F;
+}
+size_t ex_bytes(cudaDataType t) {
+  switch (t) {
+    case CUDA_R_16F: case CUDA_R_16BF: return 2;
+    case CUDA_R_32F: return 4;
+    case CUDA_R_64F: case CUDA_C_32F: return 8;
+    case CUDA_C_64F: return 16;
+    default: return 0;
+  }
+}
+bool ex_complex(cudaDataType t) { return t == CUDA_C_32F || t == CUDA_C_64F; }
+// The type arithmetic runs in: R_32F for everything narrower than double.
+cudaDataType ex_exec(cudaDataType t) {
+  return t == CUDA_R_64F ? CUDA_R_64F : t == CUDA_C_32F || t == CUDA_C_64F ? t : CUDA_R_32F;
+}
+// The real type of the same width, for norms and sums of magnitudes.
+cudaDataType ex_real(cudaDataType t) {
+  return t == CUDA_R_64F || t == CUDA_C_64F ? CUDA_R_64F : CUDA_R_32F;
+}
+
+cd ex_get(cudaDataType t, const uint8_t* p) {
+  switch (t) {
+    case CUDA_R_16F: { __half v; std::memcpy(&v, p, 2); return __half2float(v); }
+    case CUDA_R_16BF: { __nv_bfloat16 v; std::memcpy(&v, p, 2); return __bfloat162float(v); }
+    case CUDA_R_32F: { float v; std::memcpy(&v, p, 4); return v; }
+    case CUDA_R_64F: { double v; std::memcpy(&v, p, 8); return v; }
+    case CUDA_C_32F: { float v[2]; std::memcpy(v, p, 8); return {v[0], v[1]}; }
+    case CUDA_C_64F: { double v[2]; std::memcpy(v, p, 16); return {v[0], v[1]}; }
+    default: return 0;
+  }
+}
+// Rounded to the execution type first (single precision for the narrow
+// types), then to the element's own.
+void ex_put(cudaDataType t, uint8_t* p, cd v, cudaDataType exec) {
+  if (exec == CUDA_R_32F || exec == CUDA_C_32F) v = cd((float)v.real(), (float)v.imag());
+  switch (t) {
+    case CUDA_R_16F: { const __half h = __float2half((float)v.real()); std::memcpy(p, &h, 2); break; }
+    case CUDA_R_16BF: { const __nv_bfloat16 h = __float2bfloat16((float)v.real()); std::memcpy(p, &h, 2); break; }
+    case CUDA_R_32F: { const float f = (float)v.real(); std::memcpy(p, &f, 4); break; }
+    case CUDA_R_64F: { const double d = v.real(); std::memcpy(p, &d, 8); break; }
+    case CUDA_C_32F: { const float f[2] = {(float)v.real(), (float)v.imag()}; std::memcpy(p, f, 8); break; }
+    case CUDA_C_64F: { const double d[2] = {v.real(), v.imag()}; std::memcpy(p, d, 16); break; }
+    default: break;
+  }
+}
+
+// n elements of a strided vector, in BLAS order.
+std::vector<cd> ex_load(const void* x, cudaDataType t, int n, int inc) {
+  const size_t e = ex_bytes(t), step = (size_t)std::abs(inc);
+  const auto raw = fetch<uint8_t>(x, n > 0 ? ((n - 1) * step + 1) * e : 0);
+  std::vector<cd> out(std::max(n, 0));
+  for (int i = 0; i < n; ++i) out[i] = ex_get(t, raw.data() + (inc > 0 ? i : n - 1 - i) * step * e);
+  return out;
+}
+void ex_store(void* x, cudaDataType t, int n, int inc, const std::vector<cd>& v, cudaDataType exec) {
+  const size_t e = ex_bytes(t), step = (size_t)std::abs(inc);
+  auto raw = fetch<uint8_t>(x, n > 0 ? ((n - 1) * step + 1) * e : 0);   // keep what lies between
+  for (int i = 0; i < n; ++i) ex_put(t, raw.data() + (inc > 0 ? i : n - 1 - i) * step * e, v[i], exec);
+  store(x, raw);
+}
+
+cd ex_scalar(cublasHandle_t h, const void* p, cudaDataType t) {
+  if (!p) return 0;
+  std::vector<uint8_t> b(ex_bytes(t));
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) b = fetch<uint8_t>(p, b.size());
+  else std::memcpy(b.data(), p, b.size());
+  return ex_get(t, b.data());
+}
+void ex_result(cublasHandle_t h, void* result, cudaDataType t, cd v, cudaDataType exec) {
+  std::vector<uint8_t> b(ex_bytes(t));
+  ex_put(t, b.data(), v, exec);
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) store(result, b);
+  else std::memcpy(result, b.data(), b.size());
+}
+
+// A reduction's checks and its graph capture, then `body`.
+template <class Body>
+cublasStatus_t ex_reduce(cublasHandle_t h, void* result, Body body) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { body(); })) return CUBLAS_STATUS_SUCCESS;
+  body();
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t dot_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, int incx, const void* y,
+                      cudaDataType yt, int incy, void* result, cudaDataType rt, cudaDataType et, bool conj) {
+  if (!ex_known(xt) || yt != xt || rt != xt || et != ex_exec(xt)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return ex_reduce(h, result, [=] {
+    cd acc = 0;
+    if (n > 0) {
+      const auto xv = ex_load(x, xt, n, incx), yv = ex_load(y, yt, n, incy);
+      for (int i = 0; i < n; ++i) acc += (conj ? std::conj(xv[i]) : xv[i]) * yv[i];
+    }
+    ex_result(h, result, rt, acc, et);
+  });
+}
+
+cublasStatus_t nrm2_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, int incx, void* result,
+                       cudaDataType rt, cudaDataType et) {
+  if (!ex_known(xt) || rt != (ex_complex(xt) ? ex_real(xt) : xt) || et != ex_real(xt))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  return ex_reduce(h, result, [=] {
+    double acc = 0;
+    if (n > 0 && incx > 0)
+      for (const cd& v : ex_load(x, xt, n, incx)) acc += std::norm(v);
+    ex_result(h, result, rt, std::sqrt(acc), et);
+  });
+}
+
+// The sum of |re| + |im|, as BLAS's scasum and dzasum define it.
+cublasStatus_t asum_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, int incx, void* result,
+                       cudaDataType rt, cudaDataType et) {
+  if (!ex_known(xt) || rt != ex_real(xt) || et != (ex_complex(xt) ? xt : ex_real(xt)))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  return ex_reduce(h, result, [=] {
+    double acc = 0;
+    if (n > 0 && incx > 0)
+      for (const cd& v : ex_load(x, xt, n, incx)) acc += std::fabs(v.real()) + std::fabs(v.imag());
+    ex_result(h, result, rt, acc, ex_real(xt));
+  });
+}
+
+// The 1-based index of the first element of largest (or smallest) |re| + |im|;
+// 0 when there is nothing to search.
+template <class R>
+cublasStatus_t iamax_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, int incx, R* result, bool min) {
+  if (!ex_known(xt)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (host_result_under_capture(h)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=] { iamax_ex<R>(h, n, x, xt, incx, result, min); })) return CUBLAS_STATUS_SUCCESS;
+  R best = 0;
+  if (n > 0 && incx > 0) {
+    const auto xv = ex_load(x, xt, n, incx);
+    double top = 0;
+    for (int i = 0; i < n; ++i) {
+      const double v = std::fabs(xv[i].real()) + std::fabs(xv[i].imag());
+      if (i == 0 || (min ? v < top : v > top)) {
+        top = v;
+        best = i + 1;
+      }
+    }
+  }
+  put_result(h, result, best);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t axpy_ex(cublasHandle_t h, int n, const void* alpha, cudaDataType at, const void* x, cudaDataType xt,
+                       int incx, void* y, cudaDataType yt, int incy, cudaDataType et) {
+  if (!ex_known(xt) || yt != xt || at != ex_exec(xt) || et != at) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, ex_bytes(at))] {
+        axpy_ex(h, n, al.get(), at, x, xt, incx, y, yt, incy, et);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const cd a = ex_scalar(h, alpha, at);
+  const auto xv = ex_load(x, xt, n, incx);
+  auto yv = ex_load(y, yt, n, incy);
+  for (int i = 0; i < n; ++i) yv[i] += a * xv[i];
+  ex_store(y, yt, n, incy, yv, et);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t scal_ex(cublasHandle_t h, int n, const void* alpha, cudaDataType at, void* x, cudaDataType xt,
+                       int incx, cudaDataType et) {
+  if (!ex_known(xt) || at != ex_exec(xt) || et != at) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n <= 0 || incx <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, ex_bytes(at))] { scal_ex(h, n, al.get(), at, x, xt, incx, et); }))
+    return CUBLAS_STATUS_SUCCESS;
+  const cd a = ex_scalar(h, alpha, at);
+  auto xv = ex_load(x, xt, n, incx);
+  for (cd& v : xv) v *= a;
+  ex_store(x, xt, n, incx, xv, et);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// Copy and swap move elements without arithmetic; x and y are one type.
+cublasStatus_t copy_ex(cublasHandle_t h, int n, const void* x, cudaDataType xt, int incx, void* y, cudaDataType yt,
+                       int incy, bool swap) {
+  if (!ex_known(xt) || yt != xt) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=] { copy_ex(h, n, x, xt, incx, y, yt, incy, swap); })) return CUBLAS_STATUS_SUCCESS;
+  const auto xv = ex_load(x, xt, n, incx);
+  if (swap) ex_store(const_cast<void*>(x), xt, n, incx, ex_load(y, yt, n, incy), ex_complex(xt) ? xt : CUDA_R_64F);
+  ex_store(y, yt, n, incy, xv, ex_complex(xt) ? xt : CUDA_R_64F);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasDotEx(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                       const void* y, cudaDataType yType, int incy, void* result,
+                                       cudaDataType resultType, cudaDataType executionType) {
+  return dot_ex(h, n, x, xType, incx, y, yType, incy, result, resultType, executionType, false);
+}
+VGPU_EXPORT cublasStatus_t cublasDotcEx(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                        const void* y, cudaDataType yType, int incy, void* result,
+                                        cudaDataType resultType, cudaDataType executionType) {
+  return dot_ex(h, n, x, xType, incx, y, yType, incy, result, resultType, executionType, true);
+}
+VGPU_EXPORT cublasStatus_t cublasNrm2Ex(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                        void* result, cudaDataType resultType, cudaDataType executionType) {
+  return nrm2_ex(h, n, x, xType, incx, result, resultType, executionType);
+}
+VGPU_EXPORT cublasStatus_t cublasAsumEx(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                        void* result, cudaDataType resultType, cudaDataType executionType) {
+  return asum_ex(h, n, x, xType, incx, result, resultType, executionType);
+}
+VGPU_EXPORT cublasStatus_t cublasIamaxEx(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                         int* result) {
+  return iamax_ex(h, n, x, xType, incx, result, false);
+}
+VGPU_EXPORT cublasStatus_t cublasIaminEx(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                         int* result) {
+  return iamax_ex(h, n, x, xType, incx, result, true);
+}
+VGPU_EXPORT cublasStatus_t cublasAxpyEx(cublasHandle_t h, int n, const void* alpha, cudaDataType alphaType,
+                                        const void* x, cudaDataType xType, int incx, void* y, cudaDataType yType,
+                                        int incy, cudaDataType executiontype) {
+  return axpy_ex(h, n, alpha, alphaType, x, xType, incx, y, yType, incy, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasScalEx(cublasHandle_t h, int n, const void* alpha, cudaDataType alphaType, void* x,
+                                        cudaDataType xType, int incx, cudaDataType executionType) {
+  return scal_ex(h, n, alpha, alphaType, x, xType, incx, executionType);
+}
+VGPU_EXPORT cublasStatus_t cublasCopyEx(cublasHandle_t h, int n, const void* x, cudaDataType xType, int incx,
+                                        void* y, cudaDataType yType, int incy) {
+  return copy_ex(h, n, x, xType, incx, y, yType, incy, false);
+}
+VGPU_EXPORT cublasStatus_t cublasSwapEx(cublasHandle_t h, int n, void* x, cudaDataType xType, int incx, void* y,
+                                        cudaDataType yType, int incy) {
+  return copy_ex(h, n, x, xType, incx, y, yType, incy, true);
+}
+
+// The 64-bit forms (HeCBench's f16sp calls cublasDotEx_64), refused past int
+// as the other _64 forms here are.
+VGPU_EXPORT cublasStatus_t cublasDotEx_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                          int64_t incx, const void* y, cudaDataType yType, int64_t incy,
+                                          void* result, cudaDataType resultType, cudaDataType executionType) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return dot_ex(h, (int)n, x, xType, (int)incx, y, yType, (int)incy, result, resultType, executionType, false);
+}
+VGPU_EXPORT cublasStatus_t cublasDotcEx_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                           int64_t incx, const void* y, cudaDataType yType, int64_t incy,
+                                           void* result, cudaDataType resultType, cudaDataType executionType) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return dot_ex(h, (int)n, x, xType, (int)incx, y, yType, (int)incy, result, resultType, executionType, true);
+}
+VGPU_EXPORT cublasStatus_t cublasNrm2Ex_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                           int64_t incx, void* result, cudaDataType resultType,
+                                           cudaDataType executionType) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return nrm2_ex(h, (int)n, x, xType, (int)incx, result, resultType, executionType);
+}
+VGPU_EXPORT cublasStatus_t cublasAsumEx_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                           int64_t incx, void* result, cudaDataType resultType,
+                                           cudaDataType executionType) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return asum_ex(h, (int)n, x, xType, (int)incx, result, resultType, executionType);
+}
+VGPU_EXPORT cublasStatus_t cublasIamaxEx_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                            int64_t incx, int64_t* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return iamax_ex(h, (int)n, x, xType, (int)incx, result, false);
+}
+VGPU_EXPORT cublasStatus_t cublasIaminEx_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                            int64_t incx, int64_t* result) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return iamax_ex(h, (int)n, x, xType, (int)incx, result, true);
+}
+VGPU_EXPORT cublasStatus_t cublasAxpyEx_64(cublasHandle_t h, int64_t n, const void* alpha, cudaDataType alphaType,
+                                           const void* x, cudaDataType xType, int64_t incx, void* y,
+                                           cudaDataType yType, int64_t incy, cudaDataType executiontype) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return axpy_ex(h, (int)n, alpha, alphaType, x, xType, (int)incx, y, yType, (int)incy, executiontype);
+}
+VGPU_EXPORT cublasStatus_t cublasScalEx_64(cublasHandle_t h, int64_t n, const void* alpha, cudaDataType alphaType,
+                                           void* x, cudaDataType xType, int64_t incx, cudaDataType executionType) {
+  if (!fits_int(n) || !fits_int(incx)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return scal_ex(h, (int)n, alpha, alphaType, x, xType, (int)incx, executionType);
+}
+VGPU_EXPORT cublasStatus_t cublasCopyEx_64(cublasHandle_t h, int64_t n, const void* x, cudaDataType xType,
+                                           int64_t incx, void* y, cudaDataType yType, int64_t incy) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return copy_ex(h, (int)n, x, xType, (int)incx, y, yType, (int)incy, false);
+}
+VGPU_EXPORT cublasStatus_t cublasSwapEx_64(cublasHandle_t h, int64_t n, void* x, cudaDataType xType, int64_t incx,
+                                           void* y, cudaDataType yType, int64_t incy) {
+  if (!fits_int(n) || !fits_int(incx) || !fits_int(incy)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return copy_ex(h, (int)n, x, xType, (int)incx, y, yType, (int)incy, true);
+}
+
+// The 64-bit GEMM forms, onto the 32-bit ones.
+VGPU_EXPORT cublasStatus_t cublasGemmEx_64(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int64_t m,
+                                           int64_t n, int64_t k, const void* alpha, const void* A, cudaDataType Atype,
+                                           int64_t lda, const void* B, cudaDataType Btype, int64_t ldb,
+                                           const void* beta, void* C, cudaDataType Ctype, int64_t ldc,
+                                           cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
+  for (int64_t v : {m, n, k, lda, ldb, ldc})
+    if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return cublasGemmEx(h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, B, Btype, (int)ldb, beta, C,
+                      Ctype, (int)ldc, computeType, algo);
+}
+VGPU_EXPORT cublasStatus_t cublasGemmBatchedEx_64(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,
+                                                  int64_t m, int64_t n, int64_t k, const void* alpha,
+                                                  const void* const Aarray[], cudaDataType Atype, int64_t lda,
+                                                  const void* const Barray[], cudaDataType Btype, int64_t ldb,
+                                                  const void* beta, void* const Carray[], cudaDataType Ctype,
+                                                  int64_t ldc, int64_t batchCount, cublasComputeType_t computeType,
+                                                  cublasGemmAlgo_t algo) {
+  for (int64_t v : {m, n, k, lda, ldb, ldc, batchCount})
+    if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return cublasGemmBatchedEx(h, ta, tb, (int)m, (int)n, (int)k, alpha, Aarray, Atype, (int)lda, Barray, Btype,
+                             (int)ldb, beta, Carray, Ctype, (int)ldc, (int)batchCount, computeType, algo);
+}
+VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx_64(
+    cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int64_t m, int64_t n, int64_t k, const void* alpha,
+    const void* A, cudaDataType Atype, int64_t lda, long long strideA, const void* B, cudaDataType Btype, int64_t ldb,
+    long long strideB, const void* beta, void* C, cudaDataType Ctype, int64_t ldc, long long strideC,
+    int64_t batchCount, cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
+  for (int64_t v : {m, n, k, lda, ldb, ldc, batchCount})
+    if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return cublasGemmStridedBatchedEx(h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, strideA, B, Btype,
+                                    (int)ldb, strideB, beta, C, Ctype, (int)ldc, strideC, (int)batchCount,
+                                    computeType, algo);
+}
+VGPU_EXPORT cublasStatus_t cublasSgemmEx_64(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int64_t m,
+                                            int64_t n, int64_t k, const float* alpha, const void* A, cudaDataType Atype,
+                                            int64_t lda, const void* B, cudaDataType Btype, int64_t ldb,
+                                            const float* beta, void* C, cudaDataType Ctype, int64_t ldc) {
+  for (int64_t v : {m, n, k, lda, ldb, ldc})
+    if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return cublasSgemmEx(h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, B, Btype, (int)ldb, beta, C,
+                       Ctype, (int)ldc);
+}

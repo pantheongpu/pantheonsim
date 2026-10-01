@@ -7,8 +7,10 @@
 // form, GEMV, the level-1 routines, rank-1 and rank-k updates, triangular
 // multiplies and solves, Hermitian/symmetric products, and batched LU.
 //
+// Also geam and gelsBatched, for the real types as well (at the end).
+//
 // Not implemented (still stubs): her/her2/syr/syr2, her2k/syr2k, the rot
-// family, geqrfBatched and gelsBatched.
+// family and geqrfBatched.
 
 #include "complex_linalg.hpp"
 
@@ -19,9 +21,14 @@ using vgpu_la::CMat;
 
 inline cd to_cd(const cuComplex& v) { return {v.x, v.y}; }
 inline cd to_cd(const cuDoubleComplex& v) { return {v.x, v.y}; }
+// The real types too, for the routines below written once for S, D, C and Z.
+inline cd to_cd(float v) { return {v, 0.0}; }
+inline cd to_cd(double v) { return {v, 0.0}; }
 template <class T> T from_cd(cd v);
 template <> inline cuComplex from_cd<cuComplex>(cd v) { return make_cuComplex((float)v.real(), (float)v.imag()); }
 template <> inline cuDoubleComplex from_cd<cuDoubleComplex>(cd v) { return make_cuDoubleComplex(v.real(), v.imag()); }
+template <> inline float from_cd<float>(cd v) { return static_cast<float>(v.real()); }
+template <> inline double from_cd<double>(cd v) { return v.real(); }
 template <class T> using Real = std::conditional_t<std::is_same_v<T, cuComplex>, float, double>;
 
 template <class T> std::vector<cd> load_c(const T* dev, size_t n) {
@@ -575,3 +582,118 @@ VGPU_EXPORT cublasStatus_t cublasZdscal_v2(cublasHandle_t h, int n, const double
     return CUBLAS_STATUS_SUCCESS;
   });
 }
+
+/* ---- geam and gelsBatched, for all four types ----
+   Written once over std::complex<double>, as the rest of this file is; a real
+   matrix is a complex one with no imaginary part, and comes out rounded to its
+   own precision. The answers to bad arguments are an RTX 3060's. */
+namespace {
+
+// C = alpha op(A) + beta op(B), all m x n. Each op is N, T or C (C is T for
+// the real types). Only what a zero scalar multiplies goes unread: B may be
+// NULL when beta is 0, and NaN in it stays out of C. C may be A, or B, in
+// place, provided that operand is not transposed and has C's leading
+// dimension; otherwise INVALID_VALUE, as for a leading dimension shorter than
+// its matrix's rows.
+template <class T>
+cublasStatus_t geam(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, const T* alpha,
+                    const T* A, int lda, const T* beta, const T* B, int ldb, T* C, int ldc) {
+  auto known = [](cublasOperation_t t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; };
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!known(ta) || !known(tb) || m < 0 || n < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  const int rows_a = ta == CUBLAS_OP_N ? m : n, cols_a = ta == CUBLAS_OP_N ? n : m;
+  const int rows_b = tb == CUBLAS_OP_N ? m : n, cols_b = tb == CUBLAS_OP_N ? n : m;
+  if (lda < std::max(1, rows_a) || ldb < std::max(1, rows_b) || ldc < std::max(1, m))
+    return CUBLAS_STATUS_INVALID_VALUE;
+  if ((C == A && (ta != CUBLAS_OP_N || lda != ldc)) || (C == B && (tb != CUBLAS_OP_N || ldb != ldc)))
+    return CUBLAS_STATUS_INVALID_VALUE;
+  if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+  return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
+    const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
+    const auto oa = to_op(ta), ob = to_op(tb);
+    const bool use_a = a_ != cd(0), use_b = b_ != cd(0);
+    CMat a, b;
+    if (use_a) a = load_mat(A, lda, cols_a, rows_a);
+    if (use_b) b = load_mat(B, ldb, cols_b, rows_b);
+    CMat c = load_mat(C, ldc, n, m);   // the rows past m in each column stay as they are
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < m; ++i)
+        c(i, j) = (use_a ? a_ * opel(a, oa, i, j) : cd(0)) + (use_b ? b_ * opel(b, ob, i, j) : cd(0));
+    store_mat(C, c, n, m);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+// Least squares, min |C - A X|, for each of `batch` overdetermined systems
+// (m >= n), by Householder QR as LAPACK's gels does it: A is left holding its
+// QR factorization (R, and geqrf's reflectors below it), and C its first n
+// rows X and below them the rest of Q^H C. Only CUBLAS_OP_N, and only m >= n,
+// as documented; either is NOT_SUPPORTED. A bad argument is INVALID_VALUE
+// with *info set to minus its position as the card numbers it (m -1, nrhs -2,
+// n -3, lda -5, ldc -7, the batch size -8); a NULL info is INVALID_VALUE
+// itself. devInfoArray, which may be NULL, gets for each system 0, or the
+// 1-based index of the first zero on R's diagonal -- a rank-deficient A,
+// whose X is then not finite, on the card as here.
+template <class T>
+cublasStatus_t gels_batched(cublasHandle_t h, cublasOperation_t trans, int m, int n, int nrhs, T* const Aarray[],
+                            int lda, T* const Carray[], int ldc, int* info, int* devInfo, int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!info) return CUBLAS_STATUS_INVALID_VALUE;
+  *info = m < 0 ? -1 : nrhs < 0 ? -2 : n < 0 ? -3 : lda < std::max(1, m) ? -5 : ldc < std::max(1, m) ? -7
+        : batch < 0 ? -8 : 0;
+  if (*info) return CUBLAS_STATUS_INVALID_VALUE;
+  if (trans != CUBLAS_OP_N || m < n) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (n == 0 || batch == 0) return CUBLAS_STATUS_SUCCESS;
+  if (deferred_to_graph(h, [=] {
+        int ignored;
+        gels_batched<T>(h, trans, m, n, nrhs, Aarray, lda, Carray, ldc, &ignored, devInfo, batch);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  const auto pa = fetch<T*>(Aarray, (size_t)batch);
+  const auto pc = fetch<T*>(Carray, (size_t)batch);
+  std::vector<int> rank(batch, 0);
+  for (int b = 0; b < batch; ++b) {
+    CMat a = load_mat(pa[b], lda, n, m);
+    std::vector<cd> tau;
+    vgpu_la::geqrf(a, m, n, &tau);
+    for (int j = 0; j < n && !rank[b]; ++j)
+      if (a(j, j) == cd(0)) rank[b] = j + 1;
+    store_mat(pa[b], a, n, m);
+    if (nrhs == 0) continue;
+    CMat c = load_mat(pc[b], ldc, nrhs, m);
+    vgpu_la::unmqr(true, vgpu_la::Op::C, m, nrhs, n, a, tau.data(), c);
+    for (int col = 0; col < nrhs; ++col)
+      vgpu_la::tri_solve(a, n, false, vgpu_la::Op::N, false, &c(0, col), 1);
+    store_mat(pc[b], c, nrhs, m);
+  }
+  if (devInfo) store(devInfo, rank);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+bool fits_int64(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+
+}  // namespace
+
+#define VGPU_GEAM_GELS(P, T)                                                                                      \
+  VGPU_EXPORT cublasStatus_t cublas##P##geam(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,  \
+                                             int n, const T* alpha, const T* A, int lda, const T* beta,          \
+                                             const T* B, int ldb, T* C, int ldc) {                                \
+    return geam<T>(h, ta, tb, m, n, alpha, A, lda, beta, B, ldb, C, ldc);                                         \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##geam_64(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb,      \
+                                                int64_t m, int64_t n, const T* alpha, const T* A, int64_t lda,    \
+                                                const T* beta, const T* B, int64_t ldb, T* C, int64_t ldc) {      \
+    if (!fits_int64(m) || !fits_int64(n) || !fits_int64(lda) || !fits_int64(ldb) || !fits_int64(ldc))            \
+      return CUBLAS_STATUS_NOT_SUPPORTED;                                                                         \
+    return geam<T>(h, ta, tb, (int)m, (int)n, alpha, A, (int)lda, beta, B, (int)ldb, C, (int)ldc);                \
+  }                                                                                                               \
+  VGPU_EXPORT cublasStatus_t cublas##P##gelsBatched(cublasHandle_t h, cublasOperation_t trans, int m, int n,       \
+                                                    int nrhs, T* const Aarray[], int lda, T* const Carray[],      \
+                                                    int ldc, int* info, int* devInfoArray, int batchSize) {       \
+    return gels_batched<T>(h, trans, m, n, nrhs, Aarray, lda, Carray, ldc, info, devInfoArray, batchSize);        \
+  }
+VGPU_GEAM_GELS(S, float)
+VGPU_GEAM_GELS(D, double)
+VGPU_GEAM_GELS(C, cuComplex)
+VGPU_GEAM_GELS(Z, cuDoubleComplex)
+#undef VGPU_GEAM_GELS

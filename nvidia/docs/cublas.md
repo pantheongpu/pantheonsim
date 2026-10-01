@@ -60,6 +60,11 @@ increment that is not positive, which is what the hardware does too.
 The level 1 routines also have their 64-bit-index forms (`cublasDnrm2_64` and
 so on, CUDA 12), with `i?amax_64` answering in an `int64_t`; a size or stride
 beyond the range of `int` is refused.
+The typed level-1 routines (`DotEx`, `DotcEx`, `Nrm2Ex`, `AsumEx`,
+`I?amaxEx`, `AxpyEx`, `ScalEx`, `CopyEx`, `SwapEx` and their `_64` forms)
+take half, bfloat16, single, double and complex elements, with the table of
+result and execution types an RTX 3060's cuBLAS accepts. `geam` and the
+least-squares `gelsBatched` are there in all four precisions.
 The host and device copy helpers `cublasSetVector`, `cublasGetVector`,
 `cublasSetMatrix` and `cublasGetMatrix`, and their `Async` forms, are there
 too, with increments and leading dimensions on both sides.
