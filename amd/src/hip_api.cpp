@@ -4209,6 +4209,11 @@ static_assert(sizeof(IpcPayload) <= sizeof(vgpu::amd::abi::IpcMemHandle), "an IP
 constexpr uint32_t kIpcMagic = 0x48495043;   // "HIPC"
 std::string ipc_path(const char* id) { return vgpu::telemetry::default_path() + "/ipc-hip-" + id; }
 std::map<void*, int> g_ipc_open;   // pointer -> the device it was mapped on
+// This process's exports, numbered: HIP's and HSA's handles share the count.
+uint32_t next_ipc_serial() {
+  static std::atomic<uint32_t> counter{0};
+  return counter.fetch_add(1) + 1;
+}
 static_assert(sizeof(IpcPayload) <= 64, "an IPC payload fits hipMemPoolPtrExportData");
 std::map<uint64_t, IpcPayload> g_pool_exports;   // pool allocation -> how it was exported
 
@@ -5331,13 +5336,12 @@ hipError_t hipIpcGetMemHandle(vgpu::amd::abi::IpcMemHandle* handle, void* ptr) {
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
   if (d < 0) return record(s, hipErrorInvalidDevicePointer);
-  static std::atomic<uint32_t> counter{0};
   IpcPayload p{};
   p.magic = kIpcMagic;
   p.version = 1;
   p.device = static_cast<uint32_t>(d);
   p.pid = static_cast<uint32_t>(::getpid());
-  std::snprintf(p.id, sizeof p.id, "%x-%x", p.pid, counter.fetch_add(1) + 1);
+  std::snprintf(p.id, sizeof p.id, "%x-%x", p.pid, next_ipc_serial());
   try {
     p.size = s.rt->device(d).memory().share(reinterpret_cast<uint64_t>(ptr), ipc_path(p.id));
   } catch (const std::exception& e) {
@@ -6404,12 +6408,12 @@ hipError_t peer_3d(const vgpu::amd::abi::Memcpy3DPeerParms* p, hipStream_t strea
 
 // Memory whose rows are `pitch` bytes apart: each row rounded up to 256
 // bytes, as ROCm's HIP rounds it, and the allocation exactly pitch * height
-// * depth. None at all (a zero dimension) is no allocation.
+// * depth. None at all (a zero dimension) is no allocation, and leaves the
+// pitch as it was, as ROCm's HIP leaves it.
 hipError_t pitched_alloc(void** ptr, size_t* pitch, size_t width, size_t height, size_t depth) {
   if (!ptr || !pitch) return hipErrorInvalidValue;
   if (!width || !height || !depth) {
     *ptr = nullptr;
-    *pitch = 0;
     return hipSuccess;
   }
   if (width > SIZE_MAX - 255) return hipErrorOutOfMemory;
@@ -7290,6 +7294,69 @@ bool set_scratch_limit(int ordinal, size_t bytes) {
   std::lock_guard<std::mutex> lock(s.mutex);
   return set_scratch_limit_locked(s, ordinal, bytes);
 }
+bool ipc_share(void* ptr, int* device, uint64_t* size, uint32_t* serial, std::string* why) {
+  settle_before_sharing(ptr);
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) != hipSuccess) return *why = "no devices", false;
+  const int d = owner_of(s, reinterpret_cast<uint64_t>(ptr));
+  if (d < 0) return *why = "the address is no device's memory", false;
+  *serial = next_ipc_serial();
+  char id[40];
+  std::snprintf(id, sizeof id, "%x-%x", static_cast<unsigned>(::getpid()), *serial);
+  try {
+    *size = s.rt->device(d).memory().share(reinterpret_cast<uint64_t>(ptr), ipc_path(id));
+  } catch (const std::exception& e) {
+    return *why = e.what(), false;
+  }
+  *device = d;
+  return true;
+}
+void* ipc_attach(uint32_t pid, uint32_t serial, uint64_t size, int device, std::string* why) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (ensure_runtime(s) != hipSuccess) return *why = "no devices", nullptr;
+  const int d = device >= 0 && device < s.rt->device_count() ? device : s.current;
+  char id[40];
+  std::snprintf(id, sizeof id, "%x-%x", pid, serial);
+  void* p = nullptr;
+  try {
+    p = reinterpret_cast<void*>(s.rt->device(d).memory().adopt(ipc_path(id), size));
+  } catch (const std::exception& e) {
+    return *why = e.what(), nullptr;
+  }
+  g_ipc_open[p] = d;
+  s.ipc_mapped.insert(d);
+  return p;
+}
+bool ipc_detach(void* ptr) {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const auto it = g_ipc_open.find(ptr);
+  if (it == g_ipc_open.end()) return false;
+  s.rt->device(it->second).memory().abandon(reinterpret_cast<uint64_t>(ptr));
+  g_ipc_open.erase(it);
+  return true;
+}
+
+hipError_t vgpu_own_hipMemGetHandleForAddressRange(void* handle, void* ptr, size_t size, int type,
+                                                   unsigned long long flags)
+    __attribute__((alias("hipMemGetHandleForAddressRange"), visibility("hidden")));
+bool export_dmabuf(const void* ptr, size_t size, int* fd, uint64_t* offset, std::string* why) {
+  int out = -1;
+  if (vgpu_own_hipMemGetHandleForAddressRange(&out, const_cast<void*>(ptr), size, 1, 0) != hipSuccess)
+    return *why = "the range is not one device allocation's", false;
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const uint64_t va = reinterpret_cast<uint64_t>(ptr);
+  uint64_t base = va;
+  if (const auto m = vmm_mapping(va); m != g_vmm_maps.end()) base = m->first;
+  else if (auto p = g_dmabuf_paths.upper_bound(va); p != g_dmabuf_paths.begin()) base = std::prev(p)->first;
+  *fd = out;
+  *offset = va - base;
+  return true;
+}
+
 int physical(int ordinal) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
@@ -7345,3 +7412,24 @@ bool copy(void* dst, const void* src, size_t n, std::string* why) {
 }
 
 }  // namespace vgpu::amd::shared
+
+// ---- HIP's virtual memory, for the HSA runtime -------------------------------------
+//
+// hsa_vmem.inc builds HSA's virtual memory on these calls. It reaches them by
+// these hidden names, never the exported ones: a program that loads ROCm's
+// own libamdhip64 over this HSA runtime has that library's hipMem* first in
+// the symbol search, and ROCm's implementations call back into HSA.
+extern "C" {
+hipError_t vgpu_own_hipMemAddressReserve(void** ptr, size_t size, size_t alignment, void*, unsigned long long) __attribute__((alias("hipMemAddressReserve"), visibility("hidden")));
+hipError_t vgpu_own_hipMemAddressFree(void* ptr, size_t size) __attribute__((alias("hipMemAddressFree"), visibility("hidden")));
+hipError_t vgpu_own_hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAllocationProp* prop, unsigned long long flags) __attribute__((alias("hipMemCreate"), visibility("hidden")));
+hipError_t vgpu_own_hipMemRelease(void* handle) __attribute__((alias("hipMemRelease"), visibility("hidden")));
+hipError_t vgpu_own_hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsigned long long flags) __attribute__((alias("hipMemMap"), visibility("hidden")));
+hipError_t vgpu_own_hipMemUnmap(void* ptr, size_t size) __attribute__((alias("hipMemUnmap"), visibility("hidden")));
+hipError_t vgpu_own_hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAccessDesc* desc, size_t count) __attribute__((alias("hipMemSetAccess"), visibility("hidden")));
+hipError_t vgpu_own_hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemLocation* location, void* ptr) __attribute__((alias("hipMemGetAccess"), visibility("hidden")));
+hipError_t vgpu_own_hipMemExportToShareableHandle(void* out, void* handle, int type, unsigned long long flags) __attribute__((alias("hipMemExportToShareableHandle"), visibility("hidden")));
+hipError_t vgpu_own_hipMemImportFromShareableHandle(void** handle, void* os_handle, int type) __attribute__((alias("hipMemImportFromShareableHandle"), visibility("hidden")));
+hipError_t vgpu_own_hipMemRetainAllocationHandle(void** handle, void* addr) __attribute__((alias("hipMemRetainAllocationHandle"), visibility("hidden")));
+hipError_t vgpu_own_hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocationProp* prop, void* handle) __attribute__((alias("hipMemGetAllocationPropertiesFromHandle"), visibility("hidden")));
+}

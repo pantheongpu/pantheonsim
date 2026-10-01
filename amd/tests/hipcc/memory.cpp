@@ -56,8 +56,9 @@ int main() {
   (void)hipFree(p);
   EXPECT(hipMallocPitch(&p, &pitch, 1, SIZE_MAX), hipErrorOutOfMemory, "a pitched allocation too big to count");
   p = reinterpret_cast<void*>(1);
+  pitch = 7;
   (void)hipMallocPitch(&p, &pitch, 0, 1);
-  check(p == nullptr && pitch == 0, "no bytes is no allocation, and no pitch");
+  check(p == nullptr && pitch == 7, "no bytes is no allocation, and the pitch is left as it was");
   hipPitchedPtr pp{};
   (void)hipMalloc3D(&pp, make_hipExtent(260, 16, 8));
   check(pp.pitch == 512 && pp.xsize == 260 && pp.ysize == 16, "hipMalloc3D gives the pitch and the extent back");
