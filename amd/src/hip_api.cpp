@@ -763,8 +763,10 @@ hipError_t check_launch(State& s, int ordinal, const Kernel& kernel, vgpu::amd::
   }
   const uint64_t threads = uint64_t{block.x} * block.y * block.z;
   if (lim.max_threads_per_block && threads > lim.max_threads_per_block) return hipErrorInvalidConfiguration;
+  // Past the kernel's launch bounds (its metadata's max_flat_workgroup_size):
+  // a launch failure, as ROCm's HIP says (ihipLaunchKernel_validate).
   if (kernel.max_flat_workgroup_size && threads > kernel.max_flat_workgroup_size)
-    return fail(hipErrorInvalidConfiguration, "the block has more work-items than the kernel's launch bounds allow");
+    return fail(hipErrorLaunchFailure, "the block has more work-items than the kernel's launch bounds allow");
   if (lim.shared_mem_per_block && uint64_t{shared} + kernel.group_segment > lim.shared_mem_per_block)
     return fail(hipErrorInvalidValue, "the launch asks for more LDS than a block may have");
   if (stream) {
