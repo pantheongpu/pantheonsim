@@ -548,6 +548,27 @@ if(CUDA_ABI_INCLUDE)
   endif()
 
   # ---------------------------------------------------------------------------
+  # libvgpucustatevec: cuStateVec (cuQuantum), presented as libcustatevec.so.1.
+  # NVIDIA's carries a statically linked CUDA runtime, which cannot reach a
+  # simulated driver, so the simulator answers the documented API itself, from
+  # its own declarations (nvidia/include/vgpu_custatevec.h). NVIDIA's tags its
+  # symbols libcustatevec.so.0, so programs linked against it ask for that.
+  # ---------------------------------------------------------------------------
+  vgpu_version_script(custatevec 0 _custatevec_map)
+  add_library(vgpucustatevec SHARED nvidia/src/custatevec_api.cpp)
+  target_link_libraries(vgpucustatevec PRIVATE vgpucudart)
+  target_include_directories(vgpucustatevec PRIVATE ${CUDA_ABI_INCLUDE})
+  set_target_properties(vgpucustatevec PROPERTIES OUTPUT_NAME custatevec SOVERSION 1 VERSION 1.0)
+  target_link_options(vgpucustatevec PRIVATE "-Wl,--version-script=${_custatevec_map}")
+  add_custom_command(TARGET vgpucustatevec POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcustatevec.so.1.0"
+            "${CMAKE_BINARY_DIR}/shim/libcustatevec.so.1"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcustatevec.so.1.0"
+            "${CMAKE_BINARY_DIR}/shim/libcustatevec.so"
+    COMMENT "Creating cuStateVec shim symlinks (build/shim/libcustatevec.so.1)")
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -1214,7 +1235,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
