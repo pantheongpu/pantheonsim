@@ -667,9 +667,20 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (ex && leader < 32) write32(w, ins.dst[1], static_cast<unsigned>(std::countr_zero(ex)), leader);
       return;
     }
-    case Op::USETMAXREG:   // no register file to reallocate: an allocation always succeeds
+    case Op::USETMAXREG: {
+      // setmaxnreg: a warpgroup gives registers back (.DEALLOC) or takes more
+      // (.TRY_ALLOC), past the count the kernel was compiled for -- a
+      // warp-specialized GEMM's consumers go from 168 to 232 while its
+      // producer drops to 40. The allocation always succeeds; the warp's file
+      // grows to the count, keeping what it holds, and a release leaves it be.
+      const unsigned n = static_cast<unsigned>(ins.src[0].imm);
+      if (ins.mods[0] == "TRY_ALLOC" && n > w.nregs) {
+        w.nregs = std::min(n, 256u);
+        w.r.resize(static_cast<size_t>(w.nregs) * 32, 0);
+      }
       if (!ins.dst.empty() && ex) set_pred(w, ins.dst[0], static_cast<unsigned>(std::countr_zero(ex)), true);
       return;
+    }
     case Op::WARPGROUP:   // the warpgroup MMAs complete as they issue: nothing to fence or wait for
       return;
     case Op::RPCMOV:   // RPCMOV.32 to or from the return-address register
