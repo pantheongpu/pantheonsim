@@ -142,8 +142,6 @@ struct ShimState {
   std::unordered_map<uintptr_t, KernelRec> kernels;
   std::unordered_map<uintptr_t, EventRec> events;
   std::set<uintptr_t> streams;      // explicitly created streams (all synchronous)
-  // cuMemHostAlloc results, with the flags they were allocated with.
-  std::map<void*, vgpu::runtime::HostRange> host_allocs;
   std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
   std::unordered_map<uintptr_t, ArrayRec> arrays;  // cuArray3DCreate results
   std::unordered_map<uintptr_t, MipmapRec> mipmaps;  // cuMipmappedArrayCreate results
@@ -1930,6 +1928,15 @@ std::map<void*, vgpu::runtime::HostRange>& registrations(ShimState& s) {
   return s.rt->host_registrations();
 }
 
+// Pinned host memory, with the flags it was allocated with: cuMemHostAlloc's
+// and the runtime's cudaMallocHost and cudaHostAlloc results in one record, in
+// the machine both libraries share. The driver used to keep its own, so
+// cuMemHostGetFlags on memory the runtime pinned was INVALID_VALUE where an
+// RTX 3060 reports its flags, and cuMemFreeHost refused it.
+std::map<void*, vgpu::runtime::HostRange>& pinned(ShimState& s) {
+  return s.rt->host_allocations();
+}
+
 // `rows` rows of `width` elements of T, `pitch` bytes apart -- a 1D fill is
 // one row. What an RTX 3060 checks: nothing, for an empty region (a null
 // pointer included); a pointer aligned to the element; and, only when there is
@@ -2167,7 +2174,7 @@ VGPU_EXPORT CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int fla
     if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
     for (int d = 0; d < s.rt->device_count(); ++d)
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
-    s.host_allocs[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
+    pinned(s)[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
     *pp = p;
     return CUDA_SUCCESS;
   });
@@ -2178,10 +2185,10 @@ VGPU_EXPORT CUresult cuMemAllocHost_v2(void** pp, size_t bytesize) {
 VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return cuMemHostAlloc(pp, bytesize, 0); }
 VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
-    auto it = s.host_allocs.find(p);
-    if (it == s.host_allocs.end()) return CUDA_ERROR_INVALID_VALUE;
+    auto it = pinned(s).find(p);
+    if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
     for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
-    s.host_allocs.erase(it);
+    pinned(s).erase(it);
     std::free(p);
     return CUDA_SUCCESS;
   });
@@ -2257,7 +2264,7 @@ VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) {
       *flags = (r->flags & CU_MEMHOSTREGISTER_PORTABLE) | CU_MEMHOSTALLOC_DEVICEMAP;
       return CUDA_SUCCESS;
     }
-    if (const auto* r = host_range_at(s.host_allocs, p)) {
+    if (const auto* r = host_range_at(pinned(s), p)) {
       *flags = (r->flags & 0x7u) | CU_MEMHOSTALLOC_DEVICEMAP;
       return CUDA_SUCCESS;
     }
@@ -2274,7 +2281,7 @@ VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) {
 VGPU_EXPORT CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr* dptr, void* p, unsigned int flags) {
   return api("cuMemHostGetDevicePointer", true, false, [&](ShimState& s) {
     if (!dptr || !p || flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    if (!host_range_at(registrations(s), p) && !host_range_at(s.host_allocs, p))
+    if (!host_range_at(registrations(s), p) && !host_range_at(pinned(s), p))
       return CUDA_ERROR_INVALID_VALUE;
     *dptr = reinterpret_cast<CUdeviceptr>(p);
     return CUDA_SUCCESS;

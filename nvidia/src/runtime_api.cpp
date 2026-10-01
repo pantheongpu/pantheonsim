@@ -263,13 +263,13 @@ struct State {
     void* storage = nullptr;
   };
   std::vector<ManagedVar> managed_vars;
-  // cudaMallocHost / cudaHostAlloc results. cudaFreeHost consults this before
-  // it frees anything: it used to hand whatever it was given to free(), so a
+  // cudaMallocHost / cudaHostAlloc results are kept with the driver's, in the
+  // shared machine (pinned(), below). cudaFreeHost consults them before it
+  // frees anything: it used to hand whatever it was given to free(), so a
   // malloc'd pointer, a device pointer or a second free took the process down
   // inside the allocator instead of returning cudaErrorInvalidValue.
-  std::map<void*, HostRange> host_allocs;
-  // Managed allocations, kept apart from host_allocs because freeing one has
-  // to unmap it from the device side as well.
+  // Managed allocations, kept apart from the pinned ones because freeing one
+  // has to unmap it from the device side as well.
   std::map<void*, HostRange> managed_allocs;
   // What cudaMemAdvise and cudaMemPrefetchAsync were told about them.
   std::map<void*, ManagedAdvice> managed_advice;
@@ -320,6 +320,9 @@ State& st() {
 // library's: cuMemHostRegister keeps the same one, since on the card memory
 // either API registered is registered to both.
 std::map<void*, HostRange>& registered(State& s) { return s.rt->host_registrations(); }
+// cudaMallocHost and cudaHostAlloc results, and the driver's cuMemHostAlloc
+// ones: one record, shared with the driver (Runtime::host_allocations).
+std::map<void*, HostRange>& pinned(State& s) { return s.rt->host_allocations(); }
 
 // The device cudaSetDevice selected, for the calling host thread only. CUDA
 // documents the current device as per-thread state, with every new thread
@@ -796,7 +799,7 @@ bool is_device_ptr(const void* p) {
 // managed buffer with cudaMemcpyDeviceToHost.
 bool copyable_as_device(State& s, const void* p) {
   return is_device_ptr(p) || find_range(s.managed_allocs, p) != s.managed_allocs.end() ||
-         find_range(s.host_allocs, p) != s.host_allocs.end();
+         find_range(pinned(s), p) != pinned(s).end();
 }
 
 // Pending chevron launch configuration, pushed by __cudaPushCallConfiguration
@@ -1416,7 +1419,7 @@ VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
       it = m.erase(it);
     }
   };
-  release(s.host_allocs, true);
+  release(pinned(s), true);
   release(s.managed_allocs, true);
   release(registered(s), false);
   std::erase_if(s.peer_access,
@@ -2007,7 +2010,7 @@ VGPU_EXPORT cudaError_t cudaMemset(void* dst, int value, size_t count) {
     // the device fill, which refuses it.
     if (!is_device_ptr(dst)) {
       if (find_range(registered(s), dst) != registered(s).end()) return cudaErrorInvalidValue;
-      for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+      for (auto* ranges : {&s.managed_allocs, &pinned(s)}) {
         auto it = find_range(*ranges, dst);
         if (it == ranges->end()) continue;
         const size_t off = static_cast<size_t>(static_cast<char*>(dst) - static_cast<char*>(it->first));
@@ -2060,7 +2063,7 @@ VGPU_EXPORT cudaError_t cudaMallocHost(void** ptr, size_t size) {
     const size_t n = size ? size : 1;
     void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
     if (!p) return cudaErrorMemoryAllocation;
-    s.host_allocs[p] = HostRange{n, t_current_device};
+    pinned(s)[p] = HostRange{n, t_current_device};
     // Pinned memory is device-addressable under unified addressing, at its
     // host address; see cudaHostGetDevicePointer.
     map_host_everywhere(s, p, n);
@@ -2074,7 +2077,7 @@ VGPU_EXPORT cudaError_t cudaHostAlloc(void** ptr, size_t size, unsigned int flag
   const cudaError_t e = cudaMallocHost(ptr, size);
   if (e != cudaSuccess) return e;
   return guard("cudaHostAlloc", [&](State& s) {
-    s.host_allocs[*ptr].flags = flags;
+    pinned(s)[*ptr].flags = flags;
     return cudaSuccess;
   });
 }
@@ -2084,8 +2087,8 @@ VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
     // Only a base pointer this runtime handed out, and only once. Anything
     // else used to go straight to free(): a malloc'd pointer aborted inside
     // glibc, a device pointer segfaulted, and a second free corrupted the heap.
-    auto it = s.host_allocs.find(ptr);
-    if (it == s.host_allocs.end()) {
+    auto it = pinned(s).find(ptr);
+    if (it == pinned(s).end()) {
       if (!quiet())
         std::fprintf(stderr,
                      "[vgpu] cudaFreeHost: %p was not returned by cudaMallocHost or cudaHostAlloc, "
@@ -2094,7 +2097,7 @@ VGPU_EXPORT cudaError_t cudaFreeHost(void* ptr) {
       return cudaErrorInvalidValue;
     }
     unmap_host_everywhere(s, ptr);
-    s.host_allocs.erase(it);
+    pinned(s).erase(it);
     std::free(ptr);
     return cudaSuccess;
   });
@@ -2793,7 +2796,7 @@ VGPU_EXPORT cudaError_t cudaHostRegister(void* p, size_t size, unsigned int flag
       --it;
       return static_cast<const char*>(it->first) + std::max<size_t>(it->second.size, 1) > lo;
     };
-    if (overlaps(registered(s)) || overlaps(s.host_allocs) || overlaps(s.managed_allocs))
+    if (overlaps(registered(s)) || overlaps(pinned(s)) || overlaps(s.managed_allocs))
       return cudaErrorHostMemoryAlreadyRegistered;
     // Pinned or managed memory the driver allocated is mapped already.
     vgpu::MemoryManager& mem = s.rt->device(0).memory();
@@ -2825,7 +2828,7 @@ VGPU_EXPORT cudaError_t cudaHostUnregister(void* p) {
 VGPU_EXPORT cudaError_t cudaHostGetDevicePointer(void** dev, void* host, unsigned int flags) {
   return guard("cudaHostGetDevicePointer", [&](State& s) -> cudaError_t {
     if (!dev || !host || flags != 0) return cudaErrorInvalidValue;
-    if (find_range(s.host_allocs, host) == s.host_allocs.end() &&
+    if (find_range(pinned(s), host) == pinned(s).end() &&
         find_range(registered(s), host) == registered(s).end())
       return cudaErrorInvalidValue;
     *dev = host;
@@ -2845,7 +2848,7 @@ VGPU_EXPORT cudaError_t cudaHostGetFlags(unsigned int* flags, void* host) {
       *flags = (it->second.flags & cudaHostRegisterPortable) | cudaHostAllocMapped;
       return cudaSuccess;
     }
-    if (auto it = find_range(s.host_allocs, host); it != s.host_allocs.end()) {
+    if (auto it = find_range(pinned(s), host); it != pinned(s).end()) {
       *flags = (it->second.flags & (cudaHostAllocPortable | cudaHostAllocWriteCombined)) | cudaHostAllocMapped;
       return cudaSuccess;
     }
@@ -2874,7 +2877,7 @@ VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, co
       return true;
     };
     if (host_kind(st.managed_allocs, cudaMemoryTypeManaged) ||
-        host_kind(st.host_allocs, cudaMemoryTypeHost) ||
+        host_kind(pinned(st), cudaMemoryTypeHost) ||
         host_kind(registered(st), cudaMemoryTypeHost))
       return cudaSuccess;
     if (vgpu::is_device_va(a)) {
@@ -4982,7 +4985,7 @@ static cudaError_t replay_fill(const RecordedLaunch& rl) {
       // cudaMemset fills them (taskflow zeroes a managed buffer with a node).
       if (!is_device_ptr(row)) {
         bool host = false;
-        for (auto* ranges : {&s.managed_allocs, &s.host_allocs}) {
+        for (auto* ranges : {&s.managed_allocs, &pinned(s)}) {
           auto it = find_range(*ranges, row);
           if (it == ranges->end()) continue;
           const size_t off = static_cast<size_t>(static_cast<char*>(row) - static_cast<char*>(it->first));

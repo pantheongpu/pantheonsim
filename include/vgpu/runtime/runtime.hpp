@@ -176,6 +176,11 @@ class Runtime {
   // API registered is already registered to the other, and either may
   // unregister it. Callers hold shared_api_mutex().
   std::map<void*, HostRange>& host_registrations() { return host_registrations_; }
+  // Pinned host memory either library allocated (cudaMallocHost, cudaHostAlloc,
+  // cuMemHostAlloc), by its base: one record, as the card keeps one, so the
+  // driver reports the flags of memory the runtime pinned and either library
+  // frees what the other allocated. Callers hold shared_api_mutex().
+  std::map<void*, HostRange>& host_allocations() { return host_allocations_; }
 
  private:
   void publish_identity(const DeviceProfile& profile, int ordinal);
@@ -183,6 +188,7 @@ class Runtime {
   telemetry::Publisher telemetry_;
   std::vector<std::unique_ptr<Device>> devices_;
   std::map<void*, HostRange> host_registrations_;
+  std::map<void*, HostRange> host_allocations_;
 };
 
 }  // namespace vgpu::runtime
