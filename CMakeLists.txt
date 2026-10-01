@@ -1868,6 +1868,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # A kernel's fault reported by the calls after its launch, not by the
+  # launch, from the runtime and the driver, as an RTX 3060 reports it.
+  add_test(NAME e2e_deferred_errors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_deferred_errors.sh)
+  set_tests_properties(e2e_deferred_errors PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # The two libraries loaded privately (RTLD_LOCAL), as Rust's libloading
   # does, still share one machine. Needs only a C++ compiler.
   add_test(NAME e2e_private_loads COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_private_loads.sh)

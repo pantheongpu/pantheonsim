@@ -393,16 +393,40 @@ thread_local cudaError_t g_async_error = cudaSuccess;
 
 // A context a kernel has corrupted. CUDA documents an illegal address, an
 // illegal instruction and a device-side assert as leaving the context unusable:
-// every later call fails the same way until the device is reset. This used to
-// be forgotten on the next call -- cudaMalloc succeeded right after a kernel had
-// written past its allocation -- so a program that did not check the launch
-// carried on computing with whatever the dead kernel had left behind, which on
-// hardware it could not have done. Per process, like the context it models.
+// every later call that needs the context fails the same way until the device
+// is reset. This used to be forgotten on the next call -- cudaMalloc succeeded
+// right after a kernel had written past its allocation -- so a program that did
+// not check the launch carried on computing with whatever the dead kernel had
+// left behind, which on hardware it could not have done. Per process, like the
+// context it models, and kept in the machine both CUDA libraries share
+// (Runtime::context_fault): a kernel the driver API launched kills the
+// runtime's context too, as it does on the card, where the two are one.
 //
-// Atomic because it is read without the state lock -- cudaGetLastError,
-// cudaPeekAtLastError and cudaDeviceSynchronize take none -- while a launch on
-// another thread may be setting it. As a plain global that was a data race.
-std::atomic<cudaError_t> g_sticky_error{cudaSuccess};
+// Asking initialises, as any call that needs the context does: the first
+// runtime call a program makes may be the one that finds the driver API's
+// kernel dead.
+cudaError_t sticky_error() {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  try {
+    ensure_init(s);
+  } catch (const std::exception&) {
+    return cudaSuccess;   // no machine, so no context to have died; the call itself will say why
+  }
+  return static_cast<cudaError_t>(s.rt->context_fault());
+}
+void set_sticky_error(State& s, cudaError_t code) { s.rt->set_context_fault(static_cast<int>(code)); }
+
+// What a call that needs the context answers once a kernel has killed it: the
+// fault, which becomes the thread's last error as any failed call's does. On an
+// RTX 3060, after a failed device assert, stream and event calls, allocation,
+// copies and launches all answer cudaErrorAssert; asking which device is
+// current, or what a device is, still succeeds.
+cudaError_t dead_context() {
+  const cudaError_t e = sticky_error();
+  if (e != cudaSuccess) g_last_error = e;
+  return e;
+}
 
 // Whether an error arose inside a running kernel rather than in the host call.
 bool in_kernel(const char* api) {
@@ -463,9 +487,10 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
       code = in_kernel(api) ? cudaErrorMisalignedAddress : cudaErrorInvalidValue;
       break;
     case Err::UninitializedRegister: code = cudaErrorIllegalAddress; break;
-    // "trap" is what a failed device assert and an unreachable path compile to,
-    // and hardware surfaces it as an illegal instruction.
-    case Err::Trap: code = cudaErrorIllegalInstruction; break;
+    // "trap" is what an unreachable path compiles to, and "brkpt" with no
+    // debugger attached ends a kernel the same way: an RTX 3060 reports both
+    // as "unspecified launch failure" (719), not an illegal instruction.
+    case Err::Trap: code = cudaErrorLaunchFailure; break;
     case Err::DeviceAssert: code = cudaErrorAssert; break;
     case Err::EccUncorrectable: code = cudaErrorECCUncorrectable; break;
     // "unspecified launch failure": what programs report when their GPU falls
@@ -484,9 +509,17 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     case Err::LaunchConfig: code = cudaErrorInvalidConfiguration; break;
     default: code = cudaErrorInvalidValue; break;
   }
-  (void)s;
-  if (poisons_context(api, e.code())) g_sticky_error.store(code);
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
+  if (poisons_context(api, e.code())) {
+    set_sticky_error(s, code);
+    // A kernel's fault is not the launch's: on the card the launch returned
+    // long before the kernel ran, and the fault surfaces at the next call that
+    // touches the context -- a synchronize, a copy, the next launch. The
+    // launch itself succeeds and leaves the last error alone; what reports it
+    // is dead_context(), from every call after. (A copy that read
+    // uncorrectable memory is the call that failed, and says so.)
+    if (in_kernel(api)) return cudaSuccess;
+  }
   g_last_error = code;
   return code;
 }
@@ -757,8 +790,12 @@ void bind_driver_context() {
   bound = t_current_device;
 }
 
+// The body of every API call: the lock, initialisation, the dead-context
+// check, and errors thrown inside turned into codes. `needs_context` is false
+// for the calls an RTX 3060 still answers after a kernel has killed the
+// context -- which device is current, how many there are, what one is.
 template <class F>
-cudaError_t guard(const char* api, F&& body) {
+cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   // A profiler's API trace, and the correlation the work this call issues
@@ -768,9 +805,11 @@ cudaError_t guard(const char* api, F&& body) {
     try {
       ensure_init(s);
       bind_driver_context();
-      if (const cudaError_t sticky = g_sticky_error.load(); sticky != cudaSuccess) {
-        g_last_error = sticky;
-        return sticky;
+      if (needs_context) {
+        if (const cudaError_t sticky = static_cast<cudaError_t>(s.rt->context_fault())) {
+          g_last_error = sticky;
+          return sticky;
+        }
       }
       const cudaError_t r = body(s);
       if (r != cudaSuccess) g_last_error = r;
@@ -785,6 +824,14 @@ cudaError_t guard(const char* api, F&& body) {
   }();
   call.set_result(rc);
   return rc;
+}
+template <class F>
+cudaError_t guard(const char* api, F&& body) {
+  return guard_impl(api, true, std::forward<F>(body));
+}
+template <class F>
+cudaError_t guard_query(const char* api, F&& body) {
+  return guard_impl(api, false, std::forward<F>(body));
 }
 
 bool is_device_ptr(const void* p) {
@@ -1330,7 +1377,7 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernelMultiDevice(struct cudaLaunch
 /* ===================================================================== */
 
 VGPU_EXPORT cudaError_t cudaGetDeviceCount(int* count) {
-  return guard("cudaGetDeviceCount", [&](State& s) {
+  return guard_query("cudaGetDeviceCount", [&](State& s) {
     if (!count) return cudaErrorInvalidValue;
     *count = s.rt->device_count();
     return cudaSuccess;
@@ -1338,7 +1385,7 @@ VGPU_EXPORT cudaError_t cudaGetDeviceCount(int* count) {
 }
 
 VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
-  return guard("cudaSetDevice", [&](State& s) {
+  return guard_query("cudaSetDevice", [&](State& s) {
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     t_current_device = device;
     bind_driver_context();
@@ -1347,7 +1394,7 @@ VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
 }
 
 VGPU_EXPORT cudaError_t cudaGetDevice(int* device) {
-  return guard("cudaGetDevice", [&](State& s) {
+  return guard_query("cudaGetDevice", [&](State& s) {
     if (!device) return cudaErrorInvalidValue;
     *device = t_current_device;
     return cudaSuccess;
@@ -1384,8 +1431,12 @@ VGPU_EXPORT cudaError_t cudaDeviceSynchronize(void) {
   // with out-of-memory, a synchronize with no kernel in sight reported
   // cudaErrorMemoryAllocation. A refused call is reported by that call and by
   // cudaGetLastError, not by synchronization.
-  const cudaError_t sticky = g_sticky_error.load();
-  return sticky != cudaSuccess ? sticky : g_async_error;
+  //
+  // A kernel's fault is reported here first: its launch returned success, as
+  // it does on the card, and this is the call that finds the context dead. It
+  // becomes the last error, as every failed call's result does.
+  if (const cudaError_t sticky = dead_context(); sticky != cudaSuccess) return sticky;
+  return g_async_error;
 }
 
 static void forget_arrays_on(int device);
@@ -1405,8 +1456,8 @@ VGPU_EXPORT cudaError_t cudaDeviceReset(void) {
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   g_last_error = cudaSuccess;
   g_async_error = cudaSuccess;
-  g_sticky_error.store(cudaSuccess);
   if (!s.initialized) return cudaSuccess;  // nothing was ever set up
+  set_sticky_error(s, cudaSuccess);
   const int dev = t_current_device;
   auto release = [&](std::map<void*, HostRange>& m, bool ours) {
     for (auto it = m.begin(); it != m.end();) {
@@ -1447,7 +1498,7 @@ VGPU_EXPORT cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchroni
 #undef cudaGetDeviceProperties
 #endif
 VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
-  return guard("cudaGetDeviceProperties", [&](State& s) {
+  return guard_query("cudaGetDeviceProperties", [&](State& s) {
     if (!prop) return cudaErrorInvalidValue;
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     const vgpu::DeviceProfile& p = s.rt->device(device).profile();
@@ -1517,7 +1568,7 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int dev
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, int device) {
-  return guard("cudaDeviceGetAttribute", [&](State& s) {
+  return guard_query("cudaDeviceGetAttribute", [&](State& s) {
     if (!value) return cudaErrorInvalidValue;
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     const vgpu::DeviceProfile& p = s.rt->device(device).profile();
@@ -2240,6 +2291,7 @@ int clamp_priority(int p) {
 }
 
 cudaError_t create_stream(cudaStream_t* out, unsigned flags, int priority) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (!out) return cudaErrorInvalidValue;
   if (flags & ~static_cast<unsigned>(cudaStreamNonBlocking)) return cudaErrorInvalidValue;
   auto rec = std::make_unique<RtStream>();
@@ -2462,6 +2514,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetLimit(size_t* value, cudaLimit limit) {
 // Streams are executed inline, so every priority is equally honoured. CUDA
 // reports the range as [greatest, least] with lower meaning higher priority.
 VGPU_EXPORT cudaError_t cudaDeviceGetStreamPriorityRange(int* least, int* greatest) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (least) *least = 0;
   if (greatest) *greatest = 0;
   return cudaSuccess;
@@ -2859,7 +2912,7 @@ VGPU_EXPORT cudaError_t cudaHostGetFlags(unsigned int* flags, void* host) {
 // Where a pointer lives. Frameworks branch on this to pick a copy path, so
 // getting it wrong sends a device buffer through a host memcpy.
 VGPU_EXPORT cudaError_t cudaPointerGetAttributes(cudaPointerAttributes* attr, const void* p) {
-  return guard("cudaPointerGetAttributes", [&](State& st) {
+  return guard_query("cudaPointerGetAttributes", [&](State& st) {
     if (!attr) return cudaErrorInvalidValue;
     std::memset(attr, 0, sizeof *attr);
     const uint64_t a = reinterpret_cast<uint64_t>(p);
@@ -2929,6 +2982,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetPCIBusId(char* buf, int len, int device) {
 // outstanding by the time this is reached.
 VGPU_EXPORT cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCallback_t cb,
                                               void* user, unsigned int) {
+  if (const cudaError_t dead = dead_context()) return dead;
   // Not supported under stream capture, as documented -- cudaLaunchHostFunc is
   // the one that is -- so a capturing stream refuses it and the capture fails.
   if (capture_refuse(stream, "cudaStreamAddCallback")) return cudaErrorStreamCaptureUnsupported;
@@ -2937,6 +2991,7 @@ VGPU_EXPORT cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCal
 }
 
 VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void* func, cudaFuncAttribute attr, int value) {
+  if (const cudaError_t dead = dead_context()) return dead;
   // Most attributes are tuning knobs (a shared-memory carveout, say) that the
   // interpreter has no use for. The one that changes what may launch is the
   // non-portable cluster size, so that one is kept.
@@ -3982,6 +4037,7 @@ VGPU_EXPORT cudaError_t cudaStreamGetPriority(cudaStream_t stream, int* priority
 // A host callback is enqueued behind the stream's work. Work is synchronous
 // here, so everything before it has already finished and it runs now.
 VGPU_EXPORT cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* user) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (!fn) return cudaErrorInvalidValue;
   if (capture_host_fn(stream, fn, user)) return cudaSuccess;   // a host node, run on launch
   fn(user);
@@ -3991,6 +4047,7 @@ VGPU_EXPORT cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn,
 // cudaStreamGetCaptureInfo_v2 is defined with the graph machinery below: what
 // it reports is the capture's own graph and dependency set.
 VGPU_EXPORT cudaError_t cudaStreamDestroy(cudaStream_t stream) {
+  if (const cudaError_t dead = dead_context()) return dead;
   // The default streams are not a program's to destroy.
   if (is_default_stream(stream)) return cudaErrorInvalidResourceHandle;
   {
@@ -4012,6 +4069,7 @@ VGPU_EXPORT cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
   return cudaDeviceSynchronize();
 }
 VGPU_EXPORT cudaError_t cudaStreamQuery(cudaStream_t stream) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (capture_refuse(stream, "cudaStreamQuery")) return cudaErrorStreamCaptureUnsupported;
   return cudaSuccess;
 }
@@ -4064,6 +4122,7 @@ RtEvent* find_event(cudaEvent_t e) {  // caller holds g_event_mu
 }  // namespace
 
 VGPU_EXPORT cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned int flags) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (!e) return cudaErrorInvalidValue;
   auto rec = std::make_unique<RtEvent>();
   rec->timing = (flags & cudaEventDisableTiming) == 0;
@@ -4076,6 +4135,7 @@ VGPU_EXPORT cudaError_t cudaEventCreate(cudaEvent_t* e) {
   return cudaEventCreateWithFlags(e, cudaEventDefault);
 }
 VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t stream) {
+  if (const cudaError_t dead = dead_context()) return dead;
   std::lock_guard<std::mutex> lock(g_event_mu);
   RtEvent* r = find_event(e);
   if (!r) return cudaErrorInvalidResourceHandle;
@@ -4102,6 +4162,7 @@ VGPU_EXPORT cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t stream) {
 // a graph is timed from outside. Without it, this is cudaEventRecord.
 VGPU_EXPORT cudaError_t cudaEventRecordWithFlags(cudaEvent_t e, cudaStream_t stream,
                                                  unsigned int flags) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (flags & ~static_cast<unsigned>(cudaEventRecordExternal)) return cudaErrorInvalidValue;
   if (!(flags & cudaEventRecordExternal)) return cudaEventRecord(e, stream);
   std::lock_guard<std::mutex> lock(g_event_mu);
@@ -4147,6 +4208,7 @@ cudaError_t wait_event_now(cudaEvent_t e) {
 // to, and a stream not yet capturing joins the capture -- a fork. The rules on
 // what may be waited on are CUDA's, each with the error it documents.
 VGPU_EXPORT cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t e, unsigned int flags) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (flags & ~static_cast<unsigned>(cudaEventWaitExternal)) return cudaErrorInvalidValue;
   bool captured = false;
   unsigned long long id = 0;
@@ -4205,18 +4267,21 @@ VGPU_EXPORT cudaError_t cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventH
 }
 
 VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
+  if (const cudaError_t dead = dead_context()) return dead;
   std::lock_guard<std::mutex> lock(g_event_mu);
   const RtEvent* r = find_event(e);
   if (!r) return cudaErrorInvalidResourceHandle;
   return r->captured ? cudaErrorCapturedEvent : cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
+  if (const cudaError_t dead = dead_context()) return dead;
   std::lock_guard<std::mutex> lock(g_event_mu);
   const RtEvent* r = find_event(e);
   if (!r) return cudaErrorInvalidResourceHandle;
   return r->captured ? cudaErrorCapturedEvent : cudaSuccess;   // it stands for work not yet run
 }
 VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end) {
+  if (const cudaError_t dead = dead_context()) return dead;
   if (!ms) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_event_mu);
   const RtEvent* a = find_event(start);
@@ -4232,6 +4297,7 @@ VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaE
   return cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
+  if (const cudaError_t dead = dead_context()) return dead;
   std::lock_guard<std::mutex> lock(g_event_mu);
   return g_events.erase(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
 }
@@ -4240,18 +4306,20 @@ VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
 /* Errors and versions                                                   */
 /* ===================================================================== */
 
-// A sticky error is not cleared by reading it: the context is still unusable.
+// The last error, and nothing else: reading it clears it even when a kernel
+// has killed the context, as on an RTX 3060 -- after a failed device assert,
+// cudaDeviceSynchronize then cudaGetLastError report cudaErrorAssert, and the
+// next cudaGetLastError reports success. The context is no less dead: the next
+// call that needs it fails again and sets it again (dead_context). Nor does a
+// kernel's fault reach the last error before such a call: right after the
+// launch, these report success.
 VGPU_EXPORT cudaError_t cudaGetLastError(void) {
   cudaError_t e = g_last_error;
   g_last_error = cudaSuccess;
   g_async_error = cudaSuccess;
-  const cudaError_t sticky = g_sticky_error.load();
-  return sticky != cudaSuccess ? sticky : e;
+  return e;
 }
-VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) {
-  const cudaError_t sticky = g_sticky_error.load();
-  return sticky != cudaSuccess ? sticky : g_last_error;
-}
+VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) { return g_last_error; }
 
 // Both name every code the runtime API declares, from the table shared with
 // the driver shim (error_names.hpp). They used to name only the codes this
@@ -4949,12 +5017,17 @@ cudaError_t graph_mem_free_run(uint64_t va) {
 // synchronous engine any such order is a correct execution of the graph, and a
 // program that depended on more than the order it asked for would be depending
 // on something CUDA does not promise either.
+//
+// A kernel that faults ends the graph's work there: its context is dead, so
+// nothing after it can run. The launch still succeeds, as on the card, and the
+// fault is what the next call that needs the context reports.
 static cudaError_t run_graph(GraphRec& g, cudaStream_t stream) {
   const std::vector<GraphNodeRec*> order = topological_order(g);
   if (order.size() != g.nodes.size()) return cudaErrorInvalidValue;
   for (GraphNodeRec* n : order) {
     const cudaError_t rc = run_graph_node(n, stream);
     if (rc != cudaSuccess) return rc;
+    if (sticky_error() != cudaSuccess) return cudaSuccess;
   }
   return cudaSuccess;
 }
@@ -5043,6 +5116,7 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
 }
 
 VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
+  if (const cudaError_t dead = dead_context()) return dead;
   std::unique_ptr<GraphRec> replay;
   bool auto_free = false;
   void* source = nullptr;

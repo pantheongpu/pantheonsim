@@ -10,6 +10,7 @@
 // without changing these semantics for the default stream.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -182,6 +183,16 @@ class Runtime {
   // frees what the other allocated. Callers hold shared_api_mutex().
   std::map<void*, HostRange>& host_allocations() { return host_allocations_; }
 
+  // The fault a kernel left the context with, as the CUDA error code it is
+  // reported as (the runtime's and the driver's codes for these are the same
+  // numbers), or 0. A kernel that hits an illegal address, a trap or a failed
+  // assert leaves the context unusable, and every later call that needs it
+  // fails with that code until a reset -- whichever library launched the
+  // kernel and whichever is asked, since they share one context. Atomic: it is
+  // read without the API lock.
+  int context_fault() const { return context_fault_.load(); }
+  void set_context_fault(int code) { context_fault_.store(code); }
+
  private:
   void publish_identity(const DeviceProfile& profile, int ordinal);
 
@@ -189,6 +200,7 @@ class Runtime {
   std::vector<std::unique_ptr<Device>> devices_;
   std::map<void*, HostRange> host_registrations_;
   std::map<void*, HostRange> host_allocations_;
+  std::atomic<int> context_fault_{0};
 };
 
 }  // namespace vgpu::runtime

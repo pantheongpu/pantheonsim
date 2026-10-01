@@ -217,7 +217,8 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     // Both of these reached the switch's fallthrough before, and so were
     // reported as CUDA_ERROR_UNKNOWN -- the least informative code available,
     // for the two conditions this project most wants to be legible.
-    case Err::Trap: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
+    // An RTX 3060 reports a kernel's "trap" (and "brkpt") as LAUNCH_FAILED.
+    case Err::Trap: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::EccUncorrectable: return CUDA_ERROR_ECC_UNCORRECTABLE;
     // What programs report when their GPU falls off the bus.
@@ -233,6 +234,49 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
   return CUDA_ERROR_UNKNOWN;
 }
 
+// Whether an error leaves the context unusable: a kernel's illegal address,
+// trap or failed assert, as the runtime decides it (runtime_api.cpp's
+// poisons_context), and uncorrectable memory whatever read it.
+bool poisons_context(vgpu::Err e, bool kernel_context) {
+  using vgpu::Err;
+  switch (e) {
+    case Err::InvalidPointer:
+    case Err::UseAfterFree:
+    case Err::OutOfBounds:
+    case Err::MisalignedAccess:
+    case Err::UninitializedRegister:
+    case Err::Trap:
+    case Err::DeviceAssert:
+    case Err::DeviceLost:
+      return kernel_context;
+    case Err::EccUncorrectable:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The calls an RTX 3060 still answers once a kernel has killed the context:
+// what a device is, which context is current, and the primary context's own
+// bookkeeping. Every other call that needs the context fails with the fault
+// (Runtime::context_fault), the next cuCtxSynchronize first among them.
+bool answers_dead_context(const char* name) {
+  static const char* const kLive[] = {"cuInit", "cuDevice", "cuCtxGetCurrent", "cuCtxSetCurrent",
+                                      "cuCtxPushCurrent", "cuCtxPopCurrent", "cuCtxGetDevice",
+                                      "cuCtxCreate", "cuCtxDestroy", "cuCtxAttach", "cuTensorMap"};
+  for (const char* p : kLive)
+    if (std::strncmp(name, p, std::strlen(p)) == 0) return true;
+  return false;
+}
+
+// The fault a dead context answers with, or CUDA_SUCCESS. For the entry points
+// that do not go through api().
+CUresult dead_context() {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  return s.initialized ? static_cast<CUresult>(s.rt->context_fault()) : CUDA_SUCCESS;
+}
+
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
@@ -242,13 +286,22 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     report(name, "cuInit has not been called");
     return CUDA_ERROR_NOT_INITIALIZED;
   }
+  if (s.initialized && !answers_dead_context(name))
+    if (const int fault = s.rt->context_fault()) return static_cast<CUresult>(fault);
   try {
     CUresult r = body(s);
     if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d\n", name, static_cast<int>(r));
     return r;
   } catch (const vgpu::Error& e) {
     report(name, e.what());
-    const CUresult r = map_error(e, kernel_context);
+    CUresult r = map_error(e, kernel_context);
+    if (s.initialized && poisons_context(e.code(), kernel_context)) {
+      s.rt->set_context_fault(static_cast<int>(r));
+      // A kernel's fault is reported by the calls after its launch, which on
+      // the card returned before the kernel ran: cuLaunchKernel succeeds, and
+      // the next cuCtxSynchronize is CUDA_ERROR_ASSERT or ILLEGAL_ADDRESS.
+      if (kernel_context) r = CUDA_SUCCESS;
+    }
     if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d (threw)\n", name, static_cast<int>(r));
     return r;
   } catch (const std::exception& e) {
@@ -1030,8 +1083,14 @@ VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
 }
 
 // Releasing the primary context. Nothing is cached per context here, so this
-// succeeds without tearing down the device.
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) { return CUDA_SUCCESS; }
+// succeeds without tearing down the device -- except a fault a kernel left the
+// context with, which a reset is the one way out of, as cudaDeviceReset is.
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (s.initialized) s.rt->set_context_fault(0);
+  return CUDA_SUCCESS;
+}
 
 /* ---- runtime JIT linking ----
  *
@@ -3261,8 +3320,8 @@ VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
   fn(user);
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return CUDA_SUCCESS; }  // always idle
-VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return dead_context(); }  // always idle
+VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return dead_context(); }
 VGPU_EXPORT CUresult cuStreamGetPriority(CUstream, int* p) {
   if (p) *p = 0;
   return CUDA_SUCCESS;
@@ -3301,8 +3360,8 @@ VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventQuery(void*) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuEventSynchronize(void*) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuEventQuery(void*) { return dead_context(); }
+VGPU_EXPORT CUresult cuEventSynchronize(void*) { return dead_context(); }
 VGPU_EXPORT CUresult cuEventDestroy_v2(void* ev) {
   return api("cuEventDestroy", true, false, [&](ShimState& s) {
     s.events.erase(reinterpret_cast<uintptr_t>(ev));
@@ -3354,6 +3413,7 @@ VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
 VGPU_EXPORT CUresult cuCtxPopCurrent(CUcontext* pctx) { return cuCtxPopCurrent_v2(pctx); }
 
 VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
+  if (const CUresult dead = dead_context()) return dead;
   if (!v) return CUDA_ERROR_INVALID_VALUE;
   switch (limit) {
     case 0: *v = 1024; break;              // STACK_SIZE
@@ -3363,7 +3423,7 @@ VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
   }
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuCtxSetLimit(int, size_t) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuCtxSetLimit(int, size_t) { return dead_context(); }
 VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext, unsigned int* v) {
   if (v) *v = 3020;
   return CUDA_SUCCESS;
@@ -3394,7 +3454,7 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flag
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset_v2(CUdevice) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) { return cuDevicePrimaryCtxReset(dev); }
 
 VGPU_EXPORT CUresult cuModuleGetLoadingMode(int* mode) {
   if (!mode) return CUDA_ERROR_INVALID_VALUE;
