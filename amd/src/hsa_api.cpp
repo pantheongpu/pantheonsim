@@ -543,7 +543,9 @@ hsa_status_t hsa_system_get_info(hsa_system_info_t attribute, void* value) {
     case HSA_SYSTEM_INFO_MACHINE_MODEL: put<uint32_t>(value, HSA_MACHINE_MODEL_LARGE); break;
     case HSA_SYSTEM_INFO_EXTENSIONS: std::memset(value, 0, 128); break;
     case HSA_AMD_SYSTEM_INFO_BUILD_VERSION: put<const char*>(value, "VirtualGPU"); break;
-    case HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED:
+    // SVM's interfaces, as on a machine with HMM; ranges are given to an
+    // agent explicitly (not accessible by default, as without XNACK).
+    case HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED: put<bool>(value, true); break;
     case HSA_AMD_SYSTEM_INFO_SVM_ACCESSIBLE_BY_DEFAULT:
     case HSA_AMD_SYSTEM_INFO_MWAITX_ENABLED:
     case HSA_AMD_SYSTEM_INFO_DMABUF_SUPPORTED:
@@ -1943,15 +1945,14 @@ hsa_status_t hsa_amd_register_system_event_handler(void*, void*) { return HSA_ST
 // ---- Virtual memory and memory shared between processes --------------------------
 #include "hsa_vmem.inc"
 
-// What this does not model yet, refused by name: images laid out by
-// graphics interop (hsa_amd_image_create), SVM's attributes, graphics
-// interop and DMA-buf export.
+// ---- Shared virtual memory ---------------------------------------------------------
+#include "hsa_svm.inc"
+
+// What this does not model, refused by name: images laid out by graphics
+// interop (hsa_amd_image_create), and graphics interop.
 #define VGPU_HSA_REFUSED(name, what) \
   hsa_status_t name() { return fail(HSA_STATUS_ERROR_NOT_SUPPORTED, #name " is not supported: " what); }
 VGPU_HSA_REFUSED(hsa_amd_image_create, "images over another API's layout are not modelled")
-VGPU_HSA_REFUSED(hsa_amd_svm_attributes_get, "SVM is not modelled")
-VGPU_HSA_REFUSED(hsa_amd_svm_attributes_set, "SVM is not modelled")
-VGPU_HSA_REFUSED(hsa_amd_svm_prefetch_async, "SVM is not modelled")
 VGPU_HSA_REFUSED(hsa_amd_interop_map_buffer, "there is no graphics driver to share with")
 VGPU_HSA_REFUSED(hsa_amd_interop_unmap_buffer, "there is no graphics driver to share with")
 VGPU_HSA_REFUSED(hsa_executable_agent_global_variable_define, "external variables are not defined yet")

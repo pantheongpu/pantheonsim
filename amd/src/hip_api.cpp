@@ -1273,6 +1273,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   int ordinal = 0;
   const uint64_t dst_va = reinterpret_cast<uint64_t>(dst), src_va = reinterpret_cast<uint64_t>(src);
   RegionSink* const sink = t_sink;
+  const bool called_sync = !async;   // before a device-to-device copy is queued as an asynchronous one
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     d = device(s);
@@ -1313,10 +1314,12 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   const bool to_device = to.mem != nullptr, from_device = from.mem != nullptr;
   // A synchronous copy of another device's memory also comes after what that
   // device's blocking streams were given: it is ordered on the device the
-  // memory is on, as ROCm's HIP orders it, as well as the current one.
-  // A graph's launch runs its copy right here, on its stream's thread.
+  // memory is on, as ROCm's HIP orders it, as well as the current one --
+  // a device-to-device one too, which returns before it is done but not
+  // before what it follows there. A graph's launch runs its copy right here,
+  // on its stream's thread.
   const bool run_here = sink != nullptr;
-  if (!async && !run_here)
+  if (called_sync && !run_here)
     for (const Side* side : {&to, &from})
       if (side->device && side->ordinal != ordinal) drain_device(side->ordinal, true);
   bool wait = !async || run_here;
@@ -5515,7 +5518,10 @@ hipError_t hipIpcGetEventHandle(void* handle, hipEvent_t event) {
   const ApiCall api("hipIpcGetEventHandle");
   std::lock_guard<std::mutex> lock(g_event_mutex);
   const Event* e = find_event(event);
-  if (!handle || !e || !e->ipc) return record(state(), hipErrorInvalidValue);
+  if (!handle || !e) return record(state(), hipErrorInvalidValue);
+  // An event made without hipEventInterprocess has no handle; ROCm's HIP says
+  // so as a configuration error (CUDA's says invalid handle).
+  if (!e->ipc) return record(state(), hipErrorInvalidConfiguration);
   IpcEventPayload p{};
   p.magic = kIpcEventMagic;
   p.version = 1;
@@ -6344,9 +6350,7 @@ hipError_t copy_3d(const vgpu::amd::abi::Memcpy3DParms* p, hipStream_t stream, b
   const bool sptr = p->srcPtr.ptr != nullptr, dptr = p->dstPtr.ptr != nullptr;
   if (sarr == sptr || darr == dptr) return hipErrorInvalidValue;
   const int kind = p->kind;
-  if (kind != hipMemcpyDefault && kind != hipMemcpyHostToHost && kind != hipMemcpyHostToDevice &&
-      kind != hipMemcpyDeviceToHost && kind != hipMemcpyDeviceToDevice)
-    return hipErrorInvalidMemcpyDirection;
+  if (!valid_kind(kind)) return hipErrorInvalidMemcpyDirection;
   if (sarr || darr) return array_3d(p, stream, async);
   const auto& e = p->extent;
   size_t spitch = 0, dpitch = 0;
@@ -6500,25 +6504,43 @@ hipError_t hipMemcpy3DPeerAsync(vgpu::amd::abi::Memcpy3DPeerParms* p, hipStream_
   const ApiCall api("hipMemcpy3DPeerAsync");
   return record(state(), peer_3d(p, stream, true));
 }
-// Several 3D copies, in order on the stream, each operand a pointer with its
-// row length (bytes) and slice height. The flags must be zero.
+// Several 3D copies, in order on the stream, each as hipMemcpy3D would make
+// it (ROCm's HIP's getMemcpy3DParms): an operand is a pointer with its row
+// length and slice height, or an array at an offset. Where either side is an
+// array, the extent's width and a pointer's row length are elements of it;
+// otherwise bytes. The flags must be zero; the first copy that fails is
+// named, and none after it is made.
 hipError_t hipMemcpy3DBatchAsync(size_t count, vgpu::amd::abi::Memcpy3DBatchOp* ops, size_t* fail_idx,
                                  unsigned long long flags, hipStream_t stream) {
   const ApiCall api("hipMemcpy3DBatchAsync");
   if (!count || !ops || flags) return record(state(), hipErrorInvalidValue);
+  if (fail_idx) *fail_idx = SIZE_MAX;
   for (size_t i = 0; i < count; ++i) {
     const auto& op = ops[i];
     hipError_t e = hipSuccess;
-    if (op.src.type != 1 || op.dst.type != 1) {
-      e = op.src.type == 2 || op.dst.type == 2 ? hipErrorNotSupported : hipErrorInvalidValue;
+    const auto side = [](int type) { return type == 1 || type == 2; };
+    if (!side(op.src.type) || !side(op.dst.type)) {
+      e = hipErrorInvalidValue;
     } else {
-      const auto& x = op.extent;
-      const uint64_t sp = op.src.op.ptr.rowLength ? op.src.op.ptr.rowLength : x.width;
-      const uint64_t dp = op.dst.op.ptr.rowLength ? op.dst.op.ptr.rowLength : x.width;
-      const uint64_t ss = sp * (op.src.op.ptr.layerHeight ? op.src.op.ptr.layerHeight : x.height);
-      const uint64_t ds = dp * (op.dst.op.ptr.layerHeight ? op.dst.op.ptr.layerHeight : x.height);
-      e = copy_region(op.dst.op.ptr.ptr, Region{x.width, x.height, x.depth, dp, ds}, op.src.op.ptr.ptr,
-                      Region{x.width, x.height, x.depth, sp, ss}, hipMemcpyDefault, stream, true);
+      const void* array = op.src.type == 2 ? op.src.op.array.array : op.dst.type == 2 ? op.dst.op.array.array : nullptr;
+      const HipArray* a = array ? find_array(array) : nullptr;
+      const size_t element = a ? a->element() : 1;
+      vgpu::amd::abi::Memcpy3DParms p{};
+      p.extent = op.extent;
+      p.kind = hipMemcpyDefault;
+      const auto set = [&](const vgpu::amd::abi::Memcpy3DOperand& o, void** arr, vgpu::amd::abi::Pos* pos,
+                           vgpu::amd::abi::PitchedPtr* ptr) {
+        if (o.type == 2) {
+          *arr = o.op.array.array;
+          *pos = {o.op.array.x, o.op.array.y, o.op.array.z};
+        } else {
+          const size_t row = o.op.ptr.rowLength ? o.op.ptr.rowLength : op.extent.width;
+          *ptr = {o.op.ptr.ptr, row * element, row, o.op.ptr.layerHeight ? o.op.ptr.layerHeight : op.extent.height};
+        }
+      };
+      set(op.src, &p.srcArray, &p.srcPos, &p.srcPtr);
+      set(op.dst, &p.dstArray, &p.dstPos, &p.dstPtr);
+      e = copy_3d(&p, stream, true);
     }
     if (e != hipSuccess) {
       if (fail_idx) *fail_idx = i;

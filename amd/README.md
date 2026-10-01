@@ -474,7 +474,8 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Host access:** the host is never given a device's memory directly, so CLR copies instead of writing through it.
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
 - **Images, virtual memory and IPC:** HSA's images extension (see Textures), its virtual memory (`hsa_amd_vmem_*`), its IPC handles (`hsa_amd_ipc_memory_*`) and dma-buf export are modelled. The last three are HIP's own (`src/hsa_vmem.inc`), reached by hidden names so that ROCm's libamdhip64 over this runtime does not call itself. ROCm's HIP runs `tests/hipcc/memory.cpp`'s virtual memory, pool IPC and dma-buf checks over it.
-- **Not modelled:** SVM's attributes and prefetch (the runtime reports no HMM, so ROCm's HIP keeps its managed memory without them), and graphics interop.
+- **Shared virtual memory:** the runtime reports SVM support, as ROCm's does on a machine with HMM. ROCm's HIP then keeps managed memory the way it does there: host pages made accessible to each GPU, advised and prefetched through `hsa_amd_svm_attributes_set`, `_get` and `hsa_amd_svm_prefetch_async` (`src/hsa_svm.inc`). A range given to a GPU is mapped for the devices where it is. Advice, access and the last prefetch's target are kept page by page and read back, uniform or not. A prefetch moves nothing, because there is no second copy of the pages. It waits for its dependencies and completes its signal.
+- **Not modelled:** graphics interop.
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 

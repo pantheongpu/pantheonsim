@@ -1010,8 +1010,8 @@ struct Machine {
       // A field of a hardware register: the immediate's low six bits say
       // which register, the next five where the field starts, the top five
       // how wide it is less one. MODE is kept per wave, and gfx12's SCHED_MODE;
-      // HW_ID says which wave of the work-group this is; the rest are refused
-      // by name.
+      // HW_ID says which wave of the work-group this is, and SHADER_CYCLES
+      // the shader clock; the rest are refused by name.
       const uint32_t id = static_cast<uint32_t>(in.simm) & 0x3F, at = (static_cast<uint32_t>(in.simm) >> 6) & 0x1F,
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
@@ -1033,6 +1033,13 @@ struct Machine {
         else if (sched) reg = w.sched_mode;
         else if (flat_scr) reg = w.flat_scratch[id - 20];
         else if (id == 4) reg = static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF;   // HW_ID: the wave's slot
+        // SHADER_CYCLES, which clock() reads on RDNA: 20 bits of the cycle
+        // count on gfx10.3 and gfx11; on gfx12 its low word (29) and high
+        // word (30). The count is s_memtime's, the instructions retired.
+        else if (id == 29 && is_rdna(in.arch))
+          reg = in.arch == gcn::Target::Gfx1200 ? static_cast<uint32_t>(stats.instructions)
+                                                : static_cast<uint32_t>(stats.instructions) & 0xFFFFF;
+        else if (id == 30 && in.arch == gcn::Target::Gfx1200) reg = static_cast<uint32_t>(stats.instructions >> 32);
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);
       }
@@ -5693,9 +5700,11 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   // what it asked for still reads its own LDS: rocFFT's kernels do.
   group.lds.assign(std::min<uint64_t>((group_segment + 511) / 512 * 512, lds_limit(d)), 0);
   // Each work-item's private memory. A kernel that spills says how much
-  // it needs; the rest get none.
+  // it needs; the rest get none. The hardware gives it to every lane of a
+  // wave, work-item or not: a function saving whole-wave registers turns
+  // on every lane, past the group's last work-item too.
   group.scratch_per_lane = (k.private_segment + 3) & ~3u;
-  group.scratch.assign(static_cast<size_t>(group.scratch_per_lane) * threads, 0);
+  group.scratch.assign(static_cast<size_t>(group.scratch_per_lane) * waves_per_group * lanes, 0);
   group.waves.resize(waves_per_group);
   group.id[0] = gx;
   group.id[1] = gy;

@@ -85,6 +85,24 @@ int main() {
   (void)hipMemcpy3D(&c);
   check(part[0] == uint8_t(5 + 9 + 7) && part[10 * 2 + 10 + 9] == uint8_t(14 + 12 + 14),
         "and starts where its position says");
+  // hipMemcpyDeviceToDeviceNoCU is a direction too, device to device.
+  hipPitchedPtr twin{};
+  (void)hipMalloc3D(&twin, make_hipExtent(w, h, d));
+  hipMemcpy3DParms nocu{};
+  nocu.srcPtr = pp;
+  nocu.dstPtr = twin;
+  nocu.extent = make_hipExtent(w, h, d);
+  nocu.kind = hipMemcpyDeviceToDeviceNoCU;
+  EXPECT(hipMemcpy3D(&nocu), hipSuccess, "a 3D copy from device to device without compute units");
+  std::fill(host.begin(), host.end(), 0);
+  c.srcPos = make_hipPos(0, 0, 0);
+  c.srcPtr = twin;
+  c.dstPtr = make_hipPitchedPtr(host.data(), w, w, h);
+  c.extent = make_hipExtent(w, h, d);
+  (void)hipMemcpy3D(&c);
+  check(host[w * h * (d - 1) + w * (h - 1) + w - 1] == uint8_t(w - 1 + 3 * (h - 1) + 7 * (d - 1)), "copies it all");
+  (void)hipFree(twin.ptr);
+  c.srcPtr = pp;
   c.srcPtr.pitch = INT32_MAX;
   EXPECT(hipMemcpy3D(&c), hipErrorInvalidValue, "a pitch as wide as the widest there is, is refused");
   EXPECT(hipMemcpy3D(nullptr), hipErrorInvalidValue, "and no parameters at all");
@@ -172,6 +190,19 @@ int main() {
   (void)hipMemcpyDtoH(back.data(), other, 1024);
   check(back[255] == 7, "hipMemcpyPeer copies between devices");
   EXPECT(hipMemcpyPeer(other, 2, words, 0, 1024), hipErrorInvalidDevice, "to a device that is not there, it refuses");
+  // A synchronous copy of another device's memory comes after what that
+  // device's null stream was given: here a memset queued behind a delay.
+  // ROCm's HIP leaves this to timing (a card's memset is done long before
+  // the copy starts; hip-tests' peer copies count on it), and a simulated
+  // memset is slow enough to lose that race, so the copy waits here.
+  delay<<<1, 1>>>(300, rate);
+  (void)hipMemset(words, 0x5A, 1024);
+  (void)hipSetDevice(1);
+  (void)hipMemcpy(other, words, 1024, hipMemcpyDeviceToDevice);
+  (void)hipMemcpy(back.data(), other, 1024, hipMemcpyDeviceToHost);
+  (void)hipSetDevice(0);
+  check(back[0] == 0x5A5A5A5Au && back[255] == 0x5A5A5A5Au,
+        "a copy from another device's memory follows the memset queued there before it");
 
   // ---- Managed memory: advice and prefetches, page by page
   char* managed = nullptr;

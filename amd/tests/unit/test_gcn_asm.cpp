@@ -421,6 +421,45 @@ VTEST(rdna4_gives_each_wave_its_number_in_ttmp8) {
   VCHECK_EQ(wrong, 0);
 }
 
+// A wave has scratch for every lane, work-item or not: a function saving
+// whole-wave registers stores with every lane on, and hip-tests' double
+// math, one work-item calling such a function, did just that.
+VTEST(rdna_every_lane_of_a_wave_has_scratch_in_a_group_of_one) {
+  const amd::CodeObject o = object("asm_wave", "gfx1100");
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(8);
+  const amd::Kernel* k = amd::find_kernel(o, "whole_wave_scratch");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(out >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 1;
+  amd::execute(d, mem);
+  uint32_t r[2] = {};
+  mem.read(out, r, 8);
+  VCHECK_EQ(r[0], 0x5eed0000u);
+  VCHECK_EQ(r[1], 0x5eed001fu);
+}
+
+// The shader clock as clock() reads it on RDNA: SHADER_CYCLES' 20 bits on
+// gfx11, and on gfx12 a low and a high word, read high, low, high.
+VTEST(rdna_shader_cycles_count_up) {
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(16);
+  const std::vector<uint32_t> r = run(object("asm_wave", "gfx1100"), "shader_cycles", mem, out, 2, {out});
+  VCHECK(r[0] <= 0xFFFFF && r[1] <= 0xFFFFF);
+  const uint32_t ticks = (r[1] - r[0]) & 0xFFFFF;
+  VCHECK(ticks > 0 && ticks < 64);
+  const std::vector<uint32_t> q = run(object("asm_cycles", "gfx1201"), "shader_cycles", mem, out, 4, {out});
+  VCHECK_EQ(q[0], q[2]);   // the high word held still
+  VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
+}
+
 VTEST(lds_64_bit_read_modify_writes_and_the_scalar_bit_operations_compute_what_the_isa_says) {
   const amd::CodeObject o = object("asm_lds64");
   MemoryManager mem(16ull << 20);

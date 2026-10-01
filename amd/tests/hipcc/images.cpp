@@ -10,11 +10,13 @@
 //     explicit level of detail with no mipmaps;
 //   - linear memory through tex1Dfetch (and the driver API's
 //     hipTexObjectCreate), pitched memory through tex2D;
-//   - 3D, 2D layered and 1D layered arrays, with hipMemcpy3D into them;
+//   - 3D, 2D layered and 1D layered arrays, with hipMemcpy3D into them and
+//     hipMemcpy3DBatchAsync between them;
 //   - gathers, and surfaces written and read;
 //   - the copies to and from arrays, and what the API answers about them.
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -165,7 +167,22 @@ int main() {
                                hipMemcpyDeviceToHost));
     int wrong = 0;
     for (int i = 0; i < W * H; ++i) wrong += back[i] != texels[i];
-    report("a 2D array copied in and out", wrong, W * H);
+    // And from device memory into another array, as a device-to-device copy
+    // without compute units (hipMemcpyDeviceToDeviceNoCU).
+    float* d_rows = nullptr;
+    CHECK(hipMalloc(&d_rows, W * H * sizeof(float)));
+    CHECK(hipMemcpy(d_rows, texels.data(), W * H * sizeof(float), hipMemcpyHostToDevice));
+    hipArray_t twin = nullptr;
+    CHECK(hipMallocArray(&twin, &fdesc, W, H));
+    CHECK(hipMemcpy2DToArray(twin, 0, 0, d_rows, W * sizeof(float), W * sizeof(float), H,
+                             hipMemcpyDeviceToDeviceNoCU));
+    std::fill(back.begin(), back.end(), -1.0f);
+    CHECK(hipMemcpy2DFromArray(back.data(), W * sizeof(float), twin, 0, 0, W * sizeof(float), H,
+                               hipMemcpyDeviceToHost));
+    for (int i = 0; i < W * H; ++i) wrong += back[i] != texels[i];
+    CHECK(hipFreeArray(twin));
+    CHECK(hipFree(d_rows));
+    report("a 2D array copied in and out, from the host and from device memory", wrong, 2 * W * H);
   }
   hipResourceDesc res;
   std::memset(&res, 0, sizeof res);
@@ -503,6 +520,37 @@ int main() {
     wrong = 0;
     for (size_t i = 0; i < box.size(); ++i) wrong += out[i] != box[i];
     report("a 3D array copied out", wrong, count);
+    // A batch: the 3D array from its second column into a pointer whose rows
+    // are elements long, the array into the layered one, and that one out.
+    std::vector<float> part(static_cast<size_t>((N - 1) * N * D), -1), whole(box.size(), -1);
+    hipMemcpy3DBatchOp ops[3];
+    std::memset(ops, 0, sizeof ops);
+    ops[0].src.type = hipMemcpyOperandTypeArray;
+    ops[0].src.op.array.array = a3;
+    ops[0].src.op.array.offset = {1, 0, 0};
+    ops[0].dst.type = hipMemcpyOperandTypePointer;
+    ops[0].dst.op.ptr.ptr = part.data();
+    ops[0].dst.op.ptr.rowLength = N - 1;
+    ops[0].extent = make_hipExtent(N - 1, N, D);
+    ops[1].src.type = ops[1].dst.type = hipMemcpyOperandTypeArray;
+    ops[1].src.op.array.array = a3;
+    ops[1].dst.op.array.array = a2l;
+    ops[1].extent = make_hipExtent(N, N, D);
+    ops[2].src.type = hipMemcpyOperandTypeArray;
+    ops[2].src.op.array.array = a2l;
+    ops[2].dst.type = hipMemcpyOperandTypePointer;
+    ops[2].dst.op.ptr.ptr = whole.data();
+    ops[2].extent = make_hipExtent(N, N, D);
+    for (auto& op : ops) op.srcAccessOrder = hipMemcpySrcAccessOrderStream;
+    size_t failed = 0;
+    CHECK(hipMemcpy3DBatchAsync(3, ops, &failed, 0, nullptr));
+    CHECK(hipStreamSynchronize(nullptr));
+    wrong = failed != SIZE_MAX;
+    for (int z = 0; z < D; ++z)
+      for (int y = 0; y < N; ++y)
+        for (int x = 0; x < N - 1; ++x) wrong += part[(z * N + y) * (N - 1) + x] != box[(z * N + y) * N + x + 1];
+    for (size_t i = 0; i < box.size(); ++i) wrong += whole[i] != box[i];
+    report("a batch of 3D copies to, from and between arrays", wrong, 1 + (N - 1) * N * D + count);
     CHECK(hipFreeArray(a3));
     CHECK(hipFreeArray(a2l));
     CHECK(hipFreeArray(a1l));
