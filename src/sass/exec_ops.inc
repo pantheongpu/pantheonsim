@@ -2446,6 +2446,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         w.wait_kind[l] = Wait::None;
         w.pc[l] += 16;
       });
+      w.b[x] &= ~arrived;   // they have converged: the barrier is free for its next BSSY
     }
   };
   const auto release_warpsync = [&] {
@@ -2673,7 +2674,14 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       return true;
     }
     case Op::BSSY:
-      if (ex) w.b[ins.dst[0].reg] = ex | (w.b[ins.dst[0].reg] & 0);
+      // The lanes join the barrier. Sibling paths of one divergent branch
+      // can each set up the same Bx for their own reconvergence point (a
+      // -G build's switch over function pointers, every case with its own
+      // BSSY B6 around its call); run interleaved, an overwrite let the
+      // last one's lanes alone count, and the others' BSYNC then waited
+      // for lanes that had already left. They converge together instead,
+      // and BSYNC takes the lanes it releases back out.
+      w.b[ins.dst[0].reg] |= ex;
       return false;
     case Op::BREAK:   // BREAK Pn, Bx: the lanes where both hold leave Bx
       w.b[ins.src.back().reg] &= ~with_condition(ex);
