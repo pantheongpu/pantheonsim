@@ -1214,13 +1214,28 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
     set_tests_properties(e2e_${_name} PROPERTIES
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
+
+  # Driver and runtime entry points CUDA's samples reach for, checked against
+  # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
+  # __managed__ variables (managed_vars.cu). On two devices, so that peer
+  # access and peer copies have a peer, and a managed variable two devices.
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart")
+    string(REPLACE ":" ";" _parts "${_check}")
+    list(POP_FRONT _parts _name)
+    add_test(NAME e2e_${_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    set_tests_properties(e2e_${_name} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_DEVICE_COUNT=2"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
@@ -1397,6 +1412,20 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_div_approx
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_div_approx.sh)
   set_tests_properties(e2e_div_approx PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_printf_formats
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_printf_formats.sh)
+  set_tests_properties(e2e_printf_formats PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_device_last_error
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_last_error.sh)
+  set_tests_properties(e2e_device_last_error PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)

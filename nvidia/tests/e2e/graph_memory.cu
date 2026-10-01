@@ -245,6 +245,54 @@ int main() {
   CK(cudaMemcpy(host, kept, kBytes, cudaMemcpyDeviceToHost));
   CHECK(host[0] == 7 && host[kInts - 1] == kInts - 1 + 7);
 
+  // ---- execs that outlive their graphs --------------------------------------
+  //
+  // What CUDA's graphMemoryNodes and graphMemoryFootprint samples do: destroy a
+  // graph as soon as it is instantiated and go on launching the exec. The exec
+  // still allocates at its node's address -- again after a free outside the
+  // graph, which is what lets it be launched again -- and a graph made later,
+  // which may be given a destroyed one's handle, is a graph of its own: its
+  // instantiation is its first, not a second one of the destroyed graph.
+  cudaGraph_t shortlived = nullptr;
+  CK(cudaGraphCreate(&shortlived, 0));
+  cudaMemAllocNodeParams slp = ap;
+  slp.dptr = nullptr;
+  cudaGraphNode_t sl_alloc = nullptr;
+  CK(cudaGraphAddMemAllocNode(&sl_alloc, shortlived, nullptr, 0, &slp));
+  int* sl = static_cast<int*>(slp.dptr);
+  int sl_base = 3;
+  void* sl_args[] = {&sl, &n, &sl_base};
+  cudaKernelNodeParams slk = kp;
+  slk.kernelParams = sl_args;
+  cudaGraphNode_t sl_kern = nullptr;
+  CK(cudaGraphAddKernelNode(&sl_kern, shortlived, &sl_alloc, 1, &slk));
+  cudaGraphExec_t sl_exec = nullptr;
+  CK(cudaGraphInstantiate(&sl_exec, shortlived, 0));
+  CK(cudaGraphDestroy(shortlived));
+  for (int round = 0; round < 2; ++round) {
+    CK(cudaGraphLaunch(sl_exec, 0));
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(host, sl, kBytes, cudaMemcpyDeviceToHost));
+    CHECK(host[0] == 3 && host[kInts - 1] == kInts - 1 + 3);
+    CK(cudaFree(sl));
+  }
+  cudaGraphExec_t later[4] = {};
+  for (cudaGraphExec_t& e : later) {
+    cudaGraph_t gi = nullptr;
+    CK(cudaGraphCreate(&gi, 0));
+    cudaMemAllocNodeParams ip = ap;
+    ip.dptr = nullptr;
+    cudaGraphNode_t ia = nullptr, ifree = nullptr;
+    CK(cudaGraphAddMemAllocNode(&ia, gi, nullptr, 0, &ip));
+    CK(cudaGraphAddMemFreeNode(&ifree, gi, &ia, 1, ip.dptr));
+    CK(cudaGraphInstantiate(&e, gi, 0));
+    CK(cudaGraphDestroy(gi));
+    CK(cudaGraphLaunch(e, 0));
+    CK(cudaDeviceSynchronize());
+  }
+  for (cudaGraphExec_t e : later) CK(cudaGraphExecDestroy(e));
+  CK(cudaGraphExecDestroy(sl_exec));
+
   // Sharing a graph allocation between processes would need a handle type this
   // does not offer, and the API documents IPC as unsupported for these too.
   cudaGraph_t shared = nullptr;

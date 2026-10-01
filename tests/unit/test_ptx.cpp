@@ -213,6 +213,26 @@ VTEST(global_scalar_initialiser_is_not_a_symbol) {
   VCHECK_EQ(int(m.globals[1].init[3]), 0x3F);
 }
 
+// A __managed__ variable is ".attribute(.managed)" before the type, and
+// ".attribute(.unified(...))" names one across devices: both parse, the first
+// flags the global, and neither changes its layout or initialiser.
+VTEST(managed_global_attribute) {
+  Module m = parse(
+      ".version 8.3\n.target sm_90\n.address_size 64\n"
+      ".global .attribute(.managed) .align 4 .u32 counter = 5;\n"
+      ".global .attribute(.unified(19, 95)) .align 8 .b8 table[16];\n"
+      ".global .align 4 .u32 plain;\n"
+      ".visible .entry k()\n{\nret;\n}\n");
+  VCHECK_EQ(m.globals.size(), size_t{3});
+  VCHECK(m.globals[0].managed);
+  VCHECK_EQ(m.globals[0].name, std::string("counter"));
+  VCHECK_EQ(m.globals[0].align, uint32_t{4});
+  VCHECK_EQ(int(m.globals[0].init[0]), 5);
+  VCHECK(!m.globals[1].managed);
+  VCHECK_EQ(m.globals[1].size, uint64_t{16});
+  VCHECK(!m.globals[2].managed);
+}
+
 // ".common" is a tentative definition: zero-initialised, and merged with any
 // other definition of the same symbol at link time. Once a module is loaded
 // there is nothing left to merge with, so it declares exactly what ".global"

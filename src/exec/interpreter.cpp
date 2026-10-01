@@ -32,6 +32,7 @@
 #include <memory>
 #include <cfenv>
 #include <climits>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -432,6 +433,11 @@ struct Warp {
   // warp's share stays small. It also keeps the verdict independent of how
   // many host threads the grid happens to be spread over.
   uint64_t steps = 0;
+  // Per thread, the last error a device-runtime call returned: the device's
+  // cudaGetLastError reports it and clears it. The CUDA Programming Guide
+  // records device-side errors per thread, and an RTX 3060 keeps them so: a
+  // thread whose launch failed sees the error, its warp-mates do not.
+  Lanes device_error{};
   // Live paths. Reconvergence is by *lowest program counter*: the path with
   // the smallest pc always runs next, and paths that arrive at the same pc are
   // merged. For the structured control flow compilers emit, that reconverges
@@ -3024,7 +3030,7 @@ class Interpreter {
   // The member mask of a warp instruction that synchronizes the lanes it
   // names (shfl.sync, vote.sync, match.sync, redux.sync), or null.
   static const Operand* sync_members(const Instr& ins) {
-    if (const auto* op = std::get_if<OpShfl>(&ins.op)) return &op->member_mask;
+    if (const auto* op = std::get_if<OpShfl>(&ins.op); op && op->has_members) return &op->member_mask;
     if (const auto* op = std::get_if<OpMatch>(&ins.op)) return &op->membermask;
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) return &op->members;
     if (const auto* op = std::get_if<OpVote>(&ins.op); op && op->has_members) return &op->members;
@@ -5238,6 +5244,14 @@ class Interpreter {
       // one after another in launch order, which every ordering these can
       // ask for already satisfies: creation hands back a distinct handle,
       // and destroying, recording and waiting have nothing left to do.
+      if (op->callee == "__cuda_syscall_cnpv2GetLastError") {
+        exec_device_get_last_error(w, *op, m);
+        return;
+      }
+      if (op->callee == "__cuda_syscall_cnpv2SetLastError") {
+        exec_device_set_last_error(w, ctx, ins, *op, m);
+        return;
+      }
       if (op->callee == "__cuda_syscall_cnpv2StreamCreate" || op->callee == "__cuda_syscall_cnpv2EventCreate") {
         exec_device_handle(w, ctx, ins, *op, m);
         return;
@@ -11491,6 +11505,33 @@ class Interpreter {
       if (m & (Mask{1} << lane)) out.write(lane, 0, bytes, r[lane]);
   }
 
+  // A device-runtime call's error, kept as the thread's last one when it is
+  // an error at all (a success does not clear it, as on the host).
+  static void record_device_errors(Warp& w, Mask m, const Lanes& r) {
+    for (uint32_t lane = 0; lane < kMaxWarpSize; ++lane)
+      if ((m & (Mask{1} << lane)) && r[lane]) w.device_error[lane] = r[lane];
+  }
+
+  // The device runtime's per-thread error, through the two driver entry points
+  // its library is built on: __cuda_syscall_cnpv2GetLastError reads it
+  // without clearing it (cudaPeekAtLastError is just that call), and
+  // __cuda_syscall_cnpv2SetLastError writes it -- the library's own
+  // cudaGetLastError reads and then sets 0.
+  void exec_device_get_last_error(Warp& w, const OpCall& op, Mask m) {
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) r[lane] = w.device_error[lane];
+    write_call_result(w, op, m, r, 4);
+  }
+  void exec_device_set_last_error(Warp& w, const BlockCtx&, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 1)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes one argument");
+    const Warp::Slot& err = call_slot(w, ins, op, 0);
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) w.device_error[lane] = static_cast<uint32_t>(err.read(lane, 0, 4));
+    write_call_result(w, op, m, Lanes{}, 4);
+  }
+
   // int f(int* out): writes `value` through the pointer and returns success.
   void exec_device_int_query(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m,
                              int value) {
@@ -11509,6 +11550,7 @@ class Interpreter {
       // so it goes wherever a generic store would.
       store_routed(w, ctx, ins, lane, addr, 4, static_cast<uint32_t>(value));
     }
+    record_device_errors(w, m, r);
     write_call_result(w, op, m, r, 4);
   }
 
@@ -11530,6 +11572,7 @@ class Interpreter {
       const uint64_t handle = kDeviceHandleBase + device_handles_.fetch_add(1, std::memory_order_relaxed);
       store_routed(w, ctx, ins, lane, addr, 8, handle);
     }
+    record_device_errors(w, m, r);
     write_call_result(w, op, m, r, 4);
   }
   static constexpr uint64_t kDeviceHandleBase = 0x5654'4750'0000'0000ull;   // "VTGP": never a device address
@@ -11612,6 +11655,7 @@ class Interpreter {
       dl_->queue.push_back(c);
       r[lane] = kSuccess;
     }
+    record_device_errors(w, m, r);
     write_call_result(w, op, m, r, 4);
   }
 
@@ -11698,7 +11742,6 @@ class Interpreter {
       uint64_t valist = va_it->second.read(lane, 0, 8);
       uint64_t cursor = 0;
       std::string out;
-      char buf[256];
 
       auto fetch = [&](uint32_t size) -> uint64_t {
         cursor = (cursor + size - 1) / size * size;  // natural alignment in the valist
@@ -11710,67 +11753,112 @@ class Interpreter {
         return v;
       };
 
+      // The format is the C one, formatted the way an RTX 3060's host side
+      // formats it: glibc's text for every conversion (so "(nil)", "(null)",
+      // "-nan"), and a conversion it does not know printed as written,
+      // consuming no argument. What the card does wrong is refused by name
+      // rather than imitated: a `*` precision, hh, %Lf and %n.
+      auto format = [&](const std::string& spec, auto value) {
+        const int n = std::snprintf(nullptr, 0, spec.c_str(), value);
+        std::string text(n > 0 ? static_cast<size_t>(n) : 0, '\0');
+        if (n > 0) std::snprintf(text.data(), text.size() + 1, spec.c_str(), value);
+        out += text;
+      };
       for (size_t i = 0; i < fmt.size(); ++i) {
         if (fmt[i] != '%') {
           out += fmt[i];
           continue;
         }
-        size_t start = i++;
-        if (i < fmt.size() && fmt[i] == '%') {
-          out += '%';
-          continue;
-        }
-        while (i < fmt.size() && std::string("-+ #0123456789.").find(fmt[i]) != std::string::npos) ++i;
-        int longs = 0;
-        while (i < fmt.size() && (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'z')) {
-          if (fmt[i] == 'l') ++longs;
-          if (fmt[i] == 'z') longs = 2;
+        const size_t start = i++;
+        std::string spec = "%";   // flags, width and precision, lengths removed
+        while (i < fmt.size() && std::string("-+ #0").find(fmt[i]) != std::string::npos) spec += fmt[i++];
+        if (i < fmt.size() && fmt[i] == '*') {
+          // A `*` width is an int argument before the value.
+          spec += std::to_string(static_cast<int32_t>(fetch(4)));
           ++i;
         }
-        if (i >= fmt.size())
-          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
-                   "printf format ends inside a % specifier");
-        char conv = fmt[i];
-        // Spec with normalized length: 64-bit integers always use "ll".
-        std::string flags = fmt.substr(start + 1, (i - (longs ? longs : 0)) - start - 1);
-        // Strip any length chars that slipped into flags capture.
-        while (!flags.empty() && (flags.back() == 'l' || flags.back() == 'h' || flags.back() == 'z'))
-          flags.pop_back();
-        bool is64 = longs >= 1 || conv == 'p';  // %l.. and pointers are 8 bytes on this ABI
-        switch (conv) {
-          case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'c': {
-            uint64_t v = fetch(is64 ? 8 : 4);
-            std::string spec = "%" + flags + (is64 ? "ll" : "") + conv;
-            if (is64)
-              std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<unsigned long long>(v));
-            else if (conv == 'd' || conv == 'i' || conv == 'c')
-              std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<int>(v));
-            else
-              std::snprintf(buf, sizeof buf, spec.c_str(), static_cast<unsigned>(v));
-            out += buf;
-            break;
-          }
-          case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
-            uint64_t v = fetch(8);
-            std::string spec = "%" + flags + conv;
-            std::snprintf(buf, sizeof buf, spec.c_str(), f64(v));
-            out += buf;
-            break;
-          }
-          case 'p': {
-            uint64_t v = fetch(8);
-            std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
-            out += buf;
-            break;
-          }
-          case 's': {
-            uint64_t v = fetch(8);
-            out += read_cstring(w, ctx, ins, lane, v);
-            break;
-          }
-          default:
+        while (i < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[i]))) spec += fmt[i++];
+        if (i < fmt.size() && fmt[i] == '.') {
+          spec += fmt[i++];
+          if (i < fmt.size() && fmt[i] == '*')
             ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
-                     std::string("printf conversion '%") + conv + "' is not implemented");
+                     "printf's `*` precision: an RTX 3060 prints the value as 0 and misreads every "
+                     "argument after it, so it is not imitated");
+          while (i < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[i]))) spec += fmt[i++];
+        }
+        // Length: hh and h narrow an int, l, ll, z, j and t make it 8 bytes.
+        int narrow = 0;          // how many h's
+        bool wide = false, long_double = false, lflag = false;
+        while (i < fmt.size() && std::string("hlzjtL").find(fmt[i]) != std::string::npos) {
+          const char c = fmt[i++];
+          if (c == 'h') ++narrow;
+          else if (c == 'L') long_double = true;
+          else {
+            wide = true;
+            if (c == 'l') lflag = true;
+          }
+        }
+        if (i >= fmt.size())
+          ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue, "printf format ends inside a % specifier");
+        const char conv = fmt[i];
+        if (narrow >= 2)
+          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                   "printf's hh length: an RTX 3060 reads the value from the wrong bytes (the format "
+                   "text's), so it is not imitated");
+        switch (conv) {
+          case '%':
+            out += '%';   // "%5%" too
+            break;
+          case 'd': case 'i': {
+            const uint64_t v = fetch(wide ? 8 : 4);
+            const std::string sp = spec + "lld";
+            const long long x = wide     ? static_cast<long long>(v)
+                                : narrow ? static_cast<short>(v)
+                                         : static_cast<int32_t>(v);
+            format(sp, x);
+            break;
+          }
+          case 'u': case 'o': case 'x': case 'X': {
+            const uint64_t v = fetch(wide ? 8 : 4);
+            const std::string sp = spec + "ll" + conv;
+            const unsigned long long x = wide     ? v
+                                         : narrow ? static_cast<unsigned short>(v)
+                                                  : static_cast<uint32_t>(v);
+            format(sp, x);
+            break;
+          }
+          case 'c':
+            format(spec + 'c', static_cast<int>(static_cast<unsigned char>(fetch(4))));
+            break;
+          case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
+            if (long_double)
+              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                       "printf's %L: long double is not a device type, and an RTX 3060 prints nan and "
+                       "misreads the arguments after it");
+            format(spec + conv, f64(fetch(8)));
+            break;
+          }
+          case 'p':
+            format(spec + 'p', reinterpret_cast<void*>(static_cast<uintptr_t>(fetch(8))));
+            break;
+          case 's': {
+            const uint64_t v = fetch(8);
+            if (v == 0) {
+              format(spec + 's', "(null)");
+            } else if (lflag) {
+              ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                       "printf's %ls with a wide string is not implemented");
+            } else {
+              const std::string str = read_cstring(w, ctx, ins, lane, v);
+              format(spec + 's', str.c_str());
+            }
+            break;
+          }
+          case 'n':
+            ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx, "printf's %n is not implemented");
+          default:
+            // Not a conversion: the card prints it as written and moves on.
+            out.append(fmt, start, i - start + 1);
         }
       }
       // One lock for the whole line: blocks run on several threads, and

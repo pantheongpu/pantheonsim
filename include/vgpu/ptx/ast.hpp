@@ -238,7 +238,9 @@ struct OpGetCtaRank { bool generic = false; Reg dst; Operand src; };
 
 // Warp shuffle. `pred_dst` is the optional "d|p" second destination.
 enum class ShflMode { Up, Down, Bfly, Idx };
-struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; };
+// has_members is false for the pre-Volta form without .sync, which takes no
+// member mask and shuffles among the lanes that happen to be active.
+struct OpShfl { ShflMode mode; Reg dst; Reg pred_dst; Operand a, b, c, member_mask; bool has_members = true; };
 // Warp vote/ballot across the active mask.
 enum class VoteMode { All, Any, Uni, Ballot };
 struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg src; bool negate_src = false;
@@ -1201,6 +1203,10 @@ struct GlobalVar {
   uint32_t align = 1;
   uint64_t size = 0;
   std::vector<uint8_t> init;  // empty or size bytes
+  // ".attribute(.managed)": a __managed__ variable. The module gives it device
+  // memory like any other global; the runtime, which registers the variable
+  // with the host, moves it to memory the host shares (Device::rebind_global).
+  bool managed = false;
   // A pointer-valued global can be initialised with another symbol's address
   // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
   // table of function pointers is exactly that. Addresses are not known until

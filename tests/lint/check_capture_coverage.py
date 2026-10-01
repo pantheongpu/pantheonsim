@@ -42,6 +42,8 @@ EXEMPT = {
     # Managed memory has one physical copy here, so a prefetch moves nothing and
     # there is nothing for a replay to repeat.
     "cudaMemPrefetchAsync": "managed memory has one copy; nothing to replay",
+    # Nor does attaching it to a stream: it only checks its arguments.
+    "cudaStreamAttachMemAsync": "managed memory has one copy; attaching moves nothing to replay",
     # There is no device to stage a graph onto; uploading does nothing either way.
     "cudaGraphUpload": "nothing to upload, captured or not",
 }

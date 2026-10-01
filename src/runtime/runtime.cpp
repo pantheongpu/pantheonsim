@@ -421,6 +421,26 @@ const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t addr) {
+  for (auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    const auto it = lm.symbols.find(name);
+    if (it == lm.symbols.end() || !lm.mod)
+      throw Error::make(Err::NotFound, "module ", module_id, " has no global '", name, "'");
+    it->second = addr;
+    // A global initialised with this one's address now holds the new one.
+    for (const auto& g : lm.mod->globals)
+      for (const auto& si : g.init_symbols)
+        if (si.name == name) {
+          const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
+          const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
+          if (bytes) mem_.write(lm.symbols.at(g.name) + si.offset, &addr, bytes);
+        }
+    return;
+  }
+  throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+}
+
 bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id) continue;

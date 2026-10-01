@@ -33,6 +33,7 @@ typedef enum cudaError_enum {
   CUDA_ERROR_INVALID_DEVICE = 101,
   CUDA_ERROR_INVALID_IMAGE = 200,
   CUDA_ERROR_INVALID_CONTEXT = 201,
+  CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217,
   CUDA_ERROR_FILE_NOT_FOUND = 301,
   CUDA_ERROR_INVALID_HANDLE = 400,
   CUDA_ERROR_ECC_UNCORRECTABLE = 214,
@@ -45,6 +46,11 @@ typedef enum cudaError_enum {
   CUDA_ERROR_LAUNCH_FAILED = 719,
   CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES = 701,
   CUDA_ERROR_LAUNCH_TIMEOUT = 702,
+  CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704,
+  CUDA_ERROR_PEER_ACCESS_NOT_ENABLED = 705,
+  CUDA_ERROR_CONTEXT_IS_DESTROYED = 709,
+  CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED = 712,
+  CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 713,
   CUDA_ERROR_NOT_SUPPORTED = 801,
   CUDA_ERROR_UNKNOWN = 999,
 } CUresult;
@@ -150,6 +156,40 @@ typedef struct CUDA_MEMCPY3D_st {
   size_t Depth;
 } CUDA_MEMCPY3D;
 typedef struct CUevent_st* CUevent;
+
+/* Mipmapped arrays, and the texture and surface references that predate
+ * texture objects (deprecated, still declared by CUDA 13's cuda.h). */
+typedef struct CUmipmappedArray_st* CUmipmappedArray;
+typedef struct CUtexref_st* CUtexref;
+typedef struct CUsurfref_st* CUsurfref;
+typedef struct CUgraphicsResource_st* CUgraphicsResource;
+typedef struct CUdevprop_st {
+  int maxThreadsPerBlock;
+  int maxThreadsDim[3];
+  int maxGridSize[3];
+  int sharedMemPerBlock;
+  int totalConstantMemory;
+  int SIMDWidth;
+  int memPitch;
+  int regsPerBlock;
+  int clockRate;
+  int textureAlign;
+} CUdevprop;
+/* cuOccupancyMaxPotentialBlockSize's per-block dynamic shared memory callback. */
+typedef size_t (*CUoccupancyB2DSize)(int blockSize);
+#define CU_MEMHOSTALLOC_PORTABLE 0x01
+#define CU_MEMHOSTALLOC_DEVICEMAP 0x02
+#define CU_MEMHOSTALLOC_WRITECOMBINED 0x04
+#define CU_MEMHOSTREGISTER_PORTABLE 0x01
+#define CU_MEMHOSTREGISTER_DEVICEMAP 0x02
+#define CU_MEMHOSTREGISTER_IOMEMORY 0x04
+#define CU_MEMHOSTREGISTER_READ_ONLY 0x08
+#define CU_TRSA_OVERRIDE_FORMAT 0x01
+#define CU_TRSF_READ_AS_INTEGER 0x01
+#define CU_TRSF_NORMALIZED_COORDINATES 0x02
+#define CU_TRSF_SRGB 0x10
+#define CU_TRSF_DISABLE_TRILINEAR_OPTIMIZATION 0x20
+#define CU_TRSF_SEAMLESS_CUBEMAP 0x40
 
 typedef enum CUdevice_attribute_enum {
   CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1,
