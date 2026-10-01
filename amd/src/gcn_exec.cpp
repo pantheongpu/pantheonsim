@@ -4763,6 +4763,20 @@ struct Machine {
     } else {
       throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
     }
+    // Lanes of one load that read the same address read it once, as the card
+    // reads it in one transaction: the compiler counts on a wave-uniform
+    // address giving every lane the same value (it branches the whole wave
+    // on it), and lane by lane, another work-group's store landing between
+    // two lanes gave them different ones -- unsafeAtomicMax's compare-and-
+    // swap loop then left lanes that never swapped holding the old value.
+    uint64_t memo_addr = 0;
+    bool memo = false;
+    uint32_t memo_words[kMaxWords];
+    uint64_t memo_value = 0;
+    const auto load_once = [&](uint64_t addr, uint32_t bytes) {
+      if (!memo || memo_addr != addr) memo_value = load(addr, bytes), memo_addr = addr, memo = true;
+      return memo_value;
+    };
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
@@ -4773,14 +4787,16 @@ struct Machine {
       switch (kind) {
         case Kind::Narrow:
           if (narrow_store) store(addr, n.bytes, lane_src(w, in.src[1], lane));
-          else write_lane(w, in.dst[0], lane, widen(load(addr, n.bytes), n));
+          else write_lane(w, in.dst[0], lane, widen(load_once(addr, n.bytes), n));
           break;
         case Kind::Load: {
           // One word, or two, or four: a register each, in order.
-          uint32_t words[kMaxWords];
           if (in.dst[0].width > kMaxWords) throw Error::make(Err::Unsupported, "memory instruction ", op, " moves more than 16 words");
-          load_words(addr, in.dst[0].width, words);
-          for (uint32_t k = 0; k < in.dst[0].width; ++k) set_word(w, in.dst[0], k, lane, words[k]);
+          if (!memo || memo_addr != addr) {
+            load_words(addr, in.dst[0].width, memo_words);
+            memo_addr = addr, memo = true;
+          }
+          for (uint32_t k = 0; k < in.dst[0].width; ++k) set_word(w, in.dst[0], k, lane, memo_words[k]);
           break;
         }
         case Kind::Store: {
@@ -4795,7 +4811,7 @@ struct Machine {
           break;
         case Kind::HalfReg:
           if (half.store) store(addr, half.bytes, half_store(lane_src(w, in.src[1], lane), half));
-          else write_half_load(w, in, in.dst[0], lane, half_load(load(addr, half.bytes), half), half);
+          else write_half_load(w, in, in.dst[0], lane, half_load(load_once(addr, half.bytes), half), half);
           break;
         case Kind::Atomic: {
           // Lane by lane, which is what makes these atomic within a wave:
