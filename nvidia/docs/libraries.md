@@ -40,6 +40,7 @@ which is the honest meaning of "the same image".
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the 64-bit X API, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
+| cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
 | nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |
