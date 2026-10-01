@@ -177,6 +177,18 @@ class Runner {
     local_size_ = std::max<uint32_t>({k.min_stack, k.frame_size, 16,
                                       static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
     local_size_ = (local_size_ + 15) & ~15u;
+    shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
+    // From compute capability 8.0 the driver reserves 1 KiB of shared memory
+    // behind every block's own, which it rounds to its 128-byte allocation
+    // unit (cooperative_groups keeps the scratch of multi-warp tiles there).
+    // SR_SMEMSZ is the whole allocation, and the reserved region's begin is
+    // SR_SMEMSZ less the reserved size the constant bank holds.
+    if (const uint32_t r = profile_.reserved_smem_per_block()) {
+      kernel_shared_ = (shared_size_ + 127) / 128 * 128;
+      shared_size_ = kernel_shared_ + r;
+    } else {
+      kernel_shared_ = shared_size_;
+    }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -188,7 +200,6 @@ class Runner {
     }
     const auto it = m.code_index.find(k.text_section);
     entry_ = m.code[it->second].base;
-    shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
   }
 
   exec::LaunchStats run();
@@ -267,6 +278,7 @@ class Runner {
   uint64_t coop_ws_ = 0;
   uint32_t local_size_ = 0;
   uint64_t shared_size_ = 0;
+  uint64_t kernel_shared_ = 0;   // the block's own shared memory, rounded (see shared_size_)
   uint32_t block_threads_ = 0;
   // Thread-block clusters: the shape (1x1x1 without one), its size, and
   // whether the launch has clusters at all (any dimension over 1, as the PTX
@@ -316,6 +328,17 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
     put32(nctaid + 4 * i, cfg_.grid[i]);
   }
   if (sm < 90) put64(0x18, kSharedWindow);
+  // The reserved shared memory (see shared_size_): its size, which ptxas
+  // subtracts from SR_SMEMSZ for %reserved_smem_offset_begin, and before
+  // sm_90 %reserved_smem_offset_end (the 0x120 bytes the driver uses past
+  // the begin, as an RTX 3060 reports) and _1, the start of what is left.
+  if (const uint32_t r = profile_.reserved_smem_per_block()) {
+    put32(sm >= 100 ? 0x16c : 0x114, r);
+    if (sm < 90) {
+      put32(0x120, static_cast<uint32_t>(kernel_shared_ + 0x120));
+      put32(0x124, static_cast<uint32_t>(kernel_shared_));
+    }
+  }
   // Where the non-global windows start (a pointer at or past it is not
   // global), and the parameter window: bank 0's own address before sm_90,
   // the parameters' from it.

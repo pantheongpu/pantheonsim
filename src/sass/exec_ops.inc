@@ -333,9 +333,13 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                            : static_cast<uint64_t>(sgn ? static_cast<int64_t>(static_cast<int32_t>(ival(w, ins.src[2], l)))
                                                        : ival(w, ins.src[2], l));
           if (ins.src[2].neg && (ins.src[2].kind == Kind::Reg || ins.src[2].kind == Kind::UReg)) c = 0 - c;
-          const unsigned __int128 full = ((static_cast<unsigned __int128>(prod) + c) >> 32) + cin;
-          write32(w, ins.dst[0], l, static_cast<uint32_t>(full));
-          if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, (full >> 32) != 0);
+          // .X's carry comes in at bit 0 of the 64-bit sum, not into the
+          // high word: hi(a*b + c + carry) (mad.hi.u64's last step is
+          // IMAD.HI.U32.X, which was one too high when the low half did not
+          // carry).
+          const unsigned __int128 sum = static_cast<unsigned __int128>(prod) + c + cin;
+          write32(w, ins.dst[0], l, static_cast<uint32_t>(sum >> 32));
+          if (ins.dst.size() > 1) set_pred(w, ins.dst[1], l, (sum >> 64) != 0);
         } else {
           const uint32_t c = ival(w, ins.src[2], l);
           const uint64_t full = static_cast<uint64_t>(a * b) + c + cin;
@@ -926,7 +930,9 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         }
         if (fz) r = ftz(r);
         if (st) r = sat(r);
-        write32(w, ins.dst[0], l, f32_bits(r));
+        // A NaN result is the card's canonical one, whatever made it (inf *
+        // 0 here is 0xffc00000 on the host), as the PTX engine's canon32.
+        write32(w, ins.dst[0], l, r != r ? 0x7fffffffu : f32_bits(r));
       });
       return;
     }
@@ -1192,8 +1198,9 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
           write32(w, ins.dst[0], l, f32_bits(f));
           return;
         }
+        // A NaN result is the canonical 0x7fff, as the PTX engine writes it.
         uint16_t h[2];
-        for (int i = 0; i < 2; ++i) h[i] = bf ? f64_to_bf16(r[i]) : f64_to_half(r[i]);
+        for (int i = 0; i < 2; ++i) h[i] = r[i] != r[i] ? uint16_t{0x7fff} : bf ? f64_to_bf16(r[i]) : f64_to_half(r[i]);
         write32(w, ins.dst[0], l, h[0] | (static_cast<uint32_t>(h[1]) << 16));
       });
       return;
@@ -1665,17 +1672,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (old == cmp) nw = swap;
         } else {
           switch (popc_inc ? 3 : ins.f[0]) {
-            case 0:   // ADD
-              if (type == 3) nw = f32_bits(as_f32(static_cast<uint32_t>(old)) + as_f32(static_cast<uint32_t>(v)));
-              else if (type == 6) nw = f64_bits(as_f64(old) + as_f64(v));
-              else if (type == 4) {
-                const uint16_t lo = f32_to_half(half_to_f32(static_cast<uint16_t>(old)) + half_to_f32(static_cast<uint16_t>(v)));
-                const uint16_t hi = f32_to_half(half_to_f32(static_cast<uint16_t>(old >> 16)) + half_to_f32(static_cast<uint16_t>(v >> 16)));
-                nw = lo | (static_cast<uint32_t>(hi) << 16);
-              } else if (type == 7) {   // BF16x2
-                const uint16_t lo = f32_to_bf16(bf16_to_f32(static_cast<uint16_t>(old)) + bf16_to_f32(static_cast<uint16_t>(v)));
-                const uint16_t hi = f32_to_bf16(bf16_to_f32(static_cast<uint16_t>(old >> 16)) + bf16_to_f32(static_cast<uint16_t>(v >> 16)));
-                nw = lo | (static_cast<uint32_t>(hi) << 16);
+            case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
+              if (type == 3) {
+                // .ftz on inputs and result; a NaN result is the canonical one.
+                const auto fz = [](float x) { return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
+                const float r = fz(fz(as_f32(static_cast<uint32_t>(old))) + fz(as_f32(static_cast<uint32_t>(v))));
+                nw = r != r ? 0x7fffffffu : f32_bits(r);
+              } else if (type == 6) {
+                // A NaN comes through as it is: the one added, else the one in memory.
+                const double x = as_f64(old), y = as_f64(v);
+                nw = std::isnan(y) ? v : std::isnan(x) ? old : f64_bits(x + y);
+              } else if (type == 4 || type == 7) {   // F16x2, BF16x2: each half added once in double
+                const ptx::Type ht{type == 7 ? ptx::Type::Kind::BF : ptx::Type::Kind::F, 16};
+                const uint64_t lo = exec::reduce_value(ptx::AtomOp::Add, ht, old & 0xffff, v & 0xffff);
+                const uint64_t hi = exec::reduce_value(ptx::AtomOp::Add, ht, (old >> 16) & 0xffff, (v >> 16) & 0xffff);
+                nw = lo | (hi << 16);
               } else nw = old + v;
               break;
             case 1:   // MIN
@@ -2501,7 +2512,31 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       }
       each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
       return true;
-    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::ERRBAR: case Op::CCTL: case Op::NANOSLEEP:
+    case Op::CCTL:
+      if (ins.f[7] == 0xaa) {
+        // QSPC.{G,L,S,D} Pd, Rd, [addr] (isspacep): whether a generic address
+        // is in that space's window -- D, a cluster's shared memory, being
+        // the shared window with the CTA's rank above bit 24. The address is
+        // a register (pair with .E), a uniform register (pair), or both.
+        const unsigned urz = m_.sm >= 100 ? 255u : 63u;
+        const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+        const bool wide = ins.w.bit(72);
+        const unsigned ub = m_.sm >= 100 ? 8 : 6;
+        const unsigned u = ins.w.bit(11) ? static_cast<unsigned>(ins.w.field(32, ub)) : urz;
+        each_lane(ex, [&](unsigned l) {
+          uint64_t a = 0;
+          if (ra != kRZ) a = wide ? (w.reg(ra, l) | (static_cast<uint64_t>(w.reg(ra + 1, l)) << 32)) : w.reg(ra, l);
+          if (u != urz) a += wide ? (w.ur[u] | (static_cast<uint64_t>(w.ur[u + 1]) << 32)) : w.ur[u];
+          a += static_cast<uint64_t>(ins.src[0].imm);
+          uint64_t off;
+          const Space sp = classify(a, &off);
+          const bool in = ins.f[0] == 0 ? sp == Space::Global : ins.f[0] == 1 ? sp == Space::Local : sp == Space::Shared;
+          set_pred(w, ins.dst[0], l, in);
+          if (ins.dst.size() > 1 && ins.dst[1].reg != kRZ) write32(w, ins.dst[1], l, in ? static_cast<uint32_t>(off) : 0);
+        });
+      }
+      return false;
+    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::ERRBAR: case Op::NANOSLEEP:
     case Op::ENDCOLLECTIVE:
       return false;
     case Op::YIELD:
@@ -2590,9 +2625,19 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       return true;
     }
     case Op::RET:
+      // The return address is a register pair: a section-relative offset
+      // (MOV R20, 0xd0 before a CALL.REL inside one section), or an absolute
+      // code address a relocation wrote (a -G build, where every function
+      // has its own section and the caller passes its own address plus the
+      // return point's offset).
       each_lane(group, [&](unsigned l) {
-        if ((ex >> l) & 1) w.pc[l] = base_of(l) + w.reg(ins.src[0].reg, l);
-        else w.pc[l] += 16;
+        if (!((ex >> l) & 1)) {
+          w.pc[l] += 16;
+          return;
+        }
+        const unsigned r = ins.src[0].reg;
+        const uint32_t lo = w.reg(r, l), hi = r + 1 < w.nregs ? w.reg(r + 1, l) : 0;
+        w.pc[l] = hi == static_cast<uint32_t>(kCodeBase >> 32) ? (uint64_t{hi} << 32 | lo) : base_of(l) + lo;
       });
       return true;
     case Op::EXIT: {

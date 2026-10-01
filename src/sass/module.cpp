@@ -151,12 +151,12 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     // 12.0's ptxas writes for addresses CUDA 13's loads from bank 4: the low
     // (56) or high (57) half of one in a MOV's 32-bit immediate, and a
     // CALL.ABS.NOINC's target, 49 bits at 32 (58), or from sm_90 in 4-byte
-    // units at 16-23 and 34-80 (75). A function's own code is
-    // addressed relative to its section (nvdisasm's @srel), as RET takes its
-    // return address. Any other kind is refused by name rather than left
-    // unpatched.
+    // units at 16-23 and 34-80 (75). Code addresses are absolute (see RET).
+    // Any other kind is refused by name rather than left
+    // unpatched. The debug sections a -G build carries (.debug_line,
+    // .debug_frame, ...) are never loaded, so their relocations do not matter.
     for (CubinSection& s : m->cubin.sections) {
-      if (s.relocs.empty() || s.name == ".debug_frame") continue;
+      if (s.relocs.empty() || s.name.rfind(".debug_", 0) == 0 || s.name.rfind(".nv_debug", 0) == 0) continue;
       const bool code = m->code_index.count(s.name) != 0;
       const auto dst = section_va.find(s.name);
       if (!code && dst == section_va.end())
@@ -179,8 +179,11 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         uint64_t hi, lo;
         std::memcpy(&lo, &s.bytes[r.offset], 8);
         std::memcpy(&hi, &s.bytes[r.offset + 8], 8);
-        const bool call = r.type == 58 || r.type == 75;
-        const uint64_t value = (in_code && !call ? code_off : target) + static_cast<uint64_t>(r.addend);
+        // A code address is written absolute: a -G build returns across
+        // sections (each function in its own) through MOV'd addresses of
+        // the caller plus an offset, which RET then takes as they are.
+        const uint64_t value = target + static_cast<uint64_t>(r.addend);
+        (void)code_off;
         if (r.type == 58) {          // bits 32-80
           lo = (lo & 0xffffffffull) | (value << 32);
           hi = (hi & ~uint64_t{0x1ffff}) | ((value >> 32) & 0x1ffff);
