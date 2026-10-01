@@ -89,7 +89,7 @@ void store(void* dev, const std::vector<T>& host) {
 // the handle's pointer mode. Getting this wrong silently corrupts results.
 template <class T>
 T scalar(cublasHandle_t h, const T* p) {
-  if (!p) return T(0);
+  if (!p) return T{};
   Handle* hh = reinterpret_cast<Handle*>(h);
   if (hh && hh->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) return fetch<T>(p, 1)[0];
   return *p;
@@ -225,6 +225,11 @@ bool load_as_float(const void* dev, size_t n, cudaDataType t, std::vector<float>
       for (size_t i = 0; i < n; ++i) (*out)[i] = __bfloat162float(raw[i]);
       return true;
     }
+    case CUDA_R_8I: {
+      auto raw = fetch<int8_t>(dev, n);
+      for (size_t i = 0; i < n; ++i) (*out)[i] = raw[i];
+      return true;
+    }
     default: return false;
   }
 }
@@ -253,15 +258,12 @@ bool store_from_float(void* dev, const std::vector<float>& host, cudaDataType t)
 size_t type_bytes(cudaDataType t) {
   switch (t) {
     case CUDA_R_8I: return 1;
-    case CUDA_R_16F: case CUDA_R_16BF: return 2;
+    case CUDA_R_16F: case CUDA_R_16BF: case CUDA_C_8I: return 2;
     case CUDA_R_32F: case CUDA_R_32I: return 4;
-    case CUDA_R_64F: return 8;
+    case CUDA_R_64F: case CUDA_C_32F: return 8;
+    case CUDA_C_64F: return 16;
     default: return 0;
   }
-}
-
-bool is_narrow_float(cudaDataType t) {
-  return t == CUDA_R_32F || t == CUDA_R_16F || t == CUDA_R_16BF;
 }
 
 // C = alpha * op(A) * op(B) + beta * C over already-widened host operands.
@@ -296,13 +298,29 @@ void gemm_int8(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
     }
 }
 
+// The arguments a GEMM refuses, as an RTX 3060's cuBLAS does: an unknown
+// operation, a negative size, or a leading dimension shorter than its
+// matrix's rows (and never below 1, even for an empty matrix).
+bool known_op(cublasOperation_t t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; }
+bool gemm_args_ok(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, int lda, int ldb, int ldc) {
+  return known_op(ta) && known_op(tb) && m >= 0 && n >= 0 && k >= 0 && lda >= std::max(1, ta == CUBLAS_OP_N ? m : k) &&
+         ldb >= std::max(1, tb == CUBLAS_OP_N ? k : n) && ldc >= std::max(1, m);
+}
+
+// A matrix whose pointer is not aligned to its element is refused by the
+// card's real GEMMs as NOT_SUPPORTED (an int8 C of GemmEx too).
+bool gemm_aligned(const void* A, const void* B, const void* C, size_t ab, size_t c) {
+  auto ok = [](const void* p, size_t e) { return reinterpret_cast<uintptr_t>(p) % e == 0; };
+  return ok(A, ab) && ok(B, ab) && ok(C, c);
+}
+
 template <class T, class Acc>
 cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
                        int m, int n, int k, const Acc* alpha_p, const void* A, int lda,
                        const void* B, int ldb, const Acc* beta_p, void* C, int ldc) {
   if (!valid(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (m < 0 || n < 0 || k < 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (lda < 1 || ldb < 1 || ldc < m) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!gemm_args_ok(transa, transb, m, n, k, lda, ldb, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!gemm_aligned(A, B, C, sizeof(T), sizeof(T))) return CUBLAS_STATUS_NOT_SUPPORTED;
   if (!alpha_p || !beta_p || (!A && k) || (!B && k) || !C) return CUBLAS_STATUS_INVALID_VALUE;
   Acc alpha = scalar(handle, alpha_p), beta = scalar(handle, beta_p);
   if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
@@ -1136,7 +1154,66 @@ VGPU_EXPORT cublasStatus_t cublasIdamax_v2_64(cublasHandle_t h, int64_t n, const
   return iamax(h, (int)n, x, (int)incx, result);
 }
 
-/* ---- anything not implemented says so, rather than returning wrong numbers ---- */
+/* ---- GemmEx ----
+   The type combinations an RTX 3060's cuBLAS takes, measured over every
+   combination of A, B and C type and compute type (anything else is
+   NOT_SUPPORTED; A and B are always one type):
+
+     A = B     C             compute
+     R_16F     R_16F         32F family, 16F, 16F_PEDANTIC
+     R_16F     R_32F         32F family
+     R_16BF    R_16BF, R_32F 32F family
+     R_32F     R_32F         32F family
+     R_64F     R_64F         64F, 64F_PEDANTIC
+     C_32F     C_32F         32F family
+     C_64F     C_64F         64F, 64F_PEDANTIC
+     R_8I      R_32F         32F family
+     R_8I      R_32I         32I, 32I_PEDANTIC
+     C_8I      C_32F         32F family
+
+   (the 32F family: 32F, 32F_PEDANTIC and the FAST_16F, FAST_16BF and
+   FAST_TF32 forms, all computed here in single precision). The int8 path with
+   an int32 result takes only what cuBLAS documents for it: lda and ldb
+   multiples of 4, A and B 4-byte aligned and op(B) = N; anything else is
+   NOT_SUPPORTED, as is a real matrix not aligned to its element. A bad handle is reported before a bad type, and a bad type
+   before a bad argument, in that order on the card too. */
+namespace {
+
+bool compute_32f(cublasComputeType_t ct) {
+  return ct == CUBLAS_COMPUTE_32F || ct == CUBLAS_COMPUTE_32F_PEDANTIC || ct == CUBLAS_COMPUTE_32F_FAST_16F ||
+         ct == CUBLAS_COMPUTE_32F_FAST_16BF || ct == CUBLAS_COMPUTE_32F_FAST_TF32;
+}
+bool compute_64f(cublasComputeType_t ct) { return ct == CUBLAS_COMPUTE_64F || ct == CUBLAS_COMPUTE_64F_PEDANTIC; }
+bool compute_16f(cublasComputeType_t ct) { return ct == CUBLAS_COMPUTE_16F || ct == CUBLAS_COMPUTE_16F_PEDANTIC; }
+bool compute_32i(cublasComputeType_t ct) { return ct == CUBLAS_COMPUTE_32I || ct == CUBLAS_COMPUTE_32I_PEDANTIC; }
+
+bool gemm_ex_supported(cudaDataType a, cudaDataType b, cudaDataType c, cublasComputeType_t ct) {
+  if (a != b) return false;
+  switch (a) {
+    case CUDA_R_16F: return (c == CUDA_R_16F && (compute_32f(ct) || compute_16f(ct))) || (c == CUDA_R_32F && compute_32f(ct));
+    case CUDA_R_16BF: return (c == CUDA_R_16BF || c == CUDA_R_32F) && compute_32f(ct);
+    case CUDA_R_32F: return c == CUDA_R_32F && compute_32f(ct);
+    case CUDA_R_64F: return c == CUDA_R_64F && compute_64f(ct);
+    case CUDA_C_32F: return c == CUDA_C_32F && compute_32f(ct);
+    case CUDA_C_64F: return c == CUDA_C_64F && compute_64f(ct);
+    case CUDA_R_8I: return (c == CUDA_R_32F && compute_32f(ct)) || (c == CUDA_R_32I && compute_32i(ct));
+    case CUDA_C_8I: return c == CUDA_C_32F && compute_32f(ct);
+    default: return false;
+  }
+}
+
+// alpha and beta are typed by the compute type, and are complex when C is.
+size_t gemm_scalar_bytes(cublasComputeType_t ct, cudaDataType c) {
+  return compute_scalar_bytes(ct) * (c == CUDA_C_32F || c == CUDA_C_64F ? 2 : 1);
+}
+
+// The complex forms, written with the rest of the complex routines (after
+// cublas_complex.inc) whose machinery they use.
+cublasStatus_t gemm_ex_complex(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                               const void* alpha, const void* A, cudaDataType Atype, int lda, const void* B, int ldb,
+                               const void* beta, void* C, cudaDataType Ctype, int ldc);
+
+}  // namespace
 
 VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
                                         cublasOperation_t tb, int m, int n, int k,
@@ -1144,65 +1221,40 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
                                         int lda, const void* B, cudaDataType Btype, int ldb,
                                         const void* beta, void* C, cudaDataType Ctype, int ldc,
                                         cublasComputeType_t computeType, cublasGemmAlgo_t algo) {
-  if (deferred_to_graph(h, [=, al = hold(h, alpha, compute_scalar_bytes(computeType)),
-                            be = hold(h, beta, compute_scalar_bytes(computeType))] {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!gemm_ex_supported(Atype, Btype, Ctype, computeType)) {
+    if (trace())
+      std::fprintf(stderr,
+                   "[vgpu] cublasGemmEx: unsupported type combination (A=%d B=%d C=%d compute=%d)\n",
+                   (int)Atype, (int)Btype, (int)Ctype, (int)computeType);
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  if (!gemm_args_ok(ta, tb, m, n, k, lda, ldb, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (Ctype != CUDA_C_32F && Ctype != CUDA_C_64F && !gemm_aligned(A, B, C, type_bytes(Atype), type_bytes(Ctype)))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (compute_32i(computeType) &&
+      (lda % 4 || ldb % 4 || reinterpret_cast<uintptr_t>(A) % 4 || reinterpret_cast<uintptr_t>(B) % 4 ||
+       tb != CUBLAS_OP_N))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (deferred_to_graph(h, [=, al = hold(h, alpha, gemm_scalar_bytes(computeType, Ctype)),
+                            be = hold(h, beta, gemm_scalar_bytes(computeType, Ctype))] {
         cublasGemmEx(h, ta, tb, m, n, k, al.get(), A, Atype, lda, B, Btype, ldb, be.get(), C,
                      Ctype, ldc, computeType, algo);
       }))
     return CUBLAS_STATUS_SUCCESS;
-  // Only the all-fp32 and all-fp64 forms are implemented; mixed precision
-  // needs the f16/bf16 conversion paths and is not silently approximated.
-  if (Atype == CUDA_R_32F && Btype == CUDA_R_32F && Ctype == CUDA_R_32F)
+  if (Atype == CUDA_R_32F)
     return do_gemm<float, float>(h, ta, tb, m, n, k, static_cast<const float*>(alpha), A, lda, B,
                                  ldb, static_cast<const float*>(beta), C, ldc);
-  if (Atype == CUDA_R_64F && Btype == CUDA_R_64F && Ctype == CUDA_R_64F)
+  if (Atype == CUDA_R_64F)
     return do_gemm<double, double>(h, ta, tb, m, n, k, static_cast<const double*>(alpha), A, lda, B,
                                    ldb, static_cast<const double*>(beta), C, ldc);
-  // Mixed precision: half or bfloat16 operands accumulated in float, which is
-  // what a tensor core does under CUBLAS_COMPUTE_32F. C may be narrower than
-  // the accumulator, so it is rounded once on the way out.
-  if (is_narrow_float(Atype) && is_narrow_float(Btype) && is_narrow_float(Ctype) &&
-      computeType != CUBLAS_COMPUTE_32I && computeType != CUBLAS_COMPUTE_64F) {
-    if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-    if (m < 0 || n < 0 || k < 0 || lda < 1 || ldb < 1 || ldc < m)
-      return CUBLAS_STATUS_INVALID_VALUE;
-    if (!alpha || !beta || !C) return CUBLAS_STATUS_INVALID_VALUE;
-    if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
-    // alpha and beta are float here whatever the operand types, except under
-    // CUBLAS_COMPUTE_16F where the API says they are half.
-    float a, b;
-    if (computeType == CUBLAS_COMPUTE_16F || computeType == CUBLAS_COMPUTE_16F_PEDANTIC) {
-      auto widen = [&](const void* p) {
-        __half v;
-        if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
-          v = fetch<__half>(p, 1)[0];
-        else
-          v = *static_cast<const __half*>(p);
-        return __half2float(v);
-      };
-      a = widen(alpha);
-      b = widen(beta);
-    } else {
-      a = scalar(h, static_cast<const float*>(alpha));
-      b = scalar(h, static_cast<const float*>(beta));
-    }
-    std::vector<float> hA, hB, hC;
-    if (!load_as_float(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k), Atype, &hA) ||
-        !load_as_float(B, tb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n), Btype, &hB) ||
-        !load_as_float(C, extent(ldc, n, m), Ctype, &hC))
-      return CUBLAS_STATUS_NOT_SUPPORTED;
-    gemm_float(ta, tb, m, n, k, a, hA, lda, hB, ldb, b, hC, ldc);
-    return store_from_float(C, hC, Ctype) ? CUBLAS_STATUS_SUCCESS
-                                          : CUBLAS_STATUS_NOT_SUPPORTED;
-  }
+  if (Ctype == CUDA_C_32F || Ctype == CUDA_C_64F)
+    return gemm_ex_complex(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, ldb, beta, C, Ctype, ldc);
+  if (!alpha || !beta || !C) return CUBLAS_STATUS_INVALID_VALUE;
+  if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
 
   // The quantized path: int8 operands, int32 accumulator and output.
-  if (Atype == CUDA_R_8I && Btype == CUDA_R_8I && Ctype == CUDA_R_32I) {
-    if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-    if (m < 0 || n < 0 || k < 0 || lda < 1 || ldb < 1 || ldc < m)
-      return CUBLAS_STATUS_INVALID_VALUE;
-    if (!alpha || !beta || !C) return CUBLAS_STATUS_INVALID_VALUE;
-    if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+  if (Ctype == CUDA_R_32I) {
     const int32_t a = scalar(h, static_cast<const int32_t*>(alpha));
     const int32_t b = scalar(h, static_cast<const int32_t*>(beta));
     auto hA = fetch<int8_t>(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k));
@@ -1213,11 +1265,35 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
     return CUBLAS_STATUS_SUCCESS;
   }
 
-  if (trace())
-    std::fprintf(stderr,
-                 "[vgpu] cublasGemmEx: unsupported type combination (A=%d B=%d C=%d compute=%d)\n",
-                 (int)Atype, (int)Btype, (int)Ctype, (int)computeType);
-  return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Mixed precision: half, bfloat16 or int8 operands accumulated in float,
+  // which is what a tensor core does under CUBLAS_COMPUTE_32F. C may be
+  // narrower than the accumulator, so it is rounded once on the way out.
+  // alpha and beta are float here whatever the operand types, except under
+  // CUBLAS_COMPUTE_16F where the API says they are half.
+  float a, b;
+  if (compute_16f(computeType)) {
+    auto widen = [&](const void* p) {
+      __half v;
+      if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
+        v = fetch<__half>(p, 1)[0];
+      else
+        v = *static_cast<const __half*>(p);
+      return __half2float(v);
+    };
+    a = widen(alpha);
+    b = widen(beta);
+  } else {
+    a = scalar(h, static_cast<const float*>(alpha));
+    b = scalar(h, static_cast<const float*>(beta));
+  }
+  std::vector<float> hA, hB, hC;
+  if (!load_as_float(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k), Atype, &hA) ||
+      !load_as_float(B, tb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n), Btype, &hB) ||
+      !load_as_float(C, extent(ldc, n, m), Ctype, &hC))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  gemm_float(ta, tb, m, n, k, a, hA, lda, hB, ldb, b, hC, ldc);
+  return store_from_float(C, hC, Ctype) ? CUBLAS_STATUS_SUCCESS
+                                        : CUBLAS_STATUS_NOT_SUPPORTED;
 }
 
 VGPU_EXPORT cublasStatus_t cublasGemmStridedBatchedEx(
@@ -2160,3 +2236,137 @@ VGPU_EXPORT cublasStatus_t cublasDrotmg_v2(cublasHandle_t h, double* d1, double*
                                            double* param) {
   return rotmg_ex(h, d1, CUDA_R_64F, d2, CUDA_R_64F, x1, CUDA_R_64F, y1, CUDA_R_64F, param, CUDA_R_64F, CUDA_R_64F);
 }
+
+/* ---- the complex GEMM-family Ex routines, and SgemmEx ----
+   CgemmEx and Cgemm3mEx take A and B both C_32F or both C_8I (pairs of
+   int8), and C C_32F; CherkEx, Cherk3mEx, CsyrkEx and Csyrk3mEx the same A
+   and C C_32F. SgemmEx takes the real rows of GemmEx's table under
+   COMPUTE_32F. Those are the combinations an RTX 3060 accepts; anything else
+   is NOT_SUPPORTED. The 3m forms (Gauss's three-multiplication product) give
+   the same product as the others here, computed directly: on the card they
+   differ from it in the last bits, and are no more exact. The arithmetic is
+   the complex routines', in double and rounded to single at the end. */
+namespace {
+
+// A C_32F or C_8I matrix, as cd.
+CMat cex_mat(const void* p, cudaDataType t, int ld, int cols, int rows) {
+  if (t == CUDA_C_32F) return load_mat(static_cast<const cuComplex*>(p), ld, cols, rows);
+  const auto raw = fetch<int8_t>(p, 2 * extent(ld, cols, rows));
+  CMat m{std::vector<cd>((size_t)ld * std::max(cols, 0)), ld};
+  for (size_t i = 0; 2 * i < raw.size(); ++i) m.v[i] = cd(raw[2 * i], raw[2 * i + 1]);
+  return m;
+}
+bool cex_type(cudaDataType a, cudaDataType c) { return (a == CUDA_C_32F || a == CUDA_C_8I) && c == CUDA_C_32F; }
+
+cublasStatus_t gemm_ex_complex(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                               const void* alpha, const void* A, cudaDataType Atype, int lda, const void* B, int ldb,
+                               const void* beta, void* C, cudaDataType Ctype, int ldc) {
+  if (Ctype == CUDA_C_64F)
+    return cgemm<cuDoubleComplex>(h, ta, tb, m, n, k, static_cast<const cuDoubleComplex*>(alpha),
+                                  static_cast<const cuDoubleComplex*>(A), lda, static_cast<const cuDoubleComplex*>(B),
+                                  ldb, static_cast<const cuDoubleComplex*>(beta), static_cast<cuDoubleComplex*>(C), ldc);
+  if (Atype == CUDA_C_32F)
+    return cgemm<cuComplex>(h, ta, tb, m, n, k, static_cast<const cuComplex*>(alpha), static_cast<const cuComplex*>(A),
+                            lda, static_cast<const cuComplex*>(B), ldb, static_cast<const cuComplex*>(beta),
+                            static_cast<cuComplex*>(C), ldc);
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!gemm_args_ok(ta, tb, m, n, k, lda, ldb, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+  return run_c(h, alpha, beta, sizeof(cuComplex), [=](const void* al, const void* be) {
+    const auto oa = to_op(ta), ob = to_op(tb);
+    const CMat a = cex_mat(A, Atype, lda, oa == vgpu_la::Op::N ? k : m, oa == vgpu_la::Op::N ? m : k);
+    const CMat b = cex_mat(B, Atype, ldb, ob == vgpu_la::Op::N ? n : k, ob == vgpu_la::Op::N ? k : n);
+    CMat c = load_mat(static_cast<cuComplex*>(C), ldc, n, m);
+    cgemm_mat(oa, ob, m, n, k, cscalar(h, static_cast<const cuComplex*>(al)), a, b,
+              cscalar(h, static_cast<const cuComplex*>(be)), c);
+    store_mat(static_cast<cuComplex*>(C), c, n, m);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+cublasStatus_t cgemm_ex(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                        const cuComplex* alpha, const void* A, cudaDataType Atype, int lda, const void* B,
+                        cudaDataType Btype, int ldb, const cuComplex* beta, void* C, cudaDataType Ctype, int ldc) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!cex_type(Atype, Ctype) || Btype != Atype) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
+                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+// herk (alpha, beta float) and syrk (cuComplex) over a C_32F or C_8I A.
+template <class S>
+cublasStatus_t cherk_ex(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cublasOperation_t t, int n, int k,
+                        const S* alpha, const void* A, cudaDataType Atype, int lda, const S* beta, void* C,
+                        cudaDataType Ctype, int ldc) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!cex_type(Atype, Ctype)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (Atype == CUDA_C_32F)
+    return cherk<cuComplex, S>(h, hermitian, uplo, t, n, k, alpha, static_cast<const cuComplex*>(A), lda, beta,
+                               static_cast<cuComplex*>(C), ldc);
+  if (!herk_args_ok(uplo, t, n, k, lda, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (n == 0) return CUBLAS_STATUS_SUCCESS;
+  return run_c(h, alpha, beta, sizeof(S), [=](const void* al, const void* be) {
+    auto sc = [&](const void* p) -> cd {
+      if constexpr (std::is_same_v<S, cuComplex>) return cscalar(h, static_cast<const cuComplex*>(p));
+      else return p ? cd(scalar(h, static_cast<const float*>(p))) : cd(0);
+    };
+    const bool trans = t != CUBLAS_OP_N;
+    const CMat a = cex_mat(A, Atype, lda, trans ? n : k, trans ? k : n);
+    CMat c = load_mat(static_cast<cuComplex*>(C), ldc, n, n);
+    cherk_mat(hermitian, uplo == CUBLAS_FILL_MODE_LOWER, trans, n, k, sc(al), a, sc(be), c);
+    store_mat(static_cast<cuComplex*>(C), c, n, n);
+    return CUBLAS_STATUS_SUCCESS;
+  });
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasSgemmEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n,
+                                         int k, const float* alpha, const void* A, cudaDataType Atype, int lda,
+                                         const void* B, cudaDataType Btype, int ldb, const float* beta, void* C,
+                                         cudaDataType Ctype, int ldc) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (Ctype == CUDA_C_32F || Ctype == CUDA_C_64F || Ctype == CUDA_R_32I) return CUBLAS_STATUS_NOT_SUPPORTED;
+  return cublasGemmEx(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
+                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+#define VGPU_CGEMM_EX(NAME)                                                                                        \
+  VGPU_EXPORT cublasStatus_t NAME(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, \
+                                  const cuComplex* alpha, const void* A, cudaDataType Atype, int lda, const void* B, \
+                                  cudaDataType Btype, int ldb, const cuComplex* beta, void* C, cudaDataType Ctype,   \
+                                  int ldc) {                                                                         \
+    return cgemm_ex(h, ta, tb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc);                   \
+  }                                                                                                                  \
+  VGPU_EXPORT cublasStatus_t NAME##_64(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int64_t m,      \
+                                       int64_t n, int64_t k, const cuComplex* alpha, const void* A,                  \
+                                       cudaDataType Atype, int64_t lda, const void* B, cudaDataType Btype,           \
+                                       int64_t ldb, const cuComplex* beta, void* C, cudaDataType Ctype,              \
+                                       int64_t ldc) {                                                                \
+    for (int64_t v : {m, n, k, lda, ldb, ldc})                                                                       \
+      if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;                                                          \
+    return cgemm_ex(h, ta, tb, (int)m, (int)n, (int)k, alpha, A, Atype, (int)lda, B, Btype, (int)ldb, beta, C,       \
+                    Ctype, (int)ldc);                                                                                \
+  }
+VGPU_CGEMM_EX(cublasCgemmEx)
+VGPU_CGEMM_EX(cublasCgemm3mEx)
+#undef VGPU_CGEMM_EX
+
+#define VGPU_CHERK_EX(NAME, S, HERM)                                                                               \
+  VGPU_EXPORT cublasStatus_t NAME(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t t, int n, int k,        \
+                                  const S* alpha, const void* A, cudaDataType Atype, int lda, const S* beta, void* C, \
+                                  cudaDataType Ctype, int ldc) {                                                     \
+    return cherk_ex<S>(h, HERM, uplo, t, n, k, alpha, A, Atype, lda, beta, C, Ctype, ldc);                           \
+  }                                                                                                                  \
+  VGPU_EXPORT cublasStatus_t NAME##_64(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t t, int64_t n,      \
+                                       int64_t k, const S* alpha, const void* A, cudaDataType Atype, int64_t lda,    \
+                                       const S* beta, void* C, cudaDataType Ctype, int64_t ldc) {                    \
+    for (int64_t v : {n, k, lda, ldc})                                                                               \
+      if (!fits_int(v)) return CUBLAS_STATUS_NOT_SUPPORTED;                                                          \
+    return cherk_ex<S>(h, HERM, uplo, t, (int)n, (int)k, alpha, A, Atype, (int)lda, beta, C, Ctype, (int)ldc);       \
+  }
+VGPU_CHERK_EX(cublasCherkEx, float, true)
+VGPU_CHERK_EX(cublasCherk3mEx, float, true)
+VGPU_CHERK_EX(cublasCsyrkEx, cuComplex, false)
+VGPU_CHERK_EX(cublasCsyrk3mEx, cuComplex, false)
+#undef VGPU_CHERK_EX

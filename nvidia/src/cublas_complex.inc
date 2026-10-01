@@ -88,24 +88,32 @@ template <class T> void store_vec(T* x, int n, int inc, const std::vector<cd>& v
   store_c(x, raw);
 }
 
+// C = alpha op(A) op(B) + beta C over operands already on the host. C is
+// read even when beta is 0, so the padding between its columns is written
+// back as it was; its old values are then never used.
+void cgemm_mat(vgpu_la::Op oa, vgpu_la::Op ob, int m, int n, int k, cd alpha, const CMat& a, const CMat& b, cd beta,
+               CMat& c) {
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      cd s = 0;
+      for (int p = 0; p < k; ++p) s += opel(a, oa, i, p) * opel(b, ob, p, j);
+      c(i, j) = beta == cd(0) ? alpha * s : alpha * s + beta * c(i, j);
+    }
+}
+
 template <class T>
 cublasStatus_t cgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
                      const T* alpha, const T* A, int lda, const T* B, int ldb, const T* beta, T* C, int ldc) {
-  if (m < 0 || n < 0 || k < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!gemm_args_ok(ta, tb, m, n, k, lda, ldb, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
   return run_c(h, alpha, beta, sizeof(T), [=](const void* al, const void* be) {
     const cd a_ = cscalar(h, static_cast<const T*>(al)), b_ = cscalar(h, static_cast<const T*>(be));
     const auto oa = to_op(ta), ob = to_op(tb);
     const CMat a = load_mat(A, lda, oa == vgpu_la::Op::N ? k : m, oa == vgpu_la::Op::N ? m : k);
     const CMat b = load_mat(B, ldb, ob == vgpu_la::Op::N ? n : k, ob == vgpu_la::Op::N ? k : n);
-    // C is read even when beta is 0, so the padding between its columns is
-    // written back as it was; its old values are then never used.
     CMat c = load_mat(C, ldc, n, m);
-    for (int j = 0; j < n; ++j)
-      for (int i = 0; i < m; ++i) {
-        cd s = 0;
-        for (int p = 0; p < k; ++p) s += opel(a, oa, i, p) * opel(b, ob, p, j);
-        c(i, j) = b_ == cd(0) ? a_ * s : a_ * s + b_ * c(i, j);
-      }
+    cgemm_mat(oa, ob, m, n, k, a_, a, b, b_, c);
     store_mat(C, c, n, m);
     return CUBLAS_STATUS_SUCCESS;
   });
@@ -208,31 +216,43 @@ cublasStatus_t chemv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, in
 
 // C = alpha op(A) op(A)^H + beta C (herk: alpha, beta real, C Hermitian) or
 // alpha op(A) op(A)^T + beta C (syrk). Only C's `uplo` triangle is written.
+// Any operation but N reads A transposed: herk takes T as C, syrk C as T, as
+// the card does.
+void cherk_mat(bool hermitian, bool lower, bool trans, int n, int k, cd alpha, const CMat& a, cd beta, CMat& c) {
+  for (int j = 0; j < n; ++j)
+    for (int i = lower ? j : 0; i < (lower ? n : j + 1); ++i) {
+      cd s = 0;
+      for (int p = 0; p < k; ++p) {
+        const cd x = trans ? (hermitian ? std::conj(a(p, i)) : a(p, i)) : a(i, p);
+        const cd y = trans ? a(p, j) : (hermitian ? std::conj(a(j, p)) : a(j, p));
+        s += x * y;
+      }
+      c(i, j) = beta == cd(0) ? alpha * s : alpha * s + beta * c(i, j);
+      if (hermitian && i == j) c(i, j) = c(i, j).real();
+    }
+}
+// What herk and syrk refuse on the card: a fill mode other than lower or upper,
+// an unknown operation, a negative size or a short leading dimension.
+bool herk_args_ok(cublasFillMode_t uplo, cublasOperation_t t, int n, int k, int lda, int ldc) {
+  return (uplo == CUBLAS_FILL_MODE_LOWER || uplo == CUBLAS_FILL_MODE_UPPER) && known_op(t) && n >= 0 && k >= 0 &&
+         lda >= std::max(1, t == CUBLAS_OP_N ? n : k) && ldc >= std::max(1, n);
+}
+
 template <class T, class S>
 cublasStatus_t cherk(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cublasOperation_t t, int n, int k,
                      const S* alpha, const T* A, int lda, const S* beta, T* C, int ldc) {
-  if (n < 0 || k < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!herk_args_ok(uplo, t, n, k, lda, ldc)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (n == 0) return CUBLAS_STATUS_SUCCESS;
   return run_c(h, alpha, beta, sizeof(S), [=](const void* al, const void* be) {
     auto sc = [&](const void* p) -> cd {
       if constexpr (std::is_same_v<S, T>) return cscalar(h, static_cast<const T*>(p));
       else return p ? cd(scalar(h, static_cast<const S*>(p))) : cd(0);
     };
-    const cd a_ = sc(al), b_ = sc(be);
     const bool trans = t != CUBLAS_OP_N;
     const CMat a = load_mat(A, lda, trans ? n : k, trans ? k : n);
     CMat c = load_mat(C, ldc, n, n);
-    const bool lower = uplo == CUBLAS_FILL_MODE_LOWER;
-    for (int j = 0; j < n; ++j)
-      for (int i = lower ? j : 0; i < (lower ? n : j + 1); ++i) {
-        cd s = 0;
-        for (int p = 0; p < k; ++p) {
-          const cd x = trans ? (hermitian ? std::conj(a(p, i)) : a(p, i)) : a(i, p);
-          const cd y = trans ? a(p, j) : (hermitian ? std::conj(a(j, p)) : a(j, p));
-          s += x * y;
-        }
-        c(i, j) = b_ == cd(0) ? a_ * s : a_ * s + b_ * c(i, j);
-        if (hermitian && i == j) c(i, j) = c(i, j).real();
-      }
+    cherk_mat(hermitian, uplo == CUBLAS_FILL_MODE_LOWER, trans, n, k, sc(al), a, sc(be), c);
     store_mat(C, c, n, n);
     return CUBLAS_STATUS_SUCCESS;
   });
