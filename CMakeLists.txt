@@ -1625,6 +1625,17 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Conditional graph nodes -- IF, IF/ELSE, WHILE and SWITCH, decided by a
+# kernel's cudaGraphSetConditional -- and capture into an existing graph.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_conditional COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_conditional.sh)
+  set_tests_properties(e2e_graph_conditional PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 600)
+endif()
+
 # Checks on the code rather than on behaviour, each guarding a class of bug that
 # shipped once: an entry point that puts work on a stream without knowing about
 # capture (the work goes missing from every replay), and a shim library with a

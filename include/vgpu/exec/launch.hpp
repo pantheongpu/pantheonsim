@@ -8,6 +8,8 @@
 
 #include <functional>
 #include <map>
+#include <mutex>
+#include <unordered_map>
 
 #include "vgpu/exec/scheduler.hpp"
 #include "vgpu/exec/texture.hpp"
@@ -25,6 +27,15 @@ struct KernelRef {
   const std::map<std::string, uint64_t>* symbols = nullptr;
 };
 using KernelTable = std::map<uint64_t, KernelRef>;
+
+// The values of a CUDA graph's conditional handles, by handle: what a kernel in
+// the graph sets with cudaGraphSetConditional, and what the graph's
+// conditional nodes read to decide whether a body runs, how often, or which.
+// Owned by the runtime that launches the graph; a value outlives a launch.
+struct GraphConditionals {
+  std::mutex mu;
+  std::unordered_map<uint64_t, uint32_t> values;
+};
 
 struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
@@ -72,6 +83,10 @@ struct LaunchConfig {
   // cudaFuncAttributeNonPortableClusterSizeAllowed, set on the kernel: a
   // cluster may then exceed the portable 8 blocks, up to what the part has.
   bool nonportable_cluster = false;
+  // The conditional handles of the graph this kernel runs in. Null for a
+  // kernel launched outside a graph, whose cudaGraphSetConditional faults --
+  // an illegal address on an RTX 3060.
+  GraphConditionals* conditionals = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

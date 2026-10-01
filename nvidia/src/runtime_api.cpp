@@ -1202,6 +1202,13 @@ void vgpu_drop_capture(cudaStream_t stream);
 // should return when it was.
 cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled);
 
+// The values of every conditional handle (cudaGraphConditionalHandleCreate),
+// which a kernel in a graph sets with cudaGraphSetConditional and a
+// conditional node reads. A value is the handle's, not a launch's: without
+// cudaGraphCondAssignDefault it carries over from one launch to the next, and
+// across instantiations, as on an RTX 3060.
+vgpu::exec::GraphConditionals g_graph_conditionals;
+
 // The body of both launch entry points. `cooperative` is the only difference,
 // and it changes one thing: whether the blocks are resident together and may
 // wait on each other. See the scheduler note in interpreter.cpp.
@@ -1318,6 +1325,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       }
     }
     cfg.nonportable_cluster = ki.nonportable_cluster;
+    // A graph's kernels can set its conditional handles; no other kernel can.
+    if (std::strcmp(api, "cudaGraphLaunch") == 0) cfg.conditionals = &g_graph_conditionals;
     dev.launch(*fn, cfg, kargs, dev.symbols(mid));
     if (profiling) {
       vgpu::profiling::Event ev;
@@ -4528,6 +4537,18 @@ struct GraphNodeRec {
   // an empty node in all but type, and its parameters are left alone. The flag
   // belongs to the instantiated graph, not to the graph it was built from.
   bool enabled = true;
+  // A conditional node (CUDA 12.3): the handle whose value decides it, what
+  // kind it is, and its body graphs, which its graph owns (GraphRec::children).
+  // The handle's default, and whether each launch applies it, are copied here
+  // when the node is made, so an instantiated graph carries its own.
+  struct Conditional {
+    uint64_t handle = 0;
+    int kind = 0;   // cudaGraphCondTypeIf (0), cudaGraphCondTypeWhile (1), cudaGraphCondTypeSwitch (2)
+    unsigned default_value = 0;
+    bool assign_default = false;
+    std::vector<struct GraphRec*> bodies;
+    std::vector<cudaGraph_t> body_handles;   // what cudaConditionalNodeParams::phGraph_out points at
+  } cond;
 };
 
 struct GraphRec {
@@ -4543,6 +4564,9 @@ struct GraphRec {
   // not be used.
   bool invalidated = false;
   const char* invalidated_by = nullptr;
+  // A conditional node's body: the graph that node is in. A handle made for an
+  // enclosing graph can decide a conditional node in its body.
+  GraphRec* parent = nullptr;
 
   // Adds a node with the given predecessors. Returns its handle.
   GraphNodeRec* add(cudaGraphNodeType type, RecordedLaunch work,
@@ -4576,6 +4600,9 @@ std::unique_ptr<GraphRec> clone_graph(const GraphRec& src,
     n->type = up->type;
     n->work = up->work;
     n->enabled = up->enabled;
+    n->cond = up->cond;
+    n->cond.bodies.clear();
+    n->cond.body_handles.clear();
     local[up.get()] = n;
   }
   for (const auto& up : src.nodes) {
@@ -4584,6 +4611,13 @@ std::unique_ptr<GraphRec> clone_graph(const GraphRec& src,
     if (up->child) {
       out->children.push_back(clone_graph(*up->child, nullptr));
       n->child = out->children.back().get();
+    }
+    for (const GraphRec* body : up->cond.bodies) {
+      out->children.push_back(clone_graph(*body, nullptr));
+      GraphRec* b = out->children.back().get();
+      b->parent = out.get();
+      n->cond.bodies.push_back(b);
+      n->cond.body_handles.push_back(static_cast<cudaGraph_t>(static_cast<void*>(b)));
     }
   }
   if (mapping) *mapping = local;
@@ -4652,6 +4686,38 @@ bool holds_graph_memory(const GraphRec& g) {
   return false;
 }
 
+// Whether a graph holds a conditional node, which brings restrictions of its
+// own, as CUDA documents them and an RTX 3060 enforces them: such a graph
+// cannot be cloned or made a child of another (cudaErrorNotSupported), and it
+// may have one instantiation at a time.
+bool holds_conditional(const GraphRec& g) {
+  for (const auto& up : g.nodes)
+    if (!up->cond.bodies.empty() || (up->child && holds_conditional(*up->child))) return true;
+  return false;
+}
+
+// Conditional handles (cudaGraphConditionalHandleCreate), by handle. Each is
+// made for one graph and decides at most one conditional node, in that graph
+// or a body nested in it; its value lives in g_graph_conditionals. Caller holds
+// g_graph_mu.
+struct CondHandle {
+  const GraphRec* owner = nullptr;
+  unsigned default_value = 0;
+  bool assign_default = false;
+  bool used = false;   // a conditional node decides by it
+};
+std::unordered_map<uint64_t, CondHandle> g_cond_handles;
+// Handles are numbers to a kernel. An RTX 3060 numbers them from 1 in each
+// graph and tells graphs apart by the launch; here they are unique in the
+// process, so the number alone says whose it is. Zero is never one.
+uint64_t g_next_cond_handle = 1;
+
+// `g` and every graph inside it: child graphs and conditional bodies.
+void graph_tree(const GraphRec& g, std::set<const GraphRec*>* out) {
+  out->insert(&g);
+  for (const auto& c : g.children) graph_tree(*c, out);
+}
+
 // The nodes in an order that runs every node after everything it depends on.
 // Empty when the dependencies contain a cycle, which is how adding one is
 // refused.
@@ -4693,6 +4759,16 @@ std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graphs;      // graph han
 // handle for it without owning it. Destroying one through cudaGraphDestroy is
 // refused, as CUDA refuses it -- the node's graph is the node's.
 std::unordered_map<void*, GraphRec*> g_borrowed_graphs;
+
+// What refers to a graph that is going away, and to everything inside it: the
+// handles lent for its child graphs and bodies, and the conditional handles
+// made for any of them. Caller holds g_graph_mu.
+void forget_graph_tree(const GraphRec& g) {
+  std::set<const GraphRec*> tree;
+  graph_tree(g, &tree);
+  std::erase_if(g_borrowed_graphs, [&](const auto& kv) { return &g != kv.second && tree.count(kv.second); });
+  std::erase_if(g_cond_handles, [&](const auto& kv) { return tree.count(kv.second.owner) != 0; });
+}
 std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graph_execs; // instantiated graphs
 // Capture sequences, and the streams taking part in them. A sequence owns the
 // graph it builds until cudaStreamEndCapture hands it over. Every stream taking
@@ -4701,7 +4777,10 @@ std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graph_execs; // instantia
 // depends on. That is what lets two streams build two branches of one graph and
 // join them again, which is how a multi-stream program is captured.
 struct Capture {
-  std::unique_ptr<GraphRec> graph;
+  // The graph being built: one the capture made and owns (`owned`), or, for
+  // cudaStreamBeginCaptureToGraph, a program's own graph.
+  GraphRec* graph = nullptr;
+  std::unique_ptr<GraphRec> owned;
   unsigned long long id = 0;
   void* origin = nullptr;   // the stream that began it; only it can end it
 };
@@ -4726,7 +4805,7 @@ StreamCapture* stream_capture(cudaStream_t stream) {
 GraphRec* capture_target(cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   const StreamCapture* sc = stream_capture(stream);
-  return sc ? sc->cap->graph.get() : nullptr;
+  return sc ? sc->cap->graph : nullptr;
 }
 
 // Adds a captured operation: it depends on the stream's position, and becomes
@@ -4763,6 +4842,13 @@ namespace {
 cudaError_t fill_memcpy_work(RecordedLaunch* w, const cudaMemcpy3DParms* p);
 cudaError_t fill_memset_work(RecordedLaunch* w, const cudaMemsetParams* p);
 cudaMemcpy3DParms linear_copy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
+GraphRec* graph_from(cudaGraph_t h);
+// Destroys a program's graph and what refers to it, as cudaGraphDestroy does.
+// Caller holds g_graph_mu.
+void destroy_graph(void* graph);
+#if CUDART_VERSION >= 12030
+bool default_edges(const cudaGraphEdgeData* data, size_t count);
+#endif
 }  // namespace
 
 // Records a copy or a fill during capture. Returns true when it was recorded,
@@ -4828,7 +4914,7 @@ void vgpu_drop_capture(cudaStream_t stream) {
     g_stream_capture.erase(reinterpret_cast<void*>(stream));
     return;
   }
-  g_borrowed_graphs.erase(cap->graph.get());   // the stream that began it takes it along
+  if (cap->owned) g_borrowed_graphs.erase(cap->graph);   // the stream that began it takes it along
   leave_capture(cap);
   g_captures.erase(reinterpret_cast<void*>(stream));
 }
@@ -4879,7 +4965,8 @@ VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCa
   std::lock_guard<std::mutex> lock(g_graph_mu);
   if (stream_capture(stream)) return cudaErrorIllegalState;   // already capturing
   auto cap = std::make_unique<Capture>();
-  cap->graph = std::make_unique<GraphRec>();
+  cap->owned = std::make_unique<GraphRec>();
+  cap->graph = cap->owned.get();
   cap->id = g_next_capture_id.fetch_add(1);
   cap->origin = reinterpret_cast<void*>(stream);
   // The graph being captured into is a handle a program can use before the
@@ -4887,7 +4974,7 @@ VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCa
   // own nodes to it. The capture owns it, so it is lent rather than given --
   // cudaGraphDestroy refuses it -- and it keeps its address when the capture
   // ends, so the handle is the same graph cudaStreamEndCapture returns.
-  g_borrowed_graphs[cap->graph.get()] = cap->graph.get();
+  g_borrowed_graphs[cap->graph] = cap->graph;
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), {}, {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
   return cudaSuccess;
@@ -4919,15 +5006,35 @@ VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* p
     for (const GraphNodeRec* n : osc.deps)
       if (!before_end.count(n)) unjoined = true;
   }
-  std::unique_ptr<GraphRec> graph = std::move(cap->graph);
+  GraphRec* const graph = cap->graph;
+  std::unique_ptr<GraphRec> owned = std::move(cap->owned);
   leave_capture(cap);
   g_captures.erase(reinterpret_cast<void*>(stream));
-  g_borrowed_graphs.erase(graph.get());   // no longer lent: returned, or dropped below
+  if (owned) g_borrowed_graphs.erase(graph);   // no longer lent: returned, or dropped below
+  const bool invalidated = graph->invalidated;
+  const char* const invalidated_by = graph->invalidated_by;
+  if ((unjoined || invalidated) && !owned) {
+    // Captured into a program's own graph (cudaStreamBeginCaptureToGraph): a
+    // capture that fails takes the graph with it. On an RTX 3060 the handle
+    // is invalid afterwards (cudaGraphGetNodes says cudaErrorInvalidValue),
+    // whether the graph was the program's or a conditional node's body. A
+    // body here is emptied and no longer lent out -- the card goes on to
+    // crash instantiating its parent, which nothing should rely on.
+    if (g_graphs.count(graph)) {
+      destroy_graph(graph);
+    } else {
+      forget_graph_tree(*graph);
+      g_borrowed_graphs.erase(graph);
+      graph->nodes.clear();
+      graph->invalidated = false;
+      graph->invalidated_by = nullptr;
+    }
+  }
   if (unjoined) {
     if (pGraph) *pGraph = nullptr;
     return cudaErrorStreamCaptureUnjoined;
   }
-  if (graph->invalidated) {
+  if (invalidated) {
     // CUDA reports a capture that saw an unsupported operation this way, and
     // callers fall back to running the work directly. Handing back a graph that
     // silently omits the copies would give wrong answers on every replay.
@@ -4936,45 +5043,187 @@ VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* p
                    "[vgpu] stream capture invalidated: %s inside a captured region is not "
                    "recorded (only kernel launches are).\n"
                    "       Run the work directly instead of replaying a graph.\n",
-                   graph->invalidated_by ? graph->invalidated_by : "an operation");
+                   invalidated_by ? invalidated_by : "an operation");
     if (pGraph) *pGraph = nullptr;
     return cudaErrorStreamCaptureInvalidated;
   }
-  void* handle = graph.get();
-  g_graphs[handle] = std::move(graph);
-  if (pGraph) *pGraph = static_cast<cudaGraph_t>(handle);
+  if (owned) g_graphs[graph] = std::move(owned);
+  if (pGraph) *pGraph = static_cast<cudaGraph_t>(static_cast<void*>(graph));
   return cudaSuccess;
 }
 
-VGPU_EXPORT cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t graph,
-                                             unsigned long long flags) {
+#if CUDART_VERSION >= 12030
+// Capture into a graph that already exists, after the nodes named: what CUDA
+// Samples' graphConditionalNodes uses to fill a conditional node's body. The
+// graph stays the program's -- the capture adds to it, and cudaStreamEndCapture
+// hands back the same handle. Measured on an RTX 3060: the first node captured
+// depends on the nodes named; cudaStreamGetCaptureInfo reports this graph;
+// cudaGraphDestroy refuses it while the capture lasts (cudaErrorIllegalState);
+// and a capture that fails destroys it.
+VGPU_EXPORT cudaError_t cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGraph_t graph,
+                                                      const cudaGraphNode_t* dependencies,
+                                                      const cudaGraphEdgeData* dependencyData,
+                                                      size_t numDependencies,
+                                                      cudaStreamCaptureMode mode) {
+  (void)mode;
+  if (stream == nullptr || stream == cudaStreamLegacy) return cudaErrorStreamCaptureUnsupported;
+  if (numDependencies && !dependencies) return cudaErrorInvalidValue;
+  if (!default_edges(dependencyData, numDependencies)) return cudaErrorNotSupported;
   std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> deps;
+  for (size_t i = 0; i < numDependencies; ++i) {
+    auto* n = reinterpret_cast<GraphNodeRec*>(dependencies[i]);
+    if (!n || !g->holds(n)) return cudaErrorInvalidValue;
+    deps.push_back(n);
+  }
+  if (stream_capture(stream)) return cudaErrorIllegalState;   // already capturing
+  for (const auto& [origin, other] : g_captures)
+    if (other->graph == g) return cudaErrorIllegalState;     // another capture is filling it
+  auto cap = std::make_unique<Capture>();
+  cap->graph = g;
+  cap->id = g_next_capture_id.fetch_add(1);
+  cap->origin = reinterpret_cast<void*>(stream);
+  g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), std::move(deps), {}};
+  g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  return cudaSuccess;
+}
+#endif
+
+namespace {
+// What a conditional node's body may hold, as CUDA documents it and an RTX
+// 3060 enforces it at instantiation: kernels, empty nodes, child graphs, fills,
+// copies and further conditional nodes, all the way down. A host node or an
+// event node in a body is refused (cudaErrorInvalidValue), and so is an
+// allocation node -- each is accepted when added, and refused only then.
+bool conditional_bodies_ok(const GraphRec& g, bool in_body) {
+  for (const auto& up : g.nodes) {
+    const bool conditional = !up->cond.bodies.empty();
+    if (in_body && !conditional) {
+      switch (up->type) {
+        case cudaGraphNodeTypeKernel:
+        case cudaGraphNodeTypeEmpty:
+        case cudaGraphNodeTypeGraph:
+        case cudaGraphNodeTypeMemset:
+        case cudaGraphNodeTypeMemcpy:
+          break;
+        default:
+          return false;
+      }
+    }
+    if (up->child && !conditional_bodies_ok(*up->child, in_body)) return false;
+    for (const GraphRec* body : up->cond.bodies)
+      if (!conditional_bodies_ok(*body, true)) return false;
+  }
+  return true;
+}
+
+// Instantiation's checks on conditional handles and nodes. Caller holds
+// g_graph_mu. A handle made for this graph, or for a body in it, that decides
+// no conditional node fails the instantiation (cudaErrorInvalidValue, and
+// cudaGraphInstantiateConditionalHandleUnused from
+// cudaGraphInstantiateWithParams), as on an RTX 3060.
+cudaError_t check_conditionals(const GraphRec& g, cudaGraphInstantiateResult* result) {
+  std::set<const GraphRec*> tree;
+  graph_tree(g, &tree);
+  for (const auto& [h, ch] : g_cond_handles)
+    if (tree.count(ch.owner) && !ch.used) {
+      *result = static_cast<cudaGraphInstantiateResult>(5);   // cudaGraphInstantiateConditionalHandleUnused (12.3)
+      return cudaErrorInvalidValue;
+    }
+  if (!conditional_bodies_ok(g, false)) return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+
+cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long long flags,
+                        cudaGraphInstantiateResult* result) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  *result = cudaGraphInstantiateError;
   auto it = g_graphs.find(static_cast<void*>(graph));
-  if (it == g_graphs.end()) return cudaErrorInvalidValue;
-  if (topological_order(*it->second).empty() && !it->second->nodes.empty())
+  if (it == g_graphs.end()) {
+    // A conditional node's body is instantiated with the graph it is in; on
+    // its own it is cudaErrorNotSupported, as on the card.
+    const GraphRec* g = graph_from(graph);
+    return g && g->parent ? cudaErrorNotSupported : cudaErrorInvalidValue;
+  }
+  if (topological_order(*it->second).empty() && !it->second->nodes.empty()) {
+    *result = cudaGraphInstantiateInvalidStructure;
     return cudaErrorInvalidValue;                      // a cycle cannot be instantiated
+  }
   if (holds_graph_memory(*it->second)) {
     // One instantiation at a time, as documented: two would each believe they
     // own the allocation, and the second to free it would free it twice.
     for (const auto& [exec_handle, source] : g_exec_source)
       if (source == static_cast<void*>(graph)) return cudaErrorInvalidValue;
   }
+  if (holds_conditional(*it->second)) {
+    // One at a time for a graph with conditional nodes too, and an RTX 3060
+    // says so with cudaErrorNotSupported.
+    for (const auto& [exec_handle, source] : g_exec_source)
+      if (source == static_cast<void*>(graph)) return cudaErrorNotSupported;
+  }
+  if (const cudaError_t rc = check_conditionals(*it->second, result); rc != cudaSuccess) return rc;
   auto exec = clone_graph(*it->second, nullptr);        // a snapshot, as CUDA takes
   void* handle = exec.get();
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
+  *result = cudaGraphInstantiateSuccess;
   return cudaSuccess;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t graph,
+                                             unsigned long long flags) {
+  cudaGraphInstantiateResult result;
+  return instantiate(pExec, graph, flags, &result);
 }
 VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pExec, cudaGraph_t graph,
                                                       unsigned long long flags) {
   return cudaGraphInstantiate(pExec, graph, flags);
 }
+// The same, saying why an instantiation failed. The upload stream is not
+// needed: a graph is uploaded by being instantiated here.
+VGPU_EXPORT cudaError_t cudaGraphInstantiateWithParams(cudaGraphExec_t* pExec, cudaGraph_t graph,
+                                                       cudaGraphInstantiateParams* params) {
+  if (!params) return cudaErrorInvalidValue;
+  cudaGraphInstantiateResult result;
+  const cudaError_t rc = instantiate(pExec, graph, params->flags, &result);
+  params->result_out = result;
+  params->errNode_out = nullptr;
+  return rc;
+}
 
 // Runs one node's work. Nodes with no work of their own (empty ones) do
 // nothing but order the nodes around them.
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream);
+
+namespace {
+// cudaGraphCondAssignDefault: a launch starts each such handle at its default
+// -- once, as the launch begins. Measured on an RTX 3060: an IF node with a
+// defaulted handle, inside the body of a WHILE node that ran three times, ran
+// its body once; the default was not applied again for each iteration. A
+// handle without the flag keeps whatever value it last had.
+void assign_condition_defaults(const GraphRec& g) {
+  for (const auto& up : g.nodes) {
+    if (!up->cond.bodies.empty() && up->cond.assign_default) {
+      std::lock_guard<std::mutex> lock(g_graph_conditionals.mu);
+      g_graph_conditionals.values[up->cond.handle] = up->cond.default_value;
+    }
+    if (up->child) assign_condition_defaults(*up->child);
+    for (const GraphRec* body : up->cond.bodies) assign_condition_defaults(*body);
+  }
+}
+
+#if CUDART_VERSION >= 12030
+uint32_t condition_value(uint64_t handle) {
+  std::lock_guard<std::mutex> lock(g_graph_conditionals.mu);
+  return g_graph_conditionals.values[handle];
+}
+#endif
+}  // namespace
 
 namespace {
 
@@ -5090,6 +5339,37 @@ static cudaError_t replay_fill(const RecordedLaunch& rl) {
   });
 }
 
+#if CUDART_VERSION >= 12030
+// A conditional node: its handle's value, read once the nodes before it have
+// run, decides which body runs -- for IF, the first body when it is nonzero
+// and the second (an ELSE, when there is one) when it is zero; for WHILE, the
+// body again for as long as it is nonzero, read afresh after each run; for
+// SWITCH, the body it numbers, and none when it is past the last.
+static cudaError_t run_conditional(const GraphNodeRec& n, cudaStream_t stream) {
+  const auto& c = n.cond;
+  switch (c.kind) {
+    case 0: {   // cudaGraphCondTypeIf
+      const uint32_t v = condition_value(c.handle);
+      GraphRec* body = v ? c.bodies[0] : c.bodies.size() > 1 ? c.bodies[1] : nullptr;
+      return body ? run_graph(*body, stream) : cudaSuccess;
+    }
+    case 1:     // cudaGraphCondTypeWhile
+      while (condition_value(c.handle) != 0) {
+        const cudaError_t rc = run_graph(*c.bodies[0], stream);
+        if (rc != cudaSuccess) return rc;
+        if (sticky_error() != cudaSuccess) return cudaSuccess;   // a kernel in it faulted
+      }
+      return cudaSuccess;
+    case 2: {   // cudaGraphCondTypeSwitch
+      const uint32_t v = condition_value(c.handle);
+      return v < c.bodies.size() ? run_graph(*c.bodies[v], stream) : cudaSuccess;
+    }
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+#endif
+
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
   RecordedLaunch& rl = n->work;
   if (!n->enabled) return cudaSuccess;   // switched off: it still orders its neighbours
@@ -5119,6 +5399,10 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
       return wait_event_now(rl.event);
     case cudaGraphNodeTypeGraph:
       return n->child ? run_graph(*n->child, stream) : cudaSuccess;
+#if CUDART_VERSION >= 12030
+    case cudaGraphNodeTypeConditional:
+      return run_conditional(*n, stream);
+#endif
     default: {
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
@@ -5156,6 +5440,7 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t strea
       return cudaSuccess;
     }
     replay = clone_graph(*it->second, nullptr);   // run without holding the lock
+    assign_condition_defaults(*replay);
     auto_free = g_exec_auto_free.count(static_cast<void*>(exec)) != 0;
     if (const auto src = g_exec_source.find(static_cast<void*>(exec)); src != g_exec_source.end())
       source = src->second;
@@ -5539,6 +5824,8 @@ VGPU_EXPORT cudaError_t cudaGraphAddChildGraphNode(cudaGraphNode_t* pNode, cudaG
   // taken by copy, and a copy of an allocation node would name an address the
   // original owns. CUDA documents the same restriction.
   if (holds_graph_memory(*child)) return cudaErrorInvalidValue;
+  // Nor can one with a conditional node; the card says cudaErrorNotSupported.
+  if (holds_conditional(*child)) return cudaErrorNotSupported;
   // Cloned now: CUDA takes the child's structure as it is at this moment.
   g->children.push_back(clone_graph(*child, nullptr));
   GraphNodeRec* n = g->add(cudaGraphNodeTypeGraph, RecordedLaunch{}, pred);
@@ -5586,19 +5873,33 @@ static cudaError_t graph_remove_deps(cudaGraph_t graph, const cudaGraphNode_t* f
 VGPU_EXPORT cudaError_t cudaGraphDestroyNode(cudaGraphNode_t node) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
-  for (auto& [handle, g] : g_graphs) {
-    if (!g->holds(n)) continue;
-    // Nodes cannot be taken out of a graph that owns memory: removing the
-    // allocation node or the free node would leave the other one alone.
-    if (holds_graph_memory(*g)) return cudaErrorInvalidValue;
-    for (auto& up : g->nodes)
-      up->deps.erase(std::remove(up->deps.begin(), up->deps.end(), n), up->deps.end());
-    for (auto& [s, sc] : g_stream_capture)
-      if (sc.cap->graph.get() == g.get()) std::erase(sc.deps, n);
-    std::erase_if(g->nodes, [&](const std::unique_ptr<GraphNodeRec>& up) { return up.get() == n; });
-    return cudaSuccess;
+  // The node's graph: a program's, or one lent out -- a conditional node's
+  // body, or a graph being captured.
+  GraphRec* g = nullptr;
+  for (auto& [handle, owned] : g_graphs)
+    if (owned->holds(n)) g = owned.get();
+  for (auto& [handle, lent] : g_borrowed_graphs)
+    if (!g && lent->holds(n)) g = lent;
+  if (!g) return cudaErrorInvalidValue;
+  // Nodes cannot be taken out of a graph that owns memory: removing the
+  // allocation node or the free node would leave the other one alone.
+  if (holds_graph_memory(*g)) return cudaErrorInvalidValue;
+  for (auto& up : g->nodes)
+    up->deps.erase(std::remove(up->deps.begin(), up->deps.end(), n), up->deps.end());
+  for (auto& [s, sc] : g_stream_capture)
+    if (sc.cap->graph == g) std::erase(sc.deps, n);
+  // A conditional node's bodies go with it, and its handle decides nothing
+  // now -- so instantiating the graph reports it unused, as on an RTX 3060.
+  if (!n->cond.bodies.empty()) {
+    if (const auto h = g_cond_handles.find(n->cond.handle); h != g_cond_handles.end()) h->second.used = false;
+    for (GraphRec* body : n->cond.bodies) {
+      forget_graph_tree(*body);
+      g_borrowed_graphs.erase(body);
+      std::erase_if(g->children, [&](const std::unique_ptr<GraphRec>& c) { return c.get() == body; });
+    }
   }
-  return cudaErrorInvalidValue;
+  std::erase_if(g->nodes, [&](const std::unique_ptr<GraphNodeRec>& up) { return up.get() == n; });
+  return cudaSuccess;
 }
 
 // ---- what a graph is, read back ----
@@ -5800,6 +6101,7 @@ VGPU_EXPORT cudaError_t cudaGraphClone(cudaGraph_t* pGraphClone, cudaGraph_t ori
   // would name the original's addresses, and one of the two graphs would free
   // memory the other still uses. CUDA refuses it for the same reason.
   if (holds_graph_memory(*src)) return cudaErrorInvalidValue;
+  if (holds_conditional(*src)) return cudaErrorNotSupported;   // as documented, and as the card says
   auto copy = clone_graph(*src, nullptr);
   void* handle = copy.get();
   g_graphs[handle] = std::move(copy);
@@ -5839,6 +6141,13 @@ VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t gr
   GraphRec* want = graph_from(graph);
   if (it == g_graph_execs.end() || !want) return cudaErrorInvalidValue;
   GraphRec& have = *it->second;
+  // Conditional nodes are not updated in place here: their bodies would have
+  // to be compared and taken over too. Refused, as an update of what an
+  // implementation does not support is documented to be.
+  if (holds_conditional(have) || holds_conditional(*want)) {
+    if (info) info->result = cudaGraphExecUpdateErrorNotSupported;
+    return cudaErrorGraphExecUpdateFailure;
+  }
   // Same shape means the same nodes in the same order depending on the same
   // ones. Counting nodes and edges was not enough: a graph rewired between two
   // nodes has the same counts, and taking its parameters would have run the old
@@ -6545,7 +6854,7 @@ VGPU_EXPORT cudaError_t cudaDeviceSetGraphMemAttribute(int device,
 namespace {
 // An edge-data array is accepted when it asks for the default edge; anything
 // else describes ordering this engine does not model.
-#if CUDART_VERSION >= 13000
+#if CUDART_VERSION >= 12030
 bool default_edges(const cudaGraphEdgeData* data, size_t count) {
   if (!data) return true;
   for (size_t i = 0; i < count; ++i)
@@ -6675,11 +6984,79 @@ VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node,
 }
 #endif
 
+#if CUDART_VERSION >= 12030
+// A conditional handle for `graph`: a number a kernel passes to
+// cudaGraphSetConditional, and a conditional node in this graph, or in a body
+// nested in it, decides by. Its value starts at 0; with
+// cudaGraphCondAssignDefault every launch sets it to `defaultLaunchValue` as it
+// begins, and without, it keeps what it last held -- the default is not
+// applied at all, as on an RTX 3060.
+VGPU_EXPORT cudaError_t cudaGraphConditionalHandleCreate(cudaGraphConditionalHandle* pHandle_out,
+                                                         cudaGraph_t graph, unsigned int defaultLaunchValue,
+                                                         unsigned int flags) {
+  if (!pHandle_out || (flags & ~static_cast<unsigned>(cudaGraphCondAssignDefault))) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const GraphRec* g = graph_from(graph);
+  if (!g) return cudaErrorInvalidValue;
+  const uint64_t h = g_next_cond_handle++;
+  g_cond_handles[h] = CondHandle{g, defaultLaunchValue, (flags & cudaGraphCondAssignDefault) != 0, false};
+  {
+    std::lock_guard<std::mutex> values(g_graph_conditionals.mu);
+    g_graph_conditionals.values[h] = 0;
+  }
+  *pHandle_out = h;
+  return cudaSuccess;
+}
+
+// A conditional node: IF with one body (or two, the second an ELSE), WHILE with
+// one, SWITCH with any number. Its bodies are empty graphs made with it, which
+// the program fills -- node by node, or by capturing into them -- and which
+// belong to the node: cudaGraphDestroy refuses one. What the card refuses here,
+// each with cudaErrorInvalidValue: another size, another kind, a handle that
+// does not exist, one already deciding a node, and one made for a graph this
+// one is not inside.
+static cudaError_t add_conditional_node(cudaGraphNode_t* pNode, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                        size_t numDeps, cudaConditionalNodeParams* p) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(graph);
+  if (!g) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, deps, numDeps, &pred)) return cudaErrorInvalidValue;
+  const int kind = static_cast<int>(p->type);
+  const bool size_ok = kind == 0 ? p->size == 1 || p->size == 2   // cudaGraphCondTypeIf
+                       : kind == 1 ? p->size == 1                 // cudaGraphCondTypeWhile
+                       : kind == 2 && p->size >= 1;               // cudaGraphCondTypeSwitch
+  if (!size_ok) return cudaErrorInvalidValue;
+  const auto h = g_cond_handles.find(p->handle);
+  if (h == g_cond_handles.end() || h->second.used) return cudaErrorInvalidValue;
+  bool inside = false;
+  for (const GraphRec* at = g; at && !inside; at = at->parent) inside = at == h->second.owner;
+  if (!inside) return cudaErrorInvalidValue;
+  GraphNodeRec* n = g->add(cudaGraphNodeTypeConditional, RecordedLaunch{}, pred);
+  n->cond.handle = p->handle;
+  n->cond.kind = kind;
+  n->cond.default_value = h->second.default_value;
+  n->cond.assign_default = h->second.assign_default;
+  for (unsigned i = 0; i < p->size; ++i) {
+    g->children.push_back(std::make_unique<GraphRec>());
+    GraphRec* body = g->children.back().get();
+    body->parent = g;
+    g_borrowed_graphs[body] = body;
+    n->cond.bodies.push_back(body);
+    n->cond.body_handles.push_back(static_cast<cudaGraph_t>(static_cast<void*>(body)));
+  }
+  h->second.used = true;
+  p->phGraph_out = n->cond.body_handles.data();
+  *pNode = reinterpret_cast<cudaGraphNode_t>(n);
+  return cudaSuccess;
+}
+#endif
+
 // A node of any kind through the one generic entry point: the parameter union
 // is unpacked and handed to the per-kind call, which checks it as it checks
 // its own. The reserved fields must be zero, as must a copy node's flags.
-// Conditional nodes and external semaphores are not modelled, and a child
-// graph can only be cloned into its parent, not moved.
+// External semaphores are not modelled, and a child graph can only be cloned
+// into its parent, not moved.
 #if CUDART_VERSION >= 12020
 static cudaError_t graph_add_node(cudaGraphNode_t* pNode, cudaGraph_t graph, const cudaGraphNode_t* deps,
                                   size_t numDeps, cudaGraphNodeParams* p) {
@@ -6737,9 +7114,12 @@ static cudaError_t graph_add_node(cudaGraphNode_t* pNode, cudaGraph_t graph, con
     }
     case cudaGraphNodeTypeMemFree:
       return cudaGraphAddMemFreeNode(pNode, graph, deps, numDeps, p->free.dptr);
+#if CUDART_VERSION >= 12030
+    case cudaGraphNodeTypeConditional:
+      return add_conditional_node(pNode, graph, deps, numDeps, &p->conditional);
+#endif
     case cudaGraphNodeTypeExtSemaphoreSignal:
     case cudaGraphNodeTypeExtSemaphoreWait:
-    case cudaGraphNodeTypeConditional:
       if (!quiet())
         std::fprintf(stderr, "[vgpu] cudaGraphAddNode: node type %d is not supported\n", static_cast<int>(p->type));
       return cudaErrorNotSupported;
@@ -6781,6 +7161,9 @@ VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char* pa
       case cudaGraphNodeTypeEmpty: return "EMPTY";
       case cudaGraphNodeTypeEventRecord: return "EVENT_RECORD";
       case cudaGraphNodeTypeWaitEvent: return "WAIT_EVENT";
+#if CUDART_VERSION >= 12030
+      case cudaGraphNodeTypeConditional: return "CONDITIONAL";
+#endif
       default: return "NODE";
     }
   };
@@ -6797,6 +7180,7 @@ VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char* pa
   return cudaSuccess;
 }
 
+// The graph's own records go with it (destroy_graph, below).
 VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   // A child graph belongs to the node that holds it; destroying it here would
@@ -6804,9 +7188,17 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   if (g_borrowed_graphs.count(static_cast<void*>(graph)) &&
       !g_graphs.count(static_cast<void*>(graph)))
     return cudaErrorInvalidValue;
-  if (GraphRec* g = graph_from(graph))
-    for (const auto& child : g->children) std::erase_if(
-        g_borrowed_graphs, [&](const auto& kv) { return kv.second == child.get(); });
+  // Nor a graph a capture is adding to (cudaStreamBeginCaptureToGraph): an RTX
+  // 3060 answers cudaErrorIllegalState until the capture ends.
+  for (const auto& [origin, cap] : g_captures)
+    if (cap->graph == static_cast<void*>(graph)) return cudaErrorIllegalState;
+  destroy_graph(static_cast<void*>(graph));
+  return cudaSuccess;
+}
+
+namespace {
+void destroy_graph(void* graph) {
+  if (GraphRec* g = graph_from(static_cast<cudaGraph_t>(graph))) forget_graph_tree(*g);
   // Allocations this graph made outlive it, as CUDA documents: a program still
   // holding one frees it itself. What ends with the graph is the chance of ever
   // allocating at that address again, so the address can be given back -- by the
@@ -6831,21 +7223,21 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   void* const gone = reinterpret_cast<void*>((++tombstones << 1) | 1);
   bool instantiated = false;
   for (auto& [exec_handle, source] : g_exec_source)
-    if (source == static_cast<void*>(graph)) {
+    if (source == graph) {
       source = gone;
       instantiated = true;
     }
   {
     std::lock_guard<std::mutex> mem_lock(g_graph_mem_mu);
     for (auto& [va, a] : g_graph_allocs)
-      if (a.owner == static_cast<void*>(graph)) {
+      if (a.owner == graph) {
         a.owner_gone = !instantiated;
         a.owner = gone;
       }
   }
-  g_graphs.erase(static_cast<void*>(graph));
-  return cudaSuccess;
+  g_graphs.erase(graph);
 }
+}  // namespace
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   g_graph_execs.erase(static_cast<void*>(exec));
@@ -6997,6 +7389,10 @@ VGPU_PT_ALIAS(cudaStreamCopyAttributes_ptsz, cudaStreamCopyAttributes)
 VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
 VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
 VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
+VGPU_PT_ALIAS(cudaGraphInstantiateWithParams_ptsz, cudaGraphInstantiateWithParams)
+#if CUDART_VERSION >= 12030
+VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
+#endif
 #undef VGPU_PT_ALIAS
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
