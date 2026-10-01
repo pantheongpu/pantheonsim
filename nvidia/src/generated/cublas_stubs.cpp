@@ -16,7 +16,7 @@
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
 namespace {
-void vgpu_report_unimplemented(const char* fn) {
+[[maybe_unused]] void vgpu_report_unimplemented(const char* fn) {
   static std::mutex mu;
   static std::set<std::string> seen;
   std::lock_guard<std::mutex> lock(mu);
@@ -31,18 +31,7 @@ void vgpu_report_unimplemented(const char* fn) {
 }
 }  // namespace
 
-VGPU_EXPORT int cublasCgeqrfBatched() { vgpu_report_unimplemented("cublasCgeqrfBatched"); return 15; }
-VGPU_EXPORT int cublasDgeqrfBatched() { vgpu_report_unimplemented("cublasDgeqrfBatched"); return 15; }
-VGPU_EXPORT int cublasLtMatmul() { vgpu_report_unimplemented("cublasLtMatmul"); return 15; }
-VGPU_EXPORT int cublasLtMatmulAlgoGetHeuristic() { vgpu_report_unimplemented("cublasLtMatmulAlgoGetHeuristic"); return 15; }
-VGPU_EXPORT int cublasLtMatmulDescCreate() { vgpu_report_unimplemented("cublasLtMatmulDescCreate"); return 15; }
-VGPU_EXPORT int cublasLtMatmulDescDestroy() { vgpu_report_unimplemented("cublasLtMatmulDescDestroy"); return 15; }
-VGPU_EXPORT int cublasLtMatmulDescSetAttribute() { vgpu_report_unimplemented("cublasLtMatmulDescSetAttribute"); return 15; }
-VGPU_EXPORT int cublasLtMatmulPreferenceCreate() { vgpu_report_unimplemented("cublasLtMatmulPreferenceCreate"); return 15; }
-VGPU_EXPORT int cublasLtMatmulPreferenceDestroy() { vgpu_report_unimplemented("cublasLtMatmulPreferenceDestroy"); return 15; }
-VGPU_EXPORT int cublasLtMatmulPreferenceSetAttribute() { vgpu_report_unimplemented("cublasLtMatmulPreferenceSetAttribute"); return 15; }
-VGPU_EXPORT int cublasLtMatrixLayoutCreate() { vgpu_report_unimplemented("cublasLtMatrixLayoutCreate"); return 15; }
-VGPU_EXPORT int cublasLtMatrixLayoutDestroy() { vgpu_report_unimplemented("cublasLtMatrixLayoutDestroy"); return 15; }
-VGPU_EXPORT int cublasLtMatrixLayoutSetAttribute() { vgpu_report_unimplemented("cublasLtMatrixLayoutSetAttribute"); return 15; }
-VGPU_EXPORT int cublasSgeqrfBatched() { vgpu_report_unimplemented("cublasSgeqrfBatched"); return 15; }
-VGPU_EXPORT int cublasZgeqrfBatched() { vgpu_report_unimplemented("cublasZgeqrfBatched"); return 15; }
+// None at present: every entry point a program reaches in the stub list this
+// file once held is implemented in cublas_api.cpp. The cublasLt* names it also
+// held are not libcublas's (NVIDIA's exports none of them) and are left to
+// libcublasLt, where a lookup by name in the global scope must find them.
