@@ -110,29 +110,24 @@ bool single_type(cudssDataType_t t) { return t == CUDSS_R_32F || t == CUDSS_C_32
 // ---- simulated device memory ----
 //
 // cuDSS takes the CSR arrays, the user permutation and DataGet's outputs from
-// host or device memory alike, so every access asks which it is.
-bool on_device(const void* p) {
-  cudaPointerAttributes a{};
-  const bool dev = cudaPointerGetAttributes(&a, p) == cudaSuccess &&
-                   (a.type == cudaMemoryTypeDevice || a.type == cudaMemoryTypeManaged);
-  cudaGetLastError();
-  return dev;
-}
-
+// host or device memory alike. Every access is a cudaMemcpy with
+// cudaMemcpyDefault, so the runtime decides which it is and a device side
+// goes through the simulator's bounds-checked memory: a copy past the end of
+// an allocation fails (and the call with it) rather than writing on.
 bool read_bytes(void* dst, const void* src, size_t n) {
   if (!n) return true;
-  if (!src) return false;
-  if (on_device(src)) return cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost) == cudaSuccess;
-  std::memcpy(dst, src, n);
-  return true;
+  if (!src || !dst) return false;
+  const bool ok = cudaMemcpy(dst, src, n, cudaMemcpyDefault) == cudaSuccess;
+  cudaGetLastError();
+  return ok;
 }
 
 bool write_bytes(void* dst, const void* src, size_t n) {
   if (!n) return true;
-  if (!dst) return false;
-  if (on_device(dst)) return cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice) == cudaSuccess;
-  std::memcpy(dst, src, n);
-  return true;
+  if (!dst || !src) return false;
+  const bool ok = cudaMemcpy(dst, src, n, cudaMemcpyDefault) == cudaSuccess;
+  cudaGetLastError();
+  return ok;
 }
 
 bool read_indices(const void* p, cudssDataType_t t, size_t count, std::vector<int64_t>& out) {

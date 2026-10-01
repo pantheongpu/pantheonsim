@@ -77,6 +77,28 @@ static Kkt make_kkt(int n, int m, std::mt19937_64& g) {
   return K;
 }
 
+// SCS's test/problems/degenerate.h, the first of its tests to reach the
+// linear solver: n = 2, m = 4, P = diag(0.02, 2), and A with an empty first
+// row, so one constraint's KKT row holds only its diagonal. Built as SCS's
+// form_kkt does: the upper triangle in CSC, which SCS hands over as lower CSR.
+static Kkt degenerate_kkt() {
+  const int n = 2, m = 4;
+  const double Ax[] = {-10, -1, 1, -1};
+  const int Ai[] = {1, 2, 1, 3}, Ap[] = {0, 2, 4};
+  std::vector<std::vector<std::pair<int, double>>> lower(n + m);
+  for (int j = 0; j < n; ++j)
+    for (int k = Ap[j]; k < Ap[j + 1]; ++k) lower[n + Ai[k]].push_back({j, Ax[k]});
+  Kkt K{n, m, {0}, {}, {}, {}, {0.02, 2.0}};
+  for (int i = 0; i < n + m; ++i) {
+    for (auto& [c, v] : lower[i]) K.ci.push_back(c), K.val.push_back(v);
+    K.diag.push_back((int64_t)K.ci.size());
+    K.ci.push_back(i);
+    K.val.push_back(0);
+    K.rp.push_back((int64_t)K.ci.size());
+  }
+  return K;
+}
+
 // SCS's scs_update_lin_sys_diag_r: P's diagonal plus rho_x on top, -rho_y below.
 static void set_diagonal(Kkt& K, double rho_x, double rho_y_scale) {
   for (int i = 0; i < K.n; ++i) K.val[K.diag[i]] = K.p_diag[i] + rho_x;
@@ -105,10 +127,11 @@ static double residual(const Kkt& K, const std::vector<double>& x, const std::ve
 }
 
 template <class I, class V>
-static void scs_like(const char* label, cudssDataType_t itype, cudssDataType_t vtype, int n, int m, double tol) {
+static void scs_like(const char* label, cudssDataType_t itype, cudssDataType_t vtype, int n, int m, double tol,
+                     bool degenerate = false) {
   std::printf("-- %s: n = %d, m = %d\n", label, n, m);
   std::mt19937_64 g(1234 + n * 7 + m);
-  Kkt K = make_kkt(n, m, g);
+  Kkt K = degenerate ? degenerate_kkt() : make_kkt(n, m, g);
   set_diagonal(K, 1e-6, 0.1);
   const int N = n + m;
   const int64_t nnz = K.rp[N];
@@ -215,6 +238,12 @@ int main() {
   scs_like<int32_t, float>("32-bit indices, float (SFLOAT)", CUDSS_R_32I, CUDSS_R_32F, 30, 45, 1e-5);
   scs_like<int64_t, float>("64-bit indices, float (DLONG SFLOAT)", CUDSS_R_64I, CUDSS_R_32F, 30, 45, 1e-5);
   scs_like<int32_t, double>("a larger one", CUDSS_R_32I, CUDSS_R_64F, 160, 220, 1e-13);
+  // Every buffer is allocated at exactly SCS's size, so a write past one is
+  // the simulator's bounds error rather than a quiet overrun.
+  scs_like<int32_t, double>("SCS's degenerate problem", CUDSS_R_32I, CUDSS_R_64F, 2, 4, 1e-13, true);
+  scs_like<int64_t, double>("SCS's degenerate problem, DLONG", CUDSS_R_64I, CUDSS_R_64F, 2, 4, 1e-13, true);
+  scs_like<int32_t, float>("SCS's degenerate problem, SFLOAT", CUDSS_R_32I, CUDSS_R_32F, 2, 4, 1e-5, true);
+  scs_like<int64_t, float>("SCS's degenerate problem, DLONG SFLOAT", CUDSS_R_64I, CUDSS_R_32F, 2, 4, 1e-5, true);
   std::printf(failures ? "FAIL: %d checks failed\n" : "PASS\n", failures);
   return failures ? 1 : 0;
 }
