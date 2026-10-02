@@ -24,10 +24,6 @@ on:
       - ci/external/**
       - .github/workflows/external-smoke.yml
   workflow_dispatch:
-  # TEMPORARY, to test the branch before it has a pull request: remove.
-  push:
-    branches: [ci-tests-2]
-    paths: [.github/workflows/external-smoke.yml, ci/external/**]
 
 permissions:
   contents: read
