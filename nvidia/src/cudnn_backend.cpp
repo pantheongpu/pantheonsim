@@ -1312,7 +1312,10 @@ bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
 // its virtual inputs come from the operation that holds it.
 bool runnable(const Desc* graph, std::string* why) {
   std::vector<Op> order;
-  if (!graph->get(CUDNN_ATTR_OPERATIONGRAPH_HANDLE)) {
+  void* h = nullptr;
+  if (const Attr* ha = graph->get(CUDNN_ATTR_OPERATIONGRAPH_HANDLE))
+    if (ha->bytes.size() >= sizeof h) std::memcpy(&h, ha->bytes.data(), sizeof h);
+  if (!h) {
     std::set<int64_t> any;
     const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
     for (int64_t i = 0; ops && i < ops->count; ++i) {
@@ -2138,8 +2141,10 @@ struct Runner {
 
 // Attention's dropout decision for element (b, h, i, j) of the [B, H, Sq,
 // Skv] probabilities: kept (1) with probability 1 - p.
+// The same draw and test as the RNG operation's Bernoulli with probability
+// 1 - p, so the single operation and the composite graph agree.
 double dropout_keep(uint64_t seed, uint64_t offset, size_t linear, double p) {
-  return unit(draw(seed, offset, linear)) >= p ? 1.0 : 0.0;
+  return unit(draw(seed, offset, linear)) < 1.0 - p ? 1.0 : 0.0;
 }
 
 // Scaled dot-product attention, forward and backward, as cuDNN's fused
