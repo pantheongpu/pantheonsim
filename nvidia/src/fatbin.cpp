@@ -2,10 +2,13 @@
 
 #include <dlfcn.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 #include "vgpu/error.hpp"
+#include "vgpu/sass/exec.hpp"
 
 namespace vgpu::cuda {
 namespace {
@@ -147,7 +150,12 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
   return extract_ptx(data, std::numeric_limits<size_t>::max());
 }
 
-std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
+namespace {
+
+// Walks a fatbin's entries, calling `take` with each entry's kind, arch and
+// payload (decompressed). Every offset is checked as extract_ptx describes.
+template <class Take>
+void walk_entries(const void* data, size_t bytes, Take&& take) {
   if (!data) throw Error::make(Err::InvalidValue, "NULL fatbin image");
   const uint8_t* p = static_cast<const uint8_t*>(data);
 
@@ -200,7 +208,6 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
     throw Error::make(Err::InvalidValue, "fatbin declares ", ch.size,
                       " bytes, above the ", kMaxFatbinBytes, "-byte limit; image looks corrupt");
 
-  std::vector<FatbinPtx> out;
   need(p, ch.header_size, "the container header it declares");
   const uint8_t* const body = p + ch.header_size;
   // The declared body size is a number from the image. Where the real length is
@@ -225,10 +232,10 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
       throw Error::make(Err::InvalidValue, "fatbin entry payload (", eh.padded_payload_size,
                         " bytes) runs past the end of the image");
 
-    if (eh.kind == 1 /* PTX */) {
+    if (eh.kind == 1 /* PTX */ || eh.kind == 2 /* ELF: a cubin */) {
       uint64_t size = eh.payload_size ? eh.payload_size : eh.padded_payload_size;
       if (size > eh.padded_payload_size)
-        throw Error::make(Err::InvalidValue, "fatbin PTX payload_size (", size,
+        throw Error::make(Err::InvalidValue, "fatbin entry payload_size (", size,
                           ") exceeds its padded size (", eh.padded_payload_size, ")");
       FatbinPtx px;
       px.arch = eh.arch;
@@ -252,8 +259,9 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
       } else {
         px.text.assign(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
       }
-      while (!px.text.empty() && px.text.back() == '\0') px.text.pop_back();
-      out.push_back(std::move(px));
+      if (eh.kind == 1)
+        while (!px.text.empty() && px.text.back() == '\0') px.text.pop_back();
+      take(eh.kind, std::move(px));
     }
 
     const uint8_t* next = payload + eh.padded_payload_size;
@@ -263,7 +271,75 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
                         "image is malformed");
     e = next;
   }
+}
+
+}  // namespace
+
+std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
+  std::vector<FatbinPtx> out;
+  walk_entries(data, bytes, [&](uint16_t kind, FatbinPtx&& px) {
+    if (kind == 1) out.push_back(std::move(px));
+  });
   return out;
+}
+
+std::vector<FatbinPtx> extract_elf(const void* data, size_t bytes) {
+  std::vector<FatbinPtx> out;
+  walk_entries(data, bytes, [&](uint16_t kind, FatbinPtx&& px) {
+    if (kind == 2) out.push_back(std::move(px));
+  });
+  return out;
+}
+
+std::vector<FatbinPtx> extract_elf(const void* data) {
+  return extract_elf(data, std::numeric_limits<size_t>::max());
+}
+
+std::string pick_cubin(const void* fatbin, uint32_t cc) {
+  if (const char* v = std::getenv("VGPU_SASS"); v && v[0] == '0') return {};
+  std::vector<FatbinPtx> elfs;
+  try {
+    elfs = extract_elf(fatbin);
+  } catch (const Error&) {
+    return {};
+  }
+  const FatbinPtx* best = nullptr;
+  for (const FatbinPtx& e : elfs) {
+    if (e.text.size() < 64 || e.text[0] != 0x7f) continue;
+    uint16_t type;
+    std::memcpy(&type, e.text.data() + 16, 2);
+    if (type != 2 /* ET_EXEC */) continue;
+    if (e.arch / 10 != cc / 10 || e.arch > cc) continue;
+    if (!best || e.arch > best->arch) best = &e;
+  }
+  if (!best) return {};
+  // SASS the executor cannot run all of yet gives way to the fatbin's PTX,
+  // when it has some; VGPU_SASS=1 insists on the SASS (to find what is
+  // missing), and VGPU_SASS_LOG=1 says when a fatbin falls back.
+  const char* force = std::getenv("VGPU_SASS");
+  if (!(force && force[0] == '1')) {
+    std::string why;
+    try {
+      why = vgpu::sass::unsupported(reinterpret_cast<const uint8_t*>(best->text.data()), best->text.size());
+    } catch (const Error& e) {
+      why = e.message();
+    }
+    if (!why.empty()) {
+      bool has_ptx = false;
+      try {
+        has_ptx = !extract_ptx(fatbin).empty();
+      } catch (const Error&) {
+      }
+      if (has_ptx) {
+        if (const char* log = std::getenv("VGPU_SASS_LOG"); log && log[0] == '1')
+          std::fprintf(stderr, "[vgpu] running PTX instead of SASS: %s\n", why.c_str());
+        return {};
+      }
+    }
+  }
+  if (const char* log = std::getenv("VGPU_SASS_LOG"); log && log[0] == '1')
+    std::fprintf(stderr, "[vgpu] running SASS: an sm_%u cubin\n", best->arch);
+  return best->text;
 }
 
 // The ".target sm_XY[a|f]" line of a PTX image: the number, and the suffix

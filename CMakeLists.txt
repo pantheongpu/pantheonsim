@@ -128,6 +128,10 @@ add_library(vgpu STATIC
   amd/src/bundle.cpp
   amd/src/codeobject.cpp
   amd/src/gcn_decode.cpp
+  src/sass/decode.cpp
+  src/sass/cubin.cpp
+  src/sass/module.cpp
+  src/sass/exec.cpp
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
@@ -704,6 +708,8 @@ add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpu
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # CDNA machine code, decoded and checked against what the assembler wrote.
+vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
+target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
 target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # And run: a wavefront over that machine code, against device memory.
@@ -1548,6 +1554,26 @@ set_tests_properties(e2e_texture_gather PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# SASS by default, PTX the fallback: which code a binary runs, by what it
+# carries, what the SASS executor runs, and VGPU_SASS's overrides.
+add_test(NAME e2e_sass_path
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_path.sh)
+set_tests_properties(e2e_sass_path PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# SASS on every architecture: programs built for each generation's SASS, sm_75
+# to sm_120, run by default and on their PTX, which must agree. sm_100 and
+# sm_120 need CUDA 12.8's nvcc; older ones skip those. nvidia/docs/sass.md.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_sass_archs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_sass_archs PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 3600)
+endif()
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.
@@ -1840,18 +1866,21 @@ endif()
 # Memory a graph owns: an allocation node, a free node, what the graph-memory
 # attributes report, and a trim that keeps the address it documents as fixed.
 if(TARGET vgpucudart)
-  # PyTorch's CUDA build, unmodified, on a simulated RTX 5090: the whole-model
-  # checks the AMD GPUs run (amd/tests/pytorch/models.py), through
-  # `vgpu run --preload`, where a Python with PyTorch for CUDA 13 is installed
-  # (VGPU_TORCH_CUDA_PYTHON); it skips elsewhere. nvidia/docs/pytorch.md.
-  add_test(NAME e2e_pytorch_models_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
-           ${CMAKE_SOURCE_DIR}/amd/tests/pytorch/models.py 12 nvidia/rtx5090)
-  set_tests_properties(e2e_pytorch_models_rtx5090 PROPERTIES
-    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
-    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    SKIP_REGULAR_EXPRESSION "^SKIP:"
-    RUN_SERIAL TRUE
-    TIMEOUT 1800)
+  # PyTorch's CUDA build, unmodified: the whole-model checks the AMD GPUs run
+  # (amd/tests/pytorch/models.py), through `vgpu run --preload`, where a Python
+  # with PyTorch for CUDA 13 is installed (VGPU_TORCH_CUDA_PYTHON); they skip
+  # elsewhere. One GPU per SASS image the wheel carries (sm_75, 80, 86, 90,
+  # 100, 120): its kernels run as that machine code. nvidia/docs/pytorch.md.
+  foreach(_gpu t4 a100 rtx3060 h100 b200 rtx5090)
+    add_test(NAME e2e_pytorch_models_${_gpu} COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+             ${CMAKE_SOURCE_DIR}/amd/tests/pytorch/models.py 12 nvidia/${_gpu})
+    set_tests_properties(e2e_pytorch_models_${_gpu} PROPERTIES
+      DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      RUN_SERIAL TRUE
+      TIMEOUT 1800)
+  endforeach()
   # One operator at a time against the CPU (nvidia/tests/pytorch/ops.py): the
   # libraries PyTorch ships -- cuBLAS/cuBLASLt (fp8 included), cuDNN, cuFFT,
   # cuRAND, cuSOLVER, cuSPARSE -- each SDPA backend, autocast, and the
