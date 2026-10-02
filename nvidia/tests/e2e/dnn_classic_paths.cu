@@ -1284,6 +1284,246 @@ static void fused_ops() {
   }
 }
 
+/* ---- multi-head attention ---- */
+
+// A host model reading every weight where cudnnGetMultiHeadAttnWeights says
+// it is (address, dimensions, strides), in double.
+struct HostAttn {
+  int H, qS, kS, vS, qP, kP, vP, oP;
+  double sm;
+  struct T3 { long off = -1; int d[3] = {}, s[3] = {}; };
+  T3 tw[8];
+  int qe() const { return qP ? qP : qS; }
+  int ve() const { return vP ? vP : vS; }
+  int oS() const { return oP ? oP : H * ve(); }
+  void project(const std::vector<double>& w, int kind, int h, const double* x, int S, int P, double* y) const {
+    if (tw[kind].off < 0) { std::copy(x, x + S, y); return; }
+    for (int p = 0; p < P; ++p) {
+      double a = tw[kind + 4].off >= 0 ? w[tw[kind + 4].off + (size_t)h * tw[kind + 4].s[0] + (size_t)p * tw[kind + 4].s[1]] : 0;
+      for (int c = 0; c < S; ++c) a += w[tw[kind].off + (size_t)h * tw[kind].s[0] + (size_t)p * tw[kind].s[1] + (size_t)c * tw[kind].s[2]] * x[c];
+      y[p] = a;
+    }
+  }
+  // Layout [batch][time][vect] (beam 1); outputs for steps < lq, windows lo/hi.
+  std::vector<double> run(const std::vector<double>& w, const std::vector<double>& Q, const std::vector<double>& K,
+                          const std::vector<double>& V, const std::vector<double>* R, int B, int Tq, int Tk,
+                          const std::vector<int>& lq, const std::vector<int>& lk, const std::vector<int>& lo,
+                          const std::vector<int>& hi) const {
+    const int E = qe(), Ve = ve(), O = oS();
+    std::vector<double> out((size_t)B * Tq * O, 0.0);
+    for (int b = 0; b < B; ++b)
+      for (int t = 0; t < Tq; ++t) {
+        double* o = out.data() + ((size_t)b * Tq + t) * O;
+        for (int r = 0; r < O && oP; ++r) o[r] = tw[7].off >= 0 ? w[tw[7].off + r] : 0;
+        if (t >= lq[b]) {  // past the sequence: the output bias and the residual (measured)
+          if (R)
+            for (int r = 0; r < O; ++r) o[r] += (*R)[((size_t)b * Tq + t) * qS + r];
+          continue;
+        }
+        std::vector<double> hv((size_t)H * Ve, 0.0);
+        for (int h = 0; h < H; ++h) {
+          std::vector<double> qb(E);
+          project(w, 0, h, Q.data() + ((size_t)b * Tq + t) * qS, qS, E, qb.data());
+          const int first = std::max(lo[t], 0), last = std::min(hi[t], lk[b]);
+          std::vector<double> sc, vbs;
+          for (int k = first; k < last; ++k) {
+            std::vector<double> kb(E), vb(Ve);
+            project(w, 1, h, K.data() + ((size_t)b * Tk + k) * kS, kS, E, kb.data());
+            project(w, 2, h, V.data() + ((size_t)b * Tk + k) * vS, vS, Ve, vb.data());
+            double d = 0;
+            for (int e = 0; e < E; ++e) d += kb[e] * qb[e];
+            sc.push_back(sm * d);
+            vbs.insert(vbs.end(), vb.begin(), vb.end());
+          }
+          double mx = -1e300, z = 0;
+          for (double v : sc) mx = std::fmax(mx, v);
+          for (double v : sc) z += std::exp(v - mx);
+          for (size_t i = 0; i < sc.size(); ++i)
+            for (int c = 0; c < Ve; ++c) hv[(size_t)h * Ve + c] += std::exp(sc[i] - mx) / z * vbs[i * Ve + c];
+        }
+        if (oP)
+          for (int r = 0; r < O; ++r)
+            for (int h = 0; h < H; ++h)
+              for (int c = 0; c < Ve; ++c)
+                o[r] += w[tw[3].off + (size_t)h * tw[3].s[0] + (size_t)r * tw[3].s[1] + (size_t)c * tw[3].s[2]] * hv[(size_t)h * Ve + c];
+        else
+          std::copy(hv.begin(), hv.end(), o);
+        if (R)
+          for (int r = 0; r < O; ++r) o[r] += (*R)[((size_t)b * Tq + t) * qS + r];
+      }
+    return out;
+  }
+};
+
+static void attention(bool biases, int qS, int kS, int vS, int qP, int vP, int oP, bool residual, const char* name) {
+  const int NH = 2, Tq = 4, Tk = 5, B = 2;
+  const double sm = 0.5;
+  cudnnAttnDescriptor_t ad;
+  (cudnnCreateAttnDescriptor(&ad), own(ad, cudnnDestroyAttnDescriptor));
+  const unsigned mode = CUDNN_ATTN_QUERYMAP_ALL_TO_ONE | (biases ? CUDNN_ATTN_ENABLE_PROJ_BIASES : 0);
+  CK(cudnnSetAttnDescriptor(ad, mode, NH, sm, CUDNN_DATA_DOUBLE, CUDNN_DATA_DOUBLE, CUDNN_DEFAULT_MATH, nullptr, nullptr, qS, kS,
+                            vS, qP, qP, vP, oP, Tq, Tk, B, 1));
+  size_t wb = 0, ws = 0, rs = 0, wsi = 0;
+  CK(cudnnGetMultiHeadAttnBuffers(H, ad, &wb, &wsi, nullptr));  // inference's workspace
+  CK(cudnnGetMultiHeadAttnBuffers(H, ad, &wb, &ws, &rs));
+  const size_t nw = wb / 8;
+  std::vector<double> hw(nw);
+  for (size_t i = 0; i < nw; ++i) hw[i] = 0.3 * std::sin(0.37 * i + 0.2);
+  Buf<double> w(hw.empty() ? std::vector<double>(1) : hw);
+  HostAttn host{NH, qS, kS, vS, qP, qP, vP, oP, sm, {}};
+  cudnnTensorDescriptor_t td = tensor();
+  const int ve = vP ? vP : vS, os = oP ? oP : NH * ve;
+  bool shapes = true;
+  for (int k = 0; k < 8; ++k) {
+    void* a = nullptr;
+    CK(cudnnGetMultiHeadAttnWeights(H, ad, (cudnnMultiHeadAttnWeightKind_t)k, wb, w.p, td, &a));
+    cudnnDataType_t dt;
+    int nb = -1;
+    auto& e = host.tw[k];
+    CK(cudnnGetTensorNdDescriptor(td, 3, &dt, &nb, e.d, e.s));
+    const bool exists = (k == 0 || k == 4) ? qP > 0 : (k == 1 || k == 5) ? qP > 0 : (k == 2 || k == 6) ? vP > 0 : oP > 0;
+    const bool want = exists && (k < 4 || biases);
+    shapes &= want ? (a != nullptr && nb == 3) : (a == nullptr && nb == 0);
+    if (a) e.off = (long)((double*)a - w.p);
+  }
+  // The weights in the hardware's order and strides (measured).
+  if (qP && vP && oP && biases && qS == 6 && kS == 5 && vS == 4)
+    shapes &= host.tw[0].off == 0 && host.tw[0].s[0] == qP && host.tw[0].s[1] == 1 && host.tw[0].s[2] == NH * qP &&
+              host.tw[1].off == 36 && host.tw[2].off == 66 && host.tw[3].off == 82 && host.tw[3].s[0] == oP * vP &&
+              host.tw[3].s[2] == oP && host.tw[4].off == 102 && host.tw[7].off == 118 && host.tw[7].d[0] == 1;
+  char what[200];
+  std::snprintf(what, sizeof what, "%s: weights where the hardware keeps them", name);
+  expect(what, shapes);
+  // Sequences [batch][time][vect], the second of each shorter.
+  cudnnSeqDataDescriptor_t qd, kd, vd, od;
+  for (auto* d : {&qd, &kd, &vd, &od}) (cudnnCreateSeqDataDescriptor(d), own(*d, cudnnDestroySeqDataDescriptor));
+  cudnnSeqDataAxis_t axes[4] = {CUDNN_SEQDATA_BATCH_DIM, CUDNN_SEQDATA_BEAM_DIM, CUDNN_SEQDATA_TIME_DIM,
+                                CUDNN_SEQDATA_VECT_DIM};
+  auto dims = [](int T, int Bn, int V) {
+    std::vector<int> d(4);
+    d[CUDNN_SEQDATA_TIME_DIM] = T, d[CUDNN_SEQDATA_BATCH_DIM] = Bn, d[CUDNN_SEQDATA_BEAM_DIM] = 1, d[CUDNN_SEQDATA_VECT_DIM] = V;
+    return d;
+  };
+  const std::vector<int> lq = {Tq, Tq - 1}, lk = {Tk, Tk - 1};
+  CK(cudnnSetSeqDataDescriptor(qd, CUDNN_DATA_DOUBLE, 4, dims(Tq, B, qS).data(), axes, 2, lq.data(), nullptr));
+  CK(cudnnSetSeqDataDescriptor(kd, CUDNN_DATA_DOUBLE, 4, dims(Tk, B, kS).data(), axes, 2, lk.data(), nullptr));
+  CK(cudnnSetSeqDataDescriptor(vd, CUDNN_DATA_DOUBLE, 4, dims(Tk, B, vS).data(), axes, 2, lk.data(), nullptr));
+  CK(cudnnSetSeqDataDescriptor(od, CUDNN_DATA_DOUBLE, 4, dims(Tq, B, os).data(), axes, 2, lq.data(), nullptr));
+  const size_t nq = (size_t)B * Tq * qS, nk = (size_t)B * Tk * kS, nv = (size_t)B * Tk * vS, no = (size_t)B * Tq * os;
+  std::vector<double> hq(nq), hk(nk), hv(nv), hr(residual ? nq : 0);
+  for (size_t i = 0; i < nq; ++i) hq[i] = std::cos(0.5 * i);
+  for (size_t i = 0; i < nk; ++i) hk[i] = std::sin(0.7 * i + 1);
+  for (size_t i = 0; i < nv; ++i) hv[i] = std::cos(0.3 * i + 2);
+  for (size_t i = 0; i < hr.size(); ++i) hr[i] = 0.1 * i;
+  const std::vector<int> lo = {0, 0, 1, 0}, hi = {2, 3, 4, 1000};  // sliding windows, the last everything
+  Buf<int> dlq(lq), dlk(lk);
+  Buf<double> bq(hq), bk(hk), bv(hv), br(residual ? hr : std::vector<double>(1)), bo(no), work(std::max(ws, wsi) / 8 + 1),
+      res(rs / 8 + 1);
+  CK(cudnnMultiHeadAttnForward(H, ad, -1, lo.data(), hi.data(), dlq.p, dlk.p, qd, bq.p, residual ? br.p : nullptr, kd,
+                               bk.p, vd, bv.p, od, bo.p, wb, w.p, ws, work.p, rs, res.p));
+  const auto want = host.run(hw, hq, hk, hv, residual ? &hr : nullptr, B, Tq, Tk, lq, lk, lo, hi);
+  auto got = bo.get();
+  double e = 0;
+  for (size_t i = 0; i < no; ++i) e = std::fmax(e, std::fabs(got[i] - want[i]));
+  std::snprintf(what, sizeof what, "%s: forward over windows, steps past a sequence = the output bias", name);
+  expect(what, e < 1e-12, e);
+  // Inference, one step: only that step is written.
+  std::vector<double> marker(no, 7.0);
+  bo.put(marker);
+  CK(cudnnMultiHeadAttnForward(H, ad, 2, lo.data(), hi.data(), dlq.p, dlk.p, qd, bq.p, residual ? br.p : nullptr, kd,
+                               bk.p, vd, bv.p, od, bo.p, wb, w.p, wsi, work.p, 0, nullptr));
+  expect("a single step with a reserve space (training) is BAD_PARAM",
+         cudnnMultiHeadAttnForward(H, ad, 2, lo.data(), hi.data(), dlq.p, dlk.p, qd, bq.p, residual ? br.p : nullptr, kd,
+                                   bk.p, vd, bv.p, od, bo.p, wb, w.p, std::max(ws, wsi), work.p, rs, res.p) ==
+             CUDNN_STATUS_BAD_PARAM);
+  got = bo.get();
+  bool step = true;
+  for (int b = 0; b < B; ++b)
+    for (int t = 0; t < Tq; ++t)
+      for (int r = 0; r < os; ++r) {
+        const size_t i = ((size_t)b * Tq + t) * os + r;
+        step &= t == 2 ? std::fabs(got[i] - want[i]) < 1e-12 : got[i] == 7.0;
+      }
+  std::snprintf(what, sizeof what, "%s: currIdx 2 writes that step alone", name);
+  expect(what, step);
+  // Gradients against finite differences of L = <out, dout>.
+  CK(cudnnMultiHeadAttnForward(H, ad, -1, lo.data(), hi.data(), dlq.p, dlk.p, qd, bq.p, residual ? br.p : nullptr, kd,
+                               bk.p, vd, bv.p, od, bo.p, wb, w.p, ws, work.p, rs, res.p));
+  std::vector<double> hdo(no);
+  for (int b = 0; b < B; ++b)
+    for (int t = 0; t < Tq; ++t)
+      for (int r = 0; r < os; ++r) hdo[((size_t)b * Tq + t) * os + r] = t < lq[b] ? std::cos(0.9 * (b * 31 + t * 7 + r)) : 0;
+  Buf<double> bdo(hdo), bdq(nq), bdk(nk), bdv(nv), bdw(nw ? nw : 1);
+  CK(cudnnMultiHeadAttnBackwardData(H, ad, lo.data(), hi.data(), dlq.p, dlk.p, od, bdo.p, qd, bdq.p, bq.p, kd, bdk.p,
+                                    bk.p, vd, bdv.p, bv.p, wb, w.p, ws, work.p, rs, res.p));
+  if (nw)
+    CK(cudnnMultiHeadAttnBackwardWeights(H, ad, CUDNN_WGRAD_MODE_SET, qd, bq.p, kd, bk.p, vd, bv.p, od, bdo.p, wb, w.p,
+                                         bdw.p, ws, work.p, rs, res.p));
+  auto loss = [&](const std::vector<double>& ww, const std::vector<double>& q, const std::vector<double>& k,
+                  const std::vector<double>& v) {
+    const auto o = host.run(ww, q, k, v, residual ? &hr : nullptr, B, Tq, Tk, lq, lk, lo, hi);
+    double s = 0;
+    for (size_t i = 0; i < no; ++i) s += o[i] * hdo[i];
+    return s;
+  };
+  auto fd = [&](const char* part, std::vector<double> x, const std::vector<double>& g, int which, size_t step) {
+    double worst = 0;
+    for (size_t i = 0; i < x.size(); i += step) {
+      const double h = 1e-6, keep = x[i];
+      x[i] = keep + h;
+      const double lp = which == 0 ? loss(x, hq, hk, hv) : which == 1 ? loss(hw, x, hk, hv) : which == 2 ? loss(hw, hq, x, hv) : loss(hw, hq, hk, x);
+      x[i] = keep - h;
+      const double lm = which == 0 ? loss(x, hq, hk, hv) : which == 1 ? loss(hw, x, hk, hv) : which == 2 ? loss(hw, hq, x, hv) : loss(hw, hq, hk, x);
+      x[i] = keep;
+      const double f = (lp - lm) / (2 * h);
+      worst = std::fmax(worst, std::fabs(f - g[i]) / (std::fabs(f) + 1e-3));
+    }
+    char t[200];
+    std::snprintf(t, sizeof t, "%s: %s matches finite differences", name, part);
+    expect(t, worst < 1e-5, worst);
+  };
+  fd("dqueries", hq, bdq.get(), 1, 1);
+  fd("dkeys", hk, bdk.get(), 2, 1);
+  fd("dvalues", hv, bdv.get(), 3, 1);
+  if (nw) fd("dweights", hw, bdw.get(), 0, nw / 53 + 1);
+}
+
+static void attention_status() {
+  cudnnAttnDescriptor_t ad;
+  (cudnnCreateAttnDescriptor(&ad), own(ad, cudnnDestroyAttnDescriptor));
+  auto set = [&](unsigned mode, double sm, int qP, int kP, cudnnDataType_t t, int qS, int kS, int beam) {
+    return cudnnSetAttnDescriptor(ad, mode, 2, sm, t, t, CUDNN_DEFAULT_MATH, nullptr, nullptr, qS, kS, 4, qP, kP, 3, 4,
+                                  3, 4, 2, beam);
+  };
+  bool ok = set(0, 0.5, 2, 2, CUDNN_DATA_FLOAT, 4, 4, 1) == CUDNN_STATUS_SUCCESS;
+  ok &= set(0, 0.5, 2, 3, CUDNN_DATA_FLOAT, 4, 4, 1) == CUDNN_STATUS_BAD_PARAM;
+  ok &= set(0, -1.0, 2, 2, CUDNN_DATA_FLOAT, 4, 4, 1) == CUDNN_STATUS_BAD_PARAM;
+  ok &= set(0, 0.5, 0, 0, CUDNN_DATA_FLOAT, 4, 5, 1) == CUDNN_STATUS_BAD_PARAM;
+  ok &= set(0, 0.5, 2, 2, CUDNN_DATA_BFLOAT16, 4, 4, 1) == CUDNN_STATUS_BAD_PARAM;
+  ok &= set(CUDNN_ATTN_QUERYMAP_ONE_TO_ONE, 0.5, 2, 2, CUDNN_DATA_FLOAT, 4, 4, 2) == CUDNN_STATUS_NOT_SUPPORTED;
+  expect("cudnnSetAttnDescriptor's refusals (as on an RTX 3060)", ok);
+  cudnnSeqDataDescriptor_t sd;
+  (cudnnCreateSeqDataDescriptor(&sd), own(sd, cudnnDestroySeqDataDescriptor));
+  int dims[4];
+  dims[CUDNN_SEQDATA_TIME_DIM] = 4, dims[CUDNN_SEQDATA_BATCH_DIM] = 2, dims[CUDNN_SEQDATA_BEAM_DIM] = 1, dims[CUDNN_SEQDATA_VECT_DIM] = 6;
+  cudnnSeqDataAxis_t axes[4] = {CUDNN_SEQDATA_BATCH_DIM, CUDNN_SEQDATA_BEAM_DIM, CUDNN_SEQDATA_TIME_DIM,
+                                CUDNN_SEQDATA_VECT_DIM};
+  cudnnSeqDataAxis_t bad[4] = {CUDNN_SEQDATA_BATCH_DIM, CUDNN_SEQDATA_BEAM_DIM, CUDNN_SEQDATA_VECT_DIM,
+                               CUDNN_SEQDATA_TIME_DIM};
+  const int lens[2] = {4, 3};
+  ok = cudnnSetSeqDataDescriptor(sd, CUDNN_DATA_FLOAT, 3, dims, axes, 2, lens, nullptr) == CUDNN_STATUS_NOT_SUPPORTED;
+  ok &= cudnnSetSeqDataDescriptor(sd, CUDNN_DATA_FLOAT, 4, dims, axes, 1, lens, nullptr) == CUDNN_STATUS_BAD_PARAM;
+  ok &= cudnnSetSeqDataDescriptor(sd, CUDNN_DATA_FLOAT, 4, dims, bad, 2, lens, nullptr) == CUDNN_STATUS_BAD_PARAM;
+  ok &= cudnnSetSeqDataDescriptor(sd, CUDNN_DATA_FLOAT, 4, dims, axes, 2, lens, nullptr) == CUDNN_STATUS_SUCCESS;
+  cudnnDataType_t t;
+  int nb = 0, gd[4] = {}, gl[4] = {};
+  cudnnSeqDataAxis_t ga[4];
+  size_t nl = 0;
+  ok &= cudnnGetSeqDataDescriptor(sd, &t, &nb, 4, gd, ga, &nl, 4, gl, nullptr) == CUDNN_STATUS_SUCCESS && nb == 4 &&
+        gd[CUDNN_SEQDATA_VECT_DIM] == 6 && ga[0] == CUDNN_SEQDATA_BATCH_DIM && nl == 2 && gl[1] == 3;
+  expect("sequence data descriptors: setter refusals and the getter", ok);
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("FAIL cudnnCreate\n");
@@ -1318,6 +1558,11 @@ int main() {
   folded_dgrad(5, 6, 9, 7, 3, 1, 2);
   folded_dgrad(3, 4, 9, 9, 3, 1, 3);
   folded_dgrad(2, 4, 8, 8, 4, 1, 2);
+  attention(true, 6, 5, 4, 3, 2, 5, false, "attention with projections and biases");
+  attention(false, 6, 5, 4, 3, 2, 5, false, "attention with projections, no biases");
+  attention(false, 6, 6, 4, 0, 0, 0, false, "attention without projections");
+  attention(true, 5, 6, 4, 3, 2, 5, true, "attention with residuals");
+  attention_status();
   destroy_owned();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
