@@ -118,6 +118,10 @@ echo "wrote $(pwd)/rdna4.gfx1201"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 rdna2.cpp -o rdna2.gfx1030
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1030 rdna2.cpp -o rdna2.w64.gfx1030
 echo "wrote $(pwd)/rdna2.gfx1030 and rdna2.w64.gfx1030"
+# Where a work-group runs (__smid), on every target, in one program.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-arch=gfx950 --offload-arch=gfx90a \
+  --offload-arch=gfx1030 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
+echo "wrote $(pwd)/smid.all"
 # Arrays, textures and surfaces, for each RDNA generation's image resources.
 for arch in gfx1030 gfx1100 gfx1201; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
