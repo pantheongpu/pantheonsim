@@ -16,12 +16,24 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #define CK(x) do { cudnnStatus_t s_ = (x); if (s_ != CUDNN_STATUS_SUCCESS) { \
   std::printf("%s -> %d\n", #x, (int)s_); return; } } while (0)
 
 static cudnnHandle_t H;
+
+// Every descriptor made here is destroyed before the program exits, so the
+// sanitizer build's leak checker finds nothing left over.
+static std::vector<std::function<void()>> g_owned;
+template <class D, class F>
+static void own(D d, F destroy) {
+  g_owned.push_back([d, destroy] { destroy(d); });
+}
+static void destroy_owned() {
+  while (!g_owned.empty()) g_owned.back()(), g_owned.pop_back();
+}
 
 static float fill(int i, float scale) { return scale * std::sin(0.7f * i + 0.3f) + 0.1f * (i % 5) - 0.2f; }
 
@@ -64,7 +76,7 @@ struct Buf {
 
 static cudnnTensorDescriptor_t t4(cudnnTensorFormat_t f, cudnnDataType_t t, int n, int c, int h, int w) {
   cudnnTensorDescriptor_t d;
-  cudnnCreateTensorDescriptor(&d);
+  (cudnnCreateTensorDescriptor(&d), own(d, cudnnDestroyTensorDescriptor));
   cudnnStatus_t s = cudnnSetTensor4dDescriptor(d, f, t, n, c, h, w);
   if (s) std::printf("SetTensor4d -> %d\n", (int)s);
   return d;
@@ -75,10 +87,10 @@ static void conv(const char* tag, cudnnDataType_t dt, cudnnDataType_t ct, cudnnT
                  int W, int K, int R, int pad, int stride) {
   cudnnTensorDescriptor_t xd = t4(f, dt, N, C, H_, W);
   cudnnFilterDescriptor_t wd;
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   CK(cudnnSetFilter4dDescriptor(wd, dt, f, K, C, R, R));
   cudnnConvolutionDescriptor_t cd;
-  cudnnCreateConvolutionDescriptor(&cd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
   CK(cudnnSetConvolution2dDescriptor(cd, pad, pad, stride, stride, 1, 1, CUDNN_CROSS_CORRELATION, ct));
   int n, c, h, w;
   CK(cudnnGetConvolution2dForwardOutputDim(cd, xd, wd, &n, &c, &h, &w));
@@ -109,10 +121,10 @@ static void int8_conv() {
   cudnnTensorDescriptor_t y8 = t4(CUDNN_TENSOR_NHWC, CUDNN_DATA_INT8, 2, 4, 5, 5);
   cudnnTensorDescriptor_t yf = t4(CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, 2, 4, 5, 5);
   cudnnFilterDescriptor_t wd;
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   CK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_INT8, CUDNN_TENSOR_NHWC, 4, 8, 3, 3));
   cudnnConvolutionDescriptor_t cd;
-  cudnnCreateConvolutionDescriptor(&cd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
   CK(cudnnSetConvolution2dDescriptor(cd, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_INT32));
   Buf<int8_t> x(400, 20.0f), w(288, 3.0f, 5), y(200, 0.0f);
   Buf<float> f(200, 0.0f);
@@ -144,7 +156,7 @@ static void half_layers() {
   const float one = 1.0f, zero = 0.0f, two = 2.0f, half = 0.5f;
   cudnnTensorDescriptor_t d = t4(CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, 2, 3, 4, 5);
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
   for (auto m : {CUDNN_ACTIVATION_RELU, CUDNN_ACTIVATION_SIGMOID, CUDNN_ACTIVATION_TANH, CUDNN_ACTIVATION_ELU}) {
     CK(cudnnSetActivationDescriptor(ad, m, CUDNN_NOT_PROPAGATE_NAN, 0.7));
     Buf<__half> x(120, 1.5f), y(120, 0.0f), dy(120, 1.0f, 4), dx(120, 0.5f, 8);
@@ -157,7 +169,7 @@ static void half_layers() {
     dump(t, dx.get());
   }
   cudnnPoolingDescriptor_t pd;
-  cudnnCreatePoolingDescriptor(&pd);
+  (cudnnCreatePoolingDescriptor(&pd), own(pd, cudnnDestroyPoolingDescriptor));
   cudnnTensorDescriptor_t px = t4(CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, 2, 3, 6, 6);
   cudnnTensorDescriptor_t py = t4(CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, 2, 3, 3, 3);
   for (auto m : {CUDNN_POOLING_MAX, CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING}) {
@@ -183,7 +195,7 @@ static void half_layers() {
   }
   // Batch normalization: half data, float parameters.
   cudnnTensorDescriptor_t bnd;
-  cudnnCreateTensorDescriptor(&bnd);
+  (cudnnCreateTensorDescriptor(&bnd), own(bnd, cudnnDestroyTensorDescriptor));
   CK(cudnnDeriveBNTensorDescriptor(bnd, d, CUDNN_BATCHNORM_SPATIAL));
   cudnnDataType_t pt;
   int n, c, h, w, s0, s1, s2, s3;
@@ -202,7 +214,7 @@ static void half_layers() {
   dump("half bn dbias", dbias.get());
   // Op tensor: half data, float compute.
   cudnnOpTensorDescriptor_t od;
-  cudnnCreateOpTensorDescriptor(&od);
+  (cudnnCreateOpTensorDescriptor(&od), own(od, cudnnDestroyOpTensorDescriptor));
   CK(cudnnSetOpTensorDescriptor(od, CUDNN_OP_TENSOR_MUL, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
   cudnnTensorDescriptor_t bc = t4(CUDNN_TENSOR_NCHW, CUDNN_DATA_HALF, 1, 3, 1, 1);
   Buf<__half> A(120, 1.5f), B(3, 1.0f, 2), C(120, 1.0f, 6);
@@ -257,6 +269,7 @@ int main() {
   int8_conv();
   half_layers();
   conversions();
+  destroy_owned();
   cudnnDestroy(H);
   return 0;
 }

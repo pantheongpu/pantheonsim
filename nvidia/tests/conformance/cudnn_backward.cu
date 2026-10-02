@@ -22,12 +22,24 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #define CK(x) do { cudnnStatus_t s_ = (x); if (s_ != CUDNN_STATUS_SUCCESS) { \
   std::printf("%s -> %d\n", #x, (int)s_); return; } } while (0)
 
 static cudnnHandle_t H;
+
+// Every descriptor made here is destroyed before the program exits, so the
+// sanitizer build's leak checker finds nothing left over.
+static std::vector<std::function<void()>> g_owned;
+template <class D, class F>
+static void own(D d, F destroy) {
+  g_owned.push_back([d, destroy] { destroy(d); });
+}
+static void destroy_owned() {
+  while (!g_owned.empty()) g_owned.back()(), g_owned.pop_back();
+}
 
 static float fill(int i, float scale) { return scale * std::sin(0.7f * i + 0.3f) + 0.1f * (i % 5) - 0.2f; }
 
@@ -61,7 +73,7 @@ struct Buf {
 
 static cudnnTensorDescriptor_t tensor(cudnnDataType_t t, std::vector<int> dims, std::vector<int> strides = {}) {
   cudnnTensorDescriptor_t d;
-  cudnnCreateTensorDescriptor(&d);
+  (cudnnCreateTensorDescriptor(&d), own(d, cudnnDestroyTensorDescriptor));
   if (strides.empty()) {
     strides.assign(dims.size(), 1);
     for (int i = (int)dims.size() - 2; i >= 0; --i) strides[i] = strides[i + 1] * dims[i + 1];
@@ -72,7 +84,7 @@ static cudnnTensorDescriptor_t tensor(cudnnDataType_t t, std::vector<int> dims, 
 }
 static cudnnTensorDescriptor_t tensor4(cudnnTensorFormat_t f, cudnnDataType_t t, int n, int c, int h, int w) {
   cudnnTensorDescriptor_t d;
-  cudnnCreateTensorDescriptor(&d);
+  (cudnnCreateTensorDescriptor(&d), own(d, cudnnDestroyTensorDescriptor));
   cudnnStatus_t s = cudnnSetTensor4dDescriptor(d, f, t, n, c, h, w);
   if (s) std::printf("SetTensor4d -> %d\n", (int)s);
   return d;
@@ -99,15 +111,15 @@ static void conv_case(const ConvCase& cc, cudnnDataType_t dt) {
   const int nsp = (int)cc.x.size() - 2;
   cudnnConvolutionDescriptor_t cd;
   cudnnFilterDescriptor_t wd;
-  cudnnCreateConvolutionDescriptor(&cd);
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   std::vector<int> pads(nsp, cc.pad), strs(nsp, cc.stride), dils(nsp, cc.dil);
   CK(cudnnSetConvolutionNdDescriptor(cd, nsp, pads.data(), strs.data(), dils.data(), cc.mode, dt));
   CK(cudnnSetConvolutionGroupCount(cd, cc.groups));
   CK(cudnnSetFilterNdDescriptor(wd, dt, cc.fmt, (int)cc.w.size(), cc.w.data()));
   cudnnTensorDescriptor_t xd, yd;
-  cudnnCreateTensorDescriptor(&xd);
-  cudnnCreateTensorDescriptor(&yd);
+  (cudnnCreateTensorDescriptor(&xd), own(xd, cudnnDestroyTensorDescriptor));
+  (cudnnCreateTensorDescriptor(&yd), own(yd, cudnnDestroyTensorDescriptor));
   if (cc.fmt == CUDNN_TENSOR_NHWC) {
     CK(cudnnSetTensorNdDescriptorEx(xd, CUDNN_TENSOR_NHWC, dt, (int)cc.x.size(), cc.x.data()));
   } else if (cc.strided) {
@@ -170,10 +182,6 @@ static void conv_case(const ConvCase& cc, cudnnDataType_t dt) {
   CK(cudnnConvolutionBackwardBias(H, &a, yd, dy.p, &b, bd, db.p));
   std::snprintf(tag, sizeof tag, "%s bwd-bias a.5 b.25", cc.tag);
   dump(tag, db.get());
-  for (auto d : {xd, yd, bd}) cudnnDestroyTensorDescriptor(d);
-  if (cc.strided) cudnnDestroyTensorDescriptor(xpk), cudnnDestroyTensorDescriptor(ypk);
-  cudnnDestroyFilterDescriptor(wd);
-  cudnnDestroyConvolutionDescriptor(cd);
 }
 
 static void convolutions() {
@@ -197,13 +205,13 @@ static void conv_bias_act() {
   cudnnTensorDescriptor_t xd = tensor(CUDNN_DATA_FLOAT, {2, 3, 5, 5}), yd = tensor(CUDNN_DATA_FLOAT, {2, 4, 5, 5}),
                           bd = tensor(CUDNN_DATA_FLOAT, {1, 4, 1, 1});
   cudnnFilterDescriptor_t wd;
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   CK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, 3, 3, 3));
   cudnnConvolutionDescriptor_t cd;
-  cudnnCreateConvolutionDescriptor(&cd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
   CK(cudnnSetConvolution2dDescriptor(cd, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
   Buf<float> x(150, 1.0f), w(108, 0.5f, 3), z(200, 0.7f, 5), bias(4, 0.4f, 9), y(200, 0.0f);
   const float a1 = 1.0f, a2 = 0.5f;
   for (auto m : {CUDNN_ACTIVATION_RELU, CUDNN_ACTIVATION_IDENTITY}) {
@@ -226,7 +234,7 @@ static void activations() {
   cudnnTensorDescriptor_t d = tensor(CUDNN_DATA_FLOAT, {2, 3, 4, 5});
   cudnnTensorDescriptor_t dn = tensor4(CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, 2, 3, 4, 5);
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
   struct M { const char* tag; cudnnActivationMode_t m; double coef; };
   const M modes[] = {{"relu", CUDNN_ACTIVATION_RELU, 0}, {"sigmoid", CUDNN_ACTIVATION_SIGMOID, 0},
                      {"tanh", CUDNN_ACTIVATION_TANH, 0}, {"clipped relu 0.8", CUDNN_ACTIVATION_CLIPPED_RELU, 0.8},
@@ -257,7 +265,7 @@ static void pooling() {
                      {"avg incl 3x3 p1 s2", CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING, 3, 1, 2},
                      {"avg excl 3x3 p1 s2", CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING, 3, 1, 2}};
   cudnnPoolingDescriptor_t pd;
-  cudnnCreatePoolingDescriptor(&pd);
+  (cudnnCreatePoolingDescriptor(&pd), own(pd, cudnnDestroyPoolingDescriptor));
   const float one = 1.0f, zero = 0.0f, a = 1.5f, b = 0.5f;
   cudnnTensorDescriptor_t xd = tensor(CUDNN_DATA_FLOAT, {2, 3, 7, 6});
   for (const P& p : cases) {
@@ -271,7 +279,6 @@ static void pooling() {
     char tag[64];
     std::snprintf(tag, sizeof tag, "pool bwd %s", p.tag);
     dump(tag, dx.get());
-    cudnnDestroyTensorDescriptor(yd);
   }
   // 3-D max pooling.
   const int win[3] = {2, 2, 2}, pad[3] = {0, 1, 0}, str[3] = {1, 2, 2};
@@ -305,7 +312,7 @@ static void softmax() {
 static void lrn() {
   cudnnTensorDescriptor_t d = tensor(CUDNN_DATA_FLOAT, {2, 7, 3, 2});
   cudnnLRNDescriptor_t ld;
-  cudnnCreateLRNDescriptor(&ld);
+  (cudnnCreateLRNDescriptor(&ld), own(ld, cudnnDestroyLRNDescriptor));
   const float one = 1.0f, zero = 0.0f;
   for (unsigned n : {5u, 4u, 1u}) {
     CK(cudnnSetLRNDescriptor(ld, n, 0.3, 0.75, 1.5));
@@ -327,7 +334,7 @@ static void reductions() {
   cudnnTensorDescriptor_t a = tensor(CUDNN_DATA_FLOAT, {2, 3, 4, 5});
   const std::vector<std::vector<int>> outs = {{1, 3, 1, 1}, {2, 1, 4, 1}, {1, 1, 1, 1}, {2, 3, 4, 1}};
   cudnnReduceTensorDescriptor_t rd;
-  cudnnCreateReduceTensorDescriptor(&rd);
+  (cudnnCreateReduceTensorDescriptor(&rd), own(rd, cudnnDestroyReduceTensorDescriptor));
   const float al = 1.5f, be = 0.5f;
   Buf<float> A(120, 2.0f);
   for (int op = CUDNN_REDUCE_TENSOR_ADD; op <= CUDNN_REDUCE_TENSOR_MUL_NO_ZEROS; ++op)
@@ -359,7 +366,6 @@ static void reductions() {
         std::printf("\n");
       }
       if (wsp) cudaFree(wsp);
-      cudnnDestroyTensorDescriptor(c);
     }
   cudnnTensorDescriptor_t same = tensor(CUDNN_DATA_FLOAT, {2, 3, 4, 5});
   Buf<float> C(120, 1.0f);
@@ -373,7 +379,7 @@ static void arithmetic() {
   cudnnTensorDescriptor_t c = tensor4(CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, 2, 3, 4, 5);
   cudnnTensorDescriptor_t bc = tensor(CUDNN_DATA_FLOAT, {1, 3, 1, 1}), bn = tensor(CUDNN_DATA_FLOAT, {2, 1, 4, 5});
   cudnnOpTensorDescriptor_t od;
-  cudnnCreateOpTensorDescriptor(&od);
+  (cudnnCreateOpTensorDescriptor(&od), own(od, cudnnDestroyOpTensorDescriptor));
   const float a1 = 1.5f, a2 = -0.5f, b = 0.25f;
   for (int op = CUDNN_OP_TENSOR_ADD; op <= CUDNN_OP_TENSOR_NOT; ++op) {
     CK(cudnnSetOpTensorDescriptor(od, (cudnnOpTensorOp_t)op, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN));
@@ -417,7 +423,7 @@ static void dropout() {
   void* st = nullptr;
   cudaMalloc(&st, states);
   cudnnDropoutDescriptor_t dd;
-  cudnnCreateDropoutDescriptor(&dd);
+  (cudnnCreateDropoutDescriptor(&dd), own(dd, cudnnDestroyDropoutDescriptor));
   CK(cudnnSetDropoutDescriptor(dd, H, 0.3f, st, states, 42));
   // Forward on a constant: the kept elements must all be x / (1 - p).
   Buf<float> x(1000, 0.0f), y(1000, 0.0f), dy(1000, 1.0f), dx(1000, 0.0f);
@@ -445,7 +451,7 @@ static void dropout() {
 
 static void batchnorm_nhwc() {
   cudnnTensorDescriptor_t x = tensor4(CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, 3, 4, 5, 2), bnd;
-  cudnnCreateTensorDescriptor(&bnd);
+  (cudnnCreateTensorDescriptor(&bnd), own(bnd, cudnnDestroyTensorDescriptor));
   const float one = 1.0f, zero = 0.0f;
   for (auto mode : {CUDNN_BATCHNORM_SPATIAL, CUDNN_BATCHNORM_PER_ACTIVATION}) {
     CK(cudnnDeriveBNTensorDescriptor(bnd, x, mode));
@@ -477,10 +483,10 @@ static void batchnorm_nhwc() {
 // the reserve space the library asks for.
 static void batchnorm_fused() {
   cudnnTensorDescriptor_t x = tensor4(CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, 2, 4, 3, 3), bnd;
-  cudnnCreateTensorDescriptor(&bnd);
+  (cudnnCreateTensorDescriptor(&bnd), own(bnd, cudnnDestroyTensorDescriptor));
   CK(cudnnDeriveBNTensorDescriptor(bnd, x, CUDNN_BATCHNORM_SPATIAL_PERSISTENT));
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
   const float one = 1.0f, zero = 0.0f;
   struct F { const char* tag; cudnnBatchNormOps_t ops; cudnnActivationMode_t act; };
   for (const F& f : {F{"bn+relu", CUDNN_BATCHNORM_OPS_BN_ACTIVATION, CUDNN_ACTIVATION_RELU},
@@ -540,6 +546,7 @@ static void batchnorm_fused() {
 static void spatial_transformer() {
   cudnnSpatialTransformerDescriptor_t st;
   CK(cudnnCreateSpatialTransformerDescriptor(&st));
+  own(st, cudnnDestroySpatialTransformerDescriptor);
   const int dims[4] = {2, 2, 4, 5};
   CK(cudnnSetSpatialTransformerNdDescriptor(st, CUDNN_SAMPLER_BILINEAR, CUDNN_DATA_FLOAT, 4, dims));
   const float th[12] = {0.83f, 0.21f, 0.07f, -0.17f, 0.91f, -0.05f, 1.13f, -0.31f, 0.12f, 0.27f, 0.77f, 0.19f};
@@ -557,7 +564,6 @@ static void spatial_transformer() {
   dump("stn sampler dgrid", dgrid.get());
   CK(cudnnSpatialTfGridGeneratorBackward(H, st, dgrid.p, dtheta.p));
   dump("stn dtheta", dtheta.get());
-  cudnnDestroySpatialTransformerDescriptor(st);
 }
 
 // CTC loss: costs and gradients from activations (SOFTMAX) and from
@@ -568,6 +574,7 @@ static void ctc_loss() {
   cudnnTensorDescriptor_t pd = tensor(CUDNN_DATA_FLOAT, {T, N, A});
   cudnnCTCLossDescriptor_t cd;
   CK(cudnnCreateCTCLossDescriptor(&cd));
+  own(cd, cudnnDestroyCTCLossDescriptor);
   const int labels[] = {1, 2, 2, 4, 3, 1, 4}, llen[N] = {3, 1, 3}, ilen[N] = {6, 5, 4};
   Buf<float> x(T * N * A, 1.5f), costs(N, 0.0f);
   // Probabilities for NONE mode: a softmax of x over A.
@@ -626,15 +633,14 @@ static void ctc_loss() {
     dump(tag, g2.get());
   }
   cudaFree(dl), cudaFree(dll), cudaFree(dil);
-  cudnnDestroyCTCLossDescriptor(cd);
 }
 
 // The cuDNN 8 normalization API: per-channel training forward and backward,
 // per-activation inference, and the one group it allows.
 static void normalization_api() {
   cudnnTensorDescriptor_t x = tensor(CUDNN_DATA_FLOAT, {3, 4, 5, 2}), sb, mv;
-  cudnnCreateTensorDescriptor(&sb);
-  cudnnCreateTensorDescriptor(&mv);
+  (cudnnCreateTensorDescriptor(&sb), own(sb, cudnnDestroyTensorDescriptor));
+  (cudnnCreateTensorDescriptor(&mv), own(mv, cudnnDestroyTensorDescriptor));
   const float one = 1.0f, zero = 0.0f;
   CK(cudnnDeriveNormTensorDescriptor(sb, mv, x, CUDNN_NORM_PER_CHANNEL, 1));
   Buf<float> X(120, 1.5f), Y(120, 0.0f), dy(120, 1.0f, 4), dx(120, 0.0f), scale(4, 0.5f, 3), bias(4, 0.2f, 5),
@@ -681,10 +687,10 @@ static void normalization_api() {
 static void im2col() {
   cudnnTensorDescriptor_t xd = tensor(CUDNN_DATA_FLOAT, {2, 3, 6, 5});
   cudnnFilterDescriptor_t wd;
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   CK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, 3, 3, 2));
   cudnnConvolutionDescriptor_t cd;
-  cudnnCreateConvolutionDescriptor(&cd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
   Buf<float> x(180, 1.0f);
   for (auto mode : {CUDNN_CROSS_CORRELATION, CUDNN_CONVOLUTION}) {
     CK(cudnnSetConvolution2dDescriptor(cd, 1, 0, 2, 1, 1, 2, mode, CUDNN_DATA_FLOAT));
@@ -719,6 +725,7 @@ int main() {
   ctc_loss();
   normalization_api();
   im2col();
+  destroy_owned();
   cudnnDestroy(H);
   return 0;
 }

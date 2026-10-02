@@ -44,6 +44,17 @@ static void expect(const char* what, bool ok, double detail = 0) {
 
 static cudnnHandle_t H;
 
+// Every descriptor made here is destroyed before the program exits, so the
+// sanitizer build's leak checker finds nothing left over.
+static std::vector<std::function<void()>> g_owned;
+template <class D, class F>
+static void own(D d, F destroy) {
+  g_owned.push_back([d, destroy] { destroy(d); });
+}
+static void destroy_owned() {
+  while (!g_owned.empty()) g_owned.back()(), g_owned.pop_back();
+}
+
 static double fill(int i, double scale) { return scale * std::sin(0.7 * i + 0.3) + 0.05 * (i % 7) - 0.1; }
 
 template <class T>
@@ -74,7 +85,7 @@ static double dot(const std::vector<T>& a, const std::vector<T>& b) {
 
 static cudnnTensorDescriptor_t nd(cudnnDataType_t t, const std::vector<int>& dims, bool nhwc = false) {
   cudnnTensorDescriptor_t d;
-  cudnnCreateTensorDescriptor(&d);
+  (cudnnCreateTensorDescriptor(&d), own(d, cudnnDestroyTensorDescriptor));
   cudnnSetTensorNdDescriptorEx(d, nhwc ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW, t, (int)dims.size(), dims.data());
   return d;
 }
@@ -99,8 +110,8 @@ static void adjoint(const Case& c, cudnnDataType_t dt) {
   const int nsp = (int)c.x.size() - 2;
   cudnnConvolutionDescriptor_t cd;
   cudnnFilterDescriptor_t wd;
-  cudnnCreateConvolutionDescriptor(&cd);
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   std::vector<int> pads(nsp, c.pad), strides(nsp, c.stride), dils(nsp, c.dil);
   CK(cudnnSetConvolutionNdDescriptor(cd, nsp, pads.data(), strides.data(), dils.data(), c.mode, dt));
   CK(cudnnSetConvolutionGroupCount(cd, c.groups));
@@ -149,8 +160,6 @@ static void adjoint(const Case& c, cudnnDataType_t dt) {
   const double scale = std::fabs(a) + 1.0, tol = sizeof(T) == 8 ? 1e-10 : 1e-4;
   const double err = std::fmax(std::fabs(a - b), std::fabs(a - e)) / scale;
   expect(what, err < tol, err);
-  cudnnDestroyTensorDescriptor(xd), cudnnDestroyTensorDescriptor(yd);
-  cudnnDestroyFilterDescriptor(wd), cudnnDestroyConvolutionDescriptor(cd);
 }
 
 static void convolutions() {
@@ -195,7 +204,7 @@ static void gradients() {
   const std::vector<double> x0 = x.get(), g = dy.get();
 
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
   struct A { const char* name; cudnnActivationMode_t m; double coef; };
   for (const A& a : {A{"sigmoid", CUDNN_ACTIVATION_SIGMOID, 0}, A{"tanh", CUDNN_ACTIVATION_TANH, 0},
                      A{"elu", CUDNN_ACTIVATION_ELU, 0.7}, A{"swish", CUDNN_ACTIVATION_SWISH, 0},
@@ -216,7 +225,7 @@ static void gradients() {
   }
 
   cudnnPoolingDescriptor_t pd;
-  cudnnCreatePoolingDescriptor(&pd);
+  (cudnnCreatePoolingDescriptor(&pd), own(pd, cudnnDestroyPoolingDescriptor));
   for (auto m : {CUDNN_POOLING_AVERAGE_COUNT_INCLUDE_PADDING, CUDNN_POOLING_AVERAGE_COUNT_EXCLUDE_PADDING,
                  CUDNN_POOLING_MAX}) {
     CK(cudnnSetPooling2dDescriptor(pd, m, CUDNN_NOT_PROPAGATE_NAN, 3, 2, 1, 1, 2, 1));
@@ -236,7 +245,6 @@ static void gradients() {
     char what[96];
     std::snprintf(what, sizeof what, "pooling backward (mode %d) matches finite differences", (int)m);
     check_gradient(what, n, x0, fwd, pdy.get(), pdx.get());
-    cudnnDestroyTensorDescriptor(pyd);
   }
 
   for (auto algo : {CUDNN_SOFTMAX_ACCURATE, CUDNN_SOFTMAX_LOG})
@@ -256,7 +264,7 @@ static void gradients() {
     }
 
   cudnnLRNDescriptor_t ld;
-  cudnnCreateLRNDescriptor(&ld);
+  (cudnnCreateLRNDescriptor(&ld), own(ld, cudnnDestroyLRNDescriptor));
   for (unsigned w : {3u, 4u}) {
     CK(cudnnSetLRNDescriptor(ld, w, 0.4, 0.75, 1.2));
     auto fwd = [&](const std::vector<double>& in) {
@@ -294,10 +302,10 @@ static void algorithms() {
   cudnnTensorDescriptor_t xd = nd(CUDNN_DATA_FLOAT, {2, 4, 8, 8}), yd = nd(CUDNN_DATA_FLOAT, {2, 6, 8, 8}),
                           bad = nd(CUDNN_DATA_FLOAT, {2, 6, 7, 8});
   cudnnFilterDescriptor_t wd;
-  cudnnCreateFilterDescriptor(&wd);
+  (cudnnCreateFilterDescriptor(&wd), own(wd, cudnnDestroyFilterDescriptor));
   CK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 6, 4, 3, 3));
   cudnnConvolutionDescriptor_t cd;
-  cudnnCreateConvolutionDescriptor(&cd);
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
   CK(cudnnSetConvolution2dDescriptor(cd, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
 
   int fmax = 0, dmax = 0, wmax = 0;
@@ -387,13 +395,13 @@ static void algorithms() {
   expect("a bias gradient with the wrong channel count is BAD_PARAM",
          cudnnConvolutionBackwardBias(H, &one, yd, dy.p, &zero, bias, w.p) == CUDNN_STATUS_BAD_PARAM);
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
   cudnnSetActivationDescriptor(ad, CUDNN_ACTIVATION_IDENTITY, CUDNN_NOT_PROPAGATE_NAN, 0);
   expect("IDENTITY activation backward is BAD_PARAM, as forward is",
          cudnnActivationBackward(H, ad, &one, xd, x.p, xd, x.p, xd, x.p, &zero, xd, x.p) == CUDNN_STATUS_BAD_PARAM);
   int dims[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1}, strides[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
   cudnnTensorDescriptor_t t;
-  cudnnCreateTensorDescriptor(&t);
+  (cudnnCreateTensorDescriptor(&t), own(t, cudnnDestroyTensorDescriptor));
   expect("a 9-dimensional tensor is NOT_SUPPORTED",
          cudnnSetTensorNdDescriptor(t, CUDNN_DATA_FLOAT, 9, dims, strides) == CUDNN_STATUS_NOT_SUPPORTED);
   dims[1] = 0;
@@ -417,7 +425,7 @@ static void dropout() {
   void* st = nullptr;
   cudaMalloc(&st, states);
   cudnnDropoutDescriptor_t dd;
-  cudnnCreateDropoutDescriptor(&dd);
+  (cudnnCreateDropoutDescriptor(&dd), own(dd, cudnnDestroyDropoutDescriptor));
   const float p = 0.3f;
   CK(cudnnSetDropoutDescriptor(dd, H, p, st, states, 2024));
   Buf<float> x(n), y(n), dy(n), dx(n);
@@ -473,15 +481,19 @@ static void rnn_dropout() {
   cudaMalloc(&st, ss);
   cudnnDropoutDescriptor_t drop;
   CK(cudnnCreateDropoutDescriptor(&drop));
+  own(drop, cudnnDestroyDropoutDescriptor);
   CK(cudnnSetDropoutDescriptor(drop, H, 0.5f, st, ss, 77));
   cudnnRNNDescriptor_t rd;
   CK(cudnnCreateRNNDescriptor(&rd));
+  own(rd, cudnnDestroyRNNDescriptor);
   CK(cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS, CUDNN_UNIDIRECTIONAL,
                               CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, I, Hd, Hd, L,
                               drop, 0));
   cudnnRNNDataDescriptor_t xd, yd;
   CK(cudnnCreateRNNDataDescriptor(&xd));
+  own(xd, cudnnDestroyRNNDataDescriptor);
   CK(cudnnCreateRNNDataDescriptor(&yd));
+  own(yd, cudnnDestroyRNNDataDescriptor);
   const int lens[B] = {T, T};
   CK(cudnnSetRNNDataDescriptor(xd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, I, lens, nullptr));
   CK(cudnnSetRNNDataDescriptor(yd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, Hd, lens, nullptr));
@@ -535,8 +547,6 @@ static void rnn_dropout() {
     worst = std::fmax(worst, std::fabs((loss(x0, a) - loss(x0, b)) / (2 * e) - gw[i]));
   }
   expect("RNN backward-weights through dropout matches finite differences", worst < 5e-3, worst);
-  cudnnDestroyRNNDataDescriptor(xd), cudnnDestroyRNNDataDescriptor(yd), cudnnDestroyRNNDescriptor(rd);
-  cudnnDestroyTensorDescriptor(hd), cudnnDestroyDropoutDescriptor(drop);
   cudaFree(st);
 }
 
@@ -549,13 +559,13 @@ static std::vector<double> lstm_output(cudnnDataType_t type, cudnnDataType_t mat
   const int Tn = 3, B = 2, I = 3, Hd = 4, L = 2;
   *status = 0;
   cudnnRNNDescriptor_t rd;
-  cudnnCreateRNNDescriptor(&rd);
+  (cudnnCreateRNNDescriptor(&rd), own(rd, cudnnDestroyRNNDescriptor));
   cudnnStatus_t s = cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS,
                                              CUDNN_UNIDIRECTIONAL, CUDNN_LINEAR_INPUT, type, math, CUDNN_DEFAULT_MATH,
                                              I, Hd, Hd, L, nullptr, 0);
   if (s) { *status = s; return {}; }
   cudnnRNNDataDescriptor_t xd, yd;
-  cudnnCreateRNNDataDescriptor(&xd), cudnnCreateRNNDataDescriptor(&yd);
+  (cudnnCreateRNNDataDescriptor(&xd), own(xd, cudnnDestroyRNNDataDescriptor)), (cudnnCreateRNNDataDescriptor(&yd), own(yd, cudnnDestroyRNNDataDescriptor));
   const int lens[B] = {Tn, Tn};
   cudnnSetRNNDataDescriptor(xd, type, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, Tn, B, I, lens, nullptr);
   cudnnSetRNNDataDescriptor(yd, type, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, Tn, B, Hd, lens, nullptr);
@@ -575,8 +585,6 @@ static std::vector<double> lstm_output(cudnnDataType_t type, cudnnDataType_t mat
   *status = s;
   std::vector<double> out;
   for (T v : dy.get()) out.push_back((double)(float)v);
-  cudnnDestroyRNNDataDescriptor(xd), cudnnDestroyRNNDataDescriptor(yd), cudnnDestroyRNNDescriptor(rd);
-  cudnnDestroyTensorDescriptor(hd);
   return out;
 }
 
@@ -607,6 +615,7 @@ static void ctc() {
   cudnnTensorDescriptor_t pd = nd(CUDNN_DATA_FLOAT, {T, N, A});
   cudnnCTCLossDescriptor_t cd;
   CK(cudnnCreateCTCLossDescriptor(&cd));
+  own(cd, cudnnDestroyCTCLossDescriptor);
   CK(cudnnSetCTCLossDescriptor_v9(cd, CUDNN_DATA_FLOAT, CUDNN_LOSS_NORMALIZATION_SOFTMAX, CUDNN_CTC_ZERO_OOB_GRADIENTS,
                                   4));
   const int labels[] = {1, 2, 3}, llen[N] = {2, 1}, ilen[N] = {5, 4};
@@ -645,7 +654,6 @@ static void ctc() {
   const double want = -(v[2] - std::log(sum));
   expect("a one-step CTC cost is -log of the symbol's probability", std::fabs(c1.get()[0] - want) < 1e-5,
          c1.get()[0] - want);
-  cudnnDestroyCTCLossDescriptor(cd);
 }
 
 int main() {
@@ -660,6 +668,7 @@ int main() {
   rnn_dropout();
   rnn_types();
   ctc();
+  destroy_owned();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
   return fails ? 1 : 0;
