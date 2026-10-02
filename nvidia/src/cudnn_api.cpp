@@ -44,11 +44,13 @@ struct TensorDesc {
   Layout l;
   bool nd = false;            // set through an Nd setter: GetTensorNdDescriptor reports its own rank
   bool channels_last = false; // NHWC by format, or by strides with C innermost
+  int vect = 0;               // NCHW_VECT_C: channels per vector (4 or 32); strides count vectors
 };
 
 struct FilterDesc {
   Layout l;
   cudnnTensorFormat_t format = CUDNN_TENSOR_NCHW;
+  int vect = 0;  // NCHW_VECT_C: channels per vector (4 or 32)
 };
 
 struct ConvDesc {
@@ -110,6 +112,109 @@ const FilterDesc* fdesc(const void* d) {
 
 #define BAD(fn, why) fail(CUDNN_STATUS_BAD_PARAM, fn, why)
 #define UNSUPPORTED(fn, why) fail(CUDNN_STATUS_NOT_SUPPORTED, fn, why)
+
+/* ---- vectorized types and the NCHW_VECT_C layout ---- */
+
+// INT8x4 and UINT8x4 pack four channels into a 32-bit word, INT8x32 32 into
+// 32 bytes. In the NCHW_VECT_C layout a tensor [N, C, spatial...] is stored
+// as [N][C/v][spatial...][v]: the descriptor's strides count vectors
+// (measured: 2x8x3x5 INT8x4 reports strides 30,15,5,1 and 240 bytes). In any
+// other layout one element is one whole vector (2x8x3x5 INT8x4 NCHW is 960
+// bytes, INT8x32 32 bytes per element).
+int lanes_of(cudnnDataType_t t) {
+  switch (t) {
+    case CUDNN_DATA_INT8x4: case CUDNN_DATA_UINT8x4: return 4;
+    case CUDNN_DATA_INT8x32: return 32;
+    default: return 0;
+  }
+}
+cudnnDataType_t lane_type(cudnnDataType_t t) { return t == CUDNN_DATA_UINT8x4 ? CUDNN_DATA_UINT8 : CUDNN_DATA_INT8; }
+size_t elem_bytes(cudnnDataType_t t) { return t == CUDNN_DATA_INT8x32 ? 32 : type_bytes(t); }
+
+// Element types the classic descriptors take at all; the rest -- FP8, FP4,
+// BOOLEAN, INT64 -- are BAD_PARAM from every tensor and filter setter
+// (measured, cuDNN 9.27 on an RTX 3060 (sm_86): FP8_E4M3/E5M2/E8M0,
+// FP4_E2M1, BOOLEAN and INT64 through Set4d, SetNd, SetNdEx and the filter
+// setters).
+bool classic_type(cudnnDataType_t t) {
+  switch (t) {
+    case CUDNN_DATA_FLOAT: case CUDNN_DATA_DOUBLE: case CUDNN_DATA_HALF: case CUDNN_DATA_BFLOAT16:
+    case CUDNN_DATA_INT8: case CUDNN_DATA_UINT8: case CUDNN_DATA_INT32:
+    case CUDNN_DATA_INT8x4: case CUDNN_DATA_UINT8x4: case CUDNN_DATA_INT8x32:
+      return true;
+    default: return false;
+  }
+}
+
+// Bytes of an NCHW_VECT_C tensor or filter (packed; channels a multiple of v,
+// or rounded down to one, as cuDNN sizes a filter of 6 channels in INT8x4).
+size_t vect_bytes(const Layout& l, int v) {
+  size_t n = 1;
+  for (int i = 0; i < l.rank; ++i) n *= static_cast<size_t>(i == 1 ? l.dims[1] / v : l.dims[i]);
+  return n * static_cast<size_t>(v);
+}
+// Byte offset of logical element i (row-major over the logical dims).
+inline size_t vect_offset(const Layout& l, int v, size_t i) {
+  size_t S = 1;
+  for (int d = 2; d < l.rank; ++d) S *= static_cast<size_t>(l.dims[d]);
+  const size_t C = static_cast<size_t>(l.dims[1]), s = i % S, c = (i / S) % C, n = i / (S * C);
+  return ((n * (C / v) + c / v) * S + s) * v + c % v;
+}
+void vect_decode(const Layout& l, int v, const uint8_t* raw, std::vector<double>* out) {
+  const cudnnDataType_t lt = lane_type(l.type);
+  out->assign(l.count(), 0.0);
+  for (size_t i = 0; i < out->size(); ++i) (*out)[i] = decode(lt, raw + vect_offset(l, v, i));
+}
+void vect_encode(const Layout& l, int v, const std::vector<double>& in, uint8_t* raw) {
+  const cudnnDataType_t lt = lane_type(l.type);
+  for (size_t i = 0; i < l.count() && i < in.size(); ++i) encode(lt, in[i], raw + vect_offset(l, v, i));
+}
+
+// Reads and writes that also take the vectorized layout.
+bool read_any(const Layout& l, int v, const void* dev, std::vector<double>* out) {
+  if (!v) return read(l, dev, out);
+  std::vector<uint8_t> raw(vect_bytes(l, v));
+  if (!dev || cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  vect_decode(l, v, raw.data(), out);
+  return true;
+}
+bool blend_any(const Layout& l, int v, void* dev, const std::vector<double>& r, double alpha, double beta) {
+  if (!v) return blend_write(l, dev, r, alpha, beta);
+  std::vector<uint8_t> raw(vect_bytes(l, v));
+  if (!dev || cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  std::vector<double> out(l.count(), 0.0);
+  if (beta != 0.0) vect_decode(l, v, raw.data(), &out);
+  for (size_t i = 0; i < out.size() && i < r.size(); ++i) out[i] = beta != 0.0 ? alpha * r[i] + beta * out[i] : alpha * r[i];
+  vect_encode(l, v, out, raw.data());
+  return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+// cudnnReorderFilterAndBias's permutation of an INT8x32 filter, measured on
+// the RTX 3060 by reordering filters whose bytes count their own positions
+// (K 4 to 96, C 32 and 64, 1x1 to 3x3): the filter is a [K][L] byte matrix
+// (L = C/32 * R * S * 32) cut into 32-byte column chunks; the output holds
+// chunk 0 of every row first, then chunk 1, ..., each as groups of 8 rows,
+// and within a group output vector j (0..7), lane l takes row
+// 8g + j/4 + 2((l%16)/4), byte (j%4)*8 + (l/16)*4 + l%4 of the chunk. Rows
+// past K (K not a multiple of 8) come out as zeros. Calls f(output byte,
+// source byte or -1).
+template <class F>
+void x32_filter_map(int64_t K, int64_t L, size_t bytes, F&& f) {
+  const int64_t G = (K + 7) / 8;
+  for (size_t d = 0; d < bytes; ++d) {
+    const int64_t l = static_cast<int64_t>(d % 32), t = static_cast<int64_t>(d / 32);
+    const int64_t j = t % 8, g = (t / 8) % G, c = t / 8 / G;
+    const int64_t row = g * 8 + j / 4 + 2 * ((l % 16) / 4), col = c * 32 + (j % 4) * 8 + (l / 16) * 4 + l % 4;
+    f(d, row < K && col < L ? row * L + col : -1);
+  }
+}
+// And of its bias (one float per output channel), measured the same way:
+// within each block of 32, output j takes (g%4)*8 + (g/4)*4 + j%4 of the
+// block (g = (j%32)/4), zero where that is past K.
+inline int64_t x32_bias_source(int64_t K, int64_t j) {
+  const int64_t base = j / 32 * 32, g = (j % 32) / 4, src = base + (g % 4) * 8 + (g / 4) * 4 + j % 4;
+  return src < K ? src : -1;
+}
 
 // Whether every dimension of a is c's or 1: what may be broadcast onto c.
 bool broadcastable(const Layout& a, const Layout& c) {
@@ -303,10 +408,13 @@ cudnnStatus_t set_tensor(const char* fn, TensorDesc* t, cudnnDataType_t type, in
                          const int* strides, int fmt) {
   if (nb > kMaxRank) return UNSUPPORTED(fn, "more than " + std::to_string(kMaxRank) + " dimensions");
   if (nb < 1) return BAD(fn, "a tensor needs at least one dimension");
-  if (fmt == CUDNN_TENSOR_NCHW_VECT_C)
-    return UNSUPPORTED(fn, "the vectorized CUDNN_TENSOR_NCHW_VECT_C layout is not supported");
-  if (!storable(type) || type == CUDNN_DATA_BOOLEAN)
-    return UNSUPPORTED(fn, std::string("data type ") + type_name(type) + " is not supported");
+  if (!classic_type(type)) return BAD(fn, std::string("data type ") + type_name(type) + " is not a classic tensor type");
+  // NCHW_VECT_C takes the vectorized types only, and channels a multiple of
+  // the vector (measured: INT8 or FLOAT with VECT_C, and 6 channels of
+  // INT8x4 or 16 of INT8x32, are BAD_PARAM).
+  const int v = fmt == CUDNN_TENSOR_NCHW_VECT_C ? lanes_of(type) : 0;
+  if (fmt == CUDNN_TENSOR_NCHW_VECT_C && (!v || nb < 2 || dims[1] % v))
+    return BAD(fn, "NCHW_VECT_C needs INT8x4, UINT8x4 or INT8x32 and channels a multiple of the vector");
   Layout l;
   l.type = type;
   l.rank = nb;
@@ -314,7 +422,13 @@ cudnnStatus_t set_tensor(const char* fn, TensorDesc* t, cudnnDataType_t type, in
     if (dims[i] <= 0) return BAD(fn, "dimension " + std::to_string(i) + " is " + std::to_string(dims[i]));
     l.dims[i] = dims[i];
   }
-  if (strides) {
+  if (v) {
+    // Strides count vectors: those of [N, C/v, spatial...] packed.
+    int64_t vd[kMaxRank];
+    std::copy(l.dims, l.dims + nb, vd);
+    vd[1] /= v;
+    packed_strides(nb, vd, false, l.strides);
+  } else if (strides) {
     for (int i = 0; i < nb; ++i) {
       if (strides[i] <= 0) return BAD(fn, "stride " + std::to_string(i) + " is " + std::to_string(strides[i]));
       l.strides[i] = strides[i];
@@ -323,6 +437,7 @@ cudnnStatus_t set_tensor(const char* fn, TensorDesc* t, cudnnDataType_t type, in
     packed_strides(nb, l.dims, fmt == CUDNN_TENSOR_NHWC, l.strides);
   }
   t->l = l;
+  t->vect = v;
   t->channels_last = fmt == CUDNN_TENSOR_NHWC ||
                      (fmt < 0 && nb >= 3 && l.strides[1] == 1 && l.dims[1] > 1);
   return CUDNN_STATUS_SUCCESS;
@@ -399,7 +514,11 @@ VGPU_EXPORT cudnnStatus_t cudnnGetTensorNdDescriptor(const cudnnTensorDescriptor
 VGPU_EXPORT cudnnStatus_t cudnnGetTensorSizeInBytes(const cudnnTensorDescriptor_t d, size_t* size) {
   const TensorDesc* t = tdesc(d);
   if (!t || !size) return CUDNN_STATUS_BAD_PARAM;
-  *size = t->l.span() * type_bytes(t->l.type);
+  if (t->vect) {
+    *size = vect_bytes(t->l, t->vect);
+    return CUDNN_STATUS_SUCCESS;
+  }
+  *size = t->l.span() * elem_bytes(t->l.type);
   return CUDNN_STATUS_SUCCESS;
 }
 
@@ -419,12 +538,18 @@ VGPU_EXPORT cudnnStatus_t cudnnSetFilterNdDescriptor(cudnnFilterDescriptor_t d, 
                                                      cudnnTensorFormat_t fmt, int nb, const int dims[]) {
   static const char* fn = "cudnnSetFilterNdDescriptor";
   if (!known(d) || !dims) return CUDNN_STATUS_BAD_PARAM;
-  if (fmt == CUDNN_TENSOR_NCHW_VECT_C) return UNSUPPORTED(fn, "the vectorized CUDNN_TENSOR_NCHW_VECT_C layout is not supported");
-  if (fmt != CUDNN_TENSOR_NCHW && fmt != CUDNN_TENSOR_NHWC) return BAD(fn, "unknown format");
+  if (fmt != CUDNN_TENSOR_NCHW && fmt != CUDNN_TENSOR_NHWC && fmt != CUDNN_TENSOR_NCHW_VECT_C)
+    return BAD(fn, "unknown format");
   if (nb < 3 || nb > kMaxRank) return BAD(fn, "a filter has 3 to 8 dimensions");
-  if (!storable(type) || type == CUDNN_DATA_BOOLEAN)
-    return UNSUPPORTED(fn, std::string("data type ") + type_name(type) + " is not supported");
+  if (!classic_type(type)) return BAD(fn, std::string("data type ") + type_name(type) + " is not a classic filter type");
+  // VECT_C takes the vectorized types only (measured: an INT8 VECT_C filter
+  // is BAD_PARAM); unlike a tensor, a filter may have channels that are not a
+  // multiple of the vector, and is then sized as if rounded down (INT8x4
+  // 8x6x3x3: 288 bytes; INT8x32 32x40x1x1: 1024).
+  const int v = fmt == CUDNN_TENSOR_NCHW_VECT_C ? lanes_of(type) : 0;
+  if (fmt == CUDNN_TENSOR_NCHW_VECT_C && !v) return BAD(fn, "NCHW_VECT_C needs INT8x4, UINT8x4 or INT8x32");
   FilterDesc f;
+  f.vect = v;
   f.format = fmt;
   f.l.type = type;
   f.l.rank = nb;
@@ -469,7 +594,7 @@ VGPU_EXPORT cudnnStatus_t cudnnGetFilterNdDescriptor(const cudnnFilterDescriptor
 VGPU_EXPORT cudnnStatus_t cudnnGetFilterSizeInBytes(const cudnnFilterDescriptor_t d, size_t* size) {
   const FilterDesc* f = fdesc(d);
   if (!f || !size) return CUDNN_STATUS_BAD_PARAM;
-  *size = f->l.count() * type_bytes(f->l.type);
+  *size = f->vect ? vect_bytes(f->l, f->vect) : f->l.count() * elem_bytes(f->l.type);
   return CUDNN_STATUS_SUCCESS;
 }
 
@@ -618,7 +743,59 @@ struct ConvCall {
   Accum acc = Accum::Exact;
   const Layout *x = nullptr, *w = nullptr, *y = nullptr;
   cudnnDataType_t scale_type = CUDNN_DATA_FLOAT;
+  int xv = 0, wv = 0, yv = 0;  // vector lanes of an NCHW_VECT_C operand
+  unsigned algos = ~0u;        // the forward algorithms this configuration runs, by bit
+  bool unreorder = false;      // an INT8x32 filter (and bias) cudnnReorderFilterAndBias already permuted
 };
+
+// The integer configurations run the two implicit-GEMM algorithms only
+// (measured: the forward list marks the other six NOT_SUPPORTED).
+constexpr unsigned kImplicitGemms = (1u << CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM) |
+                                    (1u << CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM);
+
+// The vectorized configurations of cudnnConvolutionForward, as an RTX 3060
+// runs them (cuDNN 9.27, every pairing of INT8x4/UINT8x4/INT8x32 x and w with
+// INT8, FLOAT, INT8x4, INT8x32 and UINT8x4 y, compute INT32 and FLOAT):
+//   INT8x4_CONFIG / UINT8x4_CONFIG    x INT8x4 or UINT8x4, w INT8x4 -> y INT8x4
+//   INT8x4_EXT / UINT8x4_EXT_CONFIG   ... -> y FLOAT, NCHW (both implicit
+//                                     GEMMs) or NHWC (IMPLICIT_PRECOMP_GEMM only)
+//   INT8x32_CONFIG                    x, w INT8x32 -> y INT8x32
+// all with compute INT32, two spatial dimensions, dilation 1 (any groups, both
+// modes); y UINT8x4, INT8 or INT8x32 from INT8x4, or anything but INT8x32
+// from INT8x32, is NOT_SUPPORTED, as is every backward pass. A vectorized
+// type in a layout other than NCHW_VECT_C is BAD_PARAM.
+cudnnStatus_t vect_conv_check(const char* fn, ConvDir dir, const TensorDesc* x, const FilterDesc* w,
+                              const TensorDesc* y, const ConvDesc* c, ConvCall* call) {
+  const cudnnDataType_t xt = x->l.type, wt = w->l.type, yt = y->l.type;
+  if (!x->vect || !w->vect || (lanes_of(yt) && !y->vect))
+    return BAD(fn, "vectorized types need the NCHW_VECT_C layout");
+  if (x->l.dims[1] % x->vect || w->l.dims[1] % w->vect)
+    return BAD(fn, "channels are not a multiple of the vector");
+  const std::string config = std::string("x ") + type_name(xt) + ", w " + type_name(wt) + ", y " + type_name(yt) +
+                             " with compute type " + type_name(c->type) + " is not one of cuDNN's vectorized configurations";
+  if (dir != ConvDir::Forward) return UNSUPPORTED(fn, std::string(type_name(xt)) + " has no backward pass");
+  if (c->type != CUDNN_DATA_INT32) return UNSUPPORTED(fn, config);
+  bool ok = false;
+  call->algos = kImplicitGemms;
+  if ((xt == CUDNN_DATA_INT8x4 || xt == CUDNN_DATA_UINT8x4) && wt == CUDNN_DATA_INT8x4) {
+    if (yt == CUDNN_DATA_INT8x4) ok = true;
+    if (yt == CUDNN_DATA_FLOAT) {
+      ok = true;
+      if (y->channels_last) call->algos = 1u << CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+    }
+  } else if (xt == CUDNN_DATA_INT8x32 && wt == CUDNN_DATA_INT8x32) {
+    ok = yt == CUDNN_DATA_INT8x32;
+  }
+  if (!ok) return UNSUPPORTED(fn, config);
+  if (c->nsp != 2) return UNSUPPORTED(fn, "vectorized convolution is two-dimensional only");
+  for (int i = 0; i < c->nsp; ++i)
+    if (c->dil[i] != 1) return UNSUPPORTED(fn, "vectorized convolution takes no dilation");
+  if (y->vect && y->l.dims[1] % y->vect) return BAD(fn, "output channels are not a multiple of the vector");
+  call->xv = x->vect, call->wv = w->vect, call->yv = y->vect;
+  call->unreorder = wt == CUDNN_DATA_INT8x32 && c->reorder == CUDNN_NO_REORDER;
+  call->acc = Accum::Int;
+  return CUDNN_STATUS_SUCCESS;
+}
 
 cudnnStatus_t conv_check(const char* fn, ConvDir dir, const void* xd, const void* wd, const void* cd, const void* yd,
                          ConvCall* call) {
@@ -640,13 +817,17 @@ cudnnStatus_t conv_check(const char* fn, ConvDir dir, const void* xd, const void
            type_name(ct) + " is not one of cuDNN's convolution configurations";
   };
   call->scale_type = CUDNN_DATA_FLOAT;
-  if (xt == CUDNN_DATA_INT8 && wt == CUDNN_DATA_INT8) {
-    // INT8_CONFIG and INT8_EXT_CONFIG: forward only, channels-last only.
+  if (lanes_of(xt) || lanes_of(wt)) return vect_conv_check(fn, dir, x, w, y, c, call);
+  if ((xt == CUDNN_DATA_INT8 || xt == CUDNN_DATA_UINT8) && wt == CUDNN_DATA_INT8) {
+    // INT8_CONFIG / INT8_EXT_CONFIG, and UINT8_CONFIG / UINT8_EXT_CONFIG (x
+    // UINT8; measured: their output is INT8 or FLOAT, a UINT8 y is
+    // NOT_SUPPORTED): forward only, channels-last only, the implicit GEMMs.
     if (dir != ConvDir::Forward || ct != CUDNN_DATA_INT32 || (yt != CUDNN_DATA_INT8 && yt != CUDNN_DATA_FLOAT))
       return UNSUPPORTED(fn, config());
     if (!x->channels_last || w->format != CUDNN_TENSOR_NHWC || !y->channels_last)
       return UNSUPPORTED(fn, "INT8 convolution needs NHWC tensors and filters");
     call->acc = Accum::Int;
+    call->algos = kImplicitGemms;
     return CUDNN_STATUS_SUCCESS;
   }
   if (xt != wt || xt != yt) return UNSUPPORTED(fn, config());
@@ -701,6 +882,11 @@ bool algo_runs(ConvDir dir, int algo) {
   }
 }
 
+// Whether this call's configuration runs an algorithm.
+bool call_runs(const ConvCall& call, ConvDir dir, int algo) {
+  return algo_runs(dir, algo) && (dir != ConvDir::Forward || (call.algos >> algo & 1u));
+}
+
 const char* dir_name(ConvDir dir) {
   return dir == ConvDir::Forward ? "forward" : dir == ConvDir::Data ? "backward-data" : "backward-filter";
 }
@@ -710,13 +896,13 @@ const char* dir_name(ConvDir dir) {
 // nominal one in list order) and -1 for one that did not.
 template <class Perf>
 void list_algos(ConvDir dir, const int* order, int count, int requested, int* returned, Perf* perf, bool config_ok,
-                cudnnMathType_t math, bool timed) {
+                cudnnMathType_t math, bool timed, unsigned mask = ~0u) {
   const int n = std::min(requested, count);
   // Runnable ones first, then the rest, as the hardware sorts them.
   int k = 0;
   for (int pass = 0; pass < 2; ++pass)
     for (int i = 0; i < count && k < n; ++i) {
-      const bool runs = config_ok && algo_runs(dir, order[i]);
+      const bool runs = config_ok && algo_runs(dir, order[i]) && (mask >> order[i] & 1u);
       if (runs != (pass == 0)) continue;
       Perf& p = perf[k];
       std::memset(&p, 0, sizeof p);
@@ -731,23 +917,86 @@ void list_algos(ConvDir dir, const int* order, int count, int requested, int* re
   *returned = k;
 }
 
+// A forward convolution's filter in logical order; an INT8x32 filter under
+// CUDNN_NO_REORDER is in cudnnReorderFilterAndBias's order, and is put back.
+bool read_filter(const ConvCall& call, const void* w, std::vector<double>* out) {
+  if (!call.unreorder) return read_any(*call.w, call.wv, w, out);
+  const Layout& l = *call.w;
+  const size_t bytes = vect_bytes(l, call.wv);
+  std::vector<uint8_t> re(bytes), orig(bytes, 0);
+  if (!w || cudaMemcpy(re.data(), w, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  x32_filter_map(l.dims[0], static_cast<int64_t>(bytes / l.dims[0]), bytes, [&](size_t d, int64_t src) {
+    if (src >= 0) orig[static_cast<size_t>(src)] = re[d];
+  });
+  vect_decode(l, call.wv, orig.data(), out);
+  return true;
+}
+
 cudnnStatus_t run_conv(const char* fn, ConvDir dir, cudnnHandle_t h, int algo, const void* alpha, const void* a,
                        const void* b, const void* beta, void* out, const ConvCall& call) {
-  if (!algo_runs(dir, algo))
-    return UNSUPPORTED(fn, std::string(dir_name(dir)) + " algorithm " + std::to_string(algo) + " is not one cuDNN implements");
+  if (!call_runs(call, dir, algo))
+    return UNSUPPORTED(fn, std::string(dir_name(dir)) + " algorithm " + std::to_string(algo) +
+                               (algo_runs(dir, algo) ? " does not run this configuration" : " is not one cuDNN implements"));
   if (!alpha || !beta || !a || !b || !out) return BAD(fn, "a scaling factor or data pointer is null");
   sync_handle(h);
   std::vector<double> va, vb, r;
-  const Layout* la = dir == ConvDir::Forward ? call.x : call.y;
-  const Layout* lb = dir == ConvDir::Filter ? call.x : call.w;
-  const Layout* lo = dir == ConvDir::Forward ? call.y : dir == ConvDir::Data ? call.x : call.w;
-  if (!read(*la, a, &va) || !read(*lb, b, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (dir == ConvDir::Forward) {
+    if (!read_any(*call.x, call.xv, a, &va) || !read_filter(call, b, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+  } else {
+    const Layout* la = call.y;
+    const Layout* lb = dir == ConvDir::Filter ? call.x : call.w;
+    if (!read(*la, a, &va) || !read(*lb, b, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
   convolve(call.g, dir, va, vb, &r, call.acc);
+  const Layout* lo = dir == ConvDir::Forward ? call.y : dir == ConvDir::Data ? call.x : call.w;
   const double al = scale_of(alpha, call.scale_type), be = scale_of(beta, call.scale_type);
-  return blend_write(*lo, out, r, al, be) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+  return blend_any(*lo, dir == ConvDir::Forward ? call.yv : 0, out, r, al, be) ? CUDNN_STATUS_SUCCESS
+                                                                              : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
 }  // namespace
+
+// INT8x32 filters (and their float bias) in the order the hardware's
+// tensor-core kernels read them; a convolution descriptor set to
+// CUDNN_NO_REORDER then takes them as they are. The permutation is the one
+// measured on the RTX 3060 (x32_filter_map, x32_bias_source). Also measured:
+// CUDNN_NO_REORDER copies the filter unchanged, and with reorderBias > 0
+// returns EXECUTION_FAILED_CUDART leaving the bias alone (matched); a reorder
+// type other than the two is taken as the default; any K is accepted.
+VGPU_EXPORT cudnnStatus_t cudnnReorderFilterAndBias(cudnnHandle_t h, const cudnnFilterDescriptor_t wd,
+                                                    cudnnReorderType_t type, const void* w, void* rw, int reorder_bias,
+                                                    const void* b, void* rb) {
+  static const char* fn = "cudnnReorderFilterAndBias";
+  const FilterDesc* W = fdesc(wd);
+  if (!known(h) || !W || !w || !rw) return BAD(fn, "invalid handle, filter descriptor or pointer");
+  if (reorder_bias > 0 && (!b || !rb)) return BAD(fn, "bias reordering asked for with a null bias pointer");
+  if (W->l.rank != 4) return BAD(fn, "the filter is not 4-dimensional");
+  if (W->l.type != CUDNN_DATA_INT8x32 || !W->vect) return UNSUPPORTED(fn, "only INT8x32 NCHW_VECT_C filters are reordered");
+  sync_handle(h);
+  const int64_t K = W->l.dims[0];
+  const size_t bytes = vect_bytes(W->l, W->vect);
+  std::vector<uint8_t> src(bytes), dst(bytes, 0);
+  if (cudaMemcpy(src.data(), w, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (type == CUDNN_NO_REORDER) {
+    if (cudaMemcpy(rw, src.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
+    return reorder_bias > 0 ? fail(CUDNN_STATUS_EXECUTION_FAILED_CUDART, fn, "no bias copy without reordering (as measured)")
+                            : CUDNN_STATUS_SUCCESS;
+  }
+  x32_filter_map(K, static_cast<int64_t>(bytes / static_cast<size_t>(K)), bytes, [&](size_t d, int64_t from) {
+    dst[d] = from >= 0 ? src[static_cast<size_t>(from)] : 0;
+  });
+  if (cudaMemcpy(rw, dst.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (reorder_bias > 0) {
+    std::vector<float> bi(static_cast<size_t>(K)), bo(static_cast<size_t>(K), 0.0f);
+    if (cudaMemcpy(bi.data(), b, bi.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
+    for (int64_t j = 0; j < K; ++j) {
+      const int64_t from = x32_bias_source(K, j);
+      bo[static_cast<size_t>(j)] = from >= 0 ? bi[static_cast<size_t>(from)] : 0.0f;
+    }
+    if (cudaMemcpy(rb, bo.data(), bo.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
 
 // The input as the matrix an explicit-GEMM convolution multiplies: one row
 // per (input channel, filter tap) of a group-0 filter, row-major over the
@@ -763,6 +1012,8 @@ VGPU_EXPORT cudnnStatus_t cudnnIm2Col(cudnnHandle_t h, const cudnnTensorDescript
   if (!known(h) || !X || !W || !known(cd) || !x || !col) return BAD(fn, "invalid handle, descriptor or pointer");
   const auto* C = as<const ConvDesc>(cd);
   if (X->l.rank != C->nsp + 2 || W->l.rank != X->l.rank) return BAD(fn, "the tensor, filter and convolution ranks differ");
+  // Documented, and measured for INT8x4: integer data is NOT_SUPPORTED.
+  if (!floating(X->l.type)) return UNSUPPORTED(fn, std::string(type_name(X->l.type)) + " data");
   ConvGeom g;
   const int nsp = C->nsp;
   int64_t out[3];
@@ -837,7 +1088,7 @@ cudnnStatus_t enumerate(const char* fn, ConvDir dir, cudnnHandle_t h, const void
   const int* order = dir == ConvDir::Forward ? kFwdAlgos : dir == ConvDir::Data ? kDataAlgos : kFilterAlgos;
   const int count = dir == ConvDir::Forward ? kFwdCount : dir == ConvDir::Data ? kDataCount : kFilterCount;
   list_algos(dir, order, count, requested, returned, perf, s == CUDNN_STATUS_SUCCESS,
-             static_cast<const ConvDesc*>(cd)->math, timed);
+             static_cast<const ConvDesc*>(cd)->math, timed, dir == ConvDir::Forward ? call.algos : ~0u);
   return CUDNN_STATUS_SUCCESS;
 }
 
@@ -847,7 +1098,7 @@ cudnnStatus_t workspace(const char* fn, ConvDir dir, const void* xd, const void*
   ConvCall call;
   cudnnStatus_t s = conv_check(fn, dir, xd, wd, cd, yd, &call);
   if (s != CUDNN_STATUS_SUCCESS) return s;
-  if (!algo_runs(dir, algo))
+  if (!call_runs(call, dir, algo))
     return UNSUPPORTED(fn, std::string(dir_name(dir)) + " algorithm " + std::to_string(algo) + " is not one cuDNN implements");
   *bytes = 0;  // computed on the host
   return CUDNN_STATUS_SUCCESS;
@@ -1085,7 +1336,17 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationForward(cudnnHandle_t h, cudnnActivatio
   // entry point. Matching that keeps callers' fallbacks intact.
   if (A.mode == CUDNN_ACTIVATION_IDENTITY) return BAD(fn, "CUDNN_ACTIVATION_IDENTITY is only for the fused convolution");
   if (!X->l.same_dims(Y->l)) return BAD(fn, "x and y differ in shape");
-  if (!floating(X->l.type) || !floating(Y->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
+  if (!floating(X->l.type) || !floating(Y->l.type)) {
+    // Measured: INT8 to INT8 runs (the result, times alpha, plus beta times
+    // the prior y, rounded to nearest even and saturated); INT8 to FLOAT is
+    // BAD_PARAM; UINT8, INT32 and the vectorized types are NOT_SUPPORTED.
+    if (X->l.type != CUDNN_DATA_INT8 || Y->l.type != CUDNN_DATA_INT8) {
+      if ((X->l.type == CUDNN_DATA_INT8) != (Y->l.type == CUDNN_DATA_INT8) && !lanes_of(X->l.type) &&
+          !lanes_of(Y->l.type))
+        return BAD(fn, "INT8 activation writes INT8");
+      return UNSUPPORTED(fn, std::string(type_name(X->l.type)) + " data");
+    }
+  }
   double r;
   if (!activate(A, 0.0, &r)) return UNSUPPORTED(fn, "activation mode " + std::to_string(A.mode));
   sync_handle(h);
@@ -1169,11 +1430,23 @@ VGPU_EXPORT cudnnStatus_t cudnnConvolutionBiasActivationForward(
   const ActDesc& A = *as<const ActDesc>(ad);
   if (A.mode != CUDNN_ACTIVATION_RELU && A.mode != CUDNN_ACTIVATION_IDENTITY)
     return UNSUPPORTED(fn, "only RELU and IDENTITY activations are fused");
-  if (!algo_runs(ConvDir::Forward, algo)) return UNSUPPORTED(fn, "forward algorithm " + std::to_string(algo));
+  if (!call_runs(call, ConvDir::Forward, algo)) return UNSUPPORTED(fn, "forward algorithm " + std::to_string(algo));
   sync_handle(h);
   std::vector<double> vx, vw, vz, vb, r;
-  if (!read(*call.x, x, &vx) || !read(*call.w, w, &vw) || !read(Z->l, z, &vz) || !read(B->l, bias, &vb))
+  if (!read_any(*call.x, call.xv, x, &vx) || !read_filter(call, w, &vw) || !read_any(Z->l, Z->vect, z, &vz) ||
+      !read(B->l, bias, &vb))
     return CUDNN_STATUS_EXECUTION_FAILED;
+  if (call.unreorder) {
+    // The bias was permuted along with the filter (measured: with
+    // CUDNN_NO_REORDER the hardware reads both in reordered order).
+    std::vector<double> logical(vb.size(), 0.0);
+    const int64_t K = static_cast<int64_t>(vb.size());
+    for (int64_t j = 0; j < K; ++j) {
+      const int64_t src = x32_bias_source(K, j);
+      if (src >= 0) logical[static_cast<size_t>(src)] = vb[static_cast<size_t>(j)];
+    }
+    vb.swap(logical);
+  }
   convolve(call.g, ConvDir::Forward, vx, vw, &r, call.acc);
   const double a1 = scale_of(alpha1, call.scale_type), a2 = scale_of(alpha2, call.scale_type);
   int64_t N, K, S;
@@ -1186,7 +1459,7 @@ VGPU_EXPORT cudnnStatus_t cudnnConvolutionBiasActivationForward(
         if (A.mode == CUDNN_ACTIVATION_RELU && !(v > 0.0)) v = 0.0;
         r[at] = v;
       }
-  return write(*call.y, y, r) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+  return blend_any(*call.y, call.yv, y, r, 1.0, 0.0) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
 /* ---- pooling ---- */
@@ -1334,10 +1607,18 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingForward(cudnnHandle_t h, const cudnnPoolin
   PoolGeom g;
   cudnnStatus_t s = pool_geometry(fn, P, X->l, Y->l, &g);
   if (s != CUDNN_STATUS_SUCCESS) return s;
-  if (!floating(X->l.type) || !floating(Y->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
+  if (!floating(X->l.type) || !floating(Y->l.type)) {
+    // Integer pooling, measured: INT8 in any layout and INT8x4 or INT8x32 in
+    // NCHW_VECT_C, y of x's type (else BAD_PARAM), the average rounded to
+    // nearest even after alpha and beta; UINT8 and INT32 are NOT_SUPPORTED.
+    if (X->l.type != Y->l.type || X->vect != Y->vect) return BAD(fn, "integer pooling needs y of x's type and layout");
+    const cudnnDataType_t t = X->l.type;
+    if (t != CUDNN_DATA_INT8 && !((t == CUDNN_DATA_INT8x4 || t == CUDNN_DATA_INT8x32) && X->vect))
+      return UNSUPPORTED(fn, std::string(type_name(t)) + " data");
+  }
   sync_handle(h);
   std::vector<double> vx;
-  if (!read(X->l, x, &vx)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (!read_any(X->l, X->vect, x, &vx)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<double> r(static_cast<size_t>(g.NC * g.osz()));
   const bool is_max = P.mode == CUDNN_POOLING_MAX || P.mode == CUDNN_POOLING_MAX_DETERMINISTIC;
   for (int64_t nc = 0; nc < g.NC; ++nc) {
@@ -1353,7 +1634,7 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingForward(cudnnHandle_t h, const cudnnPoolin
       r[static_cast<size_t>(nc * g.osz() + o)] = v;
     }
   }
-  return blend_write(Y->l, y, r, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
+  return blend_any(Y->l, Y->vect, y, r, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
                                                                    : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
@@ -1625,6 +1906,152 @@ VGPU_EXPORT cudnnStatus_t cudnnLRNCrossChannelBackward(cudnnHandle_t h, cudnnLRN
                                                                       : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
+/* ---- divisive normalization ---- */
+
+// Spatial divisive normalization, the second half of local contrast
+// normalization. The formula was measured on the RTX 3060 (windows of 1 to 5,
+// with and without means, to 2.5e-7 relative): for each element,
+//   y = x / (K + alpha / n^d * sum over the window (x_j - m)^2)^beta
+// where m is the means tensor at that element (zero when means is NULL), the
+// window is n wide in each of the d spatial dimensions (the LRN descriptor's
+// lookBehind floor((n-1)/2), the rest ahead), and positions outside the
+// tensor are left out of the sum but not out of the n^d. The numerator is x
+// itself, not x - m.
+namespace {
+struct DivNormCall {
+  const TensorDesc *X = nullptr, *Y = nullptr;
+  int64_t NC = 0, sp[3] = {1, 1, 1};
+};
+
+cudnnStatus_t divnorm_check(const char* fn, cudnnHandle_t h, const void* ld, const void* alpha, const void* beta,
+                            const TensorDesc* X, const TensorDesc* Y, std::initializer_list<const void*> ptrs,
+                            DivNormCall* c) {
+  if (!known(h) || !known(ld) || !X || !Y || !alpha || !beta) return BAD(fn, "invalid handle, descriptor or scaling factor");
+  for (const void* p : ptrs)
+    if (!p) return BAD(fn, "a data or workspace pointer is null");
+  if (X->l.rank < 4 || X->l.rank > 5) return BAD(fn, "only 4-D and 5-D tensors are supported");
+  if (!X->l.same_dims(Y->l)) return BAD(fn, "the tensors differ in shape");
+  // Measured: x NCHW and y NHWC is NOT_SUPPORTED; NHWC on both runs.
+  for (int i = 0; i < X->l.rank; ++i)
+    if (X->l.strides[i] != Y->l.strides[i]) return UNSUPPORTED(fn, "the input and output strides differ");
+  if (!floating(X->l.type) || X->l.type != Y->l.type || X->vect)
+    return UNSUPPORTED(fn, std::string(type_name(X->l.type)) + " data");
+  c->X = X, c->Y = Y;
+  c->NC = X->l.dims[0] * X->l.dims[1];
+  for (int i = 2; i < X->l.rank; ++i) c->sp[3 - (X->l.rank - i)] = X->l.dims[i];
+  return CUDNN_STATUS_SUCCESS;
+}
+
+// The window of each element: f(element, neighbour) for every neighbour
+// inside the tensor, in the plane's own offsets.
+template <class F>
+void divnorm_windows(const LrnDesc& L, const int64_t* sp, F&& f) {
+  const int64_t lb = (static_cast<int64_t>(L.n) - 1) / 2, la = static_cast<int64_t>(L.n) - lb - 1;
+  for (int64_t a = 0; a < sp[0]; ++a)
+    for (int64_t b = 0; b < sp[1]; ++b)
+      for (int64_t c = 0; c < sp[2]; ++c) {
+        const int64_t at = (a * sp[1] + b) * sp[2] + c;
+        // A 4-D tensor's planes have sp[0] = 1, which clips the first
+        // dimension's window to the element itself.
+        for (int64_t i = a - lb; i <= a + la; ++i) {
+          if (i < 0 || i >= sp[0]) continue;
+          for (int64_t j = b - lb; j <= b + la; ++j) {
+            if (j < 0 || j >= sp[1]) continue;
+            for (int64_t k = c - lb; k <= c + la; ++k) {
+              if (k < 0 || k >= sp[2]) continue;
+              f(at, (i * sp[1] + j) * sp[2] + k);
+            }
+          }
+        }
+      }
+}
+
+// The denominators' bases, K + alpha / n^d * sum (x_j - m)^2, of every element.
+std::vector<double> divnorm_base(const LrnDesc& L, const DivNormCall& c, const std::vector<double>& x,
+                                 const std::vector<double>& m) {
+  const int64_t S = c.sp[0] * c.sp[1] * c.sp[2];
+  const double coef = L.alpha / std::pow(static_cast<double>(L.n), c.X->l.rank - 2);
+  std::vector<double> d(x.size(), 0.0);
+  for (int64_t p = 0; p < c.NC; ++p) {
+    const size_t o = static_cast<size_t>(p * S);
+    divnorm_windows(L, c.sp, [&](int64_t at, int64_t nb) {
+      const double e = x[o + nb] - m[o + at];
+      d[o + at] += e * e;
+    });
+  }
+  for (double& e : d) e = L.k + coef * e;
+  return d;
+}
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnDivisiveNormalizationForward(cudnnHandle_t h, cudnnLRNDescriptor_t ld,
+                                                            cudnnDivNormMode_t, const void* alpha,
+                                                            const cudnnTensorDescriptor_t xd, const void* x,
+                                                            const void* means, void* temp, void* temp2,
+                                                            const void* beta, const cudnnTensorDescriptor_t yd,
+                                                            void* y) {
+  static const char* fn = "cudnnDivisiveNormalizationForward";
+  DivNormCall c;
+  // The mode is not checked (measured: an undefined mode runs as
+  // PRECOMPUTED_MEANS); the temporaries are the caller's, and unused here.
+  if (cudnnStatus_t s = divnorm_check(fn, h, ld, alpha, beta, tdesc(xd), tdesc(yd), {x, y, temp, temp2}, &c);
+      s != CUDNN_STATUS_SUCCESS)
+    return s;
+  const LrnDesc& L = *as<const LrnDesc>(ld);
+  sync_handle(h);
+  std::vector<double> vx, vm(c.X->l.count(), 0.0);
+  if (!read(c.X->l, x, &vx) || (means && !read(c.X->l, means, &vm))) return CUDNN_STATUS_EXECUTION_FAILED;
+  const std::vector<double> d = divnorm_base(L, c, vx, vm);
+  std::vector<double> r(vx.size());
+  for (size_t i = 0; i < r.size(); ++i) r[i] = vx[i] * std::pow(d[i], -L.beta);
+  return blend_write(c.Y->l, y, r, sc(alpha, c.Y->l), sc(beta, c.Y->l)) ? CUDNN_STATUS_SUCCESS
+                                                                        : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+// The gradients of the forward formula with respect to x and to the means,
+// which are an input of their own here. Measured: for an even window the
+// hardware gathers each element's x gradient over the element's own window
+// rather than over the windows that contain it (they differ only when the
+// window is not symmetric); matched.
+VGPU_EXPORT cudnnStatus_t cudnnDivisiveNormalizationBackward(cudnnHandle_t h, cudnnLRNDescriptor_t ld,
+                                                             cudnnDivNormMode_t, const void* alpha,
+                                                             const cudnnTensorDescriptor_t xd, const void* x,
+                                                             const void* means, const void* dy, void* temp,
+                                                             void* temp2, const void* beta,
+                                                             const cudnnTensorDescriptor_t dxd, void* dx,
+                                                             void* dmeans) {
+  static const char* fn = "cudnnDivisiveNormalizationBackward";
+  DivNormCall c;
+  if (cudnnStatus_t s = divnorm_check(fn, h, ld, alpha, beta, tdesc(xd), tdesc(dxd), {x, dy, dx, temp, temp2}, &c);
+      s != CUDNN_STATUS_SUCCESS)
+    return s;
+  const LrnDesc& L = *as<const LrnDesc>(ld);
+  sync_handle(h);
+  std::vector<double> vx, vdy, vm(c.X->l.count(), 0.0);
+  if (!read(c.X->l, x, &vx) || !read(c.X->l, dy, &vdy) || (means && !read(c.X->l, means, &vm)))
+    return CUDNN_STATUS_EXECUTION_FAILED;
+  const std::vector<double> d = divnorm_base(L, c, vx, vm);
+  const double coef = L.alpha / std::pow(static_cast<double>(L.n), c.X->l.rank - 2);
+  // g_i: dy_i times the derivative of y_i with respect to its sum.
+  std::vector<double> g(vx.size()), rdx(vx.size()), rdm(vx.size(), 0.0);
+  for (size_t i = 0; i < g.size(); ++i) {
+    g[i] = vdy[i] * vx[i] * -L.beta * std::pow(d[i], -L.beta - 1.0) * coef;
+    rdx[i] = vdy[i] * std::pow(d[i], -L.beta);
+  }
+  const int64_t S = c.sp[0] * c.sp[1] * c.sp[2];
+  for (int64_t p = 0; p < c.NC; ++p) {
+    const size_t o = static_cast<size_t>(p * S);
+    divnorm_windows(L, c.sp, [&](int64_t at, int64_t nb) {
+      rdx[o + at] += 2.0 * g[o + nb] * (vx[o + at] - vm[o + nb]);
+      rdm[o + at] -= 2.0 * g[o + at] * (vx[o + nb] - vm[o + at]);
+    });
+  }
+  const double a = sc(alpha, c.Y->l), b = sc(beta, c.Y->l);
+  if (!blend_write(c.Y->l, dx, rdx, a, b)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (dmeans && !blend_write(c.Y->l, dmeans, rdm, a, b)) return CUDNN_STATUS_EXECUTION_FAILED;
+  return CUDNN_STATUS_SUCCESS;
+}
+
 /* ---- tensor arithmetic ---- */
 
 // C = alpha * A + beta * C, A broadcast over any dimension where it has
@@ -1857,8 +2284,29 @@ VGPU_EXPORT cudnnStatus_t cudnnReduceTensor(cudnnHandle_t h, const cudnnReduceTe
   return CUDNN_STATUS_SUCCESS;
 }
 
+namespace {
+// What cudnnTransformTensor takes of the vectorized types, measured: INT8x4
+// in NCHW_VECT_C to and from FLOAT, HALF, INT8 (NCHW or NHWC, or strided) and
+// INT8x4, with alpha and beta; UINT8 or INT32 on the other side is
+// NOT_SUPPORTED; UINT8x4, INT8x32, and a vectorized type in any other layout,
+// are BAD_PARAM.
+cudnnStatus_t vect_transform_check(const char* fn, const TensorDesc* X, const TensorDesc* Y) {
+  const cudnnDataType_t xt = X->l.type, yt = Y->l.type;
+  if (!lanes_of(xt) && !lanes_of(yt)) return CUDNN_STATUS_SUCCESS;
+  for (const TensorDesc* t : {X, Y}) {
+    const cudnnDataType_t ty = t->l.type;
+    if (lanes_of(ty) && (!t->vect || ty != CUDNN_DATA_INT8x4))
+      return BAD(fn, std::string(type_name(ty)) + (t->vect ? " does not transform" : " outside NCHW_VECT_C"));
+    if (ty == CUDNN_DATA_UINT8 || ty == CUDNN_DATA_INT32)
+      return UNSUPPORTED(fn, std::string(type_name(ty)) + " to or from INT8x4");
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+}  // namespace
+
 // y = alpha * x + beta * y, between any two layouts and element types of the
-// same shape: how a program converts NCHW to NHWC, or float to half.
+// same shape: how a program converts NCHW to NHWC, float to half, or INT8 to
+// the vectorized INT8x4 layout.
 VGPU_EXPORT cudnnStatus_t cudnnTransformTensor(cudnnHandle_t h, const void* alpha, const cudnnTensorDescriptor_t xd,
                                                const void* x, const void* beta, const cudnnTensorDescriptor_t yd,
                                                void* y) {
@@ -1866,11 +2314,256 @@ VGPU_EXPORT cudnnStatus_t cudnnTransformTensor(cudnnHandle_t h, const void* alph
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !X || !Y || !alpha || !beta || !x || !y) return BAD(fn, "invalid handle, descriptor or pointer");
   if (!X->l.same_dims(Y->l)) return BAD(fn, "x and y differ in shape");
+  if (cudnnStatus_t s = vect_transform_check(fn, X, Y); s != CUDNN_STATUS_SUCCESS) return s;
   sync_handle(h);
   std::vector<double> v;
-  if (!read(X->l, x, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
-  return blend_write(Y->l, y, v, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
-                                                                   : CUDNN_STATUS_EXECUTION_FAILED;
+  if (!read_any(X->l, X->vect, x, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
+  return blend_any(Y->l, Y->vect, y, v, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
+                                                                         : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+/* ---- tensor transform descriptors: padding, folding, unfolding ---- */
+
+// A transform descriptor: per-dimension padding before and after, a fold
+// factor per spatial dimension, the direction, and the destination layout.
+// What each does was measured on the RTX 3060 with tensors and filters whose
+// values count their own positions:
+//   - Padding grows (or, negative, crops) every dimension, batch and channels
+//     included; padded positions are zero.
+//   - Folding (space to depth) by f_d first pads, then cuts each spatial
+//     extent into ceil(padded / f_d) blocks; output channel
+//     padBefore[C] + (fold offset, last dimension fastest) * C + c, the
+//     channels then padded at the end to (C + padding) * prod(f). Positions of
+//     a last, partial block past the padded extent are not written.
+//   - Unfolding is the inverse: output channel c at fold offset o reads input
+//     channel o * C_out + c - padBefore[C], and the padding applies to the
+//     unfolded result.
+//   - Folding and padding take alpha but no beta (beta != 0 is
+//     NOT_SUPPORTED, and so is a destination laid out unlike destFormat);
+//     unfolding and a plain layout change take both. The destination's element
+//     type may differ (float to half runs).
+//   - A NULL array keeps the values a previous set gave; nbDims above
+//     CUDNN_DIM_MAX is NOT_SUPPORTED, anything else is accepted (two
+//     dimensions, a VECT_C format, an unknown direction included).
+namespace {
+struct TransDesc {
+  uint32_t nb = 0;
+  cudnnTensorFormat_t fmt = CUDNN_TENSOR_NCHW;
+  int32_t pb[kMaxRank] = {}, pa[kMaxRank] = {};
+  uint32_t fold[kMaxRank] = {};  // per spatial dimension
+  cudnnFoldingDirection_t dir = CUDNN_TRANSFORM_FOLD;
+
+  uint32_t f(int spatial) const { return fold[spatial] > 1 ? fold[spatial] : 1; }
+  bool folds(int rank) const {
+    for (int i = 0; i + 2 < rank; ++i)
+      if (f(i) > 1) return true;
+    return false;
+  }
+  bool pads(int rank) const {
+    for (int i = 0; i < rank; ++i)
+      if (pb[i] || pa[i]) return true;
+    return false;
+  }
+  bool unfolds(int rank) const { return dir == CUDNN_TRANSFORM_UNFOLD && folds(rank); }
+  // The destination's dimensions for a source of these; false if one is not positive.
+  bool dest_dims(const Layout& src, int64_t* out) const {
+    const int r = src.rank;
+    int64_t F = 1;
+    for (int i = 0; i + 2 < r; ++i) F *= f(i);
+    const bool un = dir == CUDNN_TRANSFORM_UNFOLD;
+    for (int i = 0; i < r; ++i) {
+      const int64_t pad = pb[i] + pa[i];
+      if (i == 0) out[i] = src.dims[0] + pad;
+      else if (i == 1) out[i] = un ? src.dims[1] / F + pad : (src.dims[1] + pad) * F;
+      else out[i] = un ? src.dims[i] * f(i - 2) + pad : (src.dims[i] + pad + f(i - 2) - 1) / f(i - 2);
+      if (out[i] <= 0) return false;
+    }
+    return true;
+  }
+};
+
+const TransDesc* trdesc(const void* d) { return known(d) ? static_cast<const TransDesc*>(d) : nullptr; }
+
+// Runs a transform between two layouts (tensors or filters alike). sv/dv
+// are the vector lanes of an NCHW_VECT_C operand; dest_last says whether the
+// destination is laid out channels-last.
+cudnnStatus_t run_transform(const char* fn, cudnnHandle_t h, const TransDesc& T, const void* alpha, const Layout& S,
+                            int sv, const void* src, const void* beta, const Layout& D, int dv, bool dest_last,
+                            void* dst, bool check_format) {
+  const int r = S.rank;
+  if (D.rank != r) return BAD(fn, "source and destination ranks differ");
+  int64_t want[kMaxRank];
+  if (!T.dest_dims(S, want)) return BAD(fn, "the transform leaves a dimension empty");
+  for (int i = 0; i < r; ++i)
+    if (D.dims[i] != want[i]) return BAD(fn, "the destination's dimensions are not the transform's");
+  const double a = scale_of(alpha, D.type), b = scale_of(beta, D.type);
+  const bool reshapes = T.folds(r) || T.pads(r);
+  if (reshapes) {
+    if (sv || dv) return UNSUPPORTED(fn, "padding or folding a vectorized layout");
+    if (!T.unfolds(r)) {
+      if (b != 0.0) return UNSUPPORTED(fn, "padding and folding take beta = 0");
+      if (check_format && dest_last != (T.fmt == CUDNN_TENSOR_NHWC))
+        return UNSUPPORTED(fn, "the destination is not laid out as the transform's format");
+    }
+  }
+  sync_handle(h);
+  std::vector<double> vs, out(D.count(), 0.0);
+  if (!read_any(S, sv, src, &vs)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (!reshapes) return blend_any(D, dv, dst, vs, a, b) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+  // Every destination element from its source (or zero), and which are written.
+  std::vector<uint8_t> written(out.size(), 1);
+  const bool un = T.unfolds(r);
+  int64_t sstr[kMaxRank], idx[kMaxRank] = {};
+  {
+    int64_t st = 1;
+    for (int i = r; i-- > 0;) sstr[i] = st, st *= S.dims[i];
+  }
+  for (size_t e = 0; e < out.size(); ++e) {
+    int64_t si[kMaxRank];
+    bool inside = true;
+    si[0] = idx[0] - T.pb[0];
+    inside &= si[0] >= 0 && si[0] < S.dims[0];
+    int64_t blk = 0;  // the fold offset, last spatial dimension fastest
+    if (!un) {
+      // Output channel -> (fold offset, source channel).
+      const int64_t cc = idx[1] - T.pb[1];
+      int64_t F = 1;
+      for (int d = 2; d < r; ++d) F *= T.f(d - 2);
+      if (cc < 0 || cc >= S.dims[1] * F) inside = false;
+      else blk = cc / S.dims[1], si[1] = cc % S.dims[1];
+      int64_t rem = blk;
+      for (int d = r - 1; d >= 2; --d) {
+        const int64_t f = T.f(d - 2), off = rem % f;
+        rem /= f;
+        const int64_t hp = idx[d] * f + off;  // padded position
+        if (hp >= S.dims[d] + T.pb[d] + T.pa[d]) { written[e] = 0; inside = false; }
+        si[d] = hp - T.pb[d];
+        inside &= si[d] >= 0 && si[d] < S.dims[d];
+      }
+    } else {
+      const int64_t Cout = D.dims[1];
+      for (int d = r - 1; d >= 2; --d) {
+        const int64_t f = T.f(d - 2), u = idx[d] - T.pb[d];
+        if (u < 0 || u >= S.dims[d] * f) { inside = false; continue; }
+        si[d] = u / f;
+      }
+      int64_t mul = 1;
+      for (int d = r - 1; d >= 2; --d) {
+        const int64_t f = T.f(d - 2), u = idx[d] - T.pb[d];
+        if (u >= 0) blk += (u % f) * mul;
+        mul *= f;
+      }
+      si[1] = blk * Cout + idx[1] - T.pb[1];
+      inside &= si[1] >= 0 && si[1] < S.dims[1];
+    }
+    if (inside) {
+      size_t at = 0;
+      for (int d = 0; d < r; ++d) at += static_cast<size_t>(si[d] * sstr[d]);
+      out[e] = vs[at];
+    }
+    for (int d = r; d-- > 0;) {
+      if (++idx[d] < D.dims[d]) break;
+      idx[d] = 0;
+    }
+  }
+  std::vector<double> prior;
+  bool all = true;
+  for (uint8_t w : written) all &= w != 0;
+  if ((b != 0.0 || !all) && !read(D, dst, &prior)) return CUDNN_STATUS_EXECUTION_FAILED;
+  for (size_t e = 0; e < out.size(); ++e)
+    out[e] = !written[e] ? prior[e] : b != 0.0 ? a * out[e] + b * prior[e] : a * out[e];
+  return write(D, dst, out) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnCreateTensorTransformDescriptor(cudnnTensorTransformDescriptor_t* d) {
+  if (!d) return CUDNN_STATUS_BAD_PARAM;
+  *d = reinterpret_cast<cudnnTensorTransformDescriptor_t>(track(new TransDesc()));
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnDestroyTensorTransformDescriptor(cudnnTensorTransformDescriptor_t d) {
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  untrack(d);
+  delete as<TransDesc>(d);
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnSetTensorTransformDescriptor(cudnnTensorTransformDescriptor_t d, const uint32_t nb,
+                                                            const cudnnTensorFormat_t fmt, const int32_t pb[],
+                                                            const int32_t pa[], const uint32_t fold[],
+                                                            const cudnnFoldingDirection_t dir) {
+  static const char* fn = "cudnnSetTensorTransformDescriptor";
+  if (!known(d)) return BAD(fn, "invalid descriptor");
+  if (nb > static_cast<uint32_t>(kMaxRank)) return UNSUPPORTED(fn, "more than CUDNN_DIM_MAX dimensions");
+  auto* t = as<TransDesc>(d);
+  t->nb = nb;
+  t->fmt = fmt;
+  t->dir = dir;
+  for (uint32_t i = 0; i < nb; ++i) {
+    if (pb) t->pb[i] = pb[i];
+    if (pa) t->pa[i] = pa[i];
+    if (fold && i + 2 < nb) t->fold[i] = fold[i];
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetTensorTransformDescriptor(cudnnTensorTransformDescriptor_t d, uint32_t requested,
+                                                            cudnnTensorFormat_t* fmt, int32_t pb[], int32_t pa[],
+                                                            uint32_t fold[], cudnnFoldingDirection_t* dir) {
+  const TransDesc* t = trdesc(d);
+  if (!t) return CUDNN_STATUS_BAD_PARAM;
+  if (fmt) *fmt = t->fmt;
+  if (dir) *dir = t->dir;
+  const uint32_t n = std::min<uint32_t>(requested, static_cast<uint32_t>(kMaxRank));
+  for (uint32_t i = 0; i < n; ++i) {
+    if (pb) pb[i] = t->pb[i];
+    if (pa) pa[i] = t->pa[i];
+    if (fold && i + 2 < n) fold[i] = t->fold[i];
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+
+// The packed destination a transform gives, in its format, and its size.
+VGPU_EXPORT cudnnStatus_t cudnnInitTransformDest(const cudnnTensorTransformDescriptor_t td,
+                                                 const cudnnTensorDescriptor_t sd, cudnnTensorDescriptor_t dd,
+                                                 size_t* bytes) {
+  static const char* fn = "cudnnInitTransformDest";
+  const TransDesc* t = trdesc(td);
+  const TensorDesc* S = tdesc(sd);
+  if (!t || !S || !known(dd) || !bytes) return BAD(fn, "invalid descriptor or size pointer");
+  int64_t want[kMaxRank];
+  if (!t->dest_dims(S->l, want)) return BAD(fn, "the transform leaves a dimension empty");
+  int dims[kMaxRank];
+  for (int i = 0; i < S->l.rank; ++i) dims[i] = static_cast<int>(want[i]);
+  const cudnnTensorFormat_t fmt = t->fmt == CUDNN_TENSOR_NHWC ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+  cudnnStatus_t s = cudnnSetTensorNdDescriptorEx(dd, fmt, S->l.type, S->l.rank, dims);
+  if (s != CUDNN_STATUS_SUCCESS) return s;
+  return cudnnGetTensorSizeInBytes(dd, bytes);
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnTransformTensorEx(cudnnHandle_t h, const cudnnTensorTransformDescriptor_t td,
+                                                 const void* alpha, const cudnnTensorDescriptor_t sd, const void* src,
+                                                 const void* beta, const cudnnTensorDescriptor_t dd, void* dst) {
+  static const char* fn = "cudnnTransformTensorEx";
+  const TransDesc* t = trdesc(td);
+  const TensorDesc *S = tdesc(sd), *D = tdesc(dd);
+  if (!known(h) || !t || !S || !D || !alpha || !beta || !src || !dst) return BAD(fn, "invalid handle, descriptor or pointer");
+  if (!t->folds(S->l.rank) && !t->pads(S->l.rank)) {
+    if (!S->l.same_dims(D->l)) return BAD(fn, "x and y differ in shape");
+    if (cudnnStatus_t st = vect_transform_check(fn, S, D); st != CUDNN_STATUS_SUCCESS) return st;
+  }
+  return run_transform(fn, h, *t, alpha, S->l, S->vect, src, beta, D->l, D->vect, D->channels_last, dst, true);
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnTransformFilter(cudnnHandle_t h, const cudnnTensorTransformDescriptor_t td,
+                                               const void* alpha, const cudnnFilterDescriptor_t sd, const void* src,
+                                               const void* beta, const cudnnFilterDescriptor_t dd, void* dst) {
+  static const char* fn = "cudnnTransformFilter";
+  const TransDesc* t = trdesc(td);
+  const FilterDesc *S = fdesc(sd), *D = fdesc(dd);
+  if (!known(h) || !t || !S || !D || !alpha || !beta || !src || !dst) return BAD(fn, "invalid handle, descriptor or pointer");
+  if (lanes_of(S->l.type) != (S->vect ? lanes_of(S->l.type) : 0) || lanes_of(D->l.type) != (D->vect ? lanes_of(D->l.type) : 0))
+    return BAD(fn, "vectorized types need the NCHW_VECT_C layout");
+  return run_transform(fn, h, *t, alpha, S->l, S->vect, src, beta, D->l, D->vect, D->format == CUDNN_TENSOR_NHWC, dst,
+                       false);
 }
 
 // Measured: the value is a float for float, half and bfloat16 tensors and a
@@ -2516,6 +3209,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSpatialTfSamplerForward(cudnnHandle_t h, cudnnSpa
   if (!D.set || X->l.rank != 4 || Y->l.rank != 4 || Y->l.dims[0] != D.n || Y->l.dims[1] != D.c ||
       Y->l.dims[2] != D.h || Y->l.dims[3] != D.w || X->l.dims[0] != D.n || X->l.dims[1] != D.c)
     return BAD(fn, "x, y and the transformer's dimensions do not agree");
+  if (!floating(X->l.type) || !floating(Y->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
   const Layout gl = st_array(D, {D.n, D.h, D.w, 2});
   const int64_t Hi = X->l.dims[2], Wi = X->l.dims[3];
   sync_handle(h);
