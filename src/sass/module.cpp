@@ -191,8 +191,28 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     // A relocation's symbol: a variable, a function VirtualGPU provides, a
     // function's code, or a section. *in_code is set for code, whose offset
     // in its section is *code_off.
-    const auto resolve = [&](const std::string& name, bool* in_code, uint64_t* code_off) -> uint64_t {
+    const auto resolve = [&](const CubinReloc& r, bool* in_code, uint64_t* code_off) -> uint64_t {
+      const std::string& name = r.symbol;
       *in_code = false;
+      // The symbol the relocation names, by its index: names of local
+      // symbols repeat once units are linked (each has its "$str" strings;
+      // a program using dynamic parallelism has the device runtime
+      // library's too, and its printf printed "cudaSuccess"). A function
+      // VirtualGPU provides is still the builtin, even where the cubin
+      // carries code for it (the device runtime's).
+      if (r.symbol_index < c.symbols.size()) {
+        const CubinSymbol& sym = c.symbols[r.symbol_index];
+        bool builtin = false;
+        for (const auto& [addr, b] : m->builtins) builtin = builtin || (sym.function && b == name);
+        if (!builtin && !sym.section.empty()) {
+          if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
+            *in_code = true;
+            *code_off = sym.value;
+            return m->code[code->second].base + sym.value;
+          }
+          if (const auto sec = section_va.find(sym.section); sec != section_va.end()) return sec->second + sym.value;
+        }
+      }
       if (const auto v = m->symbol_va.find(name); v != m->symbol_va.end()) return v->second;
       for (const auto& [addr, b] : m->builtins)
         if (b == name) return addr;
@@ -237,7 +257,7 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
                       "cubin: relocation type " + std::to_string(r.type) + " in " + s.name + " is not supported yet");
         bool in_code = false;
         uint64_t code_off = 0;
-        const uint64_t target = resolve(r.symbol, &in_code, &code_off);
+        const uint64_t target = resolve(r, &in_code, &code_off);
         if (!code) {
           const uint64_t value = target + static_cast<uint64_t>(r.addend);
           mem.write(dst->second + r.offset, &value, 8);

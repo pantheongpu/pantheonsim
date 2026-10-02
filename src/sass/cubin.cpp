@@ -175,6 +175,7 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
       const uint64_t sym = info >> 32;
       if (sym >= sym_names.size()) bad("relocation names a symbol past the table");
       rel.symbol = sym_names[sym];
+      rel.symbol_index = static_cast<size_t>(sym);
       if (es == 24) rel.addend = r.at<int64_t>(o + 16);
       target.relocs.push_back(std::move(rel));
     }
