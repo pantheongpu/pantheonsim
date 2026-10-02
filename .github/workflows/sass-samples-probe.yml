@@ -48,8 +48,7 @@ jobs:
       - name: The branch's programs on both engines
         env:
           VGPU_SASS_PROGRAMS: dynamic_parallelism:75 cdp_device_api:75 rdc_device_api:75 large_params:75 shared_atomics64:75 vector_add:75
-          VGPU_BUILD_DIR: build
-        run: nvidia/tests/e2e/run_sass_archs.sh
+        run: VGPU_BUILD_DIR="$PWD/build" nvidia/tests/e2e/run_sass_archs.sh
 
       - name: CUDA Samples
         if: always() && matrix.flavor == 'cuda13_0'
@@ -59,7 +58,15 @@ jobs:
           VGPU_SASS_LOG: '1'
         run: |
           ci/external/suites.sh fetch cuda-samples suite
-          ci/external/suites.sh build cuda-samples suite
+          # Each sample on its own (the whole tree's configure wants libraries
+          # this image lacks), where suites.sh looks for it.
+          for p in 3_CUDA_Features/cdpQuadtree 3_CUDA_Features/cdpSimpleQuicksort 3_CUDA_Features/cdpSimplePrint \
+                   3_CUDA_Features/cdpBezierTessellation 3_CUDA_Features/jacobiCudaGraphs 6_Performance/LargeKernelParameter; do
+            sed -i -E 's/set\(CMAKE_CUDA_ARCHITECTURES [^)]*\)/set(CMAKE_CUDA_ARCHITECTURES 86)/' suite/Samples/$p/CMakeLists.txt
+            cmake -S suite/Samples/$p -B suite/build/Samples/$p -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared > /dev/null
+            cmake --build suite/build/Samples/$p -j"$(nproc)" | tail -2
+          done
           rc=0
           ci/external/suites.sh run cuda-samples suite build/shim report || rc=1
           VGPU_SASS=0 ci/external/suites.sh run cuda-samples suite build/shim report-ptx || rc=1
