@@ -67,9 +67,9 @@ paths tested here do not call them.
 
 - Dropout between the layers of a cuDNN RNN in training, LSTM projections,
   and non-float RNNs: refused by name.
-- Graphs with operations other than convolution, matmul, pointwise and
-  reduction (norms, resampling, attention): refused when the graph is
-  finalized, so PyTorch falls back or reports it.
+- Graphs with operations other than convolution, matmul, pointwise,
+  reduction and normalization (resampling, attention): refused when the graph
+  is finalized, so PyTorch falls back or reports it.
 - Anything a kernel does that the PTX interpreter does not implement: the
   launch fails naming the instruction, and the PyTorch test scripts fail on any
   such line, even if a check prints `ok`.

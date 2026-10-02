@@ -12,11 +12,12 @@
 //     them back on GetAttribute, so a caller reads what it wrote.
 //   - One engine, global index 0, runs any graph this library can compute:
 //     any number of convolution (forward, backward-data, backward-filter),
-//     matmul, pointwise and reduction operations, joined through virtual
-//     tensors -- cudnn-frontend's conv-bias-activation, matmul-epilogue and
-//     reduction patterns, and PyTorch's single convolutions. A graph with any
-//     other operation is refused when it is finalized, by name, rather than
-//     accepted and run wrongly.
+//     matmul, pointwise, reduction and normalization (layer, instance, batch,
+//     RMS; forward and backward) operations, joined through virtual tensors --
+//     cudnn-frontend's conv-bias-activation, dgrad-drelu, matmul-epilogue,
+//     reduction and norm patterns, and PyTorch's single convolutions. A graph
+//     with any other operation is refused when it is finalized, by name,
+//     rather than accepted and run wrongly.
 //   - Execute computes on the host, as the classic API here does (see
 //     cudnn_api.cpp): the operations run in an order that respects their
 //     data, inputs copied out of device memory and outputs copied back after
@@ -229,7 +230,12 @@ double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
 // What an operation is, which tensors it reads and writes, and its settings,
 // checked: everything a graph's finalization needs to accept it and its
 // execution needs to run it.
-enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction };
+enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd };
+
+// A normalization's tensors, by role: which of an Op's inputs and outputs
+// each is (-1 when the graph does not give it).
+enum NormRole { kX, kScale, kBias, kEps, kMean, kInv, kFactor, kRunMeanIn, kRunVarIn, kDy,
+                kY, kMeanOut, kInvOut, kRunMeanOut, kRunVarOut, kDx, kDscale, kDbias, kRoles };
 
 struct Op {
   Kind kind;
@@ -248,6 +254,14 @@ struct Op {
   int64_t axis = -1;
   // Reduction: the operator. Matmul: in = {a, b}.
   cudnnReduceTensorOp_t red = CUDNN_REDUCE_TENSOR_ADD;
+  // Normalization: the mode, whether it trains, the outputs beyond `out`,
+  // and where each role is (an index into in, or for an output role into
+  // {out, more...}).
+  cudnnBackendNormMode_t norm = CUDNN_LAYER_NORM;
+  bool training = false;
+  std::vector<GTensor> more;
+  int role[kRoles];
+  Op() { for (int& r : role) r = -1; }
 };
 
 const char* op_name(cudnnBackendDescriptorType_t t) {
@@ -485,6 +499,103 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       op->in = {x};
       return true;
     }
+    case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR: {
+      const bool fwd = d->type == CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR;
+      op->kind = fwd ? Kind::NormFwd : Kind::NormBwd;
+      op->norm = static_cast<cudnnBackendNormMode_t>(d->i64(fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_MODE : CUDNN_ATTR_OPERATION_NORM_BWD_MODE));
+      op->training = fwd && d->i64(CUDNN_ATTR_OPERATION_NORM_FWD_PHASE) == CUDNN_NORM_FWD_TRAINING;
+      const char* mode = op->norm == CUDNN_LAYER_NORM ? "layer" : op->norm == CUDNN_INSTANCE_NORM ? "instance"
+                       : op->norm == CUDNN_BATCH_NORM ? "batch" : op->norm == CUDNN_RMS_NORM ? "RMS" : nullptr;
+      if (!mode) { *why = "normalization mode " + std::to_string(op->norm) + " (group norm) is not supported"; return false; }
+      if (fwd && op->norm == CUDNN_BATCH_NORM && !op->training) {
+        *why = "batch normalization's inference phase is not supported (nor is it by cuDNN's graph API)";
+        return false;
+      }
+      if (d->get(fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS : CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS)) {
+        *why = "multi-GPU normalization (peer statistics) is not supported";
+        return false;
+      }
+      // Each role's tensor, if set: inputs go to in, outputs to out (the
+      // first, y or dx) and then more.
+      bool have_out = false;
+      auto take = [&](cudnnBackendAttributeName_t n, int r, bool required, bool output) {
+        if (!d->desc(n)) {
+          if (required) *why = std::string(op_name(d->type)) + ": a required tensor is missing";
+          return !required;
+        }
+        GTensor t;
+        if (!tensor(n, "a tensor", &t)) return false;
+        if (output) {
+          if (!have_out) {
+            op->out = t;
+            op->role[r] = 0;
+            have_out = true;
+          } else {
+            op->more.push_back(t);
+            op->role[r] = static_cast<int>(op->more.size());
+          }
+        } else {
+          op->in.push_back(t);
+          op->role[r] = static_cast<int>(op->in.size() - 1);
+        }
+        return true;
+      };
+      const bool rms = op->norm == CUDNN_RMS_NORM;
+      bool ok;
+      if (fwd) {
+        ok = take(CUDNN_ATTR_OPERATION_NORM_FWD_YDESC, kY, true, true) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_XDESC, kX, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC, kScale, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC, kBias, !rms, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC, kEps, true, false);
+        if (ok && op->training)
+          ok = take(CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC, kMeanOut, false, true) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC, kInvOut, false, true) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_EXP_AVG_FACTOR_DESC, kFactor, false, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_MEAN_DESC, kRunMeanIn, false, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_VAR_DESC, kRunVarIn, false, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_MEAN_DESC, kRunMeanOut, false, true) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_VAR_DESC, kRunVarOut, false, true);
+        else if (ok)
+          ok = take(CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC, kMean, !rms, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC, kInv, true, false);
+        if (ok && op->role[kRunMeanOut] >= 0 && (op->role[kRunMeanIn] < 0 || op->role[kFactor] < 0 || op->role[kRunVarOut] < 0 || op->role[kRunVarIn] < 0)) {
+          *why = "normalization forward: running statistics need both inputs, both outputs and the factor";
+          return false;
+        }
+      } else {
+        ok = take(CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC, kDx, true, true) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_XDESC, kX, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC, kDy, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC, kScale, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC, kMean, false, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC, kInv, false, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_EPSILON_DESC, kEps, false, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC, kDscale, false, true) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC, kDbias, false, true);
+        if (ok && (op->role[kInv] < 0 || (!rms && op->role[kMean] < 0))) {
+          *why = "normalization backward: only the form with the saved mean and inverse variance is supported";
+          return false;
+        }
+      }
+      if (!ok) return false;
+      // Shapes: y (dx) is x's; scale, bias and the statistics broadcast onto x.
+      const vc::Layout& X = op->in[op->role[kX]].l;
+      if (!op->out.l.same_dims(X)) { *why = std::string(mode) + " normalization: the output's shape is not x's"; return false; }
+      for (int r : {kScale, kBias, kMean, kInv, kRunMeanIn, kRunVarIn, kDy})
+        if (op->role[r] >= 0 && !broadcasts(op->in[op->role[r]].l, X)) {
+          *why = std::string(mode) + " normalization: a parameter or statistic does not broadcast onto x";
+          return false;
+        }
+      for (const GTensor& t : op->more)
+        if (!broadcasts(t.l, X)) { *why = std::string(mode) + " normalization: an output does not broadcast onto x"; return false; }
+      if (op->role[kEps] >= 0 && op->in[op->role[kEps]].l.count() != 1) {
+        *why = std::string(mode) + " normalization: epsilon is not a scalar";
+        return false;
+      }
+      return true;
+    }
     default: {
       const char* n = op_name(d->type);
       *why = n ? std::string("the ") + n + " operation is not implemented"
@@ -505,10 +616,13 @@ bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
   for (size_t i = 0; i < all.size(); ++i) {
     const Desc* d = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, i);
     if (!d || !op_of(d, &all[i], why)) return false;
-    if (!producer.emplace(all[i].out.uid, i).second) {
-      *why = "tensor " + std::to_string(all[i].out.uid) + " is written by two operations";
-      return false;
-    }
+    std::vector<int64_t> outs{all[i].out.uid};
+    for (const GTensor& t : all[i].more) outs.push_back(t.uid);
+    for (int64_t uid : outs)
+      if (!producer.emplace(uid, i).second) {
+        *why = "tensor " + std::to_string(uid) + " is written by two operations";
+        return false;
+      }
   }
   for (const Op& o : all)
     for (const GTensor& t : o.in)
@@ -528,6 +642,7 @@ bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
       if (!ok) continue;
       done[i] = true, progress = true;
       ready.insert(all[i].out.uid);
+      for (const GTensor& t : all[i].more) ready.insert(t.uid);
       order->push_back(all[i]);
     }
     if (!progress) { *why = "the graph's operations depend on each other in a cycle"; return false; }
@@ -704,12 +819,136 @@ void run_reduction(const Op& op, const std::vector<double>& x, std::vector<doubl
   *y = std::move(acc);
 }
 
+// Layer, instance, batch and RMS normalization: statistics over the
+// dimensions where the statistics tensor has extent 1 (by default those the
+// mode names: all but N; all but N and C; all but C; all but N), then
+// y = scale * (x - mean) * inv + bias, with inv = 1 / sqrt(var + eps) and,
+// for RMS, no mean. The backward pass, from the saved statistics:
+//   dx = inv * (g - mean(g) - xhat * mean(g * xhat)),  g = dy * scale
+// (no mean(g) term for RMS), and dscale, dbias summed over the dimensions
+// where they have extent 1. outs[0] is op.out; outs[k] is op.more[k - 1].
+void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs) {
+  const vc::Layout& X = op.in[op.role[kX]].l;
+  const std::vector<double>& x = *in[op.role[kX]];
+  const size_t n = x.size();
+  auto input = [&](int r) -> const std::vector<double>* { return op.role[r] >= 0 ? in[op.role[r]] : nullptr; };
+  auto layout_in = [&](int r) -> const vc::Layout* { return op.role[r] >= 0 ? &op.in[op.role[r]].l : nullptr; };
+  auto layout_out = [&](int r) -> const vc::Layout* {
+    return op.role[r] < 0 ? nullptr : op.role[r] == 0 ? &op.out.l : &op.more[op.role[r] - 1].l;
+  };
+  // The statistics' shape.
+  vc::Layout st;
+  const vc::Layout* given = nullptr;
+  for (const vc::Layout* l : {layout_out(kMeanOut), layout_out(kInvOut), layout_in(kMean), layout_in(kInv)})
+    if (l && !given) given = l;
+  if (given) {
+    st = *given;
+  } else {
+    st.rank = X.rank;
+    for (int i = 0; i < X.rank; ++i) {
+      const bool keep = op.norm == CUDNN_BATCH_NORM ? i == 1 : op.norm == CUDNN_INSTANCE_NORM ? i <= 1 : i == 0;
+      st.dims[i] = keep ? X.dims[i] : 1;
+    }
+  }
+  const std::vector<size_t> si = broadcast_index(st, X);
+  const size_t ns = st.count();
+  std::vector<double> cnt(ns, 0.0);
+  for (size_t i = 0; i < n; ++i) cnt[si[i]] += 1;
+  const bool rms = op.norm == CUDNN_RMS_NORM;
+  const double eps = input(kEps) ? (*input(kEps))[0] : 0.0;
+  auto bcast = [&](int r, double dflt) {  // a parameter, per element of x
+    std::vector<double> v(n, dflt);
+    if (op.role[r] < 0) return v;
+    const std::vector<size_t> bi = broadcast_index(op.in[op.role[r]].l, X);
+    for (size_t i = 0; i < n; ++i) v[i] = (*in[op.role[r]])[bi[i]];
+    return v;
+  };
+  std::vector<double> mean(ns, 0.0), inv(ns, 0.0), var(ns, 0.0);
+  if (op.kind == Kind::NormFwd && op.training) {
+    for (size_t i = 0; i < n; ++i) mean[si[i]] += rms ? 0.0 : x[i];
+    for (size_t k = 0; k < ns; ++k) mean[k] /= cnt[k];
+    for (size_t i = 0; i < n; ++i) { const double c = x[i] - mean[si[i]]; var[si[i]] += c * c; }
+    for (size_t k = 0; k < ns; ++k) var[k] /= cnt[k], inv[k] = 1.0 / std::sqrt(var[k] + eps);
+  } else {
+    // From the given statistics, read in st's own order.
+    const std::vector<size_t> mi = input(kMean) ? broadcast_index(*layout_in(kMean), st) : std::vector<size_t>{};
+    const std::vector<size_t> ii = broadcast_index(*layout_in(kInv), st);
+    for (size_t k = 0; k < ns; ++k) {
+      mean[k] = input(kMean) && !rms ? (*input(kMean))[mi[k]] : 0.0;
+      inv[k] = (*input(kInv))[ii[k]];
+    }
+  }
+  const std::vector<double> scale = bcast(kScale, 1.0);
+  outs->assign(1 + op.more.size(), {});
+  auto put = [&](int r, std::vector<double> v) { if (op.role[r] >= 0) (*outs)[op.role[r]] = std::move(v); };
+  // Statistics in an output tensor's own shape (it is st's, or broadcast-equal).
+  auto stats_out = [&](int r, const std::vector<double>& v) {
+    const vc::Layout* l = layout_out(r);
+    if (!l) return;
+    const std::vector<size_t> bi = broadcast_index(st, *l);
+    std::vector<double> o(l->count());
+    for (size_t k = 0; k < o.size(); ++k) o[k] = v[bi[k]];
+    put(r, std::move(o));
+  };
+  if (op.kind == Kind::NormFwd) {
+    const std::vector<double> bias = bcast(kBias, 0.0);
+    std::vector<double> y(n);
+    for (size_t i = 0; i < n; ++i) y[i] = scale[i] * (x[i] - mean[si[i]]) * inv[si[i]] + bias[i];
+    put(kY, std::move(y));
+    if (op.training) {
+      stats_out(kMeanOut, mean);
+      stats_out(kInvOut, inv);
+      if (op.role[kRunMeanOut] >= 0) {
+        // Running variance tracks the unbiased estimate.
+        const double f = (*input(kFactor))[0];
+        const std::vector<size_t> rmi = broadcast_index(*layout_in(kRunMeanIn), st);
+        const std::vector<size_t> rvi = broadcast_index(*layout_in(kRunVarIn), st);
+        std::vector<double> rm(ns), rv(ns);
+        for (size_t k = 0; k < ns; ++k) {
+          const double unbiased = cnt[k] > 1 ? var[k] * cnt[k] / (cnt[k] - 1) : var[k];
+          rm[k] = (1.0 - f) * (*input(kRunMeanIn))[rmi[k]] + f * mean[k];
+          rv[k] = (1.0 - f) * (*input(kRunVarIn))[rvi[k]] + f * unbiased;
+        }
+        stats_out(kRunMeanOut, rm);
+        stats_out(kRunVarOut, rv);
+      }
+    }
+    return;
+  }
+  // Backward.
+  const std::vector<double> dy = bcast(kDy, 0.0);
+  std::vector<double> xhat(n), g(n), mg(ns, 0.0), mgx(ns, 0.0);
+  for (size_t i = 0; i < n; ++i) {
+    xhat[i] = (x[i] - mean[si[i]]) * inv[si[i]];
+    g[i] = dy[i] * scale[i];
+    mg[si[i]] += g[i];
+    mgx[si[i]] += g[i] * xhat[i];
+  }
+  std::vector<double> dx(n);
+  for (size_t i = 0; i < n; ++i) {
+    const size_t k = si[i];
+    dx[i] = inv[k] * (g[i] - (rms ? 0.0 : mg[k] / cnt[k]) - xhat[i] * mgx[k] / cnt[k]);
+  }
+  put(kDx, std::move(dx));
+  for (int r : {kDscale, kDbias}) {
+    const vc::Layout* l = layout_out(r);
+    if (!l) continue;
+    const std::vector<size_t> bi = broadcast_index(*l, X);
+    std::vector<double> o(l->count(), 0.0);
+    for (size_t i = 0; i < n; ++i) o[bi[i]] += r == kDscale ? dy[i] * xhat[i] : dy[i];
+    put(r, std::move(o));
+  }
+}
+
 // Runs a scheduled graph: inputs from the variant pack (device memory, or
 // host memory for a by-value scalar), intermediates on the host rounded to
 // their declared types, outputs written back.
 cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, const std::map<int64_t, void*>& ptrs) {
   static const char* fn = "cudnnBackendExecute";
   std::map<int64_t, std::vector<double>> values;
+  std::set<int64_t> consumed;  // tensors some operation reads
+  for (const Op& op : order)
+    for (const GTensor& t : op.in) consumed.insert(t.uid);
   // The work the program queued before this call comes first.
   vc::sync_handle(handle);
   auto input = [&](const GTensor& t, const std::vector<double>** out) -> cudnnStatus_t {
@@ -728,6 +967,23 @@ cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, 
     *out = &it->second;
     return CUDNN_STATUS_SUCCESS;
   };
+  // An operation's result: kept on the host if virtual, else written out
+  // (and read back, rounded to its type, if a later operation reads it).
+  auto store = [&](const GTensor& o, std::vector<double> r, double alpha, double beta) -> cudnnStatus_t {
+    if (o.is_virtual) {
+      for (double& v : r) v = vc::round_to(o.l.type, alpha * v);
+      values[o.uid] = std::move(r);
+      return CUDNN_STATUS_SUCCESS;
+    }
+    auto p = ptrs.find(o.uid);
+    if (p == ptrs.end() || !p->second) return refuse(fn, "no data pointer for tensor " + std::to_string(o.uid));
+    if (!vc::blend_write(o.l, p->second, r, alpha, beta)) return CUDNN_STATUS_EXECUTION_FAILED;
+    if (!consumed.count(o.uid)) return CUDNN_STATUS_SUCCESS;
+    std::vector<double> back;
+    if (!vc::read(o.l, p->second, &back)) return CUDNN_STATUS_EXECUTION_FAILED;
+    values[o.uid] = std::move(back);
+    return CUDNN_STATUS_SUCCESS;
+  };
   for (const Op& op : order) {
     std::vector<const std::vector<double>*> in(op.in.size());
     for (size_t i = 0; i < op.in.size(); ++i) {
@@ -742,6 +998,19 @@ cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, 
       case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
       case Kind::Matmul: run_matmul(op, *in[0], *in[1], &r); break;
       case Kind::Reduction: run_reduction(op, *in[0], &r); break;
+      case Kind::NormFwd:
+      case Kind::NormBwd: {
+        std::vector<std::vector<double>> outs;
+        run_norm(op, in, &outs);
+        // Every output after the first is stored here; the first goes the
+        // common way below.
+        for (size_t k = 0; k < op.more.size(); ++k) {
+          cudnnStatus_t s = store(op.more[k], std::move(outs[k + 1]), 1.0, 0.0);
+          if (s != CUDNN_STATUS_SUCCESS) return s;
+        }
+        r = std::move(outs[0]);
+        break;
+      }
       case Kind::Pointwise: {
         const vc::Layout& Y = op.out.l;
         r.resize(Y.count());
@@ -763,19 +1032,8 @@ cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, 
         break;
       }
     }
-    const GTensor& o = op.out;
-    if (o.is_virtual) {
-      for (double& v : r) v = vc::round_to(o.l.type, alpha * v);
-      values[o.uid] = std::move(r);
-      continue;
-    }
-    auto p = ptrs.find(o.uid);
-    if (p == ptrs.end() || !p->second) return refuse(fn, "no data pointer for tensor " + std::to_string(o.uid));
-    if (!vc::blend_write(o.l, p->second, r, alpha, beta)) return CUDNN_STATUS_EXECUTION_FAILED;
-    // Later operations read what was written, rounded to its type.
-    std::vector<double> back;
-    if (!vc::read(o.l, p->second, &back)) return CUDNN_STATUS_EXECUTION_FAILED;
-    values[o.uid] = std::move(back);
+    cudnnStatus_t s = store(op.out, std::move(r), alpha, beta);
+    if (s != CUDNN_STATUS_SUCCESS) return s;
   }
   return CUDNN_STATUS_SUCCESS;
 }
@@ -908,7 +1166,9 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR:
-    case CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR: {
+    case CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR: {
       // Shapes that do not fit are the caller's error; a setting this
       // library does not compute is refused by name.
       Op op;

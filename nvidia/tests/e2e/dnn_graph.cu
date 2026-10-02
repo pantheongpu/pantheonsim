@@ -6,6 +6,8 @@
 //   - batched matmul + bias + GELU (a matmul epilogue)
 //   - reductions (sum, max, L2 norm) over chosen dimensions
 //   - pointwise forward and backward modes, with broadcasting and alpha
+//   - layer, RMS and batch normalization, training forward (saved and
+//     running statistics) and backward
 //
 // each checked against a reference computed here on the host, and a graph
 // holding an operation the library has no engine for refused rather than run.
@@ -415,6 +417,162 @@ static void pointwise_ops() {
   }
 }
 
+/* ---- normalization: layer, batch and RMS, forward and backward ---- */
+
+static Desc scalar_tensor(int64_t uid) {
+  Desc t = make(CUDNN_BACKEND_TENSOR_DESCRIPTOR);
+  const cudnnDataType_t f = CUDNN_DATA_FLOAT;
+  const int64_t one[4] = {1, 1, 1, 1}, align = 4;
+  const bool by_value = true;
+  set(t, CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &f);
+  set(t, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, 4, one);
+  set(t, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, 4, one);
+  set(t, CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, 1, &uid);
+  set(t, CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, CUDNN_TYPE_INT64, 1, &align);
+  set(t, CUDNN_ATTR_TENSOR_IS_BY_VALUE, CUDNN_TYPE_BOOLEAN, 1, &by_value);
+  cudnnBackendFinalize(t);
+  return t;
+}
+
+// Statistics per group of x (groups: the positions where the stats shape
+// keeps x's index), the host reference for every normalization below.
+struct Stats { std::vector<double> mean, inv, var; std::vector<size_t> slot; std::vector<double> count; };
+static Stats stats(const std::vector<float>& x, const std::vector<int64_t>& xd, const std::vector<int64_t>& sd,
+                   bool rms, double eps) {
+  Stats s;
+  const size_t n = x.size(), ns = count(sd);
+  s.mean.assign(ns, 0), s.var.assign(ns, 0), s.inv.assign(ns, 0), s.count.assign(ns, 0), s.slot.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    size_t rem = i, k = 0, mul = 1;
+    std::vector<int64_t> idx(xd.size());
+    for (size_t d = xd.size(); d-- > 0;) idx[d] = rem % xd[d], rem /= xd[d];
+    for (size_t d = xd.size(); d-- > 0;) k += (sd[d] == 1 ? 0 : idx[d]) * mul, mul *= sd[d];
+    s.slot[i] = k;
+    s.count[k] += 1;
+    s.mean[k] += rms ? 0.0 : x[i];
+  }
+  for (size_t k = 0; k < ns; ++k) s.mean[k] /= s.count[k];
+  for (size_t i = 0; i < n; ++i) s.var[s.slot[i]] += (x[i] - s.mean[s.slot[i]]) * (x[i] - s.mean[s.slot[i]]);
+  for (size_t k = 0; k < ns; ++k) s.var[k] /= s.count[k], s.inv[k] = 1 / std::sqrt(s.var[k] + eps);
+  return s;
+}
+
+static void norms() {
+  const std::vector<int64_t> xd = {4, 6, 1, 1}, pd = {1, 6, 1, 1};
+  const float eps = 1e-5f;
+  const auto hx = filled(count(xd), 1.5f, 3), hs = filled(6, 0.5f, 4), hb = filled(6, 0.3f, 5);
+  struct M { const char* name; cudnnBackendNormMode_t mode; std::vector<int64_t> sd; };
+  for (const M& m : {M{"layer", CUDNN_LAYER_NORM, {4, 1, 1, 1}}, M{"RMS", CUDNN_RMS_NORM, {4, 1, 1, 1}},
+                     M{"batch", CUDNN_BATCH_NORM, {1, 6, 1, 1}}}) {
+    const bool rms = m.mode == CUDNN_RMS_NORM, batch = m.mode == CUDNN_BATCH_NORM;
+    // Forward, training: y and the saved statistics (and, for batch
+    // normalization, the running ones).
+    Desc x = tensor(1, xd), sc = tensor(2, pd), b = tensor(3, pd), e = scalar_tensor(4), y = tensor(5, xd),
+         mean = tensor(6, m.sd), inv = tensor(7, m.sd), f = scalar_tensor(8), rmi = tensor(9, pd), rvi = tensor(10, pd),
+         rmo = tensor(11, pd), rvo = tensor(12, pd);
+    Desc op = make(CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR);
+    const cudnnBackendNormFwdPhase_t phase = CUDNN_NORM_FWD_TRAINING;
+    set(op, CUDNN_ATTR_OPERATION_NORM_FWD_MODE, CUDNN_TYPE_NORM_MODE, 1, &m.mode);
+    set(op, CUDNN_ATTR_OPERATION_NORM_FWD_PHASE, CUDNN_TYPE_NORM_FWD_PHASE, 1, &phase);
+    set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_XDESC, x);
+    set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC, sc);
+    if (!rms) set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC, b);
+    set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC, e);
+    set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_YDESC, y);
+    if (!rms) set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC, mean);
+    set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC, inv);
+    if (batch) {
+      set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_EXP_AVG_FACTOR_DESC, f);
+      set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_MEAN_DESC, rmi);
+      set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_VAR_DESC, rvi);
+      set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_MEAN_DESC, rmo);
+      set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_VAR_DESC, rvo);
+    }
+    cudnnBackendFinalize(op);
+    const float factor = 0.25f;
+    float *dx = to_dev(hx), *ds = to_dev(hs), *db = to_dev(hb), *dyv = to_dev(std::vector<float>(count(xd), 7.0f)),
+          *dmean = to_dev(std::vector<float>(count(m.sd), 7.0f)), *dinv = to_dev(std::vector<float>(count(m.sd), 7.0f)),
+          *drmi = to_dev(std::vector<float>(6, 0.5f)), *drvi = to_dev(std::vector<float>(6, 2.0f)),
+          *drmo = to_dev(std::vector<float>(6, 7.0f)), *drvo = to_dev(std::vector<float>(6, 7.0f));
+    std::vector<int64_t> uids = {1, 2, 4, 5, 7};
+    std::vector<void*> ptrs = {dx, ds, (void*)&eps, dyv, dinv};
+    if (!rms) uids.push_back(3), ptrs.push_back(db), uids.push_back(6), ptrs.push_back(dmean);
+    if (batch)
+      for (auto [u, p] : std::vector<std::pair<int64_t, void*>>{{8, (void*)&factor}, {9, drmi}, {10, drvi}, {11, drmo}, {12, drvo}})
+        uids.push_back(u), ptrs.push_back(p);
+    char what[96];
+    std::snprintf(what, sizeof what, "graph: %s normalization forward (training)", m.name);
+    const int ran = run(what, {op}, uids, ptrs);
+    const Stats st = stats(hx, xd, m.sd, rms, eps);
+    std::vector<double> want(hx.size());
+    for (size_t i = 0; i < want.size(); ++i) {
+      const size_t c = (i / 1) % 6, k = st.slot[i];
+      want[i] = hs[c] * (hx[i] - st.mean[k]) * st.inv[k] + (rms ? 0.0 : hb[c]);
+    }
+    double err = 0;
+    if (ran == 1) {
+      err = max_rel(from_dev(dyv, want.size()), want);
+      err = std::fmax(err, max_rel(from_dev(dinv, st.inv.size()), st.inv));
+      if (!rms) err = std::fmax(err, max_rel(from_dev(dmean, st.mean.size()), st.mean));
+      if (batch) {
+        std::vector<double> rm(6), rv(6);
+        for (int c = 0; c < 6; ++c) {
+          rm[c] = 0.75 * 0.5 + 0.25 * st.mean[c];
+          rv[c] = 0.75 * 2.0 + 0.25 * st.var[c] * st.count[c] / (st.count[c] - 1);
+        }
+        err = std::fmax(err, max_rel(from_dev(drmo, 6), rm));
+        err = std::fmax(err, max_rel(from_dev(drvo, 6), rv));
+      }
+    }
+    report(what, ran, err, 1e-4);
+
+    // Backward, from the saved statistics.
+    const auto hdy = filled(count(xd), 0.9f, 6);
+    Desc gy = tensor(13, xd), gx = tensor(14, xd), gs = tensor(15, pd), gb = tensor(16, pd);
+    Desc bop = make(CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR);
+    set(bop, CUDNN_ATTR_OPERATION_NORM_BWD_MODE, CUDNN_TYPE_NORM_MODE, 1, &m.mode);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_XDESC, x);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC, gy);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC, sc);
+    if (!rms) set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC, mean);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC, inv);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC, gx);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC, gs);
+    if (!rms) set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC, gb);
+    cudnnBackendFinalize(bop);
+    std::vector<float> fmean(st.mean.begin(), st.mean.end()), finv(st.inv.begin(), st.inv.end());
+    float *ddy = to_dev(hdy), *dgx = to_dev(std::vector<float>(count(xd), 7.0f)), *dgs = to_dev(std::vector<float>(6, 7.0f)),
+          *dgb = to_dev(std::vector<float>(6, 7.0f)), *smean = to_dev(fmean), *sinv = to_dev(finv);
+    std::vector<int64_t> buids = {1, 13, 2, 7, 14, 15};
+    std::vector<void*> bptrs = {dx, ddy, ds, sinv, dgx, dgs};
+    if (!rms) buids.push_back(6), bptrs.push_back(smean), buids.push_back(16), bptrs.push_back(dgb);
+    std::snprintf(what, sizeof what, "graph: %s normalization backward", m.name);
+    const int bran = run(what, {bop}, buids, bptrs);
+    double berr = 0;
+    if (bran == 1) {
+      // dx = inv * (g - mean(g) - xhat * mean(g * xhat)), g = dy * scale.
+      const size_t ns = st.mean.size();
+      std::vector<double> mg(ns, 0), mgx(ns, 0), dscale(6, 0), dbias(6, 0), want_dx(hx.size());
+      for (size_t i = 0; i < hx.size(); ++i) {
+        const size_t k = st.slot[i], c = i % 6;
+        const double xh = (hx[i] - st.mean[k]) * st.inv[k], g = hdy[i] * hs[c];
+        mg[k] += g, mgx[k] += g * xh, dscale[c] += hdy[i] * xh, dbias[c] += hdy[i];
+      }
+      for (size_t i = 0; i < hx.size(); ++i) {
+        const size_t k = st.slot[i], c = i % 6;
+        const double xh = (hx[i] - st.mean[k]) * st.inv[k], g = hdy[i] * hs[c];
+        want_dx[i] = st.inv[k] * (g - (rms ? 0.0 : mg[k] / st.count[k]) - xh * mgx[k] / st.count[k]);
+      }
+      berr = max_rel(from_dev(dgx, want_dx.size()), want_dx);
+      berr = std::fmax(berr, max_rel(from_dev(dgs, 6), dscale));
+      if (!rms) berr = std::fmax(berr, max_rel(from_dev(dgb, 6), dbias));
+    }
+    report(what, bran, berr, 1e-4);
+    for (Desc d : {x, sc, b, e, y, mean, inv, f, rmi, rvi, rmo, rvo, op, gy, gx, gs, gb, bop}) cudnnBackendDestroyDescriptor(d);
+    for (float* p : {dx, ds, db, dyv, dmean, dinv, drmi, drvi, drmo, drvo, ddy, dgx, dgs, dgb, smean, sinv}) cudaFree(p);
+  }
+}
+
 // An operation this library has no engine for is refused when it is
 // finalized, by name, not accepted and run wrongly. (NVIDIA's library has an
 // engine for it, so this is VirtualGPU's own contract.)
@@ -438,6 +596,7 @@ int main() {
   matmul();
   reductions();
   pointwise_ops();
+  norms();
   refusals();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
