@@ -21,7 +21,9 @@ if ! nvcc -arch=compute_90a -code=compute_90a -c "$out.cu" -o /dev/null 2>/dev/n
 fi
 nvcc_host_compiler_fix
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
-nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a "${san_flags[@]}" \
+# -nodlink: CUDA 12.8's device-link step asks nvlink for compute_90aa and fails;
+# without -rdc there is nothing to device-link anyway.
+nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a -nodlink "${san_flags[@]}" \
      "$root/nvidia/tests/e2e/tma_im2col.cu" -o "$out" \
   || { echo "FAIL: tma_im2col.cu did not build"; exit 1; }
 if ! require_shim_libs "$shim" "$out"; then exit 0; fi
