@@ -17,4 +17,9 @@
 // for an address no allocation covers.
 bool vgpu_device_allocation(const void* p, void** base, std::size_t* size);
 
+// Removes the file behind device memory this process shared with
+// cudaIpcGetMemHandle, keeping every mapping of it -- for a library that knows
+// all its importers have opened it. False if `p` is not such memory.
+bool vgpu_ipc_unlink(const void* p);
+
 #endif  // VGPU_RUNTIME_SHIM_MEMORY_HPP

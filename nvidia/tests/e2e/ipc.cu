@@ -118,6 +118,10 @@ static int do_export(const std::string& handle_file) {
 }
 
 static int do_import(const std::string& handle_file) {
+  // IPC_IMPORT_DEVICE: import with another device current than the exporter
+  // used -- one GPU per process, as NCCL and NVSHMEM run -- so that this
+  // process's kernels reach the memory on a device that did not export it.
+  if (const char* d = getenv("IPC_IMPORT_DEVICE")) CK(cudaSetDevice(atoi(d)));
   cudaIpcMemHandle_t handle{};
   if (!read_file(handle_file, &handle, sizeof handle)) {
     printf("FAIL no handle to import\n");
