@@ -20,6 +20,11 @@
 // Multi-GPU plans spread their data over the simulated devices in NVIDIA's
 // layouts, and LTO callbacks given as PTX run on the device around the host
 // transform: see the sections at the end of this file.
+// CUDA 12.7-12.9's cufftXt.h defines cufftXtSetJITCallback as a static
+// inline that calls __cufftXtSetJITCallback_12_7; this file defines the
+// plain name itself, and exports the versioned one for programs built
+// against those headers.
+#define CUFFT_NO_INLINE
 #include <cufft.h>
 #include <cufftXt.h>
 
@@ -1703,4 +1708,14 @@ VGPU_EXPORT cufftResult cufftXtSetJITCallback(cufftHandle plan, const char* lto_
   cb.info = caller_info ? caller_info[0] : nullptr;  // one pointer per GPU; one GPU here
   it->second.jit[(int)type] = std::move(cb);
   return CUFFT_SUCCESS;
+}
+
+// What a program compiled against CUDA 12.7-12.9's cufftXt.h calls.
+VGPU_EXPORT cufftResult __cufftXtSetJITCallback_12_7(cufftHandle plan,
+                                                     const char* lto_callback_symbol_name,
+                                                     const void* lto_callback_fatbin,
+                                                     size_t lto_callback_fatbin_size,
+                                                     cufftXtCallbackType type, void** caller_info) {
+  return cufftXtSetJITCallback(plan, lto_callback_symbol_name, lto_callback_fatbin,
+                               lto_callback_fatbin_size, type, caller_info);
 }
