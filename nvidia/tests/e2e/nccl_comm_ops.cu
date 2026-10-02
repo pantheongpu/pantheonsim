@@ -512,6 +512,24 @@ int main() {
     NK(ncclGroupStart());
     for (int i = 0; i < nranks; ++i) NK(ncclAlltoAll(s[i], d[i], 0, ncclFloat, world[i], streams[i]));
     expect_rc(ncclGroupEnd(), ncclSuccess, "alltoall: count 0");
+    // Zero elements everywhere else too, a pre-multiplied sum and an empty
+    // message included: each synchronizes and moves nothing. (Added after the
+    // RTX 3060 runs, while their GPU 0 was reserved; NCCL documents count 0.)
+    {
+      std::vector<ncclRedOp_t> zop(nranks);
+      float one = 1.0f;
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclRedOpCreatePreMulSum(&zop[i], &one, ncclFloat, ncclScalarHostImmediate, world[i])); }
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) {
+        NK(ncclAllGather(s[i], d[i], 0, ncclFloat, world[i], streams[i]));
+        NK(ncclAllReduce(s[i], d[i], 0, ncclFloat, zop[i], world[i], streams[i]));
+        NK(ncclGather(s[i], d[i], 0, ncclFloat, 0, world[i], streams[i]));
+        NK(ncclSend(s[i], 0, ncclFloat, (i + 1) % nranks, world[i], streams[i]));
+        NK(ncclRecv(d[i], 0, ncclFloat, (i + nranks - 1) % nranks, world[i], streams[i]));
+      }
+      expect_rc(ncclGroupEnd(), ncclSuccess, "count 0: allgather, premulsum, gather, send/recv");
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclRedOpDestroy(zop[i], world[i]); }
+    }
     cudaSetDevice(0);
     expect_rc(ncclAlltoAll(s[0], d[0], C, (ncclDataType_t)99, world[0], streams[0]), ncclInvalidArgument,
               "alltoall: invalid datatype");

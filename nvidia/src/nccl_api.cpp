@@ -844,6 +844,11 @@ ncclResult_t collect(Op& op) {
                                   "a matching ncclSend", c); r != ncclSuccess)
       return r;
     const size_t bytes = op.count * es;
+    if (bytes == 0) {   // an empty message: nothing to map (mmap refuses length 0)
+      unlink(c->rz->p2p_path(op.peer, c->rank, want_msgs).c_str());
+      meta->taken[op.peer][c->rank].store(want_msgs, std::memory_order_release);
+      return ncclSuccess;
+    }
     Mapping m;
     // The file's own length is the message length, so a size disagreement is
     // caught here rather than trusted from a shared counter that a later send
@@ -874,6 +879,11 @@ ncclResult_t collect(Op& op) {
         return true;
       }, "the other ranks to reach this collective", c); r != ncclSuccess)
     return r;
+  // A collective of zero elements still synchronizes, and moves nothing. Going
+  // on would hand memcpy the null data() of empty buffers, which UBSan rightly
+  // calls undefined, and look for a pre-multiplied sum's scalar after data
+  // that was never written.
+  if (op.count == 0 && op.kind != Kind::Split) return ncclSuccess;
 
   std::vector<char> peer;
   switch (op.kind) {
