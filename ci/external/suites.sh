@@ -65,7 +65,10 @@ build() {
     cuda-samples)
       # One architecture, the card's, rather than the nine the samples list.
       find Samples -name CMakeLists.txt -exec sed -i -E 's/set\(CMAKE_CUDA_ARCHITECTURES [^)]*\)/set(CMAKE_CUDA_ARCHITECTURES 86)/' {} +
+      # The nvcc on PATH, named: CMake otherwise finds /usr/bin/nvcc first where
+      # Ubuntu's CUDA 12.0 is installed too (the pantheonsim.com runner).
       cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
+        -DCMAKE_CUDA_COMPILER="$(command -v nvcc)" \
         -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared > build-configure.log 2>&1 || { tail -30 build-configure.log; exit 1; }
       targets=$(entries | cut -d'|' -f1 | xargs -n1 basename)
       # -k 0: one sample that fails to build is reported by `run`, not fatal here.
@@ -134,7 +137,7 @@ run() {
       done < <(entries) ;;
     rodinia)
       while IFS='|' read -r app src flags args file sum; do
-        log="$report/logs/$app.log"; wd="$dir/$src/run-$app"; rm -rf "$wd"; mkdir -p "$wd"
+        log="$report/logs/$app.log"; wd="$src/run-$app"; rm -rf "$wd"; mkdir -p "$wd"
         [[ -x $src/$app ]] || { result "$app" FAIL 0 "did not build"; continue; }
         # shellcheck disable=SC2086
         run_one "$app" "$wd" "$log" "../$app" $args
