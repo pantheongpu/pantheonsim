@@ -230,4 +230,9 @@ struct DropoutState { unsigned long long seed; uint64_t drawn; };
 // computes on the host, and the inputs must be there first.
 void sync_handle(cudnnHandle_t h);
 
+// Leaves a tensor descriptor with no dimensions, as cuDNN reports a weight
+// matrix or bias that does not exist (cudnnGetRNNWeightParams).
+// (cudnn_api.cpp)
+void clear_tensor(cudnnTensorDescriptor_t d);
+
 }  // namespace vgpu_cudnn
