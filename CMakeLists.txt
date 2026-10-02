@@ -582,9 +582,10 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
+    # Every entry point PyTorch binds is implemented, so cuDNN has no
+    # generated stubs (nvidia/src/generated/) any more.
     add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/cudnn_backend.cpp nvidia/src/cudnn_rnn.cpp
-      nvidia/src/cudnn_common.cpp
-      nvidia/src/generated/cudnn_stubs.cpp)
+      nvidia/src/cudnn_common.cpp)
     target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
     target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpucudnn PROPERTIES OUTPUT_NAME cudnn SOVERSION 9 VERSION 9.0)

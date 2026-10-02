@@ -34,7 +34,7 @@ which is the honest meaning of "the same image".
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex), GEMV, level‑1, triangular solves, batched LU (`getrfBatched`/`getrsBatched`); for complex also rank-1/rank-k updates, Hermitian products, `trmm`/`trmv`/`trsv` |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
-| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation), dropout, the spatial transformer, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC; the graph API's convolution, matmul, pointwise, reduction and normalization (layer, instance, batch, RMS) graphs; RNNs |
+| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation), dropout, the spatial transformer, CTC loss, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC; the graph API's convolution, matmul, pointwise, reduction and normalization (layer, instance, batch, RMS) graphs; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
@@ -74,7 +74,7 @@ output. Anything that differs is a bug in this implementation.
 | `cublas_gemm` | every GEMM path bit-identical, mixed precision included; level‑1/2 to ~1e‑7 |
 | `lt_and_rand` | cuBLASLt bit-identical; cuRAND matches distribution and reseed semantics |
 | `cudnn_ops` | all 50 reported values bit-identical |
-| `cudnn_backward` | all 155 lines agree to 1e‑6 relative: the three convolution passes (groups, dilation, both modes, NHWC, strided, 3‑D, double), fused bias-activation, activation, pooling, softmax and LRN backward, reductions with every index identical, op-tensor, transforms, dropout's backward pass, NHWC batch normalization with and without a fused add and activation, the spatial transformer's grid and sampler both ways |
+| `cudnn_backward` | all 165 lines agree to 1e‑6 relative: the three convolution passes (groups, dilation, both modes, NHWC, strided, 3‑D, double), fused bias-activation, activation, pooling, softmax and LRN backward, reductions with every index identical, op-tensor, transforms, dropout's backward pass, NHWC batch normalization with and without a fused add and activation, the spatial transformer's grid and sampler both ways, CTC loss from activations and from probabilities |
 | `cudnn_types` | INT8 convolution identical to the integer; float-to-half and -bfloat16 bits identical; half and bfloat16 convolution, activation, pooling, softmax and batch normalization to 2e‑4 |
 | `cufft_transforms` | all 14 bit-identical, across composite, prime, 2‑D, 3‑D and both precisions |
 | `cusparse_ops` | all 15 bit-identical; CSR to CSC identical in every index and value, both bases, both value types, structure only and with values |
@@ -112,8 +112,11 @@ An LRN window of even size reaches one channel further up than down.
 8, 6 and 7 entries (the max counts say 10, 8 and 9) with forward `DIRECT` and
 backward-filter `WINOGRAD` never runnable; dropout's reserve space is one bit
 per element, least significant first, rounded up to whole words; batch
-normalization fuses an add and RELU or SWISH forward, RELU alone backward.
-All of that is matched. Where the arithmetic order is the hardware's own choice it is not:
+normalization fuses an add and RELU or SWISH forward, RELU alone backward;
+CTC's gradient with respect to probabilities (normalization `NONE`) is
+`-posterior / y` where some path passes and `y` where none does, and a label
+too long for its input costs 0 with its gradient zeroed up to the batch's
+longest input. All of that is matched. Where the arithmetic order is the hardware's own choice it is not:
 float and double sums are accumulated exactly here and rounded once, a
 `TRUE_HALF` convolution accumulates in half in its own order, and the dropout
 mask comes from a different generator (kept fraction, scaling, reseeding and
@@ -137,7 +140,7 @@ runs them; each is a ctest of its own.
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
-| `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)` |
+| `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch norm forward and backward | `cudnn_convolution_add_relu`, cudnn-frontend |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -276,7 +279,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   the saved statistics, ragged and vectorized tensors, asymmetric padding; the
   vectorized layouts (`NCHW_VECT_C`, INT8x4/INT8x32) and FP8 tensors; the
   cuDNN 8 normalization API,
-  divisive normalization, CTC loss, `cudnnIm2Col`,
+  divisive normalization, `cudnnIm2Col`,
   fused-ops plans and tensor transform descriptors; RNN projections and
   non-float RNNs.
 - **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.

@@ -17,6 +17,7 @@
 //     the forward pass's mask, a reseed repeating it; and between an RNN's
 //     layers, its gradients against finite differences of a reseeded
 //     training pass.
+//   - CTC loss: its gradient against finite differences of its cost.
 #include <cudnn.h>
 #include <cuda_runtime.h>
 
@@ -536,6 +537,57 @@ static void rnn_dropout() {
   cudaFree(st);
 }
 
+/* ---- CTC loss ---- */
+
+// CTC's gradient with respect to the activations (SOFTMAX mode) against
+// finite differences of its own cost, and the cost of a one-step,
+// one-symbol label against -log of that symbol's probability.
+static void ctc() {
+  const int T = 5, N = 2, A = 4;
+  cudnnTensorDescriptor_t pd = nd(CUDNN_DATA_FLOAT, {T, N, A});
+  cudnnCTCLossDescriptor_t cd;
+  CK(cudnnCreateCTCLossDescriptor(&cd));
+  CK(cudnnSetCTCLossDescriptor_v9(cd, CUDNN_DATA_FLOAT, CUDNN_LOSS_NORMALIZATION_SOFTMAX, CUDNN_CTC_ZERO_OOB_GRADIENTS,
+                                  4));
+  const int labels[] = {1, 2, 3}, llen[N] = {2, 1}, ilen[N] = {5, 4};
+  size_t ws = 0;
+  CK(cudnnGetCTCLossWorkspaceSize(H, pd, pd, labels, llen, ilen, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd, &ws));
+  Buf<char> work(ws + 16);
+  Buf<float> x(T * N * A, 1.2, 4), costs(N), grad(T * N * A);
+  CK(cudnnCTCLoss(H, pd, x.p, labels, llen, ilen, costs.p, pd, grad.p, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd, work.p,
+                  ws));
+  const auto x0 = x.get(), g = grad.get();
+  auto cost = [&](const std::vector<float>& xs) {
+    Buf<float> xi(T * N * A), c(N);
+    xi.put(xs);
+    cudnnCTCLoss(H, pd, xi.p, labels, llen, ilen, c.p, pd, nullptr, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd, work.p, ws);
+    const auto v = c.get();
+    return (double)v[0] + v[1];
+  };
+  double worst = 0;
+  for (int t = 0; t < 4; ++t)  // both sequences run 4 steps or more
+    for (int i : {0, 1, 2, 3, 5, 6}) {
+      const size_t k = (size_t)t * N * A + i;
+      auto a = x0, b = x0;
+      a[k] += 1e-2f, b[k] -= 1e-2f;
+      worst = std::fmax(worst, std::fabs((cost(a) - cost(b)) / 2e-2 - g[k]));
+    }
+  expect("CTC gradient matches finite differences of its cost", worst < 2e-3, worst);
+  // One step, one symbol: the only path is that symbol.
+  cudnnTensorDescriptor_t p1 = nd(CUDNN_DATA_FLOAT, {1, 1, A});
+  const int one_label[] = {2}, one[] = {1};
+  Buf<float> x1(A, 1.0, 9), c1(1);
+  CK(cudnnCTCLoss(H, p1, x1.p, one_label, one, one, c1.p, p1, nullptr, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd, work.p,
+                  ws));
+  const auto v = x1.get();
+  double sum = 0;
+  for (float e : v) sum += std::exp((double)e);
+  const double want = -(v[2] - std::log(sum));
+  expect("a one-step CTC cost is -log of the symbol's probability", std::fabs(c1.get()[0] - want) < 1e-5,
+         c1.get()[0] - want);
+  cudnnDestroyCTCLossDescriptor(cd);
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("FAIL cudnnCreate\n");
@@ -546,6 +598,7 @@ int main() {
   algorithms();
   dropout();
   rnn_dropout();
+  ctc();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
   return fails ? 1 : 0;

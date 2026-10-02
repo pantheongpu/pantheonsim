@@ -2383,6 +2383,255 @@ VGPU_EXPORT cudnnStatus_t cudnnSpatialTfSamplerBackward(cudnnHandle_t h, cudnnSp
              : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
+/* ---- CTC loss ---- */
+
+namespace {
+struct CtcDesc {
+  cudnnDataType_t type = CUDNN_DATA_FLOAT;
+  cudnnLossNormalizationMode_t norm = CUDNN_LOSS_NORMALIZATION_SOFTMAX;
+  cudnnCTCGradMode_t grad = CUDNN_CTC_ZERO_OOB_GRADIENTS;
+  int max_label = 255;
+};
+
+inline double log_add(double a, double b) {
+  if (a == -INFINITY) return b;
+  if (b == -INFINITY) return a;
+  const double m = std::max(a, b);
+  return m + std::log1p(std::exp(-std::fabs(a - b)));
+}
+
+// The loss and its gradient for every sequence, by the forward-backward
+// recursion over the label with blanks between and around (label 0 is the
+// blank), in log space. SOFTMAX mode takes activations and gives the gradient
+// with respect to them, y - posterior; NONE takes probabilities and gives the
+// gradient with respect to them, -posterior / y where some path passes and,
+// as measured on the hardware, y where none does. A label the input is too
+// short for costs 0, with its gradient zeroed (up to the batch's longest
+// input) or left alone as the descriptor says; otherwise steps past a
+// sequence's length are left alone.
+cudnnStatus_t ctc(const char* fn, cudnnHandle_t h, const CtcDesc& D, const void* pd, const void* probs,
+                  const std::vector<int>& labels, const std::vector<int>& label_len, const std::vector<int>& input_len,
+                  void* costs, const void* gd, void* grads) {
+  const TensorDesc *P = tdesc(pd), *G = tdesc(gd);
+  if (!known(h) || !P || !probs || !costs) return BAD(fn, "invalid handle, descriptor or pointer");
+  if (P->l.rank != 3) return BAD(fn, "probabilities must be [T, N, A]");
+  if (grads && (!G || !G->l.same_dims(P->l))) return BAD(fn, "the gradients' shape is not the probabilities'");
+  if (!floating(P->l.type)) return UNSUPPORTED(fn, std::string(type_name(P->l.type)) + " data");
+  const int T = static_cast<int>(P->l.dims[0]), N = static_cast<int>(P->l.dims[1]), A = static_cast<int>(P->l.dims[2]);
+  if (static_cast<int>(label_len.size()) < N || static_cast<int>(input_len.size()) < N) return BAD(fn, "lengths missing");
+  size_t total = 0;
+  for (int n = 0; n < N; ++n) {
+    if (label_len[n] < 0 || label_len[n] > D.max_label || input_len[n] < 0 || input_len[n] > T)
+      return BAD(fn, "a label or input length is out of range");
+    total += static_cast<size_t>(label_len[n]);
+  }
+  if (labels.size() < total) return BAD(fn, "fewer labels than the label lengths add up to");
+  for (size_t i = 0; i < total; ++i)
+    if (labels[i] < 1 || labels[i] >= A) return BAD(fn, "a label is outside [1, A - 1]");
+  sync_handle(h);
+  std::vector<double> in, g;
+  if (!read(P->l, probs, &in)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (grads && !read(G->l, grads, &g)) return CUDNN_STATUS_EXECUTION_FAILED;  // what is left alone stays
+  // log y[t][n][a]
+  std::vector<double> ly(in.size());
+  for (int t = 0; t < T; ++t)
+    for (int n = 0; n < N; ++n) {
+      const double* row = in.data() + (static_cast<size_t>(t) * N + n) * A;
+      double* out = ly.data() + (static_cast<size_t>(t) * N + n) * A;
+      if (D.norm == CUDNN_LOSS_NORMALIZATION_SOFTMAX) {
+        double m = -INFINITY, sum = 0.0;
+        for (int a = 0; a < A; ++a) m = std::max(m, row[a]);
+        for (int a = 0; a < A; ++a) sum += std::exp(row[a] - m);
+        for (int a = 0; a < A; ++a) out[a] = row[a] - m - std::log(sum);
+      } else {
+        for (int a = 0; a < A; ++a) out[a] = std::log(row[a]);
+      }
+    }
+  auto LY = [&](int t, int n, int a) { return ly[(static_cast<size_t>(t) * N + n) * A + a]; };
+  std::vector<double> cost(N, 0.0);
+  const int max_len = *std::max_element(input_len.begin(), input_len.begin() + N);
+  size_t off = 0;
+  for (int n = 0; n < N; ++n) {
+    const int L = label_len[n], Tn = input_len[n], S = 2 * L + 1;
+    std::vector<int> lp(S, 0);
+    for (int i = 0; i < L; ++i) lp[2 * i + 1] = labels[off + i];
+    off += static_cast<size_t>(L);
+    std::vector<double> al(static_cast<size_t>(Tn) * S, -INFINITY), be(static_cast<size_t>(Tn) * S, -INFINITY);
+    auto at = [&](int t, int s) { return static_cast<size_t>(t) * S + s; };
+    double logp = -INFINITY;
+    if (Tn > 0) {
+      al[at(0, 0)] = LY(0, n, lp[0]);
+      if (S > 1) al[at(0, 1)] = LY(0, n, lp[1]);
+      for (int t = 1; t < Tn; ++t)
+        for (int s = 0; s < S; ++s) {
+          double v = al[at(t - 1, s)];
+          if (s > 0) v = log_add(v, al[at(t - 1, s - 1)]);
+          if (s > 1 && lp[s] != 0 && lp[s] != lp[s - 2]) v = log_add(v, al[at(t - 1, s - 2)]);
+          al[at(t, s)] = v + LY(t, n, lp[s]);
+        }
+      be[at(Tn - 1, S - 1)] = LY(Tn - 1, n, lp[S - 1]);
+      if (S > 1) be[at(Tn - 1, S - 2)] = LY(Tn - 1, n, lp[S - 2]);
+      for (int t = Tn - 2; t >= 0; --t)
+        for (int s = 0; s < S; ++s) {
+          double v = be[at(t + 1, s)];
+          if (s + 1 < S) v = log_add(v, be[at(t + 1, s + 1)]);
+          if (s + 2 < S && lp[s] != 0 && lp[s] != lp[s + 2]) v = log_add(v, be[at(t + 1, s + 2)]);
+          be[at(t, s)] = v + LY(t, n, lp[s]);
+        }
+      logp = al[at(Tn - 1, S - 1)];
+      if (S > 1) logp = log_add(logp, al[at(Tn - 1, S - 2)]);
+    }
+    const bool feasible = logp > -INFINITY;
+    cost[n] = feasible ? -logp : 0.0;
+    if (!grads) continue;
+    if (!feasible) {
+      // Measured: up to the longest input of the batch, past this one's too.
+      if (D.grad == CUDNN_CTC_ZERO_OOB_GRADIENTS)
+        for (int t = 0; t < max_len; ++t)
+          for (int a = 0; a < A; ++a) g[(static_cast<size_t>(t) * N + n) * A + a] = 0.0;
+      continue;
+    }
+    for (int t = 0; t < Tn; ++t) {
+      // log of sum over s with lp[s] = a of alpha * beta (each includes y once too many)
+      std::vector<double> lab(A, -INFINITY);
+      for (int s = 0; s < S; ++s) lab[lp[s]] = log_add(lab[lp[s]], al[at(t, s)] + be[at(t, s)]);
+      for (int a = 0; a < A; ++a) {
+        const double lyta = LY(t, n, a), yv = std::exp(lyta);
+        double& out = g[(static_cast<size_t>(t) * N + n) * A + a];
+        if (D.norm == CUDNN_LOSS_NORMALIZATION_SOFTMAX)
+          out = yv - std::exp(lab[a] - logp - lyta);
+        else
+          out = lab[a] == -INFINITY ? yv : -std::exp(lab[a] - logp - 2.0 * lyta);
+      }
+    }
+  }
+  Layout cl;
+  cl.type = P->l.type;
+  cl.rank = 1;
+  cl.dims[0] = N;
+  cl.strides[0] = 1;
+  if (!write(cl, costs, cost)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (grads && !write(G->l, grads, g)) return CUDNN_STATUS_EXECUTION_FAILED;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+std::vector<int> device_ints(const int* p, size_t n) {
+  std::vector<int> v(n, 0);
+  if (p && n) cudaMemcpy(v.data(), p, n * sizeof(int), cudaMemcpyDeviceToHost);
+  return v;
+}
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnCreateCTCLossDescriptor(cudnnCTCLossDescriptor_t* d) {
+  if (!d) return CUDNN_STATUS_BAD_PARAM;
+  *d = reinterpret_cast<cudnnCTCLossDescriptor_t>(track(new CtcDesc()));
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnDestroyCTCLossDescriptor(cudnnCTCLossDescriptor_t d) {
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  untrack(d); delete as<CtcDesc>(d);
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnSetCTCLossDescriptor_v9(cudnnCTCLossDescriptor_t d, cudnnDataType_t type,
+                                                       cudnnLossNormalizationMode_t norm, cudnnCTCGradMode_t grad,
+                                                       int max_label) {
+  if (!known(d) || max_label < 0) return CUDNN_STATUS_BAD_PARAM;
+  if (norm != CUDNN_LOSS_NORMALIZATION_NONE && norm != CUDNN_LOSS_NORMALIZATION_SOFTMAX)
+    return BAD("cudnnSetCTCLossDescriptor_v9", "unknown normalization mode");
+  *as<CtcDesc>(d) = CtcDesc{type, norm, grad, max_label};
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnSetCTCLossDescriptor_v8(cudnnCTCLossDescriptor_t d, cudnnDataType_t type,
+                                                       cudnnLossNormalizationMode_t norm, cudnnNanPropagation_t,
+                                                       int max_label) {
+  return cudnnSetCTCLossDescriptor_v9(d, type, norm, CUDNN_CTC_ZERO_OOB_GRADIENTS, max_label);
+}
+VGPU_EXPORT cudnnStatus_t cudnnSetCTCLossDescriptorEx(cudnnCTCLossDescriptor_t d, cudnnDataType_t type,
+                                                      cudnnLossNormalizationMode_t norm, cudnnNanPropagation_t) {
+  return cudnnSetCTCLossDescriptor_v9(d, type, norm, CUDNN_CTC_ZERO_OOB_GRADIENTS, 255);
+}
+VGPU_EXPORT cudnnStatus_t cudnnSetCTCLossDescriptor(cudnnCTCLossDescriptor_t d, cudnnDataType_t type) {
+  return cudnnSetCTCLossDescriptor_v9(d, type, CUDNN_LOSS_NORMALIZATION_NONE, CUDNN_CTC_ZERO_OOB_GRADIENTS, 255);
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossDescriptor_v9(cudnnCTCLossDescriptor_t d, cudnnDataType_t* type,
+                                                       cudnnLossNormalizationMode_t* norm, cudnnCTCGradMode_t* grad,
+                                                       int* max_label) {
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  const auto* c = as<const CtcDesc>(d);
+  if (type) *type = c->type;
+  if (norm) *norm = c->norm;
+  if (grad) *grad = c->grad;
+  if (max_label) *max_label = c->max_label;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossDescriptor_v8(cudnnCTCLossDescriptor_t d, cudnnDataType_t* type,
+                                                       cudnnLossNormalizationMode_t* norm, cudnnNanPropagation_t* nan,
+                                                       int* max_label) {
+  if (nan) *nan = CUDNN_NOT_PROPAGATE_NAN;
+  return cudnnGetCTCLossDescriptor_v9(d, type, norm, nullptr, max_label);
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossDescriptorEx(cudnnCTCLossDescriptor_t d, cudnnDataType_t* type,
+                                                      cudnnLossNormalizationMode_t* norm, cudnnNanPropagation_t* nan) {
+  if (nan) *nan = CUDNN_NOT_PROPAGATE_NAN;
+  return cudnnGetCTCLossDescriptor_v9(d, type, norm, nullptr, nullptr);
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossDescriptor(cudnnCTCLossDescriptor_t d, cudnnDataType_t* type) {
+  return cudnnGetCTCLossDescriptor_v9(d, type, nullptr, nullptr, nullptr);
+}
+
+// Workspace: none, since the work is done on the host.
+VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossWorkspaceSize(cudnnHandle_t h, const cudnnTensorDescriptor_t pd,
+                                                       const cudnnTensorDescriptor_t, const int*, const int*,
+                                                       const int*, cudnnCTCLossAlgo_t, cudnnCTCLossDescriptor_t d,
+                                                       size_t* size) {
+  if (!known(h) || !tdesc(pd) || !known(d) || !size) return CUDNN_STATUS_BAD_PARAM;
+  *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossWorkspaceSize_v8(cudnnHandle_t h, cudnnCTCLossAlgo_t,
+                                                          cudnnCTCLossDescriptor_t d, const cudnnTensorDescriptor_t pd,
+                                                          const cudnnTensorDescriptor_t, size_t* size) {
+  if (!known(h) || !tdesc(pd) || !known(d) || !size) return CUDNN_STATUS_BAD_PARAM;
+  *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+// Labels and lengths in host memory.
+VGPU_EXPORT cudnnStatus_t cudnnCTCLoss(cudnnHandle_t h, const cudnnTensorDescriptor_t pd, const void* probs,
+                                       const int labels[], const int label_len[], const int input_len[], void* costs,
+                                       const cudnnTensorDescriptor_t gd, void* grads, cudnnCTCLossAlgo_t algo,
+                                       cudnnCTCLossDescriptor_t d, void*, size_t) {
+  static const char* fn = "cudnnCTCLoss";
+  const TensorDesc* P = tdesc(pd);
+  if (!known(d) || !P || P->l.rank != 3 || !labels || !label_len || !input_len) return BAD(fn, "invalid descriptor or pointer");
+  if (algo != CUDNN_CTC_LOSS_ALGO_DETERMINISTIC && algo != CUDNN_CTC_LOSS_ALGO_NON_DETERMINISTIC)
+    return BAD(fn, "unknown algorithm");
+  const int N = static_cast<int>(P->l.dims[1]);
+  std::vector<int> ll(label_len, label_len + N), il(input_len, input_len + N);
+  size_t total = 0;
+  for (int v : ll) total += v > 0 ? static_cast<size_t>(v) : 0;
+  return ctc(fn, h, *as<const CtcDesc>(d), pd, probs, std::vector<int>(labels, labels + total), ll, il, costs, gd,
+             grads);
+}
+// Labels and lengths in device memory.
+VGPU_EXPORT cudnnStatus_t cudnnCTCLoss_v8(cudnnHandle_t h, cudnnCTCLossAlgo_t algo, cudnnCTCLossDescriptor_t d,
+                                          const cudnnTensorDescriptor_t pd, const void* probs, const int labels[],
+                                          const int label_len[], const int input_len[], void* costs,
+                                          const cudnnTensorDescriptor_t gd, void* grads, size_t, void*) {
+  static const char* fn = "cudnnCTCLoss_v8";
+  const TensorDesc* P = tdesc(pd);
+  if (!known(h) || !known(d) || !P || P->l.rank != 3 || !labels || !label_len || !input_len)
+    return BAD(fn, "invalid handle, descriptor or pointer");
+  if (algo != CUDNN_CTC_LOSS_ALGO_DETERMINISTIC && algo != CUDNN_CTC_LOSS_ALGO_NON_DETERMINISTIC)
+    return BAD(fn, "unknown algorithm");
+  sync_handle(h);
+  const int N = static_cast<int>(P->l.dims[1]);
+  const std::vector<int> ll = device_ints(label_len, N), il = device_ints(input_len, N);
+  size_t total = 0;
+  for (int v : ll) total += v > 0 ? static_cast<size_t>(v) : 0;
+  return ctc(fn, h, *as<const CtcDesc>(d), pd, probs, device_ints(labels, total), ll, il, costs, gd, grads);
+}
+
 /* ---- dropout ---- */
 
 namespace {

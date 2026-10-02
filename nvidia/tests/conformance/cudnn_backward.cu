@@ -5,7 +5,8 @@
 // pooling, softmax and LRN; reductions with indices, op-tensor broadcasts,
 // transforms, dropout's backward pass from a known mask, and batch
 // normalization's backward pass in NHWC, with and without a fused add and
-// activation; and the spatial transformer's grid and sampler, both ways. The same binary runs against
+// activation; the spatial transformer's grid and sampler, both ways; and CTC
+// loss. The same binary runs against
 // NVIDIA's libcudnn.so.9 and against VirtualGPU's; the printed values must
 // agree (nvidia/tests/conformance/golden/cudnn_backward.rtx3060.txt holds what
 // an RTX 3060 printed).
@@ -559,6 +560,75 @@ static void spatial_transformer() {
   cudnnDestroySpatialTransformerDescriptor(st);
 }
 
+// CTC loss: costs and gradients from activations (SOFTMAX) and from
+// probabilities (NONE), labels in host and in device memory, and a label too
+// long for its input, whose gradient is zeroed or left alone.
+static void ctc_loss() {
+  const int T = 6, N = 3, A = 5;
+  cudnnTensorDescriptor_t pd = tensor(CUDNN_DATA_FLOAT, {T, N, A});
+  cudnnCTCLossDescriptor_t cd;
+  CK(cudnnCreateCTCLossDescriptor(&cd));
+  const int labels[] = {1, 2, 2, 4, 3, 1, 4}, llen[N] = {3, 1, 3}, ilen[N] = {6, 5, 4};
+  Buf<float> x(T * N * A, 1.5f), costs(N, 0.0f);
+  // Probabilities for NONE mode: a softmax of x over A.
+  std::vector<float> hx = x.get(), probs(hx.size());
+  for (int r = 0; r < T * N; ++r) {
+    float sum = 0;
+    for (int a = 0; a < A; ++a) sum += std::exp(hx[r * A + a]);
+    for (int a = 0; a < A; ++a) probs[r * A + a] = std::exp(hx[r * A + a]) / sum;
+  }
+  Buf<float> p(T * N * A, 0.0f);
+  cudaMemcpy(p.p, probs.data(), probs.size() * 4, cudaMemcpyHostToDevice);
+  for (auto norm : {CUDNN_LOSS_NORMALIZATION_SOFTMAX, CUDNN_LOSS_NORMALIZATION_NONE}) {
+    CK(cudnnSetCTCLossDescriptor_v9(cd, CUDNN_DATA_FLOAT, norm, CUDNN_CTC_ZERO_OOB_GRADIENTS, 8));
+    size_t ws = 0;
+    CK(cudnnGetCTCLossWorkspaceSize(H, pd, pd, labels, llen, ilen, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd, &ws));
+    Buf<char> work(ws + 16, 0.0f);
+    Buf<float> grad(T * N * A, 0.25f, 3);  // steps past a sequence keep these
+    CK(cudnnCTCLoss(H, pd, norm == CUDNN_LOSS_NORMALIZATION_SOFTMAX ? x.p : p.p, labels, llen, ilen, costs.p, pd,
+                    grad.p, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd, work.p, ws));
+    char tag[64];
+    std::snprintf(tag, sizeof tag, "ctc norm %d costs", (int)norm);
+    dump(tag, costs.get());
+    std::snprintf(tag, sizeof tag, "ctc norm %d gradients", (int)norm);
+    dump(tag, grad.get());
+  }
+  // Device-memory labels, the other algorithm.
+  CK(cudnnSetCTCLossDescriptor_v9(cd, CUDNN_DATA_FLOAT, CUDNN_LOSS_NORMALIZATION_SOFTMAX, CUDNN_CTC_ZERO_OOB_GRADIENTS, 8));
+  int *dl, *dll, *dil;
+  cudaMalloc(&dl, sizeof labels), cudaMalloc(&dll, sizeof llen), cudaMalloc(&dil, sizeof ilen);
+  cudaMemcpy(dl, labels, sizeof labels, cudaMemcpyHostToDevice);
+  cudaMemcpy(dll, llen, sizeof llen, cudaMemcpyHostToDevice);
+  cudaMemcpy(dil, ilen, sizeof ilen, cudaMemcpyHostToDevice);
+  size_t ws = 0;
+  CK(cudnnGetCTCLossWorkspaceSize_v8(H, CUDNN_CTC_LOSS_ALGO_NON_DETERMINISTIC, cd, pd, pd, &ws));
+  Buf<char> work(ws + 16, 0.0f);
+  Buf<float> grad(T * N * A, 0.25f, 3);
+  CK(cudnnCTCLoss_v8(H, CUDNN_CTC_LOSS_ALGO_NON_DETERMINISTIC, cd, pd, x.p, dl, dll, dil, costs.p, pd, grad.p, ws,
+                     work.p));
+  dump("ctc v8 costs", costs.get());
+  dump("ctc v8 gradients", grad.get());
+  // A label of 3 with a repeat needs 4 steps; the first sequence has 3.
+  const int bad_labels[] = {2, 2, 3, 4, 1}, bad_llen[N] = {3, 1, 1}, bad_ilen[N] = {3, 5, 4};
+  for (auto gm : {CUDNN_CTC_ZERO_OOB_GRADIENTS, CUDNN_CTC_SKIP_OOB_GRADIENTS}) {
+    CK(cudnnSetCTCLossDescriptor_v9(cd, CUDNN_DATA_FLOAT, CUDNN_LOSS_NORMALIZATION_SOFTMAX, gm, 8));
+    size_t ws2 = 0;
+    CK(cudnnGetCTCLossWorkspaceSize(H, pd, pd, bad_labels, bad_llen, bad_ilen, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC, cd,
+                                    &ws2));
+    Buf<char> work2(ws2 + 16, 0.0f);
+    Buf<float> g2(T * N * A, 0.25f, 3);
+    CK(cudnnCTCLoss(H, pd, x.p, bad_labels, bad_llen, bad_ilen, costs.p, pd, g2.p, CUDNN_CTC_LOSS_ALGO_DETERMINISTIC,
+                    cd, work2.p, ws2));
+    char tag[64];
+    std::snprintf(tag, sizeof tag, "ctc infeasible grad mode %d costs", (int)gm);
+    dump(tag, costs.get());
+    std::snprintf(tag, sizeof tag, "ctc infeasible grad mode %d gradients", (int)gm);
+    dump(tag, g2.get());
+  }
+  cudaFree(dl), cudaFree(dll), cudaFree(dil);
+  cudnnDestroyCTCLossDescriptor(cd);
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("cudnnCreate failed\n");
@@ -576,6 +646,7 @@ int main() {
   batchnorm_nhwc();
   batchnorm_fused();
   spatial_transformer();
+  ctc_loss();
   cudnnDestroy(H);
   return 0;
 }

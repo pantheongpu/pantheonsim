@@ -153,3 +153,13 @@ stn sampler fwd                          n=80 abs=3.658385e+01 sq=2.253058e+01 w
 stn sampler dx b.5                       n=168 abs=4.295319e+01 sq=1.814440e+01 wabs=1.792975e+02
 stn sampler dgrid                        n=80 abs=1.093831e+02 sq=2.309711e+02 wabs=4.613991e+02
 stn dtheta                               n=12 abs=3.190796e+01 sq=1.702943e+02 wabs=1.457433e+02
+ctc norm 1 costs                         n=3 abs=1.977916e+01 sq=1.349740e+02 wabs=3.817448e+01
+ctc norm 1 gradients                     n=90 abs=2.097840e+01 sq=7.951093e+00 wabs=8.729148e+01
+ctc norm 0 costs                         n=3 abs=1.977916e+01 sq=1.349740e+02 wabs=3.817448e+01
+ctc norm 0 gradients                     n=90 abs=1.321312e+02 sq=9.337207e+02 wabs=6.115061e+02
+ctc v8 costs                             n=3 abs=1.977916e+01 sq=1.349740e+02 wabs=3.817448e+01
+ctc v8 gradients                         n=90 abs=2.097840e+01 sq=7.951093e+00 wabs=8.729148e+01
+ctc infeasible grad mode 0 costs         n=3 abs=1.004244e+01 sq=5.042606e+01 wabs=2.508593e+01
+ctc infeasible grad mode 0 gradients     n=90 abs=1.364087e+01 sq=4.290095e+00 wabs=5.531271e+01
+ctc infeasible grad mode 1 costs         n=3 abs=1.004244e+01 sq=5.042606e+01 wabs=2.508593e+01
+ctc infeasible grad mode 1 gradients     n=90 abs=1.852159e+01 sq=5.685473e+00 wabs=7.591901e+01
