@@ -766,8 +766,9 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf(cusolverDnHandle_t h, cusolverDnPa
                                               void*, size_t, void*, size_t, int* info) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   // What an RTX 3060 (CUDA 13.0) answers: an element type it has no LU for is
-  // INVALID_VALUE with info 0; a bad size is SUCCESS with info -i in LAPACK's
-  // numbering (m, n, A, lda); the compute type is not checked.
+  // INVALID_VALUE with info 0; a bad size is info -i in LAPACK's numbering (m,
+  // n, A, lda), with SUCCESS when pivoting and INVALID_VALUE without; the
+  // compute type is not checked.
   if (!is_elem(ta)) {
     set_info(info, 0);
     return CUSOLVER_STATUS_INVALID_VALUE;
@@ -775,7 +776,7 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf(cusolverDnHandle_t h, cusolverDnPa
   (void)tc;
   if (m < 0 || n < 0 || lda < std::max<int64_t>(1, m)) {
     set_info(info, m < 0 ? -1 : n < 0 ? -2 : -4);
-    return CUSOLVER_STATUS_SUCCESS;
+    return ipiv ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INVALID_VALUE;
   }
   return by_elem(ta, [&](auto tag) {
     using T = decltype(tag);
