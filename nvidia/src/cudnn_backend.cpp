@@ -2473,8 +2473,17 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
       if (!runnable(d, &why)) return refuse("cudnnBackendFinalize(operation graph)", why);
       break;
     case CUDNN_BACKEND_ENGINE_DESCRIPTOR:
-      if (d->i64(CUDNN_ATTR_ENGINE_GLOBAL_INDEX, -1) != 0 || !d->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH))
-        return CUDNN_STATUS_NOT_SUPPORTED;  // only engine 0 exists
+      // Engine 0 is the one the heuristics offer; a program may also pin an
+      // engine by its global index with knobs (cudnn-frontend does for
+      // deterministic attention backward on Hopper and Blackwell): any index
+      // names the same host interpreter here, the knobs being performance
+      // choices only.
+      if (d->i64(CUDNN_ATTR_ENGINE_GLOBAL_INDEX, -1) < 0 || !d->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH))
+        return CUDNN_STATUS_NOT_SUPPORTED;
+      {
+        std::string why;
+        if (!runnable(d->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH), &why)) return refuse("cudnnBackendFinalize(engine)", why);
+      }
       break;
     case CUDNN_BACKEND_ENGINECFG_DESCRIPTOR:
       if (!d->desc(CUDNN_ATTR_ENGINECFG_ENGINE)) return CUDNN_STATUS_BAD_PARAM;
