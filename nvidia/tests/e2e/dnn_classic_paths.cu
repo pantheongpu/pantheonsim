@@ -988,6 +988,71 @@ static void rnn_getters() {
   expect("linLayerID 8 without a projection: NULL, no dimensions", !m && !bb && nb == 0);
 }
 
+/* ---- folded backward-data descriptors ---- */
+
+// cudnnGetFoldedConvBackwardDataDescriptors, then the pipeline they describe
+// (fold the filter, pad dy, a stride-1 backward-data, unfold dx), against a
+// plain strided backward-data. The descriptors' shapes are the ones an
+// RTX 3060 returns.
+static void folded_dgrad(int C, int K, int Hh, int W, int R, int pad, int str) {
+  cudnnFilterDescriptor_t w = filter(), fw = filter();
+  cudnnTensorDescriptor_t dy = tensor(), dx = tensor(), pdy = tensor(), fdx = tensor();
+  cudnnConvolutionDescriptor_t c, fc;
+  (cudnnCreateConvolutionDescriptor(&c), own(c, cudnnDestroyConvolutionDescriptor));
+  (cudnnCreateConvolutionDescriptor(&fc), own(fc, cudnnDestroyConvolutionDescriptor));
+  cudnnTensorTransformDescriptor_t t[4];
+  for (auto& e : t) (cudnnCreateTensorTransformDescriptor(&e), own(e, cudnnDestroyTensorTransformDescriptor));
+  const int N = 2;
+  CK(cudnnSetFilter4dDescriptor(w, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, K, C, R, R));
+  CK(cudnnSetTensor4dDescriptor(dx, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, C, Hh, W));
+  CK(cudnnSetConvolution2dDescriptor(c, pad, pad, str, str, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+  int o[4];
+  CK(cudnnGetConvolution2dForwardOutputDim(c, dx, w, o, o + 1, o + 2, o + 3));
+  CK(cudnnSetTensor4dDescriptor(dy, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, o[0], o[1], o[2], o[3]));
+  CK(cudnnGetFoldedConvBackwardDataDescriptors(H, w, dy, c, dx, CUDNN_TENSOR_NCHW, fw, pdy, fc, fdx, t[0], t[1], t[2],
+                                               t[3]));
+  char what[160];
+  if (C == 3 && K == 4 && Hh == 8 && str == 2 && R == 3 && pad == 1) {
+    cudnnDataType_t dt;
+    cudnnTensorFormat_t ff;
+    int k, cc, h, ww, n1, c1, h1, w1, n2, c2, h2, w2, ss[4], pd[2], sd[2], dl[2], nsp;
+    cudnnConvolutionMode_t m;
+    CK(cudnnGetFilter4dDescriptor(fw, &dt, &ff, &k, &cc, &h, &ww));
+    CK(cudnnGetTensor4dDescriptor(pdy, &dt, &n1, &c1, &h1, &w1, ss, ss + 1, ss + 2, ss + 3));
+    CK(cudnnGetTensor4dDescriptor(fdx, &dt, &n2, &c2, &h2, &w2, ss, ss + 1, ss + 2, ss + 3));
+    CK(cudnnGetConvolutionNdDescriptor(fc, 2, &nsp, pd, sd, dl, &m, &dt));
+    expect("folded descriptors: filter 8x16x2x2, dy 2x8x5x5, dx 2x16x4x4, stride 1 pad 1 (as on an RTX 3060)",
+           k == 8 && cc == 16 && h == 2 && ww == 2 && c1 == 8 && h1 == 5 && w1 == 5 && c2 == 16 && h2 == 4 && w2 == 4 &&
+               pd[0] == 1 && sd[0] == 1 && sd[1] == 1);
+  }
+  const size_t nw = (size_t)K * C * R * R, ny = (size_t)N * K * o[2] * o[3], nx = (size_t)N * C * Hh * W;
+  std::vector<float> hw(nw), hy(ny);
+  for (size_t i = 0; i < nw; ++i) hw[i] = (float)std::sin(0.3 * i);
+  for (size_t i = 0; i < ny; ++i) hy[i] = (float)std::cos(0.7 * i);
+  size_t sfw = 0, spy = 0, sfx = 0;
+  CK(cudnnGetFilterSizeInBytes(fw, &sfw));
+  CK(cudnnGetTensorSizeInBytes(pdy, &spy));
+  CK(cudnnGetTensorSizeInBytes(fdx, &sfx));
+  Buf<float> bw(hw), by(hy), bx(nx), bx2(nx), bfw(sfw / 4), bpy(spy / 4), bfx(sfx / 4);
+  Buf<char> work(1 << 20);
+  const float one = 1, zero = 0;
+  int got = 0;
+  cudnnConvolutionBwdDataAlgoPerf_t perf[8];
+  CK(cudnnGetConvolutionBackwardDataAlgorithm_v7(H, w, dy, c, dx, 8, &got, perf));
+  CK(cudnnConvolutionBackwardData(H, &one, w, bw.p, dy, by.p, c, perf[0].algo, work.p, 1 << 20, &zero, dx, bx.p));
+  CK(cudnnTransformFilter(H, t[0], &one, w, bw.p, &zero, fw, bfw.p));
+  CK(cudnnTransformTensorEx(H, t[1], &one, dy, by.p, &zero, pdy, bpy.p));
+  CK(cudnnGetConvolutionBackwardDataAlgorithm_v7(H, fw, pdy, fc, fdx, 8, &got, perf));
+  CK(cudnnConvolutionBackwardData(H, &one, fw, bfw.p, pdy, bpy.p, fc, perf[0].algo, work.p, 1 << 20, &zero, fdx, bfx.p));
+  CK(cudnnTransformTensorEx(H, t[3], &one, fdx, bfx.p, &zero, dx, bx2.p));
+  const auto a = bx.get(), b = bx2.get();
+  double e = 0, m = 0;
+  for (size_t i = 0; i < nx; ++i) e = std::fmax(e, std::fabs(a[i] - b[i])), m = std::fmax(m, std::fabs(a[i]));
+  std::snprintf(what, sizeof what, "folded backward-data (C %d, K %d, %dx%d, %dx%d filter, pad %d, stride %d) = backward-data",
+                C, K, Hh, W, R, R, pad, str);
+  expect(what, e < 1e-3 * (1 + m), e);
+}
+
 /* ---- fused-ops plans ---- */
 
 static cudnnTensorDescriptor_t t4(cudnnTensorFormat_t f, cudnnDataType_t t, int n, int c, int h, int w) {
@@ -1249,6 +1314,10 @@ int main() {
   lstm_projection({3, 4, 2, 2, 1, true, -0.3, 0.25}, "LSTM 2 layers, projection 2, clipping");
   rnn_getters();
   fused_ops();
+  folded_dgrad(3, 4, 8, 8, 3, 1, 2);
+  folded_dgrad(5, 6, 9, 7, 3, 1, 2);
+  folded_dgrad(3, 4, 9, 9, 3, 1, 3);
+  folded_dgrad(2, 4, 8, 8, 4, 1, 2);
   destroy_owned();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");

@@ -302,6 +302,7 @@ VGPU_EXPORT size_t cudnnGetCudartVersion(void) { return 13000; }
 VGPU_EXPORT cudnnStatus_t cudnnGraphVersionCheck(void) { return CUDNN_STATUS_SUCCESS; }
 VGPU_EXPORT cudnnStatus_t cudnnOpsVersionCheck(void) { return CUDNN_STATUS_SUCCESS; }
 VGPU_EXPORT cudnnStatus_t cudnnCnnVersionCheck(void) { return CUDNN_STATUS_SUCCESS; }
+VGPU_EXPORT cudnnStatus_t cudnnAdvVersionCheck(void) { return CUDNN_STATUS_SUCCESS; }
 
 VGPU_EXPORT const char* cudnnGetErrorString(cudnnStatus_t s) {
   switch (s) {
@@ -3654,6 +3655,95 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutBackward(cudnnHandle_t h, const cudnnDropo
   for (size_t i = 0; i < n; ++i)
     v[i] = (mask[i / 8] >> (i % 8)) & 1 ? v[i] * (1.0 / (1.0 - p)) : 0.0;
   return write(DX->l, dx, v) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+/* ---- folded backward-data descriptors ---- */
+
+// The descriptors that turn a strided backward-data convolution into a
+// stride-1 one over folded tensors (filter folded, dy padded, dx folded and
+// unfolded back). Undocumented beyond the signature; every rule here was
+// measured on the RTX 3060 over strides 1 to 5 (and asymmetric ones),
+// filters 1x1 to 5x5, paddings 0 to 2, dilation 2, groups, half, float and
+// double, NCHW and NHWC:
+//   - output channels K padded to a multiple of 8;
+//   - input channels C padded to floor(roundup(C * sh * sw, 8) / (sh * sw))
+//     (the filter's by its own channels, dx's by dx's);
+//   - per spatial dimension, the filter padded before by (s - p % s) % s and
+//     after up to a multiple of s, then folded by s; the folded convolution
+//     has stride 1, padding (p + before) / s, the same dilation, mode, compute
+//     type and groups;
+//   - dx folds to [N, Cpad * sh * sw, ceil(H / sh), ceil(W / sw)], dy is
+//     padded to what the folded convolution's forward pass would give;
+//   - the three folding transforms take transformFormat, the unfolding one
+//     dx's own layout; more than 4 dimensions is BAD_PARAM.
+VGPU_EXPORT cudnnStatus_t cudnnGetFoldedConvBackwardDataDescriptors(
+    const cudnnHandle_t h, const cudnnFilterDescriptor_t wd, const cudnnTensorDescriptor_t dyd,
+    const cudnnConvolutionDescriptor_t cd, const cudnnTensorDescriptor_t dxd, const cudnnTensorFormat_t tf,
+    cudnnFilterDescriptor_t fwd, cudnnTensorDescriptor_t pdyd, cudnnConvolutionDescriptor_t fcd,
+    cudnnTensorDescriptor_t fdxd, cudnnTensorTransformDescriptor_t t_filter, cudnnTensorTransformDescriptor_t t_dy,
+    cudnnTensorTransformDescriptor_t t_dx, cudnnTensorTransformDescriptor_t t_unfold) {
+  static const char* fn = "cudnnGetFoldedConvBackwardDataDescriptors";
+  const FilterDesc* W = fdesc(wd);
+  const TensorDesc *DY = tdesc(dyd), *DX = tdesc(dxd);
+  if (!known(h) || !W || !DY || !DX || !known(cd) || !known(fwd) || !known(pdyd) || !known(fcd) || !known(fdxd) ||
+      !known(t_filter) || !known(t_dy) || !known(t_dx) || !known(t_unfold))
+    return BAD(fn, "a handle or descriptor is null or never set");
+  const ConvDesc& C = *as<const ConvDesc>(cd);
+  if (DX->l.rank != 4 || DY->l.rank != 4 || W->l.rank != 4 || C.nsp != 2) return BAD(fn, "only 4-D tensors are folded");
+  const cudnnTensorFormat_t fmt = tf == CUDNN_TENSOR_NHWC ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+  const int64_t N = DX->l.dims[0], Cx = DX->l.dims[1], K = W->l.dims[0], Cw = W->l.dims[1];
+  const int64_t sh = C.str[0], sw = C.str[1], f = sh * sw;
+  auto cpad = [&](int64_t c) { return (c * f + 7) / 8 * 8 / f; };
+  const int64_t Kp = (K + 7) / 8 * 8, Cwp = cpad(Cw), Cxp = cpad(Cx);
+  int64_t before[2], after[2], rf[2], pf[2], xf[2], yp[2];
+  for (int i = 0; i < 2; ++i) {
+    const int64_t s = C.str[i], p = C.pad[i], R = W->l.dims[2 + i];
+    before[i] = (s - p % s) % s;
+    rf[i] = (R + before[i] + s - 1) / s;
+    after[i] = rf[i] * s - R - before[i];
+    pf[i] = (p + before[i]) / s;
+    xf[i] = (DX->l.dims[2 + i] + s - 1) / s;
+    yp[i] = xf[i] + 2 * pf[i] - C.dil[i] * (rf[i] - 1);
+  }
+  // The folded filter, padded dy, folded dx and the folded convolution.
+  cudnnStatus_t s = cudnnSetFilter4dDescriptor(fwd, W->l.type, fmt, static_cast<int>(Kp), static_cast<int>(Cwp * f),
+                                               static_cast<int>(rf[0]), static_cast<int>(rf[1]));
+  if (s == CUDNN_STATUS_SUCCESS)
+    s = cudnnSetTensor4dDescriptor(pdyd, fmt, DY->l.type, static_cast<int>(N), static_cast<int>(Kp),
+                                   static_cast<int>(yp[0]), static_cast<int>(yp[1]));
+  if (s == CUDNN_STATUS_SUCCESS)
+    s = cudnnSetTensor4dDescriptor(fdxd, fmt, DX->l.type, static_cast<int>(N), static_cast<int>(Cxp * f),
+                                   static_cast<int>(xf[0]), static_cast<int>(xf[1]));
+  if (s != CUDNN_STATUS_SUCCESS) return s;
+  ConvDesc fc = C;
+  for (int i = 0; i < 2; ++i) fc.pad[i] = pf[i], fc.str[i] = 1;
+  *as<ConvDesc>(fcd) = fc;
+  // The transforms.
+  const uint32_t fold[2] = {static_cast<uint32_t>(sh), static_cast<uint32_t>(sw)};
+  TransDesc* t = as<TransDesc>(t_filter);
+  *t = TransDesc();
+  t->nb = 4, t->fmt = fmt, t->dir = CUDNN_TRANSFORM_FOLD;
+  t->pb[2] = static_cast<int32_t>(before[0]), t->pb[3] = static_cast<int32_t>(before[1]);
+  t->pa[0] = static_cast<int32_t>(Kp - K), t->pa[1] = static_cast<int32_t>(Cwp - Cw);
+  t->pa[2] = static_cast<int32_t>(after[0]), t->pa[3] = static_cast<int32_t>(after[1]);
+  t->fold[0] = fold[0], t->fold[1] = fold[1];
+  t = as<TransDesc>(t_dy);
+  *t = TransDesc();  // measured: its fold factors stay 0
+  t->nb = 4, t->fmt = fmt, t->dir = CUDNN_TRANSFORM_FOLD;
+  t->pa[1] = static_cast<int32_t>(Kp - K);
+  t->pa[2] = static_cast<int32_t>(yp[0] - DY->l.dims[2]), t->pa[3] = static_cast<int32_t>(yp[1] - DY->l.dims[3]);
+  t = as<TransDesc>(t_dx);
+  *t = TransDesc();
+  t->nb = 4, t->fmt = fmt, t->dir = CUDNN_TRANSFORM_FOLD;
+  t->pa[1] = static_cast<int32_t>(Cxp - Cx);
+  t->fold[0] = fold[0], t->fold[1] = fold[1];
+  t = as<TransDesc>(t_unfold);
+  *t = TransDesc();
+  t->nb = 4, t->fmt = DX->channels_last ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW, t->dir = CUDNN_TRANSFORM_UNFOLD;
+  t->pa[1] = static_cast<int32_t>(Cx - Cxp);
+  t->pa[2] = static_cast<int32_t>(DX->l.dims[2] - xf[0] * sh), t->pa[3] = static_cast<int32_t>(DX->l.dims[3] - xf[1] * sw);
+  t->fold[0] = fold[0], t->fold[1] = fold[1];
+  return CUDNN_STATUS_SUCCESS;
 }
 
 /* ---- fused-ops plans ---- */
