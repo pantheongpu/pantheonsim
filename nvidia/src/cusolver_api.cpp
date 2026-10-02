@@ -1517,11 +1517,16 @@ cusolverStatus_t complex_geev(int64_t n, cudaDataType ta, void* A, int64_t lda, 
 }  // namespace
 
 VGPU_EXPORT cusolverStatus_t cusolverDnXgeev_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t,
-                                                        cusolverEigMode_t, int64_t n, cudaDataType, const void*,
-                                                        int64_t, cudaDataType, const void*, cudaDataType, const void*,
-                                                        int64_t, cudaDataType, const void*, int64_t, cudaDataType,
-                                                        size_t* dev, size_t* host) {
+                                                        cusolverEigMode_t jobvr, int64_t n, cudaDataType ta,
+                                                        const void*, int64_t, cudaDataType tw, const void*,
+                                                        cudaDataType, const void*, int64_t, cudaDataType tvr,
+                                                        const void*, int64_t, cudaDataType tc, size_t* dev,
+                                                        size_t* host) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  // A complex A takes W, VR and the compute type of its own type, as Xgeev does.
+  if ((ta == CUDA_C_32F || ta == CUDA_C_64F) &&
+      (tw != ta || tc != ta || (jobvr == CUSOLVER_EIG_MODE_VECTOR && tvr != ta)))
+    return CUSOLVER_STATUS_INVALID_VALUE;
   if (dev) *dev = x_workspace(n);
   if (host) *host = x_workspace(n);
   return CUSOLVER_STATUS_SUCCESS;
