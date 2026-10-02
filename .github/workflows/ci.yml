@@ -15,6 +15,11 @@ on:
         type: boolean
         required: false
         default: false
+      nvidia_only:
+        description: "Skip the jobs an NVIDIA-side change does not need (pantheon workloads, ollama on every GPU and on each AMD GPU, AMD code objects)"
+        type: boolean
+        required: false
+        default: false
 
 # A push that lands while an earlier run is still going supersedes it; there is
 # no value in finishing a build of code nobody will look at again.
@@ -82,6 +87,8 @@ jobs:
 
   workloads:
     name: pantheon workloads
+    # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
+    if: ${{ !inputs.nvidia_only }}
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
     # another, e.g. ["self-hosted", "pantheonsim-ci"] for the runner on the
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
@@ -202,6 +209,8 @@ jobs:
 
   ollama:
     name: ollama on every GPU
+    # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
+    if: ${{ !inputs.nvidia_only }}
     runs-on: ubuntu-24.04
     # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
     timeout-minutes: 90
@@ -282,6 +291,8 @@ jobs:
         run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
   ollama-amd:
     name: ollama on ${{ matrix.gpu }}
+    # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
+    if: ${{ !inputs.nvidia_only }}
     runs-on: ubuntu-24.04
     # A simulated GPU takes some 3 to 17 minutes to load a model and generate
     # three tokens, so each GPU has a job of its own.
@@ -343,6 +354,8 @@ jobs:
 
   amd-code-objects:
     name: AMD code objects and CDNA decoding
+    # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
+    if: ${{ !inputs.nvidia_only }}
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
     # another, e.g. ["self-hosted", "pantheonsim-ci"] for the runner on the
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
