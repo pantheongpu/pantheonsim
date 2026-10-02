@@ -6,8 +6,9 @@
 #
 # Beside the program this builds what only nvcc can make, from
 # jitlink_lib.cu: a host object carrying relocatable PTX (-dc), a static
-# library of it, and an LTO-IR fatbin -- the inputs nvJitLink takes from
-# files and nvFatbinAddReloc reads -- and passes them on the command line.
+# library of it, an LTO-IR fatbin, and a linked and a relocatable cubin --
+# the inputs nvJitLink takes from files and nvFatbinAddReloc reads -- and
+# passes them on the command line.
 #
 # As in run_lib_check.sh, a call into a stub or a kernel the simulator
 # refused fails the test even if the program's own checks passed.
@@ -37,6 +38,9 @@ nvcc -dc -gencode arch=compute_80,code=compute_80 -Wno-deprecated-gpu-targets \
 ar rcs "$tmp/libjitlink.a" "$tmp/jitlink_lib.o"
 nvcc -fatbin -rdc=true -gencode arch=compute_80,code=lto_80 -Wno-deprecated-gpu-targets \
      "$e2e/jitlink_lib.cu" -o "$tmp/jitlink_lib_lto.fatbin"
+nvcc -cubin -arch=sm_80 -Wno-deprecated-gpu-targets "$e2e/jitlink_lib.cu" -o "$tmp/jitlink_lib.cubin"
+nvcc -cubin -rdc=true -arch=sm_80 -Wno-deprecated-gpu-targets "$e2e/jitlink_lib.cu" \
+     -o "$tmp/jitlink_lib_rdc.cubin"
 
 # nvFatbin is linked against the shim's copy, CUDA 12.0's toolkit having
 # none. nvJitLink is NVIDIA's header and library where the toolkit has them,
@@ -62,7 +66,8 @@ fi
 require_shim_libs "$shim" "$tmp/$name" || exit 0
 
 case "$name" in
-  nvjitlink_paths) args=("$tmp/jitlink_lib.o" "$tmp/libjitlink.a" "$tmp/jitlink_lib_lto.fatbin") ;;
+  nvjitlink_paths) args=("$tmp/jitlink_lib.o" "$tmp/libjitlink.a" "$tmp/jitlink_lib_lto.fatbin"
+                         "$tmp/jitlink_lib.cubin" "$tmp/jitlink_lib_rdc.cubin") ;;
   *) args=("$tmp/jitlink_lib.o") ;;
 esac
 status=0

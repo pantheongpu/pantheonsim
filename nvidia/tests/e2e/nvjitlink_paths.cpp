@@ -6,11 +6,11 @@
 // a host object's and a static library's device code, and the result codes
 // for each misuse.
 //
-//   nvjitlink_paths [object.o library.a lto.fatbin]
+//   nvjitlink_paths [object.o library.a lto.fatbin linked.cubin relocatable.cubin]
 //
-// The object, the library and an LTO-IR fatbin are built by
-// run_nvjitlink.sh from jitlink_lib.cu (nvcc -dc, ar, nvcc -dlto -fatbin);
-// without them those checks are skipped.
+// The files are built by run_jit_link.sh from jitlink_lib.cu (nvcc -dc, ar,
+// an LTO-IR fatbin, nvcc -cubin without and with -rdc); without them those
+// checks are skipped.
 //
 // Built against NVIDIA's nvJitLink.h where the toolkit has one, so
 // it calls the versioned entry points a real program imports. Every check
@@ -309,6 +309,33 @@ int main(int argc, char** argv) {
       check(error_log(h).find("LTO-IR input '") != std::string::npos, "and the input is named");
     } else {
       is(r, NVJITLINK_SUCCESS, "LTO-IR with -lto is an input (NVIDIA)");
+      IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
+      check(runs_right(cubin_of(h)), "and links with the kernel's PTX");
+    }
+    nvJitLinkDestroy(&h);
+  }
+
+  // Cubins. A linked one (nvcc -cubin) adds nothing to a link -- NVIDIA's
+  // passes over it -- so the kernel still needs the library's PTX, and its
+  // definitions collide with nothing. Relocatable SASS (-rdc) NVIDIA's links;
+  // VirtualGPU, which links PTX, refuses it by name.
+  if (argc >= 6) {
+    h = create({"-arch=sm_80"});
+    add(h, kMain, "main.ptx");
+    IS(nvJitLinkAddFile(h, NVJITLINK_INPUT_CUBIN, argv[4]), NVJITLINK_SUCCESS);
+    add(h, kLib, "lib.ptx");
+    IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
+    check(error_log(h).empty(), "a linked cubin adds no definitions to collide with");
+    check(runs_right(cubin_of(h)), "and the link runs as without it");
+    nvJitLinkDestroy(&h);
+    h = create({"-arch=sm_80"});
+    add(h, kMain, "main.ptx");
+    const int r = nvJitLinkAddFile(h, NVJITLINK_INPUT_CUBIN, argv[5]);
+    if (ptx_cubin) {
+      is(r, NVJITLINK_ERROR_INVALID_INPUT, "relocatable SASS is refused (VirtualGPU)");
+      check(error_log(h).find("relocatable SASS") != std::string::npos, "by name");
+    } else {
+      is(r, NVJITLINK_SUCCESS, "relocatable SASS is an input (NVIDIA)");
       IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
       check(runs_right(cubin_of(h)), "and links with the kernel's PTX");
     }

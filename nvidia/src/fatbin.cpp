@@ -578,6 +578,11 @@ BlobKind classify_blob(const void* data, size_t bytes) {
   return BlobKind::Unknown;
 }
 
+bool cubin_linked(const void* data, size_t bytes) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  return p && is_elf(p, bytes) && read_le<uint16_t>(p + 16) == 2;   // ET_EXEC
+}
+
 uint32_t cubin_arch(const void* data, size_t bytes) {
   const uint8_t* p = static_cast<const uint8_t*>(data);
   if (!p || !is_elf(p, bytes) || read_le<uint16_t>(p + 18) != kEmCuda) return 0;

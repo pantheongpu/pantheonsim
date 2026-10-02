@@ -286,9 +286,14 @@ insists, so NVIDIA's driver JITs it as readily as VirtualGPU runs it.
 Inputs are PTX, a fatbin's PTX (the image the driver would pick for
 `-arch`), the device code nvcc puts in a host object's `.nv_fatbin` and
 `__nv_relfatbin` sections and in a static library's members, and VirtualGPU's
-own cubins, which are PTX. A real cubin is refused (SASS cannot be relinked
-here), and so is LTO-IR, NVVM bitcode that only NVIDIA's compiler reads --
-both by name in the error log, with what to add instead.
+own cubins, which are PTX. A linked cubin (`nvcc -cubin`) is accepted and adds
+nothing, which is how NVIDIA's treats one. Relocatable SASS (`-rdc` or `-dc`
+cubins, a fatbin with no PTX) is refused, since linking machine code means
+applying its relocations and this links PTX; so is LTO-IR, NVVM bitcode that
+only NVIDIA's compiler reads -- both by name in the error log, with what to
+add instead. The simulator runs SASS too, but the linked image stays PTX:
+the only SASS NVIDIA's linker would carry into its output is relocatable
+code, which is what is refused.
 
 nvFatbin needs no GPU at all, so it is the whole library: it writes the
 container NVIDIA's writes with `-compress=false`, entry for entry, and
@@ -325,9 +330,9 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.
-- **nvJitLink**: SASS and LTO-IR inputs (a cubin, a fatbin with no PTX, NVVM
-  bitcode, index files), and so link-time optimisation; the cubin it returns
-  is PTX. Code-generation options (`-O`, `-maxrregcount`, `-Xptxas`, ...) are
+- **nvJitLink**: relocatable SASS and LTO-IR inputs (`-rdc`/`-dc` cubins, a
+  fatbin with no PTX, NVVM bitcode, index files), and so link-time
+  optimisation; the cubin it returns is PTX. Code-generation options (`-O`, `-maxrregcount`, `-Xptxas`, ...) are
   accepted and have nothing to act on.
 - **nvFatbin**: compression (`-compress` is accepted, nothing is compressed)
   and `nvFatbinAddIndex`, whose index names LTO-IR libraries.

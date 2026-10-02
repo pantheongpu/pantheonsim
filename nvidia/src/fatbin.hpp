@@ -131,6 +131,10 @@ BlobKind classify_blob(const void* data, size_t bytes);
 // header; 0 when the buffer is not a CUDA ELF image.
 uint32_t cubin_arch(const void* data, size_t bytes);
 
+// Whether a cubin is linked (ELF type ET_EXEC: what nvcc -cubin writes) rather
+// than relocatable (ET_REL: -rdc / -dc, which needs a device link).
+bool cubin_linked(const void* data, size_t bytes);
+
 // Which of a fatbin's PTX images the driver would JIT for a device of compute
 // capability `cc` (e.g. 90), as an index into `ptxs`; ptxs.size() if empty.
 //
