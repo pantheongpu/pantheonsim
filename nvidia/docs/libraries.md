@@ -32,7 +32,7 @@ which is the honest meaning of "the same image".
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
-| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex), GEMV, level‑1, triangular solves, batched LU (`getrfBatched`/`getrsBatched`); for complex also rank-1/rank-k updates, Hermitian products, `trmm`/`trmv`/`trsv` |
+| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (the plane rotations bit for bit), triangular solves, batched LU (`getrfBatched`/`getrsBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`); see [cublas.md](cublas.md) |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
 | cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
@@ -280,8 +280,11 @@ driver then runs the linked PTX.
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
-- **cuBLAS**: most of real level‑2/3; for complex types `her`/`her2`/`syr`/`syr2`,
-  `her2k`/`syr2k`, the `rot` family, `geqrfBatched` and `gelsBatched`.
+- **cuBLAS**: the legacy (pre-`_v2`) API, cuBLASXt, the band and packed level-2
+  routines (`gbmv`, `sbmv`, `spmv`, `tpsv` and the rest), the batched GEMVs,
+  `getriBatched`/`matinvBatched`, `syrkx`/`herkx`, and most `_64` forms of
+  levels 2 and 3 (absent, so a program that needs one fails to load with the
+  name).
 - **cuBLASLt**: the backward epilogues (`BGRADA`/`BGRADB`, `DRELU`, `DGELU`),
   auxiliary outputs, and the block-scaled FP8/FP4 modes.
 - **cuDNN**: the graph/backend API of cuDNN 8+, non-NCHW layouts, non-float
