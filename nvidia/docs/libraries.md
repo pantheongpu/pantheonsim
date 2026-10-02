@@ -37,7 +37,7 @@ which is the honest meaning of "the same image".
 | cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
-| cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
+| cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); legacy coo2csr, sorts, csrgeam2, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, general blocks too), csric02 and csrilu02. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the 64-bit X API, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
@@ -112,15 +112,19 @@ runs them; each is a ctest of its own.
 | `e2e_fft_layouts` | cufftXt plans, strided and padded layouts of every rank, 2‑D/3‑D C2R, half | `torch.fft` |
 | `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
+| `e2e_sparse_complex_paths` | SpMV, SpMM, SDDMM, SpSV/SpSM, SpGEMM, conversions and csrgeam2 on complex values, every op; the type combinations and conjugate transposes NVIDIA's refuses | complex `torch.sparse` |
+| `e2e_sparse_bsr_paths` | generic BSR (SpMV, SpMM, SDDMM) and the legacy BSR family: bsrmv/bsrxmv/bsrmm, bsrsv2/bsrsm2 with their zero pivots, bsric02/bsrilu02 (and csric02/csrilu02) with ILU's boost, CSR to BSR and back | preconditioned iterative solvers |
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
-what they assert is what the real libraries do, not only what these do. Two
+what they assert is what the real libraries do, not only what these do. Three
 things that run turned up: cuSPARSE 13.0's batched CSR SpMM uses the first
 matrix's row offsets for every member (13.2 follows the stride, as documented
-and as this does), and NVIDIA's SDDMM refuses a NULL buffer even when it asked
-for none. The FP8 matmuls need an sm_89 card to compare against; their output
+and as this does), NVIDIA's SDDMM refuses a NULL buffer even when it asked
+for none, and it takes a conjugate transpose of a complex operand, which it
+does not document, and computes neither A^H B nor anything else with it (this
+refuses one with NOT_SUPPORTED). The FP8 matmuls need an sm_89 card to compare against; their output
 encoding is checked against `cuda_fp8.h`'s conversion, bit for bit.
 
 The same suite runs on a rented multi-GPU machine through
@@ -249,7 +253,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   types, and every backward pass.
 - **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
-  CUDA 12), the blocked (BSR) routines, complex values.
+  CUDA 12); the tridiagonal and pentadiagonal solvers (`gtsv2`, `gpsv`), the
+  pruning, coloring and `nnz`/`nnz_compress` helpers, `gebsr2gebsr` and
+  `gebsr2gebsc`; sliced-ELL and blocked-ELL storage; SDDMM with a conjugate
+  transpose (NVIDIA's documents none and computes something else when given
+  one). cuSPARSELt is a library of its own and is not provided.
 - **cuSOLVER**: the sparse (`cusolverSp`) and multi-GPU (`cusolverMg`) modules,
   the randomized variants, `sytrf` (symmetric indefinite), and `Xgeev` on a
   complex matrix.
