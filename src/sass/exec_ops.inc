@@ -3037,8 +3037,20 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       Block::Barrier& b = blk.bars[id];
       b.mode = mode;
       b.red = ins.f[1];
+      // A thread count (bar.sync 7, 256): only the warps that arrive take part,
+      // and the barrier completes at that many threads -- not at every live
+      // thread of the block, which held CUTLASS's consumer warpgroups at their
+      // own barrier while its producer warps waited on them. As the PTX engine
+      // counts it, from the ISA: a warp's arrival is all of its threads.
+      if (const uint32_t count = ins.f[2]) {
+        if (count % 32)
+          throw Error(Err::InvalidValue, "a barrier's thread count must be a non-zero multiple of the warp size (32); got " +
+                                             std::to_string(count));
+        b.expected = count;
+        if (ex) b.arrived += 32;
+      }
       each_lane(ex, [&](unsigned l) {
-        ++b.arrived;
+        if (!ins.f[2]) ++b.arrived;
         if (mode == 2) {
           const bool p = pred(w, ins.src.back(), l);
           b.popc += p;
