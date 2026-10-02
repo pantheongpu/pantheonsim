@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
