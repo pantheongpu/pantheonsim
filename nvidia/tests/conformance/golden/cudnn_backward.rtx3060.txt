@@ -148,3 +148,8 @@ bn+add+relu dscale                       n=4 abs=2.338352e+01 sq=1.370996e+02 wa
 bn+add+relu dbias                        n=4 abs=1.716541e+01 sq=7.460085e+01 wabs=4.486360e+01
 bn+swish fwd                             n=72 abs=2.501652e+01 sq=1.371083e+01 wabs=1.031981e+02
 bn+swish backward: status 3000
+stn grid                                 n=80 abs=4.788333e+01 sq=3.918067e+01 wabs=1.828950e+02
+stn sampler fwd                          n=80 abs=3.658385e+01 sq=2.253058e+01 wabs=1.438110e+02
+stn sampler dx b.5                       n=168 abs=4.295319e+01 sq=1.814440e+01 wabs=1.792975e+02
+stn sampler dgrid                        n=80 abs=1.093831e+02 sq=2.309711e+02 wabs=4.613991e+02
+stn dtheta                               n=12 abs=3.190796e+01 sq=1.702943e+02 wabs=1.457433e+02

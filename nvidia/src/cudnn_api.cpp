@@ -2190,6 +2190,199 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackwardEx(
                      dx, bnd, scale, bias, dscale, dbias, eps, saved_mean, saved_inv, fuse);
 }
 
+/* ---- spatial transformer: affine grid and bilinear sampling ---- */
+
+namespace {
+struct StDesc {
+  cudnnSamplerType_t sampler = CUDNN_SAMPLER_BILINEAR;
+  cudnnDataType_t type = CUDNN_DATA_FLOAT;
+  int n = 0, c = 0, h = 0, w = 0;  // the output's dimensions
+  bool set = false;
+};
+// theta [N, 2, 3] and grid [N, H, W, 2], packed, of the descriptor's type.
+Layout st_array(const StDesc& d, std::initializer_list<int64_t> dims) {
+  Layout l;
+  l.type = d.type;
+  l.rank = static_cast<int>(dims.size());
+  int i = 0;
+  for (int64_t v : dims) l.dims[i++] = v;
+  packed_strides(l.rank, l.dims, false, l.strides);
+  return l;
+}
+// The output's normalized coordinates: -1 to 1 across the pixel centres, the
+// corners included (measured: a 4-wide row is -1, -1/3, 1/3, 1).
+inline double st_coord(int i, int n) { return n > 1 ? -1.0 + 2.0 * i / (n - 1) : 0.0; }
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnCreateSpatialTransformerDescriptor(cudnnSpatialTransformerDescriptor_t* d) {
+  if (!d) return CUDNN_STATUS_BAD_PARAM;
+  *d = reinterpret_cast<cudnnSpatialTransformerDescriptor_t>(track(new StDesc()));
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnDestroySpatialTransformerDescriptor(cudnnSpatialTransformerDescriptor_t d) {
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  untrack(d); delete as<StDesc>(d);
+  return CUDNN_STATUS_SUCCESS;
+}
+// The output's [N, C, H, W]; a fifth dimension is accepted and ignored here,
+// as only 2-D transforms exist.
+VGPU_EXPORT cudnnStatus_t cudnnSetSpatialTransformerNdDescriptor(cudnnSpatialTransformerDescriptor_t d,
+                                                                 cudnnSamplerType_t sampler, cudnnDataType_t type,
+                                                                 const int nb, const int dims[]) {
+  static const char* fn = "cudnnSetSpatialTransformerNdDescriptor";
+  if (!known(d) || !dims || nb < 4) return CUDNN_STATUS_BAD_PARAM;
+  if (sampler != CUDNN_SAMPLER_BILINEAR) return BAD(fn, "only the bilinear sampler exists");
+  if (!floating(type)) return UNSUPPORTED(fn, std::string(type_name(type)) + " data");
+  for (int i = 0; i < 4; ++i)
+    if (dims[i] <= 0) return BAD(fn, "a dimension is not positive");
+  *as<StDesc>(d) = StDesc{sampler, type, dims[0], dims[1], dims[2], dims[3], true};
+  return CUDNN_STATUS_SUCCESS;
+}
+
+// grid[n, h, w] = theta[n] * (x_t, y_t, 1) over the output's normalized coordinates.
+VGPU_EXPORT cudnnStatus_t cudnnSpatialTfGridGeneratorForward(cudnnHandle_t h,
+                                                             const cudnnSpatialTransformerDescriptor_t d,
+                                                             const void* theta, void* grid) {
+  if (!known(h) || !known(d) || !theta || !grid || !as<const StDesc>(d)->set) return CUDNN_STATUS_BAD_PARAM;
+  const StDesc& D = *as<const StDesc>(d);
+  const Layout tl = st_array(D, {D.n, 2, 3}), gl = st_array(D, {D.n, D.h, D.w, 2});
+  sync_handle(h);
+  std::vector<double> th, g(gl.count());
+  if (!read(tl, theta, &th)) return CUDNN_STATUS_EXECUTION_FAILED;
+  for (int n = 0; n < D.n; ++n)
+    for (int i = 0; i < D.h; ++i)
+      for (int j = 0; j < D.w; ++j) {
+        const double xt = st_coord(j, D.w), yt = st_coord(i, D.h), *t = th.data() + n * 6;
+        double* o = g.data() + ((static_cast<size_t>(n) * D.h + i) * D.w + j) * 2;
+        o[0] = t[0] * xt + t[1] * yt + t[2];
+        o[1] = t[3] * xt + t[4] * yt + t[5];
+      }
+  return write(gl, grid, g) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+// dtheta[n] = sum over the grid of dgrid (x) (x_t, y_t, 1).
+VGPU_EXPORT cudnnStatus_t cudnnSpatialTfGridGeneratorBackward(cudnnHandle_t h,
+                                                              const cudnnSpatialTransformerDescriptor_t d,
+                                                              const void* dgrid, void* dtheta) {
+  if (!known(h) || !known(d) || !dgrid || !dtheta || !as<const StDesc>(d)->set) return CUDNN_STATUS_BAD_PARAM;
+  const StDesc& D = *as<const StDesc>(d);
+  const Layout tl = st_array(D, {D.n, 2, 3}), gl = st_array(D, {D.n, D.h, D.w, 2});
+  sync_handle(h);
+  std::vector<double> g, th(tl.count(), 0.0);
+  if (!read(gl, dgrid, &g)) return CUDNN_STATUS_EXECUTION_FAILED;
+  for (int n = 0; n < D.n; ++n)
+    for (int i = 0; i < D.h; ++i)
+      for (int j = 0; j < D.w; ++j) {
+        const double xt = st_coord(j, D.w), yt = st_coord(i, D.h);
+        const double* q = g.data() + ((static_cast<size_t>(n) * D.h + i) * D.w + j) * 2;
+        double* t = th.data() + n * 6;
+        t[0] += q[0] * xt, t[1] += q[0] * yt, t[2] += q[0];
+        t[3] += q[1] * xt, t[4] += q[1] * yt, t[5] += q[1];
+      }
+  return write(tl, dtheta, th) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+namespace {
+// Bilinear sampling of one plane at normalized (gx, gy): the source pixel is
+// ((gx + 1)(W - 1) / 2, (gy + 1)(H - 1) / 2), the four around it weighted by
+// distance, and those outside the plane read as zero (measured). f(at, weight)
+// is called for each corner inside; the derivatives of the result with
+// respect to the pixel coordinates come back in dx, dy when asked.
+template <class F>
+void bilinear(int64_t H, int64_t W, double gx, double gy, F&& f) {
+  const double px = (gx + 1.0) * (W - 1) / 2.0, py = (gy + 1.0) * (H - 1) / 2.0;
+  const double x0 = std::floor(px), y0 = std::floor(py), fx = px - x0, fy = py - y0;
+  for (int dyi = 0; dyi < 2; ++dyi)
+    for (int dxi = 0; dxi < 2; ++dxi) {
+      const int64_t xi = static_cast<int64_t>(x0) + dxi, yi = static_cast<int64_t>(y0) + dyi;
+      if (xi < 0 || xi >= W || yi < 0 || yi >= H) continue;
+      const double wx = dxi ? fx : 1.0 - fx, wy = dyi ? fy : 1.0 - fy;
+      // d(weight)/d(px), d(weight)/d(py)
+      const double dwx = (dxi ? 1.0 : -1.0) * wy, dwy = (dyi ? 1.0 : -1.0) * wx;
+      f(yi * W + xi, wx * wy, dwx, dwy);
+    }
+}
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnSpatialTfSamplerForward(cudnnHandle_t h, cudnnSpatialTransformerDescriptor_t d,
+                                                       const void* alpha, const cudnnTensorDescriptor_t xd,
+                                                       const void* x, const void* grid, const void* beta,
+                                                       cudnnTensorDescriptor_t yd, void* y) {
+  static const char* fn = "cudnnSpatialTfSamplerForward";
+  const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
+  if (!known(h) || !known(d) || !X || !Y || !alpha || !beta || !x || !grid || !y)
+    return BAD(fn, "invalid handle, descriptor or pointer");
+  const StDesc& D = *as<const StDesc>(d);
+  if (!D.set || X->l.rank != 4 || Y->l.rank != 4 || Y->l.dims[0] != D.n || Y->l.dims[1] != D.c ||
+      Y->l.dims[2] != D.h || Y->l.dims[3] != D.w || X->l.dims[0] != D.n || X->l.dims[1] != D.c)
+    return BAD(fn, "x, y and the transformer's dimensions do not agree");
+  const Layout gl = st_array(D, {D.n, D.h, D.w, 2});
+  const int64_t Hi = X->l.dims[2], Wi = X->l.dims[3];
+  sync_handle(h);
+  std::vector<double> vx, g;
+  if (!read(X->l, x, &vx) || !read(gl, grid, &g)) return CUDNN_STATUS_EXECUTION_FAILED;
+  std::vector<double> r(Y->l.count(), 0.0);
+  for (int n = 0; n < D.n; ++n)
+    for (int i = 0; i < D.h; ++i)
+      for (int j = 0; j < D.w; ++j) {
+        const double* q = g.data() + ((static_cast<size_t>(n) * D.h + i) * D.w + j) * 2;
+        for (int c = 0; c < D.c; ++c) {
+          const double* plane = vx.data() + (static_cast<size_t>(n) * D.c + c) * Hi * Wi;
+          double v = 0.0;
+          bilinear(Hi, Wi, q[0], q[1], [&](int64_t at, double wt, double, double) { v += wt * plane[at]; });
+          r[((static_cast<size_t>(n) * D.c + c) * D.h + i) * D.w + j] = v;
+        }
+      }
+  return blend_write(Y->l, y, r, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
+                                                                   : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+// dx = alpha * (dy spread back over each sample's four inputs) + beta * dx;
+// dgrid = alphaDgrid * (dy times the sample's slope in each coordinate) +
+// betaDgrid * dgrid.
+VGPU_EXPORT cudnnStatus_t cudnnSpatialTfSamplerBackward(cudnnHandle_t h, cudnnSpatialTransformerDescriptor_t d,
+                                                        const void* alpha, const cudnnTensorDescriptor_t xd,
+                                                        const void* x, const void* beta,
+                                                        const cudnnTensorDescriptor_t dxd, void* dx,
+                                                        const void* alpha_grid, const cudnnTensorDescriptor_t dyd,
+                                                        const void* dy, const void* grid, const void* beta_grid,
+                                                        void* dgrid) {
+  static const char* fn = "cudnnSpatialTfSamplerBackward";
+  const TensorDesc *X = tdesc(xd), *DX = tdesc(dxd), *DY = tdesc(dyd);
+  if (!known(h) || !known(d) || !X || !DX || !DY || !alpha || !beta || !alpha_grid || !beta_grid || !x || !dx ||
+      !dy || !grid || !dgrid)
+    return BAD(fn, "invalid handle, descriptor or pointer");
+  const StDesc& D = *as<const StDesc>(d);
+  if (!D.set || X->l.rank != 4 || !X->l.same_dims(DX->l) || DY->l.rank != 4 || DY->l.dims[0] != D.n ||
+      DY->l.dims[1] != D.c || DY->l.dims[2] != D.h || DY->l.dims[3] != D.w || X->l.dims[0] != D.n ||
+      X->l.dims[1] != D.c)
+    return BAD(fn, "x, dx, dy and the transformer's dimensions do not agree");
+  const Layout gl = st_array(D, {D.n, D.h, D.w, 2});
+  const int64_t Hi = X->l.dims[2], Wi = X->l.dims[3];
+  sync_handle(h);
+  std::vector<double> vx, vdy, g;
+  if (!read(X->l, x, &vx) || !read(DY->l, dy, &vdy) || !read(gl, grid, &g)) return CUDNN_STATUS_EXECUTION_FAILED;
+  std::vector<double> rdx(vx.size(), 0.0), rdg(g.size(), 0.0);
+  for (int n = 0; n < D.n; ++n)
+    for (int i = 0; i < D.h; ++i)
+      for (int j = 0; j < D.w; ++j) {
+        const size_t gi = ((static_cast<size_t>(n) * D.h + i) * D.w + j) * 2;
+        for (int c = 0; c < D.c; ++c) {
+          const size_t pbase = (static_cast<size_t>(n) * D.c + c) * Hi * Wi;
+          const double gy = vdy[((static_cast<size_t>(n) * D.c + c) * D.h + i) * D.w + j];
+          bilinear(Hi, Wi, g[gi], g[gi + 1], [&](int64_t at, double wt, double dwx, double dwy) {
+            rdx[pbase + at] += wt * gy;
+            rdg[gi] += gy * vx[pbase + at] * dwx * (Wi - 1) / 2.0;
+            rdg[gi + 1] += gy * vx[pbase + at] * dwy * (Hi - 1) / 2.0;
+          });
+        }
+      }
+  if (!blend_write(DX->l, dx, rdx, sc(alpha, DX->l), sc(beta, DX->l))) return CUDNN_STATUS_EXECUTION_FAILED;
+  return blend_write(gl, dgrid, rdg, scale_of(alpha_grid, D.type), scale_of(beta_grid, D.type))
+             ? CUDNN_STATUS_SUCCESS
+             : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
 /* ---- dropout ---- */
 
 namespace {

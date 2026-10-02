@@ -34,15 +34,8 @@ void vgpu_report_unimplemented(const char* fn) {
 VGPU_EXPORT int cudnnCTCLoss() { vgpu_report_unimplemented("cudnnCTCLoss"); return 9; }
 VGPU_EXPORT int cudnnCTCLoss_v8() { vgpu_report_unimplemented("cudnnCTCLoss_v8"); return 9; }
 VGPU_EXPORT int cudnnCreateCTCLossDescriptor() { vgpu_report_unimplemented("cudnnCreateCTCLossDescriptor"); return 9; }
-VGPU_EXPORT int cudnnCreateSpatialTransformerDescriptor() { vgpu_report_unimplemented("cudnnCreateSpatialTransformerDescriptor"); return 9; }
 VGPU_EXPORT int cudnnDestroyCTCLossDescriptor() { vgpu_report_unimplemented("cudnnDestroyCTCLossDescriptor"); return 9; }
-VGPU_EXPORT int cudnnDestroySpatialTransformerDescriptor() { vgpu_report_unimplemented("cudnnDestroySpatialTransformerDescriptor"); return 9; }
 VGPU_EXPORT int cudnnGetCTCLossWorkspaceSize() { vgpu_report_unimplemented("cudnnGetCTCLossWorkspaceSize"); return 9; }
 VGPU_EXPORT int cudnnGetCTCLossWorkspaceSize_v8() { vgpu_report_unimplemented("cudnnGetCTCLossWorkspaceSize_v8"); return 9; }
 VGPU_EXPORT int cudnnSetCTCLossDescriptorEx() { vgpu_report_unimplemented("cudnnSetCTCLossDescriptorEx"); return 9; }
 VGPU_EXPORT int cudnnSetCTCLossDescriptor_v9() { vgpu_report_unimplemented("cudnnSetCTCLossDescriptor_v9"); return 9; }
-VGPU_EXPORT int cudnnSetSpatialTransformerNdDescriptor() { vgpu_report_unimplemented("cudnnSetSpatialTransformerNdDescriptor"); return 9; }
-VGPU_EXPORT int cudnnSpatialTfGridGeneratorBackward() { vgpu_report_unimplemented("cudnnSpatialTfGridGeneratorBackward"); return 9; }
-VGPU_EXPORT int cudnnSpatialTfGridGeneratorForward() { vgpu_report_unimplemented("cudnnSpatialTfGridGeneratorForward"); return 9; }
-VGPU_EXPORT int cudnnSpatialTfSamplerBackward() { vgpu_report_unimplemented("cudnnSpatialTfSamplerBackward"); return 9; }
-VGPU_EXPORT int cudnnSpatialTfSamplerForward() { vgpu_report_unimplemented("cudnnSpatialTfSamplerForward"); return 9; }

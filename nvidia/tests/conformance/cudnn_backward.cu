@@ -5,7 +5,7 @@
 // pooling, softmax and LRN; reductions with indices, op-tensor broadcasts,
 // transforms, dropout's backward pass from a known mask, and batch
 // normalization's backward pass in NHWC, with and without a fused add and
-// activation. The same binary runs against
+// activation; and the spatial transformer's grid and sampler, both ways. The same binary runs against
 // NVIDIA's libcudnn.so.9 and against VirtualGPU's; the printed values must
 // agree (nvidia/tests/conformance/golden/cudnn_backward.rtx3060.txt holds what
 // an RTX 3060 printed).
@@ -534,6 +534,31 @@ static void batchnorm_fused() {
   }
 }
 
+// The spatial transformer: an affine grid per image, bilinear sampling
+// (some of it off the image), and both backward passes.
+static void spatial_transformer() {
+  cudnnSpatialTransformerDescriptor_t st;
+  CK(cudnnCreateSpatialTransformerDescriptor(&st));
+  const int dims[4] = {2, 2, 4, 5};
+  CK(cudnnSetSpatialTransformerNdDescriptor(st, CUDNN_SAMPLER_BILINEAR, CUDNN_DATA_FLOAT, 4, dims));
+  const float th[12] = {0.83f, 0.21f, 0.07f, -0.17f, 0.91f, -0.05f, 1.13f, -0.31f, 0.12f, 0.27f, 0.77f, 0.19f};
+  Buf<float> theta(12, 0.0f), grid(80, 0.0f), x(168, 1.0f), y(80, 0.0f), dy(80, 1.0f, 3), dx(168, 0.2f, 5),
+      dgrid(80, 0.0f), dtheta(12, 0.0f);
+  cudaMemcpy(theta.p, th, sizeof th, cudaMemcpyHostToDevice);
+  cudnnTensorDescriptor_t xd = tensor(CUDNN_DATA_FLOAT, {2, 2, 6, 7}), yd = tensor(CUDNN_DATA_FLOAT, {2, 2, 4, 5});
+  const float one = 1.0f, zero = 0.0f, half = 0.5f;
+  CK(cudnnSpatialTfGridGeneratorForward(H, st, theta.p, grid.p));
+  dump("stn grid", grid.get());
+  CK(cudnnSpatialTfSamplerForward(H, st, &one, xd, x.p, grid.p, &zero, yd, y.p));
+  dump("stn sampler fwd", y.get());
+  CK(cudnnSpatialTfSamplerBackward(H, st, &one, xd, x.p, &half, xd, dx.p, &one, yd, dy.p, grid.p, &zero, dgrid.p));
+  dump("stn sampler dx b.5", dx.get());
+  dump("stn sampler dgrid", dgrid.get());
+  CK(cudnnSpatialTfGridGeneratorBackward(H, st, dgrid.p, dtheta.p));
+  dump("stn dtheta", dtheta.get());
+  cudnnDestroySpatialTransformerDescriptor(st);
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("cudnnCreate failed\n");
@@ -550,6 +575,7 @@ int main() {
   dropout();
   batchnorm_nhwc();
   batchnorm_fused();
+  spatial_transformer();
   cudnnDestroy(H);
   return 0;
 }
