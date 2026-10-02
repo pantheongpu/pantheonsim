@@ -56,7 +56,7 @@ using DeAllocFn_t = std::function<void(void*, size_t)>;
  * chunk, or that bitstream after its uncompressed size. */
 enum class BitstreamKind { NVCOMP_NATIVE = 0, RAW = 1, WITH_UNCOMPRESSED_SIZE = 2 };
 
-enum ChecksumPolicy {
+enum ChecksumPolicy : int {
   NoComputeNoVerify = 0,
   ComputeAndNoVerify = 1,
   NoComputeAndVerifyIfPresent = 2,

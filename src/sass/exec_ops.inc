@@ -2020,7 +2020,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // process's alone (vgpu/exec/host_atomic.hpp).
         uint64_t old = 0;
         uint8_t* host = sp == Space::Global && addr % n == 0 ? mem_.host_address(addr, n) : nullptr;
-        if (host) {
+        if (host && reinterpret_cast<uintptr_t>(host) % n == 0) {
           old = exec::host_atomic_rmw(host, n, compute);
         } else {
           mem_read(blk, w, l, sp, addr, &old, n);

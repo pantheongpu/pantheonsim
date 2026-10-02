@@ -220,10 +220,15 @@ struct nvcompManagerInternalBase {
     h.uncomp_chunk_size = chunk;
     h.data_offset = uint32_t(data_offset);
     std::memcpy(o.data(), &h, sizeof h);
-    std::memcpy(o.data() + kCommonSize, spec.data(), spec.size());
-    std::memcpy(o.data() + spec_end(), offsets.data(), nc * 8);
-    std::memcpy(o.data() + spec_end() + nc * 8, sizes.data(), nc * 8);
-    for (size_t i = 0; i < nc; ++i) std::memcpy(o.data() + data_offset + offsets[i], pieces[i].data(), sizes[i]);
+    // An empty vector's data() may be null, which memcpy may not be given
+    // even for no bytes: a format with no spec, no chunks, an empty chunk.
+    auto copy = [&](size_t at, const void* from, size_t len) {
+      if (len) std::memcpy(o.data() + at, from, len);
+    };
+    copy(kCommonSize, spec.data(), spec.size());
+    copy(spec_end(), offsets.data(), nc * 8);
+    copy(spec_end() + nc * 8, sizes.data(), nc * 8);
+    for (size_t i = 0; i < nc; ++i) copy(data_offset + offsets[i], pieces[i].data(), sizes[i]);
     if (!impl::put(out, o.data(), o.size())) raise(nvcompErrorCudaError, "the compressed buffer is not writable");
     return o.size();
   }

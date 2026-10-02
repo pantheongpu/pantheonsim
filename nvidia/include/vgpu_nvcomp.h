@@ -16,6 +16,19 @@
 #ifndef VGPU_NVCOMP_H_
 #define VGPU_NVCOMP_H_
 
+// Every enum here takes the values a program may store in it, valid or not:
+// the entry points check them and answer with the library's own status. In
+// C++ an enum without a fixed underlying type cannot even be loaded holding
+// an unlisted value (UBSan's -fsanitize=enum), so the C++ view fixes it to
+// int -- the same size, and the same ABI, as the C view.
+#ifndef VGPU_ENUM_INT
+#ifdef __cplusplus
+#define VGPU_ENUM_INT : int
+#else
+#define VGPU_ENUM_INT
+#endif
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #ifndef __cplusplus
@@ -39,7 +52,7 @@ extern "C" {
 #endif
 
 /* ---- shared types ---- */
-typedef enum nvcompStatus_t {
+typedef enum nvcompStatus_t VGPU_ENUM_INT {
   nvcompSuccess = 0,
   nvcompErrorInvalidValue = 10,
   nvcompErrorNotSupported = 11,
@@ -60,7 +73,7 @@ typedef enum nvcompStatus_t {
   nvcompErrorInternal = 10000
 } nvcompStatus_t;
 
-typedef enum nvcompType_t {
+typedef enum nvcompType_t VGPU_ENUM_INT {
   NVCOMP_TYPE_CHAR = 0,
   NVCOMP_TYPE_UCHAR = 1,
   NVCOMP_TYPE_SHORT = 2,
@@ -74,7 +87,7 @@ typedef enum nvcompType_t {
   NVCOMP_TYPE_BITS = 0xff
 } nvcompType_t;
 
-typedef enum nvcompDecompressBackend_t {
+typedef enum nvcompDecompressBackend_t VGPU_ENUM_INT {
   NVCOMP_DECOMPRESS_BACKEND_DEFAULT = 0,
   NVCOMP_DECOMPRESS_BACKEND_HARDWARE = 1,
   NVCOMP_DECOMPRESS_BACKEND_CUDA = 2
@@ -91,7 +104,7 @@ typedef struct {
   size_t temp;
 } nvcompAlignmentRequirements_t;
 
-typedef enum nvcompBitshuffleMode_t {
+typedef enum nvcompBitshuffleMode_t VGPU_ENUM_INT {
   NVCOMP_BITSHUFFLE_NONE = 0,
   NVCOMP_BITSHUFFLE_MSB_FIRST = 1,
   NVCOMP_BITSHUFFLE_LSB_FIRST = 2
@@ -177,7 +190,7 @@ typedef struct {
   int algorithm;
   char reserved[60];
 } nvcompBatchedGzipCompressOpts_t;
-typedef enum {
+typedef enum VGPU_ENUM_INT {
   NVCOMP_GZIP_DECOMPRESS_ALGORITHM_NAIVE = 0,
   NVCOMP_GZIP_DECOMPRESS_ALGORITHM_LOOKAHEAD = 1
 } nvcompBatchedGzipDecompressAlgorithm_t;
@@ -243,7 +256,7 @@ static const nvcompBatchedBitcompCompressOpts_t nvcompBatchedBitcompCompressDefa
 static const nvcompBatchedBitcompDecompressOpts_t nvcompBatchedBitcompDecompressDefaultOpts = {
     NVCOMP_DECOMPRESS_BACKEND_DEFAULT, {0}};
 
-typedef enum nvcompANSType_t { nvcomp_rANS } nvcompANSType_t;
+typedef enum nvcompANSType_t VGPU_ENUM_INT { nvcomp_rANS } nvcompANSType_t;
 typedef struct {
   nvcompANSType_t type;
   nvcompType_t data_type;
@@ -324,7 +337,7 @@ static const nvcompCRC32Spec_t nvcompCRC32_BZIP2 = {0x04C11DB7, 0xFFFFFFFF, fals
 static const nvcompCRC32Spec_t nvcompCRC32_POSIX = {0x04C11DB7, 0x00000000, false, false, 0xFFFFFFFF, {0}};
 static const nvcompCRC32Spec_t nvcompCRC32_MPEG_2 = {0x04C11DB7, 0xFFFFFFFF, false, false, 0x00000000, {0}};
 
-typedef enum nvcompCRC32KernelKind_t { nvcompCRC32WarpKernel = 0, nvcompCRC32BlockKernel = 1 } nvcompCRC32KernelKind_t;
+typedef enum nvcompCRC32KernelKind_t VGPU_ENUM_INT { nvcompCRC32WarpKernel = 0, nvcompCRC32BlockKernel = 1 } nvcompCRC32KernelKind_t;
 typedef struct {
   nvcompCRC32KernelKind_t kernel_kind;
   int32_t bytes_per_read;
@@ -336,7 +349,7 @@ typedef struct {
   nvcompCRC32KernelConf_t kernel_conf;
   char reserved[64];
 } nvcompBatchedCRC32Opts_t;
-typedef enum nvcompCRC32SegmentKind_t {
+typedef enum nvcompCRC32SegmentKind_t VGPU_ENUM_INT {
   nvcompCRC32OnlySegment = 0,
   nvcompCRC32FirstSegment,
   nvcompCRC32MidSegment,

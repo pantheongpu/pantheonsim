@@ -986,6 +986,15 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
     case ScalarAt::Unchanged:  // only answered for a store
     case ScalarAt::HostMap:
       // Host memory, mapped: no device ECC covers it, so no fault is taken.
+      // Read as an atomic of its width, as a chunk's scalar is: the host, or
+      // another process's kernels on shared memory, may be updating it with
+      // the CPU's atomics -- which is how the engines make a device atomic on
+      // such memory (vgpu/exec/host_atomic.hpp) -- and a memcpy racing those
+      // is a data race (ThreadSanitizer, e2e_host_atomics).
+      {
+        std::lock_guard<std::mutex> lock(host_maps_->mu);
+        if (const HostMap* m = find_host_map_locked(addr, size)) return load_at(m->host + (addr - m->base), size);
+      }
       read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
       return v;
   }
@@ -1016,6 +1025,15 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       return;
     case ScalarAt::Unchanged:
       return;
+    case ScalarAt::HostMap: {
+      // An atomic store of its width, as load_scalar's load is.
+      std::lock_guard<std::mutex> lock(host_maps_->mu);
+      if (const HostMap* m = find_host_map_locked(addr, size)) {
+        store_at(m->host + (addr - m->base), size, value);
+        return;
+      }
+      break;
+    }
     default:
       break;
   }

@@ -18,6 +18,19 @@
 #ifndef VGPU_CUFILE_H_
 #define VGPU_CUFILE_H_
 
+// Every enum here takes the values a program may store in it, valid or not:
+// the entry points check them and answer with the library's own status. In
+// C++ an enum without a fixed underlying type cannot even be loaded holding
+// an unlisted value (UBSan's -fsanitize=enum), so the C++ view fixes it to
+// int -- the same size, and the same ABI, as the C view.
+#ifndef VGPU_ENUM_INT
+#ifdef __cplusplus
+#define VGPU_ENUM_INT : int
+#else
+#define VGPU_ENUM_INT
+#endif
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -37,7 +50,7 @@ extern "C" {
 /* The cuFile status codes: 0 for success, otherwise 5000 plus a small number.
  * Data path calls (cuFileRead, cuFileWrite) return their negation, or -1 with
  * errno for a file system error. */
-typedef enum CUfileOpError {
+typedef enum CUfileOpError VGPU_ENUM_INT {
   CU_FILE_SUCCESS = 0,
   CU_FILE_DRIVER_NOT_INITIALIZED = CUFILEOP_BASE_ERR + 1,
   CU_FILE_DRIVER_INVALID_PROPS = CUFILEOP_BASE_ERR + 2,
@@ -101,7 +114,7 @@ typedef struct CUfileError {
 #define CU_FILE_CUDA_ERR(status) ((status).cu_err)
 
 /* Bit positions in CUfileDrvProps_t.nvfs.dstatusflags. */
-typedef enum CUfileDriverStatusFlags {
+typedef enum CUfileDriverStatusFlags VGPU_ENUM_INT {
   CU_FILE_LUSTRE_SUPPORTED = 0,
   CU_FILE_WEKAFS_SUPPORTED = 1,
   CU_FILE_NFS_SUPPORTED = 2,
@@ -117,13 +130,13 @@ typedef enum CUfileDriverStatusFlags {
 } CUfileDriverStatusFlags_t;
 
 /* Bit positions in CUfileDrvProps_t.nvfs.dcontrolflags. */
-typedef enum CUfileDriverControlFlags {
+typedef enum CUfileDriverControlFlags VGPU_ENUM_INT {
   CU_FILE_USE_POLL_MODE = 0,
   CU_FILE_ALLOW_COMPAT_MODE = 1
 } CUfileDriverControlFlags_t;
 
 /* Bit positions in CUfileDrvProps_t.fflags. */
-typedef enum CUfileFeatureFlags {
+typedef enum CUfileFeatureFlags VGPU_ENUM_INT {
   CU_FILE_DYN_ROUTING_SUPPORTED = 0,
   CU_FILE_BATCH_IO_SUPPORTED = 1,
   CU_FILE_STREAMS_SUPPORTED = 2,
@@ -167,7 +180,7 @@ typedef struct CUfileFSOps {
   ssize_t (*write)(void* handle, const char*, size_t, loff_t, cufileRDMAInfo_t*);
 } CUfileFSOps_t;
 
-enum CUfileFileHandleType {
+enum CUfileFileHandleType VGPU_ENUM_INT {
   CU_FILE_HANDLE_TYPE_OPAQUE_FD = 1,
   CU_FILE_HANDLE_TYPE_OPAQUE_WIN32 = 2,
   CU_FILE_HANDLE_TYPE_USERSPACE_FS = 3
@@ -211,9 +224,9 @@ ssize_t cuFileWrite(CUfileHandle_t fh, const void* bufPtr_base, size_t size, off
                     off_t bufPtr_offset);
 
 /* ---- batch I/O ---- */
-typedef enum CUfileOpcode { CUFILE_READ = 0, CUFILE_WRITE } CUfileOpcode_t;
+typedef enum CUfileOpcode VGPU_ENUM_INT { CUFILE_READ = 0, CUFILE_WRITE } CUfileOpcode_t;
 
-typedef enum CUFILEStatus_enum {
+typedef enum CUFILEStatus_enum VGPU_ENUM_INT {
   CUFILE_WAITING = 0x000001,
   CUFILE_PENDING = 0x000002,
   CUFILE_INVALID = 0x000004,
@@ -223,7 +236,7 @@ typedef enum CUFILEStatus_enum {
   CUFILE_FAILED = 0x000040
 } CUfileStatus_t;
 
-typedef enum cufileBatchMode { CUFILE_BATCH = 1 } CUfileBatchMode_t;
+typedef enum cufileBatchMode VGPU_ENUM_INT { CUFILE_BATCH = 1 } CUfileBatchMode_t;
 
 typedef struct CUfileIOParams {
   CUfileBatchMode_t mode; /* first, always */
@@ -270,7 +283,7 @@ CUfileError_t cuFileStreamRegister(CUstream stream, unsigned flags);
 CUfileError_t cuFileStreamDeregister(CUstream stream);
 
 /* ---- configuration ---- */
-typedef enum CUFileSizeTConfigParameter_t {
+typedef enum CUFileSizeTConfigParameter_t VGPU_ENUM_INT {
   CUFILE_PARAM_PROFILE_STATS,
   CUFILE_PARAM_EXECUTION_MAX_IO_QUEUE_DEPTH,
   CUFILE_PARAM_EXECUTION_MAX_IO_THREADS,
@@ -285,7 +298,7 @@ typedef enum CUFileSizeTConfigParameter_t {
   CUFILE_PARAM_PROPERTIES_BATCH_IO_TIMEOUT_MS
 } CUFileSizeTConfigParameter_t;
 
-typedef enum CUFileBoolConfigParameter_t {
+typedef enum CUFileBoolConfigParameter_t VGPU_ENUM_INT {
   CUFILE_PARAM_PROPERTIES_USE_POLL_MODE,
   CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE,
   CUFILE_PARAM_FORCE_COMPAT_MODE,
@@ -300,13 +313,13 @@ typedef enum CUFileBoolConfigParameter_t {
   CUFILE_PARAM_STREAM_MEMOPS_BYPASS
 } CUFileBoolConfigParameter_t;
 
-typedef enum CUFileStringConfigParameter_t {
+typedef enum CUFileStringConfigParameter_t VGPU_ENUM_INT {
   CUFILE_PARAM_LOGGING_LEVEL,
   CUFILE_PARAM_ENV_LOGFILE_PATH,
   CUFILE_PARAM_LOG_DIR
 } CUFileStringConfigParameter_t;
 
-typedef enum CUFileArrayConfigParameter_t {
+typedef enum CUFileArrayConfigParameter_t VGPU_ENUM_INT {
   CUFILE_PARAM_POSIX_POOL_SLAB_SIZE_KB,
   CUFILE_PARAM_POSIX_POOL_SLAB_COUNT
 } CUFileArrayConfigParameter_t;

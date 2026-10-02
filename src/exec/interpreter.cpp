@@ -10310,7 +10310,8 @@ class Interpreter {
         // code and other processes' kernels respect; the stripe lock is this
         // process's alone (host_atomic.hpp).
         if (!is_shared(addr) && !is_local(addr) && addr % size == 0) {
-          if (uint8_t* host = mem_.host_address(addr, size)) {
+          uint8_t* host = mem_.host_address(addr, size);
+          if (host && reinterpret_cast<uintptr_t>(host) % size == 0) {
             r[lane] = vgpu::exec::host_atomic_rmw(host, size, compute);
             continue;
           }

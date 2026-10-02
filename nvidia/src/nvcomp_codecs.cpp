@@ -1326,10 +1326,11 @@ Result zstd_block(ZstdFrameState& fs, const uint8_t* p, size_t n, Sink& s, size_
   if (regen > block_max || csize > n - hdr) return Result::Corrupt;
   std::vector<uint8_t> lit(regen);
   const uint8_t* lp = p + hdr;
+  // An empty literals section has no buffer to copy into (data() is null).
   if (ltype == 0) {
-    std::memcpy(lit.data(), lp, regen);
+    if (regen) std::memcpy(lit.data(), lp, regen);
   } else if (ltype == 1) {
-    std::memset(lit.data(), lp[0], regen);
+    if (regen) std::memset(lit.data(), lp[0], regen);
   } else {
     size_t tree = 0;
     if (ltype == 2) {
