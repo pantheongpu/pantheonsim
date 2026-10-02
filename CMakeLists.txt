@@ -1322,6 +1322,16 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
+  # fatbin and PTX, as an RTX 3060 answers for all three. The cubin needs SASS
+  # support; until it is in the tree the script asks only that it be refused.
+  add_test(NAME e2e_managed_module
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_managed_module.sh)
+  set_tests_properties(e2e_managed_module PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)
   set_tests_properties(e2e_rdc_link PROPERTIES
