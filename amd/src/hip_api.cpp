@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
@@ -596,13 +597,14 @@ hipError_t order_for(State& s, hipStream_t stream, Order* o) {
 // Runs `work` in `stream`'s order: queued, and returned from at once -- or,
 // for a synchronous call (wait) and under VGPU_SYNC_LAUNCHES, waited for, and
 // its own result returned. Called without s.mutex held.
-hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false) {
+hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std::vector<Queue::Marker> also = {}) {
   State& s = state();
   Order o;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return e;
   }
+  for (Queue::Marker& m : also) o.after.push_back(std::move(m));
   if (!wait && !synchronous_launches()) {
     o.queue->submit(std::move(work), std::move(o.after));
     return hipSuccess;
@@ -931,6 +933,8 @@ hipError_t run_launch(const LaunchJob& job) {
     const double clock = mhz ? mhz * 1e6 : 1e9;
     d.note_busy(static_cast<double>(stats.instructions) / clock);
   } catch (const std::exception& e) {
+    // The process is exiting (stop_work_at_exit): nothing to say.
+    if (vgpu::amd::dispatches_abandoned()) return hipErrorLaunchFailure;
     // A launch that failed counted nothing, and the profiler is told so.
     if (prof && prof->launched && start) prof->launched(launch, nullptr, start, vgpu::amd::hipprof::now_ns(), token);
     for (uint64_t a : {job.kernarg_at ? 0 : kernarg, grid_sync})
@@ -946,7 +950,50 @@ hipError_t run_launch(const LaunchJob& job) {
 }
 
 // A prepared launch, run in its stream's order.
+// At exit, before the shim's static objects (its modules, their code and
+// decode caches among them) are destroyed: a kernel still running on a
+// stream's thread reads them. A card abandons the work a process leaves
+// behind; so does this. Every dispatch stops (vgpu::amd::abandon_dispatches),
+// and the streams' threads are given a few seconds to finish what they hold
+// -- not the one exit is called on, nor one that holds the lock -- after which
+// exit goes on regardless.
+//
+// When it runs matters: the decoder's tables and much else are made lazily,
+// as the first kernel runs, and exit destroys what was made last first. The
+// main thread's thread_local objects go before any of it, so a guard there
+// (made at its first launch) is the hook; an atexit handler, registered at
+// the first launch too, covers exit called from another thread.
+void stop_work_at_exit() {
+  vgpu::amd::abandon_dispatches();
+  State& s = state();
+  std::vector<std::shared_ptr<Queue>> qs;
+  {
+    std::unique_lock<std::mutex> lock(s.mutex, std::defer_lock);
+    for (int i = 0; i < 100 && !lock.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!lock.owns_lock()) return;
+    for (auto& [device, q] : s.null_queues)
+      if (q) qs.push_back(q);
+    for (auto& [handle, st] : s.streams)
+      if (st.queue) qs.push_back(st.queue);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  for (const auto& q : qs)
+    if (!q->on_worker() && !q->wait_until(q->tail(), deadline)) return;
+}
+
+struct MainThreadExitGuard {
+  ~MainThreadExitGuard() {
+    if (static_cast<pid_t>(syscall(SYS_gettid)) == getpid()) stop_work_at_exit();
+  }
+};
+
 hipError_t launch_in_order(LaunchJob job) {
+  static const bool at_exit = (std::atexit(stop_work_at_exit), true);
+  (void)at_exit;
+  if (static_cast<pid_t>(syscall(SYS_gettid)) == getpid()) {
+    thread_local MainThreadExitGuard guard;
+    (void)guard;
+  }
   const hipStream_t stream = job.stream;
   return in_order(stream, [job = std::move(job)] { return run_launch(job); });
 }
@@ -1316,14 +1363,16 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   const bool to_device = to.mem != nullptr, from_device = from.mem != nullptr;
   // A synchronous copy of another device's memory also comes after what that
   // device's blocking streams were given: it is ordered on the device the
-  // memory is on, as ROCm's HIP orders it, as well as the current one --
-  // a device-to-device one too, which returns before it is done but not
-  // before what it follows there. A graph's launch runs its copy right here,
-  // on its stream's thread.
+  // memory is on, as ROCm's HIP orders it, as well as the current one. A
+  // device-to-device one, which is queued and returned from at once, waits
+  // only for the device it reads from, so that it reads what was queued there
+  // before it, and still returns before the work queued where it writes is
+  // done (hip-tests' hipMemcpyPeer synchronization check). A graph's launch
+  // runs its copy right here, on its stream's thread.
   const bool run_here = sink != nullptr;
   if (called_sync && !run_here)
     for (const Side* side : {&to, &from})
-      if (side->device && side->ordinal != ordinal) drain_device(side->ordinal, true);
+      if (side->device && side->ordinal != ordinal && (!async || side == &from)) drain_device(side->ordinal, true);
   bool wait = !async || run_here;
   if (async && (!to.mem || (!to.device && !from.device))) wait = true;
   const uint64_t w = dr.width, rows = dr.rows, depth = dr.depth;
@@ -1373,7 +1422,18 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     }
     return hipSuccess;
   };
-  return run_here ? work() : in_order(stream, work, wait);
+  // An asynchronous copy from another device's memory comes after what that
+  // device's blocking streams were given too -- as a dependency of its own
+  // stream, not a wait here -- so that it reads what was queued there before
+  // it (hip-tests' hipGetProcAddress 2D copies: a memset on one device, then an
+  // asynchronous copy on the other). ROCm's HIP leaves this to timing, which a
+  // card wins and a simulated memset may not.
+  std::vector<Queue::Marker> after_source;
+  if (!run_here && !called_sync && from.device && from.ordinal != ordinal) {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    for (const std::shared_ptr<Queue>& q : queues_of(s, from.ordinal, true)) after_source.push_back({q, q->tail()});
+  }
+  return run_here ? work() : in_order(stream, work, wait, std::move(after_source));
 }
 
 // A copy of `bytes`, or of `rows` rows of them `dpitch` and `spitch` apart.
