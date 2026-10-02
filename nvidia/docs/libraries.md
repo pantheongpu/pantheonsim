@@ -153,6 +153,29 @@ NVIDIA's does not -- every algorithm for every shape, dy with gaps in
 backward-data and x with gaps in backward-filter, double-precision NHWC
 backward-data -- rather than refusing them.
 
+The rest of the classic API was measured on the same card and matched.
+`NCHW_VECT_C` tensors report strides in vectors (2x8x3x5 INT8x4 is 240
+bytes); INT8x4 and UINT8x4 convolve to INT8x4 or FLOAT (NCHW on both
+implicit GEMMs, NHWC on the precomputed one), INT8x32 to INT8x32 only, with
+no dilation and no backward pass; `cudnnReorderFilterAndBias` permutes an
+INT8x32 filter in 32-byte chunks of eight output channels (and its bias in
+blocks of 32), which a `CUDNN_NO_REORDER` convolution reads back. INT8
+pooling and activation round to nearest even after alpha and beta; FP8,
+BOOLEAN and INT64 classic descriptors are BAD_PARAM. Divisive normalization
+is `x / (K + alpha / n^d * sum (x_j - m)^2)^beta` over the window, and its
+backward pass gathers over each element's own window (which differs from
+the exact gradient only for even windows). A tensor transform pads, then
+folds channels as `padBefore + offset * C + c`; folding and padding take no
+beta. `cudnnGetFoldedConvBackwardDataDescriptors` pads K to a multiple of 8
+and C to `floor(roundup(C * sh * sw, 8) / (sh * sw))`. LSTM projections
+keep the weight space's matrices before all its biases (as every RNN now
+does), and cell clipping limits the state where it is read, with float
+bounds, reporting cy unclipped. Fused-ops plans run BNSTATS convolution
+(half NHWC, the affine result rounded to half) and both batch-norm
+finalizations. Multi-head attention keeps W_Q, W_K, W_V, W_O and then the
+biases in the weight buffer, input element slowest, and writes steps past a
+sequence as the output bias plus the residual.
+
 ## Checked in CI without hardware
 
 The paths PyTorch takes through these libraries are also covered by
@@ -174,6 +197,7 @@ runs them; each is a ctest of its own.
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, LSTMs in half, bfloat16 and double, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
+| `e2e_dnn_classic_paths` | cuDNN's classic API beyond the training paths: INT8x4/UINT8x4/INT8x32 convolution and fused bias-ReLU against an integer reference (also through `cudnnReorderFilterAndBias`), transforms to and from `NCHW_VECT_C`, INT8 pooling and activation, divisive normalization against its formula and finite differences, padding/folding/unfolding transforms and the folded backward-data pipeline, LSTM projections and clipping against a host LSTM and finite differences, the RNN getters, fused-ops plans, multi-head attention forward and both gradients | `nn.LSTM(proj_size=)`, `nn.MultiheadAttention`-style models, INT8 inference engines |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch norm forward and backward, max and average pooling both ways, asymmetric padding, concatenation | `cudnn_convolution_add_relu`, cudnn-frontend |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -358,9 +382,13 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   RNG, reshape, statistics generation, ...), group normalization,
   normalization backward without the saved statistics, interpolating
   resampling (nearest, bilinear) and resampling index tensors, ragged and
-  vectorized tensors; in the classic API, the vectorized layouts
-  (`NCHW_VECT_C`, INT8x4/INT8x32), FP8 tensors, divisive normalization,
-  fused-ops plans, tensor transform descriptors and RNN projections.
+  vectorized tensors; in the classic API, the fused ops cuDNN runs only on
+  Volta and Turing (`SCALE_BIAS_ACTIVATION_WGRAD`,
+  `CONV_SCALE_BIAS_ADD_ACTIVATION`, which an RTX 3060 refuses too) and the
+  two undocumented ones, multi-head attention's one-to-one query mapping
+  with beams (refused by the hardware as well), and NVIDIA's own dropout
+  masks in RNNs and attention (the fraction kept and the scaling are
+  cuDNN's; the generator is this library's).
 - **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
   CUDA 12); the tridiagonal and pentadiagonal solvers (`gtsv2`, `gpsv`), the

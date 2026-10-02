@@ -10,10 +10,14 @@
 // activation, pooling, softmax, LRN, batch normalization (with its fused add
 // and activation, and as the cuDNN 8 normalization API), dropout, the spatial
 // transformer, CTC loss, and tensor arithmetic (add, op-tensor, reduce,
-// transform, set, scale). Tensors are 1-8
+// transform, set, scale), divisive normalization, tensor transform
+// descriptors (padding, folding), folded backward-data descriptors and
+// fused-ops plans. Tensors are 1-8
 // dimensional with any strides -- NCHW, NHWC or neither -- of float, double,
-// half or bfloat16, with the compute types cuDNN documents for each, and INT8
-// convolution in NHWC. What cuDNN would compute that this library does not
+// half or bfloat16, with the compute types cuDNN documents for each; INT8 and
+// UINT8 convolution in NHWC, and the vectorized NCHW_VECT_C layout (INT8x4,
+// UINT8x4, INT8x32) for convolution, pooling and transforms, with
+// cudnnReorderFilterAndBias. What cuDNN would compute that this library does not
 // returns CUDNN_STATUS_NOT_SUPPORTED, by name, so a caller can fall back
 // rather than receive a plausible wrong answer. The graph/backend API is in
 // cudnn_backend.cpp, RNNs in cudnn_rnn.cpp.

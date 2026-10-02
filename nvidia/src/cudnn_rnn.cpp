@@ -1,5 +1,7 @@
 // libvgpucudnn's recurrent networks: cuDNN's RNN API (the v8 forms PyTorch's
-// nn.LSTM, nn.GRU and nn.RNN call) and the dropout descriptor it takes.
+// nn.LSTM, nn.GRU and nn.RNN call) and the dropout descriptor it takes; and,
+// at the end, the classic multi-head attention API, the other half of
+// cuDNN's adv library.
 //
 // As everywhere in this library, the math runs on the host over copies of the
 // device buffers (see cudnn_api.cpp). What the API leaves to the library, and
