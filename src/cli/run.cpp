@@ -144,8 +144,8 @@ bool is_cuda_soname(const std::string& soname) {
       "libcuda.so",   "libcudart.so",  "libcublas.so", "libcublasLt.so", "libcudnn.so",
       "libcufft.so",  "libcurand.so",  "libcusparse.so", "libcusolver.so", "libcusolverMg.so",
       "libnccl.so",   "libnvrtc.so",  "libcupti.so",   "libnvidia-ml.so", "libnpp", "libnvjpeg.so",
-      "libnvidia-encode.so", "libcustatevec.so", "libcudss.so", "libnvJitLink.so",
-      "libnvfatbin.so", "libcusparseLt.so"};
+      "libnvidia-encode.so", "libcustatevec.so", "libcudss.so", "libnvJitLink.so", "libnvfatbin.so",
+      "libcusparseLt.so", "libcutensor.so", "libcutensornet.so"};
   for (const char* p : kPrefixes)
     if (soname.rfind(p, 0) == 0) return true;
   return false;
@@ -452,8 +452,8 @@ int cmd_run(const std::vector<std::string>& args) {
       static const char* kCuda[] = {"libcuda.so.1", "libcudart.so", "libcublasLt.so", "libcublas.so",
                                     "libcudnn.so", "libcufft.so", "libcurand.so", "libcusparse.so",
                                     "libcusolver.so", "libnccl.so", "libnvrtc.so", "libcupti.so",
-                                    "libnvidia-ml.so.1", "libcustatevec.so", "libcudss.so",
-                                    "libnvJitLink.so", "libnvfatbin.so", "libcusparseLt.so"};
+                                    "libnvidia-ml.so.1", "libcustatevec.so", "libcudss.so", "libnvJitLink.so",
+                                    "libnvfatbin.so", "libcusparseLt.so", "libcutensor.so", "libcutensornet.so"};
       for (const char* stem : kCuda) {
         std::string found;
         if (std::string(stem).find(".so.") != std::string::npos) {
