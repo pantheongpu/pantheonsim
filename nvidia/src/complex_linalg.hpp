@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -441,6 +442,255 @@ inline void svd(const CMat& in, int m, int n, bool full, std::vector<double>* s,
     for (int j = 0; j < vcols; ++j)
       for (int i = 0; i < n; ++i) (*v)(i, j) = right(i, j);
   }
+}
+
+// ---- eigenvalues and right eigenvectors of a general complex matrix ----
+//
+// LAPACK's zgeev without balancing: Householder reduction to Hessenberg form
+// (zgehd2) with Q accumulated, the single-shift QR iteration of zlahqr --
+// Wilkinson shifts, exceptional shifts every 10 iterations without
+// deflation, Ahues-Kahan deflation -- to Schur form T = Q^H A Q, then each
+// eigenvector of T by back-substitution (ztrevc) carried back by Q. The
+// eigenvalues come out in the order zlahqr deflates them, which is LAPACK's.
+// Each vector has unit 2-norm and its largest component real and positive.
+// Returns 0, or i (1-based) when the QR iteration failed to converge, with
+// eigenvalues i+1..n correct (zhseqr's INFO).
+
+inline double cabs1(cd v) { return std::fabs(v.real()) + std::fabs(v.imag()); }
+
+// zlarfg: H = I - tau v v^H with v = (1, x) maps (alpha, x) to (beta, 0), beta real.
+inline cd larfg2(int n, cd& alpha, cd* x, size_t step) {
+  double xnorm = 0;
+  for (int i = 0; i < n - 1; ++i) xnorm = std::hypot(xnorm, std::abs(x[(size_t)i * step]));
+  if (n <= 1 || (xnorm == 0.0 && alpha.imag() == 0.0)) return 0.0;
+  const double ar = alpha.real(), ai = alpha.imag();
+  const double mag = std::sqrt(ar * ar + ai * ai + xnorm * xnorm);
+  const double beta = ar >= 0 ? -mag : mag;
+  const cd tau((beta - ar) / beta, -ai / beta);
+  const cd scal = 1.0 / (alpha - beta);
+  for (int i = 0; i < n - 1; ++i) x[(size_t)i * step] *= scal;
+  alpha = beta;
+  return tau;
+}
+
+inline int geev(const CMat& in, int n, std::vector<cd>* w, CMat* vr) {
+  w->assign((size_t)n, 0);
+  if (vr) {
+    vr->ld = std::max(n, 1);
+    vr->v.assign((size_t)vr->ld * n, 0);
+  }
+  if (n == 0) return 0;
+  CMat H{std::vector<cd>((size_t)n * n), n}, Z{std::vector<cd>((size_t)n * n, 0), n};
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < n; ++i) H(i, j) = in(i, j);
+  for (int i = 0; i < n; ++i) Z(i, i) = 1;
+
+  // zgehd2, accumulating Q = H(0) H(1) ... into Z from the right.
+  for (int i = 0; i + 1 < n; ++i) {
+    cd alpha = H(i + 1, i);
+    const int len = n - i - 1;
+    const cd tau = larfg2(len, alpha, len > 1 ? &H(i + 2, i) : nullptr, 1);
+    std::vector<cd> v((size_t)len);
+    v[0] = 1;
+    for (int k = 1; k < len; ++k) v[(size_t)k] = H(i + 1 + k, i);
+    if (tau != cd(0)) {
+      for (int r = 0; r < n; ++r) {  // right: H(:, i+1:) -= tau (H v) v^H
+        cd s = 0;
+        for (int k = 0; k < len; ++k) s += H(r, i + 1 + k) * v[(size_t)k];
+        s *= tau;
+        for (int k = 0; k < len; ++k) H(r, i + 1 + k) -= s * std::conj(v[(size_t)k]);
+      }
+      for (int c = i + 1; c < n; ++c) {  // left: H(i+1:, :) -= conj(tau) v (v^H H)
+        cd s = 0;
+        for (int k = 0; k < len; ++k) s += std::conj(v[(size_t)k]) * H(i + 1 + k, c);
+        s *= std::conj(tau);
+        for (int k = 0; k < len; ++k) H(i + 1 + k, c) -= v[(size_t)k] * s;
+      }
+      for (int r = 0; r < n; ++r) {  // Z := Z H(i)
+        cd s = 0;
+        for (int k = 0; k < len; ++k) s += Z(r, i + 1 + k) * v[(size_t)k];
+        s *= tau;
+        for (int k = 0; k < len; ++k) Z(r, i + 1 + k) -= s * std::conj(v[(size_t)k]);
+      }
+    }
+    H(i + 1, i) = alpha;
+    for (int k = i + 2; k < n; ++k) H(k, i) = 0;
+  }
+
+  // zlahqr with wantt and wantz, 0-based (LAPACK's I is i + 1 here).
+  const int ilo = 0, ihi = n - 1;
+  for (int i = ilo + 1; i <= ihi; ++i) {  // make the subdiagonal real
+    if (H(i, i - 1).imag() == 0.0) continue;
+    cd sc = H(i, i - 1) / cabs1(H(i, i - 1));
+    sc = std::conj(sc) / std::abs(sc);
+    H(i, i - 1) = std::abs(H(i, i - 1));
+    for (int j = i; j < n; ++j) H(i, j) *= sc;
+    for (int j = 0; j <= std::min(ihi, i + 1); ++j) H(j, i) *= std::conj(sc);
+    for (int j = 0; j < n; ++j) Z(j, i) *= std::conj(sc);
+  }
+  const double safmin = std::numeric_limits<double>::min();
+  const double ulp = std::numeric_limits<double>::epsilon();
+  const double smlnum = safmin * ((double)n / ulp);
+  const int itmax = 30 * std::max(10, n), kexsh = 10;
+  const double dat1 = 0.75;
+  int kdefl = 0;
+  int i = ihi;
+  while (i >= ilo) {
+    int l = ilo;
+    bool converged = false;
+    for (int its = 0; its <= itmax; ++its) {
+      int k;
+      for (k = i; k > l; --k) {
+        if (cabs1(H(k, k - 1)) <= smlnum) break;
+        double tst = cabs1(H(k - 1, k - 1)) + cabs1(H(k, k));
+        if (tst == 0.0) {
+          if (k - 2 >= ilo) tst += std::fabs(H(k - 1, k - 2).real());
+          if (k + 1 <= ihi) tst += std::fabs(H(k + 1, k).real());
+        }
+        if (std::fabs(H(k, k - 1).real()) <= ulp * tst) {
+          const double ab = std::max(cabs1(H(k, k - 1)), cabs1(H(k - 1, k)));
+          const double ba = std::min(cabs1(H(k, k - 1)), cabs1(H(k - 1, k)));
+          const double aa = std::max(cabs1(H(k, k)), cabs1(H(k - 1, k - 1) - H(k, k)));
+          const double bb = std::min(cabs1(H(k, k)), cabs1(H(k - 1, k - 1) - H(k, k)));
+          const double s = aa + ab;
+          if (ba * (ab / s) <= std::max(smlnum, ulp * (bb * (aa / s)))) break;
+        }
+      }
+      l = k;
+      if (l > ilo) H(l, l - 1) = 0;
+      if (l >= i) {
+        converged = true;
+        break;
+      }
+      ++kdefl;
+      cd t;
+      if (kdefl % (2 * kexsh) == 0) {
+        t = dat1 * std::fabs(H(i, i - 1).real()) + H(i, i);
+      } else if (kdefl % kexsh == 0) {
+        t = dat1 * std::fabs(H(l + 1, l).real()) + H(l, l);
+      } else {  // Wilkinson's shift
+        t = H(i, i);
+        const cd u = std::sqrt(H(i - 1, i)) * std::sqrt(H(i, i - 1));
+        double s = cabs1(u);
+        if (s != 0.0) {
+          const cd x = 0.5 * (H(i - 1, i - 1) - t);
+          const double sx = cabs1(x);
+          s = std::max(s, cabs1(x));
+          cd y = s * std::sqrt((x / s) * (x / s) + (u / s) * (u / s));
+          if (sx > 0.0 && (x / sx).real() * y.real() + (x / sx).imag() * y.imag() < 0.0) y = -y;
+          t -= u * (u / (x + y));
+        }
+      }
+      // Two consecutive small subdiagonal elements?
+      int m;
+      cd v[2];
+      for (m = i - 1; m > l; --m) {
+        const cd h11 = H(m, m), h22 = H(m + 1, m + 1);
+        cd h11s = h11 - t;
+        double h21 = H(m + 1, m).real();
+        const double s = cabs1(h11s) + std::fabs(h21);
+        h11s /= s;
+        h21 /= s;
+        v[0] = h11s;
+        v[1] = h21;
+        const double h10 = H(m, m - 1).real();
+        if (std::fabs(h10) * std::fabs(h21) <= ulp * (cabs1(h11s) * (cabs1(h11) + cabs1(h22)))) break;
+      }
+      if (m == l) {
+        cd h11s = H(l, l) - t;
+        double h21 = H(l + 1, l).real();
+        const double s = cabs1(h11s) + std::fabs(h21);
+        v[0] = h11s / s;
+        v[1] = h21 / s;
+      }
+      // The single-shift QR step.
+      for (int kk = m; kk <= i - 1; ++kk) {
+        if (kk > m) {
+          v[0] = H(kk, kk - 1);
+          v[1] = H(kk + 1, kk - 1);
+        }
+        const cd t1 = larfg2(2, v[0], &v[1], 1);
+        if (kk > m) {
+          H(kk, kk - 1) = v[0];
+          H(kk + 1, kk - 1) = 0;
+        }
+        const cd v2 = v[1];
+        const double t2 = (t1 * v2).real();
+        for (int j = kk; j < n; ++j) {
+          const cd sum = std::conj(t1) * H(kk, j) + t2 * H(kk + 1, j);
+          H(kk, j) -= sum;
+          H(kk + 1, j) -= sum * v2;
+        }
+        for (int j = 0; j <= std::min(kk + 2, i); ++j) {
+          const cd sum = t1 * H(j, kk) + t2 * H(j, kk + 1);
+          H(j, kk) -= sum;
+          H(j, kk + 1) -= sum * std::conj(v2);
+        }
+        for (int j = 0; j < n; ++j) {
+          const cd sum = t1 * Z(j, kk) + t2 * Z(j, kk + 1);
+          Z(j, kk) -= sum;
+          Z(j, kk + 1) -= sum * std::conj(v2);
+        }
+        if (kk == m && m > l) {  // keep H(m, m-1) real
+          cd temp = 1.0 - t1;
+          temp /= std::abs(temp);
+          H(m + 1, m) *= std::conj(temp);
+          if (m + 2 <= i) H(m + 2, m + 1) *= temp;
+          for (int j = m; j <= i; ++j) {
+            if (j == m + 1) continue;
+            for (int c = j + 1; c < n; ++c) H(j, c) *= temp;
+            for (int r = 0; r < j; ++r) H(r, j) *= std::conj(temp);
+            for (int r = 0; r < n; ++r) Z(r, j) *= std::conj(temp);
+          }
+        }
+      }
+      cd temp = H(i, i - 1);  // keep H(i, i-1) real
+      if (temp.imag() != 0.0) {
+        const double rtemp = std::abs(temp);
+        H(i, i - 1) = rtemp;
+        temp /= rtemp;
+        for (int c = i + 1; c < n; ++c) H(i, c) *= std::conj(temp);
+        for (int r = 0; r < i; ++r) H(r, i) *= temp;
+        for (int r = 0; r < n; ++r) Z(r, i) *= temp;
+      }
+    }
+    if (!converged) {
+      for (int r = i + 1; r < n; ++r) (*w)[(size_t)r] = H(r, r);
+      return i + 1;
+    }
+    (*w)[(size_t)i] = H(i, i);
+    kdefl = 0;
+    i = l - 1;
+  }
+  if (!vr) return 0;
+
+  // Eigenvectors of T, then Q x, normalized as zgeev leaves them.
+  for (int ki = n - 1; ki >= 0; --ki) {
+    const cd lambda = H(ki, ki);
+    const double smin = std::max(ulp * cabs1(lambda), smlnum);
+    std::vector<cd> x((size_t)ki + 1, 0);
+    x[(size_t)ki] = 1;
+    for (int k = ki - 1; k >= 0; --k) {
+      cd s = 0;
+      for (int j = k + 1; j <= ki; ++j) s += H(k, j) * x[(size_t)j];
+      cd d = H(k, k) - lambda;
+      if (cabs1(d) < smin) d = smin;
+      x[(size_t)k] = -s / d;
+    }
+    std::vector<cd> v((size_t)n, 0);
+    for (int r = 0; r < n; ++r)
+      for (int j = 0; j <= ki; ++j) v[(size_t)r] += Z(r, j) * x[(size_t)j];
+    double nrm = 0;
+    for (const cd& e : v) nrm = std::hypot(nrm, std::abs(e));
+    int big = 0;
+    for (int r = 1; r < n; ++r)
+      if (std::norm(v[(size_t)r]) > std::norm(v[(size_t)big])) big = r;
+    cd scale = nrm > 0 ? 1.0 / nrm : 1.0;
+    if (std::abs(v[(size_t)big]) > 0) scale *= std::conj(v[(size_t)big]) / std::abs(v[(size_t)big]);
+    for (int r = 0; r < n; ++r) (*vr)(r, ki) = v[(size_t)r] * scale;
+    (*vr)(big, ki) = std::abs((*vr)(big, ki));
+  }
+  return 0;
 }
 
 }  // namespace vgpu_la

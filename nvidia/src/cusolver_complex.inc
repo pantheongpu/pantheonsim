@@ -8,8 +8,8 @@
 // (potrf/potrs and batched), QR (geqrf, ungqr, unmqr), Hermitian eigen (heevd,
 // heevj and batched), SVD (gesvd, gesvdj and batched, gesvdaStridedBatched),
 // and complex types through the 64-bit X API (Xpotrf, Xpotrs, Xgeqrf,
-// Xsyevd). Not implemented: sytrf (symmetric indefinite), and Xgeev on a
-// complex matrix.
+// Xsyevd, Xgeev). The symmetric indefinite routines (sytrf, Xsytrs, sytri)
+// are in cusolver_api.cpp, one template for all four types.
 
 #include "complex_linalg.hpp"
 

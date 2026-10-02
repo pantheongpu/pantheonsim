@@ -460,6 +460,7 @@ if(CUDA_ABI_INCLUDE)
     "cufft:12:cufft_api"
     "cusparse:12:cusparse_api"
     "cusolver:12:cusolver_api"
+    "cusolverMg:12:cusolvermg_api"
     "nvrtc:13:nvrtc_api"
     "nvjpeg:13:nvjpeg_api"
   )
@@ -499,6 +500,13 @@ if(CUDA_ABI_INCLUDE)
               "${CMAKE_BINARY_DIR}/shim/lib${_lib}.so"
       COMMENT "Creating ${_lib} shim symlinks (soname lib${_lib}.so.${_ver})")
   endforeach()
+  # cusolverSp is part of libcusolver and reads cuSPARSE's matrix descriptors
+  # through cuSPARSE's getters, so like NVIDIA's libcusolver it links
+  # libcusparse.
+  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp)
+  target_link_libraries(vgpucusolver PRIVATE vgpucusparse)
+  # cusolverMg gathers a distributed matrix and runs cusolverDn on it.
+  target_link_libraries(vgpucusolvermg PRIVATE vgpucusolver)
 
   # ---------------------------------------------------------------------------
   # NPP. NVIDIA splits it across eleven shared objects that share one API
@@ -1274,7 +1282,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
                  "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
@@ -1289,8 +1297,9 @@ if(TARGET vgpucublas)
   # Driver and runtime entry points CUDA's samples reach for, checked against
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer
-  # access and peer copies have a peer, and a managed variable two devices.
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart")
+  # access and peer copies have a peer, and a managed variable two devices;
+  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both.
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
