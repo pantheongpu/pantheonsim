@@ -1,0 +1,150 @@
+name: SASS and PTX
+
+# Since the SASS executor (nvidia/docs/sass.md), a binary that carries SASS for
+# the simulated GPU runs it, as on the real driver, and its PTX runs only when
+# asked (VGPU_SASS=0) or when the executor lacks an instruction. The PTX
+# engine is still most programs' fallback and the SASS path's oracle, so it
+# needs its own coverage:
+#
+#   ptx     the build job's suite again with VGPU_SASS=0 (nightly and by
+#           hand: it repeats a 40-minute run).
+#   digest  representative e2e programs built for sm_75, sm_86, sm_90, sm_100
+#           and sm_120, each run on SASS and on PTX with VGPU_KERNEL_DIGEST,
+#           and the per-kernel memory digests compared
+#           (nvidia/tools/sass_ptx_digest.sh). Also on pull requests that touch
+#           either engine.
+#
+# Before the SASS executor merged, both jobs see no SASS path and pass with a
+# notice, so this workflow can land first.
+on:
+  schedule:
+    - cron: '53 5 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/exec/**
+      - src/ptx/**
+      - src/sass/**
+      - nvidia/src/**
+      - nvidia/tools/sass_ptx_digest.sh
+      - .github/workflows/sass-ptx.yml
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
+  ptx:
+    name: the suite on PTX (VGPU_SASS=0)
+    if: github.event_name != 'pull_request'
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    container:
+      # The build job's toolchain (Ubuntu's CUDA 12.0), so this is that job's
+      # run with only the engine changed.
+      image: ${{ needs.image.outputs.cuda12_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      NVCC_PREPEND_FLAGS: -ccbin g++-12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is there a SASS path?
+        id: sass
+        run: |
+          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          else echo "::notice::no SASS executor in this tree: every kernel already runs on PTX, nothing to repeat"; fi
+
+      - name: Install toolchain
+        if: steps.sass.outputs.here && !job.container.id
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
+
+      - name: Build
+        if: steps.sass.outputs.here
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Unit and end-to-end tests on PTX
+        if: steps.sass.outputs.here
+        env:
+          VGPU_SASS: '0'
+        # The build job's set, less the AMD tests, which VGPU_SASS does not
+        # touch.
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -E '^(pantheon_workloads|amd_.*|test_amd.*|.*ollama.*)$'
+
+  digest:
+    name: SASS and PTX leave the same memory
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      # CUDA 13: the only toolkit here that targets every generation (12.0
+      # stops at sm_90).
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      NVCC_PREPEND_FLAGS: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is there a SASS path?
+        id: sass
+        run: |
+          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          else echo "::notice::no SASS executor in this tree: nothing to compare"; fi
+
+      - name: Install CUDA 13
+        if: steps.sass.outputs.here && !job.container.id
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+
+      - name: Build the runtime shims
+        if: steps.sass.outputs.here
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target vgpucudart vgpucuda
+
+      - name: Compare
+        if: steps.sass.outputs.here
+        run: |
+          mkdir -p digest
+          VGPU_DIGEST_OUT="$PWD/digest" nvidia/tools/sass_ptx_digest.sh build 2>&1 | tee digest/summary.txt
+          exit "${PIPESTATUS[0]}"
+
+      - name: Keep the digests
+        if: failure() && steps.sass.outputs.here
+        uses: actions/upload-artifact@v4
+        with:
+          name: sass-ptx-digests
+          path: digest
+          retention-days: 14
