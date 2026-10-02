@@ -136,6 +136,7 @@ jobs:
 
       - name: Compare
         if: steps.sass.outputs.here
+        shell: bash
         run: |
           mkdir -p digest
           VGPU_DIGEST_OUT="$PWD/digest" nvidia/tools/sass_ptx_digest.sh build 2>&1 | tee digest/summary.txt
