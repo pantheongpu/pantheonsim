@@ -681,9 +681,10 @@ if(CUDA_ABI_INCLUDE)
   # with no version tag, so these carry none.
   # ---------------------------------------------------------------------------
   set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
-  file(WRITE "${_nvcomp_map}" "{\n  global: nvcomp*;\n  local: *;\n};\n")
+  file(WRITE "${_nvcomp_map}"
+       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; };\n  local: *;\n};\n")
   add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
-              nvidia/src/nvcomp_gdeflate.cpp)
+              nvidia/src/nvcomp_gdeflate.cpp nvidia/src/nvcomp_manager.cpp)
   target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
   target_include_directories(vgpunvcomp PRIVATE ${CUDA_ABI_INCLUDE} include)
   set_target_properties(vgpunvcomp PROPERTIES OUTPUT_NAME nvcomp SOVERSION 5 VERSION 5.3)
@@ -1417,7 +1418,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvshmem_host:nvshmem_host"
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvshmem_host:nvshmem_host"
                  "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)

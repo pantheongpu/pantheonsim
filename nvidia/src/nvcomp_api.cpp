@@ -11,7 +11,7 @@
 //
 // GDeflate is NVIDIA's own rearrangement of DEFLATE for SIMD decoding,
 // published as an Internet-Draft (draft-uralsky-gdeflate-00); see
-// nvcomp_gdeflate.cpp.
+// nvcomp_gdeflate.cpp. The C++ manager API is nvcomp_manager.cpp.
 //
 // Cascaded, Bitcomp and ANS are NVIDIA's own formats too, but their bitstreams
 // are not publicly specified. Decoding NVIDIA's output would mean reverse
@@ -37,16 +37,16 @@
 
 #include "nvcomp_codecs.hpp"
 #include "nvcomp_gdeflate.hpp"
+#include "nvcomp_internal.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/runtime/capture.hpp"
 #include "vgpu/runtime/shim_memory.hpp"
 
-namespace {
+namespace vgpu::nvcomp_impl {
 
 using vgpu::codec::Bytes;
 using vgpu::codec::Result;
 
-enum class Fmt { LZ4, Snappy, Deflate, Gdeflate, Gzip, Zstd };
 
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
@@ -183,6 +183,14 @@ Result decompress(Fmt f, const uint8_t* in, size_t n, uint8_t* out, size_t cap, 
   }
   return Result::Corrupt;
 }
+
+}  // namespace vgpu::nvcomp_impl
+
+namespace {
+
+using namespace vgpu::nvcomp_impl;
+using vgpu::codec::Bytes;
+using vgpu::codec::Result;
 
 // ---- the batched operations ----------------------------------------------------
 

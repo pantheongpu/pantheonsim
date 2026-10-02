@@ -84,6 +84,22 @@ every stream NVIDIA's library wrote word for word -- and NVIDIA's library
 decodes this encoder's streams in every block layout, including the
 multi-block, stored and fixed-Huffman ones nvCOMP never writes itself.
 
+The high-level interface -- `nvcomp::LZ4Manager` and its siblings, their
+configurations, `create_manager` and `get_compression_format` -- is the C++
+classes NVIDIA's headers declare, laid out member for member and vtable slot
+for vtable slot (`nvidia/include/vgpu_nvcomp.hpp`), so a program compiled
+against either header runs on either library. A manager cuts a buffer into
+chunks and writes nvCOMP's container (`NVCOMP_NATIVE`), the bare bitstream
+(`RAW`) or the bitstream after its uncompressed size (`WITH_UNCOMPRESSED_SIZE`:
+4 bytes for LZ4, 8 for the others). The container's layout is not documented;
+it is what NVIDIA's library writes, measured on the card -- a 64-byte header,
+the format's `formatSpec.hpp` struct, each chunk's offset and size, the chunks
+8-byte aligned -- and each library reads the other's
+(`nvidia/tests/e2e/nvcomp_manager.cpp`). The container can also carry
+checksums whose algorithm is not public (no standard CRC or hash matches
+them): a policy that computes them is refused, and one that verifies them if
+present decompresses and reports `nvcompErrorCannotVerifyChecksums`.
+
 The compressed bytes differ from NVIDIA's (another encoder makes other
 choices); the decompressed bytes never do. The queries -- alignments, maximum
 output sizes, status strings, which options are refused -- answer what nvCOMP
@@ -150,7 +166,7 @@ are not the simulator's to ship.
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration, batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
-| nvCOMP | `libnvcomp.so.5` | the low-level batched API for LZ4, Snappy, Deflate, GDeflate, Gzip and Zstd, interoperable with NVIDIA's in both directions, and CRC32; Cascaded, Bitcomp and ANS refused (no public bitstream) |
+| nvCOMP | `libnvcomp.so.5` | the low-level batched API and the C++ manager API for LZ4, Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, and CRC32; Cascaded, Bitcomp and ANS refused (no public bitstream) |
 | NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID; the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; the image is PTX (below) |
@@ -474,9 +490,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   configuration (accepted, nothing to configure).
 - **nvCOMP**: Cascaded, Bitcomp and ANS, whose bitstreams NVIDIA does not
   publish -- every entry point answers `nvcompErrorNotSupported` -- and LZ4's
-  bitshuffle option, likewise; the high-level manager API (`nvcompManager`,
-  C++), the CPU and streaming gzip APIs, and the hardware decompression
-  engine (the backend option is accepted; everything runs on the host).
+  bitshuffle option, likewise; the container's checksums (their algorithm is
+  not public: computing them is refused, verifying them reports
+  `nvcompErrorCannotVerifyChecksums`); the CPU and streaming gzip APIs; and
+  the hardware decompression engine (the backend option is accepted;
+  everything runs on the host).
 - **NVSHMEM**: the MPI and OpenSHMEM bootstraps (refused by name: use the
   unique ID), PEs on more than one node and proxy or network transports, NVLink
   SHARP multicast (`nvshmemx_mc_ptr` is NULL), host-side reductions, the
