@@ -1883,3 +1883,4 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsytrs(cusolverDnHandle_t h, cublasFillMo
 }
 
 #include "cusolver_dense_more.inc"
+#include "cusolver_irs.inc"
