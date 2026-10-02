@@ -23,7 +23,7 @@
 // projections (projSize != hiddenSize), skip-input mode, dropout between
 // layers during training (random, so nothing to compare against), and other
 // data types.
-#include <cudnn.h>
+#include "cudnn_common.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -48,8 +48,6 @@ cudnnStatus_t refuse(const char* fn, const char* why) {
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", fn, why);
   return CUDNN_STATUS_NOT_SUPPORTED;
 }
-
-struct Dropout { float p = 0.0f; };
 
 struct Rnn {
   cudnnRNNMode_t mode = CUDNN_LSTM;
@@ -102,11 +100,11 @@ struct Data {
   }
 };
 
-std::mutex g_mu;
-std::set<const void*> g_live;
-template <class T> T* track(T* p) { std::lock_guard<std::mutex> l(g_mu); g_live.insert(p); return p; }
-bool known(const void* p) { std::lock_guard<std::mutex> l(g_mu); return p && g_live.count(p); }
-void untrack(const void* p) { std::lock_guard<std::mutex> l(g_mu); g_live.erase(p); }
+// The library's one registry (cudnn_common.hpp): the dropout descriptor an
+// RNN takes is the classic API's.
+using vgpu_cudnn::known;
+using vgpu_cudnn::track;
+using vgpu_cudnn::untrack;
 
 std::vector<float> fetch(const void* dev, size_t n) {
   std::vector<float> h(n, 0.0f);
@@ -283,36 +281,7 @@ cudnnStatus_t resolve(cudnnRNNDescriptor_t rd, cudnnRNNDataDescriptor_t xd, cudn
 
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
-/* ---- dropout ---- */
-
-VGPU_EXPORT cudnnStatus_t cudnnCreateDropoutDescriptor(cudnnDropoutDescriptor_t* d) {
-  if (!d) return CUDNN_STATUS_BAD_PARAM;
-  *d = reinterpret_cast<cudnnDropoutDescriptor_t>(track(new Dropout()));
-  return CUDNN_STATUS_SUCCESS;
-}
-VGPU_EXPORT cudnnStatus_t cudnnDestroyDropoutDescriptor(cudnnDropoutDescriptor_t d) {
-  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
-  untrack(d);
-  delete reinterpret_cast<Dropout*>(d);
-  return CUDNN_STATUS_SUCCESS;
-}
-// The generator's state: this library draws no random numbers (dropout
-// inside an RNN is refused when it would apply), so a token amount.
-VGPU_EXPORT cudnnStatus_t cudnnDropoutGetStatesSize(cudnnHandle_t, size_t* size) {
-  if (!size) return CUDNN_STATUS_BAD_PARAM;
-  *size = 256;
-  return CUDNN_STATUS_SUCCESS;
-}
-VGPU_EXPORT cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t, float p, void*,
-                                                    size_t, unsigned long long) {
-  if (!known(d) || p < 0.0f || p > 1.0f) return CUDNN_STATUS_BAD_PARAM;
-  reinterpret_cast<Dropout*>(d)->p = p;
-  return CUDNN_STATUS_SUCCESS;
-}
-VGPU_EXPORT cudnnStatus_t cudnnRestoreDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t h, float p,
-                                                        void* states, size_t size, unsigned long long seed) {
-  return cudnnSetDropoutDescriptor(d, h, p, states, size, seed);
-}
+// The dropout descriptor and its calls are the classic API's (cudnn_api.cpp).
 
 /* ---- descriptors ---- */
 
@@ -343,7 +312,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSetRNNDescriptor_v8(cudnnRNNDescriptor_t d, cudnn
   r->bias = bias;
   r->dirs = dir == CUDNN_BIDIRECTIONAL ? 2 : 1;
   r->in = in, r->hid = hid, r->layers = layers;
-  r->dropout = known(drop) ? reinterpret_cast<Dropout*>(drop)->p : 0.0f;
+  r->dropout = known(drop) ? reinterpret_cast<vgpu_cudnn::DropoutDesc*>(drop)->p : 0.0f;
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnCreateRNNDataDescriptor(cudnnRNNDataDescriptor_t* d) {

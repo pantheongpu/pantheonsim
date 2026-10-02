@@ -1,0 +1,228 @@
+// What libvgpucudnn's three sources share: the descriptor registry, the last
+// error message, and tensors on the host -- strided device memory of any of
+// cuDNN's element types read into logical order as doubles and written back --
+// plus the one convolution all of the classic API, and the backend API, run.
+//
+// Internal to the library: the namespace is hidden, so nothing here is
+// exported next to cuDNN's own names.
+#pragma once
+
+#include <cudnn.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+
+namespace vgpu_cudnn __attribute__((visibility("hidden"))) {
+
+inline bool quiet() {
+  const char* q = std::getenv("VGPU_QUIET");
+  return q && q[0] == '1';
+}
+inline bool trace() {
+  const char* t = std::getenv("VGPU_TRACE");
+  return t && t[0] == '1';
+}
+
+// Every classic descriptor (handles, tensors, filters, convolutions, ...) is
+// registered when created, so a stale or foreign pointer is refused rather
+// than dereferenced. One registry for the whole library: the RNN API takes the
+// dropout descriptor the classic API's dropout calls take. (cudnn_api.cpp)
+void* track_raw(void* p);
+bool known(const void* p);
+void untrack(const void* p);
+template <class T> T* track(T* p) { return static_cast<T*>(track_raw(p)); }
+
+// cudnnGetLastErrorString's message: the reason the last call on this thread
+// failed. fail() records it and returns the status; a NOT_SUPPORTED is also
+// printed (unless VGPU_QUIET=1), since it is this library declining work the
+// hardware would do.
+void set_last_error(const std::string& msg);
+std::string last_error();
+cudnnStatus_t fail(cudnnStatus_t s, const char* fn, const std::string& why);
+
+/* ---- element types ---- */
+
+inline size_t type_bytes(cudnnDataType_t t) {
+  switch (t) {
+    case CUDNN_DATA_HALF:
+    case CUDNN_DATA_BFLOAT16: return 2;
+    case CUDNN_DATA_DOUBLE:
+    case CUDNN_DATA_INT64: return 8;
+    case CUDNN_DATA_INT8:
+    case CUDNN_DATA_UINT8:
+    case CUDNN_DATA_BOOLEAN: return 1;
+    default: return 4;  // FLOAT, INT32, and the packed INT8x4/UINT8x4
+  }
+}
+// Types this library reads and writes element by element.
+inline bool storable(cudnnDataType_t t) {
+  switch (t) {
+    case CUDNN_DATA_FLOAT: case CUDNN_DATA_DOUBLE: case CUDNN_DATA_HALF: case CUDNN_DATA_BFLOAT16:
+    case CUDNN_DATA_INT8: case CUDNN_DATA_UINT8: case CUDNN_DATA_INT32: case CUDNN_DATA_INT64:
+    case CUDNN_DATA_BOOLEAN:
+      return true;
+    default: return false;
+  }
+}
+inline bool floating(cudnnDataType_t t) {
+  return t == CUDNN_DATA_FLOAT || t == CUDNN_DATA_DOUBLE || t == CUDNN_DATA_HALF || t == CUDNN_DATA_BFLOAT16;
+}
+const char* type_name(cudnnDataType_t t);
+
+float half_to_float(uint16_t h);
+uint16_t float_to_half(float f);  // round to nearest even
+float bf16_to_float(uint16_t b);
+uint16_t float_to_bf16(float f);  // round to nearest even
+
+// One element, decoded from / encoded to its bytes. Encoding rounds as the
+// hardware's conversions do: to nearest even, and integers saturate.
+double decode(cudnnDataType_t t, const uint8_t* p);
+void encode(cudnnDataType_t t, double v, uint8_t* p);
+// v as the type holds it.
+double round_to(cudnnDataType_t t, double v);
+
+// A scaling factor (alpha, beta): a double for double data, else a float.
+inline double scale_of(const void* p, cudnnDataType_t data, double dflt = 1.0) {
+  if (!p) return dflt;
+  if (data == CUDNN_DATA_DOUBLE) return *static_cast<const double*>(p);
+  return *static_cast<const float*>(p);
+}
+
+/* ---- tensors ---- */
+
+constexpr int kMaxRank = CUDNN_DIM_MAX;
+
+// A tensor's element type and shape. dims are logical (N, C, then spatial,
+// whatever the memory order); strides say where each lands, in elements.
+struct Layout {
+  cudnnDataType_t type = CUDNN_DATA_FLOAT;
+  int rank = 0;
+  int64_t dims[kMaxRank] = {};
+  int64_t strides[kMaxRank] = {};
+
+  size_t count() const {
+    if (!rank) return 0;
+    size_t n = 1;
+    for (int i = 0; i < rank; ++i) n *= static_cast<size_t>(dims[i]);
+    return n;
+  }
+  // Elements from the first to one past the last, as the strides lay them out.
+  size_t span() const {
+    if (!count()) return 0;
+    size_t s = 1;
+    for (int i = 0; i < rank; ++i) s += static_cast<size_t>((dims[i] - 1) * strides[i]);
+    return s;
+  }
+  bool same_dims(const Layout& o) const {
+    if (rank != o.rank) return false;
+    for (int i = 0; i < rank; ++i)
+      if (dims[i] != o.dims[i]) return false;
+    return true;
+  }
+  // Every element's own slot, none shared and none skipped.
+  bool packed() const;
+};
+
+// Packed strides for dims in NCHW order (row-major), or channels-last (NHWC:
+// C innermost, then the spatial dimensions, then N).
+void packed_strides(int rank, const int64_t* dims, bool channels_last, int64_t* strides);
+
+// Calls f(logical index, element offset) for every element in logical
+// (row-major) order.
+template <class F>
+void each(const Layout& t, F&& f) {
+  const size_t n = t.count();
+  int64_t idx[kMaxRank] = {};
+  size_t off = 0;
+  for (size_t i = 0; i < n; ++i) {
+    f(i, off);
+    for (int d = t.rank; d-- > 0;) {
+      if (++idx[d] < t.dims[d]) { off += static_cast<size_t>(t.strides[d]); break; }
+      off -= static_cast<size_t>((t.dims[d] - 1) * t.strides[d]);
+      idx[d] = 0;
+    }
+  }
+}
+
+// Device memory in logical order: read() copies the tensor's span to the host
+// and decodes it; write() encodes the values back over the span, leaving any
+// gaps between strided elements as they were.
+bool read(const Layout& t, const void* dev, std::vector<double>* out);
+bool write(const Layout& t, void* dev, const std::vector<double>& v);
+
+// out = alpha * r + beta * out, reading the prior output only when beta is
+// nonzero (cuDNN's rule, so a NaN-filled output with beta = 0 is fine). r is
+// rounded to the output's type by write().
+bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, double alpha, double beta);
+
+// Logical index of a coordinate in a row-major shape.
+inline size_t flat(const Layout& t, const int64_t* idx) {
+  size_t i = 0;
+  for (int d = 0; d < t.rank; ++d) i = i * static_cast<size_t>(t.dims[d]) + static_cast<size_t>(idx[d]);
+  return i;
+}
+
+/* ---- convolution ---- */
+
+// Up to three spatial dimensions, right-aligned into three (fewer are padded
+// with extent 1), groups, padding, stride, dilation, and convolution (filter
+// flipped) or cross-correlation.
+struct ConvGeom {
+  int64_t N = 0, C = 0, K = 0, G = 1, Cg = 0, Kg = 0;
+  int64_t in[3] = {1, 1, 1}, out[3] = {1, 1, 1}, flt[3] = {1, 1, 1};
+  int64_t pad[3] = {0, 0, 0}, str[3] = {1, 1, 1}, dil[3] = {1, 1, 1};
+  bool flip = false;
+};
+
+// The output extent one spatial dimension of a convolution gives.
+inline int64_t conv_out(int64_t in, int64_t pad, int64_t flt, int64_t str, int64_t dil) {
+  return 1 + (in + 2 * pad - ((flt - 1) * dil + 1)) / str;
+}
+
+// x: [N, C, sp...], w: [K, C/G, sp...], y: [N, K, sp...] (logical dims), and
+// the convolution's per-dimension settings. False, with the reason, when they
+// do not fit together.
+bool conv_geometry(const Layout& x, const Layout& w, const Layout& y, int nsp, const int64_t* pad,
+                   const int64_t* str, const int64_t* dil, bool flip, ConvGeom* g, std::string* why);
+
+enum class ConvDir { Forward, Data, Filter };
+// How the products are summed: exactly (in double, then rounded once when the
+// result is stored -- what float and double compute give, up to their own
+// summation order); in half precision, rounding after every step, as a
+// TRUE_HALF configuration does on the hardware; or in integers (INT8 data).
+enum class Accum { Exact, Half, Int };
+
+// Every output element of one direction, each as one sum, before alpha/beta:
+//   Forward: y[n,k,o]  = sum x[n,c,p] w[k,c',f]       (a = x,  b = w)
+//   Data:    dx[n,c,p] = sum dy[n,k,o] w[k,c',f]      (a = dy, b = w)
+//   Filter:  dw[k,c',f] = sum dy[n,k,o] x[n,c,p]      (a = dy, b = x)
+// over the taps that land inside the input. Inputs and the result are in
+// logical (packed NCHW) order.
+void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, const std::vector<double>& b,
+              std::vector<double>* out, Accum acc);
+
+// A dropout descriptor, which the classic API's dropout calls and the RNN
+// API both take. The generator's position (seed, elements drawn so far) lives
+// in the caller's states buffer when there is one, as cuDNN keeps its
+// generator there: cudnnRestoreDropoutDescriptor then resumes where the
+// buffer says, and a fresh cudnnSetDropoutDescriptor starts over.
+struct DropoutDesc {
+  float p = 0.0f;
+  void* states = nullptr;
+  size_t state_bytes = 0;
+  unsigned long long seed = 0;
+  uint64_t drawn = 0;  // when there is no states buffer to keep it in
+};
+
+// Waits for what the program queued on the handle's stream: this library
+// computes on the host, and the inputs must be there first.
+void sync_handle(cudnnHandle_t h);
+
+}  // namespace vgpu_cudnn
