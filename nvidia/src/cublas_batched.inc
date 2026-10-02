@@ -305,6 +305,8 @@ VGPU_EXPORT cublasStatus_t cublasHgemmStridedBatched(cublasHandle_t h, cublasOpe
                                                      int lda, long long sA, const __half* B, int ldb, long long sB,
                                                      const __half* beta, __half* C, int ldc, long long sC,
                                                      int batch) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (batch < 0) return CUBLAS_STATUS_INVALID_VALUE;   // as the card answers
   return cublasGemmStridedBatchedEx(h, ta, tb, m, n, k, alpha, A, CUDA_R_16F, lda, sA, B, CUDA_R_16F, ldb, sB, beta,
                                     C, CUDA_R_16F, ldc, sC, batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
 }

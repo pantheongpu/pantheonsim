@@ -790,7 +790,7 @@ cublasStatus_t getrf_batched(cublasHandle_t h, int n, T* const Aarray[], int lda
   const auto ptrs = fetch<T*>(Aarray, (size_t)batch);
   std::vector<int> all_info(batch, 0);
   for (int b = 0; b < batch; ++b) {
-    const auto hv = fetch<T>(ptrs[b], (size_t)lda * n);
+    const auto hv = fetch<T>(ptrs[b], extent(lda, n, n));
     std::vector<double> a(hv.begin(), hv.end());
     std::vector<int> ipiv;
     all_info[b] = lu_factor(a, n, lda, pivots ? &ipiv : nullptr);
@@ -816,8 +816,8 @@ cublasStatus_t getrs_batched(cublasHandle_t h, cublasOperation_t trans, int n, i
   const auto pa = fetch<const T*>(Aarray, (size_t)batch);
   const auto pb = fetch<T*>(Barray, (size_t)batch);
   for (int b = 0; b < batch; ++b) {
-    const auto av = fetch<T>(pa[b], (size_t)lda * n);
-    const auto bv = fetch<T>(pb[b], (size_t)ldb * nrhs);
+    const auto av = fetch<T>(pa[b], extent(lda, n, n));
+    const auto bv = fetch<T>(pb[b], extent(ldb, nrhs, n));
     std::vector<double> a(av.begin(), av.end()), x(bv.begin(), bv.end());
     std::vector<int> ipiv;
     if (pivots) ipiv = fetch<int>(pivots + (size_t)b * n, (size_t)n);
@@ -872,8 +872,8 @@ template <class T>
 cublasStatus_t trsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans, cublasDiagType_t diag,
                         int m, int n, T alpha, const T* A, int lda, T* B, int ldb) {
   const int k = side == CUBLAS_SIDE_LEFT ? m : n;
-  const auto av = fetch<T>(A, (size_t)lda * k);
-  const auto bv = fetch<T>(B, (size_t)ldb * n);
+  const auto av = fetch<T>(A, extent(lda, k, k));
+  const auto bv = fetch<T>(B, extent(ldb, n, m));
   const std::vector<double> a(av.begin(), av.end());
   std::vector<double> b(bv.begin(), bv.end());
   const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, t = trans != CUBLAS_OP_N, unit = diag == CUBLAS_DIAG_UNIT;
