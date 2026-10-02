@@ -118,6 +118,22 @@ echo "wrote $(pwd)/rdna4.gfx1201"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 rdna2.cpp -o rdna2.gfx1030
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1030 rdna2.cpp -o rdna2.w64.gfx1030
 echo "wrote $(pwd)/rdna2.gfx1030 and rdna2.w64.gfx1030"
+# hipCUB and rocThrust, which are headers compiled into the program, for a
+# wave64 target and a wave32 one in one program. Their headers come with
+# ROCm's hipcub-dev and rocthrust-dev, and need that ROCm's own hipcc
+# (PRIM_ROCM, where it is another ROCm than the one above). rocThrust uses
+# libhipcxx's <cuda/std/version> where it finds one, so a machine with CUDA's
+# libcu++ in /usr/include builds this with it moved out of the way. rocPRIM
+# builds every kernel for each GPU's tuning, so the bundle is compressed and
+# the program stripped: 2.5 MB rather than 40.
+prim=${PRIM_ROCM:-$rocm}
+"$prim/bin/hipcc" -O2 -std=c++17 -isystem "$prim/include" --offload-arch=gfx942 --offload-arch=gfx1100 \
+  --offload-compress -s prim.cpp -o prim.all
+echo "wrote $(pwd)/prim.all"
+# Where a work-group runs (__smid), on every target, in one program.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-arch=gfx950 --offload-arch=gfx90a \
+  --offload-arch=gfx1030 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
+echo "wrote $(pwd)/smid.all"
 # Arrays, textures and surfaces, for each RDNA generation's image resources.
 for arch in gfx1030 gfx1100 gfx1201; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch

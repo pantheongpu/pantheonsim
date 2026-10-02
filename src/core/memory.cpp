@@ -1,8 +1,13 @@
 #include "vgpu/memory.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -50,6 +55,47 @@ void store_at(uint8_t* p, uint32_t size, uint64_t v) {
     }
   }
   for (uint32_t i = 0; i < size; ++i) relaxed_store<uint8_t>(p + i, (v >> (8 * i)) & 0xff);
+}
+
+// Sixteen aligned bytes in place, as one access (MemoryManager::load_quad).
+// x86-64 with AVX moves them in one SSE instruction, which Intel and AMD
+// guarantee is atomic when aligned; without it, or elsewhere, each side takes
+// one of a set of locks striped by address.
+bool quad_is_one_instruction() {
+#if defined(__x86_64__)
+  static const bool avx = __builtin_cpu_supports("avx");
+  return avx;
+#else
+  return false;
+#endif
+}
+std::mutex& quad_lock(const uint8_t* p) {
+  static std::array<std::mutex, 64> locks;
+  return locks[(reinterpret_cast<uintptr_t>(p) >> 4) % locks.size()];
+}
+void load16(const uint8_t* p, uint64_t out[2]) {
+#if defined(__x86_64__)
+  if (quad_is_one_instruction() && reinterpret_cast<uintptr_t>(p) % 16 == 0) {
+    __m128i v;
+    asm volatile("movdqa %1, %0" : "=x"(v) : "m"(*reinterpret_cast<const __m128i*>(p)));
+    std::memcpy(out, &v, 16);
+    return;
+  }
+#endif
+  std::lock_guard<std::mutex> lock(quad_lock(p));
+  out[0] = load_at(p, 8), out[1] = load_at(p + 8, 8);
+}
+void store16(uint8_t* p, const uint64_t in[2]) {
+#if defined(__x86_64__)
+  if (quad_is_one_instruction() && reinterpret_cast<uintptr_t>(p) % 16 == 0) {
+    __m128i v;
+    std::memcpy(&v, in, 16);
+    asm volatile("movdqa %1, %0" : "=m"(*reinterpret_cast<__m128i*>(p)) : "x"(v));
+    return;
+  }
+#endif
+  std::lock_guard<std::mutex> lock(quad_lock(p));
+  store_at(p, 8, in[0]), store_at(p + 8, 8, in[1]);
 }
 
 // A `size`-byte scalar whose every byte is `b`, and whether `v` is one.
@@ -1005,6 +1051,49 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       break;
   }
   write(addr, &value, size);  // a managed host mapping, behind its own lock
+}
+
+void MemoryManager::load_quad(uint64_t addr, uint64_t out[2]) const {
+  // A fault armed for loads, or stuck cells, change what a load returns, and
+  // load_scalar applies them; the runtime attaches its faults to every device,
+  // so it is whether one is armed that counts, not whether any is attached.
+  const bool faulted = access_fault_ && (any_stuck() || (access_fault_->load_pending &&
+                                                         __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)));
+  if (addr % 16 || faulted || (host_maps_ && host_maps_->may_contain(addr))) {
+    out[0] = load_scalar(addr, 8), out[1] = load_scalar(addr + 8, 8);
+    return;
+  }
+  // Sixteen aligned bytes never straddle a chunk (kChunkSize is a multiple
+  // of 16).
+  uint64_t base = 0;
+  const Allocation& a = resolve(addr, 16, "device memory read", &base, /*writing=*/false, /*page_slack=*/true);
+  const uint64_t off = addr - base;
+  const uint8_t* chunk = a.chunks[off / kChunkSize].load(std::memory_order_acquire);
+  if (!chunk) {
+    out[0] = out[1] = 0;
+  } else if (is_uniform(chunk)) {
+    out[0] = out[1] = repeated(uniform_byte(chunk), 8);
+  } else {
+    load16(chunk + off % kChunkSize, out);
+  }
+}
+
+void MemoryManager::store_quad(uint64_t addr, const uint64_t in[2]) {
+  const bool faulted = access_fault_ && access_fault_->store_pending &&
+                       __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED);
+  if (addr % 16 || faulted || (host_maps_ && host_maps_->may_contain(addr))) {
+    store_scalar(addr, 8, in[0]), store_scalar(addr + 8, 8, in[1]);
+    return;
+  }
+  uint64_t base = 0;
+  auto& a = const_cast<Allocation&>(
+      resolve(addr, 16, "device memory write", &base, /*writing=*/false, /*page_slack=*/false));
+  const uint64_t off = addr - base;
+  const uint64_t chunk_idx = off / kChunkSize;
+  uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
+  if (is_uniform(chunk) && in[0] == in[1] && in[0] == repeated(uniform_byte(chunk), 8)) return;
+  if (!chunk || is_uniform(chunk)) chunk = materialize(a, chunk_idx);
+  store16(chunk + off % kChunkSize, in);
 }
 
 // Where a kernel's scalar load or store lives: bytes in a chunk (materialized

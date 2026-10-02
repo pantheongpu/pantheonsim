@@ -78,6 +78,16 @@ struct Dispatch {
   // the kernel finds through its hidden_multigrid_sync_arg argument.
   bool cooperative = false;
   uint64_t grid_sync = 0;
+  // How the device is laid out, which says where each work-group runs: what
+  // the hardware registers a wave reads to learn that (HW_ID, HW_ID1 and
+  // XCC_ID, which HIP's __smid reads) hold. Its compute dies, the shader
+  // engines in each, the shader arrays in each engine, and the units of each
+  // die -- compute units, or on RDNA the workgroup processors, each two
+  // compute units. Work-groups go to the dies in turn, and on each die to its
+  // engines in turn, then its arrays, then the units in them.
+  struct Layout {
+    uint32_t dies = 1, engines = 1, arrays = 1, units = 1;
+  } layout;
 };
 
 // What the GPU's performance counters would count for a dispatch: every
