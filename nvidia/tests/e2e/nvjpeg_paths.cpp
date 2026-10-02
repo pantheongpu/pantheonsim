@@ -135,6 +135,8 @@ static double psnr(const std::vector<unsigned char>& a, const std::vector<unsign
 }
 
 int main(int argc, char** argv) {
+  // Every line out as it is written, so a run that dies shows how far it got.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   // The fixtures are beside this source unless a directory is given.
   dir = argc > 1 ? argv[1] : std::string(__FILE__).substr(0, std::string(__FILE__).rfind('/')) + "/../../data/jpeg";
   const bool print = argc > 2 && std::strcmp(argv[2], "--print") == 0;

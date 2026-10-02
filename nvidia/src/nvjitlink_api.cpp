@@ -222,12 +222,18 @@ bool has_ptx_only(const Link& L) {
   return false;
 }
 
+// Whether SASS built for sm_<sass> runs on -arch: machine code carries over
+// within a major version only, to the same or a later minor (sm_80's runs on
+// sm_86 and sm_89, sm_100's on sm_103; none runs on another major, newer or
+// not) -- unlike PTX, which any later architecture compiles.
+bool sass_runs_on(uint32_t sass, uint32_t arch) { return sass / 10 == arch / 10 && sass <= arch; }
+
 // Relocatable SASS for -arch, as a link input. A cubin for an architecture
 // -arch cannot run is refused when it is added, as NVIDIA's refuses it
 // (NVJITLINK_ERROR_INVALID_INPUT, "ERROR 4: bad input:<name>" on CUDA 13.0's).
 nvJitLinkResult add_sass(Link& L, const void* data, size_t size, const std::string& label, std::string ptx = {}) {
   const uint32_t arch = vgpu::cuda::cubin_arch(data, size);
-  if (!vgpu::cuda::target_runs_on(arch, 0, L.arch_number, L.arch_suffix)) {
+  if (!sass_runs_on(arch, L.arch_number)) {
     L.error_log += "ERROR 4: bad input:" + label + "\n";
     return NVJITLINK_ERROR_INVALID_INPUT;
   }
@@ -285,7 +291,7 @@ nvJitLinkResult add_fatbin(Link& L, const void* data, size_t size, const std::st
     else if (im.kind == vgpu::cuda::kFatbinElf && !im.stored &&
              vgpu::cuda::cubin_relocatable(im.data.data(), im.data.size())) {
       const uint32_t a = vgpu::cuda::cubin_arch(im.data.data(), im.data.size());
-      if (vgpu::cuda::target_runs_on(a, 0, L.arch_number, L.arch_suffix)) {
+      if (sass_runs_on(a, L.arch_number)) {
         if (!sass || a > vgpu::cuda::cubin_arch(sass->data.data(), sass->data.size())) sass = &im;
       } else {
         other_sass = a;
