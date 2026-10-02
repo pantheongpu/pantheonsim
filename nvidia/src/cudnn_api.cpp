@@ -1910,12 +1910,56 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardInference(
                                                                     : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
-VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTraining(
-    cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha, const void* beta, const cudnnTensorDescriptor_t xd,
-    const void* x, const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale,
-    const void* bias, double exp_avg_factor, void* running_mean, void* running_var, double eps, void* save_mean,
-    void* save_inv_var) {
-  static const char* fn = "cudnnBatchNormalizationForwardTraining";
+namespace {
+// Batch normalization's fused forms (the Ex calls): y = act(bn(x) + z), the
+// add and the activation each optional. The activation is RELU or SWISH, the
+// two cuDNN fuses forward, and RELU alone backward (measured: the others are
+// NOT_SUPPORTED, a missing descriptor BAD_PARAM). The pre-activation value
+// goes to the reserve space, one float per element, for the backward pass,
+// which can also do without it, from y.
+struct BnFusion {
+  bool add = false;
+  const ActDesc* act = nullptr;  // null: no activation
+  const TensorDesc* Z = nullptr;
+  const void* z = nullptr;
+  void* reserve = nullptr;
+  size_t reserve_bytes = 0;
+};
+
+cudnnStatus_t bn_fusion(const char* fn, cudnnBatchNormOps_t ops, const void* zd, const void* z, const void* ad,
+                        const Layout& x, void* reserve, size_t reserve_bytes, BnFusion* f) {
+  if (ops == CUDNN_BATCHNORM_OPS_BN) return CUDNN_STATUS_SUCCESS;
+  if (ops != CUDNN_BATCHNORM_OPS_BN_ACTIVATION && ops != CUDNN_BATCHNORM_OPS_BN_ADD_ACTIVATION)
+    return BAD(fn, "unknown batch normalization ops");
+  if (!known(ad)) return BAD(fn, "a fused activation needs an activation descriptor");
+  f->act = static_cast<const ActDesc*>(ad);
+  if (f->act->mode != CUDNN_ACTIVATION_RELU && f->act->mode != CUDNN_ACTIVATION_SWISH)
+    return UNSUPPORTED(fn, "only RELU and SWISH are fused into batch normalization");
+  if (ops == CUDNN_BATCHNORM_OPS_BN_ADD_ACTIVATION) {
+    f->add = true;
+    f->Z = tdesc(zd);
+    if (!f->Z || !z) return BAD(fn, "the added tensor z is missing");
+    if (!f->Z->l.same_dims(x)) return BAD(fn, "z differs from x in shape");
+    f->z = z;
+  }
+  if (reserve && reserve_bytes >= x.count() * sizeof(float)) f->reserve = reserve, f->reserve_bytes = reserve_bytes;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+double fused_act(const ActDesc& a, double t) {
+  return a.mode == CUDNN_ACTIVATION_RELU ? (t > 0.0 ? t : 0.0) : t * sigmoid(a.swish_beta * t);
+}
+double fused_act_grad(const ActDesc& a, double t) {
+  if (a.mode == CUDNN_ACTIVATION_RELU) return t > 0.0 ? 1.0 : 0.0;
+  const double s = sigmoid(a.swish_beta * t);
+  return s + a.swish_beta * t * s * (1.0 - s);
+}
+
+cudnnStatus_t bn_forward_training(const char* fn, cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha,
+                                  const void* beta, const void* xd, const void* x, const void* yd, void* y,
+                                  const void* bnd, const void* scale, const void* bias, double exp_avg_factor,
+                                  void* running_mean, void* running_var, double eps, void* save_mean,
+                                  void* save_inv_var, const BnFusion& fuse) {
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd), *B = tdesc(bnd);
   if (!known(h) || !Y || !alpha || !beta || !x || !y || !scale || !bias)
     return BAD(fn, "invalid handle, descriptor or pointer");
@@ -1925,8 +1969,9 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTraining(
   if (s != CUDNN_STATUS_SUCCESS) return s;
   if (!X->l.same_dims(Y->l)) return BAD(fn, "x and y differ in shape");
   sync_handle(h);
-  std::vector<double> vx, hs, hb;
+  std::vector<double> vx, hs, hb, vz;
   if (!read(X->l, x, &vx) || !read(B->l, scale, &hs) || !read(B->l, bias, &hb)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (fuse.add && !read(fuse.Z->l, fuse.z, &vz)) return CUDNN_STATUS_EXECUTION_FAILED;
   const size_t np = g.params();
   std::vector<double> sum(np, 0.0), sq(np, 0.0), cnt(np, 0.0);
   for (int64_t n = 0; n < g.N; ++n)
@@ -1943,13 +1988,19 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTraining(
     inv[p] = 1.0 / std::sqrt(var[p] + eps);
   }
   std::vector<double> r(vx.size());
+  std::vector<float> pre(fuse.act ? vx.size() : 0);
   for (int64_t n = 0; n < g.N; ++n)
     for (int64_t c = 0; c < g.C; ++c)
       for (int64_t i = 0; i < g.S; ++i) {
         const size_t p = g.slot(c, i), at = static_cast<size_t>((n * g.C + c) * g.S + i);
-        r[at] = hs[p] * (vx[at] - mean[p]) * inv[p] + hb[p];
+        double t = hs[p] * (vx[at] - mean[p]) * inv[p] + hb[p];
+        if (fuse.add) t += vz[at];
+        if (fuse.act) pre[at] = static_cast<float>(t), t = fused_act(*fuse.act, t);
+        r[at] = t;
       }
   if (!blend_write(Y->l, y, r, sc(alpha, Y->l), sc(beta, Y->l))) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (fuse.reserve && cudaMemcpy(fuse.reserve, pre.data(), pre.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+    return CUDNN_STATUS_EXECUTION_FAILED;
   if (save_mean && !write(B->l, save_mean, mean)) return CUDNN_STATUS_EXECUTION_FAILED;
   if (save_inv_var && !write(B->l, save_inv_var, inv)) return CUDNN_STATUS_EXECUTION_FAILED;
   if (running_mean && running_var) {
@@ -1967,55 +2018,20 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTraining(
   return CUDNN_STATUS_SUCCESS;
 }
 
-// Workspace and reserve space: none, since the work is done on the host.
-VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
-    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnTensorDescriptor_t,
-    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t,
-    const cudnnActivationDescriptor_t, size_t* size) {
-  if (size) *size = 0;
-  return CUDNN_STATUS_SUCCESS;
-}
-VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationBackwardExWorkspaceSize(
-    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnTensorDescriptor_t,
-    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t,
-    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnActivationDescriptor_t, size_t* size) {
-  if (size) *size = 0;
-  return CUDNN_STATUS_SUCCESS;
-}
-VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
-    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnActivationDescriptor_t,
-    const cudnnTensorDescriptor_t, size_t* size) {
-  if (size) *size = 0;
-  return CUDNN_STATUS_SUCCESS;
-}
-
-// The Ex form without its fusions (an added tensor, an activation) is the
-// plain one; with them it is refused by name.
-VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTrainingEx(
-    cudnnHandle_t h, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops, const void* alpha, const void* beta,
-    const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t, const void*,
-    const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale, const void* bias,
-    double factor, void* running_mean, void* running_var, double eps, void* save_mean, void* save_inv_var,
-    cudnnActivationDescriptor_t, void*, size_t, void*, size_t) {
-  if (ops != CUDNN_BATCHNORM_OPS_BN)
-    return UNSUPPORTED("cudnnBatchNormalizationForwardTrainingEx",
-                       "only CUDNN_BATCHNORM_OPS_BN (no fused add or activation) is supported");
-  return cudnnBatchNormalizationForwardTraining(h, mode, alpha, beta, xd, x, yd, y, bnd, scale, bias, factor,
-                                                running_mean, running_var, eps, save_mean, save_inv_var);
-}
-
 // The gradient of y = scale * (x - mean) * inv + bias, per channel (spatial)
 // or per activation:
-//   dbias  = sum dy
-//   dscale = sum dy * xhat
-//   dx     = scale * inv / m * (m * dy - dbias - xhat * dscale)
-// with the saved mean and inverse deviation when given, else recomputed.
-VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackward(
-    cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha_data, const void* beta_data, const void* alpha_param,
-    const void* beta_param, const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t dyd,
-    const void* dy, const cudnnTensorDescriptor_t dxd, void* dx, const cudnnTensorDescriptor_t bnd, const void* scale,
-    void* dscale_out, void* dbias_out, double eps, const void* saved_mean, const void* saved_inv) {
-  static const char* fn = "cudnnBatchNormalizationBackward";
+//   dbias  = sum g
+//   dscale = sum g * xhat
+//   dx     = scale * inv / m * (m * g - dbias - xhat * dscale)
+// with the saved mean and inverse deviation when given, else recomputed. g is
+// dy, or for a fused form dy through the activation's derivative (and dz = g
+// when z was added).
+cudnnStatus_t bn_backward(const char* fn, cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha_data,
+                          const void* beta_data, const void* alpha_param, const void* beta_param, const void* xd,
+                          const void* x, const void* yd, const void* y, const void* dyd, const void* dy,
+                          const void* dzd, void* dz, const void* dxd, void* dx, const void* bnd, const void* scale,
+                          const void* bias, void* dscale_out, void* dbias_out, double eps, const void* saved_mean,
+                          const void* saved_inv, const BnFusion& fuse) {
   const TensorDesc *X = tdesc(xd), *DY = tdesc(dyd), *DX = tdesc(dxd), *B = tdesc(bnd);
   if (!known(h) || !DY || !DX || !alpha_data || !beta_data || !alpha_param || !beta_param || !x || !dy || !dx ||
       !scale)
@@ -2024,11 +2040,32 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackward(
   cudnnStatus_t s = bn_check(fn, mode, X, B, &g);
   if (s != CUDNN_STATUS_SUCCESS) return s;
   if (!X->l.same_dims(DY->l) || !X->l.same_dims(DX->l)) return BAD(fn, "x, dy and dx differ in shape");
+  const TensorDesc *Y = tdesc(yd), *DZ = tdesc(dzd);
+  // Measured: the hardware's fused backward pass takes RELU only.
+  if (fuse.act && fuse.act->mode != CUDNN_ACTIVATION_RELU)
+    return UNSUPPORTED(fn, "only RELU is fused into batch normalization's backward pass");
+  if (fuse.act && !fuse.reserve && (!Y || !y || !Y->l.same_dims(X->l)))
+    return BAD(fn, "a fused activation's backward pass needs y or the reserve space");
+  if (fuse.add && (!DZ || !dz || !DZ->l.same_dims(X->l))) return BAD(fn, "the fused add's gradient dz is missing");
   const double ad = sc(alpha_data, DX->l), bd = sc(beta_data, DX->l);
   const double ap = sc(alpha_param, B->l), bp = sc(beta_param, B->l);
   sync_handle(h);
   std::vector<double> vx, vdy, hs;
   if (!read(X->l, x, &vx) || !read(DY->l, dy, &vdy) || !read(B->l, scale, &hs)) return CUDNN_STATUS_EXECUTION_FAILED;
+  if (fuse.act) {
+    std::vector<double> t;
+    if (fuse.reserve) {
+      std::vector<float> pre(vx.size());
+      if (cudaMemcpy(pre.data(), fuse.reserve, pre.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return CUDNN_STATUS_EXECUTION_FAILED;
+      t.assign(pre.begin(), pre.end());
+    } else if (!read(Y->l, y, &t)) {  // RELU: y > 0 exactly where the pre-activation was
+      return CUDNN_STATUS_EXECUTION_FAILED;
+    }
+    for (size_t i = 0; i < vdy.size(); ++i) vdy[i] *= fused_act_grad(*fuse.act, t[i]);
+    if (fuse.add && !blend_write(DZ->l, dz, vdy, ad, bd)) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
+  (void)bias;  // the gradient does not depend on it
   const size_t np = g.params();
   std::vector<double> mean(np, 0.0), inv(np, 0.0), cnt(np, 0.0);
   for (int64_t n = 0; n < g.N; ++n)
@@ -2072,19 +2109,85 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackward(
   if (dbias_out && !blend_write(B->l, dbias_out, dbias, ap, bp)) return CUDNN_STATUS_EXECUTION_FAILED;
   return CUDNN_STATUS_SUCCESS;
 }
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTraining(
+    cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha, const void* beta, const cudnnTensorDescriptor_t xd,
+    const void* x, const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale,
+    const void* bias, double exp_avg_factor, void* running_mean, void* running_var, double eps, void* save_mean,
+    void* save_inv_var) {
+  return bn_forward_training("cudnnBatchNormalizationForwardTraining", h, mode, alpha, beta, xd, x, yd, y, bnd, scale,
+                             bias, exp_avg_factor, running_mean, running_var, eps, save_mean, save_inv_var, BnFusion{});
+}
+
+// Workspace: none, since the work is done on the host. Reserve space: the
+// fused forms keep the pre-activation value, a float per element.
+VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnTensorDescriptor_t,
+    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t,
+    const cudnnActivationDescriptor_t, size_t* size) {
+  if (size) *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationBackwardExWorkspaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t, const cudnnTensorDescriptor_t,
+    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t,
+    const cudnnTensorDescriptor_t, const cudnnTensorDescriptor_t, const cudnnActivationDescriptor_t, size_t* size) {
+  if (size) *size = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
+    cudnnHandle_t, cudnnBatchNormMode_t, cudnnBatchNormOps_t ops, const cudnnActivationDescriptor_t,
+    const cudnnTensorDescriptor_t xd, size_t* size) {
+  if (!size) return CUDNN_STATUS_BAD_PARAM;
+  const TensorDesc* X = tdesc(xd);
+  *size = ops != CUDNN_BATCHNORM_OPS_BN && X ? X->l.count() * sizeof(float) : 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTrainingEx(
+    cudnnHandle_t h, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops, const void* alpha, const void* beta,
+    const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t zd, const void* z,
+    const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale, const void* bias,
+    double factor, void* running_mean, void* running_var, double eps, void* save_mean, void* save_inv_var,
+    cudnnActivationDescriptor_t ad, void*, size_t, void* reserve, size_t reserve_bytes) {
+  static const char* fn = "cudnnBatchNormalizationForwardTrainingEx";
+  const TensorDesc* X = tdesc(xd);
+  if (!X) return BAD(fn, "x's descriptor is null, destroyed or never set");
+  BnFusion fuse;
+  cudnnStatus_t s = bn_fusion(fn, ops, zd, z, ad, X->l, reserve, reserve_bytes, &fuse);
+  if (s != CUDNN_STATUS_SUCCESS) return s;
+  return bn_forward_training(fn, h, mode, alpha, beta, xd, x, yd, y, bnd, scale, bias, factor, running_mean,
+                             running_var, eps, save_mean, save_inv_var, fuse);
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackward(
+    cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha_data, const void* beta_data, const void* alpha_param,
+    const void* beta_param, const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t dyd,
+    const void* dy, const cudnnTensorDescriptor_t dxd, void* dx, const cudnnTensorDescriptor_t bnd, const void* scale,
+    void* dscale_out, void* dbias_out, double eps, const void* saved_mean, const void* saved_inv) {
+  return bn_backward("cudnnBatchNormalizationBackward", h, mode, alpha_data, beta_data, alpha_param, beta_param, xd, x,
+                     nullptr, nullptr, dyd, dy, nullptr, nullptr, dxd, dx, bnd, scale, nullptr, dscale_out, dbias_out,
+                     eps, saved_mean, saved_inv, BnFusion{});
+}
 
 VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackwardEx(
     cudnnHandle_t h, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops, const void* alpha_data, const void* beta_data,
     const void* alpha_param, const void* beta_param, const cudnnTensorDescriptor_t xd, const void* x,
-    const cudnnTensorDescriptor_t, const void*, const cudnnTensorDescriptor_t dyd, const void* dy,
-    const cudnnTensorDescriptor_t, void*, const cudnnTensorDescriptor_t dxd, void* dx,
-    const cudnnTensorDescriptor_t bnd, const void* scale, const void*, void* dscale, void* dbias, double eps,
-    const void* saved_mean, const void* saved_inv, cudnnActivationDescriptor_t, void*, size_t, void*, size_t) {
-  if (ops != CUDNN_BATCHNORM_OPS_BN)
-    return UNSUPPORTED("cudnnBatchNormalizationBackwardEx",
-                       "only CUDNN_BATCHNORM_OPS_BN (no fused add or activation) is supported");
-  return cudnnBatchNormalizationBackward(h, mode, alpha_data, beta_data, alpha_param, beta_param, xd, x, dyd, dy, dxd,
-                                         dx, bnd, scale, dscale, dbias, eps, saved_mean, saved_inv);
+    const cudnnTensorDescriptor_t yd, const void* y, const cudnnTensorDescriptor_t dyd, const void* dy,
+    const cudnnTensorDescriptor_t dzd, void* dz, const cudnnTensorDescriptor_t dxd, void* dx,
+    const cudnnTensorDescriptor_t bnd, const void* scale, const void* bias, void* dscale, void* dbias, double eps,
+    const void* saved_mean, const void* saved_inv, cudnnActivationDescriptor_t ad, void*, size_t, void* reserve,
+    size_t reserve_bytes) {
+  static const char* fn = "cudnnBatchNormalizationBackwardEx";
+  const TensorDesc* X = tdesc(xd);
+  if (!X) return BAD(fn, "x's descriptor is null, destroyed or never set");
+  BnFusion fuse;
+  // The added tensor's gradient stands in for z when checking the fusion.
+  cudnnStatus_t s = bn_fusion(fn, ops, dzd, dz, ad, X->l, reserve, reserve_bytes, &fuse);
+  if (s != CUDNN_STATUS_SUCCESS) return s;
+  return bn_backward(fn, h, mode, alpha_data, beta_data, alpha_param, beta_param, xd, x, yd, y, dyd, dy, dzd, dz, dxd,
+                     dx, bnd, scale, bias, dscale, dbias, eps, saved_mean, saved_inv, fuse);
 }
 
 /* ---- dropout ---- */

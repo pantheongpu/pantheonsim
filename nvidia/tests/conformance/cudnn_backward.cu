@@ -4,7 +4,8 @@
 // convolution-bias-activation, and the backward passes of activation,
 // pooling, softmax and LRN; reductions with indices, op-tensor broadcasts,
 // transforms, dropout's backward pass from a known mask, and batch
-// normalization's backward pass in NHWC. The same binary runs against
+// normalization's backward pass in NHWC, with and without a fused add and
+// activation. The same binary runs against
 // NVIDIA's libcudnn.so.9 and against VirtualGPU's; the printed values must
 // agree (nvidia/tests/conformance/golden/cudnn_backward.rtx3060.txt holds what
 // an RTX 3060 printed).
@@ -470,6 +471,69 @@ static void batchnorm_nhwc() {
   }
 }
 
+// Batch normalization with a fused add and activation, in the one layout the
+// hardware fuses (NHWC, SPATIAL_PERSISTENT): forward and backward through
+// the reserve space the library asks for.
+static void batchnorm_fused() {
+  cudnnTensorDescriptor_t x = tensor4(CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, 2, 4, 3, 3), bnd;
+  cudnnCreateTensorDescriptor(&bnd);
+  CK(cudnnDeriveBNTensorDescriptor(bnd, x, CUDNN_BATCHNORM_SPATIAL_PERSISTENT));
+  cudnnActivationDescriptor_t ad;
+  cudnnCreateActivationDescriptor(&ad);
+  const float one = 1.0f, zero = 0.0f;
+  struct F { const char* tag; cudnnBatchNormOps_t ops; cudnnActivationMode_t act; };
+  for (const F& f : {F{"bn+relu", CUDNN_BATCHNORM_OPS_BN_ACTIVATION, CUDNN_ACTIVATION_RELU},
+                     F{"bn+add+relu", CUDNN_BATCHNORM_OPS_BN_ADD_ACTIVATION, CUDNN_ACTIVATION_RELU},
+                     F{"bn+swish", CUDNN_BATCHNORM_OPS_BN_ACTIVATION, CUDNN_ACTIVATION_SWISH}}) {
+    CK(cudnnSetActivationDescriptor(ad, f.act, CUDNN_NOT_PROPAGATE_NAN, 0.0));
+    const bool add = f.ops == CUDNN_BATCHNORM_OPS_BN_ADD_ACTIVATION;
+    size_t ws = 0, bws = 0, rs = 0;
+    CK(cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(H, CUDNN_BATCHNORM_SPATIAL_PERSISTENT, f.ops, x,
+                                                                add ? x : nullptr, x, bnd, ad, &ws));
+    // The fused backward pass takes RELU only.
+    const bool backward = f.act == CUDNN_ACTIVATION_RELU;
+    if (backward)
+      CK(cudnnGetBatchNormalizationBackwardExWorkspaceSize(H, CUDNN_BATCHNORM_SPATIAL_PERSISTENT, f.ops, x, x, x,
+                                                           add ? x : nullptr, x, bnd, ad, &bws));
+    CK(cudnnGetBatchNormalizationTrainingExReserveSpaceSize(H, CUDNN_BATCHNORM_SPATIAL_PERSISTENT, f.ops, ad, x, &rs));
+    Buf<float> X(72, 1.5f), Z(72, 0.7f, 2), Y(72, 0.0f), dy(72, 1.0f, 4), dx(72, 0.0f), dz(72, 0.0f),
+        scale(4, 0.5f, 3), bias(4, 0.2f, 5), mean(4, 0.0f), inv(4, 0.0f), dscale(4, 0.0f), dbias(4, 0.0f),
+        work((ws > bws ? ws : bws) / 4 + 1, 0.0f), reserve(rs / 4 + 1, 0.0f);
+    std::vector<float> s(4);
+    for (int i = 0; i < 4; ++i) s[i] = 0.75f + 0.1f * i;
+    cudaMemcpy(scale.p, s.data(), 16, cudaMemcpyHostToDevice);
+    CK(cudnnBatchNormalizationForwardTrainingEx(H, CUDNN_BATCHNORM_SPATIAL_PERSISTENT, f.ops, &one, &zero, x, X.p,
+                                                add ? x : nullptr, add ? Z.p : nullptr, x, Y.p, bnd, scale.p, bias.p,
+                                                0.1, nullptr, nullptr, 1e-5, mean.p, inv.p, ad, work.p, ws,
+                                                reserve.p, rs));
+    char tag[64];
+    std::snprintf(tag, sizeof tag, "%s fwd", f.tag);
+    dump(tag, Y.get());
+    if (!backward) {
+      std::printf("%s backward: status %d\n", f.tag,
+                  (int)cudnnBatchNormalizationBackwardEx(H, CUDNN_BATCHNORM_SPATIAL_PERSISTENT, f.ops, &one, &zero,
+                                                         &one, &zero, x, X.p, x, Y.p, x, dy.p, nullptr, nullptr, x,
+                                                         dx.p, bnd, scale.p, bias.p, dscale.p, dbias.p, 1e-5, mean.p,
+                                                         inv.p, ad, work.p, bws, reserve.p, rs));
+      continue;
+    }
+    CK(cudnnBatchNormalizationBackwardEx(H, CUDNN_BATCHNORM_SPATIAL_PERSISTENT, f.ops, &one, &zero, &one, &zero, x,
+                                         X.p, x, Y.p, x, dy.p, add ? x : nullptr, add ? dz.p : nullptr, x, dx.p, bnd,
+                                         scale.p, bias.p, dscale.p, dbias.p, 1e-5, mean.p, inv.p, ad, work.p, bws,
+                                         reserve.p, rs));
+    std::snprintf(tag, sizeof tag, "%s dx", f.tag);
+    dump(tag, dx.get());
+    if (add) {
+      std::snprintf(tag, sizeof tag, "%s dz", f.tag);
+      dump(tag, dz.get());
+    }
+    std::snprintf(tag, sizeof tag, "%s dscale", f.tag);
+    dump(tag, dscale.get());
+    std::snprintf(tag, sizeof tag, "%s dbias", f.tag);
+    dump(tag, dbias.get());
+  }
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("cudnnCreate failed\n");
@@ -485,6 +549,7 @@ int main() {
   arithmetic();
   dropout();
   batchnorm_nhwc();
+  batchnorm_fused();
   cudnnDestroy(H);
   return 0;
 }

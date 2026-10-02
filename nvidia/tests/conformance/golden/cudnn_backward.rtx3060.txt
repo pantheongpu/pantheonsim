@@ -137,3 +137,14 @@ bn nhwc per-activation fwd               n=120 abs=2.955151e+02 sq=1.039610e+03 
 bn nhwc per-activation dx                n=120 abs=6.444530e+01 sq=1.118940e+02 wabs=2.526700e+02
 bn nhwc per-activation dscale            n=40 abs=7.078451e+01 sq=1.542790e+02 wabs=2.860248e+02
 bn nhwc per-activation dbias             n=40 abs=2.652002e+01 sq=2.497607e+01 wabs=1.048377e+02
+bn+relu fwd                              n=72 abs=2.260561e+01 sq=2.100023e+01 wabs=9.313468e+01
+bn+relu dx                               n=72 abs=1.332738e+01 sq=3.601179e+00 wabs=5.132837e+01
+bn+relu dscale                           n=4 abs=2.333911e+01 sq=1.362173e+02 wabs=5.841170e+01
+bn+relu dbias                            n=4 abs=2.013843e+01 sq=1.014009e+02 wabs=5.046670e+01
+bn+add+relu fwd                          n=72 abs=2.873169e+01 sq=3.294747e+01 wabs=1.165877e+02
+bn+add+relu dx                           n=72 abs=1.544792e+01 sq=4.879043e+00 wabs=6.106230e+01
+bn+add+relu dz                           n=72 abs=2.254282e+01 sq=1.881899e+01 wabs=8.240059e+01
+bn+add+relu dscale                       n=4 abs=2.338352e+01 sq=1.370996e+02 wabs=5.960975e+01
+bn+add+relu dbias                        n=4 abs=1.716541e+01 sq=7.460085e+01 wabs=4.486360e+01
+bn+swish fwd                             n=72 abs=2.501652e+01 sq=1.371083e+01 wabs=1.031981e+02
+bn+swish backward: status 3000

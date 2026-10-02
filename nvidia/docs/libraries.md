@@ -74,7 +74,7 @@ output. Anything that differs is a bug in this implementation.
 | `cublas_gemm` | every GEMM path bit-identical, mixed precision included; level‑1/2 to ~1e‑7 |
 | `lt_and_rand` | cuBLASLt bit-identical; cuRAND matches distribution and reseed semantics |
 | `cudnn_ops` | all 50 reported values bit-identical |
-| `cudnn_backward` | all 139 lines agree to 1e‑6 relative: the three convolution passes (groups, dilation, both modes, NHWC, strided, 3‑D, double), fused bias-activation, activation, pooling, softmax and LRN backward, reductions with every index identical, op-tensor, transforms, dropout's backward pass, NHWC batch normalization |
+| `cudnn_backward` | all 150 lines agree to 1e‑6 relative: the three convolution passes (groups, dilation, both modes, NHWC, strided, 3‑D, double), fused bias-activation, activation, pooling, softmax and LRN backward, reductions with every index identical, op-tensor, transforms, dropout's backward pass, NHWC batch normalization with and without a fused add and activation |
 | `cudnn_types` | INT8 convolution identical to the integer; float-to-half and -bfloat16 bits identical; half and bfloat16 convolution, activation, pooling, softmax and batch normalization to 2e‑4 |
 | `cufft_transforms` | all 14 bit-identical, across composite, prime, 2‑D, 3‑D and both precisions |
 | `cusparse_ops` | all 15 bit-identical; CSR to CSC identical in every index and value, both bases, both value types, structure only and with values |
@@ -111,8 +111,9 @@ An LRN window of even size reaches one channel further up than down.
 `alpha * sum` rounded to nearest even and saturated. The algorithm lists have
 8, 6 and 7 entries (the max counts say 10, 8 and 9) with forward `DIRECT` and
 backward-filter `WINOGRAD` never runnable; dropout's reserve space is one bit
-per element, least significant first, rounded up to whole words. All of that
-is matched. Where the arithmetic order is the hardware's own choice it is not:
+per element, least significant first, rounded up to whole words; batch
+normalization fuses an add and RELU or SWISH forward, RELU alone backward.
+All of that is matched. Where the arithmetic order is the hardware's own choice it is not:
 float and double sums are accumulated exactly here and rounded once, a
 `TRUE_HALF` convolution accumulates in half in its own order, and the dropout
 mask comes from a different generator (kept fraction, scaling, reseeding and
@@ -273,8 +274,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   pointwise, reduction and normalization (resampling, attention, RNG,
   concatenation, ...), group normalization, normalization backward without
   the saved statistics, ragged and vectorized tensors, asymmetric padding; the
-  vectorized layouts (`NCHW_VECT_C`, INT8x4/INT8x32) and FP8 tensors; batch
-  normalization's fused add and activation; the cuDNN 8 normalization API,
+  vectorized layouts (`NCHW_VECT_C`, INT8x4/INT8x32) and FP8 tensors; the
+  cuDNN 8 normalization API,
   divisive normalization, spatial transformers, CTC loss, `cudnnIm2Col`,
   fused-ops plans and tensor transform descriptors; RNN dropout, projections
   and non-float RNNs.
