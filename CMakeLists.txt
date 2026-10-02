@@ -513,15 +513,20 @@ if(CUDA_ABI_INCLUDE)
 
   # ---------------------------------------------------------------------------
   # NPP. NVIDIA splits it across eleven shared objects that share one API
-  # surface, so one source is built into each under its own soname. The symbols
-  # are identical in every copy and ELF resolves a name to a single definition
-  # process-wide, so the duplication costs disk and nothing else.
+  # surface, so one set of objects is linked into each under its own soname
+  # (compiled once). The symbols are identical in every copy and ELF resolves a
+  # name to a single definition process-wide, so the duplication costs disk and
+  # nothing else.
   # ---------------------------------------------------------------------------
+  add_library(vgpunpp_objs OBJECT nvidia/src/npp_api.cpp nvidia/src/npp_imgproc.cpp)
+  set_target_properties(vgpunpp_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(vgpunpp_objs PRIVATE vgpu)
+  target_include_directories(vgpunpp_objs PRIVATE ${CUDA_ABI_INCLUDE})
   set(_vgpu_npp_libs nppc nppial nppicc nppidei nppif nppig nppim nppist nppisu nppitc npps)
   foreach(_npp IN LISTS _vgpu_npp_libs)
     vgpu_toolkit_soversion(${_npp} 13 _nppver)
     vgpu_version_script(${_npp} ${_nppver} _nppmap)
-    add_library(vgpu${_npp} SHARED nvidia/src/npp_api.cpp)
+    add_library(vgpu${_npp} SHARED $<TARGET_OBJECTS:vgpunpp_objs>)
     target_link_libraries(vgpu${_npp} PRIVATE vgpu vgpucudart)
     target_include_directories(vgpu${_npp} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_npp} PROPERTIES
@@ -1315,12 +1320,13 @@ if(TARGET vgpucublas)
   # temporary storage, decoupled look-back scan and warp primitives throughout
   # -- so running them end to end exercises far more than a hand-written kernel
   # does, and the answer is checked rather than the launch's return code.
-  # cuBLAS, cuSPARSE and cuDNN conformance programs against output an RTX 3060
-  # printed, so a routine that stops agreeing with the hardware fails without a GPU.
+  # cuBLAS, cuSPARSE, cuDNN and NPP conformance programs against output an RTX
+  # 3060 printed, so a routine that stops agreeing with the hardware fails
+  # without a GPU.
   add_test(NAME e2e_library_goldens
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_library_goldens.sh)
   set_tests_properties(e2e_library_goldens PROPERTIES
-    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn"
+    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn;vgpunppc;vgpunppig"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)

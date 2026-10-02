@@ -96,7 +96,7 @@ processes.
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
-| NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
+| NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring -- every entry point OpenCV, DALI, FFmpeg and the CUDA Samples call but four (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
 | NVENC | `libnvidia-encode.so.1` | video encode |
 
@@ -137,11 +137,12 @@ output. Anything that differs is a bug in this implementation.
 | `nccl_collectives` | all 24 bit-identical at two ranks on two physical GPUs |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
+| `npp_imgproc` | 289 results: every integer image identical (a dozen near-ties marked approximate, within a count on a pixel or two), floats to 1e‑5 -- warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and shifts, alpha compositing, gamma, demosaicing, lookup, statistics, histograms, integral images, rank and morphological filters, Prewitt gradients and Canny |
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
 | `multi_gpu` | all 13 identical to two physical GPUs |
 
-Four of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward` and
-`cudnn_types`, also run in CI on every pull request: `e2e_library_goldens`
+Five of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward`,
+`cudnn_types` and `npp_imgproc`, also run in CI on every pull request: `e2e_library_goldens`
 compiles them against the simulator alone and compares the output with what
 the RTX 3060 printed (`nvidia/tests/conformance/golden/`), so a change that
 makes a routine disagree with the hardware fails on a runner with no GPU.
@@ -287,8 +288,9 @@ formats represent exactly.
 
 ## Two NPP entry points that do not match, and why they say so
 
-Everything in the NPP subset is bit-identical to hardware except two, and both
-are excluded from the conformance comparison rather than quietly claimed:
+Everything in `npp_api.cpp`'s part of NPP is bit-identical to hardware except
+two, and both are excluded from the conformance comparison rather than quietly
+claimed (the image-processing half has its own list, below):
 
 - **`nppiFilter_32f_C1R`** (general convolution). Probing NVIDIA's
   implementation with delta kernels gives a mask-to-source mapping that aliases
@@ -303,6 +305,60 @@ are excluded from the conformance comparison rather than quietly claimed:
 Both are usable and both are documented as approximations. Getting an answer
 that is *close* to NVIDIA's is not the same as getting NVIDIA's, and this file
 is where the difference is written down.
+
+## NPP: what real programs call
+
+NPP has some ten thousand entry points; which of them matter was settled by
+reading the programs that use it -- OpenCV's cudaarithm, cudaimgproc,
+cudawarping and cudafilters (and its core), DALI, FFmpeg's `scale_npp`,
+jetson-utils, torchvision (which calls none) and the CUDA Samples -- and
+collecting every `npp*` name they call: 253 functions. 249 of them are
+implemented:
+
+| user | calls | here |
+| --- | --- | --- |
+| OpenCV | 194 | all: warps (affine, perspective, both directions, every depth and channel count), rotation, mirroring in place and not, the logical and shift operators with constants, magnitude, alpha compositing and premultiplication, gamma, channel swaps, masked and float mean/standard deviation, even and ranged histograms with their level and buffer helpers, rectangle standard deviation, windowed sums, box, max and min filters, dilation and erosion with masks, float thresholds, transpose |
+| DALI | 12 | all: `nppiRemap` at every depth it uses, `nppiCFAToRGB` 8- and 16-bit |
+| FFmpeg | 3 | all: `nppiResizeSqrPixel_8u_C1R` (nearest, linear, cubic), the YCbCr 4:2:0 plane layouts |
+| CUDA Samples | 51 | all but the two in `watershedSegmentationNPP`: Canny, Prewitt gradient vectors, `nppiLUT_Linear`, `nppiCompareC`, border-replicating box filter, constant-border copy, every allocator |
+| jetson-utils | 1 | `nppiCFAToRGB_8u_C1C3R` |
+
+What is left, ranked by those users: `nppiSegmentWatershed_8u_C1IR` and
+`nppiCompressMarkerLabelsUF_32u_C1IR` (with their buffer-size queries), one
+CUDA Sample between them -- both absent, so the sample fails at link time with
+the name. Beyond the list, nothing else of NPP's is implemented.
+
+The conventions NPP leaves unwritten were measured on an RTX 3060 against
+NPP 13.0 and are recorded at each function in `npp_core.hpp` and
+`npp_imgproc.cpp`; `npp_imgproc` (above) pins them. The few places that are
+not exact, and are marked so in that test rather than claimed:
+
+- **Cubic sampling** is four-point Lagrange interpolation in single
+  precision (an impulse a quarter pixel away gives -0.0547, 0.8203, 0.2734,
+  -0.0391). 8-bit and float results match; a 16-bit image has about one pixel
+  in a thousand a count apart, a 32-bit integer one a float ulp apart on about
+  one in ten.
+- **`nppiResizeSqrPixel`** cubic is a different kernel, not one of the Keys or
+  Mitchell-Netravali family; Lagrange stands in for it, a few counts away.
+  Super-sampling and Lanczos are not implemented (`NPP_INTERPOLATION_ERROR`).
+- **`nppiAlphaComp_8u_AC4R`**: every operator's alpha and every colour is
+  exact except the non-premultiplied ATOP and XOR colours, within one count.
+- **`nppiFilterCannyBorder`**: on NPP 13.0 the high threshold changes nothing
+  (an isolated step of magnitude 40 is an edge at thresholds 30 and 32767
+  alike); VirtualGPU does the same. With the Sobel kernel, the CUDA Samples'
+  parameters and moderate thresholds match pixel for pixel; a threshold down
+  in the noise leaves about ten of 1,500 pixels decided differently, and the
+  Scharr kernel some 25 -- its gradients are not the plain 3-10-3 ones.
+- **`nppiHistogramEven`**: NVIDIA's writes one or more entries past the
+  nLevels - 1 the documentation sizes the histogram for; VirtualGPU writes the
+  documented ones.
+- **`nppiDilate` and `nppiErode` with an off-centre anchor**: where the mask
+  reaches past the ROI on the side away from the anchor, NVIDIA's reads the
+  ROI's own edge pixels instead of the image beyond; VirtualGPU reads the
+  image, as the documentation describes, so those edge pixels can differ.
+  Centred anchors (the usual 3x3 with anchor 1,1) match.
+- `nppiRemap_16s` linear, and `nppiCFAToRGB` on a tie in its green
+  direction, can be a count apart on a pixel.
 
 ## NVRTC: the compiler is the compiler
 
@@ -446,11 +502,15 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `-maxrregcount`, `-Xptxas`, ...) are accepted and have nothing to act on.
 - **nvFatbin**: compression (`-compress` is accepted, nothing is compressed)
   and `nvFatbinAddIndex`, whose index names LTO-IR libraries.
-- **NPP**: a chosen subset -- allocation, per-pixel arithmetic and logic, data
-  exchange, colour conversion, thresholding, statistics, box filtering, 3x3
-  morphology, mirroring, resizing, and the signal-processing equivalents. The
-  rest of NPP's several thousand entry points are absent rather than
-  approximated, so a program that needs more fails at link time with a name.
+- **NPP**: the functions OpenCV, DALI, FFmpeg, jetson-utils and the CUDA
+  Samples call (see "NPP: what real programs call") plus the original subset
+  -- allocation, per-pixel arithmetic and logic, data exchange, colour
+  conversion, thresholding, statistics, filters, morphology, resizing, and
+  the signal-processing equivalents. Not implemented: watershed segmentation
+  and marker-label compression (one CUDA Sample), ResizeSqrPixel's
+  super-sampling and Lanczos modes, and the rest of NPP's ten thousand entry
+  points, which are absent rather than approximated, so a program that needs
+  more fails at link time with a name.
 - **nvJPEG**: 12-bit samples, arithmetic coding, lossless and hierarchical
   JPEG (refused by name, `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`); the hardware
   backend and what only it does (`nvjpegDecodeBatchedEx`, scaled decodes,

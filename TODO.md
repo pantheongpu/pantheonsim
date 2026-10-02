@@ -525,6 +525,18 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   copied quantisation tables. Decoded pixels match NVIDIA's nvJPEG 13.0 on an
   RTX 3060 on all but 10 of 5.5 million samples (within two counts), and every
   refusal is the card's. e2e_nvjpeg_paths passes against both libraries.
+- NPP: every entry point OpenCV (cudaarithm, cudaimgproc, cudawarping,
+  cudafilters), DALI, FFmpeg's scale_npp, jetson-utils and the CUDA Samples
+  call, but watershed segmentation and marker-label compression (one CUDA
+  Sample): warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and
+  shifts with constants, alpha compositing, gamma, Bayer demosaicing, LUT,
+  masked/float statistics, histograms, integral images, rank and morphological
+  filters, Prewitt gradients, Canny (nvidia/src/npp_imgproc.cpp,
+  npp_core.hpp). Sampling, rounding and fused-arithmetic conventions measured
+  on an RTX 3060 against NPP 13.0; npp_imgproc's 289 results match it (golden
+  in e2e_library_goldens), the near-ties listed in libraries.md marked.
+  Remaining: watershed, marker labels, ResizeSqrPixel super-sampling and
+  Lanczos, Scharr Canny's exact edges, the resize cubic kernel.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
