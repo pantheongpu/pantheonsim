@@ -40,6 +40,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/runtime/capture.hpp"
+#include "enum_value.hpp"
 
 // Operands are read from and written to the same virtual device memory the
 // kernels see, through the runtime shim's own copy path (declared by the CUDA
@@ -539,52 +540,58 @@ int device_sm_count() {
 VGPU_EXPORT cublasStatus_t cublasGetAtomicsMode(cublasHandle_t h, cublasAtomicsMode_t* mode) {
   return get_setting(h, mode, [](Handle* x) { return x->atomics; });
 }
+// Each setter reads its argument as an integer (enum_value.hpp) and checks
+// that before the value is used as the enum.
 VGPU_EXPORT cublasStatus_t cublasSetAtomicsMode(cublasHandle_t h, cublasAtomicsMode_t mode) {
-  return set_setting(h, mode == CUBLAS_ATOMICS_NOT_ALLOWED || mode == CUBLAS_ATOMICS_ALLOWED,
-                     [&](Handle* x) { x->atomics = mode; });
+  const int v = enum_value(mode);
+  return set_setting(h, v == CUBLAS_ATOMICS_NOT_ALLOWED || v == CUBLAS_ATOMICS_ALLOWED,
+                     [v](Handle* x) { x->atomics = (cublasAtomicsMode_t)v; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetSmCountTarget(cublasHandle_t h, int* target) {
   return get_setting(h, target, [](Handle* x) { return x->sm_count_target; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetSmCountTarget(cublasHandle_t h, int target) {
   return set_setting(h, valid(h) && target >= 0 && target <= device_sm_count(),
-                     [&](Handle* x) { x->sm_count_target = target; });
+                     [target](Handle* x) { x->sm_count_target = target; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetEmulationStrategy(cublasHandle_t h, vgpu_emu_strategy* s) {
   return get_setting(h, s, [](Handle* x) { return x->emulation_strategy; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetEmulationStrategy(cublasHandle_t h, vgpu_emu_strategy s) {
-  return set_setting(h, (int)s >= 0 && (int)s <= 2, [&](Handle* x) { x->emulation_strategy = (int)s; });
+  const int v = enum_value(s);
+  return set_setting(h, v >= 0 && v <= 2, [v](Handle* x) { x->emulation_strategy = v; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetEmulationSpecialValuesSupport(cublasHandle_t h, vgpu_emu_special* mask) {
   return get_setting(h, mask, [](Handle* x) { return x->emulation_special_values; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetEmulationSpecialValuesSupport(cublasHandle_t h, vgpu_emu_special mask) {
-  return set_setting(h, true, [&](Handle* x) { x->emulation_special_values = (int)mask; });
+  const int v = enum_value(mask);   // a bit mask: any combination is taken
+  return set_setting(h, true, [v](Handle* x) { x->emulation_special_values = v; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMantissaControl(cublasHandle_t h, vgpu_emu_mantissa* c) {
   return get_setting(h, c, [](Handle* x) { return x->mantissa_control; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMantissaControl(cublasHandle_t h, vgpu_emu_mantissa c) {
-  return set_setting(h, (int)c == 0 || (int)c == 1, [&](Handle* x) { x->mantissa_control = (int)c; });
+  const int v = enum_value(c);
+  return set_setting(h, v == 0 || v == 1, [v](Handle* x) { x->mantissa_control = v; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMaxMantissaBitCount(cublasHandle_t h, int* bits) {
   return get_setting(h, bits, [](Handle* x) { return x->max_mantissa_bits; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMaxMantissaBitCount(cublasHandle_t h, int bits) {
-  return set_setting(h, bits >= 0, [&](Handle* x) { x->max_mantissa_bits = bits; });
+  return set_setting(h, bits >= 0, [bits](Handle* x) { x->max_mantissa_bits = bits; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMantissaBitOffset(cublasHandle_t h, int* offset) {
   return get_setting(h, offset, [](Handle* x) { return x->mantissa_bit_offset; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMantissaBitOffset(cublasHandle_t h, int offset) {
-  return set_setting(h, true, [&](Handle* x) { x->mantissa_bit_offset = offset; });
+  return set_setting(h, true, [offset](Handle* x) { x->mantissa_bit_offset = offset; });
 }
 VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMantissaBitCountPointer(cublasHandle_t h, int** p) {
   return get_setting(h, p, [](Handle* x) { return x->mantissa_bit_count; });
 }
 VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMantissaBitCountPointer(cublasHandle_t h, int* p) {
-  return set_setting(h, true, [&](Handle* x) { x->mantissa_bit_count = p; });
+  return set_setting(h, true, [p](Handle* x) { x->mantissa_bit_count = p; });
 }
 VGPU_EXPORT size_t cublasGetCudartVersion(void) { return CUDART_VERSION; }
 

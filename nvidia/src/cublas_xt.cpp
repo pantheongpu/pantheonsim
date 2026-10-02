@@ -22,6 +22,8 @@
 #include <cublasXt.h>
 #include <cuda_runtime_api.h>
 
+#include "enum_value.hpp"
+
 #include <algorithm>
 #include <complex>
 #include <cstdint>
@@ -111,7 +113,21 @@ cublasStatus_t on_device(XtHandle* x, size_t i, Fn fn) {
   return st;
 }
 
-bool known_op(cublasOperation_t t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; }
+// The enum arguments are read as integers first (enum_value.hpp): a value
+// the enum does not declare is refused before it is ever used as the enum.
+bool known_op(int t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; }
+// Declared values of each enum (the routines refuse some of these themselves).
+bool fill_v(int v) { return v == CUBLAS_FILL_MODE_LOWER || v == CUBLAS_FILL_MODE_UPPER || v == CUBLAS_FILL_MODE_FULL; }
+bool op_v(int v) { return v >= CUBLAS_OP_N && v <= CUBLAS_OP_CONJG; }
+bool side_v(int v) { return v == CUBLAS_SIDE_LEFT || v == CUBLAS_SIDE_RIGHT; }
+bool diag_v(int v) { return v == CUBLAS_DIAG_NON_UNIT || v == CUBLAS_DIAG_UNIT; }
+// A selected handle, then enum arguments that are values of their enums
+// (INVALID_VALUE otherwise, as the card answers a bad fill mode or side).
+cublasStatus_t precheck(cublasXtHandle_t h, bool enums_ok) {
+  XtHandle* x = get(h);
+  if (!x || x->devices.empty()) return CUBLAS_STATUS_NOT_INITIALIZED;
+  return enums_ok ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
 
 // The routines by element type, onto the single-GPU API.
 template <class T> struct Blas;
@@ -140,9 +156,10 @@ cublasStatus_t xt_gemm(cublasXtHandle_t h, cublasOperation_t ta, cublasOperation
   if (!x || x->devices.empty()) return CUBLAS_STATUS_NOT_INITIALIZED;
   for (size_t v : {m, n, k, lda, ldb, ldc})
     if (!fits(v)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  const size_t arows = ta == CUBLAS_OP_N ? m : k, brows = tb == CUBLAS_OP_N ? k : n;
-  if (!known_op(ta) || !known_op(tb) || lda < std::max<size_t>(1, arows) || ldb < std::max<size_t>(1, brows) ||
-      ldc < std::max<size_t>(1, m))
+  const int tav = enum_value(ta), tbv = enum_value(tb);
+  if (!known_op(tav) || !known_op(tbv)) return CUBLAS_STATUS_INVALID_VALUE;
+  const size_t arows = tav == CUBLAS_OP_N ? m : k, brows = tbv == CUBLAS_OP_N ? k : n;
+  if (lda < std::max<size_t>(1, arows) || ldb < std::max<size_t>(1, brows) || ldc < std::max<size_t>(1, m))
     return CUBLAS_STATUS_INVALID_VALUE;
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   if (!m || !n) return CUBLAS_STATUS_SUCCESS;
@@ -319,17 +336,18 @@ VGPU_EXPORT cublasStatus_t cublasXtGetPinningMemMode(cublasXtHandle_t handle, cu
 VGPU_EXPORT cublasStatus_t cublasXtSetPinningMemMode(cublasXtHandle_t handle, cublasXtPinnedMemMode_t mode) {
   XtHandle* x = get(handle);
   if (!x) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (mode != CUBLASXT_PINNING_DISABLED && mode != CUBLASXT_PINNING_ENABLED) return CUBLAS_STATUS_INVALID_VALUE;
-  x->pinning = mode;
+  const int v = enum_value(mode);
+  if (v != CUBLASXT_PINNING_DISABLED && v != CUBLASXT_PINNING_ENABLED) return CUBLAS_STATUS_INVALID_VALUE;
+  x->pinning = (cublasXtPinnedMemMode_t)v;
   return CUBLAS_STATUS_SUCCESS;
 }
 VGPU_EXPORT cublasStatus_t cublasXtSetCpuRoutine(cublasXtHandle_t handle, cublasXtBlasOp_t blasOp,
                                                  cublasXtOpType_t type, void* blasFunctor) {
   XtHandle* x = get(handle);
   if (!x) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if ((int)blasOp < 0 || blasOp >= CUBLASXT_ROUTINE_MAX || (int)type < 0 || (int)type > 3)
-    return CUBLAS_STATUS_INVALID_VALUE;
-  x->cpu_routine[blasOp][type] = blasFunctor;
+  const int op = enum_value(blasOp), ty = enum_value(type);
+  if (op < 0 || op >= CUBLASXT_ROUTINE_MAX || ty < 0 || ty > 3) return CUBLAS_STATUS_INVALID_VALUE;
+  x->cpu_routine[op][ty] = blasFunctor;
   return CUBLAS_STATUS_SUCCESS;
 }
 VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXtBlasOp_t blasOp,
@@ -337,9 +355,9 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   XtHandle* x = get(handle);
   if (!x) return CUBLAS_STATUS_NOT_INITIALIZED;
   // The card checks the routine and type, not the ratio (2 and -1 are taken).
-  if ((int)blasOp < 0 || blasOp >= CUBLASXT_ROUTINE_MAX || (int)type < 0 || (int)type > 3)
-    return CUBLAS_STATUS_INVALID_VALUE;
-  x->cpu_ratio[blasOp][type] = ratio;
+  const int op = enum_value(blasOp), ty = enum_value(type);
+  if (op < 0 || op >= CUBLASXT_ROUTINE_MAX || ty < 0 || ty > 3) return CUBLAS_STATUS_INVALID_VALUE;
+  x->cpu_ratio[op][ty] = ratio;
   return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -355,6 +373,9 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   VGPU_EXPORT cublasStatus_t cublasXt##P##syrk(cublasXtHandle_t h, cublasFillMode_t u, cublasOperation_t t,       \
                                                size_t n, size_t k, const T* alpha, const T* A, size_t lda,        \
                                                const T* beta, T* C, size_t ldc) {                                 \
+    if (const cublasStatus_t st_ = precheck(h, fill_v(enum_value(u)) && op_v(enum_value(t)));                     \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ar = t == CUBLAS_OP_N ? n : k, ac = t == CUBLAS_OP_N ? k : n;                                    \
     return xt_whole(h, {n, k, lda, ldc},                                                                          \
                     {{A, nullptr, span_bytes<T>(lda, ac, ar)}, {C, C, span_bytes<T>(ldc, n, n)}},                 \
@@ -366,6 +387,9 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   VGPU_EXPORT cublasStatus_t cublasXt##P##syr2k(cublasXtHandle_t h, cublasFillMode_t u, cublasOperation_t t,      \
                                                 size_t n, size_t k, const T* alpha, const T* A, size_t lda,       \
                                                 const T* B, size_t ldb, const T* beta, T* C, size_t ldc) {        \
+    if (const cublasStatus_t st_ = precheck(h, fill_v(enum_value(u)) && op_v(enum_value(t)));                     \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ar = t == CUBLAS_OP_N ? n : k, ac = t == CUBLAS_OP_N ? k : n;                                    \
     return xt_whole(h, {n, k, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ac, ar)}, {B, nullptr, span_bytes<T>(ldb, ac, ar)},          \
@@ -378,6 +402,9 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   VGPU_EXPORT cublasStatus_t cublasXt##P##syrkx(cublasXtHandle_t h, cublasFillMode_t u, cublasOperation_t t,      \
                                                 size_t n, size_t k, const T* alpha, const T* A, size_t lda,       \
                                                 const T* B, size_t ldb, const T* beta, T* C, size_t ldc) {        \
+    if (const cublasStatus_t st_ = precheck(h, fill_v(enum_value(u)) && op_v(enum_value(t)));                     \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ar = t == CUBLAS_OP_N ? n : k, ac = t == CUBLAS_OP_N ? k : n;                                    \
     return xt_whole(h, {n, k, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ac, ar)}, {B, nullptr, span_bytes<T>(ldb, ac, ar)},          \
@@ -390,6 +417,9 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   VGPU_EXPORT cublasStatus_t cublasXt##P##symm(cublasXtHandle_t h, cublasSideMode_t s, cublasFillMode_t u,        \
                                                size_t m, size_t n, const T* alpha, const T* A, size_t lda,        \
                                                const T* B, size_t ldb, const T* beta, T* C, size_t ldc) {         \
+    if (const cublasStatus_t st_ = precheck(h, side_v(enum_value(s)) && fill_v(enum_value(u)));                   \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ka = s == CUBLAS_SIDE_LEFT ? m : n;                                                              \
     return xt_whole(h, {m, n, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ka, ka)}, {B, nullptr, span_bytes<T>(ldb, n, m)},            \
@@ -402,6 +432,10 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   VGPU_EXPORT cublasStatus_t cublasXt##P##trsm(cublasXtHandle_t h, cublasSideMode_t s, cublasFillMode_t u,        \
                                                cublasOperation_t t, cublasDiagType_t dg, size_t m, size_t n,      \
                                                const T* alpha, const T* A, size_t lda, T* B, size_t ldb) {        \
+    if (const cublasStatus_t st_ = precheck(h, side_v(enum_value(s)) && fill_v(enum_value(u)) &&                  \
+                                                 op_v(enum_value(t)) && diag_v(enum_value(dg)));                  \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ka = s == CUBLAS_SIDE_LEFT ? m : n;                                                              \
     return xt_whole(h, {m, n, lda, ldb},                                                                          \
                     {{A, nullptr, span_bytes<T>(lda, ka, ka)}, {B, B, span_bytes<T>(ldb, n, m)}},                 \
@@ -414,6 +448,10 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
                                                cublasOperation_t t, cublasDiagType_t dg, size_t m, size_t n,      \
                                                const T* alpha, const T* A, size_t lda, const T* B, size_t ldb,    \
                                                T* C, size_t ldc) {                                                \
+    if (const cublasStatus_t st_ = precheck(h, side_v(enum_value(s)) && fill_v(enum_value(u)) &&                  \
+                                                 op_v(enum_value(t)) && diag_v(enum_value(dg)));                  \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ka = s == CUBLAS_SIDE_LEFT ? m : n;                                                              \
     return xt_whole(h, {m, n, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ka, ka)}, {B, nullptr, span_bytes<T>(ldb, n, m)},            \
@@ -428,6 +466,9 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   VGPU_EXPORT cublasStatus_t cublasXt##P##spmm(cublasXtHandle_t h, cublasSideMode_t s, cublasFillMode_t u,        \
                                                size_t m, size_t n, const T* alpha, const T* AP, const T* B,       \
                                                size_t ldb, const T* beta, T* C, size_t ldc) {                     \
+    if (const cublasStatus_t st_ = precheck(h, side_v(enum_value(s)) && fill_v(enum_value(u)));                   \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ka = s == CUBLAS_SIDE_LEFT ? m : n;                                                              \
     if (!get(h)) return CUBLAS_STATUS_NOT_INITIALIZED;                                                            \
     if (!fits(ka)) return CUBLAS_STATUS_NOT_SUPPORTED;                                                            \
@@ -460,6 +501,9 @@ VGPU_XT(Z, cuDoubleComplex, double)
   VGPU_EXPORT cublasStatus_t cublasXt##P##hemm(cublasXtHandle_t h, cublasSideMode_t s, cublasFillMode_t u,        \
                                                size_t m, size_t n, const T* alpha, const T* A, size_t lda,        \
                                                const T* B, size_t ldb, const T* beta, T* C, size_t ldc) {         \
+    if (const cublasStatus_t st_ = precheck(h, side_v(enum_value(s)) && fill_v(enum_value(u)));                   \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ka = s == CUBLAS_SIDE_LEFT ? m : n;                                                              \
     return xt_whole(h, {m, n, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ka, ka)}, {B, nullptr, span_bytes<T>(ldb, n, m)},            \
@@ -472,6 +516,9 @@ VGPU_XT(Z, cuDoubleComplex, double)
   VGPU_EXPORT cublasStatus_t cublasXt##P##herk(cublasXtHandle_t h, cublasFillMode_t u, cublasOperation_t t,       \
                                                size_t n, size_t k, const R* alpha, const T* A, size_t lda,        \
                                                const R* beta, T* C, size_t ldc) {                                 \
+    if (const cublasStatus_t st_ = precheck(h, fill_v(enum_value(u)) && op_v(enum_value(t)));                     \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ar = t == CUBLAS_OP_N ? n : k, ac = t == CUBLAS_OP_N ? k : n;                                    \
     return xt_whole(h, {n, k, lda, ldc},                                                                          \
                     {{A, nullptr, span_bytes<T>(lda, ac, ar)}, {C, C, span_bytes<T>(ldc, n, n)}},                 \
@@ -483,6 +530,9 @@ VGPU_XT(Z, cuDoubleComplex, double)
   VGPU_EXPORT cublasStatus_t cublasXt##P##her2k(cublasXtHandle_t h, cublasFillMode_t u, cublasOperation_t t,      \
                                                 size_t n, size_t k, const T* alpha, const T* A, size_t lda,       \
                                                 const T* B, size_t ldb, const R* beta, T* C, size_t ldc) {        \
+    if (const cublasStatus_t st_ = precheck(h, fill_v(enum_value(u)) && op_v(enum_value(t)));                     \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ar = t == CUBLAS_OP_N ? n : k, ac = t == CUBLAS_OP_N ? k : n;                                    \
     return xt_whole(h, {n, k, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ac, ar)}, {B, nullptr, span_bytes<T>(ldb, ac, ar)},          \
@@ -495,6 +545,9 @@ VGPU_XT(Z, cuDoubleComplex, double)
   VGPU_EXPORT cublasStatus_t cublasXt##P##herkx(cublasXtHandle_t h, cublasFillMode_t u, cublasOperation_t t,      \
                                                 size_t n, size_t k, const T* alpha, const T* A, size_t lda,       \
                                                 const T* B, size_t ldb, const R* beta, T* C, size_t ldc) {        \
+    if (const cublasStatus_t st_ = precheck(h, fill_v(enum_value(u)) && op_v(enum_value(t)));                     \
+        st_ != CUBLAS_STATUS_SUCCESS)                                                                             \
+      return st_;                                                                                                 \
     const size_t ar = t == CUBLAS_OP_N ? n : k, ac = t == CUBLAS_OP_N ? k : n;                                    \
     return xt_whole(h, {n, k, lda, ldb, ldc},                                                                     \
                     {{A, nullptr, span_bytes<T>(lda, ac, ar)}, {B, nullptr, span_bytes<T>(ldb, ac, ar)},          \

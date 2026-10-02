@@ -36,6 +36,8 @@
 
 #include <cuda_runtime.h>
 
+#include "enum_value.hpp"
+
 namespace {
 
 bool quiet() {
@@ -63,10 +65,14 @@ constexpr int32_t kScaleVec16UE4M3 = 1, kScaleVec32UE8M0 = 2, kScaleVec128 = 4, 
 constexpr int kTypeUE8M0 = 30, kTypeFP4 = 33;
 
 struct MatmulDesc {
-  cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
-  cudaDataType scale = CUDA_R_32F;
-  cublasOperation_t transa = CUBLAS_OP_N, transb = CUBLAS_OP_N;
-  cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+  // The enumerated settings are kept as the integers the caller passed: a
+  // caller's value need not be one the enum declares (an FP4 type under
+  // CUDA 12.0's header, or a deliberately bad one), and loading such a value
+  // as the enum type is undefined. Each is checked as an integer.
+  int32_t compute = CUBLAS_COMPUTE_32F;
+  int32_t scale = CUDA_R_32F;
+  int32_t transa = CUBLAS_OP_N, transb = CUBLAS_OP_N;
+  int32_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
   const void* bias = nullptr;
   int32_t bias_type = -1;  // -1: the default, which depends on D's type
   int32_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
@@ -87,7 +93,7 @@ struct MatmulDesc {
 };
 
 struct MatrixLayout {
-  cudaDataType type = CUDA_R_32F;
+  int32_t type = CUDA_R_32F;   // as the caller passed it; see MatmulDesc
   uint64_t rows = 0, cols = 0;
   int64_t ld = 0;
   int32_t batch = 1;
@@ -231,8 +237,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescCreate(cublasLtMatmulDesc_t* d,
                                                     cudaDataType scale) {
   if (!d) return CUBLAS_STATUS_INVALID_VALUE;
   auto* m = new MatmulDesc();
-  m->compute = compute;
-  m->scale = scale;
+  m->compute = enum_value(compute);
+  m->scale = enum_value(scale);
   *d = reinterpret_cast<cublasLtMatmulDesc_t>(track(m));
   return CUBLAS_STATUS_SUCCESS;
 }
@@ -283,11 +289,12 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
                                                           const void* buf, size_t bytes) {
   if (!known(d) || !buf) return CUBLAS_STATUS_INVALID_VALUE;
   auto* m = reinterpret_cast<MatmulDesc*>(d);
+  const int a = enum_value(attr);   // attributes newer than the header are not its values
   AttrInfo info;
-  if (!attr_info((int)attr, &info)) return CUBLAS_STATUS_SUCCESS;   // attributes not modelled are inert
+  if (!attr_info(a, &info)) return CUBLAS_STATUS_SUCCESS;   // attributes not modelled are inert
   if (bytes < info.bytes) return CUBLAS_STATUS_INVALID_VALUE;
   auto take = [&](void* field) { std::memcpy(field, buf, info.bytes); };
-  switch ((int)attr) {
+  switch (a) {
     case CUBLASLT_MATMUL_DESC_TRANSA: take(&m->transa); break;
     case CUBLASLT_MATMUL_DESC_TRANSB: take(&m->transb); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE: take(&m->epilogue); break;
@@ -314,7 +321,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
     default: break;
   }
   const auto* b = static_cast<const uint8_t*>(buf);
-  m->raw[(int)attr].assign(b, b + info.bytes);
+  m->raw[a].assign(b, b + info.bytes);
   return CUBLAS_STATUS_SUCCESS;
 }
 // What was set, or the attribute's default; the compute and scale types are
@@ -326,14 +333,15 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t d
                                                           size_t* written) {
   if (!known(d)) return CUBLAS_STATUS_INVALID_VALUE;
   auto* m = reinterpret_cast<MatmulDesc*>(d);
+  const int a = enum_value(attr);
   std::vector<uint8_t> v;
   AttrInfo info;
-  if (attr == CUBLASLT_MATMUL_DESC_COMPUTE_TYPE || attr == CUBLASLT_MATMUL_DESC_SCALE_TYPE) {
-    const int32_t t = attr == CUBLASLT_MATMUL_DESC_COMPUTE_TYPE ? (int32_t)m->compute : (int32_t)m->scale;
+  if (a == CUBLASLT_MATMUL_DESC_COMPUTE_TYPE || a == CUBLASLT_MATMUL_DESC_SCALE_TYPE) {
+    const int32_t t = a == CUBLASLT_MATMUL_DESC_COMPUTE_TYPE ? m->compute : m->scale;
     v.assign((const uint8_t*)&t, (const uint8_t*)&t + sizeof t);
-  } else if (m->raw.count((int)attr)) {
-    v = m->raw[(int)attr];
-  } else if (attr_info((int)attr, &info)) {
+  } else if (m->raw.count(a)) {
+    v = m->raw[a];
+  } else if (attr_info(a, &info)) {
     v.assign(info.bytes, 0);
     std::memcpy(v.data(), &info.def, info.bytes);   // little-endian: the low bytes hold the value
   } else {
@@ -350,7 +358,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatrixLayoutCreate(cublasLtMatrixLayout_t* l,
                                                       uint64_t rows, uint64_t cols, int64_t ld) {
   if (!l) return CUBLAS_STATUS_INVALID_VALUE;
   auto* m = new MatrixLayout();
-  m->type = type;
+  m->type = enum_value(type);
   m->rows = rows;
   m->cols = cols;
   m->ld = ld;
@@ -514,7 +522,7 @@ uint16_t to_bf16(double d) {
   return (uint16_t)(x >> 16);
 }
 
-size_t elem_bytes(cudaDataType t) {
+size_t elem_bytes(int t) {
   switch (t) {
     case CUDA_R_8F_E4M3: case CUDA_R_8F_E5M2: return 1;
     case CUDA_R_16F: case CUDA_R_16BF: return 2;
@@ -523,10 +531,10 @@ size_t elem_bytes(cudaDataType t) {
     default: return 0;
   }
 }
-bool is_fp8(cudaDataType t) { return t == CUDA_R_8F_E4M3 || t == CUDA_R_8F_E5M2; }
+bool is_fp8(int t) { return t == CUDA_R_8F_E4M3 || t == CUDA_R_8F_E5M2; }
 
 // A device buffer of `n` elements of type `t`, as doubles.
-std::vector<double> read_as_double(const void* dev, size_t n, cudaDataType t) {
+std::vector<double> read_as_double(const void* dev, size_t n, int t) {
   std::vector<double> out(n);
   if (!n) return out;
   std::vector<uint8_t> raw(n * elem_bytes(t));
@@ -544,7 +552,7 @@ std::vector<double> read_as_double(const void* dev, size_t n, cudaDataType t) {
   }
   return out;
 }
-void encode(double v, cudaDataType t, uint8_t* p) {
+void encode(double v, int t, uint8_t* p) {
   switch (t) {
     case CUDA_R_8F_E4M3: *p = to_bits_fp8(v, true); break;
     case CUDA_R_8F_E5M2: *p = to_bits_fp8(v, false); break;
@@ -566,7 +574,7 @@ size_t at(const MatrixLayout& l, int64_t r, int64_t c) {
 }
 
 // alpha and beta are of the scale type; a scale is always fp32.
-double read_scalar(const void* p, cudaDataType t, bool device) {
+double read_scalar(const void* p, int t, bool device) {
   if (!p) return 0.0;
   if (device) return read_as_double(p, 1, t)[0];
   switch (t) {
@@ -599,17 +607,17 @@ uint8_t to_fp4(double v) {
 double from_ue8m0(uint8_t b) { return b == 255 ? NAN : std::ldexp(1.0, (int)b - 127); }
 double from_ue4m3(uint8_t b) { return from_bits_fp8(b & 0x7f, true); }
 
-bool is_fp4(cudaDataType t) { return (int)t == kTypeFP4; }
-bool narrow(cudaDataType t) { return is_fp8(t) || is_fp4(t); }
-bool known_type(cudaDataType t) { return elem_bytes(t) || is_fp4(t); }
-size_t elem_bits(cudaDataType t) { return is_fp4(t) ? 4 : elem_bytes(t) * 8; }
+bool is_fp4(int t) { return t == kTypeFP4; }
+bool narrow(int t) { return is_fp8(t) || is_fp4(t); }
+bool known_type(int t) { return elem_bytes(t) || is_fp4(t); }
+size_t elem_bits(int t) { return is_fp4(t) ? 4 : elem_bytes(t) * 8; }
 
 // One matrix's elements, read whole from device memory, decoded and encoded
 // in place: FP4 included.
 struct Elems {
   std::vector<uint8_t> raw;
-  cudaDataType t = CUDA_R_32F;
-  void load(const void* dev, size_t n, cudaDataType type) {
+  int t = CUDA_R_32F;
+  void load(const void* dev, size_t n, int type) {
     t = type;
     raw.assign((n * elem_bits(t) + 7) / 8, 0);
     if (!raw.empty()) cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost);
@@ -782,9 +790,9 @@ struct Epilogue {
   bool relu_aux() const { return (relu && aux_out) || drelu; }
   bool gelu_aux() const { return (gelu && aux_out) || dgelu; }
 };
-Epilogue epilogue_of(cublasLtEpilogue_t e) {
+Epilogue epilogue_of(int e) {
   Epilogue x;
-  switch ((int)e) {
+  switch (e) {
     case CUBLASLT_EPILOGUE_DEFAULT: break;
     case CUBLASLT_EPILOGUE_RELU: x.relu = true; break;
     case CUBLASLT_EPILOGUE_BIAS: x.bias = true; break;
@@ -942,7 +950,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
                         ? load_scales(md.d_scale, kScaleScalar, 1, 1).values[0]
                         : 1.0;
 
-  cudaDataType bias_type = (cudaDataType)md.bias_type;
+  int bias_type = md.bias_type;
   if (md.bias_type < 0) bias_type = narrow(ld.type) ? CUDA_R_16BF : ld.type;
   if ((ep.bias || ep.bgrad || ep.bgrada || ep.bgradb) && !elem_bytes(bias_type)) return CUBLAS_STATUS_NOT_SUPPORTED;
 
