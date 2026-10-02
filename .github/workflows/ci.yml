@@ -149,12 +149,22 @@ jobs:
     # sm_120a) and requires it to run, which takes a few hours.
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
+    # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
+    # the runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     env:
       NVCC_PREPEND_FLAGS: ''
     steps:
       - uses: actions/checkout@v4
 
       - name: Install CUDA 13
+        if: ${{ !job.container.id }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
