@@ -20,14 +20,16 @@
 // __nv_relfatbin sections; and this library's own output, or NVRTC's shim's
 // "CUBIN", which are PTX, given back as NVJITLINK_INPUT_CUBIN. A linked cubin
 // (SASS, nvcc -cubin) is accepted and adds nothing, as NVIDIA's treats one.
-// What cannot be linked: relocatable SASS (-rdc / -dc cubins, which need
-// their relocations applied -- a machine-code linker this is not), and LTO-IR
-// (NVVM bitcode, which only NVIDIA's compiler reads). Each is refused by name,
-// in the error log, with what to pass instead.
 //
-// The simulator runs SASS as well as PTX, but the linked image stays PTX: the
-// one SASS input NVIDIA's linker would put in its output is relocatable code,
-// which is exactly what is refused.
+// Relocatable SASS -- -rdc / -dc cubins, and fatbins, objects and libraries
+// carrying them -- links too, as machine code (sass_link.cpp): when every
+// input has SASS for -arch and some input has no PTX, the link is SASS, and
+// the cubin is a real one, which VirtualGPU's driver runs as SASS. When every
+// input has PTX the link stays PTX, as before: it is the form the PTX engine
+// and every older path take. What cannot be linked is SASS with PTX that has
+// no SASS beside it -- NVIDIA's compiles the PTX for -arch; there is no
+// compiler here -- which is refused by name when the second kind arrives, and
+// LTO-IR (NVVM bitcode, which only NVIDIA's compiler reads).
 //
 // Results, error-log text and the order checks happen in follow NVIDIA's
 // library as measured on CUDA 13.0's: a failed nvJitLinkCreate still returns
@@ -49,6 +51,7 @@
 
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
+#include "sass_link.hpp"
 #include "vgpu/error.hpp"
 
 // CUDA_VERSION of the toolkit this library stands in for (CMake passes it).
@@ -71,6 +74,15 @@ struct Link {
   bool completed = false;
   bool linked_ok = false;
   std::vector<vgpu::cuda::PtxInput> inputs;
+  // Each input, by what it brings: PTX (an index into `inputs`), relocatable
+  // SASS for -arch (into `sass`), or both (a fatbin or object built for both).
+  struct Piece {
+    std::string label;
+    int ptx = -1, sass = -1;
+  };
+  std::vector<Piece> pieces;
+  std::vector<vgpu::cuda::SassLinkInput> sass;
+  bool linked_sass = false;   // `linked` is a cubin (ELF), not PTX text
   size_t unnamed = 0;
   std::string linked;
   std::string error_log;
@@ -178,14 +190,60 @@ nvJitLinkResult refuse_ltoir(Link& L, const std::string& label) {
   return NVJITLINK_ERROR_NVVM_COMPILE;
 }
 
-// Relocatable SASS -- a cubin or fatbin built with -rdc or -dc -- is what
-// NVIDIA's links. Linking machine code means applying its relocations, which
-// this linker does not do: it links PTX.
-nvJitLinkResult refuse_relocatable_sass(Link& L, const std::string& label, uint32_t arch) {
-  L.error_log += "ERROR: '" + label + "' is relocatable SASS for sm_" + std::to_string(arch) +
-                 ", which VirtualGPU cannot link: it links PTX, not machine code. Add the PTX it "
-                 "was built from, or a fatbin that carries it\n";
+// SASS and PTX without SASS cannot be linked together: NVIDIA's compiles the
+// PTX for -arch first, and there is no compiler here. Refused when the second
+// kind arrives, naming both.
+nvJitLinkResult refuse_mixing(Link& L, const std::string& label, bool adding_sass) {
+  std::string other;
+  for (const Link::Piece& p : L.pieces)
+    if (adding_sass ? p.sass < 0 : p.ptx < 0) {
+      other = p.label;
+      break;
+    }
+  if (adding_sass)
+    L.error_log += "ERROR: '" + label + "' is relocatable SASS, and '" + other +
+                   "' is PTX with no SASS for " + L.arch +
+                   ": VirtualGPU links SASS with SASS and PTX with PTX, and cannot compile PTX to SASS. "
+                   "Add the PTX this input was built from, or SASS for the PTX one\n";
+  else
+    L.error_log += "ERROR: '" + label + "' is PTX with no SASS for " + L.arch + ", and '" + other +
+                   "' is relocatable SASS: VirtualGPU links SASS with SASS and PTX with PTX, and cannot "
+                   "compile PTX to SASS\n";
   return NVJITLINK_ERROR_INVALID_INPUT;
+}
+bool has_sass_only(const Link& L) {
+  for (const Link::Piece& p : L.pieces)
+    if (p.ptx < 0) return true;
+  return false;
+}
+bool has_ptx_only(const Link& L) {
+  for (const Link::Piece& p : L.pieces)
+    if (p.sass < 0) return true;
+  return false;
+}
+
+// Relocatable SASS for -arch, as a link input. A cubin for an architecture
+// -arch cannot run is refused when it is added, as NVIDIA's refuses it
+// (NVJITLINK_ERROR_INVALID_INPUT, "ERROR 4: bad input:<name>" on CUDA 13.0's).
+nvJitLinkResult add_sass(Link& L, const void* data, size_t size, const std::string& label, std::string ptx = {}) {
+  const uint32_t arch = vgpu::cuda::cubin_arch(data, size);
+  if (!vgpu::cuda::target_runs_on(arch, 0, L.arch_number, L.arch_suffix)) {
+    L.error_log += "ERROR 4: bad input:" + label + "\n";
+    return NVJITLINK_ERROR_INVALID_INPUT;
+  }
+  const bool with_ptx = !ptx.empty();
+  if (!with_ptx && has_ptx_only(L)) return refuse_mixing(L, label, true);
+  Link::Piece p;
+  p.label = label;
+  p.sass = static_cast<int>(L.sass.size());
+  const auto* b = static_cast<const uint8_t*>(data);
+  L.sass.push_back({label, std::vector<uint8_t>(b, b + size)});
+  if (with_ptx) {
+    p.ptx = static_cast<int>(L.inputs.size());
+    L.inputs.push_back({label, std::move(ptx)});
+  }
+  L.pieces.push_back(std::move(p));
+  return NVJITLINK_SUCCESS;
 }
 
 nvJitLinkResult add_ptx(Link& L, std::string text, const std::string& label) {
@@ -202,6 +260,8 @@ nvJitLinkResult add_ptx(Link& L, std::string text, const std::string& label) {
     L.error_log += "ERROR NVJITLINK_ERROR_PTX_COMPILE: JIT the PTX (" + label + ")\n";
     return NVJITLINK_ERROR_PTX_COMPILE;
   }
+  if (has_sass_only(L)) return refuse_mixing(L, label, false);
+  L.pieces.push_back({label, static_cast<int>(L.inputs.size()), -1});
   L.inputs.push_back({label, std::move(text)});
   return NVJITLINK_SUCCESS;
 }
@@ -217,18 +277,31 @@ nvJitLinkResult add_fatbin(Link& L, const void* data, size_t size, const std::st
   }
   std::vector<vgpu::cuda::FatbinPtx> ptx;
   bool ltoir = false;
-  uint32_t relocatable_sass = 0;
+  const vgpu::cuda::FatbinImage* sass = nullptr;   // the relocatable SASS for -arch, the newest that runs
+  uint32_t other_sass = 0;
   for (auto& im : images) {
-    if (im.is_ptx()) ptx.push_back({im.arch, std::move(im.data)});
+    if (im.is_ptx()) ptx.push_back({im.arch, im.data});
     else if (im.kind == vgpu::cuda::kFatbinLtoIr) ltoir = true;
     else if (im.kind == vgpu::cuda::kFatbinElf && !im.stored &&
-             !vgpu::cuda::cubin_linked(im.data.data(), im.data.size()))
-      relocatable_sass = im.arch;
+             vgpu::cuda::cubin_relocatable(im.data.data(), im.data.size())) {
+      const uint32_t a = vgpu::cuda::cubin_arch(im.data.data(), im.data.size());
+      if (vgpu::cuda::target_runs_on(a, 0, L.arch_number, L.arch_suffix)) {
+        if (!sass || a > vgpu::cuda::cubin_arch(sass->data.data(), sass->data.size())) sass = &im;
+      } else {
+        other_sass = a;
+      }
+    }
   }
-  if (!ptx.empty())
-    return add_ptx(L, std::move(ptx[vgpu::cuda::pick_ptx(ptx, L.arch_number)].text), label);
+  // Both, when it has both: the link is PTX unless some input has SASS only.
+  if (sass)
+    return add_sass(L, sass->data.data(), sass->data.size(), label,
+                    ptx.empty() ? std::string() : ptx[vgpu::cuda::pick_ptx(ptx, L.arch_number)].text);
+  if (!ptx.empty()) return add_ptx(L, std::move(ptx[vgpu::cuda::pick_ptx(ptx, L.arch_number)].text), label);
   if (ltoir) return refuse_ltoir(L, label);
-  if (relocatable_sass) return refuse_relocatable_sass(L, label, relocatable_sass);
+  if (other_sass) {
+    L.error_log += "ERROR 4: bad input:" + label + "\n";
+    return NVJITLINK_ERROR_INVALID_INPUT;
+  }
   // An empty fatbin, or one of linked cubins only, contributes nothing: NVIDIA's
   // nvJitLink links relocatable code, and passes over a linked cubin.
   return NVJITLINK_SUCCESS;
@@ -287,7 +360,7 @@ nvJitLinkResult add_input(Link& L, nvJitLinkInputType type, const void* data, si
           L.info_log += "info    : '" + label + "' is a linked cubin, which adds nothing to a link\n";
         return NVJITLINK_SUCCESS;
       }
-      return refuse_relocatable_sass(L, label, vgpu::cuda::cubin_arch(data, size));
+      return add_sass(L, data, size, label);
     case NVJITLINK_INPUT_FATBIN:
       if (kind != BlobKind::Fatbin) return wrong_type("NVJITLINK_INPUT_FATBIN");
       return add_fatbin(L, data, size, label);
@@ -410,6 +483,21 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkComplete(nvJitLinkHandle handle) {
     L->error_log += "ERROR: -ptx requires that all inputs have LTOIR\n";
     return NVJITLINK_ERROR_INCORRECT_INPUT_TYPE;
   }
+  if (has_sass_only(*L)) {
+    // Machine code: every piece has SASS for -arch (add_sass saw to that).
+    std::vector<vgpu::cuda::SassLinkInput> in;
+    for (const Link::Piece& p : L->pieces) in.push_back(L->sass[static_cast<size_t>(p.sass)]);
+    vgpu::cuda::SassLinkResult r = vgpu::cuda::link_sass(in, L->arch_number);
+    L->error_log += r.errors;
+    if (!r.ok) return NVJITLINK_ERROR_INTERNAL;
+    L->linked.assign(r.cubin.begin(), r.cubin.end());
+    L->linked_sass = true;
+    L->linked_ok = true;
+    if (L->verbose)
+      L->info_log += "info    : linked " + std::to_string(in.size()) + " relocatable SASS module" +
+                     (in.size() == 1 ? "" : "s") + " for " + L->arch + "\n";
+    return NVJITLINK_SUCCESS;
+  }
   vgpu::cuda::PtxLinkResult r = vgpu::cuda::link_ptx(L->inputs, L->arch);
   L->error_log += r.errors;
   if (!r.ok) return NVJITLINK_ERROR_INTERNAL;
@@ -427,6 +515,10 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedCubinSize(nvJitLinkHandle handle, 
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!size) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->linked_sass) {   // a real cubin: its own size, no terminator
+    *size = L->linked.size();
+    return NVJITLINK_SUCCESS;
+  }
   return copy_size(L->linked, size);
 }
 VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedCubin(nvJitLinkHandle handle, void* cubin) {
@@ -434,6 +526,10 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedCubin(nvJitLinkHandle handle, void
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!cubin) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->linked_sass) {
+    std::memcpy(cubin, L->linked.data(), L->linked.size());
+    return NVJITLINK_SUCCESS;
+  }
   return copy_out(L->linked, cubin);
 }
 VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedPtxSize(nvJitLinkHandle handle, size_t* size) {
@@ -441,6 +537,9 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedPtxSize(nvJitLinkHandle handle, si
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!size) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  // A SASS link has no PTX to give: NVIDIA's 13.0 returned
+  // NVJITLINK_ERROR_INVALID_INPUT for it.
+  if (L->linked_sass) return NVJITLINK_ERROR_INVALID_INPUT;
   return copy_size(L->linked, size);
 }
 VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedPtx(nvJitLinkHandle handle, char* ptx) {
@@ -448,6 +547,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedPtx(nvJitLinkHandle handle, char* 
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!ptx) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->linked_sass) return NVJITLINK_ERROR_INVALID_INPUT;
   return copy_out(L->linked, ptx);
 }
 

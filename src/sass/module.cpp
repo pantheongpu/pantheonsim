@@ -191,7 +191,11 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       if (!code && dst == section_va.end())
         throw Error(Err::UnsupportedPtx, "cubin: relocations in " + s.name + " are not supported yet");
       for (const CubinReloc& r : s.relocs) {
-        const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 75) : r.type == 2;
+        // In data, R_CUDA_G64 (4) is an address too: NVIDIA's device link
+        // writes it for a __device__ pointer initialised to a variable's
+        // address (&array[2]), which nvJitLink's output keeps for the loader.
+        const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 75)
+                                : (r.type == 2 || r.type == 4);
         if (!known)
           throw Error(Err::UnsupportedPtx,
                       "cubin: relocation type " + std::to_string(r.type) + " in " + s.name + " is not supported yet");

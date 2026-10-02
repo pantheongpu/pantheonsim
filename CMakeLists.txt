@@ -589,7 +589,7 @@ if(CUDA_ABI_INCLUDE)
   # libraries -- a linker and a container writer -- so, like NVRTC, they carry
   # no simulator and no runtime: only the fatbin reader and writer
   # (fatbin.cpp) and the PTX linker the runtime also links -rdc builds with
-  # (ptx_link.cpp). Each is written from the documented API with the
+  # (ptx_link.cpp), and nvJitLink's machine-code linker (sass_link.cpp). Each is written from the documented API with the
   # simulator's own declarations (nvidia/include/vgpu_nvjitlink.h,
   # vgpu_nvfatbin.h), since CUDA 12.0 has no nvFatbin.h. NVIDIA tags both
   # libraries' symbols with their soname, and the stubs programs link against
@@ -607,7 +607,7 @@ if(CUDA_ABI_INCLUDE)
     set(_ver ${SO_CUDART})
     vgpu_version_script(${_lib} ${_ver} _map)
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp nvidia/src/fatbin.cpp
-                nvidia/src/ptx_link.cpp src/core/error.cpp)
+                nvidia/src/ptx_link.cpp nvidia/src/sass_link.cpp src/core/error.cpp)
     target_include_directories(vgpu${_lower} PRIVATE include nvidia/src)
     target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})   # libzstd, dlopened
     target_compile_definitions(vgpu${_lower} PRIVATE VGPU_${_macro}_VERSION=${VGPU_TOOLKIT_VERSION})
@@ -1376,6 +1376,15 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # nvJitLink linking relocatable SASS (-rdc cubins, a host object, a static
+  # library) for each generation, and running what it links. The program
+  # passes on an RTX 3060 with NVIDIA's nvJitLink and with this one.
+  add_test(NAME e2e_nvjitlink_sass COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_jit_link_sass.sh)
+  set_tests_properties(e2e_nvjitlink_sass PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
 
   # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
   # fatbin and PTX, as an RTX 3060 answers for all three.
