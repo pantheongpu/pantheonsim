@@ -59,7 +59,7 @@ jobs=$(cutlass_compile_jobs ${#tests[@]})
 # CUTLASS's own CMake defines CUTLASS_TARGET_NAME, which the conv testbed uses.
 compile() {
   local name="${1##*/}"
-  nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a --expt-relaxed-constexpr \
+  nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code="$(cutlass_code compute_90a)" --expt-relaxed-constexpr \
        -DCUTLASS_TARGET_NAME="\"$name\"" \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" -I "$cutlass/test" \
        -I "$gtest/googletest/include" "$u/$1.cu" "$u/test_unit.cpp" \
@@ -80,7 +80,7 @@ for path in "${tests[@]}"; do
   t="${path##*/}"
   if ! require_shim_libs "$shim" "$work/$t"; then exit 0; fi
   # Kept out of a failing command substitution, so a failure prints its reason.
-  result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" \
+  result="$(VGPU_QUIET=1 VGPU_SASS_LOG=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" \
             "$work/$t" --gtest_filter='-*Tma_Load_1D' 2>&1 || true)"
   summary="$(grep -E '^\[  (PASSED|FAILED)  \]' <<<"$result" | head -2 | tr '\n' ' ')"
   echo "$t: $summary"
@@ -88,5 +88,6 @@ for path in "${tests[@]}"; do
     grep -E 'FAILED|Failure|VirtualGPU' <<<"$result" | head -20
     fail=1
   fi
+  cutlass_sass_check "$t" "$result" || fail=1
 done
 exit $fail
