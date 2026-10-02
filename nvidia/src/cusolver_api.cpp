@@ -14,10 +14,15 @@
 // Also the symmetric indefinite factorization (sytrf, Xsytrs, sytri) and, in
 // cusolver_complex.inc, the complex types. The sparse module (cusolverSp) is
 // cusolver_sp.cpp, built into this library too; the multi-GPU one
-// (cusolverMg) is a library of its own, cusolvermg_api.cpp.
+// (cusolverMg) is a library of its own, cusolvermg_api.cpp. The reductions,
+// generalized and selected eigen, potri/lauum and the remaining 64-bit X
+// functions (Xgetrf, Xtrtri, Xsyevdx, Xgesvd, Xgesvdp, Xgesvdr, Xlarft) are
+// cusolver_dense_more.inc; the iterative refinement solvers cusolver_irs.inc;
+// the refactorization module (cusolverRf) cusolver_rf.cpp.
 //
-// Not implemented: the randomized variants and the refactorization module
-// (cusolverRf).
+// Xgeev computes right eigenvectors only: jobvl = VECTOR is INTERNAL_ERROR,
+// as NVIDIA's CUDA 13.0 and 13.2 libraries answer on an RTX 3060 (its
+// documentation says geev supports right eigenvectors only).
 #include <cusolverDn.h>
 
 #include <algorithm>

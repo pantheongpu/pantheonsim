@@ -24,8 +24,9 @@
 // with no boost Refactor returns ZERO_PIVOT (Solve then divides by the zero).
 // Solve takes one right-hand side (nrhs > 1, ldt < n or ldxf < n:
 // INVALID_VALUE); before any setup, Analyze, Refactor and Solve return
-// SUCCESS and do nothing, and so does a Refactor before Analyze. A fresh handle holds the documented defaults (CSR,
-// STORED_L, ALG0/ALG1, zero = boost = 0, fast mode off), as NVIDIA's does.
+// SUCCESS and do nothing, and so does a Refactor before Analyze. A fresh
+// handle holds the documented defaults (CSR, STORED_L, ALG0/ALG1, zero =
+// boost = 0, fast mode off), as NVIDIA's does.
 //
 // The batched forms follow the documentation and the same arithmetic: on
 // that card NVIDIA's own crashed in cusolverRfBatchAnalyze/BatchRefactor (a

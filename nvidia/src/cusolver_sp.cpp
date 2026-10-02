@@ -16,9 +16,10 @@
 //   Cholesky  right-looking on the lower triangle (the upper part is
 //             ignored, as NVIDIA documents), A = L L^H.
 //
-// reorder 0 keeps the natural order; 1 is reverse Cuthill-McKee, and 2 and 3
-// (symamd, METIS) are a minimum-degree ordering. They change the fill and the
-// rounding, not the answer. What an RTX 3060's cuSOLVER (CUDA 13.0) showed,
+// reorder 0 keeps the natural order; 1 is csrsymrcm's reverse Cuthill-McKee
+// and 2 csrsymamd's approximate minimum degree, both NVIDIA's exact
+// permutations; 3 (METIS) is csrsymmdq's minimum degree. They change the fill
+// and the rounding, not the answer. What an RTX 3060's cuSOLVER (CUDA 13.0) showed,
 // and this follows (nvidia/tests/e2e/solver_sparse_paths.cu):
 //
 //   - `tol` is absolute: an LU or QR pivot of magnitude <= tol, or a
@@ -43,10 +44,10 @@
 //     augmentation), unmatched columns given the unmatched rows in order.
 //
 // Not reproduced: which index NVIDIA's Cholesky names when several columns
-// are independent of one another (its internal order differs), the exact
-// permutations its reorderings produce (any fill-reducing permutation is a
-// correct answer), and its Cholesky with reorder = 1 reading the upper
-// triangle it documents as ignored.
+// are independent of one another (its internal order differs), csrmetisnd's
+// METIS permutation (any fill-reducing permutation is a correct answer), and
+// its Cholesky with reorder = 1 reading the upper triangle it documents as
+// ignored.
 #include <cusolverSp.h>
 #include <cusolverSp_LOWLEVEL_PREVIEW.h>
 
@@ -250,62 +251,181 @@ std::vector<int> minimum_degree(std::vector<std::set<int>> g) {
   return order;
 }
 
-// Reverse Cuthill-McKee: per component, breadth-first from a pseudo-peripheral
-// node (George and Liu), neighbours by increasing degree, then reversed.
-std::vector<int> rcm(const std::vector<std::set<int>>& g) {
+// Which rows store their diagonal entry: NVIDIA's RCM counts it in a node's
+// degree.
+std::vector<char> diagonal_flags(int n, const std::vector<int>& off, const std::vector<int>& col) {
+  std::vector<char> d((size_t)n, 0);
+  for (int i = 0; i < n; ++i)
+    for (int k = off[(size_t)i]; k < off[(size_t)i + 1]; ++k)
+      if (col[(size_t)k] == i) d[(size_t)i] = 1;
+  return d;
+}
+
+// Reverse Cuthill-McKee as csrsymrcmHost orders, measured on an RTX 3060
+// (CUDA 13.0) against 100 matrices (random, banded, 2D and 3D grids, dense
+// rows, several components) -- every permutation identical:
+//   - components in the order of their lowest-numbered node;
+//   - each one's root by George and Liu's pseudo-peripheral search from that
+//     node: breadth-first levels (neighbours ascending), the first node of
+//     least degree in the last level becomes the root, repeated while the
+//     level count grows -- without SPARSPAK's early return when the first
+//     structure is already a path, and keeping the last node tried;
+//   - Cuthill-McKee from the root: each node's unnumbered neighbours by their
+//     count of unnumbered neighbours, plus one when the row stores its
+//     diagonal, the lower index first on a tie;
+//   - the whole sequence reversed at the end.
+// A node's degree in the root search also counts its stored diagonal.
+std::vector<int> rcm(const std::vector<std::set<int>>& g, const std::vector<char>& diag) {
   const int n = (int)g.size();
-  std::vector<int> order, level((size_t)n, -1);
-  std::vector<char> done((size_t)n, 0);
-  auto bfs = [&](int s, std::vector<int>* visit) {
-    std::fill(level.begin(), level.end(), -1);
-    visit->clear();
-    visit->push_back(s);
-    level[(size_t)s] = 0;
-    for (size_t h = 0; h < visit->size(); ++h) {
-      const int v = (*visit)[h];
-      std::vector<int> nb;
-      for (int u : g[(size_t)v])
-        if (level[(size_t)u] < 0) nb.push_back(u);
-      std::sort(nb.begin(), nb.end(), [&](int a, int b) {
-        return g[(size_t)a].size() != g[(size_t)b].size() ? g[(size_t)a].size() < g[(size_t)b].size() : a < b;
-      });
-      for (int u : nb) {
-        level[(size_t)u] = level[(size_t)v] + 1;
-        visit->push_back(u);
-      }
+  auto dg = [&](int v) { return diag.empty() ? 0 : (int)diag[(size_t)v]; };
+  std::vector<char> num((size_t)n, 0);
+  std::vector<int> order, mark((size_t)n, -1);
+  int stamp = 0;
+  auto levels = [&](int root, std::vector<std::vector<int>>* lv) {
+    ++stamp;
+    lv->assign(1, {root});
+    mark[(size_t)root] = stamp;
+    for (;;) {
+      std::vector<int> next;
+      for (int v : lv->back())
+        for (int u : g[(size_t)v])
+          if (!num[(size_t)u] && mark[(size_t)u] != stamp) {
+            mark[(size_t)u] = stamp;
+            next.push_back(u);
+          }
+      if (next.empty()) return;
+      lv->push_back(std::move(next));
     }
   };
-  std::vector<int> visit;
+  std::vector<std::vector<int>> lv, lv2;
   for (int s0 = 0; s0 < n; ++s0) {
-    if (done[(size_t)s0]) continue;
-    bfs(s0, &visit);
-    int s = s0;  // the least degree in the component first
-    for (int v : visit)
-      if (g[(size_t)v].size() < g[(size_t)s].size()) s = v;
-    int ecc = -1;
+    if (num[(size_t)s0]) continue;
+    levels(s0, &lv);
+    int root = s0;
     for (;;) {
-      bfs(s, &visit);
-      const int e = level[(size_t)visit.back()];
-      if (e <= ecc) break;
-      ecc = e;
-      int best = visit.back();
-      for (int v : visit)
-        if (level[(size_t)v] == e && g[(size_t)v].size() < g[(size_t)best].size()) best = v;
-      if (best == s) break;
-      s = best;
+      const std::vector<int>& last = lv.back();
+      root = last[0];
+      int best = (int)g[(size_t)root].size() + dg(root);
+      for (int v : last)
+        if ((int)g[(size_t)v].size() + dg(v) < best) {
+          best = (int)g[(size_t)v].size() + dg(v);
+          root = v;
+        }
+      levels(root, &lv2);
+      if (lv2.size() <= lv.size()) break;
+      lv.swap(lv2);
     }
-    bfs(s, &visit);
-    for (int v : visit) done[(size_t)v] = 1;
-    order.insert(order.end(), visit.begin(), visit.end());
+    size_t h = order.size();
+    order.push_back(root);
+    num[(size_t)root] = 1;
+    for (; h < order.size(); ++h) {
+      std::vector<std::pair<int, int>> kids;
+      for (int u : g[(size_t)order[h]])
+        if (!num[(size_t)u]) {
+          int k = dg(u);
+          for (int w : g[(size_t)u]) k += !num[(size_t)w];
+          kids.push_back({k, u});
+        }
+      std::sort(kids.begin(), kids.end());
+      for (const auto& [k, u] : kids) {
+        num[(size_t)u] = 1;
+        order.push_back(u);
+      }
+    }
   }
   std::reverse(order.begin(), order.end());
   return order;
 }
 
-// The column order `reorder` names, over the graph a factorization fills.
-std::vector<int> column_order(int reorder, const std::vector<std::set<int>>& g) {
-  if (reorder == 1) return rcm(g);
-  if (reorder == 2 || reorder == 3) return minimum_degree(g);
+// The elimination tree of the matrix with pattern g taken in the order p,
+// then p rearranged into its postorder: children before parents, siblings and
+// roots in ascending order.
+std::vector<int> etree_postorder(const std::vector<std::set<int>>& g, const std::vector<int>& p) {
+  const int n = (int)p.size();
+  std::vector<int> pinv((size_t)n), parent((size_t)n, -1), anc((size_t)n, -1);
+  for (int k = 0; k < n; ++k) pinv[(size_t)p[(size_t)k]] = k;
+  for (int k = 0; k < n; ++k)
+    for (int v : g[(size_t)p[(size_t)k]]) {
+      int j = pinv[(size_t)v];
+      while (j != -1 && j < k) {
+        const int up = anc[(size_t)j];
+        anc[(size_t)j] = k;
+        if (up == -1) parent[(size_t)j] = k;
+        j = up;
+      }
+    }
+  std::vector<int> head((size_t)n, -1), next((size_t)n, -1), post, stack;
+  for (int j = n - 1; j >= 0; --j)
+    if (parent[(size_t)j] != -1) {
+      next[(size_t)j] = head[(size_t)parent[(size_t)j]];
+      head[(size_t)parent[(size_t)j]] = j;
+    }
+  for (int j = 0; j < n; ++j) {
+    if (parent[(size_t)j] != -1) continue;
+    stack.push_back(j);
+    while (!stack.empty()) {
+      const int t = stack.back(), c = head[(size_t)t];
+      if (c == -1) {
+        stack.pop_back();
+        post.push_back(p[(size_t)t]);
+      } else {
+        head[(size_t)t] = next[(size_t)c];
+        stack.push_back(c);
+      }
+    }
+  }
+  return post;
+}
+
+// Minimum degree on a quotient graph with an approximate degree, as
+// csrsymamdHost orders: a variable's degree after each elimination is
+// |A_i| + |L_p \ i| + sum over its other elements e of |L_e \ L_p| (AMD's
+// external-degree bound, without the bounds AMD takes the minimum with),
+// elements adjacent to the pivot absorbed, the lowest index on a tie; then
+// the elimination tree's postorder. Identical to an RTX 3060's (CUDA 13.0)
+// on the 100 matrices csrsymrcmHost was measured on.
+std::vector<int> approximate_minimum_degree(const std::vector<std::set<int>>& g) {
+  const int n = (int)g.size();
+  std::vector<std::set<int>> A(g), E((size_t)n), L((size_t)n);
+  std::vector<int> deg((size_t)n), order;
+  std::set<std::pair<int, int>> queue;
+  for (int i = 0; i < n; ++i) queue.insert({deg[(size_t)i] = (int)g[(size_t)i].size(), i});
+  while (!queue.empty()) {
+    const int p = queue.begin()->second;
+    queue.erase(queue.begin());
+    order.push_back(p);
+    std::set<int> lp = A[(size_t)p];
+    for (int e : E[(size_t)p]) lp.insert(L[(size_t)e].begin(), L[(size_t)e].end());
+    lp.erase(p);
+    for (int e : E[(size_t)p]) L[(size_t)e].clear();
+    for (int i : lp) {
+      A[(size_t)i].erase(p);
+      for (int x : lp) A[(size_t)i].erase(x);
+      for (int e : E[(size_t)p]) E[(size_t)i].erase(e);
+      E[(size_t)i].insert(p);
+    }
+    L[(size_t)p] = lp;
+    for (int i : lp) {
+      int d = (int)A[(size_t)i].size() + (int)lp.size() - 1;
+      for (int e : E[(size_t)i])
+        if (e != p)
+          for (int x : L[(size_t)e]) d += !lp.count(x);
+      queue.erase({deg[(size_t)i], i});
+      queue.insert({deg[(size_t)i] = d, i});
+    }
+    A[(size_t)p].clear();
+    E[(size_t)p].clear();
+  }
+  return etree_postorder(g, order);
+}
+
+// The column order `reorder` names, over the graph a factorization fills:
+// 1 csrsymrcm's, 2 csrsymamd's, 3 csrsymmdq's in place of METIS (see
+// csrmetisndHost).
+std::vector<int> column_order(int reorder, const std::vector<std::set<int>>& g, const std::vector<char>& diag = {}) {
+  if (reorder == 1) return rcm(g, diag);
+  if (reorder == 2) return approximate_minimum_degree(g);
+  if (reorder == 3) return etree_postorder(g, minimum_degree(g));
   std::vector<int> q(g.size());
   for (size_t i = 0; i < q.size(); ++i) q[i] = (int)i;
   return q;
@@ -575,7 +695,7 @@ cusolverStatus_t linear_solve(Method method, cusolverSpHandle_t h, int n, int nn
   std::vector<V> xv;
   int sing = -1;
   if (method == Method::Lu) {
-    const auto f = lu_factor(a, column_order(reorder, symmetric_graph(n, a.off, a.col)), tol);
+    const auto f = lu_factor(a, column_order(reorder, symmetric_graph(n, a.off, a.col), diagonal_flags(n, a.off, a.col)), tol);
     sing = f.singularity < 0 ? -1 : f.q[(size_t)f.singularity];
     xv = lu_solve(f, bv);
   } else if (method == Method::Qr) {
@@ -584,7 +704,7 @@ cusolverStatus_t linear_solve(Method method, cusolverSpHandle_t h, int n, int nn
     sing = k < 0 ? -1 : f.q[(size_t)k];
     xv = qr_solve(f);
   } else {
-    const auto q = column_order(reorder, symmetric_graph(n, a.off, a.col));
+    const auto q = column_order(reorder, symmetric_graph(n, a.off, a.col), diagonal_flags(n, a.off, a.col));
     int k = -1;
     xv = cholesky_solve(a, q, bv, tol, &k);
     sing = k < 0 ? -1 : q[(size_t)k];
@@ -845,6 +965,15 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrissymHost(cusolverSpHandle_t h, int m
   return CUSOLVER_STATUS_SUCCESS;
 }
 
+// The four reorderings. symrcm, symamd and symmdq return exactly the
+// permutations NVIDIA's do (see rcm, approximate_minimum_degree and below);
+// symmdq is exact minimum degree (lowest index on a tie) followed by the
+// elimination tree's postorder, identical on the same 100 matrices.
+// csrmetisndHost runs METIS 5.1.0's METIS_NodeND with default options on the
+// pattern of A + A^T without its diagonal (a reference METIS 5.1.0 build gave
+// NVIDIA's permutation on 99 of those 100). VirtualGPU carries no METIS, so
+// metisnd returns symmdq's permutation: a correct fill-reducing ordering, not
+// METIS's.
 static cusolverStatus_t ordering(cusolverSpHandle_t h, int n, int nnz, cusparseMatDescr_t d, const int* off,
                                  const int* col, int* p, int reorder) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
@@ -852,7 +981,7 @@ static cusolverStatus_t ordering(cusolverSpHandle_t h, int n, int nnz, cusparseM
   if (const cusolverStatus_t st = check_descr(d); st != CUSOLVER_STATUS_SUCCESS) return st;
   std::vector<int> o, c;
   if (!read_pattern(n, n, nnz, d, off, col, false, &o, &c)) return CUSOLVER_STATUS_INVALID_VALUE;
-  const auto q = column_order(reorder, symmetric_graph(n, o, c));
+  const auto q = column_order(reorder, symmetric_graph(n, o, c), diagonal_flags(n, o, c));
   std::copy(q.begin(), q.end(), p);
   return CUSOLVER_STATUS_SUCCESS;
 }
@@ -862,7 +991,7 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrsymrcmHost(cusolverSpHandle_t h, int 
 }
 VGPU_EXPORT cusolverStatus_t cusolverSpXcsrsymmdqHost(cusolverSpHandle_t h, int n, int nnz, const cusparseMatDescr_t d,
                                                       const int* off, const int* col, int* p) {
-  return ordering(h, n, nnz, d, off, col, p, 2);
+  return ordering(h, n, nnz, d, off, col, p, 3);
 }
 VGPU_EXPORT cusolverStatus_t cusolverSpXcsrsymamdHost(cusolverSpHandle_t h, int n, int nnz, const cusparseMatDescr_t d,
                                                       const int* off, const int* col, int* p) {
