@@ -16,6 +16,10 @@
 //
 // Precision: single and double through the classic API; cufftXt adds half,
 // computed in double like the rest and rounded to half on the way out.
+//
+// Multi-GPU plans spread their data over the simulated devices in NVIDIA's
+// layouts, and LTO callbacks given as PTX run on the device around the host
+// transform: see the sections at the end of this file.
 #include <cufft.h>
 #include <cufftXt.h>
 
@@ -1555,16 +1559,16 @@ std::string callback_kernel(bool load, const std::string& sym, char kind) {
        "ld.param.u64 %rd10, [p_vals];\nmul.lo.u64 %rd11, %rd1, " + std::to_string(e.bytes) + ";\n"
        "add.s64 %rd11, %rd10, %rd11;\n";
   if (load) {
-    s += "{\n.param .b64 a0;\nst.param.b64 [a0], %rd7;\n.param .b64 a1;\nst.param.b64 [a1], %rd6;\n"
-         ".param .b64 a2;\nst.param.b64 [a2], %rd8;\n.param .b64 a3;\nst.param.b64 [a3], %rd9;\n" +
-         e.decl("r") + ";\ncall.uni (r), " + sym + ", (a0, a1, a2, a3);\n" + e.ld_param("r") + "}\n" +
+    s += "{\n.param .b64 q0;\nst.param.b64 [q0], %rd7;\n.param .b64 q1;\nst.param.b64 [q1], %rd6;\n"
+         ".param .b64 q2;\nst.param.b64 [q2], %rd8;\n.param .b64 q3;\nst.param.b64 [q3], %rd9;\n" +
+         e.decl("qr") + ";\ncall.uni (qr), " + sym + ", (q0, q1, q2, q3);\n" + e.ld_param("qr") + "}\n" +
          e.st_mem("%rd11");
   } else {
     s += e.ld_mem("%rd11") +
-         "{\n.param .b64 a0;\nst.param.b64 [a0], %rd7;\n.param .b64 a1;\nst.param.b64 [a1], %rd6;\n" +
-         e.decl("a2") + ";\n" + e.st_param("a2") +
-         ".param .b64 a3;\nst.param.b64 [a3], %rd8;\n.param .b64 a4;\nst.param.b64 [a4], %rd9;\n"
-         "call.uni " + sym + ", (a0, a1, a2, a3, a4);\n}\n";
+         "{\n.param .b64 q0;\nst.param.b64 [q0], %rd7;\n.param .b64 q1;\nst.param.b64 [q1], %rd6;\n" +
+         e.decl("q2") + ";\n" + e.st_param("q2") +
+         ".param .b64 q3;\nst.param.b64 [q3], %rd8;\n.param .b64 q4;\nst.param.b64 [q4], %rd9;\n"
+         "call.uni " + sym + ", (q0, q1, q2, q3, q4);\n}\n";
   }
   s += "$L_done:\nret;\n}\n";
   return s;
