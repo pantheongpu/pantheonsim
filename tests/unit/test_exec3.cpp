@@ -2958,6 +2958,42 @@ VTEST(the_shared_memory_size_registers_report_what_the_launch_gave) {
   VCHECK_EQ(e.mem.load_scalar(out + 4, 4), uint64_t{512 + 256});
 }
 
+// %aggr_smem_size is all the shared memory the block was allocated: its own
+// (%total_smem_size: 400 static bytes and 1024 dynamic ones, in 128-byte
+// allocation units, 1536) and the driver's reserved KiB. Hopper is the first
+// generation that has the register.
+VTEST(aggr_smem_size_adds_the_reserved_shared_memory) {
+  std::string ptx = std::string(kHeader90) + R"(
+.extern .shared .align 16 .b8 dyn[];
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    .shared .align 4 .b8 tile[400];
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %aggr_smem_size;
+    mov.u32 %r2, %total_smem_size;
+    mov.u32 %r3, %dynamic_smem_size;
+    st.global.u32 [%rd2], %r1;
+    st.global.u32 [%rd2+4], %r2;
+    st.global.u32 [%rd2+8], %r3;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/h100");
+  auto m = ptx::parse(ptx);
+  uint64_t out = mem.alloc(16);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.shared_bytes = 1024;
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, mem, prof);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{1536 + 1024});
+  VCHECK_EQ(mem.load_scalar(out + 4, 4), uint64_t{1536});
+  VCHECK_EQ(mem.load_scalar(out + 8, 4), uint64_t{1024});
+}
+
 // The driver's reserved shared memory, where cooperative_groups keeps the
 // scratch for tiles of more than one warp. An RTX 3060 puts it straight after
 // the kernel's own shared memory, counted in 128-byte allocation units:

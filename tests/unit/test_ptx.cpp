@@ -107,15 +107,51 @@ VTEST(an_unknown_special_register_is_not_silently_a_register) {
   // zero and stored four bytes below its shared array. An unimplemented special
   // register has to say so.
   //
-  // The example has to be one that is genuinely still unimplemented, and this
-  // test keeps outliving its examples: it named %total_smem_size until that
-  // was implemented, then %clusterid until the cluster registers were. Each
-  // time it failed, which is the test working rather than breaking.
-  // %current_graph_exec is the current one -- it identifies the graph
-  // executable a kernel is running inside, and nothing here tracks that.
-  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %current_graph_exec;\nret;")));
+  // The example used to be a real register not yet implemented, and the test
+  // kept outliving its examples: %total_smem_size, then %clusterid, then
+  // %current_graph_exec, which is now refused by name (below). Every special
+  // register the PTX ISA defines is now either implemented or refused by
+  // name, so the example is a name no register has.
+  auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %not_a_special_register;\nret;")));
   VCHECK(err.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(err.what(), "%current_graph_exec");
+  VCHECK_CONTAINS(err.what(), "%not_a_special_register");
+}
+
+VTEST(registers_with_no_honest_value_are_refused_by_name) {
+  // The performance-monitor counters, 32- and 64-bit: VirtualGPU has no
+  // timing model, so they have nothing to count.
+  for (const char* r : {"%pm0", "%pm7", "%pm0_64", "%pm3_64", "%pm7_64"}) {
+    const bool wide = std::string(r).size() > 4;
+    auto err = VCAPTURE(Error, parse(wrap_kernel(std::string("mov.u") + (wide ? "64 %rd1, " : "32 %r1, ") +
+                                                 r + ";\nret;")));
+    VCHECK(err.code() == Err::UnsupportedPtx);
+    VCHECK_CONTAINS(err.what(), r);
+    VCHECK_CONTAINS(err.what(), "performance-monitor counter");
+  }
+  // %pm8 is no register at all, and is refused as an unknown one.
+  auto pm8 = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %pm8;\nret;")));
+  VCHECK(pm8.code() == Err::UnsupportedPtx);
+  VCHECK(std::string(pm8.what()).find("performance-monitor") == std::string::npos);
+  // The kernel's graph, which only device-side graph launch would use.
+  auto graph = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %current_graph_exec;\nret;")));
+  VCHECK(graph.code() == Err::UnsupportedPtx);
+  VCHECK_CONTAINS(graph.what(), "%current_graph_exec");
+  VCHECK_CONTAINS(graph.what(), "device-side graph launch");
+}
+
+VTEST(aggr_smem_size_needs_sm_90_and_ptx_8_1) {
+  // As ptxas has it: an RTX 3060's driver refused an sm_86 module reading it.
+  const std::string body = ".reg .b32 %r<2>;\nmov.u32 %r1, %aggr_smem_size;\nret;\n}\n";
+  auto module = [&](const char* version, const char* target) {
+    return std::string(".version ") + version + "\n.target " + target +
+           "\n.address_size 64\n.visible .entry k()\n{\n" + body;
+  };
+  auto old_target = VCAPTURE(Error, parse(module("8.1", "sm_86")));
+  VCHECK_CONTAINS(old_target.what(), "requires .target sm_90 or higher");
+  auto old_isa = VCAPTURE(Error, parse(module("8.0", "sm_90")));
+  VCHECK_CONTAINS(old_isa.what(), "requires PTX ISA .version 8.1 or later");
+  Module m = parse(module("8.1", "sm_90a"));
+  VCHECK_EQ(m.entries.size(), size_t{1});
 }
 
 VTEST(lane_masks_are_the_masks_they_name) {

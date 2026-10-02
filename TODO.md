@@ -1135,12 +1135,15 @@ Two questions that look alike and are not.
 `%laneid`, `%smid` and `%clock64` are PTX ISA instructions, identical on a T4
 and a B200. What varies is which exist -- the ten thread-block cluster
 registers require sm_90 -- and what they return, which is already profile
-driven (`%nsmid` is 132 on an H100 and 58 on an L4). The parser knows 46 names,
-the cluster registers included. What they return is still approximate in three
+driven (`%nsmid` is 132 on an H100 and 58 on an L4). The parser knows 52 names
+and the `%envreg` bank, the cluster registers and Hopper's `%aggr_smem_size`
+included. What they return is still approximate in three
 places: `%smid` is round-robin rather than real placement, `%clock`, `%clock64`
 and `%globaltimer` count instructions rather than time, and only `%envreg1-2`
-are set. `%pm0`-`%pm7` stay refused on purpose: they are undefined unless a
-profiler configured them, so a silent zero would be a confidently wrong answer.
+are set. `%pm0`-`%pm7` and their 64-bit forms `%pm0_64`-`%pm7_64` stay refused
+on purpose, by name: they are undefined unless a profiler configured them, so a
+silent zero would be a confidently wrong answer. So does `%current_graph_exec`,
+which only device-side graph launch would use.
 
 **Performance counters here are not hardware counters, and so are the same on
 every profile by construction.** `global_sectors` is computed from the

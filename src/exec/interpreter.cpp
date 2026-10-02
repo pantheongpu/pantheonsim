@@ -2106,6 +2106,12 @@ class Interpreter {
 
       case Sreg::DynamicSmemSize: return cfg_.shared_bytes;
       case Sreg::TotalSmemSize: return kernel_shared_bytes();
+      // Everything the block was allocated: its own shared memory, in
+      // allocation units as %total_smem_size counts it, and the driver's
+      // reserved part (1 KiB from compute capability 8.0) -- the PTX ISA's
+      // definition. ptxas accepts it only from sm_90, so no card here could
+      // measure it; the parts are the measured ones.
+      case Sreg::AggrSmemSize: return kernel_shared_bytes() + reserved_smem_bytes();
       // Measured on an RTX 3060, for kernels from none to 48 KiB of shared
       // memory: begin, offset 0 and offset 1 are %total_smem_size; end is 288
       // bytes on (the space cooperative_groups' memory.h says it can expect);

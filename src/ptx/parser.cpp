@@ -46,6 +46,7 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%nsmid", Sreg::NSmId},
       {"%dynamic_smem_size", Sreg::DynamicSmemSize},
       {"%total_smem_size", Sreg::TotalSmemSize},
+      {"%aggr_smem_size", Sreg::AggrSmemSize},
       {"%reserved_smem_offset_begin", Sreg::ReservedSmemBegin},
       {"%reserved_smem_offset_end", Sreg::ReservedSmemEnd},
       {"%reserved_smem_offset_cap", Sreg::ReservedSmemCap},
@@ -1239,8 +1240,41 @@ class Parser {
       if (it != sreg_table().end()) {
         if (cur_fn_ && it->second >= Sreg::ReservedSmemBegin && it->second <= Sreg::ReservedSmemOffset1)
           cur_fn_->reads_reserved_smem = true;
+        // ptxas refuses %aggr_smem_size below sm_90 and before PTX ISA 8.1,
+        // as an RTX 3060's driver did for an sm_86 module ("requires .target
+        // sm_90 or higher"), so a module that reads it there is refused here
+        // with the same reason rather than handed a number.
+        if (it->second == Sreg::AggrSmemSize) {
+          int sm = 0, major = 0, minor = 0;
+          std::sscanf(target_.c_str(), "sm_%d", &sm);
+          std::sscanf(version_.c_str(), "%d.%d", &major, &minor);
+          if (sm < 90)
+            fail(t.line, "%aggr_smem_size requires .target sm_90 or higher; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+          if (major < 8 || (major == 8 && minor < 1))
+            fail(t.line, "%aggr_smem_size requires PTX ISA .version 8.1 or later; this module is " +
+                             version_);
+        }
         return SregOperand{it->second};
       }
+      // Performance-monitor counters, 32- and 64-bit. They count hardware
+      // events, and a functional simulator has no hardware events -- no
+      // timing model, no caches, no pipelines -- so there is no honest value
+      // to give. pmevent, which raises the events they count, is accepted
+      // and does nothing.
+      if (w.rfind("%pm", 0) == 0 && w.size() >= 4 && w[3] >= '0' && w[3] <= '7' &&
+          (w.size() == 4 || w.compare(4, std::string::npos, "_64") == 0))
+        fail_unsupported(t.line, w, cur_fn_ ? cur_fn_->name : std::string(),
+                         "special register '" + w +
+                             "' is a performance-monitor counter; VirtualGPU has no timing model, "
+                             "so it has nothing to count");
+      // The graph executable a kernel runs inside: what a kernel hands to
+      // cudaGraphLaunch to launch a graph from the device. Device-side graph
+      // launch is not implemented, so nothing could use the handle.
+      if (w == "%current_graph_exec")
+        fail_unsupported(t.line, w, cur_fn_ ? cur_fn_->name : std::string(),
+                         "special register '%current_graph_exec' identifies the kernel's graph "
+                         "for device-side graph launch, which VirtualGPU does not implement");
       // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
       // number for a driver that sets them, and this one does not.
       // %envreg0..31 is a bank the driver fills in before the launch. Which
