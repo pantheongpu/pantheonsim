@@ -79,6 +79,15 @@ build() {
     cuda-samples)
       # One architecture, the card's, rather than the nine the samples list.
       find Samples -name CMakeLists.txt -exec sed -i -E 's/set\(CMAKE_CUDA_ARCHITECTURES [^)]*\)/set(CMAKE_CUDA_ARCHITECTURES 86)/' {} +
+      # Only the listed samples' directories (each is a CMake project of its
+      # own): the others need libraries a toolchain may not have (the CI
+      # image drops the static ones that simpleCUFFT_callback links), and
+      # configuring them all is slow.
+      if [[ ! -e CMakeLists.txt.all ]]; then
+        mv CMakeLists.txt CMakeLists.txt.all
+        { sed '/add_subdirectory(Samples)/d' CMakeLists.txt.all
+          entries | cut -d'|' -f1 | xargs -n1 dirname | sort -u | sed 's/.*/add_subdirectory(&)/'; } > CMakeLists.txt
+      fi
       # The nvcc on PATH, named: CMake otherwise finds /usr/bin/nvcc first where
       # Ubuntu's CUDA 12.0 is installed too (the pantheonsim.com runner).
       cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
