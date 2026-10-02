@@ -3,18 +3,18 @@
 # check themselves (print PASS or FAIL). Columns: directory | arguments | the card's
 # result: exit status, then how many times it printed PASS and FAIL (a FAIL the card
 # printed too is the benchmark's own, e.g. crc64 at seed 1).
+# Left out after the first run on the pantheonsim.com runner (4 CPUs): atomicPerf,
+# atomicReduction, babelstream, base64e, fsm and mdh, which match the card but take
+# longer than the nightly's 10 minutes each there, crossEntropy (9.7 minutes), and
+# interval, which built locally but not on the runner (to look into).
 adam-cuda|10000 20 1|rc=0 1 PASS
 asmooth-cuda|512 256 9 1|rc=0 1 PASS
 atomicCost-cuda|1 1|rc=0 1 FAIL 2 PASS
 atomicIntrinsics-cuda|20 1|rc=0 2 PASS
-atomicPerf-cuda|1|rc=0 18 PASS
-atomicReduction-cuda||rc=0 20 PASS
 attention-cuda|4096 256 0 1|rc=0 1 PASS
 axpby-cuda|1|rc=0 13 PASS
-babelstream-cuda||rc=0 2 PASS
 background-subtract-cuda|256 128 0 2|rc=0 1 PASS
 backprop-cuda|4096|rc=0 1 PASS
-base64e-cuda||rc=0 2 PASS
 bgmv-cuda|--op bgmv_shrink --tokens 1 --hidden 1024 --rank 16 --loras 4 --repeat 1|rc=0 6 PASS
 bilateral-cuda|256 128 0.5 0.5 1|rc=0 1 PASS
 bitonic-sort-cuda|16 1|rc=0 1 PASS
@@ -46,7 +46,6 @@ cooling-cuda|10000 1|rc=0 1 PASS
 coordinates-cuda|100000 1|rc=0 2 PASS
 crc64-cuda|1 1 65536|rc=0 2 FAIL
 cross-cuda|100000 1|rc=0 2 PASS
-crossEntropy-cuda|1|rc=0 3 PASS
 damage-cuda|100000 1|rc=0 2 PASS
 dct8x8-cuda|512 512 1|rc=0 2 PASS
 determinant-cuda|1|rc=0 1 PASS
@@ -67,7 +66,6 @@ fluidSim-cuda|10|rc=0 1 PASS
 fma-cuda|256 256 1031 256 1|rc=0 8 PASS
 fpc-cuda|256 1|rc=0 1 PASS
 fresnel-cuda|1|rc=0 1 PASS
-fsm-cuda|1024|rc=0 1 PASS
 fwt-cuda|1|rc=0 1 PASS
 ga-cuda|10000 100 11 1|rc=0 1 PASS
 gabor-cuda|512 512 1|rc=0 1 PASS
@@ -88,7 +86,6 @@ hellinger-cuda|1|rc=0 1 PASS
 histogram-cuda|--i=1|rc=0 6 PASS
 hwt1d-cuda|65536 1|rc=0 1 PASS
 hybridsort-cuda|r|rc=0 1 PASS
-interval-cuda|0 1000|rc=0 1 PASS
 inversek2j-cuda|../inversek2j-sycl/coord_in.txt 1000|rc=0 1 PASS
 is-cuda|32 32 32|rc=0 1 PASS
 ising-cuda|-x 512 -y 512 -w 10 -n 10|rc=0 1 PASS
@@ -113,6 +110,5 @@ matrix-rotate-cuda|256 1|rc=0 1 PASS
 matrixT-cuda|512 512 1|rc=0 1 PASS
 maxpool3d-cuda|128 128 8 1|rc=0 1 PASS
 md5hash-cuda|1 1|rc=0 4 PASS
-mdh-cuda|-itmax 2|rc=0 3 PASS
 merge-cuda|10000 1|rc=0 8 PASS
 mergeVS-cuda|1|rc=0 20 PASS

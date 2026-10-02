@@ -54,6 +54,14 @@ fetch() {
     git fetch -q --depth 1 origin "${commit[$suite]}"
   fi
   git -c advice.detachedHead=false checkout -q FETCH_HEAD
+  if [[ $suite == hecbench ]]; then
+    # Some benchmarks build or run from a sibling's files (boxfilter-cuda
+    # takes its headers and image from ../boxfilter-sycl): add every
+    # directory a listed one's Makefile or arguments name.
+    sibs=$( { entries | cut -d'|' -f2; entries | cut -d'|' -f1 | sed 's#^#src/#; s#$#/Makefile#' | xargs cat 2>/dev/null; } |
+            grep -oE '\.\./[A-Za-z0-9_.+-]+' | sed 's#^\.\./#src/#' | sort -u)
+    [[ -n $sibs ]] && git sparse-checkout add $sibs >/dev/null
+  fi
   echo "$suite at $(git rev-parse --short HEAD)"
 }
 
@@ -76,7 +84,8 @@ build() {
       ;;
     hecbench)
       entries | cut -d'|' -f1 | xargs -P "$jobs" -I{} bash -c '
-        cd src/{} && make -s CC="nvcc -cudart shared" ARCH=sm_86 EXTRA_CFLAGS="-w" > build.log 2>&1 || echo "{}: build failed" ' ;;
+        cd src/{} && make -s CC="nvcc -cudart shared" ARCH=sm_86 EXTRA_CFLAGS="-w" > build.log 2>&1 ||
+          { echo "{}: build failed"; tail -8 build.log | sed "s/^/    /"; }' ;;
     rodinia)
       entries | while IFS='|' read -r app src flags args file sum; do
         (cd "$src" && nvcc -arch=sm_86 -cudart shared -w -include "$compat" -I../util $flags -o "$app" > "$app.build.log" 2>&1) ||
