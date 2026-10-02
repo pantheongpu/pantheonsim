@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -44,6 +45,10 @@ using cd = std::complex<double>;
 // The generic API's BSR format, CUSPARSE_FORMAT_BSR. CUDA 12.0's header has no
 // name for it (BSR arrived in the generic API in 12.1), and the value is ABI.
 constexpr cusparseFormat_t kFormatBsr = static_cast<cusparseFormat_t>(6);
+// Blocked-ELL (5, in every CUDA 12 header) and sliced ELL (7, from 12.1).
+constexpr cusparseFormat_t kFormatBlockedEll = static_cast<cusparseFormat_t>(5);
+constexpr cusparseFormat_t kFormatSlicedEll = static_cast<cusparseFormat_t>(7);
+bool is_ell(cusparseFormat_t f) { return f == kFormatBlockedEll || f == kFormatSlicedEll; }
 
 struct SpMat {
   cusparseFormat_t format = CUSPARSE_FORMAT_CSR;
@@ -65,6 +70,10 @@ struct SpMat {
   // BSR: square blocks of bdim, each stored row- or column-major.
   int64_t bdim = 1;
   cusparseOrder_t block_order = CUSPARSE_ORDER_ROW;
+  // Blocked-ELL: ellCols, the width of the values array (bdim is the block
+  // size). Sliced ELL: the slice size and the length of the values array.
+  int64_t ell_cols = 0;
+  int64_t slice = 0, sell_size = 0;
 };
 
 struct DnVec {
@@ -101,6 +110,8 @@ bool is_complex(cudaDataType t) {
 }
 size_t type_bytes(cudaDataType t) {
   switch (t) {
+    case CUDA_R_8I: case CUDA_R_8U: return 1;
+    case CUDA_R_32I: return 4;
     case CUDA_R_16F: case CUDA_R_16BF: return 2;
     case CUDA_R_32F: case CUDA_C_16F: case CUDA_C_16BF: return 4;
     case CUDA_R_64F: case CUDA_C_32F: return 8;
@@ -165,14 +176,29 @@ uint16_t to_bf16(double d) {
 // One real component (a real value, or half of a complex one) of type t.
 double get_part(const uint8_t* p, cudaDataType t) {
   switch (t) {
+    case CUDA_R_8I: return (double)static_cast<int8_t>(p[0]);
+    case CUDA_R_8U: return (double)p[0];
+    case CUDA_R_32I: { int32_t i; std::memcpy(&i, p, 4); return i; }
     case CUDA_R_16F: case CUDA_C_16F: { uint16_t h; std::memcpy(&h, p, 2); return from_half(h); }
     case CUDA_R_16BF: case CUDA_C_16BF: { uint16_t h; std::memcpy(&h, p, 2); return from_bf16(h); }
     case CUDA_R_32F: case CUDA_C_32F: { float f; std::memcpy(&f, p, 4); return f; }
     default: { double d; std::memcpy(&d, p, 8); return d; }
   }
 }
+// Integer results saturate, rounding to nearest (an int8 x int8 product
+// accumulated in int32 is exact here, so only out-of-range values clamp).
+template <class I> I to_int(double v) {
+  if (std::isnan(v)) return 0;
+  const double r = std::nearbyint(v);
+  if (r <= (double)std::numeric_limits<I>::min()) return std::numeric_limits<I>::min();
+  if (r >= (double)std::numeric_limits<I>::max()) return std::numeric_limits<I>::max();
+  return (I)r;
+}
 void put_part(uint8_t* p, double v, cudaDataType t) {
   switch (t) {
+    case CUDA_R_8I: { const int8_t i = to_int<int8_t>(v); std::memcpy(p, &i, 1); return; }
+    case CUDA_R_8U: p[0] = to_int<uint8_t>(v); return;
+    case CUDA_R_32I: { const int32_t i = to_int<int32_t>(v); std::memcpy(p, &i, 4); return; }
     case CUDA_R_16F: case CUDA_C_16F: { const uint16_t h = to_half(v); std::memcpy(p, &h, 2); return; }
     case CUDA_R_16BF: case CUDA_C_16BF: { const uint16_t h = to_bf16(v); std::memcpy(p, &h, 2); return; }
     case CUDA_R_32F: case CUDA_C_32F: { const float f = (float)v; std::memcpy(p, &f, 4); return; }
@@ -249,6 +275,12 @@ bool fetch_indices(const void* dev, size_t n, cusparseIndexType_t t, std::vector
   }
   if (t == CUSPARSE_INDEX_64I)
     return cudaMemcpy(out->data(), dev, n * 8, cudaMemcpyDeviceToHost) == cudaSuccess;
+  if (t == CUSPARSE_INDEX_16U) {
+    std::vector<uint16_t> tmp(n);
+    if (cudaMemcpy(tmp.data(), dev, n * 2, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    for (size_t i = 0; i < n; ++i) (*out)[i] = tmp[i];
+    return true;
+  }
   return false;
 }
 
@@ -272,7 +304,66 @@ template <class V> struct Triplets {
   std::vector<V> val;
 };
 
+// The ELL formats' entries, in the order of their slots in the values array
+// (padding skipped, so element k of the list is not element k of the values).
+// What an RTX 3060's cuSPARSE 13.0 does with each, measured with SpMM and
+// SpMV against an identity:
+//   * Blocked-ELL: values is rows x ellCols, row-major; block slot k of block
+//     row i holds block column ellColInd[i * (ellCols / bs) + k]. A padding
+//     block (-1) is still multiplied, as block column 0 -- its values are
+//     meant to be zero, and DenseToSparse writes zeros there.
+//   * Sliced ELL: slice s of sliceSize rows starts at sliceOffsets[s] (in the
+//     index base, like CSR's offsets) and stores its slots column by column:
+//     slot k of row r is at offset + k * sliceSize + r. A slot whose column
+//     is negative after the base is padding and is skipped, whatever value it
+//     holds; any other slot is an entry.
+template <class V> bool expand_ell(const SpMat& a, Triplets<V>* t) {
+  const int64_t off = a.base == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
+  t->row.clear(); t->col.clear(); t->val.clear();
+  if (a.format == kFormatBlockedEll) {
+    const int64_t bs = a.bdim, slots = bs ? a.ell_cols / bs : 0, brows = bs ? a.rows / bs : 0;
+    std::vector<int64_t> cols;
+    std::vector<V> vals;
+    if (!fetch_indices(a.cols_ptr, (size_t)(brows * slots), a.col_type, &cols) ||
+        !fetch_values(a.values, (size_t)(a.rows * a.ell_cols), a.value_type, &vals))
+      return false;
+    for (int64_t br = 0; br < brows; ++br)
+      for (int64_t k = 0; k < slots; ++k) {
+        const int64_t bc = std::max<int64_t>(0, cols[(size_t)(br * slots + k)] - off);
+        for (int64_t r = 0; r < bs; ++r)
+          for (int64_t c = 0; c < bs; ++c) {
+            t->row.push_back(br * bs + r);
+            t->col.push_back(bc * bs + c);
+            t->val.push_back(vals[(size_t)((br * bs + r) * a.ell_cols + k * bs + c)]);
+          }
+      }
+    return true;
+  }
+  const int64_t ss = a.slice, nslices = ss > 0 ? (a.rows + ss - 1) / ss : 0;
+  std::vector<int64_t> offs, cols;
+  std::vector<V> vals;
+  if (ss <= 0 || !fetch_indices(a.rows_ptr, (size_t)nslices + 1, a.row_type, &offs) ||
+      !fetch_indices(a.cols_ptr, (size_t)a.sell_size, a.col_type, &cols) ||
+      !fetch_values(a.values, (size_t)a.sell_size, a.value_type, &vals))
+    return false;
+  for (int64_t s = 0; s < nslices; ++s) {
+    const int64_t begin = offs[(size_t)s] - off, end = offs[(size_t)s + 1] - off;
+    if (begin < 0 || end < begin || end > a.sell_size) return false;
+    const int64_t width = (end - begin) / ss;
+    for (int64_t k = 0; k < width; ++k)
+      for (int64_t r = 0; r < ss && s * ss + r < a.rows; ++r) {
+        const int64_t e = begin + k * ss + r, c = cols[(size_t)e] - off;
+        if (c < 0) continue;
+        t->row.push_back(s * ss + r);
+        t->col.push_back(c);
+        t->val.push_back(vals[(size_t)e]);
+      }
+  }
+  return true;
+}
+
 template <class V> bool expand(const SpMat& a, Triplets<V>* t) {
+  if (is_ell(a.format)) return expand_ell(a, t);
   std::vector<V> vals;
   if (!fetch_values(a.values, (size_t)a.nnz, a.value_type, &vals)) return false;
   const int64_t off = a.base == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
@@ -619,6 +710,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCsrGet(cusparseSpMatDescr_t d, int64_t* row
                                             cusparseIndexBase_t* base, cudaDataType* vt) {
   if (!known(d)) return CUSPARSE_STATUS_INVALID_VALUE;
   auto* m = reinterpret_cast<SpMat*>(d);
+  if (is_ell(m->format)) return CUSPARSE_STATUS_INVALID_VALUE;  // measured: "invalid sparse matrix format"
   if (rows) *rows = m->rows;
   if (cols) *cols = m->cols;
   if (nnz) *nnz = m->nnz;
@@ -806,7 +898,16 @@ cusparseStatus_t spmv(cusparseHandle_t h, cusparseOperation_t op, const void* al
 }
 
 cusparseStatus_t spmv_check(cusparseOperation_t op, const SpMat& A, const DnVec& X, const DnVec& Y,
-                            cudaDataType ct) {
+                            cudaDataType ct, cusparseSpMVAlg_t alg) {
+  // Blocked-ELL is SpMM's alone; sliced ELL takes CUSPARSE_SPMV_SELL_ALG1 (5)
+  // or the default, with A, x and y of one type (an RTX 3060's 13.0 refuses
+  // half A with single x and y).
+  if (A.format == kFormatBlockedEll) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  if (A.format == kFormatSlicedEll) {
+    if (alg != CUSPARSE_SPMV_ALG_DEFAULT && alg != static_cast<cusparseSpMVAlg_t>(5)) return CUSPARSE_STATUS_INVALID_VALUE;
+    if (A.value_type != X.type || A.value_type != Y.type) return CUSPARSE_STATUS_NOT_SUPPORTED;
+    if (A.slice <= 0) return CUSPARSE_STATUS_INVALID_VALUE;  // NVIDIA's faults on the device
+  }
   if (!type_bytes(ct)) return CUSPARSE_STATUS_NOT_SUPPORTED;
   if (bad_conj(op, A.value_type)) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!complex_combo_ok(A.value_type, X.type, Y.type, ct, true)) return CUSPARSE_STATUS_NOT_SUPPORTED;
@@ -820,11 +921,11 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV_bufferSize(cusparseHandle_t, cusparseO
                                                      const void*, cusparseConstSpMatDescr_t matA,
                                                      cusparseConstDnVecDescr_t vecX, const void*,
                                                      cusparseDnVecDescr_t vecY, cudaDataType ct,
-                                                     cusparseSpMVAlg_t, size_t* bytes) {
+                                                     cusparseSpMVAlg_t alg, size_t* bytes) {
   if (bytes) *bytes = 0;   // host-computed: no device workspace to size
   if (known(matA) && known(vecX) && known(vecY))
     return spmv_check(op, *reinterpret_cast<const SpMat*>(matA), *reinterpret_cast<const DnVec*>(vecX),
-                      *reinterpret_cast<const DnVec*>(vecY), ct);
+                      *reinterpret_cast<const DnVec*>(vecY), ct, alg);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -848,7 +949,7 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   auto& Y = *reinterpret_cast<DnVec*>(vecY);
-  if (const cusparseStatus_t st = spmv_check(op, A, X, Y, ct); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = spmv_check(op, A, X, Y, ct, alg); st != CUSPARSE_STATUS_SUCCESS) return st;
   return any_complex({A.value_type, X.type, Y.type, ct}) ? spmv<cd>(h, op, alpha, A, X, beta, Y, ct)
                                                          : spmv<double>(h, op, alpha, A, X, beta, Y, ct);
 }
@@ -933,7 +1034,32 @@ cusparseStatus_t spmm(cusparseHandle_t h, cusparseOperation_t opA, cusparseOpera
 }
 
 cusparseStatus_t spmm_check(cusparseOperation_t opA, cusparseOperation_t opB, const SpMat& A, const DnMat& B,
-                            const DnMat& C, cudaDataType ct) {
+                            const DnMat& C, cudaDataType ct, cusparseSpMMAlg_t alg) {
+  if (A.format == kFormatSlicedEll) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  if (A.format == kFormatBlockedEll) {
+    // What an RTX 3060's 13.0 takes (CUSPARSE_SPMM_BLOCKED_ELL_ALG1, 13, or
+    // the default; any other algorithm is INVALID_VALUE): op(A) = A; real
+    // values, A and B of one type, with C and the compute type
+    //   half: C half or single, compute half (C half) or single;
+    //   bfloat16: C bfloat16 or single, compute single;
+    //   single and double: all the same;
+    //   int8: C int32 and compute int32, B and C column-major.
+    if (alg != CUSPARSE_SPMM_ALG_DEFAULT && alg != static_cast<cusparseSpMMAlg_t>(13))
+      return CUSPARSE_STATUS_INVALID_VALUE;
+    if (opA != CUSPARSE_OPERATION_NON_TRANSPOSE) return CUSPARSE_STATUS_NOT_SUPPORTED;
+    const cudaDataType a = A.value_type;
+    bool ok = a == B.type;
+    switch (a) {
+      case CUDA_R_16F: ok = ok && (C.type == a || C.type == CUDA_R_32F) && (ct == CUDA_R_32F || (ct == a && C.type == a)); break;
+      case CUDA_R_16BF: ok = ok && (C.type == a || C.type == CUDA_R_32F) && ct == CUDA_R_32F; break;
+      case CUDA_R_32F: case CUDA_R_64F: ok = ok && C.type == a && ct == a; break;
+      case CUDA_R_8I:
+        ok = ok && C.type == CUDA_R_32I && ct == CUDA_R_32I && B.order == CUSPARSE_ORDER_COL && C.order == CUSPARSE_ORDER_COL;
+        break;
+      default: ok = false;
+    }
+    if (!ok) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  }
   if (!type_bytes(ct)) return CUSPARSE_STATUS_NOT_SUPPORTED;
   if (bad_conj(opA, A.value_type) || bad_conj(opB, B.type)) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!complex_combo_ok(A.value_type, B.type, C.type, ct, true)) return CUSPARSE_STATUS_NOT_SUPPORTED;
@@ -956,11 +1082,11 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMM_bufferSize(cusparseHandle_t, cusparseO
                                                      cusparseConstSpMatDescr_t matA,
                                                      cusparseConstDnMatDescr_t matB, const void*,
                                                      cusparseDnMatDescr_t matC, cudaDataType ct,
-                                                     cusparseSpMMAlg_t, size_t* bytes) {
+                                                     cusparseSpMMAlg_t alg, size_t* bytes) {
   if (bytes) *bytes = 0;
   if (known(matA) && known(matB) && known(matC))
     return spmm_check(opA, opB, *reinterpret_cast<const SpMat*>(matA), *reinterpret_cast<const DnMat*>(matB),
-                      *reinterpret_cast<const DnMat*>(matC), ct);
+                      *reinterpret_cast<const DnMat*>(matC), ct, alg);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -985,7 +1111,7 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMM(cusparseHandle_t h, cusparseOperation_
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   const auto& B = *reinterpret_cast<const DnMat*>(matB);
   const auto& C = *reinterpret_cast<const DnMat*>(matC);
-  if (const cusparseStatus_t st = spmm_check(opA, opB, A, B, C, ct); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = spmm_check(opA, opB, A, B, C, ct, alg); st != CUSPARSE_STATUS_SUCCESS) return st;
   return any_complex({A.value_type, B.type, C.type, ct}) ? spmm<cd>(h, opA, opB, alpha, A, B, beta, C, ct)
                                                          : spmm<double>(h, opA, opB, alpha, A, B, beta, C, ct);
 }
@@ -1004,8 +1130,13 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMM_preprocess(cusparseHandle_t, cusparseO
    (NOT_SUPPORTED) at _bufferSize, so this does too. */
 
 namespace {
-cusparseStatus_t convert_check(const SpMat& A) {
-  return A.format == kFormatBsr ? CUSPARSE_STATUS_NOT_SUPPORTED : CUSPARSE_STATUS_SUCCESS;
+// Neither direction takes sliced ELL, and only DenseToSparse takes
+// Blocked-ELL (filling the values of the blocks its column indices name), as
+// an RTX 3060's 13.0 answers.
+cusparseStatus_t convert_check(const SpMat& A, bool to_sparse) {
+  if (A.format == kFormatBsr || A.format == kFormatSlicedEll) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  if (A.format == kFormatBlockedEll && !to_sparse) return CUSPARSE_STATUS_NOT_SUPPORTED;
+  return CUSPARSE_STATUS_SUCCESS;
 }
 
 template <class V> cusparseStatus_t sparse_to_dense(const SpMat& A, DnMat& B) {
@@ -1030,6 +1161,28 @@ template <class V> cusparseStatus_t dense_nnz(const DnMat& A, int64_t* nnz) {
     for (int64_t c = 0; c < A.cols; ++c)
       if (d[dn_index(A, r, c)] != V(0.0)) ++*nnz;
   return CUSPARSE_STATUS_SUCCESS;
+}
+
+// Blocked-ELL: the blocks B's column indices name, copied out of A; a padding
+// block (-1) gets zeros, as an RTX 3060's 13.0 writes.
+template <class V> cusparseStatus_t dense_to_bell(const DnMat& A, SpMat& B) {
+  std::vector<V> d;
+  std::vector<int64_t> cols;
+  const int64_t bs = B.bdim, slots = B.ell_cols / bs, brows = B.rows / bs;
+  const int64_t off = B.base == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
+  if (!fetch_values(A.values, dn_elems(A), A.type, &d) ||
+      !fetch_indices(B.cols_ptr, (size_t)(brows * slots), B.col_type, &cols))
+    return CUSPARSE_STATUS_INTERNAL_ERROR;
+  std::vector<V> vals((size_t)(B.rows * B.ell_cols), V(0.0));
+  for (int64_t br = 0; br < brows; ++br)
+    for (int64_t k = 0; k < slots; ++k) {
+      const int64_t bc = cols[(size_t)(br * slots + k)] - off;
+      if (bc < 0 || bc * bs >= B.cols) continue;
+      for (int64_t r = 0; r < bs; ++r)
+        for (int64_t c = 0; c < bs; ++c)
+          vals[(size_t)((br * bs + r) * B.ell_cols + k * bs + c)] = d[dn_index(A, br * bs + r, bc * bs + c)];
+    }
+  return store_values(B.values, vals, B.value_type) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_INTERNAL_ERROR;
 }
 
 template <class V> cusparseStatus_t dense_to_sparse(const DnMat& A, SpMat& B) {
@@ -1088,7 +1241,7 @@ VGPU_EXPORT cusparseStatus_t cusparseSparseToDense_bufferSize(cusparseHandle_t,
                                                               cusparseSparseToDenseAlg_t,
                                                               size_t* bytes) {
   if (bytes) *bytes = 0;
-  return known(matA) ? convert_check(*reinterpret_cast<const SpMat*>(matA)) : CUSPARSE_STATUS_SUCCESS;
+  return known(matA) ? convert_check(*reinterpret_cast<const SpMat*>(matA), false) : CUSPARSE_STATUS_SUCCESS;
 }
 
 VGPU_EXPORT cusparseStatus_t cusparseSparseToDense(cusparseHandle_t h,
@@ -1105,7 +1258,7 @@ VGPU_EXPORT cusparseStatus_t cusparseSparseToDense(cusparseHandle_t h,
   }
   const auto& A = *reinterpret_cast<const SpMat*>(matA);
   auto& B = *reinterpret_cast<DnMat*>(matB);
-  if (const cusparseStatus_t st = convert_check(A); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = convert_check(A, false); st != CUSPARSE_STATUS_SUCCESS) return st;
   return any_complex({A.value_type, B.type}) ? sparse_to_dense<cd>(A, B) : sparse_to_dense<double>(A, B);
 }
 
@@ -1115,7 +1268,7 @@ VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_bufferSize(cusparseHandle_t,
                                                               cusparseDenseToSparseAlg_t,
                                                               size_t* bytes) {
   if (bytes) *bytes = 0;
-  return known(matB) ? convert_check(*reinterpret_cast<const SpMat*>(matB)) : CUSPARSE_STATUS_SUCCESS;
+  return known(matB) ? convert_check(*reinterpret_cast<const SpMat*>(matB), true) : CUSPARSE_STATUS_SUCCESS;
 }
 
 // Two-call protocol: _analysis fills in nnz, the caller allocates, _convert
@@ -1127,7 +1280,8 @@ VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_analysis(cusparseHandle_t h,
   if (!known(h) || !known(matA) || !known(matB)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   const auto& A = *reinterpret_cast<const DnMat*>(matA);
   auto& B = *reinterpret_cast<SpMat*>(matB);
-  if (const cusparseStatus_t st = convert_check(B); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = convert_check(B, true); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (B.format == kFormatBlockedEll) return CUSPARSE_STATUS_SUCCESS;  // the structure is the caller's
   return is_complex(A.type) ? dense_nnz<cd>(A, &B.nnz) : dense_nnz<double>(A, &B.nnz);
 }
 
@@ -1139,6 +1293,8 @@ VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_convert(cusparseHandle_t h,
   const auto& A = *reinterpret_cast<const DnMat*>(matA);
   auto& B = *reinterpret_cast<SpMat*>(matB);
   if (A.rows != B.rows || A.cols != B.cols) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (B.format == kFormatBlockedEll)
+    return any_complex({A.type, B.value_type}) ? dense_to_bell<cd>(A, B) : dense_to_bell<double>(A, B);
   if (B.format != CUSPARSE_FORMAT_CSR && B.format != CUSPARSE_FORMAT_CSC && B.format != CUSPARSE_FORMAT_COO)
     return CUSPARSE_STATUS_NOT_SUPPORTED;
   return any_complex({A.type, B.value_type}) ? dense_to_sparse<cd>(A, B) : dense_to_sparse<double>(A, B);
@@ -1286,6 +1442,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCsrSetStridedBatch(cusparseSpMatDescr_t d, 
                                                         int64_t off_stride, int64_t val_stride) {
   if (!known(d) || count < 1) return CUSPARSE_STATUS_INVALID_VALUE;
   auto* m = reinterpret_cast<SpMat*>(d);
+  if (is_ell(m->format)) return CUSPARSE_STATUS_INVALID_VALUE;
   m->batch = count;
   m->off_stride = off_stride;
   m->val_stride = m->col_stride = val_stride;
@@ -1294,6 +1451,7 @@ VGPU_EXPORT cusparseStatus_t cusparseCsrSetStridedBatch(cusparseSpMatDescr_t d, 
 VGPU_EXPORT cusparseStatus_t cusparseCooSetStridedBatch(cusparseSpMatDescr_t d, int count, int64_t stride) {
   if (!known(d) || count < 1) return CUSPARSE_STATUS_INVALID_VALUE;
   auto* m = reinterpret_cast<SpMat*>(d);
+  if (is_ell(m->format)) return CUSPARSE_STATUS_INVALID_VALUE;
   m->batch = count;
   m->off_stride = m->col_stride = m->val_stride = stride;
   return CUSPARSE_STATUS_SUCCESS;
@@ -1632,7 +1790,10 @@ namespace {
 struct SpGEMMDescr {
   std::vector<int64_t> off, col;
   std::vector<cd> val;
+  int64_t products = 0;     // cusparseSpGEMM_getNumProducts, once workEstimation has seen a buffer
+  bool structured = false;  // SpGEMMreuse: off and col hold C's structure
 };
+int64_t count_products(const SpMat& A, const SpMat& B);
 bool put_index_array(void* dev, const std::vector<int64_t>& v, cusparseIndexType_t t, int64_t base) {
   if (v.empty()) return true;
   if (t == CUSPARSE_INDEX_32I) {
@@ -1695,12 +1856,15 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_destroyDescr(cusparseSpGEMMDescr_t d
 // non-NULL buffer.
 VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_workEstimation(cusparseHandle_t h, cusparseOperation_t,
                                                            cusparseOperation_t, const void*,
-                                                           cusparseConstSpMatDescr_t, cusparseConstSpMatDescr_t,
+                                                           cusparseConstSpMatDescr_t matA, cusparseConstSpMatDescr_t matB,
                                                            const void*, cusparseSpMatDescr_t, cudaDataType,
                                                            cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d,
                                                            size_t* bytes, void* buffer) {
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!buffer && bytes) *bytes = 16;
+  if (buffer && known(matA) && known(matB))
+    reinterpret_cast<SpGEMMDescr*>(d)->products =
+        count_products(*reinterpret_cast<const SpMat*>(matA), *reinterpret_cast<const SpMat*>(matB));
   return CUSPARSE_STATUS_SUCCESS;
 }
 VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_compute(cusparseHandle_t h, cusparseOperation_t opA,
@@ -1722,7 +1886,8 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_compute(cusparseHandle_t h, cusparse
   const auto& B = *reinterpret_cast<const SpMat*>(matB);
   auto& C = *reinterpret_cast<SpMat*>(matC);
   if (A.cols != B.rows || C.rows != A.rows || C.cols != B.cols) return CUSPARSE_STATUS_INVALID_VALUE;
-  if (C.format != CUSPARSE_FORMAT_CSR || A.format == kFormatBsr || B.format == kFormatBsr)
+  if (C.format != CUSPARSE_FORMAT_CSR || A.format == kFormatBsr || B.format == kFormatBsr || is_ell(A.format) ||
+      is_ell(B.format))
     return CUSPARSE_STATUS_NOT_SUPPORTED;
   auto& g = *reinterpret_cast<SpGEMMDescr*>(d);
   return any_complex({A.value_type, B.value_type, C.value_type, ct})
@@ -1749,6 +1914,7 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_copy(cusparseHandle_t h, cusparseOpe
 namespace {
 cusparseStatus_t sddmm_check(cusparseOperation_t opA, cusparseOperation_t opB, const DnMat& A, const DnMat& B,
                              const SpMat& C, cudaDataType ct) {
+  if (is_ell(C.format)) return CUSPARSE_STATUS_NOT_SUPPORTED;  // CSR and BSR only (measured: sliced ELL)
   if (!type_bytes(ct)) return CUSPARSE_STATUS_NOT_SUPPORTED;
   if (bad_conj(opA, A.type) || bad_conj(opB, B.type)) return CUSPARSE_STATUS_INVALID_VALUE;
   // A conjugate transpose of a complex operand is refused. NVIDIA documents
@@ -1841,7 +2007,21 @@ VGPU_EXPORT cusparseStatus_t cusparseSDDMM(cusparseHandle_t h, cusparseOperation
 /* ---- triangular solves: op(A) y = alpha x (SpSV), op(A) C = alpha op(B) (SpSM) ---- */
 
 namespace {
-struct TriDescr {};
+// What SpSV/SpSM's analysis saw, and cusparseSp{SV,SM}_updateMatrix's
+// replacements: an RTX 3060's 13.0 solves with the updated values without
+// touching the matrix descriptor or its arrays, a GENERAL update replacing
+// every value and a DIAGONAL one only the diagonal (from a dense array of
+// rows values), the two combining. Both are copied when given.
+struct TriDescr {
+  SpMat mat;
+  bool analysed = false;
+  void* values = nullptr;  // owned device copies
+  void* diag = nullptr;
+  ~TriDescr() {
+    if (values) cudaFree(values);
+    if (diag) cudaFree(diag);
+  }
+};
 
 // op(A) restricted to the triangle A's fill mode names, as rows of (column,
 // value), with its diagonal apart. Entries outside the triangle are ignored,
@@ -1876,11 +2056,23 @@ cusparseStatus_t triangle_from(const Triplets<V>& tr, int64_t n, bool lower, boo
   }
   return CUSPARSE_STATUS_SUCCESS;
 }
-template <class V> cusparseStatus_t triangle(const SpMat& A, cusparseOperation_t op, Triangle<V>* t) {
+template <class V>
+cusparseStatus_t triangle(const SpMat& A0, cusparseOperation_t op, Triangle<V>* t, const TriDescr* d = nullptr) {
+  SpMat A = A0;
+  if (d && d->values) A.values = d->values;
   if (A.rows != A.cols) return CUSPARSE_STATUS_INVALID_VALUE;
   Triplets<V> tr;
   if (!expand(A, &tr)) return CUSPARSE_STATUS_INTERNAL_ERROR;
-  return triangle_from(tr, A.rows, A.fill == CUSPARSE_FILL_MODE_LOWER, A.diag == CUSPARSE_DIAG_TYPE_UNIT, op, t);
+  const cusparseStatus_t st =
+      triangle_from(tr, A.rows, A.fill == CUSPARSE_FILL_MODE_LOWER, A.diag == CUSPARSE_DIAG_TYPE_UNIT, op, t);
+  if (st != CUSPARSE_STATUS_SUCCESS || !d || !d->diag || A.diag == CUSPARSE_DIAG_TYPE_UNIT) return st;
+  std::vector<V> dg;
+  if (!fetch_values(d->diag, (size_t)A.rows, A.value_type, &dg)) return CUSPARSE_STATUS_INTERNAL_ERROR;
+  for (int64_t i = 0; i < A.rows; ++i) {
+    t->diag[(size_t)i] = conj_op(dg[(size_t)i], op);
+    t->has_diag[(size_t)i] = 1;
+  }
+  return st;
 }
 // Substitution in place: `x` holds the right-hand side and ends as the solution.
 // A zero on the diagonal gives inf/nan where hardware reports a structural zero.
@@ -1898,7 +2090,8 @@ cusparseStatus_t spsv_check(cusparseOperation_t op, const SpMat& A, cudaDataType
   if (!type_bytes(ct)) return CUSPARSE_STATUS_NOT_SUPPORTED;
   if (bad_conj(op, A.value_type)) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!complex_combo_ok(A.value_type, x, y, ct, false)) return CUSPARSE_STATUS_NOT_SUPPORTED;
-  if (A.format == kFormatBsr) return CUSPARSE_STATUS_NOT_SUPPORTED;  // CSR, COO (and sliced ELL) only
+  // CSR, COO and sliced ELL only.
+  if (A.format == kFormatBsr || A.format == kFormatBlockedEll) return CUSPARSE_STATUS_NOT_SUPPORTED;
   return CUSPARSE_STATUS_SUCCESS;
 }
 cusparseStatus_t spsm_check(cusparseOperation_t opA, cusparseOperation_t opB, const SpMat& A, const DnMat& B,
@@ -1913,10 +2106,10 @@ cusparseStatus_t spsm_check(cusparseOperation_t opA, cusparseOperation_t opB, co
 
 template <class V>
 cusparseStatus_t spsv(cusparseHandle_t h, cusparseOperation_t op, const void* alpha, const SpMat& A, const DnVec& X,
-                      const DnVec& Y, cudaDataType ct) {
+                      const DnVec& Y, cudaDataType ct, const TriDescr* d) {
   if (X.size != A.rows || Y.size != A.rows) return CUSPARSE_STATUS_INVALID_VALUE;
   Triangle<V> t;
-  if (const cusparseStatus_t st = triangle(A, op, &t); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = triangle(A, op, &t, d); st != CUSPARSE_STATUS_SUCCESS) return st;
   std::vector<V> x;
   if (!fetch_values(X.values, (size_t)X.size, X.type, &x)) return CUSPARSE_STATUS_INTERNAL_ERROR;
   const V al = scalar<V>(h, alpha, ct);
@@ -1927,11 +2120,11 @@ cusparseStatus_t spsv(cusparseHandle_t h, cusparseOperation_t op, const void* al
 
 template <class V>
 cusparseStatus_t spsm(cusparseHandle_t h, cusparseOperation_t opA, cusparseOperation_t opB, const void* alpha,
-                      const SpMat& A, const DnMat& B, const DnMat& C, cudaDataType ct) {
+                      const SpMat& A, const DnMat& B, const DnMat& C, cudaDataType ct, const TriDescr* d) {
   const int64_t brows = transposed(opB) ? B.cols : B.rows, ncols = transposed(opB) ? B.rows : B.cols;
   if (brows != A.rows || C.rows != A.rows || C.cols != ncols) return CUSPARSE_STATUS_INVALID_VALUE;
   Triangle<V> t;
-  if (const cusparseStatus_t st = triangle(A, opA, &t); st != CUSPARSE_STATUS_SUCCESS) return st;
+  if (const cusparseStatus_t st = triangle(A, opA, &t, d); st != CUSPARSE_STATUS_SUCCESS) return st;
   std::vector<V> b, c;
   if (!fetch_values(B.values, dn_elems(B), B.type, &b) || !fetch_values(C.values, dn_elems(C), C.type, &c))
     return CUSPARSE_STATUS_INTERNAL_ERROR;
@@ -1979,6 +2172,10 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSV_analysis(cusparseHandle_t h, cusparseO
                                                    cusparseDnVecDescr_t vecY, cudaDataType ct, cusparseSpSVAlg_t,
                                                    cusparseSpSVDescr_t d, void*) {
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (known(matA)) {
+    reinterpret_cast<TriDescr*>(d)->mat = *reinterpret_cast<const SpMat*>(matA);
+    reinterpret_cast<TriDescr*>(d)->analysed = true;
+  }
   if (known(matA) && known(vecX) && known(vecY))
     return spsv_check(op, *reinterpret_cast<const SpMat*>(matA), reinterpret_cast<const DnVec*>(vecX)->type,
                       reinterpret_cast<const DnVec*>(vecY)->type, ct);
@@ -2005,8 +2202,9 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSV_solve(cusparseHandle_t h, cusparseOper
   const auto& X = *reinterpret_cast<const DnVec*>(vecX);
   const auto& Y = *reinterpret_cast<const DnVec*>(vecY);
   if (const cusparseStatus_t st = spsv_check(op, A, X.type, Y.type, ct); st != CUSPARSE_STATUS_SUCCESS) return st;
-  return any_complex({A.value_type, X.type, Y.type, ct}) ? spsv<cd>(h, op, alpha, A, X, Y, ct)
-                                                         : spsv<double>(h, op, alpha, A, X, Y, ct);
+  const auto* td = reinterpret_cast<const TriDescr*>(d);
+  return any_complex({A.value_type, X.type, Y.type, ct}) ? spsv<cd>(h, op, alpha, A, X, Y, ct, td)
+                                                         : spsv<double>(h, op, alpha, A, X, Y, ct, td);
 }
 
 VGPU_EXPORT cusparseStatus_t cusparseSpSM_bufferSize(cusparseHandle_t h, cusparseOperation_t opA,
@@ -2027,6 +2225,10 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSM_analysis(cusparseHandle_t h, cusparseO
                                                    cusparseDnMatDescr_t matC, cudaDataType ct, cusparseSpSMAlg_t,
                                                    cusparseSpSMDescr_t d, void*) {
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
+  if (known(matA)) {
+    reinterpret_cast<TriDescr*>(d)->mat = *reinterpret_cast<const SpMat*>(matA);
+    reinterpret_cast<TriDescr*>(d)->analysed = true;
+  }
   if (known(matA) && known(matB) && known(matC))
     return spsm_check(opA, opB, *reinterpret_cast<const SpMat*>(matA), *reinterpret_cast<const DnMat*>(matB),
                       *reinterpret_cast<const DnMat*>(matC), ct);
@@ -2051,8 +2253,9 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSM_solve(cusparseHandle_t h, cusparseOper
   const auto& B = *reinterpret_cast<const DnMat*>(matB);
   const auto& C = *reinterpret_cast<const DnMat*>(matC);
   if (const cusparseStatus_t st = spsm_check(opA, opB, A, B, C, ct); st != CUSPARSE_STATUS_SUCCESS) return st;
-  return any_complex({A.value_type, B.type, C.type, ct}) ? spsm<cd>(h, opA, opB, alpha, A, B, C, ct)
-                                                         : spsm<double>(h, opA, opB, alpha, A, B, C, ct);
+  const auto* td = reinterpret_cast<const TriDescr*>(d);
+  return any_complex({A.value_type, B.type, C.type, ct}) ? spsm<cd>(h, opA, opB, alpha, A, B, C, ct, td)
+                                                         : spsm<double>(h, opA, opB, alpha, A, B, C, ct, td);
 }
 
 /* ---- the blocked (BSR) legacy API, csric02 and csrilu02 ----
@@ -2816,3 +3019,8 @@ VGPU_LEGACY_BSR(D, double)
 VGPU_LEGACY_BSR(C, cuComplex)
 VGPU_LEGACY_BSR(Z, cuDoubleComplex)
 #undef VGPU_LEGACY_BSR
+
+#include "cusparse_ell.inc"
+#include "cusparse_spvec.inc"
+#include "cusparse_generic_rest.inc"
+#include "cusparse_tridiag.inc"
