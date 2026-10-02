@@ -435,9 +435,11 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   vgpu_toolkit_soversion(cublas 13 SO_CUBLAS)
   vgpu_version_script(cublas ${SO_CUBLAS} _cublas_map)
-  add_library(vgpucublas SHARED nvidia/src/cublas_api.cpp nvidia/src/generated/cublas_stubs.cpp)
+  add_library(vgpucublas SHARED nvidia/src/cublas_api.cpp nvidia/src/generated/cublas_stubs.cpp
+              nvidia/src/cublas_xt.cpp nvidia/src/cublas_legacy_core.cpp
+              nvidia/src/generated/cublas_64.cpp nvidia/src/generated/cublas_legacy.cpp)
   target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
-  target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE})
+  target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE} nvidia/src)
   set_target_properties(vgpucublas PROPERTIES
     OUTPUT_NAME cublas SOVERSION ${SO_CUBLAS} VERSION ${SO_CUBLAS}.0)
   target_link_options(vgpucublas PRIVATE "-Wl,--version-script=${_cublas_map}")
@@ -1419,8 +1421,17 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                 "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor" "cutensornet_paths:cutensornet")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver"
+                          "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse"
+                          "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt"
+                          "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
+                          "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
+                          "blas_level23_paths:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
+                          "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
+                          "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+                          "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
+                          "cutensornet_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1435,8 +1446,9 @@ if(TARGET vgpucublas)
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer
   # access and peer copies have a peer, and a managed variable two devices;
-  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both.
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver")
+  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, as
+  # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles.
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
