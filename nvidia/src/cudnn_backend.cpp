@@ -1856,7 +1856,7 @@ void run_paged_load(const Op& op, const std::vector<const std::vector<double>*>&
   const vc::Layout &C = op.in[op.role[kContainer]].l, &T = op.in[op.role[kPageTable]].l, &Y = op.out.l;
   // y may be declared transposed ([B, H, D, S], K's form for Q K^T): its
   // strides say which; the gather is done in [B, H, S, D] and laid out.
-  const bool kt = Y.dims[3] != C.dims[3];
+  const bool kt = Y.dims[2] == C.dims[3] && Y.strides[2] < Y.strides[3] && (Y.dims[3] != C.dims[3] || Y.strides[2] == 1);
   const int64_t S = kt ? Y.dims[3] : Y.dims[2];
   std::vector<double> g;
   page_gather(C, *in[op.role[kContainer]], *in[op.role[kPageTable]], T.dims[2], Y.dims[0], S, in[op.role[kSeqLen]], &g);

@@ -5,7 +5,7 @@
 //     log-sum-exp statistics a training pass keeps, a causal (top-left or
 //     bottom-right) or sliding-window mask, per-batch padding (sequence
 //     lengths, or packed variable-length sequences through ragged offsets),
-//     grouped-query heads, and Philox dropout;
+//     grouped-query heads, paged K/V caches, and Philox dropout;
 //   - backward: dQ, dK, dV (and dBias) from O, dO and the statistics;
 //
 // both as the frontend's UNIFIED node (one SDPA operation, cuDNN 9.13+) and
@@ -220,6 +220,7 @@ struct Cfg {
   bool backward = true;
   bool bhsd_interleaved = false;  // Q/K/V/O as [b, s, h, d] in memory
   bool ragged = false;            // packed sequences (THD), with ragged offsets; implies padding
+  int64_t page = 0;               // paged K/V caches of this block size (forward only; implies padding)
 };
 
 // A ragged (THD) tensor: batch b's tokens start at offset[b] = (tokens
@@ -409,7 +410,28 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   auto Seed = make_buf(fe::DataType_t::INT64, {1, 1, 1, 1}, {1, 1, 1, 1}, {static_cast<double>(seed_v)});
   auto Offset = make_buf(fe::DataType_t::INT64, {1, 1, 1, 1}, {1, 1, 1, 1}, {static_cast<double>(offset_v)});
 
-  enum : int64_t { kQ = 1, kK, kV, kO, kStats, kBias, kSeqQ, kSeqKV, kSeed, kOffset, kMask, kdO, kdQ, kdK, kdV, kdBias, kRagQ, kRagKV };
+  enum : int64_t { kQ = 1, kK, kV, kO, kStats, kBias, kSeqQ, kSeqKV, kSeed, kOffset, kMask, kdO, kdQ, kdK, kdV, kdBias, kRagQ, kRagKV,
+                   kTableK, kTableV };
+  // Paged K and V: each batch's sequence in pages of c.page positions,
+  // scattered over a container of blocks in a shuffled order the page table
+  // records.
+  const int64_t pages = c.page ? c.skv / c.page : 0, nblocks = c.b * pages;
+  std::vector<double> table(static_cast<size_t>(nblocks));
+  for (int64_t i = 0; i < nblocks; ++i) table[i] = static_cast<double>((i * 5 + 3) % nblocks);
+  auto paged = [&](const std::vector<double>& logical, int64_t D) {
+    std::vector<double> cont(static_cast<size_t>(nblocks * c.hk * c.page * D), 0.0);
+    for (int64_t b = 0; b < c.b; ++b)
+      for (int64_t h = 0; h < c.hk; ++h)
+        for (int64_t s = 0; s < c.skv; ++s)
+          for (int64_t d = 0; d < D; ++d) {
+            const int64_t blk = static_cast<int64_t>(table[b * pages + s / c.page]);
+            cont[((blk * c.hk + h) * c.page + s % c.page) * D + d] = logical[((b * c.hk + h) * c.skv + s) * D + d];
+          }
+    return cont;
+  };
+  auto KC = c.page ? make_buf(T, {nblocks, c.hk, c.page, c.d}, {c.hk * c.page * c.d, c.page * c.d, c.d, 1}, paged(K->v, c.d)) : nullptr;
+  auto VC = c.page ? make_buf(T, {nblocks, c.hk, c.page, c.dv}, {c.hk * c.page * c.dv, c.page * c.dv, c.dv, 1}, paged(V->v, c.dv)) : nullptr;
+  auto Table = make_buf(fe::DataType_t::INT32, {c.b, 1, pages ? pages : 1, 1}, {pages ? pages : 1, pages ? pages : 1, 1, 1}, table);
   auto common = [&](fe::graph::Graph& g) {
     g.set_io_data_type(T).set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
   };
@@ -430,8 +452,10 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   fe::graph::Graph fg;
   common(fg);
   auto q = tensor(fg, kQ, "Q", {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d));
-  auto k = tensor(fg, kK, "K", {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d));
-  auto v = tensor(fg, kV, "V", {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv));
+  auto k = c.page ? tensor(fg, kK, "K", {nblocks, c.hk, c.page, c.d}, {c.hk * c.page * c.d, c.page * c.d, c.d, 1})
+                   : tensor(fg, kK, "K", {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d));
+  auto v = c.page ? tensor(fg, kV, "V", {nblocks, c.hk, c.page, c.dv}, {c.hk * c.page * c.dv, c.page * c.dv, c.dv, 1})
+                   : tensor(fg, kV, "V", {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv));
   std::shared_ptr<fe::graph::Tensor_attributes> frq, frkv;
   if (c.ragged) {
     frq = ragged(fg, true), frkv = ragged(fg, false);
@@ -444,6 +468,11 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
         .set_diagonal_band_right_bound(0);
   }
   if (c.left >= 0) opts.set_diagonal_band_left_bound(c.left);
+  if (c.page) {
+    opts.set_paged_attention_k_table(tensor(fg, kTableK, "table_k", {c.b, 1, pages, 1}, {pages, pages, 1, 1}, fe::DataType_t::INT32));
+    opts.set_paged_attention_v_table(tensor(fg, kTableV, "table_v", {c.b, 1, pages, 1}, {pages, pages, 1, 1}, fe::DataType_t::INT32));
+    opts.set_paged_attention_max_seq_len_kv(static_cast<int>(c.skv));
+  }
   if (c.bias) opts.set_bias(tensor(fg, kBias, "bias", {1, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}));
   if (c.padding)
     opts.set_padding_mask(true)
@@ -461,6 +490,7 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   if (stats) stats->set_output(true).set_uid(kStats).set_data_type(fe::DataType_t::FLOAT);
   if (c.ragged) o->set_ragged_offset(frq);
   Var pack{{kQ, Q->d->p}, {kK, K->d->p}, {kV, V->d->p}, {kO, O->d->p}};
+  if (c.page) pack[kK] = KC->d->p, pack[kV] = VC->d->p, pack[kTableK] = Table->d->p, pack[kTableV] = Table->d->p;
   if (c.ragged) pack[kRagQ] = RagQ->d->p, pack[kRagKV] = RagKV->d->p;
   if (c.backward) pack[kStats] = Stats->d->p;
   if (c.bias) pack[kBias] = Bias->d->p;
@@ -628,6 +658,8 @@ int main() {
     c.io = fe::DataType_t::BFLOAT16; c.impl = I::UNIFIED; c.ragged = c.padding = true; c.backward = false;
   });
   add("half, unified, padding", [](Cfg& c) { c.impl = I::UNIFIED; c.padding = true; c.backward = false; });
+  add("half, composite, paged K/V caches", [](Cfg& c) { c.impl = I::COMPOSITE; c.page = 4; c.padding = true; c.backward = false; });
+  add("half, unified, paged K/V caches", [](Cfg& c) { c.impl = I::UNIFIED; c.page = 4; c.padding = true; c.backward = false; });
   add("half, composite, BSHD layout, d = 32", [](Cfg& c) { c.impl = I::COMPOSITE; c.bhsd_interleaved = true; c.d = c.dv = 32; });
   add("half, composite, dropout", [](Cfg& c) { c.impl = I::COMPOSITE; c.dropout = 0.25f; c.sq = c.skv = 32; });
   add("float, composite", [](Cfg& c) { c.io = fe::DataType_t::FLOAT; c.impl = I::COMPOSITE; c.causal = true; });
