@@ -1237,7 +1237,7 @@ if(TARGET vgpucublas)
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
   foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec"
-                 "dnn_backward:cudnn")
+                 "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
