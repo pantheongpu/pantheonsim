@@ -5,8 +5,8 @@
 // pooling, softmax and LRN; reductions with indices, op-tensor broadcasts,
 // transforms, dropout's backward pass from a known mask, and batch
 // normalization's backward pass in NHWC, with and without a fused add and
-// activation; the spatial transformer's grid and sampler, both ways; and CTC
-// loss. The same binary runs against
+// activation, and through the cuDNN 8 normalization API; the spatial
+// transformer's grid and sampler, both ways; and CTC loss. The same binary runs against
 // NVIDIA's libcudnn.so.9 and against VirtualGPU's; the printed values must
 // agree (nvidia/tests/conformance/golden/cudnn_backward.rtx3060.txt holds what
 // an RTX 3060 printed).
@@ -629,6 +629,54 @@ static void ctc_loss() {
   cudnnDestroyCTCLossDescriptor(cd);
 }
 
+// The cuDNN 8 normalization API: per-channel training forward and backward,
+// per-activation inference, and the one group it allows.
+static void normalization_api() {
+  cudnnTensorDescriptor_t x = tensor(CUDNN_DATA_FLOAT, {3, 4, 5, 2}), sb, mv;
+  cudnnCreateTensorDescriptor(&sb);
+  cudnnCreateTensorDescriptor(&mv);
+  const float one = 1.0f, zero = 0.0f;
+  CK(cudnnDeriveNormTensorDescriptor(sb, mv, x, CUDNN_NORM_PER_CHANNEL, 1));
+  Buf<float> X(120, 1.5f), Y(120, 0.0f), dy(120, 1.0f, 4), dx(120, 0.0f), scale(4, 0.5f, 3), bias(4, 0.2f, 5),
+      rmean(4, 0.1f, 6), rvar(4, 0.0f), mean(4, 0.0f), inv(4, 0.0f), dscale(4, 0.0f), dbias(4, 0.0f);
+  std::vector<float> ones(4, 1.0f);
+  cudaMemcpy(rvar.p, ones.data(), 16, cudaMemcpyHostToDevice);
+  size_t ws = 0, rs = 0;
+  CK(cudnnGetNormalizationForwardTrainingWorkspaceSize(H, CUDNN_NORM_PER_CHANNEL, CUDNN_NORM_OPS_NORM,
+                                                       CUDNN_NORM_ALGO_STANDARD, x, nullptr, x, sb, nullptr, mv, &ws, 1));
+  CK(cudnnGetNormalizationTrainingReserveSpaceSize(H, CUDNN_NORM_PER_CHANNEL, CUDNN_NORM_OPS_NORM,
+                                                   CUDNN_NORM_ALGO_STANDARD, nullptr, x, &rs, 1));
+  Buf<char> work(ws + 16, 0.0f), reserve(rs + 16, 0.0f);
+  CK(cudnnNormalizationForwardTraining(H, CUDNN_NORM_PER_CHANNEL, CUDNN_NORM_OPS_NORM, CUDNN_NORM_ALGO_STANDARD, &one,
+                                       &zero, x, X.p, sb, scale.p, bias.p, 0.25, mv, rmean.p, rvar.p, 1e-5, mean.p,
+                                       inv.p, nullptr, nullptr, nullptr, x, Y.p, work.p, ws, reserve.p, rs, 1));
+  dump("norm api training fwd", Y.get());
+  dump("norm api running variance", rvar.get());
+  size_t bws = 0;
+  CK(cudnnGetNormalizationBackwardWorkspaceSize(H, CUDNN_NORM_PER_CHANNEL, CUDNN_NORM_OPS_NORM,
+                                                CUDNN_NORM_ALGO_STANDARD, x, x, x, nullptr, x, sb, nullptr, mv, &bws,
+                                                1));
+  Buf<char> bwork(bws + 16, 0.0f);
+  CK(cudnnNormalizationBackward(H, CUDNN_NORM_PER_CHANNEL, CUDNN_NORM_OPS_NORM, CUDNN_NORM_ALGO_STANDARD, &one, &zero,
+                                &one, &zero, x, X.p, x, Y.p, x, dy.p, nullptr, nullptr, x, dx.p, sb, scale.p, bias.p,
+                                dscale.p, dbias.p, 1e-5, mv, mean.p, inv.p, nullptr, bwork.p, bws, reserve.p, rs, 1));
+  dump("norm api backward dx", dx.get());
+  dump("norm api backward dscale", dscale.get());
+  dump("norm api backward dbias", dbias.get());
+  // Per activation, inference from given statistics.
+  CK(cudnnDeriveNormTensorDescriptor(sb, mv, x, CUDNN_NORM_PER_ACTIVATION, 1));
+  Buf<float> s2(40, 0.5f, 7), b2(40, 0.2f, 8), m2(40, 0.3f, 9), v2(40, 0.0f);
+  std::vector<float> var(40);
+  for (int i = 0; i < 40; ++i) var[i] = 0.5f + 0.05f * i;
+  cudaMemcpy(v2.p, var.data(), 160, cudaMemcpyHostToDevice);
+  CK(cudnnNormalizationForwardInference(H, CUDNN_NORM_PER_ACTIVATION, CUDNN_NORM_OPS_NORM, CUDNN_NORM_ALGO_STANDARD,
+                                        &one, &zero, x, X.p, sb, s2.p, b2.p, mv, m2.p, v2.p, nullptr, nullptr, nullptr,
+                                        x, Y.p, 1e-5, 1));
+  dump("norm api inference per activation", Y.get());
+  std::printf("norm api with 2 groups: status %d\n",
+              (int)cudnnDeriveNormTensorDescriptor(sb, mv, x, CUDNN_NORM_PER_CHANNEL, 2));
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("cudnnCreate failed\n");
@@ -647,6 +695,7 @@ int main() {
   batchnorm_fused();
   spatial_transformer();
   ctc_loss();
+  normalization_api();
   cudnnDestroy(H);
   return 0;
 }

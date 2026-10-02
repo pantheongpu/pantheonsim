@@ -163,3 +163,10 @@ ctc infeasible grad mode 0 costs         n=3 abs=1.004244e+01 sq=5.042606e+01 wa
 ctc infeasible grad mode 0 gradients     n=90 abs=1.364087e+01 sq=4.290095e+00 wabs=5.531271e+01
 ctc infeasible grad mode 1 costs         n=3 abs=1.004244e+01 sq=5.042606e+01 wabs=2.508593e+01
 ctc infeasible grad mode 1 gradients     n=90 abs=1.852159e+01 sq=5.685473e+00 wabs=7.591901e+01
+norm api training fwd                    n=120 abs=5.275852e+01 sq=3.198185e+01 wabs=2.028343e+02
+norm api running variance                n=4 abs=4.195523e+00 sq=4.401786e+00 wabs=1.054373e+01
+norm api backward dx                     n=120 abs=1.156765e+01 sq=1.761607e+00 wabs=4.589406e+01
+norm api backward dscale                 n=4 abs=7.953280e+01 sq=1.584547e+03 wabs=2.026113e+02
+norm api backward dbias                  n=4 abs=2.429257e+00 sq=1.785139e+00 wabs=7.249771e+00
+norm api inference per activation        n=120 abs=3.332976e+01 sq=1.536448e+01 wabs=1.336722e+02
+norm api with 2 groups: status 3000
