@@ -238,6 +238,12 @@ bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
     if (t->ragged_mult < 1) { *why = "tensor " + std::to_string(t->uid) + ": the ragged offset multiplier is below 1"; return false; }
   }
   if (const Attr* cv = d->get(CUDNN_ATTR_TENSOR_CONSTANT_VALUE)) t->constant = cv->bytes;
+  // A reordered filter (INT8x32's interleaving for IMMA) is in a layout cuDNN
+  // does not document.
+  if (d->i64(CUDNN_ATTR_TENSOR_REORDERING_MODE, CUDNN_TENSOR_REORDERING_NONE) != CUDNN_TENSOR_REORDERING_NONE) {
+    *why = "tensor " + std::to_string(t->uid) + " is reordered (INT8x32 or F16x16 interleaving), which is not supported";
+    return false;
+  }
   if (!vc::storable(t->l.type)) {
     *why = std::string("tensor ") + std::to_string(t->uid) + " has data type " + vc::type_name(t->l.type) +
            ", which is not supported";
@@ -256,9 +262,17 @@ bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
 
 // Each logical element's offset, in elements, from the tensor's base pointer:
 // strided, vectorized or ragged (offs: the ragged offsets, read already).
+//
+// A ragged tensor's elements past its last offset (the end of the packed
+// data) are -1: not read (0) and not written. Others past a batch's own
+// length land in the next batch's rows, which come later in logical order
+// and so overwrite them, as the hardware's writes of only the valid rows
+// leave them.
 std::vector<int64_t> element_offsets(const GTensor& t, const std::vector<double>* offs = nullptr) {
   const vc::Layout& L = t.l;
   std::vector<int64_t> o(L.count());
+  const int64_t end = offs && offs->size() > static_cast<size_t>(L.dims[0])
+                          ? static_cast<int64_t>((*offs)[static_cast<size_t>(L.dims[0])]) * t.ragged_mult : -1;
   int64_t at[vc::kMaxRank] = {};
   for (size_t i = 0; i < o.size(); ++i) {
     int64_t off = 0;
@@ -271,7 +285,7 @@ std::vector<int64_t> element_offsets(const GTensor& t, const std::vector<double>
       if (d == 0 && offs) { off += static_cast<int64_t>((*offs)[static_cast<size_t>(idx)]) * t.ragged_mult; continue; }
       off += idx * t.mem_strides[d] * (t.vdim >= 0 ? t.vcount : 1);
     }
-    o[i] = off;
+    o[i] = end >= 0 && off >= end ? -1 : off;
     for (int d = L.rank; d-- > 0;) {
       if (++at[d] < L.dims[d]) break;
       at[d] = 0;
@@ -287,13 +301,11 @@ bool gather(cudnnDataType_t type, const void* dev, const std::vector<int64_t>& o
   if (!dev) return false;
   const size_t eb = vc::type_bytes(type);
   int64_t hi = 0;
-  for (int64_t o : offs) {
-    if (o < 0) return false;
-    hi = std::max(hi, o + 1);
-  }
+  for (int64_t o : offs) hi = std::max(hi, o + 1);
   std::vector<uint8_t> raw(static_cast<size_t>(hi) * eb);
-  if (cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-  for (size_t i = 0; i < offs.size(); ++i) (*out)[i] = vc::decode(type, raw.data() + offs[i] * eb);
+  if (hi && cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  for (size_t i = 0; i < offs.size(); ++i)
+    if (offs[i] >= 0) (*out)[i] = vc::decode(type, raw.data() + offs[i] * eb);
   return true;
 }
 bool scatter(cudnnDataType_t type, void* dev, const std::vector<int64_t>& offs, const std::vector<double>& v) {
@@ -301,14 +313,13 @@ bool scatter(cudnnDataType_t type, void* dev, const std::vector<int64_t>& offs, 
   if (!dev || v.size() < offs.size()) return false;
   const size_t eb = vc::type_bytes(type);
   int64_t hi = 0;
-  for (int64_t o : offs) {
-    if (o < 0) return false;
-    hi = std::max(hi, o + 1);
-  }
+  for (int64_t o : offs) hi = std::max(hi, o + 1);
+  if (!hi) return true;
   std::vector<uint8_t> raw(static_cast<size_t>(hi) * eb);
   // What lies between the elements belongs to someone else: keep it.
   if (cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-  for (size_t i = 0; i < offs.size(); ++i) vc::encode(type, v[i], raw.data() + offs[i] * eb);
+  for (size_t i = 0; i < offs.size(); ++i)
+    if (offs[i] >= 0) vc::encode(type, v[i], raw.data() + offs[i] * eb);
   return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
 }
 

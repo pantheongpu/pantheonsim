@@ -14,6 +14,7 @@
 //   - group normalization, and normalization backward without the saved
 //     statistics
 //   - statistics generation, the RNG operation, reshape, transpose, slice
+//   - an INT8x4 vectorized convolution
 //
 // each checked against a reference computed here on the host, and a graph
 // holding an operation the library has no engine for refused rather than run.
@@ -1108,6 +1109,93 @@ static void data_movement() {
   cudaFree(dx), cudaFree(ds);
 }
 
+// A vectorized INT8 convolution: tensors whose channel dimension holds
+// vectors of 4 (the graph API's form of NCHW_VECT_C / INT8x4, the DP4A
+// path), dims and strides counting vectors, accumulated in INT32 and
+// saturated to INT8.
+static Desc vtensor(int64_t uid, const std::vector<int64_t>& dims) {
+  Desc d = make(CUDNN_BACKEND_TENSOR_DESCRIPTOR);
+  const cudnnDataType_t t = CUDNN_DATA_INT8;
+  const int64_t align = 16, vc = 4, vd = 1;
+  const std::vector<int64_t> strides = packed(dims);
+  const bool v = false;
+  set(d, CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &t);
+  set(d, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, (int64_t)dims.size(), dims.data());
+  set(d, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, (int64_t)strides.size(), strides.data());
+  set(d, CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, 1, &uid);
+  set(d, CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, CUDNN_TYPE_INT64, 1, &align);
+  set(d, CUDNN_ATTR_TENSOR_IS_VIRTUAL, CUDNN_TYPE_BOOLEAN, 1, &v);
+  set(d, CUDNN_ATTR_TENSOR_VECTOR_COUNT, CUDNN_TYPE_INT64, 1, &vc);
+  set(d, CUDNN_ATTR_TENSOR_VECTORIZED_DIMENSION, CUDNN_TYPE_INT64, 1, &vd);
+  cudnnBackendFinalize(d);
+  return d;
+}
+static void vectorized_conv() {
+  const int C = 8, K = 8, Hh = 5, W = 5, R = 3, pad = 1, cv = C / 4, kv = K / 4;
+  // Memory order: [n][c/4][h][w][4] and [k][c/4][r][s][4].
+  std::vector<int8_t> hx(C * Hh * W), hw(K * C * R * R);
+  auto xat = [&](int c, int h, int w) { return ((c / 4) * Hh * W + h * W + w) * 4 + c % 4; };
+  auto wat = [&](int k, int c, int r, int q) { return ((k * cv + c / 4) * R * R + r * R + q) * 4 + c % 4; };
+  auto yat = [&](int k, int h, int w) { return ((k / 4) * Hh * W + h * W + w) * 4 + k % 4; };
+  for (int c = 0; c < C; ++c)
+    for (int h = 0; h < Hh; ++h)
+      for (int w = 0; w < W; ++w) hx[xat(c, h, w)] = (int8_t)((c * 7 + h * 3 + w * 5) % 5 - 2);
+  for (int k = 0; k < K; ++k)
+    for (int c = 0; c < C; ++c)
+      for (int r = 0; r < R; ++r)
+        for (int q = 0; q < R; ++q) hw[wat(k, c, r, q)] = (int8_t)((k * 5 + c * 3 + r * 2 + q + (k > 5 ? 1 : 0)) % 3 - (k > 5 ? 0 : 1));
+  std::vector<int> want(K * Hh * W);
+  for (int k = 0; k < K; ++k)
+    for (int h = 0; h < Hh; ++h)
+      for (int w = 0; w < W; ++w) {
+        int acc = 0;
+        for (int c = 0; c < C; ++c)
+          for (int r = 0; r < R; ++r)
+            for (int q = 0; q < R; ++q) {
+              const int ih = h - pad + r, iw = w - pad + q;
+              if (ih >= 0 && ih < Hh && iw >= 0 && iw < W) acc += hx[xat(c, ih, iw)] * hw[wat(k, c, r, q)];
+            }
+        want[yat(k, h, w)] = acc > 127 ? 127 : acc < -128 ? -128 : acc;
+      }
+  Desc x = vtensor(1, {1, cv, Hh, W}), wd = vtensor(2, {K, cv, R, R}), y = vtensor(3, {1, kv, Hh, W});
+  Desc cd = make(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR);
+  const cudnnDataType_t i32 = CUDNN_DATA_INT32;
+  const cudnnConvolutionMode_t mode = CUDNN_CROSS_CORRELATION;
+  const int64_t spatial = 2, pads[2] = {pad, pad}, ones[2] = {1, 1};
+  set(cd, CUDNN_ATTR_CONVOLUTION_COMP_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &i32);
+  set(cd, CUDNN_ATTR_CONVOLUTION_CONV_MODE, CUDNN_TYPE_CONVOLUTION_MODE, 1, &mode);
+  set(cd, CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS, CUDNN_TYPE_INT64, 1, &spatial);
+  set(cd, CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, CUDNN_TYPE_INT64, 2, pads);
+  set(cd, CUDNN_ATTR_CONVOLUTION_POST_PADDINGS, CUDNN_TYPE_INT64, 2, pads);
+  set(cd, CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, CUDNN_TYPE_INT64, 2, ones);
+  set(cd, CUDNN_ATTR_CONVOLUTION_DILATIONS, CUDNN_TYPE_INT64, 2, ones);
+  cudnnBackendFinalize(cd);
+  Desc op = make(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR);
+  const float alpha = 1.0f, beta = 0.0f;
+  set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, x);
+  set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, wd);
+  set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, y);
+  set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, cd);
+  set(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, CUDNN_TYPE_FLOAT, 1, &alpha);
+  set(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, CUDNN_TYPE_FLOAT, 1, &beta);
+  const cudnnStatus_t st = cudnnBackendFinalize(op);
+  int8_t *dx, *dw, *dy;
+  cudaMalloc(&dx, hx.size() + 64), cudaMalloc(&dw, hw.size() + 64), cudaMalloc(&dy, want.size() + 64);
+  cudaMemcpy(dx, hx.data(), hx.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dw, hw.data(), hw.size(), cudaMemcpyHostToDevice);
+  cudaMemset(dy, 0x55, want.size());
+  const int ran = st == CUDNN_STATUS_SUCCESS ? run("graph: INT8x4 vectorized convolution", {op}, {1, 2, 3}, {dx, dw, dy}) : 0;
+  double err = 0;
+  if (ran == 1) {
+    std::vector<int8_t> got(want.size());
+    cudaMemcpy(got.data(), dy, got.size(), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < got.size(); ++i) err = std::fmax(err, std::fabs(got[i] - want[i]));
+  }
+  report("graph: INT8x4 vectorized convolution", ran, err, 0.5);
+  for (Desc d : {x, wd, y, cd, op}) cudnnBackendDestroyDescriptor(d);
+  cudaFree(dx), cudaFree(dw), cudaFree(dy);
+}
+
 // An operation this library has no engine for is refused when it is
 // finalized, by name, not accepted and run wrongly. (NVIDIA's library has an
 // engine for it, so this is VirtualGPU's own contract.)
@@ -1139,6 +1227,7 @@ int main() {
   genstats();
   rng();
   data_movement();
+  vectorized_conv();
   refusals();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");

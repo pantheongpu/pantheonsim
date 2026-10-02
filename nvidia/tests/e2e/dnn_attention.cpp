@@ -4,7 +4,8 @@
 //   - forward: O = softmax(scale * Q K^T + bias, masked) V, with the
 //     log-sum-exp statistics a training pass keeps, a causal (top-left or
 //     bottom-right) or sliding-window mask, per-batch padding (sequence
-//     lengths), grouped-query heads, and Philox dropout;
+//     lengths, or packed variable-length sequences through ragged offsets),
+//     grouped-query heads, and Philox dropout;
 //   - backward: dQ, dK, dV (and dBias) from O, dO and the statistics;
 //
 // both as the frontend's UNIFIED node (one SDPA operation, cuDNN 9.13+) and
@@ -145,11 +146,13 @@ static std::vector<int64_t> physical(const std::vector<int64_t>& dim, const std:
   }
   return p;
 }
+// phys, when given, says where each logical element lives (-1: nowhere, a
+// ragged tensor's padding).
 static std::unique_ptr<Buf> make_buf(fe::DataType_t t, const std::vector<int64_t>& dim, const std::vector<int64_t>& str,
-                                     std::vector<double> vals) {
+                                     std::vector<double> vals, const std::vector<int64_t>* phys = nullptr) {
   auto b = std::make_unique<Buf>();
   b->t = t;
-  b->phys = physical(dim, str);
+  b->phys = phys ? *phys : physical(dim, str);
   int64_t span = 0;
   for (int64_t o : b->phys) span = std::max(span, o + 1);
   b->d = std::make_unique<Dev>(static_cast<size_t>(span) * b->esize());
@@ -158,6 +161,7 @@ static std::unique_ptr<Buf> make_buf(fe::DataType_t t, const std::vector<int64_t
   for (size_t i = 0; i < b->phys.size(); ++i) {
     const double x = i < vals.size() ? vals[i] : 0.0;
     b->v[i] = round_to(t, x);
+    if (b->phys[i] < 0) continue;
     uint8_t* at = host.data() + b->phys[i] * b->esize();
     if (t == fe::DataType_t::HALF) { uint16_t h = f2h(static_cast<float>(x)); std::memcpy(at, &h, 2); }
     else if (t == fe::DataType_t::BFLOAT16) { uint16_t h = f2bf(static_cast<float>(x)); std::memcpy(at, &h, 2); }
@@ -173,6 +177,7 @@ static std::vector<double> read_buf(const Buf& b) {
   cudaMemcpy(host.data(), b.d->p, host.size(), cudaMemcpyDeviceToHost);
   std::vector<double> out(b.phys.size());
   for (size_t i = 0; i < out.size(); ++i) {
+    if (b.phys[i] < 0) continue;
     const uint8_t* at = host.data() + b.phys[i] * b.esize();
     if (b.t == fe::DataType_t::HALF) { uint16_t h; std::memcpy(&h, at, 2); out[i] = h2f(h); }
     else if (b.t == fe::DataType_t::BFLOAT16) { uint16_t h; std::memcpy(&h, at, 2); out[i] = bf2f(h); }
@@ -214,7 +219,27 @@ struct Cfg {
   float dropout = 0.0f;
   bool backward = true;
   bool bhsd_interleaved = false;  // Q/K/V/O as [b, s, h, d] in memory
+  bool ragged = false;            // packed sequences (THD), with ragged offsets; implies padding
 };
+
+// A ragged (THD) tensor: batch b's tokens start at offset[b] = (tokens
+// before it) * H * D elements, each token's heads then dims; positions past
+// a batch's length are not stored.
+static std::vector<int64_t> ragged_phys(int64_t B, int64_t H, int64_t S, int64_t D, const std::vector<int>& len,
+                                        std::vector<double>* offsets) {
+  std::vector<int64_t> p(static_cast<size_t>(B * H * S * D), -1);
+  offsets->assign(static_cast<size_t>(B + 1), 0.0);
+  int64_t tok = 0;
+  for (int64_t b = 0; b < B; ++b) {
+    (*offsets)[b] = static_cast<double>(tok * H * D);
+    for (int64_t h = 0; h < H; ++h)
+      for (int64_t s = 0; s < len[b]; ++s)
+        for (int64_t d = 0; d < D; ++d) p[((b * H + h) * S + s) * D + d] = (tok + s) * H * D + h * D + d;
+    tok += len[b];
+  }
+  (*offsets)[B] = static_cast<double>(tok * H * D);
+  return p;
+}
 
 // Scores' mask for one (batch, row, col): whether the element is kept.
 static bool kept(const Cfg& c, int64_t row, int64_t col, int64_t sq_b, int64_t skv_b) {
@@ -340,6 +365,7 @@ static int build_and_run(const char* what, fe::graph::Graph& g, cudnnHandle_t h,
 }
 
 static std::vector<int64_t> strides_of(const Cfg& c, int64_t h, int64_t s, int64_t d) {
+  if (c.ragged) return {h * d, d, h * d, 1};                 // THD: the batch stride is the ragged offset's
   if (c.bhsd_interleaved) return {s * h * d, d, h * d, 1};  // memory [b, s, h, d]
   return {h * s * d, s * d, d, 1};
 }
@@ -359,11 +385,19 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     seq_q[i] = static_cast<int>(c.sq - 3 * i - 1 > 1 ? c.sq - 3 * i - 1 : 1);
     seq_kv[i] = static_cast<int>(c.skv - 2 * i - 2 > 1 ? c.skv - 2 * i - 2 : 1);
   }
-  auto Q = make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), Qv);
-  auto K = make_buf(T, {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d), Kv);
-  auto V = make_buf(T, {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv), Vv);
-  auto O = make_buf(T, {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv), {});
-  auto dO = make_buf(T, {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv), dOv);
+  // Ragged (THD) tensors: where each element lives, and the offsets.
+  std::vector<double> rq_off, rkv_off;
+  const std::vector<int64_t> pq = c.ragged ? ragged_phys(c.b, c.hq, c.sq, c.d, seq_q, &rq_off) : std::vector<int64_t>{};
+  const std::vector<int64_t> pkv = c.ragged ? ragged_phys(c.b, c.hk, c.skv, c.d, seq_kv, &rkv_off) : std::vector<int64_t>{};
+  const std::vector<int64_t>* PQ = c.ragged ? &pq : nullptr;
+  const std::vector<int64_t>* PKV = c.ragged ? &pkv : nullptr;
+  auto RagQ = make_buf(fe::DataType_t::INT32, {c.b + 1, 1, 1, 1}, {1, 1, 1, 1}, rq_off);
+  auto RagKV = make_buf(fe::DataType_t::INT32, {c.b + 1, 1, 1, 1}, {1, 1, 1, 1}, rkv_off);
+  auto Q = make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), Qv, PQ);
+  auto K = make_buf(T, {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d), Kv, PKV);
+  auto V = make_buf(T, {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv), Vv, PKV);
+  auto O = make_buf(T, {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv), {}, PQ);
+  auto dO = make_buf(T, {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv), dOv, PQ);
   auto Bias = make_buf(T, {1, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}, Bv);
   auto Stats = make_buf(fe::DataType_t::FLOAT, {c.b, c.hq, c.sq, 1}, {c.hq * c.sq, c.sq, 1, 1}, {});
   auto Mask = make_buf(fe::DataType_t::FLOAT, {c.b, c.hq, c.sq, c.skv},
@@ -375,7 +409,7 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   auto Seed = make_buf(fe::DataType_t::INT64, {1, 1, 1, 1}, {1, 1, 1, 1}, {static_cast<double>(seed_v)});
   auto Offset = make_buf(fe::DataType_t::INT64, {1, 1, 1, 1}, {1, 1, 1, 1}, {static_cast<double>(offset_v)});
 
-  enum : int64_t { kQ = 1, kK, kV, kO, kStats, kBias, kSeqQ, kSeqKV, kSeed, kOffset, kMask, kdO, kdQ, kdK, kdV, kdBias };
+  enum : int64_t { kQ = 1, kK, kV, kO, kStats, kBias, kSeqQ, kSeqKV, kSeed, kOffset, kMask, kdO, kdQ, kdK, kdV, kdBias, kRagQ, kRagKV };
   auto common = [&](fe::graph::Graph& g) {
     g.set_io_data_type(T).set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
   };
@@ -385,6 +419,11 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     if (t != fe::DataType_t::NOT_SET) a.set_data_type(t);
     return g.tensor(a);
   };
+  // The ragged offsets of a graph's Q-side and K/V-side tensors.
+  auto ragged = [&](fe::graph::Graph& g, bool q_side) {
+    return tensor(g, q_side ? kRagQ : kRagKV, q_side ? "ragged_q" : "ragged_kv", {c.b + 1, 1, 1, 1}, {1, 1, 1, 1},
+                  fe::DataType_t::INT32);
+  };
   const bool dropout = c.dropout > 0;
 
   // Forward.
@@ -393,6 +432,11 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   auto q = tensor(fg, kQ, "Q", {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d));
   auto k = tensor(fg, kK, "K", {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d));
   auto v = tensor(fg, kV, "V", {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv));
+  std::shared_ptr<fe::graph::Tensor_attributes> frq, frkv;
+  if (c.ragged) {
+    frq = ragged(fg, true), frkv = ragged(fg, false);
+    q->set_ragged_offset(frq), k->set_ragged_offset(frkv), v->set_ragged_offset(frkv);
+  }
   auto opts = fe::graph::SDPA_attributes().set_name("sdpa").set_generate_stats(c.backward).set_attn_scale(c.scale);
   opts.set_implementation(c.impl);
   if (c.causal) {
@@ -415,7 +459,9 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   auto [o, stats] = fg.sdpa(q, k, v, opts);
   o->set_output(true).set_uid(kO).set_dim({c.b, c.hq, c.sq, c.dv}).set_stride(strides_of(c, c.hq, c.sq, c.dv));
   if (stats) stats->set_output(true).set_uid(kStats).set_data_type(fe::DataType_t::FLOAT);
+  if (c.ragged) o->set_ragged_offset(frq);
   Var pack{{kQ, Q->d->p}, {kK, K->d->p}, {kV, V->d->p}, {kO, O->d->p}};
+  if (c.ragged) pack[kRagQ] = RagQ->d->p, pack[kRagKV] = RagKV->d->p;
   if (c.backward) pack[kStats] = Stats->d->p;
   if (c.bias) pack[kBias] = Bias->d->p;
   if (c.padding) pack[kSeqQ] = SeqQ->d->p, pack[kSeqKV] = SeqKV->d->p;
@@ -458,12 +504,12 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   if (!c.backward) return;
 
   // Backward, from the library's own O and statistics.
-  auto Og = make_buf(T, {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv), read_buf(*O));
+  auto Og = make_buf(T, {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv), read_buf(*O), PQ);
   Ref fref = ref;
   fref.O = Og->v;
-  auto dQ = make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), {});
-  auto dK = make_buf(T, {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d), {});
-  auto dV = make_buf(T, {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv), {});
+  auto dQ = make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), {}, PQ);
+  auto dK = make_buf(T, {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d), {}, PKV);
+  auto dV = make_buf(T, {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv), {}, PKV);
   auto dBias = make_buf(T, {1, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}, {});
   auto Mask2 = make_buf(fe::DataType_t::FLOAT, {c.b, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}, {});
   fe::graph::Graph bg;
@@ -474,7 +520,18 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   auto bo = tensor(bg, kO, "O", {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv));
   auto bdo = tensor(bg, kdO, "dO", {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv));
   auto bst = tensor(bg, kStats, "stats", {c.b, c.hq, c.sq, 1}, {c.hq * c.sq, c.sq, 1, 1}, fe::DataType_t::FLOAT);
+  std::shared_ptr<fe::graph::Tensor_attributes> brq, brkv;
+  if (c.ragged) {
+    brq = ragged(bg, true), brkv = ragged(bg, false);
+    bq->set_ragged_offset(brq), bo->set_ragged_offset(brq), bdo->set_ragged_offset(brq);
+    bk->set_ragged_offset(brkv), bv->set_ragged_offset(brkv);
+  }
   auto bopts = fe::graph::SDPA_backward_attributes().set_name("sdpa_backward").set_attn_scale(c.scale);
+  if (c.ragged) {
+    int64_t tq = 0, tkv = 0;
+    for (int64_t i = 0; i < c.b; ++i) tq += seq_q[i], tkv += seq_kv[i];
+    bopts.set_max_total_seq_len_q(tq).set_max_total_seq_len_kv(tkv);
+  }
   if (c.causal) {
     bopts.set_diagonal_alignment(c.bottom_right ? fe::DiagonalAlignment_t::BOTTOM_RIGHT : fe::DiagonalAlignment_t::TOP_LEFT)
         .set_diagonal_band_right_bound(0);
@@ -499,10 +556,12 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   dq->set_output(true).set_uid(kdQ).set_dim({c.b, c.hq, c.sq, c.d}).set_stride(strides_of(c, c.hq, c.sq, c.d));
   dk->set_output(true).set_uid(kdK).set_dim({c.b, c.hk, c.skv, c.d}).set_stride(strides_of(c, c.hk, c.skv, c.d));
   dv->set_output(true).set_uid(kdV).set_dim({c.b, c.hk, c.skv, c.dv}).set_stride(strides_of(c, c.hk, c.skv, c.dv));
+  if (c.ragged) dq->set_ragged_offset(brq), dk->set_ragged_offset(brkv), dv->set_ragged_offset(brkv);
   Var bpack{{kQ, Q->d->p}, {kK, K->d->p}, {kV, V->d->p}, {kO, Og->d->p}, {kdO, dO->d->p}, {kStats, Stats->d->p},
             {kdQ, dQ->d->p}, {kdK, dK->d->p}, {kdV, dV->d->p}};
   if (c.bias) bpack[kBias] = Bias->d->p, bpack[kdBias] = dBias->d->p;
   if (c.padding) bpack[kSeqQ] = SeqQ->d->p, bpack[kSeqKV] = SeqKV->d->p;
+  if (c.ragged) bpack[kRagQ] = RagQ->d->p, bpack[kRagKV] = RagKV->d->p;
   if (dropout) bpack[kSeed] = Seed->d->p, bpack[kOffset] = Offset->d->p, bpack[kMask] = Mask2->d->p;
   const std::string bwd_name = c.name + " backward";
   const int bran = build_and_run(bwd_name.c_str(), bg, handle, bpack);
@@ -564,6 +623,11 @@ int main() {
   add("half, composite, grouped-query heads", [](Cfg& c) { c.impl = I::COMPOSITE; c.hq = 4; c.hk = 2; c.causal = true; });
   add("half, composite, bias", [](Cfg& c) { c.impl = I::COMPOSITE; c.bias = true; });
   add("half, composite, padding", [](Cfg& c) { c.impl = I::COMPOSITE; c.padding = true; c.causal = true; });
+  add("half, composite, ragged (packed THD) sequences", [](Cfg& c) { c.impl = I::COMPOSITE; c.ragged = c.padding = true; c.causal = true; });
+  add("bfloat16, unified, ragged (packed THD) sequences", [](Cfg& c) {
+    c.io = fe::DataType_t::BFLOAT16; c.impl = I::UNIFIED; c.ragged = c.padding = true; c.backward = false;
+  });
+  add("half, unified, padding", [](Cfg& c) { c.impl = I::UNIFIED; c.padding = true; c.backward = false; });
   add("half, composite, BSHD layout, d = 32", [](Cfg& c) { c.impl = I::COMPOSITE; c.bhsd_interleaved = true; c.d = c.dv = 32; });
   add("half, composite, dropout", [](Cfg& c) { c.impl = I::COMPOSITE; c.dropout = 0.25f; c.sq = c.skv = 32; });
   add("float, composite", [](Cfg& c) { c.io = fe::DataType_t::FLOAT; c.impl = I::COMPOSITE; c.causal = true; });
