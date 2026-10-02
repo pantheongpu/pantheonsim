@@ -6,6 +6,10 @@
 //   ipc export <handle-file>   allocate, fill, publish the handle, wait, verify
 //   ipc import <handle-file>   open the handle, check what is there, write back
 //
+// Then both processes' kernels hammer one shared set of counters with atomics
+// at the same time, as NVSHMEM's PEs add into one another's heaps, and no
+// update may be lost: an atomic is atomic against another process's too.
+//
 // The two processes talk only through the handle file and the shared buffer:
 // nothing about this works unless the memory really is shared.
 #include <cuda_runtime.h>
@@ -26,6 +30,29 @@ static const int kInts = 1024;
 __global__ void bump(int* p, int n, int add) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) p[i] += add;
+}
+
+// Atomics on the shared counters: kRaceBlocks x kRaceThreads threads, kRaceIters each.
+static const int kRaceBlocks = 32, kRaceThreads = 128, kRaceIters = 16;
+static const unsigned long long kRacePerProcess = 1ull * kRaceBlocks * kRaceThreads * kRaceIters;
+struct Counters {
+  unsigned u32;            // atomicAdd
+  unsigned cas;            // an atomicCAS loop
+  unsigned long long u64;  // atomicAdd, 64-bit
+  float f32;               // atomicAdd on whole numbers, exact below 2^24
+};
+__global__ void hammer(Counters* c) {
+  for (int i = 0; i < kRaceIters; ++i) {
+    atomicAdd(&c->u32, 1u);
+    atomicAdd(&c->u64, 1ull);
+    atomicAdd(&c->f32, 1.0f);
+    unsigned old = *(volatile unsigned*)&c->cas;
+    for (;;) {
+      const unsigned got = atomicCAS(&c->cas, old, old + 1);
+      if (got == old) break;
+      old = got;
+    }
+  }
 }
 
 static bool write_file(const std::string& path, const void* data, size_t n) {
@@ -62,6 +89,15 @@ static bool wait_for(const std::string& path) {
 static int do_export(const std::string& handle_file) {
   int* buf = nullptr;
   CK(cudaMalloc(reinterpret_cast<void**>(&buf), kInts * sizeof(int)));
+  Counters* counters = nullptr;
+  CK(cudaMalloc(reinterpret_cast<void**>(&counters), sizeof(Counters)));
+  CK(cudaMemset(counters, 0, sizeof(Counters)));
+  cudaIpcMemHandle_t counters_handle{};
+  CK(cudaIpcGetMemHandle(&counters_handle, counters));
+  if (!write_file(handle_file + ".counters", &counters_handle, sizeof counters_handle)) {
+    printf("FAIL could not publish the counters' handle\n");
+    return 1;
+  }
   int host[kInts];
   for (int i = 0; i < kInts; ++i) host[i] = i;
   CK(cudaMemcpy(buf, host, sizeof host, cudaMemcpyHostToDevice));
@@ -97,10 +133,28 @@ static int do_export(const std::string& handle_file) {
     printf("FAIL could not publish the handle\n");
     return 1;
   }
+  // The race: both processes start hammering once both are ready.
+  touch(handle_file + ".xready");
+  if (!wait_for(handle_file + ".iready")) {
+    printf("FAIL the importing process never got ready to race\n");
+    return 1;
+  }
+  hammer<<<kRaceBlocks, kRaceThreads>>>(counters);
+  CK(cudaDeviceSynchronize());
   if (!wait_for(handle_file + ".done")) {
     printf("FAIL the importing process never finished\n");
     return 1;
   }
+  Counters got{};
+  CK(cudaMemcpy(&got, counters, sizeof got, cudaMemcpyDeviceToHost));
+  const unsigned long long want = 2 * kRacePerProcess;
+  if (got.u32 != want || got.cas != want || got.u64 != want ||
+      static_cast<unsigned long long>(got.f32) != want) {
+    printf("FAIL lost atomic updates between processes: u32 %u, CAS loop %u, u64 %llu, f32 %.0f; "
+           "expected %llu each\n", got.u32, got.cas, got.u64, got.f32, want);
+    return 1;
+  }
+  CK(cudaFree(counters));
 
   // What the other process wrote is here, in this process's own pointer.
   CK(cudaMemcpy(host, buf, sizeof host, cudaMemcpyDeviceToHost));
@@ -169,6 +223,23 @@ static int do_import(const std::string& handle_file) {
 
   CK(cudaIpcCloseMemHandle(ptr));
   WANT(cudaIpcCloseMemHandle(ptr), cudaErrorInvalidValue);   // closed once only
+
+  // The race on the exporter's counters, alongside its own kernel.
+  cudaIpcMemHandle_t counters_handle{};
+  if (!read_file(handle_file + ".counters", &counters_handle, sizeof counters_handle)) {
+    printf("FAIL no counters' handle to import\n");
+    return 1;
+  }
+  void* counters = nullptr;
+  CK(cudaIpcOpenMemHandle(&counters, counters_handle, cudaIpcMemLazyEnablePeerAccess));
+  touch(handle_file + ".iready");
+  if (!wait_for(handle_file + ".xready")) {
+    printf("FAIL the exporting process never got ready to race\n");
+    return 1;
+  }
+  hammer<<<kRaceBlocks, kRaceThreads>>>(static_cast<Counters*>(counters));
+  CK(cudaDeviceSynchronize());
+  CK(cudaIpcCloseMemHandle(counters));
   touch(handle_file + ".done");
   printf("PASS import\n");
   return 0;

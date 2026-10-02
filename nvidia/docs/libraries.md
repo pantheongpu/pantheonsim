@@ -138,7 +138,12 @@ store the inline code never leaves the kernel, so puts, gets, `p`/`g`, atomics,
 signal operations and waits, `quiet`, `fence` and the barriers -- at thread and
 block scope, in teams, and in kernels started with `nvshmemx_collective_launch`
 -- run as NVIDIA compiled them. The device library contains SASS only (PTX is
-shipped for sm_120 alone), which the simulator's SASS engine runs.
+shipped for sm_120 alone), which the simulator's SASS engine runs. Each PE's
+heap is memory shared between the processes, and an atomic on memory the host
+maps is made with the CPU's own compare-and-swap in both engines, so PEs
+adding into one word at once lose no update (`e2e_ipc` races two processes'
+kernels on CUDA-IPC memory; `e2e_host_atomics` races a kernel against host
+atomics).
 
 Card ground truth is thin: on an RTX 3060 under WSL NVIDIA's library
 initializes a job of one PE and then has no symmetric heap (`nvshmem_malloc`
@@ -499,9 +504,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   unique ID), PEs on more than one node and proxy or network transports, NVLink
   SHARP multicast (`nvshmemx_mc_ptr` is NULL), host-side reductions, the
   device API's own proxy and IBGDA paths (never taken: every PE is a peer).
-  Device-side atomics between PEs are atomic within a process but not across
-  the PE processes, so two PEs updating one word with atomics at once can lose
-  an update. NVIDIA's default `NVSHMEM_MAX_TEAMS` is 256; here it is 32 unless
+  NVIDIA's default `NVSHMEM_MAX_TEAMS` is 256; here it is 32 unless
   set, since each team holds synchronization arrays in the symmetric heap.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time

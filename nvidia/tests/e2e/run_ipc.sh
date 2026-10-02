@@ -31,7 +31,7 @@ run() { VGPU_QUIET=1 VGPU_GPU=nvidia/a10 VGPU_VRAM_MB=256 \
 rc=0
 # Twice: both processes on device 0, then the importer on device 1 of two.
 for round in same other; do
-  rm -f "$out/handle" "$out/handle.event" "$out/handle.done"
+  rm -f "$out"/handle "$out"/handle.*
   if [[ $round == same ]]; then
     run export "$out/handle" > "$out/export.log" 2>&1 &
     exporter=$!
