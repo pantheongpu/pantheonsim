@@ -14,12 +14,17 @@ name: SASS and PTX
 #           (nvidia/tools/sass_ptx_digest.sh). Also on pull requests that touch
 #           either engine.
 #
-# Before the SASS executor merged, both jobs see no SASS path and pass with a
-# notice, so this workflow can land first.
+# On a tree without the SASS executor (before #255) both jobs see no SASS path
+# and pass with a notice.
 on:
   schedule:
     - cron: '53 5 * * *'
   workflow_dispatch:
+  # TEMPORARY, to run the digest job from this branch before it merges
+  # (workflow_dispatch needs the file on main): remove before merging.
+  push:
+    branches: [ci-infra]
+    paths: [.github/workflows/sass-ptx.yml, nvidia/tools/sass_ptx_digest.sh]
   pull_request:
     paths:
       - src/exec/**
@@ -43,7 +48,7 @@ jobs:
 
   ptx:
     name: the suite on PTX (VGPU_SASS=0)
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 150
