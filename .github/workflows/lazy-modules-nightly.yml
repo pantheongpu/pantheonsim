@@ -43,7 +43,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: -ccbin g++-12
     steps:

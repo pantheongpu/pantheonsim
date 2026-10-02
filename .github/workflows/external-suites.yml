@@ -28,10 +28,6 @@ on:
       amd_gpu:
         description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
         default: ''
-  # TEMPORARY, for testing the branch before it merges: remove before merging.
-  push:
-    branches: [ci-infra]
-    paths: [".github/workflows/external-suites.yml", "ci/external/**"]
 
 permissions:
   contents: read

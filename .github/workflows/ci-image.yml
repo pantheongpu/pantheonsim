@@ -45,7 +45,6 @@ jobs:
         include:
           - { flavor: cuda12.0, target: cuda12.0, cuda: '' }
           - { flavor: cuda13.0, target: cuda,     cuda: '13.0' }
-          - { flavor: cuda12.8, target: cuda,     cuda: '12.8' }
     steps:
       - uses: actions/checkout@v4
         with:

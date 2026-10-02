@@ -20,9 +20,6 @@ on:
       cuda13_0:
         description: NVIDIA's CUDA 13.0
         value: ${{ jobs.find.outputs.cuda13_0 }}
-      cuda12_8:
-        description: NVIDIA's CUDA 12.8
-        value: ${{ jobs.find.outputs.cuda12_8 }}
 
 jobs:
   find:
@@ -32,7 +29,6 @@ jobs:
     outputs:
       cuda12_0: ${{ steps.find.outputs.cuda12_0 }}
       cuda13_0: ${{ steps.find.outputs.cuda13_0 }}
-      cuda12_8: ${{ steps.find.outputs.cuda12_8 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,7 +45,7 @@ jobs:
           fi
           hash=$(sha256sum .github/ci-image/Dockerfile | cut -c1-12)
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null 2>&1 || true
-          for flavor in cuda12.0 cuda13.0 cuda12.8; do
+          for flavor in cuda12.0 cuda13.0; do
             ref="ghcr.io/${OWNER,,}/pantheonsim-ci:$flavor-$hash"
             if timeout 120 docker manifest inspect "$ref" >/dev/null 2>&1; then
               echo "${flavor/./_}=$ref" >> "$GITHUB_OUTPUT"

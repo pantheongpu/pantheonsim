@@ -40,22 +40,14 @@ jobs:
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
     # this job's toolchain built in, so the install step runs only on GitHub's.
     runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
-    # The toolchain image (.github/ci-image), or, when there is none, the
-    # runner itself with the install step below.
-    needs: image
-    container:
-      image: ${{ vars.SIM_RUNS_ON == '' && needs.image.outputs.cuda12_0 || '' }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ github.token }}
-      # TSan's setarch -R needs personality(), LeakSanitizer ptrace, and the
-      # simulator's IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    # Not in the toolchain image (.github/ci-image) like the other jobs: its
+    # session tests (vgpu shell) need the user namespaces and mounts that an
+    # unprivileged container refuses, so it keeps the runner and apt.
     steps:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
-        if: runner.environment == 'github-hosted' && !job.container.id
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           # nvidia-profiler is nvprof, an unmodified profiler run against the
@@ -101,9 +93,8 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      # TSan's setarch -R needs personality(), LeakSanitizer ptrace, and the
-      # simulator's IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      # The IPC tests need more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g
     steps:
       - uses: actions/checkout@v4
         with:
@@ -157,7 +148,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: ''
     steps:
@@ -216,9 +207,8 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      # TSan's setarch -R needs personality(), LeakSanitizer ptrace, and the
-      # simulator's IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      # The IPC tests need more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g
     env:
       # Shims built against CUDA 13 make Ollama pick its cuda_v13 backend,
       # whose PTX starts at sm_75 and so covers every profile.
@@ -361,11 +351,18 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      # TSan's setarch -R needs personality(), LeakSanitizer ptrace, and the
-      # simulator's IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      # The IPC tests need more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g
     steps:
       - uses: actions/checkout@v4
+
+      # The checkout belongs to the runner's user and the job runs as root in
+      # the container: trust this one repository, or git refuses it (tests ask
+      # git which files are tracked). actions/checkout's own exception lasts
+      # only for its step.
+      - name: Trust the checkout
+        if: job.container.id
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # clang builds the gfx942 code objects these tests read, and
       # llvm-objdump prints the instructions the decoder is checked against.
@@ -492,11 +489,19 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      # TSan's setarch -R needs personality(), LeakSanitizer ptrace, and the
-      # simulator's IPC tests more than Docker's 64 MB of /dev/shm.
+      # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
+      # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
       options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
+
+      # The checkout belongs to the runner's user and the job runs as root in
+      # the container: trust this one repository, or git refuses it (tests ask
+      # git which files are tracked). actions/checkout's own exception lasts
+      # only for its step.
+      - name: Trust the checkout
+        if: job.container.id
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install toolchain
         if: ${{ !job.container.id }}
@@ -529,11 +534,19 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      # TSan's setarch -R needs personality(), LeakSanitizer ptrace, and the
-      # simulator's IPC tests more than Docker's 64 MB of /dev/shm.
+      # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
+      # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
       options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
+
+      # The checkout belongs to the runner's user and the job runs as root in
+      # the container: trust this one repository, or git refuses it (tests ask
+      # git which files are tracked). actions/checkout's own exception lasts
+      # only for its step.
+      - name: Trust the checkout
+        if: job.container.id
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install toolchain
         if: ${{ !job.container.id }}

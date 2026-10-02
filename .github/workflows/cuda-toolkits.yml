@@ -8,11 +8,10 @@ name: CUDA toolkits
 # simulator and the e2e programs with CUDA 12.8 and runs the build job's tests.
 #
 # On pull requests that touch the NVIDIA side, when a change lands, nightly
-# and by hand. Another 12.x is one more row (and one more image flavor in
-# .github/ci-image and ci-image-ref.yml).
+# and by hand. Another 12.x is one more row.
 on:
   push:
-    branches: [main, ci-infra]  # TEMPORARY ci-infra: remove before merging
+    branches: [main]
     paths: ["nvidia/**", "src/**", "include/**", "tests/**", "CMakeLists.txt", ".github/workflows/cuda-toolkits.yml"]
   pull_request:
     paths: ["nvidia/**", "include/**", "tests/shim_guard.sh", "CMakeLists.txt", ".github/workflows/cuda-toolkits.yml"]
@@ -22,40 +21,30 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  image:
-    uses: ./.github/workflows/ci-image-ref.yml
-
   suite:
     name: build + tests, CUDA ${{ matrix.cuda }}
-    needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         cuda: ['12.8']
-    container:
-      # The cuda12.8 image; empty (the runner itself, apt below) without one.
-      image: ${{ matrix.cuda == '12.8' && needs.image.outputs.cuda12_8 || '' }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ github.token }}
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    # On the runner itself, not the cuda12.8 image: it runs the build job's
+    # tests, whose session tests need user namespaces and mounts a container
+    # refuses.
     env:
-      # CUDA 12.4 and later take GCC 13, the image's own.
+      # CUDA 12.4 and later take GCC 13, the runner's own.
       NVCC_PREPEND_FLAGS: ''
     steps:
       - uses: actions/checkout@v4
 
       - name: Install CUDA ${{ matrix.cuda }}
-        if: ${{ !job.container.id }}
         env:
           CUDA: ${{ matrix.cuda }}
         run: |
