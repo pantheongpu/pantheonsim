@@ -109,7 +109,7 @@ output. Anything that differs is a bug in this implementation.
 | `cublas_level1` | single and double `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and `tbmv` agree, every index identical, negative increments included |
 | `cusolver_factorizations` | Cholesky, LU (pivots included), QR and every solve bit-identical; one f32 eigenvalue differs by ~1e‑6 relative |
 | `nccl_collectives` | all 24 bit-identical at two ranks on two physical GPUs |
-| `nccl_comm_ops` (e2e) | all 75 checks pass against NCCL 2.29.7 at two ranks on two physical GPUs: split, shrink, non-blocking, pre-multiplied sums, all-to-all, gather, scatter, scalable init, windows, and their error codes |
+| `nccl_comm_ops` (e2e) | all 74 checks pass against NCCL 2.29.7 at two ranks on two physical GPUs: split, shrink, non-blocking, pre-multiplied sums, all-to-all, gather, scatter, scalable init, windows, and their error codes |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |

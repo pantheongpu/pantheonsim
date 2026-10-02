@@ -12,13 +12,16 @@
 // ncclAlltoAll/ncclGather/ncclScatter, ncclCommShrink,
 // ncclCommInitRankScalable and ncclCommWindowRegister. Anything newer than the
 // nccl.h or the libnccl in use prints "skipped:" for that part (a "SKIP:" line
-// means the whole program could not run).
+// means the whole program could not run). Against NVIDIA's library it needs
+// libnccl 2.29 (2.28.9 crashes on the window argument checks); its one 2.29
+// entry point, ncclWinGetUserPtr, is looked up rather than linked.
 #include <nccl.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <vector>
 
 static int g_bad = 0;
@@ -504,13 +507,8 @@ int main() {
         for (size_t k = 0; k < C; ++k) ok = ok && got[i * C + k] == v(i, j * C + k);
     }
     expect(ok, "alltoall: block j of rank i lands as block i of rank j");
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) NK(ncclAlltoAll(s[i], s[i], C, ncclFloat, world[i], streams[i]));
-    NK(ncclGroupEnd());
-    sync_all();
-    ok = true;
-    for (int j = 0; j < nranks; ++j) ok = ok && download(j, s[j], C * nranks) == download(j, d[j], C * nranks);
-    expect(ok, "alltoall: in place");
+    // nccl.h documents no in-place all-to-all (unlike gather and scatter), and
+    // on the card one is a race: it came out right twice and wrong once.
     NK(ncclGroupStart());
     for (int i = 0; i < nranks; ++i) NK(ncclAlltoAll(s[i], d[i], 0, ncclFloat, world[i], streams[i]));
     expect_rc(ncclGroupEnd(), ncclSuccess, "alltoall: count 0");
@@ -672,11 +670,14 @@ int main() {
       ok = ok && download(i, (const float*)((char*)mem[i] + 4096), 4) == std::vector<float>(4, sum);
     expect(ok, "window: allreduce on the registered buffer");
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
-    if (g_ver >= NCCL_VERSION(2, 29, 0)) {
+    using GetUserPtr = ncclResult_t (*)(ncclComm_t, ncclWindow_t, void**);
+    if (auto get = (GetUserPtr)dlsym(RTLD_DEFAULT, "ncclWinGetUserPtr")) {
       void* user = nullptr;
-      ok = win[0] ? ncclWinGetUserPtr(world[0], win[0], &user) == ncclSuccess && user == mem[0]
-                  : ncclWinGetUserPtr(world[0], win[0], &user) == ncclInvalidArgument;
+      ok = win[0] ? get(world[0], win[0], &user) == ncclSuccess && user == mem[0]
+                  : get(world[0], win[0], &user) == ncclInvalidArgument;
       expect(ok, win[0] ? "window: user pointer" : "window: NULL window has no user pointer");
+    } else {
+      std::printf("skipped: ncclWinGetUserPtr needs libnccl 2.29\n");
     }
 #endif
     NK(ncclGroupStart());

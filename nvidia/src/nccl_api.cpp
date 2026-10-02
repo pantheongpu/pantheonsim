@@ -1513,8 +1513,9 @@ VGPU_EXPORT ncclResult_t ncclReduceScatter(const void* send, void* recv, size_t 
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 // NCCL 2.28 added these three; nccl.h declares them from that version on.
-// card: rank j's output block i is rank i's input block j; the input may be
-// the output; count 0 is a no-op that succeeds.
+// card: rank j's output block i is rank i's input block j; count 0 is a no-op
+// that succeeds. nccl.h promises no in-place all-to-all and on the card one
+// races; here the input is copied out before any output is written, so it works.
 VGPU_EXPORT ncclResult_t ncclAlltoAll(const void* send, void* recv, size_t count,
                                       ncclDataType_t dt, ncclComm_t comm, cudaStream_t stream) {
   Op o{Kind::AlltoAll, reinterpret_cast<Comm*>(comm), send, recv, count, dt, ncclSum, 0, 0, stream};
