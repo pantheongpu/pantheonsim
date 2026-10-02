@@ -1,0 +1,60 @@
+name: CI image tags
+
+# Which toolchain images (.github/ci-image/Dockerfile, built by ci-image.yml)
+# a workflow's jobs can run in: called as a job of its own, and the jobs that
+# need it put an output in `container: image:`.
+#
+# The tag is the one built from this checkout's Dockerfile, so a pull request
+# that changes the Dockerfile never runs in an image that predates the change.
+# An output is empty when that image is not there -- not built yet, GHCR down,
+# or no access from a fork's token -- or when the repository variable CI_IMAGE
+# is `off`; a job given an empty image runs on the runner itself and installs
+# its toolchain with apt, as before the images existed. This job never fails:
+# a registry hiccup costs the apt install, not the run.
+on:
+  workflow_call:
+    outputs:
+      cuda12_0:
+        description: Ubuntu's CUDA 12.0, GCC 12, nvprof, clang/LLVM
+        value: ${{ jobs.find.outputs.cuda12_0 }}
+      cuda13_0:
+        description: NVIDIA's CUDA 13.0
+        value: ${{ jobs.find.outputs.cuda13_0 }}
+      cuda12_8:
+        description: NVIDIA's CUDA 12.8
+        value: ${{ jobs.find.outputs.cuda12_8 }}
+
+jobs:
+  find:
+    name: find the toolchain images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      cuda12_0: ${{ steps.find.outputs.cuda12_0 }}
+      cuda13_0: ${{ steps.find.outputs.cuda13_0 }}
+      cuda12_8: ${{ steps.find.outputs.cuda12_8 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ci-image
+
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          SWITCH: ${{ vars.CI_IMAGE }}
+        run: |
+          if [[ "$SWITCH" == off ]]; then
+            echo "::notice::CI_IMAGE is off: every job installs its toolchain itself"; exit 0
+          fi
+          hash=$(sha256sum .github/ci-image/Dockerfile | cut -c1-12)
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null 2>&1 || true
+          for flavor in cuda12.0 cuda13.0 cuda12.8; do
+            ref="ghcr.io/${OWNER,,}/pantheonsim-ci:$flavor-$hash"
+            if timeout 120 docker manifest inspect "$ref" >/dev/null 2>&1; then
+              echo "${flavor/./_}=$ref" >> "$GITHUB_OUTPUT"
+              echo "$flavor: $ref"
+            else
+              echo "::notice::no $ref (yet); jobs that would run in it install their toolchain instead"
+            fi
+          done
