@@ -180,9 +180,25 @@ namespace vc = vgpu_cudnn;
 // graph (here, on the host between operations); by-value tensors are scalars
 // whose variant-pack pointer is host memory.
 struct GTensor {
-  vc::Layout l;
+  vc::Layout l;  // logical dims (a vectorized dimension counts elements, not vectors) and strides
   int64_t uid = 0;
   bool is_virtual = false, by_value = false;
+  // A vectorized tensor (CUDNN_ATTR_TENSOR_VECTOR_COUNT): dimension vdim
+  // holds vectors of vcount elements, each vector contiguous, and the
+  // descriptor's dimensions and strides count vectors -- the graph API's form
+  // of NCHW_VECT_C (INT8x4, INT8x32). l has the element count; mem_dims and
+  // mem_strides are the descriptor's own.
+  int64_t vcount = 1;
+  int vdim = -1;
+  int64_t mem_dims[vc::kMaxRank] = {}, mem_strides[vc::kMaxRank] = {};
+  // A ragged tensor (CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC): batch b's first
+  // element is at offset[b] * mult elements rather than b * strides[0] --
+  // packed variable-length sequences (THD) in attention.
+  std::shared_ptr<GTensor> ragged;
+  int64_t ragged_mult = 1;
+  // A by-value tensor's compile-time constant (CUDNN_ATTR_TENSOR_CONSTANT_VALUE),
+  // used when the variant pack gives it no pointer.
+  std::vector<uint8_t> constant;
 };
 
 bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
@@ -199,14 +215,29 @@ bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
            std::to_string(strides.size()) + " strides";
     return false;
   }
-  if (d->i64(CUDNN_ATTR_TENSOR_VECTOR_COUNT, 1) != 1) {
-    *why = "tensor " + std::to_string(t->uid) + " is vectorized, which is not supported";
-    return false;
+  t->vcount = d->i64(CUDNN_ATTR_TENSOR_VECTOR_COUNT, 1);
+  if (t->vcount != 1) {
+    t->vdim = static_cast<int>(d->i64(CUDNN_ATTR_TENSOR_VECTORIZED_DIMENSION, -1));
+    if (t->vcount < 1 || t->vdim < 0 || t->vdim >= static_cast<int>(dims.size()) || t->is_virtual) {
+      *why = "tensor " + std::to_string(t->uid) + ": a vectorized tensor needs a vectorized dimension inside it, and "
+             "cannot be virtual";
+      return false;
+    }
   }
-  if (d->get(CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC)) {
-    *why = "tensor " + std::to_string(t->uid) + " is ragged, which is not supported";
-    return false;
+  if (const Desc* rd = d->desc(CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC)) {
+    t->ragged = std::make_shared<GTensor>();
+    std::string w;
+    if (!tensor_of(rd, t->ragged.get(), &w) || t->ragged->ragged || t->ragged->is_virtual ||
+        (t->ragged->l.type != CUDNN_DATA_INT32 && t->ragged->l.type != CUDNN_DATA_INT64) ||
+        t->ragged->l.count() < static_cast<size_t>(dims[0]) + 1) {
+      *why = "tensor " + std::to_string(t->uid) + ": its ragged offsets must be an INT32 or INT64 device tensor with " +
+             "one more element than the first dimension" + (w.empty() ? "" : " (" + w + ")");
+      return false;
+    }
+    t->ragged_mult = d->i64(CUDNN_ATTR_TENSOR_RAGGED_OFFSET_MULTIPLIER, 1);
+    if (t->ragged_mult < 1) { *why = "tensor " + std::to_string(t->uid) + ": the ragged offset multiplier is below 1"; return false; }
   }
+  if (const Attr* cv = d->get(CUDNN_ATTR_TENSOR_CONSTANT_VALUE)) t->constant = cv->bytes;
   if (!vc::storable(t->l.type)) {
     *why = std::string("tensor ") + std::to_string(t->uid) + " has data type " + vc::type_name(t->l.type) +
            ", which is not supported";
@@ -214,10 +245,71 @@ bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
   }
   t->l.rank = static_cast<int>(dims.size());
   for (int i = 0; i < t->l.rank; ++i) {
-    if (dims[i] <= 0 || strides[i] <= 0) { *why = "tensor " + std::to_string(t->uid) + " has a nonpositive extent or stride"; return false; }
-    t->l.dims[i] = dims[i], t->l.strides[i] = strides[i];
+    // A stride of 0 broadcasts (a by-value or [1..] scalar may say so).
+    if (dims[i] <= 0 || strides[i] < 0) { *why = "tensor " + std::to_string(t->uid) + " has a nonpositive extent or negative stride"; return false; }
+    t->mem_dims[i] = dims[i], t->mem_strides[i] = strides[i];
+    t->l.dims[i] = dims[i] * (i == t->vdim ? t->vcount : 1), t->l.strides[i] = strides[i];
   }
+  if (t->vcount != 1) vc::packed_strides(t->l.rank, t->l.dims, false, t->l.strides);
   return true;
+}
+
+// Each logical element's offset, in elements, from the tensor's base pointer:
+// strided, vectorized or ragged (offs: the ragged offsets, read already).
+std::vector<int64_t> element_offsets(const GTensor& t, const std::vector<double>* offs = nullptr) {
+  const vc::Layout& L = t.l;
+  std::vector<int64_t> o(L.count());
+  int64_t at[vc::kMaxRank] = {};
+  for (size_t i = 0; i < o.size(); ++i) {
+    int64_t off = 0;
+    for (int d = 0; d < L.rank; ++d) {
+      int64_t idx = at[d];
+      if (d == t.vdim) {
+        off += (idx / t.vcount) * t.mem_strides[d] * t.vcount + idx % t.vcount;
+        continue;
+      }
+      if (d == 0 && offs) { off += static_cast<int64_t>((*offs)[static_cast<size_t>(idx)]) * t.ragged_mult; continue; }
+      off += idx * t.mem_strides[d] * (t.vdim >= 0 ? t.vcount : 1);
+    }
+    o[i] = off;
+    for (int d = L.rank; d-- > 0;) {
+      if (++at[d] < L.dims[d]) break;
+      at[d] = 0;
+    }
+  }
+  return o;
+}
+
+// Reads (gathers) or writes (scatters) a tensor at the given element offsets.
+bool gather(cudnnDataType_t type, const void* dev, const std::vector<int64_t>& offs, std::vector<double>* out) {
+  out->assign(offs.size(), 0.0);
+  if (offs.empty()) return true;
+  if (!dev) return false;
+  const size_t eb = vc::type_bytes(type);
+  int64_t hi = 0;
+  for (int64_t o : offs) {
+    if (o < 0) return false;
+    hi = std::max(hi, o + 1);
+  }
+  std::vector<uint8_t> raw(static_cast<size_t>(hi) * eb);
+  if (cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  for (size_t i = 0; i < offs.size(); ++i) (*out)[i] = vc::decode(type, raw.data() + offs[i] * eb);
+  return true;
+}
+bool scatter(cudnnDataType_t type, void* dev, const std::vector<int64_t>& offs, const std::vector<double>& v) {
+  if (offs.empty()) return true;
+  if (!dev || v.size() < offs.size()) return false;
+  const size_t eb = vc::type_bytes(type);
+  int64_t hi = 0;
+  for (int64_t o : offs) {
+    if (o < 0) return false;
+    hi = std::max(hi, o + 1);
+  }
+  std::vector<uint8_t> raw(static_cast<size_t>(hi) * eb);
+  // What lies between the elements belongs to someone else: keep it.
+  if (cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  for (size_t i = 0; i < offs.size(); ++i) vc::encode(type, v[i], raw.data() + offs[i] * eb);
+  return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
 double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
@@ -231,12 +323,24 @@ double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
 // What an operation is, which tensors it reads and writes, and its settings,
 // checked: everything a graph's finalization needs to accept it and its
 // execution needs to run it.
-enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd, Concat };
+enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd, Concat,
+                  Reshape, Transpose, Slice, Rng, GenStats, Softmax, BandMask, SdpaFwd, SdpaBwd, PagedLoad };
 
-// A normalization's tensors, by role: which of an Op's inputs and outputs
-// each is (-1 when the graph does not give it).
-enum NormRole { kX, kScale, kBias, kEps, kMean, kInv, kFactor, kRunMeanIn, kRunVarIn, kDy,
-                kY, kMeanOut, kInvOut, kRunMeanOut, kRunVarOut, kDx, kDscale, kDbias, kRoles };
+// An operation's tensors, by role: which of an Op's inputs (or, for an
+// output role, which of {out, more...}) each is; -1 when the graph does not
+// give it.
+enum Role { kX, kScale, kBias, kEps, kMean, kInv, kFactor, kRunMeanIn, kRunVarIn, kDy,
+            kY, kMeanOut, kInvOut, kRunMeanOut, kRunVarOut, kDx, kDscale, kDbias,
+            // matmul overrides; resampling's index tensor
+            kMOverride, kNOverride, kKOverride, kIdx,
+            // RNG
+            kSeed, kOffset,
+            // softmax and attention
+            kSink, kStats, kMax, kSumExp, kFill, kSeqQ, kSeqKV, kLeft, kShift,
+            kQ, kK, kV, kO, kDO, kDQ, kDK, kDV, kRngDump, kPageK, kPageV, kDSink,
+            // statistics generation; paged cache load
+            kSum, kSqSum, kContainer, kPageTable, kSeqLen,
+            kRoles };
 
 struct Op {
   Kind kind;
@@ -265,6 +369,27 @@ struct Op {
   int64_t win[3] = {1, 1, 1}, pre[3] = {0, 0, 0}, post[3] = {0, 0, 0}, pstr[3] = {1, 1, 1};
   cudnnBackendNormMode_t norm = CUDNN_LAYER_NORM;
   bool training = false;
+  // Resampling by interpolation: fractional window, strides and paddings.
+  double fwin[3] = {1, 1, 1}, fpre[3] = {0, 0, 0}, fpost[3] = {0, 0, 0}, fstr[3] = {1, 1, 1};
+  // Matmul: the value an element outside an overridden M x N is given.
+  double pad_value = 0.0;
+  // Reshape: view-only (the same memory through other dims and strides) or
+  // logical (row-major order kept). Transpose: the permutation. Slice: per
+  // dimension start, limit and stride.
+  bool view_only = true;
+  std::vector<int64_t> perm, start, limit, sstride;
+  // RNG: the distribution and its parameters; the seed when it is a value.
+  cudnnRngDistribution_t dist = CUDNN_RNG_DISTRIBUTION_BERNOULLI;
+  double prob = 0.5, umin = 0.0, umax = 1.0, nmean = 0.0, nstd = 1.0;
+  int64_t seed = 0;
+  // Diagonal band mask: the comparison.
+  cudnnPointwiseMode_t cmp = CUDNN_POINTWISE_CMP_GE;
+  // Attention: dropout probability; the pre-softmax subgraph (its schedule,
+  // input and output) and the softmax's own operation, when given.
+  double dropout = 0.0;
+  std::shared_ptr<std::vector<struct Op>> sub;
+  int64_t sub_in = 0, sub_out = 0;
+  std::shared_ptr<struct Op> softmax;
   std::vector<GTensor> more;
   int role[kRoles];
   Op() { for (int& r : role) r = -1; }
@@ -298,6 +423,12 @@ const char* op_name(cudnnBackendDescriptorType_t t) {
     case CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR: return "scaled dot-product attention backward";
     case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR: return "MoE grouped matmul";
     case CUDNN_BACKEND_OPERATION_DIAGONAL_BAND_MASK_DESCRIPTOR: return "diagonal band mask";
+    case CUDNN_BACKEND_OPERATION_SOFTMAX_DESCRIPTOR: return "softmax";
+    case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR: return "transpose";
+    case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR: return "slice";
+    case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR: return "MoE grouped matmul backward";
+    case CUDNN_BACKEND_OPERATION_ROPE_FWD_DESCRIPTOR: return "rotary position embedding forward";
+    case CUDNN_BACKEND_OPERATION_ROPE_BWD_DESCRIPTOR: return "rotary position embedding backward";
     default: return nullptr;
   }
 }
@@ -331,13 +462,39 @@ Arity arity(cudnnPointwiseMode_t m) {
   }
 }
 
+// a at c's rank: a lower-rank tensor (cudnn-frontend's scalars are [1])
+// lines up with c's last dimensions, the leading ones of extent 1.
+vc::Layout at_rank(const vc::Layout& a, int rank) {
+  if (a.rank >= rank) return a;
+  vc::Layout r = a;
+  r.rank = rank;
+  const int k = rank - a.rank;
+  for (int i = rank; i-- > 0;) {
+    r.dims[i] = i >= k ? a.dims[i - k] : 1;
+    r.strides[i] = i >= k ? a.strides[i - k] : 0;
+  }
+  return r;
+}
+
 // Every dimension of a is c's or 1, at c's rank.
-bool broadcasts(const vc::Layout& a, const vc::Layout& c) {
+bool broadcasts(const vc::Layout& a0, const vc::Layout& c) {
+  const vc::Layout a = at_rank(a0, c.rank);
   if (a.rank != c.rank) return false;
   for (int i = 0; i < a.rank; ++i)
     if (a.dims[i] != c.dims[i] && a.dims[i] != 1) return false;
   return true;
 }
+
+// Every dimension of a is c's or divides it (a group of c's entries per
+// entry of a: grouped-query heads, group normalization's statistics).
+bool divides(const vc::Layout& a, const vc::Layout& c) {
+  if (a.rank != c.rank) return false;
+  for (int i = 0; i < a.rank; ++i)
+    if (a.dims[i] < 1 || c.dims[i] % a.dims[i]) return false;
+  return true;
+}
+
+bool schedule_ops(const Desc* graph, std::vector<Op>* order, std::string* why, const std::set<int64_t>& free_inputs);
 
 bool op_of(const Desc* d, Op* op, std::string* why) {
   op->desc = d;
@@ -369,6 +526,31 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       return false;
     const cudnnDataType_t ct = static_cast<cudnnDataType_t>(c->i64(CUDNN_ATTR_CONVOLUTION_COMP_TYPE, CUDNN_DATA_FLOAT));
     op->acc = ct == CUDNN_DATA_HALF ? vc::Accum::Half : vc::Accum::Exact;
+    return true;
+  };
+  // Each role's tensor, if set: inputs go to in, outputs to out (the
+  // first) and then more.
+  bool have_out = false;
+  auto take = [&](cudnnBackendAttributeName_t n, int r, bool required, bool output) {
+    if (!d->desc(n)) {
+      if (required) *why = std::string(op_name(d->type)) + ": a required tensor is missing";
+      return !required;
+    }
+    GTensor t;
+    if (!tensor(n, "a tensor", &t)) return false;
+    if (output) {
+      if (!have_out) {
+        op->out = t;
+        op->role[r] = 0;
+        have_out = true;
+      } else {
+        op->more.push_back(t);
+        op->role[r] = static_cast<int>(op->more.size());
+      }
+    } else {
+      op->in.push_back(t);
+      op->role[r] = static_cast<int>(op->in.size() - 1);
+    }
     return true;
   };
   switch (d->type) {
@@ -414,15 +596,11 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       if (!tensor(CUDNN_ATTR_OPERATION_MATMUL_ADESC, "a", &a) || !tensor(CUDNN_ATTR_OPERATION_MATMUL_BDESC, "b", &b) ||
           !tensor(CUDNN_ATTR_OPERATION_MATMUL_CDESC, "c", &op->out))
         return false;
-      if (d->desc(CUDNN_ATTR_OPERATION_MATMUL_GEMM_M_OVERRIDE_DESC) || d->desc(CUDNN_ATTR_OPERATION_MATMUL_GEMM_N_OVERRIDE_DESC) ||
-          d->desc(CUDNN_ATTR_OPERATION_MATMUL_GEMM_K_OVERRIDE_DESC)) {
-        *why = "matmul: per-batch M/N/K overrides (ragged batches) are not supported";
-        return false;
-      }
       const Desc* md = d->desc(CUDNN_ATTR_OPERATION_MATMUL_DESC);
       if (!md || md->type != CUDNN_BACKEND_MATMUL_DESCRIPTOR) { *why = "matmul: the matmul descriptor is missing"; return false; }
       const auto ct = static_cast<cudnnDataType_t>(md->i64(CUDNN_ATTR_MATMUL_COMP_TYPE, CUDNN_DATA_FLOAT));
       op->acc = ct == CUDNN_DATA_HALF ? vc::Accum::Half : vc::Accum::Exact;
+      op->pad_value = scalar(md, CUDNN_ATTR_MATMUL_PADDING_VALUE, 0.0);
       const vc::Layout &A = a.l, &B = b.l, &C = op->out.l;
       const int r = C.rank;
       if (r < 2 || A.rank != r || B.rank != r || A.dims[r - 1] != B.dims[r - 2] || A.dims[r - 2] != C.dims[r - 2] ||
@@ -430,12 +608,28 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         *why = "matmul: a [.., M, K], b [.., K, N] and c [.., M, N] do not fit together";
         return false;
       }
+      // A batch dimension of a or b is c's, 1 (broadcast) or a divisor of
+      // c's, each of its entries then serving a consecutive group of c's
+      // (grouped-query attention's K and V heads).
       for (int i = 0; i < r - 2; ++i)
-        if ((A.dims[i] != C.dims[i] && A.dims[i] != 1) || (B.dims[i] != C.dims[i] && B.dims[i] != 1)) {
-          *why = "matmul: a batch dimension of a or b is neither c's nor 1";
+        if (C.dims[i] % A.dims[i] || C.dims[i] % B.dims[i]) {
+          *why = "matmul: a batch dimension of a or b neither is c's nor divides it";
           return false;
         }
       op->in = {a, b};
+      // Per-batch M, N and K: the leading rows, columns and terms each batch
+      // really has (padded sequences); the rest of c is the padding value.
+      if (!take(CUDNN_ATTR_OPERATION_MATMUL_GEMM_M_OVERRIDE_DESC, kMOverride, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_MATMUL_GEMM_N_OVERRIDE_DESC, kNOverride, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_MATMUL_GEMM_K_OVERRIDE_DESC, kKOverride, false, false))
+        return false;
+      for (int ro : {kMOverride, kNOverride, kKOverride}) {
+        if (op->role[ro] < 0) continue;
+        const vc::Layout& L = op->in[op->role[ro]].l;
+        bool fits = L.rank == r;
+        for (int i = 0; fits && i < r; ++i) fits = i < r - 2 ? C.dims[i] % L.dims[i] == 0 : L.dims[i] == 1;
+        if (!fits) { *why = "matmul: an M/N/K override is not [batch.., 1, 1] over c's batch"; return false; }
+      }
       return true;
     }
     case CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR: {
@@ -501,8 +695,10 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         *why = "reduction operator " + std::to_string(op->red) + " is not supported";
         return false;
       }
-      if (!broadcasts(op->out.l, x.l)) {
-        *why = "reduction: every dimension of y must be x's or 1 (grouped reductions are not supported)";
+      // y's extents are x's, 1, or divisors of x's: each y entry then sums
+      // a consecutive group (grouped-query attention's head reduction).
+      if (!divides(op->out.l, x.l)) {
+        *why = "reduction: every dimension of y must be x's, 1 or a divisor of x's";
         return false;
       }
       op->in = {x};
@@ -539,37 +735,86 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       if (!rd || rd->type != CUDNN_BACKEND_RESAMPLE_DESCRIPTOR) { *why = "resample: the resample descriptor is missing"; return false; }
       op->resample = static_cast<cudnnResampleMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_MODE, CUDNN_RESAMPLE_NEAREST));
       if (op->resample != CUDNN_RESAMPLE_MAXPOOL && op->resample != CUDNN_RESAMPLE_AVGPOOL_INCLUDE_PADDING &&
-          op->resample != CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING) {
-        *why = "resample mode " + std::to_string(op->resample) + " (nearest or bilinear interpolation) is not supported";
+          op->resample != CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING && op->resample != CUDNN_RESAMPLE_NEAREST &&
+          op->resample != CUDNN_RESAMPLE_BILINEAR) {
+        *why = "resample mode " + std::to_string(op->resample) + " is not defined";
+        return false;
+      }
+      const bool interp = op->resample == CUDNN_RESAMPLE_NEAREST || op->resample == CUDNN_RESAMPLE_BILINEAR;
+      // Interpolation: cuDNN documents neither how the window, strides and
+      // paddings place the samples nor how bilinear weights them, and an RTX
+      // 3060 with cuDNN 9.27 offers no engine for either mode (forward or
+      // backward, NCHW or NHWC, upsampling or downsampling -- measured), so
+      // there is nothing to match: refused by name, as that hardware does.
+      if (interp) {
+        *why = "resample: nearest and bilinear interpolation are not supported (no engine on the hardware, semantics "
+               "undocumented)";
         return false;
       }
       op->padding = static_cast<cudnnPaddingMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_ZERO_PAD));
       op->nsp = static_cast<int>(rd->i64(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS));
-      // Integer settings only: fractional strides and windows are for interpolation.
-      auto ints = [&](cudnnBackendAttributeName_t n, int64_t* out) {
+      // Each setting: integers, or fractions (interpolation's strides and
+      // paddings are fractional when it upsamples).
+      auto fracs = [&](cudnnBackendAttributeName_t n, double* out) {
         const Attr* a = rd->get(n);
-        if (!a || a->type != CUDNN_TYPE_INT64 || a->count != op->nsp) return false;
-        std::memcpy(out, a->bytes.data(), static_cast<size_t>(op->nsp) * sizeof(int64_t));
+        if (!a || a->count != op->nsp) return false;
+        for (int i = 0; i < op->nsp; ++i) {
+          if (a->type == CUDNN_TYPE_INT64) {
+            int64_t v;
+            std::memcpy(&v, a->bytes.data() + i * sizeof v, sizeof v);
+            out[i] = static_cast<double>(v);
+          } else if (a->type == CUDNN_TYPE_FRACTION) {
+            cudnnFraction_t f;
+            std::memcpy(&f, a->bytes.data() + i * sizeof f, sizeof f);
+            if (f.denominator == 0) return false;
+            out[i] = static_cast<double>(f.numerator) / static_cast<double>(f.denominator);
+          } else {
+            return false;
+          }
+        }
         return true;
       };
-      if (op->nsp < 1 || op->nsp > 3 || !ints(CUDNN_ATTR_RESAMPLE_WINDOW_DIMS, op->win) ||
-          !ints(CUDNN_ATTR_RESAMPLE_STRIDES, op->pstr) || !ints(CUDNN_ATTR_RESAMPLE_PRE_PADDINGS, op->pre) ||
-          !ints(CUDNN_ATTR_RESAMPLE_POST_PADDINGS, op->post)) {
-        *why = "resample: the window, strides and paddings must be integer lists of 1 to 3 (fractional ones are not supported)";
+      if (op->nsp < 1 || op->nsp > 3 || !fracs(CUDNN_ATTR_RESAMPLE_WINDOW_DIMS, op->fwin) ||
+          !fracs(CUDNN_ATTR_RESAMPLE_STRIDES, op->fstr) || !fracs(CUDNN_ATTR_RESAMPLE_PRE_PADDINGS, op->fpre) ||
+          !fracs(CUDNN_ATTR_RESAMPLE_POST_PADDINGS, op->fpost)) {
+        *why = "resample: the window, strides and paddings must be lists of 1 to 3 integers or fractions";
         return false;
       }
-      if (d->desc(fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC)) {
-        *why = "resample: index tensors are not supported (backward max pooling reads x and y instead)";
+      for (int i = 0; i < op->nsp; ++i) {
+        const bool integral = op->fwin[i] == std::floor(op->fwin[i]) && op->fstr[i] == std::floor(op->fstr[i]) &&
+                              op->fpre[i] == std::floor(op->fpre[i]) && op->fpost[i] == std::floor(op->fpost[i]);
+        if (!interp && !integral) {
+          *why = "resample: pooling takes integer windows, strides and paddings";
+          return false;
+        }
+        op->win[i] = static_cast<int64_t>(op->fwin[i]), op->pstr[i] = static_cast<int64_t>(op->fstr[i]);
+        op->pre[i] = static_cast<int64_t>(op->fpre[i]), op->post[i] = static_cast<int64_t>(op->fpost[i]);
+        if (op->resample == CUDNN_RESAMPLE_BILINEAR && op->fwin[i] != 2.0) {
+          *why = "resample: bilinear interpolation's window is 2";  // cuDNN's documented rule
+          return false;
+        }
+      }
+      // The index tensor: max pooling's argmax (or nearest's source) within
+      // each window, which the backward pass may read instead of x.
+      if (!take(fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC, kIdx, false, false))
         return false;
+      if (op->role[kIdx] >= 0) {
+        const GTensor idx = op->in.back();
+        op->in.pop_back();
+        op->role[kIdx] = -1;
+        op->more.push_back(idx);  // placed below: an output forward, an input backward
       }
       op->alpha = scalar(d, fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_ALPHA, 1.0);
       op->beta = scalar(d, fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_BETA, 0.0);
       GTensor x, y;
+      std::vector<GTensor> idx;
+      idx.swap(op->more);
       const vc::Layout *X, *Y;
       if (fwd) {
         if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC, "y", &op->out))
           return false;
         op->in = {x};
+        if (!idx.empty()) op->more = idx, op->role[kIdx] = 1;
         X = &op->in[0].l, Y = &op->out.l;
       } else {
         GTensor dy;
@@ -577,18 +822,23 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
             !tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC, "dx", &op->out))
           return false;
         op->in = {dy};
-        // x (which max pooling's gradient reads) and y may be given; both
-        // must be for an NCHW tensor on the hardware.
+        // x (which max pooling's gradient reads, unless the index tensor
+        // says where each maximum was) and y may be given.
         if (d->desc(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC)) {
           if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC, "x", &x)) return false;
           op->in.push_back(x);
-        } else if (op->resample == CUDNN_RESAMPLE_MAXPOOL) {
-          *why = "resample backward: max pooling's gradient needs x";
+          op->role[kX] = 1;
+        } else if (op->resample == CUDNN_RESAMPLE_MAXPOOL && idx.empty()) {
+          *why = "resample backward: max pooling's gradient needs x or the index tensor";
           return false;
         }
         if (d->desc(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC)) {
           if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC, "y", &y)) return false;
           op->in.push_back(y);
+        }
+        if (!idx.empty()) {
+          op->in.push_back(idx[0]);
+          op->role[kIdx] = static_cast<int>(op->in.size() - 1);
         }
         X = &op->out.l, Y = &op->in[0].l;
       }
@@ -596,13 +846,24 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         *why = "resample: x and y do not have the window's rank, batch and channels";
         return false;
       }
-      for (int i = 0; i < op->nsp; ++i)
-        if (op->win[i] < 1 || op->pstr[i] < 1 || op->pre[i] < 0 || op->post[i] < 0 ||
-            Y->dims[2 + i] != 1 + (X->dims[2 + i] + op->pre[i] + op->post[i] - op->win[i]) / op->pstr[i]) {
+      // y_i = 1 + (x_i + pre_i + post_i - w_i) / s_i, as cuDNN documents it
+      // for every mode (the division truncating).
+      for (int i = 0; i < op->nsp; ++i) {
+        const double span = static_cast<double>(X->dims[2 + i]) + op->fpre[i] + op->fpost[i] - op->fwin[i];
+        if (op->fwin[i] <= 0 || op->fstr[i] <= 0 || op->fpre[i] < 0 || op->fpost[i] < 0 || span < 0 ||
+            Y->dims[2 + i] != 1 + static_cast<int64_t>(std::floor(span / op->fstr[i] + 1e-9))) {
           *why = "resample: y's extent in spatial dimension " + std::to_string(i) + " is not what the window gives";
           return false;
         }
-      if (!fwd && op->in.size() > 1 && !op->in[1].l.same_dims(*X)) {
+      }
+      if (op->role[kIdx] >= 0) {
+        const vc::Layout& I = fwd ? op->more[0].l : op->in[op->role[kIdx]].l;
+        if (!I.same_dims(*Y) || (op->resample != CUDNN_RESAMPLE_MAXPOOL && op->resample != CUDNN_RESAMPLE_NEAREST)) {
+          *why = "resample: the index tensor must have y's shape, for max pooling or nearest resampling";
+          return false;
+        }
+      }
+      if (!fwd && op->role[kX] >= 0 && !op->in[op->role[kX]].l.same_dims(*X)) {
         *why = "resample backward: x's shape is not dx's";
         return false;
       }
@@ -615,8 +876,9 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       op->norm = static_cast<cudnnBackendNormMode_t>(d->i64(fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_MODE : CUDNN_ATTR_OPERATION_NORM_BWD_MODE));
       op->training = fwd && d->i64(CUDNN_ATTR_OPERATION_NORM_FWD_PHASE) == CUDNN_NORM_FWD_TRAINING;
       const char* mode = op->norm == CUDNN_LAYER_NORM ? "layer" : op->norm == CUDNN_INSTANCE_NORM ? "instance"
-                       : op->norm == CUDNN_BATCH_NORM ? "batch" : op->norm == CUDNN_RMS_NORM ? "RMS" : nullptr;
-      if (!mode) { *why = "normalization mode " + std::to_string(op->norm) + " (group norm) is not supported"; return false; }
+                       : op->norm == CUDNN_BATCH_NORM ? "batch" : op->norm == CUDNN_RMS_NORM ? "RMS"
+                       : op->norm == CUDNN_GROUP_NORM ? "group" : nullptr;
+      if (!mode) { *why = "normalization mode " + std::to_string(op->norm) + " is not defined"; return false; }
       if (fwd && op->norm == CUDNN_BATCH_NORM && !op->training) {
         *why = "batch normalization's inference phase is not supported (nor is it by cuDNN's graph API)";
         return false;
@@ -625,31 +887,6 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         *why = "multi-GPU normalization (peer statistics) is not supported";
         return false;
       }
-      // Each role's tensor, if set: inputs go to in, outputs to out (the
-      // first, y or dx) and then more.
-      bool have_out = false;
-      auto take = [&](cudnnBackendAttributeName_t n, int r, bool required, bool output) {
-        if (!d->desc(n)) {
-          if (required) *why = std::string(op_name(d->type)) + ": a required tensor is missing";
-          return !required;
-        }
-        GTensor t;
-        if (!tensor(n, "a tensor", &t)) return false;
-        if (output) {
-          if (!have_out) {
-            op->out = t;
-            op->role[r] = 0;
-            have_out = true;
-          } else {
-            op->more.push_back(t);
-            op->role[r] = static_cast<int>(op->more.size());
-          }
-        } else {
-          op->in.push_back(t);
-          op->role[r] = static_cast<int>(op->in.size() - 1);
-        }
-        return true;
-      };
       const bool rms = op->norm == CUDNN_RMS_NORM;
       bool ok;
       if (fwd) {
@@ -683,8 +920,11 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
              take(CUDNN_ATTR_OPERATION_NORM_BWD_EPSILON_DESC, kEps, false, false) &&
              take(CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC, kDscale, false, true) &&
              take(CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC, kDbias, false, true);
-        if (ok && (op->role[kInv] < 0 || (!rms && op->role[kMean] < 0))) {
-          *why = "normalization backward: only the form with the saved mean and inverse variance is supported";
+        // Without the saved statistics they are recomputed from x, which
+        // needs epsilon.
+        const bool saved = op->role[kInv] >= 0 && (rms || op->role[kMean] >= 0);
+        if (ok && !saved && op->role[kEps] < 0) {
+          *why = "normalization backward: without the saved mean and inverse variance, epsilon is required";
           return false;
         }
       }
@@ -692,15 +932,308 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       // Shapes: y (dx) is x's; scale, bias and the statistics broadcast onto x.
       const vc::Layout& X = op->in[op->role[kX]].l;
       if (!op->out.l.same_dims(X)) { *why = std::string(mode) + " normalization: the output's shape is not x's"; return false; }
-      for (int r : {kScale, kBias, kMean, kInv, kRunMeanIn, kRunVarIn, kDy})
+      // Statistics may also cover groups of x's entries (group
+      // normalization's [N, G, 1, 1] over [N, C, ...]).
+      for (int r : {kScale, kBias, kRunMeanIn, kRunVarIn, kDy})
         if (op->role[r] >= 0 && !broadcasts(op->in[op->role[r]].l, X)) {
-          *why = std::string(mode) + " normalization: a parameter or statistic does not broadcast onto x";
+          *why = std::string(mode) + " normalization: a parameter does not broadcast onto x";
+          return false;
+        }
+      for (int r : {kMean, kInv})
+        if (op->role[r] >= 0 && !divides(op->in[op->role[r]].l, X)) {
+          *why = std::string(mode) + " normalization: a statistic does not cover x";
           return false;
         }
       for (const GTensor& t : op->more)
-        if (!broadcasts(t.l, X)) { *why = std::string(mode) + " normalization: an output does not broadcast onto x"; return false; }
+        if (!divides(t.l, X)) { *why = std::string(mode) + " normalization: an output does not cover x"; return false; }
+      if (op->norm == CUDNN_GROUP_NORM) {
+        // The groups are the statistics' second dimension: they must be
+        // given (by the mean or inverse-variance tensor) to say how many.
+        const vc::Layout* st = nullptr;
+        for (int r : {kMean, kInv})
+          if (op->role[r] >= 0) st = &op->in[op->role[r]].l;
+        for (int r : {kMeanOut, kInvOut})
+          if (op->role[r] > 0) st = &op->more[op->role[r] - 1].l;
+        if (!st || X.rank < 3 || st->dims[0] != X.dims[0] || X.dims[1] % st->dims[1]) {
+          *why = "group normalization: the mean or inverse-variance tensor, [N, G, 1, ...] with G dividing C, is required";
+          return false;
+        }
+        for (int i = 2; i < st->rank; ++i)
+          if (st->dims[i] != 1) { *why = "group normalization: the statistics must be 1 past the group dimension"; return false; }
+      }
       if (op->role[kEps] >= 0 && op->in[op->role[kEps]].l.count() != 1) {
         *why = std::string(mode) + " normalization: epsilon is not a scalar";
+        return false;
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR: {
+      // The same elements under other dims and strides: view-only keeps
+      // their memory (y is x's bytes read through y's strides -- a
+      // transpose, when the strides are permuted), logical keeps their
+      // row-major order.
+      op->kind = Kind::Reshape;
+      if (!take(CUDNN_ATTR_OPERATION_RESHAPE_XDESC, kX, true, false) || !take(CUDNN_ATTR_OPERATION_RESHAPE_YDESC, kY, true, true))
+        return false;
+      op->view_only = d->i64(CUDNN_ATTR_OPERATION_RESHAPE_MODE, CUDNN_RESHAPE_VIEW_ONLY) == CUDNN_RESHAPE_VIEW_ONLY;
+      if (op->in[0].l.count() != op->out.l.count()) { *why = "reshape: x and y hold different numbers of elements"; return false; }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR: {
+      op->kind = Kind::Transpose;
+      if (!take(CUDNN_ATTR_OPERATION_TRANSPOSE_XDESC, kX, true, false) || !take(CUDNN_ATTR_OPERATION_TRANSPOSE_YDESC, kY, true, true))
+        return false;
+      op->perm = d->i64s(CUDNN_ATTR_OPERATION_TRANSPOSE_PERMUTATION);
+      const vc::Layout &X = op->in[0].l, &Y = op->out.l;
+      std::vector<bool> seen(static_cast<size_t>(X.rank), false);
+      bool ok = static_cast<int>(op->perm.size()) == X.rank && Y.rank == X.rank;
+      for (int i = 0; ok && i < X.rank; ++i) {
+        const int64_t q = op->perm[i];
+        ok = q >= 0 && q < X.rank && !seen[q] && Y.dims[i] == X.dims[q];
+        if (ok) seen[q] = true;
+      }
+      if (!ok) { *why = "transpose: the permutation does not map x's dimensions onto y's"; return false; }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR: {
+      op->kind = Kind::Slice;
+      if (!take(CUDNN_ATTR_OPERATION_SLICE_XDESC, kX, true, false) || !take(CUDNN_ATTR_OPERATION_SLICE_YDESC, kY, true, true))
+        return false;
+      op->start = d->i64s(CUDNN_ATTR_OPERATION_SLICE_START_INDICES);
+      op->limit = d->i64s(CUDNN_ATTR_OPERATION_SLICE_LIMIT_INDICES);
+      op->sstride = d->i64s(CUDNN_ATTR_OPERATION_SLICE_STRIDES);
+      const vc::Layout &X = op->in[0].l, &Y = op->out.l;
+      const size_t r = static_cast<size_t>(X.rank);
+      if (op->sstride.empty()) op->sstride.assign(r, 1);
+      bool ok = op->start.size() == r && op->limit.size() == r && op->sstride.size() == r && Y.rank == X.rank;
+      for (size_t i = 0; ok && i < r; ++i)
+        ok = op->sstride[i] >= 1 && op->start[i] >= 0 && op->limit[i] <= X.dims[i] && op->start[i] < op->limit[i] &&
+             Y.dims[i] == (op->limit[i] - op->start[i] + op->sstride[i] - 1) / op->sstride[i];
+      if (!ok) { *why = "slice: the start, limit and strides do not give y's shape inside x"; return false; }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR: {
+      op->kind = Kind::Rng;
+      const Desc* rd = d->desc(CUDNN_ATTR_OPERATION_RNG_DESC);
+      if (!rd || rd->type != CUDNN_BACKEND_RNG_DESCRIPTOR) { *why = "random number generation: the RNG descriptor is missing"; return false; }
+      op->dist = static_cast<cudnnRngDistribution_t>(rd->i64(CUDNN_ATTR_RNG_DISTRIBUTION, CUDNN_RNG_DISTRIBUTION_BERNOULLI));
+      op->prob = scalar(rd, CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY, 0.5);
+      op->umin = scalar(rd, CUDNN_ATTR_RNG_UNIFORM_DIST_MINIMUM, 0.0);
+      op->umax = scalar(rd, CUDNN_ATTR_RNG_UNIFORM_DIST_MAXIMUM, 1.0);
+      op->nmean = scalar(rd, CUDNN_ATTR_RNG_NORMAL_DIST_MEAN, -1.0);
+      op->nstd = scalar(rd, CUDNN_ATTR_RNG_NORMAL_DIST_STANDARD_DEVIATION, -1.0);
+      if (!take(CUDNN_ATTR_OPERATION_RNG_YDESC, kY, true, true) || !take(CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC, kOffset, true, false))
+        return false;
+      const Attr* sa = d->get(CUDNN_ATTR_OPERATION_RNG_SEED);
+      if (sa && sa->type == CUDNN_TYPE_BACKEND_DESCRIPTOR) {
+        if (!take(CUDNN_ATTR_OPERATION_RNG_SEED, kSeed, true, false)) return false;
+      } else {
+        op->seed = d->i64(CUDNN_ATTR_OPERATION_RNG_SEED, 0);
+      }
+      for (int r : {kSeed, kOffset})
+        if (op->role[r] >= 0 && op->in[op->role[r]].l.count() != 1) {
+          *why = "random number generation: the seed and offset must be single-element tensors";
+          return false;
+        }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR: {
+      // Per-channel sum and sum of squares: every output dimension 1 but C.
+      op->kind = Kind::GenStats;
+      if (!take(CUDNN_ATTR_OPERATION_GENSTATS_XDESC, kX, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC, kSum, true, true) ||
+          !take(CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC, kSqSum, true, true))
+        return false;
+      if (d->i64(CUDNN_ATTR_OPERATION_GENSTATS_MODE, CUDNN_GENSTATS_SUM_SQSUM) != CUDNN_GENSTATS_SUM_SQSUM) {
+        *why = "generate-statistics: only the SUM_SQSUM mode is defined";
+        return false;
+      }
+      const vc::Layout& X = op->in[0].l;
+      for (const vc::Layout* l : {&op->out.l, &op->more[0].l}) {
+        bool ok = l->rank == X.rank && X.rank >= 2;
+        for (int i = 0; ok && i < X.rank; ++i) ok = l->dims[i] == (i == 1 ? X.dims[1] : 1);
+        if (!ok) { *why = "generate-statistics: the outputs must be 1 in every dimension but C, which is x's"; return false; }
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_SOFTMAX_DESCRIPTOR: {
+      // Softmax over the last dimension, with its row maximum, sum of
+      // exponentials and log-sum-exp (stats) as optional outputs, and an
+      // optional sink: one more logit per head that joins the denominator.
+      op->kind = Kind::Softmax;
+      if (!take(CUDNN_ATTR_OPERATION_SOFTMAX_YDESC, kY, true, true) || !take(CUDNN_ATTR_OPERATION_SOFTMAX_XDESC, kX, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_SOFTMAX_SINK_DESC, kSink, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_SOFTMAX_STATS_DESC, kStats, false, true) ||
+          !take(CUDNN_ATTR_OPERATION_SOFTMAX_MAX_DESC, kMax, false, true) ||
+          !take(CUDNN_ATTR_OPERATION_SOFTMAX_SUM_EXP_DESC, kSumExp, false, true))
+        return false;
+      const vc::Layout& X = op->in[op->role[kX]].l;
+      if (!op->out.l.same_dims(X) || X.rank < 2) { *why = "softmax: y's shape is not x's"; return false; }
+      vc::Layout row = X;
+      row.dims[X.rank - 1] = 1;
+      for (int r : {kStats, kMax, kSumExp})
+        if (op->role[r] > 0 && !op->more[op->role[r] - 1].l.same_dims(row)) {
+          *why = "softmax: the statistics are not x's shape with a last dimension of 1";
+          return false;
+        }
+      if (op->role[kSink] >= 0 && !broadcasts(op->in[op->role[kSink]].l, row)) {
+        *why = "softmax: the sink does not broadcast onto x's rows";
+        return false;
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_DIAGONAL_BAND_MASK_DESCRIPTOR: {
+      // y = x where the element (row = dimension -2, column = dimension -1)
+      // lies inside the band, else b (minus infinity, typically):
+      //   right bound (CMP_GE):  row + shift [+ s_kv - s_q] >= col
+      //   left bound (CMP_GT):   col + left [- s_kv + s_q] > row
+      // the sequence lengths, when given, aligning the diagonal bottom-right.
+      op->kind = Kind::BandMask;
+      if (!take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_YDESC, kY, true, true) ||
+          !take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_XDESC, kX, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_BDESC, kFill, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_SEQ_LEN_QDESC, kSeqQ, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_SEQ_LEN_KVDESC, kSeqKV, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_LEFT_BOUND_DESC, kLeft, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_SHIFT_RIGHT_BOUND_DESC, kShift, false, false))
+        return false;
+      if (d->desc(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_CU_SEQ_LEN_QDESC) ||
+          d->desc(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_CU_SEQ_LEN_KVDESC)) {
+        *why = "diagonal band mask: cumulative sequence lengths are not supported";
+        return false;
+      }
+      op->cmp = static_cast<cudnnPointwiseMode_t>(d->i64(CUDNN_ATTR_OPERATION_DIAGONAL_BAND_MASK_COMPARISON_MODE, CUDNN_POINTWISE_CMP_GE));
+      const vc::Layout& X = op->in[op->role[kX]].l;
+      if (!op->out.l.same_dims(X) || X.rank < 2) { *why = "diagonal band mask: y's shape is not x's"; return false; }
+      for (int r : {kFill, kSeqQ, kSeqKV, kLeft, kShift})
+        if (op->role[r] >= 0 && !broadcasts(op->in[op->role[r]].l, X)) {
+          *why = "diagonal band mask: a bound or sequence length does not broadcast onto x";
+          return false;
+        }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR: {
+      // y[b, h, s, d] = container[table[b, s / bs], h, s % bs, d] for s below
+      // the batch's sequence length (y may be K's transpose, through its strides).
+      op->kind = Kind::PagedLoad;
+      if (!take(CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_YDESC, kY, true, true) ||
+          !take(CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_CONTAINER_DESC, kContainer, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_PAGE_TABLE_DESC, kPageTable, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_PAGED_CACHE_LOAD_SEQUENCE_DESC, kSeqLen, true, false))
+        return false;
+      const vc::Layout &C = op->in[op->role[kContainer]].l, &T = op->in[op->role[kPageTable]].l, &Y = op->out.l;
+      if (C.rank != 4 || T.rank != 4 || Y.rank != 4 || Y.dims[1] != C.dims[1] || T.dims[0] != Y.dims[0]) {
+        *why = "paged cache load: the container [blocks, H, block size, D], page table [B, 1, pages, 1] and y do not fit";
+        return false;
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR: {
+      const bool fwd = d->type == CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR;
+      op->kind = fwd ? Kind::SdpaFwd : Kind::SdpaBwd;
+      bool ok;
+      if (fwd) {
+        if (d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC)) {
+          *why = "scaled dot-product attention: block masks are not supported";
+          return false;
+        }
+        for (cudnnBackendAttributeName_t n : {CUDNN_ATTR_OPERATION_SDPA_FWD_CU_SEQ_LEN_QDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_CU_SEQ_LEN_KVDESC,
+                                              CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_KDESC,
+                                              CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_VDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_SDESC,
+                                              CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_SDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_ODESC,
+                                              CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_SDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_ODESC})
+          if (d->desc(n)) {
+            *why = "scaled dot-product attention: cumulative sequence lengths and FP8 scaling are not supported";
+            return false;
+          }
+        ok = take(CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC, kO, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC, kQ, true, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_KDESC, kK, true, false) && take(CUDNN_ATTR_OPERATION_SDPA_FWD_VDESC, kV, true, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_STATSDESC, kStats, false, true) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_SCALEDESC, kScale, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC, kSeqQ, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC, kSeqKV, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_KDESC, kPageK, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC, kPageV, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_SEED_DESC, kSeed, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_OFFSET_DESC, kOffset, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_RNG_DUMP_DESC, kRngDump, false, true);
+        op->dropout = scalar(d, CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_PROBABILITY, 0.0);
+        if (ok && op->dropout != 0.0 && (op->role[kSeed] < 0 || op->role[kOffset] < 0 || op->dropout < 0 || op->dropout >= 1)) {
+          *why = "scaled dot-product attention: dropout needs a seed, an offset and a probability in [0, 1)";
+          return false;
+        }
+        // The softmax's own descriptor (cuDNN 9.21+): its statistics, row
+        // maximum, sum of exponentials and sink join this operation's
+        // tensors.
+        if (ok && d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_SOFTMAX_DESC)) {
+          auto sm = std::make_shared<Op>();
+          if (!op_of(d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_SOFTMAX_DESC), sm.get(), why)) return false;
+          if (sm->kind != Kind::Softmax) { *why = "scaled dot-product attention: the softmax descriptor is not a softmax"; return false; }
+          if (sm->role[kSink] >= 0) {
+            op->in.push_back(sm->in[sm->role[kSink]]);
+            op->role[kSink] = static_cast<int>(op->in.size() - 1);
+          }
+          for (int r : {kStats, kMax, kSumExp})
+            if (sm->role[r] > 0) {
+              if (op->role[r] >= 0) { *why = "scaled dot-product attention: statistics given twice"; return false; }
+              op->more.push_back(sm->more[sm->role[r] - 1]);
+              op->role[r] = static_cast<int>(op->more.size());
+            }
+          op->softmax = sm;
+        }
+      } else {
+        if (d->desc(CUDNN_ATTR_OPERATION_SDPA_BWD_SINK_DESC) || d->desc(CUDNN_ATTR_OPERATION_SDPA_BWD_DSINK_DESC)) {
+          *why = "scaled dot-product attention backward: sinks are not supported";
+          return false;
+        }
+        ok = take(CUDNN_ATTR_OPERATION_SDPA_BWD_DQDESC, kDQ, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_DKDESC, kDK, true, true) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_DVDESC, kDV, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_QDESC, kQ, true, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_KDESC, kK, true, false) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_VDESC, kV, true, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_ODESC, kO, true, false) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_DODDESC, kDO, true, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_STATSDESC, kStats, true, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_SCALEDESC, kScale, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_QDESC, kSeqQ, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_KVDESC, kSeqKV, false, false);
+      }
+      if (!ok) return false;
+      // The score modifier subgraph: a graph run on the scaled scores
+      // (bias, masks, ALiBi, soft-capping) whose input and output uids are
+      // given; its other tensors come from this graph's variant pack.
+      const Desc* sg = d->desc(fwd ? CUDNN_ATTR_OPERATION_SDPA_FWD_SUBGRAPH : CUDNN_ATTR_OPERATION_SDPA_BWD_SUBGRAPH);
+      if (sg) {
+        op->sub_in = d->i64(fwd ? CUDNN_ATTR_OPERATION_SDPA_FWD_SUBGRAPH_INPUT_UID : CUDNN_ATTR_OPERATION_SDPA_BWD_SUBGRAPH_INPUT_UID, -1);
+        op->sub_out = d->i64(fwd ? CUDNN_ATTR_OPERATION_SDPA_FWD_SUBGRAPH_OUTPUT_UID : CUDNN_ATTR_OPERATION_SDPA_BWD_SUBGRAPH_OUTPUT_UID, -1);
+        op->sub = std::make_shared<std::vector<Op>>();
+        if (!schedule_ops(sg, op->sub.get(), why, {op->sub_in})) return false;
+        // Its device inputs are this operation's too (for the schedule and
+        // the variant pack); virtual ones stay inside it.
+        for (const Op& so : *op->sub)
+          for (const GTensor& t : so.in)
+            if (!t.is_virtual && !t.by_value) op->in.push_back(t);
+      }
+      // Shapes: Q [B, Hq, Sq, D], K [B, Hk, Skv, D], V [B, Hv, Skv, Dv], O [B, Hq, Sq, Dv],
+      // Hk and Hv dividing Hq; or K and V page containers.
+      const vc::Layout &Q = op->in[op->role[kQ]].l, &K = op->in[op->role[kK]].l, &V = op->in[op->role[kV]].l;
+      const vc::Layout& O = fwd ? op->out.l : op->in[op->role[kO]].l;
+      const bool paged = op->role[kPageK] >= 0 || op->role[kPageV] >= 0;
+      if (paged && (op->role[kPageK] < 0 || op->role[kPageV] < 0 || op->role[kSeqKV] < 0)) {
+        *why = "scaled dot-product attention: paged K and V need both page tables and the K/V sequence lengths";
+        return false;
+      }
+      bool shapes = Q.rank == 4 && K.rank == 4 && V.rank == 4 && O.rank == 4 && K.dims[3] == Q.dims[3] &&
+                    O.dims[0] == Q.dims[0] && O.dims[1] == Q.dims[1] && O.dims[2] == Q.dims[2] && O.dims[3] == V.dims[3] &&
+                    K.dims[1] >= 1 && V.dims[1] >= 1 && Q.dims[1] % K.dims[1] == 0 && Q.dims[1] % V.dims[1] == 0;
+      if (shapes && !paged)
+        shapes = K.dims[0] == Q.dims[0] && V.dims[0] == Q.dims[0] && K.dims[2] == V.dims[2];
+      if (!shapes) { *why = "scaled dot-product attention: Q, K, V and O do not fit together"; return false; }
+      for (int r : {kSeqQ, kSeqKV})
+        if (op->role[r] >= 0 && op->in[op->role[r]].l.count() != static_cast<size_t>(Q.dims[0])) {
+          *why = "scaled dot-product attention: a sequence-length tensor does not have one element per batch";
+          return false;
+        }
+      if (op->role[kScale] >= 0 && op->in[op->role[kScale]].l.count() != 1) {
+        *why = "scaled dot-product attention: the scale is not a single element";
         return false;
       }
       return true;
@@ -716,8 +1249,9 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
 
 // A graph's operations in an order that runs: each after the ones whose
 // outputs it reads. Every tensor no operation writes must be one the variant
-// pack supplies (not virtual).
-bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
+// pack supplies (not virtual) -- or, for a subgraph (an attention operation's
+// score modifiers), one of free_inputs, which its operation provides.
+bool schedule_ops(const Desc* graph, std::vector<Op>* order, std::string* why, const std::set<int64_t>& free_inputs) {
   const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
   if (!ops || ops->count < 1) { *why = "the graph has no operations"; return false; }
   std::vector<Op> all(static_cast<size_t>(ops->count));
@@ -735,7 +1269,7 @@ bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
   }
   for (const Op& o : all)
     for (const GTensor& t : o.in)
-      if (t.is_virtual && !producer.count(t.uid)) {
+      if (t.is_virtual && !producer.count(t.uid) && !free_inputs.count(t.uid)) {
         *why = "virtual tensor " + std::to_string(t.uid) + " is read but no operation writes it";
         return false;
       }
@@ -758,10 +1292,27 @@ bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
   }
   return true;
 }
+bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
+  return schedule_ops(graph, order, why, {});
+}
 
-// Whether this library can run a graph, and if not, why.
+// Whether this library can run a graph, and if not, why. A graph made
+// without a handle is a subgraph (an attention operation's score modifiers):
+// its virtual inputs come from the operation that holds it.
 bool runnable(const Desc* graph, std::string* why) {
   std::vector<Op> order;
+  if (!graph->get(CUDNN_ATTR_OPERATIONGRAPH_HANDLE)) {
+    std::set<int64_t> any;
+    const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
+    for (int64_t i = 0; ops && i < ops->count; ++i) {
+      Op o;
+      const Desc* d = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, static_cast<size_t>(i));
+      if (d && op_of(d, &o, why))
+        for (const GTensor& t : o.in)
+          if (t.is_virtual) any.insert(t.uid);
+    }
+    return schedule_ops(graph, &order, why, any);
+  }
   return schedule(graph, &order, why);
 }
 
@@ -848,13 +1399,15 @@ double pointwise(const Op& op, double x, double b, double t, int64_t index) {
 }
 
 // For each element of c (logical order), the logical index of a's element
-// broadcast onto it.
-std::vector<size_t> broadcast_index(const vc::Layout& a, const vc::Layout& c) {
+// broadcast onto it: a's extent is c's, 1, or a divisor of c's (each of a's
+// entries then covering a consecutive group of c's).
+std::vector<size_t> broadcast_index(const vc::Layout& a0, const vc::Layout& c) {
+  const vc::Layout a = at_rank(a0, c.rank);
   std::vector<size_t> idx(c.count());
   int64_t at[vc::kMaxRank] = {};
   for (size_t i = 0; i < idx.size(); ++i) {
     size_t j = 0;
-    for (int d = 0; d < c.rank; ++d) j = j * a.dims[d] + (a.dims[d] == 1 ? 0 : at[d]);
+    for (int d = 0; d < c.rank; ++d) j = j * a.dims[d] + at[d] / (c.dims[d] / a.dims[d]);
     idx[i] = j;
     for (int d = c.rank; d-- > 0;) {
       if (++at[d] < c.dims[d]) break;
@@ -864,8 +1417,12 @@ std::vector<size_t> broadcast_index(const vc::Layout& a, const vc::Layout& c) {
   return idx;
 }
 
-void run_matmul(const Op& op, const std::vector<double>& a, const std::vector<double>& b, std::vector<double>* c) {
+// Batched c = a b. a's and b's batch dimensions broadcast or group onto c's;
+// per-batch M, N and K overrides (the leading rows, columns and terms a
+// padded batch really has) leave the rest of c at the padding value.
+void run_matmul(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* c) {
   const vc::Layout &A = op.in[0].l, &B = op.in[1].l, &C = op.out.l;
+  const std::vector<double> &a = *in[0], &b = *in[1];
   const int r = C.rank;
   const int64_t M = C.dims[r - 2], N = C.dims[r - 1], K = A.dims[r - 1];
   // The batch: C's leading dimensions, with a's and b's broadcast onto them.
@@ -875,15 +1432,29 @@ void run_matmul(const Op& op, const std::vector<double>& a, const std::vector<do
   const size_t batches = r > 2 ? cb.count() : 1;
   const std::vector<size_t> ai = r > 2 ? broadcast_index(ab, cb) : std::vector<size_t>{0};
   const std::vector<size_t> bi = r > 2 ? broadcast_index(bb, cb) : std::vector<size_t>{0};
-  c->assign(batches * M * N, 0.0);
+  // An override's value for each batch.
+  auto per_batch = [&](int role, int64_t full) {
+    std::vector<int64_t> v(batches, full);
+    if (op.role[role] < 0) return v;
+    vc::Layout ob;
+    ob.rank = r - 2;
+    const vc::Layout& L = op.in[op.role[role]].l;
+    for (int i = 0; i < r - 2; ++i) ob.dims[i] = L.dims[i];
+    const std::vector<size_t> oi = r > 2 ? broadcast_index(ob, cb) : std::vector<size_t>{0};
+    for (size_t q = 0; q < batches; ++q)
+      v[q] = std::max<int64_t>(0, std::min<int64_t>(full, static_cast<int64_t>((*in[op.role[role]])[oi[q]])));
+    return v;
+  };
+  const std::vector<int64_t> Mq = per_batch(kMOverride, M), Nq = per_batch(kNOverride, N), Kq = per_batch(kKOverride, K);
+  c->assign(batches * M * N, op.pad_value);
   for (size_t q = 0; q < batches; ++q) {
     const double* pa = a.data() + ai[q] * M * K;
     const double* pb = b.data() + bi[q] * K * N;
     double* pc = c->data() + q * M * N;
-    for (int64_t i = 0; i < M; ++i)
-      for (int64_t j = 0; j < N; ++j) {
+    for (int64_t i = 0; i < Mq[q]; ++i)
+      for (int64_t j = 0; j < Nq[q]; ++j) {
         double s = 0.0;
-        for (int64_t k = 0; k < K; ++k) {
+        for (int64_t k = 0; k < Kq[q]; ++k) {
           if (op.acc == vc::Accum::Half)
             s = vc::half_to_float(vc::float_to_half(static_cast<float>(s) + static_cast<float>(pa[i * K + k]) * static_cast<float>(pb[k * N + j])));
           else
@@ -902,7 +1473,7 @@ void run_reduction(const Op& op, const std::vector<double>& x, std::vector<doubl
   int64_t at[vc::kMaxRank] = {};
   for (size_t i = 0; i < x.size(); ++i) {
     size_t o = 0;
-    for (int d = 0; d < X.rank; ++d) o = o * Y.dims[d] + (Y.dims[d] == 1 ? 0 : at[d]);
+    for (int d = 0; d < X.rank; ++d) o = o * Y.dims[d] + at[d] / (X.dims[d] / Y.dims[d]);
     const double v = x[i];
     const int64_t k = cnt[o]++;
     double& a = acc[o];
@@ -973,7 +1544,8 @@ void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, s
     return v;
   };
   std::vector<double> mean(ns, 0.0), inv(ns, 0.0), var(ns, 0.0);
-  if (op.kind == Kind::NormFwd && op.training) {
+  const bool saved = op.role[kInv] >= 0 && (rms || op.role[kMean] >= 0);
+  if ((op.kind == Kind::NormFwd && op.training) || (op.kind == Kind::NormBwd && !saved)) {
     for (size_t i = 0; i < n; ++i) mean[si[i]] += rms ? 0.0 : x[i];
     for (size_t k = 0; k < ns; ++k) mean[k] /= cnt[k];
     for (size_t i = 0; i < n; ++i) { const double c = x[i] - mean[si[i]]; var[si[i]] += c * c; }
@@ -1054,7 +1626,12 @@ void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, s
 // edge value as the padding mode says. Average pooling includes padded taps
 // in its divisor or not as its mode says; the maximum's gradient goes to the
 // first largest tap, recomputed from x.
-void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* r) {
+// The index tensor (max pooling's, measured on an RTX 3060 with cuDNN 9.27):
+// the maximum's position in its window, row-major over the window's taps
+// with padded taps counted, as INT8; the backward pass may take it in place
+// of x.
+void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs) {
+  std::vector<double>* r = &(*outs)[0];
   const bool fwd = op.kind == Kind::PoolFwd;
   const vc::Layout& X = fwd ? op.in[0].l : op.out.l;
   const vc::Layout& Y = fwd ? op.out.l : op.in[0].l;
@@ -1065,13 +1642,16 @@ void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, s
   }
   const int64_t NC = X.dims[0] * X.dims[1], isz = I[0] * I[1] * I[2], osz = O[0] * O[1] * O[2];
   const bool is_max = op.resample == CUDNN_RESAMPLE_MAXPOOL;
-  const std::vector<double>* xin = fwd ? in[0] : (is_max ? in[1] : nullptr);
+  const std::vector<double>* xin = fwd ? in[0] : (is_max && op.role[kX] >= 0 ? in[op.role[kX]] : nullptr);
+  const std::vector<double>* idx_in = !fwd && op.role[kIdx] >= 0 ? in[op.role[kIdx]] : nullptr;
+  std::vector<double>* idx_out = fwd && op.role[kIdx] > 0 ? &(*outs)[op.role[kIdx]] : nullptr;
+  if (idx_out) idx_out->assign(static_cast<size_t>(NC * osz), 0.0);
   r->assign(static_cast<size_t>(fwd ? NC * osz : NC * isz), 0.0);
   for (int64_t nc = 0; nc < NC; ++nc)
     for (int64_t o = 0; o < osz; ++o) {
       const int64_t o0 = o / (O[1] * O[2]), o1 = (o / O[2]) % O[1], o2 = o % O[2];
       double best = -INFINITY, sum = 0.0;
-      int64_t arg = -1, valid = 0, taps = 0;
+      int64_t arg = -1, valid = 0, taps = 0, warg = 0;
       for (int64_t a = 0; a < Wn[0]; ++a)
         for (int64_t b = 0; b < Wn[1]; ++b)
           for (int64_t c = 0; c < Wn[2]; ++c) {
@@ -1093,16 +1673,31 @@ void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, s
               if (op.padding == CUDNN_NEG_INF_PAD) continue;
               v = 0.0;  // zero padding
             }
-            if (is_max && (arg == -1 || v > best)) best = v, arg = at;
+            if (is_max && (arg == -1 || v > best)) best = v, arg = at, warg = (a * Wn[1] + b) * Wn[2] + c;
             sum += v;
           }
       const double div = op.resample == CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING ? static_cast<double>(valid)
                                                                               : static_cast<double>(taps);
       if (fwd) {
         (*r)[static_cast<size_t>(nc * osz + o)] = is_max ? best : (div ? sum / div : 0.0);
+        if (idx_out) (*idx_out)[static_cast<size_t>(nc * osz + o)] = static_cast<double>(warg);
         continue;
       }
       const double g = (*in[0])[static_cast<size_t>(nc * osz + o)];
+      if (is_max && idx_in) {
+        // The window position the forward pass recorded.
+        const int64_t w = static_cast<int64_t>((*idx_in)[static_cast<size_t>(nc * osz + o)]);
+        if (w < 0 || w >= Wn[0] * Wn[1] * Wn[2]) continue;
+        int64_t p[3] = {o0 * S[0] - P[0] + w / (Wn[1] * Wn[2]), o1 * S[1] - P[1] + (w / Wn[2]) % Wn[1], o2 * S[2] - P[2] + w % Wn[2]};
+        bool inside = true;
+        for (int d = 0; d < 3; ++d) inside &= p[d] >= 0 && p[d] < I[d];
+        if (!inside && op.padding == CUDNN_EDGE_VAL_PAD) {
+          for (int d = 0; d < 3; ++d) p[d] = std::min(std::max<int64_t>(p[d], 0), I[d] - 1);
+          inside = true;
+        }
+        if (inside) (*r)[static_cast<size_t>(nc * isz + (p[0] * I[1] + p[1]) * I[2] + p[2])] += g;
+        continue;
+      }
       if (is_max) {
         if (arg >= 0) (*r)[static_cast<size_t>(nc * isz + arg)] += g;  // a padded maximum takes it nowhere
         continue;
@@ -1140,105 +1735,618 @@ void run_concat(const Op& op, const std::vector<const std::vector<double>*>& in,
   }
 }
 
+/* ---- Philox: the RNG operation's generator and attention's dropout ---- */
+
+// Philox4x32-10 (Salmon et al., "Parallel random numbers: as easy as 1, 2,
+// 3"), keyed and countered as PyTorch's PhiloxRNGEngine, which cuDNN's RNG
+// operation documents it follows: key = seed, counter = {offset, subsequence}
+// (each a 64-bit pair of words).
+struct Philox4 {
+  uint32_t v[4];
+};
+Philox4 philox(uint64_t seed, uint64_t subsequence, uint64_t offset) {
+  uint32_t c[4] = {static_cast<uint32_t>(offset), static_cast<uint32_t>(offset >> 32), static_cast<uint32_t>(subsequence),
+                   static_cast<uint32_t>(subsequence >> 32)};
+  uint32_t k[2] = {static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32)};
+  for (int r = 0; r < 10; ++r) {
+    const uint64_t p0 = 0xD2511F53ull * c[0], p1 = 0xCD9E8D57ull * c[2];
+    const uint32_t hi0 = static_cast<uint32_t>(p0 >> 32), lo0 = static_cast<uint32_t>(p0);
+    const uint32_t hi1 = static_cast<uint32_t>(p1 >> 32), lo1 = static_cast<uint32_t>(p1);
+    const uint32_t n0 = hi1 ^ c[1] ^ k[0], n2 = hi0 ^ c[3] ^ k[1];
+    c[0] = n0, c[1] = lo1, c[2] = n2, c[3] = lo0;
+    k[0] += 0x9E3779B9u, k[1] += 0xBB67AE85u;
+  }
+  return {{c[0], c[1], c[2], c[3]}};
+}
+// A 32-bit draw as a uniform value in [0, 1).
+double unit(uint32_t x) { return static_cast<double>(x) * (1.0 / 4294967296.0); }
+
+// The i-th draw of a stream: the i-th 32-bit output of subsequence 0 from
+// the offset on, as PyTorch's engine hands them out.
+uint32_t draw(uint64_t seed, uint64_t offset, uint64_t i) {
+  return philox(seed, 0, offset + i / 4).v[i % 4];
+}
+
+/* ---- data movement: reshape, transpose, slice, paged cache load ---- */
+
+void run_reshape(const Op& op, const std::vector<double>& x, std::vector<double>* y) {
+  const GTensor &X = op.in[0], &Y = op.out;
+  if (!op.view_only) {  // the same row-major order
+    *y = x;
+    return;
+  }
+  // y is x's memory read through y's strides: find, for each of y's
+  // element offsets, the element of x that lives there.
+  const std::vector<int64_t> xo = element_offsets(X), yo = element_offsets(Y);
+  int64_t hi = 0;
+  for (int64_t o : xo) hi = std::max(hi, o + 1);
+  std::vector<int64_t> at(static_cast<size_t>(hi), -1);
+  for (size_t i = 0; i < xo.size(); ++i) at[static_cast<size_t>(xo[i])] = static_cast<int64_t>(i);
+  y->assign(yo.size(), 0.0);
+  for (size_t i = 0; i < yo.size(); ++i)
+    if (yo[i] >= 0 && yo[i] < hi && at[static_cast<size_t>(yo[i])] >= 0) (*y)[i] = x[static_cast<size_t>(at[static_cast<size_t>(yo[i])])];
+}
+
+void run_transpose(const Op& op, const std::vector<double>& x, std::vector<double>* y) {
+  const vc::Layout &X = op.in[0].l, &Y = op.out.l;
+  y->assign(Y.count(), 0.0);
+  int64_t at[vc::kMaxRank] = {}, xs[vc::kMaxRank] = {};
+  for (int d = X.rank, s = 1; d-- > 0;) xs[d] = s, s *= static_cast<int>(X.dims[d]);
+  for (size_t i = 0; i < y->size(); ++i) {
+    int64_t j = 0;
+    for (int d = 0; d < Y.rank; ++d) j += at[d] * xs[op.perm[d]];  // y index d is x index perm[d]
+    (*y)[i] = x[static_cast<size_t>(j)];
+    for (int d = Y.rank; d-- > 0;) {
+      if (++at[d] < Y.dims[d]) break;
+      at[d] = 0;
+    }
+  }
+}
+
+void run_slice(const Op& op, const std::vector<double>& x, std::vector<double>* y) {
+  const vc::Layout &X = op.in[0].l, &Y = op.out.l;
+  y->assign(Y.count(), 0.0);
+  int64_t at[vc::kMaxRank] = {}, xs[vc::kMaxRank] = {};
+  for (int d = X.rank, s = 1; d-- > 0;) xs[d] = s, s *= static_cast<int>(X.dims[d]);
+  for (size_t i = 0; i < y->size(); ++i) {
+    int64_t j = 0;
+    for (int d = 0; d < Y.rank; ++d) j += (op.start[d] + at[d] * op.sstride[d]) * xs[d];
+    (*y)[i] = x[static_cast<size_t>(j)];
+    for (int d = Y.rank; d-- > 0;) {
+      if (++at[d] < Y.dims[d]) break;
+      at[d] = 0;
+    }
+  }
+}
+
+// Gathers [B, H, S, D] from a container of pages [blocks, H, block size, D]:
+// position s of batch b is in page table[b, s / block size].
+void page_gather(const vc::Layout& C, const std::vector<double>& cont, const std::vector<double>& table, int64_t pages,
+                 int64_t B, int64_t S, const std::vector<double>* seq, std::vector<double>* out) {
+  const int64_t H = C.dims[1], bs = C.dims[2], D = C.dims[3];
+  out->assign(static_cast<size_t>(B * H * S * D), 0.0);
+  for (int64_t b = 0; b < B; ++b) {
+    const int64_t len = seq ? std::min<int64_t>(S, static_cast<int64_t>((*seq)[static_cast<size_t>(b)])) : S;
+    for (int64_t s = 0; s < len; ++s) {
+      const int64_t page = static_cast<int64_t>(table[static_cast<size_t>(b * pages + s / bs)]);
+      if (page < 0 || page >= C.dims[0]) continue;
+      for (int64_t h = 0; h < H; ++h)
+        for (int64_t d = 0; d < D; ++d)
+          (*out)[static_cast<size_t>(((b * H + h) * S + s) * D + d)] =
+              cont[static_cast<size_t>(((page * H + h) * bs + s % bs) * D + d)];
+    }
+  }
+}
+
+void run_paged_load(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y) {
+  const vc::Layout &C = op.in[op.role[kContainer]].l, &T = op.in[op.role[kPageTable]].l, &Y = op.out.l;
+  // y may be declared transposed ([B, H, D, S], K's form for Q K^T): its
+  // strides say which; the gather is done in [B, H, S, D] and laid out.
+  const bool kt = Y.dims[3] != C.dims[3];
+  const int64_t S = kt ? Y.dims[3] : Y.dims[2];
+  std::vector<double> g;
+  page_gather(C, *in[op.role[kContainer]], *in[op.role[kPageTable]], T.dims[2], Y.dims[0], S, in[op.role[kSeqLen]], &g);
+  if (!kt) {
+    *y = std::move(g);
+    return;
+  }
+  const int64_t B = Y.dims[0], H = Y.dims[1], D = Y.dims[2];
+  y->assign(g.size(), 0.0);
+  for (int64_t b = 0; b < B; ++b)
+    for (int64_t h = 0; h < H; ++h)
+      for (int64_t s = 0; s < S; ++s)
+        for (int64_t d = 0; d < D; ++d)
+          (*y)[static_cast<size_t>(((b * H + h) * D + d) * S + s)] = g[static_cast<size_t>(((b * H + h) * S + s) * D + d)];
+}
+
+/* ---- random numbers, statistics, softmax and masks ---- */
+
+// The RNG operation: one draw per element of y in its logical order.
+// Bernoulli gives 1 with the given probability; uniform covers [min, max);
+// normal pairs draws through Box-Muller.
+void run_rng(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y) {
+  const uint64_t seed = op.role[kSeed] >= 0 ? static_cast<uint64_t>(static_cast<int64_t>((*in[op.role[kSeed]])[0]))
+                                            : static_cast<uint64_t>(op.seed);
+  const uint64_t offset = static_cast<uint64_t>(static_cast<int64_t>((*in[op.role[kOffset]])[0]));
+  const size_t n = op.out.l.count();
+  y->assign(n, 0.0);
+  for (size_t i = 0; i < n; ++i) {
+    const double u = unit(draw(seed, offset, i));
+    switch (op.dist) {
+      case CUDNN_RNG_DISTRIBUTION_BERNOULLI: (*y)[i] = u < op.prob ? 1.0 : 0.0; break;
+      case CUDNN_RNG_DISTRIBUTION_UNIFORM: (*y)[i] = op.umin + u * (op.umax - op.umin); break;
+      default: {
+        const double u2 = unit(draw(seed, offset ^ 0x8000000000000000ull, i));
+        (*y)[i] = op.nmean + op.nstd * std::sqrt(-2.0 * std::log(1.0 - u)) * std::cos(2.0 * M_PI * u2);
+        break;
+      }
+    }
+  }
+}
+
+void run_genstats(const Op& op, const std::vector<double>& x, std::vector<std::vector<double>>* outs) {
+  const vc::Layout& X = op.in[0].l;
+  const int64_t C = X.dims[1];
+  int64_t inner = 1;
+  for (int d = 2; d < X.rank; ++d) inner *= X.dims[d];
+  std::vector<double> sum(static_cast<size_t>(C), 0.0), sq(static_cast<size_t>(C), 0.0);
+  for (size_t i = 0; i < x.size(); ++i) {
+    const size_t c = static_cast<size_t>((static_cast<int64_t>(i) / inner) % C);
+    sum[c] += x[i], sq[c] += x[i] * x[i];
+  }
+  outs->assign(2, {});
+  (*outs)[op.role[kSum]] = std::move(sum);
+  (*outs)[op.role[kSqSum]] = std::move(sq);
+}
+
+// Softmax along each row (the last dimension) of x, with an optional sink
+// logit per row joining the denominator: m = max(row, sink), e = exp(x - m),
+// z = sum(e) + exp(sink - m), y = e / z; stats = m + log z (the log-sum-exp),
+// and m and z themselves. A row with nothing unmasked gives y = 0.
+struct SoftmaxRows {
+  std::vector<double> y, stats, max, sum;
+};
+SoftmaxRows softmax_rows(const std::vector<double>& x, int64_t cols, const std::vector<double>* sink_per_row) {
+  SoftmaxRows r;
+  const size_t rows = x.size() / static_cast<size_t>(cols);
+  r.y.assign(x.size(), 0.0);
+  r.stats.assign(rows, 0.0), r.max.assign(rows, 0.0), r.sum.assign(rows, 0.0);
+  for (size_t i = 0; i < rows; ++i) {
+    const double* xr = x.data() + i * static_cast<size_t>(cols);
+    double m = -INFINITY;
+    for (int64_t j = 0; j < cols; ++j) m = std::max(m, xr[j]);
+    const double sink = sink_per_row ? (*sink_per_row)[i] : -INFINITY;
+    m = std::max(m, sink);
+    double z = 0.0;
+    if (m != -INFINITY) {
+      for (int64_t j = 0; j < cols; ++j) z += std::exp(xr[j] - m);
+      if (sink != -INFINITY) z += std::exp(sink - m);
+      for (int64_t j = 0; j < cols; ++j) r.y[i * static_cast<size_t>(cols) + static_cast<size_t>(j)] = std::exp(xr[j] - m) / z;
+    }
+    r.max[i] = m, r.sum[i] = z, r.stats[i] = m + std::log(z);
+  }
+  return r;
+}
+
+void run_softmax(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs) {
+  const vc::Layout& X = op.in[op.role[kX]].l;
+  const int64_t cols = X.dims[X.rank - 1];
+  std::vector<double> sink;
+  if (op.role[kSink] >= 0) {
+    vc::Layout row = X;
+    row.dims[X.rank - 1] = 1;
+    const std::vector<size_t> si = broadcast_index(op.in[op.role[kSink]].l, row);
+    sink.resize(si.size());
+    for (size_t i = 0; i < si.size(); ++i) sink[i] = (*in[op.role[kSink]])[si[i]];
+  }
+  SoftmaxRows r = softmax_rows(*in[op.role[kX]], cols, sink.empty() ? nullptr : &sink);
+  outs->assign(1 + op.more.size(), {});
+  (*outs)[0] = std::move(r.y);
+  if (op.role[kStats] > 0) (*outs)[op.role[kStats]] = std::move(r.stats);
+  if (op.role[kMax] > 0) (*outs)[op.role[kMax]] = std::move(r.max);
+  if (op.role[kSumExp] > 0) (*outs)[op.role[kSumExp]] = std::move(r.sum);
+}
+
+// One input of a band mask or an attention operation, broadcast onto x and
+// read at element i (or a default when absent).
+struct Bcast {
+  const std::vector<double>* v = nullptr;
+  std::vector<size_t> idx;
+  double dflt = 0.0;
+  double operator[](size_t i) const { return v ? (*v)[idx[i]] : dflt; }
+};
+Bcast bcast_of(const Op& op, const std::vector<const std::vector<double>*>& in, int role, const vc::Layout& onto, double dflt) {
+  Bcast b;
+  b.dflt = dflt;
+  if (op.role[role] < 0) return b;
+  b.v = in[op.role[role]];
+  b.idx = broadcast_index(op.in[op.role[role]].l, onto);
+  return b;
+}
+
+// Whether element (row, col) of batch b's scores is inside a band; see the
+// diagonal band mask's description in op_of.
+bool in_band(bool left_mode, cudnnPointwiseMode_t cmp, double row, double col, double bound, double sq, double skv,
+             bool have_sq, bool have_skv) {
+  double a, b;
+  if (!left_mode) {
+    a = row + bound + (have_skv ? skv : 0.0) - (have_sq ? sq : 0.0);
+    b = col;
+  } else {
+    a = col + bound - (have_skv ? skv : 0.0) + (have_sq ? sq : 0.0);
+    b = row;
+  }
+  switch (cmp) {
+    case CUDNN_POINTWISE_CMP_GT: return a > b;
+    case CUDNN_POINTWISE_CMP_GE: return a >= b;
+    case CUDNN_POINTWISE_CMP_LT: return a < b;
+    case CUDNN_POINTWISE_CMP_LE: return a <= b;
+    case CUDNN_POINTWISE_CMP_EQ: return a == b;
+    case CUDNN_POINTWISE_CMP_NEQ: return a != b;
+    default: return a >= b;
+  }
+}
+
+void run_bandmask(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y) {
+  const vc::Layout& X = op.in[op.role[kX]].l;
+  const std::vector<double>& x = *in[op.role[kX]];
+  const bool left_mode = op.role[kLeft] >= 0;
+  const Bcast fill = bcast_of(op, in, kFill, X, 0.0), sq = bcast_of(op, in, kSeqQ, X, 0.0), skv = bcast_of(op, in, kSeqKV, X, 0.0);
+  const Bcast bound = bcast_of(op, in, left_mode ? kLeft : kShift, X, 0.0);
+  y->assign(x.size(), 0.0);
+  int64_t at[vc::kMaxRank] = {};
+  for (size_t i = 0; i < x.size(); ++i) {
+    const double row = static_cast<double>(at[X.rank - 2]), col = static_cast<double>(at[X.rank - 1]);
+    const bool keep = in_band(left_mode, op.cmp, row, col, bound[i], sq[i], skv[i], op.role[kSeqQ] >= 0, op.role[kSeqKV] >= 0);
+    (*y)[i] = keep ? x[i] : fill[i];
+    for (int d = X.rank; d-- > 0;) {
+      if (++at[d] < X.dims[d]) break;
+      at[d] = 0;
+    }
+  }
+}
+
+/* ---- running a graph ---- */
+
 // Runs a scheduled graph: inputs from the variant pack (device memory, or
 // host memory for a by-value scalar), intermediates on the host rounded to
-// their declared types, outputs written back.
-cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, const std::map<int64_t, void*>& ptrs) {
-  static const char* fn = "cudnnBackendExecute";
+// their declared types, outputs written back. An attention operation's
+// score-modifier subgraph runs in a Runner of its own over the same pack.
+struct Runner {
+  cudnnHandle_t handle;
+  const std::map<int64_t, void*>& ptrs;
   std::map<int64_t, std::vector<double>> values;
   std::set<int64_t> consumed;  // tensors some operation reads
-  for (const Op& op : order)
-    for (const GTensor& t : op.in) consumed.insert(t.uid);
-  // The work the program queued before this call comes first.
-  vc::sync_handle(handle);
-  auto input = [&](const GTensor& t, const std::vector<double>** out) -> cudnnStatus_t {
+
+  Runner(cudnnHandle_t h, const std::map<int64_t, void*>& p) : handle(h), ptrs(p) {}
+
+  static constexpr const char* fn = "cudnnBackendExecute";
+
+  void* ptr_of(int64_t uid) const {
+    auto p = ptrs.find(uid);
+    return p == ptrs.end() ? nullptr : p->second;
+  }
+
+  // The element offsets of a tensor that is ragged or vectorized (empty:
+  // plainly strided, which read()/write() handle themselves).
+  cudnnStatus_t offsets_of(const GTensor& t, std::vector<int64_t>* offs) {
+    offs->clear();
+    if (t.ragged) {
+      const std::vector<double>* ro = nullptr;
+      cudnnStatus_t s = input(*t.ragged, &ro);
+      if (s != CUDNN_STATUS_SUCCESS) return s;
+      *offs = element_offsets(t, ro);
+    } else if (t.vdim >= 0) {
+      *offs = element_offsets(t);
+    }
+    return CUDNN_STATUS_SUCCESS;
+  }
+
+  cudnnStatus_t input(const GTensor& t, const std::vector<double>** out) {
     auto it = values.find(t.uid);
     if (it == values.end()) {
-      auto p = ptrs.find(t.uid);
-      if (p == ptrs.end() || !p->second) return refuse(fn, "no data pointer for tensor " + std::to_string(t.uid));
+      void* p = ptr_of(t.uid);
       std::vector<double> v;
-      if (t.by_value) {
-        v.assign(t.l.count(), vc::decode(t.l.type, static_cast<const uint8_t*>(p->second)));
-      } else if (!vc::read(t.l, p->second, &v)) {
-        return CUDNN_STATUS_EXECUTION_FAILED;
+      if (t.by_value && !p && !t.constant.empty()) {
+        v.assign(t.l.count(), vc::decode(t.l.type, t.constant.data()));
+      } else if (!p) {
+        return refuse(fn, "no data pointer for tensor " + std::to_string(t.uid));
+      } else if (t.by_value) {
+        v.assign(t.l.count(), vc::decode(t.l.type, static_cast<const uint8_t*>(p)));
+      } else {
+        std::vector<int64_t> offs;
+        cudnnStatus_t s = offsets_of(t, &offs);
+        if (s != CUDNN_STATUS_SUCCESS) return s;
+        if (offs.empty() ? !vc::read(t.l, p, &v) : !gather(t.l.type, p, offs, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
       }
       it = values.emplace(t.uid, std::move(v)).first;
     }
     *out = &it->second;
     return CUDNN_STATUS_SUCCESS;
-  };
+  }
+
   // An operation's result: kept on the host if virtual, else written out
   // (and read back, rounded to its type, if a later operation reads it).
-  auto store = [&](const GTensor& o, std::vector<double> r, double alpha, double beta) -> cudnnStatus_t {
+  cudnnStatus_t store(const GTensor& o, std::vector<double> r, double alpha, double beta) {
     if (o.is_virtual) {
       for (double& v : r) v = vc::round_to(o.l.type, alpha * v);
       values[o.uid] = std::move(r);
       return CUDNN_STATUS_SUCCESS;
     }
-    auto p = ptrs.find(o.uid);
-    if (p == ptrs.end() || !p->second) return refuse(fn, "no data pointer for tensor " + std::to_string(o.uid));
-    if (!vc::blend_write(o.l, p->second, r, alpha, beta)) return CUDNN_STATUS_EXECUTION_FAILED;
+    void* p = ptr_of(o.uid);
+    if (!p) return refuse(fn, "no data pointer for tensor " + std::to_string(o.uid));
+    std::vector<int64_t> offs;
+    cudnnStatus_t s = offsets_of(o, &offs);
+    if (s != CUDNN_STATUS_SUCCESS) return s;
+    if (offs.empty()) {
+      if (!vc::blend_write(o.l, p, r, alpha, beta)) return CUDNN_STATUS_EXECUTION_FAILED;
+    } else {
+      std::vector<double> prior;
+      if (beta != 0.0 && !gather(o.l.type, p, offs, &prior)) return CUDNN_STATUS_EXECUTION_FAILED;
+      for (size_t i = 0; i < r.size(); ++i) r[i] = beta != 0.0 ? alpha * r[i] + beta * prior[i] : alpha * r[i];
+      if (!scatter(o.l.type, p, offs, r)) return CUDNN_STATUS_EXECUTION_FAILED;
+    }
     if (!consumed.count(o.uid)) return CUDNN_STATUS_SUCCESS;
     std::vector<double> back;
-    if (!vc::read(o.l, p->second, &back)) return CUDNN_STATUS_EXECUTION_FAILED;
+    if (offs.empty() ? !vc::read(o.l, p, &back) : !gather(o.l.type, p, offs, &back)) return CUDNN_STATUS_EXECUTION_FAILED;
     values[o.uid] = std::move(back);
     return CUDNN_STATUS_SUCCESS;
-  };
-  for (const Op& op : order) {
-    std::vector<const std::vector<double>*> in(op.in.size());
-    for (size_t i = 0; i < op.in.size(); ++i) {
-      cudnnStatus_t s = input(op.in[i], &in[i]);
+  }
+
+  cudnnStatus_t run(const std::vector<Op>& order) {
+    for (const Op& op : order) {
+      for (const GTensor& t : op.in) consumed.insert(t.uid);
+      if (op.sub)
+        for (const Op& so : *op.sub)
+          for (const GTensor& t : so.in) consumed.insert(t.uid);
+    }
+    for (const Op& op : order) {
+      cudnnStatus_t s = run_op(op);
       if (s != CUDNN_STATUS_SUCCESS) return s;
     }
-    std::vector<double> r;
-    double alpha = 1.0, beta = 0.0;
-    switch (op.kind) {
-      case Kind::ConvFwd: vc::convolve(op.geom, vc::ConvDir::Forward, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
-      case Kind::ConvData: vc::convolve(op.geom, vc::ConvDir::Data, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
-      case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
-      case Kind::Matmul: run_matmul(op, *in[0], *in[1], &r); break;
-      case Kind::Reduction: run_reduction(op, *in[0], &r); break;
-      case Kind::PoolFwd:
-      case Kind::PoolBwd: run_pool(op, in, &r); alpha = op.alpha, beta = op.beta; break;
-      case Kind::Concat: run_concat(op, in, &r); break;
-      case Kind::NormFwd:
-      case Kind::NormBwd: {
-        std::vector<std::vector<double>> outs;
-        run_norm(op, in, &outs);
-        // Every output after the first is stored here; the first goes the
-        // common way below.
-        for (size_t k = 0; k < op.more.size(); ++k) {
-          cudnnStatus_t s = store(op.more[k], std::move(outs[k + 1]), 1.0, 0.0);
-          if (s != CUDNN_STATUS_SUCCESS) return s;
+    return CUDNN_STATUS_SUCCESS;
+  }
+
+  // Applies an attention operation's score modifiers to s ([B, H, Sq, Skv]).
+  cudnnStatus_t modify_scores(const Op& op, std::vector<double>* s) {
+    if (!op.sub) return CUDNN_STATUS_SUCCESS;
+    Runner sub(handle, ptrs);
+    sub.values[op.sub_in] = *s;
+    cudnnStatus_t st = sub.run(*op.sub);
+    if (st != CUDNN_STATUS_SUCCESS) return st;
+    auto it = sub.values.find(op.sub_out);
+    if (it == sub.values.end() || it->second.size() != s->size())
+      return refuse(fn, "the attention score subgraph did not produce its output tensor");
+    *s = std::move(it->second);
+    return CUDNN_STATUS_SUCCESS;
+  }
+
+  cudnnStatus_t run_sdpa(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs);
+  cudnnStatus_t run_op(const Op& op);
+};
+
+// Attention's dropout decision for element (b, h, i, j) of the [B, H, Sq,
+// Skv] probabilities: kept (1) with probability 1 - p.
+double dropout_keep(uint64_t seed, uint64_t offset, size_t linear, double p) {
+  return unit(draw(seed, offset, linear)) >= p ? 1.0 : 0.0;
+}
+
+// Scaled dot-product attention, forward and backward, as cuDNN's fused
+// operations define it:
+//   S = scale * Q K^T (then the score subgraph: bias, masks, ...), padded
+//   rows and columns (sequence lengths) masked; P = softmax(S) with its
+//   log-sum-exp kept as the statistics; dropout keeps each P element with
+//   probability 1 - p and scales it by 1 / (1 - p); O = P V, P taken in the
+//   I/O type as the hardware's second matmul takes it.
+// Backward, from O, dO and the statistics: P = exp(S - stats),
+//   dV = P^T dO, dP = dO V^T, dS = P (dP - rowsum(dO O)),
+//   dQ = scale dS K, dK = scale dS^T Q,
+// grouped K/V heads summing their query heads' gradients.
+cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector<double>*>& in,
+                               std::vector<std::vector<double>>* outs) {
+  const bool fwd = op.kind == Kind::SdpaFwd;
+  const vc::Layout &QL = op.in[op.role[kQ]].l, &KL = op.in[op.role[kK]].l, &VL = op.in[op.role[kV]].l;
+  const int64_t B = QL.dims[0], Hq = QL.dims[1], Sq = QL.dims[2], D = QL.dims[3], Dv = VL.dims[3];
+  const int64_t Hk = KL.dims[1], Hv = VL.dims[1];
+  const std::vector<double>& Q = *in[op.role[kQ]];
+  std::vector<double> K = *in[op.role[kK]], V = *in[op.role[kV]];
+  int64_t Skv = KL.dims[2];
+  if (op.role[kPageK] >= 0) {
+    // Paged K and V: gather each batch's sequence from its pages.
+    const vc::Layout &TK = op.in[op.role[kPageK]].l, &TV = op.in[op.role[kPageV]].l;
+    Skv = TK.dims[2] * KL.dims[2];
+    const int64_t SkvV = TV.dims[2] * VL.dims[2];
+    if (SkvV < Skv) return refuse(fn, "scaled dot-product attention: V's pages cover fewer positions than K's");
+    std::vector<double> k2, v2;
+    page_gather(KL, K, *in[op.role[kPageK]], TK.dims[2], B, Skv, in[op.role[kSeqKV]], &k2);
+    page_gather(VL, V, *in[op.role[kPageV]], TV.dims[2], B, Skv, in[op.role[kSeqKV]], &v2);
+    K.swap(k2), V.swap(v2);
+  }
+  const double scale = op.role[kScale] >= 0 ? (*in[op.role[kScale]])[0] : 1.0;
+  const bool padded = op.role[kSeqQ] >= 0 && op.role[kSeqKV] >= 0;
+  auto len = [&](int r, int64_t b, int64_t full) {
+    return op.role[r] >= 0 ? std::min<int64_t>(full, static_cast<int64_t>((*in[op.role[r]])[static_cast<size_t>(b)])) : full;
+  };
+  const cudnnDataType_t io = op.in[op.role[kQ]].l.type;
+  const size_t nS = static_cast<size_t>(B * Hq * Sq * Skv);
+  // S, scaled, in float as the hardware accumulates it, then modified.
+  std::vector<double> S(nS, 0.0);
+  for (int64_t b = 0; b < B; ++b)
+    for (int64_t h = 0; h < Hq; ++h) {
+      const int64_t hk = h / (Hq / Hk);
+      for (int64_t i = 0; i < Sq; ++i)
+        for (int64_t j = 0; j < Skv; ++j) {
+          double acc = 0.0;
+          for (int64_t d = 0; d < D; ++d)
+            acc += Q[static_cast<size_t>(((b * Hq + h) * Sq + i) * D + d)] * K[static_cast<size_t>(((b * Hk + hk) * Skv + j) * D + d)];
+          S[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)] = static_cast<float>(acc * scale);
         }
-        r = std::move(outs[0]);
-        break;
-      }
-      case Kind::Pointwise: {
-        const vc::Layout& Y = op.out.l;
-        r.resize(Y.count());
-        std::vector<std::vector<size_t>> bi;
-        for (const GTensor& t : op.in) bi.push_back(broadcast_index(t.l, Y));
-        const bool backward = arity(op.pw) == Arity::Backward;
-        int64_t at[vc::kMaxRank] = {};
-        for (size_t i = 0; i < r.size(); ++i) {
-          // Backward modes: in = {dy, x}; the others: {x, b, t}.
-          const double x = backward ? (*in[1])[bi[1][i]] : op.alpha * (*in[0])[bi[0][i]];
-          const double b = backward ? (*in[0])[bi[0][i]] : in.size() > 1 ? op.alpha2 * (*in[1])[bi[1][i]] : 0.0;
-          const double t = in.size() > 2 ? (*in[2])[bi[2][i]] : 0.0;
-          r[i] = pointwise(op, x, b, t, op.axis >= 0 && op.axis < Y.rank ? at[op.axis] : 0);
-          for (int d = Y.rank; d-- > 0;) {
-            if (++at[d] < Y.dims[d]) break;
-            at[d] = 0;
-          }
+    }
+  cudnnStatus_t st = modify_scores(op, &S);
+  if (st != CUDNN_STATUS_SUCCESS) return st;
+  std::vector<bool> row_live(static_cast<size_t>(B * Hq * Sq), true);
+  if (padded)
+    for (int64_t b = 0; b < B; ++b) {
+      const int64_t lq = len(kSeqQ, b, Sq), lk = len(kSeqKV, b, Skv);
+      for (int64_t h = 0; h < Hq; ++h)
+        for (int64_t i = 0; i < Sq; ++i) {
+          row_live[static_cast<size_t>((b * Hq + h) * Sq + i)] = i < lq;
+          for (int64_t j = 0; j < Skv; ++j)
+            if (i >= lq || j >= lk) S[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)] = -INFINITY;
         }
-        break;
+    }
+  outs->assign(1 + op.more.size(), {});
+  if (fwd) {
+    std::vector<double> sink;
+    if (op.role[kSink] >= 0) {
+      vc::Layout rows;
+      rows.rank = 4, rows.dims[0] = B, rows.dims[1] = Hq, rows.dims[2] = Sq, rows.dims[3] = 1;
+      const std::vector<size_t> si = broadcast_index(op.in[op.role[kSink]].l, rows);
+      sink.resize(si.size());
+      for (size_t i = 0; i < si.size(); ++i) sink[i] = (*in[op.role[kSink]])[si[i]];
+    }
+    SoftmaxRows sm = softmax_rows(S, Skv, sink.empty() ? nullptr : &sink);
+    std::vector<double> P = std::move(sm.y);
+    std::vector<double> mask;
+    if (op.dropout > 0.0) {
+      const uint64_t seed = static_cast<uint64_t>(static_cast<int64_t>((*in[op.role[kSeed]])[0]));
+      const uint64_t offset = static_cast<uint64_t>(static_cast<int64_t>((*in[op.role[kOffset]])[0]));
+      mask.resize(nS);
+      for (size_t e = 0; e < nS; ++e) {
+        mask[e] = dropout_keep(seed, offset, e, op.dropout);
+        P[e] *= mask[e] / (1.0 - op.dropout);
       }
     }
-    cudnnStatus_t s = store(op.out, std::move(r), alpha, beta);
+    std::vector<double> O(static_cast<size_t>(B * Hq * Sq * Dv), 0.0);
+    for (int64_t b = 0; b < B; ++b)
+      for (int64_t h = 0; h < Hq; ++h) {
+        const int64_t hv = h / (Hq / Hv);
+        for (int64_t i = 0; i < Sq; ++i) {
+          if (!row_live[static_cast<size_t>((b * Hq + h) * Sq + i)]) continue;  // padded rows stay 0
+          for (int64_t j = 0; j < Skv; ++j) {
+            const double p = vc::round_to(io, P[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)]);
+            if (p == 0.0) continue;
+            for (int64_t e = 0; e < Dv; ++e)
+              O[static_cast<size_t>(((b * Hq + h) * Sq + i) * Dv + e)] += p * V[static_cast<size_t>(((b * Hv + hv) * Skv + j) * Dv + e)];
+          }
+        }
+      }
+    (*outs)[0] = std::move(O);
+    if (op.role[kStats] > 0) (*outs)[op.role[kStats]] = std::move(sm.stats);
+    if (op.role[kMax] > 0) (*outs)[op.role[kMax]] = std::move(sm.max);
+    if (op.role[kSumExp] > 0) (*outs)[op.role[kSumExp]] = std::move(sm.sum);
+    if (op.role[kRngDump] > 0) (*outs)[op.role[kRngDump]] = mask.empty() ? std::vector<double>(nS, 1.0) : mask;
+    return CUDNN_STATUS_SUCCESS;
+  }
+  // Backward.
+  const std::vector<double> &O = *in[op.role[kO]], &dO = *in[op.role[kDO]], &stats = *in[op.role[kStats]];
+  std::vector<double> dQ(Q.size(), 0.0), dK(K.size(), 0.0), dV(V.size(), 0.0);
+  for (int64_t b = 0; b < B; ++b)
+    for (int64_t h = 0; h < Hq; ++h) {
+      const int64_t hk = h / (Hq / Hk), hv = h / (Hq / Hv);
+      for (int64_t i = 0; i < Sq; ++i) {
+        const size_t row = static_cast<size_t>((b * Hq + h) * Sq + i);
+        if (!row_live[row]) continue;
+        double Drow = 0.0;
+        for (int64_t e = 0; e < Dv; ++e) Drow += dO[row * Dv + e] * O[row * Dv + e];
+        for (int64_t j = 0; j < Skv; ++j) {
+          const double s = S[row * Skv + j];
+          const double p = s == -INFINITY ? 0.0 : std::exp(s - stats[row]);
+          if (p == 0.0) continue;
+          const double pio = vc::round_to(io, p);
+          double dp = 0.0;
+          for (int64_t e = 0; e < Dv; ++e) {
+            const double g = dO[row * Dv + e];
+            dp += g * V[static_cast<size_t>(((b * Hv + hv) * Skv + j) * Dv + e)];
+            dV[static_cast<size_t>(((b * Hv + hv) * Skv + j) * Dv + e)] += pio * g;
+          }
+          const double ds = vc::round_to(io, p * (dp - Drow) * scale);
+          for (int64_t d = 0; d < D; ++d) {
+            dQ[row * D + d] += ds * K[static_cast<size_t>(((b * Hk + hk) * Skv + j) * D + d)];
+            dK[static_cast<size_t>(((b * Hk + hk) * Skv + j) * D + d)] += ds * Q[row * D + d];
+          }
+        }
+      }
+    }
+  (*outs)[0] = std::move(dQ);
+  (*outs)[op.role[kDK]] = std::move(dK);
+  (*outs)[op.role[kDV]] = std::move(dV);
+  return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t Runner::run_op(const Op& op) {
+  std::vector<const std::vector<double>*> in(op.in.size());
+  for (size_t i = 0; i < op.in.size(); ++i) {
+    cudnnStatus_t s = input(op.in[i], &in[i]);
     if (s != CUDNN_STATUS_SUCCESS) return s;
   }
-  return CUDNN_STATUS_SUCCESS;
+  // outs[0] is op.out; outs[k] is op.more[k - 1] (left empty: not written).
+  std::vector<std::vector<double>> outs(1 + op.more.size());
+  std::vector<double>& r = outs[0];
+  double alpha = 1.0, beta = 0.0;
+  switch (op.kind) {
+    case Kind::ConvFwd: vc::convolve(op.geom, vc::ConvDir::Forward, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+    case Kind::ConvData: vc::convolve(op.geom, vc::ConvDir::Data, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+    case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+    case Kind::Matmul: run_matmul(op, in, &r); break;
+    case Kind::Reduction: run_reduction(op, *in[0], &r); break;
+    case Kind::PoolFwd:
+    case Kind::PoolBwd:
+      run_pool(op, in, &outs);
+      alpha = op.alpha, beta = op.beta;
+      break;
+    case Kind::Concat: run_concat(op, in, &r); break;
+    case Kind::NormFwd:
+    case Kind::NormBwd: run_norm(op, in, &outs); break;
+    case Kind::Reshape: run_reshape(op, *in[0], &r); break;
+    case Kind::Transpose: run_transpose(op, *in[0], &r); break;
+    case Kind::Slice: run_slice(op, *in[0], &r); break;
+    case Kind::Rng: run_rng(op, in, &r); break;
+    case Kind::GenStats: run_genstats(op, *in[0], &outs); break;
+    case Kind::Softmax: run_softmax(op, in, &outs); break;
+    case Kind::BandMask: run_bandmask(op, in, &r); break;
+    case Kind::PagedLoad: run_paged_load(op, in, &r); break;
+    case Kind::SdpaFwd:
+    case Kind::SdpaBwd: {
+      cudnnStatus_t s = run_sdpa(op, in, &outs);
+      if (s != CUDNN_STATUS_SUCCESS) return s;
+      break;
+    }
+    case Kind::Pointwise: {
+      const vc::Layout& Y = op.out.l;
+      r.resize(Y.count());
+      std::vector<std::vector<size_t>> bi;
+      for (const GTensor& t : op.in) bi.push_back(broadcast_index(t.l, Y));
+      const bool backward = arity(op.pw) == Arity::Backward;
+      int64_t at[vc::kMaxRank] = {};
+      for (size_t i = 0; i < r.size(); ++i) {
+        // Backward modes: in = {dy, x}; the others: {x, b, t}.
+        const double x = backward ? (*in[1])[bi[1][i]] : op.alpha * (*in[0])[bi[0][i]];
+        const double b = backward ? (*in[0])[bi[0][i]] : in.size() > 1 ? op.alpha2 * (*in[1])[bi[1][i]] : 0.0;
+        const double t = in.size() > 2 ? (*in[2])[bi[2][i]] : 0.0;
+        r[i] = pointwise(op, x, b, t, op.axis >= 0 && op.axis < Y.rank ? at[op.axis] : 0);
+        for (int d = Y.rank; d-- > 0;) {
+          if (++at[d] < Y.dims[d]) break;
+          at[d] = 0;
+        }
+      }
+      break;
+    }
+  }
+  // Every output after the first, then the first (which alpha and beta blend).
+  for (size_t k = 0; k < op.more.size(); ++k) {
+    if (outs[k + 1].empty()) continue;
+    cudnnStatus_t s = store(op.more[k], std::move(outs[k + 1]), 1.0, 0.0);
+    if (s != CUDNN_STATUS_SUCCESS) return s;
+  }
+  return store(op.out, std::move(r), alpha, beta);
+}
+
+cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, const std::map<int64_t, void*>& ptrs) {
+  // The work the program queued before this call comes first.
+  vc::sync_handle(handle);
+  Runner runner(handle, ptrs);
+  return runner.run(order);
 }
 
 // The one engine: global index 0, for the graph it was made for, owned (with
@@ -1374,7 +2482,17 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR:
-    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR: {
+    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_SOFTMAX_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_DIAGONAL_BAND_MASK_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR: {
       // Shapes that do not fit are the caller's error; a setting this
       // library does not compute is refused by name.
       Op op;
@@ -1396,9 +2514,37 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_MATMUL_DESCRIPTOR:
       if (!d->get(CUDNN_ATTR_MATMUL_COMP_TYPE)) return CUDNN_STATUS_BAD_PARAM;
       break;
-    case CUDNN_BACKEND_RESAMPLE_DESCRIPTOR:
-      if (!d->get(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS)) return CUDNN_STATUS_BAD_PARAM;
+    case CUDNN_BACKEND_RNG_DESCRIPTOR: {
+      // cuDNN's documented refusals: a negative standard deviation or
+      // probability, a uniform range whose maximum is below its minimum.
+      const int64_t dist = d->i64(CUDNN_ATTR_RNG_DISTRIBUTION, CUDNN_RNG_DISTRIBUTION_BERNOULLI);
+      if ((dist == CUDNN_RNG_DISTRIBUTION_NORMAL && scalar(d, CUDNN_ATTR_RNG_NORMAL_DIST_STANDARD_DEVIATION, -1.0) < 0) ||
+          (dist == CUDNN_RNG_DISTRIBUTION_UNIFORM && scalar(d, CUDNN_ATTR_RNG_UNIFORM_DIST_MAXIMUM, 1.0) < scalar(d, CUDNN_ATTR_RNG_UNIFORM_DIST_MINIMUM, 0.0)) ||
+          (dist == CUDNN_RNG_DISTRIBUTION_BERNOULLI && scalar(d, CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY, 0.5) < 0) ||
+          dist < CUDNN_RNG_DISTRIBUTION_BERNOULLI || dist > CUDNN_RNG_DISTRIBUTION_NORMAL)
+        return CUDNN_STATUS_BAD_PARAM;
       break;
+    }
+    case CUDNN_BACKEND_RESAMPLE_DESCRIPTOR: {
+      if (!d->get(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS)) return CUDNN_STATUS_BAD_PARAM;
+      // Interpolation's window is 2 in every dimension: cuDNN documents it
+      // for bilinear, and an RTX 3060 (cuDNN 9.27) refuses a window of 1 for
+      // nearest too, with NOT_SUPPORTED.
+      const int64_t mode = d->i64(CUDNN_ATTR_RESAMPLE_MODE, CUDNN_RESAMPLE_NEAREST);
+      if (mode == CUDNN_RESAMPLE_NEAREST || mode == CUDNN_RESAMPLE_BILINEAR) {
+        const Attr* w = d->get(CUDNN_ATTR_RESAMPLE_WINDOW_DIMS);
+        for (int64_t i = 0; w && i < w->count; ++i) {
+          double v = 0;
+          if (w->type == CUDNN_TYPE_INT64) { int64_t x; std::memcpy(&x, w->bytes.data() + i * 8, 8); v = static_cast<double>(x); }
+          else if (w->type == CUDNN_TYPE_FRACTION) {
+            cudnnFraction_t f; std::memcpy(&f, w->bytes.data() + i * sizeof f, sizeof f);
+            v = f.denominator ? static_cast<double>(f.numerator) / static_cast<double>(f.denominator) : 0.0;
+          }
+          if (v != 2.0) return refuse("cudnnBackendFinalize", "resample: interpolation's window must be 2");
+        }
+      }
+      break;
+    }
     case CUDNN_BACKEND_REDUCTION_DESCRIPTOR: {
       if (!d->get(CUDNN_ATTR_REDUCTION_OPERATOR) || !d->get(CUDNN_ATTR_REDUCTION_COMP_TYPE)) return CUDNN_STATUS_BAD_PARAM;
       const int64_t r = d->i64(CUDNN_ATTR_REDUCTION_OPERATOR);
@@ -1575,4 +2721,12 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackend
     ptrs[uids[i]] = ptr;
   }
   return execute_graph(handle, order, ptrs);
+}
+
+// cudnn-frontend references cudnnReorderFilterAndBias (for INT8x32 filters),
+// so a program built with it needs the symbol to load. Weak: the classic
+// API's own definition, where there is one, takes its place.
+extern "C" __attribute__((visibility("default"), weak)) cudnnStatus_t cudnnReorderFilterAndBias(
+    cudnnHandle_t, const cudnnFilterDescriptor_t, cudnnReorderType_t, const void*, void*, int, const void*, void*) {
+  return vgpu_cudnn::fail(CUDNN_STATUS_NOT_SUPPORTED, "cudnnReorderFilterAndBias", "filter reordering is not supported");
 }

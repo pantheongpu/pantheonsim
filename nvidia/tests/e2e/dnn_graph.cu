@@ -10,6 +10,10 @@
 //     running statistics) and backward
 //   - max and average pooling (resampling), forward and backward
 //   - a convolution padded asymmetrically, and a concatenation
+//   - NHWC max pooling with its index tensor, and the backward pass from it
+//   - group normalization, and normalization backward without the saved
+//     statistics
+//   - statistics generation, the RNG operation, reshape, transpose, slice
 //
 // each checked against a reference computed here on the host, and a graph
 // holding an operation the library has no engine for refused rather than run.
@@ -745,6 +749,365 @@ static void asymmetric_and_concat() {
   }
 }
 
+/* ---- the graph API's other operations ---- */
+
+// A tensor of any type and strides (packed when strides is empty).
+static Desc tensor_of(int64_t uid, const std::vector<int64_t>& dims, cudnnDataType_t t, std::vector<int64_t> strides = {},
+                      bool is_virtual = false) {
+  Desc d = make(CUDNN_BACKEND_TENSOR_DESCRIPTOR);
+  const int64_t align = 16;
+  if (strides.empty()) strides = packed(dims);
+  set(d, CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &t);
+  set(d, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, (int64_t)dims.size(), dims.data());
+  set(d, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, (int64_t)strides.size(), strides.data());
+  set(d, CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, 1, &uid);
+  set(d, CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, CUDNN_TYPE_INT64, 1, &align);
+  set(d, CUDNN_ATTR_TENSOR_IS_VIRTUAL, CUDNN_TYPE_BOOLEAN, 1, &is_virtual);
+  cudnnBackendFinalize(d);
+  return d;
+}
+
+// Max pooling in NHWC with the INT8 index tensor: the maximum's position in
+// its window, row-major over the window's taps, padded taps counted (as an
+// RTX 3060 writes it), and the backward pass taken from the index alone.
+static void pooling_index() {
+  const int N = 1, C = 2, Hh = 4, W = 6, wh = 2, ww = 3, sh = 2, sw = 2, ph = 0, pw = 1;
+  const int Ho = 1 + (Hh + 2 * ph - wh) / sh, Wo = 1 + (W + 2 * pw - ww) / sw;
+  const std::vector<int64_t> xd = {N, C, Hh, W}, yd = {N, C, Ho, Wo};
+  const std::vector<int64_t> xs = {Hh * W * C, 1, W * C, C}, ys = {Ho * Wo * C, 1, Wo * C, C};
+  const auto hx = filled(count(xd), 2.0f, 9);  // logical NCHW order
+  // In memory, NHWC.
+  std::vector<float> mx(hx.size());
+  for (int c = 0; c < C; ++c)
+    for (int h = 0; h < Hh; ++h)
+      for (int w = 0; w < W; ++w) mx[(h * W + w) * C + c] = hx[(c * Hh + h) * W + w];
+  std::vector<double> want_y(count(yd)), want_i(count(yd)), want_dx(count(xd), 0.0);
+  const auto hdy = filled(count(yd), 1.0f, 4);
+  for (int c = 0; c < C; ++c)
+    for (int i = 0; i < Ho; ++i)
+      for (int j = 0; j < Wo; ++j) {
+        double best = 0;
+        int arg = -1, at = -1;
+        for (int a = 0; a < wh; ++a)
+          for (int b = 0; b < ww; ++b) {
+            const int r = i * sh - ph + a, q = j * sw - pw + b;
+            if (r < 0 || r >= Hh || q < 0 || q >= W) continue;
+            const double v = hx[(c * Hh + r) * W + q];
+            if (arg < 0 || v > best) best = v, arg = a * ww + b, at = (c * Hh + r) * W + q;
+          }
+        const int yi = (c * Ho + i) * Wo + j;
+        want_y[yi] = best, want_i[yi] = arg;
+        want_dx[at] += hdy[yi];
+      }
+  Desc rd = make(CUDNN_BACKEND_RESAMPLE_DESCRIPTOR);
+  const cudnnResampleMode_t mode = CUDNN_RESAMPLE_MAXPOOL;
+  const cudnnPaddingMode_t pad = CUDNN_NEG_INF_PAD;
+  const int64_t nsp = 2, w2[2] = {wh, ww}, p2[2] = {ph, pw}, s2[2] = {sh, sw};
+  const cudnnDataType_t f = CUDNN_DATA_FLOAT;
+  const cudnnNanPropagation_t nan = CUDNN_NOT_PROPAGATE_NAN;
+  set(rd, CUDNN_ATTR_RESAMPLE_MODE, CUDNN_TYPE_RESAMPLE_MODE, 1, &mode);
+  set(rd, CUDNN_ATTR_RESAMPLE_COMP_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &f);
+  set(rd, CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION, CUDNN_TYPE_NAN_PROPOGATION, 1, &nan);
+  set(rd, CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_TYPE_PADDING_MODE, 1, &pad);
+  set(rd, CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS, CUDNN_TYPE_INT64, 1, &nsp);
+  set(rd, CUDNN_ATTR_RESAMPLE_WINDOW_DIMS, CUDNN_TYPE_INT64, 2, w2);
+  set(rd, CUDNN_ATTR_RESAMPLE_PRE_PADDINGS, CUDNN_TYPE_INT64, 2, p2);
+  set(rd, CUDNN_ATTR_RESAMPLE_POST_PADDINGS, CUDNN_TYPE_INT64, 2, p2);
+  set(rd, CUDNN_ATTR_RESAMPLE_STRIDES, CUDNN_TYPE_INT64, 2, s2);
+  cudnnBackendFinalize(rd);
+  Desc x = tensor_of(1, xd, CUDNN_DATA_FLOAT, xs), y = tensor_of(2, yd, CUDNN_DATA_FLOAT, ys),
+       ix = tensor_of(3, yd, CUDNN_DATA_INT8, ys);
+  Desc op = make(CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR);
+  set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC, rd);
+  set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC, x);
+  set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC, y);
+  set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC, ix);
+  cudnnBackendFinalize(op);
+  float *dx = to_dev(mx), *dy = to_dev(std::vector<float>(count(yd), 7.0f));
+  int8_t* di = nullptr;
+  cudaMalloc(&di, count(yd) + 64);
+  cudaMemset(di, 0x7f, count(yd));
+  const int ran = run("graph: NHWC max pooling with its index tensor", {op}, {1, 2, 3}, {dx, dy, di});
+  double err = 0;
+  std::vector<int8_t> hi(count(yd));
+  if (ran == 1) {
+    const auto gy = from_dev(dy, count(yd));
+    cudaMemcpy(hi.data(), di, hi.size(), cudaMemcpyDeviceToHost);
+    for (int c = 0; c < C; ++c)
+      for (int i = 0; i < Ho; ++i)
+        for (int j = 0; j < Wo; ++j) {
+          const int yi = (c * Ho + i) * Wo + j, mi = (i * Wo + j) * C + c;
+          err = std::fmax(err, std::fabs(gy[mi] - want_y[yi]) + std::fabs(hi[mi] - want_i[yi]));
+        }
+  }
+  report("graph: NHWC max pooling with its index tensor", ran, err, 1e-6);
+  // Backward from the index alone (no x): the RTX 3060 offers no engine for
+  // it, so on the hardware this is skipped.
+  {
+    std::vector<int8_t> idx_mem(count(yd));
+    std::vector<float> dy_mem(count(yd));
+    for (int c = 0; c < C; ++c)
+      for (int i = 0; i < Ho; ++i)
+        for (int j = 0; j < Wo; ++j) {
+          const int yi = (c * Ho + i) * Wo + j, mi = (i * Wo + j) * C + c;
+          idx_mem[mi] = (int8_t)want_i[yi], dy_mem[mi] = hdy[yi];
+        }
+    cudaMemcpy(di, idx_mem.data(), idx_mem.size(), cudaMemcpyHostToDevice);
+    Desc gy = tensor_of(4, yd, CUDNN_DATA_FLOAT, ys), gx = tensor_of(5, xd, CUDNN_DATA_FLOAT, xs);
+    Desc bop = make(CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR);
+    set_desc(bop, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DESC, rd);
+    set_desc(bop, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC, gy);
+    set_desc(bop, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC, gx);
+    set_desc(bop, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC, ix);
+    cudnnBackendFinalize(bop);
+    float *ddy = to_dev(dy_mem), *dgx = to_dev(std::vector<float>(count(xd), 7.0f));
+    const int bran = run("graph: max pooling backward from the index tensor", {bop}, {4, 5, 3}, {ddy, dgx, di});
+    double berr = 0;
+    if (bran == 1) {
+      const auto g = from_dev(dgx, count(xd));
+      for (int c = 0; c < C; ++c)
+        for (int h = 0; h < Hh; ++h)
+          for (int w = 0; w < W; ++w) berr = std::fmax(berr, std::fabs(g[(h * W + w) * C + c] - want_dx[(c * Hh + h) * W + w]));
+    }
+    report("graph: max pooling backward from the index tensor", bran, berr, 1e-6);
+    for (Desc d : {gy, gx, bop}) cudnnBackendDestroyDescriptor(d);
+    cudaFree(ddy), cudaFree(dgx);
+  }
+  for (Desc d : {rd, x, y, ix, op}) cudnnBackendDestroyDescriptor(d);
+  cudaFree(dx), cudaFree(dy), cudaFree(di);
+}
+
+// Group normalization (the norm operation's GROUP_NORM mode, the groups
+// given by the statistics' [N, G, 1, 1] shape) forward and backward, and
+// layer normalization's backward pass without the saved statistics (from x
+// and epsilon).
+static void group_and_unsaved_norms() {
+  const int N = 2, C = 6, G = 3, S = 4;
+  const std::vector<int64_t> xd = {N, C, S, 1}, pd = {1, C, 1, 1}, sd = {N, G, 1, 1};
+  const float eps = 1e-5f;
+  const auto hx = filled(count(xd), 1.5f, 11), hs = filled(C, 0.5f, 12), hb = filled(C, 0.3f, 13), hdy = filled(count(xd), 0.8f, 14);
+  // Host reference: groups of C / G consecutive channels.
+  const int cg = C / G;
+  std::vector<double> mean(N * G, 0), var(N * G, 0), inv(N * G);
+  auto slot = [&](size_t i) { const int n = (int)(i / (C * S)), c = (int)(i / S) % C; return n * G + c / cg; };
+  for (size_t i = 0; i < hx.size(); ++i) mean[slot(i)] += hx[i] / (cg * S);
+  for (size_t i = 0; i < hx.size(); ++i) var[slot(i)] += (hx[i] - mean[slot(i)]) * (hx[i] - mean[slot(i)]) / (cg * S);
+  for (int k = 0; k < N * G; ++k) inv[k] = 1 / std::sqrt(var[k] + eps);
+  std::vector<double> want_y(hx.size());
+  for (size_t i = 0; i < hx.size(); ++i) {
+    const int c = (int)(i / S) % C;
+    want_y[i] = hs[c] * (hx[i] - mean[slot(i)]) * inv[slot(i)] + hb[c];
+  }
+  const cudnnBackendNormMode_t gm = CUDNN_GROUP_NORM;
+  Desc x = tensor(1, xd), sc = tensor(2, pd), b = tensor(3, pd), e = scalar_tensor(4), y = tensor(5, xd), m = tensor(6, sd),
+       iv = tensor(7, sd);
+  Desc op = make(CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR);
+  const cudnnBackendNormFwdPhase_t phase = CUDNN_NORM_FWD_TRAINING;
+  set(op, CUDNN_ATTR_OPERATION_NORM_FWD_MODE, CUDNN_TYPE_NORM_MODE, 1, &gm);
+  set(op, CUDNN_ATTR_OPERATION_NORM_FWD_PHASE, CUDNN_TYPE_NORM_FWD_PHASE, 1, &phase);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_XDESC, x);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC, sc);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC, b);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC, e);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_YDESC, y);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC, m);
+  set_desc(op, CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC, iv);
+  const cudnnStatus_t fs = cudnnBackendFinalize(op);
+  float *dx = to_dev(hx), *ds = to_dev(hs), *db = to_dev(hb), *dyv = to_dev(std::vector<float>(hx.size(), 7.0f)),
+        *dm = to_dev(std::vector<float>(N * G, 7.0f)), *di = to_dev(std::vector<float>(N * G, 7.0f));
+  int ran = fs == CUDNN_STATUS_SUCCESS ? run("graph: group normalization forward (training)", {op}, {1, 2, 3, 4, 5, 6, 7},
+                                             {dx, ds, db, (void*)&eps, dyv, dm, di})
+                                       : 0;
+  double err = 0;
+  if (ran == 1)
+    err = std::fmax(std::fmax(max_rel(from_dev(dyv, hx.size()), want_y), max_rel(from_dev(dm, N * G), mean)),
+                    max_rel(from_dev(di, N * G), inv));
+  report("graph: group normalization forward (training)", ran, err, 1e-4);
+
+  // Backward: with the saved statistics (group norm), and without them
+  // (layer norm, recomputed from x and epsilon).
+  auto backward_ref = [&](const std::vector<double>& mn, const std::vector<double>& in, auto slotf, int per,
+                          std::vector<double>* gx, std::vector<double>* gs, std::vector<double>* gb) {
+    const size_t ns = mn.size();
+    std::vector<double> mg(ns, 0), mgx(ns, 0);
+    gx->assign(hx.size(), 0), gs->assign(C, 0), gb->assign(C, 0);
+    for (size_t i = 0; i < hx.size(); ++i) {
+      const int k = slotf(i), c = (int)(i / S) % C;
+      const double xh = (hx[i] - mn[k]) * in[k], g = hdy[i] * hs[c];
+      mg[k] += g, mgx[k] += g * xh, (*gs)[c] += hdy[i] * xh, (*gb)[c] += hdy[i];
+    }
+    for (size_t i = 0; i < hx.size(); ++i) {
+      const int k = slotf(i), c = (int)(i / S) % C;
+      const double xh = (hx[i] - mn[k]) * in[k], g = hdy[i] * hs[c];
+      (*gx)[i] = in[k] * (g - mg[k] / per - xh * mgx[k] / per);
+    }
+  };
+  for (int unsaved = 0; unsaved < 2; ++unsaved) {
+    const char* what = unsaved ? "graph: layer normalization backward without saved statistics"
+                               : "graph: group normalization backward";
+    const cudnnBackendNormMode_t mode = unsaved ? CUDNN_LAYER_NORM : CUDNN_GROUP_NORM;
+    std::vector<double> lmean(N, 0), lvar(N, 0), linv(N);
+    for (size_t i = 0; i < hx.size(); ++i) lmean[i / (C * S)] += hx[i] / (C * S);
+    for (size_t i = 0; i < hx.size(); ++i) lvar[i / (C * S)] += (hx[i] - lmean[i / (C * S)]) * (hx[i] - lmean[i / (C * S)]) / (C * S);
+    for (int n = 0; n < N; ++n) linv[n] = 1 / std::sqrt(lvar[n] + eps);
+    std::vector<double> wgx, wgs, wgb;
+    if (unsaved) backward_ref(lmean, linv, [&](size_t i) { return (int)(i / (C * S)); }, C * S, &wgx, &wgs, &wgb);
+    else backward_ref(mean, inv, slot, cg * S, &wgx, &wgs, &wgb);
+    Desc gy = tensor(13, xd), gx = tensor(14, xd), gs = tensor(15, pd), gb = tensor(16, pd);
+    Desc bop = make(CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR);
+    set(bop, CUDNN_ATTR_OPERATION_NORM_BWD_MODE, CUDNN_TYPE_NORM_MODE, 1, &mode);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_XDESC, x);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC, gy);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC, sc);
+    if (unsaved) {
+      set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_EPSILON_DESC, e);
+    } else {
+      set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC, m);
+      set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC, iv);
+    }
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC, gx);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC, gs);
+    set_desc(bop, CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC, gb);
+    const cudnnStatus_t bs = cudnnBackendFinalize(bop);
+    std::vector<float> fm(mean.begin(), mean.end()), fi(inv.begin(), inv.end());
+    float *ddy = to_dev(hdy), *dgx = to_dev(std::vector<float>(hx.size(), 7.0f)), *dgs = to_dev(std::vector<float>(C, 7.0f)),
+          *dgb = to_dev(std::vector<float>(C, 7.0f)), *sm = to_dev(fm), *si = to_dev(fi);
+    std::vector<int64_t> uids = {1, 13, 2, 14, 15, 16};
+    std::vector<void*> ptrs = {dx, ddy, ds, dgx, dgs, dgb};
+    if (unsaved) uids.push_back(4), ptrs.push_back((void*)&eps);
+    else uids.push_back(6), ptrs.push_back(sm), uids.push_back(7), ptrs.push_back(si);
+    const int bran = bs == CUDNN_STATUS_SUCCESS ? run(what, {bop}, uids, ptrs) : 0;
+    double berr = 0;
+    if (bran == 1)
+      berr = std::fmax(std::fmax(max_rel(from_dev(dgx, hx.size()), wgx), max_rel(from_dev(dgs, C), wgs)), max_rel(from_dev(dgb, C), wgb));
+    report(what, bran, berr, 1e-4);
+    for (Desc d : {gy, gx, gs, gb, bop}) cudnnBackendDestroyDescriptor(d);
+    for (float* p : {ddy, dgx, dgs, dgb, sm, si}) cudaFree(p);
+  }
+  for (Desc d : {x, sc, b, e, y, m, iv, op}) cudnnBackendDestroyDescriptor(d);
+  for (float* p : {dx, ds, db, dyv, dm, di}) cudaFree(p);
+}
+
+// Statistics generation: per-channel sum and sum of squares.
+static void genstats() {
+  const std::vector<int64_t> xd = {2, 3, 4, 4}, cd = {1, 3, 1, 1};
+  const auto hx = filled(count(xd), 1.0f, 21);
+  std::vector<double> sum(3, 0), sq(3, 0);
+  for (size_t i = 0; i < hx.size(); ++i) sum[(i / 16) % 3] += hx[i], sq[(i / 16) % 3] += hx[i] * hx[i];
+  Desc x = tensor(1, xd), s = tensor(2, cd), q = tensor(3, cd);
+  Desc op = make(CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR);
+  const cudnnGenStatsMode_t mode = CUDNN_GENSTATS_SUM_SQSUM;
+  const cudnnDataType_t f = CUDNN_DATA_FLOAT;
+  set(op, CUDNN_ATTR_OPERATION_GENSTATS_MODE, CUDNN_TYPE_GENSTATS_MODE, 1, &mode);
+  set(op, CUDNN_ATTR_OPERATION_GENSTATS_MATH_PREC, CUDNN_TYPE_DATA_TYPE, 1, &f);
+  set_desc(op, CUDNN_ATTR_OPERATION_GENSTATS_XDESC, x);
+  set_desc(op, CUDNN_ATTR_OPERATION_GENSTATS_SUMDESC, s);
+  set_desc(op, CUDNN_ATTR_OPERATION_GENSTATS_SQSUMDESC, q);
+  const cudnnStatus_t st = cudnnBackendFinalize(op);
+  float *dx = to_dev(hx), *dsum = to_dev(std::vector<float>(3, 7.0f)), *dsq = to_dev(std::vector<float>(3, 7.0f));
+  const int ran = st == CUDNN_STATUS_SUCCESS ? run("graph: statistics generation (sum, sum of squares)", {op}, {1, 2, 3}, {dx, dsum, dsq}) : 0;
+  report("graph: statistics generation (sum, sum of squares)", ran,
+         ran == 1 ? std::fmax(max_rel(from_dev(dsum, 3), sum), max_rel(from_dev(dsq, 3), sq)) : 0, 1e-5);
+  for (Desc d : {x, s, q, op}) cudnnBackendDestroyDescriptor(d);
+  cudaFree(dx), cudaFree(dsum), cudaFree(dsq);
+}
+
+// The RNG operation (Philox; the hardware offers no engine for it alone, so
+// this checks VirtualGPU's own: Bernoulli's rate and values, uniform's
+// range, and that the seed and offset decide the stream).
+static void rng() {
+  if (!kOnSim) {
+    std::printf("skip the RNG operation alone (no engine for it on this GPU)\n");
+    return;
+  }
+  const std::vector<int64_t> yd = {1, 1, 64, 64};
+  auto draw = [&](cudnnRngDistribution_t dist, int64_t seed, int64_t offset, std::vector<float>* out) {
+    Desc rd = make(CUDNN_BACKEND_RNG_DESCRIPTOR);
+    const double p = 0.3, lo = 2.0, hi = 5.0;
+    set(rd, CUDNN_ATTR_RNG_DISTRIBUTION, CUDNN_TYPE_RNG_DISTRIBUTION, 1, &dist);
+    set(rd, CUDNN_ATTR_RNG_BERNOULLI_DIST_PROBABILITY, CUDNN_TYPE_DOUBLE, 1, &p);
+    set(rd, CUDNN_ATTR_RNG_UNIFORM_DIST_MINIMUM, CUDNN_TYPE_DOUBLE, 1, &lo);
+    set(rd, CUDNN_ATTR_RNG_UNIFORM_DIST_MAXIMUM, CUDNN_TYPE_DOUBLE, 1, &hi);
+    cudnnBackendFinalize(rd);
+    Desc y = tensor(1, yd), off = tensor_of(2, {1, 1, 1, 1}, CUDNN_DATA_INT64);
+    Desc op = make(CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR);
+    set_desc(op, CUDNN_ATTR_OPERATION_RNG_DESC, rd);
+    set_desc(op, CUDNN_ATTR_OPERATION_RNG_YDESC, y);
+    set(op, CUDNN_ATTR_OPERATION_RNG_SEED, CUDNN_TYPE_INT64, 1, &seed);
+    set_desc(op, CUDNN_ATTR_OPERATION_RNG_OFFSET_DESC, off);
+    cudnnBackendFinalize(op);
+    float* dy = to_dev(std::vector<float>(count(yd), -1.0f));
+    int64_t* doff = nullptr;
+    cudaMalloc(&doff, 8);
+    cudaMemcpy(doff, &offset, 8, cudaMemcpyHostToDevice);
+    const int ran = run("graph: RNG", {op}, {1, 2}, {dy, doff});
+    *out = from_dev(dy, count(yd));
+    for (Desc d : {rd, y, off, op}) cudnnBackendDestroyDescriptor(d);
+    cudaFree(dy), cudaFree(doff);
+    return ran;
+  };
+  std::vector<float> a, b, c, u;
+  const int r1 = draw(CUDNN_RNG_DISTRIBUTION_BERNOULLI, 42, 0, &a), r2 = draw(CUDNN_RNG_DISTRIBUTION_BERNOULLI, 42, 0, &b),
+            r3 = draw(CUDNN_RNG_DISTRIBUTION_BERNOULLI, 42, 4096, &c), r4 = draw(CUDNN_RNG_DISTRIBUTION_UNIFORM, 7, 0, &u);
+  double ones = 0;
+  bool binary = true, range = true;
+  for (float v : a) ones += v, binary &= v == 0.0f || v == 1.0f;
+  for (float v : u) range &= v >= 2.0f && v < 5.0f;
+  expect("graph: RNG runs", r1 == 1 && r2 == 1 && r3 == 1 && r4 == 1);
+  expect("graph: RNG Bernoulli draws 0 or 1, about 30% ones", binary && std::fabs(ones / a.size() - 0.3) < 0.03, ones / a.size());
+  expect("graph: RNG repeats a seed and offset, and a new offset changes it", a == b && a != c);
+  expect("graph: RNG uniform stays in [min, max)", range);
+}
+
+// Reshape (a view: a transpose through permuted strides), transpose and
+// slice, chained through virtual tensors.
+static void data_movement() {
+  const int64_t A = 2, B = 3, Cc = 4;
+  const auto hx = filled(A * B * Cc, 1.0f, 31);
+  // y[a, c, b] = x[a, b, c] by a view-only reshape whose strides permute
+  // x's: [A, Cc, B] with strides {B*Cc, 1, Cc}.
+  Desc x = tensor(1, {A, B, Cc}), v = tensor_of(2, {A, Cc, B}, CUDNN_DATA_FLOAT, {B * Cc, 1, Cc}, true), y = tensor(3, {A, Cc, B});
+  Desc rs = make(CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR);
+  set_desc(rs, CUDNN_ATTR_OPERATION_RESHAPE_XDESC, x);
+  set_desc(rs, CUDNN_ATTR_OPERATION_RESHAPE_YDESC, v);
+  cudnnBackendFinalize(rs);
+  Desc id = pointwise(CUDNN_POINTWISE_IDENTITY, v, nullptr, y);
+  std::vector<double> want(hx.size());
+  for (int64_t a = 0; a < A; ++a)
+    for (int64_t b = 0; b < B; ++b)
+      for (int64_t c = 0; c < Cc; ++c) want[(a * Cc + c) * B + b] = hx[(a * B + b) * Cc + c];
+  float *dx = to_dev(hx), *dy = to_dev(std::vector<float>(hx.size(), 7.0f));
+  const int ran = run("graph: reshape (a transposing view) + identity", {rs, id}, {1, 3}, {dx, dy});
+  report("graph: reshape (a transposing view) + identity", ran, ran == 1 ? max_rel(from_dev(dy, want.size()), want) : 0, 1e-6);
+  for (Desc d : {x, v, y, rs, id}) cudnnBackendDestroyDescriptor(d);
+  cudaFree(dy);
+  // transpose {2, 0, 1} then slice [.., 1:3, ::2]: [Cc, A, B] -> [Cc, A, 2]... over B with start 0 step 2.
+  Desc x2 = tensor(1, {A, B, Cc}), t = tensor_of(2, {Cc, A, B}, CUDNN_DATA_FLOAT, {}, true), s = tensor(3, {2, A, 2});
+  Desc tr = make(CUDNN_BACKEND_OPERATION_TRANSPOSE_DESCRIPTOR);
+  const int64_t perm[3] = {2, 0, 1};
+  set_desc(tr, CUDNN_ATTR_OPERATION_TRANSPOSE_XDESC, x2);
+  set_desc(tr, CUDNN_ATTR_OPERATION_TRANSPOSE_YDESC, t);
+  set(tr, CUDNN_ATTR_OPERATION_TRANSPOSE_PERMUTATION, CUDNN_TYPE_INT64, 3, perm);
+  cudnnBackendFinalize(tr);
+  Desc sl = make(CUDNN_BACKEND_OPERATION_SLICE_DESCRIPTOR);
+  const int64_t st[3] = {1, 0, 0}, lim[3] = {3, A, B}, str[3] = {1, 1, 2};
+  set_desc(sl, CUDNN_ATTR_OPERATION_SLICE_XDESC, t);
+  set_desc(sl, CUDNN_ATTR_OPERATION_SLICE_YDESC, s);
+  set(sl, CUDNN_ATTR_OPERATION_SLICE_START_INDICES, CUDNN_TYPE_INT64, 3, st);
+  set(sl, CUDNN_ATTR_OPERATION_SLICE_LIMIT_INDICES, CUDNN_TYPE_INT64, 3, lim);
+  set(sl, CUDNN_ATTR_OPERATION_SLICE_STRIDES, CUDNN_TYPE_INT64, 3, str);
+  cudnnBackendFinalize(sl);
+  std::vector<double> want2(2 * A * 2);
+  for (int64_t c = 0; c < 2; ++c)
+    for (int64_t a = 0; a < A; ++a)
+      for (int64_t b = 0; b < 2; ++b) want2[(c * A + a) * 2 + b] = hx[(a * B + 2 * b) * Cc + (c + 1)];
+  float* ds = to_dev(std::vector<float>(want2.size(), 7.0f));
+  const int ran2 = run("graph: transpose + slice", {tr, sl}, {1, 3}, {dx, ds});
+  report("graph: transpose + slice", ran2, ran2 == 1 ? max_rel(from_dev(ds, want2.size()), want2) : 0, 1e-6);
+  for (Desc d : {x2, t, s, tr, sl}) cudnnBackendDestroyDescriptor(d);
+  cudaFree(dx), cudaFree(ds);
+}
+
 // An operation this library has no engine for is refused when it is
 // finalized, by name, not accepted and run wrongly. (NVIDIA's library has an
 // engine for it, so this is VirtualGPU's own contract.)
@@ -753,10 +1116,10 @@ static void refusals() {
     std::printf("skip refusal of an operation with no engine (VirtualGPU's contract)\n");
     return;
   }
-  Desc sdpa = make(CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
+  Desc q = make(CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR);
   expect("an operation with no engine here is refused, not run",
-         cudnnBackendFinalize(sdpa) == CUDNN_STATUS_NOT_SUPPORTED);
-  cudnnBackendDestroyDescriptor(sdpa);
+         cudnnBackendFinalize(q) == CUDNN_STATUS_NOT_SUPPORTED);
+  cudnnBackendDestroyDescriptor(q);
 }
 
 int main() {
@@ -771,6 +1134,11 @@ int main() {
   norms();
   pooling();
   asymmetric_and_concat();
+  pooling_index();
+  group_and_unsaved_norms();
+  genstats();
+  rng();
+  data_movement();
   refusals();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");

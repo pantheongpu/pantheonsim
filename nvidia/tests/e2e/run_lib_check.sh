@@ -45,6 +45,12 @@ for lib in "$@"; do
   [[ "$lib" == cudnn ]] && links+=("-I$root/nvidia/third_party/cudnn_include")
   links+=("-l$lib")
 done
+# A graph-API test built on NVIDIA's cudnn-frontend (header-only) gets it
+# fetched; without network access it is skipped.
+if grep -q '#include <cudnn_frontend.h>' "$src"; then
+  fe="$("$root/nvidia/tests/e2e/fetch_cudnn_frontend.sh")" || { echo "SKIP: cudnn-frontend could not be fetched"; exit 0; }
+  links+=("-I$fe")
+fi
 trap 'rm -f "$out"' EXIT
 nvcc -std=c++17 -cudart "$cudart" -arch=compute_80 -code=compute_80 \
      -Wno-deprecated-gpu-targets -Xcompiler -Wno-deprecated-declarations \
