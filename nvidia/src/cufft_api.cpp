@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -35,6 +36,9 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+
+#include "fatbin.hpp"
+#include "ptx_link.hpp"
 
 namespace {
 
@@ -66,6 +70,7 @@ struct Plan {
   };
   std::map<int, JitCallback> jit;  // by cufftXtCallbackType
   size_t jit_shared[8] = {};       // cufftXtSetCallbackSharedSize, by type
+  struct JitModule* jit_module = nullptr;  // the linked callback kernels, once made
 };
 
 std::mutex g_mu;
@@ -253,6 +258,11 @@ std::vector<size_t> layout(const std::vector<int>& shape, const std::vector<long
 bool is_double(cufftType t) { return t == CUFFT_Z2Z || t == CUFFT_D2Z || t == CUFFT_Z2D; }
 
 cufftResult multi_check(Plan& p);
+int load_type(cufftType t);
+int store_type(cufftType t);
+bool jm_has(const JitModule* m, bool load);
+bool jm_run(const JitModule& m, bool load, void* data, const std::vector<uint64_t>& offs,
+            std::vector<char>& vals, size_t bytes, size_t shared, cudaStream_t stream);
 void zero_work(cufftHandle h, size_t* work);
 cufftResult jit_prepare(Plan& p);
 
@@ -401,7 +411,34 @@ cufftResult exec(cufftHandle handle, const void* idata, void* odata, int directi
   std::vector<char> hout(g.out_span * g.oe.size()), hin(g.in_span * g.ie.size());
   cudaMemcpy(hout.data(), odata, hout.size(), cudaMemcpyDeviceToHost);
   cudaMemcpy(hin.data(), idata, hin.size(), cudaMemcpyDeviceToHost);
+  // LTO callbacks: the load callback supplies every input element, given its
+  // offset in the input buffer; the store callback is handed every result
+  // with its offset in the output buffer, and writes it (or not) itself.
+  const JitModule* jm = p->jit_module;
+  if (jm && jm_has(jm, true)) {
+    std::vector<uint64_t> offs;
+    for (long long b = 0; b < p->batch; ++b)
+      for (size_t k : g.ioff) offs.push_back((uint64_t)b * g.idist + k);
+    std::vector<char> vals(offs.size() * g.ie.size());
+    if (!jm_run(*jm, true, const_cast<void*>(idata), offs, vals, g.ie.size(),
+                p->jit_shared[load_type(p->type)], p->stream))
+      return CUFFT_EXEC_FAILED;
+    for (size_t i = 0; i < offs.size(); ++i)
+      std::memcpy(hin.data() + offs[i] * g.ie.size(), vals.data() + i * g.ie.size(), g.ie.size());
+  }
   transform(*p, g, hin, hout, direction);
+  if (jm && jm_has(jm, false)) {
+    std::vector<uint64_t> offs;
+    for (long long b = 0; b < p->batch; ++b)
+      for (size_t k : g.ooff) offs.push_back((uint64_t)b * g.odist + k);
+    std::vector<char> vals(offs.size() * g.oe.size());
+    for (size_t i = 0; i < offs.size(); ++i)
+      std::memcpy(vals.data() + i * g.oe.size(), hout.data() + offs[i] * g.oe.size(), g.oe.size());
+    if (!jm_run(*jm, false, odata, offs, vals, g.oe.size(), p->jit_shared[store_type(p->type)],
+                p->stream))
+      return CUFFT_EXEC_FAILED;
+    return CUFFT_SUCCESS;
+  }
   cudaMemcpy(odata, hout.data(), hout.size(), cudaMemcpyHostToDevice);
   return CUFFT_SUCCESS;
 }
@@ -1025,6 +1062,9 @@ cufftResult exec_desc(cufftHandle plan, cudaLibXtDesc* in, cudaLibXtDesc* out, i
     cudaDeviceSynchronize();
   }
   if (p.spread == kBatches) {
+    // LTO callbacks do not run on several GPUs: NVIDIA's makes a batched
+    // plan with them and refuses to execute it, INTERNAL_ERROR.
+    if (!p.jit.empty()) return CUFFT_INTERNAL_ERROR;
     // Each GPU transforms its own batches where they are, whatever the
     // descriptors' subFormats say, which are left as they were. Out of place,
     // a real side is read or written packed whatever the descriptor's format
@@ -1335,6 +1375,328 @@ VGPU_EXPORT cufftResult cufftXtSetCallbackSharedSize(cufftHandle plan, cufftXtCa
   return CUFFT_SUCCESS;
 }
 
+/* ---- LTO callbacks (cufftXtSetJITCallback, CUDA 12.6 and later) ----
+ *
+ * NVIDIA's library compiles a wrapper around the user's callback with NVRTC
+ * and links the two with nvJitLink when the plan is made. The callback image
+ * is meant to be LTO-IR, but NVIDIA's takes PTX too -- as text, or in a fatbin
+ * -- and runs it (RTX 3060, CUDA 13.0 and 13.2). VirtualGPU executes PTX, so
+ * here a PTX callback is linked (ptx_link.cpp, the device linker's rules)
+ * with kernels that call it once per element, and those kernels run on the
+ * simulated device: the load kernel before the host-computed transform, the
+ * store kernel after it, with each element's offset in the user's buffer as
+ * cuFFT passes it. An LTO-IR image is NVVM bitcode, which only NVIDIA's
+ * compiler reads: a plan with one fails as a callback that does not link
+ * fails on the card, NVJITLINK_FAILURE (CUDA 13.2's cuFFT; 13.0's says
+ * INTERNAL_ERROR).
+ *
+ * The callback's symbol is the C++ mangling of the name for the callback
+ * type's prototype, as NVIDIA's wrapper declares it: a load returns its value
+ * (the return type is not mangled, so every load mangles alike), a store takes
+ * the element. A callback type the plan never calls must still link (a load
+ * set as CUFFT_CB_ST_REAL does not; one set as CUFFT_CB_LD_REAL on a C2C plan
+ * does, and is never called).
+ */
+extern "C" void** __cudaRegisterFatBinary(void* fatCubin);
+extern "C" void __cudaRegisterFunction(void** fatCubinHandle, const char* hostFun, char* deviceFun,
+                                       const char* deviceName, int thread_limit, void* tid,
+                                       void* bid, void* bDim, void* gDim, int* wSize);
+
 namespace {
-cufftResult jit_prepare(Plan&) { return CUFFT_SUCCESS; }
+
+// 0x13 is CUFFT_NVJITLINK_FAILURE, which CUDA 12.0's header does not have.
+constexpr cufftResult kLinkFailure = (cufftResult)0x13;
+
+// The element a callback type loads or stores: 'C' float2, 'Z' double2, 'R'
+// float, 'D' double.
+char cb_kind(int type) { return "CZRDCZRD"[type & 7]; }
+bool cb_is_load(int type) { return type < CUFFT_CB_ST_COMPLEX; }
+
+std::string mangle(const std::string& name, int type) {
+  static const char* const store_arg[] = {"6float2", "7double2", "f", "d"};
+  std::string m = "_Z" + std::to_string(name.size()) + name + "Pvy";
+  if (!cb_is_load(type)) m += store_arg[type & 3];
+  return m + "S_S_";
+}
+
+// The callback types a plan of this type calls.
+int load_type(cufftType t) {
+  switch (t) {
+    case CUFFT_C2C: case CUFFT_C2R: return CUFFT_CB_LD_COMPLEX;
+    case CUFFT_Z2Z: case CUFFT_Z2D: return CUFFT_CB_LD_COMPLEX_DOUBLE;
+    case CUFFT_R2C: return CUFFT_CB_LD_REAL;
+    default: return CUFFT_CB_LD_REAL_DOUBLE;
+  }
+}
+int store_type(cufftType t) {
+  switch (t) {
+    case CUFFT_C2C: case CUFFT_R2C: return CUFFT_CB_ST_COMPLEX;
+    case CUFFT_Z2Z: case CUFFT_D2Z: return CUFFT_CB_ST_COMPLEX_DOUBLE;
+    case CUFFT_C2R: return CUFFT_CB_ST_REAL;
+    default: return CUFFT_CB_ST_REAL_DOUBLE;
+  }
+}
+
+// The PTX a callback image carries: PTX text as it is, or a fatbin's PTX
+// for the current device. Empty for anything else (LTO-IR, SASS, garbage).
+std::string image_ptx(const std::vector<char>& image) {
+  using namespace vgpu::cuda;
+  try {
+    switch (classify_blob(image.data(), image.size())) {
+      case BlobKind::Ptx: {
+        std::string text(image.begin(), image.end());
+        while (!text.empty() && text.back() == '\0') text.pop_back();
+        return text;
+      }
+      case BlobKind::Fatbin: {
+        std::vector<FatbinPtx> ptxs = extract_ptx(image.data(), image.size());
+        if (ptxs.empty()) return {};
+        int dev = 0, major = 0, minor = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        return ptxs[pick_ptx(ptxs, (uint32_t)(major * 10 + minor))].text;
+      }
+      default:
+        return {};
+    }
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+// Whether `ptx` defines function `sym` (rather than only declaring it).
+bool defines(const std::string& ptx, const std::string& sym) {
+  size_t at = 0;
+  while ((at = ptx.find(sym, at)) != std::string::npos) {
+    const size_t line = ptx.rfind('\n', at) + 1;
+    const std::string head = ptx.substr(line, at - line);
+    const char before = at ? ptx[at - 1] : ' ';
+    size_t after = at + sym.size();
+    while (after < ptx.size() && (ptx[after] == ' ' || ptx[after] == '\t')) ++after;
+    if ((before == ' ' || before == '\t' || before == ')') && after < ptx.size() &&
+        ptx[after] == '(' && head.find(".func") != std::string::npos &&
+        head.find(".extern") == std::string::npos)
+      return true;
+    at += sym.size();
+  }
+  return false;
+}
+
+// One element in PTX: how a parameter of it is declared, and how it moves
+// between registers, parameters and memory.
+struct PtxElem {
+  int bytes;
+  std::string decl(const std::string& name) const {
+    if (bytes == 4) return ".param .b32 " + name;
+    if (bytes == 8 && !pair) return ".param .b64 " + name;
+    return ".param .align " + std::to_string(bytes) + " .b8 " + name + "[" + std::to_string(bytes) + "]";
+  }
+  bool pair;            // complex: two components
+  const char* type;     // f32 or f64
+  const char* regs;     // the registers it lives in
+  std::string ld_param(const std::string& p) const {
+    if (!pair) return std::string("ld.param.") + type + " " + regs + ", [" + p + "];\n";
+    const int half = bytes / 2;
+    return std::string("ld.param.") + type + " " + first() + ", [" + p + "];\n" +
+           "ld.param." + type + " " + second() + ", [" + p + "+" + std::to_string(half) + "];\n";
+  }
+  std::string st_param(const std::string& p) const {
+    if (!pair) return std::string("st.param.") + type + " [" + p + "], " + regs + ";\n";
+    const int half = bytes / 2;
+    return std::string("st.param.") + type + " [" + p + "], " + first() + ";\n" +
+           "st.param." + type + " [" + p + "+" + std::to_string(half) + "], " + second() + ";\n";
+  }
+  std::string ld_mem(const std::string& addr) const {
+    return std::string(pair ? "ld.v2." : "ld.") + type + " " + (pair ? "{" + std::string(regs) + "}" : regs) +
+           ", [" + addr + "];\n";
+  }
+  std::string st_mem(const std::string& addr) const {
+    return std::string(pair ? "st.v2." : "st.") + type + " [" + addr + "], " +
+           (pair ? "{" + std::string(regs) + "}" : regs) + ";\n";
+  }
+  std::string first() const { std::string r = regs; return r.substr(0, r.find(',')); }
+  std::string second() const { std::string r = regs; return r.substr(r.find(',') + 2); }
+};
+
+PtxElem ptx_elem(char kind) {
+  switch (kind) {
+    case 'C': return {8, true, "f32", "%f1, %f2"};
+    case 'Z': return {16, true, "f64", "%fd1, %fd2"};
+    case 'R': return {4, false, "f32", "%f1"};
+    default: return {8, false, "f64", "%fd1"};
+  }
+}
+
+// The kernels that call the callbacks, one element a thread:
+//   load(data, offsets, values, count, info):  values[i] = cb(data, offsets[i], info, shared)
+//   store(data, offsets, values, count, info): cb(data, offsets[i], values[i], info, shared)
+std::string callback_kernel(bool load, const std::string& sym, char kind) {
+  const PtxElem e = ptx_elem(kind);
+  const std::string name = load ? "vgpu_cufft_cb_load" : "vgpu_cufft_cb_store";
+  std::string s;
+  if (load)
+    s += ".extern .func (" + e.decl("r") + ") " + sym +
+         "(.param .b64 a0, .param .b64 a1, .param .b64 a2, .param .b64 a3);\n";
+  else
+    s += ".extern .func " + sym + "(.param .b64 a0, .param .b64 a1, " + e.decl("a2") +
+         ", .param .b64 a3, .param .b64 a4);\n";
+  s += ".visible .entry " + name +
+       "(.param .u64 p_data, .param .u64 p_offs, .param .u64 p_vals, .param .u64 p_count, "
+       ".param .u64 p_info)\n{\n"
+       ".reg .pred %p<2>;\n.reg .b32 %r<4>;\n.reg .b64 %rd<16>;\n.reg .f32 %f<3>;\n.reg .f64 %fd<3>;\n"
+       "mov.u32 %r1, %ctaid.x;\nmov.u32 %r2, %ntid.x;\nmov.u32 %r3, %tid.x;\n"
+       "mul.wide.u32 %rd1, %r1, %r2;\ncvt.u64.u32 %rd2, %r3;\nadd.s64 %rd1, %rd1, %rd2;\n"
+       "ld.param.u64 %rd3, [p_count];\nsetp.ge.u64 %p1, %rd1, %rd3;\n@%p1 bra $L_done;\n"
+       "ld.param.u64 %rd4, [p_offs];\nshl.b64 %rd5, %rd1, 3;\nadd.s64 %rd5, %rd4, %rd5;\n"
+       "ld.u64 %rd6, [%rd5];\n"
+       "ld.param.u64 %rd7, [p_data];\nld.param.u64 %rd8, [p_info];\n"
+       "mov.u64 %rd9, vgpu_cufft_cb_smem;\ncvta.shared.u64 %rd9, %rd9;\n"
+       "ld.param.u64 %rd10, [p_vals];\nmul.lo.u64 %rd11, %rd1, " + std::to_string(e.bytes) + ";\n"
+       "add.s64 %rd11, %rd10, %rd11;\n";
+  if (load) {
+    s += "{\n.param .b64 a0;\nst.param.b64 [a0], %rd7;\n.param .b64 a1;\nst.param.b64 [a1], %rd6;\n"
+         ".param .b64 a2;\nst.param.b64 [a2], %rd8;\n.param .b64 a3;\nst.param.b64 [a3], %rd9;\n" +
+         e.decl("r") + ";\ncall.uni (r), " + sym + ", (a0, a1, a2, a3);\n" + e.ld_param("r") + "}\n" +
+         e.st_mem("%rd11");
+  } else {
+    s += e.ld_mem("%rd11") +
+         "{\n.param .b64 a0;\nst.param.b64 [a0], %rd7;\n.param .b64 a1;\nst.param.b64 [a1], %rd6;\n" +
+         e.decl("a2") + ";\n" + e.st_param("a2") +
+         ".param .b64 a3;\nst.param.b64 [a3], %rd8;\n.param .b64 a4;\nst.param.b64 [a4], %rd9;\n"
+         "call.uni " + sym + ", (a0, a1, a2, a3, a4);\n}\n";
+  }
+  s += "$L_done:\nret;\n}\n";
+  return s;
+}
+
+// A callback module registered with the runtime. Never freed: the runtime
+// keeps pointers into it for as long as the process runs.
+struct JitModule {
+  std::string fatbin;
+  struct { int magic, version; const void* data; void* filename; } wrapper{};
+  char load_key = 0, store_key = 0;  // their addresses name the kernels
+  bool has_load = false, has_store = false;
+  void* load_info = nullptr;
+  void* store_info = nullptr;
+};
+std::mutex g_jit_mu;
+std::vector<std::unique_ptr<JitModule>> g_jit_modules;
+
 }  // namespace
+
+namespace {
+cufftResult jit_prepare(Plan& p) {
+  // On several GPUs: a single transform's plan fails (INTERNAL_ERROR), a
+  // batched one is made and fails to execute (RTX 3060 pair).
+  if (p.gpus.size() > 1) return p.spread == kBatches ? CUFFT_SUCCESS : CUFFT_INTERNAL_ERROR;
+  if (p.prec == 16) return kLinkFailure;
+  std::map<int, std::string> ptx;
+  for (const auto& [type, cb] : p.jit) {
+    std::string text = image_ptx(cb.image);
+    if (text.empty() || cb.name.empty() || !defines(text, mangle(cb.name, type))) return kLinkFailure;
+    ptx[type] = std::move(text);
+  }
+  const int lt = load_type(p.type), st = store_type(p.type);
+  const bool load = p.jit.count(lt), store = p.jit.count(st);
+  if (!load && !store) return CUFFT_SUCCESS;
+  // The callbacks' modules first (the first one's .target is the module's),
+  // then the kernels that call them.
+  std::vector<vgpu::cuda::PtxInput> inputs;
+  std::set<std::string> seen;
+  for (int t : {lt, st})
+    if (p.jit.count(t) && seen.insert(ptx[t]).second) inputs.push_back({p.jit[t].name, ptx[t]});
+  std::string kernels = ".version 7.0\n.target sm_52\n.address_size 64\n"
+                        ".extern .shared .align 16 .b8 vgpu_cufft_cb_smem[];\n";
+  if (load) kernels += callback_kernel(true, mangle(p.jit[lt].name, lt), cb_kind(lt));
+  if (store) kernels += callback_kernel(false, mangle(p.jit[st].name, st), cb_kind(st));
+  inputs.push_back({"cuFFT callback kernels", kernels});
+  const vgpu::cuda::PtxLinkResult linked = vgpu::cuda::link_ptx(inputs, "");
+  if (!linked.ok) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cuFFT LTO callback link failed:\n%s", linked.errors.c_str());
+    return kLinkFailure;
+  }
+  auto m = std::make_unique<JitModule>();
+  vgpu::cuda::FatbinImage img;
+  img.kind = vgpu::cuda::kFatbinPtx;
+  uint32_t target = 52;
+  char suffix = 0;
+  vgpu::cuda::ptx_module_target(linked.ptx, &target, &suffix);
+  img.arch = target;
+  img.major = 7;
+  img.data = linked.ptx;
+  m->fatbin = vgpu::cuda::write_fatbin({img});
+  m->wrapper = {0x466243b1, 1, m->fatbin.data(), nullptr};
+  void** handle = __cudaRegisterFatBinary(&m->wrapper);
+  if (!handle) return kLinkFailure;
+  if (load) {
+    __cudaRegisterFunction(handle, &m->load_key, (char*)"vgpu_cufft_cb_load", "vgpu_cufft_cb_load", -1,
+                           nullptr, nullptr, nullptr, nullptr, nullptr);
+    m->has_load = true;
+    m->load_info = p.jit[lt].info;
+  }
+  if (store) {
+    __cudaRegisterFunction(handle, &m->store_key, (char*)"vgpu_cufft_cb_store", "vgpu_cufft_cb_store", -1,
+                           nullptr, nullptr, nullptr, nullptr, nullptr);
+    m->has_store = true;
+    m->store_info = p.jit[st].info;
+  }
+  std::lock_guard<std::mutex> l(g_jit_mu);
+  p.jit_module = m.get();
+  g_jit_modules.push_back(std::move(m));
+  return CUFFT_SUCCESS;
+}
+
+// Runs a callback kernel over `count` elements: their offsets in the user's
+// buffer, and the values loaded or to be stored, `bytes` each.
+bool run_callback(const JitModule& m, bool load, void* data, const std::vector<uint64_t>& offs,
+                  std::vector<char>& vals, size_t bytes, size_t shared, cudaStream_t stream) {
+  const uint64_t count = offs.size();
+  if (!count) return true;
+  void *d_offs = nullptr, *d_vals = nullptr;
+  if (cudaMalloc(&d_offs, count * 8) != cudaSuccess || cudaMalloc(&d_vals, count * bytes) != cudaSuccess) {
+    cudaFree(d_offs);
+    return false;
+  }
+  cudaMemcpy(d_offs, offs.data(), count * 8, cudaMemcpyHostToDevice);
+  if (!load) cudaMemcpy(d_vals, vals.data(), count * bytes, cudaMemcpyHostToDevice);
+  void* info = load ? m.load_info : m.store_info;
+  void* args[] = {&data, &d_offs, &d_vals, (void*)&count, &info};
+  const unsigned block = 128;
+  const dim3 grid((unsigned)((count + block - 1) / block));
+  const cudaError_t e = cudaLaunchKernel(load ? (const void*)&m.load_key : (const void*)&m.store_key, grid,
+                                         dim3(block), args, shared, stream);
+  cudaStreamSynchronize(stream);
+  if (e == cudaSuccess && load) cudaMemcpy(vals.data(), d_vals, count * bytes, cudaMemcpyDeviceToHost);
+  cudaFree(d_offs);
+  cudaFree(d_vals);
+  return e == cudaSuccess;
+}
+bool jm_has(const JitModule* m, bool load) { return load ? m->has_load : m->has_store; }
+bool jm_run(const JitModule& m, bool load, void* data, const std::vector<uint64_t>& offs,
+            std::vector<char>& vals, size_t bytes, size_t shared, cudaStream_t stream) {
+  return run_callback(m, load, data, offs, vals, bytes, shared, stream);
+}
+}  // namespace
+
+VGPU_EXPORT cufftResult cufftXtSetJITCallback(cufftHandle plan, const char* lto_callback_symbol_name,
+                                              const void* lto_callback_fatbin,
+                                              size_t lto_callback_fatbin_size,
+                                              cufftXtCallbackType type, void** caller_info) {
+  // RTX 3060, CUDA 13.0: an unknown plan, or one already made, is
+  // INVALID_PLAN; no image, or an empty one, INVALID_VALUE; a type out of
+  // range INVALID_TYPE. The image and the name are not looked at until the
+  // plan is made. Setting a type again replaces it.
+  std::lock_guard<std::mutex> l(g_mu);
+  auto it = g_plans.find(plan);
+  if (it == g_plans.end() || !it->second.n.empty()) return CUFFT_INVALID_PLAN;
+  if (!lto_callback_fatbin || !lto_callback_fatbin_size) return CUFFT_INVALID_VALUE;
+  if ((int)type < 0 || (int)type >= CUFFT_CB_UNDEFINED) return CUFFT_INVALID_TYPE;
+  Plan::JitCallback cb;
+  cb.name = lto_callback_symbol_name ? lto_callback_symbol_name : "";
+  const char* bytes = static_cast<const char*>(lto_callback_fatbin);
+  cb.image.assign(bytes, bytes + lto_callback_fatbin_size);
+  cb.info = caller_info ? caller_info[0] : nullptr;  // one pointer per GPU; one GPU here
+  it->second.jit[(int)type] = std::move(cb);
+  return CUFFT_SUCCESS;
+}
