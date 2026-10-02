@@ -8,6 +8,7 @@
 //   - pointwise forward and backward modes, with broadcasting and alpha
 //   - layer, RMS and batch normalization, training forward (saved and
 //     running statistics) and backward
+//   - max and average pooling (resampling), forward and backward
 //
 // each checked against a reference computed here on the host, and a graph
 // holding an operation the library has no engine for refused rather than run.
@@ -573,6 +574,99 @@ static void norms() {
   }
 }
 
+/* ---- pooling as resampling ---- */
+
+static void pooling() {
+  const int N = 2, C = 3, Hh = 7, W = 6, win = 3, pad = 1, str = 2;
+  const int Ho = 1 + (Hh + 2 * pad - win) / str, Wo = 1 + (W + 2 * pad - win) / str;
+  const std::vector<int64_t> xd = {N, C, Hh, W}, yd = {N, C, Ho, Wo};
+  const auto hx = filled(count(xd), 2.0f, 2), hdy = filled(count(yd), 1.0f, 3);
+  struct P { const char* name; cudnnResampleMode_t mode; cudnnPaddingMode_t pad; };
+  for (const P& p : {P{"max", CUDNN_RESAMPLE_MAXPOOL, CUDNN_NEG_INF_PAD},
+                     P{"average excluding padding", CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING, CUDNN_ZERO_PAD},
+                     P{"average including padding", CUDNN_RESAMPLE_AVGPOOL_INCLUDE_PADDING, CUDNN_ZERO_PAD}}) {
+    Desc rd = make(CUDNN_BACKEND_RESAMPLE_DESCRIPTOR);
+    const int64_t nsp = 2, w2[2] = {win, win}, p2[2] = {pad, pad}, s2[2] = {str, str};
+    const cudnnDataType_t f = CUDNN_DATA_FLOAT;
+    const cudnnNanPropagation_t nan = CUDNN_NOT_PROPAGATE_NAN;
+    set(rd, CUDNN_ATTR_RESAMPLE_MODE, CUDNN_TYPE_RESAMPLE_MODE, 1, &p.mode);
+    set(rd, CUDNN_ATTR_RESAMPLE_COMP_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &f);
+    set(rd, CUDNN_ATTR_RESAMPLE_NAN_PROPAGATION, CUDNN_TYPE_NAN_PROPOGATION, 1, &nan);
+    set(rd, CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_TYPE_PADDING_MODE, 1, &p.pad);
+    set(rd, CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS, CUDNN_TYPE_INT64, 1, &nsp);
+    set(rd, CUDNN_ATTR_RESAMPLE_WINDOW_DIMS, CUDNN_TYPE_INT64, 2, w2);
+    set(rd, CUDNN_ATTR_RESAMPLE_PRE_PADDINGS, CUDNN_TYPE_INT64, 2, p2);
+    set(rd, CUDNN_ATTR_RESAMPLE_POST_PADDINGS, CUDNN_TYPE_INT64, 2, p2);
+    set(rd, CUDNN_ATTR_RESAMPLE_STRIDES, CUDNN_TYPE_INT64, 2, s2);
+    cudnnBackendFinalize(rd);
+    // The host reference: windows, divisors and the first maximum.
+    std::vector<double> want_y(count(yd)), want_dx(count(xd), 0.0);
+    for (int nc = 0; nc < N * C; ++nc)
+      for (int i = 0; i < Ho; ++i)
+        for (int j = 0; j < Wo; ++j) {
+          double best = -1e30, sum = 0;
+          int arg = -1, valid = 0;
+          for (int a = 0; a < win; ++a)
+            for (int b = 0; b < win; ++b) {
+              const int r = i * str - pad + a, c = j * str - pad + b;
+              if (r < 0 || r >= Hh || c < 0 || c >= W) continue;
+              const double v = hx[(nc * Hh + r) * W + c];
+              if (arg < 0 || v > best) best = v, arg = (nc * Hh + r) * W + c;
+              sum += v, ++valid;
+            }
+          const int yi = (nc * Ho + i) * Wo + j;
+          const double div = p.mode == CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING ? valid : win * win;
+          want_y[yi] = p.mode == CUDNN_RESAMPLE_MAXPOOL ? best : sum / div;
+          if (p.mode == CUDNN_RESAMPLE_MAXPOOL) {
+            want_dx[arg] += hdy[yi];
+            continue;
+          }
+          for (int a = 0; a < win; ++a)
+            for (int b = 0; b < win; ++b) {
+              const int r = i * str - pad + a, c = j * str - pad + b;
+              if (r >= 0 && r < Hh && c >= 0 && c < W) want_dx[(nc * Hh + r) * W + c] += hdy[yi] / div;
+            }
+        }
+    {
+      Desc x = tensor(1, xd), y = tensor(2, yd);
+      Desc op = make(CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC, rd);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC, x);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC, y);
+      cudnnBackendFinalize(op);
+      float *dx = to_dev(hx), *dy = to_dev(std::vector<float>(count(yd), 7.0f));
+      char what[96];
+      std::snprintf(what, sizeof what, "graph: %s pooling forward", p.name);
+      const int ran = run(what, {op}, {1, 2}, {dx, dy});
+      report(what, ran, ran == 1 ? max_rel(from_dev(dy, want_y.size()), want_y) : 0, 1e-5);
+      for (Desc d : {x, y, op}) cudnnBackendDestroyDescriptor(d);
+      cudaFree(dx), cudaFree(dy);
+    }
+    {
+      // x and y too, as the hardware requires for NCHW.
+      Desc gy = tensor(1, yd), gx = tensor(2, xd), x = tensor(3, xd), y = tensor(4, yd);
+      Desc op = make(CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DESC, rd);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC, gy);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC, gx);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC, x);
+      set_desc(op, CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC, y);
+      std::vector<float> fy(want_y.begin(), want_y.end());
+      float *ddy = to_dev(hdy), *dgx = to_dev(std::vector<float>(count(xd), 7.0f)), *dx = to_dev(hx), *dyv = to_dev(fy);
+      const std::vector<int64_t> uids = {1, 2, 3, 4};
+      const std::vector<void*> ptrs = {ddy, dgx, dx, dyv};
+      cudnnBackendFinalize(op);
+      char what[96];
+      std::snprintf(what, sizeof what, "graph: %s pooling backward", p.name);
+      const int ran = run(what, {op}, uids, ptrs);
+      report(what, ran, ran == 1 ? max_rel(from_dev(dgx, want_dx.size()), want_dx) : 0, 1e-5);
+      for (Desc d : {gy, gx, x, y, op}) cudnnBackendDestroyDescriptor(d);
+      cudaFree(ddy), cudaFree(dgx), cudaFree(dx), cudaFree(dyv);
+    }
+    cudnnBackendDestroyDescriptor(rd);
+  }
+}
+
 // An operation this library has no engine for is refused when it is
 // finalized, by name, not accepted and run wrongly. (NVIDIA's library has an
 // engine for it, so this is VirtualGPU's own contract.)
@@ -581,10 +675,10 @@ static void refusals() {
     std::printf("skip refusal of an operation with no engine (VirtualGPU's contract)\n");
     return;
   }
-  Desc rs = make(CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR);
+  Desc sdpa = make(CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
   expect("an operation with no engine here is refused, not run",
-         cudnnBackendFinalize(rs) == CUDNN_STATUS_NOT_SUPPORTED);
-  cudnnBackendDestroyDescriptor(rs);
+         cudnnBackendFinalize(sdpa) == CUDNN_STATUS_NOT_SUPPORTED);
+  cudnnBackendDestroyDescriptor(sdpa);
 }
 
 int main() {
@@ -597,6 +691,7 @@ int main() {
   reductions();
   pointwise_ops();
   norms();
+  pooling();
   refusals();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");

@@ -12,10 +12,12 @@
 //     them back on GetAttribute, so a caller reads what it wrote.
 //   - One engine, global index 0, runs any graph this library can compute:
 //     any number of convolution (forward, backward-data, backward-filter),
-//     matmul, pointwise, reduction and normalization (layer, instance, batch,
-//     RMS; forward and backward) operations, joined through virtual tensors --
+//     matmul, pointwise, reduction, normalization (layer, instance, batch,
+//     RMS; forward and backward) and pooling (resampling: max and average,
+//     forward and backward) operations, joined through virtual tensors --
 //     cudnn-frontend's conv-bias-activation, dgrad-drelu, matmul-epilogue,
-//     reduction and norm patterns, and PyTorch's single convolutions. A graph
+//     reduction, norm and pooling patterns, and PyTorch's single
+//     convolutions. A graph
 //     with any other operation is refused when it is finalized, by name,
 //     rather than accepted and run wrongly.
 //   - Execute computes on the host, as the classic API here does (see
@@ -230,7 +232,7 @@ double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
 // What an operation is, which tensors it reads and writes, and its settings,
 // checked: everything a graph's finalization needs to accept it and its
 // execution needs to run it.
-enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd };
+enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd };
 
 // A normalization's tensors, by role: which of an Op's inputs and outputs
 // each is (-1 when the graph does not give it).
@@ -257,6 +259,11 @@ struct Op {
   // Normalization: the mode, whether it trains, the outputs beyond `out`,
   // and where each role is (an index into in, or for an output role into
   // {out, more...}).
+  // Resampling (pooling): the mode, how padding reads, and the window.
+  cudnnResampleMode_t resample = CUDNN_RESAMPLE_MAXPOOL;
+  cudnnPaddingMode_t padding = CUDNN_ZERO_PAD;
+  int nsp = 0;
+  int64_t win[3] = {1, 1, 1}, pre[3] = {0, 0, 0}, post[3] = {0, 0, 0}, pstr[3] = {1, 1, 1};
   cudnnBackendNormMode_t norm = CUDNN_LAYER_NORM;
   bool training = false;
   std::vector<GTensor> more;
@@ -497,6 +504,83 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         return false;
       }
       op->in = {x};
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR: {
+      const bool fwd = d->type == CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR;
+      op->kind = fwd ? Kind::PoolFwd : Kind::PoolBwd;
+      const Desc* rd = d->desc(fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DESC);
+      if (!rd || rd->type != CUDNN_BACKEND_RESAMPLE_DESCRIPTOR) { *why = "resample: the resample descriptor is missing"; return false; }
+      op->resample = static_cast<cudnnResampleMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_MODE, CUDNN_RESAMPLE_NEAREST));
+      if (op->resample != CUDNN_RESAMPLE_MAXPOOL && op->resample != CUDNN_RESAMPLE_AVGPOOL_INCLUDE_PADDING &&
+          op->resample != CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING) {
+        *why = "resample mode " + std::to_string(op->resample) + " (nearest or bilinear interpolation) is not supported";
+        return false;
+      }
+      op->padding = static_cast<cudnnPaddingMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_ZERO_PAD));
+      op->nsp = static_cast<int>(rd->i64(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS));
+      // Integer settings only: fractional strides and windows are for interpolation.
+      auto ints = [&](cudnnBackendAttributeName_t n, int64_t* out) {
+        const Attr* a = rd->get(n);
+        if (!a || a->type != CUDNN_TYPE_INT64 || a->count != op->nsp) return false;
+        std::memcpy(out, a->bytes.data(), static_cast<size_t>(op->nsp) * sizeof(int64_t));
+        return true;
+      };
+      if (op->nsp < 1 || op->nsp > 3 || !ints(CUDNN_ATTR_RESAMPLE_WINDOW_DIMS, op->win) ||
+          !ints(CUDNN_ATTR_RESAMPLE_STRIDES, op->pstr) || !ints(CUDNN_ATTR_RESAMPLE_PRE_PADDINGS, op->pre) ||
+          !ints(CUDNN_ATTR_RESAMPLE_POST_PADDINGS, op->post)) {
+        *why = "resample: the window, strides and paddings must be integer lists of 1 to 3 (fractional ones are not supported)";
+        return false;
+      }
+      if (d->desc(fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC)) {
+        *why = "resample: index tensors are not supported (backward max pooling reads x and y instead)";
+        return false;
+      }
+      op->alpha = scalar(d, fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_ALPHA, 1.0);
+      op->beta = scalar(d, fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_BETA, 0.0);
+      GTensor x, y;
+      const vc::Layout *X, *Y;
+      if (fwd) {
+        if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC, "y", &op->out))
+          return false;
+        op->in = {x};
+        X = &op->in[0].l, Y = &op->out.l;
+      } else {
+        GTensor dy;
+        if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC, "dy", &dy) ||
+            !tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC, "dx", &op->out))
+          return false;
+        op->in = {dy};
+        // x (which max pooling's gradient reads) and y may be given; both
+        // must be for an NCHW tensor on the hardware.
+        if (d->desc(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC)) {
+          if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC, "x", &x)) return false;
+          op->in.push_back(x);
+        } else if (op->resample == CUDNN_RESAMPLE_MAXPOOL) {
+          *why = "resample backward: max pooling's gradient needs x";
+          return false;
+        }
+        if (d->desc(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC)) {
+          if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC, "y", &y)) return false;
+          op->in.push_back(y);
+        }
+        X = &op->out.l, Y = &op->in[0].l;
+      }
+      if (X->rank != op->nsp + 2 || Y->rank != X->rank || X->dims[0] != Y->dims[0] || X->dims[1] != Y->dims[1]) {
+        *why = "resample: x and y do not have the window's rank, batch and channels";
+        return false;
+      }
+      for (int i = 0; i < op->nsp; ++i)
+        if (op->win[i] < 1 || op->pstr[i] < 1 || op->pre[i] < 0 || op->post[i] < 0 ||
+            Y->dims[2 + i] != 1 + (X->dims[2 + i] + op->pre[i] + op->post[i] - op->win[i]) / op->pstr[i]) {
+          *why = "resample: y's extent in spatial dimension " + std::to_string(i) + " is not what the window gives";
+          return false;
+        }
+      if (!fwd && op->in.size() > 1 && !op->in[1].l.same_dims(*X)) {
+        *why = "resample backward: x's shape is not dx's";
+        return false;
+      }
       return true;
     }
     case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
@@ -940,6 +1024,79 @@ void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, s
   }
 }
 
+// Pooling as the graph API's resampling: per (n, c), each output's window
+// over the input, the padding read as zero, minus infinity or the nearest
+// edge value as the padding mode says. Average pooling includes padded taps
+// in its divisor or not as its mode says; the maximum's gradient goes to the
+// first largest tap, recomputed from x.
+void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* r) {
+  const bool fwd = op.kind == Kind::PoolFwd;
+  const vc::Layout& X = fwd ? op.in[0].l : op.out.l;
+  const vc::Layout& Y = fwd ? op.out.l : op.in[0].l;
+  int64_t I[3] = {1, 1, 1}, O[3] = {1, 1, 1}, Wn[3] = {1, 1, 1}, P[3] = {0, 0, 0}, S[3] = {1, 1, 1};
+  for (int i = 0; i < op.nsp; ++i) {
+    const int k = 3 - op.nsp + i;
+    I[k] = X.dims[2 + i], O[k] = Y.dims[2 + i], Wn[k] = op.win[i], P[k] = op.pre[i], S[k] = op.pstr[i];
+  }
+  const int64_t NC = X.dims[0] * X.dims[1], isz = I[0] * I[1] * I[2], osz = O[0] * O[1] * O[2];
+  const bool is_max = op.resample == CUDNN_RESAMPLE_MAXPOOL;
+  const std::vector<double>* xin = fwd ? in[0] : (is_max ? in[1] : nullptr);
+  r->assign(static_cast<size_t>(fwd ? NC * osz : NC * isz), 0.0);
+  for (int64_t nc = 0; nc < NC; ++nc)
+    for (int64_t o = 0; o < osz; ++o) {
+      const int64_t o0 = o / (O[1] * O[2]), o1 = (o / O[2]) % O[1], o2 = o % O[2];
+      double best = -INFINITY, sum = 0.0;
+      int64_t arg = -1, valid = 0, taps = 0;
+      for (int64_t a = 0; a < Wn[0]; ++a)
+        for (int64_t b = 0; b < Wn[1]; ++b)
+          for (int64_t c = 0; c < Wn[2]; ++c) {
+            int64_t p[3] = {o0 * S[0] - P[0] + a, o1 * S[1] - P[1] + b, o2 * S[2] - P[2] + c};
+            ++taps;
+            bool inside = true;
+            for (int d = 0; d < 3; ++d) inside &= p[d] >= 0 && p[d] < I[d];
+            if (!inside && op.padding == CUDNN_EDGE_VAL_PAD) {
+              for (int d = 0; d < 3; ++d) p[d] = std::min(std::max<int64_t>(p[d], 0), I[d] - 1);
+              inside = true;
+            }
+            double v;
+            int64_t at = -1;
+            if (inside) {
+              at = (p[0] * I[1] + p[1]) * I[2] + p[2];
+              v = xin ? (*xin)[static_cast<size_t>(nc * isz + at)] : 0.0;
+              ++valid;
+            } else {
+              if (op.padding == CUDNN_NEG_INF_PAD) continue;
+              v = 0.0;  // zero padding
+            }
+            if (is_max && (arg == -1 || v > best)) best = v, arg = at;
+            sum += v;
+          }
+      const double div = op.resample == CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING ? static_cast<double>(valid)
+                                                                              : static_cast<double>(taps);
+      if (fwd) {
+        (*r)[static_cast<size_t>(nc * osz + o)] = is_max ? best : (div ? sum / div : 0.0);
+        continue;
+      }
+      const double g = (*in[0])[static_cast<size_t>(nc * osz + o)];
+      if (is_max) {
+        if (arg >= 0) (*r)[static_cast<size_t>(nc * isz + arg)] += g;  // a padded maximum takes it nowhere
+        continue;
+      }
+      for (int64_t a = 0; a < Wn[0]; ++a)
+        for (int64_t b = 0; b < Wn[1]; ++b)
+          for (int64_t c = 0; c < Wn[2]; ++c) {
+            int64_t p[3] = {o0 * S[0] - P[0] + a, o1 * S[1] - P[1] + b, o2 * S[2] - P[2] + c};
+            bool inside = true;
+            for (int d = 0; d < 3; ++d) inside &= p[d] >= 0 && p[d] < I[d];
+            if (!inside && op.padding == CUDNN_EDGE_VAL_PAD) {
+              for (int d = 0; d < 3; ++d) p[d] = std::min(std::max<int64_t>(p[d], 0), I[d] - 1);
+              inside = true;
+            }
+            if (inside && div) (*r)[static_cast<size_t>(nc * isz + (p[0] * I[1] + p[1]) * I[2] + p[2])] += g / div;
+          }
+    }
+}
+
 // Runs a scheduled graph: inputs from the variant pack (device memory, or
 // host memory for a by-value scalar), intermediates on the host rounded to
 // their declared types, outputs written back.
@@ -998,6 +1155,8 @@ cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, 
       case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
       case Kind::Matmul: run_matmul(op, *in[0], *in[1], &r); break;
       case Kind::Reduction: run_reduction(op, *in[0], &r); break;
+      case Kind::PoolFwd:
+      case Kind::PoolBwd: run_pool(op, in, &r); alpha = op.alpha, beta = op.beta; break;
       case Kind::NormFwd:
       case Kind::NormBwd: {
         std::vector<std::vector<double>> outs;
@@ -1168,7 +1327,9 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
-    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR: {
+    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR: {
       // Shapes that do not fit are the caller's error; a setting this
       // library does not compute is refused by name.
       Op op;
@@ -1189,6 +1350,9 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
       break;
     case CUDNN_BACKEND_MATMUL_DESCRIPTOR:
       if (!d->get(CUDNN_ATTR_MATMUL_COMP_TYPE)) return CUDNN_STATUS_BAD_PARAM;
+      break;
+    case CUDNN_BACKEND_RESAMPLE_DESCRIPTOR:
+      if (!d->get(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS)) return CUDNN_STATUS_BAD_PARAM;
       break;
     case CUDNN_BACKEND_REDUCTION_DESCRIPTOR: {
       if (!d->get(CUDNN_ATTR_REDUCTION_OPERATOR) || !d->get(CUDNN_ATTR_REDUCTION_COMP_TYPE)) return CUDNN_STATUS_BAD_PARAM;

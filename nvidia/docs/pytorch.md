@@ -70,8 +70,8 @@ paths tested here do not call them.
   training runs, with this library's generator: the masks differ from
   NVIDIA's, the fraction kept and the reseeding do not.)
 - Graphs with operations other than convolution, matmul, pointwise,
-  reduction and normalization (resampling, attention): refused when the graph
-  is finalized, so PyTorch falls back or reports it.
+  reduction, normalization and pooling (attention, for one): refused when the
+  graph is finalized, so PyTorch falls back or reports it.
 - Anything a kernel does that the PTX interpreter does not implement: the
   launch fails naming the instruction, and the PyTorch test scripts fail on any
   such line, even if a check prints `ok`.
