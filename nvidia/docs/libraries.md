@@ -278,10 +278,9 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   RNG, reshape, statistics generation, ...), group normalization,
   normalization backward without the saved statistics, interpolating
   resampling (nearest, bilinear) and resampling index tensors, ragged and
-  vectorized tensors; the
-  vectorized layouts (`NCHW_VECT_C`, INT8x4/INT8x32) and FP8 tensors;
-  divisive normalization,
-  fused-ops plans and tensor transform descriptors; RNN projections.
+  vectorized tensors; in the classic API, the vectorized layouts
+  (`NCHW_VECT_C`, INT8x4/INT8x32), FP8 tensors, divisive normalization,
+  fused-ops plans, tensor transform descriptors and RNN projections.
 - **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
   CUDA 12), the blocked (BSR) routines, complex values.
