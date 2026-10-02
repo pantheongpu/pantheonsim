@@ -1,0 +1,24 @@
+name: zz ci-infra probe (temporary)
+on:
+  push:
+    branches: [ci-infra]
+    paths: [.github/workflows/zz-ci-infra-probe.yml]
+jobs:
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+  empty:
+    needs: image
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ needs.image.outputs.cuda12_8 && '' || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    steps:
+      - name: in container?
+        if: ${{ !job.container.id }}
+        run: echo "NO CONTAINER (expected)"; test ! -f /.dockerenv; echo "outputs: '${{ needs.image.outputs.cuda12_0 }}'"
+      - name: container
+        if: ${{ job.container.id }}
+        run: echo "IN CONTAINER (unexpected)"; exit 1
