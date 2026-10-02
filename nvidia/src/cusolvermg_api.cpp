@@ -12,11 +12,20 @@
 // block b on device b % G as its local block b / G; every device holds its
 // columns contiguously with leading dimension = the matrix's row count. IPIV
 // is spread the same way, as a 1 x N row. info and syevd's W are host memory.
-// Submatrices (IA, JA other than 1) and grids with more than one row of
-// devices are refused with NOT_SUPPORTED, as NVIDIA documents only these;
-// getrs with op other than N, and the upper triangle anywhere, are
-// INVALID_VALUE, as NVIDIA's answers them (potrf's and potri's _bufferSize
-// already refuse upper; potrs's and syevd's only the call itself).
+//
+// A submatrix (IA, JA, base 1, ScaLAPACK's convention) is gathered, worked
+// on, and scattered back; nothing outside it changes. getrf's IPIV goes to
+// columns JA.. of the IPIV row, its pivots relative to the submatrix, as
+// NVIDIA's writes them. What that card answered and this follows: a grid
+// with more than one row of devices is refused when it is created
+// (INVALID_VALUE: NVIDIA's supports 1-D column block cyclic only, as it
+// documents); syevd on a submatrix other than IA = JA = 1 is INVALID_VALUE;
+// potrf of a matrix that is not positive definite returns INTERNAL_ERROR with
+// info set; getrs with op other than N, and the upper triangle anywhere, are
+// INVALID_VALUE (potrf's and potri's _bufferSize already refuse upper;
+// potrs's and syevd's only the call itself). NVIDIA's getrf on a submatrix
+// that starts below its diagonal block (IA > JA) returns neither the LU of the
+// submatrix nor anything recognisable; this returns the LU.
 //
 // potri leaves the upper triangle as it was (NVIDIA's writes scratch there);
 // the inverse is in the lower one, as the API documents.
@@ -74,41 +83,44 @@ Place place(const Desc& d, int64_t j) {
   return {(int)(block % g), (block / g) * d.nb + j % d.nb};
 }
 
-// The distributed matrix as one column-major host array, ld = rows.
-bool gather(const Desc& d, void* const* parts, int64_t rows, int64_t cols, std::vector<uint8_t>* out) {
+// The rows x cols submatrix starting at global (i0, j0) (0-based), as one
+// column-major host array with ld = rows.
+bool gather(const Desc& d, void* const* parts, int64_t i0, int64_t j0, int64_t rows, int64_t cols,
+            std::vector<uint8_t>* out) {
   const size_t eb = elem_bytes(d.type);
   out->assign((size_t)rows * cols * eb, 0);
   for (int64_t j = 0; j < cols; ++j) {
-    const Place p = place(d, j);
-    const uint8_t* src = static_cast<const uint8_t*>(parts[p.slot]) + (size_t)(p.col * d.m) * eb;
+    const Place p = place(d, j0 + j);
+    const uint8_t* src = static_cast<const uint8_t*>(parts[p.slot]) + (size_t)(p.col * d.m + i0) * eb;
     if (rows && cudaMemcpy(out->data() + (size_t)j * rows * eb, src, (size_t)rows * eb, cudaMemcpyDeviceToHost) != cudaSuccess)
       return false;
   }
   return true;
 }
-bool scatter(const Desc& d, void* const* parts, int64_t rows, int64_t cols, const std::vector<uint8_t>& in) {
+bool scatter(const Desc& d, void* const* parts, int64_t i0, int64_t j0, int64_t rows, int64_t cols,
+             const std::vector<uint8_t>& in) {
   const size_t eb = elem_bytes(d.type);
   for (int64_t j = 0; j < cols; ++j) {
-    const Place p = place(d, j);
-    uint8_t* dst = static_cast<uint8_t*>(parts[p.slot]) + (size_t)(p.col * d.m) * eb;
+    const Place p = place(d, j0 + j);
+    uint8_t* dst = static_cast<uint8_t*>(parts[p.slot]) + (size_t)(p.col * d.m + i0) * eb;
     if (rows && cudaMemcpy(dst, in.data() + (size_t)j * rows * eb, (size_t)rows * eb, cudaMemcpyHostToDevice) != cudaSuccess)
       return false;
   }
   return true;
 }
-// IPIV, a 1 x n row in the same column blocks.
-bool gather_ipiv(const Desc& d, int* const* parts, int64_t n, std::vector<int>* out) {
+// IPIV, a 1 x N row in the same column blocks: n entries from column j0.
+bool gather_ipiv(const Desc& d, int* const* parts, int64_t j0, int64_t n, std::vector<int>* out) {
   out->assign((size_t)n, 0);
   for (int64_t j = 0; j < n; ++j) {
-    const Place p = place(d, j);
+    const Place p = place(d, j0 + j);
     if (cudaMemcpy(&(*out)[(size_t)j], parts[p.slot] + p.col, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess)
       return false;
   }
   return true;
 }
-bool scatter_ipiv(const Desc& d, int* const* parts, const std::vector<int>& in) {
+bool scatter_ipiv(const Desc& d, int* const* parts, int64_t j0, const std::vector<int>& in) {
   for (size_t j = 0; j < in.size(); ++j) {
-    const Place p = place(d, (int64_t)j);
+    const Place p = place(d, j0 + (int64_t)j);
     if (cudaMemcpy(parts[p.slot] + p.col, &in[j], sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return false;
   }
   return true;
@@ -127,9 +139,14 @@ cusolverStatus_t check(cusolverMgHandle_t h, const void* descr, int ia, int ja, 
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (!known(descr)) return CUSOLVER_STATUS_INVALID_VALUE;
   const Desc& d = *static_cast<const Desc*>(descr);
-  if (ia != 1 || ja != 1 || d.grid->rows != 1) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  if (ia < 1 || ja < 1 || ia > std::max<int64_t>(d.m, 1) || ja > std::max<int64_t>(d.n, 1))
+    return CUSOLVER_STATUS_INVALID_VALUE;
   if (compute != d.type) return CUSOLVER_STATUS_INVALID_VALUE;
   return CUSOLVER_STATUS_SUCCESS;
+}
+// The rows x cols submatrix at (ia, ja), base 1, fits in the matrix.
+bool fits(const Desc& d, int ia, int ja, int64_t rows, int64_t cols) {
+  return rows >= 0 && cols >= 0 && ia - 1 + rows <= d.m && ja - 1 + cols <= d.n;
 }
 const Desc& desc(const void* d) { return *static_cast<const Desc*>(d); }
 int dev_info(const DevBuf& b) {
@@ -322,7 +339,8 @@ VGPU_EXPORT cusolverStatus_t cusolverMgDeviceSelect(cusolverMgHandle_t h, int co
 }
 VGPU_EXPORT cusolverStatus_t cusolverMgCreateDeviceGrid(cudaLibMgGrid_t* grid, int32_t rows, int32_t cols,
                                                         const int32_t ids[], cusolverMgGridMapping_t) {
-  if (!grid || rows < 1 || cols < 1 || !ids) return CUSOLVER_STATUS_INVALID_VALUE;
+  // One row of devices only (1-D column block cyclic), as NVIDIA's refuses others.
+  if (!grid || rows != 1 || cols < 1 || !ids) return CUSOLVER_STATUS_INVALID_VALUE;
   auto* g = new Grid();
   g->rows = rows;
   g->cols = cols;
@@ -371,18 +389,19 @@ VGPU_EXPORT cusolverStatus_t cusolverMgGetrf(cusolverMgHandle_t h, int M, int N,
                                              int* info) {
   if (const cusolverStatus_t st = check(h, dA, IA, JA, c); st != CUSOLVER_STATUS_SUCCESS) return st;
   const Desc& d = desc(dA);
-  if (M < 0 || N < 0 || M > d.m || N > d.n || !A) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (!fits(d, IA, JA, M, N) || !A) return CUSOLVER_STATUS_INVALID_VALUE;
   std::vector<uint8_t> a;
-  if (!gather(d, A, d.m, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  if (!gather(d, A, IA - 1, JA - 1, M, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   DevBuf da(a.size()), dp((size_t)std::max(1, std::min(M, N)) * sizeof(int)), di(sizeof(int));
   if (!da.put(a.data(), a.size())) return CUSOLVER_STATUS_EXECUTION_FAILED;
-  const cusolverStatus_t st = dn_getrf(reinterpret_cast<Handle*>(h)->dn, d.type, M, N, da.p, (int)d.m,
+  const cusolverStatus_t st = dn_getrf(reinterpret_cast<Handle*>(h)->dn, d.type, M, N, da.p, std::max(1, M),
                                        ipiv ? static_cast<int*>(dp.p) : nullptr, static_cast<int*>(di.p));
   if (st != CUSOLVER_STATUS_SUCCESS) return st;
   if (info) *info = dev_info(di);
+  // The pivots, relative to the submatrix, at columns JA.. of the IPIV row.
   std::vector<int> piv((size_t)std::min(M, N));
-  if (!da.get(a.data(), a.size()) || !dp.get(piv.data(), piv.size() * sizeof(int)) || !scatter(d, A, d.m, N, a) ||
-      (ipiv && !scatter_ipiv(d, ipiv, piv)))
+  if (!da.get(a.data(), a.size()) || !dp.get(piv.data(), piv.size() * sizeof(int)) ||
+      !scatter(d, A, IA - 1, JA - 1, M, N, a) || (ipiv && !scatter_ipiv(d, ipiv, JA - 1, piv)))
     return CUSOLVER_STATUS_EXECUTION_FAILED;
   return CUSOLVER_STATUS_SUCCESS;
 }
@@ -403,21 +422,22 @@ VGPU_EXPORT cusolverStatus_t cusolverMgGetrs(cusolverMgHandle_t h, cublasOperati
   const Desc &a_d = desc(dA), &b_d = desc(dB);
   // A itself only, as NVIDIA's (its _bufferSize takes a transpose; getrs does not).
   if (op != CUBLAS_OP_N) return CUSOLVER_STATUS_INVALID_VALUE;
-  if (N < 0 || NRHS < 0 || N > a_d.n || N > a_d.m || NRHS > b_d.n || N > b_d.m || !A || !B || !ipiv)
+  if (!fits(a_d, IA, JA, N, N) || !fits(b_d, IB, JB, N, NRHS) || !A || !B || !ipiv)
     return CUSOLVER_STATUS_INVALID_VALUE;
   std::vector<uint8_t> a, b;
   std::vector<int> piv;
-  if (!gather(a_d, A, a_d.m, N, &a) || !gather(b_d, B, b_d.m, NRHS, &b) || !gather_ipiv(a_d, ipiv, N, &piv))
+  if (!gather(a_d, A, IA - 1, JA - 1, N, N, &a) || !gather(b_d, B, IB - 1, JB - 1, N, NRHS, &b) ||
+      !gather_ipiv(a_d, ipiv, JA - 1, N, &piv))
     return CUSOLVER_STATUS_EXECUTION_FAILED;
   DevBuf da(a.size()), db(b.size()), dp(piv.size() * sizeof(int)), di(sizeof(int));
   if (!da.put(a.data(), a.size()) || !db.put(b.data(), b.size()) || !dp.put(piv.data(), piv.size() * sizeof(int)))
     return CUSOLVER_STATUS_EXECUTION_FAILED;
-  const cusolverStatus_t st = dn_getrs(reinterpret_cast<Handle*>(h)->dn, a_d.type, op, N, NRHS, da.p, (int)a_d.m,
-                                       static_cast<int*>(dp.p), db.p, (int)b_d.m, static_cast<int*>(di.p));
+  const cusolverStatus_t st = dn_getrs(reinterpret_cast<Handle*>(h)->dn, a_d.type, op, N, NRHS, da.p, std::max(1, N),
+                                       static_cast<int*>(dp.p), db.p, std::max(1, N), static_cast<int*>(di.p));
   if (st != CUSOLVER_STATUS_SUCCESS) return st;
   if (info) *info = dev_info(di);
-  return db.get(b.data(), b.size()) && scatter(b_d, B, b_d.m, NRHS, b) ? CUSOLVER_STATUS_SUCCESS
-                                                                       : CUSOLVER_STATUS_EXECUTION_FAILED;
+  return db.get(b.data(), b.size()) && scatter(b_d, B, IB - 1, JB - 1, N, NRHS, b) ? CUSOLVER_STATUS_SUCCESS
+                                                                                   : CUSOLVER_STATUS_EXECUTION_FAILED;
 }
 
 VGPU_EXPORT cusolverStatus_t cusolverMgPotrf_bufferSize(cusolverMgHandle_t h, cublasFillMode_t uplo, int N, void*[],
@@ -431,17 +451,20 @@ VGPU_EXPORT cusolverStatus_t cusolverMgPotrf(cusolverMgHandle_t h, cublasFillMod
                                              int* info) {
   if (const cusolverStatus_t st = check(h, dA, IA, JA, c); st != CUSOLVER_STATUS_SUCCESS) return st;
   const Desc& d = desc(dA);
-  if (N < 0 || N > d.n || N > d.m || !A || uplo != CUBLAS_FILL_MODE_LOWER) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (!fits(d, IA, JA, N, N) || !A || uplo != CUBLAS_FILL_MODE_LOWER) return CUSOLVER_STATUS_INVALID_VALUE;
   std::vector<uint8_t> a;
-  if (!gather(d, A, d.m, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  if (!gather(d, A, IA - 1, JA - 1, N, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   DevBuf da(a.size()), di(sizeof(int));
   if (!da.put(a.data(), a.size())) return CUSOLVER_STATUS_EXECUTION_FAILED;
   const cusolverStatus_t st =
-      dn_potrf(reinterpret_cast<Handle*>(h)->dn, d.type, uplo, N, da.p, (int)d.m, static_cast<int*>(di.p));
+      dn_potrf(reinterpret_cast<Handle*>(h)->dn, d.type, uplo, N, da.p, std::max(1, N), static_cast<int*>(di.p));
   if (st != CUSOLVER_STATUS_SUCCESS) return st;
-  if (info) *info = dev_info(di);
-  return da.get(a.data(), a.size()) && scatter(d, A, d.m, N, a) ? CUSOLVER_STATUS_SUCCESS
-                                                                 : CUSOLVER_STATUS_EXECUTION_FAILED;
+  const int bad = dev_info(di);
+  if (info) *info = bad;
+  // Not positive definite: INTERNAL_ERROR with info set, as NVIDIA's answers it.
+  if (bad > 0) return CUSOLVER_STATUS_INTERNAL_ERROR;
+  return da.get(a.data(), a.size()) && scatter(d, A, IA - 1, JA - 1, N, N, a) ? CUSOLVER_STATUS_SUCCESS
+                                                                              : CUSOLVER_STATUS_EXECUTION_FAILED;
 }
 
 VGPU_EXPORT cusolverStatus_t cusolverMgPotrs_bufferSize(cusolverMgHandle_t h, cublasFillMode_t, int n, int, void*[],
@@ -457,19 +480,19 @@ VGPU_EXPORT cusolverStatus_t cusolverMgPotrs(cusolverMgHandle_t h, cublasFillMod
   if (const cusolverStatus_t st = check(h, dA, IA, JA, c); st != CUSOLVER_STATUS_SUCCESS) return st;
   if (const cusolverStatus_t st = check(h, dB, IB, JB, c); st != CUSOLVER_STATUS_SUCCESS) return st;
   const Desc &a_d = desc(dA), &b_d = desc(dB);
-  if (n < 0 || nrhs < 0 || n > a_d.n || n > a_d.m || nrhs > b_d.n || n > b_d.m || !A || !B ||
-      uplo != CUBLAS_FILL_MODE_LOWER)
+  if (!fits(a_d, IA, JA, n, n) || !fits(b_d, IB, JB, n, nrhs) || !A || !B || uplo != CUBLAS_FILL_MODE_LOWER)
     return CUSOLVER_STATUS_INVALID_VALUE;
   std::vector<uint8_t> a, b;
-  if (!gather(a_d, A, a_d.m, n, &a) || !gather(b_d, B, b_d.m, nrhs, &b)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  if (!gather(a_d, A, IA - 1, JA - 1, n, n, &a) || !gather(b_d, B, IB - 1, JB - 1, n, nrhs, &b))
+    return CUSOLVER_STATUS_EXECUTION_FAILED;
   DevBuf da(a.size()), db(b.size()), di(sizeof(int));
   if (!da.put(a.data(), a.size()) || !db.put(b.data(), b.size())) return CUSOLVER_STATUS_EXECUTION_FAILED;
-  const cusolverStatus_t st = dn_potrs(reinterpret_cast<Handle*>(h)->dn, a_d.type, uplo, n, nrhs, da.p, (int)a_d.m,
-                                       db.p, (int)b_d.m, static_cast<int*>(di.p));
+  const cusolverStatus_t st = dn_potrs(reinterpret_cast<Handle*>(h)->dn, a_d.type, uplo, n, nrhs, da.p, std::max(1, n),
+                                       db.p, std::max(1, n), static_cast<int*>(di.p));
   if (st != CUSOLVER_STATUS_SUCCESS) return st;
   if (info) *info = dev_info(di);
-  return db.get(b.data(), b.size()) && scatter(b_d, B, b_d.m, nrhs, b) ? CUSOLVER_STATUS_SUCCESS
-                                                                       : CUSOLVER_STATUS_EXECUTION_FAILED;
+  return db.get(b.data(), b.size()) && scatter(b_d, B, IB - 1, JB - 1, n, nrhs, b) ? CUSOLVER_STATUS_SUCCESS
+                                                                                   : CUSOLVER_STATUS_EXECUTION_FAILED;
 }
 
 VGPU_EXPORT cusolverStatus_t cusolverMgPotri_bufferSize(cusolverMgHandle_t h, cublasFillMode_t uplo, int N, void*[],
@@ -483,14 +506,10 @@ VGPU_EXPORT cusolverStatus_t cusolverMgPotri(cusolverMgHandle_t h, cublasFillMod
                                              int* info) {
   if (const cusolverStatus_t st = check(h, dA, IA, JA, c); st != CUSOLVER_STATUS_SUCCESS) return st;
   const Desc& d = desc(dA);
-  if (N < 0 || N > d.n || N > d.m || !A) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (!fits(d, IA, JA, N, N) || !A) return CUSOLVER_STATUS_INVALID_VALUE;
   if (uplo != CUBLAS_FILL_MODE_LOWER) return CUSOLVER_STATUS_INVALID_VALUE;
-  std::vector<uint8_t> a;
-  if (!gather(d, A, d.m, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
-  // Contiguous N x N: the gathered matrix has ld = d.m.
-  const size_t eb = elem_bytes(d.type);
-  std::vector<uint8_t> sq((size_t)N * N * eb);
-  for (int j = 0; j < N; ++j) std::memcpy(&sq[(size_t)j * N * eb], &a[(size_t)j * d.m * eb], (size_t)N * eb);
+  std::vector<uint8_t> sq;  // the N x N submatrix, contiguous
+  if (!gather(d, A, IA - 1, JA - 1, N, N, &sq)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   const bool lower = uplo == CUBLAS_FILL_MODE_LOWER;
   int bad = 0;  // a zero on the factor's diagonal: no inverse
   auto diag_zero = [&](auto tag) {
@@ -514,8 +533,7 @@ VGPU_EXPORT cusolverStatus_t cusolverMgPotri(cusolverMgHandle_t h, cublasFillMod
   }
   if (info) *info = bad;
   if (bad) return CUSOLVER_STATUS_SUCCESS;
-  for (int j = 0; j < N; ++j) std::memcpy(&a[(size_t)j * d.m * eb], &sq[(size_t)j * N * eb], (size_t)N * eb);
-  return scatter(d, A, d.m, N, a) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_EXECUTION_FAILED;
+  return scatter(d, A, IA - 1, JA - 1, N, N, sq) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_EXECUTION_FAILED;
 }
 
 VGPU_EXPORT cusolverStatus_t cusolverMgSyevd_bufferSize(cusolverMgHandle_t h, cusolverEigMode_t, cublasFillMode_t,
@@ -528,11 +546,16 @@ VGPU_EXPORT cusolverStatus_t cusolverMgSyevd(cusolverMgHandle_t h, cusolverEigMo
                                              cudaDataType tw, cudaDataType c, void*[], int64_t, int* info) {
   if (const cusolverStatus_t st = check(h, dA, IA, JA, c); st != CUSOLVER_STATUS_SUCCESS) return st;
   const Desc& d = desc(dA);
-  if (N < 0 || N > d.n || N > d.m || !A || !W) return CUSOLVER_STATUS_INVALID_VALUE;
+  // The whole matrix only: a submatrix is INVALID_VALUE with info 0, as NVIDIA's answers it.
+  if (IA != 1 || JA != 1) {
+    if (info) *info = 0;
+    return CUSOLVER_STATUS_INVALID_VALUE;
+  }
+  if (!fits(d, IA, JA, N, N) || !A || !W) return CUSOLVER_STATUS_INVALID_VALUE;
   const cudaDataType real = d.type == CUDA_R_32F || d.type == CUDA_C_32F ? CUDA_R_32F : CUDA_R_64F;
   if (tw != real || uplo != CUBLAS_FILL_MODE_LOWER) return CUSOLVER_STATUS_INVALID_VALUE;
   std::vector<uint8_t> a;
-  if (!gather(d, A, d.m, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  if (!gather(d, A, 0, 0, d.m, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   const size_t wb = (size_t)N * elem_bytes(real);
   DevBuf da(a.size()), dw(wb), di(sizeof(int));
   if (!da.put(a.data(), a.size())) return CUSOLVER_STATUS_EXECUTION_FAILED;
@@ -542,6 +565,6 @@ VGPU_EXPORT cusolverStatus_t cusolverMgSyevd(cusolverMgHandle_t h, cusolverEigMo
   if (info) *info = dev_info(di);
   if (!dw.get(W, wb)) return CUSOLVER_STATUS_EXECUTION_FAILED;  // W is host memory
   if (jobz != CUSOLVER_EIG_MODE_VECTOR) return CUSOLVER_STATUS_SUCCESS;
-  return da.get(a.data(), a.size()) && scatter(d, A, d.m, N, a) ? CUSOLVER_STATUS_SUCCESS
-                                                                 : CUSOLVER_STATUS_EXECUTION_FAILED;
+  return da.get(a.data(), a.size()) && scatter(d, A, 0, 0, d.m, N, a) ? CUSOLVER_STATUS_SUCCESS
+                                                                       : CUSOLVER_STATUS_EXECUTION_FAILED;
 }

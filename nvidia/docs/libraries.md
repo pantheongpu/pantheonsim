@@ -97,8 +97,8 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); legacy coo2csr, sorts, csrgeam2, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, general blocks too), csric02 and csrilu02. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
-| cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the 64-bit X API, `Xgeev` on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings, `csrperm`, `csrzfd`, batched QR |
-| cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix spread over several devices in NVIDIA's column-block-cyclic layout |
+| cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the reductions and their back-transforms (`sytrd`/`hetrd`, `orgtr`/`ungtr`, `ormtr`/`unmtr`, `gebrd`, `orgbr`/`ungbr`), `potri`, `lauum`, selected and generalized eigen (`syevdx`/`heevdx`, `sygvd`/`hegvd`, `sygvdx`/`hegvdx`, `sygvj`/`hegvj`); symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the iterative refinement solvers (`<t1><t2>gesv`/`gels`, `IRSXgesv`/`IRSXgels`); the 64-bit X API with `Xgetrf`/`Xgetrs`, `Xtrtri`, `Xsyevdx`, `Xgesvd`, `Xgesvdp`, `Xgesvdr` and `Xlarft`, `Xgeev` (right eigenvectors) on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings (`symrcm`, `symamd` and `symmdq` give NVIDIA's own permutations), `csrperm`, `csrzfd`, batched QR, and the low-level preview API (LU on the host, QR and Cholesky on the host and the device, step by step). The refactorization module, cusolverRf, single and batched |
+| cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix, or getrf/getrs and potrf/potrs/potri on a submatrix (IA, JA), spread over several devices in NVIDIA's column-block-cyclic layout |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
@@ -202,8 +202,11 @@ runs them; each is a ctest of its own.
 | --- | --- | --- |
 | `e2e_fft_layouts` | cufftXt plans, strided and padded layouts of every rank, 2‑D/3‑D C2R, half | `torch.fft` |
 | `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
-| `e2e_solver_sparse_paths` | cusolverSp: LU, QR and Cholesky solves in S/D/C/Z with every reorder, singularity, least squares, shift-inverse eigenvalues, reorderings, permutations, batched QR | `scipy`-style sparse solves |
-| `e2e_solver_mg_paths` | cusolverMg on two devices: getrf/getrs, potrf/potrs/potri, syevd, IPIV's layout | multi-GPU dense solvers |
+| `e2e_solver_sparse_paths` | cusolverSp: LU, QR and Cholesky solves in S/D/C/Z with every reorder, singularity, least squares, shift-inverse eigenvalues, reorderings (NVIDIA's permutations for symrcm, symamd, symmdq), permutations, batched QR | `scipy`-style sparse solves |
+| `e2e_solver_mg_paths` | cusolverMg on two devices: getrf/getrs, potrf/potrs/potri, syevd, IPIV's layout, submatrices, the grids NVIDIA's refuses | multi-GPU dense solvers |
+| `e2e_solver_dense_paths` | the reductions and back-transforms, potri/lauum, syevdx and the generalized eigensolvers, the iterative refinement solvers, Xgetrf/Xgetrs, Xtrtri, Xsyevdx, Xgesvd, Xgesvdp, Xgesvdr, Xlarft, Xgeev's left-eigenvector refusal, the handle modes and Jacobi getters | `torch.linalg.eigh` on generalized problems, `cholesky_inverse`, mixed-precision solves |
+| `e2e_solver_rf_paths` | cusolverRf: setup, analyze, refactor, solve, the documented defaults, zero pivots and the boost, the unit-diagonal formats and split factors, batched (on the simulator) | sparse refactorization loops (circuit simulation) |
+| `e2e_solver_sparse_ll_paths` | cusolverSp's low-level preview API: threshold LU, QR with a shift and least squares, Cholesky in its elimination tree's postorder, host and device, the call-order refusals | sparse direct solvers built on the preview API |
 | `e2e_solver_sytrf_paths` | sytrf + Xsytrs and sytri in S/D/C/Z, both triangles, 2x2 pivots, singular D; laswp; Xgeev on complex matrices | `torch.linalg.ldl_factor`, complex `eig` |
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
 | `e2e_sparse_complex_paths` | SpMV, SpMM, SDDMM, SpSV/SpSM, SpGEMM, conversions and csrgeam2 on complex values, every op; the type combinations and conjugate transposes NVIDIA's refuses | complex `torch.sparse` |
@@ -405,19 +408,35 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `gebsr2gebsc`; sliced-ELL and blocked-ELL storage; SDDMM with a conjugate
   transpose (NVIDIA's documents none and computes something else when given
   one). cuSPARSELt is a library of its own and is not provided.
-- **cuSOLVER**: the refactorization module (`cusolverRf`), cusolverSp's
-  low-level preview API and its `csrlsvlu` on the device (NVIDIA ships only
-  the host one), the randomized variants (`Xgesvdr`), left eigenvectors from
-  `Xgeev`, and cusolverMg on a submatrix (IA, JA other than 1) or a grid with
-  more than one row of devices. cusolverSp's reorderings are correct
-  fill-reducing permutations but not NVIDIA's own, and when several columns
-  of a Cholesky factorization are independent of one another NVIDIA's names a
-  different one in `singularity`. `Xgeev` on a
-  complex matrix returns its eigenvalues in NVIDIA's order up to n = 74 (both
-  are LAPACK's single-shift QR there); past that NVIDIA's switches algorithm,
-  as LAPACK's does, and the order can differ. NVIDIA's `sytri` (CUDA 13.0, RTX
-  3060) returns success and leaves A as it was; this one computes the inverse
-  the API documents.
+- **cuSOLVER**: left eigenvectors from `Xgeev` (NVIDIA's CUDA 13.0 and 13.2
+  libraries answer jobvl = VECTOR with INTERNAL_ERROR and document right
+  eigenvectors only; this does the same), `csrmetisnd`'s METIS permutation
+  (NVIDIA's runs METIS 5.1.0's `METIS_NodeND` with its default options on
+  A + A^T without the diagonal -- a reference METIS 5.1.0 build gave its
+  permutation on 99 of 100 matrices -- and VirtualGPU carries no METIS, so it
+  returns `symmdq`'s minimum-degree permutation instead), cusolverSp's
+  `csrlsvlu` on the device (NVIDIA ships only the host one), and cusolverMg
+  grids with more than one row of devices (NVIDIA's refuses them too, at
+  `cusolverMgCreateDeviceGrid`). Measured differences: when several columns of
+  a Cholesky factorization are independent of one another NVIDIA's names a
+  different one in `singularity`. `Xgeev` on a complex matrix returns its
+  eigenvalues in NVIDIA's order up to n = 74 (both are LAPACK's single-shift
+  QR there); past that NVIDIA's switches algorithm, as LAPACK's does, and the
+  order can differ. NVIDIA's `sytri` (CUDA 13.0, RTX 3060) returns success and
+  leaves A as it was; this one computes the inverse the API documents.
+  NVIDIA's batched cusolverRf crashed on every input tried (a cudaFree of an
+  invalid pointer in `cusolverRfBatchAnalyze`/`BatchRefactor`, CUDA 13.0 and
+  13.2), so the batched forms follow the documentation unmeasured. The
+  low-level preview QR factors in place on NVIDIA's, so a second `csrqrFactor`
+  without a new setup refactors its own output; here each Factor starts from
+  the setup's matrix. NVIDIA's cusolverMg getrf on a submatrix that starts
+  below its diagonal block (IA > JA) returns nothing recognisable; this
+  returns the submatrix's LU. The iterative refinement solvers can take one
+  refinement step more or fewer than NVIDIA's (its GMRES variants and some
+  n = 200 systems), and workspace sizes (`_bufferSize`) are this library's
+  own; Jacobi sweep counts are this implementation's, and singular vectors
+  for repeated singular values can differ by a rotation, as LAPACK's
+  documentation allows.
 - **cuTENSOR**: block-sparse contractions are created and checked but not
   planned (NOT_SUPPORTED; an RTX 3060 cannot plan them either, so there is no
   card to check a kernel against); just-in-time kernels (the JIT mode is

@@ -12,6 +12,11 @@
 //   potri           A A^-1 = I from the lower triangle
 //   syevd           A v = w v, eigenvalues ascending, W in host memory
 //
+//   a submatrix     the same on sub(A) at IA, JA other than 1, IPIV in its
+//                   own columns; syevd refusing one, as NVIDIA's does
+//   refusals        a grid with two rows of devices; potrf of a matrix that
+//                   is not positive definite (INTERNAL_ERROR, info set)
+//
 // For S, D, C and Z, on every device there is (two at most): the RTX 3060
 // pair this was written against, or the two simulated devices CI gives it.
 // N is not a multiple of the block size, so the last block is short.
@@ -353,6 +358,201 @@ template <class T> static void run() {
   }
 }
 
+// A submatrix (IA, JA, base 1): sub(A) of order n at (IA, JA) = (5, 5), sub(B)
+// at (5, 2). What that card did: the factorizations and solves act on the
+// submatrix alone, getrf's pivots land in IPIV's columns JA.. relative to the
+// submatrix; syevd refuses a submatrix (INVALID_VALUE, info 0); potrf of a
+// matrix that is not positive definite returns INTERNAL_ERROR with info set;
+// a grid with two rows of devices is refused when created.
+template <class T> static void submatrix() {
+  const bool cplx = Ty<T>::type == CUDA_C_32F || Ty<T>::type == CUDA_C_64F;
+  const int N = 13, n = 6, IA = 5, JA = 5, IB = 5, JB = 2, NRHS = 2;
+  const cudaDataType t = Ty<T>::type;
+  std::vector<T> a((size_t)N * N), spd((size_t)N * N), b((size_t)N * 3);
+  for (int j = 0; j < N; ++j)
+    for (int i = 0; i < N; ++i) {
+      a[(size_t)j * N + i] = Ty<T>::make(cdouble(std::sin(0.7 + 1.3 * i + 0.4 * j) + (i == j ? 0.3 : 0.0),
+                                                 cplx ? 0.3 * std::cos(i + 2.0 * j) : 0.0));
+      spd[(size_t)j * N + i] = Ty<T>::make(cdouble(1.0 / (1.0 + i + j) + (i == j ? N + i : 0.0),
+                                                   cplx && i != j ? 0.05 * (i - j) : 0.0));
+    }
+  for (size_t i = 0; i < b.size(); ++i) b[i] = Ty<T>::make(cdouble(std::cos(0.4 * (double)i), cplx ? 0.1 : 0.0));
+  const auto aw = widen(a), sw = widen(spd), bw = widen(b);
+  auto at = [N](const std::vector<cdouble>& m, int i, int j) { return m[(size_t)j * N + i]; };
+  char line[220];
+  int info = -1;
+  {  // potrf, potrs, potri on sub(A)
+    Dist<T> A(N, N);
+    A.put(spd);
+    int64_t lwork = -1;
+    CK(cusolverMgPotrf_bufferSize(h, CUBLAS_FILL_MODE_LOWER, n, A.parts.data(), IA, JA, A.desc, t, &lwork));
+    Work<T> w(lwork);
+    CK(cusolverMgPotrf(h, CUBLAS_FILL_MODE_LOWER, n, A.parts.data(), IA, JA, A.desc, t, w.parts.data(), lwork, &info));
+    cudaDeviceSynchronize();
+    const auto f = widen(A.get());
+    double e = 0;
+    bool outside = true;
+    for (int j = 0; j < N; ++j)
+      for (int i = 0; i < N; ++i) {
+        const int si = i - (IA - 1), sj = j - (JA - 1);
+        if (si < 0 || sj < 0 || si >= n || sj >= n || si < sj) {
+          outside = outside && at(f, i, j) == at(sw, i, j);
+          continue;
+        }
+        cdouble s = 0;
+        for (int k = 0; k <= sj; ++k) s += at(f, IA - 1 + si, JA - 1 + k) * std::conj(at(f, IA - 1 + sj, JA - 1 + k));
+        e = std::max(e, std::abs(s - at(sw, i, j)));
+      }
+    std::snprintf(line, sizeof line, "%spotrf on sub(A) at (%d, %d): L L^H = sub(A), nothing else touched", Ty<T>::name,
+                  IA, JA);
+    check(info == 0 && outside && e / N < 10 * Ty<T>::tol, line, e / N);
+    Dist<T> B(N, 3);
+    B.put(b);
+    CK(cusolverMgPotrs_bufferSize(h, CUBLAS_FILL_MODE_LOWER, n, NRHS, A.parts.data(), IA, JA, A.desc, B.parts.data(), IB,
+                                  JB, B.desc, t, &lwork));
+    Work<T> w2(lwork);
+    CK(cusolverMgPotrs(h, CUBLAS_FILL_MODE_LOWER, n, NRHS, A.parts.data(), IA, JA, A.desc, B.parts.data(), IB, JB,
+                       B.desc, t, w2.parts.data(), lwork, &info));
+    cudaDeviceSynchronize();
+    const auto x = widen(B.get());
+    double r = 0;
+    bool bout = true;
+    for (int c = 0; c < 3; ++c)
+      for (int i = 0; i < N; ++i) {
+        const int si = i - (IB - 1), sc = c - (JB - 1);
+        if (si < 0 || si >= n || sc < 0 || sc >= NRHS) {
+          bout = bout && x[(size_t)c * N + i] == bw[(size_t)c * N + i];
+          continue;
+        }
+        cdouble s = 0;
+        for (int k = 0; k < n; ++k) {
+          const int r0 = std::max(si, k), c0 = std::min(si, k);  // the Hermitian sub(A) from its lower triangle
+          const cdouble v = at(sw, IA - 1 + r0, JA - 1 + c0);
+          s += (si >= k ? v : std::conj(v)) * x[(size_t)c * N + IB - 1 + k];
+        }
+        r = std::max(r, std::abs(s - bw[(size_t)c * N + i]));
+      }
+    std::snprintf(line, sizeof line, "%spotrs on sub(A), sub(B) at (%d, %d): sub(A) X = sub(B), nothing else touched",
+                  Ty<T>::name, IB, JB);
+    check(info == 0 && bout && r < 100 * Ty<T>::tol, line, r);
+    CK(cusolverMgPotri_bufferSize(h, CUBLAS_FILL_MODE_LOWER, n, A.parts.data(), IA, JA, A.desc, t, &lwork));
+    Work<T> w3(lwork);
+    CK(cusolverMgPotri(h, CUBLAS_FILL_MODE_LOWER, n, A.parts.data(), IA, JA, A.desc, t, w3.parts.data(), lwork, &info));
+    cudaDeviceSynchronize();
+    const auto inv = widen(A.get());
+    double ie = 0;
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) {
+        cdouble s = 0;
+        for (int k = 0; k < n; ++k) {
+          const cdouble av = i >= k ? at(sw, IA - 1 + i, JA - 1 + k) : std::conj(at(sw, IA - 1 + k, JA - 1 + i));
+          const cdouble iv = k >= j ? at(inv, IA - 1 + k, JA - 1 + j) : std::conj(at(inv, IA - 1 + j, JA - 1 + k));
+          s += av * iv;
+        }
+        ie = std::max(ie, std::abs(s - (i == j ? 1.0 : 0.0)));
+      }
+    std::snprintf(line, sizeof line, "%spotri on sub(A): sub(A) sub(A)^-1 = I", Ty<T>::name);
+    check(info == 0 && ie < 100 * Ty<T>::tol, line, ie);
+  }
+  {  // getrf + getrs on sub(A): IPIV at columns JA.., relative to sub(A)
+    Dist<T> A(N, N);
+    A.put(a);
+    std::vector<int*> ipiv(G);
+    std::vector<int> ilocal(G, 0);
+    for (int b2 = 0; b2 * NB < N; ++b2) ilocal[b2 % G] += std::min(NB, N - b2 * NB);
+    for (int d = 0; d < G; ++d) {
+      cudaSetDevice(ids[d]);
+      cudaMalloc(&ipiv[d], sizeof(int) * std::max(ilocal[d], 1));
+      cudaMemset(ipiv[d], 0xff, sizeof(int) * std::max(ilocal[d], 1));  // -1 everywhere
+    }
+    cudaSetDevice(ids[0]);
+    int64_t lwork = -1;
+    CK(cusolverMgGetrf_bufferSize(h, n, n, A.parts.data(), IA, JA, A.desc, ipiv.data(), t, &lwork));
+    Work<T> w(lwork);
+    CK(cusolverMgGetrf(h, n, n, A.parts.data(), IA, JA, A.desc, ipiv.data(), t, w.parts.data(), lwork, &info));
+    cudaDeviceSynchronize();
+    const auto f = widen(A.get());
+    std::vector<int> piv(N);
+    for (int j = 0; j < N; ++j) {
+      const auto [d, c] = Dist<T>::where(j);
+      cudaMemcpy(&piv[j], ipiv[d] + c, sizeof(int), cudaMemcpyDeviceToHost);
+    }
+    std::vector<cdouble> lu((size_t)n * n);
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < n; ++i) {
+        cdouble s = 0;
+        for (int k = 0; k <= std::min(i, j); ++k)
+          s += (k == i ? 1.0 : at(f, IA - 1 + i, JA - 1 + k)) * at(f, IA - 1 + k, JA - 1 + j);
+        lu[(size_t)j * n + i] = s;
+      }
+    bool valid = true;
+    for (int k = n - 1; k >= 0; --k) {
+      const int p = piv[JA - 1 + k];
+      valid = valid && p >= 1 && p <= n;
+      if (valid && p - 1 != k)
+        for (int j = 0; j < n; ++j) std::swap(lu[(size_t)j * n + k], lu[(size_t)j * n + p - 1]);
+    }
+    for (int j = 0; j < N; ++j) valid = valid && (j >= JA - 1 && j < JA - 1 + n ? true : piv[j] == -1);
+    double e = 0;
+    bool outside = true;
+    for (int j = 0; j < N; ++j)
+      for (int i = 0; i < N; ++i) {
+        const int si = i - (IA - 1), sj = j - (JA - 1);
+        if (si >= 0 && sj >= 0 && si < n && sj < n) e = std::max(e, std::abs(lu[(size_t)sj * n + si] - at(aw, i, j)));
+        else outside = outside && at(f, i, j) == at(aw, i, j);
+      }
+    std::snprintf(line, sizeof line, "%sgetrf on sub(A): P L U = sub(A), IPIV in columns JA.. relative to it", Ty<T>::name);
+    check(info == 0 && valid && outside && e < 10 * Ty<T>::tol * N, line, e);
+    Dist<T> B(N, 3);
+    B.put(b);
+    CK(cusolverMgGetrs_bufferSize(h, CUBLAS_OP_N, n, NRHS, A.parts.data(), IA, JA, A.desc, ipiv.data(), B.parts.data(),
+                                  IB, 1, B.desc, t, &lwork));
+    Work<T> w2(lwork);
+    CK(cusolverMgGetrs(h, CUBLAS_OP_N, n, NRHS, A.parts.data(), IA, JA, A.desc, ipiv.data(), B.parts.data(), IB, 1,
+                       B.desc, t, w2.parts.data(), lwork, &info));
+    cudaDeviceSynchronize();
+    const auto x = widen(B.get());
+    double r = 0;
+    for (int c = 0; c < NRHS; ++c)
+      for (int i = 0; i < n; ++i) {
+        cdouble s = 0;
+        for (int k = 0; k < n; ++k) s += at(aw, IA - 1 + i, JA - 1 + k) * x[(size_t)c * N + IB - 1 + k];
+        r = std::max(r, std::abs(s - bw[(size_t)c * N + IB - 1 + i]));
+      }
+    std::snprintf(line, sizeof line, "%sgetrs on sub(A), sub(B) at (%d, 1): sub(A) X = sub(B)", Ty<T>::name, IB);
+    check(info == 0 && r < 100 * Ty<T>::tol * N, line, r);
+    for (int* p : ipiv) cudaFree(p);
+  }
+  {  // refusals: syevd on a submatrix; potrf not positive definite
+    Dist<T> A(N, N);
+    A.put(spd);
+    std::vector<typename Ty<T>::R> wv(N);
+    Work<T> w(1 << 16);
+    info = -7;
+    const int st = cusolverMgSyevd(h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, A.parts.data(), IA, JA,
+                                   A.desc, wv.data(), Ty<T>::real, t, w.parts.data(), 1 << 16, &info);
+    std::snprintf(line, sizeof line, "%ssyevd on a submatrix: INVALID_VALUE, info 0", Ty<T>::name);
+    check(st == CUSOLVER_STATUS_INVALID_VALUE && info == 0, line, st);
+    std::vector<T> bad = spd;
+    bad[(size_t)2 * N + 2] = Ty<T>::make(-100.0);
+    A.put(bad);
+    int64_t lwork = -1;
+    CK(cusolverMgPotrf_bufferSize(h, CUBLAS_FILL_MODE_LOWER, N, A.parts.data(), 1, 1, A.desc, t, &lwork));
+    Work<T> w2(lwork);
+    const int st2 = cusolverMgPotrf(h, CUBLAS_FILL_MODE_LOWER, N, A.parts.data(), 1, 1, A.desc, t, w2.parts.data(),
+                                    lwork, &info);
+    std::snprintf(line, sizeof line, "%spotrf, not positive definite at 3: INTERNAL_ERROR, info 3", Ty<T>::name);
+    check(st2 == CUSOLVER_STATUS_INTERNAL_ERROR && info == 3, line, st2);
+  }
+}
+
+static void grids() {
+  cudaLibMgGrid_t g = nullptr;
+  int dev[2] = {0, G > 1 ? 1 : 0};
+  const int st = cusolverMgCreateDeviceGrid(&g, 2, 1, dev, CUDALIBMG_GRID_MAPPING_COL_MAJOR);
+  check(st == CUSOLVER_STATUS_INVALID_VALUE, "a 2 x 1 grid of devices: INVALID_VALUE (one row of devices only)", st);
+}
+
 int main() {
   int count = 0;
   cudaGetDeviceCount(&count);
@@ -371,6 +571,11 @@ int main() {
   run<double>();
   run<cuComplex>();
   run<cuDoubleComplex>();
+  submatrix<float>();
+  submatrix<double>();
+  submatrix<cuComplex>();
+  submatrix<cuDoubleComplex>();
+  grids();
   cusolverMgDestroyGrid(grid);
   cusolverMgDestroy(h);
   std::printf(failures ? "FAIL: %d cusolverMg checks\n" : "PASS: every cusolverMg check\n", failures);
