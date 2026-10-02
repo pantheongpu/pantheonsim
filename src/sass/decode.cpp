@@ -3658,9 +3658,12 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   // ALU ops keep bit 8 clear; the form in bits 9-11 is never zero for them.
   if (w.field(9, 3) != 0 && (low9 & 0x100) == 0) {
     const bool uniform = (low9 & 0x80) != 0;
-    // sm_120 gives the uniform datapath 64-bit ops of its own: UIADD3.64
-    // (0x97, the vector IMNMX's number) and UIMNMX.S64/U64 (0x85).
-    if (sm >= 120 && uniform && ((low9 & 0x7f) == 0x17 || (low9 & 0x7f) == 0x05)) {
+    // The uniform datapath's own 64-bit ops: UIADD3.64 (0x97, the vector
+    // IMNMX's number), which CUDA 13's ptxas uses from sm_90 (a bulk copy's
+    // source address, CuTe's), and from sm_120 UIMNMX.S64/U64 (0x85).
+    // Before sm_90 ptxas has no UIADD3.64; taking 0x97 as UIMNMX there
+    // turned an address plus 0x30 into the larger of the two.
+    if (uniform && ((sm >= 90 && (low9 & 0x7f) == 0x17) || (sm >= 120 && (low9 & 0x7f) == 0x05))) {
       if ((low9 & 0x7f) == 0x17) {
         dec_iadd3(ins, w, true);
         ins.mods.insert(ins.mods.begin(), "64");
