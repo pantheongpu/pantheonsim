@@ -497,9 +497,22 @@ VGPU_EXPORT cudnnStatus_t cudnnSetTensorNdDescriptorEx(cudnnTensorDescriptor_t d
   if (s == CUDNN_STATUS_SUCCESS) as<TensorDesc>(d)->nd = true;
   return s;
 }
+void vgpu_cudnn::clear_tensor(cudnnTensorDescriptor_t d) {
+  if (!known(d)) return;
+  auto* t = as<TensorDesc>(d);
+  t->l.rank = 0;
+  t->vect = 0;
+  t->nd = true;
+}
+
 VGPU_EXPORT cudnnStatus_t cudnnGetTensorNdDescriptor(const cudnnTensorDescriptor_t d, int requested,
                                                      cudnnDataType_t* type, int* nb, int dims[], int strides[]) {
   const TensorDesc* t = tdesc(d);
+  if (!t && known(d) && as<const TensorDesc>(d)->nd) {
+    // A descriptor cudnnGetRNNWeightParams cleared: no dimensions (measured).
+    if (nb) *nb = 0;
+    return CUDNN_STATUS_SUCCESS;
+  }
   if (!t) return CUDNN_STATUS_BAD_PARAM;
   if (type) *type = t->l.type;
   if (nb) *nb = t->l.rank;

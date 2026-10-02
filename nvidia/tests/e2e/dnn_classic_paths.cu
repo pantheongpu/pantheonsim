@@ -680,6 +680,313 @@ static void transform_descriptors() {
   expect("a transform without padding or folding is a layout change with alpha and beta", same);
 }
 
+/* ---- LSTM projections, clipping and the RNN getters ---- */
+
+// One LSTM configuration, in double so that finite differences are sharp.
+struct Lstm {
+  int I, Hd, P, L, D;
+  bool clip;
+  double lclip, rclip;
+};
+
+// A host LSTM reading the weights where cudnnGetRNNWeightParams says they
+// are: gates i, f, g, o; with a projection h = Wp (o * tanh(c)); clipping
+// limits the cell state where it is read (c_t = f clip(c_{t-1}) + i g,
+// h from tanh(clip(c_t))) and cy is the unclipped state, as measured on an
+// RTX 3060.
+struct HostLstm {
+  Lstm c;
+  int T, B;
+  std::vector<int> lens;
+  std::vector<std::vector<size_t>> mat, bias;  // per pseudo-layer: offsets of lin 0..8, biases 0..7 (or -1)
+  void run(const std::vector<double>& w, const std::vector<double>& x, const std::vector<double>& hx,
+           const std::vector<double>& cx, std::vector<double>* y, std::vector<double>* hy, std::vector<double>* cy) const {
+    const int G = 4, H = c.Hd, O = c.P, D = c.D;
+    // The bounds apply in float, even to double data (measured).
+    auto clip = [&](double v) {
+      return c.clip ? std::fmin(std::fmax(v, (double)(float)c.lclip), (double)(float)c.rclip) : v;
+    };
+    auto sig = [](double v) { return 1.0 / (1.0 + std::exp(-v)); };
+    std::vector<double> in = x;
+    int I = c.I;
+    hy->assign((size_t)c.L * D * B * O, 0.0);
+    cy->assign((size_t)c.L * D * B * H, 0.0);
+    for (int l = 0; l < c.L; ++l) {
+      std::vector<double> out((size_t)T * B * O * D, 0.0);
+      for (int dir = 0; dir < D; ++dir) {
+        const int pl = l * D + dir;
+        for (int b = 0; b < B; ++b) {
+          std::vector<double> h(hx.begin() + ((size_t)pl * B + b) * O, hx.begin() + ((size_t)pl * B + b + 1) * O);
+          std::vector<double> cc(cx.begin() + ((size_t)pl * B + b) * H, cx.begin() + ((size_t)pl * B + b + 1) * H);
+          for (int s = 0; s < lens[b]; ++s) {
+            const int t = dir == 0 ? s : lens[b] - 1 - s;
+            const double* xt = in.data() + ((size_t)t * B + b) * I;
+            std::vector<double> z((size_t)G * H), hr(H);
+            for (int g = 0; g < G; ++g)
+              for (int j = 0; j < H; ++j) {
+                double a = w[bias[pl][g] + j] + w[bias[pl][G + g] + j];
+                for (int k = 0; k < I; ++k) a += w[mat[pl][g] + (size_t)j * I + k] * xt[k];
+                for (int k = 0; k < O; ++k) a += w[mat[pl][G + g] + (size_t)j * O + k] * h[k];
+                z[g * H + j] = a;
+              }
+            for (int j = 0; j < H; ++j) {
+              const double i = sig(z[j]), f = sig(z[H + j]), g = std::tanh(z[2 * H + j]), o = sig(z[3 * H + j]);
+              cc[j] = f * clip(cc[j]) + i * g;
+              hr[j] = o * std::tanh(clip(cc[j]));
+            }
+            if (O < H)
+              for (int p = 0; p < O; ++p) {
+                double a = 0;
+                for (int j = 0; j < H; ++j) a += w[mat[pl][8] + (size_t)p * H + j] * hr[j];
+                h[p] = a;
+              }
+            else
+              h = hr;
+            for (int p = 0; p < O; ++p) out[((size_t)t * B + b) * O * D + (size_t)dir * O + p] = h[p];
+          }
+          std::copy(h.begin(), h.end(), hy->begin() + ((size_t)pl * B + b) * O);
+          std::copy(cc.begin(), cc.end(), cy->begin() + ((size_t)pl * B + b) * H);
+        }
+      }
+      in = out;
+      I = O * D;
+    }
+    *y = in;
+  }
+};
+
+static void lstm_projection(const Lstm& c, const char* name) {
+  const int T = 3, B = 2, G = 4, O = c.P, LD = c.L * c.D;
+  const std::vector<int> lens = {3, 2};
+  cudnnRNNDescriptor_t rd;
+  (cudnnCreateRNNDescriptor(&rd), own(rd, cudnnDestroyRNNDescriptor));
+  CK(cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS,
+                              c.D == 2 ? CUDNN_BIDIRECTIONAL : CUDNN_UNIDIRECTIONAL, CUDNN_LINEAR_INPUT,
+                              CUDNN_DATA_DOUBLE, CUDNN_DATA_DOUBLE, CUDNN_DEFAULT_MATH, c.I, c.Hd, c.P, c.L, nullptr,
+                              CUDNN_RNN_PADDED_IO_ENABLED));
+  if (c.clip) CK(cudnnRNNSetClip_v9(rd, CUDNN_RNN_CLIP_MINMAX, c.lclip, c.rclip));
+  cudnnRNNDataDescriptor_t xd, yd;
+  (cudnnCreateRNNDataDescriptor(&xd), own(xd, cudnnDestroyRNNDataDescriptor));
+  (cudnnCreateRNNDataDescriptor(&yd), own(yd, cudnnDestroyRNNDataDescriptor));
+  CK(cudnnSetRNNDataDescriptor(xd, CUDNN_DATA_DOUBLE, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, c.I, lens.data(),
+                               nullptr));
+  CK(cudnnSetRNNDataDescriptor(yd, CUDNN_DATA_DOUBLE, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, O * c.D,
+                               lens.data(), nullptr));
+  cudnnTensorDescriptor_t hd = tensor(), cd = tensor(), md = tensor(), bd = tensor();
+  const int hdims[3] = {LD, B, O}, hstr[3] = {B * O, O, 1}, cdims[3] = {LD, B, c.Hd}, cstr[3] = {B * c.Hd, c.Hd, 1};
+  CK(cudnnSetTensorNdDescriptor(hd, CUDNN_DATA_DOUBLE, 3, hdims, hstr));
+  CK(cudnnSetTensorNdDescriptor(cd, CUDNN_DATA_DOUBLE, 3, cdims, cstr));
+  size_t wbytes = 0, work = 0, reserve = 0;
+  CK(cudnnGetRNNWeightSpaceSize(H, rd, &wbytes));
+  CK(cudnnGetRNNTempSpaceSizes(H, rd, CUDNN_FWD_MODE_TRAINING, xd, &work, &reserve));
+  const size_t nw = wbytes / 8;
+  // The weight space: every pseudo-layer's input, recurrent and projection
+  // matrices, then the biases.
+  size_t want_w = 0;
+  for (int pl = 0; pl < LD; ++pl) {
+    const int I = pl / c.D == 0 ? c.I : O * c.D;
+    want_w += (size_t)G * c.Hd * I + (size_t)G * c.Hd * O + (O < c.Hd ? (size_t)O * c.Hd : 0);
+  }
+  const size_t mats = want_w;
+  want_w += (size_t)LD * 2 * G * c.Hd;
+  char what[200];
+  std::snprintf(what, sizeof what, "%s: the weight space holds the matrices, then the biases (%zu)", name, want_w);
+  std::vector<double> hw(nw);
+  for (size_t i = 0; i < nw; ++i) hw[i] = 0.4 * std::sin(0.37 * i + 0.1);
+  Buf<double> w(hw);
+  HostLstm host{c, T, B, lens, {}, {}};
+  bool shapes = nw == want_w;
+  for (int pl = 0; pl < LD; ++pl) {
+    host.mat.emplace_back(9, 0), host.bias.emplace_back(8, 0);
+    const int I = pl / c.D == 0 ? c.I : O * c.D;
+    for (int lin = 0; lin <= 8; ++lin) {
+      void *m = nullptr, *b = nullptr;
+      CK(cudnnGetRNNWeightParams(H, rd, pl, wbytes, w.p, lin, md, &m, bd, &b));
+      cudnnDataType_t t;
+      int nb = -1, dims[3] = {}, str[3] = {};
+      CK(cudnnGetTensorNdDescriptor(md, 3, &t, &nb, dims, str));
+      if (lin == 8) {
+        if (O < c.Hd) shapes &= m && nb == 3 && dims[1] == O && dims[2] == c.Hd && !b;
+        else shapes &= !m && nb == 0;
+        if (m) host.mat[pl][8] = (double*)m - w.p;
+        continue;
+      }
+      const int cols = lin < G ? I : O;
+      shapes &= m && b && nb == 3 && dims[1] == c.Hd && dims[2] == cols;
+      shapes &= (size_t)((double*)b - w.p) >= mats;
+      host.mat[pl][lin] = (double*)m - w.p, host.bias[pl][lin] = (double*)b - w.p;
+    }
+  }
+  {
+    void *m = nullptr, *b = nullptr;
+    shapes &= cudnnGetRNNWeightParams(H, rd, 0, wbytes, w.p, 9, md, &m, bd, &b) == CUDNN_STATUS_BAD_PARAM;
+  }
+  expect(what, shapes);
+  // Forward against the host model.
+  std::vector<double> x((size_t)T * B * c.I), hx((size_t)LD * B * O), cx((size_t)LD * B * c.Hd);
+  for (size_t i = 0; i < x.size(); ++i) x[i] = std::cos(0.5 * i);
+  for (size_t i = 0; i < hx.size(); ++i) hx[i] = 0.3 * std::sin(1.1 * i);
+  for (size_t i = 0; i < cx.size(); ++i) cx[i] = 0.5 * std::cos(0.9 * i);
+  const size_t ny = (size_t)T * B * O * c.D;
+  Buf<double> bx(x), bhx(hx), bcx(cx), by(ny), bhy(hx.size()), bcy(cx.size()), wk(work / 8 + 1), rs(reserve / 8 + 1);
+  CK(cudnnRNNForward(H, rd, CUDNN_FWD_MODE_TRAINING, nullptr, xd, bx.p, yd, by.p, hd, bhx.p, bhy.p, cd, bcx.p, bcy.p,
+                     wbytes, w.p, work, wk.p, reserve, rs.p));
+  std::vector<double> ry, rhy, rcy;
+  host.run(hw, x, hx, cx, &ry, &rhy, &rcy);
+  const auto gy = by.get(), ghy = bhy.get(), gcy = bcy.get();
+  double e = 0;
+  for (int t = 0; t < T; ++t)
+    for (int b = 0; b < B; ++b)
+      if (t < lens[b])
+        for (int k = 0; k < O * c.D; ++k) {
+          const size_t i = ((size_t)t * B + b) * O * c.D + k;
+          e = std::fmax(e, std::fabs(gy[i] - ry[i]));
+        }
+  for (size_t i = 0; i < rhy.size(); ++i) e = std::fmax(e, std::fabs(ghy[i] - rhy[i]));
+  for (size_t i = 0; i < rcy.size(); ++i) e = std::fmax(e, std::fabs(gcy[i] - rcy[i]));
+  std::snprintf(what, sizeof what, "%s: forward (y, hy, cy) matches the host model", name);
+  expect(what, e < 1e-12, e);
+  // Backward against finite differences of L = <y, dy> + <hy, dhy> + <cy, dcy>.
+  std::vector<double> dy(ny), dhy(hx.size()), dcy(cx.size());
+  for (size_t i = 0; i < ny; ++i) dy[i] = std::cos(0.7 * i + 0.2);
+  for (int t = 0; t < T; ++t)
+    for (int b = 0; b < B; ++b)
+      if (t >= lens[b])
+        for (int k = 0; k < O * c.D; ++k) dy[((size_t)t * B + b) * O * c.D + k] = 0;
+  for (size_t i = 0; i < dhy.size(); ++i) dhy[i] = 0.5 * std::sin(0.3 * i);
+  for (size_t i = 0; i < dcy.size(); ++i) dcy[i] = 0.25 * std::cos(0.4 * i);
+  Buf<double> bdy(dy), bdhy(dhy), bdcy(dcy), bdx(x.size()), bdhx(hx.size()), bdcx(cx.size()), bdw(nw);
+  CK(cudnnRNNBackwardData_v8(H, rd, nullptr, yd, by.p, bdy.p, xd, bdx.p, hd, bhx.p, bdhy.p, bdhx.p, cd, bcx.p, bdcy.p,
+                             bdcx.p, wbytes, w.p, work, wk.p, reserve, rs.p));
+  CK(cudnnRNNBackwardWeights_v8(H, rd, CUDNN_WGRAD_MODE_ADD, nullptr, xd, bx.p, hd, bhx.p, yd, by.p, wbytes, bdw.p,
+                                work, wk.p, reserve, rs.p));
+  auto loss = [&](const std::vector<double>& ww, const std::vector<double>& xx, const std::vector<double>& h0,
+                  const std::vector<double>& c0) {
+    std::vector<double> a, b2, c2;
+    host.run(ww, xx, h0, c0, &a, &b2, &c2);
+    double s = 0;
+    for (size_t i = 0; i < a.size(); ++i) s += a[i] * dy[i];
+    for (size_t i = 0; i < b2.size(); ++i) s += b2[i] * dhy[i];
+    for (size_t i = 0; i < c2.size(); ++i) s += c2[i] * dcy[i];
+    return s;
+  };
+  const auto gx = bdx.get(), ghx = bdhx.get(), gcx = bdcx.get(), gw = bdw.get();
+  auto fd_check = [&](const char* part, std::vector<double> v, const std::vector<double>& grad, int which,
+                      size_t stride) {
+    double worst = 0;
+    for (size_t i = 0; i < v.size(); i += stride) {
+      const double h = 1e-6, keep = v[i];
+      v[i] = keep + h;
+      const double lp = which == 0 ? loss(v, x, hx, cx) : which == 1 ? loss(hw, v, hx, cx)
+                        : which == 2 ? loss(hw, x, v, cx) : loss(hw, x, hx, v);
+      v[i] = keep - h;
+      const double lm = which == 0 ? loss(v, x, hx, cx) : which == 1 ? loss(hw, v, hx, cx)
+                        : which == 2 ? loss(hw, x, v, cx) : loss(hw, x, hx, v);
+      v[i] = keep;
+      const double fd = (lp - lm) / (2 * h);
+      worst = std::fmax(worst, std::fabs(fd - grad[i]) / (std::fabs(fd) + 1e-3));
+    }
+    char t[200];
+    std::snprintf(t, sizeof t, "%s: %s matches finite differences", name, part);
+    expect(t, worst < 1e-5, worst);
+  };
+  // Only the positions a sequence reaches have a gradient.
+  std::vector<double> gx_masked = gx;
+  fd_check("dx", x, gx_masked, 1, 3);
+  fd_check("dhx", hx, ghx, 2, 1);
+  fd_check("dcx", cx, gcx, 3, 1);
+  fd_check("dw (input, recurrent, projection and biases)", hw, gw, 0, nw / 61 + 1);
+}
+
+static void rnn_getters() {
+  cudnnRNNDescriptor_t rd;
+  (cudnnCreateRNNDescriptor(&rd), own(rd, cudnnDestroyRNNDescriptor));
+  cudnnRNNAlgo_t algo;
+  cudnnRNNMode_t mode;
+  cudnnRNNBiasMode_t bias;
+  cudnnDirectionMode_t dir;
+  cudnnRNNInputMode_t input;
+  cudnnDataType_t dt, mp;
+  cudnnMathType_t mt;
+  int32_t in, hid, proj, layers;
+  cudnnDropoutDescriptor_t drop;
+  uint32_t aux;
+  expect("cudnnGetRNNDescriptor_v8 before a set is NOT_INITIALIZED",
+         cudnnGetRNNDescriptor_v8(rd, &algo, &mode, &bias, &dir, &input, &dt, &mp, &mt, &in, &hid, &proj, &layers,
+                                  &drop, &aux) == CUDNN_STATUS_NOT_INITIALIZED);
+  CK(cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_SINGLE_INP_BIAS, CUDNN_BIDIRECTIONAL,
+                              CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_TENSOR_OP_MATH, 5, 6, 4, 2,
+                              nullptr, CUDNN_RNN_PADDED_IO_ENABLED));
+  CK(cudnnGetRNNDescriptor_v8(rd, &algo, &mode, &bias, &dir, &input, &dt, &mp, &mt, &in, &hid, &proj, &layers, &drop,
+                              &aux));
+  expect("cudnnGetRNNDescriptor_v8 returns what was set",
+         algo == CUDNN_RNN_ALGO_STANDARD && mode == CUDNN_LSTM && bias == CUDNN_RNN_SINGLE_INP_BIAS &&
+             dir == CUDNN_BIDIRECTIONAL && input == CUDNN_LINEAR_INPUT && dt == CUDNN_DATA_FLOAT &&
+             mp == CUDNN_DATA_FLOAT && mt == CUDNN_TENSOR_OP_MATH && in == 5 && hid == 6 && proj == 4 && layers == 2 &&
+             drop == nullptr && aux == CUDNN_RNN_PADDED_IO_ENABLED);
+  expect("projSize above hiddenSize is NOT_SUPPORTED",
+         cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS, CUDNN_UNIDIRECTIONAL,
+                                  CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, 4, 6, 8, 1,
+                                  nullptr, 0) == CUDNN_STATUS_NOT_SUPPORTED);
+  expect("a GRU with a projection is NOT_SUPPORTED",
+         cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_GRU, CUDNN_RNN_DOUBLE_BIAS, CUDNN_UNIDIRECTIONAL,
+                                  CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, 4, 6, 3, 1,
+                                  nullptr, 0) == CUDNN_STATUS_NOT_SUPPORTED);
+  // Clip settings round-trip; lclip > rclip is refused.
+  cudnnRNNClipMode_t cm;
+  cudnnNanPropagation_t nan;
+  double lc = 0, rc = 0;
+  CK(cudnnRNNSetClip_v8(rd, CUDNN_RNN_CLIP_MINMAX, CUDNN_NOT_PROPAGATE_NAN, -0.5, 0.75));
+  CK(cudnnRNNGetClip_v8(rd, &cm, &nan, &lc, &rc));
+  bool ok = cm == CUDNN_RNN_CLIP_MINMAX && nan == CUDNN_NOT_PROPAGATE_NAN && lc == -0.5 && rc == 0.75;
+  CK(cudnnRNNSetClip_v9(rd, CUDNN_RNN_CLIP_MINMAX, -1.0, 1.0));
+  CK(cudnnRNNGetClip_v9(rd, &cm, &lc, &rc));
+  ok &= cm == CUDNN_RNN_CLIP_MINMAX && lc == -1.0 && rc == 1.0;
+  ok &= cudnnRNNSetClip_v9(rd, CUDNN_RNN_CLIP_MINMAX, 1.0, -1.0) == CUDNN_STATUS_BAD_PARAM;
+  expect("RNN clip settings round-trip, lclip > rclip is BAD_PARAM", ok);
+  CK(cudnnBuildRNNDynamic(H, rd, 4));
+  // The data descriptor's getter.
+  cudnnRNNDataDescriptor_t xd;
+  (cudnnCreateRNNDataDescriptor(&xd), own(xd, cudnnDestroyRNNDataDescriptor));
+  const int lens[3] = {4, 2, 3};
+  const float fill = 2.5f;
+  CK(cudnnSetRNNDataDescriptor(xd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_BATCH_MAJOR_UNPACKED, 4, 3, 7, lens, (void*)&fill));
+  cudnnRNNDataLayout_t lay;
+  int T = 0, B = 0, V = 0, got[5] = {-1, -1, -1, -1, -1};
+  float f = 0;
+  CK(cudnnGetRNNDataDescriptor(xd, &dt, &lay, &T, &B, &V, 5, got, &f));
+  expect("cudnnGetRNNDataDescriptor returns what was set, the rest of the array zeroed",
+         dt == CUDNN_DATA_FLOAT && lay == CUDNN_RNN_DATA_LAYOUT_BATCH_MAJOR_UNPACKED && T == 4 && B == 3 && V == 7 &&
+             got[0] == 4 && got[1] == 2 && got[2] == 3 && got[3] == 0 && got[4] == 0 && f == 2.5f);
+  expect("cudnnGetRNNDataDescriptor with an array shorter than the batch is BAD_PARAM",
+         cudnnGetRNNDataDescriptor(xd, &dt, &lay, &T, &B, &V, 2, got, nullptr) == CUDNN_STATUS_BAD_PARAM);
+  // Unpacked sequences of different lengths need padded I/O.
+  cudnnRNNDescriptor_t r2;
+  (cudnnCreateRNNDescriptor(&r2), own(r2, cudnnDestroyRNNDescriptor));
+  CK(cudnnSetRNNDescriptor_v8(r2, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS, CUDNN_UNIDIRECTIONAL,
+                              CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, 3, 4, 4, 1,
+                              nullptr, 0));
+  cudnnRNNDataDescriptor_t a, b;
+  (cudnnCreateRNNDataDescriptor(&a), own(a, cudnnDestroyRNNDataDescriptor));
+  (cudnnCreateRNNDataDescriptor(&b), own(b, cudnnDestroyRNNDataDescriptor));
+  const int l2[2] = {3, 2};
+  CK(cudnnSetRNNDataDescriptor(a, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, 3, 2, 3, l2, nullptr));
+  CK(cudnnSetRNNDataDescriptor(b, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, 3, 2, 4, l2, nullptr));
+  size_t wbytes = 0;
+  CK(cudnnGetRNNWeightSpaceSize(H, r2, &wbytes));
+  Buf<float> w(wbytes / 4), x(18), y(24), wk(1 << 16);
+  expect("unpacked sequences of different lengths without CUDNN_RNN_PADDED_IO_ENABLED are BAD_PARAM",
+         cudnnRNNForward(H, r2, CUDNN_FWD_MODE_INFERENCE, nullptr, a, x.p, b, y.p, nullptr, nullptr, nullptr, nullptr,
+                         nullptr, nullptr, wbytes, w.p, 1 << 18, wk.p, 0, nullptr) == CUDNN_STATUS_BAD_PARAM);
+  // Without a projection, linLayerID 8 is no matrix.
+  cudnnTensorDescriptor_t md = tensor(), bd = tensor();
+  void *m = (void*)1, *bb = (void*)1;
+  CK(cudnnGetRNNWeightParams(H, r2, 0, wbytes, w.p, 8, md, &m, bd, &bb));
+  int nb = -1, dims[3], str[3];
+  CK(cudnnGetTensorNdDescriptor(md, 3, &dt, &nb, dims, str));
+  expect("linLayerID 8 without a projection: NULL, no dimensions", !m && !bb && nb == 0);
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("FAIL cudnnCreate\n");
@@ -704,6 +1011,11 @@ int main() {
   int8_layers();
   divisive_normalization();
   transform_descriptors();
+  lstm_projection({5, 6, 4, 1, 1, false, 0, 0}, "LSTM 5->6, projection 4");
+  lstm_projection({5, 6, 4, 2, 2, false, 0, 0}, "LSTM 2 layers, bidirectional, projection 4");
+  lstm_projection({3, 4, 4, 1, 1, true, -0.3, 0.25}, "LSTM with cell clipping");
+  lstm_projection({3, 4, 2, 2, 1, true, -0.3, 0.25}, "LSTM 2 layers, projection 2, clipping");
+  rnn_getters();
   destroy_owned();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
