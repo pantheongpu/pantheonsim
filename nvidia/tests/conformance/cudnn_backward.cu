@@ -6,7 +6,7 @@
 // transforms, dropout's backward pass from a known mask, and batch
 // normalization's backward pass in NHWC, with and without a fused add and
 // activation, and through the cuDNN 8 normalization API; the spatial
-// transformer's grid and sampler, both ways; and CTC loss. The same binary runs against
+// transformer's grid and sampler, both ways; CTC loss; and im2col. The same binary runs against
 // NVIDIA's libcudnn.so.9 and against VirtualGPU's; the printed values must
 // agree (nvidia/tests/conformance/golden/cudnn_backward.rtx3060.txt holds what
 // an RTX 3060 printed).
@@ -677,6 +677,28 @@ static void normalization_api() {
               (int)cudnnDeriveNormTensorDescriptor(sb, mv, x, CUDNN_NORM_PER_CHANNEL, 2));
 }
 
+// cudnnIm2Col's matrix, both modes, with padding, stride and dilation.
+static void im2col() {
+  cudnnTensorDescriptor_t xd = tensor(CUDNN_DATA_FLOAT, {2, 3, 6, 5});
+  cudnnFilterDescriptor_t wd;
+  cudnnCreateFilterDescriptor(&wd);
+  CK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 4, 3, 3, 2));
+  cudnnConvolutionDescriptor_t cd;
+  cudnnCreateConvolutionDescriptor(&cd);
+  Buf<float> x(180, 1.0f);
+  for (auto mode : {CUDNN_CROSS_CORRELATION, CUDNN_CONVOLUTION}) {
+    CK(cudnnSetConvolution2dDescriptor(cd, 1, 0, 2, 1, 1, 2, mode, CUDNN_DATA_FLOAT));
+    int n, c, h, w;
+    CK(cudnnGetConvolution2dForwardOutputDim(cd, xd, wd, &n, &c, &h, &w));
+    const size_t cols = (size_t)n * h * w, rows = 3 * 3 * 2;
+    Buf<float> col(rows * cols, 0.0f);
+    CK(cudnnIm2Col(H, xd, x.p, wd, cd, col.p));
+    char tag[64];
+    std::snprintf(tag, sizeof tag, "im2col mode %d (%zux%zu)", (int)mode, rows, cols);
+    dump(tag, col.get());
+  }
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("cudnnCreate failed\n");
@@ -696,6 +718,7 @@ int main() {
   spatial_transformer();
   ctc_loss();
   normalization_api();
+  im2col();
   cudnnDestroy(H);
   return 0;
 }

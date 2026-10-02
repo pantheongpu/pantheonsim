@@ -170,3 +170,5 @@ norm api backward dscale                 n=4 abs=7.953280e+01 sq=1.584547e+03 wa
 norm api backward dbias                  n=4 abs=2.429257e+00 sq=1.785139e+00 wabs=7.249771e+00
 norm api inference per activation        n=120 abs=3.332976e+01 sq=1.536448e+01 wabs=1.336722e+02
 norm api with 2 groups: status 3000
+im2col mode 1 (18x18)                    n=324 abs=1.856387e+02 sq=1.492966e+02 wabs=7.520770e+02
+im2col mode 0 (18x18)                    n=324 abs=1.856387e+02 sq=1.492966e+02 wabs=7.333256e+02

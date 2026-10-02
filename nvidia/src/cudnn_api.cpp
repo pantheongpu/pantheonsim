@@ -746,6 +746,66 @@ cudnnStatus_t run_conv(const char* fn, ConvDir dir, cudnnHandle_t h, int algo, c
 
 }  // namespace
 
+// The input as the matrix an explicit-GEMM convolution multiplies: one row
+// per (input channel, filter tap) of a group-0 filter, row-major over the
+// taps, and one column per (image, output position) -- stored row by row
+// (measured: [C*R*S][N*P*Q]), zero where a tap falls in the padding, and the
+// taps flipped for CUDNN_CONVOLUTION.
+VGPU_EXPORT cudnnStatus_t cudnnIm2Col(cudnnHandle_t h, const cudnnTensorDescriptor_t xd, const void* x,
+                                      const cudnnFilterDescriptor_t wd, const cudnnConvolutionDescriptor_t cd,
+                                      void* col) {
+  static const char* fn = "cudnnIm2Col";
+  const TensorDesc* X = tdesc(xd);
+  const FilterDesc* W = fdesc(wd);
+  if (!known(h) || !X || !W || !known(cd) || !x || !col) return BAD(fn, "invalid handle, descriptor or pointer");
+  const auto* C = as<const ConvDesc>(cd);
+  if (X->l.rank != C->nsp + 2 || W->l.rank != X->l.rank) return BAD(fn, "the tensor, filter and convolution ranks differ");
+  ConvGeom g;
+  const int nsp = C->nsp;
+  int64_t out[3];
+  for (int i = 0; i < nsp; ++i) out[i] = conv_out(X->l.dims[2 + i], C->pad[i], W->l.dims[2 + i], C->str[i], C->dil[i]);
+  // Geometry for one channel group the filter's width: what the GEMM sees.
+  Layout yl;
+  yl.rank = X->l.rank;
+  yl.dims[0] = X->l.dims[0], yl.dims[1] = W->l.dims[0];
+  for (int i = 0; i < nsp; ++i) yl.dims[2 + i] = out[i];
+  Layout wl = W->l;
+  wl.dims[1] = X->l.dims[1];  // all input channels
+  std::string why;
+  if (!conv_geometry(X->l, wl, yl, nsp, C->pad, C->str, C->dil, C->mode == CUDNN_CONVOLUTION, &g, &why))
+    return BAD(fn, why);
+  sync_handle(h);
+  std::vector<double> vx;
+  if (!read(X->l, x, &vx)) return CUDNN_STATUS_EXECUTION_FAILED;
+  const int64_t taps = g.flt[0] * g.flt[1] * g.flt[2], positions = g.out[0] * g.out[1] * g.out[2];
+  const int64_t cols = g.N * positions, isz = g.in[0] * g.in[1] * g.in[2];
+  std::vector<double> m(static_cast<size_t>(g.C * taps * cols), 0.0);
+  for (int64_t c = 0; c < g.C; ++c)
+    for (int64_t t = 0; t < taps; ++t) {
+      const int64_t f[3] = {t / (g.flt[1] * g.flt[2]), (t / g.flt[2]) % g.flt[1], t % g.flt[2]};
+      for (int64_t n = 0; n < g.N; ++n)
+        for (int64_t o = 0; o < positions; ++o) {
+          const int64_t q[3] = {o / (g.out[1] * g.out[2]), (o / g.out[2]) % g.out[1], o % g.out[2]};
+          int64_t p[3];
+          bool inside = true;
+          for (int d = 0; d < 3; ++d) {
+            const int64_t tap = g.flip ? g.flt[d] - 1 - f[d] : f[d];
+            p[d] = q[d] * g.str[d] - g.pad[d] + tap * g.dil[d];
+            inside &= p[d] >= 0 && p[d] < g.in[d];
+          }
+          if (inside)
+            m[static_cast<size_t>((c * taps + t) * cols + n * positions + o)] =
+                vx[static_cast<size_t>((n * g.C + c) * isz + (p[0] * g.in[1] + p[1]) * g.in[2] + p[2])];
+        }
+    }
+  Layout ml;
+  ml.type = X->l.type;
+  ml.rank = 1;
+  ml.dims[0] = static_cast<int64_t>(m.size());
+  ml.strides[0] = 1;
+  return write(ml, col, m) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
 // cuDNN reports two more than it lists; programs size their arrays by this.
 VGPU_EXPORT cudnnStatus_t cudnnGetConvolutionForwardAlgorithmMaxCount(cudnnHandle_t h, int* count) {
   if (!known(h) || !count) return CUDNN_STATUS_BAD_PARAM;
