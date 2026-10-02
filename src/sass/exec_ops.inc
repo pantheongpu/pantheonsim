@@ -3106,6 +3106,21 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     });
     return;
   }
+  // The device runtime's per-thread error, through the two driver entry
+  // points its library (linked in by -rdc builds) is built on, as the PTX
+  // engine's exec_device_get_last_error: GetLastError reads it without
+  // clearing it, SetLastError writes it.
+  if (name == "__cuda_syscall_cnpv2GetLastError") {
+    each_lane(ex, [&](unsigned l) { w.reg(4, l) = w.device_error[l]; });
+    return;
+  }
+  if (name == "__cuda_syscall_cnpv2SetLastError") {
+    each_lane(ex, [&](unsigned l) {
+      w.device_error[l] = w.reg(4, l);
+      w.reg(4, l) = 0;
+    });
+    return;
+  }
   if (name == "cudaGraphLaunch") {
     // (graphExec, stream) from a kernel, as the PTX engine's
     // exec_device_graph_launch: the runtime that launched this kernel's graph

@@ -62,6 +62,7 @@ struct Warp {
   uint32_t ur[256] = {};
   bool up[8] = {false, false, false, false, false, false, false, true};
   uint64_t pc[32] = {};               // per-lane code address
+  uint32_t device_error[32] = {};     // the device runtime's per-thread last error
   Mask alive = 0;                     // lanes that are threads of the block
   Mask exited = 0;
   Mask waiting = 0;

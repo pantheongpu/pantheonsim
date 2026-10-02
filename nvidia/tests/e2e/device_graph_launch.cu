@@ -90,8 +90,6 @@ __global__ void launch_then_last_error(cudaGraphExec_t g) {
   g_err[1] = cudaGetLastError();
   g_err[2] = cudaPeekAtLastError();
 }
-__global__ void child_k() {}
-__global__ void launches_a_kernel() { child_k<<<1, 1>>>(); }
 
 static cudaStream_t s;
 static const unsigned long long DL = cudaGraphInstantiateFlagDeviceLaunch;
@@ -385,7 +383,8 @@ int main(int argc, char** argv) {
     CK(cudaGraphCreate(&g, 0));
     CK(cudaGraphAddEventRecordNode(&n, g, nullptr, 0, ev));
     refused(g, DL, __LINE__);                                   // an event node
-    refused(one_kernel((const void*)launches_a_kernel, nullptr), DL, __LINE__);   // dynamic parallelism
+    // (A kernel that launches kernels: dynamic_parallelism.cu, built for the
+    // PTX engine, which alone runs dynamic parallelism.)
     int* dev;
     int* pinned;
     int* managed;

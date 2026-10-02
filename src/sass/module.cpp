@@ -55,7 +55,8 @@ namespace {
 
 // The functions a module may call that VirtualGPU provides itself.
 const char* const kBuiltins[] = {"vprintf", "malloc", "free", "__assertfail", "cudaGraphSetConditional",
-                                 "cudaGraphLaunch"};
+                                 "cudaGraphLaunch", "__cuda_syscall_cnpv2GetLastError",
+                                 "__cuda_syscall_cnpv2SetLastError"};
 
 bool is_bank(const std::string& name, unsigned* bank) {
   // ".nv.constant<N>" or ".nv.constant<N>.<kernel>"
@@ -193,9 +194,12 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       for (const CubinReloc& r : s.relocs) {
         // In data, R_CUDA_G64 (4) is an address too: NVIDIA's device link
         // writes it for a __device__ pointer initialised to a variable's
-        // address (&array[2]), which nvJitLink's output keeps for the loader.
+        // address (&array[2]), which nvJitLink's output keeps for the loader;
+        // and so is R_CUDA_FUNC_DESC_64 (35), a function pointer in a table
+        // (the device runtime -rdc builds link in has one), since a
+        // function's descriptor here is its code address.
         const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 75)
-                                : (r.type == 2 || r.type == 4);
+                                : (r.type == 2 || r.type == 4 || r.type == 35);
         if (!known)
           throw Error(Err::UnsupportedPtx,
                       "cubin: relocation type " + std::to_string(r.type) + " in " + s.name + " is not supported yet");
@@ -245,6 +249,23 @@ bool runs_instr(const Instr& ins);   // exec.cpp
 
 std::string unsupported(const uint8_t* image, size_t size) {
   const Cubin c = parse_cubin(image, size);
+  // Relocations the loader applies (see load), against symbols it can
+  // resolve: the module's own, or a function VirtualGPU provides. Anything
+  // else -- dynamic parallelism's device runtime, whose launch the SASS path
+  // does not have, being the usual one -- leaves the module to its PTX
+  // rather than failing to load.
+  for (const CubinSection& s : c.sections) {
+    if (s.relocs.empty() || s.name.rfind(".debug_", 0) == 0 || s.name.rfind(".nv_debug", 0) == 0) continue;
+    const bool code = s.name.rfind(".text.", 0) == 0;
+    for (const CubinReloc& r : s.relocs) {
+      const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 75)
+                              : (r.type == 2 || r.type == 4 || r.type == 35);
+      if (!known) return "relocation type " + std::to_string(r.type) + " in " + s.name;
+      bool resolved = std::find(std::begin(kBuiltins), std::end(kBuiltins), r.symbol) != std::end(kBuiltins);
+      for (const CubinSymbol& sym : c.symbols) resolved = resolved || (sym.name == r.symbol && !sym.section.empty());
+      if (!resolved) return "a call to " + r.symbol + ", which VirtualGPU's SASS path does not provide";
+    }
+  }
   // VGPU_SASS_REFUSE=<op>: treat that op as unsupported, for testing the
   // fallback to PTX.
   const char* refuse = std::getenv("VGPU_SASS_REFUSE");

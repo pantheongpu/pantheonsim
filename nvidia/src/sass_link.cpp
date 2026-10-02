@@ -58,7 +58,8 @@
 //               CONST_FIELDs against a constant, its bank from .nv.constant<N>)
 //              114 R_CUDA_ABS56_16_34 against __UFT_OFFSET: an indirect call's
 //                  offset into a function table this link does not build, 0
-//     kept      2 R_CUDA_64, 4 R_CUDA_G64 (data), 56/57 R_CUDA_ABS32_LO_32/HI_32,
+//     kept      2 R_CUDA_64, 4 R_CUDA_G64, 35 R_CUDA_FUNC_DESC_64 (data),
+//               56/57 R_CUDA_ABS32_LO_32/HI_32,
 //               58 R_CUDA_ABS47_34 and 75 R_CUDA_ABS55_16_34 (calls)
 //     converted 112/113 R_CUDA_UNIFIED32_LO_32/HI_32 to 56/57, 102 R_CUDA_UNIFIED
 //               to 2: a function's address, which NVIDIA's link turns into its
@@ -289,6 +290,7 @@ const char* reloc_name(uint32_t t) {
   switch (t) {
     case 2: return "R_CUDA_64";
     case 4: return "R_CUDA_G64";
+    case 35: return "R_CUDA_FUNC_DESC_64";
     case 55: return "R_CUDA_ABS32_32";
     case 56: return "R_CUDA_ABS32_LO_32";
     case 57: return "R_CUDA_ABS32_HI_32";
@@ -928,6 +930,7 @@ void Linker::relocate() {
           continue;   // the function table's offset: no table, 0
         case 2:
         case 4:
+        case 35:
         case 56:
         case 57:
         case 58:
@@ -942,7 +945,7 @@ void Linker::relocate() {
       if (link_time) fail("it is a shared or constant-bank offset, which the loader cannot place");
       uint32_t type = r.type == 112 ? 56 : r.type == 113 ? 57 : r.type == 102 ? 2 : r.type;
       int64_t kept_addend = r.addend;
-      if (!r.rela && (type == 2 || type == 4)) {   // data, REL: the addend is the 64-bit field
+      if (!r.rela && (type == 2 || type == 4 || type == 35)) {   // data, REL: the addend is the 64-bit field
         kept_addend = static_cast<int64_t>(get_bits(b, at, 0, 64));
         put_bits(b, at, 0, 64, 0);
       }
