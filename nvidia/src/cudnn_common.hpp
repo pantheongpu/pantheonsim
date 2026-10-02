@@ -181,16 +181,22 @@ struct ConvGeom {
   bool flip = false;
 };
 
-// The output extent one spatial dimension of a convolution gives.
+// The output extent one spatial dimension of a convolution gives, padded by
+// pre before and post after.
+inline int64_t conv_out(int64_t in, int64_t pre, int64_t post, int64_t flt, int64_t str, int64_t dil) {
+  return 1 + (in + pre + post - ((flt - 1) * dil + 1)) / str;
+}
 inline int64_t conv_out(int64_t in, int64_t pad, int64_t flt, int64_t str, int64_t dil) {
-  return 1 + (in + 2 * pad - ((flt - 1) * dil + 1)) / str;
+  return conv_out(in, pad, pad, flt, str, dil);
 }
 
 // x: [N, C, sp...], w: [K, C/G, sp...], y: [N, K, sp...] (logical dims), and
-// the convolution's per-dimension settings. False, with the reason, when they
-// do not fit together.
+// the convolution's per-dimension settings; post paddings, if given, differ
+// from the pre paddings (pad). False, with the reason, when they do not fit
+// together.
 bool conv_geometry(const Layout& x, const Layout& w, const Layout& y, int nsp, const int64_t* pad,
-                   const int64_t* str, const int64_t* dil, bool flip, ConvGeom* g, std::string* why);
+                   const int64_t* str, const int64_t* dil, bool flip, ConvGeom* g, std::string* why,
+                   const int64_t* post = nullptr);
 
 enum class ConvDir { Forward, Data, Filter };
 // How the products are summed: exactly (in double, then rounded once when the

@@ -13,13 +13,12 @@
 //   - One engine, global index 0, runs any graph this library can compute:
 //     any number of convolution (forward, backward-data, backward-filter),
 //     matmul, pointwise, reduction, normalization (layer, instance, batch,
-//     RMS; forward and backward) and pooling (resampling: max and average,
-//     forward and backward) operations, joined through virtual tensors --
-//     cudnn-frontend's conv-bias-activation, dgrad-drelu, matmul-epilogue,
-//     reduction, norm and pooling patterns, and PyTorch's single
-//     convolutions. A graph
-//     with any other operation is refused when it is finalized, by name,
-//     rather than accepted and run wrongly.
+//     RMS; forward and backward), pooling (resampling: max and average,
+//     forward and backward) and concatenation operations, joined through
+//     virtual tensors -- cudnn-frontend's conv-bias-activation, dgrad-drelu,
+//     matmul-epilogue, reduction, norm and pooling patterns, and PyTorch's
+//     single convolutions. A graph with any other operation is refused when
+//     it is finalized, by name, rather than accepted and run wrongly.
 //   - Execute computes on the host, as the classic API here does (see
 //     cudnn_api.cpp): the operations run in an order that respects their
 //     data, inputs copied out of device memory and outputs copied back after
@@ -232,7 +231,7 @@ double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
 // What an operation is, which tensors it reads and writes, and its settings,
 // checked: everything a graph's finalization needs to accept it and its
 // execution needs to run it.
-enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd };
+enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd, Concat };
 
 // A normalization's tensors, by role: which of an Op's inputs and outputs
 // each is (-1 when the graph does not give it).
@@ -361,10 +360,13 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
              std::to_string(dil.size()) + ")";
       return false;
     }
-    // Asymmetric padding: the output extent would follow from both sides.
-    if (!post.empty() && post != pre) { *why = "asymmetric padding (post-paddings differ from pre-paddings) is not supported"; return false; }
+    // Post paddings may differ from pre paddings (TensorFlow's SAME padding):
+    // the output's extent follows from both, positions from the pre ones.
+    if (!post.empty() && post.size() != s) { *why = "the convolution's post paddings are incomplete"; return false; }
     const bool flip = c->i64(CUDNN_ATTR_CONVOLUTION_CONV_MODE) == CUDNN_CONVOLUTION;
-    if (!vc::conv_geometry(x, w, y, nsp, pre.data(), str.data(), dil.data(), flip, &op->geom, why)) return false;
+    if (!vc::conv_geometry(x, w, y, nsp, pre.data(), str.data(), dil.data(), flip, &op->geom, why,
+                           post.empty() ? nullptr : post.data()))
+      return false;
     const cudnnDataType_t ct = static_cast<cudnnDataType_t>(c->i64(CUDNN_ATTR_CONVOLUTION_COMP_TYPE, CUDNN_DATA_FLOAT));
     op->acc = ct == CUDNN_DATA_HALF ? vc::Accum::Half : vc::Accum::Exact;
     return true;
@@ -504,6 +506,29 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         return false;
       }
       op->in = {x};
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR: {
+      op->kind = Kind::Concat;
+      if (!tensor(CUDNN_ATTR_OPERATION_CONCAT_OUTPUT_DESC, "output", &op->out)) return false;
+      const Attr* ins = d->get(CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS);
+      if (!ins || ins->count < 1) { *why = "concatenate: no inputs"; return false; }
+      op->axis = d->i64(CUDNN_ATTR_OPERATION_CONCAT_AXIS, -1);
+      const vc::Layout& Y = op->out.l;
+      if (op->axis < 0 || op->axis >= Y.rank) { *why = "concatenate: the axis is outside the output"; return false; }
+      int64_t total = 0;
+      for (int64_t i = 0; i < ins->count; ++i) {
+        GTensor t;
+        if (!tensor_of(d->desc(CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS, static_cast<size_t>(i)), &t, why)) return false;
+        bool fits = t.l.rank == Y.rank;
+        for (int k = 0; fits && k < Y.rank; ++k) fits = k == op->axis || t.l.dims[k] == Y.dims[k];
+        if (!fits) { *why = "concatenate: an input differs from the output outside the axis"; return false; }
+        total += t.l.dims[op->axis];
+        op->in.push_back(t);
+      }
+      if (total != Y.dims[op->axis]) { *why = "concatenate: the inputs' extents along the axis do not add up to the output's"; return false; }
+      // The in-place input (already where it belongs in the output) is
+      // copied over itself like the others: the same values.
       return true;
     }
     case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
@@ -1097,6 +1122,24 @@ void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, s
     }
 }
 
+// Concatenation: each input's elements at their offset along the axis.
+void run_concat(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* r) {
+  const vc::Layout& Y = op.out.l;
+  const int ax = static_cast<int>(op.axis);
+  int64_t outer = 1, inner = 1;
+  for (int k = 0; k < ax; ++k) outer *= Y.dims[k];
+  for (int k = ax + 1; k < Y.rank; ++k) inner *= Y.dims[k];
+  r->assign(Y.count(), 0.0);
+  int64_t at = 0;
+  for (size_t i = 0; i < op.in.size(); ++i) {
+    const int64_t e = op.in[i].l.dims[ax];
+    for (int64_t o = 0; o < outer; ++o)
+      for (int64_t j = 0; j < e * inner; ++j)
+        (*r)[static_cast<size_t>((o * Y.dims[ax] + at) * inner + j)] = (*in[i])[static_cast<size_t>(o * e * inner + j)];
+    at += e;
+  }
+}
+
 // Runs a scheduled graph: inputs from the variant pack (device memory, or
 // host memory for a by-value scalar), intermediates on the host rounded to
 // their declared types, outputs written back.
@@ -1157,6 +1200,7 @@ cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, 
       case Kind::Reduction: run_reduction(op, *in[0], &r); break;
       case Kind::PoolFwd:
       case Kind::PoolBwd: run_pool(op, in, &r); alpha = op.alpha, beta = op.beta; break;
+      case Kind::Concat: run_concat(op, in, &r); break;
       case Kind::NormFwd:
       case Kind::NormBwd: {
         std::vector<std::vector<double>> outs;
@@ -1329,7 +1373,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
-    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR: {
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR: {
       // Shapes that do not fit are the caller's error; a setting this
       // library does not compute is refused by name.
       Op op;

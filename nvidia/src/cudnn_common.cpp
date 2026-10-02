@@ -236,7 +236,8 @@ bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, doubl
 /* ---- convolution ---- */
 
 bool conv_geometry(const Layout& x, const Layout& w, const Layout& y, int nsp, const int64_t* pad,
-                   const int64_t* str, const int64_t* dil, bool flip, ConvGeom* g, std::string* why) {
+                   const int64_t* str, const int64_t* dil, bool flip, ConvGeom* g, std::string* why,
+                   const int64_t* post) {
   if (nsp < 1 || nsp > 3) { *why = "only 1 to 3 spatial dimensions are supported"; return false; }
   if (x.rank != nsp + 2 || w.rank != nsp + 2 || y.rank != nsp + 2) {
     *why = "tensor ranks (" + std::to_string(x.rank) + ", " + std::to_string(w.rank) + ", " + std::to_string(y.rank) +
@@ -253,11 +254,12 @@ bool conv_geometry(const Layout& x, const Layout& w, const Layout& y, int nsp, c
     const int k = 3 - nsp + i;
     g->in[k] = x.dims[2 + i], g->out[k] = y.dims[2 + i], g->flt[k] = w.dims[2 + i];
     g->pad[k] = pad[i], g->str[k] = str[i], g->dil[k] = dil[i];
-    if (str[i] < 1 || dil[i] < 1 || pad[i] < 0) { *why = "a stride, dilation or padding is out of range"; return false; }
-    if (g->out[k] != conv_out(g->in[k], g->pad[k], g->flt[k], g->str[k], g->dil[k])) {
+    const int64_t after = post ? post[i] : pad[i];
+    if (str[i] < 1 || dil[i] < 1 || pad[i] < 0 || after < 0) { *why = "a stride, dilation or padding is out of range"; return false; }
+    const int64_t want = conv_out(g->in[k], g->pad[k], after, g->flt[k], g->str[k], g->dil[k]);
+    if (g->out[k] != want) {
       *why = "output extent " + std::to_string(g->out[k]) + " in spatial dimension " + std::to_string(i) +
-             " is not the " + std::to_string(conv_out(g->in[k], g->pad[k], g->flt[k], g->str[k], g->dil[k])) +
-             " the convolution gives";
+             " is not the " + std::to_string(want) + " the convolution gives";
       return false;
     }
   }

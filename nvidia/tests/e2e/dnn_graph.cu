@@ -9,6 +9,7 @@
 //   - layer, RMS and batch normalization, training forward (saved and
 //     running statistics) and backward
 //   - max and average pooling (resampling), forward and backward
+//   - a convolution padded asymmetrically, and a concatenation
 //
 // each checked against a reference computed here on the host, and a graph
 // holding an operation the library has no engine for refused rather than run.
@@ -667,6 +668,83 @@ static void pooling() {
   }
 }
 
+/* ---- asymmetric convolution padding, and concatenation ---- */
+
+static void asymmetric_and_concat() {
+  {
+    // TensorFlow's SAME padding of an even filter: one more row after than before.
+    const int N = 1, C = 2, Hh = 5, W = 6, K = 3, R = 2;
+    const int64_t pre[2] = {0, 1}, post[2] = {1, 0}, ones[2] = {1, 1}, spatial = 2;
+    const int Ho = Hh + pre[0] + post[0] - R + 1, Wo = W + pre[1] + post[1] - R + 1;
+    const std::vector<int64_t> xd = {N, C, Hh, W}, wd = {K, C, R, R}, yd = {N, K, Ho, Wo};
+    const auto hx = filled(count(xd), 1.0f, 1), hw = filled(count(wd), 0.5f, 2);
+    Desc x = tensor(1, xd), w = tensor(2, wd), y = tensor(3, yd);
+    Desc cd = make(CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR);
+    const cudnnDataType_t f = CUDNN_DATA_FLOAT;
+    const cudnnConvolutionMode_t mode = CUDNN_CROSS_CORRELATION;
+    set(cd, CUDNN_ATTR_CONVOLUTION_COMP_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &f);
+    set(cd, CUDNN_ATTR_CONVOLUTION_CONV_MODE, CUDNN_TYPE_CONVOLUTION_MODE, 1, &mode);
+    set(cd, CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS, CUDNN_TYPE_INT64, 1, &spatial);
+    set(cd, CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, CUDNN_TYPE_INT64, 2, pre);
+    set(cd, CUDNN_ATTR_CONVOLUTION_POST_PADDINGS, CUDNN_TYPE_INT64, 2, post);
+    set(cd, CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, CUDNN_TYPE_INT64, 2, ones);
+    set(cd, CUDNN_ATTR_CONVOLUTION_DILATIONS, CUDNN_TYPE_INT64, 2, ones);
+    cudnnBackendFinalize(cd);
+    Desc op = make(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR);
+    const float one = 1.0f, zero = 0.0f;
+    set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, x);
+    set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, w);
+    set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, y);
+    set_desc(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, cd);
+    set(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, CUDNN_TYPE_FLOAT, 1, &one);
+    set(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, CUDNN_TYPE_FLOAT, 1, &zero);
+    cudnnBackendFinalize(op);
+    float *dx = to_dev(hx), *dw = to_dev(hw), *dy = to_dev(std::vector<float>(count(yd), 7.0f));
+    const int ran = run("asymmetric padding", {op}, {1, 2, 3}, {dx, dw, dy});
+    std::vector<double> want(count(yd), 0.0);
+    for (int k = 0; k < K; ++k)
+      for (int i = 0; i < Ho; ++i)
+        for (int j = 0; j < Wo; ++j) {
+          double acc = 0;
+          for (int c = 0; c < C; ++c)
+            for (int r = 0; r < R; ++r)
+              for (int q = 0; q < R; ++q) {
+                const int ii = i - (int)pre[0] + r, jj = j - (int)pre[1] + q;
+                if (ii < 0 || ii >= Hh || jj < 0 || jj >= W) continue;
+                acc += (double)hx[(c * Hh + ii) * W + jj] * hw[((k * C + c) * R + r) * R + q];
+              }
+          want[(k * Ho + i) * Wo + j] = acc;
+        }
+    report("graph: convolution with asymmetric padding", ran, ran == 1 ? max_rel(from_dev(dy, want.size()), want) : 0,
+           1e-5);
+    for (Desc d : {x, w, y, cd, op}) cudnnBackendDestroyDescriptor(d);
+    cudaFree(dx), cudaFree(dw), cudaFree(dy);
+  }
+  {
+    const std::vector<int64_t> ad = {2, 3, 4}, bd = {2, 5, 4}, cd = {2, 8, 4};
+    const auto ha = filled(count(ad), 1.0f, 1), hb = filled(count(bd), 1.0f, 2);
+    Desc a = tensor(1, ad), b = tensor(2, bd), c = tensor(3, cd);
+    Desc op = make(CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR);
+    const int64_t axis = 1;
+    const Desc ins[2] = {a, b};
+    set(op, CUDNN_ATTR_OPERATION_CONCAT_AXIS, CUDNN_TYPE_INT64, 1, &axis);
+    set(op, CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS, CUDNN_TYPE_BACKEND_DESCRIPTOR, 2, ins);
+    set_desc(op, CUDNN_ATTR_OPERATION_CONCAT_OUTPUT_DESC, c);
+    cudnnBackendFinalize(op);
+    float *da = to_dev(ha), *db = to_dev(hb), *dc = to_dev(std::vector<float>(count(cd), 7.0f));
+    const int ran = run("concatenate", {op}, {1, 2, 3}, {da, db, dc});
+    std::vector<double> want(count(cd));
+    for (int n = 0; n < 2; ++n)
+      for (int k = 0; k < 8; ++k)
+        for (int j = 0; j < 4; ++j)
+          want[(n * 8 + k) * 4 + j] = k < 3 ? ha[(n * 3 + k) * 4 + j] : hb[(n * 5 + k - 3) * 4 + j];
+    report("graph: concatenation along the channels", ran, ran == 1 ? max_rel(from_dev(dc, want.size()), want) : 0,
+           1e-7);
+    for (Desc d : {a, b, c, op}) cudnnBackendDestroyDescriptor(d);
+    cudaFree(da), cudaFree(db), cudaFree(dc);
+  }
+}
+
 // An operation this library has no engine for is refused when it is
 // finalized, by name, not accepted and run wrongly. (NVIDIA's library has an
 // engine for it, so this is VirtualGPU's own contract.)
@@ -692,6 +770,7 @@ int main() {
   pointwise_ops();
   norms();
   pooling();
+  asymmetric_and_concat();
   refusals();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
