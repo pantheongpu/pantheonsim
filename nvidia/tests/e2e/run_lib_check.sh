@@ -52,7 +52,7 @@ nvcc -std=c++17 -cudart "$cudart" -arch=compute_80 -code=compute_80 \
      $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" "${links[@]}"
 require_shim_libs "$shim" "$out" || exit 0
 status=0
-result="$(VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
+result="$(VGPU_GPU=nvidia/a100 VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
 if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU' <<< "$result"; then
   echo "FAIL: the program reached an unimplemented entry point or a refused kernel"; exit 1
