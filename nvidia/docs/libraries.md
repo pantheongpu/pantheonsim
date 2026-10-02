@@ -454,6 +454,15 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   morphology, mirroring, resizing, and the signal-processing equivalents. The
   rest of NPP's several thousand entry points are absent rather than
   approximated, so a program that needs more fails at link time with a name.
+- **Device runtime** (cudadevrt, dynamic parallelism), on both engines:
+  device-side launches, the last error, `cudaGetDevice`/`cudaGetDeviceCount`,
+  and device streams and events are implemented. The rest of what a kernel
+  can call -- `cudaMemcpyAsync`/`cudaMemsetAsync` and `cudaMalloc` from a
+  kernel, `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, the occupancy
+  queries, the older `cudaGetParameterBuffer`/`cudaLaunchDevice` pair -- is
+  not provided: a kernel that needs the driver for one fails with the name of
+  the entry point it reached (on SASS, one of the library's
+  `__cuda_syscall_*` calls).
 - **nvJPEG**: baseline sequential DCT only. Progressive JPEG, 12-bit samples,
   arithmetic coding and lossless mode are rejected by name; so are the batched
   and device-side decode APIs and the transcoding entry points.
