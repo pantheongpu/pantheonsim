@@ -18,11 +18,11 @@
 //     the gate gradients there for backward-weights.
 //
 // Supported: LSTM, GRU, and ReLU/tanh RNNs; one or two directions; any number
-// of layers; no, single or double biases; padded (sequence- or batch-major)
-// and packed sequences of varying lengths; float data. Refused by name:
-// projections (projSize != hiddenSize), skip-input mode, dropout between
-// layers during training (random, so nothing to compare against), and other
-// data types.
+// of layers, with dropout between them in training (the classic API's
+// generator, so a reseeded descriptor repeats its masks); no, single or
+// double biases; padded (sequence- or batch-major) and packed sequences of
+// varying lengths; float data. Refused by name: projections (projSize !=
+// hiddenSize), skip-input mode, and other data types.
 #include "cudnn_common.hpp"
 
 #include <algorithm>
@@ -44,6 +44,8 @@ bool quiet() {
   return q && q[0] == '1';
 }
 
+using vgpu_cudnn::known;
+
 cudnnStatus_t refuse(const char* fn, const char* why) {
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", fn, why);
   return CUDNN_STATUS_NOT_SUPPORTED;
@@ -53,7 +55,10 @@ struct Rnn {
   cudnnRNNMode_t mode = CUDNN_LSTM;
   cudnnRNNBiasMode_t bias = CUDNN_RNN_DOUBLE_BIAS;
   int dirs = 1, in = 0, hid = 0, layers = 1;
-  float dropout = 0.0f;
+  // The dropout descriptor, read when a training pass runs: its probability
+  // and generator are the caller's to change in between.
+  vgpu_cudnn::DropoutDesc* drop = nullptr;
+  float dropout() const { return drop && known(drop) ? drop->p : 0.0f; }
   int gates() const { return mode == CUDNN_LSTM ? 4 : mode == CUDNN_GRU ? 3 : 1; }
   bool input_bias() const { return bias == CUDNN_RNN_DOUBLE_BIAS || bias == CUDNN_RNN_SINGLE_INP_BIAS; }
   bool rec_bias() const { return bias == CUDNN_RNN_DOUBLE_BIAS || bias == CUDNN_RNN_SINGLE_REC_BIAS; }
@@ -102,7 +107,6 @@ struct Data {
 
 // The library's one registry (cudnn_common.hpp): the dropout descriptor an
 // RNN takes is the classic API's.
-using vgpu_cudnn::known;
 using vgpu_cudnn::track;
 using vgpu_cudnn::untrack;
 
@@ -152,6 +156,7 @@ void pack(const Data& d, void* dev, const std::vector<float>& dense) {
 struct Reserve {
   size_t T, B, G, H;
   std::vector<size_t> input;   // per layer: [T][B][in_l]
+  std::vector<size_t> mask;    // per layer but the last: dropout's scale on its output, [T][B][H*D]
   size_t per_pl_start = 0;     // then per pseudo-layer: gates, c, h, rn, dgi, dgr
   size_t pl_stride = 0;
   size_t total = 0;
@@ -160,6 +165,10 @@ struct Reserve {
     for (int l = 0; l < r.layers; ++l) {
       input.push_back(off);
       off += T * B * r.layer_in(l);
+    }
+    for (int l = 0; l + 1 < r.layers; ++l) {
+      mask.push_back(off);
+      off += T * B * H * r.dirs;
     }
     per_pl_start = off;
     pl_stride = T * B * (G * H + H + H + H + G * H + G * H);
@@ -189,7 +198,10 @@ inline int step_t(int dir, int s, int len) { return dir == 0 ? s : len - 1 - s; 
 
 // Runs every layer forward. Writes y (dense), hy, cy, and the reserve when
 // training (res != nullptr).
-void forward(const Rnn& r, const Data& xd, const std::vector<float>& x, const std::vector<float>& w,
+// In training, dropout scales each layer's output but the last's before the
+// next layer reads it: by 0 or 1 / (1 - p), drawn from the dropout
+// descriptor and kept in the reserve for the backward pass.
+bool forward(const Rnn& r, const Data& xd, const std::vector<float>& x, const std::vector<float>& w,
              const std::vector<float>& hx, const std::vector<float>& cx, std::vector<float>* y,
              std::vector<float>* hy, std::vector<float>* cy, std::vector<float>* res, const Reserve& rv) {
   const int T = xd.T, B = xd.B, H = r.hid, G = r.gates(), D = r.dirs;
@@ -258,9 +270,22 @@ void forward(const Rnn& r, const Data& xd, const std::vector<float>& x, const st
         if (r.mode == CUDNN_LSTM) std::copy(c.begin(), c.end(), cy->begin() + ((size_t)pl * B + b) * H);
       }
     }
+    if (res && l + 1 < r.layers) {
+      const float p = r.dropout();
+      float* m = res->data() + rv.mask[l];
+      if (p > 0.0f) {
+        std::vector<uint8_t> keep;
+        if (!vgpu_cudnn::dropout_draw(r.drop, out.size(), &keep)) return false;
+        const float scale = p < 1.0f ? 1.0f / (1.0f - p) : 0.0f;
+        for (size_t i = 0; i < out.size(); ++i) m[i] = keep[i] ? scale : 0.0f, out[i] *= m[i];
+      } else {
+        std::fill(m, m + out.size(), 1.0f);
+      }
+    }
     in = std::move(out);
   }
   *y = std::move(in);
+  return true;
 }
 
 struct Rnns {
@@ -312,7 +337,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSetRNNDescriptor_v8(cudnnRNNDescriptor_t d, cudnn
   r->bias = bias;
   r->dirs = dir == CUDNN_BIDIRECTIONAL ? 2 : 1;
   r->in = in, r->hid = hid, r->layers = layers;
-  r->dropout = known(drop) ? reinterpret_cast<vgpu_cudnn::DropoutDesc*>(drop)->p : 0.0f;
+  r->drop = known(drop) ? reinterpret_cast<vgpu_cudnn::DropoutDesc*>(drop) : nullptr;
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnCreateRNNDataDescriptor(cudnnRNNDataDescriptor_t* d) {
@@ -408,8 +433,6 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNForward(cudnnHandle_t h, cudnnRNNDescriptor_t 
   if (const cudnnStatus_t s = resolve(rd, xd, yd, &d); s != CUDNN_STATUS_SUCCESS) return s;
   const Rnn& r = *d.r;
   const bool training = mode == CUDNN_FWD_MODE_TRAINING;
-  if (training && r.dropout > 0.0f && r.layers > 1)
-    return refuse("cudnnRNNForward", "dropout between layers is not supported in training");
   if (wsize < r.weights() * sizeof(float)) return CUDNN_STATUS_BAD_PARAM;
   const Reserve rv(r, d.x->T, d.x->B);
   if (training && (!reserve || rsize < rv.total * sizeof(float))) return CUDNN_STATUS_BAD_PARAM;
@@ -420,7 +443,8 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNForward(cudnnHandle_t h, cudnnRNNDescriptor_t 
   const auto cx_ = r.mode == CUDNN_LSTM && cx ? fetch(cx, states) : std::vector<float>(states, 0.0f);
   std::vector<float> dense_y, hy_(states, 0.0f), cy_(states, 0.0f);
   std::vector<float> res(training ? rv.total : 0, 0.0f);
-  forward(r, *d.x, unpack(*d.x, x), hw, hx_, cx_, &dense_y, &hy_, &cy_, training ? &res : nullptr, rv);
+  if (!forward(r, *d.x, unpack(*d.x, x), hw, hx_, cx_, &dense_y, &hy_, &cy_, training ? &res : nullptr, rv))
+    return CUDNN_STATUS_EXECUTION_FAILED;
   pack(*d.y, y, dense_y);
   if (hy) store(hy, hy_);
   if (cy && r.mode == CUDNN_LSTM) store(cy, cy_);
@@ -523,6 +547,11 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t h, cudnnRNNDescr
         std::copy(dh.begin(), dh.end(), dhx_.begin() + ((size_t)pl * B + b) * H);
         if (r.mode == CUDNN_LSTM) std::copy(dc.begin(), dc.end(), dcx_.begin() + ((size_t)pl * B + b) * H);
       }
+    }
+    // Into the layer below, through the dropout that scaled its output.
+    if (l > 0) {
+      const float* m = res.data() + rv.mask[l - 1];
+      for (size_t i = 0; i < din.size(); ++i) din[i] *= m[i];
     }
     dout = std::move(din);
   }

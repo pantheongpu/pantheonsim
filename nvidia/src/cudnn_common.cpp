@@ -393,6 +393,28 @@ void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, cons
   }
 }
 
+namespace {
+// Element i of the stream that starts at a seed is a hash of (seed, i), so
+// any position can be drawn without the ones before it.
+inline double uniform(unsigned long long seed, uint64_t i) {
+  uint64_t z = seed * 0x9e3779b97f4a7c15ull + i + 0x632be59bd9b4e019ull;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  z ^= z >> 31;
+  return static_cast<double>(z >> 11) * 0x1.0p-53;
+}
+}  // namespace
+
+bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep) {
+  DropoutState st{d->seed, d->drawn};
+  if (d->states && cudaMemcpy(&st, d->states, sizeof st, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  keep->resize(n);
+  for (size_t i = 0; i < n; ++i) (*keep)[i] = d->p < 1.0f && uniform(st.seed, st.drawn + i) >= d->p;
+  st.drawn += n;
+  d->drawn = st.drawn;
+  return !d->states || cudaMemcpy(d->states, &st, sizeof st, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
 void sync_handle(cudnnHandle_t h) {
   cudaStream_t s = nullptr;
   if (cudnnGetStream(h, &s) == CUDNN_STATUS_SUCCESS) cudaStreamSynchronize(s);

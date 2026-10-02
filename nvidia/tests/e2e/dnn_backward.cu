@@ -14,7 +14,9 @@
 //     NOT_SUPPORTED, a shape mismatch BAD_PARAM, an algorithm out of range
 //     NOT_SUPPORTED, and the last error string set.
 //   - Dropout: the fraction kept, the scaling, the backward pass following
-//     the forward pass's mask, a reseed repeating it.
+//     the forward pass's mask, a reseed repeating it; and between an RNN's
+//     layers, its gradients against finite differences of a reseeded
+//     training pass.
 #include <cudnn.h>
 #include <cuda_runtime.h>
 
@@ -453,6 +455,87 @@ static void dropout() {
   cudaFree(st);
 }
 
+/* ---- RNN dropout between layers ---- */
+
+// A two-layer LSTM with dropout 0.5 between its layers. Training draws a
+// mask (the output differs from inference), a reseeded descriptor draws the
+// same one again, and the gradients follow the mask: they match finite
+// differences of the training forward pass, reseeded before each call.
+static void rnn_dropout() {
+  const int T = 4, B = 2, I = 3, Hd = 4, L = 2;
+  size_t ss = 0;
+  CK(cudnnDropoutGetStatesSize(H, &ss));
+  void* st = nullptr;
+  cudaMalloc(&st, ss);
+  cudnnDropoutDescriptor_t drop;
+  CK(cudnnCreateDropoutDescriptor(&drop));
+  CK(cudnnSetDropoutDescriptor(drop, H, 0.5f, st, ss, 77));
+  cudnnRNNDescriptor_t rd;
+  CK(cudnnCreateRNNDescriptor(&rd));
+  CK(cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS, CUDNN_UNIDIRECTIONAL,
+                              CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, I, Hd, Hd, L,
+                              drop, 0));
+  cudnnRNNDataDescriptor_t xd, yd;
+  CK(cudnnCreateRNNDataDescriptor(&xd));
+  CK(cudnnCreateRNNDataDescriptor(&yd));
+  const int lens[B] = {T, T};
+  CK(cudnnSetRNNDataDescriptor(xd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, I, lens, nullptr));
+  CK(cudnnSetRNNDataDescriptor(yd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, Hd, lens, nullptr));
+  cudnnTensorDescriptor_t hd = nd(CUDNN_DATA_FLOAT, {L, B, Hd});
+  size_t wbytes = 0, work = 0, reserve = 0;
+  CK(cudnnGetRNNWeightSpaceSize(H, rd, &wbytes));
+  CK(cudnnGetRNNTempSpaceSizes(H, rd, CUDNN_FWD_MODE_TRAINING, xd, &work, &reserve));
+  const size_t nw = wbytes / 4, nx = (size_t)T * B * I, ny = (size_t)T * B * Hd;
+  Buf<float> w(nw, 0.4, 1), x(nx, 1.0, 2), y(ny), dy(ny, 1.0, 3), dx(nx), dw(nw), wk(work / 4 + 1), rs(reserve / 4 + 1);
+  auto forward = [&](const float* xp, const float* wp, float* yp, cudnnForwardMode_t mode) {
+    CK(cudnnSetDropoutDescriptor(drop, H, 0.5f, st, ss, 77));  // the same mask each time
+    CK(cudnnRNNForward(H, rd, mode, nullptr, xd, xp, yd, yp, hd, nullptr, nullptr, hd, nullptr, nullptr, wbytes, wp,
+                       work, wk.p, mode == CUDNN_FWD_MODE_TRAINING ? reserve : 0,
+                       mode == CUDNN_FWD_MODE_TRAINING ? rs.p : nullptr));
+  };
+  Buf<float> yi(ny), y2(ny);
+  forward(x.p, w.p, yi.p, CUDNN_FWD_MODE_INFERENCE);
+  forward(x.p, w.p, y2.p, CUDNN_FWD_MODE_TRAINING);
+  forward(x.p, w.p, y.p, CUDNN_FWD_MODE_TRAINING);
+  const auto vi = yi.get(), v2 = y2.get(), v = y.get();
+  int differ = 0, same = 0;
+  for (size_t i = 0; i < ny; ++i) differ += vi[i] != v[i], same += v2[i] == v[i];
+  expect("RNN training with dropout differs from inference", differ > 0);
+  expect("a reseeded dropout descriptor repeats the RNN's mask", same == (int)ny, (int)ny - same);
+  CK(cudnnRNNBackwardData_v8(H, rd, nullptr, yd, y.p, dy.p, xd, dx.p, hd, nullptr, nullptr, nullptr, hd, nullptr,
+                             nullptr, nullptr, wbytes, w.p, work, wk.p, reserve, rs.p));
+  CK(cudnnRNNBackwardWeights_v8(H, rd, CUDNN_WGRAD_MODE_ADD, nullptr, xd, x.p, hd, nullptr, yd, y.p, wbytes, dw.p, work,
+                                wk.p, reserve, rs.p));
+  const auto g = dy.get(), gx = dx.get(), gw = dw.get();
+  auto loss = [&](const std::vector<float>& xs, const std::vector<float>& ws) {
+    Buf<float> x2(nx), w2(nw), yy(ny), r2(reserve / 4 + 1);
+    x2.put(xs), w2.put(ws);
+    cudnnSetDropoutDescriptor(drop, H, 0.5f, st, ss, 77);
+    cudnnRNNForward(H, rd, CUDNN_FWD_MODE_TRAINING, nullptr, xd, x2.p, yd, yy.p, hd, nullptr, nullptr, hd, nullptr,
+                    nullptr, wbytes, w2.p, work, wk.p, reserve, r2.p);
+    return dot(yy.get(), g);
+  };
+  const auto x0 = x.get(), w0 = w.get();
+  const float e = 1e-2f;
+  double worst = 0;
+  for (size_t i : {size_t(0), nx / 2, nx - 1}) {
+    auto a = x0, b = x0;
+    a[i] += e, b[i] -= e;
+    worst = std::fmax(worst, std::fabs((loss(a, w0) - loss(b, w0)) / (2 * e) - gx[i]));
+  }
+  expect("RNN backward-data through dropout matches finite differences", worst < 5e-3, worst);
+  worst = 0;
+  for (size_t i : {size_t(1), nw / 3, nw / 2, nw - 2}) {
+    auto a = w0, b = w0;
+    a[i] += e, b[i] -= e;
+    worst = std::fmax(worst, std::fabs((loss(x0, a) - loss(x0, b)) / (2 * e) - gw[i]));
+  }
+  expect("RNN backward-weights through dropout matches finite differences", worst < 5e-3, worst);
+  cudnnDestroyRNNDataDescriptor(xd), cudnnDestroyRNNDataDescriptor(yd), cudnnDestroyRNNDescriptor(rd);
+  cudnnDestroyTensorDescriptor(hd), cudnnDestroyDropoutDescriptor(drop);
+  cudaFree(st);
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("FAIL cudnnCreate\n");
@@ -462,6 +545,7 @@ int main() {
   gradients();
   algorithms();
   dropout();
+  rnn_dropout();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
   return fails ? 1 : 0;

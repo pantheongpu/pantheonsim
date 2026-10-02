@@ -2193,20 +2193,6 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackwardEx(
 /* ---- dropout ---- */
 
 namespace {
-// The generator: element i of the stream that starts at a seed is a hash of
-// (seed, i), so any position can be drawn without the ones before it. Not
-// NVIDIA's generator -- the masks differ from the hardware's, though the
-// fraction kept, the scaling and the reserve-space format are cuDNN's.
-inline double uniform(unsigned long long seed, uint64_t i) {
-  uint64_t z = seed * 0x9e3779b97f4a7c15ull + i + 0x632be59bd9b4e019ull;
-  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-  z ^= z >> 31;
-  return static_cast<double>(z >> 11) * 0x1.0p-53;
-}
-// What the states buffer holds: where the stream is.
-struct DropoutState { unsigned long long seed; uint64_t drawn; };
-
 // One bit per element, least significant first, 1 for kept; the size rounded
 // up to whole 32-bit words (measured on the hardware: 10000 elements, 1252 bytes).
 size_t dropout_reserve(size_t elements) { return (elements + 31) / 32 * 4; }
@@ -2281,22 +2267,15 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutForward(cudnnHandle_t h, const cudnnDropou
   if (reserve_bytes < dropout_reserve(n)) return BAD(fn, "the reserve space is smaller than cudnnDropoutGetReserveSpaceSize says");
   auto* D = as<DropoutDesc>(dd);
   sync_handle(h);
-  DropoutState st{D->seed, D->drawn};
-  if (D->states && cudaMemcpy(&st, D->states, sizeof st, cudaMemcpyDeviceToHost) != cudaSuccess)
-    return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<double> v;
-  if (!read(X->l, x, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
+  std::vector<uint8_t> keep;
+  if (!read(X->l, x, &v) || !dropout_draw(D, n, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<uint8_t> mask(dropout_reserve(n), 0);
   const double p = D->p;
   for (size_t i = 0; i < n; ++i) {
-    const bool keep = p < 1.0 && uniform(st.seed, st.drawn + i) >= p;
-    if (keep) mask[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-    v[i] = keep ? v[i] * (1.0 / (1.0 - p)) : 0.0;
+    if (keep[i]) mask[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+    v[i] = keep[i] ? v[i] * (1.0 / (1.0 - p)) : 0.0;
   }
-  st.drawn += n;
-  D->drawn = st.drawn;
-  if (D->states && cudaMemcpy(D->states, &st, sizeof st, cudaMemcpyHostToDevice) != cudaSuccess)
-    return CUDNN_STATUS_EXECUTION_FAILED;
   if (cudaMemcpy(reserve, mask.data(), mask.size(), cudaMemcpyHostToDevice) != cudaSuccess)
     return CUDNN_STATUS_EXECUTION_FAILED;
   return write(Y->l, y, v) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;

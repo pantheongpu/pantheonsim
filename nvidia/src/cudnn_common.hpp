@@ -221,6 +221,14 @@ struct DropoutDesc {
   uint64_t drawn = 0;  // when there is no states buffer to keep it in
 };
 
+// Draws n keep (1) / drop (0) decisions, each kept with probability 1 - p,
+// from the descriptor's generator, and advances it. Not NVIDIA's generator:
+// the masks differ from the hardware's, though the fraction kept and the
+// reseeding are cuDNN's. (cudnn_common.cpp)
+bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep);
+// The state a states buffer holds: the seed, and how many have been drawn.
+struct DropoutState { unsigned long long seed; uint64_t drawn; };
+
 // Waits for what the program queued on the handle's stream: this library
 // computes on the host, and the inputs must be there first.
 void sync_handle(cudnnHandle_t h);

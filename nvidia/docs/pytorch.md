@@ -55,7 +55,8 @@ paths tested here do not call them.
   that call it.
 - **BatchNorm:** cuDNN's training forward and backward (the Ex forms).
 - **RNNs:** cuDNN's RNN API (`nvidia/src/cudnn_rnn.cpp`): LSTM, GRU and
-  ReLU/tanh RNNs, one or two directions, padded or packed sequences.
+  ReLU/tanh RNNs, one or two directions, padded or packed sequences, dropout
+  between layers.
 - **Linear layers:** cuBLAS and cuBLASLt's fused matmul + bias; PyTorch passes
   its cuBLAS handle as the cuBLASLt handle, which is accepted.
 - **Both CUDA APIs:** PyTorch calls the driver API too. `libcudart` and
@@ -65,8 +66,9 @@ paths tested here do not call them.
 
 ## Not supported
 
-- Dropout between the layers of a cuDNN RNN in training, LSTM projections,
-  and non-float RNNs: refused by name.
+- LSTM projections and non-float RNNs: refused by name. (Dropout between an
+  RNN's layers in training runs, with this library's generator: the masks
+  differ from NVIDIA's, the fraction kept and the reseeding do not.)
 - Graphs with operations other than convolution, matmul, pointwise,
   reduction and normalization (resampling, attention): refused when the graph
   is finalized, so PyTorch falls back or reports it.
