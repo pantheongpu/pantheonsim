@@ -65,7 +65,9 @@ struct Rnn {
   // The dropout descriptor, read when a training pass runs: its probability
   // and generator are the caller's to change in between.
   vgpu_cudnn::DropoutDesc* drop = nullptr;
-  real dropout() const { return drop && known(drop) ? drop->p : 0.0f; }
+  float set_p = 0.0f;  // its probability when the RNN was set, for when it is gone
+  bool drop_alive() const { return drop && known(drop); }
+  real dropout() const { return drop_alive() ? drop->p : set_p; }
   int gates() const { return mode == CUDNN_LSTM ? 4 : mode == CUDNN_GRU ? 3 : 1; }
   bool input_bias() const { return bias == CUDNN_RNN_DOUBLE_BIAS || bias == CUDNN_RNN_SINGLE_INP_BIAS; }
   bool rec_bias() const { return bias == CUDNN_RNN_DOUBLE_BIAS || bias == CUDNN_RNN_SINGLE_REC_BIAS; }
@@ -371,6 +373,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSetRNNDescriptor_v8(cudnnRNNDescriptor_t d, cudnn
   r->dirs = dir == CUDNN_BIDIRECTIONAL ? 2 : 1;
   r->in = in, r->hid = hid, r->layers = layers;
   r->drop = known(drop) ? reinterpret_cast<vgpu_cudnn::DropoutDesc*>(drop) : nullptr;
+  r->set_p = r->drop ? r->drop->p : 0.0f;
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnCreateRNNDataDescriptor(cudnnRNNDataDescriptor_t* d) {
@@ -468,6 +471,8 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNForward(cudnnHandle_t h, cudnnRNNDescriptor_t 
   if (const cudnnStatus_t s = resolve(rd, xd, yd, &d); s != CUDNN_STATUS_SUCCESS) return s;
   const Rnn& r = *d.r;
   const bool training = mode == CUDNN_FWD_MODE_TRAINING;
+  if (training && r.layers > 1 && r.dropout() > 0.0 && !r.drop_alive())
+    return refuse("cudnnRNNForward", "the dropout descriptor this RNN was set with has been destroyed");
   if (wsize < r.weights() * r.esize()) return CUDNN_STATUS_BAD_PARAM;
   const Reserve rv(r, d.x->T, d.x->B);
   if (training && (!reserve || rsize < rv.total * sizeof(real))) return CUDNN_STATUS_BAD_PARAM;
