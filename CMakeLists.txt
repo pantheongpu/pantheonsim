@@ -697,6 +697,33 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating nvCOMP shim symlinks (build/shim/libnvcomp.so.5)")
 
   # ---------------------------------------------------------------------------
+  # libvgpunvshmem: NVSHMEM's host library, presented as libnvshmem_host.so.3.
+  # Each PE is a process with a simulated GPU; the symmetric heaps are shared
+  # through the simulator's CUDA IPC, so every PE reaches every other by load
+  # and store, and kernels built with NVIDIA's NVSHMEM headers and device
+  # library run their inline device API against the state this library fills
+  # in (nvidia/src/nvshmem_api.cpp, nvshmem_abi.hpp). The host API's
+  # declarations are the simulator's own (nvidia/include/vgpu_nvshmem.h).
+  # NVIDIA tags its symbols NVSHMEM; so does this, including the C++
+  # nvshmemi_init_thread NVSHMEM's inline nvshmem_init() calls.
+  # ---------------------------------------------------------------------------
+  set(_nvshmem_map "${CMAKE_BINARY_DIR}/maps/libnvshmem_host.so.3.map")
+  file(WRITE "${_nvshmem_map}"
+       "NVSHMEM {\n  global: nvshmem*;\n  extern \"C++\" { nvshmemi_init_thread*; };\n  local: *;\n};\n")
+  add_library(vgpunvshmem SHARED nvidia/src/nvshmem_api.cpp)
+  target_link_libraries(vgpunvshmem PRIVATE vgpucudart ${CMAKE_DL_LIBS})
+  target_include_directories(vgpunvshmem PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpunvshmem PROPERTIES OUTPUT_NAME nvshmem_host SOVERSION 3 VERSION 3.8)
+  target_link_options(vgpunvshmem PRIVATE "-Wl,--version-script=${_nvshmem_map}")
+  add_custom_command(TARGET vgpunvshmem POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
+            "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so.3"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
+            "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so"
+    COMMENT "Creating NVSHMEM shim symlinks (build/shim/libnvshmem_host.so.3)")
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -1390,7 +1417,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile" "nvcomp_paths:nvcomp"
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvshmem_host:nvshmem_host"
                  "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
@@ -1431,6 +1458,16 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # NVSHMEM's device API: kernels built with NVIDIA's NVSHMEM headers and
+  # device library, on the simulator's host library, across a job of PEs.
+  # NVSHMEM is not in the CUDA toolkit, so this skips unless NVSHMEM_HOME or
+  # the nvidia-nvshmem pip package provides it.
+  add_test(NAME e2e_nvshmem_device COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvshmem_device.sh)
+  set_tests_properties(e2e_nvshmem_device PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
 
   # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
   # fatbin and PTX, as an RTX 3060 answers for all three.
