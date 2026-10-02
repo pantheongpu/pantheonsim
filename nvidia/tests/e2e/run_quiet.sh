@@ -15,13 +15,14 @@ root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
 san="$(shim_sanitizer "$build/shim")"
 if [[ -n "$san" ]]; then echo "SKIP: shim is built with $san, and the Python interpreter is not instrumented"; exit 0; fi
-# Any generated stub will do; this is one of the cuSPARSELt names cuSPARSE's
-# stubs carry, which nothing implements. (It was cufftXtExec until cuFFT's Xt
-# API was written, and cusparseCbsrmv until the BSR routines were.)
-lib="$build/shim/libcusparse.so"
-stub=cusparseLtInit
+# Any generated stub will do; this is one of the NCCL names NCCL's stubs carry,
+# which nothing implements. (It was cufftXtExec until cuFFT's Xt API was
+# written, cusparseCbsrmv until the BSR routines were, and cusparseLtInit until
+# cuSPARSELt became a library of its own.)
+lib="$build/shim/libnccl.so"
+stub=ncclCommShrink
 command -v python3 >/dev/null || { echo "SKIP: no python3"; exit 0; }
-[[ -e "$lib" ]] || { echo "SKIP: no cuSPARSE shim at $lib"; exit 0; }
+[[ -e "$lib" ]] || { echo "SKIP: no NCCL shim at $lib"; exit 0; }
 fail=0
 for case in "unset:yes" "0:yes" "1:no" "true:yes"; do
   q="${case%%:*}"; want="${case##*:}"
