@@ -1,0 +1,67 @@
+name: sass-samples probe (temporary)
+
+# TEMPORARY, for the sass-samples branch only, removed before it merges: the
+# branch's e2e programs on both engines, and the five CUDA Samples it fixes,
+# on hosted runners rather than the shared pantheonsim.com one.
+on:
+  push:
+    branches: [sass-samples]
+
+concurrency:
+  group: sass-samples-probe
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
+  probe:
+    name: ${{ matrix.flavor }}
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [cuda13_0, cuda12_0]
+    container:
+      image: ${{ needs.image.outputs[matrix.flavor] }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: ${{ matrix.flavor == 'cuda12_0' && '-ccbin g++-12' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build VirtualGPU
+        run: |
+          nvcc --version | tail -1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: The branch's programs on both engines
+        env:
+          VGPU_SASS_PROGRAMS: dynamic_parallelism:75 cdp_device_api:75 rdc_device_api:75 large_params:75 shared_atomics64:75 vector_add:75
+          VGPU_BUILD_DIR: build
+        run: nvidia/tests/e2e/run_sass_archs.sh
+
+      - name: CUDA Samples
+        if: always() && matrix.flavor == 'cuda13_0'
+        env:
+          SUITE_ONLY: /(cdpQuadtree|cdpSimpleQuicksort|cdpSimplePrint|cdpBezierTessellation|jacobiCudaGraphs|LargeKernelParameter)$
+          SUITE_TIMEOUT: '900'
+          VGPU_SASS_LOG: '1'
+        run: |
+          ci/external/suites.sh fetch cuda-samples suite
+          ci/external/suites.sh build cuda-samples suite
+          rc=0
+          ci/external/suites.sh run cuda-samples suite build/shim report || rc=1
+          VGPU_SASS=0 ci/external/suites.sh run cuda-samples suite build/shim report-ptx || rc=1
+          for f in report/logs/*.log report-ptx/logs/*.log; do echo "=== $f"; head -c 3000 "$f"; echo; done
+          exit $rc
