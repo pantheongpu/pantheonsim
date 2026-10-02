@@ -2768,3 +2768,16 @@ extern "C" __attribute__((visibility("default"), weak)) cudnnStatus_t cudnnReord
     cudnnHandle_t, const cudnnFilterDescriptor_t, cudnnReorderType_t, const void*, void*, int, const void*, void*) {
   return vgpu_cudnn::fail(CUDNN_STATUS_NOT_SUPPORTED, "cudnnReorderFilterAndBias", "filter reordering is not supported");
 }
+
+// Recording a plan into a CUDA graph: this library computes on the host, so
+// there are no kernels to record. NOT_SUPPORTED is what cuDNN answers for an
+// engine without CUDA-graph support, and cudnn-frontend then executes the
+// plan directly.
+VGPU_EXPORT cudnnStatus_t cudnnBackendPopulateCudaGraph(cudnnHandle_t, cudnnBackendDescriptor_t, cudnnBackendDescriptor_t,
+                                                       cudaGraph_t) {
+  return refuse("cudnnBackendPopulateCudaGraph", "plans are computed on the host and cannot be recorded into a CUDA graph");
+}
+VGPU_EXPORT cudnnStatus_t cudnnBackendUpdateCudaGraph(cudnnHandle_t, cudnnBackendDescriptor_t, cudnnBackendDescriptor_t,
+                                                     cudaGraph_t) {
+  return refuse("cudnnBackendUpdateCudaGraph", "plans are computed on the host and cannot be recorded into a CUDA graph");
+}
