@@ -3507,8 +3507,11 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
 
   if (ins.op == Op::UBLKCP || ins.op == Op::UBLKRED) {
     const unsigned dir = ins.f[0];   // 1 .S.G, 2 .G.S, 3 .S.S
-    const uint32_t n = urv(urc);
-    if (n % 16) throw Fault("a bulk copy's size must be a multiple of 16");
+    // The size in 16-byte units in the low half of its register, and a
+    // multicast's CTA mask in the high half: ptxas shifts a byte count right
+    // by 4 and PRMTs the mask in (my own probes, every direction).
+    const uint32_t size_reg = urv(urc);
+    const uint32_t n = (size_reg & 0xffff) * 16;
     std::vector<uint8_t> data(n);
     if (dir == 1) {
       const uint64_t g = ur64(urb);
@@ -3542,7 +3545,7 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     }
     // Into shared memory, completing on the destination's mbarrier.
     const uint32_t dst_addr = urv(ura), bar_addr = urv(ura + 1);
-    const uint32_t mask = ins.f[1] ? (urv(urc + 1) & 0xffff) : 0;
+    const uint32_t mask = ins.f[1] ? size_reg >> 16 : 0;
     const auto deliver = [&](Block& to, uint32_t off, uint32_t bar_off) {
       shared_range(to, off, n, "a bulk copy");
       if (ins.op == Op::UBLKRED) {   // .S.S: an integer reduction into shared memory
