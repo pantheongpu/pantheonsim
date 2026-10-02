@@ -659,7 +659,7 @@ if(CUDA_ABI_INCLUDE)
   file(WRITE "${_cusparselt_map}" "{\n  global: cusparseLt*;\n  local: *;\n};\n")
   add_library(vgpucusparselt SHARED nvidia/src/cusparselt_api.cpp)
   target_link_libraries(vgpucusparselt PRIVATE vgpucudart)
-  target_include_directories(vgpucusparselt PRIVATE ${CUDA_ABI_INCLUDE})
+  target_include_directories(vgpucusparselt PRIVATE ${CUDA_ABI_INCLUDE} include)
   set_target_properties(vgpucusparselt PROPERTIES OUTPUT_NAME cusparseLt SOVERSION 0 VERSION 0.10)
   target_link_options(vgpucusparselt PRIVATE "-Wl,--version-script=${_cusparselt_map}")
   add_custom_command(TARGET vgpucusparselt POST_BUILD
