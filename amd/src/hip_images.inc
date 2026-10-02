@@ -196,6 +196,7 @@ HipArray* find_array(const void* handle) {
   std::lock_guard<std::mutex> lock(s.mutex);
   return find_array_locked(handle);
 }
+extern "C++" bool is_array_handle(const void* p) { return find_array(p) != nullptr; }
 
 // Makes an array as ROCm's HIP does (ihipArrayCreate): 1, 2 or 4 channels,
 // no cubemap, a gather array 2D, and the dimensions within the device's.

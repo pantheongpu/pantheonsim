@@ -460,6 +460,97 @@ VTEST(rdna_shader_cycles_count_up) {
   VCHECK(q[3] - q[1] > 0 && q[3] - q[1] < 64);
 }
 
+// RDNA4's scalar half instructions read an inline float constant as the
+// half's own encoding (2.0 is 0x4000): hip-tests' __halfMath on gfx12 got
+// 3.0 for 1.0 * 2.0 + 3.0 when it was read as a float's bits.
+VTEST(rdna4_scalar_half_instructions_read_inline_constants_as_halves) {
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(16);
+  const std::vector<uint32_t> r = run(object("asm_salu_f16", "gfx1201"), "salu_half", mem, out, 4, {out});
+  VCHECK_EQ(r[0], 0x4500u);   // 5.0
+  VCHECK_EQ(r[1], 0x4000u);   // 2.0
+  VCHECK_EQ(r[2], 0x3800u);   // 0.5
+  VCHECK_EQ(r[3], 1u);
+}
+
+// RDNA's float atomic min and max in global memory (gfx11's
+// global_atomic_min_f32, gfx12's global_atomic_min_num_f32), returning what
+// they found: hip-tests' float atomicMin/atomicMax compile to them on gfx12.
+VTEST(rdna_float_atomic_min_and_max_in_global_memory) {
+  for (const auto& [name, target] : {std::pair{"asm_fminmax11", "gfx1100"}, std::pair{"asm_fminmax12", "gfx1201"}}) {
+    MemoryManager mem(16ull << 20);
+    const uint64_t out = mem.alloc(16);
+    const float three[2] = {3.0f, 3.0f};
+    mem.write(out, three, 8);
+    const std::vector<uint32_t> r = run(object(name, target), "fminmax", mem, out, 4, {out});
+    VCHECK_EQ(r[0], f(1.0f));
+    VCHECK_EQ(r[1], f(5.0f));
+    VCHECK_EQ(r[2], f(3.0f));
+    VCHECK_EQ(r[3], f(3.0f));
+  }
+}
+
+// RDNA's packed 16-bit instructions take a literal as the whole pair: the
+// high result reads its top 16 bits (hipRTC's fp16 header test builds
+// v_dot2_f32_f16 with 0x42004200, 3.0 in both halves).
+VTEST(rdna_packed_literals_give_each_half_its_own_16_bits) {
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(8);
+  const std::vector<uint32_t> r = run(object("asm_literal", "gfx1100"), "packed_literals", mem, out, 2, {out});
+  VCHECK_EQ(r[0], f(9.0f));
+  VCHECK_EQ(r[1], 0x46004400u);
+}
+
+// Code built for an RDNA generic target (gfx11-generic, gfx12-generic) runs
+// as its family's: hip-tests' hipModuleLoadFatBinary loads such bundles, and
+// they ran as CDNA code before.
+VTEST(rdna_generic_code_objects_run_as_their_family) {
+  for (const char* target : {"gfx11-generic", "gfx12-generic"}) {
+    const amd::CodeObject o = object("vector_add", target);
+    VCHECK(amd::gcn::is_rdna(amd::gcn::target_of_mach(o.mach)));
+    MemoryManager mem(16ull << 20);
+    std::vector<float> a(64), b(64);
+    for (int i = 0; i < 64; ++i) a[i] = static_cast<float>(i), b[i] = 0.5f * static_cast<float>(i);
+    const uint64_t pa = mem.alloc(256), pb = mem.alloc(256), out = mem.alloc(256);
+    mem.write(pa, a.data(), 256);
+    mem.write(pb, b.data(), 256);
+    const std::vector<uint32_t> r = run(o, "vector_add", mem, out, 64, {pa, pb, out, 64});
+    int wrong = 0;
+    for (int i = 0; i < 64; ++i) wrong += r[i] != f(1.5f * static_cast<float>(i));
+    VCHECK_EQ(wrong, 0);
+  }
+}
+
+// A kernel that ends where it begins, launched over 64 million work-groups,
+// as hip-tests launches its NOPKernel over the largest grids there are: one
+// group runs, and the dispatch counts what it did once for each group.
+VTEST(an_empty_kernel_over_a_huge_grid_counts_every_wave_without_running_each) {
+  const amd::CodeObject o = object("asm_wave", "gfx1100");
+  MemoryManager mem(16ull << 20);
+  const amd::Kernel* k = amd::find_kernel(o, "empty");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  const auto launch = [&](uint32_t groups) {
+    amd::Dispatch d;
+    d.object = &o;
+    d.kernel = k;
+    d.groups[0] = groups;
+    d.group_size[0] = 64;
+    d.wave_size = 32;
+    return amd::execute(d, mem);
+  };
+  const amd::DispatchStats one = launch(1);
+  const auto start = std::chrono::steady_clock::now();
+  const amd::DispatchStats many = launch(1u << 26);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  VCHECK_EQ(one.waves, 2u);
+  VCHECK_EQ(many.waves, one.waves << 26);
+  VCHECK_EQ(many.instructions, one.instructions << 26);
+  VCHECK_EQ(many.counts.salu, one.counts.salu << 26);
+  VCHECK_EQ(many.waves_lt64, one.waves_lt64 << 26);
+  VCHECK(seconds < 5.0);   // 64 million groups, each run, take minutes
+}
+
 VTEST(lds_64_bit_read_modify_writes_and_the_scalar_bit_operations_compute_what_the_isa_says) {
   const amd::CodeObject o = object("asm_lds64");
   MemoryManager mem(16ull << 20);

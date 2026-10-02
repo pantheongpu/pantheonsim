@@ -178,16 +178,6 @@ int main(void) {
   }
 
   /* ---- error paths ---- */
-  /* Kernel-side out-of-bounds: lie about n so threads index past the buffers. */
-  CUdeviceptr small_a, small_b, small_c;
-  CHECK(cuMemAlloc(&small_a, 16 * sizeof(float)));
-  CHECK(cuMemAlloc(&small_b, 16 * sizeof(float)));
-  CHECK(cuMemAlloc(&small_c, 16 * sizeof(float)));
-  unsigned int lie = 64;
-  void* bad_params[] = {&small_a, &small_b, &small_c, &lie};
-  EXPECT(cuLaunchKernel(fn, 1, 1, 1, 64, 1, 1, 0, NULL, bad_params, NULL),
-         CUDA_ERROR_ILLEGAL_ADDRESS);
-
   /* Block size beyond the profile limit. */
   EXPECT(cuLaunchKernel(fn, 1, 1, 1, 2048, 1, 1, 0, NULL, params, NULL), CUDA_ERROR_INVALID_VALUE);
 
@@ -201,11 +191,22 @@ int main(void) {
   EXPECT(cuMemFree(da), CUDA_ERROR_INVALID_VALUE);
   CHECK(cuMemFree(db));
   CHECK(cuMemFree(dc));
-  CHECK(cuMemFree(small_a));
-  CHECK(cuMemFree(small_b));
-  CHECK(cuMemFree(small_c));
 
-  CHECK(cuModuleUnload(mod));
+  /* Last, because it kills the context: a kernel-side out-of-bounds access
+   * (lie about n so threads index past the buffers). As on the card, the
+   * launch succeeds -- the kernel has not run when it returns -- and the
+   * next call that needs the context reports the fault, as does every call
+   * after it. */
+  CUdeviceptr small_a, small_b, small_c;
+  CHECK(cuMemAlloc(&small_a, 16 * sizeof(float)));
+  CHECK(cuMemAlloc(&small_b, 16 * sizeof(float)));
+  CHECK(cuMemAlloc(&small_c, 16 * sizeof(float)));
+  unsigned int lie = 64;
+  void* bad_params[] = {&small_a, &small_b, &small_c, &lie};
+  CHECK(cuLaunchKernel(fn, 1, 1, 1, 64, 1, 1, 0, NULL, bad_params, NULL));
+  EXPECT(cuCtxSynchronize(), CUDA_ERROR_ILLEGAL_ADDRESS);
+  EXPECT(cuMemFree(small_a), CUDA_ERROR_ILLEGAL_ADDRESS);
+
   CHECK(cuCtxDestroy(ctx));
 
   printf("PASS\n");

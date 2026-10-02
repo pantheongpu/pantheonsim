@@ -1264,7 +1264,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_ex_paths:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1654,6 +1654,17 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Conditional graph nodes -- IF, IF/ELSE, WHILE and SWITCH, decided by a
+# kernel's cudaGraphSetConditional -- and capture into an existing graph.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_graph_conditional COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_conditional.sh)
+  set_tests_properties(e2e_graph_conditional PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 600)
+endif()
+
 # Checks on the code rather than on behaviour, each guarding a class of bug that
 # shipped once: an entry point that puts work on a stream without knowing about
 # capture (the work goes missing from every replay), and a shim library with a
@@ -1893,6 +1904,14 @@ if(TARGET vgpucudart)
   # The runtime and driver APIs sharing one simulated machine.
   add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
   set_tests_properties(e2e_mixed_apis PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # A kernel's fault reported by the calls after its launch, not by the
+  # launch, from the runtime and the driver, as an RTX 3060 reports it.
+  add_test(NAME e2e_deferred_errors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_deferred_errors.sh)
+  set_tests_properties(e2e_deferred_errors PROPERTIES
     DEPENDS "vgpucudart;vgpucuda"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"

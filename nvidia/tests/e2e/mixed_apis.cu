@@ -210,6 +210,41 @@ int main() {
     std::free(h);
   }
 
+  // One record of pinned memory, too: on the card the driver reports the flags
+  // of memory the runtime pinned -- what was asked for, and DEVICEMAP always --
+  // the runtime reports the driver's, and either API frees what the other
+  // allocated. The driver used to keep its own list and answer the runtime's
+  // pinned memory with INVALID_VALUE.
+  {
+    const size_t bytes = 1 << 20;   // whole allocations of their own, not carved from a shared one
+    void *a = nullptr, *b = nullptr, *c = nullptr;
+    unsigned f = 0;
+    expect("cudaMallocHost", cudaMallocHost(&a, bytes) == cudaSuccess);
+    expect("the driver reports its flags", cuMemHostGetFlags(&f, a) == CUDA_SUCCESS && f == CU_MEMHOSTALLOC_DEVICEMAP);
+    f = 0;
+    expect("inside it too", cuMemHostGetFlags(&f, static_cast<char*>(a) + 100) == CUDA_SUCCESS &&
+                                f == CU_MEMHOSTALLOC_DEVICEMAP);
+    CUdeviceptr dp = 0;
+    expect("and maps it", cuMemHostGetDevicePointer(&dp, a, 0) == CUDA_SUCCESS && dp == reinterpret_cast<CUdeviceptr>(a));
+    // Not PORTABLE: the card's own pinned allocator sometimes drops it from the
+    // report (the first portable allocation after a cudaMallocHost answered
+    // DEVICEMAP alone, the second PORTABLE | DEVICEMAP).
+    expect("cudaHostAlloc write-combined", cudaHostAlloc(&b, bytes, cudaHostAllocWriteCombined) == cudaSuccess);
+    f = 0;
+    expect("the driver reports write-combined and mapped",
+           cuMemHostGetFlags(&f, b) == CUDA_SUCCESS && f == (CU_MEMHOSTALLOC_WRITECOMBINED | CU_MEMHOSTALLOC_DEVICEMAP));
+    expect("cuMemHostAlloc device-mapped", cuMemHostAlloc(&c, bytes, CU_MEMHOSTALLOC_DEVICEMAP) == CUDA_SUCCESS);
+    f = 0;
+    expect("the runtime reports the driver's flags", cudaHostGetFlags(&f, c) == cudaSuccess && f == cudaHostAllocMapped);
+    expect("the driver frees the runtime's", cuMemFreeHost(a) == CUDA_SUCCESS);
+    expect("and then the runtime has nothing to free", cudaFreeHost(a) == cudaErrorInvalidValue);
+    cudaGetLastError();
+    expect("and the driver no flags to report", cuMemHostGetFlags(&f, a) == CUDA_ERROR_INVALID_VALUE);
+    expect("the runtime frees the driver's", cudaFreeHost(c) == cudaSuccess);
+    expect("and then the driver has nothing to free", cuMemFreeHost(c) == CUDA_ERROR_INVALID_VALUE);
+    expect("cudaFreeHost", cudaFreeHost(b) == cudaSuccess);
+  }
+
   std::printf(fails ? "FAIL\n" : "PASS\n");
   return fails != 0;
 }

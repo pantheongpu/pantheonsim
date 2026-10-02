@@ -46,6 +46,39 @@ static const char* kPtx = R"(
 }
 )";
 
+// A module with __managed__ globals, as nvcc emits them for
+// "__managed__ int counter = 5; __managed__ float scaled[4] = {1, 2, 3, 4};",
+// and a kernel that updates both.
+static const char* kManagedPtx = R"(
+.version 7.0
+.target sm_80
+.address_size 64
+.global .attribute(.managed) .align 4 .u32 counter = 5;
+.global .attribute(.managed) .align 4 .b8 scaled[16] = {0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64};
+.global .align 4 .u32 plain = 9;
+.visible .entry bump()
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<4>;
+    .reg .f32 %f<3>;
+    .reg .b64 %rd<4>;
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p1, %r1, 0;
+    @%p1 bra scale;
+    ld.global.u32 %r2, [counter];
+    add.u32 %r3, %r2, 10;
+    st.global.u32 [counter], %r3;
+scale:
+    mov.u64 %rd1, scaled;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.s64 %rd3, %rd1, %rd2;
+    ld.global.f32 %f1, [%rd3];
+    add.f32 %f2, %f1, %f1;
+    st.global.f32 [%rd3], %f2;
+    ret;
+}
+)";
+
 static int host_calls = 0;
 static void on_host(void* p) { host_calls += *static_cast<int*>(p); }
 
@@ -164,6 +197,44 @@ int main() {
   IS(cuMemFree(a), CUDA_SUCCESS);
   cuMemFree(d);
   cuModuleUnload(mod);
+
+  // A module's __managed__ globals, loaded through the driver: managed memory
+  // at the address cuModuleGetGlobal returns, holding the initial values, that
+  // the host reads and writes in place and a kernel's writes reach -- as an
+  // RTX 3060 has it. They used to be ordinary device memory.
+  {
+    CUmodule mm = nullptr;
+    CUfunction bump = nullptr;
+    CUdeviceptr counter = 0, scaled = 0, plain = 0, base = 0;
+    size_t bytes = 0, range = 0;
+    IS(cuModuleLoadData(&mm, kManagedPtx), CUDA_SUCCESS);
+    IS(cuModuleGetFunction(&bump, mm, "bump"), CUDA_SUCCESS);
+    IS(cuModuleGetGlobal(&counter, &bytes, mm, "counter"), CUDA_SUCCESS);
+    check(bytes == 4, "the managed global's size");
+    IS(cuModuleGetGlobal(&scaled, &bytes, mm, "scaled"), CUDA_SUCCESS);
+    check(bytes == 16, "the managed array's size");
+    IS(cuModuleGetGlobal(&plain, nullptr, mm, "plain"), CUDA_SUCCESS);
+    int is_managed = -1;
+    IS(cuPointerGetAttribute(&is_managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, counter), CUDA_SUCCESS);
+    check(is_managed == 1, "a managed global is managed memory");
+    is_managed = -1;
+    IS(cuPointerGetAttribute(&is_managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, plain), CUDA_SUCCESS);
+    check(is_managed == 0, "a plain global is not");
+    IS(cuMemGetAddressRange(&base, &range, counter), CUDA_SUCCESS);
+    check(base == counter && range == 4, "its allocation is the variable");
+    auto* hc = reinterpret_cast<unsigned*>(counter);
+    auto* hs = reinterpret_cast<float*>(scaled);
+    check(*hc == 5 && hs[1] == 2.0f, "the host reads the initial values in place");
+    *hc = 100;
+    IS(cuLaunchKernel(bump, 1, 1, 1, 4, 1, 1, 0, nullptr, nullptr, nullptr), CUDA_SUCCESS);
+    IS(cuCtxSynchronize(), CUDA_SUCCESS);
+    check(*hc == 110, "the kernel saw the host's write, and the host sees the kernel's");
+    check(hs[0] == 2.0f && hs[1] == 4.0f && hs[2] == 6.0f && hs[3] == 8.0f, "the managed array, scaled in place");
+    unsigned via_copy = 0;
+    IS(cuMemcpyDtoH(&via_copy, counter, sizeof via_copy), CUDA_SUCCESS);
+    check(via_copy == 110, "a copy reads it too");
+    IS(cuModuleUnload(mm), CUDA_SUCCESS);
+  }
   cuStreamDestroy(s);
   std::printf(failures ? "FAIL: %d managed-memory checks\n" : "PASS: every managed-memory check\n", failures);
   return failures ? 1 : 0;
