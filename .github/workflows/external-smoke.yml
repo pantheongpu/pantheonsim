@@ -1,6 +1,6 @@
 name: External suites smoke
 
-# A fast subset of the nightly's outside suites (ci/external/smoke.txt: 14 CUDA
+# A fast subset of the nightly's outside suites (ci/external/smoke.txt: 13 CUDA
 # Samples, 12 HeCBench benchmarks, 4 Rodinia apps, 7 PolyBench kernels) on
 # pull requests that change the simulator, so a regression shows on the pull
 # request rather than in the next morning's run. Each program is checked twice:
@@ -8,7 +8,8 @@ name: External suites smoke
 #   card    against an RTX 3060's results, as the nightly checks them;
 #   digest  SASS against PTX: run on each engine with VGPU_KERNEL_DIGEST, the
 #           device memory after every kernel must hold the same bytes (the
-#           e2e programs' digest is sass-ptx.yml's).
+#           e2e programs' digest is sass-ptx.yml's). The differences known
+#           and not yet reconciled are listed in ci/external/digest-known.txt.
 #
 # On a GitHub-hosted runner in the cuda13.0 toolchain image (CUDA 13.0, what
 # the card's binaries were built with), not the pantheonsim.com runner the
@@ -79,12 +80,11 @@ jobs:
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
 
-      - name: Build the runtime and driver shims
-        # The subset's programs call the runtime (and through it the driver);
-        # none needs a library shim.
+      - name: Build the shims the subset loads
+        # The runtime and the driver, and cuRAND (MC_EstimatePiP).
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target vgpucudart vgpucuda
+          cmake --build build -j"$(nproc)" --target vgpucudart vgpucuda vgpucurand
 
       - name: The subsets
         id: subsets

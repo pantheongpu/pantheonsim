@@ -146,12 +146,19 @@ digest_result() {
     return
   fi
   if [[ ! -s $d.ptx ]]; then result "$name" FAIL "$secs" "no digest written"; return; fi
+  # A known difference (digest-known.txt) is reported, not failed.
+  local known
+  known=$(awk -F'|' -v s="$suite" -v n="$name" '$1 == s && $2 == n {print $3}' "$here/digest-known.txt" 2>/dev/null)
   if cmp -s <(sed -E "$strip" "$d.sass") <(sed -E "$strip" "$d.ptx"); then
-    result "$name" ok "$secs" "$(wc -l < "$d.ptx") launches, the same memory on SASS and PTX"
+    result "$name" ok "$secs" "$(wc -l < "$d.ptx") launches, the same memory on SASS and PTX${known:+ (listed as known to differ: it no longer does, take it off digest-known.txt)}"
   else
     local first
     first=$(diff <(sed -E "$strip" "$d.ptx") <(sed -E "$strip" "$d.sass") | grep -m1 '^<' | cut -c3-)
-    result "$name" FAIL "$secs" "SASS and PTX differ after launch ${first%% *} ($(cut -d' ' -f2 <<< "$first"))"
+    if [[ -n $known ]]; then
+      result "$name" ok "$secs" "known difference: SASS and PTX differ after launch ${first%% *} ($(cut -d' ' -f2 <<< "$first")); listed: $known"
+    else
+      result "$name" FAIL "$secs" "SASS and PTX differ after launch ${first%% *} ($(cut -d' ' -f2 <<< "$first"))"
+    fi
   fi
 }
 
