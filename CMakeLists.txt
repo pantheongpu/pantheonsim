@@ -648,6 +648,29 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating cuDSS shim symlinks (build/shim/libcudss.so.0)")
 
   # ---------------------------------------------------------------------------
+  # libvgpucufile: cuFile (GPUDirect Storage), presented as libcufile.so.0. A
+  # simulated GPU has no nvidia-fs, so this is cuFile's compatibility mode:
+  # POSIX I/O staged through host memory into simulated device memory, with
+  # NVIDIA's statuses (nvidia/src/cufile_api.cpp, declarations in
+  # nvidia/include/vgpu_cufile.h, since CUDA 12.0's toolkit has no cufile.h).
+  # NVIDIA's exports its symbols with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_cufile_map "${CMAKE_BINARY_DIR}/maps/libcufile.so.0.map")
+  file(WRITE "${_cufile_map}" "{\n  global: cuFile*;\n  local: *;\n};\n")
+  add_library(vgpucufile SHARED nvidia/src/cufile_api.cpp)
+  target_link_libraries(vgpucufile PRIVATE vgpucudart)
+  target_include_directories(vgpucufile PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucufile PROPERTIES OUTPUT_NAME cufile SOVERSION 0 VERSION 0.15)
+  target_link_options(vgpucufile PRIVATE "-Wl,--version-script=${_cufile_map}")
+  add_custom_command(TARGET vgpucufile POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcufile.so.0.15"
+            "${CMAKE_BINARY_DIR}/shim/libcufile.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcufile.so.0.15"
+            "${CMAKE_BINARY_DIR}/shim/libcufile.so"
+    COMMENT "Creating cuFile shim symlinks (build/shim/libcufile.so.0)")
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -1335,7 +1358,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile"
                  "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)

@@ -75,6 +75,7 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #include "vgpu/telemetry.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
+#include "vgpu/runtime/shim_memory.hpp"
 
 namespace {
 
@@ -4841,6 +4842,27 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
   p.height = 1;
   cudaError_t rc = cudaSuccess;
   return vgpu_record_fill_if_capturing(p, stream, &rc);
+}
+
+// For the library shims (cuFile, nvCOMP, NVSHMEM): the device allocation that
+// holds `p`, on whichever simulated device owns it. False for host memory, a
+// device-heap block and an address no allocation covers -- a shim that is
+// handed one of those refuses it itself rather than letting a copy fail.
+bool vgpu_device_allocation(const void* p, void** base, size_t* size) {
+  bool found = false;
+  guard_query("vgpu_device_allocation", [&](State& s) {
+    const uint64_t addr = reinterpret_cast<uint64_t>(p);
+    if (!vgpu::is_device_va(addr)) return cudaSuccess;
+    vgpu::MemoryManager& mm = owner_memory(s, p);
+    if (mm.heap_contains(addr)) return cudaSuccess;
+    uint64_t b = 0, sz = 0;
+    if (!mm.find_allocation(addr, &b, &sz)) return cudaSuccess;
+    if (base) *base = reinterpret_cast<void*>(b);
+    if (size) *size = static_cast<size_t>(sz);
+    found = true;
+    return cudaSuccess;
+  });
+  return found;
 }
 
 // Records a host-computed library call during capture. Returns true when it was

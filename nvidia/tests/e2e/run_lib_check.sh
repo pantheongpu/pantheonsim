@@ -38,10 +38,11 @@ for lib in "$@"; do
   if (( ${#have[@]} == 0 )); then
     echo "SKIP: the $lib shim is not built (CUDA ABI headers absent at build time)"; exit 0
   fi
-  # cuStateVec, cuDSS and cuDNN are not part of the toolkit, so nvcc has no
-  # copy to link against: link against the shim's, which follows NVIDIA's ABI.
-  # cuDNN's headers are vendored.
-  [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cudnn ]] && links+=("-L$shim")
+  # cuStateVec, cuDSS, cuDNN and nvCOMP are not part of the toolkit, and
+  # cuFile is not part of CUDA 12.0's, so nvcc has no copy to link against:
+  # link against the shim's, which follows NVIDIA's ABI. cuDNN's headers are
+  # vendored; the others' are the simulator's own (nvidia/include/vgpu_*.h).
+  [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cudnn || "$lib" == cufile || "$lib" == nvcomp ]] && links+=("-L$shim")
   [[ "$lib" == cudnn ]] && links+=("-I$root/nvidia/third_party/cudnn_include")
   links+=("-l$lib")
 done
