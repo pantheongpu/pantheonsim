@@ -737,6 +737,13 @@ std::string sreg_name(unsigned idx) {
     case 0x52: return "SR_GLOBALTIMERLO";
     case 0x53: return "SR_GLOBALTIMERHI";
     case 0x80: return "SR_PM0";
+    case 0x81: return "SR_PM1";
+    case 0x82: return "SR_PM2";
+    case 0x83: return "SR_PM3";
+    case 0x84: return "SR_PM4";
+    case 0x85: return "SR_PM5";
+    case 0x86: return "SR_PM6";
+    case 0x87: return "SR_PM7";
     default: {
       char b[16];
       std::snprintf(b, sizeof b, "SR%u", idx);

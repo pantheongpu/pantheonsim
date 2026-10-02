@@ -59,5 +59,23 @@ log="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out.sass" 2>&
 echo "$log" | sed "s/^/    sass-on-h100: /"
 grep -qE "launch: cudaErrorNoKernelImageForDevice" <<< "$log" ||
   { echo "FAIL: SASS for another architecture was not refused"; fails=1; }
+# A performance-monitor counter is refused by name whichever code runs: the
+# fatbin falls back from SASS that reads SR_PM0 to PTX that names %pm0, and
+# SASS alone refuses it at the instruction.
+pm="$root/nvidia/tests/e2e/pm_counter.cu"
+if "$nvcc_bin" -arch=sm_86 -cudart shared -Wno-deprecated-gpu-targets "${san_flags[@]}" "$pm" -o "$out.pm-both" &&
+   "$nvcc_bin" -gencode arch=compute_86,code=sm_86 -cudart shared -Wno-deprecated-gpu-targets "${san_flags[@]}" \
+     "$pm" -o "$out.pm-sass"; then
+  for v in both sass; do
+    log="$(VGPU_SASS_LOG=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$out.pm-$v" 2>&1)"
+    rc=$?
+    echo "$log" | sed "s/^/    pm-counter-$v: /"
+    if [[ $rc == 0 ]] || ! grep -q "performance-monitor counter" <<< "$log"; then
+      echo "FAIL: pm-counter-$v: %pm0 was not refused by name"; fails=1
+    fi
+  done
+else
+  echo "FAIL: pm_counter.cu does not compile"; fails=1
+fi
 [[ $fails == 0 ]] && echo "PASS" || echo "FAIL: sass path"
 exit $fails
