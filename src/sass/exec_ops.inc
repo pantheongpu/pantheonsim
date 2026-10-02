@@ -2028,8 +2028,13 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (is64) write64(w, d, l, old);
           else write32(w, d, l, static_cast<uint32_t>(old));
           // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
+          // The .64 form's flag is the whole register pair: ptxas's loop
+          // after it (sm_86's atomicAdd of a double in shared memory, as
+          // CUDA Samples' jacobiCudaGraphs does) tests Rd == 1 and Rd+1 == 0,
+          // so leaving the old value's high word in Rd+1 spun forever.
           if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
             if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
+            else if (is64) write64(w, d, l, old == v ? 1 : 0);
             else write32(w, d, l, old == v ? 1 : 0);
           }
         }
