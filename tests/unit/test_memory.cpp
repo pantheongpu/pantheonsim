@@ -1154,3 +1154,96 @@ VTEST(a_mapping_of_shared_memory_sees_the_same_bytes) {
   owner.free(p);
   VCHECK(!std::filesystem::exists(path));
 }
+
+// ---- the device heap (malloc and free in a kernel) -----------------------
+
+// The heap's limit is a budget of bytes asked for: up to it a block, past it
+// null rather than an error, and a request so large the sum would wrap is
+// past it too.
+VTEST(the_device_heap_returns_null_past_its_limit) {
+  MemoryManager mm(64 << 20);
+  const uint64_t limit = 8 << 20;
+  const uint64_t a = mm.heap_alloc(6 << 20, limit);
+  VCHECK(a != 0);
+  VCHECK_EQ(mm.heap_used(), uint64_t{6 << 20});
+  VCHECK_EQ(mm.heap_alloc(3 << 20, limit), uint64_t{0});
+  VCHECK_EQ(mm.heap_alloc(0, limit), uint64_t{0});
+  VCHECK_EQ(mm.heap_alloc(~uint64_t{0}, limit), uint64_t{0});
+  VCHECK_EQ(mm.heap_alloc(~uint64_t{0} - (1 << 20), limit), uint64_t{0});
+  const uint64_t b = mm.heap_alloc(2 << 20, limit);   // exactly the rest
+  VCHECK(b != 0);
+  VCHECK_EQ(mm.heap_alloc(1, limit), uint64_t{0});
+  VCHECK_EQ(mm.heap_used(), limit);
+  // Blocks are ordinary allocations, of the size asked for.
+  uint64_t base = 0, size = 0;
+  VCHECK(mm.find_allocation(b + 100, &base, &size));
+  VCHECK_EQ(base, b);
+  VCHECK_EQ(size, uint64_t{2 << 20});
+  VCHECK_EQ(mm.used(), limit);
+}
+
+// free() gives the bytes back to the budget; a pointer the heap did not hand
+// out -- cudaMalloc's, an interior one, one already freed -- is refused with
+// nothing changed, for the engine to report.
+VTEST(the_device_heap_refunds_a_free_and_refuses_what_it_did_not_allocate) {
+  MemoryManager mm(64 << 20);
+  const uint64_t limit = 8 << 20;
+  const uint64_t a = mm.heap_alloc(6 << 20, limit);
+  const uint64_t host = mm.alloc(4096);
+  VCHECK(!mm.heap_free(host));
+  uint64_t base = 0, size = 0;
+  VCHECK(mm.find_allocation(host, &base, &size));   // still live
+  VCHECK(!mm.heap_free(a + 256));
+  VCHECK_EQ(mm.heap_used(), uint64_t{6 << 20});
+  VCHECK(mm.heap_free(a));
+  VCHECK_EQ(mm.heap_used(), uint64_t{0});
+  VCHECK(!mm.heap_free(a));   // twice
+  // The freed block is quarantined like any other: a use after free is named.
+  uint8_t byte = 0;
+  VCHECK(VCAPTURE(Error, mm.read(a, &byte, 1)).code() == Err::UseAfterFree);
+  VCHECK(mm.heap_alloc(8 << 20, limit) != 0);   // the whole budget is back
+  mm.free(host);
+}
+
+// A device reset frees the heap's blocks with everything else and gives the
+// budget back, so blocks a program leaked before it do not count after.
+VTEST(a_device_reset_empties_the_device_heap) {
+  MemoryManager mm(64 << 20);
+  const uint64_t limit = 8 << 20;
+  uint64_t leaked[3];
+  for (uint64_t& p : leaked) {
+    p = mm.heap_alloc(2 << 20, limit);
+    VCHECK(p != 0);
+  }
+  mm.free_all();
+  VCHECK_EQ(mm.heap_used(), uint64_t{0});
+  VCHECK_EQ(mm.live_allocations(), size_t{0});
+  for (uint64_t p : leaked) VCHECK(!mm.heap_free(p));   // not the heap's any more
+  VCHECK(mm.heap_alloc(limit - 256, limit) != 0);
+}
+
+// When the device's memory runs out before the heap's limit, malloc still
+// returns null rather than failing.
+VTEST(the_device_heap_returns_null_when_device_memory_is_full) {
+  MemoryManager mm(1 << 20);
+  VCHECK_EQ(mm.heap_alloc(2 << 20, 8 << 20), uint64_t{0});
+  VCHECK_EQ(mm.heap_used(), uint64_t{0});
+  VCHECK(mm.heap_alloc(1 << 20, 8 << 20) != 0);
+}
+
+// Blocks run on several host threads: however their mallocs interleave, the
+// heap hands out exactly its limit and no more.
+VTEST(the_device_heap_holds_its_limit_across_threads) {
+  MemoryManager mm(256 << 20);
+  const uint64_t limit = 1 << 20, each = 4096;
+  std::atomic<uint64_t> got{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 8; ++t)
+    threads.emplace_back([&] {
+      for (int i = 0; i < 64; ++i)
+        if (mm.heap_alloc(each, limit)) got += each;
+    });
+  for (std::thread& t : threads) t.join();
+  VCHECK_EQ(got.load(), limit);
+  VCHECK_EQ(mm.heap_used(), limit);
+}

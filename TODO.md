@@ -106,7 +106,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   a kernel that calls malloc/free or printf has launched, decided from the
   kernel's code. Stack and printf-buffer sizes are recorded and reported but
   bound nothing here. e2e_device_limits allocates up to a raised limit and one
-  past it.
+  past it. The heap is one per device whichever engine a kernel runs on (the
+  device's memory manager keeps it): a block one kernel allocates a later one
+  may free, SASS or PTX, free() refunds the budget, and cudaDeviceReset empties
+  it -- blocks leaked before a reset used to keep counting against the limit.
+  e2e_device_heap, both engines and across them (an RTX 3060 passes it).
 - A capture records everything a stream is given. Several entry points ran their
   work the moment they were called on a capturing stream, so the graph came back
   without it and every replay silently left it out: 2D copies and fills, copies
@@ -640,8 +644,9 @@ past that it stops being caution and starts being a false negative.
 
 **Vendor libraries.** cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
 cuSOLVER, NCCL, NVRTC, NPP and nvJPEG are implemented under their real sonames, each verified
-against NVIDIA's own library on a physical GPU: cuDNN, cuFFT and cuSPARSE are
-bit-identical on every value the conformance suite reports, cuSOLVER on
+against NVIDIA's own library on a physical GPU: cuFFT and cuSPARSE are
+bit-identical on every value the conformance suite reports, cuDNN on its
+forward suite and to 1e-6 relative on its training suite, cuSOLVER on
 everything but one f32 eigenvalue, and NCCL on all 24 values at two ranks
 across two physical GPUs. The math runs on the host rather than through the
 interpreter, because a vendor library is not user code — see nvidia/docs/libraries.md

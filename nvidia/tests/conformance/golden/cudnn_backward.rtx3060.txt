@@ -1,0 +1,174 @@
+conv 3x3 pad1 y=2 6 8 8 
+conv 3x3 pad1 fwd                        n=768 abs=7.995666e+02 sq=1.152485e+03 wabs=3.191166e+03
+conv 3x3 pad1 bwd-data a.5 b.25          n=512 abs=1.777638e+02 sq=9.154170e+01 wabs=7.042753e+02
+conv 3x3 pad1 bwd-filter                 n=216 abs=4.076964e+03 sq=9.384150e+04 wabs=1.628126e+04
+conv 3x3 pad1 bwd-bias a.5 b.25          n=6 abs=3.016126e+00 sq=1.802456e+00 wabs=1.117085e+01
+conv 3x2 pad2 s2 d2 y=1 4 5 5 
+conv 3x2 pad2 s2 d2 fwd                  n=100 abs=2.079008e+01 sq=6.712077e+00 wabs=8.080923e+01
+conv 3x2 pad2 s2 d2 bwd-data a.5 b.25    n=216 abs=2.071989e+01 sq=4.818022e+00 wabs=8.186155e+01
+conv 3x2 pad2 s2 d2 bwd-filter           n=72 abs=4.527533e+01 sq=4.339425e+01 wabs=1.822952e+02
+conv 3x2 pad2 s2 d2 bwd-bias a.5 b.25    n=4 abs=1.378286e+00 sq=7.593790e-01 wabs=2.779944e+00
+conv flipped g2 y=2 6 7 7 
+conv flipped g2 fwd                      n=588 abs=2.535803e+02 sq=1.701414e+02 wabs=1.006421e+03
+conv flipped g2 bwd-data a.5 b.25        n=392 abs=1.077744e+02 sq=4.480760e+01 wabs=4.371779e+02
+conv flipped g2 bwd-filter               n=108 abs=2.242014e+03 sq=5.532340e+04 wabs=8.801602e+03
+conv flipped g2 bwd-bias a.5 b.25        n=6 abs=8.833789e+00 sq=1.330177e+01 wabs=3.220541e+01
+conv depthwise s2 y=1 4 3 3 
+conv depthwise s2 fwd                    n=36 abs=3.266671e+01 sq=3.822301e+01 wabs=1.302620e+02
+conv depthwise s2 bwd-data a.5 b.25      n=144 abs=1.778549e+01 sq=3.325032e+00 wabs=6.772077e+01
+conv depthwise s2 bwd-filter             n=36 abs=6.127918e+01 sq=1.362852e+02 wabs=2.487346e+02
+conv depthwise s2 bwd-bias a.5 b.25      n=4 abs=2.618668e-01 sq=3.250054e-02 wabs=6.104334e-01
+conv nhwc 3x3 y=2 4 5 6 
+conv nhwc 3x3 fwd                        n=240 abs=8.141987e+02 sq=3.265672e+03 wabs=3.248938e+03
+conv nhwc 3x3 bwd-data a.5 b.25          n=180 abs=5.604385e+01 sq=3.236247e+01 wabs=2.303898e+02
+conv nhwc 3x3 bwd-filter                 n=108 abs=8.881040e+01 sq=1.030274e+02 wabs=3.694502e+02
+conv nhwc 3x3 bwd-bias a.5 b.25          n=4 abs=1.086302e+00 sq=3.718031e-01 wabs=3.290712e+00
+conv strided rows y=2 2 4 3 
+conv strided rows fwd                    n=93 abs=3.072564e+01 sq=1.464844e+01 wabs=1.194322e+02
+conv strided rows bwd-data a.5 b.25      n=355 abs=7.960837e+01 sq=2.855639e+01 wabs=3.173854e+02
+conv strided rows bwd-filter             n=54 abs=1.176168e+02 sq=3.195527e+02 wabs=4.578216e+02
+conv strided rows bwd-bias a.5 b.25      n=2 abs=1.364293e+00 sq=9.327827e-01 wabs=2.079114e+00
+conv 3-D y=1 3 5 5 5 
+conv 3-D fwd                             n=375 abs=7.821254e+02 sq=2.225865e+03 wabs=3.170184e+03
+conv 3-D bwd-data a.5 b.25               n=200 abs=3.291974e+02 sq=7.628756e+02 wabs=1.327140e+03
+conv 3-D bwd-filter                      n=108 abs=2.111313e+03 sq=5.207600e+04 wabs=8.473292e+03
+conv 3-D bwd-bias a.5 b.25               n=3 abs=8.257224e-01 sq=2.289077e-01 wabs=1.660778e+00
+conv double s2 y=2 4 3 3 
+conv double s2 fwd                       n=72 abs=1.590318e+02 sq=4.407133e+02 wabs=6.278519e+02
+conv double s2 bwd-data a.5 b.25         n=216 abs=1.015354e+02 sq=6.411960e+01 wabs=3.951284e+02
+conv double s2 bwd-filter                n=108 abs=3.661720e+02 sq=1.623427e+03 wabs=1.464882e+03
+conv double s2 bwd-bias a.5 b.25         n=4 abs=3.930639e-01 sq=5.935626e-02 wabs=9.925821e-01
+conv-bias-relu                           n=200 abs=1.741179e+02 sq=4.381250e+02 wabs=6.328954e+02
+conv-bias-identity                       n=200 abs=3.145517e+02 sq=7.336180e+02 wabs=1.229833e+03
+conv-bias-sigmoid status 3000
+act bwd relu a2 b.5                      n=120 abs=7.839232e+01 sq=1.026944e+02 wabs=3.116579e+02
+act bwd relu nhwc                        n=120 abs=3.828475e+01 sq=3.161790e+01 wabs=1.522701e+02
+act bwd sigmoid a2 b.5                   n=120 abs=1.296751e+01 sq=2.011898e+00 wabs=5.209796e+01
+act bwd sigmoid nhwc                     n=120 abs=1.406535e+01 sq=1.988594e+00 wabs=5.541842e+01
+act bwd tanh a2 b.5                      n=120 abs=4.240349e+01 sq=2.219971e+01 wabs=1.694887e+02
+act bwd tanh nhwc                        n=120 abs=2.968953e+01 sq=9.854462e+00 wabs=1.179679e+02
+act bwd clipped relu 0.8 a2 b.5          n=120 abs=3.000891e+01 sq=1.700970e+01 wabs=1.243792e+02
+act bwd clipped relu 0.8 nhwc            n=120 abs=7.644050e+00 sq=4.487893e+00 wabs=3.431819e+01
+act bwd elu 0.6 a2 b.5                   n=120 abs=7.797571e+01 sq=1.026097e+02 wabs=3.102475e+02
+act bwd elu 0.6 nhwc                     n=120 abs=4.710619e+01 sq=3.320694e+01 wabs=1.870147e+02
+act bwd swish a2 b.5                     n=120 abs=8.032812e+01 sq=1.106591e+02 wabs=3.179146e+02
+act bwd swish nhwc                       n=120 abs=4.270036e+01 sq=3.392394e+01 wabs=1.695128e+02
+pool bwd max 2x2 s2                      n=252 abs=8.041791e+01 sq=6.832185e+01 wabs=3.219130e+02
+pool bwd max 3x3 p1 s1                   n=252 abs=7.676266e+01 sq=7.452038e+01 wabs=3.184990e+02
+pool bwd max-det 3x3 p1 s2               n=252 abs=8.187181e+01 sq=8.617584e+01 wabs=3.437918e+02
+pool bwd avg incl 3x3 p1 s2              n=252 abs=4.696610e+01 sq=1.375185e+01 wabs=2.122809e+02
+pool bwd avg excl 3x3 p1 s2              n=252 abs=5.825407e+01 sq=2.110840e+01 wabs=2.563455e+02
+pool 3-D max fwd                         n=24 abs=3.710006e+01 sq=6.652307e+01 wabs=1.440736e+02
+pool 3-D max bwd                         n=120 abs=1.549012e+01 sq=1.378299e+01 wabs=6.391130e+01
+softmax bwd algo 0 mode 0                n=60 abs=7.047933e+00 sq=1.160298e+00 wabs=2.794251e+01
+softmax bwd algo 0 mode 1                n=60 abs=1.015507e+01 sq=2.611135e+00 wabs=4.261480e+01
+softmax bwd algo 1 mode 0                n=60 abs=7.047933e+00 sq=1.160298e+00 wabs=2.794251e+01
+softmax bwd algo 1 mode 1                n=60 abs=1.015507e+01 sq=2.611134e+00 wabs=4.261479e+01
+softmax bwd algo 2 mode 0                n=60 abs=7.687780e+01 sq=1.248034e+02 wabs=3.079721e+02
+softmax bwd algo 2 mode 1                n=60 abs=7.657236e+01 sq=1.310179e+02 wabs=3.112254e+02
+lrn n=5 fwd                              n=84 abs=5.268518e+01 sq=4.108641e+01 wabs=2.111263e+02
+lrn n=5 bwd                              n=84 abs=3.398783e+01 sq=1.695129e+01 wabs=1.359130e+02
+lrn n=4 fwd                              n=84 abs=5.237177e+01 sq=4.047248e+01 wabs=2.100832e+02
+lrn n=4 bwd                              n=84 abs=3.384888e+01 sq=1.676836e+01 wabs=1.355313e+02
+lrn n=1 fwd                              n=84 abs=4.920620e+01 sq=3.400530e+01 wabs=1.971930e+02
+lrn n=1 bwd                              n=84 abs=2.838014e+01 sq=1.383316e+01 wabs=1.136524e+02
+reduce op 0 to 1x3x1x1                   n=3 abs=1.120565e+01 sq=5.205407e+01 wabs=2.456976e+01
+reduce op 0 to 2x1x4x1                   n=8 abs=6.058390e+01 sq=5.488772e+02 wabs=2.632450e+02
+reduce op 0 to 1x1x1x1                   n=1 abs=7.675579e+00 sq=5.891451e+01 wabs=7.675579e+00
+reduce op 0 to 2x3x4x1                   n=24 abs=1.278900e+02 sq=8.477540e+02 wabs=4.445609e+02
+reduce op 1 to 2x3x4x1                   n=24 abs=6.425378e+01 sq=2.813664e+02 wabs=2.244664e+02
+reduce op 2 to 1x3x1x1                   n=3 abs=8.722952e+00 sq=2.547334e+01 wabs=1.783845e+01
+  indices size 12: 20 36 25
+reduce op 2 to 2x1x4x1                   n=8 abs=2.517671e+01 sq=8.109453e+01 wabs=9.623387e+01
+  indices size 32: 12 1 11 0 0 10 0 6
+reduce op 2 to 1x1x1x1                   n=1 abs=2.803039e+00 sq=7.857029e+00 wabs=2.803039e+00
+  indices size 4: 105
+reduce op 2 to 2x3x4x1                   n=24 abs=5.824864e+01 sq=1.664249e+02 wabs=2.268588e+02
+  indices size 96: 4 1 4 0 4 0 3 0 2 4 1 4 0 4 0 3 0 2 4 1 4 0 4 0
+reduce op 3 to 1x3x1x1                   n=3 abs=1.057274e+01 sq=3.738251e+01 wabs=2.069453e+01
+  indices size 12: 34 9 39
+reduce op 3 to 2x1x4x1                   n=8 abs=2.432127e+01 sq=7.517954e+01 wabs=8.351100e+01
+  indices size 32: 2 9 1 8 8 14 4 14
+reduce op 3 to 1x1x1x1                   n=1 abs=3.747553e+00 sq=1.404416e+01 wabs=3.747553e+00
+  indices size 4: 29
+reduce op 3 to 2x3x4x1                   n=24 abs=5.595682e+01 sq=1.502903e+02 wabs=2.064626e+02
+  indices size 96: 2 4 1 4 0 4 0 3 0 2 4 1 4 0 4 0 3 4 2 4 1 4 0 4
+reduce op 4 to 1x3x1x1                   n=3 abs=1.083632e+01 sq=3.920697e+01 wabs=2.131509e+01
+  indices size 12: 20 9 25
+reduce op 4 to 2x1x4x1                   n=8 abs=2.525521e+01 sq=8.050151e+01 wabs=8.750976e+01
+  indices size 32: 2 9 11 0 0 10 4 6
+reduce op 4 to 1x1x1x1                   n=1 abs=3.794704e+00 sq=1.439978e+01 wabs=3.794704e+00
+  indices size 4: 105
+reduce op 4 to 2x3x4x1                   n=24 abs=7.125205e+01 sq=2.158252e+02 wabs=2.609702e+02
+  indices size 96: 2 1 1 0 0 4 3 3 2 2 1 1 0 4 4 3 3 2 2 1 1 0 4 4
+reduce op 5 to 1x3x1x1                   n=3 abs=1.183848e+00 sq=5.220121e-01 wabs=2.131531e+00
+reduce op 5 to 2x1x4x1                   n=8 abs=3.914885e+00 sq=2.649142e+00 wabs=1.570858e+01
+reduce op 5 to 1x1x1x1                   n=1 abs=5.556636e-01 sq=3.087621e-01 wabs=5.556636e-01
+reduce op 5 to 2x3x4x1                   n=24 abs=2.670054e+01 sq=3.736782e+01 wabs=9.389777e+01
+reduce op 6 to 1x3x1x1                   n=3 abs=2.318755e+02 sq=1.792796e+04 wabs=4.606305e+02
+reduce op 6 to 2x1x4x1                   n=8 abs=2.306079e+02 sq=6.658732e+03 wabs=8.358423e+02
+reduce op 6 to 1x1x1x1                   n=1 abs=2.313670e+02 sq=5.353070e+04 wabs=2.313670e+02
+reduce op 6 to 2x3x4x1                   n=24 abs=2.305230e+02 sq=2.233045e+03 wabs=8.562985e+02
+reduce op 7 to 1x3x1x1                   n=3 abs=4.163818e+01 sq=5.781574e+02 wabs=8.258905e+01
+reduce op 7 to 2x1x4x1                   n=8 abs=6.606005e+01 sq=5.464101e+02 wabs=2.355983e+02
+reduce op 7 to 1x1x1x1                   n=1 abs=2.395735e+01 sq=5.739546e+02 wabs=2.395735e+01
+reduce op 7 to 2x3x4x1                   n=24 abs=1.142050e+02 sq=5.473579e+02 wabs=4.227804e+02
+reduce op 8 to 2x3x4x1                   n=24 abs=6.425378e+01 sq=2.813664e+02 wabs=2.244664e+02
+reduce to the same shape: status 2000
+optensor 0 nhwc, B [2,1,4,5]             n=120 abs=1.204271e+02 sq=1.609090e+02 wabs=4.631571e+02
+optensor 1 nhwc, B [2,1,4,5]             n=120 abs=4.148932e+01 sq=2.006887e+01 wabs=1.614033e+02
+optensor 2 nhwc, B [2,1,4,5]             n=120 abs=7.849746e+01 sq=8.031631e+01 wabs=3.068511e+02
+optensor 3 nhwc, B [2,1,4,5]             n=120 abs=7.935563e+01 sq=8.308628e+01 wabs=3.177599e+02
+optensor 4 nhwc, B [2,1,4,5]             n=120 abs=2.440924e+02 sq=5.538025e+02 wabs=9.789219e+02
+optensor 5 nhwc, B [2,1,4,5]             n=120 abs=1.386830e+02 sq=2.525451e+02 wabs=5.429658e+02
+addtensor bias onto nhwc                 n=120 abs=1.096846e+02 sq=1.399207e+02 wabs=4.342624e+02
+transform nchw float -> nhwc double      n=120 abs=1.158342e+02 sq=1.417080e+02 wabs=4.656341e+02
+  y[0..3] 2.527132e-01 1.235356e+00 -4.649760e-01 9.650152e-01
+dropout reserve: 1000 elements 128 bytes, 7 elements 4 bytes
+dropout forward: 0 values neither 0 nor x/(1-p)
+dropout bwd from a known mask            n=1000 abs=4.546819e+02 sq=5.200827e+02 wabs=1.913143e+03
+dropout bwd with a short reserve: status 2000
+dropout descriptor p 3.000000e-01 seed 42 states kept
+bn nhwc spatial fwd                      n=120 abs=9.886408e+01 sq=1.053922e+02 wabs=3.961024e+02
+bn nhwc spatial dx                       n=120 abs=2.378543e+01 sq=6.877719e+00 wabs=9.523418e+01
+bn nhwc spatial dscale                   n=4 abs=7.953273e+01 sq=1.583772e+03 wabs=2.021971e+02
+bn nhwc spatial dbias                    n=4 abs=2.374411e+00 sq=1.722038e+00 wabs=7.129654e+00
+bn nhwc per-activation fwd               n=120 abs=2.955151e+02 sq=1.039610e+03 wabs=1.173207e+03
+bn nhwc per-activation dx                n=120 abs=6.444530e+01 sq=1.118940e+02 wabs=2.526700e+02
+bn nhwc per-activation dscale            n=40 abs=7.078451e+01 sq=1.542790e+02 wabs=2.860248e+02
+bn nhwc per-activation dbias             n=40 abs=2.652002e+01 sq=2.497607e+01 wabs=1.048377e+02
+bn+relu fwd                              n=72 abs=2.260561e+01 sq=2.100023e+01 wabs=9.313468e+01
+bn+relu dx                               n=72 abs=1.332738e+01 sq=3.601179e+00 wabs=5.132837e+01
+bn+relu dscale                           n=4 abs=2.333911e+01 sq=1.362173e+02 wabs=5.841170e+01
+bn+relu dbias                            n=4 abs=2.013843e+01 sq=1.014009e+02 wabs=5.046670e+01
+bn+add+relu fwd                          n=72 abs=2.873169e+01 sq=3.294747e+01 wabs=1.165877e+02
+bn+add+relu dx                           n=72 abs=1.544792e+01 sq=4.879043e+00 wabs=6.106230e+01
+bn+add+relu dz                           n=72 abs=2.254282e+01 sq=1.881899e+01 wabs=8.240059e+01
+bn+add+relu dscale                       n=4 abs=2.338352e+01 sq=1.370996e+02 wabs=5.960975e+01
+bn+add+relu dbias                        n=4 abs=1.716541e+01 sq=7.460085e+01 wabs=4.486360e+01
+bn+swish fwd                             n=72 abs=2.501652e+01 sq=1.371083e+01 wabs=1.031981e+02
+bn+swish backward: status 3000
+stn grid                                 n=80 abs=4.788333e+01 sq=3.918067e+01 wabs=1.828950e+02
+stn sampler fwd                          n=80 abs=3.658385e+01 sq=2.253058e+01 wabs=1.438110e+02
+stn sampler dx b.5                       n=168 abs=4.295319e+01 sq=1.814440e+01 wabs=1.792975e+02
+stn sampler dgrid                        n=80 abs=1.093831e+02 sq=2.309711e+02 wabs=4.613991e+02
+stn dtheta                               n=12 abs=3.190796e+01 sq=1.702943e+02 wabs=1.457433e+02
+ctc norm 1 costs                         n=3 abs=1.977916e+01 sq=1.349740e+02 wabs=3.817448e+01
+ctc norm 1 gradients                     n=90 abs=2.097840e+01 sq=7.951093e+00 wabs=8.729148e+01
+ctc norm 0 costs                         n=3 abs=1.977916e+01 sq=1.349740e+02 wabs=3.817448e+01
+ctc norm 0 gradients                     n=90 abs=1.321312e+02 sq=9.337207e+02 wabs=6.115061e+02
+ctc v8 costs                             n=3 abs=1.977916e+01 sq=1.349740e+02 wabs=3.817448e+01
+ctc v8 gradients                         n=90 abs=2.097840e+01 sq=7.951093e+00 wabs=8.729148e+01
+ctc infeasible grad mode 0 costs         n=3 abs=1.004244e+01 sq=5.042606e+01 wabs=2.508593e+01
+ctc infeasible grad mode 0 gradients     n=90 abs=1.364087e+01 sq=4.290095e+00 wabs=5.531271e+01
+ctc infeasible grad mode 1 costs         n=3 abs=1.004244e+01 sq=5.042606e+01 wabs=2.508593e+01
+ctc infeasible grad mode 1 gradients     n=90 abs=1.852159e+01 sq=5.685473e+00 wabs=7.591901e+01
+norm api training fwd                    n=120 abs=5.275852e+01 sq=3.198185e+01 wabs=2.028343e+02
+norm api running variance                n=4 abs=4.195523e+00 sq=4.401786e+00 wabs=1.054373e+01
+norm api backward dx                     n=120 abs=1.156765e+01 sq=1.761607e+00 wabs=4.589406e+01
+norm api backward dscale                 n=4 abs=7.953280e+01 sq=1.584547e+03 wabs=2.026113e+02
+norm api backward dbias                  n=4 abs=2.429257e+00 sq=1.785139e+00 wabs=7.249771e+00
+norm api inference per activation        n=120 abs=3.332976e+01 sq=1.536448e+01 wabs=1.336722e+02
+norm api with 2 groups: status 3000
+im2col mode 1 (18x18)                    n=324 abs=1.856387e+02 sq=1.492966e+02 wabs=7.520770e+02
+im2col mode 0 (18x18)                    n=324 abs=1.856387e+02 sq=1.492966e+02 wabs=7.333256e+02

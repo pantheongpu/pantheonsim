@@ -7,7 +7,7 @@
 //   - cuDNN's backend (graph) API: convolution forward, backward-data and
 //     backward-filter; groups, stride, dilation, padding, channels-last
 //     strides, a 3-D convolution; descriptors destroyed once the graph holds
-//     them; a graph cuDNN would need an engine this library lacks is refused.
+//     them. (Multi-operation graphs, and refusals: dnn_graph.cu.)
 //   - cuDNN's BatchNorm training forward and backward (the Ex forms), and
 //     N-dimensional tensor descriptors.
 //   - cuDNN's RNN API: LSTM (two layers, both directions, packed sequences of
@@ -270,11 +270,8 @@ static void graph_api(cudnnHandle_t h) {
   };
   for (const auto& cc : cases)
     for (Dir d : {Dir::Fwd, Dir::Data, Dir::Filter}) conv(h, cc, d);
-  // A graph whose operation this library has no engine for is refused when
-  // it is finalized, not accepted and run wrongly.
-  Desc pw = make(CUDNN_BACKEND_POINTWISE_DESCRIPTOR);
-  expect("an operation with no engine here is refused, not run", cudnnBackendFinalize(pw) != CUDNN_STATUS_SUCCESS);
-  cudnnBackendDestroyDescriptor(pw);
+  // Graphs of more than one operation, and the refusal of one this library
+  // has no engine for: dnn_graph.cu.
 }
 
 /* ---- BatchNorm training ---------------------------------------------------- */

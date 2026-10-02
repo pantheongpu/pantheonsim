@@ -3115,31 +3115,17 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     return;
   }
   if (name == "malloc" || name == "free") {
-    static std::mutex heap_mu;
-    static std::map<const MemoryManager*, std::pair<uint64_t, std::map<uint64_t, uint64_t>>> heaps;
-    std::lock_guard<std::mutex> g(heap_mu);
-    auto& heap = heaps[&mem_];
+    // The device's heap, shared with the PTX engine (MemoryManager::
+    // heap_alloc): each thread allocates on its own, and out of heap is null.
     each_lane(ex, [&](unsigned l) {
       const uint64_t arg = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
       if (name == "malloc") {
-        uint64_t p = 0;
-        if (arg && heap.first + arg <= cfg_.device_heap_bytes) {
-          try {
-            p = mem_.alloc(arg);
-            heap.first += arg;
-            heap.second[p] = arg;
-          } catch (const Error&) {
-            p = 0;
-          }
-        }
+        const uint64_t p = mem_.heap_alloc(arg, cfg_.device_heap_bytes);
         w.reg(4, l) = static_cast<uint32_t>(p);
         w.reg(5, l) = static_cast<uint32_t>(p >> 32);
-      } else if (arg) {
-        const auto it = heap.second.find(arg);
-        if (it == heap.second.end()) fault(w, ins, l, "device free() of a pointer this kernel's heap did not allocate");
-        heap.first -= it->second;
-        heap.second.erase(it);
-        mem_.free(arg);
+      } else if (arg && !mem_.heap_free(arg)) {   // free(nullptr) is a no-op
+        fault(w, ins, l, "device free() of a pointer the device heap did not allocate, or already freed",
+              Err::InvalidFree);
       }
     });
     return;

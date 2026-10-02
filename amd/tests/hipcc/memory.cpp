@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -203,6 +204,37 @@ int main() {
   (void)hipSetDevice(0);
   check(back[0] == 0x5A5A5A5Au && back[255] == 0x5A5A5A5Au,
         "a copy from another device's memory follows the memset queued there before it");
+  // But a device-to-device copy waits only for the device it reads from: one
+  // into another device's memory returns before the work queued there is
+  // done (hip-tests' hipMemcpyPeer synchronization check expects it back
+  // while that work runs).
+  (void)hipSetDevice(1);
+  delay<<<1, 1>>>(1000, rate);
+  (void)hipSetDevice(0);
+  const auto copy_start = std::chrono::steady_clock::now();
+  (void)hipMemcpyPeer(other, 1, words, 0, 1024);
+  const double copy_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count();
+  check(copy_ms < 500, "a peer copy into another device's memory does not wait for the work queued there",
+        std::to_string(static_cast<int>(copy_ms)) + " ms");
+  (void)hipSetDevice(1);
+  (void)hipDeviceSynchronize();
+  (void)hipSetDevice(0);
+  // And an asynchronous copy from another device's memory, on a stream of the
+  // device it writes, comes after what was queued where it reads -- a memset
+  // behind a delay -- as a dependency of its stream rather than a wait.
+  delay<<<1, 1>>>(300, rate);
+  (void)hipMemset(words, 0x3C, 1024);
+  (void)hipSetDevice(1);
+  hipStream_t there;
+  (void)hipStreamCreate(&there);
+  (void)hipMemcpyAsync(other, words, 1024, hipMemcpyDeviceToDevice, there);
+  (void)hipStreamSynchronize(there);
+  (void)hipMemcpy(back.data(), other, 1024, hipMemcpyDeviceToHost);
+  (void)hipStreamDestroy(there);
+  (void)hipSetDevice(0);
+  check(back[0] == 0x3C3C3C3Cu && back[255] == 0x3C3C3C3Cu,
+        "an asynchronous copy from another device's memory follows the memset queued there before it");
 
   // ---- Managed memory: advice and prefetches, page by page
   char* managed = nullptr;
