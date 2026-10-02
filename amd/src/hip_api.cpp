@@ -597,13 +597,14 @@ hipError_t order_for(State& s, hipStream_t stream, Order* o) {
 // Runs `work` in `stream`'s order: queued, and returned from at once -- or,
 // for a synchronous call (wait) and under VGPU_SYNC_LAUNCHES, waited for, and
 // its own result returned. Called without s.mutex held.
-hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false) {
+hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std::vector<Queue::Marker> also = {}) {
   State& s = state();
   Order o;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return e;
   }
+  for (Queue::Marker& m : also) o.after.push_back(std::move(m));
   if (!wait && !synchronous_launches()) {
     o.queue->submit(std::move(work), std::move(o.after));
     return hipSuccess;
@@ -1421,7 +1422,18 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     }
     return hipSuccess;
   };
-  return run_here ? work() : in_order(stream, work, wait);
+  // An asynchronous copy from another device's memory comes after what that
+  // device's blocking streams were given too -- as a dependency of its own
+  // stream, not a wait here -- so that it reads what was queued there before
+  // it (hip-tests' hipGetProcAddress 2D copies: a memset on one device, then an
+  // asynchronous copy on the other). ROCm's HIP leaves this to timing, which a
+  // card wins and a simulated memset may not.
+  std::vector<Queue::Marker> after_source;
+  if (!run_here && !called_sync && from.device && from.ordinal != ordinal) {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    for (const std::shared_ptr<Queue>& q : queues_of(s, from.ordinal, true)) after_source.push_back({q, q->tail()});
+  }
+  return run_here ? work() : in_order(stream, work, wait, std::move(after_source));
 }
 
 // A copy of `bytes`, or of `rows` rows of them `dpitch` and `spitch` apart.

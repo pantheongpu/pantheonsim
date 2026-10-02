@@ -220,6 +220,21 @@ int main() {
   (void)hipSetDevice(1);
   (void)hipDeviceSynchronize();
   (void)hipSetDevice(0);
+  // And an asynchronous copy from another device's memory, on a stream of the
+  // device it writes, comes after what was queued where it reads -- a memset
+  // behind a delay -- as a dependency of its stream rather than a wait.
+  delay<<<1, 1>>>(300, rate);
+  (void)hipMemset(words, 0x3C, 1024);
+  (void)hipSetDevice(1);
+  hipStream_t there;
+  (void)hipStreamCreate(&there);
+  (void)hipMemcpyAsync(other, words, 1024, hipMemcpyDeviceToDevice, there);
+  (void)hipStreamSynchronize(there);
+  (void)hipMemcpy(back.data(), other, 1024, hipMemcpyDeviceToHost);
+  (void)hipStreamDestroy(there);
+  (void)hipSetDevice(0);
+  check(back[0] == 0x3C3C3C3Cu && back[255] == 0x3C3C3C3Cu,
+        "an asynchronous copy from another device's memory follows the memset queued there before it");
 
   // ---- Managed memory: advice and prefetches, page by page
   char* managed = nullptr;
