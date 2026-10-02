@@ -1,0 +1,105 @@
+name: CI image
+
+# The toolchain images CI's hosted jobs run in (.github/ci-image/Dockerfile),
+# built here and pushed to GHCR as
+#
+#   ghcr.io/pantheongpu/pantheonsim-ci:<flavor>-<hash>
+#
+# where <hash> is the first 12 hex digits of the Dockerfile's SHA-256. A job
+# asks for the tag of the Dockerfile in its own checkout (the `image` job of
+# ci.yml), so a change to the Dockerfile is used only once its image exists,
+# and until then that job installs its toolchain the old way. main's builds
+# also move the plain <flavor> tag.
+#
+# Built on a push that changes the Dockerfile (any branch of this repository:
+# a pull request's image is ready by its second CI run), weekly so the images
+# pick up Ubuntu's and NVIDIA's updates, and by hand.
+on:
+  push:
+    paths:
+      - .github/ci-image/**
+      - .github/workflows/ci-image.yml
+  schedule:
+    - cron: '11 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/pantheonsim-ci
+
+jobs:
+  image:
+    name: image ${{ matrix.flavor }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { flavor: cuda12.0, target: cuda12.0, cuda: '' }
+          - { flavor: cuda13.0, target: cuda,     cuda: '13.0' }
+          - { flavor: cuda12.8, target: cuda,     cuda: '12.8' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Make room
+        # The CUDA layers are several GB unpacked, twice over while they are
+        # exported; the runner's preinstalled SDKs are not needed.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          df -h / | tail -1
+
+      - name: Tags
+        id: tags
+        env:
+          FLAVOR: ${{ matrix.flavor }}
+        run: |
+          hash=$(sha256sum .github/ci-image/Dockerfile | cut -c1-12)
+          tags="$IMAGE:$FLAVOR-$hash"
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then tags="$tags,$IMAGE:$FLAVOR"; fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Tags: $tags"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .github/ci-image
+          target: ${{ matrix.target }}
+          build-args: ${{ matrix.cuda && format('CUDA_VERSION={0}', matrix.cuda) || '' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+          # The source label links the package to this repository, so the
+          # repository's workflows can pull it with their own token.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=pantheonsim CI toolchain (${{ matrix.flavor }})
+          provenance: false
+
+      - name: Pull it back, as a job would, and say what it holds
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          ref="${TAGS%%,*}"
+          start=$(date +%s)
+          docker pull -q "$ref"
+          echo "Pulled in $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+          docker image inspect "$ref" --format '{{.Size}}' | awk '{printf "Image size: %.1f GB\n", $1/1e9}' | tee -a "$GITHUB_STEP_SUMMARY"
+          docker run --rm "$ref" bash -c 'echo "PANTHEONSIM_CI_IMAGE=$PANTHEONSIM_CI_IMAGE"; nvcc --version | tail -1; cmake --version | head -1; g++ --version | head -1' | tee -a "$GITHUB_STEP_SUMMARY"
