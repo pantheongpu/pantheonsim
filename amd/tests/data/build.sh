@@ -41,7 +41,7 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
@@ -53,13 +53,13 @@ for src in asm_lds_dma asm_ds_tr; do
 done
 
 # And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
-for src in asm_permlane asm_images asm_wave asm_literal asm_fminmax11; do
+for src in asm_permlane asm_images asm_wave asm_literal asm_fminmax11 asm_hwid11; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -c "$src.s" -o "$src.gfx1100.o"
   echo "wrote $(pwd)/$src.gfx1100.o"
 done
 
 # And for gfx1201 (RDNA4), for what only it has (test_amd_gcn_asm).
-for src in asm_ttmp asm_cycles asm_fminmax12 asm_salu_f16; do
+for src in asm_ttmp asm_cycles asm_fminmax12 asm_salu_f16 asm_hwid12; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c "$src.s" -o "$src.gfx1201.o"
   echo "wrote $(pwd)/$src.gfx1201.o"
 done

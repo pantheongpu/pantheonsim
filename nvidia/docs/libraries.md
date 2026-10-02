@@ -51,6 +51,41 @@ both libraries. Refused with a message: the Schur complement mode, the nested
 dissection tree, double-double values, and a matrix distributed across
 processes.
 
+## cuTENSOR and cuTensorNet: tensor contractions, and networks of them
+
+NVIDIA's libcutensor and libcutensornet each carry a static CUDA runtime that
+cannot reach a simulated driver, so both are written here from the documented
+APIs (`nvidia/include/vgpu_cutensor.h`, `vgpu_cutensornet.h`). cuTENSOR
+computes on the host like cuBLAS: one loop nest per operation, in double
+precision, with each operand rounded first to the precision its compute
+descriptor names (half, bfloat16, TF32; single for 3XTF32, 9X16BF and 4X16F;
+double for 8XINT8). cuTensorNet is built on that cuTENSOR and on the
+simulator's cuSOLVER, as NVIDIA's is on theirs: a network is contracted
+pairwise with `cutensorContract` into intermediates carved from the caller's
+workspace, one slice at a time; QR and SVD lay the tensor out as a matrix with
+`cutensorPermute` and factor it with `cusolverDn?geqrf`/`orgqr` and `gesvd`.
+
+Statuses, attribute sizes and defaults, scalar types, FLOP and byte counts,
+the padded layout of a permutation and which type and compute combinations
+plan follow NVIDIA's libraries on an RTX 3060 (cuTENSOR 2.8.1, cuTensorNet
+2.14, CUDA 13.0) where the documentation leaves them open:
+`nvidia/tests/e2e/cutensor_paths.cpp` (440 checks) and `cutensornet_paths.cpp`
+(293) pass against both, and the binaries linked against NVIDIA's pass
+unchanged on the simulator. Some measured behaviour differs from the
+documentation and is followed: `cutensorCreatePlan` requires a plan
+preference, a contraction refuses an alignment of 0, CONJ is refused on real
+data, and a repeated mode is that operand's diagonal.
+
+What each library chooses for itself is not NVIDIA's. Kernel selection is not
+modelled, so every workspace estimate is zero and a plan cache entry records
+the problem only (which plans NVIDIA's cache keeps is its own rule). The
+contraction path is a greedy pairwise search and slicing cuts whole contracted
+modes until the intermediates fit and the minimum slice count is met, where
+NVIDIA's hyper-optimizer searches further: paths, slicing, FLOP counts and
+workspace sizes differ, the contracted tensor does not. A sliced extent means
+what NVIDIA reports -- the extent of the mode within one slice, so a mode of
+extent 8 sliced completely shows as 1 and gives 8 slices.
+
 | library | soname | what it covers |
 | --- | --- | --- |
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
@@ -67,6 +102,8 @@ processes.
 | NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition) and gate splitting on cuSOLVER. Built on the simulator's cuTENSOR and cuSOLVER |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; the image is PTX (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
@@ -427,6 +464,26 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   as LAPACK's does, and the order can differ. NVIDIA's `sytri` (CUDA 13.0, RTX
   3060) returns success and leaves A as it was; this one computes the inverse
   the API documents.
+- **cuTENSOR**: block-sparse contractions are created and checked but not
+  planned (NOT_SUPPORTED; an RTX 3060 cannot plan them either, so there is no
+  card to check a kernel against); just-in-time kernels (the JIT mode is
+  accepted and changes nothing); the undocumented exports
+  (`cutensorCreateComputeDescriptor`, extraction and insertion, ...), which
+  answer NOT_SUPPORTED. A permutation whose input has a mode its output lacks
+  is planned by NVIDIA's library and writes zeros on an RTX 3060; here its
+  plan is refused (NOT_SUPPORTED).
+- **cuTensorNet**: the state API (states, network operators, accessors,
+  expectations, marginals, samplers, MPS and its projection), gradients,
+  distributed execution and the undocumented exports answer NOT_SUPPORTED;
+  the SVD algorithms other than `gesvd` (gesvdj, gesvdp, gesvdr) are refused,
+  as are decompositions of half-precision tensors and decompositions made
+  while the stream is capturing a graph (they read their results back to
+  the host). Autotuning has nothing to tune and returns at once; the cache
+  workspace is never used; `RUNTIME_EST` is 0, there being no timing model.
+  cuQuantum Python's own calls are these (traced on an RTX 3060), but
+  cuQuantum Python 26.09 does not start on the simulator yet: the runtime
+  module of cuda-bindings 13 that it uses through nvmath-python, and CuPy 14,
+  carry a static CUDA runtime that asks the driver for its export table.
 - **NCCL**: symmetric memory windows (registration returns a NULL window, as
   NCCL does without peer mappings) and the network plugin interface (there is
   no network to plug into); see "NCCL: a file-backed transport". Not exported,

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -444,6 +445,82 @@ VTEST(rdna_every_lane_of_a_wave_has_scratch_in_a_group_of_one) {
   mem.read(out, r, 8);
   VCHECK_EQ(r[0], 0x5eed0000u);
   VCHECK_EQ(r[1], 0x5eed001fu);
+}
+
+// Runs a `where` kernel (asm_hwid*.s) over `groups` work-groups of one wave
+// each, on a device laid out as `layout`, and returns the `words` it wrote
+// for each group.
+std::vector<uint32_t> where(const amd::CodeObject& o, uint32_t groups, amd::Dispatch::Layout layout, uint32_t lanes,
+                            size_t words) {
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(groups * words * 4);
+  const amd::Kernel* k = amd::find_kernel(o, "where");
+  if (!k) throw vtest::Failure("no kernel named where");
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(out >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.groups[0] = groups;
+  d.group_size[0] = lanes;
+  d.layout = layout;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(groups * words);
+  mem.read(out, r.data(), r.size() * 4);
+  return r;
+}
+
+// An MI300X: 8 compute dies of 4 shader engines, 38 compute units to a die.
+// Work-groups go to the dies in turn, then to each die's engines in turn.
+// HW_ID says the compute unit (11:8) and engine (14:13), XCC_ID the die, and
+// HIP's __smid, which puts them together, tells all 304 apart.
+VTEST(cdna3_hw_id_and_xcc_id_say_which_compute_unit_a_wave_runs_on) {
+  const std::vector<uint32_t> r = where(object("asm_hwid"), 608, {8, 4, 1, 38}, 64, 2);
+  int wrong = 0;
+  std::set<uint32_t> smid;
+  for (uint32_t g = 0; g < 608; ++g) {
+    const uint32_t hw = r[2 * g], xcc = r[2 * g + 1], unit = g / 8 % 38;
+    wrong += xcc != g % 8;
+    wrong += (hw >> 8 & 0xF) != unit / 4 || (hw >> 13 & 3) != unit % 4 || (hw >> 12 & 1) != 0 || (hw & 0xF) != 0;
+    smid.insert((xcc << 2 | (hw >> 13 & 3)) << 4 | (hw >> 8 & 0xF));
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK_EQ(smid.size(), size_t{304});
+}
+
+// An RX 7900 XTX: 6 shader engines of 2 arrays, 48 workgroup processors.
+// HW_ID1 says the processor (13:10), array (16) and engine (20:18), and HIP's
+// __smid tells all 48 apart.
+VTEST(rdna3_hw_id1_says_which_workgroup_processor_a_wave_runs_on) {
+  const std::vector<uint32_t> r = where(object("asm_hwid11", "gfx1100"), 96, {1, 6, 2, 48}, 32, 1);
+  int wrong = 0;
+  std::set<uint32_t> smid;
+  for (uint32_t g = 0; g < 96; ++g) {
+    const uint32_t hw = r[g], unit = g % 48;
+    wrong += (hw >> 18 & 7) != unit % 6 || (hw >> 16 & 1) != unit / 6 % 2 || (hw >> 10 & 0xF) != unit / 12;
+    wrong += (hw & 0x1F) != 0;
+    smid.insert(((hw >> 18 & 7) << 1 | (hw >> 16 & 1)) << 4 | (hw >> 10 & 0xF));
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK_EQ(smid.size(), size_t{48});
+}
+
+// An RX 9070 XT: 4 engines of 2 arrays, 32 workgroup processors, the same
+// HW_ID1. Register 4 is STATE_PRIV on gfx12, whose bit 9 is SCC.
+VTEST(rdna4_hw_id1_says_where_a_wave_runs_and_state_priv_holds_scc) {
+  const std::vector<uint32_t> r = where(object("asm_hwid12", "gfx1201"), 64, {1, 4, 2, 32}, 32, 3);
+  int wrong = 0;
+  std::set<uint32_t> units;
+  for (uint32_t g = 0; g < 64; ++g) {
+    const uint32_t hw = r[3 * g], unit = g % 32;
+    wrong += (hw >> 18 & 7) != unit % 4 || (hw >> 16 & 1) != unit / 4 % 2 || (hw >> 10 & 0xF) != unit / 8;
+    wrong += r[3 * g + 1] != 1u << 9 || r[3 * g + 2] != 0;
+    units.insert(hw >> 10);
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK_EQ(units.size(), size_t{32});
 }
 
 // The shader clock as clock() reads it on RDNA: SHADER_CYCLES' 20 bits on
