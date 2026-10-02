@@ -1931,7 +1931,12 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
       const int64_t off = ins.w.sfield(38, 16);
       each_lane(ex, [&](unsigned l) {
-        const uint64_t o = static_cast<uint64_t>((ra == kRZ ? 0 : static_cast<int64_t>(static_cast<int32_t>(w.reg(ra, l)))) + off);
+        // A bank is 64 KiB, and the address wraps in it: parameters past
+        // 4 KiB (CUDA 12.1+) reach 0x8000 and beyond, which the 16-bit
+        // offset holds as a negative number. ptxas relies on the wrap:
+        // sm_100's c[0x0][-0x7fa8] (RZ) is 0x8058, and c[0x0][R7+-0x7f84]
+        // with R7 = -4*i is parameter byte 0x807c - 4*i.
+        const uint64_t o = static_cast<uint64_t>((ra == kRZ ? 0 : static_cast<int64_t>(static_cast<int32_t>(w.reg(ra, l)))) + off) & 0xffff;
         if (bytes == 8) write64(w, ins.dst[0], l, cbank32(bank, o) | (static_cast<uint64_t>(cbank32(bank, o + 4)) << 32));
         else write32(w, ins.dst[0], l, extend(cbank32(bank, o & ~3ull) >> (8 * (o & 3))));
       });

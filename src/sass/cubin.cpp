@@ -54,6 +54,7 @@ enum Attr : uint8_t {
   kRegcount = 0x2f,
   kCtaPerCluster = 0x3d,     // __cluster_dims__: x, y, z
   kExplicitCluster = 0x3e,   // launched with a cluster, or refused
+  kKparamInfoV2 = 0x45,      // KPARAM_INFO for parameters past 4 KiB
   kNumBarriers = 0x4c,
 };
 
@@ -205,6 +206,22 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
             p.ordinal = u32(rec.payload + 4) & 0xffff;
             p.offset = u32(rec.payload + 4) >> 16;
             p.size = (u32(rec.payload + 8) >> 18) & 0x3fff;
+            k.params.push_back(p);
+          }
+          break;
+        case kKparamInfoV2:
+          // What ptxas (CUDA 12.1 and later) writes instead of KPARAM_INFO
+          // when a kernel's parameters pass the old 4 KiB limit (up to 32764
+          // bytes on sm_70 and later): the same index and ordinal/offset
+          // words, then the size in the low 16 bits of the third (nvdisasm's
+          // "Size", checked against parameters of 1 to 0x7d00 bytes). Such a
+          // kernel's parameters start at 0x1a80 of bank 0 on sm_86
+          // (PARAM_CBANK says where), not 0x160.
+          if (rec.size >= 12) {
+            CubinParam p;
+            p.ordinal = u32(rec.payload + 4) & 0xffff;
+            p.offset = u32(rec.payload + 4) >> 16;
+            p.size = u32(rec.payload + 8) & 0xffff;
             k.params.push_back(p);
           }
           break;
