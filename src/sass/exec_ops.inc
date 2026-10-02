@@ -3092,6 +3092,28 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     });
     return;
   }
+  if (name == "cudaGraphSetConditional") {
+    // (handle, value): sets a conditional handle's value, which the graph's
+    // conditional node reads once the kernel is done -- as the PTX engine's
+    // exec_graph_set_conditional does. Outside a graph, or with a handle no
+    // graph made, an RTX 3060 faults with an illegal address; racing calls
+    // are undefined, and here the last lane to run wins.
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t h = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
+      if (exec::GraphConditionals* table = cfg_.conditionals) {
+        std::lock_guard<std::mutex> guard(table->mu);
+        if (const auto it = table->values.find(h); it != table->values.end()) {
+          it->second = w.reg(6, l);
+          return;
+        }
+      }
+      fault(w, ins, l,
+            cfg_.conditionals ? "cudaGraphSetConditional with a handle no graph created (" + std::to_string(h) + ")"
+                              : std::string("cudaGraphSetConditional in a kernel that is not running in a graph"),
+            Err::InvalidPointer);
+    });
+    return;
+  }
   if (name == "malloc" || name == "free") {
     static std::mutex heap_mu;
     static std::map<const MemoryManager*, std::pair<uint64_t, std::map<uint64_t, uint64_t>>> heaps;
