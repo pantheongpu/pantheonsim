@@ -13,6 +13,7 @@
 // asynchronous error.
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -63,6 +64,17 @@ class WorkQueue {
     cv_.wait(lock, [&] { return completed_ >= seq; });
   }
   void drain() { wait(tail()); }
+  // Waits for the seq'th item until `deadline`; says whether it ran.
+  bool wait_until(uint64_t seq, std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_until(lock, deadline, [&] { return completed_ >= seq; });
+  }
+  // Whether the calling thread is this queue's own (a host function that
+  // calls exit, say).
+  bool on_worker() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return thread_.joinable() && thread_.get_id() == std::this_thread::get_id();
+  }
   bool done(uint64_t seq) const {
     std::lock_guard<std::mutex> lock(mu_);
     return completed_ >= seq;

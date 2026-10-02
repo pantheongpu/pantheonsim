@@ -13,6 +13,9 @@
 //   - The stack reached through a flat pointer, whose kernel sets FLAT_SCRATCH
 //     first (s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO/HI)), as llama.cpp's
 //     flash-attention kernels do.
+//   - A cooperative launch's grid sync, which gfx10 does with the GWS
+//     barrier (ds_gws_barrier) rather than with atomics in memory.
+#include <hip/hip_cooperative_groups.h>
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -108,6 +111,19 @@ __global__ void stack_by_pointer(const int* in, int* out) {
   const int l = threadIdx.x;
   for (int i = 0; i < 24; ++i) local[i] = in[(l + i) % kWave] + i;
   out[l] = sum_through(local, 24 - l % 8);
+}
+
+// Each work-group adds one before each of two grid syncs and reads the
+// count after it: every group sees every other's addition.
+__global__ void grid_sync(int* counter, int* seen) {
+  auto grid = cooperative_groups::this_grid();
+  if (threadIdx.x == 0) atomicAdd(counter, 1);
+  grid.sync();
+  if (threadIdx.x == 0) seen[blockIdx.x] = atomicAdd(counter, 0);
+  grid.sync();
+  if (threadIdx.x == 0) atomicAdd(counter, 1);
+  grid.sync();
+  if (threadIdx.x == 0) seen[gridDim.x + blockIdx.x] = atomicAdd(counter, 0);
 }
 
 int wrong = 0;
@@ -229,6 +245,20 @@ int main() {
     report("v_permlanex16_b32", bad[1], kWave);
     report("DPP row_share", bad[2], kWave);
     report("DPP row_xmask", bad[3], kWave);
+  }
+  {
+    constexpr int kGroups = 8;
+    int zero = 0, seen[2 * kGroups] = {};
+    int* counter = upload(&zero, 1);
+    int* dseen = upload(seen, 2 * kGroups);
+    void* args[] = {&counter, &dseen};
+    CHECK(hipLaunchCooperativeKernel(reinterpret_cast<void*>(grid_sync), dim3(kGroups), dim3(2 * kWave), args, 0,
+                                     nullptr));
+    CHECK(hipDeviceSynchronize());
+    download(seen, dseen, 2 * kGroups);
+    int bad = 0;
+    for (int i = 0; i < kGroups; ++i) bad += (seen[i] != kGroups) + (seen[kGroups + i] != 2 * kGroups);
+    report("a cooperative grid sync (the GWS barrier)", bad, 2 * kGroups);
   }
   std::printf("%s\n", wrong ? "FAIL" : "PASS");
   return wrong ? 1 : 0;

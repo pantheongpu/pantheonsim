@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <list>
+#include <map>
 #include <cstdlib>
 #include <exception>
 #include <thread>
@@ -179,6 +180,10 @@ struct Wave {
   uint64_t pc = 0;
   bool done = false;
   bool at_barrier = false;
+  // At a GWS barrier (Machine::gws_barrier): counted there, and waiting for
+  // the barrier's generation to move past this one.
+  bool gws_waiting = false;
+  uint64_t gws_generation = 0;
   uint32_t first_lane = 0;   // this wave's first work-item in the group
   // How many lanes: 64 on CDNA, 32 for an RDNA kernel built wave32. A
   // wave32 wave is a wave64 whose upper half is never switched on, so an
@@ -5349,6 +5354,46 @@ struct Machine {
     debug::stop(v, &w);
   }
 
+  // The global wave sync (GWS) barrier, which gfx10's cooperative groups
+  // sync a grid with: the kernel names the resource by M0's bits 21:16 plus
+  // the instruction's offset, and passes (in its first active lane) how many
+  // waves, less one, the barrier waits for; ROCm's runtime initializes the
+  // resource before a cooperative launch. A wave arrives once, then gives way
+  // to the others (as s_sleep does) and tries again on its next turn, until
+  // that many have arrived; then all of them go on. A cooperative launch runs
+  // its work-groups on one machine, which keeps the counts.
+  struct GwsBarrier {
+    uint64_t arrived = 0, generation = 0;
+  };
+  std::map<uint32_t, GwsBarrier> gws;
+  bool gws_barrier(Wave& w, const Inst& in) {
+    const OpName op(in.name);
+    if (op == "ds_gws_init"_op) return true;   // the count comes with each barrier
+    if (op != "ds_gws_barrier"_op)
+      throw Error::make(Err::Unsupported, in.name, ": GWS semaphores are not modelled");
+    if (!d.cooperative)
+      throw Error::make(Err::Unsupported, "a GWS barrier outside a cooperative launch, whose work-groups are not all "
+                                          "resident at once");
+    if (!w.exec) return true;
+    GwsBarrier& b = gws[((w.m0 >> 16) & 0x3F) + static_cast<uint32_t>(in.offset)];
+    if (!w.gws_waiting) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(w.exec));
+      const uint64_t waves = uint64_t{static_cast<uint32_t>(lane_src(w, in.src[0], lane))} + 1;
+      if (++b.arrived >= waves) {
+        b.arrived = 0;
+        ++b.generation;
+        return true;
+      }
+      w.gws_waiting = true;
+      w.gws_generation = b.generation;
+    } else if (b.generation != w.gws_generation) {
+      w.gws_waiting = false;
+      return true;
+    }
+    w.pc -= in.size;   // not yet: this instruction again on the wave's next turn
+    return false;
+  }
+
   bool step(Wave& w, Group& g) {
     if (debug::active() &&
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
@@ -5447,6 +5492,7 @@ struct Machine {
       }
       case gcn::Enc::Ds:
         ++n.lds;
+        if (in.name.rfind("ds_gws_", 0) == 0) return gws_barrier(w, in);
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
@@ -5820,7 +5866,13 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 // hardware interleaves the waves of groups resident together: a wave polling
 // memory for another group's write, with no s_sleep in its loop, gives the
 // other group its turn.
+std::atomic<bool> g_abandoned{false};
+[[noreturn]] void abandon() {
+  throw Error::make(Err::DeviceLost, "the process is exiting, and the dispatch was abandoned");
+}
+
 bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
+  if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   bool runnable = false;
   for (Wave& w : group.waves) {
     if (w.done || w.at_barrier) continue;
@@ -5830,6 +5882,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
       for (uint64_t n = 0; m.step(w, group); ++n) {
         pc = w.pc;
         if (slice && n + 1 >= slice) break;
+        if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
       }
     } catch (const Error& e) {
       throw m.at_instruction(e, pc);
@@ -5915,7 +5968,11 @@ std::mutex& memory_atomic_lock(uint64_t addr) {
   return locks[(addr >> 2) % locks.size()];
 }
 
+void abandon_dispatches() { g_abandoned.store(true); }
+bool dispatches_abandoned() { return g_abandoned.load(); }
+
 DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
+  if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   if (!d.object || !d.kernel) throw Error::make(Err::InvalidValue, "a dispatch needs a kernel");
   const Kernel& k = *d.kernel;
   // A wave is 64 lanes on CDNA. An RDNA kernel says in its descriptor
