@@ -41,8 +41,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { cuda: '12.8', os: ubuntu-24.04, repo: ubuntu2404 }
-          - { cuda: '12.4', os: ubuntu-22.04, repo: ubuntu2204 }
+          - { cuda: '12.8', os: ubuntu-24.04, repo: ubuntu2404, skip: '' }
+          # amd_tools and regs_cli compare with the host's own lspci, whose
+          # output 22.04's older pciutils formats differently; nothing in them
+          # depends on the toolkit, and the build job runs them on 24.04.
+          - { cuda: '12.4', os: ubuntu-22.04, repo: ubuntu2204, skip: '|amd_tools|regs_cli' }
     # On the runner itself, not the cuda12.8 image: it runs the build job's
     # tests, whose session tests need user namespaces and mounts a container
     # refuses.
@@ -98,6 +101,8 @@ jobs:
       - name: Unit and end-to-end tests
         # The build job's set. The ML tests are the ml job's, the workloads
         # and ollama ci.yml's, and CUTLASS's builds take hours.
+        env:
+          SKIP: ${{ matrix.skip }}
         run: |
           ctest --test-dir build --output-on-failure \
-            -E '^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_cutlass.*)$'
+            -E "^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_cutlass.*$SKIP)\$"
