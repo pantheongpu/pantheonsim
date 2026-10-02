@@ -4,6 +4,7 @@
 //    can then have nearly the whole heap again;
 //  - free() gives the bytes back, within a kernel and across kernels;
 //  - a block one kernel allocates, a later kernel may read and free;
+//  - the host's cudaFree refuses a block a kernel allocated, which stays live;
 //  - and the same across the simulator's two engines: device_heap_peer.cu is
 //    built to PTX only, so its kernels run on the PTX interpreter while these
 //    run as SASS, and each frees what the other allocated.
@@ -164,6 +165,21 @@ int main() {
   launch_peer_try(most, b.ok);
   CHECK(results(b, r, 1));
   CHECK(r[0] == 1);
+
+  // ---- the host may not free a device-heap block --------------------------------
+  // An RTX 3060's cudaFree of a block a kernel's malloc() handed out returns
+  // InvalidValue, sets the last error, and leaves the block live: a later
+  // kernel still reads its marks and frees it.
+  keep<<<1, 1>>>(b.slot, 256, 0x5a);
+  CK(cudaDeviceSynchronize());
+  void* held = nullptr;
+  CK(cudaMemcpy(&held, b.slot, sizeof held, cudaMemcpyDeviceToHost));
+  CHECK(held != nullptr);
+  CHECK(cudaFree(held) == cudaErrorInvalidValue);
+  CHECK(cudaGetLastError() == cudaErrorInvalidValue);
+  check_free<<<1, 1>>>(b.slot, 256, b.ok);
+  CHECK(results(b, r, 1));
+  CHECK(r[0] == 0x5a5a);
 
   CK(cudaGetLastError());
   printf("PASS\n");

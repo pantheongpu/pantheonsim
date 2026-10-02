@@ -135,6 +135,12 @@ class MemoryManager {
   bool heap_free(uint64_t ptr);
   // Bytes the heap has handed out and not had back.
   uint64_t heap_used() const;
+  // Whether `addr` lies in a live heap block. The host API refuses those: an
+  // RTX 3060's cudaFree and cuMemFree of a device-malloc'd block return
+  // InvalidValue and leave it live (the device's free() still works), and
+  // cuMemGetAddressRange answers NOT_FOUND -- they are the device heap's,
+  // not allocations the host made.
+  bool heap_contains(uint64_t addr) const;
 
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);

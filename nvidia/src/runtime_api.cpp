@@ -1837,6 +1837,9 @@ VGPU_EXPORT cudaError_t cudaFree(void* ptr) {
     bool was_graph_alloc = false;
     if (const cudaError_t rc = free_graph_alloc(s, ptr, &was_graph_alloc); was_graph_alloc)
       return rc;
+    // A block a kernel's malloc() handed out is the device heap's: the host
+    // may not free it (the card returns InvalidValue and leaves it live).
+    if (owner_memory(s, ptr).heap_contains(reinterpret_cast<uint64_t>(ptr))) return cudaErrorInvalidValue;
     owner_memory(s, ptr).free(reinterpret_cast<uint64_t>(ptr));
     return cudaSuccess;
   });

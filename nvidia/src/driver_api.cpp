@@ -1033,6 +1033,8 @@ VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
       s.managed.erase(it);
       return CUDA_SUCCESS;
     }
+    // The device heap's blocks are not the host's to free (as cudaFree).
+    if (owner_memory(s, dptr).heap_contains(dptr)) return CUDA_ERROR_INVALID_VALUE;
     owner_memory(s, dptr).free(dptr);
     return CUDA_SUCCESS;
   });
@@ -2302,6 +2304,9 @@ VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CU
       if (size) *size = m->second;
       return CUDA_SUCCESS;
     }
+    // A device-heap block is no allocation of the host's: the card answers
+    // NOT_FOUND for it.
+    if (owner_memory(s, dptr).heap_contains(dptr)) return CUDA_ERROR_NOT_FOUND;
     if (!owner_memory(s, dptr).find_allocation(dptr, &b, &sz)) return CUDA_ERROR_INVALID_VALUE;
     if (base) *base = b;
     if (size) *size = sz;

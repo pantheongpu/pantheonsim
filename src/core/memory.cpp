@@ -181,6 +181,14 @@ uint64_t MemoryManager::heap_used() const {
   return heap_->used;
 }
 
+bool MemoryManager::heap_contains(uint64_t addr) const {
+  std::lock_guard<std::mutex> guard(heap_->mu);
+  auto it = heap_->blocks.upper_bound(addr);
+  if (it == heap_->blocks.begin()) return false;
+  --it;
+  return addr - it->first < it->second;
+}
+
 const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, uint64_t len,
                                                                const char* op, uint64_t* base_out,
                                                                bool writing) const {
