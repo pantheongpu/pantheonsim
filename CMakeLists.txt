@@ -699,6 +699,10 @@ vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
 target_compile_definitions(test_regs PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_regalloc)
+# Behaviour the nvcc-built e2e programs check, mirrored in hand-written PTX so a
+# regression shows without a CUDA toolkit: device printf, heap, atomics,
+# grid sync, symbols, managed variables, the device runtime, reset.
+vgpu_unit_test(test_e2e_parity)
 # How many host threads a grid is spread over: the CPUs the process may use,
 # its cgroup's CPU quota included, not the host's count.
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
