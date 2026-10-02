@@ -20,11 +20,6 @@ on:
   schedule:
     - cron: '53 5 * * *'
   workflow_dispatch:
-  # TEMPORARY, to run the digest job from this branch before it merges
-  # (workflow_dispatch needs the file on main): remove before merging.
-  push:
-    branches: [ci-infra]
-    paths: [.github/workflows/sass-ptx.yml, nvidia/tools/sass_ptx_digest.sh]
   pull_request:
     paths:
       - src/exec/**
