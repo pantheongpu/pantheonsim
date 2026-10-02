@@ -1,0 +1,22 @@
+Unit_hipClock64_Positive_Basic	timeout	ClockCheckTest	/work/hip-tests/catch/unit/clock/hipClockCheck.cc:140: FAILED: due to a fatal error condition: 
+Unit_hipClock_Positive_Basic	timeout	ClockCheckTest	/work/hip-tests/catch/unit/clock/hipClockCheck.cc:172: FAILED: due to a fatal error condition: 
+Unit_dynamic_loading_device_kernels_from_library	timeout	Dynamic	/work/hip-tests/catch/unit/dynamicLoading/complex_loading_behavior.cc:139: FAILED: due to a fatal error condition: 
+Unit_hipEvent	timeout	EventTest	/work/hip-tests/catch/unit/event/Unit_hipEvent.cc:205: FAILED:   {Unknown expression after the reported line} 
+Unit_hipMemFaultStackAllocation_Check	timeout	KernelTest	/work/hip-tests/catch/unit/kernel/hipMemFaultStackAllocation.cc:82: FAILED:   {Unknown expression after the reported line} 
+Unit_hipHostMalloc_AllocateUseMoreThanAvailGPUMemory	timeout	MemoryTest2	/work/hip-tests/catch/unit/memory/hipHostMalloc.cc:273: FAILED: due to a fatal error condition: 
+Unit_hipExtModuleLaunchKernel_Functional	timeout	ModuleTest	/work/hip-tests/catch/unit/module/hipExtModuleLaunchKernel.cc:766: FAILED: due to a fatal error condition: 
+Unit_hipExtModuleLaunchKernel_Negative_Parameters	timeout	ModuleTest	/work/hip-tests/catch/unit/module/hip_module_launch_kernel_common.hh:161: FAILED:   {Unknown expression after the reported line} 
+Unit_hipExtModuleLaunchKernel_Positive_Parameters	timeout	ModuleTest	/work/hip-tests/catch/unit/module/hip_module_launch_kernel_common.hh:85: FAILED: due to a fatal error condition: 
+Unit_hipModuleLaunchKernel_Fntl	timeout	ModuleTest	/work/hip-tests/catch/unit/module/hipModuleLaunchKernel.cc:312: FAILED: due to a fatal error condition: 
+Unit_hipModuleLaunchKernel_Positive_Parameters	timeout	ModuleTest	/work/hip-tests/catch/unit/module/hip_module_launch_kernel_common.hh:85: FAILED: due to a fatal error condition: 
+Unit_hiprtcCombiComplrOptnTst	fail	RTC	FAILED IN COMBINATION :
+Unit_hiprtcDisabledSlpVectorizeComplrOptnTst	fail	RTC	/work/hip-tests/catch/unit/rtc/hiprtcComplrOptnTesting.cc:92: FAILED:
+Unit_hipStreamPerThreadTst_StrmQuery	timeout	StreamPerThreadTest	/work/hip-tests/catch/unit/streamperthread/hipStreamPerThrdTsts.cc:268: FAILED: due to a fatal error condition: 
+Unit_hipStreamPerThread_StrmWaitEvt	timeout	StreamPerThreadTest	/work/hip-tests/catch/unit/streamperthread/hipStreamPerThrdTsts.cc:420: FAILED: due to a fatal error condition: 
+Unit_hipMultiStream_sameDevice	timeout	StreamTest	/work/hip-tests/catch/unit/stream/hipMultiStream.cc:39: FAILED: due to a fatal error condition: 
+Unit_hipStreamAddCallback_StrmSyncTiming	timeout	StreamTest	/work/hip-tests/catch/unit/stream/hipStreamACb_StrmSyncTiming.cc:83: FAILED: due to a fatal error condition: 
+Unit_hipStreamCreate_MultistreamBasicFunctionalities	timeout	StreamTest	/work/hip-tests/catch/unit/stream/hipAPIStreamDisable.cc:46: FAILED: due to a fatal error condition: 
+Unit_Warp_Ballot_Positive_Basic	timeout	WarpTest	/work/hip-tests/catch/unit/warp/warp_ballot.cc:50: FAILED: due to a fatal error condition: 
+Unit_dynamic_loading_device_kernels_from_library	timeout	dynamicLoading	/work/hip-tests/catch/unit/dynamicLoading/complex_loading_behavior.cc:139: FAILED: due to a fatal error condition: 
+Unit_hipP2pLinkTypeAndHopFunc	fail	p2pTests	/work/hip-tests/catch/unit/p2p/hipP2pLinkTypeAndHopFunc.cc:231: FAILED:
+Unit_Copy_Coherency	timeout	synchronizationTests	/work/hip-tests/catch/unit/synchronization/copy_coherency.cc:324: FAILED: due to a fatal error condition: 
