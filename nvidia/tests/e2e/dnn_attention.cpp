@@ -20,8 +20,14 @@
 // offer no engine for a configuration on that GPU, the check says so and is
 // skipped (the library declining is not a wrong answer); on VirtualGPU every
 // configuration must run.
+// The frontend resolves cuDNN, the runtime and NVRTC at run time, as PyTorch
+// builds it, rather than linking the CUDA 12+ runtime entry points its
+// optional OSS engines name.
+#define NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #include <cudnn_frontend.h>
 #include <cuda_runtime.h>
+
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <cmath>
@@ -36,6 +42,9 @@
 #include <vector>
 
 namespace fe = cudnn_frontend;
+namespace cudnn_frontend {
+void* cudnn_dlhandle = dlopen("libcudnn.so.9", RTLD_NOW | RTLD_GLOBAL);
+}
 
 static int fails = 0;
 static void expect(const std::string& what, bool ok, double detail = 0) {

@@ -1783,7 +1783,10 @@ uint32_t draw(uint64_t seed, uint64_t offset, uint64_t i) {
 
 /* ---- data movement: reshape, transpose, slice, paged cache load ---- */
 
-void run_reshape(const Op& op, const std::vector<double>& x, std::vector<double>* y) {
+// xr and yr: the ragged offsets of x and y, when they are ragged (a view of
+// packed sequences keeps their packing).
+void run_reshape(const Op& op, const std::vector<double>& x, std::vector<double>* y, const std::vector<double>* xr,
+                 const std::vector<double>* yr) {
   const GTensor &X = op.in[0], &Y = op.out;
   if (!op.view_only) {  // the same row-major order
     *y = x;
@@ -1791,11 +1794,12 @@ void run_reshape(const Op& op, const std::vector<double>& x, std::vector<double>
   }
   // y is x's memory read through y's strides: find, for each of y's
   // element offsets, the element of x that lives there.
-  const std::vector<int64_t> xo = element_offsets(X), yo = element_offsets(Y);
+  const std::vector<int64_t> xo = element_offsets(X, xr), yo = element_offsets(Y, yr);
   int64_t hi = 0;
   for (int64_t o : xo) hi = std::max(hi, o + 1);
   std::vector<int64_t> at(static_cast<size_t>(hi), -1);
-  for (size_t i = 0; i < xo.size(); ++i) at[static_cast<size_t>(xo[i])] = static_cast<int64_t>(i);
+  for (size_t i = 0; i < xo.size(); ++i)
+    if (xo[i] >= 0) at[static_cast<size_t>(xo[i])] = static_cast<int64_t>(i);
   y->assign(yo.size(), 0.0);
   for (size_t i = 0; i < yo.size(); ++i)
     if (yo[i] >= 0 && yo[i] < hi && at[static_cast<size_t>(yo[i])] >= 0) (*y)[i] = x[static_cast<size_t>(at[static_cast<size_t>(yo[i])])];
@@ -2314,7 +2318,16 @@ cudnnStatus_t Runner::run_op(const Op& op) {
     case Kind::Concat: run_concat(op, in, &r); break;
     case Kind::NormFwd:
     case Kind::NormBwd: run_norm(op, in, &outs); break;
-    case Kind::Reshape: run_reshape(op, *in[0], &r); break;
+    case Kind::Reshape: {
+      const std::vector<double>*xr = nullptr, *yr = nullptr;
+      for (auto [t, o] : {std::pair<const GTensor*, const std::vector<double>**>{&op.in[0], &xr}, {&op.out, &yr}})
+        if (t->ragged) {
+          cudnnStatus_t s = input(*t->ragged, o);
+          if (s != CUDNN_STATUS_SUCCESS) return s;
+        }
+      run_reshape(op, *in[0], &r, xr, yr);
+      break;
+    }
     case Kind::Transpose: run_transpose(op, *in[0], &r); break;
     case Kind::Slice: run_slice(op, *in[0], &r); break;
     case Kind::Rng: run_rng(op, in, &r); break;
