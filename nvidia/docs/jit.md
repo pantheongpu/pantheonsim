@@ -44,9 +44,10 @@ builds 64-bit index arithmetic.
 
 ## Triton
 
-Triton runs `ptxas` itself and loads the cubin, which VirtualGPU cannot run: it
-has no SASS decoder. Under `vgpu run` and `vgpu shell` nothing needs changing.
-They point Triton's ptxas (`TRITON_PTXAS_PATH`, and
+Triton runs `ptxas` itself and loads the cubin. VirtualGPU runs a cubin's SASS
+(nvidia/docs/sass.md), but Triton's kernels have been checked on the PTX path,
+so under `vgpu run` and `vgpu shell` they still take it, with nothing to change.
+Those commands point Triton's ptxas (`TRITON_PTXAS_PATH`, and
 `TRITON_PTXAS_BLACKWELL_PATH`, which Triton uses for sm_100 and later) at
 `build/bin/vgpu-ptxas`, which writes the PTX, NUL terminated, where the cubin
 would go; `cuModuleLoadData` loads PTX from there as from anywhere. Its
@@ -79,9 +80,8 @@ through `ptxas`, and there is nothing to do with the cubin that produces.
 The hook ends Triton's compilation pipeline at PTX instead of letting it
 assemble a cubin. It uses `knobs.runtime.add_stages_inspection_hook`, Triton's
 own documented extension point for rewriting stages, so it depends on one public
-name and nothing else. Refusing the cubin rather than guessing at it is
-deliberate: SASS is undocumented, and a decoder for it is not something this
-project will contain.
+name and nothing else. A Triton left with the real ptxas produces cubins, which
+run on their SASS.
 
 `tl.dot` works, which means Triton's tensor-core path works: it emits
 `ldmatrix.sync.aligned.m8n8.x4.shared.b16`, the form that names the shared space

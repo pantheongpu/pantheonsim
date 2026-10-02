@@ -49,6 +49,21 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes);
 // two-argument form anywhere a size exists.
 std::vector<FatbinPtx> extract_ptx(const void* data);
 
+// The fatbin's cubins (ELF images of SASS), by the same walk: `arch` is the
+// SASS architecture (86 for sm_86), `text` the ELF bytes.
+std::vector<FatbinPtx> extract_elf(const void* data, size_t bytes);
+std::vector<FatbinPtx> extract_elf(const void* data);
+
+// The cubin a device of compute capability `cc` runs from a fatbin, as the
+// driver picks it: SASS built for exactly this architecture, or else the
+// newest the device can run (the same major, an older minor). Only linked
+// cubins (ET_EXEC): relocatable ones (-rdc) need a device link first, and
+// the PTX path links those. Empty when there is none, when VGPU_SASS=0
+// asks for PTX only, or when the cubin holds an instruction the SASS
+// executor does not run yet and the fatbin has PTX (VGPU_SASS=1: the cubin
+// regardless).
+std::string pick_cubin(const void* fatbin, uint32_t cc);
+
 // Which of a fatbin's PTX images the driver would JIT for a device of compute
 // capability `cc` (e.g. 90), as an index into `ptxs`; ptxs.size() if empty.
 //

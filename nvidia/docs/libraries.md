@@ -27,6 +27,30 @@ inverse DCT, so two correct decoders differ by about a count per pixel. The
 conformance test compares statistics at a precision that rounding cannot move,
 which is the honest meaning of "the same image".
 
+## cuDSS: a sparse direct solver of its own
+
+As with nvJPEG there is nothing to delegate to, so `nvidia/src/cudss_solver.cpp`
+is a multifrontal solver: minimum-degree ordering on the quotient graph,
+supernodes from the elimination tree, and dense partial factorization of each
+front -- LU with threshold partial pivoting, LDL^T (LDL^H) with 1x1 and 2x2
+pivots, Cholesky -- where a column with no stable pivot in its front is delayed
+to the parent's. It is deterministic and works in double precision whatever the
+caller's type.
+
+What the matrix fixes agrees with NVIDIA's library: solutions, residuals, the
+inertia (exactly, for SCS's quasi-definite KKT systems), `INFO` for a matrix
+passed as positive definite that is not. What the factorization chooses does
+not: the permutation (NVIDIA's default is nested dissection), `LU_NNZ`,
+`FLOPS`, `DIAG` (each pivot, reported by original row, depends on the order),
+and `NPIVOTS`, which counts pivots replaced by the pivot epsilon -- NVIDIA's
+library pivots only on the diagonal of each supernode and perturbs a zero
+pivot where this one takes a 2x2 pivot or delays the column. Statuses,
+defaults, sizes and phase rules were measured on an RTX 3060 where the
+documentation leaves them open, and `nvidia/tests/e2e/cudss_*.cpp` pass against
+both libraries. Refused with a message: the Schur complement mode, the nested
+dissection tree, double-double values, and a matrix distributed across
+processes.
+
 | library | soname | what it covers |
 | --- | --- | --- |
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
@@ -41,6 +65,7 @@ which is the honest meaning of "the same image".
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the 64-bit X API, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
 | nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |

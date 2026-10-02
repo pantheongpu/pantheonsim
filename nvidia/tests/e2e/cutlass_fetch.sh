@@ -125,3 +125,17 @@ cutlass_compile_jobs() {
   (( jobs > max )) && jobs=$max
   echo "$jobs"
 }
+
+# VGPU_CUTLASS_SASS=1: build each test's SASS as well as its PTX (-code=sm_XX,
+# compute_XX), as a user's build does, and require that the SASS is what ran
+# (nvidia/docs/sass.md). By default the tests carry PTX only.
+cutlass_code() {   # cutlass_code compute_XX -> the -code list
+  if [[ "${VGPU_CUTLASS_SASS:-0}" == 1 ]]; then echo "sm_${1#compute_},$1"; else echo "$1"; fi
+}
+cutlass_sass_check() {   # cutlass_sass_check <name> <output>: fails when the SASS did not run
+  [[ "${VGPU_CUTLASS_SASS:-0}" == 1 ]] || return 0
+  if grep -q "running PTX instead of SASS" <<<"$2"; then
+    echo "FAIL: $1 fell back to its PTX: $(grep -m1 'running PTX instead of SASS' <<<"$2")"; return 1
+  fi
+  grep -q "running SASS" <<<"$2" || { echo "FAIL: $1 did not run its SASS"; return 1; }
+}
