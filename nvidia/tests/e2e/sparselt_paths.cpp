@@ -708,19 +708,22 @@ int main() {
 
   // ---- compression: sizes, kept values, metadata ----
   {
-    struct Sz { cudaDataType t; int64_t r, c; size_t cs, cbs; } sizes[] = {
+    struct Sz { cudaDataType t; int64_t r, c; size_t cs, cbs; cusparseOrder_t o; } sizes[] = {
         {CUDA_R_16F, 64, 64, 4608, 512},    {CUDA_R_16F, 16, 32, 768, 256},     {CUDA_R_16F, 64, 32, 2560, 512},
         {CUDA_R_16F, 96, 160, 17920, 2560}, {CUDA_R_16BF, 128, 128, 18432, 2048}, {CUDA_R_8I, 64, 64, 4096, 1024},
         {CUDA_R_8I, 96, 160, 15872, 4096},  {CUDA_R_8I, 256, 64, 16384, 4096},  {CUDA_R_32F, 64, 64, 10240, 1024},
         {CUDA_R_32F, 8, 16, 768, 256},      {CUDA_R_32F, 96, 160, 40960, 5120},
+        // int8 sizes are not symmetric: K is taken as the contiguous dimension
+        {CUDA_R_8I, 64, 128, 8192, 2048, COL}, {CUDA_R_8I, 128, 64, 6144, 1024, COL}, {CUDA_R_8I, 128, 64, 8192, 2048},
     };
     for (const Sz& z : sizes) {
       cusparseLtMatDescriptor_t d;
       size_t cs = 0, cbs = 0;
-      const int s0 = cusparseLtStructuredDescriptorInit(&h, &d, z.r, z.c, z.c, 16, z.t, ROW, S50);
+      const cusparseOrder_t o = z.o == COL ? COL : ROW;
+      const int s0 = cusparseLtStructuredDescriptorInit(&h, &d, z.r, z.c, o == ROW ? z.c : z.r, 16, z.t, o, S50);
       const int s1 = cusparseLtSpMMACompressedSize2(&h, &d, &cs, &cbs);
       char what[120];
-      std::snprintf(what, sizeof what, "type %d %lldx%lld compresses to %zu bytes with a %zu-byte buffer (got %zu, %zu)", (int)z.t, (long long)z.r, (long long)z.c, z.cs, z.cbs, cs, cbs);
+      std::snprintf(what, sizeof what, "type %d %lldx%lld %s-major compresses to %zu bytes with a %zu-byte buffer (got %zu, %zu)", (int)z.t, (long long)z.r, (long long)z.c, o == ROW ? "row" : "column", z.cs, z.cbs, cs, cbs);
       check(s0 == 0 && s1 == 0 && cs == z.cs && cbs == z.cbs, what);
     }
     // fp16 64x64: values row-major, then the metadata in the card's layout

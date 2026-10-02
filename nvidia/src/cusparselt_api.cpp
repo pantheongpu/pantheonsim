@@ -418,9 +418,14 @@ bool compressible_type(int t) {
   return t == CUDA_R_16F || t == CUDA_R_16BF || t == CUDA_R_8I || t == CUDA_R_32F;
 }
 size_t values_bytes(int t, int64_t nk, int64_t k) { return (size_t)(nk * (k / 2)) * type_bytes(t); }
-// One batch's compressed bytes for a structured descriptor: the descriptor's
-// rows x columns decide, whichever operand it is (see MetaCodec).
-size_t descriptor_meta_bytes(const MatImpl& m) { return meta_bytes(m.type, m.rows, m.cols); }
+// One batch's compressed bytes for a structured descriptor, which does not
+// say which operand it is: K is taken to be the contiguous dimension
+// (measured: CompressedSize2 and the plan's CompressedSize agree, and for
+// int8 -- whose sizes are not symmetric in the two dimensions, and whose
+// operands must be K-contiguous -- both give the K-contiguous sizes of a
+// column-major A or B).
+int64_t line_length(const MatImpl& m) { return m.order == CUSPARSE_ORDER_ROW ? m.cols : m.rows; }
+size_t descriptor_meta_bytes(const MatImpl& m) { return meta_bytes(m.type, lines(m), line_length(m)); }
 size_t descriptor_batch_bytes(const MatImpl& m) { return values_bytes(m.type, m.rows, m.cols) + descriptor_meta_bytes(m); }
 // A batch stride of 0 is one matrix for every batch, so one compressed copy.
 int64_t compressed_batches(const MatImpl& m) { return m.stride == 0 ? 1 : m.batches; }
@@ -446,10 +451,10 @@ size_t nibble8(int64_t r, int64_t g, int64_t nk) {
 }
 
 // Where each 4-bit code goes. The region's size comes from the descriptor
-// as NVIDIA's CompressedSize2 sees it (rows x columns, no operation), which
-// for int8 can be smaller than the card's layout of the logical operand
-// needs (a B with K along its rows); such a matrix keeps its codes row-major
-// instead, which no measured shape needed.
+// alone (see descriptor_meta_bytes), which for int8 can be smaller than the
+// card's layout of the logical operand needs when K is not the contiguous
+// dimension -- a layout no int8 product accepts; such a matrix keeps its
+// codes row-major instead.
 struct MetaCodec {
   int t;
   int64_t nk, k;
@@ -1066,7 +1071,7 @@ Status sizes(const char* api, const SparseTarget& g, size_t* compressedSize, siz
   // batch for a batched descriptor that no plan has used yet; this one counts
   // them all.
   *compressedSize = descriptor_batch_bytes(g.m) * (size_t)compressed_batches(g.m);
-  *bufferSize = buffer_bytes(g.m.type, g.m.rows, g.m.cols) * (size_t)compressed_batches(g.m);
+  *bufferSize = buffer_bytes(g.m.type, lines(g.m), line_length(g.m)) * (size_t)compressed_batches(g.m);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1684,9 +1689,6 @@ cusparseStatus_t cusparseLtSpMMACompressedSize2(const cusparseLtHandle_t* handle
   if (Status s = check_handle(api, handle)) return s;
   const MatImpl* m = mat(sparseMatDescr);
   if (!m) return bad_arg(api, 2, "sparseMatDescr", sparseMatDescr ? "bad initialization or already destroyed" : "NULL pointer");
-  // The descriptor alone does not say which operand it is; the sizes do not
-  // depend on it beyond which dimension is K, and for the descriptor's own
-  // rows x columns NVIDIA's measured sizes are those of A with op N.
   return sizes(api, SparseTarget{*m, true, CUSPARSE_OPERATION_NON_TRANSPOSE}, compressedSize, compressedBufferSize);
 }
 
