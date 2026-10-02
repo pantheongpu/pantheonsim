@@ -51,6 +51,39 @@ both libraries. Refused with a message: the Schur complement mode, the nested
 dissection tree, double-double values, and a matrix distributed across
 processes.
 
+## cuSPARSELt: the card's pruning and compressed layout
+
+`nvidia/src/cusparselt_api.cpp` answers the cuSPARSELt 0.10 API on the host.
+Everything an application can observe was measured against NVIDIA's library on
+an RTX 3060, and `nvidia/tests/e2e/sparselt_paths.cpp` passes against both:
+
+- the descriptor checks (which refusals are `INVALID_VALUE` and which
+  `NOT_SUPPORTED`), attribute defaults and sizes, and the combinations sm_86
+  accepts -- fp16, bf16 and tf32 with fp32 compute, int8 with int32 compute
+  into int8, int32, fp16 or bf16 when both operands run along K;
+- the pruning, value for value: STRIP keeps the two larger magnitudes of each
+  group of four (the lower position on a tie); TILE keeps the pattern of
+  largest L1 norm in each 4x4 tile, ties broken in an order measured on the
+  card (fp32 uses 1:2 groups and 2x2 tiles);
+- the compressed matrix: its size and buffer size (formulas fitted to every
+  shape of a grid up to 320 x 320), the kept values (fp32 ones carrying the
+  tf32 rounding half-unit, as the card stores them) and the 2-bit metadata in
+  the card's layout;
+- Matmul's rounding: operands rounded to tf32 to nearest (ties away), fp32
+  accumulation, round-to-nearest-even into every output type, saturation into
+  integers, ReLU's signed zero, GELU (the tanh form), the bias type (D's type,
+  float for int8 inputs), alpha and beta vectors, batches and broadcasts.
+
+Where it differs: NVIDIA's metadata layout for 8- and 16-bit values changes at
+larger shapes (seen at 256 x 64) and this one keeps the smaller shapes' layout,
+so compressed bytes of large matrices differ while products do not; pruning a
+group or tile that holds NaN or an infinity is not the card's; 587 pairs of
+TILE patterns never tie on their own on the card, so their order here is
+unmeasured; `MatmulSearch` runs the product once and keeps the plan's
+configuration; NVIDIA's `CompressedSize2` counts one batch until a plan has
+used the descriptor, this one always counts them all; the workspace a plan
+asks for is the card's for the default split-K and is never used.
+
 | library | soname | what it covers |
 | --- | --- | --- |
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
@@ -67,6 +100,7 @@ processes.
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32 and int8 (into int8, int32, fp16, bf16) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; the image is PTX (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
@@ -378,8 +412,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   every entry (NVIDIA's returns column indices past n), `gpsvInterleavedBatch`
   with an algo other than 0 is NOT_SUPPORTED (NVIDIA's does nothing and
   reports success). The solvers agree with NVIDIA's to rounding, not bit for
-  bit: they compute in double. cuSPARSELt is a library of its own and is not
-  provided.
+  bit: they compute in double.
+- **cuSPARSELt**: FP8 and FP4 inputs (sm_89 and later on NVIDIA's library;
+  their scale modes are accepted and ignored), fp16 compute (no sm_86 kernel on NVIDIA's library
+  either), and GELU outside int8 output (refused there too); see the section
+  above for where the compressed layout and the search differ.
 - **cuSOLVER**: the refactorization module (`cusolverRf`), cusolverSp's
   low-level preview API and its `csrlsvlu` on the device (NVIDIA ships only
   the host one), the randomized variants (`Xgesvdr`), left eigenvectors from
