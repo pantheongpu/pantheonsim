@@ -48,6 +48,7 @@
 // correct answer), and its Cholesky with reorder = 1 reading the upper
 // triangle it documents as ignored.
 #include <cusolverSp.h>
+#include <cusolverSp_LOWLEVEL_PREVIEW.h>
 
 #include <algorithm>
 #include <cmath>
@@ -73,8 +74,21 @@ namespace {
 using cd = std::complex<double>;
 
 struct SpHandle { cudaStream_t stream = nullptr; };
+// The low-level QR's state (cusolver_sp_lowlevel.inc); the device form shares
+// csrqrInfo_t with the batched QR, so it lives in QrInfo.
+struct QrLL {
+  int m = -1, n = -1, nnz = -1;
+  bool analyzed = false, buffered = false, setup = false, factored = false;
+  std::vector<int> off, col;
+  std::vector<cd> vals;                 // A - mu I, on A's pattern plus the diagonal
+  std::vector<int> voff, vcol;          // that matrix's pattern
+  std::vector<std::map<int, cd>> v;     // reflector k: rows > k (v(k) = 1 implicit)
+  std::vector<cd> tau;
+  std::vector<std::map<int, cd>> r;     // row k of R: columns >= k
+};
 struct QrInfo {
   int m = -1, n = -1, nnz = -1;
+  QrLL ll;
 };
 
 std::mutex& g_mu = *new std::mutex;
@@ -924,7 +938,7 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrqrAnalysisBatched(cusolverSpHandle_t 
   if (const cusolverStatus_t st = check_descr(d); st != CUSOLVER_STATUS_SUCCESS) return st;
   std::vector<int> o, c;
   if (!read_pattern(m, n, nnz, d, off, col, true, &o, &c)) return CUSOLVER_STATUS_INVALID_VALUE;
-  *reinterpret_cast<QrInfo*>(info) = QrInfo{m, n, nnz};
+  *reinterpret_cast<QrInfo*>(info) = QrInfo{m, n, nnz, QrLL{}};
   return CUSOLVER_STATUS_SUCCESS;
 }
 
@@ -1055,3 +1069,5 @@ VGPU_EXPORT cusolverStatus_t cusolverSpZcsreigsHost(cusolverSpHandle_t h, int m,
                                                     cuDoubleComplex lb, cuDoubleComplex ru, int* num) {
   return eig_count<cuDoubleComplex>(h, m, nnz, d, val, off, col, to_cd(lb), to_cd(ru), num);
 }
+
+#include "cusolver_sp_lowlevel.inc"
