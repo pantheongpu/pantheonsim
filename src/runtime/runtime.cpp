@@ -361,18 +361,16 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
   mod->target = "sm_" + std::to_string(sm->sm);
   // From sm_90 ptxas puts the driver's reserved shared memory (1 KiB) inside
   // each kernel's own .nv.shared section -- a kernel with none of its own has
-  // 0x400 there, beside a .nv.shared.reserved.0 section -- where before sm_90
-  // the section is the kernel's static shared memory alone. The profile adds
+  // 0x400 there, whether CUDA 12.0 built it or CUDA 13 (which also adds a
+  // .nv.shared.reserved.0 section beside it) -- where before sm_90 the
+  // section is the kernel's static shared memory alone. The profile adds
   // that reservation to every block itself (reserved_smem_per_block), so the
   // kernel's static size, for occupancy, the per-block limit and
   // cudaFuncGetAttributes, leaves it out, as the kernel's PTX does; counted
   // twice, a block asking for the most shared memory the part allows (as
   // CUTLASS's Hopper kernels do) could not be placed. Dynamic shared memory
   // still starts past the whole section.
-  bool reserve_in_section = false;
-  for (const sass::CubinSection& s : sm->cubin.sections)
-    if (s.name.rfind(".nv.shared.reserved.", 0) == 0) reserve_in_section = true;
-  const uint32_t in_section = reserve_in_section ? profile_.reserved_smem_per_block() : 0;
+  const uint32_t in_section = sm->sm >= 90 ? profile_.reserved_smem_per_block() : 0;
   for (const sass::CubinKernel& k : sm->cubin.kernels) {
     ptx::EntryFn e;
     e.name = k.name;
