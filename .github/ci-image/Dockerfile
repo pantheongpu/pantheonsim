@@ -21,6 +21,10 @@
 # Every image says which it is in PANTHEONSIM_CI_IMAGE, so a step can tell it
 # is running in one.
 #
+# The libraries' static archives (some GB) are deleted: nothing here links
+# them, and every job pulls the image. libcudart_static stays, as nvcc links it
+# by default.
+#
 # Anything a test probes for (python3, bc, lspci, objdump, readelf, taskset)
 # is installed too: a test that skips here but ran on the bare runner would be
 # lost coverage nobody sees.
@@ -38,6 +42,7 @@ RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
       g++-12 nvidia-cuda-toolkit nvidia-profiler clang llvm \
  && rm -rf /var/lib/apt/lists/* \
+ && find /usr/lib/x86_64-linux-gnu -name 'lib*_static*.a' ! -name 'libcudart_static.a' ! -name 'libculibos.a' -delete \
  && nvcc --version | tail -2
 # nvcc 12.0 rejects GCC 13's headers; the workflows also set this, but a job
 # that forgets cannot then fail on it.
@@ -60,6 +65,7 @@ RUN v=$(echo "$CUDA_VERSION" | tr . -) \
  && if apt-cache show "cuda-crt-$v" >/dev/null 2>&1; then pkgs="$pkgs cuda-crt-$v"; fi \
  && apt-get install -y -qq --no-install-recommends $pkgs \
  && rm -rf /var/lib/apt/lists/* \
+ && find "/usr/local/cuda-$CUDA_VERSION/" -name 'lib*_static*.a' ! -name 'libcudart_static.a' ! -name 'libculibos.a' -delete \
  && "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" --version | tail -2
 ENV PATH=/usr/local/cuda-$CUDA_VERSION/bin:$PATH CUDA_HOME=/usr/local/cuda-$CUDA_VERSION \
     NVCC_PREPEND_FLAGS="" PANTHEONSIM_CI_IMAGE=cuda$CUDA_VERSION
