@@ -1360,8 +1360,7 @@ if(TARGET vgpucublas)
   endforeach()
 
   # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
-  # fatbin and PTX, as an RTX 3060 answers for all three. The cubin needs SASS
-  # support; until it is in the tree the script asks only that it be refused.
+  # fatbin and PTX, as an RTX 3060 answers for all three.
   add_test(NAME e2e_managed_module
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_managed_module.sh)
   set_tests_properties(e2e_managed_module PROPERTIES

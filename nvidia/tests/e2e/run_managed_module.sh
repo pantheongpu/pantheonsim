@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # __managed__ variables in a module the driver API loads, from a cubin, a
 # fatbin and PTX (managed_module_load.cpp), on a simulated RTX 3060 -- the card
-# the expected answers come from, and the sm_86 the cubin is built for.
-#
-# Until SASS execution is in the tree (PR #255; include/vgpu/sass/cubin.hpp
-# marks it), a cubin cannot be loaded, so VGPU_CUBIN_PENDING asks only that it
-# be refused cleanly. Once it is, the cubin is held to every check.
+# the expected answers come from, and the sm_86 the cubin is built for. The
+# cubin and the fatbin run as SASS.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -31,7 +28,6 @@ nvcc -std=c++17 -cudart none $(shim_sanitizer_nvcc_flags "$shim") \
      "$e2e/managed_module_load.cpp" -o "$tmp/managed_module_load" -lcuda
 require_shim_libs "$shim" "$tmp/managed_module_load" || exit 0
 
-[[ -e "$root/include/vgpu/sass/cubin.hpp" ]] || export VGPU_CUBIN_PENDING=1
 status=0
 result="$(VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$tmp/managed_module_load" \
           "cubin:$tmp/managed.cubin" "fatbin:$tmp/managed.fatbin" "ptx:$tmp/managed.ptx" 2>&1)" ||

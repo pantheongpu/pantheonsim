@@ -7,16 +7,11 @@
 // CU_POINTER_ATTRIBUTE_IS_MANAGED says it is managed (and a plain __device__
 // variable is not), the host reads its initial value and writes it in place,
 // and a kernel's writes reach the host after cuCtxSynchronize. Every check
-// passes on an RTX 3060 for all three forms.
-//
-// A cubin is SASS, which VirtualGPU executes only once SASS support is in the
-// tree (PR #255). Until then run_managed_module.sh sets VGPU_CUBIN_PENDING,
-// and a cubin need only be refused cleanly; the other two forms carry PTX and
-// are checked in full regardless.
+// passes on an RTX 3060 for all three forms. The cubin and the fatbin run
+// as SASS on the simulator, the PTX as PTX.
 #include <cuda.h>
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -34,12 +29,6 @@ static void module_checks(const std::string& kind, const std::vector<char>& imag
   const std::string in = " (" + kind + ")";
   CUmodule mod;
   const CUresult loaded = cuModuleLoadData(&mod, image.data());
-  if (kind == "cubin" && std::getenv("VGPU_CUBIN_PENDING")) {
-    check(loaded != CUDA_SUCCESS, "a cubin is refused until SASS support lands" + in);
-    if (loaded != CUDA_SUCCESS) std::printf("note: cubin checks wait for SASS support (PR #255)\n");
-    if (loaded == CUDA_SUCCESS) cuModuleUnload(mod);
-    return;
-  }
   check(loaded == CUDA_SUCCESS, "the module loads" + in);
   if (loaded != CUDA_SUCCESS) return;
   CUdeviceptr counter = 0, scaled = 0, plain = 0;
