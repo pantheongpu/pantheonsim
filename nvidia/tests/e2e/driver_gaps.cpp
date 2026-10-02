@@ -955,6 +955,17 @@ int main() {
     std::printf("FAIL: no device\n");
     return 1;
   }
+  {
+    // Before any context is current (an RTX 3060, CUDA 13.0): the calls that
+    // need one answer CUDA_ERROR_INVALID_CONTEXT, cuCtxGetCurrent a null one.
+    CUdevice d = -5;
+    CUcontext c = (CUcontext)0x1;
+    IS(cuCtxGetDevice(&d), CUDA_ERROR_INVALID_CONTEXT);
+    IS(cuCtxGetDevice(nullptr), CUDA_ERROR_INVALID_VALUE);
+    IS(cuCtxSynchronize(), CUDA_ERROR_INVALID_CONTEXT);
+    IS(cuCtxGetCurrent(&c), CUDA_SUCCESS);
+    check(c == nullptr, "no context is current yet");
+  }
   // CUDA 13's cuCtxCreate takes a parameter block; a zeroed one (what CUDA's
   // own samples pass) is an ordinary context.
 #if CUDA_VERSION >= 13000
