@@ -1,13 +1,17 @@
 // libvgpucusparse -- VirtualGPU's cuSPARSE, presented as libcusparse.so.12.
 //
-// The generic (descriptor) API: CSR, CSC, COO and BSR sparse matrices, dense
-// vectors and matrices, strided batches of them, SpMV, SpMM, SpGEMM, SDDMM,
-// triangular solves (SpSV, SpSM) and conversion in both directions, in real and
-// complex values. Of the legacy API, what CUDA 12 and 13 still ship: matrix
-// descriptors, coo2csr, the COO and CSR sorts, csrgeam2 (C = alpha A + beta B),
-// the CSR transpose csr2cscEx2 (which SCS calls), the blocked (BSR) routines --
+// Every entry point NVIDIA's cuSPARSE 13.0 exports. The generic (descriptor)
+// API: CSR, CSC, COO, BSR, Blocked-ELL and sliced-ELL sparse matrices, sparse
+// and dense vectors, dense matrices, strided batches of them, SpMV, SpMM,
+// SpGEMM (and SpGEMMreuse), SDDMM, triangular solves (SpSV, SpSM), SpVV and
+// the other sparse-vector operations, and conversion in both directions, in
+// real and complex values. Of the legacy API, what CUDA 12 and 13 still ship:
+// matrix descriptors, coo2csr, the COO, CSR and CSC sorts, csrgeam2, the CSR
+// transpose csr2cscEx2 (which SCS calls), gemvi, the blocked (BSR) routines --
 // bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02 and the CSR <-> BSR
-// conversions -- and their CSR counterparts csric02 and csrilu02.
+// and BSR <-> BSR/BSC conversions -- csric02 and csrilu02, the tridiagonal and
+// pentadiagonal solvers (cusparse_tridiag.inc), pruning, coloring, nnz counting
+// and compression, and unsorted CSR (cusparse_helpers.inc).
 //
 // Like the other vendor libraries the arithmetic runs on the host, in double
 // (std::complex<double> for complex values), and is rounded to the requested

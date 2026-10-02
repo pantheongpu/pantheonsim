@@ -19,9 +19,10 @@
 //   * nnz_compress counts |a| > tol per row, |a| in the value type's precision
 //     (cuCabsf for complex); only tol's real part is read, and a negative one
 //     is INVALID_VALUE. csr2csr_compress keeps the same entries. NVIDIA's
-//     keeps a > tol instead (negative entries dropped, for real and complex
-//     values alike), leaving the slots nnz_compress counted for them unwritten;
-//     this keeps what the count and the documentation say.
+//     does not always: for real values it keeps a > tol (dropping negative
+//     entries), and for complex ones it compares against |tol| where
+//     nnz_compress read Re(tol) -- either way leaving slots nnz_compress
+//     counted unwritten. This keeps what the count and the documentation say.
 //   * csru2csr needs csru2csr_bufferSizeExt first, with the same nnz, and
 //     csr2csru a csru2csr before it (INVALID_VALUE otherwise): the sort's
 //     permutation lives in the info.
