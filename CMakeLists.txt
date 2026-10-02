@@ -2026,6 +2026,16 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The rest of cuDNN's classic API -- vectorized INT8x4/INT8x32 layouts and
+  # convolution, INT8 pooling and activation, divisive normalization, tensor
+  # transform descriptors, LSTM projections and the RNN getters -- against
+  # host references; it also passes against NVIDIA's library on an RTX 3060.
+  add_test(NAME e2e_dnn_classic_paths
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh dnn_classic_paths cudnn)
+  set_tests_properties(e2e_dnn_classic_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   # The runtime and driver APIs sharing one simulated machine.
   add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
   set_tests_properties(e2e_mixed_apis PROPERTIES
