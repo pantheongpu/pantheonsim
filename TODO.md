@@ -640,8 +640,9 @@ past that it stops being caution and starts being a false negative.
 
 **Vendor libraries.** cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
 cuSOLVER, NCCL, NVRTC, NPP and nvJPEG are implemented under their real sonames, each verified
-against NVIDIA's own library on a physical GPU: cuDNN, cuFFT and cuSPARSE are
-bit-identical on every value the conformance suite reports, cuSOLVER on
+against NVIDIA's own library on a physical GPU: cuFFT and cuSPARSE are
+bit-identical on every value the conformance suite reports, cuDNN on its
+forward suite and to 1e-6 relative on its training suite, cuSOLVER on
 everything but one f32 eigenvalue, and NCCL on all 24 values at two ranks
 across two physical GPUs. The math runs on the host rather than through the
 interpreter, because a vendor library is not user code — see nvidia/docs/libraries.md

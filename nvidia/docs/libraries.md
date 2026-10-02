@@ -34,7 +34,7 @@ which is the honest meaning of "the same image".
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex), GEMV, level‑1, triangular solves, batched LU (`getrfBatched`/`getrsBatched`); for complex also rank-1/rank-k updates, Hermitian products, `trmm`/`trmv`/`trsv` |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
-| cuDNN | `libcudnn.so.9` | convolution, activation, pooling, softmax, batchnorm |
+| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization, dropout, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC; the graph API's convolution, matmul, pointwise and reduction graphs; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC; legacy coo2csr, sorts and csrgeam2. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
@@ -74,6 +74,8 @@ output. Anything that differs is a bug in this implementation.
 | `cublas_gemm` | every GEMM path bit-identical, mixed precision included; level‑1/2 to ~1e‑7 |
 | `lt_and_rand` | cuBLASLt bit-identical; cuRAND matches distribution and reseed semantics |
 | `cudnn_ops` | all 50 reported values bit-identical |
+| `cudnn_backward` | all 139 lines agree to 1e‑6 relative: the three convolution passes (groups, dilation, both modes, NHWC, strided, 3‑D, double), fused bias-activation, activation, pooling, softmax and LRN backward, reductions with every index identical, op-tensor, transforms, dropout's backward pass, NHWC batch normalization |
+| `cudnn_types` | INT8 convolution identical to the integer; float-to-half and -bfloat16 bits identical; half and bfloat16 convolution, activation, pooling, softmax and batch normalization to 2e‑4 |
 | `cufft_transforms` | all 14 bit-identical, across composite, prime, 2‑D, 3‑D and both precisions |
 | `cusparse_ops` | all 15 bit-identical; CSR to CSC identical in every index and value, both bases, both value types, structure only and with values |
 | `cublas_level1` | single and double `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and `tbmv` agree, every index identical, negative increments included |
@@ -84,11 +86,11 @@ output. Anything that differs is a bug in this implementation.
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
 | `multi_gpu` | all 13 identical to two physical GPUs |
 
-Two of those suites, `cublas_level1` and `cusparse_ops`, also run in CI on
-every pull request: `e2e_library_goldens` compiles them against the simulator
-alone and compares the output with what the RTX 3060 printed
-(`nvidia/tests/conformance/golden/`), so a change that makes a routine disagree
-with the hardware fails on a runner with no GPU.
+Four of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward` and
+`cudnn_types`, also run in CI on every pull request: `e2e_library_goldens`
+compiles them against the simulator alone and compares the output with what
+the RTX 3060 printed (`nvidia/tests/conformance/golden/`), so a change that
+makes a routine disagree with the hardware fails on a runner with no GPU.
 
 The library majors in that table are the ones this machine has; the build
 reads each soname off the installed toolkit, so on a CUDA 12 host the same
@@ -98,6 +100,26 @@ Some of those numbers came out of the hardware rather than the documentation.
 cuDNN rejects `CUDNN_ACTIVATION_IDENTITY` from `cudnnActivationForward`, and
 cuRAND does *not* rewind its stream when the seed is set again. Both were found
 by differential testing and are matched deliberately.
+
+cuDNN's training paths were pinned down the same way, on an RTX 3060 with
+cuDNN 9.27. Its gradients read the forward pass's input for ReLU, clipped ReLU
+(which passes `0 < x <= coef`) and swish, and its output for sigmoid, tanh and
+ELU. Max pooling's gradient goes to the first largest input of a window,
+recomputed from x; `MAX_DETERMINISTIC` sends it to the first input equal to y.
+An LRN window of even size reaches one channel further up than down.
+`cudnnSetTensor` takes a float for a half tensor; an INT8 result is the float
+`alpha * sum` rounded to nearest even and saturated. The algorithm lists have
+8, 6 and 7 entries (the max counts say 10, 8 and 9) with forward `DIRECT` and
+backward-filter `WINOGRAD` never runnable; dropout's reserve space is one bit
+per element, least significant first, rounded up to whole words. All of that
+is matched. Where the arithmetic order is the hardware's own choice it is not:
+float and double sums are accumulated exactly here and rounded once, a
+`TRUE_HALF` convolution accumulates in half in its own order, and the dropout
+mask comes from a different generator (kept fraction, scaling, reseeding and
+the backward pass are cuDNN's). And this library runs some configurations
+NVIDIA's does not -- every algorithm for every shape, dy with gaps in
+backward-data and x with gaps in backward-filter, double-precision NHWC
+backward-data -- rather than refusing them.
 
 ## Checked in CI without hardware
 
@@ -114,6 +136,8 @@ runs them; each is a ctest of its own.
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
+| `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout | `conv2d`, pooling and activation backward |
+| `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward | `cudnn_convolution_add_relu`, cudnn-frontend |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
 what they assert is what the real libraries do, not only what these do. Two
@@ -245,8 +269,14 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `her2k`/`syr2k`, the `rot` family, `geqrfBatched` and `gelsBatched`.
 - **cuBLASLt**: the backward epilogues (`BGRADA`/`BGRADB`, `DRELU`, `DGELU`),
   auxiliary outputs, and the block-scaled FP8/FP4 modes.
-- **cuDNN**: the graph/backend API of cuDNN 8+, non-NCHW layouts, non-float
-  types, and every backward pass.
+- **cuDNN**: in the graph API, every operation but convolution, matmul,
+  pointwise and reduction (normalization, resampling, attention, RNG,
+  concatenation, ...), ragged and vectorized tensors, asymmetric padding; the
+  vectorized layouts (`NCHW_VECT_C`, INT8x4/INT8x32) and FP8 tensors; batch
+  normalization's fused add and activation; the cuDNN 8 normalization API,
+  divisive normalization, spatial transformers, CTC loss, `cudnnIm2Col`,
+  fused-ops plans and tensor transform descriptors; RNN dropout, projections
+  and non-float RNNs.
 - **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
   CUDA 12), the blocked (BSR) routines, complex values.

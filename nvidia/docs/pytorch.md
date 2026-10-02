@@ -48,7 +48,11 @@ paths tested here do not call them.
   Without both, a GPT training step took more than 6 GB.
 - **Convolutions:** cuDNN's backend (graph) API (`nvidia/src/cudnn_backend.cpp`):
   forward, backward-data and backward-filter, 1-3 spatial dimensions, groups,
-  dilation, any strides; float, half, bfloat16, double. Computed on the host.
+  dilation, any strides; float, half, bfloat16, double; and the graphs that
+  fuse a convolution with pointwise operations, such as conv + bias + ReLU.
+  Computed on the host. The classic API (`nvidia/src/cudnn_api.cpp`) covers
+  the same convolutions and every other layer's backward pass, for frameworks
+  that call it.
 - **BatchNorm:** cuDNN's training forward and backward (the Ex forms).
 - **RNNs:** cuDNN's RNN API (`nvidia/src/cudnn_rnn.cpp`): LSTM, GRU and
   ReLU/tanh RNNs, one or two directions, padded or packed sequences.
@@ -63,9 +67,9 @@ paths tested here do not call them.
 
 - Dropout between the layers of a cuDNN RNN in training, LSTM projections,
   and non-float RNNs: refused by name.
-- Graphs cuDNN's backend would run with fused operations (pointwise, norms,
-  matmul inside a graph): refused when the graph is finalized, so PyTorch
-  falls back or reports it.
+- Graphs with operations other than convolution, matmul, pointwise and
+  reduction (norms, resampling, attention): refused when the graph is
+  finalized, so PyTorch falls back or reports it.
 - Anything a kernel does that the PTX interpreter does not implement: the
   launch fails naming the instruction, and the PyTorch test scripts fail on any
   such line, even if a check prints `ok`.
@@ -74,6 +78,8 @@ paths tested here do not call them.
 
 - `e2e_dnn_paths`: cuDNN's graph API, BatchNorm, RNNs and cuBLASLt called
   directly, against host references and finite differences. Needs no PyTorch.
+- `e2e_dnn_backward`, `e2e_dnn_graph`: the classic API's backward passes and
+  multi-operation graphs, likewise (`nvidia/docs/libraries.md`).
 - `e2e_mixed_apis`: the runtime and driver APIs on one machine.
 - `test_runtime`, `test_exec`: lazy parsing, and the 256-bit `.v8` accesses
   PyTorch's elementwise kernels use.
