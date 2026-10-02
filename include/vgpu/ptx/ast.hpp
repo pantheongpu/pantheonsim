@@ -71,7 +71,9 @@ enum class Sreg : uint8_t {
   SmId, NSmId,
   // Shared memory available to the block: the launch's dynamic bytes, and that
   // plus the module's static declarations, in the allocation unit's steps.
-  DynamicSmemSize, TotalSmemSize,
+  // %aggr_smem_size (sm_90 and later) adds the driver's reserved shared memory
+  // to the second: everything the block was allocated.
+  DynamicSmemSize, TotalSmemSize, AggrSmemSize,
   // Where the driver's reserved shared memory lies (sm_80 and later), as
   // offsets in the block's shared window: it starts where the kernel's own
   // shared memory ends, and cooperative_groups keeps the scratch for tiles of

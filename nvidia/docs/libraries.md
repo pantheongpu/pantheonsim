@@ -56,7 +56,7 @@ processes.
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
-| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex), GEMV, level‑1, triangular solves, batched LU (`getrfBatched`/`getrsBatched`); for complex also rank-1/rank-k updates, Hermitian products, `trmm`/`trmv`/`trsv` |
+| cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (the plane rotations bit for bit), triangular solves, batched LU (`getrfBatched`/`getrsBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`); see [cublas.md](cublas.md) |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS), pooling and concatenation graphs; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
@@ -68,6 +68,8 @@ processes.
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
+| nvJitLink | `libnvJitLink.so.13` | linking PTX, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; the image is PTX (below) |
+| nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
 | nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |
 | NVENC | `libnvidia-encode.so.1` | video encode |
@@ -297,13 +299,58 @@ PTX. That is what turned up two gaps in the PTX parser — a forward-declared
 `.entry` prototype, and a global initialised with another symbol's address —
 both of which appear in ordinary nvcc output and are now handled.
 
+## nvJitLink and nvFatbin: linking stops at PTX
+
+nvJitLink is the device linker as a library. NVIDIA's compiles every input to
+SASS and links a cubin; VirtualGPU executes PTX, so its nvJitLink links the
+inputs' PTX into one module and hands that module out as the "cubin" -- the
+choice NVRTC's shim makes for `nvrtcGetCUBIN`, for the same reason: whatever
+the caller does with a cubin (`cuModuleLoadData`, `cuLibraryLoadData`, write
+it to a file for `cuModuleLoad`, wrap it with nvFatbin) it can do with PTX
+here. `nvJitLinkGetLinkedPtx` returns the same module, without the `-lto -ptx`
+NVIDIA's asks for.
+
+The linking is a linker's, measured against NVIDIA's on an RTX 3060: a
+symbol with external linkage has one definition, a strong one beating a
+`.weak` one; a second strong definition is named in the error log and
+dropped, the link still succeeding (as NVIDIA's does); an undefined reference
+fails the link with `NVJITLINK_ERROR_INTERNAL` and its name; each module's
+file-scope names stay its own (two modules may both have a `twice`). The
+linked module declares everything before its first use, the way ptxas
+insists, so NVIDIA's driver JITs it as readily as VirtualGPU runs it.
+
+Inputs are PTX, a fatbin's PTX (the image the driver would pick for
+`-arch`), the device code nvcc puts in a host object's `.nv_fatbin` and
+`__nv_relfatbin` sections and in a static library's members, and VirtualGPU's
+own cubins, which are PTX. A linked cubin (`nvcc -cubin`) is accepted and adds
+nothing, which is how NVIDIA's treats one. Relocatable SASS (`-rdc` or `-dc`
+cubins, a fatbin with no PTX) is refused, since linking machine code means
+applying its relocations and this links PTX; so is LTO-IR, NVVM bitcode that
+only NVIDIA's compiler reads -- both by name in the error log, with what to
+add instead. The simulator runs SASS too, but the linked image stays PTX:
+the only SASS NVIDIA's linker would carry into its output is relocatable
+code, which is what is refused.
+
+nvFatbin needs no GPU at all, so it is the whole library: it writes the
+container NVIDIA's writes with `-compress=false`, entry for entry, and
+NVIDIA's driver loads it as VirtualGPU's loaders do. It never compresses,
+and it takes a VirtualGPU cubin (PTX) as the PTX it is.
+
+`e2e_nvjitlink_paths` and `e2e_nvfatbin_paths` check all of this, and pass
+unchanged against NVIDIA's libnvJitLink and libnvfatbin 13.0 on an RTX 3060
+-- and with VirtualGPU's two libraries in their place on the same card, whose
+driver then runs the linked PTX.
+
 ## What is not implemented
 
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
-- **cuBLAS**: most of real level‑2/3; for complex types `her`/`her2`/`syr`/`syr2`,
-  `her2k`/`syr2k`, the `rot` family, `geqrfBatched` and `gelsBatched`.
+- **cuBLAS**: the legacy (pre-`_v2`) API, cuBLASXt, the band and packed level-2
+  routines (`gbmv`, `sbmv`, `spmv`, `tpsv` and the rest), the batched GEMVs,
+  `getriBatched`/`matinvBatched`, `syrkx`/`herkx`, and most `_64` forms of
+  levels 2 and 3 (absent, so a program that needs one fails to load with the
+  name).
 - **cuBLASLt**: the backward epilogues (`BGRADA`/`BGRADB`, `DRELU`, `DGELU`),
   auxiliary outputs, and the block-scaled FP8/FP4 modes.
 - **cuDNN**: in the graph API, every operation but convolution, matmul,
@@ -339,6 +386,12 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.
+- **nvJitLink**: relocatable SASS and LTO-IR inputs (`-rdc`/`-dc` cubins, a
+  fatbin with no PTX, NVVM bitcode, index files), and so link-time
+  optimisation; the cubin it returns is PTX. Code-generation options (`-O`, `-maxrregcount`, `-Xptxas`, ...) are
+  accepted and have nothing to act on.
+- **nvFatbin**: compression (`-compress` is accepted, nothing is compressed)
+  and `nvFatbinAddIndex`, whose index names LTO-IR libraries.
 - **NPP**: a chosen subset -- allocation, per-pixel arithmetic and logic, data
   exchange, colour conversion, thresholding, statistics, box filtering, 3x3
   morphology, mirroring, resizing, and the signal-processing equivalents. The

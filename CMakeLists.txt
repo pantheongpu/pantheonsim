@@ -165,7 +165,7 @@ add_library(vgpu STATIC
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
 # libvgpucuda: the CUDA Driver API shim external programs link against.
-add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/fatbin.cpp)
+add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
@@ -360,11 +360,14 @@ if(CUDA_ABI_INCLUDE)
   # outside a session and what `vgpu shell` offers -- is never below it.
   file(STRINGS "${CUDA_ABI_INCLUDE}/cuda_runtime_api.h" _cudart_define
        REGEX "^#define[ \t]+CUDART_VERSION[ \t]+[0-9]+")
+  set(VGPU_TOOLKIT_VERSION "${SO_CUDART}000")
   if(_cudart_define MATCHES "([0-9]+)[ \t]*$")
     target_compile_definitions(vgpu PUBLIC VGPU_TOOLKIT_CUDART_VERSION=${CMAKE_MATCH_1})
+    set(VGPU_TOOLKIT_VERSION "${CMAKE_MATCH_1}")
     message(STATUS "toolkit runtime version: CUDART_VERSION ${CMAKE_MATCH_1}")
   endif()
-  add_library(vgpucudart SHARED nvidia/src/runtime_api.cpp nvidia/src/fatbin.cpp)
+  add_library(vgpucudart SHARED nvidia/src/runtime_api.cpp nvidia/src/fatbin.cpp
+              nvidia/src/fatbin_sass.cpp nvidia/src/ptx_link.cpp)
   target_link_libraries(vgpucudart PRIVATE vgpu ${CMAKE_DL_LIBS})
   target_include_directories(vgpucudart PRIVATE ${CUDA_ABI_INCLUDE} nvidia/src)
   # Present as the toolkit's own libcudart soname so unmodified binaries find
@@ -579,6 +582,46 @@ if(CUDA_ABI_INCLUDE)
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcustatevec.so.1.0"
             "${CMAKE_BINARY_DIR}/shim/libcustatevec.so"
     COMMENT "Creating cuStateVec shim symlinks (build/shim/libcustatevec.so.1)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvjitlink and libvgpunvfatbin: nvJitLink and nvFatbin, presented as
+  # libnvJitLink.so.13 and libnvfatbin.so.13 (.12 under CUDA 12). Both are host
+  # libraries -- a linker and a container writer -- so, like NVRTC, they carry
+  # no simulator and no runtime: only the fatbin reader and writer
+  # (fatbin.cpp) and the PTX linker the runtime also links -rdc builds with
+  # (ptx_link.cpp). Each is written from the documented API with the
+  # simulator's own declarations (nvidia/include/vgpu_nvjitlink.h,
+  # vgpu_nvfatbin.h), since CUDA 12.0 has no nvFatbin.h. NVIDIA tags both
+  # libraries' symbols with their soname, and the stubs programs link against
+  # ask for it. Both majors are the CUDA major (.so.12 throughout CUDA 12, .so.13
+  # in 13), so that is what is used rather than a copy found on the host: the
+  # pantheonsim.com runner's CUDA 13 toolkit has none, and the search found
+  # Ubuntu's CUDA 12 libnvJitLink.so.12 instead.
+  # ---------------------------------------------------------------------------
+  foreach(_entry IN ITEMS "nvJitLink:nvjitlink_api:NVJITLINK" "nvfatbin:nvfatbin_api:NVFATBIN")
+    string(REPLACE ":" ";" _parts "${_entry}")
+    list(GET _parts 0 _lib)
+    list(GET _parts 1 _src)
+    list(GET _parts 2 _macro)
+    string(TOLOWER "${_lib}" _lower)
+    set(_ver ${SO_CUDART})
+    vgpu_version_script(${_lib} ${_ver} _map)
+    add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp nvidia/src/fatbin.cpp
+                nvidia/src/ptx_link.cpp src/core/error.cpp)
+    target_include_directories(vgpu${_lower} PRIVATE include nvidia/src)
+    target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})   # libzstd, dlopened
+    target_compile_definitions(vgpu${_lower} PRIVATE VGPU_${_macro}_VERSION=${VGPU_TOOLKIT_VERSION})
+    set_target_properties(vgpu${_lower} PROPERTIES
+      OUTPUT_NAME ${_lib} SOVERSION ${_ver} VERSION ${_ver}.0 CXX_VISIBILITY_PRESET hidden)
+    target_link_options(vgpu${_lower} PRIVATE "-Wl,--version-script=${_map}")
+    add_custom_command(TARGET vgpu${_lower} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_lib}.so.${_ver}.0"
+              "${CMAKE_BINARY_DIR}/shim/lib${_lib}.so.${_ver}"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../lib${_lib}.so.${_ver}.0"
+              "${CMAKE_BINARY_DIR}/shim/lib${_lib}.so"
+      COMMENT "Creating ${_lib} shim symlinks (soname lib${_lib}.so.${_ver})")
+  endforeach()
 
   # ---------------------------------------------------------------------------
   # libvgpucudss: cuDSS, the sparse direct solver, presented as libcudss.so.0.
@@ -919,8 +962,14 @@ vgpu_unit_test(test_amd_gcn_grid amd/tests/unit/test_gcn_grid.cpp)
 target_compile_definitions(test_amd_gcn_grid PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
-target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp)
+target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(test_robustness PRIVATE ${CMAKE_DL_LIBS})
+# The PTX linker (-rdc builds, nvJitLink) and the fatbin writer and container
+# readers (nvFatbin, nvJitLink's object and library inputs), with no toolkit.
+vgpu_unit_test(test_ptx_link)
+target_include_directories(test_ptx_link PRIVATE nvidia/src)
+target_sources(test_ptx_link PRIVATE nvidia/src/fatbin.cpp nvidia/src/ptx_link.cpp)
+target_link_libraries(test_ptx_link PRIVATE ${CMAKE_DL_LIBS})
 
 # The C harness: an "external application" built with a plain C compiler
 # against the documented ABI only (vgpu_cuda.h + libvgpucuda.so).
@@ -1313,6 +1362,29 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # nvJitLink and nvFatbin as JIT frameworks call them: PTX, fatbins, a host
+  # object's and a static library's device code linked and loaded, the device
+  # linker's resolution rules, LTO-IR refused by name, and fatbins written at
+  # run time that the driver loads. Both programs pass against NVIDIA's
+  # libraries on an RTX 3060.
+  foreach(_prog IN ITEMS nvjitlink_paths nvfatbin_paths)
+    add_test(NAME e2e_${_prog}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_jit_link.sh ${_prog})
+    set_tests_properties(e2e_${_prog} PROPERTIES
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endforeach()
+
+  # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
+  # fatbin and PTX, as an RTX 3060 answers for all three.
+  add_test(NAME e2e_managed_module
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_managed_module.sh)
+  set_tests_properties(e2e_managed_module PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
 
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)

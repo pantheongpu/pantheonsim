@@ -47,6 +47,7 @@
 
 #include "error_names.hpp"
 #include "fatbin.hpp"
+#include "ptx_link.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
@@ -539,86 +540,6 @@ vgpu::MemoryManager& owner_memory(State& s, const void* p) {
   return current(s).memory();
 }
 
-// A linked-in piece's file-scope names -- module variables and functions
-// not declared .visible, .extern or .weak -- belong to that piece alone,
-// the way an object file's local symbols do. Pasted together they did
-// not: every translation unit names its first string literal $str, and
-// CUDA's device-runtime library, always one of the pieces, has a $str of
-// its own ("cudaSuccess"). Its definition won, so a program's string
-// literal read as the library's (NanoVDB's device strcmp returned 17 for
-// two equal strings: 't' - 'c'). Renaming each linked-in piece's locals
-// keeps them apart. nvcc's __nv_static_ names are already unique, and the
-// host registers them by name, so they are left alone.
-void localize_ptx(std::string& text, size_t piece) {
-  auto id_char = [](char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
-  };
-  auto starts = [](const std::string& line, const char* word) {
-    return line.compare(0, std::strlen(word), word) == 0;
-  };
-  std::set<std::string> locals;
-  size_t pos = 0;
-  while (pos < text.size()) {
-    size_t eol = text.find('\n', pos);
-    if (eol == std::string::npos) eol = text.size();
-    const std::string line = text.substr(pos, eol - pos);
-    pos = eol + 1;
-    // Module-scope declarations start in column 0; a function's own
-    // .shared or .local is indented and stays where it is.
-    const bool func = starts(line, ".func");
-    if (!func && !starts(line, ".global") && !starts(line, ".const")) continue;
-    std::string name;
-    size_t i = func ? 5 : 0;
-    if (func) {
-      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-      if (i < line.size() && line[i] == '(') {  // the return parameter list
-        const size_t close = line.find(')', i);
-        if (close == std::string::npos) continue;
-        i = close + 1;
-      }
-      while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-      size_t j = i;
-      while (j < line.size() && id_char(line[j])) ++j;
-      name = line.substr(i, j - i);
-    } else {
-      // ".global .align 8 .u64 name[8] = {...};": the first token that is
-      // neither a directive nor a number.
-      std::istringstream toks(line);
-      std::string tok;
-      while (toks >> tok) {
-        if (tok[0] == '.' || std::isdigit(static_cast<unsigned char>(tok[0]))) continue;
-        size_t j = 0;
-        while (j < tok.size() && id_char(tok[j])) ++j;
-        name = tok.substr(0, j);
-        break;
-      }
-    }
-    if (!name.empty() && name.compare(0, 12, "__nv_static_") != 0) locals.insert(name);
-  }
-  if (locals.empty()) return;
-  const std::string suffix = "$vgpu" + std::to_string(piece);
-  std::string out;
-  out.reserve(text.size() + locals.size() * 16);
-  for (size_t k = 0; k < text.size();) {
-    const char c = text[k];
-    // An identifier starts with a letter, '_' or '$'; a register (after
-    // '%') or a number is copied through untouched.
-    if ((std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$') &&
-        (k == 0 || (!id_char(text[k - 1]) && text[k - 1] != '%'))) {
-      size_t j = k;
-      while (j < text.size() && id_char(text[j])) ++j;
-      const std::string word = text.substr(k, j - k);
-      out += word;
-      if (locals.count(word)) out += suffix;
-      k = j;
-    } else {
-      out += c;
-      ++k;
-    }
-  }
-  text = std::move(out);
-}
-
 // The PTX a registered fatbin holds for this machine's devices: the image the
 // driver would JIT (pick_ptx), or, for a separately compiled (-rdc) build,
 // its relocatable pieces put together. Empty where there is none.
@@ -699,7 +620,7 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
         // the opposite of what had happened.
         if (pieces > 0) {
           text = strip_ptx_header(text);
-          localize_ptx(text, pieces);
+          vgpu::cuda::localize_ptx(text, pieces);
         }
         linked += text;
         linked += "\n";

@@ -1113,7 +1113,8 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
       // 64-bit CUDA one before anything further is read from a pointer that
       // came with no length.
       const auto* b = static_cast<const uint8_t*>(image);
-      if (b[4] != 2 || b[7] != 0x41) return CUDA_ERROR_INVALID_IMAGE;
+      // OS/ABI 0x41 is CUDA 13's (ELF ABI version 8), 0x33 CUDA 12's (7).
+      if (b[4] != 2 || (b[7] != 0x41 && b[7] != 0x33)) return CUDA_ERROR_INVALID_IMAGE;
       // A bare cubin: its size is in its own headers (the section table ends it).
       uint64_t shoff;
       uint16_t shentsize, shnum;
@@ -1123,7 +1124,10 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
       const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;
       uint32_t eflags;
       std::memcpy(&eflags, b + 0x30, 4);
-      const int sm = static_cast<int>((eflags >> 8) & 0xff);
+      // The architecture is in e_flags' second byte from ABI version 8 on,
+      // and its low byte before (as sass::parse_cubin reads it): a CUDA 12
+      // cubin for sm_86 carries 0x560556.
+      const int sm = static_cast<int>(b[7] == 0x33 ? eflags & 0xff : (eflags >> 8) & 0xff);
       if (!vgpu::sass::runs_on(sm, false, static_cast<int>(cc))) return CUDA_ERROR_NO_BINARY_FOR_GPU;
       try {
         mid = s.rt->device(dev).load_cubin(b, size);

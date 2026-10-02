@@ -737,6 +737,16 @@ std::string sreg_name(unsigned idx) {
     case 0x52: return "SR_GLOBALTIMERLO";
     case 0x53: return "SR_GLOBALTIMERHI";
     case 0x80: return "SR_PM0";
+    // The performance-monitor counters, as CUDA 13.0's ptxas writes %pm0-%pm7
+    // (CS2R; the odd index between two is the high half a 64-bit read takes).
+    case 0x64: return "SR_PM0";
+    case 0x66: return "SR_PM1";
+    case 0x68: return "SR_PM2";
+    case 0x6a: return "SR_PM3";
+    case 0x6c: return "SR_PM4";
+    case 0x6e: return "SR_PM5";
+    case 0x70: return "SR_PM6";
+    case 0x72: return "SR_PM7";
     default: {
       char b[16];
       std::snprintf(b, sizeof b, "SR%u", idx);
