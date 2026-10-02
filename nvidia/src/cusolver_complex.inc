@@ -144,7 +144,7 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     CMat a;                                                                                                       \
     if (!cload<T>(A, lda, n, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                        \
     std::vector<int> ipiv;                                                                                        \
-    set_info(info, vgpu_la::lu(a, m, n, devIpiv ? &ipiv : nullptr));                                              \
+    set_info(info, vgpu_la::lu(a, m, n, devIpiv ? &ipiv : nullptr, true));                                         \
     if (devIpiv && !ipiv.empty() &&                                                                               \
         cudaMemcpy(devIpiv, ipiv.data(), ipiv.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess)       \
       return CUSOLVER_STATUS_EXECUTION_FAILED;                                                                    \

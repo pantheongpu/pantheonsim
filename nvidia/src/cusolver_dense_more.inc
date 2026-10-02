@@ -783,7 +783,7 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf(cusolverDnHandle_t h, cusolverDnPa
     CMat a;
     if (!to_cmat<T>(A, lda, n, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
     std::vector<int> piv;
-    set_info(info, vgpu_la::lu(a, (int)m, (int)n, ipiv ? &piv : nullptr));
+    set_info(info, vgpu_la::lu(a, (int)m, (int)n, ipiv ? &piv : nullptr, true));
     std::vector<int64_t> p64(piv.begin(), piv.end());
     if (ipiv && !p64.empty() &&
         cudaMemcpy(ipiv, p64.data(), p64.size() * sizeof(int64_t), cudaMemcpyHostToDevice) != cudaSuccess)

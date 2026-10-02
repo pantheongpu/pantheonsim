@@ -45,16 +45,17 @@ inline cd apply_op(cd x, Op op) { return op == Op::C ? std::conj(x) : x; }
 // row interchanges, min(m, n) of them. Returns 0 or the 1-based index of the
 // first exactly-zero pivot, after which the factorization still completes, as
 // LAPACK's does.
-inline int lu(CMat& a, int m, int n, std::vector<int>* ipiv) {
+// `cabs1` picks the pivot by |re| + |im| (LAPACK's izamax), as cuSOLVER's
+// getrf does; otherwise by |.|, as cuBLAS's getrfBatched does (RTX 3060,
+// CUDA 13.0: on [3, 2+2i] the first takes row 2, the second row 1).
+inline int lu(CMat& a, int m, int n, std::vector<int>* ipiv, bool cabs1 = false) {
   const int k = std::min(m, n);
   int info = 0;
   if (ipiv) ipiv->assign(k, 0);
   for (int j = 0; j < k; ++j) {
     int p = j;
     if (ipiv) {
-      // LAPACK's izamax: the largest |re| + |im|, which NVIDIA's pivots on too
-      // (RTX 3060, CUDA 13.0: getrf and Xgetrf on complex matrices).
-      auto mag = [](cd v) { return std::fabs(v.real()) + std::fabs(v.imag()); };
+      auto mag = [cabs1](cd v) { return cabs1 ? std::fabs(v.real()) + std::fabs(v.imag()) : std::abs(v); };
       for (int i = j + 1; i < m; ++i)
         if (mag(a(i, j)) > mag(a(p, j))) p = i;
       (*ipiv)[j] = p + 1;
