@@ -190,8 +190,15 @@ class Runner {
     if (const uint32_t r = profile_.reserved_smem_per_block()) {
       kernel_shared_ = (shared_size_ + 127) / 128 * 128;
       shared_size_ = kernel_shared_ + r;
+      smemsz_ = shared_size_;
     } else {
       kernel_shared_ = shared_size_;
+      // Before 8.0 there is no reserved part, but the allocation is still
+      // counted in its unit (256 bytes, cuda_occupancy.h), as the PTX path's
+      // %total_smem_size counts it; ptxas reads that register as SR_SMEMSZ.
+      // The window itself stays exact, so an overrun into the rounding is
+      // still caught.
+      smemsz_ = (shared_size_ + 255) / 256 * 256;
     }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
@@ -297,6 +304,7 @@ class Runner {
   uint32_t local_size_ = 0;
   uint64_t shared_size_ = 0;
   uint64_t kernel_shared_ = 0;   // the block's own shared memory, rounded (see shared_size_)
+  uint64_t smemsz_ = 0;          // SR_SMEMSZ: the whole allocation, in allocation units
   uint32_t block_threads_ = 0;
   // Thread-block clusters: the shape (1x1x1 without one), its size, and
   // whether the launch has clusters at all (any dimension over 1, as the PTX
@@ -350,6 +358,16 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
   // subtracts from SR_SMEMSZ for %reserved_smem_offset_begin, and before
   // sm_90 %reserved_smem_offset_end (the 0x120 bytes the driver uses past
   // the begin, as an RTX 3060 reports) and _1, the start of what is left.
+  // The shared-memory size registers, as ptxas compiles them (checked on the
+  // SASS CUDA 13.0's ptxas writes for sm_75 to sm_120): %dynamic_smem_size is
+  // a bank-0 word, the launch's dynamic bytes; %total_smem_size is SR_SMEMSZ
+  // less the reserved size below; and from sm_90 %aggr_smem_size is SR_SMEMSZ
+  // clamped by another bank-0 word. What the hardware keeps there was not
+  // measurable here (no sm_90 card), so it holds the allocation itself and
+  // the clamp gives the PTX ISA's answer, which the PTX path gives too. sm_100
+  // indexes both words by SR_CgaSize, which is 0 here.
+  put32(sm >= 100 ? 0x2ac : 0x2c, cfg_.shared_bytes);
+  if (sm >= 90) put32(sm >= 100 ? 0x2bc : 0x13c, static_cast<uint32_t>(smemsz_));
   if (const uint32_t r = profile_.reserved_smem_per_block()) {
     put32(sm >= 100 ? 0x16c : 0x114, r);
     if (sm < 90) {
@@ -526,7 +544,7 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
       const uint64_t t = w.steps;
       return (idx == 0x51 || idx == 0x53) ? static_cast<uint32_t>(t >> 32) : static_cast<uint32_t>(t);
     }
-    case 0x32: return static_cast<uint32_t>(shared_size_);              // SR_SMEMSZ
+    case 0x32: return static_cast<uint32_t>(smemsz_);                   // SR_SMEMSZ
     case 0x2f: return static_cast<uint32_t>(kSharedWindow >> 32);       // SR_SWINHI
     case 0x88: return blk.rank;                                         // SR_CgaCtaId: the rank in the cluster
     case 0x8a: return 0;                                                // SR_CgaSize (bank 0's envregs at +0)
