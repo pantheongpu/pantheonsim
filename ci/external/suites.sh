@@ -54,6 +54,14 @@ fetch() {
     git fetch -q --depth 1 origin "${commit[$suite]}"
   fi
   git -c advice.detachedHead=false checkout -q FETCH_HEAD
+  if [[ $suite == hecbench ]]; then
+    # Some benchmarks build or run from a sibling's files (boxfilter-cuda
+    # takes its headers and image from ../boxfilter-sycl): add every
+    # directory a listed one's Makefile or arguments name.
+    sibs=$( { entries | cut -d'|' -f2; entries | cut -d'|' -f1 | sed 's#^#src/#; s#$#/Makefile#' | xargs cat 2>/dev/null; } |
+            grep -oE '\.\./[A-Za-z0-9_.+-]+' | sed 's#^\.\./#src/#' | sort -u)
+    [[ -n $sibs ]] && git sparse-checkout add $sibs >/dev/null
+  fi
   echo "$suite at $(git rev-parse --short HEAD)"
 }
 
@@ -65,7 +73,10 @@ build() {
     cuda-samples)
       # One architecture, the card's, rather than the nine the samples list.
       find Samples -name CMakeLists.txt -exec sed -i -E 's/set\(CMAKE_CUDA_ARCHITECTURES [^)]*\)/set(CMAKE_CUDA_ARCHITECTURES 86)/' {} +
+      # The nvcc on PATH, named: CMake otherwise finds /usr/bin/nvcc first where
+      # Ubuntu's CUDA 12.0 is installed too (the pantheonsim.com runner).
       cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
+        -DCMAKE_CUDA_COMPILER="$(command -v nvcc)" \
         -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared > build-configure.log 2>&1 || { tail -30 build-configure.log; exit 1; }
       targets=$(entries | cut -d'|' -f1 | xargs -n1 basename)
       # -k 0: one sample that fails to build is reported by `run`, not fatal here.
@@ -73,7 +84,8 @@ build() {
       ;;
     hecbench)
       entries | cut -d'|' -f1 | xargs -P "$jobs" -I{} bash -c '
-        cd src/{} && make -s CC="nvcc -cudart shared" ARCH=sm_86 EXTRA_CFLAGS="-w" > build.log 2>&1 || echo "{}: build failed" ' ;;
+        cd src/{} && make -s CC="nvcc -cudart shared" ARCH=sm_86 EXTRA_CFLAGS="-w" > build.log 2>&1 ||
+          { echo "{}: build failed"; tail -8 build.log | sed "s/^/    /"; }' ;;
     rodinia)
       entries | while IFS='|' read -r app src flags args file sum; do
         (cd "$src" && nvcc -arch=sm_86 -cudart shared -w -include "$compat" -I../util $flags -o "$app" > "$app.build.log" 2>&1) ||
@@ -134,7 +146,7 @@ run() {
       done < <(entries) ;;
     rodinia)
       while IFS='|' read -r app src flags args file sum; do
-        log="$report/logs/$app.log"; wd="$dir/$src/run-$app"; rm -rf "$wd"; mkdir -p "$wd"
+        log="$report/logs/$app.log"; wd="$src/run-$app"; rm -rf "$wd"; mkdir -p "$wd"
         [[ -x $src/$app ]] || { result "$app" FAIL 0 "did not build"; continue; }
         # shellcheck disable=SC2086
         run_one "$app" "$wd" "$log" "../$app" $args
