@@ -188,7 +188,12 @@ class Runner {
     // SR_SMEMSZ is the whole allocation, and the reserved region's begin is
     // SR_SMEMSZ less the reserved size the constant bank holds.
     if (const uint32_t r = profile_.reserved_smem_per_block()) {
-      kernel_shared_ = (shared_size_ + 127) / 128 * 128;
+      // From sm_90 ptxas puts the reserved region first, at offset 0, and
+      // counts it in the kernel's .nv.shared section (400 bytes of
+      // __shared__ make a 0x590-byte section, the variables from 0x400), so
+      // there it is already inside the block's own.
+      const uint64_t own = m.sm >= 90 && k.shared_bytes >= r ? k.shared_bytes - r : k.shared_bytes;
+      kernel_shared_ = (own + cfg.shared_bytes + 127) / 128 * 128;
       shared_size_ = kernel_shared_ + r;
       smemsz_ = shared_size_;
     } else {

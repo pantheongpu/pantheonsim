@@ -23,10 +23,11 @@ uint32_t Runner::ival(Warp& w, const Operand& o, unsigned lane) {
 // The profiler's instruction classes, by SASS op.
 // Whether the executor runs an instruction: what a cubin must hold for the
 // runtime to prefer it over the fatbin's PTX (sass::unsupported).
-// SR_PM0-SR_PM7, which ptxas reads for %pm0-%pm7 and %pm0_64-%pm7_64.
+// SR_PM0-SR_PM7 (0x64, 0x66, ... 0x72, each with its high half after it),
+// which ptxas reads for %pm0-%pm7 and %pm0_64-%pm7_64.
 bool reads_pm_counter(const Instr& ins) {
-  return (ins.op == Op::S2R || ins.op == Op::S2UR || ins.op == Op::CS2R) && ins.f[0] >= 0x80 &&
-         ins.f[0] <= 0x87;
+  return (ins.op == Op::S2R || ins.op == Op::S2UR || ins.op == Op::CS2R) && ins.f[0] >= 0x64 &&
+         ins.f[0] <= 0x73;
 }
 
 bool executes(const Instr& ins) {
