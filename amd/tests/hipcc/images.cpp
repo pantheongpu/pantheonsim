@@ -595,6 +595,11 @@ int main() {
     CHECK(hipArrayGetInfo(nullptr, &e, &flags, arr));
     wrong += got.x != 32 || got.y != 0 || got.f != hipChannelFormatKindFloat;
     wrong += e.width != W || e.height != H || e.depth != 0 || flags != 0;
+    // An array's handle is an array to hipPointerGetAttribute.
+    unsigned int memory_type = 0;
+    wrong += hipPointerGetAttribute(&memory_type, HIP_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                    reinterpret_cast<hipDeviceptr_t>(arr)) != hipSuccess ||
+             memory_type != hipMemoryTypeArray;
     hipTextureObject_t t = 0;
     hipTextureDesc d = tex_desc(hipAddressModeClamp, hipFilterModePoint, 1);
     wrong += hipCreateTextureObject(nullptr, &res, &d, nullptr) != hipErrorInvalidChannelDescriptor;
@@ -633,7 +638,7 @@ int main() {
     CHECK(hipArrayGetDescriptor(&adback, a1));
     wrong += adback.Width != 16 || adback.NumChannels != 2 || adback.Format != HIP_AD_FORMAT_UNSIGNED_INT16;
     CHECK(hipArrayDestroy(a1));
-    report("what the API answers", wrong, 44);
+    report("what the API answers", wrong, 45);
   }
   CHECK(hipFreeArray(arr));
   CHECK(hipFree(d_at));

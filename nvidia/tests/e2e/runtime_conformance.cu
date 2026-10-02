@@ -269,14 +269,24 @@ int main() {
   cudaGetLastError();
 
   // Last: a kernel's illegal address corrupts the context, and it stays
-  // corrupted until a reset. The next call used to succeed.
+  // corrupted until a reset. The next call used to succeed. The fault is the
+  // kernel's, not its launch's: on an RTX 3060 the launch has returned before
+  // the kernel runs, so it succeeds and leaves the last error clear, and the
+  // fault is reported by the next call that needs the context. Reading the last
+  // error clears it, as reading it always does -- the context is no less dead,
+  // and the call after fails again.
   oob<<<1, 1>>>(d);
+  e = cudaPeekAtLastError();
+  CHECK("the faulting kernel's launch succeeds", e == cudaSuccess, "got %d", e);
   e = cudaDeviceSynchronize();
   CHECK("out-of-bounds write -> illegal address", e == cudaErrorIllegalAddress, "got %d", e);
   int* after = nullptr;
   CHECK("sticky: the next malloc fails", cudaMalloc(&after, 16) == cudaErrorIllegalAddress, "unexpected");
-  CHECK("sticky: reading it does not clear it", cudaGetLastError() == cudaErrorIllegalAddress &&
-                                                   cudaGetLastError() == cudaErrorIllegalAddress, "unexpected");
+  CHECK("reading the last error clears it", cudaGetLastError() == cudaErrorIllegalAddress &&
+                                                cudaGetLastError() == cudaSuccess, "unexpected");
+  CHECK("sticky: the call after fails again", cudaMalloc(&after, 16) == cudaErrorIllegalAddress, "unexpected");
+  int dev = -1;
+  CHECK("which device is current still answers", cudaGetDevice(&dev) == cudaSuccess && dev == 0, "unexpected");
   CHECK("reset clears it", cudaDeviceReset() == cudaSuccess && cudaMalloc(&after, 16) == cudaSuccess, "unexpected");
 
   // Copy directions under unified addressing, as an RTX 3060 answers them: a

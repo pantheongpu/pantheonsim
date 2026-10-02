@@ -317,6 +317,46 @@ int main() {
   (void)hipGraphExecDestroy(x);
   (void)hipGraphDestroy(eg);
 
+  // ---- A 2D memset node in an executable graph takes new parameters of
+  // the same shape (another allocation), as ROCm's HIP allows, and refuses
+  // another shape.
+  {
+    char *p1 = nullptr, *p2 = nullptr;
+    size_t pitch = 0;
+    (void)hipMallocPitch(reinterpret_cast<void**>(&p1), &pitch, 64, 8);
+    (void)hipMallocPitch(reinterpret_cast<void**>(&p2), &pitch, 64, 8);
+    hipMemsetParams m2{};
+    m2.dst = p1;
+    m2.elementSize = 1;
+    m2.width = 64;
+    m2.height = 8;
+    m2.pitch = pitch;
+    m2.value = 1;
+    hipGraph_t g2;
+    hipGraphNode_t n2;
+    hipGraphExec_t x2;
+    (void)hipGraphCreate(&g2, 0);
+    (void)hipGraphAddMemsetNode(&n2, g2, nullptr, 0, &m2);
+    (void)hipGraphInstantiate(&x2, g2, nullptr, nullptr, 0);
+    m2.dst = p2;
+    m2.value = 0x5a;
+    EXPECT(hipGraphExecMemsetNodeSetParams(x2, n2, &m2), hipSuccess,
+           "an executable 2D memset node takes another allocation of its shape");
+    (void)hipGraphLaunch(x2, stream);
+    (void)hipStreamSynchronize(stream);
+    std::vector<char> rows(64 * 8, 0);
+    (void)hipMemcpy2D(rows.data(), 64, p2, pitch, 64, 8, hipMemcpyDeviceToHost);
+    bool filled = true;
+    for (char c : rows) filled &= c == 0x5a;
+    check(filled, "and fills it");
+    m2.height = 4;
+    EXPECT(hipGraphExecMemsetNodeSetParams(x2, n2, &m2), hipErrorInvalidValue, "but not one of another shape");
+    (void)hipGraphExecDestroy(x2);
+    (void)hipGraphDestroy(g2);
+    (void)hipFree(p1);
+    (void)hipFree(p2);
+  }
+
   // ---- Graph memory: an allocation node's address, live beyond the graph
   hipGraph_t mg;
   (void)hipGraphCreate(&mg, 0);
@@ -334,6 +374,18 @@ int main() {
   (void)hipGraphInstantiate(&mx, mg, nullptr, nullptr, 0);
   EXPECT(hipGraphInstantiate(&mx2, mg, nullptr, nullptr, 0), hipErrorNotSupported,
          "a graph that allocates is instantiated once at a time");
+  // A graph that frees is held to the same, as ROCm's HIP holds it; this one
+  // is never launched, so the memory stays.
+  hipGraph_t fg;
+  (void)hipGraphCreate(&fg, 0);
+  hipGraphNode_t free_node;
+  EXPECT(hipGraphAddMemFreeNode(&free_node, fg, nullptr, 0, ap.dptr), hipSuccess, "a free node");
+  hipGraphExec_t fx, fx2;
+  (void)hipGraphInstantiate(&fx, fg, nullptr, nullptr, 0);
+  EXPECT(hipGraphInstantiate(&fx2, fg, nullptr, nullptr, 0), hipErrorNotSupported,
+         "and a graph that frees is instantiated once at a time too");
+  (void)hipGraphExecDestroy(fx);
+  (void)hipGraphDestroy(fg);
   hipGraph_t mclone;
   EXPECT(hipGraphClone(&mclone, mg), hipErrorNotSupported, "nor cloned");
   EXPECT(hipGraphDestroyNode(alloc_node), hipErrorNotSupported, "and its allocation node stays");

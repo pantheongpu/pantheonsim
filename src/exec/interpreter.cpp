@@ -6144,6 +6144,12 @@ class Interpreter {
         exec_device_set_last_error(w, ctx, ins, *op, m);
         return;
       }
+      // cudaGraphSetConditional(handle, value): nvcc leaves it a call to an
+      // external function of that name, which the driver supplies.
+      if (op->callee == "cudaGraphSetConditional") {
+        exec_graph_set_conditional(w, ins, *op, m);
+        return;
+      }
       if (op->callee == "__cuda_syscall_cnpv2StreamCreate" || op->callee == "__cuda_syscall_cnpv2EventCreate") {
         exec_device_handle(w, ctx, ins, *op, m);
         return;
@@ -10613,6 +10619,35 @@ class Interpreter {
     const Warp::Slot& err = call_slot(w, ins, op, 0);
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) w.device_error[lane] = static_cast<uint32_t>(err.read(lane, 0, 4));
+    write_call_result(w, op, m, Lanes{}, 4);
+  }
+
+  // cudaGraphSetConditional: sets a conditional handle's value, which the
+  // graph's conditional node reads once the kernel is done. A kernel launched
+  // outside a graph has no handles to set, and on an RTX 3060 the call faults
+  // with an illegal address; so does a handle no graph made. Racing calls are
+  // undefined, as CUDA documents; here the last lane to run wins.
+  void exec_graph_set_conditional(Warp& w, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 2)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes two arguments");
+    const Warp::Slot& handle = call_slot(w, ins, op, 0);
+    const Warp::Slot& value = call_slot(w, ins, op, 1);
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t h = handle.read(lane, 0, 8);
+      GraphConditionals* table = cfg_.conditionals;
+      if (table) {
+        std::lock_guard<std::mutex> guard(table->mu);
+        const auto it = table->values.find(h);
+        if (it != table->values.end()) {
+          it->second = static_cast<uint32_t>(value.read(lane, 0, 4));
+          continue;
+        }
+      }
+      ctx_fail(ins, static_cast<int>(lane), Err::InvalidPointer,
+               table ? "cudaGraphSetConditional with a handle no graph created (" + std::to_string(h) + ")"
+                     : std::string("cudaGraphSetConditional in a kernel that is not running in a graph"));
+    }
     write_call_result(w, op, m, Lanes{}, 4);
   }
 

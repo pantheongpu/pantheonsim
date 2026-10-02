@@ -51,8 +51,8 @@ across architectures either, so the harness compares those with a tolerance
 ## What is implemented
 
 Handles and configuration (`cublasCreate/Destroy`, streams, pointer mode, math
-mode, version/properties), `Sgemm`, `Dgemm`, `SgemmStridedBatched`, `GemmEx`
-for the all-fp32 and all-fp64 forms, `Sgemv`, and in both single and double
+mode, version/properties), `Sgemm`, `Dgemm` and their batched and
+strided-batched forms, `Sgemv`, and in both single and double
 precision `axpy`, `scal`, `dot`, `nrm2`, `i?amax`, the triangular band
 product `tbmv`, and `dgmm` (a matrix times a diagonal one, from either side). A negative increment walks the vector from its far end, as
 BLAS defines it; `scal`, `nrm2` and `i?amax` do nothing (or return 0) for an
@@ -69,11 +69,27 @@ The host and device copy helpers `cublasSetVector`, `cublasGetVector`,
 `cublasSetMatrix` and `cublasGetMatrix`, and their `Async` forms, are there
 too, with increments and leading dimensions on both sides.
 
-Not implemented — these return `CUBLAS_STATUS_NOT_SUPPORTED` rather than a
-plausible wrong answer: mixed-precision `GemmEx` (f16/bf16/int8 paths),
-cuBLASLt, complex types, triangular solves, and the remaining level-1/2/3
-routines. Add them the same way the PTX subset grew: hit one, implement it,
-prove it against hardware.
+The complex (C and Z) routines PyTorch's complex tensors reach are in
+`cublas_complex.inc`, and the same templates serve the real level-2 and
+level-3 routines (`ger`, `symv`, `trmv`, `trsv`, `symm`, `syrk`, `syr2k`,
+`trmm`) and the rank updates `syr`, `syr2`, `her`, `her2` and `her2k` in
+every type they come in. The plane rotations (`rot`, `rotg`, `rotm`, `rotmg`,
+typed and Ex) match an RTX 3060 bit for bit in real arithmetic, the card's
+order of fused operations repeated. `GemmEx` takes exactly the card's table
+of operand and compute types — complex, and int8 into float, included — as
+do `SgemmEx`, the complex Ex GEMMs (`CgemmEx`, `Cgemm3mEx`, `CherkEx`,
+`CsyrkEx` and their 3m forms); `geqrfBatched`
+is LAPACK's geqrf per matrix. Each routine refuses the arguments the card
+refuses, measured: an unknown fill mode, side, operation or diagonal, a
+negative size, a zero increment or a short leading dimension in levels 2 and
+3, nothing in level 1.
+
+Not implemented: the legacy (pre-`_v2`) API, cuBLASXt, the band and packed
+level-2 routines (`gbmv`, `sbmv`, `spmv`, `tpsv` and the rest), the batched
+GEMVs, `getriBatched`/`matinvBatched`, `syrkx`/`herkx`, and most `_64` forms
+of level 2 and 3. These are absent rather than stubbed, so a program that
+needs one fails to load with the name it was looking for. Add them the same
+way the rest grew: hit one, implement it, prove it against hardware.
 
 ## The rest of the stack
 

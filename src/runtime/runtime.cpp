@@ -534,6 +534,18 @@ void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+std::vector<std::string> Device::managed_globals(uint64_t module_id) const {
+  for (const auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    std::vector<std::string> out;
+    if (lm.mod)
+      for (const auto& g : lm.mod->globals)
+        if (g.managed) out.push_back(g.name);
+    return out;
+  }
+  throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+}
+
 bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id) continue;

@@ -207,10 +207,12 @@ inline Target target_of_mach(uint32_t mach) {
   switch (mach) {
     case 0x3f: return Target::Gfx90a;
     case 0x4f: return Target::Gfx950;
-    // gfx1100, 1101, 1102, 1103, 1150, 1151, 1152: RDNA3 and 3.5.
-    case 0x41: case 0x46: case 0x47: case 0x44: case 0x43: case 0x4a: case 0x55: return Target::Gfx1100;
-    // gfx1200, 1201: RDNA4.
-    case 0x48: case 0x4e: return Target::Gfx1200;
+    // gfx1100, 1101, 1102, 1103, 1150, 1151, 1152, 1153 and gfx11-generic:
+    // RDNA3 and 3.5.
+    case 0x41: case 0x46: case 0x47: case 0x44: case 0x43: case 0x4a: case 0x55: case 0x58: case 0x54:
+      return Target::Gfx1100;
+    // gfx1200, 1201 and gfx12-generic: RDNA4.
+    case 0x48: case 0x4e: case 0x59: return Target::Gfx1200;
     // gfx1030 to 1036 and gfx10-3-generic: RDNA2.
     case 0x36: case 0x37: case 0x38: case 0x39: case 0x3d: case 0x3e: case 0x45: case 0x53: return Target::Gfx1030;
     default: return Target::Gfx942;

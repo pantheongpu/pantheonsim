@@ -31,6 +31,9 @@ static std::string err(hipError_t e) { return hipGetErrorName(e); }
   } while (0)
 
 __global__ void takes_nothing() {}
+__global__ void __launch_bounds__(64) bounded(int* p) {
+  if (p) p[threadIdx.x] = 1;
+}
 // A static __constant__ variable is reached through the code object's global
 // offset table, which the loader fills in when it places the image.
 __device__ static __constant__ float static_const[4];
@@ -267,6 +270,10 @@ int main() {
   check(out[3] == 14, "both launches ran", std::to_string(out[3]));
   EXPECT(hipLaunchKernel(reinterpret_cast<const void*>(add_one), dim3(1), dim3(1025), args, 0, nullptr),
          hipErrorInvalidConfiguration, "a block past the device's limit is refused");
+  bounded<<<1, 128>>>(nullptr);
+  EXPECT(hipGetLastError(), hipErrorLaunchFailure, "a block past the kernel's launch bounds is a launch failure");
+  bounded<<<1, 64>>>(nullptr);
+  EXPECT(hipGetLastError(), hipSuccess, "and one inside them launches");
   hipStream_t gone;
   (void)hipStreamCreate(&gone);
   (void)hipStreamDestroy(gone);

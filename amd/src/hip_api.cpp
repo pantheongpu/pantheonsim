@@ -763,8 +763,10 @@ hipError_t check_launch(State& s, int ordinal, const Kernel& kernel, vgpu::amd::
   }
   const uint64_t threads = uint64_t{block.x} * block.y * block.z;
   if (lim.max_threads_per_block && threads > lim.max_threads_per_block) return hipErrorInvalidConfiguration;
+  // Past the kernel's launch bounds (its metadata's max_flat_workgroup_size):
+  // a launch failure, as ROCm's HIP says (ihipLaunchKernel_validate).
   if (kernel.max_flat_workgroup_size && threads > kernel.max_flat_workgroup_size)
-    return fail(hipErrorInvalidConfiguration, "the block has more work-items than the kernel's launch bounds allow");
+    return fail(hipErrorLaunchFailure, "the block has more work-items than the kernel's launch bounds allow");
   if (lim.shared_mem_per_block && uint64_t{shared} + kernel.group_segment > lim.shared_mem_per_block)
     return fail(hipErrorInvalidValue, "the launch asks for more LDS than a block may have");
   if (stream) {
@@ -4618,8 +4620,19 @@ hipError_t hipModuleLaunchCooperativeKernel(hipFunction_t f, unsigned int gx, un
   const ApiCall api("hipModuleLaunchCooperativeKernel");
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
-  if (!f) return record(s, hipErrorInvalidValue);
   if (!device(s)) return record(s, hipErrorInvalidDevice);
+  // ROCm's HIP checks these first, in this order, each an invalid value:
+  // a destroyed stream; empty or too large a block; more LDS than a
+  // compute unit has; an empty grid. Only then the function.
+  Stream null_stream;
+  if (!find_stream(s, stream, &null_stream)) return record(s, hipErrorContextIsDestroyed);
+  const vgpu::Limits& lim = s.rt->device(s.current).profile().limits;
+  const uint64_t threads = uint64_t{bx} * by * bz;
+  if (!bx || !by || !bz || (lim.max_threads_per_block && threads > lim.max_threads_per_block))
+    return record(s, hipErrorInvalidValue);
+  if (lim.shared_mem_per_block && shared > lim.shared_mem_per_block) return record(s, hipErrorInvalidValue);
+  if (!gx || !gy || !gz) return record(s, hipErrorInvalidValue);
+  if (!f) return record(s, hipErrorInvalidResourceHandle);
   Function* fn = reinterpret_cast<Function*>(f);
   if (const hipError_t e = check_launch(s, s.current, *fn->kernel, {gx, gy, gz}, {bx, by, bz}, shared, stream);
       e != hipSuccess)
@@ -4916,9 +4929,20 @@ hipError_t hipMemPtrGetInfo(void* ptr, size_t* size) {
 // allocation it falls in.
 // The three yes-or-no attributes are one byte, and the buffer id and range
 // size 32 bits, as ROCm's HIP writes them.
+}  // extern "C"
+namespace {
+bool is_array_handle(const void* p);   // hip_images.inc
+}  // namespace
+extern "C" {
 hipError_t hipPointerGetAttribute(void* data, int attribute, void* ptr) {
   const ApiCall api("hipPointerGetAttribute");
   if (!data || !ptr) return record(state(), hipErrorInvalidValue);
+  // An array's handle, which no allocation holds, is an array: ROCm's HIP
+  // looks the address up among its arrays for the memory type.
+  if (attribute == vgpu::amd::abi::PointerAttributeKind::kPointerMemoryType && is_array_handle(ptr)) {
+    *static_cast<unsigned*>(data) = 10;   // hipMemoryTypeArray
+    return record(state(), hipSuccess);
+  }
   vgpu::amd::abi::PointerAttribute a{};
   if (const hipError_t e = hipPointerGetAttributes(&a, ptr); e != hipSuccess) return e;
   State& s = state();
