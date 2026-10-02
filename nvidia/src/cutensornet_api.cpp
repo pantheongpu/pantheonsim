@@ -156,10 +156,10 @@ cutensorComputeDescriptor_t to_cutensor(cutensornetComputeType_t c) {
 
 std::vector<int64_t> packed_strides(const std::vector<int64_t>& ext) {
   std::vector<int64_t> s(ext.size());
-  int64_t p = 1;
+  uint64_t p = 1;  // unsigned: the product past the last mode is never used
   for (size_t i = 0; i < ext.size(); ++i) {
-    s[i] = p;
-    p *= ext[i];
+    s[i] = (int64_t)p;
+    p *= (uint64_t)ext[i];
   }
   return s;
 }

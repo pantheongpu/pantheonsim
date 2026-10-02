@@ -1044,11 +1044,13 @@ cutensorStatus_t cutensorCreateTensorDescriptor(const cutensorHandle_t handle, c
   auto* d = new cutensorTensorDescriptor;
   d->type = dataType;
   d->alignment = al;
-  int64_t packed = 1;
+  // Packed strides, multiplied in unsigned arithmetic: the product past the
+  // last mode is never used and may not fit an int64_t (63 modes of 2).
+  uint64_t packed = 1;
   for (uint32_t i = 0; i < numModes; ++i) {
     d->extent.push_back(extent[i]);
-    d->stride.push_back(stride ? stride[i] : packed);
-    packed *= extent[i];
+    d->stride.push_back(stride ? stride[i] : (int64_t)packed);
+    packed *= (uint64_t)extent[i];
   }
   *desc = d;
   return CUTENSOR_STATUS_SUCCESS;
