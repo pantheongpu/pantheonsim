@@ -16,7 +16,10 @@
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$root/tests/shim_guard.sh"
-build="${1:-${VGPU_BUILD_DIR:-$root/build}}"
+# Absolute: the programs run from the output directory, and a relative
+# LD_LIBRARY_PATH would miss the shim there and quietly load the toolkit's
+# real libcudart (which, with no GPU, fails the first cudaMalloc).
+build="$(cd "${1:-${VGPU_BUILD_DIR:-$root/build}}" && pwd)" || { echo "FAIL: no build directory"; exit 1; }
 shim="$build/shim"
 
 if ! grep -q VGPU_SASS_LOG "$root/nvidia/src/fatbin.cpp" 2>/dev/null; then
@@ -82,8 +85,10 @@ for j in "${jobs[@]}"; do
   if [[ $rs != 0 || $rp != 0 ]]; then
     echo "FAIL $arch $p: the SASS run exited $rs, the PTX run $rp"; fails=1
     if [[ -z ${shown_why:-} ]]; then
-      # Once: the same run without VGPU_QUIET, for the simulator's own words.
+      # Once: which libcudart the program loads, and the same run without
+      # VGPU_QUIET, stderr included, for the simulator's own words.
       shown_why=1
+      (cd "$out" && env "${env[@]}" ldd "$bin" | grep -E 'libcudart|libcuda\.' | sed 's/^/    loads: /')
       (cd "$out" && env "${env[@]/VGPU_QUIET=1/VGPU_QUIET=0}" VGPU_SASS_LOG=1 timeout 300 "$bin" 2>&1 | tail -15 | sed 's/^/    /')
     fi
     continue
