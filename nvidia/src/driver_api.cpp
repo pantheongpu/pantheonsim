@@ -142,9 +142,10 @@ struct ShimState {
   std::unordered_map<uintptr_t, KernelRec> kernels;
   std::unordered_map<uintptr_t, EventRec> events;
   std::set<uintptr_t> streams;      // explicitly created streams (all synchronous)
-  // cuMemHostAlloc results, with the flags they were allocated with.
-  std::map<void*, vgpu::runtime::HostRange> host_allocs;
   std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
+  // The memory a loaded module's __managed__ globals were moved to, by (device,
+  // module id): entries in `managed` too, freed when the module is unloaded.
+  std::map<std::pair<int, uint64_t>, std::vector<uintptr_t>> module_managed;
   std::unordered_map<uintptr_t, ArrayRec> arrays;  // cuArray3DCreate results
   std::unordered_map<uintptr_t, MipmapRec> mipmaps;  // cuMipmappedArrayCreate results
   // Mipmapped arrays destroyed, and the level arrays that went with them: the
@@ -219,7 +220,8 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     // Both of these reached the switch's fallthrough before, and so were
     // reported as CUDA_ERROR_UNKNOWN -- the least informative code available,
     // for the two conditions this project most wants to be legible.
-    case Err::Trap: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
+    // An RTX 3060 reports a kernel's "trap" (and "brkpt") as LAUNCH_FAILED.
+    case Err::Trap: return CUDA_ERROR_LAUNCH_FAILED;
     case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::EccUncorrectable: return CUDA_ERROR_ECC_UNCORRECTABLE;
     // What programs report when their GPU falls off the bus.
@@ -235,6 +237,49 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
   return CUDA_ERROR_UNKNOWN;
 }
 
+// Whether an error leaves the context unusable: a kernel's illegal address,
+// trap or failed assert, as the runtime decides it (runtime_api.cpp's
+// poisons_context), and uncorrectable memory whatever read it.
+bool poisons_context(vgpu::Err e, bool kernel_context) {
+  using vgpu::Err;
+  switch (e) {
+    case Err::InvalidPointer:
+    case Err::UseAfterFree:
+    case Err::OutOfBounds:
+    case Err::MisalignedAccess:
+    case Err::UninitializedRegister:
+    case Err::Trap:
+    case Err::DeviceAssert:
+    case Err::DeviceLost:
+      return kernel_context;
+    case Err::EccUncorrectable:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The calls an RTX 3060 still answers once a kernel has killed the context:
+// what a device is, which context is current, and the primary context's own
+// bookkeeping. Every other call that needs the context fails with the fault
+// (Runtime::context_fault), the next cuCtxSynchronize first among them.
+bool answers_dead_context(const char* name) {
+  static const char* const kLive[] = {"cuInit", "cuDevice", "cuCtxGetCurrent", "cuCtxSetCurrent",
+                                      "cuCtxPushCurrent", "cuCtxPopCurrent", "cuCtxGetDevice",
+                                      "cuCtxCreate", "cuCtxDestroy", "cuCtxAttach", "cuTensorMap"};
+  for (const char* p : kLive)
+    if (std::strncmp(name, p, std::strlen(p)) == 0) return true;
+  return false;
+}
+
+// The fault a dead context answers with, or CUDA_SUCCESS. For the entry points
+// that do not go through api().
+CUresult dead_context() {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  return s.initialized ? static_cast<CUresult>(s.rt->context_fault()) : CUDA_SUCCESS;
+}
+
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
@@ -244,13 +289,22 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     report(name, "cuInit has not been called");
     return CUDA_ERROR_NOT_INITIALIZED;
   }
+  if (s.initialized && !answers_dead_context(name))
+    if (const int fault = s.rt->context_fault()) return static_cast<CUresult>(fault);
   try {
     CUresult r = body(s);
     if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d\n", name, static_cast<int>(r));
     return r;
   } catch (const vgpu::Error& e) {
     report(name, e.what());
-    const CUresult r = map_error(e, kernel_context);
+    CUresult r = map_error(e, kernel_context);
+    if (s.initialized && poisons_context(e.code(), kernel_context)) {
+      s.rt->set_context_fault(static_cast<int>(r));
+      // A kernel's fault is reported by the calls after its launch, which on
+      // the card returned before the kernel ran: cuLaunchKernel succeeds, and
+      // the next cuCtxSynchronize is CUDA_ERROR_ASSERT or ILLEGAL_ADDRESS.
+      if (kernel_context) r = CUDA_SUCCESS;
+    }
     if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d (threw)\n", name, static_cast<int>(r));
     return r;
   } catch (const std::exception& e) {
@@ -537,6 +591,46 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
 
 // Instantiates a context-independent library on `dev` (parsing its PTX into a
 // runtime module on first use) and returns the runtime module id.
+// A loaded module's __managed__ globals, moved onto managed memory: host memory
+// every device maps, at one address for the host and every device, holding the
+// variable's initial value -- as the runtime moves a registered __managed__
+// variable (runtime_api.cpp's bind_managed_vars). It used to stay ordinary
+// device memory, which the host could not touch. On an RTX 3060 a module loaded
+// with cuModuleLoadData has its managed global at the address cuModuleGetGlobal
+// returns, readable and writable from the host, reported as managed, and a
+// kernel's writes to it visible there after cuCtxSynchronize.
+void bind_managed_globals(ShimState& s, int dev, uint64_t mid) {
+  vgpu::runtime::Device& d = s.rt->device(dev);
+  std::vector<uintptr_t> storage;
+  for (const std::string& name : d.managed_globals(mid)) {
+    uint64_t at = 0, size = 0;
+    if (!d.global(mid, name, &at, &size)) continue;
+    const size_t n = std::max<size_t>(size, 1);
+    void* p = std::aligned_alloc(4096, (n + 4095) / 4096 * 4096);
+    if (!p) throw vgpu::Error::make(vgpu::Err::OutOfMemory, "__managed__ '", name, "'");
+    d.memory().read(at, p, size);   // the initial value
+    for (int o = 0; o < s.rt->device_count(); ++o)
+      s.rt->device(o).memory().map_host(reinterpret_cast<uint64_t>(p), p, n);
+    s.managed[reinterpret_cast<uintptr_t>(p)] = n;
+    d.rebind_global(mid, name, reinterpret_cast<uint64_t>(p));
+    storage.push_back(reinterpret_cast<uintptr_t>(p));
+  }
+  if (!storage.empty()) s.module_managed[{dev, mid}] = std::move(storage);
+}
+
+// Unloads a module, and frees what its managed globals were moved to.
+void unload_module(ShimState& s, int dev, uint64_t mid) {
+  s.rt->device(dev).unload_module(mid);
+  const auto it = s.module_managed.find({dev, mid});
+  if (it == s.module_managed.end()) return;
+  for (uintptr_t p : it->second) {
+    for (int o = 0; o < s.rt->device_count(); ++o) s.rt->device(o).memory().unmap_host(p);
+    s.managed.erase(p);
+    std::free(reinterpret_cast<void*>(p));
+  }
+  s.module_managed.erase(it);
+}
+
 uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   auto it = s.libraries.find(lib_handle);
   if (it == s.libraries.end())
@@ -546,6 +640,7 @@ uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   if (mit != lib.per_device_module.end()) return mit->second;
   uint64_t mid = s.rt->device(dev).load_module(lib.ptx);
   lib.per_device_module[dev] = mid;
+  bind_managed_globals(s, dev, mid);
   return mid;
 }
 
@@ -1007,6 +1102,7 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
     }
     int dev = current_device(s);
     uint64_t mid = s.rt->device(dev).load_module(text);
+    bind_managed_globals(s, dev, mid);
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};
     *module = reinterpret_cast<CUmodule>(h);
@@ -1032,8 +1128,14 @@ VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
 }
 
 // Releasing the primary context. Nothing is cached per context here, so this
-// succeeds without tearing down the device.
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) { return CUDA_SUCCESS; }
+// succeeds without tearing down the device -- except a fault a kernel left the
+// context with, which a reset is the one way out of, as cudaDeviceReset is.
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (s.initialized) s.rt->set_context_fault(0);
+  return CUDA_SUCCESS;
+}
 
 /* ---- runtime JIT linking ----
  *
@@ -1407,7 +1509,7 @@ VGPU_EXPORT CUresult cuModuleUnload(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
-    s.rt->device(dev).unload_module(mid);
+    unload_module(s, dev, mid);
     s.modules.erase(it);
     for (auto fit = s.functions.begin(); fit != s.functions.end();) {
       // Function handles from this module are now dangling; drop them.
@@ -1537,7 +1639,7 @@ VGPU_EXPORT CUresult cuLibraryUnload(void* library) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(library), kTagLibrary, "library");
     auto it = s.libraries.find(h);
     if (it == s.libraries.end()) return CUDA_ERROR_INVALID_VALUE;
-    for (auto& [dev, mid] : it->second.per_device_module) s.rt->device(dev).unload_module(mid);
+    for (auto& [dev, mid] : it->second.per_device_module) unload_module(s, dev, mid);
     // Drop kernels and functions minted from this library.
     for (auto k = s.kernels.begin(); k != s.kernels.end();)
       k = k->second.library == h ? s.kernels.erase(k) : std::next(k);
@@ -1930,6 +2032,15 @@ std::map<void*, vgpu::runtime::HostRange>& registrations(ShimState& s) {
   return s.rt->host_registrations();
 }
 
+// Pinned host memory, with the flags it was allocated with: cuMemHostAlloc's
+// and the runtime's cudaMallocHost and cudaHostAlloc results in one record, in
+// the machine both libraries share. The driver used to keep its own, so
+// cuMemHostGetFlags on memory the runtime pinned was INVALID_VALUE where an
+// RTX 3060 reports its flags, and cuMemFreeHost refused it.
+std::map<void*, vgpu::runtime::HostRange>& pinned(ShimState& s) {
+  return s.rt->host_allocations();
+}
+
 // `rows` rows of `width` elements of T, `pitch` bytes apart -- a 1D fill is
 // one row. What an RTX 3060 checks: nothing, for an empty region (a null
 // pointer included); a pointer aligned to the element; and, only when there is
@@ -2148,6 +2259,13 @@ VGPU_EXPORT CUresult cuMemsetD2D32Async(CUdeviceptr d, size_t pitch, unsigned in
 VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) {
   return api("cuMemGetAddressRange", true, false, [&](ShimState& s) {
     uint64_t b = 0, sz = 0;
+    // Managed memory is the allocation it was made as -- for a module's
+    // managed global, the variable, as the card reports it.
+    if (const auto* m = managed_range(s, dptr, 1)) {
+      if (base) *base = m->first;
+      if (size) *size = m->second;
+      return CUDA_SUCCESS;
+    }
     if (!owner_memory(s, dptr).find_allocation(dptr, &b, &sz)) return CUDA_ERROR_INVALID_VALUE;
     if (base) *base = b;
     if (size) *size = sz;
@@ -2167,7 +2285,7 @@ VGPU_EXPORT CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int fla
     if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
     for (int d = 0; d < s.rt->device_count(); ++d)
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
-    s.host_allocs[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
+    pinned(s)[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
     *pp = p;
     return CUDA_SUCCESS;
   });
@@ -2178,10 +2296,10 @@ VGPU_EXPORT CUresult cuMemAllocHost_v2(void** pp, size_t bytesize) {
 VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return cuMemHostAlloc(pp, bytesize, 0); }
 VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
-    auto it = s.host_allocs.find(p);
-    if (it == s.host_allocs.end()) return CUDA_ERROR_INVALID_VALUE;
+    auto it = pinned(s).find(p);
+    if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
     for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
-    s.host_allocs.erase(it);
+    pinned(s).erase(it);
     std::free(p);
     return CUDA_SUCCESS;
   });
@@ -2257,7 +2375,7 @@ VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) {
       *flags = (r->flags & CU_MEMHOSTREGISTER_PORTABLE) | CU_MEMHOSTALLOC_DEVICEMAP;
       return CUDA_SUCCESS;
     }
-    if (const auto* r = host_range_at(s.host_allocs, p)) {
+    if (const auto* r = host_range_at(pinned(s), p)) {
       *flags = (r->flags & 0x7u) | CU_MEMHOSTALLOC_DEVICEMAP;
       return CUDA_SUCCESS;
     }
@@ -2274,7 +2392,7 @@ VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) {
 VGPU_EXPORT CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr* dptr, void* p, unsigned int flags) {
   return api("cuMemHostGetDevicePointer", true, false, [&](ShimState& s) {
     if (!dptr || !p || flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    if (!host_range_at(registrations(s), p) && !host_range_at(s.host_allocs, p))
+    if (!host_range_at(registrations(s), p) && !host_range_at(pinned(s), p))
       return CUDA_ERROR_INVALID_VALUE;
     *dptr = reinterpret_cast<CUdeviceptr>(p);
     return CUDA_SUCCESS;
@@ -3254,8 +3372,8 @@ VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
   fn(user);
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return CUDA_SUCCESS; }  // always idle
-VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return dead_context(); }  // always idle
+VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return dead_context(); }
 VGPU_EXPORT CUresult cuStreamGetPriority(CUstream, int* p) {
   if (p) *p = 0;
   return CUDA_SUCCESS;
@@ -3294,8 +3412,8 @@ VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventQuery(void*) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuEventSynchronize(void*) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuEventQuery(void*) { return dead_context(); }
+VGPU_EXPORT CUresult cuEventSynchronize(void*) { return dead_context(); }
 VGPU_EXPORT CUresult cuEventDestroy_v2(void* ev) {
   return api("cuEventDestroy", true, false, [&](ShimState& s) {
     s.events.erase(reinterpret_cast<uintptr_t>(ev));
@@ -3347,6 +3465,7 @@ VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
 VGPU_EXPORT CUresult cuCtxPopCurrent(CUcontext* pctx) { return cuCtxPopCurrent_v2(pctx); }
 
 VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
+  if (const CUresult dead = dead_context()) return dead;
   if (!v) return CUDA_ERROR_INVALID_VALUE;
   switch (limit) {
     case 0: *v = 1024; break;              // STACK_SIZE
@@ -3356,7 +3475,7 @@ VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
   }
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuCtxSetLimit(int, size_t) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuCtxSetLimit(int, size_t) { return dead_context(); }
 VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext, unsigned int* v) {
   if (v) *v = 3020;
   return CUDA_SUCCESS;
@@ -3387,7 +3506,7 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flag
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset_v2(CUdevice) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) { return cuDevicePrimaryCtxReset(dev); }
 
 VGPU_EXPORT CUresult cuModuleGetLoadingMode(int* mode) {
   if (!mode) return CUDA_ERROR_INVALID_VALUE;
