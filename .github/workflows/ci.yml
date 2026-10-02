@@ -462,10 +462,13 @@ jobs:
         #   amd_rocprofiler_abi, amd_rocprofv3
         #                        the image's ROCm has no rocprofiler-sdk (yet).
         #   e2e_jit_frameworks   numba and triton are not in the image (yet).
-        # The last two are the image's to fix; drop them here when it is.
+        #   e2e_nvshmem_device   NVIDIA's NVSHMEM (headers, libnvshmem_device.a)
+        #                        is not in the image (yet); NVSHMEM_HOME or the
+        #                        nvidia-nvshmem-cu13 pip package turns it on.
+        # The last three are the image's to fix; drop them here when it is.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks)$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
