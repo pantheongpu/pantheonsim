@@ -2614,9 +2614,22 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
   if (!live(desc) || requested < 0) return CUDNN_STATUS_BAD_PARAM;
   auto* d = reinterpret_cast<Desc*>(desc);
   if (trace()) std::fprintf(stderr, "[vgpu][trace] cudnnBackendGetAttribute(%p, %d, type %d, %lld)\n", (void*)d, name, type, (long long)requested);
+  // A scalar answer, written at the width the caller asked for: cudnn-frontend
+  // reads CUDNN_ATTR_ENGINECFG_SHARED_MEMORY_USED into an int32_t, and an
+  // 8-byte write there ran past it (ASan, e2e_dnn_attention).
   auto give_i64 = [&](int64_t v) {
     if (count) *count = 1;
-    if (requested >= 1 && values) std::memcpy(values, &v, sizeof v);
+    if (requested >= 1 && values) {
+      if (type == CUDNN_TYPE_INT32) {
+        const int32_t w = static_cast<int32_t>(v);
+        std::memcpy(values, &w, sizeof w);
+      } else if (type == CUDNN_TYPE_BOOLEAN) {
+        const bool b = v != 0;
+        std::memcpy(values, &b, sizeof b);
+      } else {
+        std::memcpy(values, &v, sizeof v);
+      }
+    }
     return CUDNN_STATUS_SUCCESS;
   };
   auto give_none = [&]() {
