@@ -684,11 +684,12 @@ struct Machine {
   // an integer constant is its sign-extended 32 bits, so its high half is
   // their top; a float constant is the half in the low 16 bits with zero
   // above. The compiler asks for a constant in both halves by pointing the
-  // high result at the low half. A literal's second half is not modelled.
-  static uint16_t constant_half(const Inst& in, const Operand& o, uint32_t top) {
+  // high result at the low half. A literal (RDNA's; gfx9's packed
+  // instructions take none) is the whole pair: its top 16 bits are the high
+  // half, as LLVM encodes a packed constant (3.0 in both halves is
+  // 0x42004200).
+  static uint16_t constant_half(const Inst&, const Operand& o, uint32_t top) {
     if (o.kind == OperandKind::InlineFloat) return top ? 0 : as_bits(static_cast<_Float16>(o.fvalue));
-    if (top && o.kind == OperandKind::Literal)
-      throw Error::make(Err::Unsupported, in.name, " takes the second half of a literal, which this does not model");
     return static_cast<uint16_t>(static_cast<uint32_t>(o.value) >> (16 * top));
   }
   // Source k's 16 bits for the low result (half 0) or the high one, as the
@@ -805,6 +806,18 @@ struct Machine {
 
   // ---- The instructions ---------------------------------------------------
 
+  // A half operand of a scalar float instruction: a register's low 16 bits,
+  // or a constant's. An inline float constant is the half's own encoding
+  // (2.0 is 0x4000), as the vector unit reads one for a 16-bit instruction,
+  // not the float's bits, whose low half is zero.
+  _Float16 scalar_half(Wave& w, const Operand& o) {
+    if (o.kind == OperandKind::InlineFloat) return static_cast<_Float16>(o.fvalue);
+    const uint16_t bits = static_cast<uint16_t>(scalar(w, o));
+    _Float16 r;
+    std::memcpy(&r, &bits, 2);
+    return r;
+  }
+
   // RDNA's scalar float instructions (gfx11.5 and gfx12): a float or a half
   // in a scalar register, IEEE arithmetic as the vector unit does it.
   // Returns whether `op` was one.
@@ -822,6 +835,9 @@ struct Machine {
       std::memcpy(&bits, &v, 2);
       write_scalar(w, in.dst[0], bits);
     };
+    // Source k of a half instruction (scalar_half: an inline float constant
+    // is the half's own encoding).
+    const auto hs = [&](size_t k) { return scalar_half(w, in.src[k]); };
     if (op == "s_add_f32"_op) put(x + y);
     else if (op == "s_sub_f32"_op) put(x - y);
     else if (op == "s_mul_f32"_op) put(x * y);
@@ -838,20 +854,20 @@ struct Machine {
     else if (op == "s_cvt_u32_f32"_op)
       write_scalar(w, in.dst[0], std::isnan(x) || x <= 0 ? 0u : x >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(x));
     else if (op == "s_cvt_f16_f32"_op) put_h(static_cast<_Float16>(x));
-    else if (op == "s_cvt_f32_f16"_op) put(static_cast<float>(h(a)));
+    else if (op == "s_cvt_f32_f16"_op) put(static_cast<float>(hs(0)));
     else if (op == "s_cvt_hi_f32_f16"_op) put(static_cast<float>(h(a >> 16)));
     else if (op == "s_ceil_f32"_op) put(std::ceil(x));
     else if (op == "s_floor_f32"_op) put(std::floor(x));
     else if (op == "s_trunc_f32"_op) put(std::trunc(x));
     else if (op == "s_rndne_f32"_op) put(std::nearbyint(x));
-    else if (op == "s_add_f16"_op) put_h(h(a) + h(b));
-    else if (op == "s_sub_f16"_op) put_h(h(a) - h(b));
-    else if (op == "s_mul_f16"_op) put_h(h(a) * h(b));
+    else if (op == "s_add_f16"_op) put_h(hs(0) + hs(1));
+    else if (op == "s_sub_f16"_op) put_h(hs(0) - hs(1));
+    else if (op == "s_mul_f16"_op) put_h(hs(0) * hs(1));
     else if (op == "s_fmac_f16"_op)
-      put_h(static_cast<_Float16>(std::fma(static_cast<float>(h(a)), static_cast<float>(h(b)),
+      put_h(static_cast<_Float16>(std::fma(static_cast<float>(hs(0)), static_cast<float>(hs(1)),
                                            static_cast<float>(h(scalar(w, in.dst[0]))))));
-    else if (op == "s_min_num_f16"_op) put_h(h(a) < h(b) || h(b) != h(b) ? h(a) : h(b));
-    else if (op == "s_max_num_f16"_op) put_h(h(a) > h(b) || h(b) != h(b) ? h(a) : h(b));
+    else if (op == "s_min_num_f16"_op) put_h(hs(0) < hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
+    else if (op == "s_max_num_f16"_op) put_h(hs(0) > hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
     else return false;
     return true;
   }
@@ -1291,14 +1307,10 @@ struct Machine {
     if (in.name.size() > 10 && in.name.rfind("s_cmp_", 0) == 0 &&
         (in.name.compare(in.name.size() - 4, 4, "_f32") == 0 || in.name.compare(in.name.size() - 4, 4, "_f16") == 0)) {
       const bool half = in.name.compare(in.name.size() - 4, 4, "_f16") == 0;
-      const auto value = [&](uint64_t v) -> double {
-        if (!half) return as_float(static_cast<uint32_t>(v));
-        _Float16 h16;
-        const uint16_t bits = static_cast<uint16_t>(v);
-        std::memcpy(&h16, &bits, 2);
-        return static_cast<double>(h16);
+      const auto value = [&](size_t k, uint64_t v) -> double {
+        return half ? static_cast<double>(scalar_half(w, in.src[k])) : as_float(static_cast<uint32_t>(v));
       };
-      const double x = value(a), y = value(b);
+      const double x = value(0, a), y = value(1, b);
       const std::string t = in.name.substr(6, in.name.size() - 10);
       const bool unordered = x != x || y != y;
       w.scc = t == "lt" ? x < y : t == "eq" ? x == y : t == "le" ? x <= y : t == "gt" ? x > y
@@ -4591,7 +4603,7 @@ struct Machine {
   // A read-modify-write of global or flat memory: what it does, and how
   // wide it is.
   enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
-                   AddF64, MinF64, MaxF64, CmpSwap };
+                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap };
   struct AtomicOp {
     Rmw rmw = Rmw::Add;
     uint32_t bytes = 4;
@@ -4612,9 +4624,15 @@ struct Machine {
         {"smax", Rmw::SMax},     {"umax", Rmw::UMax},       {"inc", Rmw::Inc},           {"dec", Rmw::Dec},
         {"cmpswap", Rmw::CmpSwap}, {"add_f32", Rmw::AddF32}, {"pk_add_f16", Rmw::PkAddF16},
         {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
-        {"max_f64", Rmw::MaxF64}};
-    for (const auto& [name, rmw] : kNames)
+        {"max_f64", Rmw::MaxF64},
+        // RDNA's float min and max, as each generation spells them: gfx10's
+        // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
+        {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
+        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32}};
+    for (auto [name, rmw] : kNames)
       if (what == name) {
+        if (a->bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
+        if (a->bytes == 8 && rmw == Rmw::MaxF32) rmw = Rmw::MaxF64;
         a->rmw = rmw;
         if (rmw == Rmw::AddF64 || rmw == Rmw::MinF64 || rmw == Rmw::MaxF64) a->bytes = 8;
         return !(a->bytes == 8 && (rmw == Rmw::AddF32 || rmw == Rmw::PkAddF16 || rmw == Rmw::PkAddBf16));
@@ -4638,6 +4656,8 @@ struct Machine {
         case Rmw::Xor: return b ^ x;
         case Rmw::Swap: return x;
         case Rmw::AddF32: return as_bits(as_float(b) + as_float(x));
+        case Rmw::MinF32: return as_bits(std::fmin(as_float(b), as_float(x)));
+        case Rmw::MaxF32: return as_bits(std::fmax(as_float(b), as_float(x)));
         case Rmw::SMin: return static_cast<uint32_t>(std::min(sb, sx));
         case Rmw::UMin: return std::min(b, x);
         case Rmw::SMax: return static_cast<uint32_t>(std::max(sb, sx));
@@ -5939,6 +5959,24 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   DecodeCache* cache = d.decoded;
   if (!cache) cache = (own = std::make_unique<DecodeCache>(d.object->text.size())).get();
   DispatchStats total;
+  // A kernel whose first instruction ends it does the same in every
+  // work-group: each wave starts and stops, and nothing else happens. hip-tests
+  // launches such empty kernels over the largest grids there are (2^31
+  // work-groups and more). One group runs, and what it did is counted once
+  // for each. Where the groups differ in shape (a partial last group), and
+  // under the debugger or the wave trace, every group runs.
+  bool same_shape = true;
+  for (int i = 0; i < 3; ++i) same_shape &= !d.grid_items[i] || d.grid_items[i] % d.group_size[i] == 0;
+  if (groups > 1 && same_shape && !debug::active() && !Machine::tracing()) {
+    Machine m(d, mem, *cache);
+    if (OpName(m.fetch(d.code_base + k.entry).name) == "s_endpgm"_op) {
+      run_groups(m, d, packet, group_segment, 0, 1, group_at, nullptr);
+      total = m.stats;
+      total.scale(groups);
+      if (packet) mem.free(packet);
+      return total;
+    }
+  }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (d.cooperative) {
     // A cooperative launch's work-groups may wait on one another (a grid

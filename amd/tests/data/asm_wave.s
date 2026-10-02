@@ -8,6 +8,8 @@
 // lane stores 0x5eed0000 | its lane number to its own scratch and reads it
 // back; out[0] is lane 0's and out[1] lane 31's.
 // shader_cycles(uint* out): the counter read twice, a few instructions apart.
+// empty(): ends where it begins, as hip-tests' NOPKernel does, which it
+// launches over the largest grids there are.
   .amdgcn_target "amdgcn-amd-amdhsa--gfx1100"
   .text
   .globl whole_wave_scratch
@@ -50,6 +52,14 @@ shader_cycles:
 .Lshader_cycles_end:
   .size shader_cycles, .Lshader_cycles_end-shader_cycles
 
+  .globl empty
+  .p2align 8
+  .type empty,@function
+empty:
+  s_endpgm
+.Lempty_end:
+  .size empty, .Lempty_end-empty
+
   .rodata
   .p2align 6
   .amdhsa_kernel whole_wave_scratch
@@ -66,6 +76,12 @@ shader_cycles:
     .amdhsa_wavefront_size32 1
     .amdhsa_next_free_vgpr 3
     .amdhsa_next_free_sgpr 8
+  .end_amdhsa_kernel
+  .p2align 6
+  .amdhsa_kernel empty
+    .amdhsa_wavefront_size32 1
+    .amdhsa_next_free_vgpr 1
+    .amdhsa_next_free_sgpr 1
   .end_amdhsa_kernel
 
   .amdgpu_metadata
@@ -96,5 +112,15 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 64
     .args:
       - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }
+  - .name: empty
+    .symbol: empty.kd
+    .kernarg_segment_size: 0
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 32
+    .sgpr_count: 1
+    .vgpr_count: 1
+    .max_flat_workgroup_size: 64
 ...
   .end_amdgpu_metadata

@@ -134,6 +134,18 @@ struct DispatchStats {
     waves_lt16 += o.waves_lt16, waves_lt32 += o.waves_lt32, waves_lt48 += o.waves_lt48;
     waves_lt64 += o.waves_lt64, waves_eq64 += o.waves_eq64;
   }
+  // The same, done `n` times over: each count multiplied.
+  void scale(uint64_t n) {
+    waves *= n, instructions *= n, barriers *= n;
+    InstructionCounts& c = counts;
+    c.valu *= n, c.mfma *= n, c.salu *= n, c.smem *= n, c.vmem *= n;
+    c.flat *= n, c.lds *= n, c.branch *= n, c.sendmsg *= n, c.gds *= n;
+    c.flat_read *= n, c.flat_write *= n, c.flat_atomic *= n;
+    for (uint64_t& v : c.mix) v *= n;
+    for (uint64_t& v : c.mops) v *= n;
+    c.vmem_rd *= n, c.vmem_wr *= n;
+    waves_lt16 *= n, waves_lt32 *= n, waves_lt48 *= n, waves_lt64 *= n, waves_eq64 *= n;
+  }
 };
 
 // Runs the dispatch to completion. Throws Err::Unsupported naming the

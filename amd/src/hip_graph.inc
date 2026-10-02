@@ -398,11 +398,6 @@ bool has_memory_nodes(const GraphObj& g) {
       return true;
   return false;
 }
-bool has_alloc_nodes(const GraphObj& g) {
-  for (const auto& n : g.nodes)
-    if (n->type == vgpu::amd::abi::kNodeMemAlloc || (n->child && has_alloc_nodes(*n->child))) return true;
-  return false;
-}
 
 // Destroys a graph a program made, or one a capture made and gave up.
 void destroy_graph(GraphObj* g, Destructors* d) {
@@ -2160,13 +2155,14 @@ hipError_t hipGraphReleaseUserObject(void* graph, void* object, unsigned int cou
 }  // extern "C"
 namespace {
 // An executable graph: a copy of the graph, which checks it has no cycle,
-// and -- where it allocates -- that no other executable graph of it is
-// there, since both would map memory at the same addresses.
+// and -- where it allocates or frees -- that no other executable graph of it
+// is there, since both would map or unmap memory at the same addresses (ROCm's
+// HIP refuses a second one for a free node too).
 hipError_t instantiate(State& s, void** out, void* graph, unsigned long long flags) {
   GraphObj* g = find_graph(graph);
   if (!out || !g) return hipErrorInvalidValue;
   if (!acyclic(*g)) return fail(hipErrorInvalidValue, "the graph's edges go round in a cycle");
-  if (has_alloc_nodes(*g) && g->live_execs) return hipErrorNotSupported;
+  if (has_memory_nodes(*g) && g->live_execs) return hipErrorNotSupported;
   auto x = std::make_unique<ExecObj>();
   x->handle = new_handle();
   std::map<const GNode*, GNode*> m;
@@ -2438,7 +2434,14 @@ hipError_t hipGraphExecMemsetNodeSetParams(void* exec, void* node, const vgpu::a
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeMemset);
-    if (!n || !params || n->fill.p.height > 1 || params->height > 1) return record(s, hipErrorInvalidValue);
+    if (!n || !params) return record(s, hipErrorInvalidValue);
+    // A 2D memset keeps its shape, as ROCm's HIP holds it to: the same bytes
+    // a row and the same rows (a 1D one only has to fit its allocation).
+    const auto& was = n->fill.p;
+    if (params->height > 1 &&
+        (uint64_t{was.width} * was.elementSize != uint64_t{params->width} * params->elementSize ||
+         was.height != params->height))
+      return record(s, hipErrorInvalidValue);
     old_device = owner_of(s, reinterpret_cast<uint64_t>(n->fill.p.dst));
   }
   FillData f;

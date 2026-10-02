@@ -27,6 +27,13 @@ for src in vector_add ops math memory globals grid bytes int64 atomics mixed hal
   echo "wrote $(pwd)/$src.gfx1100.o, $src.gfx1201.o and $src.gfx1030.o"
 done
 
+# vector_add for the RDNA generic targets (test_amd_gcn_asm), which need a
+# clang that knows them (ROCm's; LLVM 19 and later).
+for t in gfx11-generic gfx12-generic; do
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=$t -nogpulib -O2 -c vector_add.c -o vector_add.$t.o ||
+    echo "this clang has no $t: keeping vector_add.$t.o as it is"
+done
+
 # The scratch kernel for gfx90a too, which reaches its private memory through
 # a buffer resource rather than flat scratch (test_amd_gcn_memory).
 "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx90a -nogpulib -O2 -c memory.c -o memory.gfx90a.o
@@ -46,13 +53,13 @@ for src in asm_lds_dma asm_ds_tr; do
 done
 
 # And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
-for src in asm_permlane asm_images asm_wave; do
+for src in asm_permlane asm_images asm_wave asm_literal asm_fminmax11; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -c "$src.s" -o "$src.gfx1100.o"
   echo "wrote $(pwd)/$src.gfx1100.o"
 done
 
 # And for gfx1201 (RDNA4), for what only it has (test_amd_gcn_asm).
-for src in asm_ttmp asm_cycles; do
+for src in asm_ttmp asm_cycles asm_fminmax12 asm_salu_f16; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c "$src.s" -o "$src.gfx1201.o"
   echo "wrote $(pwd)/$src.gfx1201.o"
 done
