@@ -400,7 +400,8 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
 void Device::reset() {
   // Modules first: their globals are allocations, and unloading frees them by
   // handle. Whatever is left afterwards -- cudaMalloc, arrays, pitched
-  // buffers -- goes in one sweep.
+  // buffers, the blocks kernels malloc'd and the heap's budget for them --
+  // goes in one sweep.
   while (!modules_.empty()) unload_module(modules_.back().id);
   textures_.clear();
   mem_.free_all();

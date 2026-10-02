@@ -1726,6 +1726,12 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
+  # The device heap is one per device, for both engines, and a reset empties it.
+  add_test(NAME e2e_device_heap COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_heap.sh)
+  set_tests_properties(e2e_device_heap PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 endif()
 
 # A cooperative launch through cudaLaunchKernelEx, and a library splicing nodes
