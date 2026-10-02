@@ -37,6 +37,12 @@ bool executes(const Instr& ins) {
   switch (ins.op) {
     case Op::HMMA: case Op::IMMA:
       return true;
+    case Op::F2FP:
+      // A narrow form (merging into C, or unpacking a narrow source) whose
+      // format the decoder did not recognise would run as some other one.
+      if (ins.f[5] == 1 && ins.f[3] < 10) return false;
+      if (ins.f[5] == 4 && ins.f[4] != 0 && ins.f[4] < 10) return false;
+      return true;
     case Op::LDSM: {
       // ldmatrix's forms: 16-bit 8x8, either way; packed 4- or 6-bit 8x16;
       // 8-bit or packed 16x16, transposed. Anything else is not one.
@@ -70,7 +76,7 @@ bool executes(const Instr& ins) {
     case Op::SYNCS: case Op::ARRIVES: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
     case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
     case Op::UTCSHIFT: case Op::UTCATOMSWS: case Op::STAS: case Op::REDAS: case Op::UGETNEXTWORKID:
-    case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
+    case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
     case Op::I2F: case Op::I2FP: case Op::I2I: case Op::I2IP: case Op::MUFU:
@@ -1388,25 +1394,65 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         });
         return;
       }
-      if (ins.f[3] >= 6 || ins.f[5] == 4) {   // the FP8 forms
-        const bool unpack = ins.f[5] == 4, sat = ins.f[6];
+      if (ins.f[3] >= 6 || ins.f[5] == 4) {   // the narrow forms: FP8, FP6, FP4, UE8M0
+        // The format, as the decoder names it (10 E4M3, 11 E5M2, 12 E3M2,
+        // 13 E2M3, 14 E2M1, 15 UE8M0); before sm_100 only 6 (E5M2) and 7.
+        const bool unpack = ins.f[5] == 4, sat = ins.f[6], relu = ins.f[2];
+        unsigned fmt = unpack ? ins.f[4] : ins.f[3];
+        if (fmt == 7 || (unpack && fmt == 3)) fmt = 10;
+        else if (fmt == 6 || (unpack && fmt == 2)) fmt = 11;
+        const unsigned width = fmt == 14 ? 4 : 8;   // bits a value takes in the pair
+        // One value of the format, as the PTX engine's cvt reads and writes it
+        // (vgpu/exec/numerics.hpp).
+        const auto decode = [&](uint32_t code) -> double {
+          switch (fmt) {
+            case 10: return exec::fp8_value(code, false);
+            case 11: return exec::fp8_value(code, true);
+            case 12: return exec::mx_float_value(code & 0x3F, 3, 2, 3);
+            case 13: return exec::mx_float_value(code & 0x3F, 2, 3, 1);
+            case 14: return exec::mx_float_value(code & 0xF, 2, 1, 1);
+            default: return code == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(code) - 127);
+          }
+        };
+        const auto encode = [&](double v, unsigned l) -> uint32_t {
+          if (relu && v < 0) v = 0.0;
+          switch (fmt) {
+            case 10: return exec::fp8_bits(v, false, sat);
+            case 11: return exec::fp8_bits(v, true, sat);
+            case 12: return exec::small_float_bits(v, 3, 2, 3);
+            case 13: return exec::small_float_bits(v, 2, 3, 1);
+            case 14: return exec::small_float_bits(v, 2, 1, 1);
+            default: {
+              const uint32_t c = exec::ue8m0_bits(v, ins.f[1] == 2, sat);   // .RZ, or .RP
+              if (c == ~0u) fault(w, ins, l, "F2FP to UE8M0 of a negative value, which the ISA does not define", Err::UnsupportedPtx);
+              return c;
+            }
+          }
+        };
         each_lane(ex, [&](unsigned l) {
-          if (unpack) {   // b's two bytes (low first, or its upper half's) to two halves
+          if (unpack) {   // b's pair (low first, or its upper half's) to two halves
             const uint32_t v = read32(w, ins.src[0], l) >> (ins.f[7] ? 16 : 0);
-            const bool e5 = ins.f[4] == 2;
-            const uint16_t lo = f64_to_half(exec::fp8_value(v & 0xff, e5));
-            const uint16_t hi = f64_to_half(exec::fp8_value((v >> 8) & 0xff, e5));
-            write32(w, ins.dst[0], l, lo | (static_cast<uint32_t>(hi) << 16));
+            uint32_t r = 0;
+            for (unsigned h = 0; h < 2; ++h) {
+              double x = decode((v >> (width * h)) & ((1u << width) - 1));
+              uint32_t half;
+              if (relu && std::isnan(x)) {
+                half = 0x7FFF;   // canonical NaN
+              } else {
+                if (relu && x < 0) x = 0.0;
+                half = ins.f[0] ? exec::bf16_bits(x) : exec::f16_bits(x);
+              }
+              r |= half << (16 * h);
+            }
+            write32(w, ins.dst[0], l, r);
             return;
           }
-          const bool e5 = ins.f[3] == 6;
-          float a = f32src(ins.src[0], l, false), b = f32src(ins.src[1], l, false);
-          if (ins.f[2]) {
-            if (a < 0) a = 0;
-            if (b < 0) b = 0;
-          }
-          uint32_t r = (exec::fp8_bits(a, e5, sat) << 8) | exec::fp8_bits(b, e5, sat);
-          if (ins.f[5] == 1) r |= read32(w, ins.src[2], l) & 0xffff0000u;   // MERGE_C
+          const double a = f32src(ins.src[0], l, false), b = f32src(ins.src[1], l, false);
+          uint32_t r = (encode(a, l) << width) | encode(b, l);
+          // MERGE_C: C moves up past the new pair, which is how ptxas builds a
+          // word of pairs -- each conversion's C the one before it (four FP4
+          // bytes, two FP6/FP8 halves).
+          if (ins.f[5] == 1) r |= read32(w, ins.src[2], l) << (2 * width);
           write32(w, ins.dst[0], l, r);
         });
         return;

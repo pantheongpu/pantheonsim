@@ -5127,26 +5127,15 @@ class Interpreter {
           case NarrowFmt::E2M3:
           case NarrowFmt::E3M2:
           case NarrowFmt::E2M1: {
-            // NaN goes to the positive largest normal (.satfinite).
             const int eb = fmt == NarrowFmt::E3M2 ? 3 : 2, mb = fmt == NarrowFmt::E2M3 ? 3 : fmt == NarrowFmt::E3M2 ? 2 : 1;
-            const int bias = fmt == NarrowFmt::E3M2 ? 3 : 1;
-            if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);
-            return double_to_small_float(v, eb, mb, bias);
+            return exec::small_float_bits(v, eb, mb, fmt == NarrowFmt::E3M2 ? 3 : 1);
           }
           case NarrowFmt::UE8M0: {
-            // 2^(code - 127), 0xFF NaN; .rz takes the power of two at or
-            // below, .rp the one at or above.
-            if (std::isnan(v)) return 0xFF;
-            if (v < 0)
+            const uint32_t code = exec::ue8m0_bits(v, op->rp, op->satfinite);
+            if (code == ~0u)
               ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
                        "cvt to ue8m0x2 of a negative value, which the ISA does not define");
-            if (v == 0) return 0;
-            if (std::isinf(v)) return op->satfinite ? 0xFE : 0xFF;
-            int e = std::ilogb(v);
-            if (op->rp && std::ldexp(1.0, e) != v) ++e;
-            if (e + 127 < 0) return 0;
-            if (e + 127 > 254) return op->satfinite ? 0xFE : 0xFF;
-            return static_cast<uint32_t>(e + 127);
+            return code;
           }
           case NarrowFmt::S2F6: {
             // An s8 in units of 2^-6; NaN to the positive largest.
@@ -12233,6 +12222,23 @@ std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAcces
 double fp8_value(uint32_t byte, bool e5m2) { return fp8_to_double(byte & 0xFF, e5m2 ? kE5M2 : kE4M3); }
 double mx_float_value(uint32_t code, int eb, int mb, int bias) { return small_float_value(code, eb, mb, bias); }
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite) { return double_to_fp8(v, e5m2 ? kE5M2 : kE4M3, satfinite); }
+uint32_t small_float_bits(double v, int eb, int mb, int bias) {
+  if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);   // .satfinite: the positive largest
+  return double_to_small_float(v, eb, mb, bias);
+}
+uint32_t ue8m0_bits(double v, bool round_up, bool satfinite) {
+  if (std::isnan(v)) return 0xFF;
+  if (v < 0) return ~0u;
+  if (v == 0) return 0;
+  if (std::isinf(v)) return satfinite ? 0xFE : 0xFF;
+  int e = std::ilogb(v);
+  if (round_up && std::ldexp(1.0, e) != v) ++e;
+  if (e + 127 < 0) return 0;
+  if (e + 127 > 254) return satfinite ? 0xFE : 0xFF;
+  return static_cast<uint32_t>(e + 127);
+}
+uint16_t f16_bits(double v) { return static_cast<uint16_t>(double_to_f16(v)); }
+uint16_t bf16_bits(double v) { return static_cast<uint16_t>(double_to_bf16(v)); }
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
   validate(fn, cfg, profile);

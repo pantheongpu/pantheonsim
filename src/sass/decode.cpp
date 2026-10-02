@@ -1363,21 +1363,46 @@ void dec_i2i(Instr& ins, const Word& w) {
 // 1 PACK_AB_MERGE_C: the pair into c's low half, 4 UNPACK_B: b's two bytes
 // to two halves), 75 .RELU, 79-80 the rounding, 90 .SATFINITE. From sm_89
 // nvdisasm names both types.
+// The narrow formats an F2FP packs to or unpacks from, as one code: kept in
+// f[3] (packed to) or f[4] (unpacked from).
+enum : unsigned { kNarrowE4M3 = 10, kNarrowE5M2, kNarrowE3M2, kNarrowE2M3, kNarrowE2M1, kNarrowUE8M0 };
+
 void dec_f2fp(Instr& ins, const Word& w) {
   ins.op = Op::F2FP;
   ins.mnemonic = "F2FP";
   static const char* const dts[] = {"F16", "BF16", "(2)", "(3)", "(4)", "TF32", "E5M2", "E4M3"};
   static const char* const sts[] = {"F32", "(1)", "E5M2", "E4M3"};
-  const unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
-  // 89: the one-operand forms (88: its source's upper half), 87: MERGE_C.
-  const unsigned mode = w.bit(89) ? 4 : w.bit(87) ? 1 : 0;
-  if (w.bit(75)) ins.mods.push_back("RELU");   // negatives become zero
+  unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
+  // 89: the one-operand forms (88: its source's upper half). Packing to a
+  // narrow type merges into C; 85-87 say which family (4 FP8, 3 FP6, 1 FP4,
+  // 6 UE8M0) and dt which of it. Unpacking, 82-83 say the source's family
+  // (0 FP8, 1 FP6/FP4, 2 UE8M0) and st which of it.
+  const unsigned fam = static_cast<unsigned>(w.field(85, 3)), ufam = static_cast<unsigned>(w.field(82, 2));
+  const unsigned mode = w.bit(89) ? 4 : fam ? 1 : 0;
+  const char* dname = dts[dt];
+  const char* sname = sts[st];
+  unsigned narrow = 0;
+  if (mode == 1) {
+    if (fam == 4) narrow = dt == 7 ? kNarrowE4M3 : dt == 6 ? kNarrowE5M2 : 0;
+    else if (fam == 3) narrow = dt == 7 ? kNarrowE3M2 : dt == 6 ? kNarrowE2M3 : 0;
+    else if (fam == 1) narrow = dt == 7 ? kNarrowE2M1 : 0;
+    else if (fam == 6) narrow = dt == 6 ? kNarrowUE8M0 : 0;
+    static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
+    if (narrow) dname = nn[narrow - kNarrowE4M3];
+  } else if (mode == 4 && st != 0) {
+    if (ufam == 0) narrow = st == 3 ? kNarrowE4M3 : st == 2 ? kNarrowE5M2 : 0;
+    else if (ufam == 1) narrow = st == 3 ? kNarrowE3M2 : st == 2 ? kNarrowE2M3 : kNarrowE2M1;
+    else if (ufam == 2) narrow = st == 3 ? kNarrowUE8M0 : 0;
+    static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
+    if (narrow) sname = nn[narrow - kNarrowE4M3];
+  }
   if (w.bit(90)) ins.mods.push_back("SATFINITE");
+  if (w.bit(75)) ins.mods.push_back("RELU");   // negatives become zero
   if (ins.sm >= 89) {
-    ins.mods.push_back(dts[dt]);
-    ins.mods.push_back(sts[st]);
+    ins.mods.push_back(dname);
+    ins.mods.push_back(sname);
   } else if (dt != 0) {
-    ins.mods.push_back(dts[dt]);
+    ins.mods.push_back(dname);
   }
   // Form 4 is one operand: b packed from F32 (PACK_B: tf32), else unpacked.
   ins.mods.push_back(mode == 4 ? (st == 0 ? "PACK_B" : "UNPACK_B") : mode == 1 ? "PACK_AB_MERGE_C" : "PACK_AB");
@@ -1386,8 +1411,8 @@ void dec_f2fp(Instr& ins, const Word& w) {
   ins.f[0] = dt == 1;
   ins.f[1] = rnd;
   ins.f[2] = w.bit(75);
-  ins.f[3] = dt;
-  ins.f[4] = st;
+  ins.f[3] = mode == 1 && narrow ? narrow : dt;
+  ins.f[4] = mode == 4 && narrow ? narrow : st;
   ins.f[5] = mode;
   ins.f[6] = w.bit(90);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
