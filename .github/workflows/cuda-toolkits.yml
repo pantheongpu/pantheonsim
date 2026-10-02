@@ -67,7 +67,7 @@ jobs:
           sudo apt-get update -qq
           pkgs="cuda-nvcc-$v cuda-cudart-dev-$v cuda-nvml-dev-$v cuda-cupti-dev-$v cuda-nvrtc-dev-$v
                 libcublas-dev-$v libcufft-dev-$v libcurand-dev-$v libcusparse-dev-$v libnvjpeg-dev-$v
-                libcusolver-dev-$v libnpp-dev-$v"
+                libcusolver-dev-$v libnpp-dev-$v cuda-profiler-api-$v"
           if apt-cache show "cuda-crt-$v" >/dev/null 2>&1; then pkgs="$pkgs cuda-crt-$v"; fi
           # shellcheck disable=SC2086
           sudo apt-get install -y -qq --no-install-recommends $pkgs

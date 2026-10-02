@@ -54,14 +54,15 @@ ARG CUDA_VERSION=13.0
 # The compiler and the header of every library the simulator stands in for:
 # each shim is compiled against its library's own header, so a missing one
 # fails the build. cuda-crt is a package of its own only in the releases that
-# split it out of cuda-nvcc. cuobjdump and nvdisasm are the SASS tests' oracle.
+# split it out of cuda-nvcc. cuobjdump and nvdisasm are the SASS tests' oracle;
+# cuda-profiler-api is cudaProfiler.h (e2e_driver_gaps).
 RUN v=$(echo "$CUDA_VERSION" | tr . -) \
  && wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
  && dpkg -i /tmp/keyring.deb && rm /tmp/keyring.deb \
  && apt-get update -qq \
  && pkgs="cuda-nvcc-$v cuda-cudart-dev-$v cuda-nvml-dev-$v cuda-cupti-dev-$v cuda-nvrtc-dev-$v \
           libcublas-dev-$v libcufft-dev-$v libcurand-dev-$v libcusparse-dev-$v libnvjpeg-dev-$v \
-          libcusolver-dev-$v libnpp-dev-$v cuda-cuobjdump-$v cuda-nvdisasm-$v" \
+          libcusolver-dev-$v libnpp-dev-$v cuda-cuobjdump-$v cuda-nvdisasm-$v cuda-profiler-api-$v" \
  && if apt-cache show "cuda-crt-$v" >/dev/null 2>&1; then pkgs="$pkgs cuda-crt-$v"; fi \
  && apt-get install -y -qq --no-install-recommends $pkgs \
  && rm -rf /var/lib/apt/lists/* \
