@@ -26,6 +26,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Steps run with bash, in the toolchain containers too, where a step's shell
+# would otherwise be sh: the steps use [[ ]], pipefail, arrays and PIPESTATUS.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # The toolchain images (.github/ci-image), found by ci-image-ref.yml.
   image:

@@ -28,6 +28,12 @@ env:
   # compilations need this; the shims themselves are ordinary C++.
   NVCC_PREPEND_FLAGS: -ccbin g++-12
 
+# Steps run with bash, in the toolchain containers too, where a step's shell
+# would otherwise be sh: the steps use [[ ]], pipefail, arrays and PIPESTATUS.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # The toolchain images this run's jobs can use (ci-image-ref.yml).
   image:
