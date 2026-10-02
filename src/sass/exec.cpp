@@ -183,6 +183,9 @@ class Runner {
                                       static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
     local_size_ = (local_size_ + 15) & ~15u;
     shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
+    if (m.sm >= 100)
+      for (const CubinSymbol& sym : m.cubin.symbols)
+        if (sym.name == ".nv.reservedSmem.offset0") alloc_handshake_ = static_cast<uint32_t>(sym.value);
     // From compute capability 8.0 the driver reserves 1 KiB of shared memory
     // behind every block's own, which it rounds to its 128-byte allocation
     // unit (cooperative_groups keeps the scratch of multi-warp tiles there).
@@ -310,6 +313,10 @@ class Runner {
   uint32_t local_size_ = 0;
   uint64_t shared_size_ = 0;
   uint64_t kernel_shared_ = 0;   // the block's own shared memory, rounded (see shared_size_)
+  // Where ptxas keeps its two-CTA Tensor Memory allocation handshake in the
+  // driver's reserved shared memory (.nv.reservedSmem.offset0), or ~0u.
+  uint32_t alloc_handshake_ = ~0u;
+  void seed_alloc_handshake(Block& blk);   // by the block's rank in its pair
   uint64_t smemsz_ = 0;          // SR_SMEMSZ: the whole allocation, in allocation units
   uint32_t block_threads_ = 0;
   // Thread-block clusters: the shape (1x1x1 without one), its size, and
@@ -675,6 +682,25 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
 
 // ---- the grid ------------------------------------------------------------------
 
+void Runner::seed_alloc_handshake(Block& blk) {
+  // tcgen05.alloc.cta_group::2 is a handshake ptxas writes over the reserved
+  // region .nv.reservedSmem.offset0 names: an mbarrier at +8 counting one
+  // arrival, the phase each side waits for at +0x10 (flipped every round),
+  // the column masks at +0x14 and +0x18. The pair's leader (its even CTA)
+  // waits for the peer to have acknowledged the round before, claims the
+  // columns and signals the peer (an arrive expecting 4 bytes, and st.async
+  // of them); the peer waits for that, then acknowledges on the leader's
+  // barrier. So the leader's barrier starts with its first phase complete and
+  // the peer's does not -- the only start under which both of the kernel's
+  // waits end, whichever CTA gets there first. Left zero, every 2-SM
+  // kernel waits for ever.
+  if (alloc_handshake_ != ~0u && alloc_handshake_ + 0x20 <= blk.shared.size()) {
+    const bool leader = (blk.rank & 1) == 0;
+    const uint64_t bar = 0x001ffffeull | (uint64_t{0x7ffff800u | (leader ? 0x80000000u : 0u)} << 32);
+    std::memcpy(&blk.shared[alloc_handshake_ + 8], &bar, 8);
+  }
+}
+
 void Runner::init_block(Block& blk, uint64_t linear) {
   blk.rank = 0;
   blk.own.blocks.assign(1, &blk);
@@ -684,6 +710,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   blk.ctaid[1] = static_cast<uint32_t>((linear / cfg_.grid[0]) % cfg_.grid[1]);
   blk.ctaid[2] = static_cast<uint32_t>(linear / (static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1]));
   blk.shared.assign(shared_size_, 0);
+  seed_alloc_handshake(blk);
   blk.st = exec::LaunchStats{};
   const uint32_t nwarps = (block_threads_ + 31) / 32;
   blk.st.warps = nwarps;
@@ -837,6 +864,7 @@ void Runner::run_cluster(uint64_t k) {
                    z = kz * cshape_[2] + r / (cshape_[0] * cshape_[1]);
     init_block(blocks[r], x + y * cfg_.grid[0] + z * uint64_t{cfg_.grid[0]} * cfg_.grid[1]);
     blocks[r].rank = r;
+    seed_alloc_handshake(blocks[r]);   // now that the block knows its rank
     blocks[r].cluster = &cl;
     cl.blocks.push_back(&blocks[r]);
   }
