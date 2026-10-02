@@ -16,21 +16,33 @@
 //
 // Precision: single and double through the classic API; cufftXt adds half,
 // computed in double like the rest and rounded to half on the way out.
+//
+// Multi-GPU plans spread their data over the simulated devices in NVIDIA's
+// layouts, and LTO callbacks given as PTX run on the device around the host
+// transform: see the sections at the end of this file.
 #include <cufft.h>
 #include <cufftXt.h>
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <set>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
+
+#include "fatbin.hpp"
+#include "ptx_link.hpp"
 
 namespace {
 
@@ -50,6 +62,19 @@ struct Plan {
   std::vector<long long> iembed, oembed;  // empty for the packed layout
   long long istride = 1, idist = 0, ostride = 1, odist = 0;
   cudaStream_t stream = nullptr;
+  // cufftXtSetGPUs: the devices a multi-GPU plan spreads its data over, in
+  // the order the data is dealt to them. Empty for a single-GPU plan.
+  std::vector<int> gpus;
+  int spread = 0;            // how a multi-GPU plan lays its data out (Spread)
+  // cufftXtSetJITCallback: the LTO callbacks, kept until the plan is made.
+  struct JitCallback {
+    std::string name;
+    std::vector<char> image;
+    void* info = nullptr;
+  };
+  std::map<int, JitCallback> jit;  // by cufftXtCallbackType
+  size_t jit_shared[8] = {};       // cufftXtSetCallbackSharedSize, by type
+  struct JitModule* jit_module = nullptr;  // the linked callback kernels, once made
 };
 
 std::mutex g_mu;
@@ -236,13 +261,23 @@ std::vector<size_t> layout(const std::vector<int>& shape, const std::vector<long
 
 bool is_double(cufftType t) { return t == CUFFT_Z2Z || t == CUFFT_D2Z || t == CUFFT_Z2D; }
 
+cufftResult multi_check(Plan& p);
+int load_type(cufftType t);
+int store_type(cufftType t);
+bool jm_has(const JitModule* m, bool load);
+bool jm_run(const JitModule& m, bool load, void* data, const std::vector<uint64_t>& offs,
+            std::vector<char>& vals, size_t bytes, size_t shared, cudaStream_t stream);
+void zero_work(cufftHandle h, size_t* work);
+cufftResult jit_prepare(Plan& p);
+
 // Every plan entry point lands here. `prec` is 0 to take it from the type; only
 // cufftXt plans ask for half precision.
 template <class I>
 cufftResult make_plan(cufftHandle h, int rank, const I* n, const std::type_identity_t<I>* inembed,
                       long long istride, long long idist,
                       const std::type_identity_t<I>* onembed, long long ostride, long long odist,
-                      cufftType type, long long batch, int prec = 0) {
+                      cufftType type, long long batch, int prec = 0, size_t* work = nullptr,
+                      bool make_call = false) {
   if (rank < 1 || rank > 3 || !n || batch < 1) return CUFFT_INVALID_VALUE;
   if (!is_c2c(type) && !is_r2c(type) && !is_c2r(type)) return CUFFT_INVALID_TYPE;
   Plan p;
@@ -267,7 +302,24 @@ cufftResult make_plan(cufftHandle h, int rank, const I* n, const std::type_ident
   }
   std::lock_guard<std::mutex> l(g_mu);
   auto it = g_plans.find(h);
-  if (it != g_plans.end()) p.stream = it->second.stream;  // cufftSetStream may come first
+  if (it != g_plans.end()) {  // what was set on the handle before it was made
+    p.stream = it->second.stream;
+    p.gpus = it->second.gpus;
+    p.jit = it->second.jit;
+    std::memcpy(p.jit_shared, it->second.jit_shared, sizeof p.jit_shared);
+  }
+  if (p.gpus.size() > 1) {
+    // A multi-GPU plan reports one work size per GPU, so it needs somewhere
+    // to put them: NVIDIA's answers a NULL workSize with INVALID_VALUE before
+    // it looks at anything else (RTX 3060 pair, CUDA 13.0).
+    if (make_call && !work) return CUFFT_INVALID_VALUE;
+    if (const cufftResult r = multi_check(p)) return r;
+  }
+  if (!p.jit.empty())
+    if (const cufftResult r = jit_prepare(p)) return r;
+  // Everything is computed on the host, so no plan needs a work area.
+  if (work)
+    for (size_t g = 0; g < std::max<size_t>(1, p.gpus.size()); ++g) work[g] = 0;
   g_plans[h] = p;
   return CUFFT_SUCCESS;
 }
@@ -277,44 +329,48 @@ cufftHandle alloc_handle() {
   return g_next++;
 }
 
-// The single implementation behind every Exec entry point. Reads the whole
-// input, transforms batch by batch, writes the whole output.
-cufftResult exec(cufftHandle handle, const void* idata, void* odata, int direction) {
-  Plan* p = find(handle);
-  if (!p) return CUFFT_INVALID_PLAN;
-  if (p->n.empty()) return CUFFT_INVALID_PLAN;  // created but never made
-  if (!idata || !odata) return CUFFT_INVALID_VALUE;
-  cudaStreamSynchronize(p->stream);
+// The element counts of one transform's input and output, and where each of
+// their elements sits in the user's buffer, as the plan's layout describes.
+struct Geometry {
+  Elems ie, oe;
+  std::vector<int> half;            // the stored half of a real transform's shape
+  std::vector<size_t> ioff, ooff;   // offsets of every element of one batch
+  size_t idist, odist;
+  size_t in_span, out_span;         // elements a whole call touches, batches included
+};
 
-  const bool c2r = is_c2r(p->type), r2c = is_r2c(p->type);
-  std::vector<int> half = p->n;
-  half.back() = half.back() / 2 + 1;
-  const std::vector<int>& ishape = c2r ? half : p->n;
-  const std::vector<int>& oshape = r2c ? half : p->n;
-  const Elems ie{p->prec, !r2c}, oe{p->prec, !c2r};
-  const std::vector<size_t> ioff = layout(ishape, p->iembed, p->istride);
-  const std::vector<size_t> ooff = layout(oshape, p->oembed, p->ostride);
-  const size_t idist = !p->iembed.empty() && p->idist ? (size_t)p->idist : logical_elems(ishape);
-  const size_t odist = !p->oembed.empty() && p->odist ? (size_t)p->odist : logical_elems(oshape);
+Geometry geometry(const Plan& p) {
+  const bool c2r = is_c2r(p.type), r2c = is_r2c(p.type);
+  Geometry g{Elems{p.prec, !r2c}, Elems{p.prec, !c2r}, p.n, {}, {}, 0, 0, 0, 0};
+  g.half.back() = g.half.back() / 2 + 1;
+  const std::vector<int>& ishape = c2r ? g.half : p.n;
+  const std::vector<int>& oshape = r2c ? g.half : p.n;
+  g.ioff = layout(ishape, p.iembed, p.istride);
+  g.ooff = layout(oshape, p.oembed, p.ostride);
+  g.idist = !p.iembed.empty() && p.idist ? (size_t)p.idist : logical_elems(ishape);
+  g.odist = !p.oembed.empty() && p.odist ? (size_t)p.odist : logical_elems(oshape);
   // The exact number of elements the user's buffer must hold: the last batch's
   // base plus its furthest element. Rounding this up would read past the end
   // of the allocation, which VirtualGPU catches and hardware does not.
-  const size_t in_span = (size_t)(p->batch - 1) * idist + ioff.back() + 1;
-  const size_t out_span = (size_t)(p->batch - 1) * odist + ooff.back() + 1;
+  g.in_span = (size_t)(p.batch - 1) * g.idist + g.ioff.back() + 1;
+  g.out_span = (size_t)(p.batch - 1) * g.odist + g.ooff.back() + 1;
+  return g;
+}
 
-  // The output is read first so the gaps a strided or padded layout leaves
-  // keep what they held; an in-place transform reads the input just after.
-  std::vector<char> hout(out_span * oe.size()), hin(in_span * ie.size());
-  cudaMemcpy(hout.data(), odata, hout.size(), cudaMemcpyDeviceToHost);
-  cudaMemcpy(hin.data(), idata, hin.size(), cudaMemcpyDeviceToHost);
-
+// The transform itself, on host copies of the input and output buffers. The
+// output arrives holding what the user's buffer held, so the gaps a strided or
+// padded layout leaves keep it.
+void transform(const Plan& p, const Geometry& g, const std::vector<char>& hin,
+               std::vector<char>& hout, int direction) {
+  const bool c2r = is_c2r(p.type), r2c = is_r2c(p.type);
   const int sign = c2r ? CUFFT_INVERSE : r2c ? CUFFT_FORWARD : direction;
-  const int last = p->n.back();
+  const int last = p.n.back();
+  const std::vector<int>& half = g.half;
   std::vector<cd> work;
-  for (long long b = 0; b < p->batch; ++b) {
-    const size_t ib = (size_t)b * idist, ob = (size_t)b * odist;
-    work.resize(ioff.size());
-    for (size_t k = 0; k < ioff.size(); ++k) work[k] = ie.load(hin, ib + ioff[k]);
+  for (long long b = 0; b < p.batch; ++b) {
+    const size_t ib = (size_t)b * g.idist, ob = (size_t)b * g.odist;
+    work.resize(g.ioff.size());
+    for (size_t k = 0; k < g.ioff.size(); ++k) work[k] = g.ie.load(hin, ib + g.ioff[k]);
 
     if (c2r) {
       // Invert every axis but the fastest on the stored half, then each
@@ -329,7 +385,7 @@ cufftResult exec(cufftHandle handle, const void* idata, void* odata, int directi
       }
       work.swap(full);
     } else {
-      fft_nd(work, p->n, sign);
+      fft_nd(work, p.n, sign);
       if (r2c) {  // keep the non-redundant half of the fastest dimension
         const size_t lines = work.size() / (size_t)last, h = (size_t)half.back();
         for (size_t l = 0; l < lines; ++l)
@@ -337,9 +393,56 @@ cufftResult exec(cufftHandle handle, const void* idata, void* odata, int directi
         work.resize(lines * h);
       }
     }
-    for (size_t k = 0; k < ooff.size(); ++k) oe.store(hout, ob + ooff[k], work[k]);
+    for (size_t k = 0; k < g.ooff.size(); ++k) g.oe.store(hout, ob + g.ooff[k], work[k]);
   }
+}
 
+// The single implementation behind every single-GPU Exec entry point. Reads
+// the whole input, transforms batch by batch, writes the whole output.
+cufftResult exec(cufftHandle handle, const void* idata, void* odata, int direction) {
+  Plan* p = find(handle);
+  if (!p) return CUFFT_INVALID_PLAN;
+  if (p->n.empty()) return CUFFT_INVALID_PLAN;  // created but never made
+  // A multi-GPU plan runs on descriptors (cufftXtExecDescriptor*): handed
+  // plain pointers, or a descriptor cast to one, NVIDIA's answers
+  // INTERNAL_ERROR (RTX 3060 pair).
+  if (p->gpus.size() > 1) return CUFFT_INTERNAL_ERROR;
+  if (!idata || !odata) return CUFFT_INVALID_VALUE;
+  cudaStreamSynchronize(p->stream);
+  const Geometry g = geometry(*p);
+  // The output is read first so the gaps a strided or padded layout leaves
+  // keep what they held; an in-place transform reads the input just after.
+  std::vector<char> hout(g.out_span * g.oe.size()), hin(g.in_span * g.ie.size());
+  cudaMemcpy(hout.data(), odata, hout.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hin.data(), idata, hin.size(), cudaMemcpyDeviceToHost);
+  // LTO callbacks: the load callback supplies every input element, given its
+  // offset in the input buffer; the store callback is handed every result
+  // with its offset in the output buffer, and writes it (or not) itself.
+  const JitModule* jm = p->jit_module;
+  if (jm && jm_has(jm, true)) {
+    std::vector<uint64_t> offs;
+    for (long long b = 0; b < p->batch; ++b)
+      for (size_t k : g.ioff) offs.push_back((uint64_t)b * g.idist + k);
+    std::vector<char> vals(offs.size() * g.ie.size());
+    if (!jm_run(*jm, true, const_cast<void*>(idata), offs, vals, g.ie.size(),
+                p->jit_shared[load_type(p->type)], p->stream))
+      return CUFFT_EXEC_FAILED;
+    for (size_t i = 0; i < offs.size(); ++i)
+      std::memcpy(hin.data() + offs[i] * g.ie.size(), vals.data() + i * g.ie.size(), g.ie.size());
+  }
+  transform(*p, g, hin, hout, direction);
+  if (jm && jm_has(jm, false)) {
+    std::vector<uint64_t> offs;
+    for (long long b = 0; b < p->batch; ++b)
+      for (size_t k : g.ooff) offs.push_back((uint64_t)b * g.odist + k);
+    std::vector<char> vals(offs.size() * g.oe.size());
+    for (size_t i = 0; i < offs.size(); ++i)
+      std::memcpy(vals.data() + i * g.oe.size(), hout.data() + offs[i] * g.oe.size(), g.oe.size());
+    if (!jm_run(*jm, false, odata, offs, vals, g.oe.size(), p->jit_shared[store_type(p->type)],
+                p->stream))
+      return CUFFT_EXEC_FAILED;
+    return CUFFT_SUCCESS;
+  }
   cudaMemcpy(odata, hout.data(), hout.size(), cudaMemcpyHostToDevice);
   return CUFFT_SUCCESS;
 }
@@ -392,33 +495,30 @@ VGPU_EXPORT cufftResult cufftPlanMany(cufftHandle* plan, int rank, int* n, int* 
 
 VGPU_EXPORT cufftResult cufftMakePlan1d(cufftHandle plan, int nx, cufftType type, int batch,
                                         size_t* work) {
-  if (work) *work = 0;
-  return make_plan(plan, 1, &nx, nullptr, 1, 0, nullptr, 1, 0, type, batch);
+  return make_plan(plan, 1, &nx, nullptr, 1, 0, nullptr, 1, 0, type, batch, 0, work, true);
 }
 VGPU_EXPORT cufftResult cufftMakePlan2d(cufftHandle plan, int nx, int ny, cufftType type,
                                         size_t* work) {
-  if (work) *work = 0;
   const int n[2] = {nx, ny};
-  return make_plan(plan, 2, n, nullptr, 1, 0, nullptr, 1, 0, type, 1);
+  return make_plan(plan, 2, n, nullptr, 1, 0, nullptr, 1, 0, type, 1, 0, work, true);
 }
 VGPU_EXPORT cufftResult cufftMakePlan3d(cufftHandle plan, int nx, int ny, int nz, cufftType type,
                                         size_t* work) {
-  if (work) *work = 0;
   const int n[3] = {nx, ny, nz};
-  return make_plan(plan, 3, n, nullptr, 1, 0, nullptr, 1, 0, type, 1);
+  return make_plan(plan, 3, n, nullptr, 1, 0, nullptr, 1, 0, type, 1, 0, work, true);
 }
 VGPU_EXPORT cufftResult cufftMakePlanMany(cufftHandle plan, int rank, int* n, int* inembed,
                                           int istride, int idist, int* onembed, int ostride,
                                           int odist, cufftType type, int batch, size_t* work) {
-  if (work) *work = 0;
-  return make_plan(plan, rank, n, inembed, istride, idist, onembed, ostride, odist, type, batch);
+  return make_plan(plan, rank, n, inembed, istride, idist, onembed, ostride, odist, type, batch, 0,
+                   work, true);
 }
 VGPU_EXPORT cufftResult cufftMakePlanMany64(cufftHandle plan, int rank, long long* n,
                                             long long* inembed, long long istride, long long idist,
                                             long long* onembed, long long ostride, long long odist,
                                             cufftType type, long long batch, size_t* work) {
-  if (work) *work = 0;
-  return make_plan(plan, rank, n, inembed, istride, idist, onembed, ostride, odist, type, batch);
+  return make_plan(plan, rank, n, inembed, istride, idist, onembed, ostride, odist, type, batch, 0,
+                   work, true);
 }
 
 /* ---- cufftXt: the same plans, typed by cudaDataType; PyTorch plans this way ---- */
@@ -456,9 +556,8 @@ VGPU_EXPORT cufftResult cufftXtMakePlanMany(cufftHandle plan, int rank, long lon
   // The execution type is the complex type of the transform's precision.
   const cudaDataType exec_type = prec == 64 ? CUDA_C_64F : prec == 32 ? CUDA_C_32F : CUDA_C_16F;
   if (executiontype != exec_type) return CUFFT_INVALID_TYPE;
-  if (work) *work = 0;
   return make_plan(plan, rank, n, inembed, istride, idist, onembed, ostride, odist, type, batch,
-                   prec);
+                   prec, work, true);
 }
 
 VGPU_EXPORT cufftResult cufftXtGetSizeMany(cufftHandle plan, int, long long*, long long*,
@@ -466,7 +565,7 @@ VGPU_EXPORT cufftResult cufftXtGetSizeMany(cufftHandle plan, int, long long*, lo
                                            long long, long long, cudaDataType, long long,
                                            size_t* work, cudaDataType) {
   if (!find(plan)) return CUFFT_INVALID_PLAN;
-  if (work) *work = 0;
+  zero_work(plan, work);
   return CUFFT_SUCCESS;
 }
 
@@ -482,28 +581,39 @@ VGPU_EXPORT cufftResult cufftXtExec(cufftHandle plan, void* input, void* output,
 
 /* ---- work area: everything is computed on the host, so there is none ---- */
 
+// A multi-GPU plan's work sizes are an array, one per GPU (cuFFT docs, "Plan
+// Specification and Work Areas").
+namespace {
+void zero_work(cufftHandle h, size_t* work) {
+  if (!work) return;
+  const Plan* p = find(h);
+  const size_t count = p && p->gpus.size() > 1 ? p->gpus.size() : 1;
+  for (size_t g = 0; g < count; ++g) work[g] = 0;
+}
+}  // namespace
+
 VGPU_EXPORT cufftResult cufftGetSize(cufftHandle handle, size_t* work) {
   if (!find(handle)) return CUFFT_INVALID_PLAN;
-  if (work) *work = 0;
+  zero_work(handle, work);
   return CUFFT_SUCCESS;
 }
-VGPU_EXPORT cufftResult cufftGetSize1d(cufftHandle, int, cufftType, int, size_t* w) {
-  if (w) *w = 0; return CUFFT_SUCCESS;
+VGPU_EXPORT cufftResult cufftGetSize1d(cufftHandle h, int, cufftType, int, size_t* w) {
+  zero_work(h, w); return CUFFT_SUCCESS;
 }
-VGPU_EXPORT cufftResult cufftGetSize2d(cufftHandle, int, int, cufftType, size_t* w) {
-  if (w) *w = 0; return CUFFT_SUCCESS;
+VGPU_EXPORT cufftResult cufftGetSize2d(cufftHandle h, int, int, cufftType, size_t* w) {
+  zero_work(h, w); return CUFFT_SUCCESS;
 }
-VGPU_EXPORT cufftResult cufftGetSize3d(cufftHandle, int, int, int, cufftType, size_t* w) {
-  if (w) *w = 0; return CUFFT_SUCCESS;
+VGPU_EXPORT cufftResult cufftGetSize3d(cufftHandle h, int, int, int, cufftType, size_t* w) {
+  zero_work(h, w); return CUFFT_SUCCESS;
 }
-VGPU_EXPORT cufftResult cufftGetSizeMany(cufftHandle, int, int*, int*, int, int, int*, int, int,
+VGPU_EXPORT cufftResult cufftGetSizeMany(cufftHandle h, int, int*, int*, int, int, int*, int, int,
                                          cufftType, int, size_t* w) {
-  if (w) *w = 0; return CUFFT_SUCCESS;
+  zero_work(h, w); return CUFFT_SUCCESS;
 }
-VGPU_EXPORT cufftResult cufftGetSizeMany64(cufftHandle, int, long long*, long long*, long long,
+VGPU_EXPORT cufftResult cufftGetSizeMany64(cufftHandle h, int, long long*, long long*, long long,
                                            long long, long long*, long long, long long, cufftType,
                                            long long, size_t* w) {
-  if (w) *w = 0; return CUFFT_SUCCESS;
+  zero_work(h, w); return CUFFT_SUCCESS;
 }
 VGPU_EXPORT cufftResult cufftEstimate1d(int, cufftType, int, size_t* w) { if (w) *w = 0; return CUFFT_SUCCESS; }
 VGPU_EXPORT cufftResult cufftEstimate2d(int, int, cufftType, size_t* w) { if (w) *w = 0; return CUFFT_SUCCESS; }
@@ -511,7 +621,10 @@ VGPU_EXPORT cufftResult cufftEstimate3d(int, int, int, cufftType, size_t* w) { i
 VGPU_EXPORT cufftResult cufftEstimateMany(int, int*, int*, int, int, int*, int, int, cufftType,
                                           int, size_t* w) { if (w) *w = 0; return CUFFT_SUCCESS; }
 VGPU_EXPORT cufftResult cufftSetWorkArea(cufftHandle handle, void*) {
-  return find(handle) ? CUFFT_SUCCESS : CUFFT_INVALID_PLAN;
+  // A multi-GPU plan takes its work areas through cufftXtSetWorkArea, and
+  // NVIDIA's answers this one INVALID_PLAN for it.
+  const Plan* p = find(handle);
+  return p && p->gpus.size() < 2 ? CUFFT_SUCCESS : CUFFT_INVALID_PLAN;
 }
 VGPU_EXPORT cufftResult cufftSetAutoAllocation(cufftHandle handle, int) {
   return find(handle) ? CUFFT_SUCCESS : CUFFT_INVALID_PLAN;
@@ -580,4 +693,1014 @@ VGPU_EXPORT cufftResult cufftExecZ2D(cufftHandle h, cufftDoubleComplex* in,
   if (!p) return CUFFT_INVALID_PLAN;
   if (p->type != CUFFT_Z2D) return CUFFT_INVALID_TYPE;
   return exec(h, in, out, CUFFT_INVERSE);
+}
+
+/* ---- multiple GPUs: cufftXtSetGPUs, descriptors, cufftXtExecDescriptor ----
+ *
+ * The data of a multi-GPU plan really is spread over the simulated devices:
+ * cufftXtMalloc allocates each GPU's part on that device, cufftXtMemcpy deals
+ * the host array out (and gathers it back) in NVIDIA's order, and the
+ * transform gathers every part, runs on the host like the rest of this
+ * library, and writes each part back where NVIDIA's leaves it.
+ *
+ * The orders are the ones cuFFT's documentation describes ("Multiple GPU Data
+ * Organization"), measured on two RTX 3060s with CUDA 13.0's cuFFT 12.0
+ * (nvidia/tests/e2e/fft_multigpu.cu checks each against the card):
+ *
+ *   batched (batch > 1)  whole transforms dealt out in order, the first
+ *                        batch % G GPUs taking one more; output in place, in
+ *                        natural order, the descriptor's subFormat unchanged.
+ *   single 2-D / 3-D     natural order (CUFFT_XT_FORMAT_INPLACE) splits the
+ *                        slowest axis, x, the first nx % G GPUs taking one
+ *                        more plane, each GPU's planes contiguous; the
+ *                        transform leaves it split on y instead
+ *                        (CUFFT_XT_FORMAT_INPLACE_SHUFFLED), each GPU holding
+ *                        [x][its y][z...], and a transform of shuffled data
+ *                        returns it to natural order. Each part is allocated
+ *                        for the larger of the two. Real transforms count the
+ *                        stored half of the fastest axis (padded in place).
+ *   single 1-D           natural order is n/G contiguous points per GPU; the
+ *                        output is in "strings" (the cuFFT documentation's
+ *                        permuted2Linear); CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED
+ *                        takes the input already redistributed.
+ */
+namespace {
+
+enum Spread { kSingle = 0, kBatches, kLine, kSlabs };
+
+std::vector<int> squeezed(const std::vector<int>& n) {
+  std::vector<int> s;
+  for (int d : n)
+    if (d != 1) s.push_back(d);
+  return s;
+}
+
+bool pow2(long long v) { return v > 0 && (v & (v - 1)) == 0; }
+int log2i(long long v) { int k = 0; while ((1LL << k) < v) ++k; return k; }
+
+// The rules a multi-GPU plan has to meet, with the status NVIDIA's returns
+// when it does not, each measured on the RTX 3060 pair:
+//   - half precision: SETUP_FAILED, even batched.
+//   - batch > 1: anything else goes.
+//   - batch 1, after dropping axes of size 1 (1x1x64 is a 1-D 64-point plan,
+//     32x1x32 a 2-D one): 1-D only C2C/Z2Z of a power of two of at least 64
+//     (128 on 8 GPUs, 1024 on 16) on 2, 4, 8 or 16 GPUs; 2-D and 3-D with the
+//     two slowest axes at least 32 (the third is free: 32x32x2 is accepted).
+//     Anything else is INVALID_SIZE -- a 1-D R2C too, and 8x8, 16x64, 31x32,
+//     3x32x32. (The documentation also asks every axis to factor into primes
+//     up to 127 or stay within 4096 points; NVIDIA's plans 4099x32 all the
+//     same, so this does too.)
+//   - an advanced layout (inembed/onembed) is accepted, batched or not; a
+//     single transform's descriptors still hold it packed.
+cufftResult multi_check(Plan& p) {
+  const long long G = (long long)p.gpus.size();
+  if (p.prec == 16) return CUFFT_SETUP_FAILED;
+  if (p.batch > 1) { p.spread = kBatches; return CUFFT_SUCCESS; }
+  const std::vector<int> s = squeezed(p.n);
+  if (s.empty()) return CUFFT_INVALID_SIZE;
+  if (s.size() == 1) {
+    // Two GPUs is all the card pair can show; the other counts follow the
+    // documentation's table. (NVIDIA's accepted 64 points on a three-entry
+    // GPU list, {0,1,0}, while refusing 1024 on it.)
+    const long long min = G >= 16 ? 1024 : G >= 8 ? 128 : 64;
+    if (!is_c2c(p.type) || !pow2(s[0]) || s[0] < min || !pow2(G) || G > 16)
+      return CUFFT_INVALID_SIZE;
+    p.spread = kLine;
+    return CUFFT_SUCCESS;
+  }
+  if (s[0] < 32 || s[1] < 32 || G > 16) return CUFFT_INVALID_SIZE;
+  p.spread = kSlabs;
+  return CUFFT_SUCCESS;
+}
+
+// The factors a single 1-D transform is split into (cufftXtQueryPlan's
+// cufftXt1dFactors). factor2 for 2^k points, k = 6..27, as NVIDIA's chose it
+// on two GPUs, single and double precision alike; factor1 = n / factor2; 8
+// strings, but 2 for 64 points. Past 2^27 the last choice is kept.
+struct Factors { long long n, f1, f2, strings; };
+Factors factors_1d(long long n, int G) {
+  static const int f2_log[] = {2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6,
+                               7, 8, 9, 9, 9, 8, 9, 9, 9};
+  const int k = log2i(n);
+  const int f2l = f2_log[std::min(std::max(k, 6), 27) - 6];
+  Factors f{n, n >> f2l, 1LL << f2l, k == 6 ? 2 : 8};
+  // More GPUs than the card pair has: every GPU needs a string of its own.
+  if (f.strings < G) f.strings = G;
+  return f;
+}
+
+// Where each GPU's elements sit in the natural host array: at[g][i] is the
+// host index of local element i on GPU g, in `unit`-byte elements.
+struct Placement {
+  size_t unit = 0;
+  std::vector<std::vector<size_t>> at;
+};
+
+size_t complex_bytes(const Plan& p) { return (size_t)p.prec / 4; }
+
+// The shape a single multi-GPU transform's elements form: the stored half of
+// the fastest axis for a real transform, axes of size 1 dropped.
+std::vector<int> unit_shape(const Plan& p) {
+  std::vector<int> u = p.n;
+  if (!is_c2c(p.type)) u.back() = u.back() / 2 + 1;
+  return squeezed(u);
+}
+
+// A part of `total` for each of G GPUs, the first total % G one larger.
+void split(long long total, int G, int g, long long* start, long long* count) {
+  const long long base = total / G, extra = total % G;
+  *count = base + (g < extra ? 1 : 0);
+  *start = g * base + std::min<long long>(g, extra);
+}
+
+// Whether a batched real transform's descriptor of this format holds the real
+// side packed (n reals a transform) rather than in place (the stored half,
+// padded): CUFFT_XT_FORMAT_INPUT of an R2C plan, CUFFT_XT_FORMAT_OUTPUT of a
+// C2R one, as their sizes on the card show.
+bool packed_real(const Plan& p, int fmt) {
+  return (is_r2c(p.type) && fmt == CUFFT_XT_FORMAT_INPUT) ||
+         (is_c2r(p.type) && fmt == CUFFT_XT_FORMAT_OUTPUT);
+}
+
+Placement place(const Plan& p, int fmt) {
+  const int G = (int)p.gpus.size();
+  Placement pl;
+  pl.at.resize(G);
+  pl.unit = complex_bytes(p);
+  if (p.spread == kLine) {
+    const long long n = squeezed(p.n)[0], part = n / G;
+    const Factors f = factors_1d(n, G);
+    for (int g = 0; g < G; ++g) {
+      pl.at[g].resize((size_t)part);
+      for (long long i = 0; i < part; ++i) {
+        long long lin = g * part + i;
+        if (fmt == CUFFT_XT_FORMAT_INPLACE_SHUFFLED) {
+          // The documentation's permuted2Linear: strings of factor2
+          // substrings, each substring factor1 apart, the strings in order
+          // over the GPUs.
+          const long long sl = n / f.strings, ssl = sl / f.f2;
+          const long long in_sub = i % ssl, sub = (i / ssl) % f.f2;
+          const long long str = i / sl + g * (f.strings / G);
+          lin = in_sub + str * ssl + sub * f.f1;
+        } else if (fmt == CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED) {
+          // The input of the first pass, measured: point a + factor2*b
+          // (b < factor1) goes to the GPU owning a, each GPU's a values in
+          // its strings, q of them a string, b before a within one.
+          const long long per_gpu = f.f2 / G, S = std::max<long long>(1, f.strings / G);
+          const long long q = std::max<long long>(1, per_gpu / S);
+          const long long st = i / (q * f.f1), rem = i % (q * f.f1);
+          const long long b = rem / q, a = g * per_gpu + st * q + rem % q;
+          lin = a + f.f2 * b;
+        }
+        pl.at[g][(size_t)i] = (size_t)lin;
+      }
+    }
+    return pl;
+  }
+  // Slabs: natural order splits axis 0, shuffled order axis 1.
+  const std::vector<int> u = unit_shape(p);
+  const size_t inner = logical_elems(std::vector<int>(u.begin() + 2, u.end()));
+  for (int g = 0; g < G; ++g) {
+    long long s0, c;
+    if (fmt == CUFFT_XT_FORMAT_INPLACE_SHUFFLED) {
+      split(u[1], G, g, &s0, &c);
+      for (long long x = 0; x < u[0]; ++x)
+        for (long long y = s0; y < s0 + c; ++y)
+          for (size_t r = 0; r < inner; ++r)
+            pl.at[g].push_back(((size_t)x * u[1] + (size_t)y) * inner + r);
+    } else {
+      split(u[0], G, g, &s0, &c);
+      const size_t slab = (size_t)u[1] * inner;
+      for (size_t i = 0; i < (size_t)c * slab; ++i) pl.at[g].push_back((size_t)s0 * slab + i);
+    }
+  }
+  return pl;
+}
+
+// What cufftXtMalloc allocates on each GPU, in bytes (measured sizes): a
+// batched descriptor holds its transforms; a 1-D one n/G points whatever the
+// format; a 2-D/3-D one the larger of its natural and shuffled parts, but
+// only for the formats a transform can start from -- CUFFT_XT_FORMAT_INPUT,
+// _OUTPUT and the formats past _1D_INPUT_SHUFFLED come back empty, and so do
+// a 2-D R2C plan's shuffled and a 2-D C2R plan's natural descriptors (each
+// can only start from the other).
+size_t part_bytes(const Plan& p, int fmt, int g) {
+  if (p.spread == kBatches) {
+    long long b0, cnt;
+    split(p.batch, (int)p.gpus.size(), g, &b0, &cnt);
+    if (!cnt) return 0;
+    if (!p.iembed.empty()) {
+      // An advanced layout: the span its batches cover, as the plan lays them
+      // out (8 points at stride 2, distance 16: 31 elements for two batches,
+      // 15 for one).
+      Plan local = p;
+      local.batch = cnt;
+      const Geometry geo = geometry(local);
+      const size_t in = geo.in_span * geo.ie.size(), out = geo.out_span * geo.oe.size();
+      return fmt == CUFFT_XT_FORMAT_INPUT ? in : fmt == CUFFT_XT_FORMAT_OUTPUT ? out : std::max(in, out);
+    }
+    if (packed_real(p, fmt)) return (size_t)cnt * logical_elems(p.n) * (size_t)p.prec / 8;
+    return (size_t)cnt * (is_c2c(p.type) ? logical_elems(p.n) : complex_elems(p.n)) * complex_bytes(p);
+  }
+  if (p.spread == kSlabs) {
+    if (fmt != CUFFT_XT_FORMAT_INPLACE && fmt != CUFFT_XT_FORMAT_INPLACE_SHUFFLED) return 0;
+    if (unit_shape(p).size() == 2 && is_r2c(p.type) && fmt == CUFFT_XT_FORMAT_INPLACE_SHUFFLED)
+      return 0;
+    if (unit_shape(p).size() == 2 && is_c2r(p.type) && fmt == CUFFT_XT_FORMAT_INPLACE) return 0;
+    const Placement a = place(p, CUFFT_XT_FORMAT_INPLACE), b = place(p, CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
+    return std::max(a.at[g].size(), b.at[g].size()) * a.unit;
+  }
+  const Placement pl = place(p, fmt);
+  return pl.at[g].size() * pl.unit;
+}
+
+// Which formats cufftXtMalloc takes, by spread, with NVIDIA's status for the
+// others: batched plans take INPUT, OUTPUT and INPLACE (INPLACE_SHUFFLED is
+// INVALID_VALUE, 1D_INPUT_SHUFFLED INVALID_PLAN); 1-D plans take the first
+// five; 2-D/3-D plans take all but 1D_INPUT_SHUFFLED (INVALID_PLAN), any
+// value past it included.
+cufftResult format_ok(const Plan& p, int fmt) {
+  if (fmt < 0) return CUFFT_INVALID_VALUE;
+  if (p.spread == kSlabs) return fmt == CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED ? CUFFT_INVALID_PLAN : CUFFT_SUCCESS;
+  if (p.spread == kLine) return fmt <= CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED ? CUFFT_SUCCESS : CUFFT_INVALID_VALUE;
+  if (fmt == CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED) return CUFFT_INVALID_PLAN;
+  return fmt <= CUFFT_XT_FORMAT_INPLACE ? CUFFT_SUCCESS : CUFFT_INVALID_VALUE;
+}
+
+// Restores the current device on the way out of a call that visits others.
+struct DeviceGuard {
+  int saved = 0;
+  DeviceGuard() { cudaGetDevice(&saved); }
+  ~DeviceGuard() { cudaSetDevice(saved); }
+};
+
+// Every GPU's part of a descriptor, gathered into the natural host array
+// (`bytes` long; elements no part holds are left as they are).
+// A batched descriptor's parts are the host array's consecutive pieces, each
+// as long as the part: NVIDIA's copies them so even when an advanced layout
+// leaves the last batch on a GPU short of the next GPU's first.
+void gather(const Plan& p, const cudaLibXtDesc* d, std::vector<char>& host) {
+  if (p.spread == kBatches) {
+    size_t at = 0;
+    for (int g = 0; g < d->descriptor->nGPUs; ++g) {
+      const size_t bytes = std::min(d->descriptor->size[g], host.size() - std::min(host.size(), at));
+      if (bytes) cudaMemcpy(host.data() + at, d->descriptor->data[g], bytes, cudaMemcpyDefault);
+      at += d->descriptor->size[g];
+    }
+    return;
+  }
+  const Placement pl = place(p, d->subFormat);
+  for (int g = 0; g < (int)pl.at.size(); ++g) {
+    const size_t bytes = std::min(pl.at[g].size() * pl.unit, d->descriptor->size[g]);
+    if (!bytes) continue;
+    std::vector<char> part(bytes);
+    cudaMemcpy(part.data(), d->descriptor->data[g], bytes, cudaMemcpyDefault);
+    for (size_t i = 0; i < bytes / pl.unit; ++i)
+      std::memcpy(host.data() + pl.at[g][i] * pl.unit, part.data() + i * pl.unit, pl.unit);
+  }
+}
+
+void scatter(const Plan& p, cudaLibXtDesc* d, const std::vector<char>& host) {
+  if (p.spread == kBatches) {
+    size_t at = 0;
+    for (int g = 0; g < d->descriptor->nGPUs; ++g) {
+      const size_t bytes = std::min(d->descriptor->size[g], host.size() - std::min(host.size(), at));
+      if (bytes) cudaMemcpy(d->descriptor->data[g], host.data() + at, bytes, cudaMemcpyDefault);
+      at += d->descriptor->size[g];
+    }
+    return;
+  }
+  const Placement pl = place(p, d->subFormat);
+  for (int g = 0; g < (int)pl.at.size(); ++g) {
+    const size_t bytes = std::min(pl.at[g].size() * pl.unit, d->descriptor->size[g]);
+    if (!bytes) continue;
+    std::vector<char> part(bytes);
+    for (size_t i = 0; i < bytes / pl.unit; ++i)
+      std::memcpy(part.data() + i * pl.unit, host.data() + pl.at[g][i] * pl.unit, pl.unit);
+    cudaMemcpy(d->descriptor->data[g], part.data(), bytes, cudaMemcpyDefault);
+  }
+}
+
+// The natural host array a descriptor of this format stands for, in bytes.
+size_t host_bytes(const Plan& p, int fmt) {
+  if (p.spread == kBatches) {
+    size_t n = 0;
+    for (int g = 0; g < (int)p.gpus.size(); ++g) n += part_bytes(p, fmt, g);
+    return n;
+  }
+  const Placement pl = place(p, fmt);
+  size_t n = 0;
+  for (const auto& a : pl.at) n += a.size();
+  return n * pl.unit;
+}
+
+// The single-GPU plan that transforms host copies of the data: every batch
+// packed, a real side packed (out of place) or padded in place to the stored
+// half's width. A batched plan with an advanced layout keeps it: each GPU runs
+// its batches in that layout on its own part.
+Plan host_plan(const Plan& p, bool packed_real_side) {
+  Plan h = p;
+  h.gpus.clear();
+  h.spread = kSingle;
+  if (p.spread == kBatches && !p.iembed.empty()) return h;
+  h.iembed.clear();
+  h.oembed.clear();
+  h.istride = h.ostride = 1;
+  if (is_c2c(p.type)) return h;
+  std::vector<long long> real(p.n.begin(), p.n.end()), cplx = real;
+  cplx.back() = cplx.back() / 2 + 1;
+  std::vector<long long> padded = cplx;
+  padded.back() *= 2;
+  const bool r2c = is_r2c(p.type);
+  const std::vector<long long>& rside = packed_real_side ? real : padded;
+  long long rdist = 1, cdist = 1;
+  for (long long v : rside) rdist *= v;
+  for (long long v : cplx) cdist *= v;
+  h.iembed = r2c ? rside : cplx;
+  h.oembed = r2c ? cplx : rside;
+  h.idist = r2c ? rdist : cdist;
+  h.odist = r2c ? cdist : rdist;
+  return h;
+}
+
+std::mutex g_desc_mu;
+std::set<const cudaLibXtDesc*> g_descs;  // the descriptors cufftXtMalloc made
+bool live_desc(const cudaLibXtDesc* d) {
+  std::lock_guard<std::mutex> l(g_desc_mu);
+  return d && g_descs.count(d);
+}
+
+// Runs `hp` on host copies of `in` and `out` (`in_bytes` and `out_bytes`
+// long, from the given device pointers), writing the result back.
+void run_part(const Plan& hp, const void* in, size_t in_bytes, void* out, size_t out_bytes,
+              bool in_place, int direction) {
+  const Geometry geo = geometry(hp);
+  std::vector<char> hin(std::max(in_bytes, geo.in_span * geo.ie.size()));
+  std::vector<char> hout(std::max(out_bytes, geo.out_span * geo.oe.size()));
+  if (in_bytes) cudaMemcpy(hin.data(), in, in_bytes, cudaMemcpyDefault);
+  if (in_place) std::memcpy(hout.data(), hin.data(), std::min(hin.size(), hout.size()));
+  else if (out_bytes) cudaMemcpy(hout.data(), out, out_bytes, cudaMemcpyDefault);
+  transform(hp, geo, hin, hout, direction);
+  if (out_bytes) cudaMemcpy(out, hout.data(), out_bytes, cudaMemcpyDefault);
+}
+
+// cufftXtExecDescriptor*: `want` is the plan type the entry point is for, or
+// 0 for cufftXtExecDescriptor itself.
+cufftResult exec_desc(cufftHandle plan, cudaLibXtDesc* in, cudaLibXtDesc* out, int direction,
+                      cufftType want) {
+  Plan* pp = find(plan);
+  // NVIDIA's answers a missing descriptor, and an entry point for another
+  // type, with INVALID_PLAN.
+  if (!pp || pp->n.empty() || !in || !out) return CUFFT_INVALID_PLAN;
+  const Plan p = *pp;
+  if (want && p.type != want) return CUFFT_INVALID_PLAN;
+  if (is_c2c(p.type) && direction != CUFFT_FORWARD && direction != CUFFT_INVERSE)
+    return CUFFT_INVALID_VALUE;
+  // A single-GPU plan's descriptor holds nothing (cufftXtMalloc gives it no
+  // memory), and NVIDIA's answers EXEC_FAILED.
+  if (p.gpus.size() < 2) return CUFFT_EXEC_FAILED;
+  if (!live_desc(in) || !live_desc(out)) return CUFFT_INVALID_VALUE;
+  DeviceGuard dg;
+  for (int g : p.gpus) {
+    cudaSetDevice(g);
+    cudaDeviceSynchronize();
+  }
+  if (p.spread == kBatches) {
+    // LTO callbacks do not run on several GPUs: NVIDIA's makes a batched
+    // plan with them and refuses to execute it, INTERNAL_ERROR.
+    if (!p.jit.empty()) return CUFFT_INTERNAL_ERROR;
+    // Each GPU transforms its own batches where they are, whatever the
+    // descriptors' subFormats say, which are left as they were. Out of place,
+    // a real side is read or written packed whatever the descriptor's format
+    // (an R2C from an in-place descriptor reads n reals a transform).
+    const bool in_place = in == out;
+    for (int g = 0; g < (int)p.gpus.size() && g < in->descriptor->nGPUs; ++g) {
+      long long b0, cnt;
+      split(p.batch, (int)p.gpus.size(), g, &b0, &cnt);
+      if (!cnt) continue;
+      Plan hp = host_plan(p, !in_place);
+      hp.batch = cnt;
+      run_part(hp, in->descriptor->data[g], in->descriptor->size[g], out->descriptor->data[g],
+               out->descriptor->size[g], in_place, direction);
+    }
+    return CUFFT_SUCCESS;
+  }
+  const int f = in->subFormat;
+  int out_fmt;
+  if (p.spread == kLine) {
+    // Natural or input-shuffled data in, strings out. Anything else is
+    // INVALID_TYPE: strings (inverting a 1-D result takes a cufftXtMemcpy
+    // device to device first) and the formats with no layout of their own.
+    if (f != CUFFT_XT_FORMAT_INPLACE && f != CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED)
+      return CUFFT_INVALID_TYPE;
+    out_fmt = CUFFT_XT_FORMAT_INPLACE_SHUFFLED;
+  } else {
+    // Natural in, shuffled out, and back again; any other subFormat is
+    // INTERNAL_ERROR. A 2-D R2C takes only natural input and a 2-D C2R only
+    // shuffled (the documentation's table; the other is INTERNAL_ERROR on
+    // the card), where 3-D real transforms take either.
+    if (f != CUFFT_XT_FORMAT_INPLACE && f != CUFFT_XT_FORMAT_INPLACE_SHUFFLED)
+      return CUFFT_INTERNAL_ERROR;
+    if (unit_shape(p).size() == 2 && ((is_r2c(p.type) && f != CUFFT_XT_FORMAT_INPLACE) ||
+                                      (is_c2r(p.type) && f != CUFFT_XT_FORMAT_INPLACE_SHUFFLED)))
+      return CUFFT_INTERNAL_ERROR;
+    out_fmt = f == CUFFT_XT_FORMAT_INPLACE ? CUFFT_XT_FORMAT_INPLACE_SHUFFLED
+                                           : CUFFT_XT_FORMAT_INPLACE;
+  }
+  // A single transform runs in place only: out of place is EXEC_FAILED.
+  if (in != out) return CUFFT_EXEC_FAILED;
+  const Plan hp = host_plan(p, false);
+  const Geometry geo = geometry(hp);
+  std::vector<char> hin(std::max(host_bytes(p, f), geo.in_span * geo.ie.size()));
+  gather(p, in, hin);
+  std::vector<char> hout = hin;  // the padding of an in-place real layout keeps its contents
+  hout.resize(std::max(hout.size(), geo.out_span * geo.oe.size()));
+  transform(hp, geo, hin, hout, direction);
+  out->subFormat = out_fmt;
+  scatter(p, out, hout);
+  return CUFFT_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cufftResult cufftXtSetGPUs(cufftHandle handle, int nGPUs, int* whichGPUs) {
+  Plan* p = find(handle);
+  // RTX 3060 pair: an unknown handle, or one already made, is INVALID_PLAN;
+  // fewer than two GPUs or no list INVALID_VALUE; a device that does not
+  // exist INVALID_DEVICE. The same device twice is accepted.
+  if (!p || !p->n.empty()) return CUFFT_INVALID_PLAN;
+  if (nGPUs < 2 || !whichGPUs) return CUFFT_INVALID_VALUE;
+  int count = 0;
+  cudaGetDeviceCount(&count);
+  for (int i = 0; i < nGPUs; ++i)
+    if (whichGPUs[i] < 0 || whichGPUs[i] >= count) return CUFFT_INVALID_DEVICE;
+  std::lock_guard<std::mutex> l(g_mu);
+  p->gpus.assign(whichGPUs, whichGPUs + nGPUs);
+  return CUFFT_SUCCESS;
+}
+
+VGPU_EXPORT cufftResult cufftXtMalloc(cufftHandle plan, cudaLibXtDesc** descriptor,
+                                      cufftXtSubFormat format) {
+  Plan* pp = find(plan);
+  if (!pp || pp->n.empty()) return CUFFT_INVALID_PLAN;
+  if (!descriptor) return CUFFT_INVALID_VALUE;
+  const Plan p = *pp;
+  auto* d = new cudaLibXtDesc();
+  d->version = 0;  // what NVIDIA's writes, here and in the inner descriptor
+  d->descriptor = new cudaXtDesc();
+  d->library = LIB_FORMAT_CUFFT;
+  d->subFormat = format;
+  d->libDescriptor = d;  // NVIDIA's points it at a structure of its own
+  int current = 0;
+  cudaGetDevice(&current);
+  if (p.gpus.size() < 2) {
+    // A single-GPU plan gets a descriptor of one empty part on the current
+    // device: NVIDIA's allocates nothing for it.
+    d->descriptor->nGPUs = 1;
+    d->descriptor->GPUs[0] = current;
+  } else {
+    if (const cufftResult r = format_ok(p, format)) {
+      delete d->descriptor;
+      delete d;
+      return r;
+    }
+    DeviceGuard dg;
+    d->descriptor->nGPUs = (int)p.gpus.size();
+    for (int g = 0; g < (int)p.gpus.size(); ++g) {
+      d->descriptor->GPUs[g] = p.gpus[g];
+      const size_t bytes = part_bytes(p, format, g);
+      d->descriptor->size[g] = bytes;
+      if (!bytes) continue;
+      cudaSetDevice(p.gpus[g]);
+      if (cudaMalloc(&d->descriptor->data[g], bytes) != cudaSuccess) {
+        for (int k = 0; k < g; ++k) cudaFree(d->descriptor->data[k]);
+        delete d->descriptor;
+        delete d;
+        return CUFFT_ALLOC_FAILED;
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> l(g_desc_mu);
+    g_descs.insert(d);
+  }
+  *descriptor = d;
+  return CUFFT_SUCCESS;
+}
+
+VGPU_EXPORT cufftResult cufftXtFree(cudaLibXtDesc* descriptor) {
+  if (!descriptor) return CUFFT_SUCCESS;  // as NVIDIA's answers it
+  {
+    std::lock_guard<std::mutex> l(g_desc_mu);
+    if (!g_descs.erase(descriptor)) return CUFFT_INVALID_VALUE;
+  }
+  DeviceGuard dg;
+  for (int g = 0; g < descriptor->descriptor->nGPUs; ++g)
+    if (descriptor->descriptor->data[g]) {
+      cudaSetDevice(descriptor->descriptor->GPUs[g]);
+      cudaFree(descriptor->descriptor->data[g]);
+    }
+  delete descriptor->descriptor;
+  delete descriptor;
+  return CUFFT_SUCCESS;
+}
+
+VGPU_EXPORT cufftResult cufftXtMemcpy(cufftHandle plan, void* dstPointer, void* srcPointer,
+                                      cufftXtCopyType type) {
+  Plan* pp = find(plan);
+  if (!pp || pp->n.empty()) return CUFFT_INVALID_PLAN;
+  // A copy type out of range, or a NULL either side, is INVALID_VALUE.
+  if (type != CUFFT_COPY_HOST_TO_DEVICE && type != CUFFT_COPY_DEVICE_TO_HOST &&
+      type != CUFFT_COPY_DEVICE_TO_DEVICE)
+    return CUFFT_INVALID_VALUE;
+  if (!dstPointer || !srcPointer) return CUFFT_INVALID_VALUE;
+  const Plan p = *pp;
+  // A single-GPU plan's descriptors hold nothing to copy.
+  if (p.gpus.size() < 2) return CUFFT_SUCCESS;
+  DeviceGuard dg;
+  for (int g : p.gpus) {
+    cudaSetDevice(g);
+    cudaDeviceSynchronize();
+  }
+  if (type == CUFFT_COPY_HOST_TO_DEVICE) {
+    auto* d = static_cast<cudaLibXtDesc*>(dstPointer);
+    if (!live_desc(d)) return CUFFT_INVALID_VALUE;
+    // A 1-D result's string order cannot be written from the host:
+    // INVALID_TYPE, and nothing copied.
+    if (p.spread == kLine && d->subFormat == CUFFT_XT_FORMAT_INPLACE_SHUFFLED)
+      return CUFFT_INVALID_TYPE;
+    const size_t bytes = host_bytes(p, d->subFormat);
+    std::vector<char> host(static_cast<const char*>(srcPointer),
+                           static_cast<const char*>(srcPointer) + bytes);
+    scatter(p, d, host);
+    return CUFFT_SUCCESS;
+  }
+  auto* s = static_cast<cudaLibXtDesc*>(srcPointer);
+  if (!live_desc(s)) return CUFFT_INVALID_VALUE;
+  // Input-shuffled 1-D data only goes to a transform: copying it out, to the
+  // host or another descriptor, is INVALID_TYPE.
+  if (p.spread == kLine && s->subFormat == CUFFT_XT_FORMAT_1D_INPUT_SHUFFLED)
+    return CUFFT_INVALID_TYPE;
+  if (type == CUFFT_COPY_DEVICE_TO_HOST) {
+    const size_t bytes = host_bytes(p, s->subFormat);
+    std::vector<char> host(static_cast<const char*>(dstPointer),
+                           static_cast<const char*>(dstPointer) + bytes);
+    gather(p, s, host);
+    std::memcpy(dstPointer, host.data(), bytes);
+    return CUFFT_SUCCESS;
+  }
+  auto* d = static_cast<cudaLibXtDesc*>(dstPointer);
+  if (!live_desc(d)) return CUFFT_INVALID_VALUE;
+  // Device to device puts the data in natural order. NVIDIA's copies nothing
+  // for a batched plan, and still answers SUCCESS; refuses a shuffled
+  // destination, and a 2-D real transform's shuffled source, with
+  // INTERNAL_ERROR (RTX 3060 pair).
+  if (p.spread == kBatches) return CUFFT_SUCCESS;
+  if (d->subFormat == CUFFT_XT_FORMAT_INPLACE_SHUFFLED) return CUFFT_INTERNAL_ERROR;
+  if (p.spread == kSlabs && !is_c2c(p.type) && unit_shape(p).size() == 2 &&
+      s->subFormat == CUFFT_XT_FORMAT_INPLACE_SHUFFLED)
+    return CUFFT_INTERNAL_ERROR;
+  std::vector<char> host(host_bytes(p, s->subFormat));
+  gather(p, s, host);
+  d->subFormat = CUFFT_XT_FORMAT_INPLACE;
+  scatter(p, d, host);
+  return CUFFT_SUCCESS;
+}
+
+VGPU_EXPORT cufftResult cufftXtExecDescriptorC2C(cufftHandle plan, cudaLibXtDesc* input,
+                                                 cudaLibXtDesc* output, int direction) {
+  return exec_desc(plan, input, output, direction, CUFFT_C2C);
+}
+VGPU_EXPORT cufftResult cufftXtExecDescriptorZ2Z(cufftHandle plan, cudaLibXtDesc* input,
+                                                 cudaLibXtDesc* output, int direction) {
+  return exec_desc(plan, input, output, direction, CUFFT_Z2Z);
+}
+VGPU_EXPORT cufftResult cufftXtExecDescriptorR2C(cufftHandle plan, cudaLibXtDesc* input,
+                                                 cudaLibXtDesc* output) {
+  return exec_desc(plan, input, output, CUFFT_FORWARD, CUFFT_R2C);
+}
+VGPU_EXPORT cufftResult cufftXtExecDescriptorD2Z(cufftHandle plan, cudaLibXtDesc* input,
+                                                 cudaLibXtDesc* output) {
+  return exec_desc(plan, input, output, CUFFT_FORWARD, CUFFT_D2Z);
+}
+VGPU_EXPORT cufftResult cufftXtExecDescriptorC2R(cufftHandle plan, cudaLibXtDesc* input,
+                                                 cudaLibXtDesc* output) {
+  return exec_desc(plan, input, output, CUFFT_INVERSE, CUFFT_C2R);
+}
+VGPU_EXPORT cufftResult cufftXtExecDescriptorZ2D(cufftHandle plan, cudaLibXtDesc* input,
+                                                 cudaLibXtDesc* output) {
+  return exec_desc(plan, input, output, CUFFT_INVERSE, CUFFT_Z2D);
+}
+VGPU_EXPORT cufftResult cufftXtExecDescriptor(cufftHandle plan, cudaLibXtDesc* input,
+                                              cudaLibXtDesc* output, int direction) {
+  const Plan* p = find(plan);
+  if (!p) return CUFFT_INVALID_PLAN;
+  if (!is_c2c(p->type)) direction = is_r2c(p->type) ? CUFFT_FORWARD : CUFFT_INVERSE;
+  return exec_desc(plan, input, output, direction, (cufftType)0);
+}
+
+VGPU_EXPORT cufftResult cufftXtQueryPlan(cufftHandle plan, void* queryStruct,
+                                         cufftXtQueryType queryType) {
+  // NULL, or a query type other than the 1-D factors, is INVALID_VALUE; a
+  // plan that is not a single multi-GPU 1-D transform INVALID_PLAN. (NVIDIA's
+  // divides by zero on a batched multi-GPU plan; this answers INVALID_PLAN.)
+  if (!queryStruct || queryType != CUFFT_QUERY_1D_FACTORS) return CUFFT_INVALID_VALUE;
+  const Plan* p = find(plan);
+  if (!p || p->spread != kLine) return CUFFT_INVALID_PLAN;
+  const long long n = squeezed(p->n)[0];
+  const Factors f = factors_1d(n, (int)p->gpus.size());
+  auto* q = static_cast<cufftXt1dFactors*>(queryStruct);
+  q->size = n;
+  q->stringCount = f.strings;
+  q->stringLength = n / f.strings;
+  q->substringLength = q->stringLength / f.f2;
+  q->factor1 = f.f1;
+  q->factor2 = f.f2;
+  // The masks and shifts of a power-of-two size, as NVIDIA's fills them:
+  // each length's mask is length - 1 and its shift log2(length).
+  q->stringMask = q->stringLength - 1;
+  q->substringMask = q->substringLength - 1;
+  q->factor1Mask = f.f1 - 1;
+  q->factor2Mask = f.f2 - 1;
+  q->stringShift = log2i(q->stringLength);
+  q->substringShift = log2i(q->substringLength);
+  q->factor1Shift = log2i(f.f1);
+  q->factor2Shift = log2i(f.f2);
+  return CUFFT_SUCCESS;
+}
+
+VGPU_EXPORT cufftResult cufftXtSetWorkArea(cufftHandle plan, void** workArea) {
+  const Plan* p = find(plan);
+  if (!p) return CUFFT_INVALID_PLAN;
+  // A multi-GPU plan takes one pointer per GPU and needs none of them; a
+  // single-GPU plan answers a NULL list INVALID_VALUE (RTX 3060).
+  if (p->gpus.size() < 2 && !workArea) return CUFFT_INVALID_VALUE;
+  return CUFFT_SUCCESS;
+}
+
+// There is no work area to shrink. What NVIDIA's answers (RTX 3060): a plan
+// not yet made, or a multi-GPU one, is INVALID_PLAN; CUFFT_WORKAREA_MINIMAL
+// succeeds and leaves *workSize alone; CUFFT_WORKAREA_USER, and
+// CUFFT_WORKAREA_PERFORMANCE with no workSize, are INVALID_PLAN too.
+VGPU_EXPORT cufftResult cufftXtSetWorkAreaPolicy(cufftHandle plan, cufftXtWorkAreaPolicy policy,
+                                                 size_t* workSize) {
+  const Plan* p = find(plan);
+  if (!p || p->n.empty() || p->gpus.size() > 1) return CUFFT_INVALID_PLAN;
+  if (policy == CUFFT_WORKAREA_MINIMAL) return CUFFT_SUCCESS;
+  if (policy == CUFFT_WORKAREA_PERFORMANCE && workSize) return CUFFT_SUCCESS;
+  return CUFFT_INVALID_PLAN;
+}
+
+/* ---- callbacks ----
+ *
+ * Legacy callbacks (cufftXtSetCallback with a device function pointer) exist
+ * only in NVIDIA's static library, libcufft_static.a, as cuFFT's
+ * documentation says: its libcufft.so answers every legacy callback call with
+ * NOT_IMPLEMENTED, a valid plan or not (RTX 3060, CUDA 13.0). This library
+ * stands in for libcufft.so, so it answers the same. A program linked against
+ * libcufft_static carries NVIDIA's own cuFFT and never reaches this one.
+ */
+VGPU_EXPORT cufftResult cufftXtSetCallback(cufftHandle, void**, cufftXtCallbackType, void**) {
+  return CUFFT_NOT_IMPLEMENTED;
+}
+VGPU_EXPORT cufftResult cufftXtClearCallback(cufftHandle, cufftXtCallbackType) {
+  return CUFFT_NOT_IMPLEMENTED;
+}
+// Shared memory for a callback: only a plan with LTO callbacks, once made,
+// takes it, for any callback type; anything else is INVALID_PLAN, as NVIDIA's
+// answers. (NVIDIA's crashes when asked before the plan is made.)
+VGPU_EXPORT cufftResult cufftXtSetCallbackSharedSize(cufftHandle plan, cufftXtCallbackType type,
+                                                     size_t sharedSize) {
+  std::lock_guard<std::mutex> l(g_mu);
+  auto it = g_plans.find(plan);
+  if (it == g_plans.end() || it->second.jit.empty() || it->second.n.empty())
+    return CUFFT_INVALID_PLAN;
+  if ((int)type >= 0 && (int)type < CUFFT_CB_UNDEFINED) it->second.jit_shared[type] = sharedSize;
+  return CUFFT_SUCCESS;
+}
+
+/* ---- LTO callbacks (cufftXtSetJITCallback, CUDA 12.6 and later) ----
+ *
+ * NVIDIA's library compiles a wrapper around the user's callback with NVRTC
+ * and links the two with nvJitLink when the plan is made. The callback image
+ * is meant to be LTO-IR, but NVIDIA's takes PTX too -- as text, or in a fatbin
+ * -- and runs it (RTX 3060, CUDA 13.0 and 13.2). VirtualGPU executes PTX, so
+ * here a PTX callback is linked (ptx_link.cpp, the device linker's rules)
+ * with kernels that call it once per element, and those kernels run on the
+ * simulated device: the load kernel before the host-computed transform, the
+ * store kernel after it, with each element's offset in the user's buffer as
+ * cuFFT passes it. An LTO-IR image is NVVM bitcode, which only NVIDIA's
+ * compiler reads: a plan with one fails as a callback that does not link
+ * fails on the card, NVJITLINK_FAILURE (CUDA 13.2's cuFFT; 13.0's says
+ * INTERNAL_ERROR).
+ *
+ * The callback's symbol is the C++ mangling of the name for the callback
+ * type's prototype, as NVIDIA's wrapper declares it: a load returns its value
+ * (the return type is not mangled, so every load mangles alike), a store takes
+ * the element. A callback type the plan never calls must still link (a load
+ * set as CUFFT_CB_ST_REAL does not; one set as CUFFT_CB_LD_REAL on a C2C plan
+ * does, and is never called).
+ */
+extern "C" void** __cudaRegisterFatBinary(void* fatCubin);
+extern "C" void __cudaRegisterFunction(void** fatCubinHandle, const char* hostFun, char* deviceFun,
+                                       const char* deviceName, int thread_limit, void* tid,
+                                       void* bid, void* bDim, void* gDim, int* wSize);
+
+namespace {
+
+// 0x13 is CUFFT_NVJITLINK_FAILURE, which CUDA 12.0's header does not have.
+constexpr cufftResult kLinkFailure = (cufftResult)0x13;
+
+// The element a callback type loads or stores: 'C' float2, 'Z' double2, 'R'
+// float, 'D' double.
+char cb_kind(int type) { return "CZRDCZRD"[type & 7]; }
+bool cb_is_load(int type) { return type < CUFFT_CB_ST_COMPLEX; }
+
+std::string mangle(const std::string& name, int type) {
+  static const char* const store_arg[] = {"6float2", "7double2", "f", "d"};
+  std::string m = "_Z" + std::to_string(name.size()) + name + "Pvy";
+  if (!cb_is_load(type)) m += store_arg[type & 3];
+  return m + "S_S_";
+}
+
+// The callback types a plan of this type calls.
+int load_type(cufftType t) {
+  switch (t) {
+    case CUFFT_C2C: case CUFFT_C2R: return CUFFT_CB_LD_COMPLEX;
+    case CUFFT_Z2Z: case CUFFT_Z2D: return CUFFT_CB_LD_COMPLEX_DOUBLE;
+    case CUFFT_R2C: return CUFFT_CB_LD_REAL;
+    default: return CUFFT_CB_LD_REAL_DOUBLE;
+  }
+}
+int store_type(cufftType t) {
+  switch (t) {
+    case CUFFT_C2C: case CUFFT_R2C: return CUFFT_CB_ST_COMPLEX;
+    case CUFFT_Z2Z: case CUFFT_D2Z: return CUFFT_CB_ST_COMPLEX_DOUBLE;
+    case CUFFT_C2R: return CUFFT_CB_ST_REAL;
+    default: return CUFFT_CB_ST_REAL_DOUBLE;
+  }
+}
+
+// The PTX a callback image carries: PTX text as it is, or a fatbin's PTX
+// for the current device. Empty for anything else (LTO-IR, SASS, garbage).
+std::string image_ptx(const std::vector<char>& image) {
+  using namespace vgpu::cuda;
+  try {
+    switch (classify_blob(image.data(), image.size())) {
+      case BlobKind::Ptx: {
+        std::string text(image.begin(), image.end());
+        while (!text.empty() && text.back() == '\0') text.pop_back();
+        return text;
+      }
+      case BlobKind::Fatbin: {
+        std::vector<FatbinPtx> ptxs = extract_ptx(image.data(), image.size());
+        if (ptxs.empty()) return {};
+        int dev = 0, major = 0, minor = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        return ptxs[pick_ptx(ptxs, (uint32_t)(major * 10 + minor))].text;
+      }
+      default:
+        return {};
+    }
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+// Whether `ptx` defines function `sym` (rather than only declaring it).
+bool defines(const std::string& ptx, const std::string& sym) {
+  size_t at = 0;
+  while ((at = ptx.find(sym, at)) != std::string::npos) {
+    const size_t line = ptx.rfind('\n', at) + 1;
+    const std::string head = ptx.substr(line, at - line);
+    const char before = at ? ptx[at - 1] : ' ';
+    size_t after = at + sym.size();
+    while (after < ptx.size() && (ptx[after] == ' ' || ptx[after] == '\t')) ++after;
+    if ((before == ' ' || before == '\t' || before == ')') && after < ptx.size() &&
+        ptx[after] == '(' && head.find(".func") != std::string::npos &&
+        head.find(".extern") == std::string::npos)
+      return true;
+    at += sym.size();
+  }
+  return false;
+}
+
+// One element in PTX: how a parameter of it is declared, and how it moves
+// between registers, parameters and memory.
+struct PtxElem {
+  int bytes;
+  std::string decl(const std::string& name) const {
+    if (bytes == 4) return ".param .b32 " + name;
+    if (bytes == 8 && !pair) return ".param .b64 " + name;
+    return ".param .align " + std::to_string(bytes) + " .b8 " + name + "[" + std::to_string(bytes) + "]";
+  }
+  bool pair;            // complex: two components
+  const char* type;     // f32 or f64
+  const char* regs;     // the registers it lives in
+  std::string ld_param(const std::string& p) const {
+    if (!pair) return std::string("ld.param.") + type + " " + regs + ", [" + p + "];\n";
+    const int half = bytes / 2;
+    return std::string("ld.param.") + type + " " + first() + ", [" + p + "];\n" +
+           "ld.param." + type + " " + second() + ", [" + p + "+" + std::to_string(half) + "];\n";
+  }
+  std::string st_param(const std::string& p) const {
+    if (!pair) return std::string("st.param.") + type + " [" + p + "], " + regs + ";\n";
+    const int half = bytes / 2;
+    return std::string("st.param.") + type + " [" + p + "], " + first() + ";\n" +
+           "st.param." + type + " [" + p + "+" + std::to_string(half) + "], " + second() + ";\n";
+  }
+  std::string ld_mem(const std::string& addr) const {
+    return std::string(pair ? "ld.v2." : "ld.") + type + " " + (pair ? "{" + std::string(regs) + "}" : regs) +
+           ", [" + addr + "];\n";
+  }
+  std::string st_mem(const std::string& addr) const {
+    return std::string(pair ? "st.v2." : "st.") + type + " [" + addr + "], " +
+           (pair ? "{" + std::string(regs) + "}" : regs) + ";\n";
+  }
+  std::string first() const { std::string r = regs; return r.substr(0, r.find(',')); }
+  std::string second() const { std::string r = regs; return r.substr(r.find(',') + 2); }
+};
+
+PtxElem ptx_elem(char kind) {
+  switch (kind) {
+    case 'C': return {8, true, "f32", "%f1, %f2"};
+    case 'Z': return {16, true, "f64", "%fd1, %fd2"};
+    case 'R': return {4, false, "f32", "%f1"};
+    default: return {8, false, "f64", "%fd1"};
+  }
+}
+
+// The kernels that call the callbacks, one element a thread:
+//   load(data, offsets, values, count, info):  values[i] = cb(data, offsets[i], info, shared)
+//   store(data, offsets, values, count, info): cb(data, offsets[i], values[i], info, shared)
+std::string callback_kernel(bool load, const std::string& sym, char kind) {
+  const PtxElem e = ptx_elem(kind);
+  const std::string name = load ? "vgpu_cufft_cb_load" : "vgpu_cufft_cb_store";
+  std::string s;
+  if (load)
+    s += ".extern .func (" + e.decl("r") + ") " + sym +
+         "(.param .b64 a0, .param .b64 a1, .param .b64 a2, .param .b64 a3);\n";
+  else
+    s += ".extern .func " + sym + "(.param .b64 a0, .param .b64 a1, " + e.decl("a2") +
+         ", .param .b64 a3, .param .b64 a4);\n";
+  s += ".visible .entry " + name +
+       "(.param .u64 p_data, .param .u64 p_offs, .param .u64 p_vals, .param .u64 p_count, "
+       ".param .u64 p_info)\n{\n"
+       ".reg .pred %p<2>;\n.reg .b32 %r<4>;\n.reg .b64 %rd<16>;\n.reg .f32 %f<3>;\n.reg .f64 %fd<3>;\n"
+       "mov.u32 %r1, %ctaid.x;\nmov.u32 %r2, %ntid.x;\nmov.u32 %r3, %tid.x;\n"
+       "mul.wide.u32 %rd1, %r1, %r2;\ncvt.u64.u32 %rd2, %r3;\nadd.s64 %rd1, %rd1, %rd2;\n"
+       "ld.param.u64 %rd3, [p_count];\nsetp.ge.u64 %p1, %rd1, %rd3;\n@%p1 bra $L_done;\n"
+       "ld.param.u64 %rd4, [p_offs];\nshl.b64 %rd5, %rd1, 3;\nadd.s64 %rd5, %rd4, %rd5;\n"
+       "ld.u64 %rd6, [%rd5];\n"
+       "ld.param.u64 %rd7, [p_data];\nld.param.u64 %rd8, [p_info];\n"
+       "mov.u64 %rd9, vgpu_cufft_cb_smem;\ncvta.shared.u64 %rd9, %rd9;\n"
+       "ld.param.u64 %rd10, [p_vals];\nmul.lo.u64 %rd11, %rd1, " + std::to_string(e.bytes) + ";\n"
+       "add.s64 %rd11, %rd10, %rd11;\n";
+  if (load) {
+    s += "{\n.param .b64 q0;\nst.param.b64 [q0], %rd7;\n.param .b64 q1;\nst.param.b64 [q1], %rd6;\n"
+         ".param .b64 q2;\nst.param.b64 [q2], %rd8;\n.param .b64 q3;\nst.param.b64 [q3], %rd9;\n" +
+         e.decl("qr") + ";\ncall.uni (qr), " + sym + ", (q0, q1, q2, q3);\n" + e.ld_param("qr") + "}\n" +
+         e.st_mem("%rd11");
+  } else {
+    s += e.ld_mem("%rd11") +
+         "{\n.param .b64 q0;\nst.param.b64 [q0], %rd7;\n.param .b64 q1;\nst.param.b64 [q1], %rd6;\n" +
+         e.decl("q2") + ";\n" + e.st_param("q2") +
+         ".param .b64 q3;\nst.param.b64 [q3], %rd8;\n.param .b64 q4;\nst.param.b64 [q4], %rd9;\n"
+         "call.uni " + sym + ", (q0, q1, q2, q3, q4);\n}\n";
+  }
+  s += "$L_done:\nret;\n}\n";
+  return s;
+}
+
+// A callback module registered with the runtime. Never freed: the runtime
+// keeps pointers into it for as long as the process runs.
+struct JitModule {
+  std::string fatbin;
+  struct { int magic, version; const void* data; void* filename; } wrapper{};
+  char load_key = 0, store_key = 0;  // their addresses name the kernels
+  bool has_load = false, has_store = false;
+  void* load_info = nullptr;
+  void* store_info = nullptr;
+};
+std::mutex g_jit_mu;
+std::vector<std::unique_ptr<JitModule>> g_jit_modules;
+
+}  // namespace
+
+namespace {
+cufftResult jit_prepare(Plan& p) {
+  // On several GPUs: a single transform's plan fails (INTERNAL_ERROR), a
+  // batched one is made and fails to execute (RTX 3060 pair).
+  if (p.gpus.size() > 1) return p.spread == kBatches ? CUFFT_SUCCESS : CUFFT_INTERNAL_ERROR;
+  if (p.prec == 16) return kLinkFailure;
+  std::map<int, std::string> ptx;
+  for (const auto& [type, cb] : p.jit) {
+    std::string text = image_ptx(cb.image);
+    if (text.empty() || cb.name.empty() || !defines(text, mangle(cb.name, type))) return kLinkFailure;
+    ptx[type] = std::move(text);
+  }
+  const int lt = load_type(p.type), st = store_type(p.type);
+  const bool load = p.jit.count(lt), store = p.jit.count(st);
+  if (!load && !store) return CUFFT_SUCCESS;
+  // The callbacks' modules first (the first one's .target is the module's),
+  // then the kernels that call them.
+  std::vector<vgpu::cuda::PtxInput> inputs;
+  std::set<std::string> seen;
+  for (int t : {lt, st})
+    if (p.jit.count(t) && seen.insert(ptx[t]).second) inputs.push_back({p.jit[t].name, ptx[t]});
+  std::string kernels = ".version 7.0\n.target sm_52\n.address_size 64\n"
+                        ".extern .shared .align 16 .b8 vgpu_cufft_cb_smem[];\n";
+  if (load) kernels += callback_kernel(true, mangle(p.jit[lt].name, lt), cb_kind(lt));
+  if (store) kernels += callback_kernel(false, mangle(p.jit[st].name, st), cb_kind(st));
+  inputs.push_back({"cuFFT callback kernels", kernels});
+  const vgpu::cuda::PtxLinkResult linked = vgpu::cuda::link_ptx(inputs, "");
+  if (!linked.ok) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cuFFT LTO callback link failed:\n%s", linked.errors.c_str());
+    return kLinkFailure;
+  }
+  auto m = std::make_unique<JitModule>();
+  vgpu::cuda::FatbinImage img;
+  img.kind = vgpu::cuda::kFatbinPtx;
+  uint32_t target = 52;
+  char suffix = 0;
+  vgpu::cuda::ptx_module_target(linked.ptx, &target, &suffix);
+  img.arch = target;
+  img.major = 7;
+  img.data = linked.ptx;
+  m->fatbin = vgpu::cuda::write_fatbin({img});
+  m->wrapper = {0x466243b1, 1, m->fatbin.data(), nullptr};
+  void** handle = __cudaRegisterFatBinary(&m->wrapper);
+  if (!handle) return kLinkFailure;
+  if (load) {
+    __cudaRegisterFunction(handle, &m->load_key, (char*)"vgpu_cufft_cb_load", "vgpu_cufft_cb_load", -1,
+                           nullptr, nullptr, nullptr, nullptr, nullptr);
+    m->has_load = true;
+    m->load_info = p.jit[lt].info;
+  }
+  if (store) {
+    __cudaRegisterFunction(handle, &m->store_key, (char*)"vgpu_cufft_cb_store", "vgpu_cufft_cb_store", -1,
+                           nullptr, nullptr, nullptr, nullptr, nullptr);
+    m->has_store = true;
+    m->store_info = p.jit[st].info;
+  }
+  std::lock_guard<std::mutex> l(g_jit_mu);
+  p.jit_module = m.get();
+  g_jit_modules.push_back(std::move(m));
+  return CUFFT_SUCCESS;
+}
+
+// Runs a callback kernel over `count` elements: their offsets in the user's
+// buffer, and the values loaded or to be stored, `bytes` each.
+bool run_callback(const JitModule& m, bool load, void* data, const std::vector<uint64_t>& offs,
+                  std::vector<char>& vals, size_t bytes, size_t shared, cudaStream_t stream) {
+  const uint64_t count = offs.size();
+  if (!count) return true;
+  void *d_offs = nullptr, *d_vals = nullptr;
+  if (cudaMalloc(&d_offs, count * 8) != cudaSuccess || cudaMalloc(&d_vals, count * bytes) != cudaSuccess) {
+    cudaFree(d_offs);
+    return false;
+  }
+  cudaMemcpy(d_offs, offs.data(), count * 8, cudaMemcpyHostToDevice);
+  if (!load) cudaMemcpy(d_vals, vals.data(), count * bytes, cudaMemcpyHostToDevice);
+  void* info = load ? m.load_info : m.store_info;
+  void* args[] = {&data, &d_offs, &d_vals, (void*)&count, &info};
+  const unsigned block = 128;
+  const dim3 grid((unsigned)((count + block - 1) / block));
+  const cudaError_t e = cudaLaunchKernel(load ? (const void*)&m.load_key : (const void*)&m.store_key, grid,
+                                         dim3(block), args, shared, stream);
+  cudaStreamSynchronize(stream);
+  if (e == cudaSuccess && load) cudaMemcpy(vals.data(), d_vals, count * bytes, cudaMemcpyDeviceToHost);
+  cudaFree(d_offs);
+  cudaFree(d_vals);
+  return e == cudaSuccess;
+}
+bool jm_has(const JitModule* m, bool load) { return load ? m->has_load : m->has_store; }
+bool jm_run(const JitModule& m, bool load, void* data, const std::vector<uint64_t>& offs,
+            std::vector<char>& vals, size_t bytes, size_t shared, cudaStream_t stream) {
+  return run_callback(m, load, data, offs, vals, bytes, shared, stream);
+}
+}  // namespace
+
+VGPU_EXPORT cufftResult cufftXtSetJITCallback(cufftHandle plan, const char* lto_callback_symbol_name,
+                                              const void* lto_callback_fatbin,
+                                              size_t lto_callback_fatbin_size,
+                                              cufftXtCallbackType type, void** caller_info) {
+  // RTX 3060, CUDA 13.0: an unknown plan, or one already made, is
+  // INVALID_PLAN; no image, or an empty one, INVALID_VALUE; a type out of
+  // range INVALID_TYPE. The image and the name are not looked at until the
+  // plan is made. Setting a type again replaces it.
+  std::lock_guard<std::mutex> l(g_mu);
+  auto it = g_plans.find(plan);
+  if (it == g_plans.end() || !it->second.n.empty()) return CUFFT_INVALID_PLAN;
+  if (!lto_callback_fatbin || !lto_callback_fatbin_size) return CUFFT_INVALID_VALUE;
+  if ((int)type < 0 || (int)type >= CUFFT_CB_UNDEFINED) return CUFFT_INVALID_TYPE;
+  Plan::JitCallback cb;
+  cb.name = lto_callback_symbol_name ? lto_callback_symbol_name : "";
+  const char* bytes = static_cast<const char*>(lto_callback_fatbin);
+  cb.image.assign(bytes, bytes + lto_callback_fatbin_size);
+  cb.info = caller_info ? caller_info[0] : nullptr;  // one pointer per GPU; one GPU here
+  it->second.jit[(int)type] = std::move(cb);
+  return CUFFT_SUCCESS;
 }

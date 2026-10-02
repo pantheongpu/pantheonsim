@@ -59,7 +59,7 @@ processes.
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (the plane rotations bit for bit), triangular solves, batched LU (`getrfBatched`/`getrsBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`); see [cublas.md](cublas.md) |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8, strided batches, row-major layouts, ReLU/bias/GELU epilogues, FP8 tensor-wise and row-wise scales with amax |
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
-| cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included |
+| cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); legacy coo2csr, sorts, csrgeam2, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, general blocks too), csric02 and csrilu02. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the 64-bit X API, `Xgeev` on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings, `csrperm`, `csrzfd`, batched QR |
@@ -200,6 +200,8 @@ runs them; each is a ctest of its own.
 | test | covers | torch |
 | --- | --- | --- |
 | `e2e_fft_layouts` | cufftXt plans, strided and padded layouts of every rank, 2‑D/3‑D C2R, half | `torch.fft` |
+| `e2e_fft_multigpu` | cuFFT on two devices: what multi-GPU planning refuses, batched, 2‑D/3‑D (x split, then y) and 1‑D (strings, input-shuffled) descriptors, R2C/C2R, device-to-device copies; passes on an RTX 3060 pair too | multi-GPU FFTs |
+| `e2e_fft_callbacks` | LTO load and store callbacks in C2C (strided, batched, callerInfo), R2C, Z2Z and C2R; what cufftXtSetJITCallback and planning refuse; libcufft.so's NOT_IMPLEMENTED legacy callbacks | cuFFT callbacks (CUDA 12.6+) |
 | `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
 | `e2e_solver_sparse_paths` | cusolverSp: LU, QR and Cholesky solves in S/D/C/Z with every reorder, singularity, least squares, shift-inverse eigenvalues, reorderings, permutations, batched QR | `scipy`-style sparse solves |
 | `e2e_solver_mg_paths` | cusolverMg on two devices: getrf/getrs, potrf/potrs/potri, syevd, IPIV's layout | multi-GPU dense solvers |
@@ -401,7 +403,19 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   classic API, the vectorized layouts
   (`NCHW_VECT_C`, INT8x4/INT8x32), FP8 tensors, divisive normalization,
   fused-ops plans, tensor transform descriptors and RNN projections.
-- **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
+- **cuFFT**: legacy callbacks (`cufftXtSetCallback` with a device function
+  pointer), which NVIDIA ships only in its static library: its `libcufft.so`
+  answers every legacy callback call with `CUFFT_NOT_IMPLEMENTED`, and so does
+  this one, which stands in for `libcufft.so` (a program linked against
+  `libcufft_static` carries NVIDIA's own cuFFT). LTO callbacks whose image is
+  LTO-IR -- NVVM bitcode, which only NVIDIA's compiler reads -- fail the plan
+  as a callback that does not link fails it on the card (`NVJITLINK_FAILURE`,
+  CUDA 13.2's answer; 13.0's is `INTERNAL_ERROR`); PTX images, as text or in
+  a fatbin, work. LTO callbacks on multi-GPU plans fail as NVIDIA's do. The
+  multi-GPU layouts were measured on two GPUs; with more, they follow the
+  documentation (batches and planes dealt out in order, 1‑D strings over the
+  GPUs in order), and the 1‑D factor choice past 2^27 points keeps the last
+  measured one.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
   CUDA 12); the tridiagonal and pentadiagonal solvers (`gtsv2`, `gpsv`), the
   pruning, coloring and `nnz`/`nnz_compress` helpers, `gebsr2gebsr` and
