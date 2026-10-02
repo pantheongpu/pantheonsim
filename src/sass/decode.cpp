@@ -2653,7 +2653,8 @@ void dec_utmacctl(Instr& ins, const Word& w) {
 }
 
 // USETMAXREG.DEALLOC/.TRY_ALLOC.CTAPOOL [UPd,] n (setmaxnreg): 72-73 the
-// direction, 74 .CTAPOOL, the count at 32.
+// direction, 74 .CTAPOOL, the count at 32 -- nine bits, as 256 (0x100, a
+// Blackwell GEMM's consumers) takes.
 void dec_usetmaxreg(Instr& ins, const Word& w) {
   ins.op = Op::USETMAXREG;
   ins.mnemonic = "USETMAXREG";
@@ -2662,7 +2663,7 @@ void dec_usetmaxreg(Instr& ins, const Word& w) {
   if (w.bit(74)) ins.mods.push_back("CTAPOOL");
   const unsigned up = static_cast<unsigned>(w.field(81, 3));
   if (up != kPT) ins.dst.push_back(UP(up));
-  ins.src.push_back(Imm(w.field(32, 8)));
+  ins.src.push_back(Imm(w.field(32, 9)));
 }
 
 // WARPGROUP.ARRIVE (wgmma.fence) and WARPGROUP.DEPBAR.LE gsb0, n
