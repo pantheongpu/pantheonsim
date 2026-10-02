@@ -3,9 +3,9 @@
 # architecture's SASS (with its PTX beside it), run once on SASS and once on
 # its PTX (VGPU_SASS=0), both with VGPU_KERNEL_DIGEST, and the digests --
 # per launch, a hash of every allocation the kernel's arguments reach -- must
-# be the same. e2e_sass_archs compares what the programs print; this compares
-# the memory they leave behind, after every kernel, and names the first kernel
-# that differs.
+# hold the same bytes (where the allocations lie may differ). e2e_sass_archs
+# compares what the programs print; this compares the memory they leave
+# behind, after every kernel, and names the first kernel that differs.
 #
 #   nvidia/tools/sass_ptx_digest.sh [build-dir]
 #
@@ -102,10 +102,17 @@ for j in "${jobs[@]}"; do
   fi
   compared=$((compared + 1))
   if [[ ! -s "$bin.ptx.digest" ]]; then echo "FAIL $arch $p: no digest written (VGPU_KERNEL_DIGEST unsupported?)"; fails=1; continue; fi
+  # Contents, not placement: each allocation's address is dropped before the
+  # comparison. The two engines may lay out memory differently (device_intrinsics:
+  # a buffer allocated after k_malloc lands 0x100 apart, with the same bytes),
+  # and that is noted, not failed.
+  strip() { sed -E 's/ [0-9a-f]+:/ /g' "$1"; }
   if cmp -s "$bin.sass.digest" "$bin.ptx.digest"; then
     echo "ok   $arch $p ($(wc -l < "$bin.ptx.digest") launches)"
+  elif cmp -s <(strip "$bin.sass.digest") <(strip "$bin.ptx.digest"); then
+    echo "ok   $arch $p ($(wc -l < "$bin.ptx.digest") launches; same contents, allocated at different addresses)"
   else
-    first=$(diff "$bin.ptx.digest" "$bin.sass.digest" | grep -m1 '^<' | cut -c3-)
+    first=$(diff <(strip "$bin.ptx.digest") <(strip "$bin.sass.digest") | grep -m1 '^<' | cut -c3-)
     echo "FAIL $arch $p: SASS and PTX leave different memory, first after launch: ${first%% *} $(cut -d' ' -f2 <<< "$first")"
     diff "$bin.ptx.digest" "$bin.sass.digest" | head -6 | cut -c1-200 | sed 's/^/    /'
     fails=1
