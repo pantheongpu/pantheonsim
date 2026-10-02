@@ -31,13 +31,3 @@ void vgpu_report_unimplemented(const char* fn) {
 }
 }  // namespace
 
-VGPU_EXPORT int cusolverDnCsytrf() { vgpu_report_unimplemented("cusolverDnCsytrf"); return 31; }
-VGPU_EXPORT int cusolverDnCsytrf_bufferSize() { vgpu_report_unimplemented("cusolverDnCsytrf_bufferSize"); return 31; }
-VGPU_EXPORT int cusolverDnDsytrf() { vgpu_report_unimplemented("cusolverDnDsytrf"); return 31; }
-VGPU_EXPORT int cusolverDnDsytrf_bufferSize() { vgpu_report_unimplemented("cusolverDnDsytrf_bufferSize"); return 31; }
-VGPU_EXPORT int cusolverDnSsytrf() { vgpu_report_unimplemented("cusolverDnSsytrf"); return 31; }
-VGPU_EXPORT int cusolverDnSsytrf_bufferSize() { vgpu_report_unimplemented("cusolverDnSsytrf_bufferSize"); return 31; }
-VGPU_EXPORT int cusolverDnXsytrs() { vgpu_report_unimplemented("cusolverDnXsytrs"); return 31; }
-VGPU_EXPORT int cusolverDnXsytrs_bufferSize() { vgpu_report_unimplemented("cusolverDnXsytrs_bufferSize"); return 31; }
-VGPU_EXPORT int cusolverDnZsytrf() { vgpu_report_unimplemented("cusolverDnZsytrf"); return 31; }
-VGPU_EXPORT int cusolverDnZsytrf_bufferSize() { vgpu_report_unimplemented("cusolverDnZsytrf_bufferSize"); return 31; }

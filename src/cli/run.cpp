@@ -142,8 +142,8 @@ DynInfo read_dynamic(const std::string& path) {
 bool is_cuda_soname(const std::string& soname) {
   static const char* kPrefixes[] = {
       "libcuda.so",   "libcudart.so",  "libcublas.so", "libcublasLt.so", "libcudnn.so",
-      "libcufft.so",  "libcurand.so",  "libcusparse.so", "libcusolver.so", "libnccl.so",
-      "libnvrtc.so",  "libcupti.so",   "libnvidia-ml.so", "libnpp", "libnvjpeg.so",
+      "libcufft.so",  "libcurand.so",  "libcusparse.so", "libcusolver.so", "libcusolverMg.so",
+      "libnccl.so",   "libnvrtc.so",  "libcupti.so",   "libnvidia-ml.so", "libnpp", "libnvjpeg.so",
       "libnvidia-encode.so", "libcustatevec.so", "libcudss.so", "libnvJitLink.so",
       "libnvfatbin.so"};
   for (const char* p : kPrefixes)

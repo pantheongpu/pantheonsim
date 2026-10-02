@@ -10797,36 +10797,14 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const uint64_t arg = it->second.read(lane, 0, 8);
-      std::lock_guard<std::mutex> guard(device_heap_mu());
-      DeviceHeap& heap = device_heap(mem_);
+      // The device's heap, shared with the SASS executor (MemoryManager::
+      // heap_alloc). Each thread allocates independently, exactly as on
+      // hardware -- this is not a warp-collective call.
       if (allocating) {
-        auto& used = heap.used;
-        // Each thread allocates independently, exactly as on hardware -- this
-        // is not a warp-collective call.
-        if (arg == 0 || used + arg > cfg_.device_heap_bytes) {
-          result[lane] = 0;  // out of heap: malloc returns null, it does not fail
-          continue;
-        }
-        uint64_t p = 0;
-        try {
-          p = mem_.alloc(arg);
-        } catch (const Error&) {
-          result[lane] = 0;
-          continue;
-        }
-        used += arg;
-        heap.sizes[p] = arg;
-        result[lane] = p;
-      } else {
-        if (arg == 0) continue;  // free(nullptr) is a no-op
-        auto& sizes = heap.sizes;
-        auto sz = sizes.find(arg);
-        if (sz == sizes.end())
-          ctx_fail(ins, static_cast<int>(lane), Err::InvalidFree,
-                   "device free() of a pointer this kernel's heap did not allocate");
-        heap.used -= sz->second;
-        sizes.erase(sz);
-        mem_.free(arg);
+        result[lane] = mem_.heap_alloc(arg, cfg_.device_heap_bytes);   // 0: out of heap
+      } else if (arg != 0 && !mem_.heap_free(arg)) {   // free(nullptr) is a no-op
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidFree,
+                 "device free() of a pointer the device heap did not allocate, or already freed");
       }
     }
     if (allocating && !op.retval_slot.empty()) {
@@ -10835,21 +10813,6 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) out.write(lane, 0, 8, result[lane]);
     }
-  }
-
-  // What a device's heap has handed out, kept per device -- keyed by the
-  // device's memory -- because each device has its own heap and its own limit.
-  struct DeviceHeap {
-    uint64_t used = 0;
-    std::unordered_map<uint64_t, uint64_t> sizes;
-  };
-  static std::mutex& device_heap_mu() {
-    static std::mutex mu;
-    return mu;
-  }
-  static DeviceHeap& device_heap(const MemoryManager& device_memory) {  // holds device_heap_mu
-    static std::unordered_map<const MemoryManager*, DeviceHeap> heaps;
-    return heaps[&device_memory];
   }
 
   void exec_vprintf(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
