@@ -581,8 +581,10 @@ if(CUDA_ABI_INCLUDE)
   # simulator's own declarations (nvidia/include/vgpu_nvjitlink.h,
   # vgpu_nvfatbin.h), since CUDA 12.0 has no nvFatbin.h. NVIDIA tags both
   # libraries' symbols with their soname, and the stubs programs link against
-  # ask for it. The soname major follows the toolkit's CUDA major where the
-  # toolkit has no copy to read it from.
+  # ask for it. Both majors are the CUDA major (.so.12 throughout CUDA 12, .so.13
+  # in 13), so that is what is used rather than a copy found on the host: the
+  # pantheonsim.com runner's CUDA 13 toolkit has none, and the search found
+  # Ubuntu's CUDA 12 libnvJitLink.so.12 instead.
   # ---------------------------------------------------------------------------
   foreach(_entry IN ITEMS "nvJitLink:nvjitlink_api:NVJITLINK" "nvfatbin:nvfatbin_api:NVFATBIN")
     string(REPLACE ":" ";" _parts "${_entry}")
@@ -590,7 +592,7 @@ if(CUDA_ABI_INCLUDE)
     list(GET _parts 1 _src)
     list(GET _parts 2 _macro)
     string(TOLOWER "${_lib}" _lower)
-    vgpu_toolkit_soversion(${_lib} ${SO_CUDART} _ver)
+    set(_ver ${SO_CUDART})
     vgpu_version_script(${_lib} ${_ver} _map)
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp nvidia/src/fatbin.cpp
                 nvidia/src/ptx_link.cpp src/core/error.cpp)
