@@ -32,6 +32,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
+#include <memory>
 #include <vector>
 
 using namespace vgpu_cudnn;
@@ -3652,4 +3654,459 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutBackward(cudnnHandle_t h, const cudnnDropo
   for (size_t i = 0; i < n; ++i)
     v[i] = (mask[i / 8] >> (i % 8)) & 1 ? v[i] * (1.0 / (1.0 - p)) : 0.0;
   return write(DX->l, dx, v) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+/* ---- fused-ops plans ---- */
+
+// cuDNN 7.6's fused operations, the way an RTX 3060 (sm_86) with cuDNN 9.27
+// answers them, measured:
+//   - SCALE_BIAS_ACTIVATION_CONV_BNSTATS runs (half NHWC x, w and y; float
+//     or NCHW x is NOT_SUPPORTED): y = conv(act(x * eqScale + eqBias)) with
+//     the affine result rounded to half, and per-channel sums of y and y^2.
+//   - BN_FINALIZE_STATISTICS_TRAINING and _INFERENCE run.
+//   - SCALE_BIAS_ACTIVATION_WGRAD and CONV_SCALE_BIAS_ADD_ACTIVATION are
+//     NOT_SUPPORTED from cudnnMakeFusedOpsPlan on this card; the two
+//     undocumented ones (GEN_BITMASK, DACTIVATION_FORK_DBATCHNORM) are
+//     NOT_SUPPORTED here.
+//   - Each op's packs take the labels its documentation lists (a label from
+//     another op's table is BAD_PARAM; CONV_SCALE_BIAS_ADD_ACTIVATION's const
+//     pack took none on the card); a descriptor label stores a copy of the
+//     descriptor, and its getter copies it back into a descriptor the caller
+//     created, with isNULL set when there is none; the pointer placeholders
+//     and the BN mode are enums passed by address.
+//   - A plan made from another op's pack is BAD_PARAM; executing a plan never
+//     made is NOT_INITIALIZED; making BNSTATS without x, conv, w or y, or
+//     FINALIZE_TRAINING without the y statistics and their placeholders, is
+//     BAD_PARAM.
+namespace {
+constexpr int kConstLabels = CUDNN_PARAM_BN_DBIAS_PLACEHOLDER + 1;
+constexpr int kVarPtrs = CUDNN_PTR_BN_DBIAS + 1;
+
+enum class DescKind { None, Tensor, Filter, Conv, Act };
+DescKind desc_kind(int label) {
+  switch (label) {
+    case CUDNN_PARAM_XDESC: case CUDNN_PARAM_BN_EQSCALEBIAS_DESC: case CUDNN_PARAM_YDESC: case CUDNN_PARAM_DYDESC:
+    case CUDNN_PARAM_YSTATS_DESC: case CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC: case CUDNN_PARAM_ZDESC:
+    case CUDNN_PARAM_BN_Z_EQSCALEBIAS_DESC: case CUDNN_PARAM_ACTIVATION_BITMASK_DESC: case CUDNN_PARAM_DXDESC:
+    case CUDNN_PARAM_DZDESC:
+      return DescKind::Tensor;
+    case CUDNN_PARAM_WDESC: case CUDNN_PARAM_DWDESC: return DescKind::Filter;
+    case CUDNN_PARAM_CONV_DESC: return DescKind::Conv;
+    case CUDNN_PARAM_ACTIVATION_DESC: return DescKind::Act;
+    default: return DescKind::None;
+  }
+}
+
+constexpr uint64_t bits(std::initializer_list<int> l) {
+  uint64_t m = 0;
+  for (int i : l) m |= uint64_t(1) << i;
+  return m;
+}
+// The labels each op's documentation lists (and, for CONV_SCALE_BIAS_ADD_ACTIVATION,
+// none: measured). The two undocumented ops take any.
+uint64_t const_labels(cudnnFusedOps_t op) {
+  switch (op) {
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_CONV_BNSTATS:
+      return bits({CUDNN_PARAM_XDESC, CUDNN_PARAM_XDATA_PLACEHOLDER, CUDNN_PARAM_BN_MODE, CUDNN_PARAM_BN_EQSCALEBIAS_DESC,
+                   CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER, CUDNN_PARAM_ACTIVATION_DESC,
+                   CUDNN_PARAM_CONV_DESC, CUDNN_PARAM_WDESC, CUDNN_PARAM_WDATA_PLACEHOLDER, CUDNN_PARAM_YDESC,
+                   CUDNN_PARAM_YDATA_PLACEHOLDER, CUDNN_PARAM_YSTATS_DESC, CUDNN_PARAM_YSUM_PLACEHOLDER,
+                   CUDNN_PARAM_YSQSUM_PLACEHOLDER});
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD:
+      return bits({CUDNN_PARAM_XDESC, CUDNN_PARAM_XDATA_PLACEHOLDER, CUDNN_PARAM_BN_MODE, CUDNN_PARAM_BN_EQSCALEBIAS_DESC,
+                   CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER, CUDNN_PARAM_ACTIVATION_DESC,
+                   CUDNN_PARAM_CONV_DESC, CUDNN_PARAM_DWDESC, CUDNN_PARAM_DWDATA_PLACEHOLDER, CUDNN_PARAM_DYDESC,
+                   CUDNN_PARAM_DYDATA_PLACEHOLDER});
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
+      return bits({CUDNN_PARAM_BN_MODE, CUDNN_PARAM_YSTATS_DESC, CUDNN_PARAM_YSUM_PLACEHOLDER,
+                   CUDNN_PARAM_YSQSUM_PLACEHOLDER, CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC, CUDNN_PARAM_BN_SCALE_PLACEHOLDER,
+                   CUDNN_PARAM_BN_BIAS_PLACEHOLDER, CUDNN_PARAM_BN_SAVED_MEAN_PLACEHOLDER,
+                   CUDNN_PARAM_BN_SAVED_INVSTD_PLACEHOLDER, CUDNN_PARAM_BN_RUNNING_MEAN_PLACEHOLDER,
+                   CUDNN_PARAM_BN_RUNNING_VAR_PLACEHOLDER, CUDNN_PARAM_BN_EQSCALEBIAS_DESC,
+                   CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER});
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_INFERENCE:
+      return bits({CUDNN_PARAM_BN_MODE, CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC, CUDNN_PARAM_BN_SCALE_PLACEHOLDER,
+                   CUDNN_PARAM_BN_BIAS_PLACEHOLDER, CUDNN_PARAM_BN_RUNNING_MEAN_PLACEHOLDER,
+                   CUDNN_PARAM_BN_RUNNING_VAR_PLACEHOLDER, CUDNN_PARAM_BN_EQSCALEBIAS_DESC,
+                   CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER});
+    case CUDNN_FUSED_CONV_SCALE_BIAS_ADD_ACTIVATION: return 0;
+    default: return ~uint64_t(0);
+  }
+}
+// Variant labels: the pointers by bit, and which of the four scalars.
+struct VarLabels { uint64_t ptrs; bool ws, count, factor, eps; };
+VarLabels var_labels(cudnnFusedOps_t op) {
+  switch (op) {
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_CONV_BNSTATS:
+      return {bits({CUDNN_PTR_XDATA, CUDNN_PTR_BN_EQSCALE, CUDNN_PTR_BN_EQBIAS, CUDNN_PTR_WDATA, CUDNN_PTR_YDATA,
+                    CUDNN_PTR_YSUM, CUDNN_PTR_YSQSUM, CUDNN_PTR_WORKSPACE}), true, false, false, false};
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD:
+      return {bits({CUDNN_PTR_XDATA, CUDNN_PTR_BN_EQSCALE, CUDNN_PTR_BN_EQBIAS, CUDNN_PTR_DWDATA, CUDNN_PTR_DYDATA,
+                    CUDNN_PTR_WORKSPACE}), true, false, false, false};
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
+      return {bits({CUDNN_PTR_YSUM, CUDNN_PTR_YSQSUM, CUDNN_PTR_BN_SCALE, CUDNN_PTR_BN_BIAS, CUDNN_PTR_BN_SAVED_MEAN,
+                    CUDNN_PTR_BN_SAVED_INVSTD, CUDNN_PTR_BN_RUNNING_MEAN, CUDNN_PTR_BN_RUNNING_VAR, CUDNN_PTR_BN_EQSCALE,
+                    CUDNN_PTR_BN_EQBIAS, CUDNN_PTR_WORKSPACE}), true, true, true, true};
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_INFERENCE:
+      return {bits({CUDNN_PTR_BN_SCALE, CUDNN_PTR_BN_BIAS, CUDNN_PTR_BN_RUNNING_MEAN, CUDNN_PTR_BN_RUNNING_VAR,
+                    CUDNN_PTR_BN_EQSCALE, CUDNN_PTR_BN_EQBIAS, CUDNN_PTR_WORKSPACE}), true, false, false, true};
+    case CUDNN_FUSED_CONV_SCALE_BIAS_ADD_ACTIVATION:
+    case CUDNN_FUSED_SCALE_BIAS_ADD_ACTIVATION_GEN_BITMASK:
+      return {~uint64_t(0), true, false, false, false};
+    default:
+      return {~uint64_t(0), true, true, true, true};
+  }
+}
+bool valid_fused_op(cudnnFusedOps_t op) {
+  return op >= CUDNN_FUSED_SCALE_BIAS_ACTIVATION_CONV_BNSTATS && op <= CUDNN_FUSED_DACTIVATION_FORK_DBATCHNORM;
+}
+
+struct FusedConst {
+  cudnnFusedOps_t op;
+  TensorDesc t[kConstLabels];
+  FilterDesc f[kConstLabels];
+  ConvDesc conv;
+  ActDesc act;
+  bool has[kConstLabels] = {};
+  int ph[kConstLabels] = {};  // CUDNN_PTR_NULL
+  cudnnBatchNormMode_t bn_mode = CUDNN_BATCHNORM_PER_ACTIVATION;
+  const TensorDesc* tensor(int label) const { return has[label] && t[label].l.rank ? &t[label] : nullptr; }
+};
+struct FusedVariant {
+  cudnnFusedOps_t op;
+  void* p[kVarPtrs] = {};
+  size_t ws = 0;
+  int64_t count = 0;
+  double factor = 0.0, eps = 0.0;
+};
+struct FusedPlan {
+  cudnnFusedOps_t op;
+  bool made = false;
+  std::unique_ptr<FusedConst> c;
+};
+
+bool is_half_nhwc(const TensorDesc* t) { return t && t->l.type == CUDNN_DATA_HALF && t->channels_last && t->l.rank == 4; }
+
+// The per-channel [1, C, 1, 1] vector of a descriptor, read or written.
+bool read_channels(const TensorDesc* d, const void* p, std::vector<double>* v) { return d && p && read(d->l, p, v); }
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnCreateFusedOpsConstParamPack(cudnnFusedOpsConstParamPack_t* pack, cudnnFusedOps_t op) {
+  if (!pack || !valid_fused_op(op)) return CUDNN_STATUS_BAD_PARAM;
+  auto* c = new FusedConst();
+  c->op = op;
+  *pack = reinterpret_cast<cudnnFusedOpsConstParamPack_t>(track(c));
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnDestroyFusedOpsConstParamPack(cudnnFusedOpsConstParamPack_t pack) {
+  if (!known(pack)) return CUDNN_STATUS_BAD_PARAM;
+  untrack(pack);
+  delete as<FusedConst>(pack);
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnSetFusedOpsConstParamPackAttribute(cudnnFusedOpsConstParamPack_t pack,
+                                                                  cudnnFusedOpsConstParamLabel_t label,
+                                                                  const void* param) {
+  static const char* fn = "cudnnSetFusedOpsConstParamPackAttribute";
+  if (!known(pack)) return BAD(fn, "invalid pack");
+  auto* c = as<FusedConst>(pack);
+  if (label < 0 || label >= kConstLabels || !(const_labels(c->op) >> label & 1)) return BAD(fn, "label not in this op's table");
+  switch (desc_kind(label)) {
+    case DescKind::Tensor:
+      if (param && !known(param)) return BAD(fn, "not a tensor descriptor");
+      c->has[label] = param != nullptr;
+      if (param) c->t[label] = *static_cast<const TensorDesc*>(param);
+      return CUDNN_STATUS_SUCCESS;
+    case DescKind::Filter:
+      if (param && !known(param)) return BAD(fn, "not a filter descriptor");
+      c->has[label] = param != nullptr;
+      if (param) c->f[label] = *static_cast<const FilterDesc*>(param);
+      return CUDNN_STATUS_SUCCESS;
+    case DescKind::Conv:
+      if (param && !known(param)) return BAD(fn, "not a convolution descriptor");
+      c->has[label] = param != nullptr;
+      if (param) c->conv = *static_cast<const ConvDesc*>(param);
+      return CUDNN_STATUS_SUCCESS;
+    case DescKind::Act:
+      if (param && !known(param)) return BAD(fn, "not an activation descriptor");
+      c->has[label] = param != nullptr;
+      if (param) c->act = *static_cast<const ActDesc*>(param);
+      return CUDNN_STATUS_SUCCESS;
+    default:
+      if (!param) return BAD(fn, "a null enum pointer");
+      if (label == CUDNN_PARAM_BN_MODE) c->bn_mode = *static_cast<const cudnnBatchNormMode_t*>(param);
+      else c->ph[label] = *static_cast<const int*>(param);
+      return CUDNN_STATUS_SUCCESS;
+  }
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetFusedOpsConstParamPackAttribute(const cudnnFusedOpsConstParamPack_t pack,
+                                                                  cudnnFusedOpsConstParamLabel_t label, void* param,
+                                                                  int* is_null) {
+  static const char* fn = "cudnnGetFusedOpsConstParamPackAttribute";
+  if (!known(pack) || !param || !is_null) return BAD(fn, "invalid pack or pointer");
+  const auto* c = as<const FusedConst>(pack);
+  if (label < 0 || label >= kConstLabels || !(const_labels(c->op) >> label & 1)) return BAD(fn, "label not in this op's table");
+  const DescKind k = desc_kind(label);
+  if (k == DescKind::None) {
+    *is_null = 0;
+    if (label == CUDNN_PARAM_BN_MODE) *static_cast<cudnnBatchNormMode_t*>(param) = c->bn_mode;
+    else *static_cast<int*>(param) = c->ph[label];
+    return CUDNN_STATUS_SUCCESS;
+  }
+  *is_null = c->has[label] ? 0 : 1;
+  if (!c->has[label]) return CUDNN_STATUS_SUCCESS;
+  if (!known(param)) return BAD(fn, "the descriptor to copy into was not created");
+  switch (k) {
+    case DescKind::Tensor: *static_cast<TensorDesc*>(param) = c->t[label]; break;
+    case DescKind::Filter: *static_cast<FilterDesc*>(param) = c->f[label]; break;
+    case DescKind::Conv: *static_cast<ConvDesc*>(param) = c->conv; break;
+    default: *static_cast<ActDesc*>(param) = c->act; break;
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnCreateFusedOpsVariantParamPack(cudnnFusedOpsVariantParamPack_t* pack,
+                                                              cudnnFusedOps_t op) {
+  if (!pack || !valid_fused_op(op)) return CUDNN_STATUS_BAD_PARAM;
+  auto* v = new FusedVariant();
+  v->op = op;
+  *pack = reinterpret_cast<cudnnFusedOpsVariantParamPack_t>(track(v));
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnDestroyFusedOpsVariantParamPack(cudnnFusedOpsVariantParamPack_t pack) {
+  if (!known(pack)) return CUDNN_STATUS_BAD_PARAM;
+  untrack(pack);
+  delete as<FusedVariant>(pack);
+  return CUDNN_STATUS_SUCCESS;
+}
+namespace {
+// Where a variant label lives, or nullptr if this op does not take it.
+void* var_slot(FusedVariant* v, int label, size_t* bytes) {
+  const VarLabels L = var_labels(v->op);
+  if (label >= 0 && label < kVarPtrs && (L.ptrs >> label & 1)) return *bytes = sizeof(void*), &v->p[label];
+  switch (label) {
+    case CUDNN_SCALAR_SIZE_T_WORKSPACE_SIZE_IN_BYTES: return L.ws ? (*bytes = sizeof(size_t), &v->ws) : nullptr;
+    case CUDNN_SCALAR_INT64_T_BN_ACCUMULATION_COUNT: return L.count ? (*bytes = sizeof(int64_t), &v->count) : nullptr;
+    case CUDNN_SCALAR_DOUBLE_BN_EXP_AVG_FACTOR: return L.factor ? (*bytes = sizeof(double), &v->factor) : nullptr;
+    case CUDNN_SCALAR_DOUBLE_BN_EPSILON: return L.eps ? (*bytes = sizeof(double), &v->eps) : nullptr;
+    default: return nullptr;
+  }
+}
+}  // namespace
+// Pointers are set by value (the device pointer itself) and read back
+// through a void**; the scalars both ways through a pointer to the value.
+VGPU_EXPORT cudnnStatus_t cudnnSetFusedOpsVariantParamPackAttribute(cudnnFusedOpsVariantParamPack_t pack,
+                                                                    cudnnFusedOpsVariantParamLabel_t label, void* ptr) {
+  if (!known(pack)) return CUDNN_STATUS_BAD_PARAM;
+  auto* v = as<FusedVariant>(pack);
+  size_t bytes = 0;
+  void* slot = var_slot(v, label, &bytes);
+  if (!slot) return fail(CUDNN_STATUS_BAD_PARAM, "cudnnSetFusedOpsVariantParamPackAttribute", "label not in this op's table");
+  if (label < kVarPtrs) {
+    v->p[label] = ptr;
+    return CUDNN_STATUS_SUCCESS;
+  }
+  if (!ptr) return CUDNN_STATUS_BAD_PARAM;
+  std::memcpy(slot, ptr, bytes);
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnGetFusedOpsVariantParamPackAttribute(const cudnnFusedOpsVariantParamPack_t pack,
+                                                                    cudnnFusedOpsVariantParamLabel_t label, void* ptr) {
+  if (!known(pack) || !ptr) return CUDNN_STATUS_BAD_PARAM;
+  auto* v = as<FusedVariant>(pack);
+  size_t bytes = 0;
+  void* slot = var_slot(v, label, &bytes);
+  if (!slot) return fail(CUDNN_STATUS_BAD_PARAM, "cudnnGetFusedOpsVariantParamPackAttribute", "label not in this op's table");
+  std::memcpy(ptr, slot, bytes);
+  return CUDNN_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnCreateFusedOpsPlan(cudnnFusedOpsPlan_t* plan, cudnnFusedOps_t op) {
+  if (!plan || !valid_fused_op(op)) return CUDNN_STATUS_BAD_PARAM;
+  auto* p = new FusedPlan();
+  p->op = op;
+  *plan = reinterpret_cast<cudnnFusedOpsPlan_t>(track(p));
+  return CUDNN_STATUS_SUCCESS;
+}
+VGPU_EXPORT cudnnStatus_t cudnnDestroyFusedOpsPlan(cudnnFusedOpsPlan_t plan) {
+  if (!known(plan)) return CUDNN_STATUS_BAD_PARAM;
+  untrack(plan);
+  delete as<FusedPlan>(plan);
+  return CUDNN_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnMakeFusedOpsPlan(cudnnHandle_t h, cudnnFusedOpsPlan_t plan,
+                                                const cudnnFusedOpsConstParamPack_t pack, size_t* ws) {
+  static const char* fn = "cudnnMakeFusedOpsPlan";
+  if (!known(h) || !known(plan) || !known(pack) || !ws) return BAD(fn, "invalid handle, plan, pack or pointer");
+  auto* p = as<FusedPlan>(plan);
+  const auto* c = as<const FusedConst>(pack);
+  if (c->op != p->op) return BAD(fn, "the pack belongs to another op");
+  p->made = false;
+  switch (p->op) {
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_CONV_BNSTATS: {
+      const TensorDesc *x = c->tensor(CUDNN_PARAM_XDESC), *y = c->tensor(CUDNN_PARAM_YDESC);
+      if (!x || !c->has[CUDNN_PARAM_CONV_DESC] || !c->has[CUDNN_PARAM_WDESC] || !y)
+        return BAD(fn, "x, the convolution, w and y are required");
+      const FilterDesc& w = c->f[CUDNN_PARAM_WDESC];
+      if (!is_half_nhwc(x) || !is_half_nhwc(y) || w.l.type != CUDNN_DATA_HALF || w.format != CUDNN_TENSOR_NHWC)
+        return UNSUPPORTED(fn, "x, w and y must be half NHWC");
+      if (c->conv.nsp != 2) return UNSUPPORTED(fn, "two-dimensional convolution only");
+      if (c->has[CUDNN_PARAM_ACTIVATION_DESC] && c->act.mode != CUDNN_ACTIVATION_RELU &&
+          c->act.mode != CUDNN_ACTIVATION_IDENTITY)
+        return UNSUPPORTED(fn, "only RELU and IDENTITY activations");
+      ConvGeom g;
+      std::string why;
+      if (!conv_geometry(x->l, w.l, y->l, 2, c->conv.pad, c->conv.str, c->conv.dil, c->conv.mode == CUDNN_CONVOLUTION,
+                         &g, &why) || g.G != c->conv.groups)
+        return BAD(fn, why.empty() ? "the convolution's groups do not fit" : why);
+      break;
+    }
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD:
+      if (!c->tensor(CUDNN_PARAM_XDESC) || !c->has[CUDNN_PARAM_CONV_DESC] || !c->has[CUDNN_PARAM_DWDESC] ||
+          !c->tensor(CUDNN_PARAM_DYDESC))
+        return BAD(fn, "x, the convolution, dw and dy are required");
+      return UNSUPPORTED(fn, "SCALE_BIAS_ACTIVATION_WGRAD (NOT_SUPPORTED on the hardware measured, an sm_86 card)");
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
+      if (!c->tensor(CUDNN_PARAM_YSTATS_DESC) || c->ph[CUDNN_PARAM_YSUM_PLACEHOLDER] == CUDNN_PTR_NULL ||
+          c->ph[CUDNN_PARAM_YSQSUM_PLACEHOLDER] == CUDNN_PTR_NULL)
+        return BAD(fn, "the y statistics and their placeholders are required");
+      if (!c->tensor(CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC)) return BAD(fn, "the scale/bias/mean/var descriptor is required");
+      break;
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_INFERENCE:
+      if (!c->tensor(CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC)) return BAD(fn, "the scale/bias/mean/var descriptor is required");
+      break;
+    case CUDNN_FUSED_CONV_SCALE_BIAS_ADD_ACTIVATION:
+      return UNSUPPORTED(fn, "CONV_SCALE_BIAS_ADD_ACTIVATION (NOT_SUPPORTED on the hardware measured, an sm_86 card)");
+    default:
+      return UNSUPPORTED(fn, "this fused op is undocumented and not implemented");
+  }
+  p->c = std::make_unique<FusedConst>(*c);
+  p->made = true;
+  *ws = 0;
+  return CUDNN_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cudnnStatus_t cudnnFusedOpsExecute(cudnnHandle_t h, const cudnnFusedOpsPlan_t plan,
+                                               cudnnFusedOpsVariantParamPack_t pack) {
+  static const char* fn = "cudnnFusedOpsExecute";
+  if (!known(h) || !known(plan) || !known(pack)) return BAD(fn, "invalid handle, plan or pack");
+  const auto* p = as<const FusedPlan>(plan);
+  if (!p->made) return fail(CUDNN_STATUS_NOT_INITIALIZED, fn, "the plan was never made");
+  const auto* v = as<const FusedVariant>(pack);
+  if (v->op != p->op) return BAD(fn, "the pack belongs to another op");
+  const FusedConst& c = *p->c;
+  auto ptr = [&](int label, int placeholder) -> void* {
+    return c.ph[placeholder] == CUDNN_PTR_NULL ? nullptr : v->p[label];
+  };
+  sync_handle(h);
+  switch (p->op) {
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_CONV_BNSTATS: {
+      const TensorDesc *X = c.tensor(CUDNN_PARAM_XDESC), *Y = c.tensor(CUDNN_PARAM_YDESC);
+      const TensorDesc* SB = c.tensor(CUDNN_PARAM_BN_EQSCALEBIAS_DESC);
+      const TensorDesc* ST = c.tensor(CUDNN_PARAM_YSTATS_DESC);
+      const FilterDesc& W = c.f[CUDNN_PARAM_WDESC];
+      void *x = v->p[CUDNN_PTR_XDATA], *w = v->p[CUDNN_PTR_WDATA], *y = v->p[CUDNN_PTR_YDATA];
+      if (!x || !w || !y) return BAD(fn, "x, w and y pointers are required");
+      std::vector<double> vx, vw, vs, vb, r;
+      if (!read(X->l, x, &vx) || !read(W.l, w, &vw)) return CUDNN_STATUS_EXECUTION_FAILED;
+      const void* sp = ptr(CUDNN_PTR_BN_EQSCALE, CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER);
+      const void* bp = ptr(CUDNN_PTR_BN_EQBIAS, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER);
+      if (SB && sp && !read_channels(SB, sp, &vs)) return CUDNN_STATUS_EXECUTION_FAILED;
+      if (SB && bp && !read_channels(SB, bp, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+      int64_t N, C, S;
+      ncs(X->l, &N, &C, &S);
+      const bool relu = c.has[CUDNN_PARAM_ACTIVATION_DESC] && c.act.mode == CUDNN_ACTIVATION_RELU;
+      for (int64_t n = 0; n < N; ++n)
+        for (int64_t ch = 0; ch < C; ++ch)
+          for (int64_t s = 0; s < S; ++s) {
+            double& e = vx[static_cast<size_t>((n * C + ch) * S + s)];
+            if (!vs.empty()) e *= vs[static_cast<size_t>(ch)];
+            if (!vb.empty()) e += vb[static_cast<size_t>(ch)];
+            e = round_to(CUDNN_DATA_HALF, e);  // the affine result is half (measured)
+            if (relu && !(e > 0.0)) e = 0.0;
+          }
+      ConvGeom g;
+      std::string why;
+      conv_geometry(X->l, W.l, Y->l, 2, c.conv.pad, c.conv.str, c.conv.dil, c.conv.mode == CUDNN_CONVOLUTION, &g, &why);
+      convolve(g, ConvDir::Forward, vx, vw, &r, Accum::Exact);
+      if (!write(Y->l, y, r)) return CUDNN_STATUS_EXECUTION_FAILED;
+      void* sum = ptr(CUDNN_PTR_YSUM, CUDNN_PARAM_YSUM_PLACEHOLDER);
+      void* sq = ptr(CUDNN_PTR_YSQSUM, CUDNN_PARAM_YSQSUM_PLACEHOLDER);
+      if (ST && (sum || sq)) {
+        // Per output channel, over the batch and every position, of y as stored.
+        int64_t K, P;
+        ncs(Y->l, &N, &K, &P);
+        std::vector<double> s1(static_cast<size_t>(K), 0.0), s2(static_cast<size_t>(K), 0.0);
+        for (int64_t n = 0; n < N; ++n)
+          for (int64_t k = 0; k < K; ++k)
+            for (int64_t i = 0; i < P; ++i) {
+              const double e = round_to(Y->l.type, r[static_cast<size_t>((n * K + k) * P + i)]);
+              s1[static_cast<size_t>(k)] += e, s2[static_cast<size_t>(k)] += e * e;
+            }
+        if ((sum && !write(ST->l, sum, s1)) || (sq && !write(ST->l, sq, s2))) return CUDNN_STATUS_EXECUTION_FAILED;
+      }
+      return CUDNN_STATUS_SUCCESS;
+    }
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
+    case CUDNN_FUSED_BN_FINALIZE_STATISTICS_INFERENCE: {
+      // Measured: mean = sum / count, var = sqsum / count - mean^2, invstd =
+      // 1 / sqrt(var + eps); running mean += factor (mean - running mean),
+      // running var the same toward the unbiased var * count / (count - 1);
+      // eqScale = scale * invstd, eqBias = bias - mean * eqScale. Inference
+      // uses the running mean and var.
+      const bool train = p->op == CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING;
+      const TensorDesc* MV = c.tensor(CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC);
+      const TensorDesc* ST = c.tensor(CUDNN_PARAM_YSTATS_DESC);
+      const TensorDesc* EQ = c.tensor(CUDNN_PARAM_BN_EQSCALEBIAS_DESC);
+      const int64_t K = MV->l.count();
+      std::vector<double> scale, bias, rm, rv, sum, sq;
+      void* pscale = ptr(CUDNN_PTR_BN_SCALE, CUDNN_PARAM_BN_SCALE_PLACEHOLDER);
+      void* pbias = ptr(CUDNN_PTR_BN_BIAS, CUDNN_PARAM_BN_BIAS_PLACEHOLDER);
+      void* prm = ptr(CUDNN_PTR_BN_RUNNING_MEAN, CUDNN_PARAM_BN_RUNNING_MEAN_PLACEHOLDER);
+      void* prv = ptr(CUDNN_PTR_BN_RUNNING_VAR, CUDNN_PARAM_BN_RUNNING_VAR_PLACEHOLDER);
+      if ((pscale && !read(MV->l, pscale, &scale)) || (pbias && !read(MV->l, pbias, &bias)) ||
+          (prm && !read(MV->l, prm, &rm)) || (prv && !read(MV->l, prv, &rv)))
+        return CUDNN_STATUS_EXECUTION_FAILED;
+      std::vector<double> mean(static_cast<size_t>(K), 0.0), var(static_cast<size_t>(K), 0.0);
+      if (train) {
+        if (!read(ST->l, v->p[CUDNN_PTR_YSUM], &sum) || !read(ST->l, v->p[CUDNN_PTR_YSQSUM], &sq))
+          return CUDNN_STATUS_EXECUTION_FAILED;
+        const double n = static_cast<double>(v->count);
+        for (int64_t k = 0; k < K; ++k) {
+          mean[k] = sum[k] / n;
+          var[k] = sq[k] / n - mean[k] * mean[k];
+        }
+        if (prm)
+          for (int64_t k = 0; k < K; ++k) rm[k] = (1.0 - v->factor) * rm[k] + v->factor * mean[k];
+        if (prv)
+          for (int64_t k = 0; k < K; ++k)
+            rv[k] = (1.0 - v->factor) * rv[k] + v->factor * (n > 1.0 ? var[k] * n / (n - 1.0) : var[k]);
+        if ((prm && !write(MV->l, prm, rm)) || (prv && !write(MV->l, prv, rv))) return CUDNN_STATUS_EXECUTION_FAILED;
+      } else {
+        if (rm.empty() || rv.empty()) return BAD(fn, "the running mean and variance are required");
+        mean = rm, var = rv;
+      }
+      std::vector<double> inv(static_cast<size_t>(K));
+      for (int64_t k = 0; k < K; ++k) inv[k] = 1.0 / std::sqrt(var[k] + v->eps);
+      if (train) {
+        void* psm = ptr(CUDNN_PTR_BN_SAVED_MEAN, CUDNN_PARAM_BN_SAVED_MEAN_PLACEHOLDER);
+        void* psi = ptr(CUDNN_PTR_BN_SAVED_INVSTD, CUDNN_PARAM_BN_SAVED_INVSTD_PLACEHOLDER);
+        if ((psm && !write(MV->l, psm, mean)) || (psi && !write(MV->l, psi, inv))) return CUDNN_STATUS_EXECUTION_FAILED;
+      }
+      void* pes = ptr(CUDNN_PTR_BN_EQSCALE, CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER);
+      void* peb = ptr(CUDNN_PTR_BN_EQBIAS, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER);
+      if (EQ && (pes || peb)) {
+        std::vector<double> es(static_cast<size_t>(K)), eb(static_cast<size_t>(K));
+        for (int64_t k = 0; k < K; ++k) {
+          es[k] = (scale.empty() ? 1.0 : scale[k]) * inv[k];
+          eb[k] = (bias.empty() ? 0.0 : bias[k]) - mean[k] * es[k];
+        }
+        if ((pes && !write(EQ->l, pes, es)) || (peb && !write(EQ->l, peb, eb))) return CUDNN_STATUS_EXECUTION_FAILED;
+      }
+      return CUDNN_STATUS_SUCCESS;
+    }
+    default:
+      return UNSUPPORTED(fn, "this fused op");
+  }
 }

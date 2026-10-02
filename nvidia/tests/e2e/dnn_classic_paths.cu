@@ -16,6 +16,7 @@
 //   - Tensor transform descriptors: padding, folding and unfolding of
 //     tensors and filters, cudnnInitTransformDest.
 #include <cudnn.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -987,6 +988,237 @@ static void rnn_getters() {
   expect("linLayerID 8 without a projection: NULL, no dimensions", !m && !bb && nb == 0);
 }
 
+/* ---- fused-ops plans ---- */
+
+static cudnnTensorDescriptor_t t4(cudnnTensorFormat_t f, cudnnDataType_t t, int n, int c, int h, int w) {
+  cudnnTensorDescriptor_t d = tensor();
+  cudnnSetTensor4dDescriptor(d, f, t, n, c, h, w);
+  return d;
+}
+
+static void fused_ops() {
+  const int N = 2, C = 8, Hh = 4, W = 4, K = 32;
+  const auto NHWC = CUDNN_TENSOR_NHWC;
+  const cudnnFusedOpsPointerPlaceHolder_t al = CUDNN_PTR_16B_ALIGNED;
+  const cudnnBatchNormMode_t spatial = CUDNN_BATCHNORM_SPATIAL;
+  auto make_const = [&](cudnnFusedOps_t op) {
+    cudnnFusedOpsConstParamPack_t p;
+    cudnnCreateFusedOpsConstParamPack(&p, op);
+    own(p, cudnnDestroyFusedOpsConstParamPack);
+    return p;
+  };
+  auto make_var = [&](cudnnFusedOps_t op) {
+    cudnnFusedOpsVariantParamPack_t p;
+    cudnnCreateFusedOpsVariantParamPack(&p, op);
+    own(p, cudnnDestroyFusedOpsVariantParamPack);
+    return p;
+  };
+  auto make_plan = [&](cudnnFusedOps_t op) {
+    cudnnFusedOpsPlan_t p;
+    cudnnCreateFusedOpsPlan(&p, op);
+    own(p, cudnnDestroyFusedOpsPlan);
+    return p;
+  };
+  // Scale, bias, ReLU, 3x3 convolution and the output's statistics, in half NHWC.
+  const auto op0 = CUDNN_FUSED_SCALE_BIAS_ACTIVATION_CONV_BNSTATS;
+  cudnnTensorDescriptor_t xd = t4(NHWC, CUDNN_DATA_HALF, N, C, Hh, W), sbd = t4(NHWC, CUDNN_DATA_HALF, 1, C, 1, 1);
+  cudnnTensorDescriptor_t yd = t4(NHWC, CUDNN_DATA_HALF, N, K, Hh, W), sd = t4(NHWC, CUDNN_DATA_FLOAT, 1, K, 1, 1);
+  cudnnFilterDescriptor_t wd = filter();
+  CK(cudnnSetFilter4dDescriptor(wd, CUDNN_DATA_HALF, NHWC, K, C, 3, 3));
+  cudnnConvolutionDescriptor_t cd;
+  (cudnnCreateConvolutionDescriptor(&cd), own(cd, cudnnDestroyConvolutionDescriptor));
+  CK(cudnnSetConvolution2dDescriptor(cd, 1, 1, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+  CK(cudnnSetConvolutionMathType(cd, CUDNN_TENSOR_OP_MATH));
+  cudnnActivationDescriptor_t ad;
+  (cudnnCreateActivationDescriptor(&ad), own(ad, cudnnDestroyActivationDescriptor));
+  CK(cudnnSetActivationDescriptor(ad, CUDNN_ACTIVATION_RELU, CUDNN_NOT_PROPAGATE_NAN, 0.0));
+  cudnnFusedOpsConstParamPack_t cp = make_const(op0);
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_XDESC, xd));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_XDATA_PLACEHOLDER, &al));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_BN_MODE, &spatial));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_BN_EQSCALEBIAS_DESC, sbd));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER, &al));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER, &al));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_ACTIVATION_DESC, ad));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_CONV_DESC, cd));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_WDESC, wd));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_WDATA_PLACEHOLDER, &al));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_YDESC, yd));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_YDATA_PLACEHOLDER, &al));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_YSTATS_DESC, sd));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_YSUM_PLACEHOLDER, &al));
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_YSQSUM_PLACEHOLDER, &al));
+  {
+    cudnnTensorDescriptor_t back = tensor();
+    int is_null = -1, nb = 0, dims[4], str[4];
+    cudnnDataType_t dt;
+    CK(cudnnGetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_XDESC, back, &is_null));
+    CK(cudnnGetTensorNdDescriptor(back, 4, &dt, &nb, dims, str));
+    cudnnFusedOpsPointerPlaceHolder_t ph = CUDNN_PTR_NULL;
+    int ph_null = -1;
+    CK(cudnnGetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_WDATA_PLACEHOLDER, &ph, &ph_null));
+    expect("a fused-ops pack hands back a copy of its descriptor and the placeholders",
+           is_null == 0 && nb == 4 && dims[1] == C && dt == CUDNN_DATA_HALF && str[1] == 1 && ph == al && ph_null == 0);
+    cudnnFusedOpsConstParamPack_t other = make_const(CUDNN_FUSED_BN_FINALIZE_STATISTICS_INFERENCE);
+    expect("a label from another op's table is BAD_PARAM",
+           cudnnSetFusedOpsConstParamPackAttribute(other, CUDNN_PARAM_XDESC, xd) == CUDNN_STATUS_BAD_PARAM);
+  }
+  cudnnFusedOpsPlan_t plan = make_plan(op0);
+  cudnnFusedOpsVariantParamPack_t vp = make_var(op0);
+  expect("executing a plan never made is NOT_INITIALIZED",
+         cudnnFusedOpsExecute(H, plan, vp) == CUDNN_STATUS_NOT_INITIALIZED);
+  size_t ws = 0;
+  {
+    size_t w2 = 0;
+    expect("a plan made from another op's pack is BAD_PARAM",
+           cudnnMakeFusedOpsPlan(H, make_plan(CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD), cp, &w2) ==
+               CUDNN_STATUS_BAD_PARAM);
+  }
+  CK(cudnnMakeFusedOpsPlan(H, plan, cp, &ws));
+  std::vector<__half> hx(N * C * Hh * W), hs(C), hb(C), hw(K * C * 9);
+  for (size_t i = 0; i < hx.size(); ++i) hx[i] = __float2half(0.25f * ((int)(i * 7 % 17) - 8));
+  for (int i = 0; i < C; ++i) hs[i] = __float2half(0.5f + 0.125f * i), hb[i] = __float2half(0.25f * (i % 3) - 0.25f);
+  for (size_t i = 0; i < hw.size(); ++i) hw[i] = __float2half(0.125f * ((int)(i * 5 % 9) - 4));
+  Buf<__half> x(hx), sc(hs), bi(hb), w(hw), y((size_t)N * K * Hh * W);
+  Buf<float> sum(K), sq(K);
+  Buf<char> work(ws + 16);
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_XDATA, x.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_BN_EQSCALE, sc.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_BN_EQBIAS, bi.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_WDATA, w.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_YDATA, y.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_YSUM, sum.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_YSQSUM, sq.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_WORKSPACE, work.p));
+  CK(cudnnSetFusedOpsVariantParamPackAttribute(vp, CUDNN_SCALAR_SIZE_T_WORKSPACE_SIZE_IN_BYTES, &ws));
+  {
+    void* back = nullptr;
+    CK(cudnnGetFusedOpsVariantParamPackAttribute(vp, CUDNN_PTR_YDATA, &back));
+    expect("a variant pack hands back its pointers", back == y.p);
+  }
+  CK(cudnnFusedOpsExecute(H, plan, vp));
+  const auto gy = y.get();
+  const auto gs = sum.get(), gq = sq.get();
+  double ey = 0, es = 0;
+  for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k)
+      for (int p = 0; p < Hh; ++p)
+        for (int q = 0; q < W; ++q) {
+          double acc = 0;
+          for (int c = 0; c < C; ++c)
+            for (int r = 0; r < 3; ++r)
+              for (int t = 0; t < 3; ++t) {
+                const int ih = p - 1 + r, iw = q - 1 + t;
+                if (ih < 0 || iw < 0 || ih >= Hh || iw >= W) continue;
+                double a = __half2float(hx[((n * Hh + ih) * W + iw) * C + c]) * __half2float(hs[c]) + __half2float(hb[c]);
+                a = __half2float(__float2half((float)a));
+                acc += std::fmax(a, 0.0) * __half2float(hw[((k * 3 + r) * 3 + t) * C + c]);
+              }
+          ey = std::fmax(ey, std::fabs(__half2float(gy[((n * Hh + p) * W + q) * K + k]) - acc));
+        }
+  for (int k = 0; k < K; ++k) {
+    double s1 = 0, s2 = 0;
+    for (int i = 0; i < N * Hh * W; ++i) {
+      const double v = __half2float(gy[i * K + k]);
+      s1 += v, s2 += v * v;
+    }
+    es = std::fmax(es, std::fmax(std::fabs(s1 - gs[k]), std::fabs(s2 - gq[k])) / (1 + std::fabs(s2)));
+  }
+  expect("SCALE_BIAS_ACTIVATION_CONV_BNSTATS: y = conv(relu(half(x * scale + bias)))", ey < 1e-3, ey);
+  expect("SCALE_BIAS_ACTIVATION_CONV_BNSTATS: per-channel sums of y and y^2", es < 1e-5, es);
+  // Float x is not one of its configurations.
+  CK(cudnnSetFusedOpsConstParamPackAttribute(cp, CUDNN_PARAM_XDESC, t4(NHWC, CUDNN_DATA_FLOAT, N, C, Hh, W)));
+  expect("... with float x it is NOT_SUPPORTED", cudnnMakeFusedOpsPlan(H, plan, cp, &ws) == CUDNN_STATUS_NOT_SUPPORTED);
+  // Batch-norm finalization, training and inference.
+  for (auto op : {CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING, CUDNN_FUSED_BN_FINALIZE_STATISTICS_INFERENCE}) {
+    const bool train = op == CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING;
+    cudnnFusedOpsConstParamPack_t c2 = make_const(op);
+    cudnnTensorDescriptor_t mv = t4(NHWC, CUDNN_DATA_FLOAT, 1, K, 1, 1), eq = t4(NHWC, CUDNN_DATA_HALF, 1, K, 1, 1);
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_BN_MODE, &spatial));
+    if (train) {
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_YSTATS_DESC, mv));
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_YSUM_PLACEHOLDER, &al));
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_YSQSUM_PLACEHOLDER, &al));
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_BN_SAVED_MEAN_PLACEHOLDER, &al));
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_BN_SAVED_INVSTD_PLACEHOLDER, &al));
+    }
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC, mv));
+    for (auto l : {CUDNN_PARAM_BN_SCALE_PLACEHOLDER, CUDNN_PARAM_BN_BIAS_PLACEHOLDER, CUDNN_PARAM_BN_RUNNING_MEAN_PLACEHOLDER,
+                   CUDNN_PARAM_BN_RUNNING_VAR_PLACEHOLDER, CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER,
+                   CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER})
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c2, l, &al));
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c2, CUDNN_PARAM_BN_EQSCALEBIAS_DESC, eq));
+    cudnnFusedOpsPlan_t p2 = make_plan(op);
+    size_t w2 = 0;
+    CK(cudnnMakeFusedOpsPlan(H, p2, c2, &w2));
+    std::vector<float> s1(K), s2(K), scale(K), bias(K), rm(K), rv(K);
+    for (int k = 0; k < K; ++k)
+      s1[k] = 3.0f * k - 20, s2[k] = 50.0f + 9.0f * k, scale[k] = 1.0f + 0.1f * k, bias[k] = 0.05f * k - 0.5f,
+      rm[k] = 0.1f * k, rv[k] = 1.0f + 0.2f * k;
+    Buf<float> bs1(s1), bs2(s2), bsc(scale), bbi(bias), brm(rm), brv(rv), bsm(K), bsi(K);
+    Buf<__half> bes(K), beb(K);
+    Buf<char> wk(w2 + 16);
+    cudnnFusedOpsVariantParamPack_t v2 = make_var(op);
+    if (train) {
+      CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_YSUM, bs1.p));
+      CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_YSQSUM, bs2.p));
+      CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_SAVED_MEAN, bsm.p));
+      CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_SAVED_INVSTD, bsi.p));
+    }
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_SCALE, bsc.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_BIAS, bbi.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_RUNNING_MEAN, brm.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_RUNNING_VAR, brv.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_EQSCALE, bes.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_BN_EQBIAS, beb.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_PTR_WORKSPACE, wk.p));
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_SCALAR_SIZE_T_WORKSPACE_SIZE_IN_BYTES, &w2));
+    int64_t count = 32;
+    double factor = 0.25, eps = 1e-3;
+    if (train) {
+      CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_SCALAR_INT64_T_BN_ACCUMULATION_COUNT, &count));
+      CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_SCALAR_DOUBLE_BN_EXP_AVG_FACTOR, &factor));
+    }
+    CK(cudnnSetFusedOpsVariantParamPackAttribute(v2, CUDNN_SCALAR_DOUBLE_BN_EPSILON, &eps));
+    CK(cudnnFusedOpsExecute(H, p2, v2));
+    const auto ges = bes.get(), geb = beb.get();
+    const auto grm = brm.get(), grv = brv.get(), gsm = bsm.get(), gsi = bsi.get();
+    double eh = 0, ef = 0;  // the half outputs' error, and the float outputs'
+    for (int k = 0; k < K; ++k) {
+      const double mean = train ? s1[k] / 32.0 : rm[k];
+      const double var = train ? s2[k] / 32.0 - mean * mean : rv[k];
+      const double inv = 1 / std::sqrt(var + eps), wes = scale[k] * inv, web = bias[k] - mean * wes;
+      eh = std::fmax(eh, std::fabs(__half2float(ges[k]) - wes) / (1 + std::fabs(wes)));
+      eh = std::fmax(eh, std::fabs(__half2float(geb[k]) - web) / (1 + std::fabs(web)));
+      if (train) {
+        ef = std::fmax(ef, std::fabs(grm[k] - (0.75 * rm[k] + 0.25 * mean)));
+        ef = std::fmax(ef, std::fabs(grv[k] - (0.75 * rv[k] + 0.25 * var * 32.0 / 31.0)) / (1 + rv[k]));
+        ef = std::fmax(ef, std::fabs(gsm[k] - mean) + std::fabs(gsi[k] - inv) / inv);
+      }
+    }
+    expect(train ? "BN_FINALIZE_STATISTICS_TRAINING: equivalent scale and bias, running and saved statistics"
+                 : "BN_FINALIZE_STATISTICS_INFERENCE: equivalent scale and bias from the running statistics",
+           eh < 1e-3 && ef < 1e-5, std::fmax(eh, ef));
+  }
+  // What this card does not run.
+  {
+    cudnnFusedOpsConstParamPack_t c1 = make_const(CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD);
+    cudnnTensorDescriptor_t dyd = t4(NHWC, CUDNN_DATA_HALF, N, K, Hh, W);
+    cudnnFilterDescriptor_t dwd = filter();
+    CK(cudnnSetFilter4dDescriptor(dwd, CUDNN_DATA_FLOAT, NHWC, K, C, 3, 3));
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c1, CUDNN_PARAM_XDESC, xd));
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c1, CUDNN_PARAM_CONV_DESC, cd));
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c1, CUDNN_PARAM_DWDESC, dwd));
+    CK(cudnnSetFusedOpsConstParamPackAttribute(c1, CUDNN_PARAM_DYDESC, dyd));
+    for (auto l : {CUDNN_PARAM_XDATA_PLACEHOLDER, CUDNN_PARAM_DWDATA_PLACEHOLDER, CUDNN_PARAM_DYDATA_PLACEHOLDER})
+      CK(cudnnSetFusedOpsConstParamPackAttribute(c1, l, &al));
+    size_t w1 = 0;
+    expect("SCALE_BIAS_ACTIVATION_WGRAD is NOT_SUPPORTED (as on an RTX 3060)",
+           cudnnMakeFusedOpsPlan(H, make_plan(CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD), c1, &w1) ==
+               CUDNN_STATUS_NOT_SUPPORTED);
+  }
+}
+
 int main() {
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
     std::printf("FAIL cudnnCreate\n");
@@ -1016,6 +1248,7 @@ int main() {
   lstm_projection({3, 4, 4, 1, 1, true, -0.3, 0.25}, "LSTM with cell clipping");
   lstm_projection({3, 4, 2, 2, 1, true, -0.3, 0.25}, "LSTM 2 layers, projection 2, clipping");
   rnn_getters();
+  fused_ops();
   destroy_owned();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
