@@ -906,6 +906,15 @@ hipError_t run_launch(const LaunchJob& job) {
     dispatch.cooperative = cooperative;
     dispatch.grid_sync = grid_sync;
     dispatch.peers = job.peers;
+    {
+      // The device's layout, for the registers that say where a wave runs.
+      // HIP's multiprocessors are the units: compute units, or RDNA's
+      // workgroup processors.
+      const vgpu::amd::Chip c = vgpu::amd::chip(d.profile().architecture.c_str());
+      const uint32_t dies = std::max(c.xccs, 1u);
+      dispatch.layout = {dies, std::max(c.engines / dies, 1u), std::max(c.arrays, 1u),
+                         std::max(static_cast<uint32_t>(d.profile().limits.multiprocessors) / dies, 1u)};
+    }
     if (prof) {
       launch.device = ordinal;
       launch.kernel_id = kernel_id(module, kernel);

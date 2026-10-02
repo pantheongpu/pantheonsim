@@ -957,9 +957,13 @@ VGPU_EXPORT CUresult cuCtxGetCurrent(CUcontext* pctx) {
   });
 }
 
+// With no context current, both answer CUDA_ERROR_INVALID_CONTEXT, as the
+// driver does on an RTX 3060 (CUDA 13.0); cuda.core asks cuCtxGetDevice first
+// and takes that answer as "no device chosen yet".
 VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) {
   return api("cuCtxGetDevice", true, false, [&](ShimState& s) {
     if (!device) return CUDA_ERROR_INVALID_VALUE;
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     *device = current_device(s);
     return CUDA_SUCCESS;
   });
@@ -967,6 +971,7 @@ VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) {
 
 VGPU_EXPORT CUresult cuCtxSynchronize(void) {
   return api("cuCtxSynchronize", true, false, [&](ShimState& s) {
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     (void)current_device(s);  // requires a current context
     return CUDA_SUCCESS;      // everything is synchronous today
   });
