@@ -11,19 +11,26 @@
 //   - Every descriptor keeps its attributes as it was given them, and hands
 //     them back on GetAttribute, so a caller reads what it wrote.
 //   - One engine, global index 0, runs any graph this library can compute:
-//     a single convolution forward, backward-data or backward-filter. A graph
-//     with anything else is refused when it is finalized, by name, rather
-//     than accepted and run wrongly.
+//     any number of convolution (forward, backward-data, backward-filter),
+//     matmul, pointwise, reduction, normalization (layer, instance, batch,
+//     RMS; forward and backward), pooling (resampling: max and average,
+//     forward and backward) and concatenation operations, joined through
+//     virtual tensors -- cudnn-frontend's conv-bias-activation, dgrad-drelu,
+//     matmul-epilogue, reduction, norm and pooling patterns, and PyTorch's
+//     single convolutions. A graph with any other operation is refused when
+//     it is finalized, by name, rather than accepted and run wrongly.
 //   - Execute computes on the host, as the classic API here does (see
-//     cudnn_api.cpp): the tensors are copied out of device memory, the
-//     convolution is done in float, and the result copied back, after the
-//     handle's stream has finished what it was given. Any number of spatial
-//     dimensions from one to three, groups, dilation, padding and any
-//     strides; float, half, bfloat16 and double data.
+//     cudnn_api.cpp): the operations run in an order that respects their
+//     data, inputs copied out of device memory and outputs copied back after
+//     the handle's stream has finished what it was given; intermediates stay
+//     on the host, rounded to their declared types. Convolutions take one to
+//     three spatial dimensions, groups, dilation, padding and any strides;
+//     tensors are float, half, bfloat16, double or integer, and a HALF
+//     compute type accumulates in half precision, as the hardware does.
 //
 // Declarations and values are cuDNN's own headers (nvidia/third_party/
 // cudnn_include); nothing here is NVIDIA's code.
-#include <cudnn.h>
+#include "cudnn_common.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -165,263 +172,52 @@ cudnnStatus_t refuse(const char* what, const std::string& why) {
   return CUDNN_STATUS_NOT_SUPPORTED;
 }
 
-bool is_conv_op(cudnnBackendDescriptorType_t t) {
-  return t == CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR ||
-         t == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR ||
-         t == CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR;
-}
+// ---- the graph: tensors, operations, and running them ------------------------
 
-// ---- tensors on the host ------------------------------------------------------
+namespace vc = vgpu_cudnn;
 
-struct Tensor {
-  cudnnDataType_t type = CUDNN_DATA_FLOAT;
-  std::vector<int64_t> dims, strides;  // in elements
+// A tensor as an operation names it. Virtual tensors live only inside the
+// graph (here, on the host between operations); by-value tensors are scalars
+// whose variant-pack pointer is host memory.
+struct GTensor {
+  vc::Layout l;
   int64_t uid = 0;
-  size_t count() const {
-    size_t n = 1;
-    for (int64_t d : dims) n *= static_cast<size_t>(d);
-    return n;
-  }
-  // Elements from the first to one past the last, as the strides lay them out.
-  size_t span() const {
-    size_t s = 1;
-    for (size_t i = 0; i < dims.size(); ++i) s += static_cast<size_t>((dims[i] - 1) * strides[i]);
-    return s;
-  }
+  bool is_virtual = false, by_value = false;
 };
 
-bool tensor_of(const Desc* d, Tensor* t) {
-  if (!d || d->type != CUDNN_BACKEND_TENSOR_DESCRIPTOR) return false;
-  t->type = static_cast<cudnnDataType_t>(d->i64(CUDNN_ATTR_TENSOR_DATA_TYPE));
-  t->dims = d->i64s(CUDNN_ATTR_TENSOR_DIMENSIONS);
-  t->strides = d->i64s(CUDNN_ATTR_TENSOR_STRIDES);
+bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
+  if (!d || d->type != CUDNN_BACKEND_TENSOR_DESCRIPTOR) { *why = "a tensor is missing"; return false; }
+  const std::vector<int64_t> dims = d->i64s(CUDNN_ATTR_TENSOR_DIMENSIONS), strides = d->i64s(CUDNN_ATTR_TENSOR_STRIDES);
   t->uid = d->i64(CUDNN_ATTR_TENSOR_UNIQUE_ID);
-  return t->dims.size() >= 3 && t->dims.size() == t->strides.size();
-}
-
-size_t type_bytes(cudnnDataType_t t) {
-  switch (t) {
-    case CUDNN_DATA_HALF:
-    case CUDNN_DATA_BFLOAT16: return 2;
-    case CUDNN_DATA_DOUBLE: return 8;
-    default: return 4;
-  }
-}
-bool supported_type(cudnnDataType_t t) {
-  return t == CUDNN_DATA_FLOAT || t == CUDNN_DATA_HALF || t == CUDNN_DATA_BFLOAT16 || t == CUDNN_DATA_DOUBLE;
-}
-
-float half_to_float(uint16_t h) {
-  const uint32_t sign = (h & 0x8000u) << 16, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
-  uint32_t bits;
-  if (exp == 0) {
-    if (man == 0) bits = sign;
-    else {  // subnormal: normalize
-      int e = -1;
-      uint32_t m = man;
-      do { ++e; m <<= 1; } while (!(m & 0x400));
-      bits = sign | ((127 - 15 - e) << 23) | ((m & 0x3ff) << 13);
-    }
-  } else if (exp == 31) bits = sign | 0x7f800000u | (man << 13);
-  else bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
-uint16_t float_to_half(float f) {  // round to nearest even
-  uint32_t x;
-  std::memcpy(&x, &f, 4);
-  const uint32_t sign = (x >> 16) & 0x8000u;
-  const int32_t exp = static_cast<int32_t>((x >> 23) & 0xff) - 127 + 15;
-  uint32_t man = x & 0x7fffff;
-  if (((x >> 23) & 0xff) == 0xff) return static_cast<uint16_t>(sign | 0x7c00u | (man ? 0x200u : 0));
-  if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
-  if (exp <= 0) {
-    if (exp < -10) return static_cast<uint16_t>(sign);
-    man |= 0x800000;
-    const int shift = 14 - exp;
-    uint32_t h = man >> shift;
-    const uint32_t rem = man & ((1u << shift) - 1), half = 1u << (shift - 1);
-    if (rem > half || (rem == half && (h & 1))) ++h;
-    return static_cast<uint16_t>(sign | h);
-  }
-  uint32_t h = (static_cast<uint32_t>(exp) << 10) | (man >> 13);
-  const uint32_t rem = man & 0x1fff;
-  if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) ++h;
-  return static_cast<uint16_t>(sign | h);
-}
-float bf16_to_float(uint16_t b) {
-  const uint32_t bits = static_cast<uint32_t>(b) << 16;
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
-uint16_t float_to_bf16(float f) {
-  uint32_t x;
-  std::memcpy(&x, &f, 4);
-  if ((x & 0x7f800000u) == 0x7f800000u && (x & 0x7fffff)) return static_cast<uint16_t>((x >> 16) | 0x40);
-  x += 0x7fff + ((x >> 16) & 1);
-  return static_cast<uint16_t>(x >> 16);
-}
-
-// A tensor's elements in logical order (dims[0] outermost), as float.
-struct Host {
-  Tensor t;
-  void* dev = nullptr;
-  std::vector<uint8_t> raw;   // the span, as it is in device memory
-  std::vector<float> v;       // logical order
-};
-
-// Walks every element's logical index and its offset in the span.
-template <class F>
-void each(const Tensor& t, F&& f) {
-  const size_t rank = t.dims.size();
-  std::vector<int64_t> idx(rank, 0);
-  const size_t n = t.count();
-  for (size_t i = 0; i < n; ++i) {
-    size_t off = 0;
-    for (size_t d = 0; d < rank; ++d) off += static_cast<size_t>(idx[d] * t.strides[d]);
-    f(i, off);
-    for (size_t d = rank; d-- > 0;) {
-      if (++idx[d] < t.dims[d]) break;
-      idx[d] = 0;
-    }
-  }
-}
-
-bool fetch(Host* h, bool read_values) {
-  const size_t eb = type_bytes(h->t.type);
-  h->raw.assign(h->t.span() * eb, 0);
-  if (cudaMemcpy(h->raw.data(), h->dev, h->raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-  h->v.assign(h->t.count(), 0.0f);
-  if (!read_values) return true;
-  each(h->t, [&](size_t i, size_t off) {
-    const uint8_t* p = h->raw.data() + off * eb;
-    switch (h->t.type) {
-      case CUDNN_DATA_HALF: { uint16_t b; std::memcpy(&b, p, 2); h->v[i] = half_to_float(b); break; }
-      case CUDNN_DATA_BFLOAT16: { uint16_t b; std::memcpy(&b, p, 2); h->v[i] = bf16_to_float(b); break; }
-      case CUDNN_DATA_DOUBLE: { double d; std::memcpy(&d, p, 8); h->v[i] = static_cast<float>(d); break; }
-      default: std::memcpy(&h->v[i], p, 4); break;
-    }
-  });
-  return true;
-}
-
-// Writes the logical values back over the span, leaving any gaps the strides
-// leave as they were.
-bool flush(Host* h) {
-  const size_t eb = type_bytes(h->t.type);
-  each(h->t, [&](size_t i, size_t off) {
-    uint8_t* p = h->raw.data() + off * eb;
-    switch (h->t.type) {
-      case CUDNN_DATA_HALF: { const uint16_t b = float_to_half(h->v[i]); std::memcpy(p, &b, 2); break; }
-      case CUDNN_DATA_BFLOAT16: { const uint16_t b = float_to_bf16(h->v[i]); std::memcpy(p, &b, 2); break; }
-      case CUDNN_DATA_DOUBLE: { const double d = h->v[i]; std::memcpy(p, &d, 8); break; }
-      default: std::memcpy(p, &h->v[i], 4); break;
-    }
-  });
-  return cudaMemcpy(h->dev, h->raw.data(), h->raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
-}
-
-// ---- convolution --------------------------------------------------------------
-
-struct Conv {
-  int spatial = 2;
-  std::vector<int64_t> pad, stride, dilation;
-  bool flip = false;  // CUDNN_CONVOLUTION flips the filter; cross-correlation does not
-};
-
-bool conv_of(const Desc* d, Conv* c) {
-  if (!d || d->type != CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR) return false;
-  c->spatial = static_cast<int>(d->i64(CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS));
-  c->pad = d->i64s(CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS);
-  c->stride = d->i64s(CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES);
-  c->dilation = d->i64s(CUDNN_ATTR_CONVOLUTION_DILATIONS);
-  c->flip = d->i64(CUDNN_ATTR_CONVOLUTION_CONV_MODE) == CUDNN_CONVOLUTION;
-  const size_t s = static_cast<size_t>(c->spatial);
-  return c->spatial >= 1 && c->spatial <= 3 && c->pad.size() == s && c->stride.size() == s &&
-         c->dilation.size() == s;
-}
-
-// The three convolutions share one loop: every (batch, output channel, output
-// position, input channel, filter tap) that lands inside the input. Up to
-// three spatial dimensions; fewer are padded with extent 1.
-struct Geometry {
-  int64_t N, C, K, G, Cg, Kg;
-  int64_t in[3] = {1, 1, 1}, out[3] = {1, 1, 1}, flt[3] = {1, 1, 1};
-  int64_t pad[3] = {0, 0, 0}, str[3] = {1, 1, 1}, dil[3] = {1, 1, 1};
-  bool flip = false;
-};
-
-bool geometry(const Tensor& x, const Tensor& w, const Tensor& y, const Conv& c, Geometry* g, std::string* why) {
-  const size_t s = static_cast<size_t>(c.spatial);
-  if (x.dims.size() != s + 2 || w.dims.size() != s + 2 || y.dims.size() != s + 2) {
-    *why = "tensor ranks do not match the convolution's spatial dimensions";
+  t->l.type = static_cast<cudnnDataType_t>(d->i64(CUDNN_ATTR_TENSOR_DATA_TYPE));
+  const Attr* v = d->get(CUDNN_ATTR_TENSOR_IS_VIRTUAL);
+  t->is_virtual = v && !v->bytes.empty() && v->bytes[0];
+  const Attr* bv = d->get(CUDNN_ATTR_TENSOR_IS_BY_VALUE);
+  t->by_value = bv && !bv->bytes.empty() && bv->bytes[0];
+  if (dims.empty() || dims.size() != strides.size() || dims.size() > static_cast<size_t>(vc::kMaxRank)) {
+    *why = "tensor " + std::to_string(t->uid) + " has " + std::to_string(dims.size()) + " dimensions and " +
+           std::to_string(strides.size()) + " strides";
     return false;
   }
-  g->N = x.dims[0], g->C = x.dims[1], g->K = w.dims[0], g->Cg = w.dims[1];
-  if (g->Cg <= 0 || g->C % g->Cg) { *why = "input channels are not a multiple of the filter's"; return false; }
-  g->G = g->C / g->Cg;
-  if (g->K % g->G) { *why = "output channels are not a multiple of the group count"; return false; }
-  g->Kg = g->K / g->G;
-  if (y.dims[0] != g->N || y.dims[1] != g->K) { *why = "the output's batch or channels do not match"; return false; }
-  for (size_t i = 0; i < s; ++i) {
-    const size_t k = 3 - s + i;  // right-align into three
-    g->in[k] = x.dims[2 + i], g->out[k] = y.dims[2 + i], g->flt[k] = w.dims[2 + i];
-    g->pad[k] = c.pad[i], g->str[k] = c.stride[i], g->dil[k] = c.dilation[i];
+  if (d->i64(CUDNN_ATTR_TENSOR_VECTOR_COUNT, 1) != 1) {
+    *why = "tensor " + std::to_string(t->uid) + " is vectorized, which is not supported";
+    return false;
   }
-  g->flip = c.flip;
+  if (d->get(CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC)) {
+    *why = "tensor " + std::to_string(t->uid) + " is ragged, which is not supported";
+    return false;
+  }
+  if (!vc::storable(t->l.type)) {
+    *why = std::string("tensor ") + std::to_string(t->uid) + " has data type " + vc::type_name(t->l.type) +
+           ", which is not supported";
+    return false;
+  }
+  t->l.rank = static_cast<int>(dims.size());
+  for (int i = 0; i < t->l.rank; ++i) {
+    if (dims[i] <= 0 || strides[i] <= 0) { *why = "tensor " + std::to_string(t->uid) + " has a nonpositive extent or stride"; return false; }
+    t->l.dims[i] = dims[i], t->l.strides[i] = strides[i];
+  }
   return true;
-}
-
-enum class Dir { Forward, Data, Filter };
-
-// Logical, packed indexes into the tensors' value arrays.
-inline size_t xi(const Geometry& g, int64_t n, int64_t c, const int64_t p[3]) {
-  return static_cast<size_t>(((n * g.C + c) * g.in[0] + p[0]) * g.in[1] + p[1]) * g.in[2] + p[2];
-}
-inline size_t wi(const Geometry& g, int64_t k, int64_t c, const int64_t f[3]) {
-  return static_cast<size_t>(((k * g.Cg + c) * g.flt[0] + f[0]) * g.flt[1] + f[1]) * g.flt[2] + f[2];
-}
-inline size_t yi(const Geometry& g, int64_t n, int64_t k, const int64_t o[3]) {
-  return static_cast<size_t>(((n * g.K + k) * g.out[0] + o[0]) * g.out[1] + o[1]) * g.out[2] + o[2];
-}
-
-// acc is the result tensor's size; the caller scales it into the output.
-void convolve(const Geometry& g, Dir dir, const std::vector<float>& a, const std::vector<float>& b,
-              std::vector<double>& acc) {
-  int64_t o[3], f[3], p[3];
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t k = 0; k < g.K; ++k) {
-      const int64_t grp = k / g.Kg;
-      for (o[0] = 0; o[0] < g.out[0]; ++o[0])
-        for (o[1] = 0; o[1] < g.out[1]; ++o[1])
-          for (o[2] = 0; o[2] < g.out[2]; ++o[2])
-            for (int64_t ci = 0; ci < g.Cg; ++ci)
-              for (f[0] = 0; f[0] < g.flt[0]; ++f[0])
-                for (f[1] = 0; f[1] < g.flt[1]; ++f[1])
-                  for (f[2] = 0; f[2] < g.flt[2]; ++f[2]) {
-                    bool inside = true;
-                    for (int d = 0; d < 3 && inside; ++d) {
-                      const int64_t tap = g.flip ? g.flt[d] - 1 - f[d] : f[d];
-                      p[d] = o[d] * g.str[d] - g.pad[d] + tap * g.dil[d];
-                      inside = p[d] >= 0 && p[d] < g.in[d];
-                    }
-                    if (!inside) continue;
-                    const int64_t c = grp * g.Cg + ci;
-                    switch (dir) {
-                      case Dir::Forward:  // a = x, b = w, acc = y
-                        acc[yi(g, n, k, o)] += static_cast<double>(a[xi(g, n, c, p)]) * b[wi(g, k, ci, f)];
-                        break;
-                      case Dir::Data:     // a = dy, b = w, acc = dx
-                        acc[xi(g, n, c, p)] += static_cast<double>(a[yi(g, n, k, o)]) * b[wi(g, k, ci, f)];
-                        break;
-                      case Dir::Filter:   // a = dy, b = x, acc = dw
-                        acc[wi(g, k, ci, f)] += static_cast<double>(a[yi(g, n, k, o)]) * b[xi(g, n, c, p)];
-                        break;
-                    }
-                  }
-    }
 }
 
 double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
@@ -432,100 +228,1017 @@ double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
   return dflt;
 }
 
-struct ConvOp {
-  Dir dir;
-  const Desc *x, *w, *y, *conv;  // for Data: y is dy, x is dx; for Filter: w is dw
-  double alpha, beta;
+// What an operation is, which tensors it reads and writes, and its settings,
+// checked: everything a graph's finalization needs to accept it and its
+// execution needs to run it.
+enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd, Concat };
+
+// A normalization's tensors, by role: which of an Op's inputs and outputs
+// each is (-1 when the graph does not give it).
+enum NormRole { kX, kScale, kBias, kEps, kMean, kInv, kFactor, kRunMeanIn, kRunVarIn, kDy,
+                kY, kMeanOut, kInvOut, kRunMeanOut, kRunVarOut, kDx, kDscale, kDbias, kRoles };
+
+struct Op {
+  Kind kind;
+  const Desc* desc;
+  std::vector<GTensor> in;   // the roles below, in order
+  GTensor out;
+  // Convolutions: in = {x, w} (forward), {dy, w} (data), {dy, x} (filter).
+  vc::ConvGeom geom;
+  double alpha = 1.0, beta = 0.0, alpha2 = 1.0;
+  vc::Accum acc = vc::Accum::Exact;
+  // Pointwise: the mode and its parameters; in = {x}, {x, b}, {x, b, t} or,
+  // for a backward mode, {dy, x}.
+  cudnnPointwiseMode_t pw = CUDNN_POINTWISE_ADD;
+  double lower = 0.0, upper = 0.0, slope = 0.0, elu_alpha = 1.0, softplus_beta = 1.0, swish_beta = 1.0;
+  bool has_upper = false;
+  int64_t axis = -1;
+  // Reduction: the operator. Matmul: in = {a, b}.
+  cudnnReduceTensorOp_t red = CUDNN_REDUCE_TENSOR_ADD;
+  // Normalization: the mode, whether it trains, the outputs beyond `out`,
+  // and where each role is (an index into in, or for an output role into
+  // {out, more...}).
+  // Resampling (pooling): the mode, how padding reads, and the window.
+  cudnnResampleMode_t resample = CUDNN_RESAMPLE_MAXPOOL;
+  cudnnPaddingMode_t padding = CUDNN_ZERO_PAD;
+  int nsp = 0;
+  int64_t win[3] = {1, 1, 1}, pre[3] = {0, 0, 0}, post[3] = {0, 0, 0}, pstr[3] = {1, 1, 1};
+  cudnnBackendNormMode_t norm = CUDNN_LAYER_NORM;
+  bool training = false;
+  std::vector<GTensor> more;
+  int role[kRoles];
+  Op() { for (int& r : role) r = -1; }
 };
 
-bool conv_op_of(const Desc* op, ConvOp* c) {
-  switch (op->type) {
-    case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR:
-      *c = {Dir::Forward, op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W), op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC),
-            scalar(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, 1.0),
-            scalar(op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, 0.0)};
-      break;
-    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR:
-      *c = {Dir::Data, op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W), op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC),
-            scalar(op, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA, 1.0),
-            scalar(op, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA, 0.0)};
-      break;
-    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR:
-      *c = {Dir::Filter, op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY),
-            op->desc(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC),
-            scalar(op, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, 1.0),
-            scalar(op, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA, 0.0)};
-      break;
-    default: return false;
+const char* op_name(cudnnBackendDescriptorType_t t) {
+  switch (t) {
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR: return "convolution forward";
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR: return "convolution backward-data";
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR: return "convolution backward-filter";
+    case CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR: return "matmul";
+    case CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR: return "pointwise";
+    case CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR: return "reduction";
+    case CUDNN_BACKEND_OPERATION_GEN_STATS_DESCRIPTOR: return "generate-statistics";
+    case CUDNN_BACKEND_OPERATION_BN_FINALIZE_STATISTICS_DESCRIPTOR: return "BN finalize-statistics";
+    case CUDNN_BACKEND_OPERATION_BN_BWD_WEIGHTS_DESCRIPTOR: return "BN backward-weights";
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR: return "resample forward";
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR: return "resample backward";
+    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR: return "concatenate";
+    case CUDNN_BACKEND_OPERATION_SIGNAL_DESCRIPTOR: return "signal";
+    case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR: return "normalization forward";
+    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR: return "normalization backward";
+    case CUDNN_BACKEND_OPERATION_RESHAPE_DESCRIPTOR: return "reshape";
+    case CUDNN_BACKEND_OPERATION_RNG_DESCRIPTOR: return "random number generation";
+    case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR: return "paged cache load";
+    case CUDNN_BACKEND_OPERATION_BLOCK_SCALE_QUANTIZE_DESCRIPTOR: return "block-scale quantize";
+    case CUDNN_BACKEND_OPERATION_BLOCK_SCALE_DEQUANTIZE_DESCRIPTOR: return "block-scale dequantize";
+    case CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR: return "expand band matrix";
+    case CUDNN_BACKEND_OPERATION_CONTRACT_BAND_MATRIX_DESCRIPTOR: return "contract band matrix";
+    case CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR: return "scaled dot-product attention forward";
+    case CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR: return "scaled dot-product attention backward";
+    case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR: return "MoE grouped matmul";
+    case CUDNN_BACKEND_OPERATION_DIAGONAL_BAND_MASK_DESCRIPTOR: return "diagonal band mask";
+    default: return nullptr;
   }
-  return c->x && c->w && c->y && c->conv;
+}
+
+enum class Arity { Unary, Binary, Ternary, Backward, Unknown };
+Arity arity(cudnnPointwiseMode_t m) {
+  switch (m) {
+    case CUDNN_POINTWISE_ADD: case CUDNN_POINTWISE_ADD_SQUARE: case CUDNN_POINTWISE_DIV: case CUDNN_POINTWISE_MAX:
+    case CUDNN_POINTWISE_MIN: case CUDNN_POINTWISE_MOD: case CUDNN_POINTWISE_MUL: case CUDNN_POINTWISE_POW:
+    case CUDNN_POINTWISE_SUB: case CUDNN_POINTWISE_ATAN2: case CUDNN_POINTWISE_CMP_EQ: case CUDNN_POINTWISE_CMP_NEQ:
+    case CUDNN_POINTWISE_CMP_GT: case CUDNN_POINTWISE_CMP_GE: case CUDNN_POINTWISE_CMP_LT: case CUDNN_POINTWISE_CMP_LE:
+    case CUDNN_POINTWISE_LOGICAL_AND: case CUDNN_POINTWISE_LOGICAL_OR:
+      return Arity::Binary;
+    case CUDNN_POINTWISE_ABS: case CUDNN_POINTWISE_CEIL: case CUDNN_POINTWISE_COS: case CUDNN_POINTWISE_EXP:
+    case CUDNN_POINTWISE_FLOOR: case CUDNN_POINTWISE_LOG: case CUDNN_POINTWISE_NEG: case CUDNN_POINTWISE_RSQRT:
+    case CUDNN_POINTWISE_SIN: case CUDNN_POINTWISE_SQRT: case CUDNN_POINTWISE_TAN: case CUDNN_POINTWISE_ERF:
+    case CUDNN_POINTWISE_IDENTITY: case CUDNN_POINTWISE_RECIPROCAL: case CUDNN_POINTWISE_LOGICAL_NOT:
+    case CUDNN_POINTWISE_GEN_INDEX:
+    case CUDNN_POINTWISE_RELU_FWD: case CUDNN_POINTWISE_TANH_FWD: case CUDNN_POINTWISE_SIGMOID_FWD:
+    case CUDNN_POINTWISE_ELU_FWD: case CUDNN_POINTWISE_GELU_FWD: case CUDNN_POINTWISE_SOFTPLUS_FWD:
+    case CUDNN_POINTWISE_SWISH_FWD: case CUDNN_POINTWISE_GELU_APPROX_TANH_FWD:
+      return Arity::Unary;
+    case CUDNN_POINTWISE_RELU_BWD: case CUDNN_POINTWISE_TANH_BWD: case CUDNN_POINTWISE_SIGMOID_BWD:
+    case CUDNN_POINTWISE_ELU_BWD: case CUDNN_POINTWISE_GELU_BWD: case CUDNN_POINTWISE_SOFTPLUS_BWD:
+    case CUDNN_POINTWISE_SWISH_BWD: case CUDNN_POINTWISE_GELU_APPROX_TANH_BWD:
+      return Arity::Backward;
+    case CUDNN_POINTWISE_BINARY_SELECT:
+      return Arity::Ternary;
+    default:
+      return Arity::Unknown;
+  }
+}
+
+// Every dimension of a is c's or 1, at c's rank.
+bool broadcasts(const vc::Layout& a, const vc::Layout& c) {
+  if (a.rank != c.rank) return false;
+  for (int i = 0; i < a.rank; ++i)
+    if (a.dims[i] != c.dims[i] && a.dims[i] != 1) return false;
+  return true;
+}
+
+bool op_of(const Desc* d, Op* op, std::string* why) {
+  op->desc = d;
+  auto tensor = [&](cudnnBackendAttributeName_t n, const char* role, GTensor* t) {
+    std::string w;
+    if (tensor_of(d->desc(n), t, &w)) return true;
+    *why = std::string(op_name(d->type)) + ": " + role + ": " + w;
+    return false;
+  };
+  auto conv = [&](cudnnBackendAttributeName_t cn, const vc::Layout& x, const vc::Layout& w, const vc::Layout& y) {
+    const Desc* c = d->desc(cn);
+    if (!c || c->type != CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR) { *why = "the convolution's settings are missing"; return false; }
+    const int nsp = static_cast<int>(c->i64(CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS));
+    const auto pre = c->i64s(CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS), post = c->i64s(CUDNN_ATTR_CONVOLUTION_POST_PADDINGS);
+    const auto str = c->i64s(CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES), dil = c->i64s(CUDNN_ATTR_CONVOLUTION_DILATIONS);
+    const size_t s = static_cast<size_t>(nsp);
+    if (nsp < 1 || nsp > 3 || pre.size() != s || str.size() != s || dil.size() != s) {
+      *why = "the convolution's settings are incomplete (spatial " + std::to_string(nsp) + ", pads " +
+             std::to_string(pre.size()) + ", strides " + std::to_string(str.size()) + ", dilations " +
+             std::to_string(dil.size()) + ")";
+      return false;
+    }
+    // Post paddings may differ from pre paddings (TensorFlow's SAME padding):
+    // the output's extent follows from both, positions from the pre ones.
+    if (!post.empty() && post.size() != s) { *why = "the convolution's post paddings are incomplete"; return false; }
+    const bool flip = c->i64(CUDNN_ATTR_CONVOLUTION_CONV_MODE) == CUDNN_CONVOLUTION;
+    if (!vc::conv_geometry(x, w, y, nsp, pre.data(), str.data(), dil.data(), flip, &op->geom, why,
+                           post.empty() ? nullptr : post.data()))
+      return false;
+    const cudnnDataType_t ct = static_cast<cudnnDataType_t>(c->i64(CUDNN_ATTR_CONVOLUTION_COMP_TYPE, CUDNN_DATA_FLOAT));
+    op->acc = ct == CUDNN_DATA_HALF ? vc::Accum::Half : vc::Accum::Exact;
+    return true;
+  };
+  switch (d->type) {
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR: {
+      GTensor x, w;
+      op->kind = Kind::ConvFwd;
+      if (!tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, "x", &x) ||
+          !tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, "w", &w) ||
+          !tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, "y", &op->out))
+        return false;
+      op->in = {x, w};
+      op->alpha = scalar(d, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, 1.0);
+      op->beta = scalar(d, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, 0.0);
+      return conv(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, x.l, w.l, op->out.l);
+    }
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR: {
+      GTensor dy, w;
+      op->kind = Kind::ConvData;
+      if (!tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, "dy", &dy) ||
+          !tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, "w", &w) ||
+          !tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, "dx", &op->out))
+        return false;
+      op->in = {dy, w};
+      op->alpha = scalar(d, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA, 1.0);
+      op->beta = scalar(d, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA, 0.0);
+      return conv(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, op->out.l, w.l, dy.l);
+    }
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR: {
+      GTensor dy, x;
+      op->kind = Kind::ConvFilter;
+      if (!tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY, "dy", &dy) ||
+          !tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X, "x", &x) ||
+          !tensor(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW, "dw", &op->out))
+        return false;
+      op->in = {dy, x};
+      op->alpha = scalar(d, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, 1.0);
+      op->beta = scalar(d, CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA, 0.0);
+      return conv(CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC, x.l, op->out.l, dy.l);
+    }
+    case CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR: {
+      GTensor a, b;
+      op->kind = Kind::Matmul;
+      if (!tensor(CUDNN_ATTR_OPERATION_MATMUL_ADESC, "a", &a) || !tensor(CUDNN_ATTR_OPERATION_MATMUL_BDESC, "b", &b) ||
+          !tensor(CUDNN_ATTR_OPERATION_MATMUL_CDESC, "c", &op->out))
+        return false;
+      if (d->desc(CUDNN_ATTR_OPERATION_MATMUL_GEMM_M_OVERRIDE_DESC) || d->desc(CUDNN_ATTR_OPERATION_MATMUL_GEMM_N_OVERRIDE_DESC) ||
+          d->desc(CUDNN_ATTR_OPERATION_MATMUL_GEMM_K_OVERRIDE_DESC)) {
+        *why = "matmul: per-batch M/N/K overrides (ragged batches) are not supported";
+        return false;
+      }
+      const Desc* md = d->desc(CUDNN_ATTR_OPERATION_MATMUL_DESC);
+      if (!md || md->type != CUDNN_BACKEND_MATMUL_DESCRIPTOR) { *why = "matmul: the matmul descriptor is missing"; return false; }
+      const auto ct = static_cast<cudnnDataType_t>(md->i64(CUDNN_ATTR_MATMUL_COMP_TYPE, CUDNN_DATA_FLOAT));
+      op->acc = ct == CUDNN_DATA_HALF ? vc::Accum::Half : vc::Accum::Exact;
+      const vc::Layout &A = a.l, &B = b.l, &C = op->out.l;
+      const int r = C.rank;
+      if (r < 2 || A.rank != r || B.rank != r || A.dims[r - 1] != B.dims[r - 2] || A.dims[r - 2] != C.dims[r - 2] ||
+          B.dims[r - 1] != C.dims[r - 1]) {
+        *why = "matmul: a [.., M, K], b [.., K, N] and c [.., M, N] do not fit together";
+        return false;
+      }
+      for (int i = 0; i < r - 2; ++i)
+        if ((A.dims[i] != C.dims[i] && A.dims[i] != 1) || (B.dims[i] != C.dims[i] && B.dims[i] != 1)) {
+          *why = "matmul: a batch dimension of a or b is neither c's nor 1";
+          return false;
+        }
+      op->in = {a, b};
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR: {
+      op->kind = Kind::Pointwise;
+      const Desc* pd = d->desc(CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR);
+      if (!pd || pd->type != CUDNN_BACKEND_POINTWISE_DESCRIPTOR) { *why = "pointwise: the pointwise descriptor is missing"; return false; }
+      op->pw = static_cast<cudnnPointwiseMode_t>(pd->i64(CUDNN_ATTR_POINTWISE_MODE));
+      op->lower = scalar(pd, CUDNN_ATTR_POINTWISE_RELU_LOWER_CLIP, 0.0);
+      op->has_upper = pd->get(CUDNN_ATTR_POINTWISE_RELU_UPPER_CLIP) != nullptr;
+      op->upper = scalar(pd, CUDNN_ATTR_POINTWISE_RELU_UPPER_CLIP, 0.0);
+      op->slope = scalar(pd, CUDNN_ATTR_POINTWISE_RELU_LOWER_CLIP_SLOPE, 0.0);
+      op->elu_alpha = scalar(pd, CUDNN_ATTR_POINTWISE_ELU_ALPHA, 1.0);
+      op->softplus_beta = scalar(pd, CUDNN_ATTR_POINTWISE_SOFTPLUS_BETA, 1.0);
+      op->swish_beta = scalar(pd, CUDNN_ATTR_POINTWISE_SWISH_BETA, 1.0);
+      op->axis = pd->i64(CUDNN_ATTR_POINTWISE_AXIS, -1);
+      op->alpha = scalar(d, CUDNN_ATTR_OPERATION_POINTWISE_ALPHA1, 1.0);
+      op->alpha2 = scalar(d, CUDNN_ATTR_OPERATION_POINTWISE_ALPHA2, 1.0);
+      GTensor x, b, t;
+      switch (arity(op->pw)) {
+        case Arity::Unary:
+          if (!tensor(CUDNN_ATTR_OPERATION_POINTWISE_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_POINTWISE_YDESC, "y", &op->out)) return false;
+          op->in = {x};
+          break;
+        case Arity::Binary:
+          if (!tensor(CUDNN_ATTR_OPERATION_POINTWISE_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_POINTWISE_BDESC, "b", &b) ||
+              !tensor(CUDNN_ATTR_OPERATION_POINTWISE_YDESC, "y", &op->out))
+            return false;
+          op->in = {x, b};
+          break;
+        case Arity::Ternary:
+          if (!tensor(CUDNN_ATTR_OPERATION_POINTWISE_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_POINTWISE_BDESC, "b", &b) ||
+              !tensor(CUDNN_ATTR_OPERATION_POINTWISE_TDESC, "t", &t) || !tensor(CUDNN_ATTR_OPERATION_POINTWISE_YDESC, "y", &op->out))
+            return false;
+          op->in = {x, b, t};
+          break;
+        case Arity::Backward:
+          if (!tensor(CUDNN_ATTR_OPERATION_POINTWISE_DYDESC, "dy", &b) || !tensor(CUDNN_ATTR_OPERATION_POINTWISE_XDESC, "x", &x) ||
+              !tensor(CUDNN_ATTR_OPERATION_POINTWISE_DXDESC, "dx", &op->out))
+            return false;
+          op->in = {b, x};
+          break;
+        default:
+          *why = "pointwise mode " + std::to_string(op->pw) + " is not supported";
+          return false;
+      }
+      for (const GTensor& g : op->in)
+        if (!broadcasts(g.l, op->out.l)) { *why = "pointwise: an input's dimensions are neither the output's nor 1"; return false; }
+      if (op->pw == CUDNN_POINTWISE_GEN_INDEX && (op->axis < 0 || op->axis >= op->out.l.rank)) {
+        *why = "pointwise GEN_INDEX: the axis is outside the tensor";
+        return false;
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR: {
+      GTensor x;
+      op->kind = Kind::Reduction;
+      if (!tensor(CUDNN_ATTR_OPERATION_REDUCTION_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_REDUCTION_YDESC, "y", &op->out))
+        return false;
+      const Desc* rd = d->desc(CUDNN_ATTR_OPERATION_REDUCTION_DESC);
+      if (!rd || rd->type != CUDNN_BACKEND_REDUCTION_DESCRIPTOR) { *why = "reduction: the reduction descriptor is missing"; return false; }
+      op->red = static_cast<cudnnReduceTensorOp_t>(rd->i64(CUDNN_ATTR_REDUCTION_OPERATOR));
+      if (op->red < CUDNN_REDUCE_TENSOR_ADD || op->red > CUDNN_REDUCE_TENSOR_MUL_NO_ZEROS) {
+        *why = "reduction operator " + std::to_string(op->red) + " is not supported";
+        return false;
+      }
+      if (!broadcasts(op->out.l, x.l)) {
+        *why = "reduction: every dimension of y must be x's or 1 (grouped reductions are not supported)";
+        return false;
+      }
+      op->in = {x};
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR: {
+      op->kind = Kind::Concat;
+      if (!tensor(CUDNN_ATTR_OPERATION_CONCAT_OUTPUT_DESC, "output", &op->out)) return false;
+      const Attr* ins = d->get(CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS);
+      if (!ins || ins->count < 1) { *why = "concatenate: no inputs"; return false; }
+      op->axis = d->i64(CUDNN_ATTR_OPERATION_CONCAT_AXIS, -1);
+      const vc::Layout& Y = op->out.l;
+      if (op->axis < 0 || op->axis >= Y.rank) { *why = "concatenate: the axis is outside the output"; return false; }
+      int64_t total = 0;
+      for (int64_t i = 0; i < ins->count; ++i) {
+        GTensor t;
+        if (!tensor_of(d->desc(CUDNN_ATTR_OPERATION_CONCAT_INPUT_DESCS, static_cast<size_t>(i)), &t, why)) return false;
+        bool fits = t.l.rank == Y.rank;
+        for (int k = 0; fits && k < Y.rank; ++k) fits = k == op->axis || t.l.dims[k] == Y.dims[k];
+        if (!fits) { *why = "concatenate: an input differs from the output outside the axis"; return false; }
+        total += t.l.dims[op->axis];
+        op->in.push_back(t);
+      }
+      if (total != Y.dims[op->axis]) { *why = "concatenate: the inputs' extents along the axis do not add up to the output's"; return false; }
+      // The in-place input (already where it belongs in the output) is
+      // copied over itself like the others: the same values.
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR: {
+      const bool fwd = d->type == CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR;
+      op->kind = fwd ? Kind::PoolFwd : Kind::PoolBwd;
+      const Desc* rd = d->desc(fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_DESC : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DESC);
+      if (!rd || rd->type != CUDNN_BACKEND_RESAMPLE_DESCRIPTOR) { *why = "resample: the resample descriptor is missing"; return false; }
+      op->resample = static_cast<cudnnResampleMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_MODE, CUDNN_RESAMPLE_NEAREST));
+      if (op->resample != CUDNN_RESAMPLE_MAXPOOL && op->resample != CUDNN_RESAMPLE_AVGPOOL_INCLUDE_PADDING &&
+          op->resample != CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING) {
+        *why = "resample mode " + std::to_string(op->resample) + " (nearest or bilinear interpolation) is not supported";
+        return false;
+      }
+      op->padding = static_cast<cudnnPaddingMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_ZERO_PAD));
+      op->nsp = static_cast<int>(rd->i64(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS));
+      // Integer settings only: fractional strides and windows are for interpolation.
+      auto ints = [&](cudnnBackendAttributeName_t n, int64_t* out) {
+        const Attr* a = rd->get(n);
+        if (!a || a->type != CUDNN_TYPE_INT64 || a->count != op->nsp) return false;
+        std::memcpy(out, a->bytes.data(), static_cast<size_t>(op->nsp) * sizeof(int64_t));
+        return true;
+      };
+      if (op->nsp < 1 || op->nsp > 3 || !ints(CUDNN_ATTR_RESAMPLE_WINDOW_DIMS, op->win) ||
+          !ints(CUDNN_ATTR_RESAMPLE_STRIDES, op->pstr) || !ints(CUDNN_ATTR_RESAMPLE_PRE_PADDINGS, op->pre) ||
+          !ints(CUDNN_ATTR_RESAMPLE_POST_PADDINGS, op->post)) {
+        *why = "resample: the window, strides and paddings must be integer lists of 1 to 3 (fractional ones are not supported)";
+        return false;
+      }
+      if (d->desc(fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_IDXDESC : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_IDXDESC)) {
+        *why = "resample: index tensors are not supported (backward max pooling reads x and y instead)";
+        return false;
+      }
+      op->alpha = scalar(d, fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_ALPHA : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_ALPHA, 1.0);
+      op->beta = scalar(d, fwd ? CUDNN_ATTR_OPERATION_RESAMPLE_FWD_BETA : CUDNN_ATTR_OPERATION_RESAMPLE_BWD_BETA, 0.0);
+      GTensor x, y;
+      const vc::Layout *X, *Y;
+      if (fwd) {
+        if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_FWD_XDESC, "x", &x) || !tensor(CUDNN_ATTR_OPERATION_RESAMPLE_FWD_YDESC, "y", &op->out))
+          return false;
+        op->in = {x};
+        X = &op->in[0].l, Y = &op->out.l;
+      } else {
+        GTensor dy;
+        if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DYDESC, "dy", &dy) ||
+            !tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_DXDESC, "dx", &op->out))
+          return false;
+        op->in = {dy};
+        // x (which max pooling's gradient reads) and y may be given; both
+        // must be for an NCHW tensor on the hardware.
+        if (d->desc(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC)) {
+          if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_XDESC, "x", &x)) return false;
+          op->in.push_back(x);
+        } else if (op->resample == CUDNN_RESAMPLE_MAXPOOL) {
+          *why = "resample backward: max pooling's gradient needs x";
+          return false;
+        }
+        if (d->desc(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC)) {
+          if (!tensor(CUDNN_ATTR_OPERATION_RESAMPLE_BWD_YDESC, "y", &y)) return false;
+          op->in.push_back(y);
+        }
+        X = &op->out.l, Y = &op->in[0].l;
+      }
+      if (X->rank != op->nsp + 2 || Y->rank != X->rank || X->dims[0] != Y->dims[0] || X->dims[1] != Y->dims[1]) {
+        *why = "resample: x and y do not have the window's rank, batch and channels";
+        return false;
+      }
+      for (int i = 0; i < op->nsp; ++i)
+        if (op->win[i] < 1 || op->pstr[i] < 1 || op->pre[i] < 0 || op->post[i] < 0 ||
+            Y->dims[2 + i] != 1 + (X->dims[2 + i] + op->pre[i] + op->post[i] - op->win[i]) / op->pstr[i]) {
+          *why = "resample: y's extent in spatial dimension " + std::to_string(i) + " is not what the window gives";
+          return false;
+        }
+      if (!fwd && op->in.size() > 1 && !op->in[1].l.same_dims(*X)) {
+        *why = "resample backward: x's shape is not dx's";
+        return false;
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR: {
+      const bool fwd = d->type == CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR;
+      op->kind = fwd ? Kind::NormFwd : Kind::NormBwd;
+      op->norm = static_cast<cudnnBackendNormMode_t>(d->i64(fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_MODE : CUDNN_ATTR_OPERATION_NORM_BWD_MODE));
+      op->training = fwd && d->i64(CUDNN_ATTR_OPERATION_NORM_FWD_PHASE) == CUDNN_NORM_FWD_TRAINING;
+      const char* mode = op->norm == CUDNN_LAYER_NORM ? "layer" : op->norm == CUDNN_INSTANCE_NORM ? "instance"
+                       : op->norm == CUDNN_BATCH_NORM ? "batch" : op->norm == CUDNN_RMS_NORM ? "RMS" : nullptr;
+      if (!mode) { *why = "normalization mode " + std::to_string(op->norm) + " (group norm) is not supported"; return false; }
+      if (fwd && op->norm == CUDNN_BATCH_NORM && !op->training) {
+        *why = "batch normalization's inference phase is not supported (nor is it by cuDNN's graph API)";
+        return false;
+      }
+      if (d->get(fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS : CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS)) {
+        *why = "multi-GPU normalization (peer statistics) is not supported";
+        return false;
+      }
+      // Each role's tensor, if set: inputs go to in, outputs to out (the
+      // first, y or dx) and then more.
+      bool have_out = false;
+      auto take = [&](cudnnBackendAttributeName_t n, int r, bool required, bool output) {
+        if (!d->desc(n)) {
+          if (required) *why = std::string(op_name(d->type)) + ": a required tensor is missing";
+          return !required;
+        }
+        GTensor t;
+        if (!tensor(n, "a tensor", &t)) return false;
+        if (output) {
+          if (!have_out) {
+            op->out = t;
+            op->role[r] = 0;
+            have_out = true;
+          } else {
+            op->more.push_back(t);
+            op->role[r] = static_cast<int>(op->more.size());
+          }
+        } else {
+          op->in.push_back(t);
+          op->role[r] = static_cast<int>(op->in.size() - 1);
+        }
+        return true;
+      };
+      const bool rms = op->norm == CUDNN_RMS_NORM;
+      bool ok;
+      if (fwd) {
+        ok = take(CUDNN_ATTR_OPERATION_NORM_FWD_YDESC, kY, true, true) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_XDESC, kX, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC, kScale, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC, kBias, !rms, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_FWD_EPSILON_DESC, kEps, true, false);
+        if (ok && op->training)
+          ok = take(CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC, kMeanOut, false, true) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC, kInvOut, false, true) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_EXP_AVG_FACTOR_DESC, kFactor, false, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_MEAN_DESC, kRunMeanIn, false, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INPUT_RUNNING_VAR_DESC, kRunVarIn, false, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_MEAN_DESC, kRunMeanOut, false, true) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_OUTPUT_RUNNING_VAR_DESC, kRunVarOut, false, true);
+        else if (ok)
+          ok = take(CUDNN_ATTR_OPERATION_NORM_FWD_MEAN_DESC, kMean, !rms, false) &&
+               take(CUDNN_ATTR_OPERATION_NORM_FWD_INV_VARIANCE_DESC, kInv, true, false);
+        if (ok && op->role[kRunMeanOut] >= 0 && (op->role[kRunMeanIn] < 0 || op->role[kFactor] < 0 || op->role[kRunVarOut] < 0 || op->role[kRunVarIn] < 0)) {
+          *why = "normalization forward: running statistics need both inputs, both outputs and the factor";
+          return false;
+        }
+      } else {
+        ok = take(CUDNN_ATTR_OPERATION_NORM_BWD_DXDESC, kDx, true, true) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_XDESC, kX, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_DYDESC, kDy, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC, kScale, true, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC, kMean, false, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC, kInv, false, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_EPSILON_DESC, kEps, false, false) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC, kDscale, false, true) &&
+             take(CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC, kDbias, false, true);
+        if (ok && (op->role[kInv] < 0 || (!rms && op->role[kMean] < 0))) {
+          *why = "normalization backward: only the form with the saved mean and inverse variance is supported";
+          return false;
+        }
+      }
+      if (!ok) return false;
+      // Shapes: y (dx) is x's; scale, bias and the statistics broadcast onto x.
+      const vc::Layout& X = op->in[op->role[kX]].l;
+      if (!op->out.l.same_dims(X)) { *why = std::string(mode) + " normalization: the output's shape is not x's"; return false; }
+      for (int r : {kScale, kBias, kMean, kInv, kRunMeanIn, kRunVarIn, kDy})
+        if (op->role[r] >= 0 && !broadcasts(op->in[op->role[r]].l, X)) {
+          *why = std::string(mode) + " normalization: a parameter or statistic does not broadcast onto x";
+          return false;
+        }
+      for (const GTensor& t : op->more)
+        if (!broadcasts(t.l, X)) { *why = std::string(mode) + " normalization: an output does not broadcast onto x"; return false; }
+      if (op->role[kEps] >= 0 && op->in[op->role[kEps]].l.count() != 1) {
+        *why = std::string(mode) + " normalization: epsilon is not a scalar";
+        return false;
+      }
+      return true;
+    }
+    default: {
+      const char* n = op_name(d->type);
+      *why = n ? std::string("the ") + n + " operation is not implemented"
+               : "operation descriptor type " + std::to_string(d->type) + " is not implemented";
+      return false;
+    }
+  }
+}
+
+// A graph's operations in an order that runs: each after the ones whose
+// outputs it reads. Every tensor no operation writes must be one the variant
+// pack supplies (not virtual).
+bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
+  const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
+  if (!ops || ops->count < 1) { *why = "the graph has no operations"; return false; }
+  std::vector<Op> all(static_cast<size_t>(ops->count));
+  std::map<int64_t, size_t> producer;
+  for (size_t i = 0; i < all.size(); ++i) {
+    const Desc* d = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, i);
+    if (!d || !op_of(d, &all[i], why)) return false;
+    std::vector<int64_t> outs{all[i].out.uid};
+    for (const GTensor& t : all[i].more) outs.push_back(t.uid);
+    for (int64_t uid : outs)
+      if (!producer.emplace(uid, i).second) {
+        *why = "tensor " + std::to_string(uid) + " is written by two operations";
+        return false;
+      }
+  }
+  for (const Op& o : all)
+    for (const GTensor& t : o.in)
+      if (t.is_virtual && !producer.count(t.uid)) {
+        *why = "virtual tensor " + std::to_string(t.uid) + " is read but no operation writes it";
+        return false;
+      }
+  std::vector<bool> done(all.size(), false);
+  std::set<int64_t> ready;
+  order->clear();
+  while (order->size() < all.size()) {
+    bool progress = false;
+    for (size_t i = 0; i < all.size(); ++i) {
+      if (done[i]) continue;
+      bool ok = true;
+      for (const GTensor& t : all[i].in) ok &= !producer.count(t.uid) || ready.count(t.uid);
+      if (!ok) continue;
+      done[i] = true, progress = true;
+      ready.insert(all[i].out.uid);
+      for (const GTensor& t : all[i].more) ready.insert(t.uid);
+      order->push_back(all[i]);
+    }
+    if (!progress) { *why = "the graph's operations depend on each other in a cycle"; return false; }
+  }
+  return true;
 }
 
 // Whether this library can run a graph, and if not, why.
 bool runnable(const Desc* graph, std::string* why) {
-  const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
-  if (!ops || ops->count != 1) {
-    *why = "only a graph of one convolution is supported (this one has " +
-           std::to_string(ops ? ops->count : 0) + " operations)";
-    return false;
-  }
-  const Desc* op = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, 0);
-  ConvOp c;
-  if (!op || !conv_op_of(op, &c)) {
-    *why = "only convolution forward, backward-data and backward-filter operations are supported";
-    return false;
-  }
-  Tensor x, w, y;
-  Conv cv;
-  Geometry g;
-  const bool tx = tensor_of(c.x, &x), tw = tensor_of(c.w, &w), ty = tensor_of(c.y, &y), tc = conv_of(c.conv, &cv);
-  if (!tx || !tw || !ty || !tc) {
-    *why = std::string("the convolution's ") + (!tx ? "x " : "") + (!tw ? "w " : "") + (!ty ? "y " : "") +
-           (!tc ? "settings " : "") + "are incomplete";
-    if (!tc && c.conv)
-      *why += " (spatial " + std::to_string(cv.spatial) + ", pads " + std::to_string(cv.pad.size()) + ", strides " +
-              std::to_string(cv.stride.size()) + ", dilations " + std::to_string(cv.dilation.size()) + ", type " +
-              std::to_string(c.conv->type) + ")";
-    return false;
-  }
-  for (const Tensor* t : {&x, &w, &y})
-    if (!supported_type(t->type)) { *why = "tensor data type " + std::to_string(t->type) + " is not supported"; return false; }
-  return geometry(x, w, y, cv, &g, why);
+  std::vector<Op> order;
+  return schedule(graph, &order, why);
 }
 
-cudnnStatus_t execute_conv(cudnnHandle_t handle, const Desc* op, const std::map<int64_t, void*>& ptrs) {
-  ConvOp c;
-  conv_op_of(op, &c);
-  Host x, w, y;
-  Conv cv;
-  tensor_of(c.x, &x.t), tensor_of(c.w, &w.t), tensor_of(c.y, &y.t), conv_of(c.conv, &cv);
-  for (Host* h : {&x, &w, &y}) {
-    auto it = ptrs.find(h->t.uid);
-    if (it == ptrs.end() || !it->second) return refuse("cudnnBackendExecute", "no data pointer for tensor " + std::to_string(h->t.uid));
-    h->dev = it->second;
+/* ---- running one operation ---- */
+
+double erf_gelu(double x) { return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0))); }
+double tanh_gelu_inner(double x) { return std::sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x); }
+double sigm(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+double pointwise(const Op& op, double x, double b, double t, int64_t index) {
+  switch (op.pw) {
+    case CUDNN_POINTWISE_ADD: return x + b;
+    case CUDNN_POINTWISE_ADD_SQUARE: return x + b * b;
+    case CUDNN_POINTWISE_DIV: return x / b;
+    case CUDNN_POINTWISE_MAX: return std::max(x, b);
+    case CUDNN_POINTWISE_MIN: return std::min(x, b);
+    case CUDNN_POINTWISE_MOD: return std::fmod(x, b);
+    case CUDNN_POINTWISE_MUL: return x * b;
+    case CUDNN_POINTWISE_POW: return std::pow(x, b);
+    case CUDNN_POINTWISE_SUB: return x - b;
+    case CUDNN_POINTWISE_ATAN2: return std::atan2(x, b);
+    case CUDNN_POINTWISE_ABS: return std::fabs(x);
+    case CUDNN_POINTWISE_CEIL: return std::ceil(x);
+    case CUDNN_POINTWISE_COS: return std::cos(x);
+    case CUDNN_POINTWISE_EXP: return std::exp(x);
+    case CUDNN_POINTWISE_FLOOR: return std::floor(x);
+    case CUDNN_POINTWISE_LOG: return std::log(x);
+    case CUDNN_POINTWISE_NEG: return -x;
+    case CUDNN_POINTWISE_RSQRT: return 1.0 / std::sqrt(x);
+    case CUDNN_POINTWISE_SIN: return std::sin(x);
+    case CUDNN_POINTWISE_SQRT: return std::sqrt(x);
+    case CUDNN_POINTWISE_TAN: return std::tan(x);
+    case CUDNN_POINTWISE_ERF: return std::erf(x);
+    case CUDNN_POINTWISE_IDENTITY: return x;
+    case CUDNN_POINTWISE_RECIPROCAL: return 1.0 / x;
+    case CUDNN_POINTWISE_CMP_EQ: return x == b;
+    case CUDNN_POINTWISE_CMP_NEQ: return x != b;
+    case CUDNN_POINTWISE_CMP_GT: return x > b;
+    case CUDNN_POINTWISE_CMP_GE: return x >= b;
+    case CUDNN_POINTWISE_CMP_LT: return x < b;
+    case CUDNN_POINTWISE_CMP_LE: return x <= b;
+    case CUDNN_POINTWISE_LOGICAL_AND: return x != 0.0 && b != 0.0;
+    case CUDNN_POINTWISE_LOGICAL_OR: return x != 0.0 || b != 0.0;
+    case CUDNN_POINTWISE_LOGICAL_NOT: return x == 0.0;
+    case CUDNN_POINTWISE_GEN_INDEX: return static_cast<double>(index);
+    case CUDNN_POINTWISE_BINARY_SELECT: return t != 0.0 ? x : b;
+    case CUDNN_POINTWISE_RELU_FWD:
+      // Below the lower clip: lower + slope * (x - lower); above the upper: upper.
+      if (x < op.lower) return op.lower + op.slope * (x - op.lower);
+      if (op.has_upper && x > op.upper) return op.upper;
+      return x;
+    case CUDNN_POINTWISE_TANH_FWD: return std::tanh(x);
+    case CUDNN_POINTWISE_SIGMOID_FWD: return sigm(x);
+    case CUDNN_POINTWISE_ELU_FWD: return x > 0.0 ? x : op.elu_alpha * (std::exp(x) - 1.0);
+    case CUDNN_POINTWISE_GELU_FWD: return erf_gelu(x);
+    case CUDNN_POINTWISE_SOFTPLUS_FWD: return std::log1p(std::exp(op.softplus_beta * x)) / op.softplus_beta;
+    case CUDNN_POINTWISE_SWISH_FWD: return x * sigm(op.swish_beta * x);
+    case CUDNN_POINTWISE_GELU_APPROX_TANH_FWD: return 0.5 * x * (1.0 + std::tanh(tanh_gelu_inner(x)));
+    // The backward modes: b is dy, x the forward pass's input.
+    case CUDNN_POINTWISE_RELU_BWD:
+      if (x <= op.lower) return b * op.slope;
+      if (op.has_upper && x >= op.upper) return 0.0;
+      return b;
+    case CUDNN_POINTWISE_TANH_BWD: { const double th = std::tanh(x); return b * (1.0 - th * th); }
+    case CUDNN_POINTWISE_SIGMOID_BWD: { const double s = sigm(x); return b * s * (1.0 - s); }
+    case CUDNN_POINTWISE_ELU_BWD: return x > 0.0 ? b : b * op.elu_alpha * std::exp(x);
+    case CUDNN_POINTWISE_GELU_BWD: {
+      const double cdf = 0.5 * (1.0 + std::erf(x / std::sqrt(2.0)));
+      const double pdf = std::exp(-0.5 * x * x) / std::sqrt(2.0 * M_PI);
+      return b * (cdf + x * pdf);
+    }
+    case CUDNN_POINTWISE_SOFTPLUS_BWD: return b * sigm(op.softplus_beta * x);
+    case CUDNN_POINTWISE_SWISH_BWD: {
+      const double s = sigm(op.swish_beta * x);
+      return b * (s + op.swish_beta * x * s * (1.0 - s));
+    }
+    case CUDNN_POINTWISE_GELU_APPROX_TANH_BWD: {
+      const double u = tanh_gelu_inner(x), th = std::tanh(u);
+      const double du = std::sqrt(2.0 / M_PI) * (1.0 + 3.0 * 0.044715 * x * x);
+      return b * (0.5 * (1.0 + th) + 0.5 * x * (1.0 - th * th) * du);
+    }
+    default: return 0.0;
   }
-  Geometry g;
-  std::string why;
-  if (!geometry(x.t, w.t, y.t, cv, &g, &why)) return refuse("cudnnBackendExecute", why);
+}
+
+// For each element of c (logical order), the logical index of a's element
+// broadcast onto it.
+std::vector<size_t> broadcast_index(const vc::Layout& a, const vc::Layout& c) {
+  std::vector<size_t> idx(c.count());
+  int64_t at[vc::kMaxRank] = {};
+  for (size_t i = 0; i < idx.size(); ++i) {
+    size_t j = 0;
+    for (int d = 0; d < c.rank; ++d) j = j * a.dims[d] + (a.dims[d] == 1 ? 0 : at[d]);
+    idx[i] = j;
+    for (int d = c.rank; d-- > 0;) {
+      if (++at[d] < c.dims[d]) break;
+      at[d] = 0;
+    }
+  }
+  return idx;
+}
+
+void run_matmul(const Op& op, const std::vector<double>& a, const std::vector<double>& b, std::vector<double>* c) {
+  const vc::Layout &A = op.in[0].l, &B = op.in[1].l, &C = op.out.l;
+  const int r = C.rank;
+  const int64_t M = C.dims[r - 2], N = C.dims[r - 1], K = A.dims[r - 1];
+  // The batch: C's leading dimensions, with a's and b's broadcast onto them.
+  vc::Layout cb, ab, bb;
+  cb.rank = ab.rank = bb.rank = r - 2;
+  for (int i = 0; i < r - 2; ++i) cb.dims[i] = C.dims[i], ab.dims[i] = A.dims[i], bb.dims[i] = B.dims[i];
+  const size_t batches = r > 2 ? cb.count() : 1;
+  const std::vector<size_t> ai = r > 2 ? broadcast_index(ab, cb) : std::vector<size_t>{0};
+  const std::vector<size_t> bi = r > 2 ? broadcast_index(bb, cb) : std::vector<size_t>{0};
+  c->assign(batches * M * N, 0.0);
+  for (size_t q = 0; q < batches; ++q) {
+    const double* pa = a.data() + ai[q] * M * K;
+    const double* pb = b.data() + bi[q] * K * N;
+    double* pc = c->data() + q * M * N;
+    for (int64_t i = 0; i < M; ++i)
+      for (int64_t j = 0; j < N; ++j) {
+        double s = 0.0;
+        for (int64_t k = 0; k < K; ++k) {
+          if (op.acc == vc::Accum::Half)
+            s = vc::half_to_float(vc::float_to_half(static_cast<float>(s) + static_cast<float>(pa[i * K + k]) * static_cast<float>(pb[k * N + j])));
+          else
+            s += pa[i * K + k] * pb[k * N + j];
+        }
+        pc[i * N + j] = s;
+      }
+  }
+}
+
+void run_reduction(const Op& op, const std::vector<double>& x, std::vector<double>* y) {
+  const vc::Layout &X = op.in[0].l, &Y = op.out.l;
+  const size_t ny = Y.count();
+  std::vector<double> acc(ny, 0.0);
+  std::vector<int64_t> cnt(ny, 0);
+  int64_t at[vc::kMaxRank] = {};
+  for (size_t i = 0; i < x.size(); ++i) {
+    size_t o = 0;
+    for (int d = 0; d < X.rank; ++d) o = o * Y.dims[d] + (Y.dims[d] == 1 ? 0 : at[d]);
+    const double v = x[i];
+    const int64_t k = cnt[o]++;
+    double& a = acc[o];
+    switch (op.red) {
+      case CUDNN_REDUCE_TENSOR_ADD: case CUDNN_REDUCE_TENSOR_AVG: a = k ? a + v : v; break;
+      case CUDNN_REDUCE_TENSOR_MUL: a = k ? a * v : v; break;
+      case CUDNN_REDUCE_TENSOR_MUL_NO_ZEROS: if (v != 0.0) a = (k && a != 0.0) ? a * v : (k ? a : v); else if (!k) a = 0.0; break;
+      case CUDNN_REDUCE_TENSOR_MIN: a = k ? std::min(a, v) : v; break;
+      case CUDNN_REDUCE_TENSOR_MAX: a = k ? std::max(a, v) : v; break;
+      case CUDNN_REDUCE_TENSOR_AMAX: a = k ? std::max(a, std::fabs(v)) : std::fabs(v); break;
+      case CUDNN_REDUCE_TENSOR_NORM1: a += std::fabs(v); break;
+      case CUDNN_REDUCE_TENSOR_NORM2: a += v * v; break;
+    }
+    for (int d = X.rank; d-- > 0;) {
+      if (++at[d] < X.dims[d]) break;
+      at[d] = 0;
+    }
+  }
+  for (size_t o = 0; o < ny; ++o) {
+    if (op.red == CUDNN_REDUCE_TENSOR_AVG && cnt[o]) acc[o] /= static_cast<double>(cnt[o]);
+    if (op.red == CUDNN_REDUCE_TENSOR_NORM2) acc[o] = std::sqrt(acc[o]);
+  }
+  *y = std::move(acc);
+}
+
+// Layer, instance, batch and RMS normalization: statistics over the
+// dimensions where the statistics tensor has extent 1 (by default those the
+// mode names: all but N; all but N and C; all but C; all but N), then
+// y = scale * (x - mean) * inv + bias, with inv = 1 / sqrt(var + eps) and,
+// for RMS, no mean. The backward pass, from the saved statistics:
+//   dx = inv * (g - mean(g) - xhat * mean(g * xhat)),  g = dy * scale
+// (no mean(g) term for RMS), and dscale, dbias summed over the dimensions
+// where they have extent 1. outs[0] is op.out; outs[k] is op.more[k - 1].
+void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs) {
+  const vc::Layout& X = op.in[op.role[kX]].l;
+  const std::vector<double>& x = *in[op.role[kX]];
+  const size_t n = x.size();
+  auto input = [&](int r) -> const std::vector<double>* { return op.role[r] >= 0 ? in[op.role[r]] : nullptr; };
+  auto layout_in = [&](int r) -> const vc::Layout* { return op.role[r] >= 0 ? &op.in[op.role[r]].l : nullptr; };
+  auto layout_out = [&](int r) -> const vc::Layout* {
+    return op.role[r] < 0 ? nullptr : op.role[r] == 0 ? &op.out.l : &op.more[op.role[r] - 1].l;
+  };
+  // The statistics' shape.
+  vc::Layout st;
+  const vc::Layout* given = nullptr;
+  for (const vc::Layout* l : {layout_out(kMeanOut), layout_out(kInvOut), layout_in(kMean), layout_in(kInv)})
+    if (l && !given) given = l;
+  if (given) {
+    st = *given;
+  } else {
+    st.rank = X.rank;
+    for (int i = 0; i < X.rank; ++i) {
+      const bool keep = op.norm == CUDNN_BATCH_NORM ? i == 1 : op.norm == CUDNN_INSTANCE_NORM ? i <= 1 : i == 0;
+      st.dims[i] = keep ? X.dims[i] : 1;
+    }
+  }
+  const std::vector<size_t> si = broadcast_index(st, X);
+  const size_t ns = st.count();
+  std::vector<double> cnt(ns, 0.0);
+  for (size_t i = 0; i < n; ++i) cnt[si[i]] += 1;
+  const bool rms = op.norm == CUDNN_RMS_NORM;
+  const double eps = input(kEps) ? (*input(kEps))[0] : 0.0;
+  auto bcast = [&](int r, double dflt) {  // a parameter, per element of x
+    std::vector<double> v(n, dflt);
+    if (op.role[r] < 0) return v;
+    const std::vector<size_t> bi = broadcast_index(op.in[op.role[r]].l, X);
+    for (size_t i = 0; i < n; ++i) v[i] = (*in[op.role[r]])[bi[i]];
+    return v;
+  };
+  std::vector<double> mean(ns, 0.0), inv(ns, 0.0), var(ns, 0.0);
+  if (op.kind == Kind::NormFwd && op.training) {
+    for (size_t i = 0; i < n; ++i) mean[si[i]] += rms ? 0.0 : x[i];
+    for (size_t k = 0; k < ns; ++k) mean[k] /= cnt[k];
+    for (size_t i = 0; i < n; ++i) { const double c = x[i] - mean[si[i]]; var[si[i]] += c * c; }
+    for (size_t k = 0; k < ns; ++k) var[k] /= cnt[k], inv[k] = 1.0 / std::sqrt(var[k] + eps);
+  } else {
+    // From the given statistics, read in st's own order.
+    const std::vector<size_t> mi = input(kMean) ? broadcast_index(*layout_in(kMean), st) : std::vector<size_t>{};
+    const std::vector<size_t> ii = broadcast_index(*layout_in(kInv), st);
+    for (size_t k = 0; k < ns; ++k) {
+      mean[k] = input(kMean) && !rms ? (*input(kMean))[mi[k]] : 0.0;
+      inv[k] = (*input(kInv))[ii[k]];
+    }
+  }
+  const std::vector<double> scale = bcast(kScale, 1.0);
+  outs->assign(1 + op.more.size(), {});
+  auto put = [&](int r, std::vector<double> v) { if (op.role[r] >= 0) (*outs)[op.role[r]] = std::move(v); };
+  // Statistics in an output tensor's own shape (it is st's, or broadcast-equal).
+  auto stats_out = [&](int r, const std::vector<double>& v) {
+    const vc::Layout* l = layout_out(r);
+    if (!l) return;
+    const std::vector<size_t> bi = broadcast_index(st, *l);
+    std::vector<double> o(l->count());
+    for (size_t k = 0; k < o.size(); ++k) o[k] = v[bi[k]];
+    put(r, std::move(o));
+  };
+  if (op.kind == Kind::NormFwd) {
+    const std::vector<double> bias = bcast(kBias, 0.0);
+    std::vector<double> y(n);
+    for (size_t i = 0; i < n; ++i) y[i] = scale[i] * (x[i] - mean[si[i]]) * inv[si[i]] + bias[i];
+    put(kY, std::move(y));
+    if (op.training) {
+      stats_out(kMeanOut, mean);
+      stats_out(kInvOut, inv);
+      if (op.role[kRunMeanOut] >= 0) {
+        // Running variance tracks the unbiased estimate.
+        const double f = (*input(kFactor))[0];
+        const std::vector<size_t> rmi = broadcast_index(*layout_in(kRunMeanIn), st);
+        const std::vector<size_t> rvi = broadcast_index(*layout_in(kRunVarIn), st);
+        std::vector<double> rm(ns), rv(ns);
+        for (size_t k = 0; k < ns; ++k) {
+          const double unbiased = cnt[k] > 1 ? var[k] * cnt[k] / (cnt[k] - 1) : var[k];
+          rm[k] = (1.0 - f) * (*input(kRunMeanIn))[rmi[k]] + f * mean[k];
+          rv[k] = (1.0 - f) * (*input(kRunVarIn))[rvi[k]] + f * unbiased;
+        }
+        stats_out(kRunMeanOut, rm);
+        stats_out(kRunVarOut, rv);
+      }
+    }
+    return;
+  }
+  // Backward.
+  const std::vector<double> dy = bcast(kDy, 0.0);
+  std::vector<double> xhat(n), g(n), mg(ns, 0.0), mgx(ns, 0.0);
+  for (size_t i = 0; i < n; ++i) {
+    xhat[i] = (x[i] - mean[si[i]]) * inv[si[i]];
+    g[i] = dy[i] * scale[i];
+    mg[si[i]] += g[i];
+    mgx[si[i]] += g[i] * xhat[i];
+  }
+  std::vector<double> dx(n);
+  for (size_t i = 0; i < n; ++i) {
+    const size_t k = si[i];
+    dx[i] = inv[k] * (g[i] - (rms ? 0.0 : mg[k] / cnt[k]) - xhat[i] * mgx[k] / cnt[k]);
+  }
+  put(kDx, std::move(dx));
+  for (int r : {kDscale, kDbias}) {
+    const vc::Layout* l = layout_out(r);
+    if (!l) continue;
+    const std::vector<size_t> bi = broadcast_index(*l, X);
+    std::vector<double> o(l->count(), 0.0);
+    for (size_t i = 0; i < n; ++i) o[bi[i]] += r == kDscale ? dy[i] * xhat[i] : dy[i];
+    put(r, std::move(o));
+  }
+}
+
+// Pooling as the graph API's resampling: per (n, c), each output's window
+// over the input, the padding read as zero, minus infinity or the nearest
+// edge value as the padding mode says. Average pooling includes padded taps
+// in its divisor or not as its mode says; the maximum's gradient goes to the
+// first largest tap, recomputed from x.
+void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* r) {
+  const bool fwd = op.kind == Kind::PoolFwd;
+  const vc::Layout& X = fwd ? op.in[0].l : op.out.l;
+  const vc::Layout& Y = fwd ? op.out.l : op.in[0].l;
+  int64_t I[3] = {1, 1, 1}, O[3] = {1, 1, 1}, Wn[3] = {1, 1, 1}, P[3] = {0, 0, 0}, S[3] = {1, 1, 1};
+  for (int i = 0; i < op.nsp; ++i) {
+    const int k = 3 - op.nsp + i;
+    I[k] = X.dims[2 + i], O[k] = Y.dims[2 + i], Wn[k] = op.win[i], P[k] = op.pre[i], S[k] = op.pstr[i];
+  }
+  const int64_t NC = X.dims[0] * X.dims[1], isz = I[0] * I[1] * I[2], osz = O[0] * O[1] * O[2];
+  const bool is_max = op.resample == CUDNN_RESAMPLE_MAXPOOL;
+  const std::vector<double>* xin = fwd ? in[0] : (is_max ? in[1] : nullptr);
+  r->assign(static_cast<size_t>(fwd ? NC * osz : NC * isz), 0.0);
+  for (int64_t nc = 0; nc < NC; ++nc)
+    for (int64_t o = 0; o < osz; ++o) {
+      const int64_t o0 = o / (O[1] * O[2]), o1 = (o / O[2]) % O[1], o2 = o % O[2];
+      double best = -INFINITY, sum = 0.0;
+      int64_t arg = -1, valid = 0, taps = 0;
+      for (int64_t a = 0; a < Wn[0]; ++a)
+        for (int64_t b = 0; b < Wn[1]; ++b)
+          for (int64_t c = 0; c < Wn[2]; ++c) {
+            int64_t p[3] = {o0 * S[0] - P[0] + a, o1 * S[1] - P[1] + b, o2 * S[2] - P[2] + c};
+            ++taps;
+            bool inside = true;
+            for (int d = 0; d < 3; ++d) inside &= p[d] >= 0 && p[d] < I[d];
+            if (!inside && op.padding == CUDNN_EDGE_VAL_PAD) {
+              for (int d = 0; d < 3; ++d) p[d] = std::min(std::max<int64_t>(p[d], 0), I[d] - 1);
+              inside = true;
+            }
+            double v;
+            int64_t at = -1;
+            if (inside) {
+              at = (p[0] * I[1] + p[1]) * I[2] + p[2];
+              v = xin ? (*xin)[static_cast<size_t>(nc * isz + at)] : 0.0;
+              ++valid;
+            } else {
+              if (op.padding == CUDNN_NEG_INF_PAD) continue;
+              v = 0.0;  // zero padding
+            }
+            if (is_max && (arg == -1 || v > best)) best = v, arg = at;
+            sum += v;
+          }
+      const double div = op.resample == CUDNN_RESAMPLE_AVGPOOL_EXCLUDE_PADDING ? static_cast<double>(valid)
+                                                                              : static_cast<double>(taps);
+      if (fwd) {
+        (*r)[static_cast<size_t>(nc * osz + o)] = is_max ? best : (div ? sum / div : 0.0);
+        continue;
+      }
+      const double g = (*in[0])[static_cast<size_t>(nc * osz + o)];
+      if (is_max) {
+        if (arg >= 0) (*r)[static_cast<size_t>(nc * isz + arg)] += g;  // a padded maximum takes it nowhere
+        continue;
+      }
+      for (int64_t a = 0; a < Wn[0]; ++a)
+        for (int64_t b = 0; b < Wn[1]; ++b)
+          for (int64_t c = 0; c < Wn[2]; ++c) {
+            int64_t p[3] = {o0 * S[0] - P[0] + a, o1 * S[1] - P[1] + b, o2 * S[2] - P[2] + c};
+            bool inside = true;
+            for (int d = 0; d < 3; ++d) inside &= p[d] >= 0 && p[d] < I[d];
+            if (!inside && op.padding == CUDNN_EDGE_VAL_PAD) {
+              for (int d = 0; d < 3; ++d) p[d] = std::min(std::max<int64_t>(p[d], 0), I[d] - 1);
+              inside = true;
+            }
+            if (inside && div) (*r)[static_cast<size_t>(nc * isz + (p[0] * I[1] + p[1]) * I[2] + p[2])] += g / div;
+          }
+    }
+}
+
+// Concatenation: each input's elements at their offset along the axis.
+void run_concat(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* r) {
+  const vc::Layout& Y = op.out.l;
+  const int ax = static_cast<int>(op.axis);
+  int64_t outer = 1, inner = 1;
+  for (int k = 0; k < ax; ++k) outer *= Y.dims[k];
+  for (int k = ax + 1; k < Y.rank; ++k) inner *= Y.dims[k];
+  r->assign(Y.count(), 0.0);
+  int64_t at = 0;
+  for (size_t i = 0; i < op.in.size(); ++i) {
+    const int64_t e = op.in[i].l.dims[ax];
+    for (int64_t o = 0; o < outer; ++o)
+      for (int64_t j = 0; j < e * inner; ++j)
+        (*r)[static_cast<size_t>((o * Y.dims[ax] + at) * inner + j)] = (*in[i])[static_cast<size_t>(o * e * inner + j)];
+    at += e;
+  }
+}
+
+// Runs a scheduled graph: inputs from the variant pack (device memory, or
+// host memory for a by-value scalar), intermediates on the host rounded to
+// their declared types, outputs written back.
+cudnnStatus_t execute_graph(cudnnHandle_t handle, const std::vector<Op>& order, const std::map<int64_t, void*>& ptrs) {
+  static const char* fn = "cudnnBackendExecute";
+  std::map<int64_t, std::vector<double>> values;
+  std::set<int64_t> consumed;  // tensors some operation reads
+  for (const Op& op : order)
+    for (const GTensor& t : op.in) consumed.insert(t.uid);
   // The work the program queued before this call comes first.
-  cudaStream_t stream = nullptr;
-  cudnnGetStream(handle, &stream);
-  cudaStreamSynchronize(stream);
-  Host* out = c.dir == Dir::Forward ? &y : c.dir == Dir::Data ? &x : &w;
-  Host* in1 = c.dir == Dir::Forward ? &x : &y;
-  Host* in2 = c.dir == Dir::Filter ? &x : &w;
-  if (!fetch(in1, true) || !fetch(in2, true) || !fetch(out, c.beta != 0.0)) return CUDNN_STATUS_EXECUTION_FAILED;
-  std::vector<double> acc(out->v.size(), 0.0);
-  convolve(g, c.dir, in1->v, in2->v, acc);
-  for (size_t i = 0; i < acc.size(); ++i)
-    out->v[i] = static_cast<float>(c.alpha * acc[i] + (c.beta != 0.0 ? c.beta * out->v[i] : 0.0));
-  return flush(out) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
+  vc::sync_handle(handle);
+  auto input = [&](const GTensor& t, const std::vector<double>** out) -> cudnnStatus_t {
+    auto it = values.find(t.uid);
+    if (it == values.end()) {
+      auto p = ptrs.find(t.uid);
+      if (p == ptrs.end() || !p->second) return refuse(fn, "no data pointer for tensor " + std::to_string(t.uid));
+      std::vector<double> v;
+      if (t.by_value) {
+        v.assign(t.l.count(), vc::decode(t.l.type, static_cast<const uint8_t*>(p->second)));
+      } else if (!vc::read(t.l, p->second, &v)) {
+        return CUDNN_STATUS_EXECUTION_FAILED;
+      }
+      it = values.emplace(t.uid, std::move(v)).first;
+    }
+    *out = &it->second;
+    return CUDNN_STATUS_SUCCESS;
+  };
+  // An operation's result: kept on the host if virtual, else written out
+  // (and read back, rounded to its type, if a later operation reads it).
+  auto store = [&](const GTensor& o, std::vector<double> r, double alpha, double beta) -> cudnnStatus_t {
+    if (o.is_virtual) {
+      for (double& v : r) v = vc::round_to(o.l.type, alpha * v);
+      values[o.uid] = std::move(r);
+      return CUDNN_STATUS_SUCCESS;
+    }
+    auto p = ptrs.find(o.uid);
+    if (p == ptrs.end() || !p->second) return refuse(fn, "no data pointer for tensor " + std::to_string(o.uid));
+    if (!vc::blend_write(o.l, p->second, r, alpha, beta)) return CUDNN_STATUS_EXECUTION_FAILED;
+    if (!consumed.count(o.uid)) return CUDNN_STATUS_SUCCESS;
+    std::vector<double> back;
+    if (!vc::read(o.l, p->second, &back)) return CUDNN_STATUS_EXECUTION_FAILED;
+    values[o.uid] = std::move(back);
+    return CUDNN_STATUS_SUCCESS;
+  };
+  for (const Op& op : order) {
+    std::vector<const std::vector<double>*> in(op.in.size());
+    for (size_t i = 0; i < op.in.size(); ++i) {
+      cudnnStatus_t s = input(op.in[i], &in[i]);
+      if (s != CUDNN_STATUS_SUCCESS) return s;
+    }
+    std::vector<double> r;
+    double alpha = 1.0, beta = 0.0;
+    switch (op.kind) {
+      case Kind::ConvFwd: vc::convolve(op.geom, vc::ConvDir::Forward, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+      case Kind::ConvData: vc::convolve(op.geom, vc::ConvDir::Data, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+      case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
+      case Kind::Matmul: run_matmul(op, *in[0], *in[1], &r); break;
+      case Kind::Reduction: run_reduction(op, *in[0], &r); break;
+      case Kind::PoolFwd:
+      case Kind::PoolBwd: run_pool(op, in, &r); alpha = op.alpha, beta = op.beta; break;
+      case Kind::Concat: run_concat(op, in, &r); break;
+      case Kind::NormFwd:
+      case Kind::NormBwd: {
+        std::vector<std::vector<double>> outs;
+        run_norm(op, in, &outs);
+        // Every output after the first is stored here; the first goes the
+        // common way below.
+        for (size_t k = 0; k < op.more.size(); ++k) {
+          cudnnStatus_t s = store(op.more[k], std::move(outs[k + 1]), 1.0, 0.0);
+          if (s != CUDNN_STATUS_SUCCESS) return s;
+        }
+        r = std::move(outs[0]);
+        break;
+      }
+      case Kind::Pointwise: {
+        const vc::Layout& Y = op.out.l;
+        r.resize(Y.count());
+        std::vector<std::vector<size_t>> bi;
+        for (const GTensor& t : op.in) bi.push_back(broadcast_index(t.l, Y));
+        const bool backward = arity(op.pw) == Arity::Backward;
+        int64_t at[vc::kMaxRank] = {};
+        for (size_t i = 0; i < r.size(); ++i) {
+          // Backward modes: in = {dy, x}; the others: {x, b, t}.
+          const double x = backward ? (*in[1])[bi[1][i]] : op.alpha * (*in[0])[bi[0][i]];
+          const double b = backward ? (*in[0])[bi[0][i]] : in.size() > 1 ? op.alpha2 * (*in[1])[bi[1][i]] : 0.0;
+          const double t = in.size() > 2 ? (*in[2])[bi[2][i]] : 0.0;
+          r[i] = pointwise(op, x, b, t, op.axis >= 0 && op.axis < Y.rank ? at[op.axis] : 0);
+          for (int d = Y.rank; d-- > 0;) {
+            if (++at[d] < Y.dims[d]) break;
+            at[d] = 0;
+          }
+        }
+        break;
+      }
+    }
+    cudnnStatus_t s = store(op.out, std::move(r), alpha, beta);
+    if (s != CUDNN_STATUS_SUCCESS) return s;
+  }
+  return CUDNN_STATUS_SUCCESS;
 }
 
 // The one engine: global index 0, for the graph it was made for, owned (with
@@ -627,8 +1340,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
   std::string why;
   switch (d->type) {
     case CUDNN_BACKEND_TENSOR_DESCRIPTOR: {
-      Tensor t;
-      if (!tensor_of(d, &t) && d->i64s(CUDNN_ATTR_TENSOR_DIMENSIONS).size() != d->i64s(CUDNN_ATTR_TENSOR_STRIDES).size())
+      const size_t nd = d->i64s(CUDNN_ATTR_TENSOR_DIMENSIONS).size();
+      if (!nd || nd != d->i64s(CUDNN_ATTR_TENSOR_STRIDES).size() || !d->get(CUDNN_ATTR_TENSOR_UNIQUE_ID))
         return CUDNN_STATUS_BAD_PARAM;
       break;
     }
@@ -653,9 +1366,44 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     }
     case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR:
-    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR: {
-      ConvOp c;
-      if (!conv_op_of(d, &c)) return CUDNN_STATUS_BAD_PARAM;
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_MATMUL_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_NORM_FORWARD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_NORM_BACKWARD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_RESAMPLE_BWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_CONCAT_DESCRIPTOR: {
+      // Shapes that do not fit are the caller's error; a setting this
+      // library does not compute is refused by name.
+      Op op;
+      if (!op_of(d, &op, &why)) {
+        if (why.find("not supported") != std::string::npos || why.find("not implemented") != std::string::npos)
+          return refuse("cudnnBackendFinalize", why);
+        if (trace()) std::fprintf(stderr, "[vgpu] cudnnBackendFinalize: %s\n", why.c_str());
+        vgpu_cudnn::set_last_error("cudnnBackendFinalize: " + why);
+        return CUDNN_STATUS_BAD_PARAM;
+      }
+      break;
+    }
+    case CUDNN_BACKEND_POINTWISE_DESCRIPTOR:
+      if (!d->get(CUDNN_ATTR_POINTWISE_MODE) || !d->get(CUDNN_ATTR_POINTWISE_MATH_PREC)) return CUDNN_STATUS_BAD_PARAM;
+      if (arity(static_cast<cudnnPointwiseMode_t>(d->i64(CUDNN_ATTR_POINTWISE_MODE))) == Arity::Unknown)
+        return refuse("cudnnBackendFinalize", "pointwise mode " + std::to_string(d->i64(CUDNN_ATTR_POINTWISE_MODE)) +
+                                                  " is not supported");
+      break;
+    case CUDNN_BACKEND_MATMUL_DESCRIPTOR:
+      if (!d->get(CUDNN_ATTR_MATMUL_COMP_TYPE)) return CUDNN_STATUS_BAD_PARAM;
+      break;
+    case CUDNN_BACKEND_RESAMPLE_DESCRIPTOR:
+      if (!d->get(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS)) return CUDNN_STATUS_BAD_PARAM;
+      break;
+    case CUDNN_BACKEND_REDUCTION_DESCRIPTOR: {
+      if (!d->get(CUDNN_ATTR_REDUCTION_OPERATOR) || !d->get(CUDNN_ATTR_REDUCTION_COMP_TYPE)) return CUDNN_STATUS_BAD_PARAM;
+      const int64_t r = d->i64(CUDNN_ATTR_REDUCTION_OPERATOR);
+      if (r < CUDNN_REDUCE_TENSOR_ADD || r > CUDNN_REDUCE_TENSOR_MUL_NO_ZEROS)
+        return refuse("cudnnBackendFinalize", "reduction operator " + std::to_string(r) + " is not supported");
       break;
     }
     case CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR:
@@ -663,10 +1411,13 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR:
     case CUDNN_BACKEND_INTERMEDIATE_INFO_DESCRIPTOR:
       break;
-    default:
-      // Pointwise, matmul, norms, reductions and the rest: the graph they
-      // would join is refused anyway, but say which one arrived first.
-      return refuse("cudnnBackendFinalize", "descriptor type " + std::to_string(d->type) + " is not implemented");
+    default: {
+      // Norms, resampling, attention and the rest: the graph they would join
+      // is refused anyway, but say which one arrived first.
+      const char* n = op_name(d->type);
+      return refuse("cudnnBackendFinalize", n ? std::string("the ") + n + " operation is not implemented"
+                                              : "descriptor type " + std::to_string(d->type) + " is not implemented");
+    }
   }
   d->finalized = true;
   return CUDNN_STATUS_SUCCESS;
@@ -811,7 +1562,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackend
   const Desc* graph = eng ? eng->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH) : nullptr;
   if (!graph) return CUDNN_STATUS_BAD_PARAM;
   std::string why;
-  if (!runnable(graph, &why)) return refuse("cudnnBackendExecute", why);
+  std::vector<Op> order;
+  if (!schedule(graph, &order, &why)) return refuse("cudnnBackendExecute", why);
   // The variant pack: unique ids and the device pointers that go with them.
   const std::vector<int64_t> uids = v->i64s(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS);
   const Attr* ptr_attr = v->get(CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS);
@@ -822,5 +1574,5 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackend
     std::memcpy(&ptr, ptr_attr->bytes.data() + i * sizeof(void*), sizeof(void*));
     ptrs[uids[i]] = ptr;
   }
-  return execute_conv(handle, graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, 0), ptrs);
+  return execute_graph(handle, order, ptrs);
 }

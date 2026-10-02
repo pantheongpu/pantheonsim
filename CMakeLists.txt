@@ -610,8 +610,10 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
+    # Every entry point PyTorch binds is implemented, so cuDNN has no
+    # generated stubs (nvidia/src/generated/) any more.
     add_library(vgpucudnn SHARED nvidia/src/cudnn_api.cpp nvidia/src/cudnn_backend.cpp nvidia/src/cudnn_rnn.cpp
-      nvidia/src/generated/cudnn_stubs.cpp)
+      nvidia/src/cudnn_common.cpp)
     target_link_libraries(vgpucudnn PRIVATE vgpu vgpucudart)
     target_include_directories(vgpucudnn PRIVATE ${CUDNN_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpucudnn PROPERTIES OUTPUT_NAME cudnn SOVERSION 9 VERSION 9.0)
@@ -1252,12 +1254,12 @@ if(TARGET vgpucublas)
   # temporary storage, decoupled look-back scan and warp primitives throughout
   # -- so running them end to end exercises far more than a hand-written kernel
   # does, and the answer is checked rather than the launch's return code.
-  # cuBLAS and cuSPARSE conformance programs against output an RTX 3060 printed,
-  # so a routine that stops agreeing with the hardware fails without a GPU.
+  # cuBLAS, cuSPARSE and cuDNN conformance programs against output an RTX 3060
+  # printed, so a routine that stops agreeing with the hardware fails without a GPU.
   add_test(NAME e2e_library_goldens
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_library_goldens.sh)
   set_tests_properties(e2e_library_goldens PROPERTIES
-    DEPENDS "vgpucudart;vgpucublas;vgpucusparse"
+    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
@@ -1272,7 +1274,8 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "sparse_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+                 "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1917,7 +1920,7 @@ if(TARGET vgpucudart)
   # cuRAND, cuSOLVER, cuSPARSE -- each SDPA backend, autocast, and the
   # jiterator's NVRTC kernels.
   add_test(NAME e2e_pytorch_ops_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
-           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 64 nvidia/rtx5090)
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 69 nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"

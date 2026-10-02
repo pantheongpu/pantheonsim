@@ -1,8 +1,9 @@
 """PyTorch's CUDA build, unmodified, on a simulated NVIDIA GPU: one operator
 at a time, each on the simulated GPU and on the CPU from the same inputs --
 PyTorch's own kernels and the libraries it ships (cuBLAS, cuBLASLt, cuDNN,
-cuFFT, cuRAND, cuSOLVER, cuSPARSE), attention through each SDPA backend, and
-autocast. One line each: "ok <name>", or "FAIL <name>: <why>".
+cuFFT, cuRAND, cuSOLVER, cuSPARSE), attention through each SDPA backend,
+cuDNN's training paths (convolution gradients, half and double LSTMs, CTC
+loss), and autocast. One line each: "ok <name>", or "FAIL <name>: <why>".
 """
 import torch
 import torch.nn.functional as F
@@ -117,6 +118,46 @@ def fp8(d):
 
 
 check('fp8 matmul (torch._scaled_mm)', fp8, 1e-3)
+
+
+# cuDNN's training paths, through PyTorch: convolution gradients (channels
+# last, groups, dilation; and double), an LSTM in half under autocast and in
+# double, and CTC loss with its gradient (PyTorch takes cuDNN's when the
+# targets are int32 on the CPU and every input is full length).
+def conv_grads(d, dtype=torch.float32, channels_last=True):
+    xg = x4.to(d, dtype).repeat(1, 2, 1, 1)
+    if channels_last:
+        xg = xg.contiguous(memory_format=torch.channels_last)
+    xg.requires_grad_()
+    wg = (torch.arange(6 * 3 * 3 * 3, dtype=torch.float32).reshape(6, 3, 3, 3).sin() / 4).to(d, dtype).requires_grad_()
+    out = F.conv2d(xg, wg, padding=2, dilation=2, groups=2)
+    (out * out.detach().flip(-1)).sum().backward()
+    return torch.cat([out.flatten(), xg.grad.flatten(), wg.grad.flatten()])
+
+
+def lstm(d, autocast=False, dtype=torch.float32):
+    torch.manual_seed(0)
+    m = torch.nn.LSTM(12, 16, num_layers=2).to(d, dtype)
+    xs = a[:30, :12].reshape(5, 6, 12).to(d, dtype)
+    with torch.autocast(d, dtype=torch.float16, enabled=autocast and d != 'cpu'):
+        out, _ = m(xs)
+    return out.float()
+
+
+def ctc(d):
+    logits = a[:60, :5].reshape(10, 6, 5).clone().to(d).requires_grad_()
+    targets = torch.tensor([1, 2, 2, 3, 4, 1, 3, 2, 4, 1, 1, 2], dtype=torch.int32)
+    loss = F.ctc_loss(F.log_softmax(logits, 2), targets if d != 'cpu' else targets.long(), [10] * 6, [2, 2, 2, 2, 2, 2],
+                      reduction='sum')
+    loss.backward()
+    return torch.cat([loss.reshape(1), logits.grad.flatten()])
+
+
+check('conv2d gradients (cuDNN), channels last, groups, dilation', conv_grads, 1e-3)
+check('conv2d gradients (cuDNN), double', lambda d: conv_grads(d, torch.float64, False), 1e-10)
+check('LSTM under autocast (cuDNN half RNN)', lambda d: lstm(d, autocast=True), 1e-2)
+check('LSTM in double (cuDNN double RNN)', lambda d: lstm(d, dtype=torch.float64), 1e-10)
+check('ctc_loss and its gradient (cuDNN)', ctc, 1e-3)
 
 
 # Complex tensors: cuBLAS's and cuSOLVER's C/Z entry points.
