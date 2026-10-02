@@ -119,6 +119,7 @@ struct Cluster {
 struct Block {
   uint32_t ctaid[3] = {};
   uint32_t rank = 0;            // in its cluster (SR_CgaCtaId)
+  uint32_t worker = 0;          // the launch's host thread running it (SR_VIRTUALSMID)
   Cluster* cluster = nullptr;
   Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
@@ -281,7 +282,7 @@ class Runner {
   void exec_clc(Block& blk, Warp& w, const Instr& ins, Mask ex);           // UGETNEXTWORKID
   Block& shared_block(Block& blk, uint64_t addr, uint32_t* off);
   Block& cluster_block(Block& blk, uint32_t rank);
-  void run_cluster(uint64_t k);                          // one cluster's blocks, together
+  void run_cluster(uint64_t k, unsigned worker);        // one cluster's blocks, together
   void cluster_barrier_check(Block& blk);                // UCGABAR: complete the phase if all are in
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
@@ -367,6 +368,9 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
     put32(nctaid + 4 * i, cfg_.grid[i]);
   }
   if (sm < 90) put64(0x18, kSharedWindow);
+  // %nsmid, which ptxas reads from bank 0 rather than a special register:
+  // the SM count, which SR_VIRTUALSMID stays below.
+  put32(sm >= 100 ? 0x2d0 : 0x10c, profile_.limits.multiprocessors);
   // The reserved shared memory (see shared_size_): its size, which ptxas
   // subtracts from SR_SMEMSZ for %reserved_smem_offset_begin, and before
   // sm_90 %reserved_smem_offset_end (the 0x120 bytes the driver uses past
@@ -560,6 +564,22 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
     case 0x32: return static_cast<uint32_t>(smemsz_);                   // SR_SMEMSZ
     case 0x2f: return static_cast<uint32_t>(kSharedWindow >> 32);       // SR_SWINHI
     case 0x88: return blk.rank;                                         // SR_CgaCtaId: the rank in the cluster
+    case 0x43: {   // SR_VIRTUALSMID (%smid), by the PTX engine's rule
+      // Distinct among the blocks resident at once, as a CTA's SM is on the
+      // hardware: a grid that fits the device (or a cooperative one) by its
+      // linear order, a larger one by the host thread running it -- thread
+      // t's rank-r block is SM t * cluster size + r, and the launch caps its
+      // threads so that fits. CUTLASS's grouped GEMMs keep a tensor map per
+      // SM; read as 0, every CTA rewrote the same one.
+      const uint32_t sms = profile_.limits.multiprocessors;
+      if (!sms) return 0;
+      const uint64_t linear = blk.ctaid[0] + uint64_t{blk.ctaid[1]} * cfg_.grid[0] +
+                              uint64_t{blk.ctaid[2]} * cfg_.grid[0] * cfg_.grid[1];
+      const uint64_t blocks = uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
+      if (cfg_.cooperative || blocks <= sms) return static_cast<uint32_t>(linear % sms);
+      const uint64_t size = clustered_ ? csize_ : 1;
+      return static_cast<uint32_t>((uint64_t{blk.worker} * size + blk.rank) % sms);
+    }
     case 0x8a: return 0;                                                // SR_CgaSize (bank 0's envregs at +0)
     case 0x28: return block_threads_;                                   // SR_NTID
     default: return 0;
@@ -749,7 +769,7 @@ exec::LaunchStats Runner::run() {
   std::atomic<uint64_t>& next = next_unit_;
   std::exception_ptr failure;
   std::mutex fail_mu;
-  const auto worker = [&] {
+  const auto worker = [&](unsigned t) {
     Block blk;
     for (;;) {
       const uint64_t i = next.fetch_add(1);
@@ -760,10 +780,11 @@ exec::LaunchStats Runner::run() {
       }
       try {
         if (clustered_) {
-          run_cluster(i);
+          run_cluster(i, t);
           continue;
         }
         init_block(blk, i);
+        blk.worker = t;
         run_block(blk);
         std::lock_guard<std::mutex> g(stats_mu_);
         stats_.add(blk.st);
@@ -790,6 +811,11 @@ exec::LaunchStats Runner::run() {
     // an allocation in one block beside a load in another is a data race.
     for (const std::string& e : m_.cubin.externs)
       if (e == "malloc" || e == "free") threads = 1;
+    // No more threads than the device has SMs for their clusters, so the
+    // blocks resident at once can all have distinct SM numbers (sreg 0x43),
+    // as the PTX engine caps its own.
+    if (const uint32_t sms = profile_.limits.multiprocessors)
+      threads = std::min<unsigned>(threads, std::max<unsigned>(1, sms / static_cast<unsigned>(clustered_ ? csize_ : 1)));
   }
   if (cfg_.cooperative) {
     // Every block resident at once, taking turns, so one may wait on another.
@@ -815,10 +841,10 @@ exec::LaunchStats Runner::run() {
     }
     for (Block& blk : all) stats_.add(blk.st);
   } else if (threads <= 1) {
-    worker();
+    worker(0);
   } else {
     std::vector<std::thread> pool;
-    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker, t);
     for (std::thread& t : pool) t.join();
   }
   if (failure) std::rethrow_exception(failure);
@@ -854,7 +880,7 @@ void Runner::run_block(Block& blk) {
 // do, so that one may wait on another (barrier.cluster, a peer's mbarrier,
 // its shared memory). Ranks run x fastest, as %cluster_ctarank numbers them;
 // clusters tile the grid x fastest.
-void Runner::run_cluster(uint64_t k) {
+void Runner::run_cluster(uint64_t k, unsigned worker) {
   const uint64_t ncx = cfg_.grid[0] / cshape_[0], ncy = cfg_.grid[1] / cshape_[1];
   const uint64_t kx = k % ncx, ky = (k / ncx) % ncy, kz = k / (ncx * ncy);
   std::vector<Block> blocks(csize_);
@@ -864,6 +890,7 @@ void Runner::run_cluster(uint64_t k) {
                    z = kz * cshape_[2] + r / (cshape_[0] * cshape_[1]);
     init_block(blocks[r], x + y * cfg_.grid[0] + z * uint64_t{cfg_.grid[0]} * cfg_.grid[1]);
     blocks[r].rank = r;
+    blocks[r].worker = worker;
     seed_alloc_handshake(blocks[r]);   // now that the block knows its rank
     blocks[r].cluster = &cl;
     cl.blocks.push_back(&blocks[r]);

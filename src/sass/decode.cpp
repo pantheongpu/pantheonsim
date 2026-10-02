@@ -730,6 +730,7 @@ std::string sreg_name(unsigned idx) {
     case 0x3d: return "SR_REGALLOC";
     case 0x3f: return "SR_GLOBALERRORSTATUS";
     case 0x41: return "SR_WARPERRORSTATUS";
+    case 0x43: return "SR_VIRTUALSMID";
     case 0x50: return "SR_CLOCKLO";
     case 0x88: return "SR_CgaCtaId";   // sm_90: the block's rank in its cluster
     case 0x8a: return "SR_CgaSize";
