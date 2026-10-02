@@ -46,7 +46,10 @@ static void is(int got, int want, const char* what) {
 constexpr int kInternal = 6, kUnrecognizedInput = 8, kNullInput = 10, kIncompatibleOptions = 11,
               kIncorrectInputType = 12, kUnrecognizedArch = 16, kUnsupportedArch = 17,
               kLtoNotEnabled = 18;
-const nvJitLinkInputType kInputAny = static_cast<nvJitLinkInputType>(10);
+// NVJITLINK_INPUT_ANY is 10, past the end of CUDA 12.0's enum: made where it
+// is passed, never stored in a variable of the enum's type, whose load UBSan
+// would rightly call out of range.
+#define kInputAny static_cast<nvJitLinkInputType>(10)
 
 #include "jitlink_ptx.inc"
 
@@ -270,10 +273,10 @@ int main(int argc, char** argv) {
   if (argc >= 3) {
     for (int i = 1; i <= 2; ++i) {
       const nvJitLinkInputType type = i == 1 ? NVJITLINK_INPUT_OBJECT : NVJITLINK_INPUT_LIBRARY;
-      for (nvJitLinkInputType t : {type, kInputAny}) {
+      for (int t : {static_cast<int>(type), 10}) {
         h = create({"-arch=sm_80"});
         add(h, kMain, "main.ptx");
-        const int r = nvJitLinkAddFile(h, t, argv[i]);
+        const int r = nvJitLinkAddFile(h, static_cast<nvJitLinkInputType>(t), argv[i]);
         check(r == NVJITLINK_SUCCESS, i == 1 ? "a host object's device code is an input"
                                             : "a static library's device code is an input");
         if (r != NVJITLINK_SUCCESS) std::printf("     %s\n", error_log(h).c_str());
