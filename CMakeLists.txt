@@ -1351,8 +1351,9 @@ if(TARGET vgpucublas)
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer
   # access and peer copies have a peer, and a managed variable two devices;
-  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both.
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver")
+  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, and
+  # cuFFT's multi-GPU descriptors (fft_multigpu.cu).
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "fft_multigpu:cufft")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
