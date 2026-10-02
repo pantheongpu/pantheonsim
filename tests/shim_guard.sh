@@ -73,6 +73,22 @@ shim_sanitizer_nvcc_flags() {
   esac
 }
 
+# both_shims_env <shim_dir>
+# The environment (NAME=value words, for `env`) a program needs to load the
+# driver shim and the runtime shim together -- libcuda and libcudart -- under
+# a sanitizer build. Each library links its own copy of the simulator's core,
+# so the process has every core global twice, defined identically.
+# AddressSanitizer's default ODR check (detect_odr_violation=2) reports each
+# such pair and aborts; level 1 still reports two definitions of one name
+# with different sizes, which is the ODR violation that is a bug. Nothing is
+# needed for ThreadSanitizer or an uninstrumented build.
+both_shims_env() {
+  case "$(shim_sanitizer "$1")" in
+    asan) printf 'ASAN_OPTIONS=%s' "${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_odr_violation=1" ;;
+    *) printf '' ;;
+  esac
+}
+
 # pick_nvcc_for_shim <shim_dir>
 # Echoes the path of an nvcc whose toolkit major matches this shim's, or nothing.
 #

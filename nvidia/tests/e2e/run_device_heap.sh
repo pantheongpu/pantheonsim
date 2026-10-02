@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # malloc() and free() in a kernel: one heap per device, emptied by
-# cudaDeviceReset, refunded by free(), and shared by kernels and by both
-# engines (device_heap.cu, against the values an RTX 3060 gives). Run on the
-# SASS by default, where device_heap_peer.cu -- built to PTX only -- runs on
-# the PTX interpreter beside it, and again with VGPU_SASS=0, all PTX.
+# cudaDeviceReset, refunded by free(), shared by kernels and by both engines,
+# and refused by the host's cudaFree, cuMemFree and cuMemGetAddressRange
+# (device_heap.cu, against the values an RTX 3060 gives). Run on the SASS by
+# default, where device_heap_peer.cu -- built to PTX only -- runs on the PTX
+# interpreter beside it, and again with VGPU_SASS=0, all PTX.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -26,7 +27,7 @@ e2e="$root/nvidia/tests/e2e"
 "$nvcc_bin" -std=c++17 -gencode arch=compute_86,code=compute_86 -cudart shared -Wno-deprecated-gpu-targets \
     "${san_flags[@]}" -c "$e2e/device_heap_peer.cu" -o "$out.peer.o" &&
 "$nvcc_bin" -arch=sm_86 -cudart shared -Wno-deprecated-gpu-targets "${san_flags[@]}" \
-    "$out.main.o" "$out.peer.o" -o "$out" ||
+    "$out.main.o" "$out.peer.o" -o "$out" -lcuda ||
   { echo "FAIL: does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$out"; then exit 0; fi
 
@@ -37,7 +38,8 @@ run() {
   shift 2
   local log
   # Kept out of a failing command substitution, so a failure prints its reason.
-  log="$(env VGPU_QUIET=1 VGPU_SASS_LOG=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$@" "$out" 2>&1)"
+  # Both libcudart and libcuda (both_shims_env: what a sanitizer build needs).
+  log="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_SASS_LOG=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$@" "$out" 2>&1)"
   local rc=$?
   echo "$log" | sed "s/^/    $name: /"
   if [[ $rc != 0 || "$(tail -n 1 <<< "$log")" != "PASS" ]] || grep -q '^FAIL' <<< "$log"; then

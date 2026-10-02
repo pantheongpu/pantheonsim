@@ -110,12 +110,10 @@ check() {
     echo "FAIL $arch $p: does not build"; sed 's/^/    /' "$bin.build" | tail -5; fails=1; return
   fi
   require_shim_libs "$shim" "$bin" >/dev/null || return
-  # Both shims carry the simulator's core, which a sanitizer build reports as an
-  # ODR violation when one program loads the two (as run_mixed_apis.sh skips).
-  if [[ -n ${san_flags[*]} ]] && readelf -d "$bin" | grep -q 'NEEDED.*libcuda\.so'; then
-    echo "SKIP $arch $p: a sanitizer build loads two copies of the core"; return
-  fi
-  local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim")
+  # Some programs load libcuda beside libcudart (linked, or fetched as
+  # runtime_conformance fetches a driver function): both_shims_env is what a
+  # sanitizer build needs for that.
+  local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
   [[ $p == runtime_conformance ]] && env+=(VGPU_DEVICE_COUNT=2)   # as run_runtime_conformance.sh runs it
   [[ $p == managed_vars ]] && env+=(VGPU_DEVICE_COUNT=2)          # as its own test runs it: two devices
   sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 timeout 600 "$bin" 2>&1)"; rs=$?
