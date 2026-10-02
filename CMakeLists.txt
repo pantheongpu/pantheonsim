@@ -671,6 +671,32 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating cuFile shim symlinks (build/shim/libcufile.so.0)")
 
   # ---------------------------------------------------------------------------
+  # libvgpunvcomp: nvCOMP's low-level batched API, presented as libnvcomp.so.5.
+  # Its standard formats are standard bitstreams (LZ4, Snappy, DEFLATE, gzip,
+  # Zstandard) and GDeflate is published as an Internet-Draft, so each chunk
+  # is coded on the host by the simulator's own codecs
+  # (nvidia/src/nvcomp_codecs.cpp, nvcomp_gdeflate.cpp) between reads and
+  # writes of simulated device memory. Cascaded, Bitcomp and ANS have no
+  # public bitstream and are refused. NVIDIA's library exports its symbols
+  # with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
+  file(WRITE "${_nvcomp_map}" "{\n  global: nvcomp*;\n  local: *;\n};\n")
+  add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
+              nvidia/src/nvcomp_gdeflate.cpp)
+  target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
+  target_include_directories(vgpunvcomp PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpunvcomp PROPERTIES OUTPUT_NAME nvcomp SOVERSION 5 VERSION 5.3)
+  target_link_options(vgpunvcomp PRIVATE "-Wl,--version-script=${_nvcomp_map}")
+  add_custom_command(TARGET vgpunvcomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp.so.5"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp.so"
+    COMMENT "Creating nvCOMP shim symlinks (build/shim/libnvcomp.so.5)")
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -808,6 +834,12 @@ vgpu_unit_test(test_e2e_parity)
 vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)
 target_sources(test_cudss_solver PRIVATE nvidia/src/cudss_solver.cpp)
 target_include_directories(test_cudss_solver PRIVATE nvidia/src)
+# nvCOMP's host codecs on their own: round trips at every size and effort,
+# known streams from reference encoders and from NVIDIA's nvCOMP, and
+# corrupted input, which must be refused without reading out of bounds.
+vgpu_unit_test(test_nvcomp_codecs nvidia/tests/unit/test_nvcomp_codecs.cpp)
+target_sources(test_nvcomp_codecs PRIVATE nvidia/src/nvcomp_codecs.cpp nvidia/src/nvcomp_gdeflate.cpp)
+target_include_directories(test_nvcomp_codecs PRIVATE nvidia/src)
 # How many host threads a grid is spread over: the CPUs the process may use,
 # its cgroup's CPU quota included, not the host's count.
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
@@ -1358,7 +1390,7 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile"
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile" "nvcomp_paths:nvcomp"
                  "dnn_backward:cudnn" "dnn_graph:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
