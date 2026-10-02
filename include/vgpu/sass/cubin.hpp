@@ -57,6 +57,7 @@ struct CubinSymbol {
   uint64_t size = 0;
   bool function = false;
   bool global = false;
+  bool managed = false;         // a __managed__ variable (st_other 4)
 };
 
 struct CubinKernel {

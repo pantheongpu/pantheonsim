@@ -147,11 +147,13 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
       CubinSymbol s;
       s.name = r.cstr(strtab + r.at<uint32_t>(o));
       const uint8_t info = r.at<uint8_t>(o + 4);
+      const uint8_t other = r.at<uint8_t>(o + 5);
       const uint16_t shndx = r.at<uint16_t>(o + 6);
       s.value = r.at<uint64_t>(o + 8);
       s.size = r.at<uint64_t>(o + 16);
       s.function = (info & 0xf) == 2;
       s.global = (info >> 4) == 1;
+      s.managed = (other & 4) != 0;
       if (shndx != 0 && shndx < shnum) s.section = names[shndx];
       sym_names.push_back(s.name);
       c.symbols.push_back(std::move(s));

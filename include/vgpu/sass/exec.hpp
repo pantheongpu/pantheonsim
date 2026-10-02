@@ -69,6 +69,8 @@ struct Module {
   std::map<std::string, uint64_t> bank_va;
   std::map<std::string, uint64_t> symbol_va;  // __device__ and __constant__ variables
   std::map<std::string, uint64_t> symbol_size;
+  std::vector<std::string> managed;           // the __managed__ ones among them
+  std::map<std::string, uint64_t> section_va; // banks and variables, by section name
   std::vector<uint64_t> allocations;          // freed on unload
   std::map<uint64_t, std::string> builtins;   // magic address -> vprintf, malloc, ...
 
@@ -80,6 +82,11 @@ struct Module {
 // executor cannot run.
 std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile);
 void unload(Module& m, MemoryManager& mem);
+// Moves variable `name` to `va` (a __managed__ one onto managed memory): every
+// relocation against it, in a constant bank, a variable's initialiser or the
+// code, is applied again with the new address. Done before the module's first
+// launch, as its code is decoded when it first runs.
+void rebind(Module& m, MemoryManager& mem, const std::string& name, uint64_t va);
 
 // Whether a cubin built for `cubin_sm` (arch_specific: an sm_XYa image) runs
 // on a device of compute capability `device_sm`, by the driver's rule: the

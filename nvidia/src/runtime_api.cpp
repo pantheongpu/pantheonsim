@@ -781,6 +781,7 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   if (!m.cubin.empty()) {
     const uint64_t mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(m.cubin.data()), m.cubin.size());
     m.module_per_device[dev] = mid;
+    bind_managed_vars(s, m, dev, mid);
     return mid;
   }
   if (m.ptx.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);

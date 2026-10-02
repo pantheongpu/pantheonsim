@@ -521,6 +521,10 @@ void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t
     if (it == lm.symbols.end() || !lm.mod)
       throw Error::make(Err::NotFound, "module ", module_id, " has no global '", name, "'");
     it->second = addr;
+    if (lm.sass) {   // a cubin: its code and banks hold the address, patched again
+      sass::rebind(*lm.sass, mem_, name, addr);
+      return;
+    }
     // A global initialised with this one's address now holds the new one.
     for (const auto& g : lm.mod->globals)
       for (const auto& si : g.init_symbols)
@@ -537,6 +541,7 @@ void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t
 std::vector<std::string> Device::managed_globals(uint64_t module_id) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id) continue;
+    if (lm.sass) return lm.sass->managed;
     std::vector<std::string> out;
     if (lm.mod)
       for (const auto& g : lm.mod->globals)
@@ -551,6 +556,13 @@ bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr,
     if (lm.id != module_id) continue;
     const auto it = lm.symbols.find(name);
     if (it == lm.symbols.end() || !lm.mod) return false;
+    if (lm.sass) {   // a cubin's variables
+      const auto sz = lm.sass->symbol_size.find(name);
+      if (sz == lm.sass->symbol_size.end()) return false;
+      if (addr) *addr = it->second;
+      if (size) *size = sz->second;
+      return true;
+    }
     for (const auto& g : lm.mod->globals)
       if (g.name == name) {
         if (addr) *addr = it->second;
