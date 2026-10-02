@@ -11,9 +11,11 @@
 // stored below the diagonal with their tau vector, eigenvalues ascending,
 // singular values descending.
 //
-// Not implemented: the sparse (cusolverSp) and multi-GPU (cusolverMg) modules,
-// the 64-bit generic API, and the Jacobi/randomized variants. Those return
-// CUSOLVER_STATUS_NOT_SUPPORTED.
+// Also the symmetric indefinite factorization (sytrf, Xsytrs, sytri) and, in
+// cusolver_complex.inc, the complex types.
+//
+// Not implemented: the multi-GPU (cusolverMg) module and the randomized
+// variants. Those return CUSOLVER_STATUS_NOT_SUPPORTED.
 #include <cusolverDn.h>
 
 #include <algorithm>
@@ -1489,6 +1491,29 @@ int hqr2(Geev& g) {
 
 }  // namespace
 
+namespace {
+// A general complex matrix (vgpu_la::geev): W and VR of A's own type, as is
+// the compute type; any other combination is INVALID_VALUE, as NVIDIA's
+// answers it (RTX 3060, CUDA 13.0).
+cusolverStatus_t complex_geev(int64_t n, cudaDataType ta, void* A, int64_t lda, cudaDataType tw, void* W, bool vectors,
+                              cudaDataType tvr, void* VR, int64_t ldvr, cudaDataType tc, int* info) {
+  if (tw != ta || tc != ta || (vectors && tvr != ta)) return CUSOLVER_STATUS_INVALID_VALUE;
+  return by_ctype(ta, [&](auto tag) {
+    using T = decltype(tag);
+    const int N = (int)n;
+    CMat a;
+    if (!cload<T>(A, (int)lda, N, &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    std::vector<cd> w;
+    CMat v;
+    const int rc = vgpu_la::geev(a, N, &w, vectors ? &v : nullptr);
+    set_info(info, rc);
+    if (!csave<T>(W, w)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    if (vectors && rc == 0 && N > 0 && !csave_ld<T>(VR, v, N, N, (int)ldvr)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+    return CUSOLVER_STATUS_SUCCESS;
+  });
+}
+}  // namespace
+
 VGPU_EXPORT cusolverStatus_t cusolverDnXgeev_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t,
                                                         cusolverEigMode_t, int64_t n, cudaDataType, const void*,
                                                         int64_t, cudaDataType, const void*, cudaDataType, const void*,
@@ -1502,13 +1527,14 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgeev_bufferSize(cusolverDnHandle_t h, cu
 VGPU_EXPORT cusolverStatus_t cusolverDnXgeev(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobvl,
                                              cusolverEigMode_t jobvr, int64_t n, cudaDataType ta, void* A, int64_t lda,
                                              cudaDataType tw, void* W, cudaDataType, void*, int64_t,
-                                             cudaDataType tvr, void* VR, int64_t ldvr, cudaDataType, void*, size_t,
+                                             cudaDataType tvr, void* VR, int64_t ldvr, cudaDataType tc, void*, size_t,
                                              void*, size_t, int* info) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
   if (jobvl == CUSOLVER_EIG_MODE_VECTOR) return CUSOLVER_STATUS_NOT_SUPPORTED;  // left vectors: not implemented
   const bool vectors = jobvr == CUSOLVER_EIG_MODE_VECTOR;
   if (vectors && ldvr < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (ta == CUDA_C_32F || ta == CUDA_C_64F) return complex_geev(n, ta, A, lda, tw, W, vectors, tvr, VR, ldvr, tc, info);
   const bool dbl = ta == CUDA_R_64F;
   const bool w_real = tw == ta;
   if ((ta != CUDA_R_32F && !dbl) || (!w_real && tw != (dbl ? CUDA_C_64F : CUDA_C_32F)))
@@ -1573,4 +1599,208 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgeev(cusolverDnHandle_t h, cusolverDnPar
       return CUSOLVER_STATUS_EXECUTION_FAILED;
     return CUSOLVER_STATUS_SUCCESS;
   });
+}
+
+/* ---- symmetric indefinite: sytrf, Xsytrs, sytri; and laswp ----
+   LAPACK's Bunch-Kaufman factorization (sytrf.hpp), which is what cuSOLVER's
+   computes: an RTX 3060's CUDA 13.0 gives the same pivots and the same factors
+   to rounding (nvidia/tests/e2e/solver_sytrf_paths.cu). Complex matrices are
+   symmetric, not Hermitian. The other triangle is never touched.
+
+   NVIDIA's sytri, on that card, returns success and info 0 and leaves A as it
+   was, at every size tried. This computes what the API documents, the
+   inverse, as LAPACK's xSYTRI does. */
+
+#include "sytrf.hpp"
+
+namespace {
+
+template <class T> struct Sym;
+template <> struct Sym<float> {
+  using V = double;
+  static V in(float x) { return x; }
+  static float out(V v) { return (float)v; }
+  static constexpr int lwork = 24608;  // what NVIDIA's sytrf_bufferSize answers
+};
+template <> struct Sym<double> {
+  using V = double;
+  static V in(double x) { return x; }
+  static double out(V v) { return v; }
+  static constexpr int lwork = 13328;
+};
+template <> struct Sym<cuComplex> {
+  using V = std::complex<double>;
+  static V in(cuComplex x) { return {x.x, x.y}; }
+  static cuComplex out(V v) { return make_cuComplex((float)v.real(), (float)v.imag()); }
+  static constexpr int lwork = 13328;
+};
+template <> struct Sym<cuDoubleComplex> {
+  using V = std::complex<double>;
+  static V in(cuDoubleComplex x) { return {x.x, x.y}; }
+  static cuDoubleComplex out(V v) { return make_cuDoubleComplex(v.real(), v.imag()); }
+  static constexpr int lwork = 11016;
+};
+
+template <class T> bool sym_load(const void* dev, size_t n, std::vector<typename Sym<T>::V>* out) {
+  std::vector<T> raw(n);
+  if (n && cudaMemcpy(raw.data(), dev, n * sizeof(T), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  out->resize(n);
+  for (size_t i = 0; i < n; ++i) (*out)[i] = Sym<T>::in(raw[i]);
+  return true;
+}
+template <class T> bool sym_save(void* dev, const std::vector<typename Sym<T>::V>& v) {
+  std::vector<T> raw(v.size());
+  for (size_t i = 0; i < v.size(); ++i) raw[i] = Sym<T>::out(v[i]);
+  return raw.empty() || cudaMemcpy(dev, raw.data(), raw.size() * sizeof(T), cudaMemcpyHostToDevice) == cudaSuccess;
+}
+bool uplo_ok(cublasFillMode_t u) { return u == CUBLAS_FILL_MODE_LOWER || u == CUBLAS_FILL_MODE_UPPER; }
+// The elements a column-major n-column matrix with leading dimension ld spans.
+size_t span(int64_t ld, int64_t cols) { return cols > 0 ? (size_t)ld * (size_t)(cols - 1) + (size_t)ld : 0; }
+
+template <class T>
+cusolverStatus_t sytrf(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A, int lda, int* ipiv, int* info) {
+  using V = typename Sym<T>::V;
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (!uplo_ok(uplo) || n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (n == 0) {
+    set_info(info, 0);
+    return CUSOLVER_STATUS_SUCCESS;
+  }
+  std::vector<V> a;
+  if (!sym_load<T>(A, span(lda, n), &a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  std::vector<int> piv((size_t)n);
+  const int rc = vgpu_sy::sytf2<V>(uplo == CUBLAS_FILL_MODE_UPPER, n, a.data(), lda, piv.data());
+  set_info(info, rc);
+  const bool ok = sym_save<T>(A, a) &&
+                  (!ipiv || cudaMemcpy(ipiv, piv.data(), piv.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess);
+  return ok ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_EXECUTION_FAILED;
+}
+
+template <class T>
+cusolverStatus_t sytri(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A, int lda, const int* ipiv, int* info) {
+  using V = typename Sym<T>::V;
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (!uplo_ok(uplo) || n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (n == 0) {
+    set_info(info, 0);
+    return CUSOLVER_STATUS_SUCCESS;
+  }
+  std::vector<V> a;
+  std::vector<int> piv((size_t)n);
+  if (!sym_load<T>(A, span(lda, n), &a) ||
+      cudaMemcpy(piv.data(), ipiv, piv.size() * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess)
+    return CUSOLVER_STATUS_EXECUTION_FAILED;
+  for (int p : piv)
+    if (p == 0 || std::abs(p) > n) return CUSOLVER_STATUS_INVALID_VALUE;
+  const int rc = vgpu_sy::sytri<V>(uplo == CUBLAS_FILL_MODE_UPPER, n, a.data(), lda, piv.data());
+  set_info(info, rc);
+  if (rc == 0 && !sym_save<T>(A, a)) return CUSOLVER_STATUS_EXECUTION_FAILED;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+
+template <class T> cusolverStatus_t sytrs64(cublasFillMode_t uplo, int64_t n, int64_t nrhs, const void* A, int64_t lda,
+                                            const int64_t* ipiv, void* B, int64_t ldb) {
+  using V = typename Sym<T>::V;
+  std::vector<V> a, b;
+  std::vector<int64_t> piv((size_t)n);
+  if (!sym_load<T>(A, span(lda, n), &a) || !sym_load<T>(B, span(ldb, nrhs), &b) ||
+      (n && cudaMemcpy(piv.data(), ipiv, piv.size() * sizeof(int64_t), cudaMemcpyDeviceToHost) != cudaSuccess))
+    return CUSOLVER_STATUS_EXECUTION_FAILED;
+  for (int64_t p : piv)
+    if (p == 0 || std::llabs(p) > n) return CUSOLVER_STATUS_INVALID_VALUE;
+  vgpu_sy::sytrs<V, int64_t>(uplo == CUBLAS_FILL_MODE_UPPER, (int)n, (int)nrhs, a.data(), (int)lda, piv.data(),
+                             b.data(), (int)ldb);
+  return sym_save<T>(B, b) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_EXECUTION_FAILED;
+}
+
+// LAPACK's xLASWP: rows k1..k2 (1-based) interchanged with ipiv's, in order,
+// or in reverse for a negative incx.
+template <class T> cusolverStatus_t laswp(cusolverDnHandle_t h, int n, T* A, int lda, int k1, int k2, const int* ipiv,
+                                          int incx) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (n < 0 || lda < 1 || k1 < 1 || k2 < k1) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (incx == 0 || n == 0) return CUSOLVER_STATUS_SUCCESS;
+  const int count = k1 + (k2 - k1) * std::abs(incx);
+  std::vector<int> piv((size_t)count);
+  std::vector<T> a(span(lda, n));
+  if (cudaMemcpy(piv.data(), ipiv, piv.size() * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+      cudaMemcpy(a.data(), A, a.size() * sizeof(T), cudaMemcpyDeviceToHost) != cudaSuccess)
+    return CUSOLVER_STATUS_EXECUTION_FAILED;
+  int ix = incx > 0 ? k1 : k1 + (k1 - k2) * incx;
+  const int i1 = incx > 0 ? k1 : k2, i2 = incx > 0 ? k2 : k1, inc = incx > 0 ? 1 : -1;
+  for (int i = i1; inc > 0 ? i <= i2 : i >= i2; i += inc, ix += incx) {
+    const int ip = piv[(size_t)ix - 1];
+    if (ip < 1 || ip > lda) return CUSOLVER_STATUS_INVALID_VALUE;
+    if (ip != i)
+      for (int c = 0; c < n; ++c) std::swap(a[(size_t)c * lda + i - 1], a[(size_t)c * lda + ip - 1]);
+  }
+  return cudaMemcpy(A, a.data(), a.size() * sizeof(T), cudaMemcpyHostToDevice) == cudaSuccess
+             ? CUSOLVER_STATUS_SUCCESS
+             : CUSOLVER_STATUS_EXECUTION_FAILED;
+}
+
+}  // namespace
+
+#define VGPU_SYTRF(P, T)                                                                                          \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##sytrf_bufferSize(cusolverDnHandle_t h, int n, T*, int lda,         \
+                                                               int* lwork) {                                     \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
+    if (n < 0 || lda < std::max(1, n) || !lwork) return CUSOLVER_STATUS_INVALID_VALUE;                            \
+    *lwork = std::max(Sym<T>::lwork, n * 64);                                                                     \
+    return CUSOLVER_STATUS_SUCCESS;                                                                               \
+  }                                                                                                               \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##sytrf(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,     \
+                                                    int lda, int* ipiv, T*, int, int* info) {                    \
+    return sytrf<T>(h, uplo, n, A, lda, ipiv, info);                                                              \
+  }                                                                                                               \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##sytri_bufferSize(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, \
+                                                               T*, int lda, const int*, int* lwork) {            \
+    if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
+    if (!uplo_ok(uplo) || n < 0 || lda < std::max(1, n) || !lwork) return CUSOLVER_STATUS_INVALID_VALUE;         \
+    *lwork = 1; /* NVIDIA's answer; the work happens on the host */                                               \
+    return CUSOLVER_STATUS_SUCCESS;                                                                               \
+  }                                                                                                               \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##sytri(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,     \
+                                                    int lda, const int* ipiv, T*, int, int* info) {              \
+    return sytri<T>(h, uplo, n, A, lda, ipiv, info);                                                              \
+  }                                                                                                               \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##laswp(cusolverDnHandle_t h, int n, T* A, int lda, int k1, int k2,   \
+                                                    const int* ipiv, int incx) {                                 \
+    return laswp<T>(h, n, A, lda, k1, k2, ipiv, incx);                                                            \
+  }
+VGPU_SYTRF(S, float)
+VGPU_SYTRF(D, double)
+VGPU_SYTRF(C, cuComplex)
+VGPU_SYTRF(Z, cuDoubleComplex)
+#undef VGPU_SYTRF
+
+VGPU_EXPORT cusolverStatus_t cusolverDnXsytrs_bufferSize(cusolverDnHandle_t h, cublasFillMode_t uplo, int64_t n,
+                                                         int64_t nrhs, cudaDataType, const void*, int64_t lda,
+                                                         const int64_t*, cudaDataType, void*, int64_t ldb,
+                                                         size_t* dev, size_t* host) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (!uplo_ok(uplo) || n < 0 || nrhs < 0 || lda < std::max<int64_t>(1, n) || ldb < std::max<int64_t>(1, n))
+    return CUSOLVER_STATUS_INVALID_VALUE;
+  if (dev) *dev = 0;  // as NVIDIA's answers
+  if (host) *host = 0;
+  return CUSOLVER_STATUS_SUCCESS;
+}
+VGPU_EXPORT cusolverStatus_t cusolverDnXsytrs(cusolverDnHandle_t h, cublasFillMode_t uplo, int64_t n, int64_t nrhs,
+                                              cudaDataType ta, const void* A, int64_t lda, const int64_t* ipiv,
+                                              cudaDataType tb, void* B, int64_t ldb, void*, size_t, void*, size_t,
+                                              int* info) {
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (!uplo_ok(uplo) || n < 0 || nrhs < 0 || lda < std::max<int64_t>(1, n) || ldb < std::max<int64_t>(1, n) ||
+      n > INT32_MAX || lda > INT32_MAX || ldb > INT32_MAX || nrhs > INT32_MAX)
+    return CUSOLVER_STATUS_INVALID_VALUE;
+  if (ta != tb) return CUSOLVER_STATUS_INVALID_VALUE;
+  set_info(info, 0);
+  if (n == 0 || nrhs == 0) return CUSOLVER_STATUS_SUCCESS;
+  switch (ta) {
+    case CUDA_R_32F: return sytrs64<float>(uplo, n, nrhs, A, lda, ipiv, B, ldb);
+    case CUDA_R_64F: return sytrs64<double>(uplo, n, nrhs, A, lda, ipiv, B, ldb);
+    case CUDA_C_32F: return sytrs64<cuComplex>(uplo, n, nrhs, A, lda, ipiv, B, ldb);
+    case CUDA_C_64F: return sytrs64<cuDoubleComplex>(uplo, n, nrhs, A, lda, ipiv, B, ldb);
+    default: return CUSOLVER_STATUS_NOT_SUPPORTED;
+  }
 }
