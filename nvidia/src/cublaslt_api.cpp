@@ -831,8 +831,12 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
   const Epilogue ep = epilogue_of(md.epilogue);
   if (!ep.known) return CUBLAS_STATUS_NOT_SUPPORTED;
   if ((ep.bgrada && ta) || (ep.bgradb && !tb)) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (ep.relu_aux() && (md.aux_ld <= 0 || md.aux_ld % 128 || md.aux_ld < m)) return CUBLAS_STATUS_INVALID_VALUE;
-  if (ep.gelu_aux() && (md.aux_ld <= 0 || md.aux_ld < m || (md.aux_type >= 0 && md.aux_type != (int32_t)ld.type)))
+  // The auxiliary buffer's shape is checked only once there is a buffer: with
+  // none, the card's heuristic finds an algorithm and the matmul refuses.
+  if (md.aux && ep.relu_aux() && (md.aux_ld <= 0 || md.aux_ld % 128 || md.aux_ld < m))
+    return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.aux && ep.gelu_aux() &&
+      (md.aux_ld <= 0 || md.aux_ld < m || (md.aux_type >= 0 && md.aux_type != (int32_t)ld.type)))
     return CUBLAS_STATUS_INVALID_VALUE;
   // The scaling modes (documentation-derived for the block forms).
   const int am = md.a_scale_mode, bm = md.b_scale_mode;
