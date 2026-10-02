@@ -65,13 +65,14 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)" --target vgpuhip vgpu_cli
 
-      - name: PyTorch on every simulated AMD GPU, and rocBLAS and hipSPARSELt
-        # rocBLAS from the wheel, as nothing of ROCm is installed. A test
+      - name: PyTorch on every simulated AMD GPU, and rocBLAS, hipSPARSELt, hipFFT, hipRAND, hipSOLVER and hipSPARSE
+        # The libraries from the wheel, as nothing of ROCm is installed. A test
         # missing what it needs skips; here a skip fails the job, so a wheel
         # that did not install is a red job, not a quietly green one.
         env:
           VGPU_ROCBLAS_FROM_WHEEL: "1"
+          VGPU_LIBRARIES_FROM_WHEEL: "1"
         run: |
           ctest --test-dir build --output-on-failure --timeout 1800 \
-            -R '^amd_(pytorch.*|rocblas|hipsparselt.*)$' 2>&1 | tee ctest.log
+            -R '^amd_(pytorch.*|rocblas|hipsparselt.*|libraries)$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "a test skipped: something it needs is missing"; exit 1; fi

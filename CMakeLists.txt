@@ -1028,6 +1028,11 @@ set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# AMD's hipFFT, hipRAND, hipSOLVER and hipSPARSE, unmodified, where ROCm with
+# them is installed or PyTorch's ROCm wheel is.
+add_test(NAME amd_libraries COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_libraries.sh)
+set_tests_properties(amd_libraries PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1500)
 # PyTorch's ROCm build, unmodified, where a Python with it is installed
 # (VGPU_TORCH_PYTHON, or a venv under ~/.local/share/torch-rocm*).
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
