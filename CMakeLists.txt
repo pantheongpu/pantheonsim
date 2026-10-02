@@ -1969,6 +1969,15 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Device-side graph launch and %current_graph_exec, on both engines.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_graph_launch COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_graph_launch.sh)
+  set_tests_properties(e2e_device_graph_launch PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Distributed shared memory through cooperative_groups' cluster API.
 if(TARGET vgpucudart)
   add_test(NAME e2e_dsmem_cluster COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dsmem_cluster.sh)

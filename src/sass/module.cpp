@@ -54,7 +54,8 @@ const Instr& Code::instr(size_t i) const {
 namespace {
 
 // The functions a module may call that VirtualGPU provides itself.
-const char* const kBuiltins[] = {"vprintf", "malloc", "free", "__assertfail", "cudaGraphSetConditional"};
+const char* const kBuiltins[] = {"vprintf", "malloc", "free", "__assertfail", "cudaGraphSetConditional",
+                                 "cudaGraphLaunch"};
 
 bool is_bank(const std::string& name, unsigned* bank) {
   // ".nv.constant<N>" or ".nv.constant<N>.<kernel>"

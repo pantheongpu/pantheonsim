@@ -3106,6 +3106,28 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     });
     return;
   }
+  if (name == "cudaGraphLaunch") {
+    // (graphExec, stream) from a kernel, as the PTX engine's
+    // exec_device_graph_launch: the runtime that launched this kernel's graph
+    // checks and queues it, and a launch from outside any graph, or of a
+    // handle that is no device graph, faults as on an RTX 3060.
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t g = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
+      const uint64_t s = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
+      int rc = -1;
+      if (cfg_.graph_launcher) rc = cfg_.graph_launcher->launch(g, s);
+      if (rc < 0) {
+        fault(w, ins, l,
+              cfg_.graph_launcher ? std::string("device-side cudaGraphLaunch of a handle that is not a graph "
+                                                "instantiated for device launch")
+                                  : std::string("device-side cudaGraphLaunch in a kernel that is not running in a graph"),
+              Err::InvalidPointer);
+        return;
+      }
+      w.reg(4, l) = static_cast<uint32_t>(rc);
+    });
+    return;
+  }
   if (name == "cudaGraphSetConditional") {
     // (handle, value): sets a conditional handle's value, which the graph's
     // conditional node reads once the kernel is done -- as the PTX engine's
