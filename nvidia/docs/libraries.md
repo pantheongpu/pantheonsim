@@ -166,7 +166,7 @@ whose batch dimensions group (K and V heads shared by several query heads),
 per-batch M, N and K overrides with a padding value (padded sequences),
 grouped reductions, view-only reshapes (a transpose through permuted
 strides), scalars of lower rank broadcast from the right, and tensors in
-workspace memory. `e2e_dnn_attention` runs eighteen configurations forward
+workspace memory. `e2e_dnn_attention` runs nineteen configurations forward
 and backward on the RTX 3060 against a double-precision reference -- half,
 bfloat16 and float; top-left and bottom-right causal masks; a sliding window;
 grouped-query heads; bias and its gradient; padding; paged K and V caches; packed (ragged)
