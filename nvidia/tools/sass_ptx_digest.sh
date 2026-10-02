@@ -80,7 +80,13 @@ for j in "${jobs[@]}"; do
   (cd "$out" && env "${env[@]}" VGPU_SASS_LOG=1 VGPU_KERNEL_DIGEST="$bin.sass.digest" timeout 900 "$bin" > "$bin.sass.log" 2>&1); rs=$?
   (cd "$out" && env "${env[@]}" VGPU_SASS=0 VGPU_KERNEL_DIGEST="$bin.ptx.digest" timeout 900 "$bin" > "$bin.ptx.log" 2>&1); rp=$?
   if [[ $rs != 0 || $rp != 0 ]]; then
-    echo "FAIL $arch $p: the SASS run exited $rs, the PTX run $rp"; fails=1; continue
+    echo "FAIL $arch $p: the SASS run exited $rs, the PTX run $rp"; fails=1
+    if [[ -z ${shown_why:-} ]]; then
+      # Once: the same run without VGPU_QUIET, for the simulator's own words.
+      shown_why=1
+      (cd "$out" && env "${env[@]/VGPU_QUIET=1/VGPU_QUIET=0}" VGPU_SASS_LOG=1 timeout 300 "$bin" 2>&1 | tail -15 | sed 's/^/    /')
+    fi
+    continue
   fi
   if ! grep -q "running SASS" "$bin.sass.log" || grep -q "running PTX instead of SASS" "$bin.sass.log"; then
     # Not a difference: the executor passed this binary's SASS over (or there

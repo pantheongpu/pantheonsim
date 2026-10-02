@@ -59,7 +59,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: -ccbin g++-12
     steps:
@@ -106,7 +106,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: ''
     steps:
@@ -133,11 +133,13 @@ jobs:
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
 
-      - name: Build the runtime shims
+      - name: Build
         if: steps.sass.outputs.here
+        # Everything, as the SASS job builds: the shims alone were not enough
+        # for the programs to start (their first cudaMalloc failed).
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target vgpucudart vgpucuda
+          cmake --build build -j"$(nproc)"
 
       - name: Compare
         if: steps.sass.outputs.here
