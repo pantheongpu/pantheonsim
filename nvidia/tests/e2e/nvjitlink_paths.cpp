@@ -12,14 +12,18 @@
 // run_nvjitlink.sh from jitlink_lib.cu (nvcc -dc, ar, nvcc -dlto -fatbin);
 // without them those checks are skipped.
 //
-// Built against NVIDIA's nvJitLink.h, which any CUDA 12 or 13 toolkit has, so
+// Built against NVIDIA's nvJitLink.h where the toolkit has one, so
 // it calls the versioned entry points a real program imports. Every check
 // passes against NVIDIA's libnvJitLink 13.0 on an RTX 3060, where the cubin
 // is SASS. VirtualGPU's cubin is the linked PTX, which is the one place the
 // two may answer differently; where they do, both answers are named.
 #include <cuda.h>
 #include <dlfcn.h>
+#ifdef VGPU_OWN_NVJITLINK_H   // a toolkit without nvJitLink (run_jit_link.sh)
+#include "../../include/vgpu_nvjitlink.h"
+#else
 #include <nvJitLink.h>
+#endif
 
 #include <cstdio>
 #include <cstring>

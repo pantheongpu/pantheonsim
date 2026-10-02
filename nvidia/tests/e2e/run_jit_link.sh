@@ -39,10 +39,19 @@ nvcc -fatbin -rdc=true -gencode arch=compute_80,code=lto_80 -Wno-deprecated-gpu-
      "$e2e/jitlink_lib.cu" -o "$tmp/jitlink_lib_lto.fatbin"
 
 # nvFatbin is linked against the shim's copy, CUDA 12.0's toolkit having
-# none; nvJitLink against the toolkit's, as a program would be.
-nvcc -std=c++17 -cudart none -Wno-deprecated-gpu-targets -Xcompiler -Wno-deprecated-declarations \
-     $(shim_sanitizer_nvcc_flags "$shim") "$e2e/$name.cpp" -o "$tmp/$name" \
-     "$shim/libnvfatbin.so" -lnvJitLink -lcuda
+# none. nvJitLink is NVIDIA's header and library where the toolkit has them,
+# so the program imports the versioned entry points (__nvJitLinkCreate_12_0,
+# _13_0) a real one does; a toolkit installed without them builds against
+# VirtualGPU's declarations and the shim instead.
+build() {
+  nvcc -std=c++17 -cudart none -Wno-deprecated-gpu-targets -Xcompiler -Wno-deprecated-declarations \
+       $(shim_sanitizer_nvcc_flags "$shim") "$e2e/$name.cpp" -o "$tmp/$name" \
+       "$shim/libnvfatbin.so" "$@" -lcuda
+}
+if ! build -lnvJitLink 2>"$tmp/build.log"; then
+  echo "note: no nvJitLink in this toolkit; building against VirtualGPU's declarations"
+  build -DVGPU_OWN_NVJITLINK_H "$shim/libnvJitLink.so"
+fi
 require_shim_libs "$shim" "$tmp/$name" || exit 0
 
 case "$name" in

@@ -14,7 +14,11 @@
 // which follow NVIDIA's ABI: every check passes against NVIDIA's
 // libnvfatbin 13.0 on an RTX 3060, and the fatbins it writes load there.
 #include <cuda.h>
+#ifdef VGPU_OWN_NVJITLINK_H   // a toolkit without nvJitLink (run_jit_link.sh)
+#include "../../include/vgpu_nvjitlink.h"
+#else
 #include <nvJitLink.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
