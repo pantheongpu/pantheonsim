@@ -402,8 +402,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `gebsr2gebsc`; sliced-ELL and blocked-ELL storage; SDDMM with a conjugate
   transpose (NVIDIA's documents none and computes something else when given
   one).
-- **cuSPARSELt**: FP8 and FP4 inputs and their block scaling (sm_89 and later
-  on NVIDIA's library), fp16 compute (no sm_86 kernel on NVIDIA's library
+- **cuSPARSELt**: FP8 and FP4 inputs (sm_89 and later on NVIDIA's library;
+  their scale modes are accepted and ignored), fp16 compute (no sm_86 kernel on NVIDIA's library
   either), and GELU outside int8 output (refused there too); see the section
   above for where the compressed layout and the search differ.
 - **cuSOLVER**: the refactorization module (`cusolverRf`), cusolverSp's

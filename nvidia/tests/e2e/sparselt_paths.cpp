@@ -604,6 +604,13 @@ int main() {
     for (int a = 0; a < 6; ++a) cusparseLtMatmulAlgGetAttribute(&h, &alg, (cusparseLtMatmulAlgAttribute_t)a, &vals[a], 4);
     check(vals[0] == 3 && vals[2] == 100 && vals[3] == 65 && vals[4] == 2 && vals[5] == 17, "algorithm attributes read back");
     IS(cusparseLtMatmulAlgSelectionDestroy(&alg), 0);
+    IS(cusparseLtMatmulAlgSelectionInit(&h, &alg, &md, (cusparseLtMatmulAlg_t)1), 3);
+    IS(cusparseLtMatmulAlgSelectionDestroy(nullptr), 3);
+    IS(cusparseLtMatmulPlanDestroy(nullptr), 3);
+    // a scale mode on an fp16 product is accepted (it belongs to FP8)
+    int mode = CUSPARSELT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+    IS(cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_A_SCALE_MODE, &mode, 4), 0);
+    IS(cusparseLtMatmulAlgSelectionInit(&h, &alg, &md, CUSPARSELT_MATMUL_ALG_DEFAULT), 0);
   }
 
   // ---- pruning: STRIP and TILE, as the card prunes ----
@@ -892,6 +899,10 @@ int main() {
       g.gelu = true;
       g.geluScale = 10.f;
       run_product("int8 GELU with scaling", p, [](int64_t, int64_t i, int64_t kk) { return kk == 0 ? (float)(i - 32) : 0.f; },
+                  [](int64_t, int64_t kk, int64_t j) { return kk == 0 ? (float)(j - 32) : 0.f; }, g, 1.f);
+      g.relu = true;  // with both set, GELU applies and ReLU does not (measured)
+      g.th = 0.5f;
+      run_product("int8 GELU and ReLU together", p, [](int64_t, int64_t i, int64_t kk) { return kk == 0 ? (float)(i - 32) : 0.f; },
                   [](int64_t, int64_t kk, int64_t j) { return kk == 0 ? (float)(j - 32) : 0.f; }, g, 1.f);
       p.oA = COL;
       p.opA = T;

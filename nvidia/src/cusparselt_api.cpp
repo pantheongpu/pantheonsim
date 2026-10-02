@@ -33,7 +33,8 @@
 // What is not the card's: the configuration a search picks (the simulator
 // has one kernel), and the workspace a plan asks for is the card's for the
 // default split-K but is never used. Refused, with a message: FP8/FP4 inputs
-// and block scaling, and fp16 compute (the card refuses both on sm_86);
+// and fp16 compute (the card refuses both on sm_86); scale modes are
+// accepted and ignored, as the card accepts them on these types;
 // GELU outside int8 output is INVALID_VALUE, as on the card. A call on a
 // stream that is capturing a graph is recorded and runs at each launch.
 #include "../include/vgpu_cusparselt.h"
@@ -880,15 +881,15 @@ Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
   const bool int8 = t == CUDA_R_8I;
   const size_t cbytes = descriptor_batch_bytes(S);
   // Per-row alpha and beta: a device vector of m floats each. Measured: with
-  // alpha-vector scaling and no beta vector, beta is not applied at all.
+  // alpha-vector scaling and no beta vector, beta is not applied at all; a
+  // beta vector without an alpha vector reads beta as a device vector (the
+  // card faults on a host scalar there).
   std::vector<float> av((size_t)m, sc.alpha), bv((size_t)m, sc.beta);
-  if (d.alpha_vec) {
-    if (!read_bytes(av.data(), sc.alpha_vec, (size_t)m * 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
-    if (d.beta_vec) {
-      if (!read_bytes(bv.data(), sc.beta_vec, (size_t)m * 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
-    } else {
-      std::fill(bv.begin(), bv.end(), 0.f);
-    }
+  if (d.alpha_vec && !read_bytes(av.data(), sc.alpha_vec, (size_t)m * 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
+  if (d.beta_vec) {
+    if (!read_bytes(bv.data(), sc.beta_vec, (size_t)m * 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
+  } else if (d.alpha_vec) {
+    std::fill(bv.begin(), bv.end(), 0.f);
   }
   // The bias: one value per row of D, of D's type for floating-point inputs
   // and float for int8 inputs (measured: an fp16 bias for fp16, a bf16 one
@@ -951,7 +952,7 @@ Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
         float v = av[(size_t)i] * x;
         if (bv[(size_t)i] != 0.f) v = std::fma(bv[(size_t)i], c, v);
         v += bias[(size_t)i];
-        if (d.gelu) {
+        if (d.gelu) {  // measured: with both set, GELU applies and ReLU does not
           v = d.gelu_scale * gelu(v);
         } else if (d.relu) {
           // Measured: at or below the threshold the result is a zero of the
@@ -987,12 +988,10 @@ Status matmul_call(const char* api, const cusparseLtHandle_t* handle, const cusp
   if (numStreams < 0) return bad_arg(api, 11, "numStreams", std::to_string(numStreams));
   if (numStreams > 0 && !streams) return bad_arg(api, 10, "streams", "NULL pointer");
   Scalars sc{1.f, 0.f, nullptr, nullptr};
-  if (p->md.alpha_vec) {
-    sc.alpha_vec = alpha;
-    sc.beta_vec = beta;
-  } else {
-    if (!read_bytes(&sc.alpha, alpha, 4) || !read_bytes(&sc.beta, beta, 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
-  }
+  if (p->md.alpha_vec) sc.alpha_vec = alpha;
+  else if (!read_bytes(&sc.alpha, alpha, 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
+  if (p->md.beta_vec) sc.beta_vec = beta;
+  else if (!p->md.alpha_vec && !read_bytes(&sc.beta, beta, 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
   const PlanImpl copy = *p;
   const Operands o{d_A, d_B, d_C, d_D};
   return in_stream_order(first_stream(streams, numStreams), [copy, sc, o] { return run_matmul(copy, sc, o); }, api);
@@ -1452,10 +1451,10 @@ cusparseStatus_t cusparseLtMatmulAlgSelectionInit(const cusparseLtHandle_t* hand
   if (!d) return bad_arg(api, 3, "matmulDescr", matmulDescr ? "bad initialization or already destroyed" : "NULL pointer");
   if (alg != CUSPARSELT_MATMUL_ALG_DEFAULT)
     return bad_arg(api, 4, "alg", "(cusparseLtMatmulAlg_t) UNKNOWN=(cusparseLtMatmulAlg_t) " + std::to_string((int)alg));
+  // Measured: a scale mode set on an fp16 product is accepted here and by
+  // the plan; the scaling modes belong to FP8/FP4, which the matmul
+  // descriptor has already refused, and this library ignores them.
   if (d->compute == CUSPARSE_COMPUTE_16F) return refuse(api, "fp16 compute (NVIDIA's library has no sm_86 kernel for it)");
-  for (int i = 0; i < 5; ++i)
-    if (d->scale_mode[i] != CUSPARSELT_MATMUL_SCALE_NONE)
-      return refuse(api, "block-scaled operands (an FP8/FP4 feature, not simulated)");
   std::memset(algSelection, 0, sizeof *algSelection);
   AlgImpl* a = impl<AlgImpl>(algSelection);
   a->magic = kAlgMagic;
@@ -1470,7 +1469,7 @@ cusparseStatus_t cusparseLtMatmulAlgSelectionInit(const cusparseLtHandle_t* hand
 
 cusparseStatus_t cusparseLtMatmulAlgSelectionDestroy(const cusparseLtMatmulAlgSelection_t* algSelection) {
   const char* api = "cusparseLtMatmulAlgSelectionDestroy";
-  if (!algSelection) return bad_arg(api, 1, "algSelection", "NULL pointer");
+  if (!algSelection) return bad_arg(api, 1, "alg_sel_ptr", "NULL pointer");
   const_cast<AlgImpl*>(impl<AlgImpl>(algSelection))->magic = 0;
   return CUSPARSE_STATUS_SUCCESS;
 }
