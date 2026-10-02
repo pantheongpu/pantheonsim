@@ -68,7 +68,7 @@ processes.
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
-| nvJitLink | `libnvJitLink.so.13` | linking PTX, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; the image is PTX (below) |
+| nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
 | nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |
@@ -299,47 +299,73 @@ PTX. That is what turned up two gaps in the PTX parser — a forward-declared
 `.entry` prototype, and a global initialised with another symbol's address —
 both of which appear in ordinary nvcc output and are now handled.
 
-## nvJitLink and nvFatbin: linking stops at PTX
+## nvJitLink and nvFatbin: PTX links to PTX, SASS to SASS
 
 nvJitLink is the device linker as a library. NVIDIA's compiles every input to
-SASS and links a cubin; VirtualGPU executes PTX, so its nvJitLink links the
-inputs' PTX into one module and hands that module out as the "cubin" -- the
-choice NVRTC's shim makes for `nvrtcGetCUBIN`, for the same reason: whatever
-the caller does with a cubin (`cuModuleLoadData`, `cuLibraryLoadData`, write
-it to a file for `cuModuleLoad`, wrap it with nvFatbin) it can do with PTX
-here. `nvJitLinkGetLinkedPtx` returns the same module, without the `-lto -ptx`
-NVIDIA's asks for.
+SASS and links a cubin. VirtualGPU's links what it is given, in kind:
 
-The linking is a linker's, measured against NVIDIA's on an RTX 3060: a
-symbol with external linkage has one definition, a strong one beating a
-`.weak` one; a second strong definition is named in the error log and
-dropped, the link still succeeding (as NVIDIA's does); an undefined reference
-fails the link with `NVJITLINK_ERROR_INTERNAL` and its name; each module's
-file-scope names stay its own (two modules may both have a `twice`). The
-linked module declares everything before its first use, the way ptxas
-insists, so NVIDIA's driver JITs it as readily as VirtualGPU runs it.
+- **PTX**, when every input has PTX: the inputs' PTX becomes one module,
+  handed out as the "cubin" -- the choice NVRTC's shim makes for
+  `nvrtcGetCUBIN`, for the same reason: whatever the caller does with a cubin
+  (`cuModuleLoadData`, `cuLibraryLoadData`, write it to a file for
+  `cuModuleLoad`, wrap it with nvFatbin) it can do with PTX here.
+  `nvJitLinkGetLinkedPtx` returns the same module, without the `-lto -ptx`
+  NVIDIA's asks for.
+- **SASS**, when every input has SASS for `-arch` and some input has no PTX
+  (`-rdc`/`-dc` cubins, or fatbins, objects and libraries built for SASS
+  only): a real linked cubin (`nvidia/src/sass_link.cpp`), which the driver
+  runs as SASS. `nvJitLinkGetLinkedPtx` then returns
+  `NVJITLINK_ERROR_INVALID_INPUT`, as NVIDIA's does.
 
-Inputs are PTX, a fatbin's PTX (the image the driver would pick for
-`-arch`), the device code nvcc puts in a host object's `.nv_fatbin` and
-`__nv_relfatbin` sections and in a static library's members, and VirtualGPU's
-own cubins, which are PTX. A linked cubin (`nvcc -cubin`) is accepted and adds
-nothing, which is how NVIDIA's treats one. Relocatable SASS (`-rdc` or `-dc`
-cubins, a fatbin with no PTX) is refused, since linking machine code means
-applying its relocations and this links PTX; so is LTO-IR, NVVM bitcode that
-only NVIDIA's compiler reads -- both by name in the error log, with what to
-add instead. The simulator runs SASS too, but the linked image stays PTX:
-the only SASS NVIDIA's linker would carry into its output is relocatable
-code, which is what is refused.
+The rules are a linker's, measured against NVIDIA's on an RTX 3060: a
+symbol with external linkage has one definition, a strong one beating a weak
+one; a second strong definition is named in the error log and dropped, the
+link still succeeding; an undefined reference fails the link with
+`NVJITLINK_ERROR_INTERNAL` and its name (the functions the driver supplies --
+`vprintf`, `malloc`, the device runtime's -- excepted); each module's
+file-scope names stay its own. A linked PTX module declares everything
+before its first use, the way ptxas insists, so NVIDIA's driver JITs it as
+readily as VirtualGPU runs it.
+
+The SASS linker was written from `cuobjdump -elf` listings -- section,
+symbol and relocation tables and `.nv.info` attributes -- of the relocatable
+cubins CUDA 12.0's and 13.0's nvcc write for sm_75 to sm_120 and of what
+NVIDIA's libnvJitLink 13.0 links them into, compared field by field at every
+relocation; no NVIDIA binary was disassembled. It merges module data and
+constant banks, lays out shared memory the way NVIDIA's link does (two
+functions' `__shared__` variables share an offset unless some kernel reaches
+both; a kernel's own come after; `extern __shared__` starts at the static end
+rounded to 16; from sm_90 the driver's reserved 1 KiB is counted in the
+kernel's section), applies the relocations the layout fixes (constant-bank
+offsets in six instruction encodings, shared offsets), keeps those that need
+a load address for the loader, and writes the attributes, call graph,
+prototypes and relocation descriptors NVIDIA's driver reads. For sm_75 to
+sm_90 its output matches NVIDIA's byte for byte in every code section and
+relocation table, and NVIDIA's driver on the card runs it. Two things NVIDIA's
+link does that this one does not: drop functions nothing calls, and, for
+sm_100 and sm_120, re-finalize code from the "mercury" sections ptxas leaves
+beside it (NVIDIA's linked code for those differs in scheduling, not in what
+it computes); the code is taken as ptxas wrote it.
+
+Inputs are PTX, a fatbin's PTX or relocatable SASS (the image the driver would
+pick for `-arch`), the device code nvcc puts in a host object's `.nv_fatbin`
+and `__nv_relfatbin` sections and in a static library's members, relocatable
+cubins, and VirtualGPU's own PTX cubins. A linked cubin (`nvcc -cubin`) is
+accepted and adds nothing, which is how NVIDIA's treats one; a cubin for an
+architecture `-arch` cannot run is refused when it is added. SASS beside PTX
+with no SASS is refused by name: NVIDIA's compiles the PTX first, and there
+is no compiler here. So is LTO-IR, NVVM bitcode that only NVIDIA's compiler
+reads.
 
 nvFatbin needs no GPU at all, so it is the whole library: it writes the
 container NVIDIA's writes with `-compress=false`, entry for entry, and
 NVIDIA's driver loads it as VirtualGPU's loaders do. It never compresses,
 and it takes a VirtualGPU cubin (PTX) as the PTX it is.
 
-`e2e_nvjitlink_paths` and `e2e_nvfatbin_paths` check all of this, and pass
-unchanged against NVIDIA's libnvJitLink and libnvfatbin 13.0 on an RTX 3060
--- and with VirtualGPU's two libraries in their place on the same card, whose
-driver then runs the linked PTX.
+`e2e_nvjitlink_paths`, `e2e_nvjitlink_sass` and `e2e_nvfatbin_paths` check
+all of this, and pass unchanged against NVIDIA's libnvJitLink and libnvfatbin
+13.0 on an RTX 3060 -- and with VirtualGPU's libraries in their place on the
+same card, whose driver then runs the linked PTX and SASS.
 
 ## What is not implemented
 
@@ -386,10 +412,12 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.
-- **nvJitLink**: relocatable SASS and LTO-IR inputs (`-rdc`/`-dc` cubins, a
-  fatbin with no PTX, NVVM bitcode, index files), and so link-time
-  optimisation; the cubin it returns is PTX. Code-generation options (`-O`, `-maxrregcount`, `-Xptxas`, ...) are
-  accepted and have nothing to act on.
+- **nvJitLink**: LTO-IR inputs (NVVM bitcode, index files) and so link-time
+  optimisation; linking SASS with PTX that has no SASS (there is no compiler
+  to bring them together); in a SASS link, dropping unreachable functions,
+  re-finalizing sm_100/sm_120 code, debug information (`-G`'s sections are
+  not kept) and texture/surface references. Code-generation options (`-O`,
+  `-maxrregcount`, `-Xptxas`, ...) are accepted and have nothing to act on.
 - **nvFatbin**: compression (`-compress` is accepted, nothing is compressed)
   and `nvFatbinAddIndex`, whose index names LTO-IR libraries.
 - **NPP**: a chosen subset -- allocation, per-pixel arithmetic and logic, data

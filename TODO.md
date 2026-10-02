@@ -491,6 +491,32 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   (The cluster registers, %aggr_smem_size and %current_graph_exec have
   since been implemented; what stays refused is %pm0-%pm7 -- see
   "Registers and counters" below for the whole list.)
+- Device-side graph launch (CUDA 12): a kernel's cudaGraphLaunch of a graph
+  instantiated with cudaGraphInstantiateFlagDeviceLaunch, into
+  cudaStreamGraphFireAndForget, cudaStreamGraphTailLaunch or
+  cudaStreamGraphFireAndForgetAsSibling, with the programming guide's
+  execution environments: fire-and-forget and sibling graphs run when the
+  launching kernel is done, tail launches once its graph and their children
+  are (a tail graph's own tails before those queued ahead of it), all before
+  the host launch completes. A device launch runs the graph as last uploaded.
+  %current_graph_exec reads the device graph's handle on both engines (SASS:
+  the bank-0 word ptxas loads, 0x120/0x130/0x190/0x2e8 by generation). Every
+  refusal is the RTX 3060's: only the three graph streams; a null, not
+  uploaded, running or already queued graph; 120 fire-and-forget launches per
+  execution, 255 queued tails; one tail self-launch at a time -- all
+  cudaErrorInvalidValue -- a handle not instantiated for device launch faults,
+  and a kernel that calls cudaGraphLaunch launched outside a graph is refused
+  with cudaErrorNotSupported. Instantiation for device launch refuses what the
+  card refuses (empty graphs, empty/host/event nodes, dynamic parallelism,
+  pageable or managed copies, AutoFreeOnLaunch). e2e_device_graph_launch,
+  both engines; it passes on the card.
+- nvJitLink links relocatable SASS (-rdc/-dc cubins, objects, libraries) into
+  a linked cubin that runs as SASS (nvidia/src/sass_link.cpp; see
+  nvidia/docs/libraries.md). Written from cuobjdump -elf listings of NVIDIA's
+  inputs and outputs; matches NVIDIA's link byte for byte in code and
+  relocations for sm_75-sm_90, and NVIDIA's driver runs its output.
+  e2e_nvjitlink_sass, sm_75 to sm_120, passes on the card with either
+  nvJitLink.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
