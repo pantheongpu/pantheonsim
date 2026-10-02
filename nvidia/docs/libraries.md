@@ -14,18 +14,44 @@ compressed by CUDA 12 and zstd compressed by CUDA 13, and both are read here.
 
 ## nvJPEG: a codec, not a wrapper
 
-There is no JPEG library in this repository to delegate to, so nvJPEG's half of
-the work is a baseline codec written against ITU-T T.81: marker parsing,
-Huffman decoding, dequantisation, an inverse DCT, chroma upsampling and colour
-conversion on the way in; the forward transform, quality-scaled quantisation
-and the Annex K Huffman tables on the way out.
+There is no JPEG library in this repository to delegate to, so nvJPEG is a
+codec written against ITU-T T.81: baseline, extended sequential and
+progressive decoding (spectral selection and successive approximation),
+restart markers, single-component and interleaved scans, every chroma
+subsampling, grey, and Adobe CMYK/YCCK; baseline and progressive encoding with
+standard or optimised (Annex K.2) Huffman tables from RGB, BGR or YCbCr planes
+of any subsampling.
 
-Header facts are exact and compared exactly -- component count, chroma
-subsampling, per-component dimensions for 4:4:4, 4:2:0 and grayscale files. The
-pixels are not bit-identical and cannot be: the standard does not specify the
-inverse DCT, so two correct decoders differ by about a count per pixel. The
-conformance test compares statistics at a precision that rounding cannot move,
-which is the honest meaning of "the same image".
+Every way the API reaches a decode works: `nvjpegDecode`; the batched API
+(`nvjpegDecodeBatchedInitialize`, `nvjpegDecodeBatched`), which
+`torchvision.io.decode_jpeg` uses on CUDA; and the decoupled three-phase API
+(`nvjpegDecodeJpegHost`, `nvjpegDecodeJpegTransferToDevice`,
+`nvjpegDecodeJpegDevice`, `nvjpegDecodeJpeg`) with its JPEG streams, decoder
+states, pinned and device buffers and decode parameters (output format, region
+of interest, CMYK). Every output format NVIDIA's default backend writes is
+written: planar, grey, planar and interleaved RGB/BGR, NV12 (from 4:2:0) and
+YUY2 (from 4:2:2).
+
+The decoded pixels are NVIDIA's. Against nvJPEG 13.0 on an RTX 3060, across
+twenty test images and every output format, 10 of 5.5 million samples
+differed, by one or two counts: the inverse DCT here is single precision with
+fused multiply-adds, rounded half up after the level shift, as NVIDIA's
+rounds; chroma is upsampled by replication; the colour conversion is NVIDIA's
+single-precision one with ties to even; CMYK becomes RGB as NVIDIA's makes it
+(C*K/255 with an exact half rounded down). The standard leaves the inverse
+DCT's internal rounding open, and those few samples are where NVIDIA's is not
+this one's. The edges are the card's too, each measured: a file cut short in
+its headers is `NVJPEG_STATUS_INCOMPLETE_BITSTREAM` while one cut short in its
+entropy-coded data decodes what is there; NV12 only from 4:2:0, YUY2 only from
+4:2:2, CMYK to RGB only with CMYK allowed; the decoupled transfer needs a
+device buffer attached; the hardware backend is `NVJPEG_STATUS_ARCH_MISMATCH`
+(an RTX 3060 has no JPEG engine; NVIDIA's A100 and H100 do, and the simulator
+answers the same on every profile); the batched API's argument checks;
+`nvjpegEncodeGetBufferSize`'s bound. `e2e_nvjpeg_paths` checks all of it --
+the decodes against the card's output by checksum -- and passes against
+NVIDIA's libnvjpeg 13.0 on the card and against this one. An encoded
+bitstream is a correct JPEG of its source, not NVIDIA's bytes: two encoders
+make different, equally legal choices.
 
 ## cuDSS: a sparse direct solver of its own
 
@@ -71,7 +97,7 @@ processes.
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
-| nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |
+| nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
 | NVENC | `libnvidia-encode.so.1` | video encode |
 
 ## Why the math runs on the host
@@ -425,9 +451,12 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   morphology, mirroring, resizing, and the signal-processing equivalents. The
   rest of NPP's several thousand entry points are absent rather than
   approximated, so a program that needs more fails at link time with a name.
-- **nvJPEG**: baseline sequential DCT only. Progressive JPEG, 12-bit samples,
-  arithmetic coding and lossless mode are rejected by name; so are the batched
-  and device-side decode APIs and the transcoding entry points.
+- **nvJPEG**: 12-bit samples, arithmetic coding, lossless and hierarchical
+  JPEG (refused by name, `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`); the hardware
+  backend and what only it does (`nvjpegDecodeBatchedEx`, scaled decodes,
+  applying an EXIF orientation, `nvjpegDecodeBatchedParseJpegTables`);
+  carrying metadata or Huffman tables from a parsed image into an encode; and
+  the transcoding entry points.
 
 Add them the way the PTX subset grew: hit one, implement it, prove it against
 hardware.

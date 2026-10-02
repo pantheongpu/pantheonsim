@@ -517,6 +517,14 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   relocations for sm_75-sm_90, and NVIDIA's driver runs its output.
   e2e_nvjitlink_sass, sm_75 to sm_120, passes on the card with either
   nvJitLink.
+- nvJPEG: progressive decoding, multi-scan and restart handling, CMYK/YCCK,
+  NV12/YUY2 output; the batched API torchvision.io.decode_jpeg uses and the
+  decoupled three-phase API with streams, decoder states, buffers and decode
+  parameters (region of interest, CMYK); progressive encoding, optimised
+  Huffman tables, every subsampling, YUV and NV12 input, device retrieval,
+  copied quantisation tables. Decoded pixels match NVIDIA's nvJPEG 13.0 on an
+  RTX 3060 on all but 10 of 5.5 million samples (within two counts), and every
+  refusal is the card's. e2e_nvjpeg_paths passes against both libraries.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
