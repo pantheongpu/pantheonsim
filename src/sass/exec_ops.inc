@@ -37,6 +37,15 @@ bool executes(const Instr& ins) {
   switch (ins.op) {
     case Op::HMMA: case Op::IMMA:
       return true;
+    case Op::LDSM: {
+      // ldmatrix's forms: 16-bit 8x8, either way; packed 4- or 6-bit 8x16;
+      // 8-bit or packed 16x16, transposed. Anything else is not one.
+      const unsigned fmt = ins.f[2], shape = ins.f[3];
+      if (shape == 0 || shape == 2) return fmt == 0;
+      if (shape == 5) return fmt == 1 || fmt == 2;
+      if (shape == 9) return fmt != 0;
+      return false;
+    }
     case Op::TEX: case Op::TLD: case Op::TLD4: {
       const Word& w = ins.w;
       const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59 and the offsets to 56-57
@@ -66,7 +75,7 @@ bool executes(const Instr& ins) {
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
     case Op::I2F: case Op::I2FP: case Op::I2I: case Op::I2IP: case Op::MUFU:
     case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::LD: case Op::LDC: case Op::LDG: case Op::LDGDEPBAR:
-    case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::RED: case Op::ST: case Op::STG:
+    case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::RED: case Op::ST: case Op::STG:
     case Op::STL: case Op::STS:
     case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MOVM:
       return true;
@@ -1871,6 +1880,33 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         if (!(have >> r & 1)) fault(w, ins, r, "LDSM: the lane holding a row address is not active");
         return rows[r];
       };
+      if (ins.f[3] == 5 || ins.f[3] == 9) {
+        // The 8-bit forms, as the PTX engine's ldmatrix (exec/ldmatrix.hpp):
+        // .M816 eight rows of sixteen values, .MT1616 sixteen transposed,
+        // matrix i's rows from lanes R*i.., each row unpacked to a byte a
+        // value (.U4x16P64TO8, .U6x16P32TO8) or taken as it is (.8).
+        const unsigned R = ins.f[3] == 9 ? 16 : 8, regs = R / 8;
+        exec::LdmRow fmt;
+        fmt.bits = ins.f[2] == 1 ? 4 : ins.f[2] == 2 ? 6 : 8;
+        const unsigned d = ins.dst[0].reg;
+        // Rows are read by the lane that names them, as LDSM's own reads are.
+        for (unsigned i = 0; i < nmat; ++i) {
+          uint8_t tile[16][16] = {};
+          for (unsigned r = 0; r < R; ++r) {
+            const unsigned src = R * i + r;
+            uint8_t raw[16] = {};
+            mem_read(blk, w, src, Space::Shared, row(src), raw, fmt.bytes());
+            exec::ldm_unpack_row(raw, fmt, tile[r]);
+          }
+          for (unsigned rr = 0; rr < regs; ++rr)
+            each_lane(ex, [&](unsigned t) {
+              if (d != kRZ) w.reg(d + i * regs + rr, t) = exec::ldm_word(tile, t, rr, trans);
+            });
+        }
+        blk.st.shared_loads += static_cast<uint64_t>(std::popcount(ex));
+        blk.st.shared_bytes_read += static_cast<uint64_t>(std::popcount(ex)) * 4 * nmat * regs;
+        return;
+      }
       uint32_t out[4][32] = {};
       each_lane(ex, [&](unsigned t) {
         for (unsigned i = 0; i < nmat; ++i) {

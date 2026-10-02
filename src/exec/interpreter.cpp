@@ -45,6 +45,7 @@
 #include <unordered_map>
 
 #include "vgpu/exec/device_printf.hpp"
+#include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -6378,37 +6379,24 @@ class Interpreter {
       // value in the low bits of its byte -- CUTLASS shifts e2m1 up by 2
       // itself before an mma -- or from 8 bytes of .s4, sign-extended.
       const uint32_t R = op.shape == LdmShape::M16N16 ? 16 : 8;
-      const uint32_t bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      exec::LdmRow fmt;
+      fmt.bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      fmt.sign4 = op.fmt == LdmSrc::S4;
       for (uint32_t mat = 0; mat < op.count; ++mat) {
         uint8_t tile[16][16] = {};
         for (uint32_t r = 0; r < R; ++r) {
           const uint32_t src_lane = mat * R + r;
           const uint64_t addr = row_addr(src_lane);
           uint8_t raw[16];
-          for (uint32_t b = 0; b < 16 * bits / 8; ++b)
+          for (uint32_t b = 0; b < fmt.bytes(); ++b)
             raw[b] = static_cast<uint8_t>(load_routed(w, ctx, ins, src_lane, addr + b, 1));
-          for (uint32_t c = 0; c < 16; ++c) {
-            uint32_t v = 0;
-            for (uint32_t k = 0; k < bits; ++k)
-              v |= ((raw[(c * bits + k) / 8] >> ((c * bits + k) % 8)) & 1u) << k;
-            if (op.fmt == LdmSrc::S4 && (v & 8)) v |= 0xF0;
-            tile[r][c] = static_cast<uint8_t>(v);
-          }
+          exec::ldm_unpack_row(raw, fmt, tile[r]);
         }
-        // Figures 108-109: lane t holds four consecutive columns of row t / 4
-        // (and of row t / 4 + 8 in its second register for 16x16), which for
-        // the transposed 16x16 are four stored rows at element t / 4.
         const uint32_t regs = R / 8;
         for (uint32_t rr = 0; rr < regs; ++rr) {
           Lanes out;
           for (uint32_t lane = 0; lane < W_; ++lane)
-            if (m & (Mask{1} << lane)) {
-              const uint32_t row = lane / 4 + 8 * rr, col0 = 4 * (lane % 4);
-              uint32_t word = 0;
-              for (uint32_t j = 0; j < 4; ++j)
-                word |= uint32_t{op.trans ? tile[col0 + j][row] : tile[row][col0 + j]} << (8 * j);
-              out[lane] = word;
-            }
+            if (m & (Mask{1} << lane)) out[lane] = exec::ldm_word(tile, lane, rr, op.trans);
           write_reg(w, op.dsts[mat * regs + rr], m, out, 32);
         }
       }

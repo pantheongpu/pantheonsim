@@ -40,7 +40,7 @@ progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 dev
        texture_layers:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 shared_max:75 named_barriers:75 smem_size_regs:75 waterfall:90 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
-       stmatrix:90a setmaxnreg:90a tcgen05_gemm:100a mma_blockscale:120a})
+       stmatrix:90a setmaxnreg:90a tcgen05_gemm:100a mma_blockscale:120a ldmatrix_forms:100a ldmatrix_forms:120a})
 cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"

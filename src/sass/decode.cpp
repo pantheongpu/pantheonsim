@@ -2384,19 +2384,29 @@ void dec_ldgsts(Instr& ins, const Word& w) {
   if (p != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
 }
 
-// LDSM.16.M88(.2/.4) (ldmatrix): 72-73 the matrix count, 78 .MT88
-// (transposed); the address as for LDS.
+// LDSM (ldmatrix): 72-73 the matrix count (.2, .4); 75-76 what a row holds
+// (.16; .U4x16P64TO8 and .U6x16P32TO8, sixteen packed 4- or 6-bit values
+// unpacked to a byte each; .8); 77-80 the shape (.M88, .MT88 transposed,
+// .M816 eight rows of sixteen, .MT1616 sixteen of sixteen transposed); the
+// address as for LDS. A 16-row matrix fills two registers per lane.
 void dec_ldsm(Instr& ins, const Word& w) {
   ins.op = Op::LDSM;
   ins.mnemonic = "LDSM";
-  ins.mods.push_back("16");
-  ins.mods.push_back(w.bit(78) ? "MT88" : "M88");
+  static const char* const fmts[] = {"16", "U4x16P64TO8", "U6x16P32TO8", "8"};
+  const unsigned fmt = static_cast<unsigned>(w.field(75, 2));
+  const unsigned shape = static_cast<unsigned>(w.field(77, 4));
+  const char* shape_name = shape == 0 ? "M88" : shape == 2 ? "MT88" : shape == 5 ? "M816" : shape == 9 ? "MT1616" : nullptr;
+  ins.mods.push_back(fmts[fmt]);
+  ins.mods.push_back(shape_name ? std::string(shape_name) : "(shape " + std::to_string(shape) + ")");
   const unsigned n = static_cast<unsigned>(w.field(72, 2));
   if (n == 1) ins.mods.push_back("2");
   if (n == 2) ins.mods.push_back("4");
   ins.f[0] = 1u << n;
-  ins.f[1] = w.bit(78);
-  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), 1u << n));
+  ins.f[1] = shape == 2 || shape == 9;   // transposed
+  ins.f[2] = fmt;
+  ins.f[3] = shape;
+  const unsigned regs_per_matrix = shape == 9 ? 2 : 1;
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), (1u << n) * regs_per_matrix));
   const int ur = w.bit(91) ? static_cast<int>(w.field(32, ureg_bits(ins.sm))) : -1;
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm));
 }
