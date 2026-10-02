@@ -4,7 +4,7 @@
 //   gtsv2_nopivot         parallel cyclic reduction (PCR), no pivoting
 //   gtsv2StridedBatch     the same, one right-hand side per system
 //   gtsvInterleavedBatch  algo 0 Thomas, 1 LU with partial pivoting, 2 QR
-//   gpsvInterleavedBatch  QR (Givens) of the pentadiagonal system
+//   gpsvInterleavedBatch  QR of the pentadiagonal system
 //
 // What an RTX 3060 showed with cuSPARSE 13.0 (CUDA 13.0), which is what this
 // reproduces -- nvidia/tests/e2e/sparse_tridiag_paths.cu checks it:
@@ -14,26 +14,32 @@
 //     batchCount < 1 and batchStride < m. Their _bufferSizeExt checks nothing
 //     but StridedBatch's (m, batchCount, batchStride as above). n = 0 is a
 //     successful no-op.
-//   * The interleaved solvers take any m >= 0 and batchCount >= 0 (zero of
-//     either is a no-op) and refuse an algo outside 0..2 (gtsv) or 0..1
-//     (gpsv; NVIDIA documents only 0, and 1 solves the same way).
+//   * The interleaved solvers take any m and batchCount >= 0 (zero of either
+//     is a no-op; their _bufferSizeExt checks neither), and gtsv's refuses an
+//     algo outside 0..2 with INVALID_VALUE.
 //   * The first element of each lower diagonal (and of gpsv's ds, the first
 //     two) and the last of each upper one are never read.
 //   * gtsv2 solves a system whose leading entries are zero, as LU with partial
 //     pivoting does, and leaves dl, d and du as they were; a singular system
 //     comes back NaN throughout.
-//   * gtsv2_nopivot and gtsv2StridedBatch are PCR up to 2048 unknowns: a zero
-//     pivot spoils one half of the unknowns (with d[0] = 0, every odd one is
-//     NaN and every even one is right) and leaves the other half alone. Past
-//     that, cyclic reduction (CR) steps first halve the system until PCR
-//     takes it, and the same zero spoils every unknown.
-//   * gtsvInterleavedBatch overwrites its inputs: Thomas (algo 0) leaves the
-//     modified upper diagonal c'_i = du_i / (d_i - dl_i c'_{i-1}) in du[0..m-2];
-//     LU (algo 1) leaves 1/u_ii in d[i] and u_{i,i+1} in du[i] for i < m-2;
-//     QR (algo 2) leaves r_ii in d[i] and r_{i,i+1} in du[i] for i < m-2, with
-//     NVIDIA's sign: each Givens step takes r = -sign(p) hypot(p, q) and
-//     reflects the two rows (row_i' = c row_i + s row_{i+1}, row_{i+1}' =
-//     s row_i - c row_{i+1}, c = p / r, s = q / r). dl is left as it was.
+//   * gtsv2_nopivot is PCR up to 2048 unknowns, gtsv2StridedBatch up to 512:
+//     a zero pivot spoils one half of the unknowns (with d[0] = 0, every odd
+//     one is NaN and every even one is right) and leaves the other half
+//     alone. Past that, cyclic reduction (CR) steps first halve the system
+//     until PCR takes it, and the same zero spoils every unknown.
+//   * The interleaved solvers overwrite their inputs. Thomas (gtsv algo 0)
+//     leaves the modified upper diagonal c'_i = du_i / (d_i - dl_i c'_{i-1})
+//     in du[0..m-2]; LU (algo 1) leaves 1/u_ii in d[i] and u_{i,i+1} in du[i]
+//     for i < m - 2; QR (gtsv algo 2, and gpsv) is Householder's (see
+//     qr_band_solve) and leaves R's diagonal and first superdiagonal in d and
+//     du for i < m - 2 -- and for gpsv its diagonal and two superdiagonals in
+//     d, du and dw for i < m - 3. LU and both QRs write nothing back for
+//     m <= 4. dl (and ds) are always left as they were. The same in every
+//     type.
+//   * gpsvInterleavedBatch's algo is not checked: anything but 0 does
+//     nothing and reports success, which this refuses (NOT_SUPPORTED). A
+//     negative m is INVALID_VALUE, a negative batchCount EXECUTION_FAILED
+//     (gtsvInterleavedBatch: INVALID_VALUE for both).
 //
 // The arithmetic runs in double (complex<double>) like the rest of this
 // library, so results agree with the card's to its rounding, not bit for bit.
@@ -71,14 +77,14 @@ template <class V> void pcr_solve(std::vector<V> a, std::vector<V> b, std::vecto
 }
 
 // The largest system NVIDIA's nopivot solvers hand to PCR whole (measured: a
-// zero d[0] leaves the even unknowns right at m = 2048 and spoils them all
-// at 4096).
-constexpr size_t kPcrLimit = 2048;
+// zero d[0] leaves the even unknowns right up to m = 2048 for gtsv2_nopivot
+// and spoils them all from 2049; for gtsv2StridedBatch the edge is 512/513).
+constexpr size_t kPcrLimitNopivot = 2048, kPcrLimitStrided = 512;
 
 // CR steps (keeping the odd equations) until PCR takes the system.
-template <class V> void cr_pcr_solve(std::vector<V> a, std::vector<V> b, std::vector<V> c, V* x) {
+template <class V> void cr_pcr_solve(std::vector<V> a, std::vector<V> b, std::vector<V> c, V* x, size_t limit) {
   const size_t m = b.size();
-  if (m <= kPcrLimit) return pcr_solve(std::move(a), std::move(b), std::move(c), x);
+  if (m <= limit) return pcr_solve(std::move(a), std::move(b), std::move(c), x);
   a[0] = V(0.0);
   c[m - 1] = V(0.0);
   const size_t half = m / 2;
@@ -96,7 +102,7 @@ template <class V> void cr_pcr_solve(std::vector<V> a, std::vector<V> b, std::ve
     }
     a2[k] = aa; b2[k] = bb; c2[k] = cc; d2[k] = dd;
   }
-  cr_pcr_solve(std::move(a2), std::move(b2), std::move(c2), d2.data());
+  cr_pcr_solve(std::move(a2), std::move(b2), std::move(c2), d2.data(), limit);
   for (size_t k = 0; k < half; ++k) x[2 * k + 1] = d2[k];
   for (size_t i = 0; i < m; i += 2) {
     V r = x[i];
@@ -181,33 +187,17 @@ template <class V> void thomas_solve(const std::vector<V>& a, const std::vector<
     for (size_t i = 0; i + 1 < m; ++i) du_out[i] = cp[i];
 }
 
-// One Givens step, NVIDIA's convention (see the top of this file): for pivot p
-// and the entry q below it, r = -sign(p) hypot(p, q), c = p / r, s = q / r,
-// and the pair of rows (u, v) becomes (conj(c) u + conj(s) v, s u - c v).
-template <class V> struct Givens {
-  V c, s, r;
-  Givens(V p, V q) {
-    const double h = std::sqrt(std::norm(cd(re(p), im(p))) + std::norm(cd(re(q), im(q))));
-    const double ap = std::abs(cd(re(p), im(p)));
-    const V sign = ap == 0.0 ? V(1.0) : p / V(ap);
-    r = -(sign * V(h));
-    c = p / r;
-    s = q / r;
-  }
-  void apply(V& u, V& v) const {
-    const V nu = conj_of(c) * u + conj_of(s) * v;
-    v = s * u - c * v;
-    u = nu;
-  }
-};
-
-// QR of a banded system with `lower` subdiagonals and `upper` superdiagonals,
-// by Givens steps that zero each column's subdiagonal entries nearest first.
-// band[k][i] is A(i, i + k - lower). With `d_out`, d_out[j] and du_out[j] get
-// r_jj and r_{j,j+1} for j < m - 2, as gtsvInterleavedBatch's QR leaves them.
+// QR of a banded system with `lower` subdiagonals and `upper` superdiagonals
+// by Householder reflections, one per column, made the way NVIDIA's are
+// (measured on R's entries that the interleaved solvers leave behind): beta =
+// -sgn(alpha) * norm with sgn(alpha) = alpha / |alpha| (+1 at zero), so a real
+// pivot's R entry has the opposite sign, and every column is reflected, even
+// one with nothing below its diagonal (that entry's sign flips). band[k][i] is
+// A(i, i + k - lower). With `out`, out[k][j] gets R(j, j + k) for k <= lower
+// and j < m - lower - 1, the part of R NVIDIA's leaves in d, du (and dw).
 template <class V>
-void qr_band_solve(const std::vector<std::vector<V>>& band, int lower, int upper, V* x, V* d_out = nullptr,
-                   V* du_out = nullptr) {
+void qr_band_solve(const std::vector<std::vector<V>>& band, int lower, int upper, V* x,
+                   std::vector<V>* out = nullptr) {
   const int m = (int)band[(size_t)lower].size();
   // Row i holds columns [i - lower, i + upper + lower]: R gains `lower` more
   // superdiagonals than A has.
@@ -219,17 +209,33 @@ void qr_band_solve(const std::vector<std::vector<V>>& band, int lower, int upper
       const int col = i + k - lower;
       if (col >= 0 && col < m) at(i, col) = band[(size_t)k][(size_t)i];
     }
+  std::vector<V> v((size_t)lower + 1);
   for (int j = 0; j < m; ++j) {
-    const int last = std::min(m - 1, j + upper + lower);
-    for (int i = j + 1; i <= std::min(m - 1, j + lower); ++i) {
-      const Givens<V> g(at(j, j), at(i, j));
-      for (int col = j; col <= last; ++col) g.apply(at(j, col), at(i, col));
-      g.apply(x[j], x[i]);
+    const int last_row = std::min(m - 1, j + lower), last_col = std::min(m - 1, j + upper + lower);
+    const V alpha = at(j, j);
+    double norm2 = std::norm(cd(re(alpha), im(alpha)));
+    for (int i = j + 1; i <= last_row; ++i) norm2 += std::norm(cd(re(at(i, j)), im(at(i, j))));
+    if (norm2 > 0.0) {
+      const double aa = std::abs(cd(re(alpha), im(alpha)));
+      const V sgn = aa == 0.0 ? V(1.0) : alpha / V(aa);
+      const V beta = -(sgn * V(std::sqrt(norm2)));
+      const V tau = (beta - alpha) / beta;  // real, so H = I - tau v v^H is a reflection
+      const V scale = V(1.0) / (alpha - beta);
+      v[0] = V(1.0);
+      for (int i = j + 1; i <= last_row; ++i) v[(size_t)(i - j)] = at(i, j) * scale;
+      auto reflect = [&](auto get) {
+        V w(0.0);
+        for (int i = j; i <= last_row; ++i) w += conj_of(v[(size_t)(i - j)]) * get(i);
+        w *= tau;
+        for (int i = j; i <= last_row; ++i) get(i) -= v[(size_t)(i - j)] * w;
+      };
+      for (int col = j + 1; col <= last_col; ++col) reflect([&](int i) -> V& { return at(i, col); });
+      reflect([&](int i) -> V& { return x[i]; });
+      at(j, j) = beta;
+      for (int i = j + 1; i <= last_row; ++i) at(i, j) = V(0.0);
     }
-    if (d_out && j + 2 < m) {
-      d_out[j] = at(j, j);
-      du_out[j] = at(j, j + 1);
-    }
+    if (out && j < m - lower - 1)
+      for (int k = 0; k <= lower; ++k) out[(size_t)k][(size_t)j] = at(j, j + k);
   }
   for (int i = m - 1; i >= 0; --i) {
     V s = x[i];
@@ -253,7 +259,7 @@ cusparseStatus_t gtsv2(cusparseHandle_t h, int m, int n, const T* dl, const T* d
   if (pivot) {
     lu_solve(a, b, c, x.data(), n, (size_t)ldb);
   } else {
-    for (int j = 0; j < n; ++j) cr_pcr_solve(a, b, c, x.data() + (size_t)j * ldb);
+    for (int j = 0; j < n; ++j) cr_pcr_solve(a, b, c, x.data() + (size_t)j * ldb, kPcrLimitNopivot);
   }
   return store_values(B, x, t) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_EXECUTION_FAILED;
 }
@@ -273,7 +279,7 @@ cusparseStatus_t gtsv2_strided(cusparseHandle_t h, int m, const T* dl, const T* 
   for (int k = 0; k < count; ++k) {
     const size_t o = (size_t)k * stride;
     cr_pcr_solve(std::vector<V>(a.begin() + o, a.begin() + o + m), std::vector<V>(b.begin() + o, b.begin() + o + m),
-                 std::vector<V>(c.begin() + o, c.begin() + o + m), x.data() + o);
+                 std::vector<V>(c.begin() + o, c.begin() + o + m), x.data() + o, kPcrLimitStrided);
   }
   return store_values(X, x, t) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_EXECUTION_FAILED;
 }
@@ -313,16 +319,20 @@ cusparseStatus_t gtsv_interleaved(cusparseHandle_t h, int algo, int m, T* dl, T*
       wrote_du = true;
     } else if (algo == 1) {
       lu_solve(ak, bk, ck, xk.data(), 1, (size_t)m, dnew.data(), dunew.data());
-      interleave(b, dnew, m, count, k, m - 2);
-      interleave(c, dunew, m, count, k, m - 2);
-      wrote_d = wrote_du = true;
+      if (m >= 5) {  // measured: smaller systems leave d and du alone
+        interleave(b, dnew, m, count, k, m - 2);
+        interleave(c, dunew, m, count, k, m - 2);
+        wrote_d = wrote_du = true;
+      }
     } else {
-      std::vector<std::vector<V>> band{ak, bk, ck};
       // band[k][i] is A(i, i + k - 1): the subdiagonal entry of row i is dl[i].
-      qr_band_solve(band, 1, 1, xk.data(), dnew.data(), dunew.data());
-      interleave(b, dnew, m, count, k, m - 2);
-      interleave(c, dunew, m, count, k, m - 2);
-      wrote_d = wrote_du = true;
+      std::vector<V> outs[2] = {dnew, dunew};
+      qr_band_solve(std::vector<std::vector<V>>{ak, bk, ck}, 1, 1, xk.data(), outs);
+      if (m >= 5) {
+        interleave(b, outs[0], m, count, k, m - 2);
+        interleave(c, outs[1], m, count, k, m - 2);
+        wrote_d = wrote_du = true;
+      }
     }
     interleave(x, xk, m, count, k, m);
   }
@@ -336,7 +346,11 @@ cusparseStatus_t gpsv_interleaved(cusparseHandle_t h, int algo, int m, T* ds, T*
   using V = typename Legacy<T>::V;
   constexpr cudaDataType t = Legacy<T>::type;
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
-  if (algo < 0 || algo > 1 || m < 0 || count < 0) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (m < 0) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (count < 0) return CUSPARSE_STATUS_EXECUTION_FAILED;
+  // NVIDIA documents algo 0 only. Its 13.0 takes any other, does nothing and
+  // reports success (measured with 1); that is refused rather than copied.
+  if (algo != 0) return CUSPARSE_STATUS_NOT_SUPPORTED;
   if (m == 0 || count == 0) return CUSPARSE_STATUS_SUCCESS;
   const size_t total = (size_t)m * count;
   std::vector<V> s, a, b, c, w, x;
@@ -353,10 +367,17 @@ cusparseStatus_t gpsv_interleaved(cusparseHandle_t h, int algo, int m, T* ds, T*
     band[3][(size_t)m - 1] = V(0.0);
     for (int i = std::max(0, m - 2); i < m; ++i) band[4][(size_t)i] = V(0.0);
     std::vector<V> xk = deinterleave(x, m, count, k);
-    qr_band_solve(band, 2, 2, xk.data());
+    std::vector<V> outs[3] = {band[2], band[3], band[4]};
+    qr_band_solve(band, 2, 2, xk.data(), outs);
+    if (m >= 5) {
+      interleave(b, outs[0], m, count, k, m - 3);
+      interleave(c, outs[1], m, count, k, m - 3);
+      interleave(w, outs[2], m, count, k, m - 3);
+    }
     interleave(x, xk, m, count, k, m);
   }
-  return store_values(X, x, t) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_EXECUTION_FAILED;
+  const bool ok = store_values(X, x, t) && store_values(d, b, t) && store_values(du, c, t) && store_values(dw, w, t);
+  return ok ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_EXECUTION_FAILED;
 }
 
 cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
@@ -402,8 +423,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsvInterleavedBatch_bufferSizeExt(                                     \
       cusparseHandle_t h, int algo, int m, const T*, const T*, const T*, const T*, int count, size_t* bytes) {     \
     if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;                                                          \
-    if (algo < 0 || algo > 2 || m < 0 || count < 0) return CUSPARSE_STATUS_INVALID_VALUE;                           \
-    return size_out(h, bytes, algo == 0 ? 128 : (size_t)m * count * sizeof(T));                                     \
+    if (algo < 0 || algo > 2) return CUSPARSE_STATUS_INVALID_VALUE;                                                 \
+    return size_out(h, bytes, algo == 0 ? 128 : (size_t)std::max(m, 0) * std::max(count, 0) * sizeof(T));          \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsvInterleavedBatch(cusparseHandle_t h, int algo, int m, T* dl, T* d, \
                                                                  T* du, T* x, int count, void*) {                  \
@@ -413,8 +434,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
       cusparseHandle_t h, int algo, int m, const T*, const T*, const T*, const T*, const T*, const T*, int count,  \
       size_t* bytes) {                                                                                              \
     if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;                                                          \
-    if (algo < 0 || algo > 1 || m < 0 || count < 0) return CUSPARSE_STATUS_INVALID_VALUE;                           \
-    return size_out(h, bytes, 2 * (size_t)m * count * sizeof(T));                                                   \
+    (void)algo;                                                                                                     \
+    return size_out(h, bytes, 2 * (size_t)std::max(m, 0) * std::max(count, 0) * sizeof(T));                         \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gpsvInterleavedBatch(cusparseHandle_t h, int algo, int m, T* ds, T* dl, \
                                                                  T* d, T* du, T* dw, T* x, int count, void*) {     \

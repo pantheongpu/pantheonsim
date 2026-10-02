@@ -3024,3 +3024,4 @@ VGPU_LEGACY_BSR(Z, cuDoubleComplex)
 #include "cusparse_spvec.inc"
 #include "cusparse_generic_rest.inc"
 #include "cusparse_tridiag.inc"
+#include "cusparse_helpers.inc"
