@@ -6,9 +6,11 @@
 //
 // Scope is the legacy (descriptor) API that frameworks still use, forward and
 // backward: convolution (data, filter and bias gradients, the fused
-// bias-activation form, every algorithm cuDNN enumerates), activation,
-// pooling, softmax, LRN, batch normalization, dropout, and tensor arithmetic
-// (add, op-tensor, reduce, transform, set, scale). Tensors are 1-8
+// bias-activation form, every algorithm cuDNN enumerates, im2col),
+// activation, pooling, softmax, LRN, batch normalization (with its fused add
+// and activation, and as the cuDNN 8 normalization API), dropout, the spatial
+// transformer, CTC loss, and tensor arithmetic (add, op-tensor, reduce,
+// transform, set, scale). Tensors are 1-8
 // dimensional with any strides -- NCHW, NHWC or neither -- of float, double,
 // half or bfloat16, with the compute types cuDNN documents for each, and INT8
 // convolution in NHWC. What cuDNN would compute that this library does not
