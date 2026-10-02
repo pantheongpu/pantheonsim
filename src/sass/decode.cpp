@@ -2802,8 +2802,10 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   ins.mods.push_back(std::to_string(dims) + "D");
   if (op == Op::UTMAREDG) ins.mods.push_back(kAtomOp[w.field(87, 3)]);   // 87-89: ADD MIN MAX INC DEC AND OR XOR
   // A load's mode at 82-83 (1 im2col, 3 im2col::w, 2 im2col::w::128; 80 with
-  // the ::w ones) and 84 .tile::gather4; a store's 83 .tile::scatter4.
-  const unsigned mode = store ? 0 : static_cast<unsigned>(w.field(82, 2));
+  // the ::w ones) and 84 .tile::gather4; a store's 82 .IM2COL (PTX's
+  // .im2col_no_offs, with no offsets register: CUTLASS's conv epilogue
+  // stores through its im2col map so) and 83 .tile::scatter4.
+  const unsigned mode = store ? (w.bit(82) ? 1u : 0u) : static_cast<unsigned>(w.field(82, 2));
   if (mode == 1) ins.mods.push_back("IM2COL");
   if (mode == 3) ins.mods.push_back("W");
   if (mode == 2) ins.mods.push_back("W128");
@@ -2821,7 +2823,7 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   const int ub = static_cast<int>(ureg_bits(ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
-  if (mode || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+  if ((mode && !store) || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
   if (w.bit(76)) ins.src.push_back(Txt("desc[UR" + std::to_string(w.field(40, ub)) + "]"));
 }
 

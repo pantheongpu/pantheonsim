@@ -3606,7 +3606,9 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   for (uint32_t d = 0; d < (four_rows ? 5u : dims) && d < 5; ++d) coords[d] = static_cast<int32_t>(urv(first + d));
   exec::TmaBox box;
   if (auto bad = exec::tma_box(map, dims, coords, four_rows, im2col, load, reduce, &box)) throw Error(bad->code, bad->what);
-  const uint32_t extra = (im2col || multicast) ? urv(urc) : 0;
+  // A load's im2col offsets (or multicast mask); a store's im2col form has
+  // none (.im2col_no_offs).
+  const uint32_t extra = ((im2col && load) || multicast) ? urv(urc) : 0;
   std::array<int64_t, 3> offsets{};
   if (im2col) {
     const uint32_t bits = exec::TensorMap::corner_bits(map.rank);
