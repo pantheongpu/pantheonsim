@@ -281,10 +281,12 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevj(cusolverDnHandle_t h, cusolverEigMode_t jobz,                \
                                                     cublasFillMode_t uplo, int n, T* A, int lda, R* W, T*, int,  \
-                                                    int* info, syevjInfo_t) {                                    \
+                                                    int* info, syevjInfo_t jp) {                                    \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                      \
-    return c_heev<T>(A, n, lda, W, jobz, uplo, info);                                                             \
+    const cusolverStatus_t st = c_heev<T>(A, n, lda, W, jobz, uplo, info);                                        \
+    jacobi_note(jp, false);                                                                                       \
+    return st;                                                                                                    \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevjBatched_bufferSize(                                           \
       cusolverDnHandle_t h, cusolverEigMode_t, cublasFillMode_t, int n, const T*, int, const R*, int* lwork,      \
@@ -295,9 +297,10 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz,         \
                                                            cublasFillMode_t uplo, int n, T* A, int lda, R* W,    \
-                                                           T*, int, int* info, syevjInfo_t, int batch) {         \
+                                                           T*, int, int* info, syevjInfo_t jp, int batch) {         \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || batch < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                         \
+    jacobi_note(jp, true);                                                                                        \
     for (int b = 0; b < batch; ++b) {                                                                             \
       const cusolverStatus_t st = c_heev<T>(A + (size_t)b * lda * n, n, lda, W + (size_t)b * n, jobz, uplo,       \
                                             info ? info + b : nullptr);                                           \
@@ -343,10 +346,12 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdj(cusolverDnHandle_t h, cusolverEigMode_t jobz, int econ,     \
                                                      int m, int n, T* A, int lda, R* S, T* U, int ldu, T* V,     \
-                                                     int ldv, T*, int, int* info, gesvdjInfo_t) {                \
+                                                     int ldv, T*, int, int* info, gesvdjInfo_t jp) {                \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                             \
-    return c_svd<T>(A, m, n, lda, !econ, jobz, S, U, ldu, V, ldv, info);                                          \
+    const cusolverStatus_t st = c_svd<T>(A, m, n, lda, !econ, jobz, S, U, ldu, V, ldv, info);                     \
+    jacobi_note(jp, false);                                                                                       \
+    return st;                                                                                                    \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched_bufferSize(                                          \
       cusolverDnHandle_t h, cusolverEigMode_t, int m, int n, const T*, int, const R*, const T*, int, const T*,   \
@@ -358,10 +363,11 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   /* Each matrix at A + b * lda * n; full U (m x m) and V (n x n), as the batched form computes. */             \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz, int m, \
                                                             int n, T* A, int lda, R* S, T* U, int ldu, T* V,     \
-                                                            int ldv, T*, int, int* info, gesvdjInfo_t,           \
+                                                            int ldv, T*, int, int* info, gesvdjInfo_t jp,           \
                                                             int batch) {                                         \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                \
+    jacobi_note(jp, true);                                                                                        \
     const int k = std::min(m, n);                                                                                 \
     for (int b = 0; b < batch; ++b) {                                                                             \
       const cusolverStatus_t st = c_svd<T>(A + (size_t)b * lda * n, m, n, lda, true, jobz, S + (size_t)b * k,     \

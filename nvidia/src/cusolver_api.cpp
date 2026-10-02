@@ -32,11 +32,18 @@
 
 #include <cuda_runtime.h>
 
+#include "complex_linalg.hpp"
+
 namespace {
 
 bool quiet() { const char* q = std::getenv("VGPU_QUIET"); return q && q[0] == '1'; }
 
-struct Handle { cudaStream_t stream = nullptr; };
+struct Handle {
+  cudaStream_t stream = nullptr;
+  int det_mode = 1;   // CUSOLVER_DETERMINISTIC_RESULTS
+  int math_mode = 1;  // CUSOLVER_DEFAULT_MATH
+  int emulation = 0;  // CUDA_EMULATION_STRATEGY_DEFAULT
+};
 
 std::mutex g_mu;
 std::set<const void*> g_live;
@@ -245,6 +252,12 @@ void ormqr(const Mat& A, Mat& C, int m, int n, int k, const std::vector<double>&
   }
 }
 
+// What the last Jacobi solve on this thread did, for cusolverDnXsyevjGetSweeps
+// and friends: its sweeps and the Frobenius norm of what it left off the
+// diagonal.
+thread_local int tl_sweeps = 0;
+thread_local double tl_residual = 0;
+
 // Cyclic Jacobi for the symmetric eigenproblem. Eigenvalues come back ascending
 // with their vectors, matching LAPACK's syevd.
 void syev(std::vector<double>& a, int n, std::vector<double>* w, std::vector<double>* vecs) {
@@ -252,11 +265,14 @@ void syev(std::vector<double>& a, int n, std::vector<double>* w, std::vector<dou
   vecs->assign((size_t)n * n, 0.0);
   auto V = [&](int r, int c) -> double& { return (*vecs)[(size_t)c * n + r]; };
   for (int i = 0; i < n; ++i) V(i, i) = 1.0;
+  tl_sweeps = 0;
   for (int sweep = 0; sweep < 100; ++sweep) {
     double off = 0.0;
     for (int p = 0; p < n; ++p)
       for (int q = p + 1; q < n; ++q) off += A(p, q) * A(p, q);
+    tl_residual = std::sqrt(2 * off);
     if (off <= 1e-30) break;
+    ++tl_sweeps;
     for (int p = 0; p < n; ++p)
       for (int q = p + 1; q < n; ++q) {
         if (std::fabs(A(p, q)) < 1e-300) continue;
@@ -300,8 +316,11 @@ void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vect
   v->assign((size_t)n * n, 0.0);
   auto V = [&](int r, int c) -> double& { return (*v)[(size_t)c * n + r]; };
   for (int i = 0; i < n; ++i) V(i, i) = 1.0;
+  tl_sweeps = 0;
+  tl_residual = 0;
   for (int sweep = 0; sweep < 60; ++sweep) {
-    double worst = 0.0;
+    double worst = 0.0, off = 0.0;
+    ++tl_sweeps;
     for (int p = 0; p < n; ++p)
       for (int q = p + 1; q < n; ++q) {
         double app = 0, aqq = 0, apq = 0;
@@ -312,6 +331,7 @@ void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vect
         }
         if (app == 0.0 || aqq == 0.0) continue;
         worst = std::max(worst, std::fabs(apq) / std::sqrt(app * aqq));
+        off += apq * apq;
         if (std::fabs(apq) <= 1e-15 * std::sqrt(app * aqq)) continue;
         const double theta = (aqq - app) / (2.0 * apq);
         const double t = (theta >= 0 ? 1.0 : -1.0) /
@@ -328,6 +348,7 @@ void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vect
           V(i, q) = sn * vip + c * viq;
         }
       }
+    tl_residual = std::sqrt(2 * off);
     if (worst < 1e-14) break;
   }
   s->assign(n, 0.0);
@@ -657,7 +678,26 @@ VGPU_GESVD(D, double)
 namespace {
 
 struct Params { int dummy = 0; };
-struct JacobiInfo { double tol = 0; int sweeps = 100; int sort = 1; };
+// The Jacobi settings, and what the last call that used them did (gesvdj,
+// syevj, sygvj; a batched call marks them so the getters refuse, as
+// NVIDIA's documents).
+struct JacobiInfo {
+  double tol = 0;
+  int sweeps = 100;
+  int sort = 1;
+  double residual = 0;
+  int executed = 0;
+  bool batched = false;
+};
+template <class I> void jacobi_note(I info, bool batched) {
+  if (!known(info)) return;
+  auto* j = reinterpret_cast<JacobiInfo*>(info);
+  j->batched = batched;
+  j->executed = std::max(1, std::max(tl_sweeps, vgpu_la::tl_sweeps));
+  j->residual = std::max(tl_residual, vgpu_la::tl_residual);
+  tl_sweeps = vgpu_la::tl_sweeps = 0;
+  tl_residual = vgpu_la::tl_residual = 0;
+}
 
 // Runs body<T> for a real element type named by a cudaDataType.
 template <class F>
@@ -958,10 +998,12 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int 
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdj(cusolverDnHandle_t h, cusolverEigMode_t jobz, int econ, int m,  \
                                                      int n, T* A, int lda, T* S, T* U, int ldu, T* V, int ldv, T*,   \
-                                                     int, int* info, gesvdjInfo_t) {                                 \
+                                                     int, int* info, gesvdjInfo_t jp) {                              \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                                \
-    return svd_into<T>(jobz, !econ, m, n, A, lda, S, U, ldu, V, ldv, info);                                          \
+    const cusolverStatus_t st = svd_into<T>(jobz, !econ, m, n, A, lda, S, U, ldu, V, ldv, info);                     \
+    jacobi_note(jp, false);                                                                                          \
+    return st;                                                                                                       \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched_bufferSize(                                              \
       cusolverDnHandle_t h, cusolverEigMode_t, int m, int n, const T*, int, const T*, const T*, int, const T*, int,  \
@@ -973,9 +1015,10 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int 
   /* Each matrix at A + b * lda * n; full U (m x m) and V (n x n) per matrix, as the batched form computes. */     \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz, int m,     \
                                                             int n, T* A, int lda, T* S, T* U, int ldu, T* V, int ldv, \
-                                                            T*, int, int* info, gesvdjInfo_t, int batch) {           \
+                                                            T*, int, int* info, gesvdjInfo_t jp, int batch) {        \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                   \
+    jacobi_note(jp, true);                                                                                           \
     const int k = std::min(m, n);                                                                                    \
     for (int b = 0; b < batch; ++b) {                                                                                \
       const cusolverStatus_t st = svd_into<T>(jobz, true, m, n, A + (size_t)b * lda * n, lda, S + (size_t)b * k,     \
@@ -1025,10 +1068,12 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int 
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevj(cusolverDnHandle_t h, cusolverEigMode_t jobz,                    \
                                                     cublasFillMode_t uplo, int n, T* A, int lda, T* W, T*, int,      \
-                                                    int* info, syevjInfo_t) {                                        \
+                                                    int* info, syevjInfo_t jp) {                                     \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                         \
-    return eig_into<T>(A, n, lda, W, jobz, uplo, info);                                                              \
+    const cusolverStatus_t st = eig_into<T>(A, n, lda, W, jobz, uplo, info);                                         \
+    jacobi_note(jp, false);                                                                                          \
+    return st;                                                                                                       \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevjBatched_bufferSize(cusolverDnHandle_t h, cusolverEigMode_t,       \
                                                                       cublasFillMode_t, int n, const T*, int,        \
@@ -1039,9 +1084,10 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int 
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz,             \
                                                            cublasFillMode_t uplo, int n, T* A, int lda, T* W, T*,    \
-                                                           int, int* info, syevjInfo_t, int batch) {                 \
+                                                           int, int* info, syevjInfo_t jp, int batch) {              \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (n < 0 || batch < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                            \
+    jacobi_note(jp, true);                                                                                           \
     for (int b = 0; b < batch; ++b) {                                                                                \
       const cusolverStatus_t st = eig_into<T>(A + (size_t)b * lda * n, n, lda, W + (size_t)b * n, jobz, uplo,        \
                                               info ? info + b : nullptr);                                            \
@@ -1162,7 +1208,11 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsyevBatched(cusolverDnHandle_t h, cusolv
    real A, real, with a complex pair's vector stored as two columns (real
    part, then imaginary part) at the first eigenvalue of the pair, the one
    with positive imaginary part; each vector scaled to unit 2-norm with its
-   largest component real. Left eigenvectors are not computed. */
+   largest component real. Left eigenvectors are not computed: NVIDIA's
+   documents right vectors only, and with jobvl = VECTOR its Xgeev and
+   _bufferSize return INTERNAL_ERROR (RTX 3060, CUDA 13.0 and 13.2's
+   libcusolver alike), so this does too. A real A's VR is real, as its
+   documentation's type table has it: a complex VR is INVALID_VALUE. */
 
 namespace {
 
@@ -1494,12 +1544,32 @@ int hqr2(Geev& g) {
 }  // namespace
 
 namespace {
+// The type combinations NVIDIA's Xgeev takes (RTX 3060, CUDA 13.0, as its
+// documentation lists them): A, VL, VR and compute of one type, W that type or,
+// for a real A, the complex type of its precision. Anything else is
+// INVALID_VALUE from both calls, with the workspace sizes set to 0.
+bool geev_types_ok(cudaDataType ta, cudaDataType tw, cudaDataType tvl, cudaDataType tvr, cudaDataType tc) {
+  if (tvl != ta || tvr != ta || tc != ta) return false;
+  if (ta == CUDA_R_32F) return tw == CUDA_R_32F || tw == CUDA_C_32F;
+  if (ta == CUDA_R_64F) return tw == CUDA_R_64F || tw == CUDA_C_64F;
+  return (ta == CUDA_C_32F || ta == CUDA_C_64F) && tw == ta;
+}
+// n, lda, and ldvl/ldvr >= 1 (>= n when that side's vectors are asked for).
+// A jobvl or jobvr other than VECTOR is taken as NOVECTOR, as NVIDIA's takes it.
+bool geev_args_ok(cusolverEigMode_t jobvl, cusolverEigMode_t jobvr, int64_t n, int64_t lda, int64_t ldvl,
+                  int64_t ldvr) {
+  if (n < 0 || lda < std::max<int64_t>(1, n) || ldvl < 1 || ldvr < 1) return false;
+  if (jobvl == CUSOLVER_EIG_MODE_VECTOR && ldvl < n) return false;
+  if (jobvr == CUSOLVER_EIG_MODE_VECTOR && ldvr < n) return false;
+  return true;
+}
+}  // namespace
+
+namespace {
 // A general complex matrix (vgpu_la::geev): W and VR of A's own type, as is
-// the compute type; any other combination is INVALID_VALUE, as NVIDIA's
-// answers it (RTX 3060, CUDA 13.0).
-cusolverStatus_t complex_geev(int64_t n, cudaDataType ta, void* A, int64_t lda, cudaDataType tw, void* W, bool vectors,
-                              cudaDataType tvr, void* VR, int64_t ldvr, cudaDataType tc, int* info) {
-  if (tw != ta || tc != ta || (vectors && tvr != ta)) return CUSOLVER_STATUS_INVALID_VALUE;
+// the compute type (checked by the caller).
+cusolverStatus_t complex_geev(int64_t n, cudaDataType ta, void* A, int64_t lda, cudaDataType, void* W, bool vectors,
+                              cudaDataType, void* VR, int64_t ldvr, cudaDataType, int* info) {
   return by_ctype(ta, [&](auto tag) {
     using T = decltype(tag);
     const int N = (int)n;
@@ -1516,38 +1586,38 @@ cusolverStatus_t complex_geev(int64_t n, cudaDataType ta, void* A, int64_t lda, 
 }
 }  // namespace
 
-VGPU_EXPORT cusolverStatus_t cusolverDnXgeev_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t,
-                                                        cusolverEigMode_t jobvr, int64_t n, cudaDataType ta,
-                                                        const void*, int64_t, cudaDataType tw, const void*,
-                                                        cudaDataType, const void*, int64_t, cudaDataType tvr,
-                                                        const void*, int64_t, cudaDataType tc, size_t* dev,
-                                                        size_t* host) {
+VGPU_EXPORT cusolverStatus_t cusolverDnXgeev_bufferSize(cusolverDnHandle_t h, cusolverDnParams_t,
+                                                        cusolverEigMode_t jobvl, cusolverEigMode_t jobvr, int64_t n,
+                                                        cudaDataType ta, const void*, int64_t lda, cudaDataType tw,
+                                                        const void*, cudaDataType tvl, const void*, int64_t ldvl,
+                                                        cudaDataType tvr, const void*, int64_t ldvr, cudaDataType tc,
+                                                        size_t* dev, size_t* host) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
-  // A complex A takes W, VR and the compute type of its own type, as Xgeev does.
-  if ((ta == CUDA_C_32F || ta == CUDA_C_64F) &&
-      (tw != ta || tc != ta || (jobvr == CUSOLVER_EIG_MODE_VECTOR && tvr != ta)))
+  if (!geev_types_ok(ta, tw, tvl, tvr, tc)) {
+    if (dev) *dev = 0;
+    if (host) *host = 0;
     return CUSOLVER_STATUS_INVALID_VALUE;
+  }
+  if (!geev_args_ok(jobvl, jobvr, n, lda, ldvl, ldvr)) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (jobvl == CUSOLVER_EIG_MODE_VECTOR) return CUSOLVER_STATUS_INTERNAL_ERROR;  // right vectors only
   if (dev) *dev = x_workspace(n);
   if (host) *host = x_workspace(n);
   return CUSOLVER_STATUS_SUCCESS;
 }
 VGPU_EXPORT cusolverStatus_t cusolverDnXgeev(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobvl,
                                              cusolverEigMode_t jobvr, int64_t n, cudaDataType ta, void* A, int64_t lda,
-                                             cudaDataType tw, void* W, cudaDataType, void*, int64_t,
+                                             cudaDataType tw, void* W, cudaDataType tvl, void*, int64_t ldvl,
                                              cudaDataType tvr, void* VR, int64_t ldvr, cudaDataType tc, void*, size_t,
                                              void*, size_t, int* info) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
-  if (n < 0 || lda < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
-  if (jobvl == CUSOLVER_EIG_MODE_VECTOR) return CUSOLVER_STATUS_NOT_SUPPORTED;  // left vectors: not implemented
+  if (!geev_types_ok(ta, tw, tvl, tvr, tc)) return CUSOLVER_STATUS_INVALID_VALUE;
+  // A bad size, or left vectors, which NVIDIA's computes none of: INTERNAL_ERROR, info untouched.
+  if (!geev_args_ok(jobvl, jobvr, n, lda, ldvl, ldvr) || jobvl == CUSOLVER_EIG_MODE_VECTOR)
+    return CUSOLVER_STATUS_INTERNAL_ERROR;
   const bool vectors = jobvr == CUSOLVER_EIG_MODE_VECTOR;
-  if (vectors && ldvr < std::max<int64_t>(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;
   if (ta == CUDA_C_32F || ta == CUDA_C_64F) return complex_geev(n, ta, A, lda, tw, W, vectors, tvr, VR, ldvr, tc, info);
-  const bool dbl = ta == CUDA_R_64F;
   const bool w_real = tw == ta;
-  if ((ta != CUDA_R_32F && !dbl) || (!w_real && tw != (dbl ? CUDA_C_64F : CUDA_C_32F)))
-    return CUSOLVER_STATUS_NOT_SUPPORTED;
-  const bool vr_complex = tvr == (dbl ? CUDA_C_64F : CUDA_C_32F);
-  if (vectors && !vr_complex && tvr != ta) return CUSOLVER_STATUS_NOT_SUPPORTED;
+  const bool vr_complex = false;  // a real A's vectors are real, LAPACK-packed
   return by_type(ta, [&](auto tag) {
     using T = decltype(tag);
     const int N = (int)n;
@@ -1811,3 +1881,5 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsytrs(cusolverDnHandle_t h, cublasFillMo
     default: return CUSOLVER_STATUS_NOT_SUPPORTED;
   }
 }
+
+#include "cusolver_dense_more.inc"

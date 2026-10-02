@@ -23,6 +23,11 @@ namespace vgpu_la {
 
 using cd = std::complex<double>;
 
+// What the last Jacobi solve (heev, svd) on this thread did: its sweeps, and
+// the Frobenius norm of what it left off the diagonal.
+inline thread_local int tl_sweeps = 0;
+inline thread_local double tl_residual = 0;
+
 // A column-major matrix with a leading dimension.
 struct CMat {
   std::vector<cd> v;
@@ -47,8 +52,11 @@ inline int lu(CMat& a, int m, int n, std::vector<int>* ipiv) {
   for (int j = 0; j < k; ++j) {
     int p = j;
     if (ipiv) {
+      // LAPACK's izamax: the largest |re| + |im|, which NVIDIA's pivots on too
+      // (RTX 3060, CUDA 13.0: getrf and Xgetrf on complex matrices).
+      auto mag = [](cd v) { return std::fabs(v.real()) + std::fabs(v.imag()); };
       for (int i = j + 1; i < m; ++i)
-        if (std::abs(a(i, j)) > std::abs(a(p, j))) p = i;
+        if (mag(a(i, j)) > mag(a(p, j))) p = i;
       (*ipiv)[j] = p + 1;
       if (p != j)
         for (int c = 0; c < n; ++c) std::swap(a(j, c), a(p, c));
@@ -275,11 +283,14 @@ inline void heev(const CMat& in, int n, bool lower, std::vector<double>* w, CMat
   for (int i = 0; i < n; ++i) a(i, i) = a(i, i).real();
   CMat v{std::vector<cd>((size_t)n * n, 0), n};
   for (int i = 0; i < n; ++i) v(i, i) = 1;
+  tl_sweeps = 0;
   for (int sweep = 0; sweep < 100; ++sweep) {
     double off = 0, tot = 0;
     for (int j = 0; j < n; ++j)
       for (int i = 0; i < n; ++i) (i == j ? tot : off) += std::norm(a(i, j));
+    tl_residual = std::sqrt(off);
     if (off <= 1e-30 * (tot + off) || off == 0) break;
+    ++tl_sweeps;
     for (int p = 0; p < n - 1; ++p)
       for (int q = p + 1; q < n; ++q) {
         const cd apq = a(p, q);
@@ -358,8 +369,12 @@ inline void svd(const CMat& in, int m, int n, bool full, std::vector<double>* s,
     for (int i = 0; i < rows; ++i) a(i, j) = wide ? std::conj(in(j, i)) : in(i, j);
   CMat w{std::vector<cd>((size_t)cols * cols, 0), cols};
   for (int i = 0; i < cols; ++i) w(i, i) = 1;
+  tl_sweeps = 0;
+  tl_residual = 0;
   for (int sweep = 0; sweep < 100; ++sweep) {
     bool rotated = false;
+    double off = 0;
+    ++tl_sweeps;
     for (int p = 0; p < cols - 1; ++p)
       for (int q = p + 1; q < cols; ++q) {
         double alpha = 0, beta = 0;
@@ -370,6 +385,7 @@ inline void svd(const CMat& in, int m, int n, bool full, std::vector<double>* s,
           gamma += std::conj(a(i, p)) * a(i, q);
         }
         const double g = std::abs(gamma);
+        off += g * g;
         if (g == 0 || g <= 1e-15 * std::sqrt(alpha * beta)) continue;
         rotated = true;
         const cd phase = gamma / g;
@@ -386,6 +402,7 @@ inline void svd(const CMat& in, int m, int n, bool full, std::vector<double>* s,
         rot(a, rows);
         rot(w, cols);
       }
+    tl_residual = std::sqrt(2 * off);
     if (!rotated) break;
   }
   std::vector<double> norms(cols);
