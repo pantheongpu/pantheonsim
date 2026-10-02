@@ -170,23 +170,6 @@ double round_to(cudnnDataType_t t, double v) {
 
 /* ---- tensors ---- */
 
-bool Layout::packed() const {
-  // Sorted by stride, each must equal the product of the extents inside it.
-  int order[kMaxRank];
-  for (int i = 0; i < rank; ++i) order[i] = i;
-  std::sort(order, order + rank, [&](int a, int b) {
-    return strides[a] != strides[b] ? strides[a] < strides[b] : a > b;
-  });
-  int64_t expect = 1;
-  for (int i = 0; i < rank; ++i) {
-    const int d = order[i];
-    if (dims[d] == 1) continue;
-    if (strides[d] != expect) return false;
-    expect *= dims[d];
-  }
-  return true;
-}
-
 void packed_strides(int rank, const int64_t* dims, bool channels_last, int64_t* strides) {
   if (!channels_last || rank < 3) {
     int64_t s = 1;

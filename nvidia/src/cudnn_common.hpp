@@ -126,8 +126,6 @@ struct Layout {
       if (dims[i] != o.dims[i]) return false;
     return true;
   }
-  // Every element's own slot, none shared and none skipped.
-  bool packed() const;
 };
 
 // Packed strides for dims in NCHW order (row-major), or channels-last (NHWC:
@@ -161,13 +159,6 @@ bool write(const Layout& t, void* dev, const std::vector<double>& v);
 // nonzero (cuDNN's rule, so a NaN-filled output with beta = 0 is fine). r is
 // rounded to the output's type by write().
 bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, double alpha, double beta);
-
-// Logical index of a coordinate in a row-major shape.
-inline size_t flat(const Layout& t, const int64_t* idx) {
-  size_t i = 0;
-  for (int d = 0; d < t.rank; ++d) i = i * static_cast<size_t>(t.dims[d]) + static_cast<size_t>(idx[d]);
-  return i;
-}
 
 /* ---- convolution ---- */
 
