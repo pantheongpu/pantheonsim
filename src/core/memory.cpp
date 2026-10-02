@@ -149,6 +149,38 @@ void MemoryManager::free(uint64_t ptr) {
                     " (never returned by an allocation)");
 }
 
+uint64_t MemoryManager::heap_alloc(uint64_t size, uint64_t limit) {
+  std::lock_guard<std::mutex> guard(heap_->mu);
+  // Out of heap is a null pointer, not a failure, as on the device: each
+  // thread's malloc stands alone, and the program is expected to check it.
+  // Compared without the sum, which a huge request would wrap.
+  if (size == 0 || heap_->used > limit || size > limit - heap_->used) return 0;
+  uint64_t p = 0;
+  try {
+    p = alloc(size);
+  } catch (const Error&) {
+    return 0;   // the device's memory is full before the heap is
+  }
+  heap_->used += size;
+  heap_->blocks.emplace(p, size);
+  return p;
+}
+
+bool MemoryManager::heap_free(uint64_t ptr) {
+  std::lock_guard<std::mutex> guard(heap_->mu);
+  const auto it = heap_->blocks.find(ptr);
+  if (it == heap_->blocks.end()) return false;
+  heap_->used -= it->second;
+  heap_->blocks.erase(it);
+  free(ptr);
+  return true;
+}
+
+uint64_t MemoryManager::heap_used() const {
+  std::lock_guard<std::mutex> guard(heap_->mu);
+  return heap_->used;
+}
+
 const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, uint64_t len,
                                                                const char* op, uint64_t* base_out,
                                                                bool writing) const {
@@ -437,6 +469,11 @@ void MemoryManager::unmap_host(uint64_t addr) {
 }
 
 void MemoryManager::free_all() {
+  // The heap's blocks go in the sweep below with every other allocation; its
+  // record of them, and the budget they held, go here.
+  std::lock_guard<std::mutex> heap_guard(heap_->mu);
+  heap_->used = 0;
+  heap_->blocks.clear();
   ExclusiveGuard table_guard(table_lock_.get());
   // A reset takes mapped memory, reservations and handles with it, as it takes
   // allocations: nothing survives it on a real device either.

@@ -106,7 +106,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   a kernel that calls malloc/free or printf has launched, decided from the
   kernel's code. Stack and printf-buffer sizes are recorded and reported but
   bound nothing here. e2e_device_limits allocates up to a raised limit and one
-  past it.
+  past it. The heap is one per device whichever engine a kernel runs on (the
+  device's memory manager keeps it): a block one kernel allocates a later one
+  may free, SASS or PTX, free() refunds the budget, and cudaDeviceReset empties
+  it -- blocks leaked before a reset used to keep counting against the limit.
+  e2e_device_heap, both engines and across them (an RTX 3060 passes it).
 - A capture records everything a stream is given. Several entry points ran their
   work the moment they were called on a capturing stream, so the graph came back
   without it and every replay silently left it out: 2D copies and fills, copies

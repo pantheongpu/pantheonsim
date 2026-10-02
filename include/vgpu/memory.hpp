@@ -112,8 +112,29 @@ class MemoryManager {
 
   // Frees every live allocation, as a device reset does. Each goes through
   // free(), so the pointers stay in the quarantine and a program that uses one
-  // afterwards is told it was freed.
+  // afterwards is told it was freed. The device heap starts over empty.
   void free_all();
+
+  // ---- the device heap ----
+  //
+  // malloc() and free() in a kernel, for both engines (the PTX interpreter's
+  // call and the SASS executor's): one heap per device, kept here with the
+  // memory it hands out, so a block one kernel allocates another may free,
+  // whichever code each ran, and a reset takes the heap's blocks and its
+  // budget with everything else. Blocks are ordinary allocations, so a kernel
+  // that overruns one or uses it after free() is told so.
+  //
+  // `limit` is cudaLimitMallocHeapSize as the launch saw it. Returns the
+  // block, or 0 -- not an error, as on the device -- for 0 bytes, for a
+  // request past what is left of the limit, and for one the device's memory
+  // cannot hold.
+  uint64_t heap_alloc(uint64_t size, uint64_t limit);
+  // Gives a block back to the heap and frees it. False, with nothing changed,
+  // when `ptr` is not a live heap block (the caller reports it with its own
+  // context); a null `ptr` is not passed here.
+  bool heap_free(uint64_t ptr);
+  // Bytes the heap has handed out and not had back.
+  uint64_t heap_used() const;
 
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
@@ -525,6 +546,16 @@ class MemoryManager {
   // Highest VA ever handed out, so a pointer inside the retired range can be
   // called out as stale even after it leaves the quarantine.
   uint64_t high_water_va_;
+
+  // The device heap (heap_alloc): the bytes handed out and each block's size.
+  // Its own lock, taken before the table lock and never inside it; behind a
+  // pointer so the manager stays movable.
+  struct DeviceHeap {
+    std::mutex mu;
+    uint64_t used = 0;
+    std::map<uint64_t, uint64_t> blocks;   // base -> bytes asked for
+  };
+  std::unique_ptr<DeviceHeap> heap_ = std::make_unique<DeviceHeap>();
 };
 
 }  // namespace vgpu
