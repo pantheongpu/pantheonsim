@@ -12,10 +12,12 @@
 // singular values descending.
 //
 // Also the symmetric indefinite factorization (sytrf, Xsytrs, sytri) and, in
-// cusolver_complex.inc, the complex types.
+// cusolver_complex.inc, the complex types. The sparse module (cusolverSp) is
+// cusolver_sp.cpp, built into this library too; the multi-GPU one
+// (cusolverMg) is a library of its own, cusolvermg_api.cpp.
 //
-// Not implemented: the multi-GPU (cusolverMg) module and the randomized
-// variants. Those return CUSOLVER_STATUS_NOT_SUPPORTED.
+// Not implemented: the randomized variants and the refactorization module
+// (cusolverRf).
 #include <cusolverDn.h>
 
 #include <algorithm>
