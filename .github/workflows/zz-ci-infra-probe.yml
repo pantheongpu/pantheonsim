@@ -18,7 +18,9 @@ jobs:
     steps:
       - name: in container?
         if: ${{ !job.container.id }}
-        run: echo "NO CONTAINER (expected)"; test ! -f /.dockerenv; echo "outputs: '${{ needs.image.outputs.cuda12_0 }}'"
+        run: |
+          echo "NO CONTAINER (expected)"; test ! -f /.dockerenv; echo "outputs= '${{ needs.image.outputs.cuda12_0 }}'"
       - name: container
         if: ${{ job.container.id }}
-        run: echo "IN CONTAINER (unexpected)"; exit 1
+        run: |
+          echo "IN CONTAINER (unexpected)"; exit 1
