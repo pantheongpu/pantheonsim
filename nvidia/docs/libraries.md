@@ -42,6 +42,8 @@ which is the honest meaning of "the same image".
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
+| nvJitLink | `libnvJitLink.so.13` | linking PTX, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; the image is PTX (below) |
+| nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives |
 | nvJPEG | `libnvjpeg.so.13` | baseline JPEG decode and encode |
 | NVENC | `libnvidia-encode.so.1` | video encode |
@@ -236,6 +238,43 @@ PTX. That is what turned up two gaps in the PTX parser — a forward-declared
 `.entry` prototype, and a global initialised with another symbol's address —
 both of which appear in ordinary nvcc output and are now handled.
 
+## nvJitLink and nvFatbin: linking stops at PTX
+
+nvJitLink is the device linker as a library. NVIDIA's compiles every input to
+SASS and links a cubin; VirtualGPU executes PTX, so its nvJitLink links the
+inputs' PTX into one module and hands that module out as the "cubin" -- the
+choice NVRTC's shim makes for `nvrtcGetCUBIN`, for the same reason: whatever
+the caller does with a cubin (`cuModuleLoadData`, `cuLibraryLoadData`, write
+it to a file for `cuModuleLoad`, wrap it with nvFatbin) it can do with PTX
+here. `nvJitLinkGetLinkedPtx` returns the same module, without the `-lto -ptx`
+NVIDIA's asks for.
+
+The linking is a linker's, measured against NVIDIA's on an RTX 3060: a
+symbol with external linkage has one definition, a strong one beating a
+`.weak` one; a second strong definition is named in the error log and
+dropped, the link still succeeding (as NVIDIA's does); an undefined reference
+fails the link with `NVJITLINK_ERROR_INTERNAL` and its name; each module's
+file-scope names stay its own (two modules may both have a `twice`). The
+linked module declares everything before its first use, the way ptxas
+insists, so NVIDIA's driver JITs it as readily as VirtualGPU runs it.
+
+Inputs are PTX, a fatbin's PTX (the image the driver would pick for
+`-arch`), the device code nvcc puts in a host object's `.nv_fatbin` and
+`__nv_relfatbin` sections and in a static library's members, and VirtualGPU's
+own cubins, which are PTX. A real cubin is refused (SASS cannot be relinked
+here), and so is LTO-IR, NVVM bitcode that only NVIDIA's compiler reads --
+both by name in the error log, with what to add instead.
+
+nvFatbin needs no GPU at all, so it is the whole library: it writes the
+container NVIDIA's writes with `-compress=false`, entry for entry, and
+NVIDIA's driver loads it as VirtualGPU's loaders do. It never compresses,
+and it takes a VirtualGPU cubin (PTX) as the PTX it is.
+
+`e2e_nvjitlink_paths` and `e2e_nvfatbin_paths` check all of this, and pass
+unchanged against NVIDIA's libnvJitLink and libnvfatbin 13.0 on an RTX 3060
+-- and with VirtualGPU's two libraries in their place on the same card, whose
+driver then runs the linked PTX.
+
 ## What is not implemented
 
 Unimplemented entry points return the library's own "not supported" status
@@ -258,6 +297,12 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.
+- **nvJitLink**: SASS and LTO-IR inputs (a cubin, a fatbin with no PTX, NVVM
+  bitcode, index files), and so link-time optimisation; the cubin it returns
+  is PTX. Code-generation options (`-O`, `-maxrregcount`, `-Xptxas`, ...) are
+  accepted and have nothing to act on.
+- **nvFatbin**: compression (`-compress` is accepted, nothing is compressed)
+  and `nvFatbinAddIndex`, whose index names LTO-IR libraries.
 - **NPP**: a chosen subset -- allocation, per-pixel arithmetic and logic, data
   exchange, colour conversion, thresholding, statistics, box filtering, 3x3
   morphology, mirroring, resizing, and the signal-processing equivalents. The

@@ -2,6 +2,9 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -148,6 +151,19 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
 }
 
 std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
+  std::vector<FatbinPtx> out;
+  for (FatbinImage& im : extract_images(data, bytes, nullptr, /*ptx_only=*/true)) {
+    FatbinPtx px;
+    px.arch = im.arch;
+    px.text = std::move(im.data);
+    while (!px.text.empty() && px.text.back() == '\0') px.text.pop_back();
+    out.push_back(std::move(px));
+  }
+  return out;
+}
+
+std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* consumed,
+                                       bool ptx_only) {
   if (!data) throw Error::make(Err::InvalidValue, "NULL fatbin image");
   const uint8_t* p = static_cast<const uint8_t*>(data);
 
@@ -174,6 +190,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
   need(p, 4, "the magic number");
   uint32_t magic = 0;
   std::memcpy(&magic, p, 4);
+  bool wrapped = false;
   if (magic == kWrapperMagic) {
     need(p, 16, "the fatbin wrapper");
     // __fatBinC_Wrapper_t { int magic; int version; const ull* data; void* filename_or_fatbins; }
@@ -185,6 +202,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
     // so the caller's bound no longer applies past this point.
     bytes = std::numeric_limits<size_t>::max();
     data = inner;
+    wrapped = true;
     std::memcpy(&magic, p, 4);
   }
   if (magic != kFatbinMagic)
@@ -200,7 +218,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
     throw Error::make(Err::InvalidValue, "fatbin declares ", ch.size,
                       " bytes, above the ", kMaxFatbinBytes, "-byte limit; image looks corrupt");
 
-  std::vector<FatbinPtx> out;
+  std::vector<FatbinImage> out;
   need(p, ch.header_size, "the container header it declares");
   const uint8_t* const body = p + ch.header_size;
   // The declared body size is a number from the image. Where the real length is
@@ -208,6 +226,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
   // licence to read that far.
   need(body, ch.size, "the container body it declares");
   const uint8_t* const end = body + ch.size;
+  if (consumed) *consumed = wrapped ? 16 : static_cast<size_t>(end - p);
   const uint8_t* e = body;
   // Every iteration must advance strictly, so a zero-length entry cannot spin.
   while (e < end) {
@@ -225,16 +244,33 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
       throw Error::make(Err::InvalidValue, "fatbin entry payload (", eh.padded_payload_size,
                         " bytes) runs past the end of the image");
 
-    if (eh.kind == 1 /* PTX */) {
-      uint64_t size = eh.payload_size ? eh.payload_size : eh.padded_payload_size;
-      if (size > eh.padded_payload_size)
-        throw Error::make(Err::InvalidValue, "fatbin PTX payload_size (", size,
-                          ") exceeds its padded size (", eh.padded_payload_size, ")");
-      FatbinPtx px;
-      px.arch = eh.arch;
-      if (eh.flags & kFlagZstd) {
-        px.text = decompress_zstd(payload, static_cast<size_t>(size));
-      } else if (eh.flags & kFlagLz4) {
+    const uint8_t* next = payload + eh.padded_payload_size;
+    if (next <= e)
+      throw Error::make(Err::InvalidValue,
+                        "fatbin entry does not advance (header_size and payload both zero); "
+                        "image is malformed");
+    // An entry the caller did not ask for is not decompressed: a SASS image
+    // the PTX path never reads must not fail it (when libzstd is absent, say).
+    if (ptx_only && !is_ptx_kind(eh.kind)) {
+      e = next;
+      continue;
+    }
+    uint64_t size = eh.payload_size ? eh.payload_size : eh.padded_payload_size;
+    if (size > eh.padded_payload_size)
+      throw Error::make(Err::InvalidValue, "fatbin entry payload_size (", size,
+                        ") exceeds its padded size (", eh.padded_payload_size, ")");
+    FatbinImage im;
+    im.kind = eh.kind;
+    im.arch = eh.arch;
+    im.major = eh.major;
+    im.minor = eh.minor;
+    if (eh.name_size && eh.name_offset >= sizeof(EntryHeader) &&
+        uint64_t{eh.name_offset} + eh.name_size <= eh.header_size)
+      im.name.assign(reinterpret_cast<const char*>(e + eh.name_offset), eh.name_size);
+    while (!im.name.empty() && im.name.back() == '\0') im.name.pop_back();
+    auto decode = [&]() -> std::string {
+      if (eh.flags & kFlagZstd) return decompress_zstd(payload, static_cast<size_t>(size));
+      if (eh.flags & kFlagLz4) {
         // A compressed entry carries the uncompressed size in an extended
         // header; without it there is nothing to size the output against.
         if (eh.header_size < 64)
@@ -247,20 +283,25 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
         if (uncompressed == 0 || uncompressed > kMaxFatbinBytes)
           throw Error::make(Err::InvalidValue, "fatbin LZ4 entry declares an uncompressed size of ",
                             uncompressed, ", which is not usable");
-        px.text = decompress_lz4(payload, static_cast<size_t>(size),
-                                 static_cast<size_t>(uncompressed));
-      } else {
-        px.text.assign(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
+        return decompress_lz4(payload, static_cast<size_t>(size), static_cast<size_t>(uncompressed));
       }
-      while (!px.text.empty() && px.text.back() == '\0') px.text.pop_back();
-      out.push_back(std::move(px));
+      return std::string(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
+    };
+    if (is_ptx_kind(eh.kind)) {
+      im.data = decode();
+    } else {
+      // Not every flagged payload is a zstd or LZ4 stream: nvcc's LTO-IR
+      // entries (flags 0x18011) carry something else. What a caller needs of
+      // a non-PTX entry is mostly its kind and arch, so one that does not
+      // decompress is kept as stored rather than failing the whole fatbin.
+      try {
+        im.data = decode();
+      } catch (const Error&) {
+        im.data.assign(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
+        im.stored = true;
+      }
     }
-
-    const uint8_t* next = payload + eh.padded_payload_size;
-    if (next <= e)
-      throw Error::make(Err::InvalidValue,
-                        "fatbin entry does not advance (header_size and payload both zero); "
-                        "image is malformed");
+    out.push_back(std::move(im));
     e = next;
   }
   return out;
@@ -317,5 +358,224 @@ size_t pick_ptx(const std::vector<FatbinPtx>& ptxs, uint32_t cc) {
   }
   return best;
 }
+
+/* ---- writing fatbins, and finding them in host objects ---- */
+
+std::string write_fatbin(const std::vector<FatbinImage>& images) {
+  auto put = [](std::string& out, uint64_t v, int bytes) {
+    for (int i = 0; i < bytes; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+  };
+  auto pad8 = [](std::string& out) {
+    while (out.size() % 8) out.push_back('\0');
+  };
+  std::string body;
+  for (const FatbinImage& im : images) {
+    // The header's tail: the identifier at offset 64, NUL-terminated and
+    // padded to 8, then for PTX an {offset, size} record of the options
+    // string that follows it. NVIDIA's writes an 8-byte empty string when
+    // there are no options, and so does this.
+    std::string tail;
+    tail += im.name;
+    tail.push_back('\0');
+    pad8(tail);
+    uint32_t options_record = 0;
+    if (im.is_ptx()) {
+      options_record = static_cast<uint32_t>(sizeof(EntryHeader) + 16 + tail.size());
+      std::string opts = im.options;
+      pad8(opts);
+      if (opts.empty()) opts.assign(8, '\0');
+      put(tail, options_record + 8, 4);
+      put(tail, im.options.size(), 4);
+      tail += opts;
+    }
+    std::string payload = im.data;
+    if (im.is_ptx() && (payload.empty() || payload.back() != '\0')) payload.push_back('\0');
+    pad8(payload);
+    const uint32_t header_size = static_cast<uint32_t>(sizeof(EntryHeader) + 16 + tail.size());
+    put(body, im.kind, 2);
+    put(body, 0x0101, 2);                 // entry version, as both writers set it
+    put(body, header_size, 4);
+    put(body, payload.size(), 8);         // padded payload size
+    put(body, 0, 4);                      // payload size: 0 means "uncompressed, see above"
+    put(body, options_record, 4);
+    put(body, im.minor, 2);
+    put(body, im.major, 2);
+    put(body, im.arch, 4);
+    put(body, sizeof(EntryHeader) + 16, 4);   // identifier offset
+    put(body, im.name.size(), 4);
+    put(body, 0x11, 8);                   // flags: 64-bit, Linux host, no compression
+    put(body, 0, 8);
+    put(body, 0, 8);                      // uncompressed size: unused, nothing is compressed
+    body += tail;
+    body += payload;
+  }
+  std::string out;
+  put(out, kFatbinMagic, 4);
+  put(out, 1, 2);                         // container version
+  put(out, sizeof(ContainerHeader), 2);
+  put(out, body.size(), 8);
+  out += body;
+  return out;
+}
+
+namespace {
+
+template <class T>
+T read_le(const uint8_t* p) {
+  T v;
+  std::memcpy(&v, p, sizeof v);
+  return v;
+}
+
+bool is_elf(const uint8_t* p, size_t n) {
+  return n >= 64 && p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F' && p[4] == 2;
+}
+
+constexpr uint16_t kEmCuda = 190;
+
+}  // namespace
+
+std::vector<std::pair<std::string, std::string>> elf_sections(const void* data, size_t bytes) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!p || !is_elf(p, bytes)) return out;
+  const uint64_t shoff = read_le<uint64_t>(p + 0x28);
+  const uint16_t shentsize = read_le<uint16_t>(p + 0x3a);
+  const uint16_t shnum = read_le<uint16_t>(p + 0x3c);
+  const uint16_t shstrndx = read_le<uint16_t>(p + 0x3e);
+  if (shnum == 0) return out;
+  if (shentsize < 64 || shoff > bytes || uint64_t{shentsize} * shnum > bytes - shoff ||
+      shstrndx >= shnum)
+    throw Error::make(Err::InvalidValue, "ELF file's section table does not fit its ", bytes,
+                      " bytes");
+  auto section = [&](uint16_t i, uint64_t* off, uint64_t* size) {
+    const uint8_t* sh = p + shoff + uint64_t{i} * shentsize;
+    *off = read_le<uint64_t>(sh + 0x18);
+    *size = read_le<uint64_t>(sh + 0x20);
+    if (read_le<uint32_t>(sh + 4) == 8) *size = 0;   // SHT_NOBITS occupies no file bytes
+    if (*off > bytes || *size > bytes - *off)
+      throw Error::make(Err::InvalidValue, "ELF section ", i, " runs past the end of the file");
+    return read_le<uint32_t>(sh);   // sh_name
+  };
+  uint64_t stroff = 0, strsize = 0;
+  section(shstrndx, &stroff, &strsize);
+  for (uint16_t i = 0; i < shnum; ++i) {
+    uint64_t off = 0, size = 0;
+    const uint32_t name_at = section(i, &off, &size);
+    std::string name;
+    if (name_at < strsize) {
+      const char* n = reinterpret_cast<const char*>(p + stroff + name_at);
+      name.assign(n, strnlen(n, static_cast<size_t>(strsize - name_at)));
+    }
+    out.emplace_back(std::move(name),
+                     std::string(reinterpret_cast<const char*>(p + off), static_cast<size_t>(size)));
+  }
+  return out;
+}
+
+std::vector<std::string> host_object_fatbins(const void* data, size_t bytes, bool relocatable_only) {
+  std::vector<std::string> out;
+  for (const auto& [name, contents] : elf_sections(data, bytes)) {
+    if (name != "__nv_relfatbin" && (relocatable_only || name != ".nv_fatbin")) continue;
+    // A section holds containers back to back (a linked program has one per
+    // translation unit), each starting on an 8-byte boundary.
+    const uint8_t* s = reinterpret_cast<const uint8_t*>(contents.data());
+    const size_t size = contents.size();
+    size_t at = 0;
+    while (at + sizeof(ContainerHeader) <= size) {
+      if (read_le<uint32_t>(s + at) != kFatbinMagic) {
+        at += 8;
+        continue;
+      }
+      size_t used = 0;
+      extract_images(s + at, size - at, &used, /*ptx_only=*/true);
+      out.emplace_back(reinterpret_cast<const char*>(s + at), used);
+      at += (used + 7) / 8 * 8;
+    }
+  }
+  return out;
+}
+
+std::vector<std::pair<std::string, std::string>> archive_members(const void* data, size_t bytes) {
+  const char* p = static_cast<const char*>(data);
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!p || bytes < 8 || std::memcmp(p, "!<arch>\n", 8) != 0)
+    throw Error::make(Err::InvalidValue, "not an ar archive (no !<arch> signature)");
+  std::string long_names;
+  size_t at = 8;
+  while (at + 60 <= bytes) {
+    const char* h = p + at;
+    if (h[58] != '`' || h[59] != '\n')
+      throw Error::make(Err::InvalidValue, "ar archive member header at offset ", at,
+                        " is malformed");
+    const std::string size_field(h + 48, 10);
+    char* end = nullptr;
+    const unsigned long long size = std::strtoull(size_field.c_str(), &end, 10);
+    if (end == size_field.c_str() || size > bytes - at - 60)
+      throw Error::make(Err::InvalidValue, "ar archive member at offset ", at,
+                        " runs past the end of the archive");
+    std::string name(h, 16);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    const char* body = h + 60;
+    if (name == "//") {
+      long_names.assign(body, size);   // GNU's table of names longer than 15 characters
+    } else if (name == "/" || name == "/SYM64/") {
+      // the symbol index: not a member
+    } else {
+      if (name.size() > 1 && name[0] == '/' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+        const size_t off = std::strtoul(name.c_str() + 1, nullptr, 10);
+        if (off < long_names.size())
+          name = long_names.substr(off, long_names.find('\n', off) - off);
+      }
+      if (!name.empty() && name.back() == '/') name.pop_back();
+      out.emplace_back(name, std::string(body, size));
+    }
+    at += 60 + size + (size & 1);   // members start on even offsets
+  }
+  return out;
+}
+
+BlobKind classify_blob(const void* data, size_t bytes) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  if (!p || bytes < 4) return BlobKind::Unknown;
+  const uint32_t magic = read_le<uint32_t>(p);
+  if (magic == kFatbinMagic || magic == kWrapperMagic) return BlobKind::Fatbin;
+  if (is_elf(p, bytes))
+    return read_le<uint16_t>(p + 18) == kEmCuda ? BlobKind::Cubin : BlobKind::HostObject;
+  if (bytes >= 8 && std::memcmp(p, "!<arch>\n", 8) == 0) return BlobKind::Archive;
+  // NVVM's LTO-IR (what nvcc -dlto and NVRTC's -dlto emit starts with
+  // ed 43 4e 7f), and bare or wrapped LLVM bitcode.
+  if (magic == 0x7f4e43edu || magic == 0xdec04342u || magic == 0x0b17c0deu) return BlobKind::LtoIr;
+  // PTX: text whose first directive, past blank lines and comments, is .version.
+  size_t i = 0;
+  while (i < bytes) {
+    const char c = static_cast<char>(p[i]);
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      ++i;
+    } else if (c == '/' && i + 1 < bytes && p[i + 1] == '/') {
+      while (i < bytes && p[i] != '\n') ++i;
+    } else if (c == '/' && i + 1 < bytes && p[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < bytes && !(p[i] == '*' && p[i + 1] == '/')) ++i;
+      i += 2;
+    } else {
+      break;
+    }
+  }
+  if (bytes - std::min(i, bytes) >= 8 && std::memcmp(p + i, ".version", 8) == 0) return BlobKind::Ptx;
+  return BlobKind::Unknown;
+}
+
+uint32_t cubin_arch(const void* data, size_t bytes) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  if (!p || !is_elf(p, bytes) || read_le<uint16_t>(p + 18) != kEmCuda) return 0;
+  // e_flags names the SM. Its place moved with the CUDA ELF ABI version
+  // (e_ident[8]), as cubins from the two toolkits show: CUDA 12.0's (ABI 7)
+  // carry sm_86 as 0x560556, the low byte; CUDA 13.0's (ABI 8) as 0x6005604,
+  // the second byte -- 0x5a04 for sm_90a, 0x7802 for sm_120.
+  const uint32_t flags = read_le<uint32_t>(p + 0x30);
+  return p[8] >= 8 ? (flags >> 8) & 0xff : flags & 0xff;
+}
+
 
 }  // namespace vgpu::cuda

@@ -721,6 +721,15 @@ class Parser {
     }
     // .noreturn and friends may sit between the signature and the body.
     while (peek().kind == Token::Kind::Word && peek().text[0] == '.' && !peek_punct("{")) {
+      // A prototype carries the attribute too: ".func abort() .noreturn;",
+      // which is how a linked module declares a function it defines later.
+      if (peek().text == ".noreturn" && peek(1).kind == Token::Kind::Punct && peek(1).text == ";") {
+        next();
+        next();
+        current_kernel_.clear();
+        cur_fn_ = nullptr;
+        return false;
+      }
       if (peek().text == ".noreturn" || peek().text == ".pragma") {
         next();
         while (!at_end() && !peek_punct(";") && !peek_punct("{")) next();
