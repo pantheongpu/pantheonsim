@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -152,7 +153,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data) {
 
 std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
   std::vector<FatbinPtx> out;
-  for (FatbinImage& im : extract_images(data, bytes, nullptr, /*ptx_only=*/true)) {
+  for (FatbinImage& im : extract_images(data, bytes, nullptr, kFatbinPtx | kFatbinRelocPtx)) {
     FatbinPtx px;
     px.arch = im.arch;
     px.text = std::move(im.data);
@@ -163,7 +164,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
 }
 
 std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* consumed,
-                                       bool ptx_only) {
+                                       uint16_t kinds) {
   if (!data) throw Error::make(Err::InvalidValue, "NULL fatbin image");
   const uint8_t* p = static_cast<const uint8_t*>(data);
 
@@ -251,7 +252,7 @@ std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* 
                         "image is malformed");
     // An entry the caller did not ask for is not decompressed: a SASS image
     // the PTX path never reads must not fail it (when libzstd is absent, say).
-    if (ptx_only && !is_ptx_kind(eh.kind)) {
+    if (!(eh.kind & kinds)) {
       e = next;
       continue;
     }
@@ -305,6 +306,17 @@ std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* 
     e = next;
   }
   return out;
+}
+
+std::vector<FatbinPtx> extract_elf(const void* data, size_t bytes) {
+  std::vector<FatbinPtx> out;
+  for (FatbinImage& im : extract_images(data, bytes, nullptr, kFatbinElf))
+    if (!im.stored) out.push_back({im.arch, std::move(im.data)});
+  return out;
+}
+
+std::vector<FatbinPtx> extract_elf(const void* data) {
+  return extract_elf(data, std::numeric_limits<size_t>::max());
 }
 
 // The ".target sm_XY[a|f]" line of a PTX image: the number, and the suffix
@@ -488,7 +500,7 @@ std::vector<std::string> host_object_fatbins(const void* data, size_t bytes, boo
         continue;
       }
       size_t used = 0;
-      extract_images(s + at, size - at, &used, /*ptx_only=*/true);
+      extract_images(s + at, size - at, &used, kFatbinPtx);
       out.emplace_back(reinterpret_cast<const char*>(s + at), used);
       at += (used + 7) / 8 * 8;
     }

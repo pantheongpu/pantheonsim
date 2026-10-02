@@ -38,9 +38,9 @@ for lib in "$@"; do
   if (( ${#have[@]} == 0 )); then
     echo "SKIP: the $lib shim is not built (CUDA ABI headers absent at build time)"; exit 0
   fi
-  # cuStateVec is not part of the toolkit, so nvcc has no copy to link
-  # against: link against the shim's, which follows NVIDIA's ABI.
-  [[ "$lib" == custatevec ]] && links+=("-L$shim")
+  # cuStateVec and cuDSS are not part of the toolkit, so nvcc has no copy to
+  # link against: link against the shim's, which follows NVIDIA's ABI.
+  [[ "$lib" == custatevec || "$lib" == cudss ]] && links+=("-L$shim")
   links+=("-l$lib")
 done
 trap 'rm -f "$out"' EXIT

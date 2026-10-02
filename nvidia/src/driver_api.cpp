@@ -32,6 +32,8 @@
 
 #include "error_names.hpp"
 #include "fatbin.hpp"
+#include "vgpu/sass/cubin.hpp"
+#include "vgpu/sass/exec.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -1091,17 +1093,47 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
     std::string extracted;
     uint32_t magic = 0;
     std::memcpy(&magic, image, 4);
-    if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
-      // A fatbin (wrapper or container): pull out the PTX image.
-      extracted = best_ptx(image);
-      text = extracted.c_str();
-    } else if (text[0] == 0x7f) {
-      throw vgpu::Error::make(vgpu::Err::Unsupported,
-                              "cuModuleLoadData received a bare cubin/ELF image; VirtualGPU loads "
-                              "PTX (embedded PTX text or a fatbin containing PTX)");
-    }
     int dev = current_device(s);
-    uint64_t mid = s.rt->device(dev).load_module(text);
+    uint64_t mid = 0;
+    const vgpu::DeviceProfile& prof = s.rt->device(dev).profile();
+    const uint32_t cc = static_cast<uint32_t>(prof.cc_major * 10 + prof.cc_minor);
+    if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
+      // A fatbin (wrapper or container): its SASS for this GPU if it has
+      // some, as the real driver runs; else its PTX.
+      const std::string cubin = vgpu::cuda::pick_cubin(image, cc);
+      if (!cubin.empty()) {
+        mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size());
+      } else {
+        extracted = best_ptx(image);
+        text = extracted.c_str();
+        mid = s.rt->device(dev).load_module(text);
+      }
+    } else if (magic == 0x464c457fu) {
+      // An ELF image: a cubin. The first eight bytes say whether it is a
+      // 64-bit CUDA one before anything further is read from a pointer that
+      // came with no length.
+      const auto* b = static_cast<const uint8_t*>(image);
+      if (b[4] != 2 || b[7] != 0x41) return CUDA_ERROR_INVALID_IMAGE;
+      // A bare cubin: its size is in its own headers (the section table ends it).
+      uint64_t shoff;
+      uint16_t shentsize, shnum;
+      std::memcpy(&shoff, b + 0x28, 8);
+      std::memcpy(&shentsize, b + 0x3a, 2);
+      std::memcpy(&shnum, b + 0x3c, 2);
+      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;
+      uint32_t eflags;
+      std::memcpy(&eflags, b + 0x30, 4);
+      const int sm = static_cast<int>((eflags >> 8) & 0xff);
+      if (!vgpu::sass::runs_on(sm, false, static_cast<int>(cc))) return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      try {
+        mid = s.rt->device(dev).load_cubin(b, size);
+      } catch (const vgpu::Error& e) {
+        if (e.code() == vgpu::Err::InvalidValue) return CUDA_ERROR_INVALID_IMAGE;
+        throw;
+      }
+    } else {
+      mid = s.rt->device(dev).load_module(text);
+    }
     bind_managed_globals(s, dev, mid);
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};

@@ -14,6 +14,11 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
+
+namespace vgpu {
+class MemoryManager;
+}
 
 namespace vgpu::exec {
 
@@ -84,5 +89,45 @@ struct TextureDesc {
 
 // Handle -> descriptor, owned by the device and consulted during a launch.
 using TextureTable = std::map<uint64_t, TextureDesc>;
+
+// ---- sampling, shared by the PTX interpreter and the SASS executor ----
+//
+// These throw vgpu::Error saying what is wrong with the access; the caller
+// adds which instruction and lane.
+
+// The descriptor for a handle, checked to be the kind of object wanted.
+const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, TexKind want);
+
+// One texture fetch (tex, tld4) by one thread.
+struct TexFetch {
+  uint32_t dims = 1;           // spatial coordinates: 1, 2 or 3 (3 for a cube's direction)
+  bool layered = false;        // a layer index comes with the coordinates
+  bool cube = false;
+  uint32_t layer = 0;          // unsigned: past the end reads the last layer
+  uint32_t coord[3] = {};      // register bits: f32 when float_coords, s32 otherwise
+  bool float_coords = true;
+  bool float_result = true;    // f32 destination (else s32/u32)
+  bool explicit_lod = false;
+  double lod = 0;
+  int gather = -1;             // tld4: the component (0..3) gathered, or -1
+};
+// out: the four components (tld4: the four texels' component).
+void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]);
+
+// One surface access (suld, sust) by one thread; the policy values are
+// ptx::SurfaceOob's.
+enum : uint8_t { kSurfaceTrap = 0, kSurfaceClamp = 1, kSurfaceZero = 2 };
+struct SurfaceAccess {
+  uint32_t dims = 1;
+  bool layered = false;
+  uint32_t layer = 0;
+  int64_t x = 0;               // in bytes
+  int64_t y = 0, z = 0;        // in rows and slices
+  uint32_t bytes = 4;          // the whole access
+  uint8_t oob = kSurfaceTrap;
+};
+// The address the access reads or writes, or none for a .zero access out of
+// range.
+std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a);
 
 }  // namespace vgpu::exec

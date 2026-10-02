@@ -10,12 +10,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 
 #include "vgpu/error.hpp"
 #include <cctype>
 
 #include "vgpu/ptx/parser.hpp"
+#include "vgpu/sass/exec.hpp"
 
 #include <map>
 #include <set>
@@ -150,6 +152,54 @@ bool split_pieces(const std::string& t, std::vector<Piece>* out) {
     if (braces != 0) return false;
     const Piece::Kind kind = body ? (is_entry ? Piece::Entry : Piece::Func) : Piece::Decl;
     out->push_back({kind, begin, i, body ? name : std::string()});
+  }
+}
+
+// VGPU_KERNEL_DIGEST=<file>: after every launch, a line with the kernel's
+// name and a hash of each allocation its arguments point into (any 8-byte
+// argument word that is a device address). Two runs of one program -- on
+// PTX (VGPU_SASS=0) and on SASS, say -- diverge first at the kernel that
+// wrote something different, which `diff` then names. Run with
+// VGPU_THREADS=1: blocks racing on atomics can otherwise differ run to run.
+void digest_launch(const MemoryManager& mem, const std::string& name, const std::vector<std::vector<uint8_t>>& args) {
+  static const char* const path = std::getenv("VGPU_KERNEL_DIGEST");
+  if (!path || !*path) return;
+  static std::mutex mu;
+  static uint64_t seq = 0;
+  std::map<uint64_t, uint64_t> allocs;   // base -> size
+  for (const std::vector<uint8_t>& a : args)
+    for (size_t i = 0; i + 8 <= a.size(); i += 8) {
+      uint64_t v, base, size;
+      std::memcpy(&v, &a[i], 8);
+      if (v && mem.find_allocation(v, &base, &size)) allocs[base] = size;
+    }
+  std::string line;
+  std::vector<uint8_t> buf;
+  for (const auto& [base, size] : allocs) {
+    uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a
+    uint64_t nans = 0, infs = 0;          // aligned words that are f32 NaNs and infinities: where one first appears
+    for (uint64_t at = 0; at < size;) {
+      const uint64_t n = std::min<uint64_t>(size - at, uint64_t{1} << 20);
+      buf.resize(n);
+      mem.read(base + at, buf.data(), n);
+      for (uint8_t c : buf) h = (h ^ c) * 0x100000001b3ull;
+      for (uint64_t i = 0; i + 4 <= n; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, &buf[i], 4);
+        nans += (v & 0x7f800000u) == 0x7f800000u && (v & 0x7fffffu);
+        infs += (v & 0x7fffffffu) == 0x7f800000u;
+      }
+      at += n;
+    }
+    char b[96];
+    std::snprintf(b, sizeof b, " %llx:%016llx:nan%llu:inf%llu", static_cast<unsigned long long>(base),
+                  static_cast<unsigned long long>(h), static_cast<unsigned long long>(nans), static_cast<unsigned long long>(infs));
+    line += b;
+  }
+  std::lock_guard<std::mutex> g(mu);
+  if (FILE* f = std::fopen(path, "a")) {
+    std::fprintf(f, "%llu %s%s\n", static_cast<unsigned long long>(seq++), name.c_str(), line.c_str());
+    std::fclose(f);
   }
 }
 
@@ -305,6 +355,48 @@ uint64_t Device::load_module(const std::string& ptx_src) {
   }
 }
 
+uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
+  std::shared_ptr<sass::Module> sm = sass::load(image, size, mem_, profile_);
+  auto mod = std::make_shared<ptx::Module>();
+  mod->target = "sm_" + std::to_string(sm->sm);
+  for (const sass::CubinKernel& k : sm->cubin.kernels) {
+    ptx::EntryFn e;
+    e.name = k.name;
+    for (const sass::CubinParam& p : k.params) {
+      ptx::ParamDecl d;
+      d.name = k.name + "_param_" + std::to_string(p.ordinal);
+      d.size = p.size;
+      d.align = p.size >= 8 ? 8 : p.size >= 4 ? 4 : 1;
+      e.params.push_back(d);
+    }
+    e.static_shared_size = static_cast<uint32_t>(k.shared_bytes);
+    e.dynamic_shared_offset = e.static_shared_size;
+    e.local_frame_size = std::max(k.frame_size, k.min_stack);
+    if (k.max_threads) e.max_ntid = {k.max_threads, 1, 1};
+    e.req_cluster = k.cluster;
+    e.explicit_cluster = k.explicit_cluster;
+    // The register count is ptxas's, not an estimate from PTX.
+    e.regs_analyzed = true;
+    e.cached_regs_per_thread = k.regs;
+    e.sass = sm;
+    mod->entries.push_back(std::move(e));
+  }
+  LoadedModule lm;
+  lm.id = next_module_id_++;
+  for (const auto& [name, va] : sm->symbol_va) lm.symbols[name] = va;
+  for (const auto& e : mod->entries) {
+    const uint64_t va = next_kernel_va_;
+    next_kernel_va_ += kKernelVaStride;
+    lm.symbols[e.name] = va;
+    lm.kernels.emplace_back(va, &e);
+  }
+  lm.mod = std::move(mod);
+  lm.sass = std::move(sm);
+  const uint64_t id = lm.id;
+  modules_.push_back(std::move(lm));
+  return id;
+}
+
 void Device::reset() {
   // Modules first: their globals are allocations, and unloading frees them by
   // handle. Whatever is left afterwards -- cudaMalloc, arrays, pitched
@@ -318,6 +410,7 @@ void Device::unload_module(uint64_t module_id) {
   for (auto it = modules_.begin(); it != modules_.end(); ++it) {
     if (it->id == module_id) {
       for (uint64_t va : it->global_vas) mem_.free(va);
+      if (it->sass) sass::unload(*it->sass, mem_);
       modules_.erase(it);
       return;
     }
@@ -428,6 +521,10 @@ void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t
     if (it == lm.symbols.end() || !lm.mod)
       throw Error::make(Err::NotFound, "module ", module_id, " has no global '", name, "'");
     it->second = addr;
+    if (lm.sass) {   // a cubin: its code and banks hold the address, patched again
+      sass::rebind(*lm.sass, mem_, name, addr);
+      return;
+    }
     // A global initialised with this one's address now holds the new one.
     for (const auto& g : lm.mod->globals)
       for (const auto& si : g.init_symbols)
@@ -444,6 +541,7 @@ void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t
 std::vector<std::string> Device::managed_globals(uint64_t module_id) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id) continue;
+    if (lm.sass) return lm.sass->managed;
     std::vector<std::string> out;
     if (lm.mod)
       for (const auto& g : lm.mod->globals)
@@ -458,6 +556,13 @@ bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr,
     if (lm.id != module_id) continue;
     const auto it = lm.symbols.find(name);
     if (it == lm.symbols.end() || !lm.mod) return false;
+    if (lm.sass) {   // a cubin's variables
+      const auto sz = lm.sass->symbol_size.find(name);
+      if (sz == lm.sass->symbol_size.end()) return false;
+      if (addr) *addr = it->second;
+      if (size) *size = sz->second;
+      return true;
+    }
     for (const auto& g : lm.mod->globals)
       if (g.name == name) {
         if (addr) *addr = it->second;
@@ -892,6 +997,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
   try {
     run_kernel(fn, cfg, args, syms);
+    digest_launch(mem_, fn.name, args);
   } catch (const Error& e) {
     if (fault_) {
       try {
@@ -906,6 +1012,17 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
 
 void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
+  if (fn.sass) {
+    // SASS: the executor for machine code (nvidia/docs/sass.md), after the
+    // launch checks both engines make. __cluster_dims__ applies whether or
+    // not the launch names a cluster, as in the PTX engine.
+    exec::LaunchConfig c = cfg;
+    if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
+    exec::validate_launch(fn, c, profile_);
+    report_counters(ordinal_, fn.name, c, sass::launch(*fn.sass, fn.name, c, args, mem_, profile_));
+    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), 0.0);
+    return;
+  }
   if (!telemetry_) {
     report_counters(ordinal_, fn.name, cfg, exec::launch(fn, cfg, args, mem_, profile_, syms));
     return;

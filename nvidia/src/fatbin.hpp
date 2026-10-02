@@ -72,14 +72,31 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes);
 // two-argument form anywhere a size exists.
 std::vector<FatbinPtx> extract_ptx(const void* data);
 
+// The fatbin's cubins (ELF images of SASS), by the same walk: `arch` is the
+// SASS architecture (86 for sm_86), `text` the ELF bytes.
+std::vector<FatbinPtx> extract_elf(const void* data, size_t bytes);
+std::vector<FatbinPtx> extract_elf(const void* data);
+
+// The cubin a device of compute capability `cc` runs from a fatbin, as the
+// driver picks it: SASS built for exactly this architecture, or else the
+// newest the device can run (the same major, an older minor). Only linked
+// cubins (ET_EXEC): relocatable ones (-rdc) need a device link first, and
+// the PTX path links those. Empty when there is none, when VGPU_SASS=0
+// asks for PTX only, or when the cubin holds an instruction the SASS
+// executor does not run yet and the fatbin has PTX (VGPU_SASS=1: the cubin
+// regardless). In fatbin_sass.cpp, apart from the rest: it needs the SASS
+// executor, which nvJitLink and nvFatbin, built from this file, do not carry.
+std::string pick_cubin(const void* fatbin, uint32_t cc);
+
 // Every entry of one fatbin container, not only the PTX: what nvJitLink and
 // nvFatbin need to tell a SASS-only or LTO-IR-only input from one they can
 // use. `consumed`, when given, receives the container's size in bytes, so a
 // caller can walk the several containers a host object's section holds back
-// to back. With `ptx_only`, other entries are skipped without being
-// decompressed (extract_ptx's behaviour).
+// to back. `kinds` -- kind values or'd together, which are powers of two --
+// selects entries; the rest are skipped without being decompressed, so a SASS
+// image the PTX path never reads cannot fail it.
 std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* consumed = nullptr,
-                                        bool ptx_only = false);
+                                        uint16_t kinds = 0xffff);
 
 // A fatbin container holding `images`, uncompressed, laid out as NVIDIA's
 // libnvfatbin lays out an uncompressed one (-compress=false): the 16-byte
