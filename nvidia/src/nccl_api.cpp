@@ -13,9 +13,24 @@
 // rank's call inside ncclGroupStart/End -- go through the same path, so there is
 // only one implementation to get right.
 //
-// Not implemented: the network plugin interface, user-defined reduction
-// operators (ncclRedOpCreatePreMulSum), symmetric memory windows, and the
-// non-blocking config. Those return ncclInvalidUsage rather than a wrong answer.
+// Communicators can be split (ncclCommSplit), shrunk (ncclCommShrink) and made
+// non-blocking (ncclConfig_t.blocking = 0, whose work then runs on a background
+// thread and is polled through ncclCommGetAsyncError). Pre-multiplied sums
+// (ncclRedOpCreatePreMulSum) are the one kind of user-defined reduction NCCL
+// has. Where the API leaves behaviour open, it was measured against NCCL 2.29.7
+// on two RTX 3060s, one rank per GPU; those measurements are noted where they
+// are used, as "card:".
+//
+// Not implemented, by design rather than by omission:
+//  - symmetric memory windows. ncclCommWindowRegister succeeds and returns a
+//    NULL window, which is what NCCL itself does on a machine without the
+//    peer-to-peer mappings windows are built on (the RTX 3060 pair measured);
+//    collectives on the buffer work as they always do. A real window would
+//    promise device-side loads and stores into peer memory, which another
+//    process's simulated device cannot offer through a file.
+//  - the network plugin interface. A plugin is something NCCL dlopens to drive
+//    a NIC; there is no network transport here for one to replace, so
+//    NCCL_NET_PLUGIN and NCCL_NET are not read.
 #include <nccl.h>
 
 #include <fcntl.h>
@@ -24,16 +39,23 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -46,7 +68,7 @@ namespace {
 
 constexpr int kMaxRanks = 64;          // a simulated rack, not a real cluster
 constexpr uint32_t kMagic = 0x4e470756;  // "V\a GN"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;         // 2: the abort flag
 
 bool quiet() { const char* q = std::getenv("VGPU_QUIET"); return q && q[0] == '1'; }
 
@@ -64,7 +86,7 @@ struct Meta {
   uint32_t magic;
   uint32_t version;
   uint32_t nranks;
-  uint32_t pad;
+  std::atomic<uint32_t> aborted;  // a rank called ncclCommAbort: nobody waits for it any more
   std::atomic<uint32_t> joined;
   std::atomic<uint64_t> phase[kMaxRanks];  // last collective this rank deposited
   std::atomic<uint64_t> done[kMaxRanks];   // last collective this rank finished reading
@@ -166,14 +188,65 @@ struct Rendezvous {
   }
 };
 
+// What a communicator was configured with, as far as anything here acts on it.
+// The rest of ncclConfig_t tunes CTAs, channels and NVLS, none of which exist.
+struct CommConfig {
+  int blocking = 1;
+};
+
+// NCCL_COMM_BLOCKING sets the default for a config that leaves blocking unset.
+int default_blocking() {
+  const char* e = std::getenv("NCCL_COMM_BLOCKING");
+  return (e && e[0] == '0') ? 0 : 1;
+}
+
+// A pre-multiplied sum (ncclRedOpCreatePreMulSum). The scalar is read at
+// creation for ncclScalarHostImmediate and when the collective runs otherwise.
+struct UserOp {
+  bool live = false;
+  ncclDataType_t dt = ncclFloat32;
+  bool on_device = false;
+  unsigned char host[8] = {};
+  const void* dev = nullptr;
+};
+
 struct Comm {
   Rendezvous* rz = nullptr;
   int rank = 0;
   int nranks = 1;
   int cuda_dev = 0;
-  uint64_t seq = 0;   // collectives issued on this communicator so far
-  ncclResult_t async = ncclSuccess;
+  uint64_t seq = 0;      // collectives issued on this communicator so far
+  uint64_t shrinks = 0;  // ncclCommShrink calls, which name the child's rendezvous
+  CommConfig cfg;
+  bool finalized = false;
+  // ncclCommGetAsyncError's answer: an error that outlives the call that found
+  // it (a peer aborting, a non-blocking batch failing).
+  std::atomic<int> state{ncclSuccess};
+  std::atomic<int> pending{0};             // non-blocking batches still running
+  std::atomic<bool> init_pending{false};   // non-blocking init, until every rank joined
+  std::atomic<bool> aborted{false};
+  std::mutex mu;                           // guards tail and redops
+  std::shared_future<void> tail;           // the last background batch on this comm
+  std::vector<UserOp> redops;              // see redop_handle
+  uint32_t salt = 0;                       // this communicator's tag in its redop handles
 };
+
+// card: user operators' handles differ from one communicator to the next, so
+// destroying one on the wrong communicator is caught rather than destroying
+// that communicator's own. Handles here are ncclNumOps + (salt << 16) + index.
+constexpr uint32_t kRedopSlots = 1u << 16;
+std::atomic<uint32_t> g_next_salt{1};
+ncclRedOp_t redop_handle(const Comm* c, size_t idx) {
+  return static_cast<ncclRedOp_t>(ncclNumOps + ((c->salt << 16) | (uint32_t)idx));
+}
+// The slot `op` names on `c`, or -1.
+long redop_slot(const Comm* c, ncclRedOp_t op) {
+  if (op < ncclNumOps) return -1;
+  const uint32_t v = (uint32_t)op - ncclNumOps;
+  if ((v >> 16) != c->salt) return -1;
+  const size_t idx = v & (kRedopSlots - 1);
+  return idx < c->redops.size() && c->redops[idx].live ? (long)idx : -1;
+}
 
 std::mutex g_mu;
 std::unordered_map<std::string, Rendezvous*> g_rendezvous;
@@ -183,13 +256,26 @@ bool mkdir_p(const std::string& p) {
   return false;
 }
 
+// A child communicator (split, shrink, a scalable init) has no unique id of its
+// own; every member derives the same rendezvous name from what they agree on.
+std::string derived_base(const std::string& dir, const std::string& key) {
+  auto fnv = [&](uint64_t h) {
+    for (unsigned char ch : key) { h ^= ch; h *= 0x100000001b3ull; }
+    return h;
+  };
+  char buf[40];
+  std::snprintf(buf, sizeof buf, "%016llx%016llx", (unsigned long long)fnv(0xcbf29ce484222325ull),
+                (unsigned long long)fnv(0x84222325cbf29ce4ull));
+  return dir + "/" + buf;
+}
+
+std::string dir_of(const std::string& base) { return base.substr(0, base.rfind('/')); }
+
 // Create the metadata file exactly once, whichever rank gets there first.
 // Build it under a private name and link() it into place: link fails with
 // EEXIST rather than truncating, so no rank can ever see a half-built segment.
-Rendezvous* attach(const ncclUniqueId& id, int nranks, std::string* err) {
-  const std::string dir = rendezvous_dir();
-  if (!mkdir_p(dir)) { *err = "cannot create " + dir; return nullptr; }
-  const std::string base = dir + "/" + hex16(id);
+Rendezvous* attach(const std::string& base, int nranks, std::string* err) {
+  if (!mkdir_p(dir_of(base))) { *err = "cannot create " + dir_of(base); return nullptr; }
   const std::string meta_path = base + ".meta";
 
   std::lock_guard<std::mutex> lock(g_mu);
@@ -242,10 +328,86 @@ Rendezvous* attach(const ncclUniqueId& id, int nranks, std::string* err) {
   return rz;
 }
 
+void detach(Rendezvous* rz) {
+  if (!rz) return;
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (--rz->refs <= 0) {
+    g_rendezvous.erase(rz->base);
+    delete rz;  // takes its per-rank mappings with it
+  }
+}
+
+// A communicator on the rendezvous at `base`, joined as `rank`.
+Comm* make_comm(const std::string& base, int nranks, int rank, int dev, const CommConfig& cfg,
+                std::string* err) {
+  Rendezvous* rz = attach(base, nranks, err);
+  if (!rz) return nullptr;
+  auto* c = new Comm();
+  c->rz = rz;
+  c->rank = rank;
+  c->nranks = nranks;
+  c->cuda_dev = dev;
+  c->cfg = cfg;
+  // 15 bits of salt keep every handle below ncclMaxRedOp; past 32767
+  // communicators in one process the tags repeat, which only weakens the check.
+  c->salt = 1 + (g_next_salt.fetch_add(1, std::memory_order_relaxed) - 1) % 0x7ffe;
+  rz->meta->joined.fetch_add(1, std::memory_order_release);
+  return c;
+}
+
+// A non-blocking init is complete once every rank has joined.
+void refresh_init(Comm* c) {
+  if (c->init_pending.load(std::memory_order_acquire) &&
+      (int)c->rz->meta->joined.load(std::memory_order_acquire) >= c->nranks)
+    c->init_pending.store(false, std::memory_order_release);
+}
+
+// card: on a non-blocking communicator whose last operation has not completed,
+// every call -- ncclCommCount included -- fails with ncclInvalidArgument
+// ("Attempt to use communicator before the previous operation returned
+// ncclSuccess"). A collective (`poison`) also leaves that as the
+// communicator's async error; ncclCommCount does not.
+bool busy(Comm* c, bool poison = false) {
+  if (c->cfg.blocking) return false;
+  refresh_init(c);
+  if (c->pending.load(std::memory_order_acquire) == 0 &&
+      !c->init_pending.load(std::memory_order_acquire))
+    return false;
+  std::fprintf(stderr,
+               "[vgpu] nccl: rank %d: communicator used before its previous operation returned "
+               "ncclSuccess (poll ncclCommGetAsyncError first)\n", c->rank);
+  if (poison) c->state.store(ncclInvalidArgument, std::memory_order_release);
+  return true;
+}
+
+// Reads a caller's ncclConfig_t. A NULL config inherits `parent`'s, as NCCL
+// documents for ncclCommSplit and ncclCommShrink, or takes the defaults.
+ncclResult_t parse_config(const ncclConfig_t* in, const CommConfig* parent, CommConfig* out) {
+  if (!in) {
+    *out = parent ? *parent : CommConfig{default_blocking()};
+    return ncclSuccess;
+  }
+  // card: a config not from NCCL_CONFIG_INITIALIZER is ncclInvalidArgument, and
+  // so is blocking = 5 ("Invalid config blocking attribute value 5").
+  if (in->magic != NCCL_API_MAGIC || in->size < offsetof(ncclConfig_t, blocking) + sizeof(int)) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclConfig_t argument not initialized via NCCL_CONFIG_INITIALIZER\n");
+    return ncclInvalidArgument;
+  }
+  int b = in->blocking;
+  if (b == NCCL_CONFIG_UNDEF_INT) b = default_blocking();
+  if (b != 0 && b != 1) {
+    std::fprintf(stderr, "[vgpu] nccl: invalid config blocking attribute value %d\n", b);
+    return ncclInvalidArgument;
+  }
+  out->blocking = b;
+  return ncclSuccess;
+}
+
 // Spin-wait with a deadline. Collectives that never match up are the single
-// most common NCCL bug, so time out with a diagnosis rather than hanging.
+// most common NCCL bug, so time out with a diagnosis rather than hanging. An
+// abort -- this communicator's, or a peer's -- ends the wait early.
 template <class Pred>
-bool wait_for(Pred done, const char* what, int rank) {
+ncclResult_t wait_for(Pred done, const char* what, Comm* c) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_seconds());
   int spins = 0;
@@ -253,17 +415,26 @@ bool wait_for(Pred done, const char* what, int rank) {
     if (++spins > 512) {
       timespec ts{0, 200000};  // 0.2 ms
       nanosleep(&ts, nullptr);
+      if (c->aborted.load(std::memory_order_acquire)) return ncclInvalidUsage;
+      if (c->rz->meta->aborted.load(std::memory_order_acquire)) {
+        if (done()) break;
+        std::fprintf(stderr, "[vgpu] nccl: rank %d gave up waiting for %s: a peer aborted the "
+                             "communicator\n", c->rank, what);
+        c->state.store(ncclRemoteError, std::memory_order_release);
+        return ncclRemoteError;
+      }
       if (std::chrono::steady_clock::now() > deadline) {
         std::fprintf(stderr,
                      "[vgpu] nccl: rank %d timed out waiting for %s after %.0fs. Ranks must "
                      "call the same collectives in the same order; set VGPU_NCCL_TIMEOUT to "
                      "raise the limit.\n",
-                     rank, what, timeout_seconds());
-        return false;
+                     c->rank, what, timeout_seconds());
+        c->state.store(ncclTimeout, std::memory_order_release);
+        return ncclTimeout;
       }
     }
   }
-  return true;
+  return ncclSuccess;
 }
 
 size_t type_size(ncclDataType_t t) {
@@ -399,6 +570,69 @@ void average(void* p, size_t n, ncclDataType_t dt, int nranks) {
   }
 }
 
+/* ---- pre-multiplied sums ----
+   Each rank's input is multiplied by that rank's own scalar, then summed.
+   card (NCCL 2.29.7, two ranks): fp64 results are a chain of fused multiply-adds
+   in rank order -- acc = x0*s0 rounded, then acc = fma(x_r, s_r, acc) -- for
+   every element. fp32 matches that chain on one of the ring's two chunks and the
+   same chain started at the other rank on the other: the ring's chunking picks
+   the order, and no implementation without it can reproduce both. fp16 rounds
+   each product to fp16 before summing, for every element. Integers wrap. */
+
+template <class T>
+void premul_float(void* acc, const void* in, size_t n, const void* sc, bool first) {
+  T* a = static_cast<T*>(acc);
+  const T* x = static_cast<const T*>(in);
+  T s;
+  std::memcpy(&s, sc, sizeof s);
+  for (size_t i = 0; i < n; ++i) a[i] = first ? x[i] * s : std::fma(x[i], s, a[i]);
+}
+
+template <class T>
+void premul_int(void* acc, const void* in, size_t n, const void* sc, bool first) {
+  using U = std::make_unsigned_t<T>;
+  T* a = static_cast<T*>(acc);
+  const T* x = static_cast<const T*>(in);
+  T s;
+  std::memcpy(&s, sc, sizeof s);
+  for (size_t i = 0; i < n; ++i) {
+    const U p = static_cast<U>(static_cast<U>(x[i]) * static_cast<U>(s));
+    a[i] = static_cast<T>(first ? p : static_cast<U>(static_cast<U>(a[i]) + p));
+  }
+}
+
+template <class Raw, float (*ToF)(Raw), Raw (*FromF)(float)>
+void premul_narrow(void* acc, const void* in, size_t n, const void* sc, bool first) {
+  Raw* a = static_cast<Raw*>(acc);
+  const Raw* x = static_cast<const Raw*>(in);
+  Raw s;
+  std::memcpy(&s, sc, sizeof s);
+  const float sf = ToF(s);
+  for (size_t i = 0; i < n; ++i) {
+    const Raw p = FromF(ToF(x[i]) * sf);
+    a[i] = first ? p : FromF(ToF(a[i]) + ToF(p));
+  }
+}
+
+// acc = in * scalar when `first`, acc += in * scalar after that.
+bool premul(void* acc, const void* in, size_t n, ncclDataType_t dt, const void* sc, bool first) {
+  switch (dt) {
+    case ncclInt8: premul_int<int8_t>(acc, in, n, sc, first); return true;
+    case ncclUint8: premul_int<uint8_t>(acc, in, n, sc, first); return true;
+    case ncclInt32: premul_int<int32_t>(acc, in, n, sc, first); return true;
+    case ncclUint32: premul_int<uint32_t>(acc, in, n, sc, first); return true;
+    case ncclInt64: premul_int<int64_t>(acc, in, n, sc, first); return true;
+    case ncclUint64: premul_int<uint64_t>(acc, in, n, sc, first); return true;
+    case ncclFloat32: premul_float<float>(acc, in, n, sc, first); return true;
+    case ncclFloat64: premul_float<double>(acc, in, n, sc, first); return true;
+    case ncclFloat16: premul_narrow<uint16_t, half_to_float, float_to_half>(acc, in, n, sc, first); return true;
+    case ncclBfloat16: premul_narrow<uint16_t, bf16_to_float, float_to_bf16>(acc, in, n, sc, first); return true;
+    case ncclFloat8e4m3: premul_narrow<uint8_t, e4m3_to_f, f_to_e4m3>(acc, in, n, sc, first); return true;
+    case ncclFloat8e5m2: premul_narrow<uint8_t, e5m2_to_f, f_to_e5m2>(acc, in, n, sc, first); return true;
+    default: return false;
+  }
+}
+
 /* ---- group buffering ----
    NCCL lets one thread issue every rank's call between ncclGroupStart and
    ncclGroupEnd; the calls only have to match up by the time the group closes.
@@ -406,28 +640,56 @@ void average(void* p, size_t n, ncclDataType_t dt, int nranks) {
    ops are recorded and run in four passes at ncclGroupEnd -- deposit all,
    collect all, release all, wait for all -- and each pass finishes for every
    op before the next begins. A call made outside a group is just a group of
-   one, which reduces to deposit-collect-release-wait in order. */
+   one, which reduces to deposit-collect-release-wait in order.
 
-enum class Kind { AllReduce, Broadcast, Reduce, AllGather, ReduceScatter, Send, Recv };
+   A group on non-blocking communicators runs the same four passes on a
+   background thread instead, and the call returns ncclInProgress. */
+
+enum class Kind {
+  AllReduce, Broadcast, Reduce, AllGather, ReduceScatter, AlltoAll, Gather, Scatter,
+  Send, Recv,
+  Split,    // a collective on the parent: every rank publishes (color, key)
+  Shrink,   // local: the surviving ranks already agree on who survives
+};
 
 struct Op {
   Kind kind;
   Comm* comm;
   const void* send;
   void* recv;
-  size_t count;          // elements: per-rank for AllGather, per-rank output for ReduceScatter
+  size_t count;          // elements: per rank for AllGather/AlltoAll/Gather/Scatter, per-rank output for ReduceScatter
   ncclDataType_t dt;
   ncclRedOp_t red;
   int root = 0;
   int peer = 0;
   cudaStream_t stream = nullptr;
   uint64_t seq = 0;
-  std::vector<char> staging;   // host copy of the send buffer / assembled output
+  std::vector<char> staging{};   // host copy of the send buffer / assembled output
   bool ok = true;
+  // A pre-multiplied sum carries its scalar; the rank file gets it as a trailer
+  // after the data so every reducer can apply every rank's own.
+  bool premul = false;
+  UserOp scalar{};
+  // Split and Shrink.
+  int32_t color_key[2] = {0, 0};
+  ncclComm_t* out = nullptr;
+  CommConfig child{};
+  std::vector<int> exclude{};
+  uint64_t shrink_epoch = 0;
 };
 
 thread_local int t_group_depth = 0;
 thread_local std::vector<Op> t_pending;
+// card: an argument error on a split or a collective inside a group is also
+// what ncclGroupEnd returns, and the group does not run.
+thread_local ncclResult_t t_group_error = ncclSuccess;
+
+ncclResult_t fail_call(ncclResult_t r) {
+  if (t_group_depth > 0 && t_group_error == ncclSuccess) t_group_error = r;
+  return r;
+}
+
+bool is_collective(Kind k) { return k != Kind::Send && k != Kind::Recv && k != Kind::Shrink; }
 
 // Every device access has to happen with the communicator's device current:
 // inside a group, one thread touches several devices in a row.
@@ -447,13 +709,19 @@ Mapping* writer_for(Rendezvous* rz, int rank, size_t want) {
   return it->second->open_write(rz->rank_path(rank), want) ? it->second : nullptr;
 }
 
-// How many bytes this rank publishes for the given op.
+// How many bytes of data this rank publishes for the given op (not counting a
+// pre-multiplied sum's scalar trailer).
 size_t deposit_bytes(const Op& op) {
   const size_t es = type_size(op.dt);
+  const size_t n = (size_t)op.comm->nranks;
+  const bool root = op.comm->rank == op.root;
   switch (op.kind) {
-    case Kind::AllGather: return op.count * es;                       // each rank's slice
-    case Kind::ReduceScatter: return op.count * op.comm->nranks * es;  // whole input
-    case Kind::Broadcast: return op.comm->rank == op.root ? op.count * es : 0;
+    case Kind::AllGather: case Kind::Gather: return op.count * es;        // each rank's slice
+    case Kind::ReduceScatter: case Kind::AlltoAll: return op.count * n * es;  // whole input
+    case Kind::Broadcast: return root ? op.count * es : 0;
+    case Kind::Scatter: return root ? op.count * n * es : 0;
+    case Kind::Split: return sizeof op.color_key;
+    case Kind::Shrink: case Kind::Recv: return 0;
     default: return op.count * es;
   }
 }
@@ -461,7 +729,7 @@ size_t deposit_bytes(const Op& op) {
 ncclResult_t deposit(Op& op) {
   Comm* c = op.comm;
   const size_t bytes = deposit_bytes(op);
-  if (op.kind == Kind::Recv) return ncclSuccess;  // receivers publish nothing
+  if (op.kind == Kind::Recv || op.kind == Kind::Shrink) return ncclSuccess;  // nothing to publish
 
   if (op.kind == Kind::Send) {
     // The message number this send is: the file it writes is named for it, so
@@ -484,13 +752,26 @@ ncclResult_t deposit(Op& op) {
     return ncclSuccess;
   }
 
-  if (bytes) {
+  if (op.kind == Kind::Split) {
     Mapping* m = writer_for(c->rz, c->rank, bytes);
+    if (!m) return ncclSystemError;
+    std::memcpy(m->addr, op.color_key, bytes);
+  } else if (bytes) {
+    const size_t es = type_size(op.dt);
+    const size_t total = bytes + (op.premul ? es : 0);
+    Mapping* m = writer_for(c->rz, c->rank, total);
     if (!m) return ncclSystemError;
     DeviceGuard g(c->cuda_dev);
     cudaStreamSynchronize(op.stream);
     if (cudaMemcpy(m->addr, op.send, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
       return ncclUnhandledCudaError;
+    if (op.premul) {
+      // ncclScalarDevice is read now, while the collective runs, as documented.
+      char* trailer = static_cast<char*>(m->addr) + bytes;
+      if (!op.scalar.on_device) std::memcpy(trailer, op.scalar.host, es);
+      else if (cudaMemcpy(trailer, op.scalar.dev, es, cudaMemcpyDefault) != cudaSuccess)
+        return ncclUnhandledCudaError;
+    }
     msync(m->addr, m->len, MS_ASYNC);
   } else {
     DeviceGuard g(c->cuda_dev);
@@ -500,29 +781,68 @@ ncclResult_t deposit(Op& op) {
   return ncclSuccess;
 }
 
-// Read a peer's published bytes. For the local rank we could reuse our own
-// mapping, but reading the file keeps one code path and one set of bugs.
-bool read_peer(Rendezvous* rz, int rank, size_t bytes, std::vector<char>* out) {
+// Read `bytes` of a peer's published file starting at `offset`. For the local
+// rank we could reuse our own mapping, but reading the file keeps one code path
+// and one set of bugs.
+bool read_peer(Rendezvous* rz, int rank, size_t bytes, std::vector<char>* out, size_t offset = 0) {
   out->resize(bytes);
   if (!bytes) return true;
   Mapping m;
-  if (!m.open_read(rz->rank_path(rank), bytes)) return false;
-  std::memcpy(out->data(), m.addr, bytes);
+  if (!m.open_read(rz->rank_path(rank), offset + bytes)) return false;
+  std::memcpy(out->data(), static_cast<const char*>(m.addr) + offset, bytes);
   return true;
+}
+
+// Sum of every rank's first `n` elements, each multiplied by its own scalar
+// (the trailer at byte `n * es` of its file).
+ncclResult_t premul_reduce(Comm* c, size_t n, ncclDataType_t dt, std::vector<char>* acc) {
+  const size_t es = type_size(dt);
+  std::vector<char> peer;
+  acc->resize(n * es);
+  for (int r = 0; r < c->nranks; ++r) {
+    if (!read_peer(c->rz, r, n * es + es, &peer)) return ncclSystemError;
+    if (!premul(acc->data(), peer.data(), n, dt, peer.data() + n * es, r == 0))
+      return ncclInvalidArgument;
+  }
+  return ncclSuccess;
+}
+
+// A child communicator for this rank, named from what every member agrees on.
+ncclResult_t make_child(Op& op, const std::string& key, int nranks, int rank) {
+  Comm* p = op.comm;
+  std::string err;
+  Comm* child = make_comm(derived_base(dir_of(p->rz->base), p->rz->base + key), nranks, rank,
+                          p->cuda_dev, op.child, &err);
+  if (!child) {
+    std::fprintf(stderr, "[vgpu] nccl: %s\n", err.c_str());
+    return ncclSystemError;
+  }
+  *op.out = reinterpret_cast<ncclComm_t>(child);
+  return ncclSuccess;
 }
 
 ncclResult_t collect(Op& op) {
   Comm* c = op.comm;
   Meta* meta = c->rz->meta;
   const size_t es = type_size(op.dt);
+  const size_t n = (size_t)c->nranks;
 
   if (op.kind == Kind::Send) return ncclSuccess;
 
+  if (op.kind == Kind::Shrink) {
+    // New ranks close the gaps the excluded ones leave, in the old order.
+    int newrank = c->rank;
+    for (int x : op.exclude) if (x < c->rank) --newrank;
+    std::string key = "|shrink|" + std::to_string(op.shrink_epoch);
+    for (int x : op.exclude) key += "," + std::to_string(x);
+    return make_child(op, key, c->nranks - (int)op.exclude.size(), newrank);
+  }
+
   if (op.kind == Kind::Recv) {
     const size_t want_msgs = meta->taken[op.peer][c->rank].load(std::memory_order_acquire) + 1;
-    if (!wait_for([&] { return meta->posted[op.peer][c->rank].load(std::memory_order_acquire) >= want_msgs; },
-                  "a matching ncclSend", c->rank))
-      return ncclTimeout;
+    if (ncclResult_t r = wait_for([&] { return meta->posted[op.peer][c->rank].load(std::memory_order_acquire) >= want_msgs; },
+                                  "a matching ncclSend", c); r != ncclSuccess)
+      return r;
     const size_t bytes = op.count * es;
     Mapping m;
     // The file's own length is the message length, so a size disagreement is
@@ -548,43 +868,86 @@ ncclResult_t collect(Op& op) {
   }
 
   // Collectives: everyone must have deposited before anyone reads.
-  if (!wait_for([&] {
-        for (int r = 0; r < c->nranks; ++r)
-          if (meta->phase[r].load(std::memory_order_acquire) < op.seq) return false;
+  if (ncclResult_t r = wait_for([&] {
+        for (int i = 0; i < c->nranks; ++i)
+          if (meta->phase[i].load(std::memory_order_acquire) < op.seq) return false;
         return true;
-      }, "the other ranks to reach this collective", c->rank))
-    return ncclTimeout;
+      }, "the other ranks to reach this collective", c); r != ncclSuccess)
+    return r;
 
   std::vector<char> peer;
   switch (op.kind) {
+    case Kind::Split: {
+      // card: ranks are ordered by key, ties by their old rank; any color but
+      // NCCL_SPLIT_NOCOLOR (-1) is a color, negative ones included.
+      const int my_color = op.color_key[0];
+      std::vector<std::pair<int32_t, int>> members;  // (key, old rank)
+      for (int r = 0; r < c->nranks; ++r) {
+        if (!read_peer(c->rz, r, sizeof op.color_key, &peer)) return ncclSystemError;
+        int32_t ck[2];
+        std::memcpy(ck, peer.data(), sizeof ck);
+        if (ck[0] == my_color) members.emplace_back(ck[1], r);
+      }
+      if (my_color == NCCL_SPLIT_NOCOLOR) return ncclSuccess;  // *out stays NULL
+      std::sort(members.begin(), members.end());
+      int newrank = 0;
+      while (members[newrank].second != c->rank) ++newrank;
+      return make_child(op, "|split|" + std::to_string(op.seq) + "|" + std::to_string(my_color),
+                        (int)members.size(), newrank);
+    }
     case Kind::Broadcast: {
       if (!read_peer(c->rz, op.root, op.count * es, &op.staging)) return ncclSystemError;
       break;
     }
-    case Kind::AllGather: {
-      op.staging.resize(op.count * es * c->nranks);
+    case Kind::AllGather: case Kind::Gather: {
+      if (op.kind == Kind::Gather && c->rank != op.root) break;  // only the root receives
+      op.staging.resize(op.count * es * n);
       for (int r = 0; r < c->nranks; ++r) {
         if (!read_peer(c->rz, r, op.count * es, &peer)) return ncclSystemError;
         std::memcpy(op.staging.data() + (size_t)r * op.count * es, peer.data(), op.count * es);
       }
       break;
     }
+    case Kind::AlltoAll: {
+      // Block j of rank i's input lands as block i of rank j's output.
+      op.staging.resize(op.count * es * n);
+      for (int r = 0; r < c->nranks; ++r) {
+        if (!read_peer(c->rz, r, op.count * es, &peer, (size_t)c->rank * op.count * es))
+          return ncclSystemError;
+        std::memcpy(op.staging.data() + (size_t)r * op.count * es, peer.data(), op.count * es);
+      }
+      break;
+    }
+    case Kind::Scatter: {
+      if (!read_peer(c->rz, op.root, op.count * es, &op.staging, (size_t)c->rank * op.count * es))
+        return ncclSystemError;
+      break;
+    }
     case Kind::ReduceScatter: {
       // Reduce every rank's whole input, then keep this rank's slice.
-      const size_t total = op.count * c->nranks;
+      const size_t total = op.count * n;
       std::vector<char> acc;
-      if (!read_peer(c->rz, 0, total * es, &acc)) return ncclSystemError;
-      for (int r = 1; r < c->nranks; ++r) {
-        if (!read_peer(c->rz, r, total * es, &peer)) return ncclSystemError;
-        if (!reduce(acc.data(), peer.data(), total, op.dt, op.red)) return ncclInvalidArgument;
+      if (op.premul) {
+        if (ncclResult_t r = premul_reduce(c, total, op.dt, &acc); r != ncclSuccess) return r;
+      } else {
+        if (!read_peer(c->rz, 0, total * es, &acc)) return ncclSystemError;
+        for (int r = 1; r < c->nranks; ++r) {
+          if (!read_peer(c->rz, r, total * es, &peer)) return ncclSystemError;
+          if (!reduce(acc.data(), peer.data(), total, op.dt, op.red)) return ncclInvalidArgument;
+        }
+        if (op.red == ncclAvg) average(acc.data(), total, op.dt, c->nranks);
       }
-      if (op.red == ncclAvg) average(acc.data(), total, op.dt, c->nranks);
       op.staging.assign(acc.begin() + (size_t)c->rank * op.count * es,
                         acc.begin() + (size_t)(c->rank + 1) * op.count * es);
       break;
     }
     default: {  // AllReduce and Reduce
       if (op.kind == Kind::Reduce && c->rank != op.root) break;  // only the root builds a result
+      if (op.premul) {
+        if (ncclResult_t r = premul_reduce(c, op.count, op.dt, &op.staging); r != ncclSuccess)
+          return r;
+        break;
+      }
       if (!read_peer(c->rz, 0, op.count * es, &op.staging)) return ncclSystemError;
       for (int r = 1; r < c->nranks; ++r) {
         if (!read_peer(c->rz, r, op.count * es, &peer)) return ncclSystemError;
@@ -607,43 +970,134 @@ ncclResult_t collect(Op& op) {
 // Publishing "done" only after every rank has read is what makes it safe for
 // the next collective to overwrite this rank's file.
 void release(Op& op) {
-  if (op.kind == Kind::Send || op.kind == Kind::Recv) return;
+  if (!is_collective(op.kind)) return;
   op.comm->rz->meta->done[op.comm->rank].store(op.seq, std::memory_order_release);
 }
 
 ncclResult_t settle(Op& op) {
-  if (op.kind == Kind::Send || op.kind == Kind::Recv) return ncclSuccess;
+  if (!is_collective(op.kind)) return ncclSuccess;
   Comm* c = op.comm;
   Meta* meta = c->rz->meta;
-  if (!wait_for([&] {
+  return wait_for([&] {
         for (int r = 0; r < c->nranks; ++r)
           if (meta->done[r].load(std::memory_order_acquire) < op.seq) return false;
         return true;
-      }, "the other ranks to finish this collective", c->rank))
-    return ncclTimeout;
-  return ncclSuccess;
+      }, "the other ranks to finish this collective", c);
 }
 
-ncclResult_t run_pending() {
+ncclResult_t execute(std::vector<Op>& ops) {
   ncclResult_t rc = ncclSuccess;
   auto keep = [&](ncclResult_t r) { if (rc == ncclSuccess) rc = r; };
-  for (auto& op : t_pending) keep(deposit(op));
-  if (rc == ncclSuccess) for (auto& op : t_pending) keep(collect(op));
-  for (auto& op : t_pending) release(op);
-  if (rc == ncclSuccess) for (auto& op : t_pending) keep(settle(op));
-  t_pending.clear();
+  for (auto& op : ops) keep(deposit(op));
+  if (rc == ncclSuccess) for (auto& op : ops) keep(collect(op));
+  for (auto& op : ops) release(op);
+  if (rc == ncclSuccess) for (auto& op : ops) keep(settle(op));
   return rc;
 }
 
+// Run a batch on non-blocking communicators off the calling thread. Batches on
+// the same communicator still run in the order they were issued: each waits
+// for the one before it on every communicator it touches.
+void launch_async(std::vector<Op> ops) {
+  std::vector<Comm*> comms;
+  for (auto& op : ops)
+    if (std::find(comms.begin(), comms.end(), op.comm) == comms.end()) comms.push_back(op.comm);
+  auto done = std::make_shared<std::promise<void>>();
+  std::shared_future<void> fut = done->get_future().share();
+  std::vector<std::shared_future<void>> before;
+  for (Comm* c : comms) {
+    std::lock_guard<std::mutex> l(c->mu);
+    if (c->tail.valid()) before.push_back(c->tail);
+    c->tail = fut;
+    c->pending.fetch_add(1, std::memory_order_acq_rel);
+  }
+  std::thread([ops = std::move(ops), comms, before, done]() mutable {
+    for (auto& f : before) f.wait();
+    const ncclResult_t rc = execute(ops);
+    for (Comm* c : comms) {
+      if (rc != ncclSuccess) c->state.store(rc, std::memory_order_release);
+      c->pending.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    done->set_value();
+  }).detach();
+}
+
+// Runs the calling thread's recorded ops. `async` says whether they went to the
+// background; the caller picks the return code, which differs by call.
+ncclResult_t run_pending(bool* async) {
+  std::vector<Op> ops;
+  ops.swap(t_pending);
+  *async = false;
+  for (auto& op : ops) if (!op.comm->cfg.blocking) *async = true;
+  if (ops.empty()) return ncclSuccess;
+  if (*async) { launch_async(std::move(ops)); return ncclSuccess; }
+  return execute(ops);
+}
+
+// Waits for every background batch on `c`.
+void drain(Comm* c) {
+  std::shared_future<void> t;
+  {
+    std::lock_guard<std::mutex> l(c->mu);
+    t = c->tail;
+  }
+  if (t.valid()) t.wait();
+}
+
+ncclResult_t check_comm(Comm* c, bool poison = false) {
+  if (!c) {
+    std::fprintf(stderr, "[vgpu] nccl: comm argument is NULL\n");
+    return ncclInvalidArgument;
+  }
+  return busy(c, poison) ? ncclInvalidArgument : ncclSuccess;
+}
+
 ncclResult_t enqueue(Op op) {
-  if (!op.comm || !op.comm->rz) return ncclInvalidArgument;
-  if (type_size(op.dt) == 0) return ncclInvalidArgument;
-  if (op.red < 0 || op.red >= ncclNumOps) return ncclInvalidArgument;  // no custom reducers
-  op.seq = ++op.comm->seq;
-  if (op.kind == Kind::Send || op.kind == Kind::Recv) --op.comm->seq;  // p2p has its own handshake
+  Comm* c = op.comm;
+  if (ncclResult_t r = check_comm(c, true); r != ncclSuccess) return fail_call(r);
+  if (type_size(op.dt) == 0) {
+    std::fprintf(stderr, "[vgpu] nccl: invalid type %d\n", (int)op.dt);
+    return fail_call(ncclInvalidArgument);
+  }
+  if ((op.kind == Kind::Broadcast || op.kind == Kind::Reduce || op.kind == Kind::Gather ||
+       op.kind == Kind::Scatter) && (op.root < 0 || op.root >= c->nranks)) {
+    std::fprintf(stderr, "[vgpu] nccl: root %d is not a rank of a %d-rank communicator\n", op.root,
+                 c->nranks);
+    return fail_call(ncclInvalidArgument);
+  }
+  if ((op.kind == Kind::Send || op.kind == Kind::Recv) && (op.peer < 0 || op.peer >= c->nranks)) {
+    std::fprintf(stderr, "[vgpu] nccl: peer %d is not a rank of a %d-rank communicator\n", op.peer,
+                 c->nranks);
+    return fail_call(ncclInvalidArgument);
+  }
+  if (op.red < 0 || op.red >= ncclMaxRedOp) return fail_call(ncclInvalidArgument);
+  if (op.red >= ncclNumOps) {
+    // card: an operator from another communicator, or destroyed, is
+    // ncclInvalidArgument, and so is one used with another datatype.
+    std::lock_guard<std::mutex> l(c->mu);
+    const long idx = redop_slot(c, op.red);
+    if (idx < 0) {
+      std::fprintf(stderr, "[vgpu] nccl: reduction operation %d unknown to this communicator\n",
+                   (int)op.red);
+      return fail_call(ncclInvalidArgument);
+    }
+    if (c->redops[idx].dt != op.dt) {
+      std::fprintf(stderr, "[vgpu] nccl: data type supplied to user-created ncclRedOp_t does not "
+                           "match type given to reduction operation\n");
+      return fail_call(ncclInvalidArgument);
+    }
+    op.premul = true;
+    op.scalar = c->redops[idx];
+    op.red = ncclSum;
+  }
+  if (is_collective(op.kind)) op.seq = ++c->seq;  // p2p has its own handshake
   t_pending.push_back(std::move(op));
   if (t_group_depth > 0) return ncclSuccess;
-  return run_pending();
+  bool async = false;
+  const ncclResult_t r = run_pending(&async);
+  // card: a collective on a non-blocking communicator returns ncclInProgress,
+  // even once it is connected.
+  return async ? ncclInProgress : r;
 }
 
 }  // namespace
@@ -689,41 +1143,77 @@ VGPU_EXPORT ncclResult_t ncclGetUniqueId(ncclUniqueId* out) {
 
 /* ---- communicators ---- */
 
-VGPU_EXPORT ncclResult_t ncclCommInitRank(ncclComm_t* out, int nranks, ncclUniqueId id, int rank) {
-  if (!out || nranks < 1 || rank < 0 || rank >= nranks) return ncclInvalidArgument;
+namespace {
+
+// Every init form lands here once it knows its rendezvous name. A non-blocking
+// one returns ncclInProgress (card: so does NCCL's, for InitRankConfig and
+// InitRankScalable alike) and completes when every rank has joined.
+// `dflt` is what a NULL config means: ncclCommInitRank is always blocking, the
+// config forms take NCCL_COMM_BLOCKING's default.
+ncclResult_t init_rank(ncclComm_t* out, int nranks, const std::string& base, int rank,
+                       const ncclConfig_t* config, const CommConfig* dflt = nullptr) {
+  if (!out) return ncclInvalidArgument;
+  *out = nullptr;
+  CommConfig cfg;
+  if (ncclResult_t r = parse_config(config, dflt, &cfg); r != ncclSuccess) return r;
+  if (nranks < 1 || rank < 0 || rank >= nranks) {
+    std::fprintf(stderr, "[vgpu] nccl: invalid rank requested : %d/%d\n", rank, nranks);
+    return ncclInvalidArgument;
+  }
   if (nranks > kMaxRanks) {
     std::fprintf(stderr, "[vgpu] nccl: %d ranks requested, this build supports %d\n", nranks,
                  kMaxRanks);
     return ncclInvalidArgument;
   }
+  int dev = 0;
+  cudaGetDevice(&dev);
   std::string err;
-  Rendezvous* rz = attach(id, nranks, &err);
-  if (!rz) {
+  Comm* c = make_comm(base, nranks, rank, dev, cfg, &err);
+  if (!c) {
     std::fprintf(stderr, "[vgpu] nccl: %s\n", err.c_str());
     return ncclSystemError;
   }
-  auto* c = new Comm();
-  c->rz = rz;
-  c->rank = rank;
-  c->nranks = nranks;
-  cudaGetDevice(&c->cuda_dev);
-  rz->meta->joined.fetch_add(1, std::memory_order_release);
   if (!quiet() && rank == 0)
     std::fprintf(stderr,
                  "[vgpu] nccl: %d ranks over %s (file-backed transport; see nvidia/docs/libraries.md)\n",
-                 nranks, rz->base.c_str());
+                 nranks, c->rz->base.c_str());
   *out = reinterpret_cast<ncclComm_t>(c);
-  return ncclSuccess;
+  if (cfg.blocking) return ncclSuccess;
+  c->init_pending.store(true, std::memory_order_release);
+  refresh_init(c);
+  return ncclInProgress;
 }
+
+}  // namespace
 
 VGPU_EXPORT ncclResult_t ncclCommInitRankConfig(ncclComm_t* out, int nranks, ncclUniqueId id,
                                                 int rank, ncclConfig_t* config) {
-  if (config && config->blocking == 0) {
-    std::fprintf(stderr, "[vgpu] nccl: non-blocking communicators are not implemented\n");
-    return ncclInvalidUsage;
-  }
-  return ncclCommInitRank(out, nranks, id, rank);
+  return init_rank(out, nranks, rendezvous_dir() + "/" + hex16(id), rank, config);
 }
+
+VGPU_EXPORT ncclResult_t ncclCommInitRank(ncclComm_t* out, int nranks, ncclUniqueId id, int rank) {
+  static const CommConfig kBlocking{1};
+  return init_rank(out, nranks, rendezvous_dir() + "/" + hex16(id), rank, nullptr, &kBlocking);
+}
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 23, 0)
+// Several unique ids only spread NCCL's bootstrap over several roots; every rank
+// passes the same ones, so they name one rendezvous together.
+VGPU_EXPORT ncclResult_t ncclCommInitRankScalable(ncclComm_t* out, int nranks, int myrank, int nId,
+                                                  ncclUniqueId* commIds, ncclConfig_t* config) {
+  // card: nId outside 1..nranks, or no ids, crashes NCCL 2.29.7 after "improper
+  // usage of ncclCommInitRank"; refusing them is the defined version of that.
+  if (!out || !commIds || nId < 1 || nId > nranks) {
+    std::fprintf(stderr, "[vgpu] nccl: improper usage of ncclCommInitRankScalable: nId = %d, "
+                         "nranks=%d\n", nId, nranks);
+    if (out) *out = nullptr;
+    return ncclInvalidArgument;
+  }
+  std::string key = "scalable";
+  for (int i = 0; i < nId; ++i) key += "|" + hex16(commIds[i]);
+  return init_rank(out, nranks, derived_base(rendezvous_dir(), key), myrank, config);
+}
+#endif
 
 VGPU_EXPORT ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
   if (!comms || ndev < 1) return ncclInvalidArgument;
@@ -742,42 +1232,89 @@ VGPU_EXPORT ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int*
   return ncclSuccess;
 }
 
+namespace {
+void free_comm(Comm* c) {
+  drain(c);
+  detach(c->rz);
+  delete c;
+}
+}  // namespace
+
+// card: NULL is ncclSuccess for Destroy, Abort and Finalize alike.
 VGPU_EXPORT ncclResult_t ncclCommDestroy(ncclComm_t comm) {
   auto* c = reinterpret_cast<Comm*>(comm);
   if (!c) return ncclSuccess;
-  if (c->rz) {
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (--c->rz->refs <= 0) {
-      g_rendezvous.erase(c->rz->base);
-      delete c->rz;  // takes its per-rank mappings with it
-    }
-  }
-  delete c;
+  if (busy(c)) return ncclInvalidArgument;
+  free_comm(c);
   return ncclSuccess;
 }
-VGPU_EXPORT ncclResult_t ncclCommFinalize(ncclComm_t) { return ncclSuccess; }
-VGPU_EXPORT ncclResult_t ncclCommAbort(ncclComm_t comm) { return ncclCommDestroy(comm); }
+
+// Everything issued has already been flushed through the files by the time it
+// returned (or, non-blocking, by the time its state went back to ncclSuccess),
+// so there is nothing left to flush. card: a second finalize is
+// ncclInvalidArgument; a non-blocking one returns ncclInProgress.
+VGPU_EXPORT ncclResult_t ncclCommFinalize(ncclComm_t comm) {
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!c) return ncclSuccess;
+  if (busy(c)) return ncclInvalidArgument;
+  if (c->finalized) {
+    std::fprintf(stderr, "[vgpu] nccl: communicator already finalized\n");
+    return ncclInvalidArgument;
+  }
+  c->finalized = true;
+  return c->cfg.blocking ? ncclSuccess : ncclInProgress;
+}
+
+// Abort stops whatever this communicator is waiting on, and tells the peers so
+// that theirs give up with ncclRemoteError rather than running out the clock.
+VGPU_EXPORT ncclResult_t ncclCommAbort(ncclComm_t comm) {
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!c) return ncclSuccess;
+  c->aborted.store(true, std::memory_order_release);
+  if (c->rz) c->rz->meta->aborted.store(1, std::memory_order_release);
+  free_comm(c);
+  return ncclSuccess;
+}
 
 VGPU_EXPORT ncclResult_t ncclCommCount(const ncclComm_t comm, int* n) {
-  if (!comm || !n) return ncclInvalidArgument;
-  *n = reinterpret_cast<Comm*>(comm)->nranks;
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!n) return ncclInvalidArgument;
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return r;
+  *n = c->nranks;
   return ncclSuccess;
 }
 VGPU_EXPORT ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* r) {
-  if (!comm || !r) return ncclInvalidArgument;
-  *r = reinterpret_cast<Comm*>(comm)->rank;
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!r) return ncclInvalidArgument;
+  if (ncclResult_t e = check_comm(c); e != ncclSuccess) return e;
+  *r = c->rank;
   return ncclSuccess;
 }
 VGPU_EXPORT ncclResult_t ncclCommCuDevice(const ncclComm_t comm, int* d) {
-  if (!comm || !d) return ncclInvalidArgument;
-  *d = reinterpret_cast<Comm*>(comm)->cuda_dev;
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!d) return ncclInvalidArgument;
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return r;
+  *d = c->cuda_dev;
   return ncclSuccess;
 }
+
+// An error the communicator is holding comes first (card: one left by a call
+// made too early stays, even after the init finishes); then any work still
+// running; then success.
 VGPU_EXPORT ncclResult_t ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t* e) {
-  if (!comm || !e) return ncclInvalidArgument;
-  *e = reinterpret_cast<Comm*>(comm)->async;
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!c || !e) return ncclInvalidArgument;
+  refresh_init(c);
+  const int s = c->state.load(std::memory_order_acquire);
+  if (s != ncclSuccess) *e = static_cast<ncclResult_t>(s);
+  else if (c->pending.load(std::memory_order_acquire) > 0 ||
+           c->init_pending.load(std::memory_order_acquire))
+    *e = ncclInProgress;
+  else
+    *e = ncclSuccess;
   return ncclSuccess;
 }
+
 VGPU_EXPORT ncclResult_t ncclCommRegister(const ncclComm_t, void*, size_t, void** handle) {
   if (handle) *handle = nullptr;  // no NIC to pin against
   return ncclSuccess;
@@ -792,6 +1329,117 @@ VGPU_EXPORT ncclResult_t ncclMemFree(void* ptr) {
   return cudaFree(ptr) == cudaSuccess ? ncclSuccess : ncclSystemError;
 }
 
+/* ---- new communicators from old ---- */
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 18, 0)
+// A collective on the parent: every rank, NCCL_SPLIT_NOCOLOR ones included,
+// publishes its (color, key), and each builds its own view of the result.
+// card: on a non-blocking parent the call returns ncclSuccess outside a group
+// (ncclInProgress from the ncclGroupEnd inside one), and *newcomm stays NULL
+// until the parent's state is ncclSuccess again. A NULL config inherits the
+// parent's, so the child of a non-blocking parent is non-blocking too.
+VGPU_EXPORT ncclResult_t ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t* newcomm,
+                                       ncclConfig_t* config) {
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!newcomm) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclCommSplit : newcomm argument is NULL\n");
+    return fail_call(ncclInvalidArgument);
+  }
+  *newcomm = nullptr;
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return fail_call(r);
+  Op o{Kind::Split, c, nullptr, nullptr, 2, ncclInt32, ncclSum};
+  if (ncclResult_t r = parse_config(config, &c->cfg, &o.child); r != ncclSuccess)
+    return fail_call(r);
+  o.color_key[0] = color;
+  o.color_key[1] = key;
+  o.out = newcomm;
+  const ncclResult_t r = enqueue(std::move(o));
+  return r == ncclInProgress ? ncclSuccess : r;
+}
+#endif
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
+// Only the surviving ranks call this, and they all hold the same exclusion
+// list, so nothing needs exchanging: each works out its new rank and joins.
+VGPU_EXPORT ncclResult_t ncclCommShrink(ncclComm_t comm, int* excludeRanksList,
+                                        int excludeRanksCount, ncclComm_t* newcomm,
+                                        ncclConfig_t* config, int shrinkFlags) {
+  (void)shrinkFlags;  // card: any value is accepted; ABORT has nothing in flight to stop here
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!newcomm) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclCommShrink : newcomm argument is NULL\n");
+    return fail_call(ncclInvalidArgument);
+  }
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return fail_call(r);
+  // card: a NULL list is refused, and so is a count of zero or less.
+  if (!excludeRanksList || excludeRanksCount <= 0) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclCommShrink : excludeRanksList argument is NULL or empty\n");
+    return fail_call(ncclInvalidArgument);
+  }
+  std::vector<int> ex(excludeRanksList, excludeRanksList + excludeRanksCount);
+  std::sort(ex.begin(), ex.end());
+  // card: excluding yourself is refused; a duplicate leaves an empty
+  // communicator and an error. An out-of-range rank is accepted by NCCL 2.29.7
+  // and counted as a removed rank, which leaves a communicator whose size
+  // disagrees with its members; that is refused here.
+  for (size_t i = 0; i < ex.size(); ++i) {
+    if (ex[i] < 0 || ex[i] >= c->nranks || ex[i] == c->rank || (i && ex[i] == ex[i - 1])) {
+      std::fprintf(stderr, "[vgpu] nccl: ncclCommShrink : cannot exclude rank %d\n", ex[i]);
+      return fail_call(ncclInvalidArgument);
+    }
+  }
+  Op o{Kind::Shrink, c, nullptr, nullptr, 0, ncclInt8, ncclSum};
+  if (ncclResult_t r = parse_config(config, &c->cfg, &o.child); r != ncclSuccess)
+    return fail_call(r);
+  *newcomm = nullptr;
+  o.out = newcomm;
+  o.exclude = std::move(ex);
+  o.shrink_epoch = ++c->shrinks;
+  const ncclResult_t r = enqueue(std::move(o));
+  return r == ncclInProgress ? ncclSuccess : r;
+}
+
+/* ---- symmetric memory windows ----
+   card: on the RTX 3060 pair (no NVLink, no peer mappings) ncclCommWindowRegister
+   returns ncclSuccess and a NULL window, for ncclMemAlloc and cudaMalloc buffers
+   alike; a collective on the buffer then runs as it always does. That is what
+   happens here, for the reason in the header comment. Measured argument errors:
+   a NULL comm or win, and a NULL buffer or zero size, are ncclInvalidArgument;
+   deregistering a NULL window is ncclSuccess. */
+VGPU_EXPORT ncclResult_t ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size,
+                                                ncclWindow_t* win, int winFlags) {
+  (void)winFlags;
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (!win) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclCommWindowRegister : win argument is NULL\n");
+    return ncclInvalidArgument;
+  }
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return r;
+  if (!buff || size == 0) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclCommWindowRegister: invalid pointer %p / size %zu\n",
+                 buff, size);
+    return ncclInvalidArgument;
+  }
+  *win = nullptr;
+  return ncclSuccess;
+}
+
+VGPU_EXPORT ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win) {
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return r;
+  return win ? ncclInvalidArgument : ncclSuccess;   // no window was ever handed out
+}
+#endif
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+VGPU_EXPORT ncclResult_t ncclWinGetUserPtr(ncclComm_t comm, ncclWindow_t win, void** outUserPtr) {
+  (void)comm; (void)outUserPtr;
+  std::fprintf(stderr, "[vgpu] nccl: ncclWinGetUserPtr : win argument is NULL\n");
+  (void)win;
+  return ncclInvalidArgument;   // card: a NULL window; and no other kind exists here
+}
+#endif
+
 /* ---- groups ---- */
 
 VGPU_EXPORT ncclResult_t ncclGroupStart(void) { ++t_group_depth; return ncclSuccess; }
@@ -799,7 +1447,15 @@ VGPU_EXPORT ncclResult_t ncclGroupStart(void) { ++t_group_depth; return ncclSucc
 VGPU_EXPORT ncclResult_t ncclGroupEnd(void) {
   if (t_group_depth == 0) return ncclInvalidUsage;
   if (--t_group_depth > 0) return ncclSuccess;
-  return run_pending();
+  if (t_group_error != ncclSuccess) {
+    const ncclResult_t r = t_group_error;
+    t_group_error = ncclSuccess;
+    t_pending.clear();
+    return r;
+  }
+  bool async = false;
+  const ncclResult_t r = run_pending(&async);
+  return async ? ncclInProgress : r;   // card: a non-blocking group returns ncclInProgress
 }
 
 VGPU_EXPORT ncclResult_t ncclGroupSimulateEnd(ncclSimInfo_t* info) {
@@ -807,6 +1463,7 @@ VGPU_EXPORT ncclResult_t ncclGroupSimulateEnd(ncclSimInfo_t* info) {
   if (info) info->estimatedTime = 0.0f;
   if (t_group_depth > 0) --t_group_depth;
   t_pending.clear();
+  t_group_error = ncclSuccess;
   return ncclSuccess;
 }
 
@@ -854,6 +1511,31 @@ VGPU_EXPORT ncclResult_t ncclReduceScatter(const void* send, void* recv, size_t 
   return enqueue(std::move(o));
 }
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+// NCCL 2.28 added these three; nccl.h declares them from that version on.
+// card: rank j's output block i is rank i's input block j; the input may be
+// the output; count 0 is a no-op that succeeds.
+VGPU_EXPORT ncclResult_t ncclAlltoAll(const void* send, void* recv, size_t count,
+                                      ncclDataType_t dt, ncclComm_t comm, cudaStream_t stream) {
+  Op o{Kind::AlltoAll, reinterpret_cast<Comm*>(comm), send, recv, count, dt, ncclSum, 0, 0, stream};
+  return enqueue(std::move(o));
+}
+
+// card: only the root's buffer is written; the others' are left alone.
+VGPU_EXPORT ncclResult_t ncclGather(const void* send, void* recv, size_t count, ncclDataType_t dt,
+                                    int root, ncclComm_t comm, cudaStream_t stream) {
+  Op o{Kind::Gather, reinterpret_cast<Comm*>(comm), send, recv, count, dt, ncclSum, root, 0, stream};
+  return enqueue(std::move(o));
+}
+
+VGPU_EXPORT ncclResult_t ncclScatter(const void* send, void* recv, size_t count, ncclDataType_t dt,
+                                     int root, ncclComm_t comm, cudaStream_t stream) {
+  Op o{Kind::Scatter, reinterpret_cast<Comm*>(comm), send, recv, count, dt, ncclSum, root, 0,
+       stream};
+  return enqueue(std::move(o));
+}
+#endif
+
 VGPU_EXPORT ncclResult_t ncclSend(const void* send, size_t count, ncclDataType_t dt, int peer,
                                   ncclComm_t comm, cudaStream_t stream) {
   Op o{Kind::Send, reinterpret_cast<Comm*>(comm), send, nullptr, count, dt, ncclSum, 0, peer,
@@ -868,14 +1550,62 @@ VGPU_EXPORT ncclResult_t ncclRecv(void* recv, size_t count, ncclDataType_t dt, i
   return enqueue(std::move(o));
 }
 
-/* ---- explicitly unimplemented ---- */
+/* ---- user-defined reduction operators ---- */
 
-VGPU_EXPORT ncclResult_t ncclRedOpCreatePreMulSum(ncclRedOp_t*, void*, ncclDataType_t,
-                                                  ncclScalarResidence_t, ncclComm_t) {
-  std::fprintf(stderr, "[vgpu] nccl: user-defined reduction operators are not implemented\n");
-  return ncclInvalidUsage;
+// card: a NULL comm is ncclInvalidArgument, an invalid datatype
+// ncclInternalError, and a residence other than ncclScalarHostImmediate is
+// taken as device residence. NCCL 2.29.7 crashes on a NULL op or scalar; those
+// are ncclInvalidArgument here. Handles are per communicator and a destroyed
+// one's handle is handed out again.
+VGPU_EXPORT ncclResult_t ncclRedOpCreatePreMulSum(ncclRedOp_t* op, void* scalar,
+                                                  ncclDataType_t dt,
+                                                  ncclScalarResidence_t residence,
+                                                  ncclComm_t comm) {
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (ncclResult_t r = check_comm(c); r != ncclSuccess) return r;
+  if (!op || !scalar) return ncclInvalidArgument;
+  const size_t es = type_size(dt);
+  if (es == 0) return ncclInternalError;
+  UserOp u;
+  u.live = true;
+  u.dt = dt;
+  u.on_device = residence != ncclScalarHostImmediate;
+  if (u.on_device) u.dev = scalar;
+  else std::memcpy(u.host, scalar, es);   // dereferenced now, as documented
+  std::lock_guard<std::mutex> l(c->mu);
+  size_t idx = 0;
+  while (idx < c->redops.size() && c->redops[idx].live) ++idx;
+  if (idx == c->redops.size()) {
+    if (idx >= kRedopSlots) return ncclInternalError;
+    c->redops.push_back(u);
+  } else {
+    c->redops[idx] = u;
+  }
+  *op = redop_handle(c, idx);
+  return ncclSuccess;
 }
-VGPU_EXPORT ncclResult_t ncclRedOpDestroy(ncclRedOp_t, ncclComm_t) { return ncclSuccess; }
+
+// card: a builtin, a NULL comm, another communicator's operator or one already
+// destroyed are all ncclInvalidArgument.
+VGPU_EXPORT ncclResult_t ncclRedOpDestroy(ncclRedOp_t op, ncclComm_t comm) {
+  auto* c = reinterpret_cast<Comm*>(comm);
+  if (op >= 0 && op < ncclNumOps) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclRedOpDestroy : operator is a NCCL builtin.\n");
+    return ncclInvalidArgument;
+  }
+  if (!c) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclRedOpDestroy : invalid communicator passed.\n");
+    return ncclInvalidArgument;
+  }
+  std::lock_guard<std::mutex> l(c->mu);
+  const long idx = redop_slot(c, op);
+  if (idx < 0) {
+    std::fprintf(stderr, "[vgpu] nccl: ncclRedOpDestroy : operator unknown to this communicator.\n");
+    return ncclInvalidArgument;
+  }
+  c->redops[idx].live = false;
+  return ncclSuccess;
+}
 
 /* ---- profiling aliases ----
    Real NCCL exports every entry point twice: nccl* as a weak alias of the
@@ -912,3 +1642,22 @@ VGPU_ALIAS(ncclSend);
 VGPU_ALIAS(ncclRecv);
 VGPU_ALIAS(ncclRedOpCreatePreMulSum);
 VGPU_ALIAS(ncclRedOpDestroy);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 18, 0)
+VGPU_ALIAS(ncclCommSplit);
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 23, 0)
+VGPU_ALIAS(ncclCommInitRankScalable);
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 0)
+VGPU_ALIAS(ncclCommShrink);
+VGPU_ALIAS(ncclCommWindowRegister);
+VGPU_ALIAS(ncclCommWindowDeregister);
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+VGPU_ALIAS(ncclAlltoAll);
+VGPU_ALIAS(ncclGather);
+VGPU_ALIAS(ncclScatter);
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+VGPU_ALIAS(ncclWinGetUserPtr);
+#endif

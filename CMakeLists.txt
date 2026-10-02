@@ -1230,6 +1230,19 @@ if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_group.sh 4)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # Two ranks across two processes, the shape the RTX 3060 reference run has.
+  add_test(NAME e2e_nccl_multiproc_2
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_multiproc.sh 2)
+  set_tests_properties(e2e_nccl_multiproc_2 PROPERTIES DEPENDS vgpunccl TIMEOUT 300
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # Split, shrink, non-blocking communicators, pre-multiplied sums, all-to-all:
+  # at four ranks and at three, where splitting by parity leaves unequal halves.
+  foreach(_n 4 3)
+    add_test(NAME e2e_nccl_comm_ops_${_n}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_comm_ops.sh ${_n})
+    set_tests_properties(e2e_nccl_comm_ops_${_n} PROPERTIES DEPENDS vgpunccl TIMEOUT 300
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:")
+  endforeach()
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,

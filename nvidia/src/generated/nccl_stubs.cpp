@@ -31,9 +31,3 @@ void vgpu_report_unimplemented(const char* fn) {
 }
 }  // namespace
 
-VGPU_EXPORT int ncclAlltoAll() { vgpu_report_unimplemented("ncclAlltoAll"); return 5; }
-VGPU_EXPORT int ncclCommInitRankScalable() { vgpu_report_unimplemented("ncclCommInitRankScalable"); return 5; }
-VGPU_EXPORT int ncclCommShrink() { vgpu_report_unimplemented("ncclCommShrink"); return 5; }
-VGPU_EXPORT int ncclCommWindowDeregister() { vgpu_report_unimplemented("ncclCommWindowDeregister"); return 5; }
-VGPU_EXPORT int ncclCommWindowRegister() { vgpu_report_unimplemented("ncclCommWindowRegister"); return 5; }
-VGPU_EXPORT int ncclCommSplit() { vgpu_report_unimplemented("ncclCommSplit"); return 5; }

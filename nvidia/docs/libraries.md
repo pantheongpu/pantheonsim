@@ -64,7 +64,7 @@ processes.
 | cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); legacy coo2csr, sorts, csrgeam2, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, general blocks too), csric02 and csrilu02. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the 64-bit X API, `Xgeev` on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings, `csrperm`, `csrzfd`, batched QR |
 | cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix spread over several devices in NVIDIA's column-block-cyclic layout |
-| NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
+| NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
@@ -109,6 +109,7 @@ output. Anything that differs is a bug in this implementation.
 | `cublas_level1` | single and double `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and `tbmv` agree, every index identical, negative increments included |
 | `cusolver_factorizations` | Cholesky, LU (pivots included), QR and every solve bit-identical; one f32 eigenvalue differs by ~1e‑6 relative |
 | `nccl_collectives` | all 24 bit-identical at two ranks on two physical GPUs |
+| `nccl_comm_ops` (e2e) | all 75 checks pass against NCCL 2.29.7 at two ranks on two physical GPUs: split, shrink, non-blocking, pre-multiplied sums, all-to-all, gather, scatter, scalable init, windows, and their error codes |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
@@ -247,6 +248,51 @@ called different collectives. The rank ceiling is 64.
 `nvidia/tests/e2e/run_nccl_group.sh` runs the single-process grouped form over 4
 virtual devices.
 
+Beyond the collectives:
+
+- **`ncclCommSplit`** is a collective on the parent: every rank publishes its
+  color and key, and the members of each color agree on a rendezvous name for
+  the child derived from the parent's. Ranks are ordered by key, ties by old
+  rank; `NCCL_SPLIT_NOCOLOR` gets a NULL communicator; a NULL config inherits
+  the parent's. **`ncclCommShrink`** is called only by the surviving ranks,
+  who already agree on who survives, so it needs no exchange.
+  **`ncclCommInitRankScalable`** takes the same ids on every rank and joins one
+  rendezvous named from all of them.
+- **Non-blocking communicators** (`ncclConfig_t.blocking = 0`, or
+  `NCCL_COMM_BLOCKING=0`) run their work on a background thread: init,
+  collectives, `ncclGroupEnd` and `ncclCommFinalize` return `ncclInProgress`,
+  and `ncclCommGetAsyncError` reports `ncclInProgress` until the work is done.
+  A split of a non-blocking parent returns `ncclSuccess` and fills in the new
+  communicator when the parent settles. As on NCCL, a call on a communicator
+  whose previous operation has not finished is `ncclInvalidArgument`.
+- **`ncclCommAbort`** also marks the rendezvous, so a peer waiting on the
+  aborted rank gives up with `ncclRemoteError` instead of waiting out
+  `VGPU_NCCL_TIMEOUT`.
+- **Pre-multiplied sums** (`ncclRedOpCreatePreMulSum`): each rank's input is
+  scaled by its own scalar, read at creation for `ncclScalarHostImmediate` and
+  when the collective runs for `ncclScalarDevice`. fp32 and fp64 accumulate as
+  a chain of fused multiply-adds in rank order, which is what NCCL computes on
+  every fp64 element measured. NCCL's fp32 order follows the ring's chunks,
+  which start the chain at different ranks, so an element can differ by an ulp
+  (one of eight in the measured case). fp16 rounds each product first, as NCCL
+  does.
+
+Error codes and edge cases where the documentation is silent were measured on
+NCCL 2.29.7 with two RTX 3060s, and `nvidia/tests/e2e/nccl_comm_ops.cu` and
+`nccl_multiproc.cu` pass against both libraries. Two things are deliberately
+not there:
+
+- **Symmetric memory windows.** `ncclCommWindowRegister` returns `ncclSuccess`
+  and a NULL window, which is NCCL's own answer on a machine without the peer
+  mappings windows are built on (the RTX 3060 pair gives exactly that), and a
+  collective on the buffer works as it always does. A real window promises
+  device-side loads and stores into the peers' memory -- the device API's LSA
+  pointers -- and another process's simulated device is reachable only
+  through a file.
+- **The network plugin interface.** A net plugin is a library NCCL loads to
+  drive a NIC (`NCCL_NET_PLUGIN`); there is no network transport here for one
+  to replace, so those variables are not read.
+
 ## Mixed precision
 
 `cublasGemmEx` takes fp16 or bf16 operands with a float accumulator, which is
@@ -381,8 +427,16 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   as LAPACK's does, and the order can differ. NVIDIA's `sytri` (CUDA 13.0, RTX
   3060) returns success and leaves A as it was; this one computes the inverse
   the API documents.
-- **NCCL**: the network plugin interface, user-defined reduction operators,
-  symmetric memory windows, non-blocking communicators.
+- **NCCL**: symmetric memory windows (registration returns a NULL window, as
+  NCCL does without peer mappings) and the network plugin interface (there is
+  no network to plug into); see "NCCL: a file-backed transport". Not exported,
+  so a program that needs one fails to load with its name: the 2.28+ host API
+  `ncclCommRevoke`, `ncclCommGrow`, `ncclCommGetUniqueId`,
+  `ncclCommSuspend`/`ncclCommResume`, `ncclCommMemStats`, the `nccl*Config`
+  collective forms, the one-sided `ncclPutSignal`/`ncclSignal`/`ncclWaitSignal`,
+  `ncclParam*`, and the device API (`ncclDevCommCreate`, LSA and GIN). Shrink
+  refuses an excluded rank outside the communicator, which NCCL 2.29.7
+  accepts and miscounts.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.
