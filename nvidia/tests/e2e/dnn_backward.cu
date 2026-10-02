@@ -17,8 +17,11 @@
 //     the forward pass's mask, a reseed repeating it; and between an RNN's
 //     layers, its gradients against finite differences of a reseeded
 //     training pass.
+//   - LSTMs in half, bfloat16 and double agree with float.
 //   - CTC loss: its gradient against finite differences of its cost.
 #include <cudnn.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -537,6 +540,63 @@ static void rnn_dropout() {
   cudaFree(st);
 }
 
+/* ---- RNNs in half, bfloat16 and double ---- */
+
+// One LSTM's output in the given type, from the same values (rounded to the
+// type): the weights where cudnnGetRNNWeightSpaceSize says, the input dense.
+template <class T>
+static std::vector<double> lstm_output(cudnnDataType_t type, cudnnDataType_t math, int* status) {
+  const int Tn = 3, B = 2, I = 3, Hd = 4, L = 2;
+  *status = 0;
+  cudnnRNNDescriptor_t rd;
+  cudnnCreateRNNDescriptor(&rd);
+  cudnnStatus_t s = cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_LSTM, CUDNN_RNN_DOUBLE_BIAS,
+                                             CUDNN_UNIDIRECTIONAL, CUDNN_LINEAR_INPUT, type, math, CUDNN_DEFAULT_MATH,
+                                             I, Hd, Hd, L, nullptr, 0);
+  if (s) { *status = s; return {}; }
+  cudnnRNNDataDescriptor_t xd, yd;
+  cudnnCreateRNNDataDescriptor(&xd), cudnnCreateRNNDataDescriptor(&yd);
+  const int lens[B] = {Tn, Tn};
+  cudnnSetRNNDataDescriptor(xd, type, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, Tn, B, I, lens, nullptr);
+  cudnnSetRNNDataDescriptor(yd, type, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, Tn, B, Hd, lens, nullptr);
+  cudnnTensorDescriptor_t hd = nd(type, {L, B, Hd});
+  size_t wbytes = 0, work = 0, reserve = 0;
+  cudnnGetRNNWeightSpaceSize(H, rd, &wbytes);
+  cudnnGetRNNTempSpaceSizes(H, rd, CUDNN_FWD_MODE_INFERENCE, xd, &work, &reserve);
+  const size_t nw = wbytes / sizeof(T), nx = (size_t)Tn * B * I, ny = (size_t)Tn * B * Hd;
+  std::vector<T> w(nw), x(nx);
+  for (size_t i = 0; i < nw; ++i) w[i] = (T)(float)fill((int)i, 0.4);
+  for (size_t i = 0; i < nx; ++i) x[i] = (T)(float)fill((int)i + 5, 1.0);
+  Buf<T> dw(nw), dx(nx), dy(ny);
+  Buf<char> wk(work + 16);
+  dw.put(w), dx.put(x);
+  s = cudnnRNNForward(H, rd, CUDNN_FWD_MODE_INFERENCE, nullptr, xd, dx.p, yd, dy.p, hd, nullptr, nullptr, hd, nullptr,
+                      nullptr, wbytes, dw.p, work, wk.p, 0, nullptr);
+  *status = s;
+  std::vector<double> out;
+  for (T v : dy.get()) out.push_back((double)(float)v);
+  cudnnDestroyRNNDataDescriptor(xd), cudnnDestroyRNNDataDescriptor(yd), cudnnDestroyRNNDescriptor(rd);
+  cudnnDestroyTensorDescriptor(hd);
+  return out;
+}
+
+static void rnn_types() {
+  int sf, sh, sb, sd;
+  const auto f = lstm_output<float>(CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT, &sf);
+  const auto h = lstm_output<__half>(CUDNN_DATA_HALF, CUDNN_DATA_FLOAT, &sh);
+  const auto b = lstm_output<__nv_bfloat16>(CUDNN_DATA_BFLOAT16, CUDNN_DATA_FLOAT, &sb);
+  const auto d = lstm_output<double>(CUDNN_DATA_DOUBLE, CUDNN_DATA_DOUBLE, &sd);
+  auto worst = [&](const std::vector<double>& v) {
+    double m = 0;
+    for (size_t i = 0; i < v.size() && i < f.size(); ++i) m = std::fmax(m, std::fabs(v[i] - f[i]));
+    return v.size() == f.size() ? m : 1e30;
+  };
+  expect("a float LSTM runs", sf == 0, sf);
+  expect("a half LSTM (float math) agrees with float to half precision", sh == 0 && worst(h) < 1e-2, sh ? sh : worst(h));
+  expect("a bfloat16 LSTM agrees with float to bfloat16 precision", sb == 0 && worst(b) < 5e-2, sb ? sb : worst(b));
+  expect("a double LSTM agrees with float", sd == 0 && worst(d) < 1e-5, sd ? sd : worst(d));
+}
+
 /* ---- CTC loss ---- */
 
 // CTC's gradient with respect to the activations (SOFTMAX mode) against
@@ -598,6 +658,7 @@ int main() {
   algorithms();
   dropout();
   rnn_dropout();
+  rnn_types();
   ctc();
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");

@@ -140,7 +140,7 @@ runs them; each is a ctest of its own.
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
-| `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
+| `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, LSTMs in half, bfloat16 and double, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch norm forward and backward | `cudnn_convolution_add_relu`, cudnn-frontend |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -280,8 +280,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   vectorized layouts (`NCHW_VECT_C`, INT8x4/INT8x32) and FP8 tensors; the
   cuDNN 8 normalization API,
   divisive normalization, `cudnnIm2Col`,
-  fused-ops plans and tensor transform descriptors; RNN projections and
-  non-float RNNs.
+  fused-ops plans and tensor transform descriptors; RNN projections.
 - **cuFFT**: callbacks, cuFFTXt's multi-GPU descriptors.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
   CUDA 12), the blocked (BSR) routines, complex values.
