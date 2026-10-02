@@ -51,6 +51,108 @@ both libraries. Refused with a message: the Schur complement mode, the nested
 dissection tree, double-double values, and a matrix distributed across
 processes.
 
+## cuFile: GPUDirect Storage's compatibility mode
+
+GPUDirect Storage moves file data straight between storage and GPU memory by
+DMA, through the nvidia-fs kernel driver. A simulated GPU has no nvidia-fs, so
+`libcufile.so.0` is what NVIDIA's library becomes without it: compatibility
+mode, where a read is a POSIX `pread` staged through host memory into device
+memory and a write the reverse. Everything a program sees -- the driver's open
+count, staged and running parameters, handle and buffer registration,
+`cuFileRead`/`cuFileWrite` into device, pinned, managed or pageable memory, the
+batch API, the stream-ordered API, the statistics -- follows NVIDIA's libcufile
+from CUDA 13.0 on an RTX 3060 without nvidia-fs, statuses included (a data-path
+failure is -1 with the cuFile status in `errno`, as the card answers).
+`nvidia/tests/e2e/cufile_paths.cpp` passes against both libraries, the
+stream-ordered calls excepted: NVIDIA's blocks in stream memory operations
+under WSL, so those are checked on the simulator only.
+
+## nvCOMP: standard bitstreams, coded on the host
+
+An nvCOMP chunk in a standard format is that format's bitstream -- an LZ4
+block, raw Snappy, raw DEFLATE, a gzip member, a Zstandard frame -- so
+`libnvcomp.so.5` reads each chunk out of device memory, codes it on the host
+and writes it back, with codecs of its own written from the formats'
+specifications (`nvidia/src/nvcomp_codecs.cpp`). The streams are compatible
+both ways, which an RTX 3060 checked: NVIDIA's nvCOMP 5.3 decodes what these
+codecs write, and they decode what it writes (`nvidia/tests/e2e/nvcomp_vectors.inc`
+keeps streams of both, so CI checks one direction and the card the other).
+GDeflate is NVIDIA's own layout of DEFLATE for 32-lane decoding, published as
+the Internet-Draft draft-uralsky-gdeflate-00; `nvcomp_gdeflate.cpp` follows it,
+and where the draft leaves the layout open the reading is the one that decodes
+every stream NVIDIA's library wrote word for word -- and NVIDIA's library
+decodes this encoder's streams in every block layout, including the
+multi-block, stored and fixed-Huffman ones nvCOMP never writes itself.
+
+The high-level interface -- `nvcomp::LZ4Manager` and its siblings, their
+configurations, `create_manager` and `get_compression_format` -- is the C++
+classes NVIDIA's headers declare, laid out member for member and vtable slot
+for vtable slot (`nvidia/include/vgpu_nvcomp.hpp`), so a program compiled
+against either header runs on either library. A manager cuts a buffer into
+chunks and writes nvCOMP's container (`NVCOMP_NATIVE`), the bare bitstream
+(`RAW`) or the bitstream after its uncompressed size (`WITH_UNCOMPRESSED_SIZE`:
+4 bytes for LZ4, 8 for the others). The container's layout is not documented;
+it is what NVIDIA's library writes, measured on the card -- a 64-byte header,
+the format's `formatSpec.hpp` struct, each chunk's offset and size, the chunks
+8-byte aligned -- and each library reads the other's
+(`nvidia/tests/e2e/nvcomp_manager.cpp`). The container can also carry
+checksums whose algorithm is not public (no standard CRC or hash matches
+them): a policy that computes them is refused, and one that verifies them if
+present decompresses and reports `nvcompErrorCannotVerifyChecksums`.
+
+The compressed bytes differ from NVIDIA's (another encoder makes other
+choices); the decompressed bytes never do. The queries -- alignments, maximum
+output sizes, status strings, which options are refused -- answer what nvCOMP
+5.3 answered on the card, except that Deflate's maximum output size follows
+NVIDIA's to within 8 bytes and the temporary sizes are the simulator's (it
+needs none). A buffer too small and a corrupt chunk are
+`nvcompErrorCannotDecompress`, as documented; NVIDIA's LZ4 detects neither,
+which on the card is a write past the buffer or a fault.
+
+## NVSHMEM: one GPU per process, every heap shared
+
+NVSHMEM runs a job of PEs, each a process with a GPU, and gives each a
+symmetric heap the others read and write. In `libnvshmem_host.so.3` each PE's
+heap is device memory the simulator backs with a shared file (its CUDA IPC
+mechanism), and every PE maps every other PE's heap into its own device
+address space: the single-node, all-peer-to-peer case of NVSHMEM, where a
+kernel's store to a peer's heap is a store to shared memory. The PEs meet
+through a rendezvous file named by the job's unique ID
+(`nvshmemx_get_uniqueid` and `NVSHMEMX_INIT_WITH_UNIQUEID`, the bootstrap that
+needs no MPI) or, for scripts, `VGPU_NVSHMEM_RANK`, `VGPU_NVSHMEM_NPES` and
+`VGPU_NVSHMEM_ID`; `nvshmem_init()` with neither is a job of one PE, as with
+NVIDIA's library outside a launcher.
+
+The host API is implemented here: the symmetric heap, blocking, strided,
+typed and stream-ordered puts and gets, signals, barriers, teams (strided and
+2-D splits, translation, destruction), and the broadcast, fcollect and alltoall
+collectives. The device API is NVIDIA's own: the `nvshmem_*` calls in a kernel
+are inline functions in NVIDIA's public headers, linked with NVIDIA's
+`libnvshmem_device.a` (`-rdc`). They read one struct, `nvshmemi_device_state_d`,
+which the device library's init code asks this library to fill in -- heap
+bases, the peers' heaps, the team table, the collectives' synchronization
+arrays, laid out as the public headers declare them (`nvidia/src/nvshmem_abi.hpp`,
+checked field by field against NVIDIA's headers by
+`nvidia/tests/e2e/nvshmem_device.cu`). With every peer reachable by load and
+store the inline code never leaves the kernel, so puts, gets, `p`/`g`, atomics,
+signal operations and waits, `quiet`, `fence` and the barriers -- at thread and
+block scope, in teams, and in kernels started with `nvshmemx_collective_launch`
+-- run as NVIDIA compiled them. The device library contains SASS only (PTX is
+shipped for sm_120 alone), which the simulator's SASS engine runs. Each PE's
+heap is memory shared between the processes, and an atomic on memory the host
+maps is made with the CPU's own compare-and-swap in both engines, so PEs
+adding into one word at once lose no update (`e2e_ipc` races two processes'
+kernels on CUDA-IPC memory; `e2e_host_atomics` races a kernel against host
+atomics).
+
+Card ground truth is thin: on an RTX 3060 under WSL NVIDIA's library
+initializes a job of one PE and then has no symmetric heap (`nvshmem_malloc`
+returns NULL), and two 3060s have no peer-to-peer path. What a multi-PE job
+computes here follows NVSHMEM's documentation. `e2e_nvshmem_host` runs the host
+API in jobs of one and three PEs; `e2e_nvshmem_device` runs the device API in a
+job of three, and skips unless NVIDIA's NVSHMEM is installed (`NVSHMEM_HOME`, or
+the `nvidia-nvshmem-cu13` pip package), since its headers and device library
+are not the simulator's to ship.
 ## cuTENSOR and cuTensorNet: tensor contractions, and networks of them
 
 NVIDIA's libcutensor and libcutensornet each carry a static CUDA runtime that
@@ -102,6 +204,9 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration, batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
+| nvCOMP | `libnvcomp.so.5` | the low-level batched API and the C++ manager API for LZ4, Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, and CRC32; Cascaded, Bitcomp and ANS refused (no public bitstream) |
+| NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID; the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition) and gate splitting on cuSOLVER. Built on the simulator's cuTENSOR and cuSOLVER |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
@@ -440,6 +545,23 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   carry a static CUDA runtime that asks the driver for its export table.
 - **NCCL**: the network plugin interface, user-defined reduction operators,
   symmetric memory windows, non-blocking communicators.
+- **cuFile**: the nvidia-fs (DMA) path itself, RDMA and user-space file system
+  handles (`CU_FILE_HANDLE_TYPE_USERSPACE_FS`, refused as
+  `CU_FILE_IO_NOT_SUPPORTED`), and the POSIX bounce-buffer pool's
+  configuration (accepted, nothing to configure).
+- **nvCOMP**: Cascaded, Bitcomp and ANS, whose bitstreams NVIDIA does not
+  publish -- every entry point answers `nvcompErrorNotSupported` -- and LZ4's
+  bitshuffle option, likewise; the container's checksums (their algorithm is
+  not public: computing them is refused, verifying them reports
+  `nvcompErrorCannotVerifyChecksums`); the CPU and streaming gzip APIs; and
+  the hardware decompression engine (the backend option is accepted;
+  everything runs on the host).
+- **NVSHMEM**: the MPI and OpenSHMEM bootstraps (refused by name: use the
+  unique ID), PEs on more than one node and proxy or network transports, NVLink
+  SHARP multicast (`nvshmemx_mc_ptr` is NULL), host-side reductions, the
+  device API's own proxy and IBGDA paths (never taken: every PE is a peer).
+  NVIDIA's default `NVSHMEM_MAX_TEAMS` is 256; here it is 32 unless
+  set, since each team holds synchronization arrays in the symmetric heap.
 - **NVRTC**: CUBIN, LTO-IR and OptiX-IR output (SASS and vendor bitcode, neither
   of which VirtualGPU can execute — ask for PTX), precompiled headers, time
   traces.

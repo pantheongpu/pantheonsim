@@ -299,6 +299,11 @@ class MemoryManager {
   // Gives up a mapping `adopt` returned. The file stays; the process that
   // exported it owns it.
   void abandon(uint64_t va);
+  // Removes the file behind a region this process shared, keeping the
+  // mapping: once every importer has opened it, nothing needs the name, and a
+  // process that dies before freeing the region then leaves no file behind.
+  // False if `ptr` is not the base of a region this process shared.
+  bool unlink_shared(uint64_t ptr);
 
   // ---- managed memory ----
   //

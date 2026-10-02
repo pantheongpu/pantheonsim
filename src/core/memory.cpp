@@ -733,8 +733,15 @@ uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
                       std::strerror(err));
   }
   // Move what is there now, then let the allocation's chunks go: from here on
-  // the file is the memory, at the same device address.
-  read_chunks(live->second, 0, static_cast<uint8_t*>(host), size);
+  // the file is the memory, at the same device address. The new file reads
+  // as zeros, so only chunks that hold something else are copied: writing the
+  // zeros of chunks never touched would make every page of a sparse file
+  // real (a 1 GiB NVSHMEM heap filled a 2.4 GiB tmpfs that way).
+  for (uint64_t off = 0; off < size; off += kChunkSize) {
+    const uint8_t* chunk = live->second.chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk || (is_uniform(chunk) && uniform_byte(chunk) == 0)) continue;
+    read_chunks(live->second, off, static_cast<uint8_t*>(host) + off, std::min(kChunkSize, size - off));
+  }
   live_.erase(live);
   map_host(ptr, host, size);
   shared_[ptr] = SharedRegion{ptr, size, host, path, /*owner=*/true};
@@ -766,6 +773,14 @@ uint64_t MemoryManager::adopt(const std::string& path, uint64_t size) {
   map_host(va, host, size);
   shared_[va] = SharedRegion{va, size, host, path, /*owner=*/false};
   return va;
+}
+
+bool MemoryManager::unlink_shared(uint64_t ptr) {
+  ExclusiveGuard table_guard(table_lock_.get());
+  const auto it = shared_.find(ptr);
+  if (it == shared_.end() || !it->second.owner) return false;
+  ::unlink(it->second.path.c_str());
+  return true;
 }
 
 void MemoryManager::abandon(uint64_t va) {
@@ -971,6 +986,15 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
     case ScalarAt::Unchanged:  // only answered for a store
     case ScalarAt::HostMap:
       // Host memory, mapped: no device ECC covers it, so no fault is taken.
+      // Read as an atomic of its width, as a chunk's scalar is: the host, or
+      // another process's kernels on shared memory, may be updating it with
+      // the CPU's atomics -- which is how the engines make a device atomic on
+      // such memory (vgpu/exec/host_atomic.hpp) -- and a memcpy racing those
+      // is a data race (ThreadSanitizer, e2e_host_atomics).
+      {
+        std::lock_guard<std::mutex> lock(host_maps_->mu);
+        if (const HostMap* m = find_host_map_locked(addr, size)) return load_at(m->host + (addr - m->base), size);
+      }
       read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
       return v;
   }
@@ -1001,6 +1025,15 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       return;
     case ScalarAt::Unchanged:
       return;
+    case ScalarAt::HostMap: {
+      // An atomic store of its width, as load_scalar's load is.
+      std::lock_guard<std::mutex> lock(host_maps_->mu);
+      if (const HostMap* m = find_host_map_locked(addr, size)) {
+        store_at(m->host + (addr - m->base), size, value);
+        return;
+      }
+      break;
+    }
     default:
       break;
   }

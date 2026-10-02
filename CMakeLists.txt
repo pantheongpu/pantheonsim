@@ -648,6 +648,81 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating cuDSS shim symlinks (build/shim/libcudss.so.0)")
 
   # ---------------------------------------------------------------------------
+  # libvgpucufile: cuFile (GPUDirect Storage), presented as libcufile.so.0. A
+  # simulated GPU has no nvidia-fs, so this is cuFile's compatibility mode:
+  # POSIX I/O staged through host memory into simulated device memory, with
+  # NVIDIA's statuses (nvidia/src/cufile_api.cpp, declarations in
+  # nvidia/include/vgpu_cufile.h, since CUDA 12.0's toolkit has no cufile.h).
+  # NVIDIA's exports its symbols with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_cufile_map "${CMAKE_BINARY_DIR}/maps/libcufile.so.0.map")
+  file(WRITE "${_cufile_map}" "{\n  global: cuFile*;\n  local: *;\n};\n")
+  add_library(vgpucufile SHARED nvidia/src/cufile_api.cpp)
+  target_link_libraries(vgpucufile PRIVATE vgpucudart)
+  target_include_directories(vgpucufile PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucufile PROPERTIES OUTPUT_NAME cufile SOVERSION 0 VERSION 0.15)
+  target_link_options(vgpucufile PRIVATE "-Wl,--version-script=${_cufile_map}")
+  add_custom_command(TARGET vgpucufile POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcufile.so.0.15"
+            "${CMAKE_BINARY_DIR}/shim/libcufile.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcufile.so.0.15"
+            "${CMAKE_BINARY_DIR}/shim/libcufile.so"
+    COMMENT "Creating cuFile shim symlinks (build/shim/libcufile.so.0)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvcomp: nvCOMP's low-level batched API, presented as libnvcomp.so.5.
+  # Its standard formats are standard bitstreams (LZ4, Snappy, DEFLATE, gzip,
+  # Zstandard) and GDeflate is published as an Internet-Draft, so each chunk
+  # is coded on the host by the simulator's own codecs
+  # (nvidia/src/nvcomp_codecs.cpp, nvcomp_gdeflate.cpp) between reads and
+  # writes of simulated device memory. Cascaded, Bitcomp and ANS have no
+  # public bitstream and are refused. NVIDIA's library exports its symbols
+  # with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
+  file(WRITE "${_nvcomp_map}"
+       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; };\n  local: *;\n};\n")
+  add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
+              nvidia/src/nvcomp_gdeflate.cpp nvidia/src/nvcomp_manager.cpp)
+  target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
+  target_include_directories(vgpunvcomp PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpunvcomp PROPERTIES OUTPUT_NAME nvcomp SOVERSION 5 VERSION 5.3)
+  target_link_options(vgpunvcomp PRIVATE "-Wl,--version-script=${_nvcomp_map}")
+  add_custom_command(TARGET vgpunvcomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp.so.5"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp.so"
+    COMMENT "Creating nvCOMP shim symlinks (build/shim/libnvcomp.so.5)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvshmem: NVSHMEM's host library, presented as libnvshmem_host.so.3.
+  # Each PE is a process with a simulated GPU; the symmetric heaps are shared
+  # through the simulator's CUDA IPC, so every PE reaches every other by load
+  # and store, and kernels built with NVIDIA's NVSHMEM headers and device
+  # library run their inline device API against the state this library fills
+  # in (nvidia/src/nvshmem_api.cpp, nvshmem_abi.hpp). The host API's
+  # declarations are the simulator's own (nvidia/include/vgpu_nvshmem.h).
+  # NVIDIA tags its symbols NVSHMEM; so does this, including the C++
+  # nvshmemi_init_thread NVSHMEM's inline nvshmem_init() calls.
+  # ---------------------------------------------------------------------------
+  set(_nvshmem_map "${CMAKE_BINARY_DIR}/maps/libnvshmem_host.so.3.map")
+  file(WRITE "${_nvshmem_map}"
+       "NVSHMEM {\n  global: nvshmem*;\n  extern \"C++\" { nvshmemi_init_thread*; };\n  local: *;\n};\n")
+  add_library(vgpunvshmem SHARED nvidia/src/nvshmem_api.cpp)
+  target_link_libraries(vgpunvshmem PRIVATE vgpucudart ${CMAKE_DL_LIBS})
+  target_include_directories(vgpunvshmem PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpunvshmem PROPERTIES OUTPUT_NAME nvshmem_host SOVERSION 3 VERSION 3.8)
+  target_link_options(vgpunvshmem PRIVATE "-Wl,--version-script=${_nvshmem_map}")
+  add_custom_command(TARGET vgpunvshmem POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
+            "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so.3"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
+            "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so"
+    COMMENT "Creating NVSHMEM shim symlinks (build/shim/libnvshmem_host.so.3)")
   # libvgpucutensor: cuTENSOR 2, presented as libcutensor.so.2. Like cuDSS,
   # NVIDIA's carries a statically linked CUDA runtime that cannot reach a
   # simulated driver, so the simulator answers the documented API itself, from
@@ -869,6 +944,12 @@ vgpu_unit_test(test_e2e_parity)
 vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)
 target_sources(test_cudss_solver PRIVATE nvidia/src/cudss_solver.cpp)
 target_include_directories(test_cudss_solver PRIVATE nvidia/src)
+# nvCOMP's host codecs on their own: round trips at every size and effort,
+# known streams from reference encoders and from NVIDIA's nvCOMP, and
+# corrupted input, which must be refused without reading out of bounds.
+vgpu_unit_test(test_nvcomp_codecs nvidia/tests/unit/test_nvcomp_codecs.cpp)
+target_sources(test_nvcomp_codecs PRIVATE nvidia/src/nvcomp_codecs.cpp nvidia/src/nvcomp_gdeflate.cpp)
+target_include_directories(test_nvcomp_codecs PRIVATE nvidia/src)
 # How many host threads a grid is spread over: the CPUs the process may use,
 # its cgroup's CPU quota included, not the host's count.
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
@@ -1419,8 +1500,16 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                 "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor" "cutensornet_paths:cutensornet")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver"
+                          "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse"
+                          "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt"
+                          "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
+                          "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda"
+                          "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda"
+                          "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile"
+                          "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvshmem_host:nvshmem_host"
+                          "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
+                          "cutensornet_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1460,6 +1549,16 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # NVSHMEM's device API: kernels built with NVIDIA's NVSHMEM headers and
+  # device library, on the simulator's host library, across a job of PEs.
+  # NVSHMEM is not in the CUDA toolkit, so this skips unless NVSHMEM_HOME or
+  # the nvidia-nvshmem pip package provides it.
+  add_test(NAME e2e_nvshmem_device COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvshmem_device.sh)
+  set_tests_properties(e2e_nvshmem_device PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
 
   # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
   # fatbin and PTX, as an RTX 3060 answers for all three.
@@ -1516,6 +1615,13 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_atomic_cas
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_cas.sh)
   set_tests_properties(e2e_atomic_cas PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_host_atomics
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
+  set_tests_properties(e2e_host_atomics PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)

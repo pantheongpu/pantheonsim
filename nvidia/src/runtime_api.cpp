@@ -75,6 +75,7 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #include "vgpu/telemetry.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
+#include "vgpu/runtime/shim_memory.hpp"
 
 namespace {
 
@@ -3099,6 +3100,14 @@ VGPU_EXPORT cudaError_t cudaIpcOpenMemHandle(void** ptr, cudaIpcMemHandle_t hand
                            ? static_cast<int>(p.device) : t_current_device;
     const uint64_t va = s.rt->device(device).memory().adopt(ipc_path(id), p.size);
     *ptr = reinterpret_cast<void*>(va);
+    // The memory belongs to the exporter's device, at an address of that
+    // device's; cudaIpcMemLazyEnablePeerAccess makes it reachable from the
+    // importer's devices too, so every other device maps the same bytes at
+    // the same address (an importer whose current device differs from the
+    // exporter's -- one GPU per process -- launches its kernels there).
+    if (uint8_t* host = s.rt->device(device).memory().host_address(va, p.size))
+      for (int d = 0; d < s.rt->device_count(); ++d)
+        if (d != device) s.rt->device(d).memory().map_host(va, host, p.size);
     std::lock_guard<std::mutex> lock(g_ipc_mu);
     g_ipc_open[*ptr] = device;
     return cudaSuccess;
@@ -3116,6 +3125,8 @@ VGPU_EXPORT cudaError_t cudaIpcCloseMemHandle(void* ptr) {
       device = it->second;
       g_ipc_open.erase(it);
     }
+    for (int d = 0; d < s.rt->device_count(); ++d)
+      if (d != device) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(ptr));
     s.rt->device(device).memory().abandon(reinterpret_cast<uint64_t>(ptr));
     return cudaSuccess;
   });
@@ -4841,6 +4852,39 @@ bool vgpu_record_memset_if_capturing(void* dst, int value, size_t bytes, cudaStr
   p.height = 1;
   cudaError_t rc = cudaSuccess;
   return vgpu_record_fill_if_capturing(p, stream, &rc);
+}
+
+// For the library shims (cuFile, nvCOMP, NVSHMEM): the device allocation that
+// holds `p`, on whichever simulated device owns it. False for host memory, a
+// device-heap block and an address no allocation covers -- a shim that is
+// handed one of those refuses it itself rather than letting a copy fail.
+bool vgpu_device_allocation(const void* p, void** base, size_t* size) {
+  bool found = false;
+  guard_query("vgpu_device_allocation", [&](State& s) {
+    const uint64_t addr = reinterpret_cast<uint64_t>(p);
+    if (!vgpu::is_device_va(addr)) return cudaSuccess;
+    vgpu::MemoryManager& mm = owner_memory(s, p);
+    if (mm.heap_contains(addr)) return cudaSuccess;
+    uint64_t b = 0, sz = 0;
+    if (!mm.find_allocation(addr, &b, &sz)) return cudaSuccess;
+    if (base) *base = reinterpret_cast<void*>(b);
+    if (size) *size = static_cast<size_t>(sz);
+    found = true;
+    return cudaSuccess;
+  });
+  return found;
+}
+
+// For the library shims: removes the file behind memory this process shared
+// with cudaIpcGetMemHandle, once every importer has opened it.
+bool vgpu_ipc_unlink(const void* p) {
+  bool done = false;
+  guard_query("vgpu_ipc_unlink", [&](State& s) {
+    const uint64_t addr = reinterpret_cast<uint64_t>(p);
+    for (int d = 0; d < s.rt->device_count() && !done; ++d) done = s.rt->device(d).memory().unlink_shared(addr);
+    return cudaSuccess;
+  });
+  return done;
 }
 
 // Records a host-computed library call during capture. Returns true when it was

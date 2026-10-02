@@ -28,15 +28,27 @@ run() { VGPU_QUIET=1 VGPU_GPU=nvidia/a10 VGPU_VRAM_MB=256 \
         VGPU_TELEMETRY_PATH="$out/run" VGPU_STATE_DIR="$out/state" \
         LD_LIBRARY_PATH="$shim" "$out/ipc" "$@"; }
 
-run export "$out/handle" > "$out/export.log" 2>&1 &
-exporter=$!
-run import "$out/handle" > "$out/import.log" 2>&1 &
-importer=$!
 rc=0
-wait "$exporter" || rc=1
-wait "$importer" || rc=1
-cat "$out/export.log" "$out/import.log"
-grep -q "PASS export" "$out/export.log" || rc=1
-grep -q "PASS import" "$out/import.log" || rc=1
+# Twice: both processes on device 0, then the importer on device 1 of two.
+for round in same other; do
+  rm -f "$out"/handle "$out"/handle.*
+  if [[ $round == same ]]; then
+    run export "$out/handle" > "$out/export.log" 2>&1 &
+    exporter=$!
+    run import "$out/handle" > "$out/import.log" 2>&1 &
+    importer=$!
+  else
+    VGPU_DEVICE_COUNT=2 run export "$out/handle" > "$out/export.log" 2>&1 &
+    exporter=$!
+    VGPU_DEVICE_COUNT=2 IPC_IMPORT_DEVICE=1 run import "$out/handle" > "$out/import.log" 2>&1 &
+    importer=$!
+  fi
+  wait "$exporter" || rc=1
+  wait "$importer" || rc=1
+  echo "--- importer on the $round device"
+  cat "$out/export.log" "$out/import.log"
+  grep -q "PASS export" "$out/export.log" || rc=1
+  grep -q "PASS import" "$out/import.log" || rc=1
+done
 [[ $rc -eq 0 ]] && echo "IPC between two processes: PASS"
 exit $rc
