@@ -6,6 +6,7 @@
 # this tool. Skips if nvcc is unavailable.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/session_guard.sh"
 . "$root/tests/shim_guard.sh"
 build="${VGPU_BUILD_DIR:-$root/build}"
 shim="$build/shim"
@@ -69,7 +70,7 @@ if "$build/vgpu" ncu -o "$out/rep" "$out/access" >/dev/null 2>&1; then fail "--e
 
 # Inside a session, `ncu` is this tool rather than NVIDIA's, which cannot attach.
 iso=()
-unshare --user --map-root-user true >/dev/null 2>&1 || iso=(--no-isolate)
+session_isolation_ok || iso=(--no-isolate)
 ver=$("$build/vgpu" shell --gpu nvidia/a10 --count 1 "${iso[@]}" -y -c "ncu --version" 2>/dev/null | tail -1)
 [[ "$ver" == VirtualGPU\ ncu* ]] || fail "in a session, ncu --version said '$ver'"
 echo "ncu over simulated counters: PASS"
