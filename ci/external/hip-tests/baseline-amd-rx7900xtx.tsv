@@ -1,0 +1,47 @@
+Unit_hipGetDeviceCount_HideDevices	fail	DeviceTest	/work/hip-tests/catch/./include/hip_test_process.hh:79: FAILED:
+Unit_hipEvent	timeout	EventTest	/work/hip-tests/catch/unit/event/Unit_hipEvent.cc:205: FAILED:
+Unit_hipGraph_SimpleGraphWithKernel	timeout	GraphsTest1	/work/hip-tests/catch/unit/graph/hipSimpleGraphWithKernel.cc:153: FAILED:
+Unit_hipGraphClone_multi_GPU_test	timeout	GraphsTest2	/work/hip-tests/catch/unit/graph/hipGraphCloneComplx.cc:1277: FAILED:
+Unit_hipMemFaultStackAllocation_Check	timeout	KernelTest	/work/hip-tests/catch/unit/kernel/hipMemFaultStackAllocation.cc:82: FAILED:
+Unit_hipGetProcAddress_MemoryApisMemcpy3DRelated	timeout	MemoryTest1	/work/hip-tests/catch/unit/memory/hipGetProcAddressMemoryApis.cc:4485: FAILED:
+Unit_hipHostMalloc_AllocateUseMoreThanAvailGPUMemory	timeout	MemoryTest2	/work/hip-tests/catch/unit/memory/hipHostMalloc.cc:273: FAILED:
+Unit_hipMallocPitch_KernelLaunch - float	fail	MemoryTest2	/work/hip-tests/catch/unit/memory/hipMallocPitch.cc:510: FAILED:
+Unit_hipMallocPitch_KernelLaunch - int	fail	MemoryTest2	/work/hip-tests/catch/unit/memory/hipMallocPitch.cc:510: FAILED:
+Unit_hiprtcCombiComplrOptnTst	fail	RTC	FAILED IN COMBINATION :
+Unit_hiprtcDisabledSlpVectorizeComplrOptnTst	fail	RTC	/work/hip-tests/catch/unit/rtc/hiprtcComplrOptnTesting.cc:92: FAILED:
+Unit_hipMultiStream_sameDevice	timeout	StreamTest	/work/hip-tests/catch/unit/stream/hipMultiStream.cc:39: FAILED:
+Unit_hipStreamCreateWithPriority_ValidateWithEvents	fail	StreamTest	/work/hip-tests/catch/unit/stream/hipStreamCreateWithPriority.cc:463: FAILED:
+Unit_hipStreamCreate_MultistreamBasicFunctionalities	timeout	StreamTest	/work/hip-tests/catch/unit/stream/hipAPIStreamDisable.cc:46: FAILED:
+Unit_Coalesced_Group_Shfl_Down_Positive_Basic - double	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:504: FAILED:
+Unit_Coalesced_Group_Shfl_Down_Positive_Basic - float	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:504: FAILED:
+Unit_Coalesced_Group_Shfl_Down_Positive_Basic - long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:504: FAILED:
+Unit_Coalesced_Group_Shfl_Down_Positive_Basic - unsigned long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:504: FAILED:
+Unit_Coalesced_Group_Shfl_Down_Positive_Basic - unsigned long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:504: FAILED:
+Unit_Coalesced_Group_Sync_Positive_Basic - uint16_t	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:738: FAILED:
+Unit_Coalesced_Group_Sync_Positive_Basic - uint32_t	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:738: FAILED:
+Unit_Coalesced_Group_Sync_Positive_Basic - uint8_t	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group.cc:738: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Getters_Positive_Basic	timeout	coopGrpTest	/work/hip-tests/catch/./include/cpu_grid.h:126: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - double	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - float	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - int	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - unsigned int	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - unsigned long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - unsigned long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:353: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - double	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - float	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - int	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - unsigned int	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - unsigned long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - unsigned long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_group_tiled_partition.cc:252: FAILED:
+Unit_Thread_Block_Tile_Shfl_Up_Positive_Basic - long long	timeout	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/thread_block_tile.cc:159: FAILED:
+Unit_Thread_Block_Tile_Sync_Positive_Basic - uint16_t	timeout	coopGrpTest	/work/hip-tests/catch/./include/cpu_grid.h:126: FAILED:
+Unit_Thread_Block_Tile_Sync_Positive_Basic - uint32_t	timeout	coopGrpTest	/work/hip-tests/catch/./include/cpu_grid.h:126: FAILED:
+Unit_Thread_Block_Tile_Sync_Positive_Basic - uint8_t	timeout	coopGrpTest	/work/hip-tests/catch/./include/cpu_grid.h:126: FAILED:
+Unit_coalesced_groups	fail	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/hipCGCoalescedGroups_old.cc:303: FAILED:
+Unit_coalesced_groups_shfl_down	crash	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_groups_shfl_down_old.cc:240: FAILED:
+Unit_coalesced_groups_shfl_up	crash	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_groups_shfl_up_old.cc:225: FAILED:
+Unit_Copy_Coherency	timeout	synchronizationTests	/work/hip-tests/catch/unit/synchronization/copy_coherency.cc:324: FAILED:

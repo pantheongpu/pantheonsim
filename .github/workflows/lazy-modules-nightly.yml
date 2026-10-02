@@ -26,15 +26,37 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Steps run with bash, in the toolchain containers too, where a step's shell
+# would otherwise be sh: the steps use [[ ]], pipefail, arrays and PIPESTATUS.
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  # The toolchain images (.github/ci-image), found by ci-image-ref.yml.
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
   lazy:
     name: e2e with every module parsed lazily
+    needs: image
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # The build job's toolchain image, or (empty) the runner itself with the
+    # install step below.
+    container:
+      image: ${{ needs.image.outputs.cuda12_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: -ccbin g++-12
     steps:
       - uses: actions/checkout@v4
 
       - name: Install toolchain
+        if: ${{ !job.container.id }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \

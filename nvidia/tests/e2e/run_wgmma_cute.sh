@@ -33,7 +33,9 @@ fi
 rm -f "$probe"
 . "$root/nvidia/tests/e2e/cutlass_fetch.sh"
 # PTX only: the simulator runs PTX, and skipping ptxas halves the compile.
-nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a --expt-relaxed-constexpr \
+# -nodlink: CUDA 12.8's device-link step asks nvlink for compute_90aa and fails;
+# without -rdc there is nothing to device-link anyway.
+nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code=compute_90a -nodlink --expt-relaxed-constexpr \
      -I "$cutlass/include" $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out"
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 # Kept out of a failing command substitution: with `set -e` the shell would exit

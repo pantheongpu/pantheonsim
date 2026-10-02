@@ -11,6 +11,7 @@
 #   so `--count abc` was one GPU; and a command killed by a signal exited 1.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/session_guard.sh"
 . "$root/tests/shim_guard.sh"
 build="$(cd "${VGPU_BUILD_DIR:-$root/build}" && pwd)"
 vgpu="$build/vgpu"
@@ -58,7 +59,7 @@ expect "--hostname and --kernel reach hostname and every uname form" \
   "$(sess --hostname sim-node.example --kernel 6.1.0-test \
        -c 'hostname; hostname -s; uname -n; uname -sr; uname -r -s; uname --kernel-release; uname; uname -a')"
 sess -c 'uname -z' >/dev/null; expect "uname rejects a flag it does not have" "1" "$?"
-if unshare -r -m -u true 2>/dev/null; then
+if session_isolation_ok; then
   host_before=$(cat /proc/sys/kernel/hostname)
   expect "an isolated session sets the kernel's own hostname" "iso-node" \
     "$(timeout 60 "$vgpu" shell -y --hostname iso-node -c 'cat /proc/sys/kernel/hostname' </dev/null 2>/dev/null)"

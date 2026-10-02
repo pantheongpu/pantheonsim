@@ -1,0 +1,23 @@
+# PolyBench/GPU (sgrauerg/polybenchGpu 5584aaa), MINI_DATASET, built for sm_86 with CUDA 13.0.
+# Each compares its GPU result with its own CPU reference and prints how many outputs
+# differ beyond its threshold. Columns: benchmark | source directory | the RTX 3060's counts.
+# Left out: MVT (a race in the benchmark: 8 threads update each x1[i]), GEMVER (prints no
+# count) and DOITGEN (does not compile).
+2DCONV|2DCONV|0
+2MM|2MM|0
+3DCONV|3DCONV|0
+3MM|3MM|0
+ADI|ADI|1
+ATAX|ATAX|0
+BICG|BICG|0
+CORR|CORR|0
+COVAR|COVAR|0
+FDTD-2D|FDTD-2D|0
+GEMM|GEMM|0
+GESUMMV|GESUMMV|0
+GRAMSCHM|GRAMSCHM|0
+JACOBI1D|JACOBI1D|0
+JACOBI2D|JACOBI2D|0
+LU|LU|0
+SYR2K|SYR2K|0
+SYRK|SYRK|0

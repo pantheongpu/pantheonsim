@@ -1,0 +1,8 @@
+# Rodinia (yuhc/gpu-rodinia 9c10d3e) apps whose output on the simulated nvidia/rtx3060 is
+# byte for byte an RTX 3060's (CUDA 13.0, sm_86), with inputs they generate themselves.
+# Columns: app | source directory | nvcc sources and flags | arguments | output file
+# (stdout: what it prints, with "Time consumed" lines dropped) | sha256 of the card's.
+pathfinder|cuda/pathfinder|pathfinder.cu -DBENCH_PRINT|1000 50 20|stdout|dbab14c0e89be7bda41ffc9ca076c4ad5eb6e0e5b58ce4c9cb16992fb13127c4
+needle|cuda/nw|needle.cu -DTRACEBACK|256 10|result.txt|93eddd7be8b8f594e0fdd3579f6248d76812c8103aef927ae665a0df7a7670ad
+lud|cuda/lud/cuda|lud.cu lud_kernel.cu ../common/common.c -I../common -O3|-s 256 -v|stdout|43f29fcc628d0125ca09b6c8413d9a99a7c5b52ca6ad971ff91847aec3d7c904
+streamcluster|cuda/streamcluster|streamcluster_cuda_cpu.cpp streamcluster_cuda.cu streamcluster_header.cu -O3 -lcuda|10 20 16 1024 1024 1000 none out.txt 1|out.txt|160d167fe871197552fa17559835f012aa2761ec57afd882d5a442f4ae8be39d

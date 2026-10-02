@@ -733,6 +733,10 @@ vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
 target_compile_definitions(test_regs PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_regalloc)
+# Behaviour the nvcc-built e2e programs check, mirrored in hand-written PTX so a
+# regression shows without a CUDA toolkit: device printf, heap, atomics,
+# grid sync, symbols, managed variables, the device runtime, reset.
+vgpu_unit_test(test_e2e_parity)
 # cuDSS's sparse direct solver on its own, host arithmetic only: orderings,
 # LU, LDL^T and Cholesky with their pivoting, inertia, on random matrices.
 vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)

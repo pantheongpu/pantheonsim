@@ -1,0 +1,314 @@
+name: External suites nightly
+
+# Other people's GPU test suites, unmodified, on the simulator, each checked
+# against what real hardware did with the same programs (ci/external):
+#
+#   NVIDIA, against an RTX 3060's results (CUDA 13.0, sm_86): CUDA Samples
+#   v13.0, HeCBench's self-checking benchmarks, Rodinia apps (byte for byte),
+#   PolyBench/GPU (its own CPU check). Only programs whose simulator result
+#   already matched the card's are listed, so any failure is a regression.
+#   AMD: hip-tests (rocm-7.1.0) for one GPU a night, in turn MI300X, RX 6900 XT,
+#   RX 7900 XTX and RX 9070 XT, against that GPU's baseline of known failures.
+#
+# On the pantheonsim.com runner (the repository variable ML_RUNS_ON, as the
+# ml job): it has CUDA 13.0 and ROCm 7.1, which hosted runners lack. It is one
+# runner, and pull requests' ml jobs need it too, so the work is a chain of
+# jobs of an hour or less each: a pull request's job queued meanwhile runs
+# between two of them instead of after all of them. The suites' builds do not
+# depend on the simulator and are cached (actions/cache), so a night builds
+# only the simulator unless a suite's list or pin changed.
+on:
+  schedule:
+    - cron: '37 8 * * *'
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Suites to run (space separated): cuda-samples hecbench rodinia polybench hip-tests"
+        default: cuda-samples hecbench rodinia polybench hip-tests
+      amd_gpu:
+        description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
+        default: ''
+
+permissions:
+  contents: read
+
+# One at a time, never cancelled: a second run waits for the first.
+concurrency:
+  group: external-suites
+  cancel-in-progress: false
+
+env:
+  SUITES: ${{ inputs.suites || 'cuda-samples hecbench rodinia polybench hip-tests' }}
+  # The NVIDIA lists' profile: the card their expected results came from.
+  SUITE_GPU: nvidia/rtx3060
+
+jobs:
+  sim:
+    name: build the simulator
+    if: vars.ML_RUNS_ON != ''
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 45
+    outputs:
+      amd_gpu: ${{ steps.turn.outputs.gpu }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tonight's AMD GPU
+        id: turn
+        env:
+          PICK: ${{ inputs.amd_gpu }}
+        run: |
+          gpus=(amd/mi300x amd/rx6900xt amd/rx7900xtx amd/rx9070xt)
+          gpu="${PICK:-${gpus[$(( 10#$(date -u +%j) % 4 ))]}}"
+          echo "gpu=$gpu" >> "$GITHUB_OUTPUT"; echo "hip-tests tonight: $gpu"
+
+      - name: Build
+        run: |
+          nvcc --version | tail -1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Pack it
+        # A tarball, not the artifact's own file list: the shim's libraries are
+        # links to one file each, which must stay links (see hip-tests.sh).
+        run: |
+          find build -name CMakeFiles -type d -prune -exec rm -rf {} +
+          find build \( -name '*.o' -o -name '*.a' \) -delete
+          tar -czf sim-build.tgz build
+          ls -la sim-build.tgz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sim-build
+          path: sim-build.tgz
+          retention-days: 3
+
+  # --- NVIDIA ------------------------------------------------------------
+  nvidia:
+    name: ${{ matrix.suite }} on ${{ matrix.gpu }}
+    needs: sim
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    # A build on a cache miss, then the runs.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # One at a time: they share the one runner, and a pull request's job
+      # queued meanwhile then gets the runner between two of them.
+      max-parallel: 1
+      matrix:
+        include:
+          - { suite: polybench,    gpu: nvidia/rtx3060 }
+          - { suite: rodinia,      gpu: nvidia/rtx3060 }
+          - { suite: cuda-samples, gpu: nvidia/rtx3060 }
+          - { suite: hecbench,     gpu: nvidia/rtx3060 }
+    steps:
+      - name: Wanted tonight?
+        id: want
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          if [[ " $SUITES " == *" $SUITE "* ]]; then echo "yes=1" >> "$GITHUB_OUTPUT"; else echo "not asked for: $SUITE"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.want.outputs.yes
+
+      - uses: actions/download-artifact@v4
+        if: steps.want.outputs.yes
+        with:
+          name: sim-build
+
+      - name: Unpack the simulator
+        if: steps.want.outputs.yes
+        run: tar -xzf sim-build.tgz && rm sim-build.tgz && ls build/shim | head -40
+
+      - name: The suite's build, from the cache
+        if: steps.want.outputs.yes
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: suite
+          key: external-${{ matrix.suite }}-${{ hashFiles(format('ci/external/{0}.txt', matrix.suite), 'ci/external/suites.sh', 'ci/external/compat.h') }}-cuda13.0
+
+      - name: Fetch and build it (a cache miss)
+        if: steps.want.outputs.yes && steps.cache.outputs.cache-hit != 'true'
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          ci/external/suites.sh fetch "$SUITE" suite
+          ci/external/suites.sh build "$SUITE" suite
+          # Objects are not needed to run, and would fill the cache.
+          find suite \( -name '*.o' -o -name '*.obj' \) -delete
+          find suite -name CMakeFiles -type d -prune -exec rm -rf {} +
+          du -sh suite
+
+      - name: Keep the build
+        if: steps.want.outputs.yes && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: suite
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Run it on the simulator
+        if: steps.want.outputs.yes
+        env:
+          SUITE: ${{ matrix.suite }}
+          SUITE_GPU: ${{ matrix.gpu }}
+        run: |
+          set -o pipefail
+          ci/external/suites.sh run "$SUITE" suite build/shim report | tee run.log
+
+      - name: Results
+        if: always() && steps.want.outputs.yes
+        run: cat report/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.want.outputs.yes
+        with:
+          name: external-${{ matrix.suite }}
+          path: report
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # --- AMD hip-tests -----------------------------------------------------
+  hip-tests-build:
+    name: build hip-tests for ${{ needs.sim.outputs.amd_gpu }}
+    needs: [sim, nvidia]
+    if: ${{ !cancelled() && needs.sim.result == 'success' && contains(inputs.suites || 'hip-tests', 'hip-tests') }}
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    # About 30 minutes at -j2 on 8 CPUs for one architecture's suites; longer
+    # here, and only on a cache miss.
+    timeout-minutes: 300
+    outputs:
+      arch: ${{ steps.arch.outputs.arch }}
+      key: ${{ steps.arch.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Architecture and suites
+        id: arch
+        env:
+          GPU: ${{ needs.sim.outputs.amd_gpu }}
+        run: |
+          case "$GPU" in
+            amd/mi300x) arch=gfx942 ;; amd/rx6900xt) arch=gfx1030 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
+            *) echo "::error::no hip-tests baseline for $GPU"; exit 1 ;;
+          esac
+          echo "arch=$arch" >> "$GITHUB_OUTPUT"
+          echo "key=hip-tests-rocm-7.1.0-$arch-${{ hashFiles('ci/external/hip-tests.sh', '.github/workflows/external-suites.yml') }}" >> "$GITHUB_OUTPUT"
+
+      - name: The build, from the cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: hip-tests
+          key: ${{ steps.arch.outputs.key }}
+          lookup-only: true
+
+      - name: Fetch and build (a cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          ARCH: ${{ steps.arch.outputs.arch }}
+          # Each translation unit wants a few GB; the runner has 22.
+          HT_JOBS: '3'
+        run: |
+          ci/external/hip-tests.sh fetch hip-tests
+          # Every suite any GPU's shards run (below). MemoryTest1 needs
+          # libnuma-dev, which the runner's image lacks.
+          ci/external/hip-tests.sh build hip-tests "$ARCH" \
+            AtomicsTest UnitDeviceTests SyncthreadsTest ThreadfenceTest DeviceMemoryTest ClockCheckTest KernelTest \
+            VectorTypesTest PrintfTest TextureTest SurfaceTest ChannelDescriptorTest MemoryTest2 WarpTest coopGrpTest \
+            DeviceTest StreamTest StreamPerThreadTest EventTest ErrorHandlingTest ExecutionControlTest ModuleTest RTC \
+            OccupancyTest MultiThreadTest CallbackTest Context GraphsTest1 GraphsTest2 VirtualMemoryManagementTest \
+            SVMAtomicTest LaunchBoundsTest AssertionTest CompilerTest HipSpecificTest LibraryTests dynamicLoading
+          find hip-tests \( -name '*.o' -o -name '*.obj' \) -delete
+          find hip-tests -name CMakeFiles -type d -prune -exec rm -rf {} +
+          du -sh hip-tests
+
+      - name: Keep the build
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: hip-tests
+          key: ${{ steps.arch.outputs.key }}
+
+  hip-tests:
+    name: hip-tests ${{ matrix.shard }} on ${{ needs.sim.outputs.amd_gpu }}
+    needs: [sim, hip-tests-build]
+    if: ${{ !cancelled() && needs.hip-tests-build.result == 'success' }}
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        # Device suites on every GPU; the runtime ones where the baseline
+        # covers them (all on the MI300X; ModuleTest, RTC, StreamTest,
+        # EventTest, the graph suites, OccupancyTest and VMM on the RX 7900 XTX).
+        include:
+          - shard: device 1
+            suites: AtomicsTest UnitDeviceTests SyncthreadsTest ThreadfenceTest DeviceMemoryTest ClockCheckTest KernelTest VectorTypesTest PrintfTest
+            on: all
+          - shard: device 2
+            suites: TextureTest SurfaceTest ChannelDescriptorTest MemoryTest2 WarpTest
+            on: all
+          - shard: cooperative groups
+            suites: coopGrpTest
+            on: all
+          - shard: runtime
+            suites: DeviceTest StreamTest StreamPerThreadTest EventTest ErrorHandlingTest ExecutionControlTest ModuleTest RTC OccupancyTest MultiThreadTest CallbackTest Context VirtualMemoryManagementTest SVMAtomicTest LaunchBoundsTest AssertionTest CompilerTest HipSpecificTest LibraryTests dynamicLoading
+            on: amd/mi300x
+          - shard: runtime
+            suites: ModuleTest RTC StreamTest EventTest OccupancyTest VirtualMemoryManagementTest
+            on: amd/rx7900xtx
+          - shard: graphs
+            suites: GraphsTest1 GraphsTest2
+            on: amd/mi300x amd/rx7900xtx
+    steps:
+      - name: For this GPU?
+        id: want
+        env:
+          GPU: ${{ needs.sim.outputs.amd_gpu }}
+          ON: ${{ matrix.on }}
+        run: |
+          if [[ $ON == all || " $ON " == *" $GPU "* ]]; then echo "yes=1" >> "$GITHUB_OUTPUT"; else echo "not run on $GPU"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.want.outputs.yes
+
+      - uses: actions/download-artifact@v4
+        if: steps.want.outputs.yes
+        with:
+          name: sim-build
+
+      - name: Unpack the simulator
+        if: steps.want.outputs.yes
+        run: tar -xzf sim-build.tgz && rm sim-build.tgz
+
+      - uses: actions/cache/restore@v4
+        if: steps.want.outputs.yes
+        with:
+          path: hip-tests
+          key: ${{ needs.hip-tests-build.outputs.key }}
+          fail-on-cache-miss: true
+
+      - name: Run against the baseline
+        if: steps.want.outputs.yes
+        env:
+          GPU: ${{ needs.sim.outputs.amd_gpu }}
+          SHARD_SUITES: ${{ matrix.suites }}
+        run: |
+          set -o pipefail
+          # shellcheck disable=SC2086
+          ci/external/hip-tests.sh run hip-tests "$GPU" build/shim report $SHARD_SUITES | tee run.log
+
+      - name: Results
+        if: always() && steps.want.outputs.yes
+        run: cat report/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.want.outputs.yes
+        with:
+          name: hip-tests-${{ strategy.job-index }}
+          path: report
+          retention-days: 14
+          if-no-files-found: ignore

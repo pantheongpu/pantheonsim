@@ -11,6 +11,7 @@
 #     and each card's chip ID, compute units and caches are the card's.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/session_guard.sh"
 build="$(cd "${VGPU_BUILD_DIR:-$root/build}" && pwd)"
 vgpu="$build/vgpu"
 [[ -x "$vgpu" ]] || { echo "SKIP: no vgpu at $vgpu"; exit 0; }
@@ -51,7 +52,7 @@ expect "and an Instinct card a processing accelerator" \
   "$(sess amd/mi300x -c "VGPU_PCI_IDS=/nonexistent $vgpu smi --lspci -s 01:00.0")"
 expect "lspci -k names the driver" "Kernel driver in use: amdgpu" \
   "$(sess amd/mi300x -c "$vgpu smi --lspci -k -s 01:00.0" | grep -o 'Kernel driver in use: .*')"
-if command -v lspci >/dev/null && unshare --user --map-root-user true >/dev/null 2>&1; then
+if command -v lspci >/dev/null && session_isolation_ok; then
   expect "isolated, the real lspci reads the session's /sys: the bound driver" "Kernel driver in use: amdgpu" \
     "$(isolated amd/mi300x -c 'lspci -k -s 01:00.0' | grep -o 'Kernel driver in use: .*')"
 else
@@ -68,7 +69,7 @@ expect "lspci -vmm keeps its record form" "Slot:	01:00.0|Class:	VGA compatible c
 # aliases; both differ by host, so both are left out of the comparison -- as
 # is the warning it prints where the host has no module files to read (a
 # container's "Unable to load libkmod resources").
-if command -v lspci >/dev/null && unshare --user --map-root-user true >/dev/null 2>&1; then
+if command -v lspci >/dev/null && session_isolation_ok; then
   for g in amd/rx7900xtx amd/mi300x; do
     diffs=$(timeout 300 "$vgpu" shell -y --gpu "$g" --count 3 </dev/null 2>/dev/null -c '
       norm() { sed -e "/Kernel modules:/d; /^Module:/d; /Subsystem:/d; /^SDevice:/d; /Unable to load libkmod resources/d" -e "s/\"[^\"]*\"$//"; }
@@ -118,7 +119,7 @@ expect "KFD's topology: a CPU node and a node per GPU, each with the GPU's targe
 expect "KFD's topology: Radeon GPUs reach each other through the host" "1|1|2 40" \
   "$(sess amd/rx7900xtx -c 't=$VGPU_SESSION/root/sys/class/kfd/kfd/topology/nodes/1; awk "/^(io_links_count|p2p_links_count) /{print \$2}" $t/properties; awk "/^(type|weight) /{print \$2}" $t/p2p_links/0/properties | paste -sd" "' | paste -sd'|')"
 enum=$(ls /opt/rocm/bin/rocm_agent_enumerator "$HOME"/.local/share/rocm-*/opt/rocm-*/bin/rocm_agent_enumerator 2>/dev/null | sort -V | tail -1)
-if ! unshare --user --map-root-user true >/dev/null 2>&1; then
+if ! session_isolation_ok; then
   echo "skip  the isolated kernel-driver checks: unprivileged user namespaces are unavailable here"
 else
   host_dev=$(ls -A /dev | sort | paste -sd' ')
@@ -162,7 +163,7 @@ readings() {
 }
 if [[ -z "$rsmi" ]]; then
   echo "skip  ROCm's rocm-smi: no ROCm here"
-elif ! unshare --user --map-root-user true >/dev/null 2>&1; then
+elif ! session_isolation_ok; then
   echo "skip  ROCm's rocm-smi: unprivileged user namespaces are unavailable here"
 elif objdump -p "$build/shim/librocm_smi64.so.1" 2>/dev/null | grep -q 'NEEDED.*lib[at]san'; then
   echo "skip  ROCm's rocm-smi: a sanitizer build, loaded by a Python that is not built with one"

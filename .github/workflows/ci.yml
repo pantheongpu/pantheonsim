@@ -28,7 +28,17 @@ env:
   # compilations need this; the shims themselves are ordinary C++.
   NVCC_PREPEND_FLAGS: -ccbin g++-12
 
+# Steps run with bash, in the toolchain containers too, where a step's shell
+# would otherwise be sh: the steps use [[ ]], pipefail, arrays and PIPESTATUS.
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  # The toolchain images this run's jobs can use (ci-image-ref.yml).
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
   build-and-test:
     name: build + unit tests
     # GitHub's hosted runner unless the repository variable SIM_RUNS_ON names
@@ -36,6 +46,9 @@ jobs:
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
     # this job's toolchain built in, so the install step runs only on GitHub's.
     runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
+    # Not in the toolchain image (.github/ci-image) like the other jobs: its
+    # session tests (vgpu shell) need the user namespaces and mounts that an
+    # unprivileged container refuses, so it keeps the runner and apt.
     steps:
       - uses: actions/checkout@v4
 
@@ -78,6 +91,16 @@ jobs:
     # most of it). Nothing else bounds it, so a hang would otherwise hold the
     # job for GitHub's six-hour default.
     timeout-minutes: 60
+    # The toolchain image (.github/ci-image), or, when there is none, the
+    # runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ vars.SIM_RUNS_ON == '' && needs.image.outputs.cuda12_0 || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # The IPC tests need more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,7 +114,7 @@ jobs:
           path: pantheon
 
       - name: Install toolchain
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && !job.container.id
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
@@ -105,10 +128,11 @@ jobs:
 
       - name: Run pantheon workloads
         working-directory: pantheonsim
-        env:
-          VGPU_PANTHEON_DIR: ${{ github.workspace }}/pantheon
-          VGPU_BUILD_DIR: ${{ github.workspace }}/pantheonsim/build
-        run: ./tests/workloads/run_pantheon_workloads.sh
+        # $GITHUB_WORKSPACE, not the github.workspace expression, which names
+        # the runner's path even when the job runs in a container.
+        run: |
+          export VGPU_PANTHEON_DIR="$GITHUB_WORKSPACE/pantheon" VGPU_BUILD_DIR="$GITHUB_WORKSPACE/pantheonsim/build"
+          ./tests/workloads/run_pantheon_workloads.sh
 
   sass:
     name: SASS on every architecture
@@ -122,12 +146,22 @@ jobs:
     # sm_120a) and requires it to run, which takes a few hours.
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
+    # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
+    # the runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: ''
     steps:
       - uses: actions/checkout@v4
 
       - name: Install CUDA 13
+        if: ${{ !job.container.id }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
@@ -171,16 +205,29 @@ jobs:
     runs-on: ubuntu-24.04
     # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
     timeout-minutes: 90
+    # The toolchain image (.github/ci-image), or, when there is none, the
+    # runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # The IPC tests need more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g
     env:
       # Shims built against CUDA 13 make Ollama pick its cuda_v13 backend,
       # whose PTX starts at sm_75 and so covers every profile.
       NVCC_PREPEND_FLAGS: ''
       OLLAMA_VERSION: v0.21.0
-      OLLAMA_MODELS: ${{ github.workspace }}/ollama-models
+      # Pulled before the test (and cached), so a registry 503 is retried
+      # rather than failing the job; the cache key names the model.
+      VGPU_OLLAMA_MODEL: smollm2:135m
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CUDA 13 and ollama
+      - name: Install CUDA 13
+        if: ${{ !job.container.id }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
@@ -196,6 +243,9 @@ jobs:
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+
+      - name: Install ollama
+        run: |
           mkdir -p "$RUNNER_TEMP/ollama"
           wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" |
             zstd -d | tar -x -C "$RUNNER_TEMP/ollama"
@@ -206,6 +256,25 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
           ls build/shim/libcudart.so.*
+
+      - name: The model, from the cache
+        id: model
+        uses: actions/cache/restore@v4
+        with:
+          path: ollama-models
+          key: ollama-model-${{ env.VGPU_OLLAMA_MODEL }}-v1
+
+      - name: The model, from the registry on a cache miss (retried)
+        run: |
+          echo "OLLAMA_MODELS=$GITHUB_WORKSPACE/ollama-models" >> "$GITHUB_ENV"
+          OLLAMA_MODELS="$GITHUB_WORKSPACE/ollama-models" tests/e2e/ollama_fetch_model.sh "$VGPU_OLLAMA_MODEL"
+
+      - name: Keep the model
+        if: steps.model.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ollama-models
+          key: ollama-model-${{ env.VGPU_OLLAMA_MODEL }}-v1
 
       - name: A model on every simulated NVIDIA GPU
         env:
@@ -223,7 +292,9 @@ jobs:
         gpu: [amd/mi300x, amd/mi325x, amd/mi350x, amd/mi250x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt]
     env:
       OLLAMA_VERSION: v0.21.0
-      OLLAMA_MODELS: ${{ github.workspace }}/ollama-models
+      # Pulled before the test (and cached), so a registry 503 is retried
+      # rather than failing the job; the cache key names the model.
+      VGPU_OLLAMA_MODEL: smollm2:135m
     steps:
       - uses: actions/checkout@v4
 
@@ -245,6 +316,25 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target vgpuhip vgpu_cli
 
+      - name: The model, from the cache
+        id: model
+        uses: actions/cache/restore@v4
+        with:
+          path: ollama-models
+          key: ollama-model-${{ env.VGPU_OLLAMA_MODEL }}-v1
+
+      - name: The model, from the registry on a cache miss (retried)
+        run: |
+          echo "OLLAMA_MODELS=$GITHUB_WORKSPACE/ollama-models" >> "$GITHUB_ENV"
+          OLLAMA_MODELS="$GITHUB_WORKSPACE/ollama-models" tests/e2e/ollama_fetch_model.sh "$VGPU_OLLAMA_MODEL"
+
+      - name: Keep the model
+        if: steps.model.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ollama-models
+          key: ollama-model-${{ env.VGPU_OLLAMA_MODEL }}-v1
+
       - name: A model on the simulated GPU
         env:
           VGPU_OLLAMA_PULL: '1'
@@ -259,15 +349,33 @@ jobs:
     # this job's toolchain built in, so the install step runs only on GitHub's.
     runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 20
+    # The toolchain image (.github/ci-image), or, when there is none, the
+    # runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ vars.SIM_RUNS_ON == '' && needs.image.outputs.cuda12_0 || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # The IPC tests need more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g
     steps:
       - uses: actions/checkout@v4
+
+      # The checkout belongs to the runner's user and the job runs as root in
+      # the container: trust this one repository, or git refuses it (tests ask
+      # git which files are tracked). actions/checkout's own exception lasts
+      # only for its step.
+      - name: Trust the checkout
+        if: job.container.id
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # clang builds the gfx942 code objects these tests read, and
       # llvm-objdump prints the instructions the decoder is checked against.
       # No ROCm is needed for either. They are installed here rather than left
       # to the image so the checks cannot quietly skip.
       - name: Install toolchain
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && !job.container.id
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build clang llvm
@@ -379,10 +487,30 @@ jobs:
   sanitizers:
     name: ASan + UBSan
     runs-on: ubuntu-24.04
+    # The toolchain image (.github/ci-image), or, when there is none, the
+    # runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ needs.image.outputs.cuda12_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
+      # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
 
+      # The checkout belongs to the runner's user and the job runs as root in
+      # the container: trust this one repository, or git refuses it (tests ask
+      # git which files are tracked). actions/checkout's own exception lasts
+      # only for its step.
+      - name: Trust the checkout
+        if: job.container.id
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install toolchain
+        if: ${{ !job.container.id }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
@@ -404,10 +532,30 @@ jobs:
   threads:
     name: ThreadSanitizer
     runs-on: ubuntu-24.04
+    # The toolchain image (.github/ci-image), or, when there is none, the
+    # runner itself with the install step below.
+    needs: image
+    container:
+      image: ${{ needs.image.outputs.cuda12_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
+      # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     steps:
       - uses: actions/checkout@v4
 
+      # The checkout belongs to the runner's user and the job runs as root in
+      # the container: trust this one repository, or git refuses it (tests ask
+      # git which files are tracked). actions/checkout's own exception lasts
+      # only for its step.
+      - name: Trust the checkout
+        if: job.container.id
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install toolchain
+        if: ${{ !job.container.id }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \

@@ -39,10 +39,29 @@ concurrency:
   group: workloads-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
+# Steps run with bash, in the toolchain containers too, where a step's shell
+# would otherwise be sh: the steps use [[ ]], pipefail, arrays and PIPESTATUS.
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  # The toolchain images (.github/ci-image), found by ci-image-ref.yml.
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
   machine:
     name: ${{ matrix.count }} x ${{ matrix.gpu }}, CUDA ${{ matrix.cuda }}
+    needs: image
     runs-on: ubuntu-24.04
+    # The CUDA version's toolchain image, or (empty) the runner itself with
+    # the install step below.
+    container:
+      image: ${{ matrix.cuda == '12.0' && needs.image.outputs.cuda12_0 || needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
     # A full suite takes 20 to 40 minutes on a 4-core runner. Every workload
     # also has its own timeout below, so a hang costs one row, not the job.
     timeout-minutes: 120
@@ -72,6 +91,7 @@ jobs:
           - { key: h100-pcie-x1-cuda12.0, gpu: nvidia/h100-pcie, count: 1, cuda: '12.0' }  # Hopper 9.0 on CUDA 12
           - { key: h200-x4-cuda13.0,  gpu: nvidia/h200,        count: 4, cuda: '13.0' }  # Hopper 9.0
           - { key: rtx5090-x1-cuda13.0, gpu: nvidia/rtx5090,   count: 1, cuda: '13.0' }  # Blackwell 12.0, consumer; CUDA 12.8+
+          - { key: b300-x1-cuda13.0,  gpu: nvidia/b300,        count: 1, cuda: '13.0' }  # Blackwell Ultra 10.3; CUDA 12.9+
     env:
       # CUDA 13 packages from NVIDIA's repository: the compiler and the headers
       # of every library the simulator stands in for.
@@ -91,6 +111,7 @@ jobs:
           path: pantheon
 
       - name: Install CUDA ${{ matrix.cuda }}
+        if: ${{ !job.container.id }}
         env:
           CUDA: ${{ matrix.cuda }}
         run: |
@@ -122,8 +143,6 @@ jobs:
       - name: Run every workload
         working-directory: pantheonsim
         env:
-          VGPU_PANTHEON_DIR: ${{ github.workspace }}/pantheon
-          VGPU_BUILD_DIR: ${{ github.workspace }}/pantheonsim/build
           VGPU_WORKLOADS: ${{ inputs.workloads || 'all' }}
           VGPU_WORKLOAD_GPU: ${{ matrix.gpu }}
           VGPU_WORKLOAD_COUNT: ${{ matrix.count }}
@@ -132,19 +151,24 @@ jobs:
           VGPU_WORKLOAD_SECONDS: '5'
           VGPU_WORKLOAD_ARGS: --kernel_loops 2 --warmup_iters 1 --grid_size 4
           VGPU_WORKLOAD_TIMEOUT: '300'
-          VGPU_WORKLOAD_REPORT: ${{ runner.temp }}/report/${{ matrix.key }}
-        run: ./tests/workloads/run_pantheon_workloads.sh
+          KEY: ${{ matrix.key }}
+        # Paths from $GITHUB_WORKSPACE: the github.workspace and runner.temp
+        # expressions name the runner's paths even inside a container.
+        run: |
+          export VGPU_PANTHEON_DIR="$GITHUB_WORKSPACE/pantheon" VGPU_BUILD_DIR="$GITHUB_WORKSPACE/pantheonsim/build"
+          export VGPU_WORKLOAD_REPORT="$GITHUB_WORKSPACE/report/$KEY"
+          ./tests/workloads/run_pantheon_workloads.sh
 
       - name: Results
         if: always()
-        run: cat "$RUNNER_TEMP/report/${{ matrix.key }}/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no results were written" >> "$GITHUB_STEP_SUMMARY"
+        run: cat "$GITHUB_WORKSPACE/report/${{ matrix.key }}/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no results were written" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: workloads-${{ matrix.key }}
-          path: ${{ runner.temp }}/report/${{ matrix.key }}
+          path: report/${{ matrix.key }}
           retention-days: 14
           if-no-files-found: ignore
 

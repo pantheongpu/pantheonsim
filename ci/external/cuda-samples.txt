@@ -1,0 +1,61 @@
+# CUDA Samples v13.0 (NVIDIA/cuda-samples 3f1c509) that pass on an RTX 3060 (CUDA 13.0,
+# sm_86) and on the simulated nvidia/rtx3060. Columns: sample path | the line the card
+# printed to say it passed (empty: the sample prints none, and its exit status is the check).
+# Left out: timing checks (simpleHyperQ), samples slower than the nightly allows
+# (matrixMul, simpleStreams, eigenvalues, scan, dmmaTensorCoreGemm, globalToShmemAsyncCopy),
+# and warpAggregatedAtomicsCG, whose sim result varied between runs.
+Samples/0_Introduction/asyncAPI/asyncAPI|
+Samples/0_Introduction/clock/clock|
+Samples/0_Introduction/cudaOpenMP/cudaOpenMP|
+Samples/0_Introduction/fp16ScalarProduct/fp16ScalarProduct|&&&& fp16ScalarProduct PASSED
+Samples/0_Introduction/mergeSort/mergeSort|
+Samples/0_Introduction/simpleAWBarrier/simpleAWBarrier|Result = PASSED
+Samples/0_Introduction/simpleAssert/simpleAssert|
+Samples/0_Introduction/simpleAtomicIntrinsics/simpleAtomicIntrinsics|
+Samples/0_Introduction/simpleCallback/simpleCallback|
+Samples/0_Introduction/simpleCooperativeGroups/simpleCooperativeGroups|
+Samples/0_Introduction/simpleCubemapTexture/simpleCubemapTexture|
+Samples/0_Introduction/simpleLayeredTexture/simpleLayeredTexture|
+Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU|
+Samples/0_Introduction/simpleOccupancy/simpleOccupancy|Test PASSED
+Samples/0_Introduction/simplePrintf/simplePrintf|
+Samples/0_Introduction/simpleSurfaceWrite/simpleSurfaceWrite|
+Samples/0_Introduction/simpleTemplates/simpleTemplates|[simpleTemplates] -> Test Results: 0 Failures
+Samples/0_Introduction/simpleVoteIntrinsics/simpleVoteIntrinsics|
+Samples/0_Introduction/simpleZeroCopy/simpleZeroCopy|
+Samples/0_Introduction/template/template|
+Samples/0_Introduction/vectorAdd/vectorAdd|Test PASSED
+Samples/2_Concepts_and_Techniques/MC_EstimatePiInlineP/MC_EstimatePiInlineP|
+Samples/2_Concepts_and_Techniques/MC_EstimatePiP/MC_EstimatePiP|
+Samples/2_Concepts_and_Techniques/MC_SingleAsianOptionP/MC_SingleAsianOptionP|
+Samples/2_Concepts_and_Techniques/convolutionSeparable/convolutionSeparable|Test passed
+Samples/2_Concepts_and_Techniques/dct8x8/dct8x8|Test passed
+Samples/2_Concepts_and_Techniques/histogram/histogram|Test passed
+Samples/2_Concepts_and_Techniques/inlinePTX/inlinePTX|
+Samples/2_Concepts_and_Techniques/interval/interval|
+Samples/2_Concepts_and_Techniques/radixSortThrust/radixSortThrust|Test passed
+Samples/2_Concepts_and_Techniques/reduction/reduction|Test passed
+Samples/2_Concepts_and_Techniques/scalarProd/scalarProd|Test passed
+Samples/2_Concepts_and_Techniques/segmentationTreeThrust/segmentationTreeThrust|
+Samples/2_Concepts_and_Techniques/shfl_scan/shfl_scan|
+Samples/2_Concepts_and_Techniques/sortingNetworks/sortingNetworks|
+Samples/2_Concepts_and_Techniques/streamOrderedAllocation/streamOrderedAllocation|basicStreamOrderedAllocation PASSED
+Samples/2_Concepts_and_Techniques/threadFenceReduction/threadFenceReduction|
+Samples/3_CUDA_Features/StreamPriorities/StreamPriorities|
+Samples/3_CUDA_Features/bf16TensorCoreGemm/bf16TensorCoreGemm|
+Samples/3_CUDA_Features/binaryPartitionCG/binaryPartitionCG|
+Samples/3_CUDA_Features/cdpBezierTessellation/cdpBezierTessellation|
+Samples/3_CUDA_Features/cdpQuadtree/cdpQuadtree|
+Samples/3_CUDA_Features/cdpSimplePrint/cdpSimplePrint|
+Samples/3_CUDA_Features/cdpSimpleQuicksort/cdpSimpleQuicksort|
+Samples/3_CUDA_Features/cudaTensorCoreGemm/cudaTensorCoreGemm|
+Samples/3_CUDA_Features/immaTensorCoreGemm/immaTensorCoreGemm|
+Samples/3_CUDA_Features/jacobiCudaGraphs/jacobiCudaGraphs|&&&& jacobiCudaGraphs PASSED
+Samples/3_CUDA_Features/newdelete/newdelete|
+Samples/3_CUDA_Features/ptxjit/ptxjit|
+Samples/3_CUDA_Features/simpleCudaGraphs/simpleCudaGraphs|
+Samples/3_CUDA_Features/tf32TensorCoreGemm/tf32TensorCoreGemm|
+Samples/6_Performance/LargeKernelParameter/LargeKernelParameter|Test passed!
+Samples/6_Performance/alignedTypes/alignedTypes|[alignedTypes] -> Test Results: 0 Failures
+Samples/6_Performance/cudaGraphsPerfScaling/cudaGraphsPerfScaling|Test passed
+Samples/6_Performance/transpose/transpose|Test passed

@@ -9,6 +9,7 @@
 # the host's own nvidia-smi showed through as well.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/session_guard.sh"
 build="$(cd "${VGPU_BUILD_DIR:-$root/build}" && pwd)"
 vgpu="$build/vgpu"
 [[ -x "$vgpu" ]] || { echo "no vgpu at $vgpu"; exit 1; }
@@ -41,7 +42,7 @@ expect "rocm_agent_enumerator -t GPU lists only the GPUs" "gfx942" \
 expect "and -t CPU only the CPU agent" "gfx000" "$(sess --no-isolate -c 'rocm_agent_enumerator -t CPU')"
 
 # --- isolated, the host's NVIDIA driver is out of sight too ---
-if unshare --user --map-root-user true >/dev/null 2>&1; then
+if session_isolation_ok; then
   # What pantheon.py asks: is there an nvidia-smi, is there a rocm-smi.
   probe='import shutil; print(shutil.which("nvidia-smi") is None, shutil.which("rocm-smi") is not None)'
   expect "a PATH search finds rocm-smi and no nvidia-smi" "True True" \

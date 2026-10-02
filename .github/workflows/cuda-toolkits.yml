@@ -1,0 +1,89 @@
+name: CUDA toolkits
+
+# The suite built with CUDA toolkits the other jobs do not use. ci.yml compiles
+# the shims and every e2e program with Ubuntu's CUDA 12.0 and the ollama and
+# SASS jobs with 13.0, so code behind `CUDART_VERSION >= 12020` ... `< 13000`
+# (12.2's, 12.3's, 12.5's, 12.6's and 12.8's API additions, the 12.x shims'
+# sonames with them) was never compiled, let alone run, in CI. This builds the
+# simulator and the e2e programs with CUDA 12.8 and runs the build job's tests.
+#
+# On pull requests that touch the NVIDIA side, when a change lands, nightly
+# and by hand. Another 12.x is one more row.
+on:
+  push:
+    branches: [main]
+    paths: ["nvidia/**", "src/**", "include/**", "tests/**", "CMakeLists.txt", ".github/workflows/cuda-toolkits.yml"]
+  pull_request:
+    paths: ["nvidia/**", "include/**", "tests/shim_guard.sh", "CMakeLists.txt", ".github/workflows/cuda-toolkits.yml"]
+  schedule:
+    - cron: '7 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: build + tests, CUDA ${{ matrix.cuda }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['12.8']
+    # On the runner itself, not the cuda12.8 image: it runs the build job's
+    # tests, whose session tests need user namespaces and mounts a container
+    # refuses.
+    env:
+      # CUDA 12.4 and later take GCC 13, the runner's own.
+      NVCC_PREPEND_FLAGS: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA ${{ matrix.cuda }}
+        env:
+          CUDA: ${{ matrix.cuda }}
+        run: |
+          v=${CUDA/./-}
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          pkgs="cuda-nvcc-$v cuda-cudart-dev-$v cuda-nvml-dev-$v cuda-cupti-dev-$v cuda-nvrtc-dev-$v
+                libcublas-dev-$v libcufft-dev-$v libcurand-dev-$v libcusparse-dev-$v libnvjpeg-dev-$v
+                libcusolver-dev-$v libnpp-dev-$v cuda-profiler-api-$v"
+          if apt-cache show "cuda-crt-$v" >/dev/null 2>&1; then pkgs="$pkgs cuda-crt-$v"; fi
+          # shellcheck disable=SC2086
+          sudo apt-get install -y -qq --no-install-recommends $pkgs
+          echo "/usr/local/cuda-$CUDA/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-$CUDA" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          nvcc --version | tail -2
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: The shims follow this toolkit
+        # libcudart.so.12 from 12.x headers: a 13 here would mean the build
+        # found another toolkit's headers and nothing below tested 12.x.
+        env:
+          CUDA: ${{ matrix.cuda }}
+        run: |
+          ls build/shim/
+          test -e "build/shim/libcudart.so.${CUDA%%.*}"
+          grep -qE "define CUDART_VERSION +${CUDA%%.*}0${CUDA##*.}0" "$(dirname "$(command -v nvcc)")/../include/cuda_runtime_api.h"
+
+      - name: Unit and end-to-end tests
+        # The build job's set. The ML tests are the ml job's, the workloads
+        # and ollama ci.yml's, and CUTLASS's builds take hours.
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -E '^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_cutlass.*)$'
