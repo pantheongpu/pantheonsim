@@ -58,6 +58,13 @@ nvcc -std=c++17 -cudart "$cudart" -arch=compute_80 -code=compute_80 \
      -Wno-deprecated-gpu-targets -Xcompiler -Wno-deprecated-declarations \
      $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" "${links[@]}"
 require_shim_libs "$shim" "$out" || exit 0
+# A program that opens cuDNN and the runtime itself (cudnn_dlhandle, as the
+# cudnn-frontend does) opens them RTLD_GLOBAL, which puts libcuda and libcudart
+# in one scope: each carries the simulator's globals, and a sanitizer build
+# reports the pair as an ODR violation. They are the same code, by design.
+if grep -q cudnn_dlhandle "$src"; then
+  export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_odr_violation=0"
+fi
 status=0
 result="$(VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
