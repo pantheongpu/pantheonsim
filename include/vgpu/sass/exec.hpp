@@ -73,6 +73,7 @@ struct Module {
   std::map<std::string, uint64_t> section_va; // banks and variables, by section name
   std::vector<uint64_t> allocations;          // freed on unload
   std::map<uint64_t, std::string> builtins;   // magic address -> vprintf, malloc, ...
+  bool device_launches = false;               // it can launch kernels (dynamic parallelism)
 
   const Code* code_at(uint64_t addr) const;   // the section holding a code address
 };

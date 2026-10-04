@@ -21,7 +21,7 @@ require_shim_libs() {
     case "$need" in
       libcudart.so.*|libcublas.so.*|libcublasLt.so.*|libnccl.so.*|libcuda.so.*|libcudnn.so.*|\
       libcufft.so.*|libcusolver.so.*|libcusolverMg.so.*|libcusparse.so.*|libcurand.so.*|libcustatevec.so.*|\
-      libcudss.so.*|libcutensor.so.*|libcutensornet.so.*|libnvJitLink.so.*|libnvfatbin.so.*)
+      libcudss.so.*|libnvJitLink.so.*|libnvfatbin.so.*|libcusparseLt.so.*|libcutensor.so.*|libcutensornet.so.*)
         if [[ ! -e "$shim/$need" ]]; then
           echo "SKIP: app needs $need, which $shim does not provide" \
                "(nvcc's toolkit major differs from this build's)"
