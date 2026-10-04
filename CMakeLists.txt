@@ -723,6 +723,29 @@ if(CUDA_ABI_INCLUDE)
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
             "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so"
     COMMENT "Creating NVSHMEM shim symlinks (build/shim/libnvshmem_host.so.3)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpucusparselt: cuSPARSELt, matrix products with a 2:4 structured sparse
+  # operand, presented as libcusparseLt.so.0. Like cuDSS, NVIDIA's carries a
+  # statically linked CUDA runtime that cannot reach a simulated driver, so the
+  # simulator answers the documented API itself, from its own declarations
+  # (nvidia/include/vgpu_cusparselt.h), and multiplies on the host. NVIDIA's
+  # exports its symbols with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_cusparselt_map "${CMAKE_BINARY_DIR}/maps/libcusparseLt.so.0.map")
+  file(WRITE "${_cusparselt_map}" "{\n  global: cusparseLt*;\n  local: *;\n};\n")
+  add_library(vgpucusparselt SHARED nvidia/src/cusparselt_api.cpp)
+  target_link_libraries(vgpucusparselt PRIVATE vgpucudart)
+  target_include_directories(vgpucusparselt PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucusparselt PROPERTIES OUTPUT_NAME cusparseLt SOVERSION 0 VERSION 0.10)
+  target_link_options(vgpucusparselt PRIVATE "-Wl,--version-script=${_cusparselt_map}")
+  add_custom_command(TARGET vgpucusparselt POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcusparseLt.so.0.10"
+            "${CMAKE_BINARY_DIR}/shim/libcusparseLt.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcusparseLt.so.0.10"
+            "${CMAKE_BINARY_DIR}/shim/libcusparseLt.so"
+    COMMENT "Creating cuSPARSELt shim symlinks (build/shim/libcusparseLt.so.0)")
   # libvgpucutensor: cuTENSOR 2, presented as libcutensor.so.2. Like cuDSS,
   # NVIDIA's carries a statically linked CUDA runtime that cannot reach a
   # simulated driver, so the simulator answers the documented API itself, from
@@ -1508,6 +1531,8 @@ if(TARGET vgpucublas)
                           "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda"
                           "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile"
                           "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvshmem_host:nvshmem_host"
+                          "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
+                          "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt"
                           "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
