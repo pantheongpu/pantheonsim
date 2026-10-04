@@ -658,8 +658,13 @@ struct Op {
   const void* send;
   void* recv;
   size_t count;          // elements: per rank for AllGather/AlltoAll/Gather/Scatter, per-rank output for ReduceScatter
-  ncclDataType_t dt;
-  ncclRedOp_t red;
+  // Kept as ints: a caller may pass a value that is no member of the enum
+  // (NCCL answers ncclInvalidArgument), and copying such an enum is undefined
+  // behavior that UBSan reports. enqueue() checks both before they are used.
+  int dt;
+  int red;
+  ncclDataType_t type() const { return static_cast<ncclDataType_t>(dt); }
+  ncclRedOp_t rop() const { return static_cast<ncclRedOp_t>(red); }
   int root = 0;
   int peer = 0;
   cudaStream_t stream = nullptr;
@@ -712,7 +717,7 @@ Mapping* writer_for(Rendezvous* rz, int rank, size_t want) {
 // How many bytes of data this rank publishes for the given op (not counting a
 // pre-multiplied sum's scalar trailer).
 size_t deposit_bytes(const Op& op) {
-  const size_t es = type_size(op.dt);
+  const size_t es = type_size(op.type());
   const size_t n = (size_t)op.comm->nranks;
   const bool root = op.comm->rank == op.root;
   switch (op.kind) {
@@ -757,7 +762,7 @@ ncclResult_t deposit(Op& op) {
     if (!m) return ncclSystemError;
     std::memcpy(m->addr, op.color_key, bytes);
   } else if (bytes) {
-    const size_t es = type_size(op.dt);
+    const size_t es = type_size(op.type());
     const size_t total = bytes + (op.premul ? es : 0);
     Mapping* m = writer_for(c->rz, c->rank, total);
     if (!m) return ncclSystemError;
@@ -824,7 +829,7 @@ ncclResult_t make_child(Op& op, const std::string& key, int nranks, int rank) {
 ncclResult_t collect(Op& op) {
   Comm* c = op.comm;
   Meta* meta = c->rz->meta;
-  const size_t es = type_size(op.dt);
+  const size_t es = type_size(op.type());
   const size_t n = (size_t)c->nranks;
 
   if (op.kind == Kind::Send) return ncclSuccess;
@@ -938,14 +943,14 @@ ncclResult_t collect(Op& op) {
       const size_t total = op.count * n;
       std::vector<char> acc;
       if (op.premul) {
-        if (ncclResult_t r = premul_reduce(c, total, op.dt, &acc); r != ncclSuccess) return r;
+        if (ncclResult_t r = premul_reduce(c, total, op.type(), &acc); r != ncclSuccess) return r;
       } else {
         if (!read_peer(c->rz, 0, total * es, &acc)) return ncclSystemError;
         for (int r = 1; r < c->nranks; ++r) {
           if (!read_peer(c->rz, r, total * es, &peer)) return ncclSystemError;
-          if (!reduce(acc.data(), peer.data(), total, op.dt, op.red)) return ncclInvalidArgument;
+          if (!reduce(acc.data(), peer.data(), total, op.type(), op.rop())) return ncclInvalidArgument;
         }
-        if (op.red == ncclAvg) average(acc.data(), total, op.dt, c->nranks);
+        if (op.red == ncclAvg) average(acc.data(), total, op.type(), c->nranks);
       }
       op.staging.assign(acc.begin() + (size_t)c->rank * op.count * es,
                         acc.begin() + (size_t)(c->rank + 1) * op.count * es);
@@ -954,17 +959,17 @@ ncclResult_t collect(Op& op) {
     default: {  // AllReduce and Reduce
       if (op.kind == Kind::Reduce && c->rank != op.root) break;  // only the root builds a result
       if (op.premul) {
-        if (ncclResult_t r = premul_reduce(c, op.count, op.dt, &op.staging); r != ncclSuccess)
+        if (ncclResult_t r = premul_reduce(c, op.count, op.type(), &op.staging); r != ncclSuccess)
           return r;
         break;
       }
       if (!read_peer(c->rz, 0, op.count * es, &op.staging)) return ncclSystemError;
       for (int r = 1; r < c->nranks; ++r) {
         if (!read_peer(c->rz, r, op.count * es, &peer)) return ncclSystemError;
-        if (!reduce(op.staging.data(), peer.data(), op.count, op.dt, op.red))
+        if (!reduce(op.staging.data(), peer.data(), op.count, op.type(), op.rop()))
           return ncclInvalidArgument;
       }
-      if (op.red == ncclAvg) average(op.staging.data(), op.count, op.dt, c->nranks);
+      if (op.red == ncclAvg) average(op.staging.data(), op.count, op.type(), c->nranks);
       break;
     }
   }
@@ -1065,8 +1070,8 @@ ncclResult_t check_comm(Comm* c, bool poison = false) {
 ncclResult_t enqueue(Op op) {
   Comm* c = op.comm;
   if (ncclResult_t r = check_comm(c, true); r != ncclSuccess) return fail_call(r);
-  if (type_size(op.dt) == 0) {
-    std::fprintf(stderr, "[vgpu] nccl: invalid type %d\n", (int)op.dt);
+  if (type_size(op.type()) == 0) {
+    std::fprintf(stderr, "[vgpu] nccl: invalid type %d\n", op.dt);
     return fail_call(ncclInvalidArgument);
   }
   if ((op.kind == Kind::Broadcast || op.kind == Kind::Reduce || op.kind == Kind::Gather ||
@@ -1085,13 +1090,13 @@ ncclResult_t enqueue(Op op) {
     // card: an operator from another communicator, or destroyed, is
     // ncclInvalidArgument, and so is one used with another datatype.
     std::lock_guard<std::mutex> l(c->mu);
-    const long idx = redop_slot(c, op.red);
+    const long idx = redop_slot(c, op.rop());
     if (idx < 0) {
       std::fprintf(stderr, "[vgpu] nccl: reduction operation %d unknown to this communicator\n",
-                   (int)op.red);
+                   op.red);
       return fail_call(ncclInvalidArgument);
     }
-    if (c->redops[idx].dt != op.dt) {
+    if (c->redops[idx].dt != op.type()) {
       std::fprintf(stderr, "[vgpu] nccl: data type supplied to user-created ncclRedOp_t does not "
                            "match type given to reduction operation\n");
       return fail_call(ncclInvalidArgument);
