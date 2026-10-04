@@ -62,8 +62,14 @@ require_shim_libs "$shim" "$out" || exit 0
 # cudnn-frontend does) opens them RTLD_GLOBAL, which puts libcuda and libcudart
 # in one scope: each carries the simulator's globals, and a sanitizer build
 # reports the pair as an ODR violation. They are the same code, by design.
+# Where an NVIDIA runtime of another major is installed too, the frontend picks
+# the lowest and runs on NVIDIA's own, which cannot reach a simulated driver;
+# name the shim's.
 if grep -q cudnn_dlhandle "$src"; then
   export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_odr_violation=0"
+  for rt in "$shim"/libcudart.so.[0-9]*; do
+    if [[ "$rt" =~ \.so\.[0-9]+$ ]]; then export CUDNN_FRONTEND_CUDART_LIB_NAME="$rt"; fi
+  done
 fi
 status=0
 result="$(VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
