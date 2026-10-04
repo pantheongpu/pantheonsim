@@ -421,6 +421,9 @@ int main(int argc, char** argv) {
     CK(cudaGraphAddChildGraphNode(&n, g, nullptr, 0, one_kernel((const void*)logk, a)));
     accepted(g, __LINE__);
     cudaGetLastError();
+    CK(cudaFreeHost(pinned));   // a leak check sees host allocations behind the first two
+    CK(cudaFree(managed));
+    CK(cudaFree(dev));
   }
 
   // ---- 6. upload ----------------------------------------------------------------
