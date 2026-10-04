@@ -648,6 +648,111 @@ if(CUDA_ABI_INCLUDE)
     COMMENT "Creating cuDSS shim symlinks (build/shim/libcudss.so.0)")
 
   # ---------------------------------------------------------------------------
+  # libvgpucusparselt: cuSPARSELt, matrix products with a 2:4 structured sparse
+  # operand, presented as libcusparseLt.so.0. Like cuDSS, NVIDIA's carries a
+  # statically linked CUDA runtime that cannot reach a simulated driver, so the
+  # simulator answers the documented API itself, from its own declarations
+  # (nvidia/include/vgpu_cusparselt.h), and multiplies on the host. NVIDIA's
+  # exports its symbols with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_cusparselt_map "${CMAKE_BINARY_DIR}/maps/libcusparseLt.so.0.map")
+  file(WRITE "${_cusparselt_map}" "{\n  global: cusparseLt*;\n  local: *;\n};\n")
+  add_library(vgpucusparselt SHARED nvidia/src/cusparselt_api.cpp)
+  target_link_libraries(vgpucusparselt PRIVATE vgpucudart)
+  target_include_directories(vgpucusparselt PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucusparselt PROPERTIES OUTPUT_NAME cusparseLt SOVERSION 0 VERSION 0.10)
+  target_link_options(vgpucusparselt PRIVATE "-Wl,--version-script=${_cusparselt_map}")
+  add_custom_command(TARGET vgpucusparselt POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcusparseLt.so.0.10"
+            "${CMAKE_BINARY_DIR}/shim/libcusparseLt.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcusparseLt.so.0.10"
+            "${CMAKE_BINARY_DIR}/shim/libcusparseLt.so"
+    COMMENT "Creating cuSPARSELt shim symlinks (build/shim/libcusparseLt.so.0)")
+  # libvgpucutensor: cuTENSOR 2, presented as libcutensor.so.2. Like cuDSS,
+  # NVIDIA's carries a statically linked CUDA runtime that cannot reach a
+  # simulated driver, so the simulator answers the documented API itself, from
+  # its own declarations (nvidia/include/vgpu_cutensor.h), computing on the
+  # host. NVIDIA's tags each symbol with the release that introduced it
+  # (libcutensor.1.0.0 ... libcutensor.2.5.0, a chain of versions); the map
+  # reproduces the chain so a program linked against either library binds to
+  # the other.
+  # ---------------------------------------------------------------------------
+  set(_cutensor_map "${CMAKE_BINARY_DIR}/maps/libcutensor.so.2.map")
+  file(WRITE "${_cutensor_map}" [=[
+libcutensor.1.0.0 {
+  global: cutensorGetCudartVersion; cutensorGetErrorString; cutensorGetVersion;
+  local: *;
+};
+libcutensor.1.1.0 { } libcutensor.1.0.0;
+libcutensor.1.2.0 { } libcutensor.1.1.0;
+libcutensor.1.3.0 {
+  global: cutensorLoggerForceDisable; cutensorLoggerOpenFile; cutensorLoggerSetCallback;
+          cutensorLoggerSetFile; cutensorLoggerSetLevel; cutensorLoggerSetMask;
+} libcutensor.1.2.0;
+libcutensor.1.6.0 { } libcutensor.1.3.0;
+libcutensor.1.7.0 { global: cutensorCreate; cutensorDestroy; } libcutensor.1.6.0;
+libcutensor.2.0.0 {
+  global: CUTENSOR_COMPUTE_DESC_16F; CUTENSOR_COMPUTE_DESC_16BF; CUTENSOR_COMPUTE_DESC_TF32;
+          CUTENSOR_COMPUTE_DESC_3XTF32; CUTENSOR_COMPUTE_DESC_32F; CUTENSOR_COMPUTE_DESC_64F;
+          cutensorComputeDescriptorGetAttribute; cutensorComputeDescriptorSetAttribute; cutensorContract;
+          cutensorCreateComputeDescriptor; cutensorCreateContraction; cutensorCreateElementwiseBinary;
+          cutensorCreateElementwiseTrinary; cutensorCreatePermutation; cutensorCreatePlan;
+          cutensorCreatePlanPreference; cutensorCreateReduction; cutensorCreateTensorDescriptor;
+          cutensorDestroyComputeDescriptor; cutensorDestroyOperationDescriptor; cutensorDestroyPlan;
+          cutensorDestroyPlanPreference; cutensorDestroyTensorDescriptor; cutensorElementwiseBinaryExecute;
+          cutensorElementwiseTrinaryExecute; cutensorEstimateWorkspaceSize; cutensorHandleReadPlanCacheFromFile;
+          cutensorHandleResizePlanCache; cutensorHandleWritePlanCacheToFile;
+          cutensorOperationDescriptorGetAttribute; cutensorOperationDescriptorSetAttribute;
+          cutensorOperationEstimateRuntime; cutensorOperationNumAlgos; cutensorPermute; cutensorPlanGetAttribute;
+          cutensorPlanPreferenceSetAttribute; cutensorReadKernelCacheFromFile; cutensorReduce;
+          cutensorTensorDescriptorSetAttribute; cutensorWriteKernelCacheToFile;
+} libcutensor.1.7.0;
+libcutensor.2.1.1 { global: cutensorContractTrinary; cutensorCreateContractionTrinary; } libcutensor.2.0.0;
+libcutensor.2.2.1 { global: CUTENSOR_COMPUTE_DESC_9X16BF; };
+libcutensor.2.3.0 {
+  global: cutensorBlockSparseContract; cutensorCreateBlockSparseContraction;
+          cutensorCreateBlockSparseTensorDescriptor; cutensorDestroyBlockSparseTensorDescriptor;
+} libcutensor.2.2.1;
+libcutensor.2.4.0 { global: CUTENSOR_COMPUTE_DESC_8XINT8; cutensorPlanPreferenceGetAttribute; } libcutensor.2.3.0;
+libcutensor.2.5.0 { global: CUTENSOR_COMPUTE_DESC_4X16F; } libcutensor.2.4.0;
+libcutensor.2.7.0 {
+  global: cutensorCreateExtraction; cutensorCreateInsertion; cutensorExtract; cutensorInsert;
+} libcutensor.2.5.0;
+]=])
+  add_library(vgpucutensor SHARED nvidia/src/cutensor_api.cpp)
+  target_link_libraries(vgpucutensor PRIVATE vgpucudart)
+  target_include_directories(vgpucutensor PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucutensor PROPERTIES OUTPUT_NAME cutensor SOVERSION 2 VERSION 2.8)
+  target_link_options(vgpucutensor PRIVATE "-Wl,--version-script=${_cutensor_map}")
+  add_custom_command(TARGET vgpucutensor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensor.so.2.8"
+            "${CMAKE_BINARY_DIR}/shim/libcutensor.so.2"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensor.so.2.8"
+            "${CMAKE_BINARY_DIR}/shim/libcutensor.so"
+    COMMENT "Creating cuTENSOR shim symlinks (build/shim/libcutensor.so.2)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpucutensornet: cuTensorNet (cuQuantum), presented as
+  # libcutensornet.so.2, on the simulator's cuTENSOR and cuSOLVER as NVIDIA's
+  # is on theirs. NVIDIA's tags its symbols libcutensornet.so.0.
+  # ---------------------------------------------------------------------------
+  vgpu_version_script(cutensornet 0 _cutensornet_map)
+  add_library(vgpucutensornet SHARED nvidia/src/cutensornet_api.cpp)
+  target_link_libraries(vgpucutensornet PRIVATE vgpucutensor vgpucusolver vgpucudart)
+  target_include_directories(vgpucutensornet PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucutensornet PROPERTIES OUTPUT_NAME cutensornet SOVERSION 2 VERSION 2.14)
+  target_link_options(vgpucutensornet PRIVATE "-Wl,--version-script=${_cutensornet_map}")
+  add_custom_command(TARGET vgpucutensornet POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensornet.so.2.14"
+            "${CMAKE_BINARY_DIR}/shim/libcutensornet.so.2"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensornet.so.2.14"
+            "${CMAKE_BINARY_DIR}/shim/libcutensornet.so"
+    COMMENT "Creating cuTensorNet shim symlinks (build/shim/libcutensornet.so.2)")
+
+  # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
   # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
   # struct layout has silently produced garbage twice, so we never do it.
@@ -1340,8 +1445,16 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                 "dnn_backward:cudnn" "dnn_graph:cudnn")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver"
+                          "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse"
+                          "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "sparse_tridiag_paths:cusparse"
+                          "sparse_vector_paths:cusparse" "sparse_helper_paths:cusparse" "lt_paths:cublasLt"
+                          "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
+                          "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda"
+                          "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda"
+                          "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "sparselt_paths:cusparseLt"
+                          "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
+                          "cutensornet_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
