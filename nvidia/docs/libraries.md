@@ -51,6 +51,38 @@ both libraries. Refused with a message: the Schur complement mode, the nested
 dissection tree, double-double values, and a matrix distributed across
 processes.
 
+## cuSPARSELt: the card's pruning and compressed layout
+
+`nvidia/src/cusparselt_api.cpp` answers the cuSPARSELt 0.10 API on the host.
+Everything an application can observe was measured against NVIDIA's library on
+an RTX 3060, and `nvidia/tests/e2e/sparselt_paths.cpp` passes against both:
+
+- the descriptor checks (which refusals are `INVALID_VALUE` and which
+  `NOT_SUPPORTED`), attribute defaults and sizes, and the combinations sm_86
+  accepts -- fp16, bf16 and tf32 with fp32 compute, int8 with int32 compute
+  into int8, int32, fp16 or bf16 when both operands run along K;
+- the pruning, value for value: STRIP keeps the two larger magnitudes of each
+  group of four (the lower position on a tie); TILE keeps the pattern of
+  largest L1 norm in each 4x4 tile, ties broken in an order measured on the
+  card (fp32 uses 1:2 groups and 2x2 tiles);
+- the compressed matrix: its size and buffer size (formulas fitted to every
+  shape of a grid up to 320 x 320), the kept values (fp32 ones carrying the
+  tf32 rounding half-unit, as the card stores them) and the 2-bit metadata in
+  the card's layout;
+- Matmul's rounding: operands rounded to tf32 to nearest (ties away), fp32
+  accumulation, round-to-nearest-even into every output type, saturation into
+  integers, ReLU's signed zero, GELU (the tanh form), the bias type (D's type,
+  float for int8 inputs), alpha and beta vectors, batches and broadcasts.
+
+Where it differs: NVIDIA's metadata layout for 8- and 16-bit values changes at
+larger shapes (seen at 256 x 64) and this one keeps the smaller shapes' layout,
+so compressed bytes of large matrices differ while products do not; pruning a
+group or tile that holds NaN or an infinity is not the card's; 587 pairs of
+TILE patterns never tie on their own on the card, so their order here is
+unmeasured; `MatmulSearch` runs the product once and keeps the plan's
+configuration; NVIDIA's `CompressedSize2` counts one batch until a plan has
+used the descriptor, this one always counts them all; the workspace a plan
+asks for is the card's for the default split-K and is never used.
 ## cuTENSOR and cuTensorNet: tensor contractions, and networks of them
 
 NVIDIA's libcutensor and libcutensornet each carry a static CUDA runtime that
@@ -96,12 +128,13 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans, LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
-| cuSPARSE | `libcusparse.so.12` | CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16), SpGEMM, SDDMM, SpSV/SpSM, format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); legacy coo2csr, sorts, csrgeam2, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, general blocks too), csric02 and csrilu02. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
+| cuSPARSE | `libcusparse.so.12` | every entry point NVIDIA's 13.0 exports. CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16/int8), SpGEMM (and SpGEMMreuse), SDDMM, SpSV/SpSM (with updateMatrix), format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); Blocked-ELL SpMM and sliced-ELL SpMV; sparse vectors (SpVV, Axpby, Gather, Scatter, Rot); the tridiagonal and pentadiagonal solvers (gtsv2, gtsv2_nopivot, gtsv2StridedBatch, gtsvInterleavedBatch, gpsvInterleavedBatch); legacy coo2csr, the CSR/CSC/COO sorts, csrgeam2, gemvi, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, gebsr2gebsr, gebsr2gebsc), csric02 and csrilu02, pruning, csrcolor, nnz and compression, unsorted CSR. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the 64-bit X API, `Xgeev` on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings, `csrperm`, `csrzfd`, batched QR |
 | cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix spread over several devices in NVIDIA's column-block-cyclic layout |
 | NCCL | `libnccl.so.2` | collectives and point-to-point across ranks |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32 and int8 (into int8, int32, fp16, bf16) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition) and gate splitting on cuSOLVER. Built on the simulator's cuTENSOR and cuSOLVER |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
@@ -269,6 +302,9 @@ runs them; each is a ctest of its own.
 | `e2e_sparse_paths` | coo2csr and the sorts, batched and half SpMM, SpGEMM, csrgeam2, SDDMM, SpSV/SpSM | `torch.sparse` |
 | `e2e_sparse_complex_paths` | SpMV, SpMM, SDDMM, SpSV/SpSM, SpGEMM, conversions and csrgeam2 on complex values, every op; the type combinations and conjugate transposes NVIDIA's refuses | complex `torch.sparse` |
 | `e2e_sparse_bsr_paths` | generic BSR (SpMV, SpMM, SDDMM) and the legacy BSR family: bsrmv/bsrxmv/bsrmm, bsrsv2/bsrsm2 with their zero pivots, bsric02/bsrilu02 (and csric02/csrilu02) with ILU's boost, CSR to BSR and back | preconditioned iterative solvers |
+| `e2e_sparse_tridiag_paths` | gtsv2 (pivoting), gtsv2_nopivot and gtsv2StridedBatch (PCR, and CR past 2048 and 512 unknowns: which unknowns a zero pivot spoils), the interleaved Thomas, LU and QR and the pentadiagonal QR with what each leaves in its inputs, in S, D, C and Z | ADI and spline solvers, PyTorch's `torch.linalg` tridiagonal paths |
+| `e2e_sparse_vector_paths` | sparse vectors (SpVV in every compute type, Axpby, Gather, Scatter, Rot), gemvi, Blocked-ELL SpMM and DenseToSparse, sliced-ELL SpMV, and what NVIDIA's refuses for each | sparse optimizers, block-sparse attention |
+| `e2e_sparse_helper_paths` | pruning (by threshold and percentage), nnz and compression, unsorted CSR, gebsr2gebsr/gebsr2gebsc, csrcolor, SpGEMMreuse, SpGEMM's product count and memory estimate, SpMMOp's refusal, SpSV/SpSM updateMatrix, the logger, the CSC sort | model pruning, multigrid setup |
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, LSTMs in half, bfloat16 and double, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
@@ -482,11 +518,23 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   GPUs in order), and the 1‑D factor choice past 2^27 points keeps the last
   measured one.
 - **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
-  CUDA 12); the tridiagonal and pentadiagonal solvers (`gtsv2`, `gpsv`), the
-  pruning, coloring and `nnz`/`nnz_compress` helpers, `gebsr2gebsr` and
-  `gebsr2gebsc`; sliced-ELL and blocked-ELL storage; SDDMM with a conjugate
-  transpose (NVIDIA's documents none and computes something else when given
-  one). cuSPARSELt is a library of its own and is not provided.
+  CUDA 12); SDDMM with a conjugate transpose (NVIDIA's documents none and
+  computes something else when given one); `cusparseSpMMOp`, whose operators
+  are LTO-IR (NVVM bitcode) that VirtualGPU cannot compile -- `_createPlan`
+  answers as NVIDIA's does when nvJitLink refuses them (INTERNAL_ERROR).
+  `csrcolor` gives a proper coloring, but not NVIDIA's colors (its algorithm is
+  undocumented and randomized). Where NVIDIA's 13.0 does something no caller
+  can mean, this does what the documentation says instead: `csr2csr_compress`
+  keeps |a| > tol as `nnz_compress` counts (NVIDIA's drops negative real
+  entries and leaves their slots unwritten), a negative pruning threshold keeps
+  every entry (NVIDIA's returns column indices past n), `gpsvInterleavedBatch`
+  with an algo other than 0 is NOT_SUPPORTED (NVIDIA's does nothing and
+  reports success). The solvers agree with NVIDIA's to rounding, not bit for
+  bit: they compute in double.
+- **cuSPARSELt**: FP8 and FP4 inputs (sm_89 and later on NVIDIA's library;
+  their scale modes are accepted and ignored), fp16 compute (no sm_86 kernel on NVIDIA's library
+  either), and GELU outside int8 output (refused there too); see the section
+  above for where the compressed layout and the search differ.
 - **cuSOLVER**: the refactorization module (`cusolverRf`), cusolverSp's
   low-level preview API and its `csrlsvlu` on the device (NVIDIA ships only
   the host one), the randomized variants (`Xgesvdr`), left eigenvectors from
@@ -536,6 +584,15 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   morphology, mirroring, resizing, and the signal-processing equivalents. The
   rest of NPP's several thousand entry points are absent rather than
   approximated, so a program that needs more fails at link time with a name.
+- **Device runtime** (cudadevrt, dynamic parallelism), on both engines:
+  device-side launches, the last error, `cudaGetDevice`/`cudaGetDeviceCount`,
+  and device streams and events are implemented. The rest of what a kernel
+  can call -- `cudaMemcpyAsync`/`cudaMemsetAsync` and `cudaMalloc` from a
+  kernel, `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, the occupancy
+  queries, the older `cudaGetParameterBuffer`/`cudaLaunchDevice` pair -- is
+  not provided: a kernel that needs the driver for one fails with the name of
+  the entry point it reached (on SASS, one of the library's
+  `__cuda_syscall_*` calls).
 - **nvJPEG**: baseline sequential DCT only. Progressive JPEG, 12-bit samples,
   arithmetic coding and lossless mode are rejected by name; so are the batched
   and device-side decode APIs and the transcoding entry points.

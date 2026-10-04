@@ -28,6 +28,12 @@ on:
       amd_gpu:
         description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
         default: ''
+      only:
+        description: "NVIDIA suites: a regex of program names to run (suites.sh's SUITE_ONLY); empty: all listed"
+        default: ''
+      engines:
+        description: "NVIDIA suites: the engines to run each program on (space separated): sass (the default engine), ptx (VGPU_SASS=0)"
+        default: sass
 
 permissions:
   contents: read
@@ -153,13 +159,34 @@ jobs:
         env:
           SUITE: ${{ matrix.suite }}
           SUITE_GPU: ${{ matrix.gpu }}
+          SUITE_ONLY: ${{ inputs.only }}
+          ENGINES: ${{ inputs.engines || 'sass' }}
         run: |
+          # Each engine asked for, into its own report: report/ for the
+          # default (SASS), report/ptx/ for the PTX interpreter (VGPU_SASS=0).
           set -o pipefail
-          ci/external/suites.sh run "$SUITE" suite build/shim report | tee run.log
+          rc=0
+          for engine in $ENGINES; do
+            case $engine in
+              sass) echo "== the default engine (SASS)"; dir=report ;;
+              ptx)  echo "== the PTX interpreter (VGPU_SASS=0)"; dir=report/ptx ;;
+              *) echo "::error::unknown engine $engine"; exit 1 ;;
+            esac
+            if [[ $engine == ptx ]]; then
+              VGPU_SASS=0 ci/external/suites.sh run "$SUITE" suite build/shim "$dir" | tee -a run.log || rc=1
+            else
+              ci/external/suites.sh run "$SUITE" suite build/shim "$dir" | tee -a run.log || rc=1
+            fi
+          done
+          exit $rc
 
       - name: Results
         if: always() && steps.want.outputs.yes
-        run: cat report/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          cat report/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f report/ptx/summary.md ]]; then
+            { echo; echo "On the PTX interpreter (VGPU_SASS=0):"; echo; cat report/ptx/summary.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always() && steps.want.outputs.yes

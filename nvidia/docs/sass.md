@@ -92,6 +92,21 @@ PTX engine), and the texture forms with a LOD clamp, a LOD bias, offsets or a
 depth compare. A `WARPSYNC.COLLECTIVE` reached from different code paths of
 one warp is refused when it happens.
 
+Dynamic parallelism runs on SASS as on PTX. A program using it links CUDA's
+device runtime library into its cubin; the loader resolves the relocations
+that brings (`R_CUDA_G64`, function descriptors: a kernel's descriptor is its
+code address), and the device runtime's public entry points
+(`cuda_device_runtime_api.h`: `cudaGetParameterBufferV2`, `cudaLaunchDeviceV2`,
+the device-side last error, `cudaGetDevice`, device streams and events) run as
+builtins in place of the library's code, whose own calls into the driver
+(`__cuda_syscall_*`) are left to fail, by name, if anything reaches them. Child
+grids run after their parent, in launch order, as the PTX engine runs them.
+
+Kernel parameters past 4 KiB (CUDA 12.1 and later, up to 32764 bytes) come
+with `KPARAM_INFO_V2` records and sit further into bank 0, past 0x8000, which
+the 16-bit bank offsets hold as negative numbers: a bank address wraps in the
+bank's 64 KiB.
+
 The tensor map (`cuTensorMapEncodeTiled`) keeps its tile-mode fields where
 NVIDIA's descriptor has them -- found with ptxas, one `tensormap.replace` field
 at a time -- because SASS rewrites a map in place with plain stores.
@@ -110,6 +125,8 @@ at a time -- because SASS rewrites a map in place with plain stores.
   sm_120, plus Hopper's (wgmma, TMA, tensor maps, stmatrix) for sm_90a and
   Blackwell's tensor core for sm_100a, each run by default -- checked to be
   running its SASS -- and on its PTX; the two must agree.
-  `nvidia/tests/e2e/sass_archs.cu` keeps the forms that once ran wrong.
+  `nvidia/tests/e2e/sass_archs.cu` keeps the forms that once ran wrong. The
+  dynamic-parallelism programs among them (`dynamic_parallelism`,
+  `cdp_device_api`, `rdc_device_api`) are built `-rdc=true` with cudadevrt.
 - Every other CUDA end-to-end test runs on SASS wherever its binary carries
   it, which is the default now.
