@@ -510,6 +510,13 @@ if(CUDA_ABI_INCLUDE)
   target_link_libraries(vgpucusolver PRIVATE vgpucusparse)
   # cusolverMg gathers a distributed matrix and runs cusolverDn on it.
   target_link_libraries(vgpucusolvermg PRIVATE vgpucusolver)
+  # cuFFT's LTO callbacks: the callback image's PTX is read (fatbin.cpp) and
+  # linked with the kernels that call it (ptx_link.cpp). Hidden, so these
+  # copies stay this library's own rather than meeting libcudart's.
+  target_sources(vgpucufft PRIVATE nvidia/src/fatbin.cpp nvidia/src/ptx_link.cpp)
+  target_include_directories(vgpucufft PRIVATE include nvidia/src)
+  target_link_libraries(vgpucufft PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(vgpucufft PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
   # ---------------------------------------------------------------------------
   # NPP. NVIDIA splits it across eleven shared objects that share one API
@@ -1549,19 +1556,19 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver"
-                          "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse"
-                          "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt"
-                          "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
-                          "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda"
-                          "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda"
-                          "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "cufile_paths:cufile"
-                          "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvshmem_host:nvshmem_host"
-                          "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
+  foreach(_check IN ITEMS "fft_layouts:cufft" "fft_callbacks:cufft" "solver_paths:cusolver:cublas"
+                          "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse"
+                          "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas"
+                          "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas"
+                          "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp"
+                          "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
                           "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
-                          "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt"
-                          "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
+                          "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
+                          "dnn_graph:cudnn" "dnn_attention:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
@@ -1577,8 +1584,9 @@ if(TARGET vgpucublas)
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer
   # access and peer copies have a peer, and a managed variable two devices;
-  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both.
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver")
+  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, and
+  # cuFFT's multi-GPU descriptors (fft_multigpu.cu).
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "fft_multigpu:cufft")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -2271,7 +2279,7 @@ if(TARGET vgpucudart)
   # cuRAND, cuSOLVER, cuSPARSE -- each SDPA backend, autocast, and the
   # jiterator's NVRTC kernels.
   add_test(NAME e2e_pytorch_ops_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
-           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 69 nvidia/rtx5090)
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 71 nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -2286,6 +2294,16 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The rest of cuDNN's classic API -- vectorized INT8x4/INT8x32 layouts and
+  # convolution, INT8 pooling and activation, divisive normalization, tensor
+  # transform descriptors, LSTM projections and the RNN getters -- against
+  # host references; it also passes against NVIDIA's library on an RTX 3060.
+  add_test(NAME e2e_dnn_classic_paths
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh dnn_classic_paths cudnn)
+  set_tests_properties(e2e_dnn_classic_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   # The runtime and driver APIs sharing one simulated machine.
   add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
   set_tests_properties(e2e_mixed_apis PROPERTIES
