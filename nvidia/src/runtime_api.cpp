@@ -45,10 +45,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "enum_value.hpp"
 #include "error_names.hpp"
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
 // both sides must agree on its layout. The original failure was a stale
@@ -1148,6 +1150,13 @@ cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled);
 // across instantiations, as on an RTX 3060.
 vgpu::exec::GraphConditionals g_graph_conditionals;
 
+const vgpu::exec::devrt::Services& runtime_devrt_services();   // below, with the limits it reads
+// cudaMalloc and cudaFree in a kernel draw on the device heap, as malloc and free do.
+static bool device_heap_call(const std::string& callee) {
+  const vgpu::exec::devrt::Fn f = vgpu::exec::devrt::lookup(callee);
+  return f == vgpu::exec::devrt::Fn::Malloc || f == vgpu::exec::devrt::Fn::Free;
+}
+
 // Device-side graph launch (CUDA programming guide, "Device Graph Launch"). A
 // graph runs in an execution environment, which holds its fire-and-forget
 // children and the graphs it queued for tail launch; a host launch's
@@ -1251,6 +1260,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     cfg.shared_bytes = static_cast<uint32_t>(sharedMem);
     cfg.cooperative = cooperative;
     cfg.cluster = cluster;
+    cfg.devrt = &runtime_devrt_services();
     {
       // The heap and printf limits stop being settable once a kernel that uses
       // them has launched on this device, which is decided by what the kernel's
@@ -1261,13 +1271,13 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
         State::KernelCalls found;
         if (fn->sass)   // SASS: what its call graph reaches
           for (const std::string& f : vgpu::sass::reachable(*fn->sass, fn->name)) {
-            if (f == "malloc" || f == "free") found.heap = true;
+            if (f == "malloc" || f == "free" || device_heap_call(f)) found.heap = true;
             if (f == "vprintf") found.printf = true;
             if (f == "cudaGraphLaunch") found.graph_launch = true;
           }
         for (const auto& ins : fn->body)
           if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
-            if (c->callee == "malloc" || c->callee == "free") found.heap = true;
+            if (c->callee == "malloc" || c->callee == "free" || device_heap_call(c->callee)) found.heap = true;
             if (c->callee == "vprintf") found.printf = true;
           }
         // PTX: the device functions it calls too.
@@ -1579,8 +1589,10 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int dev
   return cudaGetDeviceProperties(prop, device);
 }
 
-VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, int device) {
-  return guard_query("cudaDeviceGetAttribute", [&](State& s) {
+// A device attribute, by its number: the host's cudaDeviceGetAttribute and a kernel's (the device runtime
+// answers through the same table, vgpu/exec/devrt.hpp) both ask here.
+static cudaError_t device_attribute(State& s, int* value, int attr, int device) {
+  {
     if (!value) return cudaErrorInvalidValue;
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     const vgpu::DeviceProfile& p = s.rt->device(device).profile();
@@ -1663,8 +1675,15 @@ VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, 
         return cudaErrorInvalidValue;
     }
     return cudaSuccess;
-  });
+  }
 }
+
+VGPU_EXPORT cudaError_t cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, int device) {
+  // The number, not the enum: a caller may pass a value its header does not name.
+  const int id = enum_value(attr);
+  return guard_query("cudaDeviceGetAttribute", [&](State& s) { return device_attribute(s, value, id, device); });
+}
+
 
 // cudaFuncGetAttributes: report the kernel's actual register footprint and
 // local frame, which is what occupancy tools and tuning scripts read.
@@ -2503,27 +2522,32 @@ VGPU_EXPORT cudaError_t cudaDeviceSetLimit(cudaLimit limit, size_t value) {
   });
 }
 
+// A device limit, by its number: the host's cudaDeviceGetLimit and a kernel's
+// (the device runtime reads the same limits, vgpu/exec/devrt.hpp).
+static cudaError_t device_limit(State& s, size_t* value, int device, int id) {
+  if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+  const State::DeviceLimits& lim = s.limits[device];
+  switch (id) {
+    case cudaLimitStackSize: *value = lim.stack; return cudaSuccess;
+    case cudaLimitPrintfFifoSize: *value = lim.printf_fifo; return cudaSuccess;
+    case cudaLimitMallocHeapSize: *value = lim.malloc_heap; return cudaSuccess;
+    case cudaLimitDevRuntimeSyncDepth: {
+      const vgpu::DeviceProfile& p = s.rt->device(device).profile();
+      if (p.cc_major >= 9) return cudaErrorUnsupportedLimit;
+      *value = lim.sync_depth;
+      return cudaSuccess;
+    }
+    case cudaLimitDevRuntimePendingLaunchCount: *value = lim.pending_launches; return cudaSuccess;
+    case cudaLimitMaxL2FetchGranularity: *value = lim.l2_fetch_granularity; return cudaSuccess;
+    case cudaLimitPersistingL2CacheSize: *value = lim.persisting_l2; return cudaSuccess;
+    default: return cudaErrorUnsupportedLimit;
+  }
+}
+
 VGPU_EXPORT cudaError_t cudaDeviceGetLimit(size_t* value, cudaLimit limit) {
   if (!value) return cudaErrorInvalidValue;
   const int id = limit_id(limit);
-  return guard("cudaDeviceGetLimit", [&](State& s) -> cudaError_t {
-    const State::DeviceLimits& lim = s.limits[t_current_device];
-    switch (id) {
-      case cudaLimitStackSize: *value = lim.stack; return cudaSuccess;
-      case cudaLimitPrintfFifoSize: *value = lim.printf_fifo; return cudaSuccess;
-      case cudaLimitMallocHeapSize: *value = lim.malloc_heap; return cudaSuccess;
-      case cudaLimitDevRuntimeSyncDepth: {
-        const vgpu::DeviceProfile& p = s.rt->device(t_current_device).profile();
-        if (p.cc_major >= 9) return cudaErrorUnsupportedLimit;
-        *value = lim.sync_depth;
-        return cudaSuccess;
-      }
-      case cudaLimitDevRuntimePendingLaunchCount: *value = lim.pending_launches; return cudaSuccess;
-      case cudaLimitMaxL2FetchGranularity: *value = lim.l2_fetch_granularity; return cudaSuccess;
-      case cudaLimitPersistingL2CacheSize: *value = lim.persisting_l2; return cudaSuccess;
-      default: return cudaErrorUnsupportedLimit;
-    }
-  });
+  return guard("cudaDeviceGetLimit", [&](State& s) -> cudaError_t { return device_limit(s, value, t_current_device, id); });
 }
 
 // Streams are executed inline, so every priority is equally honoured. CUDA
@@ -3048,6 +3072,50 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
   auto it = g_cache_config.find(t_current_device);
   *config = it == g_cache_config.end() ? cudaFuncCachePreferNone : it->second;
   return cudaSuccess;
+}
+
+// What a kernel's calls into the device runtime (cudaDeviceGetAttribute,
+// cudaDeviceGetLimit, error strings...) ask of this library: the answers the
+// host's own calls give, so a kernel sees what its host sees.
+namespace {
+struct RuntimeDevRt final : vgpu::exec::devrt::Services {
+  int attribute(int device, int attr, int* value) const override {
+    State& s = st();
+    std::lock_guard<std::recursive_mutex> lock(s.mu);
+    return device_attribute(s, value, attr, device);
+  }
+  int limit(int device, int id, uint64_t* value) const override {
+    State& s = st();
+    std::lock_guard<std::recursive_mutex> lock(s.mu);
+    size_t v = 0;
+    const cudaError_t e = device_limit(s, &v, device, id);
+    if (e == cudaSuccess) *value = v;
+    return e;
+  }
+  int cache_config(int device, int* value) const override {
+    std::lock_guard<std::mutex> lock(g_cache_config_mu);
+    const auto it = g_cache_config.find(device);
+    *value = static_cast<int>(it == g_cache_config.end() ? cudaFuncCachePreferNone : it->second);
+    return cudaSuccess;
+  }
+  int shared_mem_config(int, int* value) const override {
+    *value = 1;   // cudaSharedMemBankSizeFourByte
+    return cudaSuccess;
+  }
+  const char* error_name(int code) const override {
+    const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(code);
+    return e && e->runtime_name ? e->runtime_name : "unrecognized error code";
+  }
+  const char* error_string(int code) const override {
+    const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(code);
+    return e && e->runtime_name ? e->text : "unrecognized error code";
+  }
+};
+}  // namespace
+
+const vgpu::exec::devrt::Services& runtime_devrt_services() {
+  static const RuntimeDevRt services;
+  return services;
 }
 
 VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {
@@ -5204,8 +5272,9 @@ bool kernel_launches_kernels(const void* func) {
   const vgpu::ptx::EntryFn* fn = current(s).get_function(mid, it->second.entry_name);
   if (!fn) return false;
   const auto launches = [](const std::string& callee) {
-    return callee == "cudaLaunchDeviceV2" || callee == "__cudaCDP2LaunchDeviceV2" ||
-           callee == "cudaGetParameterBufferV2" || callee == "__cudaCDP2GetParameterBufferV2";
+    const vgpu::exec::devrt::Fn f = vgpu::exec::devrt::lookup(callee);
+    return f == vgpu::exec::devrt::Fn::LaunchDeviceV2 || f == vgpu::exec::devrt::Fn::GetParameterBufferV2 ||
+           f == vgpu::exec::devrt::Fn::LaunchDevice || f == vgpu::exec::devrt::Fn::GetParameterBuffer;
   };
   if (fn->sass)
     for (const std::string& f : vgpu::sass::reachable(*fn->sass, fn->name))

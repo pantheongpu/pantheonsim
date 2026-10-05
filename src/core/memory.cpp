@@ -227,6 +227,16 @@ uint64_t MemoryManager::heap_used() const {
   return heap_->used;
 }
 
+uint64_t MemoryManager::intern_string(const std::string& text) {
+  std::lock_guard<std::mutex> guard(heap_->mu);
+  const auto it = heap_->strings.find(text);
+  if (it != heap_->strings.end()) return it->second;
+  const uint64_t va = alloc(text.size() + 1);
+  write(va, text.c_str(), text.size() + 1);
+  heap_->strings[text] = va;
+  return va;
+}
+
 bool MemoryManager::heap_contains(uint64_t addr) const {
   std::lock_guard<std::mutex> guard(heap_->mu);
   auto it = heap_->blocks.upper_bound(addr);
@@ -528,6 +538,7 @@ void MemoryManager::free_all() {
   std::lock_guard<std::mutex> heap_guard(heap_->mu);
   heap_->used = 0;
   heap_->blocks.clear();
+  heap_->strings.clear();   // the allocations go in the sweep below
   ExclusiveGuard table_guard(table_lock_.get());
   // A reset takes mapped memory, reservations and handles with it, as it takes
   // allocations: nothing survives it on a real device either.

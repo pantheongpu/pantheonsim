@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "vgpu/error.hpp"
+#include "vgpu/exec/devrt.hpp"
 #include "vgpu/sass/exec.hpp"
 
 namespace vgpu::sass {
@@ -78,6 +79,20 @@ const char* const kBuiltins[] = {
     // device runtime library's own last-error code is built on (its
     // GetLastError reads the per-thread error, SetLastError writes it).
     "cudaGraphLaunch", "__cuda_syscall_cnpv2GetLastError", "__cuda_syscall_cnpv2SetLastError"};
+
+// kBuiltins, then the rest of the device runtime's entry points (devrt.hpp)
+// under both the CDP2 and the CDP1 names, in that order: a builtin's address
+// is its place in the list, so a name already above keeps it and the new ones
+// follow.
+const std::vector<std::string>& builtin_names() {
+  static const std::vector<std::string> v = [] {
+    std::vector<std::string> out(std::begin(kBuiltins), std::end(kBuiltins));
+    for (const std::string& n : exec::devrt::names())
+      if (std::find(out.begin(), out.end(), n) == out.end()) out.push_back(n);
+    return out;
+  }();
+  return v;
+}
 
 bool is_bank(const std::string& name, unsigned* bank) {
   // ".nv.constant<N>" or ".nv.constant<N>.<kernel>"
@@ -175,8 +190,9 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       m->symbol_size[sym.name] = sym.size;
       if (sym.managed) m->managed.push_back(sym.name);
     }
-    size_t nb = sizeof kBuiltins / sizeof *kBuiltins;
-    for (size_t i = 0; i < nb; ++i) m->builtins[kBuiltinBase + 16 * i] = kBuiltins[i];
+    const std::vector<std::string>& names = builtin_names();
+    size_t nb = names.size();
+    for (size_t i = 0; i < nb; ++i) m->builtins[kBuiltinBase + 16 * i] = names[i];
     // A function the cubin calls but does not define, and that is not one
     // of the above: the device runtime library's driver entry points, which
     // only the library's own code calls (and the builtins run in its place).
@@ -189,8 +205,7 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       if (!known) m->builtins[kBuiltinBase + 16 * nb++] = sym.name;
     }
     for (const CubinSymbol& sym : c.symbols)
-      if (sym.name == "__cudaCDP2GetParameterBufferV2" || sym.name == "cudaGetParameterBufferV2")
-        m->device_launches = true;
+      if (exec::devrt::lookup(sym.name) != exec::devrt::Fn::None) m->device_launches = true;
 
     // A relocation's symbol: a variable, a function VirtualGPU provides, a
     // function's code, or a section. *in_code is set for code, whose offset
@@ -328,7 +343,8 @@ std::string unsupported(const uint8_t* image, size_t size) {
       // only the library's own code calls them, and the builtins run in its
       // place, so the loader gives them stub addresses (load) and the module
       // stays on SASS.
-      bool resolved = std::find(std::begin(kBuiltins), std::end(kBuiltins), r.symbol) != std::end(kBuiltins) ||
+      const std::vector<std::string>& names = builtin_names();
+      bool resolved = std::find(names.begin(), names.end(), r.symbol) != names.end() ||
                       r.symbol.rfind("__cuda_syscall_", 0) == 0;
       for (const CubinSymbol& sym : c.symbols) resolved = resolved || (sym.name == r.symbol && !sym.section.empty());
       if (!resolved) return "a call to " + r.symbol + ", which VirtualGPU's SASS path does not provide";

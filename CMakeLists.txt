@@ -159,6 +159,7 @@ add_library(vgpu STATIC
   src/ptx/contract.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/exec/devrt.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
 )

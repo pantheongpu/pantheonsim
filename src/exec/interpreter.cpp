@@ -54,6 +54,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
 #include "vgpu/host_cpus.hpp"
+#include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/launch.hpp"
 
 namespace vgpu::exec {
@@ -222,27 +223,54 @@ struct Warp;
 // gets a parameter buffer for a kernel, fills it, and launches it; the child
 // runs after the parent grid has finished and before the launch as a whole
 // returns -- a schedule CUDA allows for every device-side stream, since it
-// promises no concurrency between a parent and its children, and one it
-// requires of a tail launch. Children run in the order they were launched,
-// parent block by parent block, which makes the order reproducible when
-// blocks run on several host threads.
-struct ChildLaunch {
-  KernelRef kernel;
-  std::array<uint32_t, 3> grid{}, block{};
-  uint32_t shared = 0;
-  uint64_t buffer = 0;     // the parameter buffer, in device memory
-  uint32_t size = 0;
-  uint64_t order = 0;      // parent block, then issue order within it
+// promises no concurrency between a parent and its children -- except a tail
+// launch, which waits for the grid's other children too. Children run in the
+// order they were launched, parent block by parent block, which makes the
+// order reproducible when blocks run on several host threads. The shared
+// half, with what each call does and returns, is vgpu/exec/devrt.hpp.
+using ChildLaunch = devrt::Child<KernelRef>;
+using DeviceLaunches = devrt::Launches<KernelRef>;
+
+LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
+                        MemoryManager& mem, const DeviceProfile& profile, const SymbolTable* symbols,
+                        const ProgressFn& progress, DeviceLaunches* dl);
+
+// A kernel's parameter space: each parameter at its alignment, in order --
+// the layout the parent writes a child's arguments in.
+uint32_t param_space_bytes(const EntryFn& fn);
+
+// Runs one child grid: what devrt::run_children calls for each. `base` is
+// the launch of the grid whose children these are (a child differs from it in
+// its shape); `sink` takes the counters.
+struct ChildRunner {
+  const LaunchConfig& base;
+  MemoryManager& mem;
+  const DeviceProfile& profile;
+  const ProgressFn& progress;
+  LaunchStats* sink;
+  void add_stats(const LaunchStats& s) { if (sink) sink->add(s); }
+  void operator()(ChildLaunch& c, DeviceLaunches& out) {
+    // The parameters back into one argument per parameter, at the offsets the
+    // parent wrote them to.
+    std::vector<std::vector<uint8_t>> args;
+    uint32_t off = 0;
+    for (const auto& p : c.kernel.fn->params) {
+      const uint32_t align = p.align ? p.align : (p.size < 8 ? std::max<uint32_t>(p.size, 1) : 8);
+      off = (off + align - 1) / align * align;
+      if (off + p.size > c.params.size()) c.params.resize(off + p.size, 0);
+      args.emplace_back(c.params.begin() + off, c.params.begin() + off + p.size);
+      off += p.size;
+    }
+    LaunchConfig cc = base;
+    cc.grid = c.grid;
+    cc.block = c.block;
+    cc.shared_bytes = c.shared;
+    cc.cluster = {0, 0, 0};
+    cc.cooperative = false;
+    cc.coop_workspace = 0;
+    add_stats(launch_grid(*c.kernel.fn, cc, args, mem, profile, c.kernel.symbols, progress, &out));
+  }
 };
-struct DeviceLaunches {
-  std::mutex mu;
-  std::unordered_map<uint64_t, ChildLaunch> by_buffer;   // a buffer handed out, not launched yet
-  std::vector<ChildLaunch> queue;                       // launched, to run after the grid
-  std::unordered_map<uint64_t, uint64_t> per_block;     // launches each parent block has issued
-};
-// cudaLimitDevRuntimePendingLaunchCount's default, and CUDA's nesting limit.
-constexpr size_t kMaxPendingLaunches = 2048;
-constexpr uint32_t kMaxLaunchDepth = 24;
 
 // A kernel's parameter space: each parameter at its alignment, in order --
 // the layout the parent writes a child's arguments in.
@@ -6116,15 +6144,12 @@ class Interpreter {
         exec_device_heap(w, ctx, ins, *op, m);
         return;
       }
-      // The device runtime's launch entry points, as the CUDA programming
-      // guide documents them for code generators ("Device-side Launch from
-      // PTX"); CUDA 12's CDP2 compiles to the __cudaCDP2 names.
-      if (op->callee == "__cudaCDP2GetParameterBufferV2" || op->callee == "cudaGetParameterBufferV2") {
-        exec_get_parameter_buffer(w, ctx, ins, *op, m);
-        return;
-      }
-      if (op->callee == "__cudaCDP2LaunchDeviceV2" || op->callee == "cudaLaunchDeviceV2") {
-        exec_launch_device(w, ctx, ins, *op, m);
+      // The device runtime's entry points -- the launch pair as the CUDA
+      // programming guide documents them for code generators ("Device-side
+      // Launch from PTX"), and the rest of cuda_device_runtime_api.h. CUDA 12's
+      // CDP2 compiles to the __cudaCDP2 names, CDP1 to the cuda ones.
+      if (const devrt::Fn dfn = devrt::lookup(op->callee); dfn != devrt::Fn::None) {
+        exec_devrt(dfn, w, ctx, ins, *op, m);
         return;
       }
       // Device-side cudaGetDevice and cudaGetDeviceCount: the device runtime
@@ -10750,85 +10775,566 @@ class Interpreter {
   static constexpr uint64_t kDeviceHandleBase = 0x5654'4750'0000'0000ull;   // "VTGP": never a device address
   static inline std::atomic<uint64_t> device_handles_{1};
 
-  // cudaGetParameterBufferV2(func, gridDim, blockDim, sharedMem): a buffer, in
-  // device memory, laid out as the kernel's parameters are, for the calling
-  // thread to fill. Null once too many launches are pending, as on hardware.
-  void exec_get_parameter_buffer(Warp& w, const BlockCtx&, const Instr& ins, const OpCall& op, Mask m) {
-    if (op.param_slots.size() != 4)
-      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes four arguments");
-    if (!cfg_.kernels || !dl_)
-      ctx_fail(ins, -1, Err::Unsupported,
-               "a device-side launch, with no kernel table to find the child in (the runtime "
-               "supplies one; a bare exec::launch does not)");
-    const Warp::Slot& func = call_slot(w, ins, op, 0);
-    const Warp::Slot& grid = call_slot(w, ins, op, 1);
-    const Warp::Slot& block = call_slot(w, ins, op, 2);
-    const Warp::Slot& shared = call_slot(w, ins, op, 3);
-    Lanes r{};
-    for (uint32_t lane = 0; lane < W_; ++lane) {
-      if (!(m & (Mask{1} << lane))) continue;
-      const uint64_t f = func.read(lane, 0, 8);
-      auto k = cfg_.kernels->find(f);
-      if (k == cfg_.kernels->end())
-        ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue,
-                 "a device-side launch names 0x" + [&] {
-                   char b[24];
-                   std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(f));
-                   return std::string(b);
-                 }() + ", which is not the address of a kernel loaded on this device");
-      ChildLaunch c;
-      c.kernel = k->second;
-      for (int i = 0; i < 3; ++i) {
-        c.grid[i] = static_cast<uint32_t>(grid.read(lane, 4 * i, 4));
-        c.block[i] = static_cast<uint32_t>(block.read(lane, 4 * i, 4));
-      }
-      c.shared = static_cast<uint32_t>(shared.read(lane, 0, 4));
-      c.size = param_space_bytes(*c.kernel.fn);
-      std::lock_guard<std::mutex> guard(dl_->mu);
-      if (dl_->by_buffer.size() + dl_->queue.size() >= kMaxPendingLaunches) continue;   // null
-      c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
-      r[lane] = c.buffer;
-      dl_->by_buffer.emplace(c.buffer, c);
+  // ---- the device runtime (vgpu/exec/devrt.hpp) ----
+  //
+  // Every entry point of cuda_device_runtime_api.h a kernel can call, with the
+  // arguments in call slots (a pointer or size_t in eight bytes, a dim3 in
+  // twelve, a struct passed by value in its own size) and a result in the
+  // return slot. What each does, and what it returns for a bad argument, was
+  // measured on an RTX 3060 (CUDA 13.0 and 12.0): vgpu/exec/devrt.hpp and
+  // nvidia/docs/sass.md have the list. The SASS executor runs the same calls
+  // (Runner::device_runtime_call in src/sass/exec_ops.inc); the two must
+  // agree.
+
+  int64_t devrt_pending_limit() {
+    devrt::Tree& t = *dl_->tree;
+    if (t.limit < 0) {
+      uint64_t v = static_cast<uint64_t>(devrt::kDefaultPendingLaunches);
+      if (cfg_.devrt && cfg_.devrt->limit(cfg_.device_ordinal, devrt::kLimitDevRuntimePendingLaunchCount, &v) != 0)
+        v = static_cast<uint64_t>(devrt::kDefaultPendingLaunches);
+      t.limit = static_cast<int64_t>(std::min<uint64_t>(v, uint64_t{1} << 40));
     }
-    write_call_result(w, op, m, r, 8);
+    return t.limit;
   }
 
-  // cudaLaunchDeviceV2(parameterBuffer, stream): the child is queued to run
-  // after this grid. The stream is not needed to order it: every device-side
-  // stream's launches may run then, and children run in the order issued.
-  void exec_launch_device(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
-    if (op.param_slots.size() != 2)
-      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes two arguments");
-    if (!dl_)
-      ctx_fail(ins, -1, Err::Unsupported, "a device-side launch outside a launch that can run it");
-    const Warp::Slot& buf = call_slot(w, ins, op, 0);
-    constexpr uint64_t kSuccess = 0, kInvalidValue = 1, kInvalidConfiguration = 9;
+  // A parameter buffer `c` describes, handed out and remembered until it is
+  // launched.
+  uint64_t devrt_new_buffer(ChildLaunch c) {
+    c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
+    std::lock_guard<std::mutex> guard(dl_->mu);
+    dl_->mem = &mem_;
+    dl_->by_buffer.emplace(c.buffer, c);
+    return c.buffer;
+  }
+
+  // Takes a handed-out buffer back, as a launch consumes it: its description,
+  // and the parameter bytes in it now. False for an address that is none.
+  bool devrt_take_buffer(uint64_t buffer, ChildLaunch* out) {
+    {
+      std::lock_guard<std::mutex> guard(dl_->mu);
+      const auto it = dl_->by_buffer.find(buffer);
+      if (it == dl_->by_buffer.end()) return false;
+      *out = std::move(it->second);
+      dl_->by_buffer.erase(it);
+    }
+    if (out->size) {
+      out->params.resize(out->size);
+      mem_.read(out->buffer, out->params.data(), out->size);
+    }
+    mem_.free(out->buffer);
+    out->buffer = 0;
+    return true;
+  }
+
+  // Queues a launch or a copy of the block `ctx` is running; returns the
+  // cudaError_t the call gives.
+  int devrt_issue(ChildLaunch c, uint64_t stream, const BlockCtx& ctx, bool memory_op) {
+    const devrt::StreamKind kind = devrt::stream_kind(stream);
+    if (kind == devrt::StreamKind::Invalid) return memory_op ? devrt::kUnknown : devrt::kInvalidValue;
+    if (!memory_op) {
+      const EntryFn& fn = *c.kernel.fn;
+      const uint64_t bound = uint64_t{fn.max_ntid[0]} * std::max(1u, fn.max_ntid[1]) * std::max(1u, fn.max_ntid[2]);
+      if (!devrt::config_ok(c.grid, c.block, uint64_t{fn.static_shared_size} + c.shared, profile_,
+                            fn.max_ntid[0] ? bound : 0, fn.req_ntid))
+        return devrt::kInvalidConfiguration;
+    }
+    c.tail = kind == devrt::StreamKind::Tail;
     const uint64_t block_linear =
         (uint64_t{ctx.ctaid[2]} * ctx.nctaid[1] + ctx.ctaid[1]) * ctx.nctaid[0] + ctx.ctaid[0];
+    ChildRunner runner{cfg_, mem_, profile_, progress_, &dl_->extra};
+    int err = devrt::kSuccess;
+    devrt::enqueue(*dl_, mem_, runner, std::move(c), block_linear, devrt_pending_limit(), &err);
+    return err;
+  }
+
+  // cudaDeviceSynchronize (CDP1): the launches of this block, run to
+  // completion.
+  void devrt_sync(const BlockCtx& ctx) {
+    const uint64_t block_linear =
+        (uint64_t{ctx.ctaid[2]} * ctx.nctaid[1] + ctx.ctaid[1]) * ctx.nctaid[0] + ctx.ctaid[0];
+    ChildRunner runner{cfg_, mem_, profile_, progress_, &dl_->extra};
+    devrt::drain(*dl_, mem_, runner, block_linear);
+  }
+
+  void exec_devrt(devrt::Fn f, Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
+    using devrt::Fn;
+    const auto need = [&](size_t n) {
+      if (op.param_slots.size() != n)
+        ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes " + std::to_string(n) + " arguments");
+    };
+    const bool launches = f == Fn::GetParameterBufferV2 || f == Fn::GetParameterBuffer || f == Fn::LaunchDeviceV2 ||
+                          f == Fn::LaunchDevice || f == Fn::MemcpyAsync || f == Fn::Memcpy2DAsync ||
+                          f == Fn::Memcpy3DAsync || f == Fn::MemsetAsync || f == Fn::Memset2DAsync ||
+                          f == Fn::Memset3DAsync || f == Fn::DeviceSynchronize;
+    if (launches && !dl_)
+      ctx_fail(ins, -1, Err::Unsupported, "a device-side launch outside a launch that can run it");
+    const auto slot = [&](size_t i) -> const Warp::Slot& { return call_slot(w, ins, op, i); };
+    const auto fail = [&](uint32_t lane, Err e, const std::string& why) {
+      ctx_fail(ins, static_cast<int>(lane), e, why);
+    };
+    const auto put = [&](uint32_t lane, uint64_t addr, uint32_t n, uint64_t v) {
+      store_routed(w, ctx, ins, lane, addr, n, v);
+    };
+    const auto get = [&](uint32_t lane, uint64_t addr, uint32_t n) { return load_routed(w, ctx, ins, lane, addr, n); };
+    const auto kernel_at = [&](uint32_t lane, uint64_t addr) -> const KernelRef& {
+      if (!cfg_.kernels)
+        fail(lane, Err::Unsupported,
+             "a device-side call naming a kernel, with no kernel table to find it in (the runtime supplies one; a "
+             "bare exec::launch does not)");
+      const auto k = cfg_.kernels->find(addr);
+      if (k == cfg_.kernels->end()) {
+        char b[24];
+        std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(addr));
+        fail(lane, Err::InvalidValue,
+             std::string("a device-side call names 0x") + b +
+                 ", which is not the address of a kernel loaded on this device");
+      }
+      return k->second;
+    };
+    // A device pointer for a copy or a fill: shared and local addresses are
+    // this thread's and this block's, not memory the device runtime moves.
+    const auto device_addr = [&](uint32_t lane, uint64_t addr) {
+      if (is_shared(addr) || is_local(addr))
+        fail(lane, Err::Unsupported,
+             "a device-side copy or fill of shared or local memory; the device runtime moves global memory");
+      return addr;
+    };
+    const auto copy_kind_ok = [](uint32_t kind) { return kind == 3 || kind == 4; };   // device to device, default
     Lanes r{};
+    uint32_t rbytes = 4;
+    bool is_error = true;   // the result is a cudaError_t, kept as the thread's last when it is one
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
-      const uint64_t b = buf.read(lane, 0, 8);
-      std::lock_guard<std::mutex> guard(dl_->mu);
-      auto it = dl_->by_buffer.find(b);
-      if (it == dl_->by_buffer.end()) {
-        r[lane] = kInvalidValue;   // not a buffer cudaGetParameterBuffer handed out
-        continue;
+      switch (f) {
+        case Fn::GetParameterBufferV2: {
+          need(4);
+          rbytes = 8;
+          is_error = false;
+          ChildLaunch c;
+          c.kernel = kernel_at(lane, slot(0).read(lane, 0, 8));
+          c.has_kernel = true;
+          for (int i = 0; i < 3; ++i) {
+            c.grid[i] = static_cast<uint32_t>(slot(1).read(lane, 4 * i, 4));
+            c.block[i] = static_cast<uint32_t>(slot(2).read(lane, 4 * i, 4));
+          }
+          c.shared = static_cast<uint32_t>(slot(3).read(lane, 0, 4));
+          c.size = param_space_bytes(*c.kernel.fn);
+          r[lane] = devrt_new_buffer(std::move(c));
+          break;
+        }
+        case Fn::GetParameterBuffer: {   // (alignment, size): any size, as the card hands out
+          need(2);
+          rbytes = 8;
+          is_error = false;
+          const uint64_t size = slot(1).read(lane, 0, 8);
+          if (size > (uint64_t{1} << 26)) break;   // null
+          ChildLaunch c;
+          c.size = static_cast<uint32_t>(size);
+          r[lane] = devrt_new_buffer(std::move(c));
+          break;
+        }
+        case Fn::LaunchDeviceV2: {   // (parameterBuffer, stream)
+          need(2);
+          ChildLaunch c;
+          if (!devrt_take_buffer(slot(0).read(lane, 0, 8), &c) || !c.has_kernel) {
+            r[lane] = devrt::kInvalidValue;   // not a buffer cudaGetParameterBufferV2 handed out
+            break;
+          }
+          r[lane] = static_cast<uint64_t>(devrt_issue(std::move(c), slot(1).read(lane, 0, 8), ctx, false));
+          break;
+        }
+        case Fn::LaunchDevice: {   // (func, parameterBuffer, gridDim, blockDim, sharedMem, stream)
+          need(6);
+          ChildLaunch c;
+          c.kernel = kernel_at(lane, slot(0).read(lane, 0, 8));
+          c.has_kernel = true;
+          for (int i = 0; i < 3; ++i) {
+            c.grid[i] = static_cast<uint32_t>(slot(2).read(lane, 4 * i, 4));
+            c.block[i] = static_cast<uint32_t>(slot(3).read(lane, 4 * i, 4));
+          }
+          c.shared = static_cast<uint32_t>(slot(4).read(lane, 0, 4));
+          const uint32_t want = param_space_bytes(*c.kernel.fn);
+          if (const uint64_t b = slot(1).read(lane, 0, 8)) {   // a null buffer is allowed: no parameters
+            ChildLaunch held;
+            if (!devrt_take_buffer(b, &held)) {
+              r[lane] = devrt::kInvalidValue;
+              break;
+            }
+            c.params = std::move(held.params);
+          }
+          c.params.resize(want, 0);
+          r[lane] = static_cast<uint64_t>(devrt_issue(std::move(c), slot(5).read(lane, 0, 8), ctx, false));
+          break;
+        }
+        case Fn::GetLastError:
+        case Fn::PeekAtLastError:
+          r[lane] = w.device_error[lane];
+          if (f == Fn::GetLastError) w.device_error[lane] = 0;
+          is_error = false;
+          break;
+        case Fn::GetDevice:
+        case Fn::GetDeviceCount: {   // (int*)
+          need(1);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          put(lane, p, 4, static_cast<uint32_t>(f == Fn::GetDevice ? cfg_.device_ordinal : cfg_.device_count));
+          break;
+        }
+        case Fn::RuntimeGetVersion: {   // (int*): the device runtime's own, 6000 whatever the toolkit
+          need(1);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          put(lane, p, 4, 6000);
+          break;
+        }
+        case Fn::StreamCreateWithFlags:
+        case Fn::EventCreateWithFlags: {   // (handle*, flags)
+          need(2);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          const uint32_t flags = static_cast<uint32_t>(slot(1).read(lane, 0, 4));
+          const bool stream = f == Fn::StreamCreateWithFlags;
+          if (!p || !(stream ? devrt::stream_flags_ok(flags) : devrt::event_flags_ok(flags))) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          put(lane, p, 8, stream ? devrt::new_stream() : devrt::new_event());
+          break;
+        }
+        case Fn::StreamDestroy:   // (stream): only a created stream, and again is no error
+          need(1);
+          if (devrt::stream_kind(slot(0).read(lane, 0, 8)) != devrt::StreamKind::Named) r[lane] = devrt::kInvalidValue;
+          break;
+        case Fn::EventDestroy:
+          need(1);
+          if (!devrt::valid_event(slot(0).read(lane, 0, 8))) r[lane] = devrt::kInvalidValue;
+          break;
+        case Fn::EventRecord:
+        case Fn::EventRecordWithFlags:   // (event, stream[, flags])
+          need(f == Fn::EventRecord ? 2 : 3);
+          if (!devrt::valid_event(slot(0).read(lane, 0, 8)) ||
+              devrt::stream_kind(slot(1).read(lane, 0, 8)) == devrt::StreamKind::Invalid)
+            r[lane] = devrt::kInvalidValue;
+          break;
+        case Fn::StreamWaitEvent:   // (stream, event, flags)
+          need(3);
+          if (devrt::stream_kind(slot(0).read(lane, 0, 8)) == devrt::StreamKind::Invalid ||
+              !devrt::valid_event(slot(1).read(lane, 0, 8)))
+            r[lane] = devrt::kInvalidValue;
+          break;
+        case Fn::Malloc: {   // (void** p, size): the device heap, as malloc; *p is left alone on failure
+          need(2);
+          const uint64_t p = slot(0).read(lane, 0, 8), size = slot(1).read(lane, 0, 8);
+          if (!p || !size) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          const uint64_t a = mem_.heap_alloc(size, cfg_.device_heap_bytes);
+          if (!a) {
+            r[lane] = devrt::kMemoryAllocation;
+            break;
+          }
+          put(lane, p, 8, a);
+          break;
+        }
+        case Fn::Free: {   // (ptr): a heap block goes back; any other address the card lets be (a
+                           // local, a global variable); an unmapped one faults
+          need(1);
+          const uint64_t a = slot(0).read(lane, 0, 8);
+          if (!a || is_local(a) || is_shared(a) || mem_.heap_free(a)) break;
+          uint64_t base = 0, size = 0;
+          if (!mem_.find_allocation(a, &base, &size))
+            fail(lane, Err::InvalidFree,
+                 "device cudaFree of a pointer that is neither live device memory nor a block of the device heap "
+                 "(freed twice, or never allocated)");
+          break;
+        }
+        case Fn::MemcpyAsync: {   // (dst, src, count, kind, stream): device to device only
+          need(5);
+          const uint64_t dst = slot(0).read(lane, 0, 8), src = slot(1).read(lane, 0, 8), n = slot(2).read(lane, 0, 8);
+          if (!copy_kind_ok(static_cast<uint32_t>(slot(3).read(lane, 0, 4)))) {
+            r[lane] = devrt::kInvalidMemcpyDirection;
+            break;
+          }
+          if (n && (!dst || !src)) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          ChildLaunch c;
+          auto op2 = std::make_shared<devrt::MemOp>();
+          if (n) {
+            op2->dst = device_addr(lane, dst);
+            op2->src = device_addr(lane, src);
+          }
+          op2->width = n;
+          c.op = std::move(op2);
+          r[lane] = static_cast<uint64_t>(devrt_issue(std::move(c), slot(4).read(lane, 0, 8), ctx, true));
+          break;
+        }
+        case Fn::Memcpy2DAsync: {   // (dst, dpitch, src, spitch, width, height, kind, stream)
+          need(8);
+          const uint64_t dst = slot(0).read(lane, 0, 8), dp = slot(1).read(lane, 0, 8), src = slot(2).read(lane, 0, 8),
+                         sp = slot(3).read(lane, 0, 8), wd = slot(4).read(lane, 0, 8), ht = slot(5).read(lane, 0, 8);
+          if (!copy_kind_ok(static_cast<uint32_t>(slot(6).read(lane, 0, 4)))) {
+            r[lane] = devrt::kInvalidMemcpyDirection;
+            break;
+          }
+          if (wd > dp || wd > sp) {
+            r[lane] = devrt::kInvalidPitchValue;
+            break;
+          }
+          if (wd && ht && (!dst || !src)) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          ChildLaunch c;
+          auto op2 = std::make_shared<devrt::MemOp>();
+          if (wd && ht) {
+            op2->dst = device_addr(lane, dst);
+            op2->src = device_addr(lane, src);
+          }
+          op2->dpitch = dp;
+          op2->spitch = sp;
+          op2->width = wd;
+          op2->height = ht;
+          c.op = std::move(op2);
+          r[lane] = static_cast<uint64_t>(devrt_issue(std::move(c), slot(7).read(lane, 0, 8), ctx, true));
+          break;
+        }
+        case Fn::Memcpy3DAsync: {   // (const cudaMemcpy3DParms*, stream)
+          need(2);
+          const uint64_t pa = slot(0).read(lane, 0, 8);
+          if (!pa) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          // cudaMemcpy3DParms: srcArray 0, srcPos 8, srcPtr 32 (ptr, pitch, xsize, ysize), dstArray 64, dstPos 72,
+          // dstPtr 96, extent 128, kind 152.
+          const auto q = [&](uint64_t off) { return get(lane, pa + off, 8); };
+          if (q(0) || q(64)) {   // arrays: not through the device runtime
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          if (!copy_kind_ok(static_cast<uint32_t>(get(lane, pa + 152, 4)))) {
+            r[lane] = devrt::kInvalidMemcpyDirection;
+            break;
+          }
+          const uint64_t sx = q(8), sy = q(16), sz = q(24), sptr = q(32), spitch = q(40), sys = q(56);
+          const uint64_t dx = q(72), dy = q(80), dz = q(88), dptr = q(96), dpitch = q(104), dys = q(120);
+          const uint64_t wd = q(128), ht = q(136), dep = q(144);
+          if (wd > spitch || wd > dpitch) {
+            r[lane] = devrt::kInvalidPitchValue;
+            break;
+          }
+          if (wd && ht && dep && (!sptr || !dptr)) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          ChildLaunch c;
+          auto op2 = std::make_shared<devrt::MemOp>();
+          if (wd && ht && dep) {
+            op2->src = device_addr(lane, sptr) + sx + sy * spitch + sz * spitch * sys;
+            op2->dst = device_addr(lane, dptr) + dx + dy * dpitch + dz * dpitch * dys;
+          }
+          op2->spitch = spitch;
+          op2->dpitch = dpitch;
+          op2->sslice = spitch * sys;
+          op2->dslice = dpitch * dys;
+          op2->width = wd;
+          op2->height = ht;
+          op2->depth = dep;
+          c.op = std::move(op2);
+          r[lane] = static_cast<uint64_t>(devrt_issue(std::move(c), slot(1).read(lane, 0, 8), ctx, true));
+          break;
+        }
+        case Fn::MemsetAsync:
+        case Fn::Memset2DAsync:
+        case Fn::Memset3DAsync: {
+          // (ptr, value, count, stream) | (ptr, pitch, value, width, height, stream) |
+          // (cudaPitchedPtr, value, cudaExtent, stream). The card's own fill ignores the value and writes zeros
+          // (RTX 3060, driver 596.36: 0x5a, 0xff, 1 and -1 all gave 0); the documented fill is done here.
+          uint64_t ptr, pitch = 0, wd, ht = 1, dep = 1, ysize = 1, stream;
+          uint32_t value;
+          if (f == Fn::MemsetAsync) {
+            need(4);
+            ptr = slot(0).read(lane, 0, 8);
+            value = static_cast<uint32_t>(slot(1).read(lane, 0, 4));
+            wd = slot(2).read(lane, 0, 8);
+            pitch = wd;
+            stream = slot(3).read(lane, 0, 8);
+          } else if (f == Fn::Memset2DAsync) {
+            need(6);
+            ptr = slot(0).read(lane, 0, 8);
+            pitch = slot(1).read(lane, 0, 8);
+            value = static_cast<uint32_t>(slot(2).read(lane, 0, 4));
+            wd = slot(3).read(lane, 0, 8);
+            ht = slot(4).read(lane, 0, 8);
+            stream = slot(5).read(lane, 0, 8);
+          } else {
+            need(4);
+            ptr = slot(0).read(lane, 0, 8);
+            pitch = slot(0).read(lane, 8, 8);
+            ysize = slot(0).read(lane, 24, 8);
+            value = static_cast<uint32_t>(slot(1).read(lane, 0, 4));
+            wd = slot(2).read(lane, 0, 8);
+            ht = slot(2).read(lane, 8, 8);
+            dep = slot(2).read(lane, 16, 8);
+            stream = slot(3).read(lane, 0, 8);
+          }
+          if (f != Fn::MemsetAsync && wd > pitch) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          if (wd && ht && dep && !ptr) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          ChildLaunch c;
+          auto op2 = std::make_shared<devrt::MemOp>();
+          op2->kind = devrt::MemOp::Kind::Set;
+          if (wd && ht && dep) op2->dst = device_addr(lane, ptr);
+          op2->dpitch = pitch;
+          op2->dslice = pitch * ysize;
+          op2->width = wd;
+          op2->height = ht;
+          op2->depth = dep;
+          op2->value = static_cast<uint8_t>(value);
+          c.op = std::move(op2);
+          r[lane] = static_cast<uint64_t>(devrt_issue(std::move(c), stream, ctx, true));
+          break;
+        }
+        case Fn::FuncGetAttributes: {   // (cudaFuncAttributes*, func): the first seven fields
+          need(2);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          const KernelRef& k = kernel_at(lane, slot(1).read(lane, 0, 8));
+          uint8_t out[40];
+          devrt::put_func_attrs(devrt::func_attributes(*k.fn, profile_, k.arch), out);
+          for (uint32_t off = 0; off < 40; off += 8) {
+            uint64_t v;
+            std::memcpy(&v, out + off, 8);
+            put(lane, p + off, 8, v);
+          }
+          break;
+        }
+        case Fn::DeviceGetAttribute: {   // (int* value, attr, device)
+          need(3);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          const int attr = static_cast<int>(slot(1).read(lane, 0, 4));
+          const int dev = static_cast<int>(slot(2).read(lane, 0, 4));
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          // The device runtime answers attributes 1 to 148 but 131 as the host does, 0 with 0, and nothing else.
+          if (attr == 0) {
+            put(lane, p, 4, 0);
+            break;
+          }
+          if (attr < 0 || attr == 131 || attr >= 149) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          int v = 0;
+          const int e = cfg_.devrt ? cfg_.devrt->attribute(dev, attr, &v) : devrt::kNotSupported;
+          if (e) {
+            r[lane] = static_cast<uint64_t>(e);
+            break;
+          }
+          put(lane, p, 4, static_cast<uint32_t>(v));
+          break;
+        }
+        case Fn::DeviceGetLimit: {   // (size_t*, limit)
+          need(2);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          uint64_t v = 0;
+          const int e = cfg_.devrt ? cfg_.devrt->limit(cfg_.device_ordinal, static_cast<int>(slot(1).read(lane, 0, 4)), &v)
+                                   : devrt::kNotSupported;
+          if (e) {
+            r[lane] = static_cast<uint64_t>(e);
+            break;
+          }
+          put(lane, p, 8, v);
+          break;
+        }
+        case Fn::DeviceGetCacheConfig:
+        case Fn::DeviceGetSharedMemConfig: {   // (enum*)
+          need(1);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          int v = 0;
+          int e = devrt::kNotSupported;
+          if (cfg_.devrt)
+            e = f == Fn::DeviceGetCacheConfig ? cfg_.devrt->cache_config(cfg_.device_ordinal, &v)
+                                              : cfg_.devrt->shared_mem_config(cfg_.device_ordinal, &v);
+          if (e) {
+            r[lane] = static_cast<uint64_t>(e);
+            break;
+          }
+          put(lane, p, 4, static_cast<uint32_t>(v));
+          break;
+        }
+        case Fn::OccupancyMaxActiveBlocks:
+        case Fn::OccupancyMaxActiveBlocksWithFlags: {   // (int* n, func, blockSize, dynamicSmem[, flags])
+          need(f == Fn::OccupancyMaxActiveBlocks ? 4 : 5);
+          const uint64_t p = slot(0).read(lane, 0, 8);
+          const int32_t bs = static_cast<int32_t>(slot(2).read(lane, 0, 4));
+          if (!p) {
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          if (bs <= 0) {   // the card writes 0 and refuses
+            put(lane, p, 4, 0);
+            r[lane] = devrt::kInvalidValue;
+            break;
+          }
+          const KernelRef& k = kernel_at(lane, slot(1).read(lane, 0, 8));
+          const auto res = kernel_resources(*k.fn, profile_, static_cast<uint32_t>(bs),
+                                            static_cast<uint32_t>(slot(3).read(lane, 0, 8)));
+          put(lane, p, 4, res.occupancy.blocks_per_sm);
+          break;
+        }
+        case Fn::GetErrorString:
+        case Fn::GetErrorName: {   // (cudaError_t): a string in device memory
+          need(1);
+          rbytes = 8;
+          is_error = false;
+          const int code = static_cast<int>(slot(0).read(lane, 0, 4));
+          const char* text = cfg_.devrt ? (f == Fn::GetErrorString ? cfg_.devrt->error_string(code)
+                                                                    : cfg_.devrt->error_name(code))
+                                        : "unrecognized error code";
+          r[lane] = mem_.intern_string(text);
+          break;
+        }
+        case Fn::DeviceSynchronize:   // CDP1's: wait for the block's launches. Gone from sm_90 on.
+          need(0);
+          if (profile_.cc_major >= 9)
+            fail(lane, Err::Unsupported,
+                 "cudaDeviceSynchronize from device code, which NVIDIA's driver refuses to load a module for on "
+                 "sm_90 and later (CUDA 12 removed it; build for CDP2 and use tail launches)");
+          devrt_sync(ctx);
+          break;
+        case Fn::None:
+          break;
       }
-      ChildLaunch c = it->second;
-      dl_->by_buffer.erase(it);
-      const uint64_t threads = uint64_t{c.block[0]} * c.block[1] * c.block[2];
-      if (!c.grid[0] || !c.grid[1] || !c.grid[2] || !threads || (profile_.limits.max_threads_per_block && threads > profile_.limits.max_threads_per_block)) {
-        mem_.free(c.buffer);
-        r[lane] = kInvalidConfiguration;
-        continue;
-      }
-      c.order = (block_linear << 24) | (dl_->per_block[block_linear]++ & 0xFFFFFF);
-      dl_->queue.push_back(c);
-      r[lane] = kSuccess;
     }
-    record_device_errors(w, m, r);
-    write_call_result(w, op, m, r, 4);
+    if (is_error) record_device_errors(w, m, r);
+    write_call_result(w, op, m, r, rbytes);
   }
 
   void exec_device_heap(Warp& w, [[maybe_unused]] const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
@@ -12003,8 +12509,7 @@ bool allocates_while_running(const ptx::EntryFn& fn, std::set<const ptx::EntryFn
   for (const ptx::Instr& ins : fn.body) {
     const auto* op = std::get_if<ptx::OpCall>(&ins.op);
     if (!op) continue;
-    if (op->indirect || op->callee == "malloc" || op->callee == "free" ||
-        op->callee == "__cudaCDP2GetParameterBufferV2" || op->callee == "cudaGetParameterBufferV2")
+    if (op->indirect || op->callee == "malloc" || op->callee == "free" || devrt::lookup(op->callee) != devrt::Fn::None)
       return true;
     if (op->target && allocates_while_running(*op->target, seen)) return true;
   }
@@ -12192,60 +12697,6 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   return total;
 }
 
-// Runs the child grids `dl` holds, each to completion -- its own children
-// included, since a grid is complete only when they are -- before the next,
-// in the order they were launched.
-void run_children(DeviceLaunches& dl, const LaunchConfig& parent, MemoryManager& mem,
-                  const DeviceProfile& profile, const ProgressFn& progress, LaunchStats& stats,
-                  uint32_t depth) {
-  // Buffers taken and never launched go back.
-  for (auto& [buf, c] : dl.by_buffer) mem.free(buf);
-  dl.by_buffer.clear();
-  std::vector<ChildLaunch> queue = std::move(dl.queue);
-  dl.queue.clear();
-  std::stable_sort(queue.begin(), queue.end(),
-                   [](const ChildLaunch& a, const ChildLaunch& b) { return a.order < b.order; });
-  // Whatever happens, no parameter buffer outlives the launch.
-  struct Buffers {
-    MemoryManager& mem;
-    std::vector<ChildLaunch>& q;
-    ~Buffers() {
-      for (auto& c : q)
-        if (c.buffer) mem.free(c.buffer);
-    }
-  } guard{mem, queue};
-  for (ChildLaunch& c : queue) {
-    if (depth > kMaxLaunchDepth)
-      throw Error::make(Err::LaunchConfig, "kernel '", c.kernel.fn->name,
-                        "' launched at nesting depth ", depth, "; dynamic parallelism allows ",
-                        kMaxLaunchDepth);
-    std::vector<uint8_t> bytes(c.size);
-    if (c.size) mem.read(c.buffer, bytes.data(), c.size);
-    mem.free(c.buffer);
-    c.buffer = 0;
-    // The buffer back into one argument per parameter, at the offsets the
-    // parent wrote them to.
-    std::vector<std::vector<uint8_t>> args;
-    uint32_t off = 0;
-    for (const auto& p : c.kernel.fn->params) {
-      const uint32_t align = p.align ? p.align : (p.size < 8 ? std::max<uint32_t>(p.size, 1) : 8);
-      off = (off + align - 1) / align * align;
-      args.emplace_back(bytes.begin() + off, bytes.begin() + off + p.size);
-      off += p.size;
-    }
-    LaunchConfig cc = parent;
-    cc.grid = c.grid;
-    cc.block = c.block;
-    cc.shared_bytes = c.shared;
-    cc.cluster = {0, 0, 0};
-    cc.cooperative = false;
-    cc.coop_workspace = 0;
-    DeviceLaunches child;
-    stats.add(launch_grid(*c.kernel.fn, cc, args, mem, profile, c.kernel.symbols, progress, &child));
-    run_children(child, cc, mem, profile, progress, stats, depth + 1);
-  }
-}
-
 }  // namespace
 
 LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
@@ -12254,8 +12705,12 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
                    const ProgressFn& progress) {
   refresh_modes();
   DeviceLaunches dl;
+  dl.mem = &mem;
   LaunchStats stats = launch_grid(fn, cfg, args, mem, profile, symbols, progress, &dl);
-  run_children(dl, cfg, mem, profile, progress, stats, 1);
+  if (!dl.queue.empty() || !dl.by_buffer.empty() || dl.extra.blocks) {
+    ChildRunner runner{cfg, mem, profile, progress, &stats};
+    devrt::complete_children(dl, mem, runner);
+  }
   return stats;
 }
 

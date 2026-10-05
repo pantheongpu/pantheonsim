@@ -141,6 +141,10 @@ class MemoryManager {
   // cuMemGetAddressRange answers NOT_FOUND -- they are the device heap's,
   // not allocations the host made.
   bool heap_contains(uint64_t addr) const;
+  // A NUL-terminated copy of `text` in device memory, made once and kept until
+  // the device resets: what the device runtime's cudaGetErrorString and
+  // cudaGetErrorName point a kernel at.
+  uint64_t intern_string(const std::string& text);
 
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
@@ -577,6 +581,7 @@ class MemoryManager {
     std::mutex mu;
     uint64_t used = 0;
     std::map<uint64_t, uint64_t> blocks;   // base -> bytes asked for
+    std::map<std::string, uint64_t> strings;   // intern_string's
   };
   std::unique_ptr<DeviceHeap> heap_ = std::make_unique<DeviceHeap>();
 };
