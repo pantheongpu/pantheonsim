@@ -506,7 +506,7 @@ if(CUDA_ABI_INCLUDE)
   # cusolverSp is part of libcusolver and reads cuSPARSE's matrix descriptors
   # through cuSPARSE's getters, so like NVIDIA's libcusolver it links
   # libcusparse.
-  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp)
+  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp nvidia/src/cusolver_rf.cpp)
   target_link_libraries(vgpucusolver PRIVATE vgpucusparse)
   # cusolverMg gathers a distributed matrix and runs cusolverDn on it.
   target_link_libraries(vgpucusolvermg PRIVATE vgpucusolver)
@@ -1454,12 +1454,14 @@ if(TARGET vgpucublas)
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
   foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver"
-                          "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse"
-                          "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt"
-                          "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
-                          "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda"
-                          "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda"
-                          "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss" "nvjpeg_paths:nvjpeg"
+                          "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
+                          "solver_sparse_paths:cusolver:cusparse" "solver_sparse_ll_paths:cusolver:cusparse"
+                          "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas"
+                          "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas"
+                          "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+                          "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt"
                           "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
