@@ -80,6 +80,10 @@ struct Plan {
   std::map<int, JitCallback> jit;  // by cufftXtCallbackType
   size_t jit_shared[8] = {};       // cufftXtSetCallbackSharedSize, by type
   struct JitModule* jit_module = nullptr;  // the linked callback kernels, once made
+  // cufftSetPlanPropertyInt64's NVFFT_PLAN_PROPERTY_INT64_PATIENT_JIT: kept
+  // as a flag (see the property calls below); nothing here compiles
+  // patiently, as no kernel is generated for a host transform.
+  long long patient_jit = 0;
 };
 
 std::mutex g_mu;
@@ -311,6 +315,7 @@ cufftResult make_plan(cufftHandle h, int rank, const I* n, const std::type_ident
     p.stream = it->second.stream;
     p.gpus = it->second.gpus;
     p.jit = it->second.jit;
+    p.patient_jit = it->second.patient_jit;
     std::memcpy(p.jit_shared, it->second.jit_shared, sizeof p.jit_shared);
   }
   if (p.gpus.size() > 1) {
@@ -655,6 +660,61 @@ VGPU_EXPORT cufftResult cufftGetProperty(libraryPropertyType type, int* value) {
     case PATCH_LEVEL: *value = CUFFT_VER_PATCH; break;
     default: return CUFFT_INVALID_VALUE;
   }
+  return CUFFT_SUCCESS;
+}
+
+/* ---- plan properties ----
+ * cufftSetPlanPropertyInt64 and its two companions (CUDA 12.x and later). The
+ * declarations below carry the spelling of the library's symbols under other
+ * names because the property enum and these prototypes are absent from older
+ * toolkit headers (CUDA 12.0's cufft.h), and this file builds against those.
+ * The enum is read as an int: a caller may pass a value it does not declare.
+ *
+ * Measured on an RTX 3060 (cuFFT 12.0.0, CUDA 13.0):
+ *  - an unknown property is CUFFT_INVALID_VALUE, whatever the call;
+ *  - a bad handle is CUFFT_INVALID_PLAN, a NULL result pointer INVALID_VALUE;
+ *  - NVFFT_PLAN_PROPERTY_INT64_PATIENT_JIT (1) is a flag: any non-zero value
+ *    reads back as 1, zero as 0; it defaults to 0 and reset puts it back to 0;
+ *    set and reset on a plan already made are CUFFT_NOT_SUPPORTED, while the
+ *    get still answers;
+ *  - NVFFT_PLAN_PROPERTY_INT64_MAX_NUM_HOST_THREADS (2) answers
+ *    CUFFT_NOT_SUPPORTED to set, get and reset alike. */
+namespace {
+constexpr int kPropPatientJit = 1, kPropMaxHostThreads = 2;
+}
+extern "C" {
+cufftResult vgpu_cufftSetPlanPropertyInt64(cufftHandle, int, long long) __asm__("cufftSetPlanPropertyInt64");
+cufftResult vgpu_cufftGetPlanPropertyInt64(cufftHandle, int, long long*) __asm__("cufftGetPlanPropertyInt64");
+cufftResult vgpu_cufftResetPlanProperty(cufftHandle, int) __asm__("cufftResetPlanProperty");
+}
+#define VGPU_EXPORT_FN __attribute__((visibility("default")))
+VGPU_EXPORT_FN cufftResult vgpu_cufftSetPlanPropertyInt64(cufftHandle handle, int property, long long value) {
+  std::lock_guard<std::mutex> l(g_mu);
+  auto it = g_plans.find(handle);
+  if (it == g_plans.end()) return CUFFT_INVALID_PLAN;
+  if (property == kPropMaxHostThreads) return CUFFT_NOT_SUPPORTED;
+  if (property != kPropPatientJit) return CUFFT_INVALID_VALUE;
+  if (!it->second.n.empty()) return CUFFT_NOT_SUPPORTED;   // already made
+  it->second.patient_jit = value != 0;
+  return CUFFT_SUCCESS;
+}
+VGPU_EXPORT_FN cufftResult vgpu_cufftGetPlanPropertyInt64(cufftHandle handle, int property, long long* value) {
+  std::lock_guard<std::mutex> l(g_mu);
+  auto it = g_plans.find(handle);
+  if (it == g_plans.end()) return CUFFT_INVALID_PLAN;
+  if (property == kPropMaxHostThreads) return CUFFT_NOT_SUPPORTED;
+  if (property != kPropPatientJit || !value) return CUFFT_INVALID_VALUE;
+  *value = it->second.patient_jit;
+  return CUFFT_SUCCESS;
+}
+VGPU_EXPORT_FN cufftResult vgpu_cufftResetPlanProperty(cufftHandle handle, int property) {
+  std::lock_guard<std::mutex> l(g_mu);
+  auto it = g_plans.find(handle);
+  if (it == g_plans.end()) return CUFFT_INVALID_PLAN;
+  if (property == kPropMaxHostThreads) return CUFFT_NOT_SUPPORTED;
+  if (property != kPropPatientJit) return CUFFT_INVALID_VALUE;
+  if (!it->second.n.empty()) return CUFFT_NOT_SUPPORTED;
+  it->second.patient_jit = 0;
   return CUFFT_SUCCESS;
 }
 

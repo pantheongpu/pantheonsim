@@ -25,9 +25,13 @@
 //
 // CUBIN for a real architecture comes back as the PTX, which is what
 // VirtualGPU's driver loads (see nvrtcGetCUBIN). Not implemented: LTO-IR and
-// OptiX-IR output (vendor bitcode, which VirtualGPU cannot execute),
-// precompiled headers, and the time-trace files. Those return a clear status.
+// OptiX-IR output (vendor bitcode, which VirtualGPU cannot execute) and the
+// time-trace files. Those return a clear status. Precompiled headers, the
+// flow callback and Tile IR are the toolkit's NVRTC's own where it has them
+// (see "PCH, flow callback and Tile IR" below).
 #include <nvrtc.h>
+
+#include "enum_value.hpp"
 
 #include <cuda.h>  // CUDA_VERSION: the toolkit this shim was built against
 
@@ -39,6 +43,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +59,10 @@ namespace {
 
 bool trace() { const char* t = std::getenv("VGPU_TRACE"); return t && t[0] == '1'; }
 
+// Results newer than the oldest header this builds against (CUDA 12.0's
+// nvrtc.h stops at 11), named by value.
+constexpr int kNoPchCreateAttempted = 13, kCancelled = 16;
+
 struct Program {
   std::string source;
   std::string name = "default_program";
@@ -62,6 +71,14 @@ struct Program {
   std::vector<std::string> lowered;   // parallel to name_expressions, after compile
   std::string ptx;
   std::string log;
+  // After a compile: what the toolkit's NVRTC said of the precompiled header
+  // (13 is NVRTC_ERROR_NO_PCH_CREATE_ATTEMPTED, which is also the answer
+  // before any compile) and the heap it needs.
+  int pch_status = 13;
+  size_t pch_required = 0;
+  // nvrtcSetFlowCallback's callback, called during the compile.
+  int (*flow)(void*, void*) = nullptr;
+  void* flow_payload = nullptr;
   bool compiled = false;
   bool real_arch = false;  // compiled for an sm_ target, so the caller will ask for CUBIN
 };
@@ -147,6 +164,13 @@ struct RealNvrtc {
   nvrtcResult (*log_size)(nvrtcProgram, size_t*) = nullptr;
   nvrtcResult (*log)(nvrtcProgram, char*) = nullptr;
   nvrtcResult (*lowered)(nvrtcProgram, const char*, const char**) = nullptr;
+  // Newer than the oldest toolkit this builds against: absent from an older
+  // library, and every use checks for it.
+  int (*pch_status)(nvrtcProgram) = nullptr;
+  int (*pch_required)(nvrtcProgram, size_t*) = nullptr;
+  int (*pch_get_heap)(size_t*) = nullptr;
+  int (*pch_set_heap)(size_t) = nullptr;
+  int (*set_flow)(nvrtcProgram, int (*)(void*, void*), void*) = nullptr;
   std::string path;
 };
 
@@ -223,6 +247,13 @@ const RealNvrtc* real_nvrtc() {
       sym(r->log_size, "nvrtcGetProgramLogSize");
       sym(r->log, "nvrtcGetProgramLog");
       sym(r->lowered, "nvrtcGetLoweredName");
+      const bool required = ok;
+      sym(r->pch_status, "nvrtcGetPCHCreateStatus");
+      sym(r->pch_required, "nvrtcGetPCHHeapSizeRequired");
+      sym(r->pch_get_heap, "nvrtcGetPCHHeapSize");
+      sym(r->pch_set_heap, "nvrtcSetPCHHeapSize");
+      sym(r->set_flow, "nvrtcSetFlowCallback");
+      ok = required;   // the newer entry points are optional
       if (ok) {
         if (trace()) std::fprintf(stderr, "[vgpu] nvrtc: compiling with %s\n", rp.c_str());
         return r;
@@ -274,7 +305,17 @@ nvrtcResult compile_real(const RealNvrtc& r, Program* p, int num_options, const 
   } destroy{r, prog};
   for (const auto& e : p->name_expressions)
     if ((rc = r.add_name(prog, e.c_str())) != NVRTC_SUCCESS) return rc;
+  // The flow callback goes to the toolkit's compiler, which calls it as it
+  // works. A library without the feature gets the two calls this shim can
+  // make itself: before the compile and after it.
+  if (p->flow && r.set_flow) r.set_flow(prog, p->flow, p->flow_payload);
+  else if (p->flow && p->flow(p->flow_payload, nullptr) != 0) return (nvrtcResult)kCancelled;
   rc = r.compile(prog, (int)argv.size(), argv.data());
+  if (r.pch_status) p->pch_status = r.pch_status(prog);
+  if (r.pch_required) {
+    size_t need = 0;
+    if (r.pch_required(prog, &need) == NVRTC_SUCCESS) p->pch_required = need;
+  }
   size_t n = 0;
   if (r.log_size(prog, &n) == NVRTC_SUCCESS && n > 1) {
     std::string log(n, '\0');
@@ -290,6 +331,7 @@ nvrtcResult compile_real(const RealNvrtc& r, Program* p, int num_options, const 
     if (r.lowered(prog, e.c_str(), &low) != NVRTC_SUCCESS || !low) return NVRTC_ERROR_NAME_EXPRESSION_NOT_VALID;
     p->lowered.push_back(low);
   }
+  if (p->flow && !r.set_flow && p->flow(p->flow_payload, nullptr) != 0) return (nvrtcResult)kCancelled;
   return NVRTC_SUCCESS;
 }
 
@@ -334,7 +376,7 @@ bool translate_option(const std::string& opt, std::vector<std::string>* out, std
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
 VGPU_EXPORT const char* nvrtcGetErrorString(nvrtcResult r) {
-  switch (r) {
+  switch (enum_value(r)) {
     case NVRTC_SUCCESS: return "NVRTC_SUCCESS";
     case NVRTC_ERROR_OUT_OF_MEMORY: return "NVRTC_ERROR_OUT_OF_MEMORY";
     case NVRTC_ERROR_PROGRAM_CREATION_FAILURE: return "NVRTC_ERROR_PROGRAM_CREATION_FAILURE";
@@ -348,6 +390,12 @@ VGPU_EXPORT const char* nvrtcGetErrorString(nvrtcResult r) {
     case NVRTC_ERROR_NO_LOWERED_NAMES_BEFORE_COMPILATION:
       return "NVRTC_ERROR_NO_LOWERED_NAMES_BEFORE_COMPILATION";
     case NVRTC_ERROR_NAME_EXPRESSION_NOT_VALID: return "NVRTC_ERROR_NAME_EXPRESSION_NOT_VALID";
+    case 12: return "NVRTC_ERROR_TIME_FILE_WRITE_FAILED";
+    case kNoPchCreateAttempted: return "NVRTC_ERROR_NO_PCH_CREATE_ATTEMPTED";
+    case 14: return "NVRTC_ERROR_PCH_CREATE_HEAP_EXHAUSTED";
+    case 15: return "NVRTC_ERROR_PCH_CREATE";
+    case kCancelled: return "NVRTC_ERROR_CANCELLED";
+    case 17: return "NVRTC_ERROR_TIME_TRACE_FILE_WRITE_FAILED";
     default: return "NVRTC_ERROR_INTERNAL_ERROR";
   }
 }
@@ -450,8 +498,14 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
       p->real_arch = true;
   }
 
+  p->pch_status = kNoPchCreateAttempted;
+  p->pch_required = 0;
   if (const RealNvrtc* r = real_nvrtc()) return compile_real(*r, p, num_options, options);
 
+  // Without the toolkit's NVRTC the compile is nvcc's, which has no hooks to
+  // call the flow callback from: it is called before nvcc starts and after it
+  // finishes, and a 1 from either cancels the compile.
+  if (p->flow && p->flow(p->flow_payload, nullptr) != 0) return (nvrtcResult)kCancelled;
   if (!have_nvcc()) {
     p->log =
         "vgpu nvrtc: nvcc was not found on PATH.\n"
@@ -524,6 +578,10 @@ VGPU_EXPORT nvrtcResult nvrtcCompileProgram(nvrtcProgram prog, int num_options,
   if (p->ptx.empty()) {
     p->log += "vgpu nvrtc: nvcc reported success but produced no PTX\n";
     return NVRTC_ERROR_COMPILATION;
+  }
+  if (p->flow && p->flow(p->flow_payload, nullptr) != 0) {
+    p->ptx.clear();
+    return (nvrtcResult)kCancelled;
   }
 
   // Pull each lowered name back out: the marker variable's initialiser names the
@@ -641,4 +699,93 @@ VGPU_EXPORT nvrtcResult nvrtcGetOptiXIRSize(nvrtcProgram prog, size_t* size) {
 }
 VGPU_EXPORT nvrtcResult nvrtcGetOptiXIR(nvrtcProgram, char*) {
   return unsupported_output("OptiX-IR");
+}
+
+/* ---- PCH, flow callback and Tile IR ----
+ * NVRTC 12.8 and later. Their prototypes are absent from older toolkit
+ * headers (this builds against CUDA 12.0's too), so they are declared here
+ * under other names that carry the library's symbols. Where the toolkit's own
+ * NVRTC is the compiler, it answers: the heap size, the PCH status of the
+ * compile just made, the heap that compile needed and the flow callback are
+ * its own. Otherwise the answers are the ones a compile that asked for
+ * nothing gets.
+ *
+ * Measured against NVRTC 13.2 (no GPU involved):
+ *  - the heap defaults to 256 MiB; a set rounds up to a multiple of 4096
+ *    bytes (0 stays 0); a NULL result is NVRTC_ERROR_INVALID_INPUT;
+ *  - nvrtcGetPCHCreateStatus is NVRTC_ERROR_NO_PCH_CREATE_ATTEMPTED (13)
+ *    before any compile and after one that asked for no PCH; a bad program is
+ *    NVRTC_ERROR_INVALID_PROGRAM;
+ *  - nvrtcGetPCHHeapSizeRequired is 0 where no PCH was attempted, a bad
+ *    program is INVALID_PROGRAM and a NULL size INVALID_INPUT;
+ *  - nvrtcSetFlowCallback: a bad program is INVALID_PROGRAM, a NULL callback
+ *    INVALID_INPUT; the compiler calls it with the payload and NULL; any
+ *    non-zero return cancels the compile with NVRTC_ERROR_CANCELLED (16), an
+ *    empty log and a PTX of size 1;
+ *  - nvrtcGetTileIRSize and nvrtcGetTileIR succeed for a program that made no
+ *    Tile IR, before or after a compile: the size is 0 and the getter writes
+ *    nothing; a bad program is INVALID_PROGRAM, a NULL out pointer
+ *    INVALID_INPUT.
+ * Tile IR itself (nvcc's --enable-tile / --tile-only) is a vendor
+ * bitcode VirtualGPU cannot execute, so it is never produced. */
+extern "C" {
+int vgpu_nvrtcGetPCHHeapSize(size_t*) __asm__("nvrtcGetPCHHeapSize");
+int vgpu_nvrtcSetPCHHeapSize(size_t) __asm__("nvrtcSetPCHHeapSize");
+int vgpu_nvrtcGetPCHCreateStatus(nvrtcProgram) __asm__("nvrtcGetPCHCreateStatus");
+int vgpu_nvrtcGetPCHHeapSizeRequired(nvrtcProgram, size_t*) __asm__("nvrtcGetPCHHeapSizeRequired");
+int vgpu_nvrtcSetFlowCallback(nvrtcProgram, int (*)(void*, void*), void*) __asm__("nvrtcSetFlowCallback");
+int vgpu_nvrtcGetTileIRSize(nvrtcProgram, size_t*) __asm__("nvrtcGetTileIRSize");
+int vgpu_nvrtcGetTileIR(nvrtcProgram, char*) __asm__("nvrtcGetTileIR");
+}
+#define VGPU_EXPORT_FN __attribute__((visibility("default")))
+
+namespace {
+constexpr size_t kPchHeapDefault = 256u << 20, kPchHeapPage = 4096;
+std::mutex g_pch_mu;
+size_t g_pch_heap = kPchHeapDefault;
+}  // namespace
+
+VGPU_EXPORT_FN int vgpu_nvrtcGetPCHHeapSize(size_t* ret) {
+  if (!ret) return NVRTC_ERROR_INVALID_INPUT;
+  if (const RealNvrtc* r = real_nvrtc(); r && r->pch_get_heap) return r->pch_get_heap(ret);
+  std::lock_guard<std::mutex> l(g_pch_mu);
+  *ret = g_pch_heap;
+  return NVRTC_SUCCESS;
+}
+VGPU_EXPORT_FN int vgpu_nvrtcSetPCHHeapSize(size_t size) {
+  if (const RealNvrtc* r = real_nvrtc(); r && r->pch_set_heap) return r->pch_set_heap(size);
+  std::lock_guard<std::mutex> l(g_pch_mu);
+  g_pch_heap = size > SIZE_MAX - (kPchHeapPage - 1) ? size : (size + kPchHeapPage - 1) / kPchHeapPage * kPchHeapPage;
+  return NVRTC_SUCCESS;
+}
+VGPU_EXPORT_FN int vgpu_nvrtcGetPCHCreateStatus(nvrtcProgram prog) {
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  return p->pch_status;
+}
+VGPU_EXPORT_FN int vgpu_nvrtcGetPCHHeapSizeRequired(nvrtcProgram prog, size_t* size) {
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!size) return NVRTC_ERROR_INVALID_INPUT;
+  *size = p->pch_required;
+  return NVRTC_SUCCESS;
+}
+VGPU_EXPORT_FN int vgpu_nvrtcSetFlowCallback(nvrtcProgram prog, int (*callback)(void*, void*), void* payload) {
+  Program* p = get(prog);
+  if (!p) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!callback) return NVRTC_ERROR_INVALID_INPUT;
+  p->flow = callback;
+  p->flow_payload = payload;
+  return NVRTC_SUCCESS;
+}
+VGPU_EXPORT_FN int vgpu_nvrtcGetTileIRSize(nvrtcProgram prog, size_t* size) {
+  if (!get(prog)) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!size) return NVRTC_ERROR_INVALID_INPUT;
+  *size = 0;
+  return NVRTC_SUCCESS;
+}
+VGPU_EXPORT_FN int vgpu_nvrtcGetTileIR(nvrtcProgram prog, char* out) {
+  if (!get(prog)) return NVRTC_ERROR_INVALID_PROGRAM;
+  if (!out) return NVRTC_ERROR_INVALID_INPUT;
+  return NVRTC_SUCCESS;
 }

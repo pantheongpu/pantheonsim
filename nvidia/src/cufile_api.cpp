@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,7 @@
 #include <string>
 #include <vector>
 
+#include "enum_value.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/runtime/capture.hpp"
 #include "vgpu/runtime/shim_memory.hpp"
@@ -151,6 +153,16 @@ struct State {
   std::map<uintptr_t, size_t> bufs;  // registered base -> length
   std::set<Batch*> batches;
   std::map<CUstream, unsigned> streams;
+  // The P2P calls (CUDA 13.2's library) load the configuration without taking
+  // a use of the driver: until the next cuFileExportPCIeTopology or open, a
+  // parameter set is CU_FILE_DRIVER_ALREADY_OPEN though cuFileUseCount is 0.
+  bool config_locked = false;
+  bool config_loaded = false;        // the default configuration has been read
+  // cuFileSetParameterGpuBounceBufferSlabArray's array, kept across closes.
+  bool slab_set = false;
+  std::vector<size_t> slab_sizes, slab_counts;
+  // cuFileDriverSetP2PFlags, by status flag; a final close forgets them.
+  unsigned p2p[CU_FILE_MAX_TARGET_TYPES] = {};
 };
 
 State& st() {
@@ -214,7 +226,13 @@ void open_locked(State& s) {
   if (s.use_count == 0) apply_open(s);
   ++s.use_count;
   s.was_open = false;
+  s.config_loaded = true;
+  s.config_locked = false;
 }
+
+// Whether a parameter may still be set: not once the driver is open, nor
+// after a P2P call has loaded the configuration.
+bool config_frozen(const State& s) { return s.use_count > 0 || s.config_locked; }
 
 // The calls that need a driver open it when nobody has: on the card,
 // cuFileHandleRegister or cuFileBufRegister before cuFileDriverOpen leave
@@ -233,6 +251,7 @@ void release_all(State& s) {
   for (Batch* b : s.batches) delete b;
   s.batches.clear();
   s.streams.clear();
+  std::fill(std::begin(s.p2p), std::end(s.p2p), 0u);
 }
 
 Handle* find_handle(State& s, CUfileHandle_t fh) {
@@ -815,7 +834,7 @@ CUFILE_EXPORT CUfileError_t cuFileSetParameterSizeT(CUFileSizeTConfigParameter_t
   if ((int)param < 0 || (int)param >= kSizeParams) return status(CU_FILE_INVALID_VALUE);
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
-  if (s.use_count > 0) return status(CU_FILE_DRIVER_ALREADY_OPEN);
+  if (config_frozen(s)) return status(CU_FILE_DRIVER_ALREADY_OPEN);
   s.staged_size[param] = value;
   s.staged_size_set[param] = true;
   return kOk;
@@ -825,7 +844,7 @@ CUFILE_EXPORT CUfileError_t cuFileSetParameterBool(CUFileBoolConfigParameter_t p
   if ((int)param < 0 || (int)param >= kBoolParams) return status(CU_FILE_INVALID_VALUE);
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
-  if (s.use_count > 0) return status(CU_FILE_DRIVER_ALREADY_OPEN);
+  if (config_frozen(s)) return status(CU_FILE_DRIVER_ALREADY_OPEN);
   s.staged_bool[param] = value;
   s.staged_bool_set[param] = true;
   return kOk;
@@ -835,7 +854,7 @@ CUFILE_EXPORT CUfileError_t cuFileSetParameterString(CUFileStringConfigParameter
   if (!desc_str || (int)param < 0 || (int)param >= kStringParams) return status(CU_FILE_INVALID_VALUE);
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
-  if (s.use_count > 0) return status(CU_FILE_DRIVER_ALREADY_OPEN);
+  if (config_frozen(s)) return status(CU_FILE_DRIVER_ALREADY_OPEN);
   s.staged_string[param] = desc_str;
   s.staged_string_set[param] = true;
   return kOk;
@@ -860,6 +879,129 @@ CUFILE_EXPORT CUfileError_t cuFileGetParameterPosixPoolSlabArray(size_t* size_va
   (void)count_values;
   (void)len;
   return status(CU_FILE_INVALID_VALUE);
+}
+
+// The GPU bounce-buffer pool, CUDA 13.2's library (the entry points are new
+// in cuFile 1.16). Compatibility mode stages every transfer through one
+// buffer, so no pool is built from this configuration, but the configuration
+// is kept and answered as the card's library does. Measured on an RTX 3060
+// with CUDA 13.2's libcufile.so.0 (1.17):
+//  - the default array is four slabs, 1024, 8192, 16384 and 65536 KiB, of
+//    128, 8, 4 and 2 buffers;
+//  - a NULL pointer or a length below 1 is CU_FILE_INVALID_VALUE for both
+//    calls; a get whose length is not the array's length is INVALID_VALUE too;
+//  - a set is not checked beyond that (an unaligned, descending or zero-count
+//    array is kept as given) and is CU_FILE_DRIVER_ALREADY_OPEN while the
+//    driver is open or a P2P call has loaded the configuration;
+//  - a get before anything has loaded the configuration and with nothing set
+//    is INVALID_VALUE; once the driver has opened (or been loaded by a P2P
+//    call) it answers the default;
+//  - the array set stays in force across a close and the next open.
+CUFILE_EXPORT CUfileError_t cuFileSetParameterGpuBounceBufferSlabArray(const size_t* size_values,
+                                                                       const size_t* count_values, int len) {
+  if (!size_values || !count_values || len <= 0) return status(CU_FILE_INVALID_VALUE);
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (config_frozen(s)) return status(CU_FILE_DRIVER_ALREADY_OPEN);
+  s.slab_sizes.assign(size_values, size_values + len);
+  s.slab_counts.assign(count_values, count_values + len);
+  s.slab_set = true;
+  return kOk;
+}
+
+CUFILE_EXPORT CUfileError_t cuFileGetParameterGpuBounceBufferSlabArray(size_t* size_values, size_t* count_values,
+                                                                       int len) {
+  if (!size_values || !count_values || len <= 0) return status(CU_FILE_INVALID_VALUE);
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  static const size_t kDefSizes[4] = {1024, 8192, 16384, 65536}, kDefCounts[4] = {128, 8, 4, 2};
+  const size_t* sizes = kDefSizes;
+  const size_t* counts = kDefCounts;
+  size_t n = 4;
+  if (s.slab_set) {
+    sizes = s.slab_sizes.data();
+    counts = s.slab_counts.data();
+    n = s.slab_sizes.size();
+  } else if (!s.config_loaded && s.use_count == 0) {
+    return status(CU_FILE_INVALID_VALUE);
+  }
+  if ((size_t)len != n) return status(CU_FILE_INVALID_VALUE);
+  std::memcpy(size_values, sizes, n * sizeof(size_t));
+  std::memcpy(count_values, counts, n * sizeof(size_t));
+  return kOk;
+}
+
+// P2P flags, CUDA 13.2's library. Measured with CUDA 13.2's libcufile.so.0
+// on an RTX 3060, no nvidia-fs, x86_64:
+//  - both calls load the configuration (a parameter set then answers
+//    CU_FILE_DRIVER_ALREADY_OPEN) without raising cuFileUseCount, and work
+//    with the driver closed, open, or closed again;
+//  - each status flag from 0 up to (not including) CU_FILE_MAX_TARGET_TYPES
+//    holds its own flags, 0 at first; a status flag at or past that is
+//    CU_FILE_INVALID_VALUE (a negative one reads out of range on the card,
+//    answers INVALID_VALUE here); so is a NULL result;
+//  - a set takes 0 (which changes nothing: flags cannot be cleared) or
+//    CU_FILE_P2P_FLAG_PCI_P2PDMA; NVFS, DMABUF, C2C (the last is for
+//    AArch64) and any combination are CU_FILE_INVALID_VALUE (the
+//    CU_FILE_P2P_FLAG_NOT_SUPPORTED the header's comments name is not a
+//    status it declares);
+//  - a final driver close and cuFileExportPCIeTopology forget the flags.
+CUFILE_EXPORT CUfileError_t cuFileDriverGetP2PFlags(CUfileDriverStatusFlags_t status_flag,
+                                                    CUfileP2PFlags_t* p2p_flags) {
+  const int sf = enum_value(status_flag);
+  if (!p2p_flags || sf < 0 || sf >= (int)CU_FILE_MAX_TARGET_TYPES) return status(CU_FILE_INVALID_VALUE);
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (s.use_count == 0) s.config_locked = true;
+  s.config_loaded = true;
+  const unsigned v = s.p2p[sf];
+  std::memcpy(p2p_flags, &v, sizeof v);
+  return kOk;
+}
+
+CUFILE_EXPORT CUfileError_t cuFileDriverSetP2PFlags(CUfileDriverStatusFlags_t status_flag,
+                                                    CUfileP2PFlags_t p2p_flags) {
+  const int sf = enum_value(status_flag);
+  const unsigned want = (unsigned)enum_value(p2p_flags);
+  if (sf < 0 || sf >= (int)CU_FILE_MAX_TARGET_TYPES || (want & ~1u)) return status(CU_FILE_INVALID_VALUE);
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (s.use_count == 0) s.config_locked = true;
+  s.config_loaded = true;
+  s.p2p[sf] |= want;
+  return kOk;
+}
+
+// The topology file. Without nvidia-fs there is no PCIe topology to report,
+// and the card's library writes this file for an empty one: seven comment
+// lines about the format, then the JSON value null, no final newline.
+// Measured: the file is overwritten; a NULL or empty path, a directory and a
+// path that cannot be opened are CU_FILE_INVALID_VALUE; with the driver
+// closed it opens and closes the driver around the write, which leaves the
+// configuration unlocked again and forgets the P2P flags.
+CUFILE_EXPORT CUfileError_t cuFileExportPCIeTopology(const char* filename) {
+  if (!filename || !*filename) return status(CU_FILE_INVALID_VALUE);
+  static const char kTopology[] =
+      "// Topology file for cuFile.\n"
+      "// Notes:\n"
+      "// - Lower preference orders have higher priority.\n"
+      "// - Min preference order: 0x1 (dec: 1), Max preference order: 0x7000 (dec: 28672).\n"
+      "// - Ensure devices follow GPU preference mapping by checking CPU socket, NUMA node, and PCIe group.\n"
+      "// - Devices in the same PCIe group share a root port and aren't penalized in routing.\n"
+      "// - CPU socket and NUMA node penalties apply only when devices belong to different PCIe groups (root ports).\n"
+      "null";
+  std::FILE* f = std::fopen(filename, "w");
+  if (!f) return status(CU_FILE_INVALID_VALUE);
+  const bool wrote = std::fwrite(kTopology, 1, sizeof kTopology - 1, f) == sizeof kTopology - 1;
+  const bool closed = std::fclose(f) == 0;
+  if (!wrote || !closed) return status(CU_FILE_INTERNAL_ERROR);
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (s.use_count == 0) {
+    s.config_locked = false;
+    std::fill(std::begin(s.p2p), std::end(s.p2p), 0u);
+  }
+  return kOk;
 }
 
 // ---- statistics ---------------------------------------------------------------------

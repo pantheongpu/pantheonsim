@@ -126,8 +126,24 @@ typedef enum CUfileDriverStatusFlags VGPU_ENUM_INT {
   CU_FILE_NVMESH_SUPPORTED = 8,
   CU_FILE_BEEGFS_SUPPORTED = 9,
   CU_FILE_NVME_P2P_SUPPORTED = 11,
-  CU_FILE_SCATEFS_SUPPORTED = 12
+  CU_FILE_SCATEFS_SUPPORTED = 12,
+  CU_FILE_VIRTIOFS_SUPPORTED = 13,
+  CU_FILE_MAX_TARGET_TYPES
 } CUfileDriverStatusFlags_t;
+
+/* Bit positions of the P2P flags cuFileDriverSetP2PFlags takes (CUDA 13.2's
+ * cufile.h): each CU_FILE_P2P_FLAG_* is 1 << the position. */
+typedef enum CUfileP2PFlags VGPU_ENUM_INT {
+  CUFILE_P2PDMA = 0,
+  CUFILE_NVFS = 1,
+  CUFILE_DMABUF = 2,
+  CUFILE_C2C = 3,
+  CUFILE_NVIDIA_PEERMEM = 4
+} CUfileP2PFlags_t;
+#define CU_FILE_P2P_FLAG_PCI_P2PDMA ((CUfileP2PFlags_t)(1 << CUFILE_P2PDMA))
+#define CU_FILE_P2P_FLAG_NVFS ((CUfileP2PFlags_t)(1 << CUFILE_NVFS))
+#define CU_FILE_P2P_FLAG_DMABUF ((CUfileP2PFlags_t)(1 << CUFILE_DMABUF))
+#define CU_FILE_P2P_FLAG_C2C ((CUfileP2PFlags_t)(1 << CUFILE_C2C))
 
 /* Bit positions in CUfileDrvProps_t.nvfs.dcontrolflags. */
 typedef enum CUfileDriverControlFlags VGPU_ENUM_INT {
@@ -335,6 +351,12 @@ CUfileError_t cuFileSetParameterString(CUFileStringConfigParameter_t param, cons
 CUfileError_t cuFileSetParameterPosixPoolSlabArray(const size_t* size_values, const size_t* count_values,
                                                    int len);
 CUfileError_t cuFileGetParameterPosixPoolSlabArray(size_t* size_values, size_t* count_values, int len);
+CUfileError_t cuFileSetParameterGpuBounceBufferSlabArray(const size_t* size_values, const size_t* count_values,
+                                                         int len);
+CUfileError_t cuFileGetParameterGpuBounceBufferSlabArray(size_t* size_values, size_t* count_values, int len);
+CUfileError_t cuFileDriverGetP2PFlags(CUfileDriverStatusFlags_t status_flag, CUfileP2PFlags_t* p2p_flags);
+CUfileError_t cuFileDriverSetP2PFlags(CUfileDriverStatusFlags_t status_flag, CUfileP2PFlags_t p2p_flags);
+CUfileError_t cuFileExportPCIeTopology(const char* filename);
 
 /* ---- statistics ---- */
 CUfileError_t cuFileSetStatsLevel(int level);
