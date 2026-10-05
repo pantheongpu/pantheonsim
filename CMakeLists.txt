@@ -1958,6 +1958,16 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# The device runtime (cudadevrt): cdp_device_api and cdp1_device_sync alone, on four generations,
+# as e2e_sass_archs runs them among the rest (nvidia/docs/sass.md, "Device runtime").
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_runtime COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_device_runtime PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=cdp_device_api:75 cdp1_device_sync:75:89;VGPU_SASS_ARCHS=sm_75 sm_86 sm_90 sm_120"
+    TIMEOUT 1800)
+endif()
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.
