@@ -9,6 +9,7 @@
 // 4. The named device streams (cudaStreamTailLaunch, cudaStreamFireAndForget).
 // 5. A child whose parameters mix sizes and alignments, including a struct
 //    passed by value, so the parameter buffer's layout is exercised.
+// 6. A graph with such a kernel refuses instantiation for device launch.
 //
 // Every result is checked exactly. Prints PASS on the last line.
 #include <cstdio>
@@ -163,6 +164,31 @@ bool run() {
     bool good = true;
     for (int i = 0; i < 6; ++i) good = good && h[i] == want[i];
     std::printf("parameter layout: %s\n", good ? "exact" : "WRONG");
+    ok = ok && good;
+  }
+  {
+    // A graph holding a kernel that launches kernels cannot be instantiated
+    // for device launch: cudaErrorInvalidValue, as an RTX 3060 answers; for
+    // the host it can.
+    cudaGraph_t g;
+    CK(cudaGraphCreate(&g, 0));
+    int* d;
+    CK(cudaMalloc(&d, 32 * sizeof(int)));
+    void* args[] = {&d};
+    cudaKernelNodeParams p = {};
+    p.func = reinterpret_cast<void*>(fan_out);
+    p.gridDim = dim3(1);
+    p.blockDim = dim3(32);
+    p.kernelParams = args;
+    cudaGraphNode_t n;
+    CK(cudaGraphAddKernelNode(&n, g, nullptr, 0, &p));
+    cudaGraphExec_t e;
+    const cudaError_t dev = cudaGraphInstantiate(&e, g, cudaGraphInstantiateFlagDeviceLaunch);
+    const cudaError_t host = cudaGraphInstantiate(&e, g, 0);
+    cudaGetLastError();
+    const bool good = dev == cudaErrorInvalidValue && host == cudaSuccess;
+    std::printf("a graph with dynamic parallelism, for device launch: %s, for the host: %s%s\n",
+                cudaGetErrorName(dev), cudaGetErrorName(host), good ? "" : " (want cudaErrorInvalidValue, cudaSuccess)");
     ok = ok && good;
   }
   return ok;

@@ -38,20 +38,42 @@ for lib in "$@"; do
   if (( ${#have[@]} == 0 )); then
     echo "SKIP: the $lib shim is not built (CUDA ABI headers absent at build time)"; exit 0
   fi
-  # cuStateVec, cuDSS and cuDNN are not part of the toolkit, so nvcc has no
+  # cuStateVec, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuDNN, nvCOMP and NVSHMEM are not
+  # part of the toolkit, and cuFile is not part of CUDA 12.0's, so nvcc has no
   # copy to link against: link against the shim's, which follows NVIDIA's ABI.
-  # cuDNN's headers are vendored.
-  [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cudnn ]] && links+=("-L$shim")
+  # cuDNN's headers are vendored; the others' are the simulator's own
+  # (nvidia/include/vgpu_*.h).
+  [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cusparseLt || "$lib" == cutensor || "$lib" == cutensornet || "$lib" == cudnn ||
+     "$lib" == cufile || "$lib" == nvcomp || "$lib" == nvshmem_host ]] && links+=("-L$shim")
   [[ "$lib" == cudnn ]] && links+=("-I$root/nvidia/third_party/cudnn_include")
   links+=("-l$lib")
 done
+# A graph-API test built on NVIDIA's cudnn-frontend (header-only) gets it
+# fetched; without network access it is skipped.
+if grep -q '#include <cudnn_frontend.h>' "$src"; then
+  fe="$("$root/nvidia/tests/e2e/fetch_cudnn_frontend.sh")" || { echo "SKIP: cudnn-frontend could not be fetched"; exit 0; }
+  links+=("-I$fe")
+fi
 trap 'rm -f "$out"' EXIT
 nvcc -std=c++17 -cudart "$cudart" -arch=compute_80 -code=compute_80 \
      -Wno-deprecated-gpu-targets -Xcompiler -Wno-deprecated-declarations \
      $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" "${links[@]}"
 require_shim_libs "$shim" "$out" || exit 0
+# A program that opens cuDNN and the runtime itself (cudnn_dlhandle, as the
+# cudnn-frontend does) opens them RTLD_GLOBAL, which puts libcuda and libcudart
+# in one scope: each carries the simulator's globals, and a sanitizer build
+# reports the pair as an ODR violation. They are the same code, by design.
+# Where an NVIDIA runtime of another major is installed too, the frontend picks
+# the lowest and runs on NVIDIA's own, which cannot reach a simulated driver;
+# name the shim's.
+if grep -q cudnn_dlhandle "$src"; then
+  export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_odr_violation=0"
+  for rt in "$shim"/libcudart.so.[0-9]*; do
+    if [[ "$rt" =~ \.so\.[0-9]+$ ]]; then export CUDNN_FRONTEND_CUDART_LIB_NAME="$rt"; fi
+  done
+fi
 status=0
-result="$(VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
+result="$(VGPU_GPU=nvidia/a100 VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
 if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU' <<< "$result"; then
   echo "FAIL: the program reached an unimplemented entry point or a refused kernel"; exit 1

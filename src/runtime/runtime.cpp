@@ -362,11 +362,22 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
   for (const sass::CubinKernel& k : sm->cubin.kernels) {
     ptx::EntryFn e;
     e.name = k.name;
+    // Each parameter's alignment, as the one that puts it where the cubin
+    // says it is: a parameter buffer is split back into parameters by
+    // alignment (a device-side launch's, cuParamSet's), and a size says
+    // nothing of it (a struct of three ints is 12 bytes aligned to 4).
+    uint32_t end = 0;
     for (const sass::CubinParam& p : k.params) {
       ptx::ParamDecl d;
       d.name = k.name + "_param_" + std::to_string(p.ordinal);
       d.size = p.size;
       d.align = p.size >= 8 ? 8 : p.size >= 4 ? 4 : 1;
+      for (uint32_t a = 1; a <= 256; a <<= 1)
+        if ((end + a - 1) / a * a == p.offset) {
+          d.align = a;
+          break;
+        }
+      end = p.offset + p.size;
       e.params.push_back(d);
     }
     e.static_shared_size = static_cast<uint32_t>(k.shared_bytes);

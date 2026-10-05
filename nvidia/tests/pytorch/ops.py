@@ -1,7 +1,8 @@
 """PyTorch's CUDA build, unmodified, on a simulated NVIDIA GPU: one operator
 at a time, each on the simulated GPU and on the CPU from the same inputs --
 PyTorch's own kernels and the libraries it ships (cuBLAS, cuBLASLt, cuDNN,
-cuFFT, cuRAND, cuSOLVER, cuSPARSE), attention through each SDPA backend,
+cuFFT, cuRAND, cuSOLVER, cuSPARSE), attention through each SDPA backend
+(cuDNN's attention graphs, forward and backward, among them),
 cuDNN's training paths (convolution gradients, half and double LSTMs, CTC
 loss), and autocast. One line each: "ok <name>", or "FAIL <name>: <why>".
 """
@@ -89,13 +90,31 @@ check('eigh 40x40', lambda d: torch.linalg.eigvalsh((lambda m: m @ m.T)(torch.ra
 q, k, vv = (torch.randn(2, 4, 16, 32, generator=g) for _ in range(3))
 check('attention', lambda d: F.scaled_dot_product_attention(q.to(d), k.to(d), vv.to(d), is_causal=True))
 from torch.nn.attention import SDPBackend, sdpa_kernel
-for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH):
+for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
     def run(d, backend=backend):
         if d == 'cpu':
             return F.scaled_dot_product_attention(q.half().float(), k.half().float(), vv.half().float(), is_causal=True)
         with sdpa_kernel(backend):
             return F.scaled_dot_product_attention(q.half().to(d), k.half().to(d), vv.half().to(d), is_causal=True)
     check(f'attention, {backend.name.lower()} backend, half', run, 1e-2)
+
+
+def cudnn_attention_grads(d):
+    # Training through cuDNN's attention graph (forward with statistics, then
+    # the backward graph); the CPU's math path in float is the reference.
+    qq, kk, vvv = (t.half().float().clone().to(d) if d == 'cpu' else t.half().to(d).clone() for t in (q, k, vv))
+    for t in (qq, kk, vvv):
+        t.requires_grad_(True)
+    if d == 'cpu':
+        out = F.scaled_dot_product_attention(qq, kk, vvv, is_causal=True)
+    else:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            out = F.scaled_dot_product_attention(qq, kk, vvv, is_causal=True)
+    out.float().square().sum().backward()
+    return [qq.grad, kk.grad, vvv.grad]
+
+
+check('attention gradients, cudnn_attention backend, half', cudnn_attention_grads, 3e-2)
 
 
 def autocast_mlp(d):

@@ -30,6 +30,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
+#include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
@@ -62,6 +63,7 @@ struct Warp {
   uint32_t ur[256] = {};
   bool up[8] = {false, false, false, false, false, false, false, true};
   uint64_t pc[32] = {};               // per-lane code address
+  uint32_t device_error[32] = {};     // the device runtime's per-thread last error: a failed call sets it, a successful one leaves it
   Mask alive = 0;                     // lanes that are threads of the block
   Mask exited = 0;
   Mask waiting = 0;
@@ -153,6 +155,39 @@ struct Fault : std::exception {
   const char* what() const noexcept override { return msg.c_str(); }
 };
 
+// Dynamic parallelism, as the PTX engine runs it (src/exec/interpreter.cpp):
+// a thread gets a parameter buffer for a kernel of the module, fills it, and
+// launches it; the child grid runs after the parent grid has finished and
+// before the launch as a whole returns -- a schedule CUDA allows for every
+// device-side stream, since it promises no concurrency between a parent and
+// its children, and the one it requires of a tail launch. Children run in
+// the order they were launched, parent block by parent block, so the order
+// does not depend on how blocks were spread over host threads.
+struct Child {
+  size_t kernel = 0;                 // in the module's cubin.kernels
+  std::array<uint32_t, 3> grid{}, block{};
+  uint32_t shared = 0;
+  uint64_t buffer = 0;               // the parameter buffer, in device memory
+  uint32_t size = 0;
+  uint64_t order = 0;                // parent block, then issue order within it
+};
+struct Launches {
+  std::mutex mu;
+  std::unordered_map<uint64_t, Child> by_buffer;   // handed out, not launched yet
+  std::vector<Child> queue;                        // launched, to run after the grid
+  std::unordered_map<uint64_t, uint64_t> per_block;
+};
+// cudaLimitDevRuntimePendingLaunchCount's default, and CUDA's nesting limit.
+constexpr size_t kMaxPendingLaunches = 2048;
+constexpr uint32_t kMaxLaunchDepth = 24;
+
+// A kernel's parameter bytes: where its last parameter ends.
+uint32_t param_bytes(const CubinKernel& k) {
+  uint32_t end = 0;
+  for (const CubinParam& p : k.params) end = std::max(end, p.offset + p.size);
+  return end;
+}
+
 std::mutex& atomic_lock(uint64_t addr) {
   static std::mutex locks[64];
   return locks[(addr >> 3) % 64];
@@ -219,6 +254,7 @@ class Runner {
   }
 
   exec::LaunchStats run();
+  void set_launches(Launches* dl) { dl_ = dl; }
   ~Runner() {
     if (coop_ws_) {
       try {
@@ -280,6 +316,8 @@ class Runner {
   void run_cluster(uint64_t k);                          // one cluster's blocks, together
   void cluster_barrier_check(Block& blk);                // UCGABAR: complete the phase if all are in
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
+  bool device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
+  const size_t* kernel_at(uint64_t code_addr);   // the module's kernel whose code starts there
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
   // Operand access, inline for the common case -- a register -- since every
   // instruction makes it once per lane per operand; the rest out of line.
@@ -324,6 +362,9 @@ class Runner {
   uint64_t units_ = 0;
   exec::LaunchStats stats_;
   std::mutex stats_mu_;
+  Launches* dl_ = nullptr;   // where device-side launches go (dynamic parallelism)
+  std::map<uint64_t, size_t> kernel_by_code_;
+  std::once_flag kernel_by_code_once_;
   // The heap malloc() draws from, shared by every launch on the device.
 };
 
@@ -416,6 +457,12 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
     }
     put32(ctas, csize_);
   }
+  // %current_graph_exec (cudaGetCurrentGraphExec): the device graph this
+  // kernel runs in, or 0. ptxas loads it from bank 0 at 0x120 on sm_75, 0x130
+  // on sm_80-sm_89, 0x190 on sm_90 and 0x2e8 from sm_100 (CUDA 12.0's and
+  // 13.0's alike). On an RTX 3060 the sm_86 load returned the executable
+  // graph's own handle, and 0 in a kernel outside a device graph.
+  put64(sm >= 100 ? 0x2e8 : sm >= 90 ? 0x190 : sm >= 80 ? 0x130 : 0x120, cfg_.current_graph_exec);
   // PTX's %envreg1/%envreg2: a cooperative launch's grid barrier workspace,
   // high word first. cg::this_grid().sync() traps when it is zero, which is
   // what an ordinary launch of a grid-sync kernel gets.
@@ -762,6 +809,9 @@ exec::LaunchStats Runner::run() {
     // an allocation in one block beside a load in another is a data race.
     for (const std::string& e : m_.cubin.externs)
       if (e == "malloc" || e == "free") threads = 1;
+    // So does one that can launch kernels: its parameter buffers are
+    // allocations too.
+    if (m_.device_launches) threads = 1;
   }
   if (cfg_.cooperative) {
     // Every block resident at once, taking turns, so one may wait on another.
@@ -975,13 +1025,80 @@ Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
 // For sass::unsupported (module.cpp).
 bool runs_instr(const Instr& ins) { return executes(ins); }
 
+namespace {
+
+// Runs the child grids `dl` holds, each to completion -- its own children
+// included, since a grid is complete only when they are -- before the next,
+// in the order they were launched (the PTX engine's run_children).
+void run_children(const Module& m, Launches& dl, const exec::LaunchConfig& parent, MemoryManager& mem,
+                  const DeviceProfile& profile, exec::LaunchStats& stats, uint32_t depth) {
+  // Buffers taken and never launched go back.
+  for (auto& [buf, c] : dl.by_buffer) mem.free(buf);
+  dl.by_buffer.clear();
+  std::vector<Child> queue = std::move(dl.queue);
+  dl.queue.clear();
+  std::stable_sort(queue.begin(), queue.end(), [](const Child& a, const Child& b) { return a.order < b.order; });
+  // Whatever happens, no parameter buffer outlives the launch.
+  struct Buffers {
+    MemoryManager& mem;
+    std::vector<Child>& q;
+    ~Buffers() {
+      for (Child& c : q)
+        if (c.buffer) {
+          try {
+            mem.free(c.buffer);
+          } catch (const Error&) {
+          }
+        }
+    }
+  } guard{mem, queue};
+  for (Child& c : queue) {
+    const CubinKernel& k = m.cubin.kernels[c.kernel];
+    if (depth > kMaxLaunchDepth)
+      throw Error(Err::LaunchConfig, "kernel '" + k.name + "' launched at nesting depth " + std::to_string(depth) +
+                                         "; dynamic parallelism allows " + std::to_string(kMaxLaunchDepth));
+    std::vector<uint8_t> bytes(c.size);
+    if (c.size) mem.read(c.buffer, bytes.data(), c.size);
+    mem.free(c.buffer);
+    c.buffer = 0;
+    // The buffer back into one argument per parameter, from where the
+    // cubin puts each.
+    std::vector<std::vector<uint8_t>> args;
+    for (const CubinParam& p : k.params)
+      args.emplace_back(bytes.begin() + p.offset, bytes.begin() + p.offset + p.size);
+    exec::LaunchConfig cc = parent;
+    cc.grid = c.grid;
+    cc.block = c.block;
+    cc.shared_bytes = c.shared;
+    cc.cluster = k.cluster;   // __cluster_dims__, as a host launch applies it
+    cc.cooperative = false;
+    cc.coop_workspace = 0;
+    Launches child;
+    {
+      Runner r(m, k, cc, args, mem, profile);
+      r.set_launches(&child);
+      stats.add(r.run());
+    }
+    run_children(m, child, cc, mem, profile, stats, depth + 1);
+  }
+}
+
+}  // namespace
+
 exec::LaunchStats launch(const Module& m, const std::string& kernel, const exec::LaunchConfig& cfg,
                          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
                          const DeviceProfile& profile) {
   const auto it = m.kernel_index.find(kernel);
   if (it == m.kernel_index.end()) throw Error(Err::NotFound, "no kernel " + kernel + " in the module");
-  Runner r(m, m.cubin.kernels[it->second], cfg, args, mem, profile);
-  return r.run();
+  Launches dl;
+  exec::LaunchStats stats;
+  {
+    Runner r(m, m.cubin.kernels[it->second], cfg, args, mem, profile);
+    r.set_launches(&dl);
+    stats = r.run();
+  }
+  if (!dl.queue.empty() || !dl.by_buffer.empty()) run_children(m, dl, cfg, mem, profile, stats, 1);
+  return stats;
 }
 
 }  // namespace vgpu::sass

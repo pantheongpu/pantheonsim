@@ -435,9 +435,11 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   vgpu_toolkit_soversion(cublas 13 SO_CUBLAS)
   vgpu_version_script(cublas ${SO_CUBLAS} _cublas_map)
-  add_library(vgpucublas SHARED nvidia/src/cublas_api.cpp nvidia/src/generated/cublas_stubs.cpp)
+  add_library(vgpucublas SHARED nvidia/src/cublas_api.cpp nvidia/src/generated/cublas_stubs.cpp
+              nvidia/src/cublas_xt.cpp nvidia/src/cublas_legacy_core.cpp
+              nvidia/src/generated/cublas_64.cpp nvidia/src/generated/cublas_legacy.cpp)
   target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
-  target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE})
+  target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE} nvidia/src)
   set_target_properties(vgpucublas PROPERTIES
     OUTPUT_NAME cublas SOVERSION ${SO_CUBLAS} VERSION ${SO_CUBLAS}.0)
   target_link_options(vgpucublas PRIVATE "-Wl,--version-script=${_cublas_map}")
@@ -506,22 +508,34 @@ if(CUDA_ABI_INCLUDE)
   # cusolverSp is part of libcusolver and reads cuSPARSE's matrix descriptors
   # through cuSPARSE's getters, so like NVIDIA's libcusolver it links
   # libcusparse.
-  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp)
+  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp nvidia/src/cusolver_rf.cpp)
   target_link_libraries(vgpucusolver PRIVATE vgpucusparse)
   # cusolverMg gathers a distributed matrix and runs cusolverDn on it.
   target_link_libraries(vgpucusolvermg PRIVATE vgpucusolver)
+  # cuFFT's LTO callbacks: the callback image's PTX is read (fatbin.cpp) and
+  # linked with the kernels that call it (ptx_link.cpp). Hidden, so these
+  # copies stay this library's own rather than meeting libcudart's.
+  target_sources(vgpucufft PRIVATE nvidia/src/fatbin.cpp nvidia/src/ptx_link.cpp)
+  target_include_directories(vgpucufft PRIVATE include nvidia/src)
+  target_link_libraries(vgpucufft PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(vgpucufft PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
   # ---------------------------------------------------------------------------
   # NPP. NVIDIA splits it across eleven shared objects that share one API
-  # surface, so one source is built into each under its own soname. The symbols
-  # are identical in every copy and ELF resolves a name to a single definition
-  # process-wide, so the duplication costs disk and nothing else.
+  # surface, so one set of objects is linked into each under its own soname
+  # (compiled once). The symbols are identical in every copy and ELF resolves a
+  # name to a single definition process-wide, so the duplication costs disk and
+  # nothing else.
   # ---------------------------------------------------------------------------
+  add_library(vgpunpp_objs OBJECT nvidia/src/npp_api.cpp nvidia/src/npp_imgproc.cpp)
+  set_target_properties(vgpunpp_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(vgpunpp_objs PRIVATE vgpu)
+  target_include_directories(vgpunpp_objs PRIVATE ${CUDA_ABI_INCLUDE})
   set(_vgpu_npp_libs nppc nppial nppicc nppidei nppif nppig nppim nppist nppisu nppitc npps)
   foreach(_npp IN LISTS _vgpu_npp_libs)
     vgpu_toolkit_soversion(${_npp} 13 _nppver)
     vgpu_version_script(${_npp} ${_nppver} _nppmap)
-    add_library(vgpu${_npp} SHARED nvidia/src/npp_api.cpp)
+    add_library(vgpu${_npp} SHARED $<TARGET_OBJECTS:vgpunpp_objs>)
     target_link_libraries(vgpu${_npp} PRIVATE vgpu vgpucudart)
     target_include_directories(vgpu${_npp} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_npp} PROPERTIES
@@ -547,7 +561,7 @@ if(CUDA_ABI_INCLUDE)
     NO_DEFAULT_PATH)
   if(NCCL_INCLUDE)
     message(STATUS "NCCL headers at ${NCCL_INCLUDE}: building libvgpunccl")
-    add_library(vgpunccl SHARED nvidia/src/nccl_api.cpp nvidia/src/generated/nccl_stubs.cpp)
+    add_library(vgpunccl SHARED nvidia/src/nccl_api.cpp)
     target_link_libraries(vgpunccl PRIVATE vgpu vgpucudart)
     target_include_directories(vgpunccl PRIVATE ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpunccl PROPERTIES OUTPUT_NAME nccl SOVERSION 2 VERSION 2.0)
@@ -589,7 +603,7 @@ if(CUDA_ABI_INCLUDE)
   # libraries -- a linker and a container writer -- so, like NVRTC, they carry
   # no simulator and no runtime: only the fatbin reader and writer
   # (fatbin.cpp) and the PTX linker the runtime also links -rdc builds with
-  # (ptx_link.cpp). Each is written from the documented API with the
+  # (ptx_link.cpp), and nvJitLink's machine-code linker (sass_link.cpp). Each is written from the documented API with the
   # simulator's own declarations (nvidia/include/vgpu_nvjitlink.h,
   # vgpu_nvfatbin.h), since CUDA 12.0 has no nvFatbin.h. NVIDIA tags both
   # libraries' symbols with their soname, and the stubs programs link against
@@ -607,7 +621,7 @@ if(CUDA_ABI_INCLUDE)
     set(_ver ${SO_CUDART})
     vgpu_version_script(${_lib} ${_ver} _map)
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp nvidia/src/fatbin.cpp
-                nvidia/src/ptx_link.cpp src/core/error.cpp)
+                nvidia/src/ptx_link.cpp nvidia/src/sass_link.cpp src/core/error.cpp)
     target_include_directories(vgpu${_lower} PRIVATE include nvidia/src)
     target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})   # libzstd, dlopened
     target_compile_definitions(vgpu${_lower} PRIVATE VGPU_${_macro}_VERSION=${VGPU_TOOLKIT_VERSION})
@@ -646,6 +660,188 @@ if(CUDA_ABI_INCLUDE)
     COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcudss.so.0.8"
             "${CMAKE_BINARY_DIR}/shim/libcudss.so"
     COMMENT "Creating cuDSS shim symlinks (build/shim/libcudss.so.0)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpucufile: cuFile (GPUDirect Storage), presented as libcufile.so.0. A
+  # simulated GPU has no nvidia-fs, so this is cuFile's compatibility mode:
+  # POSIX I/O staged through host memory into simulated device memory, with
+  # NVIDIA's statuses (nvidia/src/cufile_api.cpp, declarations in
+  # nvidia/include/vgpu_cufile.h, since CUDA 12.0's toolkit has no cufile.h).
+  # NVIDIA's exports its symbols with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_cufile_map "${CMAKE_BINARY_DIR}/maps/libcufile.so.0.map")
+  file(WRITE "${_cufile_map}" "{\n  global: cuFile*;\n  local: *;\n};\n")
+  add_library(vgpucufile SHARED nvidia/src/cufile_api.cpp)
+  target_link_libraries(vgpucufile PRIVATE vgpucudart)
+  target_include_directories(vgpucufile PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucufile PROPERTIES OUTPUT_NAME cufile SOVERSION 0 VERSION 0.15)
+  target_link_options(vgpucufile PRIVATE "-Wl,--version-script=${_cufile_map}")
+  add_custom_command(TARGET vgpucufile POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcufile.so.0.15"
+            "${CMAKE_BINARY_DIR}/shim/libcufile.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcufile.so.0.15"
+            "${CMAKE_BINARY_DIR}/shim/libcufile.so"
+    COMMENT "Creating cuFile shim symlinks (build/shim/libcufile.so.0)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvcomp: nvCOMP's low-level batched API, presented as libnvcomp.so.5.
+  # Its standard formats are standard bitstreams (LZ4, Snappy, DEFLATE, gzip,
+  # Zstandard) and GDeflate is published as an Internet-Draft, so each chunk
+  # is coded on the host by the simulator's own codecs
+  # (nvidia/src/nvcomp_codecs.cpp, nvcomp_gdeflate.cpp) between reads and
+  # writes of simulated device memory. Cascaded, Bitcomp and ANS have no
+  # public bitstream and are refused. NVIDIA's library exports its symbols
+  # with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
+  file(WRITE "${_nvcomp_map}"
+       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; };\n  local: *;\n};\n")
+  add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
+              nvidia/src/nvcomp_gdeflate.cpp nvidia/src/nvcomp_manager.cpp)
+  target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
+  target_include_directories(vgpunvcomp PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpunvcomp PROPERTIES OUTPUT_NAME nvcomp SOVERSION 5 VERSION 5.3)
+  target_link_options(vgpunvcomp PRIVATE "-Wl,--version-script=${_nvcomp_map}")
+  add_custom_command(TARGET vgpunvcomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp.so.5"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp.so"
+    COMMENT "Creating nvCOMP shim symlinks (build/shim/libnvcomp.so.5)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvshmem: NVSHMEM's host library, presented as libnvshmem_host.so.3.
+  # Each PE is a process with a simulated GPU; the symmetric heaps are shared
+  # through the simulator's CUDA IPC, so every PE reaches every other by load
+  # and store, and kernels built with NVIDIA's NVSHMEM headers and device
+  # library run their inline device API against the state this library fills
+  # in (nvidia/src/nvshmem_api.cpp, nvshmem_abi.hpp). The host API's
+  # declarations are the simulator's own (nvidia/include/vgpu_nvshmem.h).
+  # NVIDIA tags its symbols NVSHMEM; so does this, including the C++
+  # nvshmemi_init_thread NVSHMEM's inline nvshmem_init() calls.
+  # ---------------------------------------------------------------------------
+  set(_nvshmem_map "${CMAKE_BINARY_DIR}/maps/libnvshmem_host.so.3.map")
+  file(WRITE "${_nvshmem_map}"
+       "NVSHMEM {\n  global: nvshmem*;\n  extern \"C++\" { nvshmemi_init_thread*; };\n  local: *;\n};\n")
+  add_library(vgpunvshmem SHARED nvidia/src/nvshmem_api.cpp)
+  target_link_libraries(vgpunvshmem PRIVATE vgpucudart ${CMAKE_DL_LIBS})
+  target_include_directories(vgpunvshmem PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpunvshmem PROPERTIES OUTPUT_NAME nvshmem_host SOVERSION 3 VERSION 3.8)
+  target_link_options(vgpunvshmem PRIVATE "-Wl,--version-script=${_nvshmem_map}")
+  add_custom_command(TARGET vgpunvshmem POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
+            "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so.3"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvshmem_host.so.3.8"
+            "${CMAKE_BINARY_DIR}/shim/libnvshmem_host.so"
+    COMMENT "Creating NVSHMEM shim symlinks (build/shim/libnvshmem_host.so.3)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpucusparselt: cuSPARSELt, matrix products with a 2:4 structured sparse
+  # operand, presented as libcusparseLt.so.0. Like cuDSS, NVIDIA's carries a
+  # statically linked CUDA runtime that cannot reach a simulated driver, so the
+  # simulator answers the documented API itself, from its own declarations
+  # (nvidia/include/vgpu_cusparselt.h), and multiplies on the host. NVIDIA's
+  # exports its symbols with no version tag, so these carry none.
+  # ---------------------------------------------------------------------------
+  set(_cusparselt_map "${CMAKE_BINARY_DIR}/maps/libcusparseLt.so.0.map")
+  file(WRITE "${_cusparselt_map}" "{\n  global: cusparseLt*;\n  local: *;\n};\n")
+  add_library(vgpucusparselt SHARED nvidia/src/cusparselt_api.cpp)
+  target_link_libraries(vgpucusparselt PRIVATE vgpucudart)
+  target_include_directories(vgpucusparselt PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucusparselt PROPERTIES OUTPUT_NAME cusparseLt SOVERSION 0 VERSION 0.10)
+  target_link_options(vgpucusparselt PRIVATE "-Wl,--version-script=${_cusparselt_map}")
+  add_custom_command(TARGET vgpucusparselt POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcusparseLt.so.0.10"
+            "${CMAKE_BINARY_DIR}/shim/libcusparseLt.so.0"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcusparseLt.so.0.10"
+            "${CMAKE_BINARY_DIR}/shim/libcusparseLt.so"
+    COMMENT "Creating cuSPARSELt shim symlinks (build/shim/libcusparseLt.so.0)")
+  # libvgpucutensor: cuTENSOR 2, presented as libcutensor.so.2. Like cuDSS,
+  # NVIDIA's carries a statically linked CUDA runtime that cannot reach a
+  # simulated driver, so the simulator answers the documented API itself, from
+  # its own declarations (nvidia/include/vgpu_cutensor.h), computing on the
+  # host. NVIDIA's tags each symbol with the release that introduced it
+  # (libcutensor.1.0.0 ... libcutensor.2.5.0, a chain of versions); the map
+  # reproduces the chain so a program linked against either library binds to
+  # the other.
+  # ---------------------------------------------------------------------------
+  set(_cutensor_map "${CMAKE_BINARY_DIR}/maps/libcutensor.so.2.map")
+  file(WRITE "${_cutensor_map}" [=[
+libcutensor.1.0.0 {
+  global: cutensorGetCudartVersion; cutensorGetErrorString; cutensorGetVersion;
+  local: *;
+};
+libcutensor.1.1.0 { } libcutensor.1.0.0;
+libcutensor.1.2.0 { } libcutensor.1.1.0;
+libcutensor.1.3.0 {
+  global: cutensorLoggerForceDisable; cutensorLoggerOpenFile; cutensorLoggerSetCallback;
+          cutensorLoggerSetFile; cutensorLoggerSetLevel; cutensorLoggerSetMask;
+} libcutensor.1.2.0;
+libcutensor.1.6.0 { } libcutensor.1.3.0;
+libcutensor.1.7.0 { global: cutensorCreate; cutensorDestroy; } libcutensor.1.6.0;
+libcutensor.2.0.0 {
+  global: CUTENSOR_COMPUTE_DESC_16F; CUTENSOR_COMPUTE_DESC_16BF; CUTENSOR_COMPUTE_DESC_TF32;
+          CUTENSOR_COMPUTE_DESC_3XTF32; CUTENSOR_COMPUTE_DESC_32F; CUTENSOR_COMPUTE_DESC_64F;
+          cutensorComputeDescriptorGetAttribute; cutensorComputeDescriptorSetAttribute; cutensorContract;
+          cutensorCreateComputeDescriptor; cutensorCreateContraction; cutensorCreateElementwiseBinary;
+          cutensorCreateElementwiseTrinary; cutensorCreatePermutation; cutensorCreatePlan;
+          cutensorCreatePlanPreference; cutensorCreateReduction; cutensorCreateTensorDescriptor;
+          cutensorDestroyComputeDescriptor; cutensorDestroyOperationDescriptor; cutensorDestroyPlan;
+          cutensorDestroyPlanPreference; cutensorDestroyTensorDescriptor; cutensorElementwiseBinaryExecute;
+          cutensorElementwiseTrinaryExecute; cutensorEstimateWorkspaceSize; cutensorHandleReadPlanCacheFromFile;
+          cutensorHandleResizePlanCache; cutensorHandleWritePlanCacheToFile;
+          cutensorOperationDescriptorGetAttribute; cutensorOperationDescriptorSetAttribute;
+          cutensorOperationEstimateRuntime; cutensorOperationNumAlgos; cutensorPermute; cutensorPlanGetAttribute;
+          cutensorPlanPreferenceSetAttribute; cutensorReadKernelCacheFromFile; cutensorReduce;
+          cutensorTensorDescriptorSetAttribute; cutensorWriteKernelCacheToFile;
+} libcutensor.1.7.0;
+libcutensor.2.1.1 { global: cutensorContractTrinary; cutensorCreateContractionTrinary; } libcutensor.2.0.0;
+libcutensor.2.2.1 { global: CUTENSOR_COMPUTE_DESC_9X16BF; };
+libcutensor.2.3.0 {
+  global: cutensorBlockSparseContract; cutensorCreateBlockSparseContraction;
+          cutensorCreateBlockSparseTensorDescriptor; cutensorDestroyBlockSparseTensorDescriptor;
+} libcutensor.2.2.1;
+libcutensor.2.4.0 { global: CUTENSOR_COMPUTE_DESC_8XINT8; cutensorPlanPreferenceGetAttribute; } libcutensor.2.3.0;
+libcutensor.2.5.0 { global: CUTENSOR_COMPUTE_DESC_4X16F; } libcutensor.2.4.0;
+libcutensor.2.7.0 {
+  global: cutensorCreateExtraction; cutensorCreateInsertion; cutensorExtract; cutensorInsert;
+} libcutensor.2.5.0;
+]=])
+  add_library(vgpucutensor SHARED nvidia/src/cutensor_api.cpp)
+  target_link_libraries(vgpucutensor PRIVATE vgpucudart)
+  target_include_directories(vgpucutensor PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucutensor PROPERTIES OUTPUT_NAME cutensor SOVERSION 2 VERSION 2.8)
+  target_link_options(vgpucutensor PRIVATE "-Wl,--version-script=${_cutensor_map}")
+  add_custom_command(TARGET vgpucutensor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensor.so.2.8"
+            "${CMAKE_BINARY_DIR}/shim/libcutensor.so.2"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensor.so.2.8"
+            "${CMAKE_BINARY_DIR}/shim/libcutensor.so"
+    COMMENT "Creating cuTENSOR shim symlinks (build/shim/libcutensor.so.2)")
+
+  # ---------------------------------------------------------------------------
+  # libvgpucutensornet: cuTensorNet (cuQuantum), presented as
+  # libcutensornet.so.2, on the simulator's cuTENSOR and cuSOLVER as NVIDIA's
+  # is on theirs. NVIDIA's tags its symbols libcutensornet.so.0.
+  # ---------------------------------------------------------------------------
+  vgpu_version_script(cutensornet 0 _cutensornet_map)
+  add_library(vgpucutensornet SHARED nvidia/src/cutensornet_api.cpp)
+  target_link_libraries(vgpucutensornet PRIVATE vgpucutensor vgpucusolver vgpucudart)
+  target_include_directories(vgpucutensornet PRIVATE ${CUDA_ABI_INCLUDE} include)
+  set_target_properties(vgpucutensornet PROPERTIES OUTPUT_NAME cutensornet SOVERSION 2 VERSION 2.14)
+  target_link_options(vgpucutensornet PRIVATE "-Wl,--version-script=${_cutensornet_map}")
+  add_custom_command(TARGET vgpucutensornet POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensornet.so.2.14"
+            "${CMAKE_BINARY_DIR}/shim/libcutensornet.so.2"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libcutensornet.so.2.14"
+            "${CMAKE_BINARY_DIR}/shim/libcutensornet.so"
+    COMMENT "Creating cuTensorNet shim symlinks (build/shim/libcutensornet.so.2)")
 
   # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
@@ -785,6 +981,12 @@ vgpu_unit_test(test_e2e_parity)
 vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)
 target_sources(test_cudss_solver PRIVATE nvidia/src/cudss_solver.cpp)
 target_include_directories(test_cudss_solver PRIVATE nvidia/src)
+# nvCOMP's host codecs on their own: round trips at every size and effort,
+# known streams from reference encoders and from NVIDIA's nvCOMP, and
+# corrupted input, which must be refused without reading out of bounds.
+vgpu_unit_test(test_nvcomp_codecs nvidia/tests/unit/test_nvcomp_codecs.cpp)
+target_sources(test_nvcomp_codecs PRIVATE nvidia/src/nvcomp_codecs.cpp nvidia/src/nvcomp_gdeflate.cpp)
+target_include_directories(test_nvcomp_codecs PRIVATE nvidia/src)
 # How many host threads a grid is spread over: the CPUs the process may use,
 # its cgroup's CPU quota included, not the host's count.
 add_executable(print_host_cpus tests/host_cpus/print_host_cpus.cpp)
@@ -1028,6 +1230,11 @@ set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# AMD's hipFFT, hipRAND, hipSOLVER and hipSPARSE, unmodified, where ROCm with
+# them is installed or PyTorch's ROCm wheel is.
+add_test(NAME amd_libraries COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_libraries.sh)
+set_tests_properties(amd_libraries PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1500)
 # PyTorch's ROCm build, unmodified, where a Python with it is installed
 # (VGPU_TORCH_PYTHON, or a venv under ~/.local/share/torch-rocm*).
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
@@ -1128,8 +1335,10 @@ add_test(NAME amd_hip_on_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_o
 set_tests_properties(amd_hip_on_hsa PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
+# hipCUB's and rocThrust's twenty checks run on two GPUs, each allowed ten
+# minutes by the script; a sanitizer build needs several of them.
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
@@ -1230,6 +1439,19 @@ if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_group.sh 4)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # Two ranks across two processes, the shape the RTX 3060 reference run has.
+  add_test(NAME e2e_nccl_multiproc_2
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_multiproc.sh 2)
+  set_tests_properties(e2e_nccl_multiproc_2 PROPERTIES DEPENDS vgpunccl TIMEOUT 300
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # Split, shrink, non-blocking communicators, pre-multiplied sums, all-to-all:
+  # at four ranks and at three, where splitting by parity leaves unequal halves.
+  foreach(_n 4 3)
+    add_test(NAME e2e_nccl_comm_ops_${_n}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_comm_ops.sh ${_n})
+    set_tests_properties(e2e_nccl_comm_ops_${_n} PROPERTIES DEPENDS vgpunccl TIMEOUT 300
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:")
+  endforeach()
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
@@ -1315,12 +1537,13 @@ if(TARGET vgpucublas)
   # temporary storage, decoupled look-back scan and warp primitives throughout
   # -- so running them end to end exercises far more than a hand-written kernel
   # does, and the answer is checked rather than the launch's return code.
-  # cuBLAS, cuSPARSE and cuDNN conformance programs against output an RTX 3060
-  # printed, so a routine that stops agreeing with the hardware fails without a GPU.
+  # cuBLAS, cuSPARSE, cuDNN and NPP conformance programs against output an RTX
+  # 3060 printed, so a routine that stops agreeing with the hardware fails
+  # without a GPU.
   add_test(NAME e2e_library_goldens
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_library_goldens.sh)
   set_tests_properties(e2e_library_goldens PROPERTIES
-    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn"
+    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn;vgpunppc;vgpunppig"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
@@ -1335,8 +1558,22 @@ if(TARGET vgpucublas)
   # host reference, so hosted CI covers them without PyTorch: cuFFT's cufftXt
   # API and strided multi-dimensional layouts (torch.fft), and cuSOLVER's and
   # cuBLAS's factorizations and batched solves (torch.linalg).
-  foreach(_check IN ITEMS "fft_layouts:cufft" "solver_paths:cusolver:cublas" "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse" "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse" "lt_paths:cublasLt" "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas" "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver" "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                 "dnn_backward:cudnn" "dnn_graph:cudnn")
+  foreach(_check IN ITEMS "fft_layouts:cufft" "fft_callbacks:cufft" "solver_paths:cusolver:cublas"
+                          "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse"
+                          "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "lt_paths:cublasLt" "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
+                          "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
+                          "blas_level23_paths:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
+                          "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
+                          "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp"
+                          "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
+                          "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
+                          "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
+                          "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
+                          "dnn_graph:cudnn" "dnn_attention:cudnn" "cutensor_paths:cutensor"
+                          "cutensornet_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1351,8 +1588,10 @@ if(TARGET vgpucublas)
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer
   # access and peer copies have a peer, and a managed variable two devices;
-  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both.
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver")
+  # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, as
+  # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles, and cuFFT's multi-GPU
+  # descriptors (fft_multigpu.cu).
+  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1376,6 +1615,24 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # NVSHMEM's device API: kernels built with NVIDIA's NVSHMEM headers and
+  # device library, on the simulator's host library, across a job of PEs.
+  # NVSHMEM is not in the CUDA toolkit, so this skips unless NVSHMEM_HOME or
+  # the nvidia-nvshmem pip package provides it.
+  add_test(NAME e2e_nvshmem_device COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvshmem_device.sh)
+  set_tests_properties(e2e_nvshmem_device PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+  # nvJitLink linking relocatable SASS (-rdc cubins, a host object, a static
+  # library) for each generation, and running what it links. The program
+  # passes on an RTX 3060 with NVIDIA's nvJitLink and with this one.
+  add_test(NAME e2e_nvjitlink_sass COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_jit_link_sass.sh)
+  set_tests_properties(e2e_nvjitlink_sass PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
 
   # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
   # fatbin and PTX, as an RTX 3060 answers for all three.
@@ -1432,6 +1689,13 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_atomic_cas
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_cas.sh)
   set_tests_properties(e2e_atomic_cas PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_host_atomics
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
+  set_tests_properties(e2e_host_atomics PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
@@ -1969,6 +2233,15 @@ if(TARGET vgpucudart)
     TIMEOUT 600)
 endif()
 
+# Device-side graph launch and %current_graph_exec, on both engines.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_graph_launch COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_graph_launch.sh)
+  set_tests_properties(e2e_device_graph_launch PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
 # Distributed shared memory through cooperative_groups' cluster API.
 if(TARGET vgpucudart)
   add_test(NAME e2e_dsmem_cluster COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dsmem_cluster.sh)
@@ -2011,7 +2284,7 @@ if(TARGET vgpucudart)
   # cuRAND, cuSOLVER, cuSPARSE -- each SDPA backend, autocast, and the
   # jiterator's NVRTC kernels.
   add_test(NAME e2e_pytorch_ops_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
-           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 69 nvidia/rtx5090)
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 71 nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -2026,6 +2299,16 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The rest of cuDNN's classic API -- vectorized INT8x4/INT8x32 layouts and
+  # convolution, INT8 pooling and activation, divisive normalization, tensor
+  # transform descriptors, LSTM projections and the RNN getters -- against
+  # host references; it also passes against NVIDIA's library on an RTX 3060.
+  add_test(NAME e2e_dnn_classic_paths
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh dnn_classic_paths cudnn)
+  set_tests_properties(e2e_dnn_classic_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
   # The runtime and driver APIs sharing one simulated machine.
   add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
   set_tests_properties(e2e_mixed_apis PROPERTIES

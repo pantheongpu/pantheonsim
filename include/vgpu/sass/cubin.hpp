@@ -39,6 +39,7 @@ struct CubinParam {
 struct CubinReloc {
   uint64_t offset = 0;          // in the section it patches
   std::string symbol;
+  size_t symbol_index = 0;      // in Cubin::symbols: local names repeat ($str in two units)
   uint32_t type = 0;            // 2: R_CUDA_64
   int64_t addend = 0;
 };
