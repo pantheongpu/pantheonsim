@@ -218,7 +218,34 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     p.nvml.mig = flag("mig");
     p.nvml.nvenc = flag("nvenc");
     p.nvml.nvdec = flag("nvdec");
-    p.nvml.nvjpg = flag("nvjpg");
+    auto ints = [&](const char* key) {
+      std::vector<uint32_t> out;
+      auto f = n.map.find(key);
+      if (f == n.map.end()) return out;
+      if (f->second.kind != Value::Kind::List) fail(origin, "nvml." + std::string(key) + " must be a list");
+      for (const Value& v : f->second.list) {
+        if (v.kind != Value::Kind::Int || v.i < 0)
+          fail(origin, "nvml." + std::string(key) + " must hold non-negative integers");
+        out.push_back(static_cast<uint32_t>(v.i));
+      }
+      return out;
+    };
+    p.nvml.memory_clocks_mhz = ints("memory_clocks_mhz");
+    p.nvml.pstates = ints("pstates");
+    p.nvml.graphics_step_tenths_mhz = static_cast<uint32_t>(opt_int(n, "graphics_step_tenths_mhz", origin, 0));
+    p.nvml.graphics_list_floor_mhz = static_cast<uint32_t>(opt_int(n, "graphics_list_floor_mhz", origin, 0));
+    p.nvml.graphics_floor_mhz = static_cast<uint32_t>(opt_int(n, "graphics_floor_mhz", origin, 0));
+    p.nvml.gpc_offset_min_mhz = static_cast<int32_t>(opt_int(n, "gpc_offset_min_mhz", origin, 0));
+    p.nvml.gpc_offset_max_mhz = static_cast<int32_t>(opt_int(n, "gpc_offset_max_mhz", origin, 0));
+    p.nvml.mem_offset_min_mhz = static_cast<int32_t>(opt_int(n, "mem_offset_min_mhz", origin, 0));
+    p.nvml.mem_offset_max_mhz = static_cast<int32_t>(opt_int(n, "mem_offset_max_mhz", origin, 0));
+    p.nvml.fan_min_percent = static_cast<uint32_t>(opt_int(n, "fan_min_percent", origin, 0));
+    p.nvml.fan_max_percent = static_cast<uint32_t>(opt_int(n, "fan_max_percent", origin, 0));
+    p.nvml.video_clock_floor_mhz = static_cast<uint32_t>(opt_int(n, "video_clock_floor_mhz", origin, 0));
+    p.nvml.video_clock_max_mhz = static_cast<uint32_t>(opt_int(n, "video_clock_max_mhz", origin, 0));
+    p.nvml.inforom_oem = get_str_opt(n, "inforom_oem");
+    p.nvml.inforom_image = get_str_opt(n, "inforom_image");
+    p.nvml.idle_graphics_max_mhz = static_cast<uint32_t>(opt_int(n, "idle_graphics_max_mhz", origin, 0));
   }
 
   if (auto it = doc.map.find("features"); it != doc.map.end()) {

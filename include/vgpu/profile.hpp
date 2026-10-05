@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace vgpu {
 
@@ -94,7 +95,28 @@ struct NvmlClass {
   bool mig = false;                    // supports Multi-Instance GPU
   bool nvenc = false;                  // has NVENC engines
   bool nvdec = false;                  // has NVDEC engines
-  bool nvjpg = false;                  // has NVJPG engines
+  // The clock and performance-state tables nvmlDeviceGetSupported*Clocks and
+  // nvmlDeviceGetMinMaxClockOfPState answer from. Read from a card; empty or
+  // zero where no card of the model was read, and those entry points then say
+  // NOT_SUPPORTED. Memory clocks and P-states in the order NVML lists them.
+  std::vector<uint32_t> memory_clocks_mhz;
+  std::vector<uint32_t> pstates;
+  // The graphics clocks run from the profile's sm_clock_max_mhz down in steps of
+  // graphics_step_tenths_mhz / 10 MHz to graphics_list_floor_mhz; the lowest
+  // memory clock offers only those at or below idle_graphics_max_mhz. A
+  // performance state's range reaches down to graphics_floor_mhz.
+  uint32_t graphics_step_tenths_mhz = 0;
+  uint32_t graphics_list_floor_mhz = 0;
+  uint32_t graphics_floor_mhz = 0;
+  uint32_t idle_graphics_max_mhz = 0;
+  // Overclocking offset ranges (nvmlDeviceGetClockOffsets), the fan speed range
+  // in percent, the video clock's range, and the inforom versions. All read from a
+  // card; zero or empty where none was.
+  int32_t gpc_offset_min_mhz = 0, gpc_offset_max_mhz = 0;
+  int32_t mem_offset_min_mhz = 0, mem_offset_max_mhz = 0;
+  uint32_t fan_min_percent = 0, fan_max_percent = 0;
+  uint32_t video_clock_floor_mhz = 0, video_clock_max_mhz = 0;
+  std::string inforom_oem, inforom_image;
   bool recorded = false;               // the profile has an nvml: section at all
 };
 

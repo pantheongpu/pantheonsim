@@ -47,3 +47,28 @@ nvml:
   mig: false                    # no Multi-Instance GPU (datasheet)
   nvenc: true                 # has NVENC engines (datasheet)
   nvdec: true                 # has NVDEC engines (datasheet)
+  # Clock tables, read from the card (nvmlDeviceGetSupportedMemoryClocks, GetSupportedGraphicsClocks,
+  # GetSupportedPerformanceStates and GetMinMaxClockOfPState through NVIDIA's NVML 13.0, WSL driver 596.36):
+  # five memory clocks; 227 graphics clocks per memory clock from the top in 7.5 MHz steps to 405 MHz; only 420, 412
+  # and 405 MHz at the lowest memory clock; P-states 8, 5, 3, 2 and 0, the lowest reaching down to 210 MHz.
+  # The top of the list is the profile's sm_clock_max_mhz (the card read measured 2100 MHz, this profile's silicon 2145).
+  memory_clocks_mhz: [7501, 7301, 5001, 810, 405]
+  pstates: [8, 5, 3, 2, 0]
+  graphics_step_tenths_mhz: 75
+  graphics_list_floor_mhz: 405
+  graphics_floor_mhz: 210
+  idle_graphics_max_mhz: 420
+  # Also read from the card through NVML 13.0 (WSL driver 596.36): the overclocking offset ranges
+  # (nvmlDeviceGetClockOffsets: graphics -1000..1000 MHz, memory -2000..6000 MHz), the fan range
+  # (nvmlDeviceGetMinMaxFanSpeed: 30..100 percent), the video clock's range in performance states
+  # (nvmlDeviceGetMinMaxClockOfPState: 555..1950 MHz) and the inforom versions (OEM object 2.0, image G001.0000.03.03).
+  gpc_offset_min_mhz: -1000
+  gpc_offset_max_mhz: 1000
+  mem_offset_min_mhz: -2000
+  mem_offset_max_mhz: 6000
+  fan_min_percent: 30
+  fan_max_percent: 100
+  video_clock_floor_mhz: 555
+  video_clock_max_mhz: 1950
+  inforom_oem: "2.0"
+  inforom_image: "G001.0000.03.03"

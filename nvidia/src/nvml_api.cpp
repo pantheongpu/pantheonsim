@@ -541,8 +541,25 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t device, nvmlEnableSta
   *current = *pending = NVML_FEATURE_ENABLED;
   return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMigMode(nvmlDevice_t, unsigned int*, unsigned int*) { REQUIRE_INIT();
-  return NVML_ERROR_NOT_SUPPORTED;
+// MIG mode (the instance functions are in nvml_mig.inc). A part that has no MIG
+// (the RTX 3060, T4: nvml_facts(*d).mig false) is NOT_SUPPORTED, as measured on
+// the RTX 3060 through NVIDIA's NVML 13.0 (WSL): the handle and both pointers are
+// checked first (INVALID_ARGUMENT), then NOT_SUPPORTED. A MIG part answers: the
+// current mode is always disabled, because partitioning is not simulated and a
+// device cannot be activated into a mode it would then have to honour; the
+// pending mode is what nvmlDeviceSetMigMode left in the inforom (the Persistent
+// "mig_mode" setting), which that function only ever sets to disabled.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMigMode(nvmlDevice_t device, unsigned int* current,
+                                              unsigned int* pending) {
+  NVML_DEV(device);
+  if (!current || !pending) return NVML_ERROR_INVALID_ARGUMENT;
+  if (!nvml_facts(*d).mig) return NVML_ERROR_NOT_SUPPORTED;
+  *current = NVML_DEVICE_MIG_DISABLE;
+  *pending = setting_int(d->uuid, Life::Persistent, "mig_mode", NVML_DEVICE_MIG_DISABLE) ==
+                     NVML_DEVICE_MIG_ENABLE
+                 ? NVML_DEVICE_MIG_ENABLE
+                 : NVML_DEVICE_MIG_DISABLE;
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDisplayMode(nvmlDevice_t device, nvmlEnableState_t* mode) { REQUIRE_INIT();
   unsigned int idx;
@@ -734,29 +751,39 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceIsMigDeviceHandle(nvmlDevice_t device, unsign
   *isMig = 0;
   return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxMigDeviceCount(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+// Each answer below was measured on the RTX 3060 through NVIDIA's NVML 13.0
+// (WSL), and holds for a MIG part with MIG off too (the documented answer for
+// "no MIG devices exist"): no MIG device exists, so the count is zero (the
+// documentation: "zero if MIG is not supported or enabled"), no index is found,
+// and a handle that is the physical device is not a MIG handle.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxMigDeviceCount(nvmlDevice_t device, unsigned int* count) {
+  NVML_DEV(device);
+  NVML_ARG(count);
+  *count = 0;
+  return NVML_SUCCESS;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMigDeviceHandleByIndex(nvmlDevice_t, unsigned int, nvmlDevice_t*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMigDeviceHandleByIndex(nvmlDevice_t device, unsigned int,
+                                                             nvmlDevice_t* migDevice) {
+  NVML_DEV(device);
+  NVML_ARG(migDevice);
+  return NVML_ERROR_NOT_FOUND;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetGpuInstanceId(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetGpuInstanceId(nvmlDevice_t device, unsigned int* id) {
+  NVML_DEV(device);
+  NVML_ARG(id);
+  return NVML_ERROR_INVALID_ARGUMENT;   // the handle is the device, not a MIG device
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeInstanceId(nvmlDevice_t, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeInstanceId(nvmlDevice_t device, unsigned int* id) {
+  NVML_DEV(device);
+  NVML_ARG(id);
+  return NVML_ERROR_INVALID_ARGUMENT;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDeviceHandleFromMigDeviceHandle(nvmlDevice_t, nvmlDevice_t*) {
   REQUIRE_INIT(); return NVML_ERROR_INVALID_ARGUMENT;   // no handle here is a MIG handle
 }
 
-// No data the simulator keeps. N/A in every tool, as on hardware without them.
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEncoderUtilization(nvmlDevice_t, unsigned int*, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
-}
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDecoderUtilization(nvmlDevice_t, unsigned int*, unsigned int*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
-}
+// The encoder and decoder utilization queries are in nvml_ras.inc: the card
+// answers 0, so NOT_SUPPORTED here was wrong for a GPU that has the engines.
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieThroughput(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
 }

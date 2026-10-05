@@ -38,6 +38,8 @@
 #define VGPU_NVML_13_2 1
 #endif
 
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"   // this library implements the deprecated entry points
+
 #include <fcntl.h>
 #include <sched.h>
 #include <sys/file.h>
@@ -109,6 +111,21 @@ const vgpu::NvmlClass& nvml_facts(const vgpu::telemetry::DeviceSample& d) {
   static const vgpu::NvmlClass none{};
   const vgpu::DeviceProfile* p = profile_of(d);
   return p ? p->nvml : none;
+}
+
+// A GeForce-class board. The RTX 3060 was read from the card, and what a board of
+// that class answers for the features this file is about (dynamic P-states,
+// PowerMizer, thermal settings, capability mask) is generalised to the other
+// GeForce profiles; datacenter profiles have no card behind them.
+bool consumer(const vgpu::telemetry::DeviceSample& d) { return nvml_facts(d).brand == "geforce"; }
+
+uint32_t device_index(const vgpu::telemetry::DeviceSample* d) {
+  return static_cast<uint32_t>(d - g_snap.devices);
+}
+
+// The memory bus width. One accessor, so the profile field it reads can change.
+uint32_t memory_bus_width(const vgpu::telemetry::DeviceSample& d) {
+  return nvml_facts(d).memory_bus_width_bits;
 }
 
 // ---- setters ------------------------------------------------------------------
