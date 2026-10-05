@@ -38,3 +38,11 @@ telemetry:
   ecc: true                    # supported and on by default (NVIDIA datasheet)
   memory: gddr                 # pages are retired on failure
   pcie_link: "Gen4 x16"        # most common link on real cards (371 of 374 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 384      # 384-bit GDDR6 (NVIDIA A10 datasheet; 6251 MHz x 2 x 48 B = 600 GB/s, the datasheet's bandwidth)
+  brand: nvidia
+  mig: false                    # no Multi-Instance GPU (datasheet)
+  nvenc: true                 # has NVENC engines (datasheet)
+  nvdec: true                 # has NVDEC engines (datasheet)

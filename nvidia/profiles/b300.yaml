@@ -51,3 +51,13 @@ telemetry:
   memory: hbm
   memory_temperature: true
   pcie_link: "Gen6 x16"           # NVIDIA: "PCIe Gen6 x 16 lanes"
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 8192      # 8192-bit HBM3e (eight 1024-bit stacks; the B200's, 8 TB/s)
+  brand: nvidia
+  nvlink_links: 18              # B300: 18 fifth-generation NVLink ports (1.8 TB/s total)
+  nvlink_version: 5
+  mig: true                    # supports Multi-Instance GPU (datasheet)
+  nvenc: false                 # no NVENC engines (datasheet: NVDEC and NVJPG only)
+  nvdec: true                 # has NVDEC engines (datasheet)

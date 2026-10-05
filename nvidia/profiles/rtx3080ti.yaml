@@ -40,3 +40,11 @@ telemetry:
   ecc: false                   # GeForce: no ECC
   memory: gddr                 # GDDR6X; no ECC, so nothing is retired
   pcie_link: "Gen4 x16"        # this card's link (nvidia/registers/measurements/rtx3080ti)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 384      # 384-bit GDDR6X (NVIDIA RTX 3080 Ti datasheet; 9501 MHz x 2 x 48 B = 912 GB/s, the datasheet's bandwidth); fans vary by board and were not read, so none is recorded; no NVLink (the 3080 Ti has no NVLink connector)
+  brand: geforce
+  mig: false                    # no Multi-Instance GPU (datasheet)
+  nvenc: true                 # has NVENC engines (datasheet)
+  nvdec: true                 # has NVDEC engines (datasheet)

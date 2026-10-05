@@ -158,6 +158,8 @@ nvmlReturn_t copy_string(const char* src, char* dst, unsigned int len) {
 
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
+#include "nvml_common.inc"
+
 /* ---- lifecycle ---- */
 
 VGPU_EXPORT nvmlReturn_t nvmlInit_v2(void) {
@@ -1070,6 +1072,33 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMPSComputeRunningProcesses_v2(nvmlDevice_t
   if (n) *n = 0;
   return NVML_SUCCESS;
 }
+
+/* ---- the rest of nvml.h ----
+ *
+ * Every other function the header declares, grouped by what it is for. Each file
+ * says in its own header comment what is a real answer here, what is
+ * NOT_SUPPORTED by design and why, and which header tier a guarded function
+ * belongs to (nvml_common.inc). The VGPU_NVML_SKIP_* macros exist so one group
+ * can be syntax-checked without the others.
+ */
+#ifndef VGPU_NVML_SKIP_DEVICE
+#include "nvml_device.inc"   // identity, clocks, fans, power, PCIe, thermals, affinity
+#endif
+#ifndef VGPU_NVML_SKIP_RAS
+#include "nvml_ras.inc"      // ECC, page retirement, row remapping, accounting, encoder, samples
+#endif
+#ifndef VGPU_NVML_SKIP_LINK
+#include "nvml_link.inc"     // NVLink, fabric, C2C, topology, P2P, system events
+#endif
+#ifndef VGPU_NVML_SKIP_MIG
+#include "nvml_mig.inc"      // MIG, GPU instances, compute instances
+#endif
+#ifndef VGPU_NVML_SKIP_VGPU
+#include "nvml_vgpu.inc"     // vGPU, units, GPM, confidential computing, PRM, power profiles
+#endif
+#ifndef VGPU_NVML_SKIP_SET
+#include "nvml_set.inc"      // setters, clearers and the rest that write
+#endif
 
 /* ---- undocumented internal handshake ----
  *

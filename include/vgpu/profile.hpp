@@ -78,6 +78,26 @@ struct TelemetryClass {
   uint32_t pcie_width = 0;
 };
 
+// Facts about the card that NVML reports and that no other API does, taken from
+// the vendor's public datasheets and, for the RTX 3060, read from the card
+// through NVIDIA's own NVML (each profile's yaml says which). Presentation only,
+// like TelemetryClass: nothing here reaches the execution engine. Zero or empty
+// means "not recorded", which NVML renders as NOT_SUPPORTED rather than as a
+// guess.
+struct NvmlClass {
+  uint32_t memory_bus_width_bits = 0;  // nvmlDeviceGetMemoryBusWidth
+  std::string brand;                   // "geforce" | "nvidia" (nvmlDeviceGetBrand)
+  uint32_t fans = 0;                   // fans on the board; 0 when passive or not recorded
+  uint32_t nvlink_links = 0;           // NVLink ports the part has (not links that are cabled)
+  uint32_t nvlink_version = 0;         // NVLink generation of those ports
+  uint32_t c2c_links = 0;              // NVLink-C2C links to a Grace CPU
+  bool mig = false;                    // supports Multi-Instance GPU
+  bool nvenc = false;                  // has NVENC engines
+  bool nvdec = false;                  // has NVDEC engines
+  bool nvjpg = false;                  // has NVJPG engines
+  bool recorded = false;               // the profile has an nvml: section at all
+};
+
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd"
@@ -97,6 +117,7 @@ struct DeviceProfile {
   bool verified = false;  // true once hardware characterization confirms values
   Limits limits;
   TelemetryClass telemetry;
+  NvmlClass nvml;
   std::map<std::string, bool> features;
 
   // Shared memory the driver keeps back in every block, on top of what the

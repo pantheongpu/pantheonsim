@@ -41,3 +41,14 @@ telemetry:
   # The Hopper die reaches its Grace CPU over NVLink-C2C; the PCIe link the
   # driver reports is x1.
   pcie_link: "Gen4 x1"         # most common link on real cards (365 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 6144      # 6144-bit HBM3 (NVIDIA GH200 datasheet; 2619 MHz x 2 x 768 B = 4.0 TB/s, the datasheet's 4 TB/s)
+  brand: nvidia
+  nvlink_links: 18              # GH200: 18 fourth-generation NVLink ports to other GPUs, plus the one NVLink-C2C link to its Grace CPU
+  nvlink_version: 4
+  c2c_links: 1                 # the Grace-Hopper superchip's NVLink-C2C (datasheet)
+  mig: true                    # supports Multi-Instance GPU (datasheet)
+  nvenc: false                 # no NVENC engines (datasheet: NVDEC and NVJPG only)
+  nvdec: true                 # has NVDEC engines (datasheet)

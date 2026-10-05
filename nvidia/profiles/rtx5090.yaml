@@ -43,3 +43,11 @@ telemetry:
   ecc: false                   # GeForce: no ECC
   memory: gddr
   pcie_link: "Gen5 x8"         # most common link on real cards (40 of 61 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 512      # 512-bit GDDR7 (NVIDIA RTX 5090 datasheet; 14001 MHz x 2 x 64 B = 1.79 TB/s, the datasheet's bandwidth); fans vary by board and were not read, so none is recorded; no NVLink
+  brand: geforce
+  mig: false                    # no Multi-Instance GPU (datasheet)
+  nvenc: true                 # has NVENC engines (datasheet)
+  nvdec: true                 # has NVDEC engines (datasheet)

@@ -38,3 +38,12 @@ telemetry:
   ecc: false                   # GeForce: no ECC
   memory: gddr                 # no ECC, so nothing is retired
   pcie_link: "Gen4 x16"        # most common link on real cards (275 of 335 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 192      # 192-bit GDDR6, read from the card: nvmlDeviceGetMemoryBusWidth through NVIDIA's NVML 13.0 (WSL driver 596.36) answers 192; brand 5 (NVML_BRAND_GEFORCE); 2 fans (nvmlDeviceGetNumFans); no NVLink (every NVLink query is NOT_SUPPORTED)
+  brand: geforce
+  fans: 2                     # measured on the card (nvmlDeviceGetNumFans)
+  mig: false                    # no Multi-Instance GPU (datasheet)
+  nvenc: true                 # has NVENC engines (datasheet)
+  nvdec: true                 # has NVDEC engines (datasheet)

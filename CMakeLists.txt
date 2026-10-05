@@ -1400,6 +1400,28 @@ set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# The rest of NVML (nvml.h in full): one test per category, each run once per
+# profile named, all through run_nvml_category.sh. Coverage and the card-derived
+# return-code matrix are their own scripts. See nvidia/docs/nvml.md.
+add_test(NAME nvml_coverage COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_coverage.sh)
+set_tests_properties(nvml_coverage PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_NVML_INCLUDE=${CUDA_ABI_INCLUDE}" TIMEOUT 120)
+add_test(NAME nvml_matrix COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_matrix.sh)
+set_tests_properties(nvml_matrix PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_NVML_INCLUDE=${CUDA_ABI_INCLUDE}" TIMEOUT 300)
+foreach(_nvml_cat "device;nvidia/rtx3060;nvidia/t4;nvidia/h100"
+                  "ras;nvidia/t4;nvidia/h100;nvidia/rtx3060"
+                  "link;nvidia/h100;nvidia/rtx3060"
+                  "setters;nvidia/t4;nvidia/rtx3060;nvidia/a100"
+                  "mig;nvidia/a100;nvidia/rtx3060"
+                  "vgpu;nvidia/t4;nvidia/rtx3060")
+  list(GET _nvml_cat 0 _name)
+  list(REMOVE_AT _nvml_cat 0)
+  add_test(NAME nvml_${_name}
+    COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_category.sh ${_name} ${_nvml_cat})
+  set_tests_properties(nvml_${_name} PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+endforeach()
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_isolation_fallback.sh)

@@ -38,3 +38,11 @@ telemetry:
   ecc: true                    # supported and on by default (NVIDIA datasheet)
   memory: gddr                 # pages are retired on failure
   pcie_link: "Gen3 x8"         # most common link on real cards (596 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 256      # 256-bit GDDR6 (NVIDIA T4 datasheet; 5001 MHz x 2 x 32 B = 320 GB/s, the datasheet's bandwidth)
+  brand: nvidia
+  mig: false                    # no Multi-Instance GPU (datasheet)
+  nvenc: true                 # has NVENC engines (datasheet)
+  nvdec: true                 # has NVDEC engines (datasheet)

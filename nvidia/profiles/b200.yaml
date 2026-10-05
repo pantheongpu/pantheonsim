@@ -49,3 +49,13 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: true     # reported on every real run in the benchmark database
   pcie_link: "Gen5 x16"        # most common link on real cards (30 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 8192      # 8192-bit HBM3e (eight 1024-bit stacks; 4000 MHz x 2 x 1024 B = 8 TB/s, the datasheet's bandwidth)
+  brand: nvidia
+  nvlink_links: 18              # B200: 18 fifth-generation NVLink ports (1.8 TB/s total)
+  nvlink_version: 5
+  mig: true                    # supports Multi-Instance GPU (datasheet)
+  nvenc: false                 # no NVENC engines (datasheet: NVDEC and NVJPG only)
+  nvdec: true                 # has NVDEC engines (datasheet)

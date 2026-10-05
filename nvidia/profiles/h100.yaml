@@ -44,3 +44,13 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: false    # most real runs report no memory sensor
   pcie_link: "Gen5 x16"        # most common link on real cards (864 runs in the benchmark database)
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 5120      # 5120-bit HBM3 (NVIDIA H100 datasheet; 2619 MHz x 2 x 640 B = 3.35 TB/s, the datasheet's bandwidth)
+  brand: nvidia
+  nvlink_links: 18              # H100 SXM5: 18 fourth-generation NVLink ports (900 GB/s total)
+  nvlink_version: 4
+  mig: true                    # supports Multi-Instance GPU (datasheet)
+  nvenc: false                 # no NVENC engines (datasheet: NVDEC and NVJPG only)
+  nvdec: true                 # has NVDEC engines (datasheet)

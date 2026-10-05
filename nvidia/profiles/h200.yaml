@@ -59,3 +59,13 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: false    # most real runs report no memory sensor
   pcie_link: "Gen5 x16"        # datasheet; the database's H200 runs are on a Grace host
+
+# Facts only NVML reports. Sources are per line; none reaches the execution engine.
+nvml:
+  memory_bus_width_bits: 6144      # 6144-bit HBM3e (six 1024-bit stacks, NVIDIA H200 datasheet; 3201 MHz x 2 x 768 B = 4.9 TB/s, the datasheet's 4.8 TB/s)
+  brand: nvidia
+  nvlink_links: 18              # H200 SXM: 18 fourth-generation NVLink ports (900 GB/s total)
+  nvlink_version: 4
+  mig: true                    # supports Multi-Instance GPU (datasheet)
+  nvenc: false                 # no NVENC engines (datasheet: NVDEC and NVJPG only)
+  nvdec: true                 # has NVDEC engines (datasheet)

@@ -195,6 +195,32 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     }
   }
 
+  // Optional: facts only NVML reports (NvmlClass says where they come from).
+  if (auto it = doc.map.find("nvml"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::Map) fail(origin, "'nvml' must be a map");
+    const Value& n = it->second;
+    p.nvml.recorded = true;
+    p.nvml.memory_bus_width_bits = static_cast<uint32_t>(opt_int(n, "memory_bus_width_bits", origin, 0));
+    p.nvml.brand = get_str_opt(n, "brand");
+    if (!p.nvml.brand.empty() && p.nvml.brand != "geforce" && p.nvml.brand != "nvidia")
+      fail(origin, "nvml.brand must be geforce or nvidia, got: " + p.nvml.brand);
+    p.nvml.fans = static_cast<uint32_t>(opt_int(n, "fans", origin, 0));
+    p.nvml.nvlink_links = static_cast<uint32_t>(opt_int(n, "nvlink_links", origin, 0));
+    p.nvml.nvlink_version = static_cast<uint32_t>(opt_int(n, "nvlink_version", origin, 0));
+    p.nvml.c2c_links = static_cast<uint32_t>(opt_int(n, "c2c_links", origin, 0));
+    auto flag = [&](const char* key) {
+      auto f = n.map.find(key);
+      if (f == n.map.end()) return false;
+      if (f->second.kind != Value::Kind::Bool)
+        fail(origin, "nvml." + std::string(key) + " must be true/false");
+      return f->second.b;
+    };
+    p.nvml.mig = flag("mig");
+    p.nvml.nvenc = flag("nvenc");
+    p.nvml.nvdec = flag("nvdec");
+    p.nvml.nvjpg = flag("nvjpg");
+  }
+
   if (auto it = doc.map.find("features"); it != doc.map.end()) {
     if (it->second.kind != Value::Kind::Map) fail(origin, "'features' must be a map");
     for (auto& [k, v] : it->second.map) {
