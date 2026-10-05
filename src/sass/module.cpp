@@ -73,7 +73,11 @@ const char* const kBuiltins[] = {
     "__cudaCDP2StreamCreateWithFlags", "__cudaCDP2EventCreateWithFlags", "__cudaCDP2StreamDestroy",
     "__cudaCDP2EventDestroy", "__cudaCDP2EventRecord", "__cudaCDP2EventRecord_ptsz",
     "__cudaCDP2EventRecordWithFlags", "__cudaCDP2EventRecordWithFlags_ptsz", "__cudaCDP2StreamWaitEvent",
-    "__cudaCDP2StreamWaitEvent_ptsz"};
+    "__cudaCDP2StreamWaitEvent_ptsz",
+    // Graph launch from the device, and the two driver entry points the
+    // device runtime library's own last-error code is built on (its
+    // GetLastError reads the per-thread error, SetLastError writes it).
+    "cudaGraphLaunch", "__cuda_syscall_cnpv2GetLastError", "__cuda_syscall_cnpv2SetLastError"};
 
 bool is_bank(const std::string& name, unsigned* bank) {
   // ".nv.constant<N>" or ".nv.constant<N>.<kernel>"
@@ -249,6 +253,12 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       if (!code && dst == section_va.end())
         throw Error(Err::UnsupportedPtx, "cubin: relocations in " + s.name + " are not supported yet");
       for (const CubinReloc& r : s.relocs) {
+        // In data, R_CUDA_G64 (4) is an address too: NVIDIA's device link
+        // writes it for a __device__ pointer initialised to a variable's
+        // address (&array[2]), which nvJitLink's output keeps for the loader;
+        // and so is R_CUDA_FUNC_DESC_64 (35), a function pointer in a table
+        // (the device runtime -rdc builds link in has one), since a
+        // function's descriptor here is its code address.
         const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 62 || r.type == 63 ||
                                    r.type == 75)
                                 : (r.type == 2 || r.type == 4 || r.type == 35);
@@ -301,6 +311,29 @@ bool runs_instr(const Instr& ins);   // exec.cpp
 
 std::string unsupported(const uint8_t* image, size_t size) {
   const Cubin c = parse_cubin(image, size);
+  // Relocations the loader applies (see load), against symbols it can
+  // resolve: the module's own, or a function VirtualGPU provides (the device
+  // runtime's entry points included). Anything else leaves the module to its
+  // PTX rather than failing to load.
+  for (const CubinSection& s : c.sections) {
+    if (s.relocs.empty() || s.name.rfind(".debug_", 0) == 0 || s.name.rfind(".nv_debug", 0) == 0) continue;
+    const bool code = s.name.rfind(".text.", 0) == 0;
+    for (const CubinReloc& r : s.relocs) {
+      const bool known = code ? (r.type == 56 || r.type == 57 || r.type == 58 || r.type == 62 || r.type == 63 ||
+                                 r.type == 75)
+                              : (r.type == 2 || r.type == 4 || r.type == 35);
+      if (!known) return "relocation type " + std::to_string(r.type) + " in " + s.name;
+      // The device runtime library's driver entry points (__cuda_syscall_*)
+      // are left undefined by every -rdc build that uses dynamic parallelism;
+      // only the library's own code calls them, and the builtins run in its
+      // place, so the loader gives them stub addresses (load) and the module
+      // stays on SASS.
+      bool resolved = std::find(std::begin(kBuiltins), std::end(kBuiltins), r.symbol) != std::end(kBuiltins) ||
+                      r.symbol.rfind("__cuda_syscall_", 0) == 0;
+      for (const CubinSymbol& sym : c.symbols) resolved = resolved || (sym.name == r.symbol && !sym.section.empty());
+      if (!resolved) return "a call to " + r.symbol + ", which VirtualGPU's SASS path does not provide";
+    }
+  }
   // VGPU_SASS_REFUSE=<op>: treat that op as unsupported, for testing the
   // fallback to PTX.
   const char* refuse = std::getenv("VGPU_SASS_REFUSE");

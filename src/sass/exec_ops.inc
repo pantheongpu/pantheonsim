@@ -3117,6 +3117,43 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     });
     return;
   }
+  // The device runtime's per-thread error, through the two driver entry
+  // points its library (linked in by -rdc builds) is built on, as the PTX
+  // engine's exec_device_get_last_error: GetLastError reads it without
+  // clearing it, SetLastError writes it.
+  if (name == "__cuda_syscall_cnpv2GetLastError") {
+    each_lane(ex, [&](unsigned l) { w.reg(4, l) = w.device_error[l]; });
+    return;
+  }
+  if (name == "__cuda_syscall_cnpv2SetLastError") {
+    each_lane(ex, [&](unsigned l) {
+      w.device_error[l] = w.reg(4, l);
+      w.reg(4, l) = 0;
+    });
+    return;
+  }
+  if (name == "cudaGraphLaunch") {
+    // (graphExec, stream) from a kernel, as the PTX engine's
+    // exec_device_graph_launch: the runtime that launched this kernel's graph
+    // checks and queues it, and a launch from outside any graph, or of a
+    // handle that is no device graph, faults as on an RTX 3060.
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t g = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
+      const uint64_t s = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
+      int rc = -1;
+      if (cfg_.graph_launcher) rc = cfg_.graph_launcher->launch(g, s);
+      if (rc < 0) {
+        fault(w, ins, l,
+              cfg_.graph_launcher ? std::string("device-side cudaGraphLaunch of a handle that is not a graph "
+                                                "instantiated for device launch")
+                                  : std::string("device-side cudaGraphLaunch in a kernel that is not running in a graph"),
+              Err::InvalidPointer);
+        return;
+      }
+      w.reg(4, l) = static_cast<uint32_t>(rc);
+    });
+    return;
+  }
   if (name == "cudaGraphSetConditional") {
     // (handle, value): sets a conditional handle's value, which the graph's
     // conditional node reads once the kernel is done -- as the PTX engine's
@@ -3197,7 +3234,7 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
   };
   const auto ret = [&](unsigned l, uint32_t err) {   // a cudaError_t, kept when it is an error
     w.reg(4, l) = err;
-    if (err) w.dev_err[l] = err;
+    if (err) w.device_error[l] = err;
   };
   const auto store = [&](unsigned l, uint64_t addr, uint64_t v, uint32_t n) {
     // Usually a local variable's address (int d; cudaGetDevice(&d)): a
@@ -3281,8 +3318,8 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
   if (name == "__cudaCDP2GetLastError" || name == "__cudaCDP2PeekAtLastError") {
     const bool clear = name == "__cudaCDP2GetLastError";
     each_lane(ex, [&](unsigned l) {
-      w.reg(4, l) = w.dev_err[l];
-      if (clear) w.dev_err[l] = 0;
+      w.reg(4, l) = w.device_error[l];
+      if (clear) w.device_error[l] = 0;
     });
     return true;
   }
