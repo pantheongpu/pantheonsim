@@ -968,6 +968,7 @@ vgpu_unit_test(test_dsmem)
 vgpu_unit_test(test_barriers)
 # Dynamic parallelism at the PTX level.
 vgpu_unit_test(test_dynpar)
+vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
