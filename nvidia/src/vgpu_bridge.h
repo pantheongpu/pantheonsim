@@ -27,12 +27,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-namespace vgpu::ptx { struct EntryFn; }
-namespace vgpu::exec { class SymbolTable; }
+#include "vgpu/exec/launch.hpp"
+#include "vgpu/ptx/ast.hpp"
 
 // What libcuda says about one of its functions, for libcudart to launch it:
 // the device it belongs to, the code to run and the module's symbols.
 struct VgpuDriverFuncInfo {
+  void* function = nullptr;   // the CUfunction (what a CUkernel resolves to)
+  void* kernel = nullptr;     // the CUkernel it was made from, or null
   int device = 0;
   const vgpu::ptx::EntryFn* fn = nullptr;
   const vgpu::exec::SymbolTable* syms = nullptr;
@@ -122,7 +124,7 @@ struct VgpuDriverFuncInfo {
   X(cuGraphExecDestroy, (void* exec), (exec)) \
   X(cuGraphLaunch, (void* exec, void* stream), (exec, stream)) \
   X(cuGraphUpload, (void* exec, void* stream), (exec, stream)) \
-  X(cuGraphExecUpdate, (void* exec, void* g, void* errNode, int* result), (exec, g, errNode, result)) \
+  X(cuGraphExecUpdate, (void* exec, void* g, void** errNode, int* result), (exec, g, errNode, result)) \
   X(cuGraphExecUpdate_v2, (void* exec, void* g, void* info), (exec, g, info)) \
   X(cuGraphExecKernelNodeSetParams, (void* exec, void* node, const void* p), (exec, node, p)) \
   X(cuGraphExecKernelNodeSetParams_v2, (void* exec, void* node, const void* p), (exec, node, p)) \
@@ -155,14 +157,15 @@ struct VgpuDriverFuncInfo {
   X(cuUserObjectRelease, (void* obj, unsigned count), (obj, count)) \
   X(cuGraphRetainUserObject, (void* g, void* obj, unsigned count, unsigned flags), (g, obj, count, flags)) \
   X(cuGraphReleaseUserObject, (void* g, void* obj, unsigned count), (g, obj, count)) \
-  X(cuStreamBeginCapture, (void* stream, int mode), (stream, mode)) \
+  X(cuStreamBeginCapture_v2, (void* stream, int mode), (stream, mode)) \
   X(cuStreamBeginCaptureToGraph, (void* stream, void* g, void* const* deps, const void* edge, size_t n, int mode), \
     (stream, g, deps, edge, n, mode)) \
   X(cuStreamEndCapture, (void* stream, void** g), (stream, g)) \
-  X(cuStreamGetCaptureInfo, (void* stream, int* status, unsigned long long* id, void** g, \
+  X(cuStreamGetCaptureInfo_v3, (void* stream, int* status, unsigned long long* id, void** g, \
                               const void* const** deps, const void** edge, size_t* n), \
     (stream, status, id, g, deps, edge, n)) \
-  X(cuStreamUpdateCaptureDependencies, (void* stream, void** deps, const void* edge, size_t n, unsigned flags), \
+  X(cuStreamUpdateCaptureDependencies, (void* stream, void** deps, size_t n, unsigned flags), (stream, deps, n, flags)) \
+  X(cuStreamUpdateCaptureDependencies_v2, (void* stream, void** deps, const void* edge, size_t n, unsigned flags), \
     (stream, deps, edge, n, flags)) \
   X(cuStreamIsCapturing, (void* stream, int* status), (stream, status)) \
   X(cuThreadExchangeStreamCaptureMode, (int* mode), (mode)) \
@@ -191,6 +194,12 @@ int vgpu_driver_event_record_now_v1(void* event);
 int vgpu_driver_stream_info_v1(void* stream, unsigned* flags, int* priority, int* device);
 // The device the calling thread's current context is on, or -1.
 int vgpu_driver_current_device_v1();
+// A context handle's device (0 if it is not a live context), and a device's
+// primary context handle (creating nothing: null when none is retained).
+int vgpu_driver_ctx_device_v1(void* ctx, int* device);
+void* vgpu_driver_primary_ctx_v1(int device);
+// A graph memcpy node that touches a CUDA array runs through cuMemcpy3D.
+int vgpu_driver_copy3d_v1(const void* copy3d);
 }
 
 #endif  // VGPU_BRIDGE_H_

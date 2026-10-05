@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -31,6 +32,9 @@
 #include <set>
 
 #include "error_names.hpp"
+#include "launch_params.hpp"
+#include "vgpu_bridge.h"
+#include "vgpu_cu_abi.h"
 #include "fatbin.hpp"
 #include "vgpu/sass/cubin.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -69,6 +73,7 @@ struct FuncRec {
   unsigned shared_bytes = 0;
   std::vector<uint8_t> params;   // the parameter buffer, as written
   size_t param_size = 0;         // cuParamSetSize
+  uintptr_t kernel = 0;          // the CUkernel this function was taken from, or 0
 };
 
 // A context-independent code library (CUDA 12+ cuLibrary API): holds PTX
@@ -81,11 +86,17 @@ struct LibRec {
 struct KernelRec {
   uintptr_t library = 0;
   std::string name;
+  std::unordered_map<int, uintptr_t> functions;   // the function of this kernel on each device, as made
 };
 
 struct EventRec {
   bool recorded = false;
   bool timing = true;   // false for CU_EVENT_DISABLE_TIMING
+  // Last recorded on a capturing stream: which capture and where it had got to,
+  // which a cuStreamWaitEvent on it depends on (as the runtime's events do).
+  bool captured = false;
+  unsigned long long capture_id = 0;
+  std::vector<void*> capture_deps;
   struct timespec when {};
 };
 
@@ -332,6 +343,8 @@ int current_device(ShimState& s) {
 }
 
 vgpu::runtime::Device& current(ShimState& s) { return s.rt->device(current_device(s)); }
+
+#include "driver_bridge.inc"
 
 // Device VA windows are disjoint, so a device pointer names its own device.
 // Resolving against the current context instead would make a copy between two
@@ -654,10 +667,17 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
   if (it == s.kernels.end())
     throw vgpu::Error::make(vgpu::Err::InvalidValue, "invalid kernel handle");
   int dev = current_device(s);
+  // The same function each time, as on the card (cuKernelGetFunction twice, and
+  // the function a graph's kernel node reports, are one handle).
+  if (const auto cached = it->second.functions.find(dev);
+      cached != it->second.functions.end() && s.functions.count(cached->second))
+    return cached->second;
   uint64_t mid = library_module_on(s, it->second.library, dev);
   const vgpu::ptx::EntryFn* fn = s.rt->device(dev).get_function(mid, it->second.name);
   uintptr_t fh = make_handle(s, kTagFunc);
   s.functions[fh] = {dev, it->second.library, fn, s.rt->device(dev).symbols(mid)};
+  s.functions[fh].kernel = kernel_handle;
+  it->second.functions[dev] = fh;
   return fh;
 }
 
@@ -1621,25 +1641,36 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     auto it = s.functions.find(fh);
     if (it == s.functions.end()) return CUDA_ERROR_NOT_FOUND;
     const FuncRec& rec = it->second;
-    // Every stream is the synchronous default stream in this engine: legacy
-    // (0/1), per-thread (2), and created stream handles all execute in order.
-    (void)hStream;
-    if (extra != nullptr)
-      throw vgpu::Error::make(vgpu::Err::Unsupported,
-                              "the `extra` parameter-packing path of cuLaunchKernel is not "
-                              "implemented; use kernelParams");
+    // Aimed at a capturing stream, the launch is recorded into its graph as a
+    // kernel node, and what the stream is told is the node's.
+    if (const int cap = capture_kernel(s, hStream, reinterpret_cast<CUfunction>(fh), gridDimX, gridDimY, gridDimZ,
+                                       blockDimX, blockDimY, blockDimZ, sharedMemBytes, kernelParams, extra,
+                                       cooperative);
+        cap != kNotCapturing)
+      return static_cast<CUresult>(cap);
+    // Every other stream is the synchronous default stream in this engine:
+    // legacy (0/1), per-thread (2), and created stream handles all execute in order.
     const auto& params = rec.fn->params;
-    if (!kernelParams && !params.empty()) return CUDA_ERROR_INVALID_VALUE;
     std::vector<std::vector<uint8_t>> args(params.size());
-    for (size_t i = 0; i < params.size(); ++i) {
-      if (!kernelParams[i])
-        throw vgpu::Error::make(vgpu::Err::InvalidValue, "kernelParams[", i, "] is NULL (kernel '",
-                                rec.fn->name, "' takes ", params.size(), " parameters)");
-      // The whole parameter: a struct passed by value is a .b8 array in PTX,
-      // whose element is one byte and whose size is the struct's.
-      uint32_t size = params[i].size;
-      args[i].resize(size);
-      std::memcpy(args[i].data(), kernelParams[i], size);
+    if (kernelParams) {
+      for (size_t i = 0; i < params.size(); ++i) {
+        if (!kernelParams[i])
+          throw vgpu::Error::make(vgpu::Err::InvalidValue, "kernelParams[", i, "] is NULL (kernel '",
+                                  rec.fn->name, "' takes ", params.size(), " parameters)");
+        // The whole parameter: a struct passed by value is a .b8 array in PTX,
+        // whose element is one byte and whose size is the struct's.
+        uint32_t size = params[i].size;
+        args[i].resize(size);
+        std::memcpy(args[i].data(), kernelParams[i], size);
+      }
+    } else if (extra != nullptr) {
+      // The packed block of CU_LAUNCH_PARAM_BUFFER_POINTER / _SIZE.
+      const void* block = nullptr;
+      size_t size = 0;
+      if (!vgpu_launch::read_extra(extra, &block, &size)) return CUDA_ERROR_INVALID_VALUE;
+      args = vgpu_launch::unpack(*rec.fn, block, size);
+    } else if (!params.empty()) {
+      return CUDA_ERROR_INVALID_VALUE;
     }
     vgpu::exec::LaunchConfig cfg;
     cfg.grid = {gridDimX, gridDimY, gridDimZ};
@@ -2016,23 +2047,35 @@ VGPU_EXPORT CUresult cuLaunch(CUfunction f) { return launch_grid("cuLaunch", f, 
 
 /* ---- memcpy/memset variants (everything is synchronous) ---- */
 
-VGPU_EXPORT CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr d, const void* h, size_t n, CUstream) {
+// Aimed at a capturing stream, a copy is recorded as a node (nothing is copied
+// of zero bytes) and the call reports the node's result.
+#define VGPU_CAPTURE_COPY(stream, dst, src, n)                                                       \
+  if (const int cap_ = with_capture([&](ShimState& s_) {                                           \
+        if (!stream_capturing(s_, stream)) return kNotCapturing;                                    \
+        return (n) == 0 ? 0 : capture_copy(s_, stream, (const void*)(dst), (const void*)(src), (n)); \
+      });                                                                                          \
+      cap_ != kNotCapturing)                                                                       \
+    return static_cast<CUresult>(cap_);
+VGPU_EXPORT CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr d, const void* h, size_t n, CUstream stream) {
+  VGPU_CAPTURE_COPY(stream, d, h, n)
   return cuMemcpyHtoD_v2(d, h, n);
 }
-VGPU_EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr d, const void* h, size_t n, CUstream) {
-  return cuMemcpyHtoD_v2(d, h, n);
+VGPU_EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr d, const void* h, size_t n, CUstream stream) {
+  return cuMemcpyHtoDAsync_v2(d, h, n, stream);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoHAsync_v2(void* h, CUdeviceptr d, size_t n, CUstream) {
+VGPU_EXPORT CUresult cuMemcpyDtoHAsync_v2(void* h, CUdeviceptr d, size_t n, CUstream stream) {
+  VGPU_CAPTURE_COPY(stream, h, d, n)
   return cuMemcpyDtoH_v2(h, d, n);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoHAsync(void* h, CUdeviceptr d, size_t n, CUstream) {
-  return cuMemcpyDtoH_v2(h, d, n);
+VGPU_EXPORT CUresult cuMemcpyDtoHAsync(void* h, CUdeviceptr d, size_t n, CUstream stream) {
+  return cuMemcpyDtoHAsync_v2(h, d, n, stream);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream) {
+VGPU_EXPORT CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream stream) {
+  VGPU_CAPTURE_COPY(stream, a, b, n)
   return cuMemcpyDtoD_v2(a, b, n);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream) {
-  return cuMemcpyDtoD_v2(a, b, n);
+VGPU_EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream stream) {
+  return cuMemcpyDtoDAsync_v2(a, b, n, stream);
 }
 
 // No profiler collects anything to start or stop; the card succeeds.
@@ -2083,7 +2126,8 @@ VGPU_EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) {
   std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), n);
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream) {
+VGPU_EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream stream) {
+  VGPU_CAPTURE_COPY(stream, dst, src, n)
   return cuMemcpy(dst, src, n);
 }
 
@@ -2290,13 +2334,24 @@ VGPU_EXPORT CUresult cuMemsetD32_v2(CUdeviceptr d, unsigned int v, size_t n) {
 VGPU_EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { return cuMemsetD8_v2(d, v, n); }
 VGPU_EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { return cuMemsetD16_v2(d, v, n); }
 VGPU_EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { return cuMemsetD32_v2(d, v, n); }
-VGPU_EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream) {
+// A fill aimed at a capturing stream is a memset node.
+#define VGPU_CAPTURE_FILL(stream, d, pitch, v, elem, w, h)                                          \
+  if (const int cap_ = with_capture([&](ShimState& s_) {                                           \
+        if (!stream_capturing(s_, stream)) return kNotCapturing;                                    \
+        return (w) == 0 || (h) == 0 ? 0 : capture_fill(s_, stream, d, pitch, v, elem, w, h);        \
+      });                                                                                          \
+      cap_ != kNotCapturing)                                                                       \
+    return static_cast<CUresult>(cap_);
+VGPU_EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream stream) {
+  VGPU_CAPTURE_FILL(stream, d, 0, v, 1u, n, size_t{1})
   return memset_impl("cuMemsetD8", d, 0, v, n, 1);
 }
-VGPU_EXPORT CUresult cuMemsetD16Async(CUdeviceptr d, unsigned short v, size_t n, CUstream) {
+VGPU_EXPORT CUresult cuMemsetD16Async(CUdeviceptr d, unsigned short v, size_t n, CUstream stream) {
+  VGPU_CAPTURE_FILL(stream, d, 0, v, 2u, n, size_t{1})
   return memset_impl("cuMemsetD16", d, 0, v, n, 1);
 }
-VGPU_EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream) {
+VGPU_EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream stream) {
+  VGPU_CAPTURE_FILL(stream, d, 0, v, 4u, n, size_t{1})
   return memset_impl("cuMemsetD32", d, 0, v, n, 1);
 }
 // Width counts elements, the pitch bytes.
@@ -2319,15 +2374,18 @@ VGPU_EXPORT CUresult cuMemsetD2D32(CUdeviceptr d, size_t pitch, unsigned int v, 
   return cuMemsetD2D32_v2(d, pitch, v, w, h);
 }
 VGPU_EXPORT CUresult cuMemsetD2D8Async(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h,
-                                       CUstream) {
+                                       CUstream stream) {
+  VGPU_CAPTURE_FILL(stream, d, pitch, v, 1u, w, h)
   return memset_impl("cuMemsetD2D8", d, pitch, v, w, h);
 }
 VGPU_EXPORT CUresult cuMemsetD2D16Async(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h,
-                                        CUstream) {
+                                        CUstream stream) {
+  VGPU_CAPTURE_FILL(stream, d, pitch, v, 2u, w, h)
   return memset_impl("cuMemsetD2D16", d, pitch, v, w, h);
 }
 VGPU_EXPORT CUresult cuMemsetD2D32Async(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h,
-                                        CUstream) {
+                                        CUstream stream) {
+  VGPU_CAPTURE_FILL(stream, d, pitch, v, 4u, w, h)
   return memset_impl("cuMemsetD2D32", d, pitch, v, w, h);
 }
 
@@ -3312,7 +3370,12 @@ VGPU_EXPORT CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D* p) {
   });
 }
 VGPU_EXPORT CUresult cuMemcpy3D(const CUDA_MEMCPY3D* p) { return cuMemcpy3D_v2(p); }
-VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream) { return cuMemcpy3D_v2(p); }
+VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream stream) {
+  if (p)
+    if (const int cap = with_capture([&](ShimState& s_) { return capture_copy3d(s_, stream, *p); }); cap != kNotCapturing)
+      return static_cast<CUresult>(cap);
+  return cuMemcpy3D_v2(p);
+}
 VGPU_EXPORT CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* p, CUstream st) { return cuMemcpy3DAsync_v2(p, st); }
 VGPU_EXPORT CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D* c) {
   return api("cuMemcpy2D", true, false, [&](ShimState& s) {
@@ -3323,21 +3386,33 @@ VGPU_EXPORT CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D* c) {
 VGPU_EXPORT CUresult cuMemcpy2D(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
 VGPU_EXPORT CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
 VGPU_EXPORT CUresult cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
-VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream) { return cuMemcpy2D_v2(c); }
+VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream stream) {
+  if (c)
+    if (const int cap = with_capture([&](ShimState& s_) { return capture_copy3d(s_, stream, as3d(*c)); });
+        cap != kNotCapturing)
+      return static_cast<CUresult>(cap);
+  return cuMemcpy2D_v2(c);
+}
 VGPU_EXPORT CUresult cuMemcpy2DAsync(const CUDA_MEMCPY2D* c, CUstream st) { return cuMemcpy2DAsync_v2(c, st); }
 
 // Stream-ordered allocation: the stream is synchronous, so the memory is
 // ready at once. A request for 0 bytes succeeds, as the card's does.
-VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream) {
+VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream stream) {
   if (!dptr) return CUDA_ERROR_INVALID_VALUE;
   if (bytesize == 0) {
     *dptr = 0;
     return CUDA_SUCCESS;
   }
+  // On a capturing stream the allocation is a node the capture's graph owns.
+  if (const int cap = with_capture([&](ShimState& s_) { return capture_alloc(s_, stream, bytesize, dptr); });
+      cap != kNotCapturing)
+    return static_cast<CUresult>(cap);
   return cuMemAlloc_v2(dptr, bytesize);
 }
-VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
+VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream stream) {
   if (dptr == 0) return CUDA_SUCCESS;
+  if (const int cap = with_capture([&](ShimState& s_) { return capture_free(s_, stream, dptr); }); cap != kNotCapturing)
+    return static_cast<CUresult>(cap);
   return cuMemFree_v2(dptr);
 }
 
@@ -3442,16 +3517,48 @@ VGPU_EXPORT CUresult cuStreamDestroy_v2(CUstream stream) {
   });
 }
 VGPU_EXPORT CUresult cuStreamDestroy(CUstream stream) { return cuStreamDestroy_v2(stream); }
-VGPU_EXPORT CUresult cuStreamSynchronize(CUstream) { return cuCtxSynchronize(); }
+VGPU_EXPORT CUresult cuStreamSynchronize(CUstream stream) {
+  // A capture cannot be waited for: its work has not run and will not until the
+  // graph is launched. The capture is invalidated.
+  if (const int cap = with_capture([&](ShimState& s_) { return capture_refuse_sync(s_, stream); }); cap != kNotCapturing)
+    return static_cast<CUresult>(cap);
+  return cuCtxSynchronize();
+}
 // Streams are synchronous, so everything queued before the function has run
 // by the time it is called, which is all a host function is promised.
-VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
+VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream stream, CUhostFn fn, void* user) {
   if (!fn) return CUDA_ERROR_INVALID_VALUE;
+  // On a capturing stream the function becomes a host node and runs each time
+  // the graph does, not now.
+  if (const int cap = with_capture([&](ShimState& s_) { return capture_host_fn(s_, stream, fn, user); });
+      cap != kNotCapturing)
+    return static_cast<CUresult>(cap);
   fn(user);
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return dead_context(); }  // always idle
-VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return dead_context(); }
+VGPU_EXPORT CUresult cuStreamQuery(CUstream stream) {   // always idle
+  if (const int cap = with_capture([&](ShimState& s_) { return capture_refuse_sync(s_, stream); }); cap != kNotCapturing)
+    return static_cast<CUresult>(cap);
+  return dead_context();
+}
+// A wait on an event does nothing outside a capture -- everything is done by
+// the time it is asked -- and inside one it is how streams are joined (the
+// runtime's cudaStreamWaitEvent does the same, on its own events).
+VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream stream, void* ev, unsigned int flags) {
+  return api("cuStreamWaitEvent", true, false, [&](ShimState& s) -> CUresult {
+    if (flags & ~1u) return CUDA_ERROR_INVALID_VALUE;   // CU_EVENT_WAIT_EXTERNAL
+    const auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
+    const bool captured = it != s.events.end() && it->second.captured;
+    if (!captured && !stream_capturing(s, stream)) return CUDA_SUCCESS;
+    using Fn = int (*)(void*, void*, int, unsigned long long, const std::vector<void*>*, unsigned);
+    static Fn fn = nullptr;
+    if (!fn) fn = reinterpret_cast<Fn>(runtime_symbol("vgpu_cuCaptureEventWait", false));
+    if (!fn) return CUDA_SUCCESS;
+    static const std::vector<void*> none;
+    return static_cast<CUresult>(fn(stream, ev, captured ? 1 : 0, captured ? it->second.capture_id : 0,
+                                    captured ? &it->second.capture_deps : &none, flags));
+  });
+}
 VGPU_EXPORT CUresult cuStreamGetPriority(CUstream, int* p) {
   if (p) *p = 0;
   return CUDA_SUCCESS;
@@ -3460,17 +3567,6 @@ VGPU_EXPORT CUresult cuStreamGetFlags(CUstream, unsigned int* f) {
   if (f) *f = 0;
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream, int* status, unsigned long long* id,
-                                               void*, const void**, size_t*) {
-  if (status) *status = 0;  // CU_STREAM_CAPTURE_STATUS_NONE
-  if (id) *id = 0;
-  return CUDA_SUCCESS;
-}
-VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream, int* status) {
-  if (status) *status = 0;
-  return CUDA_SUCCESS;
-}
-
 VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
   return api("cuEventCreate", true, false, [&](ShimState& s) {
     if (!ev) return CUDA_ERROR_INVALID_VALUE;
@@ -3481,17 +3577,53 @@ VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream) {
-  return api("cuEventRecord", true, false, [&](ShimState& s) {
+// On a capturing stream an event records where the capture has got to, for a
+// later wait to depend on; with CU_EVENT_RECORD_EXTERNAL it is a node, recorded
+// each time the graph runs. Such an event cannot be queried, synchronized or
+// timed (CUDA_ERROR_CAPTURED_EVENT) until it is recorded again outside a capture.
+VGPU_EXPORT CUresult cuEventRecordWithFlags(void* ev, CUstream stream, unsigned int flags) {
+  return api("cuEventRecord", true, false, [&](ShimState& s) -> CUresult {
+    if (flags & ~1u) return CUDA_ERROR_INVALID_VALUE;   // CU_EVENT_RECORD_EXTERNAL
     auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
     if (it == s.events.end()) return CUDA_ERROR_INVALID_VALUE;
+    if (stream_capturing(s, stream)) {
+      using Fn = int (*)(void*, void*, int, unsigned long long*, std::vector<void*>*);
+      static Fn fn = nullptr;
+      if (!fn) fn = reinterpret_cast<Fn>(runtime_symbol("vgpu_cuCaptureEventRecord", false));
+      unsigned long long id = 0;
+      std::vector<void*> deps;
+      if (fn && fn(stream, ev, flags & 1u ? 1 : 0, &id, &deps) == 0) {
+        it->second.captured = true;
+        it->second.capture_id = id;
+        it->second.capture_deps = std::move(deps);
+        return CUDA_SUCCESS;
+      }
+    }
+    it->second.captured = false;
+    it->second.capture_deps.clear();
     it->second.recorded = true;
     clock_gettime(CLOCK_MONOTONIC, &it->second.when);
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventQuery(void*) { return dead_context(); }
-VGPU_EXPORT CUresult cuEventSynchronize(void*) { return dead_context(); }
+VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream stream) { return cuEventRecordWithFlags(ev, stream, 0); }
+namespace {
+// An event standing for work in a capture, which has not run.
+bool event_captured(void* ev) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  const auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
+  return it != s.events.end() && it->second.captured;
+}
+}  // namespace
+VGPU_EXPORT CUresult cuEventQuery(void* ev) {
+  if (event_captured(ev)) return static_cast<CUresult>(907);   // CUDA_ERROR_CAPTURED_EVENT
+  return dead_context();
+}
+VGPU_EXPORT CUresult cuEventSynchronize(void* ev) {
+  if (event_captured(ev)) return static_cast<CUresult>(907);
+  return dead_context();
+}
 VGPU_EXPORT CUresult cuEventDestroy_v2(void* ev) {
   return api("cuEventDestroy", true, false, [&](ShimState& s) {
     s.events.erase(reinterpret_cast<uintptr_t>(ev));
@@ -3506,6 +3638,8 @@ VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
     // As the card answers: an event never recorded, or made with
     // CU_EVENT_DISABLE_TIMING, is an invalid handle here, not a bad value.
     if (!ms) return CUDA_ERROR_INVALID_VALUE;
+    if (a != s.events.end() && b != s.events.end() && (a->second.captured || b->second.captured))
+      return static_cast<CUresult>(907);   // CUDA_ERROR_CAPTURED_EVENT
     if (a == s.events.end() || b == s.events.end() || !a->second.recorded || !b->second.recorded ||
         !a->second.timing || !b->second.timing)
       return CUDA_ERROR_INVALID_HANDLE;
@@ -4240,6 +4374,113 @@ VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {
   *table = t;
   return t ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
+
+/* ---- what libcudart asks libcuda (vgpu_bridge.h) ---- */
+
+// A CUfunction, or the function of a CUkernel, as the runtime launches it.
+extern "C" VGPU_EXPORT int vgpu_driver_function_info_v1(void* f, VgpuDriverFuncInfo* out) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.initialized || !out || !f) return 1;
+  uintptr_t h = reinterpret_cast<uintptr_t>(f);
+  try {
+    if ((h & 7) == kTagKernel) h = kernel_to_function(s, h);
+  } catch (const std::exception&) {
+    return 1;
+  }
+  if ((h & 7) != kTagFunc) return 1;
+  const auto it = s.functions.find(h);
+  if (it == s.functions.end() || !it->second.fn) return 1;
+  out->function = reinterpret_cast<void*>(h);
+  out->kernel = reinterpret_cast<void*>(it->second.kernel);
+  out->device = it->second.device;
+  out->fn = it->second.fn;
+  out->syms = it->second.syms;
+  out->nonportable_cluster = it->second.nonportable_cluster;
+  out->name = it->second.fn->name.c_str();
+  return 0;
+}
+
+// A function for an entry of a module the runtime loaded, so a driver call can
+// name a kernel the runtime registered: made on first use, the same each time.
+extern "C" VGPU_EXPORT int vgpu_driver_function_for_v1(int device, uint64_t module_id, const char* name, void** out) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.initialized || !name || !out || device < 0 || device >= s.rt->device_count()) return 1;
+  static std::map<std::tuple<int, uint64_t, std::string>, uintptr_t> made;
+  const auto key = std::make_tuple(device, module_id, std::string(name));
+  if (const auto it = made.find(key); it != made.end() && s.functions.count(it->second)) {
+    *out = reinterpret_cast<void*>(it->second);
+    return 0;
+  }
+  try {
+    const vgpu::ptx::EntryFn* fn = s.rt->device(device).get_function(module_id, name);
+    if (!fn) return 1;
+    const uintptr_t fh = make_handle(s, kTagFunc);
+    s.functions[fh] = {device, 0, fn, s.rt->device(device).symbols(module_id)};
+    made[key] = fh;
+    *out = reinterpret_cast<void*>(fh);
+    return 0;
+  } catch (const std::exception&) {
+    return 1;
+  }
+}
+
+extern "C" VGPU_EXPORT int vgpu_driver_event_exists_v1(void* event) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  return s.events.count(reinterpret_cast<uintptr_t>(event)) ? 0 : 1;
+}
+extern "C" VGPU_EXPORT int vgpu_driver_event_record_now_v1(void* event) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  const auto it = s.events.find(reinterpret_cast<uintptr_t>(event));
+  if (it == s.events.end()) return 1;
+  it->second.recorded = true;
+  it->second.captured = false;
+  clock_gettime(CLOCK_MONOTONIC, &it->second.when);
+  return 0;
+}
+extern "C" VGPU_EXPORT int vgpu_driver_stream_info_v1(void* stream, unsigned* flags, int* priority, int* device) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.streams.count(reinterpret_cast<uintptr_t>(stream))) return 1;
+  if (flags) *flags = 0;
+  if (priority) *priority = 0;
+  if (device) *device = ctx_stack().empty() ? 0 : current_device(s);
+  return 0;
+}
+extern "C" VGPU_EXPORT int vgpu_driver_current_device_v1() {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.initialized || ctx_stack().empty()) return -1;
+  const auto it = s.contexts.find(ctx_stack().back());
+  return it == s.contexts.end() ? -1 : it->second;
+}
+extern "C" VGPU_EXPORT int vgpu_driver_ctx_device_v1(void* ctx, int* device) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  const auto it = s.contexts.find(reinterpret_cast<uintptr_t>(ctx));
+  if (it == s.contexts.end()) return 1;
+  if (device) *device = it->second;
+  return 0;
+}
+extern "C" VGPU_EXPORT void* vgpu_driver_primary_ctx_v1(int device) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  const auto it = s.primary_ctx.find(device);
+  return it == s.primary_ctx.end() ? nullptr : reinterpret_cast<void*>(it->second);
+}
+extern "C" VGPU_EXPORT int vgpu_driver_copy3d_v1(const void* p) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.initialized || !p) return 1;
+  return copy3d(s, *static_cast<const CUDA_MEMCPY3D*>(p));
+}
+
+/* ---- graphs and stream capture: libcudart holds them (vgpu_bridge.h) ---- */
+
+#include "driver_graph_api.inc"
 
 /* ---- cuGetProcAddress: how modern cudart resolves everything ---- */
 

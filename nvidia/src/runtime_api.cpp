@@ -35,6 +35,7 @@
 #include <cstring>
 #include <functional>
 #include <dlfcn.h>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <map>
@@ -46,6 +47,9 @@
 #include <vector>
 
 #include "error_names.hpp"
+#include "vgpu_bridge.h"
+#include "vgpu_cu_abi.h"
+#include "launch_params.hpp"
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -729,6 +733,19 @@ void bind_driver_context() {
   bound = t_current_device;
 }
 
+// A symbol of the simulator's libcuda, if it is loaded: through the global
+// scope, or by name for a library loaded privately. Never loads one -- a
+// program that uses only the runtime API has no driver to ask.
+void* driver_symbol(const char* name) {
+  if (void* p = dlsym(RTLD_DEFAULT, name)) return p;
+  void* p = nullptr;
+  if (void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD)) {
+    p = dlsym(h, name);
+    dlclose(h);
+  }
+  return p;
+}
+
 // The body of every API call: the lock, initialisation, the dead-context
 // check, and errors thrown inside turned into codes. `needs_context` is false
 // for the calls an RTX 3060 still answers after a kernel has killed the
@@ -1130,7 +1147,8 @@ bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, vo
                                      size_t sharedMem, cudaStream_t stream,
                                      const std::vector<uint32_t>& param_sizes,
                                      bool cooperative = false,
-                                     std::array<uint32_t, 3> cluster = {0, 0, 0});
+                                     std::array<uint32_t, 3> cluster = {0, 0, 0},
+                                     void* drv_func = nullptr);
 bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()> op);
 // Discards a capture in progress on a stream that is being destroyed.
 void vgpu_drop_capture(cudaStream_t stream);
@@ -1178,18 +1196,39 @@ static void run_launched_now(DeviceGraphEnv& env, cudaStream_t stream);
 // The body of both launch entry points. `cooperative` is the only difference,
 // and it changes one thing: whether the blocks are resident together and may
 // wait on each other. See the scheduler note in interpreter.cpp.
+// A kernel named by a CUfunction the driver API made, as libcuda describes it.
+// `drv_func` is the CUfunction (or CUkernel); launch_kernel_impl then runs it
+// where the driver put it rather than on the current device.
+static bool driver_function_info(void* f, VgpuDriverFuncInfo* out) {
+  using Fn = int (*)(void*, VgpuDriverFuncInfo*);
+  static const Fn fn = reinterpret_cast<Fn>(driver_symbol("vgpu_driver_function_info_v1"));
+  return fn && fn(f, out) == 0;
+}
+
 static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gridDim,
                                       dim3 blockDim, void** args, size_t sharedMem,
                                       cudaStream_t stream, bool cooperative,
-                                      std::array<uint32_t, 3> cluster = {0, 0, 0}) {
+                                      std::array<uint32_t, 3> cluster = {0, 0, 0},
+                                      void* drv_func = nullptr) {
   const cudaError_t rc = guard(api, [&](State& s) -> cudaError_t {
-    auto it = s.kernels.find(func);
-    if (it == s.kernels.end()) {
-      if (!quiet())
-        std::fprintf(stderr, "[vgpu] cudaLaunchKernel: unregistered kernel stub %p\n", func);
-      return cudaErrorInvalidDeviceFunction;
+    KernelInfo drv_ki;   // stands in for a registered stub's record when the driver made the function
+    VgpuDriverFuncInfo dinfo;
+    KernelInfo* kip = nullptr;
+    if (drv_func) {
+      if (!driver_function_info(drv_func, &dinfo)) return cudaErrorInvalidDeviceFunction;
+      drv_ki.entry_name = dinfo.name ? dinfo.name : "";
+      drv_ki.nonportable_cluster = dinfo.nonportable_cluster;
+      kip = &drv_ki;
+    } else {
+      auto it = s.kernels.find(func);
+      if (it == s.kernels.end()) {
+        if (!quiet())
+          std::fprintf(stderr, "[vgpu] cudaLaunchKernel: unregistered kernel stub %p\n", func);
+        return cudaErrorInvalidDeviceFunction;
+      }
+      kip = &it->second;
     }
-    KernelInfo& ki = it->second;
+    KernelInfo& ki = *kip;
     // A profiler wants the launch even when nothing else does; recording is a
     // relaxed load away when nobody is listening.
     const bool profiling = vgpu::profiling::enabled();
@@ -1198,16 +1237,25 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
                    ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
                    blockDim.z, sharedMem);
-    if (!ki.mod || !registered_ptx(s, *ki.mod)) {
+    if (!drv_func && (!ki.mod || !registered_ptx(s, *ki.mod))) {
       // What the real runtime says for a binary built only for other GPUs.
       if (!quiet())
         std::fprintf(stderr, "[vgpu] cudaLaunchKernel: kernel '%s' has neither SASS this GPU runs nor PTX\n",
                      ki.entry_name.c_str());
       return cudaErrorNoKernelImageForDevice;
     }
-    uint64_t mid = module_on_current(s, *ki.mod);
-    vgpu::runtime::Device& dev = current(s);
-    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    uint64_t mid = 0;
+    vgpu::runtime::Device& dev = drv_func ? s.rt->device(dinfo.device) : current(s);
+    const vgpu::ptx::EntryFn* fn = nullptr;
+    const vgpu::exec::SymbolTable* kernel_syms = nullptr;
+    if (drv_func) {
+      fn = dinfo.fn;
+      kernel_syms = dinfo.syms;
+    } else {
+      mid = module_on_current(s, *ki.mod);
+      fn = dev.get_function(mid, ki.entry_name);
+      kernel_syms = dev.symbols(mid);
+    }
 
     // A kernel with parameters needs an argument array, and every slot in it
     // must be a real pointer: dereferencing what the caller passed is the one
@@ -1230,7 +1278,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
     // Under stream capture the launch is recorded for later replay, not run.
     if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes,
-                                        cooperative, cluster))
+                                        cooperative, cluster, drv_func))
       return cudaSuccess;
 
     if (vgpu::faults::should_fail(vgpu::faults::Op::Launch)) {
@@ -1285,7 +1333,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
         }
         kc = calls.emplace(fn, found).first;
       }
-      State::DeviceLimits& lim = s.limits[t_current_device];
+      State::DeviceLimits& lim = s.limits[drv_func ? dinfo.device : t_current_device];
       lim.heap_used = lim.heap_used || kc->second.heap;
       lim.printf_used = lim.printf_used || kc->second.printf;
       cfg.device_heap_bytes = lim.malloc_heap;
@@ -1330,13 +1378,13 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       cfg.graph_launcher = t_graph_env;
       cfg.current_graph_exec = t_graph_env ? reinterpret_cast<uint64_t>(t_graph_env->self) : 0;
     }
-    dev.launch(*fn, cfg, kargs, dev.symbols(mid));
+    dev.launch(*fn, cfg, kargs, kernel_syms);
     if (profiling) {
       vgpu::profiling::Event ev;
       ev.kind = vgpu::profiling::EventKind::Kernel;
       ev.start_ns = t0;
       ev.end_ns = vgpu::profiling::now_ns();
-      ev.device = static_cast<uint32_t>(t_current_device);
+      ev.device = static_cast<uint32_t>(drv_func ? dinfo.device : t_current_device);
       ev.correlation = vgpu::profiling::work_correlation();
       ev.stream = reinterpret_cast<uint64_t>(stream);
       ev.name = ki.entry_name;
@@ -3075,11 +3123,6 @@ VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedM
   });
 }
 
-VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {
-  if (!mode) return cudaErrorInvalidValue;
-  *mode = cudaStreamCaptureModeGlobal;
-  return cudaSuccess;
-}
 
 // ---- sharing memory between processes (IPC) ---------------------------------------
 //
@@ -4237,19 +4280,41 @@ VGPU_EXPORT cudaError_t cudaEventRecordWithFlags(cudaEvent_t e, cudaStream_t str
 // does: record the event now; and check it exists, since everything before a
 // wait has already finished in a synchronous engine. Neither consults capture
 // state -- they are the graph running, not a stream being captured.
+// An event the driver API made (cuEventCreate), which is a tagged handle the
+// runtime has no record of: its record and the check that it exists are the
+// driver's. Neither is asked for a handle that cannot be one.
+static bool driver_event_exists(cudaEvent_t e) {
+  if ((reinterpret_cast<uintptr_t>(e) & 7) != 5) return false;
+  using Fn = int (*)(void*);
+  static const Fn fn = reinterpret_cast<Fn>(driver_symbol("vgpu_driver_event_exists_v1"));
+  return fn && fn(e) == 0;
+}
+static cudaError_t driver_event_record(cudaEvent_t e) {
+  using Fn = int (*)(void*);
+  static const Fn fn = reinterpret_cast<Fn>(driver_symbol("vgpu_driver_event_record_now_v1"));
+  return fn && fn(e) == 0 ? cudaSuccess : cudaErrorInvalidResourceHandle;
+}
+
 cudaError_t record_event_now(cudaEvent_t e) {
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  RtEvent* r = find_event(e);
-  if (!r) return cudaErrorInvalidResourceHandle;
-  r->captured = false;
-  r->capture_deps.clear();
-  r->recorded = true;
-  r->when = std::chrono::steady_clock::now();
-  return cudaSuccess;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    if (RtEvent* r = find_event(e)) {
+      r->captured = false;
+      r->capture_deps.clear();
+      r->recorded = true;
+      r->when = std::chrono::steady_clock::now();
+      return cudaSuccess;
+    }
+  }
+  // The driver takes its own lock, so it is asked without the event lock held.
+  return driver_event_exists(e) ? driver_event_record(e) : cudaErrorInvalidResourceHandle;
 }
 cudaError_t wait_event_now(cudaEvent_t e) {
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  return find_event(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    if (find_event(e)) return cudaSuccess;
+  }
+  return driver_event_exists(e) ? cudaSuccess : cudaErrorInvalidResourceHandle;
 }
 
 // Outside a capture every operation has finished before its call returns, so a
@@ -4558,6 +4623,23 @@ struct RecordedLaunch {
   std::function<void()> host_op;
   // Event record and event wait nodes: which event.
   cudaEvent_t event = nullptr;
+  // A kernel node made through the driver API names a CUfunction (or the
+  // function of a CUkernel) instead of a registered stub: `func` is then null
+  // and this is the handle libcuda gave. The launch resolves it through the
+  // driver (vgpu_driver_function_info_v1).
+  void* drv_func = nullptr;
+  // CUkernel the node was made from, if it was, which cuGraphKernelNodeGetParams
+  // hands back in `kern`.
+  void* drv_kernel = nullptr;
+  // A kernel node's launch attributes (cuGraphKernelNodeSetAttribute), by
+  // CUlaunchAttributeID, each the 64 bytes of the attribute value.
+  std::map<int, std::array<uint8_t, 64>> attrs;
+  // Nodes this implementation keeps as the bytes the program gave and reads
+  // back as given: external semaphore signal and wait nodes (the arrays of
+  // handles and parameters), and batch memory operations.
+  std::vector<uint8_t> blob_a, blob_b;
+  unsigned count = 0;
+  unsigned flags = 0;
 };
 
 // A graph is a directed acyclic graph of nodes, which is what CUDA's own
@@ -4592,7 +4674,66 @@ struct GraphNodeRec {
   } cond;
 };
 
+// A user object (cudaUserObjectCreate): a pointer and the function that
+// destroys it when the last reference goes -- references held by the program
+// and by graphs, which retain them for as long as the graph and everything
+// instantiated or cloned from it lives. The destructor runs on the thread that
+// released the last reference, outside every lock of this library; on an RTX
+// 3060 it ran on a thread of the driver's, some time after.
+struct UserObj {
+  void* ptr = nullptr;
+  void (*destroy)(void*) = nullptr;
+  unsigned long long refs = 0;
+};
+std::mutex g_uo_mu;   // a leaf: nothing is taken while it is held
+std::unordered_map<void*, std::unique_ptr<UserObj>> g_user_objects;
+// Destructors of objects whose last reference went while a lock was held,
+// run by whoever drops the locks (DrainUserObjects).
+thread_local std::vector<std::pair<void (*)(void*), void*>> t_uo_ready;
+
+// Drops `n` references; false if the handle is not a user object. An object
+// with no references left is forgotten and its destructor queued.
+bool uo_release(void* handle, unsigned long long n) {
+  std::lock_guard<std::mutex> lock(g_uo_mu);
+  const auto it = g_user_objects.find(handle);
+  if (it == g_user_objects.end()) return false;
+  UserObj& o = *it->second;
+  o.refs -= std::min<unsigned long long>(o.refs, n);
+  if (o.refs == 0) {
+    t_uo_ready.emplace_back(o.destroy, o.ptr);
+    g_user_objects.erase(it);
+  }
+  return true;
+}
+void uo_retain(void* handle, unsigned long long n) {
+  std::lock_guard<std::mutex> lock(g_uo_mu);
+  if (const auto it = g_user_objects.find(handle); it != g_user_objects.end()) it->second->refs += n;
+}
+// Runs the destructors queued on this thread. Declared before the locks of the
+// call it belongs to, so that it runs after they are released.
+struct DrainUserObjects {
+  ~DrainUserObjects() {
+    while (!t_uo_ready.empty()) {
+      auto ready = std::move(t_uo_ready);
+      t_uo_ready.clear();
+      for (auto& [fn, ptr] : ready)
+        if (fn) fn(ptr);
+    }
+  }
+};
+std::atomic<unsigned> g_next_graph_id{1};
+
 struct GraphRec {
+  unsigned id = g_next_graph_id.fetch_add(1);
+  const GraphRec* clone_of = nullptr;   // the graph cudaGraphClone made this from
+  // The user objects this graph holds references to: the object's handle and how
+  // many. A clone and an instantiation take their own.
+  std::vector<std::pair<void*, unsigned>> user_refs;
+  GraphRec() = default;
+  GraphRec(const GraphRec&) = delete;
+  ~GraphRec() {
+    for (const auto& [obj, count] : user_refs) uo_release(obj, count);
+  }
   std::vector<std::unique_ptr<GraphNodeRec>> nodes;
   // Child graphs a node points at, cloned when the node was added so a later
   // change to the original graph cannot change this one -- which is what CUDA
@@ -4632,6 +4773,8 @@ struct GraphRec {
 std::unique_ptr<GraphRec> clone_graph(const GraphRec& src,
                                       std::map<const GraphNodeRec*, GraphNodeRec*>* mapping) {
   auto out = std::make_unique<GraphRec>();
+  out->user_refs = src.user_refs;
+  for (const auto& [obj, count] : src.user_refs) uo_retain(obj, count);
   out->invalidated = src.invalidated;
   out->invalidated_by = src.invalidated_by;
   std::map<const GraphNodeRec*, GraphNodeRec*> local;
@@ -4712,6 +4855,11 @@ std::map<int, GraphMemStats> g_graph_mem;
 // the auto-free flag is about its allocations.
 std::map<void*, void*> g_exec_source;        // exec handle -> graph handle
 std::set<void*> g_exec_auto_free;            // execs instantiated with the flag
+// The flags an instantiation was given, as cuGraphExecGetFlags reads them back:
+// auto-free and device launch. The node-priority flag is accepted and not kept,
+// as on an RTX 3060, where AUTO_FREE | USE_NODE_PRIORITY read back as 1.
+std::map<void*, unsigned long long> g_exec_flags;
+std::map<void*, unsigned> g_exec_ids;         // each executable graph's id
 
 uint64_t round_up_to(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
 
@@ -4996,7 +5144,7 @@ void vgpu_drop_capture(cudaStream_t stream) {
   }
   if (cap->owned) g_borrowed_graphs.erase(cap->graph);   // the stream that began it takes it along
   leave_capture(cap);
-  g_captures.erase(reinterpret_cast<void*>(stream));
+  st().rt->captures_add(-static_cast<int>(g_captures.erase(reinterpret_cast<void*>(stream))));
 }
 
 // Marks any in-flight capture as unusable. Called by the operations that this
@@ -5016,10 +5164,11 @@ void vgpu_invalidate_capture(const char* what) {
 bool vgpu_record_launch_if_capturing(const void* func, dim3 grid, dim3 block, void** args,
                                      size_t sharedMem, cudaStream_t stream,
                                      const std::vector<uint32_t>& param_sizes, bool cooperative,
-                                     std::array<uint32_t, 3> cluster) {
+                                     std::array<uint32_t, 3> cluster, void* drv_func) {
   if (!capture_active(stream)) return false;
   RecordedLaunch rl;
   rl.func = func;
+  rl.drv_func = drv_func;
   rl.grid = grid;
   rl.block = block;
   rl.shared = sharedMem;
@@ -5057,6 +5206,7 @@ VGPU_EXPORT cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCa
   g_borrowed_graphs[cap->graph] = cap->graph;
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), {}, {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  st().rt->captures_add(1);
   return cudaSuccess;
 }
 
@@ -5089,7 +5239,7 @@ VGPU_EXPORT cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* p
   GraphRec* const graph = cap->graph;
   std::unique_ptr<GraphRec> owned = std::move(cap->owned);
   leave_capture(cap);
-  g_captures.erase(reinterpret_cast<void*>(stream));
+  st().rt->captures_add(-static_cast<int>(g_captures.erase(reinterpret_cast<void*>(stream))));
   if (owned) g_borrowed_graphs.erase(graph);   // no longer lent: returned, or dropped below
   const bool invalidated = graph->invalidated;
   const char* const invalidated_by = graph->invalidated_by;
@@ -5167,6 +5317,7 @@ VGPU_EXPORT cudaError_t cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaG
   cap->origin = reinterpret_cast<void*>(stream);
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), std::move(deps), {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  st().rt->captures_add(1);
   return cudaSuccess;
 }
 #endif
@@ -5310,6 +5461,7 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
                         cudaGraphInstantiateResult* result) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   *result = cudaGraphInstantiateError;
+  if (!pExec) return cudaErrorInvalidValue;   // measured: refused, as is a null graph
   auto it = g_graphs.find(static_cast<void*>(graph));
   if (it == g_graphs.end()) {
     // A conditional node's body is instantiated with the graph it is in; on
@@ -5338,6 +5490,8 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   void* handle = exec.get();
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
+  g_exec_flags[handle] = flags & (cudaGraphInstantiateFlagAutoFreeOnLaunch | cudaGraphInstantiateFlagDeviceLaunch);
+  g_exec_ids[handle] = g_next_graph_id.fetch_add(1);
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
@@ -5397,6 +5551,8 @@ VGPU_EXPORT cudaError_t cudaGraphInstantiateWithParams(cudaGraphExec_t* pExec, c
 // Runs one node's work. Nodes with no work of their own (empty ones) do
 // nothing but order the nodes around them.
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream);
+static cudaError_t run_batch_memop_node(const RecordedLaunch& rl);
+static cudaError_t run_ext_sem_node(const RecordedLaunch& rl, bool signal);
 
 namespace {
 // cudaGraphCondAssignDefault: a launch starts each such handle at its default
@@ -5575,9 +5731,19 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
     case cudaGraphNodeTypeEmpty:
       return cudaSuccess;
     case cudaGraphNodeTypeMemcpy:
+      if (rl.host_op) {   // a copy that names a CUDA array runs through the driver
+        rl.host_op();
+        return cudaSuccess;
+      }
       return replay_copy(rl);
     case cudaGraphNodeTypeMemset:
       return replay_fill(rl);
+    case cudaGraphNodeTypeExtSemaphoreSignal:
+      return run_ext_sem_node(rl, true);
+    case cudaGraphNodeTypeExtSemaphoreWait:
+      return run_ext_sem_node(rl, false);
+    case static_cast<cudaGraphNodeType>(12):   // CU_GRAPH_NODE_TYPE_BATCH_MEM_OP
+      return run_batch_memop_node(rl);
     case cudaGraphNodeTypeHost:
       // The function a program gave the node, or a captured library's closure.
       if (rl.host_fn) rl.host_fn(rl.host_user);
@@ -5605,7 +5771,7 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
       const cudaError_t rc = launch_kernel_impl("cudaGraphLaunch", rl.func, rl.grid, rl.block, ptrs.data(),
-                                                rl.shared, stream, rl.cooperative, rl.cluster);
+                                                rl.shared, stream, rl.cooperative, rl.cluster, rl.drv_func);
       // The graphs the kernel launched fire-and-forget run now that it is done.
       if (t_graph_env) run_launched_now(*t_graph_env, stream);
       return rc;
@@ -5980,8 +6146,11 @@ GraphNodeRec* exec_twin(GraphRec& exec, const GraphNodeRec* original) {  // hold
 // lock is taken, never under it: the event lock comes first everywhere, because
 // a launch records an event while running a node.
 bool event_exists(cudaEvent_t e) {
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  return find_event(e) != nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    if (find_event(e)) return true;
+  }
+  return driver_event_exists(e);
 }
 
 // Whether two graphs have the same shape: the same nodes, of the same types, in
@@ -6041,34 +6210,18 @@ void copy_params(GraphRec& dst, const GraphRec& src) {
     d.host_user = s.host_user;
     d.host_op = s.host_op;
     d.event = s.event;
+    d.func = s.func;
+    d.drv_func = s.drv_func;
+    d.drv_kernel = s.drv_kernel;
+    d.attrs = s.attrs;
+    d.blob_a = s.blob_a;
+    d.blob_b = s.blob_b;
+    d.count = s.count;
     if (dst.nodes[i]->child && src.nodes[i]->child)
       copy_params(*dst.nodes[i]->child, *src.nodes[i]->child);
   }
 }
 
-// Whether every kernel node still runs the same kernel. Which kernel a node
-// runs is part of a graph's shape, not one of its parameters, so an update that
-// changes one is refused rather than applied.
-const GraphNodeRec* changed_function(const GraphRec& have, const GraphRec& want) {
-  for (size_t i = 0; i < have.nodes.size() && i < want.nodes.size(); ++i) {
-    if (have.nodes[i]->type == cudaGraphNodeTypeKernel &&
-        have.nodes[i]->work.func != want.nodes[i]->work.func)
-      return want.nodes[i].get();
-    if (have.nodes[i]->child && want.nodes[i]->child)
-      if (const GraphNodeRec* n = changed_function(*have.nodes[i]->child, *want.nodes[i]->child))
-        return n;
-  }
-  return nullptr;
-}
-
-// Whether `from` can already be reached from `to`: adding to -> from would then
-// close a cycle, which CUDA refuses.
-bool reaches(const GraphNodeRec* from, const GraphNodeRec* to) {
-  if (from == to) return true;
-  for (const GraphNodeRec* d : from->deps)
-    if (reaches(d, to)) return true;
-  return false;
-}
 
 }  // namespace
 
@@ -6185,10 +6338,13 @@ static cudaError_t graph_add_deps(cudaGraph_t graph, const cudaGraphNode_t* from
     auto* f = reinterpret_cast<GraphNodeRec*>(from[i]);
     auto* t = reinterpret_cast<GraphNodeRec*>(to[i]);
     if (!f || !t || !g->holds(f) || !g->holds(t)) return cudaErrorInvalidValue;
-    // `to` runs after `from`. A dependency that closes a cycle is refused,
-    // because a graph with one could never be launched.
-    if (reaches(f, t)) return cudaErrorInvalidValue;
-    if (std::find(t->deps.begin(), t->deps.end(), f) == t->deps.end()) t->deps.push_back(f);
+    // `to` runs after `from`. Measured on an RTX 3060 (driver 596.36): an edge
+    // from a node to itself, and an edge that already exists, are refused
+    // (cudaErrorInvalidValue); one that closes a longer cycle is accepted, and
+    // it is instantiating the graph that fails (cudaErrorInvalidValue).
+    if (f == t) return cudaErrorInvalidValue;
+    if (std::find(t->deps.begin(), t->deps.end(), f) != t->deps.end()) return cudaErrorInvalidValue;
+    t->deps.push_back(f);
   }
   return cudaSuccess;
 }
@@ -6260,6 +6416,8 @@ VGPU_EXPORT cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* no
   const size_t take = std::min(*numNodes, have);
   for (size_t i = 0; i < take; ++i)
     nodes[i] = reinterpret_cast<cudaGraphNode_t>(g->nodes[i].get());
+  // Documented, and measured: entries past the count are set to null.
+  for (size_t i = take; i < *numNodes; ++i) nodes[i] = nullptr;
   *numNodes = take;
   return cudaSuccess;
 }
@@ -6278,6 +6436,7 @@ VGPU_EXPORT cudaError_t cudaGraphGetRootNodes(cudaGraph_t graph, cudaGraphNode_t
   }
   const size_t take = std::min(*numRootNodes, roots.size());
   for (size_t i = 0; i < take; ++i) nodes[i] = reinterpret_cast<cudaGraphNode_t>(roots[i]);
+  for (size_t i = take; i < *numRootNodes; ++i) nodes[i] = nullptr;
   *numRootNodes = take;
   return cudaSuccess;
 }
@@ -6299,6 +6458,7 @@ static cudaError_t graph_get_edges(cudaGraph_t graph, cudaGraphNode_t* from,
     from[i] = reinterpret_cast<cudaGraphNode_t>(edges[i].first);
     to[i] = reinterpret_cast<cudaGraphNode_t>(edges[i].second);
   }
+  for (size_t i = take; i < *numEdges; ++i) from[i] = to[i] = nullptr;
   *numEdges = take;
   return cudaSuccess;
 }
@@ -6321,6 +6481,7 @@ static cudaError_t node_get_deps(cudaGraphNode_t node, cudaGraphNode_t* deps, si
   }
   const size_t take = std::min(*numDeps, n->deps.size());
   for (size_t i = 0; i < take; ++i) deps[i] = reinterpret_cast<cudaGraphNode_t>(n->deps[i]);
+  for (size_t i = take; i < *numDeps; ++i) deps[i] = nullptr;
   *numDeps = take;
   return cudaSuccess;
 }
@@ -6340,6 +6501,7 @@ static cudaError_t node_get_dependents(cudaGraphNode_t node, cudaGraphNode_t* de
   }
   const size_t take = std::min(*numDependentNodes, after.size());
   for (size_t i = 0; i < take; ++i) dependent[i] = reinterpret_cast<cudaGraphNode_t>(after[i]);
+  for (size_t i = take; i < *numDependentNodes; ++i) dependent[i] = nullptr;
   *numDependentNodes = take;
   return cudaSuccess;
 }
@@ -6362,6 +6524,9 @@ VGPU_EXPORT cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t node,
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   if (!n || !params || n->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
+  // A node the driver API made names a CUfunction, which has no host stub to
+  // report (measured: cudaErrorInvalidDeviceFunction, params untouched).
+  if (n->work.drv_func) return cudaErrorInvalidDeviceFunction;
   params->func = const_cast<void*>(n->work.func);
   params->gridDim = n->work.grid;
   params->blockDim = n->work.block;
@@ -6383,8 +6548,8 @@ VGPU_EXPORT cudaError_t cudaGraphKernelNodeSetParams(cudaGraphNode_t node,
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
   if (!n || n->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
-  // The kernel a node runs cannot change, only its arguments and shape.
-  if (w.func != n->work.func) return cudaErrorInvalidValue;
+  // The kernel a node runs may change, as on an RTX 3060 (driver 596.36).
+  w.attrs = n->work.attrs;
   n->work = std::move(w);
   return cudaSuccess;
 }
@@ -6445,6 +6610,7 @@ VGPU_EXPORT cudaError_t cudaGraphClone(cudaGraph_t* pGraphClone, cudaGraph_t ori
   if (holds_graph_memory(*src)) return cudaErrorInvalidValue;
   if (holds_conditional(*src)) return cudaErrorNotSupported;   // as documented, and as the card says
   auto copy = clone_graph(*src, nullptr);
+  copy->clone_of = src;
   void* handle = copy.get();
   g_graphs[handle] = std::move(copy);
   *pGraphClone = static_cast<cudaGraph_t>(handle);
@@ -6459,9 +6625,11 @@ VGPU_EXPORT cudaError_t cudaGraphNodeFindInClone(cudaGraphNode_t* pNode,
   auto* original = reinterpret_cast<GraphNodeRec*>(originalNode);
   if (!clone || !original || !pNode) return cudaErrorInvalidValue;
   // A clone keeps its nodes in the order the original had them, so the node at
-  // the same position is the same node.
+  // the same position is the same node. The graph named has to be a clone of
+  // the node's graph (measured: the node's own graph is cudaErrorInvalidValue).
   for (auto& [handle, g] : g_graphs) {
     if (!g->holds(original)) continue;
+    if (clone->clone_of != g.get()) return cudaErrorInvalidValue;
     for (size_t i = 0; i < g->nodes.size(); ++i)
       if (g->nodes[i].get() == original) {
         if (i >= clone->nodes.size()) return cudaErrorInvalidValue;
@@ -6498,13 +6666,6 @@ VGPU_EXPORT cudaError_t cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t gr
     if (info) info->result = cudaGraphExecUpdateErrorTopologyChanged;
     return cudaErrorGraphExecUpdateFailure;
   }
-  if (const GraphNodeRec* n = changed_function(have, *want)) {
-    if (info) {
-      info->result = cudaGraphExecUpdateErrorFunctionChanged;
-      info->errorNode = reinterpret_cast<cudaGraphNode_t>(const_cast<GraphNodeRec*>(n));
-    }
-    return cudaErrorGraphExecUpdateFailure;
-  }
   copy_params(have, *want);
   return cudaSuccess;
 }
@@ -6528,7 +6689,6 @@ VGPU_EXPORT cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec,
       if (i >= it->second->nodes.size()) return cudaErrorInvalidValue;
       GraphNodeRec* target = it->second->nodes[i].get();
       if (target->type != cudaGraphNodeTypeKernel) return cudaErrorInvalidValue;
-      if (w.func != target->work.func) return cudaErrorInvalidValue;
       target->work = std::move(w);
       return cudaSuccess;
     }
@@ -6554,7 +6714,9 @@ VGPU_EXPORT cudaError_t cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec,
 VGPU_EXPORT cudaError_t cudaGraphAddHostNode(cudaGraphNode_t* pNode, cudaGraph_t graph,
                                              const cudaGraphNode_t* deps, size_t numDeps,
                                              const cudaHostNodeParams* params) {
-  if (!pNode || !params || !params->fn) return cudaErrorInvalidValue;
+  // A null function is accepted when the node is added (an RTX 3060, driver
+  // 596.36, returns success and the node runs nothing); setting one is refused.
+  if (!pNode || !params) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   GraphRec* g = graph_from(graph);
   if (!g) return cudaErrorInvalidValue;
@@ -6776,7 +6938,6 @@ VGPU_EXPORT cudaError_t cudaGraphExecChildGraphNodeSetParams(cudaGraphExec_t exe
   // The new child has to have the shape the instantiated one has, in the same
   // insertion order: this call supplies parameters, not a different graph.
   if (!same_topology(*target->child, *want)) return cudaErrorInvalidValue;
-  if (changed_function(*target->child, *want)) return cudaErrorInvalidValue;
   copy_params(*target->child, *want);
   return cudaSuccess;
 }
@@ -7532,6 +7693,7 @@ VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char* pa
 
 // The graph's own records go with it (destroy_graph, below).
 VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
+  DrainUserObjects drain;   // after the lock is released
   std::lock_guard<std::mutex> lock(g_graph_mu);
   // A child graph belongs to the node that holds it; destroying it here would
   // free memory the node still points at.
@@ -7542,6 +7704,7 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   // 3060 answers cudaErrorIllegalState until the capture ends.
   for (const auto& [origin, cap] : g_captures)
     if (cap->graph == static_cast<void*>(graph)) return cudaErrorIllegalState;
+  if (!g_graphs.count(static_cast<void*>(graph))) return cudaErrorInvalidValue;   // not a graph, or already destroyed
   destroy_graph(static_cast<void*>(graph));
   return cudaSuccess;
 }
@@ -7589,8 +7752,9 @@ void destroy_graph(void* graph) {
 }
 }  // namespace
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
+  DrainUserObjects drain;
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  g_graph_execs.erase(static_cast<void*>(exec));
+  if (!g_graph_execs.erase(static_cast<void*>(exec))) return cudaErrorInvalidValue;
   // The last exec of a destroyed graph: now nothing can allocate at that
   // graph's addresses again (see cudaGraphDestroy).
   if (const auto src = g_exec_source.find(static_cast<void*>(exec)); src != g_exec_source.end()) {
@@ -7605,6 +7769,8 @@ VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
     }
   }
   g_exec_auto_free.erase(static_cast<void*>(exec));
+  g_exec_flags.erase(static_cast<void*>(exec));
+  g_exec_ids.erase(static_cast<void*>(exec));
   g_device_graphs.erase(static_cast<void*>(exec));
   return cudaSuccess;
 }
@@ -7748,3 +7914,5 @@ VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
+
+#include "runtime_driver_graphs.inc"

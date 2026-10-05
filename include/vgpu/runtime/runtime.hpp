@@ -198,6 +198,12 @@ class Runtime {
   // kernel and whichever is asked, since they share one context. Atomic: it is
   // read without the API lock.
   int context_fault() const { return context_fault_.load(); }
+  // How many stream captures are in progress, kept by whichever library runs
+  // the graph machinery (libcudart's) and read by the other (libcuda's), whose
+  // launches and copies must be recorded into a capturing stream's graph
+  // rather than run. Zero is the common case, and costs one atomic load.
+  int captures_in_progress() const { return captures_.load(); }
+  void captures_add(int n) { captures_.fetch_add(n); }
   void set_context_fault(int code) { context_fault_.store(code); }
 
  private:
@@ -208,6 +214,7 @@ class Runtime {
   std::map<void*, HostRange> host_registrations_;
   std::map<void*, HostRange> host_allocations_;
   std::atomic<int> context_fault_{0};
+  std::atomic<int> captures_{0};
 };
 
 }  // namespace vgpu::runtime

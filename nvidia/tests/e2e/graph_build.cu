@@ -120,9 +120,23 @@ int main() {
   CK(count_dependents(fill, &dependents));
   if (dependents != 2) { printf("FAIL the fill has %zu dependents, want 2\n", dependents); return 1; }
 
-  // A dependency that would close a cycle is refused: the copy already runs
-  // after the fill, so the fill cannot also run after the copy.
-  WANT(add_dep(graph, &copy, &fill, 1), cudaErrorInvalidValue);
+  // An edge that already exists is refused, and so is one from a node to
+  // itself (measured on an RTX 3060: cudaErrorInvalidValue for both).
+  WANT(add_dep(graph, &fill, &add3, 1), cudaErrorInvalidValue);
+  WANT(add_dep(graph, &fill, &fill, 1), cudaErrorInvalidValue);
+  // An edge that closes a longer cycle is accepted: it is instantiating the
+  // graph that fails, and a graph with the edge taken out again instantiates.
+  {
+    cudaGraph_t loop = nullptr;
+    cudaGraphNode_t la = nullptr, lb = nullptr;
+    CK(cudaGraphCreate(&loop, 0));
+    CK(cudaGraphAddEmptyNode(&la, loop, nullptr, 0));
+    CK(cudaGraphAddEmptyNode(&lb, loop, &la, 1));
+    CK(add_dep(loop, &lb, &la, 1));
+    cudaGraphExec_t bad = nullptr;
+    WANT(cudaGraphInstantiate(&bad, loop, 0), cudaErrorInvalidValue);
+    CK(cudaGraphDestroy(loop));
+  }
   // And a node from another graph is not a dependency in this one.
   cudaGraph_t other = nullptr;
   cudaGraphNode_t stray = nullptr;
