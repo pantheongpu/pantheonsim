@@ -523,6 +523,56 @@ VTEST(rdna4_hw_id1_says_where_a_wave_runs_and_state_priv_holds_scc) {
   VCHECK_EQ(units.size(), size_t{32});
 }
 
+// Sixteen bytes stored with global_store_dwordx4 and loaded with
+// global_load_dwordx4 by work-groups on other host threads: each load sees
+// all four words old or all four new. Moved as two 8-byte halves, about one
+// load in a thousand took one half old and one new, and rocPRIM's look-back,
+// which packs a tile's flag and 64-bit prefix this way, then read a prefix
+// several tiles short (hipCUB's DeviceSelect::If). The memory has a fault
+// hook attached and none armed, as the runtime leaves every device's.
+struct UnarmedFaults : MemoryManager::AccessFault {
+  uint64_t none = 0;
+  UnarmedFaults() { copy_pending = stuck_pending = alu_pending = load_pending = store_pending = shared_pending = &none; }
+  uint64_t on_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+  uint64_t on_store(uint64_t, uint32_t, uint64_t v) override { return v; }
+  uint64_t on_shared_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+  void on_read(uint64_t, uint8_t*, uint64_t) override {}
+  uint64_t on_alu(uint64_t v, uint32_t) override { return v; }
+  void on_copy(uint64_t, uint8_t*, uint64_t) override {}
+};
+
+VTEST(a_16_byte_store_and_load_are_each_one_access_across_threads) {
+  const amd::CodeObject o = object("asm_quad");
+  MemoryManager mem(16ull << 20);
+  UnarmedFaults faults;
+  mem.set_access_fault(&faults);
+  const uint64_t data = mem.alloc(16), torn = mem.alloc(16);
+  const amd::Kernel* k = amd::find_kernel(o, "quads");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(data >> (8 * b)), args[8 + b] = static_cast<uint8_t>(torn >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.groups[0] = 4;   // a writer and three readers, each on a host thread of its own
+  d.group_size[0] = 64;
+  const char* was = std::getenv("VGPU_THREADS");
+  const std::string saved = was ? was : "";
+  setenv("VGPU_THREADS", "4", 1);
+  amd::execute(d, mem);
+  if (was) setenv("VGPU_THREADS", saved.c_str(), 1);
+  else unsetenv("VGPU_THREADS");
+  uint32_t r[4] = {}, q[4] = {};
+  mem.read(torn, r, 16);
+  mem.read(data, q, 16);
+  VCHECK_EQ(r[0], 200000u);   // every store made
+  VCHECK_EQ(q[0], 200000u);
+  VCHECK_EQ(r[1] + r[2] + r[3], 0u);
+}
+
 // The shader clock as clock() reads it on RDNA: SHADER_CYCLES' 20 bits on
 // gfx11, and on gfx12 a low and a high word, read high, low, high.
 VTEST(rdna_shader_cycles_count_up) {

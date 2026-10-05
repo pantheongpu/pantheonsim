@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <memory>
 #include <thread>
@@ -1153,6 +1154,38 @@ VTEST(a_mapping_of_shared_memory_sees_the_same_bytes) {
   VCHECK(VCAPTURE(Error, owner.share(p + 64, path + "-interior")).code() == Err::InvalidPointer);
   owner.free(p);
   VCHECK(!std::filesystem::exists(path));
+}
+
+// Sharing a large allocation of which little was written keeps the file
+// sparse: only the chunks that hold something are copied into it. Copying
+// the zeros too made every page of a 1 GiB NVSHMEM heap real, and filled the
+// small tmpfs the IPC files live on.
+VTEST(sharing_keeps_untouched_memory_sparse) {
+  MemoryManager mm(512ull << 20);
+  const std::string path = std::string("/tmp/vgpu-sparse-share-test-") + std::to_string(getpid());
+  std::filesystem::remove(path);
+  const uint64_t size = 256ull << 20;
+  const uint64_t p = mm.alloc(size);
+  const uint8_t v = 0x42;
+  mm.write(p + (100ull << 20), &v, 1);   // one byte, deep inside
+  mm.share(p, path);
+  struct stat sb {};
+  VCHECK(::stat(path.c_str(), &sb) == 0);
+  VCHECK_EQ(uint64_t(sb.st_size), size);
+  VCHECK(uint64_t(sb.st_blocks) * 512 < (8ull << 20));   // a chunk or so, not 256 MiB
+  uint8_t got = 0;
+  mm.read(p + (100ull << 20), &got, 1);
+  VCHECK_EQ(int(got), 0x42);
+  mm.read(p + (200ull << 20), &got, 1);
+  VCHECK_EQ(int(got), 0);
+  // Once every importer has it mapped, the exporter can drop the name and
+  // keep the memory; an address it did not share is refused.
+  VCHECK(mm.unlink_shared(p));
+  VCHECK(!std::filesystem::exists(path));
+  VCHECK(!mm.unlink_shared(p + 4096));
+  mm.read(p + (100ull << 20), &got, 1);
+  VCHECK_EQ(int(got), 0x42);
+  mm.free(p);
 }
 
 // ---- the device heap (malloc and free in a kernel) -----------------------

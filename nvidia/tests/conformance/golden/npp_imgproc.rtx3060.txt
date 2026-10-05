@@ -1,0 +1,289 @@
+WarpAffine 8u_C1R nn                         st=0 n=1364 sum=91808 wsum=4702942
+WarpAffine 8u_C3R nn                         st=0 n=4092 sum=269471 wsum=13327987
+WarpAffine 8u_C4R nn                         st=0 n=5456 sum=361529 wsum=17969313
+WarpAffine 16u_C1R nn                        st=0 n=1364 sum=21824910 wsum=1113976333
+WarpAffine 32f_C1R nn                        st=0 n=1364 sum=-3.437811e+03 wsum=-1.730185e+05
+WarpAffine 32f_C3R nn                        st=0 n=4092 sum=7.286946e+03 wsum=2.560192e+05
+WarpAffineBack 8u_C1R nn                     st=0 n=1364 sum=84108 wsum=4109045
+WarpAffineBack 8u_C3R nn                     st=0 n=4092 sum=245644 wsum=12059250
+WarpAffineBack 16u_C4R nn                    st=0 n=5456 sum=77557761 wsum=3722050806
+WarpAffineBack 32f_C1R nn                    st=0 n=1364 sum=2.914568e+03 wsum=1.983542e+05
+WarpPerspective 8u_C1R nn                    st=0 n=1364 sum=86328 wsum=4231458
+WarpPerspective 8u_C4R nn                    st=0 n=5456 sum=332038 wsum=16228727
+WarpPerspective 16u_C3R nn                   st=0 n=4092 sum=60577415 wsum=2972019697
+WarpPerspectiveBack 8u_C3R nn                st=0 n=4092 sum=299840 wsum=14872913
+WarpPerspectiveBack 16u_C1R nn               st=0 n=1364 sum=23411612 wsum=1160007521
+WarpAffine 8u_C1R linear                     st=0 n=1364 sum=91665 wsum=4680053
+WarpAffine 8u_C3R linear                     st=0 n=4092 sum=270274 wsum=13383039
+WarpAffine 8u_C4R linear                     st=0 n=5456 sum=356854 wsum=17805393
+WarpAffine 16u_C1R linear                    st=0 n=1364 sum=22481887 wsum=1134371649
+WarpAffine 32f_C1R linear                    st=0 n=1364 sum=3.799325e+03 wsum=2.275237e+05
+WarpAffine 32f_C3R linear                    st=0 n=4092 sum=1.762669e+04 wsum=6.399208e+05
+WarpAffineBack 8u_C1R linear                 st=0 n=1364 sum=80640 wsum=3932633
+WarpAffineBack 8u_C3R linear                 st=0 n=4092 sum=238372 wsum=11878926
+WarpAffineBack 16u_C4R linear                st=0 n=5456 sum=77195638 wsum=3786531347
+WarpAffineBack 32f_C1R linear                st=0 n=1364 sum=5.428093e+03 wsum=2.763283e+05
+WarpPerspective 8u_C1R linear                st=0 n=1364 sum=84954 wsum=4183681
+WarpPerspective 8u_C4R linear                st=0 n=5456 sum=333462 wsum=16299744
+WarpPerspective 16u_C3R linear               st=0 n=4092 sum=60425213 wsum=2975817673
+WarpPerspectiveBack 8u_C3R linear            st=0 n=4092 sum=297805 wsum=14508931
+WarpPerspectiveBack 16u_C1R linear           st=0 n=1364 sum=24051664 wsum=1161256928
+WarpAffine 8u_C1R cubic                      st=0 n=1364 sum=89002 wsum=4464364
+WarpAffine 8u_C3R cubic                      st=0 n=4092 sum=269069 wsum=13202422
+WarpAffine 8u_C4R cubic                      st=0 n=5456 sum=360318 wsum=18066788
+WarpAffine 16u_C1R cubic                     st=0 n=1364 sum~2.124221e+07 wsum~1.093035e+09
+WarpAffine 32f_C1R cubic                     st=0 n=1364 sum=3.710474e+03 wsum=2.701228e+05
+WarpAffine 32f_C3R cubic                     st=0 n=4092 sum=2.020642e+04 wsum=1.305034e+06
+WarpAffineBack 8u_C1R cubic                  st=0 n=1364 sum=82647 wsum=4117095
+WarpAffineBack 8u_C3R cubic                  st=0 n=4092 sum=243381 wsum=12014587
+WarpAffineBack 16u_C4R cubic                 st=0 n=5456 sum~7.845100e+07 wsum~3.830754e+09
+WarpAffineBack 32f_C1R cubic                 st=0 n=1364 sum=8.075146e+03 wsum=3.948651e+05
+WarpPerspective 8u_C1R cubic                 st=0 n=1364 sum=83808 wsum=4169818
+WarpPerspective 8u_C4R cubic                 st=0 n=5456 sum=337170 wsum=16401871
+WarpPerspective 16u_C3R cubic                st=0 n=4092 sum~6.316642e+07 wsum~3.123212e+09
+WarpPerspectiveBack 8u_C3R cubic             st=0 n=4092 sum=296487 wsum=14457261
+WarpPerspectiveBack 16u_C1R cubic            st=0 n=1364 sum~2.434659e+07 wsum~1.198638e+09
+WarpAffine 32s_C1R nn                        st=0 n=1364 sum=209207723054 wsum=10732390194232
+WarpAffineBack 32s_C3R nn                    st=0 n=4092 sum=553935817603 wsum=27425205260223
+WarpPerspectiveBack 32s_C1R nn               st=0 n=1364 sum=233961050714 wsum=11705570199057
+WarpAffine 32s_C1R linear                    st=0 n=1364 sum=208364167035 wsum=10677479133625
+WarpAffineBack 32s_C3R linear                st=0 n=4092 sum=561628031943 wsum=27882314958227
+WarpPerspectiveBack 32s_C1R linear           st=0 n=1364 sum=233248133113 wsum=11661509453823
+WarpPerspective 32f_C1R nn                   st=0 n=1364 sum=4.661324e+03 wsum=3.276335e+05
+WarpPerspective 32f_C1R linear               st=0 n=1364 sum=5.861530e+03 wsum=3.297513e+05
+WarpPerspective 32f_C1R cubic                st=0 n=1364 sum=1.785635e+03 wsum=8.371322e+04
+Rotate 8u_C1R 23.5 nn                        st=0 n=1364 sum=46493 wsum=2355217
+Rotate 8u_C3R 23.5 nn                        st=0 n=4092 sum=137480 wsum=6789346
+Rotate 32f_C1R 23.5 nn                       st=0 n=1364 sum=1.523000e+03 wsum=7.527830e+04
+Rotate 8u_C1R 23.5 linear                    st=0 n=1364 sum=47353 wsum=2383151
+Rotate 8u_C3R 23.5 linear                    st=0 n=4092 sum=137866 wsum=6723743
+Rotate 32f_C1R 23.5 linear                   st=0 n=1364 sum=4.418039e+03 wsum=2.039199e+05
+Rotate 8u_C1R 23.5 cubic                     st=0 n=1364 sum=43906 wsum=2140606
+Rotate 8u_C3R 23.5 cubic                     st=0 n=4092 sum=134900 wsum=6668425
+Rotate 32f_C1R 23.5 cubic                    st=0 n=1364 sum=1.870237e+03 wsum=1.015678e+05
+Rotate 8u_C1R -71.0 nn                       st=0 n=1364 sum=36888 wsum=1849416
+Rotate 8u_C3R -71.0 nn                       st=0 n=4092 sum=106966 wsum=5240786
+Rotate 32f_C1R -71.0 nn                      st=0 n=1364 sum=5.723405e+03 wsum=3.042261e+05
+Rotate 8u_C1R -71.0 linear                   st=0 n=1364 sum=37039 wsum=1864781
+Rotate 8u_C3R -71.0 linear                   st=0 n=4092 sum=108316 wsum=5256102
+Rotate 32f_C1R -71.0 linear                  st=0 n=1364 sum=1.064179e+04 wsum=5.151377e+05
+Rotate 8u_C1R -71.0 cubic                    st=0 n=1364 sum=37229 wsum=1866849
+Rotate 8u_C3R -71.0 cubic                    st=0 n=4092 sum=109057 wsum=5182511
+Rotate 32f_C1R -71.0 cubic                   st=0 n=1364 sum=9.142598e+03 wsum=4.583446e+05
+Rotate 8u_C1R 180.0 nn                       st=0 n=1364 sum=96385 wsum=4755206
+Rotate 8u_C3R 180.0 nn                       st=0 n=4092 sum=288083 wsum=13992695
+Rotate 32f_C1R 180.0 nn                      st=0 n=1364 sum=8.489919e+03 wsum=5.106147e+05
+Rotate 8u_C1R 180.0 linear                   st=0 n=1364 sum=96765 wsum=4837128
+Rotate 8u_C3R 180.0 linear                   st=0 n=4092 sum=291275 wsum=14325300
+Rotate 32f_C1R 180.0 linear                  st=0 n=1364 sum=5.319270e+03 wsum=2.680138e+05
+Rotate 8u_C1R 180.0 cubic                    st=0 n=1364 sum=96504 wsum=4675202
+Rotate 8u_C3R 180.0 cubic                    st=0 n=4092 sum=287384 wsum=14098703
+Rotate 32f_C1R 180.0 cubic                   st=0 n=1364 sum=-1.020405e+03 wsum=9.915827e+04
+Rotate 8u_C1R 137.0 nn                       st=30 n=1364 sum=9548 wsum=465941
+Rotate 8u_C3R 137.0 nn                       st=30 n=4092 sum=28644 wsum=1398579
+Rotate 32f_C1R 137.0 nn                      st=30 n=1364 sum=9.548000e+03 wsum=4.659410e+05
+Rotate 8u_C1R 137.0 linear                   st=30 n=1364 sum=9548 wsum=465941
+Rotate 8u_C3R 137.0 linear                   st=30 n=4092 sum=28644 wsum=1398579
+Rotate 32f_C1R 137.0 linear                  st=30 n=1364 sum=9.548000e+03 wsum=4.659410e+05
+Rotate 8u_C1R 137.0 cubic                    st=30 n=1364 sum=9548 wsum=465941
+Rotate 8u_C3R 137.0 cubic                    st=30 n=4092 sum=28644 wsum=1398579
+Rotate 32f_C1R 137.0 cubic                   st=30 n=1364 sum=9.548000e+03 wsum=4.659410e+05
+GetRotateQuad 4.335667e+00 -1.230796e-02 1.377714e+01 2.740773e+01 -8.915302e+00 3.522137e+01 -1.835678e+01 7.801328e+00
+GetRotateBound -1.835678e+01 -1.230796e-02 1.377714e+01 3.522137e+01
+Remap 8u_C1R nn                              st=0 n=988 sum=95364 wsum=4750966
+Remap 8u_C3R nn                              st=0 n=2964 sum=292176 wsum=14358185
+Remap 16u_C1R nn                             st=0 n=988 sum=24002792 wsum=1208978424
+Remap 16s_C1R nn                             st=0 n=988 sum~1.107500e+04 wsum~-2.263751e+07
+Remap 32f_C1R nn                             st=0 n=988 sum=-1.499838e+03 wsum=1.669927e+05
+Remap 32f_C3R nn                             st=0 n=2964 sum=-5.409351e+03 wsum=-1.618563e+05
+Remap 64f_C1R nn                             st=0 n=988 sum=8.225351e+03 wsum=1.627728e+05
+Remap 8u_C1R linear                          st=0 n=988 sum=95641 wsum=4706814
+Remap 8u_C3R linear                          st=0 n=2964 sum=294588 wsum=14653951
+Remap 16u_C1R linear                         st=0 n=988 sum=23068518 wsum=1128416753
+Remap 16s_C1R linear                         st=0 n=988 sum~6.370500e+04 wsum~1.519290e+07
+Remap 32f_C1R linear                         st=0 n=988 sum=-1.749966e+03 wsum=5.929120e+04
+Remap 32f_C3R linear                         st=0 n=2964 sum=8.465894e+03 wsum=5.959666e+05
+Remap 64f_C1R linear                         st=0 n=988 sum=-2.901967e+03 wsum=-1.312863e+05
+Remap 8u_C1R cubic                           st=0 n=988 sum=91903 wsum=4630159
+Remap 8u_C3R cubic                           st=0 n=2964 sum=289430 wsum=14394903
+Remap 16u_C1R cubic                          st=0 n=988 sum=24739061 wsum=1217473789
+Remap 16s_C1R cubic                          st=0 n=988 sum~-3.813090e+05 wsum~-3.176936e+07
+Remap 32f_C1R cubic                          st=0 n=988 sum=-1.459410e+03 wsum=-9.846612e+04
+Remap 32f_C3R cubic                          st=0 n=2964 sum=1.456654e+04 wsum=7.253562e+05
+Remap 64f_C1R cubic                          st=0 n=988 sum=-7.601803e+03 wsum=-5.615443e+05
+Mirror 8u_C3R 0                              st=0 n=432 sum=47299 wsum=2047959
+Mirror 8u_C3IR 0                             st=-6 n=432 sum=57221 wsum=2639748
+Mirror 8u_C4R 0                              st=0 n=576 sum=61466 wsum=2848467
+Mirror 8u_C4IR 0                             st=-6 n=576 sum=73780 wsum=3538938
+Mirror 16u_C1R 0                             st=0 n=144 sum=3957052 wsum=155192277
+Mirror 16u_C1IR 0                            st=-6 n=144 sum=4870744 wsum=199009465
+Mirror 32s_C3R 0                             st=0 n=432 sum=115599330707 wsum=4883767523152
+Mirror 32s_C3IR 0                            st=-6 n=432 sum=143023927720 wsum=6562834159622
+Mirror 32f_C1R 0                             st=0 n=144 sum=-1.007676e+03 wsum=-2.345205e+04
+Mirror 32f_C1IR 0                            st=-6 n=144 sum=-6.041622e+02 wsum=5.139595e+04
+Mirror 32f_C4R 0                             st=0 n=576 sum=1.137297e+03 wsum=-3.680073e+04
+Mirror 32f_C4IR 0                            st=-6 n=576 sum=-7.971621e+02 wsum=-1.940106e+05
+Mirror 8u_C3R 1                              st=0 n=432 sum=44806 wsum=1916309
+Mirror 8u_C3IR 1                             st=-6 n=432 sum=55189 wsum=2564606
+Mirror 8u_C4R 1                              st=0 n=576 sum=56886 wsum=2679914
+Mirror 8u_C4IR 1                             st=-6 n=576 sum=69876 wsum=3399553
+Mirror 16u_C1R 1                             st=0 n=144 sum=4151009 wsum=168024991
+Mirror 16u_C1IR 1                            st=-6 n=144 sum=5260040 wsum=219798618
+Mirror 32s_C3R 1                             st=0 n=432 sum=108458165058 wsum=4719782622572
+Mirror 32s_C3IR 1                            st=-6 n=432 sum=133129647608 wsum=6142550044072
+Mirror 32f_C1R 1                             st=0 n=144 sum=-8.124325e+02 wsum=-5.302603e+04
+Mirror 32f_C1IR 1                            st=-6 n=144 sum=-7.213244e+02 wsum=-8.484165e+04
+Mirror 32f_C4R 1                             st=0 n=576 sum=-1.778918e+02 wsum=-1.269346e+05
+Mirror 32f_C4IR 1                            st=-6 n=576 sum=-5.659188e+02 wsum=2.530239e+04
+Mirror 8u_C3R 2                              st=0 n=432 sum=45385 wsum=1932239
+Mirror 8u_C3IR 2                             st=-6 n=432 sum=55717 wsum=2543992
+Mirror 8u_C4R 2                              st=0 n=576 sum=61522 wsum=2890149
+Mirror 8u_C4IR 2                             st=-6 n=576 sum=73652 wsum=3505928
+Mirror 16u_C1R 2                             st=0 n=144 sum=3620998 wsum=136079723
+Mirror 16u_C1IR 2                            st=-6 n=144 sum=4584376 wsum=192772091
+Mirror 32s_C3R 2                             st=0 n=432 sum=111818151153 wsum=4775544409819
+Mirror 32s_C3IR 2                            st=-6 n=432 sum=136596798024 wsum=6358073019210
+Mirror 32f_C1R 2                             st=0 n=144 sum=1.744324e+03 wsum=9.317632e+04
+Mirror 32f_C1IR 2                            st=-6 n=144 sum=2.207973e+03 wsum=1.856645e+05
+Mirror 32f_C4R 2                             st=0 n=576 sum=5.457865e+03 wsum=2.358275e+05
+Mirror 32f_C4IR 2                            st=-6 n=576 sum=4.966648e+03 wsum=1.372042e+05
+ResizeSqrPixel 8u_C1R 0.50 nn                st=0 n=2120 sum=30204 wsum=1464897
+ResizeSqrPixel 8u_C3R 0.50 nn                st=0 n=6360 sum=79959 wsum=3935639
+ResizeSqrPixel 32f_C1R 0.50 nn               st=0 n=2120 sum=1.454773e+04 wsum=7.481351e+05
+ResizeSqrPixel 8u_C1R 0.50 linear            st=0 n=2120 sum~2.890300e+04 wsum~1.410103e+06
+ResizeSqrPixel 8u_C3R 0.50 linear            st=0 n=6360 sum~7.909600e+04 wsum~3.890098e+06
+ResizeSqrPixel 32f_C1R 0.50 linear           st=0 n=2120 sum=1.258536e+04 wsum=6.269190e+05
+ResizeSqrPixel 8u_C1R 0.73 nn                st=0 n=2120 sum=41172 wsum=1895061
+ResizeSqrPixel 8u_C3R 0.73 nn                st=0 n=6360 sum=111513 wsum=5542513
+ResizeSqrPixel 32f_C1R 0.73 nn               st=0 n=2120 sum=1.494232e+04 wsum=7.715535e+05
+ResizeSqrPixel 8u_C1R 0.73 linear            st=0 n=2120 sum~4.311800e+04 wsum~1.994820e+06
+ResizeSqrPixel 8u_C3R 0.73 linear            st=0 n=6360 sum~1.113980e+05 wsum~5.489304e+06
+ResizeSqrPixel 32f_C1R 0.73 linear           st=0 n=2120 sum=1.222939e+04 wsum=5.149786e+05
+ResizeSqrPixel 8u_C1R 1.37 nn                st=0 n=2120 sum=117371 wsum=5821377
+ResizeSqrPixel 8u_C3R 1.37 nn                st=0 n=6360 sum=296324 wsum=14474555
+ResizeSqrPixel 32f_C1R 1.37 nn               st=0 n=2120 sum=1.588600e+04 wsum=9.072139e+05
+ResizeSqrPixel 8u_C1R 1.37 linear            st=0 n=2120 sum~1.152830e+05 wsum~5.613129e+06
+ResizeSqrPixel 8u_C3R 1.37 linear            st=0 n=6360 sum~2.955540e+05 wsum~1.453392e+07
+ResizeSqrPixel 32f_C1R 1.37 linear           st=0 n=2120 sum=-3.391497e+03 wsum=-1.597517e+05
+ResizeSqrPixel 8u_C1R 2.00 nn                st=0 n=2120 sum=239121 wsum=11768504
+ResizeSqrPixel 8u_C3R 2.00 nn                st=0 n=6360 sum=578950 wsum=28139260
+ResizeSqrPixel 32f_C1R 2.00 nn               st=0 n=2120 sum=2.171708e+04 wsum=1.128879e+06
+ResizeSqrPixel 8u_C1R 2.00 linear            st=0 n=2120 sum~2.375100e+05 wsum~1.152239e+07
+ResizeSqrPixel 8u_C3R 2.00 linear            st=0 n=6360 sum~5.701140e+05 wsum~2.787168e+07
+ResizeSqrPixel 32f_C1R 2.00 linear           st=0 n=2120 sum=6.098081e+03 wsum=2.053142e+05
+WarpAffine super-sampling                    st=-22
+WarpAffine singular                          st=-56
+WarpAffineBack null source                   st=-8
+AndC 8u_C1R                                  st=0 n=286 sum=13723 wsum=688133
+OrC 8u_C3R                                   st=0 n=858 sum=136155 wsum=6564790
+XorC 8u_C4R                                  st=0 n=1144 sum=130702 wsum=6567364
+LShiftC 8u_C3R                               st=0 n=858 sum=83417 wsum=4018302
+RShiftC 8u_C4R                               st=0 n=1144 sum=42892 wsum=2173689
+RShiftC 8u_C1R                               st=0 n=286 sum=4106 wsum=202480
+AndC 16u_C3R                                 st=0 n=858 sum=9644035 wsum=459848184
+LShiftC 16u_C3R                              st=0 n=858 sum=24095193 wsum=1154335496
+RShiftC 16u_C3R                              st=0 n=858 sum=4766632 wsum=227638924
+RShiftC 16s_C1R                              st=0 n=286 sum=-289 wsum=-229681
+RShiftC 8s_C1R                               st=0 n=286 sum=-57 wsum=-1972
+XorC 32s_C4R                                 st=0 n=1144 sum=835007171845 wsum=41292097901326
+LShiftC 32s_C4R                              st=0 n=1144 sum=-111018974344 wsum=-5330240663889
+RShiftC 32s_C4R                              st=0 n=1144 sum=41576000591 wsum=2090033764097
+Magnitude 32fc32f_C1R                        st=0 n=180 sum=3.095697e+04 wsum=1.388555e+06
+MagnitudeSqr 32fc32f_C1R                     st=0 n=180 sum=7.036878e+06 wsum=3.099917e+08
+AlphaComp 8u_AC4R op 0                       st=0 n=17152 sum=1956267 wsum=95537534
+AlphaComp 8u_AC4R op 1                       st=0 n=17152 sum=654574 wsum=31942840
+AlphaComp 8u_AC4R op 2                       st=0 n=17152 sum=646768 wsum=31363708
+AlphaComp 8u_AC4R op 3                       st=0 n=4288 sum=527297 wsum=25662773
+AlphaComp 8u_AC4R op 4                       st=0 n=4288 sum=523981 wsum=25653877
+AlphaComp 8u_AC4R op 5                       st=0 n=17152 sum=2390091 wsum=116626103
+AlphaComp 8u_AC4R op 6                       st=0 n=17152 sum=2967505 wsum=145416524
+AlphaComp 8u_AC4R op 7                       st=0 n=17152 sum=1048832 wsum=51188648
+AlphaComp 8u_AC4R op 8                       st=0 n=17152 sum=1040053 wsum=50669959
+AlphaComp 8u_AC4R op 9                       st=0 n=17152 sum=2066265 wsum=101596391
+AlphaComp 8u_AC4R op 10                      st=0 n=17152 sum=2055272 wsum=100916728
+AlphaComp 8u_AC4R op 11                      st=0 n=17152 sum=3478908 wsum=170271658
+AlphaComp 8u_AC4R op 12                      st=0 n=17152 sum=1296115 wsum=63047792
+AlphaPremul 8u_AC4R                          st=0 n=17152 sum=1296115 wsum=63047792
+AlphaPremul 8u_AC4R odd step                 st=-108
+AlphaComp 32f_AC4R op 0                      st=0 n=1216 sum=4.757065e+03 wsum=2.622098e+05
+AlphaComp 32f_AC4R op 1                      st=0 n=1216 sum=3.099771e+03 wsum=1.882765e+05
+AlphaComp 32f_AC4R op 2                      st=0 n=1216 sum=3.915489e+03 wsum=1.920393e+05
+AlphaComp 32f_AC4R op 3                      st=0 n=1216 sum=2.185576e+03 wsum=1.372515e+05
+AlphaComp 32f_AC4R op 4                      st=0 n=1216 sum=3.001294e+03 wsum=1.410143e+05
+AlphaComp 32f_AC4R op 5                      st=0 n=1216 sum=1.984675e+03 wsum=1.668645e+05
+AlphaComp 32f_AC4R op 6                      st=0 n=1216 sum=4.964145e+03 wsum=2.716069e+05
+AlphaComp 32f_AC4R op 7                      st=0 n=1216 sum=3.237561e+03 wsum=1.639115e+05
+AlphaComp 32f_AC4R op 8                      st=0 n=1216 sum=4.687725e+03 wsum=2.252804e+05
+AlphaComp 32f_AC4R op 9                      st=0 n=1216 sum=1.620420e+03 wsum=1.134076e+05
+AlphaComp 32f_AC4R op 10                     st=0 n=1216 sum=3.070583e+03 wsum=1.747764e+05
+AlphaComp 32f_AC4R op 11                     st=0 n=1216 sum=-3.480308e+02 wsum=9.789938e+04
+AlphaComp 32f_AC4R op 12                     st=0 n=1216 sum=5.671261e+03 wsum=3.132348e+05
+GammaFwd 8u_C3R                              st=0 n=777 sum=128661 wsum=6263639
+GammaInv 8u_C3R                              st=0 n=777 sum=66579 wsum=3247443
+GammaFwd 8u_AC4R                             st=0 n=1072 sum=131467 wsum=6428107
+GammaInv 8u_AC4IR                            st=0 n=1072 sum=105898 wsum=5208394
+SwapChannels 8u_C4IR                         st=0 n=1072 sum=105898 wsum=5219780
+YCbCr420 8u_P3P2R uv                         st=0 n=95 sum=10855 wsum=476290
+YCbCr420 8u_P2P3R cr                         st=0 n=55 sum=5680 wsum=146682
+LUT_Linear 8u_C1R                            st=0 n=259 sum=31456 wsum=1473943
+LUT_Linear 8u_C1R falling                    st=0 n=259 sum=36056 wsum=1678397
+CFAToRGB 8u_C1C3R grid 0                     st=0 n=756 sum~7.695000e+04 wsum~3.741626e+06
+CFAToRGB 16u_C1C3R grid 0                    st=0 n=756 sum~2.149249e+07 wsum~1.038832e+09
+CFAToRGB 8u_C1C3R grid 1                     st=0 n=756 sum~7.942000e+04 wsum~3.793394e+06
+CFAToRGB 16u_C1C3R grid 1                    st=0 n=756 sum~2.199347e+07 wsum~1.070223e+09
+CFAToRGB 8u_C1C3R grid 2                     st=0 n=756 sum~8.011900e+04 wsum~3.748119e+06
+CFAToRGB 16u_C1C3R grid 2                    st=0 n=756 sum~2.254256e+07 wsum~1.059654e+09
+CFAToRGB 8u_C1C3R grid 3                     st=0 n=756 sum~8.318600e+04 wsum~4.016281e+06
+CFAToRGB 16u_C1C3R grid 3                    st=0 n=756 sum~2.048469e+07 wsum~9.901542e+08
+Mean_StdDev 8u_C1MR                          st=0 mean=1.211742e+02 sd=6.898951e+01
+Mean_StdDev 32f_C1R                          st=0 mean=-5.286945e-01 sd=1.562790e+02
+Mean_StdDev 32f_C1MR                         st=0 mean=-6.295455e+00 sd=1.560890e+02
+EvenLevelsHost 0 43 86 129 171 213 255 | -10 -4 2 8 13
+HistogramEven 8u_C1R                         st=0 n=16 sum=955 wsum=7958
+HistogramEven 8u_C4R                         st=0 n=60 sum=3707 wsum=72126
+HistogramEven 16u_C1R                        st=0 n=32 sum=932 wsum=15987
+HistogramEven 16s_C1R                        st=0 n=8 sum=626 wsum=2811
+HistogramRange 8u_C1R                        st=0 n=5 sum=1030 wsum=3973
+HistogramRange 32f_C1R                       st=0 n=4 sum=684 wsum=1624
+HistogramRange 32f_C4R                       st=0 n=10 sum=1777 wsum=9801
+Integral 8u32s_C1R                           st=0 n=322 sum=2152238 wsum=98413727
+Integral 8u32f_C1R                           st=0 n=322 sum=2.150138e+06 wsum=9.831780e+07
+RectStdDev 32s32f_C1R                        st=0 n=153 sum=8.991124e+03 wsum=3.831628e+05
+SumWindowRow 8u32f_C1R                       st=0 n=162 sum=6.942600e+04 wsum=2.992045e+06
+SumWindowColumn 8u32f_C1R                    st=0 n=162 sum=5.267900e+04 wsum=2.195532e+06
+FilterBox 8u_C4R                             st=0 n=1248 sum=139754 wsum=6105976
+FilterMax 8u_C4R                             st=0 n=1248 sum=262940 wsum=11499724
+FilterMin 8u_C4R                             st=0 n=1248 sum=19474 wsum=857812
+Dilate 8u_C4R                                st=0 n=1248 sum=234657 wsum=10267892
+Erode 8u_C4R                                 st=0 n=1248 sum=47856 wsum=2093481
+FilterMax 8u_C1R                             st=0 n=312 sum=61848 wsum=2797557
+FilterMin 8u_C1R                             st=0 n=312 sum=2093 wsum=87481
+Dilate 8u_C1R                                st=0 n=312 sum=57299 wsum=2609484
+Erode 8u_C1R                                 st=0 n=312 sum=11534 wsum=526781
+FilterBox 32f_C1R                            st=0 n=312 sum=5.937504e+03 wsum=3.314043e+05
+Dilate 32f_C1R                               st=0 n=312 sum=5.317208e+04 wsum=2.416393e+06
+Erode 32f_C4R                                st=0 n=1248 sum=-1.942142e+05 wsum=-8.370887e+06
+FilterBoxBorder 8u_C1R replicate             st=0 n=544 sum=64630 wsum=2950531
+GradientVectorPrewitt x norm 0               st=-5 n=544 sum=3808 wsum=178745
+GradientVectorPrewitt y norm 0               st=-5 n=544 sum=3808 wsum=178745
+GradientVectorPrewitt mag norm 0             st=-5 n=544 sum=3808 wsum=178745
+GradientVectorPrewitt angle norm 0           st=-5 n=544 sum=3.808000e+03 wsum=1.787450e+05
+GradientVectorPrewitt x norm 1               st=0 n=544 sum=-3477 wsum=-197978
+GradientVectorPrewitt y norm 1               st=0 n=544 sum=-639 wsum=396078
+GradientVectorPrewitt mag norm 1             st=0 n=544 sum=143059 wsum=6628117
+GradientVectorPrewitt angle norm 1           st=0 n=544 sum=3.298218e+02 wsum=2.330823e+04
+GradientVectorPrewitt x norm 2               st=0 n=544 sum=-3477 wsum=-197978
+GradientVectorPrewitt y norm 2               st=0 n=544 sum=-639 wsum=396078
+GradientVectorPrewitt mag norm 2             st=0 n=544 sum=113110 wsum=5211607
+GradientVectorPrewitt angle norm 2           st=0 n=544 sum=3.298218e+02 wsum=2.330823e+04
+FilterCannyBorder k0 n2 72-256               st=0 n=1632 sum=32037 wsum=1613652
+FilterCannyBorder k0 n2 40-120               st=0 n=1632 sum=32037 wsum=1613652
+FilterCannyBorder k0 n1 60-200               st=0 n=1632 sum=32037 wsum=1663887
+Threshold 32f_C1R less                       st=0 n=154 sum=9.277446e+03 wsum=3.971336e+05
+Threshold 32f_C1R greater                    st=0 n=154 sum=-8.397622e+03 wsum=-3.493849e+05
+CompareC 16s_C1R op 0                        st=0 n=154 sum=22332 wsum=957573
+CompareC 16s_C1R op 1                        st=0 n=154 sum=22587 wsum=959103
+CompareC 16s_C1R op 2                        st=0 n=154 sum=402 wsum=8208
+CompareC 16s_C1R op 3                        st=0 n=154 sum=11877 wsum=446043
+CompareC 16s_C1R op 4                        st=0 n=154 sum=11622 wsum=444513
+CopyConstBorder 8u_C1R                       st=0 n=240 sum=22597 wsum=1014395

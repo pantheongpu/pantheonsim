@@ -1,8 +1,13 @@
 #include "vgpu/memory.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -50,6 +55,47 @@ void store_at(uint8_t* p, uint32_t size, uint64_t v) {
     }
   }
   for (uint32_t i = 0; i < size; ++i) relaxed_store<uint8_t>(p + i, (v >> (8 * i)) & 0xff);
+}
+
+// Sixteen aligned bytes in place, as one access (MemoryManager::load_quad).
+// x86-64 with AVX moves them in one SSE instruction, which Intel and AMD
+// guarantee is atomic when aligned; without it, or elsewhere, each side takes
+// one of a set of locks striped by address.
+bool quad_is_one_instruction() {
+#if defined(__x86_64__)
+  static const bool avx = __builtin_cpu_supports("avx");
+  return avx;
+#else
+  return false;
+#endif
+}
+std::mutex& quad_lock(const uint8_t* p) {
+  static std::array<std::mutex, 64> locks;
+  return locks[(reinterpret_cast<uintptr_t>(p) >> 4) % locks.size()];
+}
+void load16(const uint8_t* p, uint64_t out[2]) {
+#if defined(__x86_64__)
+  if (quad_is_one_instruction() && reinterpret_cast<uintptr_t>(p) % 16 == 0) {
+    __m128i v;
+    asm volatile("movdqa %1, %0" : "=x"(v) : "m"(*reinterpret_cast<const __m128i*>(p)));
+    std::memcpy(out, &v, 16);
+    return;
+  }
+#endif
+  std::lock_guard<std::mutex> lock(quad_lock(p));
+  out[0] = load_at(p, 8), out[1] = load_at(p + 8, 8);
+}
+void store16(uint8_t* p, const uint64_t in[2]) {
+#if defined(__x86_64__)
+  if (quad_is_one_instruction() && reinterpret_cast<uintptr_t>(p) % 16 == 0) {
+    __m128i v;
+    std::memcpy(&v, in, 16);
+    asm volatile("movdqa %1, %0" : "=m"(*reinterpret_cast<__m128i*>(p)) : "x"(v));
+    return;
+  }
+#endif
+  std::lock_guard<std::mutex> lock(quad_lock(p));
+  store_at(p, 8, in[0]), store_at(p + 8, 8, in[1]);
 }
 
 // A `size`-byte scalar whose every byte is `b`, and whether `v` is one.
@@ -733,8 +779,15 @@ uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
                       std::strerror(err));
   }
   // Move what is there now, then let the allocation's chunks go: from here on
-  // the file is the memory, at the same device address.
-  read_chunks(live->second, 0, static_cast<uint8_t*>(host), size);
+  // the file is the memory, at the same device address. The new file reads
+  // as zeros, so only chunks that hold something else are copied: writing the
+  // zeros of chunks never touched would make every page of a sparse file
+  // real (a 1 GiB NVSHMEM heap filled a 2.4 GiB tmpfs that way).
+  for (uint64_t off = 0; off < size; off += kChunkSize) {
+    const uint8_t* chunk = live->second.chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk || (is_uniform(chunk) && uniform_byte(chunk) == 0)) continue;
+    read_chunks(live->second, off, static_cast<uint8_t*>(host) + off, std::min(kChunkSize, size - off));
+  }
   live_.erase(live);
   map_host(ptr, host, size);
   shared_[ptr] = SharedRegion{ptr, size, host, path, /*owner=*/true};
@@ -766,6 +819,14 @@ uint64_t MemoryManager::adopt(const std::string& path, uint64_t size) {
   map_host(va, host, size);
   shared_[va] = SharedRegion{va, size, host, path, /*owner=*/false};
   return va;
+}
+
+bool MemoryManager::unlink_shared(uint64_t ptr) {
+  ExclusiveGuard table_guard(table_lock_.get());
+  const auto it = shared_.find(ptr);
+  if (it == shared_.end() || !it->second.owner) return false;
+  ::unlink(it->second.path.c_str());
+  return true;
 }
 
 void MemoryManager::abandon(uint64_t va) {
@@ -971,6 +1032,15 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
     case ScalarAt::Unchanged:  // only answered for a store
     case ScalarAt::HostMap:
       // Host memory, mapped: no device ECC covers it, so no fault is taken.
+      // Read as an atomic of its width, as a chunk's scalar is: the host, or
+      // another process's kernels on shared memory, may be updating it with
+      // the CPU's atomics -- which is how the engines make a device atomic on
+      // such memory (vgpu/exec/host_atomic.hpp) -- and a memcpy racing those
+      // is a data race (ThreadSanitizer, e2e_host_atomics).
+      {
+        std::lock_guard<std::mutex> lock(host_maps_->mu);
+        if (const HostMap* m = find_host_map_locked(addr, size)) return load_at(m->host + (addr - m->base), size);
+      }
       read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
       return v;
   }
@@ -1001,10 +1071,62 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       return;
     case ScalarAt::Unchanged:
       return;
+    case ScalarAt::HostMap: {
+      // An atomic store of its width, as load_scalar's load is.
+      std::lock_guard<std::mutex> lock(host_maps_->mu);
+      if (const HostMap* m = find_host_map_locked(addr, size)) {
+        store_at(m->host + (addr - m->base), size, value);
+        return;
+      }
+      break;
+    }
     default:
       break;
   }
   write(addr, &value, size);  // a managed host mapping, behind its own lock
+}
+
+void MemoryManager::load_quad(uint64_t addr, uint64_t out[2]) const {
+  // A fault armed for loads, or stuck cells, change what a load returns, and
+  // load_scalar applies them; the runtime attaches its faults to every device,
+  // so it is whether one is armed that counts, not whether any is attached.
+  const bool faulted = access_fault_ && (any_stuck() || (access_fault_->load_pending &&
+                                                         __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)));
+  if (addr % 16 || faulted || (host_maps_ && host_maps_->may_contain(addr))) {
+    out[0] = load_scalar(addr, 8), out[1] = load_scalar(addr + 8, 8);
+    return;
+  }
+  // Sixteen aligned bytes never straddle a chunk (kChunkSize is a multiple
+  // of 16).
+  uint64_t base = 0;
+  const Allocation& a = resolve(addr, 16, "device memory read", &base, /*writing=*/false, /*page_slack=*/true);
+  const uint64_t off = addr - base;
+  const uint8_t* chunk = a.chunks[off / kChunkSize].load(std::memory_order_acquire);
+  if (!chunk) {
+    out[0] = out[1] = 0;
+  } else if (is_uniform(chunk)) {
+    out[0] = out[1] = repeated(uniform_byte(chunk), 8);
+  } else {
+    load16(chunk + off % kChunkSize, out);
+  }
+}
+
+void MemoryManager::store_quad(uint64_t addr, const uint64_t in[2]) {
+  const bool faulted = access_fault_ && access_fault_->store_pending &&
+                       __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED);
+  if (addr % 16 || faulted || (host_maps_ && host_maps_->may_contain(addr))) {
+    store_scalar(addr, 8, in[0]), store_scalar(addr + 8, 8, in[1]);
+    return;
+  }
+  uint64_t base = 0;
+  auto& a = const_cast<Allocation&>(
+      resolve(addr, 16, "device memory write", &base, /*writing=*/false, /*page_slack=*/false));
+  const uint64_t off = addr - base;
+  const uint64_t chunk_idx = off / kChunkSize;
+  uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
+  if (is_uniform(chunk) && in[0] == in[1] && in[0] == repeated(uniform_byte(chunk), 8)) return;
+  if (!chunk || is_uniform(chunk)) chunk = materialize(a, chunk_idx);
+  store16(chunk + off % kChunkSize, in);
 }
 
 // Where a kernel's scalar load or store lives: bytes in a chunk (materialized

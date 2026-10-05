@@ -1970,14 +1970,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         std::unique_lock<std::mutex> lock;
         if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
-        uint64_t old = 0;
-        mem_read(blk, w, l, sp, addr, &old, n);
         const Operand& vop = red ? ins.src[1] : ins.src[1];
-        uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
+        const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
+        const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        // The value the atomic stores, given the one it finds.
+        const auto compute = [&](const uint64_t old) -> uint64_t {
         uint64_t nw = old;
         if (cas) {
-          const uint64_t cmp = v, swap = is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l);
-          if (old == cmp) nw = swap;
+          if (old == v) nw = swap;
         } else {
           switch (popc_inc ? 3 : ins.f[0]) {
             case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
@@ -2017,7 +2017,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
         }
         if (!is64) nw &= 0xffffffff;
-        mem_write(blk, w, l, sp, addr, &nw, n);
+        return nw;
+        };
+        // Memory the host maps -- managed, pinned, or shared with another
+        // process through CUDA IPC -- takes the CPU's own atomic, which host
+        // code and other processes' kernels respect; the stripe lock is this
+        // process's alone (vgpu/exec/host_atomic.hpp).
+        uint64_t old = 0;
+        uint8_t* host = sp == Space::Global && addr % n == 0 ? mem_.host_address(addr, n) : nullptr;
+        if (host && reinterpret_cast<uintptr_t>(host) % n == 0) {
+          old = exec::host_atomic_rmw(host, n, compute);
+        } else {
+          mem_read(blk, w, l, sp, addr, &old, n);
+          const uint64_t nw = compute(old);
+          mem_write(blk, w, l, sp, addr, &nw, n);
+        }
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
         if (!red) {
@@ -3117,6 +3131,43 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     });
     return;
   }
+  // The device runtime's per-thread error, through the two driver entry
+  // points its library (linked in by -rdc builds) is built on, as the PTX
+  // engine's exec_device_get_last_error: GetLastError reads it without
+  // clearing it, SetLastError writes it.
+  if (name == "__cuda_syscall_cnpv2GetLastError") {
+    each_lane(ex, [&](unsigned l) { w.reg(4, l) = w.device_error[l]; });
+    return;
+  }
+  if (name == "__cuda_syscall_cnpv2SetLastError") {
+    each_lane(ex, [&](unsigned l) {
+      w.device_error[l] = w.reg(4, l);
+      w.reg(4, l) = 0;
+    });
+    return;
+  }
+  if (name == "cudaGraphLaunch") {
+    // (graphExec, stream) from a kernel, as the PTX engine's
+    // exec_device_graph_launch: the runtime that launched this kernel's graph
+    // checks and queues it, and a launch from outside any graph, or of a
+    // handle that is no device graph, faults as on an RTX 3060.
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t g = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
+      const uint64_t s = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
+      int rc = -1;
+      if (cfg_.graph_launcher) rc = cfg_.graph_launcher->launch(g, s);
+      if (rc < 0) {
+        fault(w, ins, l,
+              cfg_.graph_launcher ? std::string("device-side cudaGraphLaunch of a handle that is not a graph "
+                                                "instantiated for device launch")
+                                  : std::string("device-side cudaGraphLaunch in a kernel that is not running in a graph"),
+              Err::InvalidPointer);
+        return;
+      }
+      w.reg(4, l) = static_cast<uint32_t>(rc);
+    });
+    return;
+  }
   if (name == "cudaGraphSetConditional") {
     // (handle, value): sets a conditional handle's value, which the graph's
     // conditional node reads once the kernel is done -- as the PTX engine's
@@ -3197,7 +3248,7 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
   };
   const auto ret = [&](unsigned l, uint32_t err) {   // a cudaError_t, kept when it is an error
     w.reg(4, l) = err;
-    if (err) w.dev_err[l] = err;
+    if (err) w.device_error[l] = err;
   };
   const auto store = [&](unsigned l, uint64_t addr, uint64_t v, uint32_t n) {
     // Usually a local variable's address (int d; cudaGetDevice(&d)): a
@@ -3281,8 +3332,8 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
   if (name == "__cudaCDP2GetLastError" || name == "__cudaCDP2PeekAtLastError") {
     const bool clear = name == "__cudaCDP2GetLastError";
     each_lane(ex, [&](unsigned l) {
-      w.reg(4, l) = w.dev_err[l];
-      if (clear) w.dev_err[l] = 0;
+      w.reg(4, l) = w.device_error[l];
+      if (clear) w.device_error[l] = 0;
     });
     return true;
   }

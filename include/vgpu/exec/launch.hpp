@@ -37,6 +37,21 @@ struct GraphConditionals {
   std::unordered_map<uint64_t, uint32_t> values;
 };
 
+// Device-side graph launch (cudaGraphLaunch called from a kernel). The
+// runtime that launched the graph the kernel runs in answers each call: it
+// checks the graph and the named stream and queues the launch, which runs
+// once the kernel is done. Returns the cudaError_t the call returns, or a
+// negative value when the call faults with an illegal address, which is what
+// an RTX 3060 does for a launch from a kernel outside any graph and for a
+// handle that is not a device graph. Called from every thread that calls it,
+// possibly from several host threads at once; the implementation locks.
+struct DeviceGraphLauncher {
+  virtual int launch(uint64_t exec, uint64_t stream) = 0;
+
+ protected:
+  ~DeviceGraphLauncher() = default;
+};
+
 struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
   std::array<uint32_t, 3> block{1, 1, 1};
@@ -87,6 +102,14 @@ struct LaunchConfig {
   // kernel launched outside a graph, whose cudaGraphSetConditional faults --
   // an illegal address on an RTX 3060.
   GraphConditionals* conditionals = nullptr;
+  // The graph this kernel runs in, for device-side graph launch: the handle
+  // %current_graph_exec reads (cudaGetCurrentGraphExec), which is the
+  // executable graph's handle when that graph was instantiated for device
+  // launch and 0 otherwise -- also 0 in a kernel launched outside a graph, as
+  // on an RTX 3060 -- and what answers the kernel's cudaGraphLaunch calls.
+  // Null outside a graph, where such a call faults.
+  uint64_t current_graph_exec = 0;
+  DeviceGraphLauncher* graph_launcher = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still
