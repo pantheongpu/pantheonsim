@@ -38,10 +38,11 @@ for lib in "$@"; do
   if (( ${#have[@]} == 0 )); then
     echo "SKIP: the $lib shim is not built (CUDA ABI headers absent at build time)"; exit 0
   fi
-  # cuStateVec, cuDSS, cuTENSOR, cuTensorNet and cuDNN are not part of the
-  # toolkit, so nvcc has no copy to link against: link against the shim's,
-  # which follows NVIDIA's ABI. cuDNN's headers are vendored.
-  [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cutensor || "$lib" == cutensornet || "$lib" == cudnn ]] &&
+  # cuStateVec, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet and cuDNN are not part
+  # of the toolkit, so nvcc has no copy to link against: link against the
+  # shim's, which follows NVIDIA's ABI. cuDNN's headers are vendored.
+  [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cusparseLt || "$lib" == cutensor ||
+     "$lib" == cutensornet || "$lib" == cudnn ]] &&
     links+=("-L$shim")
   [[ "$lib" == cudnn ]] && links+=("-I$root/nvidia/third_party/cudnn_include")
   links+=("-l$lib")
@@ -52,7 +53,7 @@ nvcc -std=c++17 -cudart "$cudart" -arch=compute_80 -code=compute_80 \
      $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" "${links[@]}"
 require_shim_libs "$shim" "$out" || exit 0
 status=0
-result="$(VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
+result="$(VGPU_GPU=nvidia/a100 VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
 if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU' <<< "$result"; then
   echo "FAIL: the program reached an unimplemented entry point or a refused kernel"; exit 1

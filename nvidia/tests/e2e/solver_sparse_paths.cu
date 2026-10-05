@@ -15,7 +15,8 @@
 //   csreigs                          eigenvalues in a box, counted by Sturm
 //                                    sequences
 //   csrissym, the reorderings,       structural answers, checked for what
-//   csrperm, csrzfd                  defines them
+//   csrperm, csrzfd                  defines them; symrcm, symamd and symmdq
+//                                    also against NVIDIA's own permutations
 //   csrqrsvBatched                   least squares over a batch
 //   refusals                         a non-general matrix type
 //                                    (MATRIX_TYPE_NOT_SUPPORTED), reorder 4
@@ -599,6 +600,68 @@ static void structure() {
   std::snprintf(line, sizeof line, "symrcm, symamd, symmdq, metisnd give permutations; RCM's bandwidth %d (scrambled %d)",
                 rcm_width, scrambled_width);
   check(perms && rcm_width <= 2 * band, line, rcm_width);
+
+  // symrcm, symamd and symmdq give exactly the permutations an RTX 3060's
+  // cuSOLVER (CUDA 13.0) gives: random patterns (half of them symmetric,
+  // diagonal entries stored on some rows only) from the generator they were
+  // measured with, cases 2, 12, 20, 24 and 32 of its sequence.
+  {
+    static const std::vector<int> kWant[5][3] = {
+        {{9, 10, 3, 2, 5, 8, 4, 7, 1, 0, 6}, {9, 2, 3, 6, 0, 10, 4, 5, 1, 7, 8}, {9, 2, 3, 6, 0, 10, 4, 5, 1, 7, 8}},
+        {{6, 15, 9, 5, 22, 8, 20, 0, 14, 1, 7, 2, 4, 10, 19, 17, 21, 18, 16, 12, 13, 3, 11},
+         {0, 17, 8, 20, 15, 21, 11, 13, 2, 1, 3, 4, 5, 6, 7, 9, 10, 12, 14, 16, 18, 19, 22},
+         {0, 17, 21, 15, 8, 11, 13, 20, 1, 2, 3, 4, 5, 6, 7, 9, 10, 12, 14, 16, 18, 19, 22}},
+        {{6, 5, 8, 4, 7, 3, 2, 1, 0}, {0, 1, 2, 3, 6, 4, 7, 5, 8}, {0, 1, 2, 3, 6, 4, 7, 5, 8}},
+        {{9, 8, 11, 1, 3, 5, 4, 14, 10, 2, 15, 16, 13, 12, 6, 0, 7},
+         {8, 9, 14, 2, 3, 1, 5, 11, 10, 4, 16, 6, 7, 0, 12, 13, 15},
+         {8, 9, 14, 2, 3, 1, 5, 11, 10, 4, 16, 6, 7, 0, 12, 13, 15}},
+        {{2, 14, 6, 1, 19, 0, 22, 7, 4, 21, 9, 18, 12, 20, 13, 5, 10, 8, 15, 16, 11, 23, 3, 17},
+         {2, 19, 3, 10, 14, 0, 9, 22, 6, 1, 7, 20, 4, 11, 23, 16, 15, 5, 12, 8, 13, 17, 18, 21},
+         {2, 19, 3, 10, 14, 0, 9, 22, 6, 1, 7, 20, 4, 11, 23, 16, 15, 5, 8, 12, 13, 17, 18, 21}},
+    };
+    static const int kCase[5] = {2, 12, 20, 24, 32};
+    unsigned seed = 12345;
+    auto rnd = [&]() {
+      seed = seed * 1103515245u + 12345u;
+      return (seed >> 8) % 100000 / 100000.0;
+    };
+    int matched = 0, which_case = 0, bad = -1;
+    for (int t = 0; t <= 32; ++t) {
+      const int nn = 5 + (int)(rnd() * 70);
+      const double dens = 0.02 + rnd() * 0.25;
+      const bool sym = rnd() < 0.5;
+      std::vector<std::vector<char>> pat(nn, std::vector<char>(nn, 0));
+      for (int i = 0; i < nn; ++i)
+        for (int j = 0; j < nn; ++j)
+          if (i == j ? rnd() < 0.7 : rnd() < dens) {
+            pat[i][j] = 1;
+            if (sym) pat[j][i] = 1;
+          }
+      if (t != kCase[which_case]) continue;
+      std::vector<int> rp{0}, ci;
+      for (int i = 0; i < nn; ++i) {
+        for (int j = 0; j < nn; ++j)
+          if (pat[i][j]) ci.push_back(j);
+        rp.push_back((int)ci.size());
+      }
+      for (int k = 0; k < 3; ++k) {
+        std::vector<int> p(nn, -1);
+        const int nz = (int)ci.size();
+        const cusolverStatus_t st =
+            k == 0   ? cusolverSpXcsrsymrcmHost(h, nn, nz, D, rp.data(), ci.data(), p.data())
+            : k == 1 ? cusolverSpXcsrsymamdHost(h, nn, nz, D, rp.data(), ci.data(), p.data())
+                     : cusolverSpXcsrsymmdqHost(h, nn, nz, D, rp.data(), ci.data(), p.data());
+        if (st == CUSOLVER_STATUS_SUCCESS && p == kWant[which_case][k])
+          ++matched;
+        else if (bad < 0)
+          bad = t * 10 + k;
+      }
+      ++which_case;
+    }
+    std::snprintf(line, sizeof line, "symrcm, symamd, symmdq: NVIDIA's permutations, %d of 15 (first miss %d)", matched,
+                  bad);
+    check(matched == 15, line, matched);
+  }
 
   // csrpermHost: B = P A Q^T, rows' columns ascending, map carried along.
   {

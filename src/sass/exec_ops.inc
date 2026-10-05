@@ -1931,7 +1931,12 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
       const int64_t off = ins.w.sfield(38, 16);
       each_lane(ex, [&](unsigned l) {
-        const uint64_t o = static_cast<uint64_t>((ra == kRZ ? 0 : static_cast<int64_t>(static_cast<int32_t>(w.reg(ra, l)))) + off);
+        // A bank is 64 KiB, and the address wraps in it: parameters past
+        // 4 KiB (CUDA 12.1+) reach 0x8000 and beyond, which the 16-bit
+        // offset holds as a negative number. ptxas relies on the wrap:
+        // sm_100's c[0x0][-0x7fa8] (RZ) is 0x8058, and c[0x0][R7+-0x7f84]
+        // with R7 = -4*i is parameter byte 0x807c - 4*i.
+        const uint64_t o = static_cast<uint64_t>((ra == kRZ ? 0 : static_cast<int64_t>(static_cast<int32_t>(w.reg(ra, l)))) + off) & 0xffff;
         if (bytes == 8) write64(w, ins.dst[0], l, cbank32(bank, o) | (static_cast<uint64_t>(cbank32(bank, o + 4)) << 32));
         else write32(w, ins.dst[0], l, extend(cbank32(bank, o & ~3ull) >> (8 * (o & 3))));
       });
@@ -2023,8 +2028,13 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (is64) write64(w, d, l, old);
           else write32(w, d, l, static_cast<uint32_t>(old));
           // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
+          // The .64 form's flag is the whole register pair: ptxas's loop
+          // after it (sm_86's atomicAdd of a double in shared memory, as
+          // CUDA Samples' jacobiCudaGraphs does) tests Rd == 1 and Rd+1 == 0,
+          // so leaving the old value's high word in Rd+1 spun forever.
           if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
             if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
+            else if (is64) write64(w, d, l, old == v ? 1 : 0);
             else write32(w, d, l, old == v ? 1 : 0);
           }
         }
@@ -3072,6 +3082,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
 
 void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name) {
   // The CUDA ABI: arguments in R4, R5, R6, R7...; a result in R4 (and R5).
+  if (device_runtime_call(blk, w, ins, ex, name)) return;
   if (name == "vprintf") {   // R4:R5 the format, R6:R7 the argument buffer
     each_lane(ex, [&](unsigned l) {
       const uint64_t fmt = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
@@ -3103,6 +3114,43 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
           cstring(fmt), fetch, cstring, [](Err e, const char* why) { throw Error(e, why); });
       exec::emit_device_printf(out);
       w.reg(4, l) = static_cast<uint32_t>(out.size());
+    });
+    return;
+  }
+  // The device runtime's per-thread error, through the two driver entry
+  // points its library (linked in by -rdc builds) is built on, as the PTX
+  // engine's exec_device_get_last_error: GetLastError reads it without
+  // clearing it, SetLastError writes it.
+  if (name == "__cuda_syscall_cnpv2GetLastError") {
+    each_lane(ex, [&](unsigned l) { w.reg(4, l) = w.device_error[l]; });
+    return;
+  }
+  if (name == "__cuda_syscall_cnpv2SetLastError") {
+    each_lane(ex, [&](unsigned l) {
+      w.device_error[l] = w.reg(4, l);
+      w.reg(4, l) = 0;
+    });
+    return;
+  }
+  if (name == "cudaGraphLaunch") {
+    // (graphExec, stream) from a kernel, as the PTX engine's
+    // exec_device_graph_launch: the runtime that launched this kernel's graph
+    // checks and queues it, and a launch from outside any graph, or of a
+    // handle that is no device graph, faults as on an RTX 3060.
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t g = w.reg(4, l) | (static_cast<uint64_t>(w.reg(5, l)) << 32);
+      const uint64_t s = w.reg(6, l) | (static_cast<uint64_t>(w.reg(7, l)) << 32);
+      int rc = -1;
+      if (cfg_.graph_launcher) rc = cfg_.graph_launcher->launch(g, s);
+      if (rc < 0) {
+        fault(w, ins, l,
+              cfg_.graph_launcher ? std::string("device-side cudaGraphLaunch of a handle that is not a graph "
+                                                "instantiated for device launch")
+                                  : std::string("device-side cudaGraphLaunch in a kernel that is not running in a graph"),
+              Err::InvalidPointer);
+        return;
+      }
+      w.reg(4, l) = static_cast<uint32_t>(rc);
     });
     return;
   }
@@ -3158,7 +3206,157 @@ void Runner::builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const 
     }
     throw Error(Err::DeviceAssert, "device-side assertion failed: " + text);
   }
-  fault(w, ins, 0, "call to " + name + ", which is not available");
+  fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)),
+        "call to " + name + ", which the module does not define and VirtualGPU does not provide",
+        Err::UnsupportedPtx);
+}
+
+const size_t* Runner::kernel_at(uint64_t code_addr) {
+  std::call_once(kernel_by_code_once_, [&] {
+    for (size_t i = 0; i < m_.cubin.kernels.size(); ++i)
+      if (const auto c = m_.code_index.find(m_.cubin.kernels[i].text_section); c != m_.code_index.end())
+        kernel_by_code_[m_.code[c->second].base] = i;
+  });
+  const auto it = kernel_by_code_.find(code_addr);
+  return it == kernel_by_code_.end() ? nullptr : &it->second;
+}
+
+// The device runtime's public entry points (module.cpp, kBuiltins), with
+// the arguments where the CUDA ABI puts them -- a 64-bit one in a register
+// pair, a dim3 in three registers -- as ptxas passes them at the call sites
+// it compiles (cudaGetParameterBufferV2: the kernel in R4:R5, the grid in
+// R6-R8, the block in R9-R11, the shared bytes in R12). The same behaviour as
+// the PTX engine's (src/exec/interpreter.cpp, exec_get_parameter_buffer and
+// the rest). False for any other name.
+bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name) {
+  const auto arg64 = [&](unsigned r, unsigned l) {
+    return w.reg(r, l) | (static_cast<uint64_t>(w.reg(r + 1, l)) << 32);
+  };
+  const auto ret = [&](unsigned l, uint32_t err) {   // a cudaError_t, kept when it is an error
+    w.reg(4, l) = err;
+    if (err) w.device_error[l] = err;
+  };
+  const auto store = [&](unsigned l, uint64_t addr, uint64_t v, uint32_t n) {
+    // Usually a local variable's address (int d; cudaGetDevice(&d)): a
+    // generic store.
+    uint64_t off;
+    const Space sp = classify(addr, &off);
+    mem_write(blk, w, l, sp, off, &v, n);
+  };
+  constexpr uint32_t kSuccess = 0, kInvalidValue = 1, kInvalidConfiguration = 9;
+  if (name == "__cudaCDP2GetParameterBufferV2" || name == "cudaGetParameterBufferV2") {
+    // (func, gridDim, blockDim, sharedMem): a buffer in device memory, laid
+    // out as the kernel's parameters are, for the calling thread to fill.
+    // Null once too many launches are pending, as on hardware.
+    if (!dl_)
+      fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)), "a device-side launch outside a launch that can run it",
+            Err::Unsupported);
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t f = arg64(4, l);
+      const size_t* k = kernel_at(f);
+      if (!k) {
+        char b[24];
+        std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(f));
+        fault(w, ins, l, std::string("a device-side launch names 0x") + b + ", which is not a kernel of this module",
+              Err::InvalidValue);
+      }
+      Child c;
+      c.kernel = *k;
+      for (unsigned i = 0; i < 3; ++i) {
+        c.grid[i] = w.reg(6 + i, l);
+        c.block[i] = w.reg(9 + i, l);
+      }
+      c.shared = w.reg(12, l);
+      c.size = param_bytes(m_.cubin.kernels[*k]);
+      uint64_t buf = 0;
+      {
+        std::lock_guard<std::mutex> guard(dl_->mu);
+        if (dl_->by_buffer.size() + dl_->queue.size() < kMaxPendingLaunches) {
+          buf = c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
+          dl_->by_buffer.emplace(buf, c);
+        }
+      }
+      w.reg(4, l) = static_cast<uint32_t>(buf);
+      w.reg(5, l) = static_cast<uint32_t>(buf >> 32);
+    });
+    return true;
+  }
+  if (name == "__cudaCDP2LaunchDeviceV2" || name == "__cudaCDP2LaunchDeviceV2_ptsz" || name == "cudaLaunchDeviceV2" ||
+      name == "cudaLaunchDeviceV2_ptsz") {
+    // (parameterBuffer, stream): the child is queued to run after this
+    // grid. The stream does not order it: every device-side stream's
+    // launches may run then (cudaStreamTailLaunch must), and children run
+    // in the order issued.
+    if (!dl_)
+      fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)), "a device-side launch outside a launch that can run it",
+            Err::Unsupported);
+    const uint64_t block_linear =
+        (uint64_t{blk.ctaid[2]} * cfg_.grid[1] + blk.ctaid[1]) * cfg_.grid[0] + blk.ctaid[0];
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t b = arg64(4, l);
+      std::lock_guard<std::mutex> guard(dl_->mu);
+      const auto it = dl_->by_buffer.find(b);
+      if (it == dl_->by_buffer.end()) {
+        ret(l, kInvalidValue);   // not a buffer cudaGetParameterBuffer handed out
+        return;
+      }
+      Child c = it->second;
+      dl_->by_buffer.erase(it);
+      const uint64_t threads = uint64_t{c.block[0]} * c.block[1] * c.block[2];
+      if (!c.grid[0] || !c.grid[1] || !c.grid[2] || !threads ||
+          (profile_.limits.max_threads_per_block && threads > profile_.limits.max_threads_per_block)) {
+        mem_.free(c.buffer);
+        ret(l, kInvalidConfiguration);
+        return;
+      }
+      c.order = (block_linear << 24) | (dl_->per_block[block_linear]++ & 0xFFFFFF);
+      dl_->queue.push_back(c);
+      ret(l, kSuccess);
+    });
+    return true;
+  }
+  if (name == "__cudaCDP2GetLastError" || name == "__cudaCDP2PeekAtLastError") {
+    const bool clear = name == "__cudaCDP2GetLastError";
+    each_lane(ex, [&](unsigned l) {
+      w.reg(4, l) = w.device_error[l];
+      if (clear) w.device_error[l] = 0;
+    });
+    return true;
+  }
+  if (name == "__cudaCDP2GetDevice" || name == "__cudaCDP2GetDeviceCount") {
+    // (int*): the answer the host gets, written where the pointer points.
+    const int v = name == "__cudaCDP2GetDevice" ? cfg_.device_ordinal : cfg_.device_count;
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t p = arg64(4, l);
+      if (!p) return ret(l, kInvalidValue);
+      store(l, p, static_cast<uint32_t>(v), 4);
+      ret(l, kSuccess);
+    });
+    return true;
+  }
+  if (name == "__cudaCDP2StreamCreateWithFlags" || name == "__cudaCDP2EventCreateWithFlags") {
+    // (handle*, flags): a non-null handle, distinct per call; the flags are
+    // accepted as they come (child grids run in launch order, which every
+    // ordering these can ask for already satisfies).
+    static std::atomic<uint64_t> next{1};
+    constexpr uint64_t kHandleBase = 0x5654'4750'0000'0000ull;   // "VTGP", as the PTX engine's: never an address
+    each_lane(ex, [&](unsigned l) {
+      const uint64_t p = arg64(4, l);
+      if (!p) return ret(l, kInvalidValue);
+      store(l, p, kHandleBase + next.fetch_add(1, std::memory_order_relaxed), 8);
+      ret(l, kSuccess);
+    });
+    return true;
+  }
+  if (name == "__cudaCDP2StreamDestroy" || name == "__cudaCDP2EventDestroy" || name == "__cudaCDP2EventRecord" ||
+      name == "__cudaCDP2EventRecord_ptsz" || name == "__cudaCDP2EventRecordWithFlags" ||
+      name == "__cudaCDP2EventRecordWithFlags_ptsz" || name == "__cudaCDP2StreamWaitEvent" ||
+      name == "__cudaCDP2StreamWaitEvent_ptsz") {
+    // Nothing left to do: children already run one after another.
+    each_lane(ex, [&](unsigned l) { ret(l, kSuccess); });
+    return true;
+  }
+  return false;
 }
 
 // The cluster barrier completes its phase when every thread of the cluster

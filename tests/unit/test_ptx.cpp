@@ -109,9 +109,9 @@ VTEST(an_unknown_special_register_is_not_silently_a_register) {
   //
   // The example used to be a real register not yet implemented, and the test
   // kept outliving its examples: %total_smem_size, then %clusterid, then
-  // %current_graph_exec, which is now refused by name (below). Every special
-  // register the PTX ISA defines is now either implemented or refused by
-  // name, so the example is a name no register has.
+  // %current_graph_exec. Every special register the PTX ISA defines is now
+  // either implemented or refused by name, so the example is a name no
+  // register has.
   auto err = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %not_a_special_register;\nret;")));
   VCHECK(err.code() == Err::UnsupportedPtx);
   VCHECK_CONTAINS(err.what(), "%not_a_special_register");
@@ -132,11 +132,18 @@ VTEST(registers_with_no_honest_value_are_refused_by_name) {
   auto pm8 = VCAPTURE(Error, parse(wrap_kernel("mov.u32 %r1, %pm8;\nret;")));
   VCHECK(pm8.code() == Err::UnsupportedPtx);
   VCHECK(std::string(pm8.what()).find("performance-monitor") == std::string::npos);
-  // The kernel's graph, which only device-side graph launch would use.
-  auto graph = VCAPTURE(Error, parse(wrap_kernel("mov.u64 %rd1, %current_graph_exec;\nret;")));
-  VCHECK(graph.code() == Err::UnsupportedPtx);
-  VCHECK_CONTAINS(graph.what(), "%current_graph_exec");
-  VCHECK_CONTAINS(graph.what(), "device-side graph launch");
+}
+
+VTEST(current_graph_exec_is_a_special_register) {
+  // cudaGetCurrentGraphExec(): the device graph a kernel runs in, now that
+  // device-side graph launch exists (it used to be refused by name).
+  Module m = parse(wrap_kernel("mov.u64 %rd1, %current_graph_exec;\nret;"));
+  const auto& body = m.entries.at(0).body;
+  bool found = false;
+  for (const auto& ins : body)
+    if (const auto* mov = std::get_if<OpMov>(&ins.op))
+      if (const auto* sr = std::get_if<SregOperand>(&mov->src)) found = sr->reg == Sreg::CurrentGraphExec;
+  VCHECK(found);
 }
 
 VTEST(aggr_smem_size_needs_sm_90_and_ptx_8_1) {
