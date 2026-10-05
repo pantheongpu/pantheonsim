@@ -485,7 +485,7 @@ jobs:
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
-            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm)$' \
+            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_pytorch_sweep_full|e2e_pytorch_dist_full)$' \
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
