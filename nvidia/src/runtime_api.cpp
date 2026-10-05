@@ -452,6 +452,7 @@ bool poisons_context(const char* api, vgpu::Err e) {
     case Err::MisalignedAccess:
     case Err::UninitializedRegister:
     case Err::Trap:
+    case Err::IllegalInstruction:
     case Err::DeviceAssert:
     case Err::DeviceLost:
       return kernel;
@@ -496,6 +497,9 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     // debugger attached ends a kernel the same way: an RTX 3060 reports both
     // as "unspecified launch failure" (719), not an illegal instruction.
     case Err::Trap: code = cudaErrorLaunchFailure; break;
+    // A *.sync warp instruction run by a thread its member mask leaves out: an
+    // RTX 3060 reports 715, as for an undefined opcode.
+    case Err::IllegalInstruction: code = cudaErrorIllegalInstruction; break;
     case Err::DeviceAssert: code = cudaErrorAssert; break;
     case Err::EccUncorrectable: code = cudaErrorECCUncorrectable; break;
     // "unspecified launch failure": what programs report when their GPU falls

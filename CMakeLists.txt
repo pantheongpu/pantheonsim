@@ -157,6 +157,7 @@ add_library(vgpu STATIC
   src/ptx/parser.cpp
   src/ptx/regalloc.cpp
   src/ptx/contract.cpp
+  src/ptx/sync_masks.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp

@@ -123,10 +123,14 @@ run_one() {
   if [[ $mode == digest ]]; then
     # SASS, then PTX; the PTX run's output beside the SASS run's.
     rm -f "$report/digest/$name".*
+    # The clock stands still (fixed_time.c): a program that seeds its random
+    # numbers from time() would otherwise hand the two runs different inputs.
     (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" VGPU_THREADS=1 VGPU_SASS_LOG=1 \
+       ${fixed_time:+LD_PRELOAD="$fixed_time"} \
        VGPU_KERNEL_DIGEST="$report/digest/$name.sass" timeout -k 10 "$timeout_s" "$@" > "$log" 2>&1 < /dev/null)
     rc=$?
     (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" VGPU_THREADS=1 VGPU_SASS=0 \
+       ${fixed_time:+LD_PRELOAD="$fixed_time"} \
        VGPU_KERNEL_DIGEST="$report/digest/$name.ptx" timeout -k 10 "$timeout_s" "$@" > "$log.ptx" 2>&1 < /dev/null)
     rc_ptx=$?
   else
@@ -143,6 +147,17 @@ digest_result() {
   if [[ $rc != 0 || $rc_ptx != 0 ]]; then result "$name" FAIL "$secs" "exit $rc on SASS, $rc_ptx on PTX"; return; fi
   if ! grep -q "running SASS" "$report/logs/$name.log" || grep -q "running PTX instead of SASS" "$report/logs/$name.log"; then
     result "$name" ok "$secs" "ran PTX both times: $(grep -m1 -o 'running PTX instead of SASS.*' "$report/logs/$name.log" || echo 'no SASS ran')"
+    return
+  fi
+  if [[ ! -s $d.ptx && ! -s $d.sass ]]; then
+    # No launch finished on either engine (a digest line is written after a
+    # launch completes): both ended the first one the same way if they print
+    # the same, as HeCBench's bscan does -- an illegal instruction, as on a card.
+    if cmp -s <(grep -v '^\[vgpu\] running' "$report/logs/$name.log") "$report/logs/$name.log.ptx"; then
+      result "$name" ok "$secs" "no launch finished on either engine, and they print the same"
+    else
+      result "$name" FAIL "$secs" "no digest written, and the output differs"
+    fi
     return
   fi
   if [[ ! -s $d.ptx ]]; then result "$name" FAIL "$secs" "no digest written"; return; fi
@@ -166,6 +181,10 @@ run() {
   shim="$(cd "${4:?shim dir}" && pwd)"; report="$(mkdir -p "${5:?report dir}" && cd "$5" && pwd)"
   cd "$dir" || exit 1
   : > "$report/results.tsv"; mkdir -p "$report/logs" "$report/digest"
+  fixed_time=""
+  if [[ $mode == digest ]] && cc -shared -fPIC -O2 -o "$report/fixed_time.so" "$here/fixed_time.c" 2>/dev/null; then
+    fixed_time="$report/fixed_time.so"
+  fi
   local fails=0 total=0
   result() {  # result <name> <ok|FAIL> <secs> <detail>
     printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$report/results.tsv"

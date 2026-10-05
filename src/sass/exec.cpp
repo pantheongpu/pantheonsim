@@ -67,6 +67,10 @@ struct Warp {
   Mask alive = 0;                     // lanes that are threads of the block
   Mask exited = 0;
   Mask waiting = 0;
+  // Lanes whose WARPSYNC is satisfied but that wait for the lanes released
+  // before them (named another mask) to run, so the two sets do not execute
+  // together as one convergent group.
+  Mask ws_held = 0;
   Wait wait_kind[32] = {};
   uint32_t wait_arg[32] = {};         // the barrier a lane waits on
   Mask b[16] = {};                    // convergence barriers
@@ -917,7 +921,26 @@ bool straight(const Instr& ins);
 
 // One instruction for one group of lanes. False when no lane can run.
 bool Runner::step_warp(Block& blk, Warp& w) {
-  const Mask run = w.runnable();
+  Mask run = w.runnable();
+  if (w.ws_held && (!run || w.give_way)) {
+    // Everything released so far has run as far as it can, or is spinning
+    // (a YIELD, a backward branch it has taken a good many times): the next
+    // set of lanes that named another mask goes (see Op::WARPSYNC).
+    const uint32_t arg = w.wait_arg[std::countr_zero(w.ws_held)];
+    Mask next = 0;
+    for (Mask m = w.ws_held; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      if (w.wait_arg[l] == arg) next |= Mask{1} << l;
+    }
+    w.ws_held &= ~next;
+    for (Mask m = next; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      w.waiting &= ~(Mask{1} << l);
+      w.wait_kind[l] = Wait::None;
+      w.pc[l] += 16;
+    }
+    run = w.runnable();
+  }
   if (!run) return false;
   // The group at the lowest address -- or, when the running group has been
   // spinning, the next group up, so it gives the others a turn. One pass

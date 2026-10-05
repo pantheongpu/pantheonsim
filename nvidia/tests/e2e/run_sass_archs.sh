@@ -34,11 +34,12 @@ declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm
                 [sm_120]=nvidia/rtx5090 [sm_120a]=nvidia/rtx5090)
 archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm_120 sm_120a})
 # program:first architecture it builds for (the MMA programs need sm_80)
-# [:last one it runs on (runtime_conformance checks a T4's properties)].
+# [:last one it runs on (runtime_conformance checks a T4's properties;
+# sync_masks' values are what an RTX 3060's ptxas code did).
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
        runtime_conformance:75:75 symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75
        texture_layers:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 smem_size_regs:75
-       dynamic_parallelism:75 cdp_device_api:75 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
+       sync_masks:86:86 dynamic_parallelism:75 cdp_device_api:75 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
        stmatrix:90a setmaxnreg:90a tcgen05_gemm:100a mma_blockscale:120a})

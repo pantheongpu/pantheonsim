@@ -2082,7 +2082,10 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
           default: j = l ^ b; in = j <= maxl; break;
         }
         if (!in) j = l;
-        write32(w, ins.dst[1], l, vals[j & 31]);
+        // A source lane that is not running this shuffle gives 0, not what
+        // its register holds (an RTX 3060: lanes 0-15 of a diverged warp
+        // shuffling from lane 17 read 0).
+        write32(w, ins.dst[1], l, ((ex >> (j & 31)) & 1) ? vals[j & 31] : 0);
         set_pred(w, ins.dst[0], l, in);
       });
       return;
@@ -2786,8 +2789,23 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     Mask release = 0;
     each_lane(waiting_ws, [&](unsigned l) {
       const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
-      if ((need & ~waiting_ws) == 0) release |= Mask{1} << l;
+      if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
     });
+    // Lanes that named different masks do not come out of it together: ptxas's
+    // code for a *.sync instruction whose lanes name different masks runs the
+    // instruction after each distinct mask's WARPSYNC, over the lanes that
+    // named it (an RTX 3060: __ballot_sync(1u << lane, p) is each lane's own
+    // bit of p; Runner::step_warp releases the next set when this one has
+    // run as far as it can).
+    if (release) {
+      const uint32_t first_arg = w.wait_arg[std::countr_zero(release)];
+      Mask now = 0;
+      each_lane(release, [&](unsigned l) {
+        if (w.wait_arg[l] == first_arg) now |= Mask{1} << l;
+      });
+      w.ws_held = release & ~now;
+      release = now;
+    }
     // A .COLLECTIVE warpsync runs what follows it (up to ENDCOLLECTIVE) once
     // for all its lanes. Lanes that reach it from different places in the
     // code would each run their own copy here, so that is refused rather
@@ -2891,9 +2909,19 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
           want = u.reg >= (m_.sm >= 100 ? 255u : 63u) ? 0 : w.ur[u.reg];
           if (u.bnot) want = ~want;
         }
+        // The guard decides too, as ptxas uses it (R2UR P, URZ, R; @!P BRA...
+        // after REDUX.OR UR, R, or a LOP3 that finds lanes whose mask-mates
+        // name another mask): it holds for every lane when they all agree.
+        // Then the branch is a question of whether the lanes the mask names
+        // are all here: .DIV goes to the per-mask code when they are not,
+        // .CONV to the converged code when they are. When the lanes disagree
+        // (some guard holds, not all) the whole group goes to the per-mask
+        // code -- an RTX 3060's __ballot_sync(1u << lane, p) is each lane's
+        // own bit, not the warp's vote.
         const Mask full = want & w.alive & ~w.exited;
-        const bool converged = group == full;
-        take = (ins.f[0] == 2 ? !converged : converged) ? ex : 0;
+        const bool agreed = take == group && (full & ~group) == 0;
+        if (ins.f[0] == 2) take = (take && !agreed) ? group : 0;
+        else take = agreed ? group : 0;
       }
       const int64_t target = ins.src.back().imm;
       each_lane(group, [&](unsigned l) {
@@ -3041,6 +3069,12 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
             if (!m && (o.kind == Kind::Reg || o.kind == Kind::UReg || o.kind == Kind::Imm || o.kind == Kind::CBank))
               m = &o;
           w.wait_arg[l] = ins.f[0] || !m ? ~Mask{0} : read32(w, *m, l);
+          // A thread its own mask leaves out may not run it: an RTX 3060 ends
+          // the kernel with "an illegal instruction was encountered" (715), as
+          // PTX's *.sync instructions require the thread in the mask.
+          if (!((w.wait_arg[l] >> l) & 1u))
+            throw Error(Err::IllegalInstruction, "SASS kernel " + k_.name + ": WARPSYNC run by lane " + std::to_string(l) +
+                                                     ", which its mask " + std::to_string(w.wait_arg[l]) + " leaves out");
         } else {
           w.pc[l] += 16;
         }
