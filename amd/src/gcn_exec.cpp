@@ -342,17 +342,43 @@ struct Machine {
     if (addr % size == 0) return m.store_scalar(addr, size, v);
     for (uint32_t b = 0; b < size; ++b) m.store_scalar(addr + b, 1, (v >> (8 * b)) & 0xFF);
   }
-  // Two to four words, as a wide load or store moves them: each aligned pair
-  // of words as one 8-byte access, the way the hardware moves them. Another
-  // device's kernel, on another host thread, reading while this one writes
-  // sees each pair old or new, never half of each -- which RCCL's LL protocol
-  // counts on: a word of data and the flag that says it has arrived share
-  // eight bytes, and the reader trusts the data once it sees the flag.
-  // Moved a word at a time, it could read the old data, then the new flag.
+  // Two to four words, as a wide load or store moves them: each aligned four
+  // as one 16-byte access and each aligned pair as one 8-byte access, the way
+  // the hardware moves them. Another kernel, on another host thread, reading
+  // while this one writes sees each old or new, never half of each. RCCL's LL
+  // protocol counts on it for eight bytes, a word of data and the flag that
+  // says it has arrived; rocPRIM's decoupled look-back for sixteen, a tile's
+  // flag and its 64-bit prefix. Moved in pieces, a reader could take the old
+  // data with the new flag.
   static constexpr uint32_t kMaxWords = 16;
+  // Four words at a 16-byte boundary as one access, where they are in one
+  // device allocation; false, having done nothing, where they are not (the
+  // pieces then say what is wrong).
+  bool load_quad(uint64_t addr, uint32_t* out) const {
+    uint64_t v[2];
+    try {
+      at(addr).load_quad(addr, v);
+    } catch (const Error&) {
+      return false;
+    }
+    std::memcpy(out, v, 16);
+    return true;
+  }
+  bool store_quad(uint64_t addr, const uint32_t* words) {
+    uint64_t v[2];
+    std::memcpy(v, words, 16);
+    try {
+      at(addr).store_quad(addr, v);
+    } catch (const Error&) {
+      return false;
+    }
+    return true;
+  }
   void load_words(uint64_t addr, uint32_t n, uint32_t* out) const {
     for (uint32_t k = 0; k < n;) {
-      if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
+      if (k + 3 < n && (addr + 4 * k) % 16 == 0 && load_quad(addr + 4 * k, out + k)) {
+        k += 4;
+      } else if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
         const uint64_t v = load(addr + 4 * k, 8);
         out[k] = static_cast<uint32_t>(v), out[k + 1] = static_cast<uint32_t>(v >> 32);
         k += 2;
@@ -364,7 +390,9 @@ struct Machine {
   }
   void store_words(uint64_t addr, uint32_t n, const uint32_t* words) {
     for (uint32_t k = 0; k < n;) {
-      if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
+      if (k + 3 < n && (addr + 4 * k) % 16 == 0 && store_quad(addr + 4 * k, words + k)) {
+        k += 4;
+      } else if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
         store(addr + 4 * k, 8, words[k] | uint64_t{words[k + 1]} << 32);
         k += 2;
       } else {

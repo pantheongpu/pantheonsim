@@ -488,11 +488,55 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   failed the whole kernel over something it read only to decide when to stop
   waiting.
 
-  Still refused, each by name: the thread-block cluster registers (%clusterid,
-  %cluster_ctaid, %cluster_ctarank, %is_explicit_cluster), which need a cluster
-  concept the scheduler does not have; %pm0-%pm7, which are hardware
-  performance-monitor counters with no defined value unless a profiler set
-  them; and %current_graph_exec.
+  (The cluster registers, %aggr_smem_size and %current_graph_exec have
+  since been implemented; what stays refused is %pm0-%pm7 -- see
+  "Registers and counters" below for the whole list.)
+- Device-side graph launch (CUDA 12): a kernel's cudaGraphLaunch of a graph
+  instantiated with cudaGraphInstantiateFlagDeviceLaunch, into
+  cudaStreamGraphFireAndForget, cudaStreamGraphTailLaunch or
+  cudaStreamGraphFireAndForgetAsSibling, with the programming guide's
+  execution environments: fire-and-forget and sibling graphs run when the
+  launching kernel is done, tail launches once its graph and their children
+  are (a tail graph's own tails before those queued ahead of it), all before
+  the host launch completes. A device launch runs the graph as last uploaded.
+  %current_graph_exec reads the device graph's handle on both engines (SASS:
+  the bank-0 word ptxas loads, 0x120/0x130/0x190/0x2e8 by generation). Every
+  refusal is the RTX 3060's: only the three graph streams; a null, not
+  uploaded, running or already queued graph; 120 fire-and-forget launches per
+  execution, 255 queued tails; one tail self-launch at a time -- all
+  cudaErrorInvalidValue -- a handle not instantiated for device launch faults,
+  and a kernel that calls cudaGraphLaunch launched outside a graph is refused
+  with cudaErrorNotSupported. Instantiation for device launch refuses what the
+  card refuses (empty graphs, empty/host/event nodes, dynamic parallelism,
+  pageable or managed copies, AutoFreeOnLaunch). e2e_device_graph_launch,
+  both engines; it passes on the card.
+- nvJitLink links relocatable SASS (-rdc/-dc cubins, objects, libraries) into
+  a linked cubin that runs as SASS (nvidia/src/sass_link.cpp; see
+  nvidia/docs/libraries.md). Written from cuobjdump -elf listings of NVIDIA's
+  inputs and outputs; matches NVIDIA's link byte for byte in code and
+  relocations for sm_75-sm_90, and NVIDIA's driver runs its output.
+  e2e_nvjitlink_sass, sm_75 to sm_120, passes on the card with either
+  nvJitLink.
+- nvJPEG: progressive decoding, multi-scan and restart handling, CMYK/YCCK,
+  NV12/YUY2 output; the batched API torchvision.io.decode_jpeg uses and the
+  decoupled three-phase API with streams, decoder states, buffers and decode
+  parameters (region of interest, CMYK); progressive encoding, optimised
+  Huffman tables, every subsampling, YUV and NV12 input, device retrieval,
+  copied quantisation tables. Decoded pixels match NVIDIA's nvJPEG 13.0 on an
+  RTX 3060 on all but 10 of 5.5 million samples (within two counts), and every
+  refusal is the card's. e2e_nvjpeg_paths passes against both libraries.
+- NPP: every entry point OpenCV (cudaarithm, cudaimgproc, cudawarping,
+  cudafilters), DALI, FFmpeg's scale_npp, jetson-utils and the CUDA Samples
+  call, but watershed segmentation and marker-label compression (one CUDA
+  Sample): warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and
+  shifts with constants, alpha compositing, gamma, Bayer demosaicing, LUT,
+  masked/float statistics, histograms, integral images, rank and morphological
+  filters, Prewitt gradients, Canny (nvidia/src/npp_imgproc.cpp,
+  npp_core.hpp). Sampling, rounding and fused-arithmetic conventions measured
+  on an RTX 3060 against NPP 13.0; npp_imgproc's 289 results match it (golden
+  in e2e_library_goldens), the near-ties listed in libraries.md marked.
+  Remaining: watershed, marker labels, ResizeSqrPixel super-sampling and
+  Lanczos, Scharr Canny's exact edges, the resize cubic kernel.
 - f16 (software IEEE binary16) and packed f16x2 arithmetic.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
@@ -1138,17 +1182,32 @@ Two questions that look alike and are not.
 
 **Special registers are per *architecture*, not per GPU model.** `%tid`,
 `%laneid`, `%smid` and `%clock64` are PTX ISA instructions, identical on a T4
-and a B200. What varies is which exist -- the ten thread-block cluster
-registers require sm_90 -- and what they return, which is already profile
-driven (`%nsmid` is 132 on an H100 and 58 on an L4). The parser knows 52 names
-and the `%envreg` bank, the cluster registers and Hopper's `%aggr_smem_size`
-included. What they return is still approximate in three
-places: `%smid` is round-robin rather than real placement, `%clock`, `%clock64`
-and `%globaltimer` count instructions rather than time, and only `%envreg1-2`
-are set. `%pm0`-`%pm7` and their 64-bit forms `%pm0_64`-`%pm7_64` stay refused
-on purpose, by name: they are undefined unless a profiler configured them, so a
-silent zero would be a confidently wrong answer. So does `%current_graph_exec`,
-which only device-side graph launch would use.
+and a B200. What varies is which exist -- the thread-block cluster registers
+require sm_90 -- and what they return, which is already profile driven
+(`%nsmid` is 132 on an H100 and 58 on an L4). Every special register in the
+PTX ISA (chapter "Special Registers", ISA 9.0) is either implemented, on both
+engines, or refused by name:
+
+| Register | Status |
+| --- | --- |
+| `%tid`, `%ntid`, `%ctaid`, `%nctaid` | implemented |
+| `%laneid`, `%warpid`, `%nwarpid` | implemented (`%warpid` is the warp's index in its block, which is what this engine's scheduling makes it) |
+| `%lanemask_eq/_le/_lt/_ge/_gt` | implemented |
+| `%smid`, `%nsmid` | implemented; `%smid` is a round-robin placement, distinct among resident blocks |
+| `%gridid` | implemented: a serial number per launch |
+| `%clusterid`, `%nclusterid`, `%cluster_ctaid`, `%cluster_nctaid`, `%cluster_ctarank`, `%cluster_nctarank`, `%is_explicit_cluster` | implemented (sm_90+), with clusters from `__cluster_dims__` and `cudaLaunchKernelEx`; a launch without a cluster behaves as 1x1x1 |
+| `%clock`, `%clock_hi`, `%clock64`, `%globaltimer`, `%globaltimer_lo`, `%globaltimer_hi` | implemented as a deterministic, monotonic count of the block's instructions -- not a time (no timing model) |
+| `%envreg0`-`%envreg31` | implemented; the driver sets only `%envreg1`/`%envreg2` (a cooperative launch's grid-barrier workspace), the rest read 0 |
+| `%dynamic_smem_size`, `%total_smem_size`, `%aggr_smem_size` | implemented; `%aggr_smem_size` refused below sm_90 or PTX ISA 8.1, as ptxas refuses it |
+| `%reserved_smem_offset_begin/_end/_cap/_0/_1` | implemented (sm_80+), as an RTX 3060 reports them |
+| `%current_graph_exec` | implemented: the device graph the kernel runs in, 0 outside one (device-side graph launch; on SASS the bank-0 word ptxas loads it from) |
+| `%pm0`-`%pm7`, `%pm0_64`-`%pm7_64` | **refused by name**: hardware performance-monitor counters, undefined unless a profiler configured them, and with no timing model there is nothing to count, so a silent zero would be a confidently wrong answer |
+
+A `%`-name that is none of these is refused as an unknown special register,
+never read as an unwritten ordinary register. What they return is still
+approximate in three places: `%smid` is round-robin rather than real
+placement, the clock family counts instructions rather than time, and only
+`%envreg1-2` are set.
 
 **Performance counters here are not hardware counters, and so are the same on
 every profile by construction.** `global_sectors` is computed from the
