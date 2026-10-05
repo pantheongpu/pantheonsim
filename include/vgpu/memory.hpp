@@ -167,6 +167,18 @@ class MemoryManager {
   // naturally aligned. Values are zero-extended into the returned u64.
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
   void store_scalar(uint64_t addr, uint32_t size, uint64_t value);
+  // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
+  // or store (global_load_dwordx4): a kernel on another host thread sees them
+  // all old or all new, never half of each. rocPRIM's decoupled look-back
+  // packs a tile's flag and 64-bit prefix into sixteen bytes and trusts the
+  // prefix once it sees the flag. One instruction where the host has one
+  // that is atomic (x86-64 with AVX, whose aligned 16-byte SSE accesses Intel
+  // and AMD guarantee are), a lock striped by address elsewhere. With a fault
+  // armed (not merely attached, as the runtime attaches its faults to every
+  // device) or a host mapping possibly in range, two 8-byte accesses, as
+  // load_scalar and store_scalar make them.
+  void load_quad(uint64_t addr, uint64_t out[2]) const;
+  void store_quad(uint64_t addr, const uint64_t in[2]);
 
   // Notified with the new total whenever allocated bytes change. Used to feed
   // live memory telemetry; optional and unset by default.

@@ -31,5 +31,5 @@ done
 
 fail=0
 for p in "${pids[@]}"; do wait "$p" || fail=1; done
-[[ $fail -eq 0 ]] && echo "$nranks ranks, $nranks processes: allreduce + allgather + send/recv all correct"
+[[ $fail -eq 0 ]] && echo "$nranks ranks, $nranks processes: collectives, send/recv, split, non-blocking, premulsum, alltoall and shrink all correct"
 exit $fail

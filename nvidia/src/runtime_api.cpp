@@ -296,6 +296,7 @@ struct State {
   struct KernelCalls {
     bool heap = false;
     bool printf = false;
+    bool graph_launch = false;   // calls cudaGraphLaunch from the device
   };
   std::unordered_map<const vgpu::ptx::EntryFn*, KernelCalls> kernel_calls;
   // Enabled peer mappings as (accessing device, peer device). Direction
@@ -1147,6 +1148,33 @@ cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled);
 // across instantiations, as on an RTX 3060.
 vgpu::exec::GraphConditionals g_graph_conditionals;
 
+// Device-side graph launch (CUDA programming guide, "Device Graph Launch"). A
+// graph runs in an execution environment, which holds its fire-and-forget
+// children and the graphs it queued for tail launch; a host launch's
+// environment sits in the stream's. A kernel's cudaGraphLaunch is checked and
+// queued here (launch()), and the queued graphs run once the kernel is done:
+// fire-and-forget and sibling launches straight after it (they run
+// independently of the rest of the graph, so any point is a correct one, and
+// this one is deterministic), tail launches once the graph and its children
+// have finished. Everything here is under g_devgraph_mu, because a grid's
+// blocks may call launch() from several host threads at once.
+struct DeviceGraphEnv final : vgpu::exec::DeviceGraphLauncher {
+  // The device graph running in this environment: what %current_graph_exec
+  // reads, and what a tail self-launch names. Null for a host graph, which
+  // may launch device graphs but reads 0 there, as on an RTX 3060.
+  void* self = nullptr;
+  // Where a sibling launch goes: the environment this one is a child of.
+  // Null for the stream's own environment.
+  DeviceGraphEnv* parent = nullptr;
+  std::deque<void*> now;     // fire-and-forget (and siblings), to run next
+  std::vector<void*> tails;  // tail launches, in the order queued
+  int fire_and_forget = 0;   // this execution's, toward its limit of 120
+  bool self_tail = false;    // a tail self-launch is queued
+  int launch(uint64_t exec, uint64_t stream) override;
+};
+thread_local DeviceGraphEnv* t_graph_env = nullptr;   // the environment a graph's kernel runs in
+static void run_launched_now(DeviceGraphEnv& env, cudaStream_t stream);
+
 // The body of both launch entry points. `cooperative` is the only difference,
 // and it changes one thing: whether the blocks are resident together and may
 // wait on each other. See the scheduler note in interpreter.cpp.
@@ -1235,12 +1263,26 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
           for (const std::string& f : vgpu::sass::reachable(*fn->sass, fn->name)) {
             if (f == "malloc" || f == "free") found.heap = true;
             if (f == "vprintf") found.printf = true;
+            if (f == "cudaGraphLaunch") found.graph_launch = true;
           }
         for (const auto& ins : fn->body)
           if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
             if (c->callee == "malloc" || c->callee == "free") found.heap = true;
             if (c->callee == "vprintf") found.printf = true;
           }
+        // PTX: the device functions it calls too.
+        std::set<const vgpu::ptx::EntryFn*> seen;
+        std::vector<const vgpu::ptx::EntryFn*> todo{fn};
+        while (!todo.empty() && !found.graph_launch) {
+          const vgpu::ptx::EntryFn* f = todo.back();
+          todo.pop_back();
+          if (!seen.insert(f).second) continue;
+          for (const auto& ins : f->body)
+            if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
+              if (c->callee == "cudaGraphLaunch") found.graph_launch = true;
+              if (c->target) todo.push_back(c->target);
+            }
+        }
         kc = calls.emplace(fn, found).first;
       }
       State::DeviceLimits& lim = s.limits[t_current_device];
@@ -1248,6 +1290,16 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       lim.printf_used = lim.printf_used || kc->second.printf;
       cfg.device_heap_bytes = lim.malloc_heap;
       cfg.stack_bytes = lim.stack;   // cudaLimitStackSize: each thread's alloca stack
+      // A kernel that launches graphs from the device runs only in a graph.
+      // Launched on its own, an RTX 3060 refused it with
+      // cudaErrorNotSupported and did not run it; other kernels of its
+      // module still ran.
+      if (kc->second.graph_launch && std::strcmp(api, "cudaGraphLaunch") != 0) {
+        if (!quiet())
+          std::fprintf(stderr, "[vgpu] %s: kernel '%s' calls cudaGraphLaunch, so it can only be launched "
+                               "in a graph\n", api, ki.entry_name.c_str());
+        return cudaErrorNotSupported;
+      }
     }
     if (cooperative) {
       // A cooperative launch promises every block is resident, so the grid has
@@ -1272,7 +1324,12 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     }
     cfg.nonportable_cluster = ki.nonportable_cluster;
     // A graph's kernels can set its conditional handles; no other kernel can.
-    if (std::strcmp(api, "cudaGraphLaunch") == 0) cfg.conditionals = &g_graph_conditionals;
+    if (std::strcmp(api, "cudaGraphLaunch") == 0) {
+      cfg.conditionals = &g_graph_conditionals;
+      // And launch device graphs, and ask which device graph they are in.
+      cfg.graph_launcher = t_graph_env;
+      cfg.current_graph_exec = t_graph_env ? reinterpret_cast<uint64_t>(t_graph_env->self) : 0;
+    }
     dev.launch(*fn, cfg, kargs, dev.symbols(mid));
     if (profiling) {
       vgpu::profiling::Event ev;
@@ -4729,6 +4786,12 @@ void forget_graph_tree(const GraphRec& g) {
   std::erase_if(g_cond_handles, [&](const auto& kv) { return tree.count(kv.second.owner) != 0; });
 }
 std::unordered_map<void*, std::unique_ptr<GraphRec>> g_graph_execs; // instantiated graphs
+// Executable graphs instantiated for device launch, and the copy of each that
+// was last uploaded (cudaGraphUpload, cudaGraphInstantiateFlagUpload, or a
+// host launch): that copy is what a kernel's cudaGraphLaunch runs. On an RTX
+// 3060 a device launch after cudaGraphExecUpdate ran the graph as it was until
+// it was uploaded again, as the programming guide says it must be.
+std::unordered_map<void*, std::unique_ptr<GraphRec>> g_device_graphs;   // null: not yet uploaded
 // Capture sequences, and the streams taking part in them. A sequence owns the
 // graph it builds until cudaStreamEndCapture hands it over. Every stream taking
 // part -- the one that began it, and any that joined by waiting on an event
@@ -5128,6 +5191,96 @@ cudaError_t check_conditionals(const GraphRec& g, cudaGraphInstantiateResult* re
   return cudaSuccess;
 }
 
+// Whether a kernel launches kernels (dynamic parallelism), which a graph for
+// device launch may not hold: its code, or a device function it calls, calls
+// the device runtime's launch.
+bool kernel_launches_kernels(const void* func) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!s.rt) return false;
+  auto it = s.kernels.find(func);
+  if (it == s.kernels.end() || !it->second.mod || !registered_ptx(s, *it->second.mod)) return false;
+  const uint64_t mid = module_on_current(s, *it->second.mod);
+  const vgpu::ptx::EntryFn* fn = current(s).get_function(mid, it->second.entry_name);
+  if (!fn) return false;
+  const auto launches = [](const std::string& callee) {
+    return callee == "cudaLaunchDeviceV2" || callee == "__cudaCDP2LaunchDeviceV2" ||
+           callee == "cudaGetParameterBufferV2" || callee == "__cudaCDP2GetParameterBufferV2";
+  };
+  if (fn->sass)
+    for (const std::string& f : vgpu::sass::reachable(*fn->sass, fn->name))
+      if (launches(f)) return true;
+  std::set<const vgpu::ptx::EntryFn*> seen;
+  std::vector<const vgpu::ptx::EntryFn*> todo{fn};
+  while (!todo.empty()) {
+    const vgpu::ptx::EntryFn* f = todo.back();
+    todo.pop_back();
+    if (!seen.insert(f).second) continue;
+    for (const auto& ins : f->body)
+      if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
+        if (launches(c->callee)) return true;
+        if (c->target) todo.push_back(c->target);
+      }
+  }
+  return false;
+}
+
+// What a graph for device launch may hold, as the programming guide lists it
+// and an RTX 3060 enforces when it is instantiated (cudaErrorInvalidValue for
+// each of these): kernel, copy and fill nodes and child graphs of the same,
+// at least one node -- an empty graph, and an empty node anywhere, even in a
+// child graph, are refused -- no kernel that launches kernels, and copies and
+// fills only of device memory and pinned host memory: pageable and managed
+// memory are refused, and so are CUDA arrays.
+cudaError_t check_device_graph(cudaGraph_t graph) {
+  std::vector<const void*> funcs, ptrs;
+  {
+    std::lock_guard<std::mutex> lock(g_graph_mu);
+    const auto it = g_graphs.find(static_cast<void*>(graph));
+    if (it == g_graphs.end()) return cudaSuccess;   // instantiate says what is wrong
+    if (it->second->nodes.empty()) return cudaErrorInvalidValue;
+    std::vector<const GraphRec*> todo{it->second.get()};
+    while (!todo.empty()) {
+      const GraphRec* g = todo.back();
+      todo.pop_back();
+      for (const auto& n : g->nodes) {
+        const RecordedLaunch& rl = n->work;
+        switch (n->type) {
+          case cudaGraphNodeTypeKernel:
+            funcs.push_back(rl.func);
+            break;
+          case cudaGraphNodeTypeMemcpy:
+            if (rl.copy_params.srcArray || rl.copy_params.dstArray) return cudaErrorInvalidValue;
+            ptrs.push_back(rl.src);
+            ptrs.push_back(rl.dst);
+            break;
+          case cudaGraphNodeTypeMemset:
+            ptrs.push_back(rl.dst);
+            break;
+          case cudaGraphNodeTypeGraph:
+            if (n->child) todo.push_back(n->child);
+            break;
+          default:
+            return cudaErrorInvalidValue;
+        }
+      }
+    }
+  }
+  for (const void* f : funcs)
+    if (kernel_launches_kernels(f)) return cudaErrorInvalidValue;
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  for (const void* p : ptrs) {
+    if (!p) return cudaErrorInvalidValue;
+    if (is_device_ptr(p)) continue;
+    if (s.initialized && (find_range(pinned(s), p) != pinned(s).end() ||
+                          find_range(registered(s), p) != registered(s).end()))
+      continue;
+    return cudaErrorInvalidValue;
+  }
+  return cudaSuccess;
+}
+
 cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long long flags,
                         cudaGraphInstantiateResult* result) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
@@ -5161,16 +5314,39 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
+  if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
   *result = cudaGraphInstantiateSuccess;
   return cudaSuccess;
 }
 }  // namespace
 
+namespace {
+// The checks a graph for device launch adds (check_device_graph), and the
+// flags that cannot go with it. Measured on an RTX 3060: with
+// cudaGraphInstantiateFlagAutoFreeOnLaunch, cudaErrorInvalidValue.
+cudaError_t instantiate_checked(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long long flags,
+                                cudaGraphInstantiateResult* result) {
+  if (flags & cudaGraphInstantiateFlagDeviceLaunch) {
+    *result = cudaGraphInstantiateError;
+    if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) return cudaErrorInvalidValue;
+    if (const cudaError_t rc = check_device_graph(graph); rc != cudaSuccess) {
+      *result = cudaGraphInstantiateNodeOperationNotSupported;
+      return rc;
+    }
+  }
+  return instantiate(pExec, graph, flags, result);
+}
+}  // namespace
+
+// cudaGraphInstantiateFlagUpload belongs to cudaGraphInstantiateWithParams,
+// which has a stream to upload on; here an RTX 3060 refuses it, with or
+// without device launch (cudaErrorInvalidValue).
 VGPU_EXPORT cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t graph,
                                              unsigned long long flags) {
+  if (flags & cudaGraphInstantiateFlagUpload) return cudaErrorInvalidValue;
   cudaGraphInstantiateResult result;
-  return instantiate(pExec, graph, flags, &result);
+  return instantiate_checked(pExec, graph, flags, &result);
 }
 VGPU_EXPORT cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pExec, cudaGraph_t graph,
                                                       unsigned long long flags) {
@@ -5182,9 +5358,14 @@ VGPU_EXPORT cudaError_t cudaGraphInstantiateWithParams(cudaGraphExec_t* pExec, c
                                                        cudaGraphInstantiateParams* params) {
   if (!params) return cudaErrorInvalidValue;
   cudaGraphInstantiateResult result;
-  const cudaError_t rc = instantiate(pExec, graph, params->flags, &result);
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t rc = instantiate_checked(&exec, graph, params->flags, &result);
+  if (pExec && rc == cudaSuccess) *pExec = exec;
   params->result_out = result;
   params->errNode_out = nullptr;
+  // Uploaded as part of instantiation, which is one of the ways the guide
+  // gives to make a graph launchable from the device.
+  if (rc == cudaSuccess && (params->flags & cudaGraphInstantiateFlagUpload)) cudaGraphUpload(exec, params->uploadStream);
   return rc;
 }
 
@@ -5398,9 +5579,117 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
     default: {
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
-      return launch_kernel_impl("cudaGraphLaunch", rl.func, rl.grid, rl.block, ptrs.data(),
-                                rl.shared, stream, rl.cooperative, rl.cluster);
+      const cudaError_t rc = launch_kernel_impl("cudaGraphLaunch", rl.func, rl.grid, rl.block, ptrs.data(),
+                                                rl.shared, stream, rl.cooperative, rl.cluster);
+      // The graphs the kernel launched fire-and-forget run now that it is done.
+      if (t_graph_env) run_launched_now(*t_graph_env, stream);
+      return rc;
     }
+  }
+}
+
+namespace {
+std::mutex g_devgraph_mu;   // after g_graph_mu, when both are held
+// Device graphs running or queued to run, by handle, counted: a device launch
+// of one is refused (cudaErrorInvalidValue) -- the guide's "while a previous
+// launch of the graph is running", which on an RTX 3060 includes a graph
+// already queued: a second fire-and-forget or tail launch of the same graph
+// from one kernel was refused.
+std::map<void*, int> g_devgraph_busy;
+
+void devgraph_release(void* exec) {
+  std::lock_guard<std::mutex> lock(g_devgraph_mu);
+  if (--g_devgraph_busy[exec] <= 0) g_devgraph_busy.erase(exec);
+}
+
+// The uploaded copy of a device graph, to run. Null once the graph is gone.
+std::unique_ptr<GraphRec> uploaded_copy(void* exec) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto it = g_device_graphs.find(exec);
+  return it != g_device_graphs.end() && it->second ? clone_graph(*it->second, nullptr) : nullptr;
+}
+}  // namespace
+
+// What a kernel's cudaGraphLaunch(exec, stream) does at the moment it is
+// called; the graph runs later (see DeviceGraphEnv). Every result below was
+// measured on an RTX 3060 (sm_86, CUDA 13.0):
+//   - only the three named graph streams are accepted; the stream 0, a stream
+//     of the program's, cudaStreamPerThread, and the dynamic-parallelism names
+//     cudaStreamTailLaunch and cudaStreamFireAndForget: cudaErrorInvalidValue;
+//   - a null handle, or a device graph never uploaded: cudaErrorInvalidValue;
+//   - a handle that is not a device graph (a graph instantiated without
+//     cudaGraphInstantiateFlagDeviceLaunch): the kernel faults, illegal address;
+//   - a graph already running or queued: cudaErrorInvalidValue, except that a
+//     graph may queue itself once for tail launch (a second time is refused);
+//   - more than 120 fire-and-forget launches in one execution of a graph, or
+//     more than 255 queued tail launches: cudaErrorInvalidValue, the count
+//     starting again with the next launch of the graph.
+// A refused launch does not set the device-side last error.
+int DeviceGraphEnv::launch(uint64_t exec, uint64_t stream) {
+  constexpr int kInvalidValue = 1;
+  const uint64_t mode = stream >> 56;
+  if ((stream & ((uint64_t{1} << 56) - 1)) != 0 || mode < 1 || mode > 3) return kInvalidValue;
+  void* const g = reinterpret_cast<void*>(exec);
+  if (!g) return kInvalidValue;
+  std::lock_guard<std::mutex> graphs(g_graph_mu);
+  const auto dev = g_device_graphs.find(g);
+  if (dev == g_device_graphs.end()) return -1;
+  if (!dev->second) return kInvalidValue;
+  std::lock_guard<std::mutex> lock(g_devgraph_mu);
+  if (g_devgraph_busy.count(g)) {
+    if (mode != 1 || g != self || self_tail) return kInvalidValue;
+    self_tail = true;
+  }
+  if (mode == 1) {   // cudaStreamGraphTailLaunch
+    if (tails.size() >= 255) return kInvalidValue;
+    tails.push_back(g);
+  } else {           // cudaStreamGraphFireAndForget, or AsSibling: into the parent's environment
+    DeviceGraphEnv& into = mode == 3 && parent ? *parent : *this;
+    if (into.fire_and_forget >= 120) return kInvalidValue;
+    ++into.fire_and_forget;
+    into.now.push_back(g);
+  }
+  ++g_devgraph_busy[g];
+  return 0;
+}
+
+// Runs a device graph, launched from a kernel, in an environment of its own
+// whose parent is `parent`; then the graphs it queued for tail launch, each
+// replacing the one before in the parent environment. A tail graph's own tail
+// launches run before the ones queued ahead of it: on an RTX 3060, graph A
+// tail-launching B then C, and B tail-launching D then E, ran A B D E C.
+static void run_device_graph(void* first, DeviceGraphEnv* parent, cudaStream_t stream) {
+  std::deque<void*> todo{first};
+  while (!todo.empty()) {
+    void* const g = todo.front();
+    todo.pop_front();
+    DeviceGraphEnv env;
+    env.self = g;
+    env.parent = parent;
+    if (sticky_error() == cudaSuccess) {
+      if (std::unique_ptr<GraphRec> body = uploaded_copy(g)) {
+        DeviceGraphEnv* const outer = t_graph_env;
+        t_graph_env = &env;
+        run_graph(*body, stream);
+        t_graph_env = outer;
+      }
+    }
+    devgraph_release(g);
+    for (void* left : env.now) devgraph_release(left);   // only when a fault ended the graph early
+    todo.insert(todo.begin(), env.tails.begin(), env.tails.end());
+  }
+}
+
+static void run_launched_now(DeviceGraphEnv& env, cudaStream_t stream) {
+  for (;;) {
+    void* g = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_devgraph_mu);
+      if (env.now.empty()) return;
+      g = env.now.front();
+      env.now.pop_front();
+    }
+    run_device_graph(g, &env, stream);
   }
 }
 
@@ -5449,7 +5738,43 @@ VGPU_EXPORT cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t strea
       st_.used -= std::min<uint64_t>(st_.used, a.size);
     }
   }
-  return run_graph(*replay, stream);
+  // A graph's kernels may launch device graphs, so the launch has an
+  // environment, inside the stream's own: what they launch fire-and-forget
+  // runs when each is done, and what they queue for tail launch once the
+  // whole graph is -- all of it before the launch is complete, so the
+  // stream's next work waits for it, as an RTX 3060's did. A device graph
+  // launched from the host is uploaded by the launch, and is busy while it
+  // runs: a kernel in it that launches it again fire-and-forget is refused
+  // (cudaErrorInvalidValue on the card), while a tail self-launch is not.
+  bool device_graph = false;
+  {
+    std::lock_guard<std::mutex> lock(g_graph_mu);
+    if (const auto dev = g_device_graphs.find(static_cast<void*>(exec)); dev != g_device_graphs.end()) {
+      device_graph = true;
+      if (const auto it = g_graph_execs.find(static_cast<void*>(exec)); it != g_graph_execs.end())
+        dev->second = clone_graph(*it->second, nullptr);
+    }
+  }
+  DeviceGraphEnv stream_env, env;
+  env.parent = &stream_env;
+  if (device_graph) {
+    env.self = static_cast<void*>(exec);
+    std::lock_guard<std::mutex> lock(g_devgraph_mu);
+    ++g_devgraph_busy[env.self];
+  }
+  DeviceGraphEnv* const outer = t_graph_env;
+  t_graph_env = &env;
+  const cudaError_t rc = run_graph(*replay, stream);
+  t_graph_env = outer;
+  if (device_graph) devgraph_release(env.self);
+  {
+    std::lock_guard<std::mutex> lock(g_devgraph_mu);
+    for (void* left : env.now) --g_devgraph_busy[left];
+    std::erase_if(g_devgraph_busy, [](const auto& kv) { return kv.second <= 0; });
+  }
+  for (void* tail : env.tails) run_device_graph(tail, &stream_env, stream);
+  run_launched_now(stream_env, stream);   // sibling launches
+  return rc;
 }
 
 /* ---- building a graph node by node -------------------------------------------
@@ -6466,9 +6791,17 @@ VGPU_EXPORT cudaError_t cudaGraphExecEventWaitNodeSetEvent(cudaGraphExec_t exec,
 // already in this process's memory. It validates the handle and succeeds, so a
 // program that uploads before launching behaves as it would on a card, and
 // nothing about the launch is faster or slower for it.
+//
+// A graph instantiated for device launch is the exception: what a kernel's
+// cudaGraphLaunch runs is the graph as it was last uploaded, so this keeps a
+// copy of it (see g_device_graphs).
 VGPU_EXPORT cudaError_t cudaGraphUpload(cudaGraphExec_t exec, cudaStream_t) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
-  return g_graph_execs.count(static_cast<void*>(exec)) ? cudaSuccess : cudaErrorInvalidValue;
+  const auto it = g_graph_execs.find(static_cast<void*>(exec));
+  if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+  if (const auto dev = g_device_graphs.find(it->first); dev != g_device_graphs.end())
+    dev->second = clone_graph(*it->second, nullptr);
+  return cudaSuccess;
 }
 
 cudaError_t free_graph_alloc(State& s, void* ptr, bool* handled) {
@@ -7247,6 +7580,7 @@ VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
     }
   }
   g_exec_auto_free.erase(static_cast<void*>(exec));
+  g_device_graphs.erase(static_cast<void*>(exec));
   return cudaSuccess;
 }
 // What a library asks before it adds work to a stream that might be capturing:

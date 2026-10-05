@@ -101,6 +101,9 @@ enum class Sreg : uint8_t {
   ClusterNCtaIdX, ClusterNCtaIdY, ClusterNCtaIdZ,
   ClusterCtaRank, ClusterNCtaRank,
   IsExplicitCluster,
+  // The executable graph the kernel runs in, if that graph was instantiated
+  // for device launch (cudaGetCurrentGraphExec), and 0 otherwise.
+  CurrentGraphExec,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at
