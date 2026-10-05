@@ -44,6 +44,7 @@
 #include <optional>
 #include <unordered_map>
 
+#include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
@@ -10197,11 +10198,12 @@ class Interpreter {
           guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
         ++stats_.atomics;
         stats_.atomic_bytes += size;
-        uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         // Masked to the *access* width, not the element width: for an f16x2
         // atomic those differ, and masking to 16 bits threw away the high
         // half of every operand before it was ever added.
-        uint64_t b = mask_to_bits(bv[lane], size * 8u);
+        const uint64_t b = mask_to_bits(bv[lane], size * 8u);
+        // The value the atomic stores, given the one it finds.
+        auto compute = [&](const uint64_t old) -> uint64_t {
         uint64_t nv = old;
         if (op.ty.is_real() && op.ty.bits == 16) {
           // f16/bf16 atomics. The packed forms update two independent halves
@@ -10224,9 +10226,7 @@ class Interpreter {
           // nv with old + b -- so a packed half atomic added the two operands'
           // *bit patterns* and stored that. It looked like an accumulation
           // because the number grew.
-          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
-          r[lane] = old;
-          continue;
+          return mask_to_bits(nv, size * 8u);
         } else if (op.ty.is_float()) {
           // Reinterpret and operate in the float domain: adding the bit
           // patterns of two floats produces a number unrelated to their sum.
@@ -10274,9 +10274,7 @@ class Interpreter {
             }
             nv = std::bit_cast<uint64_t>(res);
           }
-          store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
-          r[lane] = old;
-          continue;
+          return mask_to_bits(nv, size * 8u);
         }
         switch (op.op) {
           case AtomOp::Add: nv = old + b; break;
@@ -10313,7 +10311,21 @@ class Interpreter {
           case AtomOp::Inc: nv = (old >= b) ? 0ull : old + 1ull; break;
           case AtomOp::Dec: nv = (old == 0ull || old > b) ? b : old - 1ull; break;
         }
-        store_routed(w, ctx, ins, lane, addr, size, mask_to_bits(nv, size * 8u));
+        return mask_to_bits(nv, size * 8u);
+        };
+        // Memory the host maps -- managed, pinned, or shared with another
+        // process through CUDA IPC -- takes the CPU's own atomic, which host
+        // code and other processes' kernels respect; the stripe lock is this
+        // process's alone (host_atomic.hpp).
+        if (!is_shared(addr) && !is_local(addr) && addr % size == 0) {
+          uint8_t* host = mem_.host_address(addr, size);
+          if (host && reinterpret_cast<uintptr_t>(host) % size == 0) {
+            r[lane] = vgpu::exec::host_atomic_rmw(host, size, compute);
+            continue;
+          }
+        }
+        const uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
+        store_routed(w, ctx, ins, lane, addr, size, compute(old));
         r[lane] = old;
       }
     // `red` performed the read-modify-write and has nowhere to put the old

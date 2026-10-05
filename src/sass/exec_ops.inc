@@ -1970,14 +1970,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         std::unique_lock<std::mutex> lock;
         if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
-        uint64_t old = 0;
-        mem_read(blk, w, l, sp, addr, &old, n);
         const Operand& vop = red ? ins.src[1] : ins.src[1];
-        uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
+        const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
+        const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        // The value the atomic stores, given the one it finds.
+        const auto compute = [&](const uint64_t old) -> uint64_t {
         uint64_t nw = old;
         if (cas) {
-          const uint64_t cmp = v, swap = is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l);
-          if (old == cmp) nw = swap;
+          if (old == v) nw = swap;
         } else {
           switch (popc_inc ? 3 : ins.f[0]) {
             case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
@@ -2017,7 +2017,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
         }
         if (!is64) nw &= 0xffffffff;
-        mem_write(blk, w, l, sp, addr, &nw, n);
+        return nw;
+        };
+        // Memory the host maps -- managed, pinned, or shared with another
+        // process through CUDA IPC -- takes the CPU's own atomic, which host
+        // code and other processes' kernels respect; the stripe lock is this
+        // process's alone (vgpu/exec/host_atomic.hpp).
+        uint64_t old = 0;
+        uint8_t* host = sp == Space::Global && addr % n == 0 ? mem_.host_address(addr, n) : nullptr;
+        if (host && reinterpret_cast<uintptr_t>(host) % n == 0) {
+          old = exec::host_atomic_rmw(host, n, compute);
+        } else {
+          mem_read(blk, w, l, sp, addr, &old, n);
+          const uint64_t nw = compute(old);
+          mem_write(blk, w, l, sp, addr, &nw, n);
+        }
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
         if (!red) {
