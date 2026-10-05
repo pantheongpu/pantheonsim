@@ -1709,3 +1709,8 @@ extern "C" VGPU_EXPORT int vgpu_cuCaptureEventWait(void* stream, void* event, in
   }
   return to_cu(capture_wait(static_cast<cudaStream_t>(stream), captured != 0, id, deps ? *deps : std::vector<void*>{}));
 }
+
+extern "C" VGPU_EXPORT int vgpu_cuCaptureInvalidateId(unsigned long long id, const char* what) {
+  capture_invalidate_id(id, what);
+  return 0;
+}

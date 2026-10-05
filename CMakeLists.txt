@@ -2316,6 +2316,15 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The driver API's graphs, stream capture and user objects, and the two APIs
+  # sharing graphs, streams and events (a CUgraph is a cudaGraph_t). Both
+  # programs pass against NVIDIA's libraries on an RTX 3060.
+  add_test(NAME e2e_driver_graphs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_driver_graphs.sh)
+  set_tests_properties(e2e_driver_graphs PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # A kernel's fault reported by the calls after its launch, not by the
   # launch, from the runtime and the driver, as an RTX 3060 reports it.
   add_test(NAME e2e_deferred_errors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_deferred_errors.sh)

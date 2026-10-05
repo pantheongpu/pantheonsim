@@ -4206,6 +4206,10 @@ bool capture_event_node(cudaStream_t stream, bool record, cudaEvent_t e, unsigne
 cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
                          const std::vector<void*>& deps);
 bool capture_refuse(cudaStream_t stream, const char* what);
+// Invalidates the capture with this id: querying or timing an event that stands
+// for work in a capture is refused (cudaErrorCapturedEvent) and, measured on an
+// RTX 3060, takes the capture with it.
+void capture_invalidate_id(unsigned long long id, const char* what);
 namespace {
 
 RtEvent* find_event(cudaEvent_t e) {  // caller holds g_event_mu
@@ -4386,6 +4390,7 @@ VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
   std::lock_guard<std::mutex> lock(g_event_mu);
   const RtEvent* r = find_event(e);
   if (!r) return cudaErrorInvalidResourceHandle;
+  if (r->captured) capture_invalidate_id(r->capture_id, "cudaEventSynchronize of a captured event");
   return r->captured ? cudaErrorCapturedEvent : cudaSuccess;
 }
 VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
@@ -4393,6 +4398,7 @@ VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
   std::lock_guard<std::mutex> lock(g_event_mu);
   const RtEvent* r = find_event(e);
   if (!r) return cudaErrorInvalidResourceHandle;
+  if (r->captured) capture_invalidate_id(r->capture_id, "cudaEventQuery of a captured event");
   return r->captured ? cudaErrorCapturedEvent : cudaSuccess;   // it stands for work not yet run
 }
 VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaEvent_t end) {
@@ -7269,6 +7275,15 @@ cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long 
 // An operation CUDA does not allow on a capturing stream. The capture it was
 // called on is invalidated, so cudaStreamEndCapture says so and names it, and
 // the call itself reports it -- rather than doing it now, outside the graph.
+void capture_invalidate_id(unsigned long long id, const char* what) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  for (auto& entry : g_captures)
+    if (entry.second && entry.second->id == id && !entry.second->graph->invalidated) {
+      entry.second->graph->invalidated = true;
+      entry.second->graph->invalidated_by = what;
+    }
+}
+
 bool capture_refuse(cudaStream_t stream, const char* what) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   StreamCapture* sc = stream_capture(stream);

@@ -3608,12 +3608,17 @@ VGPU_EXPORT CUresult cuEventRecordWithFlags(void* ev, CUstream stream, unsigned 
 }
 VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream stream) { return cuEventRecordWithFlags(ev, stream, 0); }
 namespace {
-// An event standing for work in a capture, which has not run.
+// An event standing for work in a capture, which has not run: asking about it
+// is refused, and takes the capture with it (measured).
 bool event_captured(void* ev) {
   ShimState& s = state();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   const auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
-  return it != s.events.end() && it->second.captured;
+  if (it == s.events.end() || !it->second.captured) return false;
+  using Fn = int (*)(unsigned long long, const char*);
+  static Fn fn = reinterpret_cast<Fn>(runtime_symbol("vgpu_cuCaptureInvalidateId", false));
+  if (fn) fn(it->second.capture_id, "querying an event recorded in the capture");
+  return true;
 }
 }  // namespace
 VGPU_EXPORT CUresult cuEventQuery(void* ev) {
@@ -3638,8 +3643,13 @@ VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
     // As the card answers: an event never recorded, or made with
     // CU_EVENT_DISABLE_TIMING, is an invalid handle here, not a bad value.
     if (!ms) return CUDA_ERROR_INVALID_VALUE;
-    if (a != s.events.end() && b != s.events.end() && (a->second.captured || b->second.captured))
+    if (a != s.events.end() && b != s.events.end() && (a->second.captured || b->second.captured)) {
+      using Fn = int (*)(unsigned long long, const char*);
+      static Fn fn = reinterpret_cast<Fn>(runtime_symbol("vgpu_cuCaptureInvalidateId", false));
+      const auto& hit = a->second.captured ? a->second : b->second;
+      if (fn) fn(hit.capture_id, "timing an event recorded in the capture");
       return static_cast<CUresult>(907);   // CUDA_ERROR_CAPTURED_EVENT
+    }
     if (a == s.events.end() || b == s.events.end() || !a->second.recorded || !b->second.recorded ||
         !a->second.timing || !b->second.timing)
       return CUDA_ERROR_INVALID_HANDLE;
