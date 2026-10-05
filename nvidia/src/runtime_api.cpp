@@ -3050,6 +3050,31 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
   return cudaSuccess;
 }
 
+// Shared memory banks are four bytes wide on every GPU this simulates, whatever
+// is asked, and the configuration calls are deprecated no-ops that read back
+// cudaSharedMemBankSizeFourByte (measured on an RTX 3060, driver 596.36: the
+// default and the value after setting each of default, 4 and 8 bytes are all
+// FourByte; a value outside 0..2 is cudaErrorInvalidValue; a null output
+// pointer is cudaErrorInvalidValue; cudaFuncSetSharedMemConfig accepts a
+// registered kernel and says cudaErrorInvalidDeviceFunction for a null one).
+VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
+  if (!config) return cudaErrorInvalidValue;
+  *config = cudaSharedMemBankSizeFourByte;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
+  const int c = static_cast<int>(config);
+  if (c < 0 || c > 2) return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
+  const int c = static_cast<int>(config);
+  if (c < 0 || c > 2) return cudaErrorInvalidValue;
+  return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
+    return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidDeviceFunction;
+  });
+}
+
 VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {
   if (!mode) return cudaErrorInvalidValue;
   *mode = cudaStreamCaptureModeGlobal;

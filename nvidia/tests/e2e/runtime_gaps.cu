@@ -396,6 +396,29 @@ static void capabilities() {
         "the properties agree with the attributes");
 }
 
+// The deprecated shared-memory bank configuration, which an RTX 3060 accepts
+// and always reads back as four-byte banks.
+__global__ void bank_kernel() {}
+static void bank_config() {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  cudaSharedMemConfig c = cudaSharedMemBankSizeEightByte;
+  IS(cudaDeviceGetSharedMemConfig(&c), cudaSuccess);
+  check(c == cudaSharedMemBankSizeFourByte, "four-byte banks by default");
+  IS(cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte), cudaSuccess);
+  IS(cudaDeviceGetSharedMemConfig(&c), cudaSuccess);
+  check(c == cudaSharedMemBankSizeFourByte, "still four-byte after asking for eight");
+  IS(cudaDeviceSetSharedMemConfig(static_cast<cudaSharedMemConfig>(7)), cudaErrorInvalidValue);
+  IS(cudaDeviceGetSharedMemConfig(nullptr), cudaErrorInvalidValue);
+  IS(cudaFuncSetSharedMemConfig(reinterpret_cast<const void*>(bank_kernel), cudaSharedMemBankSizeEightByte),
+     cudaSuccess);
+  IS(cudaFuncSetSharedMemConfig(reinterpret_cast<const void*>(bank_kernel), static_cast<cudaSharedMemConfig>(5)),
+     cudaErrorInvalidValue);
+  IS(cudaFuncSetSharedMemConfig(nullptr, cudaSharedMemBankSizeDefault), cudaErrorInvalidDeviceFunction);
+  cudaGetLastError();
+#pragma GCC diagnostic pop
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);   // every line out, should a call crash
   if (cudaFree(nullptr) != cudaSuccess) {
@@ -410,6 +433,7 @@ int main() {
   peer_3d();
   host_flags();
   capabilities();
+  bank_config();
   std::printf(failures ? "FAIL: %d runtime checks\n" : "PASS: every runtime check\n", failures);
   return failures ? 1 : 0;
 }
