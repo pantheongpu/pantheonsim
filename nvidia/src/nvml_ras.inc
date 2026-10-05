@@ -330,8 +330,9 @@ bool accounting_on(const vgpu::telemetry::DeviceSample& d) {
 }
 
 // Brings the records up to date with the processes the telemetry shows now, and
-// returns them in the order they started (oldest first). `clear` forgets them.
-std::vector<AcctRecord> acct_sync(const vgpu::telemetry::DeviceSample& d, bool clear = false) {
+// returns them in the order they started (oldest first). `clear` 1 forgets every
+// record, 2 the finished ones.
+std::vector<AcctRecord> acct_sync(const vgpu::telemetry::DeviceSample& d, int clear = 0) {
   std::vector<AcctRecord> recs;
   const std::string path = acct_path(d.uuid);
   std::error_code ec;
@@ -349,7 +350,7 @@ std::vector<AcctRecord> acct_sync(const vgpu::telemetry::DeviceSample& d, bool c
       off += n;
     }
   }
-  if (!clear) {
+  {
     std::istringstream in(text);
     for (std::string line; std::getline(in, line);) {
       AcctRecord r{};
@@ -377,6 +378,8 @@ std::vector<AcctRecord> acct_sync(const vgpu::telemetry::DeviceSample& d, bool c
       mine->max_mem = std::max<unsigned long long>(mine->max_mem, d.procs[i].used_bytes);
       mine->last_us = now;
     }
+    if (clear == 1) recs.clear();
+    if (clear == 2) recs.erase(std::remove_if(recs.begin(), recs.end(), [](const AcctRecord& r) { return !r.running; }), recs.end());
     // The driver's buffer is circular: the newest records stay (the buffer size
     // is what nvmlDeviceGetAccountingBufferSize reports).
     if (recs.size() > 4000) recs.erase(recs.begin(), recs.begin() + static_cast<long>(recs.size() - 4000));
@@ -453,7 +456,9 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetAccountingStats(nvmlDevice_t device, unsig
 }
 // Used by the setters (nvml_set.inc): forget every record.
 namespace {
-void accounting_clear(const vgpu::telemetry::DeviceSample& d) { acct_sync(d, true); }
+void accounting_clear(const vgpu::telemetry::DeviceSample& d, bool finished_only) {
+  acct_sync(d, finished_only ? 2 : 1);
+}
 }  // namespace
 
 /* ---- video engines, frame buffer capture, utilization ---- */

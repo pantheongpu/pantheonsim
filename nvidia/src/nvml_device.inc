@@ -799,30 +799,6 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieReplayCounter(nvmlDevice_t device, uns
 
 /* ---- the host's CPUs and memory nodes ---- */
 
-namespace {
-// The CPUs this process may run on, the way `vgpu smi topo` prints them: the part
-// of a topology the simulator does not have to model.
-bool allowed_cpus(std::vector<unsigned long>* words) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof set, &set) != 0) return false;
-  const unsigned bits = 8 * sizeof(unsigned long);
-  words->assign(CPU_SETSIZE / bits, 0ul);
-  for (int c = 0; c < CPU_SETSIZE; ++c)
-    if (CPU_ISSET(c, &set)) (*words)[c / bits] |= 1ul << (c % bits);
-  return true;
-}
-int numa_node_count() {
-  int n = 0;
-  std::error_code ec;
-  for (const auto& e : std::filesystem::directory_iterator("/sys/devices/system/node", ec)) {
-    const std::string name = e.path().filename().string();
-    if (name.rfind("node", 0) == 0 && name.size() > 4 && name.find_first_not_of("0123456789", 4) == std::string::npos)
-      ++n;
-  }
-  return n;
-}
-}  // namespace
 // The ideal CPUs for a GPU: all the CPUs the process may use. The card (WSL) has
 // no affinity to report; on Linux a GPU's NUMA node holds them.
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCpuAffinity(nvmlDevice_t device, unsigned int cpuSetSize,

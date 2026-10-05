@@ -128,6 +128,28 @@ uint32_t memory_bus_width(const vgpu::telemetry::DeviceSample& d) {
   return nvml_facts(d).memory_bus_width_bits;
 }
 
+// The CPUs this process may run on, the way `vgpu smi topo` prints them: the part
+// of a topology the simulator does not have to model.
+bool allowed_cpus(std::vector<unsigned long>* words) {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof set, &set) != 0) return false;
+  const unsigned bits = 8 * sizeof(unsigned long);
+  words->assign(CPU_SETSIZE / bits, 0ul);
+  for (int c = 0; c < CPU_SETSIZE; ++c)
+    if (CPU_ISSET(c, &set)) (*words)[c / bits] |= 1ul << (c % bits);
+  return true;
+}
+int numa_node_count() {
+  int n = 0;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator("/sys/devices/system/node", ec)) {
+    const std::string name = e.path().filename().string();
+    if (name.rfind("node", 0) == 0 && name.size() > 4 && name.find_first_not_of("0123456789", 4) == std::string::npos)
+      ++n;
+  }
+  return n;
+}
 // ---- setters ------------------------------------------------------------------
 
 // Whether this process may change a device's settings. The driver demands root
@@ -210,4 +232,12 @@ long long setting_int(const std::string& uuid, Life life, const char* key, long 
   return end && *end == '\0' ? v : dflt;
 }
 
+}  // namespace
+
+// Whether nvmlDeviceRemoveGpu took the GPU out of the driver's view (a volatile
+// setting, so it ends with the session). Declared in nvml_api.cpp for refresh().
+namespace {
+bool device_removed(const char* uuid) {
+  return setting_int(uuid, Life::Volatile, "removed", 0) != 0;
+}
 }  // namespace

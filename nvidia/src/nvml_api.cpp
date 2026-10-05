@@ -56,6 +56,10 @@ bool g_have_profile = false;
 vgpu::telemetry::Shared g_idle{};
 // GPUs that have fallen off the bus (`vgpu fault lose`), as of the last refresh.
 bool g_lost[vgpu::telemetry::kMaxDevices] = {};
+// GPUs taken out of the driver's view with nvmlDeviceRemoveGpu (uuid, bus id),
+// as of the last refresh; nvmlDeviceDiscoverGpus brings one back.
+std::vector<std::pair<std::string, std::string>> g_removed;
+bool device_removed(const char* uuid);   // nvml_common.inc
 
 // Handles are 1-based indices encoded as pointers, so they are never null.
 nvmlDevice_t handle_for(unsigned int index) {
@@ -97,6 +101,18 @@ bool refresh() {
   const bool had = g_snap.device_count > 0;
   g_snap.device_count = kept;
   if (had && kept == 0) return false;
+  // A GPU removed with nvmlDeviceRemoveGpu is not there until it is discovered
+  // again: not counted, not found by index, UUID or bus id.
+  g_removed.clear();
+  kept = 0;
+  for (uint32_t i = 0; i < g_snap.device_count; ++i) {
+    if (device_removed(g_snap.devices[i].uuid)) {
+      g_removed.emplace_back(g_snap.devices[i].uuid, g_snap.devices[i].bus_id);
+      continue;
+    }
+    g_snap.devices[kept++] = g_snap.devices[i];
+  }
+  g_snap.device_count = kept;
   // Injected clock-event reasons and the readings they imply, applied once
   // here so every getter agrees with every other, and with nvidia-smi.
   for (uint32_t i = 0; i < g_snap.device_count; ++i) {
@@ -399,7 +415,9 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device,
   refresh();
   const auto* d = sample(device);
   if (!d || !temp) return bad(device);
-  if (sensorType != NVML_TEMPERATURE_GPU) return NVML_ERROR_NOT_SUPPORTED;
+  // NVML_TEMPERATURE_GPU is the only sensor there is: the card refuses any other
+  // value as an invalid argument (it was NOT_SUPPORTED here).
+  if (static_cast<int>(sensorType) != NVML_TEMPERATURE_GPU) return NVML_ERROR_INVALID_ARGUMENT;
   *temp = d->temperature_c;
   return NVML_SUCCESS;
 }
@@ -438,7 +456,8 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEnforcedPowerLimit(nvmlDevice_t device, un
   refresh();
   const auto* d = sample(device);
   if (!d || !limit) return bad(device);
-  *limit = d->power_limit_mw;
+  // The limit nvmlDeviceSetPowerManagementLimit set, until the session ends.
+  *limit = static_cast<unsigned>(setting_int(d->uuid, Life::Volatile, "power_limit_mw", d->power_limit_mw));
   return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementLimit(nvmlDevice_t device,
@@ -447,7 +466,12 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementLimit(nvmlDevice_t device,
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementDefaultLimit(nvmlDevice_t device,
                                                                   unsigned int* limit) { REQUIRE_INIT();
-  return nvmlDeviceGetEnforcedPowerLimit(device, limit);
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !limit) return bad(device);
+  *limit = d->power_limit_mw;   // the profile's, whatever has been set since
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementLimitConstraints(nvmlDevice_t device,
                                                                       unsigned int* minLimit,
@@ -467,10 +491,17 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t device, nvmlClockTy
   refresh();
   const auto* d = sample(device);
   if (!d || !clock) return bad(device);
+  // A clock lock a setter recorded (nvmlDeviceSetGpuLockedClocks and
+  // SetMemoryLockedClocks) holds the clock inside its range.
+  auto locked = [&](const char* key, unsigned v) {
+    unsigned lo = 0, hi = 0;
+    std::sscanf(setting(d->uuid, Life::Volatile, key, "").c_str(), "%u,%u", &lo, &hi);
+    return hi ? std::min(std::max(v, lo), hi) : v;
+  };
   switch (type) {
     case NVML_CLOCK_GRAPHICS:
-    case NVML_CLOCK_SM: *clock = d->sm_clock_mhz; break;
-    case NVML_CLOCK_MEM: *clock = d->mem_clock_mhz; break;
+    case NVML_CLOCK_SM: *clock = locked("gpu_locked_clocks", d->sm_clock_mhz); break;
+    case NVML_CLOCK_MEM: *clock = locked("mem_locked_clocks", d->mem_clock_mhz); break;
     case NVML_CLOCK_VIDEO: *clock = d->sm_clock_mhz / 2; break;
     default: return NVML_ERROR_NOT_SUPPORTED;
   }
@@ -520,13 +551,15 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPerformanceState(nvmlDevice_t device, nvml
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPersistenceMode(nvmlDevice_t device, nvmlEnableState_t* mode) { REQUIRE_INIT();
   unsigned int idx;
   if (!index_of(device, &idx) || !mode) return bad(device);
-  *mode = NVML_FEATURE_ENABLED;
+  // On, as the card reports it, unless nvmlDeviceSetPersistenceMode changed it.
+  *mode = setting_int(g_snap.devices[idx].uuid, Life::Volatile, "persistence", 1) ? NVML_FEATURE_ENABLED
+                                                                                   : NVML_FEATURE_DISABLED;
   return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetComputeMode(nvmlDevice_t device, nvmlComputeMode_t* mode) { REQUIRE_INIT();
   unsigned int idx;
   if (!index_of(device, &idx) || !mode) return bad(device);
-  *mode = NVML_COMPUTEMODE_DEFAULT;
+  *mode = static_cast<nvmlComputeMode_t>(setting_int(g_snap.devices[idx].uuid, Life::Volatile, "compute_mode", 0));
   return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t device, nvmlEnableState_t* current,
@@ -538,7 +571,10 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetEccMode(nvmlDevice_t device, nvmlEnableSta
   const auto* d = sample(device);
   if (!d || !current || !pending) return bad(device);
   if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;
-  *current = *pending = NVML_FEATURE_ENABLED;
+  // The mode takes effect at the next reboot or GPU reset (not simulated): what
+  // nvmlDeviceSetEccMode set is the pending mode, the current one is as shipped.
+  *current = NVML_FEATURE_ENABLED;
+  *pending = setting_int(d->uuid, Life::Persistent, "ecc_pending", 1) ? NVML_FEATURE_ENABLED : NVML_FEATURE_DISABLED;
   return NVML_SUCCESS;
 }
 // MIG mode (the instance functions are in nvml_mig.inc). A part that has no MIG
