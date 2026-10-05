@@ -23,6 +23,7 @@ limits:
   max_blocks_per_sm: 32
   max_registers_per_thread: 255
   shared_mem_per_sm: 167936
+  l2_cache_bytes: 41943040          # GA100 datasheet
 features:
   fp16: true
   bf16: true
@@ -44,3 +45,9 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: false    # most real runs report no memory sensor
   pcie_link: "Gen4 x16"        # most common link on real cards (101 runs in the benchmark database)
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: five active HBM2e stacks, 40 MB L2. NVIDIA's A100 documentation sets aside up to 30 MB of it for persisting accesses.
+cuda:
+  memory_bus_width_bits: 5120
+  persisting_l2_bytes: 31457280

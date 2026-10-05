@@ -22,6 +22,7 @@ limits:
   max_blocks_per_sm: 24
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
+  l2_cache_bytes: 50331648          # AD104 datasheet
 features:
   fp16: true
   bf16: true
@@ -38,3 +39,9 @@ telemetry:
   ecc: true                    # supported and on by default (NVIDIA datasheet)
   memory: gddr                 # pages are retired on failure
   pcie_link: "Gen4 x8"         # most common link on real cards (594 runs in the benchmark database)
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: AD104 memory interface and 48 MB L2. The persisting L2 maximum is three quarters of L2, as the A100's: not read from a card.
+cuda:
+  memory_bus_width_bits: 192
+  persisting_l2_bytes: 37748736

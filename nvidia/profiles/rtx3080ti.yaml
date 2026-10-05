@@ -24,6 +24,7 @@ limits:
   max_blocks_per_sm: 16
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
+  l2_cache_bytes: 6291456          # GA102 datasheet
 features:
   fp16: true
   bf16: true
@@ -40,3 +41,10 @@ telemetry:
   ecc: false                   # GeForce: no ECC
   memory: gddr                 # GDDR6X; no ECC, so nothing is retired
   pcie_link: "Gen4 x16"        # this card's link (nvidia/registers/measurements/rtx3080ti)
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: GA102 memory interface, 6 MB L2, 1665 MHz boost clock. The persisting L2 maximum is the 3060's ratio (11/16 of L2), the same Ampere part family.
+cuda:
+  memory_bus_width_bits: 384
+  clock_khz: 1665000
+  persisting_l2_bytes: 4325376

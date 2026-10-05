@@ -161,6 +161,8 @@ add_library(vgpu STATIC
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
+  src/runtime/visible_devices.cpp
+  nvidia/src/device_attributes.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -979,6 +981,7 @@ vgpu_unit_test(test_e2e_parity)
 # cuDSS's sparse direct solver on its own, host arithmetic only: orderings,
 # LU, LDL^T and Cholesky with their pivoting, inertia, on random matrices.
 vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)
+vgpu_unit_test(test_cuda_attributes nvidia/tests/unit/test_cuda_attributes.cpp)
 target_sources(test_cudss_solver PRIVATE nvidia/src/cudss_solver.cpp)
 target_include_directories(test_cudss_solver PRIVATE nvidia/src)
 # nvCOMP's host codecs on their own: round trips at every size and effort,
@@ -2097,6 +2100,26 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_stream_identity COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_stream_identity.sh)
   set_tests_properties(e2e_stream_identity PROPERTIES
     DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# What a program is told about its device: the runtime, the driver and
+# cudaDeviceProp agree, a device has one identity for CUDA and NVML, and the
+# simulated RTX 3060 answers what the card does.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_test(NAME e2e_device_attributes COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_attributes.sh)
+  set_tests_properties(e2e_device_attributes PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER, as the driver reads them.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_test(NAME e2e_cuda_visible_devices COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cuda_visible_devices.sh)
+  set_tests_properties(e2e_cuda_visible_devices PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 endif()
