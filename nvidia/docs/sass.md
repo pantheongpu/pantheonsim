@@ -73,6 +73,7 @@ as on the hardware.
 | `VGPU_SASS_TRACE=<warp>` | every instruction that warp of block (0,0,0) runs, with its results |
 | `VGPU_SASS_TRACE_KERNEL=<text>` | only in kernels whose name holds the text |
 | `VGPU_KERNEL_DIGEST=<file>` | per launch, hashes (and NaN/Inf counts) of the memory its arguments reach: run once with `VGPU_SASS=0` and once without, and `diff` names the first kernel that differs |
+| `VGPU_KERNEL_DIGEST_DUMP=<dir>` | with the digest, each allocation's bytes too, as `<dir>/<launch>.<address>`: `cmp -l` of two runs' files for the differing allocation names the bytes (which a hash cannot) |
 
 ## Coverage
 
@@ -164,6 +165,25 @@ bank's 64 KiB.
 The tensor map (`cuTensorMapEncodeTiled`) keeps its tile-mode fields where
 NVIDIA's descriptor has them -- found with ptxas, one `tensormap.replace` field
 at a time -- because SASS rewrites a map in place with plain stores.
+
+## Member masks of the `*.sync` warp instructions
+
+ptxas compiles `__ballot_sync`, `__shfl_sync`, `__match_any_sync`,
+`__reduce_add_sync` and `__syncwarp` with a constant mask to the bare
+instruction, which ignores the mask. A mask it cannot see through (a
+lane-dependent value, a kernel argument) goes through code that checks it at
+run time: `R2UR`/`REDUX.OR` and a `BRA.DIV` or `BRA.CONV` choose between the
+bare instruction and, when the lanes name different masks, one `WARPSYNC` and
+instruction per distinct mask, each over the lanes that named it. A thread its
+own mask leaves out traps there ("an illegal instruction was encountered",
+715; `__ballot_sync((1u << lane) - 1, p)`, an exclusive prefix, is the usual
+way in, and is the HeCBench `bscan` benchmark). Both engines do what an RTX
+3060 does, as `e2e_sass_archs`' `sync_masks` pins; the PTX engine reads the
+operand to tell the constant from the register (and ptxas's constant
+propagation, for a register set once from an immediate). A shuffle from a lane
+that is not running it reads 0, not the lane's register. The SASS executor's
+`BRA.DIV`/`BRA.CONV` take the whole group when the guard holds for some lanes
+of it and not others, and `WARPSYNC` lets out one mask's lanes at a time.
 
 ## Tests
 

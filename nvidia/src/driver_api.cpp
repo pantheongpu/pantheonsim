@@ -285,6 +285,7 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     // for the two conditions this project most wants to be legible.
     // An RTX 3060 reports a kernel's "trap" (and "brkpt") as LAUNCH_FAILED.
     case Err::Trap: return CUDA_ERROR_LAUNCH_FAILED;
+    case Err::IllegalInstruction: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
     case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::EccUncorrectable: return CUDA_ERROR_ECC_UNCORRECTABLE;
     // What programs report when their GPU falls off the bus.
@@ -312,6 +313,7 @@ bool poisons_context(vgpu::Err e, bool kernel_context) {
     case Err::MisalignedAccess:
     case Err::UninitializedRegister:
     case Err::Trap:
+    case Err::IllegalInstruction:
     case Err::DeviceAssert:
     case Err::DeviceLost:
       return kernel_context;

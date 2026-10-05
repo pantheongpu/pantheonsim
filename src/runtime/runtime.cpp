@@ -173,15 +173,27 @@ void digest_launch(const MemoryManager& mem, const std::string& name, const std:
       std::memcpy(&v, &a[i], 8);
       if (v && mem.find_allocation(v, &base, &size)) allocs[base] = size;
     }
+  // VGPU_KERNEL_DIGEST_DUMP=<directory>: also each allocation's bytes, as
+  // <launch>.<base> files, so `cmp` of two runs' files names the first byte
+  // that differs once the digest has named the kernel and the allocation.
+  static const char* const dump_dir = std::getenv("VGPU_KERNEL_DIGEST_DUMP");
   std::string line;
   std::vector<uint8_t> buf;
   for (const auto& [base, size] : allocs) {
+    FILE* dump = nullptr;
+    if (dump_dir && *dump_dir) {
+      char dn[512];
+      std::snprintf(dn, sizeof dn, "%s/%llu.%llx", dump_dir, static_cast<unsigned long long>(seq),
+                    static_cast<unsigned long long>(base));
+      dump = std::fopen(dn, "wb");
+    }
     uint64_t h = 0xcbf29ce484222325ull;   // FNV-1a
     uint64_t nans = 0, infs = 0;          // aligned words that are f32 NaNs and infinities: where one first appears
     for (uint64_t at = 0; at < size;) {
       const uint64_t n = std::min<uint64_t>(size - at, uint64_t{1} << 20);
       buf.resize(n);
       mem.read(base + at, buf.data(), n);
+      if (dump) std::fwrite(buf.data(), 1, n, dump);
       for (uint8_t c : buf) h = (h ^ c) * 0x100000001b3ull;
       for (uint64_t i = 0; i + 4 <= n; i += 4) {
         uint32_t v;
@@ -191,6 +203,7 @@ void digest_launch(const MemoryManager& mem, const std::string& name, const std:
       }
       at += n;
     }
+    if (dump) std::fclose(dump);
     char b[96];
     std::snprintf(b, sizeof b, " %llx:%016llx:nan%llu:inf%llu", static_cast<unsigned long long>(base),
                   static_cast<unsigned long long>(h), static_cast<unsigned long long>(nans), static_cast<unsigned long long>(infs));

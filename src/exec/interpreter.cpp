@@ -3809,6 +3809,7 @@ class Interpreter {
     }
     if (const auto* bop = std::get_if<OpBar>(&ins.op)) {
       if (bop->warp) {   // bar.warp.sync: waits for its lanes (wait_for_members)
+        sync_mask_groups(w, ctx, ins, bop->id, m);   // a lane outside its own mask traps
         if (wait_for_members(w, ctx, ins, idx, bop->id, m)) return;
         ++w.paths[idx].pc;
         return;
@@ -3921,7 +3922,10 @@ class Interpreter {
 
     if (m != 0) {
       try {
-        dispatch(w, ctx, ins, m);
+        std::vector<Mask> groups;
+        if (const Operand* members = sync_members(ins)) groups = sync_mask_groups(w, ctx, ins, *members, m);
+        if (groups.empty()) dispatch(w, ctx, ins, m);
+        else for (Mask g : groups) dispatch(w, ctx, ins, g);
       } catch (const Error& e) {
         if (std::string(e.what()).find("in kernel") == std::string::npos)
           rethrow_with_context(e, ins, -1);
@@ -3964,6 +3968,69 @@ class Interpreter {
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) return &op->members;
     if (const auto* op = std::get_if<OpVote>(&ins.op); op && op->has_members) return &op->members;
     return nullptr;
+  }
+
+  // The member masks of a *.sync warp instruction, as ptxas's code treats
+  // them. Measured on an RTX 3060 (sm_86, CUDA 13.0), with the mask a
+  // register -- one the compiler cannot see through, such as a lane-dependent
+  // value or a kernel argument; a constant mask compiles to the bare
+  // instruction, which ignores it:
+  //  - every lane the instruction runs for names the same mask: the
+  //    instruction runs once over the lanes that are there (vote, shfl and
+  //    match.sync ignore the mask, even one that leaves lanes of the warp
+  //    out -- __ballot_sync(0xffff, p) from all 32 lanes is the 32-lane
+  //    ballot); redux.sync's code waits with WARPSYNC.EXCLUSIVE first, which
+  //    a lane outside the mask traps on;
+  //  - lanes name different masks (for shfl, masks that disagree about which
+  //    lanes they share: see below): the code runs the instruction once for
+  //    each distinct mask value, over the lanes that named it (a lane's
+  //    __ballot_sync(1u << lane, p) is its own bit of p), and each of those
+  //    waits with WARPSYNC, which a lane outside its mask traps on: "an
+  //    illegal instruction was encountered" (715), whatever the instruction.
+  //    __ballot_sync((1u << lane) - 1, p), the exclusive prefix, is the common
+  //    way into it: lane 0's mask is 0.
+  // Returns the lane groups to run the instruction for one at a time, or
+  // empty to run it as it stands.
+  std::vector<Mask> sync_mask_groups(Warp& w, const BlockCtx& ctx, const Instr& ins, const Operand& members, Mask m) {
+    if (!std::holds_alternative<RegOperand>(members) || m == 0) return {};
+    Lanes _s_mm;
+    const Lanes& mm = read_operand(w, ctx, ins, members, _s_mm);
+    const uint32_t first = static_cast<uint32_t>(mm[first_set(m)]);
+    bool uniform = true;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if ((m & (Mask{1} << lane)) && static_cast<uint32_t>(mm[lane]) != first) uniform = false;
+    // shfl's code asks something weaker than "one mask for all": that every
+    // lane its own mask names, among those here, names that same mask. Two
+    // halves of the warp with a mask each (0xffff and 0xffff0000) are
+    // consistent, and run as the plain 32-lane shuffle.
+    if (!uniform && std::holds_alternative<OpShfl>(ins.op)) {
+      uniform = true;
+      for (uint32_t lane = 0; lane < W_ && uniform; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        for (uint32_t o = 0; o < W_; ++o)
+          if ((m & (Mask{1} << o)) && ((static_cast<uint32_t>(mm[lane]) >> o) & 1u) &&
+              static_cast<uint32_t>(mm[o]) != static_cast<uint32_t>(mm[lane]))
+            uniform = false;
+      }
+    }
+    if (uniform && !std::holds_alternative<OpRedux>(ins.op)) return {};
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if ((m & (Mask{1} << lane)) && !((static_cast<uint32_t>(mm[lane]) >> lane) & 1u))
+        ctx_fail(ins, -1, Err::IllegalInstruction,
+                 "a *.sync warp instruction run by lane " + std::to_string(lane) + ", which its member mask " +
+                 std::to_string(static_cast<uint32_t>(mm[lane])) + " leaves out");
+    if (uniform) return {};
+    std::vector<Mask> groups;
+    std::vector<uint32_t> values;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint32_t v = static_cast<uint32_t>(mm[lane]);
+      size_t g = 0;
+      while (g < values.size() && values[g] != v) ++g;
+      if (g == values.size()) { values.push_back(v); groups.push_back(0); }
+      groups[g] |= Mask{1} << lane;
+    }
+    return groups;
   }
 
   // On the hardware a *.sync warp instruction and bar.warp.sync wait for every
@@ -5455,8 +5522,6 @@ class Interpreter {
       require_warp32(ins, "match.sync");
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
-      Lanes _s_mm;
-      const Lanes& mm = read_operand(w, ctx, ins, op->membermask, _s_mm);
       Lanes r;
       Mask all_agreed = 0;
       for (uint32_t lane = 0; lane < W_; ++lane) {
@@ -5464,7 +5529,8 @@ class Interpreter {
         // Participants are the lanes named by the member mask that are also
         // actually active. A lane listed in the mask but not executing cannot
         // contribute a value, and reading its stale register would invent one.
-        const Mask members = static_cast<Mask>(mm[lane]) & m;
+        // (The mask is not consulted: see sync_mask_groups.)
+        const Mask members = m;
         Mask same = 0;
         for (uint32_t o = 0; o < W_; ++o)
           if ((members & (Mask{1} << o)) && a[o] == a[lane]) same |= (Mask{1} << o);
@@ -6412,7 +6478,10 @@ class Interpreter {
           break;
       }
       if (!pred) j = lane;  // out-of-range source: the lane reads its own value
-      r[lane] = a[j & 0x1F];
+      // A source lane that is not running this shuffle gives 0, not what its
+      // register holds (an RTX 3060: lanes 0-15 of a diverged warp shuffling
+      // from lane 17 read 0).
+      r[lane] = (m >> (j & 0x1F)) & 1 ? a[j & 0x1F] : 0;
       if (pred) pred_out |= (Mask{1} << lane);
     }
     write_reg(w, op.dst, m, r, 32);
