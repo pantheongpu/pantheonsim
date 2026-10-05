@@ -870,3 +870,15 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetAddressingMode(nvmlDevice_t device, nvmlDe
   return NVML_ERROR_NOT_SUPPORTED;
 }
 #endif
+
+#if !defined(VGPU_NVML_12_4)
+// The counter collection unit's stream state: headers before CUDA 12.4 declare
+// these, later ones replaced them with the GPM streaming calls. No counter model
+// here, so the unit is not supported.
+VGPU_NVML_NS_DEV(nvmlDeviceCcuGetStreamState, device, (nvmlDevice_t device, unsigned int*))
+VGPU_EXPORT nvmlReturn_t nvmlDeviceCcuSetStreamState(nvmlDevice_t device, unsigned int state) {
+  NVML_DEV(device);
+  if (state > 1) return NVML_ERROR_INVALID_ARGUMENT;
+  return NVML_ERROR_NOT_SUPPORTED;
+}
+#endif
