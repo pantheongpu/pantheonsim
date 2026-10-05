@@ -16,6 +16,8 @@
 # program's result differs from the card's; report-dir gets one line per
 # program (results.tsv), each one's output, and a summary.md.
 #
+# The cuda-samples list's columns: path | marker | arguments | environment.
+#
 # Environment: SUITE_GPU (nvidia/rtx3060), SUITE_TIMEOUT (seconds per
 # program, 600), SUITE_JOBS (parallel builds, nproc), SUITE_ONLY (a regex of
 # program names to keep).
@@ -122,10 +124,13 @@ run() {
   }
   case $suite in
     cuda-samples)
-      while IFS='|' read -r path marker; do
+      while IFS='|' read -r path marker args extra; do
         name=$(basename "$path"); exe="build/$path"; log="$report/logs/$name.log"
         [[ -x $exe ]] || { result "$name" FAIL 0 "did not build"; continue; }
-        run_one "$name" "$(dirname "$exe")" "$log" "./$name"
+        # args: the sample's arguments; extra: environment (VGPU_DEVICE_COUNT=2 for
+        # the samples that want the card's two GPUs).
+        # shellcheck disable=SC2086
+        run_one "$name" "$(dirname "$exe")" "$log" ${extra:+env $extra} "./$name" $args
         if [[ $rc != 0 ]]; then result "$name" FAIL "$secs" "exit $rc (the card's: 0)"
         elif [[ -n $marker ]] && ! grep -qF -- "$marker" "$log"; then result "$name" FAIL "$secs" "no \"$marker\""
         else result "$name" ok "$secs" ""; fi

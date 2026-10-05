@@ -1,6 +1,7 @@
 # CUDA Samples v13.0 (NVIDIA/cuda-samples 3f1c509) that pass on an RTX 3060 (CUDA 13.0,
 # sm_86) and on the simulated nvidia/rtx3060. Columns: sample path | the line the card
 # printed to say it passed (empty: the sample prints none, and its exit status is the check).
+# Columns: sample path | marker | arguments | environment (the card had two GPUs).
 # Left out: timing checks (simpleHyperQ), samples slower than the nightly allows
 # (matrixMul, simpleStreams, eigenvalues, scan, dmmaTensorCoreGemm, globalToShmemAsyncCopy),
 # and warpAggregatedAtomicsCG, whose sim result varied between runs.
@@ -59,3 +60,82 @@ Samples/6_Performance/LargeKernelParameter/LargeKernelParameter|Test passed!
 Samples/6_Performance/alignedTypes/alignedTypes|[alignedTypes] -> Test Results: 0 Failures
 Samples/6_Performance/cudaGraphsPerfScaling/cudaGraphsPerfScaling|Test passed
 Samples/6_Performance/transpose/transpose|Test passed
+# --- triage candidates (card rc 0, 2026-10-05) ---
+Samples/0_Introduction/UnifiedMemoryStreams/UnifiedMemoryStreams|All Done!||
+Samples/0_Introduction/clock_nvrtc/clock_nvrtc|Average clocks/block =||
+Samples/0_Introduction/matrixMul/matrixMul|Checking computed result for correctness: Result = PASS|-wA=128 -hA=128 -wB=128 -hB=128|
+Samples/0_Introduction/matrixMulDrv/matrixMulDrv|Checking computed result for correctness: Result = PASS||
+Samples/0_Introduction/matrixMulDynlinkJIT/matrixMulDynlinkJIT|Test run success!||
+Samples/0_Introduction/matrixMul_nvrtc/matrixMul_nvrtc|Checking computed result for correctness: Result = PASS||
+Samples/0_Introduction/simpleAssert_nvrtc/simpleAssert_nvrtc|Device assert failed as expected||
+Samples/0_Introduction/simpleAtomicIntrinsics_nvrtc/simpleAtomicIntrinsics_nvrtc|completed, returned OK||
+Samples/0_Introduction/simpleAttributes/simpleAttributes|||
+Samples/0_Introduction/simpleDrvRuntime/simpleDrvRuntime|Result = PASS||
+Samples/0_Introduction/simpleMultiCopy/simpleMultiCopy|Measured throughput:||
+Samples/0_Introduction/simplePitchLinearTexture/simplePitchLinearTexture|completed, returned OK||
+Samples/0_Introduction/simpleStreams/simpleStreams|||
+Samples/0_Introduction/simpleTexture/simpleTexture|completed, returned OK||
+Samples/0_Introduction/simpleTextureDrv/simpleTextureDrv|||
+Samples/0_Introduction/vectorAddDrv/vectorAddDrv|Result = PASS||
+Samples/0_Introduction/vectorAddMMAP/vectorAddMMAP|Result = PASS||
+Samples/0_Introduction/vectorAdd_nvrtc/vectorAdd_nvrtc|Test PASSED||
+Samples/1_Utilities/deviceQuery/deviceQuery|Result = PASS||
+Samples/1_Utilities/deviceQueryDrv/deviceQueryDrv|Result = PASS||
+Samples/1_Utilities/topologyQuery/topologyQuery|||
+Samples/2_Concepts_and_Techniques/MC_EstimatePiInlineQ/MC_EstimatePiInlineQ|Relative error:||
+Samples/2_Concepts_and_Techniques/MC_EstimatePiQ/MC_EstimatePiQ|Relative error:||
+Samples/2_Concepts_and_Techniques/convolutionTexture/convolutionTexture|Test passed||
+Samples/2_Concepts_and_Techniques/eigenvalues/eigenvalues|Test Succeeded!||
+Samples/2_Concepts_and_Techniques/inlinePTX_nvrtc/inlinePTX_nvrtc|Test Successful.||
+Samples/2_Concepts_and_Techniques/reductionMultiBlockCG/reductionMultiBlockCG|CPU result = 1.992401361465||
+Samples/2_Concepts_and_Techniques/scan/scan|||
+Samples/2_Concepts_and_Techniques/threadMigration/threadMigration|ThreadProc() Finished!||VGPU_DEVICE_COUNT=2
+Samples/3_CUDA_Features/cdpAdvancedQuicksort/cdpAdvancedQuicksort|    cdpAdvancedQuicksort PASSED||
+Samples/3_CUDA_Features/cudaCompressibleMemory/cudaCompressibleMemory|||
+Samples/3_CUDA_Features/dmmaTensorCoreGemm/dmmaTensorCoreGemm|||
+Samples/3_CUDA_Features/globalToShmemAsyncCopy/globalToShmemAsyncCopy|Checking computed result for correctness: Result = PASS|-wA=128 -hA=128 -wB=128 -hB=128|
+Samples/3_CUDA_Features/graphConditionalNodes/graphConditionalNodes|||
+Samples/3_CUDA_Features/graphMemoryFootprint/graphMemoryFootprint|||
+Samples/3_CUDA_Features/graphMemoryNodes/graphMemoryNodes|Validation PASSED!||
+Samples/3_CUDA_Features/warpAggregatedAtomicsCG/warpAggregatedAtomicsCG|Warp Aggregated Atomics PASSED ||
+Samples/4_CUDA_Libraries/MersenneTwisterGP11213/MersenneTwisterGP11213|L1 norm: 0.000000E+00||
+Samples/4_CUDA_Libraries/batchCUBLAS/batchCUBLAS|0 error(s)||
+Samples/4_CUDA_Libraries/conjugateGradient/conjugateGradient|Test Summary:  Error amount = 0.000000||
+Samples/4_CUDA_Libraries/conjugateGradientCudaGraphs/conjugateGradientCudaGraphs|Test Summary:  Error amount = 0.000000||
+Samples/4_CUDA_Libraries/conjugateGradientMultiBlockCG/conjugateGradientMultiBlockCG|&&&& conjugateGradientMultiBlockCG PASSED||
+Samples/4_CUDA_Libraries/conjugateGradientPrecond/conjugateGradientPrecond|   Counted total of 0 errors||
+Samples/4_CUDA_Libraries/conjugateGradientUM/conjugateGradientUM|Test Summary:  Error amount = 0.000000, result = SUCCESS||
+Samples/4_CUDA_Libraries/cuSolverDn_LinearSolver/cuSolverDn_LinearSolver||b - A*x|/(|A|*|x|) =||
+Samples/4_CUDA_Libraries/cuSolverRf/cuSolverRf|cusolverRf solve||
+Samples/4_CUDA_Libraries/cuSolverSp_LinearSolver/cuSolverSp_LinearSolver|||
+Samples/4_CUDA_Libraries/cuSolverSp_LowlevelCholesky/cuSolverSp_LowlevelCholesky|(GPU) |b - A*x|/(|A|*|x|) =||
+Samples/4_CUDA_Libraries/cuSolverSp_LowlevelQR/cuSolverSp_LowlevelQR|(GPU) |b - A*x|/(|A|*|x|) =||
+Samples/4_CUDA_Libraries/lineOfSight/lineOfSight|Test passed||
+Samples/4_CUDA_Libraries/matrixMulCUBLAS/matrixMulCUBLAS|Comparing CUBLAS Matrix Multiply with CPU results: PASS||
+Samples/4_CUDA_Libraries/nvJPEG/nvJPEG|||
+Samples/4_CUDA_Libraries/nvJPEG_encoder/nvJPEG_encoder|||
+Samples/4_CUDA_Libraries/simpleCUBLAS/simpleCUBLAS|simpleCUBLAS test passed.||
+Samples/4_CUDA_Libraries/simpleCUBLASXT/simpleCUBLASXT|simpleCUBLASXT test passed.||VGPU_DEVICE_COUNT=2
+Samples/4_CUDA_Libraries/simpleCUBLAS_LU/simpleCUBLAS_LU|> TEST SUCCESSFUL, with precision: 1e-15||
+Samples/4_CUDA_Libraries/simpleCUFFT/simpleCUFFT|||
+Samples/4_CUDA_Libraries/simpleCUFFT_2d_MGPU/simpleCUFFT_2d_MGPU|||VGPU_DEVICE_COUNT=2
+Samples/4_CUDA_Libraries/simpleCUFFT_MGPU/simpleCUFFT_MGPU|value of TestResult 1||VGPU_DEVICE_COUNT=2
+Samples/4_CUDA_Libraries/simpleCUFFT_callback/simpleCUFFT_callback|||
+Samples/4_CUDA_Libraries/watershedSegmentationNPP/watershedSegmentationNPP|Rocks_SegmentBoundaries_8Way_512x512_8u succeeded.||
+Samples/5_Domain_Specific/BlackScholes/BlackScholes|Test passed||
+Samples/5_Domain_Specific/BlackScholes_nvrtc/BlackScholes_nvrtc|Test passed||
+Samples/5_Domain_Specific/FDTD3d/FDTD3d|||
+Samples/5_Domain_Specific/HSOpticalFlow/HSOpticalFlow|||
+Samples/5_Domain_Specific/MonteCarloMultiGPU/MonteCarloMultiGPU|Test passed||VGPU_DEVICE_COUNT=2
+Samples/5_Domain_Specific/NV12toBGRandResize/NV12toBGRandResize|||
+Samples/5_Domain_Specific/SobolQRNG/SobolQRNG|L1-Error: 0||
+Samples/5_Domain_Specific/binomialOptions/binomialOptions|Test passed||
+Samples/5_Domain_Specific/binomialOptions_nvrtc/binomialOptions_nvrtc|Test passed||
+Samples/5_Domain_Specific/convolutionFFT2D/convolutionFFT2D|Test passed||
+Samples/5_Domain_Specific/dwtHaar1D/dwtHaar1D|Test success!||
+Samples/5_Domain_Specific/dxtc/dxtc|Test passed||
+Samples/5_Domain_Specific/fastWalshTransform/fastWalshTransform|Test passed||
+Samples/5_Domain_Specific/quasirandomGenerator/quasirandomGenerator|L1 norm: 9.439909E-08||
+Samples/5_Domain_Specific/quasirandomGenerator_nvrtc/quasirandomGenerator_nvrtc|L1 norm: 9.439909E-08||
+Samples/5_Domain_Specific/stereoDisparity/stereoDisparity|GPU Checksum = 4293895789||
+Samples/6_Performance/UnifiedMemoryPerf/UnifiedMemoryPerf|||
