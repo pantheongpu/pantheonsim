@@ -1573,7 +1573,7 @@ if(TARGET vgpucublas)
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_attention:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet")
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}

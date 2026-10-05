@@ -27,11 +27,13 @@
 // 3060 where the documentation leaves them open.
 #include "../include/vgpu_cutensornet.h"
 #include "../include/vgpu_cutensor.h"
+#include "enum_value.hpp"
 
 #include <cuda_runtime_api.h>
 #include <cusolverDn.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -42,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -2909,10 +2912,12 @@ cutensornetStatus_t cutensornetGateSplit(
 
 }  // extern "C"
 
+// ---- the state API ----
+#include "cutensornet_state.inc"
+
 // ---- not implemented ----
 //
-// The state API (states, operators, accessors, expectations, marginals,
-// samplers, MPS projection), gradients, distributed execution and NVIDIA's
+// Gradients, the MPS projection, distributed execution and NVIDIA's
 // undocumented exports. Each is exported, so a program linked against
 // NVIDIA's library loads, and answers NOT_SUPPORTED with a message.
 extern "C" {
@@ -2920,70 +2925,18 @@ extern "C" {
   cutensornetStatus_t name(...) {                                               \
     return refuse(#name, "this part of cuTensorNet is not implemented");        \
   }
-VGPU_TN_NOT_IMPLEMENTED(cutensornetAccessorCompute)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetAccessorConfigure)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetAccessorGetInfo)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetAccessorPrepare)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetBinaryTensorContractionCompute)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetBinaryTensorContractionPrepare)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateAccessor)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateBinaryTensorContraction)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateCopyContractionOptimizerInfo)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateDistributedTensorDescriptor)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateExpectation)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateMarginal)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateMarginalDiagonal)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateNetworkOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateSampler)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateState)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateStateProjectionMPS)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyAccessor)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyBinaryTensorContraction)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyExpectation)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyMarginal)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyNetworkOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroySampler)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyState)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyStateProjectionMPS)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedGetNumRanks)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedGetProcRank)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedResetConfiguration)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedSynchronize)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetExpectationCompute)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetExpectationComputeWithGradientsBackward)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetExpectationConfigure)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetExpectationGetInfo)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetExpectationPrepare)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetGetOutputStateDetails)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetMarginalCompute)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetMarginalConfigure)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetMarginalGetInfo)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetMarginalPrepare)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetNetworkComputeGradientsBackward)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetNetworkOperatorAppendMPO)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetNetworkOperatorAppendProduct)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetNetworkPrepareGradientsBackward)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetNetworkSetAdjointTensorMemory)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetNetworkSetGradientTensorMemory)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetSamplerConfigure)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetSamplerGetInfo)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetSamplerPrepare)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetSamplerSample)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyControlledTensorOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyDiagonalTensorOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyGeneralChannel)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyNetworkOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyTensor)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyTensorOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyTensorOperatorWithGradient)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateApplyUnitaryChannel)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateCaptureMPS)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateCompute)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateConfigure)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateFinalizeMPS)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateGetInfo)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateInitializeMPS)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStatePrepare)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSComputeTensorEnv)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSConfigure)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSExtractTensor)
@@ -2992,8 +2945,5 @@ VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSInsertTensor)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSPrepare)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSUpdateCoefficients)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSUpdateDualTensors)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateUpdateTensor)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateUpdateTensorOperator)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetStateUpdateTensorOperatorGradient)
 #undef VGPU_TN_NOT_IMPLEMENTED
 }  // extern "C"
