@@ -23,14 +23,19 @@ fi
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: python3 not found (the comparison is a Python script)"; exit 0; }
 
 fail=0
-# name:library[:relative tolerance]. The cuDNN programs build against the
-# vendored headers and link the shim's library, since cuDNN is not part of the
-# toolkit; cudnn_types prints half-precision results, so it is compared to
-# half precision.
-for spec in cublas_level1:-lcublas cusparse_ops:-lcusparse cudnn_backward:-lcudnn cudnn_types:-lcudnn:1e-3; do
+# name:libraries[:relative tolerance], the libraries comma-separated. The
+# cuDNN programs build against the vendored headers and link the shim's
+# library, since cuDNN is not part of the toolkit; cudnn_types prints
+# half-precision results, so it is compared to half precision. npp_imgproc's
+# integer results are compared exactly whatever the tolerance; its floats
+# (single-precision image arithmetic, summed) to 1e-4.
+npp_libs=-lnppc,-lnppial,-lnppicc,-lnppidei,-lnppif,-lnppig,-lnppim,-lnppist,-lnppisu,-lnppitc,-lnpps
+for spec in cublas_level1:-lcublas cusparse_ops:-lcusparse cudnn_backward:-lcudnn cudnn_types:-lcudnn:1e-3 \
+            npp_imgproc:$npp_libs:1e-4; do
   name="${spec%%:*}" rest="${spec#*:}"
   lib="${rest%%:*}" tol=1e-5 inc=""
   [[ "$rest" == *:* ]] && tol="${rest#*:}"
+  lib="${lib//,/ }"
   if [[ "$lib" == -lcudnn ]]; then
     [[ -e "$shim/libcudnn.so" ]] || { echo "skip  $name: libvgpucudnn not built"; continue; }
     inc="-I$root/nvidia/third_party/cudnn_include -Xcompiler -Wno-deprecated-declarations"

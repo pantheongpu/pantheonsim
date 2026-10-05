@@ -3010,6 +3010,7 @@ class Interpreter {
       case Sreg::ReservedSmemEnd: return reserved_smem_base() + kReservedSmemUsed;
       case Sreg::ReservedSmemCap: return reserved_smem_base() + reserved_smem_bytes();
       case Sreg::GridId: return grid_id_;
+      case Sreg::CurrentGraphExec: return cfg_.current_graph_exec;
     }
     return 0;
   }
@@ -6154,6 +6155,13 @@ class Interpreter {
       // external function of that name, which the driver supplies.
       if (op->callee == "cudaGraphSetConditional") {
         exec_graph_set_conditional(w, ins, *op, m);
+        return;
+      }
+      // Device-side cudaGraphLaunch(graphExec, stream): also a driver-supplied
+      // external, which the device runtime's header declares and no library
+      // defines.
+      if (op->callee == "cudaGraphLaunch") {
+        exec_device_graph_launch(w, ins, *op, m);
         return;
       }
       if (op->callee == "__cuda_syscall_cnpv2StreamCreate" || op->callee == "__cuda_syscall_cnpv2EventCreate") {
@@ -10655,6 +10663,33 @@ class Interpreter {
                      : std::string("cudaGraphSetConditional in a kernel that is not running in a graph"));
     }
     write_call_result(w, op, m, Lanes{}, 4);
+  }
+
+  // cudaGraphLaunch(graphExec, stream) from a kernel. The runtime that launched
+  // the graph this kernel runs in checks and queues it (DeviceGraphLauncher);
+  // each calling thread is its own launch, in lane order. Outside any graph,
+  // and for a handle that is no device graph, an RTX 3060 faults with an
+  // illegal address rather than returning an error.
+  void exec_device_graph_launch(Warp& w, const Instr& ins, const OpCall& op, Mask m) {
+    if (op.param_slots.size() != 2)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, op.callee + " takes two arguments");
+    const Warp::Slot& exec = call_slot(w, ins, op, 0);
+    const Warp::Slot& stream = call_slot(w, ins, op, 1);
+    Lanes r{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t g = exec.read(lane, 0, 8);
+      if (!cfg_.graph_launcher)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidPointer,
+                 "device-side cudaGraphLaunch in a kernel that is not running in a graph");
+      const int rc = cfg_.graph_launcher->launch(g, stream.read(lane, 0, 8));
+      if (rc < 0)
+        ctx_fail(ins, static_cast<int>(lane), Err::InvalidPointer,
+                 "device-side cudaGraphLaunch of a handle that is not a graph instantiated for device "
+                 "launch (cudaGraphInstantiateFlagDeviceLaunch)");
+      r[lane] = static_cast<uint64_t>(rc);
+    }
+    write_call_result(w, op, m, r, 4);
   }
 
   // int f(int* out): writes `value` through the pointer and returns success.

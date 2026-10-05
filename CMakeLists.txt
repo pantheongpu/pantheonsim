@@ -513,15 +513,20 @@ if(CUDA_ABI_INCLUDE)
 
   # ---------------------------------------------------------------------------
   # NPP. NVIDIA splits it across eleven shared objects that share one API
-  # surface, so one source is built into each under its own soname. The symbols
-  # are identical in every copy and ELF resolves a name to a single definition
-  # process-wide, so the duplication costs disk and nothing else.
+  # surface, so one set of objects is linked into each under its own soname
+  # (compiled once). The symbols are identical in every copy and ELF resolves a
+  # name to a single definition process-wide, so the duplication costs disk and
+  # nothing else.
   # ---------------------------------------------------------------------------
+  add_library(vgpunpp_objs OBJECT nvidia/src/npp_api.cpp nvidia/src/npp_imgproc.cpp)
+  set_target_properties(vgpunpp_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(vgpunpp_objs PRIVATE vgpu)
+  target_include_directories(vgpunpp_objs PRIVATE ${CUDA_ABI_INCLUDE})
   set(_vgpu_npp_libs nppc nppial nppicc nppidei nppif nppig nppim nppist nppisu nppitc npps)
   foreach(_npp IN LISTS _vgpu_npp_libs)
     vgpu_toolkit_soversion(${_npp} 13 _nppver)
     vgpu_version_script(${_npp} ${_nppver} _nppmap)
-    add_library(vgpu${_npp} SHARED nvidia/src/npp_api.cpp)
+    add_library(vgpu${_npp} SHARED $<TARGET_OBJECTS:vgpunpp_objs>)
     target_link_libraries(vgpu${_npp} PRIVATE vgpu vgpucudart)
     target_include_directories(vgpu${_npp} PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpu${_npp} PROPERTIES
@@ -589,7 +594,7 @@ if(CUDA_ABI_INCLUDE)
   # libraries -- a linker and a container writer -- so, like NVRTC, they carry
   # no simulator and no runtime: only the fatbin reader and writer
   # (fatbin.cpp) and the PTX linker the runtime also links -rdc builds with
-  # (ptx_link.cpp). Each is written from the documented API with the
+  # (ptx_link.cpp), and nvJitLink's machine-code linker (sass_link.cpp). Each is written from the documented API with the
   # simulator's own declarations (nvidia/include/vgpu_nvjitlink.h,
   # vgpu_nvfatbin.h), since CUDA 12.0 has no nvFatbin.h. NVIDIA tags both
   # libraries' symbols with their soname, and the stubs programs link against
@@ -607,7 +612,7 @@ if(CUDA_ABI_INCLUDE)
     set(_ver ${SO_CUDART})
     vgpu_version_script(${_lib} ${_ver} _map)
     add_library(vgpu${_lower} SHARED nvidia/src/${_src}.cpp nvidia/src/fatbin.cpp
-                nvidia/src/ptx_link.cpp src/core/error.cpp)
+                nvidia/src/ptx_link.cpp nvidia/src/sass_link.cpp src/core/error.cpp)
     target_include_directories(vgpu${_lower} PRIVATE include nvidia/src)
     target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})   # libzstd, dlopened
     target_compile_definitions(vgpu${_lower} PRIVATE VGPU_${_macro}_VERSION=${VGPU_TOOLKIT_VERSION})
@@ -1133,6 +1138,11 @@ set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# AMD's hipFFT, hipRAND, hipSOLVER and hipSPARSE, unmodified, where ROCm with
+# them is installed or PyTorch's ROCm wheel is.
+add_test(NAME amd_libraries COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_libraries.sh)
+set_tests_properties(amd_libraries PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1500)
 # PyTorch's ROCm build, unmodified, where a Python with it is installed
 # (VGPU_TORCH_PYTHON, or a venv under ~/.local/share/torch-rocm*).
 add_test(NAME amd_pytorch COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh)
@@ -1233,8 +1243,10 @@ add_test(NAME amd_hip_on_hsa COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_o
 set_tests_properties(amd_hip_on_hsa PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
+# hipCUB's and rocThrust's twenty checks run on two GPUs, each allowed ten
+# minutes by the script; a sanitizer build needs several of them.
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
@@ -1420,12 +1432,13 @@ if(TARGET vgpucublas)
   # temporary storage, decoupled look-back scan and warp primitives throughout
   # -- so running them end to end exercises far more than a hand-written kernel
   # does, and the answer is checked rather than the launch's return code.
-  # cuBLAS, cuSPARSE and cuDNN conformance programs against output an RTX 3060
-  # printed, so a routine that stops agreeing with the hardware fails without a GPU.
+  # cuBLAS, cuSPARSE, cuDNN and NPP conformance programs against output an RTX
+  # 3060 printed, so a routine that stops agreeing with the hardware fails
+  # without a GPU.
   add_test(NAME e2e_library_goldens
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_library_goldens.sh)
   set_tests_properties(e2e_library_goldens PROPERTIES
-    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn"
+    DEPENDS "vgpucudart;vgpucublas;vgpucusparse;vgpucudnn;vgpunppc;vgpunppig"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
@@ -1448,6 +1461,7 @@ if(TARGET vgpucublas)
                           "blas_rot_paths:cublas" "blas_level23_paths:cublas" "blas_grouped:cublas"
                           "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
+                          "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt"
                           "dnn_backward:cudnn" "dnn_graph:cudnn" "cutensor_paths:cutensor"
@@ -1491,6 +1505,15 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # nvJitLink linking relocatable SASS (-rdc cubins, a host object, a static
+  # library) for each generation, and running what it links. The program
+  # passes on an RTX 3060 with NVIDIA's nvJitLink and with this one.
+  add_test(NAME e2e_nvjitlink_sass COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_jit_link_sass.sh)
+  set_tests_properties(e2e_nvjitlink_sass PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
 
   # __managed__ variables in a module cuModuleLoadData loads from a cubin, a
   # fatbin and PTX, as an RTX 3060 answers for all three.
@@ -2079,6 +2102,15 @@ endif()
 if(TARGET vgpucudart)
   add_test(NAME e2e_dynamic_parallelism COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dynamic_parallelism.sh)
   set_tests_properties(e2e_dynamic_parallelism PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# Device-side graph launch and %current_graph_exec, on both engines.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_graph_launch COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_graph_launch.sh)
+  set_tests_properties(e2e_device_graph_launch PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
