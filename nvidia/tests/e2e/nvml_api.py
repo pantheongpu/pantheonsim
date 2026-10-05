@@ -105,8 +105,11 @@ is_mig = ctypes.c_uint(99)
 check("not a MIG handle", lib.nvmlDeviceIsMigDeviceHandle(ctypes.c_void_p(h1), ctypes.byref(is_mig)) == SUCCESS
       and is_mig.value == 0, is_mig.value)
 util, period = ctypes.c_uint(), ctypes.c_uint()
-check("encoder utilization exists and says NOT_SUPPORTED",
-      lib.nvmlDeviceGetEncoderUtilization(ctypes.c_void_p(h1), ctypes.byref(util), ctypes.byref(period)) == NOT_SUPPORTED)
+# A T4 has an encoder, and a card with the engine answers 0 over a 200 ms period when nothing is
+# encoding (the RTX 3060 does); this used to be NOT_SUPPORTED.
+check("encoder utilization of a GPU with an encoder is 0 over 200 ms",
+      lib.nvmlDeviceGetEncoderUtilization(ctypes.c_void_p(h1), ctypes.byref(util), ctypes.byref(period)) == SUCCESS
+      and (util.value, period.value) == (0, 200000), (util.value, period.value))
 reasons = ctypes.c_ulonglong(99)
 check("an idle card reports only the idle reason, as a real one does",
       lib.nvmlDeviceGetCurrentClocksThrottleReasons(ctypes.c_void_p(h1), ctypes.byref(reasons))

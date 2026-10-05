@@ -37,7 +37,7 @@ std::vector<unsigned> graphics_clock_list(const vgpu::telemetry::DeviceSample& d
 struct Lock {
   unsigned lo = 0, hi = 0;
 };
-Lock locked_clocks(const std::string& uuid, const char* key) {
+[[maybe_unused]] Lock locked_clocks(const std::string& uuid, const char* key) {
   Lock l;
   const std::string v = setting(uuid, Life::Volatile, key, "");
   std::sscanf(v.c_str(), "%u,%u", &l.lo, &l.hi);
@@ -201,7 +201,12 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPlatformInfo(nvmlDevice_t device, nvmlPlat
     return NVML_ERROR_ARGUMENT_VERSION_MISMATCH;
   if (!consumer(*d)) return NVML_ERROR_NOT_SUPPORTED;   // an SXM board's platform is not simulated
   const unsigned version = info->version;
-  std::memset(info, 0, sizeof *info);
+  // Zero what the caller's version of the struct holds, not what the newest one does.
+#if defined(nvmlPlatformInfo_v2)
+  std::memset(info, 0, version == nvmlPlatformInfo_v1 ? sizeof(nvmlPlatformInfo_v1_t) : sizeof(nvmlPlatformInfo_v2_t));
+#else
+  std::memset(info, 0, sizeof(nvmlPlatformInfo_v1_t));
+#endif
   info->version = version;
   info->hostId = 1;
   info->moduleId = static_cast<unsigned char>(device_index(d));

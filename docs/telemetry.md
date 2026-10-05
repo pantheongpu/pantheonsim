@@ -60,7 +60,9 @@ LD_LIBRARY_PATH=build/shim python -c "import pynvml; pynvml.nvmlInit(); ..."
 ```
 
 Queries VirtualGPU cannot answer return `NVML_ERROR_NOT_SUPPORTED`, which tools
-render as `N/A` — the honest result rather than an invented number.
+render as `N/A` — the honest result rather than an invented number. Every function
+`nvml.h` declares is exported; [nvidia/docs/nvml.md](../nvidia/docs/nvml.md) says which
+answer is real, which is `NOT_SUPPORTED` by design and why, and how the setters work.
 
 ## Reliability and link in profiles
 

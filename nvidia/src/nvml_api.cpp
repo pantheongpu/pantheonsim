@@ -365,7 +365,12 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetNumGpuCores(nvmlDevice_t device, unsigned 
   refresh();
   const auto* d = sample(device);
   if (!d || !cores) return bad(device);
-  *cores = d->multiprocessors;
+  // CUDA cores, not multiprocessors (this returned the multiprocessor count, 28
+  // on an RTX 3060 that has 3584 cores): 64 per multiprocessor on Volta, Turing
+  // and the A100, 128 on GA10x, Ada, Hopper and Blackwell (NVIDIA's architecture
+  // whitepapers). The card (WSL) answers NOT_SUPPORTED; a Linux driver answers the count.
+  const unsigned per_sm = d->cc_major <= 7 || (d->cc_major == 8 && d->cc_minor == 0) ? 64 : 128;
+  *cores = d->multiprocessors * per_sm;
   return NVML_SUCCESS;
 }
 
@@ -708,6 +713,14 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char* busId, nvm
   REQUIRE_INIT();
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   if (!busId || !device) return NVML_ERROR_INVALID_ARGUMENT;
+  // Measured: text that is no PCI address ("domain:bus:device.function", in hex,
+  // the domain four or eight digits) is INVALID_ARGUMENT; a well-formed address
+  // that is no GPU is NOT_FOUND.
+  {
+    unsigned dom, bus, dev, fn;
+    char extra;
+    if (std::sscanf(busId, "%x:%x:%x.%x%c", &dom, &bus, &dev, &fn, &extra) != 4) return NVML_ERROR_INVALID_ARGUMENT;
+  }
   refresh();
   for (unsigned int i = 0; i < g_snap.device_count; ++i)
     if (same_bus_id(g_snap.devices[i].bus_id, busId)) {
@@ -919,11 +932,15 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetVbiosVersion(nvmlDevice_t, char*, unsigned
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEnergyConsumption(nvmlDevice_t, unsigned long long*) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t*,
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t* utilization,
                                                          unsigned int* count, unsigned long long) {
   REQUIRE_INIT();
-  if (count) *count = 0;
-  return NVML_ERROR_NOT_FOUND;   // the documented answer when there are no samples
+  if (!count) return NVML_ERROR_INVALID_ARGUMENT;
+  // Measured: a missing or zero-sized buffer is the sizing call, INSUFFICIENT_SIZE;
+  // with room, the documented answer when there are no samples is NOT_FOUND.
+  const bool sizing = !utilization || *count == 0;
+  *count = 0;
+  return sizing ? NVML_ERROR_INSUFFICIENT_SIZE : NVML_ERROR_NOT_FOUND;
 }
 // Each field carries its own status, and the call itself succeeds.
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count,
@@ -931,8 +948,8 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
   REQUIRE_INIT();
   std::lock_guard<std::recursive_mutex> lock(g_mu);
   unsigned int idx;
-  if (!index_of(device, &idx) || count < 0 || (count > 0 && !values))
-    return bad(device);
+  // Measured: no fields to fill (a count of 0) is as invalid as no array.
+  if (!index_of(device, &idx) || count <= 0 || !values) return bad(device);
   refresh();
   const auto* d = sample(device);
   // NVML's documented field ids, by number: they are ABI, and the oldest

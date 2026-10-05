@@ -422,8 +422,9 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetAccountingMode(nvmlDevice_t device, nvmlEn
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetAccountingPids(nvmlDevice_t device, unsigned int* count, unsigned int* pids) {
   NVML_DEV(device);
   NVML_ARG(count);
-  if (!accounting_on(*d)) return NVML_ERROR_NOT_SUPPORTED;
-  const std::vector<AcctRecord> recs = acct_sync(*d);
+  // Measured: with accounting off the card answers an empty list, not
+  // NOT_SUPPORTED as nvml.h says.
+  const std::vector<AcctRecord> recs = accounting_on(*d) ? acct_sync(*d) : std::vector<AcctRecord>{};
   const unsigned have = static_cast<unsigned>(recs.size());
   // Measured: the sizing call (a NULL list) is INSUFFICIENT_SIZE with the count,
   // as nvml.h documents, and so is any list the records do not fit.
@@ -439,7 +440,8 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetAccountingStats(nvmlDevice_t device, unsig
                                                       nvmlAccountingStats_t* stats) {
   NVML_DEV(device);
   NVML_ARG(stats);
-  if (!accounting_on(*d)) return NVML_ERROR_NOT_SUPPORTED;
+  // Measured: with accounting off no pid is found.
+  if (!accounting_on(*d)) return NVML_ERROR_NOT_FOUND;
   const std::vector<AcctRecord> recs = acct_sync(*d);
   for (auto it = recs.rbegin(); it != recs.rend(); ++it) {   // a reused pid reports its latest process
     if (it->pid != pid) continue;

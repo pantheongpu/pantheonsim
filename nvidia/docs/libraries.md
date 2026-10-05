@@ -251,7 +251,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | --- | --- | --- |
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
-| NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
+| NVML | `libnvidia-ml.so.1` | every function the toolkit's `nvml.h` declares (`pynvml`, nvitop, DCGM exporters): discovery and telemetry, clocks, fans, ECC, retired pages and remapped rows, accounting, NVLink ports, topology, and root-only setters kept in a per-device settings overlay; what has no answer here is `NOT_SUPPORTED`, as on the card -- see [nvml.md](nvml.md) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (band and packed storage included; the plane rotations bit for bit), batched GEMV in every type, triangular solves, batched LU (`getrfBatched`/`getrsBatched`/`getriBatched`/`matinvBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`), the `_64` forms, cuBLASXt over several devices and the legacy (`cublas.h`) API; see [cublas.md](cublas.md) |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4, strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 tensor-wise and row-wise scales with amax, and the block-scaled FP8/FP4 modes (documentation-derived) |
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans, LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
@@ -748,6 +748,15 @@ same card, whose driver then runs the linked PTX and SASS.
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
+- **NVML**: every function `nvml.h` declares is exported and answers (the
+  coverage test checks it against the toolkit's header). What has no answer is
+  `NVML_ERROR_NOT_SUPPORTED`: vGPU, S-class units, confidential computing, GPM
+  and PRM; MIG partitioning (MIG mode itself reads back, instances cannot be
+  created); NVLink traffic (the ports exist, none is connected); application
+  clocks; BAR1 usage, PCIe throughput and energy, which need a rate or an
+  integral the telemetry does not keep; and the clock tables, fans and
+  inforom of every profile but the RTX 3060, which no card was read for.
+  [nvml.md](nvml.md) has the list and the reasons.
 - **cuBLAS**: `cublasUint8gemmBias` (deprecated, and undocumented in
   cuBLAS 13: the card runs it, but there is no definition to implement), and
   the exported names the header does not declare (`cublas?bdmm`,

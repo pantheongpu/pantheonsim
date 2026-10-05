@@ -1,0 +1,251 @@
+# NVML getter return codes of an RTX 3060, and the simulator's.
+#
+# Columns: function, card return code, simulator return code (VGPU_GPU=nvidia/rtx3060),
+# the leading bytes (hex) of the card's first output where that output is a fixed fact of the
+# card (empty otherwise), and, where the simulator's code differs from the card's, why.
+#
+# The card: GPU index 1 of this project's RTX 3060 machine, through NVIDIA's own NVML 13.0
+# (libnvidia-ml.so.1 of the WSL driver 596.36), each getter nvml.h declares called once by the
+# probe nvidia/tools/nvml_card_probe_gen.py generates (zeroed output buffers, the version word
+# set, scalars 0, a string length of 128, handle index 1). Nothing that writes was called: no
+# setter, clearer, creator, destroyer, reset, remove, modify or discover entry point.
+# run_nvml_matrix.sh runs the same probe against the shim and compares.
+#
+# Return codes: 0 success, 2 invalid argument, 3 not supported, 6 not found, 7 insufficient
+# size, 25 argument version mismatch.
+nvmlDeviceGetAPIRestriction	3	3		
+nvmlDeviceGetAccountingBufferSize	0	0	a00f0000	
+nvmlDeviceGetAccountingMode	0	0		
+nvmlDeviceGetAccountingPids	0	0		
+nvmlDeviceGetAccountingStats	6	6		
+nvmlDeviceGetAdaptiveClockInfoStatus	0	0	01000000	
+nvmlDeviceGetAddressingMode	3	3		
+nvmlDeviceGetApplicationsClock	3	3		
+nvmlDeviceGetArchitecture	0	0	07000000	
+nvmlDeviceGetAttributes	3	3		
+nvmlDeviceGetAttributes_v2	3	3		
+nvmlDeviceGetAutoBoostedClocksEnabled	3	3		
+nvmlDeviceGetBAR1MemoryInfo	0	3		BAR1 size depends on the host (resizable BAR) and its use on the host driver; not modelled
+nvmlDeviceGetBoardId	0	0		
+nvmlDeviceGetBoardPartNumber	3	3		
+nvmlDeviceGetBrand	0	0	05000000	
+nvmlDeviceGetBridgeChipInfo	3	3		
+nvmlDeviceGetBusType	0	0	02000000	
+nvmlDeviceGetC2cModeInfoV	3	3		
+nvmlDeviceGetCapabilities	0	0		
+nvmlDeviceGetClkMonStatus	3	3		
+nvmlDeviceGetClock	0	0		
+nvmlDeviceGetClockInfo	0	0		
+nvmlDeviceGetClockOffsets	0	0		
+nvmlDeviceGetComputeInstanceId	2	2		
+nvmlDeviceGetComputeMode	0	0		
+nvmlDeviceGetComputeRunningProcesses	0	0		
+nvmlDeviceGetComputeRunningProcesses_v2	0	0		
+nvmlDeviceGetComputeRunningProcesses_v3	0	0		
+nvmlDeviceGetConfComputeGpuAttestationReport	3	3		
+nvmlDeviceGetConfComputeGpuCertificate	3	3		
+nvmlDeviceGetConfComputeMemSizeInfo	3	3		
+nvmlDeviceGetConfComputeProtectedMemoryUsage	3	3		
+nvmlDeviceGetCoolerInfo	0	0		
+nvmlDeviceGetCount	0	0		
+nvmlDeviceGetCount_v2	0	0		
+nvmlDeviceGetCpuAffinity	3	0		WSL has no CPU affinity to report; a Linux driver answers it and so does the shim
+nvmlDeviceGetCpuAffinityWithinScope	3	0		WSL has no CPU affinity to report; a Linux driver answers it and so does the shim
+nvmlDeviceGetCudaComputeCapability	0	0	0800000000000000	
+nvmlDeviceGetCurrPcieLinkGeneration	0	0		
+nvmlDeviceGetCurrPcieLinkWidth	0	0		
+nvmlDeviceGetCurrentClockFreqs	0	0		
+nvmlDeviceGetCurrentClocksEventReasons	0	0		
+nvmlDeviceGetCurrentClocksThrottleReasons	0	0		
+nvmlDeviceGetDecoderUtilization	0	0		
+nvmlDeviceGetDefaultApplicationsClock	3	3		
+nvmlDeviceGetDefaultEccMode	3	3		
+nvmlDeviceGetDetailedEccErrors	3	3		
+nvmlDeviceGetDeviceHandleFromMigDeviceHandle	2	2		
+nvmlDeviceGetDisplayActive	0	0		
+nvmlDeviceGetDisplayMode	0	0		
+nvmlDeviceGetDramEncryptionMode	3	3		
+nvmlDeviceGetDriverModel	0	3		WSL reports the WDDM driver model; a Linux driver has none (Windows-only query)
+nvmlDeviceGetDriverModel_v2	0	3		WSL reports the WDDM driver model; a Linux driver has none (Windows-only query)
+nvmlDeviceGetDynamicPstatesInfo	0	0		
+nvmlDeviceGetEccMode	3	3		
+nvmlDeviceGetEncoderCapacity	0	0	64000000	
+nvmlDeviceGetEncoderSessions	0	0		
+nvmlDeviceGetEncoderStats	0	0		
+nvmlDeviceGetEncoderUtilization	0	0		
+nvmlDeviceGetEnforcedPowerLimit	0	0		
+nvmlDeviceGetFBCSessions	0	0		
+nvmlDeviceGetFBCStats	0	0		
+nvmlDeviceGetFanControlPolicy_v2	0	0		
+nvmlDeviceGetFanSpeed	0	0		
+nvmlDeviceGetFanSpeedRPM	0	0		
+nvmlDeviceGetFanSpeed_v2	0	0		
+nvmlDeviceGetFieldValues	2	2		
+nvmlDeviceGetGpcClkMinMaxVfOffset	0	0	18fcffff00000000	
+nvmlDeviceGetGpcClkVfOffset	0	0		
+nvmlDeviceGetGpuFabricInfo	0	0		
+nvmlDeviceGetGpuFabricInfoV	25	25		
+nvmlDeviceGetGpuInstanceId	2	2		
+nvmlDeviceGetGpuInstancePossiblePlacements	3	3		
+nvmlDeviceGetGpuInstancePossiblePlacements_v2	3	3		
+nvmlDeviceGetGpuInstanceProfileInfo	3	3		
+nvmlDeviceGetGpuInstanceProfileInfoByIdV	3	3		
+nvmlDeviceGetGpuInstanceProfileInfoV	3	3		
+nvmlDeviceGetGpuInstanceRemainingCapacity	3	3		
+nvmlDeviceGetGpuMaxPcieLinkGeneration	0	0		
+nvmlDeviceGetGpuOperationMode	3	3		
+nvmlDeviceGetGraphicsRunningProcesses	0	0		
+nvmlDeviceGetGraphicsRunningProcesses_v2	0	0		
+nvmlDeviceGetGraphicsRunningProcesses_v3	0	0		
+nvmlDeviceGetGridLicensableFeatures	0	0		
+nvmlDeviceGetGridLicensableFeatures_v2	0	0		
+nvmlDeviceGetGridLicensableFeatures_v3	0	0		
+nvmlDeviceGetGridLicensableFeatures_v4	0	0		
+nvmlDeviceGetGspFirmwareMode	3	3		
+nvmlDeviceGetGspFirmwareVersion	3	3		
+nvmlDeviceGetHandleByIndex	0	0		
+nvmlDeviceGetHandleByIndex_v2	0	0		
+nvmlDeviceGetHandleByPciBusId	2	2		
+nvmlDeviceGetHandleByPciBusId_v2	2	2		
+nvmlDeviceGetHandleBySerial	6	6		
+nvmlDeviceGetHandleByUUID	6	6		
+nvmlDeviceGetHandleByUUIDV	2	2		
+nvmlDeviceGetHostVgpuMode	3	3		
+nvmlDeviceGetHostname_v1	3	3		
+nvmlDeviceGetIndex	0	0		
+nvmlDeviceGetInforomConfigurationChecksum	0	0		
+nvmlDeviceGetInforomImageVersion	0	0	473030312e303030302e30332e303300	
+nvmlDeviceGetInforomVersion	0	0	322e30	
+nvmlDeviceGetIrqNum	0	0		
+nvmlDeviceGetJpgUtilization	0	0		
+nvmlDeviceGetLastBBXFlushTime	3	3		
+nvmlDeviceGetMPSComputeRunningProcesses	0	0		
+nvmlDeviceGetMPSComputeRunningProcesses_v2	0	0		
+nvmlDeviceGetMPSComputeRunningProcesses_v3	0	0		
+nvmlDeviceGetMarginTemperature	3	3		
+nvmlDeviceGetMaxClockInfo	0	0		
+nvmlDeviceGetMaxCustomerBoostClock	3	3		
+nvmlDeviceGetMaxMigDeviceCount	0	0		
+nvmlDeviceGetMaxPcieLinkGeneration	0	0		
+nvmlDeviceGetMaxPcieLinkWidth	0	0		
+nvmlDeviceGetMemClkMinMaxVfOffset	0	0	30f8ffff00000000	
+nvmlDeviceGetMemClkVfOffset	0	0		
+nvmlDeviceGetMemoryAffinity	3	0		WSL has no NUMA nodes; a Linux driver answers it and so does the shim (single-node hosts)
+nvmlDeviceGetMemoryBusWidth	0	0	c0000000	
+nvmlDeviceGetMemoryErrorCounter	3	3		
+nvmlDeviceGetMemoryInfo	0	0	0000000003000000	
+nvmlDeviceGetMemoryInfo_v2	0	0		
+nvmlDeviceGetMigDeviceHandleByIndex	6	6		
+nvmlDeviceGetMigMode	3	3		
+nvmlDeviceGetMinMaxClockOfPState	0	0		
+nvmlDeviceGetMinMaxFanSpeed	0	0	1e00000000000000	
+nvmlDeviceGetMinorNumber	3	0		WSL has no /dev/nvidiaN; a Linux driver answers the minor number and so does the shim
+nvmlDeviceGetModuleId	0	0		
+nvmlDeviceGetMultiGpuBoard	0	0	00000000	
+nvmlDeviceGetName	0	0	4e5649444941204765466f726365205254582033303630	
+nvmlDeviceGetNumFans	0	0	02000000	
+nvmlDeviceGetNumGpuCores	3	0		WSL answers NOT_SUPPORTED; a Linux driver answers the CUDA core count (3584 on an RTX 3060) and so does the shim
+nvmlDeviceGetNumaNodeId	3	0		WSL has no NUMA nodes; a Linux driver answers it and so does the shim (single-node hosts)
+nvmlDeviceGetNvLinkCapability	3	3		
+nvmlDeviceGetNvLinkErrorCounter	3	3		
+nvmlDeviceGetNvLinkInfo	3	3		
+nvmlDeviceGetNvLinkRemoteDeviceType	3	3		
+nvmlDeviceGetNvLinkRemotePciInfo	3	3		
+nvmlDeviceGetNvLinkRemotePciInfo_v2	3	3		
+nvmlDeviceGetNvLinkState	3	3		
+nvmlDeviceGetNvLinkUtilizationControl	3	3		
+nvmlDeviceGetNvLinkUtilizationCounter	3	3		
+nvmlDeviceGetNvLinkVersion	3	3		
+nvmlDeviceGetNvlinkBwMode	3	3		
+nvmlDeviceGetNvlinkSupportedBwModes	3	3		
+nvmlDeviceGetOfaUtilization	0	0		
+nvmlDeviceGetP2PStatus	0	0		
+nvmlDeviceGetPciInfo	0	0		
+nvmlDeviceGetPciInfoExt	0	0		
+nvmlDeviceGetPciInfo_v2	0	0		
+nvmlDeviceGetPciInfo_v3	0	0		
+nvmlDeviceGetPcieLinkMaxSpeed	0	0		
+nvmlDeviceGetPcieReplayCounter	0	0		
+nvmlDeviceGetPcieSpeed	0	0		
+nvmlDeviceGetPcieThroughput	0	3		a rate needs a sampling window the telemetry does not keep
+nvmlDeviceGetPdi	0	0		
+nvmlDeviceGetPerformanceModes	0	0		
+nvmlDeviceGetPerformanceState	0	0		
+nvmlDeviceGetPersistenceMode	0	0		
+nvmlDeviceGetPgpuMetadataString	3	3		
+nvmlDeviceGetPlatformInfo	0	0	2c00000200000000	
+nvmlDeviceGetPowerManagementDefaultLimit	0	0		
+nvmlDeviceGetPowerManagementLimit	0	0		
+nvmlDeviceGetPowerManagementLimitConstraints	0	0		
+nvmlDeviceGetPowerManagementMode	0	0	01000000	
+nvmlDeviceGetPowerMizerMode_v1	0	0		
+nvmlDeviceGetPowerSource	0	0	00000000	
+nvmlDeviceGetPowerState	0	0		
+nvmlDeviceGetPowerUsage	0	0		
+nvmlDeviceGetProcessUtilization	7	7		
+nvmlDeviceGetProcessesUtilizationInfo	7	7		
+nvmlDeviceGetRemappedRows	3	3		
+nvmlDeviceGetRepairStatus	0	0		
+nvmlDeviceGetRetiredPages	3	3		
+nvmlDeviceGetRetiredPagesPendingStatus	3	3		
+nvmlDeviceGetRetiredPages_v2	3	3		
+nvmlDeviceGetRowRemapperHistogram	3	3		
+nvmlDeviceGetRunningProcessDetailList	3	3		
+nvmlDeviceGetSamples	2	2		
+nvmlDeviceGetSerial	3	3		
+nvmlDeviceGetSramEccErrorStatus	0	0		
+nvmlDeviceGetSramUniqueUncorrectedEccErrorCounts	3	3		
+nvmlDeviceGetSupportedClocksEventReasons	0	0	ff01000000000000	
+nvmlDeviceGetSupportedClocksThrottleReasons	0	0	ff01000000000000	
+nvmlDeviceGetSupportedEventTypes	0	0		
+nvmlDeviceGetSupportedGraphicsClocks	2	2		
+nvmlDeviceGetSupportedMemoryClocks	7	7		
+nvmlDeviceGetSupportedPerformanceStates	0	0		
+nvmlDeviceGetTargetFanSpeed	0	0		
+nvmlDeviceGetTemperature	0	0		
+nvmlDeviceGetTemperatureThreshold	0	0		
+nvmlDeviceGetTemperatureV	0	0		
+nvmlDeviceGetTopologyCommonAncestor	3	3		
+nvmlDeviceGetTopologyNearestGpus	3	0		WSL has no PCIe topology; the shim reports every other GPU at the host bridge
+nvmlDeviceGetTotalEccErrors	3	3		
+nvmlDeviceGetTotalEnergyConsumption	0	3		no energy counter is integrated from the synthetic power model
+nvmlDeviceGetUUID	0	0		
+nvmlDeviceGetUtilizationRates	0	0		
+nvmlDeviceGetVbiosVersion	0	3		the VBIOS version is board-specific and no profile records one
+nvmlDeviceGetVgpuCapabilities	3	3		
+nvmlDeviceGetVgpuHeterogeneousMode	3	3		
+nvmlDeviceGetVgpuInstancesUtilizationInfo	3	3		
+nvmlDeviceGetVgpuMetadata	3	3		
+nvmlDeviceGetVgpuProcessUtilization	3	3		
+nvmlDeviceGetVgpuProcessesUtilizationInfo	3	3		
+nvmlDeviceGetVgpuSchedulerCapabilities	3	3		
+nvmlDeviceGetVgpuSchedulerLog	3	3		
+nvmlDeviceGetVgpuSchedulerState	3	3		
+nvmlDeviceGetVgpuUtilization	3	3		
+nvmlDeviceGetViolationStatus	0	0		
+nvmlDeviceGetVirtualizationMode	0	0	00000000	
+nvmlDeviceIsMigDeviceHandle	0	0		
+nvmlDeviceOnSameBoard	3	3		
+nvmlDeviceQueryDrainState	6	6		
+nvmlDeviceWorkloadPowerProfileGetCurrentProfiles	3	3		
+nvmlDeviceWorkloadPowerProfileGetProfilesInfo	3	3		
+nvmlGetExcludedDeviceCount	0	0		
+nvmlGetExcludedDeviceInfoByIndex	2	2		
+nvmlGetVgpuCompatibility	0	0		
+nvmlGetVgpuDriverCapabilities	3	3		
+nvmlGetVgpuVersion	0	0	0100180001001c00	
+nvmlGpmQueryDeviceSupport	25	25		
+nvmlGpmQueryIfStreamingEnabled	3	3		
+nvmlSystemGetConfComputeCapabilities	0	0		
+nvmlSystemGetConfComputeGpusReadyState	3	3		
+nvmlSystemGetConfComputeKeyRotationThresholdInfo	25	25		
+nvmlSystemGetConfComputeState	3	3		
+nvmlSystemGetCudaDriverVersion	0	0		
+nvmlSystemGetCudaDriverVersion_v2	0	0		
+nvmlSystemGetDriverBranch	0	0		
+nvmlSystemGetDriverVersion	0	0		
+nvmlSystemGetHicVersion	0	0		
+nvmlSystemGetNVMLVersion	0	0		
+nvmlSystemGetNvlinkBwMode	3	3		
+nvmlUnitGetCount	0	0		
+nvmlVgpuTypeGetMaxInstancesPerGpuInstance	2	2		

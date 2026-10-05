@@ -180,7 +180,12 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetGpuFabricInfoV(nvmlDevice_t device, nvmlGp
 #endif
   if (!ok) return NVML_ERROR_ARGUMENT_VERSION_MISMATCH;
   const unsigned version = info->version;
-  std::memset(info, 0, sizeof *info);
+  // Zero what the caller's version of the struct holds, not what the newest one does.
+  size_t size = sizeof *info;
+#if defined(nvmlGpuFabricInfo_v2)
+  if (version == nvmlGpuFabricInfo_v2) size = sizeof(nvmlGpuFabricInfo_v2_t);
+#endif
+  std::memset(info, 0, size);
   info->version = version;
   return NVML_SUCCESS;
 }

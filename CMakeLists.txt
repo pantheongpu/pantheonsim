@@ -1411,7 +1411,7 @@ set_tests_properties(nvml_matrix PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_NVML_INCLUDE=${CUDA_ABI_INCLUDE}" TIMEOUT 300)
 foreach(_nvml_cat "device;nvidia/rtx3060;nvidia/t4;nvidia/h100"
                   "ras;nvidia/t4;nvidia/h100;nvidia/rtx3060"
-                  "link;nvidia/h100;nvidia/rtx3060"
+                  "link;nvidia/h100;nvidia/gh200-480gb;nvidia/rtx3060"
                   "setters;nvidia/t4;nvidia/rtx3060;nvidia/a100"
                   "mig;nvidia/a100;nvidia/rtx3060"
                   "vgpu;nvidia/t4;nvidia/rtx3060")
