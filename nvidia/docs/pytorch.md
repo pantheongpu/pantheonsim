@@ -55,10 +55,17 @@ paths tested here do not call them.
   Computed on the host. The classic API (`nvidia/src/cudnn_api.cpp`) covers
   the same convolutions and every other layer's backward pass, for frameworks
   that call it.
+- **Attention:** `scaled_dot_product_attention` with the cuDNN backend:
+  PyTorch's bundled cudnn-frontend hands cuDNN's graph API a single SDPA
+  operation forward (with its softmax statistics) and a composite graph
+  backward, both computed on the host (`nvidia/src/cudnn_backend.cpp`).
 - **BatchNorm:** cuDNN's training forward and backward (the Ex forms).
 - **RNNs:** cuDNN's RNN API (`nvidia/src/cudnn_rnn.cpp`): LSTM, GRU and
   ReLU/tanh RNNs, one or two directions, padded or packed sequences, dropout
-  between layers; float, half (autocast), bfloat16 and double.
+  between layers, LSTM projections (`proj_size`) and cell clipping; float,
+  half (autocast), bfloat16 and double. Dropout between an RNN's layers runs
+  with this library's generator: the masks differ from NVIDIA's, the
+  fraction kept and the reseeding do not.
 - **Linear layers:** cuBLAS and cuBLASLt's fused matmul + bias; PyTorch passes
   its cuBLAS handle as the cuBLASLt handle, which is accepted.
 - **Both CUDA APIs:** PyTorch calls the driver API too. `libcudart` and
@@ -68,9 +75,6 @@ paths tested here do not call them.
 
 ## Not supported
 
-- LSTM projections: refused by name. (Dropout between an RNN's layers in
-  training runs, with this library's generator: the masks differ from
-  NVIDIA's, the fraction kept and the reseeding do not.)
 - Graphs with operations other than convolution, matmul, pointwise,
   reduction, normalization and pooling (attention, for one): refused when the
   graph is finalized, so PyTorch falls back or reports it.
@@ -82,8 +86,11 @@ paths tested here do not call them.
 
 - `e2e_dnn_paths`: cuDNN's graph API, BatchNorm, RNNs and cuBLASLt called
   directly, against host references and finite differences. Needs no PyTorch.
-- `e2e_dnn_backward`, `e2e_dnn_graph`: the classic API's backward passes and
-  multi-operation graphs, likewise (`nvidia/docs/libraries.md`).
+- `e2e_dnn_backward`, `e2e_dnn_graph`, `e2e_dnn_attention`: the classic
+  API's backward passes, multi-operation graphs and attention as
+  cudnn-frontend builds it, likewise (`nvidia/docs/libraries.md`).
+- `e2e_dnn_classic_paths`: the rest of the classic API, LSTM projections and
+  multi-head attention among it, likewise.
 - `e2e_mixed_apis`: the runtime and driver APIs on one machine.
 - `test_runtime`, `test_exec`: lazy parsing, and the 256-bit `.v8` accesses
   PyTorch's elementwise kernels use.

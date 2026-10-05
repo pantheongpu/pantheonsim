@@ -3742,7 +3742,10 @@ std::string operand_text(const Operand& o, int sm) {
     case Kind::FImm: s = o.text; break;
     case Kind::CBank:
       // With a swizzle after it nvdisasm puts a space inside: c[0x0] [0x390].H0_H0
-      s = "c[" + imm_text(o.reg) + "]" + (o.suffix.empty() ? "" : " ") + "[" + imm_text(o.imm) + "]";
+      // The offset is 16 bits, which nvdisasm prints signed: a parameter
+      // at 0x9780 (past 4 KiB, CUDA 12.1+) is c[0x0][-0x6880].
+      s = "c[" + imm_text(o.reg) + "]" + (o.suffix.empty() ? "" : " ") + "[" +
+          imm_text(static_cast<int16_t>(static_cast<uint16_t>(o.imm))) + "]";
       break;
     case Kind::UCBank: s = "cx[UR" + std::to_string(o.reg) + "][" + imm_text(o.imm) + "]"; break;
     case Kind::Label: s = imm_text(o.imm); break;

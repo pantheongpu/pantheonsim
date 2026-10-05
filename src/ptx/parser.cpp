@@ -68,6 +68,7 @@ const std::unordered_map<std::string, Sreg>& sreg_table() {
       {"%cluster_ctarank", Sreg::ClusterCtaRank},
       {"%cluster_nctarank", Sreg::ClusterNCtaRank},
       {"%is_explicit_cluster", Sreg::IsExplicitCluster},
+      {"%current_graph_exec", Sreg::CurrentGraphExec},
   };
   return t;
 }
@@ -1268,13 +1269,6 @@ class Parser {
                          "special register '" + w +
                              "' is a performance-monitor counter; VirtualGPU has no timing model, "
                              "so it has nothing to count");
-      // The graph executable a kernel runs inside: what a kernel hands to
-      // cudaGraphLaunch to launch a graph from the device. Device-side graph
-      // launch is not implemented, so nothing could use the handle.
-      if (w == "%current_graph_exec")
-        fail_unsupported(t.line, w, cur_fn_ ? cur_fn_->name : std::string(),
-                         "special register '%current_graph_exec' identifies the kernel's graph "
-                         "for device-side graph launch, which VirtualGPU does not implement");
       // %envreg0 .. %envreg31 all read as zero; they are only distinguished by
       // number for a driver that sets them, and this one does not.
       // %envreg0..31 is a bank the driver fills in before the launch. Which

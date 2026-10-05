@@ -40,6 +40,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/runtime/capture.hpp"
+#include "enum_value.hpp"
 
 // Operands are read from and written to the same virtual device memory the
 // kernels see, through the runtime shim's own copy path (declared by the CUDA
@@ -62,6 +63,13 @@ struct Handle {
   cudaStream_t stream = nullptr;
   cublasPointerMode_t pointer_mode = CUBLAS_POINTER_MODE_HOST;
   cublasMath_t math_mode = CUBLAS_DEFAULT_MATH;
+  // Settings the host-computed routines have no use for, kept so that what
+  // a program sets it reads back (see "handle settings" below).
+  cublasAtomicsMode_t atomics = CUBLAS_ATOMICS_NOT_ALLOWED;
+  int sm_count_target = 0;
+  int emulation_strategy = 0, emulation_special_values = 0xFFFF, mantissa_control = 0;
+  int max_mantissa_bits = 0, mantissa_bit_offset = 0;
+  int* mantissa_bit_count = nullptr;
 };
 
 std::mutex g_mu;
@@ -486,6 +494,130 @@ VGPU_EXPORT const char* cublasGetStatusName(cublasStatus_t s) {
 }
 VGPU_EXPORT const char* cublasGetStatusString(cublasStatus_t s) { return cublasGetStatusName(s); }
 
+/* ---- handle settings ----
+   The atomics mode, the SM count target and CUDA 13's floating-point
+   emulation controls (which apply to Blackwell's emulated GEMMs). Nothing
+   here runs on SMs or emulates anything, so each is kept and read back,
+   with the defaults and the refusals an RTX 3060's cuBLAS 13.0 gives
+   (measured): atomics not allowed, SM target 0, emulation strategy DEFAULT,
+   every special value supported (0xFFFF), mantissa control DYNAMIC, a max
+   mantissa bit count and offset of 0 and no bit-count pointer; an unknown
+   atomics mode, strategy or mantissa control, an SM target below 0 or above
+   the device's SM count, or a negative max mantissa bit count is
+   INVALID_VALUE, as is a NULL pointer to a getter. */
+#if CUBLAS_VER_MAJOR >= 13
+using vgpu_emu_strategy = cublasEmulationStrategy_t;
+using vgpu_emu_special = cudaEmulationSpecialValuesSupport;
+using vgpu_emu_mantissa = cudaEmulationMantissaControl;
+#else   // the CUDA 12 headers declare none of these
+using vgpu_emu_strategy = int;
+using vgpu_emu_special = int;
+using vgpu_emu_mantissa = int;
+#endif
+namespace {
+template <class V, class F>
+cublasStatus_t get_setting(cublasHandle_t h, V* out, F field) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!out) return CUBLAS_STATUS_INVALID_VALUE;
+  *out = (V)field(reinterpret_cast<Handle*>(h));
+  return CUBLAS_STATUS_SUCCESS;
+}
+template <class F>
+cublasStatus_t set_setting(cublasHandle_t h, bool ok, F apply) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!ok) return CUBLAS_STATUS_INVALID_VALUE;
+  apply(reinterpret_cast<Handle*>(h));
+  return CUBLAS_STATUS_SUCCESS;
+}
+int device_sm_count() {
+  int dev = 0, sms = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  return sms;
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasGetAtomicsMode(cublasHandle_t h, cublasAtomicsMode_t* mode) {
+  return get_setting(h, mode, [](Handle* x) { return x->atomics; });
+}
+// Each setter reads its argument as an integer (enum_value.hpp) and checks
+// that before the value is used as the enum.
+VGPU_EXPORT cublasStatus_t cublasSetAtomicsMode(cublasHandle_t h, cublasAtomicsMode_t mode) {
+  const int v = enum_value(mode);
+  return set_setting(h, v == CUBLAS_ATOMICS_NOT_ALLOWED || v == CUBLAS_ATOMICS_ALLOWED,
+                     [v](Handle* x) { x->atomics = (cublasAtomicsMode_t)v; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetSmCountTarget(cublasHandle_t h, int* target) {
+  return get_setting(h, target, [](Handle* x) { return x->sm_count_target; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetSmCountTarget(cublasHandle_t h, int target) {
+  return set_setting(h, valid(h) && target >= 0 && target <= device_sm_count(),
+                     [target](Handle* x) { x->sm_count_target = target; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetEmulationStrategy(cublasHandle_t h, vgpu_emu_strategy* s) {
+  return get_setting(h, s, [](Handle* x) { return x->emulation_strategy; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetEmulationStrategy(cublasHandle_t h, vgpu_emu_strategy s) {
+  const int v = enum_value(s);
+  return set_setting(h, v >= 0 && v <= 2, [v](Handle* x) { x->emulation_strategy = v; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetEmulationSpecialValuesSupport(cublasHandle_t h, vgpu_emu_special* mask) {
+  return get_setting(h, mask, [](Handle* x) { return x->emulation_special_values; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetEmulationSpecialValuesSupport(cublasHandle_t h, vgpu_emu_special mask) {
+  const int v = enum_value(mask);   // a bit mask: any combination is taken
+  return set_setting(h, true, [v](Handle* x) { x->emulation_special_values = v; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMantissaControl(cublasHandle_t h, vgpu_emu_mantissa* c) {
+  return get_setting(h, c, [](Handle* x) { return x->mantissa_control; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMantissaControl(cublasHandle_t h, vgpu_emu_mantissa c) {
+  const int v = enum_value(c);
+  return set_setting(h, v == 0 || v == 1, [v](Handle* x) { x->mantissa_control = v; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMaxMantissaBitCount(cublasHandle_t h, int* bits) {
+  return get_setting(h, bits, [](Handle* x) { return x->max_mantissa_bits; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMaxMantissaBitCount(cublasHandle_t h, int bits) {
+  return set_setting(h, bits >= 0, [bits](Handle* x) { x->max_mantissa_bits = bits; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMantissaBitOffset(cublasHandle_t h, int* offset) {
+  return get_setting(h, offset, [](Handle* x) { return x->mantissa_bit_offset; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMantissaBitOffset(cublasHandle_t h, int offset) {
+  return set_setting(h, true, [offset](Handle* x) { x->mantissa_bit_offset = offset; });
+}
+VGPU_EXPORT cublasStatus_t cublasGetFixedPointEmulationMantissaBitCountPointer(cublasHandle_t h, int** p) {
+  return get_setting(h, p, [](Handle* x) { return x->mantissa_bit_count; });
+}
+VGPU_EXPORT cublasStatus_t cublasSetFixedPointEmulationMantissaBitCountPointer(cublasHandle_t h, int* p) {
+  return set_setting(h, true, [p](Handle* x) { x->mantissa_bit_count = p; });
+}
+VGPU_EXPORT size_t cublasGetCudartVersion(void) { return CUDART_VERSION; }
+
+// The API logger: there is nothing to log, so the settings are taken and the
+// callback kept for cublasGetLoggerCallback.
+namespace {
+std::mutex g_log_mu;
+cublasLogCallback g_log_callback = nullptr;
+}  // namespace
+VGPU_EXPORT cublasStatus_t cublasLoggerConfigure(int, int, int, const char*) { return CUBLAS_STATUS_SUCCESS; }
+VGPU_EXPORT cublasStatus_t cublasSetLoggerCallback(cublasLogCallback cb) {
+  std::lock_guard<std::mutex> lock(g_log_mu);
+  g_log_callback = cb;
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasGetLoggerCallback(cublasLogCallback* cb) {
+  if (!cb) return CUBLAS_STATUS_INVALID_VALUE;
+  std::lock_guard<std::mutex> lock(g_log_mu);
+  *cb = g_log_callback;
+  return CUBLAS_STATUS_SUCCESS;
+}
+// BLAS's error report, in the card's words, on standard output.
+VGPU_EXPORT void cublasXerbla(const char* srName, int info) {
+  std::printf(" ** On entry to %s parameter number %d had an illegal value\n", srName ? srName : "", info);
+}
+
 /* ---- GEMM ---- */
 
 VGPU_EXPORT cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta,
@@ -665,7 +797,7 @@ cublasStatus_t getrf_batched(cublasHandle_t h, int n, T* const Aarray[], int lda
   const auto ptrs = fetch<T*>(Aarray, (size_t)batch);
   std::vector<int> all_info(batch, 0);
   for (int b = 0; b < batch; ++b) {
-    const auto hv = fetch<T>(ptrs[b], (size_t)lda * n);
+    const auto hv = fetch<T>(ptrs[b], extent(lda, n, n));
     std::vector<double> a(hv.begin(), hv.end());
     std::vector<int> ipiv;
     all_info[b] = lu_factor(a, n, lda, pivots ? &ipiv : nullptr);
@@ -691,8 +823,8 @@ cublasStatus_t getrs_batched(cublasHandle_t h, cublasOperation_t trans, int n, i
   const auto pa = fetch<const T*>(Aarray, (size_t)batch);
   const auto pb = fetch<T*>(Barray, (size_t)batch);
   for (int b = 0; b < batch; ++b) {
-    const auto av = fetch<T>(pa[b], (size_t)lda * n);
-    const auto bv = fetch<T>(pb[b], (size_t)ldb * nrhs);
+    const auto av = fetch<T>(pa[b], extent(lda, n, n));
+    const auto bv = fetch<T>(pb[b], extent(ldb, nrhs, n));
     std::vector<double> a(av.begin(), av.end()), x(bv.begin(), bv.end());
     std::vector<int> ipiv;
     if (pivots) ipiv = fetch<int>(pivots + (size_t)b * n, (size_t)n);
@@ -747,8 +879,8 @@ template <class T>
 cublasStatus_t trsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans, cublasDiagType_t diag,
                         int m, int n, T alpha, const T* A, int lda, T* B, int ldb) {
   const int k = side == CUBLAS_SIDE_LEFT ? m : n;
-  const auto av = fetch<T>(A, (size_t)lda * k);
-  const auto bv = fetch<T>(B, (size_t)ldb * n);
+  const auto av = fetch<T>(A, extent(lda, k, k));
+  const auto bv = fetch<T>(B, extent(ldb, n, m));
   const std::vector<double> a(av.begin(), av.end());
   std::vector<double> b(bv.begin(), bv.end());
   const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, t = trans != CUBLAS_OP_N, unit = diag == CUBLAS_DIAG_UNIT;
@@ -995,38 +1127,6 @@ cublasStatus_t iamax(cublasHandle_t h, int n, const T* x, int incx, R* result) {
   return CUBLAS_STATUS_SUCCESS;
 }
 
-// x = op(A) x for a triangular band matrix: n by n with k diagonals beside the
-// main one, stored as LAPACK's band format. Column j of the upper form keeps
-// A(i,j) at row k+i-j of the band; the lower form keeps it at row i-j.
-template <class T>
-cublasStatus_t tbmv(cublasHandle_t h, cublasFillMode_t uplo, cublasOperation_t trans,
-                    cublasDiagType_t diag, int n, int k, const T* A, int lda, T* x, int incx) {
-  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (n < 0 || k < 0 || lda < k + 1 || incx == 0) return CUBLAS_STATUS_INVALID_VALUE;
-  if (n == 0) return CUBLAS_STATUS_SUCCESS;
-  if (deferred_to_graph(h, [=] { tbmv<T>(h, uplo, trans, diag, n, k, A, lda, x, incx); }))
-    return CUBLAS_STATUS_SUCCESS;
-  const bool upper = uplo == CUBLAS_FILL_MODE_UPPER, unit = diag == CUBLAS_DIAG_UNIT;
-  auto band = fetch<T>(A, extent(lda, n, k + 1));
-  auto hx = fetch<T>(x, span(n, incx));
-  auto a = [&](int i, int j) -> T {  // A(i,j), inside the band
-    if (i == j && unit) return T(1);
-    return band[idx(upper ? k + i - j : i - j, j, lda)];
-  };
-  std::vector<T> in(n), out(n, T(0));
-  for (int i = 0; i < n; ++i) in[i] = hx[elem(i, n, incx)];
-  for (int j = 0; j < n; ++j) {
-    const int lo = upper ? std::max(0, j - k) : j, hi = upper ? j : std::min(n - 1, j + k);
-    for (int i = lo; i <= hi; ++i) {
-      if (trans == CUBLAS_OP_N) out[i] += a(i, j) * in[j];
-      else out[j] += a(i, j) * in[i];
-    }
-  }
-  for (int i = 0; i < n; ++i) hx[elem(i, n, incx)] = out[i];
-  store(x, hx);
-  return CUBLAS_STATUS_SUCCESS;
-}
-
 // C = A diag(x) (CUBLAS_SIDE_RIGHT) or diag(x) A (CUBLAS_SIDE_LEFT): each
 // column, or each row, of A scaled by one element of x. x is walked by BLAS's
 // rule for its increment, so a zero increment scales by x[0] throughout. C may
@@ -1123,17 +1223,6 @@ VGPU_EXPORT cublasStatus_t cublasIdamax_v2(cublasHandle_t h, int n, const double
                                            int* result) {
   return iamax(h, n, x, incx, result);
 }
-VGPU_EXPORT cublasStatus_t cublasStbmv_v2(cublasHandle_t h, cublasFillMode_t uplo,
-                                          cublasOperation_t trans, cublasDiagType_t diag, int n,
-                                          int k, const float* A, int lda, float* x, int incx) {
-  return tbmv(h, uplo, trans, diag, n, k, A, lda, x, incx);
-}
-VGPU_EXPORT cublasStatus_t cublasDtbmv_v2(cublasHandle_t h, cublasFillMode_t uplo,
-                                          cublasOperation_t trans, cublasDiagType_t diag, int n,
-                                          int k, const double* A, int lda, double* x, int incx) {
-  return tbmv(h, uplo, trans, diag, n, k, A, lda, x, incx);
-}
-
 // The 64-bit-index forms CUDA 12 added (cublasDnrm2_64 and so on; cuPDLPx
 // calls that one). Sizes and strides are int64_t, and i?amax answers in an
 // int64_t. Host-computed vectors that long would not fit in memory anyway, so
@@ -2490,3 +2579,7 @@ VGPU_REAL_COPY(D, double, CUDA_R_64F)
 VGPU_COMPLEX_LEVEL1(c, Sc, cuComplex, CUDA_C_32F, float, CUDA_R_32F)
 VGPU_COMPLEX_LEVEL1(z, Dz, cuDoubleComplex, CUDA_C_64F, double, CUDA_R_64F)
 #undef VGPU_COMPLEX_LEVEL1
+
+// The batched GEMVs, getri/matinv, syrkx/herkx, gemm3m, the batched Hgemms and
+// the complex dgmm.
+#include "cublas_batched.inc"

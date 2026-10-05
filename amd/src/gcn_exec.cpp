@@ -67,6 +67,18 @@ constexpr uint64_t kLdsPerComputeUnit = 64 * 1024;
 // its scratch is: not a device address, but the mark buffer accesses through
 // it are recognised by, and sent to the work-items' private memory.
 constexpr uint64_t kScratchResourceBase = 0xFFFF00000000ull;
+// Where a work-group runs (Dispatch::Layout): its die, the engine on that
+// die, the array in that engine, and the unit in that array.
+struct Place {
+  uint32_t die, engine, array, unit;
+};
+Place place_of(const Dispatch& d, uint64_t group) {
+  const Dispatch::Layout& l = d.layout;
+  const uint32_t dies = std::max(l.dies, 1u), engines = std::max(l.engines, 1u), arrays = std::max(l.arrays, 1u);
+  const uint32_t u = static_cast<uint32_t>(group / dies % std::max(l.units, 1u));
+  return {static_cast<uint32_t>(group % dies), u % engines, u / engines % arrays, u / (engines * arrays)};
+}
+
 uint64_t lds_limit(const Dispatch& d) { return d.object && d.object->gfx950() ? 160 * 1024 : kLdsPerComputeUnit; }
 // And a work-item's private memory, which the wave reads the aperture of from
 // src_private_base: an address in it is an offset into the work-item's own.
@@ -185,6 +197,7 @@ struct Wave {
   bool gws_waiting = false;
   uint64_t gws_generation = 0;
   uint32_t first_lane = 0;   // this wave's first work-item in the group
+  uint64_t group = 0;        // its work-group, numbered x fastest, then y, then z
   // How many lanes: 64 on CDNA, 32 for an RDNA kernel built wave32. A
   // wave32 wave is a wave64 whose upper half is never switched on, so an
   // instruction over "every lane" needs only its EXEC.
@@ -329,17 +342,43 @@ struct Machine {
     if (addr % size == 0) return m.store_scalar(addr, size, v);
     for (uint32_t b = 0; b < size; ++b) m.store_scalar(addr + b, 1, (v >> (8 * b)) & 0xFF);
   }
-  // Two to four words, as a wide load or store moves them: each aligned pair
-  // of words as one 8-byte access, the way the hardware moves them. Another
-  // device's kernel, on another host thread, reading while this one writes
-  // sees each pair old or new, never half of each -- which RCCL's LL protocol
-  // counts on: a word of data and the flag that says it has arrived share
-  // eight bytes, and the reader trusts the data once it sees the flag.
-  // Moved a word at a time, it could read the old data, then the new flag.
+  // Two to four words, as a wide load or store moves them: each aligned four
+  // as one 16-byte access and each aligned pair as one 8-byte access, the way
+  // the hardware moves them. Another kernel, on another host thread, reading
+  // while this one writes sees each old or new, never half of each. RCCL's LL
+  // protocol counts on it for eight bytes, a word of data and the flag that
+  // says it has arrived; rocPRIM's decoupled look-back for sixteen, a tile's
+  // flag and its 64-bit prefix. Moved in pieces, a reader could take the old
+  // data with the new flag.
   static constexpr uint32_t kMaxWords = 16;
+  // Four words at a 16-byte boundary as one access, where they are in one
+  // device allocation; false, having done nothing, where they are not (the
+  // pieces then say what is wrong).
+  bool load_quad(uint64_t addr, uint32_t* out) const {
+    uint64_t v[2];
+    try {
+      at(addr).load_quad(addr, v);
+    } catch (const Error&) {
+      return false;
+    }
+    std::memcpy(out, v, 16);
+    return true;
+  }
+  bool store_quad(uint64_t addr, const uint32_t* words) {
+    uint64_t v[2];
+    std::memcpy(v, words, 16);
+    try {
+      at(addr).store_quad(addr, v);
+    } catch (const Error&) {
+      return false;
+    }
+    return true;
+  }
   void load_words(uint64_t addr, uint32_t n, uint32_t* out) const {
     for (uint32_t k = 0; k < n;) {
-      if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
+      if (k + 3 < n && (addr + 4 * k) % 16 == 0 && load_quad(addr + 4 * k, out + k)) {
+        k += 4;
+      } else if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
         const uint64_t v = load(addr + 4 * k, 8);
         out[k] = static_cast<uint32_t>(v), out[k + 1] = static_cast<uint32_t>(v >> 32);
         k += 2;
@@ -351,7 +390,9 @@ struct Machine {
   }
   void store_words(uint64_t addr, uint32_t n, const uint32_t* words) {
     for (uint32_t k = 0; k < n;) {
-      if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
+      if (k + 3 < n && (addr + 4 * k) % 16 == 0 && store_quad(addr + 4 * k, words + k)) {
+        k += 4;
+      } else if (k + 1 < n && (addr + 4 * k) % 8 == 0) {
         store(addr + 4 * k, 8, words[k] | uint64_t{words[k + 1]} << 32);
         k += 2;
       } else {
@@ -1031,8 +1072,9 @@ struct Machine {
       // A field of a hardware register: the immediate's low six bits say
       // which register, the next five where the field starts, the top five
       // how wide it is less one. MODE is kept per wave, and gfx12's SCHED_MODE;
-      // HW_ID says which wave of the work-group this is, and SHADER_CYCLES
-      // the shader clock; the rest are refused by name.
+      // HW_ID, HW_ID1 and XCC_ID say where the wave runs, gfx12's STATE_PRIV
+      // holds SCC, and SHADER_CYCLES is the shader clock; the rest are
+      // refused by name.
       const uint32_t id = static_cast<uint32_t>(in.simm) & 0x3F, at = (static_cast<uint32_t>(in.simm) >> 6) & 0x1F,
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
@@ -1053,7 +1095,31 @@ struct Machine {
         if (id == 1) reg = w.mode;
         else if (sched) reg = w.sched_mode;
         else if (flat_scr) reg = w.flat_scratch[id - 20];
-        else if (id == 4) reg = static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF;   // HW_ID: the wave's slot
+        else if (id == 4 && in.arch == gcn::Target::Gfx1200) {
+          // gfx12's STATE_PRIV, where register 4 was HW_ID before: of its
+          // fields only SCC (bit 9) has a value here. The barrier, priority,
+          // halt, debug and trace states read as a running wave's are, 0.
+          // (HIP's __smid still reads HW_ID's fields from it on gfx12.)
+          reg = static_cast<uint32_t>(w.scc) << 9;
+        } else if (id == 4) {
+          // HW_ID: the wave's slot (WAVE_ID, 3:0), and on CDNA its compute
+          // unit (11:8), shader array (12) and engine (14:13, or 15:13 on
+          // gfx90a).
+          reg = static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF;
+          if (!is_rdna(in.arch)) {
+            const Place p = place_of(d, w.group);
+            reg |= (p.unit & 0xF) << 8 | (p.array & 1) << 12 | (p.engine & 7) << 13;
+          }
+        } else if (id == 20 && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950)) {
+          reg = place_of(d, w.group).die & 0xF;   // XCC_ID: the compute die (3:0)
+        } else if (id == 23 && is_rdna(in.arch)) {
+          // HW_ID1: the wave's slot (4:0), its workgroup processor (13:10),
+          // shader array (16) and engine (20:18). A work-group's waves are
+          // all on one workgroup processor, as in HIP's default WGP mode.
+          const Place p = place_of(d, w.group);
+          reg = (static_cast<uint32_t>(w.first_lane / w.lanes) & 0x1F) | (p.unit & 0xF) << 10 | (p.array & 1) << 16 |
+                (p.engine & 7) << 18;
+        }
         // SHADER_CYCLES, which clock() reads on RDNA: 20 bits of the cycle
         // count on gfx10.3 and gfx11; on gfx12 its low word (29) and high
         // word (30). The count is s_memtime's, the instructions retired.
@@ -5781,6 +5847,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     w.mode = k.mode;
     w.lanes = lanes;
     w.first_lane = i * lanes;
+    w.group = gx + d.groups[0] * (gy + uint64_t{d.groups[1]} * gz);
     // The lanes this wave has of the work-group, which is short in the
     // last wave when the group is not a whole number of waves.
     const uint64_t left = threads - w.first_lane;

@@ -933,3 +933,6 @@ VGPU_GEAM_GELS(D, double)
 VGPU_GEAM_GELS(C, cuComplex)
 VGPU_GEAM_GELS(Z, cuDoubleComplex)
 #undef VGPU_GEAM_GELS
+
+// The band and packed level-2 routines.
+#include "cublas_packed.inc"

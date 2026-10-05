@@ -957,9 +957,13 @@ VGPU_EXPORT CUresult cuCtxGetCurrent(CUcontext* pctx) {
   });
 }
 
+// With no context current, both answer CUDA_ERROR_INVALID_CONTEXT, as the
+// driver does on an RTX 3060 (CUDA 13.0); cuda.core asks cuCtxGetDevice first
+// and takes that answer as "no device chosen yet".
 VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) {
   return api("cuCtxGetDevice", true, false, [&](ShimState& s) {
     if (!device) return CUDA_ERROR_INVALID_VALUE;
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     *device = current_device(s);
     return CUDA_SUCCESS;
   });
@@ -967,6 +971,7 @@ VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) {
 
 VGPU_EXPORT CUresult cuCtxSynchronize(void) {
   return api("cuCtxSynchronize", true, false, [&](ShimState& s) {
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     (void)current_device(s);  // requires a current context
     return CUDA_SUCCESS;      // everything is synchronous today
   });
@@ -1573,6 +1578,37 @@ VGPU_EXPORT CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const
 }
 
 namespace {
+// Whether a kernel calls cudaGraphLaunch from the device, in its own code or a
+// device function's. Such a kernel runs only in a graph, and this driver has
+// no graphs: an RTX 3060's runtime refused one launched on its own with
+// cudaErrorNotSupported, without running it.
+bool launches_graphs_uncached(const vgpu::ptx::EntryFn& fn) {
+  if (fn.sass)
+    for (const std::string& f : vgpu::sass::reachable(*fn.sass, fn.name))
+      if (f == "cudaGraphLaunch") return true;
+  std::set<const vgpu::ptx::EntryFn*> seen;
+  std::vector<const vgpu::ptx::EntryFn*> todo{&fn};
+  while (!todo.empty()) {
+    const vgpu::ptx::EntryFn* f = todo.back();
+    todo.pop_back();
+    if (!seen.insert(f).second) continue;
+    for (const auto& ins : f->body)
+      if (const auto* c = std::get_if<vgpu::ptx::OpCall>(&ins.op)) {
+        if (c->callee == "cudaGraphLaunch") return true;
+        if (c->target) todo.push_back(c->target);
+      }
+  }
+  return false;
+}
+bool launches_graphs(const vgpu::ptx::EntryFn& fn) {
+  static std::mutex mu;
+  static std::unordered_map<const vgpu::ptx::EntryFn*, bool> known;
+  std::lock_guard<std::mutex> lock(mu);
+  const auto it = known.find(&fn);
+  if (it != known.end()) return it->second;
+  return known[&fn] = launches_graphs_uncached(fn);
+}
+
 CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int gridDimX,
                               unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
                               unsigned int blockDimY, unsigned int blockDimZ,
@@ -1624,6 +1660,7 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
                                 p.limits.multiprocessors, " SMs = ", resident, ")");
     }
     cfg.nonportable_cluster = rec.nonportable_cluster;
+    if (launches_graphs(*rec.fn)) return CUDA_ERROR_NOT_SUPPORTED;
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
     return CUDA_SUCCESS;
   });

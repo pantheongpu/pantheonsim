@@ -388,6 +388,24 @@ expect "CUDA_VISIBLE_DEVICES=-1 hides every GPU from HIP" "hipErrorNoDevice 0" "
 expect "HIP_VISIBLE_DEVICES comes before CUDA_VISIBLE_DEVICES" "hipSuccess 1" \
   "$(visible HIP_VISIBLE_DEVICES=0 CUDA_VISIBLE_DEVICES=-1)"
 
+# hipCUB's device-wide, block and warp algorithms and rocThrust's
+# (hipcc/prim.cpp), compiled into the program, on a wave64 GPU and a wave32
+# one, each checked against the host.
+for gpu in mi300x rx7900xtx; do
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$gpu LD_LIBRARY_PATH="$shim" timeout 600 "$(dirname "$exe")/prim.all" 2>&1)
+  expect "hipCUB and rocThrust on the $gpu" "hipCUB and rocThrust: 20 of 20 match the host's" \
+    "$(grep -o '^hipCUB and rocThrust: .*' <<< "$out" || echo "$out" | tail -3 | tr '\n' ' ')"
+done
+
+# Which compute unit each work-group runs on (hipcc/smid.cpp): HIP's __smid
+# from the hardware registers that say, or on gfx12 HW_ID1 itself. Four groups
+# to a multiprocessor find every one, and a group's waves all the same one.
+for gpu in mi300x:304 mi350x:256 mi250x:110 rx6900xt:40 rx7900xtx:48 rx9070xt:32; do
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/${gpu%%:*} LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smid.all" 2>&1)
+  expect "__smid tells each multiprocessor of the ${gpu%%:*} apart" \
+    "${gpu#*:} of ${gpu#*:} multiprocessors, 0 work-items disagree" "$(sed -n 's/^gfx[^ ]*: //p' <<< "$out")"
+done
+
 # The same program on a device of another target is told so by name rather
 # than handed code it cannot run.
 out=$(VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$exe" 2>&1)

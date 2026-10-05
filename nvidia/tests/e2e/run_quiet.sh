@@ -6,29 +6,37 @@
 # cuSPARSE, cuSOLVER, cuDNN and NCCL, and nowhere else. That message is the only
 # thing telling a user their call was refused rather than answered wrongly.
 set -uo pipefail
-build="${VGPU_BUILD_DIR:-build}"
 
-# Loading an instrumented shim into the system Python aborts ("ASan runtime
-# does not come first"), so under a sanitizer build this defers to the C++ unit
-# tests, which check the same logic with the instrumentation on.
+# The reporter is the code in each generated stub file (nvidia/src/generated/
+# *_stubs.cpp). Whether a library still has a stub to call changes as its API
+# is written (NCCL's last went with ncclCommShrink, cuSOLVER's and cuBLAS's
+# files hold the reporter alone), so this compiles each file with one more
+# entry point that reports itself, and calls that from Python. The probe is
+# plain code, so a sanitizer build of the shims does not matter here.
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-. "$root/tests/shim_guard.sh"
-san="$(shim_sanitizer "$build/shim")"
-if [[ -n "$san" ]]; then echo "SKIP: shim is built with $san, and the Python interpreter is not instrumented"; exit 0; fi
-# Any generated stub will do; this is one of the cuSPARSELt names cuSPARSE's
-# stubs carry, which nothing implements. (It was cufftXtExec until cuFFT's Xt
-# API was written, and cusparseCbsrmv until the BSR routines were.)
-lib="$build/shim/libcusparse.so"
-stub=cusparseLtInit
 command -v python3 >/dev/null || { echo "SKIP: no python3"; exit 0; }
-[[ -e "$lib" ]] || { echo "SKIP: no cuSPARSE shim at $lib"; exit 0; }
+command -v g++ >/dev/null || { echo "SKIP: no g++"; exit 0; }
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 fail=0
-for case in "unset:yes" "0:yes" "1:no" "true:yes"; do
-  q="${case%%:*}"; want="${case##*:}"
-  if [[ "$q" == unset ]]; then run=(env -u VGPU_QUIET); else run=(env "VGPU_QUIET=$q"); fi
-  out=$("${run[@]}" python3 -c "import ctypes; ctypes.CDLL('$lib').$stub()" 2>&1)
-  if grep -q "not implemented by VirtualGPU" <<< "$out"; then got=yes; else got=no; fi
-  if [[ "$got" == "$want" ]]; then echo "ok    VGPU_QUIET=$q -> $([[ $got == yes ]] && echo "diagnostic printed" || echo silent)"
-  else echo "FAIL  VGPU_QUIET=$q -> printed=$got, expected $want"; fail=1; fi
+tested=0
+for stubs in "$root"/nvidia/src/generated/*_stubs.cpp; do
+  [[ -e "$stubs" ]] || continue
+  grep -q vgpu_report_unimplemented "$stubs" || continue
+  lib="$tmp/$(basename "${stubs%.cpp}").so"
+  printf '#include "%s"\nVGPU_EXPORT int vgpu_probe() { vgpu_report_unimplemented("vgpu_probe"); return 0; }\n' \
+    "$stubs" > "$tmp/probe.cpp"
+  g++ -std=c++20 -shared -fPIC -o "$lib" "$tmp/probe.cpp" || { echo "FAIL  could not build a probe from $stubs"; fail=1; continue; }
+  tested=1
+  name="$(basename "$stubs")"
+  for case in "unset:yes" "0:yes" "1:no" "true:yes"; do
+    q="${case%%:*}"; want="${case##*:}"
+    if [[ "$q" == unset ]]; then run=(env -u VGPU_QUIET); else run=(env "VGPU_QUIET=$q"); fi
+    out=$("${run[@]}" python3 -c "import ctypes; ctypes.CDLL('$lib').vgpu_probe()" 2>&1)
+    if grep -q "not implemented by VirtualGPU" <<< "$out"; then got=yes; else got=no; fi
+    if [[ "$got" == "$want" ]]; then echo "ok    $name VGPU_QUIET=$q -> $([[ $got == yes ]] && echo "diagnostic printed" || echo silent)"
+    else echo "FAIL  $name VGPU_QUIET=$q -> printed=$got, expected $want"; fail=1; fi
+  done
 done
+[[ $tested == 1 ]] || { echo "FAIL  no generated stub file carries the reporter"; exit 1; }
 exit $fail

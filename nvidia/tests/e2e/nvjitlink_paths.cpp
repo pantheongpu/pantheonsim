@@ -317,8 +317,10 @@ int main(int argc, char** argv) {
 
   // Cubins. A linked one (nvcc -cubin) adds nothing to a link -- NVIDIA's
   // passes over it -- so the kernel still needs the library's PTX, and its
-  // definitions collide with nothing. Relocatable SASS (-rdc) NVIDIA's links;
-  // VirtualGPU, which links PTX, refuses it by name.
+  // definitions collide with nothing. Relocatable SASS (-rdc) NVIDIA's links
+  // with PTX, compiling the PTX first; VirtualGPU links SASS with SASS
+  // (nvjitlink_sass.cpp) and PTX with PTX, has no compiler to bring the two
+  // together, and refuses the mix by name.
   if (argc >= 6) {
     h = create({"-arch=sm_80"});
     add(h, kMain, "main.ptx");
@@ -332,7 +334,7 @@ int main(int argc, char** argv) {
     add(h, kMain, "main.ptx");
     const int r = nvJitLinkAddFile(h, NVJITLINK_INPUT_CUBIN, argv[5]);
     if (ptx_cubin) {
-      is(r, NVJITLINK_ERROR_INVALID_INPUT, "relocatable SASS is refused (VirtualGPU)");
+      is(r, NVJITLINK_ERROR_INVALID_INPUT, "relocatable SASS beside PTX is refused (VirtualGPU)");
       check(error_log(h).find("relocatable SASS") != std::string::npos, "by name");
     } else {
       is(r, NVJITLINK_SUCCESS, "relocatable SASS is an input (NVIDIA)");
