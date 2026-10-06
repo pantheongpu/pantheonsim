@@ -222,6 +222,7 @@ class Runner {
     if (m.sm >= 100)
       for (const CubinSymbol& sym : m.cubin.symbols)
         if (sym.name == ".nv.reservedSmem.offset0") alloc_handshake_ = static_cast<uint32_t>(sym.value);
+        else if (sym.name == "__nv_reservedSMEM_tmem_allocation_pipeline_mbarrier") alloc_mbar_ = static_cast<uint32_t>(sym.value);
     // From compute capability 8.0 the driver reserves 1 KiB of shared memory
     // behind every block's own, which it rounds to its 128-byte allocation
     // unit (cooperative_groups keeps the scratch of multi-warp tiles there).
@@ -355,6 +356,11 @@ class Runner {
   // Where ptxas keeps its two-CTA Tensor Memory allocation handshake in the
   // driver's reserved shared memory (.nv.reservedSmem.offset0), or ~0u.
   uint32_t alloc_handshake_ = ~0u;
+  // CUDA 12.8's ptxas names the handshake's mbarrier (__nv_reservedSMEM_tmem_
+  // allocation_pipeline_mbarrier, at 0x58 beside separate phase, mask and
+  // parity words) where CUDA 13's keeps it eight bytes into one 32-byte
+  // struct; ~0u when the module is the latter's.
+  uint32_t alloc_mbar_ = ~0u;
   void seed_alloc_handshake(Block& blk);   // by the block's rank in its pair
   uint64_t smemsz_ = 0;          // SR_SMEMSZ: the whole allocation, in allocation units
   uint32_t block_threads_ = 0;
@@ -761,10 +767,11 @@ void Runner::seed_alloc_handshake(Block& blk) {
   // the peer's does not -- the only start under which both of the kernel's
   // waits end, whichever CTA gets there first. Left zero, every 2-SM
   // kernel waits for ever.
-  if (alloc_handshake_ != ~0u && alloc_handshake_ + 0x20 <= blk.shared.size()) {
+  const uint32_t at = alloc_mbar_ != ~0u ? alloc_mbar_ : alloc_handshake_ != ~0u ? alloc_handshake_ + 8 : ~0u;
+  if (at != ~0u && at + 8 <= blk.shared.size()) {
     const bool leader = (blk.rank & 1) == 0;
     const uint64_t bar = 0x001ffffeull | (uint64_t{0x7ffff800u | (leader ? 0x80000000u : 0u)} << 32);
-    std::memcpy(&blk.shared[alloc_handshake_ + 8], &bar, 8);
+    std::memcpy(&blk.shared[at], &bar, 8);
   }
 }
 
