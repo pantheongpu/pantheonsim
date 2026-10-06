@@ -14,7 +14,8 @@
 # engine.* (engine status, from whether the GPU is busy) and smu.*
 # (the SMU mailbox: write the argument, then the message; the response
 # register reads 1 when the SMU has answered and the argument register holds
-# its reply).
+# its reply), ras.* (the UMC's ECC counts and MCA status, from the injected
+# RAS counts) and thermal.* (the THM's temperature).
 
 grbm_status2:
   offset: "0x08008"
@@ -139,3 +140,188 @@ nbio_partition_mem_status:
   fields: ["3:0 change_statue (8 a switch requested)", "11:4 nps_mode (one bit: NPSn at bit n-1)"]
   surfaces: [amdgpu (nbio get_memory_partition_mode), sysfs.current_memory_partition]
   status: model
+
+# ---- UMC (memory controller) ECC, thermal ----------------------------------------
+# The UMC and THM bases (UMC instance 0 segment 0 at 0x14000, THM segment 0 at
+# 0x16600) are Aldebaran's from aldebaran_ip_offset.h: assumed for MI300, not
+# checked on a card, like the rest of this file. The register layouts are
+# umc_6_7_0 (Aldebaran's UMC) and thm_13_0_2. Channels 4-7 of instance 0 (BASE_IDX 1,
+# segment 1 at 0x54000) and instances 1-3 (0x94000 and up) lie beyond this 512 KiB BAR5
+# and are reached through the indirect index/data pair, which is not mapped; so
+# only channels 0-3 of instance 0 are here. ECC counts follow the injected RAS
+# counts (`vgpu fault`): the card's device-memory total is spread over the four
+# mapped channels in turn -- how a real card attributes errors to channels is
+# not modelled. The 64-bit MCA STATUS is two 32-bit registers, low then high.
+
+umc0_ch0_ecc_ctrl:
+  offset: "0x5014c"
+  width: 32
+  access: rw
+  write_mask: "0x00003503"
+  reset: "0x00000401"
+  source: "umc_6_7_0_offset.h regUMCCH0_0_EccCtrl 0x0053, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH0_0_EccCtrl__*"
+  fields: ["0 wr_ecc_en", "1 ecc_replay_en", "8 uc_fatal_en", "10 rd_ecc_en", "12 poison_fatal_dis", "13 poison_inhibit"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's, and the power-on value (write and read ECC on) is a model"
+
+umc0_ch0_ecc_err_cnt_sel:
+  offset: "0x50ca0"
+  width: 32
+  access: rw
+  write_mask: "0x0000b00f"
+  reset: "0x00008000"
+  source: "umc_6_7_0_offset.h regUMCCH0_0_EccErrCntSel 0x0328, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH0_0_EccErrCntSel__*"
+  fields: ["3:0 ecc_err_cnt_cs_sel", "13:12 ecc_err_int", "15 ecc_err_cnt_en"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's. The model reads the count whatever this register holds"
+
+umc0_ch0_ecc_err_cnt:
+  offset: "0x50ca4"
+  width: 32
+  access: ro
+  backing: ras.umc_cnt.0
+  source: "umc_6_7_0_offset.h regUMCCH0_0_EccErrCnt 0x0329, UMC instance 0 segment 0; field umc_6_7_0_sh_mask.h UMCCH0_0_EccErrCnt__EccErrCnt"
+  fields: ["15:0 ecc_err_cnt (correctable errors; 16 bits)"]
+  surfaces: [umr, amdgpu ras (umc err_count)]
+  status: model
+  measured: "not measured; the base is Aldebaran's. Count: injected corrected device-memory errors since load, shared over channels 0-3"
+
+umc0_ch1_ecc_ctrl:
+  offset: "0x5114c"
+  width: 32
+  access: rw
+  write_mask: "0x00003503"
+  reset: "0x00000401"
+  source: "umc_6_7_0_offset.h regUMCCH1_0_EccCtrl 0x0453, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH1_0_EccCtrl__*"
+  fields: ["0 wr_ecc_en", "1 ecc_replay_en", "8 uc_fatal_en", "10 rd_ecc_en", "12 poison_fatal_dis", "13 poison_inhibit"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's, and the power-on value (write and read ECC on) is a model"
+
+umc0_ch1_ecc_err_cnt_sel:
+  offset: "0x51ca0"
+  width: 32
+  access: rw
+  write_mask: "0x0000b00f"
+  reset: "0x00008000"
+  source: "umc_6_7_0_offset.h regUMCCH1_0_EccErrCntSel 0x0728, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH1_0_EccErrCntSel__*"
+  fields: ["3:0 ecc_err_cnt_cs_sel", "13:12 ecc_err_int", "15 ecc_err_cnt_en"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's. The model reads the count whatever this register holds"
+
+umc0_ch1_ecc_err_cnt:
+  offset: "0x51ca4"
+  width: 32
+  access: ro
+  backing: ras.umc_cnt.1
+  source: "umc_6_7_0_offset.h regUMCCH1_0_EccErrCnt 0x0729, UMC instance 0 segment 0; field umc_6_7_0_sh_mask.h UMCCH1_0_EccErrCnt__EccErrCnt"
+  fields: ["15:0 ecc_err_cnt (correctable errors; 16 bits)"]
+  surfaces: [umr, amdgpu ras (umc err_count)]
+  status: model
+  measured: "not measured; the base is Aldebaran's. Count: injected corrected device-memory errors since load, shared over channels 0-3"
+
+umc0_ch2_ecc_ctrl:
+  offset: "0x5214c"
+  width: 32
+  access: rw
+  write_mask: "0x00003503"
+  reset: "0x00000401"
+  source: "umc_6_7_0_offset.h regUMCCH2_0_EccCtrl 0x0853, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH2_0_EccCtrl__*"
+  fields: ["0 wr_ecc_en", "1 ecc_replay_en", "8 uc_fatal_en", "10 rd_ecc_en", "12 poison_fatal_dis", "13 poison_inhibit"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's, and the power-on value (write and read ECC on) is a model"
+
+umc0_ch2_ecc_err_cnt_sel:
+  offset: "0x52ca0"
+  width: 32
+  access: rw
+  write_mask: "0x0000b00f"
+  reset: "0x00008000"
+  source: "umc_6_7_0_offset.h regUMCCH2_0_EccErrCntSel 0x0b28, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH2_0_EccErrCntSel__*"
+  fields: ["3:0 ecc_err_cnt_cs_sel", "13:12 ecc_err_int", "15 ecc_err_cnt_en"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's. The model reads the count whatever this register holds"
+
+umc0_ch2_ecc_err_cnt:
+  offset: "0x52ca4"
+  width: 32
+  access: ro
+  backing: ras.umc_cnt.2
+  source: "umc_6_7_0_offset.h regUMCCH2_0_EccErrCnt 0x0b29, UMC instance 0 segment 0; field umc_6_7_0_sh_mask.h UMCCH2_0_EccErrCnt__EccErrCnt"
+  fields: ["15:0 ecc_err_cnt (correctable errors; 16 bits)"]
+  surfaces: [umr, amdgpu ras (umc err_count)]
+  status: model
+  measured: "not measured; the base is Aldebaran's. Count: injected corrected device-memory errors since load, shared over channels 0-3"
+
+umc0_ch3_ecc_ctrl:
+  offset: "0x5314c"
+  width: 32
+  access: rw
+  write_mask: "0x00003503"
+  reset: "0x00000401"
+  source: "umc_6_7_0_offset.h regUMCCH3_0_EccCtrl 0x0c53, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH3_0_EccCtrl__*"
+  fields: ["0 wr_ecc_en", "1 ecc_replay_en", "8 uc_fatal_en", "10 rd_ecc_en", "12 poison_fatal_dis", "13 poison_inhibit"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's, and the power-on value (write and read ECC on) is a model"
+
+umc0_ch3_ecc_err_cnt_sel:
+  offset: "0x53ca0"
+  width: 32
+  access: rw
+  write_mask: "0x0000b00f"
+  reset: "0x00008000"
+  source: "umc_6_7_0_offset.h regUMCCH3_0_EccErrCntSel 0x0f28, UMC instance 0 segment 0; fields umc_6_7_0_sh_mask.h UMCCH3_0_EccErrCntSel__*"
+  fields: ["3:0 ecc_err_cnt_cs_sel", "13:12 ecc_err_int", "15 ecc_err_cnt_en"]
+  surfaces: [umr, amdgpu ras]
+  status: model
+  measured: "not measured; the base is Aldebaran's. The model reads the count whatever this register holds"
+
+umc0_ch3_ecc_err_cnt:
+  offset: "0x53ca4"
+  width: 32
+  access: ro
+  backing: ras.umc_cnt.3
+  source: "umc_6_7_0_offset.h regUMCCH3_0_EccErrCnt 0x0f29, UMC instance 0 segment 0; field umc_6_7_0_sh_mask.h UMCCH3_0_EccErrCnt__EccErrCnt"
+  fields: ["15:0 ecc_err_cnt (correctable errors; 16 bits)"]
+  surfaces: [umr, amdgpu ras (umc err_count)]
+  status: model
+  measured: "not measured; the base is Aldebaran's. Count: injected corrected device-memory errors since load, shared over channels 0-3"
+
+umc0_mca_status_lo:
+  offset: "0x50f08"
+  width: 32
+  access: ro
+  backing: ras.umc_status_lo
+  source: "umc_6_7_0_offset.h regMCA_UMC_UMC0_MCUMC_STATUST0 0x03c2, UMC instance 0 segment 0; low half of the 64-bit register"
+  fields: ["15:0 error_code", "21:16 error_code_ext", "29:24 addr_lsb"]
+  surfaces: [umr, amdgpu ras (MCA)]
+  status: model
+  measured: "not measured; the base is Aldebaran's. The model leaves the low half zero"
+
+umc0_mca_status_hi:
+  offset: "0x50f0c"
+  width: 32
+  access: ro
+  backing: ras.umc_status_hi
+  source: "umc_6_7_0_offset.h regMCA_UMC_UMC0_MCUMC_STATUST0 0x03c2, UMC instance 0 segment 0; high half; fields umc_6_7_0_sh_mask.h MCA_UMC_UMC0_MCUMC_STATUST0__* (bit n of the register is bit n-32 here)"
+  fields: ["8 scrub", "11 poison", "12 deferred", "13 uecc", "14 cecc", "28 en", "29 uc", "30 overflow", "31 val"]
+  surfaces: [umr, amdgpu ras (MCA)]
+  status: model
+  measured: "not measured; the base is Aldebaran's. Model: Val, En and UECC with UC after an injected uncorrected error, else Val, En and CECC after a corrected one, else 0"
+
+thm_tcon_cur_tmp:
+  offset: "0x59800"
+  width: 32
+  access: ro
+  backing: thermal.cur_tmp
+  source: "thm_13_0_2_offset.h regTHM_TCON_CUR_TMP 0x0000, THM segment 0; fields thm_13_0_2_sh_mask.h THM_TCON_CUR_TMP__*"
+  fields: ["19 cur_temp_range_sel", "31:21 cur_temp"]
+  surfaces: [umr, amdgpu hwmon]
+  status: model
+  measured: "not measured; the base is Aldebaran's. The model puts the GPU temperature in cur_temp in 0.125 C steps with the range select clear; the step size is assumed"

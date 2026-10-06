@@ -196,12 +196,37 @@ published: which compute modes are offered depends on the memory mode and the
 XCC count in ways not checked yet.
 
 The register offsets, bit fields and message numbers come from the amdgpu
-headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `nbio_7_9_0_*.h`, `smu_v13_0_6_ppsmc.h`; their
-MIT notice is in `amd/registers/LICENSES/amdgpu-headers.txt`), and each entry's
+headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `nbio_7_9_0_*.h`, `smu_v13_0_6_ppsmc.h`, and for
+UMC and THM `umc_6_7_0_*.h` and `thm_13_0_2_*.h`; their
+MIT notices are in `amd/registers/LICENSES/amdgpu-headers.txt`), and each entry's
 `source` names the symbol. They are offsets from an IP block's base, and MI300
 learns its bases at boot from its IP discovery table; the database uses
 Aldebaran's (MI200's), the same GFX9 family. That, the engine status values and
 the firmware version are a model until checked on a card.
+
+### UMC ECC and thermal
+
+Behind the same BAR5 are the memory controller's ECC registers and the
+thermal sensor, from `umc_6_7_0_*.h` (Aldebaran's UMC) and `thm_13_0_2_*.h`,
+each entry naming its header symbol in `source`.
+
+| Registers | Offset | Behaviour |
+| --- | --- | --- |
+| `umc0_ch{0-3}_ecc_ctrl`, `_ecc_err_cnt_sel` | (0x14000 + regUMCCH*n*_0_EccCtrl / EccErrCntSel) * 4 | rw, only the header's fields stick; power-on value is a model (write and read ECC on, count enabled) |
+| `umc0_ch{0-3}_ecc_err_cnt` | (0x14000 + regUMCCH*n*_0_EccErrCnt) * 4 | ro, 16 bits: the injected correctable device-memory errors since load (`vgpu fault`), shared over the four channels in turn |
+| `umc0_mca_status_lo`, `_hi` | (0x14000 + regMCA_UMC_UMC0_MCUMC_STATUST0) * 4 | ro, the 64-bit MCA status as two dwords: Val and En with UECC and UC after an injected uncorrected error, else Val and En with CECC after a corrected one, else 0 |
+| `thm_tcon_cur_tmp` | (0x16600 + regTHM_TCON_CUR_TMP) * 4 | ro, `CUR_TEMP` holds the GPU temperature in 0.125 C steps |
+
+Status of these entries: the UMC instance 0 segment 0 base (0x14000) and THM
+segment 0 base (0x16600) are Aldebaran's, from `aldebaran_ip_offset.h`, and are
+assumed for MI300, not checked on a card; every entry says "not measured".
+Channels 4-7 (segment 1, 0x54000) and UMC instances 1-3 (0x94000 and up) lie
+beyond the 512 KiB BAR5 model and are reached on a card through the indirect
+index and data registers, which are not mapped, so they are not in the map. MI300 itself uses `umc_12_0_0` (its own MCA-based layout); that
+header carries a differently worded notice and is not used here. The mapping
+of the card's error count to channels, the power-on control values, the status
+bit pattern and the temperature step are models, not measured; the per-channel
+uncorrectable count and MCA address, syndrome and IPID registers are not mapped.
 
 ## From C
 

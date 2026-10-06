@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -40,6 +41,33 @@ uint32_t trained_gen(const telemetry::DeviceSample& d) { return d.pcie_gen; }
 // whether a response has been set since reset.
 enum Mailbox { kMessage, kArgument, kResponse, kResponseSet };
 
+// The UMC's ECC registers, from the injected device-memory errors since load:
+// the correctable count shared over the four mapped channels in turn (a model),
+// and the MCA status of an error, uncorrected before corrected.
+bool umc_backed(const std::string& k, const telemetry::DeviceSample& d, uint32_t* out) {
+  ras::Counters c{};
+  try {
+    c = ras::read(d.uuid).since_load;
+  } catch (const std::exception&) {
+  }
+  const auto at = [&](ras::Severity s) {
+    return c.ecc[static_cast<uint32_t>(s)][static_cast<uint32_t>(ras::Location::DeviceMemory)];
+  };
+  const uint64_t ce = at(ras::Severity::Corrected), ue = at(ras::Severity::Uncorrected);
+  if (k.compare(0, 12, "ras.umc_cnt.") == 0) {
+    const uint64_t ch = static_cast<uint64_t>(std::atoi(k.c_str() + 12));
+    *out = static_cast<uint32_t>((ce / 4 + (ch < ce % 4 ? 1 : 0)) & 0xFFFF);
+  } else if (k == "ras.umc_status_lo") {
+    *out = 0;
+  } else if (k == "ras.umc_status_hi") {
+    const uint32_t base = (1u << 31) | (1u << 28);   // Val, En
+    *out = ue ? base | (1u << 29) | (1u << 13) : ce ? base | (1u << 14) : 0u;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 bool amd_backed(const std::string& k, const Context& c, uint32_t* out) {
   const telemetry::DeviceSample& d = c.d;
   const uint32_t device = d.pci_device_id >> 16;
@@ -70,6 +98,8 @@ bool amd_backed(const std::string& k, const Context& c, uint32_t* out) {
   else if (k == "engine.grbm_status2") *out = d.utilization_gpu ? 0x73018008u : 0x00000008u;
   else if (k == "engine.cp_stat") *out = d.utilization_gpu ? 0x80000000u : 0u;
   else if (k == "engine.rlc_stat") *out = d.utilization_gpu ? 0x00000005u : 0u;
+  else if (k == "thermal.cur_tmp") *out = (d.temperature_c * 8u) << 21;   // 0.125 C steps; a model
+  else if (k.compare(0, 4, "ras.") == 0) return umc_backed(k, d, out);
   else if (k == "smu.message") *out = static_cast<uint32_t>(__atomic_load_n(&c.words[kMessage], __ATOMIC_RELAXED));
   else if (k == "smu.argument") *out = static_cast<uint32_t>(__atomic_load_n(&c.words[kArgument], __ATOMIC_RELAXED));
   else if (k == "smu.response")

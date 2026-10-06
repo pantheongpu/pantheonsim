@@ -877,8 +877,12 @@ narrows what counts as observable, not what the detector looks at.
   error counters fed by `vgpu fault` (what a memory diagnostic reads), MMU
   fault buffers, framebuffer flush addresses, the 64-word scratch arrays,
   thermal scratch and Blackwell's confidential-computing scratch.
-  Not yet: more AMD blocks (UMC ECC), and the NVIDIA blocks whose headers
-  publish no usable offsets (device topology, PRI errors, temperature). A C API (vgpu_regs.h,
+  AMD UMC ECC (channels 0-3 of instance 0), its MCA status and the THM
+  temperature are mapped on assumed Aldebaran bases.
+  Not yet: the UMC's other channels and instances (beyond BAR5, via the
+  indirect pair), NBIO PCIe link status, SRBM, XGMI/PCS, and the NVIDIA
+  blocks whose headers publish no usable offsets (device topology, PRI
+  errors, temperature). A C API (vgpu_regs.h,
   libvgpuregs) gives bring-up software the same access. tools/regprobe
   captures real cards (read-only) to check and map the model against. AMD's
   gpu_metrics table (v1.5), amdgpu's busy and memory files and its hwmon (read
