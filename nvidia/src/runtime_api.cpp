@@ -5281,6 +5281,57 @@ cudaError_t check_device_graph(cudaGraph_t graph) {
   return cudaSuccess;
 }
 
+// ---- user objects (CUDA 12): reference-counted host objects whose destructor
+// runs when the last reference goes. A graph can hold references, and an
+// executable graph instantiated from it holds its own, so the object outlives
+// a graph that was destroyed while a launch of it is still possible. PyTorch
+// 2.14 uses them to keep a captured graph's host-side state alive.
+struct UserObjectRec {
+  cudaHostFn_t destroy;
+  void* ptr;
+  unsigned refs;
+};
+std::mutex g_uo_mu;
+std::map<cudaUserObject_t, UserObjectRec> g_user_objects;
+// What each graph and each executable graph holds: object -> references.
+std::map<void*, std::map<cudaUserObject_t, unsigned>> g_graph_refs;
+std::map<void*, std::map<cudaUserObject_t, unsigned>> g_exec_refs;
+
+// Drops `count` references; runs the destructor, outside the lock, when none are left.
+cudaError_t user_object_release(cudaUserObject_t obj, unsigned count) {
+  cudaHostFn_t fn = nullptr;
+  void* ptr = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_uo_mu);
+    auto it = g_user_objects.find(obj);
+    if (it == g_user_objects.end() || count == 0 || count > it->second.refs) return cudaErrorInvalidValue;
+    it->second.refs -= count;
+    if (it->second.refs == 0) {
+      fn = it->second.destroy;
+      ptr = it->second.ptr;
+      g_user_objects.erase(it);
+    }
+  }
+  if (fn) fn(ptr);
+  return cudaSuccess;
+}
+void user_objects_release_all(std::map<cudaUserObject_t, unsigned> held) {
+  for (const auto& [obj, count] : held) user_object_release(obj, count);
+}
+// An executable graph takes its own references to what its graph holds.
+// Caller holds g_graph_mu (g_uo_mu is always taken inside it, never the reverse).
+void exec_retain_graph_objects(void* exec, void* graph) {
+  const auto held = g_graph_refs.find(graph);
+  if (held == g_graph_refs.end()) return;
+  std::lock_guard<std::mutex> lock(g_uo_mu);
+  for (const auto& [obj, count] : held->second) {
+    auto it = g_user_objects.find(obj);
+    if (it == g_user_objects.end()) continue;
+    it->second.refs += count;
+    g_exec_refs[exec][obj] += count;
+  }
+}
+
 cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long long flags,
                         cudaGraphInstantiateResult* result) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
@@ -5313,6 +5364,7 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   void* handle = exec.get();
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
+  exec_retain_graph_objects(handle, static_cast<void*>(graph));
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
@@ -7505,9 +7557,117 @@ VGPU_EXPORT cudaError_t cudaGraphDebugDotPrint(cudaGraph_t graph, const char* pa
   return cudaSuccess;
 }
 
+// ---- user objects and libraries (CUDA 12): see the table above ----
+
+VGPU_EXPORT cudaError_t cudaUserObjectCreate(cudaUserObject_t* object_out, void* ptr, cudaHostFn_t destroy,
+                                             unsigned int initialRefcount, unsigned int flags) {
+  if (!object_out || !destroy || initialRefcount == 0 || (flags & ~cudaUserObjectNoDestructorSync))
+    return cudaErrorInvalidValue;
+  auto* handle = new char;   // a handle no other object can share
+  const auto obj = reinterpret_cast<cudaUserObject_t>(handle);
+  std::lock_guard<std::mutex> lock(g_uo_mu);
+  g_user_objects[obj] = {destroy, ptr, initialRefcount};
+  *object_out = obj;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaUserObjectRetain(cudaUserObject_t object, unsigned int count) {
+  std::lock_guard<std::mutex> lock(g_uo_mu);
+  auto it = g_user_objects.find(object);
+  if (it == g_user_objects.end() || count == 0) return cudaErrorInvalidValue;
+  it->second.refs += count;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaUserObjectRelease(cudaUserObject_t object, unsigned int count) {
+  return user_object_release(object, count);
+}
+
+// The graph takes `count` references: new ones, or the caller's own with
+// cudaGraphUserObjectMove.
+VGPU_EXPORT cudaError_t cudaGraphRetainUserObject(cudaGraph_t graph, cudaUserObject_t object,
+                                                  unsigned int count, unsigned int flags) {
+  if (!graph || count == 0 || (flags & ~static_cast<unsigned>(cudaGraphUserObjectMove))) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  if (!graph_from(graph)) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> uo_lock(g_uo_mu);
+  auto it = g_user_objects.find(object);
+  if (it == g_user_objects.end()) return cudaErrorInvalidValue;
+  if (flags & cudaGraphUserObjectMove) {
+    if (count > it->second.refs) return cudaErrorInvalidValue;   // the caller's references are the graph's now
+  } else {
+    it->second.refs += count;
+  }
+  g_graph_refs[static_cast<void*>(graph)][object] += count;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphReleaseUserObject(cudaGraph_t graph, cudaUserObject_t object,
+                                                   unsigned int count) {
+  {
+    std::lock_guard<std::mutex> lock(g_graph_mu);
+    auto g = g_graph_refs.find(static_cast<void*>(graph));
+    if (g == g_graph_refs.end()) return cudaErrorInvalidValue;
+    auto held = g->second.find(object);
+    if (held == g->second.end() || count == 0 || count > held->second) return cudaErrorInvalidValue;
+    if ((held->second -= count) == 0) g->second.erase(held);
+  }
+  return user_object_release(object, count);
+}
+
+// The runtime's library API is the driver's, under the runtime's names: one
+// simulated machine behind both (see shared_runtime.cpp).
+namespace {
+// The driver shim's entry point. Every framework has the driver loaded, and the
+// runtime hands it its context (bind_driver_context); with none loaded there is
+// nothing to forward to.
+void* driver_symbol(const char* name) { return dlsym(RTLD_DEFAULT, name); }
+// CUresult and cudaError_t agree on every code these calls return.
+cudaError_t from_driver(int r) { return static_cast<cudaError_t>(r); }
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaLibraryLoadData(cudaLibrary_t* library, const void* code, cudaJitOption* jitOptions,
+                                            void** jitOptionsValues, unsigned int numJitOptions,
+                                            cudaLibraryOption* libraryOptions, void** libraryOptionValues,
+                                            unsigned int numLibraryOptions) {
+  using Fn = int (*)(void**, const void*, void*, void**, unsigned, void*, void**, unsigned);
+  auto fn = reinterpret_cast<Fn>(driver_symbol("cuLibraryLoadData"));
+  if (!fn) return cudaErrorInitializationError;
+  // through guard: the runtime starts, and the driver has this thread's context
+  return guard("cudaLibraryLoadData", [&](State&) -> cudaError_t { return from_driver(fn(reinterpret_cast<void**>(library), code, jitOptions, jitOptionsValues, numJitOptions,
+                        libraryOptions, libraryOptionValues, numLibraryOptions)); });
+}
+
+VGPU_EXPORT cudaError_t cudaLibraryGetKernel(cudaKernel_t* pKernel, cudaLibrary_t library, const char* name) {
+  using Fn = int (*)(void**, void*, const char*);
+  auto fn = reinterpret_cast<Fn>(driver_symbol("cuLibraryGetKernel"));
+  if (!fn) return cudaErrorInitializationError;
+  // through guard: the runtime starts, and the driver has this thread's context
+  return guard("cudaLibraryGetKernel", [&](State&) -> cudaError_t { return from_driver(fn(reinterpret_cast<void**>(pKernel), library, name)); });
+}
+
+VGPU_EXPORT cudaError_t cudaLibraryUnload(cudaLibrary_t library) {
+  using Fn = int (*)(void*);
+  auto fn = reinterpret_cast<Fn>(driver_symbol("cuLibraryUnload"));
+  if (!fn) return cudaErrorInitializationError;
+  // through guard: the runtime starts, and the driver has this thread's context
+  return guard("cudaLibraryUnload", [&](State&) -> cudaError_t { return from_driver(fn(library)); });
+}
+
+// cuKernelSetAttribute accepts and keeps nothing (a kernel handle's ceilings
+// are not tracked), so this does too.
+VGPU_EXPORT cudaError_t cudaKernelSetAttributeForDevice(cudaKernel_t kernel, cudaFuncAttribute attr, int value,
+                                                        int device) {
+  using Fn = int (*)(int, int, void*, int);
+  auto fn = reinterpret_cast<Fn>(driver_symbol("cuKernelSetAttribute"));
+  if (!fn) return cudaErrorInitializationError;
+  // through guard: the runtime starts, and the driver has this thread's context
+  return guard("cudaKernelSetAttributeForDevice", [&](State&) -> cudaError_t { return from_driver(fn(static_cast<int>(attr), value, kernel, device)); });
+}
+
 // The graph's own records go with it (destroy_graph, below).
 VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
-  std::lock_guard<std::mutex> lock(g_graph_mu);
+  std::unique_lock<std::mutex> lock(g_graph_mu);
   // A child graph belongs to the node that holds it; destroying it here would
   // free memory the node still points at.
   if (g_borrowed_graphs.count(static_cast<void*>(graph)) &&
@@ -7518,6 +7678,14 @@ VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
   for (const auto& [origin, cap] : g_captures)
     if (cap->graph == static_cast<void*>(graph)) return cudaErrorIllegalState;
   destroy_graph(static_cast<void*>(graph));
+  std::map<cudaUserObject_t, unsigned> held;
+  if (auto it = g_graph_refs.find(static_cast<void*>(graph)); it != g_graph_refs.end()) {
+    held = std::move(it->second);
+    g_graph_refs.erase(it);
+  }
+  // Destructors run with the graph lock dropped: one may free other graphs.
+  lock.unlock();
+  user_objects_release_all(std::move(held));
   return cudaSuccess;
 }
 
@@ -7564,7 +7732,12 @@ void destroy_graph(void* graph) {
 }
 }  // namespace
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
-  std::lock_guard<std::mutex> lock(g_graph_mu);
+  std::unique_lock<std::mutex> lock(g_graph_mu);
+  std::map<cudaUserObject_t, unsigned> held;
+  if (auto it = g_exec_refs.find(static_cast<void*>(exec)); it != g_exec_refs.end()) {
+    held = std::move(it->second);
+    g_exec_refs.erase(it);
+  }
   g_graph_execs.erase(static_cast<void*>(exec));
   // The last exec of a destroyed graph: now nothing can allocate at that
   // graph's addresses again (see cudaGraphDestroy).
@@ -7581,6 +7754,8 @@ VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   }
   g_exec_auto_free.erase(static_cast<void*>(exec));
   g_device_graphs.erase(static_cast<void*>(exec));
+  lock.unlock();
+  user_objects_release_all(std::move(held));
   return cudaSuccess;
 }
 // What a library asks before it adds work to a stream that might be capturing:
