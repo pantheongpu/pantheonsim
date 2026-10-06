@@ -12,34 +12,6 @@
 namespace vgpu::amd {
 namespace {
 
-// gpu_metrics_v1_5, field for field, with its natural alignment.
-struct MetricsV15 {
-  uint16_t structure_size;
-  uint8_t format_revision;
-  uint8_t content_revision;
-  uint16_t temperature_hotspot, temperature_mem, temperature_vrsoc;   // Celsius
-  uint16_t curr_socket_power;                                         // W
-  uint16_t average_gfx_activity, average_umc_activity;                // %
-  uint16_t vcn_activity[4];
-  uint16_t jpeg_activity[32];
-  uint64_t energy_accumulator;   // 15.259 uJ units
-  uint64_t system_clock_counter; // ns
-  uint32_t throttle_status;
-  uint32_t gfxclk_lock_status;
-  uint16_t pcie_link_width;      // lanes
-  uint16_t pcie_link_speed;      // 0.1 GT/s
-  uint16_t xgmi_link_width, xgmi_link_speed;
-  uint32_t gfx_activity_acc, mem_activity_acc;
-  uint64_t pcie_bandwidth_acc, pcie_bandwidth_inst;
-  uint64_t pcie_l0_to_recov_count_acc, pcie_replay_count_acc, pcie_replay_rover_count_acc;
-  uint32_t pcie_nak_sent_count_acc, pcie_nak_rcvd_count_acc;
-  uint64_t xgmi_read_data_acc[8], xgmi_write_data_acc[8];
-  uint64_t firmware_timestamp;   // 10 ns
-  uint16_t current_gfxclk[8];    // MHz
-  uint16_t current_socclk[4], current_vclk0[4], current_dclk0[4];
-  uint16_t current_uclk;
-  uint16_t padding;
-};
 // The kernel's own layout, checked field by field where it matters.
 static_assert(sizeof(MetricsV15) == kGpuMetricsSize);
 static_assert(offsetof(MetricsV15, temperature_hotspot) == 4);

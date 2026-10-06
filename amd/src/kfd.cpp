@@ -87,6 +87,8 @@ uint32_t kfd_gfx_target_version(const std::string& gfx) {
   return static_cast<uint32_t>(std::stoul(major) * 10000 + minor * 100 + stepping);
 }
 
+uint32_t kfd_pcie_mb_per_s(uint32_t gen, uint32_t width) { return pcie_mb_per_s(gen, width); }
+
 uint64_t kfd_unique_id(const char* uuid) { return fnv(uuid); }
 
 uint32_t kfd_gpu_id(const char* uuid) {

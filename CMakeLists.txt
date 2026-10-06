@@ -1101,7 +1101,7 @@ set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/m
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
 # ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
 add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
-target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
+target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuamdsmi vgpuhip)
 target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
 add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
 # Each with a machine of its own: the library reads the machine's telemetry,
@@ -1122,6 +1122,14 @@ set_tests_properties(test_amd_amd_smi PROPERTIES ENVIRONMENT
 add_test(NAME test_amd_amd_smi_radeon COMMAND test_amd_amd_smi)
 set_tests_properties(test_amd_amd_smi_radeon PROPERTIES ENVIRONMENT
   "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
+# What ROCm Validation Suite asks AMD SMI (clock levels, temperature, power, energy,
+# ECC) on every other profile: the sensors and counters follow each one's class.
+foreach(_g mi250x mi325x mi350x rx6900xt rx9070xt)
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
+  add_test(NAME test_amd_amd_smi_rvs_${_g} COMMAND test_amd_amd_smi rvs)
+  set_tests_properties(test_amd_amd_smi_rvs_${_g} PROPERTIES ENVIRONMENT
+    "VGPU_GPU=amd/${_g};VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
+endforeach()
 # vLLM, unmodified, generating on a simulated MI300X what the CPU generates
 # (VGPU_VLLM_PYTHON: a Python with vLLM for ROCm; skips without one).
 add_test(NAME amd_vllm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)

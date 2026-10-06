@@ -6,6 +6,7 @@
 // when it is imported, so every one must be exported, the ones not modelled
 // answering NOT_SUPPORTED.
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -61,6 +62,9 @@ int amdsmi_get_gpu_memory_partition(void*, char*, uint32_t);
 int amdsmi_get_gpu_process_list(void*, uint32_t*, void*);
 int amdsmi_get_gpu_metrics_info(void*, void*);
 int amdsmi_get_violation_status(void*, void*);
+int amdsmi_get_clk_freq(void*, int, void*);
+int amdsmi_set_clk_freq(void*, int, uint64_t);
+int amdsmi_get_energy_count(void*, uint64_t*, float*, uint64_t*);
 }
 
 namespace {
@@ -85,6 +89,16 @@ struct KfdInfo {
   uint32_t node_id, current_partition_id, reserved[12];
 };
 extern "C" int amdsmi_get_gpu_asic_info(void*, AsicInfo*);
+
+// amdsmi_frequencies_t, which RVS reads, as the header lays it out (the power,
+// ECC and clock structures are below).
+struct Frequencies {
+  bool has_deep_sleep;
+  uint32_t num_supported, current;
+  uint64_t frequency[33];
+};
+constexpr int kOutOfBounds = 17;
+constexpr int kClkSys = 0, kClkMem = 4;
 
 bool radeon() {
   const char* gpu = std::getenv("VGPU_GPU");
@@ -482,13 +496,153 @@ VTEST(the_process_list_counts_then_fills) {
   VCHECK_EQ(amdsmi_get_gpu_process_list(nullptr, &n, nullptr), kNotFound);
 }
 
+// What RVS's power, thermal and stress modules ask each GPU, answered from the
+// profile: watts, degrees, clock levels it can pin, an energy counter that only
+// Instinct has.
+VTEST(sensors_answer_what_rvs_asks_by_the_profile) {
+  amdsmi_init(2);
+  const bool rx = radeon();
+  const char* env = std::getenv("VGPU_GPU");
+  const vgpu::DeviceProfile p = vgpu::load_gpu(env ? env : "amd/mi300x");
+  const std::vector<void*> g = gpus();
+  for (size_t i = 0; i < g.size(); ++i) {
+    vgpu::telemetry::DeviceSample d{};
+    vgpu::telemetry::describe_device(p, static_cast<int>(i), &d);
+    PowerInfo pw{};
+    VCHECK_EQ(amdsmi_get_power_info(g[i], &pw), kSuccess);
+    VCHECK(pw.socket > 0 && pw.socket < 2000);
+    VCHECK_EQ(pw.limit, (d.power_limit_mw + 500) / 1000);
+    // One of the two readings, the other UINT32_MAX: MI300 and newer read
+    // current, the earlier Instinct and Radeon average.
+    const bool current = std::string(d.architecture) == "cdna3" || std::string(d.architecture) == "cdna4";
+    VCHECK_EQ(current ? pw.average : pw.current, 0xFFFFFFFFu);
+    VCHECK_EQ(current ? pw.current : pw.average, static_cast<uint32_t>(pw.socket));
+    PowerCap cap{};
+    VCHECK_EQ(amdsmi_get_power_cap_info(g[i], 0, &cap), kSuccess);
+    VCHECK_EQ(cap.max, uint64_t{d.power_limit_mw} * 1000);
+    VCHECK_EQ(amdsmi_get_power_cap_info(g[i], 3, &cap), kNotSupported);
+
+    int64_t t = -1;
+    VCHECK_EQ(amdsmi_get_temp_metric(g[i], 1, 0, &t), kSuccess);   // junction, degrees
+    VCHECK(t > 0 && t < 150);
+    // The slowdown limit, where the profile has one (mi325x's is unknown, 0).
+    VCHECK_EQ(amdsmi_get_temp_metric(g[i], 1, 1, &t), d.temperature_max_c ? kSuccess : kNotSupported);
+    if (d.temperature_max_c) VCHECK_EQ(t, int64_t{d.temperature_max_c});
+    // No edge sensor on an Instinct; no HBM on a Radeon.
+    VCHECK_EQ(amdsmi_get_temp_metric(g[i], 0, 0, &t), rx ? kSuccess : kNotSupported);
+    VCHECK_EQ(amdsmi_get_temp_metric(g[i], 3, 0, &t), rx || !d.has_memory_temperature ? kNotSupported : kSuccess);
+    VCHECK_EQ(amdsmi_get_temp_metric(g[i], 2, 0, &t), d.has_memory_temperature ? kSuccess : kNotSupported);   // VRAM
+    VCHECK_EQ(amdsmi_get_temp_metric(g[i], 300, 0, &t), kInval);
+
+    Frequencies f{};
+    VCHECK_EQ(amdsmi_get_clk_freq(g[i], kClkSys, &f), kSuccess);
+    VCHECK_EQ(f.num_supported, 2u);
+    VCHECK_EQ(f.frequency[1], uint64_t{d.sm_clock_max_mhz} * 1000000);
+    VCHECK(f.frequency[0] < f.frequency[1]);
+    VCHECK_EQ(amdsmi_get_clk_freq(g[i], kClkMem, &f), kSuccess);
+    VCHECK_EQ(f.frequency[1], uint64_t{d.mem_clock_max_mhz} * 1000000);
+    VCHECK_EQ(amdsmi_get_clk_freq(g[i], 1, &f), kNotSupported);   // data fabric: not modelled
+    // RVS's PULSE probe: each level alone must be settable, the one past the last not.
+    VCHECK_EQ(amdsmi_set_clk_freq(g[i], kClkSys, 1), kSuccess);
+    VCHECK_EQ(amdsmi_get_clk_freq(g[i], kClkSys, &f), kSuccess);
+    VCHECK_EQ(f.current, 0u);
+    VCHECK_EQ(amdsmi_set_clk_freq(g[i], kClkSys, 2), kSuccess);
+    amdsmi_get_clk_freq(g[i], kClkSys, &f);
+    VCHECK_EQ(f.current, 1u);
+    VCHECK_EQ(amdsmi_set_clk_freq(g[i], kClkSys, 4), kOutOfBounds);
+    VCHECK_EQ(amdsmi_set_clk_freq(g[i], kClkSys, 3), kSuccess);   // restored
+    VCHECK_EQ(amdsmi_set_clk_freq(g[i], kClkMem, 0), kOutOfBounds);
+
+    // Energy: Instinct's accumulator counts up; a Radeon has none.
+    uint64_t e0 = 0, e1 = 0, ts = 0;
+    float res = 0;
+    const int r = amdsmi_get_energy_count(g[i], &e0, &res, &ts);
+    VCHECK_EQ(r, rx ? kNotSupported : kSuccess);
+    if (!rx) {
+      VCHECK(e0 > 0 && res > 15.0f && res < 15.5f);
+      usleep(20000);
+      VCHECK_EQ(amdsmi_get_energy_count(g[i], &e1, &res, &ts), kSuccess);
+      VCHECK(e1 > e0);
+    }
+  }
+  void* bad = reinterpret_cast<void*>(0x1234);
+  PowerInfo pw{};
+  VCHECK_EQ(amdsmi_get_power_info(bad, &pw), kNotFound);
+  VCHECK_EQ(amdsmi_get_power_info(g[0], nullptr), kInval);
+}
+
+// ECC and RAS: Instinct ships with them, a Radeon without; counts follow the RAS model.
+VTEST(ecc_for_rvs_is_there_only_where_the_profile_has_it) {
+  amdsmi_init(2);
+  const bool rx = radeon();
+  const std::vector<void*> g = gpus();
+  uint64_t blocks = 99;
+  VCHECK_EQ(amdsmi_get_gpu_ecc_enabled(g[0], &blocks), kSuccess);
+  VCHECK_EQ(blocks != 0, !rx);
+  int state = 0;
+  VCHECK_EQ(amdsmi_get_gpu_ecc_status(g[0], 1, &state), kSuccess);   // UMC
+  VCHECK_EQ(state, rx ? 1 : 6);                                     // DISABLED : ENABLED
+  VCHECK_EQ(amdsmi_get_gpu_ecc_status(g[0], 3, &state), kInval);    // two blocks at once
+  VCHECK_EQ(amdsmi_get_gpu_ecc_status(g[0], 0x80, &state), kSuccess);                       // XGMI: as the others
+  ErrorCount ec{};
+  VCHECK_EQ(amdsmi_get_gpu_total_ecc_count(g[0], &ec), rx ? kNotSupported : kSuccess);
+  if (!rx) VCHECK_EQ(ec.correctable + ec.uncorrectable, uint64_t{0});
+}
+
+// amdsmi_gpu_metrics_t (4544 bytes in ROCm 7.2.0), read at the offsets compiled
+// from that release's header: the table's v1.5 fields copied across, the rest
+// all ones.
+VTEST(gpu_metrics_are_the_v1_5_table_in_amd_smis_structure) {
+  amdsmi_init(2);
+  const std::vector<void*> g = gpus();
+  std::vector<unsigned char> m(4544, 0);
+  const auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, &m[o], 2); return v; };
+  const auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, &m[o], 4); return v; };
+  const auto u64 = [&](size_t o) { uint64_t v; std::memcpy(&v, &m[o], 8); return v; };
+  const bool rx = radeon();
+  const char* env = std::getenv("VGPU_GPU");
+  const vgpu::DeviceProfile p = vgpu::load_gpu(env ? env : "amd/mi300x");
+  for (size_t i = 0; i < g.size(); ++i) {
+    vgpu::telemetry::DeviceSample d{};
+    vgpu::telemetry::describe_device(p, static_cast<int>(i), &d);
+    VCHECK_EQ(amdsmi_get_gpu_metrics_info(g[i], m.data()), kSuccess);
+    VCHECK_EQ(u16(0), 360u);                      // the table's size, as the header says
+    VCHECK_EQ(m[2], 1);                           // format revision
+    VCHECK_EQ(m[3], 5);                           // content revision
+    VCHECK_EQ(u16(4), 0xFFFFu);                   // temperature_edge: not in the table
+    VCHECK(u16(6) > 0 && u16(6) < 150);           // temperature_hotspot
+    VCHECK(u16(120) > 0 && u16(120) <= d.power_limit_mw / 1000);   // current_socket_power
+    VCHECK_EQ(u16(22), 0xFFFFu);                  // average_socket_power: not in v1.5
+    VCHECK_EQ(u16(74), d.pcie_width);             // pcie_link_width
+    VCHECK_EQ(u16(54), u16(312));                 // current_gfxclk is current_gfxclks[0]
+    VCHECK(u16(312) > 0 && u16(312) <= d.sm_clock_max_mhz);
+    VCHECK(u16(58) > 0 && u16(58) <= d.mem_clock_max_mhz);   // current_uclk
+    VCHECK_EQ(u32(132), 0u);                      // gfxclk_lock_status
+    VCHECK(u64(32) > 0);                          // system_clock_counter
+    VCHECK_EQ(u64(4520), ~uint64_t{0});           // vram_max_bandwidth: v1.7, not in the table
+    VCHECK_EQ(u16(4528), 0xFFFFu);                // xgmi_link_status[0]
+    VCHECK_EQ(u64(184), 0u);                      // xgmi_read_data_acc[0]
+    // The accumulator: Instinct only, the one amdsmi_get_energy_count counts.
+    if (rx) {
+      VCHECK_EQ(u64(24), ~uint64_t{0});
+    } else {
+      uint64_t e = 0, ts = 0;
+      float res = 0;
+      VCHECK(u64(24) > 0 && u64(24) != ~uint64_t{0});
+      VCHECK_EQ(amdsmi_get_energy_count(g[i], &e, &res, &ts), kSuccess);
+      VCHECK(e >= u64(24) && e - u64(24) < 1000000);
+    }
+  }
+  VCHECK_EQ(amdsmi_get_gpu_metrics_info(g[0], nullptr), kInval);
+  VCHECK_EQ(amdsmi_get_gpu_metrics_info(reinterpret_cast<void*>(0x1234), m.data()), kNotFound);
+}
+
 VTEST(what_is_not_modelled_is_refused_and_every_function_is_there) {
   amdsmi_init(2);
   const std::vector<void*> g = gpus();
   char buf[4096] = {};
   VCHECK_EQ(amdsmi_get_gpu_vbios_info(g[0], buf), kNotSupported);
   VCHECK_EQ(amdsmi_set_gpu_perf_level(g[0], 0), kNotSupported);
-  VCHECK_EQ(amdsmi_get_gpu_metrics_info(g[0], buf), kNotSupported);
   VCHECK_EQ(amdsmi_get_violation_status(g[0], buf), kNotSupported);
   int missing = 0, count = 0;
 #define AMDSMI_SYMBOL(name)                              \

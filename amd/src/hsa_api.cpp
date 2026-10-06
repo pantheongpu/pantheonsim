@@ -37,6 +37,7 @@
 #include "hip_shared.hpp"
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_chip.hpp"
+#include "vgpu/amd_kfd.hpp"
 #include "vgpu/amd_image.hpp"
 #include "vgpu/hip_abi.hpp"
 #include "vgpu/hsa_abi.h"
@@ -1043,7 +1044,39 @@ hsa_status_t hsa_amd_agent_memory_pool_get_info(hsa_agent_t agent, hsa_amd_memor
                            : never ? HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED
                                    : HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT);
       break;
-    case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS: put<uint32_t>(value, own ? 0 : 1); break;
+    // The links from the agent to the pool, as KFD's topology lists them
+    // (amd/src/kfd.cpp): zero where the pool is the agent's own or never
+    // reachable; a GPU reaches system memory over its PCI Express link, an
+    // Instinct GPU another's memory over one XGMI hop, a Radeon another's
+    // through the host: two PCI Express hops.
+    case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS:
+    case HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: {
+      const int gpu = gpu_of(agent);
+      const bool to_gpu = id.kind == PoolKind::Device;
+      const int peer = to_gpu ? gpu_of(id.agent) : -1;
+      const bool xgmi = to_gpu && id.agent.handle != agent.handle && !never && gpu >= 0 && peer >= 0 &&
+                        shared::profile(gpu).gcn_arch.rfind("gfx9", 0) == 0 &&
+                        shared::profile(peer).gcn_arch.rfind("gfx9", 0) == 0;
+      const bool belongs = to_gpu || id.kind == PoolKind::Group ? id.agent.handle == agent.handle
+                                                                : agent.handle == kCpuAgent;
+      const uint32_t hops = belongs || never ? 0 : xgmi ? 1 : to_gpu ? 2 : 1;
+      if (attribute == HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS) {
+        put<uint32_t>(value, hops);
+        break;
+      }
+      const auto& prof = shared::profile(gpu >= 0 ? gpu : 0);
+      const uint32_t pcie = vgpu::amd::kfd_pcie_mb_per_s(static_cast<uint32_t>(prof.telemetry.pcie_gen),
+                                                         static_cast<uint32_t>(prof.telemetry.pcie_width));
+      auto* out = static_cast<hsa_amd_memory_pool_link_info_t*>(value);
+      for (uint32_t h = 0; h < hops; ++h) {
+        out[h] = {};
+        out[h].link_type = xgmi ? HSA_AMD_LINK_INFO_TYPE_XGMI : HSA_AMD_LINK_INFO_TYPE_PCIE;
+        out[h].min_bandwidth = out[h].max_bandwidth = xgmi ? 64000 : pcie;
+        out[h].numa_distance = xgmi ? 15 : 20;
+        out[h].atomic_support_32bit = out[h].atomic_support_64bit = out[h].coherent_support = true;
+      }
+      break;
+    }
     default: return unknown("hsa_amd_agent_memory_pool_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;

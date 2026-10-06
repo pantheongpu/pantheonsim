@@ -8,7 +8,7 @@
 // telemetry, its RAS counters and registers), so ROCm's rocm-smi over this
 // library and VirtualGPU's rocm-smi agree; the device list and bus addresses
 // are the HIP runtime's, so HIP and ROCm SMI agree too. What a simulated GPU
-// has no value for -- a VBIOS, firmware, serial number, energy counter, the
+// has no value for -- a VBIOS, firmware, serial number, the
 // gpu_metrics table -- is RSMI_STATUS_NOT_SUPPORTED, as on a card without it,
 // and setting anything is refused the same way: nothing here is a knob.
 //
@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "vgpu/amd_chip.hpp"
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/machine.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -399,10 +400,20 @@ RSMI_API int rsmi_dev_power_cap_range_get(uint32_t d, uint32_t, uint64_t* max, u
   *min = 0;
   return kSuccess;
 }
-// No energy is integrated over time: the power model has no history.
-RSMI_API int rsmi_dev_energy_count_get(uint32_t d, uint64_t*, float*, uint64_t*) {
+// The energy accumulator: `power` is a count of `counter_resolution` micro
+// joules (15.3, as the library's kEnergyCounterResolution), so the energy is
+// their product in uJ; `timestamp` is the metrics table's system_clock_counter
+// (ns). Only Instinct GPUs have one (a Radeon's driver has no energy file), and
+// the value is amdsmi_get_energy_count's: one accumulator serves both libraries.
+RSMI_API int rsmi_dev_energy_count_get(uint32_t d, uint64_t* power, float* counter_resolution, uint64_t* timestamp) {
+  if (!power || !timestamp) return kInvalidArgs;
   DEVICE(d, s);
-  return kNotSupported;
+  if (s.architecture[0] != 'c') return kNotSupported;
+  const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
+  *power = e.ticks;
+  *timestamp = e.timestamp_ns;
+  if (counter_resolution) *counter_resolution = vgpu::amd::kEnergyTickUj;
+  return kSuccess;
 }
 
 RSMI_API int rsmi_dev_busy_percent_get(uint32_t d, uint32_t* pct) {

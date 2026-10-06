@@ -20,11 +20,13 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "vgpu/amd_chip.hpp"
 #include "vgpu/amd_kfd.hpp"
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/machine.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -461,7 +463,7 @@ AMDSMI_API int amdsmi_get_gpu_topo_numa_affinity(void* h, int32_t* node) {
 //   * Compute and memory partitions: CDNA3 and CDNA4 (MI300X, MI325X, MI350X).
 // Assumptions with no profile datum behind them are marked where they are made.
 // Layouts are those of amdsmi.h 26.2 (checked by size and offset below).
-// Not modelled, still NOT_SUPPORTED: gpu_metrics, violation status, energy,
+// Not modelled, still NOT_SUPPORTED: violation status,
 // PCIe throughput, bad-page threshold, every setter and reset.
 
 namespace {
@@ -554,6 +556,72 @@ static_assert(offsetof(XgmiInfo, xgmi_hive_id) == 8 && offsetof(XgmiInfo, index)
               offsetof(ProcInfo, memory_usage) == 336 && offsetof(ProcInfo, container_name) == 400 &&
               offsetof(ProcInfo, cu_occupancy) == 656);
 
+struct XcpMetrics {  // amdsmi_gpu_xcp_metrics_t
+  uint32_t gfx_busy_inst[8];
+  uint16_t jpeg_busy[40];
+  uint16_t vcn_busy[4];
+  uint64_t gfx_busy_acc[8];
+  uint64_t gfx_below_host_limit_acc[8];
+  uint64_t gfx_below_host_limit_ppt_acc[8];
+  uint64_t gfx_below_host_limit_thm_acc[8];
+  uint64_t gfx_low_utilization_acc[8];
+  uint64_t gfx_below_host_limit_total_acc[8];
+};
+struct GpuMetrics {  // amdsmi_gpu_metrics_t, ROCm 7.2.0's (content revision 1.7)
+  struct {
+    uint16_t structure_size;
+    uint8_t format_revision, content_revision;
+  } common_header;
+  uint16_t temperature_edge, temperature_hotspot, temperature_mem, temperature_vrgfx, temperature_vrsoc,
+      temperature_vrmem;
+  uint16_t average_gfx_activity, average_umc_activity, average_mm_activity;
+  uint16_t average_socket_power;
+  uint64_t energy_accumulator, system_clock_counter;
+  uint16_t average_gfxclk_frequency, average_socclk_frequency, average_uclk_frequency, average_vclk0_frequency,
+      average_dclk0_frequency, average_vclk1_frequency, average_dclk1_frequency;
+  uint16_t current_gfxclk, current_socclk, current_uclk, current_vclk0, current_dclk0, current_vclk1,
+      current_dclk1;
+  uint32_t throttle_status;
+  uint16_t current_fan_speed, pcie_link_width, pcie_link_speed;
+  uint32_t gfx_activity_acc, mem_activity_acc;
+  uint16_t temperature_hbm[4];
+  uint64_t firmware_timestamp;
+  uint16_t voltage_soc, voltage_gfx, voltage_mem;
+  uint64_t indep_throttle_status;
+  uint16_t current_socket_power;
+  uint16_t vcn_activity[4];
+  uint32_t gfxclk_lock_status;
+  uint16_t xgmi_link_width, xgmi_link_speed;
+  uint64_t pcie_bandwidth_acc, pcie_bandwidth_inst, pcie_l0_to_recov_count_acc, pcie_replay_count_acc,
+      pcie_replay_rover_count_acc;
+  uint64_t xgmi_read_data_acc[8], xgmi_write_data_acc[8];
+  uint16_t current_gfxclks[8], current_socclks[4], current_vclk0s[4], current_dclk0s[4];
+  uint16_t jpeg_activity[32];
+  uint32_t pcie_nak_sent_count_acc, pcie_nak_rcvd_count_acc;
+  uint64_t accumulation_counter, prochot_residency_acc, ppt_residency_acc, socket_thm_residency_acc,
+      vr_thm_residency_acc, hbm_thm_residency_acc;
+  uint16_t num_partition;
+  XcpMetrics xcp_stats[8];
+  uint32_t pcie_lc_perf_other_end_recovery;
+  uint64_t vram_max_bandwidth;
+  uint16_t xgmi_link_status[8];
+};
+// Sizes and offsets of amdsmi_gpu_metrics_t as compiled from rocm-7.2.0's amdsmi.h.
+static_assert(sizeof(XcpMetrics) == 504 && sizeof(GpuMetrics) == 4544);
+static_assert(offsetof(GpuMetrics, temperature_hotspot) == 6 && offsetof(GpuMetrics, average_gfx_activity) == 16 &&
+              offsetof(GpuMetrics, energy_accumulator) == 24 && offsetof(GpuMetrics, system_clock_counter) == 32 &&
+              offsetof(GpuMetrics, current_gfxclk) == 54 && offsetof(GpuMetrics, throttle_status) == 68 &&
+              offsetof(GpuMetrics, pcie_link_width) == 74 && offsetof(GpuMetrics, gfx_activity_acc) == 80 &&
+              offsetof(GpuMetrics, temperature_hbm) == 88 && offsetof(GpuMetrics, firmware_timestamp) == 96 &&
+              offsetof(GpuMetrics, indep_throttle_status) == 112 && offsetof(GpuMetrics, current_socket_power) == 120 &&
+              offsetof(GpuMetrics, vcn_activity) == 122 && offsetof(GpuMetrics, gfxclk_lock_status) == 132 &&
+              offsetof(GpuMetrics, pcie_bandwidth_acc) == 144 && offsetof(GpuMetrics, pcie_replay_count_acc) == 168 &&
+              offsetof(GpuMetrics, xgmi_read_data_acc) == 184 && offsetof(GpuMetrics, current_gfxclks) == 312 &&
+              offsetof(GpuMetrics, jpeg_activity) == 352 && offsetof(GpuMetrics, pcie_nak_sent_count_acc) == 416 &&
+              offsetof(GpuMetrics, accumulation_counter) == 424 && offsetof(GpuMetrics, num_partition) == 472 &&
+              offsetof(GpuMetrics, xcp_stats) == 480 && offsetof(GpuMetrics, pcie_lc_perf_other_end_recovery) == 4512 &&
+              offsetof(GpuMetrics, vram_max_bandwidth) == 4520 && offsetof(GpuMetrics, xgmi_link_status) == 4528);
+
 // amdsmi_gpu_block_t: one bit each. The blocks an ECC card reports are the
 // ones ROCm SMI's library reports (rocm_smi.cpp).
 constexpr uint64_t kBlockUmc = 1, kBlockSdma = 2, kBlockGfx = 4, kBlockMmhub = 8, kBlockPcieBif = 0x20,
@@ -562,8 +630,8 @@ constexpr uint64_t kEccBlocks = kBlockUmc | kBlockSdma | kBlockGfx | kBlockMmhub
                                 kBlockXgmiWafl;
 enum RasState : int { kRasDisabled = 1, kRasEnabled = 6 };  // amdsmi_ras_err_state_t
 enum TempType : int { kTempEdge = 0, kTempHotspot = 1, kTempVram = 2, kTempHbm0 = 3, kTempHbm3 = 6 };
-enum TempMetric : int { kTempCurrent = 0, kTempMax = 1, kTempCritical = 5 };
-enum ClkType : int { kClkGfx = 0, kClkMem = 4 };
+enum TempMetric : int { kTempCurrent = 0, kTempMax = 1, kTempCritical = 5, kTempEmergency = 7 };
+enum ClkType : int { kClkGfx = 0, kClkMem = 4 };   // amdsmi_clk_type_t (GFX is SYS)
 constexpr int kOutOfResources = 15;
 
 vgpu::ras::Counters ras_counters(const Sample& s, bool lifetime) {
@@ -763,6 +831,7 @@ AMDSMI_API int amdsmi_get_gpu_pci_bandwidth(void* h, PcieBandwidth* bw) {
 // profile has one (mi325x's is 0, unknown, so it is refused).
 AMDSMI_API int amdsmi_get_temp_metric(void* h, int type, int metric, int64_t* t) {
   GPU(h, s, t);
+  if (type < 0 || type > 249 || metric < 0 || metric > 14) return kInval;   // amdsmi_temperature_type_t, _metric_t
   uint32_t c = 0;
   if (type == kTempHotspot) c = s.temperature_c;
   else if (type == kTempEdge && !instinct(s)) c = s.temperature_c;
@@ -771,7 +840,7 @@ AMDSMI_API int amdsmi_get_temp_metric(void* h, int type, int metric, int64_t* t)
     c = s.temperature_mem_c ? s.temperature_mem_c : s.temperature_c;
   else return kNotSupported;
   if (metric == kTempCurrent) *t = c;
-  else if ((metric == kTempMax || metric == kTempCritical) && type == kTempHotspot && s.temperature_max_c)
+  else if ((metric == kTempMax || metric == kTempCritical || metric == kTempEmergency) && type == kTempHotspot && s.temperature_max_c)
     *t = s.temperature_max_c;
   else return kNotSupported;
   return kSuccess;
@@ -838,6 +907,130 @@ AMDSMI_API int amdsmi_get_clock_info(void* h, int type, ClkInfo* info) {
   }
   return kSuccess;
 }
+// The clock levels: two, as ROCm SMI's library gives them -- the clock the card
+// runs at below its most (or its idle where it is at the most), and the most.
+// Frequencies are in Hz: the header's field comment says MHz, but its function
+// documentation says Hz, and AMD's implementation passes ROCm SMI's levels
+// (Hz) through, which the CLI divides by 1e6 (amd-smi's fclk).
+namespace {
+// The levels a caller restricted a clock to with amdsmi_set_clk_freq: a mask
+// for each GPU and clock, held by this process (the machine's sample is
+// shared; what a process asks of the driver is its own request).
+std::mutex g_clk_mu;
+uint64_t g_clk_mask[256][2];   // [GPU][0: graphics, 1: memory]; 0 = unrestricted
+
+int clock_index(int type) { return type == kClkGfx ? 0 : type == kClkMem ? 1 : -1; }
+}  // namespace
+
+AMDSMI_API int amdsmi_get_clk_freq(void* h, int type, Frequencies* f) {
+  GPU(h, s, f);
+  const int idx = clock_index(type);
+  if (idx < 0) return kNotSupported;   // fabric, SoC, video, display: not modelled
+  const uint32_t max_mhz = idx == 0 ? s.sm_clock_max_mhz : s.mem_clock_max_mhz;
+  const uint32_t now_mhz = idx == 0 ? s.sm_clock_mhz : s.mem_clock_mhz;
+  const uint32_t idle_mhz = max_mhz / (idx == 0 ? 6 : 5);
+  std::memset(f, 0, sizeof *f);
+  const bool at_max = now_mhz >= max_mhz;
+  f->num_supported = 2;
+  f->frequency[0] = uint64_t{at_max ? idle_mhz : now_mhz} * 1000000;
+  f->frequency[1] = uint64_t{max_mhz} * 1000000;
+  f->current = at_max ? 1 : 0;
+  // A request for one level pins the clock there.
+  std::lock_guard<std::mutex> lock(g_clk_mu);
+  const uint64_t m = g_clk_mask[s_i][idx];
+  if (m == 1 || m == 2) f->current = m == 1 ? 0 : 1;
+  return kSuccess;
+}
+// Limits the clock to the levels whose bits are set. A mask with a level the
+// clock does not have is out of bounds, as is none at all.
+AMDSMI_API int amdsmi_set_clk_freq(void* h, int type, uint64_t mask) {
+  if (!g_init) return kNotInit;
+  const int i = ordinal(h, kGpuBase);
+  if (i < 0) return kNotFound;
+  const int idx = clock_index(type);
+  if (idx < 0) return kNotSupported;
+  if (mask == 0 || (mask & ~uint64_t{3})) return kInputOutOfBounds;
+  std::lock_guard<std::mutex> lock(g_clk_mu);
+  g_clk_mask[i][idx] = mask == 3 ? 0 : mask;
+  return kSuccess;
+}
+
+// The energy accumulator: ticks of `resolution` micro joules (15.3), as ROCm
+// SMI's rsmi_dev_energy_count_get gives it, from the one accumulator both
+// libraries share (vgpu/amd_metrics.hpp). Only Instinct GPUs have it: a
+// Radeon's driver has no energy file.
+AMDSMI_API int amdsmi_get_energy_count(void* h, uint64_t* energy, float* resolution, uint64_t* timestamp) {
+  GPU(h, s, energy);
+  if (!timestamp) return kInval;
+  if (!instinct(s)) return kNotSupported;
+  const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
+  *energy = e.ticks;
+  *timestamp = e.timestamp_ns;
+  if (resolution) *resolution = vgpu::amd::kEnergyTickUj;
+  return kSuccess;
+}
+// The driver's gpu_metrics table (v1.5, as the simulated driver publishes it in
+// sysfs) in AMD SMI's public structure, as the library copies it: header from
+// the table, each field the table has copied across, every other member all
+// ones (N/A). The single-value clocks are the first of the table's arrays, as
+// the library's v1.5 compatibility copy does. Where the table carries no energy
+// accumulator the Instinct GPU's own counter is put in, the one
+// amdsmi_get_energy_count gives. A Radeon's table is the same v1.5 layout.
+AMDSMI_API int amdsmi_get_gpu_metrics_info(void* h, GpuMetrics* out) {
+  GPU(h, s, out);
+  vgpu::amd::MetricsV15 t;
+  const std::string bytes = vgpu::amd::gpu_metrics(s, ras_counters(s, false));
+  if (bytes.size() != sizeof t) return kNotSupported;
+  std::memcpy(&t, bytes.data(), sizeof t);
+  std::memset(out, 0xFF, sizeof *out);
+  out->common_header = {t.structure_size, t.format_revision, t.content_revision};
+  out->temperature_hotspot = t.temperature_hotspot;
+  out->temperature_mem = t.temperature_mem;
+  out->temperature_vrsoc = t.temperature_vrsoc;
+  out->current_socket_power = t.curr_socket_power;
+  out->average_gfx_activity = t.average_gfx_activity;
+  out->average_umc_activity = t.average_umc_activity;
+  std::memcpy(out->vcn_activity, t.vcn_activity, sizeof t.vcn_activity);
+  std::memcpy(out->jpeg_activity, t.jpeg_activity, sizeof t.jpeg_activity);
+  out->energy_accumulator = t.energy_accumulator;
+  out->system_clock_counter = t.system_clock_counter;
+  if (instinct(s) && t.energy_accumulator == kNone64) {
+    const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
+    out->energy_accumulator = e.ticks;
+    out->system_clock_counter = e.timestamp_ns;
+  }
+  out->throttle_status = t.throttle_status;
+  out->gfxclk_lock_status = t.gfxclk_lock_status;
+  out->pcie_link_width = t.pcie_link_width;
+  out->pcie_link_speed = t.pcie_link_speed;
+  out->xgmi_link_width = t.xgmi_link_width;
+  out->xgmi_link_speed = t.xgmi_link_speed;
+  out->gfx_activity_acc = t.gfx_activity_acc;
+  out->mem_activity_acc = t.mem_activity_acc;
+  out->pcie_bandwidth_acc = t.pcie_bandwidth_acc;
+  out->pcie_bandwidth_inst = t.pcie_bandwidth_inst;
+  out->pcie_l0_to_recov_count_acc = t.pcie_l0_to_recov_count_acc;
+  out->pcie_replay_count_acc = t.pcie_replay_count_acc;
+  out->pcie_replay_rover_count_acc = t.pcie_replay_rover_count_acc;
+  out->pcie_nak_sent_count_acc = t.pcie_nak_sent_count_acc;
+  out->pcie_nak_rcvd_count_acc = t.pcie_nak_rcvd_count_acc;
+  std::memcpy(out->xgmi_read_data_acc, t.xgmi_read_data_acc, sizeof t.xgmi_read_data_acc);
+  std::memcpy(out->xgmi_write_data_acc, t.xgmi_write_data_acc, sizeof t.xgmi_write_data_acc);
+  out->firmware_timestamp = t.firmware_timestamp;
+  std::memcpy(out->current_gfxclks, t.current_gfxclk, sizeof t.current_gfxclk);
+  std::memcpy(out->current_socclks, t.current_socclk, sizeof t.current_socclk);
+  std::memcpy(out->current_vclk0s, t.current_vclk0, sizeof t.current_vclk0);
+  std::memcpy(out->current_dclk0s, t.current_dclk0, sizeof t.current_dclk0);
+  out->current_uclk = t.current_uclk;
+  out->current_gfxclk = out->current_gfxclks[0];
+  out->current_socclk = out->current_socclks[0];
+  out->current_vclk0 = out->current_vclk0s[0];
+  out->current_vclk1 = out->current_vclk0s[1];
+  out->current_dclk0 = out->current_dclk0s[0];
+  out->current_dclk1 = out->current_dclk0s[1];
+  return kSuccess;
+}
+
 // The graphics core's voltage now, in millivolts.
 AMDSMI_API int amdsmi_get_gpu_volt_metric(void* h, int type, int metric, int64_t* mv) {
   GPU(h, s, mv);
