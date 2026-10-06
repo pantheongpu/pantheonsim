@@ -501,6 +501,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // carries out -- the carry ptxas feeds a 64-bit negate's high word.
         if (!hi && ins.src[0].neg)
           sum = static_cast<uint64_t>(static_cast<uint32_t>(~(s >= 32 ? 0 : a << s))) + 1 + b + cin;
+        // LEA Rd, P, Ra, -Rb: likewise the adder takes ~Rb + 1, so a zero Rb carries out. ival() has already
+        // negated b (0 stays 0), which loses that carry, and the carry feeds the next LEA.HI.X / IADD3.X of a
+        // 64-bit index (im2col's `h_im * width - pad`); with pad 0 the high word came out 0xffffffff.
+        if (ins.src[1].neg && b == 0) sum += uint64_t{1} << 32;
         write32(w, ins.dst[0], l, static_cast<uint32_t>(sum));
         if (has_p) set_pred(w, ins.dst[1], l, (sum >> 32) != 0);
       });
@@ -1144,7 +1148,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
           const uint32_t t = three ? top[l] : static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
           shifted = static_cast<uint32_t>(((a[l] | (static_cast<uint64_t>(t) << 32)) << sh) >> 32);
         }
-        const uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
+        uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
+        if (ins.src[1].neg && b[l] == 0) sum += uint64_t{1} << 32;   // -0 is ~0 + 1: it carries out (see the general rule)
         r[l] = static_cast<uint32_t>(sum);
         carry |= static_cast<Mask>(sum >> 32 != 0) << l;
       }
