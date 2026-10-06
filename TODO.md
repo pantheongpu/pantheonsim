@@ -729,7 +729,7 @@ instance runs CUDA 12.8, so it also covers the older toolkit's LZ4 fatbins,
 its cudaGetDeviceProperties_v2 spelling and its soname majors; the 8x is
 sm_80, a second architecture.
 
-Not yet: `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
+Not yet: `nvidia-smi topo -m`; DCGM's NVML half is answered (docs/telemetry.md), DCGM itself has not been run. PyTorch also ships thousands of its own kernels,
 which would run on the interpreter, so `import torch` finding a usable GPU is
 still a separate question from library coverage.
 
@@ -862,7 +862,9 @@ narrows what counts as observable, not what the detector looks at.
   and diagnostic queries"): ECC by location, retired pages and remapped rows
   per card family, clock-event reasons and violation times, PCIe replays,
   NVLink state and error counters on the SXM profiles, accounting, and
-  `nvidia-smi -r` and `nvlink -s/-e`. Not yet: NVLink error injection, the
+  `nvidia-smi -r` and `nvlink -s/-e`; DCGM's other NVML reads too (energy
+  counter, brand and board id, topology and affinity, supported and application
+  clocks). Not yet: NVLink error injection, the
   row-remapper bank histogram (needs a bank count per card), real retired
   page addresses, `-q -x` for the new sections, a persistent accounting mode
   and ECC mode changes.

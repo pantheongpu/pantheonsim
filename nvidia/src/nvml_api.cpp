@@ -27,6 +27,7 @@
 #include <vector>
 #include <thread>
 
+#include "vgpu/host_cpus.hpp"
 #include "vgpu/profile.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -152,6 +153,50 @@ nvmlReturn_t copy_string(const char* src, char* dst, unsigned int len) {
   if (need > len) return NVML_ERROR_INSUFFICIENT_SIZE;
   std::memcpy(dst, src, need);
   return NVML_SUCCESS;
+}
+
+
+// Microseconds the device has spent in any of the clock-event reasons in
+// `mask`, from the windows `vgpu fault throttle` opens.
+uint64_t reason_time_us(const std::string& uuid, uint64_t mask) {
+  uint64_t us = 0;
+  try {
+    for (uint64_t bit = 1; bit && bit <= mask; bit <<= 1)
+      if (mask & bit) us += vgpu::ras::throttle_time_us(uuid, bit);
+  } catch (const std::exception&) {
+  }
+  return us;
+}
+
+// The clock-event reasons a performance policy counts, by the NVML field id
+// that reports it (NVML_FI_DEV_PERF_POLICY_* and the CLOCKS_EVENT_REASON_*
+// counters). Sync boost, low utilization, reliability and the application and
+// base clock totals are reasons VirtualGPU never raises, so they have no
+// reasons here (0) and are NOT_SUPPORTED, not zero, where a caller asks.
+uint64_t policy_reasons(unsigned field) {
+  switch (field) {
+    case 74: return vgpu::ras::kSwPowerCap | vgpu::ras::kHwPowerBrakeSlowdown;
+    case 75: return vgpu::ras::kSwThermalSlowdown | vgpu::ras::kHwThermalSlowdown;
+    case 77: return vgpu::ras::kHwPowerBrakeSlowdown | vgpu::ras::kHwSlowdown;
+    case 269: return vgpu::ras::kSwThermalSlowdown;
+    case 270: return vgpu::ras::kHwThermalSlowdown;
+    case 271: return vgpu::ras::kHwPowerBrakeSlowdown;
+    default: return 0;
+  }
+}
+
+// The energy counter, in millijoules: the model's power integrated over the
+// time between readings. NVML's counts from driver load, which here is the
+// process's first reading, so the figure is monotonic within a process (DCGM's
+// hostengine, a monitoring loop) and starts again from zero in the next.
+unsigned long long energy_mj(unsigned int idx, const vgpu::telemetry::DeviceSample& d) {
+  static double mj[vgpu::telemetry::kMaxDevices] = {};
+  static std::chrono::steady_clock::time_point last[vgpu::telemetry::kMaxDevices] = {};
+  const auto now = std::chrono::steady_clock::now();
+  if (last[idx].time_since_epoch().count() != 0)
+    mj[idx] += d.power_mw * std::chrono::duration<double>(now - last[idx]).count();
+  last[idx] = now;
+  return static_cast<unsigned long long>(mj[idx]);
 }
 
 }  // namespace
@@ -851,8 +896,16 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBAR1MemoryInfo(nvmlDevice_t, nvmlBAR1Memor
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetVbiosVersion(nvmlDevice_t, char*, unsigned int) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;   // a virtual device has no VBIOS
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEnergyConsumption(nvmlDevice_t, unsigned long long*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEnergyConsumption(nvmlDevice_t device,
+                                                             unsigned long long* energy) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  unsigned int idx;
+  if (!d || !energy || !index_of(device, &idx)) return bad(device);
+  *energy = energy_mj(idx, *d);
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t*,
                                                          unsigned int* count, unsigned long long) {
@@ -885,26 +938,6 @@ using Dev = vgpu::telemetry::DeviceSample;
 // what nvidia-smi's clocks_event_reasons.supported answers too. Board-limit
 // and reliability (bits 9 and 10) are newer than any measured card.
 constexpr unsigned long long kSupportedClockEvents = 0x1FF;
-
-// The reasons active now: GPU idle whenever the device is, as a real idle card
-// reports it, plus whatever `vgpu fault throttle` made active.
-unsigned long long current_clock_events(const Dev& d) {
-  return (d.utilization_gpu == 0 ? vgpu::ras::kGpuIdle : 0) | d.clock_event_reasons;
-}
-
-// Nanoseconds the clocks were held down by any of these reasons, summed over
-// every window `vgpu fault throttle` has opened. Zero until something is
-// injected: nothing throttles a simulated clock on its own.
-unsigned long long throttle_ns(const Dev& d, unsigned long long reasons) {
-  unsigned long long us = 0;
-  for (unsigned long long bit = 1; bit <= reasons; bit <<= 1)
-    if (reasons & bit) us += vgpu::ras::throttle_time_us(d.uuid, bit);
-  return us * 1000;
-}
-constexpr unsigned long long kPowerReasons =
-    vgpu::ras::kSwPowerCap | vgpu::ras::kHwPowerBrakeSlowdown;
-constexpr unsigned long long kThermalReasons =
-    vgpu::ras::kSwThermalSlowdown | vgpu::ras::kHwThermalSlowdown;
 
 // The minimum a power limit can be set to. The profile carries only the
 // limit, so this is the same half of it nvmlDeviceGetPowerManagementLimitConstraints
@@ -1003,11 +1036,15 @@ void health_field(const Dev& d, const vgpu::ras::State& rs, nvmlFieldValue_t* v)
        : id == 144 ? (life.rows_pending ? 1u : 0u) : (life.rows_failure ? 1u : 0u));
     return;
   }
-  // Time spent below the application clocks, by policy, in nanoseconds. Only
-  // power and thermal are modelled; the other policies need state a simulated
-  // card does not have.
-  if (id == 74) { ull(throttle_ns(d, kPowerReasons)); return; }
-  if (id == 75) { ull(throttle_ns(d, kThermalReasons)); return; }
+  // Time spent below the application clocks, by policy, in nanoseconds, and the
+  // clock-event reason counters (269-271), which are the same measure by
+  // reason. Power, thermal and board limit are modelled; the other policies
+  // need state a simulated card does not have.
+  if (const unsigned long long reasons = policy_reasons(id)) {
+    ull(reason_time_us(d.uuid, reasons) * 1000);
+    return;
+  }
+  if (id == 230) { ui(0); return; }   // GPU recovery action: none needed
   // Power, in milliwatts. The average over a second is documented as Ampere
   // (except GA100) and newer only; the rest are on every card.
   switch (id) {
@@ -1071,6 +1108,20 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
     }
     return pcie.pcie[static_cast<uint32_t>(c)];
   };
+  // What DCGM's cache manager reads through this call: ECC by location, page
+  // retirement and row remapping, the time spent in each clock-event reason, and
+  // the energy counter. All from the same state the dedicated entry points read.
+  const vgpu::ras::State ras_state = d ? vgpu::ras::read(d->uuid) : vgpu::ras::State{};
+  auto set_ull = [](nvmlFieldValue_t& v, unsigned long long n) {
+    v.valueType = NVML_VALUE_TYPE_UNSIGNED_LONG_LONG;
+    v.value.ullVal = n;
+    v.nvmlReturn = NVML_SUCCESS;
+  };
+  auto set_uint = [](nvmlFieldValue_t& v, unsigned int n) {
+    v.valueType = NVML_VALUE_TYPE_UNSIGNED_INT;
+    v.value.uiVal = n;
+    v.nvmlReturn = NVML_SUCCESS;
+  };
   for (int i = 0; i < count; ++i) {
     nvmlFieldValue_t& v = values[i];
     v.nvmlReturn = NVML_ERROR_NOT_SUPPORTED;
@@ -1096,7 +1147,17 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
         }
         break;
       default:
-        if (d) health_field(*d, rs, &v);
+        if (!d) break;
+        if (v.fieldId == 83) {   // total energy, as the dedicated entry point reads it
+          unsigned int at;
+          if (index_of(device, &at)) {
+            v.valueType = NVML_VALUE_TYPE_UNSIGNED_LONG_LONG;
+            v.value.ullVal = energy_mj(at, *d);
+            v.nvmlReturn = NVML_SUCCESS;
+          }
+          break;
+        }
+        health_field(*d, rs, &v);
         break;
     }
   }
@@ -1271,17 +1332,18 @@ namespace {
   if (!d_) return bad(device)
 
 // Retired-page addresses are not kept -- the state counts pages, not where
-// they were. A tool needs distinct, stable addresses to list, so these are
-// derived from the device UUID and the page's index: aligned to 64 KiB and
-// inside the framebuffer, and the same on every query. They are placeholders,
+// they were. A tool needs distinct, stable addresses to list, so they are
+// derived from the device UUID and the page's index: aligned to 64 KiB, inside
+// the framebuffer, consecutive frames within a cause, and the same on every
+// query. The two causes start half the framebuffer apart, so no page is listed
+// twice (while fewer than half the frames are retired). They are placeholders,
 // not hardware addresses.
 unsigned long long synthetic_page(const Dev& d, unsigned cause, unsigned index) {
   uint64_t h = 1469598103934665603ull;
   for (const char* c = d.uuid; *c; ++c) h = (h ^ static_cast<unsigned char>(*c)) * 1099511628211ull;
-  h = (h ^ (cause * 2654435761ull + index)) * 1099511628211ull;
   h ^= h >> 29;
   const uint64_t pages = d.vram_total_bytes >> 16;
-  return pages ? (h % pages) << 16 : 0;
+  return pages ? ((h + cause * (pages / 2) + index) % pages) << 16 : 0;
 }
 
 // Accounting mode is the driver's, not a process's: it outlives nvmlShutdown,
@@ -1453,46 +1515,45 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedClocksThrottleReasons(nvmlDevice_
   *reasons = kSupportedClockEvents;
   return NVML_SUCCESS;
 }
-// Toolkit 13 renamed throttle reasons to clock-event reasons and kept both.
-#ifdef nvmlClocksEventReasonGpuIdle
+// Toolkit 13 renamed throttle reasons to clock-event reasons and kept both; older
+// headers lack the new names, so they are declared here by their plain-C types.
+extern "C" {
+nvmlReturn_t nvmlDeviceGetCurrentClocksEventReasons(nvmlDevice_t, unsigned long long*);
+nvmlReturn_t nvmlDeviceGetSupportedClocksEventReasons(nvmlDevice_t, unsigned long long*);
+}
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedClocksEventReasons(nvmlDevice_t device,
                                                                   unsigned long long* reasons) {
   REQUIRE_INIT();
-  HEALTH_DEVICE(d);
-  if (!reasons) return NVML_ERROR_INVALID_ARGUMENT;
-  (void)d;
-  *reasons = kSupportedClockEvents;
-  return NVML_SUCCESS;
+  return nvmlDeviceGetSupportedClocksThrottleReasons(device, reasons);
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrentClocksEventReasons(nvmlDevice_t device,
                                                                 unsigned long long* reasons) {
   REQUIRE_INIT();
-  HEALTH_DEVICE(d);
-  if (!reasons) return NVML_ERROR_INVALID_ARGUMENT;
-  *reasons = current_clock_events(*d);
-  return NVML_SUCCESS;
+  return nvmlDeviceGetCurrentClocksThrottleReasons(device, reasons);   // the renamed query
 }
-#endif
 
 // How long the clocks were held below the application clocks by a policy.
 // referenceTime is a CPU timestamp in microseconds and violationTime is in
-// nanoseconds, as nvml.h says. Power and thermal are modelled, from the
-// windows `vgpu fault throttle` opens; the other policies (sync boost, board
-// limit, low utilization, reliability, the totals) need state a simulated
-// card does not have and are NOT_SUPPORTED.
+// nanoseconds, as nvml.h says; NVVS compares two readings and fails a run whose
+// thermal or power violation time grew. Power, thermal and board limit are
+// modelled, from the windows `vgpu fault throttle` opens; the other policies
+// (sync boost, low utilization, reliability, the totals) need state a simulated
+// card does not have and are NOT_SUPPORTED. Policy numbers are NVML's: power 0,
+// thermal 1, sync boost 2, board limit 3, low utilization 4, reliability 5,
+// total app clocks 10, total base clocks 11; any other is INVALID_ARGUMENT.
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetViolationStatus(nvmlDevice_t device,
                                                       nvmlPerfPolicyType_t policy,
                                                       nvmlViolationTime_t* violation) {
   REQUIRE_INIT();
   HEALTH_DEVICE(d);
   if (!violation) return NVML_ERROR_INVALID_ARGUMENT;
-  if (static_cast<int>(policy) < 0 || static_cast<int>(policy) >= static_cast<int>(NVML_PERF_POLICY_COUNT))
-    return NVML_ERROR_INVALID_ARGUMENT;
-  if (policy != NVML_PERF_POLICY_POWER && policy != NVML_PERF_POLICY_THERMAL)
-    return NVML_ERROR_NOT_SUPPORTED;
+  static const int kField[12] = {74, 75, 76, 77, 78, 79, -1, -1, -1, -1, 80, 81};
+  const int p = static_cast<int>(policy);
+  if (p < 0 || p > 11 || kField[p] < 0) return NVML_ERROR_INVALID_ARGUMENT;
+  const unsigned long long reasons = policy_reasons(static_cast<unsigned>(kField[p]));
+  if (!reasons) return NVML_ERROR_NOT_SUPPORTED;
   violation->referenceTime = static_cast<unsigned long long>(now_us());
-  violation->violationTime =
-      throttle_ns(*d, policy == NVML_PERF_POLICY_POWER ? kPowerReasons : kThermalReasons);
+  violation->violationTime = reason_time_us(d->uuid, reasons) * 1000;
   return NVML_SUCCESS;
 }
 
@@ -1636,6 +1697,209 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetNvLinkRemotePciInfo(nvmlDevice_t device, u
                                                           nvmlPciInfo_t* pci) {
   REQUIRE_INIT();
   return nvmlDeviceGetNvLinkRemotePciInfo_v2(device, link, pci);
+}
+
+/* identity */
+
+// Datacenter cards are Tesla as NVML brands them; the profile's name says the rest.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBrand(nvmlDevice_t device, nvmlBrandType_t* type) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !type) return bad(device);
+  const std::string name = d->name;
+  auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
+  *type = has("GeForce") ? NVML_BRAND_GEFORCE
+          : has("TITAN") ? NVML_BRAND_TITAN
+          : has("Quadro") ? NVML_BRAND_QUADRO
+          : has("RTX")   ? NVML_BRAND_NVIDIA_RTX
+                         : NVML_BRAND_TESLA;
+  return NVML_SUCCESS;
+}
+// One board per GPU, told apart by where it sits on the bus.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBoardId(nvmlDevice_t device, unsigned int* id) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !id) return bad(device);
+  unsigned int domain = 0, bus = 0, dev_id = 0;
+  std::sscanf(d->bus_id, "%x:%x:%x", &domain, &bus, &dev_id);
+  *id = bus << 8 | dev_id;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMultiGpuBoard(nvmlDevice_t device, unsigned int* multi) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !multi) return bad(device);
+  *multi = 0;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBusType(nvmlDevice_t device, nvmlBusType_t* type) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !type) return bad(device);
+  *type = NVML_BUS_TYPE_PCIE;
+  return NVML_SUCCESS;
+}
+// A virtual device has no infoROM, as it has no VBIOS and no serial number.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetInforomVersion(nvmlDevice_t, nvmlInforomObject_t, char*,
+                                                     unsigned int) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetInforomImageVersion(nvmlDevice_t, char*, unsigned int) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceValidateInforom(nvmlDevice_t) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+/* clocks */
+
+// The simulated memory clock does not step: one supported memory clock, the
+// profile's, and graphics clocks from the profile's maximum down in the 15 MHz
+// steps real boards use, to the 210 MHz floor they idle at.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedMemoryClocks(nvmlDevice_t device,
+                                                            unsigned int* count,
+                                                            unsigned int* clocks) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !count) return bad(device);
+  if (!d->mem_clock_max_mhz) return NVML_ERROR_NOT_SUPPORTED;
+  const unsigned int have = *count;
+  *count = 1;
+  if (!clocks || have < 1) return NVML_ERROR_INSUFFICIENT_SIZE;
+  clocks[0] = d->mem_clock_max_mhz;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedGraphicsClocks(nvmlDevice_t device,
+                                                              unsigned int memory_mhz,
+                                                              unsigned int* count,
+                                                              unsigned int* clocks) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !count) return bad(device);
+  if (!d->sm_clock_max_mhz) return NVML_ERROR_NOT_SUPPORTED;
+  if (memory_mhz != d->mem_clock_max_mhz) return NVML_ERROR_INVALID_ARGUMENT;
+  constexpr unsigned int kFloor = 210, kStep = 15;
+  const unsigned int top = d->sm_clock_max_mhz;
+  const unsigned int n = top > kFloor ? (top - kFloor) / kStep + 1 : 1;
+  const unsigned int have = *count;
+  *count = n;
+  if (!clocks || have < n) return NVML_ERROR_INSUFFICIENT_SIZE;
+  for (unsigned int i = 0; i < n; ++i) clocks[i] = top - i * kStep;
+  return NVML_SUCCESS;
+}
+// The application clocks are the maximum clocks, which is what a card nobody
+// has set application clocks on runs at; so are the customer boost maximum.
+static nvmlReturn_t max_clock_of(nvmlDevice_t device, nvmlClockType_t type, unsigned int* mhz) {
+  return nvmlDeviceGetMaxClockInfo(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetApplicationsClock(nvmlDevice_t device, nvmlClockType_t type,
+                                                        unsigned int* mhz) {
+  REQUIRE_INIT(); return max_clock_of(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDefaultApplicationsClock(nvmlDevice_t device,
+                                                               nvmlClockType_t type,
+                                                               unsigned int* mhz) {
+  REQUIRE_INIT(); return max_clock_of(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxCustomerBoostClock(nvmlDevice_t device,
+                                                            nvmlClockType_t type,
+                                                            unsigned int* mhz) {
+  REQUIRE_INIT(); return max_clock_of(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetClock(nvmlDevice_t device, nvmlClockType_t type,
+                                            nvmlClockId_t id, unsigned int* mhz) {
+  REQUIRE_INIT();
+  return id == NVML_CLOCK_ID_CURRENT ? nvmlDeviceGetClockInfo(device, type, mhz)
+                                     : max_clock_of(device, type, mhz);
+}
+
+/* PCIe link speed, topology, affinity */
+
+// Per-lane speed of the link as trained, in MB/s, by generation.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieSpeed(nvmlDevice_t device, unsigned int* mbps) {
+  REQUIRE_INIT();
+  static const unsigned int kMbps[7] = {0, 2500, 5000, 8000, 16000, 32000, 64000};
+  unsigned int gen = 0;
+  if (!mbps) return NVML_ERROR_INVALID_ARGUMENT;
+  if (const nvmlReturn_t rc = pcie_link(device, &gen, true, true); rc != NVML_SUCCESS) return rc;
+  if (gen < 1 || gen > 6) return NVML_ERROR_NOT_SUPPORTED;
+  *mbps = kMbps[gen];
+  return NVML_SUCCESS;
+}
+// The maximum link speed as NVML_PCIE_LINK_MAX_SPEED_*: 1 is 2500 MB/s, and so
+// on up through the generations.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieLinkMaxSpeed(nvmlDevice_t device, unsigned int* speed) {
+  REQUIRE_INIT();
+  unsigned int gen = 0;
+  if (!speed) return NVML_ERROR_INVALID_ARGUMENT;
+  if (const nvmlReturn_t rc = pcie_link(device, &gen, true, false); rc != NVML_SUCCESS) return rc;
+  if (gen < 1 || gen > 6) return NVML_ERROR_NOT_SUPPORTED;
+  *speed = gen;
+  return NVML_SUCCESS;
+}
+
+// Every GPU sits behind the host bridge: the topology `vgpu smi topo` prints
+// (PHB). The far end of an NVLink is not modelled (see NVLink above), so even
+// the SXM profiles that name their links report the host bridge here.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTopologyCommonAncestor(nvmlDevice_t a, nvmlDevice_t b,
+                                                             nvmlGpuTopologyLevel_t* level) {
+  REQUIRE_INIT();
+  unsigned int ia, ib;
+  if (!index_of(a, &ia)) return bad(a);
+  if (!index_of(b, &ib)) return bad(b);
+  if (!level || ia == ib) return NVML_ERROR_INVALID_ARGUMENT;
+  *level = NVML_TOPOLOGY_HOSTBRIDGE;
+  return NVML_SUCCESS;
+}
+// Peer reads, writes and atomics work between any two devices (cuDeviceCanAccessPeer
+// says so), over PCIe; the NVLink index is NOT_SUPPORTED because no link's remote
+// end is modelled, so no pair of devices is known to be joined by one.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetP2PStatus(nvmlDevice_t a, nvmlDevice_t b,
+                                                nvmlGpuP2PCapsIndex_t cap,
+                                                nvmlGpuP2PStatus_t* status) {
+  REQUIRE_INIT();
+  unsigned int ia, ib;
+  if (!index_of(a, &ia)) return bad(a);
+  if (!index_of(b, &ib)) return bad(b);
+  if (!status || ia == ib) return NVML_ERROR_INVALID_ARGUMENT;
+  switch (static_cast<int>(cap)) {
+    case NVML_P2P_CAPS_INDEX_READ:
+    case NVML_P2P_CAPS_INDEX_WRITE:
+    case NVML_P2P_CAPS_INDEX_ATOMICS:
+    case NVML_P2P_CAPS_INDEX_PCI: *status = NVML_P2P_STATUS_OK; break;
+    case NVML_P2P_CAPS_INDEX_NVLINK: *status = NVML_P2P_STATUS_NOT_SUPPORTED; break;
+    default: return NVML_ERROR_INVALID_ARGUMENT;
+  }
+  return NVML_SUCCESS;
+}
+// The host CPUs, as the bit mask NVML returns, and one memory node.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCpuAffinity(nvmlDevice_t device, unsigned int words,
+                                                  unsigned long* set) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !set || words == 0) return bad(device);
+  constexpr unsigned int kBits = 8 * sizeof(unsigned long);
+  const unsigned int cpus = vgpu::host_cpus();
+  for (unsigned int w = 0; w < words; ++w) {
+    const unsigned int lo = w * kBits;
+    set[w] = lo >= cpus ? 0ul : cpus - lo >= kBits ? ~0ul : (1ul << (cpus - lo)) - 1;
+  }
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryAffinity(nvmlDevice_t device, unsigned int words,
+                                                     unsigned long* set, nvmlAffinityScope_t) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !set || words == 0) return bad(device);
+  for (unsigned int w = 0; w < words; ++w) set[w] = w == 0 ? 1ul : 0ul;
+  return NVML_SUCCESS;
 }
 
 /* -- accounting and processes --
