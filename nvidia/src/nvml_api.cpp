@@ -1873,7 +1873,9 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetP2PStatus(nvmlDevice_t a, nvmlDevice_t b,
     case NVML_P2P_CAPS_INDEX_READ:
     case NVML_P2P_CAPS_INDEX_WRITE:
     case NVML_P2P_CAPS_INDEX_ATOMICS:
-    case NVML_P2P_CAPS_INDEX_PCI: *status = NVML_P2P_STATUS_OK; break;
+    // The PCIe capability: NVML_P2P_CAPS_INDEX_PCI in current headers, NVML_P2P_CAPS_INDEX_PROP in
+    // CUDA 12.0's (the same value, 4; the newer name does not exist there).
+    case 4: *status = NVML_P2P_STATUS_OK; break;
     case NVML_P2P_CAPS_INDEX_NVLINK: *status = NVML_P2P_STATUS_NOT_SUPPORTED; break;
     default: return NVML_ERROR_INVALID_ARGUMENT;
   }
