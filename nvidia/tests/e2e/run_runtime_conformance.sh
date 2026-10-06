@@ -19,7 +19,9 @@ nvcc -std=c++17 -cudart shared -arch=compute_75 -code=compute_75 \
      -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out"
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 rc=0
-result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || rc=$?
+# It fetches a driver function, which loads libcuda beside libcudart:
+# both_shims_env is what a sanitizer build needs for that.
+result="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/t4 VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || rc=$?
 rm -f "$out"
 echo "$result"
 exit $rc

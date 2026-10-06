@@ -20,13 +20,11 @@ read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 "$nvcc_bin" -std=c++17 -arch=sm_75 -cudart shared -Wno-deprecated-gpu-targets "${san_flags[@]}" \
      "$root/nvidia/tests/e2e/reserved_smem_attr.cu" -L"$shim" -lcuda -o "$out" || { echo "FAIL: does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$out"; then exit 0; fi
-# Both libraries carry the simulator's core, which a sanitizer build reports as
-# an ODR violation when one program loads the two (as run_mixed_apis.sh skips).
-if [[ -n "$(shim_sanitizer "$shim")" ]]; then echo "SKIP: a sanitizer build loads two copies of the core"; exit 0; fi
 fail=0
 check() {  # check <gpu> <expected line>
   local got
-  got=$(VGPU_QUIET=1 VGPU_GPU=$1 LD_LIBRARY_PATH="$shim" "$out" 2>&1 | tail -n 1)
+  # libcudart and libcuda both: both_shims_env, for a sanitizer build.
+  got=$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=$1 LD_LIBRARY_PATH="$shim" "$out" 2>&1 | tail -n 1)
   if [[ "$got" == "$2" ]]; then echo "ok    $1: $got"; else echo "FAIL  $1: expected \"$2\", got \"$got\""; fail=1; fi
 }
 check nvidia/rtx3060 "reserved 1024 1024 1024 sm 102400 102400"   # the card's own line
