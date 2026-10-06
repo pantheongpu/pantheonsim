@@ -623,6 +623,37 @@ the fault to fire, and each one caught it, reporting the fault the way it
 would on a card: its kernel's own `printf` (`[SDC FAULT] ...`), then
 "Verification: FAIL".
 
+## ROCm Validation Suite
+
+AMD's open-source [ROCm Validation Suite](https://github.com/ROCm/ROCmValidationSuite)
+(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. It was not built
+or run here (it needs ROCm's HSA, HIP, rocBLAS and AMD SMI development
+packages, which are not installable on this host); its source was read for the
+calls its modules make, and each was checked against what the simulator
+answers. What RVS asks, module by module:
+
+| Module | What it reads | State |
+| --- | --- | --- |
+| `gpup` | `/sys/class/kfd/kfd/topology/nodes/*/{gpu_id,properties,io_links}` | answered by the KFD topology (`src/kfd.cpp`); `caches_count` is 0 and there is no `caches/` directory |
+| every module | `amdsmi_get_gpu_kfd_info`, `amdsmi_get_gpu_bdf_id`, `hipDeviceGetPCIBusId` to tie a HIP device to its KFD node and SMI handle | consistent: same bus, same `kfd_id` |
+| `gm`, `tst`, `pulse`, `iet`, `gst` | `amdsmi_get_temp_metric`, `amdsmi_get_power_info`, `amdsmi_get_power_cap_info`, `amdsmi_get_clk_freq`, `amdsmi_set_clk_freq`, `amdsmi_get_energy_count` | added (`src/amd_smi.cpp`); they were NOT_SUPPORTED stubs |
+| `pebb`, `pbqt` | `hsa_amd_agent_memory_pool_get_info` `NUM_LINK_HOPS` and `LINK_INFO`, async copy and its profiling | `LINK_INFO` added: system memory is one PCI Express hop, an Instinct peer one XGMI hop, a Radeon peer two PCI Express hops, as KFD lists them |
+| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | already run (`tests/hipcc`, `tests/rocblas`); RVS's own kernels are compiled for the card, so they need a gfx942 code object |
+| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`); not exercised through RVS |
+
+The sensors follow each profile's class. Temperatures are degrees (AMD SMI
+converts the driver's millidegrees); an Instinct GPU has a junction and a
+memory sensor (VRAM and HBM) but no edge sensor, a Radeon has edge, junction
+and VRAM. Power is watts, the capability in microwatts; MI300 and newer fill
+`current_socket_power`, the earlier Instinct and Radeon `average_socket_power`,
+the other reading is UINT32_MAX. Clocks have two levels, as ROCm SMI's library
+gives them, and `amdsmi_set_clk_freq` pins one for the calling process (a mask
+of a level the clock lacks is out of bounds). Only Instinct GPUs have the
+energy accumulator (15.3 uJ a tick, counting up from an offset), ECC and
+`XGMI_WAFL` RAS: a Radeon answers NOT_SUPPORTED, or ECC disabled, from its
+profile. `tests/unit/test_amd_smi.cpp` checks all of it on every profile
+(`test_amd_amd_smi_rvs_*`), and `tests/hsa/hsa_dispatch.c` the link info.
+
 | Folder | What |
 | --- | --- |
 | `profiles/` | MI300X, MI325X and MI350X. MI325X was read from a physical card with `tools/rocminfo-to-profile.py`; the others are placeholders, and each file's header says which |
