@@ -228,6 +228,60 @@ VTEST(each_vendor_has_its_own_mmio_registers) {
   }
 }
 
+// UMC ECC, MCA status and thermal registers: offsets are (Aldebaran's IP base
+// + the header's register offset) * 4, the counts follow injected errors, and
+// every one names its header symbol and says it is not measured.
+VTEST(umc_ecc_registers_follow_injected_memory_errors) {
+  TempMachine m("umc");
+  const auto d = device("amd/mi300x");
+  const auto off = [](const char* name) {
+    const auto* r = regs::find(regs::Space::AmdMmio, name);
+    if (!r) throw vtest::Failure(std::string("no register ") + name);
+    return r->offset;
+  };
+  VCHECK_EQ(off("umc0_ch0_ecc_ctrl"), (0x14000u + 0x0053) * 4);
+  VCHECK_EQ(off("umc0_ch0_ecc_err_cnt_sel"), (0x14000u + 0x0328) * 4);
+  VCHECK_EQ(off("umc0_ch0_ecc_err_cnt"), (0x14000u + 0x0329) * 4);
+  VCHECK_EQ(off("umc0_ch3_ecc_err_cnt"), (0x14000u + 0x0f29) * 4);   // regUMCCH3_0_EccErrCnt
+  VCHECK_EQ(off("umc0_mca_status_lo"), (0x14000u + 0x03c2) * 4);     // regMCA_UMC_UMC0_MCUMC_STATUST0
+  VCHECK_EQ(off("thm_tcon_cur_tmp"), (0x16600u + 0x0000) * 4);       // THM_BASE segment 0
+  for (const char* n : {"umc0_ch0_ecc_ctrl", "umc0_ch2_ecc_err_cnt", "umc0_mca_status_hi", "thm_tcon_cur_tmp"}) {
+    const auto* r = regs::find(regs::Space::AmdMmio, n);
+    VCHECK(r->source.find("_offset.h reg") != std::string::npos);
+    VCHECK(r->measured.find("not measured") != std::string::npos);   // the base is assumed
+    VCHECK_EQ(r->status, std::string("model"));
+  }
+  {
+    regs::RegisterSpace clean(regs::Space::AmdMmio, d);
+    for (const char* n : {"umc0_ch0_ecc_err_cnt", "umc0_ch3_ecc_err_cnt", "umc0_mca_status_lo", "umc0_mca_status_hi"})
+      VCHECK_EQ(clean.read(off(n), 4), 0u);   // nothing injected, nothing counted
+    VCHECK_EQ(clean.read(off("umc0_ch0_ecc_ctrl"), 4), 0x401u);   // write and read ECC on
+    VCHECK_EQ(clean.read(off("thm_tcon_cur_tmp"), 4) >> 21, d.temperature_c * 8u);
+    clean.write(off("umc0_ch1_ecc_err_cnt_sel"), 4, 0xffffffffu);
+    VCHECK_EQ(clean.read(off("umc0_ch1_ecc_err_cnt_sel"), 4), 0xb00fu);   // only its fields
+  }
+  ras::inject_ecc(d.uuid, ras::Severity::Corrected, ras::Location::DeviceMemory, 6, ras::Retirement::Rows);
+  {
+    regs::RegisterSpace r(regs::Space::AmdMmio, d);
+    VCHECK_EQ(r.read(off("umc0_ch0_ecc_err_cnt"), 4), 2u);   // 6 shared over the four mapped channels
+    VCHECK_EQ(r.read(off("umc0_ch1_ecc_err_cnt"), 4), 2u);
+    VCHECK_EQ(r.read(off("umc0_ch2_ecc_err_cnt"), 4), 1u);
+    VCHECK_EQ(r.read(off("umc0_ch3_ecc_err_cnt"), 4), 1u);
+    const uint32_t hi = r.read(off("umc0_mca_status_hi"), 4);
+    VCHECK_EQ(hi >> 31, 1u);           // Val
+    VCHECK_EQ((hi >> 14) & 1, 1u);     // CECC
+    VCHECK_EQ((hi >> 29) & 1, 0u);     // not UC
+  }
+  ras::inject_ecc(d.uuid, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, ras::Retirement::Rows);
+  {
+    regs::RegisterSpace r(regs::Space::AmdMmio, d);
+    const uint32_t hi = r.read(off("umc0_mca_status_hi"), 4);
+    VCHECK_EQ((hi >> 29) & 1, 1u);     // UC
+    VCHECK_EQ((hi >> 13) & 1, 1u);     // UECC
+    VCHECK_EQ(r.read(off("umc0_ch0_ecc_err_cnt"), 4), 2u);   // the correctable count is unchanged
+  }
+}
+
 VTEST(engine_status_follows_whether_the_gpu_is_busy) {
   TempMachine m("grbm");
   auto d = device("amd/mi300x");

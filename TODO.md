@@ -871,7 +871,7 @@ narrows what counts as observable, not what the detector looks at.
   card's value to the bit, whether the card is a virtual function, which
   engines a bound driver leaves running, the VBIOS scratch words, the BAR1 and
   BAR2 block registers, and a timer that advances with the engine's clock.
-  Not yet: more AMD blocks (UMC ECC). A C API (vgpu_regs.h,
+  AMD UMC ECC (channels 0-3 of instance 0), its MCA status and the THM temperature are mapped on assumed Aldebaran bases. Not yet: the UMC's other channels and instances (beyond BAR5, via the indirect pair), NBIO PCIe link status, SRBM, XGMI/PCS. A C API (vgpu_regs.h,
   libvgpuregs) gives bring-up software the same access. tools/regprobe
   captures real cards (read-only) to check and map the model against. AMD's
   gpu_metrics table (v1.5), amdgpu's busy and memory files and its hwmon (read
