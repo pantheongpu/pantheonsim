@@ -31,6 +31,7 @@
 
 #include <cuda.h>  // CUDA_VERSION: the toolkit this shim was built against
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -188,6 +189,30 @@ std::vector<std::string> real_nvrtc_candidates() {
   return out;
 }
 
+// libnvrtc.so finds libnvrtc-builtins.so.<major>.<minor> with a plain dlopen by soname when the first
+// compile runs. NVIDIA's pip wheels (nvidia/cu13/lib) keep both in one directory that is on no search path,
+// and the real library is opened RTLD_LOCAL here, so that lookup fails ("failed to open
+// libnvrtc-builtins.so.13.0") and every run-time compile with it fails too. Opening the sibling by full path
+// first makes the later by-name lookup resolve to the already loaded object (same soname).
+void preload_builtins(const std::string& nvrtc_path) {
+  const size_t slash = nvrtc_path.find_last_of('/');
+  if (slash == std::string::npos) return;
+  const std::string dir = nvrtc_path.substr(0, slash);
+  DIR* d = ::opendir(dir.c_str());
+  if (!d) return;
+  std::vector<std::string> names;
+  while (const dirent* e = ::readdir(d)) {
+    const std::string n = e->d_name;
+    // the plain builtins, not the ".alt" variant that goes with libnvrtc.alt.so
+    if (n.rfind("libnvrtc-builtins.so.", 0) == 0) names.push_back(n);
+  }
+  ::closedir(d);
+  for (const std::string& n : names) {
+    void* h = ::dlopen((dir + "/" + n).c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (trace()) std::fprintf(stderr, "[vgpu] nvrtc: preload %s/%s -> %s\n", dir.c_str(), n.c_str(), h ? "ok" : "failed");
+  }
+}
+
 const RealNvrtc* real_nvrtc() {
   static const RealNvrtc* found = [] () -> const RealNvrtc* {
     if (const char* m = std::getenv("VGPU_NVRTC"); m && std::strcmp(m, "nvcc") == 0) return nullptr;
@@ -224,6 +249,7 @@ const RealNvrtc* real_nvrtc() {
       sym(r->log, "nvrtcGetProgramLog");
       sym(r->lowered, "nvrtcGetLoweredName");
       if (ok) {
+        preload_builtins(rp);
         if (trace()) std::fprintf(stderr, "[vgpu] nvrtc: compiling with %s\n", rp.c_str());
         return r;
       }
