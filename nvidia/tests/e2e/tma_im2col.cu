@@ -112,6 +112,59 @@ __global__ void load_columns(const __grid_constant__ CUtensorMap map, Conv cv, f
     out[size_t(blockIdx.x) * kPixels * kC + i] = tile[i];
 }
 
+// A convolution epilogue's store (PTX .im2col_no_offs, SASS UTMASTG.IM2COL),
+// as CUTLASS's sm90 conv2d writes its output: block b fills a 32-pixel
+// column of the output with its own values and stores it through an im2col
+// map of the output (a 1x1 filter, stride 1, no padding) at pixel 32b, with
+// no offsets. Pixels past the tensor's end are not written.
+__global__ void store_columns(const __grid_constant__ CUtensorMap map, int h, int w, float* unused) {
+  __shared__ alignas(128) float tile[kPixels * kC];
+  (void)unused;
+  for (int i = threadIdx.x; i < kPixels * kC; i += blockDim.x) tile[i] = float(blockIdx.x * 1000 + i) + 0.5f;
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int m0 = blockIdx.x * kPixels;
+    const int x = m0 % w, y = (m0 / w) % h, n = m0 / (w * h);
+    asm volatile(
+        "cp.async.bulk.tensor.4d.global.shared::cta.im2col_no_offs.bulk_group [%0, {%2, %3, %4, %5}], [%1];" ::"l"(&map),
+        "r"(smem_u32(tile)), "r"(0), "r"(x), "r"(y), "r"(n)
+        : "memory");
+    asm volatile("cp.async.bulk.commit_group;");
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  }
+}
+
+bool run_store(const char* name, int n, int h, int w) {
+  const int M = n * h * w, blocks = (M + kPixels - 1) / kPixels;
+  float* d_out;
+  CK(cudaMalloc(&d_out, size_t(M) * kC * 4));
+  CK(cudaMemset(d_out, 0, size_t(M) * kC * 4));
+  CUtensorMap map;
+  cuuint64_t dims[4] = {cuuint64_t(kC), cuuint64_t(w), cuuint64_t(h), cuuint64_t(n)};
+  cuuint64_t strides[3] = {uint64_t(kC) * 4, uint64_t(w) * kC * 4, uint64_t(h) * w * kC * 4};
+  int lower[2] = {0, 0}, upper[2] = {0, 0};
+  cuuint32_t estr[4] = {1, 1, 1, 1};
+  CK(encode_im2col()(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, d_out, dims, strides, lower, upper, kC, kPixels,
+                     estr, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                     CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+  store_columns<<<blocks, 128>>>(map, h, w, nullptr);
+  CK(cudaDeviceSynchronize());
+  std::vector<float> got(size_t(M) * kC);
+  CK(cudaMemcpy(got.data(), d_out, got.size() * 4, cudaMemcpyDeviceToHost));
+  int bad = 0;
+  for (int m = 0; m < M; ++m)
+    for (int c = 0; c < kC; ++c) {
+      const int b = m / kPixels, row = m % kPixels;
+      const float want = float(b * 1000 + row * kC + c) + 0.5f;
+      const float have = got[size_t(m) * kC + c];
+      if (have != want && bad++ < 4) std::printf("  %s: pixel %d c=%d: %g, want %g\n", name, m, c, have, want);
+    }
+  std::printf("%s: %d of %d elements wrong\n", name, bad, M * kC);
+  cudaFree(d_out);
+  return bad == 0;
+}
+
 bool run(const Conv& cv) {
   const int P = cv.p(), Q = cv.q(), M = cv.n * P * Q;
   const int tiles = (M + kPixels - 1) / kPixels, taps = cv.r * cv.s;
@@ -185,6 +238,7 @@ int main() {
   ok &= run({"2D 3x3, padding 2, dilation 2",         2, 6, 7, 3, 3, 2, 2, 1, 1, 2, 2, false});
   ok &= run({"2D 2x3, padding 0/1, stride 1/2",       3, 5, 8, 2, 3, 0, 1, 1, 2, 1, 1, false});
   ok &= run({"1D 5-tap, padding 2, stride 3",         3, 1, 20, 1, 5, 0, 2, 1, 3, 1, 1, true});
+  ok &= run_store("store 2x5x7, im2col_no_offs", 2, 5, 7);   // 70 pixels: the last column part outside
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

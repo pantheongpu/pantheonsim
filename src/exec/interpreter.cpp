@@ -46,6 +46,7 @@
 
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/device_printf.hpp"
+#include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -5128,26 +5129,15 @@ class Interpreter {
           case NarrowFmt::E2M3:
           case NarrowFmt::E3M2:
           case NarrowFmt::E2M1: {
-            // NaN goes to the positive largest normal (.satfinite).
             const int eb = fmt == NarrowFmt::E3M2 ? 3 : 2, mb = fmt == NarrowFmt::E2M3 ? 3 : fmt == NarrowFmt::E3M2 ? 2 : 1;
-            const int bias = fmt == NarrowFmt::E3M2 ? 3 : 1;
-            if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);
-            return double_to_small_float(v, eb, mb, bias);
+            return exec::small_float_bits(v, eb, mb, fmt == NarrowFmt::E3M2 ? 3 : 1);
           }
           case NarrowFmt::UE8M0: {
-            // 2^(code - 127), 0xFF NaN; .rz takes the power of two at or
-            // below, .rp the one at or above.
-            if (std::isnan(v)) return 0xFF;
-            if (v < 0)
+            const uint32_t code = exec::ue8m0_bits(v, op->rp, op->satfinite);
+            if (code == ~0u)
               ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
                        "cvt to ue8m0x2 of a negative value, which the ISA does not define");
-            if (v == 0) return 0;
-            if (std::isinf(v)) return op->satfinite ? 0xFE : 0xFF;
-            int e = std::ilogb(v);
-            if (op->rp && std::ldexp(1.0, e) != v) ++e;
-            if (e + 127 < 0) return 0;
-            if (e + 127 > 254) return op->satfinite ? 0xFE : 0xFF;
-            return static_cast<uint32_t>(e + 127);
+            return code;
           }
           case NarrowFmt::S2F6: {
             // An s8 in units of 2^-6; NaN to the positive largest.
@@ -6387,37 +6377,24 @@ class Interpreter {
       // value in the low bits of its byte -- CUTLASS shifts e2m1 up by 2
       // itself before an mma -- or from 8 bytes of .s4, sign-extended.
       const uint32_t R = op.shape == LdmShape::M16N16 ? 16 : 8;
-      const uint32_t bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      exec::LdmRow fmt;
+      fmt.bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      fmt.sign4 = op.fmt == LdmSrc::S4;
       for (uint32_t mat = 0; mat < op.count; ++mat) {
         uint8_t tile[16][16] = {};
         for (uint32_t r = 0; r < R; ++r) {
           const uint32_t src_lane = mat * R + r;
           const uint64_t addr = row_addr(src_lane);
           uint8_t raw[16];
-          for (uint32_t b = 0; b < 16 * bits / 8; ++b)
+          for (uint32_t b = 0; b < fmt.bytes(); ++b)
             raw[b] = static_cast<uint8_t>(load_routed(w, ctx, ins, src_lane, addr + b, 1));
-          for (uint32_t c = 0; c < 16; ++c) {
-            uint32_t v = 0;
-            for (uint32_t k = 0; k < bits; ++k)
-              v |= ((raw[(c * bits + k) / 8] >> ((c * bits + k) % 8)) & 1u) << k;
-            if (op.fmt == LdmSrc::S4 && (v & 8)) v |= 0xF0;
-            tile[r][c] = static_cast<uint8_t>(v);
-          }
+          exec::ldm_unpack_row(raw, fmt, tile[r]);
         }
-        // Figures 108-109: lane t holds four consecutive columns of row t / 4
-        // (and of row t / 4 + 8 in its second register for 16x16), which for
-        // the transposed 16x16 are four stored rows at element t / 4.
         const uint32_t regs = R / 8;
         for (uint32_t rr = 0; rr < regs; ++rr) {
           Lanes out;
           for (uint32_t lane = 0; lane < W_; ++lane)
-            if (m & (Mask{1} << lane)) {
-              const uint32_t row = lane / 4 + 8 * rr, col0 = 4 * (lane % 4);
-              uint32_t word = 0;
-              for (uint32_t j = 0; j < 4; ++j)
-                word |= uint32_t{op.trans ? tile[col0 + j][row] : tile[row][col0 + j]} << (8 * j);
-              out[lane] = word;
-            }
+            if (m & (Mask{1} << lane)) out[lane] = exec::ldm_word(tile, lane, rr, op.trans);
           write_reg(w, op.dsts[mat * regs + rr], m, out, 32);
         }
       }
@@ -12292,6 +12269,23 @@ std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAcces
 double fp8_value(uint32_t byte, bool e5m2) { return fp8_to_double(byte & 0xFF, e5m2 ? kE5M2 : kE4M3); }
 double mx_float_value(uint32_t code, int eb, int mb, int bias) { return small_float_value(code, eb, mb, bias); }
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite) { return double_to_fp8(v, e5m2 ? kE5M2 : kE4M3, satfinite); }
+uint32_t small_float_bits(double v, int eb, int mb, int bias) {
+  if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);   // .satfinite: the positive largest
+  return double_to_small_float(v, eb, mb, bias);
+}
+uint32_t ue8m0_bits(double v, bool round_up, bool satfinite) {
+  if (std::isnan(v)) return 0xFF;
+  if (v < 0) return ~0u;
+  if (v == 0) return 0;
+  if (std::isinf(v)) return satfinite ? 0xFE : 0xFF;
+  int e = std::ilogb(v);
+  if (round_up && std::ldexp(1.0, e) != v) ++e;
+  if (e + 127 < 0) return 0;
+  if (e + 127 > 254) return satfinite ? 0xFE : 0xFF;
+  return static_cast<uint32_t>(e + 127);
+}
+uint16_t f16_bits(double v) { return static_cast<uint16_t>(double_to_f16(v)); }
+uint16_t bf16_bits(double v) { return static_cast<uint16_t>(double_to_bf16(v)); }
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
   validate(fn, cfg, profile);

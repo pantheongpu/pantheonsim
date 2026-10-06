@@ -730,6 +730,7 @@ std::string sreg_name(unsigned idx) {
     case 0x3d: return "SR_REGALLOC";
     case 0x3f: return "SR_GLOBALERRORSTATUS";
     case 0x41: return "SR_WARPERRORSTATUS";
+    case 0x43: return "SR_VIRTUALSMID";
     case 0x50: return "SR_CLOCKLO";
     case 0x88: return "SR_CgaCtaId";   // sm_90: the block's rank in its cluster
     case 0x8a: return "SR_CgaSize";
@@ -1363,21 +1364,46 @@ void dec_i2i(Instr& ins, const Word& w) {
 // 1 PACK_AB_MERGE_C: the pair into c's low half, 4 UNPACK_B: b's two bytes
 // to two halves), 75 .RELU, 79-80 the rounding, 90 .SATFINITE. From sm_89
 // nvdisasm names both types.
+// The narrow formats an F2FP packs to or unpacks from, as one code: kept in
+// f[3] (packed to) or f[4] (unpacked from).
+enum : unsigned { kNarrowE4M3 = 10, kNarrowE5M2, kNarrowE3M2, kNarrowE2M3, kNarrowE2M1, kNarrowUE8M0 };
+
 void dec_f2fp(Instr& ins, const Word& w) {
   ins.op = Op::F2FP;
   ins.mnemonic = "F2FP";
   static const char* const dts[] = {"F16", "BF16", "(2)", "(3)", "(4)", "TF32", "E5M2", "E4M3"};
   static const char* const sts[] = {"F32", "(1)", "E5M2", "E4M3"};
-  const unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
-  // 89: the one-operand forms (88: its source's upper half), 87: MERGE_C.
-  const unsigned mode = w.bit(89) ? 4 : w.bit(87) ? 1 : 0;
-  if (w.bit(75)) ins.mods.push_back("RELU");   // negatives become zero
+  unsigned dt = static_cast<unsigned>(w.field(76, 3)), st = static_cast<unsigned>(w.field(73, 2));
+  // 89: the one-operand forms (88: its source's upper half). Packing to a
+  // narrow type merges into C; 85-87 say which family (4 FP8, 3 FP6, 1 FP4,
+  // 6 UE8M0) and dt which of it. Unpacking, 82-83 say the source's family
+  // (0 FP8, 1 FP6/FP4, 2 UE8M0) and st which of it.
+  const unsigned fam = static_cast<unsigned>(w.field(85, 3)), ufam = static_cast<unsigned>(w.field(82, 2));
+  const unsigned mode = w.bit(89) ? 4 : fam ? 1 : 0;
+  const char* dname = dts[dt];
+  const char* sname = sts[st];
+  unsigned narrow = 0;
+  if (mode == 1) {
+    if (fam == 4) narrow = dt == 7 ? kNarrowE4M3 : dt == 6 ? kNarrowE5M2 : 0;
+    else if (fam == 3) narrow = dt == 7 ? kNarrowE3M2 : dt == 6 ? kNarrowE2M3 : 0;
+    else if (fam == 1) narrow = dt == 7 ? kNarrowE2M1 : 0;
+    else if (fam == 6) narrow = dt == 6 ? kNarrowUE8M0 : 0;
+    static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
+    if (narrow) dname = nn[narrow - kNarrowE4M3];
+  } else if (mode == 4 && st != 0) {
+    if (ufam == 0) narrow = st == 3 ? kNarrowE4M3 : st == 2 ? kNarrowE5M2 : 0;
+    else if (ufam == 1) narrow = st == 3 ? kNarrowE3M2 : st == 2 ? kNarrowE2M3 : kNarrowE2M1;
+    else if (ufam == 2) narrow = st == 3 ? kNarrowUE8M0 : 0;
+    static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
+    if (narrow) sname = nn[narrow - kNarrowE4M3];
+  }
   if (w.bit(90)) ins.mods.push_back("SATFINITE");
+  if (w.bit(75)) ins.mods.push_back("RELU");   // negatives become zero
   if (ins.sm >= 89) {
-    ins.mods.push_back(dts[dt]);
-    ins.mods.push_back(sts[st]);
+    ins.mods.push_back(dname);
+    ins.mods.push_back(sname);
   } else if (dt != 0) {
-    ins.mods.push_back(dts[dt]);
+    ins.mods.push_back(dname);
   }
   // Form 4 is one operand: b packed from F32 (PACK_B: tf32), else unpacked.
   ins.mods.push_back(mode == 4 ? (st == 0 ? "PACK_B" : "UNPACK_B") : mode == 1 ? "PACK_AB_MERGE_C" : "PACK_AB");
@@ -1386,8 +1412,8 @@ void dec_f2fp(Instr& ins, const Word& w) {
   ins.f[0] = dt == 1;
   ins.f[1] = rnd;
   ins.f[2] = w.bit(75);
-  ins.f[3] = dt;
-  ins.f[4] = st;
+  ins.f[3] = mode == 1 && narrow ? narrow : dt;
+  ins.f[4] = mode == 4 && narrow ? narrow : st;
   ins.f[5] = mode;
   ins.f[6] = w.bit(90);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
@@ -2384,19 +2410,29 @@ void dec_ldgsts(Instr& ins, const Word& w) {
   if (p != kPT || w.bit(90)) ins.src.push_back(pred_src(w, 87, 90));
 }
 
-// LDSM.16.M88(.2/.4) (ldmatrix): 72-73 the matrix count, 78 .MT88
-// (transposed); the address as for LDS.
+// LDSM (ldmatrix): 72-73 the matrix count (.2, .4); 75-76 what a row holds
+// (.16; .U4x16P64TO8 and .U6x16P32TO8, sixteen packed 4- or 6-bit values
+// unpacked to a byte each; .8); 77-80 the shape (.M88, .MT88 transposed,
+// .M816 eight rows of sixteen, .MT1616 sixteen of sixteen transposed); the
+// address as for LDS. A 16-row matrix fills two registers per lane.
 void dec_ldsm(Instr& ins, const Word& w) {
   ins.op = Op::LDSM;
   ins.mnemonic = "LDSM";
-  ins.mods.push_back("16");
-  ins.mods.push_back(w.bit(78) ? "MT88" : "M88");
+  static const char* const fmts[] = {"16", "U4x16P64TO8", "U6x16P32TO8", "8"};
+  const unsigned fmt = static_cast<unsigned>(w.field(75, 2));
+  const unsigned shape = static_cast<unsigned>(w.field(77, 4));
+  const char* shape_name = shape == 0 ? "M88" : shape == 2 ? "MT88" : shape == 5 ? "M816" : shape == 9 ? "MT1616" : nullptr;
+  ins.mods.push_back(fmts[fmt]);
+  ins.mods.push_back(shape_name ? std::string(shape_name) : "(shape " + std::to_string(shape) + ")");
   const unsigned n = static_cast<unsigned>(w.field(72, 2));
   if (n == 1) ins.mods.push_back("2");
   if (n == 2) ins.mods.push_back("4");
   ins.f[0] = 1u << n;
-  ins.f[1] = w.bit(78);
-  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), 1u << n));
+  ins.f[1] = shape == 2 || shape == 9;   // transposed
+  ins.f[2] = fmt;
+  ins.f[3] = shape;
+  const unsigned regs_per_matrix = shape == 9 ? 2 : 1;
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), (1u << n) * regs_per_matrix));
   const int ur = w.bit(91) ? static_cast<int>(w.field(32, ureg_bits(ins.sm))) : -1;
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", ur, w.sfield(40, 24), ins.sm));
 }
@@ -2618,7 +2654,8 @@ void dec_utmacctl(Instr& ins, const Word& w) {
 }
 
 // USETMAXREG.DEALLOC/.TRY_ALLOC.CTAPOOL [UPd,] n (setmaxnreg): 72-73 the
-// direction, 74 .CTAPOOL, the count at 32.
+// direction, 74 .CTAPOOL, the count at 32 -- nine bits, as 256 (0x100, a
+// Blackwell GEMM's consumers) takes.
 void dec_usetmaxreg(Instr& ins, const Word& w) {
   ins.op = Op::USETMAXREG;
   ins.mnemonic = "USETMAXREG";
@@ -2627,7 +2664,7 @@ void dec_usetmaxreg(Instr& ins, const Word& w) {
   if (w.bit(74)) ins.mods.push_back("CTAPOOL");
   const unsigned up = static_cast<unsigned>(w.field(81, 3));
   if (up != kPT) ins.dst.push_back(UP(up));
-  ins.src.push_back(Imm(w.field(32, 8)));
+  ins.src.push_back(Imm(w.field(32, 9)));
 }
 
 // WARPGROUP.ARRIVE (wgmma.fence) and WARPGROUP.DEPBAR.LE gsb0, n
@@ -2767,8 +2804,10 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   ins.mods.push_back(std::to_string(dims) + "D");
   if (op == Op::UTMAREDG) ins.mods.push_back(kAtomOp[w.field(87, 3)]);   // 87-89: ADD MIN MAX INC DEC AND OR XOR
   // A load's mode at 82-83 (1 im2col, 3 im2col::w, 2 im2col::w::128; 80 with
-  // the ::w ones) and 84 .tile::gather4; a store's 83 .tile::scatter4.
-  const unsigned mode = store ? 0 : static_cast<unsigned>(w.field(82, 2));
+  // the ::w ones) and 84 .tile::gather4; a store's 82 .IM2COL (PTX's
+  // .im2col_no_offs, with no offsets register: CUTLASS's conv epilogue
+  // stores through its im2col map so) and 83 .tile::scatter4.
+  const unsigned mode = store ? (w.bit(82) ? 1u : 0u) : static_cast<unsigned>(w.field(82, 2));
   if (mode == 1) ins.mods.push_back("IM2COL");
   if (mode == 3) ins.mods.push_back("W");
   if (mode == 2) ins.mods.push_back("W128");
@@ -2786,7 +2825,7 @@ void dec_tma(Instr& ins, const Word& w, Op op, const char* name) {
   const int ub = static_cast<int>(ureg_bits(ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(32, ub)), 0, ins.sm));
   ins.src.push_back(mem_addr(kRZ, false, "", static_cast<int>(w.field(24, ub)), 0, ins.sm));
-  if (mode || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
+  if ((mode && !store) || w.bit(75)) ins.src.push_back(UR(static_cast<unsigned>(w.field(64, ub)), ins.sm));
   if (w.bit(76)) ins.src.push_back(Txt("desc[UR" + std::to_string(w.field(40, ub)) + "]"));
 }
 
@@ -3623,9 +3662,12 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   // ALU ops keep bit 8 clear; the form in bits 9-11 is never zero for them.
   if (w.field(9, 3) != 0 && (low9 & 0x100) == 0) {
     const bool uniform = (low9 & 0x80) != 0;
-    // sm_120 gives the uniform datapath 64-bit ops of its own: UIADD3.64
-    // (0x97, the vector IMNMX's number) and UIMNMX.S64/U64 (0x85).
-    if (sm >= 120 && uniform && ((low9 & 0x7f) == 0x17 || (low9 & 0x7f) == 0x05)) {
+    // The uniform datapath's own 64-bit ops: UIADD3.64 (0x97, the vector
+    // IMNMX's number), which CUDA 13's ptxas uses from sm_90 (a bulk copy's
+    // source address, CuTe's), and from sm_120 UIMNMX.S64/U64 (0x85).
+    // Before sm_90 ptxas has no UIADD3.64; taking 0x97 as UIMNMX there
+    // turned an address plus 0x30 into the larger of the two.
+    if (uniform && ((sm >= 90 && (low9 & 0x7f) == 0x17) || (sm >= 120 && (low9 & 0x7f) == 0x05))) {
       if ((low9 & 0x7f) == 0x17) {
         dec_iadd3(ins, w, true);
         ins.mods.insert(ins.mods.begin(), "64");
