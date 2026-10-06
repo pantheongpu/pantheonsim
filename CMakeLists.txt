@@ -1354,6 +1354,11 @@ set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_memtest_patterns COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_memtest_patterns.sh)
 set_tests_properties(amd_memtest_patterns PROPERTIES DEPENDS "vgpuhip;vgpu_cli"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
+# Work-groups of several dimensions and waves (ids, LDS between waves), run by
+# checked-in hipcc programs whose code objects are version 4, on four GPUs.
+add_test(NAME amd_workgroup COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_workgroup.sh)
+set_tests_properties(amd_workgroup PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)

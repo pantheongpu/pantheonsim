@@ -5905,8 +5905,10 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
                      z = static_cast<uint32_t>(flat / size[0] / size[1]);
       // From ABI version 5 a work-item's three ids are packed into v0,
       // ten bits each, and the kernel pulls them out; before it each id
-      // had a register of its own.
-      if (d.object->packed_work_item_id()) {
+      // had a register of its own -- except where the hardware packs them
+      // whatever the ABI (gcn::packs_work_item_ids): a version 4 object
+      // built for gfx90a, gfx942 or gfx1100 still reads them from v0.
+      if (d.object->packed_work_item_id() || gcn::packs_work_item_ids(m.target())) {
         w.vgpr[0][lane] = x | y << 10 | z << 20;
       } else {
         w.vgpr[0][lane] = x;

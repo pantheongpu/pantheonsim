@@ -167,3 +167,12 @@ for arch in gfx942 gfx90a gfx1030 gfx1100; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch memtest.cpp -o memtest.$arch
 done
 echo "wrote $(pwd)/memtest.gfx942, .gfx90a, .gfx1030 and .gfx1100"
+
+# Work-group shapes (ids of every dimension, LDS between the waves of a group),
+# for the four architectures the e2e test runs. Built with the Ubuntu 24.04
+# hipcc (ROCm 5.7.1), whose code objects are version 4 -- the case where
+# gfx90a, gfx942 and gfx1100 still keep a work-item's ids packed in v0.
+for arch in gfx942 gfx90a gfx1030 gfx1100; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch workgroup.cpp -o workgroup.$arch
+done
+echo "wrote $(pwd)/workgroup.gfx942, .gfx90a, .gfx1030 and .gfx1100"
