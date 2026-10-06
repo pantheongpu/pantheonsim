@@ -75,6 +75,8 @@ VTEST(moving_references_to_a_graph_and_releasing_them_from_it) {
   VCHECK_EQ(g_destroyed, 1);
 }
 
+// The runtime's library API is declared from toolkit 12.8 on; older headers have none of it.
+#if CUDART_VERSION >= 12080
 VTEST(the_runtime_loads_a_library_and_finds_its_kernel) {
   const char* ptx =
       ".version 7.0\n.target sm_75\n.address_size 64\n"
@@ -91,5 +93,6 @@ VTEST(the_runtime_loads_a_library_and_finds_its_kernel) {
   VCHECK_EQ(cudaLibraryUnload(lib), cudaSuccess);
   VCHECK(cudaLibraryUnload(lib) != cudaSuccess);   // already gone
 }
+#endif  // CUDART_VERSION >= 12080
 
 VTEST_MAIN

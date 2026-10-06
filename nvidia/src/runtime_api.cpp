@@ -7615,6 +7615,10 @@ VGPU_EXPORT cudaError_t cudaGraphReleaseUserObject(cudaGraph_t graph, cudaUserOb
   return user_object_release(object, count);
 }
 
+// Toolkits before 12.8 declare none of these (no cudaLibrary_t, cudaJitOption, cudaLibraryOption or
+// cudaKernelSetAttributeForDevice), so they are compiled only against 12.8 and later headers; a program
+// built with an older toolkit cannot call them anyway.
+#if CUDART_VERSION >= 12080
 // The runtime's library API is the driver's, under the runtime's names: one
 // simulated machine behind both (see shared_runtime.cpp).
 namespace {
@@ -7664,6 +7668,7 @@ VGPU_EXPORT cudaError_t cudaKernelSetAttributeForDevice(cudaKernel_t kernel, cud
   // through guard: the runtime starts, and the driver has this thread's context
   return guard("cudaKernelSetAttributeForDevice", [&](State&) -> cudaError_t { return from_driver(fn(static_cast<int>(attr), value, kernel, device)); });
 }
+#endif  // CUDART_VERSION >= 12080
 
 // The graph's own records go with it (destroy_graph, below).
 VGPU_EXPORT cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
