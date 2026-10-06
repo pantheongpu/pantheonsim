@@ -70,6 +70,7 @@ config:
 
 mmio:
   nbio_strap0:                 [0x034d8, 32, ro, 0x100074a1]
+  nbio_ep_pcie_lc_speed_cntl:  [0x03564, 32, ro, 0x0000000f]
   nbio_config_memsize:         [0x0378c, 32, ro, 0x00030000, vram.memsize_mb]
   nbio_partition_mem_cap:      [0x03a08, 32, ro, 0x00000009]
   nbio_partition_compute_status: [0x03a0c, 32, ro, 0x00000000]

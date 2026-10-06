@@ -161,3 +161,4 @@ mmio:
   ptimer_intr_en_0:            [0x009140, 32, rw, 0x00000000]
   ptimer_vf_timer_0:           [0x009800, 32, ro, 0x00000000, nvidia.ptimer_nsec]
   therm_i2cs_scratch:          [0x0200bc, 32, rw, 0x00000000]
+  ptop_device_info_cfg:        [0x0224fc, 32, rw, 0x00000002]

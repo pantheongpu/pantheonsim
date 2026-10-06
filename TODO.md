@@ -879,10 +879,13 @@ narrows what counts as observable, not what the detector looks at.
   thermal scratch and Blackwell's confidential-computing scratch.
   AMD UMC ECC (channels 0-3 of instance 0), its MCA status and the THM
   temperature are mapped on assumed Aldebaran bases.
-  Not yet: the UMC's other channels and instances (beyond BAR5, via the
-  indirect pair), NBIO PCIe link status, SRBM, XGMI/PCS, and the NVIDIA
-  blocks whose headers publish no usable offsets (device topology, PRI
-  errors, temperature). A C API (vgpu_regs.h,
+  The SMU mailbox answers the header's failed and unknown-command codes, the
+  NBIO link controller's speed straps are mapped, and GB100's topology table
+  version. Not yet: the UMC's other channels and instances (beyond BAR5, via
+  the indirect pair), a per-channel uncorrectable count (the UMC header has
+  none), NBIO PCIe link status in BAR5 (its segment is not in the Aldebaran
+  base table), SRBM, XGMI/PCS, and the NVIDIA blocks whose headers publish no
+  usable values (the topology rows, PRI errors, temperature). A C API (vgpu_regs.h,
   libvgpuregs) gives bring-up software the same access. tools/regprobe
   captures real cards (read-only) to check and map the model against. AMD's
   gpu_metrics table (v1.5), amdgpu's busy and memory files and its hwmon (read

@@ -159,6 +159,7 @@ vgpu regs read --space mmio grbm_status
 | `smu_message`, `smu_argument`, `smu_response` | 0x58a08, 0x58a48, 0x58a68 | the SMU mailbox (MP1 C2PMSG_66, _82, _90) |
 | `nbio_strap0` | 0x034d8 | the strap amdgpu reads the revision from: the device ID, the revision, the function enabled |
 | `nbio_config_memsize` | 0x0378c | the VRAM in MiB, which amdgpu sizes memory by; it follows the device, `VGPU_VRAM_MB` included |
+| `nbio_ep_pcie_lc_speed_cntl` | 0x03564 | the link controller's speed straps (Gen2 to Gen5 enabled), up to the profile's highest PCIe generation; model |
 | `nbio_partition_compute_status` | 0x03a0c | the compute partition mode: SPX |
 | `nbio_partition_mem_status`, `nbio_partition_mem_cap` | 0x03a10, 0x03a08 | the memory partition mode, NPS1, and the modes the GPU supports: NPS1 and NPS4 on MI300X and MI325X, NPS1 and NPS2 on MI350X |
 
@@ -166,7 +167,12 @@ The mailbox works as the driver drives it: clear the response, write the
 argument, write the message, and the SMU answers -- `1` in the response
 register, and its reply in the argument register. It answers TestMessage (the
 argument plus one), GetSmuVersion, GetDriverIfVersion and GetMetricsVersion,
-and refuses any other message with `0xfe`, unknown command:
+and answers the result codes of `smu_v13_0_6_ppsmc.h`: a message the header
+defines but the model has no handler for fails (`0xff`), and a number the header
+does not define is an unknown command (`0xfe`). The model never answers `0xfc`
+(busy) or `0xfd` (prerequisite rejected): it answers at once, and the header
+publishes no condition for either. The codes are the header's; which message
+gets which is a model:
 
 ```bash
 vgpu regs write --space mmio smu_response 0
@@ -227,6 +233,12 @@ header carries a differently worded notice and is not used here. The mapping
 of the card's error count to channels, the power-on control values, the status
 bit pattern and the temperature step are models, not measured; the per-channel
 uncorrectable count and MCA address, syndrome and IPID registers are not mapped.
+`umc_6_7_0` publishes no per-channel uncorrectable count (`EccErrCnt` counts
+correctable errors; uncorrectable ones show in the MCA status's UECC bit, which
+is per instance), so none is mapped. The PCIe link's trained speed and width
+(`regBIF_CFG_DEV0_EPF0_0_LINK_STATUS`) are in segment index 8, which Aldebaran's
+NBIO base table does not have; they stay in configuration space, and only the
+link controller's speed straps (segment 2) are mapped in BAR5.
 
 ## From C
 
@@ -352,6 +364,7 @@ tree publishes different blocks for different chips. What is mapped, by block:
 | MMU ECC | `pfb_pri_mmu_{l2tlb,hubtlb,fillunit}_ecc_uncorrected_err_count` | Turing | The injector has no location for MMU SRAMs: read zero, keep what is written. Model. |
 | Memory ECC | `pfb_fbpa_0_ecc_ded_count_{0,1}`; `..._{0..3}_gh100` | Turing; Hopper | See below. |
 | L2 ECC | `pltcg_ltc0_lts0_l2_cache_ecc_uncorrected_err_count` | Turing | See below. |
+| Topology table | `ptop_device_info_cfg` | GB100 | Only the format version, 2 at reset, which is all GB100's `dev_top.h` publishes as a value; the other fields read zero. The table's rows (`NV_PTOP_DEVICE_INFO2(i)`, from 0x022800) are not mapped. Model. |
 | Thermal scratch | `therm_i2cs_scratch`, `therm_i2cs_scratch_gb20x` | Hopper, GB100; GB20x | Scratch. The GB20x header puts it elsewhere. |
 
 **ECC counters**, the registers a memory diagnostic reads to learn whether its
@@ -374,8 +387,10 @@ vgpu regs write --space mmio pfb_fbpa_0_ecc_ded_count_0 0
 ```
 
 What the headers do *not* publish, and so what stays unmapped everywhere: the
-device topology table (PTOP's `DEVICE_INFO` rows have a layout but the values
-are per chip), the PRI ring station and PRI error registers, the temperature
+device topology table's rows (PTOP's `DEVICE_INFO2` has a layout, in GA100's and
+GB100's headers, but the values are per chip; only GB100's version is mapped),
+the PRI ring station and PRI error registers (none of the headers fetched for
+Turing, Ampere, Hopper or Blackwell defines one), the temperature
 sensors (the thermal header gives a scratch word only), the Ampere and Ada
 memory-controller ECC counters (no header), and Blackwell's zero-based
 `dev_ltc_zb`, `dev_fuse_zb` and `dev_tmr` registers, whose offsets are inside

@@ -297,6 +297,18 @@ VTEST(engine_status_follows_whether_the_gpu_is_busy) {
   VCHECK_EQ((busy.read(at, 4) >> 29) & 1, 1u);        // CP busy
 }
 
+// The link controller's speed straps follow the profile's highest generation.
+VTEST(the_link_controllers_speed_straps_follow_the_profile) {
+  TempMachine m("lcstrap");
+  for (const auto& [gpu, gen] : {std::pair{"amd/mi300x", 5u}, std::pair{"amd/mi250x", 4u}}) {
+    const telemetry::DeviceSample d = device(gpu);
+    regs::RegisterSpace cs(regs::Space::AmdMmio, d);
+    const uint32_t v = cs.read(regs::find(regs::Space::AmdMmio, "nbio_ep_pcie_lc_speed_cntl")->offset, 4);
+    VCHECK_EQ(v, (1u << (d.pcie_gen_max - 1)) - 1);
+    VCHECK_EQ(d.pcie_gen_max, gen);
+  }
+}
+
 VTEST(the_smu_mailbox_answers_as_the_firmware_does) {
   TempMachine m("smu");
   regs::RegisterSpace cs(regs::Space::AmdMmio, device("amd/mi300x"));
@@ -311,6 +323,14 @@ VTEST(the_smu_mailbox_answers_as_the_firmware_does) {
   VCHECK(send(regs::kSmuTestMessage, 41) == (std::pair{regs::kSmuResultOk, 42u}));
   VCHECK(send(regs::kSmuGetDriverIfVersion, 0) == (std::pair{regs::kSmuResultOk, 0x08042024u}));
   VCHECK_EQ(send(regs::kSmuGetSmuVersion, 0).second >> 16, 0x55u);   // 85.x.x
+  VCHECK_EQ(send(0x77, 5).first, regs::kSmuResultUnknownCmd);
+  VCHECK_EQ(send(0x3c, 0).first, regs::kSmuResultUnknownCmd);   // a gap in the header's numbering
+  VCHECK_EQ(send(0x5c, 0).first, regs::kSmuResultUnknownCmd);   // PPSMC_Message_Count is not a message
+  // Defined by the header (GetMetricsTable, ResetVCN), not modelled: fails, not unknown.
+  VCHECK_EQ(send(0x9, 0).first, regs::kSmuResultFailed);
+  VCHECK_EQ(send(0x5b, 0).first, regs::kSmuResultFailed);
+  VCHECK(regs::smu_message_defined(0x59) && !regs::smu_message_defined(0x41) && !regs::smu_message_defined(0));
+  VCHECK_EQ(send(regs::kSmuTestMessage, 1).first, regs::kSmuResultOk);   // and it recovers
   VCHECK_EQ(send(0x77, 5).first, regs::kSmuResultUnknownCmd);
   regs::RegisterSpace again(regs::Space::AmdMmio, device("amd/mi300x"));   // another process
   VCHECK_EQ(again.read(at("smu_response"), 4), regs::kSmuResultUnknownCmd);
@@ -575,6 +595,9 @@ VTEST(an_architecture_has_only_the_registers_its_headers_define) {
            Probe{"nvidia/b200", 0x580, true}, Probe{"nvidia/b300", 0x5bc, true}, Probe{"nvidia/b200", 0x5c0, false},
            Probe{"nvidia/b200", 0x200bc, true}, Probe{"nvidia/b200", 0xad00bc, false},
            Probe{"nvidia/b200", 0x1410, true},
+           // The topology table's version: only GB100's header gives a value.
+           Probe{"nvidia/b200", 0x224fc, true}, Probe{"nvidia/b300", 0x224fc, true},
+           Probe{"nvidia/rtx5090", 0x224fc, false}, Probe{"nvidia/h100", 0x224fc, false},
            Probe{"nvidia/rtx5090", 0xad00bc, true}, Probe{"nvidia/rtx5090", 0x200bc, false},
            Probe{"nvidia/rtx5090", 0x580, false}, Probe{"nvidia/rtx5090", 0x1410, false}}) {
     const uint32_t v = bar0_read(p.gpu, p.offset);

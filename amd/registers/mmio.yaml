@@ -86,7 +86,7 @@ smu_response:
   write_mask: "0xffffffff"
   backing: smu.response
   source: "mp_13_0_6_offset.h regMP1_SMN_C2PMSG_90 0x029a, MP1 segment 0"
-  fields: ["31:0 response (1 ok and 0xfe unknown command and 0 pending)"]
+  fields: ["31:0 response (PPSMC_Result_*: 0 pending and 0x1 ok and 0xfc busy and 0xfd prerequisite rejected and 0xfe unknown command and 0xff failed)"]
   surfaces: [amdgpu, umr]
   status: model
 
@@ -109,6 +109,21 @@ nbio_config_memsize:
   fields: ["31:0 config_memsize (MiB of VRAM; amdgpu sizes VRAM from it)"]
   surfaces: [amdgpu (nbio get_memsize), sysfs.mem_info_vram_total]
   status: model
+
+# The link controller's speed straps, the one NBIO link register in a segment
+# the Aldebaran base table has. The link's trained speed and width
+# (regBIF_CFG_DEV0_EPF0_0_LINK_STATUS) sit in segment index 8, which that table
+# does not have, so they are not mapped here; they are in configuration space.
+nbio_ep_pcie_lc_speed_cntl:
+  offset: "0x03564"
+  width: 32
+  access: ro
+  backing: profile.lc_speed_strap
+  source: "nbio_7_9_0_offset.h regRCC_EP_DEV0_0_EP_PCIE_LC_SPEED_CNTL 0x0059, NBIO segment 2"
+  fields: ["0 lc_gen2_en_strap", "1 lc_gen3_en_strap", "2 lc_gen4_en_strap", "3 lc_gen5_en_strap"]
+  surfaces: [umr]
+  status: model
+  measured: "not measured; the straps follow the profile's highest PCIe generation, and the header gives no values"
 
 nbio_partition_mem_cap:
   offset: "0x03a08"

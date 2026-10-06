@@ -86,6 +86,10 @@ bool amd_backed(const std::string& k, const Context& c, uint32_t* out) {
   // 9.4.3 and 9.4.4, which amdgpu assumes when the register is not read,
   // gmc_v9_0.c), NPS1 and NPS2 on CDNA4.
   else if (k == "profile.nbio_strap0") *out = (1u << 28) | device;
+  // The speeds the link controller is strapped for: Gen2 up to the profile's
+  // highest generation, one bit each (LC_GEN2_EN_STRAP to LC_GEN5_EN_STRAP).
+  else if (k == "profile.lc_speed_strap")
+    *out = d.pcie_gen_max >= 2 ? (1u << (d.pcie_gen_max > 5 ? 4 : d.pcie_gen_max - 1)) - 1 : 0u;
   else if (k == "profile.nps_cap") *out = std::strcmp(d.architecture, "cdna4") == 0 ? 0x3u : 0x9u;
   // The VRAM in MiB, as this device has it: VGPU_VRAM_MB changes it for a
   // run, so it follows the device rather than the model.
@@ -132,7 +136,8 @@ bool amd_write(const std::string& k, const Context& c, uint32_t v) {
       // The interface version the driver expects (SMU13_0_6_DRIVER_IF_VERSION).
       case kSmuGetDriverIfVersion: reply = 0x08042024u; break;
       case kSmuGetMetricsVersion: reply = 0x11u; break;   // SMU_METRICS_TABLE_VERSION
-      default: result = kSmuResultUnknownCmd; break;
+      // Defined by the header, not modelled: the firmware would do something here.
+      default: result = smu_message_defined(v) ? kSmuResultFailed : kSmuResultUnknownCmd; break;
     }
     __atomic_store_n(&s[kArgument], uint64_t{reply}, __ATOMIC_RELAXED);
     __atomic_store_n(&s[kResponse], uint64_t{result}, __ATOMIC_RELAXED);

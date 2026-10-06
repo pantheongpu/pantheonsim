@@ -307,6 +307,24 @@ pmc_device_enable_0:
   source: "ampere/ga100/dev_pmc.h NV_PMC_DEVICE_ENABLE(0), also in ampere/ga102/dev_pmc.h"
   status: model
 
+# The device topology table (PTOP). Only Blackwell GB100's header publishes a
+# value in it: the table's format version, 2 at reset. The table's rows
+# (NV_PTOP_DEVICE_INFO2(i), 353 of them from 0x022800) are chip data that no
+# header publishes, so they are not mapped, and the other fields of this
+# register are not in the header and read as zero. GA100's header names the
+# register but gives no value either.
+ptop_device_info_cfg:
+  offset: "0x0224fc"
+  width: 32
+  access: rw
+  write_mask: "0x0000000f"
+  reset: "0x00000002"
+  fields: ["3:0 version (init 0x2)"]
+  surfaces: [driver topology scan]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_top.h NV_PTOP_DEVICE_INFO_CFG"
+  status: model
+
 # The scratch array is 64 words on the architectures whose headers say so
 # (NV_PBUS_SW_SCRATCH__SIZE_1); pbus_sw_scratch_0..3 above are Turing's, where the
 # header gives no size. Real scratch: what is written reads back.

@@ -8,7 +8,7 @@ src/common/inc/swref/published/ (github.com/NVIDIA/open-gpu-kernel-modules):
   ampere/ga102/   dev_pmc.h
   ada/ad102/      dev_bus.h
   hopper/gh100/   dev_fb.h dev_fbpa.h dev_therm.h dev_bus.h
-  blackwell/gb100/ dev_bus.h dev_pmc_zb.h dev_pmc_zb_addendum.h dev_therm.h
+  blackwell/gb100/ dev_bus.h dev_pmc_zb.h dev_pmc_zb_addendum.h dev_therm.h dev_top.h
   blackwell/gb202/ dev_therm.h
 
 Each of them carries SPDX-License-Identifier: MIT, with a copyright line of
