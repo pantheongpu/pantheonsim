@@ -394,6 +394,10 @@ does on the card.
 with what its destination holds after it for lane 0 (or the lane
 `VGPU_TRACE_LANE` names). That is how the bugs above were found.
 
+## Memory tests
+
+`amd/tests/hipcc/memtest.cpp` is a HIP memory test written for this repository: walking ones and zeros, address in address, checkerboard and its inverse, moving inversions, seeded random data (verified on the device and on the host), block copies and strided sweeps, on `hipMalloc` memory and on mapped pinned host memory. It never looks at the wave size, so it runs the same on wave 64 (MI300X, MI250X) and wave 32 (RX 6900 XT, RX 7900 XTX). Checked-in builds for gfx942, gfx90a, gfx1030 and gfx1100 are run by ctest `amd_memtest_patterns`, which also arms the simulator's faults and requires the test to find them: a host-flipped bit exactly, a `vgpu fault stuck` cell, bit flips armed on stores, an uncorrectable HBM ECC error on a load (the kernel fails and a row is remapped; corrected errors are counted and change nothing; a card without ECC refuses the fault), and a wild pointer (`hipErrorLaunchFailure`). The programs were built with Ubuntu's ROCm 5.7 `hipcc` (the only toolchain installable without AMD's repositories), so they ask for `libamdhip64.so.5`, which the script maps to the shim; gfx950 and gfx1201 need a newer compiler. `ci/external/babelstream.sh` runs UoB-HPC's BabelStream (HIP), whose own validation must pass, and must fail against a stuck cell, in the nightly external suites.
+
 ## Textures
 
 The Radeon GPUs (RDNA2, RDNA3 and RDNA4: gfx1030, gfx1100, gfx1201) have

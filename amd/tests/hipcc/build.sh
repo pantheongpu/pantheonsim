@@ -155,3 +155,15 @@ echo "wrote $(pwd)/ops.gfx942.o and its listing ($(wc -l < ops.gfx942.dis) instr
 "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 wmma.gfx942.o |
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > wmma.gfx942.dis
 echo "wrote $(pwd)/wmma.gfx942.o and its listing ($(wc -l < wmma.gfx942.dis) instructions)"
+
+# Memory-test patterns (walking bits, address in address, checkerboard, moving
+# inversions, seeded random, block copies, strides) for each architecture the
+# memory test runs on. The checked-in programs were built with the Ubuntu 24.04
+# `hipcc` (ROCm 5.7.1, clang 17), which is why they ask for libamdhip64.so.5
+# and why gfx950 and gfx1201 are absent: that compiler does not know them.
+# (amd/tests/e2e/run_memtest_patterns.sh maps the shim under that name.) With
+# ROCm 6 or 7 the same line builds those too.
+for arch in gfx942 gfx90a gfx1030 gfx1100; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch memtest.cpp -o memtest.$arch
+done
+echo "wrote $(pwd)/memtest.gfx942, .gfx90a, .gfx1030 and .gfx1100"

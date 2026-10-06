@@ -12,7 +12,10 @@
 # microcontroller, so the map grew from the published headers instead.
 #
 # A register the map does not declare reads as 0xbadf5040, the value the
-# measured card answered from 0xc on: a protected or absent register.
+# measured card answered from 0xc on: a protected or absent register. So does
+# one declared with `arch` on a GPU whose architecture (or Blackwell die) it
+# does not list: the headers publish different blocks for different chips, and
+# a register is mapped only where a header defines it (docs/registers.md).
 
 pmc_boot_0:
   offset: "0x000000"
@@ -65,6 +68,7 @@ pmc_intr_en_0:
   width: 32
   access: rw
   write_mask: "0xffffffff"
+  backing: nvidia.pmc_intr_en_0
   reset: "0x00000000"
   fields: ["31:0 value"]
   surfaces: [driver interrupt setup]
@@ -190,3 +194,1272 @@ ptimer_vf_timer_0:
   surfaces: [driver timekeeping]
   source: "turing/tu102/dev_timer.h NV_PTIMER_VF_TIMER(0)"
   status: model
+
+# ---- Registers each architecture's published headers define ---------------------
+#
+# Everything below carries `arch`: the architectures (turing, ampere, hopper,
+# ada, blackwell) or Blackwell dies (gb100: B200 and B300; gb20x: the GeForce
+# RTX 50 series) whose headers define it, and only those GPUs have it. On any
+# other GPU the offset is unmapped and reads 0xbadf5040, because no published
+# header says what is there and a value would be a guess. The headers are a
+# sample of each chip's register file, not all of it, so most of BAR0 stays
+# unmapped on every architecture. Where the header's own text is the only
+# description (no behaviour modelled) the register keeps what is written and
+# its `status` says model; error counters report what `vgpu fault` injected.
+
+# Turing's second interrupt status word (NV_PMC_INTR is an array of two). As the
+# first, it reads as no interrupt pending: nothing here raises a device interrupt.
+pmc_intr_1:
+  offset: "0x000104"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  surfaces: [driver interrupt handler]
+  arch: [turing]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR(1)"
+  status: model
+
+# The enables behind the interrupt words. On Turing the header makes NV_PMC_INTR_EN
+# read-only and sets or clears its bits through INTR_EN_SET and INTR_EN_CLEAR, so a
+# write here is ignored on Turing and the SET and CLEAR registers change it (the
+# SET and CLEAR registers read as zero, as write-only registers do). On the other
+# architectures, whose headers do not define SET and CLEAR, intr_en_0 keeps what is
+# written.
+pmc_intr_en_1:
+  offset: "0x000144"
+  width: 32
+  access: rw
+  backing: nvidia.pmc_intr_en_1
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver interrupt setup]
+  arch: [turing]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR_EN(1)"
+  status: model
+
+pmc_intr_en_set_0:
+  offset: "0x000160"
+  width: 32
+  access: rw
+  backing: nvidia.pmc_intr_en_set_0
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value -- write 1 to enable"]
+  surfaces: [driver interrupt setup]
+  arch: [turing]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR_EN_SET(0)"
+  status: model
+
+pmc_intr_en_set_1:
+  offset: "0x000164"
+  width: 32
+  access: rw
+  backing: nvidia.pmc_intr_en_set_1
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value -- write 1 to enable"]
+  surfaces: [driver interrupt setup]
+  arch: [turing]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR_EN_SET(1)"
+  status: model
+
+pmc_intr_en_clear_0:
+  offset: "0x000180"
+  width: 32
+  access: rw
+  backing: nvidia.pmc_intr_en_clear_0
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value -- write 1 to disable"]
+  surfaces: [driver interrupt setup]
+  arch: [turing]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR_EN_CLEAR(0)"
+  status: model
+
+pmc_intr_en_clear_1:
+  offset: "0x000184"
+  width: 32
+  access: rw
+  backing: nvidia.pmc_intr_en_clear_1
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value -- write 1 to disable"]
+  surfaces: [driver interrupt setup]
+  arch: [turing]
+  source: "turing/tu102/dev_pmc.h NV_PMC_INTR_EN_CLEAR(1)"
+  status: model
+
+# Ampere's device enable status: one bit per device in the topology (bits 25:0
+# are defined; NV_PMC_DEVICE_ENABLE_STATUS_BIT__SIZE_1 is 26). The header's reset
+# value is all devices disabled, which is what is kept. A model: it is not tied to
+# pmc_enable, because which bit is which device comes from the topology table
+# (PTOP) that these headers publish no values for.
+pmc_device_enable_0:
+  offset: "0x000600"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 status -- bit i enables device i"]
+  surfaces: [driver bring-up, engine reset]
+  arch: [ampere]
+  source: "ampere/ga100/dev_pmc.h NV_PMC_DEVICE_ENABLE(0), also in ampere/ga102/dev_pmc.h"
+  status: model
+
+# The device topology table (PTOP). Only Blackwell GB100's header publishes a
+# value in it: the table's format version, 2 at reset. The table's rows
+# (NV_PTOP_DEVICE_INFO2(i), 353 of them from 0x022800) are chip data that no
+# header publishes, so they are not mapped, and the other fields of this
+# register are not in the header and read as zero. GA100's header names the
+# register but gives no value either.
+ptop_device_info_cfg:
+  offset: "0x0224fc"
+  width: 32
+  access: rw
+  write_mask: "0x0000000f"
+  reset: "0x00000002"
+  fields: ["3:0 version (init 0x2)"]
+  surfaces: [driver topology scan]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_top.h NV_PTOP_DEVICE_INFO_CFG"
+  status: model
+
+# The scratch array is 64 words on the architectures whose headers say so
+# (NV_PBUS_SW_SCRATCH__SIZE_1); pbus_sw_scratch_0..3 above are Turing's, where the
+# header gives no size. Real scratch: what is written reads back.
+pbus_sw_scratch_4:
+  offset: "0x001410"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(4); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_5:
+  offset: "0x001414"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(5); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_6:
+  offset: "0x001418"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(6); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_7:
+  offset: "0x00141c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(7); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_8:
+  offset: "0x001420"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(8); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_9:
+  offset: "0x001424"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(9); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_10:
+  offset: "0x001428"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(10); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_11:
+  offset: "0x00142c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(11); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_12:
+  offset: "0x001430"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(12); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_13:
+  offset: "0x001434"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(13); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_14:
+  offset: "0x001438"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(14); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_15:
+  offset: "0x00143c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(15); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_16:
+  offset: "0x001440"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(16); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_17:
+  offset: "0x001444"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(17); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_18:
+  offset: "0x001448"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(18); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_19:
+  offset: "0x00144c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(19); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_20:
+  offset: "0x001450"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(20); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_21:
+  offset: "0x001454"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(21); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_22:
+  offset: "0x001458"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(22); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_23:
+  offset: "0x00145c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(23); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_24:
+  offset: "0x001460"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(24); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_25:
+  offset: "0x001464"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(25); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_26:
+  offset: "0x001468"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(26); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_27:
+  offset: "0x00146c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(27); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_28:
+  offset: "0x001470"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(28); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_29:
+  offset: "0x001474"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(29); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_30:
+  offset: "0x001478"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(30); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_31:
+  offset: "0x00147c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(31); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_32:
+  offset: "0x001480"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(32); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_33:
+  offset: "0x001484"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(33); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_34:
+  offset: "0x001488"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(34); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_35:
+  offset: "0x00148c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(35); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_36:
+  offset: "0x001490"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(36); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_37:
+  offset: "0x001494"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(37); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_38:
+  offset: "0x001498"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(38); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_39:
+  offset: "0x00149c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(39); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_40:
+  offset: "0x0014a0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(40); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_41:
+  offset: "0x0014a4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(41); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_42:
+  offset: "0x0014a8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(42); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_43:
+  offset: "0x0014ac"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(43); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_44:
+  offset: "0x0014b0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(44); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_45:
+  offset: "0x0014b4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(45); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_46:
+  offset: "0x0014b8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(46); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_47:
+  offset: "0x0014bc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(47); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_48:
+  offset: "0x0014c0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(48); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_49:
+  offset: "0x0014c4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(49); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_50:
+  offset: "0x0014c8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(50); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_51:
+  offset: "0x0014cc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(51); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_52:
+  offset: "0x0014d0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(52); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_53:
+  offset: "0x0014d4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(53); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_54:
+  offset: "0x0014d8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(54); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_55:
+  offset: "0x0014dc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(55); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_56:
+  offset: "0x0014e0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(56); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_57:
+  offset: "0x0014e4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(57); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_58:
+  offset: "0x0014e8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(58); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_59:
+  offset: "0x0014ec"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(59); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_60:
+  offset: "0x0014f0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(60); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_61:
+  offset: "0x0014f4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(61); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_62:
+  offset: "0x0014f8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(62); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+pbus_sw_scratch_63:
+  offset: "0x0014fc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [vbios, driver]
+  arch: [ampere, hopper, ada, gb100]
+  source: "ampere/ga100/dev_bus.h NV_PBUS_SW_SCRATCH(63); hopper/gh100, ada/ad102 and blackwell/gb100 dev_bus.h the same"
+  status: done
+
+# The system-memory page a framebuffer flush writes to, as the driver programs it:
+# bits 39:8 here and 63:40 in the _hi register. Kept as written.
+pfb_niso_flush_sysmem_addr:
+  offset: "0x100c10"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 adr_39_08 -- address >> 8"]
+  surfaces: [driver bring-up]
+  arch: [ampere]
+  source: "ampere/ga100/dev_fb.h NV_PFB_NISO_FLUSH_SYSMEM_ADDR"
+  status: done
+
+pfb_niso_flush_sysmem_addr_hi:
+  offset: "0x100c40"
+  width: 32
+  access: rw
+  write_mask: "0x00ffffff"
+  reset: "0x00000000"
+  fields: ["23:0 adr_63_40"]
+  surfaces: [driver bring-up]
+  arch: [ampere]
+  source: "ampere/ga100/dev_fb.h NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI"
+  status: done
+
+# Hopper moves the flush address to the FBHUB: a low and a high word. Kept as written.
+pfb_fbhub_pcie_flush_sysmem_addr_lo:
+  offset: "0x100a34"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 adr"]
+  surfaces: [driver bring-up]
+  arch: [hopper]
+  source: "hopper/gh100/dev_fb.h NV_PFB_FBHUB_PCIE_FLUSH_SYSMEM_ADDR_LO"
+  status: done
+
+pfb_fbhub_pcie_flush_sysmem_addr_hi:
+  offset: "0x100a38"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 adr (NV_..._ADR_MASK 0x000fffff names the bits in use)"]
+  surfaces: [driver bring-up]
+  arch: [hopper]
+  source: "hopper/gh100/dev_fb.h NV_PFB_FBHUB_PCIE_FLUSH_SYSMEM_ADDR_HI"
+  status: done
+
+# Which page-fault replay requests the MMU sends: the header's default is
+# SEND_NONE. Kept as written; nothing here replays
+# faults.
+pfb_pri_mmu_page_fault_ctrl:
+  offset: "0x100cf8"
+  width: 32
+  access: rw
+  write_mask: "0x00000003"
+  reset: "0x00000003"
+  fields: ["1:0 prf_filter -- 0 send all / 3 send none"]
+  surfaces: [driver bring-up]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_PAGE_FAULT_CTRL"
+  status: model
+
+# The MMU fault buffers (replayable, then non-replayable): where software has read up
+# to (GET) and where the MMU has written to (PUT). No fault is ever raised here, so
+# PUT stays at the header's reset value, zero, and GET keeps its pointer field.
+# The corrupted and overflow bits (30, 31) are write-1-to-clear in the header and
+# never set here.
+pfb_pri_mmu_fault_buffer_get_0:
+  offset: "0x100e2c"
+  width: 32
+  access: rw
+  write_mask: "0x000fffff"
+  reset: "0x00000000"
+  fields: ["19:0 ptr", "30 getptr_corrupted", "31 overflow"]
+  surfaces: [driver fault handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_FAULT_BUFFER_GET(0)"
+  status: model
+
+pfb_pri_mmu_fault_buffer_put_0:
+  offset: "0x100e30"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  fields: ["19:0 ptr", "30 getptr_corrupted", "31 overflow"]
+  surfaces: [driver fault handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_FAULT_BUFFER_PUT(0)"
+  status: model
+
+pfb_pri_mmu_fault_buffer_get_1:
+  offset: "0x100e40"
+  width: 32
+  access: rw
+  write_mask: "0x000fffff"
+  reset: "0x00000000"
+  fields: ["19:0 ptr", "30 getptr_corrupted", "31 overflow"]
+  surfaces: [driver fault handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_FAULT_BUFFER_GET(1)"
+  status: model
+
+pfb_pri_mmu_fault_buffer_put_1:
+  offset: "0x100e44"
+  width: 32
+  access: ro
+  reset: "0x00000000"
+  fields: ["19:0 ptr", "30 getptr_corrupted", "31 overflow"]
+  surfaces: [driver fault handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_FAULT_BUFFER_PUT(1)"
+  status: model
+
+# The MMU's own ECC counters (two 16-bit counts: total in the low half, unique in the
+# high). The injector has no location for MMU SRAMs, so nothing counts here: they
+# read zero and keep what is written.
+pfb_pri_mmu_l2tlb_ecc_uncorrected_err_count:
+  offset: "0x100e78"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["15:0 total", "31:16 unique"]
+  surfaces: [diagnostics, driver ECC handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_L2TLB_ECC_UNCORRECTED_ERR_COUNT"
+  status: model
+
+pfb_pri_mmu_hubtlb_ecc_uncorrected_err_count:
+  offset: "0x100e8c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["15:0 total", "31:16 unique"]
+  surfaces: [diagnostics, driver ECC handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_HUBTLB_ECC_UNCORRECTED_ERR_COUNT"
+  status: model
+
+pfb_pri_mmu_fillunit_ecc_uncorrected_err_count:
+  offset: "0x100ea0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["15:0 total", "31:16 unique"]
+  surfaces: [diagnostics, driver ECC handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fb.h NV_PFB_PRI_MMU_FILLUNIT_ECC_UNCORRECTED_ERR_COUNT"
+  status: model
+
+# Uncorrectable (double-bit) ECC errors in device memory, for the first memory partition
+# (FBPA 0): the counters a memory test reads to see whether its pattern tripped ECC.
+# The count is what `vgpu fault` injected as an uncorrectable device-memory error
+# since the driver loaded. The injector counts the whole memory, not partitions, so
+# it is shown on counter 0 and the others read zero. As on hardware, writing the
+# counter sets it (write 0 to clear): it counts up from what was written. A model:
+# the header gives the register, not what feeds it.
+pfb_fbpa_0_ecc_ded_count_0:
+  offset: "0x900488"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_dram_ded_0
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fbpa.h NV_PFB_FBPA_0_ECC_DED_COUNT(0)"
+  status: model
+
+pfb_fbpa_0_ecc_ded_count_1:
+  offset: "0x90048c"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_dram_ded_1
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [turing]
+  source: "turing/tu102/dev_fbpa.h NV_PFB_FBPA_0_ECC_DED_COUNT(1)"
+  status: model
+
+# Hopper's array of four, at another offset than Turing's two. As the Turing counters: the
+# device's injected uncorrectable memory errors on counter 0, writes set the count.
+pfb_fbpa_0_ecc_ded_count_0_gh100:
+  offset: "0x9025a0"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_dram_ded_0
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [hopper]
+  source: "hopper/gh100/dev_fbpa.h NV_PFB_FBPA_0_ECC_DED_COUNT(0)"
+  status: model
+
+pfb_fbpa_0_ecc_ded_count_1_gh100:
+  offset: "0x9025a4"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_dram_ded_1
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [hopper]
+  source: "hopper/gh100/dev_fbpa.h NV_PFB_FBPA_0_ECC_DED_COUNT(1)"
+  status: model
+
+pfb_fbpa_0_ecc_ded_count_2_gh100:
+  offset: "0x9025a8"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_dram_ded_2
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [hopper]
+  source: "hopper/gh100/dev_fbpa.h NV_PFB_FBPA_0_ECC_DED_COUNT(2)"
+  status: model
+
+pfb_fbpa_0_ecc_ded_count_3_gh100:
+  offset: "0x9025ac"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_dram_ded_3
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [hopper]
+  source: "hopper/gh100/dev_fbpa.h NV_PFB_FBPA_0_ECC_DED_COUNT(3)"
+  status: model
+
+# Uncorrectable ECC errors in the first L2 slice: the device's injected
+# uncorrectable L2 errors, settable as the memory counters are. (Blackwell's header
+# for the same count, dev_ltc_zb.h, gives a zero-based offset inside the L2 unit and
+# no BAR0 base, so it is not mapped.)
+pltcg_ltc0_lts0_l2_cache_ecc_uncorrected_err_count:
+  offset: "0x1404f8"
+  width: 32
+  access: rw
+  backing: nvidia.ecc_l2_ded
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  surfaces: [memory diagnostics, driver ECC handler]
+  arch: [turing]
+  source: "turing/tu102/dev_ltc.h NV_PLTCG_LTC0_LTS0_L2_CACHE_ECC_UNCORRECTED_ERR_COUNT"
+  status: model
+
+# A scratch word in the thermal block that the I2C slave interface also reaches.
+# Kept as written. The GB20x header puts it at another offset (below).
+therm_i2cs_scratch:
+  offset: "0x0200bc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 data"]
+  surfaces: [driver, bmc]
+  arch: [hopper, gb100]
+  source: "hopper/gh100/dev_therm.h NV_THERM_I2CS_SCRATCH; blackwell/gb100/dev_therm.h the same"
+  status: done
+
+therm_i2cs_scratch_gb20x:
+  offset: "0xad00bc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 data"]
+  surfaces: [driver, bmc]
+  arch: [gb20x]
+  source: "blackwell/gb202/dev_therm.h NV_THERM_I2CS_SCRATCH"
+  status: done
+
+# Scratch that survives a reset, 16 words. Word 4 is where the driver and firmware
+# keep the confidential-computing state (the header's addendum names the bits).
+# The profiles record no confidential-computing mode, so every word reads the
+# header's reset value, zero: CC off.
+pmc_zb_scratch_reset_2_0:
+  offset: "0x000580"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(0)"
+  status: model
+
+pmc_zb_scratch_reset_2_1:
+  offset: "0x000584"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(1)"
+  status: model
+
+pmc_zb_scratch_reset_2_2:
+  offset: "0x000588"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(2)"
+  status: model
+
+pmc_zb_scratch_reset_2_3:
+  offset: "0x00058c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(3)"
+  status: model
+
+pmc_zb_scratch_reset_2_4:
+  offset: "0x000590"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["0 cc_mode_enabled", "1 cc_dev_enabled", "2 cc_firewall_mode_enabled", "6 cc_nvle_mode_enabled"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(4); dev_pmc_zb_addendum.h NV_PMC_ZB_SCRATCH_RESET_2_CC"
+  status: model
+
+pmc_zb_scratch_reset_2_5:
+  offset: "0x000594"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(5)"
+  status: model
+
+pmc_zb_scratch_reset_2_6:
+  offset: "0x000598"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(6)"
+  status: model
+
+pmc_zb_scratch_reset_2_7:
+  offset: "0x00059c"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(7)"
+  status: model
+
+pmc_zb_scratch_reset_2_8:
+  offset: "0x0005a0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(8)"
+  status: model
+
+pmc_zb_scratch_reset_2_9:
+  offset: "0x0005a4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(9)"
+  status: model
+
+pmc_zb_scratch_reset_2_10:
+  offset: "0x0005a8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(10)"
+  status: model
+
+pmc_zb_scratch_reset_2_11:
+  offset: "0x0005ac"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(11)"
+  status: model
+
+pmc_zb_scratch_reset_2_12:
+  offset: "0x0005b0"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(12)"
+  status: model
+
+pmc_zb_scratch_reset_2_13:
+  offset: "0x0005b4"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(13)"
+  status: model
+
+pmc_zb_scratch_reset_2_14:
+  offset: "0x0005b8"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(14)"
+  status: model
+
+pmc_zb_scratch_reset_2_15:
+  offset: "0x0005bc"
+  width: 32
+  access: rw
+  write_mask: "0xffffffff"
+  reset: "0x00000000"
+  fields: ["31:0 value"]
+  surfaces: [driver, confidential computing]
+  arch: [gb100]
+  source: "blackwell/gb100/dev_pmc_zb.h NV_PMC_ZB_SCRATCH_RESET_2(15)"
+  status: model
+

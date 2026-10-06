@@ -14,6 +14,7 @@
 #include <string>
 
 #include "vgpu/embedded_config_images.hpp"
+#include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -37,7 +38,7 @@ uint64_t pow2_at_least(uint64_t v);
 
 // The words of the shared register state a vendor keeps its own device logic
 // in (the SMU mailbox, on AMD), shared by every process on the machine.
-inline constexpr uint32_t kStateWords = 4;
+inline constexpr uint32_t kStateWords = 12;
 
 // What a vendor's backing is evaluated against.
 struct Context {
@@ -50,6 +51,9 @@ struct Context {
   // its power-on value here, so what the repository keeps is the same every
   // time it is written.
   bool derived = false;
+  // The reliability counts of the run (empty in the model's own file), for a
+  // register that reports them: NVIDIA's ECC error counters.
+  const ras::Counters& ras;
 };
 
 struct Vendor {
@@ -61,6 +65,9 @@ struct Vendor {
   uint32_t mmio_undeclared;     // what a dword no register declares reads as
   bool (*has_mmio)(const telemetry::DeviceSample& d);
   std::array<BarLayout, 6> (*bars)(const telemetry::DeviceSample& d);
+  // Whether this GPU has an MMIO register: its `arch` list names the GPU's
+  // architecture or die. A register a GPU does not have is unmapped there.
+  bool (*has_register)(const telemetry::DeviceSample& d, const Register& r);
   // The captured configuration space the device replays, or null.
   const embedded::ConfigImage* (*captured_config)(const telemetry::DeviceSample& d);
   // The generation Link Status reports now, from the link as trained.

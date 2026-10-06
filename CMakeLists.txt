@@ -1347,6 +1347,13 @@ add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 # minutes by the script; a sanitizer build needs several of them.
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Memory-test patterns (walking bits, address in address, checkerboard, moving
+# inversions, seeded random, block copies, strides) run by checked-in hipcc
+# programs on four AMD GPUs (wave 64 and wave 32), with a stuck cell, bit flips
+# on stores, an uncorrectable HBM error and a wild pointer they must report.
+add_test(NAME amd_memtest_patterns COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_memtest_patterns.sh)
+set_tests_properties(amd_memtest_patterns PROPERTIES DEPENDS "vgpuhip;vgpu_cli"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
@@ -1408,6 +1415,12 @@ set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# NVML and nvidia-smi as health and diagnostic tools use them: ECC counts,
+# retired pages, remapped rows, clock-event reasons, PCIe replays, NVLink and
+# accounting, per card, with errors injected by `vgpu fault`.
+add_test(NAME nvml_health COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_health.sh)
+set_tests_properties(nvml_health PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_isolation_fallback.sh)
