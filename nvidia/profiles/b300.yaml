@@ -51,3 +51,4 @@ telemetry:
   memory: hbm
   memory_temperature: true
   pcie_link: "Gen6 x16"           # NVIDIA: "PCIe Gen6 x 16 lanes"
+  nvlink: "NVLink5 x18"        # data sheet: SXM part, NVLink generation 5, 18 links

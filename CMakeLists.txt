@@ -1415,6 +1415,12 @@ set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# NVML and nvidia-smi as health and diagnostic tools use them: ECC counts,
+# retired pages, remapped rows, clock-event reasons, PCIe replays, NVLink and
+# accounting, per card, with errors injected by `vgpu fault`.
+add_test(NAME nvml_health COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_health.sh)
+set_tests_properties(nvml_health PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_isolation_fallback.sh)

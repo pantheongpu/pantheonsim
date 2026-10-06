@@ -674,8 +674,117 @@ enum : unsigned {
   kSecCompute = 1u << 6,
   kSecPids = 1u << 7,
   kSecPerformance = 1u << 8,
+  kSecRetired = 1u << 9,
+  kSecRemap = 1u << 10,
+  kSecAccounting = 1u << 11,
   kSecAll = ~0u,
 };
+
+// The pieces of the -q report that read the reliability state. Each prints
+// the section as nvidia-smi does, with N/A where the card of the profile has no
+// such thing, so a parser finds the same lines on every card.
+const char* yes_no(uint64_t v) { return v ? "Yes" : "No"; }
+
+// "ECC Errors": volatile (since the driver loaded) and aggregate (the card's
+// life), each by single bit (corrected) and double bit (uncorrected) and by
+// location -- the form nvidia-smi's manual shows, and the one NVML's
+// per-location counters map onto. A card without ECC (GeForce) has no counts,
+// so every one is N/A rather than a zero it could not have counted.
+void print_ecc_errors(const vgpu::telemetry::DeviceSample& d, const vgpu::ras::State* st) {
+  using L = vgpu::ras::Location;
+  struct Row {
+    const char* name;
+    int location;   // a Location, or -1 for the total, -2 for a location not tracked
+  };
+  static const Row rows[] = {
+      {"Device Memory", static_cast<int>(L::DeviceMemory)}, {"Register File", static_cast<int>(L::RegisterFile)},
+      {"L1 Cache", static_cast<int>(L::L1Cache)},           {"L2 Cache", static_cast<int>(L::L2Cache)},
+      {"Texture Memory", static_cast<int>(L::TextureMemory)}, {"Texture Shared", -2},
+      {"CBU", static_cast<int>(L::Cbu)},                    {"SRAM", static_cast<int>(L::Sram)},
+      {"Total", -1}};
+  std::printf("    ECC Errors\n");
+  for (int agg = 0; agg < 2; ++agg) {
+    std::printf("        %s\n", agg ? "Aggregate" : "Volatile");
+    for (int sev = 0; sev < 2; ++sev) {
+      std::printf("            %s\n", sev ? "Double Bit" : "Single Bit");
+      const vgpu::ras::Counters* c = st ? (agg ? &st->lifetime : &st->since_load) : nullptr;
+      for (const Row& r : rows) {
+        std::string v = "N/A";
+        if (c && d.ecc_enabled) {
+          if (r.location == -1)
+            v = std::to_string(c->ecc_total(sev ? vgpu::ras::Severity::Uncorrected
+                                                : vgpu::ras::Severity::Corrected));
+          else if (r.location == -2) v = "0";   // texture shared memory: not a location tracked
+          else v = std::to_string(c->ecc[sev][r.location]);
+        }
+        std::printf("                %-39s: %s\n", r.name, v.c_str());
+      }
+    }
+  }
+}
+
+// "Retired Pages": a GDDR card of Turing or earlier with ECC retires them; every
+// other card answers N/A (it remaps rows instead, or has no ECC).
+void print_retired_pages(const vgpu::telemetry::DeviceSample& d, const vgpu::ras::State* st) {
+  const bool has = st && d.memory_retirement == 1;
+  std::printf("    Retired Pages\n");
+  std::printf("        %-47s: %s\n", "Single Bit ECC",
+              has ? std::to_string(st->lifetime.retired_sbe).c_str() : "N/A");
+  std::printf("        %-47s: %s\n", "Double Bit ECC",
+              has ? std::to_string(st->lifetime.retired_dbe).c_str() : "N/A");
+  std::printf("        %-47s: %s\n", "Pending Page Blacklist",
+              has ? yes_no(st->lifetime.retired_pending) : "N/A");
+}
+
+// "Remapped Rows": a card of Ampere or later with ECC, and every HBM card.
+// The bank availability histogram needs a bank count no profile records (see
+// nvmlDeviceGetRowRemapperHistogram), so it reads N/A, as the query fields do.
+void print_remapped_rows(const vgpu::telemetry::DeviceSample& d, const vgpu::ras::State* st) {
+  if (!st || d.memory_retirement != 2) {
+    std::printf("    %-51s: %s\n", "Remapped Rows", "N/A");
+    return;
+  }
+  std::printf("    Remapped Rows\n");
+  std::printf("        %-47s: %llu\n", "Correctable Error",
+              static_cast<unsigned long long>(st->lifetime.rows_correctable));
+  std::printf("        %-47s: %llu\n", "Uncorrectable Error",
+              static_cast<unsigned long long>(st->lifetime.rows_uncorrectable));
+  std::printf("        %-47s: %s\n", "Pending", yes_no(st->lifetime.rows_pending));
+  std::printf("        %-47s: %s\n", "Remapping Failure Occurred", yes_no(st->lifetime.rows_failure));
+  std::printf("        Bank Remap Availability Histogram\n");
+  for (const char* k : {"Max", "High", "Partial", "Low", "None"})
+    std::printf("            %-43s: %s\n", k, "N/A");
+}
+
+// "Clocks Event Reasons" -- what is holding the clocks down now -- and the time
+// each has held them. Idle is reported whenever the GPU is idle, as a real idle
+// card does; the rest are active only while `vgpu fault throttle` says so.
+void print_clock_events(const vgpu::telemetry::DeviceSample& d) {
+  const uint64_t active = (d.utilization_gpu == 0 ? vgpu::ras::kGpuIdle : 0) | d.clock_event_reasons;
+  const auto on = [&](uint64_t bit) { return (active & bit) ? "Active" : "Not Active"; };
+  std::printf("    Clocks Event Reasons\n");
+  std::printf("        %-47s: %s\n", "Idle", on(vgpu::ras::kGpuIdle));
+  std::printf("        %-47s: %s\n", "Applications Clocks Setting", "Not Active");
+  std::printf("        %-47s: %s\n", "SW Power Cap", on(vgpu::ras::kSwPowerCap));
+  std::printf("        %-47s: %s\n", "HW Slowdown", on(vgpu::ras::kHwSlowdown));
+  std::printf("            %-43s: %s\n", "HW Thermal Slowdown", on(vgpu::ras::kHwThermalSlowdown));
+  std::printf("            %-43s: %s\n", "HW Power Brake Slowdown", on(vgpu::ras::kHwPowerBrakeSlowdown));
+  std::printf("        %-47s: %s\n", "Sync Boost", "Not Active");
+  std::printf("        %-47s: %s\n", "SW Thermal Slowdown", on(vgpu::ras::kSwThermalSlowdown));
+  std::printf("        %-47s: %s\n", "Display Clock Setting", "Not Active");
+  std::printf("    Clocks Event Reasons Counters\n");
+  const struct {
+    const char* name;
+    uint64_t bit;
+  } counters[] = {{"SW Power Capping", vgpu::ras::kSwPowerCap},
+                  {"Sync Boost", 0},
+                  {"SW Thermal Slowdown", vgpu::ras::kSwThermalSlowdown},
+                  {"HW Thermal Slowdown", vgpu::ras::kHwThermalSlowdown},
+                  {"HW Power Braking", vgpu::ras::kHwPowerBrakeSlowdown}};
+  for (const auto& c : counters)
+    std::printf("        %-47s: %llu us\n", c.name,
+                static_cast<unsigned long long>(c.bit ? vgpu::ras::throttle_time_us(d.uuid, c.bit) : 0));
+}
 
 // The verbose "-q" report. Tools scrape it for identity and limits, so the
 // indentation and the "key : value" alignment are part of the interface.
@@ -685,15 +794,16 @@ enum : unsigned {
 void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel,
                    unsigned sections) {
   const auto want = [&](unsigned sec) { return (sections & sec) != 0; };
-  char when[64];
+  char when_buf[64];
   std::time_t now = std::time(nullptr);
   std::tm tm{};
   ::localtime_r(&now, &tm);
-  std::strftime(when, sizeof when, "%a %b %e %H:%M:%S %Y", &tm);
+  std::strftime(when_buf, sizeof when_buf, "%a %b %e %H:%M:%S %Y", &tm);
+  const std::string when = when_buf;
   // The same versions the table header prints. This used to say CUDA 13.0
   // whatever the session was, beside a header two commands away that said 12.4.
   std::printf("\n==============NVSMI LOG==============\n\n");
-  std::printf("%-55s: %s\n", "Timestamp", when);
+  std::printf("%-55s: %s\n", "Timestamp", when.c_str());
   std::printf("%-55s: %s\n", "Driver Version",
               s.driver_version[0] ? s.driver_version : vgpu::kDefaultDriverRelease);
   std::printf("%-55s: %s\n", "CUDA Version", s.cuda_version[0] ? s.cuda_version : "13.0");
@@ -726,9 +836,32 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
         std::printf("                %-39s: %ux\n", "Max", l.max_width);
         std::printf("                %-39s: %ux\n", "Current", l.width);
       }
+      // Replays since the driver loaded, from the machine's PCIe counters
+      // (zero until `vgpu fault inject --pcie replay`). The throughput needs
+      // a traffic counter the simulator does not keep.
+      {
+        const vgpu::ras::State& pst = ras_for(d, when);
+        const auto replay = static_cast<unsigned long long>(
+            pst.since_load.pcie[static_cast<uint32_t>(vgpu::ras::Pcie::Replay)]);
+        const auto rollover = static_cast<unsigned long long>(
+            pst.since_load.pcie[static_cast<uint32_t>(vgpu::ras::Pcie::ReplayRollover)]);
+        std::printf("        %-47s: %llu\n", "Replays Since Reset", replay);
+        std::printf("        %-47s: %llu\n", "Replay Number Rollovers", rollover);
+        std::printf("        %-47s: %s\n", "Tx Throughput", "N/A");
+        std::printf("        %-47s: %s\n", "Rx Throughput", "N/A");
+      }
       std::printf("    %-51s: %u %%\n", "Fan Speed", d.fan_percent);
     }
-    if (want(kSecPerformance)) std::printf("    %-51s: P%u\n", "Performance State", d.perf_state);
+    if (want(kSecAccounting)) {
+      // The mode is the driver's and nothing here persists it across processes,
+      // so a fresh report always finds it at its default, off.
+      std::printf("    %-51s: %s\n", "Accounting Mode", "Disabled");
+      std::printf("    %-51s: %d\n", "Accounting Mode Buffer Size", 4000);
+    }
+    if (want(kSecPerformance)) {
+      std::printf("    %-51s: P%u\n", "Performance State", d.perf_state);
+      print_clock_events(d);
+    }
     if (want(kSecMemory)) {
       std::printf("    FB Memory Usage\n");
       std::printf("        %-47s: %d MiB\n", "Total", mib(d.vram_total_bytes));
@@ -749,10 +882,22 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
       std::printf("    ECC Mode\n");
       std::printf("        %-47s: %s\n", "Current", mode);
       std::printf("        %-47s: %s\n", "Pending", mode);
+      print_ecc_errors(d, &ras_for(d, when));
     }
+    if (want(kSecRetired)) print_retired_pages(d, &ras_for(d, when));
+    if (want(kSecRemap)) print_remapped_rows(d, &ras_for(d, when));
     if (want(kSecTemperature)) {
       std::printf("    Temperature\n");
       std::printf("        %-47s: %u C\n", "GPU Current Temp", d.temperature_c);
+      // The thresholds NVML answers (nvmlDeviceGetTemperatureThreshold): none
+      // when the profile's driver reported none.
+      if (d.temperature_max_c) {
+        std::printf("        %-47s: %u C\n", "GPU Shutdown Temp", d.temperature_max_c + 5);
+        std::printf("        %-47s: %u C\n", "GPU Slowdown Temp", d.temperature_max_c);
+      } else {
+        std::printf("        %-47s: %s\n", "GPU Shutdown Temp", "N/A");
+        std::printf("        %-47s: %s\n", "GPU Slowdown Temp", "N/A");
+      }
       if (d.has_memory_temperature)
         std::printf("        %-47s: %u C\n", "Memory Current Temp",
                     d.temperature_mem_c ? d.temperature_mem_c : d.temperature_c);
@@ -761,8 +906,16 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
     }
     if (want(kSecPower)) {
       std::printf("    Power Readings\n");
+      std::printf("        %-47s: %s\n", "Power Management", d.power_limit_mw ? "Supported" : "N/A");
       std::printf("        %-47s: %.2f W\n", "Power Draw", d.power_mw / 1000.0);
       std::printf("        %-47s: %.2f W\n", "Current Power Limit", d.power_limit_mw / 1000.0);
+      // The limits NVML reports: the profile carries one, so the default and
+      // requested limits are it, and the minimum is the half of it NVML's
+      // constraints call the least a limit can be set to.
+      std::printf("        %-47s: %.2f W\n", "Requested Power Limit", d.power_limit_mw / 1000.0);
+      std::printf("        %-47s: %.2f W\n", "Default Power Limit", d.power_limit_mw / 1000.0);
+      std::printf("        %-47s: %.2f W\n", "Min Power Limit", d.power_limit_mw / 2000.0);
+      std::printf("        %-47s: %.2f W\n", "Max Power Limit", d.power_limit_mw / 1000.0);
     }
     if (want(kSecClock)) {
       std::printf("    Clocks\n");
@@ -801,11 +954,11 @@ int parse_display(const std::string& spec, unsigned* out) {
                 {"ECC", kSecEcc},                 {"TEMPERATURE", kSecTemperature},
                 {"POWER", kSecPower},             {"CLOCK", kSecClock},
                 {"COMPUTE", kSecCompute},         {"PIDS", kSecPids},
-                {"PERFORMANCE", kSecPerformance}};
+                {"PERFORMANCE", kSecPerformance}, {"PAGE_RETIREMENT", kSecRetired},
+                {"ROW_REMAPPER", kSecRemap},      {"ACCOUNTING", kSecAccounting}};
   static const char* const kNoData[] = {
-      "SUPPORTED_CLOCKS", "PAGE_RETIREMENT", "ACCOUNTING",   "ENCODER_STATS",
-      "SUPPORTED_GPU_TARGET_TEMP", "VOLTAGE", "FBC_STATS",  "ROW_REMAPPER",
-      "RESET_STATUS", "GSP_FIRMWARE_VERSION"};
+      "SUPPORTED_CLOCKS", "ENCODER_STATS", "SUPPORTED_GPU_TARGET_TEMP", "VOLTAGE",
+      "FBC_STATS", "RESET_STATUS", "GSP_FIRMWARE_VERSION"};
   unsigned mask = 0;
   for (const std::string& raw : split_fields(spec)) {
     std::string name = raw;
@@ -822,7 +975,8 @@ int parse_display(const std::string& spec, unsigned* out) {
       }
     std::fprintf(stderr,
                  "vgpu smi: '%s' is not a -d section. Use MEMORY, UTILIZATION, ECC, TEMPERATURE,\n"
-                 "          POWER, CLOCK, COMPUTE, PIDS or PERFORMANCE, comma-separated.\n",
+                 "          POWER, CLOCK, COMPUTE, PIDS, PERFORMANCE, PAGE_RETIREMENT,\n"
+                 "          ROW_REMAPPER or ACCOUNTING, comma-separated.\n",
                  raw.c_str());
     return 2;
   }
@@ -1137,7 +1291,8 @@ void print_smi_usage(FILE* to) {
       "  -q, --query                 The verbose report\n"
       "  -d, --display=SECTIONS      With -q, only these sections, comma-separated: MEMORY,\n"
       "                              UTILIZATION, ECC, TEMPERATURE, POWER, CLOCK, COMPUTE,\n"
-      "                              PIDS, PERFORMANCE\n"
+      "                              PIDS, PERFORMANCE, PAGE_RETIREMENT, ROW_REMAPPER,\n"
+      "                              ACCOUNTING\n"
       "  -x, --xml-format            The verbose report as XML\n"
       "      --query-gpu=FIELDS      Chosen fields per GPU (see --help-query-gpu); needs --format\n"
       "      --query-compute-apps=FIELDS\n"
@@ -1145,7 +1300,10 @@ void print_smi_usage(FILE* to) {
       "      --format=csv[,noheader][,nounits]\n"
       "  -l, --loop[=SEC]            Repeat every SEC seconds (default 5) until interrupted\n"
       "  -lms, --loop-ms=MS          Repeat every MS milliseconds until interrupted\n"
+      "  -r, --gpu-reset             Reset the GPUs: the driver's volatile state and any\n"
+      "                              pending page retirement or row remap take effect\n"
       "  topo -m                     How the GPUs are connected\n"
+      "  nvlink -s | -e              NVLink status, or error counters, of GPUs that have it\n"
       "\n"
       "VirtualGPU additions:\n"
       "      --details               Append the virtual device details to the table\n"
@@ -1158,6 +1316,32 @@ void print_smi_usage(FILE* to) {
       "      --lspci-ids FILE        A PCI ID database naming the simulated cards, for `lspci -i`\n"
       "\n"
       "Exit status: 0 success, 2 invalid argument, 6 no such device.\n");
+}
+
+// `nvidia-smi nvlink -s` and `-e`: link state and error counters, for the GPUs
+// whose profile names their links (telemetry.nvlink). The speed is NVLink's
+// per-link rate by generation, from NVIDIA's data sheets: 25 GB/s for NVLink 3
+// and 26.562 GB/s for NVLink 4; a generation not listed here prints no speed.
+// Links are all up and error counters zero -- see nvmlDeviceGetNvLinkState in
+// nvidia/src/nvml_api.cpp for the assumptions.
+void print_nvlink(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& sel, bool errors) {
+  for (uint32_t i : sel) {
+    const auto& d = s.devices[i];
+    std::printf("GPU %u: %s (UUID: %s)\n", i, d.name, d.uuid);
+    for (uint32_t link = 0; link < d.nvlink_count; ++link) {
+      if (errors) {
+        std::printf("\t Link %u: Replay Errors: 0\n", link);
+        std::printf("\t Link %u: Recovery Errors: 0\n", link);
+        std::printf("\t Link %u: CRC Errors: 0\n", link);
+      } else if (d.nvlink_version == 3) {
+        std::printf("\t Link %u: 25 GB/s\n", link);
+      } else if (d.nvlink_version == 4) {
+        std::printf("\t Link %u: 26.562 GB/s\n", link);
+      } else {
+        std::printf("\t Link %u: <active>\n", link);
+      }
+    }
+  }
 }
 
 void print_topo_usage(FILE* to) {
@@ -1825,6 +2009,8 @@ int cmd_smi(const std::vector<std::string>& args) {
   bool have_query_gpu = false, have_query_apps = false, have_format = false, have_display = false;
   bool header = true, units = true, list = false, xml = false, topo = false;
   int reset_ecc = -1;   // -p: 0 volatile, 1 aggregate
+  bool gpu_reset = false;   // -r
+  int nvlink = 0;           // nvlink -s: 's', -e: 'e'
   long long loop_ms = 0;
   auto fail = [](const std::string& msg) {
     std::fprintf(stderr, "vgpu smi: %s\n", msg.c_str());
@@ -1914,6 +2100,19 @@ int cmd_smi(const std::vector<std::string>& args) {
       }
       topo = true;
       ++i;
+    } else if (a == "nvlink") {
+      // -s (state) and -e (error counters), the two every health check runs.
+      // The rest of the subcommand (capabilities, utilization counters,
+      // remote devices) needs link topology no profile has.
+      if (i + 1 >= args.size() || (args[i + 1] != "-s" && args[i + 1] != "--status" &&
+                                   args[i + 1] != "-e" && args[i + 1] != "--errorcounters")) {
+        std::fprintf(stderr, "vgpu smi: nvlink supports -s (--status) and -e (--errorcounters)\n");
+        return 2;
+      }
+      nvlink = args[i + 1] == "-s" || args[i + 1] == "--status" ? 's' : 'e';
+      ++i;
+    } else if (a == "-r" || a == "--gpu-reset") {
+      gpu_reset = true;
     } else if (a == "-L" || a == "--list-gpus" || a == "--list") {
       // One line per GPU, "GPU <n>: <name> (UUID: <uuid>)". Recognized here,
       // wherever it appears: the session wrapper only translated it as the
@@ -1957,6 +2156,64 @@ int cmd_smi(const std::vector<std::string>& args) {
   }
   if (version) {
     print_version();
+    return 0;
+  }
+  // -r resets the selected GPUs, all of them by default. A reset is what makes
+  // a pending page retirement or row remap take effect, clears the counts since
+  // the driver loaded, and retrains a degraded PCIe link; the aggregate counts
+  // are the card's life and stay. A GPU a process is using is refused, as the
+  // real tool does, with its message and exit code 255 ("other error").
+  if (gpu_reset) {
+    vgpu::telemetry::Shared snap{};
+    if (!read_machine(&snap)) return 1;
+    std::vector<uint32_t> sel;
+    if (!select_devices(snap, id_spec, &sel)) {
+      std::printf("No devices were found\n");
+      return 6;
+    }
+    int busy = 0;
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      bool lost = false;
+      try {
+        lost = vgpu::ras::is_lost(d.uuid);
+      } catch (const std::exception&) {
+      }
+      if (lost) {
+        // A GPU off the bus cannot be reset from here; `vgpu fault lose --clear`
+        // is the simulated reboot that brings it back.
+        std::fprintf(stderr,
+                     "Unable to determine the device handle for GPU%s: GPU is lost.  Reboot the "
+                     "system to recover this GPU\n",
+                     d.bus_id);
+        return 15;
+      }
+      if (d.proc_count) {
+        std::printf("GPU %s is currently in use by another process.\n", d.bus_id);
+        ++busy;
+      }
+    }
+    if (busy) {
+      std::printf("\n%d device%s is currently being used by one or more other processes (e.g., "
+                  "Fabric Manager, CUDA application, graphics application such as an X server, or a "
+                  "monitoring application such as another instance of nvidia-smi). Please first kill "
+                  "all processes using this device and all compute applications running in the "
+                  "system.\n",
+                  busy, busy == 1 ? "" : "s");
+      return 255;
+    }
+    for (uint32_t i : sel) {
+      const auto& d = snap.devices[i];
+      try {
+        vgpu::ras::reset_volatile(d.uuid, /*driver_reload=*/true);
+        vgpu::ras::restore_link(d.uuid);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "Failed to reset GPU %s: %s\n", d.bus_id, e.what());
+        return 255;
+      }
+      std::printf("GPU %s was successfully reset.\n", d.bus_id);
+    }
+    std::printf("All done.\n");
     return 0;
   }
   // -p resets the ECC counts of the selected GPUs, all of them by default.
@@ -2072,6 +2329,8 @@ int cmd_smi(const std::vector<std::string>& args) {
     const bool with_header = header && first;
     if (topo) {
       print_topology(snap);
+    } else if (nvlink) {
+      print_nvlink(snap, sel, nvlink == 'e');
     } else if (list) {
       for (uint32_t i : sel)
         std::printf("GPU %u: %s (UUID: %s)\n", i, snap.devices[i].name, snap.devices[i].uuid);
