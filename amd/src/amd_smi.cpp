@@ -15,14 +15,18 @@
 // AMD, MIT license); nothing here is AMD's code.
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "vgpu/amd_chip.hpp"
 #include "vgpu/amd_kfd.hpp"
 #include "vgpu/machine.hpp"
+#include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -41,6 +45,12 @@ enum Status : int {
 
 enum ProcessorType : int { kAmdGpu = 1 };                  // processor_type_t
 enum LinkType : int { kLinkInternal = 0, kLinkPcie = 1, kLinkXgmi = 2 };  // amdsmi_link_type_t
+enum ClockType : int { kClkSys = 0, kClkMem = 4 };           // amdsmi_clk_type_t (GFX is SYS)
+enum TempType : int { kTempEdge = 0, kTempJunction = 1, kTempVram = 2, kTempHbm0 = 3, kTempHbm3 = 6 };
+enum TempMetric : int { kTempCurrent = 0, kTempMax = 1, kTempCritical = 5, kTempEmergency = 7 };
+constexpr uint64_t kEccBlocks = 0xFF;      // UMC, SDMA, GFX, MMHUB, ATHUB, PCIE_BIF, HDP, XGMI_WAFL
+constexpr uint64_t kBlockXgmiWafl = 0x80;
+enum RasState : int { kRasDisabled = 1, kRasEnabled = 6 };    // amdsmi_ras_err_state_t
 enum MemoryType : int { kMemVram = 0, kMemVisVram = 1 };   // amdsmi_memory_type_t
 constexpr uint64_t kInitAmdGpus = 1u << 1;                 // AMDSMI_INIT_AMD_GPUS
 constexpr uint32_t kUuidSize = 38;                          // AMDSMI_GPU_UUID_SIZE
@@ -81,9 +91,28 @@ struct EngineUsage {  // amdsmi_engine_usage_t
   uint32_t gfx_activity, umc_activity, mm_activity;
   uint32_t reserved[13];
 };
+struct Frequencies {  // amdsmi_frequencies_t
+  bool has_deep_sleep;
+  uint32_t num_supported, current;
+  uint64_t frequency[33];  // AMDSMI_MAX_NUM_FREQUENCIES; Hz, as ROCm SMI's library gives them
+};
+struct PowerInfo {  // amdsmi_power_info_t
+  uint64_t socket_power;
+  uint32_t current_socket_power, average_socket_power;
+  uint64_t gfx_voltage, soc_voltage, mem_voltage;
+  uint32_t power_limit;
+  uint64_t reserved[18];
+};
+struct PowerCapInfo {  // amdsmi_power_cap_info_t
+  uint64_t power_cap, default_power_cap, dpm_cap, min_power_cap, max_power_cap, reserved[3];
+};
+struct ErrorCount {  // amdsmi_error_count_t
+  uint64_t correctable_count, uncorrectable_count, deferred_count, reserved[5];
+};
 // amdsmi_bdf_t: function 3 bits, device 5, bus 8, domain 48.
 using Bdf = uint64_t;
 static_assert(sizeof(AsicInfo) == 896 && sizeof(KfdInfo) == 64 && sizeof(DriverInfo) == 768);
+static_assert(sizeof(Frequencies) == 280 && sizeof(PowerCapInfo) == 64 && sizeof(ErrorCount) == 64);
 static_assert(sizeof(EnumerationInfo) == 272 && sizeof(Version) == 24 && sizeof(EngineUsage) == 64);
 
 using Sample = vgpu::telemetry::DeviceSample;
@@ -377,6 +406,160 @@ AMDSMI_API int amdsmi_get_gpu_activity(void* h, EngineUsage* u) {
   u->gfx_activity = s.utilization_gpu;
   u->umc_activity = s.utilization_mem;
   u->mm_activity = kNone32;
+  return kSuccess;
+}
+
+// ---- Sensors: clocks, temperature, power, energy -----------------------------------
+//
+// The values are `vgpu smi`'s and ROCm SMI's library's, so the three agree; a
+// sensor the card (or its profile) has none of answers NOT_SUPPORTED, as AMD
+// SMI does where the driver exposes no file for it: an Instinct GPU has no edge
+// sensor, a Radeon no HBM stacks or energy accumulator.
+
+namespace {
+// The levels a caller restricted a clock to with amdsmi_set_clk_freq: a mask
+// for each GPU and clock, held by this process (the machine's sample is
+// shared; what a process asks of the driver is its own request).
+std::mutex g_mu;
+uint64_t g_mask[256][2];   // [GPU][0: system, 1: memory]; 0 = unrestricted
+
+int clock_index(int type) { return type == kClkSys ? 0 : type == kClkMem ? 1 : -1; }
+
+// Two levels, as ROCm SMI's library gives them: the clock the card runs at
+// below its most (or its idle where it is at the most), and the most.
+void levels(Frequencies* f, const Sample& s, int idx, int gpu) {
+  const uint32_t max_mhz = idx == 0 ? s.sm_clock_max_mhz : s.mem_clock_max_mhz;
+  const uint32_t now_mhz = idx == 0 ? s.sm_clock_mhz : s.mem_clock_mhz;
+  const uint32_t idle_mhz = max_mhz / (idx == 0 ? 6 : 5);
+  std::memset(f, 0, sizeof *f);
+  const bool at_max = now_mhz >= max_mhz;
+  f->num_supported = 2;
+  f->frequency[0] = uint64_t{at_max ? idle_mhz : now_mhz} * 1000000;
+  f->frequency[1] = uint64_t{max_mhz} * 1000000;
+  f->current = at_max ? 1 : 0;
+  // A request for one level pins the clock there.
+  const uint64_t m = g_mask[gpu][idx];
+  if (m == 1 || m == 2) f->current = m == 1 ? 0 : 1;
+}
+}  // namespace
+
+AMDSMI_API int amdsmi_get_clk_freq(void* h, int type, Frequencies* f) {
+  GPU(h, s, f);
+  const int idx = clock_index(type);
+  if (idx < 0) return kNotSupported;   // fabric, SoC, video, display: not modelled
+  std::lock_guard<std::mutex> lock(g_mu);
+  levels(f, s, idx, s_i);
+  return kSuccess;
+}
+// Limits the clock to the levels whose bits are set. A mask with a level the
+// clock does not have is out of bounds, as is none at all.
+AMDSMI_API int amdsmi_set_clk_freq(void* h, int type, uint64_t mask) {
+  if (!g_init) return kNotInit;
+  const int i = ordinal(h, kGpuBase);
+  if (i < 0) return kNotFound;
+  const int idx = clock_index(type);
+  if (idx < 0) return kNotSupported;
+  if (mask == 0 || (mask & ~uint64_t{3})) return kInputOutOfBounds;
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_mask[i][idx] = mask == 3 ? 0 : mask;
+  return kSuccess;
+}
+
+// Degrees Celsius (AMD SMI's library converts the driver's millidegrees). The
+// sensors are those of rsmi_dev_temp_metric_get: junction everywhere, edge on
+// Radeon only, VRAM and the HBM stacks where the profile reports a memory
+// sensor.
+AMDSMI_API int amdsmi_get_temp_metric(void* h, int sensor, int metric, int64_t* t) {
+  GPU(h, s, t);
+  if (sensor < 0 || sensor > 249 || metric < 0 || metric > 14) return kInval;
+  uint32_t c = 0;
+  if (sensor == kTempJunction) c = s.temperature_c;
+  else if (sensor == kTempEdge && !instinct(s)) c = s.temperature_c;
+  else if ((sensor == kTempVram || (instinct(s) && sensor >= kTempHbm0 && sensor <= kTempHbm3)) && s.has_memory_temperature)
+    c = s.temperature_mem_c ? s.temperature_mem_c : s.temperature_c;
+  else return kNotSupported;
+  if (metric == kTempCurrent) *t = c;
+  else if (metric == kTempMax || metric == kTempCritical || metric == kTempEmergency) {
+    if (sensor != kTempJunction) return kNotSupported;
+    *t = s.temperature_max_c;
+  } else return kNotSupported;
+  return kSuccess;
+}
+
+// Watts. A member the card has no reading for is UINT32_MAX, as the header
+// says. MI300 and newer report the current socket power; the earlier Instinct
+// and Radeon GPUs the average, so only one of the two is set.
+AMDSMI_API int amdsmi_get_power_info(void* h, PowerInfo* info) {
+  GPU(h, s, info);
+  std::memset(info, 0xFF, sizeof *info);
+  std::memset(info->reserved, 0, sizeof info->reserved);
+  const uint32_t w = (s.power_mw + 500) / 1000;
+  const bool current = std::strcmp(s.architecture, "cdna3") == 0 || std::strcmp(s.architecture, "cdna4") == 0;
+  info->socket_power = w;
+  (current ? info->current_socket_power : info->average_socket_power) = w;
+  info->gfx_voltage = s.voltage_mv;
+  info->power_limit = (s.power_limit_mw + 500) / 1000;
+  return kSuccess;
+}
+// Microwatts, as a bare-metal Linux driver gives them.
+AMDSMI_API int amdsmi_get_power_cap_info(void* h, uint32_t sensor, PowerCapInfo* info) {
+  GPU(h, s, info);
+  if (sensor != 0) return kNotSupported;
+  std::memset(info, 0, sizeof *info);
+  info->power_cap = info->default_power_cap = info->max_power_cap = uint64_t{s.power_limit_mw} * 1000;
+  return kSuccess;
+}
+
+// Energy since the library was loaded, integrated from the power model's
+// reading at each call, in the accumulator's 15.3 uJ ticks. The count starts
+// from an offset for each GPU, as a hardware counter does not start at zero.
+// Only Instinct GPUs have the accumulator: a Radeon's driver has no energy file.
+AMDSMI_API int amdsmi_get_energy_count(void* h, uint64_t* energy, float* resolution, uint64_t* timestamp) {
+  GPU(h, s, energy);
+  if (!instinct(s)) return kNotSupported;
+  static std::mutex mu;
+  static double joules[256];
+  static std::chrono::steady_clock::time_point last[256];
+  const auto now = std::chrono::steady_clock::now();
+  constexpr double kTickUj = 15.3;
+  std::lock_guard<std::mutex> lock(mu);
+  if (last[s_i].time_since_epoch().count() != 0)
+    joules[s_i] += s.power_mw / 1000.0 * std::chrono::duration<double>(now - last[s_i]).count();
+  last[s_i] = now;
+  *energy = static_cast<uint64_t>(joules[s_i] * 1e6 / kTickUj) + 1000000 + 4096 * static_cast<uint64_t>(s_i);
+  if (resolution) *resolution = static_cast<float>(kTickUj);
+  if (timestamp) *timestamp = static_cast<uint64_t>(now.time_since_epoch().count());
+  return kSuccess;
+}
+
+// ---- Reliability -----------------------------------------------------------------------
+//
+// ECC and RAS as rocm_smi.cpp reads them: only a card whose profile ships ECC
+// has any. Counts are the RAS model's, as `vgpu smi` reports them.
+
+AMDSMI_API int amdsmi_get_gpu_ecc_enabled(void* h, uint64_t* mask) {
+  GPU(h, s, mask);
+  *mask = s.ecc_enabled ? kEccBlocks : 0;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_ecc_status(void* h, uint64_t block, int* state) {
+  GPU(h, s, state);
+  if (!(block & kEccBlocks) || (block & (block - 1))) return kInval;
+  if (block == kBlockXgmiWafl && !instinct(s)) return kNotSupported;
+  *state = s.ecc_enabled ? kRasEnabled : kRasDisabled;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_total_ecc_count(void* h, ErrorCount* ec) {
+  GPU(h, s, ec);
+  if (!s.ecc_enabled) return kNotSupported;
+  vgpu::ras::Counters c{};
+  try {
+    c = vgpu::ras::read(s.uuid).since_load;
+  } catch (const std::exception&) {
+  }
+  std::memset(ec, 0, sizeof *ec);
+  ec->correctable_count = c.ecc_total(vgpu::ras::Severity::Corrected);
+  ec->uncorrectable_count = c.ecc_total(vgpu::ras::Severity::Uncorrected);
   return kSuccess;
 }
 
