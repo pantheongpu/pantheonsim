@@ -31,6 +31,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/host_atomic.hpp"
+#include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
@@ -120,6 +121,7 @@ struct Cluster {
 struct Block {
   uint32_t ctaid[3] = {};
   uint32_t rank = 0;            // in its cluster (SR_CgaCtaId)
+  uint32_t worker = 0;          // the launch's host thread running it (SR_VIRTUALSMID)
   Cluster* cluster = nullptr;
   Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
@@ -217,6 +219,10 @@ class Runner {
                                       static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
     local_size_ = (local_size_ + 15) & ~15u;
     shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
+    if (m.sm >= 100)
+      for (const CubinSymbol& sym : m.cubin.symbols)
+        if (sym.name == ".nv.reservedSmem.offset0") alloc_handshake_ = static_cast<uint32_t>(sym.value);
+        else if (sym.name == "__nv_reservedSMEM_tmem_allocation_pipeline_mbarrier") alloc_mbar_ = static_cast<uint32_t>(sym.value);
     // From compute capability 8.0 the driver reserves 1 KiB of shared memory
     // behind every block's own, which it rounds to its 128-byte allocation
     // unit (cooperative_groups keeps the scratch of multi-warp tiles there).
@@ -313,7 +319,7 @@ class Runner {
   void exec_clc(Block& blk, Warp& w, const Instr& ins, Mask ex);           // UGETNEXTWORKID
   Block& shared_block(Block& blk, uint64_t addr, uint32_t* off);
   Block& cluster_block(Block& blk, uint32_t rank);
-  void run_cluster(uint64_t k);                          // one cluster's blocks, together
+  void run_cluster(uint64_t k, unsigned worker);        // one cluster's blocks, together
   void cluster_barrier_check(Block& blk);                // UCGABAR: complete the phase if all are in
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   bool device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
@@ -347,6 +353,15 @@ class Runner {
   uint32_t local_size_ = 0;
   uint64_t shared_size_ = 0;
   uint64_t kernel_shared_ = 0;   // the block's own shared memory, rounded (see shared_size_)
+  // Where ptxas keeps its two-CTA Tensor Memory allocation handshake in the
+  // driver's reserved shared memory (.nv.reservedSmem.offset0), or ~0u.
+  uint32_t alloc_handshake_ = ~0u;
+  // CUDA 12.8's ptxas names the handshake's mbarrier (__nv_reservedSMEM_tmem_
+  // allocation_pipeline_mbarrier, at 0x58 beside separate phase, mask and
+  // parity words) where CUDA 13's keeps it eight bytes into one 32-byte
+  // struct; ~0u when the module is the latter's.
+  uint32_t alloc_mbar_ = ~0u;
+  void seed_alloc_handshake(Block& blk);   // by the block's rank in its pair
   uint64_t smemsz_ = 0;          // SR_SMEMSZ: the whole allocation, in allocation units
   uint32_t block_threads_ = 0;
   // Thread-block clusters: the shape (1x1x1 without one), its size, and
@@ -400,6 +415,9 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
     put32(nctaid + 4 * i, cfg_.grid[i]);
   }
   if (sm < 90) put64(0x18, kSharedWindow);
+  // %nsmid, which ptxas reads from bank 0 rather than a special register:
+  // the SM count, which SR_VIRTUALSMID stays below.
+  put32(sm >= 100 ? 0x2d0 : 0x10c, profile_.limits.multiprocessors);
   // The reserved shared memory (see shared_size_): its size, which ptxas
   // subtracts from SR_SMEMSZ for %reserved_smem_offset_begin, and before
   // sm_90 %reserved_smem_offset_end (the 0x120 bytes the driver uses past
@@ -599,6 +617,22 @@ uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned la
     case 0x32: return static_cast<uint32_t>(smemsz_);                   // SR_SMEMSZ
     case 0x2f: return static_cast<uint32_t>(kSharedWindow >> 32);       // SR_SWINHI
     case 0x88: return blk.rank;                                         // SR_CgaCtaId: the rank in the cluster
+    case 0x43: {   // SR_VIRTUALSMID (%smid), by the PTX engine's rule
+      // Distinct among the blocks resident at once, as a CTA's SM is on the
+      // hardware: a grid that fits the device (or a cooperative one) by its
+      // linear order, a larger one by the host thread running it -- thread
+      // t's rank-r block is SM t * cluster size + r, and the launch caps its
+      // threads so that fits. CUTLASS's grouped GEMMs keep a tensor map per
+      // SM; read as 0, every CTA rewrote the same one.
+      const uint32_t sms = profile_.limits.multiprocessors;
+      if (!sms) return 0;
+      const uint64_t linear = blk.ctaid[0] + uint64_t{blk.ctaid[1]} * cfg_.grid[0] +
+                              uint64_t{blk.ctaid[2]} * cfg_.grid[0] * cfg_.grid[1];
+      const uint64_t blocks = uint64_t{cfg_.grid[0]} * cfg_.grid[1] * cfg_.grid[2];
+      if (cfg_.cooperative || blocks <= sms) return static_cast<uint32_t>(linear % sms);
+      const uint64_t size = clustered_ ? csize_ : 1;
+      return static_cast<uint32_t>((uint64_t{blk.worker} * size + blk.rank) % sms);
+    }
     case 0x8a: return 0;                                                // SR_CgaSize (bank 0's envregs at +0)
     case 0x28: return block_threads_;                                   // SR_NTID
     default: return 0;
@@ -721,6 +755,26 @@ void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, 
 
 // ---- the grid ------------------------------------------------------------------
 
+void Runner::seed_alloc_handshake(Block& blk) {
+  // tcgen05.alloc.cta_group::2 is a handshake ptxas writes over the reserved
+  // region .nv.reservedSmem.offset0 names: an mbarrier at +8 counting one
+  // arrival, the phase each side waits for at +0x10 (flipped every round),
+  // the column masks at +0x14 and +0x18. The pair's leader (its even CTA)
+  // waits for the peer to have acknowledged the round before, claims the
+  // columns and signals the peer (an arrive expecting 4 bytes, and st.async
+  // of them); the peer waits for that, then acknowledges on the leader's
+  // barrier. So the leader's barrier starts with its first phase complete and
+  // the peer's does not -- the only start under which both of the kernel's
+  // waits end, whichever CTA gets there first. Left zero, every 2-SM
+  // kernel waits for ever.
+  const uint32_t at = alloc_mbar_ != ~0u ? alloc_mbar_ : alloc_handshake_ != ~0u ? alloc_handshake_ + 8 : ~0u;
+  if (at != ~0u && at + 8 <= blk.shared.size()) {
+    const bool leader = (blk.rank & 1) == 0;
+    const uint64_t bar = 0x001ffffeull | (uint64_t{0x7ffff800u | (leader ? 0x80000000u : 0u)} << 32);
+    std::memcpy(&blk.shared[at], &bar, 8);
+  }
+}
+
 void Runner::init_block(Block& blk, uint64_t linear) {
   blk.rank = 0;
   blk.own.blocks.assign(1, &blk);
@@ -730,6 +784,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   blk.ctaid[1] = static_cast<uint32_t>((linear / cfg_.grid[0]) % cfg_.grid[1]);
   blk.ctaid[2] = static_cast<uint32_t>(linear / (static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1]));
   blk.shared.assign(shared_size_, 0);
+  seed_alloc_handshake(blk);
   blk.st = exec::LaunchStats{};
   const uint32_t nwarps = (block_threads_ + 31) / 32;
   blk.st.warps = nwarps;
@@ -768,7 +823,7 @@ exec::LaunchStats Runner::run() {
   std::atomic<uint64_t>& next = next_unit_;
   std::exception_ptr failure;
   std::mutex fail_mu;
-  const auto worker = [&] {
+  const auto worker = [&](unsigned t) {
     Block blk;
     for (;;) {
       const uint64_t i = next.fetch_add(1);
@@ -779,10 +834,11 @@ exec::LaunchStats Runner::run() {
       }
       try {
         if (clustered_) {
-          run_cluster(i);
+          run_cluster(i, t);
           continue;
         }
         init_block(blk, i);
+        blk.worker = t;
         run_block(blk);
         std::lock_guard<std::mutex> g(stats_mu_);
         stats_.add(blk.st);
@@ -812,6 +868,11 @@ exec::LaunchStats Runner::run() {
     // So does one that can launch kernels: its parameter buffers are
     // allocations too.
     if (m_.device_launches) threads = 1;
+    // No more threads than the device has SMs for their clusters, so the
+    // blocks resident at once can all have distinct SM numbers (sreg 0x43),
+    // as the PTX engine caps its own.
+    if (const uint32_t sms = profile_.limits.multiprocessors)
+      threads = std::min<unsigned>(threads, std::max<unsigned>(1, sms / static_cast<unsigned>(clustered_ ? csize_ : 1)));
   }
   if (cfg_.cooperative) {
     // Every block resident at once, taking turns, so one may wait on another.
@@ -837,10 +898,10 @@ exec::LaunchStats Runner::run() {
     }
     for (Block& blk : all) stats_.add(blk.st);
   } else if (threads <= 1) {
-    worker();
+    worker(0);
   } else {
     std::vector<std::thread> pool;
-    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker, t);
     for (std::thread& t : pool) t.join();
   }
   if (failure) std::rethrow_exception(failure);
@@ -876,7 +937,7 @@ void Runner::run_block(Block& blk) {
 // do, so that one may wait on another (barrier.cluster, a peer's mbarrier,
 // its shared memory). Ranks run x fastest, as %cluster_ctarank numbers them;
 // clusters tile the grid x fastest.
-void Runner::run_cluster(uint64_t k) {
+void Runner::run_cluster(uint64_t k, unsigned worker) {
   const uint64_t ncx = cfg_.grid[0] / cshape_[0], ncy = cfg_.grid[1] / cshape_[1];
   const uint64_t kx = k % ncx, ky = (k / ncx) % ncy, kz = k / (ncx * ncy);
   std::vector<Block> blocks(csize_);
@@ -886,6 +947,8 @@ void Runner::run_cluster(uint64_t k) {
                    z = kz * cshape_[2] + r / (cshape_[0] * cshape_[1]);
     init_block(blocks[r], x + y * cfg_.grid[0] + z * uint64_t{cfg_.grid[0]} * cfg_.grid[1]);
     blocks[r].rank = r;
+    blocks[r].worker = worker;
+    seed_alloc_handshake(blocks[r]);   // now that the block knows its rank
     blocks[r].cluster = &cl;
     cl.blocks.push_back(&blocks[r]);
   }

@@ -81,6 +81,21 @@ expect "the measured RTX 3080 Ti's BAR0: its identification, and 0xbadf5040 wher
   "0xb72000a1 0xbadf5040" \
   "$(ti regs read --space mmio pmc_boot_0 | head -1 | awk '{print $4}') $(ti regs read --space mmio 0x10 | awk '{print $3}')"
 mi regs read --space mmio 0x8012 >/dev/null; expect "an MMIO access is a whole aligned dword" "2" "$?"
+# A register only some architectures' headers define: Hopper's memory ECC counter is
+# there on an H100 and counts what was injected; Turing's is not, and says so.
+expect "an H100 has Hopper's memory ECC counter at its own offset" "0x9025a0 0x00000000" \
+  "$(h100 regs read --space mmio pfb_fbpa_0_ecc_ded_count_0_gh100 | head -1 | awk '{print $1, $4}')"
+h100 fault inject --ecc uncorrected --count 3 >/dev/null
+expect "an injected uncorrectable error is that counter's count" "0x00000003" \
+  "$(h100 regs read --space mmio pfb_fbpa_0_ecc_ded_count_0_gh100 | head -1 | awk '{print $4}')"
+h100 regs write --space mmio pfb_fbpa_0_ecc_ded_count_0_gh100 0 >/dev/null
+expect "and writing zero clears it" "0x00000000" \
+  "$(h100 regs read --space mmio pfb_fbpa_0_ecc_ded_count_0_gh100 | head -1 | awk '{print $4}')"
+h100 regs read --space mmio pfb_fbpa_0_ecc_ded_count_0 >/dev/null
+expect "Turing's counter is not an H100 register" "2" "$?"
+expect "and its offset reads as unmapped" "0xbadf5040" "$(h100 regs read --space mmio 0x900488 | awk '{print $3}')"
+expect "the list says which architectures define a register" "yes" \
+  "$(h100 regs list --space mmio | awk '$5 == "pfb_fbpa_0_ecc_ded_count_0_gh100" { print ($NF == "[hopper]") ? "yes" : "no" }')"
 VGPU_QUIET=1 "$vgpu" serve --gpu amd/mi300x --count 1 --load 0.9 >/dev/null 2>&1 &
 loaded=$!
 busy=""

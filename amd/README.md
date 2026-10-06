@@ -394,6 +394,10 @@ does on the card.
 with what its destination holds after it for lane 0 (or the lane
 `VGPU_TRACE_LANE` names). That is how the bugs above were found.
 
+## Memory tests
+
+`amd/tests/hipcc/memtest.cpp` is a HIP memory test written for this repository: walking ones and zeros, address in address, checkerboard and its inverse, moving inversions, seeded random data (verified on the device and on the host), block copies and strided sweeps, on `hipMalloc` memory and on mapped pinned host memory. It never looks at the wave size, so it runs the same on wave 64 (MI300X, MI250X) and wave 32 (RX 6900 XT, RX 7900 XTX). Checked-in builds for gfx942, gfx90a, gfx1030 and gfx1100 are run by ctest `amd_memtest_patterns`, which also arms the simulator's faults and requires the test to find them: a host-flipped bit exactly, a `vgpu fault stuck` cell, bit flips armed on stores, an uncorrectable HBM ECC error on a load (the kernel fails and a row is remapped; corrected errors are counted and change nothing; a card without ECC refuses the fault), and a wild pointer (`hipErrorLaunchFailure`). The programs were built with Ubuntu's ROCm 5.7 `hipcc` (the only toolchain installable without AMD's repositories), so they ask for `libamdhip64.so.5`, which the script maps to the shim; gfx950 and gfx1201 need a newer compiler. `ci/external/babelstream.sh` runs UoB-HPC's BabelStream (HIP), whose own validation must pass, and must fail against a stuck cell, in the nightly external suites.
+
 ## Textures
 
 The Radeon GPUs (RDNA2, RDNA3 and RDNA4: gfx1030, gfx1100, gfx1201) have
@@ -622,6 +626,37 @@ that verifies was also run with `--inject_error`, with knobs large enough for
 the fault to fire, and each one caught it, reporting the fault the way it
 would on a card: its kernel's own `printf` (`[SDC FAULT] ...`), then
 "Verification: FAIL".
+
+## ROCm Validation Suite
+
+AMD's open-source [ROCm Validation Suite](https://github.com/ROCm/ROCmValidationSuite)
+(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. It was not built
+or run here (it needs ROCm's HSA, HIP, rocBLAS and AMD SMI development
+packages, which are not installable on this host); its source was read for the
+calls its modules make, and each was checked against what the simulator
+answers. What RVS asks, module by module:
+
+| Module | What it reads | State |
+| --- | --- | --- |
+| `gpup` | `/sys/class/kfd/kfd/topology/nodes/*/{gpu_id,properties,io_links}` | answered by the KFD topology (`src/kfd.cpp`); `caches_count` is 0 and there is no `caches/` directory |
+| every module | `amdsmi_get_gpu_kfd_info`, `amdsmi_get_gpu_bdf_id`, `hipDeviceGetPCIBusId` to tie a HIP device to its KFD node and SMI handle | consistent: same bus, same `kfd_id` |
+| `gm`, `tst`, `pulse`, `iet`, `gst` | `amdsmi_get_temp_metric`, `amdsmi_get_power_info`, `amdsmi_get_power_cap_info`, `amdsmi_get_clk_freq`, `amdsmi_set_clk_freq`, `amdsmi_get_energy_count` | added (`src/amd_smi.cpp`); they were NOT_SUPPORTED stubs |
+| `pebb`, `pbqt` | `hsa_amd_agent_memory_pool_get_info` `NUM_LINK_HOPS` and `LINK_INFO`, async copy and its profiling | `LINK_INFO` added: system memory is one PCI Express hop, an Instinct peer one XGMI hop, a Radeon peer two PCI Express hops, as KFD lists them |
+| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | already run (`tests/hipcc`, `tests/rocblas`); RVS's own kernels are compiled for the card, so they need a gfx942 code object |
+| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`); not exercised through RVS |
+
+The sensors follow each profile's class. Temperatures are degrees (AMD SMI
+converts the driver's millidegrees); an Instinct GPU has a junction and a
+memory sensor (VRAM and HBM) but no edge sensor, a Radeon has edge, junction
+and VRAM. Power is watts, the capability in microwatts; MI300 and newer fill
+`current_socket_power`, the earlier Instinct and Radeon `average_socket_power`,
+the other reading is UINT32_MAX. Clocks have two levels, as ROCm SMI's library
+gives them, and `amdsmi_set_clk_freq` pins one for the calling process (a mask
+of a level the clock lacks is out of bounds). Only Instinct GPUs have the
+energy accumulator (15.3 uJ a tick, counting up from an offset), ECC and
+`XGMI_WAFL` RAS: a Radeon answers NOT_SUPPORTED, or ECC disabled, from its
+profile. `tests/unit/test_amd_smi.cpp` checks all of it on every profile
+(`test_amd_amd_smi_rvs_*`), and `tests/hsa/hsa_dispatch.c` the link info.
 
 | Folder | What |
 | --- | --- |

@@ -4,12 +4,14 @@
 //    can then have nearly the whole heap again;
 //  - free() gives the bytes back, within a kernel and across kernels;
 //  - a block one kernel allocates, a later kernel may read and free;
-//  - the host's cudaFree refuses a block a kernel allocated, which stays live;
+//  - the host's cudaFree refuses a block a kernel allocated, which stays live,
+//    and so do the driver's cuMemFree and cuMemGetAddressRange;
 //  - and the same across the simulator's two engines: device_heap_peer.cu is
 //    built to PTX only, so its kernels run on the PTX interpreter while these
 //    run as SASS, and each frees what the other allocated.
 // Checked against an RTX 3060, where a single malloc can have 7 of the default
 // 8 MiB (the allocator keeps some of it) but not 7.5.
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 
@@ -177,6 +179,15 @@ int main() {
   CHECK(held != nullptr);
   CHECK(cudaFree(held) == cudaErrorInvalidValue);
   CHECK(cudaGetLastError() == cudaErrorInvalidValue);
+  // The driver, on the card: cuMemFree refuses it with CUDA_ERROR_INVALID_VALUE,
+  // and cuMemGetAddressRange answers CUDA_ERROR_NOT_FOUND, the block being the
+  // heap's rather than an allocation of the host's. Neither frees it.
+  const CUdeviceptr dheld = reinterpret_cast<CUdeviceptr>(held);
+  CHECK(cuMemFree(dheld) == CUDA_ERROR_INVALID_VALUE);
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  CHECK(cuMemGetAddressRange(&base, &size, dheld) == CUDA_ERROR_NOT_FOUND);
+  CHECK(cudaGetLastError() == cudaSuccess);   // the driver's refusals leave the runtime's error alone
   check_free<<<1, 1>>>(b.slot, 256, b.ok);
   CHECK(results(b, r, 1));
   CHECK(r[0] == 0x5a5a);

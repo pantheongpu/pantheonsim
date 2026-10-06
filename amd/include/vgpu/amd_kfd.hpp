@@ -31,6 +31,9 @@ std::vector<KfdFile> kfd_topology(const DeviceProfile& p, int count, uint32_t cp
 // 90402, "gfx90a" is 90010, "gfx1100" is 110000). 0 for anything else.
 uint32_t kfd_gfx_target_version(const std::string& gfx);
 
+// A PCI Express link's bandwidth in MB/s, as the topology's io links give it.
+uint32_t kfd_pcie_mb_per_s(uint32_t gen, uint32_t width);
+
 // KFD's id for a GPU: a hash, stable per device. rocm-smi shows it as the
 // GUID and amd-smi as kfd_id.
 uint32_t kfd_gpu_id(const char* uuid);

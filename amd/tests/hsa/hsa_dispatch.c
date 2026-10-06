@@ -222,6 +222,19 @@ int main(int argc, char** argv) {
                                           &access));
   check("the CPU reaches the GPU's memory only by copying", access == HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED);
 
+  /* The links to a pool, as ROCm Validation Suite's P2P tests read them: none
+   * to the GPU's own memory, one PCI Express hop to system memory. */
+  uint32_t hops = 99;
+  MUST(hsa_amd_agent_memory_pool_get_info(gpu, gpu_pools.coarse, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS, &hops));
+  check("a GPU is no hop from its own memory", hops == 0);
+  MUST(hsa_amd_agent_memory_pool_get_info(gpu, cpu_pools.kernarg, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS, &hops));
+  hsa_amd_memory_pool_link_info_t link[4];
+  memset(link, 0, sizeof link);
+  MUST(hsa_amd_agent_memory_pool_get_info(gpu, cpu_pools.kernarg, HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, link));
+  check("system memory is one PCI Express hop from a GPU, with a bandwidth and a distance",
+        hops == 1 && link[0].link_type == HSA_AMD_LINK_INFO_TYPE_PCIE && link[0].max_bandwidth > 0 &&
+            link[0].numa_distance == 20);
+
   /* 3. The code object, loaded from a file into an executable. */
   const int fd = open(argv[1], O_RDONLY);
   if (fd < 0) {
@@ -401,6 +414,12 @@ int main(int argc, char** argv) {
     const Kernel add1 = kernel(exe1, gpu1, "vector_add.kd");
     Pools gpu1_pools = {0};
     MUST(hsa_amd_agent_iterate_memory_pools(gpu1, each_pool, &gpu1_pools));
+    /* An Instinct GPU reaches another's memory over one XGMI hop. */
+    MUST(hsa_amd_agent_memory_pool_get_info(gpu, gpu1_pools.coarse, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS, &hops));
+    memset(link, 0, sizeof link);
+    MUST(hsa_amd_agent_memory_pool_get_info(gpu, gpu1_pools.coarse, HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, link));
+    check("a peer Instinct GPU's memory is one XGMI hop away",
+          hops == 1 && link[0].link_type == HSA_AMD_LINK_INFO_TYPE_XGMI && link[0].numa_distance == 15);
     void* out1;
     MUST(hsa_amd_memory_pool_allocate(gpu1_pools.coarse, N * sizeof(float), 0, &out1));
     void* kernarg1;

@@ -14,12 +14,17 @@ shopt -u nullglob
 if (( ${#cudart_libs[@]} == 0 )) || [[ ! -e "$shim/libcuda.so.1" ]]; then
   echo "SKIP: libvgpucudart or libvgpucuda not built"; exit 0
 fi
-# Both libraries carry the simulator's core, which a sanitizer build reports as
-# an ODR violation when one program loads the two.
-if [[ -n "$(shim_sanitizer "$shim")" ]]; then echo "SKIP: a sanitizer build loads two copies of the core"; exit 0; fi
-"${CXX:-c++}" -std=c++17 -O1 "$src" -o "$out" -ldl
+# Under a sanitizer build the program is instrumented the same way (the
+# sanitizer's runtime has to come first), and loads both libraries, which
+# carry a copy of the simulator's core each: both_shims_env.
+case "$(shim_sanitizer "$shim")" in
+  asan) san=(-fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer) ;;
+  tsan) san=(-fsanitize=thread) ;;
+  *) san=() ;;
+esac
+"${CXX:-c++}" -std=c++17 -O1 "${san[@]}" "$src" -o "$out" -ldl
 cudart="$(basename "${cudart_libs[0]}")"
-result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" "$cudart" 2>&1 || true)"
+result="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/a100 LD_LIBRARY_PATH="$shim" "$out" "$cudart" 2>&1 || true)"
 rm -f "$out"
 echo "private loads of libcuda and libcudart: $result"
 [[ "$result" == "PASS" ]]

@@ -19,6 +19,12 @@
 #   suites.sh fetch <suite> <dir>    the suite's source at its pinned commit
 #   suites.sh build <suite> <dir>    the listed programs, for sm_86, -cudart shared
 #   suites.sh run   <suite> <dir> <shim-dir> <report-dir>
+#   suites.sh digest <suite> <dir> <shim-dir> <report-dir>
+#
+# `digest` runs each program on the SASS (the default) and on its PTX
+# (VGPU_SASS=0), one host thread each, with VGPU_KERNEL_DIGEST, and fails when
+# the device memory the two leave after any kernel holds different bytes, as
+# nvidia/tools/sass_ptx_digest.sh does for the e2e programs.
 #
 # The builds use nvcc from PATH (CUDA 13.0, as the card's did) and do not
 # depend on the simulator, so CI caches them. `run` exits non-zero when any
@@ -30,7 +36,7 @@
 # program names to keep).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-cmd="${1:?fetch|build|run}"; suite="${2:?suite}"; dir="${3:?dir}"
+cmd="${1:?fetch|build|run|digest}"; suite="${2:?suite}"; dir="${3:?dir}"
 gpu="${SUITE_GPU:-nvidia/rtx3060}"
 timeout_s="${SUITE_TIMEOUT:-600}"
 jobs="${SUITE_JOBS:-$(nproc)}"
@@ -86,6 +92,15 @@ build() {
     cuda-samples)
       # One architecture, the card's, rather than the nine the samples list.
       find Samples -name CMakeLists.txt -exec sed -i -E 's/set\(CMAKE_CUDA_ARCHITECTURES [^)]*\)/set(CMAKE_CUDA_ARCHITECTURES 86)/' {} +
+      # Only the listed samples' directories (each is a CMake project of its
+      # own): the others need libraries a toolchain may not have (the CI
+      # image drops the static ones that simpleCUFFT_callback links), and
+      # configuring them all is slow.
+      if [[ ! -e CMakeLists.txt.all ]]; then
+        mv CMakeLists.txt CMakeLists.txt.all
+        { sed '/add_subdirectory(Samples)/d' CMakeLists.txt.all
+          entries | cut -d'|' -f1 | xargs -n1 dirname | sort -u | sed 's/.*/add_subdirectory(&)/'; } > CMakeLists.txt
+      fi
       # The nvcc on PATH, named: CMake otherwise finds /usr/bin/nvcc first where
       # Ubuntu's CUDA 12.0 is installed too (the pantheonsim.com runner).
       cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
@@ -132,15 +147,52 @@ build() {
 run_one() {
   local name=$1 wd=$2 log=$3; shift 3
   local t0=$SECONDS
-  (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" \
-     timeout -k 10 "$timeout_s" "$@" > "$log" 2>&1 < /dev/null)
-  rc=$?; secs=$(( SECONDS - t0 ))
+  if [[ $mode == digest ]]; then
+    # SASS, then PTX; the PTX run's output beside the SASS run's.
+    rm -f "$report/digest/$name".*
+    (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" VGPU_THREADS=1 VGPU_SASS_LOG=1 \
+       VGPU_KERNEL_DIGEST="$report/digest/$name.sass" timeout -k 10 "$timeout_s" "$@" > "$log" 2>&1 < /dev/null)
+    rc=$?
+    (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" VGPU_THREADS=1 VGPU_SASS=0 \
+       VGPU_KERNEL_DIGEST="$report/digest/$name.ptx" timeout -k 10 "$timeout_s" "$@" > "$log.ptx" 2>&1 < /dev/null)
+    rc_ptx=$?
+  else
+    (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" \
+       timeout -k 10 "$timeout_s" "$@" > "$log" 2>&1 < /dev/null)
+    rc=$?
+  fi
+  secs=$(( SECONDS - t0 ))
+}
+
+# digest mode: the verdict for the program run_one just ran twice.
+digest_result() {
+  local name=$1 d="$report/digest/$1" strip='s/ [0-9a-f]+:/ /g'
+  if [[ $rc != 0 || $rc_ptx != 0 ]]; then result "$name" FAIL "$secs" "exit $rc on SASS, $rc_ptx on PTX"; return; fi
+  if ! grep -q "running SASS" "$report/logs/$name.log" || grep -q "running PTX instead of SASS" "$report/logs/$name.log"; then
+    result "$name" ok "$secs" "ran PTX both times: $(grep -m1 -o 'running PTX instead of SASS.*' "$report/logs/$name.log" || echo 'no SASS ran')"
+    return
+  fi
+  if [[ ! -s $d.ptx ]]; then result "$name" FAIL "$secs" "no digest written"; return; fi
+  # A known difference (digest-known.txt) is reported, not failed.
+  local known
+  known=$(awk -F'|' -v s="$suite" -v n="$name" '$1 == s && $2 == n {print $3}' "$here/digest-known.txt" 2>/dev/null)
+  if cmp -s <(sed -E "$strip" "$d.sass") <(sed -E "$strip" "$d.ptx"); then
+    result "$name" ok "$secs" "$(wc -l < "$d.ptx") launches, the same memory on SASS and PTX${known:+ (listed as known to differ: it no longer does, take it off digest-known.txt)}"
+  else
+    local first
+    first=$(diff <(sed -E "$strip" "$d.ptx") <(sed -E "$strip" "$d.sass") | grep -m1 '^<' | cut -c3-)
+    if [[ -n $known ]]; then
+      result "$name" ok "$secs" "known difference: SASS and PTX differ after launch ${first%% *} ($(cut -d' ' -f2 <<< "$first")); listed: $known"
+    else
+      result "$name" FAIL "$secs" "SASS and PTX differ after launch ${first%% *} ($(cut -d' ' -f2 <<< "$first"))"
+    fi
+  fi
 }
 
 run() {
   shim="$(cd "${4:?shim dir}" && pwd)"; report="$(mkdir -p "${5:?report dir}" && cd "$5" && pwd)"
   cd "$dir" || exit 1
-  : > "$report/results.tsv"; mkdir -p "$report/logs"
+  : > "$report/results.tsv"; mkdir -p "$report/logs" "$report/digest"
   local fails=0 total=0
   result() {  # result <name> <ok|FAIL> <secs> <detail>
     printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$report/results.tsv"
@@ -153,6 +205,7 @@ run() {
         name=$(basename "$path"); exe="build/$path"; log="$report/logs/$name.log"
         [[ -x $exe ]] || { result "$name" FAIL 0 "did not build"; continue; }
         run_one "$name" "$(dirname "$exe")" "$log" "./$name"
+        [[ $mode == digest ]] && { digest_result "$name"; continue; }
         if [[ $rc != 0 ]]; then result "$name" FAIL "$secs" "exit $rc (the card's: 0)"
         elif [[ -n $marker ]] && ! grep -qF -- "$marker" "$log"; then result "$name" FAIL "$secs" "no \"$marker\""
         else result "$name" ok "$secs" ""; fi
@@ -165,6 +218,7 @@ run() {
         [[ -n $exe && -x src/$d/$exe ]] || { result "$d" FAIL 0 "did not build"; continue; }
         # shellcheck disable=SC2086
         run_one "$d" "src/$d" "$log" "./$exe" $args
+        [[ $mode == digest ]] && { digest_result "$d"; continue; }
         # Counted as the card's were: PASS(ED) and FAIL(ED), any case.
         got="rc=$rc $(grep -ioE '\b(PASS(ED)?|FAIL(ED)?)\b' "$log" | tr 'a-z' 'A-Z' | sed 's/ED$//' | sort | uniq -c | tr '\n' ' ' | sed -E 's/ +/ /g; s/^ //; s/ $//')"
         got="${got% }"
@@ -177,6 +231,7 @@ run() {
         [[ -x $src/$app ]] || { result "$app" FAIL 0 "did not build"; continue; }
         # shellcheck disable=SC2086
         run_one "$app" "$wd" "$log" "../$app" $args
+        [[ $mode == digest ]] && { digest_result "$app"; continue; }
         if [[ $file == stdout ]]; then got=$(grep -v '^Time consumed' "$log" | sha256sum | cut -c1-64)
         else got=$(sha256sum < "$wd/$file" 2>/dev/null | cut -c1-64); fi
         if [[ $rc != 0 ]]; then result "$app" FAIL "$secs" "exit $rc"
@@ -188,6 +243,7 @@ run() {
         log="$report/logs/$name.log"
         [[ -x CUDA/$src/$name ]] || { result "$name" FAIL 0 "did not build"; continue; }
         run_one "$name" "CUDA/$src" "$log" "./$name"
+        [[ $mode == digest ]] && { digest_result "$name"; continue; }
         got=$(grep -oE 'Percent: [0-9]+' "$log" | awk '{print $2}' | paste -sd,)
         if [[ $rc != 0 ]]; then result "$name" FAIL "$secs" "exit $rc"
         elif [[ "$got" == "$card" ]]; then result "$name" ok "$secs" "non-matching outputs: $got"
@@ -238,7 +294,8 @@ run() {
       done < <(entries) ;;
   esac
   {
-    echo "### $suite on $gpu: $((total - fails)) of $total ${verdict:-as on the RTX 3060}"
+    if [[ $mode == digest ]]; then echo "### $suite on $gpu, SASS against PTX: $((total - fails)) of $total leave the same memory"
+    else echo "### $suite on $gpu: $((total - fails)) of $total ${verdict:-as on the RTX 3060}"; fi
     echo
     if (( fails )); then
       echo "| program | seconds | result |"; echo "|---|---|---|"
@@ -247,13 +304,15 @@ run() {
     fi
     echo "Slowest: $(sort -t$'\t' -k3,3nr "$report/results.tsv" | head -5 | awk -F'\t' '{printf "%s %ss, ", $1, $3}' | sed 's/, $//')"
   } > "$report/summary.md"
-  echo "$suite: $((total - fails)) of $total ${verdict:-match the card}"
+  if [[ $mode == digest ]]; then echo "$suite: $((total - fails)) of $total leave the same memory on SASS and PTX"
+  else echo "$suite: $((total - fails)) of $total ${verdict:-match the card}"; fi
   (( total > 0 && fails == 0 ))
 }
 
+mode=$cmd
 case $cmd in
   fetch) fetch ;;
   build) build ;;
-  run) run "$@" ;;
+  run|digest) run "$@" ;;
   *) echo "unknown command $cmd"; exit 2 ;;
 esac

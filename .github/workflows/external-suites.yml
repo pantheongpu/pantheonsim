@@ -12,6 +12,8 @@ name: External suites nightly
 #   find a stuck memory cell armed with `vgpu fault`).
 #   AMD: hip-tests (rocm-7.1.0) for one GPU a night, in turn MI300X, RX 6900 XT,
 #   RX 7900 XTX and RX 9070 XT, against that GPU's baseline of known failures.
+#   AMD memory test: BabelStream (HIP), on the same GPU, which validates its
+#   arrays after every run and must fail against a stuck cell (ci/external/babelstream.sh).
 #
 # On the pantheonsim.com runner (the repository variable ML_RUNS_ON, as the
 # ml job): it has CUDA 13.0 and ROCm 7.1, which hosted runners lack. It is one
@@ -26,8 +28,8 @@ on:
   workflow_dispatch:
     inputs:
       suites:
-        description: "Suites to run (space separated): cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests"
-        default: cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests
+        description: "Suites to run (space separated): cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream"
+        default: cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream
       amd_gpu:
         description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
         default: ''
@@ -47,7 +49,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SUITES: ${{ inputs.suites || 'cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests' }}
+  SUITES: ${{ inputs.suites || 'cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream' }}
   # The NVIDIA lists' profile: the card their expected results came from.
   SUITE_GPU: nvidia/rtx3060
 
@@ -341,6 +343,55 @@ jobs:
         if: always() && steps.want.outputs.yes
         with:
           name: hip-tests-${{ strategy.job-index }}
+          path: report
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # --- AMD BabelStream ---------------------------------------------------
+  # A memory-bandwidth benchmark that checks its arrays after every run; it
+  # builds in a minute, so it is built here, not cached.
+  babelstream:
+    name: BabelStream (HIP) on ${{ needs.sim.outputs.amd_gpu }}
+    needs: [sim, hip-tests]
+    if: ${{ !cancelled() && needs.sim.result == 'success' && contains(inputs.suites || 'babelstream', 'babelstream') }}
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sim-build
+
+      - name: Unpack the simulator
+        run: tar -xzf sim-build.tgz && rm sim-build.tgz
+
+      - name: Fetch and build
+        env:
+          GPU: ${{ needs.sim.outputs.amd_gpu }}
+        run: |
+          case "$GPU" in
+            amd/mi300x) arch=gfx942 ;; amd/rx6900xt) arch=gfx1030 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
+            *) echo "::error::no BabelStream arch for $GPU"; exit 1 ;;
+          esac
+          ci/external/babelstream.sh fetch babelstream
+          ci/external/babelstream.sh build babelstream "$arch"
+
+      - name: Run
+        env:
+          GPU: ${{ needs.sim.outputs.amd_gpu }}
+        run: |
+          set -o pipefail
+          ci/external/babelstream.sh run babelstream "$GPU" build/shim report | tee run.log
+
+      - name: Results
+        if: always()
+        run: cat report/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report written" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: babelstream
           path: report
           retention-days: 14
           if-no-files-found: ignore

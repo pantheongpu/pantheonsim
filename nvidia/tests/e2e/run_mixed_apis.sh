@@ -24,12 +24,11 @@ fi
 nvcc -std=c++14 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
      $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcuda
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
-# Both libraries carry the simulator's core, which a sanitizer build reports as
-# an ODR violation when one program loads the two.
-if [[ -n "$(shim_sanitizer "$shim")" ]]; then rm -f "$out"; echo "SKIP: a sanitizer build loads two copies of the core"; exit 0; fi
 # Kept out of a failing command substitution: with `set -e` the shell would
 # exit before printing, and a CI log would show the failure with no reason in it.
-result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out" 2>&1 || true)"
+# Both libraries carry the simulator's core: both_shims_env is what a
+# sanitizer build needs to load the two.
+result="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/h100 LD_LIBRARY_PATH="$shim" "$out" 2>&1 || true)"
 rm -f "$out"
 echo "runtime and driver APIs on one machine: $result"
 [[ "$result" == "PASS" ]]

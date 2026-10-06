@@ -64,15 +64,16 @@ render as `N/A` — the honest result rather than an invented number.
 
 ## Reliability and link in profiles
 
-Four optional `telemetry` keys describe what a card reports about memory
+Five optional `telemetry` keys describe what a card reports about memory
 reliability and its PCIe link:
 
 | Key | Meaning | Source |
 | --- | --- | --- |
 | `ecc` | the card has ECC and ships with it on | datasheet |
-| `memory` | `hbm` or `gddr`: HBM cards remap failing rows, GDDR cards with ECC retire pages | datasheet |
+| `memory` | `hbm` or `gddr`. HBM cards remap failing rows; so does any card with ECC from Ampere on (an A10, L4 or L40S has GDDR and remaps), and a T4 or earlier retires pages | datasheet; NVIDIA's memory-error guide |
 | `memory_temperature` | the driver reports a memory sensor | real runs; most HBM cards report none |
 | `pcie_link` | the link real cards most often run at, such as `"Gen4 x8"` | the benchmark database of real runs |
+| `nvlink` | NVLink generation and link count, such as `"NVLink4 x18"`, on the SXM profiles (A100, H100, H200, B200, B300); absent on every other card | datasheet |
 
 The link is a fact about how cards are hosted, not the slot they fit: a T4 is
 an x16 card that clouds attach at x8, and a GH200's Hopper die reaches its
@@ -90,6 +91,56 @@ declines it and ships `build/bin/nvidia-smi` instead, which renders the same
 telemetry. On a CPU-only machine there is no stock `nvidia-smi` anyway — nor
 `rocm-smi` nor `rocm_agent_enumerator` — so supplying these commands is the
 fix, not a workaround.
+
+## Health and diagnostic queries
+
+What a health tool (DCGM-style diagnostics, a monitoring agent, a burn-in
+script) asks NVML and `nvidia-smi -q` for, answered from the profile and the
+machine's reliability state, with `NVML_ERROR_NOT_SUPPORTED` (`N/A` in the
+tools) where the card of the profile has no such thing:
+
+| Query | T4 (Turing) | L4, A10, A100, H100 | GeForce (no ECC) |
+| --- | --- | --- | --- |
+| ECC mode, counts by location, volatile and aggregate (`nvmlDeviceGetTotalEccErrors`, `GetMemoryErrorCounter`, `GetDetailedEccErrors`, fields 1-28) | yes | yes | NOT_SUPPORTED |
+| Retired pages and pending (`GetRetiredPages`, `_v2`, `GetRetiredPagesPendingStatus`, fields 29-31, 92, 93) | yes | NOT_SUPPORTED | NOT_SUPPORTED |
+| Remapped rows (`GetRemappedRows`, fields 142-145) | NOT_SUPPORTED | yes | NOT_SUPPORTED |
+| Row-remapper histogram | NOT_SUPPORTED | NOT_SUPPORTED (no profile has a bank count) | NOT_SUPPORTED |
+| NVLink (`GetNvLinkState`, `Version`, `Capability`, `ErrorCounter`, fields 91 and the error fields) | NOT_SUPPORTED | A100 and H100 only; link-count and version from the profile | NOT_SUPPORTED |
+
+Also answered on every card: clock-event reasons, supported and current
+(`GetCurrentClocksThrottleReasons`, `GetSupportedClocksThrottleReasons` and the
+newer `ClocksEventReasons` names); violation times for the power and thermal
+policies (`GetViolationStatus`, fields 74 and 75) and nothing for the others;
+the performance state; power limits (fields 185-192; the one-second average only
+from Ampere, and not GA100, as NVML documents); PCIe replays
+(`GetPcieReplayCounter` and the PCIe counter fields); accounting mode, pids and
+stats for processes running now (`GetAccounting*`); and the compute, graphics
+and MPS process lists.
+
+`nvidia-smi -q` prints the same as sections -- `ECC Errors`, `Retired Pages`,
+`Remapped Rows`, `Clocks Event Reasons` and its counters, `Power Readings` with
+the limits, `Temperature` with the slowdown and shutdown thresholds,
+`Replays Since Reset` under `PCI` -- and `-d` takes `ECC`, `PAGE_RETIREMENT`,
+`ROW_REMAPPER`, `PERFORMANCE` and `ACCOUNTING` to print one. `nvidia-smi nvlink
+-s` and `-e` print link state and error counters, and `nvidia-smi -r` resets a
+GPU: a pending page retirement or row remap takes effect, the counts since the
+driver loaded are zeroed, a degraded link retrains, and the card's lifetime
+counts, retired pages and remapped rows stay. A GPU a process is using is
+refused, as the real tool does, and one that has fallen off the bus exits 15.
+
+What is not real, because nothing public gives it:
+
+- Retired-page addresses are placeholders derived from the UUID (the state
+  counts pages, not where they were), and retirement times are 0.
+- NVLink links are all up, the capabilities are an x86 host's (peer access and
+  peer atomics, no system-memory access), error counters are zero (nothing
+  injects them yet), and the remote end is not modelled, so remote type and PCI
+  address are NOT_SUPPORTED. `nvlink -s` prints speeds only for NVLink 3 and 4.
+- Accounting mode lives in the process that set it (the simulator has no
+  driver to keep it) and covers running processes only. `-q -x` does not carry
+  the new sections.
+- ECC mode cannot be changed: turning it off is NOT_SUPPORTED, since there is
+  no pending mode to apply on a reset.
 
 ## Injecting faults
 

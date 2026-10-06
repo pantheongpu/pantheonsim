@@ -212,8 +212,12 @@ int cmd_regs(const std::vector<std::string>& args) {
                   "STATUS");
       for (const auto& r : vgpu::regs::registers(space)) {
         if (!status.empty() && r.status != status) continue;
-        std::printf("0x%05x %-5u %-6s %-5s %-28s %-22s %s\n", r.offset, r.width, vgpu::regs::access_name(r.access),
-                    r.capability.empty() ? "-" : r.capability.c_str(), r.name.c_str(), r.backing.empty() ? "reset value" : r.backing.c_str(), r.status.c_str());
+        // An MMIO register an architecture's headers alone define says which.
+        std::string arch;
+        for (const auto& a : r.arch) arch += (arch.empty() ? "  [" : ",") + a;
+        if (!arch.empty()) arch += "]";
+        std::printf("0x%05x %-5u %-6s %-5s %-28s %-22s %s%s\n", r.offset, r.width, vgpu::regs::access_name(r.access),
+                    r.capability.empty() ? "-" : r.capability.c_str(), r.name.c_str(), r.backing.empty() ? "reset value" : r.backing.c_str(), r.status.c_str(), arch.c_str());
       }
       return 0;
     }
@@ -259,7 +263,10 @@ int cmd_regs(const std::vector<std::string>& args) {
 
     if (verb == "dump" && space == vgpu::regs::Space::AmdMmio) {
       // Half a megabyte of mostly undeclared space: the declared registers.
-      for (const auto& r : vgpu::regs::registers(space)) print_register(r, r.offset, cs.read(r.offset, 4));
+      for (const auto& r : vgpu::regs::registers(space)) {
+        const uint32_t at = cs.offset_of(r);   // an architecture's own registers only
+        if (at != vgpu::regs::RegisterSpace::kAbsent) print_register(r, at, cs.read(at, 4));
+      }
       return 0;
     }
     if (verb == "dump") {
@@ -284,8 +291,12 @@ int cmd_regs(const std::vector<std::string>& args) {
     } else if ((r = vgpu::regs::find(space, pos[0]))) {
       offset = cs.offset_of(*r);
       if (offset == vgpu::regs::RegisterSpace::kAbsent) {
-        std::fprintf(stderr, "vgpu regs: GPU %lld has no %s capability, so no %s\n", gpu, r->capability.c_str(),
-                     r->name.c_str());
+        if (r->capability.empty())
+          std::fprintf(stderr, "vgpu regs: %s is not a register GPU %lld has (its architecture's headers do not define it)\n",
+                       r->name.c_str(), gpu);
+        else
+          std::fprintf(stderr, "vgpu regs: GPU %lld has no %s capability, so no %s\n", gpu, r->capability.c_str(),
+                       r->name.c_str());
         return 2;
       }
     } else {
