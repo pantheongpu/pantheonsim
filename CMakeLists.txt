@@ -1122,6 +1122,14 @@ set_tests_properties(test_amd_amd_smi PROPERTIES ENVIRONMENT
 add_test(NAME test_amd_amd_smi_radeon COMMAND test_amd_amd_smi)
 set_tests_properties(test_amd_amd_smi_radeon PROPERTIES ENVIRONMENT
   "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
+# What ROCm Validation Suite asks AMD SMI (clock levels, temperature, power, energy,
+# ECC) on every other profile: the sensors and counters follow each one's class.
+foreach(_g mi250x mi325x mi350x rx6900xt rx9070xt)
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
+  add_test(NAME test_amd_amd_smi_rvs_${_g} COMMAND test_amd_amd_smi rvs)
+  set_tests_properties(test_amd_amd_smi_rvs_${_g} PROPERTIES ENVIRONMENT
+    "VGPU_GPU=amd/${_g};VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
+endforeach()
 # vLLM, unmodified, generating on a simulated MI300X what the CPU generates
 # (VGPU_VLLM_PYTHON: a Python with vLLM for ROCm; skips without one).
 add_test(NAME amd_vllm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
@@ -1339,6 +1347,13 @@ add_test(NAME amd_hipcc COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hipcc.sh)
 # minutes by the script; a sanitizer build needs several of them.
 set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# Memory-test patterns (walking bits, address in address, checkerboard, moving
+# inversions, seeded random, block copies, strides) run by checked-in hipcc
+# programs on four AMD GPUs (wave 64 and wave 32), with a stuck cell, bit flips
+# on stores, an uncorrectable HBM error and a wild pointer they must report.
+add_test(NAME amd_memtest_patterns COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_memtest_patterns.sh)
+set_tests_properties(amd_memtest_patterns PROPERTIES DEPENDS "vgpuhip;vgpu_cli"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)

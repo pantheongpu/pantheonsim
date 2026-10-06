@@ -29,6 +29,17 @@ double mx_float_value(uint32_t code, int eb, int mb, int bias);
 // Round to nearest even; .satfinite clamps to the largest finite value
 // instead of giving infinity or NaN.
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite);
+// The OCP MX small floats (e2m3, e3m2, e2m1) from a value, to nearest, with
+// .satfinite: past the largest finite, the largest; NaN the positive largest.
+uint32_t small_float_bits(double v, int eb, int mb, int bias);
+// A ue8m0 scale (2^(code - 127), 0xFF NaN): .rz the power of two at or below,
+// .rp the one at or above. ~0u for a negative value, which the ISA leaves
+// undefined.
+uint32_t ue8m0_bits(double v, bool round_up, bool satfinite);
+// binary16 and bfloat16, to nearest even, a NaN the canonical one (0x7FFF),
+// as the PTX engine converts every value to them.
+uint16_t f16_bits(double v);
+uint16_t bf16_bits(double v);
 
 // Where stored element k of chunk `chunk` in row `row` of a structured-sparse
 // mma A operand goes, as a column of the K-wide row, by the metadata the 32

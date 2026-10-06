@@ -359,6 +359,18 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
   std::shared_ptr<sass::Module> sm = sass::load(image, size, mem_, profile_);
   auto mod = std::make_shared<ptx::Module>();
   mod->target = "sm_" + std::to_string(sm->sm);
+  // From sm_90 ptxas puts the driver's reserved shared memory (1 KiB) inside
+  // each kernel's own .nv.shared section -- a kernel with none of its own has
+  // 0x400 there, whether CUDA 12.0 built it or CUDA 13 (which also adds a
+  // .nv.shared.reserved.0 section beside it) -- where before sm_90 the
+  // section is the kernel's static shared memory alone. The profile adds
+  // that reservation to every block itself (reserved_smem_per_block), so the
+  // kernel's static size, for occupancy, the per-block limit and
+  // cudaFuncGetAttributes, leaves it out, as the kernel's PTX does; counted
+  // twice, a block asking for the most shared memory the part allows (as
+  // CUTLASS's Hopper kernels do) could not be placed. Dynamic shared memory
+  // still starts past the whole section.
+  const uint32_t in_section = sm->sm >= 90 ? profile_.reserved_smem_per_block() : 0;
   for (const sass::CubinKernel& k : sm->cubin.kernels) {
     ptx::EntryFn e;
     e.name = k.name;
@@ -380,8 +392,9 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
       end = p.offset + p.size;
       e.params.push_back(d);
     }
-    e.static_shared_size = static_cast<uint32_t>(k.shared_bytes);
-    e.dynamic_shared_offset = e.static_shared_size;
+    const uint32_t section = static_cast<uint32_t>(k.shared_bytes);
+    e.static_shared_size = section >= in_section ? section - in_section : section;
+    e.dynamic_shared_offset = section;
     e.local_frame_size = std::max(k.frame_size, k.min_stack);
     if (k.max_threads) e.max_ntid = {k.max_threads, 1, 1};
     e.req_cluster = k.cluster;
