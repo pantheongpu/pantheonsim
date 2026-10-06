@@ -176,4 +176,60 @@ VTEST(large_modules_parse_kernels_when_first_used) {
   VCHECK(err.code() == Err::UnsupportedPtx);
 }
 
+// A kernel reading a little past the end of its buffer faults on NVIDIA's default profile, as
+// compute-sanitizer reports it. VGPU_PAGE_SIZE gives the device pages: the read of the rest of the last
+// page is served (llama.cpp's mul_mat_q does this on its activation tiles), a write past the end is not.
+VTEST(a_page_size_lets_a_kernel_read_past_the_end_of_its_buffer) {
+  const char* src = R"(.version 8.0
+.target sm_80
+.address_size 64
+.visible .entry peek(.param .u64 buf, .param .u64 out, .param .u32 off)
+{
+  .reg .b64 %p<4>;
+  .reg .b32 %v, %o;
+  ld.param.u64 %p0, [buf];
+  ld.param.u64 %p1, [out];
+  ld.param.u32 %o, [off];
+  cvt.u64.u32 %p2, %o;
+  add.s64 %p3, %p0, %p2;
+  ld.global.nc.u32 %v, [%p3];
+  st.global.u32 [%p1], %v;
+  ret;
+}
+.visible .entry poke(.param .u64 buf, .param .u32 off)
+{
+  .reg .b64 %p<3>;
+  .reg .b32 %o;
+  ld.param.u64 %p0, [buf];
+  ld.param.u32 %o, [off];
+  cvt.u64.u32 %p1, %o;
+  add.s64 %p2, %p0, %p1;
+  st.global.u32 [%p2], %o;
+  ret;
+}
+)";
+  auto u64 = [](uint64_t v) { std::vector<uint8_t> b(8); std::memcpy(b.data(), &v, 8); return b; };
+  auto u32 = [](uint32_t v) { std::vector<uint8_t> b(4); std::memcpy(b.data(), &v, 4); return b; };
+  auto run = [&](const char* page, bool write, uint32_t off) -> int {
+    if (page) setenv("VGPU_PAGE_SIZE", page, 1); else unsetenv("VGPU_PAGE_SIZE");
+    runtime::Runtime rt(load_gpu("nvidia/a100"));
+    unsetenv("VGPU_PAGE_SIZE");
+    auto& dev = rt.device(0);
+    const uint64_t mod = dev.load_module(src);
+    const uint64_t buf = dev.memory().alloc(6600), out = dev.memory().alloc(16);
+    try {
+      if (write) dev.launch(*dev.get_function(mod, "poke"), exec::LaunchConfig{}, {u64(buf), u32(off)}, dev.symbols(mod));
+      else dev.launch(*dev.get_function(mod, "peek"), exec::LaunchConfig{}, {u64(buf), u64(out), u32(off)}, dev.symbols(mod));
+    } catch (const Error& e) {
+      return e.code() == Err::OutOfBounds ? 1 : 2;
+    }
+    return 0;
+  };
+  VCHECK_EQ(run(nullptr, false, 6600), 1);   // default: refused
+  VCHECK_EQ(run("65536", false, 6600), 0);   // with pages: served
+  VCHECK_EQ(run("65536", false, 6596), 0);   // (the last word is in bounds either way)
+  VCHECK_EQ(run("65536", true, 6600), 1);    // a write past the end is still refused
+  VCHECK_EQ(run("bogus", false, 6600), 1);   // an unparsable value changes nothing
+}
+
 VTEST_MAIN

@@ -977,6 +977,17 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
   // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
   // set_page_size says what that lets a kernel read).
   if (profile_.vendor == "amd") mem_.set_page_size(4096);
+  // VGPU_PAGE_SIZE=<bytes> gives any device that page size. NVIDIA's default stays strict (every access to
+  // the bytes allocated, as compute-sanitizer reports it), but real cards map device memory in pages, and
+  // libraries read a little past a buffer's end into the rest of its page: llama.cpp's mul_mat_q loads whole
+  // activation tiles (more columns than the batch has) from a pool buffer padded for fewer. The columns are
+  // discarded; the read faults only here. With the page size set, a read of the rest of the last page is
+  // served; a copy or a write past the end is still refused.
+  if (const char* e = std::getenv("VGPU_PAGE_SIZE")) {
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(e, &end, 0);
+    if (end != e && *end == '\0' && v <= (1ull << 30)) mem_.set_page_size(v);
+  }
   if (telemetry_) {
     int ord = physical_;
     telemetry::Publisher* pub = telemetry_;
