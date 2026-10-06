@@ -59,3 +59,4 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: false    # most real runs report no memory sensor
   pcie_link: "Gen5 x16"        # datasheet; the database's H200 runs are on a Grace host
+  nvlink: "NVLink4 x18"        # data sheet: SXM part, NVLink generation 4, 18 links

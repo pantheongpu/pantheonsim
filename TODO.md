@@ -858,6 +858,14 @@ narrows what counts as observable, not what the detector looks at.
   ras-decode to the AFIDs it prints. Not yet: the CPER ring in debugfs, fatal
   and bad-page-threshold records, and a lost AMD GPU's sysfs entries going
   away.
+  NVML and nvidia-smi -q answer the health surface (docs/telemetry.md, "Health
+  and diagnostic queries"): ECC by location, retired pages and remapped rows
+  per card family, clock-event reasons and violation times, PCIe replays,
+  NVLink state and error counters on the SXM profiles, accounting, and
+  `nvidia-smi -r` and `nvlink -s/-e`. Not yet: NVLink error injection, the
+  row-remapper bank histogram (needs a bank count per card), real retired
+  page addresses, `-q -x` for the new sections, a persistent accounting mode
+  and ECC mode changes.
 - Registers (docs/registers.md): PCI configuration space from a register
   database (registers/pci-config.yaml) -- header, power management, MSI, PCI
   Express with the live link, AER fed by the fault model, BAR sizing -- read,

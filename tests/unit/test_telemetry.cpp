@@ -129,6 +129,34 @@ VTEST(amd_profiles_are_discoverable) {
   VCHECK_EQ((snap.devices[0].pci_device_id >> 16) & 0xFFFFu, 0x74A1u);  // MI300X
 }
 
+// How a card takes failing memory out of service, and what NVLink it has, are
+// facts about the profile that NVML's health queries answer from. NVIDIA's
+// memory-error documentation has page retirement on Turing and earlier and row
+// remapping from Ampere on, whatever the memory type.
+VTEST(memory_retirement_and_nvlink_follow_the_profile) {
+  struct Case {
+    const char* gpu;
+    uint32_t retirement;   // 0 none, 1 pages, 2 rows
+    uint32_t nvlink_version, nvlink_count;
+  };
+  const Case cases[] = {
+      {"nvidia/t4", 1, 0, 0},       // Turing, GDDR, ECC: retires pages
+      {"nvidia/l4", 2, 0, 0},       // Ada, GDDR, ECC: remaps rows
+      {"nvidia/a10", 2, 0, 0},      // Ampere, GDDR, ECC: remaps rows
+      {"nvidia/rtx3060", 0, 0, 0},  // GeForce: no ECC, neither
+      {"nvidia/h100", 2, 4, 18},    // Hopper SXM
+      {"nvidia/a100", 2, 3, 12},    // Ampere SXM4
+      {"nvidia/b200", 2, 5, 18},
+      {"nvidia/h100-pcie", 2, 0, 0},  // the optional bridge is not what clouds have
+  };
+  for (const Case& c : cases) {
+    const telemetry::Shared s = telemetry::idle_snapshot(load_gpu(c.gpu), 1);
+    VCHECK_EQ(s.devices[0].memory_retirement, c.retirement);
+    VCHECK_EQ(s.devices[0].nvlink_version, c.nvlink_version);
+    VCHECK_EQ(s.devices[0].nvlink_count, c.nvlink_count);
+  }
+}
+
 VTEST(no_publisher_means_no_snapshot) {
   telemetry::Shared snap{};
   VCHECK(!telemetry::read_snapshot(&snap, "/tmp/vgpu-telemetry-does-not-exist.d"));
