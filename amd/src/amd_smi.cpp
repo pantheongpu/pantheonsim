@@ -6,13 +6,16 @@
 // The answers come from the machine's state, as ROCm SMI's library here
 // (rocm_smi.cpp) and VirtualGPU's amd-smi read it, so the three agree, and
 // asking does not start a runtime. The rest of the library's functions answer
-// AMDSMI_STATUS_NOT_SUPPORTED (amd_smi_stubs.cpp).
+// AMDSMI_STATUS_NOT_SUPPORTED (amd_smi_stubs.cpp). The health queries (ECC,
+// bad pages, XGMI, PCIe, sensors, partitions, processes) are at the end.
 //
 // Each GPU is a socket of its own with one processor in it, as AMD SMI
 // groups discrete GPUs. Handles are tokens, one per socket and per GPU.
 //
 // The declarations follow AMD SMI's documented interface (amd_smi/amdsmi.h,
 // AMD, MIT license); nothing here is AMD's code.
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +26,7 @@
 #include "vgpu/amd_chip.hpp"
 #include "vgpu/amd_kfd.hpp"
 #include "vgpu/machine.hpp"
+#include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -440,4 +444,448 @@ AMDSMI_API int amdsmi_get_gpu_topo_numa_affinity(void* h, int32_t* node) {
   (void)s;
   *node = 0;
   return kSuccess;
+}
+
+// ---- Health and diagnostics ---------------------------------------------------------
+//
+// ECC and RAS, retired pages, XGMI, PCIe, sensors, partitions and processes,
+// from the same state ROCm SMI's library (rocm_smi.cpp) and `amd-smi` read, so
+// the three agree. What a profile's card does not have is answered
+// AMDSMI_STATUS_NOT_SUPPORTED, as the driver answers where the sysfs file is
+// missing. The profiles decide:
+//   * ECC / RAS / bad pages: only where the profile has `ecc: true` (the
+//     Instinct parts, HBM). Radeon cards (GDDR6, no ECC) have no RAS sysfs
+//     and no bad-page record, so they are refused.
+//   * XGMI: Instinct only; Radeon cards reach each other over PCIe.
+//   * Fans: Radeon only; Instinct boards are passively cooled.
+//   * Compute and memory partitions: CDNA3 and CDNA4 (MI300X, MI325X, MI350X).
+// Assumptions with no profile datum behind them are marked where they are made.
+// Layouts are those of amdsmi.h 26.2 (checked by size and offset below).
+// Not modelled, still NOT_SUPPORTED: gpu_metrics, violation status, energy,
+// PCIe throughput, bad-page threshold, every setter and reset.
+
+namespace {
+
+constexpr uint64_t kNone64 = ~uint64_t{0};
+
+struct ErrorCount {  // amdsmi_error_count_t
+  uint64_t correctable_count, uncorrectable_count, deferred_count, reserved[5];
+};
+struct RetiredPage {  // amdsmi_retired_page_record_t
+  uint64_t page_address, page_size;
+  int status;  // 0 reserved, 1 pending, 2 unreservable
+};
+struct XgmiInfo {  // amdsmi_xgmi_info_t
+  uint8_t xgmi_lanes;
+  uint64_t xgmi_hive_id, xgmi_node_id;
+  uint32_t index, reserved[9];
+};
+struct XgmiLinks {  // amdsmi_xgmi_link_status_t
+  uint32_t total_links;
+  int status[8];  // 0 down, 1 up, 2 disabled
+  uint64_t reserved[7];
+};
+struct PcieInfo {  // amdsmi_pcie_info_t
+  struct {
+    uint16_t max_pcie_width;
+    uint32_t max_pcie_speed, pcie_interface_version;
+    int slot_type;  // 0 PCIe, 1 OAM, 2 CEM, 3 unknown
+    uint32_t max_pcie_interface_version;
+    uint64_t reserved[9];
+  } pcie_static;
+  struct {
+    uint16_t pcie_width;
+    uint32_t pcie_speed, pcie_bandwidth;
+    uint64_t pcie_replay_count, pcie_l0_to_recovery_count, pcie_replay_roll_over_count, pcie_nak_sent_count,
+        pcie_nak_received_count;
+    uint32_t pcie_lc_perf_other_end_recovery_count;
+    uint64_t reserved[12];
+  } pcie_metric;
+  uint64_t reserved[32];
+};
+struct Frequencies {  // amdsmi_frequencies_t
+  bool has_deep_sleep;
+  uint32_t num_supported, current;
+  uint64_t frequency[33];
+};
+struct PcieBandwidth {  // amdsmi_pcie_bandwidth_t
+  Frequencies transfer_rate;
+  uint32_t lanes[33];
+};
+struct PowerInfo {  // amdsmi_power_info_t
+  uint64_t socket_power;
+  uint32_t current_socket_power, average_socket_power;
+  uint64_t gfx_voltage, soc_voltage, mem_voltage;
+  uint32_t power_limit;
+  uint64_t reserved[18];
+};
+struct PowerCapInfo {  // amdsmi_power_cap_info_t
+  uint64_t power_cap, default_power_cap, dpm_cap, min_power_cap, max_power_cap, reserved[3];
+};
+struct ClkInfo {  // amdsmi_clk_info_t
+  uint32_t clk, min_clk, max_clk;
+  uint8_t clk_locked, clk_deep_sleep;
+  uint32_t reserved[4];
+};
+struct ProcInfo {  // amdsmi_proc_info_t
+  char name[256];
+  uint32_t pid;
+  uint64_t mem;
+  struct {
+    uint64_t gfx, enc;
+    uint32_t reserved[12];
+  } engine_usage;
+  struct {
+    uint64_t gtt_mem, cpu_mem, vram_mem;
+    uint32_t reserved[10];
+  } memory_usage;
+  char container_name[256];
+  uint32_t cu_occupancy, evicted_time, reserved[10];
+};
+static_assert(sizeof(ErrorCount) == 64 && sizeof(RetiredPage) == 24 && sizeof(XgmiInfo) == 64 &&
+              sizeof(XgmiLinks) == 96 && sizeof(PcieInfo) == 512 && sizeof(PcieBandwidth) == 416 &&
+              sizeof(PowerInfo) == 192 && sizeof(PowerCapInfo) == 64 && sizeof(ClkInfo) == 32 &&
+              sizeof(ProcInfo) == 704);
+static_assert(offsetof(XgmiInfo, xgmi_hive_id) == 8 && offsetof(XgmiInfo, index) == 24 &&
+              offsetof(PcieInfo, pcie_static.slot_type) == 12 && offsetof(PcieInfo, pcie_metric.pcie_width) == 96 &&
+              offsetof(PcieInfo, pcie_metric.pcie_replay_count) == 112 &&
+              offsetof(PcieInfo, pcie_metric.pcie_lc_perf_other_end_recovery_count) == 152 &&
+              offsetof(PowerInfo, power_limit) == 40 && offsetof(ProcInfo, pid) == 256 &&
+              offsetof(ProcInfo, memory_usage) == 336 && offsetof(ProcInfo, container_name) == 400 &&
+              offsetof(ProcInfo, cu_occupancy) == 656);
+
+// amdsmi_gpu_block_t: one bit each. The blocks an ECC card reports are the
+// ones ROCm SMI's library reports (rocm_smi.cpp).
+constexpr uint64_t kBlockUmc = 1, kBlockSdma = 2, kBlockGfx = 4, kBlockMmhub = 8, kBlockPcieBif = 0x20,
+                   kBlockHdp = 0x40, kBlockXgmiWafl = 0x80;
+constexpr uint64_t kEccBlocks = kBlockUmc | kBlockSdma | kBlockGfx | kBlockMmhub | kBlockPcieBif | kBlockHdp |
+                                kBlockXgmiWafl;
+enum RasState : int { kRasDisabled = 1, kRasEnabled = 6 };  // amdsmi_ras_err_state_t
+enum TempType : int { kTempEdge = 0, kTempHotspot = 1, kTempVram = 2, kTempHbm0 = 3, kTempHbm3 = 6 };
+enum TempMetric : int { kTempCurrent = 0, kTempMax = 1, kTempCritical = 5 };
+enum ClkType : int { kClkGfx = 0, kClkMem = 4 };
+constexpr int kOutOfResources = 15;
+
+vgpu::ras::Counters ras_counters(const Sample& s, bool lifetime) {
+  try {
+    const vgpu::ras::State st = vgpu::ras::read(s.uuid);
+    return lifetime ? st.lifetime : st.since_load;
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+uint64_t fnv(const char* s) {
+  uint64_t h = 1469598103934665603ull;
+  for (; *s; ++s) h = (h ^ static_cast<unsigned char>(*s)) * 1099511628211ull;
+  return h;
+}
+
+// ECC by block: device memory is the UMC block, the on-chip memories GFX; the
+// other blocks have no model, so they read zero where ECC is on. Block 0 is
+// every block.
+ErrorCount ecc_of(const Sample& s, uint64_t block) {
+  using vgpu::ras::Location;
+  using vgpu::ras::Severity;
+  const vgpu::ras::Counters c = ras_counters(s, false);
+  const auto memory = [&](Severity v) {
+    return c.ecc[static_cast<uint32_t>(v)][static_cast<uint32_t>(Location::DeviceMemory)];
+  };
+  const auto count = [&](Severity v) -> uint64_t {
+    if (block == kBlockUmc) return memory(v);
+    if (block == kBlockGfx) return c.ecc_total(v) - memory(v);
+    if (block == 0) return c.ecc_total(v);
+    return 0;
+  };
+  ErrorCount e{};
+  e.correctable_count = count(Severity::Corrected);
+  e.uncorrectable_count = count(Severity::Uncorrected);
+  // Assumption: no deferred errors are modelled (poison consumption records on
+  // MI300-class cards), so the count is zero rather than N/A.
+  return e;
+}
+
+bool partitionable(const Sample& d) {
+  return std::strcmp(d.architecture, "cdna3") == 0 || std::strcmp(d.architecture, "cdna4") == 0;
+}
+uint32_t nbio(const Sample& d, const char* name) {
+  vgpu::regs::RegisterSpace mmio(vgpu::regs::Space::AmdMmio, d);
+  const vgpu::regs::Register* r = vgpu::regs::find(vgpu::regs::Space::AmdMmio, name);
+  return r ? mmio.value(*r) : 0;
+}
+
+// GT/s and MT/s of each PCIe generation, 1 to 6 (index 0 pads). Gen 1's 2.5 GT/s
+// rounds down in the GT/s the static info gives.
+constexpr uint32_t kGts[] = {0, 2, 5, 8, 16, 32, 64};
+constexpr uint32_t kMts[] = {0, 2500, 5000, 8000, 16000, 32000, 64000};
+
+}  // namespace
+
+// ---- ECC and RAS ------------------------------------------------------------------
+
+// Totals over every block. A card without ECC has no count to give.
+AMDSMI_API int amdsmi_get_gpu_total_ecc_count(void* h, ErrorCount* ec) {
+  GPU(h, s, ec);
+  if (!s.ecc_enabled) return kNotSupported;
+  *ec = ecc_of(s, 0);
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_ecc_enabled(void* h, uint64_t* mask) {
+  GPU(h, s, mask);
+  *mask = s.ecc_enabled ? kEccBlocks : 0;
+  return kSuccess;
+}
+// One block (a single bit of amdsmi_gpu_block_t); several is invalid.
+AMDSMI_API int amdsmi_get_gpu_ecc_count(void* h, uint64_t block, ErrorCount* ec) {
+  GPU(h, s, ec);
+  if (block == 0 || (block & (block - 1))) return kInval;
+  if (!s.ecc_enabled || !(block & kEccBlocks)) return kNotSupported;
+  *ec = ecc_of(s, block);
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_ecc_status(void* h, uint64_t block, int* state) {
+  GPU(h, s, state);
+  if (block == 0 || (block & (block - 1))) return kInval;
+  if (!(block & kEccBlocks)) return kNotSupported;
+  *state = s.ecc_enabled ? kRasEnabled : kRasDisabled;
+  return kSuccess;
+}
+
+// The pages taken out of service (reserved) and those marked and waiting for
+// the next window (pending). The simulator keeps no addresses, so each page
+// is numbered by its place. With no array, the count; with one, as many as it
+// holds, and INSUFFICIENT_SIZE if there are more. No ECC, no record: the
+// driver has no bad-page file on such a card.
+AMDSMI_API int amdsmi_get_gpu_bad_page_info(void* h, uint32_t* num, RetiredPage* records) {
+  GPU(h, s, num);
+  if (!s.ecc_enabled) return kNotSupported;
+  // Assumption: the profiles' HBM "row remapping" is how this simulator takes
+  // memory out of service, where amdgpu retires pages (its RAS EEPROM's bad
+  // pages), so a remapped row is listed as a page. The retired and remapped
+  // counts are aggregate (lifetime) state, kept across driver loads. A pending
+  // retirement (a flag until the next driver load) is the newest page.
+  const vgpu::ras::Counters c = ras_counters(s, true);
+  const uint32_t total = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe + c.rows_correctable + c.rows_uncorrectable);
+  const uint32_t pending = (c.retired_pending || c.rows_pending) && total ? 1 : 0;
+  const uint32_t reserved = total - pending;
+  const uint32_t k = records ? std::min(*num, total) : total;
+  for (uint32_t i = 0; records && i < k; ++i) records[i] = {uint64_t{i} << 12, 4096, i < reserved ? 0 : 1};
+  const bool fits = !records || *num >= total;
+  *num = k;
+  return fits ? kSuccess : kInsufficientSize;
+}
+
+// ---- XGMI -----------------------------------------------------------------------------
+
+// Instinct GPUs only. Every Instinct GPU of the machine is in one hive, whose
+// id is KFD's (topology `hive_id`: a hash of the first GPU's UUID). Assumption:
+// x16 XGMI links (the lane count of an Infinity Fabric link on MI300-class).
+AMDSMI_API int amdsmi_get_xgmi_info(void* h, XgmiInfo* info) {
+  GPU(h, s, info);
+  if (!instinct(s)) return kNotSupported;
+  std::memset(info, 0, sizeof *info);
+  info->xgmi_lanes = 16;
+  info->xgmi_hive_id = fnv(machine()[0].uuid);
+  info->xgmi_node_id = fnv(s.uuid);  // ROCm SMI's unique id
+  info->index = static_cast<uint32_t>(s_i);
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_gpu_xgmi_error_status(void* h, int* status) {
+  GPU(h, s, status);
+  if (!instinct(s)) return kNotSupported;
+  *status = 0;  // AMDSMI_XGMI_STATUS_NO_ERRORS: no XGMI error is modelled
+  return kSuccess;
+}
+// Assumption: one link up to each other Instinct GPU of the machine (a fully
+// connected MI300X node has seven), capped at the structure's eight.
+AMDSMI_API int amdsmi_get_gpu_xgmi_link_status(void* h, XgmiLinks* links) {
+  GPU(h, s, links);
+  if (!instinct(s)) return kNotSupported;
+  std::memset(links, 0, sizeof *links);
+  uint32_t peers = 0;
+  for (const Sample& m : machine()) peers += instinct(m);
+  peers = peers ? peers - 1 : 0;
+  links->total_links = std::min<uint32_t>(peers, 8);
+  for (uint32_t i = 0; i < links->total_links; ++i) links->status[i] = 1;  // AMDSMI_XGMI_LINK_UP
+  return kSuccess;
+}
+
+// ---- PCI Express ----------------------------------------------------------------------
+
+AMDSMI_API int amdsmi_get_pcie_info(void* h, PcieInfo* info) {
+  GPU(h, s, info);
+  std::memset(info, 0, sizeof *info);
+  const vgpu::ras::Counters c = ras_counters(s, false);
+  using vgpu::ras::Pcie;
+  info->pcie_static.max_pcie_width = static_cast<uint16_t>(s.pcie_width_max);
+  info->pcie_static.max_pcie_speed = kGts[std::min<uint32_t>(s.pcie_gen_max, 6)];
+  info->pcie_static.pcie_interface_version = s.pcie_gen_max;
+  info->pcie_static.max_pcie_interface_version = s.pcie_gen_max;
+  info->pcie_static.slot_type = instinct(s) ? 1 : 0;  // OAM boards (as oam_id says) or PCIe cards
+  info->pcie_metric.pcie_width = static_cast<uint16_t>(s.pcie_width);
+  info->pcie_metric.pcie_speed = kMts[std::min<uint32_t>(s.pcie_gen, 6)];
+  info->pcie_metric.pcie_bandwidth = kNone32;  // no traffic is metered, as ROCm SMI says
+  info->pcie_metric.pcie_replay_count = c.pcie[static_cast<uint32_t>(Pcie::Replay)];
+  info->pcie_metric.pcie_l0_to_recovery_count = c.pcie[static_cast<uint32_t>(Pcie::L0ToRecovery)];
+  info->pcie_metric.pcie_replay_roll_over_count = c.pcie[static_cast<uint32_t>(Pcie::ReplayRollover)];
+  info->pcie_metric.pcie_nak_sent_count = c.pcie[static_cast<uint32_t>(Pcie::NaksSent)];
+  info->pcie_metric.pcie_nak_received_count = c.pcie[static_cast<uint32_t>(Pcie::NaksReceived)];
+  info->pcie_metric.pcie_lc_perf_other_end_recovery_count = 0;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_pci_replay_counter(void* h, uint64_t* counter) {
+  GPU(h, s, counter);
+  *counter = ras_counters(s, false).pcie[static_cast<uint32_t>(vgpu::ras::Pcie::Replay)];
+  return kSuccess;
+}
+// Each generation up to the card's, in transfers a second, the one trained at
+// marked, as ROCm SMI's library gives it.
+AMDSMI_API int amdsmi_get_gpu_pci_bandwidth(void* h, PcieBandwidth* bw) {
+  GPU(h, s, bw);
+  std::memset(bw, 0, sizeof *bw);
+  const uint32_t gens = std::min<uint32_t>(std::max<uint32_t>(s.pcie_gen_max, 1), 6);
+  bw->transfer_rate.num_supported = gens;
+  for (uint32_t g = 0; g < gens; ++g) {
+    bw->transfer_rate.frequency[g] = uint64_t{kMts[g + 1]} * 1000000;
+    bw->lanes[g] = s.pcie_width;
+  }
+  bw->transfer_rate.current = std::min<uint32_t>(std::max<uint32_t>(s.pcie_gen, 1), gens) - 1;
+  return kSuccess;
+}
+
+// ---- Sensors --------------------------------------------------------------------------
+
+// Degrees Celsius (ROCm SMI's are millidegrees). An Instinct card has no edge
+// sensor; a Radeon's edge and junction are the one die temperature the model
+// keeps. Memory is where the profile says real cards report it. Assumption:
+// an Instinct card's four HBM stack sensors all read that one memory sensor.
+// Limits: the slowdown threshold, only for the hotspot, and only where the
+// profile has one (mi325x's is 0, unknown, so it is refused).
+AMDSMI_API int amdsmi_get_temp_metric(void* h, int type, int metric, int64_t* t) {
+  GPU(h, s, t);
+  uint32_t c = 0;
+  if (type == kTempHotspot) c = s.temperature_c;
+  else if (type == kTempEdge && !instinct(s)) c = s.temperature_c;
+  else if (type == kTempVram && s.has_memory_temperature) c = s.temperature_mem_c ? s.temperature_mem_c : s.temperature_c;
+  else if (type >= kTempHbm0 && type <= kTempHbm3 && instinct(s) && s.has_memory_temperature)
+    c = s.temperature_mem_c ? s.temperature_mem_c : s.temperature_c;
+  else return kNotSupported;
+  if (metric == kTempCurrent) *t = c;
+  else if ((metric == kTempMax || metric == kTempCritical) && type == kTempHotspot && s.temperature_max_c)
+    *t = s.temperature_max_c;
+  else return kNotSupported;
+  return kSuccess;
+}
+
+// Watts. A CDNA3 or newer card gives its current socket power, the rest (Radeon,
+// MI200) an average, as the header's field comments say; the other is
+// UINT32_MAX. No SoC or memory voltage is modelled.
+AMDSMI_API int amdsmi_get_power_info(void* h, PowerInfo* info) {
+  GPU(h, s, info);
+  std::memset(info, 0, sizeof *info);
+  const uint32_t w = s.power_mw / 1000;
+  const bool current = partitionable(s);
+  info->socket_power = w;
+  info->current_socket_power = current ? w : kNone32;
+  info->average_socket_power = current ? kNone32 : w;
+  info->gfx_voltage = s.voltage_mv;
+  info->soc_voltage = kNone64;
+  info->mem_voltage = kNone64;
+  info->power_limit = s.power_limit_mw / 1000;
+  return kSuccess;
+}
+// Microwatts. The minimum is 0 and no DPM cap is modelled, as in ROCm SMI's.
+AMDSMI_API int amdsmi_get_power_cap_info(void* h, uint32_t sensor, PowerCapInfo* info) {
+  GPU(h, s, info);
+  if (sensor != 0) return kNotSupported;
+  std::memset(info, 0, sizeof *info);
+  info->power_cap = info->default_power_cap = info->max_power_cap = uint64_t{s.power_limit_mw} * 1000;
+  return kSuccess;
+}
+// Fans on amdgpu's 0-255 scale; Instinct boards are passively cooled. No tach.
+AMDSMI_API int amdsmi_get_gpu_fan_speed(void* h, uint32_t sensor, int64_t* speed) {
+  GPU(h, s, speed);
+  if (instinct(s) || sensor != 0) return kNotSupported;
+  *speed = int64_t{s.fan_percent} * 255 / 100;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_fan_speed_max(void* h, uint32_t sensor, uint64_t* max) {
+  GPU(h, s, max);
+  if (instinct(s) || sensor != 0) return kNotSupported;
+  *max = 255;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_fan_rpms(void* h, uint32_t, int64_t* rpm) {
+  GPU(h, s, rpm);
+  return kNotSupported;
+}
+// The graphics clock and the memory clock; the others are not modelled. The
+// minimum is the clock model's idle level, as ROCm SMI's levels and amd-smi.
+AMDSMI_API int amdsmi_get_clock_info(void* h, int type, ClkInfo* info) {
+  GPU(h, s, info);
+  std::memset(info, 0, sizeof *info);
+  if (type == kClkGfx) {
+    info->clk = s.sm_clock_mhz;
+    info->max_clk = s.sm_clock_max_mhz;
+    info->min_clk = s.sm_clock_max_mhz / 6;
+    info->clk_deep_sleep = s.utilization_gpu == 0;
+  } else if (type == kClkMem) {
+    info->clk = s.mem_clock_mhz;
+    info->max_clk = s.mem_clock_max_mhz;
+    info->min_clk = s.mem_clock_max_mhz / 5;
+  } else {
+    return kNotSupported;
+  }
+  return kSuccess;
+}
+// The graphics core's voltage now, in millivolts.
+AMDSMI_API int amdsmi_get_gpu_volt_metric(void* h, int type, int metric, int64_t* mv) {
+  GPU(h, s, mv);
+  if (type != 0 || metric != 0) return kNotSupported;  // VDDGFX, current
+  *mv = s.voltage_mv;
+  return kSuccess;
+}
+
+// ---- Partitions -----------------------------------------------------------------------
+
+// As the device's NBIO registers hold them; only CDNA3 and CDNA4 have any.
+AMDSMI_API int amdsmi_get_gpu_compute_partition(void* h, char* out, uint32_t len) {
+  GPU(h, s, out);
+  if (!partitionable(s)) return kNotSupported;
+  static const char* const kCompute[] = {"SPX", "DPX", "TPX", "QPX", "CPX"};
+  const uint32_t px = (nbio(s, "nbio_partition_compute_status") >> 4) & 0xF;
+  return put_string(out, len, px < 5 ? kCompute[px] : "UNKNOWN");
+}
+AMDSMI_API int amdsmi_get_gpu_memory_partition(void* h, char* out, uint32_t len) {
+  GPU(h, s, out);
+  if (!partitionable(s)) return kNotSupported;
+  const int nps = __builtin_ffs(static_cast<int>((nbio(s, "nbio_partition_mem_status") >> 4) & 0xFF));
+  return put_string(out, len, nps ? "NPS" + std::to_string(nps) : "UNKNOWN");
+}
+
+// ---- Processes ------------------------------------------------------------------------
+
+// The processes using the GPU, as the machine's telemetry lists them. With
+// *max 0 the count comes back; where the list is too short it holds as many as
+// fit, *max is the count, and OUT_OF_RESOURCES says so, as the header does.
+AMDSMI_API int amdsmi_get_gpu_process_list(void* h, uint32_t* max, ProcInfo* list) {
+  GPU(h, s, max);
+  const uint32_t n = std::min<uint32_t>(s.proc_count, vgpu::telemetry::kMaxProcs);
+  if (*max == 0 || !list) {
+    *max = n;
+    return kSuccess;
+  }
+  const uint32_t k = std::min(*max, n);
+  for (uint32_t i = 0; i < k; ++i) {
+    ProcInfo& p = list[i];
+    std::memset(&p, 0, sizeof p);
+    std::snprintf(p.name, sizeof p.name, "%s", s.procs[i].name);
+    p.pid = s.procs[i].pid;
+    p.mem = s.procs[i].used_bytes;
+    p.memory_usage.vram_mem = s.procs[i].used_bytes;
+    p.cu_occupancy = kNone32;  // not modelled, as ROCm SMI's compute process list says
+  }
+  const bool fits = *max >= n;
+  *max = n;
+  return fits ? kSuccess : kOutOfResources;
 }

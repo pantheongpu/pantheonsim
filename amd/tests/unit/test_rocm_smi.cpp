@@ -39,6 +39,7 @@ int rsmi_dev_compute_partition_get(uint32_t, char*, uint32_t);
 int rsmi_dev_memory_partition_get(uint32_t, char*, uint32_t);
 int rsmi_dev_fan_speed_get(uint32_t, uint32_t, int64_t*);
 int rsmi_dev_vbios_version_get(uint32_t, char*, uint32_t);
+int rsmi_dev_memory_reserved_pages_get(uint32_t, uint32_t*, void*);
 int rsmi_dev_perf_level_set(uint32_t, int);
 int rsmi_dev_gpu_metrics_info_get(uint32_t, void*);
 struct Frequencies {
@@ -179,6 +180,9 @@ VTEST(ecc_and_partitions_as_the_card_has_them) {
   VCHECK_EQ(rsmi_dev_ecc_enabled_get(0, &mask), kSuccess);
   VCHECK(rx ? mask == 0 : (mask & 1) != 0);   // the UMC block's bit
   char part[16] = {};
+  // Retired pages are recorded only where there is ECC (the Radeon profiles have none).
+  uint32_t pages = 0;
+  VCHECK_EQ(rsmi_dev_memory_reserved_pages_get(0, &pages, nullptr), rx ? kNotSupported : kSuccess);
   VCHECK_EQ(rsmi_dev_compute_partition_get(0, part, sizeof part), rx ? kNotSupported : kSuccess);
   if (!rx) VCHECK_EQ(std::string(part), std::string("SPX"));
   VCHECK_EQ(rsmi_dev_memory_partition_get(0, part, sizeof part), rx ? kNotSupported : kSuccess);

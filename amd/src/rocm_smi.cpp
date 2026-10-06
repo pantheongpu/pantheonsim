@@ -568,14 +568,20 @@ RSMI_API int rsmi_dev_ecc_count_get(uint32_t d, uint64_t block, ErrorCount* ec) 
 RSMI_API int rsmi_dev_memory_reserved_pages_get(uint32_t d, uint32_t* num, RetiredPage* records) {
   if (!num) return kInvalidArgs;
   DEVICE(d, s);
+  // A card without ECC (the Radeon profiles) has no record of bad pages.
+  if (!s.ecc_enabled) return kNotSupported;
   vgpu::ras::Counters c{};
   try {
     c = vgpu::ras::read(s.uuid).lifetime;
   } catch (const std::exception&) {
   }
-  const uint32_t pages = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe);
+  // As amdsmi_get_gpu_bad_page_info (amd_smi.cpp) lists them: a remapped row
+  // counts as a page, reserved (status 0) but for the newest while a
+  // retirement is pending (status 1).
+  const uint32_t pages = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe + c.rows_correctable + c.rows_uncorrectable);
+  const uint32_t reserved = pages - ((c.retired_pending || c.rows_pending) && pages ? 1 : 0);
   if (records)
-    for (uint32_t k = 0; k < std::min(*num, pages); ++k) records[k] = {uint64_t{k} << 12, 4096, 1};
+    for (uint32_t k = 0; k < std::min(*num, pages); ++k) records[k] = {uint64_t{k} << 12, 4096, k < reserved ? 0 : 1};
   const bool fits = !records || *num >= pages;
   *num = records ? std::min(*num, pages) : pages;
   return fits ? kSuccess : kInsufficientSize;
