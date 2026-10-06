@@ -156,11 +156,14 @@ void amd_sysfs(const telemetry::DeviceSample& d, const std::string& dir) {
 
 }  // namespace
 
+// AMD's one map is the same on every GPU it has.
+static bool every_register(const telemetry::DeviceSample&, const Register&) { return true; }
+
 const Vendor& amd() {
   static const Vendor v = {
       "amd",           Space::AmdMmio, "amd-mmio", "amd/registers/mmio.yaml",
       512u << 10,      0u,             is_amd,     amd_bars,
-      no_capture,      trained_gen,    amd_backed, amd_write,
+      every_register,  no_capture,      trained_gen,    amd_backed, amd_write,
       amd_sysfs,
   };
   return v;

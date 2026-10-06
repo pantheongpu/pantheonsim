@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -472,6 +473,195 @@ VTEST(amdgpus_driver_files_are_in_the_hwmon_abis_units) {
   VCHECK_EQ(read("hwmon/freq1_input"), std::to_string(uint64_t{d.sm_clock_mhz} * 1000000));   // hertz
   for (const char* f : amd::kHwmonFiles) VCHECK(std::filesystem::exists(dir + "/hwmon/" + f));
   VCHECK(!std::filesystem::exists(dir + "/hwmon/temp1_input"));   // an MI300 has no edge sensor
+}
+
+// ---- BAR0 registers that only some architectures' headers define --------------------
+//
+// A register with an `arch` list is mapped on the GPUs whose published headers
+// define it and nowhere else; everywhere else its offset is as unmapped as any
+// undeclared one (0xbadf5040), because no header says what is there.
+
+namespace {
+constexpr uint32_t kUnmapped = 0xbadf5040u;
+uint32_t bar0_read(const char* gpu, uint32_t offset) {
+  regs::RegisterSpace bar0(regs::Space::AmdMmio, device(gpu));
+  return bar0.read(offset, 4);
+}
+}  // namespace
+
+VTEST(an_architecture_has_only_the_registers_its_headers_define) {
+  TempMachine m("nvarchmap");
+  struct Probe {
+    const char* gpu;
+    uint32_t offset;
+    bool mapped;
+  };
+  for (const Probe& p : {
+           // Turing: the second interrupt word, SET/CLEAR, two memory ECC counters, L2 ECC.
+           Probe{"nvidia/t4", 0x144, true}, Probe{"nvidia/t4", 0x160, true}, Probe{"nvidia/t4", 0x184, true},
+           Probe{"nvidia/t4", 0x900488, true}, Probe{"nvidia/t4", 0x90048c, true}, Probe{"nvidia/t4", 0x900490, false},
+           Probe{"nvidia/t4", 0x1404f8, true}, Probe{"nvidia/t4", 0x100e78, true}, Probe{"nvidia/t4", 0x100e44, true},
+           Probe{"nvidia/t4", 0x9025a0, false},   // Hopper's counters
+           Probe{"nvidia/t4", 0x600, false},      // Ampere's device enable
+           Probe{"nvidia/t4", 0x1410, false},     // Turing's header gives the scratch no size past 4 words
+           // Ampere: device enable, the flush address, the full scratch array; none of Turing's.
+           Probe{"nvidia/a100", 0x600, true}, Probe{"nvidia/rtx3080ti", 0x600, true},
+           Probe{"nvidia/a100", 0x100c10, true}, Probe{"nvidia/a100", 0x100c40, true},
+           Probe{"nvidia/a100", 0x14fc, true}, Probe{"nvidia/a100", 0x1500, false},
+           Probe{"nvidia/a100", 0x160, false}, Probe{"nvidia/a100", 0x900488, false},
+           // Ada: only the scratch array's headers.
+           Probe{"nvidia/l4", 0x1410, true}, Probe{"nvidia/l4", 0x600, false}, Probe{"nvidia/l4", 0x100c10, false},
+           // Hopper: its own ECC counters (four, at another offset), flush address, thermal scratch.
+           Probe{"nvidia/h100", 0x9025a0, true}, Probe{"nvidia/h100", 0x9025ac, true},
+           Probe{"nvidia/h100", 0x9025b0, false}, Probe{"nvidia/h100", 0x900488, false},
+           Probe{"nvidia/h100", 0x100a34, true}, Probe{"nvidia/h100", 0x100a38, true},
+           Probe{"nvidia/h100", 0x200bc, true}, Probe{"nvidia/h100", 0xad00bc, false},
+           Probe{"nvidia/gh200-480gb", 0x9025a0, true},
+           // Blackwell, GB100: the CC scratch and the thermal scratch; the GB20x has its own.
+           Probe{"nvidia/b200", 0x580, true}, Probe{"nvidia/b300", 0x5bc, true}, Probe{"nvidia/b200", 0x5c0, false},
+           Probe{"nvidia/b200", 0x200bc, true}, Probe{"nvidia/b200", 0xad00bc, false},
+           Probe{"nvidia/b200", 0x1410, true},
+           Probe{"nvidia/rtx5090", 0xad00bc, true}, Probe{"nvidia/rtx5090", 0x200bc, false},
+           Probe{"nvidia/rtx5090", 0x580, false}, Probe{"nvidia/rtx5090", 0x1410, false}}) {
+    const uint32_t v = bar0_read(p.gpu, p.offset);
+    char what[96];
+    std::snprintf(what, sizeof what, "%s at 0x%x reads 0x%08x, ", p.gpu, p.offset, v);
+    if (p.mapped && v == kUnmapped) throw vtest::Failure(std::string(what) + "but its headers define a register there");
+    if (!p.mapped && v != kUnmapped) throw vtest::Failure(std::string(what) + "but no header it has defines one there");
+  }
+  // The register database says the same, by name: an absent register is
+  // absent, not at a different offset.
+  const auto h100 = device("nvidia/h100");
+  regs::RegisterSpace bar0(regs::Space::AmdMmio, h100);
+  const regs::Register* turing_ded = regs::find(regs::Space::NvidiaMmio, "pfb_fbpa_0_ecc_ded_count_0");
+  const regs::Register* hopper_ded = regs::find(regs::Space::NvidiaMmio, "pfb_fbpa_0_ecc_ded_count_0_gh100");
+  VCHECK(turing_ded && hopper_ded);
+  VCHECK_EQ(bar0.offset_of(*turing_ded), regs::RegisterSpace::kAbsent);
+  VCHECK_EQ(bar0.offset_of(*hopper_ded), 0x9025a0u);
+  VCHECK(bar0.at(0x900488) == nullptr);
+  VCHECK(bar0.at(0x9025a0) == hopper_ded);
+  // Registers every GPU has stay where they were.
+  VCHECK(bar0.offset_of(*regs::find(regs::Space::NvidiaMmio, "pmc_boot_0")) == 0u);
+}
+
+// Every register gated to an architecture says where in NVIDIA's headers it is
+// defined, names only architectures GPUs here have, and keeps the repository's
+// conventions (a register with device logic behind it is marked as a model).
+VTEST(architecture_gated_registers_name_their_header_symbol) {
+  const std::set<std::string> known = {"turing", "ampere", "ada", "hopper", "blackwell", "gb100", "gb20x"};
+  size_t gated = 0;
+  std::set<std::string> names;
+  for (const auto& r : regs::registers(regs::Space::NvidiaMmio)) {
+    VCHECK(names.insert(r.name).second);
+    if (r.arch.empty()) continue;
+    ++gated;
+    for (const auto& a : r.arch) VCHECK(known.count(a) == 1);
+    // "turing/tu102/dev_fb.h NV_PFB_..." -- the header, then the symbol.
+    VCHECK(r.source.find("/dev_") != std::string::npos);
+    VCHECK(r.source.find(".h NV_") != std::string::npos);
+    VCHECK(r.measured.empty());   // nothing past BAR0's head was read from a card
+    if (!r.backing.empty()) VCHECK_EQ(r.status, std::string("model"));
+  }
+  VCHECK(gated > 100);
+}
+
+// Turing's header makes the interrupt enable read-only and changes it through
+// SET and CLEAR, which read as zero; the later architectures' headers define no
+// SET and CLEAR, so there the enable keeps what is written.
+VTEST(turing_interrupt_enables_are_set_and_cleared_not_written) {
+  TempMachine m("nvintren");
+  regs::RegisterSpace t4(regs::Space::AmdMmio, device("nvidia/t4"));
+  t4.write(0x140, 4, 0xffffffff);           // read-only on Turing
+  VCHECK_EQ(t4.read(0x140, 4), 0u);
+  t4.write(0x160, 4, 0x000000f0);           // NV_PMC_INTR_EN_SET(0)
+  t4.write(0x164, 4, 0x80000001);           // NV_PMC_INTR_EN_SET(1)
+  VCHECK_EQ(t4.read(0x140, 4), 0x000000f0u);
+  VCHECK_EQ(t4.read(0x144, 4), 0x80000001u);
+  t4.write(0x180, 4, 0x00000030);           // NV_PMC_INTR_EN_CLEAR(0)
+  VCHECK_EQ(t4.read(0x140, 4), 0x000000c0u);
+  t4.write(0x180, 4, 0xf);                  // clearing what is clear changes nothing
+  VCHECK_EQ(t4.read(0x140, 4), 0x000000c0u);
+  VCHECK_EQ(t4.read(0x160, 4), 0u);         // SET and CLEAR are write-only: they read zero
+  VCHECK_EQ(t4.read(0x180, 4), 0u);
+  VCHECK_EQ(t4.read(0x144, 4), 0x80000001u);   // the other word is untouched
+  regs::RegisterSpace a100(regs::Space::AmdMmio, device("nvidia/a100"));
+  a100.write(0x140, 4, 0x12345678);
+  VCHECK_EQ(a100.read(0x140, 4), 0x12345678u);
+}
+
+// The ECC counters a memory diagnostic reads: they count what `vgpu fault`
+// injected as uncorrectable errors, a write sets them (so zero clears), and a
+// corrected error is not counted.
+VTEST(nvidia_ecc_counters_report_injected_uncorrectable_errors) {
+  TempMachine m("nvecc");
+  const auto t4 = device("nvidia/t4");
+  const auto h100 = device("nvidia/h100");
+  regs::RegisterSpace turing(regs::Space::AmdMmio, t4), hopper(regs::Space::AmdMmio, h100);
+  VCHECK_EQ(turing.read(0x900488, 4), 0u);   // a machine nobody has injected into
+  VCHECK_EQ(hopper.read(0x9025a0, 4), 0u);
+  ras::inject_ecc(t4.uuid, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 3, ras::Retirement::Pages);
+  ras::inject_ecc(t4.uuid, ras::Severity::Corrected, ras::Location::DeviceMemory, 9, ras::Retirement::Pages);
+  ras::inject_ecc(t4.uuid, ras::Severity::Uncorrected, ras::Location::L2Cache, 5, ras::Retirement::Pages);
+  VCHECK_EQ(turing.read(0x900488, 4), 3u);   // partition 0 carries the device's count
+  VCHECK_EQ(turing.read(0x90048c, 4), 0u);
+  VCHECK_EQ(turing.read(0x1404f8, 4), 5u);   // L2, not memory
+  VCHECK_EQ(turing.read(0x100e78, 4), 0u);   // the MMU's SRAMs have no injection location
+  VCHECK_EQ(hopper.read(0x9025a0, 4), 0u);   // another GPU's counters are its own
+  // Writing zero clears; the counter then counts from what was written.
+  turing.write(0x900488, 4, 0);
+  VCHECK_EQ(turing.read(0x900488, 4), 0u);
+  ras::inject_ecc(t4.uuid, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 2, ras::Retirement::Pages);
+  VCHECK_EQ(turing.read(0x900488, 4), 2u);
+  turing.write(0x900488, 4, 100);
+  VCHECK_EQ(turing.read(0x900488, 4), 100u);
+  ras::inject_ecc(t4.uuid, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, ras::Retirement::Pages);
+  VCHECK_EQ(turing.read(0x900488, 4), 101u);
+  VCHECK_EQ(turing.read(0x1404f8, 4), 5u);   // clearing one counter leaves the others
+  // A counter written where nothing was counted (a partition past the first) keeps its value.
+  turing.write(0x90048c, 4, 7);
+  VCHECK_EQ(turing.read(0x90048c, 4), 7u);
+  // Hopper's, at its own offsets.
+  ras::inject_ecc(h100.uuid, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 4, ras::Retirement::Rows);
+  VCHECK_EQ(hopper.read(0x9025a0, 4), 4u);
+  VCHECK_EQ(hopper.read(0x9025a4, 4), 0u);
+  hopper.write(0x9025a0, 4, 0);
+  VCHECK_EQ(hopper.read(0x9025a0, 4), 0u);
+  // A driver reload restarts the counts; a counter's base from before does not hide them.
+  ras::reset_volatile(t4.uuid);
+  VCHECK_EQ(turing.read(0x900488, 4), 0u);
+  ras::inject_ecc(t4.uuid, ras::Severity::Uncorrected, ras::Location::DeviceMemory, 1, ras::Retirement::Pages);
+  VCHECK_EQ(turing.read(0x900488, 4), 1u);
+}
+
+// The scratch the architectures' headers give a block keeps what is written,
+// and its neighbours are untouched.
+VTEST(architecture_scratch_registers_keep_writes) {
+  TempMachine m("nvarchscratch");
+  regs::RegisterSpace h100(regs::Space::AmdMmio, device("nvidia/h100"));
+  h100.write(0x14fc, 4, 0xa5a5a5a5);        // NV_PBUS_SW_SCRATCH(63)
+  h100.write(0x200bc, 4, 0x12345678);       // NV_THERM_I2CS_SCRATCH
+  VCHECK_EQ(h100.read(0x14fc, 4), 0xa5a5a5a5u);
+  VCHECK_EQ(h100.read(0x200bc, 4), 0x12345678u);
+  VCHECK_EQ(h100.read(0x14f8, 4), 0u);
+  h100.write(0x100a34, 4, 0xfeedf000);      // the FBHUB flush address, low word
+  VCHECK_EQ(h100.read(0x100a34, 4), 0xfeedf000u);
+  regs::RegisterSpace b200(regs::Space::AmdMmio, device("nvidia/b200"));
+  b200.write(0x590, 4, 0x3);                // NV_PMC_ZB_SCRATCH_RESET_2(4): confidential-computing bits
+  VCHECK_EQ(b200.read(0x590, 4), 0x3u);
+  VCHECK_EQ(b200.read(0x58c, 4), 0u);       // CC off until something sets it
+  regs::RegisterSpace gb20x(regs::Space::AmdMmio, device("nvidia/rtx5090"));
+  gb20x.write(0xad00bc, 4, 0xcafe);
+  VCHECK_EQ(gb20x.read(0xad00bc, 4), 0xcafeu);
+  regs::RegisterSpace a100(regs::Space::AmdMmio, device("nvidia/a100"));
+  a100.write(0x100c10, 4, 0x1234);          // NV_PFB_NISO_FLUSH_SYSMEM_ADDR
+  a100.write(0x100c40, 4, 0xffffffff);      // ..._HI keeps its 24 defined bits
+  VCHECK_EQ(a100.read(0x100c10, 4), 0x1234u);
+  VCHECK_EQ(a100.read(0x100c40, 4), 0x00ffffffu);
+  regs::RegisterSpace t4(regs::Space::AmdMmio, device("nvidia/t4"));
+  t4.write(0x100e2c, 4, 0xffffffff);        // MMU_FAULT_BUFFER_GET(0): only the pointer is software's
+  VCHECK_EQ(t4.read(0x100e2c, 4), 0x000fffffu);
+  VCHECK_EQ(t4.read(0x100e30, 4), 0u);      // PUT is read-only: no fault was ever raised
+  VCHECK_EQ(t4.read(0x100cf8, 4), 3u);      // PAGE_FAULT_CTRL starts at SEND_NONE
 }
 
 VTEST_MAIN
