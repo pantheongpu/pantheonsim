@@ -43,9 +43,11 @@ jobs:
         include:
           - { cuda: '12.8', os: ubuntu-24.04, repo: ubuntu2404, skip: '' }
           # amd_tools and regs_cli compare with the host's own lspci, whose
-          # output 22.04's older pciutils formats differently; nothing in them
-          # depends on the toolkit, and the build job runs them on 24.04.
-          - { cuda: '12.4', os: ubuntu-22.04, repo: ubuntu2204, skip: '|amd_tools|regs_cli' }
+          # output 22.04's older pciutils formats differently; amd_hipcc runs
+          # the checked-in hipCUB and rocThrust programs, which ROCm's GCC 13
+          # built and 22.04's libstdc++ (GLIBCXX_3.4.30) cannot load. Nothing
+          # in them depends on the toolkit, and the build job runs them on 24.04.
+          - { cuda: '12.4', os: ubuntu-22.04, repo: ubuntu2204, skip: '|amd_tools|regs_cli|amd_hipcc' }
     # On the runner itself, not the cuda12.8 image: it runs the build job's
     # tests, whose session tests need user namespaces and mounts a container
     # refuses.
