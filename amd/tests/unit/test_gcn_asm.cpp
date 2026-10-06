@@ -1172,4 +1172,37 @@ VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_descri
   VCHECK_EQ(bad, 0);
 }
 
+VTEST(the_24_bit_multiplies_take_the_low_24_bits_signed_or_not_and_give_the_low_or_the_high_half) {
+  // v_mul_hi_i32_i24 (VOP2 0x07) was not decoded: llama.cpp's mul_mat_vec_q for Q6_K stopped on it.
+  const amd::CodeObject o = object("asm_mulhi");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(64 * 2);
+  uint32_t seed = 77;
+  const auto next = [&] {
+    seed = seed * 1103515245u + 12345u;
+    return seed;
+  };
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[2 * l] = l == 0 ? 0x7fffffu : l == 1 ? 0x800000u : l == 2 ? 0xffffffffu : next();   // the extremes, then noise
+    in[2 * l + 1] = l == 0 ? 0x7fffffu : l == 1 ? 0x800000u : l == 2 ? 0x00000002u : next();
+  }
+  const uint64_t in_d = mem.alloc(in.size() * 4), out = mem.alloc(64 * 5 * 4);
+  mem.write(in_d, in.data(), in.size() * 4);
+  const std::vector<uint32_t> r = run(o, "mulhi", mem, out, 64 * 5, {in_d, out});
+  const auto i24 = [](uint32_t v) { return static_cast<int64_t>(static_cast<int32_t>(v << 8) >> 8); };
+  const auto u24 = [](uint32_t v) { return static_cast<uint64_t>(v & 0xffffff); };
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint32_t a = in[2 * l], b = in[2 * l + 1];
+    const int64_t sp = i24(a) * i24(b);
+    const uint64_t up = u24(a) * u24(b);
+    wrong += r[5 * l + 0] != u(sp) + 0;
+    wrong += r[5 * l + 1] != u(sp >> 32);
+    wrong += r[5 * l + 2] != static_cast<uint32_t>(up);
+    wrong += r[5 * l + 3] != static_cast<uint32_t>(up >> 32);
+    wrong += r[5 * l + 4] != u(sp >> 32);
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST_MAIN

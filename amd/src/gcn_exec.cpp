@@ -2738,6 +2738,14 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane))));
       });
+    } else if (op == "v_mul_hi_i32_i24_e32"_op) {
+      each([&](uint32_t lane) {
+        // The high half of the 48-bit product of the sources' low 24 bits as signed numbers: what a compiler
+        // emits for a multiply high of values it knows fit in 24 bits (llama.cpp's mul_mat_vec_q).
+        const auto i24 = [](uint32_t v) { return static_cast<int64_t>(static_cast<int32_t>(v << 8) >> 8); };
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint32_t>((i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane))) >> 32));
+      });
     } else if (op == "v_mul_lo_u16_e32"_op) {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
