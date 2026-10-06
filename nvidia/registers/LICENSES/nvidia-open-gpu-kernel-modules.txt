@@ -1,10 +1,21 @@
 The register offsets and bit fields in nvidia/registers/mmio.yaml are taken from
-the published register headers of NVIDIA's open GPU kernel modules --
-src/common/inc/swref/published/nv_ref.h, turing/tu102/dev_pmc.h,
-turing/tu102/dev_bus.h and turing/tu102/dev_timer.h --
-each of which carries SPDX-License-Identifier: MIT and this notice:
+the published register headers of NVIDIA's open GPU kernel modules, under
+src/common/inc/swref/published/ (github.com/NVIDIA/open-gpu-kernel-modules):
 
-SPDX-FileCopyrightText: Copyright (c) 2003-2022 NVIDIA CORPORATION & AFFILIATES
+  nv_ref.h
+  turing/tu102/   dev_pmc.h dev_bus.h dev_timer.h dev_fb.h dev_fbpa.h dev_ltc.h
+  ampere/ga100/   dev_pmc.h dev_bus.h dev_fb.h
+  ampere/ga102/   dev_pmc.h
+  ada/ad102/      dev_bus.h
+  hopper/gh100/   dev_fb.h dev_fbpa.h dev_therm.h dev_bus.h
+  blackwell/gb100/ dev_bus.h dev_pmc_zb.h dev_pmc_zb_addendum.h dev_therm.h
+  blackwell/gb202/ dev_therm.h
+
+Each of them carries SPDX-License-Identifier: MIT, with a copyright line of
+"Copyright (c) <years> NVIDIA CORPORATION & AFFILIATES" (the years differ by
+file, 1993 to 2026) and this notice:
+
+SPDX-FileCopyrightText: Copyright (c) 2003-2023 NVIDIA CORPORATION & AFFILIATES
 SPDX-License-Identifier: MIT
 
 Permission is hereby granted, free of charge, to any person obtaining a

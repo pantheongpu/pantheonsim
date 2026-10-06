@@ -298,6 +298,68 @@ and each entry's `source` names the symbol). The values are this project's:
 Registers the map does not declare answer `0xbadf5040`, which is what the
 measured card answered from 0xc on.
 
+### Registers an architecture's headers define
+
+Past that common core, the map holds registers that only some architectures'
+headers publish. Each carries `arch:` in `nvidia/registers/mmio.yaml` -- one or
+more of `turing`, `ampere`, `ada`, `hopper`, `blackwell`, or the Blackwell dies
+`gb100` (B200, B300; compute capability 10.x) and `gb20x` (the GeForce RTX 50
+series; 12.x) -- and a GPU has the register only if its architecture is named.
+On any other GPU the offset is unmapped and reads `0xbadf5040`: no published
+header says what is there, so any value would be invented. The same offset can
+mean different registers on different architectures (the memory ECC counters
+move between Turing and Hopper), and a name with `_gh100` or `_gb20x` is the
+other architecture's copy. `vgpu regs list` shows the `arch` of each register;
+`vgpu regs read` on a GPU that lacks one says so; the `vgpu regs dump` and
+export files list only what the GPU has.
+
+The headers are a sample of each chip's registers, not a complete map, and the
+tree publishes different blocks for different chips. What is mapped, by block:
+
+| Block | Registers | Architectures | Behaviour |
+|---|---|---|---|
+| PMC interrupts | `pmc_intr_1`, `pmc_intr_en_1`, `pmc_intr_en_set_{0,1}`, `pmc_intr_en_clear_{0,1}` | Turing | The header makes `NV_PMC_INTR_EN` read-only and changes it through SET and CLEAR; that is modelled (SET/CLEAR read zero, a direct write to the enable is ignored on Turing and kept on the others). No interrupt is ever raised. Model. |
+| PMC device enable | `pmc_device_enable_0` | Ampere | Header reset (all disabled), kept as written. Model: it is not tied to `pmc_enable`, because the device-to-bit assignment comes from the topology table. |
+| PMC confidential computing | `pmc_zb_scratch_reset_2_{0..15}` | GB100 | 16 scratch words; word 4 holds the CC mode bits (named from the header's addendum). All zero: the profiles record no CC mode. |
+| PBUS scratch | `pbus_sw_scratch_{4..63}` | Ampere, Ada, Hopper, GB100 | The headers give 64 words on these (Turing's gives no size, so it keeps four). Scratch. |
+| PFB flush address | `pfb_niso_flush_sysmem_addr{,_hi}`, `pfb_fbhub_pcie_flush_sysmem_addr_{lo,hi}` | Ampere; Hopper | Written by the driver, kept as written (the high word keeps its defined 24 bits on Ampere). |
+| PFB MMU | `pfb_pri_mmu_page_fault_ctrl`, `pfb_pri_mmu_fault_buffer_{get,put}_{0,1}` | Turing | No fault is raised, so PUT stays 0; GET keeps its pointer; the control register starts at the header's default (send none). Model. |
+| MMU ECC | `pfb_pri_mmu_{l2tlb,hubtlb,fillunit}_ecc_uncorrected_err_count` | Turing | The injector has no location for MMU SRAMs: read zero, keep what is written. Model. |
+| Memory ECC | `pfb_fbpa_0_ecc_ded_count_{0,1}`; `..._{0..3}_gh100` | Turing; Hopper | See below. |
+| L2 ECC | `pltcg_ltc0_lts0_l2_cache_ecc_uncorrected_err_count` | Turing | See below. |
+| Thermal scratch | `therm_i2cs_scratch`, `therm_i2cs_scratch_gb20x` | Hopper, GB100; GB20x | Scratch. The GB20x header puts it elsewhere. |
+
+**ECC counters**, the registers a memory diagnostic reads to learn whether its
+test pattern tripped ECC: the double-bit (uncorrectable) count of the first
+memory partition (`NV_PFB_FBPA_0_ECC_DED_COUNT`) and of the first L2 slice. They
+report what `vgpu fault` injected as an *uncorrectable* error in device memory
+or L2 since the driver loaded -- the same counts NVML reports; a corrected error
+does not count here. The injector keeps one device-wide count rather than one per
+partition, so it is shown on counter 0 of the array and the others read zero:
+the sum is the device's count, the distribution is not modelled. As on
+hardware, a write sets the counter (write 0 to clear); it counts up from
+what was written, and a driver reload restarts the count (a counter that was
+written before the reload is only right again until its count climbs back past
+the count it was written at). A model, marked as one.
+
+```
+vgpu fault inject --ecc uncorrected --count 3              # device memory
+vgpu regs read --space mmio pfb_fbpa_0_ecc_ded_count_0   # 3  (Turing)
+vgpu regs write --space mmio pfb_fbpa_0_ecc_ded_count_0 0
+```
+
+What the headers do *not* publish, and so what stays unmapped everywhere: the
+device topology table (PTOP's `DEVICE_INFO` rows have a layout but the values
+are per chip), the PRI ring station and PRI error registers, the temperature
+sensors (the thermal header gives a scratch word only), the Ampere and Ada
+memory-controller ECC counters (no header), and Blackwell's zero-based
+`dev_ltc_zb`, `dev_fuse_zb` and `dev_tmr` registers, whose offsets are inside
+a unit whose BAR0 base the headers do not give. A caveat on the core above:
+`pbus_bar1_block`, `pbus_bar2_block` and the interrupt pair at 0x100 and 0x140
+are declared for every architecture, but the headers define them for Turing
+(and, for BAR1, Ampere) only; they stay mapped everywhere until the other
+architectures are checked, and are not gated.
+
 The map grew from the headers rather than from more measurement for a reason
 worth recording: a read-only sweep of the rest of that card's BAR0 halted its
 microcontroller (Xid 62) and the GPU needed a reset. Reading a card register by
