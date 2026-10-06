@@ -1081,3 +1081,85 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulAlgoGetHeuristic(
   *returned = 1;
   return CUBLAS_STATUS_SUCCESS;
 }
+
+// ---- an algorithm's configuration (what a tuner builds) ----------------------
+//
+// The math runs on the host, so every algorithm computes the same thing and
+// nothing in a configuration changes it: a configuration is a record that can
+// be set, read back and checked. The 64-byte algo holds its id in the first 4
+// bytes and each configuration attribute in a slot of its own after them.
+// A tuner that tries every tile or stage count finds them all accepted, and
+// all equally fast.
+namespace {
+size_t algo_attr_size(cublasLtMatmulAlgoConfigAttributes_t a) {
+  switch (static_cast<int>(a)) {
+    case CUBLASLT_ALGO_CONFIG_ID: case CUBLASLT_ALGO_CONFIG_TILE_ID: case CUBLASLT_ALGO_CONFIG_SPLITK_NUM:
+    case CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME: case CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING:
+    case CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION: case CUBLASLT_ALGO_CONFIG_STAGES_ID: return 4;
+    case CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID: case CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID: return 2;
+    default: return 0;
+  }
+}
+size_t algo_attr_offset(cublasLtMatmulAlgoConfigAttributes_t a) {
+  return static_cast<int>(a) == CUBLASLT_ALGO_CONFIG_ID ? 0 : 8 + 4 * static_cast<size_t>(a);
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasLtMatmulAlgoInit(cublasLtHandle_t, cublasComputeType_t, cudaDataType_t,
+                                                  cudaDataType_t, cudaDataType_t, cudaDataType_t, cudaDataType_t,
+                                                  int algoId, cublasLtMatmulAlgo_t* algo) {
+  if (!algo || algoId < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  std::memset(algo, 0, sizeof(*algo));
+  const uint32_t id = static_cast<uint32_t>(algoId);
+  std::memcpy(algo, &id, sizeof id);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cublasStatus_t cublasLtMatmulAlgoConfigSetAttribute(cublasLtMatmulAlgo_t* algo,
+                                                                cublasLtMatmulAlgoConfigAttributes_t attr,
+                                                                const void* buf, size_t sizeInBytes) {
+  const size_t n = algo_attr_size(attr);
+  if (!algo || !buf || n == 0 || sizeInBytes != n) return CUBLAS_STATUS_INVALID_VALUE;
+  std::memcpy(reinterpret_cast<char*>(algo) + algo_attr_offset(attr), buf, n);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+VGPU_EXPORT cublasStatus_t cublasLtMatmulAlgoConfigGetAttribute(const cublasLtMatmulAlgo_t* algo,
+                                                                cublasLtMatmulAlgoConfigAttributes_t attr,
+                                                                void* buf, size_t sizeInBytes,
+                                                                size_t* sizeWritten) {
+  const size_t n = algo_attr_size(attr);
+  if (!algo || n == 0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (sizeWritten) *sizeWritten = n;
+  if (sizeInBytes == 0 && !buf) return CUBLAS_STATUS_SUCCESS;   // a size query
+  if (!buf || sizeInBytes < n) return CUBLAS_STATUS_INVALID_VALUE;
+  std::memcpy(buf, reinterpret_cast<const char*>(algo) + algo_attr_offset(attr), n);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// What the matmul itself would say about these descriptors; the algorithm adds
+// no requirement of its own (no workspace, one wave). The algo is not touched.
+VGPU_EXPORT cublasStatus_t cublasLtMatmulAlgoCheck(cublasLtHandle_t, cublasLtMatmulDesc_t desc,
+                                                   cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
+                                                   cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc,
+                                                   const cublasLtMatmulAlgo_t* algo,
+                                                   cublasLtMatmulHeuristicResult_t* result) {
+  if (!algo || !result) return CUBLAS_STATUS_INVALID_VALUE;
+  if (known(desc) && known(Adesc) && known(Bdesc) && known(Ddesc)) {
+    const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
+    const cublasStatus_t st =
+        validate(*reinterpret_cast<MatmulDesc*>(desc), *reinterpret_cast<MatrixLayout*>(Adesc),
+                 *reinterpret_cast<MatrixLayout*>(Bdesc), known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld,
+                 ld, false);
+    if (st != CUBLAS_STATUS_SUCCESS) return st;
+  } else {
+    return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  const cublasLtMatmulAlgo_t keep = result->algo;   // "algo field is never updated"
+  std::memset(result, 0, sizeof(*result));
+  result->algo = keep;
+  result->state = CUBLAS_STATUS_SUCCESS;
+  result->workspaceSize = 0;
+  result->wavesCount = 1.0f;
+  return CUBLAS_STATUS_SUCCESS;
+}

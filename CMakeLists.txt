@@ -1473,6 +1473,13 @@ if(TARGET vgpucudart)
   add_test(NAME test_runtime_user_objects COMMAND test_runtime_user_objects)
   set_tests_properties(test_runtime_user_objects PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
 endif()
+if(TARGET vgpucublaslt)
+  add_executable(test_cublaslt_algo nvidia/tests/unit/test_cublaslt_algo.cpp)
+  target_link_libraries(test_cublaslt_algo PRIVATE vgpucublaslt vgpucudart)
+  target_include_directories(test_cublaslt_algo PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublaslt_algo COMMAND test_cublaslt_algo)
+  set_tests_properties(test_cublaslt_algo PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
 # which is invisible to a program until it captures a graph: the call has to be
