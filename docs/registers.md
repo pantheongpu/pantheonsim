@@ -159,6 +159,7 @@ vgpu regs read --space mmio grbm_status
 | `smu_message`, `smu_argument`, `smu_response` | 0x58a08, 0x58a48, 0x58a68 | the SMU mailbox (MP1 C2PMSG_66, _82, _90) |
 | `nbio_strap0` | 0x034d8 | the strap amdgpu reads the revision from: the device ID, the revision, the function enabled |
 | `nbio_config_memsize` | 0x0378c | the VRAM in MiB, which amdgpu sizes memory by; it follows the device, `VGPU_VRAM_MB` included |
+| `nbio_ep_pcie_lc_speed_cntl` | 0x03564 | the link controller's speed straps (Gen2 to Gen5 enabled), up to the profile's highest PCIe generation; model |
 | `nbio_partition_compute_status` | 0x03a0c | the compute partition mode: SPX |
 | `nbio_partition_mem_status`, `nbio_partition_mem_cap` | 0x03a10, 0x03a08 | the memory partition mode, NPS1, and the modes the GPU supports: NPS1 and NPS4 on MI300X and MI325X, NPS1 and NPS2 on MI350X |
 
@@ -166,7 +167,12 @@ The mailbox works as the driver drives it: clear the response, write the
 argument, write the message, and the SMU answers -- `1` in the response
 register, and its reply in the argument register. It answers TestMessage (the
 argument plus one), GetSmuVersion, GetDriverIfVersion and GetMetricsVersion,
-and refuses any other message with `0xfe`, unknown command:
+and answers the result codes of `smu_v13_0_6_ppsmc.h`: a message the header
+defines but the model has no handler for fails (`0xff`), and a number the header
+does not define is an unknown command (`0xfe`). The model never answers `0xfc`
+(busy) or `0xfd` (prerequisite rejected): it answers at once, and the header
+publishes no condition for either. The codes are the header's; which message
+gets which is a model:
 
 ```bash
 vgpu regs write --space mmio smu_response 0
@@ -196,12 +202,43 @@ published: which compute modes are offered depends on the memory mode and the
 XCC count in ways not checked yet.
 
 The register offsets, bit fields and message numbers come from the amdgpu
-headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `nbio_7_9_0_*.h`, `smu_v13_0_6_ppsmc.h`; their
-MIT notice is in `amd/registers/LICENSES/amdgpu-headers.txt`), and each entry's
+headers (`gc_9_4_3_*.h`, `mp_13_0_6_offset.h`, `nbio_7_9_0_*.h`, `smu_v13_0_6_ppsmc.h`, and for
+UMC and THM `umc_6_7_0_*.h` and `thm_13_0_2_*.h`; their
+MIT notices are in `amd/registers/LICENSES/amdgpu-headers.txt`), and each entry's
 `source` names the symbol. They are offsets from an IP block's base, and MI300
 learns its bases at boot from its IP discovery table; the database uses
 Aldebaran's (MI200's), the same GFX9 family. That, the engine status values and
 the firmware version are a model until checked on a card.
+
+### UMC ECC and thermal
+
+Behind the same BAR5 are the memory controller's ECC registers and the
+thermal sensor, from `umc_6_7_0_*.h` (Aldebaran's UMC) and `thm_13_0_2_*.h`,
+each entry naming its header symbol in `source`.
+
+| Registers | Offset | Behaviour |
+| --- | --- | --- |
+| `umc0_ch{0-3}_ecc_ctrl`, `_ecc_err_cnt_sel` | (0x14000 + regUMCCH*n*_0_EccCtrl / EccErrCntSel) * 4 | rw, only the header's fields stick; power-on value is a model (write and read ECC on, count enabled) |
+| `umc0_ch{0-3}_ecc_err_cnt` | (0x14000 + regUMCCH*n*_0_EccErrCnt) * 4 | ro, 16 bits: the injected correctable device-memory errors since load (`vgpu fault`), shared over the four channels in turn |
+| `umc0_mca_status_lo`, `_hi` | (0x14000 + regMCA_UMC_UMC0_MCUMC_STATUST0) * 4 | ro, the 64-bit MCA status as two dwords: Val and En with UECC and UC after an injected uncorrected error, else Val and En with CECC after a corrected one, else 0 |
+| `thm_tcon_cur_tmp` | (0x16600 + regTHM_TCON_CUR_TMP) * 4 | ro, `CUR_TEMP` holds the GPU temperature in 0.125 C steps |
+
+Status of these entries: the UMC instance 0 segment 0 base (0x14000) and THM
+segment 0 base (0x16600) are Aldebaran's, from `aldebaran_ip_offset.h`, and are
+assumed for MI300, not checked on a card; every entry says "not measured".
+Channels 4-7 (segment 1, 0x54000) and UMC instances 1-3 (0x94000 and up) lie
+beyond the 512 KiB BAR5 model and are reached on a card through the indirect
+index and data registers, which are not mapped, so they are not in the map. MI300 itself uses `umc_12_0_0` (its own MCA-based layout); that
+header carries a differently worded notice and is not used here. The mapping
+of the card's error count to channels, the power-on control values, the status
+bit pattern and the temperature step are models, not measured; the per-channel
+uncorrectable count and MCA address, syndrome and IPID registers are not mapped.
+`umc_6_7_0` publishes no per-channel uncorrectable count (`EccErrCnt` counts
+correctable errors; uncorrectable ones show in the MCA status's UECC bit, which
+is per instance), so none is mapped. The PCIe link's trained speed and width
+(`regBIF_CFG_DEV0_EPF0_0_LINK_STATUS`) are in segment index 8, which Aldebaran's
+NBIO base table does not have; they stay in configuration space, and only the
+link controller's speed straps (segment 2) are mapped in BAR5.
 
 ## From C
 
@@ -297,6 +334,71 @@ and each entry's `source` names the symbol). The values are this project's:
 
 Registers the map does not declare answer `0xbadf5040`, which is what the
 measured card answered from 0xc on.
+
+### Registers an architecture's headers define
+
+Past that common core, the map holds registers that only some architectures'
+headers publish. Each carries `arch:` in `nvidia/registers/mmio.yaml` -- one or
+more of `turing`, `ampere`, `ada`, `hopper`, `blackwell`, or the Blackwell dies
+`gb100` (B200, B300; compute capability 10.x) and `gb20x` (the GeForce RTX 50
+series; 12.x) -- and a GPU has the register only if its architecture is named.
+On any other GPU the offset is unmapped and reads `0xbadf5040`: no published
+header says what is there, so any value would be invented. The same offset can
+mean different registers on different architectures (the memory ECC counters
+move between Turing and Hopper), and a name with `_gh100` or `_gb20x` is the
+other architecture's copy. `vgpu regs list` shows the `arch` of each register;
+`vgpu regs read` on a GPU that lacks one says so; the `vgpu regs dump` and
+export files list only what the GPU has.
+
+The headers are a sample of each chip's registers, not a complete map, and the
+tree publishes different blocks for different chips. What is mapped, by block:
+
+| Block | Registers | Architectures | Behaviour |
+|---|---|---|---|
+| PMC interrupts | `pmc_intr_1`, `pmc_intr_en_1`, `pmc_intr_en_set_{0,1}`, `pmc_intr_en_clear_{0,1}` | Turing | The header makes `NV_PMC_INTR_EN` read-only and changes it through SET and CLEAR; that is modelled (SET/CLEAR read zero, a direct write to the enable is ignored on Turing and kept on the others). No interrupt is ever raised. Model. |
+| PMC device enable | `pmc_device_enable_0` | Ampere | Header reset (all disabled), kept as written. Model: it is not tied to `pmc_enable`, because the device-to-bit assignment comes from the topology table. |
+| PMC confidential computing | `pmc_zb_scratch_reset_2_{0..15}` | GB100 | 16 scratch words; word 4 holds the CC mode bits (named from the header's addendum). All zero: the profiles record no CC mode. |
+| PBUS scratch | `pbus_sw_scratch_{4..63}` | Ampere, Ada, Hopper, GB100 | The headers give 64 words on these (Turing's gives no size, so it keeps four). Scratch. |
+| PFB flush address | `pfb_niso_flush_sysmem_addr{,_hi}`, `pfb_fbhub_pcie_flush_sysmem_addr_{lo,hi}` | Ampere; Hopper | Written by the driver, kept as written (the high word keeps its defined 24 bits on Ampere). |
+| PFB MMU | `pfb_pri_mmu_page_fault_ctrl`, `pfb_pri_mmu_fault_buffer_{get,put}_{0,1}` | Turing | No fault is raised, so PUT stays 0; GET keeps its pointer; the control register starts at the header's default (send none). Model. |
+| MMU ECC | `pfb_pri_mmu_{l2tlb,hubtlb,fillunit}_ecc_uncorrected_err_count` | Turing | The injector has no location for MMU SRAMs: read zero, keep what is written. Model. |
+| Memory ECC | `pfb_fbpa_0_ecc_ded_count_{0,1}`; `..._{0..3}_gh100` | Turing; Hopper | See below. |
+| L2 ECC | `pltcg_ltc0_lts0_l2_cache_ecc_uncorrected_err_count` | Turing | See below. |
+| Topology table | `ptop_device_info_cfg` | GB100 | Only the format version, 2 at reset, which is all GB100's `dev_top.h` publishes as a value; the other fields read zero. The table's rows (`NV_PTOP_DEVICE_INFO2(i)`, from 0x022800) are not mapped. Model. |
+| Thermal scratch | `therm_i2cs_scratch`, `therm_i2cs_scratch_gb20x` | Hopper, GB100; GB20x | Scratch. The GB20x header puts it elsewhere. |
+
+**ECC counters**, the registers a memory diagnostic reads to learn whether its
+test pattern tripped ECC: the double-bit (uncorrectable) count of the first
+memory partition (`NV_PFB_FBPA_0_ECC_DED_COUNT`) and of the first L2 slice. They
+report what `vgpu fault` injected as an *uncorrectable* error in device memory
+or L2 since the driver loaded -- the same counts NVML reports; a corrected error
+does not count here. The injector keeps one device-wide count rather than one per
+partition, so it is shown on counter 0 of the array and the others read zero:
+the sum is the device's count, the distribution is not modelled. As on
+hardware, a write sets the counter (write 0 to clear); it counts up from
+what was written, and a driver reload restarts the count (a counter that was
+written before the reload is only right again until its count climbs back past
+the count it was written at). A model, marked as one.
+
+```
+vgpu fault inject --ecc uncorrected --count 3              # device memory
+vgpu regs read --space mmio pfb_fbpa_0_ecc_ded_count_0   # 3  (Turing)
+vgpu regs write --space mmio pfb_fbpa_0_ecc_ded_count_0 0
+```
+
+What the headers do *not* publish, and so what stays unmapped everywhere: the
+device topology table's rows (PTOP's `DEVICE_INFO2` has a layout, in GA100's and
+GB100's headers, but the values are per chip; only GB100's version is mapped),
+the PRI ring station and PRI error registers (none of the headers fetched for
+Turing, Ampere, Hopper or Blackwell defines one), the temperature
+sensors (the thermal header gives a scratch word only), the Ampere and Ada
+memory-controller ECC counters (no header), and Blackwell's zero-based
+`dev_ltc_zb`, `dev_fuse_zb` and `dev_tmr` registers, whose offsets are inside
+a unit whose BAR0 base the headers do not give. A caveat on the core above:
+`pbus_bar1_block`, `pbus_bar2_block` and the interrupt pair at 0x100 and 0x140
+are declared for every architecture, but the headers define them for Turing
+(and, for BAR1, Ampere) only; they stay mapped everywhere until the other
+architectures are checked, and are not gated.
 
 The map grew from the headers rather than from more measurement for a reason
 worth recording: a read-only sweep of the rest of that card's BAR0 halted its

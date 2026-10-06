@@ -870,8 +870,22 @@ narrows what counts as observable, not what the detector looks at.
   architecture in the header's own fields on every profile and the measured
   card's value to the bit, whether the card is a virtual function, which
   engines a bound driver leaves running, the VBIOS scratch words, the BAR1 and
-  BAR2 block registers, and a timer that advances with the engine's clock.
-  Not yet: more AMD blocks (UMC ECC). A C API (vgpu_regs.h,
+  BAR2 block registers, and a timer that advances with the engine's clock;
+  plus the registers each architecture's own headers define (`arch` in the
+  database; Turing through Blackwell, anything a header does not publish stays
+  unmapped): interrupt enables with Turing's SET/CLEAR, memory and L2 ECC
+  error counters fed by `vgpu fault` (what a memory diagnostic reads), MMU
+  fault buffers, framebuffer flush addresses, the 64-word scratch arrays,
+  thermal scratch and Blackwell's confidential-computing scratch.
+  AMD UMC ECC (channels 0-3 of instance 0), its MCA status and the THM
+  temperature are mapped on assumed Aldebaran bases.
+  The SMU mailbox answers the header's failed and unknown-command codes, the
+  NBIO link controller's speed straps are mapped, and GB100's topology table
+  version. Not yet: the UMC's other channels and instances (beyond BAR5, via
+  the indirect pair), a per-channel uncorrectable count (the UMC header has
+  none), NBIO PCIe link status in BAR5 (its segment is not in the Aldebaran
+  base table), SRBM, XGMI/PCS, and the NVIDIA blocks whose headers publish no
+  usable values (the topology rows, PRI errors, temperature). A C API (vgpu_regs.h,
   libvgpuregs) gives bring-up software the same access. tools/regprobe
   captures real cards (read-only) to check and map the model against. AMD's
   gpu_metrics table (v1.5), amdgpu's busy and memory files and its hwmon (read
@@ -880,7 +894,7 @@ narrows what counts as observable, not what the detector looks at.
   profiles, its registers found through its capability chain; an
   nvidia/rtx3080ti profile of that card is verified on 512 values, and its
   measured BAR0 (identification 0xb72000a1, unmapped 0xbadf5040) is its MMIO
-  space. Next: map more of BAR0, and capture data-center and AMD cards. The
+  space. Next: map more of BAR0 as headers publish it, and capture data-center and AMD cards. The
   session's /sys/bus/pci devices carry config, resource, IDs and link files
   from the registers, and NVML and nvidia-smi read the link through them, each
   access logged under the tool's name. Every GPU model's registers and

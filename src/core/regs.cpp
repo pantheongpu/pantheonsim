@@ -101,6 +101,7 @@ std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t
       throw Error::make(Err::ProfileParse, where, ": capability is pm, msi, pcie or aer");
     r.fields = list("fields");
     r.surfaces = list("surfaces");
+    r.arch = list("arch");
     if (r.access == Access::Rw && !r.write_mask)
       throw Error::make(Err::ProfileParse, where, ": a rw register needs a write_mask");
     if ((r.access == Access::Rw1c || r.access == Access::Bar) && r.backing.empty())
@@ -109,9 +110,23 @@ std::vector<Register> load(const char* yaml, const std::string& origin, uint32_t
     out.push_back(std::move(r));
   }
   std::sort(out.begin(), out.end(), [](const Register& x, const Register& y) { return x.offset < y.offset; });
-  for (size_t i = 1; i < out.size(); ++i)
-    if (out[i].offset < out[i - 1].offset + out[i - 1].width / 8)
-      throw Error::make(Err::ProfileParse, origin, ": ", out[i].name, " overlaps ", out[i - 1].name);
+  // Registers gated to different architectures may share an offset: a GPU has
+  // only the ones its own headers define.
+  const auto same_arch = [](const std::string& x, const std::string& y) {
+    const auto blackwell_die = [](const std::string& t) { return t == "gb100" || t == "gb20x"; };
+    return x == y || (x == "blackwell" && blackwell_die(y)) || (y == "blackwell" && blackwell_die(x));
+  };
+  const auto shares_an_arch = [&](const Register& a, const Register& b) {
+    if (a.arch.empty() || b.arch.empty()) return true;
+    for (const auto& x : a.arch)
+      for (const auto& y : b.arch)
+        if (same_arch(x, y)) return true;
+    return false;
+  };
+  for (size_t i = 0; i < out.size(); ++i)
+    for (size_t j = i + 1; j < out.size() && out[j].offset < out[i].offset + out[i].width / 8; ++j)
+      if (shares_an_arch(out[i], out[j]))
+        throw Error::make(Err::ProfileParse, origin, ": ", out[j].name, " overlaps ", out[i].name);
   return out;
 }
 
@@ -429,6 +444,10 @@ struct RegisterSpace::Impl {
     if (image_src) caps = walk_capabilities(image_src->bytes);
     for (size_t i = 0; i < rs.size(); ++i) {
       const Register& r = rs[i];
+      if (space != Space::Config && !vend.has_register(d, r)) {   // not this architecture's
+        at[i] = RegisterSpace::kAbsent;
+        continue;
+      }
       if (!image_src || r.capability.empty()) {
         at[i] = r.offset;
         continue;
@@ -497,8 +516,8 @@ struct RegisterSpace::Impl {
   }
 
   State* state() { return derived ? fresh.get() : static_cast<State*>(file->payload()); }
-  vendor::Context context(const Register& r) {
-    return {d, base(r), state()->vendor_words, derived};
+  vendor::Context context(const Register& r, const ras::Counters& c) {
+    return {d, base(r), state()->vendor_words, derived, c};
   }
 
   // A GPU that has fallen off the bus (`vgpu fault lose`) no longer answers:
@@ -553,7 +572,7 @@ struct RegisterSpace::Impl {
     if (k == "profile.device_id" || k == "profile.subsystem_id") return device;
     // What only the vendor's cards have: its profile values -- revision,
     // command, header type, class -- and its live device state.
-    if (uint32_t v = 0; vend.backed(k, context(r), &v)) return v;
+    if (uint32_t v = 0; vend.backed(k, context(r, c), &v)) return v;
     if (k.rfind("bar.", 0) == 0) return bar_value(static_cast<uint32_t>(k[4] - '0'));
     if (k == "link.capabilities") {
       // Max speed and width, from the profile; on a captured card the rest --
@@ -764,7 +783,7 @@ void RegisterSpace::write(uint32_t offset, uint32_t size, uint32_t value) {
         break;
       case Access::Rw: {
         if (!fixed_backing(r.backing)) {   // the vendor's device logic
-          impl_->vend.write(r.backing, impl_->context(r), (impl_->evaluate(r, c) & ~covered) | (bits & covered));
+          impl_->vend.write(r.backing, impl_->context(r, c), (impl_->evaluate(r, c) & ~covered) | (bits & covered));
           break;
         }
         const uint32_t old = impl_->evaluate(r, c);
