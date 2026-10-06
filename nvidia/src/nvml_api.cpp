@@ -27,6 +27,7 @@
 #include <vector>
 #include <thread>
 
+#include "vgpu/host_cpus.hpp"
 #include "vgpu/profile.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -152,6 +153,49 @@ nvmlReturn_t copy_string(const char* src, char* dst, unsigned int len) {
   if (need > len) return NVML_ERROR_INSUFFICIENT_SIZE;
   std::memcpy(dst, src, need);
   return NVML_SUCCESS;
+}
+
+
+// Microseconds the device has spent in any of the clock-event reasons in
+// `mask`, from the windows `vgpu fault throttle` opens.
+uint64_t reason_time_us(const std::string& uuid, uint64_t mask) {
+  uint64_t us = 0;
+  try {
+    for (uint64_t bit = 1; bit && bit <= mask; bit <<= 1)
+      if (mask & bit) us += vgpu::ras::throttle_time_us(uuid, bit);
+  } catch (const std::exception&) {
+  }
+  return us;
+}
+
+// The clock-event reasons a performance policy counts, by the NVML field id
+// that reports it (NVML_FI_DEV_PERF_POLICY_* and the CLOCKS_EVENT_REASON_*
+// counters). Sync boost, low utilization, reliability and the application and
+// base clock totals are reasons VirtualGPU never raises, so they read zero.
+uint64_t policy_reasons(unsigned field) {
+  switch (field) {
+    case 74: return vgpu::ras::kSwPowerCap;
+    case 75: return vgpu::ras::kSwThermalSlowdown | vgpu::ras::kHwThermalSlowdown;
+    case 77: return vgpu::ras::kHwPowerBrakeSlowdown | vgpu::ras::kHwSlowdown;
+    case 269: return vgpu::ras::kSwThermalSlowdown;
+    case 270: return vgpu::ras::kHwThermalSlowdown;
+    case 271: return vgpu::ras::kHwPowerBrakeSlowdown;
+    default: return 0;
+  }
+}
+
+// The energy counter, in millijoules: the model's power integrated over the
+// time between readings. NVML's counts from driver load, which here is the
+// process's first reading, so the figure is monotonic within a process (DCGM's
+// hostengine, a monitoring loop) and starts again from zero in the next.
+unsigned long long energy_mj(unsigned int idx, const vgpu::telemetry::DeviceSample& d) {
+  static double mj[vgpu::telemetry::kMaxDevices] = {};
+  static std::chrono::steady_clock::time_point last[vgpu::telemetry::kMaxDevices] = {};
+  const auto now = std::chrono::steady_clock::now();
+  if (last[idx].time_since_epoch().count() != 0)
+    mj[idx] += d.power_mw * std::chrono::duration<double>(now - last[idx]).count();
+  last[idx] = now;
+  return static_cast<unsigned long long>(mj[idx]);
 }
 
 }  // namespace
@@ -851,8 +895,16 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBAR1MemoryInfo(nvmlDevice_t, nvmlBAR1Memor
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetVbiosVersion(nvmlDevice_t, char*, unsigned int) {
   REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;   // a virtual device has no VBIOS
 }
-VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEnergyConsumption(nvmlDevice_t, unsigned long long*) {
-  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTotalEnergyConsumption(nvmlDevice_t device,
+                                                             unsigned long long* energy) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  unsigned int idx;
+  if (!d || !energy || !index_of(device, &idx)) return bad(device);
+  *energy = energy_mj(idx, *d);
+  return NVML_SUCCESS;
 }
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t*,
                                                          unsigned int* count, unsigned long long) {
@@ -899,6 +951,20 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
     }
     return pcie.pcie[static_cast<uint32_t>(c)];
   };
+  // What DCGM's cache manager reads through this call: ECC by location, page
+  // retirement and row remapping, the time spent in each clock-event reason, and
+  // the energy counter. All from the same state the dedicated entry points read.
+  const vgpu::ras::State ras_state = d ? vgpu::ras::read(d->uuid) : vgpu::ras::State{};
+  auto set_ull = [](nvmlFieldValue_t& v, unsigned long long n) {
+    v.valueType = NVML_VALUE_TYPE_UNSIGNED_LONG_LONG;
+    v.value.ullVal = n;
+    v.nvmlReturn = NVML_SUCCESS;
+  };
+  auto set_uint = [](nvmlFieldValue_t& v, unsigned int n) {
+    v.valueType = NVML_VALUE_TYPE_UNSIGNED_INT;
+    v.value.uiVal = n;
+    v.nvmlReturn = NVML_SUCCESS;
+  };
   for (int i = 0; i < count; ++i) {
     nvmlFieldValue_t& v = values[i];
     v.nvmlReturn = NVML_ERROR_NOT_SUPPORTED;
@@ -924,6 +990,56 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
         }
         break;
       default:
+        if (!d) break;
+        // ECC: fields 1 and 2 are the mode, 3..6 the totals (single and double
+        // bit, volatile then aggregate), 7..16 the volatile and 18..27 the
+        // aggregate counts by location in (single, double) pairs: L1, L2,
+        // device memory, register file, texture memory.
+        if (v.fieldId >= 1 && v.fieldId <= 27 && v.fieldId != 17) {
+          if (!d->ecc_enabled) break;
+          using S = vgpu::ras::Severity;
+          using L = vgpu::ras::Location;
+          if (v.fieldId <= 2) { set_uint(v, 1); break; }
+          if (v.fieldId <= 6) {
+            const auto& c = v.fieldId <= 4 ? ras_state.since_load : ras_state.lifetime;
+            set_ull(v, c.ecc_total(v.fieldId % 2 ? S::Corrected : S::Uncorrected));
+            break;
+          }
+          static const L kWhere[5] = {L::L1Cache, L::L2Cache, L::DeviceMemory, L::RegisterFile,
+                                      L::TextureMemory};
+          const unsigned base = v.fieldId >= 18 ? 18 : 7;
+          const unsigned at = (v.fieldId - base) / 2, double_bit = (v.fieldId - base) % 2;
+          if (at >= 5) break;
+          const auto& c = base == 7 ? ras_state.since_load : ras_state.lifetime;
+          set_ull(v, c.ecc[double_bit][static_cast<unsigned>(kWhere[at])]);
+          break;
+        }
+        // Retired pages are a GDDR card's; row remapping an HBM card's.
+        if (v.fieldId >= 29 && v.fieldId <= 31 && d->memory_retirement == 1) {
+          const auto& c = ras_state.lifetime;
+          set_ull(v, v.fieldId == 29 ? c.retired_sbe : v.fieldId == 30 ? c.retired_dbe : c.retired_pending);
+          break;
+        }
+        if (v.fieldId >= 142 && v.fieldId <= 145 && d->memory_retirement == 2) {
+          const auto& c = ras_state.lifetime;
+          set_uint(v, static_cast<unsigned>(v.fieldId == 142   ? c.rows_correctable
+                                            : v.fieldId == 143 ? c.rows_uncorrectable
+                                            : v.fieldId == 144 ? c.rows_pending
+                                                               : c.rows_failure));
+          break;
+        }
+        // Time spent in each performance policy, in nanoseconds; the clock-event
+        // reason counters are the same measure by reason.
+        if ((v.fieldId >= 74 && v.fieldId <= 81) || (v.fieldId >= 269 && v.fieldId <= 271)) {
+          set_ull(v, reason_time_us(d->uuid, policy_reasons(v.fieldId)) * 1000);
+          break;
+        }
+        if (v.fieldId == 83) {   // total energy
+          unsigned int at;
+          if (index_of(device, &at)) set_ull(v, energy_mj(at, *d));
+          break;
+        }
+        if (v.fieldId == 230) set_uint(v, 0);   // GPU recovery action: none needed
         break;
     }
   }
@@ -1069,6 +1185,434 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMPSComputeRunningProcesses_v2(nvmlDevice_t
   REQUIRE_INIT();
   if (n) *n = 0;
   return NVML_SUCCESS;
+}
+
+/* ---- what DCGM and NVVS ask for ----
+ *
+ * NVIDIA's DCGM (`dcgmi diag`, NVVS and its plugins) reads the GPU through
+ * NVML: its hostengine resolves every entry point by name, treats a missing one
+ * as FUNCTION_NOT_FOUND and a NOT_SUPPORTED answer as "this part has no such
+ * thing", and runs a diagnostic only on what it could read. These are the
+ * queries behind the fields the diagnostics and the health watches use -- clock
+ * events, thermal and power violations, ECC, retired pages and remapped rows,
+ * the PCIe link and its replay count, topology -- answered from the same
+ * profile and reliability state as everything above, so an injected fault
+ * (`vgpu fault`) shows up in DCGM as it does in nvidia-smi. Entry points that
+ * postdate CUDA 12.0's nvml.h are declared here by their plain-C types, so the
+ * shim still builds against every toolkit CI uses.
+ */
+
+extern "C" {
+nvmlReturn_t nvmlDeviceGetCurrentClocksEventReasons(nvmlDevice_t, unsigned long long*);
+nvmlReturn_t nvmlDeviceGetSupportedClocksEventReasons(nvmlDevice_t, unsigned long long*);
+}
+
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCurrentClocksEventReasons(nvmlDevice_t device,
+                                                                unsigned long long* reasons) {
+  REQUIRE_INIT();
+  return nvmlDeviceGetCurrentClocksThrottleReasons(device, reasons);   // the renamed query
+}
+// The reasons `vgpu fault throttle` can raise, plus GPU idle: the ones the
+// model can say are active.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedClocksThrottleReasons(nvmlDevice_t device,
+                                                                     unsigned long long* reasons) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  unsigned int idx;
+  if (!index_of(device, &idx) || !reasons) return bad(device);
+  *reasons = vgpu::ras::kGpuIdle | vgpu::ras::kSwPowerCap | vgpu::ras::kHwSlowdown |
+             vgpu::ras::kSwThermalSlowdown | vgpu::ras::kHwThermalSlowdown |
+             vgpu::ras::kHwPowerBrakeSlowdown;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedClocksEventReasons(nvmlDevice_t device,
+                                                                  unsigned long long* reasons) {
+  REQUIRE_INIT();
+  return nvmlDeviceGetSupportedClocksThrottleReasons(device, reasons);
+}
+
+// How long the device has spent held back by a performance policy. referenceTime
+// is the host clock in microseconds, violationTime the time in the policy in
+// nanoseconds; NVVS compares two readings and fails a run whose thermal or power
+// violation time grew.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetViolationStatus(nvmlDevice_t device,
+                                                      nvmlPerfPolicyType_t policy,
+                                                      nvmlViolationTime_t* viol) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !viol) return bad(device);
+  // Policy numbers are NVML's: power 0, thermal 1, sync boost 2, board limit 3,
+  // low utilization 4, reliability 5, total app clocks 10, total base clocks 11.
+  static const int kField[12] = {74, 75, 76, 77, 78, 79, -1, -1, -1, -1, 80, 81};
+  const int p = static_cast<int>(policy);
+  if (p < 0 || p > 11 || kField[p] < 0) return NVML_ERROR_INVALID_ARGUMENT;
+  viol->referenceTime = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+  viol->violationTime = reason_time_us(d->uuid, policy_reasons(kField[p])) * 1000;
+  return NVML_SUCCESS;
+}
+
+/* identity */
+
+// Datacenter cards are Tesla as NVML brands them; the profile's name says the rest.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBrand(nvmlDevice_t device, nvmlBrandType_t* type) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !type) return bad(device);
+  const std::string name = d->name;
+  auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
+  *type = has("GeForce") ? NVML_BRAND_GEFORCE
+          : has("TITAN") ? NVML_BRAND_TITAN
+          : has("Quadro") ? NVML_BRAND_QUADRO
+          : has("RTX")   ? NVML_BRAND_NVIDIA_RTX
+                         : NVML_BRAND_TESLA;
+  return NVML_SUCCESS;
+}
+// One board per GPU, told apart by where it sits on the bus.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBoardId(nvmlDevice_t device, unsigned int* id) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !id) return bad(device);
+  unsigned int domain = 0, bus = 0, dev_id = 0;
+  std::sscanf(d->bus_id, "%x:%x:%x", &domain, &bus, &dev_id);
+  *id = bus << 8 | dev_id;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMultiGpuBoard(nvmlDevice_t device, unsigned int* multi) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !multi) return bad(device);
+  *multi = 0;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetBusType(nvmlDevice_t device, nvmlBusType_t* type) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !type) return bad(device);
+  *type = NVML_BUS_TYPE_PCIE;
+  return NVML_SUCCESS;
+}
+// A virtual device has no infoROM, as it has no VBIOS and no serial number.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetInforomVersion(nvmlDevice_t, nvmlInforomObject_t, char*,
+                                                     unsigned int) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetInforomImageVersion(nvmlDevice_t, char*, unsigned int) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceValidateInforom(nvmlDevice_t) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerManagementMode(nvmlDevice_t device,
+                                                          nvmlEnableState_t* mode) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !mode) return bad(device);
+  *mode = NVML_FEATURE_ENABLED;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPowerState(nvmlDevice_t device, nvmlPstates_t* state) {
+  REQUIRE_INIT();
+  return nvmlDeviceGetPerformanceState(device, state);
+}
+
+/* clocks */
+
+// The simulated memory clock does not step: one supported memory clock, the
+// profile's, and graphics clocks from the profile's maximum down in the 15 MHz
+// steps real boards use, to the 210 MHz floor they idle at.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedMemoryClocks(nvmlDevice_t device,
+                                                            unsigned int* count,
+                                                            unsigned int* clocks) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !count) return bad(device);
+  if (!d->mem_clock_max_mhz) return NVML_ERROR_NOT_SUPPORTED;
+  const unsigned int have = *count;
+  *count = 1;
+  if (!clocks || have < 1) return NVML_ERROR_INSUFFICIENT_SIZE;
+  clocks[0] = d->mem_clock_max_mhz;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetSupportedGraphicsClocks(nvmlDevice_t device,
+                                                              unsigned int memory_mhz,
+                                                              unsigned int* count,
+                                                              unsigned int* clocks) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !count) return bad(device);
+  if (!d->sm_clock_max_mhz) return NVML_ERROR_NOT_SUPPORTED;
+  if (memory_mhz != d->mem_clock_max_mhz) return NVML_ERROR_INVALID_ARGUMENT;
+  constexpr unsigned int kFloor = 210, kStep = 15;
+  const unsigned int top = d->sm_clock_max_mhz;
+  const unsigned int n = top > kFloor ? (top - kFloor) / kStep + 1 : 1;
+  const unsigned int have = *count;
+  *count = n;
+  if (!clocks || have < n) return NVML_ERROR_INSUFFICIENT_SIZE;
+  for (unsigned int i = 0; i < n; ++i) clocks[i] = top - i * kStep;
+  return NVML_SUCCESS;
+}
+// The application clocks are the maximum clocks, which is what a card nobody
+// has set application clocks on runs at; so are the customer boost maximum.
+static nvmlReturn_t max_clock_of(nvmlDevice_t device, nvmlClockType_t type, unsigned int* mhz) {
+  return nvmlDeviceGetMaxClockInfo(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetApplicationsClock(nvmlDevice_t device, nvmlClockType_t type,
+                                                        unsigned int* mhz) {
+  REQUIRE_INIT(); return max_clock_of(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDefaultApplicationsClock(nvmlDevice_t device,
+                                                               nvmlClockType_t type,
+                                                               unsigned int* mhz) {
+  REQUIRE_INIT(); return max_clock_of(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMaxCustomerBoostClock(nvmlDevice_t device,
+                                                            nvmlClockType_t type,
+                                                            unsigned int* mhz) {
+  REQUIRE_INIT(); return max_clock_of(device, type, mhz);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetClock(nvmlDevice_t device, nvmlClockType_t type,
+                                            nvmlClockId_t id, unsigned int* mhz) {
+  REQUIRE_INIT();
+  return id == NVML_CLOCK_ID_CURRENT ? nvmlDeviceGetClockInfo(device, type, mhz)
+                                     : max_clock_of(device, type, mhz);
+}
+
+/* ECC, retired pages, remapped rows */
+
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDefaultEccMode(nvmlDevice_t device,
+                                                     nvmlEnableState_t* mode) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !mode) return bad(device);
+  if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;
+  *mode = NVML_FEATURE_ENABLED;
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetDetailedEccErrors(nvmlDevice_t device,
+                                                        nvmlMemoryErrorType_t error_type,
+                                                        nvmlEccCounterType_t counter_type,
+                                                        nvmlEccErrorCounts_t* counts) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !counts || static_cast<int>(error_type) > 1 || static_cast<int>(counter_type) > 1)
+    return bad(device);
+  if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;
+  using L = vgpu::ras::Location;
+  const vgpu::ras::State st = vgpu::ras::read(d->uuid);
+  const auto& c = ecc_counts(st, static_cast<int>(counter_type));
+  const unsigned sev = error_type == 0 ? 0u : 1u;
+  counts->l1Cache = c.ecc[sev][static_cast<unsigned>(L::L1Cache)];
+  counts->l2Cache = c.ecc[sev][static_cast<unsigned>(L::L2Cache)];
+  counts->deviceMemory = c.ecc[sev][static_cast<unsigned>(L::DeviceMemory)];
+  counts->registerFile = c.ecc[sev][static_cast<unsigned>(L::RegisterFile)];
+  return NVML_SUCCESS;
+}
+// `nvidia-smi -p`: zeroes the volatile counts (0) or the aggregate ones (1).
+// Retired pages and remapped rows stay, as on the card.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceClearEccErrorCounts(nvmlDevice_t device,
+                                                       nvmlEccCounterType_t counter_type) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || static_cast<int>(counter_type) > 1) return bad(device);
+  if (!d->ecc_enabled) return NVML_ERROR_NOT_SUPPORTED;
+  try {
+    if (counter_type == NVML_VOLATILE_ECC) vgpu::ras::reset_volatile(d->uuid, false);
+    else vgpu::ras::reset_aggregate(d->uuid);
+  } catch (const std::exception&) {
+    return NVML_ERROR_UNKNOWN;
+  }
+  return NVML_SUCCESS;
+}
+
+// Pages retired for `cause` (0 single-bit, 1 double-bit), on the cards that
+// retire pages (GDDR with ECC). The addresses are made up, one 64 KiB frame
+// apart: the simulator retires a count, not a particular frame.
+static nvmlReturn_t retired_pages(nvmlDevice_t device, nvmlPageRetirementCause_t cause,
+                                  unsigned int* count, unsigned long long* addresses,
+                                  unsigned long long* timestamps) {
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !count || static_cast<int>(cause) < 0 || static_cast<int>(cause) > 1) return bad(device);
+  if (d->memory_retirement != 1) return NVML_ERROR_NOT_SUPPORTED;
+  const auto& c = vgpu::ras::read(d->uuid).lifetime;
+  const unsigned int have = *count;
+  const unsigned int n = static_cast<unsigned int>(cause == 0 ? c.retired_sbe : c.retired_dbe);
+  *count = n;
+  if (n > have || (n && !addresses)) return NVML_ERROR_INSUFFICIENT_SIZE;
+  for (unsigned int i = 0; i < n; ++i) {
+    addresses[i] = 0x10000000ull + (cause == 0 ? 0 : 0x1000000ull) + i * 0x10000ull;
+    if (timestamps) timestamps[i] = 0;
+  }
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetRetiredPages(nvmlDevice_t device,
+                                                   nvmlPageRetirementCause_t cause,
+                                                   unsigned int* count,
+                                                   unsigned long long* addresses) {
+  REQUIRE_INIT(); return retired_pages(device, cause, count, addresses, nullptr);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetRetiredPages_v2(nvmlDevice_t device,
+                                                      nvmlPageRetirementCause_t cause,
+                                                      unsigned int* count,
+                                                      unsigned long long* addresses,
+                                                      unsigned long long* timestamps) {
+  REQUIRE_INIT(); return retired_pages(device, cause, count, addresses, timestamps);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetRetiredPagesPendingStatus(nvmlDevice_t device,
+                                                                nvmlEnableState_t* pending) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !pending) return bad(device);
+  if (d->memory_retirement != 1) return NVML_ERROR_NOT_SUPPORTED;
+  *pending = vgpu::ras::read(d->uuid).lifetime.retired_pending ? NVML_FEATURE_ENABLED
+                                                              : NVML_FEATURE_DISABLED;
+  return NVML_SUCCESS;
+}
+// Row remapping, on the HBM cards that do it.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetRemappedRows(nvmlDevice_t device, unsigned int* corrected,
+                                                   unsigned int* uncorrected, unsigned int* pending,
+                                                   unsigned int* failure) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !corrected || !uncorrected || !pending || !failure) return bad(device);
+  if (d->memory_retirement != 2) return NVML_ERROR_NOT_SUPPORTED;
+  const auto& c = vgpu::ras::read(d->uuid).lifetime;
+  *corrected = static_cast<unsigned int>(c.rows_correctable);
+  *uncorrected = static_cast<unsigned int>(c.rows_uncorrectable);
+  *pending = c.rows_pending ? 1 : 0;
+  *failure = c.rows_failure ? 1 : 0;
+  return NVML_SUCCESS;
+}
+// The row-remapper's bank histogram is not modelled: banks are not.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetRowRemapperHistogram(nvmlDevice_t, nvmlRowRemapperHistogramValues_t*) {
+  REQUIRE_INIT(); return NVML_ERROR_NOT_SUPPORTED;
+}
+
+/* PCIe, topology, affinity */
+
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieReplayCounter(nvmlDevice_t device, unsigned int* value) {
+  REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !value) return bad(device);
+  *value = static_cast<unsigned int>(
+      vgpu::ras::read(d->uuid).since_load.pcie[static_cast<unsigned>(vgpu::ras::Pcie::Replay)]);
+  return NVML_SUCCESS;
+}
+// Per-lane speed of the link as trained, in MB/s, by generation.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieSpeed(nvmlDevice_t device, unsigned int* mbps) {
+  REQUIRE_INIT();
+  static const unsigned int kMbps[7] = {0, 2500, 5000, 8000, 16000, 32000, 64000};
+  unsigned int gen = 0;
+  if (!mbps) return NVML_ERROR_INVALID_ARGUMENT;
+  if (const nvmlReturn_t rc = pcie_link(device, &gen, true, true); rc != NVML_SUCCESS) return rc;
+  if (gen < 1 || gen > 6) return NVML_ERROR_NOT_SUPPORTED;
+  *mbps = kMbps[gen];
+  return NVML_SUCCESS;
+}
+// The maximum link speed as NVML_PCIE_LINK_MAX_SPEED_*: 1 is 2500 MB/s, and so
+// on up through the generations.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetPcieLinkMaxSpeed(nvmlDevice_t device, unsigned int* speed) {
+  REQUIRE_INIT();
+  unsigned int gen = 0;
+  if (!speed) return NVML_ERROR_INVALID_ARGUMENT;
+  if (const nvmlReturn_t rc = pcie_link(device, &gen, true, false); rc != NVML_SUCCESS) return rc;
+  if (gen < 1 || gen > 6) return NVML_ERROR_NOT_SUPPORTED;
+  *speed = gen;
+  return NVML_SUCCESS;
+}
+
+// Every GPU sits behind the host bridge: the topology `vgpu smi topo` prints
+// (PHB), since no profile records NVLink.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTopologyCommonAncestor(nvmlDevice_t a, nvmlDevice_t b,
+                                                             nvmlGpuTopologyLevel_t* level) {
+  REQUIRE_INIT();
+  unsigned int ia, ib;
+  if (!index_of(a, &ia)) return bad(a);
+  if (!index_of(b, &ib)) return bad(b);
+  if (!level || ia == ib) return NVML_ERROR_INVALID_ARGUMENT;
+  *level = NVML_TOPOLOGY_HOSTBRIDGE;
+  return NVML_SUCCESS;
+}
+// Peer reads, writes and atomics work between any two devices (cuDeviceCanAccessPeer
+// says so), over PCIe; there is no NVLink to report.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetP2PStatus(nvmlDevice_t a, nvmlDevice_t b,
+                                                nvmlGpuP2PCapsIndex_t cap,
+                                                nvmlGpuP2PStatus_t* status) {
+  REQUIRE_INIT();
+  unsigned int ia, ib;
+  if (!index_of(a, &ia)) return bad(a);
+  if (!index_of(b, &ib)) return bad(b);
+  if (!status || ia == ib) return NVML_ERROR_INVALID_ARGUMENT;
+  switch (static_cast<int>(cap)) {
+    case NVML_P2P_CAPS_INDEX_READ:
+    case NVML_P2P_CAPS_INDEX_WRITE:
+    case NVML_P2P_CAPS_INDEX_ATOMICS:
+    case NVML_P2P_CAPS_INDEX_PCI: *status = NVML_P2P_STATUS_OK; break;
+    case NVML_P2P_CAPS_INDEX_NVLINK: *status = NVML_P2P_STATUS_NOT_SUPPORTED; break;
+    default: return NVML_ERROR_INVALID_ARGUMENT;
+  }
+  return NVML_SUCCESS;
+}
+// The host CPUs, as the bit mask NVML returns, and one memory node.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetCpuAffinity(nvmlDevice_t device, unsigned int words,
+                                                  unsigned long* set) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !set || words == 0) return bad(device);
+  constexpr unsigned int kBits = 8 * sizeof(unsigned long);
+  const unsigned int cpus = vgpu::host_cpus();
+  for (unsigned int w = 0; w < words; ++w) {
+    const unsigned int lo = w * kBits;
+    set[w] = lo >= cpus ? 0ul : cpus - lo >= kBits ? ~0ul : (1ul << (cpus - lo)) - 1;
+  }
+  return NVML_SUCCESS;
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryAffinity(nvmlDevice_t device, unsigned int words,
+                                                     unsigned long* set, nvmlAffinityScope_t) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  if (!index_of(device, &idx) || !set || words == 0) return bad(device);
+  for (unsigned int w = 0; w < words; ++w) set[w] = w == 0 ? 1ul : 0ul;
+  return NVML_SUCCESS;
+}
+
+// No profile records NVLink: these are PCIe parts as far as the simulator knows,
+// and a PCIe part answers NOT_SUPPORTED, which DCGM takes to mean zero links.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetNvLinkState(nvmlDevice_t device, unsigned int,
+                                                  nvmlEnableState_t*) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  return index_of(device, &idx) ? NVML_ERROR_NOT_SUPPORTED : bad(device);
+}
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetNvLinkVersion(nvmlDevice_t device, unsigned int,
+                                                    unsigned int*) {
+  REQUIRE_INIT();
+  unsigned int idx;
+  return index_of(device, &idx) ? NVML_ERROR_NOT_SUPPORTED : bad(device);
 }
 
 /* ---- undocumented internal handshake ----

@@ -1400,6 +1400,8 @@ set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+add_test(NAME nvml_dcgm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_dcgm.sh)
+set_tests_properties(nvml_dcgm PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_isolation_fallback.sh)

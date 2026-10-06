@@ -62,6 +62,46 @@ LD_LIBRARY_PATH=build/shim python -c "import pynvml; pynvml.nvmlInit(); ..."
 Queries VirtualGPU cannot answer return `NVML_ERROR_NOT_SUPPORTED`, which tools
 render as `N/A` — the honest result rather than an invented number.
 
+## DCGM diagnostics
+
+NVIDIA's open-source DCGM (`dcgmi diag`, NVVS and its plugins) reads the GPU
+through this NVML. Its hostengine resolves entry points by name, reads a
+missing one as `FUNCTION_NOT_FOUND` and a `NOT_SUPPORTED` answer as "this part
+has none", and builds the diagnostic's watches (clock events, thermal and power
+violation time, ECC, retired pages and remapped rows, PCIe link and replays,
+energy) from what it could read. The shim answers those queries from the same
+profile and `vgpu fault` state as the rest, so a fault injected for nvidia-smi
+shows up in DCGM too, and `vgpu fault throttle` is how a run's thermal or power
+violation is provoked:
+
+```bash
+vgpu fault throttle --gpu 0 --reason sw_thermal_slowdown --seconds 5
+vgpu fault inject --gpu 0 --ecc uncorrected
+```
+
+What is answered: clock-event reasons (current and supported), violation time
+(`nvmlDeviceGetViolationStatus` and the performance-policy fields), ECC totals
+and by location (volatile and aggregate, as queries and as fields), retired
+pages on GDDR cards and remapped rows on HBM cards, the PCIe speed, maximum
+speed and replay counter, supported and application clocks (one memory clock; graphics
+clocks in 15 MHz steps from the profile's maximum), brand, board id, topology
+(host bridge) and peer-to-peer status, CPU and memory affinity, and an energy
+counter. The energy counter integrates the synthetic power model from the
+process's first reading, so it is monotonic inside one process (a hostengine) and
+restarts from zero in the next.
+
+What is not, and answers `NOT_SUPPORTED`: NVLink (no profile records any, so DCGM
+sees zero links, as on a PCIe part), the infoROM, the row-remapper's bank
+histogram, and everything that changes the card (clock locks, power limits, ECC
+mode). Retired-page addresses are made up, 64 KiB apart: the simulator retires a
+count, not a frame.
+
+`nvidia/tests/e2e/run_nvml_dcgm.sh` checks these answers on a GDDR card, an HBM
+card and a card without ECC, each after the fault that should move it. DCGM
+itself has not been run against the simulator: the diagnostic plugins also need
+CUDA, cuBLAS and the profiling counters through their own libraries, and the
+check above covers the NVML half only.
+
 ## Reliability and link in profiles
 
 Four optional `telemetry` keys describe what a card reports about memory

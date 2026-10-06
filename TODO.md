@@ -729,7 +729,7 @@ instance runs CUDA 12.8, so it also covers the older toolkit's LZ4 fatbins,
 its cudaGetDeviceProperties_v2 spelling and its soname majors; the 8x is
 sm_80, a second architecture.
 
-Not yet: `nvidia-smi topo -m`, DCGM. PyTorch also ships thousands of its own kernels,
+Not yet: `nvidia-smi topo -m`; DCGM's NVML half is answered (docs/telemetry.md), DCGM itself has not been run. PyTorch also ships thousands of its own kernels,
 which would run on the interpreter, so `import torch` finding a usable GPU is
 still a separate question from library coverage.
 
