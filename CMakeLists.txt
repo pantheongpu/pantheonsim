@@ -1099,19 +1099,22 @@ add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# ROCm SMI and AMD SMI each carry the simulator's core, by design; a test that loads both is an ODR violation
+# to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
+set(VGPU_SAN_ODR_OFF "ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 # ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
 add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
-target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
+target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuamdsmi vgpuhip)
 target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
 add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
 # Each with a machine of its own: the library reads the machine's telemetry,
 # which another process's simulated GPUs would join.
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-rocm-smi" "${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
 set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT
-  "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi")
+  "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi;${VGPU_SAN_ODR_OFF}")
 add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
 set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT
-  "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
+  "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon;${VGPU_SAN_ODR_OFF}")
 add_executable(test_amd_amd_smi amd/tests/unit/test_amd_smi.cpp)
 target_link_libraries(test_amd_amd_smi PRIVATE vgpuamdsmi vgpu)
 target_include_directories(test_amd_amd_smi PRIVATE tests/framework amd/include)
@@ -1354,6 +1357,11 @@ set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_memtest_patterns COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_memtest_patterns.sh)
 set_tests_properties(amd_memtest_patterns PROPERTIES DEPENDS "vgpuhip;vgpu_cli"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
+# Work-groups of several dimensions and waves (ids, LDS between waves), run by
+# checked-in hipcc programs whose code objects are version 4, on four GPUs.
+add_test(NAME amd_workgroup COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_workgroup.sh)
+set_tests_properties(amd_workgroup PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
@@ -1421,6 +1429,8 @@ set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BIN
 add_test(NAME nvml_health COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_health.sh)
 set_tests_properties(nvml_health PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME nvml_dcgm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_dcgm.sh)
+set_tests_properties(nvml_dcgm PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_isolation_fallback.sh)
@@ -1460,6 +1470,13 @@ if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_group.sh 4)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # The NCCL 2.29+ names PyTorch for CUDA 13 binds at load time: exported, and
+  # unsupported when called.
+  add_executable(test_nccl_symbols nvidia/tests/unit/test_nccl_symbols.cpp)
+  target_link_libraries(test_nccl_symbols PRIVATE vgpunccl)
+  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_nccl_symbols COMMAND test_nccl_symbols)
+  set_tests_properties(test_nccl_symbols PROPERTIES ENVIRONMENT "VGPU_QUIET=1")
   # Two ranks across two processes, the shape the RTX 3060 reference run has.
   add_test(NAME e2e_nccl_multiproc_2
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_multiproc.sh 2)
@@ -1473,6 +1490,28 @@ if(TARGET vgpunccl)
     set_tests_properties(e2e_nccl_comm_ops_${_n} PROPERTIES DEPENDS vgpunccl TIMEOUT 300
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:")
   endforeach()
+endif()
+
+# What PyTorch 2.14 binds at load time and the runtime lacked: user objects (and
+# the graphs that hold them), the library API, cuBLASLt's algorithm configuration.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_user_objects nvidia/tests/unit/test_runtime_user_objects.cpp)
+  target_link_libraries(test_runtime_user_objects PRIVATE vgpucudart vgpucuda)
+  # The driver is loaded, as it is in a framework, though the test names none of its symbols.
+  target_link_options(test_runtime_user_objects PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_runtime_user_objects PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_user_objects COMMAND test_runtime_user_objects)
+  # The runtime and the driver shim each carry the simulator's core, by design; one process that loads both
+  # is an ODR violation to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
+  set_tests_properties(test_runtime_user_objects PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+if(TARGET vgpucublaslt)
+  add_executable(test_cublaslt_algo nvidia/tests/unit/test_cublaslt_algo.cpp)
+  target_link_libraries(test_cublaslt_algo PRIVATE vgpucublaslt vgpucudart)
+  target_include_directories(test_cublaslt_algo PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublaslt_algo COMMAND test_cublaslt_algo)
+  set_tests_properties(test_cublaslt_algo PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,

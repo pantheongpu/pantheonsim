@@ -864,12 +864,16 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   carry a static CUDA runtime that asks the driver for its export table.
 - **NCCL**: symmetric memory windows (registration returns a NULL window, as
   NCCL does without peer mappings) and the network plugin interface (there is
-  no network to plug into); see "NCCL: a file-backed transport". Not exported,
-  so a program that needs one fails to load with its name: the 2.28+ host API
-  `ncclCommRevoke`, `ncclCommGrow`, `ncclCommGetUniqueId`,
-  `ncclCommSuspend`/`ncclCommResume`, `ncclCommMemStats`, the `nccl*Config`
-  collective forms, the one-sided `ncclPutSignal`/`ncclSignal`/`ncclWaitSignal`,
-  `ncclParam*`, and the device API (`ncclDevCommCreate`, LSA and GIN). Shrink
+  no network to plug into); see "NCCL: a file-backed transport". Exported so
+  that a program that binds them at load time (PyTorch for CUDA 13 does, for
+  NCCL 2.30) still starts, but answering `ncclInvalidUsage` with a message
+  when called: `ncclCommRevoke`, `ncclCommGrow`, `ncclCommGetUniqueId`,
+  `ncclCommSuspend`/`ncclCommResume`, `ncclCommMemStats`, the one-sided
+  `ncclPutSignal`/`ncclSignal`/`ncclWaitSignal`, and the device API's host
+  calls (`ncclDevCommCreate`/`Destroy`, `ncclGetLsaMultimemDevicePointer`,
+  `ncclGetPeerDevicePointer`). Not exported at all, so a program that needs
+  one fails to load with its name: the `nccl*Config` collective forms,
+  `ncclParam*`, and the rest of the device API (GIN). Shrink
   refuses an excluded rank outside the communicator, which NCCL 2.29.7
   accepts and miscounts.
 - **cuFile**: the nvidia-fs (DMA) path itself, RDMA and user-space file system
