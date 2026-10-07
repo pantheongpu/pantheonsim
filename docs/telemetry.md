@@ -451,9 +451,8 @@ amdgpu_ring_cper`, which the real amd-smi reads as root), fatal and boot
 records, and the bad-page-threshold record.
 
 Outside a session both tools describe `VGPU_GPU`; with no AMD GPU configured,
-`rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. Launching a kernel on one fails with a clear
-"warp size 64 is unsupported" error — AMD *execution* is not implemented, and
-VirtualGPU says so rather than producing wrong answers. See TODO.md.
+`rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. AMD kernels run (see [amd/README.md](../amd/README.md)); what an AMD
+execution still refuses is in the gap register at the end of TODO.md.
 
 ## Where telemetry lives
 

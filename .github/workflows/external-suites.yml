@@ -7,6 +7,9 @@ name: External suites nightly
 #   v13.0, HeCBench's self-checking benchmarks, Rodinia apps (byte for byte),
 #   PolyBench/GPU (its own CPU check). Only programs whose simulator result
 #   already matched the card's are listed, so any failure is a regression.
+#   Two memory and burn-in testers, cuda_memtest and gpu-burn, have no card's
+#   output to match: each must pass by its own account (and cuda_memtest must
+#   find a stuck memory cell armed with `vgpu fault`).
 #   AMD: hip-tests (rocm-7.1.0) for one GPU a night, in turn MI300X, RX 6900 XT,
 #   RX 7900 XTX and RX 9070 XT, against that GPU's baseline of known failures.
 #   AMD memory test: BabelStream (HIP), on the same GPU, which validates its
@@ -25,8 +28,8 @@ on:
   workflow_dispatch:
     inputs:
       suites:
-        description: "Suites to run (space separated): cuda-samples hecbench rodinia polybench hip-tests babelstream"
-        default: cuda-samples hecbench rodinia polybench hip-tests babelstream
+        description: "Suites to run (space separated): cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream"
+        default: cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream
       amd_gpu:
         description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
         default: ''
@@ -46,7 +49,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SUITES: ${{ inputs.suites || 'cuda-samples hecbench rodinia polybench hip-tests babelstream' }}
+  SUITES: ${{ inputs.suites || 'cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream' }}
   # The NVIDIA lists' profile: the card their expected results came from.
   SUITE_GPU: nvidia/rtx3060
 
@@ -106,6 +109,8 @@ jobs:
       matrix:
         include:
           - { suite: polybench,    gpu: nvidia/rtx3060 }
+          - { suite: cuda-memtest, gpu: nvidia/rtx3060 }
+          - { suite: gpu-burn,     gpu: nvidia/rtx3060 }
           - { suite: rodinia,      gpu: nvidia/rtx3060 }
           - { suite: cuda-samples, gpu: nvidia/rtx3060 }
           - { suite: hecbench,     gpu: nvidia/rtx3060 }
