@@ -16,6 +16,15 @@ if [[ -z "$lib" ]]; then
     [[ -e "$c" ]] && { lib="$c"; break; }
   done
 fi
+# Where the globs find nothing, ask the Pythons that have the wheel installed (the one run_pytorch.sh uses, then any
+# python3): the package's own location is the one thing that is right whatever the virtual environment is called.
+if [[ -z "$lib" || ! -e "$lib" ]]; then
+  for py in "${VGPU_TORCH_CUDA_PYTHON:-}" "$HOME"/.local/share/torch-cu13*/bin/python python3; do
+    [[ -n "$py" ]] && command -v "$py" >/dev/null 2>&1 || continue
+    dir=$("$py" -I -c 'import importlib.util as u; s = u.find_spec("nvidia.cu13"); print(list(s.submodule_search_locations)[0] if s and s.submodule_search_locations else "")' 2>/dev/null)
+    [[ -n "$dir" && -e "$dir/lib/libnvrtc.so.13" ]] && { lib="$dir/lib/libnvrtc.so.13"; break; }
+  done
+fi
 [[ -n "$lib" && -e "$lib" ]] || { echo "SKIP: no pip-wheel libnvrtc.so.13 (set VGPU_NVRTC_LIB)"; exit 0; }
 command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit 0; }
 out=$(env -u LD_LIBRARY_PATH VGPU_NVRTC_LIB="$lib" python3 -I - "$shim/libnvrtc.so.13" <<'PY'
