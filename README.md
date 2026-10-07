@@ -53,18 +53,20 @@ Working today, all CPU-only:
 | Multi-GPU | a virtual rack of N devices with disjoint address windows; peer copies and per-device isolation match a real two-GPU machine |
 | Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSPARSELt, cuSOLVER, cuTENSOR, cuTensorNet, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU; also cuStateVec, cuDSS, nvJitLink, nvFatbin, cuFile (GPUDirect Storage's compatibility mode), nvCOMP (its standard formats and GDeflate, interoperable with NVIDIA's) and NVSHMEM (one simulated GPU per PE process, NVIDIA's device API on the simulator's host library) — see [nvidia/docs/libraries.md](nvidia/docs/libraries.md) |
 | PyTorch | PyTorch's official CUDA 13 build runs unmodified on the simulated NVIDIA GPUs, T4 to B200 and RTX 5090: GPT, ResNet, LSTM, U-Net, ViT, MoE and DLRM training all match the CPU — see [nvidia/docs/pytorch.md](nvidia/docs/pytorch.md). PyTorch for ROCm runs on the simulated AMD GPUs — see [amd/README.md](amd/README.md) |
-| Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs with a one-line hook that stops its pipeline at PTX — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
+| Python JIT | Numba runs unmodified (its PTX is assembled through the driver's JIT link API); Triton runs unmodified under `vgpu run` and `vgpu shell` (`vgpu-ptxas` stands in for `ptxas`) — see [nvidia/docs/jit.md](nvidia/docs/jit.md) |
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log; AMD MMIO (engine status, the SMU mailbox) from the amdgpu headers; a C API, `vgpu_regs.h` — see [docs/registers.md](docs/registers.md) |
-| AMD | unmodified hipcc-built programs, from ROCm 6.4, 7.0, 7.1 or 7.2, run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly. So does rocBLAS: its level-1 kernels and Tensile's float and double GEMMs, checked against a host BLAS — see [amd/README.md](amd/README.md) |
-| Profiling | CUPTI's Activity API under its real soname: kernels, copies and runtime API calls, correlated; unmodified nvprof traces a program on the T4 profile. Nsight Systems and Nsight Compute are not supported. See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
+| AMD | unmodified hipcc-built programs, from ROCm 6.4, 7.0, 7.1 or 7.2, run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly. So does rocBLAS: AMD's own quick tests pass (162,807 float and double ones, and the half, bfloat16, int8 and FP8 GEMMs run) — see [amd/README.md](amd/README.md) |
+| Profiling | CUPTI's Activity API under its real soname: kernels, copies and runtime API calls, correlated; unmodified nvprof traces a program on the T4 profile. `vgpu ncu` is this project's own `ncu`; Nsight Systems and Nsight Compute as NVIDIA ships them are not supported (`nsys` collects no CUDA data). See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
 Known limitations (deliberate, documented):
 
-- Kernels must carry **PTX** (embedded, or a fatbin containing PTX; zstd
-  fatbins are decompressed). SASS-only fatbins are rejected with a precise error.
+- Kernels run from **SASS** when the binary carries it (the default engine on
+  every generation from sm_75 to sm_120a, see [nvidia/docs/sass.md](nvidia/docs/sass.md))
+  and from **PTX** otherwise (embedded, or in a fatbin; zstd fatbins are
+  decompressed). `VGPU_SASS=0` forces the PTX path.
 - Unmodified apps must link **shared** cudart (`nvcc -cudart shared`) so the
   loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
   hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
@@ -277,13 +279,17 @@ which real GPUs cannot give you cheaply.
 
 ## Roadmap (abridged — see TODO.md)
 
-1. Shared memory, warp shuffles, more PTX → broader kernel coverage
-2. Static-cudart hosting (driver export tables) → no `-cudart shared` rebuild
-3. `vgpu test --matrix` across profiles (`vgpu run` is done)
-4. Hardware characterization + differential fuzzing against physical GPUs
-   (oracle machines) → verified profiles, conformance database, compat scores
-5. Random/adversarial warp scheduling → race detection
-6. AMD frontend (HIP/ROCm, CDNA3/CDNA4)
+Done: shared memory, warp shuffles and the PTX and SASS coverage listed in
+TODO.md; `vgpu run` and `vgpu test --matrix`; random and adversarial warp
+scheduling with race detection; the AMD frontend (HIP/ROCm, CDNA2 to CDNA4 and
+RDNA2 to RDNA4); hardware characterization for 12 NVIDIA profiles and one AMD
+profile. Still open:
+
+1. Static-cudart hosting (driver export tables) → no `-cudart shared` rebuild
+   (investigated and blocked, see TODO.md)
+2. Differential fuzzing against physical GPUs (oracle machines) → the rest of
+   the verified profiles, a conformance database, compat scores
+3. The gap register at the end of TODO.md
 
 ## Help, contributing and security
 
