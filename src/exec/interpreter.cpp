@@ -7,9 +7,10 @@
 //  - Divergence: a branch that splits the active mask parks the not-taken
 //    (pc, mask) on a per-warp divergence stack and continues with the taken
 //    side; a path that retires pops the next parked path. Paths reconverge
-//    implicitly at ret. Barriers inside divergent control flow are rejected
-//    with a clear error rather than deadlocking (IPDOM reconvergence is a
-//    planned upgrade — see TODO.md).
+//    implicitly at ret. Since then reconvergence is min-PC (paths at the same
+//    pc merge, the lowest pc runs next), so a bar.sync after a divergent region
+//    works; full IPDOM and irreducible control flow remain open (TODO.md,
+//    "Partially implemented").
 //  - Address spaces: device globals live in the MemoryManager VA range;
 //    per-thread .local frames live in a reserved window (kLocalVaBase) that
 //    generic loads/stores route to the executing lane's private buffer —
@@ -2710,7 +2711,8 @@ class Interpreter {
         std::holds_alternative<OpMovUnpack>(ins.op))
       return InstClass::BitConvert;
 
-    if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpRet>(ins.op) ||
+    if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpBrx>(ins.op) ||
+        std::holds_alternative<OpRet>(ins.op) ||
         std::holds_alternative<OpBar>(ins.op) || std::holds_alternative<OpBarRed>(ins.op) ||
         std::holds_alternative<OpTrap>(ins.op) || std::holds_alternative<OpCall>(ins.op))
       return InstClass::Control;
@@ -3606,6 +3608,10 @@ class Interpreter {
       exec_bra(w, idx, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpBrx>(&ins.op)) {
+      exec_brx(w, ctx, ins, idx, *op, m);
+      return;
+    }
     if (std::holds_alternative<OpRet>(ins.op)) {
       exec_ret(w, ctx, ins, idx, m);
       return;
@@ -3992,6 +3998,57 @@ class Interpreter {
     Path fall{fall_pc, fallthrough};
     fall.issued_at = w.steps;
     w.paths.push_back(fall);
+  }
+
+  // brx.idx: each lane goes where its own index points, so the warp splits
+  // into one path per distinct target (and one for the lanes a guard kept
+  // out). Lanes that pick the same entry stay together, and paths that reach
+  // a common pc merge again, exactly as after a divergent bra.
+  void exec_brx(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, const OpBrx& op, Mask m) {
+    if (m == 0) {
+      ++w.paths[idx].pc;
+      return;
+    }
+    Lanes scratch;
+    const Lanes& index = read_operand(w, ctx, ins, op.a, scratch);
+    std::vector<std::pair<size_t, Mask>> groups;   // target pc, lanes going there
+    for (Mask rest = m; rest != 0; rest &= rest - 1) {
+      const uint32_t lane = first_set(rest);
+      // The ISA defines no behaviour for an index outside the list, so none
+      // is chosen: the launch stops and names the lane and the value.
+      const uint32_t i = static_cast<uint32_t>(index[lane]);
+      if (i >= op.targets.size())
+        ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                 "brx.idx index " + std::to_string(i) + " is outside the branch target list '" + op.table +
+                     "' of " + std::to_string(op.targets.size()) +
+                     " entries; the PTX ISA does not define where it goes");
+      const size_t target = op.targets[i];
+      auto g = std::find_if(groups.begin(), groups.end(), [&](const auto& e) { return e.first == target; });
+      if (g == groups.end()) groups.emplace_back(target, Mask{0}), g = groups.end() - 1;
+      g->second |= Mask{1} << lane;
+    }
+    const size_t here = w.paths[idx].pc;
+    if (w.steps - turn_start_ >= kLongTurn)
+      for (const auto& g : groups)
+        if (g.first <= here) w.yield_now = true;
+    const Mask fallthrough = w.paths[idx].mask & ~m;
+    if (groups.size() == 1 && fallthrough == 0) {
+      w.paths[idx].pc = groups[0].first;
+      return;
+    }
+    ++stats_.divergent_branches;
+    w.paths[idx].pc = groups[0].first;
+    w.paths[idx].mask = groups[0].second;
+    for (size_t k = 1; k < groups.size(); ++k) {
+      Path p{groups[k].first, groups[k].second};
+      p.issued_at = w.steps;
+      w.paths.push_back(p);
+    }
+    if (fallthrough != 0) {
+      Path p{here + 1, fallthrough};
+      p.issued_at = w.steps;
+      w.paths.push_back(p);
+    }
   }
 
   void exec_ret(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, Mask m) {

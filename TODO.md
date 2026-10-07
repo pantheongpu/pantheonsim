@@ -1,12 +1,34 @@
 # TODO / status
 
-Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
+Updated: 2026-10-07 (rev 5). See ARCHITECTURE.md for the design behind these.
+
+Rev 5 is an audit, not an addition: every claim below was checked against the tree at
+`origin/main` 2ce1f45 (code, the CMake test list, the docs, the git log). The checks were
+static -- a test named here was found in the tree and registered, not re-run for this
+revision. Where an older bullet contradicted a newer one, the older one was corrected.
+The status snapshot, the inventories and the gap register at the end are new in rev 5.
+
+## Status at a glance (rev 5)
+
+| Area | State | Where to look |
+| --- | --- | --- |
+| NVIDIA execution | PTX interpreter and a SASS executor (the default; sm_75 to sm_120a); both run unmodified nvcc programs through `libvgpucudart` / `libvgpucuda` | nvidia/docs/sass.md, "Implemented" |
+| AMD execution | GCN/CDNA and RDNA executors (64- and 32-lane); unmodified hipcc programs from ROCm 6.4 to 7.2 on MI250X, MI300X, MI325X, MI350X, RX 6900 XT, RX 7900 XTX, RX 9070 XT | amd/README.md |
+| Device profiles | 16 NVIDIA (12 read from hardware) and 7 AMD (1 read from hardware) | "Profile inventory" |
+| NVIDIA libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink, nvFatbin, NVENC | nvidia/docs/libraries.md |
+| AMD libraries | rocBLAS, hipBLASLt, hipSPARSELt, MIOpen, rocPRIM/hipCUB, rocRAND, rocFFT, rocSPARSE, rocSOLVER, Composable Kernel, RCCL; ROCm SMI, AMD SMI, rocprofv3/rocprofiler-sdk shims | amd/README.md |
+| Frameworks | PyTorch (CUDA on 12 whole-model checks; ROCm on six AMD GPUs), vLLM (ROCm), llama.cpp and Ollama (every NVIDIA and AMD profile), Triton, Numba, `torch.compile` | nvidia/docs/pytorch.md, "CI inventory" |
+| Health, diagnostics, RAS | NVML (incl. the reads DCGM makes), nvidia-smi, rocm-smi, amd-smi, RVS's sensors, `vgpu fault`, BAR0/MMIO register model, memory-pattern tests | docs/telemetry.md, docs/registers.md |
+| Not possible by design | hardware performance counters that need a timing model (`%pm0`-`%pm7`, stall reasons, hit rates), timing itself | "Registers and counters" |
+| Blocked | static-cudart binaries (undocumented driver export tables), Nsight Systems collection, OptiX | "Next milestones" 4, "Known out of scope" |
+| Open work | the "Gap register" at the end of this file | |
 
 ## Implemented (tested)
 
 - M0 build system: CMake + zero-dep C++20; `scripts/build.sh`, `scripts/test.sh`
-- M1 profiles: a10/a100/h100/h200/b200 (placeholders, `verified: false`);
-  `vgpu list-gpus`, `vgpu info --gpu <id> [--json]`
+- M1 profiles: 16 NVIDIA and 7 AMD (see "Profile inventory" below; 12 NVIDIA and
+  1 AMD are read from hardware); `vgpu list-gpus`, `vgpu info --gpu <id> [--json]`
+  (`tests/unit/test_profile.cpp`)
 - M2 runtime core: devices, primary-context model, sparse virtual VRAM,
   H2D/D2H/D2D, OOB/UAF/double-free/interior-free/misalignment diagnostics
 - M4 PTX parser: ld/st(param/global), mov, cvta, add/sub/mul/min/max/div/rem,
@@ -28,13 +50,16 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   external C11 driver-API harness AND an nvcc-compiled vectorAdd e2e test.
 - Thrust and CUB run unmodified, and are under test: thrust::sort/reduce/
   inclusive_scan, and CUB's device-level DeviceReduce, DeviceScan (decoupled
-  look-back, so it depends on ordering across blocks) and DeviceRadixSort. A
-  radix sort is a tuned multi-kernel pipeline with its own temporary storage
-  and warp primitives throughout, so it exercises far more than a hand-written
-  kernel does. Also verified by probe, not yet pinned by a test: streams and
-  events with cross-stream waits, managed and pinned memory, pitched 2D
-  allocation with cudaMemcpy2D, the >48 KiB dynamic shared-memory opt-in, and
-  occupancy queries.
+  look-back, so it depends on ordering across blocks) and DeviceRadixSort
+  (`e2e_libraries`). A radix sort is a tuned multi-kernel pipeline with its own
+  temporary storage and warp primitives throughout, so it exercises far more
+  than a hand-written kernel does. Streams and events with cross-stream waits
+  (`e2e_capture_streams`, `e2e_per_thread_stream`), managed and pinned memory
+  (`e2e_runtime_conformance`, `e2e_managed_module`), pitched 2D allocation with
+  cudaMemcpy2D (`e2e_graph_shapes`, `e2e_runtime_conformance`), the >48 KiB
+  dynamic shared-memory opt-in (`shared_max`) and occupancy queries
+  (`e2e_occupancy_rules`) were verified by probe first and are pinned by those
+  tests now.
 - Stream-ordered memory pools (cudaMallocAsync, cudaMemPoolCreate,
   cudaMallocFromPoolAsync, cudaFreeAsync, the pool attributes, TrimTo,
   cudaDeviceSetMemPool): a pool holds what is freed to it up to its release
@@ -59,7 +84,9 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   an empty graph. e2e_graph_build builds a diamond, launches it, changes a
   node's parameters on the instantiated graph without rebuilding, updates it
   from the graph, clones it and runs it as a child graph. A 2D fill or a pitched
-  copy in a node is refused by name rather than run as something else.
+  copy in a node used to be refused; both are nodes like any other now (see the
+  graph-shapes bullet below, `e2e_graph_shapes`), and only a 2D fill with pitch 0
+  is refused.
 - The graph node types that are not device work: a host function
   (cudaGraphAddHostNode) runs on the CPU when the graph reaches it, and event
   record and wait nodes let a graph be timed and joined to work outside it. A
@@ -104,8 +131,9 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   program that raises it gets the room and one past it gets null -- the engine
   had said this was not wired. The heap and printf limits refuse to change once
   a kernel that calls malloc/free or printf has launched, decided from the
-  kernel's code. Stack and printf-buffer sizes are recorded and reported but
-  bound nothing here. e2e_device_limits allocates up to a raised limit and one
+  kernel's code. The stack size sets each thread's alloca stack (`e2e_stack_limit`);
+  the printf-buffer size is recorded and reported but bounds nothing here.
+  e2e_device_limits allocates up to a raised limit and one
   past it. The heap is one per device whichever engine a kernel runs on (the
   device's memory manager keeps it): a block one kernel allocates a later one
   may free, SASS or PTX, free() refunds the budget, and cudaDeviceReset empties
@@ -350,9 +378,10 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   reports its message and source location, and `cudaErrorAssert`), and the
   device heap -- `malloc`/`free` from inside a kernel, backed by the same
   allocator `cudaMalloc` uses so a device allocation gets the same
-  out-of-bounds and use-after-free checking. Capped at CUDA's default 8 MiB;
-  memory allocated there is reachable from the host here and is not on a
-  device, which is a permissive difference and recorded as one.
+  out-of-bounds and use-after-free checking. The heap is per device and sized by
+  `cudaLimitMallocHeapSize` (default 8 MiB; see the cudaDeviceSetLimit bullet,
+  `e2e_device_limits`, `e2e_device_heap`). The host may not free a device-heap
+  block: `cudaFree`, `cuMemFree` and `cuMemGetAddressRange` refuse it.
 - The video instructions, all of them: the scalar `vadd`, `vsub`,
   `vabsdiff`, `vmin`, `vmax`, `vshl`, `vshr`, `vmad` and `vset` with operand
   selectors, `.sat`, the secondary `.add`/`.min`/`.max` and the destination
@@ -537,10 +566,11 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
   in e2e_library_goldens), the near-ties listed in libraries.md marked.
   Remaining: watershed, marker labels, ResizeSqrPixel super-sampling and
   Lanczos, Scharr Canny's exact edges, the resize cubic kernel.
-- f16 (software IEEE binary16) and packed f16x2 arithmetic.
-- CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
-  devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
+  devices (`e2e_runtime_conformance`, `e2e_graph_shapes`, `test_runtime`;
+  all_reduce and p2p_thrasher take their real peer-DMA paths in
+  `pantheon_workloads`). f16 and CUDA Graphs have their own, longer bullets
+  above and in the half-precision sweep.
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
 
 ## Hardware characterization
@@ -554,8 +584,10 @@ an instance left running bills by the hour).
 `nvidia/tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware, twelve devices across seven architectures --
-including the first AMD part:
+Verified against real hardware: thirteen devices (twelve NVIDIA across six
+architectures, plus the first AMD part, CDNA3). Eleven are in the table; the
+A100 80GB (`nvidia/a100`) was read from a physical device on an 8x instance,
+as the note after the table says:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -572,13 +604,18 @@ including the first AMD part:
 | `nvidia/l40s` | L40S (sm_89, Ada Lovelace, AD102) | EC2 `g6e.2xlarge` |
 | `amd/mi325x` | MI325X (gfx942, CDNA3) | DigitalOcean `gpu-mi325x1-256gb` |
 
-All eleven NVIDIA parts match the physical device on **512 conformance values each** -- the
-same binary run on hardware and on VirtualGPU, diffed.
+The eleven NVIDIA parts in the table match the physical device on **512
+conformance values each** -- the same binary run on hardware and on VirtualGPU,
+diffed (`nvidia/tests/conformance/run_conformance.sh`,
+`nvidia/tools/verify-profile.sh`).
 
-**The AMD one is discovery, not execution.** `amd/mi325x` describes a real
-MI325X -- 304 CUs, 64-lane wavefronts, 64 KiB LDS, gfx942 -- and nothing can
-run on it yet, because the interpreter's warp is 32 lanes wide. The profile is
-deliberately ahead of the engine rather than rounded to fit it.
+**The AMD one was discovery first, and is execution now.** `amd/mi325x`
+describes a real MI325X -- 304 CUs, 64-lane wavefronts, 64 KiB LDS, gfx942 --
+and was the first AMD profile read from hardware. When it was written nothing
+could run on it, because the interpreter's warp was 32 lanes wide; the AMD
+engine (`amd/src/gcn_exec.cpp`, 64-lane wavefronts) runs gfx942 kernels now,
+and vLLM generates on a simulated MI300X and MI325X (`amd_vllm`). See
+`amd/README.md`.
 
 It also cost three droplets to get, and two of those were avoidable. The first
 two attempts compiled a HIP program on the rented machine and failed
@@ -634,7 +671,9 @@ What characterization corrected in the documentation-derived placeholders:
 Clocks, power caps, SM counts, shared-memory limits and PCI ids were already
 right. Capacity values being wrong is exactly what this process is for.
 
-Still documentation-derived: H200, B200, and all three AMD profiles. B200 had
+Still not read from hardware: H200 (inherited from H100), B200 (its framebuffer
+was measured, the rest is public documentation), B300, RTX 5090, and six AMD
+profiles (MI250X, MI300X, MI350X, RX 6900 XT, RX 7900 XTX, RX 9070 XT). B200 had
 no Lambda capacity; AMD parts are not offered there. The A100 80GB was read
 from a physical device on an 8x instance.
 
@@ -687,7 +726,9 @@ past that it stops being caution and starts being a false negative.
   (see docs/telemetry.md for why the stock nvidia-smi binary cannot be used).
 
 **Vendor libraries.** cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
-cuSOLVER, NCCL, NVRTC, NPP and nvJPEG are implemented under their real sonames, each verified
+cuSOLVER, NCCL, NVRTC, NPP and nvJPEG are implemented under their real sonames, as are cuDSS,
+cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink and nvFatbin (the whole
+list, with what each refuses, is nvidia/docs/libraries.md). The first group was verified
 against NVIDIA's own library on a physical GPU: cuFFT and cuSPARSE are
 bit-identical on every value the conformance suite reports, cuDNN on its
 forward suite and to 1e-6 relative on its training suite, cuSOLVER on
@@ -708,11 +749,13 @@ because none of them uses NVRTC:
   module loader consumes PTX, so there is no cubin to emit. Verified on shared
   memory with block reductions, atomics, 2D grids, math intrinsics, a tiled
   matmul, `shfl_up_sync` scans and streams.
-- **Triton works, with a one-line hook.** It compiles all the way to PTX and
-  then shells out to `ptxas` for a cubin, which is the one artifact in its
-  pipeline VirtualGPU cannot load. `nvidia/tools/vgpu_triton.py` ends the pipeline at
-  PTX using `knobs.runtime.add_stages_inspection_hook`, Triton's own extension
-  point. Verified on a fused softmax, a `tl.dot` matmul (real `mma.sync` and
+- **Triton works unmodified under `vgpu run` and `vgpu shell`.** It compiles to
+  PTX and shells out to `ptxas` for a cubin; `build/bin/vgpu-ptxas` stands in
+  for `ptxas` through `TRITON_PTXAS_PATH`, and `torch.compile` works too
+  (nvidia/docs/jit.md). `nvidia/tools/vgpu_triton.py` (Triton's own
+  `knobs.runtime.add_stages_inspection_hook` extension point, ending the
+  pipeline at PTX) is the older route and the fallback outside those commands.
+  Verified on a fused softmax, a `tl.dot` matmul (real `mma.sync` and
   `ldmatrix`) and an atomic reduction.
 - **CuPy does not work.** It statically links the CUDA runtime rather than
   loading `libcudart.so`, so `LD_LIBRARY_PATH` never reaches it; its embedded
@@ -723,17 +766,33 @@ because none of them uses NVRTC:
 
 Multi-GPU is verified against real hardware in four places: the local two-GPU
 box, and rented 2x H100 SXM5, 4x H100 SXM5 and 8x A100 80GB instances. All
-thirteen conformance suites match on every one of them, with NCCL compared
+the conformance suites that existed then (thirteen; there are seventeen in
+`nvidia/tests/conformance/` now) match on every one of them, with NCCL compared
 against NVIDIA's libnccl at two, four and eight ranks respectively. The 2x
 instance runs CUDA 12.8, so it also covers the older toolkit's LZ4 fatbins,
 its cudaGetDeviceProperties_v2 spelling and its soname majors; the 8x is
 sm_80, a second architecture.
 
-Not yet: `nvidia-smi topo -m`; DCGM's NVML half is answered (docs/telemetry.md), DCGM itself has not been run. PyTorch also ships thousands of its own kernels,
-which would run on the interpreter, so `import torch` finding a usable GPU is
-still a separate question from library coverage.
+`nvidia-smi topo -m` is implemented (`src/cli/smi.cpp`; `run_smi_queries.sh`,
+`run_smi_cli.sh`; only `-p2p` and `-i` are refused). DCGM's NVML half is
+answered (docs/telemetry.md; `nvml_health`, `nvml_dcgm`); DCGM itself
+has not been run against the simulator. PyTorch's official CUDA build runs
+unmodified from the T4 to the B200 and the RTX 5090 (nvidia/docs/pytorch.md;
+12 whole-model checks, `e2e_pytorch_models_<gpu>`); its CUDA 13 wheels carry
+PTX for compute_120 only, so they run only on `nvidia/rtx5090`.
 
 ## A race the simulator found in llama.cpp
+
+Status (rev 5): a record of one investigation, with no reproducer in this tree --
+it ran against an external llama.cpp checkout's `test-backend-ops`, not
+against anything under `ci/external/`, and the llama.cpp commit is not
+recorded. Whether the upstream bug has been fixed since is unknown. What *is*
+in the tree, and tested, is the detector: `VGPU_RACE=1` and `=2`
+(`src/exec/interpreter.cpp:535-548`; README.md), with
+`a_shared_race_between_warps_is_reported`, `two_warps_writing_the_same_value_is_not_reported`,
+`the_same_value_write_is_still_a_race_under_strict_mode`,
+`a_differing_write_after_a_redundant_one_is_still_reported` and
+`one_warp_reusing_its_own_shared_words_is_not_a_race` in tests/unit/test_exec3.cpp.
 
 `FLASH_ATTN_EXT` runs about 2950 cases against the CPU backend. Fourteen fail,
 all at `hsk=192, hsv=128` with a batch above one -- the asymmetric head-size
@@ -822,18 +881,33 @@ narrows what counts as observable, not what the detector looks at.
 
 - `rt_virus` needs **OptiX** (NVIDIA's ray-tracing library, loaded from
   libnvoptix.so.1), a separate NVIDIA subsystem, not CUDA; emulating it is a
-  distinct project. It fails with the vendor library's own error rather than a
-  VirtualGPU error. (`media_enc_virus` runs: `libvgpunvenc` implements NVENC.)
+  distinct project. It takes its documented "driver not installed" path (and is
+  skipped on hosts with the real driver libraries): `OUT_OF_SCOPE="rt_virus"` in
+  `tests/workloads/run_pantheon_workloads.sh`, docs/pantheon-workloads.md.
+  (`media_enc_virus` runs per the prose in that document: `libvgpunvenc`
+  implements NVENC; its status block still lists it as skipped, which is a
+  contradiction inside that document, not here.)
+- Nsight Systems and Nsight Compute as the vendor ships them. `vgpu ncu` is this
+  project's own `ncu` (src/cli/ncu.cpp, `e2e_ncu`); `nsys` runs but collects no
+  CUDA data (it uses its own bundled CUPTI, see nvidia/docs/cupti.md).
 
 ## Partially implemented
 
-- Divergence: min-PC reconvergence -- paths at the same pc merge and the lowest
-  pc runs next, so bar.sync after a divergent region works. Not full IPDOM:
-  irreducible control flow is not handled.
-- cuCtxSetCurrent(NULL) pops rather than clearing a per-thread binding; the
-  current-context stack is process-global, not thread-local.
-- M7 proper: needs the CUDA *runtime* API shim + fatbin PTX extraction to run
-  an unmodified nvcc-built binary (embedded-PTX driver-API apps work today).
+Rev 5 moved the entries that are complete features with tests out of this
+section (they follow, under their own heading). What is left here is partial in
+the sense that something specific is still missing, and each entry says what.
+
+- Divergence: min-PC reconvergence (`src/exec/interpreter.cpp`) -- paths at the
+  same pc merge and the lowest pc runs next, so bar.sync after a divergent
+  region works (`tests/unit/test_barriers.cpp`). Not full IPDOM: irreducible
+  control flow is not handled, and nothing pins that with a test. (The header
+  comment at the top of interpreter.cpp still says barriers in divergent code
+  are rejected and IPDOM is planned; it predates the min-PC code and is stale.)
+- cuCtxSetCurrent(NULL) pops the top of the context stack rather than clearing
+  the thread's binding (`nvidia/src/driver_api.cpp:938`; untested -- the
+  neighbouring `cuCtxPopCurrent` is covered by `driver_gaps.cpp`). The stack
+  itself is thread-local (`driver_api.cpp:175`); an earlier version of this
+  entry said it was process-global, which was wrong.
 - Reliability: ECC counts by location, retired pages, remapped rows and PCIe
   error counters are injected with `vgpu fault` and read by nvidia-smi, NVML
   and rocm-smi (docs/telemetry.md). `vgpu fault arm` delivers bit flips and
@@ -858,6 +932,19 @@ narrows what counts as observable, not what the detector looks at.
   ras-decode to the AFIDs it prints. Not yet: the CPER ring in debugfs, fatal
   and bad-page-threshold records, and a lost AMD GPU's sysfs entries going
   away.
+  Tests: `tests/unit/test_ras.cpp`, `test_telemetry`, `fault_cli`, `e2e_fault_datapath`,
+  `nvml_health`, `nvml_dcgm`, `amd_cper`, `amd_lost_gpu`, `amd_session`.
+  What is still not modelled, in one list (docs/telemetry.md has the line for each):
+  NVIDIA -- NVLink error injection and counters (the counters read zero and the far
+  end of a link is not modelled), ECC mode changes and persistent accounting
+  (NOT_SUPPORTED), the row-remapper bank histogram, retired-page addresses (placeholders
+  derived from the device UUID, not measured), infoROM; AMD -- the CPER debugfs ring,
+  fatal and bad-page-threshold records, a lost GPU's sysfs/hwmon entries going away
+  (they stay), violation status, PCIe throughput, bad-page threshold,
+  `rsmi_dev_gpu_metrics_info_get`, fabric/SoC/video clocks, every setter and reset
+  (amd/src/amd_smi.cpp, rocm_smi.cpp); amd-smi's `--csv`, `ras --follow` and `ras --afid`
+  (src/cli/amdsmi.cpp). AMD ECC, memory-sensor and link values follow AMD's
+  documentation and have not been compared with a real MI-series card.
   NVML and nvidia-smi -q answer the health surface (docs/telemetry.md, "Health
   and diagnostic queries"): ECC by location, retired pages and remapped rows
   per card family, clock-event reasons and violation times, PCIe replays,
@@ -910,6 +997,18 @@ narrows what counts as observable, not what the detector looks at.
   access logged under the tool's name. Every GPU model's registers and
   power-on values are kept in <vendor>/registers/gpus/ (`vgpu regs export`), and every
   simulated GPU of the model starts from them.
+  Tests: `tests/unit/test_regs.cpp`, `regs_cli`, `c_harness_regs`; the register database is
+  `registers/pci-config.yaml`, `nvidia/registers/mmio.yaml`, `amd/registers/mmio.yaml`, and
+  the BAR0 map is gated per architecture (#293). Also not modelled: partition switching
+  (docs/registers.md:200), AMD UMC bases beyond the assumed Aldebaran ones, MCA
+  address/syndrome/IPID, and registers an architecture's headers do not give values for
+  (Ampere/Ada memory-controller ECC counters, Blackwell's dev_ltc_zb, dev_fuse_zb and dev_tmr).
+
+## Implemented: Hopper, Blackwell, barriers, dynamic parallelism and CUTLASS runs
+
+Moved here from "Partially implemented" in rev 5: each entry below is a
+complete feature with tests. The names it refuses are listed with it, and again
+in "Not implemented".
 
 - Hopper's warpgroup MMA (sm_90a): `wgmma.fence`, `.commit_group`,
   `.wait_group` and `.mma_async` in every dense form the ISA defines -- f16
@@ -1018,8 +1117,8 @@ narrows what counts as observable, not what the detector looks at.
   even and subnormals, inc's wrap, a 64-bit xor; each confirmed to fail with
   the arithmetic broken), and by a CuTe program (tma_reduce_cute.cu) in
   which several blocks reduce into the same tiles, f32 through a 128B
-  swizzle and f16 unswizzled, exact with one host thread and with eight. It
-  fails on main.
+  swizzle and f16 unswizzled, exact with one host thread and with eight
+  (`e2e_tma_reduce_cute`; it failed before this work).
 
 - Tensor maps changed on the device (sm_90a): `tensormap.replace` on a map
   in global or shared memory, every field the ISA names (address, rank, box
@@ -1041,7 +1140,7 @@ narrows what counts as observable, not what the detector looks at.
   to fail with the rule it covers broken), and by a CuTe program
   (tensormap_replace_cute.cu) that retargets a descriptor through CuTe's own
   helpers in shared memory and in global memory and loads through it,
-  exact; it fails on main.
+  exact (`e2e_tensormap_replace_cute`; it failed before this work).
 
 - TMA's im2col mode (sm_90): `cuTensorMapEncodeIm2col` in the driver and
   through `cudaGetDriverEntryPoint`, with the checks cuda.h documents (the
@@ -1162,43 +1261,57 @@ narrows what counts as observable, not what the detector looks at.
 ## Not implemented (fails loudly, never silently)
 
 This list was stale for a while, which is its own kind of wrong: it still named
-textures, grid sync and host-pinned memory long after all three worked. A
+textures, grid sync and host-pinned memory long after all three worked, and
+(until rev 5) cubin/SASS loading, async copies and AMD's rocBLAS GEMMs. A
 roadmap that overstates what is missing misleads as much as one that overstates
-what is done.
+what is done. Rev 5 re-tested each item below by finding the refusing message in
+the source; the file and line are given so the next audit can repeat it. "Gap
+register" at the end of this file adds the vendor-library, SASS, AMD and
+health-surface refusals, which are far more numerous than the ones named here.
 
-- PTX, refused by name: TMA's `.im2col::w` modes (Blackwell; see
-  nvidia/docs/blackwell.md), attribute
-  overrides and reports, the NaN out-of-bounds fill (its value is not
-  documented), interleaved layouts and the 128B swizzle's 8-byte-flip
-  variant (Blackwell); tcgen05's `.ashift`, and `.ws` with A in Tensor Memory
-  or `.sp` below M = 128 (the ISA draws neither layout); and inline-asm-only
-  instructions. (tcgen05's weight-stationary `.ws` MMAs are done -- see
-  nvidia/docs/blackwell.md.) (`wgmma`, TMA,
-  the mbarrier transaction counts, `barrier.cluster` and distributed shared
-  memory are done -- see "Hopper's warpgroup MMA", "TMA and clusters" and
-  "Distributed shared memory" above. Textures, surfaces and grid sync are
-  done.)
-- Runtime: async copies. (Managed memory and host-pinned memory are done. The
-  virtual memory management API is done: cuMemAddressReserve, cuMemCreate,
-  cuMemMap, cuMemSetAccess, cuMemGetAccess, cuMemUnmap, cuMemRelease,
-  cuMemAddressFree, cuMemRetainAllocationHandle and
-  cuMemGetAllocationPropertiesFromHandle, with physical handles separable from
-  addresses -- which is what PyTorch's expandable segments and NCCL's windows
-  use to grow a buffer without moving it. Reserved-but-unmapped space, a
-  mapping with no access granted, and a write through a read-only mapping each
-  fault with a diagnostic naming which it was. Exporting a handle to another
-  process still refuses: device memory here is this process's own sparse
-  backing.)
-- Frontends: cubin/SASS loading. (AMD execution is done -- see
-  amd/README.md: unmodified hipcc programs built by ROCm 6.4, 7.0, 7.1 or 7.2
-  run on a simulated MI300X, through the fatbin path, chevron
-  launches, device printf and cooperative launch, and AMD's own rocBLAS runs
-  its level-1 kernels and Tensile's float and double GEMMs, 135,000 of its
-  own quick tests passing. What AMD still lacks is listed under the next
-  milestones.)
-- Tooling: trace record/replay, conformance DB + compat scores. (`vgpu run`,
-  `vgpu test --matrix`, shared-memory race detection, the random and
-  adversarial schedulers, and fault injection are done.)
+- **PTX, refused by name** (`src/ptx/parser.cpp`, `src/exec/interpreter.cpp`,
+  `include/vgpu/exec/tensormap.hpp`):
+  - TMA's `.im2col::w` modes (Blackwell; parser.cpp:4770, and on SASS
+    src/sass/exec_ops.inc:3800); see nvidia/docs/blackwell.md.
+  - TMA attribute overrides and reports (parser.cpp:4770, :4651).
+  - Interleaved tensor-map layouts and the 128B swizzle's 8-byte-flip variant
+    `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B` (tensormap.hpp:275-276, :362-363).
+  - tcgen05's `.ashift` (parser.cpp:2980), `.ws` with A in Tensor Memory below
+    M = 128, and `.ws.sp` (interpreter.cpp:11305-11312) -- the ISA draws neither
+    layout.
+  - sm_107 additions (`kind::ti16`, `decompress::lut`).
+  - Inline-asm-only instructions: anything the parser has no name for is refused
+    by that name, not run as something else.
+  - Not on this list any more: the TMA out-of-bounds NaN fill (`oobFill`) is
+    *accepted* -- stored in the descriptor, carried by `tensormap.replace`
+    (interpreter.cpp:9277) and honoured by loads that go out of bounds
+    (interpreter.cpp:9534, tests/unit/test_hopper.cpp:1236). What is not
+    established is the exact value the hardware writes, which the ISA does not
+    state; treat it as unverified, not as unsupported.
+  - Done, so not refused: `wgmma`, TMA, mbarrier transaction counts,
+    `barrier.cluster`, distributed shared memory, tcgen05 `.ws`, textures,
+    surfaces, grid sync (see the "Implemented: Hopper, Blackwell..." section).
+- **Runtime**: exporting a virtual-memory-management handle to another process
+  (device memory here is this process's own sparse backing; cuMemAddressReserve,
+  cuMemCreate, cuMemMap, cuMemSetAccess and the rest are done, with the faults
+  named for unmapped, no-access and read-only mappings). `cudaLaunchCooperativeKernelMultiDevice`
+  and grids too large to be resident are refused (docs/cooperative.md). The
+  async copy that this item used to name is done: `cp.async`, `cp.async.bulk`,
+  `cp.reduce.async.bulk`, stream-ordered allocation, and AMD's queued
+  `hipMemcpyAsync` (amd/src/hip_api.cpp:1705).
+- **Frontends**: nothing missing on NVIDIA -- PTX and SASS both run (SASS is the
+  default engine on every generation from sm_75 to sm_120a, src/sass/,
+  nvidia/docs/sass.md; `VGPU_SASS=0` selects PTX). Static-cudart binaries are the
+  separate, documented blocker under "Next milestones" item 4. On AMD, execution is
+  done (amd/README.md); what it refuses is in the gap register.
+- **Tooling**: trace record/replay and a conformance database with compatibility
+  scores. (`vgpu run`, `vgpu test --matrix`, shared-memory race detection, the
+  random and adversarial schedulers, and fault injection are done.) Counters
+  that need a timing model are refused by design, below.
+- **Profilers**: Nsight Compute and Nsight Systems as the vendor ships them (see
+  "Known out of scope"); CUPTI's Callback API delivers no callbacks, the Event
+  and Profiling metrics APIs are absent, and nothing derived from time is
+  reported (nvidia/docs/cupti.md:70-139).
 
 ## Registers and counters: what is modelled, and what cannot be
 
@@ -1258,7 +1371,14 @@ a claim to be taken on trust.
 
 Still countable and still missing: register-spill traffic split out from
 ordinary local traffic, and predicated-off lanes as a first-class number
-(derivable today from `instructions * 32 - thread_instructions`).
+(derivable today from `instructions * 32 - thread_instructions`). Spill traffic
+is not counted on either engine: on the PTX path no spill exists (ptxas allocates
+registers and this executes PTX), and on the SASS path spills are real local
+loads and stores that *could* be split out and are not. The note in
+`vgpu counters` (src/cli/main.cpp:103-114) still gives only the PTX reason and
+should say both. Done, not missing: the per-opcode histogram `inst_by_opcode`
+(tests/unit/test_exec3.cpp:2657) and the `ncu --query-metrics` capture
+(nvidia/tools/characterize-cloud.sh).
 
 ## Performance
 
@@ -1309,7 +1429,7 @@ finish:
 | omni_virus | 175 s |
 | memory_retention_bake | 195 s |
 | fp64_virus | watchdog (360 s) |
-| mma_virus | watchdog (360 s) |
+| mma_virus | watchdog (360 s) when this table was taken; 186 s since 2026-09-27, see below |
 
 fp64_virus is held back by the subnormal assists below; mma_virus by the
 matrix work itself, which is still about 1 M warp instructions a second.
@@ -1365,7 +1485,7 @@ Measured on an 8-core box: vectorAdd 2M elements 169 ms -> 50 ms, and the
 pantheon memory_write workload at --duration 1 went from 49 s to 7.5 s.
 
 Measure with `tools/bench.sh` (vectorAdd) and a register-heavy kernel.
-Profile with gprof; guessing has been wrong every time so far.
+Profile with perf; guessing has been wrong every time so far.
 
 Done (1.5x on memory-bound, 2.0x on ALU-bound):
 - Register names are interned to dense ids at parse time; the interpreter
@@ -1401,12 +1521,15 @@ grow), and a 32-bit register file with 64-bit values in pairs is what the
 hardware actually does.
 
 Next, in order of expected payoff:
-1. **PTX -> internal IR -> LLVM JIT** (ARCHITECTURE.md D1). Profiling now puts
-   the time in per-lane interpretation itself, which is exactly what a JIT
-   removes. This is the real answer; further interpreter micro-optimization
-   has hit diminishing returns.
+1. **PTX -> internal IR -> LLVM JIT** (ARCHITECTURE.md D1). Not started: nothing
+   in the tree uses LLVM (CMakeLists.txt has none apart from nvJitLink's own
+   linker). The profile this item was written from has moved on -- the
+   2026-09-25 and 09-27 rewrites found the remaining overhead in operand
+   decoding and bookkeeping rather than in per-lane interpretation -- so
+   re-profile before committing to a JIT.
 2. Block-level parallelism across host threads, behind the scheduler
-   abstraction so determinism is preserved.
+   abstraction so determinism is preserved. **Done**: the grid runs on every core
+   (`VGPU_THREADS`, default `host_cpus()`, interpreter.cpp:11997).
 
 A GPU still retires ~10^13 ops/s, so saturation-style stress tests are run at
 reduced intensity via their own CLI knobs; see
@@ -1414,17 +1537,25 @@ scripts/run-pantheon-workloads.sh.
 
 ## Next milestones (order)
 
-0. **AMD, in this order**: finish rocBLAS (a double trsv path from its
-   sixth work-group on, and the half, bfloat16, int8 and FP8 GEMMs, about 40
-   more instruction forms); the rest of ROCm's libraries, found by running
-   PyTorch for ROCm on a small model (hipBLASLt, MIOpen, rocPRIM/hipCUB,
-   rocRAND, rocFFT, rocSPARSE, rocSOLVER, RCCL, which needs inter-process
-   memory handles); host memory a kernel can reach (pinned and managed) and
-   streams that run asynchronously; the HSA/KFD layer beneath HIP (rocminfo,
-   amdgpu-arch, OpenMP offload); textures and images; gfx950 (MI350X).
+0. **AMD** -- the list this item held is done; rev 5 checked each entry
+   (amd/README.md has the evidence). rocBLAS runs 162,807 of its own quick
+   float and double tests, and its half, bfloat16, int8 and FP8 GEMMs run;
+   hipBLASLt, MIOpen, rocPRIM/hipCUB (`tests/hipcc/prim.cpp`), rocRAND, rocFFT,
+   rocSPARSE, rocSOLVER (`amd/tests/libraries`, `amd_libraries`), hipSPARSELt,
+   Composable Kernel (`amd_pytorch_ck`) and RCCL, single- and multi-process with
+   IPC memory handles (`amd_pytorch_distributed`, `amd_pytorch_multi_gpu`), run
+   under PyTorch for ROCm on six GPUs (`amd_pytorch_*`) and vLLM (`amd_vllm`);
+   pinned and managed memory and asynchronous streams are done; the HSA/KFD
+   layer (rocminfo, `rocm_agent_enumerator`, `/sys/class/kfd`) is done
+   (`amd_hsa`, `amd_hip_on_hsa`, `test_amd_kfd`); textures and images are done
+   on RDNA (MI300 has none, correctly); gfx950 (MI350X) is done
+   (`amd_pytorch_mi350x`). **Still open on AMD**: OpenMP offload and
+   `amdgpu-arch` (no test found for either), a double `trsv` path in rocBLAS
+   (status unconfirmed), the instruction forms the executor refuses by name
+   (gap register), and anything in the gap register's AMD part.
 1. **Interpreter speed**: intern register names to dense indices at parse
-   time (see Performance above) — the single biggest win available without
-   the JIT.
+   time. **Done** (see Performance above, "Register names are interned to dense
+   ids").
 2. **Scheduler: random and adversarial modes** -- done. `VGPU_SCHEDULER` picks
    between `deterministic`, `random` and `adversarial`, and
    `VGPU_SCHEDULER_SEED` makes the last two replayable: the same seed replays
@@ -1449,7 +1580,11 @@ scripts/run-pantheon-workloads.sh.
    state back into scheduling.
 3. **Characterization harness v0**: run the same micro-tests on a physical
    GPU (bench/ rents them) and on virtual profiles, diff, and start flipping
-   `verified` bits in the profiles.
+   `verified` bits in the profiles. **Done as v0, now ongoing per profile**: the
+   harness exists (`nvidia/tools/characterize*.sh`, `characterize.cu`,
+   `compare-profile.py`, `verify-profile.sh`, `amd/tools/characterize-do.sh`) and
+   12 NVIDIA profiles and `amd/mi325x` are verified. Open: `h200`, `b200`,
+   `b300`, `rtx5090` and six AMD profiles (Hardware characterization).
 4. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. **Investigated
@@ -1523,3 +1658,368 @@ scripts/run-pantheon-workloads.sh.
    TMA's im2col mode -- is done too (see "TMA reductions", "Tensor maps
    changed on the device" and "TMA's im2col mode"). Blackwell's gather and
    scatter modes are done; `.im2col::w` is refused (nvidia/docs/blackwell.md).
+
+## Gap work in flight (2026-10-07)
+
+Pull requests open when rev 5 was written, each closing a gap from the register below. They are
+listed so the register is not read as if nothing were being done; a merged PR should move its entry
+into "Implemented" and out of here. All were written by agents from public documentation and
+public headers, tested by their authors under ASan + UBSan, and are awaiting CI and review.
+
+| PR | Gap it closes |
+| --- | --- |
+| pantheonsim #301 | ROCm SMI: `rsmi_dev_gpu_metrics_info_get`, `rsmi_dev_metrics_header_info_get`, 52 `rsmi_*` functions the public header declares but the library did not export |
+| pantheonsim #302 | AMD SMI getters that were `NOT_SUPPORTED` stubs: VRAM usage, busy percent, perf and overdrive levels, bad pages, compute-process info |
+| pantheonsim #303 | HSA 1.1: `hsa_agent_iterate_caches`, `hsa_cache_get_info`, `hsa_isa_iterate_wavefronts`, `hsa_wavefront_get_info`, `hsa_isa_compatible`, `hsa_signal_group_*` |
+| pantheonsim #304 | NVRTC: the real `libnvrtc-builtins` beside a pip-wheel `libnvrtc` (every PyTorch jiterator kernel failed without nvcc) |
+| pantheonsim #305 | cuBLASLt int8 x int8 -> int32 (`CUBLAS_COMPUTE_32I`), what `torch._int_mm` calls |
+| pantheonsim #306 | SASS: `LEA` with a negated addend carries out of a zero (a bf16 im2col read 2^32 elements out of bounds on a T4) |
+| pantheonsim #307 | PTX `brx.idx` with `.branchtargets`, and `.calltargets` on indirect calls (a dense `switch` refused the whole kernel) |
+| pantheonsim #308 | Driver `cuLaunchKernelEx` reads its attribute list (the stride is 72 bytes in every CUDA 12 header; clustered launches from Triton and CUTLASS were refused) |
+| pantheonsim #309 | Runtime exports the toolkit has: `cudaMemset3D(Async)`, `cudaChooseDevice`, `cudaInitDevice`, 2D array copies, descriptor getters, `cudaFuncGetName`/`GetParamInfo`, ... |
+| pantheonsim #310 | Driver stream-ordered memory pools (`cuMemPool*`, `cuMemAllocAsync` through the current pool) |
+| pantheonsim #311 | Driver `cuPointerGetAttributes`, `cuPointerSetAttribute` and the missing `cuPointerGetAttribute` answers |
+| pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
+| pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
+
+## Profile inventory (rev 5)
+
+23 profiles, read from each profile's YAML at 2ce1f45. `verified: true` means the
+profile's values were read from a physical device (see "Hardware characterization").
+
+| id | vendor | arch | cc / gfx | verified |
+| --- | --- | --- | --- | --- |
+| `nvidia/t4` | NVIDIA | Turing | 7.5 | yes |
+| `nvidia/a100` (A100 SXM4 80GB) | NVIDIA | Ampere | 8.0 | yes |
+| `nvidia/a100-sxm4-40gb` | NVIDIA | Ampere | 8.0 | yes |
+| `nvidia/a10` | NVIDIA | Ampere | 8.6 | yes |
+| `nvidia/a10g` | NVIDIA | Ampere | 8.6 | yes |
+| `nvidia/rtx3060` | NVIDIA | Ampere | 8.6 | yes |
+| `nvidia/rtx3080ti` | NVIDIA | Ampere | 8.6 | yes |
+| `nvidia/l4` | NVIDIA | Ada | 8.9 | yes |
+| `nvidia/l40s` | NVIDIA | Ada | 8.9 | yes |
+| `nvidia/h100` | NVIDIA | Hopper | 9.0 | yes |
+| `nvidia/h100-pcie` | NVIDIA | Hopper | 9.0 | yes |
+| `nvidia/gh200-480gb` | NVIDIA | Hopper | 9.0 | yes |
+| `nvidia/h200` | NVIDIA | Hopper | 9.0 | **no** (inherits H100; `vram_bytes` not measured) |
+| `nvidia/b200` | NVIDIA | Blackwell | 10.0 | **no** (framebuffer measured, the rest public documentation) |
+| `nvidia/b300` | NVIDIA | Blackwell Ultra | 10.3 | **no** |
+| `nvidia/rtx5090` | NVIDIA | Blackwell | 12.0 | **no** |
+| `amd/mi325x` | AMD | CDNA3 | gfx942 | yes (rocminfo on a physical card) |
+| `amd/mi300x` | AMD | CDNA3 | gfx942 | **no** |
+| `amd/mi250x` | AMD | CDNA2 | gfx90a | **no** (one die: 110 CUs, 64 GB) |
+| `amd/mi350x` | AMD | CDNA4 | gfx950 | **no** |
+| `amd/rx6900xt` | AMD | RDNA2 | gfx1030 | **no** |
+| `amd/rx7900xtx` | AMD | RDNA3 | gfx1100 | **no** |
+| `amd/rx9070xt` | AMD | RDNA4 | gfx1201 | **no** |
+
+Counting caveat: the audit counted `verified: true` per profile file; a file can carry
+the key per field, so "yes" here means the profile as a whole is recorded as verified,
+and a future audit should check the fields too.
+
+## CI inventory (rev 5)
+
+Workflows under `.github/workflows/` at 2ce1f45.
+
+| Workflow | Triggers | Jobs |
+| --- | --- | --- |
+| `ci.yml` | push to main, PR, dispatch (`ml_tests`, `cutlass_sass`, `nvidia_only`) | toolchain-image lookup; build + unit tests; pantheon workloads (60 min); SASS on every architecture (CUDA 13 container); Ollama v0.21.0 on every NVIDIA GPU; Ollama on seven AMD GPUs (mi300x, mi325x, mi350x, mi250x, rx6900xt, rx7900xtx, rx9070xt); AMD code objects and CDNA decoding; PyTorch/ROCm/the rest on the pantheonsim.com runner; **ASan + UBSan**; **ThreadSanitizer** |
+| `action.yml` | push, PR, dispatch | the repo's own GitHub Action under test: CUDA, HIP, CUDA 12.6 from NVIDIA's repository, Ubuntu 22.04 (nvidia/t4 and amd/mi300x), a root container with no sudo, CMake projects (cmake-cuda, cmake-hip) |
+| `ci-image.yml` / `ci-image-ref.yml` | push, weekly, dispatch / workflow_call | toolchain images cuda12.0 and cuda13.0 |
+| `cuda-toolkits.yml` | push, PR, daily, dispatch | build + tests on CUDA 12.8 (ubuntu-24.04) and CUDA 12.4 (ubuntu-22.04; skips `amd_tools`, `regs_cli`, `amd_hipcc`, which need GLIBCXX_3.4.30) |
+| `external-smoke.yml` | PR touching nvidia/, src/, include/, ci/external/ | fast subset of the outside suites on nvidia/rtx3060 (cuda-samples, hecbench, rodinia, polybench), with SASS-vs-PTX digests |
+| `external-suites.yml` | nightly, dispatch | cuda-samples, hecbench, rodinia, polybench on nvidia/rtx3060 (SASS and/or PTX); hip-tests (ROCm 7.1, sharded, per-GPU baselines); BabelStream (HIP) with a `vgpu fault stuck` cell check |
+| `lazy-modules-nightly.yml` | daily, PR | the e2e suite with every module parsed lazily |
+| `rocblas-nightly.yml` | daily, PR | AMD's own `rocblas-test` in shards on mi300x, mi350x, mi250x |
+| `rocm-libraries.yml` | push, PR, weekly | PyTorch, rocBLAS and hipSPARSELt on simulated AMD GPUs |
+| `sass-ptx.yml` | daily, PR | the suite on PTX (`VGPU_SASS=0`); SASS and PTX leave the same memory (digest compare) |
+| `vllm-nightly.yml` | daily, PR | vLLM on mi300x, mi325x, mi250x, mi350x, rx7900xtx, rx9070xt |
+| `workloads.yml` | push, daily, PR, dispatch | pantheon workloads: one row per NVIDIA profile (1 to 8 GPUs, CUDA 12.0 or 13.0); `coverage` fails when a profile has no row |
+
+What no workflow covers: an AMD row in `workloads` or its `coverage` check, and the
+real-GPU card check designed in docs/ci-card-check.md (design, not enabled). The
+external suites are pinned in `ci/external/suites.sh` (cuda-samples v13.0, hecbench,
+rodinia, polybench, hip-tests rocm-7.1.0, BabelStream 5.0). The hip-tests runs carry
+per-GPU baselines and disabled-case lists (`ci/external/hip-tests/baseline-*.tsv`,
+`disabled-gfx*.txt`: 562, 561, 562 and 589 disabled cases for gfx942, gfx1030,
+gfx1100 and gfx1201); those disabled cases are an unreconciled backlog. The
+SASS-vs-PTX digest differences not yet reconciled are in `ci/external/digest-known.txt`.
+
+Sanitizer rules the code has to meet (learnt the hard way in rev 5): ASan + UBSan run with
+`detect_leaks=1` and `halt_on_error`, so free what you allocate (a user object's handle, a
+`cudaHostAlloc` buffer in a test), form wrapping arithmetic unsigned (`v_mul_i32_i24` was a
+signed overflow), and a test that loads two simulator shims in one process is an ODR
+violation to ASan, because each shim embeds the same core: give it
+`ASAN_OPTIONS=...:detect_odr_violation=0` in its CMake `ENVIRONMENT` (see
+`test_runtime_user_objects`, `VGPU_SAN_ODR_OFF`, `nvidia/tests/e2e/run_lib_check.sh`).
+CUDA 12.4 and 12.8 headers are what CI compiles against, so newer APIs need
+`CUDART_VERSION` / `NVML_API_VERSION` guards.
+
+## Test inventory (rev 5)
+
+57 `vgpu_unit_test` and about 190 `add_test` entries in `CMakeLists.txt`, grouped. Some names
+are generated per GPU (`e2e_pytorch_models_<gpu>`, `amd_pytorch_<gpu>`, `e2e_nccl_comm_ops_N`)
+and the per-library path tests (cuDSS, cuTENSOR, cuTensorNet, cuSPARSELt, cuStateVec, cuFile,
+nvCOMP, nvFatbin, nvJitLink, NVRTC, cuFFT, cuSOLVER, cuSPARSE, cuBLAS, cuBLASLt) are
+registered through loops, so they are not all individually greppable.
+
+- **Core and PTX unit**: test_yamlish, test_profile, test_driver_version, test_memory, test_ptx,
+  test_ptx_link, test_exec, test_exec2, test_exec3, test_fastpath, test_hopper, test_blackwell,
+  test_dsmem, test_barriers, test_dynpar, test_regalloc, test_robustness, test_runtime,
+  test_e2e_parity, test_sass_decode.
+- **Telemetry, RAS, registers**: test_telemetry, test_ras, test_regs, smi_format, smi_queries,
+  smi_cli, regs_cli, fault_cli, shell_cli, c_harness_vector_add, c_harness_regs, nvml_api,
+  nvml_health, nvml_dcgm.
+- **NVIDIA library unit**: test_cudss_solver, test_nvcomp_codecs, test_nccl_symbols,
+  test_runtime_user_objects, test_cublaslt_algo.
+- **AMD unit**: test_amd_codeobject, test_amd_chip, test_amd_kfd, test_amd_bundle, test_amd_hostcall,
+  test_amd_rocprofiler, test_amd_hip_at_exit, test_amd_rocm_smi (+radeon), test_amd_amd_smi
+  (+radeon, +`rvs_*`), test_amd_hip_abi, test_amd_hip_grid_*, test_amd_hipcc_*, and
+  test_amd_gcn_{exec,ops,math,memory,bytes,int64,atomics,mixed,half,calls,builtins,packed,spill,
+  crosslane,doubles,narrow,lds,idioms,asm,abandon,counters,globals,grid}.
+- **AMD end to end**: amd_hip, amd_hip_abi, amd_hipcc, amd_hipcc_disasm, amd_gcn_disasm, amd_hsa,
+  amd_hip_on_hsa, amd_rocblas, amd_rocblas_disasm, amd_rocm_versions, amd_libraries, amd_hipsparselt,
+  amd_debugger, amd_tools, amd_amdsmi_python, amd_rocprofv3, amd_rocprofiler_abi,
+  amd_memtest_patterns, amd_workgroup, amd_lost_gpu, amd_nbio, amd_cper, amd_session, amd_vllm,
+  amd_ollama, amd_pytorch (per GPU, plus `_compile`, `_models`, `_ck`, `_distributed`, `_multi_gpu`).
+- **CUDA runtime end to end**: e2e_vector_add, e2e_symbols, e2e_driver_abi, e2e_runtime_conformance,
+  e2e_vgpu_run, e2e_private_loads, isolation_fallback, quiet_semantics, e2e_deferred_errors,
+  e2e_per_thread_stream, e2e_stream_identity, e2e_device_limits, e2e_device_heap,
+  e2e_occupancy_rules, e2e_reserved_smem_attr, e2e_vmm, e2e_mempool, e2e_ipc, e2e_managed_module,
+  e2e_graph_{build,nodes,shapes,conditional,memory,cublas,cusparse}, e2e_capture_{streams,splice},
+  e2e_cooperative_grid, e2e_dynamic_parallelism, e2e_device_graph_launch, e2e_rdc_link,
+  lint_capture_coverage, lint_shim_symbols.
+- **PTX forms and numerics**: e2e_ptx_forms (127 variants), e2e_ptx_sweep (378), e2e_ptx_warp_mem
+  (153), e2e_ptx_memory_forms (90), e2e_ptx_half_forms (380), e2e_video_forms (652),
+  e2e_mma_forms (123), e2e_mul_add_contraction, e2e_div_approx, e2e_printf_formats,
+  e2e_device_{functions,function_barriers,intrinsics,last_error}, e2e_divergent_indirect_calls,
+  e2e_atomic_cas, e2e_host_atomics, e2e_warp_spin_lock, e2e_ordered_vectors, e2e_bar_red_named,
+  e2e_cg_multi_warp_tiles, e2e_alloca_stack, e2e_stack_limit, e2e_modern_dtypes.
+- **Textures and surfaces**: e2e_textures, e2e_texture_{filtering,layers,mipmaps,gather,mip_layers,
+  srgb,int_coords}, e2e_border_colour, e2e_surface_oob.
+- **Tensor cores, Hopper, Blackwell, CUTLASS**: e2e_mma_layout, e2e_wmma_{gemm,types} (21 shape/type/layout
+  combinations), e2e_stmatrix, e2e_wgmma_cute, e2e_tma_{gemm_cute,reduce_cute,im2col},
+  e2e_tensormap_replace_cute, e2e_dsmem_cluster, e2e_block_semaphore,
+  e2e_cutlass_{hopper,gemm,fmha,sm100,sm100_conv,sm103,sm120}.
+- **SASS**: e2e_sass_path, e2e_sass_archs, e2e_nvjitlink_sass.
+- **Libraries**: e2e_libraries, e2e_library_goldens, e2e_cublas_tight, e2e_dnn_{paths,classic_paths},
+  e2e_mixed_apis, e2e_nccl_{multiproc,group,multiproc_2,comm_ops}, e2e_nvshmem_device, e2e_nvenc.
+- **Profiling and tooling**: e2e_ncu, e2e_nvprof, e2e_cupti_activity, e2e_shell_nvcc_native,
+  e2e_jit_frameworks, test_matrix_exit.
+- **PyTorch, Ollama, workloads**: e2e_pytorch_models_<gpu>, e2e_pytorch_ops_rtx5090, e2e_ollama,
+  pantheon_workloads (skips when no pantheongpu/pantheon checkout is present).
+- **Faults and registers**: e2e_fault_datapath, nvml_{api,health,dcgm}.
+
+## Gap register (rev 5)
+
+Everything the tree refuses, stubs or does not model that rev 5 could find, grouped by area, each
+with the file where the refusal lives so the next audit can re-test it. The rule is the file's
+own: a gap that is written down is a decision, and a gap found by its absence is a defect. Counts
+are from a case-insensitive grep over `src/`, `nvidia/src/`, `amd/src/`, `include/` and the docs:
+roughly 674 `NOT_SUPPORTED`, 755 `unsupported`, 505 `refus*`, 92 `not implemented`, 64 `not
+supported`, 31 `not modelled`, 30 `not yet`, 10 `unimplemented`; no `FIXME`, and no real `TODO`
+marker (every `todo` hit is a variable name or a pointer to this file). Most sites are the loud
+refusals the project wants; the heaviest files are `src/ptx/parser.cpp` (about 400),
+`nvidia/src/generated/cublas_64.cpp` (166), `src/exec/interpreter.cpp` (124),
+`nvidia/src/runtime_api.cpp` (117) and `cudnn_api.cpp` (106). The register below groups them; it is
+not a promise to remove them -- several are right to stay refused (undocumented hardware
+behaviour, timing).
+
+### NVIDIA vendor libraries (nvidia/docs/libraries.md "What is not implemented", from line 746)
+
+- **cuBLAS**: `cublasUint8gemmBias`; undeclared exports (`cublas?bdmm`, `Get/SetBackdoor`,
+  `Get/SetEnvironmentMode`); cuBLASXt tiles GEMM only, with no CPU offload; emulation controls are
+  inert. Generated stubs answer `..._NOT_SUPPORTED` and print "is not implemented by VirtualGPU"
+  (nvidia/src/generated/cublas_stubs.cpp:29).
+- **cuBLASLt**: FP8 aux scale/amax, per-batch block scales, UE8M0 modes; the block-scaled modes are
+  derived from documentation, not checked against a card.
+- **cuDNN graph API**: interpolating resample, FP8/MXFP8 attention, block masks, sinks in backward
+  attention, INT8x32 reordered filters, multi-GPU norm, MoE/RoPE/band ops, dropout-mask layout; PyTorch's
+  cuDNN graphs with ops beyond convolution, matmul, pointwise, reduction, normalization and pooling are
+  refused at finalize (nvidia/docs/pytorch.md:76-82). **Classic API**: Volta/Turing fused ops, undocumented
+  ops, RNN/attention dropout masks.
+- **cuFFT**: legacy callbacks (`CUFFT_NOT_IMPLEMENTED`), LTO-IR callbacks; multi-GPU layouts measured on
+  two GPUs only.
+- **cuSPARSE**: the `csrmv` family, SDDMM conjugate transpose, SpMMOp (LTO-IR), `csrcolor` colours
+  differ from NVIDIA's, `gpsvInterleavedBatch` with algo != 0; solvers compute in double.
+  **cuSPARSELt**: FP8/FP4, fp16 compute, GELU outside int8.
+- **cuSOLVER**: `Xgeev` left eigenvectors, `csrmetisnd` (no METIS), `csrlsvlu` on device, Mg multi-row
+  grids; a list of measured differences from NVIDIA's output in libraries.md.
+- **cuTENSOR**: block-sparse (not planned), JIT mode is a no-op. **cuTensorNet**: state API, gradients,
+  distributed execution, non-gesvd SVD, half-precision decompositions, capture; cuQuantum Python 26.09
+  does not start (static cudart).
+- **NCCL**: symmetric-memory windows, the network plugin; stubs that answer `ncclInvalidUsage`:
+  `ncclCommRevoke/Grow/GetUniqueId/Suspend/Resume/MemStats`, `ncclPutSignal/Signal/WaitSignal`,
+  `ncclDevCommCreate/Destroy`, `ncclGetLsaMultimemDevicePointer`, `ncclGetPeerDevicePointer`; not
+  exported: the `nccl*Config` forms, `ncclParam*`, GIN.
+- **cuFile**: nvidia-fs DMA, RDMA, userspace-FS handles. **nvCOMP**: Cascaded, Bitcomp and ANS (all
+  NotSupported), LZ4 bitshuffle, checksums, CPU/streaming gzip, the hardware decompression engine.
+  **NVSHMEM**: MPI/OpenSHMEM bootstrap, multi-node, proxy transports, multimem, host reductions;
+  `NVSHMEM_MAX_TEAMS=32`.
+- **NVRTC**: CUBIN, LTO-IR and OptiX-IR output, precompiled headers, time traces. **nvJitLink**: LTO-IR,
+  SASS+PTX mixes, dead-function removal, re-finalizing sm_100/120, `-G` debug sections, texture refs.
+  **nvFatbin**: compression and `nvFatbinAddIndex`.
+- **NPP**: watershed, marker-label compression, ResizeSqrPixel super-sampling and Lanczos
+  (`NPP_INTERPOLATION_ERROR`). **nvJPEG**: 12-bit, arithmetic, lossless and hierarchical JPEG, the
+  hardware backend, EXIF orientation, transcoding. **NVENC**: unimplemented function-table slots
+  return `NV_ENC_ERR_UNIMPLEMENTED` (nvidia/src/nvenc_api.cpp:348-355). No NVTX or nvcuvid/NVDEC.
+- **Device runtime**: `cudaMemcpyAsync`, `cudaMemsetAsync` and `cudaMalloc` from a kernel,
+  `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, occupancy queries and
+  `cudaGetParameterBuffer`/`cudaLaunchDevice` (libraries.md:920-928).
+
+### CUDA runtime and driver (nvidia/src/runtime_api.cpp, driver_api.cpp)
+
+- Memory-pool handle types other than none (runtime_api.cpp:2706, :6959); `cudaHostRegisterReadOnly` (:2855);
+  texture/surface channel kinds (:3295-3366); resource views (:3742); `maxAnisotropy` above 1 (:3754).
+- Graphs: edge data other than the default (:5126, :7291, :7308, :7315, :7515); clone/parent restrictions
+  (:5345-5363, :5770); a CUDA array in a memcpy node (:5931); conditional-graph restrictions (:6199, :6476);
+  child-graph ownership (:7476, :7505); external semaphores not modelled (:7438). Capture modes other than
+  Relaxed (`cudaThreadExchangeStreamCaptureMode` is a stub, :3053).
+- Driver: exec affinity (driver_api.cpp:880), `requestedHandleTypes` (:1330), further stubs (:1485-1500).
+  `cudaDeviceGetAttribute` (runtime_api.cpp:1660) and `cuDeviceGetAttribute` (driver_api.cpp:587) answer 0
+  for an attribute the profile does not model, with a note on stderr.
+- `cuCtxSetCurrent(NULL)` pops instead of clearing (see "Partially implemented").
+
+### PTX and SASS execution
+
+- PTX parser: `.ashift`; sm_107 and sm_107f forms (src/ptx/parser.cpp:1790, :1851, :1860, :1884, :2952,
+  :2984-2988); cvt `.rs` for x4; `.hi` for anything but `mul` (:4138); `wmma` kinds other than
+  load/mma/store.d (:2218); multi-sample textures (:4472); `suld`/`sust` `.p` (:4534); `tex.level` LOD (:4480);
+  `tex.grad`, `tld4` on layered/cubemap and with a level (:4478-4498); signed 8-bit normalized linear
+  filtering (src/exec/interpreter.cpp:1326, :1445); anisotropy and resource views (driver_api.cpp:3252, :3261).
+- Device printf: `%ls` and `%n` (include/vgpu/exec/device_printf.hpp:115, :122). TMA: sub-byte im2col and
+  `.b4x16` alignment (include/vgpu/exec/tma.hpp:50, :64); tensor-map restrictions (tensormap.hpp:210, :262, :351).
+- SASS executor (nvidia/docs/sass.md "Coverage"): `LDGMC` (multimem); TMA `im2col::w` (src/sass/exec_ops.inc:3800);
+  texture forms with an LOD clamp, offsets, depth compare or LOD bias (exec_ops.inc:2381-2386);
+  `WARPSYNC.COLLECTIVE` from divergent paths (:2886); some `SYNCS.ARRIVE` modes (:3631, :3661); tcgen05 forms
+  (:4164); a cooperative launch with clusters (src/sass/exec.cpp:818); and five generic "SASS: <op> is not
+  implemented yet" sites (exec_ops.inc:857, :1708, :2141, :2238, :3185).
+- Blackwell (nvidia/docs/blackwell.md): the `tcgen05.alloc` blocking wait (:36) and the refused forms listed at
+  :81, :103, :118, :127, :157, :170, :214, :223, :232-233, :276-292.
+- Static cudart, `cuGetExportTable`: blocked (see "Next milestones" 4; nvidia/docs/dark-api.md).
+- CUPTI (nvidia/docs/cupti.md): per-API activity controls, the timestamp callback and device-side timestamps
+  (:70); no Callback API deliveries, no Event or Profiling metrics, nothing derived from time (:121-139).
+- Performance counters and `%pm0`-`%pm7`: refused by design (no timing model).
+
+### AMD (amd/README.md, amd/src)
+
+- Instruction forms refused by name (amd/README.md:212-218, :234, :256-262): `xf32` MFMA forms, broadcast
+  modifiers, a wave with lanes off, cross-wave DPP forms, filling a sub-dword destination with sign or
+  preserving it, the output multiplier, and a packed op needing a constant's second half; BLGP lane patterns
+  (:513, :515); decoded-but-not-implemented sites in `amd/src/gcn_exec.cpp` (:1360, :1391, :1410, :1467, :1817,
+  :2164, :3276, :3366, :3741, :3975, :4336, :4644, :4653, :4870, :5217, :5623, :5713); GWS semaphores (:5447),
+  texel offsets (:4225), cube arrays (:4161), a flat access reaching LDS or private memory (:3896); GDS
+  (amd/include/vgpu/amd_exec.hpp:109); MFMA input rounding not modelled (amd/src/gcn_decode.cpp:982); the 6-bit
+  form 0xe1 (:760); undecoded RDNA opcodes, operands and ray-tracing image instructions
+  (amd/src/rdna_decode.cpp:148, :279, :335, :563).
+- Runtime: hostcall services other than printf, i.e. device malloc and the address sanitizer
+  (amd/src/hostcall.cpp:121); linking several code objects into one (amd/src/hip_api.cpp:6982); stream-capture
+  refusals (amd/src/hip_graph.inc:942, :2638); sRGB over linear memory (amd/src/hip_images.inc:742); compressed
+  offload bundles need zlib or zstd and refuse other methods (amd/src/bundle.cpp:43-146); graphics interop
+  (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `hsa_amd_interop_unmap_buffer`,
+  `hsa_executable_agent_global_variable_define`, amd/src/hsa_api.cpp:1984-1991).
+- Profiling: no PC sampling, thread trace or HSA trace, and no records of the runtime's internal kernels
+  (amd/README.md:576).
+- Workloads and frameworks: `fused_attention` does not build for AMD (needs a 64-bit mask on wave64); `rt_virus`
+  and `media_enc_virus` skip; `mma_virus` needs rocWMMA headers (amd/README.md:609-615); vLLM runs eager only
+  (no graphs, no `torch.compile`), one short sequence, 3 GB device (:513, :515); the ROCm Validation Suite was
+  never built or run, only read (:643).
+- Open on the AMD list: OpenMP offload, `amdgpu-arch`, rocBLAS double `trsv` (see "Next milestones" 0).
+
+### Health, RAS and registers (docs/telemetry.md, docs/registers.md, docs/machine-simulator.md)
+
+- NVML/NVIDIA: the far end of an NVLink is not modelled and its index is NOT_SUPPORTED (telemetry.md:145);
+  NVLink error counters read zero and `nvlink -s` speeds exist for NVLink 3 and 4 only (:176); ECC mode cannot be
+  changed (:181); some paths cannot arm ECC errors (:236); `--on alu` is bit flips with no counting (:210);
+  rocm-smi's RAS table columns are not checked against a card (src/cli/smi.cpp:1716); resetting ECC errors
+  (:2232); retired-page addresses are placeholders (telemetry.md:45).
+- AMD: a lost GPU's `/sys/class/drm` and hwmon entries stay (telemetry.md:349); AMD ECC, memory-sensor and link
+  values follow AMD's documentation and are not checked on a real MI-series card (:425); the CPER debugfs ring and
+  fatal/bad-page-threshold records (:449); amd-smi `--csv`, `ras --follow`, `ras --afid`
+  (src/cli/amdsmi.cpp:465, :529, :532, :540); violation status, PCIe throughput, bad-page threshold and every
+  setter and reset are `NOT_SUPPORTED` (amd/src/amd_smi.cpp:466); fabric/SoC/video/display clocks
+  (amd_smi.cpp:928, rocm_smi.cpp:758-762); `cu_occupancy` (amd_smi.cpp:1079); VBIOS, serial, firmware and
+  energy are N/A in a session and `/dev/kfd` and `/dev/dri` do not exist outside isolated mode
+  (docs/machine-simulator.md:137-148).
+- DCGM: its NVML reads are answered; DCGM's own binaries, CUDA and profiling-counter needs have not been run.
+- Registers (docs/registers.md): partition switching (:200); AMD UMC bases are assumed, other channels and
+  instances and MCA address/syndrome/IPID are unmapped (:228-235); the NVIDIA topology rows, PRI errors, temperature
+  sensors, Ampere/Ada memory-controller ECC counters and Blackwell's `dev_ltc_zb`, `dev_fuse_zb` and `dev_tmr`
+  have no published values (:345, :367-401); per-partition count distribution (:377); header-defined firmware
+  actions (amd/src/regs.cpp:139).
+
+### Found by the rev 5 gap analysis and not implemented
+
+NVIDIA (found by comparing the names in `cuda_runtime_api.h`, `cuda.h` and `nvml.h`, 12.0 to 12.9,
+with what `nvidia/src` defines):
+
+- **Driver graph API and stream capture** (about 100 entry points): absent, and `cuStreamGetCaptureInfo`
+  is a stub. The driver's streams are synchronous and keep none of the runtime's roughly 3000 lines of
+  graph machinery. The largest remaining gap for driver-API users.
+- **Stream memory operations**: `cuStreamWaitValue32/64`, `cuStreamWriteValue64`, `cuStreamBatchMemOp`. A
+  wait on a false condition cannot be modelled on a synchronous stream.
+- **Other driver additions**: `cuLibraryLoadFromFile`, `GetGlobal`, `GetManaged`, `GetKernelCount`,
+  `EnumerateKernels`; `cuModuleGetFunctionCount`, `EnumerateFunctions`; `cuFuncGetName`, `GetModule`,
+  `GetParamInfo`; `cuKernelGetLibrary`, `GetParamInfo`; `cuStreamGetCtx`, `GetId`; `cuEventRecordWithFlags`;
+  `cuCtxRecordEvent`, `WaitEvent`; `cuMemRangeGetAttribute(s)`; `cuMemcpy3DPeer`; `cuDeviceGetP2PAttribute`,
+  `GetLuid`; `cuUserObject*`; green contexts; the texture-reference mipmap getters.
+- **Runtime leftovers**: `cudaGetFuncBySymbol`, `cudaGetKernel`; graph kernel-node attribute calls, the
+  generic `cudaGraph*NodeSetParams`, the 12.3 `_v2` edge-data graph calls; the external memory and semaphore
+  interop family; `cudaMemcpyBatchAsync`; `cudaOccupancyAvailableDynamicSMemPerBlock` (the semantics for
+  infeasible requests are unclear); `cudaDeviceGetTexture1DLinearMaxWidth`; `cudaSetValidDevices`.
+- **Cluster occupancy**: `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` need the
+  SM-to-GPC grouping, which no profile records and the public documentation does not give; they refuse by
+  name once the runtime-exports PR (#309) merges.
+- **NVML setters**: persistence mode, compute mode, power limit, clock locks, fan control, MIG/GPU-instance
+  and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
+  not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process
+  shows no change, so persistence across processes needs a design decision first.
+- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, `txq`, `ldu`.
+
+AMD:
+
+- **HSA**: `hsa_amd_signal_wait_any` (what its timeout returns is not settled by the public header),
+  `hsa_amd_queue_intercept_*` (what rocprofiler uses; needs queue interception),
+  `hsa_amd_register_deallocation_callback` and its deregister, `hsa_amd_memory_migrate`, `hsa_amd_spm_*`,
+  `hsa_amd_ipc_signal_*`, the deprecated `hsa_code_object_*`, `hsa_executable_create` and the finalizer calls,
+  and `hsa_ven_amd_aqlprofile_*`.
+- **AMD SMI data with no profile datum**: board, VBIOS and firmware info, cache info, violation status and PCIe
+  throughput stay `NOT_SUPPORTED`; filling them in would mean guessing field values. ROCm SMI's XCD counter
+  stays refused because the metrics table fills all 8 gfxclks even on Radeon, so a count would be wrong.
+- **ISA**: MFMA with BLGP lane patterns outside the f8f6f4 forms, MFMA with lanes off in EXEC, a few
+  high-half-constant forms, and `s_sendmsg_rtn` messages beyond the ones answered. The public sources
+  consulted did not settle the BLGP semantics, so they stay refused by name. (The GEMM forms that `TODO.md`
+  used to list as missing -- half, bf16, int8, fp8 MFMA and SMFMAC for gfx90a, gfx942 and gfx950, the f8f6f4
+  and scaled forms, DPP wave and row broadcast forms -- already exist.)
+- **HIP API surface**: no gap found against the 5.7 header (only macros and templates were missing).
+
+What rev 5 could not check: nothing here ran on a real GPU or on ROCm 7.x. The static audit reads sources
+and tests; the gap branches were tested by their authors under ASan + UBSan with CUDA 12.8 headers (the
+runtime one also syntax-checked against 12.4), and none ran the full ctest suite, a TSan build, or any e2e
+program that needs nvcc.
+
+### Tooling, CI and process
+
+- Trace record/replay and a conformance database with compatibility scores: not started.
+- A memory-aware adversarial scheduler (feeding the race detector's shadow state back into scheduling): not
+  started ("Next milestones" 2).
+- LLVM JIT (ARCHITECTURE.md D1): not started.
+- Real-GPU card check (docs/ci-card-check.md): designed on a 3080 Ti, not enabled.
+- AMD rows in `workloads.yml` and its `coverage` check: absent.
+- The hip-tests disabled-case lists and the SASS-vs-PTX digest differences (see "CI inventory"): unreconciled.
+- Pantheon workloads: 44 of 46 pass and `media_enc_virus` and `rt_virus` are skipped, per
+  docs/pantheon-workloads.md; that document's status block and prose disagree about `media_enc_virus`.
+- GitHub Action constraints (docs/github-action.md:82-124): it must use the shared cudart, needs
+  `library-path: false` when linking vendor libraries, Ubuntu 22.04's CUDA 11.5 is too old (so 12.6 is
+  installed), and its timings mean nothing.
+- External suites: `gpu-burn` and `cuda-memtest` exist as PR #290 (not yet merged when rev 5 was written); until it
+  merges the NVIDIA memory tests are the pantheon `memory_*`, `galpat`, `march_test` and `memory_hammer`
+  workloads, and the AMD ones are `amd_memtest_patterns`.
+
+### Documents that disagreed with the code at rev 5
+
+Fixed in the same change as this file unless marked: README.md's "SASS-only fatbins are rejected" (:67) and
+its roadmap (:278-285); docs/telemetry.md:454-456 and `src/cli/serve.cpp:8` ("AMD execution is not
+implemented"); README.md:60 on Nsight; the header comment of `src/exec/interpreter.cpp` (barriers in
+divergent code, IPDOM); `vgpu counters`' spill note (`src/cli/main.cpp:103-114`, left as a comment in this
+file's "Registers and counters" because it is output text, not documentation).
