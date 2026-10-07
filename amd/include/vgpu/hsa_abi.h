@@ -216,6 +216,25 @@ hsa_status_t hsa_agent_iterate_isas(hsa_agent_t agent, hsa_status_t (*callback)(
 hsa_status_t hsa_isa_get_info_alt(hsa_isa_t isa, hsa_isa_info_t attribute, void* value);
 hsa_status_t hsa_isa_from_name(const char* name, hsa_isa_t* isa);
 
+/* Caches, wavefronts and ISA compatibility (HSA 1.1; the same values as
+ * ROCm's hsa.h). */
+typedef struct hsa_cache_s { uint64_t handle; } hsa_cache_t;
+typedef enum {
+  HSA_CACHE_INFO_NAME_LENGTH = 0,
+  HSA_CACHE_INFO_NAME = 1,
+  HSA_CACHE_INFO_LEVEL = 2,
+  HSA_CACHE_INFO_SIZE = 3
+} hsa_cache_info_t;
+hsa_status_t hsa_cache_get_info(hsa_cache_t cache, hsa_cache_info_t attribute, void* value);
+hsa_status_t hsa_agent_iterate_caches(hsa_agent_t agent, hsa_status_t (*callback)(hsa_cache_t cache, void* data),
+                                      void* data);
+typedef struct hsa_wavefront_s { uint64_t handle; } hsa_wavefront_t;
+typedef enum { HSA_WAVEFRONT_INFO_SIZE = 0 } hsa_wavefront_info_t;
+hsa_status_t hsa_wavefront_get_info(hsa_wavefront_t wavefront, hsa_wavefront_info_t attribute, void* value);
+hsa_status_t hsa_isa_iterate_wavefronts(hsa_isa_t isa,
+                                        hsa_status_t (*callback)(hsa_wavefront_t wavefront, void* data), void* data);
+hsa_status_t hsa_isa_compatible(hsa_isa_t code_object_isa, hsa_isa_t agent_isa, bool* result);
+
 /* ---- Signals ----------------------------------------------------------- */
 
 typedef enum {
@@ -255,6 +274,22 @@ hsa_signal_value_t hsa_signal_wait_scacquire(hsa_signal_t signal, hsa_signal_con
 hsa_signal_value_t hsa_signal_wait_relaxed(hsa_signal_t signal, hsa_signal_condition_t condition,
                                            hsa_signal_value_t compare_value, uint64_t timeout_hint,
                                            hsa_wait_state_t wait_state_hint);
+
+/* Signal groups: wait for any of several signals. */
+typedef struct hsa_signal_group_s { uint64_t handle; } hsa_signal_group_t;
+hsa_status_t hsa_signal_group_create(uint32_t num_signals, const hsa_signal_t* signals, uint32_t num_consumers,
+                                     const hsa_agent_t* consumers, hsa_signal_group_t* signal_group);
+hsa_status_t hsa_signal_group_destroy(hsa_signal_group_t signal_group);
+hsa_status_t hsa_signal_group_wait_any_scacquire(hsa_signal_group_t signal_group,
+                                                 const hsa_signal_condition_t* conditions,
+                                                 const hsa_signal_value_t* compare_values,
+                                                 hsa_wait_state_t wait_state_hint, hsa_signal_t* signal,
+                                                 hsa_signal_value_t* value);
+hsa_status_t hsa_signal_group_wait_any_relaxed(hsa_signal_group_t signal_group,
+                                               const hsa_signal_condition_t* conditions,
+                                               const hsa_signal_value_t* compare_values,
+                                               hsa_wait_state_t wait_state_hint, hsa_signal_t* signal,
+                                               hsa_signal_value_t* value);
 
 /* ---- Queues and packets ------------------------------------------------ */
 

@@ -98,7 +98,28 @@ run_vmem() {   # run_vmem <label> <extra cflags...>
   fi
 }
 
+# Caches, wavefronts, ISA compatibility and signal groups (amd/tests/hsa/hsa_caches.c).
+run_caches() {   # run_caches <label> <extra cflags...>
+  local label=$1; shift
+  if ! "$cc" -std=c11 -O1 -Wall -Werror "${sanitize[@]}" "$@" -pthread "$root/amd/tests/hsa/hsa_caches.c" -o "$tmp/hsa_caches" \
+       -L"$shim" -l:libhsa-runtime64.so.1 -Wl,-rpath,"$(cd "$shim" && pwd)" 2> "$tmp/cc.log"; then
+    echo "FAIL  hsa_caches.c builds against $label"; sed 's/^/      /' "$tmp/cc.log" | head -20; fail=1; return
+  fi
+  local out status passed
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 timeout 120 "$tmp/hsa_caches" 2>&1)
+  status=$?
+  passed=$(grep -c '^ok ' <<< "$out")
+  if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != 11 ]]; then
+    echo "FAIL  caches, wavefronts and signal groups, built against $label: $passed of 11 (exit $status)"
+    echo "$out" | grep -v '^ok ' | tail -5 | sed 's/^/      /'
+    fail=1
+  else
+    echo "ok    caches, wavefronts and signal groups, built against $label: 11 of 11"
+  fi
+}
+
 run "VirtualGPU's HSA header" -I"$root/amd/include"
+run_caches "VirtualGPU's HSA header" -I"$root/amd/include"
 run_images "VirtualGPU's HSA header" -I"$root/amd/include"
 run_vmem "VirtualGPU's HSA header" -I"$root/amd/include"
 rocm_include="${VGPU_ROCM_INCLUDE:-}"
@@ -109,6 +130,7 @@ if [[ -z "$rocm_include" ]]; then
 fi
 if [[ -n "$rocm_include" ]]; then
   run "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
+  run_caches "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
   run_images "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
   run_vmem "ROCm's HSA headers" -DVGPU_REAL_HSA -D__HIP_PLATFORM_AMD__ -I"$rocm_include"
 else

@@ -797,6 +797,89 @@ hsa_status_t hsa_isa_from_name(const char* name, hsa_isa_t* isa) {
   return HSA_STATUS_ERROR_INVALID_ISA_NAME;
 }
 
+// ---- Caches, wavefronts and ISA compatibility ---------------------------------------
+//
+// A GPU agent's caches are the levels hsa_agent_get_info's deprecated
+// HSA_AGENT_INFO_CACHE_SIZE gives sizes for (L1, L2 and, where the chip has
+// one, L3), the same numbers: a handle is the agent's times 16 plus the
+// level. The CPU agent reports none, as that attribute does. The names are
+// the levels' ("L1"): the specification asks only for a description.
+// A wavefront's handle is its ISA's, and a GPU has one wavefront size, the
+// profile's.
+
+namespace {
+uint32_t cache_size(int gpu, uint32_t level) {
+  const auto& p = shared::profile(gpu);
+  switch (level) {
+    case 1: return chip(p).l1_kb * 1024;
+    case 2: return static_cast<uint32_t>(p.limits.l2_cache_bytes);
+    case 3: return chip(p).l3_mb * 1024 * 1024;
+  }
+  return 0;
+}
+}  // namespace
+
+hsa_status_t hsa_agent_iterate_caches(hsa_agent_t agent, hsa_status_t (*callback)(hsa_cache_t, void*), void* data) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!valid_agent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
+  if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  const int gpu = gpu_of(agent);
+  if (gpu < 0) return HSA_STATUS_SUCCESS;
+  for (uint32_t level = 1; level <= 3; ++level) {
+    if (!cache_size(gpu, level)) continue;
+    const hsa_status_t s = callback({agent.handle * 16 + level}, data);
+    if (s != HSA_STATUS_SUCCESS) return s;   // the traversal stops, and says why
+  }
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t hsa_cache_get_info(hsa_cache_t cache, hsa_cache_info_t attribute, void* value) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  const uint32_t level = static_cast<uint32_t>(cache.handle % 16);
+  const int gpu = gpu_of({cache.handle / 16});
+  if (gpu < 0 || level < 1 || level > 3 || !cache_size(gpu, level)) return HSA_STATUS_ERROR_INVALID_CACHE;
+  if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  const std::string name = "L" + std::to_string(level);
+  switch (attribute) {
+    case HSA_CACHE_INFO_NAME_LENGTH: put<uint32_t>(value, static_cast<uint32_t>(name.size())); break;
+    case HSA_CACHE_INFO_NAME: std::memcpy(value, name.c_str(), name.size() + 1); break;
+    case HSA_CACHE_INFO_LEVEL: put<uint8_t>(value, static_cast<uint8_t>(level)); break;
+    case HSA_CACHE_INFO_SIZE: put<uint32_t>(value, cache_size(gpu, level)); break;
+    default: return unknown("hsa_cache_get_info", attribute);
+  }
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t hsa_isa_iterate_wavefronts(hsa_isa_t isa, hsa_status_t (*callback)(hsa_wavefront_t, void*), void* data) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (gpu_of({isa.handle}) < 0) return HSA_STATUS_ERROR_INVALID_ISA;
+  if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  return callback({isa.handle}, data);
+}
+
+hsa_status_t hsa_wavefront_get_info(hsa_wavefront_t wavefront, hsa_wavefront_info_t attribute, void* value) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  const int gpu = gpu_of({wavefront.handle});
+  if (gpu < 0) return HSA_STATUS_ERROR_INVALID_WAVEFRONT;
+  if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  if (attribute != HSA_WAVEFRONT_INFO_SIZE) return unknown("hsa_wavefront_get_info", attribute);
+  put<uint32_t>(value, shared::profile(gpu).warp_size);
+  return HSA_STATUS_SUCCESS;
+}
+
+// Code for one ISA runs on an agent of the same ISA: the full target names
+// (with their sramecc and xnack settings) are equal. Another target is
+// reported incompatible, though a generic target's code can run on its
+// family -- the machines here are never given one.
+hsa_status_t hsa_isa_compatible(hsa_isa_t code_object_isa, hsa_isa_t agent_isa, bool* result) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  const int code = gpu_of({code_object_isa.handle}), agent = gpu_of({agent_isa.handle});
+  if (code < 0 || agent < 0) return HSA_STATUS_ERROR_INVALID_ISA;
+  if (!result) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  *result = isa_name(code) == isa_name(agent);
+  return HSA_STATUS_SUCCESS;
+}
+
 // ---- Signals ------------------------------------------------------------------
 
 hsa_status_t hsa_signal_create(hsa_signal_value_t initial, uint32_t, const hsa_agent_t*, hsa_signal_t* signal) {
@@ -883,6 +966,85 @@ VGPU_SIGNAL_CAS(acq_rel)
 VGPU_SIGNAL_WAIT(relaxed)
 VGPU_SIGNAL_WAIT(scacquire)
 VGPU_SIGNAL_WAIT(acquire)
+
+// ---- Signal groups ------------------------------------------------------------------
+//
+// A group is a list of signals waited on together. The wait looks at each
+// signal in turn, with the memory order the name says (every order is
+// sequentially consistent here), and sleeps a little between rounds, as a
+// single signal's wait does where a kernel changes a value without waking
+// anyone. The handle is the group's address; a destroyed group is no longer
+// one.
+
+namespace {
+struct SignalGroup {
+  std::vector<hsa_signal_t> signals;
+};
+std::mutex& g_groups_mutex = *new std::mutex;
+std::set<SignalGroup*>& live_groups() {
+  static std::set<SignalGroup*>& groups = *new std::set<SignalGroup*>;
+  return groups;
+}
+hsa_status_t wait_any_in_group(hsa_signal_group_t group, const hsa_signal_condition_t* conditions,
+                               const hsa_signal_value_t* values, hsa_signal_t* signal, hsa_signal_value_t* value) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  std::vector<hsa_signal_t> signals;
+  {
+    std::lock_guard<std::mutex> lock(g_groups_mutex);
+    auto* g = reinterpret_cast<SignalGroup*>(group.handle);
+    if (!live_groups().count(g)) return HSA_STATUS_ERROR_INVALID_SIGNAL_GROUP;
+    signals = g->signals;   // the group may be destroyed while this waits; the signals are the caller's
+  }
+  if (!conditions || !values || !signal || !value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  for (auto nap = std::chrono::microseconds(20);; nap = std::min(nap * 2, std::chrono::microseconds(1000))) {
+    for (size_t i = 0; i < signals.size(); ++i) {
+      const int64_t v = signal_of(signals[i])->amd.value.load();
+      if (satisfied(v, conditions[i], values[i])) {
+        *signal = signals[i];
+        *value = v;
+        return HSA_STATUS_SUCCESS;
+      }
+    }
+    std::this_thread::sleep_for(nap);
+  }
+}
+}  // namespace
+
+hsa_status_t hsa_signal_group_create(uint32_t num_signals, const hsa_signal_t* signals, uint32_t num_consumers,
+                                     const hsa_agent_t* consumers, hsa_signal_group_t* group) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!num_signals || !signals || !num_consumers || !consumers || !group) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  for (uint32_t i = 0; i < num_signals; ++i)
+    if (!signals[i].handle) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+  auto* g = new SignalGroup;
+  g->signals.assign(signals, signals + num_signals);
+  {
+    std::lock_guard<std::mutex> lock(g_groups_mutex);
+    live_groups().insert(g);
+  }
+  group->handle = reinterpret_cast<uint64_t>(g);
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_signal_group_destroy(hsa_signal_group_t group) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  auto* g = reinterpret_cast<SignalGroup*>(group.handle);
+  {
+    std::lock_guard<std::mutex> lock(g_groups_mutex);
+    if (!live_groups().erase(g)) return HSA_STATUS_ERROR_INVALID_SIGNAL_GROUP;
+  }
+  delete g;
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_signal_group_wait_any_scacquire(hsa_signal_group_t group, const hsa_signal_condition_t* conditions,
+                                                 const hsa_signal_value_t* values, hsa_wait_state_t,
+                                                 hsa_signal_t* signal, hsa_signal_value_t* value) {
+  return wait_any_in_group(group, conditions, values, signal, value);
+}
+hsa_status_t hsa_signal_group_wait_any_relaxed(hsa_signal_group_t group, const hsa_signal_condition_t* conditions,
+                                               const hsa_signal_value_t* values, hsa_wait_state_t,
+                                               hsa_signal_t* signal, hsa_signal_value_t* value) {
+  return wait_any_in_group(group, conditions, values, signal, value);
+}
 
 // ---- Queues -------------------------------------------------------------------
 
