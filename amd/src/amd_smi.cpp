@@ -986,51 +986,12 @@ AMDSMI_API int amdsmi_get_gpu_metrics_info(void* h, GpuMetrics* out) {
   if (bytes.size() != sizeof t) return kNotSupported;
   std::memcpy(&t, bytes.data(), sizeof t);
   std::memset(out, 0xFF, sizeof *out);
-  out->common_header = {t.structure_size, t.format_revision, t.content_revision};
-  out->temperature_hotspot = t.temperature_hotspot;
-  out->temperature_mem = t.temperature_mem;
-  out->temperature_vrsoc = t.temperature_vrsoc;
-  out->current_socket_power = t.curr_socket_power;
-  out->average_gfx_activity = t.average_gfx_activity;
-  out->average_umc_activity = t.average_umc_activity;
-  std::memcpy(out->vcn_activity, t.vcn_activity, sizeof t.vcn_activity);
-  std::memcpy(out->jpeg_activity, t.jpeg_activity, sizeof t.jpeg_activity);
-  out->energy_accumulator = t.energy_accumulator;
-  out->system_clock_counter = t.system_clock_counter;
+  vgpu::amd::fill_public_metrics(out, t);
   if (instinct(s) && t.energy_accumulator == kNone64) {
     const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
     out->energy_accumulator = e.ticks;
     out->system_clock_counter = e.timestamp_ns;
   }
-  out->throttle_status = t.throttle_status;
-  out->gfxclk_lock_status = t.gfxclk_lock_status;
-  out->pcie_link_width = t.pcie_link_width;
-  out->pcie_link_speed = t.pcie_link_speed;
-  out->xgmi_link_width = t.xgmi_link_width;
-  out->xgmi_link_speed = t.xgmi_link_speed;
-  out->gfx_activity_acc = t.gfx_activity_acc;
-  out->mem_activity_acc = t.mem_activity_acc;
-  out->pcie_bandwidth_acc = t.pcie_bandwidth_acc;
-  out->pcie_bandwidth_inst = t.pcie_bandwidth_inst;
-  out->pcie_l0_to_recov_count_acc = t.pcie_l0_to_recov_count_acc;
-  out->pcie_replay_count_acc = t.pcie_replay_count_acc;
-  out->pcie_replay_rover_count_acc = t.pcie_replay_rover_count_acc;
-  out->pcie_nak_sent_count_acc = t.pcie_nak_sent_count_acc;
-  out->pcie_nak_rcvd_count_acc = t.pcie_nak_rcvd_count_acc;
-  std::memcpy(out->xgmi_read_data_acc, t.xgmi_read_data_acc, sizeof t.xgmi_read_data_acc);
-  std::memcpy(out->xgmi_write_data_acc, t.xgmi_write_data_acc, sizeof t.xgmi_write_data_acc);
-  out->firmware_timestamp = t.firmware_timestamp;
-  std::memcpy(out->current_gfxclks, t.current_gfxclk, sizeof t.current_gfxclk);
-  std::memcpy(out->current_socclks, t.current_socclk, sizeof t.current_socclk);
-  std::memcpy(out->current_vclk0s, t.current_vclk0, sizeof t.current_vclk0);
-  std::memcpy(out->current_dclk0s, t.current_dclk0, sizeof t.current_dclk0);
-  out->current_uclk = t.current_uclk;
-  out->current_gfxclk = out->current_gfxclks[0];
-  out->current_socclk = out->current_socclks[0];
-  out->current_vclk0 = out->current_vclk0s[0];
-  out->current_vclk1 = out->current_vclk0s[1];
-  out->current_dclk0 = out->current_dclk0s[0];
-  out->current_dclk1 = out->current_dclk0s[1];
   return kSuccess;
 }
 
