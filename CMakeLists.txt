@@ -1489,6 +1489,28 @@ if(TARGET vgpunccl)
   endforeach()
 endif()
 
+# What PyTorch 2.14 binds at load time and the runtime lacked: user objects (and
+# the graphs that hold them), the library API, cuBLASLt's algorithm configuration.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_user_objects nvidia/tests/unit/test_runtime_user_objects.cpp)
+  target_link_libraries(test_runtime_user_objects PRIVATE vgpucudart vgpucuda)
+  # The driver is loaded, as it is in a framework, though the test names none of its symbols.
+  target_link_options(test_runtime_user_objects PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_runtime_user_objects PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_user_objects COMMAND test_runtime_user_objects)
+  # The runtime and the driver shim each carry the simulator's core, by design; one process that loads both
+  # is an ODR violation to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
+  set_tests_properties(test_runtime_user_objects PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+if(TARGET vgpucublaslt)
+  add_executable(test_cublaslt_algo nvidia/tests/unit/test_cublaslt_algo.cpp)
+  target_link_libraries(test_cublaslt_algo PRIVATE vgpucublaslt vgpucudart)
+  target_include_directories(test_cublaslt_algo PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublaslt_algo COMMAND test_cublaslt_algo)
+  set_tests_properties(test_cublaslt_algo PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+endif()
+
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
 # which is invisible to a program until it captures a graph: the call has to be
 # recorded and run at launch, over what the graph's own kernels produced, not
