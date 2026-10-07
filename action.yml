@@ -102,7 +102,18 @@ runs:
         . /etc/os-release
         [[ "$ID" == ubuntu && "${VERSION_ID%%.*}" -lt 24 ]] && pkgs="$pkgs g++-12"
         $SUDO apt-get update -qq
-        $SUDO apt-get install -y -qq --no-install-recommends $pkgs
+        # Unpacking the NVIDIA runtime libraries that nvidia-cuda-toolkit pulls in has hung a hosted
+        # runner for the whole 45 minutes, twice running. Bound each attempt, and finish whatever dpkg
+        # left half-configured before the next.
+        for attempt in 1 2 3; do
+          $SUDO timeout 900 apt-get install -y -qq --no-install-recommends $pkgs && break
+          if [[ $attempt == 3 ]]; then
+            echo "::error::apt-get install of $pkgs did not finish in three attempts"
+            exit 1
+          fi
+          echo "::warning::apt-get install failed or timed out (attempt $attempt of 3); retrying"
+          $SUDO dpkg --configure -a || true
+        done
 
     - name: Install CUDA ${{ steps.want.outputs.cuda }} from NVIDIA
       if: steps.want.outputs.cuda != 'apt' && steps.want.outputs.cuda != 'none'
