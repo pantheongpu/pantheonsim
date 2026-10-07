@@ -1659,6 +1659,29 @@ scripts/run-pantheon-workloads.sh.
    changed on the device" and "TMA's im2col mode"). Blackwell's gather and
    scatter modes are done; `.im2col::w` is refused (nvidia/docs/blackwell.md).
 
+## Gap work in flight (2026-10-07)
+
+Pull requests open when rev 5 was written, each closing a gap from the register below. They are
+listed so the register is not read as if nothing were being done; a merged PR should move its entry
+into "Implemented" and out of here. All were written by agents from public documentation and
+public headers, tested by their authors under ASan + UBSan, and are awaiting CI and review.
+
+| PR | Gap it closes |
+| --- | --- |
+| pantheonsim #301 | ROCm SMI: `rsmi_dev_gpu_metrics_info_get`, `rsmi_dev_metrics_header_info_get`, 52 `rsmi_*` functions the public header declares but the library did not export |
+| pantheonsim #302 | AMD SMI getters that were `NOT_SUPPORTED` stubs: VRAM usage, busy percent, perf and overdrive levels, bad pages, compute-process info |
+| pantheonsim #303 | HSA 1.1: `hsa_agent_iterate_caches`, `hsa_cache_get_info`, `hsa_isa_iterate_wavefronts`, `hsa_wavefront_get_info`, `hsa_isa_compatible`, `hsa_signal_group_*` |
+| pantheonsim #304 | NVRTC: the real `libnvrtc-builtins` beside a pip-wheel `libnvrtc` (every PyTorch jiterator kernel failed without nvcc) |
+| pantheonsim #305 | cuBLASLt int8 x int8 -> int32 (`CUBLAS_COMPUTE_32I`), what `torch._int_mm` calls |
+| pantheonsim #306 | SASS: `LEA` with a negated addend carries out of a zero (a bf16 im2col read 2^32 elements out of bounds on a T4) |
+| pantheonsim #307 | PTX `brx.idx` with `.branchtargets`, and `.calltargets` on indirect calls (a dense `switch` refused the whole kernel) |
+| pantheonsim #308 | Driver `cuLaunchKernelEx` reads its attribute list (the stride is 72 bytes in every CUDA 12 header; clustered launches from Triton and CUTLASS were refused) |
+| pantheonsim #309 | Runtime exports the toolkit has: `cudaMemset3D(Async)`, `cudaChooseDevice`, `cudaInitDevice`, 2D array copies, descriptor getters, `cudaFuncGetName`/`GetParamInfo`, ... |
+| pantheonsim #310 | Driver stream-ordered memory pools (`cuMemPool*`, `cuMemAllocAsync` through the current pool) |
+| pantheonsim #311 | Driver `cuPointerGetAttributes`, `cuPointerSetAttribute` and the missing `cuPointerGetAttribute` answers |
+| pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
+| pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
+
 ## Profile inventory (rev 5)
 
 23 profiles, read from each profile's YAML at 2ce1f45. `verified: true` means the
@@ -1924,6 +1947,56 @@ behaviour, timing).
   sensors, Ampere/Ada memory-controller ECC counters and Blackwell's `dev_ltc_zb`, `dev_fuse_zb` and `dev_tmr`
   have no published values (:345, :367-401); per-partition count distribution (:377); header-defined firmware
   actions (amd/src/regs.cpp:139).
+
+### Found by the rev 5 gap analysis and not implemented
+
+NVIDIA (found by comparing the names in `cuda_runtime_api.h`, `cuda.h` and `nvml.h`, 12.0 to 12.9,
+with what `nvidia/src` defines):
+
+- **Driver graph API and stream capture** (about 100 entry points): absent, and `cuStreamGetCaptureInfo`
+  is a stub. The driver's streams are synchronous and keep none of the runtime's roughly 3000 lines of
+  graph machinery. The largest remaining gap for driver-API users.
+- **Stream memory operations**: `cuStreamWaitValue32/64`, `cuStreamWriteValue64`, `cuStreamBatchMemOp`. A
+  wait on a false condition cannot be modelled on a synchronous stream.
+- **Other driver additions**: `cuLibraryLoadFromFile`, `GetGlobal`, `GetManaged`, `GetKernelCount`,
+  `EnumerateKernels`; `cuModuleGetFunctionCount`, `EnumerateFunctions`; `cuFuncGetName`, `GetModule`,
+  `GetParamInfo`; `cuKernelGetLibrary`, `GetParamInfo`; `cuStreamGetCtx`, `GetId`; `cuEventRecordWithFlags`;
+  `cuCtxRecordEvent`, `WaitEvent`; `cuMemRangeGetAttribute(s)`; `cuMemcpy3DPeer`; `cuDeviceGetP2PAttribute`,
+  `GetLuid`; `cuUserObject*`; green contexts; the texture-reference mipmap getters.
+- **Runtime leftovers**: `cudaGetFuncBySymbol`, `cudaGetKernel`; graph kernel-node attribute calls, the
+  generic `cudaGraph*NodeSetParams`, the 12.3 `_v2` edge-data graph calls; the external memory and semaphore
+  interop family; `cudaMemcpyBatchAsync`; `cudaOccupancyAvailableDynamicSMemPerBlock` (the semantics for
+  infeasible requests are unclear); `cudaDeviceGetTexture1DLinearMaxWidth`; `cudaSetValidDevices`.
+- **Cluster occupancy**: `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` need the
+  SM-to-GPC grouping, which no profile records and the public documentation does not give; they refuse by
+  name once the runtime-exports PR (#309) merges.
+- **NVML setters**: persistence mode, compute mode, power limit, clock locks, fan control, MIG/GPU-instance
+  and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
+  not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process
+  shows no change, so persistence across processes needs a design decision first.
+- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, `txq`, `ldu`.
+
+AMD:
+
+- **HSA**: `hsa_amd_signal_wait_any` (what its timeout returns is not settled by the public header),
+  `hsa_amd_queue_intercept_*` (what rocprofiler uses; needs queue interception),
+  `hsa_amd_register_deallocation_callback` and its deregister, `hsa_amd_memory_migrate`, `hsa_amd_spm_*`,
+  `hsa_amd_ipc_signal_*`, the deprecated `hsa_code_object_*`, `hsa_executable_create` and the finalizer calls,
+  and `hsa_ven_amd_aqlprofile_*`.
+- **AMD SMI data with no profile datum**: board, VBIOS and firmware info, cache info, violation status and PCIe
+  throughput stay `NOT_SUPPORTED`; filling them in would mean guessing field values. ROCm SMI's XCD counter
+  stays refused because the metrics table fills all 8 gfxclks even on Radeon, so a count would be wrong.
+- **ISA**: MFMA with BLGP lane patterns outside the f8f6f4 forms, MFMA with lanes off in EXEC, a few
+  high-half-constant forms, and `s_sendmsg_rtn` messages beyond the ones answered. The public sources
+  consulted did not settle the BLGP semantics, so they stay refused by name. (The GEMM forms that `TODO.md`
+  used to list as missing -- half, bf16, int8, fp8 MFMA and SMFMAC for gfx90a, gfx942 and gfx950, the f8f6f4
+  and scaled forms, DPP wave and row broadcast forms -- already exist.)
+- **HIP API surface**: no gap found against the 5.7 header (only macros and templates were missing).
+
+What rev 5 could not check: nothing here ran on a real GPU or on ROCm 7.x. The static audit reads sources
+and tests; the gap branches were tested by their authors under ASan + UBSan with CUDA 12.8 headers (the
+runtime one also syntax-checked against 12.4), and none ran the full ctest suite, a TSan build, or any e2e
+program that needs nvcc.
 
 ### Tooling, CI and process
 
