@@ -858,6 +858,13 @@ class Parser {
     // A label is keyed by name and the block it was defined in, and a branch
     // takes the innermost definition visible from where it stands.
     std::unordered_map<std::string, size_t> labels;
+    // "tlist: .branchtargets L1, L2, ...;" -- the lists brx.idx indexes, keyed
+    // like a label (name and the block that declared it). `pending_label` is
+    // the label just consumed and `pending_pos` the token after it: the
+    // directive belongs to a label only when it follows one directly.
+    std::unordered_map<std::string, std::vector<std::string>> branch_tables;
+    std::string pending_label;
+    size_t pending_pos = static_cast<size_t>(-1);
     std::vector<std::pair<size_t, std::string>> bra_fixups;
     std::vector<std::vector<int>> fixup_scopes;   // the scope chain at each branch
     std::vector<int> scopes{0};                   // innermost last
@@ -960,6 +967,28 @@ class Parser {
         if (peek_punct(";")) next();
         continue;
       }
+      if (t.kind == Token::Kind::Word && (t.text == ".branchtargets" || t.text == ".calltargets")) {
+        // "tlist: .branchtargets $L1, $L2;" declares the labels a brx.idx
+        // chooses among. ".calltargets" is the same for an indirect call: it
+        // narrows what the call may reach, which a call through a register
+        // already resolves exactly, so only the list's syntax is checked.
+        const bool branch = t.text == ".branchtargets";
+        if (pending_pos != pos_ || pending_label.empty())
+          fail(t.line, t.text + " must follow the label that names the list");
+        const std::string table = pending_label;
+        next();
+        std::vector<std::string> entries;
+        while (true) {
+          entries.push_back(expect_word(branch ? "branch target" : "call target"));
+          if (!peek_punct(",")) break;
+          next();
+        }
+        expect_punct(";");
+        if (branch &&
+            !branch_tables.emplace(key(table, scopes.back()), std::move(entries)).second)
+          fail(t.line, "duplicate branch target list '" + table + "'");
+        continue;
+      }
       if (t.kind == Token::Kind::Word && (t.text == ".loc" || t.text == ".pragma")) {
         next();
         while (!at_end() && !peek_punct(";") && peek().line == t.line) next();
@@ -973,8 +1002,10 @@ class Parser {
       if (t.kind == Token::Kind::Word && peek_punct(":", 1)) {
         if (!labels.emplace(key(t.text, scopes.back()), fn.body.size()).second)
           fail(t.line, "duplicate label '" + t.text + "'");
+        pending_label = t.text;
         next();
         next();
+        pending_pos = pos_;
         continue;
       }
       fn.body.push_back(parse_instruction(fn, bra_fixups));
@@ -984,8 +1015,32 @@ class Parser {
     for (size_t f = 0; f < bra_fixups.size(); ++f) {
       const auto& [idx, label] = bra_fixups[f];
       const std::vector<int>& chain = fixup_scopes[f];
-      auto it = labels.end();
-      for (size_t i = chain.size(); i-- > 0 && it == labels.end();) it = labels.find(key(label, chain[i]));
+      auto find_label = [&](const std::string& name) {
+        auto it = labels.end();
+        for (size_t i = chain.size(); i-- > 0 && it == labels.end();) it = labels.find(key(name, chain[i]));
+        return it;
+      };
+      if (auto* bx = std::get_if<OpBrx>(&fn.body[idx].op)) {
+        // The list is looked up like a label, then each entry like a branch target.
+        std::vector<std::string>* entries = nullptr;
+        for (size_t i = chain.size(); i-- > 0 && !entries;) {
+          auto t = branch_tables.find(key(label, chain[i]));
+          if (t != branch_tables.end()) entries = &t->second;
+        }
+        if (!entries)
+          fail(fn.body[idx].line, "brx.idx names '" + label + "', which no .branchtargets declares in kernel '" +
+                                      fn.name + "'");
+        bx->labels = *entries;
+        for (const std::string& name : *entries) {
+          auto it = find_label(name);
+          if (it == labels.end())
+            fail(fn.body[idx].line, "branch target list '" + label + "' names undefined label '" + name +
+                                        "' in kernel '" + fn.name + "'");
+          bx->targets.push_back(it->second);
+        }
+        continue;
+      }
+      auto it = find_label(label);
       if (it == labels.end())
         fail(fn.body[idx].line, "branch to undefined label '" + label + "' in kernel '" + fn.name + "'");
       std::get<OpBra>(fn.body[idx].op).target = it->second;
@@ -4405,6 +4460,18 @@ class Parser {
       std::string label = expect_word("branch target");
       bra_fixups.emplace_back(fn.body.size(), label);
       ins.op = OpBra{0, label};
+    } else if (op0 == "brx") {
+      // brx.idx{.uni} index, tlist;  (PTX ISA 9.7.13.2). The list is resolved
+      // with the branches, once every label is known.
+      if (parts.size() < 2 || parts.size() > 3 || parts[1] != "idx" || (parts.size() == 3 && parts[2] != "uni"))
+        return unsupported("brx form (brx.idx{.uni} is the one the ISA defines)");
+      OpBrx op;
+      op.a = parse_operand();
+      if (std::holds_alternative<ImmFloatBits>(op.a)) return unsupported("brx.idx with a floating-point index");
+      expect_punct(",");
+      op.table = expect_word("branch target list");
+      bra_fixups.emplace_back(fn.body.size(), op.table);
+      ins.op = op;
     } else if (op0 == "call") {
       // call.uni (retval0), vprintf, (param0, param1);
       OpCall op;
