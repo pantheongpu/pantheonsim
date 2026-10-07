@@ -1511,6 +1511,14 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_user_objects PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# cuLaunchKernelEx's attribute list: the cluster shape and a cooperative launch.
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_launch_ex nvidia/tests/unit/test_driver_launch_ex.cpp)
+  target_link_libraries(test_driver_launch_ex PRIVATE vgpucuda)
+  target_include_directories(test_driver_launch_ex PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_driver_launch_ex COMMAND test_driver_launch_ex)
+  set_tests_properties(test_driver_launch_ex PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1")
+endif()
 # Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
 # cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture
 # descriptor getters, cudaFuncGetName and cudaFuncGetParamInfo, ...).
