@@ -257,7 +257,9 @@ VTEST(pools_are_made_and_destroyed_under_the_documented_rules) {
   bad.location.id = 9;
   VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_INVALID_DEVICE);
   bad = props;
-  bad.location.type = CU_MEM_LOCATION_TYPE_HOST;   // a pool on the host
+  // CU_MEM_LOCATION_TYPE_HOST, spelled by value: cuda.h declares it from 12.2 and the older toolkits CI builds with do not
+  // (INVALID 0, DEVICE 1, HOST 2, HOST_NUMA 3, HOST_NUMA_CURRENT 4).
+  bad.location.type = static_cast<CUmemLocationType>(2);   // a pool on the host
   VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_NOT_SUPPORTED);
   bad = props;
   bad.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;   // a pool another process could use
