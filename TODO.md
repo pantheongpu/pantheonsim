@@ -542,11 +542,6 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
   devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
-- PTX `brx.idx` with `.branchtargets` lists (what nvcc writes for a dense
-  switch), and `.calltargets` lists on indirect calls. Each lane indexes the
-  list itself, so a warp splits into one path per distinct target; an index
-  past the end of the list is refused by name, because the ISA defines no
-  behaviour for it.
 
 ## Hardware characterization
 
