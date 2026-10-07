@@ -1723,6 +1723,17 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # Memory-test patterns (walking bits, address in address, checkerboard, moving
+  # inversions, seeded random, block copy, strides) over device memory, with a
+  # stuck cell and armed bit flips they must find.
+  add_test(NAME e2e_memtest_patterns
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_memtest_patterns.sh)
+  set_tests_properties(e2e_memtest_patterns PROPERTIES
+    DEPENDS "vgpucudart;vgpu_cli"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+
   if(TARGET vgpunvenc)
     add_test(NAME e2e_nvenc
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvenc.sh)
