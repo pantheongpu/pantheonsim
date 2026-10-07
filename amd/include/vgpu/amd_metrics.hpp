@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -54,6 +55,60 @@ struct MetricsV15 {
   uint16_t current_uclk;
   uint16_t padding;
 };
+
+// The table's fields in the public structure both AMD libraries hand out:
+// amdsmi_gpu_metrics_t and rsmi_gpu_metrics_t, which have the same members in
+// the same order (4544 bytes in ROCm 7.2.0). The caller sets every byte to
+// ones first; what the v1.5 table has is copied across, and every other member
+// stays all ones, N/A. The single-value clocks are the first of the table's
+// arrays, as the library's v1.5 compatibility copy does. The energy
+// accumulator stays as the table has it: a caller that knows its GPU has one
+// (an Instinct) puts the shared counter in where the table has none.
+template <class T>
+void fill_public_metrics(T* out, const MetricsV15& t) {
+  out->common_header.structure_size = t.structure_size;
+  out->common_header.format_revision = t.format_revision;
+  out->common_header.content_revision = t.content_revision;
+  out->temperature_hotspot = t.temperature_hotspot;
+  out->temperature_mem = t.temperature_mem;
+  out->temperature_vrsoc = t.temperature_vrsoc;
+  out->current_socket_power = t.curr_socket_power;
+  out->average_gfx_activity = t.average_gfx_activity;
+  out->average_umc_activity = t.average_umc_activity;
+  std::memcpy(out->vcn_activity, t.vcn_activity, sizeof t.vcn_activity);
+  std::memcpy(out->jpeg_activity, t.jpeg_activity, sizeof t.jpeg_activity);
+  out->energy_accumulator = t.energy_accumulator;
+  out->system_clock_counter = t.system_clock_counter;
+  out->throttle_status = t.throttle_status;
+  out->gfxclk_lock_status = t.gfxclk_lock_status;
+  out->pcie_link_width = t.pcie_link_width;
+  out->pcie_link_speed = t.pcie_link_speed;
+  out->xgmi_link_width = t.xgmi_link_width;
+  out->xgmi_link_speed = t.xgmi_link_speed;
+  out->gfx_activity_acc = t.gfx_activity_acc;
+  out->mem_activity_acc = t.mem_activity_acc;
+  out->pcie_bandwidth_acc = t.pcie_bandwidth_acc;
+  out->pcie_bandwidth_inst = t.pcie_bandwidth_inst;
+  out->pcie_l0_to_recov_count_acc = t.pcie_l0_to_recov_count_acc;
+  out->pcie_replay_count_acc = t.pcie_replay_count_acc;
+  out->pcie_replay_rover_count_acc = t.pcie_replay_rover_count_acc;
+  out->pcie_nak_sent_count_acc = t.pcie_nak_sent_count_acc;
+  out->pcie_nak_rcvd_count_acc = t.pcie_nak_rcvd_count_acc;
+  std::memcpy(out->xgmi_read_data_acc, t.xgmi_read_data_acc, sizeof t.xgmi_read_data_acc);
+  std::memcpy(out->xgmi_write_data_acc, t.xgmi_write_data_acc, sizeof t.xgmi_write_data_acc);
+  out->firmware_timestamp = t.firmware_timestamp;
+  std::memcpy(out->current_gfxclks, t.current_gfxclk, sizeof t.current_gfxclk);
+  std::memcpy(out->current_socclks, t.current_socclk, sizeof t.current_socclk);
+  std::memcpy(out->current_vclk0s, t.current_vclk0, sizeof t.current_vclk0);
+  std::memcpy(out->current_dclk0s, t.current_dclk0, sizeof t.current_dclk0);
+  out->current_uclk = t.current_uclk;
+  out->current_gfxclk = out->current_gfxclks[0];
+  out->current_socclk = out->current_socclks[0];
+  out->current_vclk0 = out->current_vclk0s[0];
+  out->current_vclk1 = out->current_vclk0s[1];
+  out->current_dclk0 = out->current_dclk0s[0];
+  out->current_dclk1 = out->current_dclk0s[1];
+}
 
 // The energy accumulator an Instinct GPU has (a Radeon's driver exposes none):
 // a count of 15.3 uJ ticks (ROCm SMI's counter_resolution, in micro joules),
