@@ -542,6 +542,12 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
   devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
+- The driver's cuLaunchKernelEx reads its attribute list (72-byte entries, as
+  every CUDA 12 cuda.h lays them out): a cluster dimension reaches
+  %cluster_*, a cooperative attribute is a cooperative launch, and the
+  attributes that change no result (priority, memory-sync domains, access
+  policy windows, programmatic events) are accepted. Triton's clustered
+  launches and CUTLASS's cluster launcher take this path.
 
 ## Hardware characterization
 

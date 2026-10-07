@@ -12,6 +12,7 @@
 #include "vgpu_cuda.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1613,7 +1614,8 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
                               unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
                               unsigned int blockDimY, unsigned int blockDimZ,
                               unsigned int sharedMemBytes, CUstream hStream, void** kernelParams,
-                              void** extra, bool cooperative) {
+                              void** extra, bool cooperative,
+                              std::array<uint32_t, 3> cluster = {0, 0, 0}) {
   return api(api_name, true, true, [&](ShimState& s) {
     uintptr_t fh = reinterpret_cast<uintptr_t>(f);
     if ((fh & 7) == kTagKernel) fh = kernel_to_function(s, fh);  // CUkernel is launchable directly
@@ -1646,6 +1648,7 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     cfg.block = {blockDimX, blockDimY, blockDimZ};
     cfg.shared_bytes = sharedMemBytes;
     cfg.cooperative = cooperative;
+    cfg.cluster = cluster;
     if (cooperative) {
       // Every block of a cooperative launch waits for every other, so a grid
       // that cannot all be resident does not run slowly -- it hangs. Hardware
@@ -1840,6 +1843,28 @@ VGPU_EXPORT CUresult cuFuncIsLoaded(int* state, CUfunction) {
 }
 VGPU_EXPORT CUresult cuFuncLoad(CUfunction) { return CUDA_SUCCESS; }
 
+// CUlaunchAttribute, as the driver ABI fixes it: a 4-byte id, padded to 8, then
+// a union padded to 64 bytes -- 72 bytes an entry. cuda.h of every CUDA 12
+// toolkit (12.0 to 12.9) declares exactly that, and it has to stay: an array
+// of these crosses the driver boundary, so a toolkit that moved the stride
+// would stop its own binaries launching on an older driver. This file reads
+// the entries through its own declaration rather than including a vendor
+// header (see vgpu_cuda.h).
+namespace {
+struct LaunchAttrABI {
+  uint32_t id;
+  char pad[4];
+  union {
+    char pad64[64];
+    int cooperative;                           // CU_LAUNCH_ATTRIBUTE_COOPERATIVE
+    struct { uint32_t x, y, z; } cluster_dim;  // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+  } value;
+};
+static_assert(sizeof(LaunchAttrABI) == 72, "CUlaunchAttribute is 72 bytes in every CUDA 12 cuda.h");
+constexpr uint32_t kLaunchAttrCooperative = 2;       // CU_LAUNCH_ATTRIBUTE_COOPERATIVE
+constexpr uint32_t kLaunchAttrClusterDimension = 4;  // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+}  // namespace
+
 VGPU_EXPORT CUresult cuLaunchKernelEx(const void* config, CUfunction f, void** kernelParams,
                                       void** extra) {
   // CUlaunchConfig: 6x u32 dims, u32 sharedMemBytes, CUstream, attrs*, numAttrs.
@@ -1847,44 +1872,36 @@ VGPU_EXPORT CUresult cuLaunchKernelEx(const void* config, CUfunction f, void** k
     unsigned gx, gy, gz, bx, by, bz;
     unsigned shared_bytes;
     CUstream stream;
-    void* attrs;
+    const LaunchAttrABI* attrs;
     unsigned num_attrs;
   };
   const auto* c = static_cast<const LaunchCfgABI*>(config);
   if (!c) return CUDA_ERROR_INVALID_VALUE;
-  // Attributes are refused rather than dropped.
+  if (c->num_attrs != 0 && c->attrs == nullptr) return CUDA_ERROR_INVALID_VALUE;
+  // The attribute list is the point of the Ex form. Two attributes change what
+  // the grid does -- a cluster shape and a cooperative launch -- and are
+  // honoured. Ignoring them would run a clustered kernel with no cluster, every
+  // block reading %cluster_ctarank as 0 and %cluster_nctarank as 1: a launch
+  // that succeeds and computes the wrong thing, which this engine is built not
+  // to do. (This entry point used to refuse any attribute for fear of reading
+  // the entries at the wrong stride; see LaunchAttrABI.)
   //
-  // This shim forwarded the config and ignored `attrs` entirely, which was
-  // harmless while nothing it could carry was implemented. Thread-block
-  // clusters changed that: a launch carrying
-  // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION would have run with no cluster, and
-  // every block would have read %cluster_ctarank as 0 and %cluster_nctarank
-  // as 1. It would have succeeded and been wrong, silently, which is the one
-  // outcome this engine is built to not produce.
-  //
-  // Walking the array is not an option here. Unlike the runtime shim, this
-  // file deliberately depends on no vendor header -- see vgpu_cuda.h -- and
-  // the entry stride is not a constant that can be hard-coded:
-  // sizeof(CUlaunchAttribute) is 72 with CUDA 13 against the 40 an older
-  // toolkit's union gives, so a fixed guess reads the wrong bytes on some
-  // toolkit and reports a cluster shape nobody asked for.
-  //
-  // So: no attributes is the supported case, and anything else says so. The
-  // runtime entry point (cudaLaunchKernelEx) does read attributes, because
-  // that shim is compiled against the vendor headers, and it is the path CUDA
-  // C++ actually takes.
-  if (c->num_attrs != 0 && c->attrs != nullptr) {
-    if (!quiet())
-      std::fprintf(stderr,
-                   "[vgpu] cuLaunchKernelEx: %u launch attribute(s) given; this entry point "
-                   "cannot read them (the attribute struct size differs between CUDA "
-                   "toolkits) and will not ignore them silently. Use cudaLaunchKernelEx, "
-                   "which does read them.\n",
-                   c->num_attrs);
-    return CUDA_ERROR_NOT_SUPPORTED;
+  // The rest are inert here for reasons already true of the runtime's
+  // cudaLaunchKernelEx: priority and memory-sync domains need a stream
+  // scheduler, access policy windows a cache model, programmatic events
+  // asynchrony, and the preferred cluster shape and shared-memory carveout are
+  // preferences a launch is free to ignore. None changes what a kernel computes.
+  std::array<uint32_t, 3> cluster{0, 0, 0};
+  bool cooperative = false;
+  for (unsigned i = 0; i < c->num_attrs; ++i) {
+    const LaunchAttrABI& a = c->attrs[i];
+    if (a.id == kLaunchAttrClusterDimension)
+      cluster = {a.value.cluster_dim.x, a.value.cluster_dim.y, a.value.cluster_dim.z};
+    else if (a.id == kLaunchAttrCooperative)
+      cooperative = a.value.cooperative != 0;
   }
-  return cuLaunchKernel(f, c->gx, c->gy, c->gz, c->bx, c->by, c->bz, c->shared_bytes, c->stream,
-                        kernelParams, extra);
+  return launch_kernel_common("cuLaunchKernelEx", f, c->gx, c->gy, c->gz, c->bx, c->by, c->bz,
+                              c->shared_bytes, c->stream, kernelParams, extra, cooperative, cluster);
 }
 
 /* ---- the pre-CUDA 4 launch: shape and parameters kept on the function ----
