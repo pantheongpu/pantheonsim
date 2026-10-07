@@ -1213,6 +1213,11 @@ add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_fo
 set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 add_test(NAME smi_queries COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_queries.sh)
 set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+# NVRTC through the toolkit's real libnvrtc from a pip wheel (PyTorch's jiterator): its builtins library
+# lives beside it, on no search path. Needs no nvcc and no GPU; skips without the wheel.
+add_test(NAME nvrtc_builtins COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvrtc_builtins.sh)
+set_tests_properties(nvrtc_builtins PROPERTIES DEPENDS vgpunvrtc SKIP_REGULAR_EXPRESSION "^SKIP:"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 60)
 # The rest of the command-line surface scripts drive: nvidia-smi's -d, -x, -h,
 # loops and field checks, the drop-in scripts, rocm-smi's own flags; vgpu
 # shell's defaults, identity, flag checks and exit status; and the exit codes
@@ -1514,6 +1519,14 @@ if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_test(NAME test_driver_launch_ex COMMAND test_driver_launch_ex)
   set_tests_properties(test_driver_launch_ex PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1")
 endif()
+# cuPointerGetAttribute / cuPointerGetAttributes / cuPointerSetAttribute.
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_pointer_attrs nvidia/tests/unit/test_driver_pointer_attrs.cpp)
+  target_link_libraries(test_driver_pointer_attrs PRIVATE vgpucuda)
+  target_include_directories(test_driver_pointer_attrs PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_driver_pointer_attrs COMMAND test_driver_pointer_attrs)
+  set_tests_properties(test_driver_pointer_attrs PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+endif()
 if(TARGET vgpucublaslt)
   add_executable(test_cublaslt_algo nvidia/tests/unit/test_cublaslt_algo.cpp)
   target_link_libraries(test_cublaslt_algo PRIVATE vgpucublaslt vgpucudart)
@@ -1730,6 +1743,17 @@ if(TARGET vgpucublas)
     DEPENDS "vgpucudart;vgpu_cli"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # Memory-test patterns (walking bits, address in address, checkerboard, moving
+  # inversions, seeded random, block copy, strides) over device memory, with a
+  # stuck cell and armed bit flips they must find.
+  add_test(NAME e2e_memtest_patterns
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_memtest_patterns.sh)
+  set_tests_properties(e2e_memtest_patterns PROPERTIES
+    DEPENDS "vgpucudart;vgpu_cli"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
 
   if(TARGET vgpunvenc)
     add_test(NAME e2e_nvenc
@@ -2354,6 +2378,15 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_pytorch_ops_rtx5090 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
            ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 71 nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # PyTorch's own SASS on a Turing card (sm_75, a T4): the executor runs every kernel, none falls back to PTX.
+  add_test(NAME e2e_pytorch_sass_sm75 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/sass_sm75.py 4 nvidia/t4)
+  set_tests_properties(e2e_pytorch_sass_sm75 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"

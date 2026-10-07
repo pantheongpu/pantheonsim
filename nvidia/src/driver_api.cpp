@@ -160,6 +160,11 @@ struct ShimState {
   std::set<std::pair<uintptr_t, uintptr_t>> peer_access;
   std::unordered_map<uintptr_t, int> attached;   // cuCtxAttach references, by context
   int cache_config = 0;   // cuCtxSetCacheConfig: CU_FUNC_CACHE_PREFER_NONE until set
+  // The device each managed allocation (by base) was made against, which
+  // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL reports.
+  std::map<uintptr_t, int> managed_device;
+  // Allocations (by base) CU_POINTER_ATTRIBUTE_SYNC_MEMOPS has been set on.
+  std::set<uint64_t> sync_memops;
 };
 
 ShimState& state() {
@@ -615,6 +620,7 @@ void bind_managed_globals(ShimState& s, int dev, uint64_t mid) {
     for (int o = 0; o < s.rt->device_count(); ++o)
       s.rt->device(o).memory().map_host(reinterpret_cast<uint64_t>(p), p, n);
     s.managed[reinterpret_cast<uintptr_t>(p)] = n;
+    s.managed_device[reinterpret_cast<uintptr_t>(p)] = dev;
     d.rebind_global(mid, name, reinterpret_cast<uint64_t>(p));
     storage.push_back(reinterpret_cast<uintptr_t>(p));
   }
@@ -629,6 +635,8 @@ void unload_module(ShimState& s, int dev, uint64_t mid) {
   for (uintptr_t p : it->second) {
     for (int o = 0; o < s.rt->device_count(); ++o) s.rt->device(o).memory().unmap_host(p);
     s.managed.erase(p);
+    s.managed_device.erase(p);
+    s.sync_memops.erase(p);
     std::free(reinterpret_cast<void*>(p));
   }
   s.module_managed.erase(it);
@@ -1036,6 +1044,8 @@ VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
     if (auto it = s.managed.find(dptr); it != s.managed.end()) {
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
       std::free(reinterpret_cast<void*>(dptr));
+      s.managed_device.erase(dptr);
+      s.sync_memops.erase(dptr);
       s.managed.erase(it);
       return CUDA_SUCCESS;
     }
@@ -2536,6 +2546,7 @@ VGPU_EXPORT CUresult cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsig
     for (int d = 0; d < s.rt->device_count(); ++d)
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
     s.managed[reinterpret_cast<uintptr_t>(p)] = bytesize;
+    s.managed_device[reinterpret_cast<uintptr_t>(p)] = current_device(s);
     *dptr = reinterpret_cast<CUdeviceptr>(p);
     return CUDA_SUCCESS;
   });
@@ -3745,49 +3756,193 @@ VGPU_EXPORT CUresult cuMemcpyPeerAsync(CUdeviceptr dst, CUcontext dctx, CUdevice
 
 /* ---- pointer queries (expected probes: fail quietly, no stderr) ---- */
 
-VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdeviceptr ptr) {
-  if (!data) return CUDA_ERROR_INVALID_VALUE;
-  bool managed = false;
-  {
-    auto& s = state();
-    std::lock_guard<std::recursive_mutex> g(s.mu);
-    managed = s.initialized && managed_range(s, ptr, 1);
+/* ---- what a pointer is ----
+ * cuPointerGetAttribute, cuPointerGetAttributes and cuPointerSetAttribute. A
+ * pointer here is device memory (a live allocation in one device's window),
+ * managed memory, pinned host memory, or registered host memory; anything else
+ * is not a CUDA pointer, which these answer as the documentation says. */
+
+namespace {
+
+enum class PtrKind { None, Device, Managed, Pinned, Registered };
+struct PtrInfo {
+  PtrKind kind = PtrKind::None;
+  int device = 0;
+  uint64_t base = 0, size = 0;   // the allocation holding the pointer
+};
+
+PtrInfo describe_pointer(ShimState& s, CUdeviceptr ptr) {
+  PtrInfo pi;
+  if (const auto* m = managed_range(s, ptr, 1)) {
+    pi.kind = PtrKind::Managed;
+    pi.base = m->first;
+    pi.size = m->second;
+    const auto d = s.managed_device.find(m->first);
+    pi.device = d == s.managed_device.end() ? 0 : d->second;
+    return pi;
   }
-  if (managed) {
-    // What an RTX 3080 Ti's driver answers for a managed pointer: device
-    // memory, managed, the same address on both sides. The context is
-    // answered as it is for device memory below.
-    switch (attribute) {
-      case 1: *static_cast<void**>(data) = nullptr; return CUDA_SUCCESS;  // CONTEXT
-      case 2: *static_cast<unsigned int*>(data) = 2; return CUDA_SUCCESS;  // MEMORY_TYPE: DEVICE
-      case 3: *static_cast<CUdeviceptr*>(data) = ptr; return CUDA_SUCCESS;  // DEVICE_POINTER
-      case 4: *static_cast<void**>(data) = reinterpret_cast<void*>(ptr); return CUDA_SUCCESS;  // HOST_POINTER
-      case 8: *static_cast<int*>(data) = 1; return CUDA_SUCCESS;  // IS_MANAGED
-      default: return CUDA_ERROR_INVALID_VALUE;
+  void* base = nullptr;
+  if (const auto* r = host_range_at(pinned(s), reinterpret_cast<void*>(ptr), &base)) {
+    pi = {PtrKind::Pinned, r->device, reinterpret_cast<uint64_t>(base), r->size};
+    return pi;
+  }
+  if (const auto* r = host_range_at(registrations(s), reinterpret_cast<void*>(ptr), &base)) {
+    pi = {PtrKind::Registered, r->device, reinterpret_cast<uint64_t>(base), r->size};
+    return pi;
+  }
+  // An address in a device window is a device pointer only while something is
+  // allocated there; a freed one, or one nothing ever was, is not a pointer.
+  if (vgpu::is_device_va(ptr))
+    for (int d = 0; d < s.rt->device_count(); ++d) {
+      vgpu::MemoryManager& mem = s.rt->device(d).memory();
+      uint64_t b = 0, sz = 0;
+      if (mem.owns(ptr) && !mem.heap_contains(ptr) && mem.find_allocation(ptr, &b, &sz)) {
+        pi = {PtrKind::Device, d, b, sz};
+        return pi;
+      }
     }
+  return pi;
+}
+
+// The context a pointer on `device` was allocated in. The allocation does not
+// record one, so this is the current context when it is on that device and the
+// device's primary context otherwise -- which is the one, in a program that
+// uses a single context per device, it was made in. 0 when there is neither.
+uintptr_t pointer_context(ShimState& s, int device) {
+  if (!ctx_stack().empty()) {
+    const auto it = s.contexts.find(ctx_stack().back());
+    if (it != s.contexts.end() && it->second == device) return ctx_stack().back();
   }
-  bool dev = vgpu::is_device_va(ptr);
+  const auto p = s.primary_ctx.find(device);
+  return p == s.primary_ctx.end() ? 0 : p->second;
+}
+
+// Bytes a CUpointer_attribute's value occupies, 0 for one that is unknown.
+size_t pointer_attribute_size(int attribute) {
   switch (attribute) {
-    case 8:  // CU_POINTER_ATTRIBUTE_IS_MANAGED
-      if (!dev) return CUDA_ERROR_INVALID_VALUE;
-      *static_cast<int*>(data) = 0;
+    case 1: return sizeof(void*);              // CONTEXT
+    case 2: return sizeof(unsigned int);       // MEMORY_TYPE
+    case 3: return sizeof(CUdeviceptr);        // DEVICE_POINTER
+    case 4: return sizeof(void*);              // HOST_POINTER
+    case 6: return sizeof(int);                // SYNC_MEMOPS
+    case 7: return sizeof(unsigned long long); // BUFFER_ID
+    case 8: return sizeof(int);                // IS_MANAGED
+    case 9: return sizeof(int);                // DEVICE_ORDINAL
+    case 10: return sizeof(int);               // IS_LEGACY_CUDA_IPC_CAPABLE
+    case 11: return sizeof(void*);             // RANGE_START_ADDR
+    case 12: return sizeof(size_t);            // RANGE_SIZE
+    case 13: return sizeof(int);               // MAPPED
+    case 14: return sizeof(int);               // ALLOWED_HANDLE_TYPES
+    case 17: return sizeof(void*);             // MEMPOOL_HANDLE
+    default: return 0;
+  }
+}
+
+// One attribute of a pointer that is a CUDA pointer. The answers for managed
+// memory that an RTX 3080 Ti's driver gives -- device memory, the same address
+// on both sides -- are kept as they were.
+CUresult pointer_attribute(ShimState& s, int attribute, CUdeviceptr ptr, const PtrInfo& pi, void* data) {
+  const bool managed = pi.kind == PtrKind::Managed;
+  const bool host = pi.kind == PtrKind::Pinned || pi.kind == PtrKind::Registered;
+  switch (attribute) {
+    case 1:   // CONTEXT: the context the memory was allocated or registered in
+      *static_cast<void**>(data) = reinterpret_cast<void*>(pointer_context(s, pi.device));
       return CUDA_SUCCESS;
-    case 1: {  // CU_POINTER_ATTRIBUTE_CONTEXT
-      if (!dev) return CUDA_ERROR_INVALID_VALUE;
-      *static_cast<void**>(data) = nullptr;
+    case 2:   // MEMORY_TYPE: CU_MEMORYTYPE_HOST (1) for host memory, DEVICE (2) otherwise
+      *static_cast<unsigned int*>(data) = host ? 1 : 2;
       return CUDA_SUCCESS;
-    }
-    case 2:  // CU_POINTER_ATTRIBUTE_MEMORY_TYPE
-      if (!dev) return CUDA_ERROR_INVALID_VALUE;
-      *static_cast<unsigned int*>(data) = 2;  // CU_MEMORYTYPE_DEVICE
-      return CUDA_SUCCESS;
-    case 3:  // DEVICE_POINTER
-      if (!dev) return CUDA_ERROR_INVALID_VALUE;
+    case 3:   // DEVICE_POINTER: the address kernels reach it by, which under UVA is its own
       *static_cast<CUdeviceptr*>(data) = ptr;
       return CUDA_SUCCESS;
+    case 4:   // HOST_POINTER: none for device memory, which the host cannot address
+      if (pi.kind == PtrKind::Device) return CUDA_ERROR_INVALID_VALUE;
+      *static_cast<void**>(data) = reinterpret_cast<void*>(ptr);
+      return CUDA_SUCCESS;
+    case 6:   // SYNC_MEMOPS
+      *static_cast<int*>(data) = s.sync_memops.count(pi.base) ? 1 : 0;
+      return CUDA_SUCCESS;
+    case 7:   // BUFFER_ID: unique over the process and never reused. A device allocation's
+              // base is both, as the address space of a device is handed out once.
+      if (pi.kind != PtrKind::Device) {
+        report("cuPointerGetAttribute", "CU_POINTER_ATTRIBUTE_BUFFER_ID is implemented for device "
+                                        "memory only");
+        return CUDA_ERROR_INVALID_VALUE;
+      }
+      *static_cast<unsigned long long*>(data) = pi.base;
+      return CUDA_SUCCESS;
+    case 8:   // IS_MANAGED
+      *static_cast<int*>(data) = managed ? 1 : 0;
+      return CUDA_SUCCESS;
+    case 9:   // DEVICE_ORDINAL: the device the memory was allocated or registered against
+      *static_cast<int*>(data) = pi.device;
+      return CUDA_SUCCESS;
+    case 11:  // RANGE_START_ADDR
+      *static_cast<void**>(data) = reinterpret_cast<void*>(pi.base);
+      return CUDA_SUCCESS;
+    case 12:  // RANGE_SIZE
+      *static_cast<size_t*>(data) = pi.size;
+      return CUDA_SUCCESS;
+    case 13:  // MAPPED: in a valid address range with something behind it
+      *static_cast<int*>(data) = 1;
+      return CUDA_SUCCESS;
     default:
+      report("cuPointerGetAttribute", "attribute " + std::to_string(attribute) +
+                                          " is not implemented (P2P tokens, legacy IPC capability, "
+                                          "allowed handle types and pool handle are not modelled)");
       return CUDA_ERROR_INVALID_VALUE;
   }
+}
+
+}  // namespace
+
+VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdeviceptr ptr) {
+  if (!data) return CUDA_ERROR_INVALID_VALUE;
+  return api("cuPointerGetAttribute", true, false, [&](ShimState& s) {
+    const PtrInfo pi = describe_pointer(s, ptr);
+    // Not a pointer CUDA knows: INVALID_VALUE, as documented.
+    if (pi.kind == PtrKind::None) return CUDA_ERROR_INVALID_VALUE;
+    return pointer_attribute(s, attribute, ptr, pi, data);
+  });
+}
+
+// Several attributes at once. Unlike the single query this is not an error for
+// a pointer CUDA does not know: each value is set to its NULL default (zero
+// bytes) and the call succeeds, which is how a caller asks "is this one of
+// yours?" of an arbitrary pointer.
+VGPU_EXPORT CUresult cuPointerGetAttributes(unsigned int numAttributes, int* attributes, void** data,
+                                            CUdeviceptr ptr) {
+  if (numAttributes == 0) return CUDA_SUCCESS;
+  if (!attributes || !data) return CUDA_ERROR_INVALID_VALUE;
+  return api("cuPointerGetAttributes", true, false, [&](ShimState& s) {
+    const PtrInfo pi = describe_pointer(s, ptr);
+    for (unsigned i = 0; i < numAttributes; ++i) {
+      const size_t size = pointer_attribute_size(attributes[i]);
+      if (!data[i] || size == 0) return CUDA_ERROR_INVALID_VALUE;
+      if (pi.kind == PtrKind::None) {
+        std::memset(data[i], 0, size);
+        continue;
+      }
+      if (const CUresult r = pointer_attribute(s, attributes[i], ptr, pi, data[i]); r != CUDA_SUCCESS) return r;
+    }
+    return CUDA_SUCCESS;
+  });
+}
+
+// The one attribute that can be set is SYNC_MEMOPS, a boolean. Every operation
+// here is already synchronous, so setting it changes nothing a program can
+// see but what a query of it reads back.
+VGPU_EXPORT CUresult cuPointerSetAttribute(const void* value, int attribute, CUdeviceptr ptr) {
+  if (!value) return CUDA_ERROR_INVALID_VALUE;
+  return api("cuPointerSetAttribute", true, false, [&](ShimState& s) {
+    if (attribute != 6) return CUDA_ERROR_INVALID_VALUE;   // CU_POINTER_ATTRIBUTE_SYNC_MEMOPS
+    const PtrInfo pi = describe_pointer(s, ptr);
+    if (pi.kind == PtrKind::None) return CUDA_ERROR_INVALID_VALUE;
+    const unsigned int v = *static_cast<const unsigned int*>(value);
+    if (v > 1) return CUDA_ERROR_INVALID_VALUE;   // a boolean: set (1) or unset (0)
+    if (v) s.sync_memops.insert(pi.base);
+    else s.sync_memops.erase(pi.base);
+    return CUDA_SUCCESS;
+  });
 }
 
 /* ---- occupancy ----
@@ -4303,7 +4458,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuModuleGetGlobal_v2), VGPU_PROC(cuCtxSetCacheConfig), VGPU_PROC(cuCtxGetCacheConfig),
     VGPU_PROC(cuCtxSetSharedMemConfig), VGPU_PROC(cuCtxGetSharedMemConfig),
     VGPU_PROC(cuFuncSetSharedMemConfig), VGPU_PROC(cuStreamAddCallback),
-    VGPU_PROC(cuPointerGetAttribute),
+    VGPU_PROC(cuPointerGetAttribute), VGPU_PROC(cuPointerGetAttributes), VGPU_PROC(cuPointerSetAttribute),
     VGPU_PROC(cuModuleLoadData), VGPU_PROC(cuModuleLoadDataEx), VGPU_PROC(cuModuleUnload),
     VGPU_PROC(cuModuleGetFunction), VGPU_PROC(cuModuleGetLoadingMode),
     VGPU_PROC(cuLibraryLoadData), VGPU_PROC(cuLibraryUnload), VGPU_PROC(cuLibraryGetKernel),
