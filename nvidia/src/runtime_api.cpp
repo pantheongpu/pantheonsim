@@ -5312,7 +5312,10 @@ cudaError_t user_object_release(cudaUserObject_t obj, unsigned count) {
       g_user_objects.erase(it);
     }
   }
-  if (fn) fn(ptr);
+  if (fn) {
+    fn(ptr);
+    delete reinterpret_cast<char*>(obj);   // the handle cudaUserObjectCreate made; nothing refers to it now
+  }
   return cudaSuccess;
 }
 void user_objects_release_all(std::map<cudaUserObject_t, unsigned> held) {

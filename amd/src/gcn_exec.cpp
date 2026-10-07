@@ -2733,10 +2733,10 @@ struct Machine {
       });
     } else if (op == "v_mul_i32_i24_e32"_op) {
       each([&](uint32_t lane) {
-        // The low 24 bits of each source, as signed numbers.
+        // The low 24 bits of each source, as signed numbers; the product wraps, so it is formed unsigned.
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
         write_lane(w, in.dst[0], lane,
-                   static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane))));
+                   static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane))) * static_cast<uint32_t>(i24(lane_src(w, in.src[1], lane))));
       });
     } else if (op == "v_mul_lo_u16_e32"_op) {
       each([&](uint32_t lane) {
