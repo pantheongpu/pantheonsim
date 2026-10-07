@@ -285,4 +285,32 @@ VTEST(simple_kernel_matches_hardware_register_count) {
   VCHECK_EQ(u.regs_per_thread, 8u);
 }
 
+VTEST(values_used_only_after_an_indirect_branch_are_live_across_it) {
+  // Every entry of a brx.idx list is a successor, so what the cases read is
+  // live up to the branch. Without those edges four registers that only the
+  // cases use would look dead, and the kernel's footprint far too small.
+  auto u = usage_of(R"(
+    .reg .b32 %r<12>;
+    mov.u32 %r1, 1;
+    mov.u32 %r2, 2;
+    mov.u32 %r3, 3;
+    mov.u32 %r4, 4;
+    mov.u32 %r9, %tid.x;
+  tbl:
+    .branchtargets A, B;
+    brx.idx %r9, tbl;
+  A:
+    add.s32 %r5, %r1, %r2;
+    add.s32 %r6, %r3, %r4;
+    add.s32 %r7, %r5, %r6;
+    ret;
+  B:
+    add.s32 %r5, %r1, %r3;
+    add.s32 %r6, %r2, %r4;
+    add.s32 %r7, %r5, %r6;
+    ret;
+  )");
+  VCHECK(u.peak_live >= 5);   // r1..r4 and the index, at the branch
+}
+
 VTEST_MAIN
