@@ -541,16 +541,7 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
   devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
-- The driver's stream-ordered memory pools: cuMemPoolCreate/Destroy/TrimTo,
-  Get/SetAttribute (used, reserved and their high-water marks, the release
-  threshold that makes a pool keep and reuse freed memory), Get/SetAccess,
-  cuDeviceGet/SetMemPool, cuDeviceGetDefaultMemPool, cuMemAllocFromPoolAsync,
-  and cuMemAllocAsync/cuMemFreeAsync through the device's current pool;
-  CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED is 1. Exporting a pool or a
-  pointer to another process, and pools on the host or a NUMA node, are
-  refused by name. A pool made through the driver and one made through the
-  runtime are different objects (each library keeps its own); the two
-  default pools do not share accounting.
+- Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
 
 ## Hardware characterization
 
