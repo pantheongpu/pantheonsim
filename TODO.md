@@ -541,7 +541,14 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - CUDA Graphs: real stream capture -> record -> replay.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
   devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
-- Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
+- The driver's pointer queries: cuPointerGetAttribute answers for device,
+  managed, pinned and registered memory (memory type, context, device
+  ordinal, range start and size, buffer id for device memory, SYNC_MEMOPS,
+  mapped), cuPointerGetAttributes gives a pointer CUDA does not know NULL
+  defaults rather than an error (what CUDA-aware MPI and UCX probe with), and
+  cuPointerSetAttribute sets SYNC_MEMOPS. Refused by name: the P2P tokens,
+  legacy-IPC capability, allowed handle types and pool handle, and buffer ids
+  for host memory.
 
 ## Hardware characterization
 
