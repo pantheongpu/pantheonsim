@@ -460,6 +460,7 @@ against ROCm's `hsa.h` where that is installed, and both builds run
 (ctest `amd_hsa`). A grid need not be a whole number of work-groups, as HSA
 allows: the last group in a dimension runs short, numbered across its own
 shape, and the kernel's `hidden_remainder` arguments say by how much.
+The HSA 1.1 queries a tool makes of an agent are answered too: `hsa_agent_iterate_caches` and `hsa_cache_get_info` (the levels, L1 to L3 where the chip has one, with the sizes the deprecated `HSA_AGENT_INFO_CACHE_SIZE` gives; the CPU agent reports none), `hsa_isa_iterate_wavefronts` and `hsa_wavefront_get_info`, `hsa_isa_compatible` (the same full target name only), and signal groups (`hsa_signal_group_create`, `_destroy` and both `_wait_any` forms). `tests/hsa/hsa_caches.c` checks them, built against this header and against ROCm's (ctest `amd_hsa`). Not answered: `hsa_amd_signal_wait_any` (the header does not say what a timeout returns), the deprecated code-object and finalizer calls, `hsa_amd_queue_intercept_*`, `hsa_amd_register_deallocation_callback`, `hsa_amd_memory_migrate` and `hsa_amd_spm_*`.
 
 ROCm's own tools and HIP runtime run on it unmodified:
 
