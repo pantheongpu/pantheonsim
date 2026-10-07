@@ -369,8 +369,8 @@ std::vector<Node> metric_nodes(const vgpu::telemetry::DeviceSample& d, const vgp
   if (on("pcie"))
     out.push_back(obj("pcie", {num("width", d.pcie_width), measured("speed", gt_per_s(d.pcie_gen), "GT/s"),
                                str("bandwidth", "N/A"), num("replay_count", c.pcie[0]),
-                               num("l0_to_recovery_count", 0), num("replay_roll_over_count", 0),
-                               num("nak_sent_count", 0), num("nak_received_count", 0),
+                               num("l0_to_recovery_count", c.pcie[2]), num("replay_roll_over_count", c.pcie[1]),
+                               num("nak_sent_count", c.pcie[6]), num("nak_received_count", c.pcie[4]),
                                str("current_bandwidth_sent", "N/A"), str("current_bandwidth_received", "N/A"),
                                str("max_packet_size", "N/A")}));
   if (on("ecc")) out.push_back(obj("ecc", ecc_totals(d, c)));
@@ -740,12 +740,18 @@ int cmd_amd_smi(const std::vector<std::string>& args) {
     } else if (cmd == "bad-pages") {
       vgpu::ras::Counters c{};
       try {
-        c = vgpu::ras::read(d.uuid).since_load;
+        c = vgpu::ras::read(d.uuid).lifetime;   // retired pages are aggregate state
       } catch (const std::exception&) {
       }
-      const uint64_t retired = c.retired_sbe + c.retired_dbe;
-      kids = {retired ? num("retired", retired) : str("retired", "No bad pages found."),
-              c.retired_pending ? num("pending", c.retired_pending) : str("pending", "No bad pages found."),
+      // As the libraries list them: a remapped row counts as a page, and a
+      // pending retirement is the newest of them.
+      const uint64_t total = c.retired_sbe + c.retired_dbe + c.rows_correctable + c.rows_uncorrectable;
+      const uint64_t pending = (c.retired_pending || c.rows_pending) && total ? 1 : 0;
+      const uint64_t retired = total - pending;
+      // No ECC, no bad-page record: amd-smi prints N/A, as the library refuses.
+      if (!d.ecc_enabled) kids = {str("retired", "N/A"), str("pending", "N/A"), str("un_res", "N/A")};
+      else kids = {retired ? num("retired", retired) : str("retired", "No bad pages found."),
+              pending ? num("pending", pending) : str("pending", "No bad pages found."),
               str("un_res", "No bad pages found.")};
     } else if (cmd == "list") {
       std::string uuid = d.uuid;

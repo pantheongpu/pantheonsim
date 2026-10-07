@@ -1099,19 +1099,22 @@ add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# ROCm SMI and AMD SMI each carry the simulator's core, by design; a test that loads both is an ODR violation
+# to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
+set(VGPU_SAN_ODR_OFF "ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 # ROCm SMI's answers to RCCL, from RCCL's side, on Instinct and Radeon GPUs.
 add_executable(test_amd_rocm_smi amd/tests/unit/test_rocm_smi.cpp)
-target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuhip)
+target_link_libraries(test_amd_rocm_smi PRIVATE vgpursmi vgpuamdsmi vgpuhip)
 target_include_directories(test_amd_rocm_smi PRIVATE tests/framework)
 add_test(NAME test_amd_rocm_smi COMMAND test_amd_rocm_smi)
 # Each with a machine of its own: the library reads the machine's telemetry,
 # which another process's simulated GPUs would join.
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-rocm-smi" "${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
 set_tests_properties(test_amd_rocm_smi PROPERTIES ENVIRONMENT
-  "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi")
+  "VGPU_GPU=amd/mi300x;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi;${VGPU_SAN_ODR_OFF}")
 add_test(NAME test_amd_rocm_smi_radeon COMMAND test_amd_rocm_smi)
 set_tests_properties(test_amd_rocm_smi_radeon PROPERTIES ENVIRONMENT
-  "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon")
+  "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-rocm-smi-radeon;${VGPU_SAN_ODR_OFF}")
 add_executable(test_amd_amd_smi amd/tests/unit/test_amd_smi.cpp)
 target_link_libraries(test_amd_amd_smi PRIVATE vgpuamdsmi vgpu)
 target_include_directories(test_amd_amd_smi PRIVATE tests/framework amd/include)

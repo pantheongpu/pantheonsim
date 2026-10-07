@@ -8,7 +8,7 @@
 // telemetry, its RAS counters and registers), so ROCm's rocm-smi over this
 // library and VirtualGPU's rocm-smi agree; the device list and bus addresses
 // are the HIP runtime's, so HIP and ROCm SMI agree too. What a simulated GPU
-// has no value for -- a VBIOS, firmware, serial number, energy counter, the
+// has no value for -- a VBIOS, firmware, serial number, the
 // gpu_metrics table -- is RSMI_STATUS_NOT_SUPPORTED, as on a card without it,
 // and setting anything is refused the same way: nothing here is a knob.
 //
@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "vgpu/amd_chip.hpp"
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/machine.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -399,10 +400,20 @@ RSMI_API int rsmi_dev_power_cap_range_get(uint32_t d, uint32_t, uint64_t* max, u
   *min = 0;
   return kSuccess;
 }
-// No energy is integrated over time: the power model has no history.
-RSMI_API int rsmi_dev_energy_count_get(uint32_t d, uint64_t*, float*, uint64_t*) {
+// The energy accumulator: `power` is a count of `counter_resolution` micro
+// joules (15.3, as the library's kEnergyCounterResolution), so the energy is
+// their product in uJ; `timestamp` is the metrics table's system_clock_counter
+// (ns). Only Instinct GPUs have one (a Radeon's driver has no energy file), and
+// the value is amdsmi_get_energy_count's: one accumulator serves both libraries.
+RSMI_API int rsmi_dev_energy_count_get(uint32_t d, uint64_t* power, float* counter_resolution, uint64_t* timestamp) {
+  if (!power || !timestamp) return kInvalidArgs;
   DEVICE(d, s);
-  return kNotSupported;
+  if (s.architecture[0] != 'c') return kNotSupported;
+  const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
+  *power = e.ticks;
+  *timestamp = e.timestamp_ns;
+  if (counter_resolution) *counter_resolution = vgpu::amd::kEnergyTickUj;
+  return kSuccess;
 }
 
 RSMI_API int rsmi_dev_busy_percent_get(uint32_t d, uint32_t* pct) {
@@ -568,14 +579,20 @@ RSMI_API int rsmi_dev_ecc_count_get(uint32_t d, uint64_t block, ErrorCount* ec) 
 RSMI_API int rsmi_dev_memory_reserved_pages_get(uint32_t d, uint32_t* num, RetiredPage* records) {
   if (!num) return kInvalidArgs;
   DEVICE(d, s);
+  // A card without ECC (the Radeon profiles) has no record of bad pages.
+  if (!s.ecc_enabled) return kNotSupported;
   vgpu::ras::Counters c{};
   try {
     c = vgpu::ras::read(s.uuid).lifetime;
   } catch (const std::exception&) {
   }
-  const uint32_t pages = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe);
+  // As amdsmi_get_gpu_bad_page_info (amd_smi.cpp) lists them: a remapped row
+  // counts as a page, reserved (status 0) but for the newest while a
+  // retirement is pending (status 1).
+  const uint32_t pages = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe + c.rows_correctable + c.rows_uncorrectable);
+  const uint32_t reserved = pages - ((c.retired_pending || c.rows_pending) && pages ? 1 : 0);
   if (records)
-    for (uint32_t k = 0; k < std::min(*num, pages); ++k) records[k] = {uint64_t{k} << 12, 4096, 1};
+    for (uint32_t k = 0; k < std::min(*num, pages); ++k) records[k] = {uint64_t{k} << 12, 4096, k < reserved ? 0 : 1};
   const bool fits = !records || *num >= pages;
   *num = records ? std::min(*num, pages) : pages;
   return fits ? kSuccess : kInsufficientSize;

@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <string>
 
@@ -39,6 +41,7 @@ int rsmi_dev_compute_partition_get(uint32_t, char*, uint32_t);
 int rsmi_dev_memory_partition_get(uint32_t, char*, uint32_t);
 int rsmi_dev_fan_speed_get(uint32_t, uint32_t, int64_t*);
 int rsmi_dev_vbios_version_get(uint32_t, char*, uint32_t);
+int rsmi_dev_memory_reserved_pages_get(uint32_t, uint32_t*, void*);
 int rsmi_dev_perf_level_set(uint32_t, int);
 int rsmi_dev_gpu_metrics_info_get(uint32_t, void*);
 struct Frequencies {
@@ -47,6 +50,11 @@ struct Frequencies {
   uint64_t frequency[33];
 };
 int rsmi_dev_gpu_clk_freq_get(uint32_t, int, Frequencies*);
+int rsmi_dev_energy_count_get(uint32_t, uint64_t*, float*, uint64_t*);
+int amdsmi_init(uint64_t);
+int amdsmi_get_socket_handles(uint32_t*, void**);
+int amdsmi_get_processor_handles(void*, uint32_t*, void**);
+int amdsmi_get_energy_count(void*, uint64_t*, float*, uint64_t*);
 }
 
 namespace {
@@ -179,10 +187,47 @@ VTEST(ecc_and_partitions_as_the_card_has_them) {
   VCHECK_EQ(rsmi_dev_ecc_enabled_get(0, &mask), kSuccess);
   VCHECK(rx ? mask == 0 : (mask & 1) != 0);   // the UMC block's bit
   char part[16] = {};
+  // Retired pages are recorded only where there is ECC (the Radeon profiles have none).
+  uint32_t pages = 0;
+  VCHECK_EQ(rsmi_dev_memory_reserved_pages_get(0, &pages, nullptr), rx ? kNotSupported : kSuccess);
   VCHECK_EQ(rsmi_dev_compute_partition_get(0, part, sizeof part), rx ? kNotSupported : kSuccess);
   if (!rx) VCHECK_EQ(std::string(part), std::string("SPX"));
   VCHECK_EQ(rsmi_dev_memory_partition_get(0, part, sizeof part), rx ? kNotSupported : kSuccess);
   if (!rx) VCHECK_EQ(std::string(part), std::string("NPS1"));
+}
+
+// The energy accumulator: Instinct only, in ticks of 15.3 uJ, one accumulator
+// behind this library and AMD SMI's, so the second reading of either follows
+// the first of the other.
+VTEST(energy_is_instinct_only_and_one_counter_serves_both_libraries) {
+  rsmi_init(0);
+  amdsmi_init(2);
+  uint32_t ns = 8;
+  void* sockets[8];
+  VCHECK_EQ(amdsmi_get_socket_handles(&ns, sockets), kSuccess);
+  uint64_t e0 = 0, ts0 = 0, e1 = 0, ts1 = 0, e2 = 0, ts2 = 0;
+  float res = 0;
+  if (radeon()) {
+    VCHECK_EQ(rsmi_dev_energy_count_get(0, &e0, &res, &ts0), kNotSupported);
+    return;
+  }
+  VCHECK_EQ(rsmi_dev_energy_count_get(0, &e0, &res, &ts0), kSuccess);
+  VCHECK(res > 15.0f && res < 15.5f);
+  VCHECK(e0 > 0 && ts0 > 0);
+  uint32_t np = 1;
+  void* gpu = nullptr;
+  VCHECK_EQ(amdsmi_get_processor_handles(sockets[0], &np, &gpu), kSuccess);
+  usleep(20000);
+  VCHECK_EQ(amdsmi_get_energy_count(gpu, &e1, &res, &ts1), kSuccess);
+  VCHECK(e1 > e0 && ts1 > ts0);
+  usleep(20000);
+  VCHECK_EQ(rsmi_dev_energy_count_get(0, &e2, &res, &ts2), kSuccess);
+  VCHECK(e2 > e1 && ts2 > ts1);
+  // 20 ms of at most a few kW is a few tens of joules: the ticks that follow
+  // are a few million, not a counter restarted from its offset.
+  VCHECK(e2 - e0 < 100 * 1000000 / 15);
+  VCHECK_EQ(rsmi_dev_energy_count_get(0, nullptr, &res, &ts0), 1);   // invalid arguments
+  VCHECK_EQ(rsmi_dev_energy_count_get(99, &e0, &res, &ts0), kOutOfBounds);
 }
 
 VTEST(what_is_not_modelled_is_refused_as_a_card_refuses_it) {
