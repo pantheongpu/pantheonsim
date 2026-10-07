@@ -1519,6 +1519,18 @@ if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_test(NAME test_driver_launch_ex COMMAND test_driver_launch_ex)
   set_tests_properties(test_driver_launch_ex PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1")
 endif()
+# Runtime entry points the toolkit exports and this one lacked (cudaMemset3D,
+# cudaChooseDevice, cudaDeviceGetByPCIBusId, the 2D array copies, the texture
+# descriptor getters, cudaFuncGetName and cudaFuncGetParamInfo, ...).
+if(TARGET vgpucudart)
+  add_executable(test_runtime_exports nvidia/tests/unit/test_runtime_exports.cpp nvidia/src/fatbin.cpp)
+  target_link_libraries(test_runtime_exports PRIVATE vgpucudart ${CMAKE_DL_LIBS})
+  target_include_directories(test_runtime_exports PRIVATE tests/framework nvidia/src include ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_exports COMMAND test_runtime_exports)
+  # The test carries its own copy of the fatbin writer the runtime also carries.
+  set_tests_properties(test_runtime_exports PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
 # cuPointerGetAttribute / cuPointerGetAttributes / cuPointerSetAttribute.
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_pointer_attrs nvidia/tests/unit/test_driver_pointer_attrs.cpp)
