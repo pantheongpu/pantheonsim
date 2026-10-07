@@ -525,11 +525,20 @@ uint16_t to_bf16(double d) {
 size_t elem_bytes(int t) {
   switch (t) {
     case CUDA_R_8F_E4M3: case CUDA_R_8F_E5M2: return 1;
+    case CUDA_R_8I: return 1;
     case CUDA_R_16F: case CUDA_R_16BF: return 2;
-    case CUDA_R_32F: return 4;
+    case CUDA_R_32F: case CUDA_R_32I: return 4;
     case CUDA_R_64F: return 8;
     default: return 0;
   }
+}
+// Integer matrices: int8 operands accumulate exactly (in a double: k * 127^2 stays far below 2^53) into int32,
+// as CUBLAS_COMPUTE_32I does.
+bool is_int(int t) { return t == CUDA_R_8I || t == CUDA_R_32I; }
+int32_t to_i32(double v) {   // round to nearest even, saturating
+  if (std::isnan(v)) return 0;
+  const double r = std::nearbyint(v);
+  return r >= 2147483647.0 ? INT32_MAX : r <= -2147483648.0 ? INT32_MIN : (int32_t)r;
 }
 bool is_fp8(int t) { return t == CUDA_R_8F_E4M3 || t == CUDA_R_8F_E5M2; }
 
@@ -547,6 +556,8 @@ std::vector<double> read_as_double(const void* dev, size_t n, int t) {
       case CUDA_R_16F: { uint16_t h; std::memcpy(&h, p, 2); out[i] = from_half(h); break; }
       case CUDA_R_16BF: { uint16_t h; std::memcpy(&h, p, 2); out[i] = from_bf16(h); break; }
       case CUDA_R_32F: { float f; std::memcpy(&f, p, 4); out[i] = f; break; }
+      case CUDA_R_8I: out[i] = (int8_t)*p; break;
+      case CUDA_R_32I: { int32_t x; std::memcpy(&x, p, 4); out[i] = x; break; }
       default: std::memcpy(&out[i], p, 8); break;
     }
   }
@@ -559,6 +570,8 @@ void encode(double v, int t, uint8_t* p) {
     case CUDA_R_16F: { const uint16_t h = to_half(v); std::memcpy(p, &h, 2); break; }
     case CUDA_R_16BF: { const uint16_t h = to_bf16(v); std::memcpy(p, &h, 2); break; }
     case CUDA_R_32F: { const float f = (float)v; std::memcpy(p, &f, 4); break; }
+    case CUDA_R_8I: { const int32_t x = to_i32(v); *p = (uint8_t)(int8_t)(x > 127 ? 127 : x < -128 ? -128 : x); break; }
+    case CUDA_R_32I: { const int32_t x = to_i32(v); std::memcpy(p, &x, 4); break; }
     default: std::memcpy(p, &v, 8); break;
   }
 }
@@ -581,6 +594,7 @@ double read_scalar(const void* p, int t, bool device) {
     case CUDA_R_64F: return *static_cast<const double*>(p);
     case CUDA_R_16F: return from_half(*static_cast<const uint16_t*>(p));
     case CUDA_R_16BF: return from_bf16(*static_cast<const uint16_t*>(p));
+    case CUDA_R_32I: return *static_cast<const int32_t*>(p);
     default: return *static_cast<const float*>(p);
   }
 }
@@ -634,6 +648,8 @@ struct Elems {
       case CUDA_R_16F: { uint16_t h; std::memcpy(&h, p, 2); return from_half(h); }
       case CUDA_R_16BF: { uint16_t h; std::memcpy(&h, p, 2); return from_bf16(h); }
       case CUDA_R_32F: { float f; std::memcpy(&f, p, 4); return f; }
+      case CUDA_R_8I: return (int8_t)*p;
+      case CUDA_R_32I: { int32_t x; std::memcpy(&x, p, 4); return x; }
       default: { double d; std::memcpy(&d, p, 8); return d; }
     }
   }
@@ -831,6 +847,14 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
                         const MatrixLayout& ld, bool at_matmul) {
   if (!known_type(la.type) || !known_type(lb.type) || !known_type(lc.type) || !known_type(ld.type))
     return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Integer matmul (PyTorch's torch._int_mm): int8 x int8 into int32 with CUBLAS_COMPUTE_32I, and nothing else
+  // mixes integer and floating types.
+  const bool any_int = is_int(la.type) || is_int(lb.type) || is_int(lc.type) || is_int(ld.type);
+  if (any_int || md.compute == CUBLAS_COMPUTE_32I) {
+    if (!(la.type == CUDA_R_8I && lb.type == CUDA_R_8I && lc.type == CUDA_R_32I && ld.type == CUDA_R_32I &&
+          md.compute == CUBLAS_COMPUTE_32I && md.scale == CUDA_R_32I))
+      return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
   const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
   const int64_t m = (int64_t)ld.rows, n = (int64_t)ld.cols, k = ta ? (int64_t)la.rows : (int64_t)la.cols;
   if ((ta ? (int64_t)la.cols : (int64_t)la.rows) != m || (tb ? (int64_t)lb.cols : (int64_t)lb.rows) != k ||

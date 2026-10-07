@@ -3,9 +3,9 @@
 //
 // Creating the devices publishes telemetry; this command then simply holds
 // them until interrupted. It is what you run to exercise nvidia-smi / rocm-smi
-// / rocm_agent_enumerator / lspci paths, and it is the only way to present AMD
-// devices today: AMD *discovery* works, AMD kernel *execution* does not (see
-// TODO.md), so nothing else keeps an AMD device alive.
+// / rocm_agent_enumerator / lspci paths, and it is how to present AMD
+// devices to tools that run outside a program of their own (rocm-smi, amd-smi,
+// rocminfo): nothing else keeps an AMD device alive between commands.
 //
 // Optionally simulates load so the synthetic power/thermal columns move.
 #include <atomic>

@@ -7,6 +7,15 @@
 #   rodinia       Rodinia apps, output byte for byte     rodinia.txt
 #   polybench     PolyBench/GPU, CPU-checked counts      polybench.txt
 #
+# Two open-source GPU memory and burn-in testers are run the same way, but there
+# is no card's output to compare with: each program must pass by its own
+# account (exit status, its own marker line, no error reported), and
+# cuda-memtest is also run against a stuck memory cell armed with `vgpu fault`,
+# which it must find:
+#
+#   cuda-memtest  cuda_memtest (ComputationalRadiationPhysics)   cuda-memtest.txt
+#   gpu-burn      gpu-burn (wilicc)                              gpu-burn.txt
+#
 #   suites.sh fetch <suite> <dir>    the suite's source at its pinned commit
 #   suites.sh build <suite> <dir>    the listed programs, for sm_86, -cudart shared
 #   suites.sh run   <suite> <dir> <shim-dir> <report-dir>
@@ -36,11 +45,15 @@ only="${SUITE_ONLY:-.}"
 declare -A repo=([cuda-samples]=https://github.com/NVIDIA/cuda-samples
                  [hecbench]=https://github.com/zjin-lcf/HeCBench
                  [rodinia]=https://github.com/yuhc/gpu-rodinia
-                 [polybench]=https://github.com/sgrauerg/polybenchGpu)
+                 [polybench]=https://github.com/sgrauerg/polybenchGpu
+                 [cuda-memtest]=https://github.com/ComputationalRadiationPhysics/cuda_memtest
+                 [gpu-burn]=https://github.com/wilicc/gpu-burn)
 declare -A commit=([cuda-samples]=3f1c50965017932fc81e6d94a3fc9e04c105b312   # tag v13.0
                    [hecbench]=7d2d3c567be522a2104065165de0a4a233a6ea1a
                    [rodinia]=9c10d3ea16ddba2ba057cc3951a9efc4c2cc18a4
-                   [polybench]=5584aaa7d0be810ff5eb0b61c49fb64ecc81ba4c)
+                   [polybench]=5584aaa7d0be810ff5eb0b61c49fb64ecc81ba4c
+                   [cuda-memtest]=e94e1ee54e0689c9f154a8a08202554452552ec6   # dev, version 1.2.3
+                   [gpu-burn]=0d19c94dcb2e9b6858b7586a4c327674cd67113b)      # master
 [[ -n "${repo[$suite]:-}" ]] || { echo "unknown suite $suite"; exit 2; }
 
 # The list's entries, comments and blank lines dropped, narrowed by SUITE_ONLY.
@@ -106,6 +119,20 @@ build() {
         (cd "$src" && nvcc -arch=sm_86 -cudart shared -w -include "$compat" -I../util $flags -o "$app" > "$app.build.log" 2>&1) ||
           { echo "$app: build failed"; tail -5 "$src/$app.build.log"; }
       done ;;
+    cuda-memtest)
+      # Built as its README says (CMake, CUDA language), for the card's sm_86
+      # and with the shared cudart, so the simulator's is the one it loads.
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
+        -DCMAKE_CUDA_COMPILER="$(command -v nvcc)" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+        > build-configure.log 2>&1 || { tail -30 build-configure.log; exit 1; }
+      cmake --build build -j"$jobs" > build.log 2>&1 || { tail -20 build.log; exit 1; } ;;
+    gpu-burn)
+      # Its Makefile, with the toolkit of the nvcc on PATH and the card's sm_86;
+      # new dtags, so LD_LIBRARY_PATH (the shim) is searched before the rpath
+      # the Makefile adds for that toolkit's libraries.
+      root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+      make -j"$jobs" CUDAPATH="$root" COMPUTE=86 LDFLAGS="-Wl,--enable-new-dtags" > build.log 2>&1 ||
+        { echo "gpu_burn: build failed"; tail -10 build.log; exit 1; } ;;
     polybench)
       entries | while IFS='|' read -r name src card; do
         (cd "CUDA/$src" && nvcc -O3 -arch=sm_86 -cudart shared -w -DMINI_DATASET -include "$compat" ./*.cu -o "$name" > build.log 2>&1) ||
@@ -222,10 +249,53 @@ run() {
         elif [[ "$got" == "$card" ]]; then result "$name" ok "$secs" "non-matching outputs: $got"
         else result "$name" FAIL "$secs" "non-matching outputs: ${got:-none printed} (the card's: $card)"; fi
       done < <(entries) ;;
+    cuda-memtest)
+      # name | arguments | fault | the line it prints when its tests are done.
+      # fault: "clean", or "stuck:<offset>": a memory cell stuck at 1, armed
+      # with `vgpu fault`, that cuda_memtest must report (with --exit_on_error
+      # it then exits non-zero).
+      verdict="as expected"
+      vgpu="$shim/../vgpu"
+      while IFS='|' read -r name args fault marker; do
+        log="$report/logs/$name.log"
+        exe=build/cuda_memtest
+        [[ -x $exe ]] || { result "$name" FAIL 0 "did not build"; continue; }
+        if [[ $fault == stuck:* ]]; then
+          st="$report/state-$name"; rm -rf "$st"; mkdir -p "$st/session"
+          export VGPU_STATE_DIR="$st/state" VGPU_SESSION="$st/session" VGPU_TELEMETRY_PATH="$st/run" VGPU_DEVICE_COUNT=1
+          VGPU_GPU="$gpu" "$vgpu" fault stuck --offset "${fault#stuck:}" --bit 3 --value 1 > /dev/null
+        fi
+        # shellcheck disable=SC2086
+        run_one "$name" . "$log" "./$exe" $args
+        unset VGPU_STATE_DIR VGPU_SESSION VGPU_TELEMETRY_PATH VGPU_DEVICE_COUNT
+        if [[ $fault == stuck:* ]]; then
+          if [[ $rc == 0 ]]; then result "$name" FAIL "$secs" "exit 0 with a stuck cell armed"
+          elif grep -q 'errors found in block' "$log"; then result "$name" ok "$secs" "found the stuck cell"
+          else result "$name" FAIL "$secs" "exit $rc, no error reported"; fi
+        elif [[ $rc != 0 ]]; then result "$name" FAIL "$secs" "exit $rc"
+        elif grep -q 'ERROR' "$log"; then result "$name" FAIL "$secs" "reported errors"
+        elif ! grep -qF -- "$marker" "$log"; then result "$name" FAIL "$secs" "no \"$marker\""
+        else result "$name" ok "$secs" ""; fi
+      done < <(entries) ;;
+    gpu-burn)
+      # name | arguments | the line it prints when every GPU passed.
+      verdict="as expected"
+      # It runs nvidia-smi for temperatures: the simulator's, beside the shim.
+      export PATH="$shim/../bin:$PATH"
+      while IFS='|' read -r name args marker; do
+        log="$report/logs/$name.log"
+        [[ -x ./gpu_burn ]] || { result "$name" FAIL 0 "did not build"; continue; }
+        # shellcheck disable=SC2086
+        run_one "$name" . "$log" ./gpu_burn $args
+        if [[ $rc != 0 ]]; then result "$name" FAIL "$secs" "exit $rc"
+        elif grep -qE 'FAULTY|errors' "$log"; then result "$name" FAIL "$secs" "reported errors"
+        elif ! grep -qF -- "$marker" "$log"; then result "$name" FAIL "$secs" "no \"$marker\""
+        else result "$name" ok "$secs" ""; fi
+      done < <(entries) ;;
   esac
   {
     if [[ $mode == digest ]]; then echo "### $suite on $gpu, SASS against PTX: $((total - fails)) of $total leave the same memory"
-    else echo "### $suite on $gpu: $((total - fails)) of $total as on the RTX 3060"; fi
+    else echo "### $suite on $gpu: $((total - fails)) of $total ${verdict:-as on the RTX 3060}"; fi
     echo
     if (( fails )); then
       echo "| program | seconds | result |"; echo "|---|---|---|"
@@ -235,7 +305,7 @@ run() {
     echo "Slowest: $(sort -t$'\t' -k3,3nr "$report/results.tsv" | head -5 | awk -F'\t' '{printf "%s %ss, ", $1, $3}' | sed 's/, $//')"
   } > "$report/summary.md"
   if [[ $mode == digest ]]; then echo "$suite: $((total - fails)) of $total leave the same memory on SASS and PTX"
-  else echo "$suite: $((total - fails)) of $total match the card"; fi
+  else echo "$suite: $((total - fails)) of $total ${verdict:-match the card}"; fi
   (( total > 0 && fails == 0 ))
 }
 

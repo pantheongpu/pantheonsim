@@ -1,0 +1,14 @@
+# cuda_memtest (ComputationalRadiationPhysics/cuda_memtest e94e1ee, dev, version 1.2.3): the
+# open-source CUDA memory tester (the memtest86 algorithms on a GPU), built and run unmodified
+# on the simulated nvidia/rtx3060. There is no card's output to compare with: a clean run must
+# exit 0 with no error reported and print its marker; a run with a memory cell stuck at 1
+# (`vgpu fault stuck`, offset in bytes from the start of device memory) must report the error
+# and exit non-zero (--exit_on_error). Columns: name | arguments | fault | marker.
+# Memory is limited to a few MB (--max_num_blocks) because the simulator runs on the CPU.
+# Left out: test 6 (moving inversions, 32 bit patterns), about 45 s per MB; test 10 at its
+# default iteration count (270 s for 4 MB), run instead with --num_iterations 2; and test 9,
+# the bit fade test, which sleeps for minutes and is disabled by default.
+patterns|--max_num_blocks 4 --num_passes 1 --disable_test 6 --disable_test 10 --exit_on_error|clean|Test8 finished
+mapped|--mappedMem --max_num_blocks 2 --num_passes 1 --disable_test 6 --disable_test 10 --exit_on_error|clean|Test8 finished
+stress|--stress --max_num_blocks 4 --num_iterations 2 --num_passes 1|clean|Test10 finished
+stuck-cell|--max_num_blocks 4 --num_passes 1 --disable_test 6 --disable_test 10 --exit_on_error|stuck:0x100000|

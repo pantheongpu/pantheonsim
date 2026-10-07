@@ -65,6 +65,17 @@ int amdsmi_get_violation_status(void*, void*);
 int amdsmi_get_clk_freq(void*, int, void*);
 int amdsmi_set_clk_freq(void*, int, uint64_t);
 int amdsmi_get_energy_count(void*, uint64_t*, float*, uint64_t*);
+int amdsmi_get_gpu_memory_usage(void*, int, uint64_t*);
+int amdsmi_get_gpu_vram_usage(void*, void*);
+int amdsmi_get_gpu_busy_percent(void*, uint32_t*);
+int amdsmi_get_gpu_perf_level(void*, int*);
+int amdsmi_get_gpu_overdrive_level(void*, uint32_t*);
+int amdsmi_get_gpu_mem_overdrive_level(void*, uint32_t*);
+int amdsmi_get_gpu_metrics_header_info(void*, void*);
+int amdsmi_get_gpu_memory_reserved_pages(void*, uint32_t*, void*);
+int amdsmi_get_gpu_compute_process_info(void*, uint32_t*);
+int amdsmi_get_gpu_compute_process_info_by_pid(uint32_t, void*);
+int amdsmi_get_gpu_compute_process_gpus(uint32_t, uint32_t*, uint32_t*);
 }
 
 namespace {
@@ -635,6 +646,66 @@ VTEST(gpu_metrics_are_the_v1_5_table_in_amd_smis_structure) {
   }
   VCHECK_EQ(amdsmi_get_gpu_metrics_info(g[0], nullptr), kInval);
   VCHECK_EQ(amdsmi_get_gpu_metrics_info(reinterpret_cast<void*>(0x1234), m.data()), kNotFound);
+}
+
+// The getters ROCm SMI's library answers, answered in AMD SMI's names from the
+// same machine.
+VTEST(the_getters_rocm_smi_answers_are_answered_here_too) {
+  amdsmi_init(2);
+  const std::vector<void*> g = gpus();
+  for (void* h : g) {
+    uint64_t total = 0, used = 0;
+    VCHECK_EQ(amdsmi_get_gpu_memory_total(h, 0, &total), kSuccess);
+    VCHECK_EQ(amdsmi_get_gpu_memory_usage(h, 0, &used), kSuccess);
+    uint32_t vram[4] = {9, 9, 9, 9};   // amdsmi_vram_usage_t: total and used in MB
+    VCHECK_EQ(amdsmi_get_gpu_vram_usage(h, vram), kSuccess);
+    VCHECK_EQ(uint64_t{vram[0]}, total >> 20);
+    VCHECK_EQ(uint64_t{vram[1]}, used >> 20);
+    VCHECK(vram[0] > 0 && vram[1] <= vram[0]);
+    VCHECK_EQ(vram[2], 0u);
+    uint32_t busy = 999, od = 999, mod = 999;
+    int level = 99;
+    VCHECK_EQ(amdsmi_get_gpu_busy_percent(h, &busy), kSuccess);
+    VCHECK(busy <= 100);
+    VCHECK_EQ(amdsmi_get_gpu_perf_level(h, &level), kSuccess);
+    VCHECK_EQ(level, 0);   // AMDSMI_DEV_PERF_LEVEL_AUTO
+    VCHECK_EQ(amdsmi_get_gpu_overdrive_level(h, &od), kSuccess);
+    VCHECK_EQ(od, 0u);
+    VCHECK_EQ(amdsmi_get_gpu_mem_overdrive_level(h, &mod), kSuccess);
+    VCHECK_EQ(mod, 0u);
+    // amd_metrics_table_header_t: the v1.5 table's, 360 bytes.
+    unsigned char hd[4] = {};
+    VCHECK_EQ(amdsmi_get_gpu_metrics_header_info(h, hd), kSuccess);
+    VCHECK(hd[0] == 104 && hd[1] == 1 && hd[2] == 1 && hd[3] == 5);
+    // Reserved pages are the bad pages the driver keeps.
+    uint32_t n = 5, m = 5;
+    VCHECK_EQ(amdsmi_get_gpu_memory_reserved_pages(h, &n, nullptr), amdsmi_get_gpu_bad_page_info(h, &m, nullptr));
+    VCHECK_EQ(n, m);
+  }
+  uint32_t x = 0;
+  VCHECK_EQ(amdsmi_get_gpu_busy_percent(g[0], nullptr), 1);   // AMDSMI_STATUS_INVAL
+  VCHECK_EQ(amdsmi_get_gpu_busy_percent(nullptr, &x), kNotFound);
+  VCHECK_EQ(amdsmi_get_gpu_vram_usage(reinterpret_cast<void*>(0x1234), &x), kNotFound);
+  VCHECK_EQ(amdsmi_get_gpu_metrics_header_info(g[0], nullptr), 1);
+}
+
+VTEST(the_compute_processes_are_counted_and_looked_up_by_pid) {
+  amdsmi_init(2);
+  uint32_t n = 7;
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_info(nullptr, &n), kSuccess);
+  VCHECK_EQ(n, 0u);   // nothing is running on the test machine
+  uint32_t m = 3;
+  unsigned char procs[3 * 32] = {};
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_info(procs, &m), kSuccess);
+  VCHECK_EQ(m, 0u);
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_info(procs, nullptr), 1);   // AMDSMI_STATUS_INVAL
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_info_by_pid(1, procs), kNotFound);
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_info_by_pid(1, nullptr), 1);
+  uint32_t idx[2], k = 2;
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_gpus(1, idx, &k), kNotFound);
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_gpus(1, idx, nullptr), 1);
+  VCHECK_EQ(amdsmi_shut_down(), kSuccess);
+  VCHECK_EQ(amdsmi_get_gpu_compute_process_info(nullptr, &n), kNotInit);
 }
 
 VTEST(what_is_not_modelled_is_refused_and_every_function_is_there) {
