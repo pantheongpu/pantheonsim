@@ -7,9 +7,10 @@
 //  - Divergence: a branch that splits the active mask parks the not-taken
 //    (pc, mask) on a per-warp divergence stack and continues with the taken
 //    side; a path that retires pops the next parked path. Paths reconverge
-//    implicitly at ret. Barriers inside divergent control flow are rejected
-//    with a clear error rather than deadlocking (IPDOM reconvergence is a
-//    planned upgrade — see TODO.md).
+//    implicitly at ret. Since then reconvergence is min-PC (paths at the same
+//    pc merge, the lowest pc runs next), so a bar.sync after a divergent region
+//    works; full IPDOM and irreducible control flow remain open (TODO.md,
+//    "Partially implemented").
 //  - Address spaces: device globals live in the MemoryManager VA range;
 //    per-thread .local frames live in a reserved window (kLocalVaBase) that
 //    generic loads/stores route to the executing lane's private buffer —
