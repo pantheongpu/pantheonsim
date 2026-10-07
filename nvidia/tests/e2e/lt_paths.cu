@@ -325,6 +325,54 @@ static void logger() {
   check(cublasLtLoggerSetLevel(0) == CUBLAS_STATUS_SUCCESS, "logger back off", 0);
 }
 
+// torch._int_mm: int8 x int8 into int32 with CUBLAS_COMPUTE_32I and an int32 scale, column-major, no
+// transposes (PyTorch swaps the operands to get a row-major product). Exact integer arithmetic, so the
+// result must equal the host's; int8 into a float D, or an int8 D, is refused rather than guessed.
+static void int8_into_int32() {
+  const int m = 48, n = 32, k = 64;
+  std::vector<int8_t> a((size_t)m * k), b((size_t)k * n);
+  for (size_t i = 0; i < a.size(); ++i) a[i] = (int8_t)(((i * 37 + 11) % 255) - 127);
+  for (size_t i = 0; i < b.size(); ++i) b[i] = (int8_t)(((i * 53 + 5) % 255) - 127);
+  std::vector<int32_t> ref((size_t)m * n, 0), d((size_t)m * n, -1);
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      int64_t acc = 0;
+      for (int p = 0; p < k; ++p) acc += (int)a[(size_t)p * m + i] * (int)b[(size_t)j * k + p];
+      ref[(size_t)j * m + i] = (int32_t)acc;
+    }
+  int8_t *da = upload(a), *db = upload(b);
+  int32_t* dd = upload(d);
+  Layouts L;
+  cublasLtMatmulDesc_t desc = nullptr;
+  CK(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+  CK(cublasLtMatrixLayoutCreate(&L.a, CUDA_R_8I, m, k, m));
+  CK(cublasLtMatrixLayoutCreate(&L.b, CUDA_R_8I, k, n, k));
+  CK(cublasLtMatrixLayoutCreate(&L.c, CUDA_R_32I, m, n, m));
+  CK(cublasLtMatrixLayoutCreate(&L.d, CUDA_R_32I, m, n, m));
+  const int32_t alpha = 1, beta = 0;
+  const cublasStatus_t st = cublasLtMatmul(lt, desc, &alpha, da, L.a, db, L.b, &beta, dd, L.c, dd, L.d, nullptr, nullptr, 0, 0);
+  check(st == CUBLAS_STATUS_SUCCESS, "int8 x int8 -> int32 matmul accepted", st);
+  const std::vector<int32_t> got = download(dd, d.size());
+  check(got == ref, "int8 x int8 -> int32 equals the host's exact product", 0);
+  // alpha = 2 scales in int32
+  const int32_t alpha2 = 2;
+  CK(cublasLtMatmul(lt, desc, &alpha2, da, L.a, db, L.b, &beta, dd, L.c, dd, L.d, nullptr, nullptr, 0, 0));
+  const std::vector<int32_t> got2 = download(dd, d.size());
+  bool twice = true;
+  for (size_t i = 0; i < ref.size(); ++i) twice = twice && got2[i] == 2 * ref[i];
+  check(twice, "int32 alpha scales the integer product", 0);
+  // an int8 operand with a float compute type is not an int8 matmul
+  cublasLtMatmulDesc_t fdesc = nullptr;
+  CK(cublasLtMatmulDescCreate(&fdesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  const float fa = 1.f, fb = 0.f;
+  check(cublasLtMatmul(lt, fdesc, &fa, da, L.a, db, L.b, &fb, dd, L.c, dd, L.d, nullptr, nullptr, 0, 0) ==
+            CUBLAS_STATUS_NOT_SUPPORTED,
+        "int8 operands with CUBLAS_COMPUTE_32F refused", 0);
+  cublasLtMatmulDescDestroy(fdesc);
+  cublasLtMatmulDescDestroy(desc);
+  cudaFree(da); cudaFree(db); cudaFree(dd);
+}
+
 int main() {
   if (cublasLtCreate(&lt)) {
     std::printf("FAIL: cublasLtCreate\n");
@@ -333,6 +381,7 @@ int main() {
   half_bias_relu();
   bf16_batched_rowmajor();
   fp8_scaled();
+  int8_into_int32();
   pointer_mode_and_refusal();
   logger();
   cublasLtDestroy(lt);
