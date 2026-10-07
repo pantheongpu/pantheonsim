@@ -1460,6 +1460,13 @@ if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_group.sh 4)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # The NCCL 2.29+ names PyTorch for CUDA 13 binds at load time: exported, and
+  # unsupported when called.
+  add_executable(test_nccl_symbols nvidia/tests/unit/test_nccl_symbols.cpp)
+  target_link_libraries(test_nccl_symbols PRIVATE vgpunccl)
+  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_nccl_symbols COMMAND test_nccl_symbols)
+  set_tests_properties(test_nccl_symbols PROPERTIES ENVIRONMENT "VGPU_QUIET=1")
   # Two ranks across two processes, the shape the RTX 3060 reference run has.
   add_test(NAME e2e_nccl_multiproc_2
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_multiproc.sh 2)
