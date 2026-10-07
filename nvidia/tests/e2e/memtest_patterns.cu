@@ -255,6 +255,7 @@ int main(int argc, char** argv) {
   Harness h;
   const size_t bytes = h.n * sizeof(uint32_t);
   bool mapped = !strcmp(mode, "mapped");
+  void* host_buf = nullptr;  // the pinned allocation behind h.buf, freed with cudaFreeHost
   if (mapped) {
     cudaSetDeviceFlags(cudaDeviceMapHost);
     void* p = nullptr;
@@ -262,6 +263,7 @@ int main(int argc, char** argv) {
     void* d = nullptr;
     if (cudaHostGetDevicePointer(&d, p, 0) != cudaSuccess) { printf("device pointer failed\n"); return 2; }
     h.buf = static_cast<uint32_t*>(d);
+    host_buf = p;
   } else {
     cudaMalloc(&h.buf, bytes);  // first, so it is at the start of device memory
   }
@@ -310,7 +312,8 @@ int main(int argc, char** argv) {
     else if (h.total) rc = 1;
     if (!rc) printf("PASS\n");
   }
-  if (!mapped) cudaFree(h.buf);
+  if (mapped) cudaFreeHost(host_buf);  // not cudaFree: this is host memory, and a leak fails the sanitizer build
+  else cudaFree(h.buf);
   cudaFree(h.spare);
   cudaFree(h.cnt);
   return rc;
