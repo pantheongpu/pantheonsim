@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -464,7 +465,9 @@ AMDSMI_API int amdsmi_get_gpu_topo_numa_affinity(void* h, int32_t* node) {
 // Assumptions with no profile datum behind them are marked where they are made.
 // Layouts are those of amdsmi.h 26.2 (checked by size and offset below).
 // Not modelled, still NOT_SUPPORTED: violation status,
-// PCIe throughput, bad-page threshold, every setter and reset.
+// PCIe throughput, bad-page threshold, every setter and reset. The getters
+// ROCm SMI's library answers (perf level, overdrive, busy percent, reserved
+// pages, the compute processes) are answered here the same way.
 
 namespace {
 
@@ -1081,4 +1084,136 @@ AMDSMI_API int amdsmi_get_gpu_process_list(void* h, uint32_t* max, ProcInfo* lis
   const bool fits = *max >= n;
   *max = n;
   return fits ? kSuccess : kOutOfResources;
+}
+
+// ---- What ROCm SMI's library answers, in AMD SMI's names ---------------------------------
+//
+// The same machine state, the same answers as rocm_smi.cpp gives them, so
+// `amd-smi` and `rocm-smi` agree.
+
+struct VramUsage {  // amdsmi_vram_usage_t
+  uint32_t vram_total, vram_used, reserved[2];   // in MB
+};
+struct ComputeProcess {  // amdsmi_process_info_t
+  uint32_t process_id;
+  uint64_t vram_usage;    // MB
+  uint64_t sdma_usage;    // microseconds
+  uint32_t cu_occupancy;  // percent
+  uint32_t evicted_time;  // ms
+};
+struct MetricsHeader {  // amd_metrics_table_header_t
+  uint16_t structure_size;
+  uint8_t format_revision, content_revision;
+};
+static_assert(sizeof(VramUsage) == 16 && sizeof(ComputeProcess) == 32 && sizeof(MetricsHeader) == 4);
+static_assert(offsetof(ComputeProcess, vram_usage) == 8 && offsetof(ComputeProcess, sdma_usage) == 16 &&
+              offsetof(ComputeProcess, cu_occupancy) == 24 && offsetof(ComputeProcess, evicted_time) == 28);
+
+// Memory in megabytes, as the structure says (the other queries give bytes).
+AMDSMI_API int amdsmi_get_gpu_vram_usage(void* h, VramUsage* u) {
+  GPU(h, s, u);
+  std::memset(u, 0, sizeof *u);
+  u->vram_total = static_cast<uint32_t>(s.vram_total_bytes >> 20);
+  u->vram_used = static_cast<uint32_t>(s.vram_used_bytes >> 20);
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_busy_percent(void* h, uint32_t* pct) {
+  GPU(h, s, pct);
+  *pct = s.utilization_gpu;
+  return kSuccess;
+}
+// No knob is modelled, so the card is as the driver leaves it: the performance
+// level "auto" (0) and no overdrive.
+AMDSMI_API int amdsmi_get_gpu_perf_level(void* h, int* level) {
+  GPU(h, s, level);
+  *level = 0;   // AMDSMI_DEV_PERF_LEVEL_AUTO
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_overdrive_level(void* h, uint32_t* od) {
+  GPU(h, s, od);
+  *od = 0;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_mem_overdrive_level(void* h, uint32_t* od) {
+  GPU(h, s, od);
+  *od = 0;
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_metrics_header_info(void* h, MetricsHeader* header) {
+  GPU(h, s, header);
+  vgpu::amd::MetricsV15 t;
+  const std::string bytes = vgpu::amd::gpu_metrics(s, ras_counters(s, false));
+  if (bytes.size() != sizeof t) return kNotSupported;
+  std::memcpy(&t, bytes.data(), sizeof t);
+  *header = {t.structure_size, t.format_revision, t.content_revision};
+  return kSuccess;
+}
+// The pages retired for uncorrectable errors, the list amdsmi_get_gpu_bad_page_info
+// gives: the driver keeps one record of them.
+AMDSMI_API int amdsmi_get_gpu_memory_reserved_pages(void* h, uint32_t* num, RetiredPage* records) {
+  return amdsmi_get_gpu_bad_page_info(h, num, records);
+}
+
+namespace {
+// Every process using an AMD GPU: the GPUs it uses (by ordinal) and its VRAM.
+struct ComputeUse {
+  uint64_t vram = 0;
+  std::vector<uint32_t> gpus;
+};
+std::map<uint32_t, ComputeUse> compute_processes() {
+  std::map<uint32_t, ComputeUse> out;
+  const std::vector<Sample> m = machine();
+  for (uint32_t k = 0; k < m.size(); ++k)
+    for (uint32_t p = 0; p < m[k].proc_count && p < vgpu::telemetry::kMaxProcs; ++p) {
+      ComputeUse& e = out[m[k].procs[p].pid];
+      e.vram += m[k].procs[p].used_bytes;
+      e.gpus.push_back(k);
+    }
+  return out;
+}
+ComputeProcess compute_info(uint32_t pid, const ComputeUse& u) {
+  // SDMA time is not kept and the eviction time is not modelled; the CU
+  // occupancy is N/A, as ROCm SMI's compute process list says.
+  return {pid, u.vram >> 20, 0, kNone32, kNone32};
+}
+}  // namespace
+
+// Where `procs` is null the count comes back; where it is too short it holds
+// as many as fit, and *num_items says how many were written.
+AMDSMI_API int amdsmi_get_gpu_compute_process_info(ComputeProcess* procs, uint32_t* num_items) {
+  if (!g_init) return kNotInit;
+  if (!num_items) return kInval;
+  const auto all = compute_processes();
+  uint32_t k = 0;
+  if (procs)
+    for (const auto& [pid, u] : all) {
+      if (k >= *num_items) break;
+      procs[k++] = compute_info(pid, u);
+    }
+  const bool fits = !procs || *num_items >= all.size();
+  *num_items = procs ? k : static_cast<uint32_t>(all.size());
+  return fits ? kSuccess : kInsufficientSize;
+}
+AMDSMI_API int amdsmi_get_gpu_compute_process_info_by_pid(uint32_t pid, ComputeProcess* proc) {
+  if (!g_init) return kNotInit;
+  if (!proc) return kInval;
+  const auto all = compute_processes();
+  const auto it = all.find(pid);
+  if (it == all.end()) return kNotFound;
+  *proc = compute_info(pid, it->second);
+  return kSuccess;
+}
+AMDSMI_API int amdsmi_get_gpu_compute_process_gpus(uint32_t pid, uint32_t* indices, uint32_t* num_devices) {
+  if (!g_init) return kNotInit;
+  if (!num_devices) return kInval;
+  const auto all = compute_processes();
+  const auto it = all.find(pid);
+  if (it == all.end()) return kNotFound;
+  const auto& g = it->second.gpus;
+  if (indices)
+    for (uint32_t k = 0; k < std::min<size_t>(*num_devices, g.size()); ++k) indices[k] = g[k];
+  const bool fits = !indices || *num_devices >= g.size();
+  *num_devices = indices ? std::min<uint32_t>(*num_devices, static_cast<uint32_t>(g.size()))
+                         : static_cast<uint32_t>(g.size());
+  return fits ? kSuccess : kInsufficientSize;
 }
