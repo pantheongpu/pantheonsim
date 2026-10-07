@@ -1357,6 +1357,11 @@ set_tests_properties(amd_hipcc PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_memtest_patterns COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_memtest_patterns.sh)
 set_tests_properties(amd_memtest_patterns PROPERTIES DEPENDS "vgpuhip;vgpu_cli"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
+# Work-groups of several dimensions and waves (ids, LDS between waves), run by
+# checked-in hipcc programs whose code objects are version 4, on four GPUs.
+add_test(NAME amd_workgroup COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_workgroup.sh)
+set_tests_properties(amd_workgroup PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 # The decoder against ROCm's assembler on code ROCm's compiler built: the
 # checked-in object everywhere, and a fresh build wherever ROCm is installed.
 add_test(NAME test_amd_hipcc_ops_decode COMMAND test_amd_gcn)
@@ -1424,6 +1429,8 @@ set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BIN
 add_test(NAME nvml_health COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_health.sh)
 set_tests_properties(nvml_health PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME nvml_dcgm COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_dcgm.sh)
+set_tests_properties(nvml_dcgm PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 
 # With no `unshare`, vgpu shell must not touch the host's mounts.
 add_test(NAME isolation_fallback COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_isolation_fallback.sh)
@@ -1463,6 +1470,13 @@ if(TARGET vgpunccl)
   add_test(NAME e2e_nccl_group COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_group.sh 4)
   set_tests_properties(e2e_nccl_group PROPERTIES DEPENDS vgpunccl TIMEOUT 300
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+  # The NCCL 2.29+ names PyTorch for CUDA 13 binds at load time: exported, and
+  # unsupported when called.
+  add_executable(test_nccl_symbols nvidia/tests/unit/test_nccl_symbols.cpp)
+  target_link_libraries(test_nccl_symbols PRIVATE vgpunccl)
+  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_nccl_symbols COMMAND test_nccl_symbols)
+  set_tests_properties(test_nccl_symbols PROPERTIES ENVIRONMENT "VGPU_QUIET=1")
   # Two ranks across two processes, the shape the RTX 3060 reference run has.
   add_test(NAME e2e_nccl_multiproc_2
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nccl_multiproc.sh 2)
