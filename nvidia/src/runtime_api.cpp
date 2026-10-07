@@ -1413,6 +1413,116 @@ VGPU_EXPORT cudaError_t cudaGetDevice(int* device) {
   });
 }
 
+// cudaChooseDevice: "the device which has properties that best match *prop".
+// The documentation does not say how matching is scored, so the rule here is
+// the plain reading of it: only the fields the caller filled in (non-zero, or a
+// non-empty name) count, a device scores one for each it satisfies -- the name
+// by equality, the capability, memory sizes and counts by being at least what
+// was asked, the warp size by equality, a capability flag by being set -- and
+// the device with the most wins, the lowest ordinal on a tie. A cleared
+// structure asks for nothing, so every device ties and the answer is 0.
+VGPU_EXPORT cudaError_t cudaChooseDevice(int* device, const struct cudaDeviceProp* prop) {
+  if (!device || !prop) return cudaErrorInvalidValue;
+  int count = 0;
+  if (const cudaError_t e = cudaGetDeviceCount(&count); e != cudaSuccess) return e;
+  int best = 0, best_score = -1;
+  for (int d = 0; d < count; ++d) {
+    cudaDeviceProp have;
+    if (const cudaError_t e = cudaGetDeviceProperties(&have, d); e != cudaSuccess) return e;
+    int score = 0;
+    auto at_least = [&](auto want, auto got) { if (want != 0 && got >= want) ++score; };
+    auto equal = [&](auto want, auto got) { if (want != 0 && got == want) ++score; };
+    if (prop->name[0] != '\0' && std::strncmp(prop->name, have.name, sizeof have.name) == 0) ++score;
+    at_least(prop->major, have.major);
+    at_least(prop->minor, have.minor);
+    at_least(prop->totalGlobalMem, have.totalGlobalMem);
+    at_least(prop->multiProcessorCount, have.multiProcessorCount);
+    at_least(prop->sharedMemPerBlock, have.sharedMemPerBlock);
+    at_least(prop->regsPerBlock, have.regsPerBlock);
+    at_least(prop->maxThreadsPerBlock, have.maxThreadsPerBlock);
+    at_least(prop->totalConstMem, have.totalConstMem);
+    at_least(prop->l2CacheSize, have.l2CacheSize);
+    equal(prop->warpSize, have.warpSize);
+    at_least(prop->concurrentKernels, have.concurrentKernels);
+    at_least(prop->canMapHostMemory, have.canMapHostMemory);
+    at_least(prop->unifiedAddressing, have.unifiedAddressing);
+    at_least(prop->managedMemory, have.managedMemory);
+    if (score > best_score) {
+      best_score = score;
+      best = d;
+    }
+  }
+  *device = best;
+  return cudaSuccess;
+}
+
+// cudaInitDevice: starts the runtime and the device's primary context without
+// making the device current. The only flag is cudaInitDeviceFlagsAreValid,
+// which says deviceFlags is to be applied; those are cudaSetDeviceFlags's, and
+// this engine keeps none of them (cudaGetDeviceFlags is always 0).
+VGPU_EXPORT cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, unsigned int flags) {
+  (void)deviceFlags;
+  if (flags & ~1u) return cudaErrorInvalidValue;   // cudaInitDeviceFlagsAreValid is the only one
+  return guard_query("cudaInitDevice", [&](State& s) {
+    if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
+    return cudaSuccess;
+  });
+}
+
+// A PCI bus id string in any of the forms the documentation lists -- domain,
+// bus, device and function, each hexadecimal, domain and function optional --
+// as the four numbers it names; false when it does not parse. The driver's
+// cuDeviceGetByPCIBusId reads the same forms the same way.
+namespace {
+bool parse_pci_bus_id(const char* text, unsigned long out[4]) {
+  std::vector<std::string> parts;
+  std::string cur;
+  for (const char* c = text; *c; ++c) {
+    if (*c == ':') {
+      parts.push_back(cur);
+      cur.clear();
+    } else {
+      cur += *c;
+    }
+  }
+  parts.push_back(cur);
+  if (parts.size() != 2 && parts.size() != 3) return false;
+  std::string fn = "0";
+  if (const size_t dot = parts.back().find('.'); dot != std::string::npos) {
+    fn = parts.back().substr(dot + 1);
+    parts.back().resize(dot);
+  }
+  if (parts.size() == 2) parts.insert(parts.begin(), "0");
+  parts.push_back(fn);
+  for (int i = 0; i < 4; ++i) {
+    if (parts[static_cast<size_t>(i)].empty()) return false;
+    char* end = nullptr;
+    out[i] = std::strtoul(parts[static_cast<size_t>(i)].c_str(), &end, 16);
+    if (*end) return false;
+  }
+  return true;
+}
+}  // namespace
+
+// The inverse of cudaDeviceGetPCIBusId: a well-formed id that names no device
+// is cudaErrorInvalidDevice, a malformed one cudaErrorInvalidValue.
+VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusId) {
+  unsigned long want[4];
+  if (!device || !pciBusId || !parse_pci_bus_id(pciBusId, want)) return cudaErrorInvalidValue;
+  int count = 0;
+  if (const cudaError_t e = cudaGetDeviceCount(&count); e != cudaSuccess) return e;
+  for (int d = 0; d < count; ++d) {
+    char id[32];
+    unsigned long have[4];
+    if (cudaDeviceGetPCIBusId(id, sizeof id, d) != cudaSuccess) continue;
+    if (parse_pci_bus_id(id, have) && std::equal(have, have + 4, want)) {
+      *device = d;
+      return cudaSuccess;
+    }
+  }
+  return cudaErrorInvalidDevice;
+}
+
 VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
   if (flags) *flags = 0;
@@ -1758,6 +1868,84 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int* n, const void* f, int bs, size_t dyn, unsigned int) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
 }
+
+// How many clusters can be active, and the largest cluster that can launch,
+// depend on how the device's SMs are grouped into GPCs -- a cluster lives in
+// one -- and no profile here records that grouping, and the documentation does
+// not give it for any part. So these are refused by name rather than answered
+// from a made-up layout: a program that calls them (CUTLASS sizes its
+// persistent grid with the first) is told which question could not be answered.
+VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveClusters(int* numClusters, const void*,
+                                                       const cudaLaunchConfig_t*) {
+  if (!numClusters) return cudaErrorInvalidValue;
+  if (!quiet())
+    std::fprintf(stderr, "[vgpu] cudaOccupancyMaxActiveClusters is not implemented: it needs the "
+                         "device's SM-to-GPC layout, which no profile records\n");
+  return cudaErrorNotSupported;
+}
+VGPU_EXPORT cudaError_t cudaOccupancyMaxPotentialClusterSize(int* clusterSize, const void*,
+                                                             const cudaLaunchConfig_t*) {
+  if (!clusterSize) return cudaErrorInvalidValue;
+  if (!quiet())
+    std::fprintf(stderr, "[vgpu] cudaOccupancyMaxPotentialClusterSize is not implemented: it needs "
+                         "the device's SM-to-GPC layout, which no profile records\n");
+  return cudaErrorNotSupported;
+}
+
+// cudaFuncGetName and cudaFuncGetParamInfo (CUDA 12.4): the kernel's name as
+// it is in the module -- the mangled one -- and where each parameter sits in
+// the kernel's parameter block. The block is laid out as a launch lays it out:
+// each parameter at the next offset its alignment allows (the declared
+// alignment, else its size up to 8 bytes), and a structure passed by value as
+// the whole of its bytes.
+#if CUDART_VERSION >= 12040
+namespace {
+cudaError_t kernel_function(State& s, const void* func, const char* api, const vgpu::ptx::EntryFn** fn) {
+  auto it = s.kernels.find(func);
+  if (it == s.kernels.end()) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] %s: unregistered kernel stub %p\n", api, func);
+    return cudaErrorInvalidDeviceFunction;
+  }
+  KernelInfo& ki = it->second;
+  if (!ki.mod || !registered_ptx(s, *ki.mod)) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] %s: kernel '%s' has no PTX in its fatbin\n", api, ki.entry_name.c_str());
+    return cudaErrorInvalidDeviceFunction;
+  }
+  *fn = current(s).get_function(module_on_current(s, *ki.mod), ki.entry_name);
+  return cudaSuccess;
+}
+}  // namespace
+
+VGPU_EXPORT cudaError_t cudaFuncGetName(const char** name, const void* func) {
+  return guard("cudaFuncGetName", [&](State& s) -> cudaError_t {
+    if (!name) return cudaErrorInvalidValue;
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
+    *name = it->second.entry_name.c_str();   // the registry's string, which outlives the call
+    return cudaSuccess;
+  });
+}
+
+VGPU_EXPORT cudaError_t cudaFuncGetParamInfo(const void* func, size_t paramIndex, size_t* paramOffset,
+                                             size_t* paramSize) {
+  return guard("cudaFuncGetParamInfo", [&](State& s) -> cudaError_t {
+    if (!paramOffset) return cudaErrorInvalidValue;
+    const vgpu::ptx::EntryFn* fn = nullptr;
+    if (const cudaError_t e = kernel_function(s, func, "cudaFuncGetParamInfo", &fn); e != cudaSuccess) return e;
+    if (paramIndex >= fn->params.size()) return cudaErrorInvalidValue;
+    uint64_t end = 0, offset = 0, size = 0;
+    for (size_t i = 0; i <= paramIndex; ++i) {
+      size = fn->params[i].size;
+      const uint64_t align = fn->params[i].align ? fn->params[i].align : (size < 8 ? size : 8);
+      offset = align ? (end + align - 1) / align * align : end;
+      end = offset + size;
+    }
+    *paramOffset = static_cast<size_t>(offset);
+    if (paramSize) *paramSize = static_cast<size_t>(size);
+    return cudaSuccess;
+  });
+}
+#endif
 
 // What one device can do with another's memory. The answers follow
 // cudaDeviceCanAccessPeer: distinct simulated devices reach each other, and
@@ -2120,6 +2308,43 @@ VGPU_EXPORT cudaError_t cudaMemset2DAsync(void* dst, size_t pitch, int value, si
     return rc;
   }
   return cudaMemset2D(dst, pitch, value, width, height);
+}
+
+// cudaMemset3D: `extent.depth` slices of `extent.height` rows of `extent.width`
+// bytes, rows `pitch` apart and slices `pitch * ysize` apart (the pitched
+// pointer's own ysize, the height of each 2D slice in rows). A box that does
+// not fit in its pitch or slice would write over its own neighbours, so it is
+// refused before anything is written.
+namespace {
+cudaError_t check_box(const cudaPitchedPtr& p, const cudaExtent& e) {
+  if (!p.ptr) return cudaErrorInvalidValue;
+  if (e.width > p.pitch) return cudaErrorInvalidValue;
+  if (e.depth > 1 && e.height > p.ysize) return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+}  // namespace
+VGPU_EXPORT cudaError_t cudaMemset3D(cudaPitchedPtr pitchedDevPtr, int value, cudaExtent extent) {
+  if (extent.width == 0 || extent.height == 0 || extent.depth == 0) return cudaSuccess;
+  if (const cudaError_t e = check_box(pitchedDevPtr, extent); e != cudaSuccess) return e;
+  for (size_t z = 0; z < extent.depth; ++z) {
+    char* slice = static_cast<char*>(pitchedDevPtr.ptr) + z * pitchedDevPtr.pitch * pitchedDevPtr.ysize;
+    const cudaError_t e = cudaMemset2D(slice, pitchedDevPtr.pitch, value, extent.width, extent.height);
+    if (e != cudaSuccess) return e;
+  }
+  return cudaSuccess;
+}
+// Captured, each slice is a 2D memset node in the stream's chain.
+VGPU_EXPORT cudaError_t cudaMemset3DAsync(cudaPitchedPtr pitchedDevPtr, int value, cudaExtent extent,
+                                          cudaStream_t stream) {
+  if (extent.width == 0 || extent.height == 0 || extent.depth == 0) return cudaSuccess;
+  if (const cudaError_t e = check_box(pitchedDevPtr, extent); e != cudaSuccess) return e;
+  for (size_t z = 0; z < extent.depth; ++z) {
+    char* slice = static_cast<char*>(pitchedDevPtr.ptr) + z * pitchedDevPtr.pitch * pitchedDevPtr.ysize;
+    const cudaError_t e =
+        cudaMemset2DAsync(slice, pitchedDevPtr.pitch, value, extent.width, extent.height, stream);
+    if (e != cudaSuccess) return e;
+  }
+  return cudaSuccess;
 }
 
 
@@ -3050,6 +3275,45 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
   return cudaSuccess;
 }
 
+// Shared memory banks are four bytes wide on every GPU this simulates, as the
+// driver's cuCtxSetSharedMemConfig answers: a configuration in the enumeration
+// is accepted and has no effect, and the answer stays the four-byte bank size.
+// Deprecated in 12.4, and removed with CUDA 13.
+#if CUDART_VERSION < 13000
+VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
+  const int c = static_cast<int>(config);
+  return c >= 0 && c <= 2 ? cudaSuccess : cudaErrorInvalidValue;
+}
+VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
+  if (!config) return cudaErrorInvalidValue;
+  *config = cudaSharedMemBankSizeFourByte;
+  return cudaSuccess;
+}
+VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
+  const int c = static_cast<int>(config);
+  if (c < 0 || c > 2) return cudaErrorInvalidValue;
+  return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
+    return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
+  });
+}
+
+// The cudaThread* calls are the pre-cudaDevice* names, deprecated since CUDA
+// 4 and documented as the same operations; cudaThreadSynchronize already was.
+VGPU_EXPORT cudaError_t cudaThreadExit(void) { return cudaDeviceReset(); }
+VGPU_EXPORT cudaError_t cudaThreadSetLimit(cudaLimit limit, size_t value) {
+  return cudaDeviceSetLimit(limit, value);
+}
+VGPU_EXPORT cudaError_t cudaThreadGetLimit(size_t* value, cudaLimit limit) {
+  return cudaDeviceGetLimit(value, limit);
+}
+VGPU_EXPORT cudaError_t cudaThreadSetCacheConfig(cudaFuncCache config) {
+  return cudaDeviceSetCacheConfig(config);
+}
+VGPU_EXPORT cudaError_t cudaThreadGetCacheConfig(cudaFuncCache* config) {
+  return cudaDeviceGetCacheConfig(config);
+}
+#endif
+
 VGPU_EXPORT cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* mode) {
   if (!mode) return cudaErrorInvalidValue;
   *mode = cudaStreamCaptureModeGlobal;
@@ -3733,6 +3997,72 @@ VGPU_EXPORT cudaError_t cudaMemcpyFromArrayAsync(void* dst, cudaArray_const_t sr
   return copy_from_array(dst, src, wOffset, hOffset, count, kind);
 }
 
+// The 2D copies into and out of an array have asynchronous forms too. Streams
+// are synchronous, so each is the plain copy; one that names an array is not
+// something a captured graph can record, so under capture it is refused, as
+// cudaMemcpyToArrayAsync and cudaMemcpy3DAsync are.
+VGPU_EXPORT cudaError_t cudaMemcpy2DToArrayAsync(cudaArray_t dst, size_t wOffset, size_t hOffset,
+                                                 const void* src, size_t spitch, size_t width,
+                                                 size_t height, cudaMemcpyKind kind,
+                                                 cudaStream_t stream) {
+  if (capture_active(stream)) return cudaErrorStreamCaptureUnsupported;
+  return cudaMemcpy2DToArray(dst, wOffset, hOffset, src, spitch, width, height, kind);
+}
+VGPU_EXPORT cudaError_t cudaMemcpy2DFromArrayAsync(void* dst, size_t dpitch, cudaArray_const_t src,
+                                                   size_t wOffset, size_t hOffset, size_t width,
+                                                   size_t height, cudaMemcpyKind kind,
+                                                   cudaStream_t stream) {
+  if (capture_active(stream)) return cudaErrorStreamCaptureUnsupported;
+  return cudaMemcpy2DFromArray(dst, dpitch, src, wOffset, hOffset, width, height, kind);
+}
+
+// An array to an array, `height` rows of `width` bytes, each starting at its
+// own (wOffset, hOffset). The arrays are dense and row-major here, as in the
+// other array copies; a row may not run past the end of either array's row,
+// nor the copy past its last row.
+VGPU_EXPORT cudaError_t cudaMemcpy2DArrayToArray(cudaArray_t dst, size_t wOffsetDst, size_t hOffsetDst,
+                                                 cudaArray_const_t src, size_t wOffsetSrc,
+                                                 size_t hOffsetSrc, size_t width, size_t height,
+                                                 cudaMemcpyKind kind) {
+  return guard("cudaMemcpy2DArrayToArray", [&](State& s) -> cudaError_t {
+    if (kind != cudaMemcpyDeviceToDevice && kind != cudaMemcpyDefault) return cudaErrorInvalidMemcpyDirection;
+    auto d = g_arrays.find(reinterpret_cast<uint64_t>(dst));
+    auto f = g_arrays.find(reinterpret_cast<uint64_t>(src));
+    if (d == g_arrays.end() || f == g_arrays.end()) return cudaErrorInvalidResourceHandle;
+    const ArrayRec& to = d->second;
+    const ArrayRec& from = f->second;
+    auto rows = [](const ArrayRec& a) { return uint64_t{a.height ? a.height : 1}; };
+    // Sums of size_t offsets and extents are checked against the array before
+    // anything is added to an address.
+    if (width > to.row_bytes() || wOffsetDst > to.row_bytes() - width || width > from.row_bytes() ||
+        wOffsetSrc > from.row_bytes() - width)
+      return cudaErrorInvalidValue;
+    if (height > rows(to) || hOffsetDst > rows(to) - height || height > rows(from) ||
+        hOffsetSrc > rows(from) - height)
+      return cudaErrorInvalidValue;
+    vgpu::MemoryManager& mem = s.rt->device(to.device).memory();
+    vgpu::MemoryManager& src_mem = s.rt->device(from.device).memory();
+    std::vector<uint8_t> stage(width);
+    for (size_t row = 0; row < height; ++row) {
+      src_mem.read(from.base + (hOffsetSrc + row) * from.row_bytes() + wOffsetSrc, stage.data(), width);
+      mem.write(to.base + (hOffsetDst + row) * to.row_bytes() + wOffsetDst, stage.data(), width);
+    }
+    return cudaSuccess;
+  });
+}
+
+// What a texture or surface object was made from, kept so the Get*Desc calls
+// can hand it back: the resource descriptor and, for a texture, the texture
+// descriptor (all zeros when it was made with none). Keyed by the object's
+// handle and held under the API lock, like the table it describes.
+namespace {
+struct ObjectDescs {
+  cudaResourceDesc res;
+  cudaTextureDesc tex;
+};
+std::unordered_map<uint64_t, ObjectDescs> g_object_descs;
+}  // namespace
+
 VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
                                                 const cudaResourceDesc* res,
                                                 const cudaTextureDesc* tex,
@@ -3769,6 +4099,7 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
     }
     const uint64_t handle = g_next_texobj++;
     current(s).textures()[handle] = d;
+    g_object_descs[handle] = ObjectDescs{*res, tex ? *tex : cudaTextureDesc{}};
     *out = static_cast<cudaTextureObject_t>(handle);
     return cudaSuccess;
   });
@@ -3776,6 +4107,7 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
 
 VGPU_EXPORT cudaError_t cudaDestroyTextureObject(cudaTextureObject_t obj) {
   return guard("cudaDestroyTextureObject", [&](State& s) -> cudaError_t {
+    g_object_descs.erase(static_cast<uint64_t>(obj));
     return current(s).textures().erase(static_cast<uint64_t>(obj)) ? cudaSuccess
                                                                    : cudaErrorInvalidValue;
   });
@@ -3790,6 +4122,7 @@ VGPU_EXPORT cudaError_t cudaCreateSurfaceObject(cudaSurfaceObject_t* out,
     if (cudaError_t e = fill_from_resource(res, &d); e != cudaSuccess) return e;
     const uint64_t handle = g_next_texobj++;
     current(s).textures()[handle] = d;
+    g_object_descs[handle] = ObjectDescs{*res, cudaTextureDesc{}};
     *out = static_cast<cudaSurfaceObject_t>(handle);
     return cudaSuccess;
   });
@@ -3797,13 +4130,49 @@ VGPU_EXPORT cudaError_t cudaCreateSurfaceObject(cudaSurfaceObject_t* out,
 
 VGPU_EXPORT cudaError_t cudaDestroySurfaceObject(cudaSurfaceObject_t obj) {
   return guard("cudaDestroySurfaceObject", [&](State& s) -> cudaError_t {
+    g_object_descs.erase(static_cast<uint64_t>(obj));
     return current(s).textures().erase(static_cast<uint64_t>(obj)) ? cudaSuccess
                                                                    : cudaErrorInvalidValue;
   });
 }
 
-VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceDesc(cudaResourceDesc*, cudaTextureObject_t) {
-  return cudaErrorNotSupported;
+// The descriptors an object was created with. A texture object made here never
+// has a resource view -- cudaCreateTextureObject refuses one -- and the
+// documented answer for an object with none is cudaErrorInvalidValue.
+VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceDesc(cudaResourceDesc* desc, cudaTextureObject_t obj) {
+  return guard("cudaGetTextureObjectResourceDesc", [&](State& s) -> cudaError_t {
+    if (!desc || !current(s).textures().count(static_cast<uint64_t>(obj))) return cudaErrorInvalidValue;
+    const auto it = g_object_descs.find(static_cast<uint64_t>(obj));
+    if (it == g_object_descs.end()) return cudaErrorInvalidValue;
+    *desc = it->second.res;
+    return cudaSuccess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaGetTextureObjectTextureDesc(cudaTextureDesc* desc, cudaTextureObject_t obj) {
+  return guard("cudaGetTextureObjectTextureDesc", [&](State& s) -> cudaError_t {
+    if (!desc || !current(s).textures().count(static_cast<uint64_t>(obj))) return cudaErrorInvalidValue;
+    const auto it = g_object_descs.find(static_cast<uint64_t>(obj));
+    if (it == g_object_descs.end()) return cudaErrorInvalidValue;
+    *desc = it->second.tex;
+    return cudaSuccess;
+  });
+}
+VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceViewDesc(cudaResourceViewDesc* desc, cudaTextureObject_t obj) {
+  return guard("cudaGetTextureObjectResourceViewDesc", [&](State& s) -> cudaError_t {
+    (void)desc;
+    (void)obj;
+    (void)s;
+    return cudaErrorInvalidValue;   // no object made here has a resource view
+  });
+}
+VGPU_EXPORT cudaError_t cudaGetSurfaceObjectResourceDesc(cudaResourceDesc* desc, cudaSurfaceObject_t obj) {
+  return guard("cudaGetSurfaceObjectResourceDesc", [&](State& s) -> cudaError_t {
+    if (!desc || !current(s).textures().count(static_cast<uint64_t>(obj))) return cudaErrorInvalidValue;
+    const auto it = g_object_descs.find(static_cast<uint64_t>(obj));
+    if (it == g_object_descs.end()) return cudaErrorInvalidValue;
+    *desc = it->second.res;
+    return cudaSuccess;
+  });
 }
 
 // Managed memory is one allocation the CPU and GPU both address. Device memory
@@ -3961,6 +4330,30 @@ VGPU_EXPORT cudaError_t cudaMemPrefetchAsync(const void* p, size_t n, int device
 }
 VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise kind, int device) {
   return guard("cudaMemAdvise", [&](State& s) { return advise(s, p, n, kind, device); });
+}
+#endif
+
+// CUDA 12.2 added the location-taking forms under _v2 names, and CUDA 13 gave
+// them the plain ones (above). A program built against 12.2 to 12.9 that asks
+// for a location -- a host location, a NUMA node -- calls these.
+#if CUDART_VERSION >= 12020 && CUDART_VERSION < 13000
+VGPU_EXPORT cudaError_t cudaMemPrefetchAsync_v2(const void* p, size_t n, struct cudaMemLocation loc,
+                                                unsigned int flags, cudaStream_t stream) {
+  (void)flags;   // reserved, as the documentation says
+  (void)stream;
+  return guard("cudaMemPrefetchAsync_v2", [&](State& s) -> cudaError_t {
+    if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
+      return cudaErrorInvalidValue;
+    return prefetch(s, p, n, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
+  });
+}
+VGPU_EXPORT cudaError_t cudaMemAdvise_v2(const void* p, size_t n, cudaMemoryAdvise kind,
+                                         struct cudaMemLocation loc) {
+  return guard("cudaMemAdvise_v2", [&](State& s) -> cudaError_t {
+    if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
+      return cudaErrorInvalidValue;
+    return advise(s, p, n, kind, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
+  });
 }
 #endif
 
@@ -4321,6 +4714,13 @@ VGPU_EXPORT cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t start, cudaE
   *ms = std::chrono::duration<float, std::milli>(b->when - a->when).count();
   return cudaSuccess;
 }
+// CUDA 12.8 added _v2 of the elapsed-time query for the event kinds it brought;
+// for the events this engine makes it is the same query.
+#if CUDART_VERSION >= 12080
+VGPU_EXPORT cudaError_t cudaEventElapsedTime_v2(float* ms, cudaEvent_t start, cudaEvent_t end) {
+  return cudaEventElapsedTime(ms, start, end);
+}
+#endif
 VGPU_EXPORT cudaError_t cudaEventDestroy(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
   std::lock_guard<std::mutex> lock(g_event_mu);
@@ -7855,6 +8255,11 @@ VGPU_PT_ALIAS(cudaMemcpy3D_ptds, cudaMemcpy3D)
 VGPU_PT_ALIAS(cudaMemcpy3DPeer_ptds, cudaMemcpy3DPeer)
 VGPU_PT_ALIAS(cudaMemset_ptds, cudaMemset)
 VGPU_PT_ALIAS(cudaMemset2D_ptds, cudaMemset2D)
+VGPU_PT_ALIAS(cudaMemset3D_ptds, cudaMemset3D)
+VGPU_PT_ALIAS(cudaMemset3DAsync_ptsz, cudaMemset3DAsync)
+VGPU_PT_ALIAS(cudaMemcpy2DToArrayAsync_ptsz, cudaMemcpy2DToArrayAsync)
+VGPU_PT_ALIAS(cudaMemcpy2DFromArrayAsync_ptsz, cudaMemcpy2DFromArrayAsync)
+VGPU_PT_ALIAS(cudaMemcpy2DArrayToArray_ptds, cudaMemcpy2DArrayToArray)
 VGPU_PT_ALIAS(cudaMemcpyPeer_ptds, cudaMemcpyPeer)
 VGPU_PT_ALIAS(cudaMemcpyToArray_ptds, cudaMemcpyToArray)
 VGPU_PT_ALIAS(cudaMemcpyFromArray_ptds, cudaMemcpyFromArray)

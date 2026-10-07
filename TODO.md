@@ -542,6 +542,21 @@ Updated: 2026-09-01 (rev 4). See ARCHITECTURE.md for the design behind these.
 - Multi-GPU: peer access queries and cudaMemcpyPeer(Async) across virtual
   devices (all_reduce and p2p_thrasher take their real peer-DMA paths).
 - Configurable virtual VRAM (VGPU_VRAM_MB); VGPU_TRACE coverage-growth logging.
+- Runtime entry points the toolkit exports and this lacked (found by
+  comparing the exported names against cuda_runtime_api.h of 12.0 to 12.9):
+  cudaMemset3D(Async), cudaChooseDevice, cudaInitDevice,
+  cudaDeviceGetByPCIBusId, cudaMemcpy2DToArrayAsync, cudaMemcpy2DFromArrayAsync,
+  cudaMemcpy2DArrayToArray, the texture and surface descriptor getters,
+  cudaMemAdvise_v2 and cudaMemPrefetchAsync_v2, cudaFuncGetName and
+  cudaFuncGetParamInfo, the shared-memory-bank config calls and the
+  deprecated cudaThread* spellings. cudaOccupancyMaxActiveClusters and
+  cudaOccupancyMaxPotentialClusterSize are exported and refuse by name: they
+  need the device's SM-to-GPC grouping, which no profile records. Still
+  missing, with reasons in the commit that added these: cudaGetFuncBySymbol and
+  cudaGetKernel (a CUfunction/CUkernel for a host stub), the external
+  memory/semaphore interop family, the graph-node generic setters
+  (cudaGraphAddNode, cudaGraph*NodeSetParams), the _v2 edge-data graph calls
+  of 12.3 to 12.9, and cudaMemcpyBatchAsync.
 
 ## Hardware characterization
 
