@@ -2370,6 +2370,15 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  # PyTorch's own SASS on a Turing card (sm_75, a T4): the executor runs every kernel, none falls back to PTX.
+  add_test(NAME e2e_pytorch_sass_sm75 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/sass_sm75.py 4 nvidia/t4)
+  set_tests_properties(e2e_pytorch_sass_sm75 PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
   # handle -- the paths PyTorch's CUDA build takes -- against host references.
   add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
