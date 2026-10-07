@@ -1213,6 +1213,11 @@ add_test(NAME smi_format COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_fo
 set_tests_properties(smi_format PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
 add_test(NAME smi_queries COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_queries.sh)
 set_tests_properties(smi_queries PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+# NVRTC through the toolkit's real libnvrtc from a pip wheel (PyTorch's jiterator): its builtins library
+# lives beside it, on no search path. Needs no nvcc and no GPU; skips without the wheel.
+add_test(NAME nvrtc_builtins COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvrtc_builtins.sh)
+set_tests_properties(nvrtc_builtins PROPERTIES DEPENDS vgpunvrtc SKIP_REGULAR_EXPRESSION "^SKIP:"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 60)
 # The rest of the command-line surface scripts drive: nvidia-smi's -d, -x, -h,
 # loops and field checks, the drop-in scripts, rocm-smi's own flags; vgpu
 # shell's defaults, identity, flag checks and exit status; and the exit codes
