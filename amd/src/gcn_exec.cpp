@@ -2162,7 +2162,7 @@ struct Machine {
     } else if (op == "v_mad_i32_i16"_op) {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
-                   static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + static_cast<int32_t>(lane_src(w, in.src[2], lane))));
+                   static_cast<uint32_t>(i16(0, lane) * i16(1, lane)) + lane_src(w, in.src[2], lane));   // wraps, as the hardware's 32-bit add does
       });
     } else if (op == "v_med3_i16"_op || op == "v_med3_u16"_op) {
       each([&](uint32_t lane) {
