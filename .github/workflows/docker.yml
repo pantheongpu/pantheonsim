@@ -112,8 +112,11 @@ jobs:
           run vgpu demo vectoradd --gpu nvidia/h100 | tee /dev/stderr | grep -q '^PASS'
           run bash -c 'VGPU_GPU=nvidia/h100 nvidia-smi -L'
           run bash -c 'VGPU_GPU=amd/mi300x rocm-smi --showproductname | head -5'
-          # Nothing in /opt/pantheonsim may need a library the image lacks.
-          run bash -c 'for f in /opt/pantheonsim/vgpu /opt/pantheonsim/*.so.*; do
+          # Nothing in /opt/pantheonsim may need a library the image lacks. The
+          # shim's libraries find one another through the shim directory, as
+          # they do under `vgpu run`.
+          run bash -c 'export LD_LIBRARY_PATH=/opt/pantheonsim/shim
+                       for f in /opt/pantheonsim/vgpu /opt/pantheonsim/*.so.*; do
                          [ -f "$f" ] && ldd "$f" 2>/dev/null | grep "not found" && echo "unresolved in $f" && exit 1; done; true'
 
       # The image has no compiler on purpose. This is the recipe for adding one:
