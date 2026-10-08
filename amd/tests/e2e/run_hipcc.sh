@@ -348,6 +348,13 @@ for prog in atomics memory graphs cooperative streams; do
   fi
 done
 
+# And gfx1250's own instructions against the host (hipcc/gfx1250.cpp): 64-bit integer arithmetic, the clamped
+# adds, packed saturating shifts, tanh, bfloat16 functions, 8-bit floats to half and an f64 atomic.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 instruction program runs to the end" "0" "$status"
+expect "every gfx1250 instruction check holds" "7 of 7" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

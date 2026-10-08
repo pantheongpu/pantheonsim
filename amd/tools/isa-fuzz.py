@@ -64,7 +64,7 @@ def disassemble(word, nbytes):
                        text=True)
     if p.returncode != 0 or 'warning' in p.stderr or 'error' in p.stderr or 'Invalid' in p.stdout:
         return None
-    if 'src_flat_scratch' in p.stdout or 'pops_exiting' in p.stdout:
+    if 'src_flat_scratch' in p.stdout or 'pops_exiting' in p.stdout or 'src_vccz' in p.stdout or 'src_execz' in p.stdout:
         return None   # special registers the simulator does not model
     lines = [l.strip() for l in p.stdout.splitlines() if l.strip() and not l.strip().startswith('.')]
     return lines[0] if len(lines) == 1 else None
@@ -76,8 +76,8 @@ def disassemble(word, nbytes):
 # prints without a suffix.
 SKIP = re.compile(r'^(s_sendmsg|s_wait_alu|ds_swizzle|s_prefetch|s_buffer_prefetch|s_atc_probe|v_cvt_pk_f16_(fp8|bf8)'
                   r'|v_pipeflush|v_nop|v_movrel|v_add_(max|min)_|s_version|s_getreg|s_setreg|s_incperflevel|s_decperflevel|s_set_vgpr_msb|s_denorm_mode|s_barrier_wait|s_barrier_leave|s_nop|s_sleep|s_sethalt|s_setprio|s_endpgm|s_monitor_sleep|s_wait_|s_delay_alu)')
-# Source codes for the special registers (src_vccz, src_execz, the flat-scratch and POPS ones) the decoder does not
-# take yet; a source field that lands on one is moved to an ordinary SGPR.
+# Source codes for the special registers LLVM prints but its assembler refuses on this part (src_vccz, src_execz) or the
+# decoder does not take (the flat-scratch and POPS ones); a source field that lands on one is moved to an ordinary SGPR.
 SRC_FIELDS = ('SRC0', 'SRC1', 'SRC2', 'SSRC0', 'SSRC1', 'SDATA_SRC')
 
 
@@ -87,7 +87,7 @@ def tame_sources(word, fields, name):
             continue
         v = field_value(word, fields[fn])
         # (240 to 248 are the inline floats, which LLVM prints as a half's bits in a 16-bit integer operation.)
-        if (209 <= v <= 239 or 249 <= v <= 250 or v == 254 or (240 <= v <= 248 and re.search(r'_[ui]16|bitop3_b16', name)) or
+        if (209 <= v <= 239 or 249 <= v <= 252 or v == 254 or (240 <= v <= 248 and re.search(r'_[ui]16|bitop3_b16', name)) or
                 (128 <= v <= 248 and re.match(r'^s_.*_f16$', name))):
             word = put(word, fields[fn], v & 0x3F)
     return word

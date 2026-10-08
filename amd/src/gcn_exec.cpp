@@ -509,9 +509,6 @@ struct Machine {
       // RDNA's null register reads zero, and SCC reads as 0 or 1.
       case OperandKind::Null: return 0;
       case OperandKind::Scc: return w.scc ? 1 : 0;
-      // src_vccz and src_execz: 1 when VCC (EXEC) is all zeroes, over the wave's lanes.
-      case OperandKind::Vccz: return (w.vcc & (w.lanes >= 64 ? ~0ull : (1ull << w.lanes) - 1)) == 0;
-      case OperandKind::Execz: return (w.exec & (w.lanes >= 64 ? ~0ull : (1ull << w.lanes) - 1)) == 0;
       case OperandKind::Ttmp:
         if (o.index + o.width > 16) break;
         return o.width >= 2 ? w.ttmp[o.index] | static_cast<uint64_t>(w.ttmp[o.index + 1]) << 32 : w.ttmp[o.index];

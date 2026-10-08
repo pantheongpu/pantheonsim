@@ -33,7 +33,7 @@ const char* enc_name(Enc e);
 // apertures' limits beside their bases.
 enum class OperandKind {
   Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal,
-  Ttmp, Null, Scc, SharedLimit, PrivateLimit, Vccz, Execz, None
+  Ttmp, Null, Scc, SharedLimit, PrivateLimit, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;

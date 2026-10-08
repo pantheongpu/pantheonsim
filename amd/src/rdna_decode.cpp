@@ -282,9 +282,6 @@ Operand operand(uint32_t code, uint32_t width) {
     static const double kFloats[] = {0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.15915494309189532};
     o.kind = OperandKind::InlineFloat;
     o.fvalue = kFloats[code - 240];
-  } else if (code == 251 || code == 252) {
-    o.kind = code == 251 ? OperandKind::Vccz : OperandKind::Execz;   // 1 when VCC (EXEC) is zero
-    o.width = 1;
   } else if (code == 253) {
     o.kind = OperandKind::Scc;
     o.width = 1;
@@ -1188,8 +1185,6 @@ std::string reg_text(const Operand& o) {
     case OperandKind::Scc: return "src_scc";
     case OperandKind::SharedLimit: return "src_shared_limit";
     case OperandKind::PrivateLimit: return "src_private_limit";
-    case OperandKind::Vccz: return "src_vccz";
-    case OperandKind::Execz: return "src_execz";
     default: return operand_text(o);
   }
 }
