@@ -845,7 +845,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (size == 5) {
         write64(w, ins.dst[0], 0, read64(w, c, 0));
       } else {
-        uint32_t v = read32(w, c, 0);
+        // A narrow load (.U8 .S8 .U16 .S16) takes its bytes out of the aligned word, as the indexed
+        // form above does: c[0x3][0x59] is a byte of the word at 0x58, not a 4-byte load at 0x59.
+        uint32_t v = size < 4 ? cbank32(c.reg, static_cast<uint64_t>(c.imm) & ~3ull) >> (8 * (static_cast<uint64_t>(c.imm) & 3))
+                              : read32(w, c, 0);
         switch (size) {
           case 0: v &= 0xff; break;
           case 1: v = static_cast<uint32_t>(static_cast<int8_t>(v)); break;
