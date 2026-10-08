@@ -424,7 +424,16 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         const uint32_t r = lop3(read32(w, ins.src[0], l), read32(w, ins.src[1], l), read32(w, ins.src[2], l), ins.f[0]);
         write32(w, d, l, r);
-        if (has_p) set_pred(w, ins.dst[0], l, ins.f[1] ? r == kAll : r != 0);
+        // The last operand is a predicate the answer is ORed with: ptxas chains the low and
+        // high words of a 64-bit "(a & b) != 0" as
+        //   LOP3.LUT P0, RZ, lo_a, lo_b, RZ, 0xc0, !PT
+        //   LOP3.LUT P0, RZ, hi_a, hi_b, RZ, 0xc0,  P0
+        // and !PT, the usual value, is false, which leaves the answer alone. (.PAND is
+        // left as it was: no compiled code that sets it has been checked against a card.)
+        if (has_p) {
+          const bool in = pred(w, ins.src[4], l);
+          set_pred(w, ins.dst[0], l, ins.f[1] ? r == kAll : (r != 0 || in));
+        }
       });
       return;
     }
@@ -1118,9 +1127,11 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         for (unsigned l = 0; l < 32; ++l) r[l] |= (s[0][l] ^ ma) & (s[1][l] ^ mb) & (s[2][l] ^ mc);
       }
       if (has_p) {
+        if (ins.src.size() < 5) return false;
         Mask pm = 0;
         for (unsigned l = 0; l < 32; ++l)
           if (ins.f[1] ? r[l] == kAll : r[l] != 0) pm |= Mask{1} << l;
+        if (!ins.f[1]) pm |= pmask(ins.src[4]);   // ORed with the predicate operand, as the general path does
         setp(ins.dst[0], pm);
       }
       store(has_p ? ins.dst[1] : ins.dst[0]);

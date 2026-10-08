@@ -1826,6 +1826,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_lop3_pred_chain
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
+  set_tests_properties(e2e_lop3_pred_chain PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_host_atomics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
   set_tests_properties(e2e_host_atomics PROPERTIES
