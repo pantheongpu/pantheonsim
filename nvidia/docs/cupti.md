@@ -150,7 +150,7 @@ NVIDIA's). Enabled domains and callbacks are delivered as the call happens:
   initialisation finished.
 - **Synchronize**: stream and context synchronized.
 
-`nvidia/tests/e2e/run_cupti_trace.sh` runs one program that traces itself
+`nvidia/tests/e2e/run_cupti_case.sh trace` runs one program that traces itself
 through both APIs and compares what it prints, with timestamps and id values
 removed, with the trace NVIDIA's CUPTI printed for the same program on an RTX
 3060 (`nvidia/tests/data/cupti_trace.expected`). `--card` runs the program
@@ -170,10 +170,20 @@ with a table to fill in. `libcupti` exports that entry point, so a profiler that
 sets the variable to this library (as it does to NVIDIA's) receives markers,
 ranges (push/pop and start/end), domains, registered strings and thread names as
 `MARKER`, `MARKER_DATA` and `NAME` records and as `CUPTI_CB_DOMAIN_NVTX`
-callbacks. `nvidia/tests/e2e/run_cupti_nvtx.sh` compares them with what NVIDIA's
+callbacks. `nvidia/tests/e2e/run_cupti_case.sh nvtx` compares them with what NVIDIA's
 CUPTI printed for the same calls. The wide-character spellings (`nvtxMarkW`,
 `nvtxRangePushW`, ...) are not delivered, because NVIDIA's CUPTI does not
 deliver them either (measured).
+
+## External correlation
+
+`cuptiActivityPushExternalCorrelationId` / `Pop` keep one stack per kind per
+thread. While any is non-empty, each runtime call is reported with an
+`EXTERNAL_CORRELATION` record per kind (innermost tag first by kind, ahead of
+the call's own record) carrying the tag and the call's correlation id: how
+PyTorch's profiler ties a kernel to the operator that launched it. Popping an
+empty stack is `CUPTI_ERROR_QUEUE_EMPTY`, as on NVIDIA's (measured).
+`run_cupti_case.sh extcorr` compares all of it with the card.
 
 ## What is not implemented, and why
 

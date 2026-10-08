@@ -30,6 +30,9 @@
 #define VGPU_NVTX 1
 #define NVTX_NO_IMPL 1
 #include <nvtx3/nvToolsExt.h>
+#if __has_include(<nvtx3/nvToolsExtSync.h>)
+#include <nvtx3/nvToolsExtSync.h>
+#endif
 #include <generated_nvtx_meta.h>
 #endif
 #endif
@@ -111,7 +114,8 @@ bool produced(CUpti_ActivityKind k) {
          k == CUPTI_ACTIVITY_KIND_RUNTIME || k == CUPTI_ACTIVITY_KIND_SYNCHRONIZATION ||
          k == CUPTI_ACTIVITY_KIND_DEVICE || k == CUPTI_ACTIVITY_KIND_CONTEXT ||
          k == CUPTI_ACTIVITY_KIND_STREAM || k == CUPTI_ACTIVITY_KIND_MARKER ||
-         k == CUPTI_ACTIVITY_KIND_MARKER_DATA || k == CUPTI_ACTIVITY_KIND_NAME;
+         k == CUPTI_ACTIVITY_KIND_MARKER_DATA || k == CUPTI_ACTIVITY_KIND_NAME ||
+         k == CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION;
 }
 
 void announce_once() {
@@ -352,6 +356,16 @@ size_t fill_marker_data(uint8_t* out, const vgpu::profiling::Event& e) {
   return sizeof *r;
 }
 
+size_t fill_external(uint8_t* out, const vgpu::profiling::Event& e) {
+  auto* r = reinterpret_cast<CUpti_ActivityExternalCorrelation*>(out);
+  std::memset(r, 0, sizeof *r);
+  r->kind = CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION;
+  r->externalKind = static_cast<CUpti_ExternalCorrelationKind>(e.flags);
+  r->externalId = e.handle;
+  r->correlationId = e.correlation;
+  return sizeof *r;
+}
+
 size_t fill_name(uint8_t* out, const vgpu::profiling::Event& e) {
   auto* r = reinterpret_cast<CUpti_ActivityName*>(out);
   std::memset(r, 0, sizeof *r);
@@ -435,6 +449,7 @@ size_t kind_size(CUpti_ActivityKind k) {
     case CUPTI_ACTIVITY_KIND_MARKER: return sizeof(CUpti_ActivityMarker2);
     case CUPTI_ACTIVITY_KIND_MARKER_DATA: return sizeof(CUpti_ActivityMarkerData);
     case CUPTI_ACTIVITY_KIND_NAME: return sizeof(CUpti_ActivityName);
+    case CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION: return sizeof(CUpti_ActivityExternalCorrelation);
     default: return sizeof(KernelRecord);
   }
 }
@@ -452,6 +467,7 @@ size_t record_size(const vgpu::profiling::Event& e) {
     case K::Marker: return sizeof(CUpti_ActivityMarker2);
     case K::MarkerData: return sizeof(CUpti_ActivityMarkerData);
     case K::Name: return sizeof(CUpti_ActivityName);
+    case K::ExternalCorrelation: return sizeof(CUpti_ActivityExternalCorrelation);
     default: return sizeof(MemcpyRecord);
   }
 }
@@ -469,6 +485,7 @@ size_t fill(uint8_t* out, const vgpu::profiling::Event& e) {
     case K::Marker: return fill_marker(out, e);
     case K::MarkerData: return fill_marker_data(out, e);
     case K::Name: return fill_name(out, e);
+    case K::ExternalCorrelation: return fill_external(out, e);
     default: return fill_memcpy(out, e);
   }
 }
@@ -488,6 +505,7 @@ bool kind_wanted(const vgpu::profiling::Event& e) {
     case K::Marker: return g_kinds[CUPTI_ACTIVITY_KIND_MARKER];
     case K::MarkerData: return g_kinds[CUPTI_ACTIVITY_KIND_MARKER_DATA];
     case K::Name: return g_kinds[CUPTI_ACTIVITY_KIND_NAME];
+    case K::ExternalCorrelation: return g_kinds[CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION];
     default: return g_kinds[CUPTI_ACTIVITY_KIND_MEMCPY];
   }
 }
@@ -869,7 +887,7 @@ void install_hooks() {
 bool known_domain(CUpti_CallbackDomain d) {
   return d == CUPTI_CB_DOMAIN_DRIVER_API || d == CUPTI_CB_DOMAIN_RUNTIME_API ||
          d == CUPTI_CB_DOMAIN_RESOURCE || d == CUPTI_CB_DOMAIN_SYNCHRONIZE ||
-         d == CUPTI_CB_DOMAIN_NVTX || d == CUPTI_CB_DOMAIN_STATE;
+         d == CUPTI_CB_DOMAIN_NVTX;
 }
 
 CUptiResult set_callback(uint32_t enable, CUpti_SubscriberHandle sub, CUpti_CallbackDomain d, uint32_t id) {
@@ -1398,12 +1416,20 @@ VGPU_EXPORT CUptiResult cuptiNvtxInitialize(void*) { return CUPTI_SUCCESS; }
 VGPU_EXPORT CUptiResult cuptiNvtxInitialize2(void*) { return CUPTI_SUCCESS; }
 VGPU_EXPORT CUptiResult cuptiOpenACCInitialize(void*) { return CUPTI_ERROR_NOT_SUPPORTED; }
 
-VGPU_EXPORT CUptiResult cuptiActivityPushExternalCorrelationId(CUpti_ExternalCorrelationKind,
-                                                              uint64_t) {
+VGPU_EXPORT CUptiResult cuptiActivityPushExternalCorrelationId(CUpti_ExternalCorrelationKind kind,
+                                                              uint64_t id) {
+  // Kind 0 is invalid; the rest index the stacks. NVIDIA's reports a kind
+  // outside its range as an invalid parameter.
+  if (kind == CUPTI_EXTERNAL_CORRELATION_KIND_INVALID || !vgpu::profiling::push_external(static_cast<int>(kind), id))
+    return CUPTI_ERROR_INVALID_PARAMETER;
   return CUPTI_SUCCESS;
 }
-VGPU_EXPORT CUptiResult cuptiActivityPopExternalCorrelationId(CUpti_ExternalCorrelationKind,
+VGPU_EXPORT CUptiResult cuptiActivityPopExternalCorrelationId(CUpti_ExternalCorrelationKind kind,
                                                              uint64_t* last) {
-  if (last) *last = 0;
+  if (kind == CUPTI_EXTERNAL_CORRELATION_KIND_INVALID) return CUPTI_ERROR_INVALID_PARAMETER;
+  uint64_t popped = 0;
+  // An empty stack is CUPTI_ERROR_QUEUE_EMPTY (18), measured on an RTX 3060.
+  if (!vgpu::profiling::pop_external(static_cast<int>(kind), &popped)) return CUPTI_ERROR_QUEUE_EMPTY;
+  if (last) *last = popped;
   return CUPTI_SUCCESS;
 }

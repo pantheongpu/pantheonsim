@@ -24,6 +24,8 @@ thread_local const void* t_args[16];           // the next call's arguments (not
 thread_local int t_nargs = 0;
 thread_local const char* t_symbol = nullptr;
 
+thread_local std::vector<uint64_t> t_external[kExternalKinds];
+
 std::mutex g_hook_mu;
 Hooks g_hooks;
 std::atomic<bool> g_hooked{false};
@@ -62,6 +64,18 @@ uint64_t now_ns() {
 uint32_t next_correlation() { return g_correlation.fetch_add(1, std::memory_order_relaxed); }
 
 uint32_t work_correlation() { return t_api_correlation ? t_api_correlation : next_correlation(); }
+
+bool push_external(int kind, uint64_t id) {
+  if (kind < 0 || kind >= kExternalKinds) return false;
+  t_external[kind].push_back(id);
+  return true;
+}
+bool pop_external(int kind, uint64_t* last) {
+  if (kind < 0 || kind >= kExternalKinds || t_external[kind].empty()) return false;
+  if (last) *last = t_external[kind].back();
+  t_external[kind].pop_back();
+  return true;
+}
 
 void set_hooks(const Hooks& h) {
   std::lock_guard<std::mutex> lock(g_hook_mu);
@@ -169,6 +183,17 @@ ApiCall::~ApiCall() {
     }
   }
   if (!enabled()) return;
+  // The tags in force when the call was made, one per kind, ahead of the call.
+  for (int k = 0; k < kExternalKinds; ++k) {
+    if (t_external[k].empty()) continue;
+    Event x;
+    x.kind = EventKind::ExternalCorrelation;
+    x.start_ns = x.end_ns = start_;
+    x.correlation = correlation_;
+    x.flags = static_cast<uint32_t>(k);
+    x.handle = t_external[k].back();
+    record(std::move(x));
+  }
   Event e;
   e.kind = EventKind::Api;
   e.start_ns = start_;

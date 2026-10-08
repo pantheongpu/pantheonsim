@@ -2020,7 +2020,7 @@ if(TARGET vgpucupti)
   # The trace a program gets of itself -- callbacks and activity records --
   # against the one NVIDIA's CUPTI printed for the same program on an RTX 3060.
   add_test(NAME e2e_cupti_trace
-           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_trace.sh)
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh trace)
   set_tests_properties(e2e_cupti_trace PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -2029,8 +2029,18 @@ if(TARGET vgpucupti)
 
   # NVTX markers and ranges through CUPTI, against what NVIDIA's printed.
   add_test(NAME e2e_cupti_nvtx
-           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_nvtx.sh)
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh nvtx)
   set_tests_properties(e2e_cupti_nvtx PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # External correlation ids, which a framework's profiler uses to tie a kernel
+  # to the operator that launched it.
+  add_test(NAME e2e_cupti_extcorr
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh extcorr)
+  set_tests_properties(e2e_cupti_extcorr PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"

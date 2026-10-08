@@ -24,7 +24,7 @@ namespace vgpu::profiling {
 //
 // Sync: a stream, context or event wait that returned; Stream and Context: a
 // resource coming into being, which a profiler lists once.
-enum class EventKind : uint8_t { Kernel, Memcpy, Memset, Api, Sync, Stream, Context, Device, Marker, MarkerData, Name };
+enum class EventKind : uint8_t { Kernel, Memcpy, Memset, Api, Sync, Stream, Context, Device, Marker, MarkerData, Name, ExternalCorrelation };
 
 // What a copy's two ends are, as a profiler classifies them.
 enum class MemKind : uint8_t { Unknown, Pageable, Pinned, Device, Array, Managed };
@@ -125,6 +125,14 @@ void notify_sync(SyncKind what, uint64_t stream);
 // when nobody listens.
 void note_args(const void* const* args, int n);
 void note_symbol(const char* name);
+
+// External correlation ids: a framework tags the work it is about to issue
+// ("this is op 100") with a push, and every API call made while the tag is on
+// the thread's stack for its kind is reported with it. One stack per kind per
+// thread, as NVIDIA's.
+constexpr int kExternalKinds = 8;
+bool push_external(int kind, uint64_t id);    // false: no such kind
+bool pop_external(int kind, uint64_t* last);  // false: the stack is empty
 
 // A stretch of the shim's own code that makes public calls on the program's
 // behalf (a front end asking the runtime what a device is): they are not the
