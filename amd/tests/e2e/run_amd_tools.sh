@@ -144,6 +144,19 @@ else
   else
     echo "skip  ROCm's rocm_agent_enumerator: no ROCm here"
   fi
+  # LLVM's offload-arch (amdgpu-arch), which OpenMP offload and CMake's
+  # HIP language use to find the GPUs, reads the driver's own directory,
+  # /sys/devices/virtual/kfd/kfd, and not the class.
+  arch=$(ls /opt/rocm/lib/llvm/bin/offload-arch "$HOME"/.local/share/rocm-*/opt/rocm-*/lib/llvm/bin/offload-arch 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$arch" ]]; then
+    for g in amd/mi300x amd/rx7900xtx amd/mi250x; do
+      want=$(sess "$g" -c 'rocm_agent_enumerator -t GPU' | sort -u)
+      expect "ROCm's offload-arch, unmodified, finds the GPUs ($g)" "$want $want" \
+        "$(isolated "$g" -c "'$arch' --only=amdgpu" | paste -sd' ')"
+    done
+  else
+    echo "skip  ROCm's offload-arch: no ROCm LLVM here"
+  fi
 fi
 
 # --- ROCm's own rocm-smi, on the simulator's librocm_smi64 ---

@@ -1258,6 +1258,16 @@ set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# OpenMP target offloading (LLVM's libomptarget, whose AMD plugin drives the HSA
+# runtime directly), built by ROCm's amdclang++ for every simulated GPU's ISA.
+add_test(NAME amd_openmp COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_openmp.sh)
+set_tests_properties(amd_openmp PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# OpenCL (ROCm's runtime and compiler library over the simulator's HSA runtime)
+# on every simulated GPU.
+add_test(NAME amd_opencl COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_opencl.sh)
+set_tests_properties(amd_opencl PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # AMD's hipFFT, hipRAND, hipSOLVER and hipSPARSE, unmodified, where ROCm with
 # them is installed or PyTorch's ROCm wheel is.
 add_test(NAME amd_libraries COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_libraries.sh)
