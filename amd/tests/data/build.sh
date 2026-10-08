@@ -109,3 +109,9 @@ open("bundle_zlib.bin", "wb").write(head + packed)'
   "$lld" -shared vector_add.gfx942.o -o vector_add.gfx942.hsaco
   echo "wrote the bundles, linked.gfx942.hsaco and vector_add.gfx942.hsaco"
 fi
+
+# devmalloc.gfx942.hsaco: device-side malloc and free (devmalloc.cpp), which needs hipcc. Run by
+# test_amd_runtime_gaps. hipcc --genco writes an offload bundle; the code object is its gfx942 entry.
+#   hipcc --genco --offload-arch=gfx942 -O1 devmalloc.cpp -o devmalloc.co
+#   clang-offload-bundler --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx942 \
+#       --input=devmalloc.co --output=devmalloc.gfx942.hsaco

@@ -709,6 +709,41 @@ hsa_status_t hsa_amd_ipc_memory_attach(const hsa_amd_ipc_memory_t* handle, size_
                                        const hsa_agent_t* mapping_agents, void** mapped_ptr);
 hsa_status_t hsa_amd_ipc_memory_detach(void* mapped_ptr);
 
+/* ---- Further AMD extensions (hsa_ext_amd.h) -------------------------------- */
+
+enum { HSA_AMD_SIGNAL_AMD_GPU_ONLY = 1, HSA_AMD_SIGNAL_IPC = 2 };
+typedef hsa_amd_ipc_memory_t hsa_amd_ipc_signal_t;
+hsa_status_t hsa_amd_ipc_signal_create(hsa_signal_t signal, hsa_amd_ipc_signal_t* handle);
+hsa_status_t hsa_amd_ipc_signal_attach(const hsa_amd_ipc_signal_t* handle, hsa_signal_t* signal);
+
+uint32_t hsa_amd_signal_wait_any(uint32_t signal_count, hsa_signal_t* signals, hsa_signal_condition_t* conds,
+                                 hsa_signal_value_t* values, uint64_t timeout_hint, hsa_wait_state_t wait_hint,
+                                 hsa_signal_value_t* satisfying_value);
+hsa_status_t hsa_amd_async_function(void (*callback)(void* arg), void* arg);
+
+hsa_status_t hsa_amd_memory_pool_can_migrate(hsa_amd_memory_pool_t src_memory_pool,
+                                             hsa_amd_memory_pool_t dst_memory_pool, bool* result);
+hsa_status_t hsa_amd_memory_migrate(const void* ptr, hsa_amd_memory_pool_t memory_pool, uint32_t flags);
+
+typedef void (*hsa_amd_deallocation_callback_t)(void* ptr, void* user_data);
+hsa_status_t hsa_amd_register_deallocation_callback(void* ptr, hsa_amd_deallocation_callback_t callback,
+                                                    void* user_data);
+hsa_status_t hsa_amd_deregister_deallocation_callback(void* ptr, hsa_amd_deallocation_callback_t callback);
+
+/* The deprecated code object and executable calls (hsa.h). */
+typedef struct hsa_code_object_s { uint64_t handle; } hsa_code_object_t;
+hsa_status_t hsa_code_object_deserialize(void* serialized_code_object, size_t serialized_code_object_size,
+                                         const char* options, hsa_code_object_t* code_object);
+hsa_status_t hsa_code_object_destroy(hsa_code_object_t code_object);
+hsa_status_t hsa_executable_create(hsa_profile_t profile, hsa_executable_state_t executable_state,
+                                   const char* options, hsa_executable_t* executable);
+hsa_status_t hsa_executable_load_code_object(hsa_executable_t executable, hsa_agent_t agent,
+                                             hsa_code_object_t code_object, const char* options);
+hsa_status_t hsa_executable_get_symbol(hsa_executable_t executable, const char* module_name,
+                                       const char* symbol_name, hsa_agent_t agent, int32_t call_convention,
+                                       hsa_executable_symbol_t* symbol);
+hsa_status_t hsa_executable_validate(hsa_executable_t executable, uint32_t* result);
+
 #ifdef __cplusplus
 }
 #endif

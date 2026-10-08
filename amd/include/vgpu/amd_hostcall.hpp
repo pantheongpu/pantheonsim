@@ -10,7 +10,8 @@
 // slot, clears the packet's ready bit, and the kernel, spinning on that bit,
 // carries on.
 //
-// The one service implemented is printf. A printf is a message, carried in as
+// The services implemented are printf, device memory (what device-side malloc
+// and free ask for) and the address sanitizer's report. A printf is a message, carried in as
 // many packets as it needs: the first word says which stream, then the format
 // string, eight bytes to a word, then the arguments -- a word each, or a
 // string's bytes for %s. The host gives the message an id when it begins and
@@ -46,14 +47,18 @@ class Hostcall {
 
   // Does the host's part for every packet the device has made ready. Safe to
   // call from several threads at once; throws, naming it, for a service
-  // other than printf.
+  // other than printf, device memory and the sanitizer's report.
   void service();
 
   // The protocol's service numbers, as ockl's services.cl gives them.
   static constexpr uint32_t kServicePrintf = 2;
+  static constexpr uint32_t kServiceDevmem = 3;      // device malloc's slabs and large blocks
+  static constexpr uint32_t kServiceSanitizer = 4;   // the address sanitizer's report
 
  private:
   void serve_printf(uint64_t payload, uint64_t active);
+  void serve_devmem(uint64_t payload, uint64_t active);
+  void serve_sanitizer(uint64_t payload, uint64_t active);
   uint64_t alloc(uint64_t bytes);
 
   MemoryManager& mem_;
@@ -63,6 +68,7 @@ class Hostcall {
   std::vector<uint64_t> allocations_;
   std::mutex mu_;
   std::map<uint64_t, std::vector<uint64_t>> messages_;   // by id: the words so far
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> devmem_;   // block -> (allocation it sits in, size)
   uint64_t next_id_ = 1;
 };
 

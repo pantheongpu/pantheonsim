@@ -740,7 +740,10 @@ hipError_t create_texture(void** handle, const ResourceDesc* res, const TextureD
     if (!srgb_of(format, channels, normalized, &srgb)) return hipErrorInvalidValue;
     // A buffer resource's format field has no room for sRGB's codes on gfx11
     // and gfx12, so linear memory read as sRGB is not modelled.
-    if (srgb && res->resType == 2) return fail(hipErrorNotSupported, "sRGB over linear memory is not modelled");
+    if (srgb && res->resType == 2)
+      return fail(hipErrorNotSupported, "hipCreateTextureObject: sRGB over linear memory (resType hipResourceTypeLinear) is "
+                                        "not supported: a buffer resource has no sRGB number format here, and what tex1Dfetch "
+                                        "would return for one is not documented; use a 2D pitched allocation or an array");
     im::Format f = image_format(format, channels, normalized);
     if (srgb) f.num = im::Num::Srgb;
     const uint32_t element = channel_bytes(format) * channels;
