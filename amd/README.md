@@ -212,8 +212,13 @@ match a GEMM done on the host. A double's accumulator does not hold its rows
 as a float's does -- each lane group every fourth row, not four together --
 and moving any part of either arrangement makes them fail. Sums are formed in
 double (fused, for doubles) and rounded once; where a sum is not exact, a card
-may round it differently. The reduced-precision xf32 forms, the broadcast
-modifiers, and a wave with lanes switched off are refused.
+may round it differently. The reduced-precision xf32 forms (`v_mfma_f32_16x16x8_xf32`
+and `32x32x4`, gfx940 to gfx942) multiply floats whose mantissa is cut to 10 bits,
+as the MI300 ISA guide describes them: the guide says "round" once and
+"truncated" in each instruction's own text, and the instruction's is taken
+(`test_amd_gcn_asm` checks the layout the guide's general formula gives and the
+cut). The B broadcast pattern (BLGP) and a wave with lanes switched off are
+refused.
 
 A lane can also read another lane's register through the cross-lane form,
 within its row of sixteen: the shifts and the rotate, the two mirrors, the

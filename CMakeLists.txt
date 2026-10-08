@@ -1343,6 +1343,11 @@ set_tests_properties(amd_pytorch_models_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_
 add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
 set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# hipBLASLt's xf32 GEMM (reduced-precision floats, v_mfma_f32_16x16x8_xf32), which PyTorch
+# runs on an MI300X when told a float32 matmul may use it.
+add_test(NAME amd_pytorch_xf32 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh xf32.py 1 1)
+set_tests_properties(amd_pytorch_xf32 PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Two processes, as torchrun runs them: RCCL across processes, and
 # DistributedDataParallel.
 add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
@@ -1409,6 +1414,10 @@ set_tests_properties(amd_hipcc_disasm PROPERTIES DEPENDS test_amd_gcn
 # The HIP structures against the HIP headers, field by field, where ROCm is installed.
 add_test(NAME amd_hip_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_abi.sh)
 set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+# The HIP version the runtime reports, by the library name a program was built to ask for.
+add_test(NAME amd_hip_version COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_version.sh)
+set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn
