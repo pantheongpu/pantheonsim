@@ -238,6 +238,32 @@ VTEST(a_matrix_instruction_broadcasts_a_blocks_a_to_its_group) {
   VCHECK(changed > 0);   // the two broadcasts took different blocks' A
 }
 
+VTEST(a_permute_or_swizzle_that_reads_a_switched_off_lane_gets_zero) {
+  // The MI300 ISA guide: DS_BPERMUTE_B32 returns zero when src_lane is disabled, and DS_SWIZZLE_B32
+  // reads "thread_valid[j] ? thread_in[j] : 0". Lanes that are off keep what they held. rocPRIM's
+  // warp shuffles (test_intrinsics) are written to that, with half the lanes off.
+  const amd::CodeObject o = object("asm_permute_exec");
+  MemoryManager mem(16ull << 20);
+  const uint64_t active = 0x0123456789ABCDEFull;
+  std::vector<uint32_t> in(64);
+  for (uint32_t i = 0; i < 64; ++i) in[i] = 1000 + i;
+  const uint64_t pin = mem.alloc(64 * 4), out = mem.alloc(128 * 4);
+  mem.write(pin, in.data(), 64 * 4);
+  const std::vector<uint32_t> r = run(o, "permute", mem, out, 128, {pin, out});
+  int wrong = 0, zeros = 0;
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    const bool on = active >> lane & 1;
+    const uint32_t from = (lane + 3) & 63, mate = lane ^ 1;
+    const uint32_t want_b = !on ? 0xAAu : (active >> from & 1) ? in[from] : 0u;
+    const uint32_t want_s = !on ? 0xAAu : (active >> mate & 1) ? in[mate] : 0u;
+    wrong += r[lane] != want_b;
+    wrong += r[64 + lane] != want_s;
+    zeros += on && !(active >> from & 1);
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK(zeros > 10);   // the pattern does read disabled lanes
+}
+
 VTEST(a_wave_that_waits_for_a_load_lets_the_waves_beside_it_read_lds_first) {
   // Thread 0 writes an LDS word; after a barrier every thread reads it and the first wave then
   // does a global load and overwrites the word. A card's second wave reads within cycles of the

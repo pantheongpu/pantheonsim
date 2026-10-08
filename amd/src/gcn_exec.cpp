@@ -3500,10 +3500,14 @@ struct Machine {
       } else if (op == "ds_bpermute_b32"_op) {
         // A lane reads what another lane holds: the address says which, in
         // bytes, and the source register is read across the wave.
+        // A lane that is switched off does not give its value: "if src_lane selects a disabled
+        // thread then zero is returned" (the MI300 ISA guide, DS_BPERMUTE_B32).
         const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (w.lanes - 1);
-        write_lane(w, in.dst[0], lane, before[from]);
+        write_lane(w, in.dst[0], lane, w.exec >> from & 1 ? before[from] : 0);
       } else if (op == "ds_swizzle_b32"_op) {
-        write_lane(w, in.dst[0], lane, before[swizzle_source(static_cast<uint32_t>(in.offset), lane)]);
+        // The same: "thread_valid[j] ? thread_in[j] : 0".
+        const uint32_t from = swizzle_source(static_cast<uint32_t>(in.offset), lane);
+        write_lane(w, in.dst[0], lane, w.exec >> from & 1 ? before[from] : 0);
       } else if (op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op || op == "ds_min_f32"_op ||
                  op == "ds_min_rtn_f32"_op || op == "ds_max_f32"_op || op == "ds_max_rtn_f32"_op) {
         // Float atomics, lane by lane, as the integer ones are; the _rtn
