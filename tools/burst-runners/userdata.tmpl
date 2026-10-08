@@ -1,0 +1,82 @@
+#!/bin/bash
+# pantheonsim CI burst runner: two GitHub Actions runner processes on this
+# instance, for the SASS / ASan / TSan jobs (BURST_RUNS_ON). Each has the one label
+# pantheonsim-burst and none of the defaults (self-hosted, Linux, X64), so a job
+# that asks for any other label -- the ML job's pantheonsim-ci -- cannot be given to it. A watchdog shuts
+# the instance down (it terminates on shutdown) when no pull request is open, or
+# after TTL_HOURS whatever the state.
+set -uxo pipefail
+exec > >(tee /var/log/burst-setup.log | logger -t burst-setup -s 2>/dev/console) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+REPO=pantheongpu/pantheonsim
+TOKEN='__TOKEN__'
+RUNNER_VERSION=2.337.0
+NRUNNERS=2
+TTL_HOURS=24
+
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends docker.io curl jq ca-certificates tar git sudo
+systemctl enable --now docker
+
+useradd -m -s /bin/bash runner
+usermod -aG docker runner
+echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner
+
+TOKEN_IMDS=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN_IMDS" http://169.254.169.254/latest/meta-data/instance-id)
+
+curl -sL -o /tmp/runner.tgz "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+for i in $(seq 1 $NRUNNERS); do
+  d=/home/runner/r$i
+  mkdir -p "$d" && tar xzf /tmp/runner.tgz -C "$d" && chown -R runner:runner "$d"
+  (cd "$d" && sudo -u runner ./config.sh --unattended --url "https://github.com/$REPO" --token "$TOKEN" \
+      --name "burst-$IID-$i" --no-default-labels --labels pantheonsim-burst --replace --work _work \
+   && ./svc.sh install runner && ./svc.sh start)
+done
+
+mkdir -p /var/lib/burst
+date +%s > /var/lib/burst/started
+echo 0 > /var/lib/burst/zero
+cat > /usr/local/bin/burst-watchdog.sh <<'WD'
+#!/bin/bash
+# Every 5 minutes. Shut down when no pull request has been open for three checks
+# in a row and no job is running, or when the lifetime cap is over (waiting for a
+# running job to finish for up to two more hours).
+REPO=pantheongpu/pantheonsim
+TTL_HOURS=__TTL__
+now=$(date +%s); started=$(cat /var/lib/burst/started); age=$((now - started))
+busy=0; pgrep -f Runner.Worker >/dev/null && busy=1
+count=$(curl -sf --max-time 20 "https://api.github.com/search/issues?q=repo:$REPO+type:pr+state:open&per_page=1" | jq -r .total_count 2>/dev/null)
+zero=$(cat /var/lib/burst/zero)
+if [[ "$count" =~ ^[0-9]+$ ]]; then
+  if (( count == 0 )); then zero=$((zero + 1)); else zero=0; fi
+  echo "$zero" > /var/lib/burst/zero
+fi
+logger -t burst-watchdog "open PRs: ${count:-unknown}, zero checks: $zero, busy: $busy, age: ${age}s"
+if (( busy == 0 )) && { (( zero >= 3 )) || (( age > TTL_HOURS * 3600 )); }; then
+  logger -t burst-watchdog "shutting down"; shutdown -h now
+elif (( age > (TTL_HOURS + 2) * 3600 )); then
+  logger -t burst-watchdog "lifetime cap with a job still running: shutting down"; shutdown -h now
+fi
+WD
+sed -i "s/__TTL__/$TTL_HOURS/" /usr/local/bin/burst-watchdog.sh
+chmod +x /usr/local/bin/burst-watchdog.sh
+cat > /etc/systemd/system/burst-watchdog.service <<'UNIT'
+[Unit]
+Description=Shut down when the pull request backlog is empty
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/burst-watchdog.sh
+UNIT
+cat > /etc/systemd/system/burst-watchdog.timer <<'UNIT'
+[Unit]
+Description=Backlog watchdog
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now burst-watchdog.timer
+echo "burst setup done: $(date -u)"
