@@ -316,9 +316,18 @@ RSMI_API int rsmi_dev_vbios_version_get(uint32_t d, char*, uint32_t) {
   DEVICE(d, s);
   return kNotSupported;
 }
-RSMI_API int rsmi_dev_firmware_version_get(uint32_t d, int, uint64_t*) {
+// The compute microengine's (MEC) is the one firmware anything here asks for: RCCL 2.27 reads it to
+// know whether a card needs HSA_NO_SCRATCH_RECLAIM, and refuses to start without the variable when it
+// is missing. An MI300-class card reports the version RCCL accepts (amd_chip.hpp); the other blocks,
+// and the other chips, are not modelled.
+RSMI_API int rsmi_dev_firmware_version_get(uint32_t d, int block, uint64_t* fw_version) {
+  if (!fw_version) return kInvalidArgs;
   DEVICE(d, s);
-  return kNotSupported;
+  const uint32_t mec = vgpu::amd::chip(s.architecture).mec_fw;
+  constexpr int kBlockMec = 5;   // RSMI_FW_BLOCK_MEC
+  if (block != kBlockMec || mec == 0) return kNotSupported;
+  *fw_version = mec;
+  return kSuccess;
 }
 // Stable per device: from the UUID NVML and amd-smi report, as `vgpu smi`'s.
 RSMI_API int rsmi_dev_unique_id_get(uint32_t d, uint64_t* id) {
