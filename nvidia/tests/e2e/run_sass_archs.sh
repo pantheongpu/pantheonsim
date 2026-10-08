@@ -71,6 +71,19 @@ if (( ${rmaj:-0} < 13 )); then
   for p in "${progs[@]}"; do [[ ${p%%:*} == mma_forms ]] || kept+=("$p"); done
   progs=("${kept[@]}")
 fi
+# sync_masks' expected values are what an RTX 3060 ran from CUDA 13.0's ptxas
+# (the code it generates for a mask it cannot see through); CUDA 12's lowers
+# some of those cases differently, so its values are not comparable.
+if (( ${rmaj:-0} < 13 )); then
+  echo "SKIP sync_masks: its expected values are CUDA 13's ptxas code (this nvcc is $rmaj.$rmin)"
+  kept=()
+  for p in "${progs[@]}"; do [[ ${p%%:*} == sync_masks ]] || kept+=("$p"); done
+  progs=("${kept[@]}")
+fi
+if (( ${#progs[@]} == 0 )); then
+  echo "SKIP: no program left to build for this nvcc"
+  exit 0
+fi
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 jobs=()
 for arch in "${archs[@]}"; do

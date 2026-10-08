@@ -2098,6 +2098,7 @@ if(TARGET vgpucudart)
   set_tests_properties(e2e_sync_masks PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=sync_masks:86:86;VGPU_SASS_ARCHS=sm_86"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
 endif()
 
