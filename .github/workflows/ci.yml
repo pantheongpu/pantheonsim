@@ -151,7 +151,12 @@ jobs:
     # their PTX (nvidia/tests/e2e/run_sass_archs.sh). A run started by hand
     # with cutlass_sass also builds the CUTLASS tests' SASS (sm_90a, sm_100a,
     # sm_120a) and requires it to run, which takes a few hours.
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
+    # another pool, e.g. ["self-hosted", "pantheonsim-burst"]: AWS instances
+    # started while the pull request backlog is long and terminated when it is
+    # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
+    # the pool, and it runs in the toolchain image there as it does here.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
     # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
     # the runner itself with the install step below.
@@ -504,7 +509,12 @@ jobs:
 
   sanitizers:
     name: ASan + UBSan
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
+    # another pool, e.g. ["self-hosted", "pantheonsim-burst"]: AWS instances
+    # started while the pull request backlog is long and terminated when it is
+    # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
+    # the pool, and it runs in the toolchain image there as it does here.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -549,7 +559,12 @@ jobs:
 
   threads:
     name: ThreadSanitizer
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
+    # another pool, e.g. ["self-hosted", "pantheonsim-burst"]: AWS instances
+    # started while the pull request backlog is long and terminated when it is
+    # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
+    # the pool, and it runs in the toolchain image there as it does here.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
