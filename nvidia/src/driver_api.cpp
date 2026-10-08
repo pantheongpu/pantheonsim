@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <dlfcn.h>
 #include <fstream>
 #include <iterator>
@@ -125,6 +126,40 @@ struct TexRefRec {
   CUarray array = nullptr;       // bound array, or null
 };
 
+// A stream-ordered memory pool (CUmemoryPool). Every stream here is
+// synchronous, so the ordering half of the API costs nothing: an allocation is
+// usable when the call returns and a free is complete when it returns. What a
+// pool is for is the caching, and that is modelled: memory freed to a pool is
+// kept, up to the pool's release threshold, and handed out again.
+//
+// Which cached block a request reuses is this engine's choice, not the API's:
+// the first block at least as large as the request and no more than twice its
+// size, so a small request never quietly takes a large block out of circulation.
+//
+// The runtime's cudaMemPool_t is a different object: a pool made through one
+// library is not a handle the other recognises, and each library's default pool
+// is its own.
+struct PoolRec {
+  int device = 0;
+  bool is_default = false;
+  bool destroyed = false;
+  unsigned long long threshold = 0;   // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD
+  // The reuse policies are on by default, and with synchronous streams they
+  // change nothing observable; they are kept because a program reads them back.
+  int reuse_follow_event_deps = 1, reuse_allow_opportunistic = 1, reuse_allow_internal_deps = 1;
+  uint64_t used = 0, used_high = 0, reserved = 0, reserved_high = 0;
+  std::map<uint64_t, uint64_t> live;                  // handed out: pointer -> size
+  std::vector<std::pair<uint64_t, uint64_t>> cached;  // freed and kept, oldest first
+  // Access granted to each device, as a CUmemAccess_flags value. A pool is
+  // accessible from the device it lives on and from no other until told so.
+  std::map<int, int> access;
+  uint64_t cached_bytes() const {
+    uint64_t n = 0;
+    for (const auto& [p, sz] : cached) n += sz;
+    return n;
+  }
+};
+
 struct ShimState {
   // One lock for both CUDA libraries, since they share one machine
   // (shared_runtime.cpp).
@@ -160,6 +195,11 @@ struct ShimState {
   std::set<std::pair<uintptr_t, uintptr_t>> peer_access;
   std::unordered_map<uintptr_t, int> attached;   // cuCtxAttach references, by context
   int cache_config = 0;   // cuCtxSetCacheConfig: CU_FUNC_CACHE_PREFER_NONE until set
+  // Memory pools. In a deque so a pool's address, which is its handle, never
+  // moves; each device's default pool is made on first use.
+  std::deque<PoolRec> pools;
+  std::map<int, PoolRec*> default_pool;   // by device
+  std::map<int, PoolRec*> current_pool;
   // The device each managed allocation (by base) was made against, which
   // CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL reports.
   std::map<uintptr_t, int> managed_device;
@@ -554,7 +594,7 @@ int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
     case 112: return 0;                              // SPARSE_CUDA_ARRAY_SUPPORTED
     case 113: return 0;                              // READ_ONLY_HOST_REGISTER_SUPPORTED
     case 114: return 0;                              // TIMELINE_SEMAPHORE_INTEROP_SUPPORTED
-    case 115: return 0;                              // MEMORY_POOLS_SUPPORTED (no cuMemPool*)
+    case 115: return 1;                              // MEMORY_POOLS_SUPPORTED
     case 116: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
     case 117: return 0;                              // GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS
     case 118: return 0;                              // GPU_DIRECT_RDMA_WRITES_ORDERING
@@ -3354,19 +3394,334 @@ VGPU_EXPORT CUresult cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* c) { return cuMemc
 VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream) { return cuMemcpy2D_v2(c); }
 VGPU_EXPORT CUresult cuMemcpy2DAsync(const CUDA_MEMCPY2D* c, CUstream st) { return cuMemcpy2DAsync_v2(c, st); }
 
-// Stream-ordered allocation: the stream is synchronous, so the memory is
-// ready at once. A request for 0 bytes succeeds, as the card's does.
-VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream) {
-  if (!dptr) return CUDA_ERROR_INVALID_VALUE;
-  if (bytesize == 0) {
-    *dptr = 0;
-    return CUDA_SUCCESS;
-  }
-  return cuMemAlloc_v2(dptr, bytesize);
+// ---- stream-ordered memory pools ----
+//
+// See PoolRec. cuMemAllocAsync takes from the current context's device's
+// current pool (its default pool until cuDeviceSetMemPool says otherwise), and
+// cuMemFreeAsync gives the memory back to the pool it came from.
+
+namespace {
+
+PoolRec& default_pool_for(ShimState& s, int device) {
+  auto it = s.default_pool.find(device);
+  if (it != s.default_pool.end()) return *it->second;
+  s.pools.emplace_back();
+  PoolRec& p = s.pools.back();
+  p.device = device;
+  p.is_default = true;
+  p.access[device] = 3;   // CU_MEM_ACCESS_FLAGS_PROT_READWRITE, on its own device
+  s.default_pool[device] = &p;
+  return p;
 }
+
+PoolRec& pool_for(ShimState& s, int device) {
+  auto it = s.current_pool.find(device);
+  return it != s.current_pool.end() ? *it->second : default_pool_for(s, device);
+}
+
+// A CUmemoryPool is the pool's address; this checks one before following it.
+PoolRec* pool_from_handle(ShimState& s, const void* h) {
+  for (PoolRec& p : s.pools)
+    if (static_cast<const void*>(&p) == h && !p.destroyed) return &p;
+  return nullptr;
+}
+
+// Gives cached blocks back to the device until no more than `keep` bytes are
+// held, oldest first.
+void release_cached(ShimState& s, PoolRec& p, uint64_t keep) {
+  while (p.cached_bytes() > keep && !p.cached.empty()) {
+    const auto [ptr, size] = p.cached.front();
+    p.cached.erase(p.cached.begin());
+    s.rt->device(p.device).memory().free(ptr);
+    p.reserved -= size;
+  }
+}
+
+CUdeviceptr pool_alloc(ShimState& s, PoolRec& p, size_t size) {
+  // Reuse: the first cached block big enough, and no more than twice the size
+  // asked for.
+  for (size_t i = 0; i < p.cached.size(); ++i) {
+    const auto [ptr, block] = p.cached[i];
+    if (block >= size && block - size <= size) {
+      p.cached.erase(p.cached.begin() + static_cast<long>(i));
+      p.live[ptr] = block;
+      p.used += block;
+      p.used_high = std::max(p.used_high, p.used);
+      return ptr;
+    }
+  }
+  const uint64_t ptr = s.rt->device(p.device).memory().alloc(size);
+  p.live[ptr] = size;
+  p.used += size;
+  p.reserved += size;
+  p.used_high = std::max(p.used_high, p.used);
+  p.reserved_high = std::max(p.reserved_high, p.reserved);
+  return ptr;
+}
+
+// The pool a pointer was allocated from, or null.
+PoolRec* pool_of(ShimState& s, uint64_t ptr) {
+  for (PoolRec& p : s.pools)
+    if (p.live.count(ptr)) return &p;
+  return nullptr;
+}
+
+void pool_free(ShimState& s, PoolRec& p, uint64_t ptr) {
+  const uint64_t size = p.live[ptr];
+  p.live.erase(ptr);
+  p.used -= size;
+  p.cached.emplace_back(ptr, size);
+  // The default threshold is 0, so by default this hands the memory straight
+  // back to the device and the pool keeps nothing.
+  release_cached(s, p, p.threshold);
+}
+
+// CUmemLocation and CUmemAccessDesc, as cuda.h lays them out.
+struct MemLocationABI { int type; int id; };
+struct MemAccessDescABI { MemLocationABI location; int flags; };
+// CUmemPoolProps: the fields this reads, which sit at the same offsets in every
+// CUDA 12 cuda.h (what follows them -- a maximum size, a usage mask, reserved
+// bytes -- was added over the releases and is not looked at).
+struct MemPoolPropsABI {
+  int alloc_type;
+  int handle_types;
+  MemLocationABI location;
+  void* win32_security_attributes;
+};
+constexpr int kMemAllocationTypePinned = 1;      // CU_MEM_ALLOCATION_TYPE_PINNED
+constexpr int kMemLocationTypeDevice = 1;        // CU_MEM_LOCATION_TYPE_DEVICE
+constexpr int kMemAccessNone = 0, kMemAccessRead = 1, kMemAccessReadWrite = 3;   // CU_MEM_ACCESS_FLAGS_PROT_*
+
+}  // namespace
+
+// Zero bytes succeed, as the card's do, with a null pointer.
+VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream) {
+  return api("cuMemAllocAsync", true, false, [&](ShimState& s) {
+    if (!dptr) return CUDA_ERROR_INVALID_VALUE;
+    if (bytesize == 0) {
+      *dptr = 0;
+      return CUDA_SUCCESS;
+    }
+    *dptr = pool_alloc(s, pool_for(s, current_device(s)), bytesize);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream) {
+  return api("cuMemAllocFromPoolAsync", true, false, [&](ShimState& s) {
+    if (!dptr) return CUDA_ERROR_INVALID_VALUE;
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p) return CUDA_ERROR_INVALID_VALUE;
+    if (bytesize == 0) {
+      *dptr = 0;
+      return CUDA_SUCCESS;
+    }
+    *dptr = pool_alloc(s, *p, bytesize);
+    return CUDA_SUCCESS;
+  });
+}
+// A pointer from a pool goes back to it; any other device allocation is freed
+// as cuMemFree frees it.
 VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
   if (dptr == 0) return CUDA_SUCCESS;
-  return cuMemFree_v2(dptr);
+  bool pooled = false;
+  const CUresult r = api("cuMemFreeAsync", true, false, [&](ShimState& s) {
+    if (PoolRec* p = pool_of(s, dptr)) {
+      pool_free(s, *p, dptr);
+      pooled = true;
+    }
+    return CUDA_SUCCESS;
+  });
+  return pooled || r != CUDA_SUCCESS ? r : cuMemFree_v2(dptr);
+}
+
+VGPU_EXPORT CUresult cuDeviceGetDefaultMemPool(void** pool, CUdevice dev) {
+  return api("cuDeviceGetDefaultMemPool", true, false, [&](ShimState& s) {
+    if (!pool) return CUDA_ERROR_INVALID_VALUE;
+    check_device(s, dev);
+    *pool = &default_pool_for(s, dev);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuDeviceGetMemPool(void** pool, CUdevice dev) {
+  return api("cuDeviceGetMemPool", true, false, [&](ShimState& s) {
+    if (!pool) return CUDA_ERROR_INVALID_VALUE;
+    check_device(s, dev);
+    *pool = &pool_for(s, dev);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuDeviceSetMemPool(CUdevice dev, void* pool) {
+  return api("cuDeviceSetMemPool", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    PoolRec* p = pool_from_handle(s, pool);
+    // A pool belongs to the device it was made for.
+    if (!p || p->device != dev) return CUDA_ERROR_INVALID_VALUE;
+    s.current_pool[dev] = p;
+    return CUDA_SUCCESS;
+  });
+}
+
+VGPU_EXPORT CUresult cuMemPoolCreate(void** pool, const void* poolProps) {
+  return api("cuMemPoolCreate", true, false, [&](ShimState& s) {
+    if (!pool || !poolProps) return CUDA_ERROR_INVALID_VALUE;
+    const auto* props = static_cast<const MemPoolPropsABI*>(poolProps);
+    if (props->alloc_type != kMemAllocationTypePinned) return CUDA_ERROR_INVALID_VALUE;
+    // A pool on the host, or on a NUMA node, would hold host memory the
+    // device reaches; only device pools are made here.
+    if (props->location.type != kMemLocationTypeDevice) {
+      report("cuMemPoolCreate", "only a pool located on a device is implemented (a host or NUMA "
+                                "location is not)");
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (props->location.id < 0 || props->location.id >= s.rt->device_count()) return CUDA_ERROR_INVALID_DEVICE;
+    // A pool another process could allocate from would have to share this
+    // process's own memory.
+    if (props->handle_types != 0) {
+      report("cuMemPoolCreate", "a pool that exports shareable handles is not implemented: device "
+                                "memory here is this process's own");
+      return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    s.pools.emplace_back();
+    PoolRec& p = s.pools.back();
+    p.device = props->location.id;
+    p.access[p.device] = kMemAccessReadWrite;
+    *pool = &p;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemPoolDestroy(void* pool) {
+  return api("cuMemPoolDestroy", true, false, [&](ShimState& s) {
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p || p->is_default) return CUDA_ERROR_INVALID_VALUE;   // the default pool is the device's
+    // Outstanding allocations would have to outlive the pool, and freeing them
+    // afterwards needs it. Refused instead.
+    if (!p->live.empty()) {
+      report("cuMemPoolDestroy", std::to_string(p->live.size()) +
+                                     " allocation(s) are still outstanding; free them with cuMemFreeAsync first");
+      return CUDA_ERROR_INVALID_VALUE;
+    }
+    release_cached(s, *p, 0);
+    p->destroyed = true;
+    for (auto it = s.current_pool.begin(); it != s.current_pool.end();)
+      it = it->second == p ? s.current_pool.erase(it) : std::next(it);
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemPoolTrimTo(void* pool, size_t minBytesToKeep) {
+  return api("cuMemPoolTrimTo", true, false, [&](ShimState& s) {
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p) return CUDA_ERROR_INVALID_VALUE;
+    release_cached(s, *p, minBytesToKeep);
+    return CUDA_SUCCESS;
+  });
+}
+
+// CUmemPool_attribute: the three reuse policies are ints, the rest 64-bit.
+namespace {
+constexpr int kPoolReuseFollowEventDeps = 1, kPoolReuseAllowOpportunistic = 2, kPoolReuseAllowInternalDeps = 3,
+              kPoolReleaseThreshold = 4, kPoolReservedCurrent = 5, kPoolReservedHigh = 6, kPoolUsedCurrent = 7,
+              kPoolUsedHigh = 8;
+}  // namespace
+VGPU_EXPORT CUresult cuMemPoolSetAttribute(void* pool, int attr, void* value) {
+  return api("cuMemPoolSetAttribute", true, false, [&](ShimState& s) {
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p || !value) return CUDA_ERROR_INVALID_VALUE;
+    switch (attr) {
+      case kPoolReleaseThreshold:
+        p->threshold = *static_cast<unsigned long long*>(value);
+        // Lowering it takes effect now; every operation here is already synchronous.
+        release_cached(s, *p, p->threshold);
+        return CUDA_SUCCESS;
+      case kPoolReuseFollowEventDeps: p->reuse_follow_event_deps = *static_cast<int*>(value); return CUDA_SUCCESS;
+      case kPoolReuseAllowOpportunistic: p->reuse_allow_opportunistic = *static_cast<int*>(value); return CUDA_SUCCESS;
+      case kPoolReuseAllowInternalDeps: p->reuse_allow_internal_deps = *static_cast<int*>(value); return CUDA_SUCCESS;
+      // The documented way to reset a high-water mark is to write 0 to it.
+      case kPoolReservedHigh:
+        if (*static_cast<unsigned long long*>(value) != 0) return CUDA_ERROR_INVALID_VALUE;
+        p->reserved_high = p->reserved;
+        return CUDA_SUCCESS;
+      case kPoolUsedHigh:
+        if (*static_cast<unsigned long long*>(value) != 0) return CUDA_ERROR_INVALID_VALUE;
+        p->used_high = p->used;
+        return CUDA_SUCCESS;
+      default:
+        return CUDA_ERROR_INVALID_VALUE;   // the current totals are read-only
+    }
+  });
+}
+VGPU_EXPORT CUresult cuMemPoolGetAttribute(void* pool, int attr, void* value) {
+  return api("cuMemPoolGetAttribute", true, false, [&](ShimState& s) {
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p || !value) return CUDA_ERROR_INVALID_VALUE;
+    auto u64 = [&](uint64_t v) {
+      *static_cast<unsigned long long*>(value) = v;
+      return CUDA_SUCCESS;
+    };
+    switch (attr) {
+      case kPoolReuseFollowEventDeps: *static_cast<int*>(value) = p->reuse_follow_event_deps; return CUDA_SUCCESS;
+      case kPoolReuseAllowOpportunistic: *static_cast<int*>(value) = p->reuse_allow_opportunistic; return CUDA_SUCCESS;
+      case kPoolReuseAllowInternalDeps: *static_cast<int*>(value) = p->reuse_allow_internal_deps; return CUDA_SUCCESS;
+      case kPoolReleaseThreshold: return u64(p->threshold);
+      case kPoolReservedCurrent: return u64(p->reserved);
+      case kPoolReservedHigh: return u64(p->reserved_high);
+      case kPoolUsedCurrent: return u64(p->used);
+      case kPoolUsedHigh: return u64(p->used_high);
+      default: return CUDA_ERROR_INVALID_VALUE;
+    }
+  });
+}
+
+// What a pool's memory may be reached from. It starts as the device it lives
+// on, read and write, and no other; a request can widen that to a peer or take
+// it away. Nothing enforces it -- every kernel here reaches every device's
+// memory -- so it is state a program reads back, not a fence.
+VGPU_EXPORT CUresult cuMemPoolSetAccess(void* pool, const void* map, size_t count) {
+  return api("cuMemPoolSetAccess", true, false, [&](ShimState& s) {
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p || (!map && count)) return CUDA_ERROR_INVALID_VALUE;
+    const auto* descs = static_cast<const MemAccessDescABI*>(map);
+    for (size_t i = 0; i < count; ++i) {
+      if (descs[i].location.type != kMemLocationTypeDevice || descs[i].location.id < 0 ||
+          descs[i].location.id >= s.rt->device_count())
+        return CUDA_ERROR_INVALID_VALUE;
+      if (descs[i].flags != kMemAccessNone && descs[i].flags != kMemAccessRead &&
+          descs[i].flags != kMemAccessReadWrite)
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for (size_t i = 0; i < count; ++i) p->access[descs[i].location.id] = descs[i].flags;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuMemPoolGetAccess(int* flags, void* pool, void* location) {
+  return api("cuMemPoolGetAccess", true, false, [&](ShimState& s) {
+    PoolRec* p = pool_from_handle(s, pool);
+    if (!p || !flags || !location) return CUDA_ERROR_INVALID_VALUE;
+    const auto* loc = static_cast<const MemLocationABI*>(location);
+    if (loc->type != kMemLocationTypeDevice || loc->id < 0 || loc->id >= s.rt->device_count())
+      return CUDA_ERROR_INVALID_VALUE;
+    const auto it = p->access.find(loc->id);
+    *flags = it == p->access.end() ? kMemAccessNone : it->second;
+    return CUDA_SUCCESS;
+  });
+}
+
+// Sharing a pool, or one of its allocations, with another process needs memory
+// that process can map; device memory here is this process's own sparse backing.
+VGPU_EXPORT CUresult cuMemPoolExportToShareableHandle(void*, void*, int, unsigned long long) {
+  report("cuMemPoolExportToShareableHandle", "not implemented: device memory here is this process's own");
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void**, void*, int, unsigned long long) {
+  report("cuMemPoolImportFromShareableHandle", "not implemented: device memory here is this process's own");
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemPoolExportPointer(void*, CUdeviceptr) {
+  report("cuMemPoolExportPointer", "not implemented: device memory here is this process's own");
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+VGPU_EXPORT CUresult cuMemPoolImportPointer(CUdeviceptr*, void*, void*) {
+  report("cuMemPoolImportPointer", "not implemented: device memory here is this process's own");
+  return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 /* ---- pitched memory, module globals, context configuration ----
@@ -4453,7 +4808,13 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuMemcpy2D), VGPU_PROC(cuMemcpy2D_v2), VGPU_PROC(cuMemcpy2DUnaligned),
     VGPU_PROC(cuMemcpy2DUnaligned_v2), VGPU_PROC(cuMemcpy2DAsync), VGPU_PROC(cuMemcpy2DAsync_v2),
     VGPU_PROC(cuMemcpy3D), VGPU_PROC(cuMemcpy3D_v2), VGPU_PROC(cuMemcpy3DAsync), VGPU_PROC(cuMemcpy3DAsync_v2),
-    VGPU_PROC(cuMemAllocAsync), VGPU_PROC(cuMemFreeAsync),
+    VGPU_PROC(cuMemAllocAsync), VGPU_PROC(cuMemFreeAsync), VGPU_PROC(cuMemAllocFromPoolAsync),
+    VGPU_PROC(cuDeviceGetDefaultMemPool), VGPU_PROC(cuDeviceGetMemPool), VGPU_PROC(cuDeviceSetMemPool),
+    VGPU_PROC(cuMemPoolCreate), VGPU_PROC(cuMemPoolDestroy), VGPU_PROC(cuMemPoolTrimTo),
+    VGPU_PROC(cuMemPoolSetAttribute), VGPU_PROC(cuMemPoolGetAttribute), VGPU_PROC(cuMemPoolSetAccess),
+    VGPU_PROC(cuMemPoolGetAccess), VGPU_PROC(cuMemPoolExportToShareableHandle),
+    VGPU_PROC(cuMemPoolImportFromShareableHandle), VGPU_PROC(cuMemPoolExportPointer),
+    VGPU_PROC(cuMemPoolImportPointer),
     VGPU_PROC(cuMemAllocPitch), VGPU_PROC(cuMemAllocPitch_v2), VGPU_PROC(cuModuleGetGlobal),
     VGPU_PROC(cuModuleGetGlobal_v2), VGPU_PROC(cuCtxSetCacheConfig), VGPU_PROC(cuCtxGetCacheConfig),
     VGPU_PROC(cuCtxSetSharedMemConfig), VGPU_PROC(cuCtxGetSharedMemConfig),

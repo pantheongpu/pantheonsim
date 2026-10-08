@@ -1511,6 +1511,14 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_user_objects PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_mempool nvidia/tests/unit/test_driver_mempool.cpp)
+  target_link_libraries(test_driver_mempool PRIVATE vgpucuda)
+  target_include_directories(test_driver_mempool PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_driver_mempool COMMAND test_driver_mempool)
+  set_tests_properties(test_driver_mempool PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+endif()
 # cuLaunchKernelEx's attribute list: the cluster shape and a cooperative launch.
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_launch_ex nvidia/tests/unit/test_driver_launch_ex.cpp)
