@@ -38,7 +38,7 @@ archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
        runtime_conformance:75:75 symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75
        texture_layers:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
-       dynamic_parallelism:75 cdp_device_api:75 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
+       dynamic_parallelism:75 cdp_device_api:75 cdp1_device_sync:75:89 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
        stmatrix:90a setmaxnreg:90a setmaxnreg:100a bulk_copy:90a tcgen05_gemm:100a tmem_alloc_pair:100a mma_blockscale:120a ldmatrix_forms:100a ldmatrix_forms:120a narrow_cvt:100a narrow_cvt:120a})
@@ -46,7 +46,10 @@ cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 # Built the way a program that uses dynamic parallelism is (-rdc=true, linked
 # with cudadevrt): the linked cubin carries the device runtime library and the
 # relocations that come with it.
-rdc=" dynamic_parallelism cdp_device_api rdc_device_api "
+rdc=" dynamic_parallelism cdp_device_api cdp1_device_sync rdc_device_api "
+# The first device runtime, which CUDA 12 and 13 still build for parts before Hopper
+# on request: cudaDeviceSynchronize from a kernel is among its calls.
+cdp1=" cdp1_device_sync "
 
 supported="$("$nvcc_bin" --list-gpu-code 2>/dev/null)"
 # Hopper's own programs use PTX newer than CUDA 12.0's (tensormap.replace is
@@ -100,10 +103,11 @@ fi
 
 # Builds, several at once. --as-needed keeps libcuda out of the programs that
 # never call the driver API, so a sanitizer build can still run them (below).
-export nvcc_bin root work cutlass rdc
+export nvcc_bin root work cutlass rdc cdp1
 export san="${san_flags[*]}"
 printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_SASS_JOBS:-$(nproc)}" -L 1 bash -c '
   sep=(); [[ $rdc == *" $0 "* ]] && sep=(-rdc=true -lcudadevrt)
+  [[ $cdp1 == *" $0 "* ]] && sep+=(-DCUDA_FORCE_CDP1_IF_SUPPORTED -D__CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
     ${cutlass:+-O1 --expt-relaxed-constexpr -I"$cutlass/include"} \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$work/$0.$1" -lcuda "${sep[@]}" 2> "$work/$0.$1.build" ||

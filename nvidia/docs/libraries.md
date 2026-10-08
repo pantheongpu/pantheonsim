@@ -913,15 +913,31 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   super-sampling and Lanczos modes, and the rest of NPP's ten thousand entry
   points, which are absent rather than approximated, so a program that needs
   more fails at link time with a name.
-- **Device runtime** (cudadevrt, dynamic parallelism), on both engines:
-  device-side launches, the last error, `cudaGetDevice`/`cudaGetDeviceCount`,
-  and device streams and events are implemented. The rest of what a kernel
-  can call -- `cudaMemcpyAsync`/`cudaMemsetAsync` and `cudaMalloc` from a
-  kernel, `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, the occupancy
-  queries, the older `cudaGetParameterBuffer`/`cudaLaunchDevice` pair -- is
-  not provided: a kernel that needs the driver for one fails with the name of
-  the entry point it reached (on SASS, one of the library's
-  `__cuda_syscall_*` calls).
+- **Device runtime** (cudadevrt, dynamic parallelism), on both engines: all of
+  `cuda_device_runtime_api.h` that CUDA 12 and 13 still offer to a kernel --
+  device-side launches (`<<<>>>`, `cudaGetParameterBuffer` /
+  `cudaLaunchDevice`, tail and fire-and-forget streams, named streams and
+  events), the pending-launch limit, `cudaMemcpyAsync`, `cudaMemcpy2DAsync`,
+  `cudaMemcpy3DAsync` and the memset family, `cudaMalloc` and `cudaFree`,
+  `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, `cudaDeviceGetLimit`,
+  the cache configuration, the occupancy queries (and
+  `cudaOccupancyMaxPotentialBlockSize` from them), `cudaGetErrorString`,
+  `cudaGetErrorName`, `cudaRuntimeGetVersion`, the last error and
+  `cudaGetDevice`/`cudaGetDeviceCount` -- under CDP2's names, and CDP1's
+  (`-DCUDA_FORCE_CDP1_IF_SUPPORTED`, which has `cudaDeviceSynchronize`, for
+  parts before Hopper). Each call returns what an RTX 3060 returned
+  (`nvidia/docs/sass.md`, "Device runtime"). What remains: a parameter buffer
+  launched a second time (the card runs it again; here it is
+  `cudaErrorInvalidValue`); `cudaMemcpy3DAsync` between `cudaArray`s
+  (`cudaErrorInvalidValue`; the card's answer is unmeasured) and copies of
+  shared or local memory; `cudaGraphKernelNode*` updates from a kernel and
+  cooperative groups' multi-grid and `cudaCG*` calls into the library
+  (refused by name, as is any other `__cuda_syscall_*` the library makes);
+  and kernels running concurrently with their parent: children run after it,
+  so a kernel that waits (spinning on a flag) for a child it launched, or a
+  child that waits for its parent, hangs here where it runs on the card. A
+  device-side `cudaMemsetAsync` fills with its value; the card's wrote zeros
+  whatever it was.
 - **nvJPEG**: 12-bit samples, arithmetic coding, lossless and hierarchical
   JPEG (refused by name, `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`); the hardware
   backend and what only it does (`nvjpegDecodeBatchedEx`, scaled decodes,

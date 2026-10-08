@@ -3334,20 +3334,93 @@ const size_t* Runner::kernel_at(uint64_t code_addr) {
   return it == kernel_by_code_.end() ? nullptr : &it->second;
 }
 
-// The device runtime's public entry points (module.cpp, kBuiltins), with
-// the arguments where the CUDA ABI puts them -- a 64-bit one in a register
-// pair, a dim3 in three registers -- as ptxas passes them at the call sites
-// it compiles (cudaGetParameterBufferV2: the kernel in R4:R5, the grid in
-// R6-R8, the block in R9-R11, the shared bytes in R12). The same behaviour as
-// the PTX engine's (src/exec/interpreter.cpp, exec_get_parameter_buffer and
-// the rest). False for any other name.
+// The PTX engine's kernel record for a kernel of this module (a fat binary
+// carries the PTX beside the SASS, and the runtime loads both as one kernel),
+// which is where the host-visible numbers -- registers, occupancy -- come
+// from. Null when there is none.
+const exec::KernelRef* Runner::ptx_kernel(size_t idx) {
+  const auto it = ptx_refs_.find(idx);
+  if (it != ptx_refs_.end()) return it->second;
+  const exec::KernelRef* found = nullptr;
+  if (cfg_.kernels)
+    for (const auto& [va, ref] : *cfg_.kernels)
+      if (ref.fn && ref.fn->sass.get() == &m_ && ref.fn->name == m_.cubin.kernels[idx].name) {
+        found = &ref;
+        break;
+      }
+  return ptx_refs_[idx] = found;
+}
+
+namespace {
+// Where the CUDA ABI puts a call's arguments, as ptxas writes them at every
+// call of the device runtime's entry points (read from the SASS CUDA 13.0's
+// and 12.0's ptxas writes for sm_75 to sm_120, which agree). The first twelve
+// words of arguments go in R4 to R15, each argument at the lowest free word
+// that fits and suits its alignment -- a small one fills the hole an aligned
+// one left (cudaOccupancy...WithFlags' flags sit in R9, between blockSize in R8
+// and the size_t in R10:R11) -- and an argument that fits nowhere in them is
+// on the stack, at R1 plus an offset that grows with each such argument
+// (cudaMemcpy2DAsync's kind at 0 and its stream at 8; cudaMemset3DAsync's
+// cudaExtent, 24 bytes that do not fit after its 32-byte cudaPitchedPtr in
+// R4 to R11 and the int in R12, at 0, with its stream still in R14:R15).
+struct ArgSpec {
+  uint32_t size, align;
+};
+struct ArgAt {
+  int reg = -1;          // the first register, or -1 for the stack
+  uint32_t stack = 0;    // the offset from R1 when on the stack
+};
+using Layout = std::array<ArgAt, 8>;
+
+Layout abi_layout(std::initializer_list<ArgSpec> sig) {
+  Layout out{};
+  bool used[12] = {};
+  uint32_t stack = 0;
+  size_t i = 0;
+  for (const ArgSpec& a : sig) {
+    const unsigned words = (a.size + 3) / 4, align = std::max(1u, a.align / 4);
+    int at = -1;
+    for (unsigned s = 0; s + words <= 12 && at < 0; s += align) {
+      bool free_run = true;
+      for (unsigned k = 0; k < words; ++k) free_run = free_run && !used[s + k];
+      if (free_run) at = static_cast<int>(s);
+    }
+    if (at >= 0) {
+      for (unsigned k = 0; k < words; ++k) used[at + k] = true;
+      out[i].reg = 4 + at;
+    } else {
+      stack = (stack + a.align - 1) / a.align * a.align;
+      out[i].stack = stack;
+      stack += a.size;
+    }
+    ++i;
+  }
+  return out;
+}
+
+constexpr ArgSpec kP{8, 8}, kI{4, 4}, kD3{12, 4}, kPitched{32, 8}, kExtent{24, 8};
+}  // namespace
+
+// The device runtime's public entry points (module.cpp's builtins; the list
+// is vgpu/exec/devrt.hpp's), with the arguments where the CUDA ABI puts them
+// (abi_layout) and a result in R4 -- a pointer in R4:R5. The same behaviour as
+// the PTX engine's (src/exec/interpreter.cpp, exec_devrt), which is where the
+// reasons are: what each call returns for what it is given was measured on an
+// RTX 3060, CUDA 13.0 and 12.0 (nvidia/docs/sass.md). False for any other
+// name.
 bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name) {
-  const auto arg64 = [&](unsigned r, unsigned l) {
-    return w.reg(r, l) | (static_cast<uint64_t>(w.reg(r + 1, l)) << 32);
-  };
+  namespace devrt = exec::devrt;
+  using devrt::Fn;
+  const Fn f = devrt::lookup(name);
+  if (f == Fn::None) return false;
+
   const auto ret = [&](unsigned l, uint32_t err) {   // a cudaError_t, kept when it is an error
     w.reg(4, l) = err;
     if (err) w.device_error[l] = err;
+  };
+  const auto ret_ptr = [&](unsigned l, uint64_t p) {
+    w.reg(4, l) = static_cast<uint32_t>(p);
+    w.reg(5, l) = static_cast<uint32_t>(p >> 32);
   };
   const auto store = [&](unsigned l, uint64_t addr, uint64_t v, uint32_t n) {
     // Usually a local variable's address (int d; cudaGetDevice(&d)): a
@@ -3356,118 +3429,510 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
     const Space sp = classify(addr, &off);
     mem_write(blk, w, l, sp, off, &v, n);
   };
-  constexpr uint32_t kSuccess = 0, kInvalidValue = 1, kInvalidConfiguration = 9;
-  if (name == "__cudaCDP2GetParameterBufferV2" || name == "cudaGetParameterBufferV2") {
-    // (func, gridDim, blockDim, sharedMem): a buffer in device memory, laid
-    // out as the kernel's parameters are, for the calling thread to fill.
-    // Null once too many launches are pending, as on hardware.
-    if (!dl_)
-      fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)), "a device-side launch outside a launch that can run it",
-            Err::Unsupported);
-    each_lane(ex, [&](unsigned l) {
-      const uint64_t f = arg64(4, l);
-      const size_t* k = kernel_at(f);
-      if (!k) {
-        char b[24];
-        std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(f));
-        fault(w, ins, l, std::string("a device-side launch names 0x") + b + ", which is not a kernel of this module",
-              Err::InvalidValue);
-      }
-      Child c;
-      c.kernel = *k;
-      for (unsigned i = 0; i < 3; ++i) {
-        c.grid[i] = w.reg(6 + i, l);
-        c.block[i] = w.reg(9 + i, l);
-      }
-      c.shared = w.reg(12, l);
-      c.size = param_bytes(m_.cubin.kernels[*k]);
-      uint64_t buf = 0;
-      {
-        std::lock_guard<std::mutex> guard(dl_->mu);
-        if (dl_->by_buffer.size() + dl_->queue.size() < kMaxPendingLaunches) {
-          buf = c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
-          dl_->by_buffer.emplace(buf, c);
-        }
-      }
-      w.reg(4, l) = static_cast<uint32_t>(buf);
-      w.reg(5, l) = static_cast<uint32_t>(buf >> 32);
-    });
-    return true;
-  }
-  if (name == "__cudaCDP2LaunchDeviceV2" || name == "__cudaCDP2LaunchDeviceV2_ptsz" || name == "cudaLaunchDeviceV2" ||
-      name == "cudaLaunchDeviceV2_ptsz") {
-    // (parameterBuffer, stream): the child is queued to run after this
-    // grid. The stream does not order it: every device-side stream's
-    // launches may run then (cudaStreamTailLaunch must), and children run
-    // in the order issued.
-    if (!dl_)
-      fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)), "a device-side launch outside a launch that can run it",
-            Err::Unsupported);
-    const uint64_t block_linear =
-        (uint64_t{blk.ctaid[2]} * cfg_.grid[1] + blk.ctaid[1]) * cfg_.grid[0] + blk.ctaid[0];
-    each_lane(ex, [&](unsigned l) {
-      const uint64_t b = arg64(4, l);
+  const auto fetch = [&](unsigned l, uint64_t addr, uint32_t n) -> uint64_t {
+    uint64_t off, v = 0;
+    const Space sp = classify(addr, &off);
+    mem_read(blk, w, l, sp, off, &v, n);
+    return v;
+  };
+  const auto where = [&](unsigned l, const std::string& why, Err e) { fault(w, ins, l, why, e); };
+  // An argument's value: `n` bytes (4 or 8) of argument `i`, `off` bytes in.
+  const auto arg = [&](const Layout& L, unsigned i, unsigned off, unsigned n, unsigned l) -> uint64_t {
+    if (L[i].reg >= 0) {
+      const unsigned r = static_cast<unsigned>(L[i].reg) + off / 4;
+      return n == 8 ? w.reg(r, l) | (static_cast<uint64_t>(w.reg(r + 1, l)) << 32) : w.reg(r, l);
+    }
+    uint64_t v = 0;
+    mem_read(blk, w, l, Space::Local, uint64_t{w.reg(1, l)} + L[i].stack + off, &v, n);
+    return v;
+  };
+  const bool launches = f == Fn::GetParameterBufferV2 || f == Fn::GetParameterBuffer || f == Fn::LaunchDeviceV2 ||
+                        f == Fn::LaunchDevice || f == Fn::MemcpyAsync || f == Fn::Memcpy2DAsync ||
+                        f == Fn::Memcpy3DAsync || f == Fn::MemsetAsync || f == Fn::Memset2DAsync ||
+                        f == Fn::Memset3DAsync || f == Fn::DeviceSynchronize;
+  if (launches && !dl_)
+    fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)), "a device-side launch outside a launch that can run it",
+          Err::Unsupported);
+  const uint64_t block_linear = (uint64_t{blk.ctaid[2]} * cfg_.grid[1] + blk.ctaid[1]) * cfg_.grid[0] + blk.ctaid[0];
+
+  const auto kernel_idx = [&](unsigned l, uint64_t addr) -> size_t {
+    const size_t* k = kernel_at(addr);
+    if (!k) {
+      char b[24];
+      std::snprintf(b, sizeof b, "%llx", static_cast<unsigned long long>(addr));
+      where(l, std::string("a device-side call names 0x") + b + ", which is not a kernel of this module",
+            Err::InvalidValue);
+    }
+    return *k;
+  };
+  const auto pending_limit = [&]() -> int64_t {
+    devrt::Tree& t = *dl_->tree;
+    if (t.limit < 0) {
+      uint64_t v = static_cast<uint64_t>(devrt::kDefaultPendingLaunches);
+      if (cfg_.devrt && cfg_.devrt->limit(cfg_.device_ordinal, devrt::kLimitDevRuntimePendingLaunchCount, &v) != 0)
+        v = static_cast<uint64_t>(devrt::kDefaultPendingLaunches);
+      t.limit = static_cast<int64_t>(std::min<uint64_t>(v, uint64_t{1} << 40));
+    }
+    return t.limit;
+  };
+  const auto new_buffer = [&](Child c) -> uint64_t {
+    c.buffer = mem_.alloc(std::max<uint64_t>(c.size, 16));
+    std::lock_guard<std::mutex> guard(dl_->mu);
+    dl_->mem = &mem_;
+    dl_->by_buffer.emplace(c.buffer, c);
+    return c.buffer;
+  };
+  // A handed-out buffer, taken back as a launch consumes it: its
+  // description and the parameter bytes in it now.
+  const auto take_buffer = [&](uint64_t buffer, Child* out) -> bool {
+    {
       std::lock_guard<std::mutex> guard(dl_->mu);
-      const auto it = dl_->by_buffer.find(b);
-      if (it == dl_->by_buffer.end()) {
-        ret(l, kInvalidValue);   // not a buffer cudaGetParameterBuffer handed out
-        return;
-      }
-      Child c = it->second;
+      const auto it = dl_->by_buffer.find(buffer);
+      if (it == dl_->by_buffer.end()) return false;
+      *out = std::move(it->second);
       dl_->by_buffer.erase(it);
-      const uint64_t threads = uint64_t{c.block[0]} * c.block[1] * c.block[2];
-      if (!c.grid[0] || !c.grid[1] || !c.grid[2] || !threads ||
-          (profile_.limits.max_threads_per_block && threads > profile_.limits.max_threads_per_block)) {
-        mem_.free(c.buffer);
-        ret(l, kInvalidConfiguration);
-        return;
-      }
-      c.order = (block_linear << 24) | (dl_->per_block[block_linear]++ & 0xFFFFFF);
-      dl_->queue.push_back(c);
-      ret(l, kSuccess);
-    });
+    }
+    if (out->size) {
+      out->params.resize(out->size);
+      mem_.read(out->buffer, out->params.data(), out->size);
+    }
+    mem_.free(out->buffer);
+    out->buffer = 0;
     return true;
-  }
-  if (name == "__cudaCDP2GetLastError" || name == "__cudaCDP2PeekAtLastError") {
-    const bool clear = name == "__cudaCDP2GetLastError";
-    each_lane(ex, [&](unsigned l) {
-      w.reg(4, l) = w.device_error[l];
-      if (clear) w.device_error[l] = 0;
-    });
-    return true;
-  }
-  if (name == "__cudaCDP2GetDevice" || name == "__cudaCDP2GetDeviceCount") {
-    // (int*): the answer the host gets, written where the pointer points.
-    const int v = name == "__cudaCDP2GetDevice" ? cfg_.device_ordinal : cfg_.device_count;
-    each_lane(ex, [&](unsigned l) {
-      const uint64_t p = arg64(4, l);
-      if (!p) return ret(l, kInvalidValue);
-      store(l, p, static_cast<uint32_t>(v), 4);
-      ret(l, kSuccess);
-    });
-    return true;
-  }
-  if (name == "__cudaCDP2StreamCreateWithFlags" || name == "__cudaCDP2EventCreateWithFlags") {
-    // (handle*, flags): a non-null handle, distinct per call; the flags are
-    // accepted as they come (child grids run in launch order, which every
-    // ordering these can ask for already satisfies).
-    static std::atomic<uint64_t> next{1};
-    constexpr uint64_t kHandleBase = 0x5654'4750'0000'0000ull;   // "VTGP", as the PTX engine's: never an address
-    each_lane(ex, [&](unsigned l) {
-      const uint64_t p = arg64(4, l);
-      if (!p) return ret(l, kInvalidValue);
-      store(l, p, kHandleBase + next.fetch_add(1, std::memory_order_relaxed), 8);
-      ret(l, kSuccess);
-    });
-    return true;
-  }
-  if (name == "__cudaCDP2StreamDestroy" || name == "__cudaCDP2EventDestroy" || name == "__cudaCDP2EventRecord" ||
-      name == "__cudaCDP2EventRecord_ptsz" || name == "__cudaCDP2EventRecordWithFlags" ||
-      name == "__cudaCDP2EventRecordWithFlags_ptsz" || name == "__cudaCDP2StreamWaitEvent" ||
-      name == "__cudaCDP2StreamWaitEvent_ptsz") {
-    // Nothing left to do: children already run one after another.
-    each_lane(ex, [&](unsigned l) { ret(l, kSuccess); });
-    return true;
+  };
+  // Queues a launch or a copy of this block; the cudaError_t the call gives.
+  const auto issue = [&](Child c, uint64_t stream, bool memory_op) -> uint32_t {
+    const devrt::StreamKind kind = devrt::stream_kind(stream);
+    if (kind == devrt::StreamKind::Invalid) return memory_op ? devrt::kUnknown : devrt::kInvalidValue;
+    if (!memory_op) {
+      const CubinKernel& k = m_.cubin.kernels[c.kernel];
+      if (!devrt::config_ok(c.grid, c.block, k.shared_bytes + c.shared, profile_, k.max_threads, {0, 0, 0}))
+        return devrt::kInvalidConfiguration;
+    }
+    c.tail = kind == devrt::StreamKind::Tail;
+    ChildRunner runner{m_, cfg_, mem_, profile_, &dl_->extra};
+    int err = devrt::kSuccess;
+    devrt::enqueue(*dl_, mem_, runner, std::move(c), block_linear, pending_limit(), &err);
+    return static_cast<uint32_t>(err);
+  };
+  // A device pointer for a copy or a fill: shared and local addresses are
+  // this thread's and this block's, not memory the device runtime moves.
+  const auto device_addr = [&](unsigned l, uint64_t addr) -> uint64_t {
+    uint64_t off;
+    if (classify(addr, &off) != Space::Global)
+      where(l, "a device-side copy or fill of shared or local memory; the device runtime moves global memory",
+            Err::Unsupported);
+    return addr;
+  };
+  const auto copy_kind_ok = [](uint32_t kind) { return kind == 3 || kind == 4; };   // device to device, default
+
+  switch (f) {
+    case Fn::GetParameterBufferV2: {   // (func, gridDim, blockDim, sharedMem): a buffer for the child's parameters
+      static const Layout L = abi_layout({kP, kD3, kD3, kI});
+      each_lane(ex, [&](unsigned l) {
+        Child c;
+        c.kernel = kernel_idx(l, arg(L, 0, 0, 8, l));
+        c.has_kernel = true;
+        for (unsigned i = 0; i < 3; ++i) {
+          c.grid[i] = static_cast<uint32_t>(arg(L, 1, 4 * i, 4, l));
+          c.block[i] = static_cast<uint32_t>(arg(L, 2, 4 * i, 4, l));
+        }
+        c.shared = static_cast<uint32_t>(arg(L, 3, 0, 4, l));
+        c.size = param_bytes(m_.cubin.kernels[c.kernel]);
+        ret_ptr(l, new_buffer(std::move(c)));
+      });
+      return true;
+    }
+    case Fn::GetParameterBuffer: {   // (alignment, size): any size, as the card hands out
+      static const Layout L = abi_layout({kP, kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t size = arg(L, 1, 0, 8, l);
+        if (size > (uint64_t{1} << 26)) return ret_ptr(l, 0);
+        Child c;
+        c.size = static_cast<uint32_t>(size);
+        ret_ptr(l, new_buffer(std::move(c)));
+      });
+      return true;
+    }
+    case Fn::LaunchDeviceV2: {   // (parameterBuffer, stream): the child is queued
+      static const Layout L = abi_layout({kP, kP});
+      each_lane(ex, [&](unsigned l) {
+        Child c;
+        if (!take_buffer(arg(L, 0, 0, 8, l), &c) || !c.has_kernel) return ret(l, devrt::kInvalidValue);
+        ret(l, issue(std::move(c), arg(L, 1, 0, 8, l), false));
+      });
+      return true;
+    }
+    case Fn::LaunchDevice: {   // (func, parameterBuffer, gridDim, blockDim, sharedMem, stream)
+      static const Layout L = abi_layout({kP, kP, kD3, kD3, kI, kP});
+      each_lane(ex, [&](unsigned l) {
+        Child c;
+        c.kernel = kernel_idx(l, arg(L, 0, 0, 8, l));
+        c.has_kernel = true;
+        for (unsigned i = 0; i < 3; ++i) {
+          c.grid[i] = static_cast<uint32_t>(arg(L, 2, 4 * i, 4, l));
+          c.block[i] = static_cast<uint32_t>(arg(L, 3, 4 * i, 4, l));
+        }
+        c.shared = static_cast<uint32_t>(arg(L, 4, 0, 4, l));
+        if (const uint64_t b = arg(L, 1, 0, 8, l)) {   // a null buffer is allowed: no parameters
+          Child held;
+          if (!take_buffer(b, &held)) return ret(l, devrt::kInvalidValue);
+          c.params = std::move(held.params);
+        }
+        c.params.resize(param_bytes(m_.cubin.kernels[c.kernel]), 0);
+        ret(l, issue(std::move(c), arg(L, 5, 0, 8, l), false));
+      });
+      return true;
+    }
+    case Fn::GetLastError:
+    case Fn::PeekAtLastError:
+      each_lane(ex, [&](unsigned l) {
+        w.reg(4, l) = w.device_error[l];
+        if (f == Fn::GetLastError) w.device_error[l] = 0;
+      });
+      return true;
+    case Fn::GetDevice:
+    case Fn::GetDeviceCount:
+    case Fn::RuntimeGetVersion: {   // (int*): the answer the host gets (the device runtime's own version is 6000)
+      static const Layout L = abi_layout({kP});
+      const int v = f == Fn::GetDevice ? cfg_.device_ordinal : f == Fn::GetDeviceCount ? cfg_.device_count : 6000;
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        if (!p) return ret(l, devrt::kInvalidValue);
+        store(l, p, static_cast<uint32_t>(v), 4);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::StreamCreateWithFlags:
+    case Fn::EventCreateWithFlags: {   // (handle*, flags)
+      static const Layout L = abi_layout({kP, kI});
+      const bool stream = f == Fn::StreamCreateWithFlags;
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        const uint32_t flags = static_cast<uint32_t>(arg(L, 1, 0, 4, l));
+        if (!p || !(stream ? devrt::stream_flags_ok(flags) : devrt::event_flags_ok(flags)))
+          return ret(l, devrt::kInvalidValue);
+        store(l, p, stream ? devrt::new_stream() : devrt::new_event(), 8);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::StreamDestroy:   // (stream): only a created stream, and again is no error
+    case Fn::EventDestroy: {
+      static const Layout L = abi_layout({kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t h = arg(L, 0, 0, 8, l);
+        const bool ok = f == Fn::StreamDestroy ? devrt::stream_kind(h) == devrt::StreamKind::Named
+                                               : devrt::valid_event(h);
+        ret(l, ok ? devrt::kSuccess : devrt::kInvalidValue);
+      });
+      return true;
+    }
+    case Fn::EventRecord:
+    case Fn::EventRecordWithFlags: {   // (event, stream[, flags])
+      static const Layout L = abi_layout({kP, kP, kI});
+      each_lane(ex, [&](unsigned l) {
+        const bool ok = devrt::valid_event(arg(L, 0, 0, 8, l)) &&
+                        devrt::stream_kind(arg(L, 1, 0, 8, l)) != devrt::StreamKind::Invalid;
+        ret(l, ok ? devrt::kSuccess : devrt::kInvalidValue);
+      });
+      return true;
+    }
+    case Fn::StreamWaitEvent: {   // (stream, event, flags)
+      static const Layout L = abi_layout({kP, kP, kI});
+      each_lane(ex, [&](unsigned l) {
+        const bool ok = devrt::stream_kind(arg(L, 0, 0, 8, l)) != devrt::StreamKind::Invalid &&
+                        devrt::valid_event(arg(L, 1, 0, 8, l));
+        ret(l, ok ? devrt::kSuccess : devrt::kInvalidValue);
+      });
+      return true;
+    }
+    case Fn::Malloc: {   // (void** p, size): the device heap, as malloc; *p is left alone on failure
+      static const Layout L = abi_layout({kP, kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l), size = arg(L, 1, 0, 8, l);
+        if (!p || !size) return ret(l, devrt::kInvalidValue);
+        const uint64_t a = mem_.heap_alloc(size, cfg_.device_heap_bytes);
+        if (!a) return ret(l, devrt::kMemoryAllocation);
+        store(l, p, a, 8);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::Free: {   // (ptr): a heap block goes back; any other address the card lets be (a local, a global
+                       // variable); an unmapped one faults
+      static const Layout L = abi_layout({kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t a = arg(L, 0, 0, 8, l);
+        uint64_t off;
+        ret(l, devrt::kSuccess);
+        if (!a || classify(a, &off) != Space::Global || mem_.heap_free(a)) return;
+        uint64_t base = 0, size = 0;
+        if (!mem_.find_allocation(a, &base, &size))
+          where(l, "device cudaFree of a pointer that is neither live device memory nor a block of the device heap "
+                   "(freed twice, or never allocated)",
+                Err::InvalidFree);
+      });
+      return true;
+    }
+    case Fn::MemcpyAsync: {   // (dst, src, count, kind, stream): device to device only
+      static const Layout L = abi_layout({kP, kP, kP, kI, kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t dst = arg(L, 0, 0, 8, l), src = arg(L, 1, 0, 8, l), n = arg(L, 2, 0, 8, l);
+        if (!copy_kind_ok(static_cast<uint32_t>(arg(L, 3, 0, 4, l)))) return ret(l, devrt::kInvalidMemcpyDirection);
+        if (n && (!dst || !src)) return ret(l, devrt::kInvalidValue);
+        Child c;
+        auto op = std::make_shared<devrt::MemOp>();
+        if (n) {
+          op->dst = device_addr(l, dst);
+          op->src = device_addr(l, src);
+        }
+        op->width = n;
+        c.op = std::move(op);
+        ret(l, issue(std::move(c), arg(L, 4, 0, 8, l), true));
+      });
+      return true;
+    }
+    case Fn::Memcpy2DAsync: {   // (dst, dpitch, src, spitch, width, height, kind, stream)
+      static const Layout L = abi_layout({kP, kP, kP, kP, kP, kP, kI, kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t dst = arg(L, 0, 0, 8, l), dp = arg(L, 1, 0, 8, l), src = arg(L, 2, 0, 8, l),
+                       sp = arg(L, 3, 0, 8, l), wd = arg(L, 4, 0, 8, l), ht = arg(L, 5, 0, 8, l);
+        if (!copy_kind_ok(static_cast<uint32_t>(arg(L, 6, 0, 4, l)))) return ret(l, devrt::kInvalidMemcpyDirection);
+        if (wd > dp || wd > sp) return ret(l, devrt::kInvalidPitchValue);
+        if (wd && ht && (!dst || !src)) return ret(l, devrt::kInvalidValue);
+        Child c;
+        auto op = std::make_shared<devrt::MemOp>();
+        if (wd && ht) {
+          op->dst = device_addr(l, dst);
+          op->src = device_addr(l, src);
+        }
+        op->dpitch = dp;
+        op->spitch = sp;
+        op->width = wd;
+        op->height = ht;
+        c.op = std::move(op);
+        ret(l, issue(std::move(c), arg(L, 7, 0, 8, l), true));
+      });
+      return true;
+    }
+    case Fn::Memcpy3DAsync: {   // (const cudaMemcpy3DParms*, stream)
+      static const Layout L = abi_layout({kP, kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t pa = arg(L, 0, 0, 8, l);
+        if (!pa) return ret(l, devrt::kInvalidValue);
+        // cudaMemcpy3DParms: srcArray 0, srcPos 8, srcPtr 32 (ptr, pitch, xsize, ysize), dstArray 64, dstPos 72,
+        // dstPtr 96, extent 128, kind 152.
+        const auto q = [&](uint64_t off) { return fetch(l, pa + off, 8); };
+        if (q(0) || q(64)) return ret(l, devrt::kInvalidValue);   // arrays: not through the device runtime
+        if (!copy_kind_ok(static_cast<uint32_t>(fetch(l, pa + 152, 4)))) return ret(l, devrt::kInvalidMemcpyDirection);
+        const uint64_t sx = q(8), sy = q(16), sz = q(24), sptr = q(32), spitch = q(40), sys = q(56);
+        const uint64_t dx = q(72), dy = q(80), dz = q(88), dptr = q(96), dpitch = q(104), dys = q(120);
+        const uint64_t wd = q(128), ht = q(136), dep = q(144);
+        if (wd > spitch || wd > dpitch) return ret(l, devrt::kInvalidPitchValue);
+        if (wd && ht && dep && (!sptr || !dptr)) return ret(l, devrt::kInvalidValue);
+        Child c;
+        auto op = std::make_shared<devrt::MemOp>();
+        if (wd && ht && dep) {
+          op->src = device_addr(l, sptr) + sx + sy * spitch + sz * spitch * sys;
+          op->dst = device_addr(l, dptr) + dx + dy * dpitch + dz * dpitch * dys;
+        }
+        op->spitch = spitch;
+        op->dpitch = dpitch;
+        op->sslice = spitch * sys;
+        op->dslice = dpitch * dys;
+        op->width = wd;
+        op->height = ht;
+        op->depth = dep;
+        c.op = std::move(op);
+        ret(l, issue(std::move(c), arg(L, 1, 0, 8, l), true));
+      });
+      return true;
+    }
+    case Fn::MemsetAsync:
+    case Fn::Memset2DAsync:
+    case Fn::Memset3DAsync: {
+      // (ptr, value, count, stream) | (ptr, pitch, value, width, height, stream) |
+      // (cudaPitchedPtr, value, cudaExtent, stream). The card's own fill ignores the value and writes zeros (RTX
+      // 3060, driver 596.36: 0x5a, 0xff, 1 and -1 all gave 0); the documented fill is done here.
+      static const Layout L1 = abi_layout({kP, kI, kP, kP});
+      static const Layout L2 = abi_layout({kP, kP, kI, kP, kP, kP});
+      static const Layout L3 = abi_layout({kPitched, kI, kExtent, kP});
+      each_lane(ex, [&](unsigned l) {
+        uint64_t ptr, pitch = 0, wd, ht = 1, dep = 1, ysize = 1, stream;
+        uint32_t value;
+        if (f == Fn::MemsetAsync) {
+          ptr = arg(L1, 0, 0, 8, l);
+          value = static_cast<uint32_t>(arg(L1, 1, 0, 4, l));
+          wd = arg(L1, 2, 0, 8, l);
+          pitch = wd;
+          stream = arg(L1, 3, 0, 8, l);
+        } else if (f == Fn::Memset2DAsync) {
+          ptr = arg(L2, 0, 0, 8, l);
+          pitch = arg(L2, 1, 0, 8, l);
+          value = static_cast<uint32_t>(arg(L2, 2, 0, 4, l));
+          wd = arg(L2, 3, 0, 8, l);
+          ht = arg(L2, 4, 0, 8, l);
+          stream = arg(L2, 5, 0, 8, l);
+        } else {
+          ptr = arg(L3, 0, 0, 8, l);
+          pitch = arg(L3, 0, 8, 8, l);
+          ysize = arg(L3, 0, 24, 8, l);
+          value = static_cast<uint32_t>(arg(L3, 1, 0, 4, l));
+          wd = arg(L3, 2, 0, 8, l);
+          ht = arg(L3, 2, 8, 8, l);
+          dep = arg(L3, 2, 16, 8, l);
+          stream = arg(L3, 3, 0, 8, l);
+        }
+        if (f != Fn::MemsetAsync && wd > pitch) return ret(l, devrt::kInvalidValue);
+        if (wd && ht && dep && !ptr) return ret(l, devrt::kInvalidValue);
+        Child c;
+        auto op = std::make_shared<devrt::MemOp>();
+        op->kind = devrt::MemOp::Kind::Set;
+        if (wd && ht && dep) op->dst = device_addr(l, ptr);
+        op->dpitch = pitch;
+        op->dslice = pitch * ysize;
+        op->width = wd;
+        op->height = ht;
+        op->depth = dep;
+        op->value = static_cast<uint8_t>(value);
+        c.op = std::move(op);
+        ret(l, issue(std::move(c), stream, true));
+      });
+      return true;
+    }
+    case Fn::FuncGetAttributes: {   // (cudaFuncAttributes*, func): the first seven fields
+      static const Layout L = abi_layout({kP, kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        if (!p) return ret(l, devrt::kInvalidValue);
+        const size_t idx = kernel_idx(l, arg(L, 1, 0, 8, l));
+        const exec::KernelRef* ref = ptx_kernel(idx);
+        const CubinKernel& k = m_.cubin.kernels[idx];
+        devrt::FuncAttrs a;
+        if (ref) {
+          a = devrt::func_attributes(*ref->fn, profile_, ref->arch ? ref->arch : m_.sm);
+        } else {   // no PTX beside the SASS: what the cubin says
+          a.max_threads = static_cast<int32_t>(profile_.limits.max_threads_per_block);
+          a.binary = profile_.cc_major * 10 + profile_.cc_minor;
+          a.ptx = m_.sm;
+        }
+        // A kernel with no PTX to analyse: its registers and frame are in the cubin.
+        if (!ref || ref->fn->body.empty()) {
+          a.regs = static_cast<int32_t>(k.regs);
+          a.local = k.frame_size;
+          a.shared = k.shared_bytes;
+        }
+        uint8_t out[40];
+        devrt::put_func_attrs(a, out);
+        for (uint32_t off = 0; off < 40; off += 8) {
+          uint64_t v;
+          std::memcpy(&v, out + off, 8);
+          store(l, p + off, v, 8);
+        }
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::DeviceGetAttribute: {   // (int* value, attr, device)
+      static const Layout L = abi_layout({kP, kI, kI});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        const int attr = static_cast<int>(arg(L, 1, 0, 4, l));
+        const int dev = static_cast<int>(arg(L, 2, 0, 4, l));
+        if (!p) return ret(l, devrt::kInvalidValue);
+        // The device runtime answers attributes 1 to 148 but 131 as the host does, 0 with 0, and nothing else.
+        if (attr == 0) {
+          store(l, p, 0, 4);
+          return ret(l, devrt::kSuccess);
+        }
+        if (attr < 0 || attr == 131 || attr >= 149) return ret(l, devrt::kInvalidValue);
+        int v = 0;
+        const int e = cfg_.devrt ? cfg_.devrt->attribute(dev, attr, &v) : devrt::kNotSupported;
+        if (e) return ret(l, static_cast<uint32_t>(e));
+        store(l, p, static_cast<uint32_t>(v), 4);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::DeviceGetLimit: {   // (size_t*, limit)
+      static const Layout L = abi_layout({kP, kI});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        if (!p) return ret(l, devrt::kInvalidValue);
+        uint64_t v = 0;
+        const int e = cfg_.devrt ? cfg_.devrt->limit(cfg_.device_ordinal, static_cast<int>(arg(L, 1, 0, 4, l)), &v)
+                                 : devrt::kNotSupported;
+        if (e) return ret(l, static_cast<uint32_t>(e));
+        store(l, p, v, 8);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::DeviceGetCacheConfig:
+    case Fn::DeviceGetSharedMemConfig: {   // (enum*)
+      static const Layout L = abi_layout({kP});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        if (!p) return ret(l, devrt::kInvalidValue);
+        int v = 0;
+        int e = devrt::kNotSupported;
+        if (cfg_.devrt)
+          e = f == Fn::DeviceGetCacheConfig ? cfg_.devrt->cache_config(cfg_.device_ordinal, &v)
+                                            : cfg_.devrt->shared_mem_config(cfg_.device_ordinal, &v);
+        if (e) return ret(l, static_cast<uint32_t>(e));
+        store(l, p, static_cast<uint32_t>(v), 4);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::OccupancyMaxActiveBlocks:
+    case Fn::OccupancyMaxActiveBlocksWithFlags: {   // (int* n, func, blockSize, dynamicSmem[, flags])
+      static const Layout L = abi_layout({kP, kP, kI, kP, kI});
+      each_lane(ex, [&](unsigned l) {
+        const uint64_t p = arg(L, 0, 0, 8, l);
+        const int32_t bs = static_cast<int32_t>(arg(L, 2, 0, 4, l));
+        if (!p) return ret(l, devrt::kInvalidValue);
+        if (bs <= 0) {   // the card writes 0 and refuses
+          store(l, p, 0, 4);
+          return ret(l, devrt::kInvalidValue);
+        }
+        const size_t idx = kernel_idx(l, arg(L, 1, 0, 8, l));
+        const exec::KernelRef* ref = ptx_kernel(idx);
+        if (!ref) return ret(l, devrt::kNotSupported);
+        const auto res = exec::kernel_resources(*ref->fn, profile_, static_cast<uint32_t>(bs),
+                                                static_cast<uint32_t>(arg(L, 3, 0, 8, l)));
+        store(l, p, res.occupancy.blocks_per_sm, 4);
+        ret(l, devrt::kSuccess);
+      });
+      return true;
+    }
+    case Fn::GetErrorString:
+    case Fn::GetErrorName: {   // (cudaError_t): a string in device memory
+      static const Layout L = abi_layout({kI});
+      each_lane(ex, [&](unsigned l) {
+        const int code = static_cast<int>(arg(L, 0, 0, 4, l));
+        const char* text = cfg_.devrt ? (f == Fn::GetErrorString ? cfg_.devrt->error_string(code)
+                                                                  : cfg_.devrt->error_name(code))
+                                      : "unrecognized error code";
+        ret_ptr(l, mem_.intern_string(text));
+      });
+      return true;
+    }
+    case Fn::DeviceSynchronize: {   // CDP1's: wait for the block's launches. Gone from sm_90 on.
+      if (profile_.cc_major >= 9)
+        fault(w, ins, static_cast<unsigned>(std::countr_zero(ex)),
+              "cudaDeviceSynchronize from device code, which NVIDIA's driver refuses to load a module for on sm_90 "
+              "and later (CUDA 12 removed it; build for CDP2 and use tail launches)",
+              Err::Unsupported);
+      ChildRunner runner{m_, cfg_, mem_, profile_, &dl_->extra};
+      devrt::drain(*dl_, mem_, runner, block_linear);
+      each_lane(ex, [&](unsigned l) { ret(l, devrt::kSuccess); });
+      return true;
+    }
+    case Fn::None:
+      break;
   }
   return false;
 }

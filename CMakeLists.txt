@@ -159,6 +159,7 @@ add_library(vgpu STATIC
   src/ptx/contract.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/exec/devrt.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
 )
@@ -967,6 +968,7 @@ vgpu_unit_test(test_dsmem)
 vgpu_unit_test(test_barriers)
 # Dynamic parallelism at the PTX level.
 vgpu_unit_test(test_dynpar)
+vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -2079,6 +2081,16 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 3600)
+endif()
+
+# The device runtime (cudadevrt): cdp_device_api and cdp1_device_sync alone, on four generations,
+# as e2e_sass_archs runs them among the rest (nvidia/docs/sass.md, "Device runtime").
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_runtime COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_device_runtime PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=cdp_device_api:75 cdp1_device_sync:75:89;VGPU_SASS_ARCHS=sm_75 sm_86 sm_90 sm_120"
+    TIMEOUT 1800)
 endif()
 
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the

@@ -1011,9 +1011,11 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   // Every kernel loaded on the device, for the child grids a kernel launches.
   exec::KernelTable kernels;
   if (!cfg.kernels) {
-    for (const auto& lm : modules_)
+    for (const auto& lm : modules_) {
+      const int arch = lm.mod ? target_arch(lm.mod->target) : 0;
       for (const auto& [va, fn] : lm.kernels)
-        if (fn) kernels[va] = exec::KernelRef{fn, &lm.symbols};
+        if (fn) kernels[va] = exec::KernelRef{fn, &lm.symbols, arch};
+    }
     cfg.kernels = &kernels;
   }
   if (fault_) {

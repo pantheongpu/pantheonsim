@@ -1221,9 +1221,30 @@ in "Not implemented".
   parent block, so it is the same with any number of host threads), each
   complete -- its own children included -- before the next: a schedule CUDA
   allows for every device-side stream, since it promises no concurrency
-  between parent and child. CUDA's limits apply (2048 pending, 24 deep).
-  Checked by test_dynpar and dynamic_parallelism.cu (built with -rdc: fan-out,
-  nesting, order, the tail and fire-and-forget streams, a struct parameter).
+  between parent and child. CUDA's limit applies: 2048 pending launches (the
+  24 this first wrote down was the synchronization depth, not a nesting
+  limit; see the entry below). Checked by test_dynpar and
+  dynamic_parallelism.cu (built with -rdc: fan-out, nesting, order, the tail
+  and fire-and-forget streams, a struct parameter).
+
+- The device runtime, completed (2026-10-05), on both engines: everything
+  cuda_device_runtime_api.h gives a kernel -- cudaMemcpyAsync/2D/3D and the
+  memset family, cudaMalloc/cudaFree (the device heap), cudaFuncGetAttributes,
+  cudaDeviceGetAttribute/GetLimit, the cache configuration, the occupancy
+  queries, cudaGetErrorString/Name, cudaRuntimeGetVersion, the older
+  cudaGetParameterBuffer/cudaLaunchDevice pair, stream and event validation --
+  under CDP2's names and CDP1's (cudaDeviceSynchronize for parts before
+  Hopper). Each call's result, errors included, was measured on an RTX 3060
+  (nvidia/docs/sass.md, "Device runtime"), which also corrected what the
+  first version assumed: there is no nesting limit of 24 (a chain stops at the
+  pending-launch limit, 2048 by default, with cudaErrorLaunchPendingCountExceeded;
+  a limit below 32 is 32), a tail launch waits for every other grid the grid
+  launched, and the card's device-side cudaMemsetAsync writes zero whatever
+  the value is. The pending count is the card's, and when it is full the
+  queued grids run at once. Both engines share include/vgpu/exec/devrt.hpp;
+  the library's own answers (attributes, limits, error strings) come from the
+  CUDA shim that launched the kernel. Checked by cdp_device_api.cu (against
+  the card) and cdp1_device_sync.cu in e2e_sass_archs and e2e_device_runtime.
 
 - CUTLASS's SM90 GEMM unit tests, run unmodified (2026-09-25), found: the
   register estimate ignored launch bounds (.maxntid/.minnctapersm/.maxnreg
