@@ -57,6 +57,7 @@ struct Operand {
   // A literal in a 64-bit float operand: the word is the double's high half,
   // the low half zero (a 64-bit integer operand's is zero-extended instead).
   bool literal_high = false;
+  bool scale_src = false;   // gfx1250: a scale source of a scaled matrix instruction, after the matrices' own
   bool lit64 = false;   // gfx1250: a 64-bit literal (source code 254), two words of the instruction stream
   bool constant_k = false;   // RDNA: an instruction's own constant (v_fmaak_f32's K), always written in hex
 };

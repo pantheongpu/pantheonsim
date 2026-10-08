@@ -32,7 +32,7 @@ ENCODINGS = {
     'ENC_SMEM': 'Smem', 'ENC_VOP1': 'Vop1', 'ENC_VOP2': 'Vop2', 'ENC_VOPC': 'Vopc', 'ENC_VOP3': 'Vop3',
     'VOP3_SDST_ENC': 'Vop3', 'ENC_VOP3P': 'Vop3p', 'ENC_DS': 'Ds', 'ENC_FLAT': 'Flat',
     'ENC_FLAT_GLOBAL': 'Flat', 'ENC_FLAT_SCRATCH': 'Flat', 'ENC_MUBUF': 'Mubuf', 'ENC_MTBUF': 'Mtbuf',
-    'VOPDXY': 'Vopd', 'VOPDXY_X': 'Vopd', 'VOPDXY_Y': 'Vopd', 'VOPD3XY': 'Vopd',   # CDNA 5 lists the X and Y halves apart
+    'VOPDXY': 'Vopd', 'VOPDXY_X': 'Vopd', 'VOPDXY_Y': 'Vopd', 'VOPD3XY': 'Vopd', 'ENC_VOP3PX2': 'Vop3p', 'ENC_VOP3PX3': 'Vop3p',   # CDNA 5 lists the X and Y halves apart
     # RDNA4's names for the same encodings.
     'ENC_VOP3SD': 'Vop3', 'ENC_VFLAT': 'Flat', 'ENC_VGLOBAL': 'Flat', 'ENC_VSCRATCH': 'Flat',
     'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd', 'ENC_VDS': 'Ds', 'ENC_FLAT_GLBL': 'Flat',
@@ -64,6 +64,8 @@ KINDS = {
 IMAGE_ENCODINGS = {'ENC_MIMG': 0, 'ENC_VIMAGE': 0, 'ENC_VSAMPLE': 1}
 if images:
     ENCODINGS = {e: 'Mimg' for e in IMAGE_ENCODINGS}
+elif 'CDNA 5' in arch:
+    ENCODINGS['ENC_VIMAGE'] = 'Mimg'   # CDNA 5 has the tensor data mover's two, which are not image accesses
 # Fields the decoder reads itself rather than as operands.
 SKIP_FIELDS = {'LITERAL'}
 
@@ -89,7 +91,7 @@ for inst in isa.find('Instructions'):
             continue
         enc = ENCODINGS[enc_xml]
         opcode = int(ie.find('Opcode').text, int(ie.find('Opcode').get('Radix', '10')))
-        segment = {'VOPD3XY': 1, 'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
+        segment = {'ENC_VIMAGE': 3, 'ENC_VOP3PX2': 1, 'ENC_VOP3PX3': 2, 'VOPD3XY': 1, 'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
         if images:
             segment = IMAGE_ENCODINGS[enc_xml]
         ops = []

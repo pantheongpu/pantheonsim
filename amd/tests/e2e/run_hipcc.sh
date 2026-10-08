@@ -331,6 +331,23 @@ echo "$out" | sed 's/^/      /'
 expect "the atomics program runs to the end" "0" "$status"
 expect "every one of its atomic checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# The MI455X (gfx1250, CDNA 5; wave32): the same self-checking programs built for it by ROCm 7.2's hipcc and run on a
+# simulated one. Its compiler output reaches memory with a scalar base and a scaled offset register, takes the wave's
+# number from IB_STS2, finds globals and functions by 64-bit PC-relative relocations, and issues dual-issue pairs of
+# three words. No card has run these: the programs hold themselves to what HIP's API and the C++ say.
+for prog in atomics memory graphs cooperative streams; do
+  mi455_dir=$(mktemp -d)
+  mi455_shim=$(cd "$shim" && pwd)
+  out=$(cd "$mi455_dir" && VGPU_QUIET=1 VGPU_GPU=amd/mi455x VGPU_DEVICE_COUNT=2 LD_LIBRARY_PATH="$mi455_shim" timeout 300 \
+        "$(dirname "$exe")/$prog.gfx1250" 2>&1)
+  status=$?
+  rm -rf "$mi455_dir"
+  expect "the gfx1250 $prog program runs to the end" "0" "$status"
+  if [[ "$prog" != cooperative && "$prog" != streams ]]; then
+    expect "every one of its gfx1250 $prog checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+  fi
+done
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

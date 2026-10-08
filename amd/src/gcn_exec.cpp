@@ -3990,13 +3990,35 @@ struct Machine {
   // everything else is the device's. Most flat accesses reach only the
   // device's, and those are global accesses by another name.
   // Returns whether any lane's address was in LDS.
+  // How many bytes a global or flat access moves per lane, for SCALE_OFFSET.
+  static uint32_t access_bytes(const Inst& in) {
+    const std::string_view body = std::string_view(in.name).substr(in.name.find('_') + 1);
+    Narrow n;
+    Half h;
+    AtomicOp a;
+    if (narrow(in.name, &n)) return n.bytes;
+    if (half_access(body, &h)) return h.bytes;
+    if ((body.rfind("load_dword", 0) == 0 || body.rfind("load_monitor_b", 0) == 0) && !in.dst.empty()) return 4 * in.dst[0].width;
+    if (body.rfind("store_dword", 0) == 0 && in.src.size() > 1) return 4 * in.src[1].width;
+    if (parse_atomic(body, &a)) return a.bytes;
+    return 4;
+  }
+  // A lane's address in a flat access: a 64-bit one in a register pair, or -- gfx1250 -- a scalar pair's with a 32-bit
+  // offset register added (scaled, where SCALE_OFFSET asks).
+  uint64_t flat_address(Wave& w, const Inst& in, uint32_t lane, uint32_t bytes) {
+    const uint64_t base = in.has_saddr ? scalar_field(w, in.saddr, true) + scaled_offset(in, lane_src(w, in.src[0], lane), bytes)
+                                       : lane_src64(w, in.src[0], lane);
+    return base + static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+  }
+
   bool flat_access(Wave& w, const Inst& in, Group& g) {
     const auto in_lds = [](uint64_t a) { return a >= kSharedBase && a < kSharedBase + kSharedSize; };
     const auto in_private = [](uint64_t a) { return a >= kPrivateBase && a < kPrivateBase + kPrivateSize; };
+    const uint32_t bytes_per_lane = access_bytes(in);
     bool lds = false, priv = false;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+      const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
       lds = lds || in_lds(addr);
       priv = priv || in_private(addr);
     }
@@ -4012,7 +4034,7 @@ struct Machine {
     if (AtomicOp a; parse_atomic(body, &a)) {
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         if (!(w.exec >> lane & 1)) continue;
-        const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+        const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
         uint64_t v = 0, expected = 0, before = 0;
         atomic_data(w, in, a, lane, &v, &expected);
         uint8_t* host = nullptr;
@@ -4047,7 +4069,7 @@ struct Machine {
     const uint32_t bytes = part ? n.bytes : 4 * words;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+      const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
       uint8_t* host = nullptr;   // where LDS or private memory keeps it; null for the device's
       if (in_lds(addr)) {
         const uint64_t where = addr - kSharedBase;
@@ -5793,6 +5815,8 @@ struct Machine {
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mimg:
+        if (in.name.rfind("tensor_", 0) == 0)
+          throw Error::make(Err::Unsupported, in.name, " (gfx1250's tensor data mover) is decoded but not modeled");
         ++n.vmem;
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
         else ++n.vmem_rd;

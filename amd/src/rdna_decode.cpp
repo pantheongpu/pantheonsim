@@ -101,6 +101,7 @@ const std::vector<Row>& rows_rdna4() {
 thread_local bool g_rdna4 = false;   // gfx12's encodings: RDNA4, and CDNA 5 which is built on them
 thread_local bool g_rdna2 = false;
 thread_local bool g_cdna5 = false;   // gfx1250, whose table and additions are its own
+thread_local uint8_t g_vop3px = 0;   // inside a scaled matrix instruction's second half: 2 (X2) or 3 (X3), its table segment
 struct Generation {
   bool saved4, saved2, saved5;
   explicit Generation(Target t) : saved4(g_rdna4), saved2(g_rdna2), saved5(g_cdna5) {
@@ -487,6 +488,28 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const bool r4 = g_rdna4, r2 = g_rdna2;
   const uint32_t null_code = r2 ? 125 : 124;
   const uint32_t w0 = word(code, at);
+  // gfx1250's scaled matrix instructions are two VOP3P words: a prefix that names the scale sources (its opcode
+  // says whether a scale is 32 bits, X2, or 64, X3), then the matrix instruction itself. The specification's
+  // opcodes for the prefix and the ones LLVM 22 writes differ: the specification's identifiers (0xCC37, 0xCCBD for X2;
+  // 0xCC3B, 0xCCBA for X3) are the opcodes of ordinary instructions in the same specification (0x37 is
+  // v_pk_maximum3_f16), so only LLVM's (0x35 for X2, 0x3A for X3) are taken.
+  if (g_cdna5 && !g_vop3px && (w0 >> 24) == 0xCC) {
+    const uint32_t pre = bits(w0, 23, 16);
+    const bool x2 = pre == 0x35, x3 = pre == 0x3A;
+    if (x2 || x3) {
+      const uint64_t prefix = w0 | static_cast<uint64_t>(word(code, at + 4)) << 32;
+      g_vop3px = x2 ? 2 : 3;
+      struct Reset { ~Reset() { g_vop3px = 0; } } reset;
+      Inst main = rdna::decode(code, at + 8, pc + 8, target, wave64);
+      // The scale sources: the prefix's SRC0 and SRC1 fields (the matrix word's own are the matrices').
+      main.src.push_back(operand(bits(prefix, 40, 32), x2 ? 1 : 2));
+      main.src.push_back(operand(bits(prefix, 49, 41), x2 ? 1 : 2));
+      main.src[main.src.size() - 2].scale_src = main.src.back().scale_src = true;
+      main.pc = pc;
+      main.size = 16;
+      return main;
+    }
+  }
   uint32_t w2 = 0;   // RDNA4's 96-bit memory encodings' third word
   bool vopd3 = false;  // gfx1250's 96-bit dual-issue encoding
   Inst in;
@@ -514,6 +537,33 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   }
   // An image instruction: MIMG on gfx10 and gfx11; VIMAGE and VSAMPLE on
   // RDNA4.
+  // gfx1250's tensor data mover: VIMAGE with an opcode of its own, whose operands are groups of scalar registers.
+  if (g_cdna5 && (w0 >> 26) == 0x34 && (bits(w0, 21, 14) == 196 || bits(w0, 21, 14) == 197)) {
+    const uint32_t w1 = word(code, at + 4), g = word(code, at + 8);
+    in.enc = Enc::Mimg;
+    in.size = 12;
+    in.opcode = bits(w0, 21, 14);
+    const Row& tr = row(Enc::Mimg, 3, in.opcode);
+    in.name = tr.name;
+    in.asm_name = in.name;
+    in.cache = bits(w1, 22, 20) | bits(w1, 19, 18) << 3;   // TH, SCOPE
+    in.gfx12_cache = true;
+    in.nv = bits(w0, 7, 7);
+    const auto group = [&](uint32_t reg, uint32_t width) {
+      Operand o;
+      o.kind = reg == 124 ? OperandKind::Null : OperandKind::Sgpr;
+      o.index = reg;
+      o.width = width;
+      return o;
+    };
+    in.src = {group(g & 0xFF, 4), group(g >> 8 & 0xFF, 8)};
+    // The third and fourth groups are named only when the descriptor is longer than the first two give.
+    if ((g >> 16 & 0xFF) != 124 || (g >> 24 & 0xFF) != 124) {
+      in.src.push_back(group(g >> 16 & 0xFF, 4));
+      in.src.push_back(group(g >> 24 & 0xFF, 4));
+    }
+    return in;
+  }
   if ((!r4 && (w0 >> 26) == 0x3c) || (r4 && ((w0 >> 26) == 0x34 || (w0 >> 26) == 0x39)))
     return decode_image(code, at, in);
   if ((w0 >> 23) == 0x17d) {
@@ -691,7 +741,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const uint32_t seg = in.enc != Enc::Flat ? 0
                      : r4 ? ((w0 >> 24) == 0xed ? 1 : (w0 >> 24) == 0xee ? 2 : 0)
                           : r2 ? bits(w, 15, 14) : bits(w, 17, 16);
-  const uint8_t segment = static_cast<uint8_t>(seg == 1 ? 2 : seg == 2 ? 1 : 0);
+  const uint8_t segment = in.enc == Enc::Vop3p && g_vop3px ? static_cast<uint8_t>(g_vop3px - 1)
+                                                          : static_cast<uint8_t>(seg == 1 ? 2 : seg == 2 ? 1 : 0);
   const Row& r = row(in.enc, segment, in.opcode);
   in.name = r.name;
   if (in.enc == Enc::Flat) in.segment = segment == 1 ? Inst::Segment::Global : segment == 2 ? Inst::Segment::Scratch
@@ -783,6 +834,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const bool vop3_16 = vop3ish;   // VOP3's 16-bit operands pick their half with OP_SEL
   for (const Opnd& op : r.ops) {
     const std::string f = op.field;
+    if (f.rfind("SCALE_", 0) == 0) continue;   // a scaled matrix instruction's, taken from its prefix above
     bool buffer_atomic_data = false;
     uint32_t width = width_of(op, in.enc, wave64);
     // A buffer address is an offset or an index, one register, or both, two.
@@ -1332,7 +1384,8 @@ std::string one(const Inst& i) {
   const bool short_form = i.enc == Enc::Vop1 || i.enc == Enc::Vop2 || i.enc == Enc::Vopc;
   // A short form with no long one to tell it from (v_fmaak_f32,
   // v_readfirstlane_b32) has no suffix.
-  if (short_form && (i.dpp || i.dpp8)) s += "_dpp";
+  // (gfx1250's compare in DPP form is written with no suffix at all.)
+  if (short_form && (i.dpp || i.dpp8)) s += g_cdna5 && i.enc == Enc::Vopc ? "" : "_dpp";
   else if (short_form && i.sdwa) s += "_e32";   // (made _sdwa below)
   else if (short_form && table().long_forms.count(name) && name != "v_readfirstlane_b32" && name != "v_nop")
     s += "_e32";
@@ -1342,6 +1395,7 @@ std::string one(const Inst& i) {
   const bool promoted = i.enc == Enc::Vop3 && table().short_forms.count(name);
   if (i.enc == Enc::Vop3 && promoted) s += i.dpp || i.dpp8 ? "_e64_dpp" : "_e64";
   if (i.enc == Enc::Vop3 && !promoted && (i.dpp || i.dpp8)) s += "_e64_dpp";
+  if (g_cdna5 && i.enc == Enc::Vop3p && (i.dpp || i.dpp8)) s += "_e64_dpp";
 
   if (i.enc == Enc::Sopp) {
     if (name == "s_waitcnt") return s + " " + waitcnt(static_cast<uint32_t>(i.simm));
@@ -1526,9 +1580,11 @@ std::string one(const Inst& i) {
       const uint32_t all = (1u << n) - 1;
       // A mixed-precision instruction's sources are floats unless OP_SEL_HI
       // says half, so it writes the list only where some are halves.
-      const bool mix = name.rfind("v_fma_mix", 0) == 0 || name.find("f8f6f4") != std::string::npos;
+      const bool mix = name.rfind("v_fma_mix", 0) == 0;
+      // gfx1250's matrix instructions use OP_SEL_HI for their formats, which are not written out here.
+      const bool matrix = g_cdna5 && (name.rfind("v_wmma_", 0) == 0 || name.rfind("v_swmmac_", 0) == 0);
       list("op_sel", i.op_sel & all, 0);
-      list("op_sel_hi", i.op_sel_hi & all, mix ? 0 : all);
+      if (!matrix) list("op_sel_hi", i.op_sel_hi & all, mix ? 0 : all);
       list("neg_lo", i.neg_lo & all, 0);
       list("neg_hi", i.neg_hi & all, 0);
       if (i.clamp) s += " clamp";
@@ -1568,6 +1624,15 @@ std::string one(const Inst& i) {
 std::string to_text(const Inst& i) {
   const Generation generation(i.arch);
   if (i.enc == Enc::Vopd && i.dual.size() == 2) return one(i.dual[0]) + " :: " + one(i.dual[1]);
+  if (i.enc == Enc::Mimg && i.name.rfind("tensor_", 0) == 0) {
+    std::string s = i.name;
+    std::string sep = " ";
+    for (const Operand& o : i.src) {
+      s += sep + op_text(o);
+      sep = ", ";
+    }
+    return s + gfx12_cache(i.name, i.cache) + (i.nv ? " nv" : "");
+  }
   if (i.enc == Enc::Mimg) return image_text(i);
   return one(i);
 }
