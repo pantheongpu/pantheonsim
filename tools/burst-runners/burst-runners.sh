@@ -39,7 +39,10 @@ case "${1:-}" in
     n="${2:-2}"
     [[ -z "$(instances)" ]] || { echo "already running: $(instances)"; exit 1; }
     # The default VPC's subnet and the newest Ubuntu 24.04, as the playground host uses.
-    ami=$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text)
+    # (describe-images, not Canonical's SSM parameter, which a limited IAM user may not read.)
+    ami=$(aws ec2 describe-images --owners 099720109477 \
+      --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' 'Name=state,Values=available' \
+      --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text)
     subnet=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=true --query 'Subnets[0].SubnetId' --output text)
     vpc=$(aws ec2 describe-subnets --subnet-ids "$subnet" --query 'Subnets[0].VpcId' --output text)
     sg=$(aws ec2 describe-security-groups --filters Name=group-name,Values=pantheonsim-burst-runners Name=vpc-id,Values="$vpc" --query 'SecurityGroups[0].GroupId' --output text)
