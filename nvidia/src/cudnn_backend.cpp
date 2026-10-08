@@ -1409,6 +1409,41 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
 // outputs it reads. Every tensor no operation writes must be one the variant
 // pack supplies (not virtual) -- or, for a subgraph (an attention operation's
 // score modifiers), one of free_inputs, which its operation provides.
+// cudnn-frontend 1.30 builds an attention sink's gradient as
+//   dSink = reduce_add(exp(sink - stats) * rowsum(dO * O))
+// (a SUB, an EXP, a MUL and an ADD reduction), whose sign is the opposite of
+// the gradient: the sink's probability exp(sink - stats) goes to no value, so
+// dSink = -sum(exp(sink - stats) * D). The card returns the gradient
+// (measured: dnn_attention's sink cases on an RTX 3060, cuDNN 9.27, fail by
+// exactly the sign against the literal graph and pass against the gradient),
+// so a reduction of that shape -- an ADD over a product of an EXP of (a graph
+// input - a tensor) and another tensor, into a result the shape of that
+// input -- is negated.
+void mark_sink_gradients(std::vector<Op>* order) {
+  std::map<int64_t, const Op*> producer;
+  for (const Op& o : *order) {
+    producer[o.out.uid] = &o;
+    for (const GTensor& t : o.more) producer[t.uid] = &o;
+  }
+  auto made_by = [&](const GTensor& t, Kind k, cudnnPointwiseMode_t pw) -> const Op* {
+    const auto it = producer.find(t.uid);
+    if (it == producer.end() || it->second->kind != k) return nullptr;
+    if (k == Kind::Pointwise && it->second->pw != pw) return nullptr;
+    return it->second;
+  };
+  for (Op& r : *order) {
+    if (r.kind != Kind::Reduction || r.red != CUDNN_REDUCE_TENSOR_ADD || r.in.empty()) continue;
+    const Op* mul = made_by(r.in[0], Kind::Pointwise, CUDNN_POINTWISE_MUL);
+    if (!mul || mul->in.size() != 2) continue;
+    for (const GTensor& factor : mul->in) {
+      const Op* ex = made_by(factor, Kind::Pointwise, CUDNN_POINTWISE_EXP);
+      const Op* sub = ex && !ex->in.empty() ? made_by(ex->in[0], Kind::Pointwise, CUDNN_POINTWISE_SUB) : nullptr;
+      if (!sub || sub->in.size() != 2 || producer.count(sub->in[0].uid)) continue;
+      if (sub->in[0].l.count() == r.out.l.count()) r.alpha = -r.alpha;
+    }
+  }
+}
+
 bool schedule_ops(const Desc* graph, std::vector<Op>* order, std::string* why, const std::set<int64_t>& free_inputs) {
   const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
   if (!ops || ops->count < 1) { *why = "the graph has no operations"; return false; }
@@ -1448,6 +1483,7 @@ bool schedule_ops(const Desc* graph, std::vector<Op>* order, std::string* why, c
     }
     if (!progress) { *why = "the graph's operations depend on each other in a cycle"; return false; }
   }
+  mark_sink_gradients(order);
   return true;
 }
 bool schedule(const Desc* graph, std::vector<Op>* order, std::string* why) {
@@ -2599,7 +2635,7 @@ cudnnStatus_t Runner::run_op(const Op& op) {
     case Kind::ConvData: vc::convolve(op.geom, vc::ConvDir::Data, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
     case Kind::ConvFilter: vc::convolve(op.geom, vc::ConvDir::Filter, *in[0], *in[1], &r, op.acc); alpha = op.alpha, beta = op.beta; break;
     case Kind::Matmul: run_matmul(op, in, &r); break;
-    case Kind::Reduction: run_reduction(op, *in[0], &r); break;
+    case Kind::Reduction: run_reduction(op, *in[0], &r); alpha = op.alpha; break;
     case Kind::PoolFwd:
     case Kind::PoolBwd:
       run_pool(op, in, &outs);

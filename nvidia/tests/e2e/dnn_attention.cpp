@@ -740,8 +740,12 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   check("dV", *dV, gr.dV, false);
   if (c.bias) check("dBias", *dBias, gr.dBias, false);
   if (c.sink) {
-    const double er = err_of(read_buf(*dSink), gr.dSink);
+    const std::vector<double> got_ds = read_buf(*dSink);
+    const double er = err_of(got_ds, gr.dSink);
     expect(bwd_name + ": dSink", er < gtol, er);
+    if (!(er < gtol))
+      for (size_t i = 0; i < got_ds.size() && i < gr.dSink.size(); ++i)
+        std::printf("     dSink[%zu]: got %g, want %g\n", i, got_ds[i], gr.dSink[i]);
   }
 }
 
