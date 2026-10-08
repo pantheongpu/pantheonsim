@@ -24,7 +24,7 @@ namespace vgpu::profiling {
 //
 // Sync: a stream, context or event wait that returned; Stream and Context: a
 // resource coming into being, which a profiler lists once.
-enum class EventKind : uint8_t { Kernel, Memcpy, Memset, Api, Sync, Stream, Context, Device };
+enum class EventKind : uint8_t { Kernel, Memcpy, Memset, Api, Sync, Stream, Context, Device, Marker, MarkerData, Name };
 
 // What a copy's two ends are, as a profiler classifies them.
 enum class MemKind : uint8_t { Unknown, Pageable, Pinned, Device, Array, Managed };
@@ -59,6 +59,14 @@ struct Event {
   uint32_t flags = 0;            // Stream: cudaStream* flags
   int32_t priority = 0;          // Stream
   bool domain_driver = false;    // Api: a driver-API call rather than a runtime one
+  // NVTX: a Marker is an instant, the start or the end of a range (flags); its
+  // MarkerData carries the attributes the program gave it; a Name names a
+  // thread. `handle` is the marker's id; `name` its message.
+  std::string domain;
+  uint32_t color = 0;
+  uint32_t category = 0;
+  int32_t payload_kind = 0;
+  uint64_t payload = 0;
 };
 
 // Off until a front end asks for it, so a program nobody is profiling pays

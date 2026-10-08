@@ -113,6 +113,7 @@ Records produced:
 | `SYNCHRONIZATION` | event, stream-wait-event, stream and context waits, with stream and event ids |
 | `DEVICE` | every device once, when the kind is first flushed: name, compute capability, multiprocessors, memory and limits |
 | `CONTEXT`, `STREAM` | a context or stream coming into being, while the kind is enabled |
+| `MARKER`, `MARKER_DATA`, `NAME` | NVTX instants and ranges (start and end paired by id), their colour, category and payload, and named threads: see NVTX below |
 
 A kernel or copy has the correlation id of the runtime call that issued it,
 which is how a profiler connects the GPU timeline to the host call that
@@ -144,6 +145,7 @@ NVIDIA's). Enabled domains and callbacks are delivered as the call happens:
   this cannot describe is not delivered, rather than delivered with a structure
   of zeros that a consumer would read as what the program passed. The
   activity `RUNTIME` records cover every call.
+- **NVTX**: one callback per call, before it, with the toolkit's parameter structures.
 - **Resource**: context created, stream created and destroyed, driver
   initialisation finished.
 - **Synchronize**: stream and context synchronized.
@@ -160,10 +162,23 @@ module-loaded callbacks when it first loads a kernel's code; this loads whole
 modules at once and does not. Register counts come from this project's
 analysis, not from the compiler, and are not compared.
 
+## NVTX
+
+NVTX is header-only and calls nothing until a tool is injected: it opens the
+library named by `NVTX_INJECTION64_PATH` and calls its `InitializeInjectionNvtx2`
+with a table to fill in. `libcupti` exports that entry point, so a profiler that
+sets the variable to this library (as it does to NVIDIA's) receives markers,
+ranges (push/pop and start/end), domains, registered strings and thread names as
+`MARKER`, `MARKER_DATA` and `NAME` records and as `CUPTI_CB_DOMAIN_NVTX`
+callbacks. `nvidia/tests/e2e/run_cupti_nvtx.sh` compares them with what NVIDIA's
+CUPTI printed for the same calls. The wide-character spellings (`nvtxMarkW`,
+`nvtxRangePushW`, ...) are not delivered, because NVIDIA's CUPTI does not
+deliver them either (measured).
+
 ## What is not implemented, and why
 
 **The Callback API covers the runtime, resource and synchronize domains
-only.** The driver-API domain, module and graph resources, and the NVTX domain
+only (plus NVTX).** The driver-API domain, and module and graph resources,
 deliver nothing. Runtime calls outside the set above are in the activity
 records but not delivered as callbacks.
 

@@ -23,9 +23,23 @@
 #include <cupti.h>
 #include <cuda_runtime_api.h>
 
+// NVTX's types, for the tool side of its injection protocol. The header-only
+// library is not needed: only its declarations, which NVTX_NO_IMPL asks for.
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>) && __has_include(<generated_nvtx_meta.h>)
+#define VGPU_NVTX 1
+#define NVTX_NO_IMPL 1
+#include <nvtx3/nvToolsExt.h>
+#include <generated_nvtx_meta.h>
+#endif
+#endif
+
 #include <dlfcn.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -96,7 +110,8 @@ bool produced(CUpti_ActivityKind k) {
          k == CUPTI_ACTIVITY_KIND_MEMCPY || k == CUPTI_ACTIVITY_KIND_MEMSET ||
          k == CUPTI_ACTIVITY_KIND_RUNTIME || k == CUPTI_ACTIVITY_KIND_SYNCHRONIZATION ||
          k == CUPTI_ACTIVITY_KIND_DEVICE || k == CUPTI_ACTIVITY_KIND_CONTEXT ||
-         k == CUPTI_ACTIVITY_KIND_STREAM;
+         k == CUPTI_ACTIVITY_KIND_STREAM || k == CUPTI_ACTIVITY_KIND_MARKER ||
+         k == CUPTI_ACTIVITY_KIND_MARKER_DATA || k == CUPTI_ACTIVITY_KIND_NAME;
 }
 
 void announce_once() {
@@ -309,6 +324,45 @@ size_t fill_device(uint8_t* out, const vgpu::profiling::Event& e) {
   return sizeof *d;
 }
 
+size_t fill_marker(uint8_t* out, const vgpu::profiling::Event& e) {
+  auto* r = reinterpret_cast<CUpti_ActivityMarker2*>(out);
+  std::memset(r, 0, sizeof *r);
+  r->kind = CUPTI_ACTIVITY_KIND_MARKER;
+  r->flags = static_cast<CUpti_ActivityFlag>(e.flags);
+  r->timestamp = e.start_ns;
+  r->id = static_cast<uint32_t>(e.handle);
+  r->objectKind = CUPTI_ACTIVITY_OBJECT_THREAD;
+  r->objectId.pt.processId = e.process_id;
+  r->objectId.pt.threadId = e.thread_id;
+  r->name = e.name.empty() ? nullptr : intern(e.name);
+  r->domain = e.domain.empty() ? nullptr : intern(e.domain);
+  return sizeof *r;
+}
+
+size_t fill_marker_data(uint8_t* out, const vgpu::profiling::Event& e) {
+  auto* r = reinterpret_cast<CUpti_ActivityMarkerData*>(out);
+  std::memset(r, 0, sizeof *r);
+  r->kind = CUPTI_ACTIVITY_KIND_MARKER_DATA;
+  r->flags = static_cast<CUpti_ActivityFlag>(e.flags);
+  r->id = static_cast<uint32_t>(e.handle);
+  r->payloadKind = static_cast<CUpti_MetricValueKind>(e.payload_kind);
+  std::memcpy(&r->payload, &e.payload, sizeof e.payload);
+  r->color = e.color;
+  r->category = e.category;
+  return sizeof *r;
+}
+
+size_t fill_name(uint8_t* out, const vgpu::profiling::Event& e) {
+  auto* r = reinterpret_cast<CUpti_ActivityName*>(out);
+  std::memset(r, 0, sizeof *r);
+  r->kind = CUPTI_ACTIVITY_KIND_NAME;
+  r->objectKind = CUPTI_ACTIVITY_OBJECT_THREAD;
+  r->objectId.pt.processId = e.process_id;
+  r->objectId.pt.threadId = static_cast<uint32_t>(e.handle);
+  r->name = intern(e.name);
+  return sizeof *r;
+}
+
 /* ---- the runtime functions whose calls are recorded ----
    By the callback ID CUPTI names each with (cupti_runtime_cbid.h). The table
    is generated from that header at configure time, so it is the toolkit's own
@@ -378,6 +432,9 @@ size_t kind_size(CUpti_ActivityKind k) {
     case CUPTI_ACTIVITY_KIND_DEVICE: return sizeof(DeviceRecord);
     case CUPTI_ACTIVITY_KIND_CONTEXT: return sizeof(ContextRecord);
     case CUPTI_ACTIVITY_KIND_STREAM: return sizeof(CUpti_ActivityStream);
+    case CUPTI_ACTIVITY_KIND_MARKER: return sizeof(CUpti_ActivityMarker2);
+    case CUPTI_ACTIVITY_KIND_MARKER_DATA: return sizeof(CUpti_ActivityMarkerData);
+    case CUPTI_ACTIVITY_KIND_NAME: return sizeof(CUpti_ActivityName);
     default: return sizeof(KernelRecord);
   }
 }
@@ -392,6 +449,9 @@ size_t record_size(const vgpu::profiling::Event& e) {
     case K::Stream: return sizeof(CUpti_ActivityStream);
     case K::Context: return sizeof(ContextRecord);
     case K::Device: return sizeof(DeviceRecord);
+    case K::Marker: return sizeof(CUpti_ActivityMarker2);
+    case K::MarkerData: return sizeof(CUpti_ActivityMarkerData);
+    case K::Name: return sizeof(CUpti_ActivityName);
     default: return sizeof(MemcpyRecord);
   }
 }
@@ -406,6 +466,9 @@ size_t fill(uint8_t* out, const vgpu::profiling::Event& e) {
     case K::Stream: return fill_stream(out, e);
     case K::Context: return fill_context(out, e);
     case K::Device: return fill_device(out, e);
+    case K::Marker: return fill_marker(out, e);
+    case K::MarkerData: return fill_marker_data(out, e);
+    case K::Name: return fill_name(out, e);
     default: return fill_memcpy(out, e);
   }
 }
@@ -422,6 +485,9 @@ bool kind_wanted(const vgpu::profiling::Event& e) {
     case K::Stream: return g_kinds[CUPTI_ACTIVITY_KIND_STREAM];
     case K::Context: return g_kinds[CUPTI_ACTIVITY_KIND_CONTEXT];
     case K::Device: return g_kinds[CUPTI_ACTIVITY_KIND_DEVICE];
+    case K::Marker: return g_kinds[CUPTI_ACTIVITY_KIND_MARKER];
+    case K::MarkerData: return g_kinds[CUPTI_ACTIVITY_KIND_MARKER_DATA];
+    case K::Name: return g_kinds[CUPTI_ACTIVITY_KIND_NAME];
     default: return g_kinds[CUPTI_ACTIVITY_KIND_MEMCPY];
   }
 }
@@ -863,6 +929,277 @@ VGPU_EXPORT CUptiResult cuptiEnableAllDomains(uint32_t enable, CUpti_SubscriberH
   }
   return CUPTI_SUCCESS;
 }
+
+/* ---- NVTX ----
+   A program's own markers and ranges. NVTX is header-only and calls nothing
+   until a tool hands it function pointers: it looks for a library exporting
+   InitializeInjectionNvtx2 (named by NVTX_INJECTION64_PATH, as a profiler
+   sets it) and gives it a table of callbacks to fill in. This is that tool.
+
+   What it produces matches what NVIDIA's CUPTI reports for the same calls
+   (checked on an RTX 3060): a MARKER record per instant, per range start and
+   per range end, with the id that pairs a start with its end; a MARKER_DATA
+   record beside the ones made from attribute structures; a NAME record for a
+   named thread. NVTX callbacks are delivered once per call, before it. */
+
+#ifdef VGPU_NVTX
+namespace {
+
+struct NvtxDomain {
+  std::string name;
+};
+
+std::atomic<uint32_t> g_marker_id{1};
+thread_local std::vector<uint32_t> t_range_stack;
+
+std::string utf8(const wchar_t* w) {
+  std::string out;
+  for (; w && *w; ++w) {
+    uint32_t c = static_cast<uint32_t>(*w);
+    if (c < 0x80) out += static_cast<char>(c);
+    else if (c < 0x800) { out += static_cast<char>(0xC0 | (c >> 6)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+    else if (c < 0x10000) { out += static_cast<char>(0xE0 | (c >> 12)); out += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+    else { out += static_cast<char>(0xF0 | (c >> 18)); out += static_cast<char>(0x80 | ((c >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); out += static_cast<char>(0x80 | (c & 0x3F)); }
+  }
+  return out;
+}
+
+// A string registered with a domain is a handle to it; the handle is the
+// string's own storage here.
+struct RegisteredString {
+  std::string text;
+};
+
+std::string message_of(const nvtxEventAttributes_t* a) {
+  if (!a) return {};
+  switch (a->messageType) {
+    case NVTX_MESSAGE_TYPE_ASCII: return a->message.ascii ? a->message.ascii : "";
+    case NVTX_MESSAGE_TYPE_UNICODE: return utf8(a->message.unicode);
+    case NVTX_MESSAGE_TYPE_REGISTERED:
+      return a->message.registered ? reinterpret_cast<const RegisteredString*>(a->message.registered)->text : "";
+    default: return {};
+  }
+}
+
+// The subscriber's NVTX callback, once per call and before it.
+template <class Params>
+void nvtx_callback(CUpti_CallbackId id, const char* name, Params* params) {
+  CUpti_CallbackFunc fn = nullptr;
+  void* user = nullptr;
+  if (!cb_enabled(CUPTI_CB_DOMAIN_NVTX, id, &fn, &user)) return;
+  CUpti_NvtxData data;
+  std::memset(&data, 0, sizeof data);
+  data.functionName = name;
+  data.functionParams = params;
+  vgpu::profiling::Silence silent;
+  fn(user, CUPTI_CB_DOMAIN_NVTX, id, &data);
+}
+
+bool recording() { return vgpu::profiling::enabled(); }
+
+void emit_marker(uint32_t flags, uint32_t id, const std::string& name, const NvtxDomain* domain,
+                 const nvtxEventAttributes_t* attrib) {
+  if (!recording()) return;
+  vgpu::profiling::Event e;
+  e.kind = vgpu::profiling::EventKind::Marker;
+  e.start_ns = e.end_ns = vgpu::profiling::now_ns();
+  e.flags = flags;
+  e.handle = id;
+  e.name = name;
+  if (domain) e.domain = domain->name;
+  e.process_id = static_cast<uint32_t>(::getpid());
+  e.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+  vgpu::profiling::record(std::move(e));
+  // Only a start or an instant made from attributes carries them.
+  if (attrib && (flags & (CUPTI_ACTIVITY_FLAG_MARKER_INSTANTANEOUS | CUPTI_ACTIVITY_FLAG_MARKER_START))) {
+    vgpu::profiling::Event d;
+    d.kind = vgpu::profiling::EventKind::MarkerData;
+    d.start_ns = d.end_ns = vgpu::profiling::now_ns();
+    d.handle = id;
+    const bool argb = attrib->colorType == NVTX_COLOR_ARGB;
+    d.flags = argb ? CUPTI_ACTIVITY_FLAG_MARKER_COLOR_ARGB : 0;   // none: the flag stays clear, as NVIDIA's
+    d.color = argb ? attrib->color : 0;
+    d.category = attrib->category;
+    // CUPTI_METRIC_VALUE_KIND_: DOUBLE 0, UINT64 1, INT64 4. A call with no
+    // payload is reported as an unsigned zero.
+    switch (attrib->payloadType) {
+      case NVTX_PAYLOAD_TYPE_DOUBLE:
+        d.payload_kind = 0;
+        std::memcpy(&d.payload, &attrib->payload.dValue, sizeof d.payload);
+        break;
+      case NVTX_PAYLOAD_TYPE_FLOAT: {
+        const double v = attrib->payload.fValue;
+        d.payload_kind = 0;
+        std::memcpy(&d.payload, &v, sizeof d.payload);
+        break;
+      }
+      case NVTX_PAYLOAD_TYPE_INT64: d.payload_kind = 4; d.payload = static_cast<uint64_t>(attrib->payload.llValue); break;
+      case NVTX_PAYLOAD_TYPE_INT32: d.payload_kind = 4; d.payload = static_cast<uint64_t>(static_cast<int64_t>(attrib->payload.iValue)); break;
+      case NVTX_PAYLOAD_TYPE_UNSIGNED_INT64: d.payload_kind = 1; d.payload = attrib->payload.ullValue; break;
+      case NVTX_PAYLOAD_TYPE_UNSIGNED_INT32: d.payload_kind = 1; d.payload = attrib->payload.uiValue; break;
+      default: d.payload_kind = 1; break;
+    }
+    vgpu::profiling::record(std::move(d));
+  }
+}
+
+uint32_t begin_range(const std::string& name, const NvtxDomain* d, const nvtxEventAttributes_t* a) {
+  const uint32_t id = g_marker_id.fetch_add(1);
+  emit_marker(CUPTI_ACTIVITY_FLAG_MARKER_START, id, name, d, a);
+  return id;
+}
+void end_range(uint32_t id, const NvtxDomain* d) {
+  emit_marker(CUPTI_ACTIVITY_FLAG_MARKER_END, id, {}, d, nullptr);
+}
+
+/* The entry points handed to NVTX. Each is the default domain's unless it
+   names one. */
+
+void NVTX_API nv_mark_ex(const nvtxEventAttributes_t* a) {
+  nvtxMarkEx_params p{a};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxMarkEx, "nvtxMarkEx", &p);
+  emit_marker(CUPTI_ACTIVITY_FLAG_MARKER_INSTANTANEOUS, g_marker_id.fetch_add(1), message_of(a), nullptr, a);
+}
+void NVTX_API nv_mark_a(const char* m) {
+  nvtxMarkA_params p{m};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxMarkA, "nvtxMarkA", &p);
+  emit_marker(CUPTI_ACTIVITY_FLAG_MARKER_INSTANTANEOUS, g_marker_id.fetch_add(1), m ? m : "", nullptr, nullptr);
+}
+nvtxRangeId_t NVTX_API nv_range_start_ex(const nvtxEventAttributes_t* a) {
+  nvtxRangeStartEx_params p{a};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxRangeStartEx, "nvtxRangeStartEx", &p);
+  return begin_range(message_of(a), nullptr, a);
+}
+nvtxRangeId_t NVTX_API nv_range_start_a(const char* m) {
+  nvtxRangeStartA_params p{m};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxRangeStartA, "nvtxRangeStartA", &p);
+  return begin_range(m ? m : "", nullptr, nullptr);
+}
+void NVTX_API nv_range_end(nvtxRangeId_t id) {
+  nvtxRangeEnd_params p{id};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxRangeEnd, "nvtxRangeEnd", &p);
+  end_range(static_cast<uint32_t>(id), nullptr);
+}
+int NVTX_API nv_range_push_ex(const nvtxEventAttributes_t* a) {
+  nvtxRangePushEx_params p{a};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxRangePushEx, "nvtxRangePushEx", &p);
+  t_range_stack.push_back(begin_range(message_of(a), nullptr, a));
+  return static_cast<int>(t_range_stack.size()) - 1;
+}
+int NVTX_API nv_range_push_a(const char* m) {
+  nvtxRangePushA_params p{m};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxRangePushA, "nvtxRangePushA", &p);
+  t_range_stack.push_back(begin_range(m ? m : "", nullptr, nullptr));
+  return static_cast<int>(t_range_stack.size()) - 1;
+}
+int NVTX_API nv_range_pop() {
+  nvtxRangePop_params p{0};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxRangePop, "nvtxRangePop", &p);
+  if (t_range_stack.empty()) return -1;   // NVTX_NO_PUSH_POP_TRACKING
+  const uint32_t id = t_range_stack.back();
+  t_range_stack.pop_back();
+  end_range(id, nullptr);
+  return static_cast<int>(t_range_stack.size());
+}
+void NVTX_API nv_name_os_thread_a(uint32_t tid, const char* name) {
+  nvtxNameOsThreadA_params p{tid, name};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxNameOsThreadA, "nvtxNameOsThreadA", &p);
+  if (!recording()) return;
+  vgpu::profiling::Event e;
+  e.kind = vgpu::profiling::EventKind::Name;
+  e.start_ns = e.end_ns = vgpu::profiling::now_ns();
+  e.handle = tid;
+  e.name = name ? name : "";
+  e.process_id = static_cast<uint32_t>(::getpid());
+  vgpu::profiling::record(std::move(e));
+}
+nvtxDomainHandle_t NVTX_API nv_domain_create_a(const char* name) {
+  nvtxDomainCreateA_params p{name};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainCreateA, "nvtxDomainCreateA", &p);
+  return reinterpret_cast<nvtxDomainHandle_t>(new NvtxDomain{name ? name : ""});
+}
+void NVTX_API nv_domain_destroy(nvtxDomainHandle_t d) {
+  nvtxDomainDestroy_params p{d};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainDestroy, "nvtxDomainDestroy", &p);
+  delete reinterpret_cast<NvtxDomain*>(d);
+}
+void NVTX_API nv_domain_mark_ex(nvtxDomainHandle_t d, const nvtxEventAttributes_t* a) {
+  nvtxDomainMarkEx_params p{d, {a}};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainMarkEx, "nvtxDomainMarkEx", &p);
+  emit_marker(CUPTI_ACTIVITY_FLAG_MARKER_INSTANTANEOUS, g_marker_id.fetch_add(1), message_of(a),
+              reinterpret_cast<NvtxDomain*>(d), a);
+}
+nvtxRangeId_t NVTX_API nv_domain_range_start_ex(nvtxDomainHandle_t d, const nvtxEventAttributes_t* a) {
+  nvtxDomainRangeStartEx_params p{d, {a}};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainRangeStartEx, "nvtxDomainRangeStartEx", &p);
+  return begin_range(message_of(a), reinterpret_cast<NvtxDomain*>(d), a);
+}
+void NVTX_API nv_domain_range_end(nvtxDomainHandle_t d, nvtxRangeId_t id) {
+  nvtxDomainRangeEnd_params p{d, {id}};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainRangeEnd, "nvtxDomainRangeEnd", &p);
+  end_range(static_cast<uint32_t>(id), reinterpret_cast<NvtxDomain*>(d));
+}
+int NVTX_API nv_domain_range_push_ex(nvtxDomainHandle_t d, const nvtxEventAttributes_t* a) {
+  nvtxDomainRangePushEx_params p{d, {a}};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainRangePushEx, "nvtxDomainRangePushEx", &p);
+  t_range_stack.push_back(begin_range(message_of(a), reinterpret_cast<NvtxDomain*>(d), a));
+  return static_cast<int>(t_range_stack.size()) - 1;
+}
+int NVTX_API nv_domain_range_pop(nvtxDomainHandle_t d) {
+  nvtxDomainRangePop_params p{d};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainRangePop, "nvtxDomainRangePop", &p);
+  if (t_range_stack.empty()) return -1;
+  const uint32_t id = t_range_stack.back();
+  t_range_stack.pop_back();
+  end_range(id, reinterpret_cast<NvtxDomain*>(d));
+  return static_cast<int>(t_range_stack.size());
+}
+nvtxStringHandle_t NVTX_API nv_domain_register_string_a(nvtxDomainHandle_t d, const char* s) {
+  nvtxDomainRegisterStringA_params p{d, s};
+  nvtx_callback(CUPTI_CBID_NVTX_nvtxDomainRegisterStringA, "nvtxDomainRegisterStringA", &p);
+  return reinterpret_cast<nvtxStringHandle_t>(new RegisteredString{s ? s : ""});
+}
+
+template <class Fn>
+void install(NvtxFunctionTable table, unsigned size, unsigned id, Fn fn) {
+  if (id <= size && table[id]) *table[id] = reinterpret_cast<NvtxFunctionPointer>(fn);
+}
+
+}  // namespace
+
+// NVTX's entry point for a tool: fill in the callbacks the program's NVTX calls
+// go through. Calls it does not fill are no-ops, as with no tool attached --
+// NVIDIA's CUPTI fills none of the wide-character spellings (checked on an RTX
+// 3060: no callback and no record for them), and neither does this.
+extern "C" __attribute__((visibility("default"))) int NVTX_API InitializeInjectionNvtx2(
+    NvtxGetExportTableFunc_t get_table) {
+  const auto* callbacks = static_cast<const NvtxExportTableCallbacks*>(get_table(NVTX_ETID_CALLBACKS));
+  if (!callbacks || !callbacks->GetModuleFunctionTable) return 0;
+  NvtxFunctionTable core = nullptr, core2 = nullptr;
+  unsigned core_size = 0, core2_size = 0;
+  if (!callbacks->GetModuleFunctionTable(NVTX_CB_MODULE_CORE, &core, &core_size) || !core) return 0;
+  install(core, core_size, NVTX_CBID_CORE_MarkEx, nv_mark_ex);
+  install(core, core_size, NVTX_CBID_CORE_MarkA, nv_mark_a);
+  install(core, core_size, NVTX_CBID_CORE_RangeStartEx, nv_range_start_ex);
+  install(core, core_size, NVTX_CBID_CORE_RangeStartA, nv_range_start_a);
+  install(core, core_size, NVTX_CBID_CORE_RangeEnd, nv_range_end);
+  install(core, core_size, NVTX_CBID_CORE_RangePushEx, nv_range_push_ex);
+  install(core, core_size, NVTX_CBID_CORE_RangePushA, nv_range_push_a);
+  install(core, core_size, NVTX_CBID_CORE_RangePop, nv_range_pop);
+  install(core, core_size, NVTX_CBID_CORE_NameOsThreadA, nv_name_os_thread_a);
+  if (callbacks->GetModuleFunctionTable(NVTX_CB_MODULE_CORE2, &core2, &core2_size) && core2) {
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainMarkEx, nv_domain_mark_ex);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainRangeStartEx, nv_domain_range_start_ex);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainRangeEnd, nv_domain_range_end);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainRangePushEx, nv_domain_range_push_ex);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainRangePop, nv_domain_range_pop);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainRegisterStringA, nv_domain_register_string_a);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainCreateA, nv_domain_create_a);
+    install(core2, core2_size, NVTX_CBID_CORE2_DomainDestroy, nv_domain_destroy);
+  }
+  return 1;
+}
+#endif  // VGPU_NVTX
 
 /* ---- identifiers and attributes ----
    Small, real, and needed before a tool will get as far as asking for
