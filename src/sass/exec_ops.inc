@@ -3852,11 +3852,17 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
           a.binary = profile_.cc_major * 10 + profile_.cc_minor;
           a.ptx = m_.sm;
         }
-        // A kernel with no PTX to analyse: its registers and frame are in the cubin.
-        if (!ref || ref->fn->body.empty()) {
+        // A kernel with no PTX beside its SASS: its registers and frame are in
+        // the cubin. (A cubin loaded on its own has a record that says so --
+        // ptxas's register count, the frame, the static shared memory without the
+        // reservation -- and func_attributes read it above, as the host's call
+        // does.) The section of a kernel from sm_90 holds the driver's
+        // reserved 1 KiB (Device::load_cubin), which the static size leaves out.
+        if (!ref) {
+          const uint32_t in_section = m_.sm >= 90 ? profile_.reserved_smem_per_block() : 0;
           a.regs = static_cast<int32_t>(k.regs);
-          a.local = k.frame_size;
-          a.shared = k.shared_bytes;
+          a.local = std::max<uint64_t>(k.frame_size, k.min_stack);
+          a.shared = k.shared_bytes >= in_section ? k.shared_bytes - in_section : k.shared_bytes;
         }
         uint8_t out[40];
         devrt::put_func_attrs(a, out);
