@@ -57,7 +57,9 @@ else
        $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcupti -lcuda -L"$shim"
   if ! require_shim_libs "$shim" "$out"; then exit 0; fi
   # The RTX 3060 profile: the trace names the device it ran on.
-  VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$out" > "$out.txt"
+  # The driver shim and the runtime shim (which the CUPTI shim sits on) both
+  # carry the simulator's core; a sanitizer build needs told so.
+  env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$out" > "$out.txt"
 fi
 
 if (( card && update )); then
