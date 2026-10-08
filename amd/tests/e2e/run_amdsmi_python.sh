@@ -62,6 +62,16 @@ try:
     print("vbios answered")
 except amdsmi.AmdSmiLibraryException as e:
     print("vbios", e.get_error_code())
+# What AMD's package prints for a field the card has no value for: N/A, which it recognizes as 0xFFFF.
+pw = amdsmi.amdsmi_get_power_info(h[0])
+print("power", pw["socket_power"] > 0, pw["soc_voltage"], pw["mem_voltage"],
+      [pw["current_socket_power"], pw["average_socket_power"]].count("N/A"))
+print("activity", amdsmi.amdsmi_get_gpu_activity(h[0])["mm_activity"])
+pc = amdsmi.amdsmi_get_pcie_info(h[0])["pcie_static"]
+print("pcie", pc["max_pcie_speed"], pc["max_pcie_width"])
+caps = amdsmi.amdsmi_get_supported_power_cap(h[0])
+print("caps", caps["sensor_inds"], [amdsmi.amdsmi_get_power_cap_info(h[0], i)["max_power_cap"] > 0 for i in caps["sensor_inds"]])
+print("managed", amdsmi.amdsmi_is_gpu_power_management_enabled(h[0]))
 amdsmi.amdsmi_shut_down()
 EOF
 )
@@ -84,5 +94,13 @@ EOF
   check "its NUMA node" "numa 0"
   check "its PCI address" "bdf 0000:02:00.0"
   check "what is not modelled is refused as a card refuses it" "vbios 2"
+  check "a field with no value is N/A, as the package prints it: SoC and memory voltage, the power the card does not give" \
+    "power True N/A N/A 1"
+  check "so is the media engines' activity" "activity N/A"
+  # In MT/s: the CLI divides by 1000 to print GT/s.
+  if [[ $g == amd/mi300x ]]; then check "the PCIe link's maximum speed and width" "pcie 32000 16"
+  else check "the PCIe link's maximum speed and width" "pcie 16000 16"; fi
+  check "the power cap sensors, and each one's cap" "caps [0] [True]"
+  check "power management is on" "managed True"
 done
 exit $fail

@@ -54,6 +54,9 @@ int amdsmi_get_gpu_pci_bandwidth(void*, void*);
 int amdsmi_get_temp_metric(void*, int, int, int64_t*);
 int amdsmi_get_power_info(void*, void*);
 int amdsmi_get_power_cap_info(void*, uint32_t, void*);
+int amdsmi_get_supported_power_cap(void*, uint32_t*, uint32_t*, uint32_t*);
+int amdsmi_is_gpu_power_management_enabled(void*, bool*);
+int amdsmi_get_gpu_activity(void*, void*);
 int amdsmi_get_gpu_fan_speed(void*, uint32_t, int64_t*);
 int amdsmi_get_clock_info(void*, int, void*);
 int amdsmi_get_gpu_volt_metric(void*, int, int, int64_t*);
@@ -417,7 +420,7 @@ VTEST(pcie_info_replays_and_link_as_the_machine_has_them) {
   VCHECK_EQ(amdsmi_get_pcie_info(g[0], &p), kSuccess);
   // MI300X: Gen5 x16; RX 7900 XTX: Gen4 x16 (the profiles').
   VCHECK_EQ(p.stat.max_width, 16);
-  VCHECK_EQ(p.stat.max_speed, rx ? 16u : 32u);
+  VCHECK_EQ(p.stat.max_speed, rx ? 16000u : 32000u);   // MT/s, as the CLI reads it (it divides by 1000)
   VCHECK_EQ(p.stat.max_version, rx ? 4u : 5u);
   VCHECK_EQ(p.stat.slot_type, rx ? 0 : 1);   // PCIe card, OAM module
   VCHECK_EQ(p.metric.width, 16);
@@ -464,7 +467,9 @@ VTEST(sensors_are_the_profiles_and_missing_ones_are_refused) {
   PowerInfo pw{};
   VCHECK_EQ(amdsmi_get_power_info(g[0], &pw), kSuccess);
   VCHECK_EQ(pw.limit, rx ? 355u : 750u);
-  VCHECK_EQ(rx ? pw.current : pw.average, 0xFFFFFFFFu);   // CDNA3 gives the current power, Radeon the average
+  VCHECK_EQ(rx ? pw.current : pw.average, 0xFFFFu);   // CDNA3 gives the current power, Radeon the average; the other is what the package reads as N/A
+  VCHECK_EQ(pw.soc_mv, uint64_t{0xFFFF});
+  VCHECK_EQ(pw.mem_mv, uint64_t{0xFFFF});
   VCHECK_EQ(pw.socket, uint64_t{rx ? pw.average : pw.current});
   VCHECK(pw.gfx_mv > 0);
   VCHECK_EQ(amdsmi_get_gpu_volt_metric(g[0], 0, 0, &t), kSuccess);   // the one voltage the model keeps
@@ -474,6 +479,19 @@ VTEST(sensors_are_the_profiles_and_missing_ones_are_refused) {
   VCHECK_EQ(cap.cap, uint64_t{rx ? 355000000u : 750000000u});
   VCHECK_EQ(cap.max, cap.cap);
   VCHECK_EQ(amdsmi_get_power_cap_info(g[0], 1, &cap), kNotSupported);
+  // The sensors a cap is kept for: PPT0, which is what the CLI then asks for.
+  uint32_t sensors = 0, inds[4] = {9, 9, 9, 9}, types[4] = {9, 9, 9, 9};
+  VCHECK_EQ(amdsmi_get_supported_power_cap(g[0], &sensors, inds, types), kSuccess);
+  VCHECK_EQ(sensors, 1u);
+  VCHECK_EQ(inds[0], 0u);
+  VCHECK_EQ(types[0], 0u);
+  bool managed = false;
+  VCHECK_EQ(amdsmi_is_gpu_power_management_enabled(g[0], &managed), kSuccess);
+  VCHECK(managed);
+  // The engine usage: graphics and memory are measured, the media engines are not (N/A is 0xFFFF).
+  struct { uint32_t gfx, umc, mm; uint32_t reserved[13]; } act{};
+  VCHECK_EQ(amdsmi_get_gpu_activity(g[0], &act), kSuccess);
+  VCHECK_EQ(act.mm, 0xFFFFu);
   // Clocks: graphics and memory; the data fabric's is not modelled.
   ClkInfo clk{};
   VCHECK_EQ(amdsmi_get_clock_info(g[0], 0, &clk), kSuccess);
@@ -523,10 +541,10 @@ VTEST(sensors_answer_what_rvs_asks_by_the_profile) {
     VCHECK_EQ(amdsmi_get_power_info(g[i], &pw), kSuccess);
     VCHECK(pw.socket > 0 && pw.socket < 2000);
     VCHECK_EQ(pw.limit, (d.power_limit_mw + 500) / 1000);
-    // One of the two readings, the other UINT32_MAX: MI300 and newer read
+    // One of the two readings, the other 0xFFFF (N/A to the package): MI300 and newer read
     // current, the earlier Instinct and Radeon average.
     const bool current = std::string(d.architecture) == "cdna3" || std::string(d.architecture) == "cdna4";
-    VCHECK_EQ(current ? pw.average : pw.current, 0xFFFFFFFFu);
+    VCHECK_EQ(current ? pw.average : pw.current, 0xFFFFu);
     VCHECK_EQ(current ? pw.current : pw.average, static_cast<uint32_t>(pw.socket));
     PowerCap cap{};
     VCHECK_EQ(amdsmi_get_power_cap_info(g[i], 0, &cap), kSuccess);
