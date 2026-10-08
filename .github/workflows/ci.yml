@@ -212,6 +212,13 @@ jobs:
             echo "::error::a CUTLASS test skipped; this job installs what they need"; exit 1
           fi
 
+      # The jobs run as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
+      # next job's checkout cannot clean it. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
   ollama:
     name: ollama on every GPU
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
@@ -557,6 +564,13 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-san --output-on-failure -E pantheon_workloads
 
+      # The jobs run as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
+      # next job's checkout cannot clean it. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
   threads:
     name: ThreadSanitizer
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
@@ -606,3 +620,11 @@ jobs:
         # the run needs randomization off. Without this every test aborts with
         # "unexpected memory mapping" before it starts.
         run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E pantheon_workloads
+
+      # The jobs run as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
+      # next job's checkout cannot clean it. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
