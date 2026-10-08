@@ -20,6 +20,8 @@ std::vector<Event> g_events;
 std::atomic<uint32_t> g_correlation{1};
 thread_local uint32_t t_api_correlation = 0;   // the API call this thread is inside
 thread_local int t_api_depth = 0;              // public calls this thread is inside
+thread_local int t_silence = 0;                // Silence scopes this thread is inside
+thread_local int t_sync_depth = 0;             // waits this thread is inside
 thread_local const void* t_args[16];           // the next call's arguments (note_args)
 thread_local int t_nargs = 0;
 thread_local const char* t_symbol = nullptr;
@@ -112,8 +114,43 @@ void note_symbol(const char* name) {
   if (enabled() || hooked()) t_symbol = name;
 }
 
-Silence::Silence() { ++t_api_depth; }
-Silence::~Silence() { --t_api_depth; }
+Silence::Silence() {
+  ++t_api_depth;
+  ++t_silence;
+}
+Silence::~Silence() {
+  --t_api_depth;
+  --t_silence;
+}
+bool silenced() { return t_silence > 0; }
+
+void notify_init_finished() {
+  static std::atomic<bool> told{false};
+  if (!enabled() && !hooked()) return;
+  if (!told.exchange(true)) notify_resource(Resource::CuInitFinished, 0, 0);
+}
+
+SyncScope::SyncScope(SyncKind kind, uint64_t stream, uint64_t event, uint32_t device)
+    : kind_(kind), stream_(stream), event_(event), device_(device), outermost_(t_sync_depth++ == 0) {
+  if (outermost_) t0_ = now_ns();
+}
+SyncScope::~SyncScope() {
+  --t_sync_depth;
+  if (!outermost_) return;
+  if (enabled()) {
+    Event ev;
+    ev.kind = EventKind::Sync;
+    ev.sync_kind = static_cast<uint8_t>(kind_);
+    ev.start_ns = t0_;
+    ev.end_ns = now_ns();
+    ev.device = device_;
+    ev.correlation = work_correlation();
+    ev.stream = stream_;
+    ev.handle = event_;
+    record(std::move(ev));
+  }
+  if (kind_ == SyncKind::Stream || kind_ == SyncKind::Context) notify_sync(kind_, stream_);
+}
 
 ApiCall::ApiCall(const char* name, Domain domain) {
   // The arguments noted for this call are this call's, whether or not it is

@@ -144,6 +144,32 @@ class Silence {
   Silence(const Silence&) = delete;
   Silence& operator=(const Silence&) = delete;
 };
+// Whether this thread is inside a Silence: the shim is answering a profiler's
+// question, not serving the program, and must not announce resources or bind
+// contexts on the program's behalf as a side effect.
+bool silenced();
+
+// Driver initialisation finished: told to a subscriber once per process, by
+// whichever library (driver or runtime) gets there first.
+void notify_init_finished();
+
+// A wait that returned, for a profiler's synchronization record and the
+// callback API's synchronize domain. One public wait that goes through another
+// (a stream wait through the context-wide one) is one wait.
+class SyncScope {
+ public:
+  SyncScope(SyncKind kind, uint64_t stream, uint64_t event, uint32_t device);
+  ~SyncScope();
+  SyncScope(const SyncScope&) = delete;
+  SyncScope& operator=(const SyncScope&) = delete;
+
+ private:
+  SyncKind kind_;
+  uint64_t stream_, event_;
+  uint32_t device_;
+  uint64_t t0_ = 0;
+  bool outermost_;
+};
 
 // One API call, recorded as it returns when anyone is profiling. A call made
 // through another public call (cudaMemcpyAsync going through cudaMemcpy) is

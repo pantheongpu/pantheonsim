@@ -744,7 +744,9 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
   const cudaError_t rc = [&]() -> cudaError_t {
     try {
       ensure_init(s);
-      bind_driver_context();
+      // A profiler's own question (vgpu::profiling::Silence) is not the
+      // program using the runtime: it binds no context and creates none.
+      if (!vgpu::profiling::silenced()) bind_driver_context();
       announce_context();
       if (needs_context) {
         if (const cudaError_t sticky = static_cast<cudaError_t>(s.rt->context_fault())) {
@@ -788,44 +790,21 @@ struct StreamContextScope {
   ~StreamContextScope() { t_stream_ctx = {}; }
 };
 
-// A wait that returned, for a profiler's synchronization record and the
-// callback API's synchronize domain. One public wait that goes through another
-// (cudaStreamSynchronize through the device-wide wait) is one wait.
-thread_local int t_sync_depth = 0;
-struct SyncScope {
-  vgpu::profiling::SyncKind kind;
-  uint64_t stream, event;
-  uint64_t t0 = 0;
-  bool outermost;
+// A wait that returned (vgpu/profiling.hpp), on the device this thread has
+// current.
+struct SyncScope : vgpu::profiling::SyncScope {
   SyncScope(vgpu::profiling::SyncKind k, const void* stream_handle, const void* event_handle = nullptr)
-      : kind(k), stream(reinterpret_cast<uint64_t>(stream_handle)),
-        event(reinterpret_cast<uint64_t>(event_handle)), outermost(t_sync_depth++ == 0) {
-    if (outermost) t0 = vgpu::profiling::now_ns();
-  }
-  ~SyncScope() {
-    --t_sync_depth;
-    if (!outermost) return;
-    if (vgpu::profiling::enabled()) {
-      vgpu::profiling::Event ev;
-      ev.kind = vgpu::profiling::EventKind::Sync;
-      ev.sync_kind = static_cast<uint8_t>(kind);
-      ev.start_ns = t0;
-      ev.end_ns = vgpu::profiling::now_ns();
-      ev.device = static_cast<uint32_t>(t_current_device);
-      ev.correlation = vgpu::profiling::work_correlation();
-      ev.stream = stream;
-      ev.handle = event;
-      vgpu::profiling::record(std::move(ev));
-    }
-    if (kind == vgpu::profiling::SyncKind::Stream || kind == vgpu::profiling::SyncKind::Context)
-      vgpu::profiling::notify_sync(kind, stream);
-  }
+      : vgpu::profiling::SyncScope(k, reinterpret_cast<uint64_t>(stream_handle),
+                                   reinterpret_cast<uint64_t>(event_handle),
+                                   static_cast<uint32_t>(t_current_device)) {}
 };
 
 // The first call that reaches a device creates its context, which a
 // subscriber is told of -- and the first of all finishes driver initialisation.
 static void announce_context() {
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
+  // A profiler asking what a device is has not made a context.
+  if (vgpu::profiling::silenced()) return;
   static std::atomic<uint32_t> announced{0};
   const uint32_t bit = 1u << (static_cast<unsigned>(t_current_device) & 31u);
   const uint32_t before = announced.fetch_or(bit);
@@ -858,12 +837,7 @@ static const char* launch_symbol(const void* func) {
 // are only taken when somebody listens.
 // Driver initialisation finishes before the first runtime call a profiler is
 // told of, as it does on NVIDIA's.
-static void announce_driver_init() {
-  static std::once_flag driver_ready;
-  std::call_once(driver_ready, [] {
-    vgpu::profiling::notify_resource(vgpu::profiling::Resource::CuInitFinished, 0, 0);
-  });
-}
+static void announce_driver_init() { vgpu::profiling::notify_init_finished(); }
 
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
