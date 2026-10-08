@@ -1759,7 +1759,7 @@ struct Machine {
       });
     } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
       each([&](uint32_t lane) {
-        const uint32_t v = op == "v_mad_u16"_op ? u16(0, lane) * u16(1, lane) + u16(2, lane)
+        const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
       });
@@ -2187,7 +2187,7 @@ struct Machine {
       });
     } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
       each([&](uint32_t lane) {
-        const uint32_t v = op == "v_mad_u16"_op ? u16(0, lane) * u16(1, lane) + u16(2, lane)
+        const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
       });
