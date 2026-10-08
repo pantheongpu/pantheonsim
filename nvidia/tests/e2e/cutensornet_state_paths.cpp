@@ -1053,6 +1053,17 @@ static void test_state_compute() {
 
 // ---- matrix product states ----
 
+// What the last run_mps computed from (its workspace and output tensors): kept until the next run_mps, since
+// a captured MPS reads the tensors again, and released by free_mps_run() before the program ends.
+static WS* g_mps_ws = nullptr;
+static std::vector<Dev*> g_mps_bufs;
+static void free_mps_run() {
+  delete g_mps_ws;
+  g_mps_ws = nullptr;
+  for (Dev* d : g_mps_bufs) delete d;
+  g_mps_bufs.clear();
+}
+
 struct MpsOut {
   std::vector<std::vector<int64_t>> ext, str;
   std::vector<std::vector<cd>> data;
@@ -1127,12 +1138,12 @@ static bool run_mps(const std::vector<std::vector<int>>& gates, const MpsSetup& 
   }
   if (cutensornetStateFinalizeMPS(h, c.st, CUTENSORNET_BOUNDARY_CONDITION_OPEN, ep.data(), su.row_major ? sp.data() : nullptr))
     return false;
-  static WS* ws = nullptr;
-  delete ws;
-  ws = new WS;
+  delete g_mps_ws;
+  g_mps_ws = new WS;
+  WS* ws = g_mps_ws;
   if (cutensornetStatePrepare(h, c.st, (size_t)1 << 30, ws->d, 0)) return false;
   ws->alloc();
-  static std::vector<Dev*> bufs;
+  std::vector<Dev*>& bufs = g_mps_bufs;
   for (Dev* d : bufs) delete d;
   bufs.clear();
   std::vector<void*> ptr((size_t)n);
@@ -1564,6 +1575,7 @@ int main() {
   test_mps();
   test_mps_init_capture();
   test_errors();
+  free_mps_run();
   cutensornetDestroy(h);
   std::printf("%s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
   return failures ? 1 : 0;

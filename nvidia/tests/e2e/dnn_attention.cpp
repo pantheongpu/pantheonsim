@@ -758,9 +758,18 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
 // softmax row whose probability exp(sink - stats) goes to no value, and its gradient is
 // -exp(sink - stats) * rowsum(dO * O), summed over the rows that share it.
 using Desc = cudnnBackendDescriptor_t;
+// Every descriptor made here is destroyed when the DescGuard of the test that made them goes out of scope,
+// whichever way it returns (an engine configuration, a heuristics descriptor and an unused plan included).
+static std::vector<Desc> g_made;
+struct DescGuard {
+  ~DescGuard() {
+    for (Desc d : g_made) cudnnBackendDestroyDescriptor(d);
+    g_made.clear();
+  }
+};
 static Desc make_desc(cudnnBackendDescriptorType_t t) {
   Desc d = nullptr;
-  cudnnBackendCreateDescriptor(t, &d);
+  if (cudnnBackendCreateDescriptor(t, &d) == CUDNN_STATUS_SUCCESS && d) g_made.push_back(d);
   return d;
 }
 static void set_attr(Desc d, cudnnBackendAttributeName_t n, cudnnBackendAttributeType_t t, int64_t count, const void* v) {
@@ -782,6 +791,7 @@ static Desc raw_tensor(int64_t uid, cudnnDataType_t t, const std::vector<int64_t
 }
 
 static void raw_sdpa_backward(cudnnHandle_t handle) {
+  DescGuard destroy_descriptors;
   Cfg c;
   c.name = "raw SDPA backward operation, half, sink";
   c.impl = fe::AttentionImplementation_t::UNIFIED;
@@ -882,8 +892,6 @@ static void raw_sdpa_backward(cudnnHandle_t handle) {
       expect(c.name + ": " + n, er < gtol, er);
     }
   }
-  for (Desc d : keep) cudnnBackendDestroyDescriptor(d);
-  for (Desc d : {op, graph, plan, vp}) if (d) cudnnBackendDestroyDescriptor(d);
 }
 
 int main() {
