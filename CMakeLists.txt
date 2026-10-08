@@ -1898,6 +1898,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_warpsync_bsync_standoff
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_warpsync_bsync_standoff.sh)
+  set_tests_properties(e2e_warpsync_bsync_standoff PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_host_atomics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
   set_tests_properties(e2e_host_atomics PROPERTIES

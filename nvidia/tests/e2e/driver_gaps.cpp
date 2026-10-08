@@ -880,6 +880,7 @@ static void stream_context(CUcontext ctx) {
   c = nullptr;
   IS(cuStreamGetCtx(nullptr, &c), CUDA_SUCCESS);
   check(c == ctx, "and the legacy default stream answers the current context");
+#if CUDA_VERSION >= 12050   // the v2 form came with CUDA 12.5
   c = nullptr;
   CUgreenCtx green = reinterpret_cast<CUgreenCtx>(0x1);
   IS(cuStreamGetCtx_v2(s, &c, &green), CUDA_SUCCESS);
@@ -887,8 +888,9 @@ static void stream_context(CUcontext ctx) {
   c = nullptr;
   IS(cuStreamGetCtx_v2(s, &c, nullptr), CUDA_SUCCESS);
   check(c == ctx, "the green-context output is optional");
-  IS(cuStreamGetCtx(s, nullptr), CUDA_ERROR_INVALID_VALUE);
   IS(cuStreamGetCtx_v2(s, nullptr, nullptr), CUDA_ERROR_INVALID_VALUE);
+#endif
+  IS(cuStreamGetCtx(s, nullptr), CUDA_ERROR_INVALID_VALUE);
   IS(cuStreamDestroy(s), CUDA_SUCCESS);
   // with nothing current: the answer, and the output untouched
   CUcontext popped = nullptr;
