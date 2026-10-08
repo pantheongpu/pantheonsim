@@ -1,0 +1,54 @@
+# callbacks
+CB nvtx 1 nvtxMarkA
+CB nvtx 8 nvtxRangePushA
+CB nvtx 8 nvtxRangePushA
+CB nvtx 11 nvtxRangePop
+CB nvtx 11 nvtxRangePop
+CB nvtx 4 nvtxRangeStartA
+CB nvtx 7 nvtxRangeEnd
+CB nvtx 6 nvtxRangeStartEx
+CB nvtx 7 nvtxRangeEnd
+CB nvtx 3 nvtxMarkEx
+CB nvtx 3 nvtxMarkEx
+CB nvtx 3 nvtxMarkEx
+CB nvtx 3 nvtxMarkEx
+CB nvtx 14 nvtxNameOsThreadA
+CB nvtx 7 nvtxRangeEnd
+CB nvtx 11 nvtxRangePop
+CB nvtx 41 nvtxDomainCreateA
+CB nvtx 39 nvtxDomainRegisterStringA
+CB nvtx 30 nvtxDomainMarkEx
+CB nvtx 33 nvtxDomainRangePushEx
+CB nvtx 34 nvtxDomainRangePop
+CB nvtx 31 nvtxDomainRangeStartEx
+CB nvtx 32 nvtxDomainRangeEnd
+CB nvtx 43 nvtxDomainDestroy
+# activity
+MARKER flags=0x1 id=1 object=2 name=plain mark domain=(null)
+MARKER flags=0x2 id=2 object=2 name=outer domain=(null)
+MARKER flags=0x2 id=3 object=2 name=inner domain=(null)
+MARKER flags=0x4 id=3 object=2 name=(null) domain=(null)
+MARKER flags=0x4 id=2 object=2 name=(null) domain=(null)
+MARKER flags=0x2 id=4 object=2 name=started domain=(null)
+MARKER flags=0x4 id=4 object=2 name=(null) domain=(null)
+MARKER flags=0x2 id=5 object=2 name=coloured domain=(null)
+MARKER_DATA flags=0x2 id=5 color=0xff336699 category=7 payloadKind=1 payload=0
+MARKER flags=0x4 id=5 object=2 name=(null) domain=(null)
+MARKER flags=0x1 id=6 object=2 name=no colour domain=(null)
+MARKER_DATA flags=0x0 id=6 color=0x0 category=0 payloadKind=1 payload=0
+MARKER flags=0x1 id=7 object=2 name=double payload domain=(null)
+MARKER_DATA flags=0x0 id=7 color=0x0 category=1 payloadKind=0 payload=4612811918334230528
+MARKER flags=0x1 id=8 object=2 name=int64 payload domain=(null)
+MARKER_DATA flags=0x0 id=8 color=0x0 category=1 payloadKind=4 payload=18446744073709551609
+MARKER flags=0x1 id=9 object=2 name=uint64 payload domain=(null)
+MARKER_DATA flags=0x0 id=9 color=0x0 category=1 payloadKind=1 payload=42
+NAME object=2 name=worker
+MARKER flags=0x4 id=0 object=2 name=(null) domain=(null)
+MARKER flags=0x1 id=10 object=2 name=registered text domain=mydomain
+MARKER_DATA flags=0x2 id=10 color=0xff00ff00 category=3 payloadKind=1 payload=0
+MARKER flags=0x2 id=11 object=2 name=coloured domain=mydomain
+MARKER_DATA flags=0x2 id=11 color=0xff336699 category=7 payloadKind=1 payload=0
+MARKER flags=0x4 id=11 object=2 name=(null) domain=mydomain
+MARKER flags=0x2 id=12 object=2 name=no colour domain=mydomain
+MARKER_DATA flags=0x0 id=12 color=0x0 category=0 payloadKind=1 payload=0
+MARKER flags=0x4 id=12 object=2 name=(null) domain=mydomain
