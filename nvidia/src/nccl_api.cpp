@@ -1003,10 +1003,27 @@ ncclResult_t settle(Op& op) {
 ncclResult_t execute(std::vector<Op>& ops) {
   ncclResult_t rc = ncclSuccess;
   auto keep = [&](ncclResult_t r) { if (rc == ncclSuccess) rc = r; };
-  for (auto& op : ops) keep(deposit(op));
-  if (rc == ncclSuccess) for (auto& op : ops) keep(collect(op));
-  for (auto& op : ops) release(op);
-  if (rc == ncclSuccess) for (auto& op : ops) keep(settle(op));
+  // Every collective publishes its data in the rank's one file, so a pass that
+  // deposited two of them before collecting either would have the second overwrite
+  // the first (two all-reduces in one group read each other's data). A group runs as
+  // segments holding at most one collective, with the point-to-point operations
+  // beside it, each segment in the four passes; collectives are issued in the same
+  // order on every rank, so the segments line up.
+  size_t begin = 0;
+  while (begin < ops.size() && rc == ncclSuccess) {
+    size_t end = begin;
+    bool collective = false;
+    for (; end < ops.size(); ++end) {
+      if (!is_collective(ops[end].kind)) continue;
+      if (collective) break;
+      collective = true;
+    }
+    for (size_t i = begin; i < end; ++i) keep(deposit(ops[i]));
+    if (rc == ncclSuccess) for (size_t i = begin; i < end; ++i) keep(collect(ops[i]));
+    for (size_t i = begin; i < end; ++i) release(ops[i]);
+    if (rc == ncclSuccess) for (size_t i = begin; i < end; ++i) keep(settle(ops[i]));
+    begin = end;
+  }
   return rc;
 }
 
