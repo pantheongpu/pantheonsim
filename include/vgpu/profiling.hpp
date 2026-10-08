@@ -21,7 +21,16 @@ namespace vgpu::profiling {
 
 // Api: a runtime API call itself, on the host thread that made it; the work it
 // issued carries the same correlation.
-enum class EventKind : uint8_t { Kernel, Memcpy, Memset, Api };
+//
+// Sync: a stream, context or event wait that returned; Stream and Context: a
+// resource coming into being, which a profiler lists once.
+enum class EventKind : uint8_t { Kernel, Memcpy, Memset, Api, Sync, Stream, Context, Device };
+
+// What a copy's two ends are, as a profiler classifies them.
+enum class MemKind : uint8_t { Unknown, Pageable, Pinned, Device, Array, Managed };
+
+// Which wait a Sync event is.
+enum class SyncKind : uint8_t { Event = 1, StreamWaitEvent = 2, Stream = 3, Context = 4 };
 
 struct Event {
   EventKind kind = EventKind::Kernel;
@@ -40,6 +49,16 @@ struct Event {
   uint32_t process_id = 0;       // Api: the caller
   uint32_t thread_id = 0;
   int32_t result = 0;            // Api: what the call returned
+  MemKind src_kind = MemKind::Unknown, dst_kind = MemKind::Unknown;   // Memcpy; Memset: dst_kind
+  bool async = false;            // Memcpy and Memset: the stream-ordered spelling
+  uint32_t value = 0;            // Memset: the byte value
+  uint32_t static_shared_bytes = 0;
+  uint32_t local_bytes_per_thread = 0;
+  uint8_t sync_kind = 0;         // Sync: a SyncKind
+  uint64_t handle = 0;           // Sync: the event waited on; Stream: the stream made
+  uint32_t flags = 0;            // Stream: cudaStream* flags
+  int32_t priority = 0;          // Stream
+  bool domain_driver = false;    // Api: a driver-API call rather than a runtime one
 };
 
 // Off until a front end asks for it, so a program nobody is profiling pays
@@ -59,11 +78,65 @@ uint32_t next_correlation();
 // thread is inside, or a fresh one outside any.
 uint32_t work_correlation();
 
-// One API call, recorded as it returns when anyone is profiling. Calls nest (a
-// call made through another public call); each keeps its own correlation.
+// ---- the callback side ----
+//
+// A tool that subscribes (CUPTI's Callback API) is told of each API call as it
+// is entered and as it returns. The runtime reports the call without knowing
+// who listens or what shape they want it in: a name, the correlation, and
+// pointers to the arguments the caller passed, in declaration order. The
+// front end turns those into the parameter structures its consumer reads.
+enum class Domain : uint8_t { Runtime, Driver };
+
+struct ApiInfo {
+  Domain domain = Domain::Runtime;
+  bool enter = true;
+  const char* name = "";
+  uint32_t correlation = 0;
+  const void* const* args = nullptr;   // pointers to the caller's arguments; null if not captured
+  int nargs = 0;
+  const char* symbol = nullptr;        // a kernel launch: the kernel's name
+  int32_t result = 0;                  // on exit
+};
+
+enum class Resource : uint8_t { CuInitFinished, ContextCreated, ContextDestroyStarting, StreamCreated, StreamDestroyStarting };
+
+struct Hooks {
+  void (*api)(const ApiInfo&) = nullptr;
+  void (*resource)(Resource what, uint64_t handle, uint32_t device) = nullptr;
+  void (*sync)(SyncKind what, uint64_t stream) = nullptr;
+  // Asked on a kernel launch, when a subscriber wants the kernel's name.
+  bool wants_symbols = false;
+};
+void set_hooks(const Hooks& h);          // all-null removes
+bool hooked();
+void notify_resource(Resource what, uint64_t handle, uint32_t device);
+void notify_sync(SyncKind what, uint64_t stream);
+
+// The arguments of the call about to be made: pointers to its parameters, in
+// declaration order. Taken by the next ApiCall on this thread. Costs nothing
+// when nobody listens.
+void note_args(const void* const* args, int n);
+void note_symbol(const char* name);
+
+// A stretch of the shim's own code that makes public calls on the program's
+// behalf (a front end asking the runtime what a device is): they are not the
+// program's calls and are not reported as its.
+class Silence {
+ public:
+  Silence();
+  ~Silence();
+  Silence(const Silence&) = delete;
+  Silence& operator=(const Silence&) = delete;
+};
+
+// One API call, recorded as it returns when anyone is profiling. A call made
+// through another public call (cudaMemcpyAsync going through cudaMemcpy) is
+// not a call of its own: a real runtime does not route its API through itself,
+// so a profiler there lists the one the program made, and so does this. The
+// work it issues carries that call's correlation.
 class ApiCall {
  public:
-  explicit ApiCall(const char* name);
+  explicit ApiCall(const char* name, Domain domain = Domain::Runtime);
   ~ApiCall();
   ApiCall(const ApiCall&) = delete;
   ApiCall& operator=(const ApiCall&) = delete;
@@ -71,6 +144,13 @@ class ApiCall {
 
  private:
   const char* name_ = nullptr;   // null when nobody was profiling at the call
+  Domain domain_ = Domain::Runtime;
+  bool outermost_ = false;       // a call made through another public call is not a call of its own
+  bool hooked_ = false;
+  const void* saved_[16] = {};
+  const void* const* args_ = nullptr;
+  int nargs_ = 0;
+  const char* symbol_ = nullptr;
   uint32_t correlation_ = 0, outer_ = 0;
   uint64_t start_ = 0;
   int32_t result_ = 0;

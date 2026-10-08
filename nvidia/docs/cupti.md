@@ -106,26 +106,66 @@ Records produced:
 
 | kind | carries |
 | --- | --- |
-| `CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL` | name, grid and block, dynamic shared bytes, device, stream, correlation id, start and end |
-| `CUPTI_ACTIVITY_KIND_MEMCPY` | direction, bytes, device, stream, correlation id, start and end |
-| `CUPTI_ACTIVITY_KIND_RUNTIME` | the runtime call (`cbid`), process and thread, return value, correlation id, start and end |
+| `CONCURRENT_KERNEL` / `KERNEL` | name (the mangled entry name, as NVIDIA's reports it), grid and block, dynamic and static shared bytes, registers and local bytes per thread, device, context, stream, correlation id, start and end |
+| `MEMCPY` | direction, source and destination memory kind (pageable, pinned, device, managed), bytes, the async flag, device, stream, correlation id, start and end |
+| `MEMSET` | value, bytes, memory kind, the async flag, stream, correlation id |
+| `RUNTIME` | the runtime call (`cbid`, for every function the toolkit's `cupti_runtime_cbid.h` names), process and thread, return value, correlation id |
+| `SYNCHRONIZATION` | event, stream-wait-event, stream and context waits, with stream and event ids |
+| `DEVICE` | every device once, when the kind is first flushed: name, compute capability, multiprocessors, memory and limits |
+| `CONTEXT`, `STREAM` | a context or stream coming into being, while the kind is enabled |
 
 A kernel or copy has the correlation id of the runtime call that issued it,
-which is how a profiler connects the GPU timeline to the host calls.
+which is how a profiler connects the GPU timeline to the host call that
+launched it. A call made through another public call (`cudaMemcpyAsync`
+goes through `cudaMemcpy` here) is one call, as it is on NVIDIA's runtime,
+which does not route its API through itself.
+
+The record structures are the newest the toolkit being built against defines
+(`CUpti_ActivityKernel11` under CUDA 13.2, `Kernel10` under 13.0, `Kernel9`
+before; `Memcpy6` from API version 26), because a consumer built with that
+toolkit reads those offsets.
 
 Enabling a kind that is not produced succeeds and yields nothing. Refusing
 would stop a profiler that asks for everything and uses what arrives, which is
 most of them; returning nothing for a kind with no data behind it is the honest
 answer.
 
+## The Callback API
+
+`cuptiSubscribe` takes one subscriber at a time (a second is refused, as on
+NVIDIA's). Enabled domains and callbacks are delivered as the call happens:
+
+- **Runtime API**: ENTER and EXIT around each call, with `functionName`, the
+  correlation id, `symbolName` on a kernel launch, the return value on exit
+  and the toolkit's own parameter structure in `functionParams`. Delivered for
+  the ~50 calls whose structures are filled completely: allocation and free,
+  the copy and fill families, launches, streams, events, device queries,
+  synchronization, graph launch and stream capture. A call whose parameters
+  this cannot describe is not delivered, rather than delivered with a structure
+  of zeros that a consumer would read as what the program passed. The
+  activity `RUNTIME` records cover every call.
+- **Resource**: context created, stream created and destroyed, driver
+  initialisation finished.
+- **Synchronize**: stream and context synchronized.
+
+`nvidia/tests/e2e/run_cupti_trace.sh` runs one program that traces itself
+through both APIs and compares what it prints, with timestamps and id values
+removed, with the trace NVIDIA's CUPTI printed for the same program on an RTX
+3060 (`nvidia/tests/data/cupti_trace.expected`). `--card` runs the program
+against NVIDIA's libraries on a GPU and compares with the same file, which is
+how the expected output is known to be what hardware prints.
+
+Known differences, all of the lazy-loading kind: a real driver raises
+module-loaded callbacks when it first loads a kernel's code; this loads whole
+modules at once and does not. Register counts come from this project's
+analysis, not from the compiler, and are not compared.
+
 ## What is not implemented, and why
 
-**The Callback API delivers no callbacks.** `cuptiSubscribe`,
-`cuptiEnableCallback` and `cuptiEnableDomain` accept a subscriber so a consumer
-can attach, but nothing is dispatched. The points a real CUPTI intercepts are
-inside the driver, and synthesising them here would mean reporting API entries
-and exits that did not happen the way the consumer is told they did. The
-`RUNTIME` activity records carry the runtime calls themselves.
+**The Callback API covers the runtime, resource and synchronize domains
+only.** The driver-API domain, module and graph resources, and the NVTX domain
+deliver nothing. Runtime calls outside the set above are in the activity
+records but not delivered as callbacks.
 
 **No metrics or events.** The Profiling and Event APIs report hardware
 performance counters. The exact counters this engine keeps -- instruction mix,

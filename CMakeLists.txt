@@ -409,6 +409,26 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   vgpu_toolkit_soversion(cupti 13 SO_CUPTI)
   vgpu_version_script(cupti ${SO_CUPTI} _cupti_map)
+  # The runtime-API callback IDs are the toolkit's, so the table of them is
+  # read from its header here rather than kept by hand: {function, versioned
+  # name, ID} for every one the header names. Without cupti.h beside it there is
+  # no CUPTI to build, and the guard on the target below says so.
+  set(_cbid_header "${CUDA_ABI_INCLUDE}/cupti_runtime_cbid.h")
+  set(_cbid_inc "${CMAKE_BINARY_DIR}/gen/cupti_runtime_cbids.inc")
+  set(_cbid_text "")
+  if(EXISTS "${_cbid_header}")
+    file(STRINGS "${_cbid_header}" _cbid_lines REGEX "CUPTI_RUNTIME_TRACE_CBID_[A-Za-z0-9_]+_v[0-9]+ *=")
+    foreach(_line IN LISTS _cbid_lines)
+      if(_line MATCHES "CUPTI_RUNTIME_TRACE_CBID_([A-Za-z0-9_]+)_v([0-9]+) *=")
+        set(_fn "${CMAKE_MATCH_1}")
+        set(_ver "${CMAKE_MATCH_2}")
+        string(APPEND _cbid_text
+               "VGPU_CBID_ROW(\"${_fn}\", \"${_fn}_v${_ver}\", CUPTI_RUNTIME_TRACE_CBID_${_fn}_v${_ver})\n")
+      endif()
+    endforeach()
+  endif()
+  file(WRITE "${_cbid_inc}.tmp" "${_cbid_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cbid_inc}.tmp" "${_cbid_inc}")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -416,7 +436,7 @@ if(CUDA_ABI_INCLUDE)
   # turn recording on in one and the runtime would keep reading the other, and
   # a profiler would attach successfully and receive nothing.
   target_link_libraries(vgpucupti PRIVATE vgpucudart)
-  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include)
+  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include "${CMAKE_BINARY_DIR}/gen")
   set_target_properties(vgpucupti PROPERTIES
     OUTPUT_NAME cupti SOVERSION ${SO_CUPTI} VERSION ${SO_CUPTI}.0)
   target_link_options(vgpucupti PRIVATE "-Wl,--version-script=${_cupti_map}")
@@ -1992,6 +2012,16 @@ if(TARGET vgpucupti)
   add_test(NAME e2e_cupti_activity
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_activity.sh)
   set_tests_properties(e2e_cupti_activity PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # The trace a program gets of itself -- callbacks and activity records --
+  # against the one NVIDIA's CUPTI printed for the same program on an RTX 3060.
+  add_test(NAME e2e_cupti_trace
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_trace.sh)
+  set_tests_properties(e2e_cupti_trace PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
