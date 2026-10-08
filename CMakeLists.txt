@@ -1162,6 +1162,18 @@ foreach(_p IN LISTS VGPU_PROFILES)
   endif()
 endforeach()
 
+# The AMD runtime calls the gap register listed as refused (HSA waits, shared signals, migration,
+# release notices, the deprecated code object calls; hipLink*, device malloc, capture refusals,
+# sRGB over linear memory), each on a runtime of its own: the process holds one GPU.
+add_executable(test_amd_runtime_gaps amd/tests/unit/test_amd_runtime_gaps.cpp)
+target_link_libraries(test_amd_runtime_gaps PRIVATE vgpuhip vgpu)
+target_include_directories(test_amd_runtime_gaps PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_runtime_gaps PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_runtime_gaps COMMAND test_amd_runtime_gaps)
+set_tests_properties(test_amd_runtime_gaps PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+add_test(NAME test_amd_runtime_gaps_radeon COMMAND test_amd_runtime_gaps)
+set_tests_properties(test_amd_runtime_gaps_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_QUIET=1")
+
 vgpu_unit_test(test_amd_hipcc_ops amd/tests/unit/test_hipcc_ops.cpp)
 target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 

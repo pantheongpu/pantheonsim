@@ -13,6 +13,7 @@
 
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_codeobject.hpp"
+#include "vgpu/error.hpp"
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -121,6 +122,25 @@ VTEST(a_damaged_compressed_bundle_is_refused) {
     refused = true;
   }
   VCHECK(refused);
+}
+
+// Only zlib (0) and zstd (1) are methods clang's offload bundler defines, and only the header
+// versions 2 and 3 are read: anything else is refused by name rather than read as the nearest.
+VTEST(a_compressed_bundle_of_an_unknown_method_or_version_is_refused_by_name) {
+  auto refusal = [&](const std::string& fixture, size_t at, uint16_t value) {
+    std::string raw = file(fixture);
+    raw.replace(at, 2, std::string(reinterpret_cast<const char*>(&value), 2));
+    try {
+      amd::read_bundle(bytes(raw), "gfx942:sramecc+:xnack-");
+    } catch (const Error& e) {
+      return e.code() == Err::Unsupported ? std::string(e.what()) : std::string("wrong kind of error");
+    }
+    return std::string("not refused");
+  };
+  VCHECK(refusal("bundle_zstd.bin", 6, 2).find("method (2)") != std::string::npos);
+  VCHECK(refusal("bundle_zlib.bin", 6, 7).find("method (7)") != std::string::npos);
+  VCHECK(refusal("bundle_zstd.bin", 4, 4).find("format version 4") != std::string::npos);
+  VCHECK(refusal("bundle_zlib.bin", 4, 1).find("format version 1") != std::string::npos);
 }
 
 VTEST(what_is_not_a_bundle_is_not_read_as_one) {

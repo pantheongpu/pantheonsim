@@ -136,7 +136,7 @@ VTEST(each_lane_has_a_message_of_its_own_and_stderr_is_its_own_stream) {
   VCHECK_EQ(printed[1].stream, 1);
 }
 
-VTEST(a_service_other_than_printf_is_refused_by_name) {
+VTEST(a_service_the_host_does_not_provide_is_refused_by_name) {
   MemoryManager mem(64ull << 20);
   amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
   Device dev(mem, hc);
@@ -144,11 +144,93 @@ VTEST(a_service_other_than_printf_is_refused_by_name) {
   lanes[0] = {1024, 0};
   bool refused = false;
   try {
-    dev.call(3 /* device malloc */, 1, lanes);
+    dev.call(1 /* a device function call */, 1, lanes);
   } catch (const Error& e) {
-    refused = e.code() == Err::Unsupported && std::string(e.what()).find("device malloc") != std::string::npos;
+    refused = e.code() == Err::Unsupported && std::string(e.what()).find("a device function call") != std::string::npos;
   }
   VCHECK(refused);
+}
+
+// ockl's __ockl_devmem_request(addr, size): memory for a size, with no address; a block
+// back for an address, with no size. What the device's malloc builds its slabs on.
+VTEST(device_memory_is_handed_out_aligned_and_taken_back) {
+  MemoryManager mem(256ull << 20);
+  amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
+  Device dev(mem, hc);
+  const uint64_t before = mem.used();
+  std::vector<std::vector<uint64_t>> lanes(64);
+  lanes[0] = {0, 2ull << 20};   // a slab, as the library asks
+  lanes[7] = {0, 6144};
+  lanes[9] = {0, 0};            // nothing asked, nothing given
+  const auto got = dev.call(amd::Hostcall::kServiceDevmem, 1 | 1ull << 7 | 1ull << 9, lanes);
+  VCHECK(got[0].first != 0);
+  VCHECK_EQ(got[0].first % (2ull << 20), uint64_t{0});   // slabs are found by masking an address
+  VCHECK(got[7].first != 0);
+  VCHECK_EQ(got[7].first % 4096, uint64_t{0});
+  VCHECK_EQ(got[9].first, uint64_t{0});
+  // The blocks are device memory the kernel can use.
+  mem.store_scalar(got[0].first + (2ull << 20) - 8, 8, 0x1234);
+  VCHECK_EQ(mem.load_scalar(got[0].first + (2ull << 20) - 8, 8), uint64_t{0x1234});
+  // A request the device cannot hold answers with a null pointer, as malloc does.
+  lanes[0] = {0, 1ull << 40};
+  VCHECK_EQ(dev.call(amd::Hostcall::kServiceDevmem, 1, lanes)[0].first, uint64_t{0});
+  // Giving the blocks back.
+  lanes[0] = {got[0].first, 0};
+  lanes[7] = {got[7].first, 0};
+  dev.call(amd::Hostcall::kServiceDevmem, 1 | 1ull << 7, lanes);
+  VCHECK_EQ(mem.used(), before);
+  // An address the host never handed out, or a request that both asks and gives, is refused.
+  bool refused_free = false, refused_both = false;
+  lanes[0] = {got[0].first, 0};
+  try {
+    dev.call(amd::Hostcall::kServiceDevmem, 1, lanes);
+  } catch (const Error& e) {
+    refused_free = e.code() == Err::InvalidFree;
+  }
+  lanes[0] = {0x1000, 64};
+  try {
+    dev.call(amd::Hostcall::kServiceDevmem, 1, lanes);
+  } catch (const Error& e) {
+    refused_both = e.code() == Err::InvalidValue;
+  }
+  VCHECK(refused_free);
+  VCHECK(refused_both);
+}
+
+VTEST(blocks_still_out_when_the_hostcall_goes_are_given_back) {
+  MemoryManager mem(64ull << 20);
+  const uint64_t before = mem.used();
+  {
+    amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
+    Device dev(mem, hc);
+    std::vector<std::vector<uint64_t>> lanes(64);
+    lanes[0] = {0, 3000};
+    VCHECK(dev.call(amd::Hostcall::kServiceDevmem, 1, lanes)[0].first != 0);
+  }
+  VCHECK_EQ(mem.used(), before);
+}
+
+// ockl's __ockl_sanitizer_report(address, pc, wg x, y, z, wave, is_read, size): the kernel
+// ends with the report as the error.
+VTEST(the_address_sanitizers_report_ends_the_kernel_and_says_what_it_found) {
+  MemoryManager mem(64ull << 20);
+  amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
+  Device dev(mem, hc);
+  std::vector<std::vector<uint64_t>> lanes(64);
+  lanes[2] = {0xdead0000, 0x4200, 1, 2, 3, 4, 1, 8};
+  std::string what;
+  Err code = Err::Internal;
+  try {
+    dev.call(amd::Hostcall::kServiceSanitizer, 1 << 2, lanes);
+  } catch (const Error& e) {
+    what = e.what();
+    code = e.code();
+  }
+  VCHECK(code == Err::DeviceAssert);
+  VCHECK(what.find("AddressSanitizer") != std::string::npos);
+  VCHECK(what.find("read of 8 bytes at 0xdead0000") != std::string::npos);
+  VCHECK(what.find("pc 0x4200") != std::string::npos);
+  VCHECK(what.find("work-group 1,2,3") != std::string::npos);
 }
 
 VTEST(the_conversions_come_out_as_the_hosts_printf_makes_them) {

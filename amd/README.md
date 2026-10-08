@@ -80,8 +80,12 @@ clones, allocation nodes whose memory outlives the graph, user objects, and a
 drawing in Graphviz's dot. A launch is one piece of its stream's work, its
 nodes run in an order their edges allow. Every function ROCm 7.1's `libamdhip64`
 exports is here, down to `__managed__` variables, modules loaded as CUDA 12's
-libraries or as fat binaries, the run-time linker for code objects (linking
-LLVM bitcode needs AMD's compiler library, and is refused), HCC's launch by
+libraries or as fat binaries, the run-time linker for code objects (`hipLink*`: one input comes back as it
+is; several become one module holding them, a kernel defined twice is a link
+error, and the binary `hipLinkComplete` writes is this runtime's own
+container, which `hipModuleLoadData` reads back, not an ELF; relocatable
+objects that call into one another would need a real linker, and linking LLVM
+bitcode needs AMD's compiler library, so both are refused), HCC's launch by
 its C and C++ names, and what a device with no OpenGL and no dma-bufs answers
 (`tests/hipcc/exports.cpp`). A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
@@ -124,7 +128,7 @@ and all (`gfx942:sramecc+:xnack-`), which is how rocBLAS picks, of the code it
 ships for each setting of XNACK, the code built for this one. Its device code
 comes as compressed offload bundles, dozens of them, inflated with the
 system's zstd or zlib when a kernel first needs one rather than as the
-library loads; Tensile's GEMMs come from code objects hundreds of kernels
+library loads (zlib and zstd are the two methods clang defines; any other method number, and a header version other than 2 and 3, is refused by name); Tensile's GEMMs come from code objects hundreds of kernels
 were linked into, each keeping its own metadata. The stream-ordered
 allocations, pitched copies, pointer attributes and work-item-sized launches
 (`hipExtModuleLaunchKernel`) it calls are there. `tests/e2e/run_rocblas.sh`
@@ -227,11 +231,19 @@ hostcall): the kernel takes a packet from a buffer the runtime gave it,
 fills a slot per lane, pushes it onto a ready stack and raises a doorbell,
 whose mailbox makes it send an interrupt (`s_sendmsg`); that is where the
 host's part is done (`src/hostcall.cpp`), and the kernel, spinning on the
-packet, carries on. `printf` is the service implemented: a message per lane,
+packet, carries on. `printf` is a service implemented: a message per lane,
 carried in as many packets as it needs, formatted as C's printf would and
-written to the program's stdout, with printf's return value sent back. A
-hostcall for another service (device `malloc`, the address sanitizer) is
-refused by name. Vector loads and stores may be unaligned, as ROCm runs the
+written to the program's stdout, with printf's return value sent back.
+Device-side `malloc` and `free` are the second (service 3, ockl's
+`__ockl_devmem_request`): the device library's allocator asks the host for
+its 2 MiB slabs and for large blocks, and gives them back; the host answers
+with device memory placed on the alignment the library finds slabs by, and a
+null pointer when the device is full (`tests/data/devmalloc.cpp`, run by
+`test_amd_runtime_gaps`). The address sanitizer's report (service 4) ends the
+kernel with the report as the error (ROCm's runtime prints it and aborts); no
+sanitizer-instrumented code was available to run it, so it is checked against
+the device library's argument order only. A hostcall for any other service
+(a device function call) is refused by name. Vector loads and stores may be unaligned, as ROCm runs the
 hardware; the compiler counts on that when it packs a string.
 
 A program hipcc built carries linked code objects, whose code reaches its
@@ -418,7 +430,7 @@ texture units, and the simulator models them from the kernel up:
 - **HIP:** arrays (1D, 2D, 3D, layered), every copy to and from them, texture
   objects over arrays, linear and pitched memory (runtime and driver API),
   texture references (`texture<T, dim, mode>`, bound with `hipBindTexture*`
-  or a module's through `hipTexRef*`), sRGB textures, and surface objects
+  or a module's through `hipTexRef*`), sRGB textures (over arrays and pitched memory; sRGB over linear memory is refused by name: a buffer resource has no sRGB number format and nothing public says what `tex1Dfetch` would return), and surface objects
   (`src/hip_images.inc`), each check and error as ROCm's HIP makes it.
   ROCm's HIP on Linux has no mipmaps or cube arrays, so neither does the shim.
 - **HSA:** the images extension (`src/hsa_images.inc`): images and samplers,
@@ -480,7 +492,8 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
 - **Images, virtual memory and IPC:** HSA's images extension (see Textures), its virtual memory (`hsa_amd_vmem_*`), its IPC handles (`hsa_amd_ipc_memory_*`) and dma-buf export are modelled. The last three are HIP's own (`src/hsa_vmem.inc`), reached by hidden names so that ROCm's libamdhip64 over this runtime does not call itself. ROCm's HIP runs `tests/hipcc/memory.cpp`'s virtual memory, pool IPC and dma-buf checks over it.
 - **Shared virtual memory:** the runtime reports SVM support, as ROCm's does on a machine with HMM. ROCm's HIP then keeps managed memory the way it does there: host pages made accessible to each GPU, advised and prefetched through `hsa_amd_svm_attributes_set`, `_get` and `hsa_amd_svm_prefetch_async` (`src/hsa_svm.inc`). A range given to a GPU is mapped for the devices where it is. Advice, access and the last prefetch's target are kept page by page and read back, uniform or not. A prefetch moves nothing, because there is no second copy of the pages. It waits for its dependencies and completes its signal.
-- **Not modelled:** graphics interop.
+- **Also answered:** `hsa_amd_signal_wait_any` (the header does not say what a wait that times out returns; this answers `UINT32_MAX`, no index of any list, with the timeout in the 1 GHz system ticks `hsa_signal_wait` takes); `hsa_amd_ipc_signal_create` and `_attach` for a signal made with `HSA_AMD_SIGNAL_IPC`, within the process (a handle from another process is refused: a signal is an object of its process's heap); `hsa_amd_memory_pool_can_migrate` and `hsa_amd_memory_migrate` between the CPU's fine- and coarse-grained pools and from a pool to itself (a buffer keeps its address, and the grain `hsa_amd_pointer_info` reports changes); `hsa_amd_register_deallocation_callback` and `_deregister_` (fired once, from `hsa_amd_memory_pool_free`, the one release the header names); `hsa_amd_async_function`; and the deprecated `hsa_code_object_deserialize`, `_destroy`, `hsa_executable_create`, `_load_code_object`, `_get_symbol` (no module names) and `_validate`, through the reader path (`test_amd_runtime_gaps`).
+- **Refused by name (`HSA_STATUS_ERROR_NOT_SUPPORTED`):** `hsa_amd_spm_*` (no counter stream), the finalizer (`hsa_ext_program_*`; AMD's runtime has had none since ROCm 2), the rest of the deprecated code object interface (`hsa_code_object_serialize`, `_get_info`, `_get_symbol*`, `_iterate_symbols`, `hsa_code_symbol_get_info`, `hsa_executable_load_program_code_object`, `_iterate_program_symbols`), `hsa_amd_queue_intercept_*` and `hsa_ven_amd_aqlprofile_*` (packets are not diverted to a tool and there are no PM4 counter packets; the public header available here did not declare the interception calls, so their signatures were not checked), the variable definitions (`hsa_executable_agent_global_variable_define`, `_global_variable_define`, `_readonly_variable_define`: the loader leaves a code object's undefined symbols unrelocated, so a defined variable would bind to nothing), and graphics interop (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `_unmap_buffer`). Still absent, not refused: `hsa_soft_queue_create`, `hsa_queue_inactivate`, `hsa_memory_assign_agent`, `hsa_extension_get_name`, the exception-policy queries, `hsa_amd_image_get_info_max_dim`.
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 
