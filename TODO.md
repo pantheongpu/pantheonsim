@@ -1549,8 +1549,9 @@ scripts/run-pantheon-workloads.sh.
    layer (rocminfo, `rocm_agent_enumerator`, `/sys/class/kfd`) is done
    (`amd_hsa`, `amd_hip_on_hsa`, `test_amd_kfd`); textures and images are done
    on RDNA (MI300 has none, correctly); gfx950 (MI350X) is done
-   (`amd_pytorch_mi350x`). **Still open on AMD**: OpenMP offload and
-   `amdgpu-arch` (no test found for either), a double `trsv` path in rocBLAS
+   (`amd_pytorch_mi350x`); OpenMP offload and OpenCL run on all six
+   (`amd_openmp`, `amd_opencl`). **Still open on AMD**: gfx9 image
+   instructions (MI250X), a double `trsv` path in rocBLAS
    (status unconfirmed), the instruction forms the executor refuses by name
    (gap register), and anything in the gap register's AMD part.
 1. **Interpreter speed**: intern register names to dense indices at parse
@@ -1924,7 +1925,7 @@ behaviour, timing).
   and `media_enc_virus` skip; `mma_virus` needs rocWMMA headers (amd/README.md:609-615); vLLM runs eager only
   (no graphs, no `torch.compile`), one short sequence, 3 GB device (:513, :515); the ROCm Validation Suite was
   never built or run, only read (:643).
-- Open on the AMD list: OpenMP offload, `amdgpu-arch`, rocBLAS double `trsv` (see "Next milestones" 0).
+- Open on the AMD list: rocBLAS double `trsv` (see "Next milestones" 0). OpenMP offload (`amd_openmp`), OpenCL (`amd_opencl`) and `offload-arch` are done; gfx90a image instructions (MIMG on gfx9) are not, though MI250X reports image support.
 
 ### Health, RAS and registers (docs/telemetry.md, docs/registers.md, docs/machine-simulator.md)
 
