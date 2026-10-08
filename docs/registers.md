@@ -303,6 +303,11 @@ the real card's but for the IDs and the BAR addresses, and the
 512 conformance values -- matches it byte for byte but for the BAR addresses its
 host's firmware chose. Other cards use the generic layout.
 
+An NVIDIA GPU whose id NVIDIA has not published (`nvidia/vr200`, `nvidia/thor`)
+carries a placeholder id from 0xFE00 up, above every id in NVIDIA's open kernel
+modules name table; `vgpu regs export` says so in the file's header. See
+`nvidia/docs/profiles.md`.
+
 `--space mmio` on an NVIDIA GPU is its BAR0 (`nvidia/registers/mmio.yaml`).
 Every offset and bit field there comes from the published register headers of
 NVIDIA's open GPU kernel modules, which carry an MIT license

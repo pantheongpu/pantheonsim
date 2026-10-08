@@ -443,6 +443,8 @@ VTEST(every_nvidia_card_reports_its_architecture_in_bar0) {
                         Want{"nvidia/gb200", 0x1a},         // the superchip's GPU is a GB100-architecture die
                         Want{"nvidia/rtx-pro-6000", 0x1b},  // GB202: a GB20x die
                         Want{"nvidia/gb10", 0x1b},          // cc 12.1; boot_architecture() puts every 12.x on the GB20x id
+                        Want{"nvidia/vr200", 0},            // Rubin: no architecture id is published, so none is reported
+                        Want{"nvidia/thor", 0x1a},          // a Blackwell GPU with compute capability 11.0: the GB100 id, by the cc < 12 rule
                         Want{"nvidia/rtx5090", 0x1b}}) {    // GB200: the GB20x dies
     regs::RegisterSpace bar0(regs::Space::AmdMmio, device(w.gpu));
     const uint32_t v = bar0.read(0x0, 4);

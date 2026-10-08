@@ -23,6 +23,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/l4", "nvidia/l40s",
       "nvidia/rtx2080ti", "nvidia/rtx3090", "nvidia/a40", "nvidia/a30", "nvidia/rtx4090", "nvidia/l40",
       "nvidia/rtx-pro-6000", "nvidia/gb10", "nvidia/gb200",
+      "nvidia/vr200", "nvidia/thor",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/rx7900xtx", "amd/rx9070xt",
       "amd/rx6900xt"};
   VCHECK_EQ(ids.size(), expected.size());

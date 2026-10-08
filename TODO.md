@@ -1685,7 +1685,7 @@ public headers, tested by their authors under ASan + UBSan, and are awaiting CI 
 
 ## Profile inventory (rev 6)
 
-32 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds nine NVIDIA profiles built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
+34 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
 profile's values were read from a physical device (see "Hardware characterization").
 
 | id | vendor | arch | cc / gfx | verified |
@@ -1707,6 +1707,8 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `nvidia/b300` | NVIDIA | Blackwell Ultra | 10.3 | **no** |
 | `nvidia/rtx5090` | NVIDIA | Blackwell | 12.0 | **no** |
 | `nvidia/gb200` | NVIDIA | Blackwell | 10.0 | **no** (B200's limits; memory from NVIDIA's per-superchip figure) |
+| `nvidia/vr200` | NVIDIA | Rubin | 10.7 | **no** (placeholder PCI id 0xFE10) |
+| `nvidia/thor` | NVIDIA | Blackwell | 11.0 | **no** (placeholder PCI id 0xFE11; SM count derived) |
 | `nvidia/rtx-pro-6000` | NVIDIA | Blackwell | 12.0 | **no** |
 | `nvidia/gb10` | NVIDIA | Blackwell | 12.1 | **no** (SM count derived from the 6,144 CUDA cores) |
 | `nvidia/rtx4090` | NVIDIA | Ada | 8.9 | **no** |

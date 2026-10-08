@@ -50,6 +50,8 @@ set(VGPU_PROFILES
   nvidia/rtx-pro-6000
   nvidia/gb10
   nvidia/gb200
+  nvidia/vr200
+  nvidia/thor
   amd/mi250x
   amd/mi300x
   amd/mi325x

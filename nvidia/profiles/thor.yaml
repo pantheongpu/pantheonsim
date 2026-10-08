@@ -1,0 +1,68 @@
+# VirtualGPU device profile: NVIDIA Jetson AGX Thor (Blackwell GPU in the T5000 module;
+# compute capability 11.0, sm_110).
+# Public values; verified: false -- nothing here has been measured on a card.
+#
+# !! The PCI device id below (0xFE11) is a PLACEHOLDER, not NVIDIA's. NVIDIA has
+# !! not published an id for Thor's GPU: NVIDIA's open GPU kernel modules name
+# !! table (g_nv_name_released.h) has no Thor or Tegra entry. 0xFE11 is above every
+# !! id in that table (the highest is 0xC838), so it collides with no NVIDIA part.
+# !! Replace it when NVIDIA publishes one, as the MI300X and MI350X placeholders are.
+#
+# Where each value comes from:
+#   - compute capability 11.0 (sm_110): the CUDA C++ Programming Guide's table has
+#     an 11.0 column, and the CUDA toolkit release notes (cuBLAS 13.0) add "sm_110
+#     GPUs for arm64-sbsa" and "TF32 GEMMs on Thor GPUs". NVIDIA's CUDA GPUs table
+#     lists the Jetson T5000 and T4000 under 11.0 but has no Thor row.
+#   - CUDA cores 2560, 10 TPCs, GPU max frequency 1.57 GHz, 128 GB 256-bit LPDDR5X
+#     at 273 GB/s, 40 W to 130 W configurable: NVIDIA's Jetson Thor page (T5000).
+#     SMs 20 are DERIVED: 2560 / 128 CUDA cores an SM (NVIDIA's RTX Blackwell
+#     whitepaper), which is also 10 TPCs at two SMs each; NVIDIA states no SM
+#     count. Unverified.
+#   - Memory: vram_bytes is 128 GiB, the whole unified pool shared with the CPU, an
+#     upper bound (NVIDIA's "GB" is binary here as elsewhere). The memory clock is
+#     what 273 GB/s on 256 bits gives, 8.53 Gbps, half of it 4266 MHz -- the figure
+#     NVIDIA's DGX Spark page gives for the same LPDDR5X.
+#   - Per-SM shared memory: the programming guide's 11.0 column, 228 KB an SM and
+#     227 KB a block (sm_100's; the block figure is inferred, not read from the
+#     guide), 64K 32-bit registers an SM.
+#   - COPIED from nvidia/b200 (sm_100) because the guide's resident-block and
+#     thread rows could not be tied to the 11.0 column: 2048 threads and 32 blocks
+#     an SM. power_limit_w is the top of the configurable range, 130 W.
+#   - Not recorded: ECC, a memory type (LPDDR5X is neither "hbm" nor "gddr"), PCIe
+#     and NVLink links (Thor is an SoC), a temperature limit.
+id: nvidia/thor
+vendor: nvidia
+model: "NVIDIA Jetson AGX Thor"
+architecture: blackwell
+compute_capability: "11.0"
+warp_size: 32
+vram_bytes: 137438953472         # 131072 MiB, the unified pool; an upper bound
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448   # 227 KiB (compute capability 11.0)
+  registers_per_block: 65536
+  multiprocessors: 20            # derived, see the header; unverified
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048       # copied from sm_100
+  max_blocks_per_sm: 32          # copied from sm_100
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 233472      # 228 KiB (compute capability 11.0)
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 131072         # 128 GiB in MiB, shared with the CPU; not measured on a card
+  power_limit_w: 130             # top of the configurable 40-130 W (NVIDIA)
+  sm_clock_max_mhz: 1570         # "1.57 GHz" (NVIDIA)
+  mem_clock_max_mhz: 4266        # see the header
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 65041           # 0xFE11: PLACEHOLDER, NVIDIA has published no Thor id (see the header)
