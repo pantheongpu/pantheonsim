@@ -15,11 +15,11 @@
  *
  * Declared is the subset VirtualGPU implements: tensor network contraction
  * (the network API and the older descriptor/plan API), the contraction
- * optimizer, slicing, workspace management, and the tensor decompositions
- * (QR, SVD, gate split). The high-level state API (states, operators,
- * expectations, marginals, samplers, MPS), gradients and distributed
- * execution are exported by the library but answer NOT_SUPPORTED, so they
- * are not declared here.
+ * optimizer, slicing, workspace management, the tensor decompositions
+ * (QR, SVD, gate split), and the high-level state API (states, tensor
+ * operators, network operators, accessors, expectations, marginals, samplers,
+ * MPS). Distributed execution and the undocumented exports are exported by
+ * the library but answer NOT_SUPPORTED, so they are not declared here.
  */
 #ifndef VGPU_CUTENSORNET_H_
 #define VGPU_CUTENSORNET_H_
@@ -30,6 +30,7 @@
 
 #include <driver_types.h>  /* cudaStream_t */
 #include <library_types.h> /* cudaDataType_t */
+#include <cuComplex.h>    /* cuDoubleComplex, a network operator's coefficients */
 
 #define CUTENSORNET_MAJOR 2
 #define CUTENSORNET_MINOR 14
@@ -569,6 +570,317 @@ cutensornetStatus_t cutensornetGateSplit(
     const cutensornetGateSplitAlgo_t gateAlgo, const cutensornetTensorSVDConfig_t svdConfig,
     cutensornetComputeType_t computeType, cutensornetTensorSVDInfo_t svdInfo,
     const cutensornetWorkspaceDescriptor_t workDesc, cudaStream_t stream);
+
+/* ---- Gradients of a network ---- */
+
+cutensornetStatus_t cutensornetNetworkSetGradientTensorMemory(const cutensornetHandle_t handle,
+                                                              cutensornetNetworkDescriptor_t networkDesc,
+                                                              int64_t correspondingTensorId, void* const buffer,
+                                                              const int64_t strides[]);
+cutensornetStatus_t cutensornetNetworkSetAdjointTensorMemory(const cutensornetHandle_t handle,
+                                                             cutensornetNetworkDescriptor_t networkDesc,
+                                                             const void* const buffer, const int64_t strides[]);
+cutensornetStatus_t cutensornetNetworkPrepareGradientsBackward(const cutensornetHandle_t handle,
+                                                               cutensornetNetworkDescriptor_t networkDesc,
+                                                               const cutensornetWorkspaceDescriptor_t workDesc);
+cutensornetStatus_t cutensornetNetworkComputeGradientsBackward(const cutensornetHandle_t handle,
+                                                               cutensornetNetworkDescriptor_t networkDesc,
+                                                               int32_t accumulateOutput,
+                                                               const cutensornetWorkspaceDescriptor_t workDesc,
+                                                               const cutensornetSliceGroup_t sliceGroup,
+                                                               cudaStream_t stream);
+
+/* ---- The state API: tensor network states, operators, and what is computed from them ---- */
+
+typedef void* cutensornetState_t;
+typedef void* cutensornetStateAccessor_t;
+typedef void* cutensornetStateExpectation_t;
+typedef void* cutensornetStateMarginal_t;
+typedef void* cutensornetStateSampler_t;
+typedef void* cutensornetStateProjectionMPS_t;
+typedef void* cutensornetNetworkOperator_t;
+
+typedef enum {
+  CUTENSORNET_STATE_PURITY_PURE,
+  CUTENSORNET_STATE_PURITY_MIXED
+} cutensornetStatePurity_t;
+
+typedef enum {
+  CUTENSORNET_BOUNDARY_CONDITION_OPEN
+} cutensornetBoundaryCondition_t;
+
+typedef enum {
+  CUTENSORNET_STATE_MPS_CANONICAL_CENTER = 0,
+  CUTENSORNET_STATE_MPS_SVD_CONFIG_ABS_CUTOFF = 1,
+  CUTENSORNET_STATE_MPS_SVD_CONFIG_REL_CUTOFF = 2,
+  CUTENSORNET_STATE_MPS_SVD_CONFIG_S_NORMALIZATION = 3,
+  CUTENSORNET_STATE_MPS_SVD_CONFIG_ALGO = 4,
+  CUTENSORNET_STATE_MPS_SVD_CONFIG_ALGO_PARAMS = 5,
+  CUTENSORNET_STATE_MPS_SVD_CONFIG_DISCARDED_WEIGHT_CUTOFF = 6,
+  CUTENSORNET_STATE_NUM_HYPER_SAMPLES = 7,
+  CUTENSORNET_STATE_CONFIG_MPS_CANONICAL_CENTER = 16,
+  CUTENSORNET_STATE_CONFIG_MPS_SVD_ABS_CUTOFF = 17,
+  CUTENSORNET_STATE_CONFIG_MPS_SVD_REL_CUTOFF = 18,
+  CUTENSORNET_STATE_CONFIG_MPS_SVD_S_NORMALIZATION = 19,
+  CUTENSORNET_STATE_CONFIG_MPS_SVD_ALGO = 20,
+  CUTENSORNET_STATE_CONFIG_MPS_SVD_ALGO_PARAMS = 21,
+  CUTENSORNET_STATE_CONFIG_MPS_SVD_DISCARDED_WEIGHT_CUTOFF = 22,
+  CUTENSORNET_STATE_CONFIG_MPS_MPO_APPLICATION = 23,
+  CUTENSORNET_STATE_CONFIG_MPS_GAUGE_OPTION = 24,
+  CUTENSORNET_STATE_CONFIG_NUM_HYPER_SAMPLES = 30,
+  CUTENSORNET_STATE_INFO_FLOPS = 64
+} cutensornetStateAttributes_t;
+
+typedef enum {
+  CUTENSORNET_STATE_MPO_APPLICATION_INEXACT,
+  CUTENSORNET_STATE_MPO_APPLICATION_EXACT
+} cutensornetStateMPOApplication_t;
+
+typedef enum {
+  CUTENSORNET_STATE_MPS_GAUGE_FREE = 0,
+  CUTENSORNET_STATE_MPS_GAUGE_SIMPLE = 1
+} cutensornetStateMPSGaugeOption_t;
+
+typedef enum {
+  CUTENSORNET_ACCESSOR_OPT_NUM_HYPER_SAMPLES = 0,
+  CUTENSORNET_ACCESSOR_CONFIG_NUM_HYPER_SAMPLES = 1,
+  CUTENSORNET_ACCESSOR_INFO_FLOPS = 64
+} cutensornetAccessorAttributes_t;
+
+typedef enum {
+  CUTENSORNET_EXPECTATION_OPT_NUM_HYPER_SAMPLES = 0,
+  CUTENSORNET_EXPECTATION_CONFIG_NUM_HYPER_SAMPLES = 1,
+  CUTENSORNET_EXPECTATION_INFO_FLOPS = 64
+} cutensornetExpectationAttributes_t;
+
+typedef enum {
+  CUTENSORNET_MARGINAL_KIND_FULL = 0,
+  CUTENSORNET_MARGINAL_KIND_DIAGONAL = 1
+} cutensornetMarginalKind_t;
+
+typedef enum {
+  CUTENSORNET_MARGINAL_OPT_NUM_HYPER_SAMPLES = 0,
+  CUTENSORNET_MARGINAL_CONFIG_NUM_HYPER_SAMPLES = 1,
+  CUTENSORNET_MARGINAL_INFO_FLOPS = 64,
+  CUTENSORNET_MARGINAL_INFO_KIND = 65
+} cutensornetMarginalAttributes_t;
+
+typedef enum {
+  CUTENSORNET_SAMPLER_OPT_NUM_HYPER_SAMPLES = 0,
+  CUTENSORNET_SAMPLER_CONFIG_NUM_HYPER_SAMPLES = 1,
+  CUTENSORNET_SAMPLER_CONFIG_DETERMINISTIC = 2,
+  CUTENSORNET_SAMPLER_INFO_FLOPS = 64
+} cutensornetSamplerAttributes_t;
+
+cutensornetStatus_t cutensornetCreateState(const cutensornetHandle_t handle, cutensornetStatePurity_t purity,
+                                           int32_t numStateModes, const int64_t* stateModeExtents,
+                                           cudaDataType_t dataType, cutensornetState_t* tensorNetworkState);
+cutensornetStatus_t cutensornetDestroyState(cutensornetState_t tensorNetworkState);
+cutensornetStatus_t cutensornetStateApplyTensor(const cutensornetHandle_t handle,
+                                                cutensornetState_t tensorNetworkState, int32_t numStateModes,
+                                                const int32_t* stateModes, void* tensorData,
+                                                const int64_t* tensorModeStrides, const int32_t immutable,
+                                                const int32_t adjoint, const int32_t unitary, int64_t* tensorId);
+cutensornetStatus_t cutensornetStateApplyTensorOperator(const cutensornetHandle_t handle,
+                                                        cutensornetState_t tensorNetworkState,
+                                                        int32_t numStateModes, const int32_t* stateModes,
+                                                        void* tensorData, const int64_t* tensorModeStrides,
+                                                        const int32_t immutable, const int32_t adjoint,
+                                                        const int32_t unitary, int64_t* tensorId);
+cutensornetStatus_t cutensornetStateApplyTensorOperatorWithGradient(
+    const cutensornetHandle_t handle, cutensornetState_t tensorNetworkState, int32_t numStateModes,
+    const int32_t* stateModes, void* tensorData, const int64_t* tensorModeStrides, const int32_t immutable,
+    const int32_t adjoint, const int32_t unitary, void* gradientData, const int64_t* gradientModeStrides,
+    int64_t* tensorId);
+cutensornetStatus_t cutensornetStateUpdateTensorOperatorGradient(const cutensornetHandle_t handle,
+                                                                 cutensornetState_t tensorNetworkState,
+                                                                 int64_t tensorId, void* gradientData);
+cutensornetStatus_t cutensornetStateApplyDiagonalTensorOperator(
+    const cutensornetHandle_t handle, cutensornetState_t tensorNetworkState, int32_t numStateModes,
+    const int32_t* stateModes, void* tensorData, const int64_t* tensorModeStrides, const int32_t immutable,
+    const int32_t adjoint, const int32_t unitary, int64_t* tensorId);
+cutensornetStatus_t cutensornetStateApplyControlledTensorOperator(
+    const cutensornetHandle_t handle, cutensornetState_t tensorNetworkState, int32_t numControlModes,
+    const int32_t* stateControlModes, const int64_t* stateControlValues, int32_t numTargetModes,
+    const int32_t* stateTargetModes, void* tensorData, const int64_t* tensorModeStrides, const int32_t immutable,
+    const int32_t adjoint, const int32_t unitary, int64_t* tensorId);
+cutensornetStatus_t cutensornetStateUpdateTensor(const cutensornetHandle_t handle,
+                                                 cutensornetState_t tensorNetworkState, int64_t tensorId,
+                                                 void* tensorData, int32_t unitary);
+cutensornetStatus_t cutensornetStateUpdateTensorOperator(const cutensornetHandle_t handle,
+                                                         cutensornetState_t tensorNetworkState, int64_t tensorId,
+                                                         void* tensorData, int32_t unitary);
+cutensornetStatus_t cutensornetStateApplyNetworkOperator(const cutensornetHandle_t handle,
+                                                         cutensornetState_t tensorNetworkState,
+                                                         const cutensornetNetworkOperator_t tensorNetworkOperator,
+                                                         const int32_t immutable, const int32_t adjoint,
+                                                         const int32_t unitary, int64_t* operatorId);
+cutensornetStatus_t cutensornetStateApplyUnitaryChannel(const cutensornetHandle_t handle,
+                                                        cutensornetState_t tensorNetworkState,
+                                                        int32_t numStateModes, const int32_t* stateModes,
+                                                        int32_t numTensors, void* tensorData[],
+                                                        const int64_t* tensorModeStrides,
+                                                        const double probabilities[], int64_t* channelId);
+cutensornetStatus_t cutensornetStateApplyGeneralChannel(const cutensornetHandle_t handle,
+                                                        cutensornetState_t tensorNetworkState,
+                                                        int32_t numStateModes, const int32_t* stateModes,
+                                                        int32_t numTensors, void* tensorData[],
+                                                        const int64_t* tensorModeStrides, int64_t* channelId);
+cutensornetStatus_t cutensornetStateInitializeMPS(const cutensornetHandle_t handle,
+                                                  cutensornetState_t tensorNetworkState,
+                                                  cutensornetBoundaryCondition_t boundaryCondition,
+                                                  const int64_t* const extentsIn[],
+                                                  const int64_t* const stridesIn[], void* stateTensorsIn[]);
+cutensornetStatus_t cutensornetStateFinalizeMPS(const cutensornetHandle_t handle,
+                                                cutensornetState_t tensorNetworkState,
+                                                cutensornetBoundaryCondition_t boundaryCondition,
+                                                const int64_t* const extentsOut[],
+                                                const int64_t* const stridesOut[]);
+cutensornetStatus_t cutensornetStateCaptureMPS(const cutensornetHandle_t handle,
+                                               cutensornetState_t tensorNetworkState);
+cutensornetStatus_t cutensornetStateConfigure(const cutensornetHandle_t handle,
+                                              cutensornetState_t tensorNetworkState,
+                                              cutensornetStateAttributes_t attribute, const void* attributeValue,
+                                              size_t attributeSize);
+cutensornetStatus_t cutensornetStatePrepare(const cutensornetHandle_t handle,
+                                            cutensornetState_t tensorNetworkState, size_t maxWorkspaceSizeDevice,
+                                            cutensornetWorkspaceDescriptor_t workDesc, cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetStateGetInfo(const cutensornetHandle_t handle,
+                                            const cutensornetState_t tensorNetworkState,
+                                            cutensornetStateAttributes_t attribute, void* attributeValue,
+                                            size_t attributeSize);
+cutensornetStatus_t cutensornetStateCompute(const cutensornetHandle_t handle,
+                                            cutensornetState_t tensorNetworkState,
+                                            cutensornetWorkspaceDescriptor_t workDesc, int64_t* extentsOut[],
+                                            int64_t* stridesOut[], void* stateTensorsOut[],
+                                            cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetGetOutputStateDetails(const cutensornetHandle_t handle,
+                                                     const cutensornetState_t tensorNetworkState,
+                                                     int32_t* numTensorsOut, int32_t numModesOut[],
+                                                     int64_t* extentsOut[], int64_t* stridesOut[]);
+
+/* Network operators: sums of products and matrix product operators */
+cutensornetStatus_t cutensornetCreateNetworkOperator(const cutensornetHandle_t handle, int32_t numStateModes,
+                                                     const int64_t stateModeExtents[], cudaDataType_t dataType,
+                                                     cutensornetNetworkOperator_t* tensorNetworkOperator);
+cutensornetStatus_t cutensornetNetworkOperatorAppendProduct(
+    const cutensornetHandle_t handle, cutensornetNetworkOperator_t tensorNetworkOperator,
+    cuDoubleComplex coefficient, int32_t numTensors, const int32_t numStateModes[], const int32_t* stateModes[],
+    const int64_t* tensorModeStrides[], const void* tensorData[], int64_t* componentId);
+cutensornetStatus_t cutensornetNetworkOperatorAppendMPO(
+    const cutensornetHandle_t handle, cutensornetNetworkOperator_t tensorNetworkOperator,
+    cuDoubleComplex coefficient, int32_t numStateModes, const int32_t stateModes[],
+    const int64_t* tensorModeExtents[], const int64_t* tensorModeStrides[], const void* tensorData[],
+    cutensornetBoundaryCondition_t boundaryCondition, int64_t* componentId);
+cutensornetStatus_t cutensornetDestroyNetworkOperator(cutensornetNetworkOperator_t tensorNetworkOperator);
+
+/* Amplitudes */
+cutensornetStatus_t cutensornetCreateAccessor(const cutensornetHandle_t handle,
+                                              cutensornetState_t tensorNetworkState, int32_t numProjectedModes,
+                                              const int32_t* projectedModes,
+                                              const int64_t* amplitudesTensorStrides,
+                                              cutensornetStateAccessor_t* tensorNetworkAccessor);
+cutensornetStatus_t cutensornetAccessorConfigure(const cutensornetHandle_t handle,
+                                                 cutensornetStateAccessor_t tensorNetworkAccessor,
+                                                 cutensornetAccessorAttributes_t attribute,
+                                                 const void* attributeValue, size_t attributeSize);
+cutensornetStatus_t cutensornetAccessorPrepare(const cutensornetHandle_t handle,
+                                               cutensornetStateAccessor_t tensorNetworkAccessor,
+                                               size_t maxWorkspaceSizeDevice,
+                                               cutensornetWorkspaceDescriptor_t workDesc, cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetAccessorGetInfo(const cutensornetHandle_t handle,
+                                               const cutensornetStateAccessor_t tensorNetworkAccessor,
+                                               cutensornetAccessorAttributes_t attribute, void* attributeValue,
+                                               size_t attributeSize);
+cutensornetStatus_t cutensornetAccessorCompute(const cutensornetHandle_t handle,
+                                               cutensornetStateAccessor_t tensorNetworkAccessor,
+                                               const int64_t* projectedModeValues,
+                                               cutensornetWorkspaceDescriptor_t workDesc, void* amplitudesTensor,
+                                               void* stateNorm, cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetDestroyAccessor(cutensornetStateAccessor_t tensorNetworkAccessor);
+
+/* Expectation values */
+cutensornetStatus_t cutensornetCreateExpectation(const cutensornetHandle_t handle,
+                                                 cutensornetState_t tensorNetworkState,
+                                                 cutensornetNetworkOperator_t tensorNetworkOperator,
+                                                 cutensornetStateExpectation_t* tensorNetworkExpectation);
+cutensornetStatus_t cutensornetExpectationConfigure(const cutensornetHandle_t handle,
+                                                    cutensornetStateExpectation_t tensorNetworkExpectation,
+                                                    cutensornetExpectationAttributes_t attribute,
+                                                    const void* attributeValue, size_t attributeSize);
+cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t handle,
+                                                  cutensornetStateExpectation_t tensorNetworkExpectation,
+                                                  size_t maxWorkspaceSizeDevice,
+                                                  cutensornetWorkspaceDescriptor_t workDesc,
+                                                  cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetExpectationGetInfo(const cutensornetHandle_t handle,
+                                                  const cutensornetStateExpectation_t tensorNetworkExpectation,
+                                                  cutensornetExpectationAttributes_t attribute,
+                                                  void* attributeValue, size_t attributeSize);
+cutensornetStatus_t cutensornetExpectationCompute(const cutensornetHandle_t handle,
+                                                  cutensornetStateExpectation_t tensorNetworkExpectation,
+                                                  cutensornetWorkspaceDescriptor_t workDesc,
+                                                  void* expectationValue, void* stateNorm,
+                                                  cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetExpectationComputeWithGradientsBackward(
+    const cutensornetHandle_t handle, cutensornetStateExpectation_t tensorNetworkExpectation,
+    int32_t accumulateGradients, const void* expectationValueAdjoint, const void* stateNormAdjoint,
+    cutensornetWorkspaceDescriptor_t workDesc, void* expectationValue, void* stateNorm, cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetDestroyExpectation(cutensornetStateExpectation_t tensorNetworkExpectation);
+
+/* Marginals (reduced density matrices) and their diagonals */
+cutensornetStatus_t cutensornetCreateMarginal(const cutensornetHandle_t handle,
+                                              cutensornetState_t tensorNetworkState, int32_t numMarginalModes,
+                                              const int32_t* marginalModes, int32_t numProjectedModes,
+                                              const int32_t* projectedModes, const int64_t* marginalTensorStrides,
+                                              cutensornetStateMarginal_t* tensorNetworkMarginal);
+cutensornetStatus_t cutensornetCreateMarginalDiagonal(const cutensornetHandle_t handle,
+                                                      cutensornetState_t tensorNetworkState,
+                                                      int32_t numMarginalModes, const int32_t* marginalModes,
+                                                      int32_t numProjectedModes, const int32_t* projectedModes,
+                                                      const int64_t* marginalDiagonalTensorStrides,
+                                                      cutensornetStateMarginal_t* tensorNetworkMarginal);
+cutensornetStatus_t cutensornetMarginalConfigure(const cutensornetHandle_t handle,
+                                                 cutensornetStateMarginal_t tensorNetworkMarginal,
+                                                 cutensornetMarginalAttributes_t attribute,
+                                                 const void* attributeValue, size_t attributeSize);
+cutensornetStatus_t cutensornetMarginalPrepare(const cutensornetHandle_t handle,
+                                               cutensornetStateMarginal_t tensorNetworkMarginal,
+                                               size_t maxWorkspaceSizeDevice,
+                                               cutensornetWorkspaceDescriptor_t workDesc, cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetMarginalGetInfo(const cutensornetHandle_t handle,
+                                               const cutensornetStateMarginal_t tensorNetworkMarginal,
+                                               cutensornetMarginalAttributes_t attribute, void* attributeValue,
+                                               size_t attributeSize);
+cutensornetStatus_t cutensornetMarginalCompute(const cutensornetHandle_t handle,
+                                               cutensornetStateMarginal_t tensorNetworkMarginal,
+                                               const int64_t* projectedModeValues,
+                                               cutensornetWorkspaceDescriptor_t workDesc, void* marginalTensor,
+                                               cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetDestroyMarginal(cutensornetStateMarginal_t tensorNetworkMarginal);
+
+/* Samplers */
+cutensornetStatus_t cutensornetCreateSampler(const cutensornetHandle_t handle,
+                                             cutensornetState_t tensorNetworkState, int32_t numModesToSample,
+                                             const int32_t* modesToSample,
+                                             cutensornetStateSampler_t* tensorNetworkSampler);
+cutensornetStatus_t cutensornetSamplerConfigure(const cutensornetHandle_t handle,
+                                                cutensornetStateSampler_t tensorNetworkSampler,
+                                                cutensornetSamplerAttributes_t attribute,
+                                                const void* attributeValue, size_t attributeSize);
+cutensornetStatus_t cutensornetSamplerPrepare(const cutensornetHandle_t handle,
+                                              cutensornetStateSampler_t tensorNetworkSampler,
+                                              size_t maxWorkspaceSizeDevice,
+                                              cutensornetWorkspaceDescriptor_t workDesc, cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetSamplerGetInfo(const cutensornetHandle_t handle,
+                                              const cutensornetStateSampler_t tensorNetworkSampler,
+                                              cutensornetSamplerAttributes_t attribute, void* attributeValue,
+                                              size_t attributeSize);
+cutensornetStatus_t cutensornetSamplerSample(const cutensornetHandle_t handle,
+                                             cutensornetStateSampler_t tensorNetworkSampler, int64_t numShots,
+                                             cutensornetWorkspaceDescriptor_t workDesc, int64_t* samples,
+                                             cudaStream_t cudaStream);
+cutensornetStatus_t cutensornetDestroySampler(cutensornetStateSampler_t tensorNetworkSampler);
 
 #ifdef __cplusplus
 }
