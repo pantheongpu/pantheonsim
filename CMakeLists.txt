@@ -2172,6 +2172,14 @@ set_tests_properties(e2e_texture_layers PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# Global loads of __constant__ data, through the window bank 0 advertises for it.
+add_test(NAME e2e_constant_global_load
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_global_load.sh)
+set_tests_properties(e2e_constant_global_load PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
 # Mipmapped textures: explicit level of detail and plain fetches, every
 # filter combination, biases and clamps, bit for bit with an RTX 3060.
 add_test(NAME e2e_texture_mipmaps COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_mipmaps.sh)
