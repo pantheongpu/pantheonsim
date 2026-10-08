@@ -335,7 +335,7 @@ double scalar(const Desc* op, cudnnBackendAttributeName_t n, double dflt) {
 // checked: everything a graph's finalization needs to accept it and its
 // execution needs to run it.
 enum class Kind { ConvFwd, ConvData, ConvFilter, Matmul, Pointwise, Reduction, NormFwd, NormBwd, PoolFwd, PoolBwd, Concat,
-                  Reshape, Transpose, Slice, Rng, GenStats, Softmax, BandMask, SdpaFwd, SdpaBwd, PagedLoad };
+                  Reshape, Transpose, Slice, Rng, GenStats, Softmax, BandMask, SdpaFwd, SdpaBwd, PagedLoad, MoeFwd, Rope, NoEngine };
 
 // An operation's tensors, by role: which of an Op's inputs (or, for an
 // output role, which of {out, more...}) each is; -1 when the graph does not
@@ -348,7 +348,9 @@ enum Role { kX, kScale, kBias, kEps, kMean, kInv, kFactor, kRunMeanIn, kRunVarIn
             kSeed, kOffset,
             // softmax and attention
             kSink, kStats, kMax, kSumExp, kFill, kSeqQ, kSeqKV, kLeft, kShift,
-            kQ, kK, kV, kO, kDO, kDQ, kDK, kDV, kRngDump, kPageK, kPageV, kDSink,
+            kQ, kK, kV, kO, kDO, kDQ, kDK, kDV, kRngDump, kPageK, kPageV, kDSink, kCuQ, kCuKV,
+            // MoE grouped matmul; rotary embedding
+            kWeight, kFirstOffset, kTokenIndex, kTokenKs, kFreqs,
             // statistics generation; paged cache load
             kSum, kSqSum, kContainer, kPageTable, kSeqLen,
             kRoles };
@@ -401,6 +403,16 @@ struct Op {
   std::shared_ptr<std::vector<struct Op>> sub;
   int64_t sub_in = 0, sub_out = 0;
   std::shared_ptr<struct Op> softmax;
+  // An operation this library computes but no cuDNN engine offers on the
+  // RTX 3060 it follows (cuDNN 9.27): the graph finalizes, the heuristics
+  // return no configuration, and this says why (the reason cuDNN's own
+  // support check gives). Such an operation is never run.
+  std::string gap;
+  // MoE grouped matmul: the routing mode (cudnnMoeGroupedMatmulMode_t's value) and top-k;
+  // rotary embedding: the output scale and the rotated width (0: all of it).
+  int64_t moe_mode = 0, top_k = 1, rope_dim = 0;
+  double out_scale = 1.0;
+  bool rope_bwd = false;
   std::vector<GTensor> more;
   int role[kRoles];
   Op() { for (int& r : role) r = -1; }
@@ -756,12 +768,13 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       // paddings place the samples nor how bilinear weights them, and an RTX
       // 3060 with cuDNN 9.27 offers no engine for either mode (forward or
       // backward, NCHW or NHWC, upsampling or downsampling -- measured), so
-      // there is nothing to match: refused by name, as that hardware does.
-      if (interp) {
-        *why = "resample: nearest and bilinear interpolation are not supported (no engine on the hardware, semantics "
-               "undocumented)";
-        return false;
-      }
+      // there is nothing to match: the operation and its graph finalize, the
+      // heuristics offer no configuration and cudnn-frontend's
+      // create_execution_plans fails with "No valid engine configs", as on
+      // that hardware (an interpolation window of anything but 2 is refused
+      // earlier, when the resample descriptor is finalized).
+      if (interp)
+        op->gap = "CUDNN_STATUS_NOT_SUPPORTED; Reason: no engine supports resampling by nearest or bilinear interpolation";
       op->padding = static_cast<cudnnPaddingMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_ZERO_PAD));
       op->nsp = static_cast<int>(rd->i64(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS));
       // Each setting: integers, or fractions (interpolation's strides and
@@ -1123,6 +1136,109 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         }
       return true;
     }
+    case CUDNN_BACKEND_OPERATION_ROPE_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_ROPE_BWD_DESCRIPTOR: {
+      // Rotary position embedding (non-interleaved), per position s with
+      // angles a_j = freqs[s, j], j below half the rotated width r:
+      //   y[j] = x[j] c_j - x[j + r/2] s_j,  y[j + r/2] = x[j + r/2] c_j + x[j] s_j
+      // on the last r elements of the head dimension, c = scale cos a,
+      // s = scale sin a; the first D - r elements are x scaled (measured on
+      // an RTX 3060, bf16 and fp16, through a RoPE + attention graph, the
+      // only graph shape its engines run). The backward pass is the inverse
+      // rotation, scaled alike.
+      const bool fwd = d->type == CUDNN_BACKEND_OPERATION_ROPE_FWD_DESCRIPTOR;
+      op->kind = Kind::Rope;
+      op->out_scale = scalar(d, fwd ? CUDNN_ATTR_OPERATION_ROPE_FWD_OUTPUT_SCALE : CUDNN_ATTR_OPERATION_ROPE_BWD_OUTPUT_SCALE, 1.0);
+      op->rope_dim = d->i64(fwd ? CUDNN_ATTR_OPERATION_ROPE_FWD_ROPE_DIM : CUDNN_ATTR_OPERATION_ROPE_BWD_ROPE_DIM, 0);
+      op->rope_bwd = !fwd;
+      if (!take(fwd ? CUDNN_ATTR_OPERATION_ROPE_FWD_YDESC : CUDNN_ATTR_OPERATION_ROPE_BWD_DXDESC, kY, true, true) ||
+          !take(fwd ? CUDNN_ATTR_OPERATION_ROPE_FWD_XDESC : CUDNN_ATTR_OPERATION_ROPE_BWD_DYDESC, kX, true, false) ||
+          !take(fwd ? CUDNN_ATTR_OPERATION_ROPE_FWD_FREQSDESC : CUDNN_ATTR_OPERATION_ROPE_BWD_FREQSDESC, kFreqs, true, false))
+        return false;
+      const vc::Layout &X = op->in[op->role[kX]].l, &F = op->in[op->role[kFreqs]].l;
+      if (!op->out.l.same_dims(X)) { *why = "rotary embedding: x and y must have the same dimensions"; return false; }
+      const int64_t D = X.dims[X.rank - 1], r = op->rope_dim ? op->rope_dim : D;
+      if (X.rank != 4 || F.rank != 4 || r < 2 || r > D || r % 2 || F.dims[3] != r || F.dims[1] != 1 || F.dims[2] != 1 ||
+          F.dims[0] < X.dims[2]) {
+        *why = "rotary embedding: x is [B, H, S, D], the frequencies [S, 1, 1, rotated width] with an even width of at most D";
+        return false;
+      }
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR: {
+      // Mixture-of-experts grouped matmul (measured on an RTX 3060, fp16,
+      // bf16 and fp32): token rows are grouped by expert, the groups being
+      // the first_token_offset entries (B * E of them, group g using expert
+      // g % E; group g holds the rows from its offset to the next group's,
+      // the first from row 0 and the last to the end), and
+      //   NONE:    out[i] = token[i] W[e(i)]
+      //   GATHER:  out[i] = token[index[i]] W[e(i)]            (i over the index's rows)
+      //   SCATTER: out[index[i] * top_k + ks[i]] = token[i] W[e(i)]
+      op->kind = Kind::MoeFwd;
+      op->moe_mode = d->i64(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_MODE, CUDNN_MOE_GROUPED_MATMUL_MODE_NONE);
+      op->top_k = d->i64(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_TOP_K, 1);
+      if (op->moe_mode < CUDNN_MOE_GROUPED_MATMUL_MODE_NONE || op->moe_mode > CUDNN_MOE_GROUPED_MATMUL_MODE_SCATTER) {
+        *why = "MoE grouped matmul: the routing mode is not defined";
+        return false;
+      }
+      if (!take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_OUTPUT_DESC, kY, true, true) ||
+          !take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_TOKEN_DESC, kX, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_WEIGHT_DESC, kWeight, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_FIRST_TOKEN_OFFSET_DESC, kFirstOffset, true, false) ||
+          !take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_TOKEN_INDEX_DESC, kTokenIndex, false, false) ||
+          !take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_TOKEN_KS_DESC, kTokenKs, false, false))
+        return false;
+      const vc::Layout &Tk = op->in[op->role[kX]].l, &W = op->in[op->role[kWeight]].l, &Off = op->in[op->role[kFirstOffset]].l,
+                       &Y = op->out.l;
+      auto floating = [](cudnnDataType_t t) { return t == CUDNN_DATA_HALF || t == CUDNN_DATA_BFLOAT16 || t == CUDNN_DATA_FLOAT; };
+      if (!floating(Tk.type) || Tk.type != W.type || !floating(Y.type)) {
+        *why = "MoE grouped matmul: only half, bfloat16 and float tokens and weights are supported";
+        return false;
+      }
+      const bool gather = op->moe_mode == CUDNN_MOE_GROUPED_MATMUL_MODE_GATHER, scatter = op->moe_mode == CUDNN_MOE_GROUPED_MATMUL_MODE_SCATTER;
+      if ((gather || scatter) && op->role[kTokenIndex] < 0) { *why = "MoE grouped matmul: gather and scatter need the token index"; return false; }
+      if (scatter && (op->role[kTokenKs] < 0 || op->top_k < 1)) { *why = "MoE grouped matmul: scatter needs the token ks and a top-k"; return false; }
+      for (int r : {kFirstOffset, kTokenIndex, kTokenKs})
+        if (op->role[r] >= 0 && op->in[op->role[r]].l.type != CUDNN_DATA_INT32) { *why = "MoE grouped matmul: the offsets and indices are INT32"; return false; }
+      if (Tk.rank != 3 || W.rank != 3 || Y.rank != 3 || Off.rank != 3 || Tk.dims[0] != 1 || Y.dims[0] != 1 || Tk.dims[2] != W.dims[1] ||
+          Y.dims[2] != W.dims[2] || Off.count() % static_cast<size_t>(W.dims[0]) != 0) {
+        *why = "MoE grouped matmul: token [1, rows, K], weight [E, K, N], output [1, rows, N] and B * E offsets do not fit together";
+        return false;
+      }
+      const int64_t rows_in = gather ? op->in[op->role[kTokenIndex]].l.count() : Tk.dims[1];
+      if (Y.dims[1] != rows_in) { *why = "MoE grouped matmul: the output has one row per routed token"; return false; }
+      // The card computes a bf16 product only in float: with the compute
+      // type of bf16 itself (what cudnn-frontend passes for a graph made in
+      // bf16) it finds no engine.
+      const int64_t math = d->i64(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_MATH_PREC, CUDNN_DATA_FLOAT);
+      if (Tk.type == CUDNN_DATA_BFLOAT16 && math != CUDNN_DATA_FLOAT)
+        op->gap = "CUDNN_STATUS_NOT_SUPPORTED_DATA_TYPE; Reason: MOE grouped matmul: input/compute type mismatch";
+      return true;
+    }
+    case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_CONTRACT_BAND_MATRIX_DESCRIPTOR: {
+      // Operations an RTX 3060 (cuDNN 9.27) finalizes and builds a graph
+      // from but offers no engine for -- measured: the heuristics return
+      // nothing for the band-matrix operations (which cudnn-frontend never
+      // emits) and the MoE backward pass (Hopper and Blackwell, and a
+      // cuBLASLt newer than 13.1) -- so there is no result to match and no
+      // layout to learn: they are never run.
+      op->kind = Kind::NoEngine;
+      const bool moe = d->type == CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
+      const bool expand = d->type == CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR;
+      if (!take(moe ? CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_BWD_DWEIGHT_DESC
+                    : expand ? CUDNN_ATTR_OPERATION_EXPAND_BAND_MATRIX_YDESC : CUDNN_ATTR_OPERATION_CONTRACT_BAND_MATRIX_YDESC,
+                kY, true, true) ||
+          !take(moe ? CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_BWD_DOUTPUT_DESC
+                    : expand ? CUDNN_ATTR_OPERATION_EXPAND_BAND_MATRIX_XDESC : CUDNN_ATTR_OPERATION_CONTRACT_BAND_MATRIX_XDESC,
+                kX, true, false))
+        return false;
+      if (moe && !take(CUDNN_ATTR_OPERATION_MOE_GROUPED_MATMUL_BWD_TOKEN_DESC, kWeight, true, false)) return false;
+      op->gap = moe ? "CUDNN_STATUS_NOT_SUPPORTED; Reason: MoE grouped matmul backward has no engine for this GPU and cuBLASLt"
+                    : "CUDNN_STATUS_NOT_SUPPORTED; Reason: no engine supports the band-matrix operations on this GPU";
+      return true;
+    }
     case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR: {
       // y[b, h, s, d] = container[table[b, s / bs], h, s % bs, d] for s below
       // the batch's sequence length (y may be K's transpose, through its strides).
@@ -1145,17 +1261,19 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       op->kind = fwd ? Kind::SdpaFwd : Kind::SdpaBwd;
       bool ok;
       if (fwd) {
-        if (d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC)) {
-          *why = "scaled dot-product attention: block masks are not supported";
-          return false;
-        }
-        for (cudnnBackendAttributeName_t n : {CUDNN_ATTR_OPERATION_SDPA_FWD_CU_SEQ_LEN_QDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_CU_SEQ_LEN_KVDESC,
-                                              CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_KDESC,
+        // A block mask finalizes, but cuDNN's only engines for it are
+        // Blackwell's and Rubin's: an RTX 3060 offers none (measured: the
+        // heuristics' configurations all fail their support check with
+        // NOT_SUPPORTED_ARCH_MISMATCH, "Block mask is only supported on
+        // Blackwell and Rubin"), and the mask's bit layout is undocumented.
+        if (d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC))
+          op->gap = "CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: Block mask is only supported on Blackwell and Rubin";
+        for (cudnnBackendAttributeName_t n : {CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_KDESC,
                                               CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_VDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_SDESC,
                                               CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_SDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_ODESC,
                                               CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_SDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_ODESC})
           if (d->desc(n)) {
-            *why = "scaled dot-product attention: cumulative sequence lengths and FP8 scaling are not supported";
+            *why = "scaled dot-product attention: FP8 scaling is not supported";
             return false;
           }
         ok = take(CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC, kO, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC, kQ, true, false) &&
@@ -1164,6 +1282,8 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_SCALEDESC, kScale, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_QDESC, kSeqQ, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_SEQ_LEN_KVDESC, kSeqKV, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_CU_SEQ_LEN_QDESC, kCuQ, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_CU_SEQ_LEN_KVDESC, kCuKV, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_KDESC, kPageK, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC, kPageV, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_SEED_DESC, kSeed, false, false) &&
@@ -1194,10 +1314,6 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
           op->softmax = sm;
         }
       } else {
-        if (d->desc(CUDNN_ATTR_OPERATION_SDPA_BWD_SINK_DESC) || d->desc(CUDNN_ATTR_OPERATION_SDPA_BWD_DSINK_DESC)) {
-          *why = "scaled dot-product attention backward: sinks are not supported";
-          return false;
-        }
         ok = take(CUDNN_ATTR_OPERATION_SDPA_BWD_DQDESC, kDQ, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_DKDESC, kDK, true, true) &&
              take(CUDNN_ATTR_OPERATION_SDPA_BWD_DVDESC, kDV, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_QDESC, kQ, true, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_BWD_KDESC, kK, true, false) && take(CUDNN_ATTR_OPERATION_SDPA_BWD_VDESC, kV, true, false) &&
@@ -1205,7 +1321,14 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
              take(CUDNN_ATTR_OPERATION_SDPA_BWD_STATSDESC, kStats, true, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_BWD_SCALEDESC, kScale, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_QDESC, kSeqQ, false, false) &&
-             take(CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_KVDESC, kSeqKV, false, false);
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_SEQ_LEN_KVDESC, kSeqKV, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_SINK_DESC, kSink, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_BWD_DSINK_DESC, kDSink, false, true);
+        // The sink's gradient needs the sink (cudnn-frontend's rule too).
+        if (ok && op->role[kDSink] >= 0 && op->role[kSink] < 0) {
+          *why = "scaled dot-product attention backward: the sink's gradient needs the sink";
+          return false;
+        }
       }
       if (!ok) return false;
       // The score modifier subgraph: a graph run on the scaled scores
@@ -1228,7 +1351,7 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       const vc::Layout &Q = op->in[op->role[kQ]].l, &K = op->in[op->role[kK]].l, &V = op->in[op->role[kV]].l;
       const vc::Layout& O = fwd ? op->out.l : op->in[op->role[kO]].l;
       const bool paged = op->role[kPageK] >= 0 || op->role[kPageV] >= 0;
-      if (paged && (op->role[kPageK] < 0 || op->role[kPageV] < 0 || op->role[kSeqKV] < 0)) {
+      if (paged && (op->role[kPageK] < 0 || op->role[kPageV] < 0 || (op->role[kSeqKV] < 0 && op->role[kCuKV] < 0))) {
         *why = "scaled dot-product attention: paged K and V need both page tables and the K/V sequence lengths";
         return false;
       }
@@ -1243,9 +1366,33 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
           *why = "scaled dot-product attention: a sequence-length tensor does not have one element per batch";
           return false;
         }
+      // Cumulative sequence lengths: one more element than batches (the
+      // running sum of the lengths, from 0), INT32, and a side gives either
+      // its length or its cumulative length, not both.
+      for (int r : {kCuQ, kCuKV}) {
+        if (op->role[r] < 0) continue;
+        const GTensor& cu = op->in[op->role[r]];
+        if (cu.l.count() != static_cast<size_t>(Q.dims[0] + 1) || cu.l.type != CUDNN_DATA_INT32) {
+          *why = "scaled dot-product attention: a cumulative sequence-length tensor must be INT32 with one element per batch and one more";
+          return false;
+        }
+        if (op->role[r == kCuQ ? kSeqQ : kSeqKV] >= 0) {
+          *why = "scaled dot-product attention: a side gives its sequence length or its cumulative one, not both";
+          return false;
+        }
+      }
       if (op->role[kScale] >= 0 && op->in[op->role[kScale]].l.count() != 1) {
         *why = "scaled dot-product attention: the scale is not a single element";
         return false;
+      }
+      if (!fwd && op->role[kSink] >= 0) {
+        vc::Layout rows;
+        rows.rank = 4, rows.dims[0] = Q.dims[0], rows.dims[1] = Q.dims[1], rows.dims[2] = Q.dims[2], rows.dims[3] = 1;
+        if (!broadcasts(op->in[op->role[kSink]].l, rows) ||
+            (op->role[kDSink] >= 0 && !broadcasts(op->more[static_cast<size_t>(op->role[kDSink] - 1)].l, rows))) {
+          *why = "scaled dot-product attention backward: the sink (and its gradient) must broadcast onto the rows";
+          return false;
+        }
       }
       return true;
     }
@@ -1328,6 +1475,29 @@ bool runnable(const Desc* graph, std::string* why) {
     return schedule_ops(graph, &order, why, any);
   }
   return schedule(graph, &order, why);
+}
+
+// Why no cuDNN engine on the RTX 3060 this follows offers one for a graph
+// that is otherwise valid (empty: one does). An operation's own reason, or:
+// rotary embedding alone -- cuDNN runs it only inside a graph with a matrix
+// multiplication or attention (the kernel-generation engine's "no MMA node"
+// refusal, measured).
+std::string engine_gap(const Desc* graph) {
+  const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
+  bool rope = false, mma = false;
+  for (int64_t i = 0; ops && i < ops->count; ++i) {
+    Op o;
+    std::string why;
+    const Desc* d = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, static_cast<size_t>(i));
+    if (!d || !op_of(d, &o, &why)) continue;
+    if (!o.gap.empty()) return o.gap;
+    rope |= o.kind == Kind::Rope;
+    mma |= o.kind == Kind::Matmul || o.kind == Kind::ConvFwd || o.kind == Kind::ConvData || o.kind == Kind::ConvFilter ||
+           o.kind == Kind::SdpaFwd || o.kind == Kind::SdpaBwd || o.kind == Kind::MoeFwd;
+  }
+  if (rope && !mma)
+    return "CUDNN_STATUS_NOT_SUPPORTED; Reason: (mmaNodeCount == 0) && !is_pointwise_fusion && (resampleNodeCount == 0)";
+  return "";
 }
 
 /* ---- running one operation ---- */
@@ -2024,6 +2194,40 @@ void run_bandmask(const Op& op, const std::vector<const std::vector<double>*>& i
   }
 }
 
+// A value as a TF32 operand: float, the low 13 mantissa bits rounded away to
+// nearest, ties away from zero (what the card's fp32 grouped matmul reads).
+double tf32(double v) {
+  float f = static_cast<float>(v);
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof x);
+  if ((x & 0x7f800000u) == 0x7f800000u) return f;
+  x = (x + 0x1000u) & 0xffffe000u;
+  std::memcpy(&f, &x, sizeof f);
+  return f;
+}
+
+// Rotary position embedding, forward or backward, as op_of defines it.
+void run_rope(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y) {
+  const vc::Layout &X = op.in[op.role[kX]].l, &F = op.in[op.role[kFreqs]].l;
+  const std::vector<double> &x = *in[op.role[kX]], &freqs = *in[op.role[kFreqs]];
+  const int64_t BH = X.dims[0] * X.dims[1], S = X.dims[2], D = X.dims[3], r = F.dims[3], nope = D - r, half = r / 2;
+  const bool bwd = op.rope_bwd;
+  y->assign(x.size(), 0.0);
+  for (int64_t bh = 0; bh < BH; ++bh)
+    for (int64_t s = 0; s < S; ++s) {
+      const size_t row = static_cast<size_t>((bh * S + s) * D);
+      for (int64_t d = 0; d < nope; ++d) (*y)[row + static_cast<size_t>(d)] = x[row + static_cast<size_t>(d)] * op.out_scale;
+      for (int64_t j = 0; j < half; ++j) {
+        const float a = static_cast<float>(freqs[static_cast<size_t>(s * r + j)]);
+        const double c = std::cos(a) * op.out_scale, sn = std::sin(a) * op.out_scale;
+        const size_t i1 = row + static_cast<size_t>(nope + j), i2 = row + static_cast<size_t>(nope + half + j);
+        const double x1 = x[i1], x2 = x[i2];
+        (*y)[i1] = bwd ? x1 * c + x2 * sn : x1 * c - x2 * sn;
+        (*y)[i2] = bwd ? x2 * c - x1 * sn : x2 * c + x1 * sn;
+      }
+    }
+}
+
 /* ---- running a graph ---- */
 
 // Runs a scheduled graph: inputs from the variant pack (device memory, or
@@ -2140,6 +2344,7 @@ struct Runner {
   }
 
   cudnnStatus_t run_sdpa(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs);
+  cudnnStatus_t run_moe(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y);
   cudnnStatus_t run_op(const Op& op);
 };
 
@@ -2171,6 +2376,20 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
   const std::vector<double>& Q = *in[op.role[kQ]];
   std::vector<double> K = *in[op.role[kK]], V = *in[op.role[kV]];
   int64_t Skv = KL.dims[2];
+  // Each batch's sequence lengths: given directly, or as the differences of
+  // cumulative ones (cu[b + 1] - cu[b]; measured on an RTX 3060: the same
+  // result as the lengths themselves, padded or ragged); the full extent
+  // when the side gives none.
+  auto lengths = [&](int seq_role, int cu_role, int64_t full) {
+    std::vector<double> l(static_cast<size_t>(B), static_cast<double>(full));
+    for (int64_t b = 0; b < B; ++b) {
+      const size_t i = static_cast<size_t>(b);
+      if (cu_role >= 0) l[i] = (*in[cu_role])[i + 1] - (*in[cu_role])[i];
+      else if (seq_role >= 0) l[i] = (*in[seq_role])[i];
+    }
+    return l;
+  };
+  const bool has_len_kv = op.role[kSeqKV] >= 0 || op.role[kCuKV] >= 0;
   if (op.role[kPageK] >= 0) {
     // Paged K and V: gather each batch's sequence from its pages.
     const vc::Layout &TK = op.in[op.role[kPageK]].l, &TV = op.in[op.role[kPageV]].l;
@@ -2178,14 +2397,17 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
     const int64_t SkvV = TV.dims[2] * VL.dims[2];
     if (SkvV < Skv) return refuse(fn, "scaled dot-product attention: V's pages cover fewer positions than K's");
     std::vector<double> k2, v2;
-    page_gather(KL, K, *in[op.role[kPageK]], TK.dims[2], B, Skv, in[op.role[kSeqKV]], &k2);
-    page_gather(VL, V, *in[op.role[kPageV]], TV.dims[2], B, Skv, in[op.role[kSeqKV]], &v2);
+    const std::vector<double> kvlen = lengths(op.role[kSeqKV], op.role[kCuKV], Skv);
+    page_gather(KL, K, *in[op.role[kPageK]], TK.dims[2], B, Skv, &kvlen, &k2);
+    page_gather(VL, V, *in[op.role[kPageV]], TV.dims[2], B, Skv, &kvlen, &v2);
     K.swap(k2), V.swap(v2);
   }
   const double scale = op.role[kScale] >= 0 ? (*in[op.role[kScale]])[0] : 1.0;
-  const bool padded = op.role[kSeqQ] >= 0 && op.role[kSeqKV] >= 0;
+  const bool padded = (op.role[kSeqQ] >= 0 || op.role[kCuQ] >= 0) && has_len_kv;
+  const std::vector<double> len_q = lengths(op.role[kSeqQ], op.role[kCuQ], Sq), len_kv = lengths(op.role[kSeqKV], op.role[kCuKV], Skv);
   auto len = [&](int r, int64_t b, int64_t full) {
-    return op.role[r] >= 0 ? std::min<int64_t>(full, static_cast<int64_t>((*in[op.role[r]])[static_cast<size_t>(b)])) : full;
+    const std::vector<double>& l = r == kSeqQ ? len_q : len_kv;
+    return std::min<int64_t>(full, static_cast<int64_t>(l[static_cast<size_t>(b)]));
   };
   const cudnnDataType_t io = op.in[op.role[kQ]].l.type;
   const size_t nS = static_cast<size_t>(B * Hq * Sq * Skv);
@@ -2261,6 +2483,21 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
   // Backward.
   const std::vector<double> &O = *in[op.role[kO]], &dO = *in[op.role[kDO]], &stats = *in[op.role[kStats]];
   std::vector<double> dQ(Q.size(), 0.0), dK(K.size(), 0.0), dV(V.size(), 0.0);
+  // The sink (one more logit per row, its probability exp(sink - stats)
+  // going to no value) takes the gradient -exp(sink - stats) * rowsum(dO O),
+  // summed over the rows that share it (measured on an RTX 3060 through
+  // cudnn-frontend's composite graph, which the card runs: dSink matches).
+  std::vector<double> dsink;
+  std::vector<size_t> sink_of_row, dsink_of_row;
+  if (op.role[kSink] >= 0) {
+    vc::Layout rows;
+    rows.rank = 4, rows.dims[0] = B, rows.dims[1] = Hq, rows.dims[2] = Sq, rows.dims[3] = 1;
+    sink_of_row = broadcast_index(op.in[op.role[kSink]].l, rows);
+    if (op.role[kDSink] >= 0) {
+      dsink.assign(op.more[static_cast<size_t>(op.role[kDSink] - 1)].l.count(), 0.0);
+      dsink_of_row = broadcast_index(op.more[static_cast<size_t>(op.role[kDSink] - 1)].l, rows);
+    }
+  }
   for (int64_t b = 0; b < B; ++b)
     for (int64_t h = 0; h < Hq; ++h) {
       const int64_t hk = h / (Hq / Hk), hv = h / (Hq / Hv);
@@ -2269,6 +2506,7 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
         if (!row_live[row]) continue;
         double Drow = 0.0;
         for (int64_t e = 0; e < Dv; ++e) Drow += dO[row * Dv + e] * O[row * Dv + e];
+        if (!dsink.empty()) dsink[dsink_of_row[row]] -= std::exp((*in[op.role[kSink]])[sink_of_row[row]] - stats[row]) * Drow;
         for (int64_t j = 0; j < Skv; ++j) {
           const double s = S[row * Skv + j];
           const double p = s == -INFINITY ? 0.0 : std::exp(s - stats[row]);
@@ -2291,10 +2529,62 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
   (*outs)[0] = std::move(dQ);
   (*outs)[op.role[kDK]] = std::move(dK);
   (*outs)[op.role[kDV]] = std::move(dV);
+  if (!dsink.empty()) (*outs)[op.role[kDSink]] = std::move(dsink);
+  return CUDNN_STATUS_SUCCESS;
+}
+
+// The MoE grouped matmul, as op_of defines it. Scatter writes only the rows
+// the index names, so the rest of the output keeps what it held.
+cudnnStatus_t Runner::run_moe(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<double>* y) {
+  const vc::Layout &Tk = op.in[op.role[kX]].l, &W = op.in[op.role[kWeight]].l, &Y = op.out.l;
+  const int64_t E = W.dims[0], K = W.dims[1], N = W.dims[2], M = Y.dims[1];
+  const std::vector<double> &tok = *in[op.role[kX]], &w = *in[op.role[kWeight]], &off = *in[op.role[kFirstOffset]];
+  const bool gather = op.moe_mode == CUDNN_MOE_GROUPED_MATMUL_MODE_GATHER, scatter = op.moe_mode == CUDNN_MOE_GROUPED_MATMUL_MODE_SCATTER;
+  const std::vector<double>* idx = op.role[kTokenIndex] >= 0 ? in[op.role[kTokenIndex]] : nullptr;
+  const std::vector<double>* ks = op.role[kTokenKs] >= 0 ? in[op.role[kTokenKs]] : nullptr;
+  const int64_t routed = gather ? static_cast<int64_t>(idx->size()) : Tk.dims[1];
+  const bool tf = Tk.type == CUDNN_DATA_FLOAT;
+  y->assign(static_cast<size_t>(M * N), 0.0);
+  if (scatter) {
+    void* p = op.out.is_virtual ? nullptr : ptr_of(op.out.uid);
+    if (p && !vc::read(Y, p, y)) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
+  const int64_t groups = static_cast<int64_t>(off.size());
+  int64_t cursor = 0;
+  auto clampi = [&](double v) { return static_cast<int64_t>(std::max(0.0, std::min(static_cast<double>(routed), v))); };
+  for (int64_t g = 0; g < groups; ++g) {
+    const int64_t start = std::max(cursor, g == 0 ? int64_t{0} : clampi(off[static_cast<size_t>(g)]));
+    const int64_t end = g + 1 < groups ? clampi(off[static_cast<size_t>(g + 1)]) : routed;
+    if (end <= start) continue;
+    cursor = end;
+    const int64_t e = g % E;
+    for (int64_t i = start; i < end; ++i) {
+      int64_t src = i, dst = i;
+      if (gather) {
+        src = static_cast<int64_t>((*idx)[static_cast<size_t>(i)]);
+        // An index outside the tokens makes the card's kernel read outside
+        // them (a fault there): refused here.
+        if (src < 0 || src >= Tk.dims[1]) return refuse(fn, "MoE grouped matmul: a token index is outside the token tensor");
+      } else if (scatter) {
+        dst = static_cast<int64_t>((*idx)[static_cast<size_t>(i)]) * op.top_k + static_cast<int64_t>((*ks)[static_cast<size_t>(i)]);
+        // A row that lands outside the output is dropped (measured).
+        if (dst < 0 || dst >= M || (*idx)[static_cast<size_t>(i)] < 0) continue;
+      }
+      for (int64_t n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (int64_t k = 0; k < K; ++k) {
+          const double a = tok[static_cast<size_t>(src * K + k)], b = w[static_cast<size_t>((e * K + k) * N + n)];
+          acc += tf ? tf32(a) * tf32(b) : a * b;
+        }
+        (*y)[static_cast<size_t>(dst * N + n)] = acc;
+      }
+    }
+  }
   return CUDNN_STATUS_SUCCESS;
 }
 
 cudnnStatus_t Runner::run_op(const Op& op) {
+  if (op.kind == Kind::NoEngine || !op.gap.empty()) return refuse(fn, "no engine for this operation: " + op.gap);
   std::vector<const std::vector<double>*> in(op.in.size());
   for (size_t i = 0; i < op.in.size(); ++i) {
     cudnnStatus_t s = input(op.in[i], &in[i]);
@@ -2335,6 +2625,13 @@ cudnnStatus_t Runner::run_op(const Op& op) {
     case Kind::Softmax: run_softmax(op, in, &outs); break;
     case Kind::BandMask: run_bandmask(op, in, &r); break;
     case Kind::PagedLoad: run_paged_load(op, in, &r); break;
+    case Kind::Rope: run_rope(op, in, &r); break;
+    case Kind::MoeFwd: {
+      cudnnStatus_t s = run_moe(op, in, &r);
+      if (s != CUDNN_STATUS_SUCCESS) return s;
+      break;
+    }
+    case Kind::NoEngine: break;
     case Kind::SdpaFwd:
     case Kind::SdpaBwd: {
       cudnnStatus_t s = run_sdpa(op, in, &outs);
@@ -2496,6 +2793,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
       {
         std::string why;
         if (!runnable(d->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH), &why)) return refuse("cudnnBackendFinalize(engine)", why);
+        if (const std::string gap = engine_gap(d->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH)); !gap.empty())
+          return refuse("cudnnBackendFinalize(engine)", "this engine does not support the operation graph: " + gap);
       }
       break;
     case CUDNN_BACKEND_ENGINECFG_DESCRIPTOR:
@@ -2529,6 +2828,12 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
     case CUDNN_BACKEND_OPERATION_SOFTMAX_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_DIAGONAL_BAND_MASK_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_PAGED_CACHE_LOAD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_ROPE_FWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_ROPE_BWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_EXPAND_BAND_MATRIX_DESCRIPTOR:
+    case CUDNN_BACKEND_OPERATION_CONTRACT_BAND_MATRIX_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR:
     case CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR: {
       // Shapes that do not fit are the caller's error; a setting this
@@ -2640,7 +2945,7 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
     // What this library computes rather than stores.
     case CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT: {
       std::string why;
-      return give_i64(runnable(d, &why) ? 1 : 0);
+      return give_i64(runnable(d, &why) && engine_gap(d).empty() ? 1 : 0);
     }
     case CUDNN_ATTR_ENGINEHEUR_RESULTS: {
       // One configuration: engine 0, no knobs. The caller made the ENGINECFG
@@ -2649,6 +2954,15 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
       std::string why;
       if (!graph || !runnable(graph, &why)) {
         if (trace()) std::fprintf(stderr, "[vgpu][trace] engine heuristics: no engine: %s\n", why.c_str());
+        return give_none();
+      }
+      // A valid graph no engine of the card offers: no configuration, as
+      // cuDNN's own filter of its heuristics' candidates leaves none (its
+      // support checks' reasons are the last error's text, which
+      // cudnn-frontend puts in "No valid engine configs for ...").
+      if (const std::string gap = engine_gap(graph); !gap.empty()) {
+        if (trace()) std::fprintf(stderr, "[vgpu][trace] engine heuristics: no engine: %s\n", gap.c_str());
+        vgpu_cudnn::set_last_error("Warning: No viable engine configs among (0) heuristics result(s). \nWarning: " + gap);
         return give_none();
       }
       if (count) *count = 1;
@@ -2761,6 +3075,7 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackend
   std::string why;
   std::vector<Op> order;
   if (!schedule(graph, &order, &why)) return refuse("cudnnBackendExecute", why);
+  if (const std::string gap = engine_gap(graph); !gap.empty()) return refuse("cudnnBackendExecute", "no engine for this graph: " + gap);
   // The variant pack: unique ids and the device pointers that go with them.
   const std::vector<int64_t> uids = v->i64s(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS);
   const Attr* ptr_attr = v->get(CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS);

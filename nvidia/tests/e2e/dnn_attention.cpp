@@ -230,6 +230,11 @@ struct Cfg {
   bool bhsd_interleaved = false;  // Q/K/V/O as [b, s, h, d] in memory
   bool ragged = false;            // packed sequences (THD), with ragged offsets; implies padding
   int64_t page = 0;               // paged K/V caches of this block size (forward only; implies padding)
+  bool sink = false;              // a per-head sink logit that joins each softmax denominator (forward and backward)
+  bool rope = false;              // rotary embeddings on Q and K feed the attention (fused, as cuDNN's engines run them); dQ and dK go back through the inverse rotation
+  int64_t rope_dim = 0;           // the width rotated (0: the whole head dimension), the rest scaled only
+  float rope_scale = 1.0f;        // the embeddings' output scale
+  int cu_seq = 0;                 // sequence lengths as cumulative sums (cu_seq_len_q/kv; unified, forward only; implies padding): 1 both sides, 2 only Q's, 3 only K/V's
 };
 
 // A ragged (THD) tensor: batch b's tokens start at offset[b] = (tokens
@@ -266,7 +271,7 @@ struct Ref {
 static Ref reference_fwd(const Cfg& c, const std::vector<double>& Q, const std::vector<double>& K,
                          const std::vector<double>& V, const std::vector<double>* bias,
                          const std::vector<int>& seq_q, const std::vector<int>& seq_kv,
-                         const std::vector<double>* mask) {
+                         const std::vector<double>* mask, const std::vector<double>* sink = nullptr) {
   Ref r;
   r.O.assign(static_cast<size_t>(c.b * c.hq * c.sq * c.dv), 0.0);
   r.stats.assign(static_cast<size_t>(c.b * c.hq * c.sq), 0.0);
@@ -289,7 +294,9 @@ static Ref reference_fwd(const Cfg& c, const std::vector<double>& Q, const std::
           mx = std::max(mx, s[j]);
         }
         if (c.padding && i >= sqb) continue;  // padded rows: not compared
-        double sum = 0;
+        // A sink is one more logit in the row's softmax whose probability goes nowhere.
+        if (sink) mx = std::max(mx, (*sink)[h]);
+        double sum = sink ? std::exp((*sink)[h] - mx) : 0.0;
         for (int64_t j = 0; j < c.skv; ++j) sum += s[j] == -INFINITY ? 0.0 : std::exp(s[j] - mx);
         r.stats[(bb * c.hq + h) * c.sq + i] = mx + std::log(sum);
         for (int64_t j = 0; j < c.skv; ++j) {
@@ -306,12 +313,14 @@ static Ref reference_fwd(const Cfg& c, const std::vector<double>& Q, const std::
 }
 
 struct Grads {
-  std::vector<double> dQ, dK, dV, dBias;
+  std::vector<double> dQ, dK, dV, dBias, dSink;
 };
 static Grads reference_bwd(const Cfg& c, const std::vector<double>& Q, const std::vector<double>& K,
                            const std::vector<double>& V, const Ref& f, const std::vector<double>& dO,
-                           const std::vector<int>& seq_q, const std::vector<double>* mask) {
+                           const std::vector<int>& seq_q, const std::vector<double>* mask,
+                           const std::vector<double>* sink = nullptr) {
   Grads g;
+  g.dSink.assign(static_cast<size_t>(c.hq), 0.0);
   g.dQ.assign(Q.size(), 0.0);
   g.dK.assign(K.size(), 0.0);
   g.dV.assign(V.size(), 0.0);
@@ -326,6 +335,8 @@ static Grads reference_bwd(const Cfg& c, const std::vector<double>& Q, const std
         double D = 0;
         for (int64_t e = 0; e < c.dv; ++e)
           D += dO[((bb * c.hq + h) * c.sq + i) * c.dv + e] * f.O[((bb * c.hq + h) * c.sq + i) * c.dv + e];
+        // The sink's probability exp(sink - stats) takes no part in O, so its gradient is -p_sink * D.
+        if (sink) g.dSink[h] -= std::exp((*sink)[h] - f.stats[(bb * c.hq + h) * c.sq + i]) * D;
         for (int64_t j = 0; j < c.skv; ++j) {
           const size_t pi = static_cast<size_t>(((bb * c.hq + h) * c.sq + i) * c.skv + j);
           const double p = f.P[pi], m = mask ? (*mask)[pi] * ks : 1.0;
@@ -345,6 +356,27 @@ static Grads reference_bwd(const Cfg& c, const std::vector<double>& Q, const std
       }
     }
   return g;
+}
+
+// Rotary embedding (non-interleaved) of x [B*H, S, D] with angles fr [S, r] (r = the rotated
+// width): the last r elements of a row rotate in pairs (j, j + r/2) by fr[s][j], all scaled; the
+// leading D - r are scaled only. bwd: the inverse rotation. Measured on an RTX 3060.
+static std::vector<double> rope_ref(const std::vector<double>& x, const std::vector<double>& fr, int64_t BH, int64_t S, int64_t D,
+                                    int64_t r, double scale, bool bwd) {
+  std::vector<double> y(x.size());
+  const int64_t nope = D - r, half = r / 2;
+  for (int64_t bh = 0; bh < BH; ++bh)
+    for (int64_t s = 0; s < S; ++s) {
+      const size_t row = static_cast<size_t>((bh * S + s) * D);
+      for (int64_t d = 0; d < nope; ++d) y[row + d] = x[row + d] * scale;
+      for (int64_t j = 0; j < half; ++j) {
+        const double a = fr[static_cast<size_t>(s * r + j)], c = std::cos(a) * scale, sn = std::sin(a) * scale;
+        const double x1 = x[row + nope + j], x2 = x[row + nope + half + j];
+        y[row + nope + j] = bwd ? x1 * c + x2 * sn : x1 * c - x2 * sn;
+        y[row + nope + half + j] = bwd ? x2 * c - x1 * sn : x2 * c + x1 * sn;
+      }
+    }
+  return y;
 }
 
 // ---- running a graph -------------------------------------------------------------
@@ -415,12 +447,31 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   std::vector<double> sq_d(seq_q.begin(), seq_q.end()), skv_d(seq_kv.begin(), seq_kv.end());
   auto SeqQ = make_buf(fe::DataType_t::INT32, {c.b, 1, 1, 1}, {1, 1, 1, 1}, sq_d);
   auto SeqKV = make_buf(fe::DataType_t::INT32, {c.b, 1, 1, 1}, {1, 1, 1, 1}, skv_d);
+  // Cumulative sequence lengths: cu[b + 1] = cu[b] + length[b], in tokens.
+  std::vector<double> cuq_d(static_cast<size_t>(c.b + 1), 0.0), cukv_d(static_cast<size_t>(c.b + 1), 0.0);
+  for (int64_t i = 0; i < c.b; ++i) cuq_d[i + 1] = cuq_d[i] + seq_q[i], cukv_d[i + 1] = cukv_d[i] + seq_kv[i];
+  auto CuQ = make_buf(fe::DataType_t::INT32, {c.b + 1, 1, 1, 1}, {1, 1, 1, 1}, cuq_d);
+  auto CuKV = make_buf(fe::DataType_t::INT32, {c.b + 1, 1, 1, 1}, {1, 1, 1, 1}, cukv_d);
+  const auto Sinkv = randoms(static_cast<size_t>(c.hq), 6, -1.0, 1.0);
+  auto Sink = make_buf(fe::DataType_t::FLOAT, {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, Sinkv);
+  auto dSink = make_buf(fe::DataType_t::FLOAT, {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, {});
+  // Rotary embeddings: angles [max(S_q, S_kv), 1, 1, r], the rotated Q and K the library hands back.
+  const int64_t rope_r = c.rope_dim ? c.rope_dim : c.d, rope_s = std::max(c.sq, c.skv);
+  const auto Freqv = [&] {
+    std::vector<double> f(static_cast<size_t>(rope_s * rope_r));
+    for (int64_t s2 = 0; s2 < rope_s; ++s2)
+      for (int64_t j = 0; j < rope_r; ++j) f[s2 * rope_r + j] = static_cast<double>(static_cast<float>(0.07 * (s2 + 1) * (1 + (j % (rope_r / 2)) * 0.31)));
+    return f;
+  }();
+  auto Freqs = make_buf(fe::DataType_t::FLOAT, {rope_s, 1, 1, rope_r}, {rope_r, rope_r, rope_r, 1}, Freqv);
+  auto QRot = make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), {});
+  auto KRot = make_buf(T, {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d), {});
   int64_t seed_v = 1234567, offset_v = 89;
   auto Seed = make_buf(fe::DataType_t::INT64, {1, 1, 1, 1}, {1, 1, 1, 1}, {static_cast<double>(seed_v)});
   auto Offset = make_buf(fe::DataType_t::INT64, {1, 1, 1, 1}, {1, 1, 1, 1}, {static_cast<double>(offset_v)});
 
   enum : int64_t { kQ = 1, kK, kV, kO, kStats, kBias, kSeqQ, kSeqKV, kSeed, kOffset, kMask, kdO, kdQ, kdK, kdV, kdBias, kRagQ, kRagKV,
-                   kTableK, kTableV };
+                   kTableK, kTableV, kSink, kdSink, kCuQ, kCuKV, kFreqs, kQRot, kKRot, kdQRaw };
   // Paged K and V: each batch's sequence in pages of c.page positions,
   // scattered over a container of blocks in a shuffled order the page table
   // records.
@@ -483,10 +534,18 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     opts.set_paged_attention_max_seq_len_kv(static_cast<int>(c.skv));
   }
   if (c.bias) opts.set_bias(tensor(fg, kBias, "bias", {1, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}));
-  if (c.padding)
-    opts.set_padding_mask(true)
-        .set_seq_len_q(tensor(fg, kSeqQ, "seq_q", {c.b, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32))
-        .set_seq_len_kv(tensor(fg, kSeqKV, "seq_kv", {c.b, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32));
+  if (c.padding) {
+    opts.set_padding_mask(true);
+    if (c.cu_seq == 1 || c.cu_seq == 2)
+      opts.set_cu_seq_len_q(tensor(fg, kCuQ, "cu_seq_q", {c.b + 1, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32));
+    else
+      opts.set_seq_len_q(tensor(fg, kSeqQ, "seq_q", {c.b, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32));
+    if (c.cu_seq == 1 || c.cu_seq == 3)
+      opts.set_cu_seq_len_kv(tensor(fg, kCuKV, "cu_seq_kv", {c.b + 1, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32));
+    else
+      opts.set_seq_len_kv(tensor(fg, kSeqKV, "seq_kv", {c.b, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32));
+  }
+  if (c.sink) opts.set_sink_token(tensor(fg, kSink, "sink", {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, fe::DataType_t::FLOAT));
   if (dropout) {
     auto sd = tensor(fg, kSeed, "seed", {1, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT64);
     auto of = tensor(fg, kOffset, "offset", {1, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT64);
@@ -494,7 +553,18 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     opts.set_rng_dump(tensor(fg, kMask, "rng_dump", {c.b, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1},
                              fe::DataType_t::FLOAT));
   }
-  auto [o, stats] = fg.sdpa(q, k, v, opts);
+  std::shared_ptr<fe::graph::Tensor_attributes> sq_in = q, sk_in = k;
+  if (c.rope) {
+    auto fr = tensor(fg, kFreqs, "freqs", {rope_s, 1, 1, rope_r}, {rope_r, rope_r, rope_r, 1}, fe::DataType_t::FLOAT);
+    auto ra = fe::graph::RoPE_attributes().set_name("rope_q").set_output_scale(c.rope_scale);
+    auto rb = fe::graph::RoPE_attributes().set_name("rope_k").set_output_scale(c.rope_scale);
+    if (c.rope_dim) ra.set_rope_dim(c.rope_dim), rb.set_rope_dim(c.rope_dim);
+    sq_in = fg.rope(q, fr, ra);
+    sq_in->set_output(true).set_uid(kQRot).set_data_type(T).set_dim({c.b, c.hq, c.sq, c.d}).set_stride(strides_of(c, c.hq, c.sq, c.d));
+    sk_in = fg.rope(k, fr, rb);
+    sk_in->set_output(true).set_uid(kKRot).set_data_type(T).set_dim({c.b, c.hk, c.skv, c.d}).set_stride(strides_of(c, c.hk, c.skv, c.d));
+  }
+  auto [o, stats] = fg.sdpa(sq_in, sk_in, v, opts);
   o->set_output(true).set_uid(kO).set_dim({c.b, c.hq, c.sq, c.dv}).set_stride(strides_of(c, c.hq, c.sq, c.dv));
   if (stats) stats->set_output(true).set_uid(kStats).set_data_type(fe::DataType_t::FLOAT);
   if (c.ragged) o->set_ragged_offset(frq);
@@ -503,7 +573,12 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   if (c.ragged) pack[kRagQ] = RagQ->d->p, pack[kRagKV] = RagKV->d->p;
   if (c.backward) pack[kStats] = Stats->d->p;
   if (c.bias) pack[kBias] = Bias->d->p;
-  if (c.padding) pack[kSeqQ] = SeqQ->d->p, pack[kSeqKV] = SeqKV->d->p;
+  if (c.padding) {
+    if (c.cu_seq == 1 || c.cu_seq == 2) pack[kCuQ] = CuQ->d->p; else pack[kSeqQ] = SeqQ->d->p;
+    if (c.cu_seq == 1 || c.cu_seq == 3) pack[kCuKV] = CuKV->d->p; else pack[kSeqKV] = SeqKV->d->p;
+  }
+  if (c.sink) pack[kSink] = Sink->d->p;
+  if (c.rope) pack[kFreqs] = Freqs->d->p, pack[kQRot] = QRot->d->p, pack[kKRot] = KRot->d->p;
   if (dropout) pack[kSeed] = Seed->d->p, pack[kOffset] = Offset->d->p, pack[kMask] = Mask->d->p;
   const std::string fwd_name = c.name + " forward";
   const int ran = build_and_run(fwd_name.c_str(), fg, handle, pack);
@@ -522,7 +597,18 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     expect(c.name + ": the dropout mask is 0/1 and keeps about 1 - p", !bad && std::fabs(frac - (1.0 - c.dropout)) < 0.08,
            frac);
   }
-  const Ref ref = reference_fwd(c, Q->v, K->v, V->v, c.bias ? &Bias->v : nullptr, seq_q, seq_kv, dropout ? &maskv : nullptr);
+  // The queries and keys the attention saw: the rotated ones, which the library hands back and
+  // which are checked against the reference rotation (to the rounding of the output type).
+  std::vector<double> Qeff = Q->v, Keff = K->v;
+  if (c.rope) {
+    const std::vector<double> qr = rope_ref(Q->v, Freqv, c.b * c.hq, c.sq, c.d, rope_r, c.rope_scale, false);
+    const std::vector<double> kr = rope_ref(K->v, Freqv, c.b * c.hk, c.skv, c.d, rope_r, c.rope_scale, false);
+    Qeff = read_buf(*QRot), Keff = read_buf(*KRot);
+    expect(c.name + ": the rotated queries", err_of(Qeff, qr) < tol, err_of(Qeff, qr));
+    expect(c.name + ": the rotated keys", err_of(Keff, kr) < tol, err_of(Keff, kr));
+  }
+  const Ref ref = reference_fwd(c, Qeff, Keff, V->v, c.bias ? &Bias->v : nullptr, seq_q, seq_kv, dropout ? &maskv : nullptr,
+                                c.sink ? &Sinkv : nullptr);
   std::vector<double> got = read_buf(*O), want = ref.O;
   if (c.padding)  // rows past a batch's sequence length are the library's own
     for (int64_t bb = 0; bb < c.b; ++bb)
@@ -555,6 +641,10 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   common(bg);
   auto bq = tensor(bg, kQ, "Q", {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d));
   auto bk = tensor(bg, kK, "K", {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d));
+  // With rotary embeddings the backward pass is given the rotated Q and K, and its dQ goes back
+  // through the inverse rotation.
+  auto QRB = c.rope ? make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), Qeff) : nullptr;
+  auto KRB = c.rope ? make_buf(T, {c.b, c.hk, c.skv, c.d}, strides_of(c, c.hk, c.skv, c.d), Keff) : nullptr;
   auto bv = tensor(bg, kV, "V", {c.b, c.hk, c.skv, c.dv}, strides_of(c, c.hk, c.skv, c.dv));
   auto bo = tensor(bg, kO, "O", {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv));
   auto bdo = tensor(bg, kdO, "dO", {c.b, c.hq, c.sq, c.dv}, strides_of(c, c.hq, c.sq, c.dv));
@@ -580,6 +670,10 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     bopts.set_bias(tensor(bg, kBias, "bias", {1, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}));
     bopts.set_dbias(tensor(bg, kdBias, "dbias", {1, c.hq, c.sq, c.skv}, {c.hq * c.sq * c.skv, c.sq * c.skv, c.skv, 1}));
   }
+  if (c.sink) {
+    bopts.set_sink_token(tensor(bg, kSink, "sink", {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, fe::DataType_t::FLOAT));
+    bopts.set_dsink_token(tensor(bg, kdSink, "dsink", {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, fe::DataType_t::FLOAT));
+  }
   if (c.padding)
     bopts.set_padding_mask(true)
         .set_seq_len_q(tensor(bg, kSeqQ, "seq_q", {c.b, 1, 1, 1}, {1, 1, 1, 1}, fe::DataType_t::INT32))
@@ -592,14 +686,25 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
                               fe::DataType_t::FLOAT));
   }
   auto [dq, dk, dv] = bg.sdpa_backward(bq, bk, bv, bo, bdo, bst, bopts);
+  if (c.rope) {
+    auto fr = tensor(bg, kFreqs, "freqs", {rope_s, 1, 1, rope_r}, {rope_r, rope_r, rope_r, 1}, fe::DataType_t::FLOAT);
+    auto ra = fe::graph::RoPE_backward_attributes().set_name("rope_q_bwd").set_output_scale(c.rope_scale);
+    if (c.rope_dim) ra.set_rope_dim(c.rope_dim);
+    // dQ, before its rotation, is an output too: the library reads its pointer.
+    dq->set_output(true).set_uid(kdQRaw).set_data_type(T).set_dim({c.b, c.hq, c.sq, c.d}).set_stride(strides_of(c, c.hq, c.sq, c.d));
+    dq = bg.rope_backward(dq, fr, ra);  // (cuDNN's engines take one inverse rotation, dQ's, in this graph)
+  }
   dq->set_output(true).set_uid(kdQ).set_dim({c.b, c.hq, c.sq, c.d}).set_stride(strides_of(c, c.hq, c.sq, c.d));
   dk->set_output(true).set_uid(kdK).set_dim({c.b, c.hk, c.skv, c.d}).set_stride(strides_of(c, c.hk, c.skv, c.d));
   dv->set_output(true).set_uid(kdV).set_dim({c.b, c.hk, c.skv, c.dv}).set_stride(strides_of(c, c.hk, c.skv, c.dv));
   if (c.ragged) dq->set_ragged_offset(brq), dk->set_ragged_offset(brkv), dv->set_ragged_offset(brkv);
-  Var bpack{{kQ, Q->d->p}, {kK, K->d->p}, {kV, V->d->p}, {kO, Og->d->p}, {kdO, dO->d->p}, {kStats, Stats->d->p},
+  Var bpack{{kQ, c.rope ? QRB->d->p : Q->d->p}, {kK, c.rope ? KRB->d->p : K->d->p}, {kV, V->d->p}, {kO, Og->d->p}, {kdO, dO->d->p}, {kStats, Stats->d->p},
             {kdQ, dQ->d->p}, {kdK, dK->d->p}, {kdV, dV->d->p}};
   if (c.bias) bpack[kBias] = Bias->d->p, bpack[kdBias] = dBias->d->p;
   if (c.padding) bpack[kSeqQ] = SeqQ->d->p, bpack[kSeqKV] = SeqKV->d->p;
+  if (c.sink) bpack[kSink] = Sink->d->p, bpack[kdSink] = dSink->d->p;
+  auto dQRaw = c.rope ? make_buf(T, {c.b, c.hq, c.sq, c.d}, strides_of(c, c.hq, c.sq, c.d), {}) : nullptr;
+  if (c.rope) bpack[kFreqs] = Freqs->d->p, bpack[kdQRaw] = dQRaw->d->p;
   if (c.ragged) bpack[kRagQ] = RagQ->d->p, bpack[kRagKV] = RagKV->d->p;
   if (dropout) bpack[kSeed] = Seed->d->p, bpack[kOffset] = Offset->d->p, bpack[kMask] = Mask2->d->p;
   const std::string bwd_name = c.name + " backward";
@@ -613,7 +718,11 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
     const auto m2 = read_buf(*Mask2);
     expect(c.name + ": the backward pass regenerates the forward pass's dropout mask", m2 == maskv);
   }
-  const Grads gr = reference_bwd(c, Q->v, K->v, V->v, fref, dO->v, seq_q, dropout ? &maskv : nullptr);
+  Grads gr = reference_bwd(c, Qeff, Keff, V->v, fref, dO->v, seq_q, dropout ? &maskv : nullptr,
+                                 c.sink ? &Sinkv : nullptr);
+  if (c.rope) {
+    gr.dQ = rope_ref(gr.dQ, Freqv, c.b * c.hq, c.sq, c.d, rope_r, c.rope_scale, true);
+  }
   // Gradients sum over a sequence: allow for that in the tolerance.
   const double gtol = tol * 4;
   auto check = [&](const char* n, const Buf& b, const std::vector<double>& want_all, bool q_rows) {
@@ -630,6 +739,147 @@ static void run(const Cfg& c, cudnnHandle_t handle) {
   check("dK", *dK, gr.dK, false);
   check("dV", *dV, gr.dV, false);
   if (c.bias) check("dBias", *dBias, gr.dBias, false);
+  if (c.sink) {
+    const double er = err_of(read_buf(*dSink), gr.dSink);
+    expect(bwd_name + ": dSink", er < gtol, er);
+  }
+}
+
+// ---- the backend's attention backward operation, with a sink --------------------------------------
+
+// cudnn-frontend never emits CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR (its backward is the composite
+// graph), so this one is built by hand. cuDNN's only engines for it are Blackwell's: an RTX 3060 offers
+// none and the check is skipped there. Its sink semantics are those of the composite graph's, which the
+// card runs and the checks above compare with the same reference: the sink is one more logit of every
+// softmax row whose probability exp(sink - stats) goes to no value, and its gradient is
+// -exp(sink - stats) * rowsum(dO * O), summed over the rows that share it.
+using Desc = cudnnBackendDescriptor_t;
+static Desc make_desc(cudnnBackendDescriptorType_t t) {
+  Desc d = nullptr;
+  cudnnBackendCreateDescriptor(t, &d);
+  return d;
+}
+static void set_attr(Desc d, cudnnBackendAttributeName_t n, cudnnBackendAttributeType_t t, int64_t count, const void* v) {
+  cudnnBackendSetAttribute(d, n, t, count, v);
+}
+static Desc raw_tensor(int64_t uid, cudnnDataType_t t, const std::vector<int64_t>& dim, bool by_value = false) {
+  Desc d = make_desc(CUDNN_BACKEND_TENSOR_DESCRIPTOR);
+  std::vector<int64_t> str(dim.size(), 1);
+  for (size_t i = dim.size() - 1; i-- > 0;) str[i] = str[i + 1] * dim[i + 1];
+  const int64_t align = 16;
+  set_attr(d, CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_TYPE_DATA_TYPE, 1, &t);
+  set_attr(d, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64, static_cast<int64_t>(dim.size()), dim.data());
+  set_attr(d, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64, static_cast<int64_t>(str.size()), str.data());
+  set_attr(d, CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64, 1, &uid);
+  set_attr(d, CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, CUDNN_TYPE_INT64, 1, &align);
+  if (by_value) set_attr(d, CUDNN_ATTR_TENSOR_IS_BY_VALUE, CUDNN_TYPE_BOOLEAN, 1, &by_value);
+  cudnnBackendFinalize(d);
+  return d;
+}
+
+static void raw_sdpa_backward(cudnnHandle_t handle) {
+  Cfg c;
+  c.name = "raw SDPA backward operation, half, sink";
+  c.impl = fe::AttentionImplementation_t::UNIFIED;
+  c.sink = true;
+  const fe::DataType_t T = c.io;
+  const auto Qv = randoms(static_cast<size_t>(c.b * c.hq * c.sq * c.d), 1), Kv = randoms(static_cast<size_t>(c.b * c.hk * c.skv * c.d), 2),
+             Vv = randoms(static_cast<size_t>(c.b * c.hk * c.skv * c.dv), 3), dOv = randoms(static_cast<size_t>(c.b * c.hq * c.sq * c.dv), 4),
+             Sinkv = randoms(static_cast<size_t>(c.hq), 6, -1.0, 1.0);
+  const std::vector<int> none;
+  auto Q = make_buf(T, {c.b, c.hq, c.sq, c.d}, {c.hq * c.sq * c.d, c.sq * c.d, c.d, 1}, Qv);
+  auto K = make_buf(T, {c.b, c.hk, c.skv, c.d}, {c.hk * c.skv * c.d, c.skv * c.d, c.d, 1}, Kv);
+  auto V = make_buf(T, {c.b, c.hk, c.skv, c.dv}, {c.hk * c.skv * c.dv, c.skv * c.dv, c.dv, 1}, Vv);
+  Ref ref = reference_fwd(c, Q->v, K->v, V->v, nullptr, none, none, nullptr, &Sinkv);
+  for (double& x : ref.O) x = round_to(T, x);
+  auto O = make_buf(T, {c.b, c.hq, c.sq, c.dv}, {c.hq * c.sq * c.dv, c.sq * c.dv, c.dv, 1}, ref.O);
+  auto dO = make_buf(T, {c.b, c.hq, c.sq, c.dv}, {c.hq * c.sq * c.dv, c.sq * c.dv, c.dv, 1}, dOv);
+  auto Stats = make_buf(fe::DataType_t::FLOAT, {c.b, c.hq, c.sq, 1}, {c.hq * c.sq, c.sq, 1, 1}, ref.stats);
+  auto Sink = make_buf(fe::DataType_t::FLOAT, {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, Sinkv);
+  auto dQ = make_buf(T, {c.b, c.hq, c.sq, c.d}, {c.hq * c.sq * c.d, c.sq * c.d, c.d, 1}, {});
+  auto dK = make_buf(T, {c.b, c.hk, c.skv, c.d}, {c.hk * c.skv * c.d, c.skv * c.d, c.d, 1}, {});
+  auto dV = make_buf(T, {c.b, c.hk, c.skv, c.dv}, {c.hk * c.skv * c.dv, c.skv * c.dv, c.dv, 1}, {});
+  auto dSink = make_buf(fe::DataType_t::FLOAT, {1, c.hq, 1, 1}, {c.hq, 1, 1, 1}, {});
+  const cudnnDataType_t h16 = CUDNN_DATA_HALF, f32 = CUDNN_DATA_FLOAT;
+  std::vector<Desc> keep;
+  auto tens = [&](int64_t uid, cudnnDataType_t t, std::vector<int64_t> dim, bool bv = false) {
+    keep.push_back(raw_tensor(uid, t, dim, bv));
+    return keep.back();
+  };
+  Desc op = make_desc(CUDNN_BACKEND_OPERATION_SDPA_BWD_DESCRIPTOR);
+  auto attach = [&](cudnnBackendAttributeName_t n, Desc d) { set_attr(op, n, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &d); };
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_QDESC, tens(1, h16, {c.b, c.hq, c.sq, c.d}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_KDESC, tens(2, h16, {c.b, c.hk, c.skv, c.d}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_VDESC, tens(3, h16, {c.b, c.hk, c.skv, c.dv}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_ODESC, tens(4, h16, {c.b, c.hq, c.sq, c.dv}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_DODDESC, tens(5, h16, {c.b, c.hq, c.sq, c.dv}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_STATSDESC, tens(6, f32, {c.b, c.hq, c.sq, 1}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_DQDESC, tens(7, h16, {c.b, c.hq, c.sq, c.d}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_DKDESC, tens(8, h16, {c.b, c.hk, c.skv, c.d}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_DVDESC, tens(9, h16, {c.b, c.hk, c.skv, c.dv}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_SCALEDESC, tens(10, f32, {1, 1, 1, 1}, true));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_SINK_DESC, tens(11, f32, {1, c.hq, 1, 1}));
+  attach(CUDNN_ATTR_OPERATION_SDPA_BWD_DSINK_DESC, tens(12, f32, {1, c.hq, 1, 1}));
+  if (cudnnBackendFinalize(op) != CUDNN_STATUS_SUCCESS) {
+    std::printf("skip %s (the operation does not finalize here)\n", c.name.c_str());
+    return;
+  }
+  Desc graph = make_desc(CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR);
+  set_attr(graph, CUDNN_ATTR_OPERATIONGRAPH_HANDLE, CUDNN_TYPE_HANDLE, 1, &handle);
+  set_attr(graph, CUDNN_ATTR_OPERATIONGRAPH_OPS, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &op);
+  Desc plan = nullptr;
+  if (cudnnBackendFinalize(graph) == CUDNN_STATUS_SUCCESS) {
+    for (cudnnBackendHeurMode_t mode : {CUDNN_HEUR_MODE_A, CUDNN_HEUR_MODE_FALLBACK}) {
+      Desc heur = make_desc(CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR);
+      set_attr(heur, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &graph);
+      set_attr(heur, CUDNN_ATTR_ENGINEHEUR_MODE, CUDNN_TYPE_HEUR_MODE, 1, &mode);
+      if (cudnnBackendFinalize(heur) == CUDNN_STATUS_SUCCESS) {
+        int64_t n = 0;
+        Desc cfg = make_desc(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR);
+        cudnnBackendGetAttribute(heur, CUDNN_ATTR_ENGINEHEUR_RESULTS, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &n, &cfg);
+        if (n > 0 && !plan) {
+          Desc p = make_desc(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+          set_attr(p, CUDNN_ATTR_EXECUTION_PLAN_HANDLE, CUDNN_TYPE_HANDLE, 1, &handle);
+          set_attr(p, CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, CUDNN_TYPE_BACKEND_DESCRIPTOR, 1, &cfg);
+          if (cudnnBackendFinalize(p) == CUDNN_STATUS_SUCCESS) plan = p;
+        }
+      }
+    }
+  }
+  if (!plan) {
+    if (!kOnSim) {
+      std::printf("skip %s (no engine offered on this GPU)\n", c.name.c_str());
+      return;
+    }
+    expect(c.name + " plans", false);
+    return;
+  }
+  float scale = c.scale;
+  std::vector<int64_t> uids{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  std::vector<void*> ptrs{Q->d->p, K->d->p, V->d->p, O->d->p, dO->d->p, Stats->d->p, dQ->d->p, dK->d->p, dV->d->p, &scale, Sink->d->p, dSink->d->p};
+  Desc vp = make_desc(CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR);
+  void* ws = nullptr;
+  set_attr(vp, CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR, static_cast<int64_t>(ptrs.size()), ptrs.data());
+  set_attr(vp, CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64, static_cast<int64_t>(uids.size()), uids.data());
+  set_attr(vp, CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR, 1, &ws);
+  cudnnBackendFinalize(vp);
+  const cudnnStatus_t st = cudnnBackendExecute(handle, plan, vp);
+  cudaDeviceSynchronize();
+  expect(c.name + " runs", st == CUDNN_STATUS_SUCCESS);
+  if (st == CUDNN_STATUS_SUCCESS) {
+    Ref fref = ref;
+    fref.O = O->v;
+    const Grads gr = reference_bwd(c, Q->v, K->v, V->v, fref, dO->v, none, nullptr, &Sinkv);
+    const double gtol = 4e-3 * 4;
+    const std::vector<std::pair<const char*, std::pair<const Buf*, const std::vector<double>*>>> checks{
+        {"dQ", {dQ.get(), &gr.dQ}}, {"dK", {dK.get(), &gr.dK}}, {"dV", {dV.get(), &gr.dV}}, {"dSink", {dSink.get(), &gr.dSink}}};
+    for (const auto& [n, bw] : checks) {
+      const double er = err_of(read_buf(*bw.first), *bw.second);
+      expect(c.name + ": " + n, er < gtol, er);
+    }
+  }
+  for (Desc d : keep) cudnnBackendDestroyDescriptor(d);
+  for (Desc d : {op, graph, plan, vp}) if (d) cudnnBackendDestroyDescriptor(d);
 }
 
 int main() {
@@ -673,6 +923,24 @@ int main() {
   add("half, composite, dropout", [](Cfg& c) { c.impl = I::COMPOSITE; c.dropout = 0.25f; c.sq = c.skv = 32; });
   add("float, composite", [](Cfg& c) { c.io = fe::DataType_t::FLOAT; c.impl = I::COMPOSITE; c.causal = true; });
   add("half, auto", [](Cfg& c) { c.impl = I::AUTO; c.causal = true; });
+  add("half, unified, sink", [](Cfg& c) { c.impl = I::UNIFIED; c.sink = true; c.causal = true; });
+  add("half, composite, sink", [](Cfg& c) { c.impl = I::COMPOSITE; c.sink = true; c.causal = true; });
+  add("half, unified, cumulative sequence lengths", [](Cfg& c) {
+    c.impl = I::UNIFIED; c.padding = true; c.cu_seq = 1; c.backward = false; c.causal = true;
+  });
+  add("half, unified, cumulative query lengths, plain K/V lengths", [](Cfg& c) {
+    c.impl = I::UNIFIED; c.padding = true; c.cu_seq = 2; c.backward = false;
+  });
+  add("half, unified, plain query lengths, cumulative K/V lengths", [](Cfg& c) {
+    c.impl = I::UNIFIED; c.padding = true; c.cu_seq = 3; c.backward = false; c.sq = 8; c.skv = 24;
+  });
+  add("half, unified, cumulative sequence lengths, ragged", [](Cfg& c) {
+    c.impl = I::UNIFIED; c.padding = c.ragged = true; c.cu_seq = 1; c.backward = false; c.causal = true;
+  });
+  add("half, auto, rotary embeddings", [](Cfg& c) { c.impl = I::AUTO; c.rope = true; c.d = c.dv = 64; c.causal = true; });
+  add("bfloat16, auto, rotary embeddings, rotated width 32, scaled", [](Cfg& c) {
+    c.io = fe::DataType_t::BFLOAT16; c.impl = I::AUTO; c.rope = true; c.rope_dim = 32; c.rope_scale = 0.5f; c.d = c.dv = 64;
+  });
   for (const Cfg& c : cfgs) {
     try {
       run(c, handle);
@@ -681,6 +949,7 @@ int main() {
       else std::printf("skip %s (frontend: %s)\n", c.name.c_str(), ex.what());
     }
   }
+  raw_sdpa_backward(handle);
   cudnnDestroy(handle);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
   return fails ? 1 : 0;
