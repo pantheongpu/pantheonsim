@@ -25,6 +25,7 @@ standard runners.
   More at [pantheonsim.com/ci](https://pantheonsim.com/ci/).
 - **Run it on your own machine.** [Build it](#build--test) (C++20, no
   dependencies), then `vgpu run ./your_program`.
+  Or [pull it as a container image](docs/docker.md).
 
 PantheonSim checks what your code does, not how fast it runs: there is no
 performance model, and a run on physical GPUs before a release is still the

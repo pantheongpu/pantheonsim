@@ -5066,7 +5066,7 @@ struct Machine {
   struct MatrixShape {
     uint32_t m, n, k, blocks;
     char in, out;   // 'h' a half, 'b' a bfloat16, 'c' a signed byte, 'e' an fp8, 'g' a bf8,
-                    // 'f' a float, 'd' a double, 'i' an int32
+                    // 'f' a float, 'F' an xf32 (a float with a 10-bit mantissa), 'd' a double, 'i' an int32
     char in_b = 0;  // B's type, where it is not A's
   };
   static const MatrixShape* matrix_shape(const OpName& op) {
@@ -5076,6 +5076,7 @@ struct Machine {
         bf16_16x16x16{16, 16, 16, 1, 'b', 'f'}, f16_32x32x8{32, 32, 8, 1, 'h', 'f'},
         bf16_32x32x8{32, 32, 8, 1, 'b', 'f'}, i8_32x32x16{32, 32, 16, 1, 'c', 'i'},
         f16_4x4x4_16b{4, 4, 4, 16, 'h', 'f'}, bf16_4x4x4_16b{4, 4, 4, 16, 'b', 'f'},
+        xf32_16x16x8{16, 16, 8, 1, 'F', 'f'}, xf32_32x32x4{32, 32, 4, 1, 'F', 'f'},
         f16_16x16x4_4b{16, 16, 4, 4, 'h', 'f'}, bf16_16x16x4_4b{16, 16, 4, 4, 'b', 'f'},
         i8_16x16x32{16, 16, 32, 1, 'c', 'i'}, f8_16x16x32[4] = {{16, 16, 32, 1, 'g', 'f', 'g'},
                                                                  {16, 16, 32, 1, 'g', 'f', 'e'},
@@ -5095,6 +5096,9 @@ struct Machine {
     if (op == "v_mfma_f32_32x32x16_fp8_bf8"_op) return &f8_32x32x16[2];
     if (op == "v_mfma_f32_32x32x16_fp8_fp8"_op) return &f8_32x32x16[3];
     if (op == "v_mfma_f32_16x16x16_f16"_op) return &f16_16x16x16;
+    // The reduced-precision float forms (gfx940 to gfx942): a float's mantissa cut to 10 bits.
+    if (op == "v_mfma_f32_16x16x8_xf32"_op) return &xf32_16x16x8;
+    if (op == "v_mfma_f32_32x32x4_xf32"_op) return &xf32_32x32x4;
     if (op == "v_mfma_f32_16x16x4_f32"_op) return &f32_16x16x4;
     if (op == "v_mfma_f32_32x32x2_f32"_op) return &f32_32x32x2;
     if (op == "v_mfma_f32_16x16x1_4b_f32"_op) return &f32_16x16x1_4b;
@@ -5262,6 +5266,13 @@ struct Machine {
         return static_cast<double>(h);
       }
       if (type == 'f') return static_cast<double>(as_float(reg(o, e, lane)));
+      if (type == 'F') {
+        // XF32: "32-bit floats but the mantissa truncated to 10 bits (not including the leading 1)"
+        // (the MI300 ISA guide, V_MFMA_F32_16X16X8_XF32), denormals kept. Infinities and NaNs stay.
+        uint32_t bits = reg(o, e, lane);
+        if ((bits & 0x7F800000u) != 0x7F800000u) bits &= ~0x1FFFu;
+        return static_cast<double>(as_float(bits));
+      }
       if (o.kind == OperandKind::InlineFloat) return o.fvalue;
       return as_double(reg(o, 2 * e, lane) | static_cast<uint64_t>(reg(o, 2 * e + 1, lane)) << 32);
     };
