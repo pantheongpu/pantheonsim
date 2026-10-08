@@ -1818,7 +1818,9 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         const uint64_t g = address(a, l, wide, ur, store ? 64 : 32, 0);
         uint64_t off;
-        const Space sp = generic ? classify(g, &off) : (off = g, Space::Global);
+        // A global load reads the constant window too (see kConstWindow); the other windows are for generic accesses.
+        const bool in_const = g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32);
+        const Space sp = generic || in_const ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
         space = sp == Space::Global || sp == Space::Param ? 0 : sp == Space::Shared ? 1 : 2;
         // A 32-byte access (ENL2.256) moves two register quads: a store's low

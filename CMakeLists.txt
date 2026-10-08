@@ -2130,6 +2130,13 @@ set_tests_properties(e2e_texture_filtering PROPERTIES
 
 # Layered (1D, 2D) and cubemap (plain and layered) textures, and layered
 # surfaces, compared bit for bit with results recorded on an RTX 3060.
+add_test(NAME e2e_constant_global_load
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_global_load.sh)
+set_tests_properties(e2e_constant_global_load PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
 add_test(NAME e2e_alloca_stack COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_alloca_stack.sh)
 set_tests_properties(e2e_alloca_stack PROPERTIES
   DEPENDS vgpucudart
