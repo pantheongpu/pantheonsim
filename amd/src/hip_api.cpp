@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <pthread.h>
 #include <thread>
 #include <climits>
 #include <cstddef>
