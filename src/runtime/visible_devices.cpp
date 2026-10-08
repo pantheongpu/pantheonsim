@@ -28,6 +28,14 @@ std::string lowered(std::string s) {
 
 VisibleDevices cuda_visible_devices(const DeviceProfile& profile, int machine, const char* visible, const char* order) {
   VisibleDevices out;
+  // A machine of AMD's GPUs has no CUDA device: the CUDA libraries are here
+  // because the simulator's directory holds every vendor's, but on the machine
+  // it models there is no NVIDIA driver, and a program asking CUDA for devices
+  // (offload-arch, a framework probing both vendors) is told there are none.
+  if (profile.vendor != "nvidia") {
+    out.error = kNoDevice;
+    return out;
+  }
   const auto all = [&] {
     for (int i = 0; i < machine; ++i) out.physical.push_back(i);
   };

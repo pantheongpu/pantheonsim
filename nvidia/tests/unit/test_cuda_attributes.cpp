@@ -234,4 +234,15 @@ VTEST(cuda_visible_devices_reads_as_the_driver_reads_it) {
   VCHECK_EQ(shown(p, 4, "2,4,1"), std::string("2"));
 }
 
+// A machine of AMD's GPUs has no NVIDIA driver, so CUDA finds no device on it,
+// whatever CUDA_VISIBLE_DEVICES says (offload-arch asked CUDA and was told of
+// two sm_00 devices on a simulated MI300X).
+VTEST(an_amd_machine_has_no_cuda_device) {
+  for (const char* id : {"amd/mi300x", "amd/rx7900xtx"}) {
+    const vgpu::DeviceProfile p = vgpu::load_gpu(id);
+    VCHECK_EQ(shown(p, 2, nullptr), std::string("error 100"));
+    VCHECK_EQ(shown(p, 2, "0"), std::string("error 100"));
+  }
+}
+
 VTEST_MAIN
