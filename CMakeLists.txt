@@ -845,16 +845,37 @@ libcutensor.2.7.0 {
 
   # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
-  # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
-  # struct layout has silently produced garbage twice, so we never do it.
+  # cuDNN headers -- hand-writing a vendor struct layout has silently produced
+  # garbage twice, so we never do it. The headers are NVIDIA's and are not
+  # redistributed in this tree: they are fetched from the nvidia-cudnn-cu12 wheel
+  # into nvidia/third_party/cudnn_include (git-ignored), or taken from
+  # $CUDNN_HEADER_DIR if set. Set VGPU_FETCH_CUDNN_HEADERS=OFF to skip the download.
   # Real cuDNN exports versioned symbols tagged "libcudnn.so.9"; the version
   # script gives ours the same tag so the loader binds without the
   # "no version information available" warning.
   # ---------------------------------------------------------------------------
+  option(VGPU_FETCH_CUDNN_HEADERS
+         "Download the cuDNN headers from the nvidia-cudnn-cu12 wheel when they are not found" ON)
   vgpu_forget_stale_path(CUDNN_INCLUDE cudnn.h)
   find_path(CUDNN_INCLUDE cudnn.h
     PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/cudnn_include" ENV CUDNN_HEADER_DIR
     NO_DEFAULT_PATH)
+  if(NOT CUDNN_INCLUDE AND VGPU_FETCH_CUDNN_HEADERS)
+    message(STATUS "cuDNN headers not found: fetching them from the nvidia-cudnn-cu12 wheel")
+    execute_process(
+      COMMAND bash "${CMAKE_SOURCE_DIR}/nvidia/third_party/fetch-cudnn-headers.sh"
+      RESULT_VARIABLE _cudnn_fetch_rc
+      OUTPUT_VARIABLE _cudnn_fetch_out
+      ERROR_VARIABLE _cudnn_fetch_out)
+    if(_cudnn_fetch_rc EQUAL 0)
+      unset(CUDNN_INCLUDE CACHE)
+      find_path(CUDNN_INCLUDE cudnn.h
+        PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/cudnn_include"
+        NO_DEFAULT_PATH)
+    else()
+      message(WARNING "Could not fetch the cuDNN headers; libvgpucudnn will not be built:\n${_cudnn_fetch_out}")
+    endif()
+  endif()
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
     # Every entry point PyTorch binds is implemented, so cuDNN has no

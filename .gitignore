@@ -13,3 +13,5 @@ build-cu12/
 build-fix/
 build-san/
 build-tsan/
+# NVIDIA cuDNN headers: fetched by nvidia/third_party/fetch-cudnn-headers.sh, not redistributed
+/nvidia/third_party/cudnn_include/

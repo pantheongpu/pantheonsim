@@ -1,18 +1,21 @@
 # Vendored headers
 
-`cudnn_include/` and `nccl_include/` are the public API headers from the
-redistributable `nvidia-cudnn-cu12` and `nvidia-nccl-cu12` wheels. They are
-here so the shims are compiled against the *real* ABI rather than a
-hand-written approximation — writing struct layouts by hand has silently
-produced garbage twice in this project (`cudaDeviceProp`, `cudaFuncAttributes`),
-and there is no reason to risk it a third time.
+`nccl_include/` holds the public API headers from NVIDIA's NCCL, which is open
+source (Apache-2.0 / BSD-3-Clause, per the SPDX tags in each file; the license
+text is in `nccl_include/LICENSE.txt`). They are here so the shims are compiled
+against the *real* ABI rather than a hand-written approximation -- writing struct
+layouts by hand has silently produced garbage twice in this project
+(`cudaDeviceProp`, `cudaFuncAttributes`). They are build-time only, and the shims
+implement the documented APIs, not any NVIDIA code.
 
-They are build-time only: nothing here is redistributed in a binary, and the
-shims implement the documented APIs, not any NVIDIA code.
-
-Refresh with:
-
-    pip download --no-deps --dest /tmp/nvpkg nvidia-cudnn-cu12 nvidia-nccl-cu12
+The cuDNN headers are **not** in this tree. They are NVIDIA's, under the NVIDIA
+SDK license shipped in the `nvidia-cudnn-cu12` wheel, which does not allow
+redistributing them as source. `fetch-cudnn-headers.sh` downloads them from that
+wheel into `cudnn_include/` (git-ignored); CMake runs it automatically when
+`libvgpucudnn` is configured and the headers are missing. To use headers you
+already have, set `CUDNN_HEADER_DIR`; to skip the download, configure with
+`-DVGPU_FETCH_CUDNN_HEADERS=OFF` (then `libvgpucudnn` is not built). The wheel is
+several hundred MB; only the headers are kept.
 
 `nvenc_include/nvEncodeAPI.h` is the public NVENC API header from NVIDIA's
 Video Codec SDK, which NVIDIA licenses under the MIT terms printed at the top of
