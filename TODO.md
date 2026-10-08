@@ -1309,7 +1309,7 @@ health-surface refusals, which are far more numerous than the ones named here.
   random and adversarial schedulers, and fault injection are done.) Counters
   that need a timing model are refused by design, below.
 - **Profilers**: Nsight Compute and Nsight Systems as the vendor ships them (see
-  "Known out of scope"); CUPTI's Callback API delivers no callbacks, the Event
+  "Known out of scope"); CUPTI's Callback API delivers the runtime, resource and synchronize domains only (no driver, module, graph or NVTX callbacks), the Event
   and Profiling metrics APIs are absent, and nothing derived from time is
   reported (nvidia/docs/cupti.md:70-139).
 
