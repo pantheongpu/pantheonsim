@@ -89,8 +89,25 @@ Every generation from Turing to Blackwell runs, sm_75 through sm_120a:
 Instructions the executor does not run, and so leave a kernel to its PTX:
 `LDGMC` (multimem; the PTX engine has no multicast memory either), TMA's `im2col::w` modes (nor does the
 PTX engine), and the texture forms with a LOD clamp, a LOD bias, offsets or a
-depth compare. A `WARPSYNC.COLLECTIVE` reached from different code paths of
-one warp is refused when it happens.
+depth compare. Neither engine has them: the PTX parser takes no offset, depth
+compare or bias operand on `tex`, there is no SASS fixture of those encodings
+(`nvidia/tests/data/sass` holds `TEX.LL`, `TEX`, `TLD.LZ` and `TLD4` only), and the
+bits that carry them (the LOD mode at 87-89, the offset flags at 76/77, the compare
+at 78) are read by the executor only to refuse them by name. A `WARPSYNC.COLLECTIVE` reached from different code paths of
+one warp is refused when it happens: the code between it and `ENDCOLLECTIVE` would
+run once per path, and what the hardware does is not published.
+
+The five "SASS: <op> is not implemented yet" messages (the `default:` of
+`exec_int`, `exec_float`, `exec_mem`, `exec_warp` and `exec_control`) are
+defensive: every instruction the decoder produces has a `case` in the function
+that `Runner::execute` routes it to (checked by listing `ops.inc` against the
+dispatch), so no decoded program reaches them. The three enumerators that no
+decoder path produces (`JMP`, `F2IP`, `HMNMX2`) and `LDGMC` fail earlier, as
+"instruction not decodable" or by name.
+
+Not on SASS: `sured`, `txq` and `suq` run on the PTX engine only (`SURED`/`SUATOM`
+and the texture-query instructions have no decoder entry and no fixture). `ldu`
+runs on the PTX engine as `ld.global`; no SASS was compiled here (no ptxas), so what a program built with it runs as on SASS is unchecked.
 
 Dynamic parallelism runs on SASS as on PTX. A program using it links CUDA's
 device runtime library into its cubin; the loader resolves the relocations

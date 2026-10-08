@@ -1576,7 +1576,11 @@ class Parser {
       const auto* imm = std::get_if<ImmInt>(&init);
       if (!imm || imm->value != 0) return unsupported("st.bulk's initval must be the constant 0");
       ins.op = op;
-    } else if (op0 == "ld" || op0 == "st") {
+    } else if (op0 == "ld" || op0 == "st" || op0 == "ldu") {
+      // ldu{.ss}{.vec}.type d, [a] a load of an address the
+      // whole warp reads at once from read-only data. It returns what ld.global
+      // does, so it runs as that; the uniformity is a promise the program makes.
+      const bool uniform_load = op0 == "ldu";
       Space space = Space::Generic;
       size_t vec = 1;
       Type ty{};
@@ -1584,6 +1588,8 @@ class Parser {
       bool acquire = false, release = false, b128 = false, ordered = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
+        if (uniform_load && p != "global" && p != "v2" && p != "v4" && !parse_type_token(p))
+          return unsupported("ldu modifier '." + p + "' (ldu takes .global, a vector width and a type)");
         if (p == "relaxed" || p == "volatile" || p == "acquire" || p == "release") ordered = true;
         if (p == "acquire") acquire = true;
         else if (p == "release") release = true;
@@ -1621,10 +1627,14 @@ class Parser {
         vec = 2;
       }
       if (!have_ty) fail(ins.line, "ld/st missing type: " + opcode);
+      if (uniform_load) {
+        if (space == Space::Generic) space = Space::Global;
+        if (b128 || vec == 8) return unsupported("ldu of 128 or 256 bits");
+      }
       storage_bytes(ty, ins.line, opcode);
       if (vec == 8 && (ty.bytes() != 4 || space != Space::Global))
         return unsupported(".v8 " + op0 + " of other than 32-bit elements in global memory");
-      if (op0 == "ld") {
+      if (op0 == "ld" || op0 == "ldu") {
         Addr addr;
         std::vector<Reg> dsts;
         // A one-element braced list is legal PTX for a scalar load, and it is
@@ -4190,7 +4200,9 @@ class Parser {
         return unsupported(".sat on " + base_op + "." + parts.back() +
                            " (it is for add/sub/mul.f32 and add/sub.s32)");
       if (hi) {
-        if (base_op != "mul") return unsupported("'." + base_op + ".hi' is not implemented");
+        if (base_op != "mul")
+          return unsupported("'" + base_op + ".hi': the PTX ISA defines .hi only for mul, mad, mul24, mad24 "
+                             "and dp2a/dp4a, so there is no " + base_op + ".hi to run");
         if (ty.is_float()) return unsupported("mul.hi on floats");
         OpMulHi op;
         op.ty = ty;
@@ -4585,6 +4597,99 @@ class Parser {
       expect_punct("]");
       if (level) {
         op.level = true;
+        expect_punct(",");
+        op.lod = parse_operand();
+      }
+      ins.op = std::move(op);
+    } else if (op0 == "sured") {
+      // sured.b.<op>.<geom>.<type>.<clamp> [obj, {coords}], src
+      uint32_t dims = 0;
+      bool layered = false, bform = false, have_op = false, have_oob = false;
+      OpSured op;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "b") bform = true;
+        else if (p == "p")
+          return unsupported("sured.p (a reduction on formatted surface data) is not implemented: how the "
+                             "packed value converts to and from the surface's channel format is not "
+                             "established here");
+        else if (p == "1d") dims = 1;
+        else if (p == "2d") dims = 2;
+        else if (p == "3d") dims = 3;
+        else if (p == "a1d") { dims = 1; layered = true; }
+        else if (p == "a2d") { dims = 2; layered = true; }
+        else if (p == "trap") { op.oob = kSurfTrap; have_oob = true; }
+        else if (p == "clamp") { op.oob = kSurfClamp; have_oob = true; }
+        else if (p == "zero") { op.oob = kSurfZero; have_oob = true; }
+        else if (p == "add") { op.op = AtomOp::Add; have_op = true; }
+        else if (p == "min") { op.op = AtomOp::Min; have_op = true; }
+        else if (p == "max") { op.op = AtomOp::Max; have_op = true; }
+        else if (p == "and") { op.op = AtomOp::And; have_op = true; }
+        else if (p == "or") { op.op = AtomOp::Or; have_op = true; }
+        else if (auto t = parse_type_token(p)) op.ty = *t;
+        else return unsupported("sured modifier '." + p + "'");
+      }
+      if (!bform) return unsupported("sured needs .b (byte-addressed); .p is refused");
+      if (!dims) return unsupported("sured geometry");
+      if (!have_op) return unsupported("sured needs a reduction operation");
+      if (!have_oob) return unsupported("sured needs an out-of-range policy (.trap, .clamp or .zero)");
+      {
+        const Type t = op.ty;
+        const bool is32 = t.bits == 32 && !t.is_real(), is64 = t.bits == 64 && !t.is_real();
+        bool ok = false;
+        switch (op.op) {
+          case AtomOp::Add: ok = (is32 && t.kind != Type::Kind::B) || (t.kind == Type::Kind::U && is64); break;
+          case AtomOp::Min:
+          case AtomOp::Max: ok = (is32 || is64) && t.kind != Type::Kind::B; break;
+          default: ok = is32 || is64; break;   // and, or
+        }
+        if (!ok) return unsupported("sured has no " + t.str() + " form of this operation");
+      }
+      op.dims = dims;
+      op.layered = layered;
+      expect_punct("[");
+      op.obj = parse_operand();
+      expect_punct(",");
+      op.coords = parse_operand_vector_any();
+      expect_punct("]");
+      expect_punct(",");
+      op.src = parse_operand();
+      if (op.coords.size() < dims + (layered ? 1 : 0)) return unsupported("sured coordinate count");
+      ins.op = std::move(op);
+    } else if (op0 == "txq" || op0 == "suq") {
+      // txq.<q>.b32 d, [tex];  txq.level.<q>.b32 d, [tex], lod;  suq.<q>.b32 d, [surf];
+      OpTexQuery op;
+      op.surface = op0 == "suq";
+      bool have_q = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "b32") ;
+        else if (p == "level" && !op.surface) op.level = true;
+        else if (p == "width") { op.query = TexQuery::Width; have_q = true; }
+        else if (p == "height") { op.query = TexQuery::Height; have_q = true; }
+        else if (p == "depth") { op.query = TexQuery::Depth; have_q = true; }
+        else if (p == "array_size") { op.query = TexQuery::ArraySize; have_q = true; }
+        else if (p == "num_mipmap_levels" && !op.surface) { op.query = TexQuery::NumMipmapLevels; have_q = true; }
+        else if (p == "normalized_coords" && !op.surface) { op.query = TexQuery::NormalizedCoords; have_q = true; }
+        else if (p == "channel_data_type" || p == "channel_order" || p == "filter_mode" ||
+                 p == "force_unnormalized_coords" || p == "addr_mode_0" || p == "addr_mode_1" ||
+                 p == "addr_mode_2" || p == "memory_layout")
+          return unsupported(op0 + "." + p + " is not implemented: it returns a numbered enumeration whose "
+                             "values are not established here, so it is refused rather than guessed");
+        else if (p == "num_samples")
+          return unsupported(op0 + ".num_samples: multi-sample textures are not implemented");
+        else return unsupported(op0 + " modifier '." + p + "'");
+      }
+      if (!have_q) return unsupported(op0 + " needs a query");
+      if (op.level && op.query != TexQuery::Width && op.query != TexQuery::Height &&
+          op.query != TexQuery::Depth)
+        return unsupported("txq.level takes .width, .height or .depth");
+      op.dst = expect_reg_operand(op0 + " destination");
+      expect_punct(",");
+      expect_punct("[");
+      op.obj = parse_operand();
+      expect_punct("]");
+      if (op.level) {
         expect_punct(",");
         op.lod = parse_operand();
       }

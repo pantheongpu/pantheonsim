@@ -1027,6 +1027,30 @@ struct OpSust {
   std::vector<Operand> coords;
   std::vector<Operand> srcs;
 };
+// sured.b.<op>.<geom>.<type>.<clamp> [obj, {x,y}], src: an atomic reduction
+// into a surface, addressed in bytes as suld.b is. The operation is the
+// reduction cp.reduce.async and red use (add, min, max, and, or).
+struct OpSured {
+  uint32_t dims = 1;
+  bool layered = false;
+  AtomOp op = AtomOp::Add;
+  Type ty;                       // .u32, .s32, .b32, .u64, .s64: the element
+  uint8_t oob = 0;
+  Operand obj;
+  std::vector<Operand> coords;
+  Operand src;
+};
+// txq / suq: what a texture or surface object is. Only the queries the object
+// descriptor settles are here; the rest are refused by name when parsed.
+enum class TexQuery { Width, Height, Depth, ArraySize, NumMipmapLevels, NormalizedCoords };
+struct OpTexQuery {
+  bool surface = false;          // suq (else txq)
+  TexQuery query = TexQuery::Width;
+  bool level = false;            // txq.level.<q>: the size of one mip level
+  Reg dst;
+  Operand obj;
+  Operand lod;
+};
 // bar.red.{and,or}.pred d, 0, p  /  bar.red.popc.u32 d, 0, p
 // A barrier that also reduces a predicate across every thread in the block and
 // gives all of them the result. Unlike bar.sync it produces a value, so it
@@ -1106,7 +1130,7 @@ struct OpCall {
 };
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
-                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
+                        OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpSured, OpTexQuery, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 

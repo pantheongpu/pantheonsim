@@ -2723,7 +2723,7 @@ class Interpreter {
         std::holds_alternative<OpBulkCopy>(ins.op) ||
         std::holds_alternative<OpLdMatrix>(ins.op) ||
         std::holds_alternative<OpStMatrix>(ins.op) ||
-        std::holds_alternative<OpWmmaStore>(ins.op) ||
+        std::holds_alternative<OpWmmaStore>(ins.op) || std::holds_alternative<OpSured>(ins.op) ||
         std::holds_alternative<OpLdSlot>(ins.op) || std::holds_alternative<OpStSlot>(ins.op))
       return InstClass::Memory;
 
@@ -6249,6 +6249,14 @@ class Interpreter {
       exec_suld(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpSured>(&ins.op)) {
+      exec_sured(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpTexQuery>(&ins.op)) {
+      exec_texquery(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpStack>(&ins.op)) {
       exec_stack(w, ctx, ins, *op, m);
       return;
@@ -6714,6 +6722,109 @@ class Interpreter {
     }
     count_memory(Space::Global, op.bytes * static_cast<uint32_t>(op.srcs.size()), popcount_mask(m),
                  /*is_store=*/true);
+  }
+
+  // sured.b: an atomic reduction into a surface. The address is found as
+  // suld.b finds it (a byte offset in x, the .trap/.clamp/.zero policy), and
+  // the element is then read-modified-written the way red does it.
+  void exec_sured(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSured& op, Mask m) {
+    Lanes _s_obj;
+    const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
+    std::array<Lanes, 4> coord;
+    std::array<Lanes, 4> coord_scratch;
+    for (uint32_t i = 0; i < op.dims + (op.layered ? 1 : 0); ++i)
+      coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
+    Lanes _s_src;
+    const Lanes& src = read_operand(w, ctx, ins, op.src, _s_src);
+    const uint32_t size = op.ty.bytes();
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const TextureDesc& d = texture_for(ins, static_cast<int>(lane), obj[lane], TexKind::Surface);
+      const std::optional<uint64_t> at =
+          surface_address(ins, lane, d, coord, op.dims, size, op.layered, op.oob);
+      if (!at) continue;   // .zero, out of range: the reduction is dropped
+      const uint64_t addr = *at;
+      const uint64_t b = mask_to_bits(src[lane], size * 8u);
+      auto compute = [&](const uint64_t old) -> uint64_t {
+        return mask_to_bits(reduce_value(op.op, op.ty, old, b), size * 8u);
+      };
+      std::unique_lock<std::mutex> guard;
+      if (concurrent_) guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
+      ++stats_.atomics;
+      stats_.atomic_bytes += size;
+      try {
+        uint8_t* host = addr % size == 0 ? mem_.host_address(addr, size) : nullptr;
+        if (host && reinterpret_cast<uintptr_t>(host) % size == 0) {
+          (void)vgpu::exec::host_atomic_rmw(host, size, compute);
+        } else {
+          const uint64_t old = mem_.load_scalar(addr, size);
+          mem_.store_scalar(addr, size, compute(old));
+        }
+      } catch (const Error& e) {
+        rethrow_with_context(e, ins, static_cast<int>(lane));
+      }
+    }
+  }
+
+  // txq / suq: sizes and flags the object's descriptor holds. A query the
+  // descriptor cannot answer (a dimension the object lacks, a level it has
+  // not got) is refused by name rather than answered with a number.
+  void exec_texquery(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTexQuery& op, Mask m) {
+    Lanes _s_obj;
+    const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
+    Lanes _s_lod;
+    const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
+    const char* const qname[] = {"width", "height", "depth", "array_size", "num_mipmap_levels", "normalized_coords"};
+    const std::string what = std::string(op.surface ? "suq." : op.level ? "txq.level." : "txq.") +
+                             qname[static_cast<int>(op.query)];
+    Lanes out;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const TextureDesc& d = texture_for(ins, static_cast<int>(lane), obj[lane],
+                                         op.surface ? TexKind::Surface : TexKind::Texture);
+      uint32_t level = 0;
+      if (lod) {
+        level = static_cast<uint32_t>((*lod)[lane]);
+        if (level >= std::max(1u, d.mip_levels))
+          ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                   what + ": level " + std::to_string(level) + " is past the texture's " +
+                       std::to_string(std::max(1u, d.mip_levels)) +
+                       " level(s); what the hardware returns for it is not established");
+      }
+      const auto lacks = [&](const char* dim) {
+        ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                 what + ": this object has no " + dim + ", and what the hardware returns for a dimension an "
+                        "object lacks is not established");
+      };
+      uint64_t v = 0;
+      switch (op.query) {
+        case TexQuery::Width: v = std::max(1u, d.width >> level); break;
+        case TexQuery::Height:
+          if (!d.height) lacks("height");
+          v = std::max(1u, d.height >> level);
+          break;
+        case TexQuery::Depth:
+          if (!d.depth) lacks("depth");
+          v = std::max(1u, d.depth >> level);
+          break;
+        case TexQuery::ArraySize:
+          if (!d.layers) lacks("layers");
+          if (d.cubemap)
+            ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                     what + " of a cubemap array: whether it counts cubemaps or faces is not established");
+          v = d.layers;
+          break;
+        case TexQuery::NumMipmapLevels:
+          if (!d.mip_levels)
+            ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
+                     what + " of a texture without mipmaps: whether it returns 0 or 1 is not established");
+          v = d.mip_levels;
+          break;
+        case TexQuery::NormalizedCoords: v = d.normalized_coords ? 1 : 0; break;
+      }
+      out[lane] = v;
+    }
+    write_reg(w, op.dst, m, out, 32);
   }
 
   // add/sub with the condition-code carry bit. PTX defines subtraction's carry

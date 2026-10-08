@@ -8342,4 +8342,205 @@ VTEST(a_calltargets_list_names_the_functions_an_indirect_call_may_reach) {
     VCHECK_EQ(dev.memory().load_scalar(out + 4 * t, 4), uint64_t{t & 1 ? t + 100 : 2 * t});
 }
 
+// ---- ldu, sured, txq and suq ----
+namespace {
+std::string parse_refusal(const std::string& body) {
+  auto err = VCAPTURE(Error, ptx::parse(std::string(kHeader) + ".visible .entry k(.param .u64 p) { .reg .b32 %r<8>; "
+                                                              ".reg .b64 %rd<4>; .reg .f32 %f<4>; " +
+                                        body + " ret; }\n"));
+  return err.message();
+}
+}  // namespace
+
+VTEST(ldu_loads_as_ld_global_does) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    ldu.global.v2.u32 {%r1, %r2}, [%rd3];
+    ldu.global.u32 %r3, [%rd3+8];
+    add.u32 %r4, %r1, %r2;
+    add.u32 %r4, %r4, %r3;
+    st.global.u32 [%rd4], %r4;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t in = e.mem.alloc(16), out = e.mem.alloc(16);
+  e.mem.store_scalar(in, 4, 10);
+  e.mem.store_scalar(in + 4, 4, 20);
+  e.mem.store_scalar(in + 8, 4, 300);
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(in), arg_u64(out)}, e.mem, e.prof);
+  VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{330});
+  VCHECK_CONTAINS(parse_refusal("ldu.shared.u32 %r1, [%rd1];"), "ldu");
+}
+
+namespace {
+// One thread per element: sured at x = 4 * tid (or 8 * tid) of a 1D surface.
+// `access` is e.g. "sured.b.add.1d.u32.trap"; src is the value in `vals`.
+std::vector<uint64_t> sured_run(const std::string& access, uint32_t elem, const std::vector<uint64_t>& init,
+                                const std::vector<uint64_t>& vals, const std::vector<int32_t>& xs) {
+  const bool wide = elem == 8;
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s, .param .u64 v)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    ld.param.u64 %rd1, [s];
+    ld.param.u64 %rd2, [v];
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 16;
+    add.u64 %rd4, %rd2, %rd3;
+    ld.global.u32 %r2, [%rd4+8];
+)" + (wide ? "    ld.global.u64 %rd6, [%rd4];\n    " + access + " [%rd1, {%r2}], %rd6;\n"
+             : "    ld.global.u32 %r3, [%rd4];\n    " + access + " [%rd1, {%r2}], %r3;\n") + R"(
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t data = e.mem.alloc(64), pv = e.mem.alloc(16 * vals.size());
+  for (size_t i = 0; i < init.size(); ++i) e.mem.store_scalar(data + i * elem, elem, init[i]);
+  for (size_t i = 0; i < vals.size(); ++i) {
+    e.mem.store_scalar(pv + 16 * i, 8, vals[i]);
+    e.mem.store_scalar(pv + 16 * i + 8, 4, static_cast<uint32_t>(xs[i]));
+  }
+  TextureTable tex;
+  TextureDesc d;
+  d.base = data;
+  d.width = static_cast<uint32_t>(init.size());
+  d.channel_bits[0] = elem * 8;
+  d.texel_bytes = elem;
+  d.object = TexKind::Surface;
+  tex[9] = d;
+  LaunchConfig cfg;
+  cfg.block = {static_cast<uint32_t>(vals.size()), 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(9), arg_u64(pv)}, e.mem, e.prof);
+  std::vector<uint64_t> got;
+  for (size_t i = 0; i < init.size(); ++i) got.push_back(e.mem.load_scalar(data + i * elem, elem));
+  return got;
+}
+}  // namespace
+
+VTEST(sured_reduces_into_a_surface) {
+  using V = std::vector<uint64_t>;
+  // Four threads add into texel 0 (x = 0) and one into texel 1 (x = 4).
+  VCHECK(sured_run("sured.b.add.1d.u32.trap", 4, V{100, 7}, V{1, 2, 3, 4, 5}, {0, 0, 0, 0, 4}) == (V{110, 12}));
+  // Signed and unsigned minimum and maximum differ on the sign bit.
+  VCHECK(sured_run("sured.b.min.1d.s32.trap", 4, V{5, 5}, V{0xfffffffeu, 9, 0xffffffffu}, {0, 4, 4}) ==
+         (V{0xfffffffeu, 0xffffffffu}));
+  VCHECK(sured_run("sured.b.min.1d.u32.trap", 4, V{5, 5}, V{0xfffffffeu, 9, 3}, {0, 4, 4}) == (V{5, 3}));
+  VCHECK(sured_run("sured.b.max.1d.s32.trap", 4, V{5, 5}, V{0xfffffffeu, 9, 7}, {0, 4, 4}) == (V{5, 9}));
+  VCHECK(sured_run("sured.b.max.1d.u32.trap", 4, V{5, 5}, V{0xfffffffeu, 9}, {0, 4}) == (V{0xfffffffeu, 9}));
+  VCHECK(sured_run("sured.b.and.1d.b32.trap", 4, V{0xff0, 0xff}, V{0x0ff, 0xf0f}, {0, 4}) == (V{0x0f0, 0x0f}));
+  VCHECK(sured_run("sured.b.or.1d.b32.trap", 4, V{0xf0, 1}, V{0x0f, 2}, {0, 4}) == (V{0xff, 3}));
+  // 64-bit, wrapping.
+  VCHECK(sured_run("sured.b.add.1d.u64.trap", 8, V{~0ull, 1}, V{2, 5}, {0, 8}) == (V{1, 6}));
+  VCHECK(sured_run("sured.b.max.1d.s64.trap", 8, V{~0ull, 1}, V{2, 5}, {0, 8}) == (V{2, 5}));
+  // The out-of-range policies are suld's: .zero drops the reduction, .clamp
+  // moves it to the last texel, .trap faults.
+  VCHECK(sured_run("sured.b.add.1d.u32.zero", 4, V{1, 1}, V{5, 6}, {64, 4}) == (V{1, 7}));
+  VCHECK(sured_run("sured.b.add.1d.u32.clamp", 4, V{1, 1}, V{5, 6}, {64, 4}) == (V{1, 12}));
+  auto err = VCAPTURE(Error, sured_run("sured.b.add.1d.u32.trap", 4, V{1, 1}, V{5}, {64}));
+  VCHECK(err.code() == Err::OutOfBounds);
+}
+
+VTEST(sured_refuses_the_forms_it_cannot_run_by_name) {
+  VCHECK_CONTAINS(parse_refusal("sured.p.add.2d.u32.trap [%rd1, {%r1, %r2}], %r3;"), "sured.p");
+  VCHECK_CONTAINS(parse_refusal("sured.b.add.2d.b32.trap [%rd1, {%r1, %r2}], %r3;"), "no .b32 form");
+  VCHECK_CONTAINS(parse_refusal("sured.b.add.2d.s64.trap [%rd1, {%r1, %r2}], %rd3;"), "no .s64 form");
+  VCHECK_CONTAINS(parse_refusal("sured.b.xor.2d.b32.trap [%rd1, {%r1, %r2}], %r3;"), "modifier '.xor'");
+}
+
+namespace {
+// Runs one query on `d` (a texture, or a surface when `surface`) in one
+// thread; returns the result.
+uint64_t query_run(const std::string& instr, const TextureDesc& d, uint32_t lod = 0) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out, .param .u64 lod)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    ld.param.u64 %rd4, [lod];
+    cvt.u32.u64 %r2, %rd4;
+    cvta.to.global.u64 %rd3, %rd2;
+)" + instr + R"(
+    st.global.u32 [%rd3], %r1;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const uint64_t out = e.mem.alloc(16);
+  TextureTable tex;
+  tex[5] = d;
+  LaunchConfig cfg;
+  cfg.block = {1, 1, 1};
+  cfg.textures = &tex;
+  exec::launch(m.entries[0], cfg, {arg_u64(5), arg_u64(out), arg_u64(lod)}, e.mem, e.prof);
+  return e.mem.load_scalar(out, 4);
+}
+TextureDesc q_desc(uint32_t w, uint32_t h, uint32_t depth, uint32_t layers, uint32_t mips) {
+  TextureDesc d;
+  d.width = w;
+  d.height = h;
+  d.depth = depth;
+  d.layers = layers;
+  d.mip_levels = mips;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  return d;
+}
+}  // namespace
+
+VTEST(txq_and_suq_report_what_the_descriptor_holds) {
+  TextureDesc d = q_desc(16, 8, 4, 0, 3);
+  d.normalized_coords = true;
+  VCHECK_EQ(query_run("    txq.width.b32 %r1, [%rd1];", d), uint64_t{16});
+  VCHECK_EQ(query_run("    txq.height.b32 %r1, [%rd1];", d), uint64_t{8});
+  VCHECK_EQ(query_run("    txq.depth.b32 %r1, [%rd1];", d), uint64_t{4});
+  VCHECK_EQ(query_run("    txq.num_mipmap_levels.b32 %r1, [%rd1];", d), uint64_t{3});
+  VCHECK_EQ(query_run("    txq.normalized_coords.b32 %r1, [%rd1];", d), uint64_t{1});
+  // A mip level is half the size, down to 1.
+  VCHECK_EQ(query_run("    txq.level.width.b32 %r1, [%rd1], %r2;", d, 1), uint64_t{8});
+  VCHECK_EQ(query_run("    txq.level.height.b32 %r1, [%rd1], %r2;", d, 2), uint64_t{2});
+  VCHECK_EQ(query_run("    txq.level.depth.b32 %r1, [%rd1], %r2;", d, 2), uint64_t{1});
+  d.normalized_coords = false;
+  VCHECK_EQ(query_run("    txq.normalized_coords.b32 %r1, [%rd1];", d), uint64_t{0});
+  VCHECK_EQ(query_run("    txq.array_size.b32 %r1, [%rd1];", q_desc(16, 8, 0, 5, 0)), uint64_t{5});
+  TextureDesc s = q_desc(32, 4, 0, 0, 0);
+  s.object = TexKind::Surface;
+  VCHECK_EQ(query_run("    suq.width.b32 %r1, [%rd1];", s), uint64_t{32});
+  VCHECK_EQ(query_run("    suq.height.b32 %r1, [%rd1];", s), uint64_t{4});
+  // Where the descriptor cannot answer, the query says so by name.
+  auto err = VCAPTURE(Error, query_run("    txq.depth.b32 %r1, [%rd1];", q_desc(16, 8, 0, 0, 0)));
+  VCHECK_CONTAINS(err.message(), "txq.depth: this object has no depth");
+  err = VCAPTURE(Error, query_run("    txq.level.width.b32 %r1, [%rd1], %r2;", d, 9));
+  VCHECK_CONTAINS(err.message(), "level 9");
+  err = VCAPTURE(Error, query_run("    txq.num_mipmap_levels.b32 %r1, [%rd1];", q_desc(16, 8, 0, 0, 0)));
+  VCHECK_CONTAINS(err.message(), "without mipmaps");
+  // A texture handle is not a surface handle.
+  err = VCAPTURE(Error, query_run("    suq.width.b32 %r1, [%rd1];", d));
+  VCHECK(err.code() == Err::InvalidValue);
+  for (const char* q : {"channel_data_type", "channel_order", "filter_mode", "addr_mode_0", "force_unnormalized_coords"})
+    VCHECK_CONTAINS(parse_refusal(std::string("txq.") + q + ".b32 %r1, [%rd1];"), std::string("txq.") + q);
+  VCHECK_CONTAINS(parse_refusal("txq.num_samples.b32 %r1, [%rd1];"), "multi-sample");
+}
+
+VTEST(hi_on_other_instructions_is_named_as_not_in_the_isa) {
+  VCHECK_CONTAINS(parse_refusal("add.hi.u32 %r1, %r2, %r3;"), "add.hi");
+}
+
+
 VTEST_MAIN

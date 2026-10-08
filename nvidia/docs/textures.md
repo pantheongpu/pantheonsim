@@ -44,7 +44,7 @@ timing.
 
 | | |
 | --- | --- |
-| Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}`, `tex.level`, `tld4.{r,g,b,a}.2d`, `suld.b`/`sust.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d` |
+| Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}`, `tex.level`, `tld4.{r,g,b,a}.2d`, `suld.b`/`sust.b`/`sured.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d`, `txq` and `suq` (sizes, array size, mip level count, `normalized_coords`) |
 | Backing memory | linear (`cudaResourceTypeLinear`), pitched 2D, `cudaArray` (1D/2D/3D, layered, cubemap, layered cubemap), mipmapped arrays |
 | Filtering | point and linear, within and between mip levels |
 | Addressing | clamp, wrap, mirror, border (any colour) |
@@ -222,6 +222,14 @@ Each with its own message, rather than a plausible wrong number:
   two-texel blends.)
 - `tld4` on layered or cubemap textures (the runtime refuses a gather array
   that is layered or a cubemap, so there is nothing to measure them on).
+- **`sured.p`** (a reduction on formatted data), **multi-sample textures** (`.2dms`, `.a2dms`, `txq.num_samples`),
+  **`suld.p`/`sust.p`**: the conversion to and from a surface's channel format, and the multi-sample layout, are not
+  established here.
+- **`txq`/`suq` of `channel_data_type`, `channel_order`, `filter_mode`, `addr_mode_*`, `force_unnormalized_coords`,
+  `memory_layout`**: they return numbered enumerations whose values are not established here. A query of a
+  dimension the object lacks (`txq.depth` of a 2D texture), of a mip level it does not have, of `array_size` on a
+  cubemap array, or of `num_mipmap_levels` on a texture without mipmaps is refused at run time, by name, because
+  what the hardware returns there is not established either.
 - Resource views and anisotropic filtering.
 
 ## Surfaces out of range: .trap, .clamp and .zero
