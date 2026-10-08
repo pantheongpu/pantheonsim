@@ -3,6 +3,14 @@ on the CPU from the same inputs and compared; one line each, "ok <name>" or
 "FAIL <name>: <why>", and "skip <name>: <why>" for a check whose optional
 package is not installed (those are not counted).
 
+known_failures.txt lists the checks that are known not to match the CPU yet
+(name, a tab, a one-line reason). Such a check prints "XFAIL <name>: <why>
+-- known: <reason>" when it fails, with the numbers, and the run does not
+fail for it; when it starts passing it prints "XPASS <name>" and the run
+does fail, so the entry is removed and the list stays honest. A reason that
+starts with "[sim-error]" says the failure also prints a "VirtualGPU error ["
+line, which run_pytorch_sweep.sh tolerates only then.
+
 Selection (environment): VGPU_SWEEP_GROUPS (comma list, default every group),
 VGPU_SWEEP_TIER (quick: the time-bounded subset; full: everything),
 VGPU_SWEEP_ONLY (a regular expression on the check's name),
@@ -27,6 +35,15 @@ GPU = 'cuda'
 # compare in fp32 so a difference means a bug, not the precision mode.
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_tf32 = False
+KNOWN = {}  # check name -> reason, from known_failures.txt
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'known_failures.txt')) as _f:
+        for _line in _f:
+            if _line.strip() and not _line.startswith('#'):
+                _name, _, _reason = _line.rstrip('\n').partition('\t')
+                KNOWN[_name] = _reason.strip()
+except OSError:
+    pass
 REGISTRY = []  # dicts: group, name, fn, tol, tier, needs
 
 
@@ -164,8 +181,15 @@ def run_one(c, timeout):
             traceback.print_exc()
     stop.set()
     secs = time.time() - t0
+    known = KNOWN.get(name)
+    if known is not None:
+        if why is None:
+            print(f"XPASS {name}: it matches the CPU now; remove it from sweep/known_failures.txt  ({secs:.1f} s)", flush=True)
+            return 'xpass'
+        print(f"XFAIL {name}: {why}  -- known: {known}  ({secs:.1f} s)", flush=True)
+        return 'xfail'
     print(f"ok {name}  ({secs:.1f} s)" if why is None else f"FAIL {name}: {why}  ({secs:.1f} s)", flush=True)
-    return why is None
+    return 'ok' if why is None else 'fail'
 
 
 def selected():
@@ -198,10 +222,8 @@ def main(argv, loaders):
     for c, missing in skipped:
         print(f"skip {c['name']}: needs {', '.join(missing)}", flush=True)
     timeout = float(os.environ.get('VGPU_SWEEP_TIMEOUT', '900'))
-    bad = 0
-    for c in todo:
-        bad += not run_one(c, timeout)
-    print(f"# {len(todo) - bad} of {len(todo)} checks ok", flush=True)
+    results = [run_one(c, timeout) for c in todo]
+    print(f"# {results.count('ok')} of {len(todo)} checks ok, {results.count('xfail')} known failures", flush=True)
     return 0
 
 

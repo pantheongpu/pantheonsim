@@ -2019,6 +2019,25 @@ and tests; the gap branches were tested by their authors under ASan + UBSan with
 runtime one also syntax-checked against 12.4), and none ran the full ctest suite, a TSan build, or any e2e
 program that needs nvcc.
 
+### PyTorch sweep: known failures
+
+`nvidia/tests/pytorch/sweep/known_failures.txt` lists the sweep's checks that do not match the CPU on the
+simulator (nvidia/rtx5090). The CI-wired `e2e_pytorch_sweep` prints each as `XFAIL` with its numbers and fails
+only on a new failure or on a listed one that starts passing (`XPASS`: delete its line). Each is work to do:
+
+- **Graphs (4 checks)**: capture and replay of cuDNN + cuBLAS, a whole training step, Adam with
+  `capturable=True`, `make_graphed_callables` all fail with "operation failed due to a previous error during
+  capture". Which call errors under stream capture is not identified (cuDNN computes on the host, which a
+  capture cannot record).
+- **torch.compile `reduce-overhead`**: 1.2 scaled difference from the CPU (allowed 0.001); it replays a captured
+  CUDA graph, probably the same gap.
+- **torch.compile gather / scatter_add / index_select**: an Inductor kernel fails to load, `cuModuleLoadData`
+  answers `unsupported-ptx` (the log shows only that line, not the unsupported feature) and the driver call
+  returns "operation not supported". Find the PTX feature first.
+- **Numeric**: the tiny causal transformer after three AdamW steps (0.0027 against 0.002), SGD with OneCycleLR
+  and gradient clipping (0.32), and `clip_grad_norm_` (foreach) / `clip_grad_value_` (0.0012 against 0.0001).
+  The kernel or reduction order that drifts is not isolated; no tolerance was loosened.
+
 ### Tooling, CI and process
 
 - Trace record/replay and a conformance database with compatibility scores: not started.

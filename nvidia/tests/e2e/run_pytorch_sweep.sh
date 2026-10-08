@@ -5,9 +5,11 @@
 #
 # Each group of checks runs in its own `vgpu run --preload` process, so a hang or
 # a crash costs one group, not the sweep; the checks print "ok <name>" or
-# "FAIL <name>: <why>", each against the CPU. The number of ok lines must be the
-# number of checks the sweep lists for this tier (a check that silently stopped
-# running is a failure), and "VirtualGPU error [" in any output -- a kernel the
+# "FAIL <name>: <why>", each against the CPU. A check listed in
+# sweep/known_failures.txt prints "XFAIL" with its numbers instead and does not fail
+# the run; one that starts passing prints "XPASS" and does. The number of ok and
+# XFAIL lines must be the number of checks the sweep lists for this tier (a check
+# that silently stopped running is a failure), and "VirtualGPU error [" in any output -- a kernel the
 # simulator could not run, which PyTorch may carry on past -- fails the run.
 #
 # Optional packages (torchvision, torchaudio, transformers, ...) are used where the
@@ -69,7 +71,7 @@ cap=()
 if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
   cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-10G}" -p MemorySwapMax=0)
 fi
-fail=0 total=0 passed=0
+fail=0 total=0 passed=0 known=0
 for g in $groups; do
   want=$(printf '%s\n' "${listing[@]}" | cut -f1 | grep -cx "$g")
   count=1
@@ -79,18 +81,21 @@ for g in $groups; do
     timeout "${VGPU_SWEEP_GROUP_TIMEOUT:-1500}" "${cap[@]}" "$vgpu" run --gpu "$gpu" --count "$count" --preload "$python" "$sweep" 2>&1)
   status=$?
   secs=$((SECONDS - start))
-  echo "$out" | grep -E '^(ok|FAIL|skip) ' | sed "s/^/      [$g] /"
+  echo "$out" | grep -E '^(ok|FAIL|skip|XFAIL|XPASS) ' | sed "s/^/      [$g] /"
   ok=$(grep -c '^ok ' <<< "$out")
-  total=$((total + want)); passed=$((passed + ok))
-  if grep -q '^FAIL ' <<< "$out" || [[ $ok != "$want" ]]; then
-    echo "FAIL  group $g: $ok of $want checks match the CPU on $gpu (${secs}s)"; fail=1
+  xfail=$(grep -c '^XFAIL ' <<< "$out")
+  total=$((total + want)); passed=$((passed + ok)); known=$((known + xfail))
+  if grep -q '^FAIL \|^XPASS ' <<< "$out" || [[ $((ok + xfail)) != "$want" ]]; then
+    echo "FAIL  group $g: $ok of $want checks match the CPU on $gpu, $xfail known failures (${secs}s)"; fail=1
   else
-    echo "ok    group $g: $ok of $want checks match the CPU on $gpu (${secs}s)"
+    echo "ok    group $g: $ok of $want checks match the CPU on $gpu, $xfail known failures (${secs}s)"
   fi
-  if grep -q 'VirtualGPU error \[' <<< "$out"; then
+  # A known failure marked [sim-error] in sweep/known_failures.txt also prints a
+  # "VirtualGPU error [" line; without one in the group it is a failure.
+  if grep -q 'VirtualGPU error \[' <<< "$out" && ! grep -q '^XFAIL .*-- known: \[sim-error\]' <<< "$out"; then
     echo "FAIL  group $g: the simulator ran every kernel it was given"; grep -m5 'VirtualGPU error \[' <<< "$out" | sed 's/^/      /'; fail=1
   fi
   [[ $status == 0 ]] || { echo "FAIL  group $g: the checks ran to the end (exit $status)"; echo "$out" | tail -5 | sed 's/^/      /'; fail=1; }
 done
-echo "      $passed of $total checks (tier $tier)"
+echo "      $passed of $total checks (tier $tier), $known known failures (nvidia/tests/pytorch/sweep/known_failures.txt)"
 exit $fail

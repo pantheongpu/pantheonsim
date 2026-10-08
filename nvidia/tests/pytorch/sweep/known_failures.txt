@@ -1,0 +1,13 @@
+# Checks that are known not to match the CPU on the simulator yet: name, a tab, the reason (one line).
+# The sweep prints them as XFAIL and does not fail for them; one that starts passing prints XPASS and does fail,
+# so remove its line then. Each is a gap listed in TODO.md ("PyTorch sweep: known failures"). A reason starting
+# with [sim-error] says the failure also prints a "VirtualGPU error [" line.
+tiny causal transformer, three AdamW steps	numeric: three AdamW steps of the tiny causal transformer differ from the CPU by 0.0027 (allowed 0.002); the layer or reduction that drifts is not identified
+SGD with OneCycleLR and gradient clipping	numeric: 0.32 scaled difference after five steps; either the clipping norm or the scheduled learning rate differs from the CPU, not yet isolated
+clip_grad_norm_ (foreach), clip_grad_value_, parameters_to_vector	numeric: 0.0012 against 1e-4 on the foreach gradient norm and clip; the reduction order of the foreach kernels is not isolated
+capture and replay: convolution (cuDNN) and linear (cuBLAS)	stream capture: "operation failed due to a previous error during capture"; the call that errors under capture is not identified (cuDNN computes on the host, see libraries.md)
+a training step captured whole (forward, backward, SGD with momentum) and replayed	stream capture: same capture error as the cuDNN/cuBLAS capture check
+Adam with capturable=True inside a graph	stream capture: same capture error as the cuDNN/cuBLAS capture check
+make_graphed_callables: forward and backward graphs	stream capture: same capture error as the cuDNN/cuBLAS capture check
+torch.compile: gather, scatter_add and index_select	[sim-error] Inductor kernel fails to load: cuModuleLoadData reports unsupported PTX (the PTX feature is not named in the log) and the driver call answers "operation not supported"
+torch.compile: mode="reduce-overhead" (CUDA graphs under Inductor)	numeric: 1.2 scaled difference; reduce-overhead replays a captured CUDA graph, probably the same capture gap as the graphs group

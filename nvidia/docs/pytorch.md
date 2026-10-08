@@ -96,3 +96,13 @@ paths tested here do not call them.
   PyTorch's elementwise kernels use.
 - `e2e_pytorch_models_<gpu>`: `models.py` on one GPU per SASS image (T4,
   A100, RTX 3060, H100, B200, RTX 5090), where PyTorch is installed.
+
+## The sweep
+
+`nvidia/tests/pytorch/sweep.py` runs many small checks (nn layers, losses, optimizers, graphs, `torch.compile`,
+each SDPA backend, ...) on the simulated GPU and on the CPU from the same inputs. `ctest -R e2e_pytorch_sweep`
+runs the quick tier through `nvidia/tests/e2e/run_pytorch_sweep.sh` (`e2e_pytorch_sweep_full` the rest; the
+nightly workflow runs it). A check that does not match yet is listed with its reason in
+`nvidia/tests/pytorch/sweep/known_failures.txt`: it prints `XFAIL` with its numbers and does not fail the run,
+a listed check that starts passing prints `XPASS` and does, and a new failure fails. The gaps are in `TODO.md`
+("PyTorch sweep: known failures"). Tolerances are never loosened to hide one.
