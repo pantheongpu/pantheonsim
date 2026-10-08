@@ -33,7 +33,7 @@ const char* enc_name(Enc e);
 // apertures' limits beside their bases.
 enum class OperandKind {
   Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal,
-  Ttmp, Null, Scc, SharedLimit, PrivateLimit, None
+  Ttmp, Null, Scc, SharedLimit, PrivateLimit, Vccz, Execz, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;
@@ -57,6 +57,7 @@ struct Operand {
   // A literal in a 64-bit float operand: the word is the double's high half,
   // the low half zero (a 64-bit integer operand's is zero-extended instead).
   bool literal_high = false;
+  bool lit64 = false;   // gfx1250: a 64-bit literal (source code 254), two words of the instruction stream
   bool constant_k = false;   // RDNA: an instruction's own constant (v_fmaak_f32's K), always written in hex
 };
 std::string operand_text(const Operand& o);

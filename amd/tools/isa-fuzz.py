@@ -64,6 +64,8 @@ def disassemble(word, nbytes):
                        text=True)
     if p.returncode != 0 or 'warning' in p.stderr or 'error' in p.stderr or 'Invalid' in p.stdout:
         return None
+    if 'src_flat_scratch' in p.stdout or 'pops_exiting' in p.stdout:
+        return None   # special registers the simulator does not model
     lines = [l.strip() for l in p.stdout.splitlines() if l.strip() and not l.strip().startswith('.')]
     return lines[0] if len(lines) == 1 else None
 
@@ -85,7 +87,8 @@ def tame_sources(word, fields, name):
             continue
         v = field_value(word, fields[fn])
         # (240 to 248 are the inline floats, which LLVM prints as a half's bits in a 16-bit integer operation.)
-        if 209 <= v <= 239 or 249 <= v <= 254 or (240 <= v <= 248 and re.search(r'_[ui]16', name)):
+        if (209 <= v <= 239 or 249 <= v <= 250 or v == 254 or (240 <= v <= 248 and re.search(r'_[ui]16', name)) or
+                (128 <= v <= 248 and re.match(r'^s_.*_f16$', name))):
             word = put(word, fields[fn], v & 0x3F)
     return word
 
@@ -98,19 +101,28 @@ for inst in isa.find('Instructions'):
         continue
     for ie in inst.find('InstructionEncodings'):
         name = ie.findtext('EncodingName')
-        if ie.findtext('EncodingCondition') != 'default' or name not in encodings or 'LITERAL' in name or 'DPP' in name:
+        if not (ie.findtext('EncodingCondition') == 'default' or (ie.findtext('EncodingCondition') or '').startswith('!has_')) or name not in encodings or 'LITERAL' in name or 'DPP' in name:
             continue
         bits, fields, ids, mask = encodings[name]
-        if 'OP' not in fields:
-            continue
         op = int(ie.find('Opcode').text, int(ie.find('Opcode').get('Radix', '10')))
-        base = None
-        for i in ids:
-            if field_value(i, fields['OP']) == op:
-                base = i & mask
-                break
-        if base is None:
+        if name in ('VOPDXY_X', 'VOPDXY_Y'):
+            # A dual-issue pair: this instruction in one half, a multiply in the other.
+            base = ids[0] & (0x3F << 26)
+            half, other = ('OPX', 'OPY') if name.endswith('_X') else ('OPY', 'OPX')
+            base = put(put(base, fields[half], op), fields[other], 3)
+            fields = dict(fields)
+            fields['OP'] = fields[half]
+            mask = 0x3F << 26
+        elif 'OP' not in fields:
             continue
+        else:
+            base = None
+            for i in ids:
+                if field_value(i, fields['OP']) == op:
+                    base = i & mask
+                    break
+            if base is None:
+                continue
         # Only the fields the instruction uses as operands (and its cache-policy, offset and scale bits) are
         # varied: a bit the specification gives no meaning to makes LLVM print something no program means.
         used = {o.findtext('FieldName') for o in ie.iter('Operand')}
@@ -129,6 +141,36 @@ for inst in isa.find('Instructions'):
                 # SGPR fields: clear the bits below the alignment (only meaningful for the first range).
                 off, n = fields[fn][0]
                 free &= ~(((1 << (a.bit_length() - 1)) - 1) << off)
+        # The same instruction with a 32-bit literal (source code 255) or a 64-bit one (254) in its first source,
+        # where the specification gives it that form.
+        lit_forms = []
+        for other in inst.find('InstructionEncodings'):
+            cond = other.findtext('EncodingCondition') or ''
+            if other.findtext('EncodingName') in (name + '_INST_LITERAL', name.replace('ENC_', '') + '_INST_LITERAL') and cond in ('has_lit', 'has_lit_0'):
+                lit_forms.append(255)
+            if other.findtext('EncodingName') in (name + '_INST_LITERAL64', name.replace('ENC_', '') + '_INST_LITERAL64') and cond in ('has_lit64', 'has_lit64_0'):
+                lit_forms.append(254)
+        src0 = next((f for f in ('SRC0', 'SSRC0') if f in fields), None)
+        for lit in lit_forms if src0 else []:
+            w = base | (random.getrandbits(bits) & free)
+            w = put(w, fields['OP'], op)
+            w = tame_sources(w, fields, inst.findtext('InstructionName').lower())
+            iname = inst.findtext('InstructionName').lower()
+            # LLVM's rules for how a literal is written differ by operand class: a 32-bit literal in a 64-bit
+            # integer operation is printed lit64(...), and a 16-bit operation's is the whole word for some
+            # (bfloat16, the scalar conversions and packs) and its low half for others. None of it changes what
+            # the instruction does, so those are left out.
+            if lit == 255 and (re.match(r'^[sv]_.*_(b64|i64|u64)$', iname) or
+                               re.search(r'bf16|fma_mix', iname) or re.match(r'^s_.*(f16|i16|b16|u16)$', iname) or
+                               re.match(r'^s_(pack|sext|cvt)', iname)):
+                continue
+            w = put(w, fields[src0], lit)
+            literal = random.getrandbits(32 if lit == 255 else 64)
+            data = w | (literal << bits)
+            text = disassemble(data, bits // 8 + (4 if lit == 255 else 8))
+            if text:
+                n = bits // 32 + (1 if lit == 255 else 2)
+                rows.append((' '.join(f'{(data >> (32 * i)) & 0xFFFFFFFF:08X}' for i in range(n)), text))
         for k in range(per):
             w = base
             if k == 1:

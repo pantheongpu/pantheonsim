@@ -1115,6 +1115,9 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   # way round, and a register per work-item id.
   add_test(NAME test_amd_gcn_${_t}_gfx1030 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1030 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1030")
+  # And for gfx1250 (CDNA 5, MI455X): gfx12's encodings with its additions, built by ROCm's clang.
+  add_test(NAME test_amd_gcn_${_t}_gfx1250 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1250 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1250")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)

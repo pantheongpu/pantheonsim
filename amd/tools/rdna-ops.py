@@ -32,7 +32,7 @@ ENCODINGS = {
     'ENC_SMEM': 'Smem', 'ENC_VOP1': 'Vop1', 'ENC_VOP2': 'Vop2', 'ENC_VOPC': 'Vopc', 'ENC_VOP3': 'Vop3',
     'VOP3_SDST_ENC': 'Vop3', 'ENC_VOP3P': 'Vop3p', 'ENC_DS': 'Ds', 'ENC_FLAT': 'Flat',
     'ENC_FLAT_GLOBAL': 'Flat', 'ENC_FLAT_SCRATCH': 'Flat', 'ENC_MUBUF': 'Mubuf', 'ENC_MTBUF': 'Mtbuf',
-    'VOPDXY': 'Vopd',
+    'VOPDXY': 'Vopd', 'VOPDXY_X': 'Vopd', 'VOPDXY_Y': 'Vopd', 'VOPD3XY': 'Vopd',   # CDNA 5 lists the X and Y halves apart
     # RDNA4's names for the same encodings.
     'ENC_VOP3SD': 'Vop3', 'ENC_VFLAT': 'Flat', 'ENC_VGLOBAL': 'Flat', 'ENC_VSCRATCH': 'Flat',
     'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd', 'ENC_VDS': 'Ds', 'ENC_FLAT_GLBL': 'Flat',
@@ -81,14 +81,15 @@ for inst in isa.find('Instructions'):
         # An instruction that always carries a literal (v_fmaak_f32) is only
         # listed under its encoding's _INST_LITERAL form, which stands in.
         priority = 0
-        if enc_xml.endswith('_INST_LITERAL') and cond == 'default':
+        if (enc_xml.endswith('_INST_LITERAL') or enc_xml.endswith(('_INST_LITERAL_X', '_INST_LITERAL_Y'))) and cond == 'default':
             enc_xml, priority = {'VOP2_INST_LITERAL': 'ENC_VOP2', 'VOPDXY_INST_LITERAL': 'VOPDXY',
+                                 'VOPDXY_INST_LITERAL_X': 'VOPDXY_X', 'VOPDXY_INST_LITERAL_Y': 'VOPDXY_Y',
                                  'SOPK_INST_LITERAL': 'ENC_SOPK', 'SOP2_INST_LITERAL': 'ENC_SOP2'}.get(enc_xml, enc_xml), 1
-        if enc_xml not in ENCODINGS or not (cond == 'default' or cond.startswith('Nothas')):
+        if enc_xml not in ENCODINGS or not (cond == 'default' or cond.startswith(('Nothas', '!has_'))):
             continue
         enc = ENCODINGS[enc_xml]
         opcode = int(ie.find('Opcode').text, int(ie.find('Opcode').get('Radix', '10')))
-        segment = {'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
+        segment = {'VOPD3XY': 1, 'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
         if images:
             segment = IMAGE_ENCODINGS[enc_xml]
         ops = []

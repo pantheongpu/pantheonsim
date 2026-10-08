@@ -1939,6 +1939,8 @@ std::string operand_text(const Operand& o) {
     case OperandKind::Scc: return wrap("src_scc");
     case OperandKind::SharedLimit: return wrap("src_shared_limit");
     case OperandKind::PrivateLimit: return wrap("src_private_limit");
+    case OperandKind::Vccz: return wrap("src_vccz");
+    case OperandKind::Execz: return wrap("src_execz");
     case OperandKind::None: break;
   }
   return "?";
