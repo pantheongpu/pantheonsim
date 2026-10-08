@@ -20,7 +20,12 @@ registers, RAS counts, CPER records and amdgpu sysfs files are modelled
   the scalar registers, VCC, SCC and the EXEC mask the ISA exposes, over LDS
   and device memory, with barriers between the waves of a group. Divergence is
   what the compiler writes -- save EXEC, narrow it, put it back -- not a path
-  stack.
+  stack. A group's waves take turns, each running until it stops (a barrier,
+  `s_sleep`, the end) -- except that a wave waiting for a global load lets the
+  others run first, as the load's latency does on a card: rocPRIM reads a
+  block id from LDS after a barrier and overwrites it once its loads arrive,
+  and without the pause the wave that went on to the load overwrote it before
+  the others had read (`tests/data/asm_barrier_order.s`).
 
 - `src/hip_api.cpp` is `libamdhip64`: the HIP runtime API, over those pieces.
   A HIP program links against it the way it links against AMD's, asks for
