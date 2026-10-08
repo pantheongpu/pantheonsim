@@ -1,6 +1,8 @@
 #!/bin/bash
 # pantheonsim CI burst runner: two GitHub Actions runner processes on this
-# instance, for the SASS / ASan / TSan jobs (BURST_RUNS_ON). A watchdog shuts
+# instance, for the SASS / ASan / TSan jobs (BURST_RUNS_ON). Each has the one label
+# pantheonsim-burst and none of the defaults (self-hosted, Linux, X64), so a job
+# that asks for any other label -- the ML job's pantheonsim-ci -- cannot be given to it. A watchdog shuts
 # the instance down (it terminates on shutdown) when no pull request is open, or
 # after TTL_HOURS whatever the state.
 set -uxo pipefail
@@ -28,7 +30,7 @@ for i in $(seq 1 $NRUNNERS); do
   d=/home/runner/r$i
   mkdir -p "$d" && tar xzf /tmp/runner.tgz -C "$d" && chown -R runner:runner "$d"
   (cd "$d" && sudo -u runner ./config.sh --unattended --url "https://github.com/$REPO" --token "$TOKEN" \
-      --name "burst-$IID-$i" --labels pantheonsim-burst --replace --work _work \
+      --name "burst-$IID-$i" --no-default-labels --labels pantheonsim-burst --replace --work _work \
    && ./svc.sh install runner && ./svc.sh start)
 done
 

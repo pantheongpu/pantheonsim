@@ -6,6 +6,7 @@
 #   tools/burst-runners/burst-runners.sh start [instances]    (default 2)
 #   tools/burst-runners/burst-runners.sh status
 #   tools/burst-runners/burst-runners.sh stop
+#   tools/burst-runners/burst-runners.sh stop-old <instance-id>...    (after BURST_REPLACE=1 start)
 #
 # start   launches the instances (two runner processes each, m7i.2xlarge,
 #         on-demand, no inbound access), waits for their runners to come online,
@@ -37,7 +38,9 @@ runners() { gh api "repos/$REPO/actions/runners" --paginate --jq ".runners[] | s
 case "${1:-}" in
   start)
     n="${2:-2}"
-    [[ -z "$(instances)" ]] || { echo "already running: $(instances)"; exit 1; }
+    # BURST_REPLACE=1 starts a new pool beside a running one (to change how it is made);
+    # retire the old one afterwards with `stop-old <instance-id>...`.
+    [[ -n "${BURST_REPLACE:-}" || -z "$(instances)" ]] || { echo "already running: $(instances) (BURST_REPLACE=1 to add a pool beside it)"; exit 1; }
     # The default VPC's subnet and the newest Ubuntu 24.04, as the playground host uses.
     # (describe-images, not Canonical's SSM parameter, which a limited IAM user may not read.)
     ami=$(aws ec2 describe-images --owners 099720109477 \
@@ -62,14 +65,15 @@ case "${1:-}" in
       --query 'Instances[].InstanceId' --output text)
     echo "launched: $ids"
     want=$((n * 2))
+    pat=$(echo "$ids" | tr -s '[:space:]' '|' | sed 's/|$//')   # only the runners of these instances count
     for _ in $(seq 1 60); do   # up to 20 minutes for Docker and the runners
-      have=$(runners | grep -c ' online$' || true)
+      have=$(runners | grep -E "burst-($pat)-" | grep -c ' online$' || true)
       [[ "$have" -ge "$want" ]] && break
       sleep 20
     done
-    runners
+    runners | grep -E "burst-($pat)-"
     [[ "$have" -ge "$want" ]] || { echo "only $have of $want runners online: not setting BURST_RUNS_ON; see 'aws ec2 get-console-output'"; exit 1; }
-    gh variable set BURST_RUNS_ON --repo "$REPO" --body "[\"self-hosted\",\"$LABEL\"]"
+    gh variable set BURST_RUNS_ON --repo "$REPO" --body "[\"$LABEL\"]"
     echo "BURST_RUNS_ON set: the SASS, ASan and TSan jobs go to the pool"
     ;;
   status)
@@ -85,5 +89,20 @@ case "${1:-}" in
     # Their runners stay listed as offline until removed.
     runners | while read -r id name _; do gh api -X DELETE "repos/$REPO/actions/runners/$id" && echo "removed runner $name"; done
     ;;
-  *) sed -n 2,22p "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  stop-old)   # retire named instances once their runners are idle, leaving the rest and the variable alone
+    shift
+    for id in "$@"; do
+      for _ in $(seq 1 180); do   # up to 3 hours for a running job to finish
+        left=0
+        while read -r rid name _; do
+          [[ "$name" == burst-$id-* ]] || continue
+          gh api -X DELETE "repos/$REPO/actions/runners/$rid" >/dev/null 2>&1 && echo "removed runner $name" || left=1   # a busy runner refuses
+        done < <(runners)
+        [[ $left == 0 ]] && break
+        sleep 60
+      done
+      aws ec2 terminate-instances --instance-ids "$id" --query 'TerminatingInstances[].[InstanceId,CurrentState.Name]' --output text
+    done
+    ;;
+  *) sed -n 2,24p "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

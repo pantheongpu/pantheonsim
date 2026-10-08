@@ -152,7 +152,7 @@ jobs:
     # with cutlass_sass also builds the CUTLASS tests' SASS (sm_90a, sm_100a,
     # sm_120a) and requires it to run, which takes a few hours.
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
-    # another pool, e.g. ["self-hosted", "pantheonsim-burst"]: AWS instances
+    # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
@@ -510,7 +510,7 @@ jobs:
   sanitizers:
     name: ASan + UBSan
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
-    # another pool, e.g. ["self-hosted", "pantheonsim-burst"]: AWS instances
+    # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
@@ -560,7 +560,7 @@ jobs:
   threads:
     name: ThreadSanitizer
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
-    # another pool, e.g. ["self-hosted", "pantheonsim-burst"]: AWS instances
+    # another pool, e.g. ["pantheonsim-burst"]: AWS instances
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
