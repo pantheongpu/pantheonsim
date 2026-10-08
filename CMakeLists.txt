@@ -845,16 +845,37 @@ libcutensor.2.7.0 {
 
   # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
-  # vendored headers (nvidia/third_party/cudnn_include) -- hand-writing a vendor
-  # struct layout has silently produced garbage twice, so we never do it.
+  # cuDNN API headers -- hand-writing a vendor struct layout has silently
+  # produced garbage twice, so we never do it. The headers are NVIDIA's and are
+  # not kept in this tree: CUDNN_HEADER_DIR (environment) names a directory that
+  # has them, and otherwise they are fetched into the build directory from the
+  # nvidia-cudnn-cu12 wheel on PyPI (scripts/fetch-cudnn-headers.py: about 1 MB,
+  # each file checked against scripts/cudnn-headers.sha256). Without network
+  # access, or with VGPU_FETCH_CUDNN_HEADERS=OFF, libvgpucudnn is skipped.
   # Real cuDNN exports versioned symbols tagged "libcudnn.so.9"; the version
   # script gives ours the same tag so the loader binds without the
   # "no version information available" warning.
   # ---------------------------------------------------------------------------
+  option(VGPU_FETCH_CUDNN_HEADERS "Fetch cuDNN's API headers from PyPI when none are given" ON)
   vgpu_forget_stale_path(CUDNN_INCLUDE cudnn.h)
   find_path(CUDNN_INCLUDE cudnn.h
-    PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/cudnn_include" ENV CUDNN_HEADER_DIR
+    PATHS ENV CUDNN_HEADER_DIR "${CMAKE_BINARY_DIR}/cudnn_include"
     NO_DEFAULT_PATH)
+  if(NOT CUDNN_INCLUDE AND VGPU_FETCH_CUDNN_HEADERS)
+    find_program(VGPU_PYTHON NAMES python3 python)
+    if(VGPU_PYTHON)
+      execute_process(
+        COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/fetch-cudnn-headers.py" "${CMAKE_BINARY_DIR}/cudnn_include"
+        RESULT_VARIABLE _cudnn_fetch_rc OUTPUT_VARIABLE _cudnn_fetch_out ERROR_VARIABLE _cudnn_fetch_err)
+      if(_cudnn_fetch_rc EQUAL 0)
+        message(STATUS "${_cudnn_fetch_out}")
+        unset(CUDNN_INCLUDE CACHE)
+        find_path(CUDNN_INCLUDE cudnn.h PATHS "${CMAKE_BINARY_DIR}/cudnn_include" NO_DEFAULT_PATH)
+      else()
+        message(STATUS "cuDNN headers could not be fetched: ${_cudnn_fetch_err}")
+      endif()
+    endif()
+  endif()
   if(CUDNN_INCLUDE)
     message(STATUS "cuDNN headers at ${CUDNN_INCLUDE}: building libvgpucudnn")
     # Every entry point PyTorch binds is implemented, so cuDNN has no
@@ -874,7 +895,7 @@ libcutensor.2.7.0 {
               "${CMAKE_BINARY_DIR}/shim/libcudnn.so"
       COMMENT "Creating cuDNN shim symlinks (build/shim/libcudnn.so.9)")
   else()
-    message(STATUS "cuDNN headers not found: skipping libvgpucudnn")
+    message(STATUS "cuDNN headers not found (set CUDNN_HEADER_DIR, or allow VGPU_FETCH_CUDNN_HEADERS): skipping libvgpucudnn")
   endif()
 
   # ---------------------------------------------------------------------------
@@ -2192,6 +2213,12 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+
+# No file under NVIDIA's proprietary terms in the tree, and the fetch that
+# stands in for the cuDNN headers that used to be vendored.
+add_test(NAME lint_no_proprietary_nvidia COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_no_proprietary_nvidia.sh)
+add_test(NAME lint_cudnn_header_fetch COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_cudnn_header_fetch.sh)
+set_tests_properties(lint_cudnn_header_fetch PROPERTIES TIMEOUT 300)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
