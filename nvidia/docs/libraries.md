@@ -632,9 +632,15 @@ not exact, and are marked so in that test rather than claimed:
   -0.0391). 8-bit and float results match; a 16-bit image has about one pixel
   in a thousand a count apart, a 32-bit integer one a float ulp apart on about
   one in ten.
-- **`nppiResizeSqrPixel`** cubic is a different kernel, not one of the Keys or
-  Mitchell-Netravali family; Lagrange stands in for it, a few counts away.
-  Super-sampling and Lanczos are not implemented (`NPP_INTERPOLATION_ERROR`).
+- **`nppiResizeSqrPixel`** cubic uses four Lagrange weights rounded the way
+  NPP's are, and the order of fused multiply-adds NPP's float output shows:
+  bit-identical to NPP 13.0 on the resize cases `npp_imgproc` pins. Lanczos
+  (windowed sinc, three lobes, not widened when shrinking) matches the card
+  at the factors tried to a float rounding and differs by up to 2e-3
+  relative between them, where NPP's sinc is tabulated or approximated;
+  super-sampling (area average, both factors below one, else
+  `NPP_RESIZE_FACTOR_ERROR`) is compared as approximate. The warps'
+  super-sampling is still `NPP_INTERPOLATION_ERROR`.
 - **`nppiAlphaComp_8u_AC4R`**: every operator's alpha and every colour is
   exact except the non-premultiplied ATOP and XOR colours, within one count.
 - **`nppiFilterCannyBorder`**: on NPP 13.0 the high threshold changes nothing
@@ -909,8 +915,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   -- allocation, per-pixel arithmetic and logic, data exchange, colour
   conversion, thresholding, statistics, filters, morphology, resizing, and
   the signal-processing equivalents. Not implemented: watershed segmentation
-  and marker-label compression (one CUDA Sample), ResizeSqrPixel's
-  super-sampling and Lanczos modes, and the rest of NPP's ten thousand entry
+  and marker-label compression (one CUDA Sample), and the rest of NPP's ten thousand entry
   points, which are absent rather than approximated, so a program that needs
   more fails at link time with a name.
 - **Device runtime** (cudadevrt, dynamic parallelism), on both engines:
