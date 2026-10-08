@@ -630,7 +630,7 @@ struct Machine {
       kBf6{2, 3, 28.0, F8::Finite, 6}, kFp4{1, 1, 6.0, F8::Finite, 4};
   // The 8-bit formats the code's processor has.
   // gfx950 and RDNA4 use the OCP formats; gfx942's are FNUZ.
-  bool ocp8() const { return d.object->gfx950() || target() == gcn::Target::Gfx1200; }
+  bool ocp8() const { return d.object->gfx950() || gcn::is_gfx12(target()); }
   const F8& fp8() const { return ocp8() ? kOcpFp8 : kFp8; }
   const F8& bf8() const { return ocp8() ? kOcpBf8 : kBf8; }
   static float f8_to_float(uint32_t v, const F8& t) {
@@ -1078,7 +1078,7 @@ struct Machine {
       const uint32_t id = static_cast<uint32_t>(in.simm) & 0x3F, at = (static_cast<uint32_t>(in.simm) >> 6) & 0x1F,
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
-      const bool sched = id == 26 && in.arch == gcn::Target::Gfx1200;
+      const bool sched = id == 26 && gcn::is_gfx12(in.arch);
       const bool flat_scr = (id == 20 || id == 21) && in.arch == gcn::Target::Gfx1030;
       if (op != "s_getreg_b32"_op) {
         if (id != 1 && !sched && !flat_scr)
@@ -1095,7 +1095,7 @@ struct Machine {
         if (id == 1) reg = w.mode;
         else if (sched) reg = w.sched_mode;
         else if (flat_scr) reg = w.flat_scratch[id - 20];
-        else if (id == 4 && in.arch == gcn::Target::Gfx1200) {
+        else if (id == 4 && gcn::is_gfx12(in.arch)) {
           // gfx12's STATE_PRIV, where register 4 was HW_ID before: of its
           // fields only SCC (bit 9) has a value here. The barrier, priority,
           // halt, debug and trace states read as a running wave's are, 0.
@@ -1124,9 +1124,9 @@ struct Machine {
         // count on gfx10.3 and gfx11; on gfx12 its low word (29) and high
         // word (30). The count is s_memtime's, the instructions retired.
         else if (id == 29 && is_rdna(in.arch))
-          reg = in.arch == gcn::Target::Gfx1200 ? static_cast<uint32_t>(stats.instructions)
+          reg = gcn::is_gfx12(in.arch) ? static_cast<uint32_t>(stats.instructions)
                                                 : static_cast<uint32_t>(stats.instructions) & 0xFFFFF;
-        else if (id == 30 && in.arch == gcn::Target::Gfx1200) reg = static_cast<uint32_t>(stats.instructions >> 32);
+        else if (id == 30 && gcn::is_gfx12(in.arch)) reg = static_cast<uint32_t>(stats.instructions >> 32);
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);
       }
@@ -1858,7 +1858,7 @@ struct Machine {
   void wmma(Wave& w, const Inst& in, const OpName& op) {
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu)
       throw Error::make(Err::Unsupported, in.name, " with lanes switched off, or in a wave64, which this does not model");
-    const bool g12 = in.arch == gcn::Target::Gfx1200;
+    const bool g12 = gcn::is_gfx12(in.arch);
     const std::string name = op;   // v_wmma_<out>_16x16x<K>_<a>[_<b>]
     const std::string out = name.substr(7, name.find('_', 7) - 7);
     const size_t shape_at = name.find("16x16x");
@@ -5908,7 +5908,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // LLVM reads it (llvm.amdgcn.wave.id). Without it every wave of a Triton
     // kernel took itself for the first, and only a group's first 32 work-items'
     // share of the work was done right.
-    if (m.target() == gcn::Target::Gfx1200) {
+    if (gcn::is_gfx12(m.target())) {
       w.ttmp[9] = gx;
       w.ttmp[7] = (gy & 0xFFFF) | gz << 16;
       w.ttmp[8] = (i & 0x1F) << 25;

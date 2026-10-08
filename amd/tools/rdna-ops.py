@@ -49,6 +49,12 @@ KINDS = {
     'OPR_SREG_M0': 'Ssrc', 'OPR_SREG_LITERAL': 'Ssrc', 'OPR_SMEM_OFFSET_NOK': 'Ssrc', 'OPR_SIMM5': 'Simm16',
     'OPR_SENDMSG_RTN': 'Sendmsg', 'OPR_SSRC_BARRIER_ID': 'Ssrc', 'OPR_WAIT_MEM_DS': 'Waitcnt', 'OPR_SLEEP': 'Simm16',
     'OPR_WAIT_ALU': 'Depctr', 'OPR_WAIT_EVENT': 'Simm16',
+    # CDNA 5's. Most are implicit operands (the memory a load reads, the PC a call writes) and never reach the
+    # table; the explicit ones are an s_set_vgpr_msb immediate, a scalar register of a tensor instruction, a
+    # 64-bit literal, and the plain and no-inline-constant vector sources.
+    'OPR_SET_VGPR_MSB': 'Simm16', 'OPR_SGPR': 'Sreg', 'OPR_SIMM64': 'Simm64', 'OPR_SRC_NOINLINE': 'Src',
+    'OPR_SRC_SIMPLE': 'Src', 'OPR_DSMEM': 'Ssrc', 'OPR_GPUMEM': 'Ssrc', 'OPR_SDST_EXEC': 'Sdst',
+    'OPR_SSRC_SPECIAL_SCC': 'Ssrc', 'OPR_PC': 'Ssrc', 'OPR_SDST_M0': 'Sdst',
     # RDNA2's.
     'OPR_SREG_NONULL': 'Sreg', 'OPR_SRC_NOLDS': 'Src', 'OPR_SSRC_NOLDS': 'Ssrc', 'OPR_VGPR_OR_LDS': 'Src',
     'OPR_ATTR': 'Simm16', 'OPR_PARAM': 'Simm16',

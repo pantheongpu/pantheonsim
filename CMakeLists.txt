@@ -45,6 +45,7 @@ set(VGPU_PROFILES
   amd/mi300x
   amd/mi325x
   amd/mi350x
+  amd/mi455x
   amd/rx7900xtx
   amd/rx9070xt
   amd/rx6900xt
