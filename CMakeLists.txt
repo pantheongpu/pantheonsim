@@ -411,6 +411,50 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   vgpu_toolkit_soversion(cupti 13 SO_CUPTI)
   vgpu_version_script(cupti ${SO_CUPTI} _cupti_map)
+  # The runtime-API callback IDs are the toolkit's, so the table of them is
+  # read from its header here rather than kept by hand: {function, versioned
+  # name, ID} for every one the header names. Without cupti.h beside it there is
+  # no CUPTI to build, and the guard on the target below says so.
+  set(_cbid_header "${CUDA_ABI_INCLUDE}/cupti_runtime_cbid.h")
+  set(_cbid_inc "${CMAKE_BINARY_DIR}/gen/cupti_runtime_cbids.inc")
+  set(_cbid_text "")
+  if(EXISTS "${_cbid_header}")
+    file(STRINGS "${_cbid_header}" _cbid_lines REGEX "CUPTI_RUNTIME_TRACE_CBID_[A-Za-z0-9_]+_v[0-9]+ *=")
+    foreach(_line IN LISTS _cbid_lines)
+      if(_line MATCHES "CUPTI_RUNTIME_TRACE_CBID_([A-Za-z0-9_]+)_v([0-9]+) *=")
+        set(_fn "${CMAKE_MATCH_1}")
+        set(_ver "${CMAKE_MATCH_2}")
+        string(APPEND _cbid_text
+               "VGPU_CBID_ROW(\"${_fn}\", \"${_fn}_v${_ver}\", CUPTI_RUNTIME_TRACE_CBID_${_fn}_v${_ver})\n")
+      endif()
+    endforeach()
+  endif()
+  file(WRITE "${_cbid_inc}.tmp" "${_cbid_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cbid_inc}.tmp" "${_cbid_inc}")
+  # The driver-API ones, from cupti_driver_cbid.h. The names are not versioned
+  # the runtime's way (cudaMalloc_v3020): they are the driver function's own
+  # spelling, cuMemAlloc_v2 and cuMemAlloc being two functions with an ID each,
+  # and the name a subscriber is told is exactly that. A second file says which
+  # exist, because the toolkits differ (cuCtxCreate_v4 is newer than 12.0).
+  set(_dcbid_header "${CUDA_ABI_INCLUDE}/cupti_driver_cbid.h")
+  set(_dcbid_inc "${CMAKE_BINARY_DIR}/gen/cupti_driver_cbids.inc")
+  set(_dcbid_have "${CMAKE_BINARY_DIR}/gen/cupti_driver_have.h")
+  set(_dcbid_text "")
+  set(_dcbid_have_text "")
+  if(EXISTS "${_dcbid_header}")
+    file(STRINGS "${_dcbid_header}" _dcbid_lines REGEX "CUPTI_DRIVER_TRACE_CBID_cu[A-Za-z0-9_]+ *=")
+    foreach(_line IN LISTS _dcbid_lines)
+      if(_line MATCHES "CUPTI_DRIVER_TRACE_CBID_(cu[A-Za-z0-9_]+) *=")
+        set(_fn "${CMAKE_MATCH_1}")
+        string(APPEND _dcbid_text "VGPU_DRIVER_CBID_ROW(\"${_fn}\", CUPTI_DRIVER_TRACE_CBID_${_fn})\n")
+        string(APPEND _dcbid_have_text "#define VGPU_HAVE_DRIVER_CBID_${_fn} 1\n")
+      endif()
+    endforeach()
+  endif()
+  file(WRITE "${_dcbid_inc}.tmp" "${_dcbid_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_inc}.tmp" "${_dcbid_inc}")
+  file(WRITE "${_dcbid_have}.tmp" "${_dcbid_have_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_have}.tmp" "${_dcbid_have}")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -418,7 +462,7 @@ if(CUDA_ABI_INCLUDE)
   # turn recording on in one and the runtime would keep reading the other, and
   # a profiler would attach successfully and receive nothing.
   target_link_libraries(vgpucupti PRIVATE vgpucudart)
-  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include)
+  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include "${CMAKE_BINARY_DIR}/gen")
   set_target_properties(vgpucupti PROPERTIES
     OUTPUT_NAME cupti SOVERSION ${SO_CUPTI} VERSION ${SO_CUPTI}.0)
   target_link_options(vgpucupti PRIVATE "-Wl,--version-script=${_cupti_map}")
@@ -1261,6 +1305,16 @@ set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# OpenMP target offloading (LLVM's libomptarget, whose AMD plugin drives the HSA
+# runtime directly), built by ROCm's amdclang++ for every simulated GPU's ISA.
+add_test(NAME amd_openmp COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_openmp.sh)
+set_tests_properties(amd_openmp PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# OpenCL (ROCm's runtime and compiler library over the simulator's HSA runtime)
+# on every simulated GPU.
+add_test(NAME amd_opencl COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_opencl.sh)
+set_tests_properties(amd_opencl PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # AMD's hipFFT, hipRAND, hipSOLVER and hipSPARSE, unmodified, where ROCm with
 # them is installed or PyTorch's ROCm wheel is.
 add_test(NAME amd_libraries COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_libraries.sh)
@@ -1343,6 +1397,11 @@ set_tests_properties(amd_pytorch_models_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_
 add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
 set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# hipBLASLt's xf32 GEMM (reduced-precision floats, v_mfma_f32_16x16x8_xf32), which PyTorch
+# runs on an MI300X when told a float32 matmul may use it.
+add_test(NAME amd_pytorch_xf32 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh xf32.py 1 1)
+set_tests_properties(amd_pytorch_xf32 PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Two processes, as torchrun runs them: RCCL across processes, and
 # DistributedDataParallel.
 add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
@@ -1409,6 +1468,10 @@ set_tests_properties(amd_hipcc_disasm PROPERTIES DEPENDS test_amd_gcn
 # The HIP structures against the HIP headers, field by field, where ROCm is installed.
 add_test(NAME amd_hip_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_abi.sh)
 set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+# The HIP version the runtime reports, by the library name a program was built to ask for.
+add_test(NAME amd_hip_version COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_version.sh)
+set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn
@@ -1995,6 +2058,45 @@ if(TARGET vgpucupti)
   add_test(NAME e2e_cupti_activity
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_activity.sh)
   set_tests_properties(e2e_cupti_activity PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # The trace a program gets of itself -- callbacks and activity records --
+  # against the one NVIDIA's CUPTI printed for the same program on an RTX 3060.
+  add_test(NAME e2e_cupti_trace
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh trace)
+  set_tests_properties(e2e_cupti_trace PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # NVTX markers and ranges through CUPTI, against what NVIDIA's printed.
+  add_test(NAME e2e_cupti_nvtx
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh nvtx)
+  set_tests_properties(e2e_cupti_nvtx PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # External correlation ids, which a framework's profiler uses to tie a kernel
+  # to the operator that launched it.
+  add_test(NAME e2e_cupti_extcorr
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh extcorr)
+  set_tests_properties(e2e_cupti_extcorr PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # The same for a program that uses only the driver API: the driver calls, the
+  # kernels, copies, fills and waits they issue, and the context and streams.
+  add_test(NAME e2e_cupti_trace_driver
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_trace_driver.sh)
+  set_tests_properties(e2e_cupti_trace_driver PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"

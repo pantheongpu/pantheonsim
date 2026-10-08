@@ -21,6 +21,7 @@
 
 extern "C" {
 int rsmi_init(uint64_t);
+int rsmi_dev_firmware_version_get(uint32_t, int, uint64_t*);
 int rsmi_num_monitor_devices(uint32_t*);
 int rsmi_dev_pci_id_get(uint32_t, uint64_t*);
 int rsmi_topo_get_link_type(uint32_t, uint32_t, uint64_t*, int*);
@@ -350,6 +351,20 @@ VTEST(every_function_of_the_header_is_there_and_refused_where_there_is_no_answer
   VCHECK_EQ(rsmi_dev_xgmi_physical_id_get(0, &v), kNotSupported);
   VCHECK_EQ(rsmi_dev_sku_get(7, &v), kOutOfBounds);
   VCHECK_EQ(rsmi_driver_status(nullptr), kNotSupported);
+}
+
+// RCCL 2.27 reads the compute microengine's firmware (block 5) to decide whether it needs
+// HSA_NO_SCRATCH_RECLAIM, and does not start on a card that gives none.
+VTEST(the_compute_microengine_firmware_is_what_rccl_accepts) {
+  uint64_t fw = 0;
+  VCHECK_EQ(rsmi_init(0), 0);
+  const char* gpu = std::getenv("VGPU_GPU");
+  const std::string g = gpu ? gpu : "amd/mi300x";
+  const bool mi300 = g == "amd/mi300x" || g == "amd/mi325x", mi350 = g == "amd/mi350x";
+  VCHECK_EQ(rsmi_dev_firmware_version_get(0, 5, &fw), mi300 || mi350 ? 0 : 2);   // 2: not supported
+  if (mi300) VCHECK_EQ(fw, uint64_t{177});
+  if (mi350) VCHECK_EQ(fw, uint64_t{24});
+  VCHECK_EQ(rsmi_dev_firmware_version_get(0, 1, &fw), 2);   // the other blocks are not modelled
 }
 
 VTEST_MAIN

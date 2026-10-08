@@ -25,6 +25,21 @@
     if (r_ != CUPTI_SUCCESS) { std::printf("FAIL %s:%d: CUPTI status %d\n", __FILE__, __LINE__, (int)r_); return 1; } \
   } while (0)
 
+// The newest layout of each record this toolkit defines, which is what the
+// library under test hands out.
+#if CUPTI_API_VERSION >= 130200
+using KernelRecord = CUpti_ActivityKernel11;
+#elif CUPTI_API_VERSION >= 130000
+using KernelRecord = CUpti_ActivityKernel10;
+#else
+using KernelRecord = CUpti_ActivityKernel9;
+#endif
+#if CUPTI_API_VERSION >= 26
+using MemcpyRecord = CUpti_ActivityMemcpy6;
+#else
+using MemcpyRecord = CUpti_ActivityMemcpy5;
+#endif
+
 static int g_kernels = 0, g_memcpies = 0;
 static int g_grid_x = 0, g_block_x = 0;
 static char g_name[256] = {0};
@@ -47,7 +62,7 @@ static void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size
   while (cuptiActivityGetNextRecord(buffer, valid, &record) == CUPTI_SUCCESS) {
     if (record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
         record->kind == CUPTI_ACTIVITY_KIND_KERNEL) {
-      auto* k = reinterpret_cast<CUpti_ActivityKernel9*>(record);
+      auto* k = reinterpret_cast<KernelRecord*>(record);
       ++g_kernels;
       g_grid_x = k->gridX;
       g_block_x = k->blockX;
@@ -55,7 +70,7 @@ static void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size
       g_kernel_corr = k->correlationId;
       if (k->end < k->start) ++g_bad_time;
     } else if (record->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {
-      auto* m = reinterpret_cast<CUpti_ActivityMemcpy5*>(record);
+      auto* m = reinterpret_cast<MemcpyRecord*>(record);
       ++g_memcpies;
       g_bytes += m->bytes;
       if (g_copies_seen < 2) g_copy_corr[g_copies_seen++] = m->correlationId;
@@ -132,8 +147,9 @@ int main() {
   }
   const char* launch_name = nullptr;
   CP(cuptiGetCallbackName(CUPTI_CB_DOMAIN_RUNTIME_API, g_launch_cbid, &launch_name));
-  if (!launch_name || std::strcmp(launch_name, "cudaLaunchKernel") != 0) {
-    std::printf("FAIL: callback %u is named '%s', expected cudaLaunchKernel\n", g_launch_cbid,
+  // The versioned spelling, as NVIDIA's names it (checked on an RTX 3060).
+  if (!launch_name || std::strcmp(launch_name, "cudaLaunchKernel_v7000") != 0) {
+    std::printf("FAIL: callback %u is named '%s', expected cudaLaunchKernel_v7000\n", g_launch_cbid,
                 launch_name ? launch_name : "(null)");
     return 1;
   }
