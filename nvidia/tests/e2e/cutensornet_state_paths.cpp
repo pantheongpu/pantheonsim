@@ -4,8 +4,11 @@
 // reduced density matrices, expectation values, samples -- by contraction or
 // from a matrix product state (MPS).
 //
-// The expectations hold for NVIDIA's libcutensornet 2.14 on an RTX 3060 too:
-// this program passes there. Conventions (the matrix layout of an operator,
+// The expectations hold for NVIDIA's libcutensornet 2.14 on an RTX 3060 too,
+// except three that are still the simulator's own and unmatched on the card
+// (the final successful AccessorCompute after the argument errors, and the
+// two CreateExpectation refusals for another set of modes and another data
+// type, which the card accepts). Conventions (the matrix layout of an operator,
 // the order of modes, which operators cancel in a norm, what an integer id
 // is) were measured on the card and are checked here against a dense host
 // simulation. The contraction paths, workspace sizes and FLOP counts are each
@@ -969,7 +972,7 @@ static void test_state_compute() {
   WS ws;
   Dev out(12);
   void* ptrs[1] = {out.p};
-  IS(cutensornetStateCompute(h, c.st, ws.d, nullptr, nullptr, ptrs, 0), 15);  // no scratch memory set
+  IS(cutensornetStateCompute(h, c.st, ws.d, nullptr, nullptr, ptrs, 0), 7);  // not prepared (refused before the scratch is looked at)
   IS(cutensornetStatePrepare(h, c.st, (size_t)1 << 30, ws.d, 0), 0);
   ws.alloc();
   IS(cutensornetStateGetInfo(h, c.st, CUTENSORNET_STATE_INFO_FLOPS, &fl, 8), 0);
@@ -1211,7 +1214,8 @@ static void test_mps() {
     // a new operator makes the MPS outdated
     c.gate({0}, c.random_matrix({0}));
     cutensornetStateAccessor_t a2;
-    IS(cutensornetCreateAccessor(h, c.st, 0, nullptr, nullptr, &a2), 14);
+    IS(cutensornetCreateAccessor(h, c.st, 0, nullptr, nullptr, &a2), 0);   // measured: still the MPS computed last
+    cutensornetDestroyAccessor(a2);
     std::vector<void*> none(5, nullptr);
     IS(cutensornetStateCompute(h, c.st, ws.d, nullptr, nullptr, none.data(), 0), 7);
   }
@@ -1377,8 +1381,10 @@ static void test_mps_init_capture() {
   Dev dg2(G2);
   int32_t m23[2] = {2, 3};
   IS(cutensornetStateApplyTensorOperator(h, k.st, 2, m23, dg2.p, nullptr, 1, 0, 0, &id), 0);
+  // measured on an RTX 3060: an accessor still reads the captured MPS (the operator joins the state when
+  // the MPS is computed again), so it returns the amplitudes from before the operator.
+  check(maxdiff(accessor_full(k, 32, &nrm), k.ref.v) < 1e-9, "an accessor reads the captured MPS, not the operators applied after it");
   k.ref.apply({2, 3}, G2);
-  check(maxdiff(accessor_full(k, 32, &nrm), k.ref.v) < 1e-9, "an operator applied after capturing the MPS");
   Circuit nc(e4);
   IS(cutensornetStateCaptureMPS(h, nc.st), 7);  // nothing computed
 }

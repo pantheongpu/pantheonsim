@@ -231,6 +231,9 @@ struct State {
   bool mps_computed = false;
   bool dense_computed = false;
   uint64_t mps_epoch = 0;
+  // s.mps holds an MPS the state's properties read (measured: after more operators are applied, an
+  // accessor still returns the MPS last computed or captured, until it is computed again).
+  bool mps_held = false;
   MpsTensors mps;
   // an RNG for channels resolved at random
   std::mt19937_64 rng{std::random_device{}()};
@@ -383,9 +386,12 @@ void emit_mps_tensors(NetBuild& b, const State& s, const MpsTensors& m, Side& si
   }
 }
 
+// Whether the properties start from the stored MPS instead of the operators.
+bool reads_mps(const State& s) { return s.mps_computed || (s.mps_finalized && s.mps_held); }
+
 // The start of a side: the computed MPS, the caller's initial MPS, or the vacuum.
 void emit_initial(NetBuild& b, const State& s, Side& side) {
-  if (s.mps_computed) {
+  if (reads_mps(s)) {
     emit_mps_tensors(b, s, s.mps, side);
     return;
   }
@@ -572,7 +578,7 @@ Status emit_op(NetBuild& b, const State& s, const Op& op, size_t idx, Circ& c, S
 Status emit_side(NetBuild& b, const State& s, Circ& c, Side& side, const char* api) {
   side.wire.assign((size_t)s.n, -1);
   emit_initial(b, s, side);
-  if (s.mps_computed) return CUTENSORNET_STATUS_SUCCESS;  // the operators are in the MPS
+  if (reads_mps(s)) return CUTENSORNET_STATUS_SUCCESS;  // the operators are in the MPS
   for (size_t i = 0; i < s.ops.size(); ++i) {
     if (!c.cancelled.empty() && c.cancelled[i]) continue;
     if (Status st = emit_op(b, s, s.ops[i], i, c, side, api)) return st;
@@ -996,7 +1002,7 @@ Status check_channels(const State& s, const char* api) {
 
 // A property needs the finalised MPS computed first (measured: creating one on
 // an uncomputed MPS fails with an internal error).
-bool awaits_mps(const State& s) { return s.mps_finalized && !s.mps_computed; }
+bool awaits_mps(const State& s) { return s.mps_finalized && !s.mps_held; }
 
 }  // namespace
 
@@ -2439,6 +2445,7 @@ cutensornetStatus_t cutensornetStateCompute(const cutensornetHandle_t handle, cu
     }
     s->mps = std::move(out);
     s->mps_computed = true;
+    s->mps_held = true;
     s->mps_epoch = s->epoch;
     return CUTENSORNET_STATUS_SUCCESS;
   }
@@ -2523,6 +2530,7 @@ cutensornetStatus_t cutensornetStateFinalizeMPS(const cutensornetHandle_t handle
   s->mps_max_ext = std::move(ext);
   s->mps_out_str = std::move(str);
   s->mps_computed = false;
+  s->mps_held = false;
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -2564,6 +2572,7 @@ cutensornetStatus_t cutensornetStateInitializeMPS(const cutensornetHandle_t hand
   s->epoch++;
   s->prepared = false;
   s->mps_computed = false;
+  s->mps_held = false;
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -2581,6 +2590,7 @@ cutensornetStatus_t cutensornetStateCaptureMPS(const cutensornetHandle_t handle,
   s->epoch++;
   s->prepared = false;
   s->mps_computed = true;
+  s->mps_held = true;
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -2990,7 +3000,7 @@ cutensornetStatus_t cutensornetCreateSampler(const cutensornetHandle_t handle, c
   State* s;
   if (Status st = state_args(handle, tensorNetworkState, h, s, api)) return st;
   if (!tensorNetworkSampler) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "a null pointer was passed");
-  if (s->mps_finalized && !s->mps_computed) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "cuTensorNet internal error");
+  if (awaits_mps(*s)) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "cuTensorNet internal error");
   auto sp = std::make_unique<Sampler>();
   if (numModesToSample < 1) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "no modes to sample");
   if (Status st = check_mode_list(numModesToSample, modesToSample, s->n, true, sp->modes, api)) return st;
