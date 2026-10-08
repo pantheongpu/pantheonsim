@@ -87,11 +87,19 @@ inline T saturate(double v) {
      with float-sized rounding errors in the low bits. */
 enum Interp { kNN = 1, kLinear = 2, kCubic = 4 };
 
+// The four weights NPP's cubic filter gives the taps at x-1, x, x+1, x+2 for a
+// fractional position f. They are the Lagrange weights, and they are rounded
+// the way NPP's are: the outer two are the products f(1-f)(2-f)/6 and
+// (f+1)f(1-f)/6 grouped as below, the inner two the plain products over 2.
+// Fitted bit for bit against NPP 13.0 on an RTX 3060: the impulse response of
+// nppiResizeSqrPixel_32f_C1R_Ctx at factors 3, 5, 6, 7, 10, 1.7 and 2.3 (an
+// exact match on 559 samples) fixes each weight to the last bit, and every
+// other grouping of the factors tried differs by up to an ulp on some phase.
 inline void lagrange4(float f, float w[4]) {
-  w[0] = -f * (f - 1) * (f - 2) / 6;
+  w[0] = -((f * (1 - f)) * ((2 - f) / 6));
   w[1] = (f + 1) * (f - 1) * (f - 2) / 2;
   w[2] = -(f + 1) * f * (f - 2) / 2;
-  w[3] = (f + 1) * f * (f - 1) / 6;
+  w[3] = -((((f + 1) / 6) * f) * (1 - f));
 }
 
 // Samples every channel of `src` at (sx, sy). Taps outside the image repeat
@@ -111,13 +119,15 @@ inline void sample(const Image<T>& src, float sx, float sy, int interp, double* 
   const int x0 = static_cast<int>(std::floor(sx)), y0 = static_cast<int>(std::floor(sy));
   const float fx = sx - x0, fy = sy - y0;
   if (interp == kLinear) {
+    // Both taps repeat the edge pixel where the point is past it.
+    const int xa = ix_img(x0), ya = iy_img(y0);
     const int x1 = ix_img(x0 + 1), y1 = iy_img(y0 + 1);
     for (int c = 0; c < src.ch; ++c) {
       // Fused exactly like this: any other grouping is off by one count on a
       // few pixels of a 16-bit image and by tens on a 32-bit one.
-      const float top = std::fma(static_cast<float>(src.at(x0, y0, c)), 1 - fx,
-                                 static_cast<float>(src.at(x1, y0, c)) * fx);
-      const float bot = std::fma(static_cast<float>(src.at(x0, y1, c)), 1 - fx,
+      const float top = std::fma(static_cast<float>(src.at(xa, ya, c)), 1 - fx,
+                                 static_cast<float>(src.at(x1, ya, c)) * fx);
+      const float bot = std::fma(static_cast<float>(src.at(xa, y1, c)), 1 - fx,
                                  static_cast<float>(src.at(x1, y1, c)) * fx);
       out[c] = std::fma(top, 1 - fy, bot * fy);
     }
@@ -131,20 +141,26 @@ inline void sample(const Image<T>& src, float sx, float sy, int interp, double* 
     xs[i] = ix_img(x0 + i - 1);
     ys[i] = iy_img(y0 + i - 1);
   }
-  // Each row first, then the column of row results, each a fused chain from
-  // the first tap: the order that reproduces NVIDIA's 16-bit results exactly.
-  // (32-bit integer images still differ from it by one float ulp on about one
-  // pixel in ten; no grouping tried removes that.)
-  auto dot4 = [](const float w[4], const float p[4]) {
+  // Each row first, then the column of row results. A row is a fused chain
+  // that starts at the second tap -- w1*p1, then w0, w2, w3 -- and the column
+  // one that starts at the first -- w0*r0, then w1, w2, w3: the orders that
+  // reproduce NVIDIA's float output bit for bit (nppiResizeSqrPixel_32f_C1R
+  // on random data, interior pixels: all of them; the 8- and 16-bit warps and
+  // resizes round it anyway). Exhaustive search over every order and fusing
+  // of four terms found these two and no other.
+  auto row4 = [](const float w[4], const float p[4]) {
+    return std::fma(w[3], p[3], std::fma(w[2], p[2], std::fma(w[0], p[0], w[1] * p[1])));
+  };
+  auto col4 = [](const float w[4], const float p[4]) {
     return std::fma(w[3], p[3], std::fma(w[2], p[2], std::fma(w[1], p[1], w[0] * p[0])));
   };
   for (int c = 0; c < src.ch; ++c) {
     float rows[4], p[4];
     for (int j = 0; j < 4; ++j) {
       for (int i = 0; i < 4; ++i) p[i] = static_cast<float>(src.at(xs[i], ys[j], c));
-      rows[j] = dot4(wx, p);
+      rows[j] = row4(wx, p);
     }
-    out[c] = dot4(wy, rows);
+    out[c] = col4(wy, rows);
   }
 }
 
