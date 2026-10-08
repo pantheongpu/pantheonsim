@@ -76,3 +76,43 @@ jobs:
           ctest --test-dir build --output-on-failure --timeout 1800 \
             -R '^amd_(pytorch.*|rocblas|hipsparselt.*|libraries)$' 2>&1 | tee ctest.log
           if grep -q 'Skipped' ctest.log; then echo "a test skipped: something it needs is missing"; exit 1; fi
+
+  models:
+    name: OpenMP offload and OpenCL on every simulated AMD GPU
+    # LLVM's libomptarget talks to the HSA runtime directly, and ROCm's OpenCL
+    # runtime is built on the same CLR as HIP. ROCm's LLVM (compiler, OpenMP
+    # runtime, device bitcode) and its OpenCL runtime and compiler library are
+    # unpacked from AMD's apt repository, with nothing installed; the HSA
+    # runtime they load is the shim's.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build ocl-icd-opencl-dev
+
+      - name: Unpack ROCm's LLVM and OpenCL runtime
+        run: |
+          amd/tests/openmp/fetch-rocm-llvm.sh "$HOME/rocm-llvm"
+          amd/tests/opencl/fetch-rocm-opencl.sh "$HOME/rocm-opencl"
+
+      - name: Build the HIP shim
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target vgpuhip
+
+      - name: OpenMP target offloading
+        # A skip fails the job: an LLVM that did not unpack is a red job.
+        run: |
+          VGPU_ROCM_PATH="$HOME/rocm-llvm/opt/rocm-7.1.0" \
+            ctest --test-dir build --output-on-failure --timeout 1800 -R '^amd_openmp$' 2>&1 | tee ctest.log
+          if grep -q 'Skipped' ctest.log; then echo "the test skipped: something it needs is missing"; exit 1; fi
+
+      - name: OpenCL
+        run: |
+          VGPU_ROCM_PATH="$HOME/rocm-opencl/opt/rocm-7.1.0" \
+            ctest --test-dir build --output-on-failure --timeout 1800 -R '^amd_opencl$' 2>&1 | tee ctest.log
+          if grep -q 'Skipped' ctest.log; then echo "the test skipped: something it needs is missing"; exit 1; fi

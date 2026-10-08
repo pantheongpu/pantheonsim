@@ -538,13 +538,137 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
   return fh;
 }
 
+/* ---- tracing ----
+ * A profiler (CUPTI) is told of the driver calls a program makes: the entry
+ * points a program calls itself are wrapped in traced(), which reports the call
+ * once, with pointers to its arguments, and everything the shim does underneath
+ * (cuStreamSynchronize through cuCtxSynchronize) is part of that one call. The
+ * work a call issues -- a kernel, a copy, a fill, a wait -- is recorded where
+ * it is done, with the correlation of the call that issued it. See
+ * vgpu/profiling.hpp, and nvidia/docs/cupti.md for what is delivered.
+ */
+
+// Reports one driver call from the program's side. `name` is NVIDIA's own
+// spelling of the function (cuMemAlloc_v2), which is what a subscriber is told.
+template <class Body, class... A>
+CUresult traced(const char* name, Body body, A... a) {
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
+    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
+    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)));
+  }
+  vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
+  const CUresult rc = body(a...);
+  call.set_result(static_cast<int32_t>(rc));
+  return rc;
+}
+
+// The device a record names: that of the calling thread's current context.
+uint32_t profiled_device(ShimState& s) {
+  if (ctx_stack().empty()) return 0;
+  const auto it = s.contexts.find(ctx_stack().back());
+  return it == s.contexts.end() ? 0u : static_cast<uint32_t>(it->second);
+}
+uint32_t profiled_device() {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  return profiled_device(s);
+}
+
+// What a profiler calls the memory a pointer names (defined with the host
+// memory registries it reads).
+vgpu::profiling::MemKind profiled_kind(ShimState& s, const void* p, bool device);
+
+// A copy that was done. copy_kind: 1 host to device, 2 device to host, 3 device
+// to device. A copy of nothing is not recorded.
+void record_copy(ShimState& s, uint32_t copy_kind, const void* dst, const void* src, size_t bytes,
+                 uint64_t t0, CUstream stream, bool async) {
+  if (!vgpu::profiling::enabled() || bytes == 0) return;
+  vgpu::profiling::Event ev;
+  ev.kind = vgpu::profiling::EventKind::Memcpy;
+  ev.start_ns = t0;
+  ev.end_ns = vgpu::profiling::now_ns();
+  ev.device = profiled_device(s);
+  ev.correlation = vgpu::profiling::work_correlation();
+  ev.bytes = bytes;
+  ev.copy_kind = copy_kind;
+  ev.stream = reinterpret_cast<uint64_t>(stream);
+  ev.async = async;
+  ev.src_kind = profiled_kind(s, src, copy_kind == 2 || copy_kind == 3);
+  ev.dst_kind = profiled_kind(s, dst, copy_kind == 1 || copy_kind == 3);
+  vgpu::profiling::record(std::move(ev));
+}
+
+// A fill that was done.
+void record_memset(ShimState& s, CUdeviceptr dst, uint32_t value, size_t bytes, uint64_t t0, CUstream stream,
+                   bool async) {
+  if (!vgpu::profiling::enabled() || bytes == 0) return;
+  vgpu::profiling::Event ev;
+  ev.kind = vgpu::profiling::EventKind::Memset;
+  ev.start_ns = t0;
+  ev.end_ns = vgpu::profiling::now_ns();
+  ev.device = profiled_device(s);
+  ev.correlation = vgpu::profiling::work_correlation();
+  ev.bytes = bytes;
+  ev.value = value;
+  ev.stream = reinterpret_cast<uint64_t>(stream);
+  ev.async = async;
+  ev.dst_kind = profiled_kind(s, reinterpret_cast<const void*>(dst), vgpu::is_device_va(dst));
+  vgpu::profiling::record(std::move(ev));
+}
+
+// A context coming into being: a subscriber is told, and a context record made.
+void announce_context_created(ShimState& s, uintptr_t handle) {
+  if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
+  const uint32_t device = profiled_device(s);
+  vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextCreated, handle, device);
+  if (vgpu::profiling::enabled()) {
+    vgpu::profiling::Event ev;
+    ev.kind = vgpu::profiling::EventKind::Context;
+    ev.device = device;
+    ev.start_ns = ev.end_ns = vgpu::profiling::now_ns();
+    ev.correlation = vgpu::profiling::work_correlation();
+    vgpu::profiling::record(std::move(ev));
+  }
+}
+
+// A stream coming into being.
+void announce_stream_created(ShimState& s, uintptr_t handle, unsigned flags, int priority) {
+  if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
+  const uint32_t device = profiled_device(s);
+  if (vgpu::profiling::enabled()) {
+    vgpu::profiling::Event ev;
+    ev.kind = vgpu::profiling::EventKind::Stream;
+    ev.device = device;
+    ev.start_ns = ev.end_ns = vgpu::profiling::now_ns();
+    ev.correlation = vgpu::profiling::work_correlation();
+    ev.handle = handle;
+    ev.flags = flags;
+    ev.priority = priority;
+    vgpu::profiling::record(std::move(ev));
+  }
+  vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamCreated, handle, device);
+}
+
+// The name a subscriber is told a launch is of: the kernel's entry name.
+const char* launch_symbol(CUfunction f) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  const uintptr_t h = reinterpret_cast<uintptr_t>(f);
+  if ((h & 7) == kTagKernel) {
+    const auto it = s.kernels.find(h);
+    return it == s.kernels.end() ? nullptr : it->second.name.c_str();
+  }
+  const auto it = s.functions.find(h);
+  return it == s.functions.end() || !it->second.fn ? nullptr : it->second.fn->name.c_str();
+}
+
 }  // namespace
 
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
 /* ---- init / version / errors ---- */
 
-VGPU_EXPORT CUresult cuInit(unsigned int flags) {
+static CUresult cuInit_impl(unsigned int flags) {
   return api("cuInit", false, false, [&](ShimState& s) {
     if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
     if (s.initialized) return CUDA_SUCCESS;
@@ -560,6 +684,22 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
     return CUDA_SUCCESS;
   });
 }
+// The call that brings the driver up is not one a profiler is told of, as on
+// NVIDIA's (measured: the first cuInit raises no callback and leaves no record,
+// a later one raises both); a subscriber is told initialisation finished
+// instead, before the next call.
+VGPU_EXPORT CUresult cuInit(unsigned int flags) {
+  bool first;
+  {
+    ShimState& s = state();
+    std::lock_guard<std::recursive_mutex> lock(s.mu);
+    first = !s.initialized;
+  }
+  if (!first) return traced("cuInit", cuInit_impl, flags);
+  const CUresult r = cuInit_impl(flags);
+  if (r == CUDA_SUCCESS) vgpu::profiling::notify_init_finished();
+  return r;
+}
 
 // What libcudart does for the driver when a program uses both APIs, as the
 // real runtime does through the real driver: the device's primary context,
@@ -569,7 +709,7 @@ VGPU_EXPORT CUresult cuInit(unsigned int flags) {
 // runtime's current device's. Called by the runtime shim, found through the
 // process's global scope (runtime_api.cpp).
 VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
-  if (cuInit(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
+  if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {
     check_device(s, dev);
     auto it = s.primary_ctx.find(dev);
@@ -618,15 +758,18 @@ VGPU_EXPORT CUresult cuGetErrorString(CUresult error, const char** pStr) {
 
 /* ---- device discovery ---- */
 
-VGPU_EXPORT CUresult cuDeviceGetCount(int* count) {
+static CUresult cuDeviceGetCount_impl(int* count) {
   return api("cuDeviceGetCount", true, false, [&](ShimState& s) {
     if (!count) return CUDA_ERROR_INVALID_VALUE;
     *count = s.rt->device_count();
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuDeviceGetCount(int* count) {
+  return traced("cuDeviceGetCount", cuDeviceGetCount_impl, count);
+}
 
-VGPU_EXPORT CUresult cuDeviceGet(CUdevice* device, int ordinal) {
+static CUresult cuDeviceGet_impl(CUdevice* device, int ordinal) {
   return api("cuDeviceGet", true, false, [&](ShimState& s) {
     if (!device) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, ordinal);
@@ -634,8 +777,11 @@ VGPU_EXPORT CUresult cuDeviceGet(CUdevice* device, int ordinal) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuDeviceGet(CUdevice* device, int ordinal) {
+  return traced("cuDeviceGet", cuDeviceGet_impl, device, ordinal);
+}
 
-VGPU_EXPORT CUresult cuDeviceGetName(char* name, int len, CUdevice dev) {
+static CUresult cuDeviceGetName_impl(char* name, int len, CUdevice dev) {
   return api("cuDeviceGetName", true, false, [&](ShimState& s) {
     if (!name || len <= 0) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -644,8 +790,11 @@ VGPU_EXPORT CUresult cuDeviceGetName(char* name, int len, CUdevice dev) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuDeviceGetName(char* name, int len, CUdevice dev) {
+  return traced("cuDeviceGetName", cuDeviceGetName_impl, name, len, dev);
+}
 
-VGPU_EXPORT CUresult cuDeviceTotalMem_v2(size_t* bytes, CUdevice dev) {
+static CUresult cuDeviceTotalMem_v2_impl(size_t* bytes, CUdevice dev) {
   return api("cuDeviceTotalMem", true, false, [&](ShimState& s) {
     if (!bytes) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -653,11 +802,14 @@ VGPU_EXPORT CUresult cuDeviceTotalMem_v2(size_t* bytes, CUdevice dev) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuDeviceTotalMem_v2(size_t* bytes, CUdevice dev) {
+  return traced("cuDeviceTotalMem_v2", cuDeviceTotalMem_v2_impl, bytes, dev);
+}
 VGPU_EXPORT CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
-  return cuDeviceTotalMem_v2(bytes, dev);
+  return cuDeviceTotalMem_v2_impl(bytes, dev);
 }
 
-VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) {
+static CUresult cuDeviceGetAttribute_impl(int* pi, CUdevice_attribute attrib, CUdevice dev) {
   return api("cuDeviceGetAttribute", true, false, [&](ShimState& s) {
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -685,8 +837,11 @@ VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CU
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) {
+  return traced("cuDeviceGetAttribute", cuDeviceGetAttribute_impl, pi, attrib, dev);
+}
 
-VGPU_EXPORT CUresult cuDeviceComputeCapability(int* major, int* minor, CUdevice dev) {
+static CUresult cuDeviceComputeCapability_impl(int* major, int* minor, CUdevice dev) {
   return api("cuDeviceComputeCapability", true, false, [&](ShimState& s) {
     if (!major || !minor) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -694,6 +849,9 @@ VGPU_EXPORT CUresult cuDeviceComputeCapability(int* major, int* minor, CUdevice 
     *minor = s.rt->device(dev).profile().cc_minor;
     return CUDA_SUCCESS;
   });
+}
+VGPU_EXPORT CUresult cuDeviceComputeCapability(int* major, int* minor, CUdevice dev) {
+  return traced("cuDeviceComputeCapability", cuDeviceComputeCapability_impl, major, minor, dev);
 }
 
 // The deprecated CUdevprop: the same limits cuDeviceGetAttribute reports.
@@ -720,7 +878,7 @@ VGPU_EXPORT CUresult cuDeviceGetProperties(CUdevprop* prop, CUdevice dev) {
 
 /* ---- contexts ---- */
 
-VGPU_EXPORT CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevice dev) {
+static CUresult cuCtxCreate_v2_impl(CUcontext* pctx, unsigned int flags, CUdevice dev) {
   return api("cuCtxCreate", true, false, [&](ShimState& s) {
     (void)flags;  // scheduling flags are performance hints; functionally inert here
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
@@ -729,11 +887,15 @@ VGPU_EXPORT CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevic
     s.contexts[h] = dev;
     ctx_stack().push_back(h);  // cuCtxCreate makes the new context current
     *pctx = reinterpret_cast<CUcontext>(h);
+    announce_context_created(s, h);
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevice dev) {
+  return traced("cuCtxCreate_v2", cuCtxCreate_v2_impl, pctx, flags, dev);
+}
 VGPU_EXPORT CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
-  return cuCtxCreate_v2(pctx, flags, dev);
+  return cuCtxCreate_v2_impl(pctx, flags, dev);
 }
 // CUDA 13's header maps cuCtxCreate to cuCtxCreate_v4, which takes a parameter
 // block for green contexts and execution affinity. Without this symbol a
@@ -742,13 +904,14 @@ VGPU_EXPORT CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice d
 // say so rather than being ignored; a block that asks for neither is an
 // ordinary context. That is what CUDA 13's own samples pass (a zeroed
 // CUctxCreateParams), and the card takes it.
-VGPU_EXPORT CUresult cuCtxCreate_v3(CUcontext* pctx, void* exec_affinity_params, int num_params,
-                                    unsigned int flags, CUdevice dev) {
+static CUresult cuCtxCreate_v3_impl(CUcontext* pctx, void* exec_affinity_params, int num_params, unsigned int flags, CUdevice dev) {
   if (exec_affinity_params && num_params > 0) return CUDA_ERROR_NOT_SUPPORTED;
-  return cuCtxCreate_v2(pctx, flags, dev);
+  return cuCtxCreate_v2_impl(pctx, flags, dev);
 }
-VGPU_EXPORT CUresult cuCtxCreate_v4(CUcontext* pctx, void* ctx_create_params, unsigned int flags,
-                                    CUdevice dev) {
+VGPU_EXPORT CUresult cuCtxCreate_v3(CUcontext* pctx, void* exec_affinity_params, int num_params, unsigned int flags, CUdevice dev) {
+  return traced("cuCtxCreate_v3", cuCtxCreate_v3_impl, pctx, exec_affinity_params, num_params, flags, dev);
+}
+static CUresult cuCtxCreate_v4_impl(CUcontext* pctx, void* ctx_create_params, unsigned int flags, CUdevice dev) {
   // CUctxCreateParams: execAffinityParams, numExecAffinityParams, cigParams.
   struct CreateParamsABI {
     void* exec_affinity;
@@ -758,20 +921,29 @@ VGPU_EXPORT CUresult cuCtxCreate_v4(CUcontext* pctx, void* ctx_create_params, un
   if (const auto* p = static_cast<const CreateParamsABI*>(ctx_create_params);
       p && ((p->exec_affinity && p->num_exec_affinity > 0) || p->cig))
     return CUDA_ERROR_NOT_SUPPORTED;
-  return cuCtxCreate_v2(pctx, flags, dev);
+  return cuCtxCreate_v2_impl(pctx, flags, dev);
+}
+VGPU_EXPORT CUresult cuCtxCreate_v4(CUcontext* pctx, void* ctx_create_params, unsigned int flags, CUdevice dev) {
+  return traced("cuCtxCreate_v4", cuCtxCreate_v4_impl, pctx, ctx_create_params, flags, dev);
 }
 
-VGPU_EXPORT CUresult cuCtxDestroy_v2(CUcontext ctx) {
+static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
   return api("cuCtxDestroy", true, false, [&](ShimState& s) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(ctx), kTagCtx, "context");
-    if (!s.contexts.erase(h)) return CUDA_ERROR_INVALID_CONTEXT;
+    if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
+    // A subscriber is told before the context goes, while it can still be asked about.
+    vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextDestroyStarting, h, profiled_device(s));
+    s.contexts.erase(h);
     std::erase(ctx_stack(), h);
     std::erase_if(s.peer_access, [h](const auto& p) { return p.first == h || p.second == h; });
     s.attached.erase(h);
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxDestroy(CUcontext ctx) { return cuCtxDestroy_v2(ctx); }
+VGPU_EXPORT CUresult cuCtxDestroy_v2(CUcontext ctx) {
+  return traced("cuCtxDestroy_v2", cuCtxDestroy_v2_impl, ctx);
+}
+VGPU_EXPORT CUresult cuCtxDestroy(CUcontext ctx) { return cuCtxDestroy_v2_impl(ctx); }
 
 // The deprecated usage count: cuCtxAttach takes another reference to the
 // current context and returns it (flags must be 0), cuCtxDetach drops one,
@@ -797,10 +969,10 @@ VGPU_EXPORT CUresult cuCtxDetach(CUcontext ctx) {
       return CUDA_SUCCESS;
     }
   }
-  return cuCtxDestroy_v2(ctx);
+  return cuCtxDestroy_v2_impl(ctx);
 }
 
-VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
+static CUresult cuCtxSetCurrent_impl(CUcontext ctx) {
   return api("cuCtxSetCurrent", true, false, [&](ShimState& s) {
     if (!ctx) {  // NULL pops/clears the current context binding
       if (!ctx_stack().empty()) ctx_stack().pop_back();
@@ -815,13 +987,19 @@ VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
+  return traced("cuCtxSetCurrent", cuCtxSetCurrent_impl, ctx);
+}
 
-VGPU_EXPORT CUresult cuCtxGetCurrent(CUcontext* pctx) {
+static CUresult cuCtxGetCurrent_impl(CUcontext* pctx) {
   return api("cuCtxGetCurrent", true, false, [&](ShimState& s) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
     *pctx = ctx_stack().empty() ? nullptr : reinterpret_cast<CUcontext>(ctx_stack().back());
     return CUDA_SUCCESS;
   });
+}
+VGPU_EXPORT CUresult cuCtxGetCurrent(CUcontext* pctx) {
+  return traced("cuCtxGetCurrent", cuCtxGetCurrent_impl, pctx);
 }
 
 // With no context current, both answer CUDA_ERROR_INVALID_CONTEXT, as the
@@ -836,13 +1014,15 @@ VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) {
   });
 }
 
-VGPU_EXPORT CUresult cuCtxSynchronize(void) {
+static CUresult cuCtxSynchronize_impl(void) {
   return api("cuCtxSynchronize", true, false, [&](ShimState& s) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     (void)current_device(s);  // requires a current context
+    vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Context, 0, 0, profiled_device(s));
     return CUDA_SUCCESS;      // everything is synchronous today
   });
 }
+VGPU_EXPORT CUresult cuCtxSynchronize(void) { return traced("cuCtxSynchronize", cuCtxSynchronize_impl); }
 
 VGPU_EXPORT CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
   return api("cuDevicePrimaryCtxRetain", true, false, [&](ShimState& s) {
@@ -886,18 +1066,21 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease(CUdevice dev) {
 
 /* ---- memory ---- */
 
-VGPU_EXPORT CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   return api("cuMemAlloc", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     *dptr = current(s).memory().alloc(bytesize);
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+  return traced("cuMemAlloc_v2", cuMemAlloc_v2_impl, dptr, bytesize);
+}
 VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
-  return cuMemAlloc_v2(dptr, bytesize);
+  return cuMemAlloc_v2_impl(dptr, bytesize);
 }
 
-VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
+static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
     if (auto it = s.managed.find(dptr); it != s.managed.end()) {
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
@@ -913,40 +1096,78 @@ VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemFree(CUdeviceptr dptr) { return cuMemFree_v2(dptr); }
+VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
+  return traced("cuMemFree_v2", cuMemFree_v2_impl, dptr);
+}
+VGPU_EXPORT CUresult cuMemFree(CUdeviceptr dptr) { return cuMemFree_v2_impl(dptr); }
 
-VGPU_EXPORT CUresult cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {
+// The three directions, in their synchronous and stream-ordered spellings. Every
+// stream is synchronous here, so the stream orders nothing; it is still the one
+// the program named, which is what a profiler's timeline is drawn by.
+static CUresult memcpy_htod(CUdeviceptr dst, const void* src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyHtoD", true, false, [&](ShimState& s) {
-    if (!srcHost && ByteCount) return CUDA_ERROR_INVALID_VALUE;
-    dev_write(s, dstDevice, srcHost, ByteCount);
+    if (!src && n) return CUDA_ERROR_INVALID_VALUE;
+    const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
+    dev_write(s, dst, src, n);
+    record_copy(s, 1, reinterpret_cast<const void*>(dst), src, n, t0, stream, async);
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyHtoD(CUdeviceptr d, const void* h, size_t n) {
-  return cuMemcpyHtoD_v2(d, h, n);
-}
-
-VGPU_EXPORT CUresult cuMemcpyDtoH_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
+static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyDtoH", true, false, [&](ShimState& s) {
-    if (!dstHost && ByteCount) return CUDA_ERROR_INVALID_VALUE;
-    dev_read(s, dstHost, srcDevice, ByteCount);
+    if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
+    const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
+    dev_read(s, dst, src, n);
+    record_copy(s, 2, dst, reinterpret_cast<const void*>(src), n, t0, stream, async);
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyDtoH(void* h, CUdeviceptr d, size_t n) {
-  return cuMemcpyDtoH_v2(h, d, n);
-}
-
-VGPU_EXPORT CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount) {
+static CUresult memcpy_dtod(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyDtoD", true, false, [&](ShimState& s) {
-    std::vector<uint8_t> tmp(ByteCount);
-    dev_read(s, tmp.data(), srcDevice, ByteCount);
-    dev_write(s, dstDevice, tmp.data(), ByteCount);
+    const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
+    std::vector<uint8_t> tmp(n);
+    dev_read(s, tmp.data(), src, n);
+    dev_write(s, dst, tmp.data(), n);
+    record_copy(s, 3, reinterpret_cast<const void*>(dst), reinterpret_cast<const void*>(src), n, t0, stream, async);
     return CUDA_SUCCESS;
   });
 }
+static CUresult cuMemcpyHtoD_v2_impl(CUdeviceptr d, const void* h, size_t n) { return memcpy_htod(d, h, n, nullptr, false); }
+static CUresult cuMemcpyDtoH_v2_impl(void* h, CUdeviceptr d, size_t n) { return memcpy_dtoh(h, d, n, nullptr, false); }
+static CUresult cuMemcpyDtoD_v2_impl(CUdeviceptr d, CUdeviceptr s, size_t n) { return memcpy_dtod(d, s, n, nullptr, false); }
+static CUresult cuMemcpyHtoDAsync_v2_impl(CUdeviceptr d, const void* h, size_t n, CUstream st) {
+  return memcpy_htod(d, h, n, st, true);
+}
+static CUresult cuMemcpyDtoHAsync_v2_impl(void* h, CUdeviceptr d, size_t n, CUstream st) {
+  return memcpy_dtoh(h, d, n, st, true);
+}
+static CUresult cuMemcpyDtoDAsync_v2_impl(CUdeviceptr d, CUdeviceptr s, size_t n, CUstream st) {
+  return memcpy_dtod(d, s, n, st, true);
+}
+VGPU_EXPORT CUresult cuMemcpyHtoD_v2(CUdeviceptr d, const void* h, size_t n) {
+  return traced("cuMemcpyHtoD_v2", cuMemcpyHtoD_v2_impl, d, h, n);
+}
+VGPU_EXPORT CUresult cuMemcpyDtoH_v2(void* h, CUdeviceptr d, size_t n) {
+  return traced("cuMemcpyDtoH_v2", cuMemcpyDtoH_v2_impl, h, d, n);
+}
+VGPU_EXPORT CUresult cuMemcpyDtoD_v2(CUdeviceptr d, CUdeviceptr s, size_t n) {
+  return traced("cuMemcpyDtoD_v2", cuMemcpyDtoD_v2_impl, d, s, n);
+}
+VGPU_EXPORT CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr d, const void* h, size_t n, CUstream st) {
+  return traced("cuMemcpyHtoDAsync_v2", cuMemcpyHtoDAsync_v2_impl, d, h, n, st);
+}
+VGPU_EXPORT CUresult cuMemcpyDtoHAsync_v2(void* h, CUdeviceptr d, size_t n, CUstream st) {
+  return traced("cuMemcpyDtoHAsync_v2", cuMemcpyDtoHAsync_v2_impl, h, d, n, st);
+}
+VGPU_EXPORT CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr d, CUdeviceptr s, size_t n, CUstream st) {
+  return traced("cuMemcpyDtoDAsync_v2", cuMemcpyDtoDAsync_v2_impl, d, s, n, st);
+}
+// The pre-CUDA 3.2 spellings are not reported: their parameters are 32-bit and a
+// profiler would be handed a structure that says so about 64-bit arguments.
+VGPU_EXPORT CUresult cuMemcpyHtoD(CUdeviceptr d, const void* h, size_t n) { return cuMemcpyHtoD_v2_impl(d, h, n); }
+VGPU_EXPORT CUresult cuMemcpyDtoH(void* h, CUdeviceptr d, size_t n) { return cuMemcpyDtoH_v2_impl(h, d, n); }
 VGPU_EXPORT CUresult cuMemcpyDtoD(CUdeviceptr d, CUdeviceptr sptr, size_t n) {
-  return cuMemcpyDtoD_v2(d, sptr, n);
+  return cuMemcpyDtoD_v2_impl(d, sptr, n);
 }
 
 VGPU_EXPORT CUresult cuMemGetInfo_v2(size_t* free_out, size_t* total) {
@@ -962,7 +1183,7 @@ VGPU_EXPORT CUresult cuMemGetInfo(size_t* f, size_t* t) { return cuMemGetInfo_v2
 
 /* ---- modules / launch ---- */
 
-VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
+static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
   return api("cuModuleLoadData", true, false, [&](ShimState& s) {
     if (!module || !image) return CUDA_ERROR_INVALID_VALUE;
     const char* text = static_cast<const char*>(image);
@@ -1021,22 +1242,31 @@ VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuModuleLoadData(CUmodule* module, const void* image) {
+  return traced("cuModuleLoadData", cuModuleLoadData_impl, module, image);
+}
 
 // A fatbin handed straight to the driver takes the same path as one passed to
 // cuModuleLoadData: pull the PTX out and load it.
+static CUresult cuModuleLoadFatBinary_impl(CUmodule* module, const void* fatCubin) {
+  return cuModuleLoadData_impl(module, fatCubin);
+}
 VGPU_EXPORT CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
-  return cuModuleLoadData(module, fatCubin);
+  return traced("cuModuleLoadFatBinary", cuModuleLoadFatBinary_impl, module, fatCubin);
 }
 
 // A module from a file: its bytes, loaded as cuModuleLoadData loads them.
 // PTX text is terminated, as the driver requires of an image in memory.
-VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
+static CUresult cuModuleLoad_impl(CUmodule* module, const char* fname) {
   if (!module || !fname) return CUDA_ERROR_INVALID_VALUE;
   std::ifstream f(fname, std::ios::binary);
   if (!f) return CUDA_ERROR_FILE_NOT_FOUND;
   std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   if (bytes.size() < 4) return CUDA_ERROR_INVALID_IMAGE;
-  return cuModuleLoadData(module, bytes.c_str());
+  return cuModuleLoadData_impl(module, bytes.c_str());
+}
+VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
+  return traced("cuModuleLoad", cuModuleLoad_impl, module, fname);
 }
 
 // Releasing the primary context. Nothing is cached per context here, so this
@@ -1384,9 +1614,8 @@ VGPU_EXPORT CUresult cuStreamWriteValue32(CUstream, CUdeviceptr addr, unsigned i
 // string and their sizes the 0 bytes written, and the wall time is 0. Left
 // alone, a program printing its info log -- CUDA's matrixMulDynlinkJIT
 // sample -- printed whatever its buffer held.
-VGPU_EXPORT CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int numOptions,
-                                        void* options, void** optionValues) {
-  const CUresult r = cuModuleLoadData(module, image);
+static CUresult cuModuleLoadDataEx_impl(CUmodule* module, const void* image, unsigned int numOptions, void* options, void** optionValues) {
+  const CUresult r = cuModuleLoadData_impl(module, image);
   const int* opts = static_cast<const int*>(options);
   if (!opts || !optionValues) return r;
   size_t info_size = 0, error_size = 0;
@@ -1414,8 +1643,11 @@ VGPU_EXPORT CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, uns
   }
   return r;
 }
+VGPU_EXPORT CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int numOptions, void* options, void** optionValues) {
+  return traced("cuModuleLoadDataEx", cuModuleLoadDataEx_impl, module, image, numOptions, options, optionValues);
+}
 
-VGPU_EXPORT CUresult cuModuleUnload(CUmodule hmod) {
+static CUresult cuModuleUnload_impl(CUmodule hmod) {
   return api("cuModuleUnload", true, false, [&](ShimState& s) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(hmod), kTagModule, "module");
     auto it = s.modules.find(h);
@@ -1430,8 +1662,11 @@ VGPU_EXPORT CUresult cuModuleUnload(CUmodule hmod) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuModuleUnload(CUmodule hmod) {
+  return traced("cuModuleUnload", cuModuleUnload_impl, hmod);
+}
 
-VGPU_EXPORT CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name) {
+static CUresult cuModuleGetFunction_impl(CUfunction* hfunc, CUmodule hmod, const char* name) {
   return api("cuModuleGetFunction", true, false, [&](ShimState& s) {
     if (!hfunc || !name) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(hmod), kTagModule, "module");
@@ -1444,6 +1679,9 @@ VGPU_EXPORT CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const
     *hfunc = reinterpret_cast<CUfunction>(fh);
     return CUDA_SUCCESS;
   });
+}
+VGPU_EXPORT CUresult cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name) {
+  return traced("cuModuleGetFunction", cuModuleGetFunction_impl, hfunc, hmod, name);
 }
 
 namespace {
@@ -1532,13 +1770,36 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     }
     cfg.nonportable_cluster = rec.nonportable_cluster;
     if (launches_graphs(*rec.fn)) return CUDA_ERROR_NOT_SUPPORTED;
+    const bool profiling = vgpu::profiling::enabled();
+    const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
+    if (profiling) {
+      vgpu::profiling::Event ev;
+      ev.kind = vgpu::profiling::EventKind::Kernel;
+      ev.start_ns = t0;
+      ev.end_ns = vgpu::profiling::now_ns();
+      ev.device = static_cast<uint32_t>(rec.device);
+      ev.correlation = vgpu::profiling::work_correlation();
+      ev.stream = reinterpret_cast<uint64_t>(hStream);
+      ev.name = rec.fn->name;
+      ev.grid[0] = gridDimX; ev.grid[1] = gridDimY; ev.grid[2] = gridDimZ;
+      ev.block[0] = blockDimX; ev.block[1] = blockDimY; ev.block[2] = blockDimZ;
+      ev.shared_bytes = sharedMemBytes;
+      ev.static_shared_bytes = rec.fn->static_shared_size;
+      {
+        const vgpu::DeviceProfile& p = s.rt->device(rec.device).profile();
+        const auto res = vgpu::exec::kernel_resources(*rec.fn, p, p.limits.max_threads_per_block, 0);
+        ev.registers_per_thread = res.usage.regs_per_thread;
+        ev.local_bytes_per_thread = res.usage.local_bytes;
+      }
+      vgpu::profiling::record(std::move(ev));
+    }
     return CUDA_SUCCESS;
   });
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+static CUresult cuLaunchKernel_impl(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
                                     unsigned int gridDimZ, unsigned int blockDimX,
                                     unsigned int blockDimY, unsigned int blockDimZ,
                                     unsigned int sharedMemBytes, CUstream hStream,
@@ -1546,6 +1807,15 @@ VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigne
   return launch_kernel_common("cuLaunchKernel", f, gridDimX, gridDimY, gridDimZ, blockDimX,
                               blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra,
                               /*cooperative=*/false);
+}
+VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                                    unsigned int gridDimZ, unsigned int blockDimX,
+                                    unsigned int blockDimY, unsigned int blockDimZ,
+                                    unsigned int sharedMemBytes, CUstream hStream,
+                                    void** kernelParams, void** extra) {
+  if (vgpu::profiling::hooked()) vgpu::profiling::note_symbol(launch_symbol(f));
+  return traced("cuLaunchKernel", cuLaunchKernel_impl, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
+                blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
 }
 
 /* ======================================================================== */
@@ -1901,23 +2171,14 @@ VGPU_EXPORT CUresult cuLaunch(CUfunction f) { return launch_grid("cuLaunch", f, 
 
 /* ---- memcpy/memset variants (everything is synchronous) ---- */
 
-VGPU_EXPORT CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr d, const void* h, size_t n, CUstream) {
-  return cuMemcpyHtoD_v2(d, h, n);
+VGPU_EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr d, const void* h, size_t n, CUstream st) {
+  return cuMemcpyHtoDAsync_v2_impl(d, h, n, st);
 }
-VGPU_EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr d, const void* h, size_t n, CUstream) {
-  return cuMemcpyHtoD_v2(d, h, n);
+VGPU_EXPORT CUresult cuMemcpyDtoHAsync(void* h, CUdeviceptr d, size_t n, CUstream st) {
+  return cuMemcpyDtoHAsync_v2_impl(h, d, n, st);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoHAsync_v2(void* h, CUdeviceptr d, size_t n, CUstream) {
-  return cuMemcpyDtoH_v2(h, d, n);
-}
-VGPU_EXPORT CUresult cuMemcpyDtoHAsync(void* h, CUdeviceptr d, size_t n, CUstream) {
-  return cuMemcpyDtoH_v2(h, d, n);
-}
-VGPU_EXPORT CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream) {
-  return cuMemcpyDtoD_v2(a, b, n);
-}
-VGPU_EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream) {
-  return cuMemcpyDtoD_v2(a, b, n);
+VGPU_EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream st) {
+  return cuMemcpyDtoDAsync_v2_impl(a, b, n, st);
 }
 
 // No profiler collects anything to start or stop; the card succeeds.
@@ -1962,9 +2223,9 @@ bool is_device_ptr(uint64_t p) { return vgpu::is_device_va(p); }
 // Direction-inferring copies (UVA style): device-range vs host pointers.
 VGPU_EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) {
   bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
-  if (dd && sd) return cuMemcpyDtoD_v2(dst, src, n);
-  if (dd) return cuMemcpyHtoD_v2(dst, reinterpret_cast<const void*>(src), n);
-  if (sd) return cuMemcpyDtoH_v2(reinterpret_cast<void*>(dst), src, n);
+  if (dd && sd) return cuMemcpyDtoD_v2_impl(dst, src, n);
+  if (dd) return cuMemcpyHtoD_v2_impl(dst, reinterpret_cast<const void*>(src), n);
+  if (sd) return cuMemcpyDtoH_v2_impl(reinterpret_cast<void*>(dst), src, n);
   std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), n);
   return CUDA_SUCCESS;
 }
@@ -2001,6 +2262,18 @@ std::map<void*, vgpu::runtime::HostRange>& pinned(ShimState& s) {
   return s.rt->host_allocations();
 }
 
+// What a profiler calls each end of a copy or fill: managed and pinned (or
+// registered) host memory by the allocation that holds the pointer, device
+// memory by where the pointer points or what the call says it is, and anything
+// else pageable.
+vgpu::profiling::MemKind profiled_kind(ShimState& s, const void* p, bool device) {
+  using vgpu::profiling::MemKind;
+  if (managed_range(s, reinterpret_cast<CUdeviceptr>(p), 1)) return MemKind::Managed;
+  if (host_range_at(pinned(s), p) || host_range_at(registrations(s), p)) return MemKind::Pinned;
+  if (device || vgpu::is_device_va(reinterpret_cast<uint64_t>(p))) return MemKind::Device;
+  return MemKind::Pageable;
+}
+
 // `rows` rows of `width` elements of T, `pitch` bytes apart -- a 1D fill is
 // one row. What an RTX 3060 checks: nothing, for an empty region (a null
 // pointer included); a pointer aligned to the element; and, only when there is
@@ -2018,7 +2291,7 @@ std::map<void*, vgpu::runtime::HostRange>& pinned(ShimState& s) {
 // as the card fills it.
 template <typename T>
 CUresult memset_impl(const char* name, CUdeviceptr dptr, size_t pitch, T value, size_t width,
-                     size_t rows) {
+                     size_t rows, CUstream stream = nullptr, bool async = false) {
   return api(name, true, false, [&](ShimState& s) {
     if (width == 0 || rows == 0) return CUDA_SUCCESS;
     if (!dptr || dptr % sizeof(T)) return CUDA_ERROR_INVALID_VALUE;
@@ -2033,8 +2306,10 @@ CUresult memset_impl(const char* name, CUdeviceptr dptr, size_t pitch, T value, 
       if (owner_memory(s, dptr).find_allocation(dptr, &base, &size) && end > base + size)
         return CUDA_ERROR_INVALID_VALUE;
     }
+    const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
     for (size_t y = 0; y < rows; ++y)
       dev_fill(s, dptr + y * pitch, reinterpret_cast<const uint8_t*>(&value), sizeof(T), width * sizeof(T));
+    record_memset(s, dptr, static_cast<uint32_t>(value), width * sizeof(T) * rows, t0, stream, async);
     return CUDA_SUCCESS;
   });
 }
@@ -2163,26 +2438,44 @@ VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void* tensorMap, unsigned int dataT
   });
 }
 
-VGPU_EXPORT CUresult cuMemsetD8_v2(CUdeviceptr d, unsigned char v, size_t n) {
+static CUresult cuMemsetD8_v2_impl(CUdeviceptr d, unsigned char v, size_t n) {
   return memset_impl("cuMemsetD8", d, 0, v, n, 1);
+}
+static CUresult cuMemsetD16_v2_impl(CUdeviceptr d, unsigned short v, size_t n) {
+  return memset_impl("cuMemsetD16", d, 0, v, n, 1);
+}
+static CUresult cuMemsetD32_v2_impl(CUdeviceptr d, unsigned int v, size_t n) {
+  return memset_impl("cuMemsetD32", d, 0, v, n, 1);
+}
+static CUresult cuMemsetD8Async_impl(CUdeviceptr d, unsigned char v, size_t n, CUstream st) {
+  return memset_impl("cuMemsetD8", d, 0, v, n, 1, st, true);
+}
+static CUresult cuMemsetD16Async_impl(CUdeviceptr d, unsigned short v, size_t n, CUstream st) {
+  return memset_impl("cuMemsetD16", d, 0, v, n, 1, st, true);
+}
+static CUresult cuMemsetD32Async_impl(CUdeviceptr d, unsigned int v, size_t n, CUstream st) {
+  return memset_impl("cuMemsetD32", d, 0, v, n, 1, st, true);
+}
+VGPU_EXPORT CUresult cuMemsetD8_v2(CUdeviceptr d, unsigned char v, size_t n) {
+  return traced("cuMemsetD8_v2", cuMemsetD8_v2_impl, d, v, n);
 }
 VGPU_EXPORT CUresult cuMemsetD16_v2(CUdeviceptr d, unsigned short v, size_t n) {
-  return memset_impl("cuMemsetD16", d, 0, v, n, 1);
+  return traced("cuMemsetD16_v2", cuMemsetD16_v2_impl, d, v, n);
 }
 VGPU_EXPORT CUresult cuMemsetD32_v2(CUdeviceptr d, unsigned int v, size_t n) {
-  return memset_impl("cuMemsetD32", d, 0, v, n, 1);
+  return traced("cuMemsetD32_v2", cuMemsetD32_v2_impl, d, v, n);
 }
-VGPU_EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { return cuMemsetD8_v2(d, v, n); }
-VGPU_EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { return cuMemsetD16_v2(d, v, n); }
-VGPU_EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { return cuMemsetD32_v2(d, v, n); }
-VGPU_EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream) {
-  return memset_impl("cuMemsetD8", d, 0, v, n, 1);
+VGPU_EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { return cuMemsetD8_v2_impl(d, v, n); }
+VGPU_EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { return cuMemsetD16_v2_impl(d, v, n); }
+VGPU_EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { return cuMemsetD32_v2_impl(d, v, n); }
+VGPU_EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream st) {
+  return traced("cuMemsetD8Async", cuMemsetD8Async_impl, d, v, n, st);
 }
-VGPU_EXPORT CUresult cuMemsetD16Async(CUdeviceptr d, unsigned short v, size_t n, CUstream) {
-  return memset_impl("cuMemsetD16", d, 0, v, n, 1);
+VGPU_EXPORT CUresult cuMemsetD16Async(CUdeviceptr d, unsigned short v, size_t n, CUstream st) {
+  return traced("cuMemsetD16Async", cuMemsetD16Async_impl, d, v, n, st);
 }
-VGPU_EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream) {
-  return memset_impl("cuMemsetD32", d, 0, v, n, 1);
+VGPU_EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream st) {
+  return traced("cuMemsetD32Async", cuMemsetD32Async_impl, d, v, n, st);
 }
 // Width counts elements, the pitch bytes.
 VGPU_EXPORT CUresult cuMemsetD2D8_v2(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) {
@@ -2241,7 +2534,7 @@ VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CU
  * address, as the runtime's cudaMallocHost makes it: a kernel can read it and
  * cuMemsetD* fills it, as on the card. */
 
-VGPU_EXPORT CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int flags) {
+static CUresult cuMemHostAlloc_impl(void** pp, size_t bytesize, unsigned int flags) {
   return api("cuMemHostAlloc", true, false, [&](ShimState& s) {
     if (!pp || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
     void* p = std::aligned_alloc(4096, (bytesize + 4095) / 4096 * 4096);
@@ -2253,11 +2546,17 @@ VGPU_EXPORT CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int fla
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemAllocHost_v2(void** pp, size_t bytesize) {
-  return cuMemHostAlloc(pp, bytesize, 0);
+VGPU_EXPORT CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int flags) {
+  return traced("cuMemHostAlloc", cuMemHostAlloc_impl, pp, bytesize, flags);
 }
-VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return cuMemHostAlloc(pp, bytesize, 0); }
-VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
+static CUresult cuMemAllocHost_v2_impl(void** pp, size_t bytesize) {
+  return cuMemHostAlloc_impl(pp, bytesize, 0);
+}
+VGPU_EXPORT CUresult cuMemAllocHost_v2(void** pp, size_t bytesize) {
+  return traced("cuMemAllocHost_v2", cuMemAllocHost_v2_impl, pp, bytesize);
+}
+VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return cuMemHostAlloc_impl(pp, bytesize, 0); }
+static CUresult cuMemFreeHost_impl(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
     auto it = pinned(s).find(p);
     if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
@@ -2266,6 +2565,9 @@ VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
     std::free(p);
     return CUDA_SUCCESS;
   });
+}
+VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
+  return traced("cuMemFreeHost", cuMemFreeHost_impl, p);
 }
 
 /* ---- registered host memory ----
@@ -3349,7 +3651,7 @@ VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
     }
     return CUDA_SUCCESS;
   });
-  return pooled || r != CUDA_SUCCESS ? r : cuMemFree_v2(dptr);
+  return pooled || r != CUDA_SUCCESS ? r : cuMemFree_v2_impl(dptr);
 }
 
 VGPU_EXPORT CUresult cuDeviceGetDefaultMemPool(void** pool, CUdevice dev) {
@@ -3624,35 +3926,60 @@ VGPU_EXPORT CUresult cuStreamAddCallback(CUstream stream, CUstreamCallback cb, v
 
 /* ---- streams (all synchronous) and events (wall-clock timestamps) ---- */
 
-VGPU_EXPORT CUresult cuStreamCreate(CUstream* s_out, unsigned int) {
+// The priority is a record for a profiler; every stream is the same here.
+static CUresult stream_create(CUstream* s_out, unsigned int flags, int priority) {
   return api("cuStreamCreate", true, false, [&](ShimState& s) {
     if (!s_out) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagStream);
     s.streams.insert(h);
     *s_out = reinterpret_cast<CUstream>(h);
+    // A priority outside the range is clamped to it, as the card does, and read back by
+    // cuStreamGetPriority; streams run in order, so it changes nothing else.
+    s.stream_priority[h] = std::min(vgpu::cuda::kLeastStreamPriority, std::max(vgpu::cuda::kGreatestStreamPriority, priority));
+    announce_stream_created(s, h, flags, priority);
     return CUDA_SUCCESS;
   });
 }
-// A priority outside the range is clamped to it, as the card does, and read
-// back by cuStreamGetPriority; streams run in order, so it changes nothing else.
+static CUresult cuStreamCreate_impl(CUstream* s_out, unsigned int flags) {
+  return stream_create(s_out, flags, 0);
+}
+VGPU_EXPORT CUresult cuStreamCreate(CUstream* s_out, unsigned int flags) {
+  return traced("cuStreamCreate", cuStreamCreate_impl, s_out, flags);
+}
+static CUresult cuStreamCreateWithPriority_impl(CUstream* s_out, unsigned int flags, int priority) {
+  return stream_create(s_out, flags, priority);
+}
 VGPU_EXPORT CUresult cuStreamCreateWithPriority(CUstream* s_out, unsigned int flags, int priority) {
-  const CUresult rc = cuStreamCreate(s_out, flags);
-  if (rc != CUDA_SUCCESS) return rc;
-  ShimState& s = state();
-  std::lock_guard<std::recursive_mutex> lock(s.mu);
-  s.stream_priority[reinterpret_cast<uintptr_t>(*s_out)] =
-      std::min(vgpu::cuda::kLeastStreamPriority, std::max(vgpu::cuda::kGreatestStreamPriority, priority));
-  return CUDA_SUCCESS;
+  return traced("cuStreamCreateWithPriority", cuStreamCreateWithPriority_impl, s_out, flags, priority);
+}
+static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
+  return api("cuStreamDestroy", true, false, [&](ShimState& s) {
+    const uintptr_t h = reinterpret_cast<uintptr_t>(stream);
+    if (s.streams.count(h))
+      vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting, h, profiled_device(s));
+    s.streams.erase(h);
+    s.stream_priority.erase(h);
+    return CUDA_SUCCESS;
+  });
 }
 VGPU_EXPORT CUresult cuStreamDestroy_v2(CUstream stream) {
-  return api("cuStreamDestroy", true, false, [&](ShimState& s) {
-    s.streams.erase(reinterpret_cast<uintptr_t>(stream));
-    s.stream_priority.erase(reinterpret_cast<uintptr_t>(stream));
-    return CUDA_SUCCESS;
+  return traced("cuStreamDestroy_v2", cuStreamDestroy_v2_impl, stream);
+}
+VGPU_EXPORT CUresult cuStreamDestroy(CUstream stream) { return cuStreamDestroy_v2_impl(stream); }
+// A wait that returned is recorded for a profiler, and the stream and context
+// waits are told to a subscriber (vgpu/profiling.hpp).
+static CUresult cuStreamSynchronize_impl(CUstream stream) {
+  return api("cuStreamSynchronize", true, false, [&](ShimState& s) {
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    (void)current_device(s);  // requires a current context
+    vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Stream, reinterpret_cast<uint64_t>(stream), 0,
+                                      profiled_device(s));
+    return CUDA_SUCCESS;      // everything is synchronous today
   });
 }
-VGPU_EXPORT CUresult cuStreamDestroy(CUstream stream) { return cuStreamDestroy_v2(stream); }
-VGPU_EXPORT CUresult cuStreamSynchronize(CUstream) { return cuCtxSynchronize(); }
+VGPU_EXPORT CUresult cuStreamSynchronize(CUstream stream) {
+  return traced("cuStreamSynchronize", cuStreamSynchronize_impl, stream);
+}
 // Streams are synchronous, so everything queued before the function has run
 // by the time it is called, which is all a host function is promised.
 VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
@@ -3660,8 +3987,27 @@ VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
   fn(user);
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamQuery(CUstream) { return dead_context(); }  // always idle
-VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream, void*, unsigned int) { return dead_context(); }
+// Always idle. The card records a query that finds the stream idle as a wait
+// on it, and tells a subscriber the stream was synchronized.
+static CUresult cuStreamQuery_impl(CUstream stream) {
+  const CUresult r = dead_context();
+  if (r == CUDA_SUCCESS)
+    vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Stream, reinterpret_cast<uint64_t>(stream), 0,
+                                      profiled_device());
+  return r;
+}
+VGPU_EXPORT CUresult cuStreamQuery(CUstream stream) { return traced("cuStreamQuery", cuStreamQuery_impl, stream); }
+static CUresult cuStreamWaitEvent_impl(CUstream stream, void* event, unsigned int) {
+  const CUresult r = dead_context();
+  if (r == CUDA_SUCCESS)
+    vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::StreamWaitEvent,
+                                      reinterpret_cast<uint64_t>(stream), reinterpret_cast<uint64_t>(event),
+                                      profiled_device());
+  return r;
+}
+VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream stream, void* event, unsigned int flags) {
+  return traced("cuStreamWaitEvent", cuStreamWaitEvent_impl, stream, event, flags);
+}
 VGPU_EXPORT CUresult cuStreamGetPriority(CUstream stream, int* p) {
   if (!p) return CUDA_SUCCESS;
   ShimState& s = state();
@@ -3685,7 +4031,7 @@ VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream, int* status) {
   return CUDA_SUCCESS;
 }
 
-VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
+static CUresult cuEventCreate_impl(void** ev, unsigned int flags) {
   return api("cuEventCreate", true, false, [&](ShimState& s) {
     if (!ev) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagEvent);
@@ -3695,7 +4041,10 @@ VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream) {
+VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
+  return traced("cuEventCreate", cuEventCreate_impl, ev, flags);
+}
+static CUresult cuEventRecord_impl(void* ev, CUstream) {
   return api("cuEventRecord", true, false, [&](ShimState& s) {
     auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
     if (it == s.events.end()) return CUDA_ERROR_INVALID_VALUE;
@@ -3704,16 +4053,39 @@ VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventQuery(void*) { return dead_context(); }
-VGPU_EXPORT CUresult cuEventSynchronize(void*) { return dead_context(); }
-VGPU_EXPORT CUresult cuEventDestroy_v2(void* ev) {
+VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream a1) {
+  return traced("cuEventRecord", cuEventRecord_impl, ev, a1);
+}
+// Like a stream query, a query that finds the event done is recorded as a wait on it.
+static CUresult cuEventQuery_impl(void* event) {
+  const CUresult r = dead_context();
+  if (r == CUDA_SUCCESS)
+    vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Event, 0, reinterpret_cast<uint64_t>(event),
+                                      profiled_device());
+  return r;
+}
+VGPU_EXPORT CUresult cuEventQuery(void* event) { return traced("cuEventQuery", cuEventQuery_impl, event); }
+static CUresult cuEventSynchronize_impl(void* event) {
+  const CUresult r = dead_context();
+  if (r == CUDA_SUCCESS)
+    vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Event, 0, reinterpret_cast<uint64_t>(event),
+                                      profiled_device());
+  return r;
+}
+VGPU_EXPORT CUresult cuEventSynchronize(void* event) {
+  return traced("cuEventSynchronize", cuEventSynchronize_impl, event);
+}
+static CUresult cuEventDestroy_v2_impl(void* ev) {
   return api("cuEventDestroy", true, false, [&](ShimState& s) {
     s.events.erase(reinterpret_cast<uintptr_t>(ev));
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventDestroy(void* ev) { return cuEventDestroy_v2(ev); }
-VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
+VGPU_EXPORT CUresult cuEventDestroy_v2(void* ev) {
+  return traced("cuEventDestroy_v2", cuEventDestroy_v2_impl, ev);
+}
+VGPU_EXPORT CUresult cuEventDestroy(void* ev) { return cuEventDestroy_v2_impl(ev); }
+static CUresult cuEventElapsedTime_impl(float* ms, void* start, void* end) {
   return api("cuEventElapsedTime", true, false, [&](ShimState& s) {
     auto a = s.events.find(reinterpret_cast<uintptr_t>(start));
     auto b = s.events.find(reinterpret_cast<uintptr_t>(end));
@@ -3729,10 +4101,16 @@ VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
     return CUDA_SUCCESS;
   });
 }
+VGPU_EXPORT CUresult cuEventElapsedTime(float* ms, void* start, void* end) {
+  return traced("cuEventElapsedTime", cuEventElapsedTime_impl, ms, start, end);
+}
 // Same story as cuCtxCreate: CUDA 13 renames this one too, and a program built
 // there resolves the versioned name, not the plain one.
+static CUresult cuEventElapsedTime_v2_impl(float* ms, void* start, void* end) {
+  return cuEventElapsedTime_impl(ms, start, end);
+}
 VGPU_EXPORT CUresult cuEventElapsedTime_v2(float* ms, void* start, void* end) {
-  return cuEventElapsedTime(ms, start, end);
+  return traced("cuEventElapsedTime_v2", cuEventElapsedTime_v2_impl, ms, start, end);
 }
 
 /* ---- context odds and ends static cudart asks about ---- */
@@ -3938,7 +4316,7 @@ VGPU_EXPORT CUresult cuCtxDisablePeerAccess(CUcontext peerContext) {
 // so each address names its own device and the contexts add nothing; the card
 // takes a null one as well.
 VGPU_EXPORT CUresult cuMemcpyPeer(CUdeviceptr dst, CUcontext, CUdeviceptr src, CUcontext, size_t n) {
-  return cuMemcpyDtoD_v2(dst, src, n);
+  return cuMemcpyDtoD_v2_impl(dst, src, n);
 }
 VGPU_EXPORT CUresult cuMemcpyPeerAsync(CUdeviceptr dst, CUcontext dctx, CUdeviceptr src, CUcontext sctx,
                                        size_t n, CUstream) {
@@ -4304,13 +4682,13 @@ uintptr_t dark_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 
 // cudart-interface slot 1/6/8: materialize a module from a registered fatbin.
 CUresult dark_get_module(CUmodule* mod, const void* wrapper) {
-  return cuModuleLoadData(mod, wrapper);
+  return cuModuleLoadData_impl(mod, wrapper);
 }
 CUresult dark_get_module_ext1(CUmodule* mod, const void* wrapper, void*, void*, uintptr_t) {
-  return cuModuleLoadData(mod, wrapper);
+  return cuModuleLoadData_impl(mod, wrapper);
 }
 CUresult dark_get_module_ext2(const void* wrapper, CUmodule* mod, void*, void*, unsigned int) {
-  return cuModuleLoadData(mod, wrapper);
+  return cuModuleLoadData_impl(mod, wrapper);
 }
 
 // Context-local storage: cudart stashes per-context state through these.

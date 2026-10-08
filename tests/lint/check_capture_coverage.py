@@ -50,19 +50,34 @@ EXEMPT = {
 }
 
 
+def _body_at(text, start):
+    depth, i = 1, start
+    while depth and i < len(text):
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return text[start:i]
+
+
+def traced_bodies(text):
+    """The bodies of the entry points a profiler can subscribe to by name.
+
+    Those are exported as a one-line wrapper (traced_call) around `NAME_body`,
+    which holds what the function does; capture state is consulted there.
+    """
+    return {m.group(1): _body_at(text, m.end())
+            for m in re.finditer(r"static\s+cudaError_t\s+(cuda\w+?)_body\s*\(([^)]*)\)\s*\{", text)}
+
+
 def exported_stream_functions(text):
     """Yields (name, body) for each exported cuda* function with a stream parameter."""
+    traced = traced_bodies(text)
     for m in re.finditer(r"VGPU_EXPORT\s+cudaError_t\s+(cuda\w+)\s*\(([^)]*)\)\s*\{", text):
         name, params = m.group(1), m.group(2)
         # A stream taken by value is one work goes onto; a cudaStream_t* is a
         # stream being handed out (cudaStreamCreate), which enqueues nothing.
         if not re.search(r"cudaStream_t(?!\s*\*)", params):
             continue
-        depth, i = 1, m.end()
-        while depth and i < len(text):
-            depth += {"{": 1, "}": -1}.get(text[i], 0)
-            i += 1
-        yield name, text[m.end():i]
+        yield name, _body_at(text, m.end()) + traced.get(name, "")
 
 
 def main():
