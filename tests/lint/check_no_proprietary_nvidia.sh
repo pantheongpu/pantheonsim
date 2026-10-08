@@ -8,7 +8,9 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
-# This script names the phrase, so it is excluded from its own search.
+# NVIDIA's header text wraps "PROPRIETARY and / CONFIDENTIAL" over two lines, so
+# the heading "NOTICE TO LICENSEE" is what matches those files; this script names
+# both phrases, so it is excluded from its own search.
 bad="$(git grep -l -I -e 'PROPRIETARY and CONFIDENTIAL' -e 'NOTICE TO LICENSEE' -- . ':!tests/lint/check_no_proprietary_nvidia.sh' || true)"
 if [[ -n "$bad" ]]; then
   echo "FAIL: files that carry NVIDIA's proprietary-licence notice:"
