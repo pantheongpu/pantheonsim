@@ -1476,60 +1476,6 @@ VGPU_EXPORT cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, uns
   });
 }
 
-// A PCI bus id string in any of the forms the documentation lists -- domain,
-// bus, device and function, each hexadecimal, domain and function optional --
-// as the four numbers it names; false when it does not parse. The driver's
-// cuDeviceGetByPCIBusId reads the same forms the same way.
-namespace {
-bool parse_pci_bus_id(const char* text, unsigned long out[4]) {
-  std::vector<std::string> parts;
-  std::string cur;
-  for (const char* c = text; *c; ++c) {
-    if (*c == ':') {
-      parts.push_back(cur);
-      cur.clear();
-    } else {
-      cur += *c;
-    }
-  }
-  parts.push_back(cur);
-  if (parts.size() != 2 && parts.size() != 3) return false;
-  std::string fn = "0";
-  if (const size_t dot = parts.back().find('.'); dot != std::string::npos) {
-    fn = parts.back().substr(dot + 1);
-    parts.back().resize(dot);
-  }
-  if (parts.size() == 2) parts.insert(parts.begin(), "0");
-  parts.push_back(fn);
-  for (int i = 0; i < 4; ++i) {
-    if (parts[static_cast<size_t>(i)].empty()) return false;
-    char* end = nullptr;
-    out[i] = std::strtoul(parts[static_cast<size_t>(i)].c_str(), &end, 16);
-    if (*end) return false;
-  }
-  return true;
-}
-}  // namespace
-
-// The inverse of cudaDeviceGetPCIBusId: a well-formed id that names no device
-// is cudaErrorInvalidDevice, a malformed one cudaErrorInvalidValue.
-VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusId) {
-  unsigned long want[4];
-  if (!device || !pciBusId || !parse_pci_bus_id(pciBusId, want)) return cudaErrorInvalidValue;
-  int count = 0;
-  if (const cudaError_t e = cudaGetDeviceCount(&count); e != cudaSuccess) return e;
-  for (int d = 0; d < count; ++d) {
-    char id[32];
-    unsigned long have[4];
-    if (cudaDeviceGetPCIBusId(id, sizeof id, d) != cudaSuccess) continue;
-    if (parse_pci_bus_id(id, have) && std::equal(have, have + 4, want)) {
-      *device = d;
-      return cudaSuccess;
-    }
-  }
-  return cudaErrorInvalidDevice;
-}
-
 VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
   if (flags) *flags = 0;
