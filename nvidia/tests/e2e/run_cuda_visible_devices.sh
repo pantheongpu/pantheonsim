@@ -102,4 +102,22 @@ for order in FASTEST_FIRST PCI_BUS_ID; do
 done
 got="$(run ::unset bogus --shown)"
 if [[ "$got" == "runtime 101 count -1 | driver cuInit 101 count-rc 3 count -1 |" ]]; then echo "ok    CUDA_DEVICE_ORDER=bogus"; else echo "FAIL  CUDA_DEVICE_ORDER=bogus: $got"; fail=1; fi
+
+# The device a program calls 0 is the machine's other one under
+# CUDA_VISIBLE_DEVICES=1, and its memory is that device's in NVML (and so in
+# nvidia-smi): work is attributed to the machine's slot, not the program's index.
+if (( ! card )); then
+  # A private telemetry directory: NVML reads whatever publishers share the
+  # default one, and a machine running other simulated programs (an AMD session,
+  # say) would be the machine it describes.
+  tele="$(mktemp -d)"; trap 'rm -rf "$tele" "$out"' EXIT
+  for c in "::unset|0" "1|1" "1,0|1" "0,1|0"; do
+    value="${c%|*}"; machine_device="${c##*|}"
+    report="$(VGPU_TELEMETRY_PATH="$tele" run "$value" ::unset --where)"
+    got="$(grep -c "device $machine_device holds 6[0-9] MiB" <<<"$report" || true)"
+    other="$(grep -c "holds 6[0-9] MiB" <<<"$report" || true)"
+    if [[ "$got" == 1 && "$other" == 1 ]]; then echo "ok    CUDA_VISIBLE_DEVICES=\"$value\": a program's device 0 is the machine's device $machine_device, in NVML"
+    else echo "FAIL  CUDA_VISIBLE_DEVICES=\"$value\": device 0's memory should be on the machine's device $machine_device"; printf "%s\n" "$report"; fail=1; fi
+  done
+fi
 exit $fail

@@ -14,8 +14,14 @@
 //   device_attributes --uuids    the UUID of each device, for the
 //                                CUDA_VISIBLE_DEVICES runner
 //   device_attributes --shown    what the program sees of its machine
+//   device_attributes --where    allocates 64 MiB on the program's device 0 and
+//                                says, through NVML, which of the machine's
+//                                devices has it (a program's device 0 under
+//                                CUDA_VISIBLE_DEVICES=1 is the machine's second)
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include <dlfcn.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -89,6 +95,35 @@ int main(int argc, char** argv) {
       else std::printf(" [%d %s %s]", i, bus, uuid_hex((const unsigned char*)p.uuid.bytes).substr(0, 8).c_str());
     }
     std::printf("\n");
+    return 0;
+  }
+  if (!std::strcmp(mode, "--where")) {
+    void* mem = nullptr;
+    CK(cudaSetDevice(0));
+    CK(cudaMalloc(&mem, 64u << 20));
+    // NVML names the machine's devices, whatever this program calls them.
+    void* nvml = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    CHECK(nvml != nullptr);
+    typedef int (*Init)();
+    typedef int (*Count)(unsigned*);
+    typedef int (*Handle)(unsigned, void**);
+    typedef struct { unsigned long long total, free, used; } Memory;
+    typedef int (*Info)(void*, Memory*);
+    Init init = (Init)dlsym(nvml, "nvmlInit_v2");
+    Count count = (Count)dlsym(nvml, "nvmlDeviceGetCount_v2");
+    Handle handle = (Handle)dlsym(nvml, "nvmlDeviceGetHandleByIndex_v2");
+    Info info = (Info)dlsym(nvml, "nvmlDeviceGetMemoryInfo");
+    CHECK(init && count && handle && info);
+    CHECK(init() == 0);
+    unsigned machine = 0;
+    CHECK(count(&machine) == 0);
+    for (unsigned i = 0; i < machine; ++i) {
+      void* h = nullptr;
+      Memory m{};
+      CHECK(handle(i, &h) == 0 && info(h, &m) == 0);
+      std::printf("nvml device %u holds %llu MiB\n", i, m.used >> 20);
+    }
+    CK(cudaFree(mem));
     return 0;
   }
   CK(cudaGetDeviceCount(&n));
@@ -170,7 +205,8 @@ int main(int argc, char** argv) {
     SAME(gpuPciSubsystemID, 140);
 #endif
     // The figures a program divides or sizes by are not zero.
-    CHECK(p.memoryBusWidth > 0 && p.l2CacheSize > 0 && p.multiProcessorCount > 0);
+    // (A profile that does not say its L2 reports none; the Blackwell parts' is not published.)
+    CHECK(p.memoryBusWidth > 0 && p.multiProcessorCount > 0 && p.l2CacheSize >= 0);
     CHECK(p.persistingL2CacheMaxSize <= p.l2CacheSize);
 
     // ---- one identity ---------------------------------------------------------

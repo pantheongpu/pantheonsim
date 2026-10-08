@@ -52,22 +52,27 @@ import re, sys
 # capability does not take a path that needs it.
 different = {
   # where the card sits and what its host does
-  "rt PciBusId", "drv PCI_BUS_ID", "prop pciBusID", "prop uuid",
-  "rt GpuPciSubsystemId", "drv GPU_PCI_SUBSYSTEM_ID", "prop gpuPciSubsystemID",
-  "rt KernelExecTimeout", "drv KERNEL_EXEC_TIMEOUT",                   # the card's display driver (WSL) has a watchdog
-  "rt ConcurrentManagedAccess", "drv CONCURRENT_MANAGED_ACCESS", "prop concurrentManagedAccess",   # WSL answers 0, Linux 1
+  "rt cudaDevAttrPciBusId", "drv CU_DEVICE_ATTRIBUTE_PCI_BUS_ID", "prop pciBusID", "prop uuid",
+  "rt cudaDevAttrGpuPciSubsystemId", "drv CU_DEVICE_ATTRIBUTE_GPU_PCI_SUBSYSTEM_ID", "prop gpuPciSubsystemID",
+  # the card's display driver (WSL) has a watchdog and no concurrent managed access, which Linux has
+  "rt cudaDevAttrKernelExecTimeout", "drv CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT",
+  "rt cudaDevAttrConcurrentManagedAccess", "drv CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS", "prop concurrentManagedAccess",
   # not implemented: sparse and deferred-mapped arrays, compressible memory,
-  # read-only host registration, host memory pools and VMM, the 64-bit and NOR stream memory operations, POSIX FD handles
-  "rt SparseCudaArraySupported", "drv SPARSE_CUDA_ARRAY_SUPPORTED", "prop sparseCudaArraySupported",
-  "rt DeferredMappingCudaArraySupported", "drv DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED", "prop deferredMappingCudaArraySupported",
-  "drv GENERIC_COMPRESSION_SUPPORTED",
-  "rt HostRegisterReadOnlySupported", "drv READ_ONLY_HOST_REGISTER_SUPPORTED", "prop hostRegisterReadOnlySupported",
-  "rt HostMemoryPoolsSupported", "drv HOST_MEMORY_POOLS_SUPPORTED",
-  "rt HostNumaMemoryPoolsSupported", "drv HOST_NUMA_MEMORY_POOLS_SUPPORTED",
-  "drv HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED", "drv HOST_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED",
-  "rt Reserved122", "rt Reserved123", "rt Reserved141", "rt Reserved145",   # the runtime's names for those four
-  "drv CAN_USE_64_BIT_STREAM_MEM_OPS", "drv CAN_USE_STREAM_WAIT_VALUE_NOR",
-  "drv HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED",
+  # read-only host registration, host memory pools and VMM, the 64-bit and NOR
+  # stream memory operations, POSIX file-descriptor handles
+  "rt cudaDevAttrSparseCudaArraySupported", "drv CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED", "prop sparseCudaArraySupported",
+  "rt cudaDevAttrDeferredMappingCudaArraySupported", "drv CU_DEVICE_ATTRIBUTE_DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED",
+  "prop deferredMappingCudaArraySupported",
+  "drv CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED",
+  "rt cudaDevAttrHostRegisterReadOnlySupported", "drv CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED",
+  "prop hostRegisterReadOnlySupported",
+  "rt cudaDevAttrHostMemoryPoolsSupported", "drv CU_DEVICE_ATTRIBUTE_HOST_MEMORY_POOLS_SUPPORTED",
+  "rt cudaDevAttrHostNumaMemoryPoolsSupported", "drv CU_DEVICE_ATTRIBUTE_HOST_NUMA_MEMORY_POOLS_SUPPORTED",
+  "drv CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED",
+  "drv CU_DEVICE_ATTRIBUTE_HOST_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED",
+  "rt cudaDevAttrReserved122", "rt cudaDevAttrReserved123", "rt cudaDevAttrReserved141", "rt cudaDevAttrReserved145",   # the runtime's names for those
+  "drv CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS", "drv CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE_NOR",
+  "drv CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED",
 }
 
 def table(lines):

@@ -63,8 +63,11 @@ Working today, all CPU-only:
 
 Known limitations (deliberate, documented):
 
-- Kernels must carry **PTX** (embedded, or a fatbin containing PTX; zstd
-  fatbins are decompressed). SASS-only fatbins are rejected with a precise error.
+- A kernel runs as its **SASS** when the binary carries SASS the simulated GPU
+  can run (the default, from Turing to Blackwell; see
+  [nvidia/docs/sass.md](nvidia/docs/sass.md)), and as its **PTX** otherwise
+  (embedded, or in a fatbin; zstd and LZ4 fatbins are decompressed). A binary
+  with neither is rejected with a precise error.
 - Unmodified apps must link **shared** cudart (`nvcc -cudart shared`) so the
   loader can substitute VirtualGPU's `libcudart.so.13`. The source is untouched;
   hosting a *statically* linked cudart needs NVIDIA's undocumented driver export
