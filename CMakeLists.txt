@@ -2092,6 +2092,13 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=cdp_device_api:75 cdp1_device_sync:75:89;VGPU_SASS_ARCHS=sm_75 sm_86 sm_90 sm_120"
     TIMEOUT 1800)
+  # The *.sync warp instructions' member masks, as an RTX 3060 (sm_86) ran them, on both engines
+  # (e2e_sass_archs runs it with the rest).
+  add_test(NAME e2e_sync_masks COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_sync_masks PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=sync_masks:86:86;VGPU_SASS_ARCHS=sm_86"
+    TIMEOUT 600)
 endif()
 
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
