@@ -1340,6 +1340,11 @@ set_tests_properties(amd_pytorch_models_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_
 add_test(NAME amd_pytorch_ck COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh ck.py 3 1)
 set_tests_properties(amd_pytorch_ck PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# hipBLASLt's xf32 GEMM (reduced-precision floats, v_mfma_f32_16x16x8_xf32), which PyTorch
+# runs on an MI300X when told a float32 matmul may use it.
+add_test(NAME amd_pytorch_xf32 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh xf32.py 1 1)
+set_tests_properties(amd_pytorch_xf32 PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Two processes, as torchrun runs them: RCCL across processes, and
 # DistributedDataParallel.
 add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
