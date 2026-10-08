@@ -1,0 +1,56 @@
+# VirtualGPU device profile: NVIDIA A40 (Ampere, GA102, sm_86).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.6: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 84: NVIDIA Ampere GA102 GPU Architecture whitepaper (v2), Table 3 (A40:
+#     84 SMs, 10752 CUDA Cores at 128 an SM, 336 Tensor Cores), and the A40 data
+#     sheet's "10,752 CUDA cores".
+#   - memory 48 GB GDDR6 with ECC, 696 GB/s, 300 W, PCIe Gen4: the A40 data sheet.
+#     The whitepaper's table gives the frame buffer as 49152 MB, 14.5 Gbps, and a
+#     1740 MHz boost clock. NVIDIA's "GB" for graphics memory is binary (see
+#     rtx2080ti.yaml), so vram_bytes is 49152 MiB; a real card's nvidia-smi total
+#     is a little smaller, so this is an upper bound.
+#   - PCI device 0x2235, "NVIDIA A40", from the name table in NVIDIA's open GPU
+#     kernel modules (g_nv_name_released.h).
+#   - Per-SM limits are compute capability 8.6's, the same as nvidia/a10 and
+#     nvidia/rtx3080ti, which were read from physical cards.
+#   - The optional NVLink bridge (112.5 GB/s) is not recorded, as for nvidia/h100-pcie.
+id: nvidia/a40
+vendor: nvidia
+model: "NVIDIA A40"
+architecture: ampere
+compute_capability: "8.6"
+warp_size: 32
+vram_bytes: 51539607552          # 49152 MiB (GA102 whitepaper); an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 84
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 16
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 49152          # GA102 whitepaper; not measured on a card
+  power_limit_w: 300             # A40 data sheet
+  sm_clock_max_mhz: 1740         # boost clock (GA102 whitepaper)
+  mem_clock_max_mhz: 7250        # half the published 14.5 Gbps data rate; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8757            # 0x2235 [A40]
+  ecc: true                      # "48 GB GDDR6 with ECC" (data sheet)
+  memory: gddr                   # GDDR; Ampere and later remap rows rather than retire pages (see telemetry.cpp)
+  pcie_link: "Gen4 x16"          # data sheet: "PCIe Gen4: 64GB/s", which is x16

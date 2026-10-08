@@ -428,12 +428,21 @@ VTEST(every_nvidia_card_reports_its_architecture_in_bar0) {
   for (const Want& w : {Want{"nvidia/t4", 0x16},            // TU100: Turing
                         Want{"nvidia/a100", 0x17},          // GA100: Ampere
                         Want{"nvidia/rtx3080ti", 0x17},
+                        Want{"nvidia/rtx3090", 0x17},       // GA102
+                        Want{"nvidia/a40", 0x17},           // GA102
+                        Want{"nvidia/a30", 0x17},           // GA100
+                        Want{"nvidia/rtx2080ti", 0x16},     // TU102: Turing
                         Want{"nvidia/h100", 0x18},          // GH100: Hopper
                         Want{"nvidia/gh200-480gb", 0x18},
                         Want{"nvidia/l4", 0x19},            // AD100: Ada
                         Want{"nvidia/l40s", 0x19},
+                        Want{"nvidia/l40", 0x19},
+                        Want{"nvidia/rtx4090", 0x19},       // AD102
                         Want{"nvidia/b200", 0x1a},          // GB100: Blackwell
                         Want{"nvidia/b300", 0x1a},          // GB110 is a GB100-architecture die
+                        Want{"nvidia/gb200", 0x1a},         // the superchip's GPU is a GB100-architecture die
+                        Want{"nvidia/rtx-pro-6000", 0x1b},  // GB202: a GB20x die
+                        Want{"nvidia/gb10", 0x1b},          // cc 12.1; boot_architecture() puts every 12.x on the GB20x id
                         Want{"nvidia/rtx5090", 0x1b}}) {    // GB200: the GB20x dies
     regs::RegisterSpace bar0(regs::Space::AmdMmio, device(w.gpu));
     const uint32_t v = bar0.read(0x0, 4);

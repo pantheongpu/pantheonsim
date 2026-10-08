@@ -1,0 +1,59 @@
+# VirtualGPU device profile: NVIDIA GB200 (one Blackwell GPU of the Grace
+# Blackwell Superchip, sm_100).
+# Public values; verified: false -- nothing here has been measured on a card.
+# This differs from nvidia/b200 where NVIDIA publishes a per-GPU figure that does:
+#   - memory: the GB200 NVL72 page gives the superchip (two Blackwell GPUs) "372 GB
+#     HBM3E" and 16 TB/s, so one GPU has 186 GB and 8 TB/s (derived, halving the
+#     superchip's figures). NVIDIA's "GB" for HBM is binary (a B200's 180 GB
+#     reports 183359 MiB), so vram_bytes is 190464 MiB; an upper bound.
+#   - PCI device 0x2941, "NVIDIA GB200", from the name table in NVIDIA's open GPU
+#     kernel modules (g_nv_name_released.h); the B200 is 0x2901.
+#   - NVLink: 3.6 TB/s for the superchip's two GPUs, 1.8 TB/s each, which is
+#     NVLink 5's 18 links (the B200 profile's count).
+# Everything else is COPIED from nvidia/b200 because NVIDIA's page gives no
+# separate figure: compute capability 10.0 (CUDA GPUs table lists GB200 as 10.0),
+# the SM count (148, itself unverified there), per-SM limits, clocks, and the
+# 1000 W power limit (the page lists no TDP), the 90 C limit and the memory
+# sensor. The Grace link is NVLink-C2C, so the PCIe link is left out rather than
+# taken from the B200.
+id: nvidia/gb200
+vendor: nvidia
+model: "NVIDIA GB200"
+architecture: blackwell
+compute_capability: "10.0"
+warp_size: 32
+vram_bytes: 199715979264         # 190464 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448   # 227 KiB (sm_100)
+  registers_per_block: 65536
+  multiprocessors: 148           # nvidia/b200's; no GB200 figure is published
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 233472
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 190464         # 186 GB in MiB; not measured on a card
+  power_limit_w: 1000            # the B200's; unpublished per GPU
+  sm_clock_max_mhz: 1965         # the B200's until measured
+  mem_clock_max_mhz: 4000        # the B200's until measured
+  temperature_max_c: 90
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 10561           # 0x2941 [GB200]
+  ecc: true
+  memory: hbm
+  memory_temperature: true
+  nvlink: "NVLink5 x18"          # see the header
