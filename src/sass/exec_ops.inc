@@ -2869,6 +2869,12 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     Mask arrived = 0;
     for (unsigned l = 0; l < 32; ++l)
       if (((w.waiting >> l) & 1) && w.wait_kind[l] == Wait::BSync && w.wait_arg[l] == x) arrived |= Mask{1} << l;
+    // A callee that uses the same Bx as its caller saves the caller's mask with BMOV.CLEAR and puts it
+    // back on return, so while it runs the barrier holds only the callee's own lanes. Lanes the caller
+    // has parked at its BSYNC Bx are waiting on the saved mask, not on this one, and the callee's BSYNC
+    // must not take them with it: released early, they ran on, and the caller's BSYNC then waited for
+    // lanes that had already left (CUB's reduce kernels calling GooFit's functions through pointers).
+    if (members) arrived &= members;
     if ((members & ~arrived) == 0 && arrived) {
       each_lane(arrived, [&](unsigned l) {
         w.waiting &= ~(Mask{1} << l);
