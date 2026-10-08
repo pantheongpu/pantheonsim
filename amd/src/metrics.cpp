@@ -2,12 +2,15 @@
 
 #include <time.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+
+#include "vgpu/amd_chip.hpp"
 
 namespace vgpu::amd {
 namespace {
@@ -64,8 +67,10 @@ std::string gpu_metrics(const telemetry::DeviceSample& d, const ras::Counters& c
   m.pcie_nak_rcvd_count_acc = static_cast<uint32_t>(pcie(ras::Pcie::NaksReceived));
   for (auto& x : m.xgmi_read_data_acc) x = 0;
   for (auto& x : m.xgmi_write_data_acc) x = 0;
-  // Every XCD at the graphics clock; the memory clock.
-  for (auto& clk : m.current_gfxclk) clk = static_cast<uint16_t>(d.sm_clock_mhz);
+  // Every XCD at the graphics clock (one entry for a part with one graphics die: the rest are
+  // not reported, and AMD's CLI lists only the entries that are); the memory clock.
+  const uint32_t xccs = std::max<uint32_t>(1, std::min<uint32_t>(vgpu::amd::chip(d.architecture).xccs, 8));
+  for (uint32_t i = 0; i < xccs; ++i) m.current_gfxclk[i] = static_cast<uint16_t>(d.sm_clock_mhz);
   m.current_uclk = static_cast<uint16_t>(d.mem_clock_mhz);
   m.padding = 0;
   return std::string(reinterpret_cast<const char*>(&m), sizeof m);

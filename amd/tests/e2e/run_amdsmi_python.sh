@@ -72,11 +72,15 @@ print("pcie", pc["max_pcie_speed"], pc["max_pcie_width"])
 caps = amdsmi.amdsmi_get_supported_power_cap(h[0])
 print("caps", caps["sensor_inds"], [amdsmi.amdsmi_get_power_cap_info(h[0], i)["max_power_cap"] > 0 for i in caps["sensor_inds"]])
 print("managed", amdsmi.amdsmi_is_gpu_power_management_enabled(h[0]))
+vr = amdsmi.amdsmi_get_gpu_vram_info(h[0])
+print("vram", vr["vram_type"], vr["vram_bit_width"], vr["vram_max_bandwidth"])
+ci = amdsmi.amdsmi_get_gpu_cache_info(h[0])["cache"]
+print("cache", [(c["cache_level"], c["max_num_cu_shared"], c["num_cache_instance"]) for c in ci])
 amdsmi.amdsmi_shut_down()
 EOF
 )
   check() {
-    if grep -qx -- "$2" <<<"$out"; then echo "ok    $1 ($g)"; else
+    if grep -qxF -- "$2" <<<"$out"; then echo "ok    $1 ($g)"; else
       echo "FAIL  $1 ($g): wanted '$2'"; echo "$out" | sed 's/^/      /'; fail=1; fi
   }
   if [[ $g == amd/mi300x ]]; then
@@ -102,5 +106,14 @@ EOF
   else check "the PCIe link's maximum speed and width" "pcie 16000 16"; fi
   check "the power cap sensors, and each one's cap" "caps [0] [True]"
   check "power management is on" "managed True"
+  if [[ $g == amd/mi300x ]]; then
+    check "the memory: HBM3 on 8192 bits, 5.3 TB/s" "vram 4 8192 5324"
+    check "the caches: a vector L1 to each of 304 compute units, an L2 on each of 8 dies, the Infinity Cache" \
+      "cache [(1, 1, 304), (2, 38, 8), (3, 304, 1)]"
+  else
+    check "the memory: GDDR6 on 384 bits, 960 GB/s" "vram 22 384 960"
+    check "the caches: a vector L1 to each of 96 compute units, one L2, the Infinity Cache" \
+      "cache [(1, 1, 96), (2, 96, 1), (3, 96, 1)]"
+  fi
 done
 exit $fail

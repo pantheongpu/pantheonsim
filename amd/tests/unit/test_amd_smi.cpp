@@ -57,6 +57,8 @@ int amdsmi_get_power_cap_info(void*, uint32_t, void*);
 int amdsmi_get_supported_power_cap(void*, uint32_t*, uint32_t*, uint32_t*);
 int amdsmi_is_gpu_power_management_enabled(void*, bool*);
 int amdsmi_get_gpu_activity(void*, void*);
+int amdsmi_get_gpu_vram_info(void*, void*);
+int amdsmi_get_gpu_cache_info(void*, void*);
 int amdsmi_get_gpu_fan_speed(void*, uint32_t, int64_t*);
 int amdsmi_get_clock_info(void*, int, void*);
 int amdsmi_get_gpu_volt_metric(void*, int, int, int64_t*);
@@ -407,6 +409,38 @@ VTEST(xgmi_is_there_only_between_instinct_gpus) {
   VCHECK_EQ(amdsmi_get_gpu_xgmi_link_status(g[0], &links), kSuccess);
   VCHECK_EQ(links.total, 1u);   // the one peer of a two-GPU machine
   VCHECK_EQ(links.status[0], 1);   // up
+}
+
+// The memory and caches of the chip (include/vgpu/amd_chip.hpp).
+VTEST(vram_and_cache_info_are_the_chips) {
+  amdsmi_init(2);
+  const std::vector<void*> g = gpus();
+  const bool rx = radeon();
+  struct {
+    int32_t type;
+    char vendor[256];
+    uint64_t size_mb;
+    uint32_t bit_width;
+    uint64_t bandwidth_gbs;
+    uint64_t reserved[37];
+  } vram{};
+  VCHECK_EQ(amdsmi_get_gpu_vram_info(g[0], &vram), kSuccess);
+  VCHECK_EQ(vram.type, rx ? 22 : 4);                 // GDDR6, HBM3
+  VCHECK_EQ(vram.bit_width, rx ? 384u : 8192u);
+  VCHECK_EQ(vram.size_mb, rx ? uint64_t{24560} : uint64_t{196608});   // the profiles' bytes, in MiB
+  VCHECK_EQ(vram.bandwidth_gbs, rx ? uint64_t{960} : uint64_t{5324});   // the cards' 960 GB/s and 5.3 TB/s
+  struct {
+    uint32_t types;
+    struct { uint32_t properties, size_kb, level, shared, instances, reserved[3]; } cache[10];
+    uint32_t reserved[15];
+  } caches{};
+  VCHECK_EQ(amdsmi_get_gpu_cache_info(g[0], &caches), kSuccess);
+  VCHECK_EQ(caches.types, 3u);                       // L1, L2 and the Infinity Cache, on both
+  VCHECK_EQ(caches.cache[0].level, 1u);
+  VCHECK_EQ(caches.cache[0].shared, 1u);
+  VCHECK_EQ(caches.cache[1].level, 2u);
+  VCHECK_EQ(caches.cache[2].size_kb, rx ? 96u * 1024 : 256u * 1024);
+  VCHECK_EQ(caches.cache[2].instances, 1u);
 }
 
 VTEST(pcie_info_replays_and_link_as_the_machine_has_them) {

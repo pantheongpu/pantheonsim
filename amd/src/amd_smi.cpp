@@ -531,6 +531,21 @@ struct PowerInfo {  // amdsmi_power_info_t
 struct PowerCapInfo {  // amdsmi_power_cap_info_t
   uint64_t power_cap, default_power_cap, dpm_cap, min_power_cap, max_power_cap, reserved[3];
 };
+struct VramInfo {  // amdsmi_vram_info_t
+  int32_t vram_type;
+  char vram_vendor[256];
+  uint64_t vram_size;       // MB
+  uint32_t vram_bit_width;
+  uint64_t vram_max_bandwidth;   // GB/s
+  uint64_t reserved[37];
+};
+struct CacheInfo {  // amdsmi_gpu_cache_info_t
+  uint32_t num_cache_types;
+  struct {
+    uint32_t properties, size_kb, level, max_num_cu_shared, num_instance, reserved[3];
+  } cache[10];
+  uint32_t reserved[15];
+};
 struct ClkInfo {  // amdsmi_clk_info_t
   uint32_t clk, min_clk, max_clk;
   uint8_t clk_locked, clk_deep_sleep;
@@ -869,6 +884,40 @@ AMDSMI_API int amdsmi_get_power_info(void* h, PowerInfo* info) {
   info->soc_voltage = kNa16;
   info->mem_voltage = kNa16;
   info->power_limit = s.power_limit_mw / 1000;
+  return kSuccess;
+}
+// The memory type, size and width of the chip (include/vgpu/amd_chip.hpp), and the bandwidth its
+// clock gives: the data rate is the memory clock times 2 for HBM2e, 4 for HBM3 and 3E, 8 for GDDR6.
+// The vendor of the memory chips is not modelled: N/A.
+AMDSMI_API int amdsmi_get_gpu_vram_info(void* h, VramInfo* info) {
+  GPU(h, s, info);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  std::memset(info, 0, sizeof *info);
+  const std::string type = c.memory;
+  uint32_t rate = 8;
+  if (type == "HBM2E") { info->vram_type = 3; rate = 2; }
+  else if (type == "HBM3") { info->vram_type = 4; rate = 4; }
+  else if (type == "HBM3E") { info->vram_type = 5; rate = 4; }
+  else if (type == "GDDR6") info->vram_type = 22;
+  std::snprintf(info->vram_vendor, sizeof info->vram_vendor, "N/A");
+  info->vram_size = s.vram_total_bytes >> 20;
+  info->vram_bit_width = c.mem_bits;
+  info->vram_max_bandwidth = uint64_t{c.mem_bits} / 8 * c.mem_mhz * rate / 1000;
+  return kSuccess;
+}
+// The caches the chip table knows: the vector L1 of each compute unit, the L2 of each compute die, and
+// the last-level cache where there is one. Instruction and scalar caches are not modelled.
+AMDSMI_API int amdsmi_get_gpu_cache_info(void* h, CacheInfo* info) {
+  GPU(h, s, info);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  std::memset(info, 0, sizeof *info);
+  const uint32_t cus = s.multiprocessors * c.cus_per_mp;
+  const uint32_t kEnabled = 1, kData = 2;
+  uint32_t n = 0;
+  info->cache[n++] = {kEnabled | kData, c.l1_kb, 1, 1, cus, {}};
+  info->cache[n++] = {kEnabled | kData, c.l2_kb, 2, cus / std::max<uint32_t>(c.xccs, 1), std::max<uint32_t>(c.xccs, 1), {}};
+  if (c.l3_mb) info->cache[n++] = {kEnabled | kData, c.l3_mb * 1024, 3, cus, 1, {}};
+  info->num_cache_types = n;
   return kSuccess;
 }
 // The one sensor power caps are kept for, PPT0 (the lower, filtered limit); the CLI asks for the
