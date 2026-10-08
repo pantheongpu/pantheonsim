@@ -100,7 +100,8 @@ The Activity API, which is what produces a timeline:
 - `cuptiGetVersion`, `cuptiGetResultString`, `cuptiGetLastError`,
   `cuptiGetTimestamp`, `cuptiFinalize`
 - `cuptiActivityPushExternalCorrelationId` / `Pop`
-- `cuptiGetCallbackName`, for the runtime functions whose calls are recorded
+- `cuptiGetCallbackName`, for the runtime and driver functions whose calls are
+  recorded (`cudaMalloc_v3020`, `cuMemAlloc_v2`)
 
 Records produced:
 
@@ -110,15 +111,17 @@ Records produced:
 | `MEMCPY` | direction, source and destination memory kind (pageable, pinned, device, managed), bytes, the async flag, device, stream, correlation id, start and end |
 | `MEMSET` | value, bytes, memory kind, the async flag, stream, correlation id |
 | `RUNTIME` | the runtime call (`cbid`, for every function the toolkit's `cupti_runtime_cbid.h` names), process and thread, return value, correlation id |
+| `DRIVER` | the driver call a program made itself (`cbid` from the toolkit's `cupti_driver_cbid.h`), process and thread, return value, correlation id; see below for which calls |
 | `SYNCHRONIZATION` | event, stream-wait-event, stream and context waits, with stream and event ids |
 | `DEVICE` | every device once, when the kind is first flushed: name, compute capability, multiprocessors, memory and limits |
 | `CONTEXT`, `STREAM` | a context or stream coming into being, while the kind is enabled |
 
-A kernel or copy has the correlation id of the runtime call that issued it,
-which is how a profiler connects the GPU timeline to the host call that
-launched it. A call made through another public call (`cudaMemcpyAsync`
-goes through `cudaMemcpy` here) is one call, as it is on NVIDIA's runtime,
-which does not route its API through itself.
+A kernel or copy has the correlation id of the runtime or driver call that
+issued it, which is how a profiler connects the GPU timeline to the host call
+that launched it. A call made through another public call (`cudaMemcpyAsync`
+goes through `cudaMemcpy` here, `cuStreamSynchronize` through
+`cuCtxSynchronize`) is one call, as it is on NVIDIA's runtime and driver, which
+do not route their API through itself.
 
 The record structures are the newest the toolkit being built against defines
 (`CUpti_ActivityKernel11` under CUDA 13.2, `Kernel10` under 13.0, `Kernel9`
@@ -144,9 +147,37 @@ NVIDIA's). Enabled domains and callbacks are delivered as the call happens:
   this cannot describe is not delivered, rather than delivered with a structure
   of zeros that a consumer would read as what the program passed. The
   activity `RUNTIME` records cover every call.
-- **Resource**: context created, stream created and destroyed, driver
-  initialisation finished.
-- **Synchronize**: stream and context synchronized.
+- **Driver API**: the same, for the calls a program makes itself. Delivered
+  for the ~55 whose structures are filled completely, under NVIDIA's own
+  spelling of each (`functionName` is `cuMemAlloc_v2`, as `cuptiGetCallbackName`
+  gives it):
+  `cuInit`, `cuDeviceGet`, `cuDeviceGetCount`, `cuDeviceGetName`,
+  `cuDeviceGetAttribute`, `cuDeviceTotalMem_v2`, `cuDeviceComputeCapability`;
+  `cuCtxCreate_v2` / `_v3` / `_v4`, `cuCtxDestroy_v2`, `cuCtxSetCurrent`,
+  `cuCtxGetCurrent`, `cuCtxSynchronize`; `cuMemAlloc_v2`, `cuMemFree_v2`,
+  `cuMemAllocHost_v2`, `cuMemFreeHost`, `cuMemHostAlloc`; the host-to-device,
+  device-to-host and device-to-device copies in `_v2` and `Async_v2` spellings;
+  `cuMemsetD8` / `D16` / `D32` (`_v2`) and their `Async` forms;
+  `cuModuleLoad`, `LoadData`, `LoadDataEx`, `LoadFatBinary`, `GetFunction`,
+  `Unload`; `cuLaunchKernel` (with `symbolName`); `cuStreamCreate`,
+  `CreateWithPriority`, `Destroy_v2`, `Synchronize`, `WaitEvent`, `Query`;
+  `cuEventCreate`, `Record`, `Synchronize`, `Query`, `Destroy_v2`,
+  `ElapsedTime` (and `_v2` where the toolkit has it). The callback-id table is
+  read from the toolkit's `cupti_driver_cbid.h` at configure time, as the
+  runtime's is. The pre-CUDA 3.2 spellings (`cuMemAlloc`, whose parameters are
+  32-bit) are not reported. Other driver calls are in neither the callbacks nor
+  the activity records; the work they issue (a kernel launched with
+  `cuLaunchCooperativeKernel`, a copy made with `cuMemcpy`) still is, with a
+  correlation id of its own.
+- **Resource**: context created and destroyed (by `cuCtxCreate*` and
+  `cuCtxDestroy`, and by a runtime program's first call on a device), stream
+  created and destroyed, driver initialisation finished.
+- **Synchronize**: stream and context synchronized (a stream query that finds
+  the stream idle counts, as on the card).
+
+The first `cuInit` of a process is not reported -- no callback and no record
+-- because the profiler is attached by that very call; a later one is. A
+subscriber is told driver initialisation finished before the next call.
 
 `nvidia/tests/e2e/run_cupti_trace.sh` runs one program that traces itself
 through both APIs and compares what it prints, with timestamps and id values
@@ -154,18 +185,34 @@ removed, with the trace NVIDIA's CUPTI printed for the same program on an RTX
 3060 (`nvidia/tests/data/cupti_trace.expected`). `--card` runs the program
 against NVIDIA's libraries on a GPU and compares with the same file, which is
 how the expected output is known to be what hardware prints.
+`run_cupti_trace_driver.sh` does the same for a program that uses only the
+driver API (`cupti_trace_driver.cu`: a PTX module in a string, device and host
+memory, copies, fills, two kernels, streams, events and every wait), against
+`cupti_trace_driver.expected`.
 
 Known differences, all of the lazy-loading kind: a real driver raises
 module-loaded callbacks when it first loads a kernel's code; this loads whole
 modules at once and does not. Register counts come from this project's
 analysis, not from the compiler, and are not compared.
 
+Two more, found by tracing a driver program on the card. The real driver makes
+a context with seven streams of its own, and reports a `STREAM` record for each
+under the `cuCtxCreate` call that made them; this makes none. And the real
+runtime is built on the real driver, so a runtime program's trace on NVIDIA's
+CUPTI also lists the driver calls its runtime made (`cuMemAlloc_v2` under
+`cudaMalloc`); here a call made through another public call is not a call of its
+own, so a runtime program has runtime records and a driver program driver
+records, and neither has the other's.
+
 ## What is not implemented, and why
 
-**The Callback API covers the runtime, resource and synchronize domains
-only.** The driver-API domain, module and graph resources, and the NVTX domain
-deliver nothing. Runtime calls outside the set above are in the activity
-records but not delivered as callbacks.
+**The Callback API covers the runtime, driver, resource and synchronize
+domains.** Module and graph resources and the NVTX domain deliver nothing.
+Runtime and driver calls outside the sets above are not delivered as callbacks;
+the runtime's are all in the activity records, the driver's are in them only
+for the set above. Retaining a primary context (`cuDevicePrimaryCtxRetain`)
+raises no context-created callback and makes no context record; a context made
+with `cuCtxCreate` does.
 
 **No metrics or events.** The Profiling and Event APIs report hardware
 performance counters. The exact counters this engine keeps -- instruction mix,

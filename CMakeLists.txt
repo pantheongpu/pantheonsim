@@ -429,6 +429,30 @@ if(CUDA_ABI_INCLUDE)
   endif()
   file(WRITE "${_cbid_inc}.tmp" "${_cbid_text}")
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cbid_inc}.tmp" "${_cbid_inc}")
+  # The driver-API ones, from cupti_driver_cbid.h. The names are not versioned
+  # the runtime's way (cudaMalloc_v3020): they are the driver function's own
+  # spelling, cuMemAlloc_v2 and cuMemAlloc being two functions with an ID each,
+  # and the name a subscriber is told is exactly that. A second file says which
+  # exist, because the toolkits differ (cuCtxCreate_v4 is newer than 12.0).
+  set(_dcbid_header "${CUDA_ABI_INCLUDE}/cupti_driver_cbid.h")
+  set(_dcbid_inc "${CMAKE_BINARY_DIR}/gen/cupti_driver_cbids.inc")
+  set(_dcbid_have "${CMAKE_BINARY_DIR}/gen/cupti_driver_have.h")
+  set(_dcbid_text "")
+  set(_dcbid_have_text "")
+  if(EXISTS "${_dcbid_header}")
+    file(STRINGS "${_dcbid_header}" _dcbid_lines REGEX "CUPTI_DRIVER_TRACE_CBID_cu[A-Za-z0-9_]+ *=")
+    foreach(_line IN LISTS _dcbid_lines)
+      if(_line MATCHES "CUPTI_DRIVER_TRACE_CBID_(cu[A-Za-z0-9_]+) *=")
+        set(_fn "${CMAKE_MATCH_1}")
+        string(APPEND _dcbid_text "VGPU_DRIVER_CBID_ROW(\"${_fn}\", CUPTI_DRIVER_TRACE_CBID_${_fn})\n")
+        string(APPEND _dcbid_have_text "#define VGPU_HAVE_DRIVER_CBID_${_fn} 1\n")
+      endif()
+    endforeach()
+  endif()
+  file(WRITE "${_dcbid_inc}.tmp" "${_dcbid_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_inc}.tmp" "${_dcbid_inc}")
+  file(WRITE "${_dcbid_have}.tmp" "${_dcbid_have_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_have}.tmp" "${_dcbid_have}")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -2022,6 +2046,16 @@ if(TARGET vgpucupti)
   add_test(NAME e2e_cupti_trace
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_trace.sh)
   set_tests_properties(e2e_cupti_trace PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # The same for a program that uses only the driver API: the driver calls, the
+  # kernels, copies, fills and waits they issue, and the context and streams.
+  add_test(NAME e2e_cupti_trace_driver
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_trace_driver.sh)
+  set_tests_properties(e2e_cupti_trace_driver PROPERTIES
     DEPENDS vgpucupti
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"

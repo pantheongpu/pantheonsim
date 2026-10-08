@@ -94,7 +94,8 @@ bool g_devices_delivered = false;
 bool produced(CUpti_ActivityKind k) {
   return k == CUPTI_ACTIVITY_KIND_KERNEL || k == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL ||
          k == CUPTI_ACTIVITY_KIND_MEMCPY || k == CUPTI_ACTIVITY_KIND_MEMSET ||
-         k == CUPTI_ACTIVITY_KIND_RUNTIME || k == CUPTI_ACTIVITY_KIND_SYNCHRONIZATION ||
+         k == CUPTI_ACTIVITY_KIND_RUNTIME || k == CUPTI_ACTIVITY_KIND_DRIVER ||
+         k == CUPTI_ACTIVITY_KIND_SYNCHRONIZATION ||
          k == CUPTI_ACTIVITY_KIND_DEVICE || k == CUPTI_ACTIVITY_KIND_CONTEXT ||
          k == CUPTI_ACTIVITY_KIND_STREAM;
 }
@@ -354,11 +355,44 @@ CUpti_CallbackId runtime_cbid(const std::string& name) {
   return it == ids.end() ? CUPTI_RUNTIME_TRACE_CBID_INVALID : it->second;
 }
 
+/* ---- the driver functions whose calls are recorded ----
+   The same, from cupti_driver_cbid.h. A driver function's ID is its own
+   spelling's (cuMemAlloc_v2 and cuMemAlloc have one each), and that spelling is
+   also the name a subscriber is told. */
+
+#include "cupti_driver_have.h"
+
+struct DriverCbidRow {
+  const char* fn;
+  CUpti_CallbackId id;
+};
+const DriverCbidRow kDriverCbids[] = {
+#define VGPU_DRIVER_CBID_ROW(fn, id) {fn, id},
+#include "cupti_driver_cbids.inc"
+#undef VGPU_DRIVER_CBID_ROW
+};
+
+CUpti_CallbackId driver_cbid(const std::string& name) {
+  static const std::unordered_map<std::string, CUpti_CallbackId> ids = [] {
+    std::unordered_map<std::string, CUpti_CallbackId> m;
+    for (const auto& r : kDriverCbids) m[r.fn] = r.id;
+    return m;
+  }();
+  const auto it = ids.find(name);
+  return it == ids.end() ? CUPTI_DRIVER_TRACE_CBID_INVALID : it->second;
+}
+
+const char* driver_cbid_name(CUpti_CallbackId id) {
+  for (const auto& r : kDriverCbids)
+    if (r.id == id) return r.fn;
+  return nullptr;
+}
+
 size_t fill_api(uint8_t* out, const vgpu::profiling::Event& e) {
   auto* a = reinterpret_cast<CUpti_ActivityAPI*>(out);
   std::memset(a, 0, sizeof *a);
   a->kind = e.domain_driver ? CUPTI_ACTIVITY_KIND_DRIVER : CUPTI_ACTIVITY_KIND_RUNTIME;
-  a->cbid = runtime_cbid(e.name);
+  a->cbid = e.domain_driver ? driver_cbid(e.name) : runtime_cbid(e.name);
   a->start = e.start_ns;
   a->end = e.end_ns;
   a->processId = e.process_id;
@@ -415,8 +449,9 @@ bool kind_wanted(const vgpu::profiling::Event& e) {
   switch (e.kind) {
     case K::Kernel: return g_kinds[CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL] || g_kinds[CUPTI_ACTIVITY_KIND_KERNEL];
     case K::Api:
-      return !e.domain_driver && g_kinds[CUPTI_ACTIVITY_KIND_RUNTIME] &&
-             runtime_cbid(e.name) != CUPTI_RUNTIME_TRACE_CBID_INVALID;
+      return e.domain_driver ? g_kinds[CUPTI_ACTIVITY_KIND_DRIVER] && driver_cbid(e.name) != CUPTI_DRIVER_TRACE_CBID_INVALID
+                             : g_kinds[CUPTI_ACTIVITY_KIND_RUNTIME] &&
+                                   runtime_cbid(e.name) != CUPTI_RUNTIME_TRACE_CBID_INVALID;
     case K::Memset: return g_kinds[CUPTI_ACTIVITY_KIND_MEMSET];
     case K::Sync: return g_kinds[CUPTI_ACTIVITY_KIND_SYNCHRONIZATION];
     case K::Stream: return g_kinds[CUPTI_ACTIVITY_KIND_STREAM];
@@ -615,9 +650,11 @@ VGPU_EXPORT CUptiResult cuptiFinalize(void) {
    consumer that reads it would be wrong rather than missing something. The
    activity records carry every call; callbacks carry the ones below.
 
-   Resource and synchronize domains: a stream made or destroyed, a context
-   created, a stream or device waited on. Module and graph resources, and the
-   driver domain, are not delivered. */
+   The driver API is delivered the same way, for the calls a program makes
+   itself and whose parameters are filled completely (below). Resource and
+   synchronize domains: a stream made or destroyed, a context created or
+   destroyed, a stream or context waited on. Module and graph resources are not
+   delivered. */
 
 namespace {
 
@@ -702,6 +739,85 @@ const std::unordered_map<std::string, Conv>& conversions() {
 #undef CONV
 #undef CONV0
 
+/* The driver's. Parameter structures are the toolkit's own, named as the
+   callback ID is (cuMemAlloc_v2_params). Each argument is copied into its field
+   byte for byte, by the field's own size, so an argument kept in a differently
+   typed variable (an event as void*) is read the same, and an enum value a
+   program passed that the toolkit does not name is never loaded as an enum. */
+#define DP(i, field) std::memcpy(&p->field, a[i], sizeof p->field)
+#define DCONV(fn, body)                                                                          \
+  {#fn, Conv{CUPTI_DRIVER_TRACE_CBID_##fn, [](void* storage, const void* const* a) {            \
+               auto* p = new (storage) fn##_params();                                            \
+               body                                                                              \
+             }}},
+#define DCONV0(fn) {#fn, Conv{CUPTI_DRIVER_TRACE_CBID_##fn, nullptr}},
+
+const std::unordered_map<std::string, Conv>& driver_conversions() {
+  static const std::unordered_map<std::string, Conv> table = {
+    DCONV(cuInit, DP(0, Flags);)
+    DCONV(cuDeviceGet, DP(0, device); DP(1, ordinal);)
+    DCONV(cuDeviceGetCount, DP(0, count);)
+    DCONV(cuDeviceGetName, DP(0, name); DP(1, len); DP(2, dev);)
+    DCONV(cuDeviceGetAttribute, DP(0, pi); DP(1, attrib); DP(2, dev);)
+    DCONV(cuDeviceTotalMem_v2, DP(0, bytes); DP(1, dev);)
+    DCONV(cuDeviceComputeCapability, DP(0, major); DP(1, minor); DP(2, dev);)
+    DCONV(cuCtxCreate_v2, DP(0, pctx); DP(1, flags); DP(2, dev);)
+    DCONV(cuCtxCreate_v3, DP(0, pctx); DP(1, paramsArray); DP(2, numParams); DP(3, flags); DP(4, dev);)
+#ifdef VGPU_HAVE_DRIVER_CBID_cuCtxCreate_v4
+    DCONV(cuCtxCreate_v4, DP(0, pctx); DP(1, ctxCreateParams); DP(2, flags); DP(3, dev);)
+#endif
+    DCONV(cuCtxDestroy_v2, DP(0, ctx);)
+    DCONV(cuCtxSetCurrent, DP(0, ctx);)
+    DCONV(cuCtxGetCurrent, DP(0, pctx);)
+    DCONV0(cuCtxSynchronize)
+    DCONV(cuMemAlloc_v2, DP(0, dptr); DP(1, bytesize);)
+    DCONV(cuMemFree_v2, DP(0, dptr);)
+    DCONV(cuMemAllocHost_v2, DP(0, pp); DP(1, bytesize);)
+    DCONV(cuMemFreeHost, DP(0, p);)
+    DCONV(cuMemHostAlloc, DP(0, pp); DP(1, bytesize); DP(2, Flags);)
+    DCONV(cuMemcpyHtoD_v2, DP(0, dstDevice); DP(1, srcHost); DP(2, ByteCount);)
+    DCONV(cuMemcpyDtoH_v2, DP(0, dstHost); DP(1, srcDevice); DP(2, ByteCount);)
+    DCONV(cuMemcpyDtoD_v2, DP(0, dstDevice); DP(1, srcDevice); DP(2, ByteCount);)
+    DCONV(cuMemcpyHtoDAsync_v2, DP(0, dstDevice); DP(1, srcHost); DP(2, ByteCount); DP(3, hStream);)
+    DCONV(cuMemcpyDtoHAsync_v2, DP(0, dstHost); DP(1, srcDevice); DP(2, ByteCount); DP(3, hStream);)
+    DCONV(cuMemcpyDtoDAsync_v2, DP(0, dstDevice); DP(1, srcDevice); DP(2, ByteCount); DP(3, hStream);)
+    DCONV(cuMemsetD8_v2, DP(0, dstDevice); DP(1, uc); DP(2, N);)
+    DCONV(cuMemsetD16_v2, DP(0, dstDevice); DP(1, us); DP(2, N);)
+    DCONV(cuMemsetD32_v2, DP(0, dstDevice); DP(1, ui); DP(2, N);)
+    DCONV(cuMemsetD8Async, DP(0, dstDevice); DP(1, uc); DP(2, N); DP(3, hStream);)
+    DCONV(cuMemsetD16Async, DP(0, dstDevice); DP(1, us); DP(2, N); DP(3, hStream);)
+    DCONV(cuMemsetD32Async, DP(0, dstDevice); DP(1, ui); DP(2, N); DP(3, hStream);)
+    DCONV(cuModuleLoad, DP(0, module); DP(1, fname);)
+    DCONV(cuModuleLoadData, DP(0, module); DP(1, image);)
+    DCONV(cuModuleLoadDataEx, DP(0, module); DP(1, image); DP(2, numOptions); DP(3, options); DP(4, optionValues);)
+    DCONV(cuModuleLoadFatBinary, DP(0, module); DP(1, fatCubin);)
+    DCONV(cuModuleGetFunction, DP(0, hfunc); DP(1, hmod); DP(2, name);)
+    DCONV(cuModuleUnload, DP(0, hmod);)
+    DCONV(cuLaunchKernel, DP(0, f); DP(1, gridDimX); DP(2, gridDimY); DP(3, gridDimZ); DP(4, blockDimX);
+          DP(5, blockDimY); DP(6, blockDimZ); DP(7, sharedMemBytes); DP(8, hStream); DP(9, kernelParams);
+          DP(10, extra);)
+    DCONV(cuStreamCreate, DP(0, phStream); DP(1, Flags);)
+    DCONV(cuStreamCreateWithPriority, DP(0, phStream); DP(1, flags); DP(2, priority);)
+    DCONV(cuStreamDestroy_v2, DP(0, hStream);)
+    DCONV(cuStreamSynchronize, DP(0, hStream);)
+    DCONV(cuStreamWaitEvent, DP(0, hStream); DP(1, hEvent); DP(2, Flags);)
+    DCONV(cuStreamQuery, DP(0, hStream);)
+    DCONV(cuEventCreate, DP(0, phEvent); DP(1, Flags);)
+    DCONV(cuEventRecord, DP(0, hEvent); DP(1, hStream);)
+    DCONV(cuEventSynchronize, DP(0, hEvent);)
+    DCONV(cuEventQuery, DP(0, hEvent);)
+    DCONV(cuEventDestroy_v2, DP(0, hEvent);)
+    DCONV(cuEventElapsedTime, DP(0, pMilliseconds); DP(1, hStart); DP(2, hEnd);)
+#ifdef VGPU_HAVE_DRIVER_CBID_cuEventElapsedTime_v2
+    DCONV(cuEventElapsedTime_v2, DP(0, pMilliseconds); DP(1, hStart); DP(2, hEnd);)
+#endif
+  };
+  return table;
+}
+#undef DP
+#undef DCONV
+#undef DCONV0
+
 std::mutex g_cb_mu;
 CUpti_CallbackFunc g_cb_fn = nullptr;
 void* g_cb_user = nullptr;
@@ -724,27 +840,32 @@ bool cb_enabled(CUpti_CallbackDomain d, uint32_t id, CUpti_CallbackFunc* fn, voi
 thread_local uint64_t t_correlation_data = 0;   // the subscriber's, from entry to exit of one call
 
 void on_api(const vgpu::profiling::ApiInfo& info) {
-  if (info.domain != vgpu::profiling::Domain::Runtime) return;
-  const auto& table = conversions();
+  const bool driver = info.domain == vgpu::profiling::Domain::Driver;
+  const auto& table = driver ? driver_conversions() : conversions();
   const auto it = table.find(info.name);
   if (it == table.end()) return;
   const Conv& conv = it->second;
+  const CUpti_CallbackDomain domain = driver ? CUPTI_CB_DOMAIN_DRIVER_API : CUPTI_CB_DOMAIN_RUNTIME_API;
   // The arguments are what the parameter structure is built from; without
   // them there is nothing true to put in it.
   if (conv.fill && !info.args) return;
   CUpti_CallbackFunc fn = nullptr;
   void* user = nullptr;
-  if (!cb_enabled(CUPTI_CB_DOMAIN_RUNTIME_API, conv.cbid, &fn, &user)) return;
+  if (!cb_enabled(domain, conv.cbid, &fn, &user)) return;
 
   alignas(16) unsigned char storage[256];
   if (conv.fill) conv.fill(storage, info.args);
+  // A runtime call returns a cudaError_t, a driver call a CUresult; both are the
+  // call's int.
   cudaError_t returned = static_cast<cudaError_t>(info.result);
+  CUresult driver_returned = static_cast<CUresult>(info.result);
   CUpti_CallbackData data;
   std::memset(&data, 0, sizeof data);
   data.callbackSite = info.enter ? CUPTI_API_ENTER : CUPTI_API_EXIT;
   data.functionName = info.name;
   data.functionParams = conv.fill ? storage : nullptr;
-  data.functionReturnValue = info.enter ? nullptr : &returned;
+  data.functionReturnValue = info.enter ? nullptr : driver ? static_cast<void*>(&driver_returned)
+                                                           : static_cast<void*>(&returned);
   data.symbolName = info.symbol;
   data.context = current_context();
   data.contextUid = context_id_of(reinterpret_cast<uint64_t>(data.context));
@@ -752,7 +873,7 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   data.correlationId = info.correlation;
   if (info.enter) t_correlation_data = 0;
   vgpu::profiling::Silence silent;   // the subscriber's own CUDA calls are its own
-  fn(user, CUPTI_CB_DOMAIN_RUNTIME_API, conv.cbid, &data);
+  fn(user, domain, conv.cbid, &data);
 }
 
 void on_resource(vgpu::profiling::Resource what, uint64_t handle, uint32_t) {
@@ -801,9 +922,8 @@ void install_hooks() {
 }
 
 bool known_domain(CUpti_CallbackDomain d) {
-  return d == CUPTI_CB_DOMAIN_DRIVER_API || d == CUPTI_CB_DOMAIN_RUNTIME_API ||
-         d == CUPTI_CB_DOMAIN_RESOURCE || d == CUPTI_CB_DOMAIN_SYNCHRONIZE ||
-         d == CUPTI_CB_DOMAIN_NVTX || d == CUPTI_CB_DOMAIN_STATE;
+  // Every domain the toolkit names (13.0 added the state domain after NVTX).
+  return d > CUPTI_CB_DOMAIN_INVALID && d < CUPTI_CB_DOMAIN_SIZE;
 }
 
 CUptiResult set_callback(uint32_t enable, CUpti_SubscriberHandle sub, CUpti_CallbackDomain d, uint32_t id) {
@@ -897,13 +1017,19 @@ VGPU_EXPORT CUptiResult cuptiGetStreamId(CUcontext, CUstream stream, uint32_t* i
 VGPU_EXPORT CUptiResult cuptiGetStreamIdEx(CUcontext c, CUstream stream, uint8_t, uint32_t* id) {
   return cuptiGetStreamId(c, stream, id);
 }
-// The names of the runtime functions, for a tool labelling what it receives:
-// the versioned spelling, as NVIDIA's reports it (cudaMalloc_v3020).
+// The names of the runtime and driver functions, for a tool labelling what it
+// receives: the runtime's versioned spelling, as NVIDIA's reports it
+// (cudaMalloc_v3020), and the driver function's own (cuMemAlloc_v2).
 VGPU_EXPORT CUptiResult cuptiGetCallbackName(CUpti_CallbackDomain domain, uint32_t cbid, const char** name) {
   if (!name) return CUPTI_ERROR_INVALID_PARAMETER;
   *name = nullptr;
   if (domain == CUPTI_CB_DOMAIN_RUNTIME_API)
     if (const char* n = runtime_cbid_name(cbid)) {
+      *name = n;
+      return CUPTI_SUCCESS;
+    }
+  if (domain == CUPTI_CB_DOMAIN_DRIVER_API)
+    if (const char* n = driver_cbid_name(cbid)) {
       *name = n;
       return CUPTI_SUCCESS;
     }
