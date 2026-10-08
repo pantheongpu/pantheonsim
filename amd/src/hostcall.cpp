@@ -43,7 +43,7 @@ const char* service_name(uint32_t s) {
   switch (s) {
     case 1: return "a device function call";
     case 2: return "printf";
-    case 3: return "device malloc";
+    case 3: return "device memory";
     case 4: return "the address sanitizer";
     default: return "an unknown service";
   }
@@ -79,6 +79,12 @@ Hostcall::Hostcall(MemoryManager& mem, Print print, uint32_t packets)
 }
 
 Hostcall::~Hostcall() {
+  for (const auto& [ptr, block] : devmem_) {
+    try {
+      mem_.free(block.first);
+    } catch (const std::exception&) {
+    }
+  }
   for (uint64_t a : allocations_) {
     try {
       mem_.free(a);
@@ -116,14 +122,79 @@ void Hostcall::service() {
     const uint64_t next = mem_.load_scalar(header + kNext, 8);
     const uint64_t active = mem_.load_scalar(header + kActive, 8);
     const uint32_t service = static_cast<uint32_t>(mem_.load_scalar(header + kService, 4));
-    if (service != kServicePrintf)
+    if (service == kServicePrintf) serve_printf(payload, active);
+    else if (service == kServiceDevmem) serve_devmem(payload, active);
+    else if (service == kServiceSanitizer) serve_sanitizer(payload, active);
+    else
       throw Error::make(Err::Unsupported, "the kernel called the host for ", service_name(service), " (hostcall service ",
-                        service, "), which is not modelled; printf is");
-    serve_printf(payload, active);
+                        service, "), which is not modelled; printf, device memory and the address sanitizer's report are");
     // Answered: the kernel, spinning on the ready bit, reads its slots.
     std::atomic_thread_fence(std::memory_order_release);
     mem_.store_scalar(header + kControl, 4, 0);
     top = next;
+  }
+}
+
+// Device memory (ockl's __ockl_devmem_request, which the device library's malloc
+// asks for slabs and large blocks): word 0 is an address and word 1 a size. A size
+// with no address asks for that much memory, and the lane's answer (word 0) is its
+// address, or zero where there is none -- malloc's null. An address with no size
+// gives a block back. Slabs are found again by masking an address down to a
+// multiple of their size (2 MiB), so a block is placed on its size's alignment, up
+// to that, as the library needs.
+void Hostcall::serve_devmem(uint64_t payload, uint64_t active) {
+  constexpr uint64_t kSlab = uint64_t{2} << 20, kPage = 4096;
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    if (!(active >> lane & 1)) continue;
+    const uint64_t slot = payload + uint64_t{lane} * kSlotWords * 8;
+    const uint64_t addr = mem_.load_scalar(slot, 8), size = mem_.load_scalar(slot + 8, 8);
+    uint64_t answer = 0;
+    if (addr == 0 && size > UINT64_MAX - kSlab) {
+      // no device holds it (and size + align would wrap): malloc's null
+    } else if (addr == 0 && size != 0) {
+      const uint64_t align = size >= kSlab ? kSlab : kPage;
+      try {
+        uint64_t base = mem_.alloc(size);
+        uint64_t at = base;
+        if (at % align != 0) {   // over-allocate, and place the block inside
+          mem_.free(base);
+          base = mem_.alloc(size + align);
+          at = (base + align - 1) / align * align;
+        }
+        devmem_[at] = {base, size};
+        answer = at;
+      } catch (const Error& e) {
+        if (e.code() != Err::OutOfMemory) throw;
+      }
+    } else if (addr != 0 && size == 0) {
+      const auto it = devmem_.find(addr);
+      if (it == devmem_.end())
+        throw Error::make(Err::InvalidFree, "the kernel gave the host 0x", std::hex, addr, std::dec,
+                          " back (hostcall device memory), which the host did not hand out");
+      mem_.free(it->second.first);
+      devmem_.erase(it);
+    } else if (addr != 0) {
+      throw Error::make(Err::InvalidValue, "a device memory request named both an address (0x", std::hex, addr, std::dec,
+                        ") and a size (", size, "): it either asks for memory or gives it back");
+    }
+    mem_.store_scalar(slot, 8, answer);
+    mem_.store_scalar(slot + 8, 8, 0);
+  }
+}
+
+// The address sanitizer's report (ockl's __ockl_sanitizer_report): the address,
+// the pc, the work-group's three ids, the wave, whether it was a read, and how
+// many bytes. ROCm's runtime prints the report and ends the process; here the
+// kernel ends, with the report as the error.
+void Hostcall::serve_sanitizer(uint64_t payload, uint64_t active) {
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    if (!(active >> lane & 1)) continue;
+    const uint64_t slot = payload + uint64_t{lane} * kSlotWords * 8;
+    uint64_t w[8];
+    for (uint32_t k = 0; k < 8; ++k) w[k] = mem_.load_scalar(slot + 8 * k, 8);
+    throw Error::make(Err::DeviceAssert, "AddressSanitizer: the kernel reported a bad ", w[6] ? "read" : "write", " of ",
+                      w[7], " bytes at 0x", std::hex, w[0], " (pc 0x", w[1], std::dec, ", work-group ", w[2], ",", w[3],
+                      ",", w[4], ", wave ", w[5], ", lane ", lane, ")");
   }
 }
 

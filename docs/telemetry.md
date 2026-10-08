@@ -64,15 +64,16 @@ render as `N/A` — the honest result rather than an invented number.
 
 ## Reliability and link in profiles
 
-Four optional `telemetry` keys describe what a card reports about memory
+Five optional `telemetry` keys describe what a card reports about memory
 reliability and its PCIe link:
 
 | Key | Meaning | Source |
 | --- | --- | --- |
 | `ecc` | the card has ECC and ships with it on | datasheet |
-| `memory` | `hbm` or `gddr`: HBM cards remap failing rows, GDDR cards with ECC retire pages | datasheet |
+| `memory` | `hbm` or `gddr`. HBM cards remap failing rows; so does any card with ECC from Ampere on (an A10, L4 or L40S has GDDR and remaps), and a T4 or earlier retires pages | datasheet; NVIDIA's memory-error guide |
 | `memory_temperature` | the driver reports a memory sensor | real runs; most HBM cards report none |
 | `pcie_link` | the link real cards most often run at, such as `"Gen4 x8"` | the benchmark database of real runs |
+| `nvlink` | NVLink generation and link count, such as `"NVLink4 x18"`, on the SXM profiles (A100, H100, H200, B200, B300); absent on every other card | datasheet |
 
 The link is a fact about how cards are hosted, not the slot they fit: a T4 is
 an x16 card that clouds attach at x8, and a GH200's Hopper die reaches its
@@ -90,6 +91,101 @@ declines it and ships `build/bin/nvidia-smi` instead, which renders the same
 telemetry. On a CPU-only machine there is no stock `nvidia-smi` anyway — nor
 `rocm-smi` nor `rocm_agent_enumerator` — so supplying these commands is the
 fix, not a workaround.
+
+## Health and diagnostic queries
+
+What a health tool (NVIDIA's open-source DCGM -- `dcgmi diag`, NVVS and its
+plugins -- a monitoring agent, a burn-in script) asks NVML and `nvidia-smi -q`
+for, answered from the profile and the machine's reliability state, with
+`NVML_ERROR_NOT_SUPPORTED` (`N/A` in the tools) where the card of the profile
+has no such thing. DCGM's hostengine resolves entry points by name, reads a
+missing one as `FUNCTION_NOT_FOUND` and a `NOT_SUPPORTED` answer as "this part
+has none", and builds its watches (clock events, thermal and power violation
+time, ECC, retired pages and remapped rows, PCIe link and replays, energy) from
+what it could read. A fault injected for nvidia-smi shows up in DCGM too, and
+`vgpu fault throttle` is how a run's thermal or power violation is provoked:
+
+```bash
+vgpu fault throttle --gpu 0 --reason sw_thermal_slowdown --seconds 5
+vgpu fault inject --gpu 0 --ecc uncorrected
+```
+
+The ECC counts are the ones the BAR0 registers read from the same `vgpu fault`
+state (`vgpu::ras::read`: volatile is `since_load`, aggregate is `lifetime`), so
+NVML, nvidia-smi and a register read agree.
+
+| Query | T4 (Turing) | L4, A10, A100, H100 | GeForce (no ECC) |
+| --- | --- | --- | --- |
+| ECC mode, counts by location, volatile and aggregate (`nvmlDeviceGetTotalEccErrors`, `GetMemoryErrorCounter`, `GetDetailedEccErrors`, fields 1-28) | yes | yes | NOT_SUPPORTED |
+| Retired pages and pending (`GetRetiredPages`, `_v2`, `GetRetiredPagesPendingStatus`, fields 29-31, 92, 93) | yes | NOT_SUPPORTED | NOT_SUPPORTED |
+| Remapped rows (`GetRemappedRows`, fields 142-145) | NOT_SUPPORTED | yes | NOT_SUPPORTED |
+| Row-remapper histogram | NOT_SUPPORTED | NOT_SUPPORTED (no profile has a bank count) | NOT_SUPPORTED |
+| NVLink (`GetNvLinkState`, `Version`, `Capability`, `ErrorCounter`, fields 91 and the error fields) | NOT_SUPPORTED | A100 and H100 only; link-count and version from the profile | NOT_SUPPORTED |
+
+Also answered on every card: clock-event reasons, supported (the driver's
+bits 0-8) and current (`GetCurrentClocksThrottleReasons`,
+`GetSupportedClocksThrottleReasons` and the newer `ClocksEventReasons` names);
+violation times for the power, thermal and board-limit policies
+(`GetViolationStatus`, fields 74, 75, 77 and the by-reason counters 269-271;
+sync boost, low utilization, reliability and the totals are NOT_SUPPORTED, and an
+unknown policy is INVALID_ARGUMENT); the performance state; power limits (fields 185-192; the one-second average only
+from Ampere, and not GA100, as NVML documents); PCIe replays
+(`GetPcieReplayCounter` and the PCIe counter fields); accounting mode, pids and
+stats for processes running now (`GetAccounting*`); and the compute, graphics
+and MPS process lists. For DCGM's other watches:
+
+- the PCIe speed and maximum speed (`GetPcieSpeed`, `GetPcieLinkMaxSpeed`);
+- supported clocks (one memory clock, the profile's; graphics clocks in 15 MHz
+  steps from the profile's maximum down to 210 MHz) and the application,
+  default-application and customer-boost clocks, which are the maximum clocks;
+- brand (Tesla for datacenter cards, from the profile's name) and board id (the
+  card's place on the bus), the bus type, and no multi-GPU board;
+- topology and peer-to-peer: every pair of GPUs shares the host bridge, with peer
+  read, write, atomics and PCIe status OK and the NVLink index NOT_SUPPORTED
+  (the far end of a link is not modelled);
+- CPU affinity (the host's CPUs) and memory affinity (one node);
+- the energy counter (`GetTotalEnergyConsumption`, field 83), the synthetic
+  power model integrated from the process's first reading, so it is monotonic
+  inside one process (a hostengine) and restarts from zero in the next;
+- field 230 (GPU recovery action), always none needed.
+
+The infoROM (`GetInforomVersion` and the like) is NOT_SUPPORTED, as a virtual
+device has none, and everything that changes the card (clock locks, power limits,
+ECC mode) is refused.
+
+`nvidia-smi -q` prints the same as sections -- `ECC Errors`, `Retired Pages`,
+`Remapped Rows`, `Clocks Event Reasons` and its counters, `Power Readings` with
+the limits, `Temperature` with the slowdown and shutdown thresholds,
+`Replays Since Reset` under `PCI` -- and `-d` takes `ECC`, `PAGE_RETIREMENT`,
+`ROW_REMAPPER`, `PERFORMANCE` and `ACCOUNTING` to print one. `nvidia-smi nvlink
+-s` and `-e` print link state and error counters, and `nvidia-smi -r` resets a
+GPU: a pending page retirement or row remap takes effect, the counts since the
+driver loaded are zeroed, a degraded link retrains, and the card's lifetime
+counts, retired pages and remapped rows stay. A GPU a process is using is
+refused, as the real tool does, and one that has fallen off the bus exits 15.
+
+What is not real, because nothing public gives it:
+
+- Retired-page addresses are placeholders (the state counts pages, not where
+  they were), all from one derivation: a 64 KiB frame inside the framebuffer
+  chosen by the device UUID, consecutive frames within a cause and the two
+  causes half the framebuffer apart. They are the same on every query, and
+  retirement times are 0.
+- NVLink links are all up, the capabilities are an x86 host's (peer access and
+  peer atomics, no system-memory access), error counters are zero (nothing
+  injects them yet), and the remote end is not modelled, so remote type and PCI
+  address are NOT_SUPPORTED. `nvlink -s` prints speeds only for NVLink 3 and 4.
+- Accounting mode lives in the process that set it (the simulator has no
+  driver to keep it) and covers running processes only. `-q -x` does not carry
+  the new sections.
+- ECC mode cannot be changed: turning it off is NOT_SUPPORTED, since there is
+  no pending mode to apply on a reset.
+
+`nvidia/tests/e2e/run_nvml_health.sh` and `run_nvml_dcgm.sh` check these answers
+on a GDDR card, an HBM card and a card without ECC, each after the fault that
+should move it. DCGM itself has not been run against the simulator: its
+diagnostic plugins also need CUDA, cuBLAS and the profiling counters through
+their own libraries, so the checks cover the NVML half only.
 
 ## Injecting faults
 
@@ -355,9 +451,8 @@ amdgpu_ring_cper`, which the real amd-smi reads as root), fatal and boot
 records, and the bad-page-threshold record.
 
 Outside a session both tools describe `VGPU_GPU`; with no AMD GPU configured,
-`rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. Launching a kernel on one fails with a clear
-"warp size 64 is unsupported" error — AMD *execution* is not implemented, and
-VirtualGPU says so rather than producing wrong answers. See TODO.md.
+`rocm_agent_enumerator` lists only `gfx000` and says on stderr how to pick one. AMD kernels run (see [amd/README.md](../amd/README.md)); what an AMD
+execution still refuses is in the gap register at the end of TODO.md.
 
 ## Where telemetry lives
 

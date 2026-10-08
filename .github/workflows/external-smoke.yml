@@ -1,0 +1,148 @@
+name: External suites smoke
+
+# A fast subset of the nightly's outside suites (ci/external/smoke.txt: 13 CUDA
+# Samples, 12 HeCBench benchmarks, 4 Rodinia apps, 7 PolyBench kernels) on
+# pull requests that change the simulator, so a regression shows on the pull
+# request rather than in the next morning's run. Each program is checked twice:
+#
+#   card    against an RTX 3060's results, as the nightly checks them;
+#   digest  SASS against PTX: run on each engine with VGPU_KERNEL_DIGEST, the
+#           device memory after every kernel must hold the same bytes (the
+#           e2e programs' digest is sass-ptx.yml's). The differences known
+#           and not yet reconciled are listed in ci/external/digest-known.txt.
+#
+# On a GitHub-hosted runner in the cuda13.0 toolchain image (CUDA 13.0, what
+# the card's binaries were built with), not the pantheonsim.com runner the
+# nightly uses, which pull requests' ml jobs already queue for. The programs'
+# builds do not depend on the simulator and are cached.
+on:
+  pull_request:
+    paths:
+      - nvidia/**
+      - src/**
+      - include/**
+      - ci/external/**
+      - .github/workflows/external-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SUITE_GPU: nvidia/rtx3060
+  SUITE_TIMEOUT: '300'
+
+jobs:
+  image:
+    uses: ./.github/workflows/ci-image-ref.yml
+
+  smoke:
+    name: outside suites, fast subset (card and SASS/PTX)
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.image.outputs.cuda13_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA 13
+        if: ${{ !job.container.id }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0 cuda-profiler-api-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+
+      - name: Build the shims the subset loads
+        # The runtime and the driver, and cuRAND (MC_EstimatePiP).
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target vgpucudart vgpucuda vgpucurand
+
+      - name: The subsets
+        id: subsets
+        run: |
+          for s in cuda-samples hecbench rodinia polybench; do
+            echo "${s//-/_}=$(grep "^$s|" ci/external/smoke.txt | cut -d'|' -f2-)" >> "$GITHUB_OUTPUT"
+          done
+
+      # One cache per suite, keyed by its list, the subset, and the scripts.
+      - name: Builds, from the cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: suites
+          key: external-smoke-${{ hashFiles('ci/external/*.txt', 'ci/external/suites.sh', 'ci/external/compat.h') }}-cuda13.0
+
+      - name: Fetch and build (a cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CUDA_SAMPLES: ${{ steps.subsets.outputs.cuda_samples }}
+          HECBENCH: ${{ steps.subsets.outputs.hecbench }}
+          RODINIA: ${{ steps.subsets.outputs.rodinia }}
+          POLYBENCH: ${{ steps.subsets.outputs.polybench }}
+        run: |
+          set -e
+          declare -A only=([cuda-samples]=$CUDA_SAMPLES [hecbench]=$HECBENCH [rodinia]=$RODINIA [polybench]=$POLYBENCH)
+          for s in cuda-samples hecbench rodinia polybench; do
+            SUITE_ONLY="${only[$s]}" ci/external/suites.sh fetch "$s" "suites/$s"
+            SUITE_ONLY="${only[$s]}" ci/external/suites.sh build "$s" "suites/$s"
+          done
+          find suites \( -name '*.o' -o -name '*.obj' \) -delete
+          find suites -name CMakeFiles -type d -prune -exec rm -rf {} +
+          du -sh suites
+
+      - name: Keep the builds
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: suites
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Against the card, and SASS against PTX
+        env:
+          CUDA_SAMPLES: ${{ steps.subsets.outputs.cuda_samples }}
+          HECBENCH: ${{ steps.subsets.outputs.hecbench }}
+          RODINIA: ${{ steps.subsets.outputs.rodinia }}
+          POLYBENCH: ${{ steps.subsets.outputs.polybench }}
+        run: |
+          declare -A only=([cuda-samples]=$CUDA_SAMPLES [hecbench]=$HECBENCH [rodinia]=$RODINIA [polybench]=$POLYBENCH)
+          status=0
+          for s in cuda-samples hecbench rodinia polybench; do
+            for mode in run digest; do
+              SUITE_ONLY="${only[$s]}" ci/external/suites.sh "$mode" "$s" "suites/$s" build/shim "report/$s-$mode" || status=1
+              cat "report/$s-$mode/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            done
+          done
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: external-smoke
+          path: report
+          retention-days: 14
+          if-no-files-found: ignore

@@ -37,6 +37,7 @@
 #include "hip_shared.hpp"
 #include "vgpu/amd_bundle.hpp"
 #include "vgpu/amd_chip.hpp"
+#include "vgpu/amd_kfd.hpp"
 #include "vgpu/amd_image.hpp"
 #include "vgpu/hip_abi.hpp"
 #include "vgpu/hsa_abi.h"
@@ -145,6 +146,21 @@ std::map<uint64_t, std::pair<int, size_t>>& g_device = *new std::map<uint64_t, s
 std::map<uintptr_t, size_t>& g_locked = *new std::map<uintptr_t, size_t>;   // under g_mutex
 // What a program attached to an allocation (hsa_amd_pointer_info_set_userdata).
 std::map<uintptr_t, void*>& g_userdata = *new std::map<uintptr_t, void*>;   // under g_mutex
+
+// Signals created to be shared (HSA_AMD_SIGNAL_IPC): each one's serial, which
+// its handle carries so a stale address is not taken for it, and how many
+// creates and attaches have yet to be destroyed.
+std::map<uintptr_t, std::pair<uint32_t, int>>& g_ipc_signals = *new std::map<uintptr_t, std::pair<uint32_t, int>>;   // under g_mutex
+uint32_t g_ipc_serial = 0;   // under g_mutex
+// Who asked to hear of an address's release (hsa_amd_register_deallocation_callback).
+struct DeallocWatch {
+  uintptr_t ptr;
+  void (*callback)(void*, void*);
+  void* user_data;
+};
+std::vector<DeallocWatch>& g_dealloc_watches = *new std::vector<DeallocWatch>;   // under g_mutex
+// System memory a program moved to the other CPU pool (hsa_amd_memory_migrate): true for coarse-grained.
+std::map<uintptr_t, bool>& g_system_grain = *new std::map<uintptr_t, bool>;   // under g_mutex
 
 // A GPU's clock: 100 MHz, a tick every 10 ns.
 constexpr uint64_t kGpuClockHz = 100000000, kGpuTickNs = 10;
@@ -796,6 +812,89 @@ hsa_status_t hsa_isa_from_name(const char* name, hsa_isa_t* isa) {
   return HSA_STATUS_ERROR_INVALID_ISA_NAME;
 }
 
+// ---- Caches, wavefronts and ISA compatibility ---------------------------------------
+//
+// A GPU agent's caches are the levels hsa_agent_get_info's deprecated
+// HSA_AGENT_INFO_CACHE_SIZE gives sizes for (L1, L2 and, where the chip has
+// one, L3), the same numbers: a handle is the agent's times 16 plus the
+// level. The CPU agent reports none, as that attribute does. The names are
+// the levels' ("L1"): the specification asks only for a description.
+// A wavefront's handle is its ISA's, and a GPU has one wavefront size, the
+// profile's.
+
+namespace {
+uint32_t cache_size(int gpu, uint32_t level) {
+  const auto& p = shared::profile(gpu);
+  switch (level) {
+    case 1: return chip(p).l1_kb * 1024;
+    case 2: return static_cast<uint32_t>(p.limits.l2_cache_bytes);
+    case 3: return chip(p).l3_mb * 1024 * 1024;
+  }
+  return 0;
+}
+}  // namespace
+
+hsa_status_t hsa_agent_iterate_caches(hsa_agent_t agent, hsa_status_t (*callback)(hsa_cache_t, void*), void* data) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!valid_agent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
+  if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  const int gpu = gpu_of(agent);
+  if (gpu < 0) return HSA_STATUS_SUCCESS;
+  for (uint32_t level = 1; level <= 3; ++level) {
+    if (!cache_size(gpu, level)) continue;
+    const hsa_status_t s = callback({agent.handle * 16 + level}, data);
+    if (s != HSA_STATUS_SUCCESS) return s;   // the traversal stops, and says why
+  }
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t hsa_cache_get_info(hsa_cache_t cache, hsa_cache_info_t attribute, void* value) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  const uint32_t level = static_cast<uint32_t>(cache.handle % 16);
+  const int gpu = gpu_of({cache.handle / 16});
+  if (gpu < 0 || level < 1 || level > 3 || !cache_size(gpu, level)) return HSA_STATUS_ERROR_INVALID_CACHE;
+  if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  const std::string name = "L" + std::to_string(level);
+  switch (attribute) {
+    case HSA_CACHE_INFO_NAME_LENGTH: put<uint32_t>(value, static_cast<uint32_t>(name.size())); break;
+    case HSA_CACHE_INFO_NAME: std::memcpy(value, name.c_str(), name.size() + 1); break;
+    case HSA_CACHE_INFO_LEVEL: put<uint8_t>(value, static_cast<uint8_t>(level)); break;
+    case HSA_CACHE_INFO_SIZE: put<uint32_t>(value, cache_size(gpu, level)); break;
+    default: return unknown("hsa_cache_get_info", attribute);
+  }
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t hsa_isa_iterate_wavefronts(hsa_isa_t isa, hsa_status_t (*callback)(hsa_wavefront_t, void*), void* data) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (gpu_of({isa.handle}) < 0) return HSA_STATUS_ERROR_INVALID_ISA;
+  if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  return callback({isa.handle}, data);
+}
+
+hsa_status_t hsa_wavefront_get_info(hsa_wavefront_t wavefront, hsa_wavefront_info_t attribute, void* value) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  const int gpu = gpu_of({wavefront.handle});
+  if (gpu < 0) return HSA_STATUS_ERROR_INVALID_WAVEFRONT;
+  if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  if (attribute != HSA_WAVEFRONT_INFO_SIZE) return unknown("hsa_wavefront_get_info", attribute);
+  put<uint32_t>(value, shared::profile(gpu).warp_size);
+  return HSA_STATUS_SUCCESS;
+}
+
+// Code for one ISA runs on an agent of the same ISA: the full target names
+// (with their sramecc and xnack settings) are equal. Another target is
+// reported incompatible, though a generic target's code can run on its
+// family -- the machines here are never given one.
+hsa_status_t hsa_isa_compatible(hsa_isa_t code_object_isa, hsa_isa_t agent_isa, bool* result) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  const int code = gpu_of({code_object_isa.handle}), agent = gpu_of({agent_isa.handle});
+  if (code < 0 || agent < 0) return HSA_STATUS_ERROR_INVALID_ISA;
+  if (!result) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  *result = isa_name(code) == isa_name(agent);
+  return HSA_STATUS_SUCCESS;
+}
+
 // ---- Signals ------------------------------------------------------------------
 
 hsa_status_t hsa_signal_create(hsa_signal_value_t initial, uint32_t, const hsa_agent_t*, hsa_signal_t* signal) {
@@ -807,13 +906,26 @@ hsa_status_t hsa_signal_create(hsa_signal_value_t initial, uint32_t, const hsa_a
   signal->handle = reinterpret_cast<uint64_t>(s);
   return HSA_STATUS_SUCCESS;
 }
-hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial, uint32_t n, const hsa_agent_t* consumers, uint64_t,
-                                   hsa_signal_t* signal) {
-  return hsa_signal_create(initial, n, consumers, signal);
+hsa_status_t hsa_amd_signal_create(hsa_signal_value_t initial, uint32_t n, const hsa_agent_t* consumers,
+                                   uint64_t attributes, hsa_signal_t* signal) {
+  if (const hsa_status_t st = hsa_signal_create(initial, n, consumers, signal); st != HSA_STATUS_SUCCESS) return st;
+  if (attributes & HSA_AMD_SIGNAL_IPC) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_ipc_signals[static_cast<uintptr_t>(signal->handle)] = {++g_ipc_serial, 1};
+  }
+  return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_signal_destroy(hsa_signal_t signal) {
   if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
   if (!signal.handle) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+  {
+    // A shared signal lives until every create and attach has been destroyed.
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (const auto it = g_ipc_signals.find(static_cast<uintptr_t>(signal.handle)); it != g_ipc_signals.end()) {
+      if (--it->second.second > 0) return HSA_STATUS_SUCCESS;
+      g_ipc_signals.erase(it);
+    }
+  }
   shared::unmap_host(&signal_of(signal)->amd);
   delete signal_of(signal);
   return HSA_STATUS_SUCCESS;
@@ -882,6 +994,85 @@ VGPU_SIGNAL_CAS(acq_rel)
 VGPU_SIGNAL_WAIT(relaxed)
 VGPU_SIGNAL_WAIT(scacquire)
 VGPU_SIGNAL_WAIT(acquire)
+
+// ---- Signal groups ------------------------------------------------------------------
+//
+// A group is a list of signals waited on together. The wait looks at each
+// signal in turn, with the memory order the name says (every order is
+// sequentially consistent here), and sleeps a little between rounds, as a
+// single signal's wait does where a kernel changes a value without waking
+// anyone. The handle is the group's address; a destroyed group is no longer
+// one.
+
+namespace {
+struct SignalGroup {
+  std::vector<hsa_signal_t> signals;
+};
+std::mutex& g_groups_mutex = *new std::mutex;
+std::set<SignalGroup*>& live_groups() {
+  static std::set<SignalGroup*>& groups = *new std::set<SignalGroup*>;
+  return groups;
+}
+hsa_status_t wait_any_in_group(hsa_signal_group_t group, const hsa_signal_condition_t* conditions,
+                               const hsa_signal_value_t* values, hsa_signal_t* signal, hsa_signal_value_t* value) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  std::vector<hsa_signal_t> signals;
+  {
+    std::lock_guard<std::mutex> lock(g_groups_mutex);
+    auto* g = reinterpret_cast<SignalGroup*>(group.handle);
+    if (!live_groups().count(g)) return HSA_STATUS_ERROR_INVALID_SIGNAL_GROUP;
+    signals = g->signals;   // the group may be destroyed while this waits; the signals are the caller's
+  }
+  if (!conditions || !values || !signal || !value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  for (auto nap = std::chrono::microseconds(20);; nap = std::min(nap * 2, std::chrono::microseconds(1000))) {
+    for (size_t i = 0; i < signals.size(); ++i) {
+      const int64_t v = signal_of(signals[i])->amd.value.load();
+      if (satisfied(v, conditions[i], values[i])) {
+        *signal = signals[i];
+        *value = v;
+        return HSA_STATUS_SUCCESS;
+      }
+    }
+    std::this_thread::sleep_for(nap);
+  }
+}
+}  // namespace
+
+hsa_status_t hsa_signal_group_create(uint32_t num_signals, const hsa_signal_t* signals, uint32_t num_consumers,
+                                     const hsa_agent_t* consumers, hsa_signal_group_t* group) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!num_signals || !signals || !num_consumers || !consumers || !group) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  for (uint32_t i = 0; i < num_signals; ++i)
+    if (!signals[i].handle) return HSA_STATUS_ERROR_INVALID_SIGNAL;
+  auto* g = new SignalGroup;
+  g->signals.assign(signals, signals + num_signals);
+  {
+    std::lock_guard<std::mutex> lock(g_groups_mutex);
+    live_groups().insert(g);
+  }
+  group->handle = reinterpret_cast<uint64_t>(g);
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_signal_group_destroy(hsa_signal_group_t group) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  auto* g = reinterpret_cast<SignalGroup*>(group.handle);
+  {
+    std::lock_guard<std::mutex> lock(g_groups_mutex);
+    if (!live_groups().erase(g)) return HSA_STATUS_ERROR_INVALID_SIGNAL_GROUP;
+  }
+  delete g;
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_signal_group_wait_any_scacquire(hsa_signal_group_t group, const hsa_signal_condition_t* conditions,
+                                                 const hsa_signal_value_t* values, hsa_wait_state_t,
+                                                 hsa_signal_t* signal, hsa_signal_value_t* value) {
+  return wait_any_in_group(group, conditions, values, signal, value);
+}
+hsa_status_t hsa_signal_group_wait_any_relaxed(hsa_signal_group_t group, const hsa_signal_condition_t* conditions,
+                                               const hsa_signal_value_t* values, hsa_wait_state_t,
+                                               hsa_signal_t* signal, hsa_signal_value_t* value) {
+  return wait_any_in_group(group, conditions, values, signal, value);
+}
 
 // ---- Queues -------------------------------------------------------------------
 
@@ -1043,7 +1234,39 @@ hsa_status_t hsa_amd_agent_memory_pool_get_info(hsa_agent_t agent, hsa_amd_memor
                            : never ? HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED
                                    : HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT);
       break;
-    case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS: put<uint32_t>(value, own ? 0 : 1); break;
+    // The links from the agent to the pool, as KFD's topology lists them
+    // (amd/src/kfd.cpp): zero where the pool is the agent's own or never
+    // reachable; a GPU reaches system memory over its PCI Express link, an
+    // Instinct GPU another's memory over one XGMI hop, a Radeon another's
+    // through the host: two PCI Express hops.
+    case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS:
+    case HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: {
+      const int gpu = gpu_of(agent);
+      const bool to_gpu = id.kind == PoolKind::Device;
+      const int peer = to_gpu ? gpu_of(id.agent) : -1;
+      const bool xgmi = to_gpu && id.agent.handle != agent.handle && !never && gpu >= 0 && peer >= 0 &&
+                        shared::profile(gpu).gcn_arch.rfind("gfx9", 0) == 0 &&
+                        shared::profile(peer).gcn_arch.rfind("gfx9", 0) == 0;
+      const bool belongs = to_gpu || id.kind == PoolKind::Group ? id.agent.handle == agent.handle
+                                                                : agent.handle == kCpuAgent;
+      const uint32_t hops = belongs || never ? 0 : xgmi ? 1 : to_gpu ? 2 : 1;
+      if (attribute == HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS) {
+        put<uint32_t>(value, hops);
+        break;
+      }
+      const auto& prof = shared::profile(gpu >= 0 ? gpu : 0);
+      const uint32_t pcie = vgpu::amd::kfd_pcie_mb_per_s(static_cast<uint32_t>(prof.telemetry.pcie_gen),
+                                                         static_cast<uint32_t>(prof.telemetry.pcie_width));
+      auto* out = static_cast<hsa_amd_memory_pool_link_info_t*>(value);
+      for (uint32_t h = 0; h < hops; ++h) {
+        out[h] = {};
+        out[h].link_type = xgmi ? HSA_AMD_LINK_INFO_TYPE_XGMI : HSA_AMD_LINK_INFO_TYPE_PCIE;
+        out[h].min_bandwidth = out[h].max_bandwidth = xgmi ? 64000 : pcie;
+        out[h].numa_distance = xgmi ? 15 : 20;
+        out[h].atomic_support_32bit = out[h].atomic_support_64bit = out[h].coherent_support = true;
+      }
+      break;
+    }
     default: return unknown("hsa_amd_agent_memory_pool_get_info", attribute);
   }
   return HSA_STATUS_SUCCESS;
@@ -1075,26 +1298,52 @@ hsa_status_t hsa_amd_memory_pool_allocate(hsa_amd_memory_pool_t pool, size_t siz
   shared::map_host(p, rounded);
   std::lock_guard<std::mutex> lock(g_mutex);
   g_system[reinterpret_cast<uintptr_t>(p)] = rounded;
+  if (id.kind == PoolKind::SystemCoarse) g_system_grain[reinterpret_cast<uintptr_t>(p)] = true;
   *ptr = p;
   VGPU_HSA_TRACE("allocated %zu bytes of system memory at %p", rounded, p);
   return HSA_STATUS_SUCCESS;
 }
+
+namespace {
+// Tells each watcher of an address in [base, end) that it is released, once:
+// the notice is dropped as it is given (hsa_ext_amd.h).
+void notify_deallocation(uintptr_t base, uintptr_t end) {
+  std::vector<DeallocWatch> due;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (size_t i = 0; i < g_dealloc_watches.size();) {
+      if (g_dealloc_watches[i].ptr >= base && g_dealloc_watches[i].ptr < end) {
+        due.push_back(g_dealloc_watches[i]);
+        g_dealloc_watches.erase(g_dealloc_watches.begin() + static_cast<long>(i));
+      } else {
+        ++i;
+      }
+    }
+  }
+  for (const DeallocWatch& w : due) w.callback(reinterpret_cast<void*>(w.ptr), w.user_data);
+}
+}  // namespace
 
 hsa_status_t hsa_amd_memory_pool_free(void* ptr) {
   if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
   if (!ptr) return HSA_STATUS_SUCCESS;
   std::unique_lock<std::mutex> lock(g_mutex);
   if (const auto it = g_system.find(reinterpret_cast<uintptr_t>(ptr)); it != g_system.end()) {
+    const uintptr_t base = it->first, end = it->first + it->second;
     g_system.erase(it);
+    g_system_grain.erase(base);
     lock.unlock();
+    notify_deallocation(base, end);
     shared::unmap_host(ptr);
     std::free(ptr);
     return HSA_STATUS_SUCCESS;
   }
   if (const auto it = g_device.find(reinterpret_cast<uint64_t>(ptr)); it != g_device.end()) {
     const int gpu = it->second.first;
+    const uintptr_t base = it->first, end = it->first + it->second.second;
     g_device.erase(it);
     lock.unlock();
+    notify_deallocation(base, end);
     try {
       shared::memory(gpu).free(reinterpret_cast<uint64_t>(ptr));
     } catch (const std::exception& e) {
@@ -1699,7 +1948,8 @@ hsa_status_t hsa_amd_pointer_info(const void* ptr, hsa_amd_pointer_info_t* info_
       info.agentBaseAddress = info.hostBaseAddress = reinterpret_cast<void*>(it->first);
       info.sizeInBytes = it->second;
       info.agentOwner = {kCpuAgent};
-      info.global_flags = HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED;
+      info.global_flags = g_system_grain.count(it->first) ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED
+                                                          : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED;
     } else if (auto it = containing(g_device, at); it != g_device.end()) {
       info.type = HSA_EXT_POINTER_TYPE_HSA;
       info.agentBaseAddress = reinterpret_cast<void*>(it->first);
@@ -1948,6 +2198,215 @@ hsa_status_t hsa_amd_register_system_event_handler(void*, void*) { return HSA_ST
 // ---- Shared virtual memory ---------------------------------------------------------
 #include "hsa_svm.inc"
 
+
+// ---- Waiting on several signals, shared signals, migration, release notices -------------
+
+// The index of the first signal whose condition holds, and its value in
+// *satisfying_value. hsa_ext_amd.h does not say what a wait that times out
+// (or is given a bad argument) returns; this answers UINT32_MAX, which is no
+// index into any list a caller can have passed. `timeout_hint` is in the
+// system's 1 GHz ticks, as hsa_signal_wait's is, and UINT64_MAX waits for
+// ever. Like every wait here it is relaxed and sleeps a little between looks.
+uint32_t hsa_amd_signal_wait_any(uint32_t signal_count, hsa_signal_t* signals, hsa_signal_condition_t* conds,
+                                 hsa_signal_value_t* values, uint64_t timeout_hint, hsa_wait_state_t,
+                                 hsa_signal_value_t* satisfying_value) {
+  constexpr uint32_t kNone = UINT32_MAX;
+  if (!started()) return kNone;
+  if (!signal_count || !signals || !conds || !values) {
+    fail(HSA_STATUS_ERROR_INVALID_ARGUMENT, "hsa_amd_signal_wait_any: a list of signals, conditions and values is needed");
+    return kNone;
+  }
+  for (uint32_t i = 0; i < signal_count; ++i)
+    if (!signals[i].handle) {
+      fail(HSA_STATUS_ERROR_INVALID_SIGNAL, "hsa_amd_signal_wait_any: signal " + std::to_string(i) + " is null");
+      return kNone;
+    }
+  const bool forever = timeout_hint == UINT64_MAX || timeout_hint > (uint64_t{1} << 62);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(forever ? 0 : timeout_hint);
+  for (auto nap = std::chrono::microseconds(20);; nap = std::min(nap * 2, std::chrono::microseconds(1000))) {
+    for (uint32_t i = 0; i < signal_count; ++i) {
+      const int64_t v = signal_of(signals[i])->amd.value.load();
+      if (satisfied(v, conds[i], values[i])) {
+        if (satisfying_value) *satisfying_value = v;
+        return i;
+      }
+    }
+    if (!forever && std::chrono::steady_clock::now() >= deadline) return kNone;
+    std::this_thread::sleep_for(nap);
+  }
+}
+
+// Runs the function on a thread of its own, as the runtime runs it on its
+// asynchronous one.
+hsa_status_t hsa_amd_async_function(void (*callback)(void*), void* arg) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  std::thread([callback, arg] { callback(arg); }).detach();
+  return HSA_STATUS_SUCCESS;
+}
+
+// A shared signal's handle: the process that made it, its serial and its address. Within one
+// process it can be attached again; a handle from another process is refused, since a signal
+// is an object of the process's own heap (its lock and its waiters), not a file.
+namespace {
+constexpr uint32_t kHsaIpcSignalMagic = 0x48534153;   // "HSAS"
+}  // namespace
+hsa_status_t hsa_amd_ipc_signal_create(hsa_signal_t signal, hsa_amd_ipc_signal_t* handle) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!signal.handle || !handle) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const auto it = g_ipc_signals.find(static_cast<uintptr_t>(signal.handle));
+  if (it == g_ipc_signals.end())
+    return fail(HSA_STATUS_ERROR_INVALID_ARGUMENT,
+                "hsa_amd_ipc_signal_create: the signal was not created with HSA_AMD_SIGNAL_IPC");
+  std::memset(handle, 0, sizeof *handle);
+  handle->handle[0] = kHsaIpcSignalMagic;
+  handle->handle[1] = static_cast<uint32_t>(::getpid());
+  handle->handle[2] = it->second.first;
+  handle->handle[3] = static_cast<uint32_t>(signal.handle);
+  handle->handle[4] = static_cast<uint32_t>(signal.handle >> 32);
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_amd_ipc_signal_attach(const hsa_amd_ipc_signal_t* handle, hsa_signal_t* signal) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!handle || !signal || handle->handle[0] != kHsaIpcSignalMagic) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  if (handle->handle[1] != static_cast<uint32_t>(::getpid()))
+    return fail(HSA_STATUS_ERROR_NOT_SUPPORTED,
+                "hsa_amd_ipc_signal_attach: a signal shared by another process is not supported: only an "
+                "attach within the process that created the handle is");
+  const uintptr_t at = static_cast<uintptr_t>(handle->handle[3]) | static_cast<uintptr_t>(handle->handle[4]) << 32;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const auto it = g_ipc_signals.find(at);
+  if (it == g_ipc_signals.end() || it->second.first != handle->handle[2])
+    return fail(HSA_STATUS_ERROR_INVALID_ARGUMENT, "hsa_amd_ipc_signal_attach: the signal behind the handle is gone");
+  if (it->second.second == INT32_MAX) return HSA_STATUS_ERROR_REFCOUNT_OVERFLOW;
+  ++it->second.second;
+  signal->handle = at;
+  return HSA_STATUS_SUCCESS;
+}
+
+// Whether the contents of one pool can be moved to another. A buffer keeps its address when it
+// moves, which holds here between the CPU's two pools (the difference is the grain the buffer
+// is reported with) and from a pool to itself; moving between a GPU's memory and system memory,
+// or between two GPUs, would change what the address means, and is not modelled.
+hsa_status_t hsa_amd_memory_pool_can_migrate(hsa_amd_memory_pool_t src, hsa_amd_memory_pool_t dst, bool* result) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  PoolId a, b;
+  if (!pool_of(src.handle, &a) || !pool_of(dst.handle, &b)) return HSA_STATUS_ERROR_INVALID_MEMORY_POOL;
+  if (!result) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  const bool cpu = a.agent.handle == kCpuAgent && b.agent.handle == kCpuAgent;
+  *result = a.kind != PoolKind::Group && b.kind != PoolKind::Group &&
+            ((cpu) || (a.agent.handle == b.agent.handle && a.kind == b.kind));
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_amd_memory_migrate(const void* ptr, hsa_amd_memory_pool_t pool, uint32_t flags) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  PoolId id;
+  if (!pool_of(pool.handle, &id) || id.kind == PoolKind::Group) return HSA_STATUS_ERROR_INVALID_MEMORY_POOL;
+  if (flags != 0 || !ptr) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const uintptr_t at = reinterpret_cast<uintptr_t>(ptr);
+  if (g_system.count(at)) {
+    if (id.kind == PoolKind::SystemFine) g_system_grain.erase(at);
+    else if (id.kind == PoolKind::SystemCoarse) g_system_grain[at] = true;
+    else
+      return fail(HSA_STATUS_ERROR_NOT_SUPPORTED,
+                  "hsa_amd_memory_migrate: moving system memory into a GPU's memory is not supported (the "
+                  "buffer would need an address in that device's memory)");
+    return HSA_STATUS_SUCCESS;
+  }
+  if (const auto it = g_device.find(at); it != g_device.end()) {
+    if (id.kind == PoolKind::Device && gpu_of(id.agent) == it->second.first) return HSA_STATUS_SUCCESS;
+    return fail(HSA_STATUS_ERROR_NOT_SUPPORTED,
+                "hsa_amd_memory_migrate: moving a GPU's memory to system memory or to another GPU is not supported "
+                "(the buffer would need another address)");
+  }
+  return fail(HSA_STATUS_ERROR_INVALID_ARGUMENT, "hsa_amd_memory_migrate: the address is the start of no allocation");
+}
+
+hsa_status_t hsa_amd_register_deallocation_callback(void* ptr, hsa_amd_deallocation_callback_t callback,
+                                                    void* user_data) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!ptr || !callback) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const uintptr_t at = reinterpret_cast<uintptr_t>(ptr);
+  if (containing(g_system, at) == g_system.end() && containing(g_device, at) == g_device.end())
+    return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+  g_dealloc_watches.push_back({at, callback, user_data});
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_amd_deregister_deallocation_callback(void* ptr, hsa_amd_deallocation_callback_t callback) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (auto it = g_dealloc_watches.begin(); it != g_dealloc_watches.end(); ++it)
+    if (it->ptr == reinterpret_cast<uintptr_t>(ptr) && it->callback == callback) {
+      g_dealloc_watches.erase(it);
+      return HSA_STATUS_SUCCESS;
+    }
+  return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+}
+
+// ---- The deprecated code object calls (hsa.h) -------------------------------------------
+//
+// Superseded by the reader and by hsa_executable_load_agent_code_object, and
+// answered through them: a "code object" is the bytes, as the reader keeps them.
+namespace {
+std::set<Reader*>& g_old_code_objects = *new std::set<Reader*>;   // under g_mutex
+}  // namespace
+hsa_status_t hsa_code_object_deserialize(void* serialized, size_t size, const char*, hsa_code_object_t* code_object) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!serialized || !size || !code_object) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  auto* r = new Reader{std::string(static_cast<const char*>(serialized), size)};
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_old_code_objects.insert(r);
+  code_object->handle = reinterpret_cast<uint64_t>(r);
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_code_object_destroy(hsa_code_object_t code_object) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  auto* r = reinterpret_cast<Reader*>(code_object.handle);
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_old_code_objects.erase(r)) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+  }
+  delete r;
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_executable_create(hsa_profile_t profile, hsa_executable_state_t state, const char* options,
+                                   hsa_executable_t* executable) {
+  if (const hsa_status_t st = hsa_executable_create_alt(profile, static_cast<hsa_default_float_rounding_mode_t>(0), options, executable);
+      st != HSA_STATUS_SUCCESS)
+    return st;
+  if (state == HSA_EXECUTABLE_STATE_FROZEN) reinterpret_cast<Executable*>(executable->handle)->frozen = true;
+  return HSA_STATUS_SUCCESS;
+}
+hsa_status_t hsa_executable_load_code_object(hsa_executable_t executable, hsa_agent_t agent,
+                                             hsa_code_object_t code_object, const char* options) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_old_code_objects.count(reinterpret_cast<Reader*>(code_object.handle)))
+      return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+  }
+  return hsa_executable_load_agent_code_object(executable, agent, {code_object.handle}, options, nullptr);
+}
+// The symbol of the program, which is every symbol here: there are no modules.
+hsa_status_t hsa_executable_get_symbol(hsa_executable_t executable, const char* module_name, const char* symbol_name,
+                                       hsa_agent_t agent, int32_t, hsa_executable_symbol_t* symbol) {
+  if (module_name && *module_name)
+    return fail(HSA_STATUS_ERROR_INVALID_SYMBOL_NAME,
+                "hsa_executable_get_symbol: a symbol of a named module is not supported (an ELF code object has no modules)");
+  return hsa_executable_get_symbol_by_name(executable, symbol_name, &agent, symbol);
+}
+// An executable here has nothing left undefined, so it is valid as it stands.
+hsa_status_t hsa_executable_validate(hsa_executable_t executable, uint32_t* result) {
+  if (!started()) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+  if (!executable_of(executable)) return HSA_STATUS_ERROR_INVALID_EXECUTABLE;
+  if (!result) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  *result = 0;
+  return HSA_STATUS_SUCCESS;
+}
+
 // What this does not model, refused by name: images laid out by graphics
 // interop (hsa_amd_image_create), and graphics interop.
 #define VGPU_HSA_REFUSED(name, what) \
@@ -1955,6 +2414,49 @@ hsa_status_t hsa_amd_register_system_event_handler(void*, void*) { return HSA_ST
 VGPU_HSA_REFUSED(hsa_amd_image_create, "images over another API's layout are not modelled")
 VGPU_HSA_REFUSED(hsa_amd_interop_map_buffer, "there is no graphics driver to share with")
 VGPU_HSA_REFUSED(hsa_amd_interop_unmap_buffer, "there is no graphics driver to share with")
-VGPU_HSA_REFUSED(hsa_executable_agent_global_variable_define, "external variables are not defined yet")
+VGPU_HSA_REFUSED(hsa_executable_agent_global_variable_define,
+                 "a variable defined from outside would have to be bound to the code object's undefined symbol, and "
+                 "the loader does not resolve undefined symbols")
+VGPU_HSA_REFUSED(hsa_executable_global_variable_define, "a variable defined from outside is not bound to a code object's undefined symbol")
+VGPU_HSA_REFUSED(hsa_executable_readonly_variable_define, "a variable defined from outside is not bound to a code object's undefined symbol")
+
+// Stream Performance Monitor: KFD's hardware counter stream, which no simulated counter backs.
+VGPU_HSA_REFUSED(hsa_amd_spm_acquire, "there is no stream of performance counters to take")
+VGPU_HSA_REFUSED(hsa_amd_spm_release, "there is no stream of performance counters to give back")
+VGPU_HSA_REFUSED(hsa_amd_spm_set_dest_buffer, "there is no stream of performance counters to write")
+
+// The finalizer (hsa_ext_finalize.h) turns HSAIL into machine code. AMD's runtime has no finalizer
+// since ROCm 2 (no extension answers HSA_EXTENSION_FINALIZER), and none exists here.
+VGPU_HSA_REFUSED(hsa_ext_program_create, "there is no finalizer, HSAIL is not compiled")
+VGPU_HSA_REFUSED(hsa_ext_program_destroy, "there is no finalizer, HSAIL is not compiled")
+VGPU_HSA_REFUSED(hsa_ext_program_add_module, "there is no finalizer, HSAIL is not compiled")
+VGPU_HSA_REFUSED(hsa_ext_program_iterate_modules, "there is no finalizer, HSAIL is not compiled")
+VGPU_HSA_REFUSED(hsa_ext_program_get_info, "there is no finalizer, HSAIL is not compiled")
+VGPU_HSA_REFUSED(hsa_ext_program_finalize, "there is no finalizer, HSAIL is not compiled")
+
+// The rest of the deprecated code object interface: what it reads is a finalizer's code object
+// (with modules and per-symbol records) rather than an ELF the loader reads.
+VGPU_HSA_REFUSED(hsa_code_object_serialize, "a code object here is the ELF it was loaded from")
+VGPU_HSA_REFUSED(hsa_code_object_get_info, "a code object's header fields are not kept apart from its ELF")
+VGPU_HSA_REFUSED(hsa_code_object_get_symbol, "a code object's symbols are an executable's here")
+VGPU_HSA_REFUSED(hsa_code_object_get_symbol_from_name, "a code object's symbols are an executable's here")
+VGPU_HSA_REFUSED(hsa_code_object_iterate_symbols, "a code object's symbols are an executable's here")
+VGPU_HSA_REFUSED(hsa_code_symbol_get_info, "a code object's symbols are an executable's here")
+VGPU_HSA_REFUSED(hsa_executable_load_program_code_object, "a code object is loaded for an agent")
+VGPU_HSA_REFUSED(hsa_executable_iterate_program_symbols, "symbols are iterated for an agent")
+
+// Queue interception and the AQL profile library: interception hands the packets a program writes
+// to a tool before the packet processor sees them, and the profile library turns counter requests
+// into PM4 packets for that hardware; neither is modelled (rocprofiler's counters here come from
+// the executor, not from packets).
+VGPU_HSA_REFUSED(hsa_amd_queue_intercept_create, "packets are not diverted to a tool before the packet processor")
+VGPU_HSA_REFUSED(hsa_amd_queue_intercept_register, "packets are not diverted to a tool before the packet processor")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_validate_event, "there are no PM4 counter packets")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_start, "there are no PM4 counter packets")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_stop, "there are no PM4 counter packets")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_read, "there are no PM4 counter packets")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_legacy_get_pm4, "there are no PM4 counter packets")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_get_info, "there are no PM4 counter packets")
+VGPU_HSA_REFUSED(hsa_ven_amd_aqlprofile_iterate_data, "there are no PM4 counter packets")
 
 }  // extern "C"

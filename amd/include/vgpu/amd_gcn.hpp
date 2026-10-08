@@ -78,6 +78,11 @@ enum class MopsType : uint8_t { None, I8, F16, BF16, F32, F64, F8, Count };
 // gfx11 GPU decodes alike. gfx1200 for RDNA4 (gfx12) likewise.
 enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100, Gfx1200, Gfx1030 };
 inline bool is_rdna(Target t) { return t == Target::Gfx1100 || t == Target::Gfx1200 || t == Target::Gfx1030; }
+// Whether the hardware puts a work-item's three ids in v0 (x in bits 0-9, y in 10-19, z in 20-29), whatever
+// the code object ABI says. gfx90a, gfx940-950 and gfx11/12 do (LLVM's "packed-tid"): a compiler for them
+// reads v0 that way even into a version 4 object, which is what Ubuntu's hipcc (ROCm 5.7, clang 17) writes.
+// gfx10.3 has a register per id.
+inline bool packs_work_item_ids(Target t) { return t != Target::Gfx1030; }
 
 struct Inst {
   Enc enc = Enc::Unknown;

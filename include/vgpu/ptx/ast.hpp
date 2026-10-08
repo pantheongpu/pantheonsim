@@ -933,6 +933,19 @@ struct OpIsTypep { Reg dst; Operand src; };
 // shared memory.
 struct OpStBulk { Addr addr; Operand size; bool shared = false; };
 struct OpBra { size_t target = 0; std::string label; };  // target = instruction index
+// brx.idx{.uni} index, tlist: an indirect branch. `tlist` names a list that
+// a `.branchtargets` directive declared (what nvcc writes for a dense switch),
+// and each lane goes to the entry its own `index` selects, so one warp can
+// leave for several labels at once. `table` is the list's name, `labels` its
+// entries, `targets` their instruction indices once resolved. An index past
+// the end of the list is not defined by the ISA, and the interpreter refuses
+// it by name rather than choosing a behaviour.
+struct OpBrx {
+  Operand a;                          // the index
+  std::string table;
+  std::vector<std::string> labels;
+  std::vector<size_t> targets;
+};
 // bar.sync / barrier.sync / bar.arrive on one of the CTA's sixteen barriers,
 // and bar.warp.sync (`warp`), which only reconverges the warp. With a count,
 // the barrier completes when that many threads -- whole warps -- have
@@ -1094,7 +1107,7 @@ struct OpCall {
 
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
-                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBar,
+                        OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
 
 struct Instr {

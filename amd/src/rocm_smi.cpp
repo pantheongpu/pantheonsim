@@ -8,8 +8,8 @@
 // telemetry, its RAS counters and registers), so ROCm's rocm-smi over this
 // library and VirtualGPU's rocm-smi agree; the device list and bus addresses
 // are the HIP runtime's, so HIP and ROCm SMI agree too. What a simulated GPU
-// has no value for -- a VBIOS, firmware, serial number, energy counter, the
-// gpu_metrics table -- is RSMI_STATUS_NOT_SUPPORTED, as on a card without it,
+// has no value for -- a VBIOS, firmware, serial number --
+// is RSMI_STATUS_NOT_SUPPORTED, as on a card without it,
 // and setting anything is refused the same way: nothing here is a knob.
 //
 // RCCL learns the topology one of two ways: by reading the AMD kernel
@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,7 @@
 #include <vector>
 
 #include "vgpu/amd_chip.hpp"
+#include "vgpu/amd_metrics.hpp"
 #include "vgpu/machine.hpp"
 #include "vgpu/ras.hpp"
 #include "vgpu/regs.hpp"
@@ -399,10 +401,20 @@ RSMI_API int rsmi_dev_power_cap_range_get(uint32_t d, uint32_t, uint64_t* max, u
   *min = 0;
   return kSuccess;
 }
-// No energy is integrated over time: the power model has no history.
-RSMI_API int rsmi_dev_energy_count_get(uint32_t d, uint64_t*, float*, uint64_t*) {
+// The energy accumulator: `power` is a count of `counter_resolution` micro
+// joules (15.3, as the library's kEnergyCounterResolution), so the energy is
+// their product in uJ; `timestamp` is the metrics table's system_clock_counter
+// (ns). Only Instinct GPUs have one (a Radeon's driver has no energy file), and
+// the value is amdsmi_get_energy_count's: one accumulator serves both libraries.
+RSMI_API int rsmi_dev_energy_count_get(uint32_t d, uint64_t* power, float* counter_resolution, uint64_t* timestamp) {
+  if (!power || !timestamp) return kInvalidArgs;
   DEVICE(d, s);
-  return kNotSupported;
+  if (s.architecture[0] != 'c') return kNotSupported;
+  const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
+  *power = e.ticks;
+  *timestamp = e.timestamp_ns;
+  if (counter_resolution) *counter_resolution = vgpu::amd::kEnergyTickUj;
+  return kSuccess;
 }
 
 RSMI_API int rsmi_dev_busy_percent_get(uint32_t d, uint32_t* pct) {
@@ -568,14 +580,20 @@ RSMI_API int rsmi_dev_ecc_count_get(uint32_t d, uint64_t block, ErrorCount* ec) 
 RSMI_API int rsmi_dev_memory_reserved_pages_get(uint32_t d, uint32_t* num, RetiredPage* records) {
   if (!num) return kInvalidArgs;
   DEVICE(d, s);
+  // A card without ECC (the Radeon profiles) has no record of bad pages.
+  if (!s.ecc_enabled) return kNotSupported;
   vgpu::ras::Counters c{};
   try {
     c = vgpu::ras::read(s.uuid).lifetime;
   } catch (const std::exception&) {
   }
-  const uint32_t pages = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe);
+  // As amdsmi_get_gpu_bad_page_info (amd_smi.cpp) lists them: a remapped row
+  // counts as a page, reserved (status 0) but for the newest while a
+  // retirement is pending (status 1).
+  const uint32_t pages = static_cast<uint32_t>(c.retired_sbe + c.retired_dbe + c.rows_correctable + c.rows_uncorrectable);
+  const uint32_t reserved = pages - ((c.retired_pending || c.rows_pending) && pages ? 1 : 0);
   if (records)
-    for (uint32_t k = 0; k < std::min(*num, pages); ++k) records[k] = {uint64_t{k} << 12, 4096, 1};
+    for (uint32_t k = 0; k < std::min(*num, pages); ++k) records[k] = {uint64_t{k} << 12, 4096, k < reserved ? 0 : 1};
   const bool fits = !records || *num >= pages;
   *num = records ? std::min(*num, pages) : pages;
   return fits ? kSuccess : kInsufficientSize;
@@ -738,6 +756,145 @@ RSMI_API int rsmi_compute_process_gpus_get(uint32_t pid, uint32_t* indices, uint
   return fits ? kSuccess : kInsufficientSize;
 }
 
+// ---- The metrics table and the identity queries the rest of the header has ----
+
+namespace {
+
+struct MetricsHeader {  // metrics_table_header_t
+  uint16_t structure_size;
+  uint8_t format_revision, content_revision;
+};
+struct XcpMetrics {  // amdgpu_xcp_metrics_t
+  uint32_t gfx_busy_inst[8];
+  uint16_t jpeg_busy[40];
+  uint16_t vcn_busy[4];
+  uint64_t gfx_busy_acc[8], gfx_below_host_limit_acc[8], gfx_below_host_limit_ppt_acc[8],
+      gfx_below_host_limit_thm_acc[8], gfx_low_utilization_acc[8], gfx_below_host_limit_total_acc[8];
+};
+// rsmi_gpu_metrics_t, ROCm 7.2.0's (content revision 1.7): the members of
+// amdsmi_gpu_metrics_t, in the same order.
+struct GpuMetrics {
+  MetricsHeader common_header;
+  uint16_t temperature_edge, temperature_hotspot, temperature_mem, temperature_vrgfx, temperature_vrsoc,
+      temperature_vrmem;
+  uint16_t average_gfx_activity, average_umc_activity, average_mm_activity;
+  uint16_t average_socket_power;
+  uint64_t energy_accumulator, system_clock_counter;
+  uint16_t average_gfxclk_frequency, average_socclk_frequency, average_uclk_frequency, average_vclk0_frequency,
+      average_dclk0_frequency, average_vclk1_frequency, average_dclk1_frequency;
+  uint16_t current_gfxclk, current_socclk, current_uclk, current_vclk0, current_dclk0, current_vclk1,
+      current_dclk1;
+  uint32_t throttle_status;
+  uint16_t current_fan_speed, pcie_link_width, pcie_link_speed;
+  uint32_t gfx_activity_acc, mem_activity_acc;
+  uint16_t temperature_hbm[4];
+  uint64_t firmware_timestamp;
+  uint16_t voltage_soc, voltage_gfx, voltage_mem;
+  uint64_t indep_throttle_status;
+  uint16_t current_socket_power;
+  uint16_t vcn_activity[4];
+  uint32_t gfxclk_lock_status;
+  uint16_t xgmi_link_width, xgmi_link_speed;
+  uint64_t pcie_bandwidth_acc, pcie_bandwidth_inst, pcie_l0_to_recov_count_acc, pcie_replay_count_acc,
+      pcie_replay_rover_count_acc;
+  uint64_t xgmi_read_data_acc[8], xgmi_write_data_acc[8];
+  uint16_t current_gfxclks[8], current_socclks[4], current_vclk0s[4], current_dclk0s[4];
+  uint16_t jpeg_activity[32];
+  uint32_t pcie_nak_sent_count_acc, pcie_nak_rcvd_count_acc;
+  uint64_t accumulation_counter, prochot_residency_acc, ppt_residency_acc, socket_thm_residency_acc,
+      vr_thm_residency_acc, hbm_thm_residency_acc;
+  uint16_t num_partition;
+  XcpMetrics xcp_stats[8];
+  uint32_t pcie_lc_perf_other_end_recovery;
+  uint64_t vram_max_bandwidth;
+  uint16_t xgmi_link_status[8];
+};
+// Sizes and offsets as compiled from rocm_smi.h of ROCm 7.2.0 (amdsmi 26.2).
+static_assert(sizeof(MetricsHeader) == 4 && sizeof(XcpMetrics) == 504 && sizeof(GpuMetrics) == 4544);
+static_assert(offsetof(GpuMetrics, temperature_hotspot) == 6 && offsetof(GpuMetrics, energy_accumulator) == 24 &&
+              offsetof(GpuMetrics, current_gfxclk) == 54 && offsetof(GpuMetrics, throttle_status) == 68 &&
+              offsetof(GpuMetrics, temperature_hbm) == 88 && offsetof(GpuMetrics, firmware_timestamp) == 96 &&
+              offsetof(GpuMetrics, indep_throttle_status) == 112 && offsetof(GpuMetrics, current_socket_power) == 120 &&
+              offsetof(GpuMetrics, gfxclk_lock_status) == 132 && offsetof(GpuMetrics, pcie_bandwidth_acc) == 144 &&
+              offsetof(GpuMetrics, xgmi_read_data_acc) == 184 && offsetof(GpuMetrics, current_gfxclks) == 312 &&
+              offsetof(GpuMetrics, jpeg_activity) == 352 && offsetof(GpuMetrics, pcie_nak_sent_count_acc) == 416 &&
+              offsetof(GpuMetrics, accumulation_counter) == 424 && offsetof(GpuMetrics, num_partition) == 472 &&
+              offsetof(GpuMetrics, xcp_stats) == 480 && offsetof(GpuMetrics, pcie_lc_perf_other_end_recovery) == 4512 &&
+              offsetof(GpuMetrics, vram_max_bandwidth) == 4520 && offsetof(GpuMetrics, xgmi_link_status) == 4528);
+
+// The driver's table for a device, as it publishes it in sysfs (v1.5).
+bool metrics_table(const Sample& s, vgpu::amd::MetricsV15* t) {
+  vgpu::ras::Counters c{};
+  try {
+    c = vgpu::ras::read(s.uuid).since_load;
+  } catch (const std::exception&) {
+  }
+  const std::string bytes = vgpu::amd::gpu_metrics(s, c);
+  if (bytes.size() != sizeof *t) return false;
+  std::memcpy(t, bytes.data(), sizeof *t);
+  return true;
+}
+
+}  // namespace
+
+// The table in ROCm SMI's public structure: what the v1.5 table has, copied
+// across (the same copy amdsmi_get_gpu_metrics_info makes), every other member
+// all ones, N/A. The energy accumulator of an Instinct GPU is the shared
+// counter rsmi_dev_energy_count_get counts.
+RSMI_API int rsmi_dev_gpu_metrics_info_get(uint32_t d, GpuMetrics* out) {
+  if (!valid(d)) return kInputOutOfBounds;
+  if (!out) return kInvalidArgs;
+  Sample s{};
+  vgpu::amd::MetricsV15 t;
+  if (!sample(d, &s)) return kNotFound;
+  if (!metrics_table(s, &t)) return kNotSupported;
+  std::memset(out, 0xFF, sizeof *out);
+  vgpu::amd::fill_public_metrics(out, t);
+  if (s.architecture[0] == 'c' && t.energy_accumulator == ~uint64_t{0}) {
+    const vgpu::amd::EnergyReading e = vgpu::amd::energy_counter(s);
+    out->energy_accumulator = e.ticks;
+    out->system_clock_counter = e.timestamp_ns;
+  }
+  return kSuccess;
+}
+RSMI_API int rsmi_dev_metrics_header_info_get(uint32_t d, MetricsHeader* out) {
+  if (!valid(d)) return kInputOutOfBounds;
+  if (!out) return kInvalidArgs;
+  Sample s{};
+  vgpu::amd::MetricsV15 t;
+  if (!sample(d, &s)) return kNotFound;
+  if (!metrics_table(s, &t)) return kNotSupported;
+  *out = {t.structure_size, t.format_revision, t.content_revision};
+  return kSuccess;
+}
+
+// The DRM render node's minor: the first render node is 128, and a GPU has
+// the one the kernel driver's topology gives it (kfd.cpp).
+RSMI_API int rsmi_dev_drm_render_minor_get(uint32_t d, uint32_t* minor) {
+  if (!minor) return kInvalidArgs;
+  DEVICE(d, s);
+  *minor = 128 + d;
+  return kSuccess;
+}
+// The hive the Instinct GPUs of the machine share: KFD's topology `hive_id`
+// (a hash of the first GPU's UUID), as amdsmi_get_xgmi_info gives it. A
+// Radeon GPU has no hive.
+RSMI_API int rsmi_dev_xgmi_hive_id_get(uint32_t d, uint64_t* hive) {
+  if (!hive) return kInvalidArgs;
+  DEVICE(d, s);
+  if (s.architecture[0] != 'c') return kNotSupported;
+  *hive = fnv(machine()[0].uuid);
+  return kSuccess;
+}
+// rsmi_pcie_slot_type_t: Instinct GPUs sit in OAM modules, Radeon cards in a
+// PCIe slot (amdsmi_get_pcie_info says the same).
+RSMI_API int rsmi_dev_pcie_slot_type_get(uint32_t d, int* type) {
+  if (!type) return kInvalidArgs;
+  DEVICE(d, s);
+  *type = s.architecture[0] == 'c' ? 2 : 0;
+  return kSuccess;
+}
+
 // ---- Not modelled ------------------------------------------------------------
 //
 // Counters and tables the simulator does not keep, and every setting: a
@@ -748,8 +905,6 @@ RSMI_API int rsmi_compute_process_gpus_get(uint32_t pid, uint32_t* indices, uint
   RSMI_API int name(uint32_t d, __VA_ARGS__) {           \
     return valid(d) ? kNotSupported : kInputOutOfBounds; \
   }
-NOT_MODELLED(rsmi_dev_gpu_metrics_info_get, void*)
-NOT_MODELLED(rsmi_dev_metrics_header_info_get, void*)
 NOT_MODELLED(rsmi_dev_metrics_xcd_counter_get, uint16_t*)
 NOT_MODELLED(rsmi_dev_activity_avg_mm_get, uint16_t*)
 NOT_MODELLED(rsmi_utilization_count_get, void*, uint32_t, uint64_t*)
@@ -780,3 +935,68 @@ RSMI_API int rsmi_event_notification_get(int, uint32_t* num, void*) {
   if (num) *num = 0;
   return kNotSupported;
 }
+
+// The rest of the header's functions, which a simulated card has nothing to
+// answer: a VBIOS build, SKU, XGMI physical id and port numbers, the PM and
+// register tables, cache info, performance counters, the power-throttle
+// limit and the like. The library exports every one, as the package that binds
+// them expects, and refuses each as a card without the feature does.
+// (The device index is checked; the other arguments are not read.)
+#define NOT_MODELLED_ANY(name)                           \
+  RSMI_API int name(uint32_t d, ...) {                   \
+    return valid(d) ? kNotSupported : kInputOutOfBounds; \
+  }
+NOT_MODELLED_ANY(rsmi_dev_activity_metric_get)
+NOT_MODELLED_ANY(rsmi_dev_cache_info_get)
+NOT_MODELLED_ANY(rsmi_dev_compute_partition_capabilities_get)
+NOT_MODELLED_ANY(rsmi_dev_compute_partition_resource_profile_get)
+NOT_MODELLED_ANY(rsmi_dev_compute_partition_supported_nps_configs_get)
+NOT_MODELLED_ANY(rsmi_dev_compute_partition_supported_xcp_configs_get)
+NOT_MODELLED_ANY(rsmi_dev_compute_partition_xcp_config_set)
+NOT_MODELLED_ANY(rsmi_dev_current_compute_xcp_config_get)
+NOT_MODELLED_ANY(rsmi_dev_device_identifiers_get)
+NOT_MODELLED_ANY(rsmi_dev_gpu_partition_metrics_info_get)
+NOT_MODELLED_ANY(rsmi_dev_gpu_run_cleaner_shader)
+NOT_MODELLED_ANY(rsmi_dev_metrics_log_get)
+NOT_MODELLED_ANY(rsmi_dev_npm_info_get)
+NOT_MODELLED_ANY(rsmi_dev_overdrive_level_set_v1)
+NOT_MODELLED_ANY(rsmi_dev_pcie_vendor_name_get)
+NOT_MODELLED_ANY(rsmi_dev_perf_level_set_v1)
+NOT_MODELLED_ANY(rsmi_dev_pm_metrics_info_get)
+NOT_MODELLED_ANY(rsmi_dev_process_isolation_get)
+NOT_MODELLED_ANY(rsmi_dev_process_isolation_set)
+NOT_MODELLED_ANY(rsmi_dev_reg_table_info_get)
+NOT_MODELLED_ANY(rsmi_dev_sku_get)
+NOT_MODELLED_ANY(rsmi_dev_soc_pstate_get)
+NOT_MODELLED_ANY(rsmi_dev_soc_pstate_set)
+NOT_MODELLED_ANY(rsmi_dev_subsystem_name_get)
+NOT_MODELLED_ANY(rsmi_dev_supported_power_cap_get)
+NOT_MODELLED_ANY(rsmi_dev_vbios_build_number_get)
+NOT_MODELLED_ANY(rsmi_dev_xgmi_physical_id_get)
+NOT_MODELLED_ANY(rsmi_dev_xgmi_plpd_get)
+NOT_MODELLED_ANY(rsmi_dev_xgmi_plpd_set)
+NOT_MODELLED_ANY(rsmi_dev_xgmi_port_num_get)
+NOT_MODELLED_ANY(rsmi_get_gpu_ptl_formats)
+NOT_MODELLED_ANY(rsmi_get_gpu_ptl_state)
+NOT_MODELLED_ANY(rsmi_ras_feature_info_get)
+NOT_MODELLED_ANY(rsmi_read_supported_ptl_formats)
+NOT_MODELLED_ANY(rsmi_set_gpu_ptl_enable_with_formats)
+NOT_MODELLED_ANY(rsmi_set_gpu_ptl_formats)
+NOT_MODELLED_ANY(rsmi_set_gpu_ptl_state)
+NOT_MODELLED_ANY(rsmi_counter_available_counters_get)
+NOT_MODELLED_ANY(rsmi_dev_counter_create)
+NOT_MODELLED_ANY(rsmi_dev_counter_group_supported)
+NOT_MODELLED_ANY(rsmi_dev_supported_func_iterator_open)
+// These take no device index.
+#define NOT_MODELLED_NO_DEVICE(name) \
+  RSMI_API int name(...) { return kNotSupported; }
+NOT_MODELLED_NO_DEVICE(rsmi_dev_amdgpu_driver_reload)
+NOT_MODELLED_NO_DEVICE(rsmi_driver_status)
+NOT_MODELLED_NO_DEVICE(rsmi_counter_control)
+NOT_MODELLED_NO_DEVICE(rsmi_counter_read)
+NOT_MODELLED_NO_DEVICE(rsmi_dev_counter_destroy)
+NOT_MODELLED_NO_DEVICE(rsmi_dev_supported_func_iterator_close)
+NOT_MODELLED_NO_DEVICE(rsmi_dev_supported_variant_iterator_open)
+NOT_MODELLED_NO_DEVICE(rsmi_func_iter_next)
+NOT_MODELLED_NO_DEVICE(rsmi_func_iter_value_get)
+NOT_MODELLED_NO_DEVICE(rsmi_topo_get_p2p_status)

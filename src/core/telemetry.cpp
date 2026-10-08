@@ -300,7 +300,18 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
   d->sm_clock_max_mhz = p.telemetry.sm_clock_max_mhz;
   d->mem_clock_max_mhz = p.telemetry.mem_clock_max_mhz;
   d->ecc_enabled = p.telemetry.ecc ? 1 : 0;
-  d->memory_retirement = !p.telemetry.ecc ? 0 : p.telemetry.hbm ? 2 : 1;
+  // How failing memory is taken out of service. NVIDIA's memory-error
+  // documentation (the "GPU Memory Error Management" guide and the nvidia-smi
+  // manual) has dynamic page retirement on Turing and earlier and row
+  // remapping from Ampere on, whatever the memory type: an A10, L4 or L40S has
+  // GDDR and remaps rows, while a T4 (also GDDR) retires pages. A profile that
+  // says hbm is remapped either way. A card without ECC has neither.
+  const std::string& arch = p.architecture;
+  const bool remaps = p.telemetry.hbm || arch == "ampere" || arch == "ada" || arch == "ada_lovelace" ||
+                      arch == "hopper" || arch == "blackwell";
+  d->memory_retirement = !p.telemetry.ecc ? 0 : remaps ? 2 : 1;
+  d->nvlink_version = p.telemetry.nvlink_version;
+  d->nvlink_count = p.telemetry.nvlink_count;
   d->has_memory_temperature = p.telemetry.memory_temperature ? 1 : 0;
   d->pcie_gen = d->pcie_gen_max = p.telemetry.pcie_gen;
   d->pcie_width = d->pcie_width_max = p.telemetry.pcie_width;

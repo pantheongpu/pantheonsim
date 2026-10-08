@@ -8060,4 +8060,286 @@ WAIT:
   for (uint64_t lane = 0; lane < 32; ++lane) VCHECK_EQ(e.mem.load_scalar(out + lane * 4, 4), uint64_t{3000});
 }
 
+// ---- brx.idx and the lists it indexes ----
+
+namespace {
+// What nvcc writes for a dense switch: the table is a label with a
+// .branchtargets directive, and brx.idx takes the label. Each case computes a
+// different value and they meet again at DONE.
+const char* kSwitchPtx = R"(
+.visible .entry k(.param .u64 out, .param .u32 sel_mask)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [out];
+    ld.param.u32 %r5, [sel_mask];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    and.b32 %r2, %r1, %r5;
+    mov.u32 %r3, 1000;
+$L__BRX_0:
+    .branchtargets
+    $L__CASE0, $L__CASE1, $L__CASE2, $L__CASE3;
+    brx.idx %r2, $L__BRX_0;
+$L__CASE0:
+    add.u32 %r3, %r3, 10;
+    bra.uni $L__DONE;
+$L__CASE1:
+    add.u32 %r3, %r3, 20;
+    bra.uni $L__DONE;
+$L__CASE2:
+    add.u32 %r3, %r3, 30;
+    bra.uni $L__DONE;
+$L__CASE3:
+    add.u32 %r3, %r3, 40;
+$L__DONE:
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+)";
+}  // namespace
+
+VTEST(brx_idx_sends_each_lane_to_the_entry_its_index_picks) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kSwitchPtx);
+  uint64_t out = e.mem.alloc(64 * 4);
+  LaunchConfig cfg;
+  cfg.block = {64, 1, 1};   // two warps, every lane choosing by tid & 3
+  std::vector<uint8_t> mask(4, 0);
+  mask[0] = 3;
+  exec::launch(m.entries[0], cfg, {arg_u64(out), mask}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 64; ++t)
+    VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), 1000 + 10 * ((t & 3) + 1));
+}
+
+VTEST(brx_idx_with_one_index_for_the_whole_warp_does_not_diverge) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kSwitchPtx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> mask(4, 0);   // tid & 0 == 0: every lane takes entry 0
+  exec::launch(m.entries[0], cfg, {arg_u64(out), mask}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 32; ++t) VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), uint64_t{1010});
+}
+
+VTEST(a_predicated_brx_idx_leaves_the_other_lanes_to_fall_through) {
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r3, 7;
+    setp.lt.u32 %p1, %r1, 8;
+    shr.u32 %r2, %r1, 2;
+tbl:
+    .branchtargets A, B;
+    @%p1 brx.idx %r2, tbl;
+    mov.u32 %r3, 99;     // lanes 8 and up come here, then skip the cases
+    bra.uni DONE;
+A:
+    mov.u32 %r3, 100;
+    bra.uni DONE;
+B:
+    mov.u32 %r3, 200;
+DONE:
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 32; ++t)
+    VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), t < 4 ? 100u : t < 8 ? 200u : 99u);
+}
+
+VTEST(brx_idx_drives_a_loop_through_a_backward_entry) {
+  // A state machine: each lane runs its own number of trips round the loop
+  // by indexing back to the top until its counter is spent.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<6>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r3, 0;
+    mov.u32 %r4, 0;
+tbl:
+    .branchtargets EXIT, TOP;
+TOP:
+    add.u32 %r3, %r3, 5;
+    add.u32 %r4, %r4, 1;
+    setp.lt.u32 %p1, %r4, %r1;
+    selp.u32 %r2, 1, 0, %p1;
+    brx.idx %r2, tbl;
+EXIT:
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r3;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 32; ++t) VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), 5 * (t ? t : 1));
+}
+
+VTEST(brx_idx_past_the_end_of_its_list_is_refused_by_name) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kSwitchPtx);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  std::vector<uint8_t> mask(4, 0);
+  mask[0] = 7;   // tid & 7 reaches 4 on lane 4: the list has four entries
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(out), mask}, e.mem, e.prof));
+  VCHECK(err.code() == Err::OutOfBounds);
+  VCHECK_CONTAINS(err.what(), "brx.idx index 4");
+  VCHECK_CONTAINS(err.what(), "$L__BRX_0");
+}
+
+VTEST(brx_idx_needs_a_declared_list_of_defined_labels) {
+  const std::string head = std::string(kHeader) + ".visible .entry k()\n{\n .reg .b32 %r<2>;\n mov.u32 %r1, 0;\n";
+  auto e1 = VCAPTURE(Error, ptx::parse(head + " brx.idx %r1, nowhere;\n ret;\n}\n"));
+  VCHECK(e1.code() == Err::PtxParse);
+  VCHECK_CONTAINS(e1.what(), "no .branchtargets declares");
+  auto e2 = VCAPTURE(Error, ptx::parse(head + "tbl:\n .branchtargets A, MISSING;\nA:\n brx.idx %r1, tbl;\n ret;\n}\n"));
+  VCHECK(e2.code() == Err::PtxParse);
+  VCHECK_CONTAINS(e2.what(), "undefined label 'MISSING'");
+  auto e3 = VCAPTURE(Error, ptx::parse(head + " .branchtargets A;\nA:\n ret;\n}\n"));
+  VCHECK(e3.code() == Err::PtxParse);
+  VCHECK_CONTAINS(e3.what(), "must follow the label");
+  auto e4 = VCAPTURE(Error, ptx::parse(head + "tbl:\n .branchtargets A;\n A:\n brx.idx.foo %r1, tbl;\n ret;\n}\n"));
+  VCHECK(e4.code() == Err::UnsupportedPtx);
+}
+
+VTEST(brx_idx_works_inside_a_device_function) {
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) pick(.param .b32 a)
+{
+    .reg .b32 %r<4>;
+    ld.param.b32 %r1, [a];
+    and.b32 %r1, %r1, 1;
+    mov.u32 %r2, 0;
+tbl:
+    .branchtargets ODD, EVEN;
+    brx.idx %r1, tbl;
+ODD:
+    mov.u32 %r2, 11;
+    bra.uni OUT;
+EVEN:
+    mov.u32 %r2, 22;
+OUT:
+    st.param.b32 [r], %r2;
+    ret;
+}
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    {
+    .param .b32 a0;
+    st.param.b32 [a0], %r1;
+    .param .b32 r0;
+    call (r0), pick, (a0);
+    ld.param.b32 %r2, [r0];
+    }
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  const ptx::EntryFn* k = nullptr;
+  for (const auto& f : m.entries) if (f.name == "k") k = &f;
+  VCHECK(k != nullptr);
+  uint64_t out = e.mem.alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(*k, cfg, {arg_u64(out)}, e.mem, e.prof);
+  for (uint64_t t = 0; t < 32; ++t) VCHECK_EQ(e.mem.load_scalar(out + t * 4, 4), t & 1 ? 22u : 11u);
+}
+
+VTEST(a_calltargets_list_names_the_functions_an_indirect_call_may_reach) {
+  std::string ptx = std::string(kHeader) + R"(
+.func (.param .b32 r) twice(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  shl.b32 %r2, %r1, 1;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.func (.param .b32 r) plus100(.param .b32 a)
+{
+  .reg .b32 %r<3>;
+  ld.param.b32 %r1, [a];
+  add.u32 %r2, %r1, 100;
+  st.param.b32 [r], %r2;
+  ret;
+}
+.global .align 8 .u64 table[2] = {twice, plus100};
+.visible .entry k(.param .u64 p)
+{
+  .reg .b32 %r<8>;
+  .reg .b64 %rd<10>;
+  ld.param.u64 %rd1, [p];
+  cvta.to.global.u64 %rd2, %rd1;
+  mov.u32 %r1, %tid.x;
+  and.b32 %r2, %r1, 1;
+  mov.u64 %rd3, table;
+  mul.wide.u32 %rd4, %r2, 8;
+  add.u64 %rd5, %rd3, %rd4;
+  ld.global.u64 %rd6, [%rd5];
+  {
+  .param .b32 a0;
+  st.param.b32 [a0], %r1;
+  .param .b32 r0;
+  FT: .calltargets twice, plus100;
+  call (r0), %rd6, (a0), FT;
+  ld.param.b32 %r3, [r0];
+  }
+  mul.wide.u32 %rd7, %r1, 4;
+  add.u64 %rd8, %rd2, %rd7;
+  st.global.u32 [%rd8], %r3;
+  ret;
+}
+)";
+  runtime::Runtime rt(load_gpu("nvidia/a10"));
+  auto& dev = rt.device(0);
+  uint64_t mod = dev.load_module(ptx);
+  const ptx::EntryFn* fn = dev.get_function(mod, "k");
+  uint64_t out = dev.memory().alloc(32 * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  dev.launch(*fn, cfg, {arg_u64(out)}, dev.symbols(mod));
+  for (uint32_t t = 0; t < 32; ++t)
+    VCHECK_EQ(dev.memory().load_scalar(out + 4 * t, 4), uint64_t{t & 1 ? t + 100 : 2 * t});
+}
+
 VTEST_MAIN

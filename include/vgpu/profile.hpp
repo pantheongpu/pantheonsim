@@ -71,11 +71,17 @@ struct TelemetryClass {
   //   pcie_gen/width      the link real cards of the model most often run at,
   //                       which depends on how they are hosted: a T4 is an x16
   //                       card that clouds attach at x8.
+  //   nvlink_version/count  the NVLink generation and the number of links the
+  //                       card's data sheet gives, for the cards that have
+  //                       them (SXM parts; not PCIe cards, whose optional
+  //                       bridge is not what cloud machines have). 0 is none.
   bool ecc = false;
   bool hbm = false;
   bool memory_temperature = false;
   uint32_t pcie_gen = 0;
   uint32_t pcie_width = 0;
+  uint32_t nvlink_version = 0;
+  uint32_t nvlink_count = 0;
 };
 
 // What CUDA reports of an NVIDIA device beyond its limits (cudaDeviceProp,

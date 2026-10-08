@@ -17,24 +17,17 @@ shopt -u nullglob
 if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
-# The driver case loads both libraries, whose two copies of the core a
-# sanitizer build reports as an ODR violation; there the runtime cases are
-# built alone, without libcuda.
-cases=(assert trap address launch-ex graph)
-if [[ -n "$(shim_sanitizer "$shim")" ]]; then
-  nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
-       -DDEFERRED_ERRORS_RUNTIME_ONLY $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out"
-else
-  nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
-       $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcuda
-  cases+=(driver)
-fi
+# The driver case loads both libraries, libcudart and libcuda (both_shims_env
+# below is what a sanitizer build needs for that).
+cases=(assert trap address launch-ex graph driver)
+nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
+     $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcuda
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 status=0
 for c in "${cases[@]}"; do
   # Kept out of a failing command substitution, so a failure prints its reason.
   # stdout only: the failed assert prints its message on stderr, as on the card.
-  result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$out" "$c" 2>/dev/null || true)"
+  result="$(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$out" "$c" 2>/dev/null || true)"
   echo "deferred kernel errors, $c: $result"
   [[ "$(tail -n 1 <<<"$result")" == "PASS" ]] || status=1
 done

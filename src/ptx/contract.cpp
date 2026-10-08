@@ -50,8 +50,8 @@ bool contractible(const Instr& ins, const OpFloatBin& op) {
 }
 
 bool ends_block(const Instr& ins) {
-  return std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpRet>(ins.op) ||
-         std::holds_alternative<OpCall>(ins.op) || std::holds_alternative<OpBar>(ins.op);
+  return std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpBrx>(ins.op) ||
+         std::holds_alternative<OpRet>(ins.op) || std::holds_alternative<OpCall>(ins.op) || std::holds_alternative<OpBar>(ins.op);
 }
 
 }  // namespace
@@ -72,6 +72,9 @@ size_t contract_mul_add(EntryFn& fn) {
     for (size_t i = 0; i < n; ++i) {
       if (const auto* b = std::get_if<OpBra>(&body[i].op))
         if (b->target < n) leader[b->target] = true;
+      if (const auto* b = std::get_if<OpBrx>(&body[i].op))
+        for (size_t t : b->targets)
+          if (t < n) leader[t] = true;
       if (ends_block(body[i])) leader[i + 1] = true;
     }
     uint32_t id = 0;

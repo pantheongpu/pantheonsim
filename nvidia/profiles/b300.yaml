@@ -51,6 +51,7 @@ telemetry:
   memory: hbm
   memory_temperature: true
   pcie_link: "Gen6 x16"           # NVIDIA: "PCIe Gen6 x 16 lanes"
+  nvlink: "NVLink5 x18"        # data sheet: SXM part, NVLink generation 5, 18 links
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # Datasheet: eight HBM3e stacks. The L2 size is not published as a figure CUDA would report, so it is left unset.

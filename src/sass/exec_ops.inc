@@ -37,6 +37,21 @@ bool executes(const Instr& ins) {
   switch (ins.op) {
     case Op::HMMA: case Op::IMMA:
       return true;
+    case Op::F2FP:
+      // A narrow form (merging into C, or unpacking a narrow source) whose
+      // format the decoder did not recognise would run as some other one.
+      if (ins.f[5] == 1 && ins.f[3] < 10) return false;
+      if (ins.f[5] == 4 && ins.f[4] != 0 && ins.f[4] < 10) return false;
+      return true;
+    case Op::LDSM: {
+      // ldmatrix's forms: 16-bit 8x8, either way; packed 4- or 6-bit 8x16;
+      // 8-bit or packed 16x16, transposed. Anything else is not one.
+      const unsigned fmt = ins.f[2], shape = ins.f[3];
+      if (shape == 0 || shape == 2) return fmt == 0;
+      if (shape == 5) return fmt == 1 || fmt == 2;
+      if (shape == 9) return fmt != 0;
+      return false;
+    }
     case Op::TEX: case Op::TLD: case Op::TLD4: {
       const Word& w = ins.w;
       const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59 and the offsets to 56-57
@@ -61,12 +76,12 @@ bool executes(const Instr& ins) {
     case Op::SYNCS: case Op::ARRIVES: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
     case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
     case Op::UTCSHIFT: case Op::UTCATOMSWS: case Op::STAS: case Op::REDAS: case Op::UGETNEXTWORKID:
-    case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2FP: case Op::F2I:
+    case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2I:
     case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
     case Op::I2F: case Op::I2FP: case Op::I2I: case Op::I2IP: case Op::MUFU:
     case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::LD: case Op::LDC: case Op::LDG: case Op::LDGDEPBAR:
-    case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::RED: case Op::ST: case Op::STG:
+    case Op::LDGSTS: case Op::LDL: case Op::LDS: case Op::RED: case Op::ST: case Op::STG:
     case Op::STL: case Op::STS:
     case Op::MATCH: case Op::REDUX: case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MOVM:
       return true;
@@ -486,6 +501,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // carries out -- the carry ptxas feeds a 64-bit negate's high word.
         if (!hi && ins.src[0].neg)
           sum = static_cast<uint64_t>(static_cast<uint32_t>(~(s >= 32 ? 0 : a << s))) + 1 + b + cin;
+        // LEA Rd, P, Ra, -Rb: likewise the adder takes ~Rb + 1, so a zero Rb carries out. ival() has already
+        // negated b (0 stays 0), which loses that carry, and the carry feeds the next LEA.HI.X / IADD3.X of a
+        // 64-bit index (im2col's `h_im * width - pad`); with pad 0 the high word came out 0xffffffff.
+        if (ins.src[1].neg && b == 0) sum += uint64_t{1} << 32;
         write32(w, ins.dst[0], l, static_cast<uint32_t>(sum));
         if (has_p) set_pred(w, ins.dst[1], l, (sum >> 32) != 0);
       });
@@ -1129,7 +1148,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
           const uint32_t t = three ? top[l] : static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
           shifted = static_cast<uint32_t>(((a[l] | (static_cast<uint64_t>(t) << 32)) << sh) >> 32);
         }
-        const uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
+        uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
+        if (ins.src[1].neg && b[l] == 0) sum += uint64_t{1} << 32;   // -0 is ~0 + 1: it carries out (see the general rule)
         r[l] = static_cast<uint32_t>(sum);
         carry |= static_cast<Mask>(sum >> 32 != 0) << l;
       }
@@ -1379,25 +1399,65 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         });
         return;
       }
-      if (ins.f[3] >= 6 || ins.f[5] == 4) {   // the FP8 forms
-        const bool unpack = ins.f[5] == 4, sat = ins.f[6];
+      if (ins.f[3] >= 6 || ins.f[5] == 4) {   // the narrow forms: FP8, FP6, FP4, UE8M0
+        // The format, as the decoder names it (10 E4M3, 11 E5M2, 12 E3M2,
+        // 13 E2M3, 14 E2M1, 15 UE8M0); before sm_100 only 6 (E5M2) and 7.
+        const bool unpack = ins.f[5] == 4, sat = ins.f[6], relu = ins.f[2];
+        unsigned fmt = unpack ? ins.f[4] : ins.f[3];
+        if (fmt == 7 || (unpack && fmt == 3)) fmt = 10;
+        else if (fmt == 6 || (unpack && fmt == 2)) fmt = 11;
+        const unsigned width = fmt == 14 ? 4 : 8;   // bits a value takes in the pair
+        // One value of the format, as the PTX engine's cvt reads and writes it
+        // (vgpu/exec/numerics.hpp).
+        const auto decode = [&](uint32_t code) -> double {
+          switch (fmt) {
+            case 10: return exec::fp8_value(code, false);
+            case 11: return exec::fp8_value(code, true);
+            case 12: return exec::mx_float_value(code & 0x3F, 3, 2, 3);
+            case 13: return exec::mx_float_value(code & 0x3F, 2, 3, 1);
+            case 14: return exec::mx_float_value(code & 0xF, 2, 1, 1);
+            default: return code == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(code) - 127);
+          }
+        };
+        const auto encode = [&](double v, unsigned l) -> uint32_t {
+          if (relu && v < 0) v = 0.0;
+          switch (fmt) {
+            case 10: return exec::fp8_bits(v, false, sat);
+            case 11: return exec::fp8_bits(v, true, sat);
+            case 12: return exec::small_float_bits(v, 3, 2, 3);
+            case 13: return exec::small_float_bits(v, 2, 3, 1);
+            case 14: return exec::small_float_bits(v, 2, 1, 1);
+            default: {
+              const uint32_t c = exec::ue8m0_bits(v, ins.f[1] == 2, sat);   // .RZ, or .RP
+              if (c == ~0u) fault(w, ins, l, "F2FP to UE8M0 of a negative value, which the ISA does not define", Err::UnsupportedPtx);
+              return c;
+            }
+          }
+        };
         each_lane(ex, [&](unsigned l) {
-          if (unpack) {   // b's two bytes (low first, or its upper half's) to two halves
+          if (unpack) {   // b's pair (low first, or its upper half's) to two halves
             const uint32_t v = read32(w, ins.src[0], l) >> (ins.f[7] ? 16 : 0);
-            const bool e5 = ins.f[4] == 2;
-            const uint16_t lo = f64_to_half(exec::fp8_value(v & 0xff, e5));
-            const uint16_t hi = f64_to_half(exec::fp8_value((v >> 8) & 0xff, e5));
-            write32(w, ins.dst[0], l, lo | (static_cast<uint32_t>(hi) << 16));
+            uint32_t r = 0;
+            for (unsigned h = 0; h < 2; ++h) {
+              double x = decode((v >> (width * h)) & ((1u << width) - 1));
+              uint32_t half;
+              if (relu && std::isnan(x)) {
+                half = 0x7FFF;   // canonical NaN
+              } else {
+                if (relu && x < 0) x = 0.0;
+                half = ins.f[0] ? exec::bf16_bits(x) : exec::f16_bits(x);
+              }
+              r |= half << (16 * h);
+            }
+            write32(w, ins.dst[0], l, r);
             return;
           }
-          const bool e5 = ins.f[3] == 6;
-          float a = f32src(ins.src[0], l, false), b = f32src(ins.src[1], l, false);
-          if (ins.f[2]) {
-            if (a < 0) a = 0;
-            if (b < 0) b = 0;
-          }
-          uint32_t r = (exec::fp8_bits(a, e5, sat) << 8) | exec::fp8_bits(b, e5, sat);
-          if (ins.f[5] == 1) r |= read32(w, ins.src[2], l) & 0xffff0000u;   // MERGE_C
+          const double a = f32src(ins.src[0], l, false), b = f32src(ins.src[1], l, false);
+          uint32_t r = (encode(a, l) << width) | encode(b, l);
+          // MERGE_C: C moves up past the new pair, which is how ptxas builds a
+          // word of pairs -- each conversion's C the one before it (four FP4
+          // bytes, two FP6/FP8 halves).
+          if (ins.f[5] == 1) r |= read32(w, ins.src[2], l) << (2 * width);
           write32(w, ins.dst[0], l, r);
         });
         return;
@@ -1871,6 +1931,33 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         if (!(have >> r & 1)) fault(w, ins, r, "LDSM: the lane holding a row address is not active");
         return rows[r];
       };
+      if (ins.f[3] == 5 || ins.f[3] == 9) {
+        // The 8-bit forms, as the PTX engine's ldmatrix (exec/ldmatrix.hpp):
+        // .M816 eight rows of sixteen values, .MT1616 sixteen transposed,
+        // matrix i's rows from lanes R*i.., each row unpacked to a byte a
+        // value (.U4x16P64TO8, .U6x16P32TO8) or taken as it is (.8).
+        const unsigned R = ins.f[3] == 9 ? 16 : 8, regs = R / 8;
+        exec::LdmRow fmt;
+        fmt.bits = ins.f[2] == 1 ? 4 : ins.f[2] == 2 ? 6 : 8;
+        const unsigned d = ins.dst[0].reg;
+        // Rows are read by the lane that names them, as LDSM's own reads are.
+        for (unsigned i = 0; i < nmat; ++i) {
+          uint8_t tile[16][16] = {};
+          for (unsigned r = 0; r < R; ++r) {
+            const unsigned src = R * i + r;
+            uint8_t raw[16] = {};
+            mem_read(blk, w, src, Space::Shared, row(src), raw, fmt.bytes());
+            exec::ldm_unpack_row(raw, fmt, tile[r]);
+          }
+          for (unsigned rr = 0; rr < regs; ++rr)
+            each_lane(ex, [&](unsigned t) {
+              if (d != kRZ) w.reg(d + i * regs + rr, t) = exec::ldm_word(tile, t, rr, trans);
+            });
+        }
+        blk.st.shared_loads += static_cast<uint64_t>(std::popcount(ex));
+        blk.st.shared_bytes_read += static_cast<uint64_t>(std::popcount(ex)) * 4 * nmat * regs;
+        return;
+      }
       uint32_t out[4][32] = {};
       each_lane(ex, [&](unsigned t) {
         for (unsigned i = 0; i < nmat; ++i) {
@@ -3061,8 +3148,20 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       Block::Barrier& b = blk.bars[id];
       b.mode = mode;
       b.red = ins.f[1];
+      // A thread count (bar.sync 7, 256): only the warps that arrive take part,
+      // and the barrier completes at that many threads -- not at every live
+      // thread of the block, which held CUTLASS's consumer warpgroups at their
+      // own barrier while its producer warps waited on them. As the PTX engine
+      // counts it, from the ISA: a warp's arrival is all of its threads.
+      if (const uint32_t count = ins.f[2]) {
+        if (count % 32)
+          throw Error(Err::InvalidValue, "a barrier's thread count must be a non-zero multiple of the warp size (32); got " +
+                                             std::to_string(count));
+        b.expected = count;
+        if (ex) b.arrived += 32;
+      }
       each_lane(ex, [&](unsigned l) {
-        ++b.arrived;
+        if (!ins.f[2]) ++b.arrived;
         if (mode == 2) {
           const bool p = pred(w, ins.src.back(), l);
           b.popc += p;
@@ -3625,8 +3724,11 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
 
   if (ins.op == Op::UBLKCP || ins.op == Op::UBLKRED) {
     const unsigned dir = ins.f[0];   // 1 .S.G, 2 .G.S, 3 .S.S
-    const uint32_t n = urv(urc);
-    if (n % 16) throw Fault("a bulk copy's size must be a multiple of 16");
+    // The size in 16-byte units in the low half of its register, and a
+    // multicast's CTA mask in the high half: ptxas shifts a byte count right
+    // by 4 and PRMTs the mask in (my own probes, every direction).
+    const uint32_t size_reg = urv(urc);
+    const uint32_t n = (size_reg & 0xffff) * 16;
     std::vector<uint8_t> data(n);
     if (dir == 1) {
       const uint64_t g = ur64(urb);
@@ -3660,7 +3762,7 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     }
     // Into shared memory, completing on the destination's mbarrier.
     const uint32_t dst_addr = urv(ura), bar_addr = urv(ura + 1);
-    const uint32_t mask = ins.f[1] ? (urv(urc + 1) & 0xffff) : 0;
+    const uint32_t mask = ins.f[1] ? size_reg >> 16 : 0;
     const auto deliver = [&](Block& to, uint32_t off, uint32_t bar_off) {
       shared_range(to, off, n, "a bulk copy");
       if (ins.op == Op::UBLKRED) {   // .S.S: an integer reduction into shared memory
@@ -3721,7 +3823,9 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   for (uint32_t d = 0; d < (four_rows ? 5u : dims) && d < 5; ++d) coords[d] = static_cast<int32_t>(urv(first + d));
   exec::TmaBox box;
   if (auto bad = exec::tma_box(map, dims, coords, four_rows, im2col, load, reduce, &box)) throw Error(bad->code, bad->what);
-  const uint32_t extra = (im2col || multicast) ? urv(urc) : 0;
+  // A load's im2col offsets (or multicast mask); a store's im2col form has
+  // none (.im2col_no_offs).
+  const uint32_t extra = ((im2col && load) || multicast) ? urv(urc) : 0;
   std::array<int64_t, 3> offsets{};
   if (im2col) {
     const uint32_t bits = exec::TensorMap::corner_bits(map.rank);

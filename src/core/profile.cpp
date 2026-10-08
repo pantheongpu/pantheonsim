@@ -203,6 +203,15 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
       p.telemetry.pcie_gen = gen;
       p.telemetry.pcie_width = width;
     }
+    if (const std::string nv = get_str_opt(t, "nvlink"); !nv.empty()) {
+      unsigned version = 0, links = 0;
+      char extra = 0;
+      if (std::sscanf(nv.c_str(), "NVLink%u x%u%c", &version, &links, &extra) != 2 || version < 1 ||
+          version > 6 || links < 1 || links > 18)
+        fail(origin, "telemetry.nvlink must look like \"NVLink4 x18\", got: " + nv);
+      p.telemetry.nvlink_version = version;
+      p.telemetry.nvlink_count = links;
+    }
   }
 
   if (auto it = doc.map.find("features"); it != doc.map.end()) {

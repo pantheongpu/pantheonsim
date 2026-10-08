@@ -41,7 +41,7 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
@@ -109,3 +109,9 @@ open("bundle_zlib.bin", "wb").write(head + packed)'
   "$lld" -shared vector_add.gfx942.o -o vector_add.gfx942.hsaco
   echo "wrote the bundles, linked.gfx942.hsaco and vector_add.gfx942.hsaco"
 fi
+
+# devmalloc.gfx942.hsaco: device-side malloc and free (devmalloc.cpp), which needs hipcc. Run by
+# test_amd_runtime_gaps. hipcc --genco writes an offload bundle; the code object is its gfx942 entry.
+#   hipcc --genco --offload-arch=gfx942 -O1 devmalloc.cpp -o devmalloc.co
+#   clang-offload-bundler --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx942 \
+#       --input=devmalloc.co --output=devmalloc.gfx942.hsaco

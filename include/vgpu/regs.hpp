@@ -51,6 +51,10 @@ struct Register {
   std::string source;          // where the offset comes from, when it is not a standard's
   std::string measured;        // what a real card read, where one has been checked
   std::string capability;      // pm, msi, pcie or aer: found through the capability chain
+  // MMIO only: the architectures (or dies) whose published headers define the
+  // register, e.g. turing, ampere, hopper, ada, blackwell, gb100, gb20x. Empty:
+  // every GPU of the vendor has it. On any other GPU the offset is unmapped.
+  std::vector<std::string> arch;
 };
 
 // A space's registers, ordered by offset. Throws on a malformed database,

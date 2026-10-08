@@ -939,7 +939,10 @@ hipError_t unsafe_during_capture(State&) {
   }
   if (culprits.empty()) return hipSuccess;
   for (Capture* c : culprits) c->invalidated = true;
-  return hipErrorStreamCaptureUnsupported;
+  // As HIP documents: a call that synchronizes or allocates is not allowed while a global (or this
+  // thread's own) capture is on, and invalidates the capture.
+  return fail(hipErrorStreamCaptureUnsupported, "a call that is unsafe during a stream capture was made while a capture "
+                                                "in global or thread-local mode is on; the capture is invalidated");
 }
 
 GNode* capture_append(Capture* c, hipStream_t resolved, std::unique_ptr<GNode> n) {

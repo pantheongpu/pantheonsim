@@ -4,6 +4,7 @@
 // (nvidia/registers/measurements/), and its BAR0 registers -- offsets and
 // fields from NVIDIA's published headers, values from the profile and from
 // what one card answered (nvidia/registers/mmio.yaml).
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -96,9 +97,72 @@ uint32_t link_gen(const telemetry::DeviceSample& d) {
   return is_geforce(d) && d.utilization_gpu == 0 && d.pcie_gen ? 1 : d.pcie_gen;
 }
 
+// Whether this GPU has a register whose `arch` names the architectures and dies
+// the published headers define it for. The architecture is the profile's;
+// Blackwell is two dies' worth of headers, GB100 (compute capability 10.x:
+// B200, B300) and the GB20x of the GeForce RTX 50 series (12.x) -- the same
+// split PMC_BOOT_0's architecture id makes. A register with no `arch` is every
+// NVIDIA GPU's.
+bool has_register(const telemetry::DeviceSample& d, const Register& r) {
+  if (r.arch.empty()) return true;
+  const bool blackwell = std::strcmp(d.architecture, "blackwell") == 0;
+  const char* die = d.cc_major >= 12 ? "gb20x" : "gb100";
+  for (const std::string& t : r.arch)
+    if (t == d.architecture || (blackwell && t == die)) return true;
+  return false;
+}
+
+bool is_turing(const telemetry::DeviceSample& d) { return std::strcmp(d.architecture, "turing") == 0; }
+
+// The words of shared state the registers below keep (regs_vendor.hpp's
+// kStateWords): the interrupt enables, and the base each error counter was
+// last written from.
+enum Words : uint32_t { kIntrEn0 = 4, kIntrEn1, kDramDed0, kL2Ded = kDramDed0 + 4 };
+
+// An error counter software can clear: it reads the value last written to it
+// plus what the engine has counted since, which is how a written counter
+// behaves on hardware -- it counts up from there. The word holds the count at
+// the time of the write (high half) and the value written (low half); a
+// fresh word is a counter nobody wrote, which reads the count. A count that
+// has restarted below the one at the write (a driver reload) starts from zero,
+// as the hardware's counters do -- until it climbs past that count again, which
+// the model cannot tell from the count it was written at (a limit of keeping
+// one word per counter, not a property of the hardware).
+uint32_t counter_value(const uint64_t* word, uint64_t count) {
+  const uint64_t w = __atomic_load_n(word, __ATOMIC_RELAXED);
+  const uint64_t at_write = w >> 32, written = w & 0xFFFFFFFFu;
+  return count < at_write ? static_cast<uint32_t>(count) : static_cast<uint32_t>(written + (count - at_write));
+}
+void counter_write(uint64_t* word, uint64_t count, uint32_t value) {
+  __atomic_store_n(word, (std::min<uint64_t>(count, 0xFFFFFFFFu) << 32) | value, __ATOMIC_RELAXED);
+}
+
+// What the injector counts as uncorrectable DRAM and L2 errors. The injector
+// keeps one count for the whole device memory, not one per memory partition,
+// so the DRAM count is shown on the first partition's counter and the rest
+// read zero; the sum a diagnostic adds up is the device's count.
+uint64_t dram_ded_count(const Context& c, uint32_t partition) {
+  return partition == 0 ? c.ras.ecc[static_cast<uint32_t>(ras::Severity::Uncorrected)]
+                                  [static_cast<uint32_t>(ras::Location::DeviceMemory)]
+                        : 0;
+}
+uint64_t l2_ded_count(const Context& c) {
+  return c.ras.ecc[static_cast<uint32_t>(ras::Severity::Uncorrected)][static_cast<uint32_t>(ras::Location::L2Cache)];
+}
+
 bool nvidia_backed(const std::string& k, const Context& c, uint32_t* out) {
   const telemetry::DeviceSample& d = c.d;
   if (k == "profile.revision") *out = 0xa1;
+  // The interrupt enables. Software on Turing sets and clears bits through the
+  // SET and CLEAR registers (the header gives the enable itself as read-only
+  // there); they read back zero.
+  else if (k == "nvidia.pmc_intr_en_0" || k == "nvidia.pmc_intr_en_1")
+    *out = static_cast<uint32_t>(__atomic_load_n(&c.words[k.back() == '0' ? kIntrEn0 : kIntrEn1], __ATOMIC_RELAXED));
+  else if (k.rfind("nvidia.pmc_intr_en_set_", 0) == 0 || k.rfind("nvidia.pmc_intr_en_clear_", 0) == 0) *out = 0;
+  else if (k.rfind("nvidia.ecc_dram_ded_", 0) == 0) {
+    const uint32_t n = static_cast<uint32_t>(k.back() - '0');
+    *out = counter_value(&c.words[kDramDed0 + n], dram_ded_count(c, n));
+  } else if (k == "nvidia.ecc_l2_ded") *out = counter_value(&c.words[kL2Ded], l2_ded_count(c));
   // Identity as the card reports it in BAR0: the architecture and die in their
   // published fields, the revision the same 0xa1 configuration space reports,
   // and bits 31:29 as the measured card had them -- the published header does
@@ -124,7 +188,24 @@ bool nvidia_backed(const std::string& k, const Context& c, uint32_t* out) {
   return true;
 }
 
-bool no_write(const std::string&, const Context&, uint32_t) { return false; }
+bool nvidia_write(const std::string& k, const Context& c, uint32_t value) {
+  const auto set = [&](uint32_t word, uint64_t v) { __atomic_store_n(&c.words[word], v, __ATOMIC_RELAXED); };
+  const auto get = [&](uint32_t word) { return __atomic_load_n(&c.words[word], __ATOMIC_RELAXED); };
+  if (k == "nvidia.pmc_intr_en_0" || k == "nvidia.pmc_intr_en_1") {
+    if (!is_turing(c.d)) set(k.back() == '0' ? kIntrEn0 : kIntrEn1, value);   // read-only on Turing
+  } else if (k.rfind("nvidia.pmc_intr_en_set_", 0) == 0) {
+    const uint32_t w = k.back() == '0' ? kIntrEn0 : kIntrEn1;
+    set(w, get(w) | value);
+  } else if (k.rfind("nvidia.pmc_intr_en_clear_", 0) == 0) {
+    const uint32_t w = k.back() == '0' ? kIntrEn0 : kIntrEn1;
+    set(w, get(w) & ~uint64_t{value});
+  } else if (k.rfind("nvidia.ecc_dram_ded_", 0) == 0) {
+    const uint32_t n = static_cast<uint32_t>(k.back() - '0');
+    counter_write(&c.words[kDramDed0 + n], dram_ded_count(c, n), value);
+  } else if (k == "nvidia.ecc_l2_ded") counter_write(&c.words[kL2Ded], l2_ded_count(c), value);
+  else return false;
+  return true;
+}
 // nvidia.ko's own files are in /proc/driver/nvidia, not the PCI device's
 // directory, so a device has only the PCI files every device has.
 void no_sysfs(const telemetry::DeviceSample&, const std::string&) {}
@@ -137,7 +218,8 @@ const Vendor& nvidia() {
   static const Vendor v = {
       "nvidia",   Space::NvidiaMmio, "nvidia-mmio", "nvidia/registers/mmio.yaml",
       16u << 20,  0xbadf5040u,       has_bar0,      nvidia_bars,
-      captured,   link_gen,          nvidia_backed, no_write,
+      has_register,
+      captured,   link_gen,          nvidia_backed, nvidia_write,
       no_sysfs,
   };
   return v;

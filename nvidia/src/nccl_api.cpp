@@ -1455,6 +1455,46 @@ VGPU_EXPORT ncclResult_t ncclWinGetUserPtr(ncclComm_t comm, ncclWindow_t win, vo
 }
 #endif
 
+/* ---- NCCL 2.28+ host API and the device API: exported, not implemented ----
+   PyTorch for CUDA 13 (2.14, built against NCCL 2.30) links libtorch_cuda to
+   these names at load time (-z now), so a library without them makes
+   `import torch` fail with "undefined symbol: ncclCommResume" before any
+   NCCL call is made. Each is exported and answers ncclInvalidUsage with its
+   name on stderr when called: nothing here quietly pretends to succeed (a
+   suspended or revoked communicator, a signal that was never sent). The
+   device API entries are declared with opaque pointers: only their names
+   and the C calling convention matter to a binding. */
+namespace {
+ncclResult_t not_supported(const char* name) {
+  std::fprintf(stderr, "[vgpu] nccl: %s is not supported by this simulator\n", name);
+  return ncclInvalidUsage;
+}
+}  // namespace
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+VGPU_EXPORT ncclResult_t ncclCommRevoke(ncclComm_t, int) { return not_supported("ncclCommRevoke"); }
+VGPU_EXPORT ncclResult_t ncclCommGetUniqueId(ncclComm_t, ncclUniqueId*) { return not_supported("ncclCommGetUniqueId"); }
+VGPU_EXPORT ncclResult_t ncclCommGrow(ncclComm_t, int, const ncclUniqueId*, int, ncclComm_t*, ncclConfig_t*) {
+  return not_supported("ncclCommGrow");
+}
+VGPU_EXPORT ncclResult_t ncclCommSuspend(ncclComm_t, int) { return not_supported("ncclCommSuspend"); }
+VGPU_EXPORT ncclResult_t ncclCommResume(ncclComm_t) { return not_supported("ncclCommResume"); }
+VGPU_EXPORT ncclResult_t ncclCommMemStats(ncclComm_t, ncclCommMemStat_t, uint64_t*) { return not_supported("ncclCommMemStats"); }
+VGPU_EXPORT ncclResult_t ncclPutSignal(const void*, size_t, ncclDataType_t, int, ncclWindow_t, size_t, int, int,
+                                       unsigned int, ncclComm_t, cudaStream_t) {
+  return not_supported("ncclPutSignal");
+}
+VGPU_EXPORT ncclResult_t ncclSignal(int, int, int, unsigned int, ncclComm_t, cudaStream_t) { return not_supported("ncclSignal"); }
+VGPU_EXPORT ncclResult_t ncclWaitSignal(int, ncclWaitSignalDesc_t*, ncclComm_t, cudaStream_t) { return not_supported("ncclWaitSignal"); }
+// nccl_device/core.h (not vendored): ncclDevCommCreate(comm, reqs*, ncclDevComm_t*),
+// ncclDevCommDestroy(comm, const ncclDevComm_t*), ncclGetLsaMultimemDevicePointer(window, offset, void**),
+// ncclGetPeerDevicePointer(window, offset, peer, void**).
+VGPU_EXPORT ncclResult_t ncclDevCommCreate(ncclComm_t, const void*, void*) { return not_supported("ncclDevCommCreate"); }
+VGPU_EXPORT ncclResult_t ncclDevCommDestroy(ncclComm_t, const void*) { return not_supported("ncclDevCommDestroy"); }
+VGPU_EXPORT ncclResult_t ncclGetLsaMultimemDevicePointer(ncclWindow_t, size_t, void**) { return not_supported("ncclGetLsaMultimemDevicePointer"); }
+VGPU_EXPORT ncclResult_t ncclGetPeerDevicePointer(ncclWindow_t, size_t, int, void**) { return not_supported("ncclGetPeerDevicePointer"); }
+#endif
+
 /* ---- groups ---- */
 
 VGPU_EXPORT ncclResult_t ncclGroupStart(void) { ++t_group_depth; return ncclSuccess; }

@@ -1,0 +1,10 @@
+# Programs whose device memory is known to differ between the SASS and PTX
+# engines (suites.sh digest), not yet reconciled. Each still matches the card
+# on the default engine (SASS). A listed program that differs is reported, not
+# failed; one that no longer differs is reported too, so it can come off the
+# list. Columns: suite | program | the first kernel after which they differ
+# (external-smoke run 37030713354, 2026-10-02).
+cuda-samples|fp16ScalarProduct|scalarProductKernel_native (launch 0)
+hecbench|backprop-cuda|kernel_adjust_weights (launch 1)
+hecbench|bscan-cuda|binary_scan (launch 0)
+rodinia|streamcluster|kernel_compute_cost (launch 0)

@@ -45,6 +45,7 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: false    # most real runs report no memory sensor
   pcie_link: "Gen4 x16"        # most common link on real cards (101 runs in the benchmark database)
+  nvlink: "NVLink3 x12"        # data sheet: SXM part, NVLink generation 3, 12 links
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # Datasheet: five active HBM2e stacks, 40 MB L2. NVIDIA's A100 documentation sets aside up to 30 MB of it for persisting accesses.

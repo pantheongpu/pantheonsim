@@ -49,6 +49,7 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: true     # reported on every real run in the benchmark database
   pcie_link: "Gen5 x16"        # most common link on real cards (30 runs in the benchmark database)
+  nvlink: "NVLink5 x18"        # data sheet: SXM part, NVLink generation 5, 18 links
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # Datasheet: eight HBM3e stacks. The L2 size is not published as a figure CUDA would report, so it is left unset.
