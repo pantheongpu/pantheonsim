@@ -1,0 +1,146 @@
+name: Docker images
+
+# The simulator as a container image, for people who would rather pull it than
+# build it (docker/Dockerfile, docs/docker.md):
+#
+#   ghcr.io/pantheongpu/pantheonsim:<version>-cuda13.0
+#   ghcr.io/pantheongpu/pantheonsim:<version>-cuda12.8
+#
+# The CUDA part of the tag is the toolkit the simulator's CUDA libraries were
+# built against, which decides the CUDA major the programs it runs can have been
+# built with. Each image carries the AMD side too.
+#
+# A pull request that changes the image builds it and runs it, and pushes
+# nothing. An image is pushed for a version tag (v*), or by hand with `push` on,
+# and never otherwise: publishing one is part of a release.
+on:
+  pull_request:
+    paths:
+      - docker/**
+      - .dockerignore
+      - scripts/package-build.sh
+      - .github/ci-image/**
+      - .github/workflows/docker.yml
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push the images (as dev-<commit>-cuda<version>)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/pantheonsim
+
+jobs:
+  image:
+    name: image cuda${{ matrix.cuda }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['13.0', '12.8']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          df -h / | tail -1
+
+      - name: Work out the tags
+        id: tags
+        env:
+          CUDA: ${{ matrix.cuda }}
+          PUSH_INPUT: ${{ inputs.push }}
+        run: |
+          push=false; tags="$IMAGE:test-cuda$CUDA"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            push=true; v="${GITHUB_REF_NAME#v}"
+            tags="$IMAGE:$v-cuda$CUDA"
+            # latest is the newest CUDA's.
+            [[ "$CUDA" == 13.0 ]] && tags="$tags,$IMAGE:$v,$IMAGE:latest"
+          elif [[ "$PUSH_INPUT" == true ]]; then
+            push=true; tags="$IMAGE:dev-${GITHUB_SHA::12}-cuda$CUDA"
+          fi
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Tags: $tags (push: $push)"
+
+      # The toolkit comes from the CI image's Dockerfile, built here rather than
+      # pulled: this workflow then does not depend on that package being
+      # readable, and the toolkit never leaves this job's build stage.
+      - name: Build the toolchain stage
+        env:
+          CUDA: ${{ matrix.cuda }}
+        run: |
+          docker build --target cuda --build-arg "CUDA_VERSION=$CUDA" \
+            -t "pantheonsim-ci:cuda$CUDA" .github/ci-image
+
+      - name: Build the image
+        env:
+          CUDA: ${{ matrix.cuda }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          args=(); IFS=, read -ra t <<< "$TAGS"; for x in "${t[@]}"; do args+=(-t "$x"); done
+          docker build -f docker/Dockerfile --build-arg "BUILDER=pantheonsim-ci:cuda$CUDA" "${args[@]}" .
+          ref="${t[0]}"
+          docker image inspect "$ref" --format '{{.Size}}' \
+            | awk '{printf "Image size: %.2f GB\n", $1/1e9}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run it
+        env:
+          CUDA: ${{ matrix.cuda }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          ref="${TAGS%%,*}"; major="${CUDA%%.*}"
+          run() { docker run --rm "$ref" "$@"; }
+          run vgpu list-gpus | head -5
+          # No toolkit and no ROCm in the image: the simulator and nothing else.
+          # (bin/nvcc is the simulator's drop-in wrapper, not a compiler.)
+          if run bash -c 'command -v hipcc || command -v ptxas || command -v nvdisasm || [ -e /usr/local/cuda ] || [ -e /opt/rocm ]'; then
+            echo "::error::the image holds a compiler or a toolkit"; exit 1
+          fi
+          run bash -c 'ls /opt/pantheonsim/shim/libcudart.so.'"$major"
+          run vgpu demo vectoradd --gpu nvidia/h100 | tee /dev/stderr | grep -q '^PASS'
+          run bash -c 'VGPU_GPU=nvidia/h100 nvidia-smi -L'
+          run bash -c 'VGPU_GPU=amd/mi300x rocm-smi --showproductname | head -5'
+          # Nothing in /opt/pantheonsim may need a library the image lacks.
+          run bash -c 'for f in /opt/pantheonsim/vgpu /opt/pantheonsim/*.so.*; do
+                         [ -f "$f" ] && ldd "$f" 2>/dev/null | grep "not found" && echo "unresolved in $f" && exit 1; done; true'
+
+      # The image has no compiler on purpose. This is the recipe for adding one:
+      # NVIDIA's own devel image with the simulator copied in (docker/example).
+      - name: Add a compiler, build a program, run it
+        env:
+          CUDA: ${{ matrix.cuda }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          ref="${TAGS%%,*}"
+          case "$CUDA" in 13.0) full=13.0.0 ;; 12.8) full=12.8.1 ;; esac
+          docker build -f docker/example/Dockerfile --build-arg "CUDA=$full" --build-arg "SIM=$ref" \
+            -t example docker/example
+          docker run --rm example | tee /dev/stderr | grep -q '^PASS'
+
+      - name: Log in
+        if: steps.tags.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: steps.tags.outputs.push == 'true'
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          IFS=, read -ra t <<< "$TAGS"
+          for x in "${t[@]}"; do docker push "$x"; done
