@@ -29,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <dlfcn.h>
+#include <link.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -3690,10 +3691,49 @@ hipError_t hipMemcpyFromSymbolAsync(void* dst, const void* symbol, size_t bytes,
   return copy_symbol(false, symbol, dst, bytes, offset, kind, stream, true);
 }
 
+namespace {
+// Whether anything loaded in the process asks for libamdhip64.so.6 and nothing for .so.7. A program
+// built by ROCm 6.4 does, and one built by 7.0 or later asks for .so.7; a program that loads the
+// library by a name of its own (ctypes) asks for neither.
+bool asks_for_hip_six_only() {
+  struct Seen { bool six = false, seven = false; } seen;
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, size_t, void* data) {
+        auto* seen = static_cast<Seen*>(data);
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+          if (info->dlpi_phdr[i].p_type != PT_DYNAMIC) continue;
+          const auto* dyn = reinterpret_cast<const ElfW(Dyn)*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+          const char* strings = nullptr;
+          for (const ElfW(Dyn)* e = dyn; e->d_tag != DT_NULL; ++e)
+            if (e->d_tag == DT_STRTAB) {
+              uintptr_t at = e->d_un.d_ptr;
+              if (at < info->dlpi_addr) at += info->dlpi_addr;   // some loaders leave it unrelocated
+              strings = reinterpret_cast<const char*>(at);
+            }
+          if (!strings) continue;
+          for (const ElfW(Dyn)* e = dyn; e->d_tag != DT_NULL; ++e) {
+            if (e->d_tag != DT_NEEDED) continue;
+            const std::string_view name = strings + e->d_un.d_val;
+            if (name == "libamdhip64.so.6") seen->six = true;
+            if (name == "libamdhip64.so.7") seen->seven = true;
+          }
+        }
+        return 0;
+      },
+      &seen);
+  return seen.six && !seen.seven;
+}
+}  // namespace
+
+// HIP_VERSION of the release the program was built for: 6.4.43483 for one that asks for
+// libamdhip64.so.6, and ROCm 7.2's 7.2.53211 for the rest (HIP_VERSION_MAJOR * 10000000 + MINOR *
+// 100000 + PATCH). RCCL 2.27 refuses to start on a runtime older than 6.4.43484 unless
+// HSA_NO_SCRATCH_RECLAIM=1 is set, and the newer wheels carry it.
 hipError_t hipRuntimeGetVersion(int* version) {
   const ApiCall api("hipRuntimeGetVersion");
   if (!version) return hipErrorInvalidValue;
-  *version = 60443483;   // 6.4.43483, a ROCm 6.4 runtime
+  static const int reported = asks_for_hip_six_only() ? 60443483 : 70253211;
+  *version = reported;
   return hipSuccess;
 }
 hipError_t hipDriverGetVersion(int* version) {

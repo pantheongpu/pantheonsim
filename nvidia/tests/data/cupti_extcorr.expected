@@ -1,0 +1,19 @@
+pop custom1 -> 0, popped 200
+popped 101
+popped 100
+pop from an empty stack -> 18
+push of an invalid kind -> 1
+RUNTIME cudaMalloc_v3020 corr=c0
+EXT kind=3 id=100 corr=c1
+RUNTIME cudaLaunchKernel_v7000 corr=c1
+EXT kind=3 id=100 corr=c2
+EXT kind=4 id=200 corr=c2
+RUNTIME cudaMemset_v3020 corr=c2
+EXT kind=3 id=100 corr=c3
+EXT kind=4 id=200 corr=c3
+RUNTIME cudaDeviceSynchronize_v3020 corr=c3
+EXT kind=3 id=100 corr=c4
+RUNTIME cudaMemset_v3020 corr=c4
+EXT kind=3 id=101 corr=c5
+RUNTIME cudaMemset_v3020 corr=c5
+RUNTIME cudaFree_v3020 corr=c6

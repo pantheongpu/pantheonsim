@@ -52,6 +52,10 @@ enum MemoryType : int { kMemVram = 0, kMemVisVram = 1 };   // amdsmi_memory_type
 constexpr uint64_t kInitAmdGpus = 1u << 1;                 // AMDSMI_INIT_AMD_GPUS
 constexpr uint32_t kUuidSize = 38;                          // AMDSMI_GPU_UUID_SIZE
 constexpr uint32_t kNone32 = 0xFFFFFFFF;                    // what the package shows as N/A
+// What AMD's Python package shows as N/A where the library fills a field of the engine usage and
+// of the power info: 0xFFFF, whatever the field's width (amdsmi_get_gpu_activity, amdsmi_get_power_info).
+// The header says UINT32_MAX there, and the package, RDC and ROCm's own library all use 0xFFFF.
+constexpr uint32_t kNa16 = 0xFFFF;
 
 struct Version {  // amdsmi_version_t
   uint32_t major, minor, release;
@@ -383,7 +387,7 @@ AMDSMI_API int amdsmi_get_gpu_activity(void* h, EngineUsage* u) {
   std::memset(u, 0, sizeof *u);
   u->gfx_activity = s.utilization_gpu;
   u->umc_activity = s.utilization_mem;
-  u->mm_activity = kNone32;
+  u->mm_activity = kNa16;
   return kSuccess;
 }
 
@@ -526,6 +530,21 @@ struct PowerInfo {  // amdsmi_power_info_t
 };
 struct PowerCapInfo {  // amdsmi_power_cap_info_t
   uint64_t power_cap, default_power_cap, dpm_cap, min_power_cap, max_power_cap, reserved[3];
+};
+struct VramInfo {  // amdsmi_vram_info_t
+  int32_t vram_type;
+  char vram_vendor[256];
+  uint64_t vram_size;       // MB
+  uint32_t vram_bit_width;
+  uint64_t vram_max_bandwidth;   // GB/s
+  uint64_t reserved[37];
+};
+struct CacheInfo {  // amdsmi_gpu_cache_info_t
+  uint32_t num_cache_types;
+  struct {
+    uint32_t properties, size_kb, level, max_num_cu_shared, num_instance, reserved[3];
+  } cache[10];
+  uint32_t reserved[15];
 };
 struct ClkInfo {  // amdsmi_clk_info_t
   uint32_t clk, min_clk, max_clk;
@@ -687,7 +706,6 @@ uint32_t nbio(const Sample& d, const char* name) {
 
 // GT/s and MT/s of each PCIe generation, 1 to 6 (index 0 pads). Gen 1's 2.5 GT/s
 // rounds down in the GT/s the static info gives.
-constexpr uint32_t kGts[] = {0, 2, 5, 8, 16, 32, 64};
 constexpr uint32_t kMts[] = {0, 2500, 5000, 8000, 16000, 32000, 64000};
 
 }  // namespace
@@ -789,7 +807,9 @@ AMDSMI_API int amdsmi_get_pcie_info(void* h, PcieInfo* info) {
   const vgpu::ras::Counters c = ras_counters(s, false);
   using vgpu::ras::Pcie;
   info->pcie_static.max_pcie_width = static_cast<uint16_t>(s.pcie_width_max);
-  info->pcie_static.max_pcie_speed = kGts[std::min<uint32_t>(s.pcie_gen_max, 6)];
+  // In MT/s, as pcie_speed below is, and as the CLI reads it (it divides by 1000 to print GT/s), though
+  // the header's comment says GT/s.
+  info->pcie_static.max_pcie_speed = kMts[std::min<uint32_t>(s.pcie_gen_max, 6)];
   info->pcie_static.pcie_interface_version = s.pcie_gen_max;
   info->pcie_static.max_pcie_interface_version = s.pcie_gen_max;
   info->pcie_static.slot_type = instinct(s) ? 1 : 0;  // OAM boards (as oam_id says) or PCIe cards
@@ -850,20 +870,72 @@ AMDSMI_API int amdsmi_get_temp_metric(void* h, int type, int metric, int64_t* t)
 }
 
 // Watts. A CDNA3 or newer card gives its current socket power, the rest (Radeon,
-// MI200) an average, as the header's field comments say; the other is
-// UINT32_MAX. No SoC or memory voltage is modelled.
+// MI200) an average, as the header's field comments say; the other is 0xFFFF,
+// which is what the package (and RDC) read as N/A. No SoC or memory voltage is modelled.
 AMDSMI_API int amdsmi_get_power_info(void* h, PowerInfo* info) {
   GPU(h, s, info);
   std::memset(info, 0, sizeof *info);
   const uint32_t w = s.power_mw / 1000;
   const bool current = partitionable(s);
   info->socket_power = w;
-  info->current_socket_power = current ? w : kNone32;
-  info->average_socket_power = current ? kNone32 : w;
+  info->current_socket_power = current ? w : kNa16;
+  info->average_socket_power = current ? kNa16 : w;
   info->gfx_voltage = s.voltage_mv;
-  info->soc_voltage = kNone64;
-  info->mem_voltage = kNone64;
+  info->soc_voltage = kNa16;
+  info->mem_voltage = kNa16;
   info->power_limit = s.power_limit_mw / 1000;
+  return kSuccess;
+}
+// The memory type, size and width of the chip (include/vgpu/amd_chip.hpp), and the bandwidth its
+// clock gives: the data rate is the memory clock times 2 for HBM2e, 4 for HBM3 and 3E, 8 for GDDR6.
+// The vendor of the memory chips is not modelled: N/A.
+AMDSMI_API int amdsmi_get_gpu_vram_info(void* h, VramInfo* info) {
+  GPU(h, s, info);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  std::memset(info, 0, sizeof *info);
+  const std::string type = c.memory;
+  uint32_t rate = 8;
+  if (type == "HBM2E") { info->vram_type = 3; rate = 2; }
+  else if (type == "HBM3") { info->vram_type = 4; rate = 4; }
+  else if (type == "HBM3E") { info->vram_type = 5; rate = 4; }
+  else if (type == "GDDR6") info->vram_type = 22;
+  std::snprintf(info->vram_vendor, sizeof info->vram_vendor, "N/A");
+  info->vram_size = s.vram_total_bytes >> 20;
+  info->vram_bit_width = c.mem_bits;
+  info->vram_max_bandwidth = uint64_t{c.mem_bits} / 8 * c.mem_mhz * rate / 1000;
+  return kSuccess;
+}
+// The caches the chip table knows: the vector L1 of each compute unit, the L2 of each compute die, and
+// the last-level cache where there is one. Instruction and scalar caches are not modelled.
+AMDSMI_API int amdsmi_get_gpu_cache_info(void* h, CacheInfo* info) {
+  GPU(h, s, info);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  std::memset(info, 0, sizeof *info);
+  const uint32_t cus = s.multiprocessors * c.cus_per_mp;
+  const uint32_t kEnabled = 1, kData = 2;
+  uint32_t n = 0;
+  info->cache[n++] = {kEnabled | kData, c.l1_kb, 1, 1, cus, {}};
+  info->cache[n++] = {kEnabled | kData, c.l2_kb, 2, cus / std::max<uint32_t>(c.xccs, 1), std::max<uint32_t>(c.xccs, 1), {}};
+  if (c.l3_mb) info->cache[n++] = {kEnabled | kData, c.l3_mb * 1024, 3, cus, 1, {}};
+  info->num_cache_types = n;
+  return kSuccess;
+}
+// The one sensor power caps are kept for, PPT0 (the lower, filtered limit); the CLI asks for the
+// sensors before it asks each one's cap.
+AMDSMI_API int amdsmi_get_supported_power_cap(void* h, uint32_t* count, uint32_t* indices, uint32_t* types) {
+  GPU(h, s, count);
+  (void)s;
+  if (!indices || !types) return kInval;
+  *count = 1;
+  indices[0] = 0;
+  types[0] = 0;   // AMDSMI_POWER_CAP_TYPE_PPT0
+  return kSuccess;
+}
+// Power management is on, as the driver leaves it.
+AMDSMI_API int amdsmi_is_gpu_power_management_enabled(void* h, bool* enabled) {
+  GPU(h, s, enabled);
+  (void)s;
+  *enabled = true;
   return kSuccess;
 }
 // Microwatts. The minimum is 0 and no DPM cap is modelled, as in ROCm SMI's.

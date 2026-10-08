@@ -1,0 +1,99 @@
+# setup
+CB resource 5
+CB runtime cudaSetDevice ENTER device=0 corr=c0
+CB resource 1
+CB runtime cudaSetDevice EXIT ret=0 device=0 corr=c0
+CB runtime cudaFree ENTER corr=c1
+CB runtime cudaFree EXIT ret=0 corr=c1
+# callbacks
+CB runtime cudaStreamCreate ENTER corr=c2
+CB resource 3
+CB runtime cudaStreamCreate EXIT ret=0 corr=c2
+CB runtime cudaEventCreate ENTER corr=c3
+CB runtime cudaEventCreate EXIT ret=0 corr=c3
+CB runtime cudaMalloc ENTER size=2048 corr=c4
+CB runtime cudaMalloc EXIT ret=0 size=2048 corr=c4
+CB runtime cudaMalloc ENTER size=2048 corr=c5
+CB runtime cudaMalloc EXIT ret=0 size=2048 corr=c5
+CB runtime cudaHostAlloc ENTER size=2048 flags=0 corr=c6
+CB runtime cudaHostAlloc EXIT ret=0 size=2048 flags=0 corr=c6
+CB runtime cudaMemcpy ENTER count=2048 kind=1 corr=c7
+CB runtime cudaMemcpy EXIT ret=0 count=2048 kind=1 corr=c7
+CB runtime cudaMemcpyAsync ENTER count=2048 kind=1 corr=c8
+CB runtime cudaMemcpyAsync EXIT ret=0 count=2048 kind=1 corr=c8
+CB runtime cudaMemset ENTER value=0 count=64 corr=c9
+CB runtime cudaMemset EXIT ret=0 value=0 count=64 corr=c9
+CB runtime cudaMemsetAsync ENTER value=17 count=128 corr=c10
+CB runtime cudaMemsetAsync EXIT ret=0 value=17 count=128 corr=c10
+CB runtime cudaLaunchKernel ENTER grid=2x1x1 block=256x1x1 shared=0 symbol=_Z5scalePffi corr=c11
+CB runtime cudaLaunchKernel EXIT ret=0 grid=2x1x1 block=256x1x1 shared=0 symbol=_Z5scalePffi corr=c11
+CB runtime cudaLaunchKernel ENTER grid=4x1x1 block=128x1x1 shared=512 symbol=_Z13reverse_blockPfi corr=c12
+CB runtime cudaLaunchKernel EXIT ret=0 grid=4x1x1 block=128x1x1 shared=512 symbol=_Z13reverse_blockPfi corr=c12
+CB runtime cudaEventRecord ENTER corr=c13
+CB runtime cudaEventRecord EXIT ret=0 corr=c13
+CB runtime cudaStreamWaitEvent ENTER corr=c14
+CB runtime cudaStreamWaitEvent EXIT ret=0 corr=c14
+CB runtime cudaEventSynchronize ENTER corr=c15
+CB runtime cudaEventSynchronize EXIT ret=0 corr=c15
+CB runtime cudaStreamSynchronize ENTER corr=c16
+CB synchronize 1
+CB runtime cudaStreamSynchronize EXIT ret=0 corr=c16
+CB runtime cudaMemcpy ENTER count=2048 kind=3 corr=c17
+CB runtime cudaMemcpy EXIT ret=0 count=2048 kind=3 corr=c17
+CB runtime cudaMemcpy ENTER count=2048 kind=2 corr=c18
+CB runtime cudaMemcpy EXIT ret=0 count=2048 kind=2 corr=c18
+CB runtime cudaDeviceSynchronize ENTER corr=c19
+CB synchronize 2
+CB runtime cudaDeviceSynchronize EXIT ret=0 corr=c19
+CB runtime cudaEventDestroy ENTER corr=c20
+CB runtime cudaEventDestroy EXIT ret=0 corr=c20
+CB runtime cudaFreeHost ENTER corr=c21
+CB runtime cudaFreeHost EXIT ret=0 corr=c21
+CB runtime cudaFree ENTER corr=c22
+CB runtime cudaFree EXIT ret=0 corr=c22
+CB runtime cudaFree ENTER corr=c23
+CB runtime cudaFree EXIT ret=0 corr=c23
+CB runtime cudaStreamDestroy ENTER corr=c24
+CB resource 4
+CB runtime cudaStreamDestroy EXIT ret=0 corr=c24
+# resources
+REC device id=0 name=NVIDIA GeForce RTX 3060 cc=8.6 sms=28
+REC context device=0
+# activity
+REC stream flag=1 priority=0 corr=c2
+REC runtime cudaStreamCreate_v3020 corr=c2
+REC runtime cudaEventCreate_v3020 corr=c3
+REC runtime cudaMalloc_v3020 corr=c4
+REC runtime cudaMalloc_v3020 corr=c5
+REC runtime cudaHostAlloc_v3020 corr=c6
+REC memcpy kind=HtoD src=pageable dst=device bytes=2048 async=0 stream=s0 corr=c7
+REC runtime cudaMemcpy_v3020 corr=c7
+REC memcpy kind=HtoD src=pinned dst=device bytes=2048 async=1 stream=s1 corr=c8
+REC runtime cudaMemcpyAsync_v3020 corr=c8
+REC memset value=0 bytes=64 kind=device async=0 stream=s0 corr=c9
+REC runtime cudaMemset_v3020 corr=c9
+REC memset value=17 bytes=128 kind=device async=1 stream=s1 corr=c10
+REC runtime cudaMemsetAsync_v3020 corr=c10
+REC kernel name=_Z5scalePffi grid=2x1x1 block=256x1x1 dynShared=0 statShared=0 stream=s0 corr=c11
+REC runtime cudaLaunchKernel_v7000 corr=c11
+REC kernel name=_Z13reverse_blockPfi grid=4x1x1 block=128x1x1 dynShared=512 statShared=32 stream=s1 corr=c12
+REC runtime cudaLaunchKernel_v7000 corr=c12
+REC runtime cudaEventRecord_v3020 corr=c13
+REC sync type=2 stream=set corr=c14
+REC runtime cudaStreamWaitEvent_v3020 corr=c14
+REC sync type=1 stream=none corr=c15
+REC runtime cudaEventSynchronize_v3020 corr=c15
+REC sync type=3 stream=set corr=c16
+REC runtime cudaStreamSynchronize_v3020 corr=c16
+REC memcpy kind=DtoD src=device dst=device bytes=2048 async=0 stream=s0 corr=c17
+REC runtime cudaMemcpy_v3020 corr=c17
+REC memcpy kind=DtoH src=device dst=pageable bytes=2048 async=0 stream=s0 corr=c18
+REC runtime cudaMemcpy_v3020 corr=c18
+REC sync type=4 stream=none corr=c19
+REC runtime cudaDeviceSynchronize_v3020 corr=c19
+REC runtime cudaEventDestroy_v3020 corr=c20
+REC runtime cudaFreeHost_v3020 corr=c21
+REC runtime cudaFree_v3020 corr=c22
+REC runtime cudaFree_v3020 corr=c23
+REC runtime cudaStreamDestroy_v5050 corr=c24
+# end (0 records ending before they start)

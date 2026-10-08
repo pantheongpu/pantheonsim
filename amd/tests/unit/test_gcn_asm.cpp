@@ -265,6 +265,57 @@ VTEST(a_wave_that_waits_for_a_load_lets_the_waves_beside_it_read_lds_first) {
   VCHECK_EQ(wrong, 0);
 }
 
+VTEST(xf32_matrix_instructions_cut_a_floats_mantissa_to_ten_bits) {
+  // v_mfma_f32_16x16x8_xf32 and v_mfma_f32_32x32x4_xf32 take floats and multiply them with the
+  // mantissa truncated to 10 bits (the MI300 ISA guide, 7.1), accumulating into a float. Inputs are
+  // full-mantissa floats so the truncation shows; both forms put A[i][k] in item k % K_L of lane
+  // i + M * (k / K_L), B the same by column, and the output in the layout of any MFMA of that block.
+  const amd::CodeObject o = object("asm_xf32");
+  MemoryManager mem(16ull << 20);
+  std::vector<float> a(128), b(128);
+  uint32_t seed = 4242;
+  const auto next = [&]() -> float {
+    seed = seed * 1103515245u + 12345u;
+    return static_cast<float>(static_cast<int32_t>(seed >> 8) - (1 << 23)) / static_cast<float>(1 << 22);
+  };
+  for (auto* v : {&a, &b})
+    for (auto& x : *v) x = next();
+  const uint64_t ina = mem.alloc(128 * 4), inb = mem.alloc(128 * 4), out = mem.alloc(1280 * 4);
+  mem.write(ina, a.data(), 128 * 4);
+  mem.write(inb, b.data(), 128 * 4);
+  const std::vector<uint32_t> r = run(o, "xf32", mem, out, 1280, {ina, inb, out});
+  const auto trunc = [](float x) {
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    bits &= ~0x1FFFu;
+    std::memcpy(&x, &bits, 4);
+    return static_cast<double>(x);
+  };
+  int wrong = 0, differs_from_full = 0;
+  struct Form { uint32_t m, regs, base; };
+  for (const Form f : {Form{16, 4, 0}, Form{32, 16, 256}}) {
+    const uint32_t m = f.m, k_total = f.m == 16 ? 8 : 4, k_l = k_total / (64 / m);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+      for (uint32_t reg = 0; reg < f.regs; ++reg) {
+        const uint32_t row = m == 16 ? 4 * (lane / 16) + reg : 8 * (reg / 4) + 4 * (lane / 32) + reg % 4;
+        const uint32_t col = lane % m;
+        double sum = 0, full = 0;
+        for (uint32_t k = 0; k < k_total; ++k) {
+          const float av = a[(row + m * (k / k_l)) * 2 + k % k_l], bv = b[(col + m * (k / k_l)) * 2 + k % k_l];
+          sum += trunc(av) * trunc(bv);
+          full += static_cast<double>(av) * static_cast<double>(bv);
+        }
+        const float want = static_cast<float>(sum);
+        uint32_t want_bits;
+        std::memcpy(&want_bits, &want, 4);
+        wrong += r[f.base + lane * f.regs + reg] != want_bits;
+        differs_from_full += static_cast<float>(full) != want;
+      }
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK(differs_from_full > 200);   // the cut mantissa changes most results
+}
+
 VTEST(global_loads_into_lds_land_where_m0_the_offset_and_the_lane_say) {
   const amd::CodeObject o = object("asm_lds_dma", "gfx950");
   MemoryManager mem(16ull << 20);

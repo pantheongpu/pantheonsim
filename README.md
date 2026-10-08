@@ -25,6 +25,7 @@ standard runners.
   More at [pantheonsim.com/ci](https://pantheonsim.com/ci/).
 - **Run it on your own machine.** [Build it](#build--test) (C++20, no
   dependencies), then `vgpu run ./your_program`.
+  Or [pull it as a container image](docs/docker.md).
 
 PantheonSim checks what your code does, not how fast it runs: there is no
 performance model, and a run on physical GPUs before a release is still the
@@ -57,7 +58,7 @@ Working today, all CPU-only:
 | Discovery | live telemetry + NVML; drop-in `nvidia-smi`, `rocm-smi`, `amd-smi`, `rocm_agent_enumerator`, and `lspci` output — see [docs/telemetry.md](docs/telemetry.md) |
 | Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log; AMD MMIO (engine status, the SMU mailbox) from the amdgpu headers; a C API, `vgpu_regs.h` — see [docs/registers.md](docs/registers.md) |
 | AMD | unmodified hipcc-built programs, from ROCm 6.4, 7.0, 7.1 or 7.2, run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly. So does rocBLAS: AMD's own quick tests pass (162,807 float and double ones, and the half, bfloat16, int8 and FP8 GEMMs run) — see [amd/README.md](amd/README.md) |
-| Profiling | CUPTI's Activity API under its real soname: kernels, copies and runtime API calls, correlated; unmodified nvprof traces a program on the T4 profile. `vgpu ncu` is this project's own `ncu`; Nsight Systems and Nsight Compute as NVIDIA ships them are not supported (`nsys` collects no CUDA data). See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
+| Profiling | CUPTI under its real soname: the Activity API (kernels, copies, fills, waits, streams, devices and runtime API calls, correlated) and the Callback API (runtime, resource and synchronize domains), checked against the trace NVIDIA's CUPTI prints on an RTX 3060; unmodified nvprof traces a program on the T4 profile. `vgpu ncu` is this project's own `ncu`; Nsight Systems and Nsight Compute as NVIDIA ships them are not supported (`nsys` collects no CUDA data). See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
 | NVENC | `libnvidia-encode.so.1` with a deterministic content-derived encoder, so video-encode SDC tests run |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
