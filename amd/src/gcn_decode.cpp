@@ -978,8 +978,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x75}, {"v_mfma_f32_32x32x16_bf8_fp8", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x76}, {"v_mfma_f32_32x32x16_fp8_bf8", 16, 3, 2, 2, 16}},
       {{Enc::Vop3p, 0x77}, {"v_mfma_f32_32x32x16_fp8_fp8", 16, 3, 2, 2, 16}},
-      // The reduced-precision float forms decode, and are refused where they
-      // run: what a card rounds their inputs to is not modelled.
+      // The reduced-precision float forms: a float's mantissa cut to 10 bits (see gcn_exec.cpp).
       {{Enc::Vop3p, 0x3e}, {"v_mfma_f32_16x16x8_xf32", 4, 3, 2, 2, 4}},
       {{Enc::Vop3p, 0x3f}, {"v_mfma_f32_32x32x4_xf32", 16, 3, 2, 2, 16}},
       // The sparse matrix instructions: A 2:4 sparse along K, its non-zero
