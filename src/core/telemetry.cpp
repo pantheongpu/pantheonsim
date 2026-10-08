@@ -294,6 +294,7 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
   // The framebuffer, as nvidia-smi and NVML report it -- not totalGlobalMem,
   // which is what CUDA reports and is a few hundred MiB smaller on real cards.
   d->vram_total_bytes = p.vram_bytes + p.telemetry.framebuffer_reserve_bytes;
+  d->vram_reserved_bytes = p.telemetry.framebuffer_reserve_bytes;
   d->vram_used_bytes = 0;
   d->power_limit_mw = p.telemetry.power_limit_w * 1000;
   d->temperature_max_c = p.telemetry.temperature_max_c;
