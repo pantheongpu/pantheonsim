@@ -477,7 +477,13 @@ Session build_session(const Config& c, const vgpu::DeviceProfile& p) {
   // The AMD kernel driver's topology, which tools read to find AMD GPUs
   // without a runtime (vgpu/amd_kfd.hpp).
   if (!nvidia) {
-    const std::string topology = s.root + "/sys/class/kfd/kfd/topology/";
+    // The driver's directory is /sys/devices/virtual/kfd/kfd and /sys/class/kfd/kfd
+    // a link to it, which is how offload-arch (amdgpu-arch) reads it: by the
+    // real path, not through the class.
+    const std::string topology = s.root + "/sys/devices/virtual/kfd/kfd/topology/";
+    make_dirs(s.root + "/sys/class/kfd");
+    std::error_code link_ec;
+    std::filesystem::create_symlink("../../devices/virtual/kfd/kfd", s.root + "/sys/class/kfd/kfd", link_ec);
     const long pages = ::sysconf(_SC_PHYS_PAGES), page = ::sysconf(_SC_PAGE_SIZE);
     const uint64_t memory = pages > 0 && page > 0 ? uint64_t(pages) * uint64_t(page) : 0;
     for (const auto& f : vgpu::amd::kfd_topology(p, c.count, std::max(1u, std::thread::hardware_concurrency()), memory)) {
@@ -1076,6 +1082,7 @@ int cmd_shell(const std::vector<std::string>& args) {
         // KFD's topology, the session's in place of any the host has, beside
         // the session's drm and hwmon classes (bound above, and staged here too).
         overlay("/sys/class", s.root + "/sys/class");
+        overlay("/sys/devices/virtual", s.root + "/sys/devices/virtual");
         // /dev/kfd and /dev/dri/{card,renderD}N, opening as /dev/null does: a
         // program that looks for them finds an AMD machine; one that asks the
         // kernel driver something (an ioctl) is refused, as a machine without
