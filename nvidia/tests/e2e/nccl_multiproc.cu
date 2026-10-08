@@ -12,7 +12,8 @@
 // sub-groups: ncclCommSplit (one color per parity, keys reversed), a
 // non-blocking child, a pre-multiplied sum with a device scalar, an all-to-all,
 // and ncclCommShrink without the last rank -- the last rank does not call it,
-// as NCCL requires. Each part works in this process alone and must still agree
+// as NCCL requires -- and then ncclCommGetUniqueId + ncclCommGrow bringing the
+// last rank back in. Each part works in this process alone and must still agree
 // with every other process's.
 #include <nccl.h>
 #include <cuda_runtime.h>
@@ -208,6 +209,61 @@ int main(int argc, char** argv) {
     if (got != nranks - 1) { ++bad; std::fprintf(stderr, "rank %d: shrunk allreduce %d\n", rank, got); }
     cudaFree(v);
     NK(ncclCommDestroy(small));
+  }
+#endif
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+  if (version >= NCCL_VERSION(2, 29, 0) && nranks > 1) {
+    // Grow the survivors of a shrink back to full size: the last rank, which
+    // left, comes back as a new rank. The root of the survivors hands the id
+    // over through a file, as a launcher would; the other survivors pass NULL.
+    const std::string gidfile = idfile + ".grow";
+    ncclComm_t big = nullptr;
+    if (rank != nranks - 1) {
+      int gone[1] = {nranks - 1};
+      ncclComm_t small = nullptr;
+      NK(ncclCommShrink(comm, gone, 1, &small, nullptr, NCCL_SHRINK_DEFAULT));
+      ncclUniqueId gid;
+      if (rank == 0) {
+        NK(ncclCommGetUniqueId(small, &gid));
+        const std::string tmp = gidfile + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) return 2;
+        std::fwrite(&gid, sizeof(gid), 1, f);
+        std::fclose(f);
+        std::rename(tmp.c_str(), gidfile.c_str());
+      }
+      NK(ncclCommGrow(small, nranks, rank == 0 ? &gid : nullptr, -1, &big, nullptr));
+      NK(ncclCommDestroy(small));
+    } else {
+      ncclUniqueId gid;
+      for (int i = 0; i < 60000; ++i) {
+        FILE* f = std::fopen(gidfile.c_str(), "rb");
+        if (f) {
+          const bool ok = std::fread(&gid, sizeof(gid), 1, f) == 1;
+          std::fclose(f);
+          if (ok) break;
+        }
+        usleep(1000);
+      }
+      usleep(1000000);   // NCCL wants the survivors to start before a new rank joins
+      NK(ncclCommGrow(nullptr, nranks, &gid, nranks - 1, &big, nullptr));
+    }
+    int bn = -1, br = -1;
+    NK(ncclCommCount(big, &bn));
+    NK(ncclCommUserRank(big, &br));
+    if (bn != nranks || br != rank) { ++bad; std::fprintf(stderr, "rank %d: grow gave %d/%d\n", rank, br, bn); }
+    int* v = nullptr;
+    cudaMalloc(&v, sizeof(int));
+    const int mine = rank + 1;
+    cudaMemcpy(v, &mine, sizeof(int), cudaMemcpyHostToDevice);
+    NK(ncclAllReduce(v, v, 1, ncclInt32, ncclSum, big, s));
+    cudaStreamSynchronize(s);
+    int got = -1;
+    cudaMemcpy(&got, v, sizeof(int), cudaMemcpyDeviceToHost);
+    if (got != nranks * (nranks + 1) / 2) { ++bad; std::fprintf(stderr, "rank %d: grown allreduce %d\n", rank, got); }
+    cudaFree(v);
+    NK(ncclCommDestroy(big));
   }
 #endif
 
