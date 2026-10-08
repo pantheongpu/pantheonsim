@@ -1,0 +1,48 @@
+name: PyTorch sweep nightly
+
+# The whole PyTorch sweep (nvidia/tests/pytorch/sweep.py) and the full
+# torch.distributed set (nvidia/tests/pytorch/dist.py) on a simulated NVIDIA
+# GPU. The time-bounded quick tier of both runs in every ci.yml `ml` job
+# (e2e_pytorch_sweep, e2e_pytorch_dist); this adds the checks that take longer
+# (torch.compile's templates, flex_attention, FSDP, every dtype of every
+# backend) and, because the runner's image has no torchvision, torchaudio or
+# transformers, installs them first so those groups run too.
+# Run it by hand with `gh workflow run pytorch-sweep-nightly.yml --ref <branch>`;
+# `tests` narrows it to a ctest regular expression.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "ctest regular expression (the full sweep and the full distributed set if empty)"
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    name: PyTorch sweep, full tier, on the pantheonsim.com runner
+    # The same runner as ci.yml's ml job (PyTorch for CUDA 13 in its image);
+    # where ML_RUNS_ON is unset the job does not run.
+    if: vars.ML_RUNS_ON != ''
+    runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - name: The full sweep
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure -R "${TESTS:-^e2e_pytorch_(sweep_full|dist_full)$}" 2>&1 | tee sweep.log
+          # A skip is the runner's image losing PyTorch: here that is a failure.
+          if grep -E '\*\*\*Skipped|Not Run' sweep.log; then echo "::error::a sweep test skipped"; exit 1; fi

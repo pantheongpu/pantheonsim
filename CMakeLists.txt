@@ -2437,6 +2437,43 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  # The PyTorch sweep (nvidia/tests/pytorch/sweep.py): nn layers and losses forward
+  # and backward, optimizers, torch.linalg / fft / sparse, AMP, CUDA graphs,
+  # torch.compile, every SDPA backend forced in turn, two devices in one process,
+  # and (where installed) torchvision, torchaudio and tiny Hugging Face models,
+  # each against the CPU. The quick tier is the time-bounded subset every ml job
+  # runs; the full tier (nightly workflow pytorch-sweep-nightly.yml, or
+  # ml_tests='e2e_pytorch_sweep_full' by hand) adds the rest.
+  add_test(NAME e2e_pytorch_sweep COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh quick nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_sweep PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 3600)
+  add_test(NAME e2e_pytorch_sweep_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh full nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_sweep_full PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SWEEP_PIP=1"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 14400)
+  # torch.distributed's NCCL backend across two processes, each its own simulated
+  # GPU: collectives in several dtypes, point to point, DDP training.
+  add_test(NAME e2e_pytorch_dist COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_dist.sh 17 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_dist PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpunccl"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  add_test(NAME e2e_pytorch_dist_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_dist.sh 29 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_dist_full PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpunccl"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SWEEP_TIER=full"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 3600)
   # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
   # handle -- the paths PyTorch's CUDA build takes -- against host references.
   add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
