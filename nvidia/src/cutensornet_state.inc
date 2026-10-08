@@ -2413,7 +2413,7 @@ cutensornetStatus_t cutensornetStateCompute(const cutensornetHandle_t handle, cu
   const int ntensors = s->mps_finalized ? s->n : 1;
   for (int i = 0; i < ntensors; ++i)
     if (!stateTensorsOut[i]) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "an output tensor has no memory");
-  if (Status st = check_scratch(w, 0, api)) return st;
+  // measured: unlike the properties, a state that is not prepared is refused before its scratch
   if (!s->prepared || s->prepared_epoch != s->epoch)
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api,
                 s->mps_finalized ? "MPS factorization is outdated due to new changes to the tensor circuit!"
