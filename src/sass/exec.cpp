@@ -276,6 +276,7 @@ class Runner {
 
   // ---- per-block ----
   void run_block(Block& blk);
+  bool break_warpsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
@@ -909,6 +910,62 @@ exec::LaunchStats Runner::run() {
   return stats_;
 }
 
+// A WARPSYNC waits for every lane its mask names, and a BSYNC waits for every lane of its barrier. A
+// warp can hold both at once: lane 0 alone in an `if (i < n)` block calls __syncthreads(), which ptxas
+// compiles to WARPSYNC 0xffffffff; BAR.SYNC, while lanes 1 to 31 skip the block and park at the BSYNC
+// that closes it, waiting for lane 0. Each waits for the other. An RTX 3080 Ti runs this (CUB's for_each
+// does it in the last tile, and cupoch's kd-tree builder inside it), so when nothing can move the
+// WARPSYNC lanes whose absent partners are all parked at a BSYNC go on; the rest of the warp follows
+// when they reach the BSYNC.
+bool Runner::break_warpsync_standoff(Block& blk) {
+  bool any = false;
+  for (Warp& w : blk.warps) {
+    Mask ws = 0, bs = 0;
+    for (unsigned l = 0; l < 32; ++l) {
+      if (!((w.waiting >> l) & 1)) continue;
+      if (w.wait_kind[l] == Wait::WarpSync) ws |= Mask{1} << l;
+      else if (w.wait_kind[l] == Wait::BSync) bs |= Mask{1} << l;
+    }
+    if (!ws || !bs) continue;
+    for (unsigned l = 0; l < 32; ++l) {
+      if (!((ws >> l) & 1)) continue;
+      const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
+      if ((need & ~ws & ~bs) != 0) continue;   // a named lane is neither at a WARPSYNC nor parked at a BSYNC
+      w.waiting &= ~(Mask{1} << l);
+      w.wait_kind[l] = Wait::None;
+      w.pc[l] += 16;
+      any = true;
+    }
+  }
+  // The block barrier the lanes go on to counts live lanes, and the ones parked at the BSYNC cannot
+  // arrive until the others have gone past it. The hardware counts the warp as arrived, so when nothing
+  // can move, a barrier that every other live lane has reached is complete.
+  for (Block::Barrier& b : blk.bars) {
+    if (!b.arrived || b.expected) continue;
+    uint32_t live = 0;
+    for (const Warp& w : blk.warps) {
+      Mask parked = 0;
+      for (unsigned l = 0; l < 32; ++l)
+        if (((w.waiting >> l) & 1) && w.wait_kind[l] == Wait::BSync) parked |= Mask{1} << l;
+      live += static_cast<uint32_t>(std::popcount(w.alive & ~w.exited & ~parked));
+    }
+    if (b.arrived < live) continue;
+    for (Warp& w : blk.warps) {
+      for (unsigned l = 0; l < 32; ++l)
+        if (((w.waiting >> l) & 1) && w.wait_kind[l] == Wait::Bar) {
+          w.waiting &= ~(Mask{1} << l);
+          w.wait_kind[l] = Wait::None;
+          w.pc[l] += 16;
+        }
+      w.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
+      w.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
+    }
+    b = Block::Barrier{};
+    any = true;
+  }
+  return any;
+}
+
 void Runner::run_block(Block& blk) {
   // Warps take turns: each runs until it waits, exits, or has had a turn of
   // a few thousand instructions, so warps that spin on one another all move.
@@ -926,6 +983,7 @@ void Runner::run_block(Block& blk) {
       w.yield = false;
     }
     if (!live) return;
+    if (!progress && break_warpsync_standoff(blk)) continue;
     if (!progress)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of block (" + std::to_string(blk.ctaid[0]) +
                                     ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
@@ -967,6 +1025,11 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
         w.yield = false;
       }
     if (!live) break;
+    if (!progress) {
+      bool broke = false;
+      for (Block& blk : blocks) broke = break_warpsync_standoff(blk) || broke;
+      if (broke) continue;
+    }
     if (!progress)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of cluster " + std::to_string(k) +
                                     " is waiting (a barrier some threads never reach)");
