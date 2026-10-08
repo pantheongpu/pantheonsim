@@ -1,9 +1,10 @@
-// The NCCL 2.29+ entry points the simulator does not implement are still
-// exported: PyTorch for CUDA 13 (2.14, built against NCCL 2.30) binds
-// libtorch_cuda to every one of them at load time, so a library without them
-// fails `import torch` with "undefined symbol: ncclCommResume". Each one must
-// exist under its real name, and must say it is unsupported when called,
-// never succeed quietly.
+// The NCCL 2.28+ entry points are exported under their real names: PyTorch for
+// CUDA 13 (2.14, built against NCCL 2.30) binds libtorch_cuda to every one of
+// them at load time, so a library without them fails `import torch` with
+// "undefined symbol: ncclCommResume". They are implemented now (see the
+// nccl_comm_ops e2e program for their behaviour on live communicators); this
+// unit test pins the names and the answer to a NULL communicator or window,
+// which needs no transport.
 #include <dlfcn.h>
 
 #include <cstdint>
@@ -38,25 +39,22 @@ VTEST(every_symbol_libtorch_cuda_binds_is_exported) {
   }
 }
 
-VTEST(each_one_answers_not_supported_when_called) {
+VTEST(a_null_communicator_or_window_is_an_invalid_argument) {
   ncclComm_t comm = nullptr;
   ncclUniqueId id{};
-  ncclComm_t out = nullptr;
   uint64_t value = 0;
   void* ptr = nullptr;
-  VCHECK_EQ(ncclCommRevoke(comm, 0), ncclInvalidUsage);
-  VCHECK_EQ(ncclCommGetUniqueId(comm, &id), ncclInvalidUsage);
-  VCHECK_EQ(ncclCommGrow(comm, 2, &id, 0, &out, nullptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclCommSuspend(comm, 0), ncclInvalidUsage);
-  VCHECK_EQ(ncclCommResume(comm), ncclInvalidUsage);
-  VCHECK_EQ(ncclCommMemStats(comm, static_cast<ncclCommMemStat_t>(0), &value), ncclInvalidUsage);
-  VCHECK_EQ(ncclSignal(0, 0, 0, 0, comm, nullptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclWaitSignal(0, nullptr, comm, nullptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclPutSignal(nullptr, 0, ncclFloat32, 0, nullptr, 0, 0, 0, 0, comm, nullptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclDevCommCreate(comm, nullptr, nullptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclDevCommDestroy(comm, nullptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclGetLsaMultimemDevicePointer(nullptr, 0, &ptr), ncclInvalidUsage);
-  VCHECK_EQ(ncclGetPeerDevicePointer(nullptr, 0, 0, &ptr), ncclInvalidUsage);
+  VCHECK_EQ(ncclCommGetUniqueId(comm, &id), ncclInvalidArgument);
+  VCHECK_EQ(ncclCommSuspend(comm, 0), ncclInvalidArgument);
+  VCHECK_EQ(ncclCommResume(comm), ncclInvalidArgument);
+  VCHECK_EQ(ncclCommMemStats(comm, static_cast<ncclCommMemStat_t>(0), &value), ncclInvalidArgument);
+  VCHECK_EQ(ncclSignal(0, 0, 0, 0, comm, nullptr), ncclInvalidArgument);
+  VCHECK_EQ(ncclWaitSignal(0, nullptr, comm, nullptr), ncclInvalidArgument);
+  VCHECK_EQ(ncclPutSignal(nullptr, 0, ncclFloat32, 0, nullptr, 0, 0, 0, 0, comm, nullptr), ncclInvalidArgument);
+  VCHECK_EQ(ncclDevCommCreate(comm, nullptr, nullptr), ncclInvalidArgument);
+  VCHECK_EQ(ncclDevCommDestroy(comm, nullptr), ncclInvalidArgument);
+  VCHECK_EQ(ncclGetLsaMultimemDevicePointer(nullptr, 0, &ptr), ncclInvalidArgument);
+  VCHECK_EQ(ncclGetPeerDevicePointer(nullptr, 0, 0, &ptr), ncclInvalidArgument);
 }
 
 VTEST_MAIN

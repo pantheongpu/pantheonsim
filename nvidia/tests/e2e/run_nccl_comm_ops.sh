@@ -18,7 +18,7 @@ command -v nvcc >/dev/null || { echo "SKIP: nvcc not found"; exit 0; }
 
 mkdir -p "$out"
 trap 'rm -rf "$out"' EXIT
-nvcc -std=c++14 -arch=sm_86 -Wno-deprecated-gpu-targets -cudart shared \
+nvcc -std=c++17 -arch=sm_86 -Wno-deprecated-gpu-targets -cudart shared \
      $(shim_sanitizer_nvcc_flags "$shim") \
      -I"$root/nvidia/third_party/nccl_include" "$root/nvidia/tests/e2e/nccl_comm_ops.cu" \
      -L"$shim" -lnccl -o "$out/ops" || { echo "FAIL: compile"; exit 1; }
