@@ -44,3 +44,4 @@ telemetry:
   memory: hbm                  # rows are remapped on failure
   memory_temperature: false    # most real runs report no memory sensor
   pcie_link: "Gen5 x16"        # most common link on real cards (864 runs in the benchmark database)
+  nvlink: "NVLink4 x18"        # data sheet: SXM part, NVLink generation 4, 18 links

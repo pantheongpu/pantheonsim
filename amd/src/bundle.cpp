@@ -143,7 +143,8 @@ Compressed compressed(const uint8_t* b) {
   }
   if (total < header) throw Error::make(Err::InvalidValue, "a compressed offload bundle shorter than its header");
   if (c.method > 1)
-    throw Error::make(Err::Unsupported, "a compressed offload bundle whose method (", c.method, ") is not zlib or zstd");
+    throw Error::make(Err::Unsupported, "a compressed offload bundle whose method (", c.method,
+                      ") is not zlib (0) or zstd (1), the two methods clang's offload bundler defines");
   c.data = b + header;
   c.size = total - header;
   return c;

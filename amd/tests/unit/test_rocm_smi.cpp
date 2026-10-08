@@ -10,8 +10,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "vtest.hpp"
 
@@ -39,14 +43,29 @@ int rsmi_dev_compute_partition_get(uint32_t, char*, uint32_t);
 int rsmi_dev_memory_partition_get(uint32_t, char*, uint32_t);
 int rsmi_dev_fan_speed_get(uint32_t, uint32_t, int64_t*);
 int rsmi_dev_vbios_version_get(uint32_t, char*, uint32_t);
+int rsmi_dev_memory_reserved_pages_get(uint32_t, uint32_t*, void*);
 int rsmi_dev_perf_level_set(uint32_t, int);
 int rsmi_dev_gpu_metrics_info_get(uint32_t, void*);
+int rsmi_dev_metrics_header_info_get(uint32_t, void*);
+int rsmi_dev_metrics_xcd_counter_get(uint32_t, uint16_t*);
+int rsmi_dev_drm_render_minor_get(uint32_t, uint32_t*);
+int rsmi_dev_xgmi_hive_id_get(uint32_t, uint64_t*);
+int rsmi_dev_pcie_slot_type_get(uint32_t, int*);
+int rsmi_dev_sku_get(uint32_t, uint16_t*);
+int rsmi_dev_xgmi_physical_id_get(uint32_t, uint16_t*);
+int rsmi_driver_status(void*);
+int amdsmi_get_gpu_metrics_info(void*, void*);
 struct Frequencies {
   bool has_deep_sleep;
   uint32_t num_supported, current;
   uint64_t frequency[33];
 };
 int rsmi_dev_gpu_clk_freq_get(uint32_t, int, Frequencies*);
+int rsmi_dev_energy_count_get(uint32_t, uint64_t*, float*, uint64_t*);
+int amdsmi_init(uint64_t);
+int amdsmi_get_socket_handles(uint32_t*, void**);
+int amdsmi_get_processor_handles(void*, uint32_t*, void**);
+int amdsmi_get_energy_count(void*, uint64_t*, float*, uint64_t*);
 }
 
 namespace {
@@ -179,18 +198,158 @@ VTEST(ecc_and_partitions_as_the_card_has_them) {
   VCHECK_EQ(rsmi_dev_ecc_enabled_get(0, &mask), kSuccess);
   VCHECK(rx ? mask == 0 : (mask & 1) != 0);   // the UMC block's bit
   char part[16] = {};
+  // Retired pages are recorded only where there is ECC (the Radeon profiles have none).
+  uint32_t pages = 0;
+  VCHECK_EQ(rsmi_dev_memory_reserved_pages_get(0, &pages, nullptr), rx ? kNotSupported : kSuccess);
   VCHECK_EQ(rsmi_dev_compute_partition_get(0, part, sizeof part), rx ? kNotSupported : kSuccess);
   if (!rx) VCHECK_EQ(std::string(part), std::string("SPX"));
   VCHECK_EQ(rsmi_dev_memory_partition_get(0, part, sizeof part), rx ? kNotSupported : kSuccess);
   if (!rx) VCHECK_EQ(std::string(part), std::string("NPS1"));
 }
 
+// The energy accumulator: Instinct only, in ticks of 15.3 uJ, one accumulator
+// behind this library and AMD SMI's, so the second reading of either follows
+// the first of the other.
+VTEST(energy_is_instinct_only_and_one_counter_serves_both_libraries) {
+  rsmi_init(0);
+  amdsmi_init(2);
+  uint32_t ns = 8;
+  void* sockets[8];
+  VCHECK_EQ(amdsmi_get_socket_handles(&ns, sockets), kSuccess);
+  uint64_t e0 = 0, ts0 = 0, e1 = 0, ts1 = 0, e2 = 0, ts2 = 0;
+  float res = 0;
+  if (radeon()) {
+    VCHECK_EQ(rsmi_dev_energy_count_get(0, &e0, &res, &ts0), kNotSupported);
+    return;
+  }
+  VCHECK_EQ(rsmi_dev_energy_count_get(0, &e0, &res, &ts0), kSuccess);
+  VCHECK(res > 15.0f && res < 15.5f);
+  VCHECK(e0 > 0 && ts0 > 0);
+  uint32_t np = 1;
+  void* gpu = nullptr;
+  VCHECK_EQ(amdsmi_get_processor_handles(sockets[0], &np, &gpu), kSuccess);
+  usleep(20000);
+  VCHECK_EQ(amdsmi_get_energy_count(gpu, &e1, &res, &ts1), kSuccess);
+  VCHECK(e1 > e0 && ts1 > ts0);
+  usleep(20000);
+  VCHECK_EQ(rsmi_dev_energy_count_get(0, &e2, &res, &ts2), kSuccess);
+  VCHECK(e2 > e1 && ts2 > ts1);
+  // 20 ms of at most a few kW is a few tens of joules: the ticks that follow
+  // are a few million, not a counter restarted from its offset.
+  VCHECK(e2 - e0 < 100 * 1000000 / 15);
+  VCHECK_EQ(rsmi_dev_energy_count_get(0, nullptr, &res, &ts0), 1);   // invalid arguments
+  VCHECK_EQ(rsmi_dev_energy_count_get(99, &e0, &res, &ts0), kOutOfBounds);
+}
+
 VTEST(what_is_not_modelled_is_refused_as_a_card_refuses_it) {
   char buf[64];
   VCHECK_EQ(rsmi_dev_vbios_version_get(0, buf, sizeof buf), kNotSupported);
-  VCHECK_EQ(rsmi_dev_gpu_metrics_info_get(0, buf), kNotSupported);
   VCHECK_EQ(rsmi_dev_perf_level_set(0, 2), kNotSupported);
   VCHECK_EQ(rsmi_dev_perf_level_set(5, 2), kOutOfBounds);
+}
+
+// rsmi_gpu_metrics_t (4544 bytes in ROCm 7.2.0), read at the offsets compiled
+// from that release's rocm_smi.h: the same table, copied across in the same
+// way, as amdsmi_gpu_metrics_t.
+VTEST(gpu_metrics_are_the_v1_5_table_in_rocm_smis_structure) {
+  VCHECK_EQ(rsmi_init(0), kSuccess);
+  std::vector<unsigned char> m(4544, 0);
+  const auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, &m[o], 2); return v; };
+  const auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, &m[o], 4); return v; };
+  const auto u64 = [&](size_t o) { uint64_t v; std::memcpy(&v, &m[o], 8); return v; };
+  for (uint32_t d = 0; d < 2; ++d) {
+    VCHECK_EQ(rsmi_dev_gpu_metrics_info_get(d, m.data()), kSuccess);
+    VCHECK_EQ(u16(0), 360u);                      // the table's size
+    VCHECK_EQ(m[2], 1);                           // format revision
+    VCHECK_EQ(m[3], 5);                           // content revision
+    VCHECK_EQ(u16(4), 0xFFFFu);                   // temperature_edge: not in the table
+    VCHECK(u16(6) > 0 && u16(6) < 150);           // temperature_hotspot
+    VCHECK(u16(120) > 0);                         // current_socket_power
+    VCHECK_EQ(u16(22), 0xFFFFu);                  // average_socket_power: not in v1.5
+    VCHECK_EQ(u16(54), u16(312));                 // current_gfxclk is current_gfxclks[0]
+    VCHECK(u16(312) > 0 && u16(58) > 0);          // the graphics and memory clocks
+    VCHECK_EQ(u32(132), 0u);                      // gfxclk_lock_status
+    VCHECK(u64(32) > 0);                          // system_clock_counter
+    VCHECK_EQ(u64(4520), ~uint64_t{0});           // vram_max_bandwidth: v1.7, not in the table
+    VCHECK_EQ(u16(4528), 0xFFFFu);                // xgmi_link_status[0]
+    VCHECK_EQ(u64(184), 0u);                      // xgmi_read_data_acc[0]
+    // The accumulator: Instinct only, the one rsmi_dev_energy_count_get counts.
+    if (radeon()) {
+      VCHECK_EQ(u64(24), ~uint64_t{0});
+    } else {
+      uint64_t e = 0, ts = 0;
+      float res = 0;
+      VCHECK(u64(24) > 0 && u64(24) != ~uint64_t{0});
+      VCHECK_EQ(rsmi_dev_energy_count_get(d, &e, &res, &ts), kSuccess);
+      VCHECK(e >= u64(24) && e - u64(24) < 1000000);
+    }
+    unsigned char header[4] = {};
+    VCHECK_EQ(rsmi_dev_metrics_header_info_get(d, header), kSuccess);
+    VCHECK(header[0] == 104 && header[1] == 1 && header[2] == 1 && header[3] == 5);   // 360 = 0x168
+  }
+  VCHECK_EQ(rsmi_dev_gpu_metrics_info_get(0, nullptr), 1);          // invalid arguments
+  VCHECK_EQ(rsmi_dev_gpu_metrics_info_get(9, m.data()), kOutOfBounds);
+  VCHECK_EQ(rsmi_dev_metrics_header_info_get(0, nullptr), 1);
+  VCHECK_EQ(rsmi_dev_metrics_header_info_get(9, m.data()), kOutOfBounds);
+  // The XCD counter has no documented source here: refused.
+  uint16_t xcd = 0;
+  VCHECK_EQ(rsmi_dev_metrics_xcd_counter_get(0, &xcd), kNotSupported);
+}
+
+// Every field both libraries copy is the same in the two structures: the
+// libraries answer one question.
+VTEST(rocm_smi_and_amd_smi_agree_on_the_metrics_table) {
+  VCHECK_EQ(amdsmi_init(2), kSuccess);
+  uint32_t sockets = 0;
+  VCHECK_EQ(amdsmi_get_socket_handles(&sockets, nullptr), kSuccess);
+  std::vector<void*> sock(sockets);
+  VCHECK_EQ(amdsmi_get_socket_handles(&sockets, sock.data()), kSuccess);
+  uint32_t n = 1;
+  void* gpu = nullptr;
+  VCHECK_EQ(amdsmi_get_processor_handles(sock[0], &n, &gpu), kSuccess);
+  std::vector<unsigned char> a(4544, 0), r(4544, 0);
+  VCHECK_EQ(amdsmi_get_gpu_metrics_info(gpu, a.data()), kSuccess);
+  VCHECK_EQ(rsmi_dev_gpu_metrics_info_get(0, r.data()), kSuccess);
+  // Byte for byte but for what moves between two calls: the clocks of the
+  // system and firmware, and the energy counter (offsets 24, 32 and 96).
+  for (size_t i = 0; i < a.size(); ++i) {
+    if ((i >= 24 && i < 40) || (i >= 96 && i < 104)) continue;
+    if (a[i] != r[i]) {
+      std::fprintf(stderr, "metrics differ at byte %zu: %u and %u\n", i, a[i], r[i]);
+      VCHECK(false);
+      break;
+    }
+  }
+}
+
+VTEST(the_identity_queries_the_header_has_answer_from_the_machine) {
+  for (uint32_t d = 0; d < 2; ++d) {
+    uint32_t minor = 0;
+    VCHECK_EQ(rsmi_dev_drm_render_minor_get(d, &minor), kSuccess);
+    VCHECK_EQ(minor, 128u + d);
+    int slot = -1;
+    VCHECK_EQ(rsmi_dev_pcie_slot_type_get(d, &slot), kSuccess);
+    VCHECK_EQ(slot, radeon() ? 0 : 2);          // RSMI_PCIE_SLOT_PCIE, _OAM
+  }
+  uint32_t minor = 0;
+  VCHECK_EQ(rsmi_dev_drm_render_minor_get(2, &minor), kOutOfBounds);
+  VCHECK_EQ(rsmi_dev_drm_render_minor_get(0, nullptr), 1);
+  uint64_t hive0 = 0, hive1 = 1;
+  if (radeon()) {
+    VCHECK_EQ(rsmi_dev_xgmi_hive_id_get(0, &hive0), kNotSupported);
+  } else {
+    VCHECK_EQ(rsmi_dev_xgmi_hive_id_get(0, &hive0), kSuccess);
+    VCHECK_EQ(rsmi_dev_xgmi_hive_id_get(1, &hive1), kSuccess);
+    VCHECK(hive0 != 0 && hive0 == hive1);       // one hive, KFD's
+  }
+}
+
+VTEST(every_function_of_the_header_is_there_and_refused_where_there_is_no_answer) {
+  uint16_t v = 0;
+  VCHECK_EQ(rsmi_dev_sku_get(0, &v), kNotSupported);
+  VCHECK_EQ(rsmi_dev_xgmi_physical_id_get(0, &v), kNotSupported);
+  VCHECK_EQ(rsmi_dev_sku_get(7, &v), kOutOfBounds);
+  VCHECK_EQ(rsmi_driver_status(nullptr), kNotSupported);
 }
 
 VTEST_MAIN

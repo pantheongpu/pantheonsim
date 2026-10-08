@@ -82,6 +82,9 @@ struct Module {
   // What a profiler knows it and its kernels by (vgpu/hip_profiler.hpp).
   uint64_t code_object_id = 0;
   std::vector<uint64_t> kernel_ids;   // one per kernel, in the object's order
+  // A module made by hipLinkComplete from several code objects holds none of its own: its
+  // kernels and variables are its members', which are modules in their own right.
+  std::vector<Module*> members;
   // Its code as its launches have decoded it, made once it is placed.
   std::unique_ptr<vgpu::amd::DecodeCache> decoded;
 };
@@ -1779,15 +1782,18 @@ hipError_t hipDeviceGet(hipDevice_t* device_out, int ordinal) {
   return record(s, hipSuccess);
 }
 
-hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
-  const ApiCall api("hipModuleLoadData");
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!module || !image) return record(s, hipErrorInvalidValue);
-  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+namespace {
+// What hipLinkComplete writes when it links several code objects: the magic, the whole length
+// (u64), a count (u32, then 4 bytes of zero), and each object's length (u64) and bytes. It
+// means nothing to any other runtime; hipModuleLoadData reads it back as one module holding
+// the objects.
+constexpr char kLinkMagic[8] = {'V', 'G', 'P', 'U', 'L', 'N', 'K', '1'};
+bool is_link_container(const uint8_t* b) { return std::memcmp(b, kLinkMagic, 8) == 0; }
+
+// Loads one code object (or a bundle holding one for the device) as a module. Called with
+// the state locked.
+hipError_t load_module(State& s, vgpu::runtime::Device* d, const void* image, Module** out) {
   const uint8_t* bytes = static_cast<const uint8_t*>(image);
-  vgpu::runtime::Device* d = device(s);
-  if (!d) return record(s, hipErrorInvalidDevice);
   // An offload bundle -- what hipcc --genco writes -- carries a code object
   // per target, and the device's is the one loaded.
   std::unique_ptr<vgpu::amd::Bundle> bundle;
@@ -1795,19 +1801,19 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
     try {
       bundle = vgpu::amd::read_bundle(bytes, d->profile().gcn_arch_full);
     } catch (const std::exception& e) {
-      return record(s, fail(hipErrorInvalidImage, e.what()));
+      return fail(hipErrorInvalidImage, e.what());
     }
     const std::string_view* code = bundle ? vgpu::amd::code_for(*bundle, d->profile().gcn_arch_full) : nullptr;
     if (!code)
-      return record(s, fail(hipErrorNoBinaryForGpu, "the bundle carries code for " +
-                                                        (bundle ? vgpu::amd::target_list(*bundle) : "no GPU") +
-                                                        ", and this device is " + d->profile().gcn_arch_full));
+      return fail(hipErrorNoBinaryForGpu, "the bundle carries code for " +
+                                              (bundle ? vgpu::amd::target_list(*bundle) : "no GPU") +
+                                              ", and this device is " + d->profile().gcn_arch_full);
     bytes = reinterpret_cast<const uint8_t*>(code->data());
   }
   // A code object's length is in its own header; the ELF says where its
   // sections end, and the last of them is where the image stops.
   if (std::memcmp(bytes, "\x7F" "ELF", 4) != 0)
-    return record(s, fail(hipErrorInvalidImage, "the image is not an ELF code object or an offload bundle"));
+    return fail(hipErrorInvalidImage, "the image is not an ELF code object or an offload bundle");
   uint64_t shoff = 0;
   std::memcpy(&shoff, bytes + 0x28, 8);
   uint16_t shentsize = 0, shnum = 0;
@@ -1833,11 +1839,78 @@ hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
     m->device = s.current;
     place(*m, d->memory());
     report_loaded(*m, s.current, image, size);
-    *module = reinterpret_cast<hipModule_t>(m.get());
+    *out = m.get();
     s.modules.push_back(std::move(m));
   } catch (const std::exception& e) {
-    return record(s, fail(hipErrorInvalidImage, e.what()));
+    return fail(hipErrorInvalidImage, e.what());
   }
+  return hipSuccess;
+}
+
+// The code objects a link container holds, as views into it; false if it is cut short.
+bool link_parts(const uint8_t* b, std::vector<std::pair<const uint8_t*, size_t>>* parts) {
+  uint64_t available = 0;
+  uint32_t count = 0;
+  std::memcpy(&available, b + 8, 8);
+  std::memcpy(&count, b + 16, 4);
+  if (available < 24) return false;
+  size_t at = 24;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint64_t n = 0;
+    if (available - at < 8) return false;
+    std::memcpy(&n, b + at, 8);
+    at += 8;
+    if (n > available - at) return false;
+    parts->push_back({b + at, static_cast<size_t>(n)});
+    at += static_cast<size_t>(n);
+  }
+  return true;
+}
+}  // namespace
+
+hipError_t hipModuleLoadData(hipModule_t* module, const void* image) {
+  const ApiCall api("hipModuleLoadData");
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!module || !image) return record(s, hipErrorInvalidValue);
+  if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+  vgpu::runtime::Device* d = device(s);
+  if (!d) return record(s, hipErrorInvalidDevice);
+  const uint8_t* bytes = static_cast<const uint8_t*>(image);
+  if (is_link_container(bytes)) {
+    // Linked from several: each is a module of its own, and the one handle names them all.
+    // (The container carries its length in the count and sizes, not in a header to read first.)
+    std::vector<std::pair<const uint8_t*, size_t>> parts;
+    if (!link_parts(bytes, &parts) || parts.empty())
+      return record(s, fail(hipErrorInvalidImage, "the linked image is cut short"));
+    auto group = std::make_unique<Module>();
+    group->device = s.current;
+    for (const auto& part : parts) {
+      Module* m = nullptr;
+      if (const hipError_t e = load_module(s, d, part.first, &m); e != hipSuccess) {
+        // Take back what was loaded so far.
+        for (Module* done : group->members) {
+          if (done->globals) {
+            try {
+              d->memory().free(done->globals);
+            } catch (const std::exception&) {
+            }
+          }
+          s.modules.erase(std::remove_if(s.modules.begin(), s.modules.end(),
+                                         [done](const auto& p) { return p.get() == done; }),
+                          s.modules.end());
+        }
+        return record(s, e);
+      }
+      group->members.push_back(m);
+    }
+    *module = reinterpret_cast<hipModule_t>(group.get());
+    s.modules.push_back(std::move(group));
+    return record(s, hipSuccess);
+  }
+  Module* m = nullptr;
+  if (const hipError_t e = load_module(s, d, image, &m); e != hipSuccess) return record(s, e);
+  *module = reinterpret_cast<hipModule_t>(m);
   return record(s, hipSuccess);
 }
 
@@ -1865,19 +1938,25 @@ hipError_t hipModuleUnload(hipModule_t module) {
     drain_device(ordinal);
   }
   std::lock_guard<std::mutex> lock(s.mutex);
-  for (size_t i = 0; i < s.modules.size(); ++i)
-    if (reinterpret_cast<hipModule_t>(s.modules[i].get()) == module) {
-      for (size_t f = s.functions.size(); f-- > 0;)
-        if (s.functions[f]->module == s.modules[i].get()) s.functions.erase(s.functions.begin() + f);
-      if (s.modules[i]->globals) {
-        if (vgpu::runtime::Device* d = device(s)) {
-          try {
-            d->memory().free(s.modules[i]->globals);
-          } catch (const std::exception&) {
-          }
+  const auto release = [&](Module* doomed) {
+    for (size_t f = s.functions.size(); f-- > 0;)
+      if (s.functions[f]->module == doomed) s.functions.erase(s.functions.begin() + f);
+    if (doomed->globals) {
+      if (vgpu::runtime::Device* d = device(s)) {
+        try {
+          d->memory().free(doomed->globals);
+        } catch (const std::exception&) {
         }
       }
-      s.modules.erase(s.modules.begin() + i);
+    }
+    s.modules.erase(std::find_if(s.modules.begin(), s.modules.end(), [doomed](const auto& p) { return p.get() == doomed; }));
+  };
+  for (size_t i = 0; i < s.modules.size(); ++i)
+    if (reinterpret_cast<hipModule_t>(s.modules[i].get()) == module) {
+      // A linked module goes with the code objects it holds.
+      const std::vector<Module*> members = s.modules[i]->members;
+      release(s.modules[i].get());
+      for (Module* m : members) release(m);
       return record(s, hipSuccess);
     }
   return record(s, hipErrorNotFound);
@@ -1890,6 +1969,9 @@ hipError_t hipModuleGetFunction(hipFunction_t* function, hipModule_t module, con
   if (!function || !module || !name) return record(s, hipErrorInvalidValue);
   Module* m = reinterpret_cast<Module*>(module);
   const Kernel* k = vgpu::amd::find_kernel(m->object, name);
+  // A linked module's kernels are its members'.
+  for (Module* member : m->members)
+    if (!k && (k = vgpu::amd::find_kernel(member->object, name))) m = member;
   if (!k) return record(s, fail(hipErrorNotFound, std::string("the code object has no kernel named ") + name));
   auto f = std::make_unique<Function>();
   f->module = m;
@@ -1907,6 +1989,8 @@ hipError_t hipModuleGetGlobal(void** dptr, size_t* bytes, hipModule_t module, co
   if (!name || !*name || (!dptr && !bytes)) return record(s, hipErrorInvalidValue);
   Module* m = reinterpret_cast<Module*>(module);
   const vgpu::amd::GlobalVar* g = vgpu::amd::find_global(m->object, name);
+  for (Module* member : m->members)
+    if (!g && (g = vgpu::amd::find_global(member->object, name))) m = member;
   if (!g) return record(s, fail(hipErrorNotFound, std::string("the module has no variable named ") + name));
   if (dptr) *dptr = reinterpret_cast<void*>(m->globals + g->offset);
   if (bytes) *bytes = static_cast<size_t>(g->size);
@@ -6086,7 +6170,10 @@ hipError_t hipModuleGetFunctionCount(unsigned int* count, hipModule_t module) {
   const ApiCall api("hipModuleGetFunctionCount");
   if (!module) return record(state(), hipErrorInvalidHandle);
   if (!count) return record(state(), hipErrorInvalidValue);
-  *count = static_cast<unsigned>(reinterpret_cast<const Module*>(module)->object.kernels.size());
+  const Module* m = reinterpret_cast<const Module*>(module);
+  size_t n = m->object.kernels.size();
+  for (const Module* member : m->members) n += member->object.kernels.size();
+  *count = static_cast<unsigned>(n);
   return record(state(), hipSuccess);
 }
 
@@ -6927,8 +7014,9 @@ hipError_t hipLibraryGetKernelCount(unsigned int* count, void* library) {
 // ---- Linking at run time -------------------------------------------------------------
 //
 // ROCm's HIP links LLVM bitcode with AMD's compiler library (comgr), which
-// is not here. A code object handed in as it is -- an AMDGPU ELF, or a
-// bundle holding one -- is what the link gives back.
+// is not here, and bitcode is refused. A code object handed in as it is -- an AMDGPU ELF, or a
+// bundle holding one -- is what a link of one input gives back; several are what
+// hipModuleLoadData loads as one module (see kLinkMagic).
 }  // extern "C"
 namespace {
 struct LinkState {
@@ -6978,8 +7066,75 @@ hipError_t hipLinkComplete(void* link, void** binary, size_t* size) {
   if (!g_links.count(st) || !binary || !size) return record(state(), hipErrorInvalidValue);
   if (st->bitcode)
     return record(state(), fail(hipErrorNotSupported, "linking LLVM bitcode needs AMD's compiler library (comgr)"));
-  if (st->inputs.size() > 1)
-    return record(state(), fail(hipErrorNotSupported, "linking more than one code object into one is not modelled"));
+  // Every input must be a code object (or a bundle of them), not a PTX text or anything else.
+  for (size_t i = 0; i < st->inputs.size(); ++i) {
+    const auto& in = st->inputs[i];
+    if (in.size() < 24 || (std::memcmp(in.data(), "\x7F" "ELF", 4) != 0 && !vgpu::amd::is_bundle(in.data())))
+      return record(state(), fail(hipErrorInvalidImage, "link input " + std::to_string(i) +
+                                                           " is not an AMDGPU code object or an offload bundle"));
+  }
+  if (st->inputs.size() > 1) {
+    // Several code objects are one module: each is placed as it is, and a name in two of them
+    // is a name defined twice. Kernels are looked for in the order the objects were added.
+    // (A link of relocatable objects that call into one another would need a real linker,
+    // and is not modelled: each object here is a linked code object, whose calls it holds.)
+    State& s = state();
+    std::string arch;
+    {
+      std::lock_guard<std::mutex> lock2(s.mutex);
+      if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
+      if (vgpu::runtime::Device* d = device(s)) arch = d->profile().gcn_arch_full;
+    }
+    std::map<std::string, size_t> defined;
+    for (size_t i = 0; i < st->inputs.size(); ++i) {
+      std::unique_ptr<vgpu::amd::Bundle> bundle;
+      const uint8_t* bytes = st->inputs[i].data();
+      size_t size = st->inputs[i].size();
+      try {
+        if (vgpu::amd::is_bundle(bytes)) {
+          bundle = vgpu::amd::read_bundle(bytes, arch);
+          const std::string_view* code = bundle ? vgpu::amd::code_for(*bundle, arch) : nullptr;
+          if (!code)
+            return record(state(), fail(hipErrorNoBinaryForGpu, "link input " + std::to_string(i) + " carries no code for " + arch));
+          bytes = reinterpret_cast<const uint8_t*>(code->data());
+          size = code->size();
+        }
+        const vgpu::amd::CodeObject o = vgpu::amd::load_code_object(std::string(reinterpret_cast<const char*>(bytes), size), "link input");
+        if (o.isa != arch.substr(0, o.isa.size()) && !arch.empty())
+          return record(state(), fail(hipErrorInvalidImage, "link input " + std::to_string(i) + " is built for " + o.isa +
+                                                               ", and this device is " + arch));
+        for (const vgpu::amd::Kernel& k : o.kernels) {
+          const auto [it, fresh] = defined.emplace(k.name, i);
+          if (!fresh)
+            return record(state(), fail(hipErrorInvalidValue, "link: multiple definition of kernel " + k.name +
+                                                                 " (inputs " + std::to_string(it->second) + " and " +
+                                                                 std::to_string(i) + ")"));
+        }
+      } catch (const std::exception& e) {
+        return record(state(), fail(hipErrorInvalidImage, std::string("link input ") + std::to_string(i) + ": " + e.what()));
+      }
+    }
+    st->output.assign(kLinkMagic, kLinkMagic + 8);
+    const uint64_t zero = 0;
+    const auto put = [&](const void* p, size_t n) {
+      const auto* b = static_cast<const uint8_t*>(p);
+      st->output.insert(st->output.end(), b, b + n);
+    };
+    put(&zero, 8);   // the whole length, below
+    const uint32_t count = static_cast<uint32_t>(st->inputs.size());
+    put(&count, 4);
+    put(&zero, 4);
+    for (const auto& in : st->inputs) {
+      const uint64_t n = in.size();
+      put(&n, 8);
+      put(in.data(), in.size());
+    }
+    const uint64_t total = st->output.size();
+    std::memcpy(st->output.data() + 8, &total, 8);
+    *binary = st->output.data();
+    *size = st->output.size();
+    return hipSuccess;
+  }
   st->output = st->inputs.empty() ? std::vector<uint8_t>{} : st->inputs.front();
   *binary = st->output.empty() ? nullptr : st->output.data();
   *size = st->output.size();

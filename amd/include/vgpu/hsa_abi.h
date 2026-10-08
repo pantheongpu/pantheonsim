@@ -216,6 +216,25 @@ hsa_status_t hsa_agent_iterate_isas(hsa_agent_t agent, hsa_status_t (*callback)(
 hsa_status_t hsa_isa_get_info_alt(hsa_isa_t isa, hsa_isa_info_t attribute, void* value);
 hsa_status_t hsa_isa_from_name(const char* name, hsa_isa_t* isa);
 
+/* Caches, wavefronts and ISA compatibility (HSA 1.1; the same values as
+ * ROCm's hsa.h). */
+typedef struct hsa_cache_s { uint64_t handle; } hsa_cache_t;
+typedef enum {
+  HSA_CACHE_INFO_NAME_LENGTH = 0,
+  HSA_CACHE_INFO_NAME = 1,
+  HSA_CACHE_INFO_LEVEL = 2,
+  HSA_CACHE_INFO_SIZE = 3
+} hsa_cache_info_t;
+hsa_status_t hsa_cache_get_info(hsa_cache_t cache, hsa_cache_info_t attribute, void* value);
+hsa_status_t hsa_agent_iterate_caches(hsa_agent_t agent, hsa_status_t (*callback)(hsa_cache_t cache, void* data),
+                                      void* data);
+typedef struct hsa_wavefront_s { uint64_t handle; } hsa_wavefront_t;
+typedef enum { HSA_WAVEFRONT_INFO_SIZE = 0 } hsa_wavefront_info_t;
+hsa_status_t hsa_wavefront_get_info(hsa_wavefront_t wavefront, hsa_wavefront_info_t attribute, void* value);
+hsa_status_t hsa_isa_iterate_wavefronts(hsa_isa_t isa,
+                                        hsa_status_t (*callback)(hsa_wavefront_t wavefront, void* data), void* data);
+hsa_status_t hsa_isa_compatible(hsa_isa_t code_object_isa, hsa_isa_t agent_isa, bool* result);
+
 /* ---- Signals ----------------------------------------------------------- */
 
 typedef enum {
@@ -255,6 +274,22 @@ hsa_signal_value_t hsa_signal_wait_scacquire(hsa_signal_t signal, hsa_signal_con
 hsa_signal_value_t hsa_signal_wait_relaxed(hsa_signal_t signal, hsa_signal_condition_t condition,
                                            hsa_signal_value_t compare_value, uint64_t timeout_hint,
                                            hsa_wait_state_t wait_state_hint);
+
+/* Signal groups: wait for any of several signals. */
+typedef struct hsa_signal_group_s { uint64_t handle; } hsa_signal_group_t;
+hsa_status_t hsa_signal_group_create(uint32_t num_signals, const hsa_signal_t* signals, uint32_t num_consumers,
+                                     const hsa_agent_t* consumers, hsa_signal_group_t* signal_group);
+hsa_status_t hsa_signal_group_destroy(hsa_signal_group_t signal_group);
+hsa_status_t hsa_signal_group_wait_any_scacquire(hsa_signal_group_t signal_group,
+                                                 const hsa_signal_condition_t* conditions,
+                                                 const hsa_signal_value_t* compare_values,
+                                                 hsa_wait_state_t wait_state_hint, hsa_signal_t* signal,
+                                                 hsa_signal_value_t* value);
+hsa_status_t hsa_signal_group_wait_any_relaxed(hsa_signal_group_t signal_group,
+                                               const hsa_signal_condition_t* conditions,
+                                               const hsa_signal_value_t* compare_values,
+                                               hsa_wait_state_t wait_state_hint, hsa_signal_t* signal,
+                                               hsa_signal_value_t* value);
 
 /* ---- Queues and packets ------------------------------------------------ */
 
@@ -392,8 +427,26 @@ typedef enum {
 } hsa_amd_memory_pool_access_t;
 typedef enum {
   HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS = 0,
-  HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS = 1
+  HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS = 1,
+  HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO = 2
 } hsa_amd_agent_memory_pool_info_t;
+
+typedef enum {
+  HSA_AMD_LINK_INFO_TYPE_HYPERTRANSPORT = 0,
+  HSA_AMD_LINK_INFO_TYPE_QPI = 1,
+  HSA_AMD_LINK_INFO_TYPE_PCIE = 2,
+  HSA_AMD_LINK_INFO_TYPE_INFINBAND = 3,
+  HSA_AMD_LINK_INFO_TYPE_XGMI = 4
+} hsa_amd_link_info_type_t;
+
+// One hop of the path from an agent to a memory pool.
+typedef struct hsa_amd_memory_pool_link_info_s {
+  uint32_t min_latency, max_latency;       // ns
+  uint32_t min_bandwidth, max_bandwidth;   // MB/s
+  bool atomic_support_32bit, atomic_support_64bit, coherent_support;
+  hsa_amd_link_info_type_t link_type;
+  uint32_t numa_distance;
+} hsa_amd_memory_pool_link_info_t;
 
 hsa_status_t hsa_amd_agent_iterate_memory_pools(hsa_agent_t agent,
                                                 hsa_status_t (*callback)(hsa_amd_memory_pool_t pool, void* data),
@@ -655,6 +708,41 @@ hsa_status_t hsa_amd_ipc_memory_create(void* ptr, size_t len, hsa_amd_ipc_memory
 hsa_status_t hsa_amd_ipc_memory_attach(const hsa_amd_ipc_memory_t* handle, size_t len, uint32_t num_agents,
                                        const hsa_agent_t* mapping_agents, void** mapped_ptr);
 hsa_status_t hsa_amd_ipc_memory_detach(void* mapped_ptr);
+
+/* ---- Further AMD extensions (hsa_ext_amd.h) -------------------------------- */
+
+enum { HSA_AMD_SIGNAL_AMD_GPU_ONLY = 1, HSA_AMD_SIGNAL_IPC = 2 };
+typedef hsa_amd_ipc_memory_t hsa_amd_ipc_signal_t;
+hsa_status_t hsa_amd_ipc_signal_create(hsa_signal_t signal, hsa_amd_ipc_signal_t* handle);
+hsa_status_t hsa_amd_ipc_signal_attach(const hsa_amd_ipc_signal_t* handle, hsa_signal_t* signal);
+
+uint32_t hsa_amd_signal_wait_any(uint32_t signal_count, hsa_signal_t* signals, hsa_signal_condition_t* conds,
+                                 hsa_signal_value_t* values, uint64_t timeout_hint, hsa_wait_state_t wait_hint,
+                                 hsa_signal_value_t* satisfying_value);
+hsa_status_t hsa_amd_async_function(void (*callback)(void* arg), void* arg);
+
+hsa_status_t hsa_amd_memory_pool_can_migrate(hsa_amd_memory_pool_t src_memory_pool,
+                                             hsa_amd_memory_pool_t dst_memory_pool, bool* result);
+hsa_status_t hsa_amd_memory_migrate(const void* ptr, hsa_amd_memory_pool_t memory_pool, uint32_t flags);
+
+typedef void (*hsa_amd_deallocation_callback_t)(void* ptr, void* user_data);
+hsa_status_t hsa_amd_register_deallocation_callback(void* ptr, hsa_amd_deallocation_callback_t callback,
+                                                    void* user_data);
+hsa_status_t hsa_amd_deregister_deallocation_callback(void* ptr, hsa_amd_deallocation_callback_t callback);
+
+/* The deprecated code object and executable calls (hsa.h). */
+typedef struct hsa_code_object_s { uint64_t handle; } hsa_code_object_t;
+hsa_status_t hsa_code_object_deserialize(void* serialized_code_object, size_t serialized_code_object_size,
+                                         const char* options, hsa_code_object_t* code_object);
+hsa_status_t hsa_code_object_destroy(hsa_code_object_t code_object);
+hsa_status_t hsa_executable_create(hsa_profile_t profile, hsa_executable_state_t executable_state,
+                                   const char* options, hsa_executable_t* executable);
+hsa_status_t hsa_executable_load_code_object(hsa_executable_t executable, hsa_agent_t agent,
+                                             hsa_code_object_t code_object, const char* options);
+hsa_status_t hsa_executable_get_symbol(hsa_executable_t executable, const char* module_name,
+                                       const char* symbol_name, hsa_agent_t agent, int32_t call_convention,
+                                       hsa_executable_symbol_t* symbol);
+hsa_status_t hsa_executable_validate(hsa_executable_t executable, uint32_t* result);
 
 #ifdef __cplusplus
 }

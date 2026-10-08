@@ -7,9 +7,10 @@
 //  - Divergence: a branch that splits the active mask parks the not-taken
 //    (pc, mask) on a per-warp divergence stack and continues with the taken
 //    side; a path that retires pops the next parked path. Paths reconverge
-//    implicitly at ret. Barriers inside divergent control flow are rejected
-//    with a clear error rather than deadlocking (IPDOM reconvergence is a
-//    planned upgrade — see TODO.md).
+//    implicitly at ret. Since then reconvergence is min-PC (paths at the same
+//    pc merge, the lowest pc runs next), so a bar.sync after a divergent region
+//    works; full IPDOM and irreducible control flow remain open (TODO.md,
+//    "Partially implemented").
 //  - Address spaces: device globals live in the MemoryManager VA range;
 //    per-thread .local frames live in a reserved window (kLocalVaBase) that
 //    generic loads/stores route to the executing lane's private buffer —
@@ -46,6 +47,7 @@
 
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/device_printf.hpp"
+#include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -2709,7 +2711,8 @@ class Interpreter {
         std::holds_alternative<OpMovUnpack>(ins.op))
       return InstClass::BitConvert;
 
-    if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpRet>(ins.op) ||
+    if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpBrx>(ins.op) ||
+        std::holds_alternative<OpRet>(ins.op) ||
         std::holds_alternative<OpBar>(ins.op) || std::holds_alternative<OpBarRed>(ins.op) ||
         std::holds_alternative<OpTrap>(ins.op) || std::holds_alternative<OpCall>(ins.op))
       return InstClass::Control;
@@ -3605,6 +3608,10 @@ class Interpreter {
       exec_bra(w, idx, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpBrx>(&ins.op)) {
+      exec_brx(w, ctx, ins, idx, *op, m);
+      return;
+    }
     if (std::holds_alternative<OpRet>(ins.op)) {
       exec_ret(w, ctx, ins, idx, m);
       return;
@@ -3991,6 +3998,57 @@ class Interpreter {
     Path fall{fall_pc, fallthrough};
     fall.issued_at = w.steps;
     w.paths.push_back(fall);
+  }
+
+  // brx.idx: each lane goes where its own index points, so the warp splits
+  // into one path per distinct target (and one for the lanes a guard kept
+  // out). Lanes that pick the same entry stay together, and paths that reach
+  // a common pc merge again, exactly as after a divergent bra.
+  void exec_brx(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, const OpBrx& op, Mask m) {
+    if (m == 0) {
+      ++w.paths[idx].pc;
+      return;
+    }
+    Lanes scratch;
+    const Lanes& index = read_operand(w, ctx, ins, op.a, scratch);
+    std::vector<std::pair<size_t, Mask>> groups;   // target pc, lanes going there
+    for (Mask rest = m; rest != 0; rest &= rest - 1) {
+      const uint32_t lane = first_set(rest);
+      // The ISA defines no behaviour for an index outside the list, so none
+      // is chosen: the launch stops and names the lane and the value.
+      const uint32_t i = static_cast<uint32_t>(index[lane]);
+      if (i >= op.targets.size())
+        ctx_fail(ins, static_cast<int>(lane), Err::OutOfBounds,
+                 "brx.idx index " + std::to_string(i) + " is outside the branch target list '" + op.table +
+                     "' of " + std::to_string(op.targets.size()) +
+                     " entries; the PTX ISA does not define where it goes");
+      const size_t target = op.targets[i];
+      auto g = std::find_if(groups.begin(), groups.end(), [&](const auto& e) { return e.first == target; });
+      if (g == groups.end()) groups.emplace_back(target, Mask{0}), g = groups.end() - 1;
+      g->second |= Mask{1} << lane;
+    }
+    const size_t here = w.paths[idx].pc;
+    if (w.steps - turn_start_ >= kLongTurn)
+      for (const auto& g : groups)
+        if (g.first <= here) w.yield_now = true;
+    const Mask fallthrough = w.paths[idx].mask & ~m;
+    if (groups.size() == 1 && fallthrough == 0) {
+      w.paths[idx].pc = groups[0].first;
+      return;
+    }
+    ++stats_.divergent_branches;
+    w.paths[idx].pc = groups[0].first;
+    w.paths[idx].mask = groups[0].second;
+    for (size_t k = 1; k < groups.size(); ++k) {
+      Path p{groups[k].first, groups[k].second};
+      p.issued_at = w.steps;
+      w.paths.push_back(p);
+    }
+    if (fallthrough != 0) {
+      Path p{here + 1, fallthrough};
+      p.issued_at = w.steps;
+      w.paths.push_back(p);
+    }
   }
 
   void exec_ret(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, Mask m) {
@@ -5128,26 +5186,15 @@ class Interpreter {
           case NarrowFmt::E2M3:
           case NarrowFmt::E3M2:
           case NarrowFmt::E2M1: {
-            // NaN goes to the positive largest normal (.satfinite).
             const int eb = fmt == NarrowFmt::E3M2 ? 3 : 2, mb = fmt == NarrowFmt::E2M3 ? 3 : fmt == NarrowFmt::E3M2 ? 2 : 1;
-            const int bias = fmt == NarrowFmt::E3M2 ? 3 : 1;
-            if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);
-            return double_to_small_float(v, eb, mb, bias);
+            return exec::small_float_bits(v, eb, mb, fmt == NarrowFmt::E3M2 ? 3 : 1);
           }
           case NarrowFmt::UE8M0: {
-            // 2^(code - 127), 0xFF NaN; .rz takes the power of two at or
-            // below, .rp the one at or above.
-            if (std::isnan(v)) return 0xFF;
-            if (v < 0)
+            const uint32_t code = exec::ue8m0_bits(v, op->rp, op->satfinite);
+            if (code == ~0u)
               ctx_fail(ins, static_cast<int>(lane), Err::UnsupportedPtx,
                        "cvt to ue8m0x2 of a negative value, which the ISA does not define");
-            if (v == 0) return 0;
-            if (std::isinf(v)) return op->satfinite ? 0xFE : 0xFF;
-            int e = std::ilogb(v);
-            if (op->rp && std::ldexp(1.0, e) != v) ++e;
-            if (e + 127 < 0) return 0;
-            if (e + 127 > 254) return op->satfinite ? 0xFE : 0xFF;
-            return static_cast<uint32_t>(e + 127);
+            return code;
           }
           case NarrowFmt::S2F6: {
             // An s8 in units of 2^-6; NaN to the positive largest.
@@ -6387,37 +6434,24 @@ class Interpreter {
       // value in the low bits of its byte -- CUTLASS shifts e2m1 up by 2
       // itself before an mma -- or from 8 bytes of .s4, sign-extended.
       const uint32_t R = op.shape == LdmShape::M16N16 ? 16 : 8;
-      const uint32_t bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      exec::LdmRow fmt;
+      fmt.bits = op.fmt == LdmSrc::B6P32 ? 6 : op.fmt == LdmSrc::B8 ? 8 : 4;
+      fmt.sign4 = op.fmt == LdmSrc::S4;
       for (uint32_t mat = 0; mat < op.count; ++mat) {
         uint8_t tile[16][16] = {};
         for (uint32_t r = 0; r < R; ++r) {
           const uint32_t src_lane = mat * R + r;
           const uint64_t addr = row_addr(src_lane);
           uint8_t raw[16];
-          for (uint32_t b = 0; b < 16 * bits / 8; ++b)
+          for (uint32_t b = 0; b < fmt.bytes(); ++b)
             raw[b] = static_cast<uint8_t>(load_routed(w, ctx, ins, src_lane, addr + b, 1));
-          for (uint32_t c = 0; c < 16; ++c) {
-            uint32_t v = 0;
-            for (uint32_t k = 0; k < bits; ++k)
-              v |= ((raw[(c * bits + k) / 8] >> ((c * bits + k) % 8)) & 1u) << k;
-            if (op.fmt == LdmSrc::S4 && (v & 8)) v |= 0xF0;
-            tile[r][c] = static_cast<uint8_t>(v);
-          }
+          exec::ldm_unpack_row(raw, fmt, tile[r]);
         }
-        // Figures 108-109: lane t holds four consecutive columns of row t / 4
-        // (and of row t / 4 + 8 in its second register for 16x16), which for
-        // the transposed 16x16 are four stored rows at element t / 4.
         const uint32_t regs = R / 8;
         for (uint32_t rr = 0; rr < regs; ++rr) {
           Lanes out;
           for (uint32_t lane = 0; lane < W_; ++lane)
-            if (m & (Mask{1} << lane)) {
-              const uint32_t row = lane / 4 + 8 * rr, col0 = 4 * (lane % 4);
-              uint32_t word = 0;
-              for (uint32_t j = 0; j < 4; ++j)
-                word |= uint32_t{op.trans ? tile[col0 + j][row] : tile[row][col0 + j]} << (8 * j);
-              out[lane] = word;
-            }
+            if (m & (Mask{1} << lane)) out[lane] = exec::ldm_word(tile, lane, rr, op.trans);
           write_reg(w, op.dsts[mat * regs + rr], m, out, 32);
         }
       }
@@ -12292,6 +12326,23 @@ std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAcces
 double fp8_value(uint32_t byte, bool e5m2) { return fp8_to_double(byte & 0xFF, e5m2 ? kE5M2 : kE4M3); }
 double mx_float_value(uint32_t code, int eb, int mb, int bias) { return small_float_value(code, eb, mb, bias); }
 uint32_t fp8_bits(double v, bool e5m2, bool satfinite) { return double_to_fp8(v, e5m2 ? kE5M2 : kE4M3, satfinite); }
+uint32_t small_float_bits(double v, int eb, int mb, int bias) {
+  if (std::isnan(v)) return (((1u << eb) - 1) << mb) | ((1u << mb) - 1);   // .satfinite: the positive largest
+  return double_to_small_float(v, eb, mb, bias);
+}
+uint32_t ue8m0_bits(double v, bool round_up, bool satfinite) {
+  if (std::isnan(v)) return 0xFF;
+  if (v < 0) return ~0u;
+  if (v == 0) return 0;
+  if (std::isinf(v)) return satfinite ? 0xFE : 0xFF;
+  int e = std::ilogb(v);
+  if (round_up && std::ldexp(1.0, e) != v) ++e;
+  if (e + 127 < 0) return 0;
+  if (e + 127 > 254) return satfinite ? 0xFE : 0xFF;
+  return static_cast<uint32_t>(e + 127);
+}
+uint16_t f16_bits(double v) { return static_cast<uint16_t>(double_to_f16(v)); }
+uint16_t bf16_bits(double v) { return static_cast<uint16_t>(double_to_bf16(v)); }
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
   validate(fn, cfg, profile);

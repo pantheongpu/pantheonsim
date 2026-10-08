@@ -434,6 +434,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x056}, {"v_cvt_pk_f32_fp8_e32", 2, 1}},
       {{Enc::Vop1, 0x057}, {"v_cvt_pk_f32_bf8_e32", 2, 1}},
       {{Enc::Vop2, 0x006}, {"v_mul_i32_i24_e32", 1, 2}},
+      {{Enc::Vop2, 0x007}, {"v_mul_hi_i32_i24_e32", 1, 2}},
       {{Enc::Vop2, 0x008}, {"v_mul_u32_u24_e32", 1, 2}},
       {{Enc::Vop2, 0x00a}, {"v_min_f32_e32", 1, 2}},
       {{Enc::Vop2, 0x00b}, {"v_max_f32_e32", 1, 2}},

@@ -80,8 +80,12 @@ clones, allocation nodes whose memory outlives the graph, user objects, and a
 drawing in Graphviz's dot. A launch is one piece of its stream's work, its
 nodes run in an order their edges allow. Every function ROCm 7.1's `libamdhip64`
 exports is here, down to `__managed__` variables, modules loaded as CUDA 12's
-libraries or as fat binaries, the run-time linker for code objects (linking
-LLVM bitcode needs AMD's compiler library, and is refused), HCC's launch by
+libraries or as fat binaries, the run-time linker for code objects (`hipLink*`: one input comes back as it
+is; several become one module holding them, a kernel defined twice is a link
+error, and the binary `hipLinkComplete` writes is this runtime's own
+container, which `hipModuleLoadData` reads back, not an ELF; relocatable
+objects that call into one another would need a real linker, and linking LLVM
+bitcode needs AMD's compiler library, so both are refused), HCC's launch by
 its C and C++ names, and what a device with no OpenGL and no dma-bufs answers
 (`tests/hipcc/exports.cpp`). A kernel's fault is told at the
 next synchronization, as on a card. `VGPU_SYNC_LAUNCHES=1` makes every call
@@ -124,7 +128,7 @@ and all (`gfx942:sramecc+:xnack-`), which is how rocBLAS picks, of the code it
 ships for each setting of XNACK, the code built for this one. Its device code
 comes as compressed offload bundles, dozens of them, inflated with the
 system's zstd or zlib when a kernel first needs one rather than as the
-library loads; Tensile's GEMMs come from code objects hundreds of kernels
+library loads (zlib and zstd are the two methods clang defines; any other method number, and a header version other than 2 and 3, is refused by name); Tensile's GEMMs come from code objects hundreds of kernels
 were linked into, each keeping its own metadata. The stream-ordered
 allocations, pitched copies, pointer attributes and work-item-sized launches
 (`hipExtModuleLaunchKernel`) it calls are there. `tests/e2e/run_rocblas.sh`
@@ -227,11 +231,19 @@ hostcall): the kernel takes a packet from a buffer the runtime gave it,
 fills a slot per lane, pushes it onto a ready stack and raises a doorbell,
 whose mailbox makes it send an interrupt (`s_sendmsg`); that is where the
 host's part is done (`src/hostcall.cpp`), and the kernel, spinning on the
-packet, carries on. `printf` is the service implemented: a message per lane,
+packet, carries on. `printf` is a service implemented: a message per lane,
 carried in as many packets as it needs, formatted as C's printf would and
-written to the program's stdout, with printf's return value sent back. A
-hostcall for another service (device `malloc`, the address sanitizer) is
-refused by name. Vector loads and stores may be unaligned, as ROCm runs the
+written to the program's stdout, with printf's return value sent back.
+Device-side `malloc` and `free` are the second (service 3, ockl's
+`__ockl_devmem_request`): the device library's allocator asks the host for
+its 2 MiB slabs and for large blocks, and gives them back; the host answers
+with device memory placed on the alignment the library finds slabs by, and a
+null pointer when the device is full (`tests/data/devmalloc.cpp`, run by
+`test_amd_runtime_gaps`). The address sanitizer's report (service 4) ends the
+kernel with the report as the error (ROCm's runtime prints it and aborts); no
+sanitizer-instrumented code was available to run it, so it is checked against
+the device library's argument order only. A hostcall for any other service
+(a device function call) is refused by name. Vector loads and stores may be unaligned, as ROCm runs the
 hardware; the compiler counts on that when it packs a string.
 
 A program hipcc built carries linked code objects, whose code reaches its
@@ -394,6 +406,10 @@ does on the card.
 with what its destination holds after it for lane 0 (or the lane
 `VGPU_TRACE_LANE` names). That is how the bugs above were found.
 
+## Memory tests
+
+`amd/tests/hipcc/memtest.cpp` is a HIP memory test written for this repository: walking ones and zeros, address in address, checkerboard and its inverse, moving inversions, seeded random data (verified on the device and on the host), block copies and strided sweeps, on `hipMalloc` memory and on mapped pinned host memory. It never looks at the wave size, so it runs the same on wave 64 (MI300X, MI250X) and wave 32 (RX 6900 XT, RX 7900 XTX). Checked-in builds for gfx942, gfx90a, gfx1030 and gfx1100 are run by ctest `amd_memtest_patterns`, which also arms the simulator's faults and requires the test to find them: a host-flipped bit exactly, a `vgpu fault stuck` cell, bit flips armed on stores, an uncorrectable HBM ECC error on a load (the kernel fails and a row is remapped; corrected errors are counted and change nothing; a card without ECC refuses the fault), and a wild pointer (`hipErrorLaunchFailure`). The programs were built with Ubuntu's ROCm 5.7 `hipcc` (the only toolchain installable without AMD's repositories), so they ask for `libamdhip64.so.5`, which the script maps to the shim; gfx950 and gfx1201 need a newer compiler. `ci/external/babelstream.sh` runs UoB-HPC's BabelStream (HIP), whose own validation must pass, and must fail against a stuck cell, in the nightly external suites.
+
 ## Textures
 
 The Radeon GPUs (RDNA2, RDNA3 and RDNA4: gfx1030, gfx1100, gfx1201) have
@@ -414,7 +430,7 @@ texture units, and the simulator models them from the kernel up:
 - **HIP:** arrays (1D, 2D, 3D, layered), every copy to and from them, texture
   objects over arrays, linear and pitched memory (runtime and driver API),
   texture references (`texture<T, dim, mode>`, bound with `hipBindTexture*`
-  or a module's through `hipTexRef*`), sRGB textures, and surface objects
+  or a module's through `hipTexRef*`), sRGB textures (over arrays and pitched memory; sRGB over linear memory is refused by name: a buffer resource has no sRGB number format and nothing public says what `tex1Dfetch` would return), and surface objects
   (`src/hip_images.inc`), each check and error as ROCm's HIP makes it.
   ROCm's HIP on Linux has no mipmaps or cube arrays, so neither does the shim.
 - **HSA:** the images extension (`src/hsa_images.inc`): images and samplers,
@@ -456,6 +472,7 @@ against ROCm's `hsa.h` where that is installed, and both builds run
 (ctest `amd_hsa`). A grid need not be a whole number of work-groups, as HSA
 allows: the last group in a dimension runs short, numbered across its own
 shape, and the kernel's `hidden_remainder` arguments say by how much.
+The HSA 1.1 queries a tool makes of an agent are answered too: `hsa_agent_iterate_caches` and `hsa_cache_get_info` (the levels, L1 to L3 where the chip has one, with the sizes the deprecated `HSA_AGENT_INFO_CACHE_SIZE` gives; the CPU agent reports none), `hsa_isa_iterate_wavefronts` and `hsa_wavefront_get_info`, `hsa_isa_compatible` (the same full target name only), and signal groups (`hsa_signal_group_create`, `_destroy` and both `_wait_any` forms). `tests/hsa/hsa_caches.c` checks them, built against this header and against ROCm's (ctest `amd_hsa`). Not answered: `hsa_amd_signal_wait_any` (the header does not say what a timeout returns), the deprecated code-object and finalizer calls, `hsa_amd_queue_intercept_*`, `hsa_amd_register_deallocation_callback`, `hsa_amd_memory_migrate` and `hsa_amd_spm_*`.
 
 ROCm's own tools and HIP runtime run on it unmodified:
 
@@ -475,7 +492,8 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 - **Supported extras:** AMD's loader extension, barrier-value packets, asynchronous signal handlers, dispatch timestamps and `hsa_amd_pointer_info` all work.
 - **Images, virtual memory and IPC:** HSA's images extension (see Textures), its virtual memory (`hsa_amd_vmem_*`), its IPC handles (`hsa_amd_ipc_memory_*`) and dma-buf export are modelled. The last three are HIP's own (`src/hsa_vmem.inc`), reached by hidden names so that ROCm's libamdhip64 over this runtime does not call itself. ROCm's HIP runs `tests/hipcc/memory.cpp`'s virtual memory, pool IPC and dma-buf checks over it.
 - **Shared virtual memory:** the runtime reports SVM support, as ROCm's does on a machine with HMM. ROCm's HIP then keeps managed memory the way it does there: host pages made accessible to each GPU, advised and prefetched through `hsa_amd_svm_attributes_set`, `_get` and `hsa_amd_svm_prefetch_async` (`src/hsa_svm.inc`). A range given to a GPU is mapped for the devices where it is. Advice, access and the last prefetch's target are kept page by page and read back, uniform or not. A prefetch moves nothing, because there is no second copy of the pages. It waits for its dependencies and completes its signal.
-- **Not modelled:** graphics interop.
+- **Also answered:** `hsa_amd_signal_wait_any` (the header does not say what a wait that times out returns; this answers `UINT32_MAX`, no index of any list, with the timeout in the 1 GHz system ticks `hsa_signal_wait` takes); `hsa_amd_ipc_signal_create` and `_attach` for a signal made with `HSA_AMD_SIGNAL_IPC`, within the process (a handle from another process is refused: a signal is an object of its process's heap); `hsa_amd_memory_pool_can_migrate` and `hsa_amd_memory_migrate` between the CPU's fine- and coarse-grained pools and from a pool to itself (a buffer keeps its address, and the grain `hsa_amd_pointer_info` reports changes); `hsa_amd_register_deallocation_callback` and `_deregister_` (fired once, from `hsa_amd_memory_pool_free`, the one release the header names); `hsa_amd_async_function`; and the deprecated `hsa_code_object_deserialize`, `_destroy`, `hsa_executable_create`, `_load_code_object`, `_get_symbol` (no module names) and `_validate`, through the reader path (`test_amd_runtime_gaps`).
+- **Refused by name (`HSA_STATUS_ERROR_NOT_SUPPORTED`):** `hsa_amd_spm_*` (no counter stream), the finalizer (`hsa_ext_program_*`; AMD's runtime has had none since ROCm 2), the rest of the deprecated code object interface (`hsa_code_object_serialize`, `_get_info`, `_get_symbol*`, `_iterate_symbols`, `hsa_code_symbol_get_info`, `hsa_executable_load_program_code_object`, `_iterate_program_symbols`), `hsa_amd_queue_intercept_*` and `hsa_ven_amd_aqlprofile_*` (packets are not diverted to a tool and there are no PM4 counter packets; the public header available here did not declare the interception calls, so their signatures were not checked), the variable definitions (`hsa_executable_agent_global_variable_define`, `_global_variable_define`, `_readonly_variable_define`: the loader leaves a code object's undefined symbols unrelocated, so a defined variable would bind to nothing), and graphics interop (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `_unmap_buffer`). Still absent, not refused: `hsa_soft_queue_create`, `hsa_queue_inactivate`, `hsa_memory_assign_agent`, `hsa_extension_get_name`, the exception-policy queries, `hsa_amd_image_get_info_max_dim`.
 
 `VGPU_TRACE_HSA=1` logs what memory the program allocates, locks and registers.
 
@@ -493,8 +511,8 @@ the simulated GPUs (amd/tests/e2e/run_amd_tools.sh, ctest `amd_tools`):
 
 RCCL (PyTorch's collectives on ROCm) runs unmodified across simulated GPUs in one process (`tests/pytorch/multi_gpu.py`, ctest `amd_pytorch_multi_gpu`) and across processes (`distributed.py`, ctest `amd_pytorch_distributed`). Three things make that work on any Linux machine:
 
-- **ROCm SMI's library.** VirtualGPU has its own `librocm_smi64` (`src/rocm_smi.cpp`, `build/shim/librocm_smi64.so.7`), which answers ROCm SMI's public interface for the simulated GPUs. Its answers come from the same machine state `rocm-smi` and nvidia-smi read, not from HIP, so asking does not make a card look busy. It covers identity (ids, names, target version, PCI address, serial-like unique id), temperature, power and its caps, busy percentages, memory, clock levels, fans on Radeon cards, voltage, PCIe, ECC, compute and memory partitions, topology and processes. What the simulator does not model is refused with `RSMI_STATUS_NOT_SUPPORTED`, as a card refuses what it lacks: `gpu_metrics`, every setter, reset and events. An isolated AMD session exports `ROCM_SMI_LIB_PATH` to it and shows `/sys/module/amdgpu` loaded, so ROCm's own `rocm-smi` runs there unmodified and says what VirtualGPU's says (ctest `amd_tools`, where the host has ROCm SMI and unprivileged user namespaces).
-- **AMD SMI's library.** VirtualGPU also has its own `libamd_smi` (`src/amd_smi.cpp`, `build/shim/libamd_smi.so.26`), which AMD's Python package `amdsmi` loads, and through it vLLM. vLLM asks it before anything else whether this is a ROCm machine, and asks each GPU's target, name, memory and UUID, and whether the GPUs are fully connected by XGMI. Each GPU is a socket of its own with one processor, as AMD SMI groups discrete GPUs. The answers are the machine's, as `amd-smi` and ROCm SMI's library give them: the target, device ID, compute units, UUID, PCI address, KFD node and id, memory, activity, and links. The package binds every function of the library when imported, so all of them are exported (the list is AMD's header's, `tools/amdsmi-symbols.py`), and the ones not modelled answer `AMDSMI_STATUS_NOT_SUPPORTED`. AMD's package, unmodified (26.2.2, the version vLLM's ROCm wheels install), runs on it: ctests `test_amd_amd_smi`, `test_amd_amd_smi_radeon`, `amd_amdsmi_python`. The package looks in `$ROCM_HOME` and `$ROCM_PATH` before the library path, so a shell with those pointing at a ROCm install loads AMD's library instead.
+- **ROCm SMI's library.** VirtualGPU has its own `librocm_smi64` (`src/rocm_smi.cpp`, `build/shim/librocm_smi64.so.7`), which answers ROCm SMI's public interface for the simulated GPUs. Its answers come from the same machine state `rocm-smi` and nvidia-smi read, not from HIP, so asking does not make a card look busy. It covers identity (ids, names, target version, PCI address, serial-like unique id), temperature, power and its caps, the energy counter (Instinct only), busy percentages, memory, clock levels, fans on Radeon cards, voltage, PCIe, ECC, compute and memory partitions, topology and processes. What the simulator does not model is refused with `RSMI_STATUS_NOT_SUPPORTED`, as a card refuses what it lacks: every setter, reset and event, the XCD counter, and the tables and identifiers with no datum behind them (SKU, VBIOS build, XGMI physical id, PM and register tables, cache info). `rsmi_dev_gpu_metrics_info_get` and `rsmi_dev_metrics_header_info_get` answer the same v1.5 table `amdsmi_get_gpu_metrics_info` does, in `rsmi_gpu_metrics_t` (4544 bytes, offsets checked against ROCm 7.2.0's `rocm_smi.h`); the DRM render minor, the XGMI hive id and the PCIe slot type are answered too, and every function of the header is exported. An isolated AMD session exports `ROCM_SMI_LIB_PATH` to it and shows `/sys/module/amdgpu` loaded, so ROCm's own `rocm-smi` runs there unmodified and says what VirtualGPU's says (ctest `amd_tools`, where the host has ROCm SMI and unprivileged user namespaces).
+- **AMD SMI's library.** VirtualGPU also has its own `libamd_smi` (`src/amd_smi.cpp`, `build/shim/libamd_smi.so.26`), which AMD's Python package `amdsmi` loads, and through it vLLM. vLLM asks it before anything else whether this is a ROCm machine, and asks each GPU's target, name, memory and UUID, and whether the GPUs are fully connected by XGMI. Each GPU is a socket of its own with one processor, as AMD SMI groups discrete GPUs. The answers are the machine's, as `amd-smi` and ROCm SMI's library give them: the target, device ID, compute units, UUID, PCI address, KFD node and id, memory, activity, and links. The package binds every function of the library when imported, so all of them are exported (the list is AMD's header's, `tools/amdsmi-symbols.py`), and the ones not modelled answer `AMDSMI_STATUS_NOT_SUPPORTED`. The health queries answer from the profile, as ROCm SMI's library and `amd-smi` do: ECC totals and per-block counts and states, bad pages, XGMI info (hive id, links, error status), PCIe info (link, replay and NAK counters, bandwidth levels), temperature, power and cap, clocks, voltage, fans, compute and memory partitions, and the process list. Instinct profiles (HBM, `ecc: true`) have ECC, bad pages and XGMI; the Radeon profiles refuse all three with `NOT_SUPPORTED` (no RAS files, no hive), have a fan where Instinct has none, and have no partitions. Assumptions with no profile datum (x16 XGMI lanes, one link per peer, HBM stack sensors reading the one memory sensor, a remapped row listed as a bad page, no deferred errors) are marked in `amd_smi.cpp`. Clock levels (`amdsmi_get_clk_freq`, in Hz as the library's function documentation says and AMD's implementation passes ROCm SMI's levels through; the header's field comment saying MHz is stale) and `amdsmi_set_clk_freq` (pins a level for the calling process), the energy counter (Instinct only; the same accumulator `rsmi_dev_energy_count_get` reads, 15.3 uJ a tick) and `amdsmi_get_gpu_metrics_info` (the v1.5 table the driver files publish, in the ROCm 7.2.0 structure, whose size and offsets are checked against ROCm 7.2.0's header) are answered too. The getters ROCm SMI's library answers are answered here the same way (VRAM usage in MB, GPU busy percent, performance level "auto", no overdrive, the metrics table's header, reserved pages, and the compute processes by pid and by GPU). Still `NOT_SUPPORTED`: violation status, PCIe throughput, the bad-page threshold, board, VBIOS and firmware info (the profiles carry none), and every other setter and reset. AMD's package, unmodified (26.2.2, the version vLLM's ROCm wheels install), runs on it: ctests `test_amd_amd_smi`, `test_amd_amd_smi_radeon`, `amd_amdsmi_python`. The package looks in `$ROCM_HOME` and `$ROCM_PATH` before the library path, so a shell with those pointing at a ROCm install loads AMD's library instead.
 - **The kernel driver's interface.** A session writes out amdkfd's topology (`src/kfd.cpp`): a CPU node, then a node per GPU with its `properties` (target, SIMDs, engines, PCI location, render minor, hive), memory bank and links. An isolated session shows it at `/sys/class/kfd/kfd/topology`, along with a `renderD` entry per GPU in `/sys/class/drm`, and `/dev/kfd` and `/dev/dri/{cardN,renderD128+N}`. Tools find AMD GPUs there without a runtime: ROCm's `rocm_agent_enumerator` reads each node's `gfx_target_version`, and Ollama and RCCL match nodes to PCI devices by `location_id`. Every value is the one HIP, rocminfo, rocm-smi and amd-smi report. The node's `gpu_id` is rocm-smi's GUID and amd-smi's `kfd_id`, and the links are the ones ROCm SMI reports. The device files open as `/dev/null` does. A program that only looks for them finds an AMD machine; one that asks the driver something (an ioctl) is refused, as on a machine without the driver. The simulated runtime asks it nothing. `/sys/class` and `/dev` are overlaid whole, and every other entry still leads to the host's (ctests `test_amd_kfd`, `amd_tools`).
 - **Topology.** RCCL learns how its GPUs are linked from the AMD kernel driver's topology under `/sys/class/kfd`, or from ROCm SMI's library. A machine with no AMD GPU has no `/sys/class/kfd`, and RCCL fails to initialize ("internal error"). WSL is the exception: RCCL skips the question there. The simulator's library answers it: the device count, each device's PCI address as HIP reports it, and the link between each pair. That link is XGMI between Instinct GPUs and PCI Express between Radeon ones. Once loaded, the library sets `RCCL_USE_ROCM_SMI_LIB=1` where there is no `/sys/class/kfd` and inside a `vgpu shell` session, whose `/sys/class/kfd` is its own copy of the same answers. It leaves the variable alone elsewhere, or where the environment already set it. The PyTorch tests swap it in beside `libamdhip64` (ctests `test_amd_rocm_smi`, `test_amd_rocm_smi_radeon`).
 - **Wide accesses.** A `global_`, `flat_` or `buffer_` load or store of two to four words moves each aligned pair of words as one 8-byte access, as the hardware does. RCCL's LL protocol puts a word of data and the flag that says it arrived in the same eight bytes, and a reader on another device trusts the data once it sees the flag. When a wide access moved one word at a time, a reader could see the new flag beside the old data, and `broadcast` lost values.
@@ -635,3 +653,39 @@ The libraries follow the runtime, each checked against the real one on
 hardware the way the NVIDIA side is.
 
 A profile id is `amd/<name>`, and its file is `profiles/<name>.yaml` here.
+
+## ROCm Validation Suite
+
+AMD's open-source [ROCm Validation Suite](https://github.com/ROCm/ROCmValidationSuite)
+(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. It was not built
+or run here (it needs ROCm's HSA, HIP, rocBLAS and AMD SMI development
+packages, which are not installable on this host); its source was read for the
+calls its modules make, and each was checked against what the simulator
+answers. What RVS asks, module by module:
+
+| Module | What it reads | State |
+| --- | --- | --- |
+| `gpup` | `/sys/class/kfd/kfd/topology/nodes/*/{gpu_id,properties,io_links}` | answered by the KFD topology (`src/kfd.cpp`); `caches_count` is 0 and there is no `caches/` directory |
+| every module | `amdsmi_get_gpu_kfd_info`, `amdsmi_get_gpu_bdf_id`, `hipDeviceGetPCIBusId` to tie a HIP device to its KFD node and SMI handle | consistent: same bus, same `kfd_id` |
+| `gm`, `tst`, `pulse`, `iet`, `gst` | `amdsmi_get_temp_metric`, `amdsmi_get_power_info`, `amdsmi_get_power_cap_info`, `amdsmi_get_clk_freq`, `amdsmi_set_clk_freq`, `amdsmi_get_energy_count` | added (`src/amd_smi.cpp`); they were NOT_SUPPORTED stubs |
+| `pebb`, `pbqt` | `hsa_amd_agent_memory_pool_get_info` `NUM_LINK_HOPS` and `LINK_INFO`, async copy and its profiling | `LINK_INFO` added: system memory is one PCI Express hop, an Instinct peer one XGMI hop, a Radeon peer two PCI Express hops, as KFD lists them |
+| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | already run (`tests/hipcc`, `tests/rocblas`); RVS's own kernels are compiled for the card, so they need a gfx942 code object |
+| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`); not exercised through RVS |
+
+The AMD SMI calls above are the ones described under "AMD SMI's library" in
+"RCCL, and PyTorch across GPUs"; the sensors follow each profile's class. Temperatures are
+degrees (AMD SMI converts the driver's millidegrees); an Instinct GPU has a
+junction and a memory sensor (VRAM and HBM) but no edge sensor, a Radeon has
+edge, junction and VRAM, and the slowdown limit is refused where the profile
+has none (MI325X). Power is watts, the capability in microwatts; MI300 and newer
+fill `current_socket_power`, the earlier Instinct and Radeon
+`average_socket_power`, the other reading is UINT32_MAX. Clocks have two
+levels, as ROCm SMI's library gives them, in Hz, and `amdsmi_set_clk_freq` pins
+one for the calling process (a mask of a level the clock lacks is out of
+bounds). Only Instinct GPUs have the energy accumulator (15.3 uJ a tick,
+counting up from an offset; `rsmi_dev_energy_count_get` and
+`amdsmi_get_energy_count` read the one counter) and a Radeon has ECC disabled
+or `NOT_SUPPORTED`, from its profile. `tests/unit/test_amd_smi.cpp` checks all of
+it on every profile (`test_amd_amd_smi_rvs_*`), `tests/unit/test_rocm_smi.cpp`
+that the two libraries agree on the energy count, and
+`tests/hsa/hsa_dispatch.c` the link info.

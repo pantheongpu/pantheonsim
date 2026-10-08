@@ -5,7 +5,13 @@ name: CUDA toolkits
 # SASS jobs with 13.0, so code behind `CUDART_VERSION >= 12020` ... `< 13000`
 # (12.2's, 12.3's, 12.5's, 12.6's and 12.8's API additions, the 12.x shims'
 # sonames with them) was never compiled, let alone run, in CI. This builds the
-# simulator and the e2e programs with CUDA 12.8 and runs the build job's tests.
+# simulator and the e2e programs with other toolkits and runs the build job's
+# tests:
+#   12.8  every 12.x guard (>= 12020 ... >= 12080) on.
+#   12.4  the 12.2 and 12.3 guards on and the 12.5, 12.6 and 12.8 ones off:
+#         the older branches of those guards, which 12.0 compiles only with
+#         everything else off too. NVIDIA's Ubuntu 24.04 repository starts at
+#         12.5, so this leg runs on 22.04 (with GCC 12: the simulator is C++20).
 #
 # On pull requests that touch the NVIDIA side, when a change lands, nightly
 # and by hand. Another 12.x is one more row.
@@ -29,17 +35,24 @@ concurrency:
 jobs:
   suite:
     name: build + tests, CUDA ${{ matrix.cuda }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        cuda: ['12.8']
+        include:
+          - { cuda: '12.8', os: ubuntu-24.04, repo: ubuntu2404, skip: '' }
+          # amd_tools and regs_cli compare with the host's own lspci, whose
+          # output 22.04's older pciutils formats differently; amd_hipcc runs
+          # the checked-in hipCUB and rocThrust programs, which ROCm's GCC 13
+          # built and 22.04's libstdc++ (GLIBCXX_3.4.30) cannot load. Nothing
+          # in them depends on the toolkit, and the build job runs them on 24.04.
+          - { cuda: '12.4', os: ubuntu-22.04, repo: ubuntu2204, skip: '|amd_tools|regs_cli|amd_hipcc' }
     # On the runner itself, not the cuda12.8 image: it runs the build job's
     # tests, whose session tests need user namespaces and mounts a container
     # refuses.
     env:
-      # CUDA 12.4 and later take GCC 13, the runner's own.
+      # CUDA 12.4 and later take the runner's GCC (13 on 24.04, 11 on 22.04).
       NVCC_PREPEND_FLAGS: ''
     steps:
       - uses: actions/checkout@v4
@@ -47,11 +60,17 @@ jobs:
       - name: Install CUDA ${{ matrix.cuda }}
         env:
           CUDA: ${{ matrix.cuda }}
+          REPO: ${{ matrix.repo }}
         run: |
           v=${CUDA/./-}
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
-          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          # The simulator is C++20: 22.04's GCC 11 is too old, so GCC 12 builds it.
+          if [[ "$(g++ -dumpversion | cut -d. -f1)" -lt 12 ]]; then
+            sudo apt-get install -y -qq --no-install-recommends g++-12
+            { echo "CC=gcc-12"; echo "CXX=g++-12"; } >> "$GITHUB_ENV"
+          fi
+          wget -qO /tmp/keyring.deb "https://developer.download.nvidia.com/compute/cuda/repos/$REPO/x86_64/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i /tmp/keyring.deb
           sudo apt-get update -qq
           pkgs="cuda-nvcc-$v cuda-cudart-dev-$v cuda-nvml-dev-$v cuda-cupti-dev-$v cuda-nvrtc-dev-$v
@@ -84,6 +103,8 @@ jobs:
       - name: Unit and end-to-end tests
         # The build job's set. The ML tests are the ml job's, the workloads
         # and ollama ci.yml's, and CUTLASS's builds take hours.
+        env:
+          SKIP: ${{ matrix.skip }}
         run: |
           ctest --test-dir build --output-on-failure \
-            -E '^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_cutlass.*)$'
+            -E "^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_cutlass.*$SKIP)\$"

@@ -1,0 +1,12 @@
+# gpu-burn (wilicc/gpu-burn 0d19c94, master): the CUDA burn-in tester, built and run unmodified
+# on the simulated nvidia/rtx3060. It multiplies 8192 x 8192 matrices with cuBLAS for the time
+# given, compares the results with a kernel it loads from compare.fatbin through the driver
+# API, and prints "GPU n: OK" for each GPU that showed no errors. There is no card's output to
+# compare with: it must exit 0, print that line and no error. Columns: name | arguments | marker.
+# -m is the memory it may use, in MB: its minimum is three result matrices (768 for floats,
+# 1536 for doubles), and four or more make it compare results across iterations (1280 floats).
+# The matrix size is fixed in the source, and a multiplication runs on the host at native
+# speed, so a run is some 40 seconds, most of them the program filling its inputs.
+float|-m 1280 5|GPU 0: OK
+double|-d -m 1536 5|GPU 0: OK
+tensor|-tc -m 768 5|GPU 0: OK

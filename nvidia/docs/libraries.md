@@ -253,7 +253,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (band and packed storage included; the plane rotations bit for bit), batched GEMV in every type, triangular solves, batched LU (`getrfBatched`/`getrsBatched`/`getriBatched`/`matinvBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`), the `_64` forms, cuBLASXt over several devices and the legacy (`cublas.h`) API; see [cublas.md](cublas.md) |
-| cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4, strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 tensor-wise and row-wise scales with amax, and the block-scaled FP8/FP4 modes (documentation-derived) |
+| cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4 and int8 x int8 into int32 (`CUBLAS_COMPUTE_32I`, what `torch._int_mm` calls), strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 tensor-wise and row-wise scales with amax, and the block-scaled FP8/FP4 modes (documentation-derived) |
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans, LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
@@ -864,12 +864,16 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   carry a static CUDA runtime that asks the driver for its export table.
 - **NCCL**: symmetric memory windows (registration returns a NULL window, as
   NCCL does without peer mappings) and the network plugin interface (there is
-  no network to plug into); see "NCCL: a file-backed transport". Not exported,
-  so a program that needs one fails to load with its name: the 2.28+ host API
-  `ncclCommRevoke`, `ncclCommGrow`, `ncclCommGetUniqueId`,
-  `ncclCommSuspend`/`ncclCommResume`, `ncclCommMemStats`, the `nccl*Config`
-  collective forms, the one-sided `ncclPutSignal`/`ncclSignal`/`ncclWaitSignal`,
-  `ncclParam*`, and the device API (`ncclDevCommCreate`, LSA and GIN). Shrink
+  no network to plug into); see "NCCL: a file-backed transport". Exported so
+  that a program that binds them at load time (PyTorch for CUDA 13 does, for
+  NCCL 2.30) still starts, but answering `ncclInvalidUsage` with a message
+  when called: `ncclCommRevoke`, `ncclCommGrow`, `ncclCommGetUniqueId`,
+  `ncclCommSuspend`/`ncclCommResume`, `ncclCommMemStats`, the one-sided
+  `ncclPutSignal`/`ncclSignal`/`ncclWaitSignal`, and the device API's host
+  calls (`ncclDevCommCreate`/`Destroy`, `ncclGetLsaMultimemDevicePointer`,
+  `ncclGetPeerDevicePointer`). Not exported at all, so a program that needs
+  one fails to load with its name: the `nccl*Config` collective forms,
+  `ncclParam*`, and the rest of the device API (GIN). Shrink
   refuses an excluded rank outside the communicator, which NCCL 2.29.7
   accepts and miscounts.
 - **cuFile**: the nvidia-fs (DMA) path itself, RDMA and user-space file system

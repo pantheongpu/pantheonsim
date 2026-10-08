@@ -170,12 +170,21 @@ RegisterUsage analyze_registers(const EntryFn& fn) {
 
   // Successors. An unpredicated branch goes only to its target; a predicated
   // one may also fall through; ret ends the path.
-  auto successors = [&](size_t i, size_t* buf) -> int {
+  auto successors = [&](size_t i, size_t* buf) -> int {   // buf: room for succ_cap entries
     const Instr& ins = fn.body[i];
     if (std::holds_alternative<OpRet>(ins.op)) return 0;
     if (const auto* br = std::get_if<OpBra>(&ins.op)) {
       int cnt = 0;
       if (br->target < n) buf[cnt++] = br->target;
+      if (ins.has_pred && i + 1 < n) buf[cnt++] = i + 1;
+      return cnt;
+    }
+    if (const auto* bx = std::get_if<OpBrx>(&ins.op)) {
+      // Any entry of the list may be taken, so all of them are successors;
+      // the buffer is sized for that below.
+      int cnt = 0;
+      for (size_t t : bx->targets)
+        if (t < n) buf[cnt++] = t;
       if (ins.has_pred && i + 1 < n) buf[cnt++] = i + 1;
       return cnt;
     }
@@ -196,13 +205,18 @@ RegisterUsage analyze_registers(const EntryFn& fn) {
   auto bit_set = [](uint64_t* w, uint32_t id) { w[id >> 6] |= 1ull << (id & 63); };
   auto bit_clear = [](uint64_t* w, uint32_t id) { w[id >> 6] &= ~(1ull << (id & 63)); };
 
+  // A branch list can name any number of entries; every other instruction has at most two successors.
+  size_t succ_cap = 2;
+  for (const Instr& in : fn.body)
+    if (const auto* bx = std::get_if<OpBrx>(&in.op)) succ_cap = std::max(succ_cap, bx->targets.size() + 1);
+  std::vector<size_t> succ(succ_cap);
+
   bool changed = true;
   while (changed) {
     changed = false;
     for (size_t ii = n; ii-- > 0;) {
       std::fill(scratch.begin(), scratch.end(), 0ull);
-      size_t succ[2];
-      const int ns = successors(ii, succ);
+      const int ns = successors(ii, succ.data());
       for (int k = 0; k < ns; ++k) {
         const uint64_t* in = &live_in[succ[k] * words];
         for (size_t w = 0; w < words; ++w) scratch[w] |= in[w];

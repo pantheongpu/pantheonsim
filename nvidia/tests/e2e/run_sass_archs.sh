@@ -37,11 +37,11 @@ archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm
 # [:last one it runs on (runtime_conformance checks a T4's properties)].
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
        runtime_conformance:75:75 symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75
-       texture_layers:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 smem_size_regs:75
+       texture_layers:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
        dynamic_parallelism:75 cdp_device_api:75 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
-       stmatrix:90a setmaxnreg:90a tcgen05_gemm:100a mma_blockscale:120a})
+       stmatrix:90a setmaxnreg:90a setmaxnreg:100a bulk_copy:90a tcgen05_gemm:100a tmem_alloc_pair:100a mma_blockscale:120a ldmatrix_forms:100a ldmatrix_forms:120a narrow_cvt:100a narrow_cvt:120a})
 cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 # Built the way a program that uses dynamic parallelism is (-rdc=true, linked
 # with cudadevrt): the linked cubin carries the device runtime library and the
@@ -116,12 +116,10 @@ check() {
     echo "FAIL $arch $p: does not build"; sed 's/^/    /' "$bin.build" | tail -5; fails=1; return
   fi
   require_shim_libs "$shim" "$bin" >/dev/null || return
-  # Both shims carry the simulator's core, which a sanitizer build reports as an
-  # ODR violation when one program loads the two (as run_mixed_apis.sh skips).
-  if [[ -n ${san_flags[*]} ]] && readelf -d "$bin" | grep -q 'NEEDED.*libcuda\.so'; then
-    echo "SKIP $arch $p: a sanitizer build loads two copies of the core"; return
-  fi
-  local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim")
+  # Some programs load libcuda beside libcudart (linked, or fetched as
+  # runtime_conformance fetches a driver function): both_shims_env is what a
+  # sanitizer build needs for that.
+  local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
   [[ $p == runtime_conformance ]] && env+=(VGPU_DEVICE_COUNT=2)   # as run_runtime_conformance.sh runs it
   [[ $p == managed_vars ]] && env+=(VGPU_DEVICE_COUNT=2)          # as its own test runs it: two devices
   sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 timeout 600 "$bin" 2>&1)"; rs=$?
