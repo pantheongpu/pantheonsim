@@ -1,385 +1,964 @@
-// libvgpunvenc — VirtualGPU's implementation of the NVENC encode API.
+// libvgpunvenc -- VirtualGPU's NVENC, presented as libnvidia-encode.so.1.
 //
-// WHY THIS EXISTS
-// ---------------
-// NVENC (`libnvidia-encode.so.1`) is a *driver* component, not a redistributable
-// SDK library: it drives fixed-function encoder silicon through the kernel
-// driver and never routes through the public CUDA API, so VirtualGPU's libcuda
-// cannot intercept it. But applications load it with
-// `dlopen("libnvidia-encode.so.1")` — a bare soname, which searches
-// LD_LIBRARY_PATH first — so we can supply our own implementation the same way
-// we supply libcuda.so.1 and libcudart.so.13.
+// NVENC is a driver component: applications dlopen the bare soname, so putting
+// this library first on LD_LIBRARY_PATH stands in for the card's encoder, the
+// way libcuda.so.1 stands in for the driver. Everything an application can ask
+// of the API answers as NVIDIA's library answered on an RTX 3060 (NVENC API
+// 13.0, driver 595; nvidia/tests/e2e/nvenc_api.cpp and its golden file pin
+// each status, count, capability, preset configuration and error string): the
+// session, the codec / profile / format / capability / preset queries,
+// initialisation and its validation, input buffers, registered CUDA resources,
+// the locked bitstream's fields, sequence parameters, reconfiguration, and the
+// calls that are NVIDIA's "not supported here" on this part.
 //
-// WHAT THIS IS (AND IS NOT)
-// -------------------------
-// This is NOT an H.264/HEVC encoder. It implements the documented NVENC API
-// (from the public Video Codec SDK header, nvEncodeAPI.h) with a deterministic,
-// *content-derived* bitstream: encoding the same frame twice yields identical
-// bytes, and changing one pixel changes the output. That is precisely the
-// property encoder stress/SDC tests rely on — they capture a golden bitstream
-// and compare later frames against it to detect silent corruption through the
-// encode path — so those tests work correctly here.
-//
-// It does NOT produce a decodable video stream. Anything that needs real
-// compressed output, rate control behavior, or codec conformance must use
-// hardware. That limitation is reported by `vgpu info` and documented.
-//
-// Input buffers are backed by VirtualGPU *device* memory, because applications
-// legitimately run CUDA kernels against the locked input pointer.
+// What is not NVIDIA's: the encoder. A frame is written as an H.264 IDR
+// picture whose every macroblock is I_PCM (nvenc_h264.hpp): a conformant,
+// lossless stream any H.264 decoder returns the input from, but not
+// compression -- rate control, GOP structure, B-frames, the preset and every
+// quality setting are accepted and change nothing, and every picture is an
+// IDR. HEVC sessions open and answer every query, but encoding refuses with
+// NV_ENC_ERR_UNSUPPORTED_PARAM: no HEVC stream is written. The input is 8-bit
+// 4:2:0 (NV12, YV12, IYUV) or 32-bit RGB (ARGB, ABGR; converted to BT.601
+// limited-range YCbCr); the 10-bit and 4:4:4 formats the card takes are refused.
+#include <cuda_runtime.h>
 #include <nvEncodeAPI.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
-#include "vgpu/error.hpp"
-#include "vgpu/memory.hpp"
+#include "nvenc_h264.hpp"
 
-// The CUDA runtime shim owns the virtual devices; reuse its allocator so
-// encoder input buffers are real device memory that kernels can write.
-extern "C" {
-int cudaMalloc(void** ptr, size_t size);
-int cudaFree(void* ptr);
-int cudaMemcpy(void* dst, const void* src, size_t count, int kind);
-}
+#include "nvenc_tables.inc"
+
+#define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
 namespace {
-
-constexpr int kMemcpyDeviceToHost = 2;
 
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && q[0] == '1';
 }
 
-struct InputBuffer {
-  uint32_t width = 0, height = 0, pitch = 0;
-  // Rows of bytes the buffer holds: the image height for packed RGB, and one
-  // and a half times it for the 4:2:0 formats, whose chroma follows the luma.
-  uint32_t rows = 0;
-  NV_ENC_BUFFER_FORMAT format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
-  size_t bytes = 0;
-  void* device_ptr = nullptr;  // VirtualGPU device memory, kernel-writable
+// A structure's version word has the API version in its low 16 bits, which the
+// card does not look at (a list built with API 14's version is accepted).
+bool version_ok(uint32_t got, uint32_t want) { return (got & 0xFFFF0000u) == (want & 0xFFFF0000u); }
+
+enum Codec { kNoCodec = -1, kH264 = 0, kHevc = 1 };
+
+bool same_guid(const GUID& a, const GUID& b) { return !std::memcmp(&a, &b, sizeof a); }
+int codec_of(const GUID& g) {
+  if (same_guid(g, NV_ENC_CODEC_H264_GUID)) return kH264;
+  if (same_guid(g, NV_ENC_CODEC_HEVC_GUID)) return kHevc;
+  return kNoCodec;
+}
+int preset_index(const GUID& g) {
+  const GUID* all[] = {&NV_ENC_PRESET_P1_GUID, &NV_ENC_PRESET_P2_GUID, &NV_ENC_PRESET_P3_GUID, &NV_ENC_PRESET_P4_GUID,
+                       &NV_ENC_PRESET_P5_GUID, &NV_ENC_PRESET_P6_GUID, &NV_ENC_PRESET_P7_GUID};
+  for (int i = 0; i < 7; ++i)
+    if (same_guid(g, *all[i])) return i + 1;
+  return 0;
+}
+
+const NV_ENC_BUFFER_FORMAT kFormatsH264[] = {
+    NV_ENC_BUFFER_FORMAT_NV12, NV_ENC_BUFFER_FORMAT_YV12, NV_ENC_BUFFER_FORMAT_IYUV, NV_ENC_BUFFER_FORMAT_YUV444,
+    NV_ENC_BUFFER_FORMAT_ARGB, NV_ENC_BUFFER_FORMAT_ABGR, NV_ENC_BUFFER_FORMAT_AYUV, NV_ENC_BUFFER_FORMAT_ARGB10,
+    NV_ENC_BUFFER_FORMAT_ABGR10};
+const NV_ENC_BUFFER_FORMAT kFormatsHevc[] = {
+    NV_ENC_BUFFER_FORMAT_NV12, NV_ENC_BUFFER_FORMAT_YV12, NV_ENC_BUFFER_FORMAT_IYUV, NV_ENC_BUFFER_FORMAT_YUV444,
+    NV_ENC_BUFFER_FORMAT_YUV420_10BIT, NV_ENC_BUFFER_FORMAT_YUV444_10BIT, NV_ENC_BUFFER_FORMAT_ARGB,
+    NV_ENC_BUFFER_FORMAT_ABGR, NV_ENC_BUFFER_FORMAT_AYUV, NV_ENC_BUFFER_FORMAT_ARGB10, NV_ENC_BUFFER_FORMAT_ABGR10};
+
+// The profiles, in the order the card lists them.
+const GUID* const kProfilesH264[] = {&NV_ENC_H264_PROFILE_BASELINE_GUID, &NV_ENC_H264_PROFILE_MAIN_GUID,
+                                     &NV_ENC_H264_PROFILE_HIGH_GUID,     &NV_ENC_H264_PROFILE_STEREO_GUID,
+                                     &NV_ENC_H264_PROFILE_HIGH_444_GUID, &NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID};
+const GUID* const kProfilesHevc[] = {&NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID, &NV_ENC_HEVC_PROFILE_MAIN_GUID,
+                                     &NV_ENC_HEVC_PROFILE_MAIN10_GUID, &NV_ENC_HEVC_PROFILE_FREXT_GUID};
+const GUID* const kPresetGuids[7] = {&NV_ENC_PRESET_P1_GUID, &NV_ENC_PRESET_P2_GUID, &NV_ENC_PRESET_P3_GUID,
+                                 &NV_ENC_PRESET_P4_GUID, &NV_ENC_PRESET_P5_GUID, &NV_ENC_PRESET_P6_GUID,
+                                 &NV_ENC_PRESET_P7_GUID};
+
+struct Input {
+  void* dev = nullptr;
+  uint32_t w = 0, h = 0, pitch = 0;
+  NV_ENC_BUFFER_FORMAT fmt = NV_ENC_BUFFER_FORMAT_UNDEFINED;
   bool locked = false;
 };
-
-struct BitstreamBuffer {
+struct Picture {
   std::vector<uint8_t> data;
+  uint64_t ts = 0, dur = 0;
+  uint32_t frame_idx = 0;
+  int pic_struct = 1;
+};
+struct Output {
+  std::deque<Picture> pending;   // encoded, not yet locked: the card queues them per buffer
+  Picture current;               // the one locked
   bool locked = false;
+};
+struct Registered {
+  void* dev = nullptr;
+  uint32_t w = 0, h = 0, pitch = 0;
+  NV_ENC_BUFFER_FORMAT fmt = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+  bool mapped = false;
+};
+struct Mapped {
+  Registered* reg = nullptr;
 };
 
 struct Session {
-  uint32_t width = 0, height = 0;
+  std::string last_error = "Success.";
   bool initialized = false;
-  std::map<void*, InputBuffer> inputs;
-  std::map<void*, BitstreamBuffer> outputs;
-  // The most recent EncodePicture result, delivered by LockBitstream.
-  std::vector<uint8_t> pending;
-  void* pending_output = nullptr;
-  uint64_t frame_index = 0;
+  int codec = kNoCodec;
+  uint32_t width = 0, height = 0;
+  NV_ENC_INITIALIZE_PARAMS init{};
+  NV_ENC_CONFIG config{};
+  std::map<void*, std::unique_ptr<Input>> inputs;
+  std::map<void*, std::unique_ptr<Output>> outputs;
+  std::map<void*, std::unique_ptr<Registered>> registered;
+  std::map<void*, std::unique_ptr<Mapped>> mapped;
+  uint64_t frames = 0;
+  uint32_t idr_id = 0;
+  bool sent_parameter_sets = false;
 };
 
 std::mutex g_mu;
-std::map<void*, Session*> g_sessions;
+std::set<Session*> g_sessions;
 
-// A deterministic content-derived "bitstream". Each 64x64 tile contributes an
-// FNV-1a hash of its pixels, so identical frames encode identically and any
-// changed pixel changes the output — the property SDC verification needs.
-std::vector<uint8_t> encode_frame(const std::vector<uint8_t>& frame, uint32_t width,
-                                  uint32_t height, uint32_t rows, uint32_t pitch,
-                                  uint32_t bytes_per_pixel) {
-  std::vector<uint8_t> out;
-  // A short pseudo-header so consumers see stable, plausible framing.
-  const uint8_t header[] = {0x00, 0x00, 0x00, 0x01, 'V', 'G', 'P', 'U'};
-  out.insert(out.end(), header, header + sizeof header);
-  auto push32 = [&out](uint32_t v) {
-    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
-  };
-  push32(width);
-  push32(height);
-
-  constexpr uint32_t kTile = 64;
-  // Every row of the buffer, chroma included: a corrupted chroma sample must
-  // change the output as surely as a corrupted luma sample does.
-  for (uint32_t ty = 0; ty < rows; ty += kTile) {
-    for (uint32_t tx = 0; tx < width; tx += kTile) {
-      uint32_t h = 2166136261u;
-      for (uint32_t y = ty; y < std::min(ty + kTile, rows); ++y) {
-        const uint8_t* row = frame.data() + static_cast<size_t>(y) * pitch;
-        for (uint32_t x = tx; x < std::min(tx + kTile, width); ++x) {
-          for (uint32_t b = 0; b < bytes_per_pixel; ++b)
-            h = (h ^ row[x * bytes_per_pixel + b]) * 16777619u;
-        }
-      }
-      push32(h);
-    }
-  }
-  return out;
+Session* find(void* enc) {
+  auto* s = static_cast<Session*>(enc);
+  return g_sessions.count(s) ? s : nullptr;
 }
 
-uint32_t bytes_per_pixel(NV_ENC_BUFFER_FORMAT fmt) {
+NVENCSTATUS fail(Session* s, NVENCSTATUS st, const char* message) {
+  if (s) s->last_error = message;
+  return st;
+}
+
+uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
+
+// The pitch (bytes per row) the driver gives a locked input buffer: the row
+// rounded up to 64 bytes for the semi-planar and 4:4:4 formats and to 512 for
+// the three-plane 4:2:0 ones and the packed 32-bit ones (measured at twelve widths from 145 to 4096
+// pixels; the table is in nvidia/tests/e2e/nvenc_api.cpp and fits exactly).
+uint32_t buffer_pitch(NV_ENC_BUFFER_FORMAT fmt, uint32_t width) {
   switch (fmt) {
-    case NV_ENC_BUFFER_FORMAT_ARGB:
-    case NV_ENC_BUFFER_FORMAT_ABGR:
-    case NV_ENC_BUFFER_FORMAT_ARGB10:
-    case NV_ENC_BUFFER_FORMAT_ABGR10:
-      return 4;
     case NV_ENC_BUFFER_FORMAT_NV12:
+    case NV_ENC_BUFFER_FORMAT_YUV444: return align_up(width, 64);
     case NV_ENC_BUFFER_FORMAT_YV12:
-    case NV_ENC_BUFFER_FORMAT_IYUV:
-      return 1;  // luma plane stride; chroma follows
-    default:
-      return 4;
+    case NV_ENC_BUFFER_FORMAT_IYUV: return align_up(width, 512);
+    default: return align_up(width * 4, 512);
   }
 }
 
-// Rows of bytes a frame occupies. The 4:2:0 formats carry half-height chroma
-// after the luma, so a buffer sized for the luma alone is a third too small and
-// an application filling the whole frame writes past its end.
+// Rows of `pitch` bytes a buffer of this format holds.
 uint32_t buffer_rows(NV_ENC_BUFFER_FORMAT fmt, uint32_t height) {
   switch (fmt) {
     case NV_ENC_BUFFER_FORMAT_NV12:
     case NV_ENC_BUFFER_FORMAT_YV12:
-    case NV_ENC_BUFFER_FORMAT_IYUV:
-      return height + (height + 1) / 2;
-    default:
-      return height;
+    case NV_ENC_BUFFER_FORMAT_IYUV: return height + (height + 1) / 2;
+    case NV_ENC_BUFFER_FORMAT_YUV444: return 3 * height;
+    default: return height;
   }
 }
 
-Session* session_of(void* enc) {
-  auto it = g_sessions.find(enc);
-  return it == g_sessions.end() ? nullptr : it->second;
+bool format_listed(int codec, NV_ENC_BUFFER_FORMAT fmt) {
+  const NV_ENC_BUFFER_FORMAT* l = codec == kHevc ? kFormatsHevc : kFormatsH264;
+  const size_t n = codec == kHevc ? sizeof kFormatsHevc / sizeof *kFormatsHevc : sizeof kFormatsH264 / sizeof *kFormatsH264;
+  for (size_t i = 0; i < n; ++i)
+    if (l[i] == fmt) return true;
+  return false;
+}
+
+// Whether this encoder can take the format as encode input (the 8-bit 4:2:0 ones
+// and 32-bit RGB).
+bool encodable(NV_ENC_BUFFER_FORMAT fmt) {
+  switch (fmt) {
+    case NV_ENC_BUFFER_FORMAT_NV12:
+    case NV_ENC_BUFFER_FORMAT_YV12:
+    case NV_ENC_BUFFER_FORMAT_IYUV:
+    case NV_ENC_BUFFER_FORMAT_ARGB:
+    case NV_ENC_BUFFER_FORMAT_ABGR: return true;
+    default: return false;
+  }
+}
+
+// Preset configurations: the card's, as the non-zero words of the structure.
+void preset_config(int codec, int preset, int tuning, NV_ENC_PRESET_CONFIG* out) {
+  const uint32_t v0 = out->version, v2 = out->presetCfg.version;
+  std::memset(out, 0, sizeof *out);
+  for (const PresetWords& p : kPresets)
+    if (p.codec == codec && p.preset == preset && p.tuning == tuning) {
+      uint32_t* words = reinterpret_cast<uint32_t*>(out);
+      for (int i = 0; i < p.n; ++i) words[p.w[i][0]] = p.w[i][1];
+      break;
+    }
+  out->version = v0;
+  out->presetCfg.version = v2;
 }
 
 }  // namespace
 
-#define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
+/* ---- the function table -------------------------------------------------- */
 
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncOpenEncodeSessionEx(
-    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS* params, void** encoder) {
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncodeAPIGetMaxSupportedVersion(uint32_t* version) {
+  if (!version) return NV_ENC_ERR_INVALID_PTR;
+  *version = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncOpenEncodeSessionEx(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS* params, void** encoder);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeGUIDCount(void*, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeGUIDs(void*, GUID*, uint32_t, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeProfileGUIDCount(void*, GUID, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeProfileGUIDs(void*, GUID, GUID*, uint32_t, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetInputFormatCount(void*, GUID, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetInputFormats(void*, GUID, NV_ENC_BUFFER_FORMAT*, uint32_t, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeCaps(void*, GUID, NV_ENC_CAPS_PARAM*, int*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetCount(void*, GUID, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetGUIDs(void*, GUID, GUID*, uint32_t, uint32_t*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfig(void*, GUID, GUID, NV_ENC_PRESET_CONFIG*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfigEx(void*, GUID, GUID, NV_ENC_TUNING_INFO, NV_ENC_PRESET_CONFIG*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInitializeEncoder(void*, NV_ENC_INITIALIZE_PARAMS*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateInputBuffer(void*, NV_ENC_CREATE_INPUT_BUFFER*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyInputBuffer(void*, NV_ENC_INPUT_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateBitstreamBuffer(void*, NV_ENC_CREATE_BITSTREAM_BUFFER*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyBitstreamBuffer(void*, NV_ENC_OUTPUT_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void*, NV_ENC_PIC_PARAMS*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockBitstream(void*, NV_ENC_LOCK_BITSTREAM*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnlockBitstream(void*, NV_ENC_OUTPUT_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockInputBuffer(void*, NV_ENC_LOCK_INPUT_BUFFER*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnlockInputBuffer(void*, NV_ENC_INPUT_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeStats(void*, NV_ENC_STAT*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParams(void*, NV_ENC_SEQUENCE_PARAM_PAYLOAD*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyEncoder(void*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRegisterResource(void*, NV_ENC_REGISTER_RESOURCE*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnregisterResource(void*, NV_ENC_REGISTERED_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncMapInputResource(void*, NV_ENC_MAP_INPUT_RESOURCE*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnmapInputResource(void*, NV_ENC_INPUT_PTR);
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncOpenEncodeSession(void*, uint32_t, void**);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRegisterAsyncEvent(void*, NV_ENC_EVENT_PARAMS*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnregisterAsyncEvent(void*, NV_ENC_EVENT_PARAMS*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInvalidateRefFrames(void*, uint64_t);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncReconfigureEncoder(void*, NV_ENC_RECONFIGURE_PARAMS*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateMVBuffer(void*, NV_ENC_CREATE_MV_BUFFER*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyMVBuffer(void*, NV_ENC_OUTPUT_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRunMotionEstimationOnly(void*, NV_ENC_MEONLY_PARAMS*);
+extern "C" const char* NVENCAPI NvEncGetLastErrorString(void*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncSetIOCudaStreams(void*, NV_ENC_CUSTREAM_PTR, NV_ENC_CUSTREAM_PTR);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParamEx(void*, NV_ENC_INITIALIZE_PARAMS*, NV_ENC_SEQUENCE_PARAM_PAYLOAD*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRestoreEncoderState(void*, NV_ENC_RESTORE_ENCODER_STATE_PARAMS*);
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLookaheadPicture(void*, NV_ENC_LOOKAHEAD_PIC_PARAMS*);
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTION_LIST* list) {
+  if (!list) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(list->version, NV_ENCODE_API_FUNCTION_LIST_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  const uint32_t version = list->version;
+  std::memset(list, 0, sizeof *list);
+  list->version = version;
+  list->nvEncOpenEncodeSession = NvEncOpenEncodeSession;
+  list->nvEncGetEncodeGUIDCount = NvEncGetEncodeGUIDCount;
+  list->nvEncGetEncodeProfileGUIDCount = NvEncGetEncodeProfileGUIDCount;
+  list->nvEncGetEncodeProfileGUIDs = NvEncGetEncodeProfileGUIDs;
+  list->nvEncGetEncodeGUIDs = NvEncGetEncodeGUIDs;
+  list->nvEncGetInputFormatCount = NvEncGetInputFormatCount;
+  list->nvEncGetInputFormats = NvEncGetInputFormats;
+  list->nvEncGetEncodeCaps = NvEncGetEncodeCaps;
+  list->nvEncGetEncodePresetCount = NvEncGetEncodePresetCount;
+  list->nvEncGetEncodePresetGUIDs = NvEncGetEncodePresetGUIDs;
+  list->nvEncGetEncodePresetConfig = NvEncGetEncodePresetConfig;
+  list->nvEncInitializeEncoder = NvEncInitializeEncoder;
+  list->nvEncCreateInputBuffer = NvEncCreateInputBuffer;
+  list->nvEncDestroyInputBuffer = NvEncDestroyInputBuffer;
+  list->nvEncCreateBitstreamBuffer = NvEncCreateBitstreamBuffer;
+  list->nvEncDestroyBitstreamBuffer = NvEncDestroyBitstreamBuffer;
+  list->nvEncEncodePicture = NvEncEncodePicture;
+  list->nvEncLockBitstream = NvEncLockBitstream;
+  list->nvEncUnlockBitstream = NvEncUnlockBitstream;
+  list->nvEncLockInputBuffer = NvEncLockInputBuffer;
+  list->nvEncUnlockInputBuffer = NvEncUnlockInputBuffer;
+  list->nvEncGetEncodeStats = NvEncGetEncodeStats;
+  list->nvEncGetSequenceParams = NvEncGetSequenceParams;
+  list->nvEncMapInputResource = NvEncMapInputResource;
+  list->nvEncUnmapInputResource = NvEncUnmapInputResource;
+  list->nvEncDestroyEncoder = NvEncDestroyEncoder;
+  list->nvEncOpenEncodeSessionEx = NvEncOpenEncodeSessionEx;
+  list->nvEncRegisterResource = NvEncRegisterResource;
+  list->nvEncUnregisterResource = NvEncUnregisterResource;
+  list->nvEncGetEncodePresetConfigEx = NvEncGetEncodePresetConfigEx;
+  list->nvEncRegisterAsyncEvent = NvEncRegisterAsyncEvent;
+  list->nvEncUnregisterAsyncEvent = NvEncUnregisterAsyncEvent;
+  list->nvEncInvalidateRefFrames = NvEncInvalidateRefFrames;
+  list->nvEncReconfigureEncoder = NvEncReconfigureEncoder;
+  list->nvEncCreateMVBuffer = NvEncCreateMVBuffer;
+  list->nvEncDestroyMVBuffer = NvEncDestroyMVBuffer;
+  list->nvEncRunMotionEstimationOnly = NvEncRunMotionEstimationOnly;
+  list->nvEncGetLastErrorString = NvEncGetLastErrorString;
+  list->nvEncSetIOCudaStreams = NvEncSetIOCudaStreams;
+  list->nvEncGetSequenceParamEx = NvEncGetSequenceParamEx;
+  list->nvEncRestoreEncoderState = NvEncRestoreEncoderState;
+  list->nvEncLookaheadPicture = NvEncLookaheadPicture;
+  return NV_ENC_SUCCESS;
+}
+
+/* ---- sessions ---------------------------------------------------------- */
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncOpenEncodeSessionEx(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS* params, void** encoder) {
   if (!params || !encoder) return NV_ENC_ERR_INVALID_PTR;
-  if (params->deviceType != NV_ENC_DEVICE_TYPE_CUDA) {
-    if (!quiet())
-      std::fprintf(stderr,
-                   "[vgpu] NvEncOpenEncodeSessionEx: only NV_ENC_DEVICE_TYPE_CUDA is supported\n");
-    return NV_ENC_ERR_UNSUPPORTED_DEVICE;
+  if (!version_ok(params->version, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  switch (params->deviceType) {
+    case NV_ENC_DEVICE_TYPE_CUDA: break;
+    case NV_ENC_DEVICE_TYPE_OPENGL: return NV_ENC_ERR_INVALID_DEVICE;
+    default: return NV_ENC_ERR_UNSUPPORTED_DEVICE;   // DirectX, and values outside the enum
   }
+  if (!params->device) return NV_ENC_ERR_INVALID_PTR;
   std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = new Session();
+  auto* s = new Session();
+  g_sessions.insert(s);
   *encoder = s;
-  g_sessions[s] = s;
   if (!quiet())
-    std::fprintf(stderr, "[vgpu] virtual NVENC session opened (deterministic content-derived "
-                         "bitstream; not a real HEVC encoder)\n");
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInitializeEncoder(void* encoder,
-                                                        NV_ENC_INITIALIZE_PARAMS* params) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s || !params) return NV_ENC_ERR_INVALID_PTR;
-  s->width = params->encodeWidth;
-  s->height = params->encodeHeight;
-  s->initialized = true;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfigEx(void* encoder, GUID encodeGUID,
-                                                              GUID presetGUID,
-                                                              NV_ENC_TUNING_INFO tuningInfo,
-                                                              NV_ENC_PRESET_CONFIG* presetConfig) {
-  (void)encodeGUID;
-  (void)presetGUID;
-  (void)tuningInfo;
-  std::lock_guard<std::mutex> lock(g_mu);
-  if (!session_of(encoder) || !presetConfig) return NV_ENC_ERR_INVALID_PTR;
-  // Hand back a zeroed config with the versions the caller expects; callers
-  // then override the fields they care about (e.g. constant-QP rate control).
-  uint32_t cfg_version = presetConfig->presetCfg.version;
-  uint32_t version = presetConfig->version;
-  std::memset(&presetConfig->presetCfg, 0, sizeof presetConfig->presetCfg);
-  presetConfig->version = version;
-  presetConfig->presetCfg.version = cfg_version;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateInputBuffer(void* encoder,
-                                                        NV_ENC_CREATE_INPUT_BUFFER* params) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s || !params) return NV_ENC_ERR_INVALID_PTR;
-  InputBuffer buf;
-  buf.width = params->width;
-  buf.height = params->height;
-  uint32_t bpp = bytes_per_pixel(params->bufferFmt);
-  buf.pitch = params->width * bpp;
-  buf.rows = buffer_rows(params->bufferFmt, params->height);
-  buf.format = params->bufferFmt;
-  buf.bytes = static_cast<size_t>(buf.pitch) * buf.rows;
-  // Device memory: applications legitimately run CUDA kernels on the locked
-  // pointer, so it must be addressable by the virtual GPU.
-  void* dptr = nullptr;
-  if (cudaMalloc(&dptr, buf.bytes) != 0 || !dptr) return NV_ENC_ERR_OUT_OF_MEMORY;
-  buf.device_ptr = dptr;
-  params->inputBuffer = dptr;  // the handle is the device pointer itself
-  s->inputs[dptr] = buf;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyInputBuffer(void* encoder, NV_ENC_INPUT_PTR input) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s) return NV_ENC_ERR_INVALID_PTR;
-  auto it = s->inputs.find(input);
-  if (it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
-  cudaFree(it->second.device_ptr);
-  s->inputs.erase(it);
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockInputBuffer(void* encoder,
-                                                      NV_ENC_LOCK_INPUT_BUFFER* params) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s || !params) return NV_ENC_ERR_INVALID_PTR;
-  auto it = s->inputs.find(params->inputBuffer);
-  if (it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
-  it->second.locked = true;
-  params->bufferDataPtr = it->second.device_ptr;  // kernel-writable
-  params->pitch = it->second.pitch;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnlockInputBuffer(void* encoder, NV_ENC_INPUT_PTR input) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s) return NV_ENC_ERR_INVALID_PTR;
-  auto it = s->inputs.find(input);
-  if (it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
-  it->second.locked = false;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI
-NvEncCreateBitstreamBuffer(void* encoder, NV_ENC_CREATE_BITSTREAM_BUFFER* params) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s || !params) return NV_ENC_ERR_INVALID_PTR;
-  auto* handle = new BitstreamBuffer();
-  params->bitstreamBuffer = handle;
-  s->outputs[handle] = BitstreamBuffer();
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyBitstreamBuffer(void* encoder,
-                                                             NV_ENC_OUTPUT_PTR bitstream) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s) return NV_ENC_ERR_INVALID_PTR;
-  s->outputs.erase(bitstream);
-  delete static_cast<BitstreamBuffer*>(bitstream);
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PARAMS* params) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s || !params) return NV_ENC_ERR_INVALID_PTR;
-  auto it = s->inputs.find(params->inputBuffer);
-  if (it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
-  const InputBuffer& in = it->second;
-
-  // Read the frame out of virtual device memory and "encode" it.
-  std::vector<uint8_t> frame(in.bytes);
-  if (cudaMemcpy(frame.data(), in.device_ptr, in.bytes, kMemcpyDeviceToHost) != 0)
-    return NV_ENC_ERR_GENERIC;
-  s->pending = encode_frame(frame, in.width, in.height, in.rows, in.pitch,
-                            bytes_per_pixel(in.format));
-  s->pending_output = params->outputBitstream;
-  ++s->frame_index;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockBitstream(void* encoder, NV_ENC_LOCK_BITSTREAM* params) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s || !params) return NV_ENC_ERR_INVALID_PTR;
-  auto it = s->outputs.find(params->outputBitstream);
-  if (it == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
-  it->second.data = s->pending;
-  it->second.locked = true;
-  params->bitstreamBufferPtr = it->second.data.data();
-  params->bitstreamSizeInBytes = static_cast<uint32_t>(it->second.data.size());
-  params->outputTimeStamp = s->frame_index;
-  params->pictureType = NV_ENC_PIC_TYPE_IDR;
-  return NV_ENC_SUCCESS;
-}
-
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnlockBitstream(void* encoder, NV_ENC_OUTPUT_PTR bitstream) {
-  std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s) return NV_ENC_ERR_INVALID_PTR;
-  auto it = s->outputs.find(bitstream);
-  if (it == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
-  it->second.locked = false;
+    std::fprintf(stderr, "[vgpu] virtual NVENC session opened (H.264 I_PCM stream: lossless, uncompressed; see nvidia/docs/libraries.md)\n");
   return NV_ENC_SUCCESS;
 }
 
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyEncoder(void* encoder) {
   std::lock_guard<std::mutex> lock(g_mu);
-  Session* s = session_of(encoder);
-  if (!s) return NV_ENC_ERR_INVALID_PTR;
-  for (auto& [ptr, buf] : s->inputs) cudaFree(buf.device_ptr);
-  // Bitstream handles are heap objects the caller never frees once the
-  // session is gone: DestroyBitstreamBuffer rejects a destroyed session.
-  for (auto& [ptr, buf] : s->outputs) delete static_cast<BitstreamBuffer*>(ptr);
-  g_sessions.erase(encoder);
+  Session* s = find(encoder);
+  if (!s) return NV_ENC_ERR_INVALID_ENCODERDEVICE;
+  for (auto& in : s->inputs) cudaFree(in.second->dev);
+  g_sessions.erase(s);
   delete s;
   return NV_ENC_SUCCESS;
 }
 
-// Unimplemented entry points report NV_ENC_ERR_UNIMPLEMENTED rather than
-// crashing on a null jump, so a caller that needs them gets a clear failure.
-namespace {
-template <int Slot>
-NVENCSTATUS NVENCAPI unimplemented(...) {
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] NVENC function slot %d is not implemented by VirtualGPU\n", Slot);
-  return NV_ENC_ERR_UNIMPLEMENTED;
+// The text of the last failure a session reported (NVIDIA's, for the calls
+// measured; the string persists until another call fails).
+extern "C" __attribute__((visibility("default"))) const char* NVENCAPI NvEncGetLastErrorString(void* encoder) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  Session* s = find(encoder);
+  return s ? s->last_error.c_str() : nullptr;
 }
-}  // namespace
 
-VGPU_EXPORT NVENCSTATUS NVENCAPI
-NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTION_LIST* functionList) {
-  if (!functionList) return NV_ENC_ERR_INVALID_PTR;
-  uint32_t version = functionList->version;
-  std::memset(functionList, 0, sizeof *functionList);
-  functionList->version = version;
-  functionList->nvEncOpenEncodeSessionEx = NvEncOpenEncodeSessionEx;
-  functionList->nvEncInitializeEncoder = NvEncInitializeEncoder;
-  functionList->nvEncGetEncodePresetConfigEx = NvEncGetEncodePresetConfigEx;
-  functionList->nvEncCreateInputBuffer = NvEncCreateInputBuffer;
-  functionList->nvEncDestroyInputBuffer = NvEncDestroyInputBuffer;
-  functionList->nvEncLockInputBuffer = NvEncLockInputBuffer;
-  functionList->nvEncUnlockInputBuffer = NvEncUnlockInputBuffer;
-  functionList->nvEncCreateBitstreamBuffer = NvEncCreateBitstreamBuffer;
-  functionList->nvEncDestroyBitstreamBuffer = NvEncDestroyBitstreamBuffer;
-  functionList->nvEncEncodePicture = NvEncEncodePicture;
-  functionList->nvEncLockBitstream = NvEncLockBitstream;
-  functionList->nvEncUnlockBitstream = NvEncUnlockBitstream;
-  functionList->nvEncDestroyEncoder = NvEncDestroyEncoder;
+/* ---- queries ------------------------------------------------------------ */
+
+#define NEED_SESSION(var)                                                       \
+  std::lock_guard<std::mutex> lock(g_mu);                                      \
+  Session* var = find(encoder);                                                \
+  if (!var) return NV_ENC_ERR_INVALID_ENCODERDEVICE
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeGUIDCount(void* encoder, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!count) return NV_ENC_ERR_INVALID_PTR;
+  *count = 2;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeGUIDs(void* encoder, GUID* guids, uint32_t size, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!guids || !count) return NV_ENC_ERR_INVALID_PTR;
+  const GUID* all[] = {&NV_ENC_CODEC_H264_GUID, &NV_ENC_CODEC_HEVC_GUID};
+  *count = std::min<uint32_t>(size, 2);
+  for (uint32_t i = 0; i < *count; ++i) guids[i] = *all[i];
   return NV_ENC_SUCCESS;
 }
 
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncodeAPIGetMaxSupportedVersion(uint32_t* version) {
-  if (!version) return NV_ENC_ERR_INVALID_PTR;
-  *version = NVENCAPI_VERSION;
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeProfileGUIDCount(void* encoder, GUID codec, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!count) return NV_ENC_ERR_INVALID_PTR;
+  const int c = codec_of(codec);
+  if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  *count = c == kH264 ? 6 : 4;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeProfileGUIDs(void* encoder, GUID codec, GUID* guids, uint32_t size, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!guids || !count) return NV_ENC_ERR_INVALID_PTR;
+  const int c = codec_of(codec);
+  if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  const GUID* const* list = c == kH264 ? kProfilesH264 : kProfilesHevc;
+  const uint32_t n = c == kH264 ? 6 : 4;
+  *count = std::min(size, n);
+  for (uint32_t i = 0; i < *count; ++i) guids[i] = *list[i];
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetInputFormatCount(void* encoder, GUID codec, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!count) return NV_ENC_ERR_INVALID_PTR;
+  const int c = codec_of(codec);
+  if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  *count = c == kHevc ? sizeof kFormatsHevc / sizeof *kFormatsHevc : sizeof kFormatsH264 / sizeof *kFormatsH264;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetInputFormats(void* encoder, GUID codec, NV_ENC_BUFFER_FORMAT* formats, uint32_t size, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!formats || !count) return NV_ENC_ERR_INVALID_PTR;
+  const int c = codec_of(codec);
+  if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  const NV_ENC_BUFFER_FORMAT* list = c == kHevc ? kFormatsHevc : kFormatsH264;
+  const uint32_t n = c == kHevc ? sizeof kFormatsHevc / sizeof *kFormatsHevc : sizeof kFormatsH264 / sizeof *kFormatsH264;
+  *count = std::min(size, n);
+  for (uint32_t i = 0; i < *count; ++i) formats[i] = list[i];
+  return NV_ENC_SUCCESS;
+}
+
+// Capabilities 0..60 are the card's; a query past them is NV_ENC_ERR_INVALID_PARAM.
+// The structure's version is not checked (a query with version 0 is answered).
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeCaps(void* encoder, GUID codec, NV_ENC_CAPS_PARAM* param, int* value) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!param || !value) return NV_ENC_ERR_INVALID_PTR;
+  const int c = codec_of(codec);
+  if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  const int cap = static_cast<int>(param->capsToQuery);
+  if (cap < 0 || cap > 60) return NV_ENC_ERR_INVALID_PARAM;
+  *value = (c == kH264 ? kCapsH264 : kCapsHevc)[cap];
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetCount(void* encoder, GUID codec, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!count) return NV_ENC_ERR_INVALID_PTR;
+  if (codec_of(codec) == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  *count = 7;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetGUIDs(void* encoder, GUID codec, GUID* guids, uint32_t size, uint32_t* count) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!guids || !count) return NV_ENC_ERR_INVALID_PTR;
+  if (codec_of(codec) == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  *count = std::min<uint32_t>(size, 7);
+  for (uint32_t i = 0; i < *count; ++i) guids[i] = *kPresetGuids[i];
+  return NV_ENC_SUCCESS;
+}
+
+// The legacy preset query (the pre-P1-P7 presets) is NVIDIA's NV_ENC_ERR_UNSUPPORTED_PARAM
+// for every codec.
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfig(void* encoder, GUID, GUID, NV_ENC_PRESET_CONFIG* config) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!config) return NV_ENC_ERR_INVALID_PTR;
+  return NV_ENC_ERR_UNSUPPORTED_PARAM;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfigEx(void* encoder, GUID codec, GUID preset, NV_ENC_TUNING_INFO tuning,
+                                                              NV_ENC_PRESET_CONFIG* config) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!config) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(config->version, NV_ENC_PRESET_CONFIG_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  const int c = codec_of(codec);
+  if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
+  const int p = preset_index(preset);
+  const int t = static_cast<int>(tuning);
+  if (p == 0 || t < 1 || t > 4) return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  preset_config(c, p, t, config);
+  return NV_ENC_SUCCESS;
+}
+
+/* ---- initialisation ------------------------------------------------------- */
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInitializeEncoder(void* encoder, NV_ENC_INITIALIZE_PARAMS* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_INITIALIZE_PARAMS_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (params->encodeConfig && !version_ok(params->encodeConfig->version, NV_ENC_CONFIG_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  const int codec = codec_of(params->encodeGUID);
+  if (same_guid(params->encodeGUID, NV_ENC_CODEC_AV1_GUID)) return fail(s, NV_ENC_ERR_INVALID_PARAM, "EncodeAPI Internal Error.");
+  if (codec == kNoCodec) return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  const uint32_t w = params->encodeWidth, h = params->encodeHeight;
+  if (codec == kH264) {
+    if (w < 145 || h < 49) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Frame Dimension less than the minimum supported value.");
+    if (w > 4096 || h > 4096) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Frame Dimension greater than the maximum supported value.");
+  } else {
+    if (w < 129 || h < 33) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Frame dimensions are less than the minimum supported value.");
+    if (w > 8192) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Width greater than supported value.");
+    if (h > 8192) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Height greater than supported value.");
+  }
+  if (preset_index(params->presetGUID) == 0)
+    return fail(s, NV_ENC_ERR_INVALID_PARAM, "NV_ENC_RC_PARAMS::lowDelayKeyFrameScale is supported with P1-P7 presets\n");
+  const int tuning = static_cast<int>(params->tuningInfo);
+  if (tuning == 0)
+    return fail(s, NV_ENC_ERR_INVALID_PARAM, "Presets P1-P7 are only supported with valid NV_ENC_INITIALIZE_PARAMS::tuningInfo\n");
+  if (tuning < 0 || tuning > 4) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Invalid Tuning Info");
+  if (tuning == NV_ENC_TUNING_INFO_LOSSLESS && params->encodeConfig &&
+      params->encodeConfig->rcParams.rateControlMode != NV_ENC_PARAMS_RC_CONSTQP)
+    return fail(s, NV_ENC_ERR_INVALID_PARAM,
+                "With lossless preset, RC Mode / Profile not supported with qpPrimeYZeroTransformBypassFlag.");
+  // Measured over gop lengths 0..30 and 2^32-1 and frameIntervalP 0..9, both codecs: a
+  // non-zero gop length shorter than the frame interval is refused.
+  if (params->encodeConfig && params->encodeConfig->gopLength != 0 &&
+      params->encodeConfig->frameIntervalP > 0 &&
+      static_cast<uint32_t>(params->encodeConfig->frameIntervalP) > params->encodeConfig->gopLength)
+    return fail(s, NV_ENC_ERR_INVALID_PARAM, "Gop Length should be greater than number of B frames + 1");
+  if ((params->maxEncodeWidth && w > params->maxEncodeWidth) || (params->maxEncodeHeight && h > params->maxEncodeHeight))
+    return fail(s, NV_ENC_ERR_INVALID_PARAM, "Encode Width / Height is greater than MaxWidth / MaxHeight.");
+  if (params->enableEncodeAsync) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Async mode not supported.");
+  if (s->initialized) {   // a second initialisation is accepted and leaves the first in force
+    return NV_ENC_SUCCESS;
+  }
+  s->codec = codec;
+  s->width = w;
+  s->height = h;
+  s->init = *params;
+  s->init.encodeConfig = nullptr;
+  if (params->encodeConfig) {
+    s->config = *params->encodeConfig;
+  } else {
+    NV_ENC_PRESET_CONFIG pc{};
+    pc.version = NV_ENC_PRESET_CONFIG_VER;
+    pc.presetCfg.version = NV_ENC_CONFIG_VER;
+    preset_config(codec, preset_index(params->presetGUID), tuning, &pc);
+    s->config = pc.presetCfg;
+  }
+  s->initialized = true;
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncReconfigureEncoder(void* encoder, NV_ENC_RECONFIGURE_PARAMS* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_RECONFIGURE_PARAMS_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
+  // No validation: the card accepts any new size (measured: larger than the
+  // initial one, with no maximum set, and smaller).
+  if (params->reInitEncodeParams.encodeWidth) s->width = params->reInitEncodeParams.encodeWidth;
+  if (params->reInitEncodeParams.encodeHeight) s->height = params->reInitEncodeParams.encodeHeight;
+  return NV_ENC_SUCCESS;
+}
+
+/* ---- buffers --------------------------------------------------------------- */
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateInputBuffer(void* encoder, NV_ENC_CREATE_INPUT_BUFFER* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_CREATE_INPUT_BUFFER_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
+  if (!params->width || !params->height) return NV_ENC_ERR_OUT_OF_MEMORY;
+  if (!format_listed(s->codec, params->bufferFmt) ||
+      (s->codec == kH264 && (params->bufferFmt == NV_ENC_BUFFER_FORMAT_YUV420_10BIT || params->bufferFmt == NV_ENC_BUFFER_FORMAT_YUV444_10BIT)))
+    return NV_ENC_ERR_INVALID_PARAM;
+  auto in = std::make_unique<Input>();
+  in->w = params->width;
+  in->h = params->height;
+  in->fmt = params->bufferFmt;
+  in->pitch = buffer_pitch(in->fmt, in->w);
+  const size_t bytes = static_cast<size_t>(in->pitch) * buffer_rows(in->fmt, in->h);
+  // Managed memory: the CPU writes a locked buffer directly, as on the card, and
+  // a kernel may write the same pointer.
+  if (cudaMallocManaged(&in->dev, bytes) != cudaSuccess || !in->dev) return NV_ENC_ERR_OUT_OF_MEMORY;
+  std::memset(in->dev, 0, bytes);
+  void* handle = in->dev;   // the handle is the device pointer itself
+  s->inputs[handle] = std::move(in);
+  params->inputBuffer = handle;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyInputBuffer(void* encoder, NV_ENC_INPUT_PTR input) {
+  NEED_SESSION(s);
+  if (!input) return NV_ENC_ERR_INVALID_PARAM;
+  auto it = s->inputs.find(input);
+  if (it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  cudaFree(it->second->dev);
+  s->inputs.erase(it);
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockInputBuffer(void* encoder, NV_ENC_LOCK_INPUT_BUFFER* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  auto it = s->inputs.find(params->inputBuffer);
+  if (!params->inputBuffer || it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  it->second->locked = true;
+  params->bufferDataPtr = it->second->dev;   // managed memory: a kernel may write it
+  params->pitch = it->second->pitch;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnlockInputBuffer(void* encoder, NV_ENC_INPUT_PTR input) {
+  NEED_SESSION(s);
+  auto it = s->inputs.find(input);
+  if (!input || it == s->inputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  it->second->locked = false;
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateBitstreamBuffer(void* encoder, NV_ENC_CREATE_BITSTREAM_BUFFER* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_CREATE_BITSTREAM_BUFFER_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
+  auto out = std::make_unique<Output>();
+  void* handle = out.get();
+  s->outputs[handle] = std::move(out);
+  params->bitstreamBuffer = handle;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyBitstreamBuffer(void* encoder, NV_ENC_OUTPUT_PTR bitstream) {
+  NEED_SESSION(s);
+  if (!bitstream) return NV_ENC_ERR_INVALID_PTR;
+  auto it = s->outputs.find(bitstream);
+  if (it == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  s->outputs.erase(it);
+  return NV_ENC_SUCCESS;
+}
+
+/* ---- registered resources --------------------------------------------------- */
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRegisterResource(void* encoder, NV_ENC_REGISTER_RESOURCE* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_REGISTER_RESOURCE_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  // The card registers whatever it is given -- a null pointer, an undefined
+  // format, a zero width -- and fails later, if at all.
+  auto r = std::make_unique<Registered>();
+  r->dev = params->resourceToRegister;
+  r->w = params->width;
+  r->h = params->height;
+  r->pitch = params->pitch;
+  r->fmt = params->bufferFormat;
+  void* handle = r.get();
+  s->registered[handle] = std::move(r);
+  params->registeredResource = handle;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnregisterResource(void* encoder, NV_ENC_REGISTERED_PTR resource) {
+  NEED_SESSION(s);
+  if (!resource) return NV_ENC_ERR_INVALID_PTR;
+  auto it = s->registered.find(resource);
+  if (it == s->registered.end()) return NV_ENC_ERR_RESOURCE_NOT_REGISTERED;
+  for (auto m = s->mapped.begin(); m != s->mapped.end();)
+    m = m->second->reg == it->second.get() ? s->mapped.erase(m) : std::next(m);
+  s->registered.erase(it);
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncMapInputResource(void* encoder, NV_ENC_MAP_INPUT_RESOURCE* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_MAP_INPUT_RESOURCE_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  auto it = s->registered.find(params->registeredResource);
+  if (!params->registeredResource || it == s->registered.end()) return NV_ENC_ERR_RESOURCE_NOT_REGISTERED;
+  auto m = std::make_unique<Mapped>();
+  m->reg = it->second.get();
+  void* handle = m.get();
+  s->mapped[handle] = std::move(m);
+  params->mappedResource = handle;
+  params->mappedBufferFmt = it->second->fmt;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnmapInputResource(void* encoder, NV_ENC_INPUT_PTR mapped) {
+  NEED_SESSION(s);
+  auto it = s->mapped.find(mapped);
+  if (!mapped || it == s->mapped.end()) return NV_ENC_ERR_RESOURCE_NOT_MAPPED;
+  s->mapped.erase(it);
+  return NV_ENC_SUCCESS;
+}
+
+/* ---- encoding ----------------------------------------------------------------- */
+
+namespace {
+
+// 8-bit planar 4:2:0 as the encoder reads it: sample accessors over device memory
+// copied to the host.
+struct Frame {
+  std::vector<uint8_t> y, u, v;
+  int w = 0, h = 0, cw = 0, ch = 0;
+};
+
+// BT.601 limited range, the matrix the card's encoder applies to ARGB / ABGR input
+// (flat colours encoded at QP 1 and decoded: red 81/90/240, green 145/54/34, blue
+// 41/240/110, white 235/128/128, grey 128 gives 126/128/128): Y = 16 + (65.481 R +
+// 128.553 G + 24.966 B) / 255 and the chroma likewise, rounded to nearest.
+uint8_t luma_of(int r, int g, int b) {
+  return static_cast<uint8_t>(std::lround(16.0 + (65.481 * r + 128.553 * g + 24.966 * b) / 255.0));
+}
+uint8_t chroma_of(double sum, int n) {
+  return static_cast<uint8_t>(std::min(255L, std::max(0L, std::lround(128.0 + sum / (255.0 * n)))));
+}
+
+Frame read_frame(const uint8_t* dev, uint32_t pitch, NV_ENC_BUFFER_FORMAT fmt, int w, int h, const uint32_t chroma_rows_offset) {
+  Frame f;
+  f.w = w;
+  f.h = h;
+  f.cw = (w + 1) / 2;
+  f.ch = (h + 1) / 2;
+  f.y.resize(static_cast<size_t>(w) * h);
+  f.u.resize(static_cast<size_t>(f.cw) * f.ch);
+  f.v.resize(f.u.size());
+  auto copy2d = [&](std::vector<uint8_t>& dst, const uint8_t* src, size_t src_pitch, int width, int rows) {
+    cudaMemcpy2D(dst.data(), width, src, src_pitch, width, rows, cudaMemcpyDefault);
+  };
+  switch (fmt) {
+    case NV_ENC_BUFFER_FORMAT_NV12: {
+      copy2d(f.y, dev, pitch, w, h);
+      std::vector<uint8_t> uv(static_cast<size_t>(f.cw) * 2 * f.ch);
+      copy2d(uv, dev + static_cast<size_t>(pitch) * chroma_rows_offset, pitch, f.cw * 2, f.ch);
+      for (size_t i = 0; i < f.u.size(); ++i) {
+        f.u[i] = uv[2 * i];
+        f.v[i] = uv[2 * i + 1];
+      }
+      break;
+    }
+    case NV_ENC_BUFFER_FORMAT_YV12:
+    case NV_ENC_BUFFER_FORMAT_IYUV: {
+      copy2d(f.y, dev, pitch, w, h);
+      const uint8_t* p1 = dev + static_cast<size_t>(pitch) * chroma_rows_offset;
+      const uint8_t* p2 = p1 + static_cast<size_t>(pitch / 2) * f.ch;
+      std::vector<uint8_t>& first = fmt == NV_ENC_BUFFER_FORMAT_IYUV ? f.u : f.v;
+      std::vector<uint8_t>& second = fmt == NV_ENC_BUFFER_FORMAT_IYUV ? f.v : f.u;
+      copy2d(first, p1, pitch / 2, f.cw, f.ch);
+      copy2d(second, p2, pitch / 2, f.cw, f.ch);
+      break;
+    }
+    default: {   // ARGB / ABGR: 32-bit words, converted
+      std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
+      copy2d(px, dev, pitch, w * 4, h);
+      const bool abgr = fmt == NV_ENC_BUFFER_FORMAT_ABGR;
+      auto rgb = [&](int x, int y, int* r, int* g, int* b) {
+        const uint8_t* p = &px[(static_cast<size_t>(y) * w + x) * 4];
+        // ARGB is a word with A in the top byte: B, G, R, A in memory; ABGR: R, G, B, A.
+        *r = abgr ? p[0] : p[2];
+        *g = p[1];
+        *b = abgr ? p[2] : p[0];
+      };
+      for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+          int r, g, b;
+          rgb(x, y, &r, &g, &b);
+          f.y[static_cast<size_t>(y) * w + x] = luma_of(r, g, b);
+        }
+      for (int y = 0; y < f.ch; ++y)
+        for (int x = 0; x < f.cw; ++x) {
+          int sr = 0, sg = 0, sb = 0, n = 0;
+          for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+              int r, g, b;
+              rgb(std::min(2 * x + dx, w - 1), std::min(2 * y + dy, h - 1), &r, &g, &b);
+              sr += r; sg += g; sb += b; ++n;
+            }
+          // Chroma from the block's mean colour.
+          f.u[static_cast<size_t>(y) * f.cw + x] = chroma_of(-37.797 * sr - 74.203 * sg + 112.0 * sb, n);
+          f.v[static_cast<size_t>(y) * f.cw + x] = chroma_of(112.0 * sr - 93.786 * sg - 18.214 * sb, n);
+        }
+    }
+  }
+  return f;
+}
+
+std::vector<uint8_t> parameter_sets(const Session& s) {
+  vgpu_nvenc::H264Stream st;
+  st.width = static_cast<int>(s.width);
+  st.height = static_cast<int>(s.height);
+  st.fps_num = s.init.frameRateNum ? static_cast<int>(s.init.frameRateNum) : 30;
+  st.fps_den = s.init.frameRateDen ? static_cast<int>(s.init.frameRateDen) : 1;
+  return st.parameter_sets();
+}
+
+}  // namespace
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParams(void* encoder, NV_ENC_SEQUENCE_PARAM_PAYLOAD* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
+  if (!params->spsppsBuffer || !params->outSPSPPSPayloadSize) return NV_ENC_ERR_INVALID_PARAM;
+  if (s->codec != kH264) return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  const std::vector<uint8_t> ps = parameter_sets(*s);
+  if (params->inBufferSize < ps.size()) return NV_ENC_ERR_OUT_OF_MEMORY;
+  std::memcpy(params->spsppsBuffer, ps.data(), ps.size());
+  *params->outSPSPPSPayloadSize = static_cast<uint32_t>(ps.size());
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PARAMS* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_PIC_PARAMS_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
+  if (params->encodePicFlags & NV_ENC_PIC_FLAG_EOS) return NV_ENC_SUCCESS;   // nothing is held back
+  if (!params->inputBuffer || !params->outputBitstream) return NV_ENC_ERR_INVALID_PARAM;
+  const int ps = static_cast<int>(params->pictureStruct);
+  if (ps < 1 || ps > 3) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Invalid value for NV_ENC_PIC_STRUCT.");
+  auto out = s->outputs.find(params->outputBitstream);
+  if (out == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  const uint8_t* dev;
+  uint32_t pitch, in_w, in_h;
+  NV_ENC_BUFFER_FORMAT fmt;
+  if (auto in = s->inputs.find(params->inputBuffer); in != s->inputs.end()) {
+    dev = static_cast<const uint8_t*>(in->second->dev);
+    pitch = in->second->pitch;
+    in_w = in->second->w;
+    in_h = in->second->h;
+    fmt = in->second->fmt;
+  } else if (auto m = s->mapped.find(params->inputBuffer); m != s->mapped.end() && m->second->reg->dev) {
+    const Registered* r = m->second->reg;
+    dev = static_cast<const uint8_t*>(r->dev);
+    pitch = r->pitch;
+    in_w = r->w;
+    in_h = r->h;
+    fmt = r->fmt;
+  } else {
+    return NV_ENC_ERR_INVALID_PARAM;
+  }
+  if (s->codec != kH264) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] NVENC: HEVC streams are not written by VirtualGPU\n");
+    return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  }
+  if (!encodable(fmt)) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] NVENC: this input format is not encoded by VirtualGPU (8-bit 4:2:0 and 32-bit RGB only)\n");
+    return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  }
+  // The picture is the size the session was initialised (or reconfigured) to,
+  // read from the top-left of the input.
+  const int w = static_cast<int>(std::min<uint32_t>(s->width, in_w)), h = static_cast<int>(std::min<uint32_t>(s->height, in_h));
+  if (w <= 0 || h <= 0) return NV_ENC_ERR_INVALID_PARAM;
+  const Frame f = read_frame(dev, pitch, fmt, w, h, in_h);
+  vgpu_nvenc::H264Stream st;
+  st.width = w;
+  st.height = h;
+  st.fps_num = s->init.frameRateNum ? static_cast<int>(s->init.frameRateNum) : 30;
+  st.fps_den = s->init.frameRateDen ? static_cast<int>(s->init.frameRateDen) : 1;
+  std::vector<uint8_t> bits;
+  const bool first = !s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.h264Config.repeatSPSPPS;
+  if (first) bits = st.parameter_sets();
+  s->sent_parameter_sets = true;
+  const std::vector<uint8_t> idr = st.idr([&](int x, int y) { return f.y[static_cast<size_t>(y) * f.w + x]; },
+                                          [&](int plane, int x, int y) { return (plane ? f.v : f.u)[static_cast<size_t>(y) * f.cw + x]; },
+                                          static_cast<int>(s->idr_id++));
+  bits.insert(bits.end(), idr.begin(), idr.end());
+  Output& o = *out->second;
+  o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps});
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockBitstream(void* encoder, NV_ENC_LOCK_BITSTREAM* params) {
+  NEED_SESSION(s);
+  if (!params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_LOCK_BITSTREAM_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  auto it = s->outputs.find(params->outputBitstream);
+  if (!params->outputBitstream || it == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  Output& o = *it->second;
+  if (o.pending.empty()) return NV_ENC_ERR_INVALID_CALL;
+  o.current = std::move(o.pending.front());
+  o.pending.pop_front();
+  o.locked = true;
+  params->bitstreamBufferPtr = o.current.data.data();
+  params->bitstreamSizeInBytes = static_cast<uint32_t>(o.current.data.size());
+  params->outputTimeStamp = o.current.ts;
+  params->outputDuration = o.current.dur;
+  params->frameIdx = o.current.frame_idx;
+  params->pictureType = NV_ENC_PIC_TYPE_IDR;   // every picture is an IDR
+  params->pictureStruct = static_cast<NV_ENC_PIC_STRUCT>(o.current.pic_struct);
+  params->hwEncodeStatus = 2;
+  params->numSlices = 1;
+  params->temporalId = 0;
+  params->sliceOffsets = nullptr;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnlockBitstream(void* encoder, NV_ENC_OUTPUT_PTR bitstream) {
+  NEED_SESSION(s);
+  if (!bitstream) return NV_ENC_ERR_INVALID_PTR;
+  auto it = s->outputs.find(bitstream);
+  if (it == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
+  it->second->locked = false;
+  return NV_ENC_SUCCESS;
+}
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeStats(void* encoder, NV_ENC_STAT* stats) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!stats) return NV_ENC_ERR_INVALID_PTR;
+  return NV_ENC_ERR_INVALID_PARAM;   // the card's answer to the statistics query of a bitstream buffer
+}
+
+/* ---- the rest of the table ---------------------------------------------------- */
+
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncOpenEncodeSession(void* device, uint32_t device_type, void** encoder) {
+  NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS p{};
+  p.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+  p.device = device;
+  p.deviceType = static_cast<NV_ENC_DEVICE_TYPE>(device_type);
+  p.apiVersion = NVENCAPI_VERSION;
+  return NvEncOpenEncodeSessionEx(&p, encoder);
+}
+
+// Measured on the card: these calls take a valid session and nothing else is
+// checked; the ones for features this part (or this build) lacks answer so.
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInvalidateRefFrames(void* encoder, uint64_t) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRegisterAsyncEvent(void* encoder, NV_ENC_EVENT_PARAMS*) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_UNIMPLEMENTED;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnregisterAsyncEvent(void* encoder, NV_ENC_EVENT_PARAMS*) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_UNIMPLEMENTED;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncSetIOCudaStreams(void* encoder, NV_ENC_CUSTREAM_PTR, NV_ENC_CUSTREAM_PTR) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_SUCCESS;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateMVBuffer(void* encoder, NV_ENC_CREATE_MV_BUFFER*) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_UNIMPLEMENTED;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyMVBuffer(void* encoder, NV_ENC_OUTPUT_PTR) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_INVALID_PTR;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRunMotionEstimationOnly(void* encoder, NV_ENC_MEONLY_PARAMS*) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_INVALID_PTR;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLookaheadPicture(void* encoder, NV_ENC_LOOKAHEAD_PIC_PARAMS*) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_INVALID_PARAM;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRestoreEncoderState(void* encoder, NV_ENC_RESTORE_ENCODER_STATE_PARAMS*) {
+  NEED_SESSION(s);
+  (void)s;
+  return NV_ENC_ERR_INVALID_PARAM;
+}
+VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParamEx(void* encoder, NV_ENC_INITIALIZE_PARAMS* init, NV_ENC_SEQUENCE_PARAM_PAYLOAD* params) {
+  NEED_SESSION(s);
+  (void)s;
+  if (!init || !params) return NV_ENC_ERR_INVALID_PTR;
+  if (!version_ok(params->version, NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER)) return NV_ENC_ERR_INVALID_VERSION;
+  if (!params->spsppsBuffer || !params->outSPSPPSPayloadSize) return NV_ENC_ERR_INVALID_PARAM;
+  if (codec_of(init->encodeGUID) != kH264) return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  vgpu_nvenc::H264Stream st;
+  st.width = static_cast<int>(init->encodeWidth);
+  st.height = static_cast<int>(init->encodeHeight);
+  st.fps_num = init->frameRateNum ? static_cast<int>(init->frameRateNum) : 30;
+  st.fps_den = init->frameRateDen ? static_cast<int>(init->frameRateDen) : 1;
+  if (st.width <= 0 || st.height <= 0) return NV_ENC_ERR_INVALID_PARAM;
+  const std::vector<uint8_t> ps = st.parameter_sets();
+  if (params->inBufferSize < ps.size()) return NV_ENC_ERR_OUT_OF_MEMORY;
+  std::memcpy(params->spsppsBuffer, ps.data(), ps.size());
+  *params->outSPSPPSPayloadSize = static_cast<uint32_t>(ps.size());
   return NV_ENC_SUCCESS;
 }

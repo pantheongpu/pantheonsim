@@ -1,14 +1,17 @@
 // NVENC through the documented API, loaded by the bare soname applications
 // dlopen, compiled with nvcc against the public Video Codec SDK header.
 //
-// The shim is not a codec, so nothing here decodes. What it promises -- and
-// what encoder stress and corruption checks rely on -- is checked instead: the
-// same frame encodes to the same bytes, and a changed byte changes them. For
-// the 4:2:0 frame the changed byte is a chroma sample, and the whole frame,
-// luma and chroma, is written into the buffer the encoder hands out.
+// What encoder stress and corruption checks rely on: the same frame encodes to
+// the same bytes, and a changed byte changes them. For the 4:2:0 frame the
+// changed byte is a chroma sample, and the whole frame, luma and chroma, is
+// written (here by a kernel) into the buffer the encoder hands out. That buffer
+// is managed memory in the simulator; nvenc_h264.cpp decodes the stream.
+#include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <vector>
 #include <dlfcn.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <nvEncodeAPI.h>
 
@@ -97,17 +100,26 @@ void check_format(Encoder& e, NV_ENC_BUFFER_FORMAT fmt, const char* name, uint32
     return;
   }
 
+  // Consecutive IDR pictures differ in idr_pic_id, and the first one is preceded by
+  // the parameter sets, so "the same frame" is compared two pictures apart and
+  // after those headers.
   const auto first = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
   const auto again = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
+  const auto third = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
   if (first.empty()) fail("FAIL %s: encoding produced no bytes%s", name);
-  if (first != again) fail("FAIL %s: the same frame encoded differently%s", name);
+  if (third.empty() || third.size() > first.size() ||
+      !std::equal(third.begin(), third.end(), first.end() - static_cast<std::ptrdiff_t>(third.size())))
+    fail("FAIL %s: the same frame encoded differently%s", name);
 
+  // The last byte of an ARGB frame is the last pixel's alpha, which the encoder
+  // ignores; its red is the byte before.
+  const size_t victim = fmt == NV_ENC_BUFFER_FORMAT_ARGB ? n - 2 : n - 1;
   unsigned char last = 0;
-  cudaMemcpy(&last, frame + n - 1, 1, cudaMemcpyDeviceToHost);
+  cudaMemcpy(&last, frame + victim, 1, cudaMemcpyDeviceToHost);
   last ^= 0x5a;
-  cudaMemcpy(frame + n - 1, &last, 1, cudaMemcpyHostToDevice);
+  cudaMemcpy(frame + victim, &last, 1, cudaMemcpyHostToDevice);
   const auto changed = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
-  if (changed.empty() || changed == first)
+  if (changed.empty() || changed == again)
     fail("FAIL %s: changing the frame's last byte did not change the output%s", name);
   done();
 }
@@ -134,6 +146,9 @@ int main() {
   open.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
   open.apiVersion = NVENCAPI_VERSION;
   open.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+  CUcontext ctx = nullptr;   // the card refuses a session without the context it encodes on
+  cuCtxGetCurrent(&ctx);
+  open.device = ctx;
   if (e.api.nvEncOpenEncodeSessionEx(&open, &e.session) != NV_ENC_SUCCESS) {
     std::printf("FAIL nvEncOpenEncodeSessionEx\n");
     return 1;
@@ -142,7 +157,9 @@ int main() {
   const uint32_t width = 256, height = 128;
   NV_ENC_INITIALIZE_PARAMS init{};
   init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-  init.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
+  init.encodeGUID = NV_ENC_CODEC_H264_GUID;
+  init.presetGUID = NV_ENC_PRESET_P4_GUID;   // the card refuses an initialisation without a P1-P7 preset
+  init.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;   // ... and without a tuning
   init.encodeWidth = width;
   init.encodeHeight = height;
   init.darWidth = width;
