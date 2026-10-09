@@ -292,7 +292,7 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevj(cusolverDnHandle_t h, cusolverEigMode_t jobz,                \
                                                     cublasFillMode_t uplo, int n, T* A, int lda, R* W, T* unused7, int unused8,  \
                                                     int* info, syevjInfo_t jp) { \
-  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_SUCCESS, cusolverDn##P##heevj, h, jobz, uplo, n, A, lda, W, unused7, unused8, info, jp); \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##heevj, h, jobz, uplo, n, A, lda, W, unused7, unused8, info, jp); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                      \
     const cusolverStatus_t st = c_heev<T>(A, n, lda, W, jobz, uplo, info);                                        \

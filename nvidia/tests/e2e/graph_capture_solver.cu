@@ -4,8 +4,12 @@
 // run_graph_capture.sh solver cusolver --card runs the same program on NVIDIA's cuSOLVER.
 #include <cusolverDn.h>
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
+#include <string>
 
 #include "graph_capture_common.h"
 
@@ -42,7 +46,107 @@ static void general(cudaStream_t st, const int* counter, T* a, int m, int n) {
   make_general<T><<<dim3((m + 7) / 8, (n + 7) / 8), dim3(8, 8), 0, st>>>(a, m, n, counter);
 }
 
+/* ---- the calls that cannot be captured, each in a process of its own --------------------------------- */
+
+struct Refusal {
+  const char* name;
+  int status;   // what the call answers in the capture
+};
+static const Refusal kRefusals[] = {
+    {"cusolverDnDgesvd", 7},   {"cusolverDnDsyevd", 7},      {"cusolverDnDsytrf", 7},      {"cusolverDnDsyevj", 7},
+    {"cusolverDnDSgesv (iterative refinement)", 7},          {"cusolverDnDSgels (iterative refinement)", 7},
+    {"cusolverDnIRSXgesv", 7},
+};
+constexpr int kRefusalCount = sizeof(kRefusals) / sizeof(kRefusals[0]);
+
+// The child: one refusal. Prints "eager=<the call made eagerly> status=<in a capture> state=<the stream's capture status
+// afterwards> end=<cudaStreamEndCapture>".
+static int refusal_child(int idx) {
+  cudaFree(nullptr);
+  cusolverDnHandle_t h;
+  cusolverDnCreate(&h);
+  cudaStream_t st;
+  cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  cusolverDnSetStream(h, st);
+  const int n = 12;
+  const size_t nn = (size_t)n * n;
+  double *a, *b, *w, *u, *vt, *s, *x;
+  for (double** p : {&a, &b, &w, &u, &vt, &s, &x}) {
+    cudaMalloc(p, 1 << 20);
+    cudaMemset(*p, 0, 1 << 20);
+  }
+  int *info, *ipiv;
+  cudaMalloc(&info, 16);
+  cudaMalloc(&ipiv, 4 * n);
+  double* work;
+  const int lw = 1 << 17;
+  cudaMalloc(&work, (size_t)lw * 8);
+  void* iwork;
+  cudaMalloc(&iwork, 1 << 22);
+  int niter = 0;
+  cusolverDnIRSParams_t irs;
+  cusolverDnIRSInfos_t irsinfo;
+  cusolverDnIRSParamsCreate(&irs);
+  cusolverDnIRSInfosCreate(&irsinfo);
+  cusolverDnIRSParamsSetSolverPrecisions(irs, CUSOLVER_R_64F, CUSOLVER_R_32F);
+  cusolverDnIRSParamsSetRefinementSolver(irs, CUSOLVER_IRS_REFINE_CLASSICAL);
+  cusolverDnIRSParamsSetMaxIters(irs, 50);
+  syevjInfo_t sj;
+  cusolverDnCreateSyevjInfo(&sj);
+  std::vector<double> m(nn);
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < n; ++i) m[j * n + i] = i == j ? n + 1.0 : 0.1 * ((std::min(i, j) * 31 + std::max(i, j)) % 5 - 2);
+  auto matrices = [&] {
+    cudaMemcpy(a, m.data(), nn * 8, cudaMemcpyHostToDevice);
+    cudaMemcpy(b, m.data(), nn * 8, cudaMemcpyHostToDevice);
+    cudaMemset(x, 0, 1 << 10);
+  };
+  auto call = [&]() -> int {
+    switch (idx) {
+      case 0: return (int)cusolverDnDgesvd(h, 'A', 'A', n, n, a, n, s, u, n, vt, n, work, lw, nullptr, info);
+      case 1: return (int)cusolverDnDsyevd(h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, a, n, s, work, lw, info);
+      case 2: return (int)cusolverDnDsytrf(h, CUBLAS_FILL_MODE_LOWER, n, a, n, ipiv, work, lw, info);
+      case 3: return (int)cusolverDnDsyevj(h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, a, n, s, work, lw, info, sj);
+      case 4: return (int)cusolverDnDSgesv(h, n, 1, a, n, ipiv, b, n, x, n, iwork, 1 << 22, &niter, info);
+      case 5: return (int)cusolverDnDSgels(h, n, n, 1, a, n, b, n, x, n, iwork, 1 << 22, &niter, info);
+      default: return (int)cusolverDnIRSXgesv(h, irs, irsinfo, n, 1, a, n, b, n, x, n, iwork, 1 << 22, &niter, info);
+    }
+  };
+  matrices();
+  const int eager = call();   // the same call, made eagerly, answers success
+  cudaStreamSynchronize(st);
+  matrices();
+  cudaGraph_t g = nullptr;
+  cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal);
+  const int rc = call();
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  cudaStreamIsCapturing(st, &status);
+  const cudaError_t e = cudaStreamEndCapture(st, &g);
+  std::printf("RESULT eager=%d status=%d state=%d end=%d\n", eager, rc, (int)status, (int)e);
+  return 0;
+}
+
+// Runs this program as the child for refusal `idx` and returns what it printed after "RESULT ".
+static std::string run_child(int idx) {
+  char self[4096] = {0};
+  const ssize_t len = readlink("/proc/self/exe", self, sizeof self - 1);
+  if (len <= 0) return "";
+  const std::string cmd = "GC_SOLVER_CASE=" + std::to_string(idx) + " '" + std::string(self, static_cast<size_t>(len)) + "' 2>&1";
+  FILE* p = popen(cmd.c_str(), "r");
+  if (!p) return "";
+  std::string result;
+  char buf[512];
+  while (std::fgets(buf, sizeof buf, p)) {
+    const std::string line = buf;
+    if (line.compare(0, 7, "RESULT ") == 0) result = line.substr(7);
+  }
+  pclose(p);
+  while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
+  return result;
+}
+
 int main() {
+  if (const char* c = std::getenv("GC_SOLVER_CASE")) return refusal_child(std::atoi(c));
   Runner r;
   cusolverDnHandle_t h;
   cusolverDnCreate(&h);
@@ -194,71 +298,25 @@ int main() {
     cusolverDnDestroyParams(params);
   }
   // The routines NVIDIA's library cannot capture wait for the stream (the eigenvalue and singular value
-  // solvers that iterate to convergence): the call answers an error and the capture is invalidated.
-  // Measured on the RTX 3060 (each as the first call after a fresh start: once a capture has been
-  // invalidated this way, the library's later calls in the process answer EXECUTION_FAILED, so this
-  // program checks one -- last, in its own block): gesvd, syevd, syevdx, sygvd, sygvdx, sygvj, sytrf,
-  // orgtr, gesvda and the 64-bit Xsyevd, Xsyevdx, Xgesvd, Xgesvdp, Xgeev answer INTERNAL_ERROR (7) and
-  // invalidate the capture; syevj answers success and invalidates it. Captured: potrf, potrs, potri and
-  // their batched forms, getrf, getrs, geqrf, orgqr, ormqr, sytrd, ormtr, orgbr, gebrd, sytri, laswp,
-  // lauum, gesvdj, syevjBatched, gesvdjBatched, and the 64-bit Xpotrf, Xpotrs, Xgetrf, Xgetrs, Xgeqrf,
-  // Xtrtri, Xsytrs, XsyevBatched.
-  {
-    struct Refusal {
-      const char* name;
-      std::function<int()> call;
-      int status;
-    };
-    double *a, *b, *w, *u, *vt, *s;
-    for (double** p : {&a, &b, &w, &u, &vt, &s}) cudaMalloc(p, 1 << 20);
-    int* info = r.alloc<int>(4);
-    int* ipiv = r.alloc<int>(n);
-    double* work = r.alloc<double>(1 << 17);
-    const int lw = 1 << 17;
-    void* xwork = r.alloc<char>(1 << 20);
-    std::vector<char> hwork(1 << 20);
-    syevjInfo_t sj;
-    cusolverDnCreateSyevjInfo(&sj);
-    cusolverDnParams_t pr;
-    cusolverDnCreateParams(&pr);
-    auto matrices = [&] {   // symmetric, diagonally dominant
-      std::vector<double> m(nn);
-      for (int j = 0; j < n; ++j)
-        for (int i = 0; i < n; ++i)
-          m[j * n + i] = i == j ? n + 1.0 : 0.1 * ((std::min(i, j) * 31 + std::max(i, j)) % 5 - 2);
-      cudaMemcpy(a, m.data(), nn * 8, cudaMemcpyHostToDevice);
-      cudaMemcpy(b, m.data(), nn * 8, cudaMemcpyHostToDevice);
-    };
-    const std::vector<Refusal> refusals = {
-      {"cusolverDnDgesvd", [&] { return (int)cusolverDnDgesvd(h, 'A', 'A', n, n, a, n, s, u, n, vt, n, work, lw, nullptr, info); }, 7},
-    };
-    for (const Refusal& f : refusals) {
-      // A fresh handle for each: the library's own state does not carry a refused capture over.
-      cusolverDnDestroy(h);
-      cusolverDnCreate(&h);
-      cusolverDnSetStream(h, r.st);
-      matrices();
-      const int eager = f.call();   // the same call, made eagerly, answers success
-      cudaStreamSynchronize(r.st);
-      expect(std::string(f.name) + " eagerly", eager == 0, eager);
-      matrices();
-      cudaGraph_t g = nullptr;
-      const cudaError_t bc = cudaStreamBeginCapture(r.st, cudaStreamCaptureModeGlobal);
-      const int rc = f.call();
-      cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-      cudaStreamIsCapturing(r.st, &status);
-      const cudaError_t e = cudaStreamEndCapture(r.st, &g);
-      if (g) cudaGraphDestroy(g);
-      cudaGetLastError();
-      cudaStreamSynchronize(r.st);
-      expect(std::string(f.name) + " in a capture: refused, and the capture is invalidated",
-             bc == cudaSuccess && rc == f.status && status == cudaStreamCaptureStatusInvalidated && e == cudaErrorStreamCaptureInvalidated,
-             rc);
-    }
-    cusolverDnDestroyParams(pr);
-    cusolverDnDestroySyevjInfo(sj);
-    for (double* p : {a, b, w, u, vt, s}) cudaFree(p);
-  }
+  // solvers that iterate to convergence, the iterative-refinement solvers that report their iteration count): the
+  // call answers an error and the capture is invalidated. Measured on the RTX 3060 (each as the first call after a
+  // fresh start: once a capture has been invalidated this way, the library's later calls in the process answer
+  // EXECUTION_FAILED, so each runs in a process of its own, which this program starts): gesvd, syevd, syevdx,
+  // sygvd, sygvdx, sygvj, syevj, sytrf, orgtr, gesvda, the 64-bit Xsyevd, Xsyevdx, Xgesvd, Xgesvdp, Xgeev, and the
+  // iterative-refinement solvers (DSgesv and its kin, DSgels, IRSXgesv, IRSXgels) answer INTERNAL_ERROR (7) and
+  // invalidate the capture. Captured: potrf, potrs, potri and their
+  // batched forms, getrf, getrs, geqrf, orgqr, ormqr, sytrd, ormtr, orgbr, gebrd, sytri, laswp, lauum, gesvdj,
+  // syevjBatched, gesvdjBatched, and the 64-bit Xpotrf, Xpotrs, Xgetrf, Xgetrs, Xgeqrf, Xtrtri, Xsytrs, XsyevBatched.
   cusolverDnDestroy(h);
+  for (int i = 0; i < kRefusalCount; ++i) {
+    const std::string res = run_child(i);
+    int eager = -2, status = -1, state = -1, end = -1;
+    const bool parsed = std::sscanf(res.c_str(), "eager=%d status=%d state=%d end=%d", &eager, &status, &state, &end) == 4;
+    // cudaStreamCaptureStatusInvalidated is 2; 901 is cudaErrorStreamCaptureInvalidated.
+    expect(std::string(kRefusals[i].name) + " in a capture: refused, and the capture is invalidated",
+           parsed && eager == 0 && status == kRefusals[i].status && state == cudaStreamCaptureStatusInvalidated && end == cudaErrorStreamCaptureInvalidated,
+           parsed ? status : -1);
+    if (!parsed) std::printf("     the child answered: '%s'\n", res.c_str());
+  }
   return finish();
 }

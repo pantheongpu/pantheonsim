@@ -1238,8 +1238,9 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   with a copy of the plan), **cuSOLVER's dense API** (the routines NVIDIA's
   library captures; `gesvd`, `syevd`, `sygvd`, `sytrf` and the 64-bit
   `Xsyevd`, `Xgesvd`, ... cannot be captured on the card -- they wait for the
-  stream -- and answer INTERNAL_ERROR here and invalidate the capture; `syevj`
-  answers success and invalidates it), **cuRAND** (the capture takes its place
+  stream -- and answer INTERNAL_ERROR here and invalidate the capture, as do
+  `syevj` and the iterative-refinement solvers `DSgesv`, `DSgels`, `IRSXgesv`
+  and their kin), **cuRAND** (the capture takes its place
   in the generator's stream, the first launch draws what an eager call would
   have, later launches of a pseudorandom generator draw other numbers, a
   quasirandom one repeats: as the card), **NPP**'s `_Ctx` functions, and
@@ -1283,8 +1284,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   and invalidate the capture, the others are refused with 4004 in the global
   mode as well, as the card does.
   **Not recorded** (they run when called, so a replay misses them -- or, for
-  the ones that wait on the stream, fail the capture): the IRS solvers'
-  iteration counts, multi-GPU cuFFT descriptors and cuFFT callbacks,
+  the ones that wait on the stream, fail the capture): multi-GPU cuFFT
+  descriptors and cuFFT callbacks,
   cuTensorNet and cuStateVec (no NVIDIA library here to measure against), and
   `cudnnBackendPopulateCudaGraph`, which answers NOT_SUPPORTED as cuDNN does
   for an engine without native CUDA-graph support. cusolverRf and cusolverMg

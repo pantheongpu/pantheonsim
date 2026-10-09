@@ -1099,7 +1099,7 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int 
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##syevj(cusolverDnHandle_t h, cusolverEigMode_t jobz,                    \
                                                     cublasFillMode_t uplo, int n, T* A, int lda, T* W, T* unused7, int unused8,      \
                                                     int* info, syevjInfo_t jp) { \
-  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_SUCCESS, cusolverDn##P##syevj, h, jobz, uplo, n, A, lda, W, unused7, unused8, info, jp); \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##syevj, h, jobz, uplo, n, A, lda, W, unused7, unused8, info, jp); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                         \
     const cusolverStatus_t st = eig_into<T>(A, n, lda, W, jobz, uplo, info);                                         \

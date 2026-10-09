@@ -377,7 +377,7 @@ cusolverStatus_t gels_entry(cusolverDnHandle_t h, bool low, int m, int n, int nr
                                                    T* A, cusolver_int_t lda, cusolver_int_t* ipiv, T* B,            \
                                                    cusolver_int_t ldb, T* X, cusolver_int_t ldx, void* unused10,             \
                                                    size_t lwork, cusolver_int_t* iter, cusolver_int_t* info) { \
-  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##N##gesv, h, n, nrhs, A, lda, ipiv, B, ldb, X, ldx, unused10, lwork, iter, info);      \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##N##gesv, h, n, nrhs, A, lda, ipiv, B, ldb, X, ldx, unused10, lwork, iter, info);      \
     return gesv_entry<T>(h, LOW, n, nrhs, A, lda, ipiv, B, ldb, X, ldx, lwork, iter, info);                          \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##N##gels_bufferSize(cusolverDnHandle_t h, cusolver_int_t m,               \
@@ -395,7 +395,7 @@ cusolverStatus_t gels_entry(cusolverDnHandle_t h, bool low, int m, int n, int nr
                                                    cusolver_int_t nrhs, T* A, cusolver_int_t lda, T* B,             \
                                                    cusolver_int_t ldb, T* X, cusolver_int_t ldx, void* unused10,             \
                                                    size_t lwork, cusolver_int_t* iter, cusolver_int_t* info) { \
-  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##N##gels, h, m, n, nrhs, A, lda, B, ldb, X, ldx, unused10, lwork, iter, info);      \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##N##gels, h, m, n, nrhs, A, lda, B, ldb, X, ldx, unused10, lwork, iter, info);      \
     return gels_entry<T>(h, LOW, m, n, nrhs, A, lda, B, ldb, X, ldx, lwork, iter, info);                             \
   }
 VGPU_IRS(DD, double, false)
@@ -698,7 +698,7 @@ VGPU_EXPORT cusolverStatus_t cusolverDnIRSXgesv(cusolverDnHandle_t h, cusolverDn
                                                 cusolver_int_t n, cusolver_int_t nrhs, void* A, cusolver_int_t lda,
                                                 void* B, cusolver_int_t ldb, void* X, cusolver_int_t ldx, void* unused11,
                                                 size_t lwork, cusolver_int_t* niters, cusolver_int_t* dinfo) {
-  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDnIRSXgesv, h, p, i, n, nrhs, A, lda, B, ldb, X, ldx, unused11, lwork, niters, dinfo);
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDnIRSXgesv, h, p, i, n, nrhs, A, lda, B, ldb, X, ldx, unused11, lwork, niters, dinfo);
   return irs_expert(false, h, p, i, n, n, nrhs, A, lda, B, ldb, X, ldx, lwork, niters, dinfo);
 }
 VGPU_EXPORT cusolverStatus_t cusolverDnIRSXgels(cusolverDnHandle_t h, cusolverDnIRSParams_t p, cusolverDnIRSInfos_t i,
@@ -706,6 +706,6 @@ VGPU_EXPORT cusolverStatus_t cusolverDnIRSXgels(cusolverDnHandle_t h, cusolverDn
                                                 cusolver_int_t lda, void* B, cusolver_int_t ldb, void* X,
                                                 cusolver_int_t ldx, void* unused12, size_t lwork, cusolver_int_t* niters,
                                                 cusolver_int_t* dinfo) {
-  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDnIRSXgels, h, p, i, m, n, nrhs, A, lda, B, ldb, X, ldx, unused12, lwork, niters, dinfo);
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDnIRSXgels, h, p, i, m, n, nrhs, A, lda, B, ldb, X, ldx, unused12, lwork, niters, dinfo);
   return irs_expert(true, h, p, i, m, n, nrhs, A, lda, B, ldb, X, ldx, lwork, niters, dinfo);
 }
