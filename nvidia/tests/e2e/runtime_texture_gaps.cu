@@ -52,6 +52,19 @@ static void observe(const std::string& label, long long value) {
   }
 }
 
+// An enum field set to a raw number, including one the enum does not name: written as bytes, so the test itself
+// never holds an out-of-range enum value (which would be undefined behaviour to copy or load).
+template <class E>
+static void set_raw(E* field, int value) {
+  static_assert(sizeof(E) == sizeof(int), "enum is not int-sized");
+  std::memcpy(field, &value, sizeof value);
+}
+static cudaChannelFormatDesc make_desc(int kind, int x, int y, int z, int w) {
+  cudaChannelFormatDesc d = {x, y, z, w, cudaChannelFormatKindSigned};
+  set_raw(&d.f, kind);
+  return d;
+}
+
 static unsigned long long fnv(const void* data, size_t bytes, unsigned long long h = 1469598103934665603ull) {
   const unsigned char* p = static_cast<const unsigned char*>(data);
   for (size_t i = 0; i < bytes; ++i) h = (h ^ p[i]) * 1099511628211ull;
@@ -119,7 +132,7 @@ static const Kind kKinds[] = {
 
 static void format_grid() {
   for (const Kind& k : kKinds) {
-    cudaChannelFormatDesc d = {k.x, k.y, k.z, k.w, static_cast<cudaChannelFormatKind>(k.kind)};
+    const cudaChannelFormatDesc d = make_desc(k.kind, k.x, k.y, k.z, k.w);
     cudaArray_t a = nullptr;
     const cudaError_t e = cudaMallocArray(&a, &d, 8, 8);
     observe(std::string("array/") + k.name, e);
@@ -159,7 +172,7 @@ static void format_grid() {
       {"U8-12bit", 1, 12, 0, 0, 0},
   };
   for (const Bad& b : bad) {
-    cudaChannelFormatDesc d = {b.x, b.y, b.z, b.w, static_cast<cudaChannelFormatKind>(b.kind)};
+    const cudaChannelFormatDesc d = make_desc(b.kind, b.x, b.y, b.z, b.w);
     cudaArray_t a = nullptr;
     observe(std::string("bad-array/") + b.name, cudaMallocArray(&a, &d, 8, 8));
     if (a) cudaFreeArray(a);
@@ -193,17 +206,17 @@ static void descriptor_fields() {
   }
   {
     cudaTextureDesc td = base;
-    td.addressMode[0] = static_cast<cudaTextureAddressMode>(7);
+    set_raw(&td.addressMode[0], 7);
     try_td("addressMode-bad", td);
   }
   {
     cudaTextureDesc td = base;
-    td.filterMode = static_cast<cudaTextureFilterMode>(5);
+    set_raw(&td.filterMode, 5);
     try_td("filterMode-bad", td);
   }
   {
     cudaTextureDesc td = base;
-    td.mipmapFilterMode = static_cast<cudaTextureFilterMode>(5);
+    set_raw(&td.mipmapFilterMode, 5);
     try_td("mipmapFilterMode-bad", td);
   }
   {
@@ -264,7 +277,7 @@ struct BcTex {
 
 static bool make_bc(const Fmt& f, int bw, int bh, const std::vector<uint8_t>& blocks, cudaTextureFilterMode filter,
                     cudaTextureAddressMode address, bool normalized, BcTex* out) {
-  cudaChannelFormatDesc d = {f.x, f.y, f.z, f.w, static_cast<cudaChannelFormatKind>(f.kind)};
+  const cudaChannelFormatDesc d = make_desc(f.kind, f.x, f.y, f.z, f.w);
   if (cudaMallocArray(&out->arr, &d, bw * 4, bh * 4) != cudaSuccess) return false;
   if (cudaMemcpy2DToArray(out->arr, 0, 0, blocks.data(), (size_t)bw * f.block_bytes, (size_t)bw * f.block_bytes, bh,
                           cudaMemcpyHostToDevice) != cudaSuccess)
@@ -434,7 +447,7 @@ static void packed_1010102() {
   std::vector<uint32_t> w(W);
   for (int i = 0; i < W; ++i)
     w[i] = (uint32_t)i | ((uint32_t)(1023 - i) << 10) | ((uint32_t)((i * 5) & 1023) << 20) | ((uint32_t)(i & 3) << 30);
-  cudaChannelFormatDesc d = {10, 10, 10, 2, static_cast<cudaChannelFormatKind>(31)};   // UnsignedNormalized1010102 (CUDA 12.1+)
+  const cudaChannelFormatDesc d = make_desc(31, 10, 10, 10, 2);   // UnsignedNormalized1010102 (CUDA 12.1+)
   cudaArray_t a = nullptr;
   if (cudaMallocArray(&a, &d, W, 1) != cudaSuccess) {
     observe("rgb10a2/array", -1);
@@ -487,9 +500,9 @@ static void views() {
     td.filterMode = cudaFilterModePoint;
     td.readMode = norm ? cudaReadModeNormalizedFloat : cudaReadModeElementType;
     const std::string mode = norm ? "/norm" : "/elem";
-    auto make = [&](cudaResourceViewFormat vf, size_t w, size_t h, cudaTextureObject_t* t) {
+    auto make = [&](int vf, size_t w, size_t h, cudaTextureObject_t* t) {
       cudaResourceViewDesc v = {};
-      v.format = vf;
+      set_raw(&v.format, vf);
       v.width = w;
       v.height = h;
       const cudaError_t e = cudaCreateTextureObject(t, &rd, &td, &v);
@@ -525,7 +538,7 @@ static void views() {
     done();
     observe("view/none" + mode, make(cudaResViewFormatNone, bw, bh, &t));
     done();
-    observe("view/format-99" + mode, make(static_cast<cudaResourceViewFormat>(99), bw, bh, &t));
+    observe("view/format-99" + mode, make(99, bw, bh, &t));
     done();
   }
   cudaFreeArray(a);

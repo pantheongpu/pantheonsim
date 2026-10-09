@@ -208,6 +208,39 @@ This used to be refused ("linear filtering with integer coordinates"), and
 out-of-range integer coordinates were clamped. e2e_texture_int_coords checks
 both against the card.
 
+## Normalized, block-compressed and packed formats
+
+An array may be made from any channel descriptor (`cudaChannelFormatKind*`) or driver format
+(`CU_AD_FORMAT_*`) the card accepts, through one table (`nvidia/src/texture_formats.hpp`) that
+the runtime and the driver share: unsigned and signed normalized 8- and 16-bit formats, BC1 to
+BC5 (each with its sRGB variant where there is one), BC6H and BC7 (arrays only), and 10:10:10:2.
+What a descriptor makes, which read modes, filters and sRGB flags a format takes, the errors
+(`cudaErrorInvalidChannelDescriptor`, `cudaErrorInvalidNormSetting` for a read mode the format
+cannot be read in, `cudaErrorInvalidFilterSetting`) and the driver's own answers (a format fixes
+its channel count; linear and pitched memory take the plain formats and 10:10:10:2 only; block
+data cannot be a surface or have the surface flag) are the card's, recorded in
+`runtime_texture_gaps_expected.inc` and `driver_texture_gaps_expected.inc`.
+
+The values are the card's. The block decoders (`include/vgpu/exec/block_compression.hpp`) are not
+the format descriptions' integer formulas: every number was measured with point-sampled blocks
+covering every endpoint pair of every channel, and the decoders reproduce them value for value.
+
+| Format | What the texture unit delivers |
+| --- | --- |
+| BC1 | 8-bit. Red and blue widen to 16 bits (`round(q * 65535 / 31)`), blend as (2a + b) / 3 and (a + 2b) / 3 and keep the high byte; green widens by bit replication and blends with weights of 321/1024 and 703/1024 on the second endpoint, rounded. Three-colour mode: red/blue `(33 (q0 + q1)) >> 3`, green weight 513/1024, the fourth colour transparent black |
+| BC2, BC3 colour | as BC1's four-colour mode; BC2 alpha is `a4 * 17` |
+| BC3 alpha | 8-bit: `floor((a0 * 2048 + (a1 - a0) * N + 1024) / 2048)`, N = 289, 578, 892, 1156, 1470, 1759 (eight values) or 385, 770, 1278, 1663 (six values and the two ends) |
+| BC4, BC5 unsigned | 16-bit: `a0 * (257 - W) + a1 * W` with W = 36, 72, 113, 144, 185, 221 (eight values) or 48, 96, 161, 209 (six values, then 0 and 65535) |
+| BC4, BC5 signed | 16-bit signed: endpoints widen by 32767/127 (-128 reads as -127) and blend with the same steps in that scale, rounded to nearest |
+| 10:10:10:2 | normalized floats; filtering widens the codes by bit replication to 16 bits (`(u << 6) \| (u >> 4)`), as the card does |
+
+Linear filtering, wrapped and mirrored addressing of all of these return exactly the card's
+floats (`runtime_texture_gaps` hashes them; the same program passes against NVIDIA's runtime).
+`maxAnisotropy` of any value is accepted and changes nothing for a fetch with no derivatives, as
+on the card. A resource view reinterprets the same bytes as another format of the same texel
+size (a `uint2` array as BC1 blocks, with four times the extent); the read mode is checked
+against the array's own format, then the view.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
@@ -222,7 +255,11 @@ Each with its own message, rather than a plausible wrong number:
   two-texel blends.)
 - `tld4` on layered or cubemap textures (the runtime refuses a gather array
   that is layered or a cubemap, so there is nothing to measure them on).
-- Resource views and anisotropic filtering.
+- **BC6H and BC7.** Arrays of these formats can be made, filled and copied, but
+  creating a texture object over one answers `cudaErrorNotSupported` /
+  `CUDA_ERROR_NOT_SUPPORTED` with a message on stderr (once). Their decoders need
+  the mode and partition tables, which were not measured (they can be, one
+  partition at a time, from the card).
 
 ## Surfaces out of range: .trap, .clamp and .zero
 

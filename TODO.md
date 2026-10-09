@@ -903,11 +903,8 @@ the sense that something specific is still missing, and each entry says what.
   control flow is not handled, and nothing pins that with a test. (The header
   comment at the top of interpreter.cpp still says barriers in divergent code
   are rejected and IPDOM is planned; it predates the min-PC code and is stale.)
-- cuCtxSetCurrent(NULL) pops the top of the context stack rather than clearing
-  the thread's binding (`nvidia/src/driver_api.cpp:938`; untested -- the
-  neighbouring `cuCtxPopCurrent` is covered by `driver_gaps.cpp`). The stack
-  itself is thread-local (`driver_api.cpp:175`); an earlier version of this
-  entry said it was process-global, which was wrong.
+- (cuCtxSetCurrent(NULL) pops the top of the context stack; the card does the same, measured and checked by
+  `driver_context_gaps`, so this is not a bug.)
 - Reliability: ECC counts by location, retired pages, remapped rows and PCIe
   error counters are injected with `vgpu fault` and read by nvidia-smi, NVML
   and rocm-smi (docs/telemetry.md). `vgpu fault arm` delivers bit flips and
@@ -1660,8 +1657,9 @@ scripts/run-pantheon-workloads.sh.
    y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
    of results against the hardware's. Refused by name: `tex.grad` (its LOD
    comes from undocumented approximate units), linear filtering of signed
-   8-bit normalized texels, `tld4` on layered/cubemap textures, anisotropy
-   and resource views. The `.clamp`/`.zero` surface policies are done, as an
+   8-bit normalized texels, `tld4` on layered/cubemap textures, and textures
+   of BC6H and BC7 blocks (BC1 to BC5, 10:10:10:2, resource views and any
+   anisotropy are done: nvidia/docs/textures.md). The `.clamp`/`.zero` surface policies are done, as an
    RTX 3060 applies them. See nvidia/docs/textures.md. Border
    colours are done: converted to the texture's format by rules measured over
    280,000 colours (e2e_border_colour, 705 cases). Measuring them turned up
@@ -1892,16 +1890,27 @@ behaviour, timing).
 
 ### CUDA runtime and driver (nvidia/src/runtime_api.cpp, driver_api.cpp)
 
-- Memory-pool handle types other than none (runtime_api.cpp:2706, :6959); `cudaHostRegisterReadOnly` (:2855);
-  texture/surface channel kinds (:3295-3366); resource views (:3742); `maxAnisotropy` above 1 (:3754).
-- Graphs: edge data other than the default (:5126, :7291, :7308, :7315, :7515); clone/parent restrictions
-  (:5345-5363, :5770); a CUDA array in a memcpy node (:5931); conditional-graph restrictions (:6199, :6476);
-  child-graph ownership (:7476, :7505); external semaphores not modelled (:7438). Capture modes other than
-  Relaxed (`cudaThreadExchangeStreamCaptureMode` is a stub, :3053).
-- Driver: exec affinity (driver_api.cpp:880), `requestedHandleTypes` (:1330), further stubs (:1485-1500).
-  `cudaDeviceGetAttribute` (runtime_api.cpp:1660) and `cuDeviceGetAttribute` (driver_api.cpp:587) answer 0
-  for an attribute the profile does not model, with a note on stderr.
-- `cuCtxSetCurrent(NULL)` pops instead of clearing (see "Partially implemented").
+Done in round 3 (branch r3-runtime-driver), each against the RTX 3060: capture modes (Global, ThreadLocal, Relaxed and
+`cudaThreadExchangeStreamCaptureMode`: `runtime_capture_modes`); memory-pool handle types, read-only host registration,
+exported VMM memory as a file descriptor (`runtime_memory_gaps`); graph edge data, clone/parent restrictions, a CUDA
+array in a memcpy node, child-graph ownership and external semaphore nodes (`runtime_graph_gaps`); driver contexts, flags,
+ids, exec affinity, limits, multicast stubs (`driver_context_gaps`);
+normalized, block-compressed (BC1 to BC5) and 10:10:10:2 texture formats, resource views and any `maxAnisotropy`, in the
+runtime and the driver (`runtime_texture_gaps`, `driver_texture_gaps`). The conditional-graph restrictions were already
+the card's, an attribute id the device-attribute table does not know is an error (`CUDA_ERROR_INVALID_VALUE`), not a 0,
+and `cuCtxSetCurrent(NULL)` removes the current context from the stack as a pop does -- that is what the card does
+(checked in `driver_context_gaps`), so the old register entries for the last two were not bugs.
+
+Still open:
+
+- BC6H and BC7 decoders (the arrays work; texture objects over them are refused by name). The tables are derivable from
+  the card one partition at a time; the arithmetic must be fitted as BC1 to BC5 were.
+- Linear filtering of signed 8-bit normalized texels (nvidia/docs/textures.md): the blend is a rounded sum of per-texel
+  conversions with weights in 1/256ths, but the conversion of a code has an asymmetry (`-64` and `64` convert one apart in
+  opposite directions) and `-128` blends as an unclamped `-128 * 258` before the final clamp; a fit of the exact steps
+  was started and not finished.
+- External memory and semaphore import (needs Vulkan, Direct3D or NvSciBuf; the card's runtime crashes on invalid handles).
+- `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (SM-to-GPC layout).
 
 ### PTX and SASS execution
 
@@ -1909,7 +1918,7 @@ behaviour, timing).
   :2984-2988); cvt `.rs` for x4; `.hi` for anything but `mul` (:4138); `wmma` kinds other than
   load/mma/store.d (:2218); multi-sample textures (:4472); `suld`/`sust` `.p` (:4534); `tex.level` LOD (:4480);
   `tex.grad`, `tld4` on layered/cubemap and with a level (:4478-4498); signed 8-bit normalized linear
-  filtering (src/exec/interpreter.cpp:1326, :1445); anisotropy and resource views (driver_api.cpp:3252, :3261).
+  filtering (src/exec/interpreter.cpp); BC6H/BC7 texture objects.
 - Device printf: `%ls` and `%n` (include/vgpu/exec/device_printf.hpp:115, :122). TMA: sub-byte im2col and
   `.b4x16` alignment (include/vgpu/exec/tma.hpp:50, :64); tensor-map restrictions (tensormap.hpp:210, :262, :351).
 - SASS executor (nvidia/docs/sass.md "Coverage"): `LDGMC` (multimem); TMA `im2col::w` (src/sass/exec_ops.inc:3800);

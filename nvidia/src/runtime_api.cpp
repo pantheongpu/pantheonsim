@@ -4031,7 +4031,7 @@ uint64_t g_next_mipmapped = 1;
 
 // A channel descriptor as the texture unit sees it, or false for one the card refuses.
 bool format_of(const cudaChannelFormatDesc& f, vgpu::cuda::TexFormat* out) {
-  return vgpu::cuda::texture_format_from_runtime(static_cast<int>(f.f), f.x, f.y, f.z, f.w, out);
+  return vgpu::cuda::texture_format_from_runtime(enum_value(f.f), f.x, f.y, f.z, f.w, out);
 }
 // What a sampled texel of this format takes in the descriptor's (virtual) layout.
 uint32_t sampled_bytes(const vgpu::cuda::TexFormat& f) { return vgpu::cuda::sampled_texel_bytes(f); }
