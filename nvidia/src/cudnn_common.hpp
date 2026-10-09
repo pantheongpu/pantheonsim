@@ -57,6 +57,8 @@ inline size_t type_bytes(cudnnDataType_t t) {
     case CUDNN_DATA_INT64: return 8;
     case CUDNN_DATA_INT8:
     case CUDNN_DATA_UINT8:
+    case CUDNN_DATA_FP8_E4M3:
+    case CUDNN_DATA_FP8_E5M2:
     case CUDNN_DATA_BOOLEAN: return 1;
     default: return 4;  // FLOAT, INT32, and the packed INT8x4/UINT8x4
   }
@@ -66,7 +68,7 @@ inline bool storable(cudnnDataType_t t) {
   switch (t) {
     case CUDNN_DATA_FLOAT: case CUDNN_DATA_DOUBLE: case CUDNN_DATA_HALF: case CUDNN_DATA_BFLOAT16:
     case CUDNN_DATA_INT8: case CUDNN_DATA_UINT8: case CUDNN_DATA_INT32: case CUDNN_DATA_INT64:
-    case CUDNN_DATA_BOOLEAN:
+    case CUDNN_DATA_BOOLEAN: case CUDNN_DATA_FP8_E4M3: case CUDNN_DATA_FP8_E5M2:
       return true;
     default: return false;
   }

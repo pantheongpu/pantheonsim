@@ -1806,7 +1806,7 @@ if(TARGET vgpucublas)
                           "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
-                          "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "cutensor_paths:cutensor"
+                          "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_frontend:cudnn" "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
@@ -1818,6 +1818,8 @@ if(TARGET vgpucublas)
       list(APPEND _env "VGPU_E2E_GPU=nvidia/h100")
     elseif(_name STREQUAL "lt_blockscaled_paths")
       list(APPEND _env "VGPU_E2E_GPU=nvidia/b200")
+    elseif(_name STREQUAL "dnn_fp8_attention" OR _name STREQUAL "dnn_fp8_attention_frontend")
+      list(APPEND _env "VGPU_E2E_GPU=nvidia/h100")   # cuDNN's FP8 attention is Hopper's and Blackwell's
     endif()
     set_tests_properties(e2e_${_name} PROPERTIES
       ENVIRONMENT "${_env}"

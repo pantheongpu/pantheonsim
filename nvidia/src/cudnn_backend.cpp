@@ -370,6 +370,8 @@ enum Role { kX, kScale, kBias, kEps, kMean, kInv, kFactor, kRunMeanIn, kRunVarIn
             // softmax and attention
             kSink, kStats, kMax, kSumExp, kFill, kSeqQ, kSeqKV, kLeft, kShift,
             kQ, kK, kV, kO, kDO, kDQ, kDK, kDV, kRngDump, kPageK, kPageV, kDSink, kCuQ, kCuKV,
+            // FP8 attention: descale factors of Q, K, V and S, scale factors of S and O, amax of S and O
+            kDescQ, kDescK, kDescV, kDescS, kScaleS, kScaleO, kAmaxS, kAmaxO,
             // MoE grouped matmul; rotary embedding
             kWeight, kFirstOffset, kTokenIndex, kTokenKs, kFreqs,
             // statistics generation; paged cache load
@@ -1289,12 +1291,11 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         // Blackwell and Rubin"), and the mask's bit layout is undocumented.
         if (d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_BLOCK_MASK_DESC))
           op->gap = "CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH; Reason: Block mask is only supported on Blackwell and Rubin";
-        for (cudnnBackendAttributeName_t n : {CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_KDESC,
-                                              CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_VDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_SDESC,
-                                              CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_SDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_ODESC,
-                                              CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_SDESC, CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_ODESC})
-          if (d->desc(n)) {
-            *why = "scaled dot-product attention: FP8 scaling is not supported";
+        // MXFP8 attention (E8M0 block scales in cuDNN's F8_128x4 layout, Blackwell's engines) is not implemented: the
+        // layout is documented only by name. Per-tensor FP8 attention is below.
+        if (const Desc* dq = d->desc(CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC))
+          if (dq->i64(CUDNN_ATTR_TENSOR_DATA_TYPE, 0) == CUDNN_DATA_FP8_E8M0) {
+            *why = "scaled dot-product attention: MXFP8 (E8M0 block scales) is not supported";
             return false;
           }
         ok = take(CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC, kO, true, true) && take(CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC, kQ, true, false) &&
@@ -1309,7 +1310,15 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_PAGE_TABLE_VDESC, kPageV, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_SEED_DESC, kSeed, false, false) &&
              take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_OFFSET_DESC, kOffset, false, false) &&
-             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_RNG_DUMP_DESC, kRngDump, false, true);
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_RNG_DUMP_DESC, kRngDump, false, true) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC, kDescQ, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_KDESC, kDescK, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_VDESC, kDescV, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_SDESC, kDescS, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_SDESC, kScaleS, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_SCALE_ODESC, kScaleO, false, false) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_SDESC, kAmaxS, false, true) &&
+             take(CUDNN_ATTR_OPERATION_SDPA_FWD_AMAX_ODESC, kAmaxO, false, true);
         op->dropout = scalar(d, CUDNN_ATTR_OPERATION_SDPA_FWD_DROPOUT_PROBABILITY, 0.0);
         if (ok && op->dropout != 0.0 && (op->role[kSeed] < 0 || op->role[kOffset] < 0 || op->dropout < 0 || op->dropout >= 1)) {
           *why = "scaled dot-product attention: dropout needs a seed, an offset and a probability in [0, 1)";
@@ -1352,6 +1361,26 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         }
       }
       if (!ok) return false;
+      // FP8 attention (documentation-derived, not checked against a card): Q, K and V all FP8, with the four descale
+      // factors, the two scale factors and O's amax, each one float.
+      if (fwd) {
+        auto fp8 = [](cudnnDataType_t t) { return t == CUDNN_DATA_FP8_E4M3 || t == CUDNN_DATA_FP8_E5M2; };
+        const bool qkv8 = fp8(op->in[op->role[kQ]].l.type) && fp8(op->in[op->role[kK]].l.type) && fp8(op->in[op->role[kV]].l.type);
+        const bool any8 = fp8(op->in[op->role[kQ]].l.type) || fp8(op->in[op->role[kK]].l.type) || fp8(op->in[op->role[kV]].l.type);
+        bool given = false;
+        for (int r : {kDescQ, kDescK, kDescV, kDescS, kScaleS, kScaleO, kAmaxS, kAmaxO}) given = given || op->role[r] >= 0;
+        if (any8 && !qkv8) { *why = "scaled dot-product attention: Q, K and V must all be FP8 or none"; return false; }
+        if (given && !qkv8) { *why = "scaled dot-product attention: FP8 scale factors on an attention that is not FP8"; return false; }
+        if (qkv8) {
+          for (int r : {kDescQ, kDescK, kDescV, kDescS, kScaleS, kScaleO})
+            if (op->role[r] < 0 || op->in[op->role[r]].l.count() != 1 || op->in[op->role[r]].l.type != CUDNN_DATA_FLOAT) {
+              *why = "scaled dot-product attention: FP8 attention needs the descale factors of Q, K, V and S and the scale factors "
+                     "of S and O, each one float";
+              return false;
+            }
+          if (op->role[kAmaxO] < 0) { *why = "scaled dot-product attention: FP8 attention needs O's amax"; return false; }
+        }
+      }
       // The score modifier subgraph: a graph run on the scaled scores
       // (bias, masks, ALiBi, soft-capping) whose input and output uids are
       // given; its other tensors come from this graph's variant pack.
@@ -2459,7 +2488,14 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
     page_gather(VL, V, *in[op.role[kPageV]], TV.dims[2], B, Skv, &kvlen, &v2);
     K.swap(k2), V.swap(v2);
   }
-  const double scale = op.role[kScale] >= 0 ? (*in[op.role[kScale]])[0] : 1.0;
+  // FP8 attention (documentation-derived): S = (Q K^T) descale_Q descale_K scale; the softmax's P is quantized to
+  // E4M3 after times scale_S; O = (P8 V) descale_S descale_V, its amax is taken, and scaled by scale_O into an FP8 O.
+  const bool fp8 = fwd && op.role[kDescQ] >= 0;
+  auto factor = [&](int r) { return r >= 0 ? (*in[r])[0] : 1.0; };
+  const double d_q = fp8 ? factor(op.role[kDescQ]) : 1.0, d_k = fp8 ? factor(op.role[kDescK]) : 1.0,
+               d_v = fp8 ? factor(op.role[kDescV]) : 1.0, d_s = fp8 ? factor(op.role[kDescS]) : 1.0,
+               s_s = fp8 ? factor(op.role[kScaleS]) : 1.0, s_o = fp8 ? factor(op.role[kScaleO]) : 1.0;
+  const double scale = (op.role[kScale] >= 0 ? (*in[op.role[kScale]])[0] : 1.0) * d_q * d_k;
   const bool padded = (op.role[kSeqQ] >= 0 || op.role[kCuQ] >= 0) && has_len_kv;
   const std::vector<double> len_q = lengths(op.role[kSeqQ], op.role[kCuQ], Sq), len_kv = lengths(op.role[kSeqKV], op.role[kCuKV], Skv);
   auto len = [&](int r, int64_t b, int64_t full) {
@@ -2516,6 +2552,9 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
         P[e] *= mask[e] / (1.0 - op.dropout);
       }
     }
+    double amax_s = 0.0, amax_o = 0.0;
+    if (fp8)
+      for (size_t e = 0; e < P.size(); ++e) amax_s = std::fmax(amax_s, std::fabs(P[e]));
     std::vector<double> O(static_cast<size_t>(B * Hq * Sq * Dv), 0.0);
     for (int64_t b = 0; b < B; ++b)
       for (int64_t h = 0; h < Hq; ++h) {
@@ -2523,13 +2562,24 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
         for (int64_t i = 0; i < Sq; ++i) {
           if (!row_live[static_cast<size_t>((b * Hq + h) * Sq + i)]) continue;  // padded rows stay 0
           for (int64_t j = 0; j < Skv; ++j) {
-            const double p = vc::round_to(io, P[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)]);
+            const double p = fp8 ? vc::round_to(CUDNN_DATA_FP8_E4M3, P[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)] * s_s)
+                                 : vc::round_to(io, P[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)]);
             if (p == 0.0) continue;
             for (int64_t e = 0; e < Dv; ++e)
               O[static_cast<size_t>(((b * Hq + h) * Sq + i) * Dv + e)] += p * V[static_cast<size_t>(((b * Hv + hv) * Skv + j) * Dv + e)];
           }
         }
       }
+    if (fp8) {
+      const bool o8 = op.out.l.type == CUDNN_DATA_FP8_E4M3 || op.out.l.type == CUDNN_DATA_FP8_E5M2;
+      for (double& o : O) {
+        o = static_cast<float>(o * d_s * d_v);
+        amax_o = std::fmax(amax_o, std::fabs(o));
+        if (o8) o = static_cast<float>(o * s_o);
+      }
+      if (op.role[kAmaxS] > 0) (*outs)[op.role[kAmaxS]] = {amax_s};
+      if (op.role[kAmaxO] > 0) (*outs)[op.role[kAmaxO]] = {amax_o};
+    }
     (*outs)[0] = std::move(O);
     if (op.role[kStats] > 0) (*outs)[op.role[kStats]] = std::move(sm.stats);
     if (op.role[kMax] > 0) (*outs)[op.role[kMax]] = std::move(sm.max);

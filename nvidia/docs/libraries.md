@@ -454,6 +454,7 @@ runs them; each is a ctest of its own.
 | `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, LSTMs in half, bfloat16 and double, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
 | `e2e_dnn_classic_paths` | cuDNN's classic API beyond the training paths: INT8x4/UINT8x4/INT8x32 convolution and fused bias-ReLU against an integer reference (also through `cudnnReorderFilterAndBias`), transforms to and from `NCHW_VECT_C`, INT8 pooling and activation, divisive normalization against its formula and finite differences, padding/folding/unfolding transforms and the folded backward-data pipeline, LSTM projections and clipping against a host LSTM and finite differences, the RNN getters, fused-ops plans, multi-head attention forward and both gradients | `nn.LSTM(proj_size=)`, `nn.MultiheadAttention`-style models, INT8 inference engines |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch/group norm forward and backward, backward without saved statistics, max and average pooling both ways, max pooling's index tensor, asymmetric padding, concatenation, statistics generation, RNG, reshape, transpose, slice, an INT8x4 vectorized convolution | `cudnn_convolution_add_relu`, cudnn-frontend |
+| `e2e_dnn_fp8_attention`, `e2e_dnn_fp8_attention_frontend` | per-tensor FP8 attention forward (descale of Q, K, V and S, scale of S and O, amax of S and O) on a Hopper profile, built from the backend API and by cudnn-frontend's `sdpa_fp8`, against the documented formulas (documentation-derived; no card), and MXFP8's refusal | Transformer Engine's FP8 attention |
 | `e2e_dnn_attention` | cuDNN scaled dot-product attention built by cudnn-frontend 1.30 (fetched): the unified and composite forms forward and backward, causal (both alignments) and sliding-window masks, bias, grouped-query heads, padding, paged K/V caches, ragged sequences, dropout, half/bfloat16/float | `scaled_dot_product_attention` with the cuDNN backend, Transformer Engine |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -861,9 +862,12 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   its derivative are exact where the card's fp32 tanh is approximate (within
   about 5e-5), which is why the probe checks GELU against the function, not a hash.
 - **cuDNN**: in the graph API, interpolating resampling (nearest,
-  bilinear: no engine on the hardware, no documented sampling rule), FP8
-  and block-scaled (MXFP8) attention and the block-scale (de)quantize
-  operations, attention's block masks and cumulative sequence lengths,
+  bilinear: no engine on the hardware, no documented sampling rule),
+  block-scaled (MXFP8) attention (E8M0 scales in the F8_128x4 layout), FP8
+  attention's backward pass and the block-scale (de)quantize operations (per-tensor
+  FP8 attention forward works from a Hopper profile, **documentation-derived**: no
+  Hopper card was available, `e2e_dnn_fp8_attention`, and through cudnn-frontend's
+  `sdpa_fp8`, `e2e_dnn_fp8_attention_frontend`; FP8 is a graph tensor type now), attention's block masks and cumulative sequence lengths,
   sinks in the backward attention operation, F16x16 and FP8-128x4 reordered
   tensors (the INT8x32 filter reordering works: `e2e_dnn_int8x32`), multi-GPU
   normalization, the MoE, RoPE and band-matrix
