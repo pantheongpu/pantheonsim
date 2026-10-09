@@ -2990,6 +2990,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # NCCL's collectives and point-to-point operations recorded into captured graphs, a rank per thread on
+  # two devices, launched together (run_graph_capture_nccl.sh --card: NVIDIA's NCCL on two GPUs).
+  add_test(NAME e2e_graph_capture_nccl COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture_nccl.sh)
+  set_tests_properties(e2e_graph_capture_nccl PROPERTIES
+    DEPENDS "vgpucudart"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # The rest of cuDNN's classic API -- vectorized INT8x4/INT8x32 layouts and
   # convolution, INT8 pooling and activation, divisive normalization, tensor
   # transform descriptors, LSTM projections and the RNN getters -- against
