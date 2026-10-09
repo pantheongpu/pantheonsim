@@ -1,0 +1,357 @@
+CB cuInit ENTER Flags=0
+CB cuInit EXIT ret=0
+CB cuDriverGetVersion ENTER driverVersion=set
+CB cuDriverGetVersion EXIT ret=0
+CB cuDeviceGetCount ENTER count=set
+CB cuDeviceGetCount EXIT ret=0
+CB cuDeviceGet ENTER device=set ordinal=0
+CB cuDeviceGet EXIT ret=0
+CB cuDeviceGetName ENTER name=set len=64 dev=0
+CB cuDeviceGetName EXIT ret=0
+CB cuDeviceTotalMem_v2 ENTER bytes=set dev=0
+CB cuDeviceTotalMem_v2 EXIT ret=0
+CB cuDeviceGetAttribute ENTER pi=set attrib=1 dev=0
+CB cuDeviceGetAttribute EXIT ret=0
+CB cuDeviceGetUuid_v2 ENTER uuid=set dev=0
+CB cuDeviceGetUuid_v2 EXIT ret=0
+CB cuDeviceGetPCIBusId ENTER pciBusId=set len=32 dev=0
+CB cuDeviceGetPCIBusId EXIT ret=0
+CB cuDeviceGetByPCIBusId ENTER dev=set pciBusId=set
+CB cuDeviceGetByPCIBusId EXIT ret=0
+CB cuDeviceCanAccessPeer ENTER canAccessPeer=set dev=0 peerDev=0
+CB cuDeviceCanAccessPeer EXIT ret=0
+CB cuDeviceGetDefaultMemPool ENTER pool_out=set dev=0
+CB cuDeviceGetDefaultMemPool EXIT ret=0
+CB cuDeviceGetMemPool ENTER pool=set dev=0
+CB cuDeviceGetMemPool EXIT ret=0
+CB cuDeviceSetMemPool ENTER dev=0 pool=set
+CB cuDeviceSetMemPool EXIT ret=0
+CB cuDeviceGetExecAffinitySupport ENTER pi=set type=0 dev=0
+CB cuDeviceGetExecAffinitySupport EXIT ret=0
+CB cuDevicePrimaryCtxGetState ENTER dev=0 flags=set active=set
+CB cuDevicePrimaryCtxGetState EXIT ret=0
+CB cuDevicePrimaryCtxRetain ENTER pctx=set dev=0
+CB cuDevicePrimaryCtxRetain EXIT ret=0
+CB cuDevicePrimaryCtxSetFlags_v2 ENTER dev=0 flags=0
+CB cuDevicePrimaryCtxSetFlags_v2 EXIT ret=0
+CB cuDevicePrimaryCtxGetState ENTER dev=0 flags=set active=set
+CB cuDevicePrimaryCtxGetState EXIT ret=0
+CB cuDevicePrimaryCtxRelease_v2 ENTER dev=0
+CB cuDevicePrimaryCtxRelease_v2 EXIT ret=0
+CB cuCtxCreate_v2 ENTER pctx=set flags=0 dev=0
+CB cuCtxCreate_v2 EXIT ret=0
+CB cuCtxPushCurrent_v2 ENTER ctx=set
+CB cuCtxPushCurrent_v2 EXIT ret=0
+CB cuCtxPopCurrent_v2 ENTER pctx=set
+CB cuCtxPopCurrent_v2 EXIT ret=0
+CB cuCtxSetCurrent ENTER ctx=set
+CB cuCtxSetCurrent EXIT ret=0
+CB cuCtxGetCurrent ENTER pctx=set
+CB cuCtxGetCurrent EXIT ret=0
+CB cuCtxGetDevice ENTER device=set
+CB cuCtxGetDevice EXIT ret=0
+CB cuCtxGetFlags ENTER flags=set
+CB cuCtxGetFlags EXIT ret=0
+CB cuCtxGetId ENTER ctx=set ctxId=set
+CB cuCtxGetId EXIT ret=0
+CB cuCtxGetApiVersion ENTER ctx=set version=set
+CB cuCtxGetApiVersion EXIT ret=0
+CB cuCtxGetLimit ENTER pvalue=set limit=0
+CB cuCtxGetLimit EXIT ret=0
+CB cuCtxSetLimit ENTER limit=0 value=1024
+CB cuCtxSetLimit EXIT ret=0
+CB cuCtxGetCacheConfig ENTER pconfig=set
+CB cuCtxGetCacheConfig EXIT ret=0
+CB cuCtxSetCacheConfig ENTER config=0
+CB cuCtxSetCacheConfig EXIT ret=0
+CB cuCtxGetStreamPriorityRange ENTER leastPriority=set greatestPriority=set
+CB cuCtxGetStreamPriorityRange EXIT ret=0
+CB cuCtxSynchronize ENTER
+CB cuCtxSynchronize EXIT ret=0
+CB cuMemGetInfo_v2 ENTER free=set total=set
+CB cuMemGetInfo_v2 EXIT ret=0
+CB cuMemAlloc_v2 ENTER dptr=set bytesize=4096
+CB cuMemAlloc_v2 EXIT ret=0
+CB cuMemAlloc_v2 ENTER dptr=set bytesize=4096
+CB cuMemAlloc_v2 EXIT ret=0
+CB cuMemAllocPitch_v2 ENTER dptr=set pPitch=set WidthInBytes=100 Height=8 ElementSizeBytes=4
+CB cuMemAllocPitch_v2 EXIT ret=0
+CB cuMemAllocManaged ENTER dptr=set bytesize=4096 flags=1
+CB cuMemAllocManaged EXIT ret=0
+CB cuMemAllocHost_v2 ENTER pp=set bytesize=4096
+CB cuMemAllocHost_v2 EXIT ret=0
+CB cuMemHostAlloc ENTER pp=set bytesize=4096 Flags=2
+CB cuMemHostAlloc EXIT ret=0
+CB cuMemHostGetDevicePointer_v2 ENTER pdptr=set p=set Flags=0
+CB cuMemHostGetDevicePointer_v2 EXIT ret=0
+CB cuMemHostGetFlags ENTER pFlags=set p=set
+CB cuMemHostGetFlags EXIT ret=0
+CB cuMemGetAddressRange_v2 ENTER pbase=set psize=set dptr=big
+CB cuMemGetAddressRange_v2 EXIT ret=0
+CB cuMemHostRegister_v2 ENTER p=set bytesize=4096 Flags=0
+CB cuMemHostRegister_v2 EXIT ret=0
+CB cuMemHostUnregister ENTER p=set
+CB cuMemHostUnregister EXIT ret=0
+CB cuMemsetD8_v2 ENTER dstDevice=big uc=1 N=256
+CB cuMemsetD8_v2 EXIT ret=0
+CB cuMemsetD16_v2 ENTER dstDevice=big us=2 N=128
+CB cuMemsetD16_v2 EXIT ret=0
+CB cuMemsetD32_v2 ENTER dstDevice=big ui=3 N=64
+CB cuMemsetD32_v2 EXIT ret=0
+CB cuMemsetD2D8_v2 ENTER dstDevice=big dstPitch=512 uc=4 Width=100 Height=8
+CB cuMemsetD2D8_v2 EXIT ret=0
+CB cuMemsetD2D16_v2 ENTER dstDevice=big dstPitch=512 us=5 Width=50 Height=8
+CB cuMemsetD2D16_v2 EXIT ret=0
+CB cuMemsetD2D32_v2 ENTER dstDevice=big dstPitch=512 ui=6 Width=25 Height=8
+CB cuMemsetD2D32_v2 EXIT ret=0
+CB cuMemcpyHtoD_v2 ENTER dstDevice=big srcHost=set ByteCount=256
+CB cuMemcpyHtoD_v2 EXIT ret=0
+CB cuMemcpyDtoH_v2 ENTER dstHost=set srcDevice=big ByteCount=256
+CB cuMemcpyDtoH_v2 EXIT ret=0
+CB cuMemcpyDtoD_v2 ENTER dstDevice=big srcDevice=big ByteCount=256
+CB cuMemcpyDtoD_v2 EXIT ret=0
+CB cuMemcpy ENTER dst=big src=big ByteCount=256
+CB cuMemcpy EXIT ret=0
+CB cuMemcpy2D_v2 ENTER pCopy=set
+CB cuMemcpy2D_v2 EXIT ret=0
+CB cuMemcpy2DUnaligned_v2 ENTER pCopy=set
+CB cuMemcpy2DUnaligned_v2 EXIT ret=0
+CB cuMemcpyPeer ENTER dstDevice=big dstContext=set srcDevice=big srcContext=set ByteCount=256
+CB cuMemcpyPeer EXIT ret=0
+CB cuPointerGetAttribute ENTER data=set attribute=2 ptr=big
+CB cuPointerGetAttribute EXIT ret=0
+CB cuPointerGetAttributes ENTER numAttributes=2 attributes=set data=set ptr=big
+CB cuPointerGetAttributes EXIT ret=0
+CB cuPointerSetAttribute ENTER value=set attribute=6 ptr=big
+CB cuPointerSetAttribute EXIT ret=0
+CB cuStreamCreate ENTER phStream=set Flags=1
+CB cuStreamCreate EXIT ret=0
+CB cuStreamCreateWithPriority ENTER phStream=set flags=0 priority=0
+CB cuStreamCreateWithPriority EXIT ret=0
+CB cuStreamGetFlags ENTER hStream=set flags=set
+CB cuStreamGetFlags EXIT ret=0
+CB cuStreamGetPriority ENTER hStream=set priority=set
+CB cuStreamGetPriority EXIT ret=0
+CB cuStreamGetCtx ENTER hStream=set pctx=set
+CB cuStreamGetCtx EXIT ret=0
+CB cuStreamQuery ENTER hStream=set
+CB cuStreamQuery EXIT ret=0
+CB cuStreamIsCapturing ENTER hStream=set captureStatus=set
+CB cuStreamIsCapturing EXIT ret=0
+CB cuEventCreate ENTER phEvent=set Flags=0
+CB cuEventCreate EXIT ret=0
+CB cuEventCreate ENTER phEvent=set Flags=0
+CB cuEventCreate EXIT ret=0
+CB cuEventRecord ENTER hEvent=set hStream=set
+CB cuEventRecord EXIT ret=0
+CB cuEventSynchronize ENTER hEvent=set
+CB cuEventSynchronize EXIT ret=0
+CB cuStreamWaitEvent ENTER hStream=set hEvent=set Flags=0
+CB cuStreamWaitEvent EXIT ret=0
+CB cuEventRecord ENTER hEvent=set hStream=set
+CB cuEventRecord EXIT ret=0
+CB cuStreamSynchronize ENTER hStream=set
+CB cuStreamSynchronize EXIT ret=0
+CB cuEventElapsedTime ENTER pMilliseconds=set hStart=set hEnd=set
+CB cuEventElapsedTime EXIT ret=0
+CB cuStreamAddCallback ENTER hStream=set callback=set userData=null flags=0
+CB cuStreamAddCallback EXIT ret=0
+CB cuLaunchHostFunc ENTER hStream=set fn=set userData=null
+CB cuLaunchHostFunc EXIT ret=0
+CB cuStreamAttachMemAsync ENTER hStream=set dptr=big length=0 flags=1
+CB cuStreamAttachMemAsync EXIT ret=0
+CB cuMemsetD8Async ENTER dstDevice=big uc=7 N=256 hStream=set
+CB cuMemsetD8Async EXIT ret=0
+CB cuMemsetD16Async ENTER dstDevice=big us=8 N=128 hStream=set
+CB cuMemsetD16Async EXIT ret=0
+CB cuMemsetD32Async ENTER dstDevice=big ui=9 N=64 hStream=set
+CB cuMemsetD32Async EXIT ret=0
+CB cuMemsetD2D8Async ENTER dstDevice=big dstPitch=512 uc=4 Width=100 Height=8 hStream=set
+CB cuMemsetD2D8Async EXIT ret=0
+CB cuMemsetD2D16Async ENTER dstDevice=big dstPitch=512 us=5 Width=50 Height=8 hStream=set
+CB cuMemsetD2D16Async EXIT ret=0
+CB cuMemsetD2D32Async ENTER dstDevice=big dstPitch=512 ui=6 Width=25 Height=8 hStream=set
+CB cuMemsetD2D32Async EXIT ret=0
+CB cuMemcpyHtoDAsync_v2 ENTER dstDevice=big srcHost=set ByteCount=256 hStream=set
+CB cuMemcpyHtoDAsync_v2 EXIT ret=0
+CB cuMemcpyDtoHAsync_v2 ENTER dstHost=set srcDevice=big ByteCount=256 hStream=set
+CB cuMemcpyDtoHAsync_v2 EXIT ret=0
+CB cuMemcpyDtoDAsync_v2 ENTER dstDevice=big srcDevice=big ByteCount=256 hStream=set
+CB cuMemcpyDtoDAsync_v2 EXIT ret=0
+CB cuMemcpyAsync ENTER dst=big src=big ByteCount=256 hStream=set
+CB cuMemcpyAsync EXIT ret=0
+CB cuMemcpy2DAsync_v2 ENTER pCopy=set hStream=set
+CB cuMemcpy2DAsync_v2 EXIT ret=0
+CB cuMemcpyPeerAsync ENTER dstDevice=big dstContext=set srcDevice=big srcContext=set ByteCount=256 hStream=set
+CB cuMemcpyPeerAsync EXIT ret=0
+CB cuStreamSynchronize ENTER hStream=set
+CB cuStreamSynchronize EXIT ret=0
+CB cuMemPoolCreate ENTER pool=set poolProps=set
+CB cuMemPoolCreate EXIT ret=0
+CB cuMemPoolSetAttribute ENTER pool=set attr=4 value=set
+CB cuMemPoolSetAttribute EXIT ret=0
+CB cuMemPoolGetAttribute ENTER pool=set attr=4 value=set
+CB cuMemPoolGetAttribute EXIT ret=0
+CB cuMemPoolSetAccess ENTER pool=set map=set count=1
+CB cuMemPoolSetAccess EXIT ret=0
+CB cuMemPoolGetAccess ENTER flags=set memPool=set location=set
+CB cuMemPoolGetAccess EXIT ret=0
+CB cuMemAllocFromPoolAsync ENTER dptr=set bytesize=65536 pool=set hStream=set
+CB cuMemAllocFromPoolAsync EXIT ret=0
+CB cuMemPoolExportToShareableHandle ENTER handle_out=set pool=set handleType=1 flags=0
+CB cuMemPoolExportToShareableHandle EXIT ret=1
+CB cuMemPoolImportFromShareableHandle ENTER pool_out=set handle=set handleType=1 flags=0
+CB cuMemPoolImportFromShareableHandle EXIT ret=801
+CB cuMemPoolExportPointer ENTER shareData_out=set ptr=big
+CB cuMemPoolExportPointer EXIT ret=1
+CB cuMemPoolImportPointer ENTER ptr_out=set pool=set shareData=set
+CB cuMemPoolImportPointer EXIT ret=1
+CB cuMemFreeAsync ENTER dptr=big hStream=set
+CB cuMemFreeAsync EXIT ret=0
+CB cuStreamSynchronize ENTER hStream=set
+CB cuStreamSynchronize EXIT ret=0
+CB cuMemPoolTrimTo ENTER pool=set minBytesToKeep=0
+CB cuMemPoolTrimTo EXIT ret=0
+CB cuMemPoolDestroy ENTER pool=set
+CB cuMemPoolDestroy EXIT ret=0
+CB cuMemAllocAsync ENTER dptr=set bytesize=4096 hStream=set
+CB cuMemAllocAsync EXIT ret=0
+CB cuMemFreeAsync ENTER dptr=big hStream=set
+CB cuMemFreeAsync EXIT ret=0
+CB cuStreamSynchronize ENTER hStream=set
+CB cuStreamSynchronize EXIT ret=0
+CB cuMemGetAllocationGranularity ENTER granularity=set prop=set option=0
+CB cuMemGetAllocationGranularity EXIT ret=0
+CB cuMemAddressReserve ENTER ptr=set size=2097152 alignment=0 addr=0 flags=0
+CB cuMemAddressReserve EXIT ret=0
+CB cuMemCreate ENTER handle=set size=2097152 prop=set flags=0
+CB cuMemCreate EXIT ret=0
+CB cuMemMap ENTER ptr=big size=2097152 offset=0 handle=set flags=0
+CB cuMemMap EXIT ret=0
+CB cuMemSetAccess ENTER ptr=big size=2097152 desc=set count=1
+CB cuMemSetAccess EXIT ret=0
+CB cuMemGetAccess ENTER flags=set location=set ptr=big
+CB cuMemGetAccess EXIT ret=0
+CB cuMemGetAllocationPropertiesFromHandle ENTER prop=set handle=set
+CB cuMemGetAllocationPropertiesFromHandle EXIT ret=0
+CB cuMemRetainAllocationHandle ENTER handle=set addr=set
+CB cuMemRetainAllocationHandle EXIT ret=0
+CB cuMemUnmap ENTER ptr=big size=2097152
+CB cuMemUnmap EXIT ret=0
+CB cuMemRelease ENTER handle=set
+CB cuMemRelease EXIT ret=0
+CB cuMemAddressFree ENTER ptr=big size=2097152
+CB cuMemAddressFree EXIT ret=0
+CB cuModuleLoadData ENTER module=set image=set
+CB cuModuleLoadData EXIT ret=0
+CB cuModuleGetFunction ENTER hfunc=set hmod=set name=set
+CB cuModuleGetFunction EXIT ret=0
+CB cuModuleGetGlobal_v2 ENTER dptr=set bytes=set hmod=set name=set
+CB cuModuleGetGlobal_v2 EXIT ret=0
+CB cuModuleGetLoadingMode ENTER mode=set
+CB cuModuleGetLoadingMode EXIT ret=0
+CB cuFuncGetAttribute ENTER pi=set attrib=4 hfunc=set
+CB cuFuncGetAttribute EXIT ret=0
+CB cuFuncSetAttribute ENTER hfunc=set attrib=8 value=1024
+CB cuFuncSetAttribute EXIT ret=0
+CB cuFuncSetCacheConfig ENTER hfunc=set config=0
+CB cuFuncSetCacheConfig EXIT ret=0
+CB cuOccupancyMaxActiveBlocksPerMultiprocessor ENTER numBlocks=set func=set blockSize=128 dynamicSMemSize=0
+CB cuOccupancyMaxActiveBlocksPerMultiprocessor EXIT ret=0
+CB cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags ENTER numBlocks=set func=set blockSize=128 dynamicSMemSize=0 flags=0
+CB cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags EXIT ret=0
+CB cuOccupancyMaxPotentialBlockSize ENTER minGridSize=set blockSize=set func=set blockSizeToDynamicSMemSize=null dynamicSMemSize=0 blockSizeLimit=0
+CB cuOccupancyMaxPotentialBlockSize EXIT ret=0
+CB cuOccupancyMaxPotentialBlockSizeWithFlags ENTER minGridSize=set blockSize=set func=set blockSizeToDynamicSMemSize=null dynamicSMemSize=0 blockSizeLimit=0 flags=0
+CB cuOccupancyMaxPotentialBlockSizeWithFlags EXIT ret=0
+CB cuLaunchKernel ENTER f=set gridDimX=1 gridDimY=1 gridDimZ=1 blockDimX=32 blockDimY=1 blockDimZ=1 sharedMemBytes=0 hStream=set kernelParams=set extra=null
+CB cuLaunchKernel EXIT ret=0
+CB cuLaunchCooperativeKernel ENTER f=set gridDimX=1 gridDimY=1 gridDimZ=1 blockDimX=32 blockDimY=1 blockDimZ=1 sharedMemBytes=0 hStream=set kernelParams=set
+CB cuLaunchCooperativeKernel EXIT ret=0
+CB cuFuncSetBlockShape ENTER hfunc=set x=32 y=1 z=1
+CB cuFuncSetBlockShape EXIT ret=0
+CB cuFuncSetSharedSize ENTER hfunc=set bytes=0
+CB cuFuncSetSharedSize EXIT ret=0
+CB cuParamSetSize ENTER hfunc=set numbytes=16
+CB cuParamSetSize EXIT ret=0
+CB cuParamSetv ENTER hfunc=set offset=0 ptr=set numbytes=8
+CB cuParamSetv EXIT ret=0
+CB cuParamSetf ENTER hfunc=set offset=8 value=2
+CB cuParamSetf EXIT ret=0
+CB cuParamSeti ENTER hfunc=set offset=12 value=32
+CB cuParamSeti EXIT ret=0
+CB cuLaunchGridAsync ENTER f=set grid_width=1 grid_height=1 hStream=set
+CB cuLaunchGridAsync EXIT ret=0
+CB cuLaunchGrid ENTER f=set grid_width=1 grid_height=1
+CB cuLaunchGrid EXIT ret=0
+CB cuLaunch ENTER f=set
+CB cuLaunch EXIT ret=0
+CB cuStreamSynchronize ENTER hStream=set
+CB cuStreamSynchronize EXIT ret=0
+CB cuCtxSynchronize ENTER
+CB cuCtxSynchronize EXIT ret=0
+CB cuLinkCreate_v2 ENTER numOptions=0 options=null optionValues=null stateOut=set
+CB cuLinkCreate_v2 EXIT ret=0
+CB cuLinkAddData_v2 ENTER state=set type=1 data=set size=645 name=set numOptions=0 options=null optionValues=null
+CB cuLinkAddData_v2 EXIT ret=0
+CB cuLinkComplete ENTER state=set cubinOut=set sizeOut=set
+CB cuLinkComplete EXIT ret=0
+CB cuLinkDestroy ENTER state=set
+CB cuLinkDestroy EXIT ret=0
+CB cuArrayCreate_v2 ENTER pHandle=set pAllocateArray=set
+CB cuArrayCreate_v2 EXIT ret=0
+CB cuArrayGetDescriptor_v2 ENTER pArrayDescriptor=set hArray=set
+CB cuArrayGetDescriptor_v2 EXIT ret=0
+CB cuMemcpy2D_v2 ENTER pCopy=set
+CB cuMemcpy2D_v2 EXIT ret=0
+CB cuMemcpyHtoA_v2 ENTER dstArray=set dstOffset=0 srcHost=set ByteCount=64
+CB cuMemcpyHtoA_v2 EXIT ret=0
+CB cuMemcpyAtoH_v2 ENTER dstHost=set srcArray=set srcOffset=0 ByteCount=64
+CB cuMemcpyAtoH_v2 EXIT ret=0
+CB cuArrayDestroy ENTER hArray=set
+CB cuArrayDestroy EXIT ret=0
+CB cuArray3DCreate_v2 ENTER pHandle=set pAllocateArray=set
+CB cuArray3DCreate_v2 EXIT ret=0
+CB cuArray3DGetDescriptor_v2 ENTER pArrayDescriptor=set hArray=set
+CB cuArray3DGetDescriptor_v2 EXIT ret=0
+CB cuArrayDestroy ENTER hArray=set
+CB cuArrayDestroy EXIT ret=0
+CB cuGetErrorString ENTER error=1 pStr=set
+CB cuGetErrorString EXIT ret=0
+CB cuGetErrorName ENTER error=1 pStr=set
+CB cuGetErrorName EXIT ret=0
+CB cuGetProcAddress_v2 ENTER symbol=set pfn=set cudaVersion=12000 flags=0 symbolStatus=set
+CB cuGetProcAddress_v2 EXIT ret=0
+CB cuProfilerStart ENTER
+CB cuProfilerStart EXIT ret=0
+CB cuProfilerStop ENTER
+CB cuProfilerStop EXIT ret=0
+CB cuModuleUnload ENTER hmod=set
+CB cuModuleUnload EXIT ret=0
+CB cuEventDestroy_v2 ENTER hEvent=set
+CB cuEventDestroy_v2 EXIT ret=0
+CB cuEventDestroy_v2 ENTER hEvent=set
+CB cuEventDestroy_v2 EXIT ret=0
+CB cuStreamDestroy_v2 ENTER hStream=set
+CB cuStreamDestroy_v2 EXIT ret=0
+CB cuStreamDestroy_v2 ENTER hStream=set
+CB cuStreamDestroy_v2 EXIT ret=0
+CB cuMemFree_v2 ENTER dptr=big
+CB cuMemFree_v2 EXIT ret=0
+CB cuMemFree_v2 ENTER dptr=big
+CB cuMemFree_v2 EXIT ret=0
+CB cuMemFree_v2 ENTER dptr=big
+CB cuMemFree_v2 EXIT ret=0
+CB cuMemFree_v2 ENTER dptr=big
+CB cuMemFree_v2 EXIT ret=0
+CB cuMemFreeHost ENTER p=set
+CB cuMemFreeHost EXIT ret=0
+CB cuMemFreeHost ENTER p=set
+CB cuMemFreeHost EXIT ret=0
+CB cuCtxSetCurrent ENTER ctx=null
+CB cuCtxSetCurrent EXIT ret=0
+CB cuCtxDestroy_v2 ENTER ctx=set
+CB cuCtxDestroy_v2 EXIT ret=0
+CB cuDevicePrimaryCtxReset_v2 ENTER dev=0
+CB cuDevicePrimaryCtxReset_v2 EXIT ret=0
+# end

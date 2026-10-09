@@ -37,7 +37,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
-case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|peer|compat12> [--card [--update]]}"
+case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|peer|compat12|driver_params> [--card [--update]]}"
 shift
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/cupti_${case_name}.cu"

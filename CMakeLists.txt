@@ -2374,7 +2374,7 @@ if(TARGET vgpucupti)
   # allocation and pool records, graphs, modules and streams, and the switches
   # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
   # an RTX 3060 (nvidia/docs/cupti.md).
-  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um compat12)
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um compat12 driver_params)
     add_test(NAME e2e_cupti_${_case}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
     set_tests_properties(e2e_cupti_${_case} PROPERTIES
@@ -2625,6 +2625,15 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME lint_capture_coverage
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+  # Every exported runtime and driver function is a call a profiler is told of,
+  # and the driver shim takes the argument sizes the toolkit declares (CUPTI
+  # reads them by those sizes).
+  add_test(NAME lint_cupti_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_cupti_coverage.py)
+  add_test(NAME lint_driver_arg_sizes
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_arg_sizes.py
+                   ${CUDA_ABI_INCLUDE})
+  set_tests_properties(lint_driver_arg_sizes PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES
