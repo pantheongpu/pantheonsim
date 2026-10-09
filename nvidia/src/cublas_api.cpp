@@ -35,12 +35,14 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 #include "vgpu/error.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/runtime/capture.hpp"
 #include "enum_value.hpp"
+#include "fixed_point_gemm.hpp"
 
 // Operands are read from and written to the same virtual device memory the
 // kernels see, through the runtime shim's own copy path (declared by the CUDA
@@ -145,7 +147,9 @@ inline size_t compute_scalar_bytes(cublasComputeType_t ct) {
     case CUBLAS_COMPUTE_16F_PEDANTIC: return sizeof(__half);
     case CUBLAS_COMPUTE_64F:
     case CUBLAS_COMPUTE_64F_PEDANTIC: return sizeof(double);
-    default: return sizeof(float);  // the 32F and 32I families are both 4 bytes
+    default:
+      if (static_cast<int>(ct) == 79) return sizeof(double);   // CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+      return sizeof(float);  // the 32F and 32I families are both 4 bytes
   }
 }
 
@@ -333,6 +337,61 @@ bool tri3_args_ok(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_
          lda >= std::max(1, side == CUBLAS_SIDE_LEFT ? m : n) && ldb >= std::max(1, m);
 }
 
+// ---- fixed-point emulation of double precision ----
+//
+// A GEMM in double precision is done on integer slices (fixed_point_gemm.hpp)
+// when the strategy is EAGER and either the compute type is
+// CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT or the handle's math mode has
+// CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH (bit 8) set -- on an RTX 3060, cuBLAS
+// 13.0 did this for GemmEx, GemmBatchedEx, GemmStridedBatchedEx, Dgemm and
+// Zgemm, and for no other strategy (DEFAULT is PERFORMANT unless the
+// CUBLAS_EMULATION_STRATEGY environment variable says "eager", and PERFORMANT
+// emulated nothing there, where double precision runs at 1/64 of single).
+// The documentation lists compute capabilities 8.x, 9.0, 10.x, 11.0 and 12.x.
+// The mantissa bit count used is written to the device pointer set with
+// cublasSetFixedPointEmulationMantissaBitCountPointer; where a call is not
+// emulated the card leaves the pointer alone, and so does this.
+constexpr int kMathFp64Emulated = 8;
+thread_local bool t_fixed_point_requested = false;   // GemmEx saw CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+struct FixedPointRequest {
+  bool saved;
+  explicit FixedPointRequest(bool on) : saved(t_fixed_point_requested) { t_fixed_point_requested = on; }
+  ~FixedPointRequest() { t_fixed_point_requested = saved; }
+};
+// CUBLAS_EMULATION_STRATEGY is read once, when the library is first used: on
+// the card a variable set later in the process, before a new handle or a
+// call, changed nothing.
+int env_emulation_strategy() {
+  static const int strategy = [] {
+    const char* e = std::getenv("CUBLAS_EMULATION_STRATEGY");
+    return (e && (e[0] == 'e' || e[0] == 'E')) ? 2 : 1;
+  }();
+  return strategy;
+}
+bool fixed_point_active(const Handle* h) {
+  int math_mode;   // as an integer: a caller may have set a value the enum does not name
+  std::memcpy(&math_mode, &h->math_mode, sizeof math_mode);
+  if (!(t_fixed_point_requested || (math_mode & kMathFp64Emulated))) return false;
+  int strategy = h->emulation_strategy;
+  if (strategy == 0) strategy = env_emulation_strategy();
+  if (strategy != 2) return false;
+  int dev = 0, major = 0, minor = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+  return major == 8 || (major == 9 && minor == 0) || major == 10 || major == 11 || major == 12;
+}
+vgpu::fpemu::Options fixed_point_options(const Handle* h) {
+  vgpu::fpemu::Options o;
+  o.dynamic = h->mantissa_control == 0;
+  o.max_bits = h->max_mantissa_bits;
+  o.offset = h->mantissa_bit_offset;
+  return o;
+}
+void report_mantissa_bits(const Handle* h, int bits) {
+  if (h->mantissa_bit_count) cudaMemcpy(h->mantissa_bit_count, &bits, sizeof bits, kH2D);
+}
+
 template <class T, class Acc>
 cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
                        int m, int n, int k, const Acc* alpha_p, const void* A, int lda,
@@ -347,6 +406,25 @@ cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOp
   auto hA = fetch<T>(A, transa == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k));
   auto hB = fetch<T>(B, transb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n));
   auto hC = fetch<T>(C, extent(ldc, n, m));
+  if constexpr (std::is_same_v<T, double>) {
+    const Handle* hh = reinterpret_cast<const Handle*>(handle);
+    if (fixed_point_active(hh)) {
+      std::vector<double> P;
+      const auto r = vgpu::fpemu::multiply(transa != CUBLAS_OP_N, transb != CUBLAS_OP_N, m, n, k, hA.data(), lda,
+                                           hB.data(), ldb, fixed_point_options(hh), &P);
+      if (r.bits >= 0) report_mantissa_bits(hh, r.bits);
+      if (r.formed) {
+        for (int j = 0; j < n; ++j)
+          for (int i = 0; i < m; ++i) {
+            double& c = hC[idx(i, j, ldc)];
+            const double prod = P[(size_t)i + (size_t)j * (size_t)m];
+            c = beta == 0.0 ? alpha * prod : alpha * prod + beta * c;
+          }
+        store(C, hC);
+        return CUBLAS_STATUS_SUCCESS;
+      }
+    }
+  }
   gemm_host<T, Acc>(transa, transb, m, n, k, alpha, hA, lda, hB, ldb, beta, hC, ldc);
   store(C, hC);
   return CUBLAS_STATUS_SUCCESS;
@@ -360,6 +438,7 @@ cublasStatus_t do_gemm(cublasHandle_t handle, cublasOperation_t transa, cublasOp
 
 VGPU_EXPORT cublasStatus_t cublasCreate_v2(cublasHandle_t* handle) {
   if (!handle) return CUBLAS_STATUS_INVALID_VALUE;
+  (void)env_emulation_strategy();   // read the variable now, not at some later call
   auto* h = new Handle();
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -619,6 +698,80 @@ VGPU_EXPORT void cublasXerbla(const char* srName, int info) {
 }
 
 /* ---- GEMM ---- */
+
+// cublasUint8gemmBias: the deprecated 8-bit GEMM with offsets. The header
+// declares it and gives no formula; this is what an RTX 3060's cuBLAS 13.0
+// does, measured (10,505 outputs over random shapes, operations and offsets,
+// all matching; nvidia/tests/e2e/blas_u8gemm_paths.cu):
+//   acc    = sum_p (op(A)[i,p] - A_bias) * (op(B)[p,j] - B_bias)
+//   C[i,j] = clamp(round_half_up((acc + C_bias) * C_mult / 2^C_shift), 0, 255)
+// C is not read. C_shift counts modulo 32 (32 is 0, 33 is 1), except 31, which
+// gives 0 whatever the product; a conjugate transpose is the transpose; a
+// transposed C (transc) is stored n x m. The product is exact in 64 bits.
+// Bad arguments print BLAS's message on standard output, numbered as the card
+// numbers them (transa 1, transb 2, transc 3, m 4, n 5, k 6, lda 8, ldb 10,
+// ldc 13; A_bias, B_bias and the pointers are never checked) and answer
+// INVALID_VALUE. A null pointer is refused here; the card takes it and faults
+// on the device.
+namespace {
+unsigned char u8gemm_scale(int64_t acc, int c_bias, int c_mult, int c_shift) {
+  const __int128 p = static_cast<__int128>(acc + c_bias) * c_mult;
+  const int s = c_shift & 31;
+  __int128 r;
+  if (s == 0) r = p;
+  else if (s == 31) r = 0;
+  else r = (p + (static_cast<__int128>(1) << (s - 1))) >> s;
+  return static_cast<unsigned char>(r < 0 ? 0 : r > 255 ? 255 : r);
+}
+int u8gemm_bad_arg(int ta, int tb, int tc, int m, int n, int k, int lda, int ldb, int ldc) {
+  auto op_ok = [](int t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; };
+  if (!op_ok(ta)) return 1;
+  if (!op_ok(tb)) return 2;
+  if (!op_ok(tc)) return 3;
+  if (m < 0) return 4;
+  if (n < 0) return 5;
+  if (k < 0) return 6;
+  if (lda < std::max(1, ta == CUBLAS_OP_N ? m : k)) return 8;
+  if (ldb < std::max(1, tb == CUBLAS_OP_N ? k : n)) return 10;
+  if (ldc < std::max(1, tc == CUBLAS_OP_N ? m : n)) return 13;
+  return 0;
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasUint8gemmBias(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb,
+                                               cublasOperation_t transc, int m, int n, int k, const unsigned char* A,
+                                               int A_bias, int lda, const unsigned char* B, int B_bias, int ldb,
+                                               unsigned char* C, int C_bias, int ldc, int C_mult, int C_shift) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int ta = enum_value(transa), tb = enum_value(transb), tc = enum_value(transc);
+  if (const int bad = u8gemm_bad_arg(ta, tb, tc, m, n, k, lda, ldb, ldc)) {
+    cublasXerbla("UINT8_GEMM", bad);
+    return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  if (deferred_to_graph(h, [=] {
+        cublasUint8gemmBias(h, transa, transb, transc, m, n, k, A, A_bias, lda, B, B_bias, ldb, C, C_bias, ldc,
+                            C_mult, C_shift);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+  if (!C || (k && (!A || !B))) return CUBLAS_STATUS_INVALID_VALUE;
+  const bool tA = ta != CUBLAS_OP_N, tB = tb != CUBLAS_OP_N, tC = tc != CUBLAS_OP_N;
+  const auto hA = fetch<unsigned char>(A, tA ? extent(lda, m, k) : extent(lda, k, m));
+  const auto hB = fetch<unsigned char>(B, tB ? extent(ldb, k, n) : extent(ldb, n, k));
+  auto hC = fetch<unsigned char>(C, tC ? extent(ldc, m, n) : extent(ldc, n, m));
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      int64_t acc = 0;
+      for (int p = 0; p < k; ++p) {
+        const int a = hA[tA ? idx(p, i, lda) : idx(i, p, lda)];
+        const int b = hB[tB ? idx(j, p, ldb) : idx(p, j, ldb)];
+        acc += static_cast<int64_t>(a - A_bias) * (b - B_bias);
+      }
+      hC[tC ? idx(j, i, ldc) : idx(i, j, ldc)] = u8gemm_scale(acc, C_bias, C_mult, C_shift);
+    }
+  store(C, hC);
+  return CUBLAS_STATUS_SUCCESS;
+}
 
 VGPU_EXPORT cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta,
                                           cublasOperation_t tb, int m, int n, int k,
@@ -1316,16 +1469,23 @@ VGPU_EXPORT cublasStatus_t cublasIdamax_v2_64(cublasHandle_t h, int64_t n, const
    before a bad argument, in that order on the card too. */
 namespace {
 
+// CUBLAS_COMPUTE_32F_EMULATED_16BFX9 (78) and CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT
+// (79) are CUDA 13 enumerators. The card takes 78 with R_32F, C_32F, R_16F and
+// R_16BF data and 79 with R_64F and C_64F, and nothing else with either.
+constexpr int kCompute32fEmulated = 78, kCompute64fEmulated = 79;
 bool compute_32f(cublasComputeType_t ct) {
   return ct == CUBLAS_COMPUTE_32F || ct == CUBLAS_COMPUTE_32F_PEDANTIC || ct == CUBLAS_COMPUTE_32F_FAST_16F ||
-         ct == CUBLAS_COMPUTE_32F_FAST_16BF || ct == CUBLAS_COMPUTE_32F_FAST_TF32;
+         ct == CUBLAS_COMPUTE_32F_FAST_16BF || ct == CUBLAS_COMPUTE_32F_FAST_TF32 || (int)ct == kCompute32fEmulated;
 }
-bool compute_64f(cublasComputeType_t ct) { return ct == CUBLAS_COMPUTE_64F || ct == CUBLAS_COMPUTE_64F_PEDANTIC; }
+bool compute_64f(cublasComputeType_t ct) {
+  return ct == CUBLAS_COMPUTE_64F || ct == CUBLAS_COMPUTE_64F_PEDANTIC || (int)ct == kCompute64fEmulated;
+}
 bool compute_16f(cublasComputeType_t ct) { return ct == CUBLAS_COMPUTE_16F || ct == CUBLAS_COMPUTE_16F_PEDANTIC; }
 bool compute_32i(cublasComputeType_t ct) { return ct == CUBLAS_COMPUTE_32I || ct == CUBLAS_COMPUTE_32I_PEDANTIC; }
 
 bool gemm_ex_supported(cudaDataType a, cudaDataType b, cudaDataType c, cublasComputeType_t ct) {
   if (a != b) return false;
+  if ((int)ct == kCompute32fEmulated && a != CUDA_R_32F && a != CUDA_C_32F && a != CUDA_R_16F && a != CUDA_R_16BF) return false;
   switch (a) {
     case CUDA_R_16F: return (c == CUDA_R_16F && (compute_32f(ct) || compute_16f(ct))) || (c == CUDA_R_32F && compute_32f(ct));
     case CUDA_R_16BF: return (c == CUDA_R_16BF || c == CUDA_R_32F) && compute_32f(ct);
@@ -1379,6 +1539,7 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
                      Ctype, ldc, computeType, algo);
       }))
     return CUBLAS_STATUS_SUCCESS;
+  const FixedPointRequest emulation((int)computeType == kCompute64fEmulated);
   if (Atype == CUDA_R_32F)
     return do_gemm<float, float>(h, ta, tb, m, n, k, static_cast<const float*>(alpha), A, lda, B,
                                  ldb, static_cast<const float*>(beta), C, ldc);

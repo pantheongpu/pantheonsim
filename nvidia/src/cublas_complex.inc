@@ -117,6 +117,51 @@ cublasStatus_t cgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t t
     const CMat a = load_mat(A, lda, oa == vgpu_la::Op::N ? k : m, oa == vgpu_la::Op::N ? m : k);
     const CMat b = load_mat(B, ldb, ob == vgpu_la::Op::N ? n : k, ob == vgpu_la::Op::N ? k : n);
     CMat c = load_mat(C, ldc, n, m);
+    if constexpr (std::is_same_v<T, cuDoubleComplex>) {
+      // Fixed-point emulation (see "fixed-point emulation" in cublas_api.cpp):
+      // four real products of the real and imaginary planes, combined in
+      // double precision. Derived from the real routine, not measured: only
+      // that cuBLAS emulates Zgemm under the same conditions was.
+      const Handle* hh = reinterpret_cast<const Handle*>(h);
+      if (m > 0 && n > 0 && fixed_point_active(hh)) {
+        std::vector<double> ar((size_t)m * (size_t)k), ai(ar.size()), br((size_t)k * (size_t)n), bi(br.size());
+        for (int p = 0; p < k; ++p)
+          for (int i = 0; i < m; ++i) {
+            const cd v = opel(a, oa, i, p);
+            ar[(size_t)i + (size_t)p * m] = v.real();
+            ai[(size_t)i + (size_t)p * m] = v.imag();
+          }
+        for (int j = 0; j < n; ++j)
+          for (int p = 0; p < k; ++p) {
+            const cd v = opel(b, ob, p, j);
+            br[(size_t)p + (size_t)j * k] = v.real();
+            bi[(size_t)p + (size_t)j * k] = v.imag();
+          }
+        const auto opts = fixed_point_options(hh);
+        std::vector<double> rr, ii, ri, ir;
+        const auto first = vgpu::fpemu::multiply(false, false, m, n, k, ar.data(), m, br.data(), k, opts, &rr);
+        bool formed = first.formed;
+        int bits = first.bits;
+        for (auto step : {0, 1, 2}) {
+          if (!formed) break;
+          const auto got = step == 0   ? vgpu::fpemu::multiply(false, false, m, n, k, ai.data(), m, bi.data(), k, opts, &ii)
+                           : step == 1 ? vgpu::fpemu::multiply(false, false, m, n, k, ar.data(), m, bi.data(), k, opts, &ri)
+                                       : vgpu::fpemu::multiply(false, false, m, n, k, ai.data(), m, br.data(), k, opts, &ir);
+          formed = got.formed;
+        }
+        if (bits >= 0) report_mantissa_bits(hh, bits);
+        if (formed) {
+          for (int j = 0; j < n; ++j)
+            for (int i = 0; i < m; ++i) {
+              const size_t q = (size_t)i + (size_t)j * m;
+              const cd prod(rr[q] - ii[q], ri[q] + ir[q]);
+              c(i, j) = b_ == cd(0) ? a_ * prod : a_ * prod + b_ * c(i, j);
+            }
+          store_mat(C, c, n, m);
+          return CUBLAS_STATUS_SUCCESS;
+        }
+      }
+    }
     cgemm_mat(oa, ob, m, n, k, a_, a, b, b_, c);
     store_mat(C, c, n, m);
     return CUBLAS_STATUS_SUCCESS;

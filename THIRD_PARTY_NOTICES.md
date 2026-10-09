@@ -11,3 +11,4 @@ third-party material.
 | AMD GPU register headers | `amd/registers/` | see `amd/registers/LICENSES/` |
 | NVIDIA open-gpu-kernel-modules register headers | `nvidia/registers/` | see `nvidia/registers/LICENSES/` |
 | NVIDIA cuDNN headers | **not included**; downloaded at build time by `scripts/fetch-cudnn-headers.py` from the `nvidia-cudnn-cu12` wheel into the build directory, each file checked against `scripts/cudnn-headers.sha256` | NVIDIA SDK license (in the wheel); not redistributed |
+| METIS 5.1.0 (graph ordering, used by `cusolverSpXcsrmetisndHost`) | `nvidia/third_party/metis/` | Apache-2.0 (`LICENSE.txt` there); Copyright 1995-2013 Regents of the University of Minnesota |

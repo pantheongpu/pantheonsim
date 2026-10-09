@@ -29,3 +29,13 @@ against `scripts/cudnn-headers.sha256`). To use headers you already have, set
 `CUDNN_HEADER_DIR`; to build without cuDNN, configure with
 `-DVGPU_FETCH_CUDNN_HEADERS=OFF`. `tests/lint/check_no_proprietary_nvidia.sh` fails
 if a file with that notice is ever added back.
+
+## METIS is here, in part
+
+`metis/` is METIS 5.1.0 (Apache-2.0, the same licence as this repository; the
+text is in `metis/LICENSE.txt`), cut down to what `METIS_NodeND` reaches and
+changed in three marked places -- see `metis/README.md`. It is compiled into
+`libcusolver`'s shim, with hidden symbols, because NVIDIA documents
+`cusolverSpXcsrmetisndHost` as a wrapper of that function and its
+permutation is METIS's. It is vendored rather than fetched at build time so a
+build needs no network.

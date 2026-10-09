@@ -31,6 +31,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <vector>
 
@@ -58,7 +59,7 @@ constexpr int32_t kScaleScalar = 0, kScaleOuterVec = 3;
 
 // Attribute numbers newer than the oldest header this builds against (CUDA
 // 12.0's), named by value.
-constexpr int kDOutScalePointer = 36, kDOutScaleMode = 37;
+constexpr int kDOutScalePointer = 36, kDOutScaleMode = 37, kEmulationDescriptor = 38;
 // The block-scaled modes (cublasLtMatmulMatrixScale_t, CUDA 12.8) and the
 // narrow types they come with (library_types.h, CUDA 12.8).
 constexpr int32_t kScaleVec16UE4M3 = 1, kScaleVec32UE8M0 = 2, kScaleVec128 = 4, kScaleBlk128x128 = 5;
@@ -88,6 +89,8 @@ struct MatmulDesc {
   // Block-scaled output: where the scales D's quantization computes go.
   void* d_out_scale = nullptr;
   int32_t d_out_scale_mode = kScaleScalar;
+  // CUBLASLT_MATMUL_DESC_EMULATION_DESCRIPTOR (38): a cublasLtEmulationDesc_t, or NULL.
+  const void* emulation = nullptr;
   // Every attribute as last set, for cublasLtMatmulDescGetAttribute.
   std::map<int, std::vector<uint8_t>> raw;
 };
@@ -277,7 +280,7 @@ bool attr_info(int attr, AttrInfo* out) {
     case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER: case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER:
     case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER:
     case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER:
-    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: case kDOutScalePointer:
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: case kDOutScalePointer: case kEmulationDescriptor:
       *out = {sizeof(void*), 0}; return true;
     default: return false;
   }
@@ -292,7 +295,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
   const int a = enum_value(attr);   // attributes newer than the header are not its values
   AttrInfo info;
   if (!attr_info(a, &info)) return CUBLAS_STATUS_SUCCESS;   // attributes not modelled are inert
-  if (bytes < info.bytes) return CUBLAS_STATUS_INVALID_VALUE;
+  if (bytes < info.bytes || (a == kEmulationDescriptor && bytes != info.bytes)) return CUBLAS_STATUS_INVALID_VALUE;
   auto take = [&](void* field) { std::memcpy(field, buf, info.bytes); };
   switch (a) {
     case CUBLASLT_MATMUL_DESC_TRANSA: take(&m->transa); break;
@@ -318,6 +321,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
     case kDScaleMode: take(&m->d_scale_mode); break;
     case kDOutScalePointer: take(&m->d_out_scale); break;
     case kDOutScaleMode: take(&m->d_out_scale_mode); break;
+    case kEmulationDescriptor: take(&m->emulation); break;
     default: break;
   }
   const auto* b = static_cast<const uint8_t*>(buf);
@@ -351,6 +355,99 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t d
   if (!buf) return bytes == 0 && written ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
   if (bytes < v.size()) return CUBLAS_STATUS_INVALID_VALUE;
   std::memcpy(buf, v.data(), v.size());
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+/* ---- cublasLtEmulationDesc_t ----
+   The settings of floating-point emulation (cublasLt.h, CUDA 13), held in a
+   64-byte opaque structure that the caller may allocate itself
+   (cublasLtEmulationDescInit). Measured on an RTX 3060 (cuBLAS 13.0): the
+   defaults are strategy 0, special values 0xFFFF, mantissa control 0, max
+   mantissa bit count 0, offset 0 and a NULL bit count pointer (8 bytes,
+   the others 4); a buffer of the wrong size, a NULL buffer and an unknown
+   attribute are INVALID_VALUE; a size query (size 0, NULL buffer) needs a
+   sizeWritten; no value is range-checked when it is set -- a strategy of 7 or
+   a mantissa control of 5 is taken. cublasLtMatmul checks them: a descriptor
+   on a matmul whose compute type is not an emulated one (CUBLAS_COMPUTE_64F
+   with one set), or with a negative max mantissa bit count, is INVALID_VALUE.
+   NVIDIA's matmul did not emulate with the descriptor on that card (the bit
+   count pointer stayed untouched, the result was the plain one), so neither
+   does this one. */
+// CUDA 13's header declares these with its own types; CUDA 12's declares nothing.
+#if CUBLAS_VER_MAJOR >= 13
+using vgpu_emu_desc = cublasLtEmulationDesc_t;
+using vgpu_emu_attr = cublasLtEmulationDescAttributes_t;
+#else
+using vgpu_emu_desc = void*;
+using vgpu_emu_attr = int;
+#endif
+namespace {
+constexpr uint64_t kEmulationMagic = 0x564755454d553031ULL;   // "VGUEMU01"
+struct EmulationDesc {
+  uint64_t magic = kEmulationMagic;
+  int32_t strategy = 0, special_values = 0xFFFF, mantissa_control = 0, max_bits = 0, bit_offset = 0;
+  int32_t* bit_count_pointer = nullptr;
+};
+static_assert(sizeof(EmulationDesc) <= 64, "an emulation descriptor must fit cublasLtEmulationDescOpaque_t");
+bool emulation_known(const void* p) {
+  return p && (known(p) || reinterpret_cast<const EmulationDesc*>(p)->magic == kEmulationMagic);
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescInit_internal(vgpu_emu_desc d, size_t size) {
+  if (!d) return CUBLAS_STATUS_INVALID_VALUE;
+  if (size < 64) return CUBLAS_STATUS_ALLOC_FAILED;
+  new (d) EmulationDesc();
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescCreate(vgpu_emu_desc* d) {
+  if (!d) return CUBLAS_STATUS_INVALID_VALUE;
+  *d = reinterpret_cast<vgpu_emu_desc>(track(new EmulationDesc()));
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescDestroy(vgpu_emu_desc d) {
+  if (known(d)) {
+    untrack(d);
+    delete reinterpret_cast<EmulationDesc*>(d);
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+namespace {
+// An attribute's field and width: 0 to 4 are int32, 5 a pointer.
+bool emulation_field(EmulationDesc* e, int attr, void** field, size_t* bytes) {
+  switch (attr) {
+    case 0: *field = &e->strategy; *bytes = 4; return true;
+    case 1: *field = &e->special_values; *bytes = 4; return true;
+    case 2: *field = &e->mantissa_control; *bytes = 4; return true;
+    case 3: *field = &e->max_bits; *bytes = 4; return true;
+    case 4: *field = &e->bit_offset; *bytes = 4; return true;
+    case 5: *field = &e->bit_count_pointer; *bytes = sizeof(void*); return true;
+    default: return false;
+  }
+}
+}  // namespace
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescSetAttribute(vgpu_emu_desc d, vgpu_emu_attr attr, const void* buf, size_t bytes) {
+  if (!emulation_known(d) || !buf) return CUBLAS_STATUS_INVALID_VALUE;
+  void* field;
+  size_t width;
+  if (!emulation_field(reinterpret_cast<EmulationDesc*>(d), enum_value(attr), &field, &width) || bytes != width)
+    return CUBLAS_STATUS_INVALID_VALUE;
+  std::memcpy(field, buf, width);
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescGetAttribute(vgpu_emu_desc d, vgpu_emu_attr attr, void* buf, size_t bytes, size_t* written) {
+  if (!emulation_known(d)) return CUBLAS_STATUS_INVALID_VALUE;
+  void* field;
+  size_t width;
+  if (!emulation_field(reinterpret_cast<EmulationDesc*>(d), enum_value(attr), &field, &width)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (bytes == 0) {
+    if (!written) return CUBLAS_STATUS_INVALID_VALUE;
+    *written = width;
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  if (!buf || bytes != width) return CUBLAS_STATUS_INVALID_VALUE;
+  std::memcpy(buf, field, width);
+  if (written) *written = width;
   return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -901,6 +998,13 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
   const int pm = md.pointer_mode;
   if (pm < CUBLASLT_POINTER_MODE_HOST || pm > CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST)
     return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.emulation) {
+    // An emulation descriptor goes with an emulated compute type
+    // (CUBLAS_COMPUTE_32F_EMULATED_16BFX9 = 78 or _64F_EMULATED_FIXEDPOINT = 79), and a negative max mantissa bit count is refused.
+    if (md.compute != 78 && md.compute != 79) return CUBLAS_STATUS_INVALID_VALUE;
+    if (emulation_known(md.emulation) && reinterpret_cast<const EmulationDesc*>(md.emulation)->max_bits < 0)
+      return CUBLAS_STATUS_INVALID_VALUE;
+  }
   if (at_matmul) {
     if (ep.aux_out && !md.aux) return CUBLAS_STATUS_NOT_SUPPORTED;
     if ((ep.drelu || ep.dgelu) && !md.aux) return CUBLAS_STATUS_INVALID_VALUE;

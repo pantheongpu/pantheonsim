@@ -1,7 +1,9 @@
 // cuBLASXt: its handle and device selection, and its level-3 routines over
 // host memory (and device memory), on two devices. GEMM with a block
 // dimension small enough that its tiles land on both; syrk, herk, syr2k,
-// her2k, syrkx, herkx, symm, hemm, spmm, trsm and trmm whole. Each is checked
+// her2k, syrkx, herkx, symm, hemm, spmm, trsm and trmm whole; and GEMM's CPU
+// share (cublasXtSetCpuRoutine and cublasXtSetCpuRatio), which hands the tail
+// of C's longer dimension to the caller's routine. Each is checked
 // against a host reference over small integers, so exactly; and the
 // arguments each refuses, as an RTX 3060's cuBLAS 13.0 answers. Every check
 // passes on the card (two RTX 3060s) too.
@@ -246,6 +248,146 @@ static void hermitian(cublasXtHandle_t x, const char* ty,
         what);
 }
 
+// ---- GEMM's CPU share ----
+//
+// The caller's routine is Fortran-style: every argument a pointer. It is
+// called on the caller's own memory, offset to its share: the last
+// floor(ratio * d) rows of C if m > n, else columns, d being the longer one.
+// What the card does (measured on an RTX 3060, cuBLAS 13.0) and this library
+// does.
+struct CpuCall {
+  char ta, tb;
+  int m, n, k, lda, ldb, ldc;
+  long a_off, b_off, c_off;
+};
+static std::vector<CpuCall> g_calls;
+static const void *g_A, *g_B, *g_C;   // the bases the offsets are counted from
+static size_t g_elem;
+
+template <class T>
+static void cpu_gemm(const char* ta, const char* tb, const int* m, const int* n, const int* k, const T*, const T* A, const int* lda,
+                     const T* B, const int* ldb, const T*, T* C, const int* ldc) {
+  g_calls.push_back({*ta, *tb, *m, *n, *k, *lda, *ldb, *ldc, (long)(((const char*)A - (const char*)g_A) / (long)g_elem),
+                     (long)(((const char*)B - (const char*)g_B) / (long)g_elem), (long)(((const char*)C - (const char*)g_C) / (long)g_elem)});
+}
+// The same, doing the work for float so that the result can be checked.
+static void cpu_sgemm(const char* ta, const char* tb, const int* m, const int* n, const int* k, const float* al, const float* A,
+                      const int* lda, const float* B, const int* ldb, const float* be, float* C, const int* ldc) {
+  cpu_gemm<float>(ta, tb, m, n, k, al, A, lda, B, ldb, be, C, ldc);
+  for (int j = 0; j < *n; ++j)
+    for (int i = 0; i < *m; ++i) {
+      float s = 0;
+      for (int p = 0; p < *k; ++p)
+        s += (*ta == 'N' ? A[i + (size_t)p * *lda] : A[p + (size_t)i * *lda]) * (*tb == 'N' ? B[p + (size_t)j * *ldb] : B[j + (size_t)p * *ldb]);
+      C[i + (size_t)j * *ldc] = *al * s + *be * C[i + (size_t)j * *ldc];
+    }
+}
+
+static bool call_is(const CpuCall& c, char ta, char tb, int m, int n, int k, int lda, int ldb, int ldc, long ao, long bo, long co) {
+  return c.ta == ta && c.tb == tb && c.m == m && c.n == n && c.k == k && c.lda == lda && c.ldb == ldb && c.ldc == ldc && c.a_off == ao &&
+         c.b_off == bo && c.c_off == co;
+}
+
+static void cpu_share() {
+  cublasXtHandle_t h;
+  cublasXtCreate(&h);
+  int dev0[1] = {0};
+  cublasXtDeviceSelect(h, 1, dev0);
+  // Which routine and type pairs take a CPU share (the others: NOT_SUPPORTED).
+  IS(cublasXtSetCpuRoutine(h, CUBLASXT_GEMM, CUBLASXT_DOUBLECOMPLEX, (void*)cpu_gemm<cuDoubleComplex>), CUBLAS_STATUS_SUCCESS);
+  IS(cublasXtSetCpuRoutine(h, CUBLASXT_SYRK, CUBLASXT_FLOAT, (void*)cpu_gemm<float>), CUBLAS_STATUS_NOT_SUPPORTED);
+  IS(cublasXtSetCpuRatio(h, CUBLASXT_TRSM, CUBLASXT_DOUBLE, 0.5f), CUBLAS_STATUS_NOT_SUPPORTED);
+  IS(cublasXtSetCpuRoutine(h, CUBLASXT_HERK, CUBLASXT_FLOAT, (void*)cpu_gemm<float>), CUBLAS_STATUS_NOT_SUPPORTED);
+  IS(cublasXtSetCpuRoutine(h, CUBLASXT_HERK, CUBLASXT_COMPLEX, (void*)cpu_gemm<cuComplex>), CUBLAS_STATUS_SUCCESS);
+  IS(cublasXtSetCpuRatio(h, CUBLASXT_HEMM, CUBLASXT_DOUBLECOMPLEX, 0.5f), CUBLAS_STATUS_SUCCESS);
+  IS(cublasXtSetCpuRoutine(h, CUBLASXT_GEMM, CUBLASXT_DOUBLECOMPLEX, nullptr), CUBLAS_STATUS_SUCCESS);
+  IS(cublasXtSetCpuRatio(h, CUBLASXT_HEMM, CUBLASXT_DOUBLECOMPLEX, 0.0f), CUBLAS_STATUS_SUCCESS);
+
+  const float al = 2, be = 0.5f;
+  auto run = [&](float ratio, int m, int n, int k, cublasOperation_t ta, cublasOperation_t tb, bool with_routine) {
+    g_calls.clear();
+    cublasXtSetCpuRoutine(h, CUBLASXT_GEMM, CUBLASXT_FLOAT, with_routine ? (void*)cpu_sgemm : nullptr);
+    cublasXtSetCpuRatio(h, CUBLASXT_GEMM, CUBLASXT_FLOAT, ratio);
+    const int lda = ta == CUBLAS_OP_N ? m : k, ldb = tb == CUBLAS_OP_N ? k : n;
+    std::vector<float> A((size_t)m * k), B((size_t)k * n), C((size_t)m * n, 1.f), R((size_t)m * n);
+    for (size_t i = 0; i < A.size(); ++i) A[i] = (float)((int)(i * 7 % 11) - 5);
+    for (size_t i = 0; i < B.size(); ++i) B[i] = (float)((int)(i * 5 % 7) - 3);
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < m; ++i) {
+        float s = 0;
+        for (int p = 0; p < k; ++p)
+          s += (ta == CUBLAS_OP_N ? A[i + (size_t)p * lda] : A[p + (size_t)i * lda]) * (tb == CUBLAS_OP_N ? B[p + (size_t)j * ldb] : B[j + (size_t)p * ldb]);
+        R[i + (size_t)j * m] = al * s + be * C[i + (size_t)j * m];
+      }
+    g_A = A.data();
+    g_B = B.data();
+    g_C = C.data();
+    g_elem = sizeof(float);
+    const int st = cublasXtSgemm(h, ta, tb, m, n, k, &al, A.data(), lda, B.data(), ldb, &be, C.data(), m);
+    return std::make_pair(st == 0 && C == R, st);
+  };
+  char what[160];
+  {
+    auto [ok, st] = run(0.5f, 100, 80, 50, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.size() == 1 && call_is(g_calls[0], 'N', 'N', 50, 80, 50, 100, 50, 100, 50, 0, 50),
+          "ratio 0.5, m > n: the last 50 rows of C go to the CPU routine, and the result is complete");
+  }
+  {
+    auto [ok, st] = run(0.25f, 80, 100, 50, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.size() == 1 && call_is(g_calls[0], 'N', 'N', 80, 25, 50, 80, 50, 80, 0, 3750, 6000),
+          "ratio 0.25, n > m: the last 25 columns of C go to the CPU routine");
+  }
+  {
+    auto [ok, st] = run(0.5f, 100, 100, 50, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.size() == 1 && call_is(g_calls[0], 'N', 'N', 100, 50, 50, 100, 50, 100, 0, 2500, 5000),
+          "m = n: columns are split");
+  }
+  {
+    auto [ok, st] = run(0.5f, 100, 80, 50, CUBLAS_OP_T, CUBLAS_OP_N, true);
+    check(ok && g_calls.size() == 1 && call_is(g_calls[0], 'T', 'N', 50, 80, 50, 50, 50, 100, 2500, 0, 50),
+          "a transposed A: the CPU's rows are the last columns of the stored A");
+  }
+  {
+    auto [ok, st] = run(0.5f, 80, 100, 50, CUBLAS_OP_N, CUBLAS_OP_T, true);
+    check(ok && g_calls.size() == 1 && call_is(g_calls[0], 'N', 'T', 80, 50, 50, 80, 100, 80, 0, 50, 4000),
+          "a transposed B: the CPU's columns are the last rows of the stored B");
+  }
+  {
+    auto [ok, st] = run(0.57f, 1000, 300, 20, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    std::snprintf(what, sizeof what, "ratio 0.57 of 1000 rows is 570 (float arithmetic), got %d", g_calls.empty() ? -1 : g_calls[0].m);
+    check(ok && g_calls.size() == 1 && g_calls[0].m == 570, what);
+  }
+  {
+    auto [ok, st] = run(0.01f, 100, 80, 50, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.size() == 1 && g_calls[0].m == 1 && g_calls[0].a_off == 99, "ratio 0.01 of 100 rows is 1 row, the last");
+  }
+  {
+    auto [ok, st] = run(0.0009f, 1000, 300, 20, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.size() == 1 && g_calls[0].m == 0, "a share that rounds down to nothing still calls the routine, with 0 rows");
+  }
+  {
+    auto [ok, st] = run(0.0f, 100, 80, 50, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.empty(), "ratio 0: the routine is never called");
+  }
+  {
+    auto [ok, st] = run(0.5f, 100, 80, 50, CUBLAS_OP_N, CUBLAS_OP_N, false);
+    check(ok && g_calls.empty(), "no routine set: the devices do all the work");
+  }
+  {
+    auto [ok, st] = run(-0.5f, 100, 80, 50, CUBLAS_OP_N, CUBLAS_OP_N, true);
+    check(ok && g_calls.empty(), "a negative ratio is no share");
+  }
+  // No routine other than GEMM calls a CPU routine, whatever is set.
+  {
+    g_calls.clear();
+    std::vector<cuComplex> a(64 * 64, make_cuComplex(1, 0)), c(64 * 64, make_cuComplex(1, 0));
+    const float one = 1, zero = 0;
+    const int st = cublasXtCherk(h, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, 64, 64, &one, a.data(), 64, &zero, c.data(), 64);
+    check(st == 0 && g_calls.empty(), "herk with a CPU routine and ratio set never calls it");
+  }
+  cublasXtDestroy(h);
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
   int count = 0;
@@ -286,6 +428,7 @@ int main() {
   IS(cublasXtSetCpuRatio(x, CUBLASXT_GEMM, (cublasXtOpType_t)9, 0.0f), CUBLAS_STATUS_INVALID_VALUE);
   IS(cublasXtSetCpuRoutine(x, CUBLASXT_GEMM, CUBLASXT_FLOAT, nullptr), CUBLAS_STATUS_SUCCESS);
   IS(cublasXtSetCpuRoutine(x, (cublasXtBlasOp_t)20, CUBLASXT_FLOAT, nullptr), CUBLAS_STATUS_INVALID_VALUE);
+  cpu_share();
   gemm<float>(x, "s");
   gemm<double>(x, "d");
   gemm<cuComplex>(x, "c");

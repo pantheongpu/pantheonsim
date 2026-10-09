@@ -22,7 +22,7 @@
 // follow NVIDIA's library on an RTX 3060 (cuTENSOR 2.8.1, CUDA 13.0), where
 // the documentation leaves them open; each is noted where it is decided.
 // Kernel selection is not modelled: every algorithm, kernel rank and JIT mode
-// computes the same way here, workspace estimates are this library's own
+// computes the same way here (as JIT does on the card, see the kernel cache), workspace estimates are this library's own
 // (it needs none), and a plan cache entry remembers the problem, not a
 // kernel.
 #include "../include/vgpu_cutensor.h"
@@ -997,15 +997,24 @@ cutensorStatus_t cutensorHandleReadPlanCacheFromFile(cutensorHandle_t handle, co
 }
 
 // There is no just-in-time compilation, so the kernel cache is always empty:
-// writing it writes an empty file (NVIDIA's library succeeds the same way with
-// nothing compiled) and reading an empty file adds nothing. Anything else is
-// not a cache this library wrote: INTERNAL_ERROR, as NVIDIA's library
-// answers a foreign file (measured).
+// writing it writes an empty file and reading an empty file adds nothing.
+// Anything else is not a cache this library wrote: INTERNAL_ERROR, as NVIDIA's
+// library answers a foreign file (measured).
+//
+// What JIT mode does on NVIDIA's library, measured on an RTX 3060 (cuTENSOR
+// 2.8.1): the plan and the results are the same with CUTENSOR_JIT_MODE_DEFAULT
+// as with NONE, and plan creation takes the same fraction of a millisecond --
+// except for some batched contractions (a mode in A, B and C), where the
+// first plan took 394 ms. The visible effect is in the kernel cache, which
+// stays empty for most contractions and, after a batched one, holds 8 to 9 MB
+// of compiled kernels. Which operations NVIDIA's heuristic compiles for, and the cache's
+// bytes, are not public, so this library does not pretend to: its cache is empty.
+// The same card answers a write to a path it cannot open with SUCCESS (nothing
+// is written when the cache is empty); so does this.
 cutensorStatus_t cutensorWriteKernelCacheToFile(const cutensorHandle_t handle, const char filename[]) {
   if (!handle || !filename) return CUTENSOR_STATUS_INVALID_VALUE;
   FILE* f = std::fopen(filename, "wb");
-  if (!f) return CUTENSOR_STATUS_IO_ERROR;
-  std::fclose(f);
+  if (f) std::fclose(f);
   return CUTENSOR_STATUS_SUCCESS;
 }
 
