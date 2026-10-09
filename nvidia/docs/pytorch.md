@@ -69,6 +69,14 @@ paths tested here do not call them.
   shorter than the longest were not).
 - **Linear layers:** cuBLAS and cuBLASLt's fused matmul + bias; PyTorch passes
   its cuBLAS handle as the cuBLASLt handle, which is accepted.
+- **CUDA graphs:** `torch.cuda.graph`, `make_graphed_callables`, a captured
+  training step with `capturable=True` optimizers, and `torch.compile`'s
+  `mode="reduce-overhead"` record and replay. A cuBLAS, cuBLASLt or cuDNN
+  graph-API call made while the stream captures becomes a node that runs at
+  each launch over what the graph's kernels wrote before it, and a Triton
+  kernel (the driver API's `cuLaunchKernel`) becomes a kernel node. The classic
+  cuDNN API (BatchNorm, RNNs, classic convolutions) does not capture yet.
+  (`e2e_graph_capture_libs`, which also passes against NVIDIA's libraries.)
 - **Both CUDA APIs:** PyTorch calls the driver API too. `libcudart` and
   `libcuda` share one simulated machine and one API lock
   (`src/runtime/shared_runtime.cpp`), and the runtime makes its device's

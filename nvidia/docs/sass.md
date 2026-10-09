@@ -88,7 +88,7 @@ Every generation from Turing to Blackwell runs, sm_75 through sm_120a:
 | --- | --- | --- |
 | sm_75 | T4 | the base: integer/float ALU, memory, control, textures and surfaces, HMMA/IMMA |
 | sm_80, sm_86, sm_89 | A100, A10, RTX 3060/3080 Ti, L4, L40S | LDGSTS, LDSM, REDUX, bf16/tf32/fp8/sparse MMA, sm_80's mbarriers (ATOMS.ARRIVE) |
-| sm_90 | H100, H200, GH200 | clusters (UCGABAR, distributed shared memory, st.async, red.async), mbarriers (SYNCS), TMA (UTMA*, UBLK*: tile, im2col, multicast, reductions), warpgroup MMA (HGMMA/IGMMA/QGMMA/BGMMA), stmatrix, setmaxnreg, collectives |
+| sm_90 | H100, H200, GH200 | clusters (UCGABAR, distributed shared memory, st.async, red.async), mbarriers (SYNCS), TMA (UTMA*, UBLK*: tile, im2col, multicast, reductions), warpgroup MMA (HGMMA/IGMMA/QGMMA/BGMMA), stmatrix, setmaxnreg, collectives, vector atomics and reductions (REDG/ATOMG `F32x2`/`F32x4`/`F16x4`/`F16x8`/`BF16x4`/`BF16x8`: PTX `atom`/`red` `.v2`/`.v4`/`.v8`) |
 | sm_100, sm_103 | B200, B300 | the uniform float datapath, tcgen05 (LDTM/STTM, UTC*MMA of every kind, UTCCP, UTCSHIFT, the Tensor Memory allocator), TMA gather4/scatter4 and CTA pairs, cluster launch control |
 | sm_120 | RTX 5090 | sm_120's integer and float forms, block-scaled MMA |
 

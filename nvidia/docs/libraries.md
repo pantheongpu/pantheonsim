@@ -521,6 +521,7 @@ runs them; each is a ctest of its own.
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_lt_epilogue_paths` | RELU_AUX/GELU_AUX's mask and input, DRELU/DGELU and their bias gradients, BGRADA/BGRADB, in fp16/bf16/fp32/fp64, and what the card refuses | a training step's backward pass (cuBLASLt-fused linear layers) |
+| `e2e_graph_capture_libs` | cuBLASLt's matmul with a bias epilogue, cuDNN's graph-API convolution and a driver-API `cuLaunchKernel` recorded into a captured CUDA graph, their descriptors, plan and pack destroyed after the capture, then launched with new inputs: the capture runs nothing, every launch reads what the graph's kernels wrote before it (`run_graph_capture_libs.sh --card` runs the same program on NVIDIA's libraries; it passes there) | PyTorch's CUDA graphs: `torch.cuda.graph`, `make_graphed_callables`, `mode="reduce-overhead"`, Triton kernels inside a graph |
 | `e2e_lt_blockscaled_paths` | MXFP8 and NVFP4 block scales in the tiled layout, the 128-element and 128x128 FP32 forms, D's block quantization and its output scales (simulator only: documentation-derived) | `_scaled_mm` with block scales |
 | `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4 and an RTX 3060 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
 | `e2e_lowprec_sparselt` | 1096 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4 and an RTX 3060 | FP8 2:4 sparse inference |
@@ -1045,6 +1046,16 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   (an assumption). The backward epilogues match the card, except that GELU and
   its derivative are exact where the card's fp32 tanh is approximate (within
   about 5e-5), which is why the probe checks GELU against the function, not a hash.
+- **Stream capture**: cuBLAS, cuBLASLt (`cublasLtMatmul`), cuDNN's graph API
+  (`cudnnBackendExecute`), cuSPARSE, cuSPARSELt, cuTENSOR, cuDSS and the driver
+  API's `cuLaunchKernel`/`cuLaunchKernelEx` are recorded into a captured CUDA
+  graph and run at each launch (a library call as a host node, a driver launch
+  as a kernel node whose parameters `cudaGraphKernelNodeGetParams` and
+  `SetParams` do not give back). Not recorded yet, and so refused when the
+  stream is capturing -- they fail the capture -- cuDNN's classic API
+  (`cudnnConvolutionForward`, BatchNorm, RNNs, ...) and `cudnnBackendPopulateCudaGraph`,
+  and the other driver-API stream calls (`cuMemcpyAsync`, `cuMemsetD*Async`,
+  events, `cuStreamWaitEvent`, `cuGraph*`), which still run when called.
 - **cuDNN**: in the graph API, interpolating resampling beyond bilinear
   upsampling by 2 (the one configuration cuDNN has an engine for; nearest
   has none, which cuDNN documents), block-scaled (MXFP8) attention (E8M0

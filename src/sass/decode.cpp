@@ -2086,30 +2086,49 @@ void dec_atom_g(Instr& ins, const Word& w, Op op, const char* name) {
 }
 
 // sm_90's float atomics, opcodes of their own: ATOM (0x9a2, generic),
-// ATOMG (0x9a3), REDG (0x9a6). 73-76 the type (9 F32, 15 F64, 0 F16x2,
-// 3 BF16x2), mapped onto the older types' numbering (BF16x2 is 7).
+// ATOMG (0x9a3), REDG (0x9a6). 73-76 the type, mapped onto the older types'
+// numbering (BF16x2 is 7), and for the vector forms (PTX .v2/.v4/.v8, checked
+// against ptxas and cuobjdump for sm_90, sm_100 and sm_120) a count of 32-bit
+// words in f[7]:
+//    0 F16x2   1 F16x4   2 F16x8   3 BF16x2   4 BF16x4   5 BF16x8
+//    9 F32    10 F32x2  11 F32x4  15 F64
+// The operation, 87-89, is 0 ADD, 2 MIN, 4 MAX here, not the integer atomics'
+// numbering (MIN and MAX exist only for the half types, and only as vectors).
 void dec_atom_f(Instr& ins, const Word& w, Op op, const char* name) {
   ins.op = op;
   ins.mnemonic = name;
   const bool red = op == Op::RED;
   if (w.bit(72)) ins.mods.push_back("E");
-  const unsigned aop = static_cast<unsigned>(w.field(87, 3));   // 90 is something else from sm_100
-  ins.mods.push_back(kAtomOp[aop]);
-  unsigned t;
+  unsigned aop = static_cast<unsigned>(w.field(87, 3));   // 90 is something else from sm_100
+  switch (aop) {
+    case 0: ins.mods.push_back("ADD"); break;
+    case 2: ins.mods.push_back("MIN"); aop = 1; break;
+    case 4: ins.mods.push_back("MAX"); aop = 2; break;
+    default: throw Error(Err::UnsupportedPtx, "SASS: float atomic operation " + std::to_string(aop));
+  }
+  unsigned t, words = 1;
   const char* tname;
   switch (w.field(73, 4)) {
     case 9: t = 3; tname = "F32.FTZ.RN"; break;
+    case 10: t = 3; words = 2; tname = "F32x2.FTZ.RN"; break;
+    case 11: t = 3; words = 4; tname = "F32x4.FTZ.RN"; break;
     case 15: t = 6; tname = "F64.RN"; break;
     case 0: t = 4; tname = "F16x2.RN"; break;
+    case 1: t = 4; words = 2; tname = "F16x4.RN"; break;
+    case 2: t = 4; words = 4; tname = "F16x8.RN"; break;
     case 3: t = 7; tname = "BF16x2.RN"; break;
+    case 4: t = 7; words = 2; tname = "BF16x4.RN"; break;
+    case 5: t = 7; words = 4; tname = "BF16x8.RN"; break;
     default: throw Error(Err::UnsupportedPtx, "SASS: float atomic type " + std::to_string(w.field(73, 4)));
   }
+  if (aop != 0 && t != 4 && t != 7) throw Error(Err::UnsupportedPtx, "SASS: float atomic MIN/MAX on " + std::string(tname));
   ins.mods.push_back(tname);
   mem_order_mods(ins, w);
   evict_mods(ins, w);
   ins.f[0] = aop;
   ins.f[4] = t;
-  const unsigned width = t == 6 ? 2 : 1;
+  ins.f[7] = words > 1 ? words : 0;
+  const unsigned width = t == 6 ? 2 : words;
   if (!red) {
     ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
     ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), width));

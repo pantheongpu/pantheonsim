@@ -51,6 +51,8 @@
 
 #include <cuda_runtime.h>
 
+#include "vgpu/runtime/capture.hpp"
+
 namespace {
 
 bool quiet() {
@@ -3405,29 +3407,61 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendGetAttribute(cudnnBackendDescriptor_t cons
   return CUDNN_STATUS_SUCCESS;
 }
 
-VGPU_EXPORT cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackendDescriptor_t plan,
-                                             cudnnBackendDescriptor_t pack) {
-  if (!live(plan) || !live(pack)) return CUDNN_STATUS_BAD_PARAM;
-  const auto* p = reinterpret_cast<const Desc*>(plan);
-  const auto* v = reinterpret_cast<const Desc*>(pack);
+namespace {
+
+// Checks a plan and its variant pack, and gives the operations to run and the
+// device pointers the pack names.
+cudnnStatus_t prepare_plan(const Desc* p, const Desc* v, std::vector<Op>* order, std::map<int64_t, void*>* ptrs) {
   if (!p->finalized || !v->finalized) return CUDNN_STATUS_BAD_PARAM;
   const Desc* cfg = p->desc(CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG);
   const Desc* eng = cfg ? cfg->desc(CUDNN_ATTR_ENGINECFG_ENGINE) : nullptr;
   const Desc* graph = eng ? eng->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH) : nullptr;
   if (!graph) return CUDNN_STATUS_BAD_PARAM;
   std::string why;
-  std::vector<Op> order;
-  if (!schedule(graph, &order, &why)) return refuse("cudnnBackendExecute", why);
+  if (!schedule(graph, order, &why)) return refuse("cudnnBackendExecute", why);
   if (const std::string gap = engine_gap(graph); !gap.empty()) return refuse("cudnnBackendExecute", "no engine for this graph: " + gap);
   // The variant pack: unique ids and the device pointers that go with them.
   const std::vector<int64_t> uids = v->i64s(CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS);
   const Attr* ptr_attr = v->get(CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS);
   if (!ptr_attr || static_cast<size_t>(ptr_attr->count) != uids.size()) return CUDNN_STATUS_BAD_PARAM;
-  std::map<int64_t, void*> ptrs;
   for (size_t i = 0; i < uids.size(); ++i) {
     void* ptr = nullptr;
     std::memcpy(&ptr, ptr_attr->bytes.data() + i * sizeof(void*), sizeof(void*));
-    ptrs[uids[i]] = ptr;
+    (*ptrs)[uids[i]] = ptr;
+  }
+  return CUDNN_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cudnnStatus_t cudnnBackendExecute(cudnnHandle_t handle, cudnnBackendDescriptor_t plan,
+                                             cudnnBackendDescriptor_t pack) {
+  if (!live(plan) || !live(pack)) return CUDNN_STATUS_BAD_PARAM;
+  const auto* p = reinterpret_cast<const Desc*>(plan);
+  const auto* v = reinterpret_cast<const Desc*>(pack);
+  std::vector<Op> order;
+  std::map<int64_t, void*> ptrs;
+  if (const cudnnStatus_t st = prepare_plan(p, v, &order, &ptrs); st != CUDNN_STATUS_SUCCESS) return st;
+  // Inside a captured region the plan is recorded, not run: it executes at each
+  // launch of the graph, over what the graph's kernels have produced by then
+  // (computing now would read operands that do not exist yet, and the
+  // synchronization it begins with is not allowed on a capturing stream). The
+  // plan and the pack are copied, because the caller may destroy both once the
+  // capture is over; the device pointers in the pack are read at launch.
+  cudaStream_t stream = nullptr;
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  if (cudnnGetStream(handle, &stream) == CUDNN_STATUS_SUCCESS && stream &&
+      cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusActive) {
+    std::shared_ptr<Desc> plan_copy = clone(p), pack_copy = clone(v);
+    if (vgpu_record_host_op_if_capturing(stream, [plan_copy, pack_copy, stream] {
+          std::vector<Op> ops;
+          std::map<int64_t, void*> device_ptrs;
+          if (prepare_plan(plan_copy.get(), pack_copy.get(), &ops, &device_ptrs) != CUDNN_STATUS_SUCCESS) return;
+          cudaStreamSynchronize(stream);
+          Runner runner(nullptr, device_ptrs);
+          runner.run(ops);
+        }))
+      return CUDNN_STATUS_SUCCESS;
   }
   return execute_graph(handle, order, ptrs);
 }

@@ -99,7 +99,7 @@ def _fast_path_mha(d):
 check(L, 'MultiheadAttention fast path (eval, no weights)', 1e-4, tier='full')(_fast_path_mha)
 
 
-def _train_step(d):
+def _train_step(d, freeze_key_bias=False):
     # A tiny encoder-only language model, three AdamW steps.
     torch.manual_seed(0)
     emb = nn.Embedding(32, 16)
@@ -115,9 +115,18 @@ def _train_step(d):
         logits = head(enc_(emb(ids), mask=mask, is_causal=True))
         loss = nn.functional.cross_entropy(logits[:, :-1].reshape(-1, 32), ids[:, 1:].reshape(-1))
         loss.backward()
+        if freeze_key_bias:
+            # The gradient of the attention key bias is zero in exact arithmetic (softmax is unchanged when the
+            # same number is added to every key) and ~1e-9 of rounding noise in float; AdamW divides the noise
+            # by its own square root, so each device turns different noise into a +-lr step. Leaving the
+            # noise out compares everything else.
+            for layer in enc_.layers:
+                layer.self_attn.in_proj_bias.grad[16:32] = 0
         opt.step()
         losses.append(loss.detach())
     return [torch.stack(losses), list(m.parameters())]
 
 
 check(L, 'tiny causal transformer, three AdamW steps', 2e-3)(_train_step)
+check(L, 'tiny causal transformer, three AdamW steps, key biases left out of the update', 2e-3, tier='full')(
+    lambda d: _train_step(d, freeze_key_bias=True))

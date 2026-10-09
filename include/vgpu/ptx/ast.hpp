@@ -933,6 +933,16 @@ struct OpAtom {
   bool b128 = false;
   Reg dst_hi;
   Operand b_hi, c_hi;
+  // The vector forms (sm_90, PTX ISA 8.1): .v2/.v4 of .f32 (add), .v2/.v4/.v8
+  // of .f16 or .bf16 and .v2/.v4 of .f16x2 or .bf16x2 (add, min, max). `vec`
+  // is the register count (1 for every other atomic), `dsts` the destination
+  // registers and `srcs` the operand registers, one per element; dst and b are
+  // unused then. `ty` is the element type (a 32-bit word for f16x2/bf16x2, with
+  // packed_half set). Each 32-bit word is updated atomically on its own; the
+  // vector as a whole is not one atomic.
+  uint8_t vec = 1;
+  std::vector<Reg> dsts;
+  std::vector<Operand> srcs;
 };
 // istypep.<texref|samplerref|surfref> p, a: whether a is an opaque variable of
 // that type.

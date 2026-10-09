@@ -458,6 +458,15 @@ The status snapshot, the inventories and the gap register at the end are new in 
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
+- The vector atomics `atom`/`red` `.v2`/`.v4`/`.v8` (PTX ISA 8.1, sm_90; Triton's `tl.atomic_add` on a pair of
+  floats, which Inductor's `scatter_add` uses): `.add` on `.f32` in two or four, `.add`/`.min`/`.max` on `.f16`,
+  `.bf16` in two, four or eight and on `.f16x2`/`.bf16x2` in two or four. Each 32-bit word is its own atomic
+  under the striped lock, the vector aligned to its whole size (`MisalignedAccess` otherwise), in both
+  engines; the SASS twin is REDG/ATOMG's F32x2/F32x4/F16x4/F16x8/BF16x4/BF16x8 forms (decoder checked against
+  nvdisasm for sm_90 to sm_120, `probes/vector_atomics.cu`; `e2e_sass_archs` runs `vector_atomics` on every
+  Hopper and Blackwell profile, SASS and PTX). Derived from the PTX documentation and ptxas's output, not checked on a card
+  (the local cards are sm_86): how a NaN, a subnormal or a signed zero combines follows the scalar atomics'
+  rules and is not asserted by the test.
 - `atom.{exch,cas}.b128` (sm_90): 16 aligned bytes, the operands `.b128`
   register pairs, under the atomics' striped lock. `st.bulk` (sm_100): zeroes
   shared memory, a multiple of 8 bytes up to 16 MiB. `istypep`: false for every
@@ -2074,21 +2083,17 @@ program that needs nvcc.
 
 `nvidia/tests/pytorch/sweep/known_failures.txt` lists the sweep's checks that do not match the CPU on the
 simulator (nvidia/rtx5090). The CI-wired `e2e_pytorch_sweep` prints each as `XFAIL` with its numbers and fails
-only on a new failure or on a listed one that starts passing (`XPASS`: delete its line). Each is work to do:
+only on a new failure or on a listed one that starts passing (`XPASS`: delete its line). One is left, and it is
+not work for the simulator:
 
-- **Graphs (4 checks)**: capture and replay of cuDNN + cuBLAS, a whole training step, Adam with
-  `capturable=True`, `make_graphed_callables` all fail with "operation failed due to a previous error during
-  capture". Which call errors under stream capture is not identified (cuDNN computes on the host, which a
-  capture cannot record).
-- **torch.compile `reduce-overhead`**: 1.2 scaled difference from the CPU (allowed 0.001); it replays a captured
-  CUDA graph, probably the same gap.
-- **torch.compile gather / scatter_add / index_select**: an Inductor kernel fails to load, `cuModuleLoadData`
-  answers `unsupported-ptx` (the log shows only that line, not the unsupported feature) and the driver call
-  returns "operation not supported". Find the PTX feature first.
-- **Numeric**: the tiny causal transformer after three AdamW steps (0.0027 against 0.002). The kernel or
-  reduction order that drifts is not isolated; no tolerance was loosened. (SGD with OneCycleLR and gradient
-  clipping, and `clip_grad_norm_` (foreach) / `clip_grad_value_`, drifted when the sweep was written and match
-  the CPU on the current main; they are no longer listed.)
+- **Numeric**: the tiny causal transformer after three AdamW steps (0.0024 to 0.0027 against 0.002) is not a
+  simulator bug and stays listed. The key bias of each attention layer has a gradient that is zero in exact
+  arithmetic (softmax is unchanged when the same number is added to every key) and ~1e-9 of rounding noise in
+  float; AdamW divides it by its own square root, so every device turns its own noise into a +-lr step. A real
+  RTX 3060 running the same PyTorch differs from the CPU by about 0.0020 the same way (the same two
+  `in_proj_bias` tensors), and with those gradients zeroed the CPU, the simulator and the 3060 agree
+  (`tiny causal transformer ... key biases left out of the update`, a full-tier check, passes). No tolerance was
+  loosened. The entry can only go if the check changes what it tests.
 
 ### Tooling, CI and process
 

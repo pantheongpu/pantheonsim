@@ -33,7 +33,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <set>
@@ -43,6 +45,7 @@
 
 #include "vgpu/profiling.hpp"
 #include "enum_value.hpp"
+#include "vgpu/runtime/capture.hpp"
 
 namespace {
 
@@ -1228,38 +1231,15 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
 
 }  // namespace
 
-VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc,
-                                          const void* alpha, const void* A,
-                                          cublasLtMatrixLayout_t Adesc, const void* B,
-                                          cublasLtMatrixLayout_t Bdesc, const void* beta,
-                                          const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
-                                          cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
-                                          void*, size_t, cudaStream_t stream) {
-  // The copies this routine makes to reach its operands on the host are not
-  // the program's: on a card the product is a kernel and whatever it moves is
-  // inside it. (No kernel record is made for it either.)
-  vgpu::profiling::Silence silent;
-  // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
-  // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
-  // library keeps nothing in a handle.
-  if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc)) return CUBLAS_STATUS_INVALID_VALUE;
-  const auto& md = *reinterpret_cast<MatmulDesc*>(desc);
-  const auto& la = *reinterpret_cast<MatrixLayout*>(Adesc);
-  const auto& lb = *reinterpret_cast<MatrixLayout*>(Bdesc);
-  const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
-  const auto& lc = known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld;
+namespace {
 
-  // Measured on an RTX 3060 and an L4: beta != 0 with no C is refused before any algorithm is looked for.
-  if (!C && beta && md.pointer_mode == CUBLASLT_POINTER_MODE_HOST && read_scalar(beta, md.scale, false) != 0.0)
-    return CUBLAS_STATUS_INVALID_VALUE;
-  const cublasStatus_t verdict = validate(md, la, lb, lc, ld, true);
-  if (verdict != CUBLAS_STATUS_SUCCESS) {
-    if (trace() || (!quiet() && verdict == CUBLAS_STATUS_NOT_SUPPORTED))
-      std::fprintf(stderr, "[vgpu] cublasLtMatmul: refused, status %d (A=%d B=%d C=%d D=%d, epilogue %d)\n",
-                   (int)verdict, (int)la.type, (int)lb.type, (int)lc.type, (int)ld.type, (int)md.epilogue);
-    return verdict;
-  }
+// The matrix product itself, on the host (see cublasLtMatmul).
+cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb, const MatrixLayout& lc,
+                          const MatrixLayout& ld, const void* alpha, const void* A, const void* B, const void* beta,
+                          const void* C, void* D, cudaStream_t stream) {
+  // The copies this routine makes to reach its operands on the host are not
+  // the program's (see cublasLtMatmul); a recorded launch runs this too.
+  vgpu::profiling::Silence silent;
   const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
   const int64_t m = (int64_t)ld.rows, n = (int64_t)ld.cols;
   const int64_t k = ta ? (int64_t)la.rows : (int64_t)la.cols;
@@ -1428,6 +1408,71 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
     cudaMemcpy(md.aux_amax, &a, sizeof a, cudaMemcpyHostToDevice);
   }
   return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc,
+                                          const void* alpha, const void* A,
+                                          cublasLtMatrixLayout_t Adesc, const void* B,
+                                          cublasLtMatrixLayout_t Bdesc, const void* beta,
+                                          const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
+                                          cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
+                                          void*, size_t, cudaStream_t stream) {
+  // The copies this routine makes to reach its operands on the host are not
+  // the program's: on a card the product is a kernel and whatever it moves is
+  // inside it. (No kernel record is made for it either.)
+  vgpu::profiling::Silence silent;
+  // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
+  // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
+  // library keeps nothing in a handle.
+  if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc)) return CUBLAS_STATUS_INVALID_VALUE;
+  const auto& md = *reinterpret_cast<MatmulDesc*>(desc);
+  const auto& la = *reinterpret_cast<MatrixLayout*>(Adesc);
+  const auto& lb = *reinterpret_cast<MatrixLayout*>(Bdesc);
+  const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
+  const auto& lc = known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld;
+
+  // Measured on an RTX 3060 and an L4: beta != 0 with no C is refused before any algorithm is looked for.
+  if (!C && beta && md.pointer_mode == CUBLASLT_POINTER_MODE_HOST && read_scalar(beta, md.scale, false) != 0.0)
+    return CUBLAS_STATUS_INVALID_VALUE;
+  const cublasStatus_t verdict = validate(md, la, lb, lc, ld, true);
+  if (verdict != CUBLAS_STATUS_SUCCESS) {
+    if (trace() || (!quiet() && verdict == CUBLAS_STATUS_NOT_SUPPORTED))
+      std::fprintf(stderr, "[vgpu] cublasLtMatmul: refused, status %d (A=%d B=%d C=%d D=%d, epilogue %d)\n",
+                   (int)verdict, (int)la.type, (int)lb.type, (int)lc.type, (int)ld.type, (int)md.epilogue);
+    return verdict;
+  }
+  // Inside a captured region the call is recorded, not run: it executes at each
+  // launch of the graph, over what the graph's kernels have produced by then
+  // (cudaStreamSynchronize and the host copies in matmul_run are not allowed on
+  // a capturing stream, and would read operands that do not exist yet). The
+  // descriptors the caller destroys after the capture, and host-side alpha and
+  // beta, are copied into the closure; device pointers are read at launch.
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  if (stream && cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusActive) {
+    auto md2 = std::make_shared<MatmulDesc>(md);
+    auto la2 = std::make_shared<MatrixLayout>(la), lb2 = std::make_shared<MatrixLayout>(lb);
+    auto lc2 = std::make_shared<MatrixLayout>(lc), ld2 = std::make_shared<MatrixLayout>(ld);
+    const bool host_scalars = md.pointer_mode == CUBLASLT_POINTER_MODE_HOST;
+    const size_t sbytes = elem_bytes(md.scale) ? elem_bytes(md.scale) : 16;
+    auto hold = [&](const void* p) {
+      std::shared_ptr<std::vector<uint8_t>> v;
+      if (p && host_scalars) {
+        const auto* b = static_cast<const uint8_t*>(p);
+        v = std::make_shared<std::vector<uint8_t>>(b, b + sbytes);
+      }
+      return v;
+    };
+    auto ha = hold(alpha), hb = hold(beta);
+    const void *dalpha = alpha, *dbeta = beta;
+    if (vgpu_record_host_op_if_capturing(stream, [=] {
+          matmul_run(*md2, *la2, *lb2, *lc2, *ld2, ha ? ha->data() : dalpha, A, B, hb ? hb->data() : dbeta, C, D, stream);
+        }))
+      return CUBLAS_STATUS_SUCCESS;
+  }
+  return matmul_run(md, la, lb, lc, ld, alpha, A, B, beta, C, D, stream);
 }
 
 // One algorithm is offered: there is nothing to tune when the math runs on the
