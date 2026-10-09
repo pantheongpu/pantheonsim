@@ -1905,6 +1905,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_bsync_across_calls
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_across_calls.sh)
+  set_tests_properties(e2e_bsync_across_calls PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_functions
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_functions.sh)
   set_tests_properties(e2e_device_functions PROPERTIES
