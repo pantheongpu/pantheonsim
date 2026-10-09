@@ -523,6 +523,15 @@ int main(int argc, char** argv) {
       play(n, d, Mode{"delay1", true, 1});
       play(n, d, Mode{"delay3", true, 3});
     }
+    // the display delay against the number of reference pictures
+    for (const char* n : {"p_ref1", "p_ref2", "p_ref4", "p_ref6", "b_ref2", "b_ref3"}) {
+      const std::vector<uint8_t> d = slurp(base + "/h264/" + n + ".h264");
+      if (d.empty()) continue;
+      play(n, d, Mode{"packets"});
+      static const char* const labels[] = {"delay1", "delay2", "delay3", "delay4", "delay6"};
+      static const unsigned delays[] = {1, 2, 3, 4, 6};
+      for (int i = 0; i < 5; ++i) play(n, d, Mode{labels[i], true, delays[i]});
+    }
     if (!o.empty()) {
       play("odd_size", o, Mode{"cropped", true, 0, true});
       play("odd_size", o, Mode{"resized", true, 0, false, true});

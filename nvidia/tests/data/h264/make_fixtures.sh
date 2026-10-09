@@ -43,3 +43,6 @@ for v in "novui vui=none" "notiming vui=notiming" "norestr vui=norestr" "level40
   python3 sps_edit.py b_spatial.h264 sps_$1.h264 "${@:2}"
 done
 python3 sps_edit.py p_cavlc.h264 sps_p_novui.h264 vui=none
+# streams for the display-delay measurements: no reordering with 1, 2, 4 and 6 reference pictures; two B-picture streams
+for r in 1 2 4 6; do gen p_ref$r 64x48 14 main "cabac=1:bframes=0:ref=$r:keyint=100"; done
+for r in 2 3; do gen b_ref$r 64x48 14 main "cabac=1:bframes=2:b-pyramid=none:ref=$r:keyint=100"; done

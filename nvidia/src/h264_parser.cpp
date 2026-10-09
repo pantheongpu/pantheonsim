@@ -2,6 +2,7 @@
 #include "h264_parser.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -23,6 +24,9 @@ struct FrameStore {
   int repeat = 0;
   int slot = -1;
   bool in_dpb = false;
+  bool queued = false;         // bumped, waiting in the display queue
+  bool released = false;       // its surface went back to the pool
+  bool current = false;        // the picture being decoded or stored
   int ref_any() const { return ref_short | ref_long; }
 };
 using FsPtr = std::shared_ptr<FrameStore>;
@@ -95,9 +99,10 @@ struct H264Parser::Impl {
   SeqInfo last_info;
   bool have_info = false;
   int pool = 0;                 // decode surfaces
-  int last_alloc = -1;
+  std::deque<int> free_list;    // decode surfaces not in use, in the order they were released
+  FsPtr held;                   // the picture displayed last
   int reorder_thr = 0;
-  unsigned dpb_frames = 1;
+  int dpb_size_ = 16;
 
   // ---- DPB ----
   std::vector<FsPtr> dpb;
@@ -465,24 +470,28 @@ struct H264Parser::Impl {
   }
 
   // ---- surfaces ----
-  bool busy(int idx) const {
-    for (const FsPtr& f : dpb)
-      if (f->pic_idx == idx) return true;
-    for (const FsPtr& f : out_queue)
-      if (f->pic_idx == idx) return true;
-    if (pending_first_field && pending_first_field->pic_idx == idx) return true;
-    if (cur && cur->fs && cur->fs->pic_idx == idx) return true;
-    return false;
+  // The pool is a queue of free surface indices: the card hands out the one that was released first.
+  // A surface goes back to the pool when its picture is neither a reference nor waiting for output -- except the last
+  // picture displayed: the application may still be reading it, so it stays out until the next picture is displayed
+  // (or until the pool runs dry and it is taken back). Measured on the card.
+  void try_free(const FsPtr& f) {
+    if (f->released || f->pic_idx < 0 || f->ref_any() || f->need_output || f->queued || f->current || f == held || f == pending_first_field) return;
+    f->released = true;
+    free_list.push_back(f->pic_idx);
   }
 
   int alloc_pic_idx() {
     for (;;) {
-      for (int step = 1; step <= pool; ++step) {
-        const int i = (last_alloc + step) % pool;
-        if (!busy(i)) {
-          last_alloc = i;
-          return i;
-        }
+      if (!free_list.empty()) {
+        const int i = free_list.front();
+        free_list.pop_front();
+        return i;
+      }
+      if (held && !held->ref_any() && !held->need_output && !held->queued) {
+        const int i = held->pic_idx;
+        held->released = true;
+        held.reset();
+        return i;
       }
       // every surface is in use: show pictures until one is free
       if (!out_queue.empty()) {
@@ -506,11 +515,10 @@ struct H264Parser::Impl {
   bool bump_one() {
     FsPtr best;
     for (const FsPtr& f : dpb)
-      if (f->need_output && (!best || std::min(f->poc[0], f->poc[1]) < std::min(best->poc[0], best->poc[1]) ||
-                             (f->have != 3 ? f->poc[f->have == 1 ? 0 : 1] : std::min(f->poc[0], f->poc[1])) < (best->have != 3 ? best->poc[best->have == 1 ? 0 : 1] : std::min(best->poc[0], best->poc[1]))))
-        best = f;
+      if (f->need_output && (!best || frame_poc(*f) < frame_poc(*best))) best = f;
     if (!best) return false;
     best->need_output = false;
+    best->queued = true;
     out_queue.push_back(best);
     remove_unused();
     return true;
@@ -521,6 +529,7 @@ struct H264Parser::Impl {
   void display_one() {
     FsPtr f = out_queue.front();
     out_queue.pop_front();
+    f->queued = false;
     DisplayInfo di;
     di.pic_idx = f->pic_idx;
     di.progressive_frame = f->progressive;
@@ -532,6 +541,9 @@ struct H264Parser::Impl {
       ts_heap.pop();
     }
     sink->display(di);
+    FsPtr prev = held;
+    held = f;
+    if (prev) try_free(prev);
   }
 
   void pop_queue(size_t limit) {
@@ -552,20 +564,16 @@ struct H264Parser::Impl {
     }
   }
 
-  void assign_slots() {
-    for (const FsPtr& f : dpb) {
-      if (f->ref_any() && f->slot < 0) {
-        for (int i = 0; i < 16; ++i)
-          if (!slots[i]) {
-            slots[i] = f;
-            f->slot = i;
-            break;
-          }
-      } else if (!f->ref_any() && f->slot >= 0) {
-        slots[f->slot].reset();
-        f->slot = -1;
+  // The card's DPB array is the list of frame stores the DPB holds -- references and pictures waiting for output
+  // alike: a picture takes the lowest free place when it is stored, and keeps it until it leaves the DPB.
+  void assign_slot(const FsPtr& f) {
+    if (f->slot >= 0) return;
+    for (int i = 0; i < 16; ++i)
+      if (!slots[i]) {
+        slots[i] = f;
+        f->slot = i;
+        return;
       }
-    }
   }
 
   // Everything still waiting is shown (end of stream, a new sequence).
@@ -673,7 +681,8 @@ struct H264Parser::Impl {
       }
       f->in_dpb = true;
       dpb.push_back(f);
-      assign_slots();
+      remove_unused();
+      assign_slot(f);
       prev_ref_frame_num = unused;
       unused = (unused + 1) % max_fn;
     }
@@ -701,7 +710,10 @@ struct H264Parser::Impl {
           best = w;
         }
       }
-      if (victim) victim->ref_short = 0;
+      if (victim) {
+        victim->ref_short = 0;
+        try_free(victim);
+      }
     }
   }
 
@@ -778,12 +790,16 @@ struct H264Parser::Impl {
         int fm = 0;
         switch (m.op) {
           case 1:
-            if (find_short(curr_pic_num - (m.a + 1), &f, &fm)) f->ref_short &= ~fm;
+            if (find_short(curr_pic_num - (m.a + 1), &f, &fm)) {
+              f->ref_short &= ~fm;
+              try_free(f);
+            }
             break;
           case 2:
             if (find_long(m.a, &f, &fm)) {
               f->ref_long &= ~fm;
               if (!f->ref_long) f->long_idx = -1;
+              try_free(f);
             }
             break;
           case 3:
@@ -858,6 +874,8 @@ struct H264Parser::Impl {
       c.poc[1] = fs.poc[1];
     }
     prev_had_mmco5 = mmco5;
+    for (const FsPtr& f : dpb)
+      if (f.get() != &fs) try_free(f);
     // POC state for the next picture
     if (s.poc_type == 0) {
       if (mmco5) {
@@ -898,7 +916,9 @@ struct H264Parser::Impl {
       have_info = true;
       const int ret = sink->sequence(info);
       pool = ret > 1 ? ret : std::max(1, info.min_surfaces);
-      last_alloc = -1;
+      free_list.clear();
+      held.reset();
+      for (int i = 0; i < pool; ++i) free_list.push_back(i);
       for (int i = 0; i < 16; ++i) slots[i].reset();
       dpb.clear();
     }
@@ -908,18 +928,21 @@ struct H264Parser::Impl {
       int dpb_size = dpb_frames_of(*sps);
       if (sps->restriction_present && sps->max_dec_frame_buffering > 0) dpb_size = sps->max_dec_frame_buffering;
       dpb_size = std::max(dpb_size, sps->num_ref_frames);
-      if (sps->restriction_present) reorder_thr = sps->num_reorder_frames;
+      dpb_size_ = std::max(1, dpb_size);
+      if (sps->restriction_present) reorder_thr = sps->max_dec_frame_buffering > 0 ? std::min(sps->num_reorder_frames, sps->max_dec_frame_buffering) : sps->num_reorder_frames;
       else if (sps->poc_type == 2) reorder_thr = 0;
       else reorder_thr = dpb_size;
     }
     if (h.idr()) {
-      // IDR: everything before it is output
+      // IDR: the references go, then everything before it is output
+      for (const FsPtr& f : dpb) {
+        f->ref_short = f->ref_long = 0;
+        try_free(f);
+      }
       while (bump_one()) {
       }
-      pop_queue(max_delay);
-      for (const FsPtr& f : dpb) f->ref_short = f->ref_long = 0;
+      pop_queue(eff_queue());
       remove_unused();
-      assign_slots();
       prev_frame_num_offset = 0;
       prev_frame_num = 0;
     } else if (!second_field) {
@@ -943,12 +966,7 @@ struct H264Parser::Impl {
       pending_first_field.reset();
     } else {
       c.fs = std::make_shared<FrameStore>();
-      const int idx = alloc_pic_idx();
-      if (idx < 0) {
-        cur.reset();
-        return false;
-      }
-      c.fs->pic_idx = idx;
+      c.fs->current = true;
       c.fs->frame_num = h.frame_num;
       // timestamp of this picture
       int64_t ts;
@@ -981,7 +999,6 @@ struct H264Parser::Impl {
     }
     // the picture parameters handed to the decode callback
     fill_pic_params(c, h, *sps, *pps);
-    if (want_sei && !c.sei.empty()) sink->sei(fs.pic_idx, c.sei);
     return true;
   }
 
@@ -1028,7 +1045,6 @@ struct H264Parser::Impl {
     pp.frame_num = h.frame_num;
     pp.ref_pic = h.nal_ref_idc != 0;
     pp.idr = h.idr();
-    c.desc.curr_pic_idx = c.fs->pic_idx;
     c.desc.field_pic = h.field_pic;
     c.desc.bottom_field = h.bottom_field;
     c.desc.second_field = c.second_field;
@@ -1042,12 +1058,18 @@ struct H264Parser::Impl {
     Cur& c = *own;
     if (c.desc.slice_offsets.empty()) {
       // only redundant slices were seen: nothing to decode
-      if (!c.second_field && c.fs && !c.fs->in_dpb) {
-      }
       return;
     }
     FrameStore& fs = *c.fs;
     PicDesc& d = c.desc;
+    // the picture's surface is taken just before it is decoded
+    if (!c.second_field) {
+      const int idx = alloc_pic_idx();
+      if (idx < 0) return;
+      fs.pic_idx = idx;
+    }
+    d.curr_pic_idx = fs.pic_idx;
+    if (want_sei && !c.sei.empty()) sink->sei(fs.pic_idx, c.sei);
     d.intra_pic = c.all_intra;
     if (c.structure == 0) {
       d.pp.poc[0] = c.poc[0];
@@ -1063,7 +1085,7 @@ struct H264Parser::Impl {
       DpbSlot& sl = d.slots[i];
       sl = DpbSlot{};
       const FsPtr& f = slots[i];
-      if (!f) continue;
+      if (!f || !f->ref_any()) continue;
       sl.pic_idx = f->non_existing ? -1 : f->pic_idx;
       sl.frame_idx = f->ref_long ? f->long_idx : f->frame_num;
       sl.is_long_term = f->ref_long != 0;
@@ -1075,10 +1097,8 @@ struct H264Parser::Impl {
     const bool show = sink->decode(d) != 0;   // an application that returns 0 from the decode callback gets no display callback
     // ---- after decoding: marking, storing, output ----
     fs.have |= c.structure == 0 ? 3 : c.structure;
-    if (!fs.in_dpb) {
-      fs.in_dpb = true;
-      dpb.push_back(c.fs);
-    }
+    const bool first_field = c.structure != 0 && !c.second_field;
+    fs.need_output = !fs.non_existing && (show || c.second_field);
     if (c.first.nal_ref_idc != 0) {
       mark_current(c);
     } else {
@@ -1114,22 +1134,63 @@ struct H264Parser::Impl {
         fs.repeat = repeat;
       }
     }
-    assign_slots();
-    const bool first_field = c.structure != 0 && !c.second_field;
-    fs.need_output = !fs.non_existing && (show || c.second_field);
+    remove_unused();
+    fs.current = false;
     if (first_field) {
+      store_current(c.fs);
       pending_first_field = c.fs;
     } else {
       pending_first_field.reset();
-      bump_after_store();
+      store_and_bump(c.fs);
+      try_free(c.fs);
     }
   }
 
+  // The picture goes into the DPB (a reference, or waiting for output) -- after the pictures that must leave to make room
+  // have been output, so a picture takes the place of one that just went.
+  void store_current(const FsPtr& f) {
+    if (f->in_dpb) return;
+    f->in_dpb = true;
+    dpb.push_back(f);
+    assign_slot(f);
+  }
+
+  void store_and_bump(const FsPtr& f) {
+    // 1. room for the picture (C.4.5.3): while the DPB is full, the picture next in output order leaves
+    if (!f->in_dpb && (f->need_output || f->ref_any())) {
+      while (static_cast<int>(dpb.size()) >= dpb_size_) {
+        FsPtr best;
+        for (const FsPtr& g : dpb)
+          if (g->need_output && (!best || frame_poc(*g) < frame_poc(*best))) best = g;
+        if (!best) break;
+        if (f->need_output && !f->ref_any() && frame_poc(*f) < frame_poc(*best)) {
+          // a non-reference picture that is next in output order is output without being stored (C.4.5.2)
+          f->need_output = false;
+          f->queued = true;
+          out_queue.push_back(f);
+          break;
+        }
+        bump_one();
+      }
+    }
+    // 2. store it
+    if (!f->in_dpb && (f->need_output || f->ref_any())) store_current(f);
+    // 3. the stream's reordering depth
+    while (waiting_count() > eff_thr() && bump_one()) {
+    }
+    pop_queue(eff_queue());
+    remove_unused();
+  }
+
+  // The display delay the card applies: the application's value up to 3 (NVDEC's decode queue depth).
+  size_t eff_queue() const { return std::min<size_t>(max_delay, 3); }
+  int eff_thr() const { return reorder_thr; }
+
   void bump_after_store() {
     remove_unused();
-    while (waiting_count() > reorder_thr && bump_one()) {
+    while (waiting_count() > eff_thr() && bump_one()) {
     }
-    pop_queue(max_delay);
+    pop_queue(eff_queue());
     remove_unused();
   }
 };
