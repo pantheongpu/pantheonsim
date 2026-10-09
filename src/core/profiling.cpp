@@ -54,6 +54,11 @@ std::unordered_map<uint64_t, uint64_t> g_node_by_handle;
 }  // namespace
 
 uint32_t next_graph_id() { return g_graph_ids.fetch_add(1, std::memory_order_relaxed); }
+namespace {
+std::atomic<uint32_t> g_module_ids{1}, g_function_ids{1};
+}
+uint32_t next_module_id() { return g_module_ids.fetch_add(1, std::memory_order_relaxed); }
+uint32_t next_function_id() { return g_function_ids.fetch_add(1, std::memory_order_relaxed); }
 void register_graph(uint64_t handle, uint32_t id) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   g_graph_by_handle[handle] = id;

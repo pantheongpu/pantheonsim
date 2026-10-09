@@ -103,6 +103,10 @@ struct Event {
   // leaves them zero.
   uint32_t context_id = 0;
   uint32_t stream_id = 0;
+  // Memcpy: on one of the driver's own streams in the device's context rather
+  // than a stream of the program's -- the nth of the eight made with the
+  // context (-1: the stream above).
+  int32_t internal_stream = -1;
 };
 
 // Off until a front end asks for it, so a program nobody is profiling pays
@@ -214,6 +218,10 @@ bool pop_external(int kind, uint64_t* last);  // false: the stack is empty
 // in the graph in the low half. Kept for as long as the object lives, whether
 // or not anyone is profiling, because a tool may attach after it was made.
 uint32_t next_graph_id();
+// The numbers a profiler gives modules and the functions in them, across the
+// runtime and the driver: each takes the next.
+uint32_t next_module_id();
+uint32_t next_function_id();
 void register_graph(uint64_t handle, uint32_t id);
 void register_graph_node(uint64_t handle, uint64_t id);
 void forget_graph_object(uint64_t handle);

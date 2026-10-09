@@ -229,6 +229,7 @@ std::unordered_map<uint64_t, uint32_t> g_stream_ids;
 std::unordered_map<uint64_t, uint32_t> g_context_ids;
 std::unordered_map<uint64_t, uint32_t> g_event_ids;
 std::unordered_map<uint32_t, uint32_t> g_device_context;   // device -> its context's id
+std::unordered_map<uint32_t, uint32_t> g_device_first_stream;   // device -> the first of its context's own streams
 uint32_t g_next_stream_id = 14;
 uint32_t g_next_context_id = 1;
 bool g_first_context_streams_done = false;
@@ -280,14 +281,23 @@ uint32_t ctx_of_device(uint32_t device) {
   return kStandInContext();
 }
 
+// One of the driver's own streams in a device's context, by its place among the
+// eight (see note_context); the first context's streams are 6 to 13.
+uint32_t internal_stream_id(uint32_t device, int index) {
+  std::lock_guard<std::mutex> lock(g_id_mu);
+  const auto it = g_device_first_stream.find(device);
+  return (it != g_device_first_stream.end() ? it->second : 6u) + static_cast<uint32_t>(index);
+}
+
 // A context coming into being: its id, and the eight streams the driver makes
 // for itself inside it (they get ids of their own, ahead of any stream the
 // program makes). The first of the eight is returned, or 0 if this context was
 // announced already. `handle` is the driver's context, 0 for the runtime's
-// primary context of the device.
-uint32_t note_context(uint32_t device, uint64_t handle, uint32_t* ctx_id) {
+// primary context of the device (of which a device has a new one after each
+// reset, `generation`).
+uint32_t note_context(uint32_t device, uint64_t handle, uint64_t generation, uint32_t* ctx_id) {
   std::lock_guard<std::mutex> lock(g_id_mu);
-  const uint64_t key = handle ? handle : (uint64_t{1} << 62) + device;
+  const uint64_t key = handle ? handle : (uint64_t{1} << 62) + device + (generation << 16);
   const auto it = g_context_ids.find(key);
   if (it != g_context_ids.end()) {
     *ctx_id = it->second;
@@ -295,12 +305,15 @@ uint32_t note_context(uint32_t device, uint64_t handle, uint32_t* ctx_id) {
   }
   *ctx_id = g_context_ids[key] = g_next_context_id++;
   if (!handle) g_device_context[device] = *ctx_id;
+  uint32_t first = 0;
   if (!g_first_context_streams_done) {
     g_first_context_streams_done = true;
-    return 6;
+    first = 6;
+  } else {
+    first = g_next_stream_id;
+    g_next_stream_id += 8;
   }
-  const uint32_t first = g_next_stream_id;
-  g_next_stream_id += 8;
+  if (!handle) g_device_first_stream[device] = first;
   return first;
 }
 
@@ -326,6 +339,8 @@ size_t fill_kernel(uint8_t* out, const vgpu::profiling::Event& e) {
   k->staticSharedMemory = e.static_shared_bytes;
   k->registersPerThread = static_cast<uint16_t>(e.registers_per_thread);
   k->localMemoryPerThread = e.local_bytes_per_thread;
+  k->graphNodeId = e.graph_node_id;
+  k->graphId = e.graph_id;
   k->name = intern(e.name);
   return sizeof *k;
 }
@@ -351,11 +366,13 @@ size_t fill_memcpy(uint8_t* out, const vgpu::profiling::Event& e) {
   m->deviceId = e.device;
   m->contextId = ctx_of_device(e.device);
   m->correlationId = e.correlation;
-  m->streamId = stream_id_of(e.stream);
+  m->streamId = e.internal_stream >= 0 ? internal_stream_id(e.device, e.internal_stream) : stream_id_of(e.stream);
   m->bytes = e.bytes;
   m->srcKind = memory_kind(e.src_kind);
   m->dstKind = memory_kind(e.dst_kind);
   if (e.async) m->flags |= CUPTI_ACTIVITY_FLAG_MEMCPY_ASYNC;
+  m->graphNodeId = e.graph_node_id;
+  m->graphId = e.graph_id;
   switch (e.copy_kind) {
     case 1: m->copyKind = CUPTI_ACTIVITY_MEMCPY_KIND_HTOD; break;
     case 2: m->copyKind = CUPTI_ACTIVITY_MEMCPY_KIND_DTOH; break;
@@ -376,8 +393,12 @@ size_t fill_memset(uint8_t* out, const vgpu::profiling::Event& e) {
   m->correlationId = e.correlation;
   m->streamId = stream_id_of(e.stream);
   m->bytes = e.bytes;
-  m->value = e.value;
-  m->memoryKind = static_cast<uint16_t>(memory_kind(e.dst_kind));
+  // A fill that is a node of a launched graph reports neither its value nor its
+  // memory kind (an RTX 3060's records for one carry zero for both).
+  m->value = e.graph_node_id ? 0 : e.value;
+  m->memoryKind = e.graph_node_id ? 0 : static_cast<uint16_t>(memory_kind(e.dst_kind));
+  m->graphNodeId = e.graph_node_id;
+  m->graphId = e.graph_id;
   if (e.async) m->flags |= CUPTI_ACTIVITY_FLAG_MEMSET_ASYNC;
   return sizeof *m;
 }
@@ -648,7 +669,7 @@ size_t fill_function(uint8_t* out, const vgpu::profiling::Event& e) {
   auto* r = reinterpret_cast<FunctionRecord*>(out);
   std::memset(r, 0, sizeof *r);
   r->kind = static_cast<CUpti_ActivityKind>(akind::kFunction);
-  r->id = e.stream_id;
+  r->id = static_cast<uint32_t>(e.handle);
   r->contextId = ctx_of_device(e.device);
   r->moduleId = e.module_id;
   r->functionIndex = e.function_index;
@@ -1125,7 +1146,7 @@ void expand(std::vector<vgpu::profiling::Event>& events, std::vector<vgpu::profi
     if (e.kind == K::CudaEvent && shift) e.start_ns += anchor_offset;
     if (e.kind == K::Context) {
       uint32_t ctx = 0;
-      const uint32_t first = note_context(e.device, e.handle, &ctx);
+      const uint32_t first = note_context(e.device, e.handle, e.sync_id, &ctx);
       if (first && g_kinds[CUPTI_ACTIVITY_KIND_STREAM]) {
         for (uint32_t i = 0; i < 8; ++i) {
           vgpu::profiling::Event st;
@@ -1549,6 +1570,10 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   const bool driver = info.domain == vgpu::profiling::Domain::Driver;
   const auto& table = driver ? driver_conversions() : all_conversions();
   // CUPTI calls cudaLaunchKernelEx by the C entry point it goes through.
+  // The two that return a string, not an error code, are listed in the activity
+  // records but not delivered to callbacks: the return value would be of the wrong type.
+  if (!driver && (std::strcmp(info.name, "cudaGetErrorString") == 0 || std::strcmp(info.name, "cudaGetErrorName") == 0))
+    return;
   const std::string name = (!driver && std::strcmp(info.name, "cudaLaunchKernelEx") == 0) ? "cudaLaunchKernelExC" : info.name;
   const auto it = table.find(name);
   if (it == table.end()) return;
@@ -1622,6 +1647,12 @@ void on_resource(const vgpu::profiling::ResourceInfo& info) {
   CUpti_CallbackFunc fn = nullptr;
   void* user = nullptr;
   if (!id || !cb_enabled(CUPTI_CB_DOMAIN_RESOURCE, id, &fn, &user)) return;
+  // The driver finishing initialisation carries no data, as NVIDIA's.
+  if (info.what == R::CuInitFinished) {
+    vgpu::profiling::Silence silent;
+    fn(user, CUPTI_CB_DOMAIN_RESOURCE, id, nullptr);
+    return;
+  }
   CUpti_ResourceData data;
   std::memset(&data, 0, sizeof data);
   data.context = info.context ? current_context() : nullptr;
