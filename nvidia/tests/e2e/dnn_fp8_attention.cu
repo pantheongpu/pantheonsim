@@ -7,7 +7,9 @@
 // cuDNN's header and cudnn-frontend's documentation give, computed here on the host:
 //   S = (Q K^T) descale_Q descale_K scale, P = softmax(S), amax_S = max P,
 //   P8 = E4M3(P scale_S), O = (P8 V) descale_S descale_V, amax_O = max |O|, O8 = E4M3(O scale_O).
-// On a card the program prints SKIP. MXFP8 attention (E8M0 block scales) is refused.
+// Below compute capability 9 the program prints SKIP; on a Hopper or Blackwell card it runs against
+// NVIDIA's cuDNN and checks the same formulas, which is how they are verified. MXFP8 attention
+// (E8M0 block scales) is refused here.
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cudnn.h>
@@ -121,8 +123,11 @@ template <class T> static T* up(const std::vector<T>& h) {
 
 int main() {
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
-  if (!std::getenv("VGPU_GPU")) {
-    std::printf("SKIP: documentation-derived; there is no card to compare with (VirtualGPU only)\nPASS\n");
+  int major = 0, dev = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  if (major < 9) {
+    std::printf("SKIP: FP8 attention needs a Hopper or Blackwell GPU (or profile)\nPASS\n");
     return 0;
   }
   if (cudnnCreate(&H) != CUDNN_STATUS_SUCCESS) {
@@ -229,7 +234,8 @@ int main() {
   };
   Desc op2 = build(false);
   cudnnBackendFinalize(op2);
-  expect("an FP8 attention without O's amax is refused", graph_status(op2) == CUDNN_STATUS_NOT_SUPPORTED);
+  const bool on_sim = std::getenv("VGPU_GPU") != nullptr;   // (what NVIDIA's library answers to these is not known here)
+  if (on_sim) expect("an FP8 attention without O's amax is refused", graph_status(op2) == CUDNN_STATUS_NOT_SUPPORTED);
   Desc e8 = tensor(20, one, CUDNN_DATA_FP8_E8M0);
   Desc mx = make(CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR);
   set_desc(mx, CUDNN_ATTR_OPERATION_SDPA_FWD_QDESC, q);
@@ -238,7 +244,7 @@ int main() {
   set_desc(mx, CUDNN_ATTR_OPERATION_SDPA_FWD_ODESC, o);
   set_desc(mx, CUDNN_ATTR_OPERATION_SDPA_FWD_DESCALE_QDESC, e8);
   cudnnBackendFinalize(mx);
-  expect("MXFP8 attention (E8M0 descale) is refused", graph_status(mx) == CUDNN_STATUS_NOT_SUPPORTED);
+  if (on_sim) expect("MXFP8 attention (E8M0 descale) is refused", graph_status(mx) == CUDNN_STATUS_NOT_SUPPORTED);
   for (Desc d : {q, k, v, o, sc, dqt, dkt, dvt, dst, sst, sot, as, ao, e8, op, op2, mx}) cudnnBackendDestroyDescriptor(d);
   for (void* p : {(void*)dQ, (void*)dK, (void*)dV, (void*)dO, (void*)dsc, (void*)ddq, (void*)ddk, (void*)ddv, (void*)dds, (void*)dss,
                   (void*)dso, (void*)das, (void*)dao})

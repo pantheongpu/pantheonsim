@@ -7,7 +7,8 @@
 //   S = (Q K^T) descale_Q descale_K attn_scale, P = softmax(S), amax_S = max P,
 //   P8 = E4M3(P scale_S), O = (P8 V) descale_S descale_V, amax_O = max |O|, O8 = E4M3(O scale_O).
 // Below compute capability 9 cudnn-frontend refuses FP8 attention itself (dnn_frontend_ops.cpp
-// checks that); this program prints SKIP there and on a card.
+// checks that); this program prints SKIP there. On a Hopper or Blackwell card it runs against
+// NVIDIA's cuDNN and checks the same formulas, which is how they are verified.
 #define NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #include <cudnn_frontend.h>
 #include <cuda_fp8.h>
@@ -50,8 +51,8 @@ int main() {
   int major = 0, dev = 0;
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-  if (!std::getenv("VGPU_GPU") || major < 9) {
-    std::printf("SKIP: FP8 attention needs a Hopper or Blackwell profile on VirtualGPU (documentation-derived)\nPASS\n");
+  if (major < 9) {
+    std::printf("SKIP: FP8 attention needs a Hopper or Blackwell GPU (or profile)\nPASS\n");
     return 0;
   }
   cudnnHandle_t h;
