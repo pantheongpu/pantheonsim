@@ -399,7 +399,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
     return size_out(h, bytes, 512);                                                                                 \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsv2(cusparseHandle_t h, int m, int n, const T* dl, const T* d,       \
-                                                  const T* du, T* B, int ldb, void*) {                             \
+                                                  const T* du, T* B, int ldb, void* unused8) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gtsv2, h, m, n, dl, d, du, B, ldb, unused8); \
     return gtsv2<T>(h, m, n, dl, d, du, B, ldb, true);                                                              \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsv2_nopivot_bufferSizeExt(                                            \
@@ -407,7 +408,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
     return size_out(h, bytes, 128);                                                                                 \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsv2_nopivot(cusparseHandle_t h, int m, int n, const T* dl,           \
-                                                          const T* d, const T* du, T* B, int ldb, void*) {         \
+                                                          const T* d, const T* du, T* B, int ldb, void* unused8) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gtsv2_nopivot, h, m, n, dl, d, du, B, ldb, unused8);         \
     return gtsv2<T>(h, m, n, dl, d, du, B, ldb, false);                                                             \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsv2StridedBatch_bufferSizeExt(                                        \
@@ -417,7 +419,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
     return size_out(h, bytes, 128);                                                                                 \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsv2StridedBatch(cusparseHandle_t h, int m, const T* dl, const T* d,  \
-                                                              const T* du, T* x, int count, int stride, void*) {   \
+                                                              const T* du, T* x, int count, int stride, void* unused8) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gtsv2StridedBatch, h, m, dl, d, du, x, count, stride, unused8);   \
     return gtsv2_strided<T>(h, m, dl, d, du, x, count, stride);                                                     \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsvInterleavedBatch_bufferSizeExt(                                     \
@@ -427,7 +430,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
     return size_out(h, bytes, algo == 0 ? 128 : (size_t)std::max(m, 0) * std::max(count, 0) * sizeof(T));          \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gtsvInterleavedBatch(cusparseHandle_t h, int algo, int m, T* dl, T* d, \
-                                                                 T* du, T* x, int count, void*) {                  \
+                                                                 T* du, T* x, int count, void* unused8) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gtsvInterleavedBatch, h, algo, m, dl, d, du, x, count, unused8); \
     return gtsv_interleaved<T>(h, algo, m, dl, d, du, x, count);                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gpsvInterleavedBatch_bufferSizeExt(                                     \
@@ -438,7 +442,8 @@ cusparseStatus_t size_out(cusparseHandle_t h, size_t* bytes, size_t value) {
     return size_out(h, bytes, 2 * (size_t)std::max(m, 0) * std::max(count, 0) * sizeof(T));                         \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gpsvInterleavedBatch(cusparseHandle_t h, int algo, int m, T* ds, T* dl, \
-                                                                 T* d, T* du, T* dw, T* x, int count, void*) {     \
+                                                                 T* d, T* du, T* dw, T* x, int count, void* unused10) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gpsvInterleavedBatch, h, algo, m, ds, dl, d, du, dw, x, count, unused10);     \
     return gpsv_interleaved<T>(h, algo, m, ds, dl, d, du, dw, x, count);                                            \
   }
 VGPU_TRIDIAG(S, float)

@@ -132,12 +132,13 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_getNumProducts(cusparseSpGEMMDescr_t
   *num = reinterpret_cast<const SpGEMMDescr*>(d)->products;
   return CUSPARSE_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_estimateMemory(cusparseHandle_t h, cusparseOperation_t,
-                                                           cusparseOperation_t, const void*,
-                                                           cusparseConstSpMatDescr_t, cusparseConstSpMatDescr_t,
-                                                           const void*, cusparseSpMatDescr_t, cudaDataType,
-                                                           cusparseSpGEMMAlg_t alg, cusparseSpGEMMDescr_t d, float,
+VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_estimateMemory(cusparseHandle_t h, cusparseOperation_t unused1,
+                                                           cusparseOperation_t unused2, const void* unused3,
+                                                           cusparseConstSpMatDescr_t unused4, cusparseConstSpMatDescr_t unused5,
+                                                           const void* unused6, cusparseSpMatDescr_t unused7, cudaDataType unused8,
+                                                           cusparseSpGEMMAlg_t alg, cusparseSpGEMMDescr_t d, float unused11,
                                                            size_t* bytes3, void* buffer3, size_t* bytes2) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMM_estimateMemory, h, unused1, unused2, unused3, unused4, unused5, unused6, unused7, unused8, alg, d, unused11, bytes3, buffer3, bytes2);
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (alg != CUSPARSE_SPGEMM_ALG2 && alg != CUSPARSE_SPGEMM_ALG3) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!bytes3) return CUSPARSE_STATUS_INVALID_VALUE;
@@ -229,9 +230,10 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_workEstimation(cusparseHandle_t
                                                                 cusparseOperation_t opB,
                                                                 cusparseConstSpMatDescr_t matA,
                                                                 cusparseConstSpMatDescr_t matB,
-                                                                cusparseSpMatDescr_t matC, cusparseSpGEMMAlg_t,
+                                                                cusparseSpMatDescr_t matC, cusparseSpGEMMAlg_t unused6,
                                                                 cusparseSpGEMMDescr_t d, size_t* bytes1,
                                                                 void* buffer1) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMMreuse_workEstimation, h, opA, opB, matA, matB, matC, unused6, d, bytes1, buffer1);
   VGPU_REUSE_ARGS;
   (void)g;
   if (!bytes1) return CUSPARSE_STATUS_INVALID_VALUE;
@@ -242,9 +244,10 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_workEstimation(cusparseHandle_t
 VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_nnz(cusparseHandle_t h, cusparseOperation_t opA,
                                                      cusparseOperation_t opB, cusparseConstSpMatDescr_t matA,
                                                      cusparseConstSpMatDescr_t matB, cusparseSpMatDescr_t matC,
-                                                     cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d, size_t* bytes2,
+                                                     cusparseSpGEMMAlg_t unused6, cusparseSpGEMMDescr_t d, size_t* bytes2,
                                                      void* buffer2, size_t* bytes3, void* buffer3, size_t* bytes4,
                                                      void* buffer4) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMMreuse_nnz, h, opA, opB, matA, matB, matC, unused6, d, bytes2, buffer2, bytes3, buffer3, bytes4, buffer4);
   VGPU_REUSE_ARGS;
   if (!bytes2 || !bytes3 || !bytes4) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!buffer2 || !buffer3 || !buffer4) {
@@ -258,8 +261,9 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_nnz(cusparseHandle_t h, cuspars
 VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_copy(cusparseHandle_t h, cusparseOperation_t opA,
                                                       cusparseOperation_t opB, cusparseConstSpMatDescr_t matA,
                                                       cusparseConstSpMatDescr_t matB, cusparseSpMatDescr_t matC,
-                                                      cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d, size_t* bytes5,
+                                                      cusparseSpGEMMAlg_t unused6, cusparseSpGEMMDescr_t d, size_t* bytes5,
                                                       void* buffer5) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMMreuse_copy, h, opA, opB, matA, matB, matC, unused6, d, bytes5, buffer5);
   VGPU_REUSE_ARGS;
   if (!bytes5) return CUSPARSE_STATUS_INVALID_VALUE;
   if (!buffer5) {
@@ -277,7 +281,8 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_compute(cusparseHandle_t h, cus
                                                          cusparseConstSpMatDescr_t matA,
                                                          cusparseConstSpMatDescr_t matB, const void* beta,
                                                          cusparseSpMatDescr_t matC, cudaDataType ct,
-                                                         cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d) {
+                                                         cusparseSpGEMMAlg_t unused9, cusparseSpGEMMDescr_t d) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMMreuse_compute, h, opA, opB, alpha, matA, matB, beta, matC, ct, unused9, d);
   VGPU_REUSE_ARGS;
   if (A.value_type != B.value_type || A.value_type != C.value_type || ct != scalar_type_of(C.value_type))
     return CUSPARSE_STATUS_NOT_SUPPORTED;
@@ -297,11 +302,12 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMMreuse_compute(cusparseHandle_t h, cus
    failed"), which is what this returns, with its reason, for any. */
 
 VGPU_EXPORT cusparseStatus_t cusparseSpMMOp_createPlan(cusparseHandle_t h, cusparseSpMMOpPlan_t* plan,
-                                                       cusparseOperation_t, cusparseOperation_t,
+                                                       cusparseOperation_t unused2, cusparseOperation_t unused3,
                                                        cusparseConstSpMatDescr_t matA, cusparseConstDnMatDescr_t matB,
-                                                       cusparseDnMatDescr_t matC, cudaDataType, cusparseSpMMOpAlg_t,
-                                                       const void* add, size_t, const void* mul, size_t,
-                                                       const void* epilogue, size_t, size_t* workspace) {
+                                                       cusparseDnMatDescr_t matC, cudaDataType unused7, cusparseSpMMOpAlg_t unused8,
+                                                       const void* add, size_t unused10, const void* mul, size_t unused12,
+                                                       const void* epilogue, size_t unused14, size_t* workspace) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpMMOp_createPlan, h, plan, unused2, unused3, matA, matB, matC, unused7, unused8, add, unused10, mul, unused12, epilogue, unused14, workspace);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!plan || !known(matA) || !known(matB) || !known(matC) || !add || !mul || !epilogue || !workspace)
     return CUSPARSE_STATUS_INVALID_VALUE;
@@ -355,10 +361,12 @@ using vgpu_spsm_update_t = int;
 #endif
 VGPU_EXPORT cusparseStatus_t cusparseSpSV_updateMatrix(cusparseHandle_t h, cusparseSpSVDescr_t d, void* values,
                                                        vgpu_spsv_update_t part) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpSV_updateMatrix, h, d, values, part);
   return update_matrix(h, d, values, (int)part);
 }
 VGPU_EXPORT cusparseStatus_t cusparseSpSM_updateMatrix(cusparseHandle_t h, cusparseSpSMDescr_t d, void* values,
                                                        vgpu_spsm_update_t part) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpSM_updateMatrix, h, d, values, part);
   return update_matrix(h, d, values, (int)part);
 }
 
@@ -373,5 +381,6 @@ VGPU_EXPORT cusparseStatus_t cusparseXcscsort_bufferSizeExt(cusparseHandle_t h, 
 // The CSR sort on the transpose: CSC's column offsets are CSR's row offsets.
 VGPU_EXPORT cusparseStatus_t cusparseXcscsort(cusparseHandle_t h, int m, int n, int nnz, const cusparseMatDescr_t d,
                                               const int* offsets, int* rows, int* P, void* buffer) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcscsort, h, m, n, nnz, d, offsets, rows, P, buffer);
   return cusparseXcsrsort(h, n, m, nnz, d, offsets, rows, P, buffer);
 }
