@@ -96,3 +96,16 @@ paths tested here do not call them.
   PyTorch's elementwise kernels use.
 - `e2e_pytorch_models_<gpu>`: `models.py` on one GPU per SASS image (T4,
   A100, RTX 3060, H100, B200, RTX 5090), where PyTorch is installed.
+- `e2e_pytorch_distributed`: `torch.distributed` across two processes, each its
+  own simulated GPU, launched as torchrun launches them
+  (`nvidia/tests/pytorch/distributed.py`). The collectives (all-reduce,
+  all-gather, broadcast, reduce-scatter, all-to-all, send/recv), then a small
+  network trained with `DistributedDataParallel`, tensor parallelism, pipeline
+  parallelism and `FullyShardedDataParallel`, each ending where one process on
+  the whole batch ends. PyTorch's NCCL backend runs on the simulator's
+  `libnccl`, whose ranks meet through its file-backed transport. Where PyTorch
+  is installed.
+- `e2e_parallel_training_<n>` (two, three and four ranks): the same four ways
+  of splitting a network, written directly against NCCL and cuBLAS
+  (`nvidia/tests/e2e/parallel_training.cu`), one process per rank. Needs no
+  PyTorch, so hosted CI runs it; the pipeline split is for two ranks.

@@ -19,10 +19,11 @@ if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
 [[ -e "$shim/libcudnn.so" ]] || { echo "SKIP: libvgpucudnn not built"; exit 0; }
-# cuDNN's headers are vendored (it ships outside the toolkit); the libraries
+cudnn_inc="$(cudnn_include_dir)" || { echo "SKIP: no cuDNN headers (see scripts/fetch-cudnn-headers.py)"; exit 0; }
+# cuDNN's headers are fetched (it ships outside the toolkit); the libraries
 # linked are the shim's, under their own sonames.
 nvcc -std=c++17 -cudart shared --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
-     -I"$root/nvidia/third_party/cudnn_include" $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" \
+     -I"$cudnn_inc" $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" \
      -L"$shim" -lcudnn -lcublasLt -lcublas
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 # Kept out of a failing command substitution: with `set -e` the shell would

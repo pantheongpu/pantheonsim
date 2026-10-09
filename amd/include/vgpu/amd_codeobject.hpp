@@ -97,6 +97,7 @@ struct Relocation {
   // both ends are in .text, so the distance between them is known as soon as
   // the module is read and the loader fills it in then.
   bool in_text = false;
+  bool wide = false;   // the whole 64-bit address (R_AMDGPU_REL64, gfx1250's s_add_nc_u64 literal)
 };
 
 struct CodeObject {

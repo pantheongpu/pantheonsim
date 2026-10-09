@@ -20,6 +20,7 @@
 
 #include "vgpu/registry.hpp"
 #include "vgpu/runtime/runtime.hpp"
+#include "vgpu/runtime/visible_devices.hpp"
 #include "vgpu/telemetry.hpp"
 
 namespace {
@@ -47,11 +48,27 @@ extern "C" __attribute__((visibility("default"))) vgpu::runtime::Runtime* vgpu_s
     // Optional: shrink advertised VRAM so VRAM-proportional stress tests run
     // at laptop scale (vgpu/registry.hpp).
     vgpu::apply_vram_override(profile);
-    rt = std::make_unique<vgpu::runtime::Runtime>(profile, count);
+    // The devices the program is shown: CUDA_VISIBLE_DEVICES picks among the
+    // machine's, in the order it lists them. NVML, and the machine's
+    // telemetry, still list them all, as on a real host.
+    const vgpu::runtime::VisibleDevices shown = vgpu::runtime::cuda_visible_devices(
+        profile, count, std::getenv("CUDA_VISIBLE_DEVICES"), std::getenv("CUDA_DEVICE_ORDER"));
+    if (shown.error == 0) {
+      rt = std::make_unique<vgpu::runtime::Runtime>(profile, static_cast<int>(shown.physical.size()),
+                                                    shown.physical, count);
+    } else {
+      rt = std::make_unique<vgpu::runtime::Runtime>(profile, 1, std::vector<int>{0}, count);
+      rt->set_visibility_error(shown.error);
+    }
     const char* q = std::getenv("VGPU_QUIET");
-    if (!(q && q[0] == '1'))
-      std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n", count, profile.id.c_str(),
-                   profile.model.c_str());
+    if (!(q && q[0] == '1')) {
+      if (shown.error == 0)
+        std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: %d x %s (%s)\n",
+                     static_cast<int>(shown.physical.size()), profile.id.c_str(), profile.model.c_str());
+      else
+        std::fprintf(stderr, "[vgpu] virtual GPU platform initialized: no device is visible (CUDA_VISIBLE_DEVICES) -> %d\n",
+                     shown.error);
+    }
   }
   return rt.get();
 }

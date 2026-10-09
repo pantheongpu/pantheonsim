@@ -36,6 +36,7 @@
 #include "fatbin.hpp"
 #include "vgpu/sass/cubin.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/cuda_attributes.hpp"
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -180,6 +181,7 @@ struct ShimState {
   std::unordered_map<uintptr_t, KernelRec> kernels;
   std::unordered_map<uintptr_t, EventRec> events;
   std::set<uintptr_t> streams;      // explicitly created streams (all synchronous)
+  std::unordered_map<uintptr_t, int> stream_priority;   // those made with a priority, clamped
   std::map<uintptr_t, size_t> managed;  // cuMemAllocManaged results: base -> bytes
   // The memory a loaded module's __managed__ globals were moved to, by (device,
   // module id): entries in `managed` too, freed when the module is unloaded.
@@ -453,188 +455,14 @@ std::string best_ptx(const void* image) {
   return std::move(ptxs[vgpu::cuda::pick_ptx(ptxs, cc)].text);
 }
 
-// Attribute values beyond the profile-backed set.
-//
-// The numbers are CUdevice_attribute, and they are the whole difficulty: an
-// answer filed under the wrong one is worse than no answer, because it is
-// returned confidently. This table previously had ten entries numbered wrong,
-// including MAX_BLOCKS_PER_MULTIPROCESSOR -- added after a CUB scan launched no
-// blocks -- filed under 134, which is HOST_NUMA_ID. The scan bug was still
-// there, and 134 was answering a NUMA query with a block count. Every id below
-// is checked against the toolkit's cuda.h.
-//
-// Texture and surface limits are the documented per-compute-capability values
-// from the CUDA C Programming Guide's technical-specification table. Nothing
-// here models performance; the clock and bandwidth entries are placeholders and
-// say so.
+// Attribute values by id, for the places in this file that need a limit
+// (texture alignment, the pitch); cuDeviceGetAttribute answers from the same
+// table (vgpu/cuda_attributes.hpp), which the runtime's cudaDeviceGetAttribute
+// and cudaDeviceProp use too. An id that table does not know is zero here.
 int extra_attribute(const vgpu::DeviceProfile& p, int attrib) {
-  switch (attrib) {
-    case 11: return 2147483647;                      // MAX_PITCH
-    case 14: return 512;                             // TEXTURE_ALIGNMENT
-    case 15: return 1;                               // GPU_OVERLAP
-    case 17: return 0;                               // KERNEL_EXEC_TIMEOUT
-    case 18: return 0;                               // INTEGRATED
-    case 19: return 1;                               // CAN_MAP_HOST_MEMORY
-    case 20: return 0;                               // COMPUTE_MODE (default)
-
-    // ---- texture limits (documented, per compute capability) ----
-    case 21: return 131072;                          // MAXIMUM_TEXTURE1D_WIDTH
-    case 22: return 131072;                          // MAXIMUM_TEXTURE2D_WIDTH
-    case 23: return 65536;                           // MAXIMUM_TEXTURE2D_HEIGHT
-    case 24: return 16384;                           // MAXIMUM_TEXTURE3D_WIDTH
-    case 25: return 16384;                           // MAXIMUM_TEXTURE3D_HEIGHT
-    case 26: return 16384;                           // MAXIMUM_TEXTURE3D_DEPTH
-    case 27: return 32768;                           // MAXIMUM_TEXTURE2D_LAYERED_WIDTH
-    case 28: return 32768;                           // MAXIMUM_TEXTURE2D_LAYERED_HEIGHT
-    case 29: return 2048;                            // MAXIMUM_TEXTURE2D_LAYERED_LAYERS
-
-    case 30: return 512;                             // SURFACE_ALIGNMENT
-    case 31: return 1;                               // CONCURRENT_KERNELS
-    case 32: return 0;                               // ECC_ENABLED
-    case 33: return 1;                               // PCI_BUS_ID
-    case 34: return 0;                               // PCI_DEVICE_ID
-    case 35: return 0;                               // TCC_DRIVER (Linux is always 0)
-    case 36: return 1000000;                         // MEMORY_CLOCK_RATE (placeholder)
-    case 37: return 256;                             // GLOBAL_MEMORY_BUS_WIDTH (placeholder)
-    case 38: return 8 * 1024 * 1024;                 // L2_CACHE_SIZE (placeholder)
-    case 39:                                         // MAX_THREADS_PER_MULTIPROCESSOR
-      return static_cast<int>(p.limits.max_threads_per_sm);
-    case 40: return 2;                               // ASYNC_ENGINE_COUNT
-    case 41: return 1;                               // UNIFIED_ADDRESSING (64-bit Linux is UVA)
-    case 42: return 32768;                           // MAXIMUM_TEXTURE1D_LAYERED_WIDTH
-    case 43: return 2048;                            // MAXIMUM_TEXTURE1D_LAYERED_LAYERS
-    case 45: return 32768;                           // MAXIMUM_TEXTURE2D_GATHER_WIDTH
-    case 46: return 32768;                           // MAXIMUM_TEXTURE2D_GATHER_HEIGHT
-    case 47: return 16384;                           // MAXIMUM_TEXTURE3D_WIDTH_ALTERNATE
-    case 48: return 16384;                           // MAXIMUM_TEXTURE3D_HEIGHT_ALTERNATE
-    case 49: return 16384;                           // MAXIMUM_TEXTURE3D_DEPTH_ALTERNATE
-    case 50: return 0;                               // PCI_DOMAIN_ID
-    case 51: return 32;                              // TEXTURE_PITCH_ALIGNMENT
-    case 52: return 32768;                           // MAXIMUM_TEXTURECUBEMAP_WIDTH
-    case 53: return 32768;                           // MAXIMUM_TEXTURECUBEMAP_LAYERED_WIDTH
-    case 54: return 2046;                            // MAXIMUM_TEXTURECUBEMAP_LAYERED_LAYERS
-
-    // ---- surface limits ----
-    case 55: return 32768;                           // MAXIMUM_SURFACE1D_WIDTH
-    case 56: return 131072;                          // MAXIMUM_SURFACE2D_WIDTH
-    case 57: return 65536;                           // MAXIMUM_SURFACE2D_HEIGHT
-    case 58: return 16384;                           // MAXIMUM_SURFACE3D_WIDTH
-    case 59: return 16384;                           // MAXIMUM_SURFACE3D_HEIGHT
-    case 60: return 16384;                           // MAXIMUM_SURFACE3D_DEPTH
-    case 61: return 32768;                           // MAXIMUM_SURFACE1D_LAYERED_WIDTH
-    case 62: return 2048;                            // MAXIMUM_SURFACE1D_LAYERED_LAYERS
-    case 63: return 32768;                           // MAXIMUM_SURFACE2D_LAYERED_WIDTH
-    case 64: return 32768;                           // MAXIMUM_SURFACE2D_LAYERED_HEIGHT
-    case 65: return 2048;                            // MAXIMUM_SURFACE2D_LAYERED_LAYERS
-    case 66: return 32768;                           // MAXIMUM_SURFACECUBEMAP_WIDTH
-    case 67: return 32768;                           // MAXIMUM_SURFACECUBEMAP_LAYERED_WIDTH
-    case 68: return 2046;                            // MAXIMUM_SURFACECUBEMAP_LAYERED_LAYERS
-
-    case 70: return 131072;                          // MAXIMUM_TEXTURE2D_LINEAR_WIDTH
-    case 71: return 65000;                           // MAXIMUM_TEXTURE2D_LINEAR_HEIGHT
-    case 72: return 2097120;                         // MAXIMUM_TEXTURE2D_LINEAR_PITCH
-    case 73: return 32768;                           // MAXIMUM_TEXTURE2D_MIPMAPPED_WIDTH
-    case 74: return 32768;                           // MAXIMUM_TEXTURE2D_MIPMAPPED_HEIGHT
-    case 77: return 32768;                           // MAXIMUM_TEXTURE1D_MIPMAPPED_WIDTH
-
-    case 78: return 1;                               // STREAM_PRIORITIES_SUPPORTED
-    case 79: return 1;                               // GLOBAL_L1_CACHE_SUPPORTED
-    case 80: return 1;                               // LOCAL_L1_CACHE_SUPPORTED
-    case 81: return static_cast<int>(p.limits.shared_mem_per_sm);
-                                                     // MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
-    case 82: return static_cast<int>(p.limits.registers_per_sm);
-                                                     // MAX_REGISTERS_PER_MULTIPROCESSOR
-    // Managed memory is host memory every device maps (cuMemAllocManaged), so
-    // the host and the devices may use it at once, as on a Linux machine with
-    // a Pascal or newer GPU. The runtime answers the same.
-    case 83: return 1;                               // MANAGED_MEMORY
-    case 89: return 1;                               // CONCURRENT_MANAGED_ACCESS
-    case 84: return 0;                               // MULTI_GPU_BOARD
-    case 85: return 0;                               // MULTI_GPU_BOARD_GROUP_ID
-    case 90: return 1;                               // COMPUTE_PREEMPTION_SUPPORTED
-    // MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: the ceiling a kernel can raise its
-    // dynamic shared memory to, above the 48 KiB default. Triton reads it to
-    // decide how large a tile it may stage, so answering zero caps every kernel
-    // at the smallest tile it knows.
-    case 97: return static_cast<int>(p.limits.shared_mem_per_block_optin);
-    case 98: return 0;                               // CAN_FLUSH_REMOTE_WRITES
-    case 99: return 1;                               // HOST_REGISTER_SUPPORTED
-    // VIRTUAL_ADDRESS_MANAGEMENT_SUPPORTED: cuMemAddressReserve, cuMemCreate,
-    // cuMemMap and cuMemSetAccess work (nvidia/tests/e2e/vmm.cu), and callers
-    // gate on this before using them -- CUDA's own vectorAddMMAP sample, and
-    // allocators that grow a buffer in place. An RTX 3060 answers 1.
-    case 102: return 1;
-    // A real quantity, and answering zero for it is what had a CUB scan launch
-    // no blocks: it is a divisor in occupancy arithmetic. 106, not 134.
-    case 106: return static_cast<int>(p.limits.max_blocks_per_sm);
-    case 107: return 0;                              // GENERIC_COMPRESSION_SUPPORTED
-    case 110: return 0;                              // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED
-    case 111: return static_cast<int>(p.reserved_smem_per_block());  // RESERVED_SHARED_MEMORY_PER_BLOCK
-
-    // ---- capabilities this deliberately does not implement ----
-    // Zero is the true answer for each, and saying so explicitly keeps them out
-    // of the "not modelled" report below: a caller that asks whether managed
-    // memory works needs a truthful no, not a warning.
-    case 86: return 0;                               // HOST_NATIVE_ATOMIC_SUPPORTED
-    case 88: return 0;                               // PAGEABLE_MEMORY_ACCESS
-    case 91: return 0;                               // CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
-    // COOPERATIVE_LAUNCH: cudaLaunchCooperativeKernel works, because the
-    // scheduler can hold every block resident and interleave them. The
-    // multi-device form (96) needs grids on separate devices waiting on each
-    // other, which it cannot.
-    case 95: return 1;
-    case 96: return 0;                               // COOPERATIVE_MULTI_DEVICE_LAUNCH
-    case 100: return 0;                              // PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
-    case 101: return 0;                              // DIRECT_MANAGED_MEM_ACCESS_FROM_HOST
-    case 103: return 0;                              // HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
-    case 104: return 0;                              // HANDLE_TYPE_WIN32_HANDLE_SUPPORTED
-    case 105: return 0;                              // HANDLE_TYPE_WIN32_KMT_HANDLE_SUPPORTED
-    case 108: return 0;                              // MAX_PERSISTING_L2_CACHE_SIZE
-    case 109: return 0;                              // MAX_ACCESS_POLICY_WINDOW_SIZE
-    case 112: return 0;                              // SPARSE_CUDA_ARRAY_SUPPORTED
-    case 113: return 0;                              // READ_ONLY_HOST_REGISTER_SUPPORTED
-    case 114: return 0;                              // TIMELINE_SEMAPHORE_INTEROP_SUPPORTED
-    case 115: return 1;                              // MEMORY_POOLS_SUPPORTED
-    case 116: return 0;                              // GPU_DIRECT_RDMA_SUPPORTED
-    case 117: return 0;                              // GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS
-    case 118: return 0;                              // GPU_DIRECT_RDMA_WRITES_ORDERING
-    case 119: return 0;                              // MEMPOOL_SUPPORTED_HANDLE_TYPES
-    case 120: return 0;                              // CLUSTER_LAUNCH (no thread-block clusters)
-    case 121: return 0;                              // DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED
-    case 124: return 0;                              // DMA_BUF_SUPPORTED
-    case 125: return 1;                              // IPC_EVENT_SUPPORTED (cuIpc* above)
-    case 128: return 0;                              // TENSOR_MAP_ACCESS_SUPPORTED
-    case 129: return 0;                              // UNIFIED_FUNCTION_POINTERS
-    case 130: return 0;                              // NUMA_CONFIG (not NUMA-attached)
-    case 131: return 0;                              // NUMA_ID
-    case 133: return 0;                              // MPS_ENABLED
-    case 134: return -1;                             // HOST_NUMA_ID (-1: no NUMA affinity)
-    case 135: return 0;                              // D3D12_CIG_SUPPORTED (Windows only)
-    case 136: return 0;                              // MEM_DECOMPRESS_ALGORITHM_MASK
-    case 137: return 0;                              // MEM_DECOMPRESS_MAXIMUM_LENGTH
-    case 138: return 0;                              // VULKAN_CIG_SUPPORTED
-    // GPU_PCI_DEVICE_ID: the 16-bit PCI device and vendor ids packed into one
-    // word. The profile carries the pair that `vgpu smi --lspci` renders, so
-    // this is the same identity the rest of the stack presents.
-    case 139:
-      return static_cast<int>((p.telemetry.pci_device_id << 16) | p.telemetry.pci_vendor_id);
-    case 140: return 0;                              // GPU_PCI_SUBSYSTEM_ID
-    case 141: return 0;                              // HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
-    case 142: return 0;                              // HOST_NUMA_MEMORY_POOLS_SUPPORTED
-    case 143: return 0;                              // HOST_NUMA_MULTINODE_IPC_SUPPORTED
-    default:
-      // Answering zero for a quantity nobody modelled is how a scan came to
-      // launch no blocks, on the runtime side of this same question. The
-      // driver API is reached by more varied software, and an error here is
-      // more likely to be fatal than useful -- so this still answers zero, but
-      // says so where it can be seen rather than only under VGPU_TRACE.
-      if (!quiet())
-        std::fprintf(stderr,
-                     "[vgpu] cuDeviceGetAttribute: attribute %d is not modelled; answering 0. If "
-                     "that is wrong for your program, add it to driver_api.cpp\n",
-                     attrib);
-      return 0;
-  }
+  int v = 0;
+  vgpu::cuda::device_attribute(p, 0, attrib, &v);
+  return v;
 }
 
 // Instantiates a context-independent library on `dev` (parsing its PTX into a
@@ -846,6 +674,11 @@ static CUresult cuInit_impl(unsigned int flags) {
     if (s.initialized) return CUDA_SUCCESS;
     // The machine libcudart may already have made (shared_runtime.cpp).
     s.rt = vgpu::runtime::shared_runtime();
+    // No device shown (CUDA_VISIBLE_DEVICES), or a bad list: cuInit says so,
+    // and nothing is initialized, as on the card (CUDA_ERROR_NO_DEVICE or
+    // CUDA_ERROR_INVALID_DEVICE, and then cuDeviceGetCount answers
+    // CUDA_ERROR_NOT_INITIALIZED).
+    if (const int shown = s.rt->visibility_error()) return static_cast<CUresult>(shown);
     s.initialized = true;
     vgpu::load_injection_library();
     return CUDA_SUCCESS;
@@ -993,28 +826,13 @@ static CUresult cuDeviceGetAttribute_impl(int* pi, CUdevice_attribute attrib, CU
     static_assert(sizeof(attrib) == sizeof(int), "CUdevice_attribute is not int-sized");
     int attr_id;
     std::memcpy(&attr_id, &attrib, sizeof attr_id);
-    switch (attr_id) {
-      case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: *pi = (int)p.limits.max_threads_per_block; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X: *pi = (int)p.limits.max_block_dim[0]; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y: *pi = (int)p.limits.max_block_dim[1]; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z: *pi = (int)p.limits.max_block_dim[2]; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X: *pi = (int)p.limits.max_grid_dim[0]; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y: *pi = (int)p.limits.max_grid_dim[1]; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z: *pi = (int)p.limits.max_grid_dim[2]; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: *pi = (int)p.limits.shared_mem_per_block; break;
-      case CU_DEVICE_ATTRIBUTE_TOTAL_CONSTANT_MEMORY: *pi = 65536; break;
-      case CU_DEVICE_ATTRIBUTE_WARP_SIZE: *pi = (int)p.warp_size; break;
-      case CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK: *pi = (int)p.limits.registers_per_block; break;
-      case CU_DEVICE_ATTRIBUTE_CLOCK_RATE:
-        // VirtualGPU does not model performance; this is a documented placeholder.
-        *pi = 1000000;
-        break;
-      case CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: *pi = (int)p.limits.multiprocessors; break;
-      case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: *pi = p.cc_major; break;
-      case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: *pi = p.cc_minor; break;
-      default:
-        *pi = extra_attribute(p, attr_id);
-        break;
+    // An id that is not an attribute of any CUDA this knows is refused, as
+    // the card refuses it (CUDA_ERROR_INVALID_VALUE), not answered with a zero
+    // that reads as "the device has none of it".
+    if (!vgpu::cuda::device_attribute(p, s.rt->device(dev).physical(), attr_id, pi)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cuDeviceGetAttribute: attribute %d is not a CUDA device attribute\n", attr_id);
+      return CUDA_ERROR_INVALID_VALUE;
     }
     return CUDA_SUCCESS;
   });
@@ -1052,7 +870,7 @@ VGPU_EXPORT CUresult cuDeviceGetProperties(CUdevprop* prop, CUdevice dev) {
     prop->SIMDWidth = static_cast<int>(p.warp_size);
     prop->memPitch = extra_attribute(p, 11);      // MAX_PITCH
     prop->regsPerBlock = static_cast<int>(p.limits.registers_per_block);
-    prop->clockRate = 1000000;                    // the placeholder CLOCK_RATE reports
+    prop->clockRate = extra_attribute(p, 13);     // CLOCK_RATE
     prop->textureAlign = extra_attribute(p, 14);  // TEXTURE_ALIGNMENT
     return CUDA_SUCCESS;
   });
@@ -4115,6 +3933,9 @@ static CUresult stream_create(CUstream* s_out, unsigned int flags, int priority)
     uintptr_t h = make_handle(s, kTagStream);
     s.streams.insert(h);
     *s_out = reinterpret_cast<CUstream>(h);
+    // A priority outside the range is clamped to it, as the card does, and read back by
+    // cuStreamGetPriority; streams run in order, so it changes nothing else.
+    s.stream_priority[h] = std::min(vgpu::cuda::kLeastStreamPriority, std::max(vgpu::cuda::kGreatestStreamPriority, priority));
     announce_stream_created(s, h, flags, priority);
     return CUDA_SUCCESS;
   });
@@ -4137,6 +3958,7 @@ static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
     if (s.streams.count(h))
       vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting, h, profiled_device(s));
     s.streams.erase(h);
+    s.stream_priority.erase(h);
     return CUDA_SUCCESS;
   });
 }
@@ -4186,13 +4008,38 @@ static CUresult cuStreamWaitEvent_impl(CUstream stream, void* event, unsigned in
 VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream stream, void* event, unsigned int flags) {
   return traced("cuStreamWaitEvent", cuStreamWaitEvent_impl, stream, event, flags);
 }
-VGPU_EXPORT CUresult cuStreamGetPriority(CUstream, int* p) {
-  if (p) *p = 0;
+VGPU_EXPORT CUresult cuStreamGetPriority(CUstream stream, int* p) {
+  if (!p) return CUDA_SUCCESS;
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  const auto it = s.stream_priority.find(reinterpret_cast<uintptr_t>(stream));
+  *p = it == s.stream_priority.end() ? 0 : it->second;
   return CUDA_SUCCESS;
 }
 VGPU_EXPORT CUresult cuStreamGetFlags(CUstream, unsigned int* f) {
   if (f) *f = 0;
   return CUDA_SUCCESS;
+}
+// A stream belongs to the context that was current when it was created, and the
+// simulator keeps one context per thread's stack, so that is the answer here;
+// the legacy default stream (NULL) answers the current context as well. With
+// no context current the driver answers CUDA_ERROR_INVALID_CONTEXT and leaves
+// the output alone. Kokkos' CUDA backend asks for it when it wraps a stream.
+VGPU_EXPORT CUresult cuStreamGetCtx(CUstream, CUcontext* pctx) {
+  return api("cuStreamGetCtx", true, false, [&](ShimState&) {
+    if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    *pctx = reinterpret_cast<CUcontext>(ctx_stack().back());
+    return CUDA_SUCCESS;
+  });
+}
+// The CUDA 12.5 form also reports a green context when the stream belongs to
+// one. The simulator has none, so for every stream the answer is NULL, as an
+// RTX 3080 Ti's driver answers for an ordinary stream.
+VGPU_EXPORT CUresult cuStreamGetCtx_v2(CUstream stream, CUcontext* pctx, CUgreenCtx* pgreen) {
+  const CUresult r = cuStreamGetCtx(stream, pctx);
+  if (r == CUDA_SUCCESS && pgreen) *pgreen = nullptr;
+  return r;
 }
 VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream, int* status, unsigned long long* id,
                                                void*, const void**, size_t*) {
@@ -4325,8 +4172,8 @@ VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext, unsigned int* v) {
   return CUDA_SUCCESS;
 }
 VGPU_EXPORT CUresult cuCtxGetStreamPriorityRange(int* least, int* greatest) {
-  if (least) *least = 0;
-  if (greatest) *greatest = 0;
+  if (least) *least = vgpu::cuda::kLeastStreamPriority;
+  if (greatest) *greatest = vgpu::cuda::kGreatestStreamPriority;
   return CUDA_SUCCESS;
 }
 VGPU_EXPORT CUresult cuCtxGetFlags(unsigned int* f) {
@@ -4362,14 +4209,11 @@ VGPU_EXPORT CUresult cuDeviceGetUuid(void* uuid, CUdevice dev) {
   return api("cuDeviceGetUuid", true, false, [&](ShimState& s) {
     if (!uuid) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
-    // Deterministic fake UUID: "VGPU" + profile hash + ordinal.
-    unsigned char b[16] = {'V', 'G', 'P', 'U'};
-    const std::string& id = s.rt->device(dev).profile().id;
-    uint32_t h = 2166136261u;
-    for (char c : id) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
-    std::memcpy(b + 4, &h, 4);
-    b[8] = static_cast<unsigned char>(dev);
-    std::memcpy(uuid, b, 16);
+    // The bytes of the "GPU-" UUID NVML and nvidia-smi print for the device,
+    // as on a card: CUDA_VISIBLE_DEVICES and every tool that correlates the
+    // two names a device by it.
+    const vgpu::DeviceProfile& p = s.rt->device(dev).profile();
+    std::memcpy(uuid, vgpu::cuda::identity(p, s.rt->device(dev).physical()).uuid, 16);
     return CUDA_SUCCESS;
   });
 }
@@ -4378,9 +4222,17 @@ VGPU_EXPORT CUresult cuDeviceGetUuid_v2(void* uuid, CUdevice dev) { return cuDev
 // A buffer too short for the id gets as much of it as fits, and
 // INVALID_VALUE, as on the card.
 VGPU_EXPORT CUresult cuDeviceGetPCIBusId(char* id, int len, CUdevice dev) {
-  if (!id || len <= 0) return CUDA_ERROR_INVALID_VALUE;
-  const int n = std::snprintf(id, static_cast<size_t>(len), "0000:%02x:00.0", dev + 1);
-  return n < len ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  return api("cuDeviceGetPCIBusId", true, false, [&](ShimState& s) {
+    if (!id || len <= 0) return CUDA_ERROR_INVALID_VALUE;
+    check_device(s, dev);
+    // The address NVML reports for the device (its domain without the zeros
+    // NVML pads it with), so a tool correlating the two finds one device.
+    char text[32];
+    vgpu::cuda::pci_bus_id(vgpu::cuda::identity(s.rt->device(dev).profile(), s.rt->device(dev).physical()), text,
+                           sizeof text);
+    const int n = std::snprintf(id, static_cast<size_t>(len), "%s", text);
+    return n < len ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  });
 }
 
 namespace {
@@ -5214,7 +5066,8 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuMemsetD8Async), VGPU_PROC(cuMemsetD16Async), VGPU_PROC(cuMemsetD32Async),
     VGPU_PROC(cuStreamCreate), VGPU_PROC(cuStreamCreateWithPriority), VGPU_PROC(cuStreamDestroy),
     VGPU_PROC(cuStreamSynchronize), VGPU_PROC(cuStreamQuery), VGPU_PROC(cuStreamWaitEvent),
-    VGPU_PROC(cuStreamGetPriority), VGPU_PROC(cuStreamGetFlags),
+    VGPU_PROC(cuStreamGetPriority), VGPU_PROC(cuStreamGetFlags), VGPU_PROC(cuStreamGetCtx),
+    VGPU_PROC(cuStreamGetCtx_v2),
     VGPU_PROC(cuStreamGetCaptureInfo_v2), VGPU_PROC(cuStreamIsCapturing),
     VGPU_PROC(cuEventCreate), VGPU_PROC(cuEventRecord), VGPU_PROC(cuEventQuery),
     VGPU_PROC(cuEventSynchronize), VGPU_PROC(cuEventDestroy), VGPU_PROC(cuEventElapsedTime),

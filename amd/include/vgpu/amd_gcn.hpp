@@ -57,6 +57,8 @@ struct Operand {
   // A literal in a 64-bit float operand: the word is the double's high half,
   // the low half zero (a 64-bit integer operand's is zero-extended instead).
   bool literal_high = false;
+  bool scale_src = false;   // gfx1250: a scale source of a scaled matrix instruction, after the matrices' own
+  bool lit64 = false;   // gfx1250: a 64-bit literal (source code 254), two words of the instruction stream
   bool constant_k = false;   // RDNA: an instruction's own constant (v_fmaak_f32's K), always written in hex
 };
 std::string operand_text(const Operand& o);
@@ -76,8 +78,12 @@ enum class MopsType : uint8_t { None, I8, F16, BF16, F32, F64, F8, Count };
 
 // gfx1100 stands for RDNA3 (gfx11), whose encodings are its own: every
 // gfx11 GPU decodes alike. gfx1200 for RDNA4 (gfx12) likewise.
-enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100, Gfx1200, Gfx1030 };
-inline bool is_rdna(Target t) { return t == Target::Gfx1100 || t == Target::Gfx1200 || t == Target::Gfx1030; }
+enum class Target { Gfx942, Gfx90a, Gfx950, Gfx1100, Gfx1200, Gfx1030, Gfx1250 };
+inline bool is_rdna(Target t) {
+  return t == Target::Gfx1100 || t == Target::Gfx1200 || t == Target::Gfx1030 || t == Target::Gfx1250;
+}
+// gfx12's instruction set: RDNA4, and CDNA 5 (gfx1250), which is built on it.
+inline bool is_gfx12(Target t) { return t == Target::Gfx1200 || t == Target::Gfx1250; }
 // Whether the hardware puts a work-item's three ids in v0 (x in bits 0-9, y in 10-19, z in 20-29), whatever
 // the code object ABI says. gfx90a, gfx940-950 and gfx11/12 do (LLVM's "packed-tid"): a compiler for them
 // reads v0 that way even into a version 4 object, which is what Ubuntu's hipcc (ROCm 5.7, clang 17) writes.
@@ -179,6 +185,9 @@ struct Inst {
   bool dpp8 = false;
   bool fi = false;
   bool gfx12_cache = false;   // RDNA4: `cache` is TH | SCOPE << 3, not glc/slc/dlc
+  // gfx12's non-volatile bit, and gfx1250's scaled offset (the offset is in units of the access size).
+  bool nv = false;
+  bool scale_offset = false;
   uint8_t printed_op_sel = 0;  // RDNA VOP3: the op_sel the assembler writes (gfx11 folds 16-bit halves into v1.h)
   bool gds = false;
   uint32_t format = 0;
@@ -218,6 +227,8 @@ inline Target target_of_mach(uint32_t mach) {
       return Target::Gfx1100;
     // gfx1200, 1201 and gfx12-generic: RDNA4.
     case 0x48: case 0x4e: case 0x59: return Target::Gfx1200;
+    // gfx1250, CDNA 5 (MI455X): gfx12's instruction set with the matrix and tensor additions.
+    case 0x49: return Target::Gfx1250;
     // gfx1030 to 1036 and gfx10-3-generic: RDNA2.
     case 0x36: case 0x37: case 0x38: case 0x39: case 0x3d: case 0x3e: case 0x45: case 0x53: return Target::Gfx1030;
     default: return Target::Gfx942;

@@ -69,7 +69,8 @@ VTEST(a_call_is_a_hole_in_the_code_until_the_module_is_placed) {
   const amd::CodeObject o = object();
   // The distance to the function, in two halves: the code works it out once
   // and both calls jump to it.
-  VCHECK(o.relocations.size() >= 2);
+  // (gfx1250 reaches it with one 64-bit relocation; the others with two 32-bit halves.)
+  VCHECK(o.relocations.size() >= (vtest::amd_target() == "gfx1250" ? 1u : 2u));
   bool to_a_function = false;
   for (const amd::Relocation& r : o.relocations) to_a_function = to_a_function || r.in_text;
   VCHECK(to_a_function);

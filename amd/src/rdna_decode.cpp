@@ -29,7 +29,7 @@ int gfx9_opcode(const std::string& name);        // gcn_decode.cpp
 namespace vgpu::amd::gcn::rdna {
 namespace {
 
-enum class K { Vgpr, Src, Ssrc, Sreg, Sdst, Simm16, Simm32, Label, Hwreg, Sendmsg, Waitcnt, Depctr, Delay, Vcc, Exec };
+enum class K { Vgpr, Src, Ssrc, Sreg, Sdst, Simm16, Simm32, Simm64, Label, Hwreg, Sendmsg, Waitcnt, Depctr, Delay, Vcc, Exec };
 struct Opnd {
   const char* field;
   K kind;
@@ -73,6 +73,13 @@ const std::vector<Row>& rows_rdna2() {
   }();
   return rows;
 }
+const std::vector<Row>& rows_cdna5() {
+  // CDNA 5 (gfx1250): gfx12's encodings and what its specification adds, no graphics and no image sampling.
+  static const std::vector<Row> rows = {
+#include "rdna_ops_cdna5.inc"
+  };
+  return rows;
+}
 const std::vector<Row>& rows_rdna4() {
   // The ordinary instructions, then the image ones (rdna_images_rdna4.inc).
   static const std::vector<Row> rows = [] {
@@ -91,20 +98,24 @@ const std::vector<Row>& rows_rdna4() {
 // Which generation the instruction being decoded or printed is: RDNA2
 // (gfx10.3), RDNA3 (gfx11) or RDNA4 (gfx12), whose numbering and memory
 // encodings differ. Set for the length of a decode or a to_text.
-thread_local bool g_rdna4 = false;
+thread_local bool g_rdna4 = false;   // gfx12's encodings: RDNA4, and CDNA 5 which is built on them
 thread_local bool g_rdna2 = false;
+thread_local bool g_cdna5 = false;   // gfx1250, whose table and additions are its own
+thread_local uint8_t g_vop3px = 0;   // inside a scaled matrix instruction's second half: 2 (X2) or 3 (X3), its table segment
 struct Generation {
-  bool saved4, saved2;
-  explicit Generation(Target t) : saved4(g_rdna4), saved2(g_rdna2) {
-    g_rdna4 = t == Target::Gfx1200;
+  bool saved4, saved2, saved5;
+  explicit Generation(Target t) : saved4(g_rdna4), saved2(g_rdna2), saved5(g_cdna5) {
+    g_rdna4 = is_gfx12(t);
     g_rdna2 = t == Target::Gfx1030;
+    g_cdna5 = t == Target::Gfx1250;
   }
   ~Generation() {
     g_rdna4 = saved4;
     g_rdna2 = saved2;
+    g_cdna5 = saved5;
   }
 };
-const char* gen_name() { return g_rdna4 ? " (gfx12)" : g_rdna2 ? " (gfx10)" : " (gfx11)"; }
+const char* gen_name() { return g_cdna5 ? " (gfx1250)" : g_rdna4 ? " (gfx12)" : g_rdna2 ? " (gfx10)" : " (gfx11)"; }
 
 struct Table {
   std::map<std::tuple<Enc, uint8_t, uint32_t>, const Row*> by_opcode;
@@ -138,8 +149,9 @@ Table make_table4() {
   return make_table(all);
 }
 const Table& table() {
-  static const Table t2 = make_table(rows_rdna2()), t3 = make_table(rows_rdna3()), t4 = make_table4();
-  return g_rdna4 ? t4 : g_rdna2 ? t2 : t3;
+  static const Table t2 = make_table(rows_rdna2()), t3 = make_table(rows_rdna3()), t4 = make_table4(),
+                     t5 = make_table(rows_cdna5());
+  return g_cdna5 ? t5 : g_rdna4 ? t4 : g_rdna2 ? t2 : t3;
 }
 const Row& row(Enc e, uint8_t segment, uint32_t opcode) {
   const auto& m = table().by_opcode;
@@ -166,7 +178,10 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
   static const std::map<std::string, std::vector<std::string>> kAliases2 = {
 #include "rdna_ops_rdna2_aliases.inc"
   };
-  const auto& kAliases = g_rdna4 ? kAliases4 : g_rdna2 ? kAliases2 : kAliases3;
+  static const std::map<std::string, std::vector<std::string>> kAliases5 = {
+#include "rdna_ops_cdna5_aliases.inc"
+  };
+  const auto& kAliases = g_cdna5 ? kAliases5 : g_rdna4 ? kAliases4 : g_rdna2 ? kAliases2 : kAliases3;
   // gfx10's own names for what gfx9 has only in 64 bits (s_andn2_saveexec_b32)
   // the executor knows by gfx11's (s_and_not1_saveexec_b32), whose earlier
   // names they are.
@@ -270,6 +285,9 @@ Operand operand(uint32_t code, uint32_t width) {
   } else if (code == 253) {
     o.kind = OperandKind::Scc;
     o.width = 1;
+  } else if (code == 254 && g_cdna5) {
+    o.kind = OperandKind::Literal;
+    o.lit64 = true;
   } else if (code == 255) {
     o.kind = OperandKind::Literal;
   } else if (code >= 256) {
@@ -467,7 +485,30 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const bool r4 = g_rdna4, r2 = g_rdna2;
   const uint32_t null_code = r2 ? 125 : 124;
   const uint32_t w0 = word(code, at);
+  // gfx1250's scaled matrix instructions are two VOP3P words: a prefix that names the scale sources (its opcode
+  // says whether a scale is 32 bits, X2, or 64, X3), then the matrix instruction itself. The specification's
+  // opcodes for the prefix and the ones LLVM 22 writes differ: the specification's identifiers (0xCC37, 0xCCBD for X2;
+  // 0xCC3B, 0xCCBA for X3) are the opcodes of ordinary instructions in the same specification (0x37 is
+  // v_pk_maximum3_f16), so only LLVM's (0x35 for X2, 0x3A for X3) are taken.
+  if (g_cdna5 && !g_vop3px && (w0 >> 24) == 0xCC) {
+    const uint32_t pre = bits(w0, 23, 16);
+    const bool x2 = pre == 0x35, x3 = pre == 0x3A;
+    if (x2 || x3) {
+      const uint64_t prefix = w0 | static_cast<uint64_t>(word(code, at + 4)) << 32;
+      g_vop3px = x2 ? 2 : 3;
+      struct Reset { ~Reset() { g_vop3px = 0; } } reset;
+      Inst main = rdna::decode(code, at + 8, pc + 8, target, wave64);
+      // The scale sources: the prefix's SRC0 and SRC1 fields (the matrix word's own are the matrices').
+      main.src.push_back(operand(bits(prefix, 40, 32), x2 ? 1 : 2));
+      main.src.push_back(operand(bits(prefix, 49, 41), x2 ? 1 : 2));
+      main.src[main.src.size() - 2].scale_src = main.src.back().scale_src = true;
+      main.pc = pc;
+      main.size = 16;
+      return main;
+    }
+  }
   uint32_t w2 = 0;   // RDNA4's 96-bit memory encodings' third word
+  bool vopd3 = false;  // gfx1250's 96-bit dual-issue encoding
   Inst in;
   in.pc = pc;
   in.arch = target;
@@ -493,6 +534,33 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   }
   // An image instruction: MIMG on gfx10 and gfx11; VIMAGE and VSAMPLE on
   // RDNA4.
+  // gfx1250's tensor data mover: VIMAGE with an opcode of its own, whose operands are groups of scalar registers.
+  if (g_cdna5 && (w0 >> 26) == 0x34 && (bits(w0, 21, 14) == 196 || bits(w0, 21, 14) == 197)) {
+    const uint32_t w1 = word(code, at + 4), g = word(code, at + 8);
+    in.enc = Enc::Mimg;
+    in.size = 12;
+    in.opcode = bits(w0, 21, 14);
+    const Row& tr = row(Enc::Mimg, 3, in.opcode);
+    in.name = tr.name;
+    in.asm_name = in.name;
+    in.cache = bits(w1, 22, 20) | bits(w1, 19, 18) << 3;   // TH, SCOPE
+    in.gfx12_cache = true;
+    in.nv = bits(w0, 7, 7);
+    const auto group = [&](uint32_t reg, uint32_t width) {
+      Operand o;
+      o.kind = reg == 124 ? OperandKind::Null : OperandKind::Sgpr;
+      o.index = reg;
+      o.width = width;
+      return o;
+    };
+    in.src = {group(g & 0xFF, 4), group(g >> 8 & 0xFF, 8)};
+    // The third and fourth groups are named only when the descriptor is longer than the first two give.
+    if ((g >> 16 & 0xFF) != 124 || (g >> 24 & 0xFF) != 124) {
+      in.src.push_back(group(g >> 16 & 0xFF, 4));
+      in.src.push_back(group(g >> 24 & 0xFF, 4));
+    }
+    return in;
+  }
   if ((!r4 && (w0 >> 26) == 0x3c) || (r4 && ((w0 >> 26) == 0x34 || (w0 >> 26) == 0x39)))
     return decode_image(code, at, in);
   if ((w0 >> 23) == 0x17d) {
@@ -537,11 +605,18 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     second();
   } else if ((w0 >> 24) == 0xcc) {
     in.enc = Enc::Vop3p;
-    in.opcode = bits(w0, 22, 16);
+    in.opcode = g_cdna5 ? bits(w0, 23, 16) : bits(w0, 22, 16);   // gfx1250's has eight opcode bits
     second();
   } else if ((w0 >> 26) == 0x32) {
     in.enc = Enc::Vopd;
     second();
+  } else if (g_cdna5 && (w0 >> 24) == 0xCF) {
+    // gfx1250's VOPD3: three words, a six-bit opcode each, three sources and a negation for each half.
+    in.enc = Enc::Vopd;
+    second();
+    w2 = word(code, at + 8);
+    in.size = 12;
+    vopd3 = true;
   } else if ((w0 >> 26) == 0x36) {
     in.enc = Enc::Ds;
     in.opcode = bits(w0, 25, 18);
@@ -565,18 +640,27 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
 
   // VOPD: two instructions in one, X and Y, each its own opcode.
   if (in.enc == Enc::Vopd) {
-    const uint32_t opx = bits(w, 25, 22), opy = bits(w, 21, 17);
-    const Row& rx = row(Enc::Vopd, 0, opx);
-    const Row& ry = row(Enc::Vopd, 0, opy);
-    const auto half = [&](const Row& r, uint32_t vdst, uint32_t src0, uint32_t vsrc1, bool y) {
+    const uint32_t opx = vopd3 ? bits(w, 23, 18) : bits(w, 25, 22), opy = vopd3 ? bits(w, 17, 12) : bits(w, 21, 17);
+    const uint8_t seg = vopd3 ? 1 : 0;
+    const Row& rx = row(Enc::Vopd, seg, opx);
+    const Row& ry = row(Enc::Vopd, seg, opy);
+    const auto half = [&](const Row& r, uint32_t vdst, uint32_t src0, uint32_t vsrc1, bool y, uint32_t vsrc2 = 0,
+                          uint32_t neg = 0) {
       Inst h;
       h.enc = Enc::Vopd;
       h.arch = target;
       h.opcode = y ? opy : opx;
       h.name = r.name;
       h.pc = pc;
+      const bool bitop2 = r.name == std::string("v_dual_bitop2_b32");
       for (const Opnd& op : r.ops) {
         const std::string f = op.field;
+        const uint32_t regs = std::max(1u, op.bits / 32u);
+        if (vopd3 && op.kind == K::Sreg) {
+          // v_dual_cndmask_b32's mask names its register (VCC, or any pair), where VOPD's is VCC unwritten.
+          h.src.push_back(take(vsrc2, wave64 ? 2 : 1));
+          continue;
+        }
         // v_dual_cndmask_b32's lane mask is VCC's low half, which the
         // assembler leaves unwritten.
         if (op.kind == K::Vcc || op.kind == K::Sreg) continue;
@@ -587,14 +671,28 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
           literal = true;
           continue;
         }
-        if (op.out) h.dst.push_back(vgpr(vdst, 1));
+        if (op.out) h.dst.push_back(vgpr(vdst, regs));
         else if (f.find("SRC") != std::string::npos && f.find("VSRC") == std::string::npos)
-          h.src.push_back(take(src0, 1));
-        else h.src.push_back(vgpr(vsrc1, 1));
+          h.src.push_back(take(src0, regs));
+        else if (!f.empty() && f.back() == '2') {
+          h.src.push_back(vgpr(vsrc2, regs));
+        } else h.src.push_back(vgpr(vsrc1, regs));
+      }
+      if (vopd3 && bitop2) h.bitop3 = static_cast<uint8_t>(vsrc2);   // the truth table, in the field a third source would use
+      if (vopd3) {
+        for (uint32_t k = 0; k < h.src.size() && k < 3; ++k)
+          if ((neg >> k) & 1) h.src[k].neg = true;
+        if (bitop2) {   // v_bitop3 reads three sources; the dual form has two
+          Operand z;
+          z.kind = OperandKind::Inline;
+          z.value = 0;
+          z.hidden = true;
+          h.src.push_back(z);
+        }
       }
       // v_dual_cndmask_b32 picks by VCC's low half, which the assembler
       // leaves unwritten but the instruction reads.
-      if (h.name == "v_dual_cndmask_b32") {
+      if (h.name == "v_dual_cndmask_b32" && !vopd3) {
         Operand v;
         v.kind = OperandKind::Vcc;
         v.hidden = true;
@@ -602,13 +700,23 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       }
       h.asm_name = h.name;
       h.name = exec_name(h.name.substr(std::string("v_dual_").size()).insert(0, "v_"), Enc::Vopd, false);
+      if (h.name == "v_bitop2_b32") h.name = "v_bitop3_b32";   // the same operation with two sources
       if (const int op9 = gfx9_opcode(h.name); op9 >= 0) h.opcode = static_cast<uint32_t>(op9);
       return h;
     };
-    const uint32_t vdstx = bits(w, 63, 56), vdsty = (bits(w, 55, 49) << 1) | ((vdstx & 1) ^ 1);
     in.name = rx.name;
-    Inst x = half(rx, vdstx, bits(w, 8, 0), bits(w, 16, 9), false);
-    Inst y = half(ry, vdsty, bits(w, 40, 32), bits(w, 48, 41), true);
+    Inst x, y;
+    if (vopd3) {
+      // Words: 0 SRCX0 | OPY << 12 | OPX << 18; 1 SRCY0, NEGX (11:9), NEGY (14:12), VSRCX1 (23:16), VSRCX2 (31:24);
+      // 2 VDSTX, VSRCY1 (15:8), VSRCY2 (23:16), VDSTY (31:24).
+      const uint32_t w1 = static_cast<uint32_t>(w >> 32);
+      x = half(rx, w2 & 0xFF, w0 & 0x1FF, bits(w1, 23, 16), false, bits(w1, 31, 24), bits(w1, 11, 9));
+      y = half(ry, bits(w2, 31, 24), w1 & 0x1FF, bits(w2, 15, 8), true, bits(w2, 23, 16), bits(w1, 14, 12));
+    } else {
+      const uint32_t vdstx = bits(w, 63, 56), vdsty = (bits(w, 55, 49) << 1) | ((vdstx & 1) ^ 1);
+      x = half(rx, vdstx, bits(w, 8, 0), bits(w, 16, 9), false);
+      y = half(ry, vdsty, bits(w, 40, 32), bits(w, 48, 41), true);
+    }
     in.dual = {x, y};
     in.asm_name = in.name;
     if (literal) {
@@ -630,7 +738,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const uint32_t seg = in.enc != Enc::Flat ? 0
                      : r4 ? ((w0 >> 24) == 0xed ? 1 : (w0 >> 24) == 0xee ? 2 : 0)
                           : r2 ? bits(w, 15, 14) : bits(w, 17, 16);
-  const uint8_t segment = static_cast<uint8_t>(seg == 1 ? 2 : seg == 2 ? 1 : 0);
+  const uint8_t segment = in.enc == Enc::Vop3p && g_vop3px ? static_cast<uint8_t>(g_vop3px - 1)
+                                                          : static_cast<uint8_t>(seg == 1 ? 2 : seg == 2 ? 1 : 0);
   const Row& r = row(in.enc, segment, in.opcode);
   in.name = r.name;
   if (in.enc == Enc::Flat) in.segment = segment == 1 ? Inst::Segment::Global : segment == 2 ? Inst::Segment::Scratch
@@ -722,6 +831,8 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   const bool vop3_16 = vop3ish;   // VOP3's 16-bit operands pick their half with OP_SEL
   for (const Opnd& op : r.ops) {
     const std::string f = op.field;
+    if (f.rfind("SCALE_", 0) == 0) continue;   // a scaled matrix instruction's, taken from its prefix above
+    bool buffer_atomic_data = false;
     uint32_t width = width_of(op, in.enc, wave64);
     // A buffer address is an offset or an index, one register, or both, two.
     const bool idxen = r4 ? bits(w, 63, 63) : r2 ? bits(w, 13, 13) : bits(w, 55, 55);
@@ -731,14 +842,19 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     // address register; without one, a whole 64-bit address. Scratch's is
     // always an offset.
     const uint32_t saddr_field = r4 ? bits(w, 6, 0) : bits(w, 54, 48);
-    if (in.enc == Enc::Flat && (f == "ADDR" || f == "VADDR") && segment != 0)
+    if (in.enc == Enc::Flat && (f == "ADDR" || f == "VADDR") && g_cdna5)
+      width = segment != 2 && saddr_field == null_code ? 2 : 1;   // flat and global: 64 bits unless a base is named
+    else if (in.enc == Enc::Flat && (f == "ADDR" || f == "VADDR") && segment != 0)
       width = segment == 1 && saddr_field == null_code ? 2 : 1;
     // An atomic returns the old value only with GLC set (RDNA4: TH's
     // return bit).
     const bool returns = r4 ? bits(w, 52, 52) : r2 && in.enc == Enc::Flat ? bits(w, 16, 16) : bits(w, 14, 14);
     if (op.out && (in.enc == Enc::Flat || in.enc == Enc::Mubuf) && r.name[0] != 'd' &&
-        std::string(r.name).find("_atomic_") != std::string::npos && !returns)
-      continue;
+        std::string(r.name).find("_atomic_") != std::string::npos && !returns) {
+      // A flat atomic's data is a separate source (VSRC); a buffer atomic's is the same field, an input here.
+      if (in.enc != Enc::Mubuf) continue;
+      buffer_atomic_data = true;
+    }
     Operand o;
     switch (op.kind) {
       case K::Exec:
@@ -821,7 +937,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       }
     }
     (void)vop3_16;
-    (op.out ? in.dst : in.src).push_back(o);
+    ((op.out && !buffer_atomic_data) ? in.dst : in.src).push_back(o);
   }
 
   // The modifiers each encoding carries -- RDNA4's memory ones first: a
@@ -832,16 +948,21 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     if (in.enc == Enc::Smem) {
       in.offset = static_cast<int32_t>(bits(w, 55, 32) << 8) >> 8;
       in.cache = bits(w, 24, 23) | bits(w, 22, 21) << 3;
+      in.nv = bits(w, 20, 20);
+      in.scale_offset = g_cdna5 && bits(w, 56, 56);
     } else {
       in.offset = static_cast<int32_t>((w2 >> 8) << 8) >> 8;   // IOFFSET, 24 bits, signed
       in.cache = bits(w, 54, 52) | bits(w, 51, 50) << 3;
+      in.nv = bits(w, 7, 7);
       if (in.enc == Enc::Mubuf) {
         in.offen = bits(w, 62, 62);
         in.idxen = bits(w, 63, 63);
         in.format = bits(w, 61, 55);
       } else {
+        in.scale_offset = g_cdna5 && bits(w, 48, 48);
         const uint32_t saddr = bits(w, 6, 0);
-        in.has_saddr = in.segment != Inst::Segment::Flat && saddr != 124;
+        // gfx1250's flat accesses take a scalar base too (and then a 32-bit offset in the vector register).
+        in.has_saddr = (g_cdna5 || in.segment != Inst::Segment::Flat) && saddr != 124;
         in.saddr = saddr;
         in.has_vaddr = in.segment != Inst::Segment::Scratch || bits(w, 49, 49);
       }
@@ -897,6 +1018,13 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       }
       in.clamp = bits(w, 15, 15);
       in.omod = static_cast<uint8_t>(bits(w, 60, 59));
+      // v_bitop3's truth table is in the modifier bits, as on gfx950: NEG, ABS and OMOD, in that order from the
+      // low end.
+      if (g_cdna5 && in.name.rfind("v_bitop3_", 0) == 0) {
+        in.bitop3 = static_cast<uint8_t>(neg | abs << 3 | in.omod << 6);
+        in.omod = 0;
+        for (Operand& o : in.src) o.neg = o.abs = false;
+      }
       // A 16-bit vector register operand is half a register: OP_SEL's bit for
       // it (bit 3 the destination's) says which half, and the assembler
       // writes that as .l or .h rather than as op_sel.
@@ -997,12 +1125,19 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     // A 16-bit operand's literal is the low half of the word; a double's is
     // its high half.
     const bool f64 = std::string(r.name).find("f64") != std::string::npos;
+    bool wide = false;
+    for (const Operand& o : in.src) wide |= o.kind == OperandKind::Literal && o.lit64;
+    const uint64_t value64 = wide ? (value | static_cast<uint64_t>(word(code, at + in.size + 4)) << 32) : value;
     for (Operand& o : in.src)
       if (o.kind == OperandKind::Literal) {
+        if (o.lit64) {
+          o.value = static_cast<int64_t>(value64);
+          continue;
+        }
         o.value = o.bits16 ? (value & 0xFFFF) : value;
         o.literal_high = f64 && o.width == 2;
       }
-    in.size += 4;
+    in.size += wide ? 8 : 4;
   }
   // A half-register source reads its half as a sub-dword instruction reads
   // a word of a register, which is how the executor runs it (the
@@ -1062,10 +1197,17 @@ std::string hex(uint32_t v) {
 // An operand with its modifiers: -v1, |s2|, -|v[3:4]|.
 std::string op_text(const Operand& o) {
   if (o.constant_k) return hex(static_cast<uint32_t>(o.value));
+  if (o.kind == OperandKind::Literal && o.lit64) {
+    char b[48];
+    std::snprintf(b, sizeof b, "lit64(0x%llx)", static_cast<unsigned long long>(o.value));
+    return o.neg ? std::string("-") + b : std::string(b);
+  }
   if (o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal) {
     Operand plain = o;
     plain.abs = false;
-    const std::string t = operand_text(plain);
+    std::string t = operand_text(plain);
+    // 1/(2*pi) in a 64-bit operand is the double's digits, not the float's.
+    if (o.kind == OperandKind::InlineFloat && o.width == 2 && t == "0.15915494") t = "0.15915494309189532";
     return o.abs ? "|" + t + "|" : t;
   }
   Operand plain = o;
@@ -1154,7 +1296,27 @@ std::string gfx12_cache(const std::string& name, uint32_t cache) {
   std::string s;
   const bool atomic = name.find("_atomic") != std::string::npos;
   const bool store = !atomic && (name.find("_store") != std::string::npos);
-  if (th) {
+  if (th && g_cdna5) {
+    // gfx1250's names (LLVM's printer for it): a store's write-back is plain WB, an atomic's cascade shows only at
+    // device scope or wider and its other TH values print as numbers, and a load's reserved value is a number too.
+    char num[24];
+    if (atomic) {
+      const bool ret = th & 1, nt = th & 2;
+      if (th & 4) {
+        if (scope >= 2) s += std::string(" th:TH_ATOMIC_CASCADE_") + (nt ? "NT" : "RT");
+        else { std::snprintf(num, sizeof num, " th:TH_ATOMIC_0x%x", th); s += num; }
+      } else {
+        s += std::string(" th:TH_ATOMIC") + (nt ? "_NT" : "") + (ret ? "_RETURN" : "");
+      }
+    } else if (th == 7 && !store) {
+      s += " th:0x7";
+    } else {
+      static const char* kLoad[] = {"", "NT", "HT", "LU", "NT_RT", "RT_NT", "NT_HT", ""};
+      static const char* kStore[] = {"", "NT", "HT", "WB", "NT_RT", "RT_NT", "NT_HT", "NT_WB"};
+      const std::string what = th == 3 && scope == 3 ? "BYPASS" : store ? kStore[th] : kLoad[th];
+      s += std::string(" th:TH_") + (store ? "STORE_" : "LOAD_") + what;
+    }
+  } else if (th) {
     if (atomic) {
       std::string t;
       if (th & 2) t += "_NT";
@@ -1217,7 +1379,8 @@ std::string one(const Inst& i) {
   const bool short_form = i.enc == Enc::Vop1 || i.enc == Enc::Vop2 || i.enc == Enc::Vopc;
   // A short form with no long one to tell it from (v_fmaak_f32,
   // v_readfirstlane_b32) has no suffix.
-  if (short_form && (i.dpp || i.dpp8)) s += "_dpp";
+  // (gfx1250's compare in DPP form is written with no suffix at all.)
+  if (short_form && (i.dpp || i.dpp8)) s += g_cdna5 && i.enc == Enc::Vopc ? "" : "_dpp";
   else if (short_form && i.sdwa) s += "_e32";   // (made _sdwa below)
   else if (short_form && table().long_forms.count(name) && name != "v_readfirstlane_b32" && name != "v_nop")
     s += "_e32";
@@ -1227,6 +1390,7 @@ std::string one(const Inst& i) {
   const bool promoted = i.enc == Enc::Vop3 && table().short_forms.count(name);
   if (i.enc == Enc::Vop3 && promoted) s += i.dpp || i.dpp8 ? "_e64_dpp" : "_e64";
   if (i.enc == Enc::Vop3 && !promoted && (i.dpp || i.dpp8)) s += "_e64_dpp";
+  if (g_cdna5 && i.enc == Enc::Vop3p && (i.dpp || i.dpp8)) s += "_e64_dpp";
 
   if (i.enc == Enc::Sopp) {
     if (name == "s_waitcnt") return s + " " + waitcnt(static_cast<uint32_t>(i.simm));
@@ -1287,11 +1451,15 @@ std::string one(const Inst& i) {
     const bool reg = i.src.size() > 1 && i.src[1].kind != OperandKind::Null;
     if (i.src.empty()) return s;   // s_gl1_inv, s_dcache_inv, s_memtime's result alone
     put(op_text(i.src[0]));
-    const uint32_t off24 = static_cast<uint32_t>(i.offset) & 0xFFFFFF;
+    // gfx12's offset is 24 bits, signed; LLVM prints a negative one as -0x...
+    const auto offset_text = [&] {
+      return i.offset < 0 ? "-" + hex(static_cast<uint32_t>(-static_cast<int64_t>(i.offset))) : hex(static_cast<uint32_t>(i.offset));
+    };
     if (i.gfx12_cache) {
-      if (reg) put(op_text(i.src[1]) + " offset:" + hex(off24));
-      else put(hex(off24));
-      return s + gfx12_cache(name, i.cache);
+      std::string scaled = i.scale_offset ? " scale_offset" : "";
+      if (reg) put(op_text(i.src[1]) + " offset:" + offset_text() + scaled);
+      else put(offset_text() + scaled);
+      return s + gfx12_cache(name, i.cache) + (i.nv ? " nv" : "");
     }
     if (reg) put(op_text(i.src[1]) + (off ? " offset:" + hex(off) : ""));
     else put(off ? hex(off) : "null");
@@ -1306,6 +1474,10 @@ std::string one(const Inst& i) {
   for (size_t k = 0; k < i.src.size(); ++k) {
     const Operand& o = cmpstore && k ? i.src[3 - k] : i.src[k];
     if (o.hidden) continue;
+    // gfx1250's flat access with no scalar base names none (global and scratch write "off").
+    if (g_cdna5 && i.enc == Enc::Flat && i.segment == Inst::Segment::Flat && !i.has_saddr && k + 1 == i.src.size() &&
+        o.kind == OperandKind::Null)
+      continue;
     if (i.enc == Enc::Flat && k == 0 && scratch_no_addr && (o.kind == OperandKind::Vgpr)) {
       put("off");
       continue;
@@ -1343,8 +1515,10 @@ std::string one(const Inst& i) {
       break;
     case Enc::Flat:
       if (i.offset) s += " offset:" + std::to_string(i.offset);
+      if (i.scale_offset) s += " scale_offset";
       if (i.gfx12_cache) {
         s += gfx12_cache(name, i.cache);
+        if (i.nv) s += " nv";
         break;
       }
       if (i.cache & 1) s += " glc";
@@ -1358,6 +1532,7 @@ std::string one(const Inst& i) {
       if (i.offset) s += " offset:" + std::to_string(i.offset);
       if (i.gfx12_cache) {
         s += gfx12_cache(name, i.cache);
+        if (i.nv) s += " nv";
         break;
       }
       if (i.cache & 1) s += " glc";
@@ -1372,10 +1547,22 @@ std::string one(const Inst& i) {
         t += std::to_string((i.printed_op_sel >> 3) & 1) + "]";
         s += t;
       }
+      if (i.bitop3) {
+        char t[24];
+        std::snprintf(t, sizeof t, " bitop3:0x%x", i.bitop3);
+        s += t;
+      }
       if (i.clamp) s += " clamp";
       if (i.omod == 1) s += " mul:2";
       if (i.omod == 2) s += " mul:4";
       if (i.omod == 3) s += " div:2";
+      break;
+    case Enc::Vopd:
+      if (i.bitop3) {
+        char t[24];
+        std::snprintf(t, sizeof t, " bitop3:0x%x", i.bitop3);
+        s += t;
+      }
       break;
     case Enc::Vop3p: {
       const uint32_t n = static_cast<uint32_t>(i.src.size());
@@ -1389,8 +1576,10 @@ std::string one(const Inst& i) {
       // A mixed-precision instruction's sources are floats unless OP_SEL_HI
       // says half, so it writes the list only where some are halves.
       const bool mix = name.rfind("v_fma_mix", 0) == 0;
+      // gfx1250's matrix instructions use OP_SEL_HI for their formats, which are not written out here.
+      const bool matrix = g_cdna5 && (name.rfind("v_wmma_", 0) == 0 || name.rfind("v_swmmac_", 0) == 0);
       list("op_sel", i.op_sel & all, 0);
-      list("op_sel_hi", i.op_sel_hi & all, mix ? 0 : all);
+      if (!matrix) list("op_sel_hi", i.op_sel_hi & all, mix ? 0 : all);
       list("neg_lo", i.neg_lo & all, 0);
       list("neg_hi", i.neg_hi & all, 0);
       if (i.clamp) s += " clamp";
@@ -1430,6 +1619,15 @@ std::string one(const Inst& i) {
 std::string to_text(const Inst& i) {
   const Generation generation(i.arch);
   if (i.enc == Enc::Vopd && i.dual.size() == 2) return one(i.dual[0]) + " :: " + one(i.dual[1]);
+  if (i.enc == Enc::Mimg && i.name.rfind("tensor_", 0) == 0) {
+    std::string s = i.name;
+    std::string sep = " ";
+    for (const Operand& o : i.src) {
+      s += sep + op_text(o);
+      sep = ", ";
+    }
+    return s + gfx12_cache(i.name, i.cache) + (i.nv ? " nv" : "");
+  }
   if (i.enc == Enc::Mimg) return image_text(i);
   return one(i);
 }

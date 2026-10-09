@@ -51,7 +51,7 @@ nvidia/                       NVIDIA GPUs and CUDA
   src/       libvgpucuda (driver API), libcudart, NVML, CUPTI, NVENC, vendor libraries
   include/   vgpu_cuda.h — clean-room driver-API subset header (public ABI)
   profiles/  one YAML per GPU; id nvidia/<name>
-  third_party/  public cuDNN and NCCL headers
+  third_party/  public NCCL and NVENC headers (cuDNN's are fetched at configure time)
   tools/     nvidia-smi, nvcc, profile characterization and verification
   tests/     e2e/ conformance/ c_harness/
   docs/      cuBLAS, CUPTI, dark API, JIT, libraries, textures
