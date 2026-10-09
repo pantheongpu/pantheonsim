@@ -5,7 +5,9 @@
 // pictures and macroblock-adaptive frame/field frames). Written from ITU-T H.264
 // (03/2009) clauses 6 to 9 and nothing else. It is bit-exact by construction: H.264
 // defines the output sample for sample, and the card's NVDEC and FFmpeg's decoder
-// agree with it on every stream in nvidia/tests/data/h264.
+// agree with it on every stream in nvidia/tests/data/h264 (frame pictures, progressive
+// and macroblock-adaptive; no stream with field pictures has been available to check
+// that path).
 //
 // VirtualGPU's NVDEC (nvcuvid_api.cpp) calls decode_picture() once per
 // cuvidDecodePicture with the parameters the application's picture parameter

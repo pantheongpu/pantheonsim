@@ -9,6 +9,15 @@ int Dec::cabac_mb_skip() {
   return cab_.decision(base + inc);
 }
 
+// mb_field_decoding_flag (9.3.3.1.1.2): the context counts the neighbouring pairs, left and above, that are field pairs.
+int Dec::cabac_field_flag() {
+  const int pair = addr_ >> 1, px = pair % W_, py = pair / W_;
+  int inc = 0;
+  if (px > 0 && avail(2 * (pair - 1)) && mbi(2 * (pair - 1)).field) ++inc;
+  if (py > 0 && avail(2 * (pair - W_)) && mbi(2 * (pair - W_)).field) ++inc;
+  return cab_.decision(70 + inc);
+}
+
 // Intra macroblock types (Table 9-36) with the context offsets of I slices (3) or of the intra prefix in P (17) / B (32) slices.
 int Dec::cabac_mb_type_i(int base, bool intra_slice) {
   int ctx0 = base;

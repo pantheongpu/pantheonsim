@@ -21,10 +21,6 @@ bool Dec::run(const std::vector<SliceData>& slices, std::string* err) {
     *err = "bad picture size";
     return false;
   }
-  if (mbaff_) {
-    *err = "macroblock-adaptive frame/field pictures are not decoded yet";
-    return false;
-  }
   W_ = pp_.mbs_w;
   H_ = field_pic_ ? pp_.mbs_h / 2 : pp_.mbs_h;
   nmb_ = W_ * H_;
@@ -259,11 +255,10 @@ uint8_t* Dec::chroma_at(int plane, int addr, int x, int y) const {
 }
 
 // Prepares the macroblock at `addr` for decoding: its record, its place in the picture and its neighbours.
+// In a macroblock-adaptive frame, mb_field_ (the pair's field decoding flag) must be set first.
 void Dec::setup_mb(int addr) {
   addr_ = addr;
   mb_ = &pd_->mb[addr];
-  const bool keep_field = mbaff_ && mb_->slice == slice_id_;   // the second macroblock of a pair keeps the pair's field flag
-  const bool fld = mb_->field;
   *mb_ = MbInfo();
   mb_->slice = static_cast<int16_t>(slice_id_);
   if (!mbaff_) {
@@ -284,9 +279,37 @@ void Dec::setup_mb(int addr) {
     nb_d_ = (mby_ > 0 && mbx_ > 0 && avail(addr - W_ - 1)) ? addr - W_ - 1 : -1;
     return;
   }
-  (void)keep_field;
-  (void)fld;
-  // macroblock-adaptive frame/field: set by setup_mbaff_mb()
+  // macroblock-adaptive frame/field: the macroblocks of a pair are the top and bottom halves of a frame pair, or the
+  // top-field and bottom-field rows of a field pair (6.4.1)
+  const int pair = addr >> 1, bot = addr & 1;
+  mbx_ = pair % W_;
+  mby_ = pair / W_;
+  mb_->field = mb_field_;
+  pair_a_ = (mbx_ > 0 && avail(2 * (pair - 1))) ? 2 * (pair - 1) : -1;
+  pair_b_ = (mby_ > 0 && avail(2 * (pair - W_))) ? 2 * (pair - W_) : -1;
+  pair_c_ = (mby_ > 0 && mbx_ < W_ - 1 && avail(2 * (pair - W_ + 1))) ? 2 * (pair - W_ + 1) : -1;
+  pair_d_ = (mby_ > 0 && mbx_ > 0 && avail(2 * (pair - W_ - 1))) ? 2 * (pair - W_ - 1) : -1;
+  const int y0 = mb_field_ ? mby_ * 32 + bot : mby_ * 32 + bot * 16;
+  const int cy0 = mb_field_ ? mby_ * 16 + bot : mby_ * 16 + bot * 8;
+  ls_ = mb_field_ ? 2 * py_.stride : py_.stride;
+  lcs_ = mb_field_ ? 2 * pu_.stride : pu_.stride;
+  ly_ = py_.p + static_cast<ptrdiff_t>(y0) * py_.stride + mbx_ * 16;
+  lu_ = pu_.p + static_cast<ptrdiff_t>(cy0) * pu_.stride + mbx_ * 8;
+  lv_ = pv_.p + static_cast<ptrdiff_t>(cy0) * pv_.stride + mbx_ * 8;
+  org_x_ = mbx_ * 16;
+  org_y_ = mb_field_ ? mby_ * 16 : mby_ * 32 + bot * 16;
+  mbaddr_a_ = locate_l(-1, 0).addr;
+  mbaddr_b_ = locate_l(0, -1).addr;
+  nb_c_ = nb_d_ = -1;
+}
+
+// 7.4.4: a pair whose mb_field_decoding_flag is not (yet) known takes the flag of the pair to the left, else the pair above
+// (in the same slice), else it is a frame pair.
+bool Dec::infer_pair_field(int addr) const {
+  const int pair = addr >> 1, px = pair % W_, py = pair / W_;
+  if (px > 0 && avail(2 * (pair - 1))) return mbi(2 * (pair - 1)).field;
+  if (py > 0 && avail(2 * (pair - W_))) return mbi(2 * (pair - W_)).field;
+  return false;
 }
 
 // ---- reference picture lists (8.2.4) --------------------------------------------------------------------
@@ -614,7 +637,7 @@ void Dec::complete_mb() {
   finish_mb();
 #ifdef VGPU_H264_DEBUG
   if (std::getenv("VGPU_H264_TRACE")) {
-    std::fprintf(stderr, "mb %d %s kind %d t8 %d cbp %02x qp %d i16 %d chroma %d shape %d ref0 %d mv0 %d,%d ref1 %d mv1 %d,%d\n", addr_, mb_->intra ? "intra" : "inter", mb_->kind, mb_->t8x8, mb_->cbp, mb_->qp, i16_mode_,
+    std::fprintf(stderr, "mb %d f%d %s kind %d t8 %d cbp %02x qp %d i16 %d chroma %d shape %d ref0 %d mv0 %d,%d ref1 %d mv1 %d,%d\n", addr_, mb_field_ ? 1 : 0, mb_->intra ? "intra" : "inter", mb_->kind, mb_->t8x8, mb_->cbp, mb_->qp, i16_mode_,
                  mb_->chroma_mode, part_shape_, mb_->ref_idx[0][0], mb_->mv[0][0][0], mb_->mv[0][0][1], mb_->ref_idx[1][0], mb_->mv[1][0][0], mb_->mv[1][0][1]);
   }
 #endif
@@ -629,7 +652,7 @@ void Dec::complete_mb() {
 // P_Skip and B_Skip: motion inferred, no residual.
 void Dec::do_skip_mb() {
 #ifdef VGPU_H264_DEBUG
-  if (std::getenv("VGPU_H264_TRACE")) std::fprintf(stderr, "mb %d skip\n", addr_);
+  if (std::getenv("VGPU_H264_TRACE")) std::fprintf(stderr, "mb %d f%d skip\n", addr_, mb_field_ ? 1 : 0);
 #endif
   is_skip_ = true;
   mb_->skip = true;
@@ -653,13 +676,24 @@ void Dec::do_skip_mb() {
 }
 
 bool Dec::decode_skipped_mb(int addr, bool last_in_run) {
-  (void)last_in_run;
+  if (mbaff_) {
+    if ((addr & 1) == 0) {
+      pair_field_ = infer_pair_field(addr);
+      // a skipped top macroblock whose bottom macroblock is coded takes the flag the bottom one carries: it is the next bit
+      if (last_in_run && br_.more_rbsp_data()) pair_field_ = br_.peek(1) != 0;
+    }
+    mb_field_ = pair_field_;
+  }
   setup_mb(addr);
   do_skip_mb();
   return true;
 }
 
 bool Dec::decode_coded_mb(int addr) {
+  if (mbaff_) {
+    if ((addr & 1) == 0 || prev_mb_skipped_) pair_field_ = br_.u(1) != 0;   // mb_field_decoding_flag
+    mb_field_ = pair_field_;
+  }
   setup_mb(addr);
   if (!parse_macroblock()) return false;
   complete_mb();
@@ -667,18 +701,50 @@ bool Dec::decode_coded_mb(int addr) {
 }
 
 bool Dec::decode_mb_cabac(int addr, bool* skipped, bool* more) {
+  const bool top = (addr & 1) == 0;
+  if (mbaff_) {
+    if (top) {
+      pair_field_ = infer_pair_field(addr);
+      next_skip_known_ = false;
+    }
+    mb_field_ = pair_field_;
+  }
   setup_mb(addr);
   bool skip = false;
-  if (!sh_.is_intra()) skip = cabac_mb_skip() != 0;
+  bool field_flag_read = false;   // the pair's mb_field_decoding_flag has been read (with the top macroblock skipped)
+  if (!sh_.is_intra()) {
+    if (mbaff_ && !top && next_skip_known_) skip = next_skip_;
+    else skip = cabac_mb_skip() != 0;
+  }
+  if (skip && mbaff_ && top) {
+    // The bottom macroblock's mb_skip_flag, and its mb_field_decoding_flag if it is coded, come next in the stream; the
+    // top macroblock needs them: a skipped macroblock of a field pair is predicted as a field macroblock.
+    mb_->skip = true;
+    setup_mb(addr + 1);
+    next_skip_ = cabac_mb_skip() != 0;
+    next_skip_known_ = true;
+    if (!next_skip_) {
+      pair_field_ = cabac_field_flag() != 0;
+      field_flag_read = true;
+    }
+    mb_field_ = pair_field_;
+    setup_mb(addr);
+  }
   if (skip) {
     do_skip_mb();
   } else {
+    if (mbaff_ && top) {
+      pair_field_ = cabac_field_flag() != 0;
+      mb_field_ = pair_field_;
+      setup_mb(addr);
+    }
+    (void)field_flag_read;
     if (!parse_macroblock()) return false;
     complete_mb();
   }
   *skipped = skip;
   prev_mb_skipped_ = skip;
-  if (mbaff_ && (addr & 1) == 0) {
+  if (mbaff_ && top) {
     *more = true;
   } else {
     *more = cab_.terminate() == 0;

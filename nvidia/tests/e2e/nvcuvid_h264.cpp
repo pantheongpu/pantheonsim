@@ -517,9 +517,19 @@ int main(int argc, char** argv) {
   static const char* const names[] = {"idr_mid",  "sps_novui",   "sps_notiming", "sps_norestr", "sps_level40",    "sps_mdfb1",    "sps_reorder1", "sps_p_novui", "i_cavlc",
                                       "p_cavlc",  "p_cabac",     "b_spatial",    "b_temporal",  "b_cavlc",       "high_8x8",     "high_cqm",     "high_cavlc_8x8", "weightp",
                                       "lowqp",    "lowqp_cavlc", "highqp",       "mbaff",       "mbaff_cavlc",   "multislice_b", "long_gop",     "deblock_off", "deblock_strong",
-                                      "p_ref1",   "p_ref2",      "p_ref4",       "p_ref6",      "b_ref2",        "b_ref3"};
+                                      "p_ref1",   "p_ref2",      "p_ref4",       "p_ref6",      "b_ref2",        "b_ref3",
+                                      "mbaff_field", "mbaff_field_cavlc", "mbaff_field_intra", "mbaff_field_temporal", "mbaff_field_spatial",
+                                      "mbaff_field_wp", "mbaff_field_slices", "mbaff_field_bff",
+                                      "p_sei",    "b_sei",       "p_aud",        "p_ps_mid"};
   const Mode plain{"packets"};
   auto load = [&](const char* n) { return slurp(base + "/h264/" + n + ".h264"); };
+  if (!only.empty() && std::find_if(std::begin(names), std::end(names), [&](const char* n) { return only == n; }) == std::end(names)) {
+    // a stream that is not in the list (for probing the card with a new file): played as it is
+    const std::vector<uint8_t> data = load(only.c_str());
+    if (data.empty()) std::printf("FAIL: %s/h264/%s.h264 is missing\n", base.c_str(), only.c_str());
+    else play(only, data, plain);
+    return 0;
+  }
   for (const char* n : names) {
     if (!only.empty() && only != n) continue;
     if (("," + skip + ",").find(std::string(",") + n + ",") != std::string::npos) continue;
@@ -588,6 +598,7 @@ int main(int argc, char** argv) {
     stream("b_ref3", Mode{"delay1", true, 1});
     // Display area and target size: a crop that fills the target is exact, a rescale is close to the card's.
     stream("odd_size", Mode{"cropped", true, 0, true});
+    stream("mbaff_field_crop", Mode{"cropped", true, 0, true});   // a cropped interlaced picture: the surface is the display rectangle
     {
       Mode m{"scaled", true};
       m.scaled = true;

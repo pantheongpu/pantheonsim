@@ -54,7 +54,8 @@ struct Expect {
   uint32_t crc = 0;
 };
 
-// stream name -> frames the card displayed, from the "[packets]" sections of the transcript.
+// stream name -> frames the card displayed, from the "[packets]" and "[cropped]" sections of the transcript (the other sections
+// play a stream with the card's scaler or in other ways, and have no checksum or are the same pictures).
 std::map<std::string, std::vector<Expect>> read_golden(const std::string& path) {
   std::map<std::string, std::vector<Expect>> out;
   std::ifstream f(path);
@@ -65,7 +66,7 @@ std::map<std::string, std::vector<Expect>> read_golden(const std::string& path) 
       std::istringstream ss(line.substr(7));
       std::string name, mode;
       ss >> name >> mode;
-      keep = mode == "[packets]";
+      keep = mode == "[packets]" || (mode == "[cropped]" && !out.count(name));
       cur = name;
       if (keep) out[cur];
       continue;
@@ -85,7 +86,6 @@ VTEST(every_stream_decodes_to_the_frames_the_cards_nvdec_displayed) {
   VCHECK(golden.size() > 20);
   int checked = 0;
   for (const auto& kv : golden) {
-    if (kv.first.rfind("mbaff", 0) == 0) continue;   // macroblock-adaptive frame/field coding is not decoded yet
     const std::vector<uint8_t> data = slurp(src + "/nvidia/tests/data/h264/" + kv.first + ".h264");
     VCHECK(!data.empty());
     std::vector<vgpu_h264::OutFrame> frames;

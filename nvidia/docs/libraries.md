@@ -270,14 +270,16 @@ CAVLC or CABAC, I, P and B slices, 4x4 and 8x8 transforms, scaling matrices,
 explicit and implicit weighted prediction, spatial and temporal direct prediction,
 multiple slices and references, long-term references, every deblocking setting,
 odd sizes with cropping, all decode to the checksums of the card's NVDEC
-(`nvidia/tests/data/h264`: 33 streams in 85 parser-driving runs; the card's
+(`nvidia/tests/data/h264`: 46 streams in 98 parser-driving runs; the card's
 transcript is `nvcuvid_h264.rtx3060.txt`, 12 991 lines, and holds the CRC-32 of
 every displayed frame, with `run_nvcuvid_h264.sh --card` running the same program
 against the driver). The parser reproduces what the card's does and the Recommendation
 leaves open: when a picture is complete, the number of decode surfaces it asks for,
 the picture indices handed out, the reference slots of every picture, display order,
 display delay, and timestamps (given, derived and absent); the rules were fitted to
-the card's callbacks. Where the fit is approximate it is
+the card's callbacks, including what does and does not complete a picture (a slice of the next one, an access unit
+delimiter or an end of sequence do; SEI messages and parameter sets, repeated or changed, do not -- streams carrying one
+before every slice are among the fixtures). Where the fit is approximate it is
 listed in the test: with `ulMaxDisplayDelay` above one on a stream with B pictures, and
 around IDR pictures, the interleaving of display callbacks with later decode callbacks
 is the card's only to within one picture. A rescaled surface (a target size that
@@ -286,9 +288,13 @@ area-averaging to shrink by more than half, compared with the card's pixels to w
 one level. The capability answer is the card's: H.264 4:2:0 8-bit, 48x16 to 4096x4096,
 and 4:0:0, 4:2:2, 4:4:4 and every deeper bit depth are reported unsupported;
 `cuvidCreateDecoder` refuses them as the card does (`CUDA_ERROR_NOT_SUPPORTED`),
-as it does the `H264_SVC` codec type. Not decoded: macroblock-adaptive frame/field
-frames and PAFF (field) pictures, flexible macroblock ordering, redundant
-pictures, SP/SI slices. Pictures that cannot be decoded report
+as it does the `H264_SVC` codec type. Macroblock-adaptive frame/field frames (MBAFF) are decoded, field and frame pairs mixed,
+with the deblocking filter's mixed edges (`mbaff_field*` in `nvidia/tests/data/h264`: interlaced test content coded with half
+or more of its macroblocks as field pairs, in CABAC and CAVLC, with P, B (spatial and temporal direct), weighted prediction,
+several slices and cropping, all equal to the card's frames and to ffmpeg's). Field pictures (PAFF) are decoded by the same
+code but no stream with field pictures is among the fixtures (the only encoder here that writes them is none: x264 writes
+MBAFF, and the card's NVENC refuses field encoding), so that path has not been checked against the card or ffmpeg. Not decoded:
+flexible macroblock ordering, redundant pictures, SP/SI slices, data partitioning. Pictures that cannot be decoded report
 `CUDA_ERROR_INVALID_IMAGE` from `cuvidDecodePicture`; damaged streams never crash
 (`test_h264_decode` flips bits in streams under ASan and UBSan). Every other codec
 reports `bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser`

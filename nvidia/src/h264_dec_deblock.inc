@@ -54,27 +54,23 @@ void filter_line(uint8_t* q0p, int step, int bs, int alpha, int beta, int tc0, b
 
 }  // namespace
 
-// Boundary strength between the 4x4 block bp of macroblock p and the block bq of macroblock q (8.7.2.1) for
-// non-MBAFF pictures.
-static int boundary_strength(const MbInfo& p, int bp, const MbInfo& q, int bq, bool mb_edge, bool vertical, bool field_pic) {
-  if (p.intra || q.intra) {
-    if (mb_edge && (!field_pic || vertical)) return 4;
-    return 3;
+// Whether the 4x4 block b of a macroblock has non-zero coefficients (for transform size 8, the 8x8 block containing it).
+static bool block_has_coefficients(const MbInfo& m, int b) {
+  if (m.t8x8) {
+    const int x0 = (b & 3) & ~1, y0 = (b >> 2) & ~1;
+    return (m.nz[0][y0 * 4 + x0] | m.nz[0][y0 * 4 + x0 + 1] | m.nz[0][(y0 + 1) * 4 + x0] | m.nz[0][(y0 + 1) * 4 + x0 + 1]) != 0;
   }
-  auto nonzero = [](const MbInfo& m, int b) {
-    if (m.t8x8) {
-      const int x0 = (b & 3) & ~1, y0 = (b >> 2) & ~1;
-      return (m.nz[0][y0 * 4 + x0] | m.nz[0][y0 * 4 + x0 + 1] | m.nz[0][(y0 + 1) * 4 + x0] | m.nz[0][(y0 + 1) * 4 + x0 + 1]) != 0;
-    }
-    return m.nz[0][b] != 0;
-  };
-  if (nonzero(p, bp) || nonzero(q, bq)) return 2;
+  return m.nz[0][b] != 0;
+}
+
+// The motion part of the boundary strength (8.7.2.1, bS 1 or 0) between two blocks of macroblocks of the same kind (both frame or both
+// field). `lim_y` is the vertical motion vector difference that counts, in the units of the macroblocks' vectors.
+static int motion_strength(const MbInfo& p, int bp, const MbInfo& q, int bq, int lim_y) {
   const int b8p = ((bp >> 2) >> 1) * 2 + ((bp & 3) >> 1), b8q = ((bq >> 2) >> 1) * 2 + ((bq & 3) >> 1);
   const int rp0 = p.ref_idx[0][b8p] >= 0 ? p.ref_id[0][b8p] : -1, rp1 = p.ref_idx[1][b8p] >= 0 ? p.ref_id[1][b8p] : -1;
   const int rq0 = q.ref_idx[0][b8q] >= 0 ? q.ref_id[0][b8q] : -1, rq1 = q.ref_idx[1][b8q] >= 0 ? q.ref_id[1][b8q] : -1;
   const int np = (p.ref_idx[0][b8p] >= 0) + (p.ref_idx[1][b8p] >= 0), nq = (q.ref_idx[0][b8q] >= 0) + (q.ref_idx[1][b8q] >= 0);
   if (np != nq) return 1;
-  const int lim_y = field_pic ? 2 : 4;
   auto far = [&](const int16_t* a, const int16_t* b) { return std::abs(a[0] - b[0]) >= 4 || std::abs(a[1] - b[1]) >= lim_y; };
   if (np == 1) {
     const int lp = p.ref_idx[0][b8p] >= 0 ? 0 : 1, lq = q.ref_idx[0][b8q] >= 0 ? 0 : 1;
@@ -91,6 +87,29 @@ static int boundary_strength(const MbInfo& p, int bp, const MbInfo& q, int bq, b
   const bool straight = far(p.mv[0][bp], q.mv[0][bq]) || far(p.mv[1][bp], q.mv[1][bq]);
   const bool cross = far(p.mv[0][bp], q.mv[1][bq]) || far(p.mv[1][bp], q.mv[0][bq]);
   return (straight && cross) ? 1 : 0;
+}
+
+// Boundary strength between the 4x4 block bp of macroblock p and the block bq of macroblock q (8.7.2.1) for
+// non-MBAFF pictures.
+static int boundary_strength(const MbInfo& p, int bp, const MbInfo& q, int bq, bool mb_edge, bool vertical, bool field_pic) {
+  if (p.intra || q.intra) {
+    if (mb_edge && (!field_pic || vertical)) return 4;
+    return 3;
+  }
+  if (block_has_coefficients(p, bp) || block_has_coefficients(q, bq)) return 2;
+  return motion_strength(p, bp, q, bq, field_pic ? 2 : 4);
+}
+
+// The same for macroblock-adaptive frames, where field and frame macroblocks meet. `mixed` is mixedModeEdgeFlag: the two
+// macroblocks are in different pairs, one a field pair and one a frame pair.
+static int boundary_strength_mbaff(const MbInfo& p, int bp, const MbInfo& q, int bq, bool mb_edge, bool vertical, bool mixed) {
+  if (p.intra || q.intra) {
+    if (mb_edge && ((!p.field && !q.field) || vertical)) return 4;
+    return 3;
+  }
+  if (block_has_coefficients(p, bp) || block_has_coefficients(q, bq)) return 2;
+  if (mixed) return 1;
+  return motion_strength(p, bp, q, bq, q.field ? 2 : 4);
 }
 
 void Dec::deblock_picture() {
@@ -197,4 +216,131 @@ void Dec::deblock_mb(int addr) {
   }
 }
 
-void Dec::deblock_mb_mbaff(int addr) { (void)addr; }
+// Deblocking of a macroblock of a macroblock-adaptive frame (8.7 with MbaffFrameFlag = 1). Field macroblocks filter along their
+// own rows (every other row of the frame); the left edge meets a pair of the other kind row by row, and the top edge of a frame
+// macroblock under a field pair is filtered twice, once per field.
+void Dec::deblock_mb_mbaff(int addr) {
+  const MbInfo& q = pd_->mb[addr];
+  const SliceParams& sp = pd_->slices[q.slice];
+  const int pair = addr >> 1, px = pair % W_, py = pair / W_, bot = addr & 1;
+  const bool fld = q.field;
+  const int dy = fld ? 2 : 1;
+  const int ls = py_.stride, cs = pu_.stride;
+  const int yI = fld ? py * 32 + bot : py * 32 + bot * 16;
+  const int yC = (yI + 1) / 2;
+  uint8_t* ly = py_.p + static_cast<ptrdiff_t>(yI) * ls + px * 16;
+  uint8_t* cb[2] = {pu_.p + static_cast<ptrdiff_t>(yC) * cs + px * 8, pv_.p + static_cast<ptrdiff_t>(yC) * cs + px * 8};
+  const ptrdiff_t lrow = static_cast<ptrdiff_t>(dy) * ls, crow = static_cast<ptrdiff_t>(dy) * cs;   // distance between the rows of this macroblock
+  const bool t8 = q.t8x8;
+  auto thresholds = [&](int qp_p, int qp_q, int* alpha, int* beta, int* indexa) {
+    const int qpav = (qp_p + qp_q + 1) >> 1;
+    const int ia = clip3(0, 51, qpav + sp.alpha_off), ib = clip3(0, 51, qpav + sp.beta_off);
+    *alpha = kAlpha[ia];
+    *beta = kBeta[ib];
+    *indexa = ia;
+  };
+  auto line = [&](uint8_t* q0, ptrdiff_t step, int bs, int qp_p, int qp_q, bool chroma) {
+    if (!bs) return;
+    int alpha, beta, ia;
+    thresholds(qp_p, qp_q, &alpha, &beta, &ia);
+    if (alpha == 0 || beta == 0) return;
+    filter_line(q0, static_cast<int>(step), bs, alpha, beta, bs < 4 ? kTc0[bs - 1][ia] : 0, chroma);
+  };
+  const int above_top = 2 * (pair - W_);   // the pair above (its top macroblock)
+  const int left_top = 2 * (pair - 1);
+  // which edges are filtered (8.7, steps 2c and 2d)
+  bool left_edge = px > 0;
+  if (left_edge && sp.disable_idc == 2 && pd_->mb[left_top].slice != q.slice) left_edge = false;
+  bool top_edge = py > 0 || (!fld && bot == 1);
+  if (top_edge && sp.disable_idc == 2 && !(!fld && bot == 1) && pd_->mb[above_top].slice != q.slice) top_edge = false;
+
+  // ---- the left edge: row k of this macroblock meets the row of the left pair at the same height
+  const MbInfo* left_mb[16];
+  int left_row[16];
+  int cleft_idx[8];   // the left macroblock (0 top, 1 bottom) of each chroma row
+  bool left_field = false;
+  if (left_edge) {
+    left_field = pd_->mb[left_top].field;
+    for (int k = 0; k < 16; ++k) {
+      const int rel = fld ? bot + 2 * k : bot * 16 + k;
+      const int m = left_field ? (rel & 1) : (rel >= 16 ? 1 : 0);
+      left_mb[k] = &pd_->mb[left_top + m];
+      left_row[k] = left_field ? rel >> 1 : rel & 15;
+    }
+    for (int k = 0; k < 8; ++k) {
+      const int rel = fld ? bot + 2 * k : bot * 8 + k;
+      cleft_idx[k] = left_field ? (rel & 1) : (rel >= 8 ? 1 : 0);
+    }
+  }
+  const bool mixed_left = left_edge && left_field != fld;
+
+  // ---- vertical luma edges
+  int bsv[4][16] = {};
+  for (int e = 0; e < 4; ++e) {
+    if (e == 0 && !left_edge) continue;
+    if (e > 0 && t8 && (e & 1)) continue;
+    for (int k = 0; k < 16; ++k) {
+      int bs, qp_p;
+      if (e == 0) {
+        bs = boundary_strength_mbaff(*left_mb[k], (left_row[k] >> 2) * 4 + 3, q, (k >> 2) * 4, true, true, mixed_left);
+        qp_p = left_mb[k]->qp;
+      } else {
+        bs = boundary_strength_mbaff(q, (k >> 2) * 4 + e - 1, q, (k >> 2) * 4 + e, false, true, false);
+        qp_p = q.qp;
+      }
+      bsv[e][k] = bs;
+      line(ly + k * lrow + 4 * e, 1, bs, qp_p, q.qp, false);
+    }
+  }
+
+  // ---- horizontal luma edges
+  // The top edge: one pass, or two (the field passes of a frame macroblock under a field pair).
+  struct TopPass {
+    const MbInfo* p;
+    ptrdiff_t q0_row;     // offset of the q0 row from the first row of the macroblock, in picture rows
+    ptrdiff_t step;       // picture rows between successive samples across the edge
+    bool mixed;
+    int bs[4];
+  } passes[2];
+  int npass = 0;
+  if (top_edge) {
+    if (!fld && bot == 0 && py > 0 && pd_->mb[above_top].field) {
+      for (int pass = 0; pass < 2; ++pass) passes[npass++] = {&pd_->mb[above_top + pass], pass, 2, true, {0, 0, 0, 0}};
+    } else if (fld) {
+      const MbInfo& ab = pd_->mb[above_top];
+      passes[npass++] = {ab.field ? &pd_->mb[above_top + bot] : &pd_->mb[above_top + 1], 0, 2, !ab.field, {0, 0, 0, 0}};
+    } else if (bot == 1) {
+      passes[npass++] = {&pd_->mb[addr - 1], 0, 1, false, {0, 0, 0, 0}};
+    } else {
+      passes[npass++] = {&pd_->mb[above_top + 1], 0, 1, false, {0, 0, 0, 0}};
+    }
+    for (int i = 0; i < npass; ++i) {
+      TopPass& tp = passes[i];
+      for (int xb = 0; xb < 4; ++xb) tp.bs[xb] = boundary_strength_mbaff(*tp.p, 12 + xb, q, xb, true, false, tp.mixed);
+      for (int x = 0; x < 16; ++x) line(ly + tp.q0_row * ls + x, tp.step * ls, tp.bs[x >> 2], tp.p->qp, q.qp, false);
+    }
+  }
+  int bsh[4][4] = {};
+  for (int e = 1; e < 4; ++e) {
+    if (t8 && (e & 1)) continue;
+    for (int xb = 0; xb < 4; ++xb) bsh[e][xb] = boundary_strength_mbaff(q, (e - 1) * 4 + xb, q, e * 4 + xb, false, false, false);
+    for (int x = 0; x < 16; ++x) line(ly + 4 * e * lrow + x, lrow, bsh[e][x >> 2], q.qp, q.qp, false);
+  }
+
+  // ---- chroma (4:2:0): the luma edges 0 and 2, the strengths of the luma samples at twice the chroma coordinates in the same field
+  for (int c = 0; c < 2; ++c) {
+    for (int ce = 0; ce < 2; ++ce) {
+      if (ce == 0 && !left_edge) continue;
+      for (int kc = 0; kc < 8; ++kc) {
+        const int lk = fld ? 2 * kc : 4 * (kc >> 1) + (kc & 1);
+        const int qp_p = ce == 0 ? pd_->mb[left_top + cleft_idx[kc]].qpc[c] : q.qpc[c];
+        line(cb[c] + kc * crow + 4 * ce, 1, bsv[2 * ce][lk], qp_p, q.qpc[c], true);
+      }
+    }
+    for (int i = 0; i < npass; ++i) {
+      const TopPass& tp = passes[i];
+      for (int xc = 0; xc < 8; ++xc) line(cb[c] + tp.q0_row * cs + xc, tp.step * cs, tp.bs[xc >> 1], tp.p->qpc[c], q.qpc[c], true);
+    }
+    for (int xc = 0; xc < 8; ++xc) line(cb[c] + 4 * crow + xc, crow, bsh[2][xc >> 1], q.qpc[c], q.qpc[c], true);
+  }
+}

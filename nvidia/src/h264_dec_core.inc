@@ -55,6 +55,8 @@ class Dec {
   int org_x_ = 0, org_y_ = 0;          // luma position of the macroblock in the (field or frame) reference geometry
   int mbaddr_a_ = -1, mbaddr_b_ = -1, nb_c_ = -1, nb_d_ = -1;   // neighbouring macroblocks (6.4.10)
   int pair_a_ = -1, pair_b_ = -1, pair_c_ = -1, pair_d_ = -1;   // MBAFF: top macroblock of the neighbouring pairs
+  bool pair_field_ = false;            // MBAFF: mb_field_decoding_flag of the current macroblock pair (inferred until it is read)
+  bool next_skip_known_ = false, next_skip_ = false;   // MBAFF, CABAC: the bottom macroblock's mb_skip_flag, read ahead
 
   // syntax of the current macroblock
   int mb_type_ = 0;
@@ -99,6 +101,8 @@ class Dec {
   int cabac_mb_type();
   int cabac_sub_mb_type();
   int cabac_mb_skip();
+  int cabac_field_flag();
+  bool infer_pair_field(int addr) const;
   int cabac_ref_idx(int list, int b8);
   int cabac_mvd(int list, int comp, int blk4);
   int cabac_cbp();

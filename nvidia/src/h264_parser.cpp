@@ -51,6 +51,14 @@ long max_dpb_mbs(int level_idc, int constraint_flags) {
 }
 
 int dpb_frames_of(const Sps& s) {
+  // The intra profiles (High, High 10, High 4:2:2 and High 4:4:4 Predictive with constraint_set3_flag, CAVLC 4:4:4 Intra, ...) hold no
+  // pictures back: max_dec_frame_buffering is inferred to be 0 (E.2.1) -- measured: the card asks for one decode surface.
+  switch (s.profile_idc) {
+    case 44: case 86: case 100: case 110: case 122: case 244:
+      if (s.constraint_flags & 0x10) return 0;
+      break;
+    default: break;
+  }
   const long per = max_dpb_mbs(s.level_idc, s.constraint_flags) / std::max(1, s.width_mbs * s.frame_height_mbs());
   return static_cast<int>(std::min<long>(per, 16));
 }
@@ -285,12 +293,13 @@ struct H264Parser::Impl {
       case 5:
         consume_slice(nal, n, n_raw, abs_offset);
         break;
+      // Parameter sets and SEI messages do not complete the picture before them -- the card's parser finishes a picture
+      // only when it reads the first slice of the next one, or an access unit delimiter or end of sequence (measured with
+      // streams that repeat or change the parameter sets and carry an SEI message before every slice).
       case 6:
-        finish_picture();
         parse_sei(nal, n);
         break;
       case 7: {
-        finish_picture();
         std::vector<uint8_t> rb = unescape(nal, n, 1);
         auto s = std::make_shared<Sps>();
         if (!parse_sps(rb.data(), rb.size(), s.get())) break;
@@ -302,7 +311,6 @@ struct H264Parser::Impl {
         break;
       }
       case 8: {
-        finish_picture();
         std::vector<uint8_t> rb = unescape(nal, n, 1);
         auto p = std::make_shared<Pps>();
         std::vector<const Sps*> by_id(32, nullptr);

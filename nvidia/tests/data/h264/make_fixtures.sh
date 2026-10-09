@@ -34,6 +34,23 @@ gen long_gop       64x48   40 high     "cabac=1:bframes=2:ref=5:keyint=40:b-adap
 gen deblock_off    64x48   6  main     "cabac=1:bframes=1:deblock=-1,-1"
 gen deblock_strong 64x48   6  main     "cabac=1:bframes=1:deblock=6,6"
 
+# Interlaced content, MBAFF coding with many field macroblock pairs: two instants of the moving test pattern woven into one frame
+# (tinterlace), so that the pairs the encoder codes as field pairs are the ones where the instants differ.
+gen_il() {   # name size rate frames profile x264-params
+  local name=$1 size=$2 rate=$3 frames=$4 profile=$5 params=$6
+  ffmpeg -nostdin -v error -y -f lavfi -i "testsrc2=size=$size:rate=$rate,noise=alls=${NOISE:-4}:allf=t,tinterlace=mode=interleave_top,format=yuv420p" -frames:v "$frames" \
+    -c:v libx264 -profile:v "$profile" -x264-params "$params:threads=1:sliced-threads=0:aud=0" -bsf:v h264_mp4toannexb -f h264 "$name.h264"
+}
+gen_il mbaff_field          128x96 8 6  high "cabac=1:8x8dct=1:bframes=2:tff=1:keyint=30"
+gen_il mbaff_field_cavlc    128x96 8 6  main "cabac=0:bframes=2:tff=1:keyint=30"
+gen_il mbaff_field_intra    128x96 8 3  high "cabac=1:8x8dct=1:keyint=1:tff=1"
+gen_il mbaff_field_temporal 128x96 8 6  main "cabac=1:bframes=3:direct=temporal:weightb=0:tff=1:b-pyramid=normal:ref=4:keyint=30"
+gen_il mbaff_field_spatial  128x96 8 6  main "cabac=1:bframes=3:direct=spatial:weightb=1:tff=1:b-pyramid=strict:ref=3:keyint=30"
+gen_il mbaff_field_wp       128x96 8 6  main "cabac=1:bframes=0:weightp=2:tff=1:ref=2:keyint=30"
+gen_il mbaff_field_slices   128x96 8 6  high "cabac=1:8x8dct=1:bframes=2:tff=1:slices=3:keyint=30"
+gen_il mbaff_field_bff      128x96 8 6  high "cabac=1:8x8dct=1:bframes=2:bff=1:keyint=30"
+gen_il mbaff_field_crop     100x60 8 6 high "cabac=1:8x8dct=1:bframes=2:tff=1:keyint=30"
+
 # A stream with several IDR pictures and B pictures around them.
 gen idr_mid 64x48 20 main "cabac=1:bframes=2:ref=3:keyint=7:min-keyint=7:scenecut=0"
 # The same stream with its sequence parameter set rewritten (sps_edit.py): no VUI at all, a VUI without timing
@@ -46,3 +63,8 @@ python3 sps_edit.py p_cavlc.h264 sps_p_novui.h264 vui=none
 # streams for the display-delay measurements: no reordering with 1, 2, 4 and 6 reference pictures; two B-picture streams
 for r in 1 2 4 6; do gen p_ref$r 64x48 14 main "cabac=1:bframes=0:ref=$r:keyint=100"; done
 for r in 2 3; do gen b_ref$r 64x48 14 main "cabac=1:bframes=2:b-pyramid=none:ref=$r:keyint=100"; done
+
+# Streams with extra NAL units, written with a few lines of Python from p_cabac / b_spatial (see make_nal_variants.py): an SEI
+# message before every slice, an access unit delimiter before every slice, and the parameter sets (changed and unchanged) repeated
+# before one of the last slices. The card's parser must give the same callbacks as for the plain streams.
+python3 make_nal_variants.py

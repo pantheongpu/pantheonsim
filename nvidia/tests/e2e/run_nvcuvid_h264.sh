@@ -13,8 +13,7 @@
 #           the golden file
 # --update  with --card, rewrite the golden file and the pixel files of the rescaled
 #           streams from the card
-# VGPU_H264_SKIP=a,b   streams the simulator does not decode yet (sections of the golden
-#           file and of the output are left out of the comparison)
+# VGPU_H264_SKIP=a,b   streams to leave out (sections of the golden file and of the output are not compared); none by default
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -25,7 +24,7 @@ data="$root/nvidia/tests/data"
 inc="$root/nvidia/third_party/nvdec_include"
 out="${TMPDIR:-/tmp}/vgpu_e2e_nvcuvid_h264_$$"
 mode=sim update=0
-skip="${VGPU_H264_SKIP:-mbaff,mbaff_cavlc}"
+skip="${VGPU_H264_SKIP:-}"
 for a in "$@"; do
   case "$a" in
     --card) mode=card; skip="" ;;
