@@ -113,6 +113,17 @@ if [[ "$probe" == ptx120 ]]; then
 fi
 
 out="${TMPDIR:-/tmp}/vgpu_lowprec_${probe}_$$"
+
+# compare <expected> <actual>: the lines of <actual> for the cases <expected> lists (the lt and sparselt probes name
+# each case in its first field; a case added since a transcript was taken is not compared on that profile), then diff.
+compare() {
+  case "$probe" in
+    lt|sparselt)
+      awk 'NR==FNR { if ($0 !~ /^#/) want[$1] = 1; next } /^#/ { next } ($1 in want)' "$1" "$2" > "$out.filtered" || return 2
+      diff <(grep -v '^#' "$1") "$out.filtered" ;;
+    *) diff <(grep -v '^#' "$1") <(grep -v '^#' "$2") ;;
+  esac
+}
 trap 'rm -f "$out" "$out".*' EXIT
 
 if (( card )); then
@@ -128,14 +139,14 @@ if (( card )); then
   for l in "${libs[@]}"; do links+=("-l$l"); done
   nvcc -std=c++17 -cudart shared -arch="${LOWPREC_ARCH:-native}" -Wno-deprecated-gpu-targets "${inc[@]}" \
        "$src" -o "$out" -L"$libdir" "${links[@]}" ${VGPU_LOWPREC_EXTRA_LIBS:-}
-  LD_LIBRARY_PATH="$libdir" "$out" "${pargs[@]}" > "$out.card.txt"
+  LD_LIBRARY_PATH="$libdir:$cuda_root/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$out" "${pargs[@]}" > "$out.card.txt"
   if (( update )); then
     mkdir -p "$data"
     cp "$out.card.txt" "$data/$probe.$slug.txt"
     echo "wrote $data/$probe.$slug.txt"
     exit 0
   fi
-  diff <(grep -v '^#' "$data/$probe.$slug.txt") <(grep -v '^#' "$out.card.txt") >"$out.diff.txt" && { echo "PASS (card $slug)"; exit 0; }
+  compare "$data/$probe.$slug.txt" "$out.card.txt" >"$out.diff.txt" && { echo "PASS (card $slug)"; exit 0; }
   head -20 "$out.diff.txt"; echo "FAIL: the card disagrees with $data/$probe.$slug.txt"; exit 1
 fi
 
@@ -176,7 +187,7 @@ for slug in "${slugs[@]}"; do
   rc=$?
   set -e
   if [[ $rc != 0 ]]; then echo "FAIL $slug: exit $rc"; tail -5 "$out.$slug.err"; fails=1; continue; fi
-  if diff <(grep -v '^#' "$expected") <(grep -v '^#' "$out.$slug.txt") > "$out.$slug.diff"; then
+  if compare "$expected" "$out.$slug.txt" > "$out.$slug.diff"; then
     echo "ok   $slug ($(grep -vc '^#' "$expected") lines)"
   else
     echo "FAIL $slug: differs from the card's transcript ($(grep -c '^[<>]' "$out.$slug.diff") lines differ)"

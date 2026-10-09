@@ -301,6 +301,8 @@ fp8dims/TN_64x64x24 h=15:0 m=15
 fp8dims/TN_e4m3out_64x64x24 h=15:0 m=15
 fp8dims/TN_64x64x40 h=15:0 m=15
 fp8dims/TN_e4m3out_64x64x40 h=15:0 m=15
+fp8dims/TN_512x256x512 h=15:0 m=15
+fp8dims/TN_e4m3out_512x256x512 h=15:0 m=15
 fp8scales/sc_sc_dbf16 h=15:0 m=15
 fp8scales/NN_sc_sc_dbf16 h=15:0 m=15
 fp8scales/sc_sc_de4m3 h=15:0 m=15
@@ -373,6 +375,35 @@ fp8compute/32F_FAST_TF32 h=15:0 m=15
 fp8compute/scale_f16 h=7:0 m=7
 fp8compute/scale_bf16 h=7:0 m=7
 fp8compute/64F h=15:0 m=15
+plainscales/f16_none h=0:1 m=0 d=fe6ae1bce5dd289a
+plainscales/f16_a h=7:0 m=7
+plainscales/f16_ab h=7:0 m=7
+plainscales/f16_d h=7:0 m=7
+plainscales/f16_amax h=7:0 m=7
+plainscales/f16_c_beta1 h=7:0 m=7
+plainscales/f16_aux_scale h=7:0 m=7
+plainscales/f16_aux_amax h=7:0 m=7
+plainscales/f16_outer h=7:0 m=7
+plainscales/bf16_none h=0:1 m=0 d=e025c7e5013497eb
+plainscales/bf16_a h=7:0 m=7
+plainscales/bf16_ab h=7:0 m=7
+plainscales/bf16_d h=7:0 m=7
+plainscales/bf16_amax h=7:0 m=7
+plainscales/bf16_c_beta1 h=7:0 m=7
+plainscales/bf16_aux_scale h=7:0 m=7
+plainscales/bf16_aux_amax h=7:0 m=7
+plainscales/bf16_outer h=7:0 m=7
+plainscales/f32_none h=0:1 m=0 d=7f87fe00e6bfc44f
+plainscales/f32_a h=7:0 m=7
+plainscales/f32_ab h=7:0 m=7
+plainscales/f32_d h=7:0 m=7
+plainscales/f32_amax h=7:0 m=7
+plainscales/f32_c_beta1 h=7:0 m=7
+plainscales/f32_aux_scale h=7:0 m=7
+plainscales/f32_aux_amax h=7:0 m=7
+plainscales/f32_outer h=7:0 m=7
+plainscales/i8_none h=0:1 m=0 d=264e5872272532d1
+plainscales/i8_a h=7:0 m=7
 fp8epi/default_dbf16 h=15:0 m=15
 fp8epi/relu_dbf16 h=15:0 m=15
 fp8epi/relu_aux_dbf16 h=15:0 m=15
@@ -1247,5 +1278,5 @@ bscompute/fast_tf32 h=15:0 m=15
 bscompute/scale_f16 h=7:0 m=7
 bscompute/alpha_half h=15:0 m=15
 bscompute/device_alpha h=15:0 m=15
-# 1247 cases
+# 1278 cases
 PASS
