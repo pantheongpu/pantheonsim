@@ -350,7 +350,11 @@ VTEST(shared_memory_banks_are_four_bytes_wide) {
   VCHECK_EQ(cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte), cudaSuccess);   // accepted, no effect
   VCHECK_EQ(cudaDeviceGetSharedMemConfig(&c), cudaSuccess);
   VCHECK_EQ(static_cast<int>(c), static_cast<int>(cudaSharedMemBankSizeFourByte));
-  VCHECK_EQ(cudaDeviceSetSharedMemConfig(static_cast<cudaSharedMemConfig>(7)), cudaErrorInvalidValue);
+  // An out-of-range enumerator, made without the cast that would itself be UB.
+  const int bad = 7;
+  cudaSharedMemConfig seven;
+  std::memcpy(&seven, &bad, sizeof seven);
+  VCHECK_EQ(cudaDeviceSetSharedMemConfig(seven), cudaErrorInvalidValue);
   VCHECK_EQ(cudaDeviceGetSharedMemConfig(nullptr), cudaErrorInvalidValue);
 }
 

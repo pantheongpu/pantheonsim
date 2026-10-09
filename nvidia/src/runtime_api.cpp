@@ -4345,13 +4345,15 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
 // is accepted and has no effect, and the answer stays the four-byte bank size.
 // Deprecated in 12.4, and removed with CUDA 13.
 #if CUDART_VERSION < 13000
-static cudaError_t cudaDeviceSetSharedMemConfig_traced(cudaSharedMemConfig config) {
-  const int c = static_cast<int>(config);
+// The configuration travels as an int: a caller's out-of-range value must not
+// be loaded as the enum (UBSan), and traced_call copies its arguments on.
+static cudaError_t cudaDeviceSetSharedMemConfig_traced(int c) {
   return c >= 0 && c <= 2 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
-  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced, config);
+  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced,
+                     enum_value(config));
 }
 static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* config) {
   if (!config) return cudaErrorInvalidValue;
@@ -4362,8 +4364,7 @@ static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* conf
 VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
   return traced_call("cudaDeviceGetSharedMemConfig", cudaDeviceGetSharedMemConfig_traced, config);
 }
-static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, cudaSharedMemConfig config) {
-  const int c = static_cast<int>(config);
+static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, int c) {
   if (c < 0 || c > 2) return cudaErrorInvalidValue;
   return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
     return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
@@ -4371,7 +4372,8 @@ static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, cudaShare
 }
 
 VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
-  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func, config);
+  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func,
+                     enum_value(config));
 }
 
 // The cudaThread* calls are the pre-cudaDevice* names, deprecated since CUDA

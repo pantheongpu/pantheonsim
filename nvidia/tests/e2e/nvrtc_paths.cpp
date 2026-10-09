@@ -464,14 +464,22 @@ static void pch_time_and_flow() {
     std::printf("skip this libnvrtc has no precompiled-header or flow-callback entry points\n");
     return;
   }
-  // The heap rounds a request up to 4096.
+  // The shim exports every entry point, and forwards to the toolkit's NVRTC: one older than 12.8 (the
+  // CUDA 12.0 of Ubuntu's packages, say) has no precompiled headers and no flow callback, and the shim
+  // answers INTERNAL_ERROR for them. That is the toolkit's age, not a failure here; skip, as for a
+  // libnvrtc whose symbols are missing.
   size_t before = 0, h = 0;
-  heap_get(&before);
-  bool round = heap_set(12345) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == 16384;
-  round = round && heap_set(1) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == 4096;
-  round = round && heap_set(1 << 20) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == (1u << 20);
-  heap_set(before);
-  check(round && heap_get(nullptr) == NVRTC_ERROR_INVALID_INPUT, "the PCH heap size rounds up to 4096, and a null destination is refused");
+  const bool old_toolkit = heap_get(&before) == NVRTC_ERROR_INTERNAL_ERROR && is_vgpu_shim();
+  if (old_toolkit) {
+    std::printf("skip the toolkit's libnvrtc is older than 12.8 and has no precompiled headers\n");
+  } else {
+    // The heap rounds a request up to 4096.
+    bool round = heap_set(12345) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == 16384;
+    round = round && heap_set(1) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == 4096;
+    round = round && heap_set(1 << 20) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == (1u << 20);
+    heap_set(before);
+    check(round && heap_get(nullptr) == NVRTC_ERROR_INVALID_INPUT, "the PCH heap size rounds up to 4096, and a null destination is refused");
+  }
 
   const char* hdr = "#pragma once\n__device__ inline int twice(int x) { return 2 * x; }\n";
   const char* hdr_name = "hdr.h";
@@ -494,8 +502,10 @@ static void pch_time_and_flow() {
   };
   std::string log;
   int st;
-  int rc = build({"--create-pch=" + d + "/a.pch"}, &log, &st);
-  if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim() && log.find("libnvrtc") != std::string::npos) {
+  int rc = old_toolkit ? NVRTC_SUCCESS : build({"--create-pch=" + d + "/a.pch"}, &log, &st);
+  if (old_toolkit) {
+    // (skipped above)
+  } else if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim() && log.find("libnvrtc") != std::string::npos) {
     std::printf("skip precompiled headers need the toolkit's libnvrtc, which is not installed\n");
   } else {
     struct stat sb;
@@ -556,7 +566,13 @@ static void pch_time_and_flow() {
   struct Cb { static int cancel(void*, void*) { ++calls; return 1; } static int go_on(void*, void*) { ++calls; return 0; } };
   nvrtcProgram f;
   nvrtcCreateProgram(&f, "extern \"C\" __global__ void k() {}", "k.cu", 0, nullptr, nullptr);
-  check(flow(f, nullptr, nullptr) == NVRTC_ERROR_INVALID_INPUT, "a null flow callback is refused");
+  const int null_cb = flow(f, nullptr, nullptr);
+  if (is_vgpu_shim() && null_cb == NVRTC_ERROR_INTERNAL_ERROR) {
+    std::printf("skip the toolkit's libnvrtc is older than 12.8 and has no flow callback\n");
+    nvrtcDestroyProgram(&f);
+    return;
+  }
+  check(null_cb == NVRTC_ERROR_INVALID_INPUT, "a null flow callback is refused");
   flow(f, Cb::cancel, nullptr);
   const char* fo[] = {"--gpu-architecture=sm_80"};
   calls = 0;
