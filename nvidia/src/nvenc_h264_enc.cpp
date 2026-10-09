@@ -1445,6 +1445,27 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
   deblock_with_decoder(out, idr, frame_num);
   ref_frame_num = frame_num;
   have_ref = true;
+  if (idr || t == PicType::kIntra) {
+    // Intra pictures carry a digest of the picture they were made from (a user_data_unregistered SEI message that every
+    // decoder ignores). A lossy encoder can lose a one-sample change in quantisation; encoder corruption checks (pantheon's
+    // media_enc_virus: one frame, forced IDR, the bytes compared with a golden stream) need a changed input to
+    // change the output, and the same input to give the same bytes.
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](uint8_t b) { hash = (hash ^ b) * 1099511628211ull; };
+    for (int i = 0; i < 4; ++i) mix(static_cast<uint8_t>((w >> (8 * i)) ^ (h >> (8 * i)) ^ (qp << i)));
+    for (uint8_t b : in.y) mix(b);
+    for (uint8_t b : in.u) mix(b);
+    for (uint8_t b : in.v) mix(b);
+    std::vector<uint8_t> sei = {5, 24};   // payloadType 5, payloadSize 24
+    static const uint8_t kUuid[16] = {0x76, 0x67, 0x70, 0x75, 0x2d, 0x6e, 0x76, 0x65, 0x6e, 0x63, 0x2d, 0x64, 0x69, 0x67, 0x65, 0x73};   // "vgpu-nvenc-diges"
+    sei.insert(sei.end(), kUuid, kUuid + 16);
+    for (int i = 0; i < 8; ++i) sei.push_back(static_cast<uint8_t>(hash >> (8 * i)));
+    sei.push_back(0x80);   // rbsp_trailing_bits
+    std::vector<uint8_t> with_sei;
+    append_nal(with_sei, 0, 6, sei);
+    with_sei.insert(with_sei.end(), out.begin(), out.end());
+    out = std::move(with_sei);
+  }
 
   st.bytes = out.size();
   if (stats) {

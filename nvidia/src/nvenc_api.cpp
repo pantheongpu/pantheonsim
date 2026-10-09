@@ -935,8 +935,14 @@ std::vector<uint8_t> encode_h264(Session& s, const Frame& f, const NV_ENC_PIC_PA
   s.since_idr = t == vgpu_nvenc::PicType::kIdr ? 1 : s.since_idr + 1;
   *pic_type = t == vgpu_nvenc::PicType::kIdr ? num(NV_ENC_PIC_TYPE_IDR) : (t == vgpu_nvenc::PicType::kIntra ? num(NV_ENC_PIC_TYPE_I) : num(NV_ENC_PIC_TYPE_P));
   std::vector<uint8_t> out;
-  if (!s.sent_parameter_sets || (flags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || (h.repeatSPSPPS && t == vgpu_nvenc::PicType::kIdr)) out = s.h264->parameter_sets();
-  out.insert(out.end(), picture.begin(), picture.end());
+  size_t skip = 0;
+  if (!s.sent_parameter_sets || (flags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || (h.repeatSPSPPS && t == vgpu_nvenc::PicType::kIdr)) {
+    out = s.h264->parameter_sets();
+    // The digest SEI message of an intra picture is the first NAL unit of its access unit, and needs the four-byte start code,
+    // only when no parameter sets come before it (Annex B, zero_byte).
+    if (picture.size() > 4 && picture[3] == 1 && (picture[4] & 31) == 6) skip = 1;
+  }
+  out.insert(out.end(), picture.begin() + static_cast<std::ptrdiff_t>(skip), picture.end());
   s.sent_parameter_sets = true;
   return out;
 }

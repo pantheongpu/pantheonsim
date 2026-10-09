@@ -1026,10 +1026,15 @@ libcutensor.2.7.0 {
           ENV NVENC_HEADER_DIR)
   if(NVENC_INCLUDE)
     message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
-    add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp)
+    # The H.264 encoder reconstructs its reference picture with the tree's own decoder (h264_decode.cpp);
+    # only NvEnc* is exported.
+    set(_nvenc_map "${CMAKE_BINARY_DIR}/maps/libnvidia-encode.so.1.map")
+    file(WRITE "${_nvenc_map}" "{\n  global: NvEnc*;\n  local: *;\n};\n")
+    add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp)
     target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
     target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE} nvidia/src)
     set_target_properties(vgpunvenc PROPERTIES OUTPUT_NAME nvidia-encode SOVERSION 1)
+    target_link_options(vgpunvenc PRIVATE "-Wl,--version-script=${_nvenc_map}")
     add_custom_command(TARGET vgpunvenc POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
       COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvidia-encode.so.1"
@@ -1179,6 +1184,10 @@ target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_
 # The H.264 and HEVC writers behind NVENC, read back by decoders of their own.
 vgpu_unit_test(test_nvenc_h264 nvidia/tests/unit/test_nvenc_h264.cpp)
 vgpu_unit_test(test_nvenc_hevc nvidia/tests/unit/test_nvenc_hevc.cpp)
+# The compressing H.264 encoder behind NVENC, against the tree's own decoder.
+vgpu_unit_test(test_nvenc_h264_enc nvidia/tests/unit/test_nvenc_h264_enc.cpp)
+target_sources(test_nvenc_h264_enc PRIVATE nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
+target_compile_definitions(test_nvenc_h264_enc PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The H.264 decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
 vgpu_unit_test(test_h264_decode nvidia/tests/unit/test_h264_decode.cpp)
 target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)

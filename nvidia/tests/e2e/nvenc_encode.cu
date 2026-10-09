@@ -6,6 +6,12 @@
 // changed byte is a chroma sample, and the whole frame, luma and chroma, is
 // written (here by a kernel) into the buffer the encoder hands out. That buffer
 // is managed memory in the simulator; nvenc_h264.cpp decodes the stream.
+//
+// Three encoders are checked: the H.264 encoder with the lossless tuning and the
+// HEVC encoder, which write an IDR picture every time (so successive encodes of one
+// frame are the same bytes), and the compressing H.264 encoder, whose pictures after the
+// first are P pictures -- there the contract is the forced-IDR one, which is what
+// pantheon's media_enc_virus does.
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -73,7 +79,7 @@ std::vector<unsigned char> encode(Encoder& e, NV_ENC_INPUT_PTR in, NV_ENC_OUTPUT
 // One buffer format end to end. `rows` is how many rows of `pitch` bytes the
 // frame occupies: the height for packed RGB, one and a half times it for 4:2:0.
 void check_format(Encoder& e, NV_ENC_BUFFER_FORMAT fmt, const char* name, uint32_t width,
-                  uint32_t height, uint32_t rows) {
+                  uint32_t height, uint32_t rows, bool every_picture_is_idr) {
   NV_ENC_CREATE_INPUT_BUFFER input{};
   input.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
   input.width = width;
@@ -114,15 +120,15 @@ void check_format(Encoder& e, NV_ENC_BUFFER_FORMAT fmt, const char* name, uint32
     return;
   }
 
-  // Consecutive IDR pictures differ in idr_pic_id, and the first one is preceded by
-  // the parameter sets, so "the same frame" is compared two pictures apart and
-  // after those headers.
+  // Without a forced IDR the PCM streams write an IDR picture every time; the first one is preceded by the parameter sets,
+  // so "the same frame" is compared from the third picture on, after those headers. The compressing encoder follows
+  // its GOP settings: the second and third pictures are P pictures and are not compared.
   const auto first = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
   const auto again = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
   const auto third = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
-  if (first.empty()) fail("FAIL %s: encoding produced no bytes%s", name);
-  if (third.empty() || third.size() > first.size() ||
-      !std::equal(third.begin(), third.end(), first.end() - static_cast<std::ptrdiff_t>(third.size())))
+  if (first.empty() || again.empty() || third.empty()) fail("FAIL %s: encoding produced no bytes%s", name);
+  if (every_picture_is_idr && (third.empty() || third.size() > first.size() ||
+      !std::equal(third.begin(), third.end(), first.end() - static_cast<std::ptrdiff_t>(third.size()))))
     fail("FAIL %s: the same frame encoded differently%s", name);
 
   // The last byte of an ARGB frame is the last pixel's alpha, which the encoder
@@ -133,7 +139,7 @@ void check_format(Encoder& e, NV_ENC_BUFFER_FORMAT fmt, const char* name, uint32
   last ^= 0x5a;
   cudaMemcpy(frame + victim, &last, 1, cudaMemcpyHostToDevice);
   const auto changed = encode(e, input.inputBuffer, output.bitstreamBuffer, fmt, width, height);
-  if (changed.empty() || changed == again)
+  if (changed.empty() || (every_picture_is_idr && changed == again))
     fail("FAIL %s: changing the frame's last byte did not change the output%s", name);
   // The pantheon media_enc_virus contract: with a forced IDR and the parameter sets every
   // time, every encode of one frame is the same bytes, and a changed byte is not.
@@ -150,13 +156,12 @@ void check_format(Encoder& e, NV_ENC_BUFFER_FORMAT fmt, const char* name, uint32
   done();
 }
 
-// What media_enc_virus does, at 1280x720: HEVC, preset P7 with its high-quality tuning and a
+// What media_enc_virus does, at 1280x720: HEVC (and H.264 here), preset P7 with its high-quality tuning and a
 // constant QP, an ARGB input buffer filled by a kernel, every frame a forced IDR with the
 // parameter sets; one golden frame, then the same frame again and again, then the frame with
 // one pixel corrupted. The workload passes when the first repeats are the golden bytes and
 // the corrupted one is not.
-void workload_contract(Encoder& e, const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS& open) {
-  const char* name = "media_enc_virus";
+void workload_contract(Encoder& e, const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS& open, const GUID& codec, const char* name) {
   void* session = nullptr;
   if (e.api.nvEncOpenEncodeSessionEx(const_cast<NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS*>(&open), &session) != NV_ENC_SUCCESS) {
     fail("FAIL %s: no session%s", name);
@@ -168,7 +173,7 @@ void workload_contract(Encoder& e, const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS& o
   const uint32_t W = 1280, H = 720;
   NV_ENC_INITIALIZE_PARAMS ip{};
   ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
-  ip.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
+  ip.encodeGUID = codec;
   ip.presetGUID = NV_ENC_PRESET_P7_GUID;
   ip.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
   ip.encodeWidth = ip.maxEncodeWidth = ip.darWidth = W;
@@ -255,10 +260,18 @@ int main() {
   }
 
   const uint32_t width = 256, height = 128;
-  // Both codecs write real (PCM) streams; nvenc_h264.cpp decodes them.
-  for (const GUID& codec : {NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID}) {
-    if (&codec != &NV_ENC_CODEC_H264_GUID) {
-      // A session of its own for each codec.
+  // A session for each encoder: the H.264 encoder with the high-quality tuning (compressed pictures), the same codec with
+  // the lossless tuning (PCM, every picture IDR) and HEVC (PCM); nvenc_h264.cpp and nvenc_nvdec.cpp decode the streams.
+  const struct {
+    const GUID* codec;
+    NV_ENC_TUNING_INFO tuning;
+    bool every_picture_is_idr;
+  } encoders[] = {{&NV_ENC_CODEC_H264_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, false},
+                  {&NV_ENC_CODEC_H264_GUID, NV_ENC_TUNING_INFO_LOSSLESS, true},
+                  {&NV_ENC_CODEC_HEVC_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, true}};
+  bool first_session = true;
+  for (const auto& enc : encoders) {
+    if (!first_session) {
       e.api.nvEncDestroyEncoder(e.session);
       e.session = nullptr;
       if (e.api.nvEncOpenEncodeSessionEx(&open, &e.session) != NV_ENC_SUCCESS) {
@@ -266,11 +279,12 @@ int main() {
         return 1;
       }
     }
+    first_session = false;
     NV_ENC_INITIALIZE_PARAMS init{};
     init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    init.encodeGUID = codec;
+    init.encodeGUID = *enc.codec;
     init.presetGUID = NV_ENC_PRESET_P4_GUID;   // the card refuses an initialisation without a P1-P7 preset
-    init.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;   // ... and without a tuning
+    init.tuningInfo = enc.tuning;              // ... and without a tuning
     init.encodeWidth = width;
     init.encodeHeight = height;
     init.darWidth = width;
@@ -283,11 +297,12 @@ int main() {
       e.api.nvEncDestroyEncoder(e.session);
       return 1;
     }
-    check_format(e, NV_ENC_BUFFER_FORMAT_ARGB, "ARGB", width, height, height);
-    check_format(e, NV_ENC_BUFFER_FORMAT_NV12, "NV12", width, height, height + height / 2);
+    check_format(e, NV_ENC_BUFFER_FORMAT_ARGB, "ARGB", width, height, height, enc.every_picture_is_idr);
+    check_format(e, NV_ENC_BUFFER_FORMAT_NV12, "NV12", width, height, height + height / 2, enc.every_picture_is_idr);
   }
 
-  workload_contract(e, open);
+  workload_contract(e, open, NV_ENC_CODEC_HEVC_GUID, "media_enc_virus (HEVC)");
+  workload_contract(e, open, NV_ENC_CODEC_H264_GUID, "media_enc_virus (H.264)");
   e.api.nvEncDestroyEncoder(e.session);
   dlclose(lib);
   if (failures) {
