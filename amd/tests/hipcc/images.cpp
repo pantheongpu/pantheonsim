@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -334,11 +335,15 @@ int main() {
     for (int i = 0; i < n; ++i)
       wrong += ri[i].x != px[i].x || ri[i].y != px[i].y || ri[i].z != px[i].z || ri[i].w != px[i].w;
     report("8-bit texels read as integers", wrong, n);
-    // sRGB: the color channels come back linear, alpha as it is. The
-    // hardware converts approximately: an RX 6800 and an RX 6700 XT are within
-    // 2e-3 of the exact curve (about half an 8-bit step) where it is
-    // steepest, so this allows 4e-3, still well under what leaving the
-    // channels unconverted would be off by (0.025 at the second texel).
+    // sRGB: the color channels come back linear, alpha as it is. A real
+    // gfx103x card converts approximately: an RX 6800 and an RX 6700 XT are
+    // within 2e-3 of the exact curve (about half an 8-bit step) where it is
+    // steepest, so there this allows 4e-3, still well under what leaving the
+    // channels unconverted would be off by (0.025 at the second texel). The
+    // simulator (VGPU_GPU set) and the other generations are held to the exact
+    // curve.
+    const bool real_gfx103x = std::strncmp(p.gcnArchName, "gfx103", 6) == 0 && !std::getenv("VGPU_GPU");
+    const float srgb_tolerance = real_gfx103x ? 4e-3f : 1e-5f;
     hipTextureObject_t ts = 0;
     d.readMode = hipReadModeNormalizedFloat;
     d.sRGB = 1;
@@ -351,8 +356,8 @@ int main() {
     };
     wrong = 0;
     for (int i = 0; i < n; ++i)
-      wrong += std::fabs(rs[i].x - linear(px[i].x)) > 4e-3f || std::fabs(rs[i].y - linear(px[i].y)) > 4e-3f ||
-               std::fabs(rs[i].z - linear(px[i].z)) > 4e-3f || std::fabs(rs[i].w - px[i].w / 255.0f) > 1e-6f;
+      wrong += std::fabs(rs[i].x - linear(px[i].x)) > srgb_tolerance || std::fabs(rs[i].y - linear(px[i].y)) > srgb_tolerance ||
+               std::fabs(rs[i].z - linear(px[i].z)) > srgb_tolerance || std::fabs(rs[i].w - px[i].w / 255.0f) > 1e-6f;
     report("8-bit sRGB texels read as linear floats", wrong, n);
     CHECK(hipDestroyTextureObject(ts));
     CHECK(hipDestroyTextureObject(tf));

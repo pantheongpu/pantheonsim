@@ -1197,8 +1197,11 @@ struct Machine {
           // processor. On gfx10.3 the waves go to the SIMDs four at a time in
           // the order 0, 2, 1, 3 and take the next slot after each four, as
           // an RX 6800 and an RX 6700 XT place them (measured with
-          // s_getreg of HW_ID1 in every wave of 256-thread groups); the other
-          // generations put every wave on SIMD 0 and number the slots by wave.
+          // s_getreg of HW_ID1 in every wave of 256-thread groups, in wave32
+          // and wave64, on gfx1030 and gfx1031). The loader maps gfx1032
+          // to gfx1036 to this target too, and nothing has measured those. The
+          // other generations put every wave on SIMD 0 and number the slots
+          // by wave.
           const Place p = place_of(d, w.group);
           const uint32_t wave = static_cast<uint32_t>(w.first_lane / w.lanes);
           static constexpr uint32_t kSimd1030[4] = {0, 2, 1, 3};

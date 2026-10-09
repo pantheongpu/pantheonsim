@@ -36,4 +36,8 @@ Where the simulator and the cards differ (found by running the hipcc programs in
 
 - `HW_ID2`, the queue, pipe and VM ids of a wave, is not modelled; a wave that reads it is refused by name.
 - The cards convert 8-bit sRGB texels to linear approximately, within 2e-3 of the exact curve; the simulator
-  is exact. `hipcc/images.cpp` allows 4e-3.
+  is exact. `hipcc/images.cpp` allows 4e-3 on a real gfx103x card and 1e-5 everywhere else, the simulator
+  included.
+- The RX 6800 places the waves of a 256-thread group on SIMDs 0, 2, 1, 3 in turn (HW_ID1 bits 9:8), in wave32
+  and in wave64 (four waves, SIMDs 0, 2, 1, 3), and the next slot (bits 4:0) after each four. The RX 6700 XT's
+  `__smid` shows the same pattern. Other gfx103x chips (gfx1032 to gfx1036) share the simulator's model, unmeasured.
