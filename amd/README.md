@@ -413,8 +413,16 @@ false` throughout. gfx1251 (MI430X) is not covered.
 - **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic
   `v_cvt_sr_{fp8,bf8}_f16` (the seed's top bits added to the half's mantissa, as the ISA's pseudocode has it),
   `v_cvt_sr_pk_{bf16,f16}_f32` and `v_fma_mix{,lo,hi}_bf16`.
-- **Decoded and printed, but refused when executed:** the tensor data mover (`tensor_load_to_lds`,
-  `tensor_store_from_lds`); cluster loads, the 6- and 4-bit transposed loads
+- **Tensor Data Mover:** `tensor_load_to_lds` and `tensor_store_from_lds`, from the ISA document's descriptor tables: tiles of
+  one to five dimensions, 1- to 8-byte elements, zero fill (load) or dropped writes (store) outside the tensor, LDS padding
+  on loads, gather and scatter by 16- or 32-bit row indices, and iteration (`tests/hipcc/tensor1250.cpp`, which builds
+  each descriptor bit range by bit range from the tables). Done when issued. Not modelled: multicast to other work-groups
+  (a cluster is one work-group here, so the mask is ignored), and the LDS barrier a descriptor can ask to be signalled
+  (`atomic_barrier_enable` is refused, since the ISA's text does not fix that barrier's width).
+- **Block loads and stores** (`global_load_block`, `global_store_block`: up to 32 dwords to or from consecutive registers, by the
+  mask in M0; a scaled offset is refused) and the **cluster loads** (`cluster_load_b{32,64,128}` and `cluster_load_async_to_lds_*`,
+  run as the global loads they downgrade to outside a cluster; `tests/hipcc/block1250.cpp`).
+- **Decoded and printed, but refused when executed:** the 6- and 4-bit transposed loads
   (`*_load_tr6_*`, `*_load_tr4_*`); `v_perm_pk16_*` and the `v_cvt_scale*` family (the ISA's pseudocode calls scaling
   helpers it does not define); the cube-face instructions and a few more. Each says so by name when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.

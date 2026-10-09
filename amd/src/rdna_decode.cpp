@@ -217,6 +217,12 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
   if (const auto it = kRenamed.find(name); it != kRenamed.end()) candidates.push_back(it->second);
   if (const auto it = kAliases.find(name); it != kAliases.end() && !own)
     candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+  // gfx1250's cluster loads return the data to the work-groups of a cluster the mask in M0 names; used outside a cluster,
+  // as every dispatch here is, "they are downgraded to global loads", which is what they run as.
+  if (g_cdna5 && name.rfind("cluster_load_b", 0) == 0) {
+    const std::string width = name.substr(14);
+    candidates.insert(candidates.begin(), width == "32" ? "global_load_dword" : width == "64" ? "global_load_dwordx2" : "global_load_dwordx4");
+  }
   candidates.push_back(name);
   const bool short_form = enc == Enc::Vop1 || enc == Enc::Vop2 || enc == Enc::Vopc || enc == Enc::Vopd;
   // gfx9's table keeps a flat, global or scratch access by the name after

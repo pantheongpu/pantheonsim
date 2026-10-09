@@ -4263,6 +4263,88 @@ struct Machine {
     return true;
   }
 
+  // gfx1250's Tensor Data Mover (tensor_load_to_lds and tensor_store_from_lds), after the CDNA 5 ISA document's section 10.11:
+  // one instruction per wave, not per lane, moving a tile of a tensor of up to five dimensions between global memory and
+  // LDS as the descriptor ("D#", in groups of scalar registers) says. A load writes zero where the tile reaches past the
+  // tensor's extent in some dimension, a store drops what falls outside, and a load can pad the LDS rows. Gather mode
+  // takes the rows from a list, and iteration repeats the move with the addresses stepped. Done when issued, so
+  // s_wait_tensorcnt has nothing to wait for. Not modelled: multicast to other work-groups of a cluster (a mask in group
+  // 1, which the ISA says must be zero outside a cluster, and is ignored), and the LDS barrier a descriptor can ask to
+  // be signalled when the move is done -- the ISA gives that barrier's layout a width its text does not fix, so a
+  // descriptor that asks for it is refused.
+  void tensor_move(Wave& w, const Inst& in, Group& g) {
+    const bool store = in.name == "tensor_store_from_lds";
+    uint32_t d[4][8] = {};
+    for (size_t k = 0; k < in.src.size() && k < 4; ++k) {
+      const Operand& o = in.src[k];
+      if (o.kind != OperandKind::Sgpr) continue;   // a NULL group is zeroes
+      for (uint32_t i = 0; i < o.width; ++i) d[k][i] = sgpr(w, o.index + i);
+    }
+    const uint32_t* g0 = d[0];
+    const uint32_t* g1 = d[1];
+    const uint32_t* g2 = d[2];
+    const uint32_t* g3 = d[3];
+    if ((g0[0] & 3) == 0) return;   // a null tensor moves nothing
+    const bool gather = (g0[0] >> 31) & 1, wide_index = (g0[0] >> 30) & 1;
+    const uint64_t lds_base = g0[1];
+    const uint64_t global_base = uint64_t{g0[2]} | (uint64_t{g0[3]} & 0x1FFFFFF) << 32;
+    const uint32_t data_log2 = (g1[0] >> 16) & 3, elem = 1u << data_log2;
+    const bool barrier = (g1[0] >> 18) & 1, iterate = (g1[0] >> 19) & 1 && !gather, pad = (g1[0] >> 20) & 1;
+    if (barrier)
+      throw Error::make(Err::Unsupported, in.name, " with atomic_barrier_enable: the LDS barrier's layout is not fixed by the ISA's text");
+    const uint32_t pad_interval_bytes = 8u << ((g1[0] >> 22) & 7), pad_bytes = 4 * (((g1[0] >> 25) & 0x7F) + 1);
+    const uint64_t tensor_dim[5] = {(g1[1] >> 16) | (uint64_t{g1[2]} & 0xFFFF) << 16, (g1[2] >> 16) | (uint64_t{g1[3]} & 0xFFFF) << 16,
+                                    g2[0], iterate ? 0 : g2[1], uint64_t{g3[1] >> 16} | (uint64_t{g3[2]} & 0xFFFF) << 16};
+    uint64_t tile_dim[5] = {g1[3] >> 16, g1[4] & 0xFFFF, g1[4] >> 16, iterate ? 0 : g2[3] >> 16, g3[2] >> 16};
+    const uint64_t stride[4] = {g1[5] | (uint64_t{g1[6]} & 0xFFFF) << 32, (g1[6] >> 16) | uint64_t{g1[7]} << 16,
+                                g2[2] | (uint64_t{g2[3]} & 0xFFFF) << 32, g3[0] | (uint64_t{g3[1]} & 0xFFFF) << 32};
+    if (tile_dim[0] == 0) return;   // a tile with no width is a NOP
+    const uint32_t repeats = iterate ? (g2[3] >> 16) + 1 : 1;
+    const uint64_t lds_step = iterate ? uint64_t{g2[1]} * elem : 0, global_step = iterate ? (g2[2] | (uint64_t{g2[3]} & 0xFFFF) << 32) * elem : 0;
+    for (uint64_t& t : tile_dim) t = std::max<uint64_t>(t, 1);   // a dimension that is zero is unused: one of it
+    if (gather) tile_dim[2] = tile_dim[3] = tile_dim[4] = 1;
+    const uint64_t rows = gather ? std::min<uint64_t>(g1[4] & 0xFFFF, wide_index ? 8 : 16) : tile_dim[1];
+    const auto row_index = [&](uint64_t r) -> uint64_t {   // group 2 then group 3 hold the list of rows
+      const uint32_t* list = r < (wide_index ? 4u : 8u) ? g2 : g3;
+      const uint64_t k = r % (wide_index ? 4u : 8u);
+      return wide_index ? list[k] : (list[k / 2] >> (16 * (k % 2))) & 0xFFFF;
+    };
+    for (uint32_t it = 0; it < repeats; ++it) {
+      uint64_t at = lds_base + it * lds_step, stored = 0;
+      for (uint64_t t4 = 0; t4 < tile_dim[4]; ++t4)
+        for (uint64_t t3 = 0; t3 < tile_dim[3]; ++t3)
+          for (uint64_t t2 = 0; t2 < tile_dim[2]; ++t2)
+            for (uint64_t r = 0; r < rows; ++r) {
+              const uint64_t y = gather ? row_index(r) : r;
+              for (uint64_t x = 0; x < tile_dim[0]; ++x) {
+                // (An unused dimension is of size one: its index 0 is always inside, whatever its length field holds.)
+                const bool inside = x < tensor_dim[0] && y < tensor_dim[1] && (t2 == 0 || t2 < tensor_dim[2]) &&
+                                    (t3 == 0 || t3 < tensor_dim[3]) && (t4 == 0 || t4 < tensor_dim[4]);
+                const uint64_t where = global_base + it * global_step + elem * (x + y * stride[0] + t2 * stride[1] + t3 * stride[2] + t4 * stride[3]);
+                if (at + elem > g.lds.size())
+                  throw Error::make(Err::InvalidValue, in.name, " reaches LDS at ", at, ", past the ", g.lds.size(), " bytes the work-group has");
+                if (store) {
+                  if (inside) {
+                    uint64_t v = 0;
+                    std::memcpy(&v, &g.lds[at], elem);
+                    this->store(where, elem, v);
+                  }
+                } else {
+                  const uint64_t v = inside ? load(where, elem) : 0;
+                  std::memcpy(&g.lds[at], &v, elem);
+                }
+                at += elem;
+                stored += elem;
+                // Padding skips LDS locations on a load, every so many bytes; a store reads the tile as it lies.
+                if (pad && !store && stored >= pad_interval_bytes) {
+                  stored = 0;
+                  at += pad_bytes;
+                }
+              }
+            }
+    }
+  }
+
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in.name);
     if (uint32_t bits; in.name.rfind("ds_", 0) == 0 && transpose_kind(std::string_view(in.name).substr(3), &bits)) {
@@ -5871,6 +5953,24 @@ struct Machine {
     // A flat access that reaches only the device's memory comes here too, so
     // what it does is read from its name past the segment ("load_dwordx4").
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
+    if (body == "load_block" || body == "store_block") {
+      // gfx1250: up to 32 consecutive dwords to or from consecutive registers, those M0's bits pick (the ISA lets a block
+      // skip "holes" in memory and in the registers alike). A scaled offset is not modelled: the ISA does not say by what.
+      if (in.scale_offset) throw Error::make(Err::Unsupported, op, " with a scaled offset, which this does not model");
+      const bool loading = body == "load_block";
+      const Operand& address = in.src[0];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const uint64_t base = (in.has_saddr ? scalar_field(w, in.saddr, true) + lane_src(w, address, lane) : lane_src64(w, address, lane)) +
+                              static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+        for (uint32_t i = 0; i < 32; ++i) {
+          if (!((w.m0 >> i) & 1)) continue;
+          if (loading) set_word(w, in.dst[0], i, lane, static_cast<uint32_t>(load(base + 4 * i, 4)));
+          else store(base + 4 * i, 4, word(w, in.src[1], i, lane));
+        }
+      }
+      return;
+    }
     if (uint32_t bits; transpose_kind(body, &bits)) {
       if (!transpose_ready(w, in)) return;
       const uint32_t n = bits == 16 ? 16 : 8;
@@ -6781,8 +6881,10 @@ struct Machine {
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mimg:
-        if (in.name.rfind("tensor_", 0) == 0)
-          throw Error::make(Err::Unsupported, in.name, " (gfx1250's tensor data mover) is decoded but not modeled");
+        if (in.name.rfind("tensor_", 0) == 0) {
+          tensor_move(w, in, g);
+          return true;
+        }
         ++n.vmem;
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
         else ++n.vmem_rd;
