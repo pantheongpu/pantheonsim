@@ -39,6 +39,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/memory.hpp"
+#include "vgpu/profiling.hpp"
 #include "vgpu/runtime/capture.hpp"
 #include "enum_value.hpp"
 
@@ -83,6 +84,9 @@ bool valid(cublasHandle_t h) {
 // Pulls `count` elements of T out of device memory.
 template <class T>
 std::vector<T> fetch(const void* dev, size_t count) {
+  // The copies a host-side routine makes to reach its operands are not the
+  // program's: on a card the routine is a kernel, whatever it moves is inside it.
+  vgpu::profiling::Silence silent;
   std::vector<T> host(count);
   if (count) cudaMemcpy(host.data(), dev, count * sizeof(T), kD2H);
   return host;
@@ -90,6 +94,7 @@ std::vector<T> fetch(const void* dev, size_t count) {
 
 template <class T>
 void store(void* dev, const std::vector<T>& host) {
+  vgpu::profiling::Silence silent;
   if (!host.empty()) cudaMemcpy(dev, host.data(), host.size() * sizeof(T), kH2D);
 }
 
@@ -218,6 +223,7 @@ size_t extent(int ld, int cols, int rows) {
    CUBLAS_COMPUTE_32F. */
 
 bool load_as_float(const void* dev, size_t n, cudaDataType t, std::vector<float>* out) {
+  vgpu::profiling::Silence silent;
   out->assign(n, 0.0f);
   if (!n) return true;
   switch (t) {
@@ -243,6 +249,7 @@ bool load_as_float(const void* dev, size_t n, cudaDataType t, std::vector<float>
 }
 
 bool store_from_float(void* dev, const std::vector<float>& host, cudaDataType t) {
+  vgpu::profiling::Silence silent;
   if (host.empty()) return true;
   switch (t) {
     case CUDA_R_32F:
@@ -1007,9 +1014,10 @@ cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, con
 // depending on the handle's pointer mode.
 template <class R>
 void put_result(cublasHandle_t h, R* result, R value) {
-  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE)
+  if (reinterpret_cast<Handle*>(h)->pointer_mode == CUBLAS_POINTER_MODE_DEVICE) {
+    vgpu::profiling::Silence silent;
     cudaMemcpy(result, &value, sizeof value, kH2D);
-  else
+  } else
     *result = value;
 }
 

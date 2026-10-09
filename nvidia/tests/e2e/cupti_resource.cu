@@ -253,6 +253,7 @@ int main() {
   cuptiActivityFlushAll(0);
 
   cuptiUnsubscribe(sub);
+  CK(cudaFree(d));
   cupti_test::print_all();
   std::printf("# end\n");
   return 0;

@@ -117,6 +117,11 @@ void set_enabled(bool on);
 void record(Event&& e);
 std::vector<Event> drain();
 
+// Told of each event as it is recorded, on the recording thread, with no lock
+// of the engine's held: a front end that hands out buffers as the first record
+// for one is made (CUPTI does) learns of it here. One hook; null to remove.
+void set_record_hook(void (*fn)(const Event&));
+
 // Monotonic, and the same clock the events carry.
 uint64_t now_ns();
 

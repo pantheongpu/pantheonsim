@@ -20,13 +20,18 @@
 #   graph    graph ids, graph-trace records, and the resource callbacks of graphs
 #   resource module, stream-attribute and context callbacks; context, stream and
 #            function records
+#   buffers  when the program is asked for a buffer: as the first record of a
+#            batch is made, not when it is delivered
+#   um       Unified Memory counters: configuring them, and (where the driver pages
+#            managed memory on demand) what a managed allocation produces
+#   peer     copies between two devices with a peer path (SKIPped where there is none)
 #   misc     which kinds can be enabled, per-function records, callback switches,
 #            CUDA event records, copies between devices, overhead, a program clock
 #            (needs two GPUs on the card)
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
-case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver> [--card [--update]]}"
+case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|peer> [--card [--update]]}"
 shift
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/cupti_${case_name}.cu"
@@ -56,7 +61,7 @@ trap 'rm -f "$out" "$out.txt" "$out.cubin"' EXIT
 # device both runs use, so the card and the shim are handed the same bytes.
 cubin=""
 devices=1
-[[ "$case_name" == misc ]] && devices=2
+[[ "$case_name" == misc || "$case_name" == peer ]] && devices=2
 if [[ "$case_name" == resource ]]; then
   cubin="$out.cubin"
   nvcc -cubin -arch=sm_86 -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/cupti_resource_module.cu" -o "$cubin"
@@ -72,7 +77,7 @@ if (( card )); then
   [[ -n "$libs" ]] || { echo "SKIP: no libcupti beside nvcc"; exit 0; }
   stubs="$libs/stubs"
   [[ -e "$stubs/libcuda.so" ]] || { echo "SKIP: no libcuda stub beside nvcc"; exit 0; }
-  if [[ "$case_name" == misc ]] && command -v nvidia-smi >/dev/null 2>&1 &&
+  if [[ "$case_name" == misc || "$case_name" == peer ]] && command -v nvidia-smi >/dev/null 2>&1 &&
      (( $(nvidia-smi -L 2>/dev/null | grep -c GPU) < 2 )); then
     echo "SKIP: the misc case's expected output was made on two GPUs"; exit 0
   fi
@@ -99,6 +104,9 @@ else
       NVTX_INJECTION64_PATH="${cupti_libs[0]}" LD_LIBRARY_PATH="$shim" "$out" > "$out.txt"
 fi
 
+if (( card )) && [[ "$case_name" == peer ]] && head -1 "$out.txt" | grep -q ": no$"; then
+  echo "SKIP: no peer path between this machine's first two GPUs"; exit 0
+fi
 if (( card && update )); then
   cp "$out.txt" "$expected"
   echo "wrote $expected"

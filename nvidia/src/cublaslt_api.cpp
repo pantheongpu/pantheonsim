@@ -36,6 +36,7 @@
 
 #include <cuda_runtime.h>
 
+#include "vgpu/profiling.hpp"
 #include "enum_value.hpp"
 
 namespace {
@@ -920,6 +921,10 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
                                           const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
                                           cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
                                           void*, size_t, cudaStream_t stream) {
+  // The copies this routine makes to reach its operands on the host are not
+  // the program's: on a card the product is a kernel and whatever it moves is
+  // inside it. (No kernel record is made for it either.)
+  vgpu::profiling::Silence silent;
   // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
   // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
   // library keeps nothing in a handle.

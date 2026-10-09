@@ -108,13 +108,20 @@ GraphWork::~GraphWork() {
   t_graph_node = saved_node_;
 }
 
+namespace {
+std::atomic<void (*)(const Event&)> g_record_hook{nullptr};
+}
+void set_record_hook(void (*fn)(const Event&)) { g_record_hook.store(fn, std::memory_order_release); }
+
 void record(Event&& e) {
   if (!enabled()) return;
+  if (t_silence > 0) return;   // not the program's: see Silence
   if (t_graph_id && (e.kind == EventKind::Kernel || e.kind == EventKind::Memcpy ||
                      e.kind == EventKind::Memset || e.kind == EventKind::Memcpy2)) {
     e.graph_id = t_graph_id;
     e.graph_node_id = (uint64_t{t_graph_id} << 32) | t_graph_node;
   }
+  if (const auto hook = g_record_hook.load(std::memory_order_acquire)) hook(e);
   std::lock_guard<std::mutex> lock(g_mu);
   if (g_events.size() >= kMaxBuffered) g_events.erase(g_events.begin());
   g_events.push_back(std::move(e));

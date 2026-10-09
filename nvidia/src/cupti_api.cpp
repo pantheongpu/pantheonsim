@@ -139,13 +139,30 @@ bool quiet() {
   return q && q[0] == '1';
 }
 
+// VGPU_TRACE=1 (the engine's trace switch) logs the activity calls a tool makes
+// and what they answered, which is how to see what a profiler asked for.
+bool tracing() {
+  static const bool on = [] {
+    const char* t = std::getenv("VGPU_TRACE");
+    return t && t[0] && t[0] != '0';
+  }();
+  return on;
+}
+#define CUPTI_TRACE(...)                                          \
+  do {                                                            \
+    if (tracing()) {                                              \
+      std::fprintf(stderr, "[vgpu][cupti] " __VA_ARGS__);         \
+      std::fprintf(stderr, "\n");                                 \
+    }                                                             \
+  } while (0)
+
 std::mutex g_mu;
 CUpti_BuffersCallbackRequestFunc g_request = nullptr;
 CUpti_BuffersCallbackCompleteFunc g_complete = nullptr;
 std::vector<bool> g_kinds(64, false);   // indexed by kind; CUPTI_ACTIVITY_KIND_COUNT differs between toolkits
 bool g_announced = false;
 bool g_devices_delivered = false;
-bool g_cuda_event_device_timestamps = false;
+std::atomic<bool> g_cuda_event_device_timestamps{false};
 
 // Which API functions' records are wanted (cuptiActivityEnableRuntimeApi and
 // cuptiActivityEnableDriverApi), as measured on an RTX 3060:
@@ -651,7 +668,7 @@ size_t fill_peer_copy(uint8_t* out, const vgpu::profiling::Event& e) {
   return sizeof *r;
 }
 
-uint64_t g_cuda_event_sync_id = 0;   // under g_mu, in flush
+std::atomic<uint64_t> g_cuda_event_sync_id{0};   // numbered as records are filled
 
 size_t fill_cuda_event(uint8_t* out, const vgpu::profiling::Event& e) {
   auto* r = reinterpret_cast<CudaEventRecord*>(out);
@@ -666,7 +683,7 @@ size_t fill_cuda_event(uint8_t* out, const vgpu::profiling::Event& e) {
   // The simulated device keeps no clock of its own: its "device timestamp" is
   // the time the record was made on the engine's clock, and zero while the
   // collection of device timestamps is off, as on NVIDIA's.
-  r->deviceTimestamp = g_cuda_event_device_timestamps ? e.start_ns : 0;
+  r->deviceTimestamp = g_cuda_event_device_timestamps.load() ? e.start_ns : 0;
   r->cudaEventSyncId = ++g_cuda_event_sync_id;
 #endif
   return sizeof *r;
@@ -742,7 +759,7 @@ CUpti_CallbackId runtime_cbid(const std::string& name) {
   // The runtime records cudaLaunchKernelEx under its own name; CUPTI reports
   // it as the C entry point it goes through.
   const auto it = ids.find(name == "cudaLaunchKernelEx" ? "cudaLaunchKernelExC" : name);
-  return it == ids.end() ? CUPTI_RUNTIME_TRACE_CBID_INVALID : it->second;
+  return it == ids.end() ? static_cast<CUpti_CallbackId>(CUPTI_RUNTIME_TRACE_CBID_INVALID) : it->second;
 }
 
 /* ---- the driver functions whose calls are recorded ----
@@ -769,7 +786,7 @@ CUpti_CallbackId driver_cbid(const std::string& name) {
     return m;
   }();
   const auto it = ids.find(name);
-  return it == ids.end() ? CUPTI_DRIVER_TRACE_CBID_INVALID : it->second;
+  return it == ids.end() ? static_cast<CUpti_CallbackId>(CUPTI_DRIVER_TRACE_CBID_INVALID) : it->second;
 }
 
 const char* driver_cbid_name(CUpti_CallbackId id) {
@@ -906,6 +923,67 @@ bool kind_wanted(const vgpu::profiling::Event& e) {
   }
 }
 
+// The buffer CUPTI asks the program for when the first record of a batch is
+// made, not when the batch is delivered (measured on an RTX 3060: with a
+// kernel kind on, the request comes as the launch returns, with the runtime
+// kind on as the first call returns, and none at all while nothing is recorded;
+// after a flush completes the buffer the next record asks again). Profilers
+// that count the buffers handed out and flush only if there are any -- Kineto,
+// under torch.profiler -- depend on it. The buffer is kept here until a flush
+// fills and completes it.
+struct HeldBuffer {
+  uint8_t* data = nullptr;
+  size_t size = 0;
+  size_t max_records = 0;
+  uint64_t request_start = 0, request_end = 0;
+  bool held = false;       // a buffer is held, or being asked for
+  bool ready = false;      // the request returned
+};
+std::mutex g_held_mu;      // before g_mu; held across the program's request callback
+HeldBuffer g_held;
+
+// Whether a record of the event would be delivered by the settings now. Under g_mu.
+bool would_deliver_locked(const vgpu::profiling::Event& e) {
+  using K = vgpu::profiling::EventKind;
+  if (g_kinds[akind::kGraphTrace] && e.graph_id != 0 &&
+      (e.kind == K::Kernel || e.kind == K::Memcpy || e.kind == K::Memset || e.kind == K::Memcpy2))
+    return false;
+  if (e.kind == K::Context && g_kinds[CUPTI_ACTIVITY_KIND_STREAM]) return true;
+  return kind_wanted(e);
+}
+
+void on_event_recorded(const vgpu::profiling::Event& e) {
+  // The program's request callback may call the runtime, which records.
+  thread_local bool inside = false;
+  if (inside) return;
+  struct Guard {
+    Guard() { inside = true; }
+    ~Guard() { inside = false; }
+  } guard;
+  std::lock_guard<std::mutex> held_lock(g_held_mu);
+  if (g_held.held) return;
+  CUpti_BuffersCallbackRequestFunc request = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_request || !would_deliver_locked(e)) return;
+    request = g_request;
+  }
+  g_held.held = true;
+  g_held.request_start = vgpu::profiling::host_ns();
+  uint8_t* data = nullptr;
+  size_t size = 0, max_records = 0;
+  request(&data, &size, &max_records);
+  g_held.request_end = vgpu::profiling::host_ns();
+  if (!data || size == 0) {   // the program gave none: ask again at the flush
+    g_held = HeldBuffer{};
+    return;
+  }
+  g_held.data = data;
+  g_held.size = size;
+  g_held.max_records = max_records;
+  g_held.ready = true;
+}
+
 }  // namespace
 
 /* ---- version and errors ---- */
@@ -972,6 +1050,7 @@ VGPU_EXPORT CUptiResult cuptiActivityRegisterCallbacks(
     CUpti_BuffersCallbackRequestFunc funcBufferRequested,
     CUpti_BuffersCallbackCompleteFunc funcBufferCompleted) {
   if (!funcBufferRequested || !funcBufferCompleted) return CUPTI_ERROR_INVALID_PARAMETER;
+  vgpu::profiling::set_record_hook(&on_event_recorded);
   std::lock_guard<std::mutex> lock(g_mu);
   g_request = funcBufferRequested;
   g_complete = funcBufferCompleted;
@@ -999,6 +1078,13 @@ CUptiResult enable_result(int k) {
       return CUPTI_ERROR_NOT_COMPATIBLE;
     case akind::kModule: case akind::kDeviceGraphTrace:
       return CUPTI_ERROR_INVALID_KIND;
+    // Unified Memory counters: on this machine (a WSL2 driver, where managed
+    // memory is not paged on demand) NVIDIA's answers "not ready" to enabling
+    // and to disabling the kind, though configuring the counters is accepted.
+    // This has no page-fault model to count from, so it says the same
+    // everywhere rather than enable a kind that produces nothing.
+    case akind::kUnifiedMemoryCounter:
+      return CUPTI_ERROR_NOT_READY;
     default:
       return CUPTI_SUCCESS;
   }
@@ -1026,8 +1112,12 @@ void on_first_context() {
 VGPU_EXPORT CUptiResult cuptiActivityEnable(CUpti_ActivityKind kind) {
   vgpu::profiling::set_context_hook(&on_first_context);
   const int k = static_cast<int>(kind);
+  CUPTI_TRACE("cuptiActivityEnable(%d)", k);
   std::lock_guard<std::mutex> lock(g_mu);
-  if (const CUptiResult r = enable_result(k); r != CUPTI_SUCCESS) return r;
+  if (const CUptiResult r = enable_result(k); r != CUPTI_SUCCESS) {
+    CUPTI_TRACE("  refused: %d", static_cast<int>(r));
+    return r;
+  }
   // The two kernel kinds are one or the other.
   if ((k == CUPTI_ACTIVITY_KIND_KERNEL && g_kinds[CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL]) ||
       (k == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL && g_kinds[CUPTI_ACTIVITY_KIND_KERNEL]))
@@ -1046,9 +1136,11 @@ VGPU_EXPORT CUptiResult cuptiActivityEnable(CUpti_ActivityKind kind) {
 
 VGPU_EXPORT CUptiResult cuptiActivityDisable(CUpti_ActivityKind kind) {
   const int k = static_cast<int>(kind);
+  CUPTI_TRACE("cuptiActivityDisable(%d)", k);
   std::lock_guard<std::mutex> lock(g_mu);
   // Disabling a kind that is not enabled, or does not exist, is not an error.
   if (k <= 0 || k >= static_cast<int>(g_kinds.size())) return CUPTI_SUCCESS;
+  if (k == akind::kUnifiedMemoryCounter) return CUPTI_ERROR_NOT_READY;   // see enable_result
   seal_locked();
   g_kinds[static_cast<size_t>(k)] = false;
   // Switched off while API calls are traced, a kind leaves the function
@@ -1071,6 +1163,7 @@ VGPU_EXPORT CUptiResult cuptiActivityDisableContext(CUcontext, CUpti_ActivityKin
 // parameter. See ApiFilter for what the two settings do together.
 VGPU_EXPORT CUptiResult cuptiActivityEnableRuntimeApi(CUpti_CallbackId cbid, uint8_t enable) {
   vgpu::profiling::set_context_hook(&on_first_context);
+  CUPTI_TRACE("cuptiActivityEnableRuntimeApi(%u, %d)", static_cast<unsigned>(cbid), static_cast<int>(enable));
   if (cbid == 0) return CUPTI_SUCCESS;
   if (!runtime_cbid_name(cbid)) return CUPTI_ERROR_INVALID_PARAMETER;
   std::lock_guard<std::mutex> lock(g_mu);
@@ -1082,6 +1175,7 @@ VGPU_EXPORT CUptiResult cuptiActivityEnableRuntimeApi(CUpti_CallbackId cbid, uin
 }
 VGPU_EXPORT CUptiResult cuptiActivityEnableDriverApi(CUpti_CallbackId cbid, uint8_t enable) {
   vgpu::profiling::set_context_hook(&on_first_context);
+  CUPTI_TRACE("cuptiActivityEnableDriverApi(%u, %d)", static_cast<unsigned>(cbid), static_cast<int>(enable));
   if (cbid == 0) return CUPTI_SUCCESS;
   if (!driver_cbid_name(cbid)) return CUPTI_ERROR_INVALID_PARAMETER;
   std::lock_guard<std::mutex> lock(g_mu);
@@ -1122,7 +1216,7 @@ VGPU_EXPORT CUptiResult cuptiActivityRegisterTimestampCallback(CUpti_TimestampCa
 // A CUDA event's record carries a device timestamp when asked to.
 VGPU_EXPORT CUptiResult cuptiActivityEnableCudaEventDeviceTimestamps(uint8_t enable) {
   std::lock_guard<std::mutex> lock(g_mu);
-  g_cuda_event_device_timestamps = enable != 0;
+  g_cuda_event_device_timestamps.store(enable != 0);
   return CUPTI_SUCCESS;
 }
 
@@ -1270,7 +1364,8 @@ void on_program_clock(std::vector<vgpu::profiling::Event>& events, uint64_t engi
 
 }  // namespace
 
-VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t) {
+VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t flags) {
+  CUPTI_TRACE("cuptiActivityFlushAll(%u)", static_cast<unsigned>(flags));
   CUpti_BuffersCallbackRequestFunc request = nullptr;
   CUpti_BuffersCallbackCompleteFunc complete = nullptr;
   {
@@ -1278,7 +1373,10 @@ VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t) {
     request = g_request;
     complete = g_complete;
   }
-  if (!request || !complete) return CUPTI_ERROR_NOT_INITIALIZED;
+  if (!request || !complete) {
+    CUPTI_TRACE("  no buffer callbacks registered");
+    return CUPTI_ERROR_NOT_INITIALIZED;
+  }
 
   const uint64_t flush_start = vgpu::profiling::host_ns();
   std::vector<vgpu::profiling::Event> events = vgpu::profiling::drain();
@@ -1320,8 +1418,21 @@ VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t) {
     wanted.insert(wanted.begin(), std::make_move_iterator(listed.begin()),
                   std::make_move_iterator(listed.end()));
   }
+  // A buffer asked for when the first record was made, if there is one.
+  HeldBuffer held;
+  {
+    std::lock_guard<std::mutex> lock(g_held_mu);
+    if (g_held.ready) {
+      held = g_held;
+      g_held = HeldBuffer{};
+    }
+  }
   // Nothing to deliver, no buffer: the cost of a flush is not a record of its own.
-  if (wanted.empty()) return CUPTI_SUCCESS;
+  CUPTI_TRACE("  %zu records to deliver", wanted.size());
+  if (wanted.empty()) {
+    if (held.held) complete(nullptr, 0, held.data, 0, 0);   // asked for, and nothing came of it
+    return CUPTI_SUCCESS;
+  }
   const bool delivering_work = std::any_of(wanted.begin(), wanted.end(), [](const vgpu::profiling::Event& e) {
     return e.kind != vgpu::profiling::EventKind::Overhead && e.kind != vgpu::profiling::EventKind::Device;
   });
@@ -1332,9 +1443,19 @@ VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t) {
     uint8_t* buffer = nullptr;
     size_t size = 0;
     size_t max_records = 0;
-    const uint64_t request_start = vgpu::profiling::host_ns();
-    request(&buffer, &size, &max_records);
-    const uint64_t request_end = vgpu::profiling::host_ns();
+    uint64_t request_start = 0, request_end = 0;
+    const bool from_record = first_buffer && held.held;
+    if (from_record) {
+      buffer = held.data;
+      size = held.size;
+      max_records = held.max_records;
+      request_start = held.request_start;
+      request_end = held.request_end;
+    } else {
+      request_start = vgpu::profiling::host_ns();
+      request(&buffer, &size, &max_records);
+      request_end = vgpu::profiling::host_ns();
+    }
     if (!buffer || size == 0) return CUPTI_ERROR_MAX_LIMIT_REACHED;
     if (first_buffer) {
       first_buffer = false;
@@ -1353,7 +1474,9 @@ VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t) {
         r.flags = uint32_t{7} << 16;   // CUPTI_ACTIVITY_OVERHEAD_ACTIVITY_BUFFER_REQUEST
         r.start_ns = request_start;
         r.end_ns = request_end;
-        if (delivering_work) wanted.push_back(std::move(f));
+        // The flush's own cost is the time until it asked for a buffer; a
+        // buffer asked for earlier leaves none.
+        if (delivering_work && !from_record) wanted.push_back(std::move(f));
         wanted.push_back(std::move(r));
       }
     }
@@ -1389,6 +1512,8 @@ VGPU_EXPORT CUptiResult cuptiActivityGetNumDroppedRecords(CUcontext, uint32_t, s
 }
 
 VGPU_EXPORT CUptiResult cuptiFinalize(void) {
+  std::lock_guard<std::mutex> held_lock(g_held_mu);
+  g_held = HeldBuffer{};
   std::lock_guard<std::mutex> lock(g_mu);
   vgpu::profiling::set_enabled(false);
   vgpu::profiling::set_host_clock(nullptr);
@@ -1398,9 +1523,10 @@ VGPU_EXPORT CUptiResult cuptiFinalize(void) {
   std::fill(g_kinds.begin(), g_kinds.end(), false);
   g_runtime_filter = ApiFilter{};
   g_driver_filter = ApiFilter{};
-  g_cuda_event_device_timestamps = false;
+  g_cuda_event_device_timestamps.store(false);
   g_live_allocs.clear();
   g_sealed.clear();
+  vgpu::profiling::set_record_hook(nullptr);
   return CUPTI_SUCCESS;
 }
 
@@ -2378,9 +2504,13 @@ VGPU_EXPORT CUptiResult cuptiKernelReplaySubscribeUpdate(CUpti_KernelReplayUpdat
 VGPU_EXPORT CUptiResult cuptiActivityConfigurePCSampling(CUcontext, CUpti_ActivityPCSamplingConfig*) {
   return CUPTI_ERROR_NOT_SUPPORTED;
 }
+// Measured on an RTX 3060 under WSL2: any list is accepted whatever its scope,
+// kind, device or enable field says, and nothing or a null list is a bad
+// parameter. The counters it configures are not produced (see enable_result).
 VGPU_EXPORT CUptiResult cuptiActivityConfigureUnifiedMemoryCounter(
-    CUpti_ActivityUnifiedMemoryCounterConfig*, uint32_t) {
-  return CUPTI_ERROR_NOT_SUPPORTED;
+    CUpti_ActivityUnifiedMemoryCounterConfig* config, uint32_t count) {
+  if (!config || count == 0) return CUPTI_ERROR_INVALID_PARAMETER;
+  return CUPTI_SUCCESS;
 }
 VGPU_EXPORT CUptiResult cuptiGetAutoBoostState(CUcontext, CUpti_ActivityAutoBoostState*) {
   return CUPTI_ERROR_NOT_SUPPORTED;
