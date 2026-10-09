@@ -858,6 +858,13 @@ if(CUDA_ABI_INCLUDE)
   add_library(vgpunvshmem SHARED nvidia/src/nvshmem_api.cpp)
   target_link_libraries(vgpunvshmem PRIVATE vgpucudart ${CMAKE_DL_LIBS})
   target_include_directories(vgpunvshmem PRIVATE ${CUDA_ABI_INCLUDE} include)
+  # The PMIx bootstrap (NVSHMEM_BOOTSTRAP=PMI with NVSHMEM_BOOTSTRAP_PMI=PMIX) is built where pmix.h is installed
+  # (libpmix-dev puts it under pmix2/); it loads libpmix.so.2 when used.
+  find_path(VGPU_PMIX_INCLUDE_DIR pmix.h HINTS ENV PMIX_HOME
+            PATHS /usr/lib/x86_64-linux-gnu/pmix2/include /usr/include /usr/local/include)
+  if(VGPU_PMIX_INCLUDE_DIR)
+    target_include_directories(vgpunvshmem PRIVATE ${VGPU_PMIX_INCLUDE_DIR})
+  endif()
   set_target_properties(vgpunvshmem PROPERTIES OUTPUT_NAME nvshmem_host SOVERSION 3 VERSION 3.8)
   target_link_options(vgpunvshmem PRIVATE "-Wl,--version-script=${_nvshmem_map}")
   add_custom_command(TARGET vgpunvshmem POST_BUILD
@@ -961,7 +968,7 @@ libcutensor.2.7.0 {
   # ---------------------------------------------------------------------------
   vgpu_version_script(cutensornet 0 _cutensornet_map)
   add_library(vgpucutensornet SHARED nvidia/src/cutensornet_api.cpp)
-  target_link_libraries(vgpucutensornet PRIVATE vgpucutensor vgpucusolver vgpucudart)
+  target_link_libraries(vgpucutensornet PRIVATE vgpucutensor vgpucusolver vgpucudart ${CMAKE_DL_LIBS})
   target_include_directories(vgpucutensornet PRIVATE ${CUDA_ABI_INCLUDE} include)
   set_target_properties(vgpucutensornet PROPERTIES OUTPUT_NAME cutensornet SOVERSION 2 VERSION 2.14)
   target_link_options(vgpucutensornet PRIVATE "-Wl,--version-script=${_cutensornet_map}")
@@ -1930,7 +1937,7 @@ if(TARGET vgpucublas)
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_frontend:cudnn"
                           "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
                           "dnn_attn_dropout:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_decomp_paths:cutensornet"
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_state_gradient:cutensornet" "cutensornet_decomp_paths:cutensornet"
                           "solver_metis_paths:cusolver:cusparse"
                           "blas_u8gemm_paths:cublas" "blas_emulation_paths:cublas" "sparse_color_paths:cusparse"
                           "lt_emulation_paths:cublasLt:cublas")
@@ -1995,6 +2002,21 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
+  # cuTensorNet distributed over MPI (Open MPI): jobs of two and three ranks, each with its
+  # own simulated GPU, and communication libraries that cannot be used. The checks pass on
+  # NVIDIA's library on two RTX 3060s (run_cutensornet_mpi.sh --card). Skips without Open MPI.
+  # NVSHMEM bootstrapped by MPI (a communicator, NVSHMEM_BOOTSTRAP=MPI or the MPI plugin), PMIx, OpenSHMEM, PMI without
+  # its library, and the settings it refuses: two PEs on one GPU, as the card runs them (run_nvshmem_bootstrap.sh --card).
+  add_test(NAME e2e_nvshmem_bootstrap COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvshmem_bootstrap.sh)
+  set_tests_properties(e2e_nvshmem_bootstrap PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+  add_test(NAME e2e_cutensornet_mpi COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutensornet_mpi.sh)
+  set_tests_properties(e2e_cutensornet_mpi PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # nvJitLink linking relocatable SASS (-rdc cubins, a host object, a static
   # library) for each generation, and running what it links. The program
   # passes on an RTX 3060 with NVIDIA's nvJitLink and with this one.

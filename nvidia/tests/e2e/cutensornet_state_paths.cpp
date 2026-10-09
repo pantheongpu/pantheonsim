@@ -1099,7 +1099,10 @@ struct MpsSetup {
   int center = -1;
   double abs_cut = 0, rel_cut = 0, dw_cut = 0;
   int norm = CUTENSORNET_TENSOR_SVD_NORMALIZATION_NONE;
+  int algo = -1;  // the SVD algorithm of the state (-1: not configured, gesvd)
 };
+
+static int g_mps_status = 0;  // the status of the last StateCompute run_mps made
 
 // Builds a circuit of gates on a pure state, finalizes and computes an MPS.
 // `gates` lists the modes of each operator (random matrices, seeded).
@@ -1135,6 +1138,10 @@ static bool run_mps(const std::vector<std::vector<int>>& gates, const MpsSetup& 
     int32_t nm = su.norm;
     if (cutensornetStateConfigure(h, c.st, CUTENSORNET_STATE_CONFIG_MPS_SVD_S_NORMALIZATION, &nm, 4)) return false;
   }
+  if (su.algo >= 0) {
+    int32_t algo = su.algo;
+    if (cutensornetStateConfigure(h, c.st, CUTENSORNET_STATE_CONFIG_MPS_SVD_ALGO, &algo, 4)) return false;
+  }
   if (cutensornetStateFinalizeMPS(h, c.st, CUTENSORNET_BOUNDARY_CONDITION_OPEN, ep.data(), su.row_major ? sp.data() : nullptr))
     return false;
   delete g_mps_ws;
@@ -1155,7 +1162,8 @@ static bool run_mps(const std::vector<std::vector<int>>& gates, const MpsSetup& 
   std::vector<std::vector<int64_t>> eo((size_t)n, std::vector<int64_t>(3, -1)), so((size_t)n, std::vector<int64_t>(3, -1));
   std::vector<int64_t*> eop((size_t)n), sop((size_t)n);
   for (int i = 0; i < n; ++i) eop[i] = eo[i].data(), sop[i] = so[i].data();
-  if (cutensornetStateCompute(h, c.st, ws->d, eop.data(), sop.data(), ptr.data(), 0)) return false;
+  g_mps_status = cutensornetStateCompute(h, c.st, ws->d, eop.data(), sop.data(), ptr.data(), 0);
+  if (g_mps_status) return false;
   out.ext.assign((size_t)n, {});
   out.str.assign((size_t)n, {});
   out.data.clear();
@@ -1331,6 +1339,32 @@ static void test_mps() {
       std::printf("   measured %-44s norm^2 %.12g fidelity %.12g\n", k.what, nb, f);
       std::snprintf(what, sizeof what, "truncated MPS: %s", k.what);
       check(std::isnan(k.fid) || (std::abs(nb / k.norm2 - 1) < 1e-7 && std::abs(f - k.fid) < 1e-7), what);
+    }
+  }
+  {  // the SVD algorithm of the state is honoured (measured on the card: gesvdj and gesvdp keep the MPS, gesvdr fails)
+    const std::vector<std::vector<int>> gfar = {{0}, {1}, {2}, {3}, {4}, {0, 2}, {1, 3}, {2, 4}, {0, 4}, {3, 1}, {4, 0}};
+    MpsSetup s2;
+    s2.maxb = {2, 2, 2, 2};
+    double base_norm = 0, base_fid = 0;
+    for (int algo : {0, 1, 2, 3}) {
+      rng_state = 777;
+      Circuit c({2, 2, 2, 2, 2});
+      MpsSetup su = s2;
+      su.algo = algo;
+      MpsOut m;
+      const bool ok = run_mps(gfar, su, c, m);
+      const char* names[] = {"gesvd", "gesvdj", "gesvdp", "gesvdr"};
+      char what[160];
+      if (algo == 3) {
+        std::snprintf(what, sizeof what, "an MPS with %s ends StateCompute with INTERNAL_ERROR", names[algo]);
+        check(!ok && g_mps_status == CUTENSORNET_STATUS_INTERNAL_ERROR, what);
+        continue;
+      }
+      double nb = 0;
+      const double f = ok ? fidelity(c.ref.v, mps_dense(m, 5), &nb) : 0;
+      if (algo == 0) base_norm = nb, base_fid = f;
+      std::snprintf(what, sizeof what, "an MPS with %s keeps the best rank-2 bonds (the norm and the fidelity of gesvd's, to 1e-5)", names[algo]);
+      check(ok && std::abs(nb / base_norm - 1) < 1e-5 && std::abs(f - base_fid) < 1e-5, what);
     }
   }
 }
