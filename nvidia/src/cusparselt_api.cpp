@@ -399,6 +399,7 @@ struct SparseView {
   const MatImpl* m;
   bool k_along_cols;
   int64_t nk, k;
+  bool plan = false;   // sized as a plan sizes it (see view_meta_bytes)
   int64_t at(int64_t i, int64_t kk) const {
     return k_along_cols ? offset_of(*m, i, kk) : offset_of(*m, kk, i);
   }
@@ -407,8 +408,8 @@ struct SparseView {
   bool k_contiguous() const { return k_along_cols == (m->order == CUSPARSE_ORDER_ROW); }
 };
 
-SparseView sparse_view(const MatImpl& m, bool isA, int op) {
-  SparseView v{&m, false, 0, 0};
+SparseView sparse_view(const MatImpl& m, bool isA, int op, bool plan = false) {
+  SparseView v{&m, false, 0, 0, plan};
   v.k_along_cols = isA ? op == CUSPARSE_OPERATION_NON_TRANSPOSE : op != CUSPARSE_OPERATION_NON_TRANSPOSE;
   v.nk = v.k_along_cols ? m.rows : m.cols;
   v.k = v.k_along_cols ? m.cols : m.rows;
@@ -471,6 +472,20 @@ size_t values_bytes(int t, int64_t nk, int64_t k) { return (size_t)(nk * (k / 2)
 int64_t line_length(const MatImpl& m) { return m.order == CUSPARSE_ORDER_ROW ? m.cols : m.rows; }
 size_t descriptor_meta_bytes(const MatImpl& m) { return meta_bytes(m.type, lines(m), line_length(m)); }
 size_t descriptor_batch_bytes(const MatImpl& m) { return values_bytes(m.type, m.rows, m.cols) + descriptor_meta_bytes(m); }
+// What a plan asks of the compressed operand. For fp16 and bf16 the metadata is R32(M) x R64(K) / 8 bytes in the
+// operand's logical shape, whatever its memory order (measured on an RTX 3060 over 400 shapes: SpMMACompressedSize
+// of a plan; the descriptor-only CompressedSize2 answers the larger of the two orientations' sizes, which is
+// where the older measurement of this table came from). The other types are sized from the descriptor.
+size_t view_meta_bytes(const SparseView& v) {
+  if (v.plan && (v.m->type == CUDA_R_16F || v.m->type == CUDA_R_16BF))
+    return (size_t)(round_up(v.nk, 32) * round_up(v.k, 64)) / 8;
+  return descriptor_meta_bytes(*v.m);
+}
+size_t view_buffer_bytes(const SparseView& v) {
+  if (v.plan && (v.m->type == CUDA_R_16F || v.m->type == CUDA_R_16BF)) return view_meta_bytes(v);
+  return buffer_bytes(v.m->type, lines(*v.m), line_length(*v.m));
+}
+size_t view_batch_bytes(const SparseView& v) { return values_bytes(v.m->type, v.m->rows, v.m->cols) + view_meta_bytes(v); }
 // A batch stride of 0 is one matrix for every batch, so one compressed copy.
 int64_t compressed_batches(const MatImpl& m) { return m.stride == 0 ? 1 : m.batches; }
 
@@ -690,8 +705,8 @@ std::vector<uint8_t> compress_batch(const SparseView& v, const Dense& m) {
   const int t = m.t;
   const size_t es = type_bytes(t);
   const size_t vb = values_bytes(t, v.nk, v.k);
-  std::vector<uint8_t> out(descriptor_batch_bytes(*v.m), 0);
-  std::vector<uint8_t> meta(descriptor_meta_bytes(*v.m), 0xEE);
+  std::vector<uint8_t> out(view_batch_bytes(v), 0);
+  std::vector<uint8_t> meta(view_meta_bytes(v), 0xEE);
   MetaCodec mc{t, v.nk, v.k, meta.size()};
   const int64_t half = v.k / 2;
   auto value_slot = [&](int64_t i, int64_t c) -> uint8_t* {
@@ -738,7 +753,7 @@ std::vector<float> decompress_batch(const SparseView& v, const uint8_t* c) {
   const bool k_contiguous = v.k_contiguous();
   const size_t es = type_bytes(t);
   const size_t vb = values_bytes(t, nk, k);
-  std::vector<uint8_t> meta(c + vb, c + vb + descriptor_meta_bytes(*v.m));
+  std::vector<uint8_t> meta(c + vb, c + vb + view_meta_bytes(v));
   MetaCodec mc{t, nk, k, meta.size()};
   const int64_t half = k / 2;
   std::vector<float> L((size_t)(nk * k), 0.f);
@@ -878,8 +893,9 @@ size_t workspace_bytes(const MatmulImpl& d) {
   // Measured on an RTX 3060 and an L4 over 280 shapes in fp16, int8 and FP8: the plan asks for exactly the
   // compression buffer of its structured operand (which for the square shapes measured earlier is an eighth of a
   // byte per output element, a quarter for fp32). The simulator uses none of it.
-  const MatImpl& S = d.A.structured ? d.A : d.B;
-  return buffer_bytes(S.type, lines(S), line_length(S)) * (size_t)compressed_batches(S);
+  const bool a = d.A.structured;
+  const MatImpl& S = a ? d.A : d.B;
+  return view_buffer_bytes(sparse_view(S, a, a ? d.opA : d.opB, true)) * (size_t)compressed_batches(S);
 }
 
 
@@ -930,11 +946,11 @@ Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
   const MatmulImpl& d = plan.md;
   const bool sparseA = d.A.structured;
   const MatImpl& S = sparseA ? d.A : d.B;
-  const SparseView sv = sparse_view(S, sparseA, sparseA ? d.opA : d.opB);
+  const SparseView sv = sparse_view(S, sparseA, sparseA ? d.opA : d.opB, true);
   const int64_t m = d.C.rows, n = d.C.cols, k = sv.k;
   const int t = d.A.type, ot = d.C.type;
   const bool int8 = t == CUDA_R_8I;
-  const size_t cbytes = descriptor_batch_bytes(S);
+  const size_t cbytes = view_batch_bytes(sv);
   // Per-row alpha and beta: a device vector of m floats each. Measured: with
   // alpha-vector scaling and no beta vector, beta is not applied at all; a
   // beta vector without an alpha vector reads beta as a device vector (the
@@ -1057,9 +1073,10 @@ struct SparseTarget {
   MatImpl m;
   bool isA;
   int op;
+  bool plan = false;   // asked through a plan (sized as a plan sizes it) rather than a bare descriptor
 };
 SparseTarget target_of(const MatmulImpl& d) {
-  return d.A.structured ? SparseTarget{d.A, true, d.opA} : SparseTarget{d.B, false, d.opB};
+  return d.A.structured ? SparseTarget{d.A, true, d.opA, true} : SparseTarget{d.B, false, d.opB, true};
 }
 
 // Batches of a pruned or checked input: a zero stride is one matrix.
@@ -1103,8 +1120,8 @@ Status compress_call(const char* api, const SparseTarget& tg, const void* d_dens
   if (!compressible_type(tg.m.type)) return refuse(api, std::string("compressing ") + type_name(tg.m.type) + " values");
   const SparseTarget g = tg;
   return in_stream_order(stream, [g, d_dense, d_compressed] {
-    const SparseView v = sparse_view(g.m, g.isA, g.op);
-    const size_t bytes = descriptor_batch_bytes(g.m);
+    const SparseView v = sparse_view(g.m, g.isA, g.op, g.plan);
+    const size_t bytes = view_batch_bytes(v);
     for (int64_t b = 0; b < compressed_batches(g.m); ++b) {
       Dense m;
       if (!load_batch(g.m, d_dense, b, m)) return CUSPARSE_STATUS_EXECUTION_FAILED;
@@ -1124,8 +1141,9 @@ Status sizes(const char* api, const SparseTarget& g, size_t* compressedSize, siz
   // (none extra for a zero stride). NVIDIA's CompressedSize2 counts a single
   // batch for a batched descriptor that no plan has used yet; this one counts
   // them all.
-  *compressedSize = descriptor_batch_bytes(g.m) * (size_t)compressed_batches(g.m);
-  *bufferSize = buffer_bytes(g.m.type, lines(g.m), line_length(g.m)) * (size_t)compressed_batches(g.m);
+  const SparseView v = sparse_view(g.m, g.isA, g.op, g.plan);
+  *compressedSize = view_batch_bytes(v) * (size_t)compressed_batches(g.m);
+  *bufferSize = view_buffer_bytes(v) * (size_t)compressed_batches(g.m);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1404,7 +1422,7 @@ cusparseStatus_t cusparseLtMatmulDescSetAttribute(const cusparseLtHandle_t* hand
     return CUSPARSE_STATUS_SUCCESS;
   };
   // Measured on an L4: GELU takes int8 into int8, and E4M3 or E5M2 into bf16 (no other output, no fp16 or fp32).
-  const bool gelu_ok = (d->A.type == CUDA_R_8I && d->C.type == CUDA_R_8I) || (is_fp8(d->A.type) && d->C.type == CUDA_R_16BF);
+  const bool gelu_ok = (d->A.type == CUDA_R_8I && d->C.type == CUDA_R_8I) || (is_fp8(d->A.type) && d->C.type == CUDA_R_16BF && sm_of_current_device() >= 89);   // (an RTX 3060 refuses it)
   int32_t iv = 0;
   switch (a) {
     case CUSPARSELT_MATMUL_ACTIVATION_RELU:

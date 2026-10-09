@@ -1172,10 +1172,16 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
   // (Each batch's scales are read in its turn below: block scales and per-batch scalars have one tensor per batch.)
 
   int bias_type = md.bias_type;
-  // Measured (L4, cuBLAS 13.3): the default bias is BF16 under an fp32 or FP8 D, as the header's exceptions say.
-  if (md.bias_type < 0) bias_type = (narrow(ld.type) || ld.type == CUDA_R_32F) ? CUDA_R_16BF : ld.type;
+  // Measured (L4, cuBLAS 13.3): under FP8 operands the default bias is BF16 for an fp32 or FP8 D, as the header's exceptions say.
+  if (md.bias_type < 0)
+    bias_type = (narrow(ld.type) || (ld.type == CUDA_R_32F && (narrow(la.type) || narrow(lb.type)))) ? CUDA_R_16BF : ld.type;
   if ((ep.bias || ep.bgrad || ep.bgrada || ep.bgradb) && !elem_bytes(bias_type)) return CUBLAS_STATUS_NOT_SUPPORTED;
 
+  // The epilogue runs in fp32 for the floating-point compute types (an fp64 or int32 matmul keeps its width).
+  const bool f32_epilogue = md.compute == CUBLAS_COMPUTE_32F || md.compute == CUBLAS_COMPUTE_32F_FAST_16F ||
+                            md.compute == CUBLAS_COMPUTE_32F_FAST_16BF || md.compute == CUBLAS_COMPUTE_32F_FAST_TF32 ||
+                            md.compute == CUBLAS_COMPUTE_32F_PEDANTIC;
+  auto rnd32 = [f32_epilogue](double x) { return f32_epilogue ? (double)(float)x : x; };
   const int batch = ld.batch;
   if ((la.batch != 1 && la.batch != batch) || (lb.batch != 1 && lb.batch != batch)) return CUBLAS_STATUS_INVALID_VALUE;
   double amax = 0.0;
@@ -1237,12 +1243,12 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
         const double al = alphas[alpha_vec ? (size_t)i : 0], be = betas[beta_vec ? (size_t)i : 0];
         // The epilogue runs in fp32 as the card's does: the product, the C term and the bias are each rounded to
         // fp32 (measured on an L4: a bias that is not exact in fp32 moves FP8 rounding ties).
-        double v = (float)(al * acc);
-        if (be != 0.0 && !ec.raw.empty()) v = (float)(v + (float)(be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j))));
+        double v = rnd32(al * acc);
+        if (be != 0.0 && !ec.raw.empty()) v = rnd32(v + rnd32(be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j))));
         // RELU_AUX_BIAS and GELU_AUX_BIAS add the bias to the product already rounded to the output type (measured: a bf16 D
         // rounds 9.21875 to 9.25 before adding -2, where RELU_BIAS and BIAS keep 7.21875; an FP8 D rounds to fp16).
         if (!hbias.empty() && (ep.relu || ep.gelu) && ep.aux_out) v = quantize(v, narrow(ld.type) ? (int)CUDA_R_16F : ld.type);
-        if (!hbias.empty()) v = (float)(v + (float)hbias[(size_t)i]);
+        if (!hbias.empty()) v = rnd32(v + rnd32(hbias[(size_t)i]));
         const size_t ax = (size_t)(j * aux_ld + i);
         if (ep.relu) {
           if (relu_aux) {
@@ -1262,7 +1268,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           v *= gelu_grad((float)aux.get(ax));
         }
         // The bias gradient sums the values as stored in D's type, in fp32 (measured: DRELU_BGRAD into bf16).
-        if (ep.bgrad) bgrad[(size_t)i] = (float)(bgrad[(size_t)i] + quantize(v, narrow(ld.type) ? (int)CUDA_R_16BF : ld.type));
+        if (ep.bgrad) bgrad[(size_t)i] = rnd32(bgrad[(size_t)i] + quantize(v, narrow(ld.type) ? (int)CUDA_R_16BF : ld.type));
         amax = std::fmax(amax, std::fabs(v));
         col[(size_t)i] = v;
       }
@@ -1271,7 +1277,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           for (auto& v : col) v *= sd;
         quantize_column(ed, ld, j, col, md.d_out_scale_mode, out_scales, (size_t)m, (size_t)bi * out_tensor);
       } else {
-        for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), (double)(float)(col[(size_t)i] * sd));
+        for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), rnd32(col[(size_t)i] * sd));
       }
     }
     ed.save(dptr);

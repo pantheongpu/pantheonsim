@@ -1812,8 +1812,15 @@ if(TARGET vgpucublas)
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    # The FP8 and block-scaled matmuls need a GPU that has them (an A100 has no FP8 kernel).
+    set(_env "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+    if(_name STREQUAL "lt_paths")
+      list(APPEND _env "VGPU_E2E_GPU=nvidia/h100")
+    elseif(_name STREQUAL "lt_blockscaled_paths")
+      list(APPEND _env "VGPU_E2E_GPU=nvidia/b200")
+    endif()
     set_tests_properties(e2e_${_name} PROPERTIES
-      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      ENVIRONMENT "${_env}"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
@@ -2164,6 +2171,19 @@ if(TARGET vgpucupti)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
+
+  # The narrow-precision library probes (FP8, MXFP8, NVFP4; nvidia/docs/lowprec.md): each prints
+  # one line per descriptor, and the lines are compared with what NVIDIA's own library printed on a
+  # real GPU for the same program (an L4, an RTX 3060: nvidia/tests/data/lowprec/<probe>.<profile>.txt).
+  foreach(_probe IN ITEMS lt sparselt cvt)
+    add_test(NAME e2e_lowprec_${_probe}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lowprec.sh ${_probe})
+    set_tests_properties(e2e_lowprec_${_probe} PROPERTIES
+      DEPENDS "vgpucudart;vgpucublaslt;vgpucusparselt"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 900)
+  endforeach()
 
   # External correlation ids, which a framework's profiler uses to tie a kernel
   # to the operator that launched it.

@@ -76,7 +76,8 @@ if grep -q cudnn_dlhandle "$src"; then
   done
 fi
 status=0
-result="$(VGPU_GPU=nvidia/a100 VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
+# VGPU_E2E_GPU picks another profile (the FP8 and block-scaled checks need a GPU that has them).
+result="$(VGPU_GPU="${VGPU_E2E_GPU:-nvidia/a100}" VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
 if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU' <<< "$result"; then
   echo "FAIL: the program reached an unimplemented entry point or a refused kernel"; exit 1
