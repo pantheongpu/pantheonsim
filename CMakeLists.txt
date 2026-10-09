@@ -2124,6 +2124,18 @@ if(TARGET vgpucublas)
     TIMEOUT 300)
 endif()
 
+# cuFFT's legacy callbacks through NVIDIA's static library, which carries its own
+# cuFFT (skips while the driver shim lacks entry points that library needs).
+if(TARGET vgpucufft)
+  add_test(NAME e2e_fft_legacy_callbacks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_legacy_callbacks.sh)
+  set_tests_properties(e2e_fft_legacy_callbacks PROPERTIES
+    DEPENDS vgpucufft
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+endif()
+
 # A program profiling itself through CUPTI, which is how every profiler reads a
 # CUDA program. Checks the records describe the work that was actually issued.
 if(TARGET vgpucupti)
