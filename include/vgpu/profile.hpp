@@ -84,6 +84,28 @@ struct TelemetryClass {
   uint32_t nvlink_count = 0;
 };
 
+// What CUDA reports of an NVIDIA device beyond its limits (cudaDeviceProp,
+// cudaDeviceGetAttribute, cuDeviceGetAttribute), where it is a fact of the
+// card and not of its compute capability. Each profile's `cuda:` section says
+// where its values came from: read from a card where one was at hand, else
+// the public datasheet. Zero means the profile did not say, and CUDA then
+// reports zero rather than a number made up for it.
+struct CudaClass {
+  // The memory interface's width in bits (cudaDeviceProp::memoryBusWidth).
+  uint32_t memory_bus_width_bits = 0;
+  // The clock CUDA calls clockRate, in kHz: the boost clock a driver reports,
+  // which on GeForce cards is below the highest clock NVML lists (an RTX 3060
+  // says 1837000 here and 2145 MHz there). Zero: the same as the maximum
+  // SM clock in `telemetry`.
+  uint32_t clock_khz = 0;
+  // Copy engines (asyncEngineCount). Zero: not said.
+  uint32_t async_engine_count = 0;
+  // The L2 a program may set aside for persisting accesses
+  // (persistingL2CacheMaxSize), in bytes. Zero: not said, or none (before
+  // compute capability 8.0 there is no access policy window at all).
+  uint64_t persisting_l2_bytes = 0;
+};
+
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd"
@@ -103,6 +125,7 @@ struct DeviceProfile {
   bool verified = false;  // true once hardware characterization confirms values
   Limits limits;
   TelemetryClass telemetry;
+  CudaClass cuda;
   std::map<std::string, bool> features;
 
   // Shared memory the driver keeps back in every block, on top of what the

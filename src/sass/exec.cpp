@@ -451,7 +451,7 @@ void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
   // Where the non-global windows start (a pointer at or past it is not
   // global), and the parameter window: bank 0's own address before sm_90,
   // the parameters' from it.
-  const uint64_t bound = std::min({kSharedWindow, kLocalWindow, kParamWindow});
+  const uint64_t bound = std::min({kConstWindow, kSharedWindow, kLocalWindow, kParamWindow});
   if (sm >= 90) put64(sm >= 100 ? 0x120 : 0xd0, bound);
   if (sm < 90) {
     put64(0x40, kParamWindow);
@@ -662,6 +662,12 @@ Runner::Space Runner::classify(uint64_t g, uint64_t* off) const {
   if (g >= kParamWindow && g < kParamWindow + (uint64_t{1} << 32)) {
     *off = g - kParamWindow;
     return Space::Param;
+  }
+  if (g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32)) {
+    // __constant__ data: a global address of the allocation that holds bank 3
+    const auto it = bank_va_.find(3);
+    *off = it == bank_va_.end() ? g : it->second + (g - kConstWindow);
+    return Space::Global;
   }
   *off = g;
   return Space::Global;

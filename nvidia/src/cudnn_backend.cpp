@@ -28,8 +28,8 @@
 //     tensors are float, half, bfloat16, double or integer, and a HALF
 //     compute type accumulates in half precision, as the hardware does.
 //
-// Declarations and values are cuDNN's own headers (nvidia/third_party/
-// cudnn_include); nothing here is NVIDIA's code.
+// Declarations and values are cuDNN's own headers (fetched at configure time by
+// scripts/fetch-cudnn-headers.py); nothing here is NVIDIA's code.
 #include "cudnn_common.hpp"
 
 #include <algorithm>

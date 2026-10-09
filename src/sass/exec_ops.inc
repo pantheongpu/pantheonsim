@@ -424,7 +424,16 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         const uint32_t r = lop3(read32(w, ins.src[0], l), read32(w, ins.src[1], l), read32(w, ins.src[2], l), ins.f[0]);
         write32(w, d, l, r);
-        if (has_p) set_pred(w, ins.dst[0], l, ins.f[1] ? r == kAll : r != 0);
+        // The last operand is a predicate the answer is ORed with: ptxas chains the low and
+        // high words of a 64-bit "(a & b) != 0" as
+        //   LOP3.LUT P0, RZ, lo_a, lo_b, RZ, 0xc0, !PT
+        //   LOP3.LUT P0, RZ, hi_a, hi_b, RZ, 0xc0,  P0
+        // and !PT, the usual value, is false, which leaves the answer alone. (.PAND is
+        // left as it was: no compiled code that sets it has been checked against a card.)
+        if (has_p) {
+          const bool in = pred(w, ins.src[4], l);
+          set_pred(w, ins.dst[0], l, ins.f[1] ? r == kAll : (r != 0 || in));
+        }
       });
       return;
     }
@@ -845,7 +854,10 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (size == 5) {
         write64(w, ins.dst[0], 0, read64(w, c, 0));
       } else {
-        uint32_t v = read32(w, c, 0);
+        // A narrow load (.U8 .S8 .U16 .S16) takes its bytes out of the aligned word, as the indexed
+        // form above does: c[0x3][0x59] is a byte of the word at 0x58, not a 4-byte load at 0x59.
+        uint32_t v = size < 4 ? cbank32(c.reg, static_cast<uint64_t>(c.imm) & ~3ull) >> (8 * (static_cast<uint64_t>(c.imm) & 3))
+                              : read32(w, c, 0);
         switch (size) {
           case 0: v &= 0xff; break;
           case 1: v = static_cast<uint32_t>(static_cast<int8_t>(v)); break;
@@ -1118,9 +1130,11 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         for (unsigned l = 0; l < 32; ++l) r[l] |= (s[0][l] ^ ma) & (s[1][l] ^ mb) & (s[2][l] ^ mc);
       }
       if (has_p) {
+        if (ins.src.size() < 5) return false;
         Mask pm = 0;
         for (unsigned l = 0; l < 32; ++l)
           if (ins.f[1] ? r[l] == kAll : r[l] != 0) pm |= Mask{1} << l;
+        if (!ins.f[1]) pm |= pmask(ins.src[4]);   // ORed with the predicate operand, as the general path does
         setp(ins.dst[0], pm);
       }
       store(has_p ? ins.dst[1] : ins.dst[0]);
@@ -1818,7 +1832,9 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         const uint64_t g = address(a, l, wide, ur, store ? 64 : 32, 0);
         uint64_t off;
-        const Space sp = generic ? classify(g, &off) : (off = g, Space::Global);
+        // A global load reads the constant window too (see kConstWindow); the other windows are for generic accesses.
+        const bool in_const = g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32);
+        const Space sp = generic || in_const ? classify(g, &off) : (off = g, Space::Global);
         addrs[l] = off;
         space = sp == Space::Global || sp == Space::Param ? 0 : sp == Space::Shared ? 1 : 2;
         // A 32-byte access (ENL2.256) moves two register quads: a store's low

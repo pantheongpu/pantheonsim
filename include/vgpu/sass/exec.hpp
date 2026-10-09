@@ -36,6 +36,11 @@ inline constexpr uint64_t kCodeBase = 0x6ffb'0000'0000ull;
 // __grid_constant__ parameter points into (bank 0 holds the window's
 // address for the kernel to add a parameter's offset to).
 inline constexpr uint64_t kParamWindow = 0x6ffd'0000'0000ull;
+// Where the user's __constant__ data (constant bank 3) shows in the global address space. ptxas forms a
+// pointer to a __constant__ variable as bank 0's word at 0x50 plus the variable's offset
+// (`IMAD.WIDE R2, R3, R2, c[0x0][0x50]`, `ULDC.64 UR4, c[0x0][0x50]`) and reads it with an ordinary
+// global load. It is the lowest of the windows, so it is also the bound below which an address is global.
+inline constexpr uint64_t kConstWindow = 0x6ff9'0000'0000ull;
 inline constexpr uint64_t kBuiltinBase = 0x6ffa'0000'0000ull;
 
 // One .text section: a kernel's code, or a device function's.

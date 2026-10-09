@@ -256,7 +256,7 @@ const QueryField kGpuFields[] = {
     {"ecc.mode.current", nullptr},  {"mig.mode.current", nullptr},
     {"pstate", nullptr},            {"fan.speed", "%"},
     {"memory.total", "MiB"},        {"memory.used", "MiB"},
-    {"memory.free", "MiB"},         {"utilization.gpu", "%"},
+    {"memory.reserved", "MiB"}, {"memory.free", "MiB"},         {"utilization.gpu", "%"},
     {"utilization.memory", "%"},    {"temperature.gpu", nullptr},
     {"power.draw", "W"},            {"power.limit", "W"},
     {"enforced.power.limit", "W"},  {"power.max_limit", "W"},
@@ -523,7 +523,8 @@ std::string query_field(const vgpu::telemetry::DeviceSample& d, uint32_t index,
   if (field == "memory.total") return num(mib(d.vram_total_bytes), "MiB");
   if (field == "memory.used") return num(mib(d.vram_used_bytes), "MiB");
   if (field == "memory.free")
-    return num(mib(d.vram_total_bytes) - mib(d.vram_used_bytes), "MiB");
+    return num(mib(d.vram_total_bytes) - mib(d.vram_reserved_bytes) - mib(d.vram_used_bytes), "MiB");
+  if (field == "memory.reserved") return num(mib(d.vram_reserved_bytes), "MiB");
   if (field == "utilization.gpu") return num(d.utilization_gpu, "%");
   if (field == "utilization.memory") return num(d.utilization_mem, "%");
   if (field == "temperature.gpu") return std::to_string(d.temperature_c);
@@ -865,9 +866,10 @@ void print_verbose(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>
     if (want(kSecMemory)) {
       std::printf("    FB Memory Usage\n");
       std::printf("        %-47s: %d MiB\n", "Total", mib(d.vram_total_bytes));
+      std::printf("        %-47s: %d MiB\n", "Reserved", mib(d.vram_reserved_bytes));
       std::printf("        %-47s: %d MiB\n", "Used", mib(d.vram_used_bytes));
       std::printf("        %-47s: %d MiB\n", "Free",
-                  mib(d.vram_total_bytes) - mib(d.vram_used_bytes));
+                  mib(d.vram_total_bytes) - mib(d.vram_reserved_bytes) - mib(d.vram_used_bytes));
     }
     if (want(kSecCompute)) std::printf("    %-51s: %s\n", "Compute Mode", "Default");
     if (want(kSecUtilization)) {
@@ -1106,8 +1108,10 @@ void print_verbose_xml(const vgpu::telemetry::Shared& s, const std::vector<uint3
     std::printf("\t\t<performance_state>P%u</performance_state>\n", d.perf_state);
     std::printf("\t\t<fb_memory_usage>\n");
     std::printf("\t\t\t<total>%d MiB</total>\n", mib(d.vram_total_bytes));
+    std::printf("\t\t\t<reserved>%d MiB</reserved>\n", mib(d.vram_reserved_bytes));
     std::printf("\t\t\t<used>%d MiB</used>\n", mib(d.vram_used_bytes));
-    std::printf("\t\t\t<free>%d MiB</free>\n", mib(d.vram_total_bytes) - mib(d.vram_used_bytes));
+    std::printf("\t\t\t<free>%d MiB</free>\n",
+                mib(d.vram_total_bytes) - mib(d.vram_reserved_bytes) - mib(d.vram_used_bytes));
     std::printf("\t\t</fb_memory_usage>\n");
     std::printf("\t\t<compute_mode>Default</compute_mode>\n");
     std::printf("\t\t<utilization>\n");

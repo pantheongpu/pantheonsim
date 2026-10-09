@@ -22,6 +22,7 @@ limits:
   max_blocks_per_sm: 16
   max_registers_per_thread: 255
   shared_mem_per_sm: 65536
+  l2_cache_bytes: 4194304          # TU104 datasheet
 features:
   fp16: true
   bf16: false
@@ -38,3 +39,10 @@ telemetry:
   ecc: true                    # supported and on by default (NVIDIA datasheet)
   memory: gddr                 # pages are retired on failure
   pcie_link: "Gen3 x8"         # most common link on real cards (596 runs in the benchmark database)
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: TU104 memory interface and 4 MB L2; three copy engines, as deviceQuery lists them. Turing has no access policy window, so no persisting L2.
+cuda:
+  memory_bus_width_bits: 256
+  async_engine_count: 3
+  persisting_l2_bytes: 0

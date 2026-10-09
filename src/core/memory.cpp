@@ -719,15 +719,31 @@ void MemoryManager::map(uint64_t va, uint64_t size, uint64_t offset, uint64_t ha
 
 void MemoryManager::unmap(uint64_t va, uint64_t size) {
   ExclusiveGuard table_guard(table_lock_.get());
-  auto it = maps_.find(va);
-  if (it == maps_.end() || it->second.size != size)
-    throw Error::make(Err::InvalidValue, "unmapping ", size, " bytes at ", Hex{va},
-                      ": no mapping of exactly that address and size");
-  const uint64_t handle = it->second.handle;
-  maps_.erase(it);
-  auto h = handles_.find(handle);
-  if (h != handles_.end() && h->second.mapped) --h->second.mapped;
-  collect_handle(handle);
+  // The range is whole mappings, one after another: a program that maps a
+  // pool a chunk at a time (ggml's VMM pool) unmaps it all in one call.
+  std::vector<uint64_t> handles;
+  uint64_t at = va;
+  while (size && at < va + size) {
+    auto it = maps_.find(at);
+    if (it == maps_.end() || at + it->second.size > va + size)
+      throw Error::make(Err::InvalidValue, "unmapping ", size, " bytes at ", Hex{va},
+                        ": no mapping of exactly that address and size (a range is whole mappings, and no mapping ",
+                        it == maps_.end() ? "starts at " : "ends where the range does at ", Hex{at}, ")");
+    handles.push_back(it->second.handle);
+    at += it->second.size;
+  }
+  if (handles.empty())
+    throw Error::make(Err::InvalidValue, "unmapping ", size, " bytes at ", Hex{va}, ": no mapping of exactly that address and size");
+  for (uint64_t a = va; a < va + size;) {
+    auto it = maps_.find(a);
+    a += it->second.size;
+    maps_.erase(it);
+  }
+  for (uint64_t handle : handles) {
+    auto h = handles_.find(handle);
+    if (h != handles_.end() && h->second.mapped) --h->second.mapped;
+    collect_handle(handle);
+  }
 }
 
 void MemoryManager::set_access(uint64_t va, uint64_t size, bool readable, bool writable) {

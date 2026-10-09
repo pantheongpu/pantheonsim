@@ -65,6 +65,7 @@ typedef unsigned long long CUdeviceptr;
 typedef struct CUipcEventHandle_st { char reserved[VGPU_CU_IPC_HANDLE_SIZE]; } CUipcEventHandle;
 typedef struct CUipcMemHandle_st { char reserved[VGPU_CU_IPC_HANDLE_SIZE]; } CUipcMemHandle;
 typedef struct CUctx_st* CUcontext;
+typedef struct CUgreenCtx_st* CUgreenCtx;
 typedef struct CUmod_st* CUmodule;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;

@@ -277,6 +277,10 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
   // Deterministic synthetic UUID/bus id, stable for a given profile+ordinal.
   uint32_t h = 2166136261u;
   for (char c : p.id) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
+  // NVIDIA's UUIDs are random, so two devices differ from the first digit and
+  // "GPU-<eight digits>" names one of them, as tools use it (CUDA_VISIBLE_DEVICES).
+  // Device 0 keeps the one it had.
+  if (p.vendor == "nvidia") h ^= static_cast<uint32_t>(ordinal) * 0x9E3779B1u;
   std::snprintf(d->uuid, sizeof d->uuid, "GPU-%08x-%04x-%04x-%04x-%08x%04x", h, (h >> 16) & 0xFFFF,
                 0x4000 | (h & 0x0FFF), 0x8000 | ((h >> 4) & 0x3FFF), h * 2654435761u,
                 static_cast<unsigned>(ordinal));
@@ -290,6 +294,7 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
   // The framebuffer, as nvidia-smi and NVML report it -- not totalGlobalMem,
   // which is what CUDA reports and is a few hundred MiB smaller on real cards.
   d->vram_total_bytes = p.vram_bytes + p.telemetry.framebuffer_reserve_bytes;
+  d->vram_reserved_bytes = p.telemetry.framebuffer_reserve_bytes;
   d->vram_used_bytes = 0;
   d->power_limit_mw = p.telemetry.power_limit_w * 1000;
   d->temperature_max_c = p.telemetry.temperature_max_c;

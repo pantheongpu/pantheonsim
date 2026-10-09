@@ -73,6 +73,7 @@ static_assert(sizeof(cudaDeviceProp) == 1032,
 #include "vgpu/driver_version.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
+#include "vgpu/cuda_attributes.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu/telemetry.hpp"
 #include "vgpu/registry.hpp"
@@ -750,6 +751,12 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
   const cudaError_t rc = [&]() -> cudaError_t {
     try {
       ensure_init(s);
+      // CUDA_VISIBLE_DEVICES showed this program no device, or a bad list:
+      // every call answers it (runtime/visible_devices.hpp).
+      if (const int shown = s.rt->visibility_error()) {
+        g_last_error = static_cast<cudaError_t>(shown);
+        return static_cast<cudaError_t>(shown);
+      }
       // A profiler's own question (vgpu::profiling::Silence) is not the
       // program using the runtime: it binds no context and creates none.
       if (!vgpu::profiling::silenced()) bind_driver_context();
@@ -1616,60 +1623,6 @@ VGPU_EXPORT cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, uns
   });
 }
 
-// A PCI bus id string in any of the forms the documentation lists -- domain,
-// bus, device and function, each hexadecimal, domain and function optional --
-// as the four numbers it names; false when it does not parse. The driver's
-// cuDeviceGetByPCIBusId reads the same forms the same way.
-namespace {
-bool parse_pci_bus_id(const char* text, unsigned long out[4]) {
-  std::vector<std::string> parts;
-  std::string cur;
-  for (const char* c = text; *c; ++c) {
-    if (*c == ':') {
-      parts.push_back(cur);
-      cur.clear();
-    } else {
-      cur += *c;
-    }
-  }
-  parts.push_back(cur);
-  if (parts.size() != 2 && parts.size() != 3) return false;
-  std::string fn = "0";
-  if (const size_t dot = parts.back().find('.'); dot != std::string::npos) {
-    fn = parts.back().substr(dot + 1);
-    parts.back().resize(dot);
-  }
-  if (parts.size() == 2) parts.insert(parts.begin(), "0");
-  parts.push_back(fn);
-  for (int i = 0; i < 4; ++i) {
-    if (parts[static_cast<size_t>(i)].empty()) return false;
-    char* end = nullptr;
-    out[i] = std::strtoul(parts[static_cast<size_t>(i)].c_str(), &end, 16);
-    if (*end) return false;
-  }
-  return true;
-}
-}  // namespace
-
-// The inverse of cudaDeviceGetPCIBusId: a well-formed id that names no device
-// is cudaErrorInvalidDevice, a malformed one cudaErrorInvalidValue.
-VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusId) {
-  unsigned long want[4];
-  if (!device || !pciBusId || !parse_pci_bus_id(pciBusId, want)) return cudaErrorInvalidValue;
-  int count = 0;
-  if (const cudaError_t e = cudaGetDeviceCount(&count); e != cudaSuccess) return e;
-  for (int d = 0; d < count; ++d) {
-    char id[32];
-    unsigned long have[4];
-    if (cudaDeviceGetPCIBusId(id, sizeof id, d) != cudaSuccess) continue;
-    if (parse_pci_bus_id(id, have) && std::equal(have, have + 4, want)) {
-      *device = d;
-      return cudaSuccess;
-    }
-  }
-  return cudaErrorInvalidDevice;
-}
-
 VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int) { return cudaSuccess; }
 VGPU_EXPORT cudaError_t cudaGetDeviceFlags(unsigned int* flags) {
   if (flags) *flags = 0;
@@ -1783,61 +1736,150 @@ VGPU_EXPORT cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device
     std::memset(prop, 0, sizeof *prop);
     std::snprintf(prop->name, sizeof prop->name, "%s", p.model.c_str());
     prop->totalGlobalMem = p.vram_bytes;
-    prop->warpSize = static_cast<int>(p.warp_size);
-    prop->major = p.cc_major;
-    prop->minor = p.cc_minor;
-    prop->multiProcessorCount = static_cast<int>(p.limits.multiprocessors);
-    prop->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-    prop->maxThreadsPerMultiProcessor = static_cast<int>(p.limits.max_threads_per_sm);
-    prop->regsPerMultiprocessor = static_cast<int>(p.limits.registers_per_sm);
-    prop->maxBlocksPerMultiProcessor = static_cast<int>(p.limits.max_blocks_per_sm);
-    prop->sharedMemPerBlock = p.limits.shared_mem_per_block;
-    prop->sharedMemPerBlockOptin = p.limits.shared_mem_per_block_optin;
+    const int physical = s.rt->device(device).physical();
+    // Everything else CUDA says of the device is the table
+    // cudaDeviceGetAttribute and cuDeviceGetAttribute answer from
+    // (vgpu/cuda_attributes.hpp), so the three agree and the values are the
+    // card's where the profile says. The attribute is named by its CUDA 13.2
+    // enumerator.
+    using namespace vgpu::cuda;
+    const auto A = [&](int id) {
+      int v = 0;
+      device_attribute(p, physical, id, &v);
+      return v;
+    };
+    prop->warpSize = A(kWarpSize);
+    prop->major = A(kComputeCapabilityMajor);
+    prop->minor = A(kComputeCapabilityMinor);
+    prop->multiProcessorCount = A(kMultiprocessorCount);
+    prop->maxThreadsPerBlock = A(kMaxThreadsPerBlock);
+    prop->maxThreadsPerMultiProcessor = A(kMaxThreadsPerMultiprocessor);
+    prop->regsPerMultiprocessor = A(kMaxRegistersPerMultiprocessor);
+    prop->maxBlocksPerMultiProcessor = A(kMaxBlocksPerMultiprocessor);
+    prop->sharedMemPerBlock = static_cast<size_t>(A(kMaxSharedMemoryPerBlock));
+    prop->sharedMemPerBlockOptin = static_cast<size_t>(A(kMaxSharedMemoryPerBlockOptin));
     // The SM's whole shared memory, not the per-block opt-in: the two differ
     // by the reserved 1 KiB from compute capability 8.0, and occupancy
     // arithmetic that adds the reservation to a full-size block needs it.
-    prop->sharedMemPerMultiprocessor = p.limits.shared_mem_per_sm;
-    prop->reservedSharedMemPerBlock = p.reserved_smem_per_block();
-    prop->regsPerBlock = static_cast<int>(p.limits.registers_per_block);
-    prop->maxThreadsDim[0] = static_cast<int>(p.limits.max_block_dim[0]);
-    prop->maxThreadsDim[1] = static_cast<int>(p.limits.max_block_dim[1]);
-    prop->maxThreadsDim[2] = static_cast<int>(p.limits.max_block_dim[2]);
-    prop->maxGridSize[0] = static_cast<int>(p.limits.max_grid_dim[0]);
-    prop->maxGridSize[1] = static_cast<int>(p.limits.max_grid_dim[1]);
-    prop->maxGridSize[2] = static_cast<int>(p.limits.max_grid_dim[2]);
-    prop->totalConstMem = 65536;
-    // Performance-related fields (clocks, bus width) are placeholders — VirtualGPU
-    // models no performance. CUDA 13 dropped clockRate/memoryClockRate/computeMode
-    // from cudaDeviceProp entirely.
-    prop->memoryBusWidth = 256;  // placeholder
-    prop->l2CacheSize = 8 * 1024 * 1024;
-    prop->concurrentKernels = 1;
-    prop->unifiedAddressing = 1;
-    prop->canMapHostMemory = 1;
+    prop->sharedMemPerMultiprocessor = static_cast<size_t>(A(kMaxSharedMemoryPerMultiprocessor));
+    prop->reservedSharedMemPerBlock = static_cast<size_t>(A(kReservedSharedMemoryPerBlock));
+    prop->regsPerBlock = A(kMaxRegistersPerBlock);
+    prop->maxThreadsDim[0] = A(kMaxBlockDimX);
+    prop->maxThreadsDim[1] = A(kMaxBlockDimY);
+    prop->maxThreadsDim[2] = A(kMaxBlockDimZ);
+    prop->maxGridSize[0] = A(kMaxGridDimX);
+    prop->maxGridSize[1] = A(kMaxGridDimY);
+    prop->maxGridSize[2] = A(kMaxGridDimZ);
+    prop->totalConstMem = static_cast<size_t>(A(kTotalConstantMemory));
+    prop->memPitch = static_cast<size_t>(A(kMaxPitch));
+    prop->textureAlignment = static_cast<size_t>(A(kTextureAlignment));
+    prop->texturePitchAlignment = static_cast<size_t>(A(kTexturePitchAlignment));
+    prop->surfaceAlignment = static_cast<size_t>(A(kSurfaceAlignment));
+    prop->integrated = A(kIntegrated);
+    prop->canMapHostMemory = A(kCanMapHostMemory);
+    prop->concurrentKernels = A(kConcurrentKernels);
+    prop->ECCEnabled = A(kEccEnabled);
+    prop->tccDriver = A(kTccDriver);
+    prop->asyncEngineCount = A(kAsyncEngineCount);
+    prop->unifiedAddressing = A(kUnifiedAddressing);
+    prop->memoryBusWidth = A(kGlobalMemoryBusWidth);
+    prop->l2CacheSize = A(kL2CacheSize);
+    prop->persistingL2CacheMaxSize = A(kMaxPersistingL2CacheSize);
+    prop->accessPolicyMaxWindowSize = A(kMaxAccessPolicyWindowSize);
+    prop->streamPrioritiesSupported = A(kStreamPrioritiesSupported);
+    prop->globalL1CacheSupported = A(kGlobalL1CacheSupported);
+    prop->localL1CacheSupported = A(kLocalL1CacheSupported);
+    prop->managedMemory = A(kManagedMemory);
+    prop->isMultiGpuBoard = A(kMultiGpuBoard);
+    prop->multiGpuBoardGroupID = A(kMultiGpuBoardGroupId);
+    prop->hostNativeAtomicSupported = A(kHostNativeAtomicSupported);
+    prop->pageableMemoryAccess = A(kPageableMemoryAccess);
+    prop->concurrentManagedAccess = A(kConcurrentManagedAccess);
+    prop->computePreemptionSupported = A(kComputePreemptionSupported);
+    prop->canUseHostPointerForRegisteredMem = A(kCanUseHostPointerForRegisteredMem);
     // The capabilities cudaDeviceGetAttribute reports, reported here too: the
     // CUDA samples read these fields, and reductionMultiBlockCG waived itself
     // on a cooperativeLaunch of 0 while the attribute said 1.
-    prop->cooperativeLaunch = 1;
-    prop->asyncEngineCount = 1;
-    prop->hostRegisterSupported = 1;
-    prop->managedMemory = 1;
-    prop->concurrentManagedAccess = 1;
-    prop->memoryPoolsSupported = 1;
+    prop->cooperativeLaunch = A(kCooperativeLaunch);
+    prop->pageableMemoryAccessUsesHostPageTables = A(kPageableMemoryAccessUsesHostPageTables);
+    prop->directManagedMemAccessFromHost = A(kDirectManagedMemAccessFromHost);
+    prop->hostRegisterSupported = A(kHostRegisterSupported);
+    prop->sparseCudaArraySupported = A(kSparseCudaArraySupported);
+    prop->hostRegisterReadOnlySupported = A(kReadOnlyHostRegisterSupported);
+    prop->timelineSemaphoreInteropSupported = A(kTimelineSemaphoreInteropSupported);
+    prop->memoryPoolsSupported = A(kMemoryPoolsSupported);
+    prop->gpuDirectRDMASupported = A(kGpuDirectRdmaSupported);
+    prop->gpuDirectRDMAFlushWritesOptions = static_cast<unsigned int>(A(kGpuDirectRdmaFlushWritesOptions));
+    prop->gpuDirectRDMAWritesOrdering = A(kGpuDirectRdmaWritesOrdering);
+    prop->memoryPoolSupportedHandleTypes = static_cast<unsigned int>(A(kMempoolSupportedHandleTypes));
+    prop->deferredMappingCudaArraySupported = A(kDeferredMappingCudaArraySupported);
+    prop->ipcEventSupported = A(kIpcEventSupported);
+    prop->clusterLaunch = A(kClusterLaunch);
+    prop->unifiedFunctionPointers = A(kUnifiedFunctionPointers);
+    prop->pciBusID = A(kPciBusId);
+    prop->pciDeviceID = A(kPciDeviceId);
+    prop->pciDomainID = A(kPciDomainId);
+    prop->maxTexture1D = A(kMaximumTexture1dWidth);
+    prop->maxTexture1DMipmap = A(kMaximumTexture1dMipmappedWidth);
+    prop->maxTexture2D[0] = A(kMaximumTexture2dWidth);
+    prop->maxTexture2D[1] = A(kMaximumTexture2dHeight);
+    prop->maxTexture2DMipmap[0] = A(kMaximumTexture2dMipmappedWidth);
+    prop->maxTexture2DMipmap[1] = A(kMaximumTexture2dMipmappedHeight);
+    prop->maxTexture2DLinear[0] = A(kMaximumTexture2dLinearWidth);
+    prop->maxTexture2DLinear[1] = A(kMaximumTexture2dLinearHeight);
+    prop->maxTexture2DLinear[2] = A(kMaximumTexture2dLinearPitch);
+    prop->maxTexture2DGather[0] = A(kMaximumTexture2dGatherWidth);
+    prop->maxTexture2DGather[1] = A(kMaximumTexture2dGatherHeight);
+    prop->maxTexture3D[0] = A(kMaximumTexture3dWidth);
+    prop->maxTexture3D[1] = A(kMaximumTexture3dHeight);
+    prop->maxTexture3D[2] = A(kMaximumTexture3dDepth);
+    prop->maxTexture3DAlt[0] = A(kMaximumTexture3dWidthAlternate);
+    prop->maxTexture3DAlt[1] = A(kMaximumTexture3dHeightAlternate);
+    prop->maxTexture3DAlt[2] = A(kMaximumTexture3dDepthAlternate);
+    prop->maxTextureCubemap = A(kMaximumTexturecubemapWidth);
+    prop->maxTexture1DLayered[0] = A(kMaximumTexture1dLayeredWidth);
+    prop->maxTexture1DLayered[1] = A(kMaximumTexture1dLayeredLayers);
+    prop->maxTexture2DLayered[0] = A(kMaximumTexture2dLayeredWidth);
+    prop->maxTexture2DLayered[1] = A(kMaximumTexture2dLayeredHeight);
+    prop->maxTexture2DLayered[2] = A(kMaximumTexture2dLayeredLayers);
+    prop->maxTextureCubemapLayered[0] = A(kMaximumTexturecubemapLayeredWidth);
+    prop->maxTextureCubemapLayered[1] = A(kMaximumTexturecubemapLayeredLayers);
+    prop->maxSurface1D = A(kMaximumSurface1dWidth);
+    prop->maxSurface2D[0] = A(kMaximumSurface2dWidth);
+    prop->maxSurface2D[1] = A(kMaximumSurface2dHeight);
+    prop->maxSurface3D[0] = A(kMaximumSurface3dWidth);
+    prop->maxSurface3D[1] = A(kMaximumSurface3dHeight);
+    prop->maxSurface3D[2] = A(kMaximumSurface3dDepth);
+    prop->maxSurface1DLayered[0] = A(kMaximumSurface1dLayeredWidth);
+    prop->maxSurface1DLayered[1] = A(kMaximumSurface1dLayeredLayers);
+    prop->maxSurface2DLayered[0] = A(kMaximumSurface2dLayeredWidth);
+    prop->maxSurface2DLayered[1] = A(kMaximumSurface2dLayeredHeight);
+    prop->maxSurface2DLayered[2] = A(kMaximumSurface2dLayeredLayers);
+    prop->maxSurfaceCubemap = A(kMaximumSurfacecubemapWidth);
+    prop->maxSurfaceCubemapLayered[0] = A(kMaximumSurfacecubemapLayeredWidth);
+    prop->maxSurfaceCubemapLayered[1] = A(kMaximumSurfacecubemapLayeredLayers);
 #if CUDART_VERSION < 13000
-    prop->deviceOverlap = 1;
+    // Fields CUDA 13 removed (cudaDeviceGetAttribute still answers them).
+    prop->clockRate = A(kClockRate);
+    prop->memoryClockRate = A(kMemoryClockRate);
+    prop->computeMode = A(kComputeMode);
+    prop->cooperativeMultiDeviceLaunch = A(kCooperativeMultiDeviceLaunch);
+    prop->deviceOverlap = A(kGpuOverlap);
+    prop->kernelExecTimeoutEnabled = A(kKernelExecTimeout);
+    prop->maxTexture1DLinear = A(kMaximumTexture1dLinearWidth);
+    prop->singleToDoublePrecisionPerfRatio = A(kSingleToDoublePrecisionPerfRatio);
+#else
+    // And the ones it added.
+    prop->deviceNumaConfig = A(kNumaConfig);
+    prop->deviceNumaId = A(kNumaId);
+    prop->mpsEnabled = A(kMpsEnabled);
+    prop->hostNumaId = A(kHostNumaId);
+    prop->gpuPciDeviceID = static_cast<unsigned int>(A(kGpuPciDeviceId));
+    prop->gpuPciSubsystemID = static_cast<unsigned int>(A(kGpuPciSubsystemId));
+    prop->hostNumaMultinodeIpcSupported = A(kHostNumaMultinodeIpcSupported);
 #endif
-    prop->pciBusID = device + 1;
-    prop->pciDeviceID = 0;
-    prop->integrated = 0;
-    prop->ECCEnabled = 0;
-    prop->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
-    // Deterministic fake UUID (matches the driver shim scheme).
-    unsigned char b[16] = {'V', 'G', 'P', 'U'};
-    uint32_t h = 2166136261u;
-    for (char c : p.id) h = (h ^ static_cast<unsigned char>(c)) * 16777619u;
-    std::memcpy(b + 4, &h, 4);
-    b[8] = static_cast<unsigned char>(device);
-    std::memcpy(&prop->uuid, b, 16);
+    // The UUID NVML and the driver report for the device (the "GPU-" one).
+    std::memcpy(&prop->uuid, identity(p, physical).uuid, 16);
     return cudaSuccess;
   });
 }
@@ -1852,83 +1894,20 @@ static cudaError_t device_attribute(State& s, int* value, int attr, int device) 
     if (!value) return cudaErrorInvalidValue;
     if (device < 0 || device >= s.rt->device_count()) return cudaErrorInvalidDevice;
     const vgpu::DeviceProfile& p = s.rt->device(device).profile();
-    // Named rather than numbered: these used to be the ordinals of
-    // cudaDeviceAttr, which is a table that only has to be renumbered once.
-    switch (attr) {
-      case cudaDevAttrMaxThreadsPerBlock: *value = static_cast<int>(p.limits.max_threads_per_block); break;
-      case cudaDevAttrMaxBlockDimX: *value = static_cast<int>(p.limits.max_block_dim[0]); break;
-      case cudaDevAttrMaxBlockDimY: *value = static_cast<int>(p.limits.max_block_dim[1]); break;
-      case cudaDevAttrMaxBlockDimZ: *value = static_cast<int>(p.limits.max_block_dim[2]); break;
-      // CUB clamps its tile count to the maximum grid extent. Reporting zero
-      // for it -- which the silent default below used to do -- asked the device
-      // to run no blocks at all, and every scan failed to launch.
-      case cudaDevAttrMaxGridDimX: *value = static_cast<int>(p.limits.max_grid_dim[0]); break;
-      case cudaDevAttrMaxGridDimY: *value = static_cast<int>(p.limits.max_grid_dim[1]); break;
-      case cudaDevAttrMaxGridDimZ: *value = static_cast<int>(p.limits.max_grid_dim[2]); break;
-      case cudaDevAttrMaxSharedMemoryPerBlock: *value = static_cast<int>(p.limits.shared_mem_per_block); break;
-      case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = static_cast<int>(p.limits.shared_mem_per_block_optin); break;
-      case cudaDevAttrMaxSharedMemoryPerMultiprocessor: *value = static_cast<int>(p.limits.shared_mem_per_sm); break;
-      case cudaDevAttrReservedSharedMemoryPerBlock: *value = static_cast<int>(p.reserved_smem_per_block()); break;
-      case cudaDevAttrMaxRegistersPerBlock: *value = static_cast<int>(p.limits.registers_per_block); break;
-      case cudaDevAttrMaxRegistersPerMultiprocessor: *value = static_cast<int>(p.limits.registers_per_sm); break;
-      case cudaDevAttrMaxThreadsPerMultiProcessor: *value = static_cast<int>(p.limits.max_threads_per_sm); break;
-      case cudaDevAttrMaxBlocksPerMultiprocessor: *value = static_cast<int>(p.limits.max_blocks_per_sm); break;
-      case cudaDevAttrWarpSize: *value = static_cast<int>(p.warp_size); break;
-      case cudaDevAttrMultiProcessorCount: *value = static_cast<int>(p.limits.multiprocessors); break;
-      case cudaDevAttrComputeCapabilityMajor: *value = p.cc_major; break;
-      case cudaDevAttrComputeCapabilityMinor: *value = p.cc_minor; break;
-      case cudaDevAttrTotalConstantMemory: *value = 64 * 1024; break;
-      case cudaDevAttrClockRate: *value = static_cast<int>(p.telemetry.sm_clock_max_mhz) * 1000; break;
-      case cudaDevAttrMemoryClockRate: *value = static_cast<int>(p.telemetry.mem_clock_max_mhz) * 1000; break;
-      case cudaDevAttrPciBusId: *value = 0; break;
-      case cudaDevAttrPciDeviceId: *value = device; break;
-      case cudaDevAttrPciDomainId: *value = 0; break;
-      // Capabilities, where zero is the answer rather than the absence of one.
-      case cudaDevAttrUnifiedAddressing: *value = 1; break;
-      case cudaDevAttrConcurrentKernels: *value = 1; break;
-      case cudaDevAttrAsyncEngineCount: *value = 1; break;
-      // A copy may overlap a kernel, as the one copy engine above says (an RTX
-      // 3060 answers 1; simpleMultiCopy asks).
-      case cudaDevAttrGpuOverlap: *value = 1; break;
-      // No watchdog stops a kernel. The card under WSL answers 1: its display
-      // driver has one.
-      case cudaDevAttrKernelExecTimeout: *value = 0; break;
-      // cudaHostRegister works; read-only registration does not, and the
-      // device pointer of registered memory is reported rather than assumed,
-      // as the driver answers both (HOST_REGISTER_*, 99 and 113; 91).
-      case cudaDevAttrHostRegisterSupported: *value = 1; break;
-      case cudaDevAttrHostRegisterReadOnlySupported: *value = 0; break;
-      case cudaDevAttrCanUseHostPointerForRegisteredMem: *value = 0; break;
-      case cudaDevAttrIntegrated: *value = 0; break;
-      case cudaDevAttrEccEnabled: *value = 0; break;
-      // Pinned and registered host memory is mapped into every device at its
-      // host address; see cudaHostGetDevicePointer.
-      case cudaDevAttrCanMapHostMemory: *value = 1; break;
-      case cudaDevAttrManagedMemory: *value = 1; break;
-      // The host and the device may touch managed memory at the same time, as
-      // on Linux since Pascal (Windows and WSL answer 0): here it is one
-      // host allocation. NanoVDB's DeviceStreamMap filters devices on it.
-      case cudaDevAttrConcurrentManagedAccess: *value = 1; break;
-      // Grid-wide sync works under cudaLaunchCooperativeKernel; the
-      // multi-device form does not.
-      case cudaDevAttrCooperativeLaunch: *value = 1; break;
-      case cudaDevAttrComputeMode: *value = 0; break;         // cudaComputeModeDefault
-      // The stream-ordered allocator is implemented: cudaMallocAsync and the
-      // cudaMemPool* API (an RTX 3060 answers 1; NanoVDB checks that the two
-      // agree). No pool can be exported to another process, so no handle types.
-      case cudaDevAttrMemoryPoolsSupported: *value = 1; break;
-      case cudaDevAttrMemoryPoolSupportedHandleTypes: *value = 0; break;
-      default:
-        // A silent zero here is how a scan came to launch no blocks. An
-        // attribute this does not model is reported, so the caller either
-        // handles it or fails where the cause is visible -- rather than being
-        // told the device has none of whatever it asked about.
-        if (!quiet())
-          std::fprintf(stderr,
-                       "[vgpu] cudaDeviceGetAttribute: attribute %d is not modelled by this "
-                       "profile; add it to runtime_api.cpp rather than assuming zero\n",
-                       static_cast<int>(attr));
-        return cudaErrorInvalidValue;
+    // cudaDeviceAttr's numbers are CUdevice_attribute's, and one table
+    // answers both (vgpu/cuda_attributes.hpp). The value is read as the
+    // integer the ABI passes: a caller built against a newer toolkit may pass
+    // one this header does not enumerate, and loading it as the enum is
+    // undefined.
+    int id;
+    static_assert(sizeof(attr) == sizeof(int), "cudaDeviceAttr is not int-sized");
+    std::memcpy(&id, &attr, sizeof id);
+    // An attribute this does not know is refused, as the card refuses one it
+    // does not: a silent zero is how a scan came to launch no blocks.
+    if (!vgpu::cuda::device_attribute(p, s.rt->device(device).physical(), id, value)) {
+      if (!quiet())
+        std::fprintf(stderr, "[vgpu] cudaDeviceGetAttribute: attribute %d is not a CUDA device attribute\n", id);
+      return cudaErrorInvalidValue;
     }
     return cudaSuccess;
   }
@@ -3063,11 +3042,12 @@ VGPU_EXPORT cudaError_t cudaDeviceGetLimit(size_t* value, cudaLimit limit) {
 }
 
 // Streams are executed inline, so every priority is equally honoured. CUDA
-// reports the range as [greatest, least] with lower meaning higher priority.
+// reports the range as [greatest, least] with lower meaning higher priority:
+// 0 and -5 on an RTX 3060.
 VGPU_EXPORT cudaError_t cudaDeviceGetStreamPriorityRange(int* least, int* greatest) {
   if (const cudaError_t dead = dead_context()) return dead;
-  if (least) *least = 0;
-  if (greatest) *greatest = 0;
+  if (least) *least = vgpu::cuda::kLeastStreamPriority;
+  if (greatest) *greatest = vgpu::cuda::kGreatestStreamPriority;
   return cudaSuccess;
 }
 static cudaError_t cudaStreamCreateWithPriority_body(cudaStream_t* s, unsigned int flags,
@@ -3541,12 +3521,54 @@ VGPU_EXPORT cudaError_t cudaDeviceGetPCIBusId(char* buf, int len, int device) {
     if (!buf || len <= 0) return cudaErrorInvalidValue;
     if (device < 0 || device >= static_cast<int>(st.rt->device_count()))
       return cudaErrorInvalidDevice;
-    // Same identity NVML reports, so a framework that parses one and compares
-    // against the other sees a consistent device.
-    vgpu::telemetry::DeviceSample snap{};
-    vgpu::telemetry::describe_device(st.rt->device(device).profile(), device, &snap);
-    std::snprintf(buf, static_cast<size_t>(len), "%s", snap.bus_id);
-    return cudaSuccess;
+    // The address NVML reports for the device, so a framework that parses one
+    // and compares against the other sees a consistent device. CUDA writes
+    // the domain with four digits, NVML with eight.
+    char text[32];
+    vgpu::cuda::pci_bus_id(vgpu::cuda::identity(st.rt->device(device).profile(), st.rt->device(device).physical()),
+                           text, sizeof text);
+    const int n = std::snprintf(buf, static_cast<size_t>(len), "%s", text);
+    return n < len ? cudaSuccess : cudaErrorInvalidValue;
+  });
+}
+
+// The device a PCI bus id names: "[domain:]bus:device[.function]", each part
+// hexadecimal, as the driver reads it (cuDeviceGetByPCIBusId). A well-formed
+// id naming no device is cudaErrorInvalidDevice, a malformed one
+// cudaErrorInvalidValue.
+VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusId) {
+  return guard("cudaDeviceGetByPCIBusId", [&](State& st) -> cudaError_t {
+    if (!device || !pciBusId) return cudaErrorInvalidValue;
+    std::vector<std::string> parts(1);
+    for (const char* c = pciBusId; *c; ++c) {
+      if (*c == ':') parts.emplace_back();
+      else parts.back() += *c;
+    }
+    if (parts.size() != 2 && parts.size() != 3) return cudaErrorInvalidValue;
+    std::string fn = "0";
+    if (const size_t dot = parts.back().find('.'); dot != std::string::npos) {
+      fn = parts.back().substr(dot + 1);
+      parts.back().resize(dot);
+    }
+    if (parts.size() == 2) parts.insert(parts.begin(), "0");
+    parts.push_back(fn);
+    unsigned long want[4];
+    for (int i = 0; i < 4; ++i) {
+      if (parts[static_cast<size_t>(i)].empty()) return cudaErrorInvalidValue;
+      char* end = nullptr;
+      want[i] = std::strtoul(parts[static_cast<size_t>(i)].c_str(), &end, 16);
+      if (*end) return cudaErrorInvalidValue;
+    }
+    for (int d = 0; d < st.rt->device_count(); ++d) {
+      const vgpu::cuda::Identity id =
+          vgpu::cuda::identity(st.rt->device(d).profile(), st.rt->device(d).physical());
+      if (want[0] == static_cast<unsigned long>(id.domain) && want[1] == static_cast<unsigned long>(id.bus) &&
+          want[2] == static_cast<unsigned long>(id.device) && want[3] == static_cast<unsigned long>(id.function)) {
+        *device = d;
+        return cudaSuccess;
+      }
+    }
+    return cudaErrorInvalidDevice;
   });
 }
 

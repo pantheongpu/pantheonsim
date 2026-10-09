@@ -1060,7 +1060,7 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
     if (c.cluster == std::array<uint32_t, 3>{0, 0, 0}) c.cluster = fn.req_cluster;
     exec::validate_launch(fn, c, profile_);
     report_counters(ordinal_, fn.name, c, sass::launch(*fn.sass, fn.name, c, args, mem_, profile_));
-    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(ordinal_), 0.0);
+    if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);   // the machine's slot, not the program's index
     return;
   }
   if (!telemetry_) {
