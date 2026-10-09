@@ -355,6 +355,14 @@ status=$?
 expect "the gfx1250 instruction program runs to the end" "0" "$status"
 expect "every gfx1250 instruction check holds" "7 of 7" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
 
+# gfx1250's matrix instructions (hipcc/wmma1250.cpp): dense WMMA in half, bfloat16, float and 8-bit float and integer,
+# sparse SWMMAC, the mixed 8-, 6- and 4-bit forms and the block-scaled forms, each against the host. The dense checks
+# do not depend on the order of K; the sparse, mixed-width and scaled ones use the layouts in AMD's CDNA 5 ISA document.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/wmma1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 matrix program runs to the end" "0" "$status"
+expect "every gfx1250 matrix check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

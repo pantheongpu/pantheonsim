@@ -502,6 +502,12 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       main.src.push_back(operand(bits(prefix, 40, 32), x2 ? 1 : 2));
       main.src.push_back(operand(bits(prefix, 49, 41), x2 ? 1 : 2));
       main.src[main.src.size() - 2].scale_src = main.src.back().scale_src = true;
+      // The prefix's SCL_NEG (A's scale format, bits 62:61), SCL_NEG_HI (B's, 9:8) and the lane-half selects
+      // (SCL_OPSEL bit 11 for A, SCL_OPSEL_HI bit 59 for B).
+      main.scale_fmt_a = static_cast<uint8_t>(bits(prefix, 62, 61));
+      main.scale_fmt_b = static_cast<uint8_t>(bits(prefix, 9, 8));
+      main.scale_hi_a = bits(prefix, 11, 11);
+      main.scale_hi_b = bits(prefix, 59, 59);
       main.pc = pc;
       main.size = 16;
       return main;

@@ -162,6 +162,10 @@ struct Inst {
   // into the high one, a bit per source. (The mixed-precision forms use
   // these bits as each source's negation and absolute value instead, and the
   // decoder puts them on the operands.)
+  // gfx1250's scaled matrix instructions (the prefix word's fields): the format of each matrix's scale values
+  // (0 E8M0, 1 E5M3, 2 E4M3) and whether a scale is read from the upper 16 lanes of its register.
+  uint8_t scale_fmt_a = 0, scale_fmt_b = 0;
+  bool scale_hi_a = false, scale_hi_b = false;
   uint8_t neg_lo = 0;
   uint8_t neg_hi = 0;
   // MUBUF: whether the address register holds an offset into the buffer, an

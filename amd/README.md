@@ -372,9 +372,14 @@ false` throughout. gfx1251 (MI430X) is not covered.
   `v_mad_u32`, `v_mad_nc_u64_u32`, `v_mad_nc_i64_i32`, `v_add_max`/`v_add_min` (clamped add, then the other
   operand); `v_ashr_pk_i8_i32`, `v_sat_pk4_*`, `v_tanh_{f32,f16,bf16}` and the bfloat16 transcendentals, fp8 to half
   conversions; f64 atomics, `*_prefetch_b8` (a no-op) and `*_load_monitor_*` (a load).
-- **Decoded and printed, but refused when executed:** the matrix instructions (`v_wmma_*`, `v_swmmac_*`, including the
-  scaled forms), because the register layouts they use are in AMD's ISA document, not in the XML or in anything
-  available here, and a guess would pass its own tests; the tensor data mover (`tensor_load_to_lds`,
+- **Matrix instructions, executed from AMD's CDNA 5 ISA document:** `v_wmma_*` (f16, bf16, f32, fp8/bf8, iu8, the
+  mixed 8-, 6- and 4-bit `f8f6f4` forms, and the block-scaled forms with E8M0, E5M3 and E4M3 scales), and the sparse
+  `v_swmmac_*`. The lane layouts, the sparse index words and the scale selection come from the document's tables and
+  pseudocode. Each product is summed exactly and rounded once, so the last bit can differ from hardware that sums in a
+  fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
+  `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
+  sparse, mixed-width and scaled ones depend on the layout read from the document.
+- **Decoded and printed, but refused when executed:** the tensor data mover (`tensor_load_to_lds`,
   `tensor_store_from_lds`); cluster loads, asynchronous loads to and from LDS, the transposed loads
   (`*_load_tr*`, `ds_load_tr*`); the named-barrier instructions; `s_set_vgpr_msb` with a non-zero value (vector
   registers past v255); `v_permlane_*` of the new kinds, `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16

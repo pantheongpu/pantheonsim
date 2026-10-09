@@ -79,7 +79,9 @@ Place place_of(const Dispatch& d, uint64_t group) {
   return {static_cast<uint32_t>(group % dies), u % engines, u / engines % arrays, u / (engines * arrays)};
 }
 
-uint64_t lds_limit(const Dispatch& d) { return d.object && d.object->gfx950() ? 160 * 1024 : kLdsPerComputeUnit; }
+uint64_t lds_limit(const Dispatch& d) {
+  return d.object && d.object->gfx1250() ? 320 * 1024 : d.object && d.object->gfx950() ? 160 * 1024 : kLdsPerComputeUnit;
+}
 // And a work-item's private memory, which the wave reads the aperture of from
 // src_private_base: an address in it is an offset into the work-item's own.
 constexpr uint64_t kPrivateBase = 0x1800'0000'0000ull;
@@ -1968,6 +1970,8 @@ struct Machine {
       } else {
         write_scalar(w, in.dst[0], as_bits(static_cast<float>(r)));
       }
+    } else if (in.arch == gcn::Target::Gfx1250 && (op.rfind("v_wmma_", 0) == 0 || op.rfind("v_swmmac_", 0) == 0)) {
+      wmma1250(w, in, op);
     } else if (op.rfind("v_wmma_", 0) == 0) {
       wmma(w, in, op);
     } else if (op == "v_xor3_b32"_op) {
@@ -2105,6 +2109,265 @@ struct Machine {
     const uint32_t regs = in.dst[0].width;
     for (uint32_t lane = 0; lane < 32; ++lane)
       for (uint32_t r = 0; r < regs && r < 8; ++r) set_word(w, in.dst[0], r, lane, result[lane][r]);
+  }
+
+
+  // gfx1250 (CDNA 5) matrix instructions: v_wmma_*, the sparse v_swmmac_*, and the block-scaled v_wmma_scale*. The
+  // layouts are those of AMD's CDNA5 ISA (section 7.12.2 on, "Matrix Element Storage in VGPRs"), wave32 only:
+  //   C and D, 32 bits, 16x16: lane n + 16 * (m / 8 % 2), register m % 8 (+ 8 for m >= 16 of a 32x16); 16 bits: register
+  //     m % 8 / 2, half m % 2.
+  //   A (and B, with N for M), by element size: 32 bits, lane m + 16 * (k / 2), register k % 2; 16 bits, lane
+  //     m + 16 * (k % 16 / 8), register 4 * (k / 16) + k % 8 / 2; 8 bits (the fp8, bf8 and iu8 forms), lane
+  //     m + 16 * (k % 16 / 8), register 8 * (k / 64) + 4 * (k % 64 / 32) + 2 * (k % 32 / 16) + k % 8 / 4; the f8f6f4 forms'
+  //     8 bits, lane m + 16 * (k % 32 / 16), register 4 * (k / 32) + k % 16 / 4; their 6 bits, lane m + 16 * (k % 64 / 32),
+  //     6 registers to each 32 k; their 4 bits, lane m + 16 * (k % 64 / 32), register 4 * (k / 64) + k % 32 / 8.
+  //   The sparse A packs two of every four k, stored as B is for the sparse forms (16-bit: lane m + 16 * (k / 16),
+  //     register k % 16 / 2; 8-bit: lane m + 16 * (k % 32 / 16), register 4 * (k / 32) + k % 16 / 4), with the two 2-bit
+  //     positions of each pair in the index register of the lane that holds the element.
+  // Each output is summed exactly (double) and rounded once, to nearest even; the hardware's order of summation is not
+  // published, so a last-bit difference is possible. FP16_OVFL is not modeled: a result too large for a 16-bit type is
+  // an infinity.
+  enum class MF { F32, F16, BF16, FP8, BF8, FP6, BF6, FP4, IU8 };
+  void wmma1250(Wave& w, const Inst& in, const OpName& op_in) {
+    if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu)
+      throw Error::make(Err::Unsupported, in.name, " with lanes switched off, or in a wave64: WMMA needs EXEC all ones in wave32");
+    std::string name = op_in;
+    if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
+      name.resize(name.size() - 4);
+    const bool sparse = name.rfind("v_swmmac_", 0) == 0;
+    std::string rest = name.substr(sparse ? 9 : 7);
+    bool scaled = false;
+    uint32_t block = 32;
+    if (rest.rfind("scale16_", 0) == 0) scaled = true, block = 16, rest = rest.substr(8);
+    else if (rest.rfind("scale_", 0) == 0) scaled = true, rest = rest.substr(6);
+    const std::string out = rest.substr(0, rest.find('_'));        // f32 f16 bf16 bf16f32 i32
+    rest = rest.substr(out.size() + 1);
+    const size_t x1 = rest.find('x'), x2 = rest.find('x', x1 + 1), us = rest.find('_');
+    const uint32_t M = static_cast<uint32_t>(std::stoul(rest.substr(0, x1))), K = static_cast<uint32_t>(std::stoul(rest.substr(x2 + 1, us - x2 - 1)));
+    const std::string types = rest.substr(us + 1);                  // f16, bf16, f32, fp8_bf8, iu8, f8f6f4, f4
+    const auto parse = [](const std::string& t) {
+      return t == "f32" ? MF::F32 : t == "f16" ? MF::F16 : t == "bf16" ? MF::BF16 : t == "fp8" ? MF::FP8
+             : t == "bf8" ? MF::BF8 : t == "iu8" ? MF::IU8 : MF::FP4;
+    };
+    MF fa, fb;
+    const bool small = types == "f8f6f4" || types == "f4";
+    if (types == "f8f6f4") {
+      static const MF kType[5] = {MF::FP8, MF::BF8, MF::FP6, MF::BF6, MF::FP4};
+      const uint32_t ta = in.op_sel & 7, tb = in.op_sel_hi & 7;
+      if (ta > 4 || tb > 4) throw Error::make(Err::InvalidValue, in.name, " names a matrix format that does not exist (", ta, ", ", tb, ")");
+      fa = kType[ta], fb = kType[tb];
+    } else if (types == "f4") {
+      fa = fb = MF::FP4;
+    } else if (types.find('_') != std::string::npos) {
+      fa = parse(types.substr(0, types.find('_'))), fb = parse(types.substr(types.find('_') + 1));
+    } else {
+      fa = fb = parse(types);
+    }
+    enum class Lay { K32, H16, B8, F8, F6, F4, SP16, SP8 };
+    const auto layout_of = [&](MF f) {
+      if (sparse) return f == MF::F16 || f == MF::BF16 ? Lay::SP16 : Lay::SP8;
+      switch (f) {
+        case MF::F32: return Lay::K32;
+        case MF::F16: case MF::BF16: return Lay::H16;
+        case MF::FP6: case MF::BF6: return Lay::F6;
+        case MF::FP4: return Lay::F4;
+        default: return small ? Lay::F8 : Lay::B8;
+      }
+    };
+    const auto width_of = [](MF f) -> uint32_t {
+      switch (f) {
+        case MF::F32: return 32;
+        case MF::F16: case MF::BF16: return 16;
+        case MF::FP6: case MF::BF6: return 6;
+        case MF::FP4: return 4;
+        default: return 8;
+      }
+    };
+    const bool a_signed = in.neg_lo & 1, b_signed = (in.neg_lo >> 1) & 1;
+    // The bits of a lane's registers (counted from the operand's first) at `at`, `width` of them.
+    const auto bits_of = [&](const Operand& o, uint32_t lane, uint32_t at, uint32_t width) -> uint64_t {
+      const uint32_t reg = at / 32, off = at % 32;
+      uint64_t v = word(w, o, reg, lane) >> off;
+      if (off + width > 32) v |= static_cast<uint64_t>(word(w, o, reg + 1, lane)) << (32 - off);
+      return v & ((uint64_t{1} << width) - 1);
+    };
+    const auto value_of = [&](MF f, uint64_t b, bool is_signed) -> double {
+      switch (f) {
+        case MF::F32: return static_cast<double>(as_float(static_cast<uint32_t>(b)));
+        case MF::BF16: return static_cast<double>(as_float(static_cast<uint32_t>(b) << 16));
+        case MF::F16: {
+          _Float16 h;
+          const uint16_t b16 = static_cast<uint16_t>(b);
+          std::memcpy(&h, &b16, 2);
+          return static_cast<double>(h);
+        }
+        case MF::FP8: return f8_to_float(static_cast<uint32_t>(b), kOcpFp8);
+        case MF::BF8: return f8_to_float(static_cast<uint32_t>(b), kOcpBf8);
+        case MF::FP6: return f8_to_float(static_cast<uint32_t>(b), kFp6);
+        case MF::BF6: return f8_to_float(static_cast<uint32_t>(b), kBf6);
+        case MF::FP4: return f8_to_float(static_cast<uint32_t>(b), kFp4);
+        case MF::IU8: return is_signed ? static_cast<double>(static_cast<int8_t>(b)) : static_cast<double>(b);
+      }
+      return 0;
+    };
+    // Element (rc, k) of a matrix read from operand `o`: where it is, then what it is.
+    const auto element = [&](const Operand& o, MF f, Lay lay, uint32_t rc, uint32_t k, bool is_signed, uint32_t reg_base) {
+      uint32_t lane = 0, at = 0;
+      switch (lay) {
+        case Lay::K32: lane = rc + 16 * (k / 2); at = 32 * (k % 2); break;
+        case Lay::H16: lane = rc + 16 * (k % 16 / 8); at = 32 * (4 * (k / 16) + k % 8 / 2) + 16 * (k % 2); break;
+        case Lay::B8:
+          lane = rc + 16 * (k % 16 / 8);
+          at = 32 * (8 * (k / 64) + 4 * (k % 64 / 32) + 2 * (k % 32 / 16) + k % 8 / 4) + 8 * (k % 4);
+          break;
+        case Lay::F8: lane = rc + 16 * (k % 32 / 16); at = 32 * (4 * (k / 32) + k % 16 / 4) + 8 * (k % 4); break;
+        case Lay::F6: lane = rc + 16 * (k % 64 / 32); at = 32 * 6 * (k / 64) + 6 * (k % 32); break;
+        case Lay::F4: lane = rc + 16 * (k % 64 / 32); at = 32 * (4 * (k / 64) + k % 32 / 8) + 4 * (k % 8); break;
+        case Lay::SP16: lane = rc + 16 * (k % 32 / 16); at = 32 * (8 * (k / 32) + k % 16 / 2) + 16 * (k % 2); break;
+        case Lay::SP8:
+          lane = rc + 16 * (k % 32 / 16);
+          at = 32 * (8 * (k / 64) + 4 * (k % 64 / 32) + k % 16 / 4) + 8 * (k % 4);
+          break;
+      }
+      return value_of(f, bits_of(o, lane, at + 32 * reg_base, width_of(f)), is_signed);
+    };
+    const Lay la = layout_of(fa), lb = layout_of(fb);
+    const bool int_out = out == "i32", half_out = out == "f16" || out == "bf16";
+    const bool d_half = half_out || out == "bf16f32";   // a 16-bit D (bf16f32's C is a 32-bit one)
+    const Operand& src_a = in.src[0];
+    const Operand& src_b = in.src[1];
+    const Operand& cin = sparse ? in.dst[0] : in.src[2];
+    const bool neg_c = (in.neg_lo >> 2) & 1, abs_c = (in.neg_hi >> 2) & 1;
+    // C or D element position.
+    const auto place = [&](bool c_is_half, uint32_t m, uint32_t n, uint32_t* lane, uint32_t* reg, uint32_t* half) {
+      *lane = n + 16 * (m % 16 / 8);
+      if (c_is_half) {
+        *reg = m % 8 / 2;
+        *half = m % 2;
+      } else {
+        *reg = m % 8 + 8 * (m / 16);
+        *half = 0;
+      }
+    };
+    const auto c_value = [&](uint32_t m, uint32_t n) -> double {
+      uint32_t lane, reg, half;
+      const bool c_half = half_out;
+      if (cin.kind != OperandKind::Vgpr) return cin.kind == OperandKind::InlineFloat ? cin.fvalue : static_cast<double>(cin.value);
+      place(c_half, m, n, &lane, &reg, &half);
+      const uint32_t v = word(w, cin, reg, lane);
+      double c;
+      if (int_out) return static_cast<double>(static_cast<int32_t>(v));
+      if (c_half) c = value_of(out == "bf16" ? MF::BF16 : MF::F16, half ? v >> 16 : v & 0xFFFF, false);
+      else c = static_cast<double>(as_float(v));
+      if (abs_c) c = std::fabs(c);
+      return neg_c ? -c : c;
+    };
+    // The scale of a block, as a factor.
+    const auto scale_factor = [&](uint32_t fmt, uint8_t raw) -> double {
+      if (fmt == 0) return raw == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(raw) - 127);
+      if (fmt == 1) {   // E5M3, unsigned, bias 15
+        if (raw == 0xFF) return std::numeric_limits<double>::quiet_NaN();
+        const int e = raw >> 3, m = raw & 7;
+        return e == 0 ? std::ldexp(m / 8.0, -14) : std::ldexp(1.0 + m / 8.0, e - 15);
+      }
+      const uint8_t r7 = raw & 0x7F;   // E4M3, unsigned, bias 7
+      if (r7 == 0x7F) return std::numeric_limits<double>::quiet_NaN();
+      const int e = r7 >> 3, m = r7 & 7;
+      return e == 0 ? std::ldexp(m / 8.0, -6) : std::ldexp(1.0 + m / 8.0, e - 7);
+    };
+    // The scale of row (column) rc and block b of A (B): from the scale source's registers.
+    const auto scale_of = [&](const Operand& s, bool is_a, uint32_t rc, uint32_t b) -> double {
+      const uint32_t fmt = is_a ? in.scale_fmt_a : in.scale_fmt_b;
+      if (s.kind != OperandKind::Vgpr) {   // a scalar: one scale for the whole matrix; the inline zero is 0x7F, 1.0
+        const uint8_t raw = s.kind == OperandKind::Inline ? 0x7F : static_cast<uint8_t>(scalar(w, s));
+        return scale_factor(fmt, raw);
+      }
+      const bool hi = is_a ? in.scale_hi_a : in.scale_hi_b;
+      const bool wide_rows = is_a && M == 32;   // F4 32x128: every lane has a row, no half select
+      const uint32_t lane = wide_rows ? rc : rc + (hi ? 16 : 0);
+      const uint32_t per = 128 / block;          // scales per row: 4 (32 to a scale) or 8 (16 to a scale)
+      (void)per;
+      const uint32_t reg = block == 32 ? 0 : b / 4, byte = b % 4;
+      return scale_factor(fmt, static_cast<uint8_t>(word(w, s, reg, lane) >> (8 * byte)));
+    };
+    // The result goes into a copy first: D may be C, A or B.
+    const uint32_t dregs = in.dst[0].width;
+    std::array<std::array<uint32_t, 16>, 32> result{};
+    for (uint32_t lane = 0; lane < 32; ++lane)
+      for (uint32_t r = 0; r < dregs && r < 16; ++r) result[lane][r] = word(w, in.dst[0], r, lane);
+    const uint32_t N = 16;
+    // Sparse A, expanded: the packed element at (m, k') is where B's layout puts it, and the pair of 2-bit positions
+    // of k' = 2j, 2j + 1 are in the index register k' / 32 of the lane holding the element, at bit 2 * (k' % 16).
+    const uint32_t kp_max = K / 2;
+    const auto sparse_expand = [&](uint32_t m, std::vector<double>* col) {
+      col->assign(K, 0.0);
+      const Operand& idx = in.src[2];
+      for (uint32_t j = 0; j < kp_max / 2; ++j) {
+        const uint32_t k0 = 2 * j;
+        const uint32_t lane = m + 16 * (k0 % 32 / 16);
+        const uint32_t word_i = word(w, idx, k0 / 32, lane);
+        const uint32_t first = 2 * (k0 % 16);
+        const uint32_t i0 = (word_i >> first) & 3, i1 = (word_i >> (first + 2)) & 3;
+        const double v0 = element(src_a, fa, la, m, k0, a_signed, 0), v1 = element(src_a, fa, la, m, k0 + 1, a_signed, 0);
+        double un[4];
+        un[0] = i0 == 0 ? v0 : 0;
+        un[1] = i0 == 1 ? v0 : i1 == 1 ? v1 : 0;
+        un[2] = i0 == 2 ? v0 : i1 == 2 ? v1 : 0;
+        un[3] = i1 == 3 ? v1 : 0;
+        for (uint32_t t = 0; t < 4; ++t) (*col)[4 * j + t] = un[t];
+      }
+    };
+    std::vector<double> arow;
+    for (uint32_t m = 0; m < M; ++m) {
+      if (sparse) sparse_expand(m, &arow);
+      for (uint32_t n = 0; n < N; ++n) {
+        uint32_t lane, reg, half;
+        place(d_half, m, n, &lane, &reg, &half);
+        double sum = 0;
+        int64_t isum = 0;
+        const double cv = c_value(m, n);
+        if (int_out) isum = static_cast<int64_t>(cv);
+        // A's register set for rows past 16 (the 32x16 f4 form) is the second.
+        const uint32_t a_base = M == 32 && m >= 16 ? 8 : 0;
+        const uint32_t mm = m % 16;
+        double acc_blocks = 0;
+        for (uint32_t b = 0; b * (scaled ? block : K) < K; ++b) {
+          const uint32_t k_lo = scaled ? b * block : 0, k_hi = scaled ? k_lo + block : K;
+          double part = 0;
+          int64_t ipart = 0;
+          for (uint32_t k = k_lo; k < k_hi; ++k) {
+            const double a = sparse ? arow[k] : element(src_a, fa, la, mm, k, a_signed, a_base);
+            const double bv = element(src_b, fb, lb, n, k, b_signed, 0);
+            if (int_out) ipart += static_cast<int64_t>(a) * static_cast<int64_t>(bv);
+            else part += a * bv;
+          }
+          if (int_out) isum += ipart;
+          else if (scaled) acc_blocks += part * scale_of(in.src[3], true, m, b) * scale_of(in.src[4], false, n, b);
+          else sum += part;
+        }
+        uint32_t& slot = result[lane][reg];
+        if (int_out) {
+          if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
+          slot = static_cast<uint32_t>(isum);
+        } else {
+          const double total = (scaled ? acc_blocks : sum) + cv;
+          if (out == "f32") {
+            slot = as_bits(static_cast<float>(total));
+          } else if (out == "f16") {
+            const _Float16 h = static_cast<_Float16>(total);
+            uint16_t b16;
+            std::memcpy(&b16, &h, 2);
+            slot = half ? (slot & 0xFFFF) | uint32_t{b16} << 16 : (slot & 0xFFFF0000u) | b16;
+          } else {   // bf16 and bf16f32: a bfloat16 result, to nearest even
+            const uint32_t f = as_bits(static_cast<float>(total));
+            const uint32_t bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;
+            slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
+          }
+        }
+      }
+    }
+    for (uint32_t lane = 0; lane < 32; ++lane)
+      for (uint32_t r = 0; r < dregs && r < 16; ++r) set_word(w, in.dst[0], r, lane, result[lane][r]);
   }
 
   // The integer, 16-bit, half-precision and double instructions PyTorch's
@@ -6288,7 +6551,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   const uint64_t group_segment = uint64_t{k.group_segment} + d.dynamic_lds;
   if (group_segment > lds_limit(d))
     throw Error::make(Err::InvalidValue, "a work-group asking for ", group_segment, " bytes of LDS is past the ",
-                      lds_limit(d), " a work-group has on ", d.object->gfx950() ? "gfx950" : "gfx942");
+                      lds_limit(d), " a work-group has on ", d.object->gfx1250() ? "gfx1250" : d.object->gfx950() ? "gfx950" : "gfx942");
 
   // What the kernel is told about its grid, and the packet it may read it
   // from. Both are written before any wave starts.
