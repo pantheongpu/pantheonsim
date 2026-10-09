@@ -52,6 +52,9 @@ struct Event {
   uint32_t device = 0;
   uint32_t correlation = 0;
   uint64_t stream = 0;
+  // How many times `stream` (or, for a stream record, `handle`) had been destroyed when the event was made:
+  // a stream handle freed and made again is a new stream to a profiler (stream_generation).
+  uint32_t stream_gen = 0;
   std::string name;              // kernel name, or the API function; empty for copies
   uint64_t bytes = 0;            // copies and fills
   uint32_t copy_kind = 0;        // cudaMemcpyKind, as the caller gave it
@@ -202,6 +205,10 @@ bool hooked();
 void notify_resource(Resource what, uint64_t handle, uint32_t device);
 void notify_resource(const ResourceInfo& info);
 void notify_sync(SyncKind what, uint64_t stream);
+// A stream handle that is destroyed and made again names a different stream: a real driver numbers the new one
+// afresh, while the shims reuse the pointer. Every StreamDestroyStarting counts one against the handle, and an
+// event is stamped with the count when it is recorded, so the profiler can tell the two streams apart.
+uint32_t stream_generation(uint64_t handle);
 
 // The clock the profiler's own timestamps for host-side events (API calls,
 // waits, markers) come from. A tool may supply one (CUPTI's timestamp
