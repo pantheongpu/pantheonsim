@@ -467,6 +467,27 @@ if(CUDA_ABI_INCLUDE)
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_inc}.tmp" "${_dcbid_inc}")
   file(WRITE "${_dcbid_have}.tmp" "${_dcbid_have_text}")
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_have}.tmp" "${_dcbid_have}")
+  # The runtime calls' parameter structures for the callback API, from the
+  # toolkit's own generated_cuda_runtime_api_meta.h (scripts/gen_cupti_runtime_conv.py).
+  # Without Python the table is empty and only the calls converted by hand are
+  # delivered to callbacks; the activity records are not affected.
+  set(_conv_inc "${CMAKE_BINARY_DIR}/gen/cupti_runtime_conv.inc")
+  find_program(VGPU_PYTHON NAMES python3 python)
+  file(WRITE "${_conv_inc}.empty" "")
+  if(VGPU_PYTHON AND EXISTS "${CUDA_ABI_INCLUDE}/generated_cuda_runtime_api_meta.h" AND EXISTS "${_cbid_header}")
+    execute_process(
+      COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py"
+              "${CUDA_ABI_INCLUDE}/generated_cuda_runtime_api_meta.h" "${_cbid_header}" "${_conv_inc}.tmp"
+      RESULT_VARIABLE _conv_rc)
+    if(NOT _conv_rc EQUAL 0)
+      file(WRITE "${_conv_inc}.tmp" "")
+    endif()
+  else()
+    file(WRITE "${_conv_inc}.tmp" "")
+  endif()
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_conv_inc}.tmp" "${_conv_inc}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
