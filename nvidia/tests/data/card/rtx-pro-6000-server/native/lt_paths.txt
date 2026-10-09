@@ -1,0 +1,24 @@
+ok   fp16 A^T B + bias, ReLU epilogue (4.08e-04)
+ok   a layout reports the attribute asked for, not its batch count (0.00e+00)
+ok   bf16 strided batch, row-major, alpha A B + beta C (2.85e-03)
+FAIL cublasLtMatmulAlgoGetHeuristic(lt, desc, L.a, L.b, L.c, L.d, pref, 1, &heur, &found) returned 15
+ok   int8 x int8 -> int32 matmul accepted (0.00e+00)
+ok   int8 x int8 -> int32 equals the host's exact product (0.00e+00)
+ok   int32 alpha scales the integer product (0.00e+00)
+ok   int8 operands with CUBLAS_COMPUTE_32F refused (0.00e+00)
+ok   alpha and beta read from device memory in the device pointer mode (5.40e-08)
+ok   an epilogue it does not implement is refused, not skipped (0.00e+00)
+ok   logger level 0 taken (0.00e+00)
+ok   logger level 5 taken (0.00e+00)
+[2026-10-09 22:46:24][cublasLt][4024][Api][cublasLtLoggerSetLevel] level=6
+ok   logger level 6 taken (0.00e+00)
+[2026-10-09 22:46:24][cublasLt][4024][Api][cublasLtLoggerSetLevel] level=7
+ok   logger level 7 refused (0.00e+00)
+ok   logger level -1 refused (0.00e+00)
+ok   logger mask 31 taken (0.00e+00)
+[2026-10-09 22:46:24][cublasLt][4024][Api][cublasLtLoggerSetMask] mask=1000
+ok   logger mask 1000 taken (0.00e+00)
+ok   logger callback cleared (0.00e+00)
+ok   logger file cleared (0.00e+00)
+ok   logger back off (0.00e+00)
+FAIL: 1 cuBLASLt checks

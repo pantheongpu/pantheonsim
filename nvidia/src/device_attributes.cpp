@@ -223,7 +223,8 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     case kMaxPersistingL2CacheSize: v = sat(p.cuda.persisting_l2_bytes); break;
     // 128 MiB less a page, from compute capability 8.0 (an RTX 3060 answers it;
     // there is no access policy window before).
-    case kMaxAccessPolicyWindowSize: v = ampere ? 134213632 : 0; break;
+    // The RTX PRO 6000 Blackwell Server Edition (sm_120, AWS g7e, 2026-10-09) answers exactly 128 MiB.
+    case kMaxAccessPolicyWindowSize: v = ampere ? (cc >= 120 ? 134217728 : 134213632) : 0; break;
     case kGpuDirectRdmaWithCudaVmmSupported: v = 0; break;
     case kReservedSharedMemoryPerBlock: v = static_cast<int>(p.reserved_smem_per_block()); break;
     // Sparse and deferred-mapped CUDA arrays are not implemented: a card
@@ -254,7 +255,8 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     // The tensor map API (cuTensorMapEncodeTiled and its TMA loads) is Hopper's.
     case kTensorMapAccessSupported: v = hopper ? 1 : 0; break;
     case kHandleTypeFabricSupported: v = 0; break;
-    case kUnifiedFunctionPointers: v = 0; break;
+    // 1 on the RTX PRO 6000 Blackwell Server Edition (sm_120, read 2026-10-09), 0 on an RTX 3060, L4 and L40S.
+    case kUnifiedFunctionPointers: v = cc >= 120 ? 1 : 0; break;
     case kNumaConfig: v = 0; break;      // CU_DEVICE_NUMA_CONFIG_NONE
     case kNumaId: v = -1; break;         // a PCIe GPU has no NUMA node of its own
     case kMulticastSupported: v = 0; break;

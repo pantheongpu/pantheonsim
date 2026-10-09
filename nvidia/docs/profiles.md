@@ -22,6 +22,7 @@ before trusting a number.
 | `nvidia/a10`, `nvidia/a10g`, `nvidia/rtx3060`, `nvidia/rtx3080ti` | Ampere | 8.6 | 72, 80, 28, 80 |
 | `nvidia/l4`, `nvidia/l40s` | Ada Lovelace | 8.9 | 58, 142 |
 | `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb` | Hopper | 9.0 | 132, 114, 132 |
+| `nvidia/rtx-pro-6000-server` | Blackwell | 12.0 | 188 |
 
 ## Public documentation only (`verified: false`)
 
@@ -42,7 +43,6 @@ before trusting a number.
 | `nvidia/a40` | Ampere | 8.6 | 84 | 48 GiB GDDR6 | none |
 | `nvidia/a30` | Ampere | 8.0 | 56 | 24 GiB HBM2 | SM count derived from two OEM listings' 224 Tensor Cores; clocks are the A100's |
 | `nvidia/rtx2080ti` | Turing | 7.5 | 68 | 11 GiB GDDR6 | none |
-| `nvidia/rtx-pro-6000-server` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | the part AWS sells as g7e (its GPU is named "RTX PRO Server 6000"); SM clock is the Workstation Edition's |
 | `nvidia/rtx-pro-6000-max-q` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | SM clock derived from the data sheet's 110 TFLOPS |
 | `nvidia/rtx6000-ada` | Ada Lovelace | 8.9 | 142 | 48 GiB GDDR6 | persisting L2 copied from the L40S |
 | `nvidia/rtx-a6000` | Ampere | 8.6 | 84 | 48 GiB GDDR6 | none |
@@ -96,9 +96,7 @@ throughput only, and the value 64 is the 12.x stand-in, labelled as one in the c
 ## Rented-card characterization, 2026-10-09: not done
 
 Closing the unverified list needs a card of each model. On 2026-10-09 a g7e.2xlarge
-(RTX PRO 6000 Blackwell Server Edition) was asked for in us-east-1: the first zone had no capacity
-and the second launch was refused by the permission system, so no instance ran and nothing was
-read. H200 and B200 are only sold as p5en.48xlarge and p6-b200.48xlarge (192 vCPUs, 8 GPUs); the
+(RTX PRO 6000 Blackwell Server Edition) was asked for in us-east-1 and had no capacity; it was read later that night in us-east-2 (see the table below). H200 and B200 are only sold as p5en.48xlarge and p6-b200.48xlarge (192 vCPUs, 8 GPUs); the
 account's "Running On-Demand P instances" and "All P Spot Instance Requests" quotas are 64 vCPUs,
 so neither can launch before a quota increase. `nvidia/tools/characterize.cu` now also writes the
 `cuda:` section (bus width, clock, copy engines, persisting L2) from the card, so the next run
@@ -128,5 +126,6 @@ was read from the card, and these runs read only what is listed.
 | `nvidia/rtx4090` | none | none | Same compute capability as the L4, so the FP8 kernel table the L4 answered is applied to it; not a measurement of it. |
 | `nvidia/l40` | none | none | The L40S's die; not a measurement of it. |
 | `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb`, `nvidia/h200` | none | none | AWS had no `p5.4xlarge` capacity (three attempts, six zones). The Hopper FP8 rules are documentation-derived. |
-| `nvidia/rtx-pro-6000` | none | none | AWS had no `g7e.2xlarge` capacity. `ptx120` has its programs and no transcript. |
+| `nvidia/rtx-pro-6000-server` | AWS g7e.2xlarge (us-east-2), driver 595.91.07, CUDA 13.2, cuBLAS 13.3 (2026-10-09, `r4-aws-verify`) | the whole characterization (188 SMs, 512-bit, 600 W, 2430/12481 MHz, 0x2BB5), `ptx_semantics` and `control_flow` (512 values), `device_attributes --dump`, `nvidia-smi -q` (`nvidia/tests/data/smi/nvidia-smi-q.rtx-pro-6000-server.txt`), `lt`, `sparselt`, `cvt`, `ptx120` and the natively run programs ([lowprec.md](lowprec.md), `nvidia/tests/data/card/rtx-pro-6000-server/`) | **`verified: true`**: the simulator reproduces the 512 conformance values. **Corrected**: boost clock 2430 MHz (was the Workstation Edition's 2617), memory clock 12481, persisting L2 83886080 (five sixths of L2, was 3/4), CUDA memory total 101975851008 B (97252 MiB; nvidia-smi 97887 MiB). The narrow-precision probes are NOT reproduced yet (`known-gaps.txt`). `nvidia/rtx-pro-6000` (the Workstation Edition, same GB202) still carries the derived 3/4 persisting L2 and 2617 MHz. |
+| `nvidia/rtx-pro-6000` | none | none | The Workstation Edition; not a measurement of it (see the Server Edition's row for the GB202's numbers). |
 | `nvidia/b200`, `nvidia/b300` and the other Blackwell profiles | none | none | An eight-GPU instance is the only way to rent them and the round's rules exclude it. |

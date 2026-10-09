@@ -1,0 +1,530 @@
+ ** On entry to cusparseLtGetProperty() parameter number 1 (propertyType) had an illegal value: (libraryPropertyType) UNKNOWN=(libraryPropertyType) 3
+
+ ** On entry to cusparseLtGetVersion() parameter number 2 (version) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtInit() parameter number 1 (handle) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtDestroy() parameter number 1 (&ctx) had an illegal value: bad initialization or already destroyed
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 1 (handle) had an illegal value: bad initialization or already destroyed
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 3 (rows) had an illegal value: 0
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 7 (valueType) had an illegal value: (cudaDataType) CUDA_R_64F
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 7 (valueType) had an illegal value: (cudaDataType) CUDA_R_8U
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 8 (order) had an illegal value: (cusparseOrder_t) 3
+
+ ** On entry to cusparseLtStructuredDescriptorInit() parameter number 9 (sparsity) had an illegal value: (cusparseLtSparsity_t) UNKNOWN=(cusparseLtSparsity_t) 1
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 1 (handle) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtDenseDescriptorInit() parameter number 2 (static_cast<void*>(matDescr)) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatDescGetAttribute() parameter number 5 (dataSize) had an illegal value: expected 8 bytes(sizeof(int64_t)), current size 4 bytes
+
+ ** On entry to cusparseLtMatDescGetAttribute() parameter number 3 (attribute) had an illegal value: (cusparseLtMatmulDescAttribute_t) UNKNOWN=(cusparseLtMatDescAttribute_t) 2
+
+ ** On entry to cusparseLtMatDescSetAttribute() parameter number 4 (data) had an illegal value: NULL pointer
+
+ok   cusparseLtInit(&h) -> 0
+ok   cusparseLtGetVersion(&h, &v) -> 0
+ok   version 0.10.0 reads 1000
+ok   cusparseLtGetProperty(MAJOR_VERSION, &major) -> 0
+ok   cusparseLtGetProperty(MINOR_VERSION, &minor) -> 0
+ok   cusparseLtGetProperty(PATCH_LEVEL, &patch) -> 0
+ok   properties 0, 10, 0
+ok   cusparseLtGetProperty((libraryPropertyType)3, &v) -> 3
+ok   cusparseLtGetVersion(&h, nullptr) -> 3
+ok   error names and strings
+ok   opaque objects: 512 bytes, aligned 16
+ok   cusparseLtInit(nullptr) -> 3
+ok   cusparseLtInit(&h2) -> 0
+ok   cusparseLtDestroy(&h2) -> 0
+ok   cusparseLtDestroy(&h2) -> 3
+ok   cusparseLtDenseDescriptorInit(&h2, &d, 64, 64, 64, 16, CUDA_R_16F, ROW) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, &d, 8, 128, 128, 16, CUDA_R_16F, ROW) -> 0
+ok   cusparseLtDenseDescriptorInit(&h, &d, 4, 128, 128, 16, CUDA_R_16F, ROW) -> 10
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 8, 128, 128, 16, CUDA_R_16F, ROW, S50) -> 10
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 16, 128, 128, 16, CUDA_R_16F, ROW, S50) -> 0
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 48, 128, 128, 16, CUDA_R_8I, ROW, S50) -> 10
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 96, 128, 128, 16, CUDA_R_8I, ROW, S50) -> 0
+ok   cusparseLtDenseDescriptorInit(&h, &d, 4, 128, 128, 16, CUDA_R_32F, ROW) -> 0
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 4, 128, 128, 16, CUDA_R_32F, ROW, S50) -> 10
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 136, 16, CUDA_R_16F, ROW) -> 0
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 132, 16, CUDA_R_16F, ROW) -> 10
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 127, 16, CUDA_R_16F, ROW) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 64, 64, 16, CUDA_R_16F, COL) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 128, 8, CUDA_R_16F, ROW) -> 10
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 128, 24, CUDA_R_16F, ROW) -> 10
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 128, 0, CUDA_R_16F, ROW) -> 10
+ok   cusparseLtDenseDescriptorInit(&h, &d, 128, 128, 128, 256, CUDA_R_16F, ROW) -> 0
+ok   cusparseLtDenseDescriptorInit(&h, &d, 0, 64, 64, 16, CUDA_R_16F, ROW) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, &d, 64, 64, 64, 16, CUDA_R_64F, ROW) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, &d, 64, 64, 64, 16, CUDA_R_8U, ROW) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, &d, 64, 64, 64, 16, CUDA_R_16F, (cusparseOrder_t)3) -> 3
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 64, 64, 64, 16, CUDA_R_16F, ROW, (cusparseLtSparsity_t)1) -> 3
+ok   cusparseLtDenseDescriptorInit(nullptr, &d, 64, 64, 64, 16, CUDA_R_16F, ROW) -> 3
+ok   cusparseLtDenseDescriptorInit(&h, nullptr, 64, 64, 64, 16, CUDA_R_16F, ROW) -> 3
+ok   cusparseLtStructuredDescriptorInit(&h, &d, 64, 64, 64, 16, CUDA_R_16F, ROW, S50) -> 0
+ok   cusparseLtMatDescGetAttribute(&h, &d, CUSPARSELT_MAT_NUM_BATCHES, &nb, 4) -> 0
+ok   cusparseLtMatDescGetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   batch defaults: 1 batch, stride rows x ld
+ok   cusparseLtMatDescGetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &nb, 4) -> 3
+ok   cusparseLtMatDescGetAttribute(&h, &d, (cusparseLtMatDescAttribute_t)2, &bs, 8) -> 3
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_NUM_BATCHES, &nb, 4) -> 0
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_NUM_BATCHES, &nb, 4) -> 3
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 3
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 3
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 3
+ok   cusparseLtMatDescSetAttribute(&h, &d, CUSPARSELT_MAT_NUM_BATCHES, nullptr, 4) -> 3
+ok   cusparseLtMatDescGetAttribute(&h, &d, CUSPARSELT_MAT_NUM_BATCHES, &nb, 4) -> 0
+o ** On entry to cusparseLtMatmulDescriptorInit() parameter number 3 (opA) had an illegal value: (cusparseOperation_t) UNKNOWN=(cusparseOperation_t) 2
+
+ ** On entry to cusparseLtMatmulDescriptorInit() parameter number 9 (computeType) had an illegal value: (cusparseComputeType) UNKNOWN=(cusparseComputeType) 7
+
+ ** On entry to cusparseLtMatmulDescriptorInit() parameter number 5 (matA) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmulDescriptorInit() parameter number 8 (matD) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmulDescGetAttribute() parameter number 5 (dataSize) had an illegal value: expected 4 bytes(sizeof(int)), current size 8 bytes
+
+ ** On entry to cusparseLtMatmulDescGetAttribute() parameter number 5 (dataSize) had an illegal value: expected 8 bytes(sizeof(void*)), current size 4 bytes
+
+ ** On entry to cusparseLtMatmulDescGetAttribute() parameter number 3 (attribute) had an illegal value: (cusparseLtMatmulDescAttribute_t) 20
+
+ ** On entry to cusparseLtMatmulDescSetAttribute() parameter number 5 (dataSize) had an illegal value: expected 8 bytes(sizeof(int64_t)), current size 4 bytes
+
+k   cusparseLtMatDescGetAttribute(&h, &d, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   batch attributes read back
+ok   cusparseLtDenseDescriptorInit(&h, &c, 64, 32, 64, 16, CUDA_R_16F, COL) -> 0
+ok   cusparseLtMatDescGetAttribute(&h, &c, CUSPARSELT_MAT_BATCH_STRIDE, &bs, 8) -> 0
+ok   a column-major matrix's default stride is cols x ld
+ok   cusparseLtMatDescriptorDestroy(&d) -> 0
+ok   types 2 -> 2 compute 2 opB 0 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 2 -> 2 compute 1 opB 0 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 10
+ok   types 2 -> 0 compute 2 opB 0 orderB 2: matmul descriptor 10
+ok   types 14 -> 14 compute 2 opB 0 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 14 -> 2 compute 2 opB 0 orderB 2: matmul descriptor 10
+ok   types 0 -> 0 compute 2 opB 0 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 3 -> 3 compute 0 opB 1 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 3 -> 10 compute 0 opB 1 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 3 -> 2 compute 0 opB 1 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 3 -> 14 compute 0 opB 1 orderB 2: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   types 3 -> 0 compute 0 opB 1 orderB 2: matmul descriptor 10
+ok   types 3 -> 3 compute 2 opB 1 orderB 2: matmul descriptor 10
+ok   types 3 -> 3 compute 0 opB 0 orderB 2: matmul descriptor 10
+ok   types 3 -> 3 compute 0 opB 0 orderB 1: matmul descriptor 0
+ok     ... algorithm selection 0
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Cd, &D, F) -> 0
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Cd, &Dld, F) -> 10
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Ccol, &D, F) -> 10
+ok   cusparseLtMatmulDescriptorInit(&h, &md, T, N, &A, &B, &Cd, &D, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &Abig, &B, &Cd, &D, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &Bs, &Cd, &D, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, (cusparseOperation_t)2, N, &A, &B, &Cd, &D, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Cd, &D, (cusparseComputeType)7) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, nullptr, &B, &Cd, &D, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Cd, nullptr, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A2, &B, &Cd, &Cd, F) -> 3
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Cd, &D, F) -> 0
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_RELU, &iv, 4) -> 0
+ok   ReLU off by default
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_RELU_UPPERBOUND, &fv, 4) -> 0
+ok   ReLU upper bound defaults to FLT_MAX
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_GELU_SCALING, &fv, 4) -> 0
+ok   GELU scaling defaults to 1
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_BIAS_STRIDE, &lv, 8) -> 0
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_BIAS_POINTER, &pv, sizeof pv) -> 0
+ok   no bias by default
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_RELU, &lv, 8) -> 3
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_BIAS_POINTER, &iv, 4) -> 3
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, (cusparseLtMatmulDescAttribute_t)20, &lv, 8) -> 3
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_RELU, &two, 4) -> 0
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_RELU, &iv, 4) -> 0
+ok   ReLU reads back as 1
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_GELU, &two, 4) -> 3
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_ACTIVATION_GELU_SCALING, &fv, 4) -> 3
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_ALPHA_VECTOR_SCALING, &two, 4) -> 0
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_BIAS_STRIDE, &lv, 8) -> 3
+ok   cusparseLtMatmulD ** On entry to cusparseLtMatmulDescSetAttribute() parameter number 4 (data) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmulAlgGetAttribute() parameter number 5 (dataSize) had an illegal value: expected 4 bytes(sizeof(int)), current size 8 bytes
+
+ ** On entry to cusparseLtMatmulAlgGetAttribute() parameter number 3 (attribute) had an illegal value: (cusparseLtMatmulAlgAttribute_t) 6
+
+ ** On entry to cusparseLtMatmulAlgSelectionInit() parameter number 4 (alg) had an illegal value: (cusparseLtMatmulAlg_t) UNKNOWN=(alg) 1
+
+ ** On entry to cusparseLtMatmulAlgSelectionDestroy() parameter number 1 (alg_sel_ptr) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmulPlanDestroy() parameter number 1 (plan) had an illegal value: NULL pointer
+
+escSetAttribute(&h, &md, CUSPARSELT_MATMUL_BIAS_STRIDE, &iv, 4) -> 3
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_BIAS_POINTER, nullptr, 8) -> 3
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_SPARSE_MAT_POINTER, &pv, sizeof pv) -> 0
+ok   cusparseLtMatmulDescGetAttribute(&h, &md, CUSPARSELT_MATMUL_SPARSE_MAT_POINTER, &pv, sizeof pv) -> 7
+ok   cusparseLtMatmulDescriptorInit(&h, &md, N, N, &A, &B, &Cd, &D, F) -> 0
+ok   cusparseLtMatmulAlgSelectionInit(&h, &alg, &md, CUSPARSELT_MATMUL_ALG_DEFAULT) -> 0
+FAIL algorithm defaults: config 0 of 4, 5 iterations, split-K 1, one kernel, no buffers
+ok   cusparseLtMatmulAlgGetAttribute(&h, &alg, CUSPARSELT_MATMUL_ALG_CONFIG_ID, &lv, 8) -> 3
+ok   cusparseLtMatmulAlgGetAttribute(&h, &alg, (cusparseLtMatmulAlgAttribute_t)6, &iv, 4) -> 3
+FAIL algorithm attribute 0 = 3 -> 0
+ok   algorithm attribute 0 = 4 -> 3
+ok   algorithm attribute 0 = -1 -> 3
+ok   algorithm attribute 1 = 1 -> 3
+ok   algorithm attribute 2 = 0 -> 0
+ok   algorithm attribute 2 = 100 -> 0
+FAIL algorithm attribute 3 = 0 -> 3
+ok   algorithm attribute 3 = 65 -> 0
+ok   algorithm attribute 4 = 0 -> 3
+ok   algorithm attribute 4 = 2 -> 0
+ok   algorithm attribute 4 = 3 -> 3
+ok   algorithm attribute 5 = -1 -> 3
+FAIL algorithm attribute 5 = 17 -> 0
+FAIL algorithm attributes read back
+ok   cusparseLtMatmulAlgSelectionDestroy(&alg) -> 0
+ok   cusparseLtMatmulAlgSelectionInit(&h, &alg, &md, (cusparseLtMatmulAlg_t)1) -> 3
+ok   cusparseLtMatmulAlgSelectionDestroy(nullptr) -> 3
+ok   cusparseLtMatmulPlanDestroy(nullptr) -> 3
+ok   cusparseLtMatmulDescSetAttribute(&h, &md, CUSPARSELT_MATMUL_A_SCALE_MODE, &mode, 4) -> 0
+ok   cusparseLtMatmulAlgSelectionInit(&h, &alg, &md, CUSPARSELT_MATMUL_ALG_DEFAULT) -> 0
+ok   STRIP pruning, opN, row-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   TILE pruning, opN, row-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   cusparseLtSpMMAPrune2(&h, &s.A, 1, op, din, dout, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   cusparseLtSpMMAPrune(&h, &s.md, din, dout1, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   Prune2 matches Prune
+ok   STRIP pruning, opT, row-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   TILE pruning, opT, row-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   cusparseLtSpMMAPrune2(&h, &s.A, 1, op, din, dout, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   cusparseLtSpMMAPrune(&h, &s.md, din, dout1, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   Prune2 matches Prune
+ok   STRIP pruning, opN, column-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   TILE pruning, opN, column-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   cusparseLtSpMMAPrune2(&h, &s.A, 1, op, din, dout, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   cusparseLtSpMMAPrune(&h, &s.md, din, dout1, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   Prune2 matches Prune
+ok   STRIP pruning, opT, column-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   TILE pruning, opT, column-major: 0 of 4096 differ
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dout, dv, nullptr) -> 0
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, din, dv, nullptr) -> 0
+ok   PruneCheck: 0 for the pruned matrix, 1 for the original
+ok   cusparseLtSpMMAPrune2(&h, &s.A, 1, op, din, dout, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   cusparseLtSpMMAPrune(&h, &s.md, din, dout1, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   Prune2 matches Prune
+ok   cusparseLtSpMMAPrune(&h, &s.md, din, dout, CUSPARSELT_PRUNE_SPMMA_TILE, nullptr) -> 0
+ok   fp32 TILE: 2x2 tiles, the anti-diagonal on a tie
+ok   type 2 64x64 row-major compresses to 4608 bytes with a 512-byte buffer (got 4608, 512)
+ok   type 2 16x32 row-major compresses to 768 bytes with a 256-byte buffer (got 768, 256)
+ok   type 2 64x32 row-major compresses to 2560 bytes with a 512-byte buffer (got 2560, 512)
+ok   type 2 96x160 row-major compresses to 17920 bytes with a 2560-byte buffer (got 17920, 2560)
+ok   type 14 128x128 row-major compresses to 18432 bytes with a 2048-byte buffer (got 18432, 2048)
+ok   type 3 64x64 row-major compresses to 4096 bytes with a 1024-byte buffer (got 4096, 1024)
+ok   type 3 96x160 row-major compresses to 15872 bytes with a 4096-byte buffer (got 15872, 4096)
+ok   type 3 256x64 row-major compresses to 16384 bytes with a 4096-byte buffer (got 16384, 4096)
+ok   type 0 64x64 row-major compresses to 10240 bytes with a 1024-byte buffer (got 10240, 1024)
+ok   type 0 8x16 row-major compresses to 768 bytes with a 256-byte buffer (got 768, 256)
+ok   type 0 96x160 row-major compresses to 40960 bytes with a 5120-byte buffer (got 40960, 5120)
+ok   type 3 64x128 column-major compresses to 8192 bytes with a 2048-byte buffer (got 8192, 2048)
+ok   type 3 128x64 column-major compresses to 6144 bytes with a 1024-byte buffer (got 6144, 1024)
+ok   type 3 128x64 row-major compresses to 8192 bytes with a 2048-byte buffer (got 8192, 2048)
+ok   type 2 64x64 compressed: 0 values and 0 metadata codes differ from the card's layout
+ok   type 3 64x64 compressed: 0 values and 0 metadata codes differ from the card's layout
+FAIL type 0 64x64 compressed: 0 values and 896 metadata codes differ from the card's layout
+ok   fp16 opNN row: descriptors
+ok   fp16 opNN row: attributes and plan
+ok   fp16 opNN row: prune and check
+ok   fp16 opNN row: compress and multiply
+ok   fp16 opNN row: D matches the host product
+ok   fp16 opNN col: descriptors
+ok   fp16 opNN col: attributes and plan
+ok   fp16 opNN col: prune and check
+ok   fp16 opNN col: compress and multiply
+ok   fp16 opNN col: D matches the host product
+ok   fp16 opNT row: descriptors
+ok   fp16 opNT row: attributes and plan
+ok   fp16 opNT row: prune and check
+ok   fp16 opNT row: compress and multiply
+ok   fp16 opNT row: D matches the host product
+ok   fp16 opNT col: descriptors
+ok   fp16 opNT col: attributes and plan
+ok   fp16 opNT col: prune and check
+ok   fp16 opNT col: compress and multiply
+ok   fp16 opNT col: D matches the host product
+ok   fp16 opTN row: descriptors
+ok   fp16 opTN row: attributes and plan
+ok   fp16 opTN row: prune and check
+ok   fp16 opTN row: compress and multiply
+ok   fp16 opTN row: D matches the host product
+ok   fp16 opTN col: descriptors
+ok   fp16 opTN col: attributes and plan
+ok   fp16 opTN col: prune and check
+ok   fp16 opTN col: compress and multiply
+ok   fp16 opTN col: D matches the host product
+ok   fp16 opTT row: descriptors
+ok   fp16 opTT row: attributes and plan
+ok   fp16 opTT row: prune and check
+ok   fp16 opTT row: compress and multiply
+ok   fp16 opTT row: D matches the host product
+ok   fp16 opTT col: descriptors
+ok   fp16 opTT col: attributes and plan
+ok   fp16 opTT col: prune and check
+ok   fp16 opTT col: compress and multiply
+ok   fp16 opTT col: D matches the host product
+ok   fp16 structured B: descriptors
+ok   fp16 structured B: attributes and plan
+ok   fp16 structured B: prune and check
+ok   fp16 structured B: compress and multiply
+ok   fp16 structured B: D matches the host product
+ok   fp16 structured B transposed, column-major D: descriptors
+ok   fp16 structured B transposed, column-major D: attributes and plan
+ok   fp16 structured B transposed, column-major D: prune and check
+ok   fp16 structured B transposed, column-major D: compress and multiply
+ok   fp16 structured B transposed, column-major D: D matches the host product
+ok   fp16 rounding to nearest even: descriptors
+ok   fp16 rounding to nearest even: attributes and plan
+ok   fp16 rounding to nearest even: prune and check
+ok   fp16 rounding to nearest even: compress and multiply
+ok   fp16 rounding to nearest even: D matches the host product
+ok   fp16 ReLU with threshold and upper bound: descriptors
+ok   fp16 ReLU with threshold and upper bound: attributes and plan
+ok   fp16 ReLU with threshold and upper bound: prune and check
+ok   fp16 ReLU with threshold and upper bound: compress and multiply
+ok   fp16 ReLU with threshold and upper bound: D matches the host product
+ok   fp16 ReLU (negative results are -0): descriptors
+ok   fp16 ReLU (negative results are -0): attributes and plan
+ok   fp16 ReLU (negative results are -0): prune and check
+ok   fp16 ReLU (negative results are -0): compress and multiply
+ok   fp16 ReLU (negative results are -0): D matches the host product
+ok   fp16 bias (fp16 values): descriptors
+ok   fp16 bias (fp16 values): attributes and plan
+ok   fp16 bias (fp16 values): prune and check
+ok   fp16 bias (fp16 values): compress and multiply
+ok   fp16 bias (fp16 values): D matches the host product
+ok   fp16 alpha vector: descriptors
+ok   fp16 alpha vector: attributes and plan
+ok   fp16 alpha vector: prune and check
+ok   fp16 alpha vector: compress and multiply
+ok   fp16 alpha vector: D matches the host product
+ok   fp16 alpha and beta vectors: descriptors
+ok   fp16 alpha and beta vectors: attributes and plan
+ok   fp16 alpha and beta vectors: prune and check
+ok   fp16 alpha and beta vectors: compress and multiply
+ok   fp16 alpha and beta vectors: D matches the host product
+ok   fp16 through MatmulSearch: descriptors
+ok   fp16 through MatmulSearch: attributes and plan
+ok   fp16 through MatmulSearch: prune and check
+ok   fp16 through MatmulSearch: compress and multiply
+ok   fp16 through MatmulSearch: D matches the host product
+ok   bf16 with a bf16 bias: descriptors
+ok   bf16 with a bf16 bias: attributes and plan
+ok   bf16 with a bf16 bias: prune and check
+ok   bf16 with a bf16 bias: compress and multiply
+ok   bf16 with a bf16 bias: D matches the host product
+ok   tf32 operand rounding: descriptors
+ok   tf32 operand rounding: attributes and plan
+ok   tf32 operand rounding: prune and check
+ok   tf32 operand rounding: compress and multiply
+     tf32 operand rounding: D[0][0][2] = 1, expected 1.00097656
+     tf32 operand rounding: D[0][0][10] = 1.00195312, expected 1.00292969
+     tf32 operand rounding: D[0][0][18] = 1.00390625, expected 1.00488281
+FAIL tf32 operand rounding: D matches the host product
+ok   tf32 transposed A, column-major D: descriptors
+ok   tf32 transposed A, column-major D: attributes and plan
+ok   tf32 transposed A, column-major D: prune and check
+ok   tf32 transposed A, column-major D: compress and multiply
+ok   tf32 transposed A, column-major D: D matches the host product
+ok   int8 into type 3: halves round to even, saturation: descriptors
+ok   int8 into type 3: halves round to even, saturation: attributes and plan
+ok   int8 into type 3: halves round to even, saturation: prune and check
+ok   int8 into type 3: halves round to even, saturation: compress and multiply
+ok   int8 into type 3: halves round to even, saturation: D matches the host product
+ok   int8 into type 3 with a float bias: descriptors
+ok   int8 into type 3 with a float bias: attributes and plan
+ok   int8 into type 3 with a float bias: prune and check
+ok   int8 into type 3 with a float bias: compress and multiply
+ok   int8 into type 3 with a float bias: D matches the host product
+ok   int8 into type 3 with an alpha vector: descriptors
+ok   int8 into type 3 with an alpha vector: attributes and plan
+ok   int8 into type 3 with an alpha vector: prune and check
+ok   int8 into type 3 with an alpha vector: compress and multiply
+ok   int8 into type 3 with an alpha vector: D matches the host product
+ok   int8 into type 10: halves round to even, saturation: descriptors
+ok   int8 into type 10: halves round to even, saturation: attributes and plan
+ok   int8 into type 10: halves round to even, saturation: prune and check
+ok   int8 into type 10: halves round to even, saturation: compress and multiply
+ok   int8 into type 10: halves round to even, saturation: D matches the host product
+ok   int8 into type 10 with a float bias: descriptors
+ok   int8 into type 10 with a float bias: attributes and plan
+ok   int8 into type 10 with a float bias: prune and check
+ok   int8 into type 10 with a float bias: compress and multiply
+ok   int8 into type 10 with a float bias: D matches the host product
+ok   int8 into type 10 with an alpha vector: descriptors
+ok   int8 into type 10 with an alpha vector: attributes and plan
+ok   int8 into type 10 with an alpha vector: prune and check
+ok   int8 into type 10 with an alpha vector: compress and multiply
+ok   int8 into type 10 with an alpha vector: D matches the host product
+ok   int8 into type 2: halves round to even, saturation: descriptors
+ok   int8 into type 2: halves round to even, saturation: attributes and plan
+ok   int8 into type 2: halves round to even, saturation: prune and check
+ok   int8 into type 2: halves round to even, saturation: compress and multiply
+ok   int8 into type 2: halves round to even, saturation: D matches the host product
+ok   int8 into type 2 with a float bias: descriptors
+ok   int8 into type 2 with a float bias: attributes and plan
+ok   int8 into type 2 with a float bias: prune and check
+ok   int8 into type 2 with a float bias: compress and multiply
+ok   int8 into type 2 with a float bias: D matches the host product
+ok   int8 into type 2 with an alpha vector: descriptors
+ok   int8 into type 2 with an alpha vector: attributes and plan
+ok   int8 into type 2 with an alpha vector: prune and check
+ok   int8 into type 2 with an alpha vector: compress and multiply
+ok   int8 into type 2 with an alpha vector: D matches the host product
+ok   int8 into type 14: halves round to even, saturation: descriptors
+ok   int8 into type 14: halves round to even, saturation: attributes and plan
+ok   int8 into type 14: halves round to even, saturation: prune and check
+ok   int8 into type 14: halves round to even, saturation: compress and multiply
+ok   int8 into type 14: halves round to even, saturation: D matches the host product
+ok   int8 into type 14 with a float bias: descriptors
+ok   int8 into type 14 with a float bias: attributes and plan
+ok   int8 into type 14 with a float bias: prune and check
+ok   int8 into type 14 with a float bias: compress and multiply
+ok   int8 into type 14 with a float bias: D matches the host product
+ok   int8 into type 14 with an alpha vector: descriptors
+ok   int8 into type 14 with an alpha vector: attributes and plan
+ok   int8 into type 14 with an alpha vector: prune and check
+ok   int8 into type 14 with an alpha vector: compress and multiply
+ok   int8 into type 14 with an alpha vector: D matches the host product
+ok   int8 GELU with scaling: descriptors
+ok   int8 GELU with scaling: attributes and plan
+ok   int8 GELU with scaling: prune and check
+ok   int8 GELU with scaling: compress and multiply
+ok   int8 GELU with scaling: D matches the host product
+ok   int8 GELU and ReLU together: descriptors
+ok   int8 GELU and ReLU together: attributes and plan
+ok   int8 GELU and ReLU together: prune and check
+ok   int8 GELU and ReLU together: compress and multiply
+ok   int8 GELU and ReLU together: D matches the host product
+ok   int8 transposed A column-major, B column-major: descriptors
+ok   int8 transposed A column-major, B column-major: attributes and plan
+ok   int8 transposed A column-major, B column-major: prune and check
+ok   int8 transposed A column-major, B column-major: compress and multiply
+ok   int8 transposed A column-major, B column-major: D matches the host product
+ok   int8 structured B: descriptors
+ok   int8 structured B: attributes and plan
+ok   int8 structured B: prune and chec ** On entry to cusparseLtSpMMACompressedSize() parameter number 3 (compressedSize) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtSpMMACompressedSize() parameter number 4 (compressBufferSize) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtSpMMACompress() parameter number 3 (d_dense) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtSpMMACompress() parameter number 4 (d_compressed) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmulGetWorkspace() parameter number 3 (workspaceSize) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 3 (alpha) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 4 (d_A) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 5 (d_B) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 6 (beta) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 7 (d_C) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 8 (d_D) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 11 (numStreams) had an illegal value: -1
+
+ ** On entry to cusparseLtMatmul() parameter number 10 (streams) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 1 (handle) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtMatmul() parameter number 2 (plan) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtSpMMAPrune() parameter number 5 (pruneAlg) had an illegal value: (cusparseLtPruneAlg_t) UNKNOWN=(cusparseLtPruneAlg_t) 2
+
+ ** On entry to cusparseLtSpMMAPrune() parameter number 3 (d_in) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtSpMMAPruneCheck() parameter number 4 (d_valid) had an illegal value: NULL pointer
+
+ ** On entry to cusparseLtSpMMAPrune2() parameter number 3 (op) had an illegal value: (cusparseOperation_t) UNKNOWN=(cusparseOperation_t) 2
+
+k
+ok   int8 structured B: compress and multiply
+ok   int8 structured B: D matches the host product
+ok   fp16 3 batches with a strided bias: descriptors
+ok   fp16 3 batches with a strided bias: attributes and plan
+ok   fp16 3 batches with a strided bias: prune and check
+ok   fp16 3 batches with a strided bias: compress and multiply
+ok   fp16 3 batches with a strided bias: D matches the host product
+ok   fp16 3 batches sharing one structured A: descriptors
+ok   fp16 3 batches sharing one structured A: attributes and plan
+ok   fp16 3 batches sharing one structured A: prune and check
+ok   fp16 3 batches sharing one structured A: compress and multiply
+ok   fp16 3 batches sharing one structured A: D matches the host product
+ok   fp16 3 batches sharing one structured B: descriptors
+ok   fp16 3 batches sharing one structured B: attributes and plan
+ok   fp16 3 batches sharing one structured B: prune and check
+ok   fp16 3 batches sharing one structured B: compress and multiply
+ok   fp16 3 batches sharing one structured B: D matches the host product
+ok   s.planit() -> 0
+ok   cusparseLtSpMMACompressedSize(&h, &s.plan, &cs, &cbs) -> 0
+ok   cusparseLtSpMMACompressedSize(&h, &s.plan, nullptr, &cbs) -> 3
+ok   cusparseLtSpMMACompressedSize(&h, &s.plan, &cs, nullptr) -> 3
+ok   cusparseLtSpMMACompress(&h, &s.plan, dA, dc, nullptr, nullptr) -> 0
+ok   cusparseLtSpMMACompress(&h, &s.plan, nullptr, dc, nullptr, nullptr) -> 3
+ok   cusparseLtSpMMACompress(&h, &s.plan, dA, nullptr, nullptr, nullptr) -> 3
+ok   cusparseLtMatmulGetWorkspace(&h, &s.plan, &ws) -> 0
+ok   cusparseLtMatmulGetWorkspace(&h, &s.plan, nullptr) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, dB, &beta, dC, dD, nullptr, nullptr, 0) -> 0
+ok   cusparseLtMatmul(&h, &s.plan, nullptr, dc, dB, &beta, dC, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, nullptr, dB, &beta, dC, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, nullptr, &beta, dC, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, dB, nullptr, dC, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, dB, &zero, nullptr, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, dB, &beta, dC, nullptr, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, dB, &beta, dC, dD, dws, nullptr, -1) -> 3
+ok   cusparseLtMatmul(&h, &s.plan, &alpha, dc, dB, &beta, dC, dD, dws, nullptr, 1) -> 3
+ok   cusparseLtMatmul(nullptr, &s.plan, &alpha, dc, dB, &beta, dC, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtMatmul(&h, nullptr, &alpha, dc, dB, &beta, dC, dD, dws, nullptr, 0) -> 3
+ok   cusparseLtSpMMAPrune(&h, &s.md, dA, dA, (cusparseLtPruneAlg_t)2, nullptr) -> 3
+ok   cusparseLtSpMMAPrune(&h, &s.md, nullptr, dA, CUSPARSELT_PRUNE_SPMMA_STRIP, nullptr) -> 3
+ok   cusparseLtSpMMAPruneCheck(&h, &s.md, dA, nullptr, nullptr) -> 3
+ok   cusparseLtSpMMAPrune2(&h, &s.A, 1, (cusparseOperation_t)2, dA, dA, CUSPARSELT_PRUNE_SPMMA_STRIP, nullptr) -> 3
+ok   Matmul captured into a CUDA graph
+ok   the graph's product used the B written after capture
+ok   cusparseLtDestroy(&h) -> 0
+FAIL (7 failures)

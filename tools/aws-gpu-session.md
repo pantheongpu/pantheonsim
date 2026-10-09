@@ -142,3 +142,18 @@ Nothing else was created (the key pair and security group are shared and stay).
   AMI (no `cupti.h` beside the CUDA 13.2 include path, no `cuda_runtime.h` for the NVENC target); `-k` skips them.
 * The whole remote session took 3 minutes on the L40S (the probes are fast; the 1278-descriptor cuBLASLt sweep took 30
   seconds). The cost of a session is the wait for capacity, not the run.
+
+### Second half of the same night (g7e.2xlarge, RTX PRO 6000)
+
+* us-east-1 never gave a g7e.2xlarge or p5.4xlarge (13 polls from 17:46 to 22:42 UTC). Quota increases through the Service
+  Quotas API (`RequestServiceQuotaIncrease`, G and VT 8 vCPUs and P 16 vCPUs in us-west-2 and us-east-2) were
+  auto-approved for G within about an hour (P stays `CASE_OPENED`), and a g7e.2xlarge launched in us-east-2a at 22:42 on the fifth
+  poll that included that region (the AMI there is `ami-089d4ee74147726da`). The region needed its own key pair and
+  security group (`ImportKeyPair` with `~/.ssh/id_rsa.pub`, `CreateSecurityGroup` in the default VPC with SSH from this
+  machine's /32); both were deleted afterwards. us-west-2 already has `pantheon-bench-wsl` and `pantheon-bench-sg`
+  (`sg-0bcd2db068be2fc66`, AMI `ami-0fec8acfc603e6e16`).
+* The slug for this card is `rtx-pro-6000-server` (the profile that exists), not `rtx-pro-6000`.
+* The remote session ran in 2.5 minutes; building the simulator on the instance took 8 minutes on 8 vCPUs.
+  Everything was copied back in the first 15 minutes, and the instance was terminated after 17 minutes of use.
+  Do the card-only extras (PROBE_DUMP of `lt` and `sparselt`, the native `sparselt_paths` with the wheel's
+  `LD_LIBRARY_PATH`) before terminating: nothing can be re-asked of the card afterwards.

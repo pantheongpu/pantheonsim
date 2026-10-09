@@ -21,7 +21,7 @@ what was written (D, the auxiliary output, the amax values, the block scales).
 | `lt` | `nvidia/tests/e2e/lowprec_lt.cu` | cuBLASLt | 1278 descriptors |
 | `sparselt` | `nvidia/tests/e2e/lowprec_sparselt.cpp` | cuSPARSELt | 1096 problems |
 | `cvt` | `nvidia/tests/e2e/lowprec_cvt.cu` | PTX `cvt` to and from e4m3x2, e5m2x2 | 9 forms x 512 values |
-| `ptx120` | `mma_blockscale.cu`, `narrow_cvt.cu`, `ldmatrix_forms.cu` | sm_120a's `mma.sync` block-scaled forms, fp4/fp6 conversions, ldmatrix expansions | (no card transcript yet, below) |
+| `ptx120` | `mma_blockscale.cu`, `narrow_cvt.cu`, `ldmatrix_forms.cu` | sm_120a's `mma.sync` block-scaled forms, fp4/fp6 conversions, ldmatrix expansions | 29 + 12 + 12 hashes |
 
 ```
 nvidia/tests/e2e/run_lowprec.sh lt                       # the simulator, every profile that has a transcript
@@ -42,9 +42,10 @@ at another set of NVIDIA libraries (a pip wheel's, for instance).
 | --- | --- | --- |
 | `nvidia/l4` (sm_89) | an AWS g6.xlarge (three sessions), driver 595.91, cuBLAS 13.3 (CUDA 13.2), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`; `cuda_attributes_l4.card.txt`; `nvidia-smi -q` (serial number, PDI and UUID redacted) |
 | `nvidia/l40s` (sm_89) | an AWS g6e.2xlarge (2026-10-09), driver 595.91.07, cuBLAS 13.3 (wheel `nvidia-cublas==13.3.*`), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`: line for line the L4's (the simulator's `l40s` profile reproduces them) |
+| `nvidia/rtx-pro-6000-server` (sm_120) | an AWS g7e.2xlarge (2026-10-09), driver 595.91.07, cuBLAS 13.3 (wheel), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`, `ptx120`; `cuda_attributes_rtx-pro-6000-server.card.txt`; `nvidia-smi -q`; the programs of `nvidia/tests/data/card/rtx-pro-6000-server/`. **The simulator does not reproduce `lt`, `sparselt` and `ptx120` yet** (`known-gaps.txt`); `cvt` it does |
 | `nvidia/rtx3060` (sm_86) | the development machine, the same libraries | `lt`, `sparselt`; cuDNN 9.27 for `dnn_int8x32` |
 
-Nothing was measured on Hopper or Blackwell (a later session, 2026-10-09 evening, got only an L40S, which answered exactly as the L4 did): AWS had no `p5.4xlarge` or
+Nothing was measured on Hopper (no `p5.4xlarge` capacity came in any of three regions over five hours) or on a data-center Blackwell; an L40S (g6e.2xlarge) answered exactly as the L4 did, and an RTX PRO 6000 Blackwell Server Edition (g7e.2xlarge, us-east-2, after a quota increase there) gave the sm_120 transcripts below. Earlier: AWS had no `p5.4xlarge` or
 `g7e.2xlarge` capacity in us-east-1 at nine attempts over four hours (every zone
 for `p5.4xlarge`; for a while no `g6.xlarge` or `g6e.xlarge` either), the Spot
 quota for the G and P families is 0, and no other region has any quota for them.
@@ -124,6 +125,58 @@ the two orientations).
 `cudnnReorderFilterAndBias` (`CUDNN_TENSOR_REORDERING_INT8x32`) gives the host
 reference on an RTX 3060 and on the shim (`dnn_int8x32.cu`).
 
+## What the RTX PRO 6000 says (sm_120)
+
+Read on 2026-10-09 from an AWS g7e.2xlarge. The shims follow the L4's rules for every GPU of compute
+capability 9 and later, plus documentation for the block-scaled modes, and the card disagrees with that in
+three places. `known-gaps.txt` lists the three probes as expected failures (`XFAIL`) until the simulator
+follows the card; the diffs below are what `run_lowprec.sh <probe> rtx-pro-6000-server` prints (keep the
+simulator's side with `LOWPREC_KEEP=<dir>`).
+
+* **cuBLASLt (`lt`, 539 of 1279 cases differ).** 448 cases the card refuses with `NOT_SUPPORTED` (15) that the
+  simulator accepts, and 78 it refuses with `INVALID_VALUE` (7) that the simulator accepts; it never refuses
+  what the card accepts. cuBLAS 13.3 has fp8 kernels on sm_120 only for part of the layout/type/epilogue space.
+  By group (cases that differ of the group's size): `fp8types` 142/240, `fp8epi` 120/385, `fp8bwd` 42/72,
+  `mx8` 27/48, `hopshape` 27/27 and `hop` 24/32 (the Hopper-only 128-element and 128x128 FP32 scale modes: the
+  card refuses all of them on sm_120), `fp8beta` 22/34, `fp8dims` 21/42, `mnk4`/`mnk4shape` 34/34 (the packed
+  `VEC128/VEC32_MN_K4_UE8M0` modes are `INVALID_VALUE` for cuBLAS 13.3), `mx8out` 16/22, `fp4`/`fp4out`/`fp4shape`
+  25/63. Of the 287 cases both accept, 274 are bit-identical; the 13 that differ are the block-quantized D's
+  output scale tensors (`mx8out/dout_v32_*`, `fp4shape/*_fp4out_*`: the scale layout/values, and for NVFP4 D
+  also the values). The kernel-existence rules live in `nvidia/src/cublaslt_api.cpp` (the FP8 rules around
+  line 999, the Hopper-and-later block modes around line 1081, the output-scale code beside the D block
+  quantization). The card's own checks in `lt_paths`/`lt_blockscaled_paths` (run natively, `card/` directory) agree:
+  VEC128_32F/BLK128x128_32F A/B scales are refused on sm_120, and the MX/NV D-scale checks of the test
+  (written from the documentation) fail on the card.
+* **cuSPARSELt (`sparselt`, 99 of 1097 cases).** The same 99 cases that the L4 transcript differs on: FP8
+  compresses to `4096 : 49216` bytes (the kept values, then a 49216-byte metadata/scale region) with a zero
+  workspace, where the L4's is `4096 : 1024` and workspace 1024 (76 cases; 23 more differ in size, workspace or
+  have no L4 counterpart), and sm_120 accepts 13 block-scaled cases (E4M3 `VEC32`/`VEC64` scales, E2M1 shapes)
+  that the L4 refuses at algorithm selection (`alg=10`); 7 ReLU/search cases have a different numerical hash `d`. The
+  layout code is `nvidia/src/cusparselt_api.cpp` (the compressed-matrix section near line 429). The native
+  `sparselt_paths` fails 7 checks on the card, all of them expectations taken from the RTX 3060 (algorithm
+  defaults and attribute round trips, the 64x64 fp16 metadata layout: 896 metadata codes differ, TF32 rounding).
+* **`mma.sync` block-scaled forms (`ptx120`, 23 of 29 `mma_blockscale` hashes).** `narrow_cvt` and
+  `ldmatrix_forms` reproduce the card exactly (24 of 24); in `mma_blockscale` the `mxf4` and `nvf4_2X_ue8m0`
+  forms and `f8f6f4_e2m3_e4m3` match, and every other form differs: `f8f6f4` with FP8/FP6/FP4 operands (8
+  forms), `mxf8f6f4` (9), `nvf4_4X_ue4m3` (2) and the sparse `sp_mx8` (2). The interpreter and the SASS runner
+  agree with each other (`src/sass/exec_ops.inc` QMMA/OMMA at line 2774, the PTX side `src/exec/interpreter.cpp`
+  around line 7458), so the difference is the arithmetic itself: the simulator sums exact products in fp32 in
+  K order; the card's FP8/FP6 tensor-core accumulation evidently rounds or aligns differently. The data to find
+  the rule are the hashes per form; `PROBE_DUMP` does not cover this probe.
+* **Attributes.** Against `device_attributes --dump`: the boost clock (2430 MHz, was 2617), the memory clock,
+  the persisting L2 (83886080), the memory total and `MaxAccessPolicyWindowSize` (134217728 on sm_120, 134213632
+  below; fixed in `nvidia/src/device_attributes.cpp`) and `UnifiedFunctionPointers` (1; fixed) were the
+  simulator's. The other differences are the capabilities the simulator does not implement (the same
+  categories as the L4's), and the PCI bus id.
+* **Natively run programs (`nvidia/tests/data/card/rtx-pro-6000-server/native/`).** `mma_blockscale`,
+  `dsmem_cluster`, `cooperative_cluster`, `stmatrix`, `vector_atomics`, `mma_fragment_layout`, `wmma_gemm`,
+  `uldc_narrow`, `lt_epilogue_paths` pass on the card. `mma_forms` fails one form of 123
+  (`s8_m16n8k32_satfinite`: the card gives 78eaef8c79913f66, the RTX 3060 4168a5c5ce5afb48 that the test
+  expects), `wmma_types` does not compile for sm_120a (the CUDA 13.2 headers: unsupported operation), and the two
+  FP8 attention tests fail on the card's cuDNN 9.27: the output quantized to E4M3 is 4.76 FP8 steps from the
+  documented formula in the backend test and 29 in the frontend's (S's amax and O's amax are as documented), so
+  the documented formula for `scale_O` quantization is not what cuDNN computes on sm_120.
+
 ## Still written from the documentation
 
 Marked "documentation-derived" in the code, and not checked against a card:
@@ -140,8 +193,7 @@ Marked "documentation-derived" in the code, and not checked against a card:
   tensor reorderings.
 - The block-scaled `tcgen05` forms of `docs/blackwell.md` (sm_100 only; AWS offers
   it only as an eight-GPU p6-b200.48xlarge, which the round's rules exclude).
-- sm_120's `mma.sync` block-scaled forms, fp4/fp6 conversions and ldmatrix
-  expansions: the program set `ptx120` is ready, its transcript needs a g7e.
+- sm_120's `mma.sync` block-scaled forms: measured (above); the simulator does not reproduce 23 of the 29 hashes.
 
 ## Running it on a GPU that has them
 

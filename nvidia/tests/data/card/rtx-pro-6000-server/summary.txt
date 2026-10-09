@@ -1,0 +1,26 @@
+[22:44:09] slug=rtx-pro-6000-server compute_cap=120 arch=sm_120a toolkit=/usr/local/cuda-13.2
+[22:45:09] lowprec-lt rc=0 23s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/lt.rtx-pro-6000-server.txt
+[22:45:11] lowprec-sparselt rc=0 2s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/sparselt.rtx-pro-6000-server.txt
+[22:45:15] lowprec-cvt rc=0 4s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/cvt.rtx-pro-6000-server.txt
+[22:45:19] lowprec-ptx120 rc=0 4s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/ptx120.rtx-pro-6000-server.txt
+[22:45:30] dnn-fp8-attention rc=1 9s: FAIL
+[22:45:50] dnn-fp8-attention-frontend rc=1 20s: FAIL
+[22:45:56] native mma_blockscale rc=0 2s: PASS
+[22:45:57] native narrow_cvt rc=0 1s: ue8m0x2 .rp              e214e912  [97] 0000ff80 [89] 0000fe82 [83] 00000000 [5] 0000817e
+[22:45:58] native ldmatrix_forms rc=0 1s: m16n16.x1.trans.b6x16_p32 (lane 5's 2nd) 383b3938
+[22:46:02] native dsmem_cluster rc=0 4s: PASS
+[22:46:06] native cooperative_cluster rc=0 4s: PASS
+[22:46:07] native stmatrix rc=0 1s: PASS
+[22:46:09] native vector_atomics rc=0 2s: PASS
+[22:46:16] native mma_forms rc=1 7s: FAIL: 122 of 123 mma forms match the RTX 3060
+[22:46:17] native mma_fragment_layout rc=0 1s: PASS
+[22:46:19] native wmma_gemm rc=0 2s: PASS
+[22:46:19] native wmma_types rc=1 0s: 
+[22:46:21] native uldc_narrow rc=0 2s: PASS: every narrow constant read
+[22:46:25] native lt_paths rc=1 4s: FAIL: 1 cuBLASLt checks
+[22:46:29] native lt_epilogue_paths rc=0 4s: PASS: every cuBLASLt epilogue check
+[22:46:32] native lt_blockscaled_paths rc=1 3s: FAIL: 4 block-scaled cuBLASLt checks
+[22:46:33] native sparselt_paths rc=127 1s: /tmp/native_sparselt_paths: error while loading shared libraries: libcusparseLt.so.0: cannot open sh
+[22:46:34] characterize: 41 lines of profile
+[22:46:36] device_attributes --dump: 409 lines
+[22:46:40] done

@@ -120,7 +120,7 @@ native() {   # native <program> [extra nvcc args...]   (source .cu or .cpp in nv
   local t0=$SECONDS
   { nvcc -std=c++17 -O1 -cudart shared -arch="$arch" -w --expt-relaxed-constexpr \
       ${cutlass:+-I$cutlass/include -I$cutlass/tools/util/include} -I"$e2e" -I"$root/nvidia/include" "$@" "$src" -o "$exe" -lcuda \
-      && timeout 600 "$exe"; } > "$out/native/$p.txt" 2>&1
+      && LD_LIBRARY_PATH="${sparselt_lib:+$sparselt_lib:}${cublas_lib:+$cublas_lib:}$LD_LIBRARY_PATH" timeout 600 "$exe"; } > "$out/native/$p.txt" 2>&1
   local rc=$?
   say "native $p rc=$rc $((SECONDS - t0))s: $(tail -n 1 "$out/native/$p.txt" | cut -c1-100)"
 }
