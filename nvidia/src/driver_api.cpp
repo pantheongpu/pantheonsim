@@ -1225,7 +1225,9 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       // and its low byte before (as sass::parse_cubin reads it): a CUDA 12
       // cubin for sm_86 carries 0x560556.
       const int sm = static_cast<int>(b[7] == 0x33 ? eflags & 0xff : (eflags >> 8) & 0xff);
-      if (!vgpu::sass::runs_on(sm, false, static_cast<int>(cc))) return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      // An sm_XYa cubin runs on XY alone, a plain one on its major from XY up.
+      if (!vgpu::sass::runs_on(sm, vgpu::sass::cubin_arch_specific(b, size), static_cast<int>(cc)))
+        return CUDA_ERROR_NO_BINARY_FOR_GPU;
       try {
         mid = s.rt->device(dev).load_cubin(b, size);
       } catch (const vgpu::Error& e) {

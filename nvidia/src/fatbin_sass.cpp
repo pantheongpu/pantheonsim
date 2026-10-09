@@ -7,6 +7,7 @@
 
 #include "fatbin.hpp"
 #include "vgpu/error.hpp"
+#include "vgpu/sass/cubin.hpp"
 #include "vgpu/sass/exec.hpp"
 
 namespace vgpu::cuda {
@@ -19,14 +20,26 @@ std::string pick_cubin(const void* fatbin, uint32_t cc) {
   } catch (const Error&) {
     return {};
   }
+  // The image the driver runs: the newest the device can run (the same major
+  // and a minor no newer than the device's), where an sm_XYa image runs on XY
+  // alone -- so on a cc 10.3 or 10.7 profile an sm_100a cubin is no candidate,
+  // and the fatbin's PTX (when it has some the device can use) is what runs.
+  // Of two images for one architecture the arch-specific one wins, as for PTX
+  // (pick_ptx).
   const FatbinPtx* best = nullptr;
+  bool best_specific = false;
   for (const FatbinPtx& e : elfs) {
     if (e.text.size() < 64 || e.text[0] != 0x7f) continue;
     uint16_t type;
     std::memcpy(&type, e.text.data() + 16, 2);
     if (type != 2 /* ET_EXEC */) continue;
-    if (e.arch / 10 != cc / 10 || e.arch > cc) continue;
-    if (!best || e.arch > best->arch) best = &e;
+    const bool specific =
+        vgpu::sass::cubin_arch_specific(reinterpret_cast<const uint8_t*>(e.text.data()), e.text.size());
+    if (!vgpu::sass::runs_on(static_cast<int>(e.arch), specific, static_cast<int>(cc))) continue;
+    if (!best || e.arch > best->arch || (e.arch == best->arch && specific && !best_specific)) {
+      best = &e;
+      best_specific = specific;
+    }
   }
   if (!best) return {};
   // SASS the executor cannot run all of yet gives way to the fatbin's PTX,

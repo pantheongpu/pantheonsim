@@ -1272,6 +1272,12 @@ vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(test_robustness PRIVATE ${CMAKE_DL_LIBS})
+# Which cubin the driver picks from a fatbin: sm_XYa SASS runs on XY alone, so
+# a B300 (10.3) or Vera Rubin (10.7) falls back to the fatbin's PTX.
+vgpu_unit_test(test_pick_cubin)
+target_include_directories(test_pick_cubin PRIVATE nvidia/src)
+target_sources(test_pick_cubin PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+target_link_libraries(test_pick_cubin PRIVATE ${CMAKE_DL_LIBS})
 # The PTX linker (-rdc builds, nvJitLink) and the fatbin writer and container
 # readers (nvFatbin, nvJitLink's object and library inputs), with no toolkit.
 vgpu_unit_test(test_ptx_link)
