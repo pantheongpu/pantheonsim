@@ -175,12 +175,12 @@ jobs:
       - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
@@ -251,15 +251,15 @@ jobs:
       - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
-          sudo apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
           # Every library the simulator stands in for: each shim is compiled
           # against that library's own header, so a missing one fails the build
           # (libcurand-dev did).
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
@@ -334,8 +334,8 @@ jobs:
 
       - name: Install ollama and its ROCm backend
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
           mkdir -p "$RUNNER_TEMP/ollama"
           for t in ollama-linux-amd64.tar.zst ollama-linux-amd64-rocm.tar.zst; do
             wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/$t" |
@@ -558,8 +558,8 @@ jobs:
       - name: Install toolchain
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
 
       - name: Build instrumented
@@ -615,8 +615,8 @@ jobs:
       - name: Install toolchain
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
 
       - name: Build instrumented
