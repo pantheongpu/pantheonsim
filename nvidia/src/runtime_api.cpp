@@ -716,8 +716,8 @@ void bind_managed_vars(State& s, RegisteredModule& m, int dev, uint64_t mid) {
 // the fatbin, the very image the card's driver would load -- and not at all
 // when the module is PTX it compiles itself, because that is not an image
 // there is to hand over. Each function of the module is listed beside it.
-void announce_module_loaded(State& s, RegisteredModule& m, int dev) {
-  const uint32_t id = vgpu::profiling::next_module_id();
+void announce_module_loaded(State& s, RegisteredModule& m, int dev, uint64_t mid) {
+  const uint32_t id = vgpu::profiling::next_module_id(static_cast<uint32_t>(dev));
   m.prof_id[dev] = id;
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   if (vgpu::profiling::silenced()) return;
@@ -729,10 +729,11 @@ void announce_module_loaded(State& s, RegisteredModule& m, int dev) {
   info.cubin_size = m.cubin.size();
   vgpu::profiling::notify_resource(info);
   if (!vgpu::profiling::enabled()) return;
-  std::vector<std::string> names;
-  for (const auto& kv : s.kernels)
-    if (kv.second.mod == &m) names.push_back(kv.second.entry_name);
-  std::sort(names.begin(), names.end());
+  // The functions of the module, in the order its source declares them: a
+  // cubin lists its functions in the opposite order (measured), so that is
+  // undone for one; PTX the engine reads is in declaration order already.
+  std::vector<std::string> names = s.rt->device(dev).kernel_names(mid);
+  if (!m.cubin.empty()) std::reverse(names.begin(), names.end());
   uint32_t index = 0;
   for (const std::string& name : names) {
     vgpu::profiling::Event e;
@@ -758,7 +759,7 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
     const uint64_t mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(m.cubin.data()), m.cubin.size());
     m.module_per_device[dev] = mid;
     bind_managed_vars(s, m, dev, mid);
-    announce_module_loaded(s, m, dev);
+    announce_module_loaded(s, m, dev, mid);
     return mid;
   }
   if (m.ptx.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);
@@ -766,7 +767,7 @@ uint64_t module_on_current(State& s, RegisteredModule& m) {
   m.module_per_device[dev] = mid;
   std::string().swap(m.ptx);
   bind_managed_vars(s, m, dev, mid);
-  announce_module_loaded(s, m, dev);
+  announce_module_loaded(s, m, dev, mid);
   return mid;
 }
 
@@ -1802,16 +1803,12 @@ static cudaError_t cudaDeviceReset_body(void) {
   if (!s.initialized) return cudaSuccess;  // nothing was ever set up
   set_sticky_error(s, cudaSuccess);
   const int dev = t_current_device;
-  // A subscriber is told the context is going, and then what it holds: its
-  // streams and the modules loaded into it (an RTX 3060's order for the two is
-  // not known, and these are told in that one).
+  // A subscriber is told the context is going, and then what it holds: the
+  // modules loaded into it, and then its streams (an RTX 3060's order).
   if (vgpu::profiling::hooked() && !vgpu::profiling::silenced() &&
       (g_announced_contexts.load() & (1u << (static_cast<unsigned>(dev) & 31u)))) {
     vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextDestroyStarting, 0,
                                      static_cast<uint32_t>(dev));
-    for (void* st : streams_of_device(dev))
-      vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting,
-                                       reinterpret_cast<uint64_t>(st), static_cast<uint32_t>(dev));
     for (auto& m : s.modules) {
       const auto id = m->prof_id.find(dev);
       if (id == m->prof_id.end() || !m->module_per_device.count(dev)) continue;
@@ -1823,10 +1820,14 @@ static cudaError_t cudaDeviceReset_body(void) {
       info.cubin_size = m->cubin.size();
       vgpu::profiling::notify_resource(info);
     }
+    for (void* st : streams_of_device(dev))
+      vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting,
+                                       reinterpret_cast<uint64_t>(st), static_cast<uint32_t>(dev));
   }
   g_announced_contexts.fetch_and(~(1u << (static_cast<unsigned>(dev) & 31u)));
   g_context_generation[static_cast<unsigned>(dev) & 31u].fetch_add(1);
   for (auto& m : s.modules) m->prof_id.erase(dev);
+  vgpu::profiling::reset_module_ids(static_cast<uint32_t>(dev));
   auto release = [&](std::map<void*, HostRange>& m, bool ours) {
     for (auto it = m.begin(); it != m.end();) {
       if (it->second.device != dev) {
@@ -2037,7 +2038,7 @@ static cudaError_t cudaGetDeviceProperties_v2_traced(cudaDeviceProp* prop, int d
 }
 
 VGPU_EXPORT cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int device) {
-  return traced_call("cudaGetDeviceProperties_v2", cudaGetDeviceProperties_v2_traced, prop, device);
+  return traced_call("cudaGetDeviceProperties", cudaGetDeviceProperties_v2_traced, prop, device);
 }
 
 static cudaError_t cudaDeviceGetAttribute_body(int* value, cudaDeviceAttr attr, int device) {
@@ -4596,11 +4597,14 @@ static void forget_arrays_on(int device) {
 VGPU_EXPORT cudaChannelFormatDesc cudaCreateChannelDesc(int x, int y, int z, int w,
                                                         cudaChannelFormatKind f) {
   cudaChannelFormatDesc d;
+  note_all(x, y, z, w, f);
+  vgpu::profiling::ApiCall call("cudaCreateChannelDesc");
   d.x = x;
   d.y = y;
   d.z = z;
   d.w = w;
   d.f = f;
+  call.set_return_value(&d);
   return d;
 }
 
@@ -5401,7 +5405,7 @@ static cudaError_t cudaMemPrefetchAsync_v2_traced(const void* p, size_t n, struc
 }
 
 VGPU_EXPORT cudaError_t cudaMemPrefetchAsync_v2(const void* p, size_t n, struct cudaMemLocation loc, unsigned int flags, cudaStream_t stream) {
-  return traced_call("cudaMemPrefetchAsync_v2", cudaMemPrefetchAsync_v2_traced, p, n, loc, flags, stream);
+  return traced_call("cudaMemPrefetchAsync", cudaMemPrefetchAsync_v2_traced, p, n, loc, flags, stream);
 }
 static cudaError_t cudaMemAdvise_v2_traced(const void* p, size_t n, cudaMemoryAdvise kind, struct cudaMemLocation loc) {
   return guard("cudaMemAdvise_v2", [&](State& s) -> cudaError_t {
@@ -5412,7 +5416,7 @@ static cudaError_t cudaMemAdvise_v2_traced(const void* p, size_t n, cudaMemoryAd
 }
 
 VGPU_EXPORT cudaError_t cudaMemAdvise_v2(const void* p, size_t n, cudaMemoryAdvise kind, struct cudaMemLocation loc) {
-  return traced_call("cudaMemAdvise_v2", cudaMemAdvise_v2_traced, p, n, kind, loc);
+  return traced_call("cudaMemAdvise", cudaMemAdvise_v2_traced, p, n, kind, loc);
 }
 #endif
 
@@ -5880,7 +5884,7 @@ static cudaError_t cudaEventElapsedTime_v2_traced(float* ms, cudaEvent_t start, 
 }
 
 VGPU_EXPORT cudaError_t cudaEventElapsedTime_v2(float* ms, cudaEvent_t start, cudaEvent_t end) {
-  return traced_call("cudaEventElapsedTime_v2", cudaEventElapsedTime_v2_traced, ms, start, end);
+  return traced_call("cudaEventElapsedTime", cudaEventElapsedTime_v2_traced, ms, start, end);
 }
 #endif
 static cudaError_t cudaEventDestroy_body(cudaEvent_t e) {
@@ -5926,18 +5930,25 @@ VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) {
 // library -- cudaErrorNoDevice, cudaErrorNotReady, cudaErrorPeerAccessAlreadyEnabled
 // -- was told "cudaErrorUnknown", confidently wrong. A code no header declares
 // gets the documented "unrecognized error code".
-// A profiler lists both as calls, as NVIDIA's does (measured: a record for each).
+// A profiler lists both as calls, as NVIDIA's does (measured: a record for each),
+// and a subscriber is shown the string they return.
 VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
+  const char* text = nullptr;
   note_all(error);
   vgpu::profiling::ApiCall call("cudaGetErrorString");
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
-  return e && e->runtime_name ? e->text : "unrecognized error code";
+  text = e && e->runtime_name ? e->text : "unrecognized error code";
+  call.set_return_value(&text);
+  return text;
 }
 VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
+  const char* text = nullptr;
   note_all(error);
   vgpu::profiling::ApiCall call("cudaGetErrorName");
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
-  return e && e->runtime_name ? e->runtime_name : "unrecognized error code";
+  text = e && e->runtime_name ? e->runtime_name : "unrecognized error code";
+  call.set_return_value(&text);
+  return text;
 }
 
 static cudaError_t cudaDriverGetVersion_body(int* v) {

@@ -1570,10 +1570,6 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   const bool driver = info.domain == vgpu::profiling::Domain::Driver;
   const auto& table = driver ? driver_conversions() : all_conversions();
   // CUPTI calls cudaLaunchKernelEx by the C entry point it goes through.
-  // The two that return a string, not an error code, are listed in the activity
-  // records but not delivered to callbacks: the return value would be of the wrong type.
-  if (!driver && (std::strcmp(info.name, "cudaGetErrorString") == 0 || std::strcmp(info.name, "cudaGetErrorName") == 0))
-    return;
   const std::string name = (!driver && std::strcmp(info.name, "cudaLaunchKernelEx") == 0) ? "cudaLaunchKernelExC" : info.name;
   const auto it = table.find(name);
   if (it == table.end()) return;
@@ -1598,8 +1594,9 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   data.callbackSite = info.enter ? CUPTI_API_ENTER : CUPTI_API_EXIT;
   data.functionName = info.name;
   data.functionParams = conv.fill ? storage : nullptr;
-  data.functionReturnValue = info.enter ? nullptr : driver ? static_cast<void*>(&driver_returned)
-                                                           : static_cast<void*>(&returned);
+  data.functionReturnValue = info.enter ? nullptr
+                             : info.return_value ? const_cast<void*>(info.return_value)
+                             : driver ? static_cast<void*>(&driver_returned) : static_cast<void*>(&returned);
   data.symbolName = info.symbol;
   data.context = current_context();
   data.contextUid = context_id_of(reinterpret_cast<uint64_t>(data.context));

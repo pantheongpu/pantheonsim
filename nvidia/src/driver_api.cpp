@@ -628,6 +628,7 @@ void announce_context_created(ShimState& s, uintptr_t handle) {
     ev.device = device;
     ev.start_ns = ev.end_ns = vgpu::profiling::now_ns();
     ev.correlation = vgpu::profiling::work_correlation();
+    ev.handle = handle;   // a context of the driver's own, not the device's primary one
     vgpu::profiling::record(std::move(ev));
   }
 }
@@ -1230,9 +1231,10 @@ static void announce_module_event(vgpu::profiling::Resource what, const ModulePr
   vgpu::profiling::notify_resource(info);
 }
 
-static void announce_module_loaded(uintptr_t handle, int device, const uint8_t* cubin, size_t cubin_size) {
+static void announce_module_loaded(uintptr_t handle, int device, const uint8_t* cubin, size_t cubin_size,
+                                   const std::vector<std::string>& functions) {
   ModuleProf m;
-  m.id = vgpu::profiling::next_module_id();
+  m.id = vgpu::profiling::next_module_id(static_cast<uint32_t>(device));
   m.device = device;
   if (cubin && cubin_size) m.cubin.assign(reinterpret_cast<const char*>(cubin), cubin_size);
   {
@@ -1240,6 +1242,20 @@ static void announce_module_loaded(uintptr_t handle, int device, const uint8_t* 
     g_module_prof[handle] = m;
   }
   announce_module_event(vgpu::profiling::Resource::ModuleLoaded, m);
+  if (!vgpu::profiling::enabled()) return;
+  uint32_t index = 0;
+  for (const std::string& name : functions) {   // in the order the source declares them (see the runtime's)
+    vgpu::profiling::Event e;
+    e.kind = vgpu::profiling::EventKind::Function;
+    e.start_ns = e.end_ns = vgpu::profiling::host_ns();
+    e.device = static_cast<uint32_t>(device);
+    e.correlation = vgpu::profiling::work_correlation();
+    e.module_id = m.id;
+    e.function_index = index++;
+    e.name = name;
+    e.handle = vgpu::profiling::next_function_id();
+    vgpu::profiling::record(std::move(e));
+  }
 }
 
 static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
@@ -1279,7 +1295,16 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       std::memcpy(&shoff, b + 0x28, 8);
       std::memcpy(&shentsize, b + 0x3a, 2);
       std::memcpy(&shnum, b + 0x3c, 2);
-      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;
+      // Where the image ends: the later of its section table and its program
+      // header table, which a cubin keeps after the sections (an RTX 3060 reports
+      // the cubin it loaded as that size).
+      uint64_t phoff;
+      uint16_t phentsize, phnum;
+      std::memcpy(&phoff, b + 0x20, 8);
+      std::memcpy(&phentsize, b + 0x36, 2);
+      std::memcpy(&phnum, b + 0x38, 2);
+      const uint64_t size = std::max(shoff + static_cast<uint64_t>(shentsize) * shnum,
+                                     phoff + static_cast<uint64_t>(phentsize) * phnum);
       uint32_t eflags;
       std::memcpy(&eflags, b + 0x30, 4);
       // The architecture is in e_flags' second byte from ABI version 8 on,
@@ -1301,7 +1326,13 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};
     *module = reinterpret_cast<CUmodule>(h);
-    announce_module_loaded(h, dev, loaded_cubin.data(), loaded_cubin.size());
+    announce_module_loaded(h, dev, loaded_cubin.data(), loaded_cubin.size(),
+                           [&] {
+                             std::vector<std::string> names;
+                             if (vgpu::profiling::enabled()) names = s.rt->device(dev).kernel_names(mid);
+                             if (!loaded_cubin.empty()) std::reverse(names.begin(), names.end());
+                             return names;
+                           }());
     return CUDA_SUCCESS;
   });
 }

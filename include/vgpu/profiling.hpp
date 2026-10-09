@@ -144,6 +144,9 @@ struct ApiInfo {
   int nargs = 0;
   const char* symbol = nullptr;        // a kernel launch: the kernel's name
   int32_t result = 0;                  // on exit
+  // On exit, the call's return value where it is not a status code (a string, a
+  // structure): a pointer to it, valid until the call returns.
+  const void* return_value = nullptr;
 };
 
 enum class Resource : uint8_t {
@@ -219,8 +222,12 @@ bool pop_external(int kind, uint64_t* last);  // false: the stack is empty
 // or not anyone is profiling, because a tool may attach after it was made.
 uint32_t next_graph_id();
 // The numbers a profiler gives modules and the functions in them, across the
-// runtime and the driver: each takes the next.
-uint32_t next_module_id();
+// runtime and the driver. A device's modules are numbered from 22 (the driver's
+// own take the ones before), starting again when its context is made again
+// after a reset (measured on an RTX 3060: the same program's module has the
+// same number in the new context); functions are numbered from 1.
+uint32_t next_module_id(uint32_t device);
+void reset_module_ids(uint32_t device);
 uint32_t next_function_id();
 void register_graph(uint64_t handle, uint32_t id);
 void register_graph_node(uint64_t handle, uint64_t id);
@@ -292,6 +299,8 @@ class ApiCall {
   ApiCall(const ApiCall&) = delete;
   ApiCall& operator=(const ApiCall&) = delete;
   void set_result(int32_t r) { result_ = r; }
+  // For a call that returns something other than a status code.
+  void set_return_value(const void* p) { return_value_ = p; }
 
  private:
   const char* name_ = nullptr;   // null when nobody was profiling at the call
@@ -305,6 +314,7 @@ class ApiCall {
   uint32_t correlation_ = 0, outer_ = 0;
   uint64_t start_ = 0;
   int32_t result_ = 0;
+  const void* return_value_ = nullptr;
 };
 
 }  // namespace vgpu::profiling

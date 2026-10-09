@@ -55,9 +55,20 @@ std::unordered_map<uint64_t, uint64_t> g_node_by_handle;
 
 uint32_t next_graph_id() { return g_graph_ids.fetch_add(1, std::memory_order_relaxed); }
 namespace {
-std::atomic<uint32_t> g_module_ids{1}, g_function_ids{1};
+std::mutex g_module_mu;
+std::unordered_map<uint32_t, uint32_t> g_module_ids;   // device -> the next number
+std::atomic<uint32_t> g_function_ids{1};
 }
-uint32_t next_module_id() { return g_module_ids.fetch_add(1, std::memory_order_relaxed); }
+uint32_t next_module_id(uint32_t device) {
+  std::lock_guard<std::mutex> lock(g_module_mu);
+  auto it = g_module_ids.find(device);
+  if (it == g_module_ids.end()) it = g_module_ids.emplace(device, 22u).first;
+  return it->second++;
+}
+void reset_module_ids(uint32_t device) {
+  std::lock_guard<std::mutex> lock(g_module_mu);
+  g_module_ids.erase(device);
+}
 uint32_t next_function_id() { return g_function_ids.fetch_add(1, std::memory_order_relaxed); }
 void register_graph(uint64_t handle, uint32_t id) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
@@ -291,6 +302,7 @@ ApiCall::~ApiCall() {
       info.nargs = nargs_;
       info.symbol = symbol_;
       info.result = result_;
+      info.return_value = return_value_;
       h.api(info);
     }
   }
