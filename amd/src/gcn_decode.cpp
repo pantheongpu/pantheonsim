@@ -1911,6 +1911,8 @@ std::string operand_text(const Operand& o) {
     case OperandKind::M0: return wrap("m0");
     case OperandKind::SharedBase: return wrap("src_shared_base");
     case OperandKind::PrivateBase: return wrap("src_private_base");
+    case OperandKind::FlatScratchLo: return wrap("src_flat_scratch_base_lo");
+    case OperandKind::FlatScratchHi: return wrap("src_flat_scratch_base_hi");
     case OperandKind::InlineFloat:
       // As the assembler writes them: 1.0, -0.5, and, for one over two pi,
       // the digits of the float it stands for.
