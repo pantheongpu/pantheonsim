@@ -389,6 +389,14 @@ status=$?
 expect "the gfx1250 named-barrier program runs to the end" "0" "$status"
 expect "every gfx1250 named-barrier check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's arithmetic the compiler seldom emits (hipcc/alu1250.cpp): the IEEE minimum and maximum families, the _num
+# three-operand forms, 16-bit integer, half and packed operations, DX9 multiplies, scalar float and bit operations and the
+# EXEC-writing scalar operations, each against the ISA's pseudocode written out again for the host.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/alu1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 arithmetic program runs to the end" "0" "$status"
+expect "every gfx1250 arithmetic check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

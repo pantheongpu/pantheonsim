@@ -379,6 +379,16 @@ false` throughout. gfx1251 (MI430X) is not covered.
   fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
   `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
   sparse, mixed-width and scaled ones depend on the layout read from the document.
+- **Arithmetic the compiler seldom emits** (`tests/hipcc/alu1250.cpp`, each against the ISA's pseudocode written out for
+  the host): the IEEE `v_minimum_*` and `v_maximum_*` families in f16, f32 and f64 (a signaling NaN comes back quieted,
+  -0 is below +0) with their three-operand and combined forms, the `_num` three-operand forms (a number beats a NaN;
+  they keep their own names rather than the older instructions' they replaced), 16-bit integer add, subtract, min, max
+  and shift, `v_cvt_i32_i16`, `v_cvt_u32_u16`, `v_sat_pk_u8_i16`, half sine, cosine, frexp and ldexp,
+  `v_cvt_nearest_i32_f32`, `v_cvt_off_f32_i4`, `v_cvt_norm_*_f16`, the DX9 and lighting multiplies, `v_sqrt_f64`,
+  the packed bfloat16, half and 16-bit integer instructions (`v_pk_*_bf16`, `v_pk_fmac_f16`, `v_pk_{minimum,maximum}*_f16`,
+  `v_pk_add_{max,min}_*16`, `v_pk_{max,min}3_*16`), and the scalar `s_{minimum,maximum}_f{16,32}`, `s_{ceil,floor,trunc,
+  rndne}_f16`, `s_cvt_pk_rtz_f16_f32`, `s_quadmask_*`, `s_bitset{0,1}_b64`, `s_bitreplicate_b64_b32`, `s_cls_i32_i64` and
+  the `s_{nand,nor,xnor}_saveexec_*`, `s_and_not{0,1}_wrexec_*` and further EXEC-writing forms.
 - **Named barriers:** `s_barrier_init`, `_join`, `_signal` (with the member count in M0), `_signal_isfirst`, `_wait`,
   `_leave`, `s_get_barrier_state` and `s_wakeup_barrier`, from the ISA document's section 5.6; the work-group barrier's
   signal count is kept too, for `isfirst`. The trap and cluster barriers do nothing (a cluster is one work-group here),

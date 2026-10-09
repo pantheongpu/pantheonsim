@@ -13,6 +13,7 @@
 // comparison's result, a carry -- is one scalar register.
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -206,9 +207,15 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
       {"v_add_nc_i16", "v_add_i16"},         {"v_sub_nc_i16", "v_sub_i16"},
       {"v_dot2acc_f32_f16", "v_dot2c_f32_f16"},
   };
+  // gfx1250's three-operand "_num" minimum and maximum forms take a number over a NaN and order the zeros, as the
+  // older instructions they replaced did not: they keep their own names, and the executor has them.
+  static const std::set<std::string> kOwnNames = {
+      "v_min3_num_f32", "v_max3_num_f32", "v_minmax_num_f32", "v_maxmin_num_f32", "v_med3_num_f32",
+      "v_min3_num_f16", "v_max3_num_f16", "v_minmax_num_f16", "v_maxmin_num_f16", "v_med3_num_f16"};
+  const bool own = g_cdna5 && kOwnNames.count(name);
   std::vector<std::string> candidates;
   if (const auto it = kRenamed.find(name); it != kRenamed.end()) candidates.push_back(it->second);
-  if (const auto it = kAliases.find(name); it != kAliases.end())
+  if (const auto it = kAliases.find(name); it != kAliases.end() && !own)
     candidates.insert(candidates.end(), it->second.begin(), it->second.end());
   candidates.push_back(name);
   const bool short_form = enc == Enc::Vop1 || enc == Enc::Vop2 || enc == Enc::Vopc || enc == Enc::Vopd;

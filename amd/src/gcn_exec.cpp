@@ -922,6 +922,17 @@ struct Machine {
     else if (op == "s_fmac_f16"_op)
       put_h(static_cast<_Float16>(std::fma(static_cast<float>(hs(0)), static_cast<float>(hs(1)),
                                            static_cast<float>(h(scalar(w, in.dst[0]))))));
+    else if (op == "s_ceil_f16"_op) put_h(static_cast<_Float16>(std::ceil(static_cast<float>(hs(0)))));
+    else if (op == "s_floor_f16"_op) put_h(static_cast<_Float16>(std::floor(static_cast<float>(hs(0)))));
+    else if (op == "s_trunc_f16"_op) put_h(static_cast<_Float16>(std::trunc(static_cast<float>(hs(0)))));
+    else if (op == "s_rndne_f16"_op) put_h(static_cast<_Float16>(std::nearbyint(static_cast<float>(hs(0)))));
+    else if (op == "s_minimum_f32"_op || op == "s_maximum_f32"_op)
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(ieee_minmax(static_cast<uint32_t>(a), static_cast<uint32_t>(b), 8, 23, op == "s_maximum_f32"_op)));
+    else if (op == "s_minimum_f16"_op || op == "s_maximum_f16"_op) {
+      const auto hb = [&](size_t k) { const _Float16 v = hs(k); uint16_t bits; std::memcpy(&bits, &v, 2); return uint64_t{bits}; };
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(ieee_minmax(hb(0), hb(1), 5, 10, op == "s_maximum_f16"_op)));
+    } else if (op == "s_cvt_pk_rtz_f16_f32"_op)
+      write_scalar(w, in.dst[0], uint32_t{half_toward_zero(x)} | uint32_t{half_toward_zero(y)} << 16);
     else if (op == "s_min_num_f16"_op) put_h(hs(0) < hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
     else if (op == "s_max_num_f16"_op) put_h(hs(0) > hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
     else return false;
@@ -1362,6 +1373,21 @@ struct Machine {
       w.exec = (w.exec & ~0xFFFFFFFFull) | v;
       write_scalar(w, in.dst[0], saved);
       w.scc = v != 0;
+    } else if (exec_logic_op(in.name)) {
+      // The rest of the EXEC-writing family (the NAND, NOR and XNOR forms, and the 64-bit and-not0, or-not0 and or-not1
+      // ones), and gfx1250's _wrexec forms, which write EXEC and the destination alike with the result where the
+      // _saveexec ones write the destination with EXEC's old value.
+      const std::string_view nm = in.name;
+      const bool wide = nm.ends_with("_b64"), wr = nm.find("_wrexec_") != std::string_view::npos;
+      const std::string_view stem = nm.substr(2, nm.find(wr ? "_wrexec_" : "_saveexec_") - 2);
+      const uint64_t mask = wide ? ~0ull : 0xFFFFFFFFull;
+      const uint64_t x = a & mask, e = w.exec & mask;
+      uint64_t v = stem == "nand" ? ~(x & e) : stem == "nor" ? ~(x | e) : stem == "xnor" ? ~(x ^ e)
+                   : stem == "and_not0" ? ~x & e : stem == "or_not0" ? ~x | e : stem == "or_not1" ? x | ~e : x & ~e;
+      v &= mask;
+      w.exec = (w.exec & ~mask) | v;
+      write_scalar(w, in.dst[0], wr ? v : e);
+      w.scc = v != 0;
     } else if (op == "s_or_not1_b32"_op) {
       const uint32_t v = static_cast<uint32_t>(a) | ~static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], v);
@@ -1375,6 +1401,27 @@ struct Machine {
         throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
       write_scalar(w, in.dst[0], realtime_ticks());
     } else if (scalar_float(w, in, op, a, b)) {
+    } else if (op == "s_quadmask_b32"_op || op == "s_quadmask_b64"_op) {
+      // One bit for each group of four: set where any of the four is.
+      const uint32_t groups = op == "s_quadmask_b32"_op ? 8 : 16;
+      uint64_t v = 0;
+      for (uint32_t i = 0; i < groups; ++i) v |= uint64_t{((a >> (4 * i)) & 0xF) != 0} << i;
+      write_scalar(w, in.dst[0], v);
+      w.scc = v != 0;
+    } else if (op == "s_bitset0_b64"_op || op == "s_bitset1_b64"_op) {
+      const uint64_t d = scalar(w, in.dst[0]), bit = uint64_t{1} << (static_cast<uint32_t>(a) & 63);
+      write_scalar(w, in.dst[0], op == "s_bitset1_b64"_op ? d | bit : d & ~bit);
+    } else if (op == "s_bitreplicate_b64_b32"_op) {
+      // Each bit twice: a quad mask into a pixel mask.
+      uint64_t v = 0;
+      for (uint32_t i = 0; i < 32; ++i) v |= (uint64_t{3} * ((a >> i) & 1)) << (2 * i);
+      write_scalar(w, in.dst[0], v);
+    } else if (op == "s_cls_i32_i64"_op) {
+      // Leading bits equal to the sign bit; -1 where all are.
+      int32_t n = -1;
+      for (uint32_t i = 1; i < 64; ++i)
+        if (((a >> (63 - i)) & 1) != (a >> 63)) { n = static_cast<int32_t>(i); break; }
+      write_scalar(w, in.dst[0], static_cast<uint32_t>(n));
     } else if (op == "s_add_nc_u64"_op || op == "s_sub_nc_u64"_op || op == "s_mul_u64"_op) {
       // RDNA4's 64-bit scalar arithmetic, SCC untouched.
       write_scalar(w, in.dst[0], op == "s_add_nc_u64"_op ? a + b : op == "s_sub_nc_u64"_op ? a - b : a * b);
@@ -1849,6 +1896,218 @@ struct Machine {
         };
         const uint32_t x = u(0, lane);
         write_lane(w, in.dst[0], lane, h(x & 0xFF) | h((x >> 8) & 0xFF) << 16);
+      });
+    } else if (op == "v_minimum_f32"_op || op == "v_maximum_f32"_op) {
+      each([&](uint32_t lane) {
+        const uint64_t r = ieee_minmax(as_bits(lane_float(w, in.src[0], lane)), as_bits(lane_float(w, in.src[1], lane)), 8, 23,
+                                       op == "v_maximum_f32"_op);
+        write_float(w, in, lane, as_float(static_cast<uint32_t>(r)));
+      });
+    } else if (op == "v_minimum_f16"_op || op == "v_maximum_f16"_op) {
+      each([&](uint32_t lane) {
+        const uint64_t r = ieee_minmax(as_bits(lane_half(w, in.src[0], lane)), as_bits(lane_half(w, in.src[1], lane)), 5, 10,
+                                       op == "v_maximum_f16"_op);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
+      });
+    } else if (op == "v_minimum_f64"_op || op == "v_maximum_f64"_op) {
+      each([&](uint32_t lane) {
+        const uint64_t r = ieee_minmax(as_bits(lane_double(w, in.src[0], lane)), as_bits(lane_double(w, in.src[1], lane)), 11, 52,
+                                       op == "v_maximum_f64"_op);
+        write_double(w, in, lane, as_double(r));
+      });
+    } else if (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op || op == "v_minimummaximum_f32"_op ||
+               op == "v_maximumminimum_f32"_op || op == "v_minimum3_f16"_op || op == "v_maximum3_f16"_op ||
+               op == "v_minimummaximum_f16"_op || op == "v_maximumminimum_f16"_op) {
+      // Three values, two steps of the IEEE minimum() or maximum(): the same twice, or one and then the other.
+      const bool f16 = name.ends_with("_f16");
+      const bool first_max = op == "v_maximum3_f32"_op || op == "v_maximum3_f16"_op || op == "v_maximumminimum_f32"_op ||
+                             op == "v_maximumminimum_f16"_op;
+      const bool second_max = op == "v_maximum3_f32"_op || op == "v_maximum3_f16"_op || op == "v_minimummaximum_f32"_op ||
+                              op == "v_minimummaximum_f16"_op;
+      each([&](uint32_t lane) {
+        const auto bits = [&](uint32_t k) { return f16 ? uint64_t{as_bits(lane_half(w, in.src[k], lane))} : uint64_t{as_bits(lane_float(w, in.src[k], lane))}; };
+        const int eb = f16 ? 5 : 8, mb = f16 ? 10 : 23;
+        const uint64_t r = ieee_minmax(ieee_minmax(bits(0), bits(1), eb, mb, first_max), bits(2), eb, mb, second_max);
+        if (f16) write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
+        else write_float(w, in, lane, as_float(static_cast<uint32_t>(r)));
+      });
+    } else if (op == "v_min3_num_f32"_op || op == "v_max3_num_f32"_op || op == "v_minmax_num_f32"_op ||
+               op == "v_maxmin_num_f32"_op || op == "v_med3_num_f32"_op || op == "v_min3_num_f16"_op ||
+               op == "v_max3_num_f16"_op || op == "v_minmax_num_f16"_op || op == "v_maxmin_num_f16"_op ||
+               op == "v_med3_num_f16"_op) {
+      const bool f16 = name.ends_with("_f16");
+      const std::string_view kind = name.rfind("v_min3", 0) == 0 ? "min3" : name.rfind("v_max3", 0) == 0 ? "max3"
+                                    : name.rfind("v_minmax", 0) == 0 ? "minmax" : name.rfind("v_maxmin", 0) == 0 ? "maxmin" : "med3";
+      each([&](uint32_t lane) {
+        if (f16) {
+          const double r = num3(kind, static_cast<double>(lane_half(w, in.src[0], lane)), static_cast<double>(lane_half(w, in.src[1], lane)),
+                                static_cast<double>(lane_half(w, in.src[2], lane)));
+          write_half(w, in, lane, static_cast<_Float16>(r));
+        } else {
+          const double r = num3(kind, lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane), lane_float(w, in.src[2], lane));
+          write_float(w, in, lane, static_cast<float>(r));
+        }
+      });
+    } else if (op == "v_add_nc_i16"_op || op == "v_sub_nc_i16"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t a = u(0, lane), b = u(1, lane);
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_add_nc_i16"_op ? a + b : a - b));
+      });
+    } else if (op == "v_max_i16"_op || op == "v_min_i16"_op) {
+      each([&](uint32_t lane) {
+        const int16_t a = static_cast<int16_t>(u(0, lane)), b = static_cast<int16_t>(u(1, lane));
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_max_i16"_op ? std::max(a, b) : std::min(a, b)));
+      });
+    } else if (op == "v_ashrrev_i16"_op) {
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(static_cast<int16_t>(u(1, lane)) >> (u(0, lane) & 15)));
+      });
+    } else if (op == "v_cvt_i32_i16"_op) {
+      each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(u(0, lane))))); });
+    } else if (op == "v_cvt_u32_u16"_op) {
+      each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, u(0, lane) & 0xFFFFu); });
+    } else if (op == "v_sat_pk_u8_i16"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t x = u(0, lane);
+        write_lane(w, in.dst[0], lane, sat8(static_cast<int16_t>(x), false) | sat8(static_cast<int16_t>(x >> 16), false) << 8);
+      });
+    } else if (op == "v_sin_f16"_op || op == "v_cos_f16"_op) {
+      each([&](uint32_t lane) {
+        // The angle is in turns. Only its fraction matters, and taking that first keeps a whole number of turns at
+        // exactly 0, as the ISA's examples have it (sin of the most negative half is +0, not a rounding error's).
+        const double x = static_cast<double>(lane_half(w, in.src[0], lane));
+        double r;
+        if (!std::isfinite(x)) r = std::numeric_limits<double>::quiet_NaN();
+        else if (x == 0 && op == "v_sin_f16"_op) r = x;
+        else {
+          const double frac = x - std::floor(x);
+          r = op == "v_sin_f16"_op ? std::sin(frac * 6.283185307179586476925286766559) : std::cos(frac * 6.283185307179586476925286766559);
+        }
+        write_half(w, in, lane, static_cast<_Float16>(r));
+      });
+    } else if (op == "v_frexp_mant_f16"_op || op == "v_frexp_exp_i16_f16"_op) {
+      each([&](uint32_t lane) {
+        const float x = static_cast<float>(lane_half(w, in.src[0], lane));
+        int e = 0;
+        const float m = std::isfinite(x) ? std::frexp(x, &e) : x;
+        if (!std::isfinite(x)) e = 0;
+        if (op == "v_frexp_mant_f16"_op) write_half(w, in, lane, static_cast<_Float16>(m));
+        else write_lane(w, in.dst[0], lane, static_cast<uint16_t>(e));
+      });
+    } else if (op == "v_ldexp_f16"_op) {
+      each([&](uint32_t lane) {
+        write_half(w, in, lane, static_cast<_Float16>(std::ldexp(static_cast<float>(lane_half(w, in.src[0], lane)),
+                                                                  static_cast<int16_t>(u(1, lane)))));
+      });
+    } else if (op == "v_cvt_nearest_i32_f32"_op) {
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane);
+        const double r = std::floor(static_cast<double>(x) + 0.5);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::isnan(r) ? 0 : r <= -2147483648.0 ? INT32_MIN : r >= 2147483647.0 ? INT32_MAX : static_cast<int32_t>(r)));
+      });
+    } else if (op == "v_cvt_off_f32_i4"_op) {
+      // The signed 4-bit input over sixteen: the interpolation offsets -0.5 to +0.4375.
+      each([&](uint32_t lane) {
+        const int32_t n = (static_cast<int32_t>(u(0, lane) & 0xF) ^ 8) - 8;
+        write_float(w, in, lane, static_cast<float>(n) / 16.0f);
+      });
+    } else if (op == "v_cvt_norm_i16_f16"_op || op == "v_cvt_norm_u16_f16"_op) {
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint16_t>(norm16(static_cast<double>(lane_half(w, in.src[0], lane)), op == "v_cvt_norm_i16_f16"_op)));
+      });
+    } else if (op == "v_mul_dx9_zero_f32"_op) {
+      // DX9: zero times anything, an infinity or a NaN included, is zero.
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane);
+        write_float(w, in, lane, x == 0.0f || y == 0.0f ? 0.0f : x * y);
+      });
+    } else if (op == "v_fma_dx9_zero_f32"_op) {
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane), z = lane_float(w, in.src[2], lane);
+        write_float(w, in, lane, x == 0.0f || y == 0.0f ? z : std::fma(x, y, z));
+      });
+    } else if (op == "v_mullit_f32"_op) {
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane), z = lane_float(w, in.src[2], lane);
+        const float lowest = -std::numeric_limits<float>::max();
+        write_float(w, in, lane, (y == lowest || std::isinf(y) && y < 0 || std::isnan(y) || z <= 0.0f || std::isnan(z)) ? lowest : x * y);
+      });
+    } else if (op == "v_pk_add_bf16"_op || op == "v_pk_mul_bf16"_op || op == "v_pk_fma_bf16"_op ||
+               op == "v_pk_min_num_bf16"_op || op == "v_pk_max_num_bf16"_op) {
+      // Each half a bfloat16, worked in double (a product of two is exact there, and a sum nearly always) and
+      // rounded once to nearest even.
+      each([&](uint32_t lane) {
+        uint32_t r = 0;
+        for (uint32_t half = 0; half < 2; ++half) {
+          const auto bfv = [&](uint32_t k) {
+            const float f = as_float(uint32_t{packed_bits(w, in, k, half, lane)} << 16);
+            return static_cast<double>(((half ? in.neg_hi : in.neg_lo) >> k) & 1 ? -f : f);
+          };
+          const double x = bfv(0), y = bfv(1);
+          const double v = op == "v_pk_add_bf16"_op ? x + y : op == "v_pk_mul_bf16"_op ? x * y
+                           : op == "v_pk_min_num_bf16"_op ? std::fmin(x, y) : op == "v_pk_max_num_bf16"_op ? std::fmax(x, y)
+                                                                                                           : std::fma(x, y, bfv(2));
+          r |= (to_bf16(static_cast<float>(v)) & 0xFFFFu) << (16 * half);
+        }
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_pk_minimum_f16"_op || op == "v_pk_maximum_f16"_op || op == "v_pk_minimum3_f16"_op ||
+               op == "v_pk_maximum3_f16"_op || op == "v_pk_min3_num_f16"_op || op == "v_pk_max3_num_f16"_op) {
+      const bool three = name.find("3") != std::string::npos, is_max = name.find("max") != std::string::npos,
+                 is_num = name.find("_num") != std::string::npos;
+      each([&](uint32_t lane) {
+        uint32_t r = 0;
+        for (uint32_t half = 0; half < 2; ++half) {
+          const auto hb = [&](uint32_t k) {
+            return static_cast<uint64_t>(packed_bits(w, in, k, half, lane) ^ ((((half ? in.neg_hi : in.neg_lo) >> k) & 1) ? 0x8000u : 0u));
+          };
+          uint64_t v;
+          if (is_num) {
+            const auto num = [&](uint64_t x, uint64_t y) {
+              const double fx = static_cast<float>(as_half(static_cast<uint16_t>(x))), fy = static_cast<float>(as_half(static_cast<uint16_t>(y)));
+              return as_bits(static_cast<_Float16>(is_max ? num_max(fx, fy) : num_min(fx, fy)));
+            };
+            v = num(num(hb(0), hb(1)), hb(2));
+          } else {
+            v = ieee_minmax(hb(0), hb(1), 5, 10, is_max);
+            if (three) v = ieee_minmax(v, hb(2), 5, 10, is_max);
+          }
+          r |= static_cast<uint32_t>(v & 0xFFFF) << (16 * half);
+        }
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_pk_fmac_f16"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t d = word(w, in.dst[0], 0, lane);
+        uint32_t r = 0;
+        for (uint32_t half = 0; half < 2; ++half) {
+          const float acc = static_cast<float>(as_half(static_cast<uint16_t>(d >> (16 * half))));
+          r |= uint32_t{as_bits(static_cast<_Float16>(std::fma(packed_half(w, in, 0, half, lane), packed_half(w, in, 1, half, lane), acc)))}
+               << (16 * half);
+        }
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_pk_add_max_i16"_op || op == "v_pk_add_max_u16"_op || op == "v_pk_add_min_i16"_op ||
+               op == "v_pk_add_min_u16"_op || op == "v_pk_max3_i16"_op || op == "v_pk_max3_u16"_op ||
+               op == "v_pk_min3_i16"_op || op == "v_pk_min3_u16"_op) {
+      // The add saturates (whatever the CLAMP bit says); CLAMP asks instead for the final result to be at least zero.
+      const bool is_signed = name.ends_with("_i16"), is_max = name.find("max") != std::string::npos, adds = name.find("add") != std::string::npos;
+      each([&](uint32_t lane) {
+        uint32_t r = 0;
+        for (uint32_t half = 0; half < 2; ++half) {
+          const auto at = [&](uint32_t k) -> int64_t {
+            const uint16_t v = packed_bits(w, in, k, half, lane);
+            return is_signed ? static_cast<int16_t>(v) : v;
+          };
+          const int64_t lo = is_signed ? -32768 : 0, hi = is_signed ? 32767 : 65535;
+          const int64_t x = adds ? std::clamp<int64_t>(at(0) + at(1), lo, hi) : is_max ? std::max(at(0), at(1)) : std::min(at(0), at(1));
+          const int64_t y = adds ? at(2) : at(2);
+          int64_t v = is_max ? std::max(x, y) : std::min(x, y);
+          if (in.clamp && is_signed) v = std::max<int64_t>(v, 0);
+          r |= (static_cast<uint32_t>(v) & 0xFFFFu) << (16 * half);
+        }
+        write_lane(w, in.dst[0], lane, r);
       });
     } else {
       return false;
@@ -2929,6 +3188,9 @@ struct Machine {
       each([&](uint32_t lane) {
         write_double(w, in, lane, std::nearbyint(lane_double(w, in.src[0], lane)));
       });
+    } else if (op == "v_sqrt_f64_e32"_op) {
+      // The hardware's is good to about a unit in the last place; this is the exact one.
+      each([&](uint32_t lane) { write_double(w, in, lane, std::sqrt(lane_double(w, in.src[0], lane))); });
     } else if (op == "v_rsq_f64_e32"_op) {
       each([&](uint32_t lane) {
         // As with the reciprocal: the hardware's is a table and this is the
@@ -4371,6 +4633,70 @@ struct Machine {
                         : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
   }
 
+  // IEEE 754-2019 minimum() or maximum() of two numbers of a binary format with `ebits` exponent bits and `mbits`
+  // mantissa bits, given and returned as bits: a signaling NaN comes back quieted (the first one first), then a quiet NaN
+  // as it is (the first first), and -0 is less than +0.
+  static uint64_t ieee_minmax(uint64_t a, uint64_t b, int ebits, int mbits, bool want_max) {
+    const uint64_t qbit = 1ull << (mbits - 1), mmask = (1ull << mbits) - 1, emask = ((1ull << ebits) - 1) << mbits;
+    const uint64_t sign = 1ull << (ebits + mbits);
+    const auto is_nan = [&](uint64_t v) { return (v & emask) == emask && (v & mmask) != 0; };
+    const auto is_snan = [&](uint64_t v) { return is_nan(v) && !(v & qbit); };
+    if (is_snan(a)) return a | qbit;
+    if (is_snan(b)) return b | qbit;
+    if (is_nan(a)) return a;
+    if (is_nan(b)) return b;
+    const auto key = [&](uint64_t v) { return (v & sign) ? -static_cast<int64_t>(v & ~sign) : static_cast<int64_t>(v); };
+    const int64_t ka = key(a), kb = key(b);
+    if (ka == kb) {   // equal, or zeros of both signs
+      if (!((a ^ b) & sign)) return a;
+      return want_max ? ((a & sign) ? b : a) : ((a & sign) ? a : b);
+    }
+    return ((ka < kb) == !want_max) ? a : b;
+  }
+  // minimumNumber() and maximumNumber(): a number beats a NaN, and -0 is less than +0 (which C's fmin and fmax leave open).
+  static double num_min(double p, double q) {
+    if (std::isnan(p)) return q;
+    if (std::isnan(q)) return p;
+    if (p == 0 && q == 0) return std::signbit(p) ? p : q;
+    return p < q ? p : q;
+  }
+  static double num_max(double p, double q) {
+    if (std::isnan(p)) return q;
+    if (std::isnan(q)) return p;
+    if (p == 0 && q == 0) return std::signbit(p) ? q : p;
+    return p > q ? p : q;
+  }
+  // The "_num" family on three values (minimumNumber and maximumNumber: a number beats a NaN), and the median.
+  static double num3(const std::string_view kind, double x, double y, double z) {
+    if (kind == "min3") return num_min(num_min(x, y), z);
+    if (kind == "max3") return num_max(num_max(x, y), z);
+    if (kind == "minmax") return num_max(num_min(x, y), z);
+    if (kind == "maxmin") return num_min(num_max(x, y), z);
+    // med3
+    if (std::isnan(x) || std::isnan(y) || std::isnan(z)) return num_min(num_min(x, y), z);
+    const double mx = num_max(num_max(x, y), z);
+    return mx == x ? num_max(y, z) : mx == y ? num_max(x, z) : num_max(x, y);
+  }
+  // A float in [-1, 1] (or [0, 1]) as the 16-bit normalized integer the conversions to _norm give: clamped, scaled,
+  // rounded to nearest even; a NaN is zero.
+  static int32_t norm16(double x, bool is_signed) {
+    if (std::isnan(x)) return 0;
+    const double lo = is_signed ? -1.0 : 0.0;
+    x = std::fmin(1.0, std::fmax(lo, x));
+    return static_cast<int32_t>(std::nearbyint(x * (is_signed ? 32767.0 : 65535.0)));
+  }
+
+  // The EXEC-writing scalar instructions not spelled out one by one in scalar_alu: s_{nand,nor,xnor}_saveexec_b{32,64},
+  // s_{and_not0,or_not0,or_not1}_saveexec_b64 and s_{and_not0,and_not1}_wrexec_b{32,64}.
+  static bool exec_logic_op(std::string_view n) {
+    const bool w32 = n.ends_with("_b32"), w64 = n.ends_with("_b64");
+    if (!w32 && !w64) return false;
+    for (const char* k : {"s_nand_saveexec_b", "s_nor_saveexec_b", "s_xnor_saveexec_b", "s_and_not0_wrexec_b", "s_and_not1_wrexec_b"})
+      if (n.rfind(k, 0) == 0) return true;
+    for (const char* k : {"s_and_not0_saveexec_b", "s_or_not0_saveexec_b", "s_or_not1_saveexec_b"})
+      if (n.rfind(k, 0) == 0 && w64) return true;
+    return false;
+  }
   // A flat address says for itself which memory it means: the shared
   // aperture is LDS, the private one the work-item's own memory, and
   // everything else is the device's. Most flat accesses reach only the
