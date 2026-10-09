@@ -342,8 +342,8 @@ const std::vector<GpuRegisters>& gpu_files() {
   }
   for (size_t i = 0; i < files.size(); ++i)
     for (size_t j = 0; j < i; ++j)
-      if (files[i].device_id == files[j].device_id)
-        throw Error::make(Err::ProfileParse, files[i].origin, ": its PCI device ID is ", files[j].origin, "'s too");
+      if (files[i].device_id == files[j].device_id && files[i].layout == files[j].layout)
+        throw Error::make(Err::ProfileParse, files[i].origin, ": its PCI device ID and layout are ", files[j].origin, "'s too");
   return by_dir.emplace(dir, std::move(files)).first->second;
 }
 
@@ -359,10 +359,20 @@ std::string gpu_registers_file(const std::string& profile) {
   return profile.substr(0, slash) + "/registers/gpus/" + profile.substr(slash + 1) + ".yaml";
 }
 
+// A model is a device id on a layout: two boards of one chip share the id (the RX 6800 and the RX 6900 XT
+// are both Navi 21's 0x73bf) and differ in whether they replay a captured configuration space. The one with
+// this device's layout wins; where only one model has the id it is returned whatever its layout, so that a
+// stale file is reported (by adopt()) and not silently passed over.
 const GpuRegisters* gpu_registers(const telemetry::DeviceSample& d) {
-  for (const auto& g : gpu_files())
-    if (g.device_id == d.pci_device_id >> 16) return &g;
-  return nullptr;
+  const embedded::ConfigImage* image = vendor::of(d).captured_config(d);
+  const std::string layout = image ? image->name : "generic";
+  const GpuRegisters* same_id = nullptr;
+  for (const auto& g : gpu_files()) {
+    if (g.device_id != d.pci_device_id >> 16) continue;
+    if (g.layout == layout) return &g;
+    if (!same_id) same_id = &g;
+  }
+  return same_id;
 }
 
 const char* access_name(Access a) {

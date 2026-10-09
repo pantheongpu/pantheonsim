@@ -215,7 +215,7 @@ std::string driver_file(const vgpu::telemetry::DeviceSample& d, const char* name
   return v;
 }
 uint32_t compute_units(const vgpu::telemetry::DeviceSample& d) {
-  return d.multiprocessors * vgpu::amd::chip(d.architecture).cus_per_mp;
+  return d.multiprocessors * vgpu::amd::chip(d.architecture, d.pci_device_id).cus_per_mp;
 }
 // amdgpu's version, or the kernel's for an in-tree driver, as amd-smi and
 // rocm-smi report it.
@@ -239,7 +239,7 @@ uint64_t gt_per_s(uint32_t gen) {
 std::vector<Node> static_nodes(const vgpu::telemetry::DeviceSample& d, uint32_t index, const std::set<std::string>& want) {
   const bool all = want.empty();
   const auto on = [&](const char* k) { return all || want.count(k); };
-  const vgpu::amd::Chip chip = vgpu::amd::chip(d.architecture);
+  const vgpu::amd::Chip chip = vgpu::amd::chip(d.architecture, d.pci_device_id);
   const uint32_t device = d.pci_device_id >> 16, vendor = d.pci_device_id & 0xFFFF;
   std::vector<Node> out;
   if (on("asic"))
@@ -332,7 +332,7 @@ std::vector<Node> metric_nodes(const vgpu::telemetry::DeviceSample& d, const vgp
                                const std::set<std::string>& want) {
   const bool all = want.empty();
   const auto on = [&](const char* k) { return all || want.count(k); };
-  const vgpu::amd::Chip chip = vgpu::amd::chip(d.architecture);
+  const vgpu::amd::Chip chip = vgpu::amd::chip(d.architecture, d.pci_device_id);
   std::vector<Node> out;
   if (on("usage"))
     out.push_back(obj("usage", {measured("gfx_activity", d.utilization_gpu, "%"),
