@@ -48,6 +48,7 @@
 
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
+#include "toolkit_nvjitlink.hpp"
 
 namespace {
 
@@ -1474,6 +1475,20 @@ std::string image_ptx(const std::vector<char>& image) {
   }
 }
 
+// Whether a callback image is LTO-IR: raw NVVM bitcode, or a fatbin whose entries are it.
+bool image_is_ltoir(const std::vector<char>& image) {
+  using namespace vgpu::cuda;
+  try {
+    switch (classify_blob(image.data(), image.size())) {
+      case BlobKind::LtoIr: return true;
+      case BlobKind::Fatbin: return !extract_images(image.data(), image.size(), nullptr, kFatbinLtoIr).empty();
+      default: return false;
+    }
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 // Whether `ptx` defines function `sym` (rather than only declaring it).
 bool defines(const std::string& ptx, const std::string& sym) {
   size_t at = 0;
@@ -1595,46 +1610,12 @@ std::vector<std::unique_ptr<JitModule>> g_jit_modules;
 }  // namespace
 
 namespace {
-cufftResult jit_prepare(Plan& p) {
-  // On several GPUs: a single transform's plan fails (INTERNAL_ERROR), a
-  // batched one is made and fails to execute (RTX 3060 pair).
-  if (p.gpus.size() > 1) return p.spread == kBatches ? CUFFT_SUCCESS : CUFFT_INTERNAL_ERROR;
-  if (p.prec == 16) return kLinkFailure;
-  std::map<int, std::string> ptx;
-  for (const auto& [type, cb] : p.jit) {
-    std::string text = image_ptx(cb.image);
-    if (text.empty() || cb.name.empty() || !defines(text, mangle(cb.name, type))) return kLinkFailure;
-    ptx[type] = std::move(text);
-  }
-  const int lt = load_type(p.type), st = store_type(p.type);
-  const bool load = p.jit.count(lt), store = p.jit.count(st);
-  if (!load && !store) return CUFFT_SUCCESS;
-  // The callbacks' modules first (the first one's .target is the module's),
-  // then the kernels that call them.
-  std::vector<vgpu::cuda::PtxInput> inputs;
-  std::set<std::string> seen;
-  for (int t : {lt, st})
-    if (p.jit.count(t) && seen.insert(ptx[t]).second) inputs.push_back({p.jit[t].name, ptx[t]});
-  std::string kernels = ".version 7.0\n.target sm_52\n.address_size 64\n"
-                        ".extern .shared .align 16 .b8 vgpu_cufft_cb_smem[];\n";
-  if (load) kernels += callback_kernel(true, mangle(p.jit[lt].name, lt), cb_kind(lt));
-  if (store) kernels += callback_kernel(false, mangle(p.jit[st].name, st), cb_kind(st));
-  inputs.push_back({"cuFFT callback kernels", kernels});
-  const vgpu::cuda::PtxLinkResult linked = vgpu::cuda::link_ptx(inputs, "");
-  if (!linked.ok) {
-    if (!quiet()) std::fprintf(stderr, "[vgpu] cuFFT LTO callback link failed:\n%s", linked.errors.c_str());
-    return kLinkFailure;
-  }
+
+// A module made of `fatbin`, registered with the runtime, with the load and store kernels
+// the plan calls.
+cufftResult register_jit_module(Plan& p, std::string fatbin, bool load, bool store, int lt, int st) {
   auto m = std::make_unique<JitModule>();
-  vgpu::cuda::FatbinImage img;
-  img.kind = vgpu::cuda::kFatbinPtx;
-  uint32_t target = 52;
-  char suffix = 0;
-  vgpu::cuda::ptx_module_target(linked.ptx, &target, &suffix);
-  img.arch = target;
-  img.major = 7;
-  img.data = linked.ptx;
-  m->fatbin = vgpu::cuda::write_fatbin({img});
+  m->fatbin = std::move(fatbin);
   m->wrapper = {0x466243b1, 1, m->fatbin.data(), nullptr};
   void** handle = __cudaRegisterFatBinary(&m->wrapper);
   if (!handle) return kLinkFailure;
@@ -1654,6 +1635,107 @@ cufftResult jit_prepare(Plan& p) {
   p.jit_module = m.get();
   g_jit_modules.push_back(std::move(m));
   return CUFFT_SUCCESS;
+}
+
+// Callbacks given as LTO-IR (what nvcc -dlto writes, and the only form NVIDIA documents for
+// cufftXtSetJITCallback). NVVM bitcode is not something VirtualGPU can read, so, as its NVRTC
+// does, it uses the CUDA toolkit on the host: libnvJitLink links the LTO-IR with the kernels
+// that call it into a cubin for the simulated device, and the simulator runs that SASS.
+// Without the toolkit's library, or with the PTX-only engine (VGPU_SASS=0), such a plan
+// fails to link, as it did before.
+cufftResult jit_prepare_lto(Plan& p, const std::map<int, std::string>& ptx, const std::set<int>& lto) {
+  const char* engine = std::getenv("VGPU_SASS");
+  if (engine && engine[0] == '0') {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cuFFT LTO-IR callbacks run as machine code; VGPU_SASS=0 asks for PTX only\n");
+    return kLinkFailure;
+  }
+  const int lt = load_type(p.type), st = store_type(p.type);
+  const bool load = p.jit.count(lt), store = p.jit.count(st);
+  int dev = 0, major = 0, minor = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+  const int cc = major * 10 + minor;
+  std::vector<vgpu::cuda::ToolkitLinkInput> inputs;
+  std::string kernels = ".version 7.0\n.target sm_52\n.address_size 64\n"
+                        ".extern .shared .align 16 .b8 vgpu_cufft_cb_smem[];\n";
+  if (load) kernels += callback_kernel(true, mangle(p.jit[lt].name, lt), cb_kind(lt));
+  if (store) kernels += callback_kernel(false, mangle(p.jit[st].name, st), cb_kind(st));
+  kernels.push_back('\0');
+  inputs.push_back({vgpu::cuda::ToolkitLinkInput::Ptx, "cuFFT callback kernels", {kernels.begin(), kernels.end()}});
+  // Each callback brings its image, and the linker sees both: images that define the same symbol
+  // twice fail to link, as NVIDIA's plan does (CUFFT_INTERNAL_ERROR on an RTX 3060, CUDA 13.0).
+  for (int t : {lt, st}) {
+    if (!p.jit.count(t)) continue;
+    if (lto.count(t)) {
+      using vgpu::cuda::BlobKind;
+      const std::vector<char>& im = p.jit[t].image;
+      const bool container = vgpu::cuda::classify_blob(im.data(), im.size()) == BlobKind::Fatbin;
+      inputs.push_back({container ? vgpu::cuda::ToolkitLinkInput::Fatbin : vgpu::cuda::ToolkitLinkInput::LtoIr,
+                        p.jit[t].name, im});
+    } else {
+      std::string text = ptx.at(t);
+      text.push_back('\0');
+      inputs.push_back({vgpu::cuda::ToolkitLinkInput::Ptx, p.jit[t].name, {text.begin(), text.end()}});
+    }
+  }
+  const vgpu::cuda::ToolkitLinkResult linked = vgpu::cuda::toolkit_lto_link(inputs, cc);
+  if (!linked.ok) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cuFFT LTO callback link failed:\n%s\n", linked.log.c_str());
+    return kLinkFailure;
+  }
+  vgpu::cuda::FatbinImage img;
+  img.kind = vgpu::cuda::kFatbinElf;
+  img.arch = (uint32_t)cc;
+  img.data = linked.cubin;
+  return register_jit_module(p, vgpu::cuda::write_fatbin({img}), load, store, lt, st);
+}
+
+cufftResult jit_prepare(Plan& p) {
+  // On several GPUs: a single transform's plan fails (INTERNAL_ERROR), a
+  // batched one is made and fails to execute (RTX 3060 pair).
+  if (p.gpus.size() > 1) return p.spread == kBatches ? CUFFT_SUCCESS : CUFFT_INTERNAL_ERROR;
+  if (p.prec == 16) return kLinkFailure;
+  std::map<int, std::string> ptx;
+  std::set<int> lto;  // callbacks given as LTO-IR: the toolkit's nvJitLink makes them machine code
+  for (const auto& [type, cb] : p.jit) {
+    std::string text = image_ptx(cb.image);
+    if (text.empty() && !cb.name.empty() && image_is_ltoir(cb.image)) {
+      lto.insert(type);
+      continue;
+    }
+    if (text.empty() || cb.name.empty() || !defines(text, mangle(cb.name, type))) return kLinkFailure;
+    ptx[type] = std::move(text);
+  }
+  const int lt = load_type(p.type), st = store_type(p.type);
+  const bool load = p.jit.count(lt), store = p.jit.count(st);
+  if (!load && !store) return CUFFT_SUCCESS;
+  if (!lto.empty()) return jit_prepare_lto(p, ptx, lto);
+  // The callbacks' modules first (the first one's .target is the module's),
+  // then the kernels that call them.
+  std::vector<vgpu::cuda::PtxInput> inputs;
+  std::set<std::string> seen;
+  for (int t : {lt, st})
+    if (p.jit.count(t) && seen.insert(ptx[t]).second) inputs.push_back({p.jit[t].name, ptx[t]});
+  std::string kernels = ".version 7.0\n.target sm_52\n.address_size 64\n"
+                        ".extern .shared .align 16 .b8 vgpu_cufft_cb_smem[];\n";
+  if (load) kernels += callback_kernel(true, mangle(p.jit[lt].name, lt), cb_kind(lt));
+  if (store) kernels += callback_kernel(false, mangle(p.jit[st].name, st), cb_kind(st));
+  inputs.push_back({"cuFFT callback kernels", kernels});
+  const vgpu::cuda::PtxLinkResult linked = vgpu::cuda::link_ptx(inputs, "");
+  if (!linked.ok) {
+    if (!quiet()) std::fprintf(stderr, "[vgpu] cuFFT LTO callback link failed:\n%s", linked.errors.c_str());
+    return kLinkFailure;
+  }
+  vgpu::cuda::FatbinImage img;
+  img.kind = vgpu::cuda::kFatbinPtx;
+  uint32_t target = 52;
+  char suffix = 0;
+  vgpu::cuda::ptx_module_target(linked.ptx, &target, &suffix);
+  img.arch = target;
+  img.major = 7;
+  img.data = linked.ptx;
+  return register_jit_module(p, vgpu::cuda::write_fatbin({img}), load, store, lt, st);
 }
 
 // Runs a callback kernel over `count` elements: their offsets in the user's

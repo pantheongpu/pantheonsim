@@ -4,10 +4,11 @@
 //
 // NVIDIA ships these only in its static library. The program is linked with
 // libcufft_static.a and libculibos.a, so it carries NVIDIA's own cuFFT and its
-// kernels, which then run on whichever device the program finds -- a card, or
-// VirtualGPU's simulated one. libcufft.so (what the shim stands in for) answers
-// every legacy callback call with CUFFT_NOT_IMPLEMENTED, and the other test of
-// this family (fft_callbacks.cu) pins that.
+// kernels, which run on the card. libcufft.so (what the shim stands in for) answers
+// every legacy callback call with CUFFT_NOT_IMPLEMENTED. The static route cannot
+// run on the simulator (the static library has a CUDA runtime of its own, which asks
+// the driver for its export table), so on the simulator the program is linked with
+// the shim and expects NOT_IMPLEMENTED; see run_fft_legacy_callbacks.sh.
 //
 //   nvcc -rdc=true fft_legacy_callbacks.cu -lcufft_static -lculibos
 //
