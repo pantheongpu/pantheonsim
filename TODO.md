@@ -1710,6 +1710,7 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `amd/mi300x` | AMD | CDNA3 | gfx942 | **no** |
 | `amd/mi250x` | AMD | CDNA2 | gfx90a | **no** (one die: 110 CUs, 64 GB) |
 | `amd/mi350x` | AMD | CDNA4 | gfx950 | **no** |
+| `amd/mi455x` | AMD | CDNA5 | gfx1250 | **no** (AMD's announcements and LLVM; no card has been seen; clocks, power and ids are placeholders) |
 | `amd/rx6900xt` | AMD | RDNA2 | gfx1030 | **no** |
 | `amd/rx7900xtx` | AMD | RDNA3 | gfx1100 | **no** |
 | `amd/rx9070xt` | AMD | RDNA4 | gfx1201 | **no** |

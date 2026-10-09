@@ -4209,9 +4209,7 @@ D41D0012 00019DF2	v_cmp_neq_f32_e64 s18, v242, -14
 7C3A0000	v_cmp_neq_f32_e32 vcc_lo, s0, v0
 7C3A4A57	v_cmp_neq_f32_e32 vcc_lo, s87, v37
 7C3A3220	v_cmp_neq_f32_e32 vcc_lo, s32, v25
-D41E00FC 000030FF FE505825	v_cmp_nlt_f32_e64 src_execz, 0xfe505825, s24
 D41E0000 00000000	v_cmp_nlt_f32_e64 s0, s0, s0
-D41E00FB 000102F5	v_cmp_nlt_f32_e64 src_vccz, -2.0, 1
 D41E0000 00000008	v_cmp_nlt_f32_e64 s0, s8, s0
 7C3C5EFF 84B29EAD	v_cmp_nlt_f32_e32 vcc_lo, 0x84b29ead, v47
 7C3D82FE 42B74244 042ACA60	v_cmp_nlt_f32_e32 vcc_lo, lit64(0x42aca6042b74244), v193
