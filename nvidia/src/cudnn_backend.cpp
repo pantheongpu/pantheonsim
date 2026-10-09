@@ -412,6 +412,10 @@ struct Op {
   // return no configuration, and this says why (the reason cuDNN's own
   // support check gives). Such an operation is never run.
   std::string gap;
+  // An operation whose engine the heuristics offer but whose execution plan
+  // cannot be built (cudnn-frontend's build_plans fails with "No valid
+  // execution plans built"): why.
+  std::string late_gap;
   // Multi-GPU batch normalization: the unique ids of the peer statistics tensors.
   std::vector<int64_t> peers;
   // MoE grouped matmul: the routing mode (cudnnMoeGroupedMatmulMode_t's value) and top-k;
@@ -770,17 +774,13 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         return false;
       }
       const bool interp = op->resample == CUDNN_RESAMPLE_NEAREST || op->resample == CUDNN_RESAMPLE_BILINEAR;
-      // Interpolation: cuDNN documents neither how the window, strides and
-      // paddings place the samples nor how bilinear weights them, and an RTX
-      // 3060 with cuDNN 9.27 offers no engine for either mode (forward or
-      // backward, NCHW or NHWC, upsampling or downsampling -- measured), so
-      // there is nothing to match: the operation and its graph finalize, the
-      // heuristics offer no configuration and cudnn-frontend's
-      // create_execution_plans fails with "No valid engine configs", as on
-      // that hardware (an interpolation window of anything but 2 is refused
-      // earlier, when the resample descriptor is finalized).
-      if (interp)
-        op->gap = "CUDNN_STATUS_NOT_SUPPORTED; Reason: no engine supports resampling by nearest or bilinear interpolation";
+      // Interpolation: the engines. Nearest has none, for any parameters (cuDNN
+      // documents that, and an RTX 3060 with cuDNN 9.27 agrees); bilinear has
+      // one, for upsampling by 2 in NHWC with float data, window 2, strides 1/2,
+      // pre-padding 1/2 and post-padding 1 -- documented as the only
+      // configuration, and measured to be (every other parameter set tried has
+      // no engine; half and bfloat16 data get an engine whose plan cannot be
+      // built). That is decided below, once the tensors are known.
       op->padding = static_cast<cudnnPaddingMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_ZERO_PAD));
       op->nsp = static_cast<int>(rd->i64(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS));
       // Each setting: integers, or fractions (interpolation's strides and
@@ -885,6 +885,20 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
           *why = "resample: y's extent in spatial dimension " + std::to_string(i) + " is not what the window gives";
           return false;
         }
+      }
+      if (interp) {
+        const char* no_engine = "CUDNN_STATUS_NOT_SUPPORTED; Reason: no engine supports resampling by this interpolation";
+        auto nhwc = [](const vc::Layout& l) {
+          return l.rank == 4 && l.strides[1] == 1 && l.strides[3] == l.dims[1] && l.strides[2] == l.dims[1] * l.dims[3] &&
+                 l.strides[0] == l.dims[1] * l.dims[2] * l.dims[3];
+        };
+        bool bilinear_config = op->resample == CUDNN_RESAMPLE_BILINEAR && fwd && op->nsp == 2 && op->role[kIdx] < 0 &&
+                               (op->padding == CUDNN_ZERO_PAD || op->padding == CUDNN_EDGE_VAL_PAD) && nhwc(*X) && nhwc(*Y);
+        for (int i = 0; i < op->nsp && bilinear_config; ++i)
+          bilinear_config = op->fstr[i] == 0.5 && op->fpre[i] == 0.5 && op->fpost[i] == 1.0 && op->fwin[i] == 2.0;
+        if (!bilinear_config) op->gap = no_engine;
+        else if (X->type != CUDNN_DATA_FLOAT || Y->type != CUDNN_DATA_FLOAT)
+          op->late_gap = "CUDNN_STATUS_NOT_SUPPORTED; Reason: bilinear resampling runs on FLOAT data only";
       }
       if (op->role[kIdx] >= 0) {
         const vc::Layout& I = fwd ? op->more[0].l : op->in[op->role[kIdx]].l;
@@ -1575,6 +1589,19 @@ std::string engine_gap(const Desc* graph) {
   return "";
 }
 
+// Why an execution plan cannot be built for a graph the heuristics offered an
+// engine for (empty: it can).
+std::string plan_gap(const Desc* graph) {
+  const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
+  for (int64_t i = 0; ops && i < ops->count; ++i) {
+    Op o;
+    std::string why;
+    const Desc* d = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, static_cast<size_t>(i));
+    if (d && op_of(d, &o, &why) && !o.late_gap.empty()) return o.late_gap;
+  }
+  return "";
+}
+
 /* ---- running one operation ---- */
 
 double erf_gelu(double x) { return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0))); }
@@ -2017,6 +2044,31 @@ void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, s
   const bool fwd = op.kind == Kind::PoolFwd;
   const vc::Layout& X = fwd ? op.in[0].l : op.out.l;
   const vc::Layout& Y = fwd ? op.out.l : op.in[0].l;
+  if (op.resample == CUDNN_RESAMPLE_BILINEAR) {
+    // Bilinear upsampling (the one configuration with an engine: see op_of). Output i, in each
+    // spatial dimension, samples the input at s = i * stride - pre + window / 2 - 1/2, clamped to
+    // the input's extent, between the two pixels either side of it by their distance -- measured
+    // on an RTX 3060 (the weights are exact: s is a multiple of 1/2 here).
+    const int64_t C = X.dims[1], H = X.dims[2], W = X.dims[3], OH = Y.dims[2], OW = Y.dims[3];
+    auto s_of = [&](int64_t i, int dim) { return static_cast<double>(i) * op.fstr[dim] - op.fpre[dim] + op.fwin[dim] / 2 - 0.5; };
+    r->assign(static_cast<size_t>(X.dims[0] * C * OH * OW), 0.0);
+    for (int64_t n = 0; n < X.dims[0]; ++n)
+      for (int64_t c = 0; c < C; ++c)
+        for (int64_t i = 0; i < OH; ++i) {
+          const double sy = std::min(std::max(s_of(i, 0), 0.0), static_cast<double>(H - 1));
+          const int64_t y0 = static_cast<int64_t>(std::floor(sy)), y1 = std::min(y0 + 1, H - 1);
+          const double fy = sy - static_cast<double>(y0);
+          for (int64_t j = 0; j < OW; ++j) {
+            const double sx = std::min(std::max(s_of(j, 1), 0.0), static_cast<double>(W - 1));
+            const int64_t x0 = static_cast<int64_t>(std::floor(sx)), x1 = std::min(x0 + 1, W - 1);
+            const double fx = sx - static_cast<double>(x0);
+            auto at = [&](int64_t y, int64_t x) { return (*in[0])[static_cast<size_t>(((n * C + c) * H + y) * W + x)]; };
+            (*r)[static_cast<size_t>(((n * C + c) * OH + i) * OW + j)] =
+                (1 - fy) * ((1 - fx) * at(y0, x0) + fx * at(y0, x1)) + fy * ((1 - fx) * at(y1, x0) + fx * at(y1, x1));
+          }
+        }
+    return;
+  }
   int64_t I[3] = {1, 1, 1}, O[3] = {1, 1, 1}, Wn[3] = {1, 1, 1}, P[3] = {0, 0, 0}, S[3] = {1, 1, 1};
   for (int i = 0; i < op.nsp; ++i) {
     const int k = 3 - op.nsp + i;
@@ -3025,6 +3077,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
       const Desc* cfg = d->desc(CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG);
       const Desc* eng = cfg ? cfg->desc(CUDNN_ATTR_ENGINECFG_ENGINE) : nullptr;
       if (!eng || !eng->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH)) return CUDNN_STATUS_BAD_PARAM;
+      if (const std::string gap = plan_gap(eng->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH)); !gap.empty())
+        return refuse("cudnnBackendFinalize(execution plan)", "no plan can be built for this graph: " + gap);
       break;
     }
     case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR:

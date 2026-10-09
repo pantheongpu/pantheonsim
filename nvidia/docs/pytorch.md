@@ -63,9 +63,10 @@ paths tested here do not call them.
 - **RNNs:** cuDNN's RNN API (`nvidia/src/cudnn_rnn.cpp`): LSTM, GRU and
   ReLU/tanh RNNs, one or two directions, padded or packed sequences, dropout
   between layers, LSTM projections (`proj_size`) and cell clipping; float,
-  half (autocast), bfloat16 and double. Dropout between an RNN's layers runs
-  with this library's generator: the masks differ from NVIDIA's, the
-  fraction kept and the reseeding do not.
+  half (autocast), bfloat16 and double. Dropout between an RNN's layers draws
+  the masks cuDNN draws, from the dropout descriptor's states, so a seed
+  gives NVIDIA's masks (measured on an RTX 3060; padded batches of sequences
+  shorter than the longest were not).
 - **Linear layers:** cuBLAS and cuBLASLt's fused matmul + bias; PyTorch passes
   its cuBLAS handle as the cuBLASLt handle, which is accepted.
 - **Both CUDA APIs:** PyTorch calls the driver API too. `libcudart` and
@@ -75,9 +76,17 @@ paths tested here do not call them.
 
 ## Not supported
 
-- Graphs with operations other than convolution, matmul, pointwise,
-  reduction, normalization and pooling (attention, for one): refused when the
-  graph is finalized, so PyTorch falls back or reports it.
+- cuDNN graph operations beyond what the graph API list in
+  `nvidia/docs/libraries.md` computes -- convolution, matmul, pointwise,
+  reduction, normalization (multi-GPU batch normalization among it), pooling,
+  attention and the data-movement operations -- are refused when the graph
+  is finalized, naming the operation; and the ones the card has no engine for
+  (nearest and bilinear resampling, the MoE backward pass, a rotary embedding
+  outside a matmul or attention graph, ...) finalize and then fail at plan
+  creation with cudnn-frontend's "No valid engine configs", as they do on
+  the RTX 3060 they were measured on, so PyTorch falls back or reports it.
+  PyTorch itself emits convolutions (with bias, add and activation),
+  matmul-based linear layers and scaled dot-product attention, all of which run.
 - Anything a kernel does that the simulator does not implement: the launch
   fails naming the instruction, and the PyTorch test scripts fail on any such
   line, even if a check prints `ok`.

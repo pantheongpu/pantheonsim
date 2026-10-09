@@ -254,7 +254,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (band and packed storage included; the plane rotations bit for bit), batched GEMV in every type, triangular solves, batched LU (`getrfBatched`/`getrsBatched`/`getriBatched`/`matinvBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`), the `_64` forms, cuBLASXt over several devices and the legacy (`cublas.h`) API; see [cublas.md](cublas.md) |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4 and int8 x int8 into int32 (`CUBLAS_COMPUTE_32I`, what `torch._int_mm` calls), strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 tensor-wise and row-wise scales with amax, and the block-scaled FP8/FP4 modes (documentation-derived) |
-| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans, LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
+| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout (cuDNN's own generator, mask for mask, also between an RNN's layers), the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans (the scale-bias-activation weight gradient among them), LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics; batch normalization across the GPUs of one process), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | every entry point NVIDIA's 13.0 exports. CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16/int8), SpGEMM (and SpGEMMreuse), SDDMM, SpSV/SpSM (with updateMatrix), format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); Blocked-ELL SpMM and sliced-ELL SpMV; sparse vectors (SpVV, Axpby, Gather, Scatter, Rot); the tridiagonal and pentadiagonal solvers (gtsv2, gtsv2_nopivot, gtsv2StridedBatch, gtsvInterleavedBatch, gpsvInterleavedBatch); legacy coo2csr, the CSR/CSC/COO sorts, csrgeam2, gemvi, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, gebsr2gebsr, gebsr2gebsc), csric02 and csrilu02, pruning, csrcolor, nnz and compression, unsorted CSR. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
@@ -350,12 +350,67 @@ CTC's gradient with respect to probabilities (normalization `NONE`) is
 too long for its input costs 0 with its gradient zeroed up to the batch's
 longest input. All of that is matched. Where the arithmetic order is the hardware's own choice it is not:
 float and double sums are accumulated exactly here and rounded once, a
-`TRUE_HALF` convolution accumulates in half in its own order, and the dropout
-mask comes from a different generator (kept fraction, scaling, reseeding and
-the backward pass are cuDNN's). And this library runs some configurations
+`TRUE_HALF` convolution accumulates in half in its own order. Dropout is not
+an exception any more: its masks are cuDNN's, see below. And this library runs some configurations
 NVIDIA's does not -- every algorithm for every shape, dy with gaps in
 backward-data and x with gaps in backward-filter, double-precision NHWC
 backward-data -- rather than refusing them.
+
+Dropout is cuDNN's own, mask for mask. Its states buffer, which the
+program can read, holds one cuRAND XORWOW state (48 bytes) per thread of the
+dropout kernel -- 768 a streaming multiprocessor, 21504 on the RTX 3060,
+which is what `cudnnDropoutGetStatesSize` reports; the card's rule for other
+GPUs is not known, and 768 per SM is assumed for them -- thread t seeded as
+`curand_init(seed, t, 0)` seeds it (Marsaglia's recurrence, whose subsequence
+jump is a GF(2) matrix power computed here). `cudnnDropoutForward` gives
+element i, in the tensor's logical order, the next output of thread i % T and
+keeps it when `curand_uniform` of it exceeds p, writing `x * (1 / (1 - p))`
+in float (in double for double data); the reserve space holds the mask one bit
+an element. The states buffer after a set and after each pass is word for
+word the card's, so `cudnnRestoreDropoutDescriptor` resumes a stream and a
+second pass continues it. Edges matched: a states buffer smaller than
+`cudnnDropoutGetStatesSize` says is `BAD_PARAM` (a larger one is fine), a null
+one is accepted and leaves the descriptor's buffer as it was (a forward pass
+through a descriptor that never had one is `BAD_PARAM`), a probability
+outside [0, 1] is accepted, bfloat16 is `NOT_SUPPORTED`. An RNN's dropout
+between layers is the same kernel: after each layer but the last, each
+direction of the next layer gets a mask of its own over the whole of the
+lower layer's output, `[T][B][hidden * dirs]`, forward direction first, layer
+after layer. `e2e_dnn_dropout` and `e2e_dnn_rnn_dropout` check all of it
+against a host model on the card's library and on this one. Not measured, and
+so not claimed: sequences shorter than the longest in a padded batch, and the
+attention API's dropout descriptors (see "What is not implemented").
+
+Two more things the card does that were first taken for refusals. The classic
+API's fused `CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD` (the weight gradient of
+a convolution whose input is `activation(x * eqScale + eqBias)`, the affine
+result rounded to the data type, as `CONV_BNSTATS` does) runs on an RTX 3060;
+it had been written down as unsupported because the configuration first
+tried, half data with a float `dw`, is. The plans cuDNN makes: x, dy and dw
+all half or all float (a mix, bfloat16 and double are `NOT_SUPPORTED`), float
+compute type, RELU, IDENTITY or no activation, scale and bias each optional
+and half or float, spatial batch-norm mode, groups, strides, dilation and
+padding as the convolution has them, x and dw in either layout and dy NHWC
+unless dw is NCHW too; with nothing to fuse at all the three layouts have to
+agree. The sum is exact, rounded once to dw's type. `e2e_dnn_classic_paths`
+checks it against the card's library and this one. The other fused ops are
+unchanged: `CUDNN_FUSED_CONV_SCALE_BIAS_ADD_ACTIVATION` and the two after it
+are marked "reserved for future use" in cuDNN's own header and are
+`NOT_SUPPORTED` on the card as here. And the graph API's multi-GPU batch
+normalization (`CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS`, and the
+backward one) runs on the card's two GPUs, which have no peer access, with the
+peer tensors in pinned host memory: every execution computes with the batches
+of all the GPUs together -- mean, inverse variance, output, running statistics
+(variance unbiased over the combined count) and, backward, `dx` -- while the
+gradients of the scale and bias come back as the combined sums divided by the
+number of GPUs (measured with two; with more it is assumed). The words inside
+the peer tensors are cuDNN's own protocol (a pair of a value and a flag for
+each statistic, as far as the tensors show), which this library does not use:
+its executions meet in memory, so they must be threads of one process, and a
+lone execution of a two-GPU graph fails after `VGPU_CUDNN_PEER_TIMEOUT_MS`
+(60 s) with `CUDNN_STATUS_EXECUTION_FAILED` where NVIDIA's kernel would wait.
+`e2e_dnn_multigpu_norm` (two GPUs) checks half and float, forward and
+backward, on both libraries.
 
 The graph API's attention was pinned down against cuDNN 9.27 on an RTX 3060
 through cudnn-frontend 1.30, the frontend PyTorch and Transformer Engine
@@ -449,6 +504,9 @@ runs them; each is a ctest of its own.
 | `e2e_blas_packed_paths`, `e2e_blas_batched_paths`, `e2e_blas_64_paths`, `e2e_blas_legacy_paths`, `e2e_blas_xt_paths` | cuBLAS's band and packed level 2, batched GEMV, getri/matinv, syrkx/herkx, the `_64` forms, the handle settings, the legacy API and cuBLASXt on two devices | SciPy-style BLAS callers, multi-GPU GEMM |
 | `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, LSTMs in half, bfloat16 and double, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
 | `e2e_dnn_classic_paths` | cuDNN's classic API beyond the training paths: INT8x4/UINT8x4/INT8x32 convolution and fused bias-ReLU against an integer reference (also through `cudnnReorderFilterAndBias`), transforms to and from `NCHW_VECT_C`, INT8 pooling and activation, divisive normalization against its formula and finite differences, padding/folding/unfolding transforms and the folded backward-data pipeline, LSTM projections and clipping against a host LSTM and finite differences, the RNN getters, fused-ops plans, multi-head attention forward and both gradients | `nn.LSTM(proj_size=)`, `nn.MultiheadAttention`-style models, INT8 inference engines |
+| `e2e_dnn_dropout` | cuDNN's classic dropout bit for bit: the states buffer cudnnSetDropoutDescriptor fills (cuRAND XORWOW, one state per kernel thread), the output, the reserve space and the states after a pass in float, half and double, a second pass and a restored descriptor continuing the streams, the backward pass, and the statuses at the edges | `nn.Dropout` through cuDNN in other frameworks, RNN dropout |
+| `e2e_dnn_rnn_dropout` | the dropout between an RNN's layers, mask for mask, in two and three layers, unidirectional and bidirectional, against the same host model | `nn.LSTM(dropout=)`, `nn.GRU(dropout=)` |
+| `e2e_dnn_multigpu_norm` | multi-GPU batch normalization, forward and backward, half and float, two GPUs and two threads, peer tensors in pinned host memory | apex-style synchronized batch norm through cudnn-frontend |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch/group norm forward and backward, backward without saved statistics, max and average pooling both ways, max pooling's index tensor, asymmetric padding, concatenation, statistics generation, RNG, reshape, transpose, slice, an INT8x4 vectorized convolution | `cudnn_convolution_add_relu`, cudnn-frontend |
 | `e2e_dnn_attention` | cuDNN scaled dot-product attention built by cudnn-frontend 1.30 (fetched): the unified and composite forms forward and backward, causal (both alignments) and sliding-window masks, bias, grouped-query heads, padding, paged K/V caches, ragged sequences, dropout, half/bfloat16/float | `scaled_dot_product_attention` with the cuDNN backend, Transformer Engine |
 
