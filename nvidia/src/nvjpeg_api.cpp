@@ -2016,9 +2016,9 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncoderStateCreate(nvjpegHandle_t h, nvjpegEnco
 }
 // NVJPEG_ENC_BACKEND_HARDWARE needs a JPEG engine: NVJPEG_STATUS_ARCH_MISMATCH,
 // as on an RTX 3060.
-// (nvjpegEncBackend_t is CUDA 13's; CUDA 12.0's header has neither it nor
-// this function.)
-#if NVJPEG_VER_MAJOR >= 13
+// (nvjpegEncBackend_t and this function arrived in nvJPEG 12.4, CUDA 12.8; the
+// headers of CUDA 12.0 to 12.6 have neither, and declare it with the enum there.)
+#if NVJPEG_VER_MAJOR >= 13 || (NVJPEG_VER_MAJOR == 12 && NVJPEG_VER_MINOR >= 4)
 #define VGPU_ENC_BACKEND nvjpegEncBackend_t
 #else
 #define VGPU_ENC_BACKEND int
