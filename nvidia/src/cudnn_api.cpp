@@ -3758,10 +3758,11 @@ VGPU_EXPORT cudnnStatus_t cudnnGetFoldedConvBackwardDataDescriptors(
 //     or NCHW x is NOT_SUPPORTED): y = conv(act(x * eqScale + eqBias)) with
 //     the affine result rounded to half, and per-channel sums of y and y^2.
 //   - BN_FINALIZE_STATISTICS_TRAINING and _INFERENCE run.
-//   - SCALE_BIAS_ACTIVATION_WGRAD and CONV_SCALE_BIAS_ADD_ACTIVATION are
-//     NOT_SUPPORTED from cudnnMakeFusedOpsPlan on this card; the two
-//     undocumented ones (GEN_BITMASK, DACTIVATION_FORK_DBATCHNORM) are
-//     NOT_SUPPORTED here.
+//   - SCALE_BIAS_ACTIVATION_WGRAD runs (half or float; see its plan below for
+//     the configurations): dw = wgrad(activation(x * eqScale + eqBias), dy).
+//   - CONV_SCALE_BIAS_ADD_ACTIVATION is NOT_SUPPORTED from cudnnMakeFusedOpsPlan
+//     on this card, and cudnn_cnn.h marks it, GEN_BITMASK and
+//     DACTIVATION_FORK_DBATCHNORM "reserved for future use": NOT_SUPPORTED here.
 //   - Each op's packs take the labels its documentation lists (a label from
 //     another op's table is BAD_PARAM; CONV_SCALE_BIAS_ADD_ACTIVATION's const
 //     pack took none on the card); a descriptor label stores a copy of the
@@ -4056,11 +4057,52 @@ VGPU_EXPORT cudnnStatus_t cudnnMakeFusedOpsPlan(cudnnHandle_t h, cudnnFusedOpsPl
         return BAD(fn, why.empty() ? "the convolution's groups do not fit" : why);
       break;
     }
-    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD:
-      if (!c->tensor(CUDNN_PARAM_XDESC) || !c->has[CUDNN_PARAM_CONV_DESC] || !c->has[CUDNN_PARAM_DWDESC] ||
-          !c->tensor(CUDNN_PARAM_DYDESC))
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD: {
+      const TensorDesc *x = c->tensor(CUDNN_PARAM_XDESC), *dy = c->tensor(CUDNN_PARAM_DYDESC);
+      if (!x || !c->has[CUDNN_PARAM_CONV_DESC] || !c->has[CUDNN_PARAM_DWDESC] || !dy)
         return BAD(fn, "x, the convolution, dw and dy are required");
-      return UNSUPPORTED(fn, "SCALE_BIAS_ACTIVATION_WGRAD (NOT_SUPPORTED on the hardware measured, an sm_86 card)");
+      const FilterDesc& dw = c->f[CUDNN_PARAM_DWDESC];
+      if (x->l.rank != 4 || dy->l.rank != 4 || dw.l.rank != 4 || c->conv.nsp != 2)
+        return UNSUPPORTED(fn, "two-dimensional convolution only");
+      // The configurations an RTX 3060 (cuDNN 9.27) makes a plan for, measured:
+      // x, dy and dw all half or all float (a mix, bfloat16 and double are
+      // NOT_SUPPORTED); a float compute type; RELU or IDENTITY or no
+      // activation; per-channel scale and bias in half or float, either
+      // optional; any of NCHW and NHWC for x and dw, and dy NHWC unless dw is
+      // NCHW too (dy NCHW with dw NHWC is NOT_SUPPORTED); groups, strides,
+      // dilation and padding as the convolution has them.
+      if ((x->l.type != CUDNN_DATA_HALF && x->l.type != CUDNN_DATA_FLOAT) || dy->l.type != x->l.type || dw.l.type != x->l.type)
+        return UNSUPPORTED(fn, "x, dy and dw must be all half or all float");
+      if (c->conv.type != CUDNN_DATA_FLOAT) return UNSUPPORTED(fn, "the compute type must be float");
+      if (!dy->channels_last && dw.format == CUDNN_TENSOR_NHWC)
+        return UNSUPPORTED(fn, "dy in NCHW needs dw in NCHW");
+      if (c->has[CUDNN_PARAM_ACTIVATION_DESC] && c->act.mode != CUDNN_ACTIVATION_RELU && c->act.mode != CUDNN_ACTIVATION_IDENTITY)
+        return UNSUPPORTED(fn, "only RELU and IDENTITY activations");
+      // With nothing to fuse (no scale, no bias, no activation) it is a plain
+      // weight gradient, which the card plans only when the three layouts agree
+      // (and for x and dw in NCHW with dy in NHWC).
+      {
+        const bool scale = c->ph[CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER] != CUDNN_PTR_NULL;
+        const bool bias = c->ph[CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER] != CUDNN_PTR_NULL;
+        const bool xl = x->channels_last, yl = dy->channels_last, wl = dw.format == CUDNN_TENSOR_NHWC;
+        if (!scale && !bias && !c->has[CUDNN_PARAM_ACTIVATION_DESC] && !((xl == yl && yl == wl) || (!xl && yl && !wl)))
+          return UNSUPPORTED(fn, "nothing to fuse, and the layouts of x, dy and dw differ");
+      }
+      if (const TensorDesc* sb = c->tensor(CUDNN_PARAM_BN_EQSCALEBIAS_DESC)) {
+        // The card checks the scale/bias descriptor against x for spatial mode.
+        if (sb->l.rank != 4 || sb->l.dims[0] != 1 || sb->l.dims[1] != x->l.dims[1] || sb->l.dims[2] != 1 || sb->l.dims[3] != 1)
+          return BAD(fn, "the equivalent scale/bias descriptor must be [1, C, 1, 1]");
+        if (sb->l.type != CUDNN_DATA_HALF && sb->l.type != CUDNN_DATA_FLOAT)
+          return UNSUPPORTED(fn, "the equivalent scale and bias are half or float");
+      }
+      if (c->bn_mode != CUDNN_BATCHNORM_SPATIAL) return UNSUPPORTED(fn, "only spatial batch normalization mode");
+      ConvGeom g;
+      std::string why;
+      if (!conv_geometry(x->l, dw.l, dy->l, 2, c->conv.pad, c->conv.str, c->conv.dil, c->conv.mode == CUDNN_CONVOLUTION,
+                         &g, &why) || g.G != c->conv.groups)
+        return BAD(fn, why.empty() ? "the convolution's groups do not fit" : why);
+      break;
+    }
     case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
       if (!c->tensor(CUDNN_PARAM_YSTATS_DESC) || c->ph[CUDNN_PARAM_YSUM_PLACEHOLDER] == CUDNN_PTR_NULL ||
           c->ph[CUDNN_PARAM_YSQSUM_PLACEHOLDER] == CUDNN_PTR_NULL)
@@ -4071,7 +4113,7 @@ VGPU_EXPORT cudnnStatus_t cudnnMakeFusedOpsPlan(cudnnHandle_t h, cudnnFusedOpsPl
       if (!c->tensor(CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC)) return BAD(fn, "the scale/bias/mean/var descriptor is required");
       break;
     case CUDNN_FUSED_CONV_SCALE_BIAS_ADD_ACTIVATION:
-      return UNSUPPORTED(fn, "CONV_SCALE_BIAS_ADD_ACTIVATION (NOT_SUPPORTED on the hardware measured, an sm_86 card)");
+      return UNSUPPORTED(fn, "CONV_SCALE_BIAS_ADD_ACTIVATION (reserved for future use in cuDNN, NOT_SUPPORTED on the card measured)");
     default:
       return UNSUPPORTED(fn, "this fused op is undocumented and not implemented");
   }
@@ -4140,6 +4182,41 @@ VGPU_EXPORT cudnnStatus_t cudnnFusedOpsExecute(cudnnHandle_t h, const cudnnFused
             }
         if ((sum && !write(ST->l, sum, s1)) || (sq && !write(ST->l, sq, s2))) return CUDNN_STATUS_EXECUTION_FAILED;
       }
+      return CUDNN_STATUS_SUCCESS;
+    }
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD: {
+      // dw = the weight gradient of conv(a), a = activation(round(x * eqScale
+      // + eqBias)) with the affine result rounded to the data type, as
+      // BNSTATS does; the sum is exact and rounded once to dw's type
+      // (measured on an RTX 3060: half and float, errors within one rounding).
+      const TensorDesc *X = c.tensor(CUDNN_PARAM_XDESC), *DY = c.tensor(CUDNN_PARAM_DYDESC);
+      const TensorDesc* SB = c.tensor(CUDNN_PARAM_BN_EQSCALEBIAS_DESC);
+      const FilterDesc& DW = c.f[CUDNN_PARAM_DWDESC];
+      void *x = v->p[CUDNN_PTR_XDATA], *dyp = v->p[CUDNN_PTR_DYDATA], *dwp = v->p[CUDNN_PTR_DWDATA];
+      if (!x || !dyp || !dwp) return BAD(fn, "x, dy and dw pointers are required");
+      std::vector<double> vx, vdy, vs, vb, r;
+      if (!read(X->l, x, &vx) || !read(DY->l, dyp, &vdy)) return CUDNN_STATUS_EXECUTION_FAILED;
+      const void* sp = ptr(CUDNN_PTR_BN_EQSCALE, CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER);
+      const void* bp = ptr(CUDNN_PTR_BN_EQBIAS, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER);
+      if (SB && sp && !read_channels(SB, sp, &vs)) return CUDNN_STATUS_EXECUTION_FAILED;
+      if (SB && bp && !read_channels(SB, bp, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+      int64_t N, C, S;
+      ncs(X->l, &N, &C, &S);
+      const bool relu = c.has[CUDNN_PARAM_ACTIVATION_DESC] && c.act.mode == CUDNN_ACTIVATION_RELU;
+      for (int64_t n = 0; n < N; ++n)
+        for (int64_t ch = 0; ch < C; ++ch)
+          for (int64_t s = 0; s < S; ++s) {
+            double& e = vx[static_cast<size_t>((n * C + ch) * S + s)];
+            if (!vs.empty()) e *= vs[static_cast<size_t>(ch)];
+            if (!vb.empty()) e += vb[static_cast<size_t>(ch)];
+            e = round_to(X->l.type, e);
+            if (relu && !(e > 0.0)) e = 0.0;
+          }
+      ConvGeom g;
+      std::string why;
+      conv_geometry(X->l, DW.l, DY->l, 2, c.conv.pad, c.conv.str, c.conv.dil, c.conv.mode == CUDNN_CONVOLUTION, &g, &why);
+      convolve(g, ConvDir::Filter, vdy, vx, &r, Accum::Exact);
+      if (!write(DW.l, dwp, r)) return CUDNN_STATUS_EXECUTION_FAILED;
       return CUDNN_STATUS_SUCCESS;
     }
     case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
