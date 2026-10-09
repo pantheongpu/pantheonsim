@@ -1285,6 +1285,12 @@ vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(test_robustness PRIVATE ${CMAKE_DL_LIBS})
+# Which cubin the driver picks from a fatbin: sm_XYa SASS runs on XY alone, so
+# a B300 (10.3) or Vera Rubin (10.7) falls back to the fatbin's PTX.
+vgpu_unit_test(test_pick_cubin)
+target_include_directories(test_pick_cubin PRIVATE nvidia/src)
+target_sources(test_pick_cubin PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+target_link_libraries(test_pick_cubin PRIVATE ${CMAKE_DL_LIBS})
 # The PTX linker (-rdc builds, nvJitLink) and the fatbin writer and container
 # readers (nvFatbin, nvJitLink's object and library inputs), with no toolkit.
 vgpu_unit_test(test_ptx_link)
@@ -1883,6 +1889,15 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_managed_module
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_managed_module.sh)
   set_tests_properties(e2e_managed_module PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # An sm_XYa cubin on the GPUs that do and do not run it: a B300 and a Vera Rubin fall back to the
+  # fatbin's PTX, a Hopper has nothing to run.
+  add_test(NAME e2e_arch_specific_cubins
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_arch_specific.sh)
+  set_tests_properties(e2e_arch_specific_cubins PROPERTIES
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)

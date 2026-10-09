@@ -99,6 +99,10 @@ struct Cubin {
 // image; every offset and size read from the file is checked against it.
 Cubin parse_cubin(const uint8_t* data, size_t size);
 
+// Whether a cubin is an sm_XYa (architecture-specific) image, read from its
+// section table alone; false for anything malformed.
+bool cubin_arch_specific(const uint8_t* data, size_t size);
+
 // True when `data` starts like an ELF cubin.
 bool is_cubin(const void* data, size_t size);
 

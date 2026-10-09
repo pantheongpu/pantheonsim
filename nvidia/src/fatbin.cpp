@@ -45,6 +45,8 @@ static_assert(sizeof(EntryHeader) == 48, "entry header prefix layout");
 // zstd via dlopen: no build-time dependency; libzstd.so.1 ships with every
 // mainstream distro (apt itself links it).
 struct Zstd {
+  size_t (*compress)(void*, size_t, const void*, size_t, int) = nullptr;
+  size_t (*bound)(size_t) = nullptr;
   size_t (*decompress)(void*, size_t, const void*, size_t) = nullptr;
   unsigned long long (*content_size)(const void*, size_t) = nullptr;
   unsigned (*is_error)(size_t) = nullptr;
@@ -57,6 +59,9 @@ const Zstd* zstd() {
     tried = true;
     void* h = dlopen("libzstd.so.1", RTLD_NOW | RTLD_GLOBAL);
     if (h) {
+      z.compress = reinterpret_cast<size_t (*)(void*, size_t, const void*, size_t, int)>(
+          dlsym(h, "ZSTD_compress"));
+      z.bound = reinterpret_cast<size_t (*)(size_t)>(dlsym(h, "ZSTD_compressBound"));
       z.decompress = reinterpret_cast<size_t (*)(void*, size_t, const void*, size_t)>(
           dlsym(h, "ZSTD_decompress"));
       z.content_size = reinterpret_cast<unsigned long long (*)(const void*, size_t)>(
@@ -146,6 +151,104 @@ std::string decompress_zstd(const uint8_t* src, size_t src_size) {
 }
 
 }  // namespace
+
+std::string compress_zstd(const std::string& data, bool high) {
+  const Zstd* z = zstd();
+  if (!z || !z->compress || !z->bound || data.empty()) return {};
+  std::string out(z->bound(data.size()), '\0');
+  const size_t n = z->compress(out.data(), out.size(), data.data(), data.size(), high ? 19 : 3);
+  if (z->is_error(n)) return {};
+  out.resize(n);
+  return out;
+}
+
+// The LZ4 block format (see decompress_lz4), written greedily with a hash of four bytes. The format's
+// end rules are kept, so any LZ4 decoder takes it: the last match starts at least 12 bytes before
+// the end, and the last 5 bytes are literals.
+std::string compress_lz4(const std::string& data) {
+  const auto* src = reinterpret_cast<const uint8_t*>(data.data());
+  const size_t n = data.size();
+  std::string out;
+  auto length_ext = [&](size_t len) {   // what a nibble of 15 leaves to say
+    while (len >= 255) {
+      out.push_back(static_cast<char>(255));
+      len -= 255;
+    }
+    out.push_back(static_cast<char>(len));
+  };
+  auto emit = [&](size_t lit_at, size_t lit_len, size_t offset, size_t match_len) {
+    const size_t token_at = out.size();
+    out.push_back(0);
+    uint8_t token = static_cast<uint8_t>((lit_len >= 15 ? 15 : lit_len) << 4);
+    if (lit_len >= 15) length_ext(lit_len - 15);
+    out.append(data, lit_at, lit_len);
+    if (match_len) {
+      out.push_back(static_cast<char>(offset & 0xff));
+      out.push_back(static_cast<char>(offset >> 8));
+      const size_t m = match_len - 4;
+      token |= static_cast<uint8_t>(m >= 15 ? 15 : m);
+      if (m >= 15) length_ext(m - 15);
+    }
+    out[token_at] = static_cast<char>(token);
+  };
+  constexpr size_t kHashBits = 14;
+  std::vector<uint32_t> table(size_t{1} << kHashBits, UINT32_MAX);
+  size_t anchor = 0, i = 0;
+  if (n >= 13) {
+    const size_t last_match_start = n - 12;   // a match may not start later (the format's rule)
+    const size_t match_limit = n - 5;         // nor reach into the last 5 bytes
+    while (i < last_match_start) {
+      uint32_t v;
+      std::memcpy(&v, src + i, 4);
+      const uint32_t h = (v * 2654435761u) >> (32 - kHashBits);
+      const uint32_t cand = table[h];
+      table[h] = static_cast<uint32_t>(i);
+      if (cand != UINT32_MAX && i - cand <= 65535) {
+        uint32_t w;
+        std::memcpy(&w, src + cand, 4);
+        if (w == v) {
+          size_t len = 4;
+          while (i + len < match_limit && src[cand + len] == src[i + len]) ++len;
+          emit(anchor, i - anchor, i - cand, len);
+          i += len;
+          anchor = i;
+          continue;
+        }
+      }
+      ++i;
+    }
+  }
+  emit(anchor, n - anchor, 0, 0);   // the last literals
+  return out;
+}
+
+std::string strip_ptx_comments(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  size_t i = 0;
+  bool quoted = false;
+  while (i < in.size()) {
+    const char c = in[i];
+    if (quoted) {
+      out.push_back(c);
+      quoted = c != '"';
+      ++i;
+    } else if (c == '"') {
+      quoted = true;
+      out.push_back(c);
+      ++i;
+    } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '/') {
+      while (i < in.size() && in[i] != '\n' && in[i] != '\r') ++i;
+    } else if (c == '/' && i + 1 < in.size() && in[i + 1] == '*') {
+      const size_t end = in.find("*/", i + 1);
+      i = end == std::string::npos ? in.size() : end + 2;
+    } else {
+      out.push_back(c);
+      ++i;
+    }
+  }
+  return out;
+}
 
 std::vector<FatbinPtx> extract_ptx(const void* data) {
   return extract_ptx(data, std::numeric_limits<size_t>::max());
@@ -289,6 +392,17 @@ std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* 
       return std::string(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
     };
     if (is_ptx_kind(eh.kind)) {
+      im.stored_payload.assign(reinterpret_cast<const char*>(payload), static_cast<size_t>(size));
+      // The options string the entry records: at the offset eh.unknown0 names, {string offset, size}.
+      if (eh.unknown0 && uint64_t{eh.unknown0} + 8 <= eh.header_size) {
+        uint32_t so = 0, sl = 0;
+        std::memcpy(&so, e + eh.unknown0, 4);
+        std::memcpy(&sl, e + eh.unknown0 + 4, 4);
+        if (uint64_t{so} + sl <= eh.header_size) im.options.assign(reinterpret_cast<const char*>(e + so), sl);
+        while (!im.options.empty() && im.options.back() == '\0') im.options.pop_back();
+      }
+      im.stored_flags = eh.flags;
+      if (eh.header_size >= 64 && room(e + 56, 8)) std::memcpy(&im.stored_uncompressed, e + 56, 8);
       im.data = decode();
     } else {
       // Not every flagged payload is a zstd or LZ4 stream: nvcc's LTO-IR
@@ -391,33 +505,39 @@ std::string write_fatbin(const std::vector<FatbinImage>& images) {
     tail.push_back('\0');
     pad8(tail);
     uint32_t options_record = 0;
-    if (im.is_ptx()) {
+    if (im.is_ptx() || im.kind == kFatbinLtoIr) {
       options_record = static_cast<uint32_t>(sizeof(EntryHeader) + 16 + tail.size());
       std::string opts = im.options;
+      opts.push_back('\0');
       pad8(opts);
-      if (opts.empty()) opts.assign(8, '\0');
       put(tail, options_record + 8, 4);
       put(tail, im.options.size(), 4);
       tail += opts;
     }
     std::string payload = im.data;
-    if (im.is_ptx() && (payload.empty() || payload.back() != '\0')) payload.push_back('\0');
+    const bool compressed = (im.flags & (kFatbinLz4 | kFatbinZstd)) != 0;
+    if (!compressed && im.is_ptx() && (payload.empty() || payload.back() != '\0')) payload.push_back('\0');
+    const uint32_t payload_size = compressed ? static_cast<uint32_t>(payload.size()) : 0;
     pad8(payload);
     const uint32_t header_size = static_cast<uint32_t>(sizeof(EntryHeader) + 16 + tail.size());
     put(body, im.kind, 2);
     put(body, 0x0101, 2);                 // entry version, as both writers set it
     put(body, header_size, 4);
     put(body, payload.size(), 8);         // padded payload size
-    put(body, 0, 4);                      // payload size: 0 means "uncompressed, see above"
+    put(body, payload_size, 4);           // payload size: 0 means "uncompressed, see above"
     put(body, options_record, 4);
     put(body, im.minor, 2);
     put(body, im.major, 2);
     put(body, im.arch, 4);
     put(body, sizeof(EntryHeader) + 16, 4);   // identifier offset
     put(body, im.name.size(), 4);
-    put(body, 0x11, 8);                   // flags: 64-bit, Linux host, no compression
-    put(body, 0, 8);
-    put(body, 0, 8);                      // uncompressed size: unused, nothing is compressed
+    put(body, im.flags, 8);               // flags: 64-bit, Linux host unless the entry says otherwise, compression
+    // A compressed LTO-IR entry carries a word of the bitcode's own header here (measured).
+    uint32_t lto_word = 0;
+    if (compressed && im.kind == kFatbinLtoIr && !im.uncompressed_head.empty())
+      std::memcpy(&lto_word, im.uncompressed_head.data(), std::min<size_t>(4, im.uncompressed_head.size()));
+    put(body, lto_word, 8);
+    put(body, compressed ? im.uncompressed_size : 0, 8);   // uncompressed size
     body += tail;
     body += payload;
   }

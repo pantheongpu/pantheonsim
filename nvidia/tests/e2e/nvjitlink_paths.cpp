@@ -16,7 +16,8 @@
 // it calls the versioned entry points a real program imports. Every check
 // passes against NVIDIA's libnvJitLink 13.0 on an RTX 3060, where the cubin
 // is SASS. VirtualGPU's cubin is the linked PTX, which is the one place the
-// two may answer differently; where they do, both answers are named.
+// two may answer differently; where they do, both answers are named. LTO-IR
+// and SASS beside PTX go to the toolkit's libnvJitLink, where there is one.
 #include <cuda.h>
 #include <dlfcn.h>
 #ifdef VGPU_OWN_NVJITLINK_H   // a toolkit without nvJitLink (run_jit_link.sh)
@@ -31,6 +32,14 @@
 #include <vector>
 
 static int failures = 0;
+
+// Whether LTO-IR and SASS-beside-PTX links get done: by NVIDIA's own library, or by this one's
+// hand-off to the toolkit's (libvgpunvjitlink does that when it finds one installed).
+static bool toolkit_links() {
+  using Fn = int (*)();
+  const auto probe = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_nvjitlink_has_toolkit_linker"));
+  return !probe || probe() != 0;
+}
 
 static void check(bool ok, const char* what) {
   std::printf("%-4s %s\n", ok ? "ok" : "FAIL", what);
@@ -294,8 +303,9 @@ int main(int argc, char** argv) {
   }
 
   // LTO-IR, as nvcc -dlto puts it in a fatbin, needs -lto. With it NVIDIA's
-  // compiles the bitcode and links it; VirtualGPU cannot compile NVVM bitcode,
-  // and refuses it by name instead.
+  // compiles the bitcode and links it; so does VirtualGPU's, by handing the
+  // inputs to the toolkit's libnvJitLink where one is installed. (NVVM bitcode
+  // is NVIDIA's compiler's alone: without one it is refused by name.)
   if (argc >= 4) {
     h = create({"-arch=sm_80"});
     IS(nvJitLinkAddFile(h, NVJITLINK_INPUT_FATBIN, argv[3]), kLtoNotEnabled);
@@ -304,15 +314,43 @@ int main(int argc, char** argv) {
     h = create({"-arch=sm_80", "-lto"});
     add(h, kMain, "main.ptx");
     const int r = nvJitLinkAddFile(h, NVJITLINK_INPUT_FATBIN, argv[3]);
-    if (ptx_cubin) {
-      is(r, NVJITLINK_ERROR_NVVM_COMPILE, "LTO-IR with -lto is refused (VirtualGPU)");
+    if (ptx_cubin && !toolkit_links()) {
+      is(r, NVJITLINK_ERROR_NVVM_COMPILE, "LTO-IR with -lto is refused (no toolkit linker to hand it to)");
       check(error_log(h).find("LTO-IR input '") != std::string::npos, "and the input is named");
     } else {
-      is(r, NVJITLINK_SUCCESS, "LTO-IR with -lto is an input (NVIDIA)");
+      is(r, NVJITLINK_SUCCESS, "LTO-IR with -lto is an input");
       IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
       check(runs_right(cubin_of(h)), "and links with the kernel's PTX");
     }
     nvJitLinkDestroy(&h);
+    if (toolkit_links()) {
+      // LTO-IR alone: -lto makes a cubin (and has no PTX to hand out); -lto -ptx makes PTX (and no cubin).
+      h = create({"-arch=sm_80", "-lto"});
+      IS(nvJitLinkAddFile(h, NVJITLINK_INPUT_FATBIN, argv[3]), NVJITLINK_SUCCESS);
+      IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
+      {
+        const std::vector<char> c = cubin_of(h);
+        size_t ps = 0;
+        check(c.size() > 64 && c[0] == 0x7f && nvJitLinkGetLinkedPtxSize(h, &ps) == NVJITLINK_ERROR_INVALID_INPUT,
+              "-lto links LTO-IR into a cubin, with no PTX to give");
+      }
+      nvJitLinkDestroy(&h);
+      h = create({"-arch=sm_80", "-lto", "-ptx"});
+      IS(nvJitLinkAddFile(h, NVJITLINK_INPUT_FATBIN, argv[3]), NVJITLINK_SUCCESS);
+      IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
+      {
+        size_t ps = 0, cs = 0;
+        std::string text;
+        if (nvJitLinkGetLinkedPtxSize(h, &ps) == NVJITLINK_SUCCESS && ps > 1) {
+          text.assign(ps, '\0');
+          nvJitLinkGetLinkedPtx(h, &text[0]);
+        }
+        check(text.find(".target sm_80") != std::string::npos && text.find(" base = 7") != std::string::npos &&
+                  nvJitLinkGetLinkedCubinSize(h, &cs) == kInternal,
+              "-lto -ptx links LTO-IR into PTX, with no cubin to give");
+      }
+      nvJitLinkDestroy(&h);
+    }
   }
 
   // Cubins. A linked one (nvcc -cubin) adds nothing to a link -- NVIDIA's
@@ -333,11 +371,11 @@ int main(int argc, char** argv) {
     h = create({"-arch=sm_80"});
     add(h, kMain, "main.ptx");
     const int r = nvJitLinkAddFile(h, NVJITLINK_INPUT_CUBIN, argv[5]);
-    if (ptx_cubin) {
-      is(r, NVJITLINK_ERROR_INVALID_INPUT, "relocatable SASS beside PTX is refused (VirtualGPU)");
+    if (ptx_cubin && !toolkit_links()) {
+      is(r, NVJITLINK_ERROR_INVALID_INPUT, "relocatable SASS beside PTX is refused (no toolkit linker)");
       check(error_log(h).find("relocatable SASS") != std::string::npos, "by name");
     } else {
-      is(r, NVJITLINK_SUCCESS, "relocatable SASS is an input (NVIDIA)");
+      is(r, NVJITLINK_SUCCESS, "relocatable SASS is an input beside PTX");
       IS(nvJitLinkComplete(h), NVJITLINK_SUCCESS);
       check(runs_right(cubin_of(h)), "and links with the kernel's PTX");
     }

@@ -545,7 +545,9 @@ The status snapshot, the inventories and the gap register at the end are new in 
   inputs and outputs; matches NVIDIA's link byte for byte in code and
   relocations for sm_75-sm_90, and NVIDIA's driver runs its output.
   e2e_nvjitlink_sass, sm_75 to sm_120, passes on the card with either
-  nvJitLink.
+  nvJitLink. The link also drops functions nothing reaches (unless `-g`), honours
+  `-kernels-used`, and carries the modules' debug sections; LTO-IR, index files and SASS beside
+  PTX go to the toolkit's libnvJitLink where one is installed.
 - nvJPEG: progressive decoding, multi-scan and restart handling, CMYK/YCCK,
   NV12/YUY2 output; the batched API torchvision.io.decode_jpeg uses and the
   decoupled three-phase API with streams, decoder states, buffers and decode
@@ -737,9 +739,9 @@ across two physical GPUs. The math runs on the host rather than through the
 interpreter, because a vendor library is not user code — see nvidia/docs/libraries.md
 for the boundary, the per-library scope, and what each one deliberately refuses.
 
-NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
-needs no GPU, so kernels compiled through NVRTC reach the interpreter through
-the driver API like any other PTX. The JIT frameworks are a separate question,
+NVRTC works by calling the toolkit's own libnvrtc (or, without it, nvcc), which runs on the host and
+needs no GPU, so kernels compiled through NVRTC reach the simulator through
+the driver API like any other kernel -- as PTX, or as the cubin of an sm_ target. The JIT frameworks are a separate question,
 because none of them uses NVRTC:
 
 - **Numba works.** It talks to `libcuda` directly and never loads a cudart. It
@@ -1900,9 +1902,14 @@ behaviour, timing).
   NotSupported), LZ4 bitshuffle, checksums, CPU/streaming gzip, the hardware decompression engine.
   **NVSHMEM**: MPI/OpenSHMEM bootstrap, multi-node, proxy transports, multimem, host reductions;
   `NVSHMEM_MAX_TEAMS=32`.
-- **NVRTC**: CUBIN, LTO-IR and OptiX-IR output, precompiled headers, time traces. **nvJitLink**: LTO-IR,
-  SASS+PTX mixes, dead-function removal, re-finalizing sm_100/120, `-G` debug sections, texture refs.
-  **nvFatbin**: compression and `nvFatbinAddIndex`.
+- **NVRTC**: without the toolkit's libnvrtc, LTO-IR, OptiX-IR, Tile IR, precompiled headers and the
+  time traces (refused by name; with it every output is NVIDIA's own). **nvJitLink**: without the
+  toolkit's libnvJitLink, LTO-IR, index files and SASS+PTX mixes (refused by name); re-finalizing
+  sm_100/120 code from the mercury sections (the format is undocumented; the frame table of a dropped
+  function is cleared, not removed, there), legacy texture/surface references, and NVIDIA's shared-memory
+  layout across a kernel and device functions in two modules (valid, not the same offsets).
+  **nvFatbin**: `nvFatbinAddIndex` (NVIDIA's takes an index file no tool can write), and compressed
+  bytes identical to NVIDIA's (the same flags and sizes within a few percent).
 - **NPP**: watershed, marker-label compression, ResizeSqrPixel super-sampling and Lanczos
   (`NPP_INTERPOLATION_ERROR`). **nvJPEG**: 12-bit, arithmetic, lossless and hierarchical JPEG, the
   hardware backend, EXIF orientation, transcoding. **NVENC**: unimplemented function-table slots

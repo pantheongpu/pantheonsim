@@ -79,6 +79,8 @@ struct FuncRec {
 // text, instantiated per device on first use.
 struct LibRec {
   std::string ptx;
+  std::string cubin;   // a cubin (ELF) the library was loaded from, run as SASS
+
   std::unordered_map<int, uint64_t> per_device_module;  // device -> runtime module id
 };
 
@@ -457,6 +459,54 @@ uintptr_t check_handle(uintptr_t h, uintptr_t tag, const char* what) {
 }
 
 // Picks the PTX image the driver would JIT -- see pick_ptx for the rule.
+// The PTX the NVRTC shim noted for a cubin it handed out (empty for any other
+// cubin, and when the toolkit's own NVRTC is the library loaded). Found by name
+// in whichever libnvrtc is loaded, since a program may have opened it privately.
+std::string nvrtc_ptx_for_cubin(const void* cubin, size_t size) {
+  using Fn = char* (*)(const void*, size_t);
+  Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_nvrtc_ptx_for_cubin"));
+  for (const char* so : {"libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2", "libnvrtc.so"}) {
+    if (fn) break;
+    if (void* h = dlopen(so, RTLD_NOLOAD | RTLD_LAZY)) fn = reinterpret_cast<Fn>(dlsym(h, "vgpu_nvrtc_ptx_for_cubin"));
+  }
+  if (!fn) return {};
+  char* copy = fn(cubin, size);
+  if (!copy) return {};
+  std::string ptx(copy);
+  std::free(copy);
+  return ptx;
+}
+
+// A bare cubin's size: the end of its section table (all the driver has to go by, handed a pointer).
+size_t bare_cubin_size(const uint8_t* b) {
+  uint64_t shoff;
+  uint16_t shentsize, shnum;
+  std::memcpy(&shoff, b + 0x28, 8);
+  std::memcpy(&shentsize, b + 0x3a, 2);
+  std::memcpy(&shnum, b + 0x3c, 2);
+  return static_cast<size_t>(shoff + static_cast<uint64_t>(shentsize) * shnum);
+}
+
+// The PTX the NVRTC shim noted for this cubin, when the SASS engine cannot run all of the cubin yet --
+// the fallback a fatbin's PTX gives (VGPU_SASS=1 insists on the SASS, VGPU_SASS=0 asks for none).
+// Empty when the cubin is to run.
+std::string ptx_for_unsupported_cubin(const uint8_t* b, size_t size) {
+  const char* force = std::getenv("VGPU_SASS");
+  if (force && (force[0] == '1' || force[0] == '0')) return {};
+  std::string aside = nvrtc_ptx_for_cubin(b, size);
+  if (aside.empty()) return {};
+  std::string why;
+  try {
+    why = vgpu::sass::unsupported(b, size);
+  } catch (const vgpu::Error& e) {
+    why = e.message();
+  }
+  if (why.empty()) return {};
+  if (const char* log = std::getenv("VGPU_SASS_LOG"); log && log[0] == '1')
+    std::fprintf(stderr, "[vgpu] running PTX instead of SASS: %s\n", why.c_str());
+  return aside;
+}
+
 std::string best_ptx(const void* image) {
   auto ptxs = vgpu::cuda::extract_ptx(image);
   if (ptxs.empty())
@@ -534,7 +584,9 @@ uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   LibRec& lib = it->second;
   auto mit = lib.per_device_module.find(dev);
   if (mit != lib.per_device_module.end()) return mit->second;
-  uint64_t mid = s.rt->device(dev).load_module(lib.ptx);
+  uint64_t mid = !lib.cubin.empty()
+                     ? s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(lib.cubin.data()), lib.cubin.size())
+                     : s.rt->device(dev).load_module(lib.ptx);
   lib.per_device_module[dev] = mid;
   bind_managed_globals(s, dev, mid);
   return mid;
@@ -1242,16 +1294,19 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       std::memcpy(&shoff, b + 0x28, 8);
       std::memcpy(&shentsize, b + 0x3a, 2);
       std::memcpy(&shnum, b + 0x3c, 2);
-      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;
+      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;   // (bare_cubin_size)
       uint32_t eflags;
       std::memcpy(&eflags, b + 0x30, 4);
       // The architecture is in e_flags' second byte from ABI version 8 on,
       // and its low byte before (as sass::parse_cubin reads it): a CUDA 12
       // cubin for sm_86 carries 0x560556.
       const int sm = static_cast<int>(b[7] == 0x33 ? eflags & 0xff : (eflags >> 8) & 0xff);
-      if (!vgpu::sass::runs_on(sm, false, static_cast<int>(cc))) return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      // An sm_XYa cubin runs on XY alone, a plain one on its major from XY up.
+      if (!vgpu::sass::runs_on(sm, vgpu::sass::cubin_arch_specific(b, size), static_cast<int>(cc)))
+        return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      const std::string aside = ptx_for_unsupported_cubin(b, size);
       try {
-        mid = s.rt->device(dev).load_cubin(b, size);
+        mid = !aside.empty() ? s.rt->device(dev).load_module(aside.c_str()) : s.rt->device(dev).load_cubin(b, size);
       } catch (const vgpu::Error& e) {
         if (e.code() == vgpu::Err::InvalidValue) return CUDA_ERROR_INVALID_IMAGE;
         throw;
@@ -1941,10 +1996,20 @@ VGPU_EXPORT CUresult cuLibraryLoadData(void** library, const void* code, void* j
     uint32_t magic = 0;
     std::memcpy(&magic, code, 4);
     LibRec lib;
-    if (magic == 0x466243B1u || magic == 0xBA55ED50u)
+    if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
       lib.ptx = best_ptx(code);
-    else
+    } else if (magic == 0x464c457fu) {
+      // A cubin (NVRTC's, for one): run as SASS, or as the PTX NVRTC made it from where the SASS engine
+      // cannot yet. The same checks as cuModuleLoadData's.
+      const auto* b = static_cast<const uint8_t*>(code);
+      if (b[4] != 2 || (b[7] != 0x41 && b[7] != 0x33)) return CUDA_ERROR_INVALID_IMAGE;
+      const size_t size = bare_cubin_size(b);
+      std::string aside = ptx_for_unsupported_cubin(b, size);
+      if (!aside.empty()) lib.ptx = std::move(aside);
+      else lib.cubin.assign(reinterpret_cast<const char*>(b), size);
+    } else {
       lib.ptx.assign(static_cast<const char*>(code));  // NUL-terminated PTX text
+    }
     uintptr_t h = make_handle(s, kTagLibrary);
     s.libraries[h] = std::move(lib);
     *library = reinterpret_cast<void*>(h);

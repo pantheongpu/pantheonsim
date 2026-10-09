@@ -378,4 +378,60 @@ VTEST(archive_members_with_long_names) {
   VCHECK(err.code() == Err::InvalidValue);
 }
 
+// nvFatbin stores PTX without its comments (measured against libnvfatbin 13.0).
+VTEST(ptx_loses_its_comments_the_way_nvfatbin_stores_it) {
+  using cuda::strip_ptx_comments;
+  VCHECK_EQ(strip_ptx_comments("a // c\nb"), std::string("a \nb"));                  // to the line's end, the newline stays
+  VCHECK_EQ(strip_ptx_comments("a // c\r\nb"), std::string("a \r\nb"));              // the carriage return too
+  VCHECK_EQ(strip_ptx_comments("x /* y */ z"), std::string("x  z"));                 // a block goes whole
+  VCHECK_EQ(strip_ptx_comments("x/* a\nb */y"), std::string("xy"));                  // across lines
+  VCHECK_EQ(strip_ptx_comments("x /* never"), std::string("x "));                    // unterminated: to the end
+  VCHECK_EQ(strip_ptx_comments("/*/ x */"), std::string(" x */"));                   // "/*/" is a whole comment
+  VCHECK_EQ(strip_ptx_comments("/* a /* b */ c */"), std::string(" c */"));          // they do not nest
+  VCHECK_EQ(strip_ptx_comments(".file 1 \"/tmp//a.cu\" // z\n"), std::string(".file 1 \"/tmp//a.cu\" \n"));
+  VCHECK_EQ(strip_ptx_comments("\"/* kept */\""), std::string("\"/* kept */\""));    // quoted text is left alone
+  VCHECK_EQ(strip_ptx_comments("a / b"), std::string("a / b"));
+}
+
+// An entry written compressed reads back as what went in -- the LZ4 block and the zstd frame
+// (the latter when libzstd is installed).
+VTEST(compressed_entries_read_back) {
+  std::string text = ".version 7.8\n.target sm_80\n.address_size 64\n";
+  for (int i = 0; i < 80; ++i) text += ".visible .entry k" + std::to_string(i) + "() { ret; }\n";
+  const std::string payload = text + std::string(1, '\0');
+  for (int variant = 0; variant < 2; ++variant) {
+    const std::string packed = variant == 0 ? cuda::compress_lz4(payload) : cuda::compress_zstd(payload, variant == 1);
+    if (packed.empty()) continue;   // no libzstd here
+    VCHECK(packed.size() < payload.size() / 2);
+    cuda::FatbinImage im;
+    im.kind = cuda::kFatbinPtx;
+    im.arch = 80;
+    im.major = 7;
+    im.minor = 8;
+    im.name = "p";
+    im.data = packed;
+    im.flags = 0x11 | (variant == 0 ? cuda::kFatbinLz4 : cuda::kFatbinZstd);
+    im.uncompressed_size = payload.size();
+    const std::string fb = cuda::write_fatbin({im});
+    const auto back = cuda::extract_ptx(fb.data(), fb.size());
+    VCHECK_EQ(back.size(), size_t{1});
+    VCHECK_EQ(back[0].text, text);
+  }
+  // LZ4 on awkward inputs: nothing, a few bytes, a long run, and bytes that never repeat.
+  for (const std::string& in : {std::string(), std::string("abc"), std::string(1000, 'q'), std::string("0123456789abcdefghij")}) {
+    const std::string packed = cuda::compress_lz4(in);
+    cuda::FatbinImage im;
+    im.kind = cuda::kFatbinElf;   // (not PTX: no terminator added, no text rules)
+    im.arch = 80;
+    im.data = packed;
+    im.flags = 0x11 | cuda::kFatbinLz4;
+    im.uncompressed_size = in.size();
+    if (in.empty()) continue;     // (a zero uncompressed size is not a usable entry)
+    const std::string fb = cuda::write_fatbin({im});
+    const auto images = cuda::extract_images(fb.data(), fb.size());
+    VCHECK_EQ(images.size(), size_t{1});
+    VCHECK_EQ(images[0].data, in);
+  }
+}
+
 VTEST_MAIN

@@ -37,3 +37,7 @@ __device__ __noinline__ int lib_scratch(int t) {
 __global__ void lib_kernel(int* out) {
   out[threadIdx.x] = lib_add(threadIdx.x) + main_const[threadIdx.x & 7] + main_counter * 0;
 }
+
+// Nothing calls these (a chain of two): a link without -g leaves them out.
+__device__ __noinline__ int lib_unused_leaf(int x) { return x * 31 + lib_var; }
+__device__ __noinline__ int lib_unused(int x) { return lib_unused_leaf(x) + 1; }
