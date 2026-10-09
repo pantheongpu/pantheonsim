@@ -52,7 +52,9 @@ static int pe_main(int rank, int npes, nvshmemx_uniqueid_t* id) {
   me = nvshmem_my_pe();
   const int n = nvshmem_n_pes();
   check(me == rank && n == npes, "my_pe and n_pes are the bootstrap's");
-  check(nvshmemx_init_status() == NVSHMEM_STATUS_IS_INITIALIZED, "initialized");
+  // PEs on one GPU make NVSHMEM's multiple-processes-per-GPU mode (measured on an RTX 3060: status 3).
+  check(nvshmemx_init_status() == (npes > (ndev ? ndev : 1) ? NVSHMEM_STATUS_LIMITED_MPG : NVSHMEM_STATUS_IS_INITIALIZED),
+        "initialized (in the multiple-processes-per-GPU mode when the PEs share a GPU)");
   int major = 0, minor = 0, patch = 0;
   nvshmem_info_get_version(&major, &minor);
   nvshmemx_vendor_get_version_info(nullptr, nullptr, &patch);
