@@ -183,3 +183,8 @@ for src in atomics memory graphs cooperative streams smid errors pointers runtim
   "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx1250 $src.cpp -o $src.gfx1250
   echo "wrote $(pwd)/$src.gfx1250"
 done
+# Kernel arguments preloaded into SGPRs (the first 3 dwords, then 16), which gfx1250 has no compatibility prologue for.
+for n in 3 16; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1250 -mllvm -amdgpu-kernarg-preload-count=$n preload1250.cpp -o preload1250.$n.gfx1250
+  echo "wrote $(pwd)/preload1250.$n.gfx1250"
+done

@@ -7533,6 +7533,14 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // Past any the descriptor reserves for preloaded arguments: a kernel
     // that preloads them loads them itself where the hardware has not (its
     // first 256 bytes do it, and the hardware skips them).
+    // The preloaded arguments, where the descriptor asks for them: the last user SGPRs hold the kernarg dwords the
+    // hardware copies there (the kernel may also have loaded them itself, as gfx942's compatibility prologue does,
+    // which gives the same values).
+    if (k.kernarg_preload_length && k.user_sgpr_count >= k.kernarg_preload_length) {
+      const uint32_t first = k.user_sgpr_count - k.kernarg_preload_length, avail = k.kernarg_size / 4;
+      for (uint32_t i = 0; i < k.kernarg_preload_length; ++i)
+        m.set_sgpr(w, first + i, k.kernarg_preload_offset + i < avail ? static_cast<uint32_t>(m.load(d.kernarg + 4ull * (k.kernarg_preload_offset + i), 4)) : 0u);
+    }
     at = std::max(at, k.user_sgpr_count);
     // RDNA4 gives the work-group's id in the trap handler's registers, and
     // the wave's number within the group in TTMP8's bits 25 to 29, where
