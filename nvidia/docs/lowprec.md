@@ -43,11 +43,14 @@ at another set of NVIDIA libraries (a pip wheel's, for instance).
 | `nvidia/l4` (sm_89) | an AWS g6.xlarge (three sessions), driver 595.91, cuBLAS 13.3 (CUDA 13.2), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`; `cuda_attributes_l4.card.txt`; `nvidia-smi -q` (serial number, PDI and UUID redacted) |
 | `nvidia/rtx3060` (sm_86) | the development machine, the same libraries | `lt`, `sparselt`; cuDNN 9.27 for `dnn_int8x32` |
 
-Nothing was measured on Hopper or Blackwell: AWS had no p5.4xlarge or
-g7e.2xlarge capacity in us-east-1 in any availability zone at any of three
-attempts (ledger lines in the hand-back; no instance was created). So the
-H100, RTX PRO 6000 and B200 columns are documentation-derived (below), and the
-`ptx120` probe has its program and runner but no transcript.
+Nothing was measured on Hopper or Blackwell: AWS had no `p5.4xlarge` or
+`g7e.2xlarge` capacity in us-east-1 at nine attempts over four hours (every zone
+for `p5.4xlarge`; for a while no `g6.xlarge` or `g6e.xlarge` either), the Spot
+quota for the G and P families is 0, and no other region has any quota for them.
+So the H100, RTX PRO 6000 and B200 columns are documentation-derived (below), and
+the `ptx120` probe has its programs and runner but no transcript. Nothing was
+launched that was not terminated: three `g6.xlarge` sessions in all (about two
+hours of GPU time, under $2).
 
 The cuBLAS version matters. The transcripts are cuBLAS 13.3's (CUDA 13.2). On the
 L4 the CUDA 13.0 library differs from it on 9 lines of the first 1247 (only the
