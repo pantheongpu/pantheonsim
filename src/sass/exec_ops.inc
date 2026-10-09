@@ -628,18 +628,33 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::VIADD:
       each_lane(ex, [&](unsigned l) {
         const uint32_t a = read32(w, ins.src[0], l), b = ival(w, ins.src[1], l);
+        // ins.f[2]: 0 U32, 1 .16x2, 2 .S32, 3 .S16x2, 4 .U8x4, 5 .S8x4; f[1] saturating (.ISAT)
+        const unsigned mode = ins.f[2];
         uint32_t r;
-        if (ins.f[0] == 1 && ins.f[1]) {   // .S32.ISAT: saturating
-          r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
-        } else if (ins.f[0] == 2) {   // per byte, wrapping; a negated b is negated byte by byte
-          const uint32_t braw = read32(w, ins.src[1], l);
+        if (mode >= 3 || mode == 1 || mode == 4) {
+          // Packed: each lane of the registers on its own, a negated source negated lane by lane,
+          // saturating to the lane's range with .ISAT (sm_120's add and sub .u8x4/.s8x4/.u16x2/.s16x2).
+          const unsigned bits = mode >= 4 ? 8 : 16, nl = 32 / bits;
+          const bool sgn = mode == 3 || mode == 5;
+          const uint32_t mask = (1u << bits) - 1, braw = read32(w, ins.src[1], l);
+          const int64_t lo = sgn ? -(int64_t{1} << (bits - 1)) : 0, hi = sgn ? (int64_t{1} << (bits - 1)) - 1 : (int64_t{1} << bits) - 1;
           r = 0;
-          for (int k = 0; k < 4; ++k) {
-            const uint32_t bk = (braw >> (8 * k)) & 0xff;
-            r |= ((((a >> (8 * k)) & 0xff) + (ins.src[1].neg ? 0u - bk : bk)) & 0xff) << (8 * k);
+          for (unsigned k = 0; k < nl; ++k) {
+            const auto part = [&](uint32_t v) -> int64_t {
+              const uint32_t u = (v >> (bits * k)) & mask;
+              return sgn ? static_cast<int64_t>(static_cast<int32_t>(u << (32 - bits)) >> (32 - bits)) : u;
+            };
+            int64_t x = part(a), y = part(braw);
+            if (ins.src[0].neg) x = -x;
+            if (ins.src[1].neg) y = -y;
+            int64_t v = x + y;
+            if (ins.f[1]) v = std::clamp(v, lo, hi);
+            r |= (static_cast<uint32_t>(v) & mask) << (bits * k);
           }
+        } else if (mode == 2 && ins.f[1]) {   // .S32.ISAT: saturating
+          r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
         } else {
-          r = a + b;
+          r = (ins.src[0].neg ? 0u - a : a) + b;
         }
         write32(w, ins.dst[0], l, r);
       });
@@ -694,10 +709,11 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
               const uint32_t u = (v >> (bits * h)) & mask;
               return sgn ? static_cast<int32_t>(u << (32 - bits)) >> (32 - bits) : static_cast<int32_t>(u);
             };
-            const int32_t m = mn ? std::min({part(a), part(b), part(c)}) : std::max({part(a), part(b), part(c)});
+            int32_t m = mn ? std::min({part(a), part(b), part(c)}) : std::max({part(a), part(b), part(c)});
+            if (ins.f[2] && m < 0) m = 0;   // .RELU: a negative lane becomes 0
             r |= (static_cast<uint32_t>(m) & mask) << (bits * h);
           }
-          write32(w, ins.dst[0], l, relu(r));
+          write32(w, ins.dst[0], l, r);
         }
       });
       return;

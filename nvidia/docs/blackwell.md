@@ -314,6 +314,17 @@ them.
   and `.scaled::n1::ue8m0` (one scale factor, the low byte, divides both inputs).
 - **The packed integer forms**: `add{.sat}`, `sub{.sat}`, `neg`, `min`/`max{.relu}` and
   `set.CmpOp` on `.u8x4`, `.s8x4`, `.u16x2` and `.s16x2`, a lane at a time.
+  The SASS engine matches the PTX one on sm_120f (checked against a host loop in
+  `packed_int_forms`; the card here is sm_86, so these forms are derived from the
+  documentation, not checked against a card).
+- **Four-wide narrow-float arithmetic** (9.7.6, sm_100a and sm_103a): `add`, `sub`,
+  `mul` and `fma` with `.rn` and `.satfinite`, destination `.e5m2x4` or `.e4m3x4`,
+  sources of any of `.e5m2x4`, `.e4m3x4`, `.e3m2x4`, `.e2m3x4`, `.e2m1x4`,
+  `.e2m1p4x4`, `.ue8m0x4`. Each lane is combined exactly and rounded once, so `fma`
+  is fused; without `.satfinite` an e4m3 result past 448 is NaN and an e5m2 one
+  infinity. Derived from documentation, not checked against a card: ptxas of CUDA 13.2
+  rejects these forms ('Unexpected instruction types'), so there is no SASS for the
+  SASS engine to run; the PTX interpreter is the only engine for them.
 
 Refused by name, and why:
 

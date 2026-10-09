@@ -1140,6 +1140,21 @@ struct OpPackedInt {
   Reg dst;
   Operand a, b;
 };
+// add, sub, mul and fma on four narrow floating-point values packed in a register (PTX ISA 9.4,
+// "alternate floating point instructions", sm_100a and sm_103a): d = a + c, a - c, a * c or a * b + c,
+// exact, then rounded to nearest-even into e5m2x4 or e4m3x4 (.satfinite clamps, and e4m3 otherwise
+// overflows to NaN). a and b may be any of e5m2x4, e4m3x4, e3m2x4, e2m3x4, e2m1x4 (a 16-bit register
+// of four nibbles), e2m1p4x4 (a nibble in the low half of each byte) and ue8m0x4.
+enum class F8x4Op : uint8_t { Add, Sub, Mul, Fma };
+struct F8x4Src { NarrowFmt fmt = NarrowFmt::E4M3; bool nibbles = false, padded_nibble = false; };
+struct OpF8x4Arith {
+  F8x4Op kind = F8x4Op::Add;
+  NarrowFmt dfmt = NarrowFmt::E4M3;   // e5m2 or e4m3
+  F8x4Src asrc, bsrc;                 // a's type; b's (mul's c, fma's b); add and sub's c is the destination type
+  bool satfinite = false;
+  Reg dst;
+  Operand a, b, c;                    // add/sub: a, c in (a, b); mul: a, c in (a, b); fma: a, b, c
+};
 // spcompress.<elemsize>.<idxsize>.sp::2:4.xN {mdata}, {cdata}, {data}, spdesc
 // (sm_107a): from every group of four elements of the dense `data`, the two the
 // descriptor's selection picks, in index order, into `cdata`, with their
@@ -1160,7 +1175,7 @@ struct OpSpDecompress {
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics

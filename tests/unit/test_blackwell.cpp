@@ -3425,4 +3425,60 @@ VTEST(cvt_narrow_forms_refused_by_name) {
   VCHECK_CONTAINS(parse("cvt.rn.relu.f32.f16 f, a;"), ".relu");
 }
 
+// add, sub, mul and fma on four packed narrow floats (PTX ISA 9.7.6, sm_100a and sm_103a). Derived from
+// documentation, not checked against a card: ptxas rejects these forms for the sm_86 card, and no sm_100 card
+// was available. The expected words were worked out by hand from the formats.
+VTEST(f8x4_arithmetic) {
+  const std::string ptx = std::string(".version 9.4\n.target sm_100a\n.address_size 64\n") + R"(
+.visible .entry k(.param .u64 out)
+{
+  .reg .b32 a, c, r<8>;
+  .reg .b64 %rd<3>;
+  ld.param.u64 %rd1, [out];
+  cvta.to.global.u64 %rd2, %rd1;
+  // add: {1, 2, 448, .5} + {1, .5, 448, -.5} in e4m3: 2, 2.5, past the largest finite (NaN, or 448 saturated), 0
+  mov.b32 a, 0x307E4038;
+  mov.b32 c, 0xB07E3038;
+  add.rn.e4m3x4.e4m3x4 r0, a, c;
+  add.rn.satfinite.e4m3x4.e4m3x4 r1, a, c;
+  // mul into e5m2: e4m3 {1, 2, 1.5, .5} times e2m1 {1.5, 2, 3, 6}: 1.5, 4, 4.5 (a tie, to even: 4), 3
+  mov.b32 a, 0x303C4038;
+  mov.b32 c, 0x7543;
+  mul.rn.e5m2x4.e4m3x4.e2m1x4 r2, a, c;
+  // fma is fused: 448*2 - 448 is 448, not an overflow; 1*1 + 2^-9 rounds back to 1
+  mov.b32 a, 0x387E403C;
+  mov.b32 c, 0x3840303C;
+  mov.b32 r3, 0x01FEB828;
+  fma.rn.e4m3x4.e4m3x4.e4m3x4 r3, a, c, r3;
+  // scaling by powers of two: e8m0 codes {128, 126, 128, 255} on e4m3 {1, 1.5, 448, 1}
+  mov.b32 a, 0x387E3C38;
+  mov.b32 c, 0xFF807E80;
+  mul.rn.e4m3x4.e4m3x4.ue8m0x4 r4, a, c;
+  // sub: {1, 2, 448, .5} - {1, .5, 448, -.5} = 0, 1.5, 0, 1
+  mov.b32 a, 0x307E4038;
+  mov.b32 c, 0xB07E3038;
+  sub.rn.e4m3x4.e4m3x4 r5, a, c;
+  st.global.b32 [%rd2], r0;
+  st.global.b32 [%rd2+4], r1;
+  st.global.b32 [%rd2+8], r2;
+  st.global.b32 [%rd2+12], r3;
+  st.global.b32 [%rd2+16], r4;
+  st.global.b32 [%rd2+20], r5;
+  ret;
+}
+)";
+  MemoryManager mem(1 << 20);
+  const uint64_t out = mem.alloc(24);
+  exec::launch(ptx::parse(ptx).entries[0], LaunchConfig{}, {arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  const uint32_t want[6] = {0x007F4240u, 0x007E4240u, 0x4244443Eu, 0x387E0042u, 0x7F7F3440u, 0x38003C00u};
+  for (int i = 0; i < 6; ++i) VCHECK_EQ(static_cast<uint32_t>(mem.load_scalar(out + 4 * i, 4)), want[i]);
+}
+
+VTEST(f8x4_arithmetic_needs_sm100a) {
+  const auto msg = VCAPTURE(Error, ptx::parse(std::string(".version 9.4\n.target sm_120a\n.address_size 64\n") +
+                                              ".visible .entry k()\n{\n .reg .b32 a, b, c;\n"
+                                              " add.rn.e4m3x4.e4m3x4 a, b, c;\n ret;\n}\n")).message();
+  VCHECK_CONTAINS(msg, "sm_100a");
+}
+
 VTEST_MAIN

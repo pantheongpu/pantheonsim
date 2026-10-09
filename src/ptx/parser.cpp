@@ -1553,6 +1553,57 @@ class Parser {
         if (a->base_kind == Addr::Base::CallSlot || a->base_kind == Addr::Base::EntryParam)
           return unsupported(op0 + ".async through a parameter/slot name");
       ins.op = op;
+    } else if ((op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "fma") &&
+               std::any_of(parts.begin() + 1, parts.end(), [](const std::string& p) {
+                 return p == "e5m2x4" || p == "e4m3x4" || p == "e3m2x4" || p == "e2m3x4" || p == "e2m1x4" ||
+                        p == "e2m1p4x4" || p == "ue8m0x4";
+               })) {
+      // add/sub{.rn}{.satfinite}.cdtype.atype d, a, c; mul{...}.dtype.atype.ctype d, a, c;
+      // fma{...}.cdtype.atype.btype d, a, b, c (PTX ISA 9.7.6, 9.4; sm_100a and sm_103a).
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        const std::string arch = target_.substr(0, target_.find(','));
+        if (!((sm == 100 || sm == 103) && arch.back() == 'a'))
+          fail(ins.line, opcode + " (PTX ISA 9.4) requires an sm_100a or sm_103a target; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
+      OpF8x4Arith op;
+      op.kind = op0 == "add" ? F8x4Op::Add : op0 == "sub" ? F8x4Op::Sub : op0 == "mul" ? F8x4Op::Mul : F8x4Op::Fma;
+      std::vector<std::string> types;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "rn") ;
+        else if (p == "satfinite") op.satfinite = true;
+        else if (p == "e5m2x4" || p == "e4m3x4" || p == "e3m2x4" || p == "e2m3x4" || p == "e2m1x4" ||
+                 p == "e2m1p4x4" || p == "ue8m0x4")
+          types.push_back(p);
+        else return unsupported(opcode + " modifier '." + p + "'");
+      }
+      const size_t want = (op.kind == F8x4Op::Add || op.kind == F8x4Op::Sub) ? 2 : 3;
+      if (types.size() != want) return unsupported(opcode + " takes " + std::to_string(want) + " types");
+      if (types[0] != "e5m2x4" && types[0] != "e4m3x4") return unsupported(opcode + "'s destination type is .e5m2x4 or .e4m3x4");
+      op.dfmt = types[0] == "e5m2x4" ? NarrowFmt::E5M2 : NarrowFmt::E4M3;
+      const auto src = [&](const std::string& t) {
+        F8x4Src r;
+        r.fmt = t == "e5m2x4" ? NarrowFmt::E5M2 : t == "e4m3x4" ? NarrowFmt::E4M3 : t == "e3m2x4" ? NarrowFmt::E3M2
+                : t == "e2m3x4" ? NarrowFmt::E2M3 : t == "ue8m0x4" ? NarrowFmt::UE8M0 : NarrowFmt::E2M1;
+        r.nibbles = t == "e2m1x4";
+        r.padded_nibble = t == "e2m1p4x4";
+        return r;
+      };
+      op.asrc = src(types[1]);
+      op.bsrc = (op.kind == F8x4Op::Mul || op.kind == F8x4Op::Fma) ? src(types[2]) : src(types[0]);   // add and sub's c is the destination's type
+      op.dst = expect_reg_operand("destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      expect_punct(",");
+      op.b = parse_operand();
+      if (op.kind == F8x4Op::Fma) {
+        expect_punct(",");
+        op.c = parse_operand();
+      }
+      ins.op = std::move(op);
     } else if ((op0 == "add" || op0 == "sub" || op0 == "min" || op0 == "max" || op0 == "neg" || op0 == "set") &&
                std::any_of(parts.begin() + 1, parts.end(), [](const std::string& p) {
                  return p == "u8x4" || p == "s8x4" || p == "u16x2" || p == "s16x2";

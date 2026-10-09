@@ -1712,16 +1712,24 @@ void dec_plop3_sign(Instr& ins, const Word& w) {
 void dec_viadd(Instr& ins, const Word& w) {
   ins.op = Op::VIADD;
   ins.mnemonic = "VIADD";
-  // sm_120: 74-75 the lanes (1 S32, 2 U8x4), 80 saturating (.ISAT).
+  // sm_120: 73-75 the lanes -- 0 U32 (nothing printed), 1 .16x2 (unsigned), 2 .S32, 3 .S16x2, 4 .U8x4,
+  // 5 .S8x4 -- 80 saturating (.ISAT), 72 the first source negated (the second's is 63's).
   const unsigned lanes = static_cast<unsigned>(w.field(74, 2));
-  if (lanes == 1) ins.mods.push_back("S32");
-  if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
+  const unsigned mode = static_cast<unsigned>(w.field(73, 3));
+  static const char* const kModes[] = {"", "16x2", "S32", "S16x2", "U8x4", "S8x4", "(6)", "(7)"};
+  if (ins.sm >= 120 && *kModes[mode]) ins.mods.push_back(kModes[mode]);
+  else if (ins.sm < 120) {   // before sm_120: S32 and the byte forms only
+    if (lanes == 1) ins.mods.push_back("S32");
+    if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
+  }
   if (w.bit(80)) ins.mods.push_back("ISAT");
   ins.f[0] = lanes;
   ins.f[1] = w.bit(80);
+  ins.f[2] = ins.sm >= 120 ? mode : (lanes == 1 ? 2 : lanes == 2 ? 4 + w.bit(73) : 0);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kUnsigned);
   int_neg(ins.src[1], w);
+  if (ins.sm >= 120 && w.bit(72)) ins.src[0].neg = true;
 }
 
 void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {

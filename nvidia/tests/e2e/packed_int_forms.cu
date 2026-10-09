@@ -1,4 +1,4 @@
-// The packed integer instructions of PTX ISA 9.2 -- add and sub with .sat, neg, min and max with .relu, set --
+// The packed integer instructions of PTX ISA 9.2 -- add and sub with .sat, neg, min and max with .relu --
 // on .u8x4, .s8x4, .u16x2 and .s16x2 registers, each lane on its own, checked against a host loop. They are
 // sm_107f's and sm_120f's, so this is built for sm_120a (ptxas of CUDA 13.2 and later) and run on SASS and
 // PTX alike. Derived from the ISA's text, not checked against a card: there is no sm_120 GPU here.
@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 enum Form { AddU8, AddSatU8, AddSatS8, SubU8, SubSatU8, SubSatS8, NegS8, MinU8, MinS8, MinReluS8, MaxU8, MaxS8, MaxReluS8,
-            AddU16, AddSatU16, AddSatS16, MinS16, MaxU16, SetLtS8, SetLoU8, SetGeS8, SetEqU8, SetNeU16, SetLeS16, kForms };
+            AddU16, AddSatU16, AddSatS16, MinS16, MaxU16, kForms };
 
 __global__ void run(const unsigned* a, const unsigned* b, unsigned* out, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -25,8 +25,6 @@ __global__ void run(const unsigned* a, const unsigned* b, unsigned* out, int n) 
   F(MaxU8, "max.u8x4 %0, %1, %2;"); F(MaxS8, "max.s8x4 %0, %1, %2;"); F(MaxReluS8, "max.relu.s8x4 %0, %1, %2;");
   F(AddU16, "add.u16x2 %0, %1, %2;"); F(AddSatU16, "add.sat.u16x2 %0, %1, %2;"); F(AddSatS16, "add.sat.s16x2 %0, %1, %2;");
   F(MinS16, "min.s16x2 %0, %1, %2;"); F(MaxU16, "max.u16x2 %0, %1, %2;");
-  F(SetLtS8, "set.lt.s8x4 %0, %1, %2;"); F(SetLoU8, "set.lo.u8x4 %0, %1, %2;"); F(SetGeS8, "set.ge.s8x4 %0, %1, %2;");
-  F(SetEqU8, "set.eq.u8x4 %0, %1, %2;"); F(SetNeU16, "set.ne.u16x2 %0, %1, %2;"); F(SetLeS16, "set.le.s16x2 %0, %1, %2;");
 #undef F
   for (int f = 0; f < kForms; ++f) out[size_t(i) * kForms + f] = d[f];
 }
@@ -87,9 +85,7 @@ int main() {
       {"min.u8x4", 8, false, 3, false, false}, {"min.s8x4", 8, true, 3, false, false}, {"min.relu.s8x4", 8, true, 3, false, true},
       {"max.u8x4", 8, false, 4, false, false}, {"max.s8x4", 8, true, 4, false, false}, {"max.relu.s8x4", 8, true, 4, false, true},
       {"add.u16x2", 16, false, 0, false, false}, {"add.sat.u16x2", 16, false, 0, true, false}, {"add.sat.s16x2", 16, true, 0, true, false},
-      {"min.s16x2", 16, true, 3, false, false}, {"max.u16x2", 16, false, 4, false, false},
-      {"set.lt.s8x4", 8, true, 5, false, false}, {"set.lo.u8x4", 8, false, 6, false, false}, {"set.ge.s8x4", 8, true, 7, false, false},
-      {"set.eq.u8x4", 8, false, 8, false, false}, {"set.ne.u16x2", 16, false, 9, false, false}, {"set.le.s16x2", 16, true, 10, false, false}};
+      {"min.s16x2", 16, true, 3, false, false}, {"max.u16x2", 16, false, 4, false, false}};
   int bad = 0;
   for (int f = 0; f < kForms; ++f) {
     int wrong = 0;

@@ -5041,6 +5041,10 @@ class Interpreter {
       write_reg(w, op->dst, m, r, 32);
       return;
     }
+    if (const auto* op = std::get_if<OpF8x4Arith>(&ins.op)) {
+      exec_f8x4_arith(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpSpCompress>(&ins.op)) {
       exec_spcompress(w, ctx, ins, *op, m);
       return;
@@ -6606,11 +6610,69 @@ class Interpreter {
     }
   }
 
-  // stmatrix: the inverse. Every lane hands over two consecutive 16-bit elements
-  // of one row, the warp reassembles each 8x8 matrix, and row r of matrix i goes
-  // to the address supplied by lane i*8+r -- the same lanes that would have
-  // supplied it to ldmatrix, so a fragment loaded by one can be stored by the
-  // other and land where it started.
+  // add, sub, mul and fma on four packed narrow floats (PTX ISA 9.7.6): each lane's operands decoded,
+  // combined exactly, and rounded to nearest-even into e5m2 or e4m3 (.satfinite clamps; without it an e4m3
+  // result past its largest finite value is NaN, an e5m2 one infinity). A sum of two values whose
+  // exponents are too far apart for a double breaks a rounding tie by the sign of what the double lost.
+  void exec_f8x4_arith(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpF8x4Arith& op, Mask m) {
+    Lanes sa, sb, sc;
+    const Lanes a = read_operand(w, ctx, ins, op.a, sa);
+    const Lanes b = read_operand(w, ctx, ins, op.b, sb);
+    const bool fma = op.kind == F8x4Op::Fma;
+    const Lanes c = fma ? Lanes(read_operand(w, ctx, ins, op.c, sc)) : Lanes{};
+    const Fp8Format& df = op.dfmt == NarrowFmt::E5M2 ? kE5M2 : kE4M3;
+    const auto element = [&](const F8x4Src& s, uint64_t reg, uint32_t i) -> double {
+      uint32_t code;
+      if (s.nibbles) code = static_cast<uint32_t>(reg >> (4 * i)) & 0xF;
+      else {
+        code = static_cast<uint32_t>(reg >> (8 * i)) & 0xFF;
+        if (s.padded_nibble) code &= 0xF;
+      }
+      switch (s.fmt) {
+        case NarrowFmt::E4M3: return fp8_to_double(code, kE4M3);
+        case NarrowFmt::E5M2: return fp8_to_double(code, kE5M2);
+        case NarrowFmt::E2M3: return small_float_value(code & 0x3F, 2, 3, 1);
+        case NarrowFmt::E3M2: return small_float_value(code & 0x3F, 3, 2, 3);
+        case NarrowFmt::E2M1: return small_float_value(code & 0xF, 2, 1, 1);
+        case NarrowFmt::UE8M0: return code == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(code) - 127);
+        default: return 0.0;
+      }
+    };
+    Lanes r;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      uint32_t out = 0;
+      for (uint32_t i = 0; i < 4; ++i) {
+        const double x = element(op.asrc, a[lane], i), y = element(op.bsrc, b[lane], i);
+        double v;
+        switch (op.kind) {
+          case F8x4Op::Add: v = x + y; break;
+          case F8x4Op::Sub: v = x - y; break;
+          case F8x4Op::Mul: v = x * y; break;
+          default: {
+            const double z = fp8_to_double((static_cast<uint32_t>(c[lane]) >> (8 * i)) & 0xFF, df);
+            const double p = x * y;   // exact: at most 8 bits by 8
+            v = p + z;
+            if (std::isfinite(p) && std::isfinite(z) && std::isfinite(v)) {   // the sum's rounding error, as a nudge
+              const double bb = v - p, err = (p - (v - bb)) + (z - bb);
+              if (err != 0) v = std::nextafter(v, err > 0 ? INFINITY : -INFINITY);
+            }
+          }
+        }
+        if (op.kind == F8x4Op::Add || op.kind == F8x4Op::Sub) {
+          if (std::isfinite(x) && std::isfinite(y) && std::isfinite(v)) {
+            const double yy = op.kind == F8x4Op::Sub ? -y : y;
+            const double bb = v - x, err = (x - (v - bb)) + (yy - bb);
+            if (err != 0) v = std::nextafter(v, err > 0 ? INFINITY : -INFINITY);
+          }
+        }
+        out |= double_to_fp8(v, df, op.satfinite) << (8 * i);
+      }
+      r[lane] = out;
+    }
+    write_reg(w, op.dst, m, r, 32);
+  }
+
   // spcompress (PTX ISA 9.4, 9.7.10.30; figure 43): per thread, every group of four
   // elements of `data` gives its two selected ones, in index order, to `cdata`
   // and their indices to `mdata` (low bits first, group after group). The
@@ -6707,6 +6769,11 @@ class Interpreter {
     for (size_t i = 0; i < op.data.size(); ++i) write_reg(w, op.data[i], m, data[i], 32);
   }
 
+  // stmatrix: the inverse. Every lane hands over two consecutive 16-bit elements
+  // of one row, the warp reassembles each 8x8 matrix, and row r of matrix i goes
+  // to the address supplied by lane i*8+r -- the same lanes that would have
+  // supplied it to ldmatrix, so a fragment loaded by one can be stored by the
+  // other and land where it started.
   void exec_stmatrix(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpStMatrix& op, Mask m) {
     Lanes _s_base;
     // A copy, not a reference: reading the source registers below goes through
@@ -12678,10 +12745,11 @@ void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetc
 std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a) { return surface_at(d, a); }
 
 // A f32 rounded toward zero to a half: the top ten mantissa bits, a magnitude past the largest finite
-// half the largest finite one (an RTX 3060's sust.p), and a NaN keeping the top of its payload.
+// half the largest finite one (an RTX 3060's sust.p), and a NaN keeping the top ten bits of its payload (quiet
+// or not; a payload that truncates to nothing becomes 1, so it stays a NaN).
 static uint16_t f32_to_f16_rz(uint32_t b) {
   const uint32_t s = b >> 31, e = (b >> 23) & 0xFF, m = b & 0x7FFFFF;
-  if (e == 0xFF) return static_cast<uint16_t>((s << 15) | 0x7C00 | (m ? std::max<uint32_t>(m >> 13, 0x200u) : 0u));
+  if (e == 0xFF) return static_cast<uint16_t>((s << 15) | 0x7C00 | (m ? std::max<uint32_t>(m >> 13, 1u) : 0u));
   const int ex = static_cast<int>(e) - 127;
   if (ex > 15) return static_cast<uint16_t>((s << 15) | 0x7BFF);
   if (ex >= -14) return static_cast<uint16_t>((s << 15) | (static_cast<uint32_t>(ex + 15) << 10) | (m >> 13));

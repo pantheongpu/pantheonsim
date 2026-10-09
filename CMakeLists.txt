@@ -2273,6 +2273,13 @@ set_tests_properties(e2e_surface_formatted PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# PTX ISA 9.2's packed integer instructions on a simulated RTX 5090, SASS and PTX, against a host loop.
+add_test(NAME e2e_packed_int_forms COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_packed_int_forms.sh)
+set_tests_properties(e2e_packed_int_forms PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # SASS by default, PTX the fallback: which code a binary runs, by what it
 # carries, what the SASS executor runs, and VGPU_SASS's overrides.
 add_test(NAME e2e_sass_path

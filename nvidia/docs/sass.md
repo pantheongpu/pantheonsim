@@ -100,7 +100,10 @@ What does run, besides the plain forms: texture fetches with an offset (`.AOFFI`
 packed register after the LOD), a depth reference (`.DC`), a residency predicate and
 half-precision results (`.F16.RN`, before sm_90); `SUST.P`; and a cooperative launch
 (`cudaLaunchAttributeCooperative`) of clusters, every block resident, each cluster with
-its own barrier and distributed shared memory. `executes()` lists the opcodes the
+its own barrier and distributed shared memory; and, on sm_120f, the packed integer
+`VIADD`/`VIMNMX` forms (a lane at a time: 8- and 16-bit lanes, `.SAT`, negated A,
+`.RELU`; derived from ptxas output for the PTX forms, compared with a host loop,
+not checked against a card). `executes()` lists the opcodes the
 executor runs; a decoded opcode outside it (`HMNMX2`, `F2IP`, `JMP`, `LDGMC` --
 the first three no decoder produces) takes the kernel to its PTX, and the "not
 implemented yet" faults at the foot of the instruction groups are unreachable for
