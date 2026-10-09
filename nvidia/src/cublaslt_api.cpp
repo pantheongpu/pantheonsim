@@ -1036,6 +1036,13 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
                         const MatrixLayout& ld, bool at_matmul) {
   if (!known_type(la.type) || !known_type(lb.type) || !known_type(lc.type) || !known_type(ld.type))
     return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Measured on an RTX 3060 (every type, int8 included): a scale or amax pointer, an auxiliary scale, or a
+  // scale mode other than the scalar one on a matmul with no FP8 or FP4 operand or output is INVALID_VALUE.
+  if (!narrow(la.type) && !narrow(lb.type) && !narrow(lc.type) && !narrow(ld.type) &&
+      (md.a_scale || md.b_scale || md.c_scale || md.d_scale || md.amax_d || md.aux_scale || md.aux_amax || md.d_out_scale ||
+       md.a_scale_mode != kScaleScalar || md.b_scale_mode != kScaleScalar || md.c_scale_mode != kScaleScalar ||
+       md.d_scale_mode != kScaleScalar || md.d_out_scale_mode != kScaleScalar))
+    return CUBLAS_STATUS_INVALID_VALUE;
   if (narrow_involved(md, la, lb, lc, ld)) {
     const int cc = device_cc();
     if (cc) {

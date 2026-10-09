@@ -303,8 +303,10 @@ void run(const Spec& s) {
   if (ls) line += " layout=" + std::to_string(ls);
 
   const float alpha = s.alpha, beta = s.beta;
-  const void* pa = s.pointer_mode ? (const void*)dAlpha.p : (const void*)&alpha;
-  const void* pb = s.pointer_mode ? (const void*)dBeta.p : (const void*)&beta;
+  const int32_t ialpha = (int32_t)s.alpha, ibeta = (int32_t)s.beta;   // an int32 scale type takes int32 scalars
+  const bool int_scalars = s.stype == CUDA_R_32I;
+  const void* pa = s.pointer_mode ? (const void*)dAlpha.p : int_scalars ? (const void*)&ialpha : (const void*)&alpha;
+  const void* pb = s.pointer_mode ? (const void*)dBeta.p : int_scalars ? (const void*)&ibeta : (const void*)&beta;
   const int ms = (int)cublasLtMatmul(g_lt, desc, pa, dA.p, LA, dB.p, LB, pb, s.c_null ? nullptr : dC.p, LC, dD.p, LD,
                                      got > 0 ? &hr.algo : nullptr, g_ws, kWs, 0);
   const cudaError_t sync = cudaDeviceSynchronize();
@@ -440,7 +442,7 @@ void fp8_cases() {
   // Dimensions and alignment.
   const int dims[][3] = {{16, 16, 16}, {8, 8, 8},    {8, 8, 16},  {16, 16, 8},  {24, 24, 24}, {32, 16, 48}, {17, 16, 16},
                          {16, 17, 16}, {16, 16, 17}, {4, 4, 16},  {1, 1, 16},   {64, 8, 64},  {64, 64, 128}, {128, 128, 128},
-                         {256, 128, 256}, {16, 64, 16}, {48, 80, 32}, {12, 12, 12}, {64, 64, 24}, {64, 64, 40}};
+                         {256, 128, 256}, {16, 64, 16}, {48, 80, 32}, {12, 12, 12}, {64, 64, 24}, {64, 64, 40}, {512, 256, 512}};
   for (auto& d : dims) {
     Spec s; s.m = d[0]; s.n = d[1]; s.k = d[2];
     add(s, "fp8dims", "TN_" + std::to_string(d[0]) + "x" + std::to_string(d[1]) + "x" + std::to_string(d[2]));
@@ -484,6 +486,26 @@ void fp8_cases() {
   { Spec s; s.stype = T_F16; add(s, "fp8compute", "scale_f16"); }
   { Spec s; s.stype = T_BF16; add(s, "fp8compute", "scale_bf16"); }
   { Spec s; s.compute = CUBLAS_COMPUTE_64F; s.stype = CUDA_R_64F; add(s, "fp8compute", "64F"); }
+}
+
+// Scale and amax pointers on a matmul that is not FP8: the library either accepts and ignores them or refuses,
+// and a framework that sets them for every dtype needs to know which.
+void plain_scales() {
+  for (int t : {T_F16, T_BF16, T_F32}) {
+    Spec b; b.at = b.bt = b.ct = b.dt = t; b.a_scale = b.b_scale = false;
+    add(b, "plainscales", tn(t) + "_none");
+    Spec s = b; s.a_scale = true; add(s, "plainscales", tn(t) + "_a");
+    s.b_scale = true; add(s, "plainscales", tn(t) + "_ab");
+    s = b; s.d_scale = true; add(s, "plainscales", tn(t) + "_d");
+    s = b; s.amax = true; add(s, "plainscales", tn(t) + "_amax");
+    s = b; s.c_scale = true; s.beta = 1.f; add(s, "plainscales", tn(t) + "_c_beta1");
+    s = b; s.epilogue = EP_GELU_AUX; s.aux_scale = true; add(s, "plainscales", tn(t) + "_aux_scale");
+    s = b; s.epilogue = EP_GELU_AUX; s.aux_amax = true; add(s, "plainscales", tn(t) + "_aux_amax");
+    s = b; s.am = M_OUTER; s.bm = M_OUTER; s.a_scale = s.b_scale = true; add(s, "plainscales", tn(t) + "_outer");
+  }
+  { Spec s; s.at = s.bt = CUDA_R_8I; s.ct = s.dt = CUDA_R_32I; s.compute = CUBLAS_COMPUTE_32I; s.stype = CUDA_R_32I; s.ta = 0; s.tb = 0;
+    s.a_scale = s.b_scale = false; add(s, "plainscales", "i8_none");
+    s.a_scale = true; add(s, "plainscales", "i8_a"); }
 }
 
 void fp8_epilogues() {
@@ -698,6 +720,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--specs")) specs = true;
   }
   fp8_cases();
+  plain_scales();
   fp8_epilogues();
   block_cases();
   if (list || specs) {
