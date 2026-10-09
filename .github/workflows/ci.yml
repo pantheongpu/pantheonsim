@@ -223,7 +223,8 @@ jobs:
     name: ollama on every GPU
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
     if: ${{ !inputs.nvidia_only }}
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
     timeout-minutes: 90
     # The toolchain image (.github/ci-image), or, when there is none, the
@@ -305,7 +306,8 @@ jobs:
     name: ollama on ${{ matrix.gpu }}
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
     if: ${{ !inputs.nvidia_only }}
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # A simulated GPU takes some 3 to 17 minutes to load a model and generate
     # three tokens, so each GPU has a job of its own.
     timeout-minutes: 120
