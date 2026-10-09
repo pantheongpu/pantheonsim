@@ -69,6 +69,7 @@
 #include <cuda_runtime.h>
 
 #include "complex_linalg.hpp"
+#include "cusolver_metis.hpp"
 
 namespace {
 
@@ -969,11 +970,10 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrissymHost(cusolverSpHandle_t h, int m
 // permutations NVIDIA's do (see rcm, approximate_minimum_degree and below);
 // symmdq is exact minimum degree (lowest index on a tie) followed by the
 // elimination tree's postorder, identical on the same 100 matrices.
-// csrmetisndHost runs METIS 5.1.0's METIS_NodeND with default options on the
-// pattern of A + A^T without its diagonal (a reference METIS 5.1.0 build gave
-// NVIDIA's permutation on 99 of those 100). VirtualGPU carries no METIS, so
-// metisnd returns symmdq's permutation: a correct fill-reducing ordering, not
-// METIS's.
+// csrmetisndHost runs METIS 5.1.0's METIS_NodeND (the vendored copy in
+// nvidia/third_party/metis, built with 64-bit indices as NVIDIA's is) on the
+// pattern of A + A^T without its diagonal, columns ascending; a reference
+// METIS 5.1.0 build gave NVIDIA's permutation on 99 of 100 test matrices.
 static cusolverStatus_t ordering(cusolverSpHandle_t h, int n, int nnz, cusparseMatDescr_t d, const int* off,
                                  const int* col, int* p, int reorder) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
@@ -999,8 +999,35 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrsymamdHost(cusolverSpHandle_t h, int 
 }
 VGPU_EXPORT cusolverStatus_t cusolverSpXcsrmetisndHost(cusolverSpHandle_t h, int n, int nnz,
                                                        const cusparseMatDescr_t d, const int* off, const int* col,
-                                                       const int64_t*, int* p) {
-  return ordering(h, n, nnz, d, off, col, p, 3);
+                                                       const int64_t* options, int* p) {
+  // The arguments, as an RTX 3060's cuSOLVER 13.0 answers them (measured):
+  // n <= 0 or nnz = 0 is INVALID_VALUE, a negative nnz ALLOC_FAILED, a NULL
+  // matrix descriptor MATRIX_TYPE_NOT_SUPPORTED, a non-general type likewise.
+  // It takes a pattern whose offsets disagree with nnz, or whose columns are
+  // out of range, and reads past the arrays; this refuses them
+  // (INVALID_VALUE). A NULL p crashes it. An options array that asks for
+  // Fortran numbering (METIS_OPTION_NUMBERING = 1) crashes it, because the
+  // arrays it hands METIS are zero-based: INVALID_VALUE here.
+  if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
+  if (!d) return CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED;
+  if (n <= 0) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (nnz < 0) return CUSOLVER_STATUS_ALLOC_FAILED;
+  if (nnz == 0 || !p) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (options && options[17 /* METIS_OPTION_NUMBERING */] == 1) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (const cusolverStatus_t st = check_descr(d); st != CUSOLVER_STATUS_SUCCESS) return st;
+  std::vector<int> o, c;
+  if (!read_pattern(n, n, nnz, d, off, col, false, &o, &c)) return CUSOLVER_STATUS_INVALID_VALUE;
+  const auto g = symmetric_graph(n, o, c);
+  std::vector<int64_t> xadj(1, 0), adj;
+  for (const auto& nb : g) {
+    adj.insert(adj.end(), nb.begin(), nb.end());
+    xadj.push_back((int64_t)adj.size());
+  }
+  std::vector<int64_t> perm, iperm;
+  if (vgpu::cusolver_metis::node_nd(n, xadj, adj, options, &perm, &iperm) != 1 /* METIS_OK */)
+    return CUSOLVER_STATUS_INTERNAL_ERROR;
+  for (int i = 0; i < n; ++i) p[i] = (int)perm[(size_t)i];
+  return CUSOLVER_STATUS_SUCCESS;
 }
 
 // B = P A Q^T in place: row i of B is row p[i] of A, column j of B column q[j]

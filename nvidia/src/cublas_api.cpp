@@ -620,6 +620,80 @@ VGPU_EXPORT void cublasXerbla(const char* srName, int info) {
 
 /* ---- GEMM ---- */
 
+// cublasUint8gemmBias: the deprecated 8-bit GEMM with offsets. The header
+// declares it and gives no formula; this is what an RTX 3060's cuBLAS 13.0
+// does, measured (10,505 outputs over random shapes, operations and offsets,
+// all matching; nvidia/tests/e2e/blas_u8gemm_paths.cu):
+//   acc    = sum_p (op(A)[i,p] - A_bias) * (op(B)[p,j] - B_bias)
+//   C[i,j] = clamp(round_half_up((acc + C_bias) * C_mult / 2^C_shift), 0, 255)
+// C is not read. C_shift counts modulo 32 (32 is 0, 33 is 1), except 31, which
+// gives 0 whatever the product; a conjugate transpose is the transpose; a
+// transposed C (transc) is stored n x m. The product is exact in 64 bits.
+// Bad arguments print BLAS's message on standard output, numbered as the card
+// numbers them (transa 1, transb 2, transc 3, m 4, n 5, k 6, lda 8, ldb 10,
+// ldc 13; A_bias, B_bias and the pointers are never checked) and answer
+// INVALID_VALUE. A null pointer is refused here; the card takes it and faults
+// on the device.
+namespace {
+unsigned char u8gemm_scale(int64_t acc, int c_bias, int c_mult, int c_shift) {
+  const __int128 p = static_cast<__int128>(acc + c_bias) * c_mult;
+  const int s = c_shift & 31;
+  __int128 r;
+  if (s == 0) r = p;
+  else if (s == 31) r = 0;
+  else r = (p + (static_cast<__int128>(1) << (s - 1))) >> s;
+  return static_cast<unsigned char>(r < 0 ? 0 : r > 255 ? 255 : r);
+}
+int u8gemm_bad_arg(int ta, int tb, int tc, int m, int n, int k, int lda, int ldb, int ldc) {
+  auto op_ok = [](int t) { return t == CUBLAS_OP_N || t == CUBLAS_OP_T || t == CUBLAS_OP_C; };
+  if (!op_ok(ta)) return 1;
+  if (!op_ok(tb)) return 2;
+  if (!op_ok(tc)) return 3;
+  if (m < 0) return 4;
+  if (n < 0) return 5;
+  if (k < 0) return 6;
+  if (lda < std::max(1, ta == CUBLAS_OP_N ? m : k)) return 8;
+  if (ldb < std::max(1, tb == CUBLAS_OP_N ? k : n)) return 10;
+  if (ldc < std::max(1, tc == CUBLAS_OP_N ? m : n)) return 13;
+  return 0;
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasUint8gemmBias(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb,
+                                               cublasOperation_t transc, int m, int n, int k, const unsigned char* A,
+                                               int A_bias, int lda, const unsigned char* B, int B_bias, int ldb,
+                                               unsigned char* C, int C_bias, int ldc, int C_mult, int C_shift) {
+  if (!valid(h)) return CUBLAS_STATUS_NOT_INITIALIZED;
+  const int ta = enum_value(transa), tb = enum_value(transb), tc = enum_value(transc);
+  if (const int bad = u8gemm_bad_arg(ta, tb, tc, m, n, k, lda, ldb, ldc)) {
+    cublasXerbla("UINT8_GEMM", bad);
+    return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  if (deferred_to_graph(h, [=] {
+        cublasUint8gemmBias(h, transa, transb, transc, m, n, k, A, A_bias, lda, B, B_bias, ldb, C, C_bias, ldc,
+                            C_mult, C_shift);
+      }))
+    return CUBLAS_STATUS_SUCCESS;
+  if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+  if (!C || (k && (!A || !B))) return CUBLAS_STATUS_INVALID_VALUE;
+  const bool tA = ta != CUBLAS_OP_N, tB = tb != CUBLAS_OP_N, tC = tc != CUBLAS_OP_N;
+  const auto hA = fetch<unsigned char>(A, tA ? extent(lda, m, k) : extent(lda, k, m));
+  const auto hB = fetch<unsigned char>(B, tB ? extent(ldb, k, n) : extent(ldb, n, k));
+  auto hC = fetch<unsigned char>(C, tC ? extent(ldc, m, n) : extent(ldc, n, m));
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      int64_t acc = 0;
+      for (int p = 0; p < k; ++p) {
+        const int a = hA[tA ? idx(p, i, lda) : idx(i, p, lda)];
+        const int b = hB[tB ? idx(j, p, ldb) : idx(p, j, ldb)];
+        acc += static_cast<int64_t>(a - A_bias) * (b - B_bias);
+      }
+      hC[tC ? idx(j, i, ldc) : idx(i, j, ldc)] = u8gemm_scale(acc, C_bias, C_mult, C_shift);
+    }
+  store(C, hC);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 VGPU_EXPORT cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta,
                                           cublasOperation_t tb, int m, int n, int k,
                                           const float* alpha, const float* A, int lda,

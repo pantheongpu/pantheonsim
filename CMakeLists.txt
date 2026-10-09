@@ -566,8 +566,22 @@ if(CUDA_ABI_INCLUDE)
   # cusolverSp is part of libcusolver and reads cuSPARSE's matrix descriptors
   # through cuSPARSE's getters, so like NVIDIA's libcusolver it links
   # libcusparse.
-  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp nvidia/src/cusolver_rf.cpp)
+  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp nvidia/src/cusolver_rf.cpp nvidia/src/cusolver_metis.cpp)
   target_link_libraries(vgpucusolver PRIVATE vgpucusparse)
+  # cusolverSpXcsrmetisndHost is NVIDIA's wrapper of METIS_NodeND, and so is
+  # ours: METIS 5.1.0 (Apache-2.0), vendored with only what NodeND reaches and
+  # built with hidden visibility into libcusolver -- see
+  # nvidia/third_party/metis/README.md.
+  set(_metis_dir "${CMAKE_SOURCE_DIR}/nvidia/third_party/metis")
+  file(GLOB _metis_srcs "${_metis_dir}/libmetis/*.c" "${_metis_dir}/GKlib/*.c")
+  add_library(vgpumetis OBJECT ${_metis_srcs})
+  target_include_directories(vgpumetis PRIVATE "${_metis_dir}/include" "${_metis_dir}/GKlib" "${_metis_dir}/libmetis")
+  target_compile_definitions(vgpumetis PRIVATE LINUX _FILE_OFFSET_BITS=64 _GNU_SOURCE NDEBUG NDEBUG2)
+  target_compile_options(vgpumetis PRIVATE -std=gnu99 -O2 -fno-strict-aliasing -fvisibility=hidden -w)
+  set_target_properties(vgpumetis PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+  target_sources(vgpucusolver PRIVATE $<TARGET_OBJECTS:vgpumetis>)
+  target_include_directories(vgpucusolver PRIVATE "${_metis_dir}/include")
+  target_link_libraries(vgpucusolver PRIVATE m)
   # cusolverMg gathers a distributed matrix and runs cusolverDn on it.
   target_link_libraries(vgpucusolvermg PRIVATE vgpucusolver)
   # cuFFT's LTO callbacks: the callback image's PTX is read (fatbin.cpp) and
@@ -1804,7 +1818,8 @@ if(TARGET vgpucublas)
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_attention:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet")
+                          "cutensornet_paths:cutensornet" "solver_metis_paths:cusolver:cusparse"
+                          "blas_u8gemm_paths:cublas")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
