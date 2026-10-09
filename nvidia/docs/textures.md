@@ -262,7 +262,7 @@ written 0. There is no `suld.p`: ptxas of CUDA 13 does not assemble one.
 An array may be made from any channel descriptor (`cudaChannelFormatKind*`) or driver format
 (`CU_AD_FORMAT_*`) the card accepts, through one table (`nvidia/src/texture_formats.hpp`) that
 the runtime and the driver share: unsigned and signed normalized 8- and 16-bit formats, BC1 to
-BC5 (each with its sRGB variant where there is one), BC6H and BC7 (arrays only), and 10:10:10:2.
+BC5, BC6H and BC7 (each with its sRGB variant where there is one), and 10:10:10:2.
 What a descriptor makes, which read modes, filters and sRGB flags a format takes, the errors
 (`cudaErrorInvalidChannelDescriptor`, `cudaErrorInvalidNormSetting` for a read mode the format
 cannot be read in, `cudaErrorInvalidFilterSetting`) and the driver's own answers (a format fixes
@@ -270,9 +270,13 @@ its channel count; linear and pitched memory take the plain formats and 10:10:10
 data cannot be a surface or have the surface flag) are the card's, recorded in
 `runtime_texture_gaps_expected.inc` and `driver_texture_gaps_expected.inc`.
 
-The values are the card's. The block decoders (`include/vgpu/exec/block_compression.hpp`) are not
-the format descriptions' integer formulas: every number was measured with point-sampled blocks
-covering every endpoint pair of every channel, and the decoders reproduce them value for value.
+The values are the card's. For BC1 to BC5 the block decoders (`include/vgpu/exec/block_compression.hpp`)
+are not the format descriptions' integer formulas: every number was measured with point-sampled blocks
+covering every endpoint pair of every channel, and the decoders reproduce them value for value. BC6H
+and BC7 are the opposite: the card follows the specification (the partition, anchor and bit-position
+tables in `include/vgpu/exec/bc67_tables.hpp` are generated from the specification's tables by
+`scripts/gen_bc67_tables.py`), and random blocks of every mode, decoded by the card and by the header,
+agree texel for texel. Filtering BC6H uses the half-float blend measured for half textures, BC7 the 8-bit one.
 
 | Format | What the texture unit delivers |
 | --- | --- |
@@ -281,6 +285,8 @@ covering every endpoint pair of every channel, and the decoders reproduce them v
 | BC3 alpha | 8-bit: `floor((a0 * 2048 + (a1 - a0) * N + 1024) / 2048)`, N = 289, 578, 892, 1156, 1470, 1759 (eight values) or 385, 770, 1278, 1663 (six values and the two ends) |
 | BC4, BC5 unsigned | 16-bit: `a0 * (257 - W) + a1 * W` with W = 36, 72, 113, 144, 185, 221 (eight values) or 48, 96, 161, 209 (six values, then 0 and 65535) |
 | BC4, BC5 signed | 16-bit signed: endpoints widen by 32767/127 (-128 reads as -127) and blend with the same steps in that scale, rounded to nearest |
+| BC7 | 8-bit, and exactly the specification's (Khronos Data Format Specification, "BPTC Compressed Texture Image Formats"): P-bits and endpoint widening, the 2/3/4-bit weight tables with `(64 - w) * e0 + w * e1 + 32) >> 6`, rotation, index selection, anchor indices. Checked on 1.6 million random blocks of all eight modes, and a low byte of zero (all channels 0) |
+| BC6H | three half floats (the raw bits come out of the block), alpha 1.0. The specification's endpoint unquantization, wrap-around deltas, 6-bit weights and final `31/64` (unsigned) or `31/32` (signed) scaling, with one difference: a negative value whose scaled magnitude is zero comes out as +0, not -0. The reserved mode numbers 19, 23, 27 and 31 return (0, 0, 0, 1). Checked on 3 million random blocks of all 14 modes |
 | 10:10:10:2 | normalized floats; filtering widens the codes by bit replication to 16 bits (`(u << 6) \| (u >> 4)`), as the card does |
 
 Linear filtering, wrapped and mirrored addressing of all of these return exactly the card's
@@ -326,26 +332,42 @@ within a level (point or linear). The fetch itself is the same as without anisot
 forms), both texel types, both filters, 17 `maxAnisotropy` values, 18 biases against each
 threshold, fractional biases and clamps -- in both engines against the card's hashes.
 
+## tex.grad
+
+The level of detail of a fetch with explicit gradients (`tex2DGrad` and friends) is derived from them by the
+texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D and 2D textures, layered or
+not, of power-of-two size (the program `texture_grad` hashes 288,000 fetches of the card on both engines). It was
+found by reading the level of detail straight off the card: a mipmapped texture whose level k holds the constant
+k, filtered trilinearly, returns the LOD in 1/256ths of a level itself, and about 5 million such fetches (random
+and gridded gradients of every size, sign and relation) were fitted. What the card does is in
+`include/vgpu/exec/texture_grad.hpp`: every gradient component is cut to 10 significant bits; the length of a
+gradient is the larger component plus 11/32 of the smaller (the smaller's mantissa times 11/8, rounded half up);
+the largest of the lengths of dPdx and dPdy and 11/16 of the lengths of dPdx + dPdy and dPdx - dPdy (the quad's
+diagonals; their components are added with one guard bit below the larger's last bit) is taken; and log2 of it
+comes from a 256-entry table indexed by the top 8 bits of the mantissa, added to 256 times the exponent. The result
+is truncated to 1/256ths like an explicit LOD, then the level bias and clamps apply as for `tex.level`; a gradient of
+zero (or NaN) is a level of minus infinity, an infinite one the last level. A texture that is not mipmapped is
+fetched at level 0 whatever the gradients. The level of a gradient is not `log2` of its Euclidean length: a pair
+of parallel gradients along one axis reads 1.375 times as long as either, the octagonal norm that earlier
+measurements ran into.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
 
-- **`tex.grad`.** The level of detail comes out of the GPU's approximate log2 and
-  length units, and 12,000 fetches of an RTX 3060 on a texture whose levels each hold
-  their own number do not follow any formula tried: with one dominant gradient it is
-  the log2 of its length to within a few 256ths, but with two comparable ones it
-  runs up to 25% longer than either, and neither the Euclidean length nor the largest
-  component nor an alpha-max-beta-min sum of one gradient explains it.
+- **`tex.grad` beyond the cases that are exact.** 1D and 2D textures (and their layered forms; SASS `TXD`) of
+  power-of-two size derive their level of detail from the gradients exactly as the card does (below). Not
+  reproduced, and refused by name: 3D and cube textures (the card's length of three gradient components is
+  larger + 11/32 middle + 1/4 smallest to a part in a thousand, but its rounding was not recovered, and ptxas
+  builds those fetches from quads of `TEX.NDV` instructions in SASS); textures whose size is not a power of two
+  (the card's product of a gradient and the size is rounded in a way that none of the pipelines tried
+  reproduces: about one fetch in ten differs by one or two 256ths of a level); and a texture with
+  `maxAnisotropy` above 1 (the card then filters along the major axis of the gradients' ellipse).
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.
 - `tld4` on layered or cubemap textures (the runtime refuses a gather array
   that is layered or a cubemap, so there is nothing to measure them on).
-- **BC6H and BC7.** Arrays of these formats can be made, filled and copied, but
-  creating a texture object over one answers `cudaErrorNotSupported` /
-  `CUDA_ERROR_NOT_SUPPORTED` with a message on stderr (once). Their decoders need
-  the mode and partition tables, which were not measured (they can be, one
-  partition at a time, from the card).
 
 ## Surfaces out of range: .trap, .clamp and .zero
 

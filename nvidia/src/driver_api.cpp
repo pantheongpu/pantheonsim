@@ -4359,18 +4359,6 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
         return static_cast<CUresult>(e);
       d.read_as_normalized_float = d.read_as_normalized_float || format.norm_only || format.packed_1010102;
     }
-    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
-    // sampled here: their decoders are not written. Say so, by name, once (the real driver takes them).
-    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
-        d.block == vgpu::exec::BlockFormat::BC7) {
-      static std::once_flag said;
-      std::call_once(said, [&] {
-        if (!quiet())
-          std::fprintf(stderr, "[vgpu] %s: textures of BC6H and BC7 blocks are not implemented (BC1 to BC5 are); "
-                               "returning CUDA_ERROR_NOT_SUPPORTED\n", name);
-      });
-      return CUDA_ERROR_NOT_SUPPORTED;
-    }
     const uint64_t handle = next_texobj++;
     current(s).textures()[handle] = d;
     *out = handle;

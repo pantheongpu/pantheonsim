@@ -4762,13 +4762,8 @@ class Parser {
         else if (auto t2 = parse_type_token(p)) types.push_back(p);
         else return unsupported("tex modifier '." + p + "'");
       }
-      if (grad)
-        return unsupported("tex.grad: the level of detail an RTX 3060 derives from gradients is "
-                           "not a function of their lengths that this could reproduce -- it grows "
-                           "with the second-largest component in ways that depend on both "
-                           "gradients (measured over 12,000 fetches), and a level off by a few "
-                           "256ths changes the filtered result. Refused rather than approximated "
-                           "(tex.level and plain fetches of mipmapped textures are implemented)");
+      if (grad && level) return unsupported("tex with both .level and .grad");
+      if (grad && op0 == "tld4") return unsupported("tld4 takes no gradients");
       if (!dims) return unsupported("tex geometry");
       if (f16x2) {
         if (!v2 || op0 == "tld4") return unsupported("f16x2 results are tex.v2.f16x2");
@@ -4819,6 +4814,18 @@ class Parser {
         op.level = true;
         expect_punct(",");
         op.lod = parse_operand();
+      }
+      if (grad) {
+        // dPdx, dPdy: a vector of floats each, as many as the geometry has coordinates (a 3D or cube texture's
+        // are four wide, the last one unused).
+        op.grad = true;
+        expect_punct(",");
+        op.ddx = parse_operand_vector_any();
+        expect_punct(",");
+        op.ddy = parse_operand_vector_any();
+        if (op.ddx.size() < dims || op.ddy.size() < dims)
+          return unsupported("tex.grad's gradient vectors are shorter than the texture's dimensions");
+        if (!ctype.is_float()) return unsupported("tex.grad takes float coordinates");
       }
       // {, e} {, f}: a braced offset vector, then a scalar depth reference
       // (either may come alone).

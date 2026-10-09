@@ -2493,6 +2493,14 @@ set_tests_properties(e2e_texture_forms PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# tex.grad (TXD in SASS, tex.grad in PTX; 1D and 2D, layered or not, power-of-two sizes): the level of detail the
+# card derives from explicit gradients, bit for bit, on both engines.
+add_test(NAME e2e_texture_grad COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_grad.sh)
+set_tests_properties(e2e_texture_grad PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
 # Formatted surface stores (sust.p): the values converted to every surface format, bit for bit
 # with an RTX 3060.
 add_test(NAME e2e_surface_formatted COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_surface_formatted.sh)

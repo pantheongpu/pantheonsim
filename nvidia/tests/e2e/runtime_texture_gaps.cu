@@ -1,13 +1,11 @@
 // Texture formats and objects the runtime answers as an RTX 3060's runtime does: which channel descriptors
 // make an array, which read modes, filters and sRGB flags each format takes, block-compressed textures
-// (BC1 to BC5 sampled; BC6H and BC7 only made), 10:10:10:2, resource views, and a descriptor's anisotropy.
+// (BC1 to BC7 sampled, BC6H and BC7 mode by mode), 10:10:10:2, resource views, and a descriptor's anisotropy.
 //
 // Every observation (an error code, or the FNV-1a hash of the values a set of fetches returned, as float
 // bits) is compared with what the card gave, recorded in runtime_texture_gaps_expected.inc
 // (`runtime_texture_gaps --print` prints the file). The same program passes against NVIDIA's runtime on a
-// card, which is how the file was made. A texture of BC6H or BC7 blocks is the one place the simulator
-// answers differently: it says cudaErrorNotSupported by name (its decoders are not written), and the check
-// reports that rather than failing.
+// card, which is how the file was made.
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -26,7 +24,7 @@ static const Expected kExpected[] = {
 };
 
 static bool g_print = false;
-static int g_checked = 0, g_failures = 0, g_unsupported_bc67 = 0;
+static int g_checked = 0, g_failures = 0;
 
 static void observe(const std::string& label, long long value) {
   if (g_print) {
@@ -41,14 +39,8 @@ static void observe(const std::string& label, long long value) {
     std::printf("FAIL %s: no expected value (observed %lld)\n", label.c_str(), value);
     ++g_failures;
   } else if (e->value != value) {
-    const bool bc67 = (label.find("BC6H") != std::string::npos || label.find("BC7") != std::string::npos) &&
-                      value == (long long)cudaErrorNotSupported;
-    if (bc67) {
-      ++g_unsupported_bc67;
-    } else {
-      std::printf("FAIL %s: expected %lld, observed %lld\n", label.c_str(), e->value, value);
-      ++g_failures;
-    }
+    std::printf("FAIL %s: expected %lld, observed %lld\n", label.c_str(), e->value, value);
+    ++g_failures;
   }
 }
 
@@ -258,11 +250,14 @@ struct Fmt {
   int kind, x, y, z, w;
   int block_bytes;
   bool srgb;
+  bool elem = false;   // BC6H is read as element type (floats), the others as normalized floats
 };
 static const Fmt kBc[] = {
     {"BC1", 17, 8, 8, 8, 8, 8, false},   {"BC1s", 18, 8, 8, 8, 8, 8, true},  {"BC2", 19, 8, 8, 8, 8, 16, false},
     {"BC3", 21, 8, 8, 8, 8, 16, false},  {"BC3s", 22, 8, 8, 8, 8, 16, true}, {"BC4u", 23, 8, 0, 0, 0, 8, false},
     {"BC4s", 24, 8, 0, 0, 0, 8, false},  {"BC5u", 25, 8, 8, 0, 0, 16, false}, {"BC5s", 26, 8, 8, 0, 0, 16, false},
+    {"BC6Hu", 27, 16, 16, 16, 0, 16, false, true}, {"BC6Hs", 28, 16, 16, 16, 0, 16, false, true},
+    {"BC7", 29, 8, 8, 8, 8, 16, false},  {"BC7s", 30, 8, 8, 8, 8, 16, true},
 };
 
 // An array of blocks_w x blocks_h blocks holding `blocks`, and a texture of it; false if it could not be made.
@@ -288,7 +283,7 @@ static bool make_bc(const Fmt& f, int bw, int bh, const std::vector<uint8_t>& bl
   cudaTextureDesc td = {};
   td.addressMode[0] = td.addressMode[1] = address;
   td.filterMode = filter;
-  td.readMode = cudaReadModeNormalizedFloat;
+  td.readMode = f.elem ? cudaReadModeElementType : cudaReadModeNormalizedFloat;
   td.sRGB = f.srgb;
   td.normalizedCoords = normalized;
   return cudaCreateTextureObject(&out->tex, &rd, &td, nullptr) == cudaSuccess;
@@ -361,7 +356,7 @@ static void bc_fetches() {
 static void bc_exhaustive() {
   // BC4 / BC5, unsigned and signed.
   for (const Fmt& f : kBc) {
-    if (f.kind < 21 || f.kind == 22) continue;   // BC3 (its alpha) and BC4, BC5
+    if (f.kind < 21 || f.kind == 22 || f.kind > 26) continue;   // BC3 (its alpha) and BC4, BC5
     const bool one = f.kind == 23 || f.kind == 24;
     const bool alpha = f.kind == 21;   // BC3: the alpha half
     const int bw = 64, bh = 64;
@@ -438,6 +433,68 @@ static void bc_exhaustive() {
       observe("bc-pairs/BC1-four-colour", fetch_hash(t.tex, grid_centres(bw * 4, bh * 4)));
     else
       observe("bc-pairs/BC1-four-colour", -1);
+  }
+}
+
+// BC7 and BC6H block by block of mode: for each mode (and the reserved encodings: a BC7 low byte of zero, the BC6H
+// mode numbers 19, 23, 27 and 31) 512 blocks of random bits with the mode bits forced and the partition cycling
+// through all of its values, point sampled at the texel centres and linearly filtered between them.
+static void bc67_modes() {
+  static const int kBc6hCodes[18] = {0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 3, 7, 11, 15, 19, 23, 27, 31};
+  static const int kBc7PartitionBits[8] = {4, 6, 6, 6, 0, 0, 0, 6};   // modes 0..7 (one subset: none)
+  const int bw = 32, bh = 16, w = bw * 4, h = bh * 4;
+  for (const Fmt& f : kBc) {
+    if (f.kind < 27) continue;
+    const bool is7 = f.kind >= 29;
+    const int modes = is7 ? 9 : 18;
+    for (int mode = 0; mode < modes; ++mode) {
+      g_lcg = 0x9E3779B97F4A7C15ull ^ ((uint64_t)f.kind << 8) ^ (uint64_t)mode;
+      std::vector<uint8_t> blocks = random_blocks((size_t)bw * bh * 16);
+      for (int i = 0; i < bw * bh; ++i) {
+        uint8_t* p = &blocks[(size_t)i * 16];
+        if (is7) {
+          if (mode == 8) {
+            p[0] = 0;
+          } else {
+            // The mode's marker bit (bit `mode`), zeros below it, the partition bits above it.
+            p[0] = (uint8_t)((p[0] & ~((1 << (mode + 1)) - 1)) | (1 << mode));
+            const int pb = kBc7PartitionBits[mode];
+            const unsigned part = (unsigned)i % (1u << pb);
+            for (int k = 0; k < pb; ++k) {
+              const int bit = mode + 1 + k;
+              p[bit / 8] = (uint8_t)((p[bit / 8] & ~(1 << (bit % 8))) | (((part >> k) & 1) << (bit % 8)));
+            }
+          }
+        } else {
+          const int c = kBc6hCodes[mode];
+          if (c < 2) p[0] = (uint8_t)((p[0] & ~3) | c);
+          else p[0] = (uint8_t)((p[0] & ~31) | c);
+          // The five partition bits are bits 77..81 in every two-subset mode.
+          const unsigned part = (unsigned)i % 32u;
+          for (int k = 0; k < 5; ++k) {
+            const int bit = 77 + k;
+            p[bit / 8] = (uint8_t)((p[bit / 8] & ~(1 << (bit % 8))) | (((part >> k) & 1) << (bit % 8)));
+          }
+        }
+      }
+      const std::string label = std::string("bc-modes/") + f.name + "/mode" + std::to_string(mode);
+      BcTex t;
+      if (!make_bc(f, bw, bh, blocks, cudaFilterModePoint, cudaAddressModeClamp, false, &t)) {
+        observe(label + "/point", -1);
+        continue;
+      }
+      observe(label + "/point", fetch_hash(t.tex, grid_centres(w, h)));
+      BcTex l;
+      if (make_bc(f, bw, bh, blocks, cudaFilterModeLinear, cudaAddressModeWrap, false, &l)) {
+        std::vector<float2> uv;
+        for (int y = 0; y < h; ++y)
+          for (int x = 0; x < w; ++x)
+            uv.push_back(make_float2(x + ((x * 7 + y * 13) % 32) / 32.0f - 1.5f, y + ((x * 11 + y * 5) % 32) / 32.0f + 0.5f));
+        observe(label + "/linear", fetch_hash(l.tex, uv));
+      } else {
+        observe(label + "/linear", -1);
+      }
+    }
   }
 }
 
@@ -551,12 +608,10 @@ int main(int argc, char** argv) {
   descriptor_fields();
   bc_fetches();
   bc_exhaustive();
+  bc67_modes();
   packed_1010102();
   views();
   if (g_print) return 0;
-  if (g_unsupported_bc67)
-    std::printf("note: %d observation(s) were cudaErrorNotSupported for BC6H / BC7 (not implemented here)\n",
-                g_unsupported_bc67);
   std::printf("%d observations checked, %d differ from the card\n", g_checked, g_failures);
   std::printf("%s\n", g_failures == 0 ? "PASS" : "FAIL");
   return g_failures == 0 ? 0 : 1;

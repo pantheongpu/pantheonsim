@@ -53,6 +53,7 @@
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
+#include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
 #include "vgpu/host_cpus.hpp"
@@ -1239,8 +1240,7 @@ uint64_t bc_texel_bits(const MemoryManager& mem, const TextureDesc& d, uint32_t 
   if (!t_bc.valid || t_bc.addr != addr || t_bc.format != d.block) {
     uint8_t raw[16];
     mem.read(addr, raw, bb);
-    if (!decode_block(d.block, raw, &t_bc.block))
-      tex_fail(Err::Unsupported, "a texture of BC6H or BC7 blocks: these two formats are not implemented (BC1 to BC5 are)");
+    if (!decode_block(d.block, raw, &t_bc.block)) tex_fail(Err::Unsupported, "a block-compressed texture of an unknown format");
     t_bc.valid = true;
     t_bc.addr = addr;
     t_bc.format = d.block;
@@ -7086,6 +7086,14 @@ class Interpreter {
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     Lanes _s_lod;
     const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
+    // .grad: dPdx and dPdy, one operand per spatial coordinate (a 3D or cube texture's vectors carry a fourth,
+    // unused one).
+    std::array<Lanes, 3> ddx, ddy, ddx_scratch, ddy_scratch;
+    if (op.grad)
+      for (uint32_t i = 0; i < op.dims; ++i) {
+        ddx[i] = read_operand(w, ctx, ins, op.ddx[i], ddx_scratch[i]);
+        ddy[i] = read_operand(w, ctx, ins, op.ddy[i], ddy_scratch[i]);
+      }
     std::array<Lanes, 3> offs;
     std::array<Lanes, 3> offs_scratch;
     const uint32_t noff = std::min<uint32_t>(3, static_cast<uint32_t>(op.offset.size()));
@@ -7115,6 +7123,13 @@ class Interpreter {
         f.lod = op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
                                     : static_cast<double>(static_cast<int32_t>((*lod)[lane]));
       f.gather = op.gather;
+      if (op.grad) {
+        f.grad = true;
+        for (uint32_t i = 0; i < op.dims; ++i) {
+          f.ddx[i] = static_cast<uint32_t>(ddx[i][lane]);
+          f.ddy[i] = static_cast<uint32_t>(ddy[i][lane]);
+        }
+      }
       // Offsets are two's complement fields, as ptxas packs them into a
       // register for the instruction: four bits for tex (-8..7, a register
       // holding more wraps: measured), six for tld4 (to be measured).
@@ -7131,7 +7146,7 @@ class Interpreter {
         f.offset[1] = static_cast<int32_t>((static_cast<uint32_t>(offs[0][lane]) >> 4 & 15u) ^ 8u) - 8;
       uint32_t r[4];
       try {
-        fetch_texel(mem_, d, f, r);
+        texture_fetch(mem_, d, f, r);   // the shared entry: it resets the block cache and resolves .grad
       } catch (const Error& e) {
         rethrow_with_context(e, ins, static_cast<int>(lane));
       }
@@ -13440,7 +13455,41 @@ const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, Te
 
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
   t_bc.valid = false;   // the memory a block was decoded from may have changed since the last fetch
-  fetch_texel(mem, d, f, out);
+  if (!f.grad) {
+    fetch_texel(mem, d, f, out);
+    return;
+  }
+  // tex.grad: the level of detail comes from the gradients (see exec/texture_grad.hpp for what is reproduced).
+  TexFetch g = f;
+  g.grad = false;
+  if (d.max_anisotropy > 1)
+    tex_fail(Err::Unsupported,
+             "tex.grad on a texture with maxAnisotropy above 1: the card then filters along the major axis of "
+             "the gradients' ellipse, which is not reproduced (set maxAnisotropy to 0 or 1)");
+  if (d.mip_levels == 0) {   // one level: the gradients choose nothing
+    fetch_texel(mem, d, g, out);
+    return;
+  }
+  if (f.cube || f.dims == 3)
+    tex_fail(Err::Unsupported,
+             "tex.grad on a 3D or cube texture: the card's length of three gradient components (larger + 11/32 "
+             "middle + 1/4 smallest, to a part in a thousand) was not reproduced bit for bit");
+  const bool one_d = f.dims == 1;
+  auto pow2 = [](uint32_t n) { return n != 0 && (n & (n - 1)) == 0; };
+  if (!pow2(d.width) || (!one_d && !pow2(d.height)))
+    tex_fail(Err::Unsupported,
+             "tex.grad on a texture whose size is not a power of two: the card scales the gradients by the size "
+             "in a way that rounds differently from every pipeline tried (about one fetch in ten differs by 1-2 "
+             "256ths of a level); a power of two is exact");
+  const double w = d.width, h = one_d ? 1.0 : d.height;
+  // A gradient in texels of the base level; an infinite gradient (1e300 here) times a size stays finite.
+  auto c = [](uint32_t bits, double scale) {
+    return std::clamp(tex_grad::component(std::bit_cast<float>(bits)) * scale, -1e300, 1e300);
+  };
+  g.explicit_lod = true;
+  g.lod = static_cast<double>(tex_grad::lod_q_2d(c(f.ddx[0], w), one_d ? 0.0 : c(f.ddx[1], h), c(f.ddy[0], w),
+                                                 one_d ? 0.0 : c(f.ddy[1], h))) / 256.0;
+  fetch_texel(mem, d, g, out);
 }
 
 std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a) { return surface_at(d, a); }

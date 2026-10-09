@@ -2325,6 +2325,18 @@ void dec_tld(Instr& ins, const Word& w) {
   tex_common(ins, w, true);
 }
 
+// TXD is tex.grad (1D, 2D and their layered forms; ptxas builds 3D and cube gradient fetches out of quads of
+// TEX instead): the coordinates in the register at 24 (the layer last), the gradients in four registers from
+// the one at 32, ordered ddx.x, ddy.x, ddx.y, ddy.y (a 1D texture uses the first two). It has no LOD mode.
+void dec_txd(Instr& ins, const Word& w) {
+  ins.op = Op::TXD;
+  ins.mnemonic = "TXD";
+  if (w.bit(60)) ins.mods.push_back("SCR");
+  tex_f16(ins, w);
+  tex_flags(ins, w);
+  tex_common(ins, w, true);
+}
+
 void dec_tld4(Instr& ins, const Word& w) {
   ins.op = Op::TLD4;
   ins.mnemonic = "TLD4";
@@ -3647,8 +3659,8 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x98c, [](Instr& i, const Word& w) { dec_atoms(i, w, false); }},
       {0x38d, [](Instr& i, const Word& w) { dec_atoms(i, w, true); }},
       {0xf8c, dec_atoms_popc},
-      {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb99, dec_suld}, {0xb9d, dec_sust}, {0xb9b, dec_sust_p},
-      {0xf60, dec_tex}, {0xf66, dec_tld}, {0xf63, dec_tld4}, {0xf99, dec_suld}, {0xf9d, dec_sust}, {0xf9b, dec_sust_p},
+      {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb6c, dec_txd}, {0xb99, dec_suld}, {0xb9d, dec_sust}, {0xb9b, dec_sust_p},
+      {0xf60, dec_tex}, {0xf66, dec_tld}, {0xf63, dec_tld4}, {0xf6c, dec_txd}, {0xf99, dec_suld}, {0xf9d, dec_sust}, {0xf9b, dec_sust_p},
       {0x34e, dec_lepc}, {0x98f, dec_cctl}, {0x31c, dec_b2r}, {0x3aa, dec_qspc}, {0x9aa, dec_qspc}, {0x9ab, dec_errbar},
       {0x942, dec_break}, {0x95c, dec_bpt},
       {0x3a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},
@@ -3783,6 +3795,12 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   }
   char b[64];
   std::snprintf(b, sizeof b, "SASS: unknown opcode 0x%03x (sm_%d)", opc, sm);
+  // BMOV (barrier registers) and FSWZADD are how ptxas builds tex.grad on a 3D or cube texture: a quad of TEX.NDV
+  // fetches with swizzled coordinates, whose implicit level of detail is not modelled.
+  if ((opc & 0xfff) == 0xf55)
+    throw Error(Err::UnsupportedPtx, std::string(b) + " -- BMOV, which ptxas emits around the quad of TEX.NDV fetches "
+                "that implement tex.grad on 3D and cube textures; those are not supported (VGPU_SASS=0 runs the PTX, "
+                "which refuses them by name too)");
   throw Error(Err::UnsupportedPtx, b);
 }
 

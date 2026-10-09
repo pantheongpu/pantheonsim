@@ -5468,18 +5468,6 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
     // integer array allows, and refuses the normalized one with cudaErrorInvalidNormSetting, whatever the
     // view is); what a fetch returns is the view's format, though.
     const vgpu::cuda::TexFormat checked_format = format;
-    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
-    // sampled here: their decoders are not written. Say so, by name, once (the real library takes them).
-    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
-        d.block == vgpu::exec::BlockFormat::BC7) {
-      static std::once_flag said;
-      std::call_once(said, [] {
-        if (!quiet())
-          std::fprintf(stderr, "[vgpu] cudaCreateTextureObject: textures of BC6H and BC7 blocks are not implemented "
-                               "(BC1 to BC5 are); returning cudaErrorNotSupported\n");
-      });
-      return cudaErrorNotSupported;
-    }
     bool normalized_read = false;
     if (tex) {
       for (int i = 0; i < 3; ++i)
