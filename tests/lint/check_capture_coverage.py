@@ -25,7 +25,7 @@ CAPTURE_AWARE = re.compile(
     r"\b(capture_active|capture_record|capture_refuse|capture_host_fn|capture_malloc|"
     r"capture_free|capture_wait|capture_event_node|capture_position|capture_target|"
     r"stream_capture|capture_info|update_capture_deps|vgpu_record_\w+|vgpu_drop_capture|"
-    r"launch_kernel_impl)\s*\(")
+    r"launch_kernel_impl|capture_array_box)\s*\(")
 
 # Stream functions that need no capture handling, each with why. Adding a name
 # here is a claim about CUDA's semantics, so it needs a reason that holds.
