@@ -4034,12 +4034,7 @@ bool format_of(const cudaChannelFormatDesc& f, vgpu::cuda::TexFormat* out) {
   return vgpu::cuda::texture_format_from_runtime(static_cast<int>(f.f), f.x, f.y, f.z, f.w, out);
 }
 // What a sampled texel of this format takes in the descriptor's (virtual) layout.
-uint32_t sampled_bytes(const vgpu::cuda::TexFormat& f) {
-  if (f.block == vgpu::exec::BlockFormat::None) return f.texel_bytes;
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < f.channels; ++i) n += f.bits[i] / 8;
-  return n;
-}
+uint32_t sampled_bytes(const vgpu::cuda::TexFormat& f) { return vgpu::cuda::sampled_texel_bytes(f); }
 // Puts a format into a texture descriptor.
 void apply_format(vgpu::exec::TextureDesc* d, const vgpu::cuda::TexFormat& f) {
   d->kind = f.kind;
@@ -4064,40 +4059,6 @@ bool address_mode_of(cudaTextureAddressMode m, vgpu::exec::TexAddress* out) {
 // them apart by what the table says. Starting well above zero means a
 // forgotten initialisation looks like the invalid handle it is.
 uint64_t g_next_texobj = 0x1000;
-
-// What a view may call a texel: the resource view formats (cudaResViewFormat*) as storage.
-bool view_format(int v, vgpu::cuda::TexFormat* f) {
-  using vgpu::exec::BlockFormat;
-  using vgpu::exec::ChannelKind;
-  *f = vgpu::cuda::TexFormat{};
-  auto plain = [&](ChannelKind k, uint32_t bits, uint32_t channels) {
-    f->kind = k;
-    f->channels = channels;
-    for (uint32_t i = 0; i < channels; ++i) f->bits[i] = bits;
-    f->texel_bytes = bits * channels / 8;
-    f->integer = k != ChannelKind::Float;
-    f->is_int32 = bits == 32 && k != ChannelKind::Float;
-    f->elem_only = k == ChannelKind::Float;
-    return true;
-  };
-  static const uint32_t kCh[3] = {1, 2, 4};
-  if (v >= 0x01 && v <= 0x03) return plain(ChannelKind::Unsigned, 8, kCh[v - 1]);
-  if (v >= 0x04 && v <= 0x06) return plain(ChannelKind::Signed, 8, kCh[v - 4]);
-  if (v >= 0x07 && v <= 0x09) return plain(ChannelKind::Unsigned, 16, kCh[v - 7]);
-  if (v >= 0x0a && v <= 0x0c) return plain(ChannelKind::Signed, 16, kCh[v - 0x0a]);
-  if (v >= 0x0d && v <= 0x0f) return plain(ChannelKind::Unsigned, 32, kCh[v - 0x0d]);
-  if (v >= 0x10 && v <= 0x12) return plain(ChannelKind::Signed, 32, kCh[v - 0x10]);
-  if (v >= 0x13 && v <= 0x15) return plain(ChannelKind::Float, 16, kCh[v - 0x13]);
-  if (v >= 0x16 && v <= 0x18) return plain(ChannelKind::Float, 32, kCh[v - 0x16]);
-  // The block-compressed views have the descriptors of the block-compressed channel kinds.
-  static const struct { int view, kind, x, y, z, w; } kBlock[] = {
-      {0x19, 17, 8, 8, 8, 8}, {0x1a, 19, 8, 8, 8, 8}, {0x1b, 21, 8, 8, 8, 8}, {0x1c, 23, 8, 0, 0, 0},
-      {0x1d, 24, 8, 0, 0, 0}, {0x1e, 25, 8, 8, 0, 0}, {0x1f, 26, 8, 8, 0, 0}, {0x20, 27, 16, 16, 16, 0},
-      {0x21, 28, 16, 16, 16, 0}, {0x22, 29, 8, 8, 8, 8}};
-  for (const auto& e : kBlock)
-    if (e.view == v) return vgpu::cuda::texture_format_from_runtime(e.kind, e.x, e.y, e.z, e.w, f);
-  return false;
-}
 
 // Fills in the parts of the descriptor that come from the resource, whichever kind it is. `format`
 // receives the format the texels are in. The errors are the card's: a pointer that is null or not aligned
@@ -4703,55 +4664,14 @@ struct ObjectDescs {
 std::unordered_map<uint64_t, ObjectDescs> g_object_descs;
 }  // namespace
 
-// A resource view reinterprets the texels of what it views: the same storage, named as another format of the
-// same size. Measured on an RTX 3060: the format is a real view format (cudaResViewFormatNone with a zero
-// descriptor is invalid), its texel is as many bytes as the resource's, and the extent given is the
-// resource's own -- for a block-compressed view of a 64- or 128-bit-texel array, four times it in each of
-// width and height, the array holding blocks. A first mipmap level, or a layer range, is not modelled.
+// A resource view: see vgpu::cuda::apply_view_format (texture_formats.hpp), shared with the driver.
 cudaError_t apply_view(const cudaResourceViewDesc* v, const cudaResourceDesc* res, vgpu::exec::TextureDesc* d,
                        vgpu::cuda::TexFormat* format) {
-  vgpu::cuda::TexFormat vf;
-  if (!view_format(enum_value(v->format), &vf)) return cudaErrorInvalidValue;
-  // What is viewed: its storage texel in bytes, and its extent.
-  uint64_t storage_texel = 0, w = 0, h = 0;
   const bool array = enum_value(res->resType) == cudaResourceTypeArray ||
                      enum_value(res->resType) == cudaResourceTypeMipmappedArray;
-  if (array) {
-    storage_texel = format->texel_bytes;
-    if (d->mip_levels || d->layers || d->cubemap) return cudaErrorNotSupported;   // a view's level and layer range
-    w = format->block != vgpu::exec::BlockFormat::None ? d->width : d->width;
-    h = d->height;
-  } else {
-    storage_texel = format->texel_bytes;
-    w = d->width;
-    h = d->height;
-  }
-  if (vf.texel_bytes != storage_texel) return cudaErrorInvalidValue;
-  if (v->firstMipmapLevel != 0 || v->lastMipmapLevel != 0 || v->firstLayer != 0 || v->lastLayer != 0)
-    return cudaErrorInvalidValue;
-  uint64_t want_w = w, want_h = h;
-  const bool from_block = format->block != vgpu::exec::BlockFormat::None;
-  if (vf.block != vgpu::exec::BlockFormat::None && !from_block) {
-    want_w = w * 4;
-    want_h = h ? h * 4 : 0;
-  } else if (from_block && vf.block == vgpu::exec::BlockFormat::None) {
-    want_w = (w + 3) / 4;
-    want_h = h ? (h + 3) / 4 : 0;
-  }
-  if (v->width != want_w || v->height != want_h || v->depth != d->depth) return cudaErrorInvalidValue;
-  // The view's format over the same bytes.
-  const uint64_t row_bytes = d->pitch_bytes ? d->pitch_bytes : w * storage_texel;
-  d->block = vf.block;
-  d->packed_1010102 = vf.packed_1010102;
-  d->kind = vf.kind;
-  d->channels = vf.channels;
-  for (int i = 0; i < 4; ++i) d->channel_bits[i] = vf.bits[i];
-  d->texel_bytes = sampled_bytes(vf);
-  d->width = static_cast<uint32_t>(v->width);
-  d->height = static_cast<uint32_t>(v->height);
-  d->pitch_bytes = static_cast<uint32_t>(row_bytes);
-  *format = vf;
-  return cudaSuccess;
+  return static_cast<cudaError_t>(vgpu::cuda::apply_view_format(
+      enum_value(v->format), v->width, v->height, v->depth, v->firstMipmapLevel, v->lastMipmapLevel,
+      v->firstLayer, v->lastLayer, array, d, format));
 }
 
 VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
@@ -4765,10 +4685,11 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
     d.object = vgpu::exec::TexKind::Texture;
     vgpu::cuda::TexFormat format;
     if (cudaError_t e = fill_from_resource(res, &d, &format); e != cudaSuccess) return e;
-    if (view) {
-      // A view's own format decides what may be done with it.
-      if (cudaError_t e = apply_view(view, res, &d, &format); e != cudaSuccess) return e;
-    }
+    // The read mode, filter and sRGB flag are checked against the resource's own format, not the view's
+    // (measured on an RTX 3060: a uint2 array viewed as BC1 takes the element-type read, which a 32-bit
+    // integer array allows, and refuses the normalized one with cudaErrorInvalidNormSetting, whatever the
+    // view is); what a fetch returns is the view's format, though.
+    const vgpu::cuda::TexFormat checked_format = format;
     // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
     // sampled here: their decoders are not written. Say so, by name, once (the real library takes them).
     if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
@@ -4794,8 +4715,8 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
       // The read mode, the filter and the sRGB flag against the format; the card's answers (see
       // texture_read_check). A read mode that is neither is the element type, as the card takes it.
       normalized_read = enum_value(tex->readMode) == cudaReadModeNormalizedFloat;
-      if (const int bad = vgpu::cuda::texture_read_check(format, normalized_read, filter == cudaFilterModeLinear,
-                                                         tex->sRGB != 0))
+      if (const int bad = vgpu::cuda::texture_read_check(checked_format, normalized_read,
+                                                         filter == cudaFilterModeLinear, tex->sRGB != 0))
         return static_cast<cudaError_t>(bad);
       // Linear filtering and sRGB decoding are done at the fetch, as the
       // texture unit does them. Anisotropy changes a result only when a sample's footprint is
@@ -4816,8 +4737,13 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
       d.mip_bias = q(tex->mipmapLevelBias);
       d.mip_min = q(tex->minMipmapLevelClamp);
       d.mip_max = q(tex->maxMipmapLevelClamp);
-    } else if (const int bad = vgpu::cuda::texture_read_check(format, false, false, false)) {
+    } else if (const int bad = vgpu::cuda::texture_read_check(checked_format, false, false, false)) {
       return static_cast<cudaError_t>(bad);   // a format that only a normalized read can take, with no descriptor
+    }
+    // The view is checked after the read mode (the card's order: a bad view with a bad read mode answers the read
+    // mode's error).
+    if (view) {
+      if (cudaError_t e = apply_view(view, res, &d, &format); e != cudaSuccess) return e;
     }
     d.read_as_normalized_float = normalized_read || format.norm_only || format.packed_1010102;
     const uint64_t handle = g_next_texobj++;

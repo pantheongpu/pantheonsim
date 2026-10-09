@@ -1814,8 +1814,8 @@ if(TARGET vgpucublas)
   # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, as
   # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles, and cuFFT's multi-GPU
   # descriptors (fft_multigpu.cu).
-  foreach(_check IN ITEMS "driver_gaps:cuda" "driver_context_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
-                          "runtime_memory_gaps:cudart" "runtime_graph_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft")
+  foreach(_check IN ITEMS "driver_gaps:cuda" "driver_context_gaps:cuda" "driver_texture_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
+                          "runtime_memory_gaps:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}

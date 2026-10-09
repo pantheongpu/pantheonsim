@@ -36,6 +36,7 @@
 #include "error_names.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
+#include "texture_formats.hpp"
 #include "vgpu/sass/cubin.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/cuda_attributes.hpp"
@@ -99,7 +100,8 @@ struct EventRec {
 // a zero Height or Depth counts as one).
 struct ArrayRec {
   CUDA_ARRAY3D_DESCRIPTOR desc{};
-  size_t elem = 0;       // bytes an element takes, all channels
+  vgpu::cuda::TexFormat tf;   // what the descriptor's format is to the texture unit
+  size_t elem = 0;       // bytes an element takes, all channels (a block-compressed array's: a 4 x 4 block)
   size_t row = 0;        // bytes a row takes
   size_t rows = 1, slices = 1;
   int device = 0;
@@ -474,11 +476,6 @@ uintptr_t ensure_primary(ShimState& s, int dev) {
     it = s.primary_ctx.emplace(dev, new_context(s, dev, (s.primary_flags[dev] & kCtxSettableMask) | kCtxMapHost)).first;
   return it->second;
 }
-
-// The current context for an entry point that needs one: CUDA_ERROR_INVALID_CONTEXT when the
-// thread has none. Measured on an RTX 3060, that is what allocation, streams, events, modules,
-// arrays, copies, launches and the context queries answer with no context current.
-bool no_current_context() { return ctx_stack().empty(); }
 
 // Device VA windows are disjoint, so a device pointer names its own device.
 // Resolving against the current context instead would make a copy between two
@@ -3074,13 +3071,31 @@ size_t format_bytes(const CUarray_format& f) {
   return 0;
 }
 
+// The descriptor's format as the texture unit sees it, with the channel count the format has, or false
+// for one the card refuses (CUDA_ERROR_INVALID_VALUE): see texture_format_from_driver.
+bool array_format(const CUDA_ARRAY3D_DESCRIPTOR& d, vgpu::cuda::TexFormat* tf) {
+  unsigned raw;
+  static_assert(sizeof raw == sizeof d.Format);
+  std::memcpy(&raw, &d.Format, sizeof raw);
+  return vgpu::cuda::texture_format_from_driver(raw, d.NumChannels, tf);
+}
+
+// Block-compressed data cannot be read or written as a surface: asking for the surface flag on such an array
+// is CUDA_ERROR_NOT_SUPPORTED (measured on an RTX 3060, for plain and mipmapped arrays).
+bool surface_on_blocks(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+  vgpu::cuda::TexFormat tf;
+  return array_format(d, &tf) && tf.block != vgpu::exec::BlockFormat::None && (d.Flags & CUDA_ARRAY3D_SURFACE_LDST);
+}
+
 bool valid_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
   const unsigned known = CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_SURFACE_LDST | CUDA_ARRAY3D_CUBEMAP |
                          CUDA_ARRAY3D_TEXTURE_GATHER;
   if (d.Flags & ~known) return false;
-  if (!format_bytes(d.Format)) return false;
-  if (d.NumChannels != 1 && d.NumChannels != 2 && d.NumChannels != 4) return false;
+  vgpu::cuda::TexFormat tf;
+  if (!array_format(d, &tf)) return false;
   if (d.Width == 0) return false;
+  // A block-compressed array has at least two dimensions (measured: a zero height is invalid).
+  if (tf.block != vgpu::exec::BlockFormat::None && d.Height == 0) return false;
   const bool layered = d.Flags & CUDA_ARRAY3D_LAYERED, cube = d.Flags & CUDA_ARRAY3D_CUBEMAP;
   if (cube) {
     if (d.Width != d.Height) return false;
@@ -3204,9 +3219,12 @@ namespace {
 uintptr_t create_array(ShimState& s, const CUDA_ARRAY3D_DESCRIPTOR& desc) {
   ArrayRec r;
   r.desc = desc;
-  r.elem = format_bytes(desc.Format) * desc.NumChannels;
-  r.row = desc.Width * r.elem;
-  r.rows = desc.Height ? desc.Height : 1;
+  array_format(desc, &r.tf);
+  r.elem = r.tf.texel_bytes;
+  const bool blocky = r.tf.block != vgpu::exec::BlockFormat::None;
+  // A block-compressed array holds 4 x 4 blocks: its rows are rows of blocks (which is what a copy addresses).
+  r.row = (blocky ? (desc.Width + 3) / 4 : desc.Width) * r.elem;
+  r.rows = blocky ? (desc.Height + 3) / 4 : (desc.Height ? desc.Height : 1);
   r.slices = desc.Depth ? desc.Depth : 1;
   r.device = current_device(s);
   r.mem = current(s).memory().alloc(r.row * r.rows * r.slices);
@@ -3219,6 +3237,7 @@ uintptr_t create_array(ShimState& s, const CUDA_ARRAY3D_DESCRIPTOR& desc) {
 VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
   return api("cuArray3DCreate", true, false, [&](ShimState& s) {
     if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
+    if (surface_on_blocks(*desc)) return CUDA_ERROR_NOT_SUPPORTED;
     *out = reinterpret_cast<CUarray>(create_array(s, *desc));
     return CUDA_SUCCESS;
   });
@@ -3369,6 +3388,7 @@ VGPU_EXPORT CUresult cuMipmappedArrayCreate(CUmipmappedArray* out, const CUDA_AR
                                             unsigned int numLevels) {
   return api("cuMipmappedArrayCreate", true, false, [&](ShimState& s) {
     if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
+    if (surface_on_blocks(*desc)) return CUDA_ERROR_NOT_SUPPORTED;
     const bool layers = desc->Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP);
     const size_t largest = std::max({desc->Width, desc->Height, layers ? size_t{0} : desc->Depth});
     unsigned full = 1;
@@ -3652,31 +3672,24 @@ struct TextureDescABI {
 
 uint64_t next_texobj = uint64_t{1} << 40;
 
-// A driver format's channel kind and width, or false for one this does not read.
-bool format_kind(const CUarray_format& f, vgpu::exec::ChannelKind* kind, uint32_t* bits) {
-  unsigned raw;
-  std::memcpy(&raw, &f, sizeof raw);
-  switch (raw) {
-    case CU_AD_FORMAT_UNSIGNED_INT8: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 8; return true;
-    case CU_AD_FORMAT_UNSIGNED_INT16: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 16; return true;
-    case CU_AD_FORMAT_UNSIGNED_INT32: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 32; return true;
-    case CU_AD_FORMAT_SIGNED_INT8: *kind = vgpu::exec::ChannelKind::Signed; *bits = 8; return true;
-    case CU_AD_FORMAT_SIGNED_INT16: *kind = vgpu::exec::ChannelKind::Signed; *bits = 16; return true;
-    case CU_AD_FORMAT_SIGNED_INT32: *kind = vgpu::exec::ChannelKind::Signed; *bits = 32; return true;
-    case CU_AD_FORMAT_HALF: *kind = vgpu::exec::ChannelKind::Float; *bits = 16; return true;
-    case CU_AD_FORMAT_FLOAT: *kind = vgpu::exec::ChannelKind::Float; *bits = 32; return true;
-  }
-  return false;
+// The format part of a descriptor, from a format and channel count the texture unit takes.
+void apply_texture_format(vgpu::exec::TextureDesc* d, const vgpu::cuda::TexFormat& f) {
+  d->kind = f.kind;
+  d->channels = f.channels;
+  for (int c = 0; c < 4; ++c) d->channel_bits[c] = f.bits[c];
+  d->block = f.block;
+  d->packed_1010102 = f.packed_1010102;
+  d->texel_bytes = vgpu::cuda::sampled_texel_bytes(f);
 }
 
-// The format part of a descriptor: channels of one kind and width.
-CUresult set_format(vgpu::exec::TextureDesc* d, const CUarray_format& format, unsigned channels) {
-  uint32_t bits = 0;
-  if (!format_kind(format, &d->kind, &bits)) return CUDA_ERROR_NOT_SUPPORTED;
-  if (channels != 1 && channels != 2 && channels != 4) return CUDA_ERROR_INVALID_VALUE;
-  d->channels = channels;
-  for (unsigned c = 0; c < 4; ++c) d->channel_bits[c] = c < channels ? bits : 0;
-  d->texel_bytes = bits / 8 * channels;
+// A linear or pitched resource takes the plain formats and 10:10:10:2 only (measured on an RTX 3060: the
+// normalized and block-compressed ones are CUDA_ERROR_INVALID_VALUE there, as is a channel count the format
+// does not have); the format's checks are texture_format_from_driver's.
+CUresult linear_format(const CUarray_format& format, unsigned channels, vgpu::cuda::TexFormat* tf) {
+  unsigned raw;
+  std::memcpy(&raw, &format, sizeof raw);
+  if (!vgpu::cuda::texture_format_from_driver(raw, channels, tf)) return CUDA_ERROR_INVALID_VALUE;
+  if (tf->block != vgpu::exec::BlockFormat::None || tf->norm_only) return CUDA_ERROR_INVALID_VALUE;
   return CUDA_SUCCESS;
 }
 
@@ -3693,13 +3706,16 @@ void set_array_shape(vgpu::exec::TextureDesc* d, const ArrayRec& a) {
   d->from_array = true;
 }
 
-CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::TextureDesc* d) {
+CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::TextureDesc* d,
+                           vgpu::cuda::TexFormat* tf) {
   switch (r.type) {
     case 0: {   // CU_RESOURCE_TYPE_ARRAY
       const ArrayRec* a = array_rec(s, r.res.array.array);
       if (!a) return CUDA_ERROR_INVALID_HANDLE;
       set_array_shape(d, *a);
-      return set_format(d, a->desc.Format, a->desc.NumChannels);
+      *tf = a->tf;
+      apply_texture_format(d, *tf);
+      return CUDA_SUCCESS;
     }
     case 1: {   // CU_RESOURCE_TYPE_MIPMAPPED_ARRAY
       auto it = s.mipmaps.find(reinterpret_cast<uintptr_t>(r.res.mipmap.mipmap));
@@ -3710,11 +3726,14 @@ CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::T
       set_array_shape(d, a);
       d->mip_levels = static_cast<uint32_t>(lv.size());
       for (size_t l = 0; l < lv.size(); ++l) d->level_base[l] = s.arrays.at(lv[l]).mem;
-      return set_format(d, a.desc.Format, a.desc.NumChannels);
+      *tf = a.tf;
+      apply_texture_format(d, *tf);
+      return CUDA_SUCCESS;
     }
     case 2: {   // CU_RESOURCE_TYPE_LINEAR
       if (!r.res.linear.ptr) return CUDA_ERROR_INVALID_VALUE;
-      if (CUresult e = set_format(d, r.res.linear.format, r.res.linear.channels)) return e;
+      if (CUresult e = linear_format(r.res.linear.format, r.res.linear.channels, tf)) return e;
+      apply_texture_format(d, *tf);
       d->base = r.res.linear.ptr;
       d->width = static_cast<uint32_t>(r.res.linear.bytes / d->texel_bytes);
       d->pitch_bytes = 0;
@@ -3722,7 +3741,8 @@ CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::T
     }
     case 3: {   // CU_RESOURCE_TYPE_PITCH2D
       if (!r.res.pitch2d.ptr) return CUDA_ERROR_INVALID_VALUE;
-      if (CUresult e = set_format(d, r.res.pitch2d.format, r.res.pitch2d.channels)) return e;
+      if (CUresult e = linear_format(r.res.pitch2d.format, r.res.pitch2d.channels, tf)) return e;
+      apply_texture_format(d, *tf);
       d->base = r.res.pitch2d.ptr;
       d->width = static_cast<uint32_t>(r.res.pitch2d.width);
       d->height = static_cast<uint32_t>(r.res.pitch2d.height);
@@ -3734,28 +3754,46 @@ CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::T
   }
 }
 
+// CUDA_RESOURCE_VIEW_DESC.
+struct ViewDescABI {
+  int format;
+  size_t width, height, depth;
+  unsigned first_mip, last_mip, first_layer, last_layer;
+  unsigned reserved[16];
+};
+
 CUresult make_object(const char* name, unsigned long long* out, const void* res, const void* tex,
                      const void* view, vgpu::exec::TexKind kind) {
   return api(name, true, false, [&](ShimState& s) -> CUresult {
     if (!out || !res) return CUDA_ERROR_INVALID_VALUE;
-    if (view) return CUDA_ERROR_NOT_SUPPORTED;   // a resource view reinterprets the format
     vgpu::exec::TextureDesc d;
     d.object = kind;
-    if (CUresult e = describe_resource(s, *static_cast<const ResourceDescABI*>(res), &d)) return e;
+    vgpu::cuda::TexFormat format;
+    const auto& rdesc = *static_cast<const ResourceDescABI*>(res);
+    if (CUresult e = describe_resource(s, rdesc, &d, &format)) return e;
+    // A surface cannot be made over block-compressed data (measured on an RTX 3060: invalid value).
+    if (kind == vgpu::exec::TexKind::Surface && format.block != vgpu::exec::BlockFormat::None)
+      return CUDA_ERROR_INVALID_VALUE;
+    bool srgb_flag = false;
     if (const auto* t = static_cast<const TextureDescABI*>(tex)) {
       for (int i = 0; i < 3; ++i) {
         if (t->address[i] < 0 || t->address[i] > 3) return CUDA_ERROR_INVALID_VALUE;
         d.address[i] = static_cast<vgpu::exec::TexAddress>(t->address[i]);   // the same order
       }
-      if (t->max_anisotropy > 1) return CUDA_ERROR_NOT_SUPPORTED;
+      // Anisotropy changes a result only when a sample's footprint is stretched, which a fetch with no
+      // derivatives (LOD 0, or an explicit one) never is: any value is accepted, as the card accepts any
+      // (measured: 0, 1, 2, 8, 16, 17, 100 and 2^32-1), and has nothing to act on.
       d.filter = t->filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
       d.normalized_coords = t->flags & CU_TRSF_NORMALIZED_COORDINATES;
-      d.srgb = t->flags & CU_TRSF_SRGB;
+      srgb_flag = t->flags & CU_TRSF_SRGB;
+      d.srgb = srgb_flag;
       // Integer texels come back as floats in [0, 1] or [-1, 1] unless
       // CU_TRSF_READ_AS_INTEGER keeps them integers -- the driver's default is
-      // the opposite of the runtime's. Only 8- and 16-bit channels promote.
-      d.read_as_normalized_float = !(t->flags & CU_TRSF_READ_AS_INTEGER) &&
-                                   d.kind != vgpu::exec::ChannelKind::Float && d.channel_bits[0] < 32;
+      // the opposite of the runtime's. Only 8- and 16-bit channels promote; the normalized,
+      // block-compressed and 10:10:10:2 formats always come back as floats.
+      d.read_as_normalized_float = format.norm_only || format.packed_1010102 ||
+                                   (!(t->flags & CU_TRSF_READ_AS_INTEGER) &&
+                                    d.kind != vgpu::exec::ChannelKind::Float && d.channel_bits[0] < 32);
       static_assert(sizeof d.border_bits == sizeof t->border);
       std::memcpy(d.border_bits, t->border, sizeof d.border_bits);
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
@@ -3763,6 +3801,30 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
       d.mip_bias = q(t->mip_bias);
       d.mip_min = q(t->mip_min);
       d.mip_max = q(t->mip_max);
+    } else {
+      d.read_as_normalized_float = format.norm_only || format.packed_1010102;
+    }
+    // The sRGB block-compressed formats need the sRGB flag (measured: invalid value without it).
+    if (format.srgb_only && !srgb_flag) return CUDA_ERROR_INVALID_VALUE;
+    if (view) {
+      const auto& v = *static_cast<const ViewDescABI*>(view);
+      const bool array = rdesc.type == 0 || rdesc.type == 1;
+      if (const int e = vgpu::cuda::apply_view_format(v.format, v.width, v.height, v.depth, v.first_mip,
+                                                      v.last_mip, v.first_layer, v.last_layer, array, &d, &format))
+        return static_cast<CUresult>(e);
+      d.read_as_normalized_float = d.read_as_normalized_float || format.norm_only || format.packed_1010102;
+    }
+    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
+    // sampled here: their decoders are not written. Say so, by name, once (the real driver takes them).
+    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
+        d.block == vgpu::exec::BlockFormat::BC7) {
+      static std::once_flag said;
+      std::call_once(said, [&] {
+        if (!quiet())
+          std::fprintf(stderr, "[vgpu] %s: textures of BC6H and BC7 blocks are not implemented (BC1 to BC5 are); "
+                               "returning CUDA_ERROR_NOT_SUPPORTED\n", name);
+      });
+      return CUDA_ERROR_NOT_SUPPORTED;
     }
     const uint64_t handle = next_texobj++;
     current(s).textures()[handle] = d;
@@ -4465,7 +4527,7 @@ VGPU_EXPORT CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
 }
 VGPU_EXPORT CUresult cuCtxPushCurrent(CUcontext ctx) { return cuCtxPushCurrent_v2(ctx); }
 VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
-  return api("cuCtxPopCurrent", true, false, [&](ShimState& s) {
+  return api("cuCtxPopCurrent", true, false, [&](ShimState&) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     if (pctx) *pctx = reinterpret_cast<CUcontext>(ctx_stack().back());
     ctx_stack().pop_back();
