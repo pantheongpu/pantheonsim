@@ -1,0 +1,123 @@
+# context
+RES 5 no data
+CB runtime cudaSetDevice ENTER
+RES 1 context=x0 stream=s0
+CB runtime cudaSetDevice EXIT
+CB runtime cudaFree ENTER
+CB runtime cudaFree EXIT
+REC stream id=s1 context=x1 flag=1 priority=0 corr=c0
+REC stream id=s2 context=x1 flag=3 priority=0 corr=c0
+REC stream id=s3 context=x1 flag=2 priority=0 corr=c0
+REC stream id=s4 context=x1 flag=2 priority=0 corr=c0
+REC stream id=s5 context=x1 flag=2 priority=0 corr=c0
+REC stream id=s6 context=x1 flag=2 priority=0 corr=c0
+REC stream id=s7 context=x1 flag=2 priority=0 corr=c0
+REC stream id=s8 context=x1 flag=1 priority=-5 corr=c0
+REC context id=x1 device=0 nullstream=s2
+REC runtime cudaSetDevice_v3020 corr=c0
+REC runtime cudaFree_v3020 corr=c1
+# launches
+CB runtime cudaMalloc ENTER
+CB runtime cudaMalloc EXIT
+CB runtime cudaLaunchKernel ENTER
+RES 6 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+CB runtime cudaLaunchKernel EXIT
+CB runtime cudaLaunchKernel ENTER
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+CB runtime cudaLaunchKernel EXIT
+CB runtime cudaLaunchKernel ENTER
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+CB runtime cudaLaunchKernel EXIT
+CB runtime cudaFuncGetAttributes ENTER
+CB runtime cudaFuncGetAttributes EXIT
+CB runtime cudaLaunchKernel ENTER
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+CB runtime cudaLaunchKernel EXIT
+REC runtime cudaMalloc_v3020 corr=c2
+REC function name=_Z10kernel_onePfi module=m0 context=x1
+REC function name=_Z10kernel_twoPfi module=m0 context=x1
+REC function name=_Z12kernel_threePfi module=m0 context=x1
+REC runtime cudaLaunchKernel_v7000 corr=c3
+REC runtime cudaLaunchKernel_v7000 corr=c4
+REC runtime cudaLaunchKernel_v7000 corr=c5
+REC runtime cudaFuncGetAttributes_v3020 corr=c6
+REC runtime cudaLaunchKernel_v7000 corr=c7
+# streams
+CB runtime cudaStreamCreate ENTER
+RES 3 context=x0 stream=s9
+CB runtime cudaStreamCreate EXIT
+CB runtime cudaStreamCreate ENTER
+RES 3 context=x0 stream=s10
+CB runtime cudaStreamCreate EXIT
+CB runtime cudaStreamSetAttribute ENTER
+RES 21 context=none stream=s9 attribute=1 value=set
+CB runtime cudaStreamSetAttribute EXIT
+CB runtime cudaStreamSetAttribute ENTER
+RES 21 context=none stream=s9 attribute=3 value=set
+CB runtime cudaStreamSetAttribute EXIT
+CB runtime cudaStreamCopyAttributes ENTER
+CB runtime cudaStreamCopyAttributes EXIT
+CB runtime cudaStreamDestroy ENTER
+RES 4 context=x0 stream=s10
+CB runtime cudaStreamDestroy EXIT
+REC stream id=s11 context=x1 flag=1 priority=0 corr=c8
+REC runtime cudaStreamCreate_v3020 corr=c8
+REC stream id=s12 context=x1 flag=1 priority=0 corr=c9
+REC runtime cudaStreamCreate_v3020 corr=c9
+REC runtime cudaStreamSetAttribute_v11000 corr=c10
+REC runtime cudaStreamSetAttribute_v11000 corr=c11
+REC runtime cudaStreamCopyAttributes_v11000 corr=c12
+REC runtime cudaStreamDestroy_v5050 corr=c13
+# driver module
+RES 6 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
+RES 8 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
+RES 8 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
+RES 7 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
+# second context
+RES 1 context=x2 stream=s0
+RES 2 context=x2 stream=s0
+REC function name=module_fill module=m1 context=x1
+REC function name=module_scale module=m1 context=x1
+REC stream id=s13 context=x3 flag=1 priority=0 corr=c14
+REC stream id=s14 context=x3 flag=3 priority=0 corr=c14
+REC stream id=s15 context=x3 flag=2 priority=0 corr=c14
+REC stream id=s16 context=x3 flag=2 priority=0 corr=c14
+REC stream id=s17 context=x3 flag=2 priority=0 corr=c14
+REC stream id=s18 context=x3 flag=2 priority=0 corr=c14
+REC stream id=s19 context=x3 flag=2 priority=0 corr=c14
+REC stream id=s20 context=x3 flag=1 priority=-5 corr=c14
+REC context id=x3 device=0 nullstream=s14
+# reset
+CB runtime cudaDeviceReset ENTER
+RES 2 context=x0 stream=s0
+RES 7 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 4 context=x0 stream=s9
+CB runtime cudaDeviceReset EXIT
+CB runtime cudaFree ENTER
+RES 1 context=x0 stream=s0
+CB runtime cudaFree EXIT
+# after reset
+CB runtime cudaMalloc ENTER
+CB runtime cudaMalloc EXIT
+CB runtime cudaLaunchKernel ENTER
+RES 6 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+CB runtime cudaLaunchKernel EXIT
+REC runtime cudaDeviceReset_v3020 corr=c15
+REC stream id=s21 context=x4 flag=1 priority=0 corr=c16
+REC stream id=s22 context=x4 flag=3 priority=0 corr=c16
+REC stream id=s23 context=x4 flag=2 priority=0 corr=c16
+REC stream id=s24 context=x4 flag=2 priority=0 corr=c16
+REC stream id=s25 context=x4 flag=2 priority=0 corr=c16
+REC stream id=s26 context=x4 flag=2 priority=0 corr=c16
+REC stream id=s27 context=x4 flag=2 priority=0 corr=c16
+REC stream id=s28 context=x4 flag=1 priority=-5 corr=c16
+REC context id=x4 device=0 nullstream=s22
+REC runtime cudaFree_v3020 corr=c16
+REC runtime cudaMalloc_v3020 corr=c17
+REC function name=_Z10kernel_onePfi module=m0 context=x4
+REC function name=_Z10kernel_twoPfi module=m0 context=x4
+REC function name=_Z12kernel_threePfi module=m0 context=x4
+REC runtime cudaLaunchKernel_v7000 corr=c18
+# end

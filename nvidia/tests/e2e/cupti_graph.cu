@@ -72,7 +72,7 @@ void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size_t, siz
         break;
       }
       case CUPTI_ACTIVITY_KIND_MEMCPY: {
-        const auto* m = reinterpret_cast<const CUpti_ActivityMemcpy6*>(r);
+        const auto* m = reinterpret_cast<const MemcpyRecord*>(r);
         out(fmt("REC memcpy bytes=%llu graph=%u node=%llx corr=#c%u", (unsigned long long)m->bytes, m->graphId,
                 (unsigned long long)m->graphNodeId, m->correlationId));
         break;
@@ -213,8 +213,10 @@ int main() {
       out(fmt("id: its node %zu is %llx", i, (unsigned long long)node_id));
     }
     CK(cudaGraphInstantiate(&ge, g, 0));
+#if CUPTI_API_VERSION >= 22
     cuptiGetGraphExecId(reinterpret_cast<CUgraphExec>(ge), &id);
     out(fmt("id: its executable graph %u", id));
+#endif
     CK(cudaGraphCreate(&g2, 0));
     cuptiGetGraphId(reinterpret_cast<CUgraph>(g2), &id);
     out(fmt("id: a created graph %u", id));
@@ -223,13 +225,15 @@ int main() {
     out(fmt("id: its clone %u", id));
     cudaGraphExec_t ge2;
     CK(cudaGraphInstantiate(&ge2, g2, 0));
+#if CUPTI_API_VERSION >= 22
     cuptiGetGraphExecId(reinterpret_cast<CUgraphExec>(ge2), &id);
     out(fmt("id: an executable graph of it %u", id));
+#endif
     cudaGraph_t g4;
     CK(cudaGraphCreate(&g4, 0));
     cuptiGetGraphId(reinterpret_cast<CUgraph>(g4), &id);
     out(fmt("id: the next graph %u", id));
-    out(fmt("id: none -> %d %d %d", (int)cuptiGetGraphId(nullptr, &id), (int)cuptiGetGraphExecId(nullptr, &id),
+    out(fmt("id: none -> %d %d", (int)cuptiGetGraphId(nullptr, &id),
             (int)cuptiGetGraphNodeId(nullptr, reinterpret_cast<uint64_t*>(&id))));
     CK(cudaGraphExecDestroy(ge));
     CK(cudaGraphExecDestroy(ge2));

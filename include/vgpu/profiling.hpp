@@ -265,6 +265,15 @@ class Silence {
 // contexts on the program's behalf as a side effect.
 bool silenced();
 
+// The first context of the process being made, once: what a tool had switched on
+// by then is what it gets for the API calls it asks to be recorded (see
+// nvidia/docs/cupti.md). `note_context_made` is called by whichever of the
+// runtime and the driver makes a context first; the hook, if there is one, is
+// called then.
+void note_context_made();
+bool context_made();
+void set_context_hook(void (*fn)());
+
 // Driver initialisation finished: told to a subscriber once per process, by
 // whichever library (driver or runtime) gets there first.
 void notify_init_finished();

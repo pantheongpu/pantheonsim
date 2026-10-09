@@ -210,6 +210,17 @@ Silence::~Silence() {
 }
 bool silenced() { return t_silence > 0; }
 
+namespace {
+std::atomic<bool> g_context_made{false};
+std::atomic<void (*)()> g_context_hook{nullptr};
+}  // namespace
+void set_context_hook(void (*fn)()) { g_context_hook.store(fn, std::memory_order_release); }
+bool context_made() { return g_context_made.load(std::memory_order_acquire); }
+void note_context_made() {
+  if (g_context_made.exchange(true, std::memory_order_acq_rel)) return;
+  if (const auto fn = g_context_hook.load(std::memory_order_acquire)) fn();
+}
+
 void notify_init_finished() {
   static std::atomic<bool> told{false};
   if (!enabled() && !hooked()) return;

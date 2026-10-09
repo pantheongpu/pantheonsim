@@ -2193,6 +2193,20 @@ if(TARGET vgpucupti)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # The rest of what a profiler reads: the parameter structures of runtime calls,
+  # allocation and pool records, graphs, modules and streams, and the switches
+  # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
+  # an RTX 3060 (nvidia/docs/cupti.md).
+  foreach(_case params memory graph resource misc overhead filter filter_driver)
+    add_test(NAME e2e_cupti_${_case}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
+    set_tests_properties(e2e_cupti_${_case} PROPERTIES
+      DEPENDS vgpucupti
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
+
   # The same for a program that uses only the driver API: the driver calls, the
   # kernels, copies, fills and waits they issue, and the context and streams.
   add_test(NAME e2e_cupti_trace_driver

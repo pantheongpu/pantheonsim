@@ -104,14 +104,6 @@ void CUPTIAPI on_callback(void*, CUpti_CallbackDomain domain, CUpti_CallbackId c
   }
 }
 
-#if CUPTI_API_VERSION >= 130000
-using ContextRecord = CUpti_ActivityContext3;
-#elif CUPTI_API_VERSION >= 24
-using ContextRecord = CUpti_ActivityContext3;
-#else
-using ContextRecord = CUpti_ActivityContext2;
-#endif
-
 void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size_t, size_t valid) {
   CUpti_Activity* r = nullptr;
   while (cuptiActivityGetNextRecord(buffer, valid, &r) == CUPTI_SUCCESS) {

@@ -1,0 +1,198 @@
+id: captured graph 1
+id: its node 0 is 100000000
+id: its node 1 is 100000001
+id: its executable graph 2
+id: a created graph 4
+id: its clone 5
+id: an executable graph of it 6
+id: the next graph 8
+id: none -> 1 1
+REC runtime cudaMalloc_v3020 corr=c0
+REC runtime cudaStreamCreate_v3020 corr=c1
+REC runtime cudaStreamBeginCapture_v10000 corr=c2
+REC runtime cudaLaunchKernel_v7000 corr=c3
+REC runtime cudaLaunchKernel_v7000 corr=c4
+REC runtime cudaStreamEndCapture_v10000 corr=c5
+REC runtime cudaGraphGetNodes_v10000 corr=c6
+REC runtime cudaGraphGetNodes_v10000 corr=c7
+REC runtime cudaGraphInstantiate_v12000 corr=c8
+REC runtime cudaGraphCreate_v10000 corr=c9
+REC runtime cudaGraphClone_v10000 corr=c10
+REC runtime cudaGraphInstantiate_v12000 corr=c11
+REC runtime cudaGraphCreate_v10000 corr=c12
+REC runtime cudaGraphExecDestroy_v10000 corr=c13
+REC runtime cudaGraphExecDestroy_v10000 corr=c14
+REC runtime cudaGraphDestroy_v10000 corr=c15
+REC runtime cudaGraphDestroy_v10000 corr=c16
+REC runtime cudaGraphDestroy_v10000 corr=c17
+REC runtime cudaGraphDestroy_v10000 corr=c18
+REC runtime cudaStreamDestroy_v5050 corr=c19
+REC runtime cudaFree_v3020 corr=c20
+######## graph trace wanted
+# captured, instantiated
+REC runtime cudaMalloc_v3020 corr=c21
+REC runtime cudaMalloc_v3020 corr=c22
+REC runtime cudaHostAlloc_v3020 corr=c23
+REC runtime cudaStreamCreate_v3020 corr=c24
+REC runtime cudaStreamBeginCapture_v10000 corr=c25
+REC runtime cudaLaunchKernel_v7000 corr=c26
+REC runtime cudaLaunchKernel_v7000 corr=c27
+REC runtime cudaMemcpyAsync_v3020 corr=c28
+REC runtime cudaMemsetAsync_v3020 corr=c29
+REC runtime cudaStreamEndCapture_v10000 corr=c30
+REC runtime cudaGraphInstantiate_v12000 corr=c31
+# launched twice
+REC graph-trace graph=10 start<=end=1 corr=c32
+REC runtime cudaGraphLaunch_v10000 corr=c32
+REC graph-trace graph=10 start<=end=1 corr=c33
+REC runtime cudaGraphLaunch_v10000 corr=c33
+REC runtime cudaStreamSynchronize_v3020 corr=c34
+# explicit graph
+REC runtime cudaGraphCreate_v10000 corr=c35
+REC runtime cudaGraphAddKernelNode_v10000 corr=c36
+REC runtime cudaGraphAddKernelNode_v10000 corr=c37
+REC runtime cudaGraphInstantiate_v12000 corr=c38
+REC graph-trace graph=13 start<=end=1 corr=c39
+REC runtime cudaGraphLaunch_v10000 corr=c39
+REC runtime cudaStreamSynchronize_v3020 corr=c40
+######## graph trace not wanted
+# captured, instantiated
+REC runtime cudaGraphExecDestroy_v10000 corr=c41
+REC runtime cudaGraphExecDestroy_v10000 corr=c42
+REC runtime cudaGraphDestroy_v10000 corr=c43
+REC runtime cudaGraphDestroy_v10000 corr=c44
+REC runtime cudaStreamDestroy_v5050 corr=c45
+REC runtime cudaFreeHost_v3020 corr=c46
+REC runtime cudaFree_v3020 corr=c47
+REC runtime cudaFree_v3020 corr=c48
+REC runtime cudaMalloc_v3020 corr=c49
+REC runtime cudaMalloc_v3020 corr=c50
+REC runtime cudaHostAlloc_v3020 corr=c51
+REC runtime cudaStreamCreate_v3020 corr=c52
+REC runtime cudaStreamBeginCapture_v10000 corr=c53
+REC runtime cudaLaunchKernel_v7000 corr=c54
+REC runtime cudaLaunchKernel_v7000 corr=c55
+REC runtime cudaMemcpyAsync_v3020 corr=c56
+REC runtime cudaMemsetAsync_v3020 corr=c57
+REC runtime cudaStreamEndCapture_v10000 corr=c58
+REC runtime cudaGraphInstantiate_v12000 corr=c59
+# launched twice
+REC kernel name=_Z5firstPfi graph=16 node=1000000000 corr=c60
+REC kernel name=_Z6secondPfi graph=16 node=1000000001 corr=c60
+REC memcpy bytes=512 graph=16 node=1000000002 corr=c60
+REC memset bytes=256 graph=16 node=1000000003 corr=c60
+REC runtime cudaGraphLaunch_v10000 corr=c60
+REC kernel name=_Z5firstPfi graph=16 node=1000000000 corr=c61
+REC kernel name=_Z6secondPfi graph=16 node=1000000001 corr=c61
+REC memcpy bytes=512 graph=16 node=1000000002 corr=c61
+REC memset bytes=256 graph=16 node=1000000003 corr=c61
+REC runtime cudaGraphLaunch_v10000 corr=c61
+REC runtime cudaStreamSynchronize_v3020 corr=c62
+# explicit graph
+REC runtime cudaGraphCreate_v10000 corr=c63
+REC runtime cudaGraphAddKernelNode_v10000 corr=c64
+REC runtime cudaGraphAddKernelNode_v10000 corr=c65
+REC runtime cudaGraphInstantiate_v12000 corr=c66
+REC kernel name=_Z5firstPfi graph=19 node=1300000000 corr=c67
+REC kernel name=_Z5firstPfi graph=19 node=1300000001 corr=c67
+REC runtime cudaGraphLaunch_v10000 corr=c67
+REC runtime cudaStreamSynchronize_v3020 corr=c68
+######## resource callbacks
+# capture
+RES 9 context=none graph=g0 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g0 original=- node=n0 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g0 original=- node=n0 originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g0 original=- node=n1 originalNode=- type=0 dependency=- exec=-
+RES 15 context=none graph=g0 original=- node=n1 originalNode=- type=0 dependency=n0 exec=-
+RES 13 context=none graph=g0 original=- node=n1 originalNode=- type=0 dependency=- exec=-
+# instantiate
+RES 9 context=none graph=g1 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g1 original=- node=n2 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g1 original=- node=n2 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g1 original=g0 node=n2 originalNode=n0 type=0 dependency=- exec=-
+RES 12 context=none graph=g1 original=- node=n3 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g1 original=- node=n3 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g1 original=g0 node=n3 originalNode=n1 type=0 dependency=- exec=-
+RES 15 context=none graph=g1 original=- node=n3 originalNode=- type=0 dependency=n2 exec=-
+RES 9 context=none graph=g2 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g2 original=- node=n4 originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g2 original=- node=n5 originalNode=- type=0 dependency=- exec=-
+RES 15 context=none graph=g2 original=- node=n5 originalNode=- type=0 dependency=n4 exec=-
+RES 17 context=set graph=g0 original=- node=- originalNode=- type=0 dependency=- exec=g1
+RES 18 context=set graph=g0 original=- node=- originalNode=- type=0 dependency=- exec=g1
+# explicit graph, empty node, dependencies
+RES 9 context=none graph=g3 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g3 original=- node=n6 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g3 original=- node=n6 originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g3 original=- node=n7 originalNode=- type=0 dependency=- exec=-
+RES 15 context=none graph=g3 original=- node=n7 originalNode=- type=0 dependency=n6 exec=-
+RES 13 context=none graph=g3 original=- node=n7 originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g3 original=- node=n8 originalNode=- type=5 dependency=- exec=-
+RES 13 context=none graph=g3 original=- node=n8 originalNode=- type=0 dependency=- exec=-
+RES 15 context=none graph=g3 original=- node=n8 originalNode=- type=0 dependency=n7 exec=-
+# remove dependency
+RES 16 context=none graph=g3 original=- node=n8 originalNode=- type=0 dependency=n7 exec=-
+# clone
+RES 9 context=none graph=g4 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g4 original=- node=n9 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g4 original=- node=n9 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g4 original=g3 node=n9 originalNode=n6 type=0 dependency=- exec=-
+RES 12 context=none graph=g4 original=- node=n10 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g4 original=- node=n10 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g4 original=g3 node=n10 originalNode=n7 type=0 dependency=- exec=-
+RES 12 context=none graph=g4 original=- node=n11 originalNode=- type=5 dependency=- exec=-
+RES 13 context=none graph=g4 original=- node=n11 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g4 original=g3 node=n11 originalNode=n8 type=0 dependency=- exec=-
+RES 15 context=none graph=g4 original=- node=n10 originalNode=- type=0 dependency=n9 exec=-
+RES 11 context=none graph=g4 original=g3 node=- originalNode=- type=0 dependency=- exec=-
+# instantiate the explicit graph
+RES 9 context=none graph=g5 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g5 original=- node=n12 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g5 original=- node=n12 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g5 original=g3 node=n12 originalNode=n6 type=0 dependency=- exec=-
+RES 12 context=none graph=g5 original=- node=n13 originalNode=- type=0 dependency=- exec=-
+RES 13 context=none graph=g5 original=- node=n13 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g5 original=g3 node=n13 originalNode=n7 type=0 dependency=- exec=-
+RES 12 context=none graph=g5 original=- node=n14 originalNode=- type=5 dependency=- exec=-
+RES 13 context=none graph=g5 original=- node=n14 originalNode=- type=0 dependency=- exec=-
+RES 20 context=none graph=g5 original=g3 node=n14 originalNode=n8 type=0 dependency=- exec=-
+RES 15 context=none graph=g5 original=- node=n13 originalNode=- type=0 dependency=n12 exec=-
+RES 9 context=none graph=g6 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g6 original=- node=n15 originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g6 original=- node=n16 originalNode=- type=0 dependency=- exec=-
+RES 12 context=none graph=g6 original=- node=n17 originalNode=- type=5 dependency=- exec=-
+RES 15 context=none graph=g6 original=- node=n16 originalNode=- type=0 dependency=n15 exec=-
+RES 17 context=set graph=g3 original=- node=- originalNode=- type=0 dependency=- exec=g5
+RES 14 context=none graph=g5 original=- node=n14 originalNode=- type=0 dependency=- exec=-
+RES 18 context=set graph=g3 original=- node=- originalNode=- type=0 dependency=- exec=g5
+# change a node of the executable graph
+RES 23 context=none graph=- original=g3 node=n13 originalNode=n7 type=0 dependency=- exec=g5
+# destroy a node
+RES 14 context=none graph=g3 original=- node=n8 originalNode=- type=0 dependency=- exec=-
+# destroy
+RES 19 context=none graph=- original=- node=- originalNode=- type=0 dependency=- exec=g1
+RES 10 context=none graph=g1 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 10 context=none graph=g2 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g2 original=- node=n4 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g2 original=- node=n5 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g1 original=- node=n2 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g1 original=- node=n3 originalNode=- type=0 dependency=- exec=-
+RES 19 context=none graph=- original=- node=- originalNode=- type=0 dependency=- exec=g5
+RES 10 context=none graph=g5 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 10 context=none graph=g6 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g6 original=- node=n15 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g6 original=- node=n16 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g6 original=- node=n17 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g5 original=- node=n12 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g5 original=- node=n13 originalNode=- type=0 dependency=- exec=-
+RES 10 context=none graph=g0 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g0 original=- node=n0 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g0 original=- node=n1 originalNode=- type=0 dependency=- exec=-
+RES 10 context=none graph=g3 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g3 original=- node=n6 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g3 original=- node=n7 originalNode=- type=0 dependency=- exec=-
+RES 10 context=none graph=g4 original=- node=- originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g4 original=- node=n9 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g4 original=- node=n10 originalNode=- type=0 dependency=- exec=-
+RES 14 context=none graph=g4 original=- node=n11 originalNode=- type=0 dependency=- exec=-
+# end

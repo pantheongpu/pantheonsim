@@ -25,6 +25,22 @@
 #include <cuda_runtime.h>
 #include <cupti.h>
 
+// The newest layout of each record the toolkit being built against defines.
+#if CUPTI_API_VERSION >= 26
+using MemcpyRecord = CUpti_ActivityMemcpy6;
+using SyncRecord = CUpti_ActivitySynchronization2;
+#else
+using MemcpyRecord = CUpti_ActivityMemcpy5;
+using SyncRecord = CUpti_ActivitySynchronization;
+#endif
+#if CUPTI_API_VERSION >= 24
+using ContextRecord = CUpti_ActivityContext3;
+#elif CUPTI_API_VERSION >= 22
+using ContextRecord = CUpti_ActivityContext2;
+#else
+using ContextRecord = CUpti_ActivityContext;
+#endif
+
 namespace cupti_test {
 
 inline std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));

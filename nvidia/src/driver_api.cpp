@@ -619,6 +619,7 @@ void record_memset(ShimState& s, CUdeviceptr dst, uint32_t value, size_t bytes, 
 
 // A context coming into being: a subscriber is told, and a context record made.
 void announce_context_created(ShimState& s, uintptr_t handle) {
+  vgpu::profiling::note_context_made();
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   const uint32_t device = profiled_device(s);
   vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextCreated, handle, device);

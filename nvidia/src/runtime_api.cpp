@@ -36,6 +36,7 @@
 #include <functional>
 #include <dlfcn.h>
 #include <atomic>
+#include <sys/syscall.h>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -123,6 +124,7 @@ struct KernelInfo {
   RegisteredModule* mod = nullptr;
   std::string entry_name;
   bool nonportable_cluster = false;   // cudaFuncAttributeNonPortableClusterSizeAllowed
+  bool load_told = false;             // a profiler has been told what loading this kernel cost
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -890,9 +892,10 @@ static std::atomic<uint32_t> g_announced_contexts{0};
 static std::atomic<uint32_t> g_context_generation[32];
 
 static void announce_context() {
-  if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   // A profiler asking what a device is has not made a context.
   if (vgpu::profiling::silenced()) return;
+  vgpu::profiling::note_context_made();
+  if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   const uint32_t bit = 1u << (static_cast<unsigned>(t_current_device) & 31u);
   const uint32_t before = g_announced_contexts.fetch_or(bit);
   if (before & bit) return;
@@ -1409,9 +1412,24 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
                      ki.entry_name.c_str());
       return cudaErrorNoKernelImageForDevice;
     }
+    const uint64_t load_start = profiling ? vgpu::profiling::host_ns() : 0;
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    // The first launch of a kernel loads it (a lazily loaded function, on the card),
+    // which a profiler is told as the cost of the launch that caused it.
+    if (profiling && !ki.load_told) {
+      ki.load_told = true;
+      vgpu::profiling::Event ev;
+      ev.kind = vgpu::profiling::EventKind::Overhead;
+      ev.flags = uint32_t{5} << 16;   // CUPTI_ACTIVITY_OVERHEAD_LAZY_FUNCTION_LOADING
+      ev.start_ns = load_start;
+      ev.end_ns = vgpu::profiling::host_ns();
+      ev.correlation = vgpu::profiling::work_correlation();
+      ev.process_id = static_cast<uint32_t>(::getpid());
+      ev.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+      vgpu::profiling::record(std::move(ev));
+    }
 
     // A kernel with parameters needs an argument array, and every slot in it
     // must be a real pointer: dereferencing what the caller passed is the one
