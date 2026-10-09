@@ -485,9 +485,13 @@ with gfx12's OCP fp8 WMMA.
   - OCP 8-bit floats.
 - **Checks:** the executor's unit kernels pass on gfx1201 too (ctests `*_gfx1201`), and `tests/hipcc/rdna4.cpp` checks WMMA, the scalar float unit and the split barrier.
 
-## RDNA2 (Radeon RX 6900 XT)
+## RDNA2 (Radeon RX 6900 XT, RX 6800, RX 6700 XT)
 
-`VGPU_GPU=amd/rx6900xt` is gfx1030 (RDNA2). PyTorch's 20 checks pass on it
+`VGPU_GPU=amd/rx6900xt` is gfx1030 (RDNA2), and so is `amd/rx6800` (Navi 21, 60 CUs). `amd/rx6700xt` is
+gfx1031 (Navi 22, 40 CUs), the same instruction set with a smaller chip. The RX 6800 and RX 6700 XT are
+profiled from real cards (`registers/measurements/`): their device properties, `rocminfo`, `amd-smi`, KFD
+topology and all 4096 bytes of PCI configuration space, which the simulated card replays (revision,
+subsystem id, capability chain and BAR layout included). PyTorch's 20 checks pass on the RX 6900 XT
 (ctest `amd_pytorch_rx6900xt`). RDNA2 has no matrix instructions, so its
 matrix products run on the vector units, and PyTorch refuses fp8 on it, as it
 does on the card.
@@ -504,7 +508,9 @@ does on the card.
   - `v_permlane16_b32` and `v_permlanex16_b32`, which RDNA3 and RDNA4 have too;
   - DPP's `row_share` and `row_xmask`, and its FI bit;
   - occupancy from gfx10.3's register file.
-- **Checks:** the executor's unit kernels pass on gfx1030 (ctests `*_gfx1030`), and `tests/hipcc/rdna2.cpp` checks SDWA, M0-relative registers, the permlanes and the DPP modes, in wave32 and wave64.
+- **Checks:** the executor's unit kernels pass on gfx1030 (ctests `*_gfx1030`), and `tests/hipcc/rdna2.cpp` checks SDWA, M0-relative registers, the permlanes and the DPP modes, in wave32 and wave64. The hipcc-built programs for textures, `__smid`, work-group shapes, the memory test and `rdna2.cpp` were also run on a real RX 6800 and RX 6700 XT, and give the same answers there as on the simulated cards.
+- **Where a wave runs:** `HW_ID1` carries the SIMD a wave is on (bits 9:8) as well as its workgroup processor. On gfx10.3 a card puts the waves of a group on SIMDs 0, 2, 1, 3 in turn and moves to the next slot after four; the simulator does the same, so HIP's `__smid` (whose lowest bit is the SIMD's) takes two values within a group, as on the card. `HW_ID2` is not modelled and a wave that reads it is refused by name.
+- **sRGB textures:** the card's conversion to linear is approximate (within 2e-3 of the exact curve in the middle of the range); the simulator's is exact.
 
 `VGPU_TRACE_WAVE=1` prints each instruction a work-group's first wave runs,
 with what its destination holds after it for lane 0 (or the lane

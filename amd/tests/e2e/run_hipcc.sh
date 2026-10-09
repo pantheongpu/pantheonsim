@@ -216,7 +216,7 @@ expect "every RDNA3 wave64 check holds (DPP, output modifiers, double literals)"
 # pitched, 3D and layered textures, surfaces, the copies to and from arrays
 # and the API's answers -- the same program built for gfx1030, gfx1100 and
 # gfx1201, whose image resources are laid out differently.
-for run in "gfx1030 rx6900xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+for run in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
   set -- $run
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/images.$1" 2>&1)
   status=$?
@@ -239,12 +239,17 @@ expect "every RDNA4 check holds (WMMA, scalar floats, split barrier, SCHED_MODE)
 # DPP's row_share and row_xmask, the stack reached through a flat pointer
 # (FLAT_SCRATCH set first), and a cooperative grid sync (the GWS barrier) --
 # in wave32 and wave64.
-for w in "" .w64; do
-  out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6900xt LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2$w.gfx1030" 2>&1)
-  status=$?
-  expect "the RDNA2${w:+ wave64} program runs to the end" "0" "$status"
-  expect "every RDNA2${w:+ wave64} check holds (SDWA, M0, permlane16, DPP, FLAT_SCRATCH, GWS)" "13 of 13" \
-    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 13"
+# The RX 6800 and RX 6700 XT run it too, and the real cards give the same
+# answers (gfx1031 is built for the RX 6700 XT).
+for run in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt"; do
+  set -- $run
+  for w in "" .w64; do
+    out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2$w.$1" 2>&1)
+    status=$?
+    expect "the $2 RDNA2${w:+ wave64} program runs to the end" "0" "$status"
+    expect "every $2 RDNA2${w:+ wave64} check holds (SDWA, M0, permlane16, DPP, FLAT_SCRATCH, GWS)" "13 of 13" \
+      "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 13"
+  done
 done
 
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
@@ -481,8 +486,10 @@ done
 
 # Which compute unit each work-group runs on (hipcc/smid.cpp): HIP's __smid
 # from the hardware registers that say, or on gfx12 HW_ID1 itself. Four groups
-# to a multiprocessor find every one, and a group's waves all the same one.
-for gpu in mi300x:304 mi350x:256 mi250x:110 rx6900xt:40 rx7900xtx:48 rx9070xt:32; do
+# to a multiprocessor find every one, and a group's waves all the same one (on
+# gfx1030 and gfx1031 the same workgroup processor: the waves of a group sit on
+# its SIMDs, as on the real cards, and __smid's lowest bit is the SIMD's).
+for gpu in mi300x:304 mi350x:256 mi250x:110 rx6900xt:40 rx6800:30 rx6700xt:20 rx7900xtx:48 rx9070xt:32; do
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/${gpu%%:*} LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smid.all" 2>&1)
   expect "__smid tells each multiprocessor of the ${gpu%%:*} apart" \
     "${gpu#*:} of ${gpu#*:} multiprocessors, 0 work-items disagree" "$(sed -n 's/^gfx[^ ]*: //p' <<< "$out")"

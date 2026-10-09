@@ -1191,12 +1191,20 @@ struct Machine {
         } else if (id == 20 && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950)) {
           reg = place_of(d, w.group).die & 0xF;   // XCC_ID: the compute die (3:0)
         } else if (id == 23 && is_rdna(in.arch)) {
-          // HW_ID1: the wave's slot (4:0), its workgroup processor (13:10),
-          // shader array (16) and engine (20:18). A work-group's waves are
-          // all on one workgroup processor, as in HIP's default WGP mode.
+          // HW_ID1: the wave's slot (4:0), the SIMD it runs on (9:8), its
+          // workgroup processor (13:10), shader array (16) and engine
+          // (20:18). A work-group's waves are all on one workgroup
+          // processor. On gfx10.3 the waves go to the SIMDs four at a time in
+          // the order 0, 2, 1, 3 and take the next slot after each four, as
+          // an RX 6800 and an RX 6700 XT place them (measured with
+          // s_getreg of HW_ID1 in every wave of 256-thread groups); the other
+          // generations put every wave on SIMD 0 and number the slots by wave.
           const Place p = place_of(d, w.group);
-          reg = (static_cast<uint32_t>(w.first_lane / w.lanes) & 0x1F) | (p.unit & 0xF) << 10 | (p.array & 1) << 16 |
-                (p.engine & 7) << 18;
+          const uint32_t wave = static_cast<uint32_t>(w.first_lane / w.lanes);
+          static constexpr uint32_t kSimd1030[4] = {0, 2, 1, 3};
+          const bool rdna2 = in.arch == gcn::Target::Gfx1030;
+          reg = ((rdna2 ? wave / 4 : wave) & 0x1F) | (rdna2 ? kSimd1030[wave % 4] : 0) << 8 | (p.unit & 0xF) << 10 |
+                (p.array & 1) << 16 | (p.engine & 7) << 18;
         }
         // SHADER_CYCLES, which clock() reads on RDNA: 20 bits of the cycle
         // count on gfx10.3 and gfx11; on gfx12 its low word (29) and high

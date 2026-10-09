@@ -334,7 +334,11 @@ int main() {
     for (int i = 0; i < n; ++i)
       wrong += ri[i].x != px[i].x || ri[i].y != px[i].y || ri[i].z != px[i].z || ri[i].w != px[i].w;
     report("8-bit texels read as integers", wrong, n);
-    // sRGB: the color channels come back linear, alpha as it is.
+    // sRGB: the color channels come back linear, alpha as it is. The
+    // hardware converts approximately: an RX 6800 and an RX 6700 XT are within
+    // 2e-3 of the exact curve (about half an 8-bit step) where it is
+    // steepest, so this allows 4e-3, still well under what leaving the
+    // channels unconverted would be off by (0.025 at the second texel).
     hipTextureObject_t ts = 0;
     d.readMode = hipReadModeNormalizedFloat;
     d.sRGB = 1;
@@ -347,8 +351,8 @@ int main() {
     };
     wrong = 0;
     for (int i = 0; i < n; ++i)
-      wrong += std::fabs(rs[i].x - linear(px[i].x)) > 1e-5f || std::fabs(rs[i].y - linear(px[i].y)) > 1e-5f ||
-               std::fabs(rs[i].z - linear(px[i].z)) > 1e-5f || std::fabs(rs[i].w - px[i].w / 255.0f) > 1e-6f;
+      wrong += std::fabs(rs[i].x - linear(px[i].x)) > 4e-3f || std::fabs(rs[i].y - linear(px[i].y)) > 4e-3f ||
+               std::fabs(rs[i].z - linear(px[i].z)) > 4e-3f || std::fabs(rs[i].w - px[i].w / 255.0f) > 1e-6f;
     report("8-bit sRGB texels read as linear floats", wrong, n);
     CHECK(hipDestroyTextureObject(ts));
     CHECK(hipDestroyTextureObject(tf));
