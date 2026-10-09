@@ -405,10 +405,27 @@ bool forward(const Rnn& r, const Data& xd, const std::vector<real>& x, const std
         if (!res) continue;  // inference: no dropout
         real* m = res->data() + rv.mask_at(l, dir);
         if (p > 0.0f) {
+          // The mask covers the valid steps only (padded steps draw nothing), time step after time step, and at each
+          // step the batch entries from the longest sequence to the shortest (equal lengths in their own order) --
+          // whatever the data layout. Measured on an RTX 3060 (cuDNN 9.27, padded I/O enabled, lengths unsorted,
+          // tied, and in all three layouts) through the descriptor's states and the outputs.
+          const size_t width = (size_t)O * D;
+          std::vector<size_t> order;   // the dense [T][B] position of each valid step, in the order drawn
+          std::vector<int> by_len(B);
+          for (int b = 0; b < B; ++b) by_len[b] = b;
+          std::stable_sort(by_len.begin(), by_len.end(), [&](int a, int c) { return xd.len[a] > xd.len[c]; });
+          for (int t = 0; t < T; ++t)
+            for (int b : by_len)
+              if (t < xd.len[b]) order.push_back((size_t)t * B + b);
           std::vector<uint8_t> keep;
-          if (!vgpu_cudnn::dropout_draw(r.drop, out.size(), &keep)) return false;
+          if (!vgpu_cudnn::dropout_draw(r.drop, order.size() * width, &keep)) return false;
           const real scale = p < 1.0f ? 1.0f / (1.0f - p) : 0.0f;
-          for (size_t i = 0; i < out.size(); ++i) m[i] = keep[i] ? scale : 0.0f, ins[dir][i] *= m[i];
+          std::fill(m, m + out.size(), 1.0f);
+          for (size_t q = 0; q < order.size(); ++q)
+            for (size_t j = 0; j < width; ++j) {
+              const size_t i = order[q] * width + j;
+              m[i] = keep[q * width + j] ? scale : 0.0f, ins[dir][i] *= m[i];
+            }
         } else {
           std::fill(m, m + out.size(), 1.0f);
         }
