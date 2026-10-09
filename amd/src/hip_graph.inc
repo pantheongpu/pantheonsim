@@ -72,6 +72,11 @@ struct CopyData {
   const void* rsrc = nullptr;
   Region dr, sr;
   int rkind = 0;
+  // A captured copy whose source was on the capturing thread's stack: the bytes
+  // as they were then (from the start of the first row), for a launch made after
+  // that frame has gone. `snap_thread` is the thread whose stack it was.
+  std::shared_ptr<const std::vector<uint8_t>> snap;
+  std::thread::id snap_thread;
 };
 
 // A fill node: hipMemsetParams as given, and a depth for a captured 3D fill,
@@ -669,6 +674,7 @@ struct Step {
   KernelData kernel;
   void* dst = nullptr;
   const void* src = nullptr;
+  std::shared_ptr<const std::vector<uint8_t>> snap;   // keeps `src` valid where it points into one
   Region dr, sr;
   int kind = 0;
   uint8_t pattern[4] = {};
@@ -682,6 +688,9 @@ struct Step {
   std::vector<uint8_t> ops;       // a batch of memory operations
 };
 struct Plan {
+  // The launching call's caller's stack pointer, about: what lies at or above it
+  // is still a live frame of the thread that launched.
+  const char* live_from = nullptr;
   std::vector<Step> steps;
   std::vector<std::pair<hipEvent_t, std::shared_ptr<Stamp>>> records;
 };
@@ -699,6 +708,15 @@ void plan_graph(State& s, const GraphObj& g, unsigned long long flags, Plan* pla
         if (n->copy.empty) st.type = vgpu::amd::abi::kNodeEmpty;
         st.dst = n->copy.rdst;
         st.src = n->copy.rsrc;
+        // A source that was a stack variable when captured is taken from the capture
+        // once its frame is gone (a library's local, copied from after it returned,
+        // as rocPRIM's histogram does); a frame still there is read as it is now,
+        // as a host buffer refilled before each launch is.
+        if (n->copy.snap && !(n->copy.snap_thread == std::this_thread::get_id() && plan->live_from &&
+                              static_cast<const char*>(n->copy.rsrc) >= plan->live_from)) {
+          st.snap = n->copy.snap;
+          st.src = st.snap->data();
+        }
         st.dr = n->copy.dr;
         st.sr = n->copy.sr;
         st.kind = n->copy.rkind;
@@ -953,6 +971,18 @@ GNode* capture_append(Capture* c, hipStream_t resolved, std::unique_ptr<GNode> n
   return p;
 }
 
+// Whether `p` is on the calling thread's stack.
+bool on_this_stack(const void* p) {
+  pthread_attr_t a;
+  if (pthread_getattr_np(pthread_self(), &a) != 0) return false;
+  void* lo = nullptr;
+  size_t size = 0;
+  const bool ok = pthread_attr_getstack(&a, &lo, &size) == 0;
+  pthread_attr_destroy(&a);
+  const char* q = static_cast<const char*>(p);
+  return ok && q >= static_cast<const char*>(lo) && q < static_cast<const char*>(lo) + size;
+}
+
 hipError_t capture_copy(State&, hipStream_t resolved, void* dst, const Region& dr, const void* src, const Region& sr,
                         hipMemcpyKind kind) {
   Capture* c = capture_of(resolved);
@@ -966,6 +996,12 @@ hipError_t capture_copy(State&, hipStream_t resolved, void* dst, const Region& d
   n->copy.sr = sr;
   n->copy.rkind = kind;
   n->copy.kind = kind;
+  if (!dr.empty() && sr.width && on_this_stack(src)) {
+    const uint64_t last = (sr.depth ? sr.depth - 1 : 0) * sr.slice + (sr.rows ? sr.rows - 1 : 0) * sr.pitch + sr.width;
+    n->copy.snap = std::make_shared<std::vector<uint8_t>>(static_cast<const uint8_t*>(src),
+                                                         static_cast<const uint8_t*>(src) + last);
+    n->copy.snap_thread = std::this_thread::get_id();
+  }
   capture_append(c, resolved, std::move(n));
   return hipSuccess;
 }
@@ -2280,6 +2316,7 @@ hipError_t hipGraphLaunch(void* exec, hipStream_t stream) {
   if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return record(s, e);
   if (x->last_queue && x->last_queue != o.queue) o.after.push_back({x->last_queue, x->last_seq});
   auto plan = std::make_shared<Plan>();
+  plan->live_from = static_cast<const char*>(__builtin_frame_address(0)) + 2 * sizeof(void*);
   plan_graph(s, *x->copy, x->flags, plan.get());
   Queue* self = o.queue.get();
   const uint64_t seq = o.queue->submit(

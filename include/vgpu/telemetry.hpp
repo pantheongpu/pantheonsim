@@ -35,9 +35,10 @@
 namespace vgpu::telemetry {
 
 inline constexpr uint32_t kMagic = 0x56475054;  // "VGPT"
-inline constexpr uint32_t kVersion = 5;  // 2: reliability and link; 3: clock-event reasons;
+inline constexpr uint32_t kVersion = 6;  // 2: reliability and link; 3: clock-event reasons;
                                          // 4: the link's maximum apart from its current state;
-                                         // 5: NVLink generation and link count
+                                         // 5: NVLink generation and link count;
+                                         // 6: the framebuffer the driver keeps for itself
 inline constexpr int kMaxDevices = 16;
 inline constexpr int kMaxProcs = 8;
 
@@ -92,6 +93,9 @@ struct DeviceSample {
   // Clock-event reasons injected with `vgpu fault throttle`, NVML's bits. Set
   // when a reading is taken (ras::apply_throttle), never by a publisher.
   uint64_t clock_event_reasons;
+  // The part of vram_total_bytes the driver sets aside for itself (profile): NVML counts it in the
+  // total, and not in what is free or used. ECC and page tables, as on a card.
+  uint64_t vram_reserved_bytes;
 
   uint32_t proc_count;
   ProcSample procs[kMaxProcs];
