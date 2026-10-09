@@ -877,7 +877,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   ALLOC_FAILED, a null descriptor MATRIX_TYPE_NOT_SUPPORTED, an option METIS
   rejects INTERNAL_ERROR) except where the card crashes (a NULL p, Fortran
   numbering in the options) or reads past its arrays (offsets that disagree
-  with nnz, columns out of range): INVALID_VALUE here. Measured differences: when several columns of
+  with nnz, columns out of range): INVALID_VALUE here. The solvers'
+  `reorder = 3` uses the same METIS ordering. Measured differences: when several columns of
   a Cholesky factorization are independent of one another NVIDIA's names a
   different one in `singularity`. `Xgeev` on a complex matrix returns its
   eigenvalues in NVIDIA's order up to n = 74 (both are LAPACK's single-shift

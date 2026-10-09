@@ -18,7 +18,7 @@
 //
 // reorder 0 keeps the natural order; 1 is csrsymrcm's reverse Cuthill-McKee
 // and 2 csrsymamd's approximate minimum degree, both NVIDIA's exact
-// permutations; 3 (METIS) is csrsymmdq's minimum degree. They change the fill
+// permutations; 3 (METIS) is csrmetisnd's (METIS 5.1.0's nested dissection). They change the fill
 // and the rounding, not the answer. What an RTX 3060's cuSOLVER (CUDA 13.0) showed,
 // and this follows (nvidia/tests/e2e/solver_sparse_paths.cu):
 //
@@ -44,8 +44,7 @@
 //     augmentation), unmatched columns given the unmatched rows in order.
 //
 // Not reproduced: which index NVIDIA's Cholesky names when several columns
-// are independent of one another (its internal order differs), csrmetisnd's
-// METIS permutation (any fill-reducing permutation is a correct answer), and
+// are independent of one another (its internal order differs), and
 // its Cholesky with reorder = 1 reading the upper triangle it documents as
 // ignored.
 #include <cusolverSp.h>
@@ -420,13 +419,27 @@ std::vector<int> approximate_minimum_degree(const std::vector<std::set<int>>& g)
   return etree_postorder(g, order);
 }
 
+// METIS_NodeND's permutation of a graph (neighbour sets, no loops); minimum
+// degree and the elimination tree's postorder if METIS fails.
+std::vector<int> metis_order(const std::vector<std::set<int>>& g) {
+  const int n = (int)g.size();
+  if (n == 0) return {};
+  std::vector<int64_t> xadj(1, 0), adj, perm, iperm;
+  for (const auto& nb : g) {
+    adj.insert(adj.end(), nb.begin(), nb.end());
+    xadj.push_back((int64_t)adj.size());
+  }
+  if (vgpu::cusolver_metis::node_nd(n, xadj, adj, nullptr, &perm, &iperm) != 1 /* METIS_OK */)
+    return etree_postorder(g, minimum_degree(g));
+  return std::vector<int>(perm.begin(), perm.end());
+}
+
 // The column order `reorder` names, over the graph a factorization fills:
-// 1 csrsymrcm's, 2 csrsymamd's, 3 csrsymmdq's in place of METIS (see
-// csrmetisndHost).
+// 1 csrsymrcm's, 2 csrsymamd's, 3 csrmetisnd's (see csrmetisndHost).
 std::vector<int> column_order(int reorder, const std::vector<std::set<int>>& g, const std::vector<char>& diag = {}) {
   if (reorder == 1) return rcm(g, diag);
   if (reorder == 2) return approximate_minimum_degree(g);
-  if (reorder == 3) return etree_postorder(g, minimum_degree(g));
+  if (reorder == 3) return metis_order(g);
   std::vector<int> q(g.size());
   for (size_t i = 0; i < q.size(); ++i) q[i] = (int)i;
   return q;
@@ -981,7 +994,10 @@ static cusolverStatus_t ordering(cusolverSpHandle_t h, int n, int nnz, cusparseM
   if (const cusolverStatus_t st = check_descr(d); st != CUSOLVER_STATUS_SUCCESS) return st;
   std::vector<int> o, c;
   if (!read_pattern(n, n, nnz, d, off, col, false, &o, &c)) return CUSOLVER_STATUS_INVALID_VALUE;
-  const auto q = column_order(reorder, symmetric_graph(n, o, c), diagonal_flags(n, o, c));
+  // The three entry points number their orderings 1 (rcm), 2 (amd) and 3 (mdq);
+  // the solvers' `reorder` numbers them 1, 2 and 3 (METIS), see column_order.
+  const auto g = symmetric_graph(n, o, c);
+  const auto q = reorder == 3 ? etree_postorder(g, minimum_degree(g)) : column_order(reorder, g, diagonal_flags(n, o, c));
   std::copy(q.begin(), q.end(), p);
   return CUSOLVER_STATUS_SUCCESS;
 }
