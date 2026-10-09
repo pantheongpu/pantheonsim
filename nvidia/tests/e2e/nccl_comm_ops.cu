@@ -72,6 +72,8 @@ static void expect_rc(ncclResult_t got, ncclResult_t want, const char* what) {
   std::printf("%s -> %s\n", #x, ncclGetErrorString(r_)); return 1; } } while (0)
 
 static int nranks = 0;
+static int g_ndev = 1;  // physical devices: with NCCL_MULTI_RANK_GPU_ENABLE=1 several ranks share one
+static int dev_of(int rank) { return rank % g_ndev; }
 static std::vector<cudaStream_t> streams;
 
 // Poll a non-blocking communicator until its last operation is done.
@@ -83,19 +85,19 @@ static ncclResult_t settle(ncclComm_t c) {
 }
 
 static void sync_all() {
-  for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaStreamSynchronize(streams[i]); }
+  for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaStreamSynchronize(streams[i]); }
 }
 
 template <class T> static T* upload(int dev, const std::vector<T>& h) {
   T* d = nullptr;
-  cudaSetDevice(dev);
+  cudaSetDevice(dev_of(dev));
   cudaMalloc(&d, h.size() * sizeof(T) + 16);
   cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
   return d;
 }
 template <class T> static std::vector<T> download(int dev, const T* d, size_t n) {
   std::vector<T> h(n);
-  cudaSetDevice(dev);
+  cudaSetDevice(dev_of(dev));
   cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
   return h;
 }
@@ -121,14 +123,14 @@ static bool gathered_order(const std::vector<ncclComm_t>& comms, const std::vect
   for (int m = 0; m < n; ++m) {
     std::vector<int> h = download(members[m], out[m], n);
     if (h != want_order) ok = false;
-    cudaSetDevice(members[m]); cudaFree(in[m]); cudaFree(out[m]);
+    cudaSetDevice(dev_of(members[m])); cudaFree(in[m]); cudaFree(out[m]);
   }
   return ok;
 }
 
 static void destroy_all(std::vector<ncclComm_t>& comms) {
   for (int i = 0; i < nranks; ++i)
-    if (comms[i]) { cudaSetDevice(i); ncclCommDestroy(comms[i]); comms[i] = nullptr; }
+    if (comms[i]) { cudaSetDevice(dev_of(i)); ncclCommDestroy(comms[i]); comms[i] = nullptr; }
 }
 
 // A communicator of every rank to experiment on: one split of the world.
@@ -136,7 +138,7 @@ static bool new_child(const std::vector<ncclComm_t>& parent, std::vector<ncclCom
   child.assign(nranks, nullptr);
   if (ncclGroupStart() != ncclSuccess) return false;
   for (int i = 0; i < nranks; ++i) {
-    cudaSetDevice(i);
+    cudaSetDevice(dev_of(i));
     if (ncclCommSplit(parent[i], 0, i, &child[i], nullptr) != ncclSuccess) { ncclGroupEnd(); return false; }
   }
   return ncclGroupEnd() == ncclSuccess;
@@ -149,7 +151,7 @@ static bool fresh_comm(std::vector<ncclComm_t>& comm) {
   comm.assign(nranks, nullptr);
   if (ncclGroupStart() != ncclSuccess) return false;
   for (int i = 0; i < nranks; ++i) {
-    cudaSetDevice(i);
+    cudaSetDevice(dev_of(i));
     if (ncclCommInitRank(&comm[i], nranks, id, i) != ncclSuccess) { ncclGroupEnd(); return false; }
   }
   return ncclGroupEnd() == ncclSuccess;
@@ -160,7 +162,7 @@ static float* d_scratch(int dev) {
   static std::vector<float*> buf;
   if (buf.empty()) {
     buf.assign(nranks, nullptr);
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaMalloc(&buf[i], 4096 * sizeof(float)); cudaMemset(buf[i], 0, 4096 * sizeof(float)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaMalloc(&buf[i], 4096 * sizeof(float)); cudaMemset(buf[i], 0, 4096 * sizeof(float)); }
   }
   return buf[dev];
 }
@@ -171,18 +173,22 @@ int main() {
   cudaGetDeviceCount(&ndev);
   nranks = ndev;
   if (const char* e = std::getenv("VGPU_NCCL_RANKS")) nranks = std::atoi(e);
-  if (nranks < 2 || nranks > ndev) {
-    std::printf("SKIP: needs 2 or more devices, one per rank (ranks=%d, devices=%d)\n", nranks, ndev);
+  g_ndev = ndev > 0 ? ndev : 1;
+  // NVIDIA's library refuses two ranks on one GPU unless NCCL_MULTI_RANK_GPU_ENABLE=1 (2.31.2).
+  const char* multi = std::getenv("NCCL_MULTI_RANK_GPU_ENABLE");
+  const bool share = multi && multi[0] == '1';
+  if (nranks < 2 || (nranks > ndev && !share)) {
+    std::printf("SKIP: needs 2 or more devices, one per rank (ranks=%d, devices=%d; NCCL_MULTI_RANK_GPU_ENABLE=1 lets ranks share)\n", nranks, ndev);
     return 0;
   }
   ncclGetVersion(&g_ver);
   std::printf("nccl ranks=%d\n", nranks);
   streams.resize(nranks);
-  for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaStreamCreate(&streams[i]); }
+  for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaStreamCreate(&streams[i]); }
 
   std::vector<ncclComm_t> world(nranks);
   std::vector<int> devs(nranks);
-  for (int i = 0; i < nranks; ++i) devs[i] = i;
+  for (int i = 0; i < nranks; ++i) devs[i] = dev_of(i);
   NK(ncclCommInitAll(world.data(), nranks, devs.data()));
   std::vector<int> everyone(nranks);
   for (int i = 0; i < nranks; ++i) everyone[i] = i;
@@ -193,7 +199,7 @@ int main() {
     // One color, keys descending: the new order is the old one reversed.
     std::vector<ncclComm_t> child(nranks, nullptr);
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSplit(world[i], 7, -i, &child[i], nullptr)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSplit(world[i], 7, -i, &child[i], nullptr)); }
     NK(ncclGroupEnd());
     bool ok = true;
     for (int i = 0; i < nranks; ++i) {
@@ -210,7 +216,7 @@ int main() {
     // Two colors (even and odd ranks), equal keys: old order within each.
     // Color -2 is an ordinary color; only NCCL_SPLIT_NOCOLOR (-1) is special.
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSplit(world[i], i % 2 ? 5 : -2, 0, &child[i], nullptr)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSplit(world[i], i % 2 ? 5 : -2, 0, &child[i], nullptr)); }
     NK(ncclGroupEnd());
     ok = true;
     for (int i = 0; i < nranks; ++i) {
@@ -232,7 +238,7 @@ int main() {
     for (auto& c : child) c = reinterpret_cast<ncclComm_t>(0x1);
     NK(ncclGroupStart());
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       NK(ncclCommSplit(world[i], i == nranks - 1 ? NCCL_SPLIT_NOCOLOR : 0, i, &child[i], nullptr));
     }
     NK(ncclGroupEnd());
@@ -241,7 +247,7 @@ int main() {
     expect(ok, "split: NCCL_SPLIT_NOCOLOR gets a NULL communicator");
     destroy_all(child);
 
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     expect_rc(ncclCommSplit(world[0], 0, 0, nullptr, nullptr), ncclInvalidArgument, "split: NULL newcomm");
     ncclComm_t x = nullptr;
     expect_rc(ncclCommSplit(nullptr, 0, 0, &x, nullptr), ncclInvalidArgument, "split: NULL comm");
@@ -251,7 +257,7 @@ int main() {
     NK(ncclGroupStart());
     ok = true;
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       child[i] = reinterpret_cast<ncclComm_t>(0x1);
       ok = ok && ncclCommSplit(world[i], 0, i, &child[i], &bad) == ncclInvalidArgument && child[i] == nullptr;
     }
@@ -272,7 +278,7 @@ int main() {
     // One thread, no group: a blocking init would deadlock here.
     bool ok = true;
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclCommInitRankConfig(&nb[i], nranks, id, i, &cfg) == ncclInProgress && nb[i];
     }
     expect(ok, "nonblocking: init returns ncclInProgress");
@@ -283,7 +289,7 @@ int main() {
     for (int i = 0; i < nranks; ++i) buf[i] = upload(i, std::vector<float>(64, 1.0f + i));
     ok = true;
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclAllReduce(buf[i], buf[i], 64, ncclFloat, ncclSum, nb[i], streams[i]) == ncclInProgress;
     }
     expect(ok, "nonblocking: ungrouped allreduce returns ncclInProgress");
@@ -308,14 +314,14 @@ int main() {
     std::vector<ncclComm_t> kid(nranks, nullptr);
     ok = true;
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclCommSplit(nb[i], 0, i, &kid[i], nullptr) == ncclSuccess;
     }
     expect(ok, "nonblocking: ungrouped split returns ncclSuccess");
     for (int i = 0; i < nranks; ++i) ok = ok && settle(nb[i]) == ncclSuccess && kid[i] != nullptr;
     expect(ok, "nonblocking: newcomm is set when the parent settles");
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclAllReduce(buf[i], buf[i], 64, ncclFloat, ncclMax, kid[i], streams[i]) == ncclInProgress;
     }
     for (int i = 0; i < nranks; ++i) ok = ok && settle(kid[i]) == ncclSuccess;
@@ -326,7 +332,7 @@ int main() {
     ncclConfig_t blk = NCCL_CONFIG_INITIALIZER;
     blk.blocking = 1;
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSplit(nb[i], 0, i, &kid[i], &blk)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSplit(nb[i], 0, i, &kid[i], &blk)); }
     expect_rc(ncclGroupEnd(), ncclInProgress, "nonblocking: grouped split of a non-blocking parent");
     ok = true;
     for (int i = 0; i < nranks; ++i) ok = ok && settle(nb[i]) == ncclSuccess && kid[i] != nullptr;
@@ -342,16 +348,16 @@ int main() {
 #endif
 
     ok = true;
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ok = ok && ncclCommFinalize(nb[i]) == ncclInProgress; }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ok = ok && ncclCommFinalize(nb[i]) == ncclInProgress; }
     expect(ok, "nonblocking: finalize returns ncclInProgress");
     for (int i = 0; i < nranks; ++i) ok = ok && settle(nb[i]) == ncclSuccess;
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ok = ok && ncclCommDestroy(nb[i]) == ncclSuccess; cudaFree(buf[i]); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ok = ok && ncclCommDestroy(nb[i]) == ncclSuccess; cudaFree(buf[i]); }
     expect(ok, "nonblocking: settles, then destroys");
 
     // Used before its init finished (the other ranks have not joined): the
     // call fails, and the communicator keeps that error.
     ncclGetUniqueId(&id);
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     ncclComm_t early = nullptr;
     NK(ncclCommInitRankConfig(&early, nranks, id, 0, &cfg));
     int n = -1;
@@ -404,7 +410,7 @@ int main() {
       s[i] = upload(i, h);
       d[i] = upload(i, std::vector<float>(N, 0.0f));
       hsc[i] = sc(i);
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclRedOpCreatePreMulSum(&op[i], &hsc[i], ncclFloat, ncclScalarHostImmediate, world[i]) == ncclSuccess;
       hsc[i] = 1000.0f;   // read at creation: this must not matter
     }
@@ -422,7 +428,7 @@ int main() {
     std::vector<ncclRedOp_t> dop(nranks);
     for (int i = 0; i < nranks; ++i) {
       dsc[i] = upload(i, std::vector<float>{-1.0f});
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclRedOpCreatePreMulSum(&dop[i], dsc[i], ncclFloat, ncclScalarDevice, world[i]) == ncclSuccess;
       const float later = 0.25f * (i + 1);
       cudaMemcpy(dsc[i], &later, sizeof later, cudaMemcpyHostToDevice);
@@ -438,7 +444,7 @@ int main() {
     expect(ok, "premulsum: allreduce, device scalars read at run time");
 
     // Reduce to the last rank and reduce-scatter take the same operator.
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaMemset(d[i], 0, N * sizeof(float)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaMemset(d[i], 0, N * sizeof(float)); }
     NK(ncclGroupStart());
     for (int i = 0; i < nranks; ++i) NK(ncclReduce(s[i], d[i], N, ncclFloat, dop[i], nranks - 1, world[i], streams[i]));
     NK(ncclGroupEnd());
@@ -473,7 +479,7 @@ int main() {
         si[i] = upload(i, std::vector<int>{1 + i, 1000000000 + i, 2147483647, -7});
         di[i] = upload(i, std::vector<int>(4, 0));
         isc[i] = i % 2 ? -2 : 3;
-        cudaSetDevice(i);
+        cudaSetDevice(dev_of(i));
         NK(ncclRedOpCreatePreMulSum(&iop[i], &isc[i], ncclInt32, ncclScalarHostImmediate, world[i]));
       }
       NK(ncclGroupStart());
@@ -489,7 +495,7 @@ int main() {
       ok = true;
       for (int i = 0; i < nranks; ++i) ok = ok && download(i, di[i], 4) == w;
       expect(ok, "premulsum: int32 wraps");
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclRedOpDestroy(iop[i], world[i]); cudaFree(si[i]); cudaFree(di[i]); }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ncclRedOpDestroy(iop[i], world[i]); cudaFree(si[i]); cudaFree(di[i]); }
     }
     // Half: each product is rounded to half before the sum (exact values here).
     {
@@ -502,7 +508,7 @@ int main() {
         sh[i] = upload(i, h);
         dh[i] = upload(i, std::vector<__half>(N, __float2half(0.0f)));
         hs[i] = __float2half(sc(i));
-        cudaSetDevice(i);
+        cudaSetDevice(dev_of(i));
         NK(ncclRedOpCreatePreMulSum(&hop[i], &hs[i], ncclHalf, ncclScalarHostImmediate, world[i]));
       }
       NK(ncclGroupStart());
@@ -517,11 +523,11 @@ int main() {
         for (size_t k = 0; k < N; ++k) ok = ok && __half2float(got[k]) == w[k];
       }
       expect(ok, "premulsum: half");
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclRedOpDestroy(hop[i], world[i]); cudaFree(sh[i]); cudaFree(dh[i]); }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ncclRedOpDestroy(hop[i], world[i]); cudaFree(sh[i]); cudaFree(dh[i]); }
     }
 
     // Error codes (card: NCCL 2.29.7).
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     expect_rc(ncclAllReduce(s[0], d[0], N, ncclInt32, op[0], world[0], streams[0]), ncclInvalidArgument,
               "premulsum: used with another datatype");
     expect_rc(ncclRedOpDestroy(ncclSum, world[0]), ncclInvalidArgument, "premulsum: destroy a builtin");
@@ -541,7 +547,7 @@ int main() {
               ncclSuccess, "premulsum: create after destroy");
     ncclRedOpDestroy(again, world[0]);
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       if (i) ncclRedOpDestroy(op[i], world[i]);
       ncclRedOpDestroy(dop[i], world[i]);
       cudaFree(s[i]); cudaFree(d[i]); cudaFree(dsc[i]); cudaFree(big[i]); cudaFree(part[i]);
@@ -582,7 +588,7 @@ int main() {
     {
       std::vector<ncclRedOp_t> zop(nranks);
       float one = 1.0f;
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclRedOpCreatePreMulSum(&zop[i], &one, ncclFloat, ncclScalarHostImmediate, world[i])); }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclRedOpCreatePreMulSum(&zop[i], &one, ncclFloat, ncclScalarHostImmediate, world[i])); }
       NK(ncclGroupStart());
       for (int i = 0; i < nranks; ++i) {
         NK(ncclAllGather(s[i], d[i], 0, ncclFloat, world[i], streams[i]));
@@ -592,9 +598,9 @@ int main() {
         NK(ncclRecv(d[i], 0, ncclFloat, (i + nranks - 1) % nranks, world[i], streams[i]));
       }
       expect_rc(ncclGroupEnd(), ncclSuccess, "count 0: allgather, premulsum, gather, send/recv");
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclRedOpDestroy(zop[i], world[i]); }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ncclRedOpDestroy(zop[i], world[i]); }
     }
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     expect_rc(ncclAlltoAll(s[0], d[0], C, (ncclDataType_t)99, world[0], streams[0]), ncclInvalidArgument,
               "alltoall: invalid datatype");
     expect_rc(ncclAlltoAll(s[0], d[0], C, ncclFloat, nullptr, streams[0]), ncclInvalidArgument,
@@ -605,7 +611,7 @@ int main() {
     for (int i = 0; i < nranks; ++i) {
       std::vector<float> h(C * nranks);
       for (size_t k = 0; k < h.size(); ++k) h[k] = v(i, k);
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       cudaMemcpy(s[i], h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
       cudaMemset(d[i], 0, C * nranks * sizeof(float));
     }
@@ -618,7 +624,7 @@ int main() {
     for (int i = 0; i < nranks; ++i) for (size_t k = 0; k < C; ++k) ok = ok && got[i * C + k] == v(i, k);
     ok = ok && download(0, d[0], C * nranks) == std::vector<float>(C * nranks, 0.0f);
     expect(ok, "gather: the root gets every rank's block");
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaMemset(d[i], 0, C * nranks * sizeof(float)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaMemset(d[i], 0, C * nranks * sizeof(float)); }
     NK(ncclGroupStart());
     for (int i = 0; i < nranks; ++i) NK(ncclScatter(s[i], d[i], C, ncclFloat, root, world[i], streams[i]));
     NK(ncclGroupEnd());
@@ -629,7 +635,7 @@ int main() {
       for (size_t k = 0; k < C; ++k) ok = ok && g[k] == v(root, i * C + k);
     }
     expect(ok, "scatter: rank i gets the root's block i");
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaFree(s[i]); cudaFree(d[i]); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaFree(s[i]); cudaFree(d[i]); }
   } else {
     std::printf("skipped: ncclAlltoAll/Gather/Scatter need libnccl 2.28 (this is %d)\n", g_ver);
   }
@@ -645,7 +651,7 @@ int main() {
     int ex[1] = {gone};
     std::vector<ncclComm_t> small(nranks, nullptr);
     NK(ncclGroupStart());
-    for (int i = 0; i < gone; ++i) { cudaSetDevice(i); NK(ncclCommShrink(world[i], ex, 1, &small[i], nullptr, NCCL_SHRINK_DEFAULT)); }
+    for (int i = 0; i < gone; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommShrink(world[i], ex, 1, &small[i], nullptr, NCCL_SHRINK_DEFAULT)); }
     NK(ncclGroupEnd());
     bool ok = true;
     for (int i = 0; i < gone; ++i) {
@@ -662,14 +668,14 @@ int main() {
       // Rank 0 leaves: everyone moves down one.
       int ex0[1] = {0};
       NK(ncclGroupStart());
-      for (int i = 1; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommShrink(world[i], ex0, 1, &small[i], nullptr, NCCL_SHRINK_DEFAULT)); }
+      for (int i = 1; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommShrink(world[i], ex0, 1, &small[i], nullptr, NCCL_SHRINK_DEFAULT)); }
       NK(ncclGroupEnd());
       ok = true;
       for (int i = 1; i < nranks; ++i) { int r = -1; ncclCommUserRank(small[i], &r); ok = ok && r == i - 1; }
       expect(ok, "shrink: excluding rank 0 renumbers from 0");
       destroy_all(small);
     }
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     ncclComm_t x = reinterpret_cast<ncclComm_t>(0x1);
     int self[1] = {0};
     expect_rc(ncclCommShrink(world[0], self, 1, &x, nullptr, 0), ncclInvalidArgument, "shrink: excluding yourself");
@@ -691,7 +697,7 @@ int main() {
     ncclGetUniqueId(&ids[1]);
     std::vector<ncclComm_t> sc(nranks, nullptr);
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommInitRankScalable(&sc[i], nranks, i, 2, ids.data(), nullptr)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommInitRankScalable(&sc[i], nranks, i, 2, ids.data(), nullptr)); }
     NK(ncclGroupEnd());
     bool ok = true;
     for (int i = 0; i < nranks; ++i) { int n = -1, r = -1; ncclCommCount(sc[i], &n); ncclCommUserRank(sc[i], &r); ok = ok && n == nranks && r == i; }
@@ -703,14 +709,14 @@ int main() {
     cfg.blocking = 0;
     ok = true;
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclCommInitRankScalable(&sc[i], nranks, i, 1, ids.data(), &cfg) == ncclInProgress;
     }
     for (int i = 0; i < nranks; ++i) ok = ok && settle(sc[i]) == ncclSuccess;
     expect(ok, "scalable: non-blocking returns ncclInProgress, then settles");
     destroy_all(sc);
     ncclComm_t x = reinterpret_cast<ncclComm_t>(0x1);
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     expect_rc(ncclCommInitRankScalable(&x, 1, 3, 1, ids.data(), nullptr), ncclInvalidArgument, "scalable: rank 3 of 1");
     expect(x == nullptr, "scalable: ...and the comm is NULL");
   } else {
@@ -729,17 +735,17 @@ int main() {
     std::vector<void*> mem(nranks);
     std::vector<ncclWindow_t> win(nranks, nullptr);
     bool ok = true;
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ok = ok && ncclMemAlloc(&mem[i], 1 << 20) == ncclSuccess; }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ok = ok && ncclMemAlloc(&mem[i], 1 << 20) == ncclSuccess; }
     NK(ncclGroupStart());
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       ok = ok && ncclCommWindowRegister(world[i], mem[i], 1 << 20, &win[i], NCCL_WIN_COLL_SYMMETRIC) == ncclSuccess;
     }
     NK(ncclGroupEnd());
     expect(ok, "window: register an ncclMemAlloc buffer");
     for (int i = 0; i < nranks; ++i) {
       std::vector<float> h(4, 1.0f + i);
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       cudaMemcpy(mem[i], h.data(), 16, cudaMemcpyHostToDevice);
     }
     NK(ncclGroupStart());
@@ -768,14 +774,14 @@ int main() {
     }
 #endif
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommWindowDeregister(world[i], win[i])); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommWindowDeregister(world[i], win[i])); }
     NK(ncclGroupEnd());
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     ncclWindow_t w = nullptr;
     expect_rc(ncclCommWindowRegister(world[0], mem[0], 1 << 20, nullptr, 0), ncclInvalidArgument, "window: NULL win");
     expect_rc(ncclCommWindowRegister(nullptr, mem[0], 1 << 20, &w, 0), ncclInvalidArgument, "window: NULL comm");
     expect_rc(ncclCommWindowDeregister(world[0], nullptr), ncclSuccess, "window: deregister NULL");
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclMemFree(mem[i]); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ncclMemFree(mem[i]); }
   } else {
     std::printf("skipped: windows need libnccl 2.27 (this is %d)\n", g_ver);
   }
@@ -823,32 +829,39 @@ int main() {
     // group. Bit 0 suspends, anything else is a successful no-op; suspending
     // twice or resuming what is running is ncclInvalidUsage; a suspended
     // communicator still answers queries and splits.
-    auto suspended = [&](int i) { uint64_t x = 9; ncclCommMemStats(ch[i], ncclStatGpuMemSuspended, &x); return x; };
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSuspend(ch[i], 0)); }
-    NK(ncclGroupEnd());
-    expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "suspend: flags 0 do nothing");
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSuspend(ch[i], NCCL_SUSPEND_MEM)); }
-    NK(ncclGroupEnd());
-    expect(suspended(0) == 1 && suspended(nranks - 1) == 1, "suspend: NCCL_SUSPEND_MEM suspends every rank");
-    cudaSetDevice(0);
-    expect_rc(ncclCommSuspend(ch[0], NCCL_SUSPEND_MEM), ncclInvalidUsage, "suspend: twice");
-    {
-      int n = -1;
-      expect(ncclCommCount(ch[0], &n) == ncclSuccess && n == nranks, "suspend: still answers ncclCommCount");
-      ncclUniqueId u;
-      expect_rc(ncclCommGetUniqueId(ch[0], &u), ncclSuccess, "suspend: still gives unique ids");
+    // NCCL 2.29.7 (RTX 3060 pair) hangs when one thread suspends or resumes the
+    // ranks in a group, which 2.31.2 accepts (2.30 was not measured), so this part
+    // runs from 2.30.
+    if (g_ver >= NCCL_VERSION(2, 30, 0)) {
+      auto suspended = [&](int i) { uint64_t x = 9; ncclCommMemStats(ch[i], ncclStatGpuMemSuspended, &x); return x; };
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSuspend(ch[i], 0)); }
+      NK(ncclGroupEnd());
+      expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "suspend: flags 0 do nothing");
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSuspend(ch[i], NCCL_SUSPEND_MEM)); }
+      NK(ncclGroupEnd());
+      expect(suspended(0) == 1 && suspended(nranks - 1) == 1, "suspend: NCCL_SUSPEND_MEM suspends every rank");
+      cudaSetDevice(dev_of(0));
+      expect_rc(ncclCommSuspend(ch[0], NCCL_SUSPEND_MEM), ncclInvalidUsage, "suspend: twice");
+      {
+        int n = -1;
+        expect(ncclCommCount(ch[0], &n) == ncclSuccess && n == nranks, "suspend: still answers ncclCommCount");
+        ncclUniqueId u;
+        expect_rc(ncclCommGetUniqueId(ch[0], &u), ncclSuccess, "suspend: still gives unique ids");
+      }
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommResume(ch[i])); }
+      NK(ncclGroupEnd());
+      expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "resume: back to running");
+      cudaSetDevice(dev_of(0));
+      expect_rc(ncclCommResume(ch[0]), ncclInvalidUsage, "resume: not suspended");
+      expect_rc(ncclCommSuspend(nullptr, NCCL_SUSPEND_MEM), ncclInvalidArgument, "suspend: NULL comm");
+      expect_rc(ncclCommResume(nullptr), ncclInvalidArgument, "resume: NULL comm");
+      expect(gathered_order(ch, everyone, everyone), "resume: the communicator works again");
+    } else {
+      std::printf("skipped: suspending and resuming in a group needs libnccl 2.30 (this is %d)\n", g_ver);
     }
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommResume(ch[i])); }
-    NK(ncclGroupEnd());
-    expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "resume: back to running");
-    cudaSetDevice(0);
-    expect_rc(ncclCommResume(ch[0]), ncclInvalidUsage, "resume: not suspended");
-    expect_rc(ncclCommSuspend(nullptr, NCCL_SUSPEND_MEM), ncclInvalidArgument, "suspend: NULL comm");
-    expect_rc(ncclCommResume(nullptr), ncclInvalidArgument, "resume: NULL comm");
-    expect(gathered_order(ch, everyone, everyone), "resume: the communicator works again");
     destroy_all(ch);
 
     // card: revoke is local. It refuses new work with ncclInvalidUsage, can be
@@ -857,15 +870,15 @@ int main() {
     // destroying open.
     expect_rc(ncclCommRevoke(nullptr, 0), ncclSuccess, "revoke: NULL comm");
     if (!new_child(world, ch)) return 1;
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     expect_rc(ncclCommRevoke(ch[0], 1), ncclInvalidArgument, "revoke: flag 1");
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommRevoke(ch[i], 0)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommRevoke(ch[i], 0)); }
     {
       ncclResult_t e = ncclInProgress;
       for (int i = 0; i < nranks; ++i) { ncclCommGetAsyncError(ch[i], &e); if (e != ncclSuccess) break; }
       expect(e == ncclSuccess, "revoke: an idle communicator is quiescent at once");
     }
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     expect_rc(ncclAllReduce(d_scratch(0), d_scratch(0), 4, ncclFloat, ncclSum, ch[0], streams[0]),
               ncclInvalidUsage, "revoke: a collective is refused");
     expect_rc(ncclSend(d_scratch(0), 4, ncclFloat, 1, ch[0], streams[0]), ncclInvalidUsage, "revoke: so is a send");
@@ -894,7 +907,7 @@ int main() {
     expect(gathered_order(ch, everyone, everyone), "revoke: a fresh communicator, connected");
     {
       auto stuck = std::async(std::launch::async, [&] {
-        cudaSetDevice(0);
+        cudaSetDevice(dev_of(0));
         const ncclResult_t r = ncclAllReduce(d_scratch(0), d_scratch(0), 4, ncclFloat, ncclSum, ch[0], streams[0]);
         const cudaError_t c = cudaStreamSynchronize(streams[0]);
         if (r != ncclSuccess || c != cudaSuccess)
@@ -902,7 +915,7 @@ int main() {
         return r == ncclSuccess && c == cudaSuccess;
       });
       std::this_thread::sleep_for(std::chrono::milliseconds(300));
-      cudaSetDevice(0);
+      cudaSetDevice(dev_of(0));
       const ncclResult_t r = ncclCommRevoke(ch[0], 0);
       if (stuck.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
         std::printf("revoke: the stream is still stuck after 60 s\nRESULT: FAIL\n");
@@ -911,7 +924,7 @@ int main() {
       }
       expect(r == ncclSuccess && stuck.get(), "revoke: releases a collective waiting for peers");
     }
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclCommRevoke(ch[i], 0); }   // rank 0's already is: the error is expected
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ncclCommRevoke(ch[i], 0); }   // rank 0's already is: the error is expected
     destroy_all(ch);
 
     // Non-blocking: ncclInProgress, then settles.
@@ -920,11 +933,11 @@ int main() {
       cfg.blocking = 0;
       std::vector<ncclComm_t> nb(nranks, nullptr);
       NK(ncclGroupStart());
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSplit(world[i], 0, i, &nb[i], &cfg)); }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSplit(world[i], 0, i, &nb[i], &cfg)); }
       NK(ncclGroupEnd());
       bool ok = true;
       for (int i = 0; i < nranks; ++i) ok = ok && settle(nb[i]) == ncclSuccess;
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ok = ok && ncclCommRevoke(nb[i], 0) == ncclInProgress; }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ok = ok && ncclCommRevoke(nb[i], 0) == ncclInProgress; }
       for (int i = 0; i < nranks; ++i) ok = ok && settle(nb[i]) == ncclSuccess;
       expect(ok, "revoke: non-blocking returns ncclInProgress, then settles");
       destroy_all(nb);
@@ -936,17 +949,17 @@ int main() {
     {
       std::vector<ncclComm_t> one(nranks, nullptr);
       NK(ncclGroupStart());
-      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSplit(world[i], i, 0, &one[i], nullptr)); }
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommSplit(world[i], i, 0, &one[i], nullptr)); }
       NK(ncclGroupEnd());
       ncclUniqueId id;
-      cudaSetDevice(0);
+      cudaSetDevice(dev_of(0));
       NK(ncclCommGetUniqueId(one[0], &id));
       ncclComm_t g0 = nullptr, g1 = nullptr;
       ncclResult_t r0 = ncclInternalError, r1 = ncclInternalError;
-      std::thread existing([&] { cudaSetDevice(0); r0 = ncclCommGrow(one[0], 2, &id, -1, &g0, nullptr); });
+      std::thread existing([&] { cudaSetDevice(dev_of(0)); r0 = ncclCommGrow(one[0], 2, &id, -1, &g0, nullptr); });
       std::thread joiner([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));   // NCCL wants the existing rank first
-        cudaSetDevice(1);
+        cudaSetDevice(dev_of(1));
         r1 = ncclCommGrow(nullptr, 2, &id, 1, &g1, nullptr);
       });
       existing.join();
@@ -963,7 +976,7 @@ int main() {
       expect(g0 && g1 && gathered_order(two, std::vector<int>{0, 1}, std::vector<int>{0, 1}), "grow: the grown communicator works");
       // The old one is still a one-rank communicator.
       int n = -1;
-      cudaSetDevice(0);
+      cudaSetDevice(dev_of(0));
       expect(ncclCommCount(one[0], &n) == ncclSuccess && n == 1, "grow: the parent is untouched");
 
       // Errors, all local. card: nRanks no larger than the communicator, a rank
@@ -978,7 +991,7 @@ int main() {
       expect_rc(ncclCommGrow(nullptr, 2, nullptr, 1, &x, nullptr), ncclInvalidArgument, "grow: a new rank without an id");
       expect_rc(ncclCommGrow(nullptr, 2, &id2, 5, &x, nullptr), ncclInvalidArgument, "grow: a new rank outside the size");
       expect_rc(ncclCommGrow(nullptr, 2, &id2, -1, &x, nullptr), ncclInvalidArgument, "grow: a new rank of -1");
-      if (g0 && g1) { two[0] = g0; two[1] = g1; for (int i = 0; i < 2; ++i) { cudaSetDevice(i); ncclCommDestroy(two[i]); } }
+      if (g0 && g1) { two[0] = g0; two[1] = g1; for (int i = 0; i < 2; ++i) { cudaSetDevice(dev_of(i)); ncclCommDestroy(two[i]); } }
 
       if (nranks >= 3 && g0 && g1) {
         // Three ranks, which the two-GPU card cannot do: the grown pair takes a
@@ -989,23 +1002,23 @@ int main() {
         ncclComm_t a0 = nullptr, a1 = nullptr, h0 = nullptr, h1 = nullptr, h2 = nullptr;
         ncclUniqueId j;
         // a second one-rank communicator on device 1 to be the pair's other half
-        std::thread e0([&] { cudaSetDevice(0); ncclCommGrow(one[0], 2, &i1, -1, &a0, nullptr); });
-        std::thread e1([&] { std::this_thread::sleep_for(std::chrono::milliseconds(500)); cudaSetDevice(1); ncclCommGrow(nullptr, 2, &i1, 1, &a1, nullptr); });
+        std::thread e0([&] { cudaSetDevice(dev_of(0)); ncclCommGrow(one[0], 2, &i1, -1, &a0, nullptr); });
+        std::thread e1([&] { std::this_thread::sleep_for(std::chrono::milliseconds(500)); cudaSetDevice(dev_of(1)); ncclCommGrow(nullptr, 2, &i1, 1, &a1, nullptr); });
         e0.join(); e1.join();
-        cudaSetDevice(0);
+        cudaSetDevice(dev_of(0));
         NK(ncclCommGetUniqueId(a0, &j));
         ncclResult_t q0 = ncclInternalError, q1 = ncclInternalError, q2 = ncclInternalError;
-        std::thread t0([&] { cudaSetDevice(0); q0 = ncclCommGrow(a0, 3, &j, -1, &h0, nullptr); });
-        std::thread t1([&] { cudaSetDevice(1); q1 = ncclCommGrow(a1, 3, nullptr, -1, &h1, nullptr); });
-        std::thread t2([&] { std::this_thread::sleep_for(std::chrono::milliseconds(500)); cudaSetDevice(2); q2 = ncclCommGrow(nullptr, 3, &j, 2, &h2, nullptr); });
+        std::thread t0([&] { cudaSetDevice(dev_of(0)); q0 = ncclCommGrow(a0, 3, &j, -1, &h0, nullptr); });
+        std::thread t1([&] { cudaSetDevice(dev_of(1)); q1 = ncclCommGrow(a1, 3, nullptr, -1, &h1, nullptr); });
+        std::thread t2([&] { std::this_thread::sleep_for(std::chrono::milliseconds(500)); cudaSetDevice(dev_of(2)); q2 = ncclCommGrow(nullptr, 3, &j, 2, &h2, nullptr); });
         t0.join(); t1.join(); t2.join();
         expect(q0 == ncclSuccess && q1 == ncclSuccess && q2 == ncclSuccess, "grow: three ranks, the non-root form");
         std::vector<ncclComm_t> three(nranks, nullptr);
         three[0] = h0; three[1] = h1; three[2] = h2;
         expect(h0 && h1 && h2 && gathered_order(three, std::vector<int>{0, 1, 2}, std::vector<int>{0, 1, 2}), "grow: all three agree");
-        for (int i = 0; i < 3; ++i) if (three[i]) { cudaSetDevice(i); ncclCommDestroy(three[i]); }
-        cudaSetDevice(0); ncclCommDestroy(a0);
-        cudaSetDevice(1); ncclCommDestroy(a1);
+        for (int i = 0; i < 3; ++i) if (three[i]) { cudaSetDevice(dev_of(i)); ncclCommDestroy(three[i]); }
+        cudaSetDevice(dev_of(0)); ncclCommDestroy(a0);
+        cudaSetDevice(dev_of(1)); ncclCommDestroy(a1);
       }
       destroy_all(one);
     }
@@ -1023,14 +1036,20 @@ int main() {
     // No communicator of this transport supports the device API; the RTX 3060
     // pair does not either. Where one does, only the refusal is skipped.
     ncclCommProperties_t pr = NCCL_COMM_PROPERTIES_INITIALIZER;
-    cudaSetDevice(1);
+    cudaSetDevice(dev_of(1));
     const ncclResult_t rq = ncclCommQueryProperties(world[1], &pr);
-    expect(rq == ncclSuccess && pr.rank == 1 && pr.nRanks == nranks && pr.cudaDev == 1 && pr.devCommRuntimeVersionSize > 0,
+    expect(rq == ncclSuccess && pr.rank == 1 && pr.nRanks == nranks && pr.cudaDev == 1
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
+               && pr.devCommRuntimeVersionSize > 0  // nccl.h 2.29's struct stops before this
+#endif
+               ,
            "properties: rank, size, device");
     ncclCommProperties_t pr0 = NCCL_COMM_PROPERTIES_INITIALIZER;
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     ncclCommQueryProperties(world[0], &pr0);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
     expect(pr0.commHash == pr.commHash, "properties: every rank sees one communicator hash");
+#endif
     ncclCommProperties_t junk;
     std::memset(&junk, 0, sizeof junk);
     expect_rc(ncclCommQueryProperties(world[0], &junk), ncclInvalidUsage, "properties: not initialised");
@@ -1059,7 +1078,7 @@ int main() {
     // One-sided operations need host RMA, which the properties say is absent
     // here; NCCL then fails all three with ncclInvalidArgument.
     if (!pr.hostRmaSupport) {
-      cudaSetDevice(0);
+      cudaSetDevice(dev_of(0));
       ncclWaitSignalDesc_t wd = {1, 1, 0, 0};
       expect_rc(ncclSignal(1, 0, 0, 0, world[0], streams[0]), ncclInvalidArgument, "rma: signal, without host RMA");
       expect_rc(ncclWaitSignal(1, &wd, world[0], streams[0]), ncclInvalidArgument, "rma: wait for a signal, without host RMA");
@@ -1069,7 +1088,7 @@ int main() {
       std::printf("skipped: host RMA is supported here\n");
     }
     // Teams. The world team is the communicator; ranks translate by stride.
-    cudaSetDevice(1);
+    cudaSetDevice(dev_of(1));
     const ncclTeam_t tw = ncclTeamWorld(world[1]);
     expect(tw.nRanks == nranks && tw.rank == 1 && tw.stride == 1, "team: world");
     expect(ncclTeamRankToWorld(world[1], tw, 0) == 0 && ncclTeamRankToWorld(world[1], tw, nranks - 1) == nranks - 1,
@@ -1112,7 +1131,7 @@ int main() {
     std::vector<float*> sb(nranks), rb(nranks);
     const size_t C = 4;
     for (int i = 0; i < nranks; ++i) {
-      cudaSetDevice(i);
+      cudaSetDevice(dev_of(i));
       cudaMalloc(&sb[i], C * nranks * sizeof(float));
       cudaMalloc(&rb[i], C * nranks * sizeof(float));
       std::vector<float> h(C * nranks);
@@ -1120,13 +1139,13 @@ int main() {
       cudaMemcpy(sb[i], h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
     }
     auto v = [&](int rank, size_t k) { return 10.0f * (rank + 1) + (float)k; };
-    auto clear = [&] { for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaMemset(rb[i], 0, C * nranks * sizeof(float)); } };
+    auto clear = [&] { for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaMemset(rb[i], 0, C * nranks * sizeof(float)); } };
     ncclCollConfig_t good = NCCL_COLLCONFIG_INITIALIZER;
     bool ok;
 
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = true;
@@ -1137,7 +1156,7 @@ int main() {
     expect(ok, "config: AllReduce");
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclBroadcastConfig(sb[i], rb[i], C, ncclFloat, 1, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclBroadcastConfig(sb[i], rb[i], C, ncclFloat, 1, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = true;
@@ -1145,7 +1164,7 @@ int main() {
     expect(ok, "config: Broadcast");
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, 0, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, 0, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     {
@@ -1156,7 +1175,7 @@ int main() {
     }
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclAllGatherConfig(sb[i], rb[i], C, ncclFloat, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclAllGatherConfig(sb[i], rb[i], C, ncclFloat, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = true;
@@ -1164,7 +1183,7 @@ int main() {
     expect(ok, "config: AllGather");
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclReduceScatterConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclReduceScatterConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = true;
@@ -1172,7 +1191,7 @@ int main() {
     expect(ok, "config: ReduceScatter");
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclAlltoAllConfig(sb[i], rb[i], C, ncclFloat, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclAlltoAllConfig(sb[i], rb[i], C, ncclFloat, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = true;
@@ -1180,7 +1199,7 @@ int main() {
     expect(ok, "config: AlltoAll");
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclGatherConfig(sb[i], rb[i], C, ncclFloat, 1, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclGatherConfig(sb[i], rb[i], C, ncclFloat, 1, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     {
@@ -1191,7 +1210,7 @@ int main() {
     }
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclScatterConfig(sb[i], rb[i], C, ncclFloat, 0, world[i], streams[i], &good)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclScatterConfig(sb[i], rb[i], C, ncclFloat, 0, world[i], streams[i], &good)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = true;
@@ -1199,7 +1218,7 @@ int main() {
     expect(ok, "config: Scatter");
     clear();
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], nullptr)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], nullptr)); }
     NK(ncclGroupEnd());
     sync_all();
     ok = download(0, rb[0], 1)[0] != 0.0f;
@@ -1209,7 +1228,7 @@ int main() {
     // and before the communicator is looked at; the size is checked first, then
     // the magic, the forced-algorithm flag, the CTA policy and the algorithm
     // selection. These configs are rejected on rank 0 alone.
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     auto bad = [&](const char* what, const ncclCollConfig_t& cfg, ncclResult_t want, int collective = 0) {
       ncclResult_t r;
       switch (collective) {
@@ -1243,7 +1262,7 @@ int main() {
     odd.minCTAs = 4; odd.maxCTAs = 2; odd.nvlsCTAs = -4; odd.cgaClusterSize = 100; odd.CTAPolicy = NCCL_CTA_POLICY_ZERO;
     odd.userProfilerTag = 0x8000000000000001ull; odd.version = 99999; odd.size += 8;
     NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &odd)); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &odd)); }
     NK(ncclGroupEnd());
     sync_all();
     expect(download(0, rb[0], 1)[0] != 0.0f, "config: unvalidated fields do not matter");
@@ -1253,7 +1272,7 @@ int main() {
     // choose. With forceAlgSelection = 1 (the default) the impossible is an
     // error; with 0 it falls back. A selection is a comma-separated list of
     // names in any case, "^" in front of a name meaning every other one.
-    cudaSetDevice(0);
+    cudaSetDevice(dev_of(0));
     auto alg = [](const char* sel, int force) {
       ncclCollConfig_t k = NCCL_COLLCONFIG_INITIALIZER;
       k.algSelection = sel;
@@ -1276,7 +1295,7 @@ int main() {
       bool ok2 = true;
       NK2(ncclGroupStart());
       for (int i = 0; i < nranks; ++i) {
-        cudaSetDevice(i);
+        cudaSetDevice(dev_of(i));
         ncclResult_t r;
         switch (collective) {
           case 1: r = ncclBroadcastConfig(sb[i], rb[i], C, ncclFloat, 0, world[i], streams[i], &cfg); break;
@@ -1310,7 +1329,7 @@ int main() {
       ok = true;
       NK(ncclGroupStart());
       for (int i = 0; i < nranks; ++i) {
-        cudaSetDevice(i);
+        cudaSetDevice(dev_of(i));
         if (i == 0) ok = ok && ncclAllReduceConfig(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i], &spoiled) == ncclInvalidArgument;
         NK(ncclAllReduce(sb[i], rb[i], C, ncclFloat, ncclSum, world[i], streams[i]));
       }
@@ -1318,7 +1337,7 @@ int main() {
       sync_all();
       expect(ok && download(0, rb[0], 1)[0] != 0.0f, "config: a refused config leaves its group alone");
     }
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); cudaFree(sb[i]); cudaFree(rb[i]); }
+    for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); cudaFree(sb[i]); cudaFree(rb[i]); }
   } else {
     std::printf("skipped: the nccl*Config forms need libnccl 2.30 (this is %d)\n", g_ver);
   }
@@ -1437,10 +1456,14 @@ int main() {
 #endif
 
   // card: a blocking communicator finalizes once; the second is an error.
-  for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommFinalize(world[i])); }
-  cudaSetDevice(0);
+  // NVIDIA's libnccl (2.31.2, an RTX 3060 pair) hangs when one thread
+  // finalizes the ranks one after another outside a group, so they go in one.
+  NK(ncclGroupStart());
+  for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); NK(ncclCommFinalize(world[i])); }
+  NK(ncclGroupEnd());
+  cudaSetDevice(dev_of(0));
   expect_rc(ncclCommFinalize(world[0]), ncclInvalidArgument, "blocking: second finalize");
-  for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclCommDestroy(world[i]); cudaStreamDestroy(streams[i]); }
+  for (int i = 0; i < nranks; ++i) { cudaSetDevice(dev_of(i)); ncclCommDestroy(world[i]); cudaStreamDestroy(streams[i]); }
   std::printf("%s\n", g_bad ? "RESULT: FAIL" : "RESULT: all communicator operations behave as NCCL's");
   return g_bad ? 1 : 0;
 }

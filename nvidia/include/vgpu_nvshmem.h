@@ -229,6 +229,9 @@ uint64_t nvshmem_signal_fetch(uint64_t* sig_addr);
 void nvshmem_quiet(void);
 void nvshmem_fence(void);
 void nvshmemx_quiet_on_stream(cudaStream_t stream);
+void nvshmemx_flush(void);
+void nvshmemx_flush_on_stream(cudaStream_t stream);
+void nvshmemx_signal_counted_reset(uint64_t* signal_addr);
 void nvshmem_barrier_all(void);
 void nvshmem_sync_all(void);
 int nvshmem_barrier(nvshmem_team_t team);
@@ -249,6 +252,9 @@ int nvshmem_team_split_2d(nvshmem_team_t parent_team, int xrange, const nvshmem_
                           long yaxis_mask, nvshmem_team_t* yaxis_team);
 void nvshmem_team_get_config(nvshmem_team_t team, nvshmem_team_config_t* config);
 void nvshmem_team_destroy(nvshmem_team_t team);
+int nvshmemx_team_get_uniqueid(nvshmemx_team_uniqueid_t* uniqueid);
+int nvshmemx_team_init(nvshmem_team_t* team, nvshmem_team_config_t* config, long config_mask, int npes,
+                       int pe_idx_in_team);
 
 /* ---- collectives over the symmetric heap ---- */
 int nvshmem_broadcastmem(nvshmem_team_t team, void* dest, const void* source, size_t nelems, int PE_root);
@@ -261,9 +267,173 @@ int nvshmemx_fcollectmem_on_stream(nvshmem_team_t team, void* dest, const void* 
 int nvshmemx_alltoallmem_on_stream(nvshmem_team_t team, void* dest, const void* source, size_t nelems,
                                    cudaStream_t stream);
 
+/* ---- the rest of the typed host API (C++: half and bfloat16 are the CUDA types) ----
+ * Nonblocking and strided RMA, signals, collectives, reductions, atomics and
+ * waits in stream order, over NVIDIA's lists of types. */
+#ifdef __cplusplus
+}
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+extern "C" {
+
+#define VGPU_NVSHMEM_RMA_TYPES(X) \
+  VGPU_NVSHMEM_FOR_TYPES(X) X(bfloat16, __nv_bfloat16) X(half, __half)
+#define VGPU_NVSHMEM_RMA_DECLS(NAME, TYPE)                                                                  \
+  void nvshmem_##NAME##_put_nbi(TYPE* dest, const TYPE* source, size_t nelems, int pe);                    \
+  void nvshmem_##NAME##_get_nbi(TYPE* dest, const TYPE* source, size_t nelems, int pe);                    \
+  void nvshmem_##NAME##_iput(TYPE* dest, const TYPE* source, ptrdiff_t dst, ptrdiff_t sst, size_t nelems,   \
+                             int pe);                                                                       \
+  void nvshmem_##NAME##_iget(TYPE* dest, const TYPE* source, ptrdiff_t dst, ptrdiff_t sst, size_t nelems,   \
+                             int pe);                                                                       \
+  void nvshmemx_##NAME##_put_nbi_on_stream(TYPE* dest, const TYPE* source, size_t nelems, int pe,          \
+                                           cudaStream_t s);                                                 \
+  void nvshmemx_##NAME##_get_nbi_on_stream(TYPE* dest, const TYPE* source, size_t nelems, int pe,          \
+                                           cudaStream_t s);                                                 \
+  void nvshmemx_##NAME##_iput_on_stream(TYPE* dest, const TYPE* source, ptrdiff_t dst, ptrdiff_t sst,       \
+                                        size_t nelems, int pe, cudaStream_t s);                             \
+  void nvshmemx_##NAME##_iget_on_stream(TYPE* dest, const TYPE* source, ptrdiff_t dst, ptrdiff_t sst,       \
+                                        size_t nelems, int pe, cudaStream_t s);                             \
+  TYPE nvshmemx_##NAME##_g_on_stream(const TYPE* source, int pe, cudaStream_t s);                          \
+  void nvshmemx_##NAME##_put_signal_on_stream(TYPE* dest, const TYPE* source, size_t nelems,                \
+                                              uint64_t* sig_addr, uint64_t signal, int sig_op, int pe,      \
+                                              cudaStream_t s);                                              \
+  void nvshmemx_##NAME##_put_signal_nbi_on_stream(TYPE* dest, const TYPE* source, size_t nelems,            \
+                                                  uint64_t* sig_addr, uint64_t signal, int sig_op, int pe,  \
+                                                  cudaStream_t s);                                          \
+  int nvshmem_##NAME##_broadcast(nvshmem_team_t team, TYPE* dest, const TYPE* source, size_t nelems,        \
+                                 int PE_root);                                                              \
+  int nvshmem_##NAME##_fcollect(nvshmem_team_t team, TYPE* dest, const TYPE* source, size_t nelems);        \
+  int nvshmem_##NAME##_alltoall(nvshmem_team_t team, TYPE* dest, const TYPE* source, size_t nelems);        \
+  int nvshmemx_##NAME##_broadcast_on_stream(nvshmem_team_t team, TYPE* dest, const TYPE* source,            \
+                                            size_t nelems, int PE_root, cudaStream_t s);                    \
+  int nvshmemx_##NAME##_fcollect_on_stream(nvshmem_team_t team, TYPE* dest, const TYPE* source,             \
+                                           size_t nelems, cudaStream_t s);                                  \
+  int nvshmemx_##NAME##_alltoall_on_stream(nvshmem_team_t team, TYPE* dest, const TYPE* source,             \
+                                           size_t nelems, cudaStream_t s);
+VGPU_NVSHMEM_RMA_TYPES(VGPU_NVSHMEM_RMA_DECLS)
+#undef VGPU_NVSHMEM_RMA_DECLS
+
+/* half and bfloat16 also have the base forms. */
+#define VGPU_NVSHMEM_TYPED(NAME, TYPE)                                                                    \
+  void nvshmem_##NAME##_put(TYPE* dest, const TYPE* source, size_t nelems, int pe);                      \
+  void nvshmem_##NAME##_get(TYPE* dest, const TYPE* source, size_t nelems, int pe);                      \
+  void nvshmem_##NAME##_p(TYPE* dest, const TYPE value, int pe);                                         \
+  TYPE nvshmem_##NAME##_g(const TYPE* source, int pe);                                                   \
+  void nvshmemx_##NAME##_put_on_stream(TYPE* dest, const TYPE* source, size_t nelems, int pe, cudaStream_t s); \
+  void nvshmemx_##NAME##_get_on_stream(TYPE* dest, const TYPE* source, size_t nelems, int pe, cudaStream_t s); \
+  void nvshmemx_##NAME##_p_on_stream(TYPE* dest, const TYPE value, int pe, cudaStream_t s);
+VGPU_NVSHMEM_TYPED(bfloat16, __nv_bfloat16)
+VGPU_NVSHMEM_TYPED(half, __half)
+#undef VGPU_NVSHMEM_TYPED
+
+#define VGPU_NVSHMEM_SIZED_MORE(BITS)                                                                      \
+  void nvshmemx_put##BITS##_nbi_on_stream(void* dest, const void* source, size_t nelems, int pe,          \
+                                          cudaStream_t s);                                                 \
+  void nvshmemx_get##BITS##_nbi_on_stream(void* dest, const void* source, size_t nelems, int pe,          \
+                                          cudaStream_t s);                                                 \
+  void nvshmemx_iput##BITS##_on_stream(void* dest, const void* source, ptrdiff_t dst, ptrdiff_t sst,       \
+                                       size_t nelems, int pe, cudaStream_t s);                             \
+  void nvshmemx_iget##BITS##_on_stream(void* dest, const void* source, ptrdiff_t dst, ptrdiff_t sst,       \
+                                       size_t nelems, int pe, cudaStream_t s);                             \
+  void nvshmemx_put##BITS##_signal_on_stream(void* dest, const void* source, size_t nelems,                \
+                                             uint64_t* sig_addr, uint64_t signal, int sig_op, int pe,      \
+                                             cudaStream_t s);                                              \
+  void nvshmemx_put##BITS##_signal_nbi_on_stream(void* dest, const void* source, size_t nelems,            \
+                                                 uint64_t* sig_addr, uint64_t signal, int sig_op, int pe,  \
+                                                 cudaStream_t s);
+VGPU_NVSHMEM_SIZED_MORE(8)
+VGPU_NVSHMEM_SIZED_MORE(16)
+VGPU_NVSHMEM_SIZED_MORE(32)
+VGPU_NVSHMEM_SIZED_MORE(64)
+VGPU_NVSHMEM_SIZED_MORE(128)
+#undef VGPU_NVSHMEM_SIZED_MORE
+
+#define VGPU_NVSHMEM_BITWISE_TYPES(X, OP)                                                                  \
+  X(uchar, unsigned char, OP) X(ushort, unsigned short, OP) X(uint, unsigned int, OP)                      \
+  X(ulong, unsigned long, OP) X(ulonglong, unsigned long long, OP) X(int8, int8_t, OP) X(int16, int16_t, OP) \
+  X(int32, int32_t, OP) X(int64, int64_t, OP) X(uint8, uint8_t, OP) X(uint16, uint16_t, OP)                \
+  X(uint32, uint32_t, OP) X(uint64, uint64_t, OP) X(size, size_t, OP)
+#define VGPU_NVSHMEM_STANDARD_TYPES(X, OP)                                                                 \
+  VGPU_NVSHMEM_BITWISE_TYPES(X, OP)                                                                        \
+  X(char, char, OP) X(schar, signed char, OP) X(short, short, OP) X(int, int, OP) X(long, long, OP)        \
+  X(longlong, long long, OP) X(bfloat16, __nv_bfloat16, OP) X(half, __half, OP) X(float, float, OP)        \
+  X(double, double, OP)
+#define VGPU_NVSHMEM_REDUCE_DECLS(NAME, TYPE, OP)                                                          \
+  int nvshmem_##NAME##_##OP##_reduce(nvshmem_team_t team, TYPE* dest, const TYPE* source, size_t nreduce); \
+  int nvshmem_##NAME##_##OP##_reducescatter(nvshmem_team_t team, TYPE* dest, const TYPE* source,           \
+                                            size_t nreduce);                                               \
+  int nvshmemx_##NAME##_##OP##_reduce_on_stream(nvshmem_team_t team, TYPE* dest, const TYPE* source,       \
+                                                size_t nreduce, cudaStream_t s);                           \
+  int nvshmemx_##NAME##_##OP##_reducescatter_on_stream(nvshmem_team_t team, TYPE* dest, const TYPE* source, \
+                                                       size_t nreduce, cudaStream_t s);
+VGPU_NVSHMEM_BITWISE_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, and)
+VGPU_NVSHMEM_BITWISE_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, or)
+VGPU_NVSHMEM_BITWISE_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, xor)
+VGPU_NVSHMEM_STANDARD_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, max)
+VGPU_NVSHMEM_STANDARD_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, min)
+VGPU_NVSHMEM_STANDARD_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, sum)
+VGPU_NVSHMEM_STANDARD_TYPES(VGPU_NVSHMEM_REDUCE_DECLS, prod)
+#undef VGPU_NVSHMEM_REDUCE_DECLS
+
+#define VGPU_NVSHMEM_AMO_BITWISE_TYPES(X) \
+  X(uint, unsigned int) X(ulong, unsigned long) X(ulonglong, unsigned long long) X(int32, int32_t) \
+  X(uint32, uint32_t) X(int64, int64_t) X(uint64, uint64_t)
+#define VGPU_NVSHMEM_AMO_STANDARD_TYPES(X) \
+  X(int, int) X(long, long) X(longlong, long long) X(size, size_t) X(ptrdiff, ptrdiff_t)
+#define VGPU_NVSHMEM_AMO_EXTENDED_TYPES(X) X(half, __half) X(float, float) X(double, double)
+#define VGPU_NVSHMEM_AMO_INT_DECLS(NAME, TYPE)                                                             \
+  void nvshmem_##NAME##_atomic_inc(TYPE* dest, int pe);                                                    \
+  TYPE nvshmem_##NAME##_atomic_fetch_inc(TYPE* dest, int pe);                                              \
+  void nvshmem_##NAME##_atomic_add(TYPE* dest, TYPE value, int pe);                                        \
+  TYPE nvshmem_##NAME##_atomic_fetch_add(TYPE* dest, TYPE value, int pe);                                  \
+  TYPE nvshmem_##NAME##_atomic_compare_swap(TYPE* dest, TYPE cond, TYPE value, int pe);
+#define VGPU_NVSHMEM_AMO_ALL_DECLS(NAME, TYPE)                                                             \
+  TYPE nvshmem_##NAME##_atomic_fetch(const TYPE* dest, int pe);                                            \
+  void nvshmem_##NAME##_atomic_set(TYPE* dest, TYPE value, int pe);                                        \
+  TYPE nvshmem_##NAME##_atomic_swap(TYPE* dest, TYPE value, int pe);
+#define VGPU_NVSHMEM_AMO_BIT_DECLS(NAME, TYPE)                                                             \
+  void nvshmem_##NAME##_atomic_and(TYPE* dest, TYPE value, int pe);                                        \
+  void nvshmem_##NAME##_atomic_or(TYPE* dest, TYPE value, int pe);                                         \
+  void nvshmem_##NAME##_atomic_xor(TYPE* dest, TYPE value, int pe);                                        \
+  TYPE nvshmem_##NAME##_atomic_fetch_and(TYPE* dest, TYPE value, int pe);                                  \
+  TYPE nvshmem_##NAME##_atomic_fetch_or(TYPE* dest, TYPE value, int pe);                                   \
+  TYPE nvshmem_##NAME##_atomic_fetch_xor(TYPE* dest, TYPE value, int pe);
+#define VGPU_NVSHMEM_AMO_XADD_DECLS(NAME, TYPE)                                                            \
+  void nvshmemx_##NAME##_atomic_add(TYPE* dest, TYPE value, int pe);                                       \
+  TYPE nvshmemx_##NAME##_atomic_fetch_add(TYPE* dest, TYPE value, int pe);
+VGPU_NVSHMEM_AMO_BITWISE_TYPES(VGPU_NVSHMEM_AMO_INT_DECLS)
+VGPU_NVSHMEM_AMO_STANDARD_TYPES(VGPU_NVSHMEM_AMO_INT_DECLS)
+VGPU_NVSHMEM_AMO_BITWISE_TYPES(VGPU_NVSHMEM_AMO_ALL_DECLS)
+VGPU_NVSHMEM_AMO_STANDARD_TYPES(VGPU_NVSHMEM_AMO_ALL_DECLS)
+VGPU_NVSHMEM_AMO_EXTENDED_TYPES(VGPU_NVSHMEM_AMO_ALL_DECLS)
+VGPU_NVSHMEM_AMO_BITWISE_TYPES(VGPU_NVSHMEM_AMO_BIT_DECLS)
+VGPU_NVSHMEM_AMO_EXTENDED_TYPES(VGPU_NVSHMEM_AMO_XADD_DECLS)
+#undef VGPU_NVSHMEM_AMO_INT_DECLS
+#undef VGPU_NVSHMEM_AMO_ALL_DECLS
+#undef VGPU_NVSHMEM_AMO_BIT_DECLS
+#undef VGPU_NVSHMEM_AMO_XADD_DECLS
+
+#define VGPU_NVSHMEM_WAIT_TYPES(X)                                                                         \
+  X(short, short) X(int, int) X(long, long) X(longlong, long long) X(ushort, unsigned short)               \
+  X(uint, unsigned int) X(ulong, unsigned long) X(ulonglong, unsigned long long) X(int32, int32_t)        \
+  X(int64, int64_t) X(uint32, uint32_t) X(uint64, uint64_t) X(size, size_t) X(ptrdiff, ptrdiff_t)
+#define VGPU_NVSHMEM_WAIT_DECLS(NAME, TYPE)                                                                \
+  void nvshmemx_##NAME##_wait_until_on_stream(TYPE* ivar, int cmp, TYPE cmp_value, cudaStream_t s);        \
+  void nvshmemx_##NAME##_wait_until_all_on_stream(TYPE* ivars, size_t nelems, const int* status, int cmp,  \
+                                                  TYPE cmp_value, cudaStream_t s);                         \
+  void nvshmemx_##NAME##_wait_until_all_vector_on_stream(TYPE* ivars, size_t nelems, const int* status,    \
+                                                         int cmp, TYPE* cmp_values, cudaStream_t s);
+VGPU_NVSHMEM_WAIT_TYPES(VGPU_NVSHMEM_WAIT_DECLS)
+#undef VGPU_NVSHMEM_WAIT_DECLS
+#endif /* __cplusplus */
+
 /* ---- kernels that use NVSHMEM's device API ---- */
 int nvshmemx_collective_launch(const void* func, dim3 gridDims, dim3 blockDims, void** args, size_t sharedMem,
                                cudaStream_t stream);
+typedef struct nvshmemx_collective_launch_attr {
+  cudaLaunchConfig_t cuda_config;
+} nvshmemx_collective_launch_attr_t;
+int nvshmemx_collective_launch_attr(const nvshmemx_collective_launch_attr_t* attr, const void* func, void** args);
 int nvshmemx_collective_launch_query_gridsize(const void* func, dim3 blockDims, void** args, size_t sharedMem,
                                               int* gridsize);
 

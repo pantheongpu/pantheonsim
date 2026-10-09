@@ -757,6 +757,7 @@ struct Accessor {
   std::vector<int64_t> strides;   // of the amplitudes tensor; empty: default
   int32_t hyper = 0;
   bool prepared = false;
+  bool broken = false;  // a projected value out of range was given: it computes nothing after that
   int64_t need = 0;
   Part amp, norm;
   std::vector<std::unique_ptr<DevBuf>> onehot;
@@ -2754,7 +2755,14 @@ cutensornetStatus_t cutensornetAccessorCompute(const cutensornetHandle_t handle,
   Workspace* w = work_of(workDesc);
   if (!h || !a || !w || !amplitudesTensor) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
   State& s = *a->s;
-  if (Status st = check_values(s, a->proj, projectedModeValues, api)) return st;
+  // RTX 3060, cuTensorNet 2.14: a call with a projected value out of range leaves the accessor
+  // refusing every call after it (INVALID_VALUE, valid arguments included); a NULL list of
+  // values, a NULL output or a NULL workspace do not.
+  if (a->broken) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "an earlier call gave a projected value out of range");
+  if (Status st = check_values(s, a->proj, projectedModeValues, api)) {
+    if (projectedModeValues) a->broken = true;
+    return st;
+  }
   if (Status st = check_scratch(w, 0, api)) return st;
   if (Status st = check_epoch_prepared(s, a->epoch, a->prepared, "Amplitudes Accessor", api)) return st;
   if (Status st = check_scratch(w, a->need, api)) return st;
@@ -3198,9 +3206,15 @@ cutensornetStatus_t cutensornetCreateExpectation(const cutensornetHandle_t handl
   if (Status st = state_args(handle, tensorNetworkState, h, s, api)) return st;
   NetOp* op = netop_of(tensorNetworkOperator);
   if (!op || !tensorNetworkExpectation) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
-  if (op->n != s->n || op->ext != s->ext || op->type != s->type)
-    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the operator does not match the state's modes and data type");
+  // RTX 3060, cuTensorNet 2.14: an operator made for another number of modes, or in another data
+  // type, is accepted -- its terms act on the state modes they name, and the rest of the state
+  // is left alone -- and so is computing with it. Here its terms must name modes of the state,
+  // and a data type other than the state's is refused when the expectation is prepared.
   if (op->comps.empty()) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the operator has no components");
+  for (const NetComponent& comp : op->comps)
+    for (const auto& f : comp.fmodes)
+      for (int32_t m : f)
+        if (m < 0 || m >= s->n) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the operator names a mode the state does not have");
   if (awaits_mps(*s)) return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "cuTensorNet internal error");
   auto e = std::make_unique<Expectation>();
   e->s = s;
@@ -3234,6 +3248,8 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
   if (!w) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid workspace descriptor");
   State& s = *e->s;
   if (s.epoch != e->epoch || e->op->version != e->op_version) return outdated("Expectation value", api);
+  if (e->op->type != s.type)
+    return refuse(api, "an operator in another data type than the state's is not read in its own type here");
   if (Status st = check_channels(s, api)) return st;
   const int64_t extra = 2 * kExtra;
   const uint64_t limit = maxWorkspaceSizeDevice > (uint64_t)extra ? maxWorkspaceSizeDevice - (uint64_t)extra : 0;
@@ -3333,29 +3349,103 @@ cutensornetStatus_t cutensornetDestroyExpectation(cutensornetStateExpectation_t 
 
 }  // extern "C"
 
-// ---- gradients: not yet ----
+// ---- gradients of a network ----
+//
+// The gradient of each input that requires one is the adjoint of the output contracted with
+// the other inputs (conjugated, for complex data): computed here as a contraction of its own
+// per input rather than as the backward sweep of the forward path, so it needs no
+// intermediates from the forward pass. The cache workspace the sizes report is checked, not
+// used. Checked against NVIDIA's library on an RTX 3060 (2.14): the values for real and
+// complex networks, overwrite and accumulate, and the statuses of the argument errors.
 
 extern "C" {
 
-cutensornetStatus_t cutensornetNetworkSetGradientTensorMemory(const cutensornetHandle_t, cutensornetNetworkDescriptor_t,
-                                                              int64_t, void* const, const int64_t[]) {
-  return refuse("cutensornetNetworkSetGradientTensorMemory", "gradients are not implemented");
+cutensornetStatus_t cutensornetNetworkSetGradientTensorMemory(const cutensornetHandle_t handle,
+                                                              cutensornetNetworkDescriptor_t networkDesc,
+                                                              int64_t correspondingTensorId, void* const buffer,
+                                                              const int64_t strides[]) {
+  const char* api = "cutensornetNetworkSetGradientTensorMemory";
+  if (!handle_of(handle)) return fail(CUTENSORNET_STATUS_NOT_INITIALIZED, api, "invalid handle");
+  Network* n = net_of(networkDesc);
+  if (!n || correspondingTensorId < 0 || correspondingTensorId >= (int64_t)n->in.size())
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid tensor id");
+  NetTensor& t = n->in[(size_t)correspondingTensorId];
+  if (!t.q.requiresGradient)
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "this tensor does not require a gradient");
+  t.grad = buffer;
+  if (strides) t.grad_strides.assign(strides, strides + t.modes.size());
+  else t.grad_strides.clear();
+  return CUTENSORNET_STATUS_SUCCESS;
 }
-cutensornetStatus_t cutensornetNetworkSetAdjointTensorMemory(const cutensornetHandle_t, cutensornetNetworkDescriptor_t,
-                                                             const void* const, const int64_t[]) {
-  return refuse("cutensornetNetworkSetAdjointTensorMemory", "gradients are not implemented");
+
+cutensornetStatus_t cutensornetNetworkSetAdjointTensorMemory(const cutensornetHandle_t handle,
+                                                             cutensornetNetworkDescriptor_t networkDesc,
+                                                             const void* const buffer, const int64_t strides[]) {
+  const char* api = "cutensornetNetworkSetAdjointTensorMemory";
+  if (!handle_of(handle)) return fail(CUTENSORNET_STATUS_NOT_INITIALIZED, api, "invalid handle");
+  Network* n = net_of(networkDesc);
+  if (!n) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid network");
+  fill_output(*n);
+  n->adjoint = buffer;  // a NULL buffer is taken here and fails when the gradients are computed
+  if (strides) n->adjoint_strides.assign(strides, strides + n->out.modes.size());
+  else n->adjoint_strides.clear();
+  return CUTENSORNET_STATUS_SUCCESS;
 }
-cutensornetStatus_t cutensornetNetworkPrepareGradientsBackward(const cutensornetHandle_t,
-                                                               cutensornetNetworkDescriptor_t,
-                                                               const cutensornetWorkspaceDescriptor_t) {
-  return refuse("cutensornetNetworkPrepareGradientsBackward", "gradients are not implemented");
+
+cutensornetStatus_t cutensornetNetworkPrepareGradientsBackward(const cutensornetHandle_t handle,
+                                                               cutensornetNetworkDescriptor_t networkDesc,
+                                                               const cutensornetWorkspaceDescriptor_t workDesc) {
+  const char* api = "cutensornetNetworkPrepareGradientsBackward";
+  if (!handle_of(handle)) return fail(CUTENSORNET_STATUS_NOT_INITIALIZED, api, "invalid handle");
+  Network* n = net_of(networkDesc);
+  if (!n || (workDesc && !work_of(workDesc))) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
+  if (!n->prepared) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "prepare the contraction first");
+  return CUTENSORNET_STATUS_SUCCESS;
 }
-cutensornetStatus_t cutensornetNetworkComputeGradientsBackward(const cutensornetHandle_t,
-                                                               cutensornetNetworkDescriptor_t, int32_t,
-                                                               const cutensornetWorkspaceDescriptor_t,
-                                                               const cutensornetSliceGroup_t, cudaStream_t) {
-  return refuse("cutensornetNetworkComputeGradientsBackward", "gradients are not implemented");
+
+cutensornetStatus_t cutensornetNetworkComputeGradientsBackward(const cutensornetHandle_t handle,
+                                                               cutensornetNetworkDescriptor_t networkDesc,
+                                                               int32_t accumulateOutput,
+                                                               const cutensornetWorkspaceDescriptor_t workDesc,
+                                                               const cutensornetSliceGroup_t sliceGroup,
+                                                               cudaStream_t stream) {
+  const char* api = "cutensornetNetworkComputeGradientsBackward";
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_NOT_INITIALIZED, api, "invalid handle");
+  Network* n = net_of(networkDesc);
+  Workspace* w = work_of(workDesc);
+  if (!n || (workDesc && !w)) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
+  const SliceGroup* group = as<SliceGroup>(sliceGroup, kMagicSlices);
+  if (sliceGroup && !group) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid slice group");
+  if (!n->prepared) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "prepare the contraction first");
+  if (!n->adjoint) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the output's adjoint has no memory");
+  std::vector<size_t> wanted;
+  for (size_t i = 0; i < n->in.size(); ++i)
+    if (n->in[i].q.requiresGradient) wanted.push_back(i);
+  if (wanted.empty()) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "no input tensor requires a gradient");
+  // RTX 3060, cuTensorNet 2.14: the cache workspace must have been given memory -- no cache
+  // (or no workspace at all) is INSUFFICIENT_WORKSPACE, whatever size is set once there is one.
+  if (!w || !w->ptr[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_CACHE] ||
+      w->size[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_CACHE] <= 0)
+    return fail(CUTENSORNET_STATUS_INSUFFICIENT_WORKSPACE, api, "the gradients need cache workspace memory");
+  for (const NetTensor& t : n->in)
+    if (!t.data) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "an input tensor has no memory");
+  fill_output(*n);
+  const Path fwd = n->has_path ? n->path : Path{};
+  std::vector<int64_t> ids;
+  if (Status st = slice_ids(group, slices_of(fwd, extent_map(*n)), ids, api)) return st;
+  for (size_t i : wanted) {
+    if (!n->in[i].grad) continue;  // no memory for this gradient: it is left out, and the call succeeds (RTX 3060, 2.14)
+    GradNet g;
+    if (Status st = build_grad_net(*n, i, fwd, g, api)) return st;
+    std::vector<const void*> in;
+    for (const NetTensor& t : g.net.in) in.push_back(t.data);
+    if (Status st = contract_slices(h, g.net, g.path, in, n->in[i].grad, accumulateOutput != 0, w, ids, stream, api))
+      return st;
+  }
+  return CUTENSORNET_STATUS_SUCCESS;
 }
+
 cutensornetStatus_t cutensornetExpectationComputeWithGradientsBackward(
     const cutensornetHandle_t, cutensornetStateExpectation_t, int32_t, const void*, const void*,
     cutensornetWorkspaceDescriptor_t, void*, void*, cudaStream_t) {

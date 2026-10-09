@@ -1870,7 +1870,7 @@ if(TARGET vgpucublas)
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_frontend:cudnn"
                           "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
                           "dnn_attn_dropout:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet"
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_decomp_paths:cutensornet"
                           "solver_metis_paths:cusolver:cusparse"
                           "blas_u8gemm_paths:cublas" "blas_emulation_paths:cublas" "sparse_color_paths:cusparse"
                           "lt_emulation_paths:cublasLt:cublas")
@@ -2217,6 +2217,30 @@ if(TARGET vgpucublas)
   set_tests_properties(e2e_modern_dtypes PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+endif()
+
+# cuFFT's legacy callbacks: NOT_IMPLEMENTED from libcufft.so's replacement, as from NVIDIA's (the
+# static route, which works on a card, cannot run on the simulator: see the script).
+if(TARGET vgpucufft)
+  add_test(NAME e2e_fft_legacy_callbacks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_legacy_callbacks.sh)
+  set_tests_properties(e2e_fft_legacy_callbacks PROPERTIES
+    DEPENDS vgpucufft
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+endif()
+
+# cuFFT's LTO callbacks as LTO-IR (nvcc -dlto), which the simulator turns into machine
+# code with the host toolkit's libnvJitLink.
+if(TARGET vgpucufft)
+  add_test(NAME e2e_fft_lto_callbacks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_lto_callbacks.sh)
+  set_tests_properties(e2e_fft_lto_callbacks PROPERTIES
+    DEPENDS vgpucufft
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 endif()
 
