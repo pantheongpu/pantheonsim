@@ -379,6 +379,10 @@ false` throughout. gfx1251 (MI430X) is not covered.
   fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
   `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
   sparse, mixed-width and scaled ones depend on the layout read from the document.
+- **Cross-lane permutes:** `v_permlane16_var_b32`, `v_permlanex16_var_b32`, `v_permlane_{bcast,up,down,xor}_b32` (lane
+  groups of a power-of-two width a scalar gives; any other width is refused, the ISA leaving it undefined),
+  `v_permlane_idx_gen_b32`, and `v_permlane16_swap_b32` (writing only the lanes that are on), from the ISA document's
+  pseudocode (`tests/hipcc/permlane1250.cpp`).
 - **Asynchronous copies:** `global_load_async_to_lds_b{8,32,64,128}` and `global_store_async_from_lds_*` move each
   lane's bytes between its global address and its LDS address, as the ISA document's pseudocode has it; the copy is done
   when the instruction is, so `s_wait_asynccnt` has nothing to wait for (`tests/hipcc/async1250.cpp`).
@@ -388,7 +392,7 @@ false` throughout. gfx1251 (MI430X) is not covered.
 - **Decoded and printed, but refused when executed:** the tensor data mover (`tensor_load_to_lds`,
   `tensor_store_from_lds`); cluster loads, the 6- and 4-bit transposed loads
   (`*_load_tr6_*`, `*_load_tr4_*`); the named-barrier instructions; `s_set_vgpr_msb` with a non-zero value (vector
-  registers past v255); `v_permlane_*` of the new kinds, `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16
+  registers past v255); `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16
   packed arithmetic and the other 16-bit packed additions. Each says so by name when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes

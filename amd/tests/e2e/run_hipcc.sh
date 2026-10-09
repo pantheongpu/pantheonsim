@@ -376,6 +376,12 @@ status=$?
 expect "the gfx1250 asynchronous-copy program runs to the end" "0" "$status"
 expect "every gfx1250 asynchronous-copy check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's cross-lane permutes (hipcc/permlane1250.cpp): the _var forms, bcast, up, down, xor, idx_gen and the swap.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/permlane1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 permlane program runs to the end" "0" "$status"
+expect "every gfx1250 permlane check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

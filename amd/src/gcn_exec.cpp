@@ -1893,6 +1893,53 @@ struct Machine {
         if (fi || (w.exec >> s & 1)) write_lane(w, in.dst[0], lane, from[s]);
         else if (bound) write_lane(w, in.dst[0], lane, 0);
       });
+    } else if (op == "v_permlane16_var_b32"_op || op == "v_permlanex16_var_b32"_op) {
+      // gfx1250: the same gather within a row (or across the pair of rows), the lane to read chosen per lane, by
+      // the low four bits of its second source. Every lane is read, on or off, as the ISA's pseudocode has it.
+      const bool cross = op == "v_permlanex16_var_b32"_op;
+      uint32_t from[kLanes];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) from[lane] = lane_src(w, in.src[0], lane);
+      each([&](uint32_t lane) {
+        const uint32_t row = lane / 16 ^ (cross ? 1 : 0);
+        write_lane(w, in.dst[0], lane, from[row * 16 + (lane_src(w, in.src[1], lane) & 0xF)]);
+      });
+    } else if (op == "v_permlane_bcast_b32"_op || op == "v_permlane_up_b32"_op || op == "v_permlane_down_b32"_op ||
+               op == "v_permlane_xor_b32"_op) {
+      // gfx1250's group permutes: the lanes are cut into groups of S2 (a power of two), and each group takes, from the
+      // lane S1 names (bcast), from S1 lanes below it (up) or above it (down) with the ends keeping their own, or from
+      // the lane S1 xor-ed in within the group (xor). Every lane is read, on or off; only the lanes that are on are
+      // written. A group width that is not a power of two is undefined in the ISA, and is refused here.
+      const uint32_t width = static_cast<uint32_t>(scalar(w, in.src[2])), wave = w.lanes;
+      if (width == 0 || width > wave || (width & (width - 1)) != 0)
+        throw Error::make(Err::InvalidValue, in.name, " with a lane group width of ", width,
+                          ", which must be a power of two no larger than the wave: the ISA leaves it undefined");
+      const uint32_t s1 = static_cast<uint32_t>(scalar(w, in.src[1]));
+      uint32_t from[kLanes], got[kLanes];
+      for (uint32_t lane = 0; lane < kLanes; ++lane) from[lane] = lane_src(w, in.src[0], lane);
+      for (uint32_t lane = 0; lane < wave; ++lane) {
+        const uint32_t base = lane / width * width, j = lane - base;
+        uint32_t src = lane;
+        if (op == "v_permlane_bcast_b32"_op) {
+          src = base + ((s1 & 63) & (width - 1));
+        } else if (op == "v_permlane_up_b32"_op) {
+          const uint32_t delta = std::min(s1, width);
+          src = j < delta ? lane : lane - delta;
+        } else if (op == "v_permlane_down_b32"_op) {
+          const uint32_t delta = std::min(s1, width);
+          src = j + delta < width ? lane + delta : lane;
+        } else if (s1 < wave) {
+          src = lane ^ (s1 & 63);
+          if (src >= base + width) src = lane;
+        }
+        got[lane] = from[src];
+      }
+      each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, got[lane]); });
+    } else if (op == "v_permlane_idx_gen_b32"_op) {
+      // The byte address ds_bpermute wants for a lane's pick (S0, taken within its group of S1 lanes).
+      const uint32_t mask = static_cast<uint32_t>(scalar(w, in.src[1])) - 1;
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane, (((lane_src(w, in.src[0], lane) & 63) & mask) + (lane & ~mask)) << 2);
+      });
     } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
       each([&](uint32_t lane) {
         const uint32_t v = op == "v_mad_u16"_op ? u16(0, lane) * u16(1, lane) + u16(2, lane)
@@ -2614,11 +2661,21 @@ struct Machine {
       // swapped where both its lanes are on.
       // Every lane, whatever EXEC says, as the ISA's pseudocode has it.
       const bool rows32 = op.find("permlane32") != std::string::npos;
+      // (gfx1250's table lists both registers as outputs, so the second is a destination there.)
       auto& d = w.vgpr[in.dst[0].index];
-      auto& v = w.vgpr[in.src[0].index];
+      auto& v = w.vgpr[(in.src.empty() ? in.dst[1] : in.src[0]).index];
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         const bool first = rows32 ? lane >= 32 : (lane / 16) % 2 == 1;
-        if (first) std::swap(d[lane], v[rows32 ? lane - 32 : lane - 16]);
+        if (!first) continue;
+        const uint32_t other = rows32 ? lane - 32 : lane - 16;
+        // gfx1250's version writes only the lanes that are on (it reads them all).
+        if (in.arch == gcn::Target::Gfx1250) {
+          const uint32_t from_d = d[lane], from_v = v[other];
+          if (w.exec >> other & 1) v[other] = from_d;
+          if (w.exec >> lane & 1) d[lane] = from_v;
+        } else {
+          std::swap(d[lane], v[other]);
+        }
       }
     } else if (op == "v_prng_b32_e32"_op || op == "v_prng_b32_e64"_op) {
       // One step of the LFSR the CDNA4 ISA gives: shift left, and where the
