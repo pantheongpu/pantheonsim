@@ -293,14 +293,14 @@ int main() {
   for (cudaGraphExec_t e : later) CK(cudaGraphExecDestroy(e));
   CK(cudaGraphExecDestroy(sl_exec));
 
-  // Sharing a graph allocation between processes would need a handle type this
-  // does not offer, and the API documents IPC as unsupported for these too.
+  // Sharing a graph allocation between processes would need a handle type the device
+  // does not offer (cudaDevAttrMemoryPoolSupportedHandleTypes is 0): invalid, as on an RTX 3060.
   cudaGraph_t shared = nullptr;
   CK(cudaGraphCreate(&shared, 0));
   cudaMemAllocNodeParams sap = ap;
   sap.poolProps.handleTypes = cudaMemHandleTypePosixFileDescriptor;
   cudaGraphNode_t shared_node = nullptr;
-  WANT(cudaGraphAddMemAllocNode(&shared_node, shared, nullptr, 0, &sap), cudaErrorNotSupported);
+  WANT(cudaGraphAddMemAllocNode(&shared_node, shared, nullptr, 0, &sap), cudaErrorInvalidValue);
 
   CK(cudaGraphExecDestroy(exec));
   CK(cudaGraphExecDestroy(auto_exec));

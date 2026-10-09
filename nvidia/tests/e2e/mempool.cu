@@ -168,7 +168,7 @@ int main() {
   // What the API refuses.
   WANT(cudaMemPoolCreate(&mine, nullptr), cudaErrorInvalidValue);
   props.location.id = 99;
-  WANT(cudaMemPoolCreate(&mine, &props), cudaErrorInvalidDevice);
+  WANT(cudaMemPoolCreate(&mine, &props), cudaErrorInvalidValue);
   props.location.id = 0;
   cudaMemPool_t bogus = reinterpret_cast<cudaMemPool_t>(0x1234);
   WANT(cudaMemPoolTrimTo(bogus, 0), cudaErrorInvalidValue);

@@ -1259,6 +1259,14 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   and marker-label compression (one CUDA Sample), and the rest of NPP's ten thousand entry
   points, which are absent rather than approximated, so a program that needs
   more fails at link time with a name.
+- **CUDA runtime and driver**: textures of BC6H and BC7 blocks (arrays of them can be made and filled; creating
+  a texture object answers `cudaErrorNotSupported` / `CUDA_ERROR_NOT_SUPPORTED` by name; see nvidia/docs/textures.md);
+  `cudaImportExternalMemory` and
+  `cudaImportExternalSemaphore` (the handles come from Vulkan, Direct3D or NvSciBuf, which this machine does not
+  have; NVIDIA's library crashes on the invalid handles a test could pass, so there is nothing to check
+  against); `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (no profile records the
+  SM-to-GPC layout); the memory pool and VMM handle types other than the POSIX file descriptor
+  (Win32, fabric), which the RTX 3060 refuses too; and exec-affinity types the device does not offer.
 - **Device runtime** (cudadevrt, dynamic parallelism), on both engines: all of
   `cuda_device_runtime_api.h` that CUDA 12 and 13 still offer to a kernel --
   device-side launches (`<<<>>>`, `cudaGetParameterBuffer` /

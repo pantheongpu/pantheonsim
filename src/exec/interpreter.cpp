@@ -1205,11 +1205,54 @@ bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
 
 // Reads one channel's raw bits out of a texel.
 uint64_t texel_channel_bits(const MemoryManager& mem, const TextureDesc& d, uint64_t texel_addr, uint32_t ch) {
+  if (d.packed_1010102) {   // 10:10:10:2, x in the low bits
+    const uint64_t w = mem.load_scalar(texel_addr, 4);
+    static constexpr uint32_t kShift[4] = {0, 10, 20, 30}, kBits[4] = {10, 10, 10, 2};
+    return (w >> kShift[ch & 3]) & ((1u << kBits[ch & 3]) - 1);
+  }
   uint32_t offset = 0;
   for (uint32_t i = 0; i < ch; ++i) offset += d.channel_bits[i] / 8;
   const uint32_t bytes = d.channel_bits[ch] / 8;
   if (bytes == 0) return 0;
   return mem.load_scalar(texel_addr + offset, bytes);
+}
+
+// ---- block-compressed textures ----
+//
+// The texel at (x, y, z) of a block-compressed texture is a texel of the decoded block that holds it; a
+// fetch looks at one or a few blocks (a filter's footprint), so the last block decoded is kept, for the
+// length of the fetch (texture_fetch clears it first, the texture's memory being free to change between
+// fetches).
+struct BcCache {
+  bool valid = false;
+  uint64_t addr = 0;
+  BlockFormat format = BlockFormat::None;
+  DecodedBlock block{};
+};
+thread_local BcCache t_bc;
+
+uint64_t bc_texel_bits(const MemoryManager& mem, const TextureDesc& d, uint32_t x, uint32_t y, uint32_t z, uint32_t ch) {
+  const uint64_t bb = block_bytes(d.block);
+  const uint64_t blocks_per_row = (uint64_t{d.width} + 3) / 4;
+  const uint64_t block_rows = ((d.height ? d.height : 1u) + 3u) / 4u;
+  const uint64_t addr = d.base + uint64_t{z} * blocks_per_row * block_rows * bb + (y / 4) * blocks_per_row * bb + (x / 4) * bb;
+  if (!t_bc.valid || t_bc.addr != addr || t_bc.format != d.block) {
+    uint8_t raw[16];
+    mem.read(addr, raw, bb);
+    if (!decode_block(d.block, raw, &t_bc.block))
+      tex_fail(Err::Unsupported, "a texture of BC6H or BC7 blocks: these two formats are not implemented (BC1 to BC5 are)");
+    t_bc.valid = true;
+    t_bc.addr = addr;
+    t_bc.format = d.block;
+  }
+  return t_bc.block.v[(y & 3) * 4 + (x & 3)][ch & 3];
+}
+
+// One channel of the texel at (x, y, z), whose address in a plain layout is `addr`.
+uint64_t texel_raw(const MemoryManager& mem, const TextureDesc& d, uint64_t addr, uint32_t x, uint32_t y, uint32_t z,
+                   uint32_t ch) {
+  if (d.block != BlockFormat::None) return ch < d.channels ? bc_texel_bits(mem, d, x, y, z, ch) : 0;
+  return texel_channel_bits(mem, d, addr, ch);
 }
 
 // sRGB decoding, as an RTX 3060's texture unit does it: through a table, not
@@ -1308,7 +1351,10 @@ uint32_t convert_channel(const TextureDesc& d, uint32_t ch, uint64_t raw, bool f
   // A channel the format does not have reads 0 -- w too, measured on an RTX
   // 3060 for every format, read mode, filter and resource type (the
   // graphics APIs' w = 1 is not what CUDA's fetches return).
-  if (bits == 0) return 0;
+  if (bits == 0) {
+    // A block-compressed format without an alpha channel has alpha 1 (measured for BC4 and BC5).
+    return d.block != BlockFormat::None && ch == 3 ? f32bits(1.0f) : 0;
+  }
   if (d.kind == ChannelKind::Float) {
     if (bits == 32) return static_cast<uint32_t>(raw);
     if (bits == 16) {
@@ -1463,6 +1509,10 @@ float tex_round_sum(const ExactSum& sum, bool half) {
 struct TexTerm {
   int w = 0;
   uint64_t addr = 0;
+  // The texel's place, and the texture it is a texel of (a mip level of the fetched one): what a
+  // block-compressed texel is found by.
+  uint32_t x = 0, y = 0, z = 0;
+  const TextureDesc* src = nullptr;
   bool border = false;
   // Which 2x2 footprint the texel belongs to -- a 3D fetch's z-slice, a mip
   // blend's level -- since the float blend aligns each on its own (see
@@ -1472,16 +1522,19 @@ struct TexTerm {
 
 void tex_check_filterable(const TextureDesc& d) {
   const uint32_t bits = d.channel_bits[0];
+  const bool packed = d.packed_1010102;   // 10:10:10:2 filters as 16-bit unsigned normalized
   const bool is_float = d.kind == ChannelKind::Float && (bits == 32 || bits == 16);
-  const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16) && d.read_as_normalized_float;
+  const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16 || packed) && d.read_as_normalized_float;
   const bool snorm = d.kind == ChannelKind::Signed && (bits == 8 || bits == 16) && d.read_as_normalized_float;
   if (!is_float && !unorm && !snorm)
     tex_fail(Err::Unsupported,
              "linear filtering needs a float, half, or normalized 8/16-bit texture read as "
              "normalized float; this texture's format has no filtered form");
-  for (uint32_t ch = 1; ch < 4; ++ch)
-    if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
-      tex_fail(Err::Unsupported, "linear filtering of a texture whose channels differ in width");
+  // The channels of a block-compressed or packed format may differ in width (BC3's colour and alpha, 10:10:10:2).
+  if (d.block == BlockFormat::None && !packed)
+    for (uint32_t ch = 1; ch < 4; ++ch)
+      if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
+        tex_fail(Err::Unsupported, "linear filtering of a texture whose channels differ in width");
 }
 
 // The texels a linear filter reads and their weights, which sum to `total`.
@@ -1523,6 +1576,8 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     t.w = w[k];
     t.border = !inside;
     t.group = off[2];
+    t.src = &d;
+    t.x = idx[0], t.y = idx[1], t.z = idx[2];
     if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
   }
   return n;
@@ -1544,13 +1599,25 @@ int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3
   const uint64_t plane = row * (d.height ? d.height : 1);
   out[0].w = total;
   out[0].border = !inside;
+  out[0].src = &d;
+  out[0].x = idx[0], out[0].y = idx[1], out[0].z = idx[2];
   out[0].addr = inside ? d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes : 0;
   return 1;
 }
 
+// An unsigned normalized channel of `bits` bits as the 16-bit integer the filter works in: the code's bits
+// repeated to fill 16 (8-bit codes are u * 257, the 10 and 2 bits of 10:10:10:2 are (u << 6) | (u >> 4) and
+// u * 21845), 16-bit ones as they are. Measured on an RTX 3060 with all 1024 codes of 10 bits (linear
+// filtering at texel centres): bit replication, not a rounded scaling.
+uint32_t unorm16(uint64_t raw, uint32_t bits) {
+  if (bits >= 16) return static_cast<uint32_t>(raw);
+  uint32_t v = static_cast<uint32_t>(raw) << (16 - bits);
+  for (uint32_t s = bits; s < 16; s *= 2) v |= v >> s;
+  return v;
+}
+
 // Sums weight x texel over the terms and rounds, by the format's rules.
 void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
-  const uint32_t bits = d.channel_bits[0];
   const bool is_float = d.kind == ChannelKind::Float;
   const bool unorm = d.kind == ChannelKind::Unsigned;
   int64_t isum[4] = {0, 0, 0, 0};
@@ -1560,7 +1627,10 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
     for (uint32_t ch = 0; ch < 4; ++ch) {
       if (!d.channel_bits[ch]) continue;
       if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
-      const uint64_t raw = terms[k].border ? tex_border_raw(d, ch) : texel_channel_bits(mem, d, terms[k].addr, ch);
+      const uint32_t bits = d.channel_bits[ch];   // the channels of a block-compressed format differ in width
+      const TextureDesc& at = terms[k].src ? *terms[k].src : d;
+      const uint64_t raw = terms[k].border ? tex_border_raw(d, ch)
+                                           : texel_raw(mem, at, terms[k].addr, terms[k].x, terms[k].y, terms[k].z, ch);
       if (is_float) {
         double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
         if (bits == 32 && std::fabs(t) < std::ldexp(1.0, -126)) t = std::copysign(0.0, t);   // flushed
@@ -1568,7 +1638,7 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
       } else if (tex_srgb(d, ch)) {
         codes[ch][k] = static_cast<uint32_t>(raw & 0xFF);
       } else if (unorm) {
-        isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
+        isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(unorm16(raw, bits));
       } else if (bits == 8) {
         isum[ch] += int64_t{terms[k].w} * static_cast<int8_t>(raw);   // the 8-bit codes, see the blend below
       } else {
@@ -1578,8 +1648,9 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
   }
   for (uint32_t ch = 0; ch < 4; ++ch) {
     float r;
+    const uint32_t bits = d.channel_bits[ch];
     if (!d.channel_bits[ch]) {
-      r = 0.0f;
+      r = d.block != BlockFormat::None && ch == 3 ? 1.0f : 0.0f;   // a block-compressed format without alpha has alpha 1
     } else if (tex_srgb(d, ch)) {
       // An sRGB channel blends its table values (measured over 134,316
       // two-texel blends): the table holds codes in blocks of eight sharing
@@ -1728,6 +1799,8 @@ TextureDesc tex_level(const TextureDesc& d, uint32_t level) {
 // as the face coordinate; and filtering stays inside the face, under the
 // texture's address mode.
 uint64_t tex_slice_bytes(const TextureDesc& d) {
+  if (d.block != BlockFormat::None)   // a slice of blocks
+    return ((uint64_t{d.width} + 3) / 4) * (((d.height ? d.height : 1u) + 3u) / 4) * block_bytes(d.block);
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
   return row * (d.height ? d.height : 1);
 }
@@ -1806,7 +1879,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
       const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
                           wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
       const uint32_t ch = static_cast<uint32_t>(f.gather);
-      const uint64_t raw = inside ? texel_channel_bits(mem, v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch)
+      const uint64_t raw = inside ? texel_raw(mem, v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ix, iy, 0, ch)
                                   : tex_border_raw(v, ch);
       uint32_t r = convert_channel(v, ch, raw, f.float_result);
       if (v.kind == ChannelKind::Signed && v.channel_bits[ch] == 8 && v.read_as_normalized_float) {
@@ -1915,7 +1988,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   const uint64_t plane = row * (v.height ? v.height : 1);
   const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
   for (uint32_t ch = 0; ch < 4; ++ch)
-    out[ch] = convert_channel(v, ch, texel_channel_bits(mem, v, addr, ch), f.float_result);
+    out[ch] = convert_channel(v, ch, texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
 }
 
 // suld/sust address a surface in *bytes* along x and in whole rows along y
@@ -13337,6 +13410,7 @@ const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, Te
 }
 
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
+  t_bc.valid = false;   // the memory a block was decoded from may have changed since the last fetch
   fetch_texel(mem, d, f, out);
 }
 

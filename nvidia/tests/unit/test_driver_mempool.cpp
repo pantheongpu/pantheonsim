@@ -255,7 +255,7 @@ VTEST(pools_are_made_and_destroyed_under_the_documented_rules) {
   VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_INVALID_VALUE);
   bad = props;
   bad.location.id = 9;
-  VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_INVALID_DEVICE);
+  VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_INVALID_VALUE);   // an RTX 3060 says invalid value, not invalid device
   bad = props;
   // CU_MEM_LOCATION_TYPE_HOST, spelled by value: cuda.h declares it from 12.2 and the older toolkits CI builds with do not
   // (INVALID 0, DEVICE 1, HOST 2, HOST_NUMA 3, HOST_NUMA_CURRENT 4).
@@ -263,7 +263,7 @@ VTEST(pools_are_made_and_destroyed_under_the_documented_rules) {
   VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_NOT_SUPPORTED);
   bad = props;
   bad.handleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;   // a pool another process could use
-  VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_NOT_SUPPORTED);
+  VCHECK_EQ(cuMemPoolCreate(&pool, &bad), CUDA_ERROR_INVALID_VALUE);   // the device supports no handle type
 
   VCHECK_EQ(cuMemPoolCreate(&pool, &props), CUDA_SUCCESS);
   CUdeviceptr p = 0;
@@ -333,18 +333,18 @@ VTEST(a_pools_access_starts_as_its_own_device_and_follows_what_is_set) {
   VCHECK_EQ(cuMemPoolDestroy(pool), CUDA_SUCCESS);
 }
 
-VTEST(sharing_a_pool_with_another_process_is_refused_by_name) {
+VTEST(sharing_a_pool_with_another_process_is_refused_as_the_card_refuses_it) {
   Env e;
   CUmemoryPool pool = make_pool(0);
   int fd = 0;
-  VCHECK_EQ(cuMemPoolExportToShareableHandle(&fd, pool, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0), CUDA_ERROR_NOT_SUPPORTED);
+  VCHECK_EQ(cuMemPoolExportToShareableHandle(&fd, pool, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0), CUDA_ERROR_INVALID_VALUE);
   CUmemoryPool imported = nullptr;
   VCHECK_EQ(cuMemPoolImportFromShareableHandle(&imported, &fd, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0),
             CUDA_ERROR_NOT_SUPPORTED);
   CUmemPoolPtrExportData data;
   CUdeviceptr p = 0;
-  VCHECK_EQ(cuMemPoolExportPointer(&data, 0), CUDA_ERROR_NOT_SUPPORTED);
-  VCHECK_EQ(cuMemPoolImportPointer(&p, pool, &data), CUDA_ERROR_NOT_SUPPORTED);
+  VCHECK_EQ(cuMemPoolExportPointer(&data, 0), CUDA_ERROR_INVALID_VALUE);
+  VCHECK_EQ(cuMemPoolImportPointer(&p, pool, &data), CUDA_ERROR_INVALID_VALUE);
   VCHECK_EQ(cuMemPoolDestroy(pool), CUDA_SUCCESS);
 }
 

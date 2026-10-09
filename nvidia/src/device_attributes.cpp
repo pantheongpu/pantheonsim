@@ -207,9 +207,10 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     case kDirectManagedMemAccessFromHost: v = 0; break;
     // cuMemAddressReserve, cuMemCreate, cuMemMap and cuMemSetAccess work.
     case kVirtualAddressManagementSupported: v = 1; break;
-    // cuMemCreate does not hand out file descriptors, and nothing else here
-    // is shared between processes through a handle.
-    case kHandleTypePosixFileDescriptorSupported: v = 0; break;
+    // cuMemCreate with the POSIX file descriptor handle type exports the memory as a descriptor
+    // another process can import (cuMemExportToShareableHandle); the other handle types do not exist
+    // here. An RTX 3060 answers 1 as well.
+    case kHandleTypePosixFileDescriptorSupported: v = 1; break;
     case kHandleTypeWin32HandleSupported: v = 0; break;
     case kHandleTypeWin32KmtHandleSupported: v = 0; break;
     // A real quantity: a divisor in occupancy arithmetic (CUB's scan launched
@@ -228,9 +229,9 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     // Sparse and deferred-mapped CUDA arrays are not implemented: a card
     // says 1, and a program that sees it makes one.
     case kSparseCudaArraySupported: v = 0; break;
-    // cuMemHostRegister refuses CU_MEMHOSTREGISTER_READ_ONLY, because nothing
-    // here would stop a kernel writing the memory.
-    case kReadOnlyHostRegisterSupported: v = 0; break;
+    // cuMemHostRegister takes CU_MEMHOSTREGISTER_READ_ONLY: a kernel's store or atomic to the
+    // range faults, as on an RTX 3060, which answers 1.
+    case kReadOnlyHostRegisterSupported: v = 1; break;
     case kTimelineSemaphoreInteropSupported: v = 0; break;
     // The stream-ordered allocator is implemented (cudaMallocAsync, the
     // cudaMemPool* API), and the runtime says so.
