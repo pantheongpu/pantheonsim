@@ -25,7 +25,12 @@ namespace vgpu::exec {
 struct KernelRef {
   const ptx::EntryFn* fn = nullptr;
   const std::map<std::string, uint64_t>* symbols = nullptr;
+  int arch = 0;   // the module's .target sm_XX (what cudaFuncAttributes::ptxVersion says); 0: unknown
 };
+
+namespace devrt {
+struct Services;   // vgpu/exec/devrt.hpp
+}
 using KernelTable = std::map<uint64_t, KernelRef>;
 
 // The values of a CUDA graph's conditional handles, by handle: what a kernel in
@@ -110,6 +115,10 @@ struct LaunchConfig {
   // Null outside a graph, where such a call faults.
   uint64_t current_graph_exec = 0;
   DeviceGraphLauncher* graph_launcher = nullptr;
+  // What the host's CUDA library answers a kernel's device-runtime queries
+  // with (cudaDeviceGetAttribute, cudaDeviceGetLimit, error strings...). Null
+  // outside the CUDA shims: those queries then return cudaErrorNotSupported.
+  const devrt::Services* devrt = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

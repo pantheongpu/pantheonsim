@@ -529,21 +529,48 @@ VGPU_NPP_MIRROR_IR(32f_C4IR, Npp32f, 4)
    likewise in y) -- pixel centres mapped through the scale (measured: nearest
    neighbour matches every pixel at factors 0.5, 0.73, 1.37 and 2) -- with the
    sample point held inside the source ROI. A destination pixel is written
-   when its sample point is before the ROI's width -- (x + 0.5) / xFactor <
-   width + 0.5 -- so a 23-wide source at factor 2 writes columns 0..46, at
-   0.73 columns 0..16 (measured at six factors), clipped to the destination
-   ROI. Nearest neighbour is exact; linear is the warps' bilinear filter, a
-   count away on the odd pixel; cubic is their four-point Lagrange filter,
-   within a few counts of NVIDIA's resize filter, whose kernel is not one of
-   the Keys or Mitchell-Netravali family. Super-sampling and Lanczos are not
-   implemented (NPP_INTERPOLATION_ERROR). */
+   when its sample point is within [-0.25, width + 0.5) of the ROI in pixel
+   edges, ux = (x + 0.5 - shift) / factor -- so a 23-wide source at factor 2
+   writes columns 0..46, at 0.73 columns 0..16 (measured at six factors, and
+   at shifts from -1 to 7 at six more: the lower bound is -0.25 in source
+   pixels at every factor, closed, and the upper bound open at width + 0.5),
+   clipped to the destination ROI. Nearest neighbour is exact; linear is the warps' bilinear filter, a
+   count away on the odd pixel; cubic is a four-point Lagrange filter whose
+   weights and fused multiply-add order were fitted bit for bit to NVIDIA's
+   resize (npp_core.hpp, lagrange4 and sample). Lanczos and super-sampling
+   follow below, each with what was measured. */
 namespace {
+// Lanczos-3 (nppiResizeSqrPixel's NPPI_INTER_LANCZOS): the windowed sinc,
+// sinc(d) * sinc(d / 3) for |d| < 3, taken at the taps within three pixels of
+// the sample point and normalised to sum to one at every point. Not widened
+// when shrinking: at factor 0.5 NPP's weights at the three half-integer
+// offsets are exactly -0.135870, 0.611413 and 0.024457 (an unwidened
+// kernel's), and at factors whose phases are multiples of 0.05 the impulse
+// response is this kernel to within a float rounding. Between those NPP's
+// values differ from the analytic kernel by up to 2e-3 relative (3e-5 in the
+// weights at three and a third); that is where the card's tabulated or
+// approximated sinc shows, and not reproduced here.
+inline double sinc_pi(double x) {
+  if (x == 0) return 1;
+  const double t = 3.14159265358979323846 * x;
+  return std::sin(t) / t;
+}
+inline double lanczos3(double d) { return std::fabs(d) < 3 ? sinc_pi(d) * sinc_pi(d / 3) : 0; }
+
 template <class T>
 NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* pDst, int dstep, NppiRect droi,
                      double fx, double fy, double shx, double shy, int interp, int ch) {
+  const bool supported = interp == NPPI_INTER_NN || interp == NPPI_INTER_LINEAR || interp == NPPI_INTER_CUBIC ||
+                         interp == NPPI_INTER_SUPER || interp == NPPI_INTER_LANCZOS;
   Rect sr{};
-  if (NppStatus st = check_geometry(pSrc, ssz, sroi, pDst, droi, interp, &sr)) return st;
+  if (!pSrc || !pDst) return NPP_NULL_POINTER_ERROR;
+  if (bad(ssz) || sroi.width <= 0 || sroi.height <= 0 || droi.width <= 0 || droi.height <= 0) return NPP_SIZE_ERROR;
+  if (!supported) return NPP_INTERPOLATION_ERROR;
+  if (!clip_src(ssz, sroi, &sr)) return NPP_WRONG_INTERSECTION_ROI_ERROR;
   if (!(fx > 0) || !(fy > 0)) return NPP_RESIZE_FACTOR_ERROR;
+  // Super-sampling shrinks: both factors must be below one (measured: factors
+  // (1, 0.5), (0.5, 1) and (1, 1) are NPP_RESIZE_FACTOR_ERROR).
+  if (interp == NPPI_INTER_SUPER && !(fx < 1 && fy < 1)) return NPP_RESIZE_FACTOR_ERROR;
   auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   // Taps clamp to the ROI: a window of the source holding just it.
   std::vector<T> win(static_cast<size_t>(sr.w) * sr.h * ch);
@@ -553,14 +580,78 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
   Image<T> si{win.data(), sr.w, sr.h, sr.w * ch, ch};
   Window<T> dst(pDst, dstep, droi.x, droi.y, droi.width, droi.height, ch);
   double v[4];
+  // The sample point of destination column x is fma(1/f, x, c) in single
+  // precision, with 1/f rounded to float and c = 0.5/f - 0.5 - shift/f formed
+  // from it in double and rounded: the only grouping that reproduces NPP's
+  // impulse responses to the last bit, at every factor and shift tried.
+  const float invx = static_cast<float>(1.0 / fx), invy = static_cast<float>(1.0 / fy);
+  const float cx = static_cast<float>(0.5 * invx - 0.5 - shx * invx);
+  const float cy = static_cast<float>(0.5 * invy - 0.5 - shy * invy);
   for (int y = droi.y; y < droi.y + droi.height; ++y)
     for (int x = droi.x; x < droi.x + droi.width; ++x) {
+      if (interp == NPPI_INTER_SUPER) {
+        // Each destination pixel is the mean of the source over the interval
+        // it covers, [(x - shift) / factor, (x + 1 - shift) / factor): the
+        // overlap-weighted sum times fx * fy (no division by the covered area,
+        // so the part of an interval beyond the ROI counts as zero). It is
+        // written only when its interval starts inside the ROI (measured: a
+        // pixel straddling the first column or row is left alone, one
+        // straddling the last is written).
+        const double x0 = (x - shx) / fx, x1 = (x + 1 - shx) / fx;
+        const double y0 = (y - shy) / fy, y1 = (y + 1 - shy) / fy;
+        if (x0 < 0 || y0 < 0 || x0 >= sr.w || y0 >= sr.h) continue;
+        const int xa = static_cast<int>(std::floor(x0)), xb = std::min(sr.w, static_cast<int>(std::ceil(x1)));
+        const int ya = static_cast<int>(std::floor(y0)), yb = std::min(sr.h, static_cast<int>(std::ceil(y1)));
+        for (int c = 0; c < ch; ++c) {
+          double acc = 0;
+          for (int sy = ya; sy < yb; ++sy) {
+            const double oy = std::min<double>(sy + 1, y1) - std::max<double>(sy, y0);
+            if (oy <= 0) continue;
+            for (int sx = xa; sx < xb; ++sx) {
+              const double ox = std::min<double>(sx + 1, x1) - std::max<double>(sx, x0);
+              if (ox <= 0) continue;
+              acc += static_cast<double>(si.at(sx, sy, c)) * ox * oy;
+            }
+          }
+          v[c] = acc * fx * fy;
+        }
+        for (int c = 0; c < ch; ++c) dst.img.at(x, y, c) = to_pixel<T>(v[c]);
+        continue;
+      }
       const double ux = (x + 0.5 - shx) / fx, uy = (y + 0.5 - shy) / fy;
-      if (ux < 0 || uy < 0 || ux >= sr.w + 0.5 || uy >= sr.h + 0.5) continue;
-      float sx = static_cast<float>(ux - 0.5);
-      float sy = static_cast<float>(uy - 0.5);
-      sx = std::min(std::max(sx, 0.f), static_cast<float>(sr.w - 1));
-      sy = std::min(std::max(sy, 0.f), static_cast<float>(sr.h - 1));
+      if (ux < -0.25 || uy < -0.25 || ux >= sr.w + 0.5 || uy >= sr.h + 0.5) continue;
+      const float sx = std::fma(invx, static_cast<float>(x), cx);
+      const float sy = std::fma(invy, static_cast<float>(y), cy);
+      if (interp == NPPI_INTER_LANCZOS) {
+        const int xa = static_cast<int>(std::floor(sx)) - 2, xb = xa + 6;
+        const int ya = static_cast<int>(std::floor(sy)) - 2, yb = ya + 6;
+        double wx[6], wy[6], sxs = 0, sys = 0;
+        for (int i = 0; i < 6; ++i) {
+          wx[i] = lanczos3((xa + i) - static_cast<double>(sx));
+          wy[i] = lanczos3((ya + i) - static_cast<double>(sy));
+          sxs += wx[i];
+          sys += wy[i];
+        }
+        (void)xb;
+        (void)yb;
+        for (int c = 0; c < ch; ++c) {
+          double acc = 0;
+          for (int j = 0; j < 6; ++j) {
+            if (wy[j] == 0) continue;
+            const int yy = std::min(std::max(ya + j, 0), sr.h - 1);
+            double row = 0;
+            for (int i = 0; i < 6; ++i) {
+              if (wx[i] == 0) continue;
+              const int xx = std::min(std::max(xa + i, 0), sr.w - 1);
+              row += wx[i] * static_cast<double>(si.at(xx, yy, c));
+            }
+            acc += wy[j] * row;
+          }
+          v[c] = acc / (sxs * sys);
+        }
+        for (int c = 0; c < ch; ++c) dst.img.at(x, y, c) = to_pixel<T>(v[c]);
+        continue;
+      }
       sample(si, sx, sy, interp, v);
       for (int c = 0; c < ch; ++c) dst.img.at(x, y, c) = to_pixel<T>(v[c]);
     }

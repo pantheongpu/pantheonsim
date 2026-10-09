@@ -33,6 +33,7 @@
 #include <set>
 
 #include "error_names.hpp"
+#include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
 #include "vgpu/sass/cubin.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -207,6 +208,20 @@ struct ShimState {
   std::map<uintptr_t, int> managed_device;
   // Allocations (by base) CU_POINTER_ATTRIBUTE_SYNC_MEMOPS has been set on.
   std::set<uint64_t> sync_memops;
+  // cuCtxSetLimit, per device, with the defaults the runtime shim keeps
+  // (runtime_api.cpp, State::DeviceLimits): a program with a static cudart
+  // sets and reads its limits through here, and a kernel's device runtime
+  // reads them.
+  struct Limits {
+    size_t stack = 1024;
+    size_t printf_fifo = 1u << 20;
+    size_t malloc_heap = 8u << 20;
+    size_t sync_depth = 2;
+    size_t pending_launches = 2048;
+    size_t l2_fetch_granularity = 64;
+    size_t persisting_l2 = 0;
+  };
+  std::map<int, Limits> limits;
 };
 
 ShimState& state() {
@@ -272,6 +287,7 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     // for the two conditions this project most wants to be legible.
     // An RTX 3060 reports a kernel's "trap" (and "brkpt") as LAUNCH_FAILED.
     case Err::Trap: return CUDA_ERROR_LAUNCH_FAILED;
+    case Err::IllegalInstruction: return CUDA_ERROR_ILLEGAL_INSTRUCTION;
     case Err::DeviceAssert: return CUDA_ERROR_ASSERT;
     case Err::EccUncorrectable: return CUDA_ERROR_ECC_UNCORRECTABLE;
     // What programs report when their GPU falls off the bus.
@@ -299,6 +315,7 @@ bool poisons_context(vgpu::Err e, bool kernel_context) {
     case Err::MisalignedAccess:
     case Err::UninitializedRegister:
     case Err::Trap:
+    case Err::IllegalInstruction:
     case Err::DeviceAssert:
     case Err::DeviceLost:
       return kernel_context;
@@ -809,23 +826,13 @@ VGPU_EXPORT CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
   return cuDeviceTotalMem_v2_impl(bytes, dev);
 }
 
-static CUresult cuDeviceGetAttribute_impl(int* pi, CUdevice_attribute attrib, CUdevice dev) {
-  return api("cuDeviceGetAttribute", true, false, [&](ShimState& s) {
+// A device attribute by its number (cuDeviceGetAttribute's body; a kernel's
+// cudaDeviceGetAttribute asks here too, vgpu/exec/devrt.hpp).
+static CUresult device_attribute_by_id(ShimState& s, int* pi, int attr_id, CUdevice dev) {
+  {
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
     const vgpu::DeviceProfile& p = s.rt->device(dev).profile();
-    // Read the attribute as the integer the ABI actually passes, not as the
-    // enum. A caller built against a newer CUDA header legitimately passes
-    // values this shim's headers do not enumerate -- CUDA 13 sends 134, and
-    // the `default:` arm below exists precisely to answer them. But *loading*
-    // an enum object holding a value outside its enumerators is undefined:
-    // UBSan reports it, and a compiler is entitled to assume the value is in
-    // range and delete the default arm, which would turn forward compatibility
-    // into a wrong answer with no diagnostic. memcpy reads the bytes without
-    // making that claim about them.
-    static_assert(sizeof(attrib) == sizeof(int), "CUdevice_attribute is not int-sized");
-    int attr_id;
-    std::memcpy(&attr_id, &attrib, sizeof attr_id);
     // An id that is not an attribute of any CUDA this knows is refused, as
     // the card refuses it (CUDA_ERROR_INVALID_VALUE), not answered with a zero
     // that reads as "the device has none of it".
@@ -835,7 +842,24 @@ static CUresult cuDeviceGetAttribute_impl(int* pi, CUdevice_attribute attrib, CU
       return CUDA_ERROR_INVALID_VALUE;
     }
     return CUDA_SUCCESS;
-  });
+  }
+}
+
+static CUresult cuDeviceGetAttribute_impl(int* pi, CUdevice_attribute attrib, CUdevice dev) {
+  // Read the attribute as the integer the ABI actually passes, not as the
+  // enum. A caller built against a newer CUDA header legitimately passes
+  // values this shim's headers do not enumerate -- CUDA 13 sends 134, and
+  // the `default:` arm of the switch exists precisely to answer them. But
+  // *loading* an enum object holding a value outside its enumerators is
+  // undefined: UBSan reports it, and a compiler is entitled to assume the
+  // value is in range and delete the default arm, which would turn forward
+  // compatibility into a wrong answer with no diagnostic. memcpy reads the
+  // bytes without making that claim about them.
+  static_assert(sizeof(attrib) == sizeof(int), "CUdevice_attribute is not int-sized");
+  int attr_id;
+  std::memcpy(&attr_id, &attrib, sizeof attr_id);
+  return api("cuDeviceGetAttribute", true, false,
+             [&](ShimState& s) { return device_attribute_by_id(s, pi, attr_id, dev); });
 }
 VGPU_EXPORT CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) {
   return traced("cuDeviceGetAttribute", cuDeviceGetAttribute_impl, pi, attrib, dev);
@@ -1716,6 +1740,79 @@ bool launches_graphs(const vgpu::ptx::EntryFn& fn) {
   return known[&fn] = launches_graphs_uncached(fn);
 }
 
+constexpr CUresult kUnsupportedLimit = static_cast<CUresult>(215);   // kUnsupportedLimit = cudaErrorUnsupportedLimit
+
+// A limit by its number (CUlimit's and cudaLimit's agree) on a device with
+// compute capability `cc_major`: what cuCtxGetLimit, and a kernel's
+// cudaDeviceGetLimit, read. kUnsupportedLimit for a number that
+// names none, and for the sync depth from compute capability 9.0, which has none.
+CUresult limit_value(const ShimState::Limits& l, int cc_major, int limit, size_t* v) {
+  switch (limit) {
+    case 0: *v = l.stack; return CUDA_SUCCESS;
+    case 1: *v = l.printf_fifo; return CUDA_SUCCESS;
+    case 2: *v = l.malloc_heap; return CUDA_SUCCESS;
+    case 3:
+      if (cc_major >= 9) return kUnsupportedLimit;
+      *v = l.sync_depth;
+      return CUDA_SUCCESS;
+    case 4: *v = l.pending_launches; return CUDA_SUCCESS;
+    case 5: *v = l.l2_fetch_granularity; return CUDA_SUCCESS;
+    case 6: *v = l.persisting_l2; return CUDA_SUCCESS;
+    default: return kUnsupportedLimit;
+  }
+}
+
+// What a kernel's calls into the device runtime (cudaDeviceGetAttribute,
+// cudaDeviceGetLimit, error strings...) ask of this library: the answers the
+// host's own calls give, so a kernel sees what its host sees. cuCtx*Limit,
+// the cache configuration and the attributes are this shim's own.
+struct DriverDevRt final : vgpu::exec::devrt::Services {
+  int attribute(int device, int attr, int* value) const override {
+    // The attribute numbers the device runtime answers (1 to 148) are
+    // CUdevice_attribute's too.
+    ShimState& s = state();
+    std::lock_guard<std::recursive_mutex> lock(s.mu);
+    if (!s.initialized) return 3;   // cudaErrorInitializationError
+    try {
+      return static_cast<int>(device_attribute_by_id(s, value, attr, device));
+    } catch (const vgpu::Error&) {
+      return 101;   // cudaErrorInvalidDevice: a device the machine has not
+    }
+  }
+  int limit(int device, int id, uint64_t* value) const override {
+    ShimState& s = state();
+    std::lock_guard<std::recursive_mutex> lock(s.mu);
+    if (!s.initialized || device < 0 || device >= s.rt->device_count()) return 101;   // cudaErrorInvalidDevice
+    size_t v = 0;
+    const CUresult r = limit_value(s.limits[device], s.rt->device(device).profile().cc_major, id, &v);
+    if (r == CUDA_SUCCESS) *value = v;
+    // kUnsupportedLimit is cudaErrorUnsupportedLimit, 215, in both.
+    return static_cast<int>(r);
+  }
+  int cache_config(int, int* value) const override {
+    ShimState& s = state();
+    std::lock_guard<std::recursive_mutex> lock(s.mu);
+    *value = s.cache_config;
+    return 0;
+  }
+  int shared_mem_config(int, int* value) const override {
+    *value = 1;   // CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE
+    return 0;
+  }
+  const char* error_name(int code) const override {
+    const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(code);
+    return e && e->runtime_name ? e->runtime_name : "unrecognized error code";
+  }
+  const char* error_string(int code) const override {
+    const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(code);
+    return e && e->runtime_name ? e->text : "unrecognized error code";
+  }
+};
+const vgpu::exec::devrt::Services& driver_devrt_services() {
+  static const DriverDevRt services;
+  return services;
+}
+
 CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int gridDimX,
                               unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
                               unsigned int blockDimY, unsigned int blockDimZ,
@@ -1770,6 +1867,11 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     }
     cfg.nonportable_cluster = rec.nonportable_cluster;
     if (launches_graphs(*rec.fn)) return CUDA_ERROR_NOT_SUPPORTED;
+    // What the device is limited to, and what a kernel's device runtime asks of this library.
+    const ShimState::Limits& lim = s.limits[rec.device];
+    cfg.device_heap_bytes = lim.malloc_heap;
+    cfg.stack_bytes = lim.stack;
+    cfg.devrt = &driver_devrt_services();
     const bool profiling = vgpu::profiling::enabled();
     const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
@@ -4158,15 +4260,34 @@ VGPU_EXPORT CUresult cuCtxPopCurrent(CUcontext* pctx) { return cuCtxPopCurrent_v
 VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
   if (const CUresult dead = dead_context()) return dead;
   if (!v) return CUDA_ERROR_INVALID_VALUE;
-  switch (limit) {
-    case 0: *v = 1024; break;              // STACK_SIZE
-    case 1: *v = 1024 * 1024; break;       // PRINTF_FIFO_SIZE
-    case 2: *v = 8 * 1024 * 1024; break;   // MALLOC_HEAP_SIZE
-    default: *v = 0; break;
-  }
-  return CUDA_SUCCESS;
+  return api("cuCtxGetLimit", false, false, [&](ShimState& s) {
+    // With no context current -- or no machine yet -- the defaults of device 0.
+    if (!s.initialized || ctx_stack().empty()) return limit_value(ShimState::Limits{}, 8, limit, v);
+    const int device = current_device(s);
+    return limit_value(s.limits[device], s.rt->device(device).profile().cc_major, limit, v);
+  });
 }
-VGPU_EXPORT CUresult cuCtxSetLimit(int, size_t) { return dead_context(); }
+VGPU_EXPORT CUresult cuCtxSetLimit(int limit, size_t value) {
+  if (const CUresult dead = dead_context()) return dead;
+  return api("cuCtxSetLimit", false, false, [&](ShimState& s) {
+    if (!s.initialized || ctx_stack().empty()) return CUDA_SUCCESS;   // nothing to set on; as it always was
+    const int device = current_device(s);
+    ShimState::Limits& l = s.limits[device];
+    switch (limit) {
+      case 0: l.stack = (value + 15) / 16 * 16; return CUDA_SUCCESS;   // a whole element
+      case 1: l.printf_fifo = value; return CUDA_SUCCESS;
+      case 2: l.malloc_heap = value; return CUDA_SUCCESS;
+      case 3:
+        if (s.rt->device(device).profile().cc_major >= 9) return kUnsupportedLimit;
+        l.sync_depth = std::min<size_t>(value, 24);
+        return CUDA_SUCCESS;
+      case 4: l.pending_launches = value; return CUDA_SUCCESS;
+      case 5: l.l2_fetch_granularity = std::min<size_t>(value, 128); return CUDA_SUCCESS;
+      case 6: l.persisting_l2 = 0; return CUDA_SUCCESS;   // nothing to set aside
+      default: return kUnsupportedLimit;
+    }
+  });
+}
 VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext, unsigned int* v) {
   if (v) *v = 3020;
   return CUDA_SUCCESS;

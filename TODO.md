@@ -1221,9 +1221,30 @@ in "Not implemented".
   parent block, so it is the same with any number of host threads), each
   complete -- its own children included -- before the next: a schedule CUDA
   allows for every device-side stream, since it promises no concurrency
-  between parent and child. CUDA's limits apply (2048 pending, 24 deep).
-  Checked by test_dynpar and dynamic_parallelism.cu (built with -rdc: fan-out,
-  nesting, order, the tail and fire-and-forget streams, a struct parameter).
+  between parent and child. CUDA's limit applies: 2048 pending launches (the
+  24 this first wrote down was the synchronization depth, not a nesting
+  limit; see the entry below). Checked by test_dynpar and
+  dynamic_parallelism.cu (built with -rdc: fan-out, nesting, order, the tail
+  and fire-and-forget streams, a struct parameter).
+
+- The device runtime, completed (2026-10-05), on both engines: everything
+  cuda_device_runtime_api.h gives a kernel -- cudaMemcpyAsync/2D/3D and the
+  memset family, cudaMalloc/cudaFree (the device heap), cudaFuncGetAttributes,
+  cudaDeviceGetAttribute/GetLimit, the cache configuration, the occupancy
+  queries, cudaGetErrorString/Name, cudaRuntimeGetVersion, the older
+  cudaGetParameterBuffer/cudaLaunchDevice pair, stream and event validation --
+  under CDP2's names and CDP1's (cudaDeviceSynchronize for parts before
+  Hopper). Each call's result, errors included, was measured on an RTX 3060
+  (nvidia/docs/sass.md, "Device runtime"), which also corrected what the
+  first version assumed: there is no nesting limit of 24 (a chain stops at the
+  pending-launch limit, 2048 by default, with cudaErrorLaunchPendingCountExceeded;
+  a limit below 32 is 32), a tail launch waits for every other grid the grid
+  launched, and the card's device-side cudaMemsetAsync writes zero whatever
+  the value is. The pending count is the card's, and when it is full the
+  queued grids run at once. Both engines share include/vgpu/exec/devrt.hpp;
+  the library's own answers (attributes, limits, error strings) come from the
+  CUDA shim that launched the kernel. Checked by cdp_device_api.cu (against
+  the card) and cdp1_device_sync.cu in e2e_sass_archs and e2e_device_runtime.
 
 - CUTLASS's SM90 GEMM unit tests, run unmodified (2026-09-25), found: the
   register estimate ignored launch bounds (.maxntid/.minnctapersm/.maxnreg
@@ -2010,6 +2031,26 @@ What rev 5 could not check: nothing here ran on a real GPU or on ROCm 7.x. The s
 and tests; the gap branches were tested by their authors under ASan + UBSan with CUDA 12.8 headers (the
 runtime one also syntax-checked against 12.4), and none ran the full ctest suite, a TSan build, or any e2e
 program that needs nvcc.
+
+### PyTorch sweep: known failures
+
+`nvidia/tests/pytorch/sweep/known_failures.txt` lists the sweep's checks that do not match the CPU on the
+simulator (nvidia/rtx5090). The CI-wired `e2e_pytorch_sweep` prints each as `XFAIL` with its numbers and fails
+only on a new failure or on a listed one that starts passing (`XPASS`: delete its line). Each is work to do:
+
+- **Graphs (4 checks)**: capture and replay of cuDNN + cuBLAS, a whole training step, Adam with
+  `capturable=True`, `make_graphed_callables` all fail with "operation failed due to a previous error during
+  capture". Which call errors under stream capture is not identified (cuDNN computes on the host, which a
+  capture cannot record).
+- **torch.compile `reduce-overhead`**: 1.2 scaled difference from the CPU (allowed 0.001); it replays a captured
+  CUDA graph, probably the same gap.
+- **torch.compile gather / scatter_add / index_select**: an Inductor kernel fails to load, `cuModuleLoadData`
+  answers `unsupported-ptx` (the log shows only that line, not the unsupported feature) and the driver call
+  returns "operation not supported". Find the PTX feature first.
+- **Numeric**: the tiny causal transformer after three AdamW steps (0.0027 against 0.002). The kernel or
+  reduction order that drifts is not isolated; no tolerance was loosened. (SGD with OneCycleLR and gradient
+  clipping, and `clip_grad_norm_` (foreach) / `clip_grad_value_`, drifted when the sweep was written and match
+  the CPU on the current main; they are no longer listed.)
 
 ### Tooling, CI and process
 

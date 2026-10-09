@@ -140,9 +140,14 @@ DONE:
   for (uint32_t i = 0; i < 32; ++i) VCHECK_EQ(mem.load_scalar(out + i * 4, 4), uint64_t{i});
 }
 
-// A kernel that launches itself one level deeper each time stops at CUDA's
-// nesting limit of 24 with an error that says so.
-VTEST(nesting_past_24_levels_is_refused) {
+// A kernel that launches itself one level deeper each time stops where the
+// pending launches reach cudaLimitDevRuntimePendingLaunchCount, 2048: each
+// grid is incomplete until the one it launched is, so the 2049th grid's launch
+// is refused with cudaErrorLaunchPendingCountExceeded (69) -- which this
+// kernel ignores -- and the chain ends there, with no error from the launch.
+// An RTX 3060 ran 2049 levels (the host-launched one and 2048 below it), and
+// there is no nesting limit of 24: that was the synchronization depth.
+VTEST(a_chain_of_launches_stops_at_the_pending_limit) {
   Loaded l = load(R"(
 .visible .entry deeper(.param .u64 out)
 {
@@ -155,18 +160,19 @@ VTEST(nesting_past_24_levels_is_refused) {
 )" + get_buffer("deeper") + R"(
     st.u64 [%rd20], %rd1;
 )" + kLaunch + R"(
+    st.u32 [%rd1+4], %r22;
     ret;
 }
 )");
   MemoryManager mem{1 << 20};
-  const uint64_t out = mem.alloc(4);
+  const uint64_t out = mem.alloc(8);
   mem.store_scalar(out, 4, 0);
   DeviceProfile prof = load_gpu("nvidia/h100");
   LaunchConfig c;
   c.kernels = &l.kernels;
-  auto err = VCAPTURE(Error, exec::launch(entry(l, "deeper"), c, {arg_u64(out)}, mem, prof, &l.symbols));
-  VCHECK_CONTAINS(err.message(), "nesting depth 25");
-  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{25});   // levels 0..24 ran
+  exec::launch(entry(l, "deeper"), c, {arg_u64(out)}, mem, prof, &l.symbols);
+  VCHECK_EQ(mem.load_scalar(out, 4), uint64_t{2049});   // levels 1..2049 ran
+  VCHECK_EQ(mem.load_scalar(out + 4, 4), uint64_t{69});   // the last one's launch was refused
 }
 
 // A launch naming an address that is not a kernel is reported, not run.

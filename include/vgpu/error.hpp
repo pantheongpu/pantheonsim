@@ -27,6 +27,7 @@ enum class Err {
   UninitializedRegister,  // kernel read a register before writing it
   DataRace,               // two warps reached the same shared word unordered
   Trap,                   // kernel executed "trap": an unreachable path
+  IllegalInstruction,     // an instruction the hardware refuses to run: a *.sync with the thread outside its member mask
   DeviceAssert,           // a device-side assert() failed, with its own message
   LaunchConfig,           // grid/block/shared config violates profile limits
   ExecLimit,              // step budget exceeded (likely infinite loop)

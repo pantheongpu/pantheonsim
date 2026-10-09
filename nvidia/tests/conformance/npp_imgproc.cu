@@ -310,19 +310,19 @@ static void geometry() {
       Img<Npp8u> s3(23, 17, 3), d3(50, 40, 3, false);
       Img<Npp32f> sf(23, 17, 1), df(50, 40, 1, false);
       char name[96];
-      g_approx = i != NPPI_INTER_NN;  // linear a count off on the odd pixel; cubic is not reported
+      g_approx = i == NPPI_INTER_LINEAR;  // linear a count off on the odd pixel; cubic is exact (the fitted weights)
       int st = nppiResizeSqrPixel_8u_C1R_Ctx(s.dev, {23, 17}, s.step(), {0, 0, 23, 17}, d.dev, d.step(),
                                              {0, 0, 50, 40}, f, f * 1.1, 0, 0, i, ctx());
       std::snprintf(name, sizeof name, "ResizeSqrPixel 8u_C1R %.2f %s", f, interp_name(i));
-      if (i != NPPI_INTER_CUBIC) report(name, st, d);
+      report(name, st, d);
       st = nppiResizeSqrPixel_8u_C3R_Ctx(s3.dev, {23, 17}, s3.step(), {0, 0, 23, 17}, d3.dev, d3.step(),
                                          {0, 0, 50, 40}, f, f * 0.9, 0, 0, i, ctx());
       std::snprintf(name, sizeof name, "ResizeSqrPixel 8u_C3R %.2f %s", f, interp_name(i));
-      if (i != NPPI_INTER_CUBIC) report(name, st, d3);
+      report(name, st, d3);
       st = nppiResizeSqrPixel_32f_C1R_Ctx(sf.dev, {23, 17}, sf.step(), {0, 0, 23, 17}, df.dev, df.step(),
                                           {0, 0, 50, 40}, f, f, 0, 0, i, ctx());
       std::snprintf(name, sizeof name, "ResizeSqrPixel 32f_C1R %.2f %s", f, interp_name(i));
-      if (i != NPPI_INTER_CUBIC) report(name, st, df);
+      report(name, st, df);
       g_approx = false;
     }
 
@@ -725,6 +725,48 @@ static void misc() {
   }
 }
 
+// Last, so that the images it makes do not move the generated inputs of the cases
+// above (the golden file's checksums depend on them).
+static void resize_modes() {
+  // ResizeSqrPixel's Lanczos and super-sampling modes (NPPI_INTER_LANCZOS = 16,
+  // NPPI_INTER_SUPER = 8). Lanczos weights agree with the card's to a float
+  // rounding at these factors and are off by up to 2e-3 relative between them,
+  // so the sums are compared as approximate; super-sampling shrinks only, and
+  // both factors must be below one.
+  for (int mode : {NPPI_INTER_LANCZOS, NPPI_INTER_SUPER}) {
+    const char* mname = mode == NPPI_INTER_LANCZOS ? "lanczos" : "super";
+    for (double f : {0.5, 0.73, 2.0}) {
+      if (mode == NPPI_INTER_SUPER && f > 1) continue;
+      Img<Npp8u> s(23, 17, 1), d(50, 40, 1, false);
+      Img<Npp32f> sf(23, 17, 1), df(50, 40, 1, false);
+      char name[96];
+      g_approx = true;
+      int st = nppiResizeSqrPixel_8u_C1R_Ctx(s.dev, {23, 17}, s.step(), {0, 0, 23, 17}, d.dev, d.step(),
+                                             {0, 0, 50, 40}, f, f, 0, 0, mode, ctx());
+      std::snprintf(name, sizeof name, "ResizeSqrPixel 8u_C1R %.2f %s", f, mname);
+      report(name, st, d);
+      g_approx = false;
+      st = nppiResizeSqrPixel_32f_C1R_Ctx(sf.dev, {23, 17}, sf.step(), {0, 0, 23, 17}, df.dev, df.step(),
+                                          {0, 0, 50, 40}, f, f, 0, 0, mode, ctx());
+      std::snprintf(name, sizeof name, "ResizeSqrPixel 32f_C1R %.2f %s", f, mname);
+      report(name, st, df);
+    }
+  }
+  {
+    Img<Npp8u> s(23, 17, 1), d(50, 40, 1, false);
+    // Super-sampling with a factor of one or more is NPP_RESIZE_FACTOR_ERROR.
+    report_status("ResizeSqrPixel super factors 1 0.5",
+                  nppiResizeSqrPixel_8u_C1R_Ctx(s.dev, {23, 17}, s.step(), {0, 0, 23, 17}, d.dev, d.step(),
+                                                {0, 0, 50, 40}, 1.0, 0.5, 0, 0, NPPI_INTER_SUPER, ctx()));
+    report_status("ResizeSqrPixel super factors 0.5 1",
+                  nppiResizeSqrPixel_8u_C1R_Ctx(s.dev, {23, 17}, s.step(), {0, 0, 23, 17}, d.dev, d.step(),
+                                                {0, 0, 50, 40}, 0.5, 1.0, 0, 0, NPPI_INTER_SUPER, ctx()));
+    report_status("ResizeSqrPixel super factors 2 2",
+                  nppiResizeSqrPixel_8u_C1R_Ctx(s.dev, {23, 17}, s.step(), {0, 0, 23, 17}, d.dev, d.step(),
+                                                {0, 0, 50, 40}, 2.0, 2.0, 0, 0, NPPI_INTER_SUPER, ctx()));
+  }
+}
+
 int main() {
   if (cudaFree(0) != cudaSuccess) {
     std::printf("no CUDA device\n");
@@ -736,5 +778,6 @@ int main() {
   statistics();
   filters();
   misc();
+  resize_modes();
   return g_lines > 0 ? 0 : 1;
 }

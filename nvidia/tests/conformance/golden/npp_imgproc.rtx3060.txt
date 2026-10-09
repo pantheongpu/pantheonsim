@@ -153,24 +153,36 @@ ResizeSqrPixel 32f_C1R 0.50 nn               st=0 n=2120 sum=1.454773e+04 wsum=7
 ResizeSqrPixel 8u_C1R 0.50 linear            st=0 n=2120 sum~2.890300e+04 wsum~1.410103e+06
 ResizeSqrPixel 8u_C3R 0.50 linear            st=0 n=6360 sum~7.909600e+04 wsum~3.890098e+06
 ResizeSqrPixel 32f_C1R 0.50 linear           st=0 n=2120 sum=1.258536e+04 wsum=6.269190e+05
+ResizeSqrPixel 8u_C1R 0.50 cubic             st=0 n=2120 sum=29713 wsum=1417055
+ResizeSqrPixel 8u_C3R 0.50 cubic             st=0 n=6360 sum=78636 wsum=3839573
+ResizeSqrPixel 32f_C1R 0.50 cubic            st=0 n=2120 sum=1.478900e+04 wsum=7.077838e+05
 ResizeSqrPixel 8u_C1R 0.73 nn                st=0 n=2120 sum=41172 wsum=1895061
 ResizeSqrPixel 8u_C3R 0.73 nn                st=0 n=6360 sum=111513 wsum=5542513
 ResizeSqrPixel 32f_C1R 0.73 nn               st=0 n=2120 sum=1.494232e+04 wsum=7.715535e+05
 ResizeSqrPixel 8u_C1R 0.73 linear            st=0 n=2120 sum~4.311800e+04 wsum~1.994820e+06
 ResizeSqrPixel 8u_C3R 0.73 linear            st=0 n=6360 sum~1.113980e+05 wsum~5.489304e+06
 ResizeSqrPixel 32f_C1R 0.73 linear           st=0 n=2120 sum=1.222939e+04 wsum=5.149786e+05
+ResizeSqrPixel 8u_C1R 0.73 cubic             st=0 n=2120 sum=45059 wsum=2084071
+ResizeSqrPixel 8u_C3R 0.73 cubic             st=0 n=6360 sum=111531 wsum=5506237
+ResizeSqrPixel 32f_C1R 0.73 cubic            st=0 n=2120 sum=1.529663e+04 wsum=7.947541e+05
 ResizeSqrPixel 8u_C1R 1.37 nn                st=0 n=2120 sum=117371 wsum=5821377
 ResizeSqrPixel 8u_C3R 1.37 nn                st=0 n=6360 sum=296324 wsum=14474555
 ResizeSqrPixel 32f_C1R 1.37 nn               st=0 n=2120 sum=1.588600e+04 wsum=9.072139e+05
 ResizeSqrPixel 8u_C1R 1.37 linear            st=0 n=2120 sum~1.152830e+05 wsum~5.613129e+06
 ResizeSqrPixel 8u_C3R 1.37 linear            st=0 n=6360 sum~2.955540e+05 wsum~1.453392e+07
 ResizeSqrPixel 32f_C1R 1.37 linear           st=0 n=2120 sum=-3.391497e+03 wsum=-1.597517e+05
+ResizeSqrPixel 8u_C1R 1.37 cubic             st=0 n=2120 sum=114593 wsum=5567701
+ResizeSqrPixel 8u_C3R 1.37 cubic             st=0 n=6360 sum=307994 wsum=15099792
+ResizeSqrPixel 32f_C1R 1.37 cubic            st=0 n=2120 sum=8.984910e+03 wsum=4.386370e+05
 ResizeSqrPixel 8u_C1R 2.00 nn                st=0 n=2120 sum=239121 wsum=11768504
 ResizeSqrPixel 8u_C3R 2.00 nn                st=0 n=6360 sum=578950 wsum=28139260
 ResizeSqrPixel 32f_C1R 2.00 nn               st=0 n=2120 sum=2.171708e+04 wsum=1.128879e+06
 ResizeSqrPixel 8u_C1R 2.00 linear            st=0 n=2120 sum~2.375100e+05 wsum~1.152239e+07
 ResizeSqrPixel 8u_C3R 2.00 linear            st=0 n=6360 sum~5.701140e+05 wsum~2.787168e+07
 ResizeSqrPixel 32f_C1R 2.00 linear           st=0 n=2120 sum=6.098081e+03 wsum=2.053142e+05
+ResizeSqrPixel 8u_C1R 2.00 cubic             st=0 n=2120 sum=223762 wsum=10966280
+ResizeSqrPixel 8u_C3R 2.00 cubic             st=0 n=6360 sum=571052 wsum=27983619
+ResizeSqrPixel 32f_C1R 2.00 cubic            st=0 n=2120 sum=1.933591e+04 wsum=1.121536e+06
 WarpAffine super-sampling                    st=-22
 WarpAffine singular                          st=-56
 WarpAffineBack null source                   st=-8
@@ -287,3 +299,16 @@ CompareC 16s_C1R op 2                        st=0 n=154 sum=402 wsum=8208
 CompareC 16s_C1R op 3                        st=0 n=154 sum=11877 wsum=446043
 CompareC 16s_C1R op 4                        st=0 n=154 sum=11622 wsum=444513
 CopyConstBorder 8u_C1R                       st=0 n=240 sum=22597 wsum=1014395
+ResizeSqrPixel 8u_C1R 0.50 lanczos           st=0 n=2120 sum~2.748200e+04 wsum~1.318458e+06
+ResizeSqrPixel 32f_C1R 0.50 lanczos          st=0 n=2120 sum=1.453467e+04 wsum=7.457308e+05
+ResizeSqrPixel 8u_C1R 0.73 lanczos           st=0 n=2120 sum~4.195200e+04 wsum~1.974151e+06
+ResizeSqrPixel 32f_C1R 0.73 lanczos          st=0 n=2120 sum=1.418497e+04 wsum=7.378786e+05
+ResizeSqrPixel 8u_C1R 2.00 lanczos           st=0 n=2120 sum~2.194070e+05 wsum~1.079473e+07
+ResizeSqrPixel 32f_C1R 2.00 lanczos          st=0 n=2120 sum=-1.050644e+04 wsum=-6.567932e+05
+ResizeSqrPixel 8u_C1R 0.50 super             st=0 n=2120 sum~2.658700e+04 wsum~1.269783e+06
+ResizeSqrPixel 32f_C1R 0.50 super            st=0 n=2120 sum=1.373957e+04 wsum=6.618797e+05
+ResizeSqrPixel 8u_C1R 0.73 super             st=0 n=2120 sum~3.945800e+04 wsum~1.864297e+06
+ResizeSqrPixel 32f_C1R 0.73 super            st=0 n=2120 sum=1.240961e+04 wsum=5.673691e+05
+ResizeSqrPixel super factors 1 0.5           st=-23
+ResizeSqrPixel super factors 0.5 1           st=-23
+ResizeSqrPixel super factors 2 2             st=-23

@@ -169,8 +169,10 @@ add_library(vgpu STATIC
   src/ptx/parser.cpp
   src/ptx/regalloc.cpp
   src/ptx/contract.cpp
+  src/ptx/sync_masks.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/exec/devrt.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
@@ -1046,6 +1048,7 @@ vgpu_unit_test(test_dsmem)
 vgpu_unit_test(test_barriers)
 # Dynamic parallelism at the PTX level.
 vgpu_unit_test(test_dynpar)
+vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
 vgpu_unit_test(test_regs)
@@ -1803,8 +1806,8 @@ if(TARGET vgpucublas)
                           "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
-                          "dnn_graph:cudnn" "dnn_attention:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet")
+                          "dnn_graph:cudnn" "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "cutensor_paths:cutensor"
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -2274,6 +2277,24 @@ if(TARGET vgpucudart)
     TIMEOUT 3600)
 endif()
 
+# The device runtime (cudadevrt): cdp_device_api and cdp1_device_sync alone, on four generations,
+# as e2e_sass_archs runs them among the rest (nvidia/docs/sass.md, "Device runtime").
+if(TARGET vgpucudart)
+  add_test(NAME e2e_device_runtime COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_device_runtime PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=cdp_device_api:75 cdp1_device_sync:75:89;VGPU_SASS_ARCHS=sm_75 sm_86 sm_90 sm_120"
+    TIMEOUT 1800)
+  # The *.sync warp instructions' member masks, as an RTX 3060 (sm_86) ran them, on both engines
+  # (e2e_sass_archs runs it with the rest).
+  add_test(NAME e2e_sync_masks COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_sync_masks PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=sync_masks:86:86;VGPU_SASS_ARCHS=sm_86"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+endif()
+
 # A grid-wide barrier through cooperative_groups, unmodified. Checks the
 # barrier holds, that a grid too large to be resident is refused rather than
 # hung, and that the same kernel launched ordinarily fails loudly.
@@ -2654,6 +2675,43 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  # The PyTorch sweep (nvidia/tests/pytorch/sweep.py): nn layers and losses forward
+  # and backward, optimizers, torch.linalg / fft / sparse, AMP, CUDA graphs,
+  # torch.compile, every SDPA backend forced in turn, two devices in one process,
+  # and (where installed) torchvision, torchaudio and tiny Hugging Face models,
+  # each against the CPU. The quick tier is the time-bounded subset every ml job
+  # runs; the full tier (nightly workflow pytorch-sweep-nightly.yml, or
+  # ml_tests='e2e_pytorch_sweep_full' by hand) adds the rest.
+  add_test(NAME e2e_pytorch_sweep COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh quick nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_sweep PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 3600)
+  add_test(NAME e2e_pytorch_sweep_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh full nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_sweep_full PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SWEEP_PIP=1"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 14400)
+  # torch.distributed's NCCL backend across two processes, each its own simulated
+  # GPU: collectives in several dtypes, point to point, DDP training.
+  add_test(NAME e2e_pytorch_dist COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_dist.sh 17 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_dist PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpunccl"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  add_test(NAME e2e_pytorch_dist_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_dist.sh 29 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_dist_full PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpunccl"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SWEEP_TIER=full"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 3600)
   # cuDNN's graph API, BatchNorm training and RNNs, and cuBLASLt with a cuBLAS
   # handle -- the paths PyTorch's CUDA build takes -- against host references.
   add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)

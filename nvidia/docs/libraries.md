@@ -260,7 +260,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuSPARSE | `libcusparse.so.12` | every entry point NVIDIA's 13.0 exports. CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16/int8), SpGEMM (and SpGEMMreuse), SDDMM, SpSV/SpSM (with updateMatrix), format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); Blocked-ELL SpMM and sliced-ELL SpMV; sparse vectors (SpVV, Axpby, Gather, Scatter, Rot); the tridiagonal and pentadiagonal solvers (gtsv2, gtsv2_nopivot, gtsv2StridedBatch, gtsvInterleavedBatch, gpsvInterleavedBatch); legacy coo2csr, the CSR/CSC/COO sorts, csrgeam2, gemvi, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, gebsr2gebsr, gebsr2gebsc), csric02 and csrilu02, pruning, csrcolor, nnz and compression, unsorted CSR. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
 | cuSOLVER | `libcusolver.so.12` | Cholesky, LU, QR (with `ungqr`/`unmqr` for complex), symmetric and Hermitian eigen, SVD, in real and complex types; the reductions and their back-transforms (`sytrd`/`hetrd`, `orgtr`/`ungtr`, `ormtr`/`unmtr`, `gebrd`, `orgbr`/`ungbr`), `potri`, `lauum`, selected and generalized eigen (`syevdx`/`heevdx`, `sygvd`/`hegvd`, `sygvdx`/`hegvdx`, `sygvj`/`hegvj`); symmetric indefinite (Bunch-Kaufman `sytrf`, `Xsytrs`, `sytri`), `laswp`; the iterative refinement solvers (`<t1><t2>gesv`/`gels`, `IRSXgesv`/`IRSXgels`); the 64-bit X API with `Xgetrf`/`Xgetrs`, `Xtrtri`, `Xsyevdx`, `Xgesvd`, `Xgesvdp`, `Xgesvdr` and `Xlarft`, `Xgeev` (right eigenvectors) on real and complex matrices, Jacobi (gesvdj, syevj, heevj) and batched forms, gesvdaStridedBatched. The sparse module, cusolverSp: `csrlsvlu`/`csrlsvqr`/`csrlsvchol` (host and device), `csrlsqvqr`, `csreigvsi`, `csreigs`, the reorderings (`symrcm`, `symamd` and `symmdq` give NVIDIA's own permutations), `csrperm`, `csrzfd`, batched QR, and the low-level preview API (LU on the host, QR and Cholesky on the host and the device, step by step). The refactorization module, cusolverRf, single and batched |
 | cusolverMg | `libcusolverMg.so.12` | getrf/getrs, potrf/potrs/potri and syevd on a matrix, or getrf/getrs and potrf/potrs/potri on a submatrix (IA, JA), spread over several devices in NVIDIA's column-block-cyclic layout |
-| NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars |
+| NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included, and the `nccl*Config` forms of each) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommGetUniqueId + ncclCommGrow, ncclCommRevoke, ncclCommSuspend/Resume/MemStats, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars, the `ncclParam*` registry; the device API's host side answers as the RTX 3060 pair does (unsupported) |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration, batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
@@ -311,7 +311,7 @@ output. Anything that differs is a bug in this implementation.
 | `cublas_level1` | single and double `axpy`, `scal`, `dot`, `nrm2`, `i?amax` and `tbmv` agree, every index identical, negative increments included |
 | `cusolver_factorizations` | Cholesky, LU (pivots included), QR and every solve bit-identical; one f32 eigenvalue differs by ~1e‑6 relative |
 | `nccl_collectives` | all 24 bit-identical at two ranks on two physical GPUs |
-| `nccl_comm_ops` (e2e) | all 74 checks pass against NCCL 2.29.7 at two ranks on two physical GPUs: split, shrink, non-blocking, pre-multiplied sums, all-to-all, gather, scatter, scalable init, windows, and their error codes |
+| `nccl_comm_ops` (e2e) | all 74 checks of NCCL 2.29's surface pass against NCCL 2.29.7, and all CHECKS_PLACEHOLDER against NCCL 2.31.2, at two ranks on two physical GPUs: split, shrink, grow, revoke, suspend and resume, memory statistics, non-blocking, pre-multiplied sums, all-to-all, gather, scatter, scalable init, windows, the `nccl*Config` forms, the `ncclParam*` registry, the device API's host side, and their error codes |
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
 | `npp_imgproc` | 289 results: every integer image identical (a dozen near-ties marked approximate, within a count on a pixel or two), floats to 1e‑5 -- warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and shifts, alpha compositing, gamma, demosaicing, lookup, statistics, histograms, integral images, rank and morphological filters, Prewitt gradients and Canny |
@@ -552,10 +552,71 @@ Beyond the collectives:
   (one of eight in the measured case). fp16 rounds each product first, as NCCL
   does.
 
+- **`ncclCommGetUniqueId` and `ncclCommGrow`.** An id's first 16 bytes name the
+  rendezvous the old and the new ranks meet at, derived from the parent's
+  rendezvous and the number of grows it has seen; the rest is a nonce, so every
+  call returns a different id, as NCCL's does. Because every existing rank
+  derives the same name, the non-root form (`uniqueId = NULL`) needs no id
+  passed to it. Existing ranks keep their numbers, a new rank brings its own,
+  and a rank number or id used twice is `ncclInvalidArgument` rather than a
+  hang. Where NCCL fails a new rank that arrives before the existing ranks have
+  started (`ncclInternalError` after a fraction of a second), this waits; that
+  is the one deliberate difference.
+- **`ncclCommRevoke`** is local, and unblocks whatever the revoked
+  communicator is waiting for: a rank alone in an all-reduce is released, and
+  the call that was waiting returns `ncclSuccess`, as the stream completes on
+  NCCL. After it every collective and send/receive is `ncclInvalidUsage`, a
+  second revoke and `ncclCommFinalize` are `ncclInvalidArgument`, and split,
+  shrink, suspend and destroy still work. A non-blocking communicator answers
+  `ncclInProgress` and settles once its queued work has unwound.
+- **`ncclCommSuspend` and `ncclCommResume`** are collective barriers (one rank
+  waits exactly as long as another is late), valid in a group and on a
+  non-blocking communicator. Only bit 0 (`NCCL_SUSPEND_MEM`) suspends; suspending
+  twice or resuming what is running is `ncclInvalidUsage`. On the card, work
+  issued to a suspended communicator faults on the buffers it released; here it
+  is refused with `ncclInvalidUsage`. **`ncclCommMemStats`**: NCCL reports
+  GPU memory it holds for the communicator (12 MiB it can release, 4 MiB it
+  cannot, for a two-rank one), and suspending frees exactly the releasable part.
+  This transport allocates no device memory, so the three sizes are zero and
+  only the "suspended" statistic is live.
+- **`nccl*Config` collectives** check their `ncclCollConfig_t` as NCCL 2.31.2
+  does and then run the plain collective: size at least 64, magic, a
+  `forceAlgSelection` of 0 or 1, a `CTAPolicy` unset or 0..3, in that order and
+  before the communicator is looked at; a refused config does not spoil the
+  group it was issued in. `algSelection` is a comma-separated list of algorithm
+  names (`ring`, `tree`, `collnetdirect`, `collnetchain`, `nvls`, `nvlstree`,
+  `pat`; any case; `^` in front means every other one). With `forceAlgSelection`
+  left at 1, an unknown name or a selection that leaves nothing available is
+  `ncclInvalidArgument`: AllReduce has ring and tree, Broadcast, Reduce,
+  AllGather and ReduceScatter ring, and AlltoAll, Gather and Scatter none --
+  the same sets the PCIe card has; NVLS, CollNet and PAT are not available.
+  With 0 it falls back to automatic selection. CTA counts, cluster size,
+  profiler tags and extension lists are accepted whatever they hold, as NCCL
+  accepts them.
+- **`ncclParam*`** reproduces NCCL 2.31.2's parameter registry as measured:
+  six public parameters (`NCCL_DEBUG`, `NCCL_DEBUG_SUBSYS`, `NCCL_DEBUG_FILE`,
+  `NCCL_DEBUG_TIMESTAMP_FORMAT`, `NCCL_DEBUG_TIMESTAMP_LEVELS`,
+  `NCCL_SET_THREAD_NAME`) and three private ones listed with
+  `NCCL_PARAM_DUMP_ALL=true`. Types, defaults, documentation text and the way
+  each environment variable is parsed are the card's, so are the getters (a
+  getter takes the parameter's own type and is `ncclInvalidArgument` for any
+  other), and `ncclParamDumpAll` writes the same text to stdout. The rest of
+  NCCL's environment variables are not in the registry on the card either.
+- **The device API's host side** answers as the RTX 3060 pair does:
+  `ncclCommQueryProperties` reports `deviceApiSupport = false` and
+  `hostRmaSupport = false` (no multimem, no GIN, one LSA team), and
+  `ncclDevCommCreate` is `ncclInvalidUsage`. The team queries
+  (`ncclTeamWorld`, `ncclTeamLsa`, `ncclTeamRail`, `ncclTeamRankToWorld`) and
+  the requirement helpers (`ncclLsaBarrierCreateRequirement`,
+  `ncclLLA2ACreateRequirement`, `ncclLLA2ACalcSlots`,
+  `ncclGinBarrierCreateRequirement`) are plain host arithmetic, reproduced from
+  the card's outputs.
+
 Error codes and edge cases where the documentation is silent were measured on
-NCCL 2.29.7 with two RTX 3060s, and `nvidia/tests/e2e/nccl_comm_ops.cu` and
-`nccl_multiproc.cu` pass against both libraries. Two things are deliberately
-not there:
+NCCL 2.29.7 and 2.31.2 with two RTX 3060s, and
+`nvidia/tests/e2e/nccl_comm_ops.cu` and `nccl_multiproc.cu` pass against both
+libraries (sections for a newer API than the library in use say "skipped"). Four
+things are deliberately not there:
 
 - **Symmetric memory windows.** `ncclCommWindowRegister` returns `ncclSuccess`
   and a NULL window, which is NCCL's own answer on a machine without the peer
@@ -564,6 +625,21 @@ not there:
   device-side loads and stores into the peers' memory -- the device API's LSA
   pointers -- and another process's simulated device is reachable only
   through a file.
+- **The device API.** Kernels that use a device communicator (`ncclDevComm`)
+  reach peers through LSA pointers, multimem addresses or GIN, none of which
+  can exist between simulated devices that share no address space; and the
+  `libnccl_device` bitcode that NCCL ships for linking such kernels has nothing
+  to link against. `ncclDevCommCreate` refuses and `ncclCommQueryProperties`
+  says why, which is the RTX 3060 pair's answer too, so a program that checks
+  support first takes its fallback.
+- **One-sided operations.** `ncclPutSignal`, `ncclSignal` and `ncclWaitSignal`
+  are `ncclInvalidArgument` ("host RMA is not supported in this
+  communicator"), every time, which is what NCCL 2.31.2 does on the card
+  with or without `numRmaCtx` and `numRmaSig` configured. NCCL moves a put
+  through a GIN transport or (2.32) a socket proxy that needs GDRCopy; this
+  transport would need a progress thread in every process holding a window,
+  and there is no card here whose signal, context and ordering behaviour that
+  could be measured against.
 - **The network plugin interface.** A net plugin is a library NCCL loads to
   drive a NIC (`NCCL_NET_PLUGIN`); there is no network transport here for one
   to replace, so those variables are not read.
@@ -632,9 +708,15 @@ not exact, and are marked so in that test rather than claimed:
   -0.0391). 8-bit and float results match; a 16-bit image has about one pixel
   in a thousand a count apart, a 32-bit integer one a float ulp apart on about
   one in ten.
-- **`nppiResizeSqrPixel`** cubic is a different kernel, not one of the Keys or
-  Mitchell-Netravali family; Lagrange stands in for it, a few counts away.
-  Super-sampling and Lanczos are not implemented (`NPP_INTERPOLATION_ERROR`).
+- **`nppiResizeSqrPixel`** cubic uses four Lagrange weights rounded the way
+  NPP's are, and the order of fused multiply-adds NPP's float output shows:
+  bit-identical to NPP 13.0 on the resize cases `npp_imgproc` pins. Lanczos
+  (windowed sinc, three lobes, not widened when shrinking) matches the card
+  at the factors tried to a float rounding and differs by up to 2e-3
+  relative between them, where NPP's sinc is tabulated or approximated;
+  super-sampling (area average, both factors below one, else
+  `NPP_RESIZE_FACTOR_ERROR`) is compared as approximate. The warps'
+  super-sampling is still `NPP_INTERPOLATION_ERROR`.
 - **`nppiAlphaComp_8u_AC4R`**: every operator's alpha and every colour is
   exact except the non-premultiplied ATOP and XOR colours, within one count.
 - **`nppiFilterCannyBorder`**: on NPP 13.0 the high threshold changes nothing
@@ -864,18 +946,18 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   carry a static CUDA runtime that asks the driver for its export table.
 - **NCCL**: symmetric memory windows (registration returns a NULL window, as
   NCCL does without peer mappings) and the network plugin interface (there is
-  no network to plug into); see "NCCL: a file-backed transport". Exported so
-  that a program that binds them at load time (PyTorch for CUDA 13 does, for
-  NCCL 2.30) still starts, but answering `ncclInvalidUsage` with a message
-  when called: `ncclCommRevoke`, `ncclCommGrow`, `ncclCommGetUniqueId`,
-  `ncclCommSuspend`/`ncclCommResume`, `ncclCommMemStats`, the one-sided
-  `ncclPutSignal`/`ncclSignal`/`ncclWaitSignal`, and the device API's host
-  calls (`ncclDevCommCreate`/`Destroy`, `ncclGetLsaMultimemDevicePointer`,
-  `ncclGetPeerDevicePointer`). Not exported at all, so a program that needs
-  one fails to load with its name: the `nccl*Config` collective forms,
-  `ncclParam*`, and the rest of the device API (GIN). Shrink
-  refuses an excluded rank outside the communicator, which NCCL 2.29.7
-  accepts and miscounts.
+  no network to plug into); see "NCCL: a file-backed transport". Every entry
+  point NCCL 2.31.2 exports is here and answers as the card does, except
+  `ncclSetEncryption` (2.32, TLS for the bootstrap sockets, which this transport
+  does not have) and the two GIN requirement helpers that no Linux header
+  declares. Refused by name, with the card's code: `ncclDevCommCreate` (device
+  API), `ncclPutSignal`, `ncclSignal` and `ncclWaitSignal` (host RMA); a window
+  query on any window is `ncclInvalidArgument`, there being none. Not
+  reproduced: the sizes `ncclCommMemStats` reports (zero, there is no device
+  memory behind a communicator), NCCL's failure of a grow whose new rank
+  arrives first, and work issued to a suspended communicator (a fault on the
+  card, `ncclInvalidUsage` here). Shrink refuses an excluded rank outside the
+  communicator, which NCCL 2.29.7 accepts and miscounts.
 - **cuFile**: the nvidia-fs (DMA) path itself, RDMA and user-space file system
   handles (`CU_FILE_HANDLE_TYPE_USERSPACE_FS`, refused as
   `CU_FILE_IO_NOT_SUPPORTED`), and the POSIX bounce-buffer pool's
@@ -909,19 +991,34 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   -- allocation, per-pixel arithmetic and logic, data exchange, colour
   conversion, thresholding, statistics, filters, morphology, resizing, and
   the signal-processing equivalents. Not implemented: watershed segmentation
-  and marker-label compression (one CUDA Sample), ResizeSqrPixel's
-  super-sampling and Lanczos modes, and the rest of NPP's ten thousand entry
+  and marker-label compression (one CUDA Sample), and the rest of NPP's ten thousand entry
   points, which are absent rather than approximated, so a program that needs
   more fails at link time with a name.
-- **Device runtime** (cudadevrt, dynamic parallelism), on both engines:
-  device-side launches, the last error, `cudaGetDevice`/`cudaGetDeviceCount`,
-  and device streams and events are implemented. The rest of what a kernel
-  can call -- `cudaMemcpyAsync`/`cudaMemsetAsync` and `cudaMalloc` from a
-  kernel, `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, the occupancy
-  queries, the older `cudaGetParameterBuffer`/`cudaLaunchDevice` pair -- is
-  not provided: a kernel that needs the driver for one fails with the name of
-  the entry point it reached (on SASS, one of the library's
-  `__cuda_syscall_*` calls).
+- **Device runtime** (cudadevrt, dynamic parallelism), on both engines: all of
+  `cuda_device_runtime_api.h` that CUDA 12 and 13 still offer to a kernel --
+  device-side launches (`<<<>>>`, `cudaGetParameterBuffer` /
+  `cudaLaunchDevice`, tail and fire-and-forget streams, named streams and
+  events), the pending-launch limit, `cudaMemcpyAsync`, `cudaMemcpy2DAsync`,
+  `cudaMemcpy3DAsync` and the memset family, `cudaMalloc` and `cudaFree`,
+  `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, `cudaDeviceGetLimit`,
+  the cache configuration, the occupancy queries (and
+  `cudaOccupancyMaxPotentialBlockSize` from them), `cudaGetErrorString`,
+  `cudaGetErrorName`, `cudaRuntimeGetVersion`, the last error and
+  `cudaGetDevice`/`cudaGetDeviceCount` -- under CDP2's names, and CDP1's
+  (`-DCUDA_FORCE_CDP1_IF_SUPPORTED`, which has `cudaDeviceSynchronize`, for
+  parts before Hopper). Each call returns what an RTX 3060 returned
+  (`nvidia/docs/sass.md`, "Device runtime"). What remains: a parameter buffer
+  launched a second time (the card runs it again; here it is
+  `cudaErrorInvalidValue`); `cudaMemcpy3DAsync` between `cudaArray`s
+  (`cudaErrorInvalidValue`; the card's answer is unmeasured) and copies of
+  shared or local memory; `cudaGraphKernelNode*` updates from a kernel and
+  cooperative groups' multi-grid and `cudaCG*` calls into the library
+  (refused by name, as is any other `__cuda_syscall_*` the library makes);
+  and kernels running concurrently with their parent: children run after it,
+  so a kernel that waits (spinning on a flag) for a child it launched, or a
+  child that waits for its parent, hangs here where it runs on the card. A
+  device-side `cudaMemsetAsync` fills with its value; the card's wrote zeros
+  whatever it was.
 - **nvJPEG**: 12-bit samples, arithmetic coding, lossless and hierarchical
   JPEG (refused by name, `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`); the hardware
   backend and what only it does (`nvjpegDecodeBatchedEx`, scaled decodes,
