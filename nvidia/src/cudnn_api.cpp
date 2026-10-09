@@ -3552,6 +3552,14 @@ namespace {
 // One bit per element, least significant first, 1 for kept; the size rounded
 // up to whole 32-bit words (measured on the hardware: 10000 elements, 1252 bytes).
 size_t dropout_reserve(size_t elements) { return (elements + 31) / 32 * 4; }
+// Float, half and double (measured on an RTX 3060: bfloat16 and the integers are NOT_SUPPORTED).
+bool dropout_type(cudnnDataType_t t) { return t == CUDNN_DATA_FLOAT || t == CUDNN_DATA_HALF || t == CUDNN_DATA_DOUBLE; }
+// What a kept element is multiplied by: 1 / (1 - p) in float for float and half
+// data, in double for double (measured bit for bit).
+double dropout_scaled(cudnnDataType_t t, double v, float p) {
+  if (t == CUDNN_DATA_DOUBLE) return v * (1.0 / (1.0 - static_cast<double>(p)));
+  return static_cast<double>(static_cast<float>(v) * (1.0f / (1.0f - p)));
+}
 }  // namespace
 
 VGPU_EXPORT cudnnStatus_t cudnnCreateDropoutDescriptor(cudnnDropoutDescriptor_t* d) {
@@ -3566,7 +3574,7 @@ VGPU_EXPORT cudnnStatus_t cudnnDestroyDropoutDescriptor(cudnnDropoutDescriptor_t
 }
 VGPU_EXPORT cudnnStatus_t cudnnDropoutGetStatesSize(cudnnHandle_t h, size_t* size) {
   if (!known(h) || !size) return CUDNN_STATUS_BAD_PARAM;
-  *size = 256;
+  *size = dropout_states_bytes();
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnDropoutGetReserveSpaceSize(cudnnTensorDescriptor_t xd, size_t* size) {
@@ -3575,27 +3583,36 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutGetReserveSpaceSize(cudnnTensorDescriptor_
   *size = dropout_reserve(X->l.count());
   return CUDNN_STATUS_SUCCESS;
 }
-// Starts the generator over from the seed, in the states buffer if one is given.
+// Starts the generators over from the seed, in the states buffer if one is
+// given. Measured on an RTX 3060: a buffer smaller than cudnnDropoutGetStatesSize
+// says (even 0 bytes) is BAD_PARAM, a null buffer is accepted whatever its size
+// (it leaves the buffer the descriptor had; a descriptor that never had one is
+// BAD_PARAM in a forward pass), a larger one is fine,
+// and a probability outside [0, 1] is accepted (below 0 everything is kept, above 1
+// nothing is).
 VGPU_EXPORT cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t h, float p,
                                                     void* states, size_t bytes, unsigned long long seed) {
-  if (!known(d) || !(p >= 0.0f && p <= 1.0f)) return CUDNN_STATUS_BAD_PARAM;
-  if (states && bytes < sizeof(DropoutState))
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  if (states && bytes < dropout_states_bytes())
     return BAD("cudnnSetDropoutDescriptor", "the states buffer is smaller than cudnnDropoutGetStatesSize says");
   auto* D = as<DropoutDesc>(d);
-  D->p = p, D->states = states, D->state_bytes = bytes, D->seed = seed, D->drawn = 0;
-  if (states) {
-    if (known(h)) sync_handle(h);
-    const DropoutState st{seed, 0};
-    if (cudaMemcpy(states, &st, sizeof st, cudaMemcpyHostToDevice) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
-  }
-  return CUDNN_STATUS_SUCCESS;
+  D->p = p, D->seed = seed, D->threads = dropout_threads();
+  if (!states) return CUDNN_STATUS_SUCCESS;  // measured: the buffer the descriptor had stays, and is not reseeded
+  D->states = states, D->state_bytes = bytes;
+  D->local.clear();
+  if (h && known(h)) sync_handle(h);
+  return dropout_seed(D) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
-// Picks up the generator wherever the states buffer says it is.
+// Picks up the generators wherever the states buffer says they are (measured:
+// the buffer is not touched).
 VGPU_EXPORT cudnnStatus_t cudnnRestoreDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t, float p,
                                                         void* states, size_t bytes, unsigned long long seed) {
-  if (!known(d) || !(p >= 0.0f && p <= 1.0f)) return CUDNN_STATUS_BAD_PARAM;
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  if (states && bytes < dropout_states_bytes())
+    return BAD("cudnnRestoreDropoutDescriptor", "the states buffer is smaller than cudnnDropoutGetStatesSize says");
   auto* D = as<DropoutDesc>(d);
-  D->p = p, D->states = states, D->state_bytes = bytes, D->seed = seed, D->drawn = 0;
+  D->p = p, D->seed = seed, D->threads = dropout_threads();
+  if (states) D->states = states, D->state_bytes = bytes, D->local.clear();
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnGetDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t, float* p,
@@ -3618,19 +3635,21 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutForward(cudnnHandle_t h, const cudnnDropou
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !known(dd) || !X || !Y || !x || !y || !reserve) return BAD(fn, "invalid handle, descriptor or pointer");
   if (!X->l.same_dims(Y->l)) return BAD(fn, "x and y differ in shape");
-  if (!floating(X->l.type) || !floating(Y->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
+  if (!dropout_type(X->l.type) || !dropout_type(Y->l.type)) return UNSUPPORTED(fn, "this data type");
   const size_t n = X->l.count();
   if (reserve_bytes < dropout_reserve(n)) return BAD(fn, "the reserve space is smaller than cudnnDropoutGetReserveSpaceSize says");
   auto* D = as<DropoutDesc>(dd);
+  if (!D->states) return BAD(fn, "the dropout descriptor was set without a states buffer");
   sync_handle(h);
   std::vector<double> v;
   std::vector<uint8_t> keep;
   if (!read(X->l, x, &v) || !dropout_draw(D, n, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<uint8_t> mask(dropout_reserve(n), 0);
-  const double p = D->p;
+  // y = x * (1 / (1 - p)), in float (measured: bit for bit on the card,
+  // where x / (1 - p) and a double scale are not), rounded to y's type.
   for (size_t i = 0; i < n; ++i) {
     if (keep[i]) mask[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-    v[i] = keep[i] ? v[i] * (1.0 / (1.0 - p)) : 0.0;
+    v[i] = keep[i] ? dropout_scaled(X->l.type, v[i], D->p) : 0.0;
   }
   if (cudaMemcpy(reserve, mask.data(), mask.size(), cudaMemcpyHostToDevice) != cudaSuccess)
     return CUDNN_STATUS_EXECUTION_FAILED;
@@ -3647,17 +3666,17 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutBackward(cudnnHandle_t h, const cudnnDropo
   if (!known(h) || !known(dd) || !DY || !DX || !dy || !dx || !reserve)
     return BAD(fn, "invalid handle, descriptor or pointer");
   if (!DY->l.same_dims(DX->l)) return BAD(fn, "dy and dx differ in shape");
-  if (!floating(DY->l.type) || !floating(DX->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
+  if (!dropout_type(DY->l.type) || !dropout_type(DX->l.type)) return UNSUPPORTED(fn, "this data type");
   const size_t n = DY->l.count();
   if (reserve_bytes < dropout_reserve(n)) return BAD(fn, "the reserve space is smaller than the forward pass's");
-  const double p = as<const DropoutDesc>(dd)->p;
+  const float drop_p = as<const DropoutDesc>(dd)->p;
   sync_handle(h);
   std::vector<uint8_t> mask(dropout_reserve(n));
   std::vector<double> v;
   if (cudaMemcpy(mask.data(), reserve, mask.size(), cudaMemcpyDeviceToHost) != cudaSuccess || !read(DY->l, dy, &v))
     return CUDNN_STATUS_EXECUTION_FAILED;
   for (size_t i = 0; i < n; ++i)
-    v[i] = (mask[i / 8] >> (i % 8)) & 1 ? v[i] * (1.0 / (1.0 - p)) : 0.0;
+    v[i] = (mask[i / 8] >> (i % 8)) & 1 ? dropout_scaled(DY->l.type, v[i], drop_p) : 0.0;
   return write(DX->l, dx, v) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
