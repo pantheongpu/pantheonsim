@@ -74,8 +74,13 @@ inline void append_nal(std::vector<uint8_t>& out, int ref_idc, int type, const s
 struct H264Stream {
   int width = 0, height = 0;   // luma samples of the picture, as the application sees it
   int fps_num = 30, fps_den = 1;
+  int profile_idc = 66;        // 66 Baseline, 77 Main, 100 High: the same tools are used in all three
+  bool interlaced = false;     // field pictures (frame_mbs_only_flag 0, no macroblock-adaptive coding); height is the frame's
+  int num_ref_frames = 1;
   int mbs_x() const { return (width + 15) / 16; }
-  int mbs_y() const { return (height + 15) / 16; }
+  // macroblock rows of the picture: of the frame, or of a field (a map unit is a pair of macroblock rows in a frame, one of a field)
+  int mbs_y() const { return interlaced ? (height + 31) / 32 : (height + 15) / 16; }
+  int frame_mbs_y() const { return interlaced ? 2 * mbs_y() : mbs_y(); }
   int coded_width() const { return (width + 1) & ~1; }
   int coded_height() const { return (height + 1) & ~1; }
   // Table A-1: the lowest level whose frame size and macroblock rate fit.
@@ -88,37 +93,54 @@ struct H264Stream {
                                {21, 19800, 792},   {22, 20250, 1620},  {30, 40500, 1620},   {31, 108000, 3600}, {32, 216000, 5120},
                                {40, 245760, 8192}, {41, 245760, 8192}, {42, 522240, 8704},  {50, 589824, 22080}, {51, 983040, 36864},
                                {52, 2073600, 36864}, {60, 4177920, 139264}, {61, 8355840, 139264}, {62, 16711680, 139264}};
-    const long fs = static_cast<long>(mbs_x()) * mbs_y();
+    const long fs = static_cast<long>(mbs_x()) * frame_mbs_y();
     const long mbps = fs * fps_num / std::max(fps_den, 1);
     for (const L& l : levels)
       if (fs <= l.max_fs && mbps <= l.max_mbps) return l.idc;
     return 62;
   }
-  // Baseline profile: I_PCM and CAVLC are all this stream uses.
+  // Baseline profile unless profile_idc says otherwise: I_PCM or CAVLC with 4x4 transforms, one reference frame.
   std::vector<uint8_t> sps() const {
     BitWriter w;
-    w.put(66, 8);          // profile_idc: Baseline
+    w.put(static_cast<uint32_t>(profile_idc), 8);
     w.put(0, 8);           // constraint_set flags and reserved bits
     w.put(static_cast<uint32_t>(level_idc()), 8);
     w.ue(0);               // seq_parameter_set_id
+    if (profile_idc >= 100) {
+      w.ue(1);             // chroma_format_idc: 4:2:0
+      w.ue(0);             // bit_depth_luma_minus8
+      w.ue(0);             // bit_depth_chroma_minus8
+      w.bit(0);            // qpprime_y_zero_transform_bypass_flag
+      w.bit(0);            // seq_scaling_matrix_present_flag
+    }
     w.ue(0);               // log2_max_frame_num_minus4
-    w.ue(2);               // pic_order_cnt_type 2: output order is decoding order
-    w.ue(1);               // max_num_ref_frames
+    if (interlaced) {
+      w.ue(0);             // pic_order_cnt_type 0
+      w.ue(12);            // log2_max_pic_order_cnt_lsb_minus4: 16 bits
+    } else {
+      w.ue(2);             // pic_order_cnt_type 2: output order is decoding order
+    }
+    w.ue(static_cast<uint32_t>(num_ref_frames));   // max_num_ref_frames
     w.bit(0);              // gaps_in_frame_num_value_allowed_flag
     w.ue(static_cast<uint32_t>(mbs_x() - 1));
-    w.ue(static_cast<uint32_t>(mbs_y() - 1));
-    w.bit(1);              // frame_mbs_only_flag
+    w.ue(static_cast<uint32_t>(mbs_y() - 1));   // pic_height_in_map_units_minus1
+    if (interlaced) {
+      w.bit(0);            // frame_mbs_only_flag
+      w.bit(0);            // mb_adaptive_frame_field_flag: field pictures only
+    } else {
+      w.bit(1);            // frame_mbs_only_flag
+    }
     w.bit(1);              // direct_8x8_inference_flag
-    // Cropping is in units of two luma samples (4:2:0), so an odd width or
-    // height is coded as the next even one: the picture a decoder returns is
-    // coded_width() by coded_height().
-    const int crop_r = mbs_x() * 16 - coded_width(), crop_b = mbs_y() * 16 - coded_height();
+    // Cropping is in units of two luma samples horizontally and two (four for interlaced coding) vertically (4:2:0), so an
+    // odd width or height is coded as the next even one: the picture a decoder returns is coded_width() by coded_height().
+    const int crop_r = mbs_x() * 16 - coded_width(), crop_b = frame_mbs_y() * 16 - coded_height();
+    const int unit_y = interlaced ? 4 : 2;
     if (crop_r || crop_b) {
       w.bit(1);
       w.ue(0);
       w.ue(static_cast<uint32_t>(crop_r / 2));
       w.ue(0);
-      w.ue(static_cast<uint32_t>(crop_b / 2));
+      w.ue(static_cast<uint32_t>(crop_b / unit_y));
     } else {
       w.bit(0);
     }

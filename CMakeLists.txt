@@ -1050,10 +1050,15 @@ libcutensor.2.7.0 {
           ENV NVENC_HEADER_DIR)
   if(NVENC_INCLUDE)
     message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
-    add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp)
+    # The H.264 encoder reconstructs its reference picture with the tree's own decoder (h264_decode.cpp);
+    # only NvEnc* is exported.
+    set(_nvenc_map "${CMAKE_BINARY_DIR}/maps/libnvidia-encode.so.1.map")
+    file(WRITE "${_nvenc_map}" "{\n  global: NvEnc*;\n  local: *;\n};\n")
+    add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp)
     target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
     target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE} nvidia/src)
     set_target_properties(vgpunvenc PROPERTIES OUTPUT_NAME nvidia-encode SOVERSION 1)
+    target_link_options(vgpunvenc PRIVATE "-Wl,--version-script=${_nvenc_map}")
     add_custom_command(TARGET vgpunvenc POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
       COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvidia-encode.so.1"
@@ -1065,7 +1070,8 @@ libcutensor.2.7.0 {
 
   # ---------------------------------------------------------------------------
   # libvgpunvcuvid: NVDEC's API (cuvid*), presented as libnvcuvid.so.1. Motion
-  # JPEG is decoded on the host by the nvJPEG library's codec, compiled in here
+  # JPEG is decoded on the host by the nvJPEG library's codec and H.264 by the
+  # decoder and video parser in nvidia/src/h264_*.cpp, compiled in here
   # (hidden: only cuvid* is exported); every other codec reports itself
   # unsupported. The Video Codec SDK headers are vendored in
   # nvidia/third_party/nvdec_include.
@@ -1073,7 +1079,8 @@ libcutensor.2.7.0 {
   if(EXISTS "${CMAKE_SOURCE_DIR}/nvidia/third_party/nvdec_include/nvcuvid.h")
     set(_nvcuvid_map "${CMAKE_BINARY_DIR}/maps/libnvcuvid.so.1.map")
     file(WRITE "${_nvcuvid_map}" "{\n  global: cuvid*;\n  local: *;\n};\n")
-    add_library(vgpunvcuvid SHARED nvidia/src/nvcuvid_api.cpp nvidia/src/nvjpeg_api.cpp)
+    add_library(vgpunvcuvid SHARED nvidia/src/nvcuvid_api.cpp nvidia/src/nvjpeg_api.cpp
+                nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp)
     target_link_libraries(vgpunvcuvid PRIVATE vgpu vgpucudart)
     target_include_directories(vgpunvcuvid PRIVATE ${CUDA_ABI_INCLUDE} nvidia/third_party/nvdec_include)
     set_target_properties(vgpunvcuvid PROPERTIES OUTPUT_NAME nvcuvid SOVERSION 1 VERSION 1.0)
@@ -1201,6 +1208,14 @@ target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_
 # The H.264 and HEVC writers behind NVENC, read back by decoders of their own.
 vgpu_unit_test(test_nvenc_h264 nvidia/tests/unit/test_nvenc_h264.cpp)
 vgpu_unit_test(test_nvenc_hevc nvidia/tests/unit/test_nvenc_hevc.cpp)
+# The compressing H.264 encoder behind NVENC, against the tree's own decoder.
+vgpu_unit_test(test_nvenc_h264_enc nvidia/tests/unit/test_nvenc_h264_enc.cpp)
+target_sources(test_nvenc_h264_enc PRIVATE nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
+target_compile_definitions(test_nvenc_h264_enc PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The H.264 decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
+vgpu_unit_test(test_h264_decode nvidia/tests/unit/test_h264_decode.cpp)
+target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
+target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
@@ -2095,6 +2110,15 @@ if(TARGET vgpucublas)
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
+    # The H.264 decoder and video parser: every callback and the CRC-32 of every displayed
+    # frame of the streams in nvidia/tests/data/h264, against the RTX 3060's.
+    add_test(NAME e2e_nvcuvid_h264
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvcuvid_h264.sh)
+    set_tests_properties(e2e_nvcuvid_h264 PROPERTIES
+      DEPENDS vgpunvcuvid
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 900)
   endif()
 
   add_test(NAME e2e_symbols

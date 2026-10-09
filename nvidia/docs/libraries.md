@@ -189,28 +189,62 @@ the card's), and `nvidia/tests/e2e/nvcuvid_paths.cpp` with
 `nvcuvid_paths.rtx3060.txt` (293 lines). `run_nvenc.sh --card` and
 `run_nvcuvid.sh --card` run the same programs against the real libraries.
 
-**NVENC.** The encoder is not NVIDIA's. A frame is written as an IDR picture
-whose every coding unit is PCM: macroblocks in H.264 (CAVLC,
-`nvidia/src/nvenc_h264.hpp`, written from ITU-T H.264) and 16x16 coding tree
-blocks in HEVC (`nvidia/src/nvenc_hevc.hpp`, written from ITU-T H.265, with the
-CABAC encoder HEVC cannot do without: one context-coded bin, `split_cu_flag`, and
-the terminate bins for `pcm_flag` and `end_of_slice_segment_flag`). Both are
-lossless and conformant, and read back exactly by ffmpeg
-(`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR through both codecs at
-sizes that are not multiples of 16 and are odd, up to 4K in the HEVC writer's own
-check, and compares every decoded sample); `test_nvenc_h264` and
-`test_nvenc_hevc` do the same with decoders of their own, no ffmpeg needed. It is
-not compression, and rate control, GOP structure, B-frames and every preset
-setting are accepted and change nothing; every picture is an IDR with one
-`idr_pic_id`, so encoding a frame twice gives the same bytes, which encoder SDC
-tests (pantheon's `media_enc_virus`: 4K HEVC, ARGB, forced IDR with the
-parameter sets on every frame, the first bitstream compared with each later one)
-rely on; `nvenc_encode.cu` replays that flow. RGB input is converted with the
-BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input is refused
-(`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it; AV1 sessions are
-refused at initialisation as the card refuses them. The card's own streams (an
-IDR, then P pictures) decode with ffmpeg too, which is how the layouts above
-were checked.
+**NVENC.** The encoder is not NVIDIA's, and it is two encoders.
+
+*H.264 is compressed* (`nvidia/src/nvenc_h264_enc.cpp`, written from ITU-T H.264):
+Intra16x16 and Intra4x4 prediction, the 4x4 integer transform and quantisation,
+CAVLC, and P pictures with one reference, quarter-sample motion search and P_Skip,
+choosing between the modes by squared error plus lambda times the bits. The loop
+filter is on; the reference picture of a P picture is the one the tree's own decoder
+(`h264_decode.cpp`, the NVDEC one) makes from the bytes just written, so encoder and
+decoder cannot disagree about it. The API follows what an application sets: the GOP
+(`gopLength` / `idrPeriod`: an IDR picture every that many pictures; `frameIntervalP
+= 0`: an IDR picture and then I pictures, as the card does it), `NV_ENC_PIC_FLAG_FORCEIDR`
+and `FORCEINTRA`, the picture type of an `enablePTD = 0` session, constant QP
+(`qpIntra` / `qpInterP`, bounded by `minQP` / `maxQP`), and `averageBitRate` for CBR and
+VBR through a closed loop on the frame size (an IDR picture's QP is a search on a scratch
+encoder, so one frame gives one bitstream; later pictures follow the running error against
+the bit budget). The SPS names the profile the configuration asks for (Baseline 66, Main
+77, High 100 -- the tools are the same in all three) and the level the frame size and rate
+need. `NvEncLockBitstream` reports IDR, I or P as the card does. Intra pictures carry a
+digest of the input as an SEI message (decoders skip it): a lossy encoder can lose a
+one-sample change in quantisation, and encoder corruption checks (pantheon's
+`media_enc_virus`: one frame, a forced IDR with the parameter sets every time, the
+bitstream compared with a golden one) need the same frame to give the same bytes and a
+changed frame to give different ones. Not used although the card's capabilities list
+them (the settings are accepted and the stream is valid without them): B pictures,
+CABAC, the 8x8 transform, several slices, adaptive quantisation, lookahead, weighted
+prediction, multiple references, intra refresh, temporal layers. Quality: at the same QP
+a noisy test sequence comes out roughly 1.5 times the card's size at the same peak
+signal-to-noise ratio (`nvenc_nvdec` prints both numbers), and about as large as x264's
+Baseline profile (no B pictures, one reference) at the same QP. The lossless tuning (and `qpPrimeYZeroTransformBypassFlag`)
+stays the PCM stream described next: transform bypass is a High 4:4:4 Predictive tool
+and the card's lossless mode is exact.
+
+*HEVC, and H.264 with the lossless tuning, are PCM streams:* every coding unit is
+PCM -- macroblocks in H.264 (CAVLC, `nvidia/src/nvenc_h264.hpp`) and 16x16 coding tree
+blocks in HEVC (`nvidia/src/nvenc_hevc.hpp`, written from ITU-T H.265, with the CABAC
+encoder HEVC cannot do without: one context-coded bin, `split_cu_flag`, and the terminate
+bins for `pcm_flag` and `end_of_slice_segment_flag`). Both are lossless and
+conformant. They are not compression: rate control, GOP structure, B-frames and every
+preset setting are accepted and change nothing, and every picture is an IDR with one
+`idr_pic_id`, so encoding a frame twice gives the same bytes.
+
+Both are read back by ffmpeg (`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR
+through both codecs at sizes that are not multiples of 16 and are odd, and compares every
+decoded sample of the PCM streams and the signal-to-noise ratio of the compressed ones;
+`nvenc_nvdec.cpp` decodes the H.264 streams with ffmpeg and with this tree's NVDEC and
+requires the same samples, and checks the picture types, the profile and the bit rate);
+`test_nvenc_h264`, `test_nvenc_hevc` and `test_nvenc_h264_enc` do the same with decoders of
+their own, no ffmpeg needed, and `test_nvenc_h264_enc` also holds the encoder's own
+reconstruction to the decoder's, picture for picture. `run_nvenc.sh --card` runs
+`nvenc_api`, `nvenc_h264` and `nvenc_nvdec` against the driver's libraries: the card's
+streams pass the same checks, and its picture types, profile bytes and bit rate agree with
+the simulator's. `nvenc_encode.cu` replays the encoder SDC flow. RGB input is converted
+with the BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input is refused
+(`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it; AV1 sessions are refused at
+initialisation as the card refuses them. The card's own streams (an IDR, then P pictures)
+decode with ffmpeg too, which is how the layouts above were checked.
 
 **NVDEC.** Motion JPEG is a sequence of independent JPEG pictures, and the
 simulator has a JPEG decoder, so `cudaVideoCodec_JPEG` is decoded on the host
@@ -225,9 +259,48 @@ card's to within one level on the baseline and restart-interval fixtures
 (`nvidia/tests/data/jpeg`, card output in `nvidia/tests/data/nvdec`). The
 subset is sequential 8-bit Huffman JPEG; the card refuses progressive pictures
 (`CUDA_ERROR_INVALID_IMAGE`, the picture's status `Error`) and four-component
-ones (the parser skips them), and so does this. Every other codec reports
-`bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser` answer
-`CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, H.264, HEVC, VP8, VP9
+ones (the parser skips them), and so does this. **H.264 is decoded too**, by a decoder written from ITU-T H.264 (03/2009) alone
+(`nvidia/src/h264_decode.cpp`, `h264_dec_*.inc`; the CAVLC, CABAC, scan, QP and
+deblocking tables are extracted from the Recommendation's PDF by
+`nvidia/tools/gen_h264_tables.py`, which is how a transcription error is kept out)
+and a video parser (`h264_parser.cpp`) that produces the sequence, decode and
+display callbacks. H.264 output is defined sample for sample, so a conformant
+decoder is bit-exact: Baseline, Main and High progressive 4:2:0 8-bit streams with
+CAVLC or CABAC, I, P and B slices, 4x4 and 8x8 transforms, scaling matrices,
+explicit and implicit weighted prediction, spatial and temporal direct prediction,
+multiple slices and references, long-term references, every deblocking setting,
+odd sizes with cropping, all decode to the checksums of the card's NVDEC
+(`nvidia/tests/data/h264`: 51 streams in 103 parser-driving runs; the card's
+transcript is `nvcuvid_h264.rtx3060.txt`, 12 991 lines, and holds the CRC-32 of
+every displayed frame, with `run_nvcuvid_h264.sh --card` running the same program
+against the driver). The parser reproduces what the card's does and the Recommendation
+leaves open: when a picture is complete, the number of decode surfaces it asks for,
+the picture indices handed out, the reference slots of every picture, display order,
+display delay, and timestamps (given, derived and absent); the rules were fitted to
+the card's callbacks, including what does and does not complete a picture (a slice of the next one, an access unit
+delimiter or an end of sequence do; SEI messages and parameter sets, repeated or changed, do not -- streams carrying one
+before every slice are among the fixtures). Where the fit is approximate it is
+listed in the test: with `ulMaxDisplayDelay` above one on a stream with B pictures, and
+around IDR pictures, the interleaving of display callbacks with later decode callbacks
+is the card's only to within one picture. A rescaled surface (a target size that
+is not the display area) is the card's scaler approximated: bilinear to enlarge,
+area-averaging to shrink by more than half, compared with the card's pixels to within
+one level. The capability answer is the card's: H.264 4:2:0 8-bit, 48x16 to 4096x4096,
+and 4:0:0, 4:2:2, 4:4:4 and every deeper bit depth are reported unsupported;
+`cuvidCreateDecoder` refuses them as the card does (`CUDA_ERROR_NOT_SUPPORTED`),
+as it does the `H264_SVC` codec type. Macroblock-adaptive frame/field frames (MBAFF) are decoded, field and frame pairs mixed,
+with the deblocking filter's mixed edges (`mbaff_field*` in `nvidia/tests/data/h264`: interlaced test content coded with half
+or more of its macroblocks as field pairs, in CABAC and CAVLC, with P, B (spatial and temporal direct), weighted prediction,
+several slices and cropping, all equal to the card's frames and to ffmpeg's). Field pictures (PAFF) are decoded too, field pairs
+shown as one frame, two reference fields per picture and the chroma offset between fields of different parity included
+(`paff*` fixtures: the only encoder that writes field pictures is this tree's own NVENC H.264 encoder in its test-only field
+mode, `make_paff.cpp`; the streams are equal to ffmpeg's decode and to the card's, and the card's callbacks -- the field
+pair, its picture order counts, its display -- are reproduced). Not decoded:
+flexible macroblock ordering, redundant pictures, SP/SI slices, data partitioning. Pictures that cannot be decoded report
+`CUDA_ERROR_INVALID_IMAGE` from `cuvidDecodePicture`; damaged streams never crash
+(`test_h264_decode` flips bits in streams under ASan and UBSan). Every other codec
+reports `bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser`
+answer `CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, HEVC, VP8, VP9
 and AV1 engines, and a software decoder for them is a large separate project --
 none is here, so an application falls back to its CPU decoder instead of
 receiving a wrong picture. `cuvidCreateVideoSource` (files and URLs) needs a
