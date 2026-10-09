@@ -178,13 +178,28 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
 
 // One wavefront: its own scalar registers, VCC, EXEC and SCC, and 64 lanes of
 // vector registers.
+// A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
+// instruction reaches past them (through s_set_vgpr_msb), which the file grows to meet. Indexed as a two-dimensional array.
+struct VgprFile {
+  std::vector<std::array<uint32_t, kLanes>> r;
+  VgprFile() : r(kVgprs) {}
+  std::array<uint32_t, kLanes>& operator[](size_t i) { return r[i]; }
+  const std::array<uint32_t, kLanes>& operator[](size_t i) const { return r[i]; }
+  void grow(size_t n) {
+    if (r.size() < n) r.resize(n);
+  }
+};
+
 struct Wave {
   uint32_t sgpr[kSgprs] = {};
   // The trap handler's registers. RDNA4 gives a kernel its work-group's id in
   // two of them (TTMP9 x; TTMP7 y and z, a half each) rather than in scalar
   // registers after the user ones.
   uint32_t ttmp[16] = {};
-  uint32_t vgpr[kVgprs][kLanes] = {};
+  VgprFile vgpr;
+  // gfx1250: the two high bits s_set_vgpr_msb puts on the numbers of the vector registers an instruction names --
+  // sources 0 to 2 in bits 1:0, 3:2 and 5:4, the destination in 7:6.
+  uint8_t vgpr_msb = 0;
   // The accumulation registers: a second bank a kernel keeps values in when
   // it has more of them than the vector registers hold.
   std::vector<std::array<uint32_t, kLanes>> agpr;
@@ -1705,7 +1720,15 @@ struct Machine {
   // only some of the lanes written. Narrowing EXEC to those lanes is what
   // keeps the rest of them as they were, since every write here asks EXEC
   // first.
-  void cross_lane_alu(Wave& w, const Inst& in) {
+  void cross_lane_alu(Wave& w, const Inst& in_dpp) {
+    // A comparison with DPP is the comparison of its name without the suffix, over the same shuffled source.
+    Inst plain;
+    const bool comparing = in_dpp.name.rfind("v_cmp", 0) == 0;
+    if (comparing) {
+      plain = in_dpp;
+      if (plain.name.ends_with("_dpp")) plain.name.resize(plain.name.size() - 4);
+    }
+    const Inst& in = comparing ? plain : in_dpp;
     std::array<uint32_t, kLanes> values{};
     const uint64_t writes = dpp_shuffle(w, in, values);
     const uint64_t saved = w.exec;
@@ -1713,7 +1736,8 @@ struct Machine {
     dpp_values = &values;
     w.exec = writes;
     try {
-      vector_alu(w, in);
+      if (comparing) compare(w, in);
+      else vector_alu(w, in);
     } catch (...) {
       w.exec = saved;
       dpp_operand = nullptr;
@@ -2108,6 +2132,75 @@ struct Machine {
           r |= (static_cast<uint32_t>(v) & 0xFFFFu) << (16 * half);
         }
         write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_cvt_pk_fp8_f16"_op || op == "v_cvt_pk_bf8_f16"_op) {
+      // Two halves narrowed, to nearest even, into one half of the destination (op_sel's bit 3 says the high one), the
+      // other half kept.
+      const F8& t = op == "v_cvt_pk_fp8_f16"_op ? fp8() : bf8();
+      each([&](uint32_t lane) {
+        const uint32_t x = lane_src(w, in.src[0], lane);
+        const auto half_at = [&](uint32_t sh) {
+          float f = static_cast<float>(as_half(static_cast<uint16_t>(x >> sh)));
+          if (in.src[0].abs) f = std::fabs(f);
+          return in.src[0].neg ? -f : f;
+        };
+        const uint32_t two = float_to_f8(half_at(0), t, in.clamp, nullptr) | float_to_f8(half_at(16), t, in.clamp, nullptr) << 8;
+        const uint32_t was = w.vgpr[in.dst[0].index][lane];
+        write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
+      });
+    } else if (op == "v_cvt_sr_fp8_f16"_op || op == "v_cvt_sr_bf8_f16"_op) {
+      // Stochastic rounding, as the ISA has it: the second source's top bits (seven for fp8, eight for bf8) are added to
+      // the half's ten mantissa bits, wrapping, and the result narrowed to nearest even into the byte op_sel's bits 3:2 name.
+      const bool is_fp8 = op == "v_cvt_sr_fp8_f16"_op;
+      const F8& t = is_fp8 ? fp8() : bf8();
+      const uint32_t at = 8 * ((in.op_sel >> 2) & 3);
+      each([&](uint32_t lane) {
+        uint32_t h = lane_src(w, in.src[0], lane) & 0xFFFFu;
+        if (in.src[0].abs) h &= 0x7FFFu;
+        if (in.src[0].neg) h ^= 0x8000u;
+        const uint32_t seed = lane_src(w, in.src[1], lane) >> (is_fp8 ? 25 : 24);
+        const uint32_t m = ((h & 0x3FFu) + seed) & 0x3FFu;
+        const float f = static_cast<float>(as_half(static_cast<uint16_t>((h & 0xFC00u) | m)));
+        const uint32_t b = float_to_f8(f, t, in.clamp, nullptr);
+        const uint32_t was = w.vgpr[in.dst[0].index][lane];
+        write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
+      });
+    } else if (op == "v_cvt_sr_pk_bf16_f32"_op) {
+      // The seed's halves are added to the floats' bits and the top half of each sum kept: a truncation, after the add.
+      each([&](uint32_t lane) {
+        const uint32_t seed = u(2, lane);
+        const uint32_t lo = as_bits(lane_float(w, in.src[0], lane)) + (seed & 0xFFFFu);
+        const uint32_t hi = as_bits(lane_float(w, in.src[1], lane)) + (seed >> 16);
+        write_lane(w, in.dst[0], lane, (lo >> 16) | (hi & 0xFFFF0000u));
+      });
+    } else if (op == "v_cvt_sr_pk_f16_f32"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t seed = u(2, lane);
+        const float lo = as_float(as_bits(lane_float(w, in.src[0], lane)) + (seed & 0xFFFFu));
+        const float hi = as_float(as_bits(lane_float(w, in.src[1], lane)) + (seed >> 16));
+        write_lane(w, in.dst[0], lane, uint32_t{as_bits(static_cast<_Float16>(lo))} | uint32_t{as_bits(static_cast<_Float16>(hi))} << 16);
+      });
+    } else if (op == "v_fma_mix_f32_bf16"_op || op == "v_fma_mixlo_bf16"_op || op == "v_fma_mixhi_bf16"_op) {
+      // As the half forms: each source a float, or -- where its op_sel_hi bit is set -- the bfloat16 half op_sel names;
+      // the "mix" forms read neg_hi as an absolute value.
+      each([&](uint32_t lane) {
+        const auto source = [&](uint32_t k) {
+          const Operand& o = in.src[k];
+          float f;
+          if (!((in.op_sel_hi >> k) & 1)) f = lane_float(w, o, lane);
+          else f = as_float((lane_src(w, o, lane) >> (((in.op_sel >> k) & 1) ? 16 : 0) & 0xFFFFu) << 16);
+          if (o.abs) f = std::fabs(f);
+          return o.neg ? -f : f;
+        };
+        float r = std::fma(source(0), source(1), source(2));
+        if (in.clamp) r = std::isnan(r) ? 0.0f : std::fmin(1.0f, std::fmax(0.0f, r));
+        if (op == "v_fma_mix_f32_bf16"_op) {
+          write_lane(w, in.dst[0], lane, as_bits(r));
+          return;
+        }
+        const uint32_t bits = to_bf16(r);
+        const uint32_t was = w.vgpr[in.dst[0].index][lane];
+        w.vgpr[in.dst[0].index][lane] = op == "v_fma_mixlo_bf16"_op ? (was & 0xFFFF0000u) | bits : (was & 0x0000FFFFu) | bits << 16;
       });
     } else {
       return false;
@@ -2973,7 +3066,7 @@ struct Machine {
     // name the short form has.
     const std::string as_short =
         in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
-        : in.dpp  ? in.name.substr(0, in.name.size() - 4) + "_e32"
+        : (in.dpp || in.dpp8) ? in.name.substr(0, in.name.size() - 4) + "_e32"
         : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
         : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
@@ -5977,6 +6070,14 @@ struct Machine {
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       values[lane] = 0;
       if (!(w.exec >> lane & 1)) continue;
+      if (in.dpp8) {
+        // DPP8: a lane takes any of the eight lanes of its group (three bits of dpp_ctrl for each), and a lane that is
+        // off supplies a zero -- or, with FI, what it holds. Every lane that is on is written.
+        const uint32_t from8 = (lane & ~7u) + ((in.dpp_ctrl >> (3 * (lane & 7))) & 7);
+        values[lane] = in.fi || ((w.exec >> from8) & 1) ? w.vgpr[o.index][from8] : 0u;
+        writes |= uint64_t{1} << lane;
+        continue;
+      }
       if (!((in.row_mask >> (lane >> 4)) & 1)) continue;
       if (!((in.bank_mask >> ((lane >> 2) & 3)) & 1)) continue;
       uint32_t from = 0;
@@ -6302,6 +6403,20 @@ struct Machine {
 
   // What s_set_gpr_idx_on does to an instruction: each vector register
   // operand it enabled is moved on by M0's low byte.
+  // gfx1250: the two top bits of each vector register's number come from the wave's s_set_vgpr_msb setting, by the
+  // operand's place in the instruction (the destination, then sources 0 to 2); a scalar, a constant or any other operand is
+  // as it was. The wave's register file grows to hold what is named.
+  static void apply_vgpr_msb(Wave& w, Inst* in) {
+    const uint32_t dst = (w.vgpr_msb >> 6) & 3, src[3] = {w.vgpr_msb & 3u, (w.vgpr_msb >> 2) & 3u, (w.vgpr_msb >> 4) & 3u};
+    const auto bump = [&](Operand& o, uint32_t msb) {
+      if (o.kind != OperandKind::Vgpr) return;
+      o.index += msb << 8;
+      w.vgpr.grow(o.index + std::max<uint32_t>(o.width, 1));
+    };
+    for (Operand& o : in->dst) bump(o, dst);
+    for (size_t k = 0; k < in->src.size(); ++k) bump(in->src[k], k < 3 ? src[k] : 0);
+    for (Inst& half : in->dual) apply_vgpr_msb(w, &half);
+  }
   static void index_gprs(const Wave& w, Inst* in) {
     const uint32_t by = w.m0 & 0xFF;
     for (uint32_t k = 0; k < in->src.size() && k < 3; ++k)
@@ -6372,8 +6487,8 @@ struct Machine {
     v.mode = &w.mode;
     v.sgpr = w.sgpr;
     v.sgprs = kSgprs;
-    v.vgpr = w.vgpr;
-    v.vgprs = kVgprs;
+    v.vgpr = reinterpret_cast<uint32_t (*)[kLanes]>(w.vgpr.r.data());
+    v.vgprs = static_cast<uint32_t>(w.vgpr.r.size());
     v.lds = &g.lds;
     v.memory = &mem;
     v.disassemble = [this](uint64_t pc, uint32_t* size) -> std::string {
@@ -6510,7 +6625,13 @@ struct Machine {
     if (debug::active() &&
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
       debug_stop(w, g);
-    const Inst& in = fetch(w.pc);
+    const Inst& decoded = fetch(w.pc);
+    // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
+    Inst remapped;
+    const bool vector_enc = decoded.enc == gcn::Enc::Vop1 || decoded.enc == gcn::Enc::Vop2 || decoded.enc == gcn::Enc::Vop3 ||
+                            decoded.enc == gcn::Enc::Vop3p || decoded.enc == gcn::Enc::Vopc || decoded.enc == gcn::Enc::Vopd ||
+                            decoded.enc == gcn::Enc::Flat || decoded.enc == gcn::Enc::Ds;
+    const Inst& in = w.vgpr_msb && vector_enc ? (remapped = decoded, apply_vgpr_msb(w, &remapped), remapped) : decoded;
     // The performance counters' instruction mix, worked out when decoded.
     {
       InstructionCounts& c = stats.counts;
@@ -6564,8 +6685,8 @@ struct Machine {
         }
         std::optional<FloatMode> fm;
         if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, x.name.find("f64") != std::string::npos);
-        if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);
-        else if (x.dpp) cross_lane_alu(w, x);
+        if (x.dpp || x.dpp8) cross_lane_alu(w, x);
+        else if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);
         else vector_alu(w, x);
         return true;
       }
@@ -6605,7 +6726,8 @@ struct Machine {
         ++n.valu;
         std::optional<FloatMode> fm;
         if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, in.name.find("f64") != std::string::npos);
-        compare(w, in);
+        if (in.dpp || in.dpp8) cross_lane_alu(w, in);
+        else compare(w, in);
         return true;
       }
       case gcn::Enc::Ds:
@@ -6705,8 +6827,9 @@ struct Machine {
     // gfx1250 addresses up to 1024 vector registers by setting the top bits of every VGPR number; a program that
     // sets any is not one this runs yet.
     if (OpName(in.name) == "s_set_vgpr_msb"_op) {
-      if (in.simm != 0)
-        throw Error::make(Err::Unsupported, "s_set_vgpr_msb ", in.simm, ", which addresses vector registers past v255 and is not modeled");
+      // The two high bits of the vector register numbers the following instructions name, until the next one (the same
+      // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
+      w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
       return true;
     }
     if (OpName(in.name) == "s_monitor_sleep"_op) return false;

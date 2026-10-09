@@ -404,11 +404,19 @@ false` throughout. gfx1251 (MI430X) is not covered.
 - **Transposing loads:** `global_load_tr16_b128`, `global_load_tr8_b64`, `ds_load_tr16_b128` and `ds_load_tr8_b64`, which
   load a 16x16 tile held column by column straight into the registers of a WMMA operand (lane map from the ISA
   document's figure; `tests/hipcc/trload1250.cpp` feeds them to a WMMA). EXEC must be all ones.
+- **Vector registers past v255:** a wave's register file grows to what a kernel names, up to the 1024 a gfx1250 wave may
+  have, and `s_set_vgpr_msb` puts the two high bits on the numbers each following instruction's destination and sources
+  name (VALU, FLAT/GLOBAL and DS instructions; the buffer and image forms and `v_movrel*` are not covered, nor is writing
+  the bits through the MODE register). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
+- **DPP8** (all eight selects, with and without `fi`, on the VALU and compare instructions) and DPP on the compares, which
+  were refused.
+- **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic
+  `v_cvt_sr_{fp8,bf8}_f16` (the seed's top bits added to the half's mantissa, as the ISA's pseudocode has it),
+  `v_cvt_sr_pk_{bf16,f16}_f32` and `v_fma_mix{,lo,hi}_bf16`.
 - **Decoded and printed, but refused when executed:** the tensor data mover (`tensor_load_to_lds`,
   `tensor_store_from_lds`); cluster loads, the 6- and 4-bit transposed loads
-  (`*_load_tr6_*`, `*_load_tr4_*`); `s_set_vgpr_msb` with a non-zero value (vector
-  registers past v255); `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16
-  packed arithmetic and the other 16-bit packed additions. Each says so by name when a kernel reaches it. The
+  (`*_load_tr6_*`, `*_load_tr4_*`); `v_perm_pk16_*` and the `v_cvt_scale*` family (the ISA's pseudocode calls scaling
+  helpers it does not define); the cube-face instructions and a few more. Each says so by name when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes
   0x37/0xBD (32-bit scales) and 0x3B/0xBA (64-bit), which are also ordinary opcodes in the same XML (0x37 is

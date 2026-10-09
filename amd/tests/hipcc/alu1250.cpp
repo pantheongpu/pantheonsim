@@ -120,6 +120,17 @@ V3(k_pk_max3_u16, "v_pk_max3_u16 %0, %1, %2, %3")
 V3(k_pk_min3_i16, "v_pk_min3_i16 %0, %1, %2, %3")
 V3(k_pk_min3_u16, "v_pk_min3_u16 %0, %1, %2, %3")
 
+V3(k_fma_mix_f32_bf16, "v_fma_mix_f32_bf16 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,1]")
+V3(k_fma_mixlo_bf16, "v_fma_mixlo_bf16 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,1]")
+V3(k_fma_mixhi_bf16, "v_fma_mixhi_bf16 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,1]")
+V1(k_cvt_pk_fp8_f16, "v_cvt_pk_fp8_f16 %0, %1")
+V1(k_cvt_pk_bf8_f16, "v_cvt_pk_bf8_f16 %0, %1")
+V1(k_cvt_pk_fp8_f16_hi, "v_cvt_pk_fp8_f16 %0, %1 op_sel:[0,1]")
+V2(k_cvt_sr_fp8_f16, "v_cvt_sr_fp8_f16 %0, %1, %2")
+V2(k_cvt_sr_bf8_f16, "v_cvt_sr_bf8_f16 %0, %1, %2")
+V3(k_cvt_sr_pk_bf16_f32, "v_cvt_sr_pk_bf16_f32 %0, %1, %2, %3")
+V3(k_cvt_sr_pk_f16_f32, "v_cvt_sr_pk_f16_f32 %0, %1, %2, %3")
+
 // Doubles, in pairs of the 32-bit arrays (a: low words, b: high words of x; c, d of y -- here passed as a, b and c, o2).
 __global__ void k_f64(const uint32_t* xlo, const uint32_t* xhi, const uint32_t* ylo, uint32_t* o) {
   const int i = blockIdx.x * 32 + threadIdx.x;
@@ -209,6 +220,28 @@ EXECOP(k_nor32, "s_nor_saveexec_b32 %0, %4")
 EXECOP(k_xnor32, "s_xnor_saveexec_b32 %0, %4")
 EXECOP(k_wr0_32, "s_and_not0_wrexec_b32 %0, %4")
 EXECOP(k_wr1_32, "s_and_not1_wrexec_b32 %0, %4")
+
+// DPP8: each lane of a group of eight takes the lane its three-bit selector names. Lanes that are off (every third)
+// supply a zero, or, with fi, what they hold. A comparison takes its first operand the same way.
+__global__ void k_dpp8(const uint32_t* a, const uint32_t* b, uint32_t* o) {
+  const int l = threadIdx.x;
+  uint32_t x = a[l], y = b[l];
+  asm volatile("" : "+v"(x), "+v"(y));   // keep the loads before the branch: a lane that is off must still hold its value
+  uint32_t r = 0, rf = 0;
+  if (l % 3 != 0) {
+    asm volatile("v_add_nc_u32_dpp %0, %1, %2 dpp8:[3,0,5,2,7,4,1,6]" : "=v"(r) : "v"(x), "v"(y));
+    asm volatile("v_add_nc_u32_dpp %0, %1, %2 dpp8:[3,0,5,2,7,4,1,6] fi:1" : "=v"(rf) : "v"(x), "v"(y));
+  }
+  o[l] = r;
+  o[32 + l] = rf;
+}
+__global__ void k_dpp_cmp(const uint32_t* a, const uint32_t* b, uint32_t* o) {
+  const uint32_t x = a[threadIdx.x], y = b[threadIdx.x];
+  uint32_t m8, m16;
+  asm volatile("v_cmp_lt_u32_dpp vcc_lo, %1, %2 dpp8:[7,6,5,4,3,2,1,0]\n\ts_mov_b32 %0, vcc_lo" : "=s"(m8) : "v"(x), "v"(y) : "vcc");
+  asm volatile("v_cmp_lt_u32_dpp vcc_lo, %1, %2 row_xmask:1 row_mask:0xf bank_mask:0xf\n\ts_mov_b32 %0, vcc_lo" : "=s"(m16) : "v"(x), "v"(y) : "vcc");
+  if (threadIdx.x == 0) o[0] = m8, o[1] = m16;
+}
 
 // --- the host's side ------------------------------------------------------------------------------------------------
 static uint32_t seed = 20260101;
@@ -584,6 +617,101 @@ int main() {
     run3("v_pk_min3_u16", k_pk_min3_u16, P, P2, P3, [&](uint32_t a, uint32_t b, uint32_t c) { return per_half(a, b, c, [&](uint32_t x, uint32_t y, uint32_t z) { return std::min({x, y, z}); }); }, 32, false, false, &failed);
   }
 
+  // --- mixed bfloat16 multiply-adds: source 0 is a bfloat16 (the high half), 1 a float, 2 a bfloat16 (the low half) ---
+  {
+    std::vector<uint32_t> M0(N), M2(N);
+    for (int i = 0; i < N; ++i) {
+      M0[i] = uint32_t{bf16_bits((static_cast<int>(rnd32() % 65) - 32) / 4.0f)} << 16 | (rnd32() & 0xFFFF);
+      M2[i] = (rnd32() & 0xFFFF0000u) | uint32_t{bf16_bits((static_cast<int>(rnd32() % 65) - 32) / 8.0f)};
+    }
+    std::vector<uint32_t> M1(N);
+    for (int i = 0; i < N; ++i) M1[i] = fb((static_cast<int>(rnd32() % 65) - 32) / 16.0f);
+    const auto mix = [](uint32_t a, uint32_t b, uint32_t c) { return std::fma(bf16f(static_cast<uint16_t>(a >> 16)), bf(b), bf16f(static_cast<uint16_t>(c))); };
+    run3("v_fma_mix_f32_bf16", k_fma_mix_f32_bf16, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return fb(mix(a, b, c)); }, 32, false, false, &failed);
+    run3("v_fma_mixlo_bf16", k_fma_mixlo_bf16, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return uint32_t{bf16_bits(mix(a, b, c))}; }, 32, false, false, &failed);
+    run3("v_fma_mixhi_bf16", k_fma_mixhi_bf16, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return uint32_t{bf16_bits(mix(a, b, c))} << 16; }, 32, false, false, &failed);
+  }
+
+  // --- 8-bit floats from halves. Values that are exact in the 8-bit format go through unchanged, and a stochastic
+  // rounding of one with a seed under half an ulp (in the half's ten mantissa bits) leaves it, one of 64 or more takes the
+  // next code up. ---
+  {
+    const auto e4m3 = [](uint32_t b, bool* ok) {
+      const int e = (b >> 3) & 15, m = b & 7;
+      *ok = !(e == 15 && m == 7);
+      const float v = e == 0 ? std::ldexp(m / 8.0f, -6) : std::ldexp(1.0f + m / 8.0f, e - 7);
+      return (b & 0x80) ? -v : v;
+    };
+    const auto e5m2 = [](uint32_t b, bool* ok) {
+      const int e = (b >> 2) & 31, m = b & 3;
+      *ok = e != 31;
+      const float v = e == 0 ? std::ldexp(m / 4.0f, -14) : std::ldexp(1.0f + m / 4.0f, e - 15);
+      return (b & 0x80) ? -v : v;
+    };
+    for (int bf8 = 0; bf8 < 2; ++bf8) {
+      std::vector<uint32_t> bytes;
+      for (uint32_t b = 0; b < 256; ++b) {
+        bool ok;
+        (bf8 ? e5m2 : e4m3)(b, &ok);
+        if (ok) bytes.push_back(b);
+      }
+      std::vector<uint32_t> pk(N), want(N), single(N), seed_lo(N), seed_hi(N), z(N, 0);
+      for (int i = 0; i < N; ++i) {
+        bool ok;
+        const uint32_t b0 = bytes[rnd32() % bytes.size()], b1 = bytes[rnd32() % bytes.size()];
+        pk[i] = uint32_t{f2h((bf8 ? e5m2 : e4m3)(b0, &ok))} | uint32_t{f2h((bf8 ? e5m2 : e4m3)(b1, &ok))} << 16;
+        want[i] = b0 | b1 << 8;
+        const uint32_t sb = bytes[rnd32() % (bytes.size() - 4)];
+        const uint32_t sbyte = (sb & 0x7F) >= (bf8 ? 0x7B : 0x7E) ? sb & 0x70 : sb;   // not the largest magnitudes: past them a seed overflows
+        single[i] = uint32_t{f2h((bf8 ? e5m2 : e4m3)(sbyte, &ok))};
+        seed_lo[i] = (rnd32() % (bf8 ? 128 : 64)) << (bf8 ? 24 : 25);   // under half an ulp of the 8-bit format
+      }
+      run3(bf8 ? "v_cvt_pk_bf8_f16" : "v_cvt_pk_fp8_f16", bf8 ? k_cvt_pk_bf8_f16 : k_cvt_pk_fp8_f16, pk, pk, pk,
+           [&](uint32_t a, uint32_t, uint32_t) {
+             const uint32_t lo = a & 0xFFFF, hi = a >> 16;
+             uint32_t r = 0;
+             for (int h = 0; h < 2; ++h) {
+               const uint32_t half = h ? hi : lo;
+               for (uint32_t b : bytes) {
+                 bool ok;
+                 if (f2h((bf8 ? e5m2 : e4m3)(b, &ok)) == half) { r |= b << (8 * h); break; }
+               }
+             }
+             return r;
+           }, 32, false, false, &failed);
+      if (!bf8)
+        run3("v_cvt_pk_fp8_f16 into the high half", k_cvt_pk_fp8_f16_hi, pk, pk, pk, [&](uint32_t a, uint32_t, uint32_t) {
+          uint32_t r = 0;
+          for (int h = 0; h < 2; ++h)
+            for (uint32_t b : bytes) {
+              bool ok;
+              if (f2h(e4m3(b, &ok)) == ((a >> (16 * h)) & 0xFFFF)) { r |= b << (8 * h); break; }
+            }
+          return r << 16;
+        }, 32, false, false, &failed);
+      run3(bf8 ? "v_cvt_sr_bf8_f16 (a small seed)" : "v_cvt_sr_fp8_f16 (a small seed)", bf8 ? k_cvt_sr_bf8_f16 : k_cvt_sr_fp8_f16, single, seed_lo, z,
+           [&](uint32_t a, uint32_t, uint32_t) {
+             for (uint32_t b : bytes) {
+               bool ok;
+               if (f2h((bf8 ? e5m2 : e4m3)(b, &ok)) == (a & 0xFFFF)) return b;
+             }
+             return 0xFFFFu;
+           }, 32, false, false, &failed);
+    }
+  }
+
+  // --- stochastic packs: the seed's halves are added to the floats' bits ---
+  {
+    std::vector<uint32_t> A2(N), B2(N), Z(N);
+    for (int i = 0; i < N; ++i) A2[i] = fb((static_cast<int>(rnd32() % 4001) - 2000) / 64.0f), B2[i] = fb((static_cast<int>(rnd32() % 4001) - 2000) / 64.0f), Z[i] = rnd32();
+    run3("v_cvt_sr_pk_bf16_f32", k_cvt_sr_pk_bf16_f32, A2, B2, Z, [](uint32_t a, uint32_t b, uint32_t seed) {
+      return ((a + (seed & 0xFFFF)) >> 16) | ((b + (seed >> 16)) & 0xFFFF0000u);
+    }, 32, false, false, &failed);
+    run3("v_cvt_sr_pk_f16_f32", k_cvt_sr_pk_f16_f32, A2, B2, Z, [](uint32_t a, uint32_t b, uint32_t seed) {
+      return uint32_t{f2h(bf(a + (seed & 0xFFFF)))} | uint32_t{f2h(bf(b + (seed >> 16)))} << 16;
+    }, 32, false, false, &failed);
+  }
+
   // --- doubles ---
   {
     std::vector<uint32_t> xlo(N), xhi(N), ylo(2 * N);
@@ -724,6 +852,43 @@ int main() {
       }
       report(op.name, wrong, 128, &failed);
     }
+  }
+
+  // --- DPP8, and a comparison with a shuffled first operand ---
+  {
+    std::vector<uint32_t> X(32), Y(32);
+    for (int i = 0; i < 32; ++i) X[i] = 1000 + 7 * i, Y[i] = 50000 + i;
+    uint32_t* x = up(X);
+    uint32_t* y = up(Y);
+    k_dpp8<<<1, 32>>>(x, y, dout);
+    CHECK(hipDeviceSynchronize());
+    auto out = fetch(64);
+    const int sel[8] = {3, 0, 5, 2, 7, 4, 1, 6};
+    int wrong = 0, wrong_fi = 0;
+    for (int l = 0; l < 32; ++l) {
+      const bool on = l % 3 != 0;
+      const int from = (l & ~7) + sel[l & 7];
+      const bool from_on = from % 3 != 0;
+      wrong += out[l] != (on ? (from_on ? X[from] : 0u) + Y[l] : 0u);
+      wrong_fi += out[32 + l] != (on ? X[from] + Y[l] : 0u);
+    }
+    report("v_add_nc_u32 with dpp8", wrong, 32, &failed);
+    report("v_add_nc_u32 with dpp8 and fi", wrong_fi, 32, &failed);
+    std::vector<uint32_t> X2(32), Y2(32);
+    for (int i = 0; i < 32; ++i) X2[i] = rnd32() % 100, Y2[i] = rnd32() % 100;
+    x = up(X2);
+    y = up(Y2);
+    k_dpp_cmp<<<1, 32>>>(x, y, dout);
+    CHECK(hipDeviceSynchronize());
+    out = fetch(2);
+    uint32_t want8 = 0, want16 = 0;
+    for (int l = 0; l < 32; ++l) {
+      want8 |= uint32_t{X2[(l & ~7) + (7 - (l & 7))] < Y2[l]} << l;
+      want16 |= uint32_t{X2[l ^ 1] < Y2[l]} << l;
+    }
+    if (out[0] != want8 || out[1] != want16) std::printf("  dpp compares: dpp8 %08x (want %08x), row_xmask %08x (want %08x)\n", out[0], want8, out[1], want16);
+    report("v_cmp_lt_u32 with dpp8", out[0] != want8, 1, &failed);
+    report("v_cmp_lt_u32 with row_xmask", out[1] != want16, 1, &failed);
   }
 
   std::printf("alu1250: %d failed\n", failed);

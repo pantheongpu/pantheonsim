@@ -397,6 +397,12 @@ status=$?
 expect "the gfx1250 arithmetic program runs to the end" "0" "$status"
 expect "every gfx1250 arithmetic check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's vector registers past v255 (hipcc/vgprs1250.cpp): s_set_vgpr_msb, and 600 values live at once.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/vgprs1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 high-register program runs to the end" "0" "$status"
+expect "every gfx1250 high-register check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.
