@@ -118,6 +118,10 @@ echo "wrote $(pwd)/rdna4.gfx1201"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 rdna2.cpp -o rdna2.gfx1030
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1030 rdna2.cpp -o rdna2.w64.gfx1030
 echo "wrote $(pwd)/rdna2.gfx1030 and rdna2.w64.gfx1030"
+# The same for gfx1031 (Navi 22, the RX 6700 XT), built by ROCm 7.2 on a machine with the card.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1031 rdna2.cpp -o rdna2.gfx1031
+"$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_W64 -mwavefrontsize64 --offload-arch=gfx1031 rdna2.cpp -o rdna2.w64.gfx1031
+echo "wrote $(pwd)/rdna2.gfx1031 and rdna2.w64.gfx1031"
 # hipCUB and rocThrust, which are headers compiled into the program, for a
 # wave64 target and a wave32 one in one program. Their headers come with
 # ROCm's hipcub-dev and rocthrust-dev, and need that ROCm's own hipcc
@@ -132,13 +136,13 @@ prim=${PRIM_ROCM:-$rocm}
 echo "wrote $(pwd)/prim.all"
 # Where a work-group runs (__smid), on every target, in one program.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-arch=gfx950 --offload-arch=gfx90a \
-  --offload-arch=gfx1030 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
+  --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
 echo "wrote $(pwd)/smid.all"
 # Arrays, textures and surfaces, for each RDNA generation's image resources.
-for arch in gfx1030 gfx1100 gfx1201; do
+for arch in gfx1030 gfx1031 gfx1100 gfx1201; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
 done
-echo "wrote $(pwd)/images.gfx1030, images.gfx1100 and images.gfx1201"
+echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100 and images.gfx1201"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.
@@ -167,6 +171,10 @@ for arch in gfx942 gfx90a gfx1030 gfx1100; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch memtest.cpp -o memtest.$arch
 done
 echo "wrote $(pwd)/memtest.gfx942, .gfx90a, .gfx1030 and .gfx1100"
+# gfx1031 (the RX 6700 XT) is built by ROCm 7.2, on the machine with the card, and
+# asks for libamdhip64.so.7.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1031 memtest.cpp -o memtest.gfx1031
+echo "wrote $(pwd)/memtest.gfx1031"
 
 # Work-group shapes (ids of every dimension, LDS between the waves of a group),
 # for the four architectures the e2e test runs. Built with the Ubuntu 24.04
@@ -176,6 +184,8 @@ for arch in gfx942 gfx90a gfx1030 gfx1100; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch workgroup.cpp -o workgroup.$arch
 done
 echo "wrote $(pwd)/workgroup.gfx942, .gfx90a, .gfx1030 and .gfx1100"
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1031 workgroup.cpp -o workgroup.gfx1031
+echo "wrote $(pwd)/workgroup.gfx1031 (ROCm 7.2, like memtest.gfx1031)"
 
 # The same programs for gfx1250 (CDNA 5, MI455X; wave32), which the runner executes on a simulated MI455X. Built
 # by ROCm 7.2's hipcc, which knows gfx1250; no card has run them.

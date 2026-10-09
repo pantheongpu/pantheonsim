@@ -69,7 +69,7 @@ VTEST(every_amd_gpu_is_a_node_as_other_tools_describe_it) {
     ++amd;
     const int count = 3;
     const Files f = topology(p, count);
-    const vgpu::amd::Chip c = vgpu::amd::chip(p.architecture.c_str());
+    const vgpu::amd::Chip c = vgpu::amd::chip(p.architecture.c_str(), p.telemetry.pci_device_id);
     const bool instinct = p.architecture[0] == 'c';
 
     // The CPU is node 0, with a link to each GPU and no SIMDs.

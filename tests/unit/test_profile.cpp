@@ -25,7 +25,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/rtx-pro-6000", "nvidia/gb10", "nvidia/gb200",
       "nvidia/vr200", "nvidia/thor",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt",
-      "amd/rx6900xt"};
+      "amd/rx6900xt", "amd/rx6800", "amd/rx6700xt"};
   VCHECK_EQ(ids.size(), expected.size());
   for (const auto& want : expected)
     VCHECK(std::find(ids.begin(), ids.end(), want) != ids.end());
@@ -49,7 +49,7 @@ VTEST(all_builtin_profiles_parse) {
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
                           p.id == "nvidia/a10g" || p.id == "nvidia/l4" ||
                           p.id == "nvidia/l40s" ||
-                          p.id == "amd/mi325x");
+                          p.id == "amd/mi325x" || p.id == "amd/rx6800" || p.id == "amd/rx6700xt");
     // AMD parts have no compute capability, and the profile that carried a
     // plausible "9.4" was inventing one. Each vendor is asked for the thing it
     // actually has.

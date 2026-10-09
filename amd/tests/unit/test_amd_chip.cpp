@@ -17,7 +17,7 @@ VTEST(every_amd_profile_has_its_own_chip) {
     const vgpu::DeviceProfile p = vgpu::load_gpu(id);
     if (p.vendor != "amd") continue;
     ++amd;
-    const vgpu::amd::Chip c = vgpu::amd::chip(p.architecture.c_str());
+    const vgpu::amd::Chip c = vgpu::amd::chip(p.architecture.c_str(), p.telemetry.pci_device_id);
     // The target the chip table gives is the profile's own.
     VCHECK_EQ(std::string(c.gfx), p.gcn_arch);
     // gfx10 and later (gfx1250 too) have no sramecc or xnack settings in their target ID: the compiler rejects

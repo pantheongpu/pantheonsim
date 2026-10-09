@@ -8,6 +8,12 @@
 // Four work-groups to a multiprocessor, of 256 work-items: every one should
 // find a multiprocessor of its own among them all, and every wave of a group
 // the same one. Built for each target into one program (build.sh).
+//
+// On gfx1030 and gfx1031 the waves of a group are spread over the SIMDs of one
+// workgroup processor, and __smid's lowest bit is the SIMD number's (HIP
+// reads it as a CU in a WGP), so a real RX 6800 or RX 6700 XT gives two
+// values per group; the workgroup processor is what stays the same, so that
+// is what is compared there.
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
@@ -17,6 +23,8 @@
 __device__ unsigned where() {
 #if defined(__gfx1200__) || defined(__gfx1201__)
   return __builtin_amdgcn_s_getreg((10 << 11) | (10 << 6) | 23);   // hwreg(HW_REG_HW_ID1, 10, 11): 20:10
+#elif defined(__gfx1030__) || defined(__gfx1031__)
+  return __smid() >> 1;
 #else
   return __smid();
 #endif

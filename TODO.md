@@ -13,7 +13,7 @@ The status snapshot, the inventories and the gap register at the end are new in 
 | Area | State | Where to look |
 | --- | --- | --- |
 | NVIDIA execution | PTX interpreter and a SASS executor (the default; sm_75 to sm_120a); both run unmodified nvcc programs through `libvgpucudart` / `libvgpucuda` | nvidia/docs/sass.md, "Implemented" |
-| AMD execution | GCN/CDNA and RDNA executors (64- and 32-lane); unmodified hipcc programs from ROCm 6.4 to 7.2 on MI250X, MI300X, MI325X, MI350X, RX 6900 XT, RX 7900 XTX, RX 9070 XT | amd/README.md |
+| AMD execution | GCN/CDNA and RDNA executors (64- and 32-lane); unmodified hipcc programs from ROCm 6.4 to 7.2 on MI250X, MI300X, MI325X, MI350X, RX 6900 XT, RX 6800, RX 6700 XT, RX 7900 XTX, RX 9070 XT | amd/README.md |
 | Device profiles | 16 NVIDIA (12 read from hardware) and 7 AMD (1 read from hardware) | "Profile inventory" |
 | NVIDIA libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink, nvFatbin, NVENC | nvidia/docs/libraries.md |
 | AMD libraries | rocBLAS, hipBLASLt, hipSPARSELt, MIOpen, rocPRIM/hipCUB, rocRAND, rocFFT, rocSPARSE, rocSOLVER, Composable Kernel, RCCL; ROCm SMI, AMD SMI, rocprofv3/rocprofiler-sdk shims | amd/README.md |
@@ -1744,6 +1744,8 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `amd/mi350x` | AMD | CDNA4 | gfx950 | **no** |
 | `amd/mi455x` | AMD | CDNA5 | gfx1250 | **no** (AMD's announcements and LLVM; no card has been seen; clocks, power and ids are placeholders) |
 | `amd/rx6900xt` | AMD | RDNA2 | gfx1030 | **no** |
+| `amd/rx6800` | AMD | RDNA2 | gfx1030 | yes (rocminfo, amd-smi, KFD topology and configuration space of a physical card; `amd/registers/measurements/`) |
+| `amd/rx6700xt` | AMD | RDNA2 | gfx1031 | yes (the same, of a physical card) |
 | `amd/rx7900xtx` | AMD | RDNA3 | gfx1100 | **no** |
 | `amd/rx9070xt` | AMD | RDNA4 | gfx1201 | **no** |
 

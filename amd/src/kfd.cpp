@@ -66,6 +66,7 @@ uint32_t pcie_mb_per_s(uint32_t gen, uint32_t width) {
 const char* asic_name(const std::string& gfx) {
   if (gfx == "gfx90a") return "aldebaran";
   if (gfx == "gfx1030") return "sienna_cichlid";
+  if (gfx == "gfx1031") return "navy_flounder";
   return "ip discovery";
 }
 
@@ -98,7 +99,7 @@ uint32_t kfd_gpu_id(const char* uuid) {
 
 std::vector<KfdFile> kfd_topology(const DeviceProfile& p, int count, uint32_t cpu_cores, uint64_t system_memory) {
   std::vector<KfdFile> out;
-  const Chip c = chip(p.architecture.c_str());
+  const Chip c = chip(p.architecture.c_str(), p.telemetry.pci_device_id);
   const bool instinct = !p.architecture.empty() && p.architecture[0] == 'c';
   const uint32_t cus = p.limits.multiprocessors * c.cus_per_mp;
   const uint32_t arrays = c.engines * c.arrays;
