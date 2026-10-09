@@ -1669,8 +1669,7 @@ scripts/run-pantheon-workloads.sh.
    measured rounding sides, one exact sum rounded ties-away, 1D as 2D at
    y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
    of results against the hardware's. Refused by name: `tex.grad` (its LOD
-   comes from undocumented approximate units) and textures of BC6H and BC7
-   blocks (BC1 to BC5, 10:10:10:2, resource views, any anisotropy, linear
+   comes from undocumented approximate units). (BC1 to BC7, 10:10:10:2, resource views, any anisotropy, linear
    filtering of signed 8-bit normalized texels and `tld4` on layered and
    cubemap textures are done: nvidia/docs/textures.md). The `.clamp`/`.zero` surface policies are done, as an
    RTX 3060 applies them. See nvidia/docs/textures.md. Border
@@ -1952,8 +1951,9 @@ and `cuCtxSetCurrent(NULL)` removes the current context from the stack as a pop 
 
 Still open:
 
-- BC6H and BC7 decoders (the arrays work; texture objects over them are refused by name). The tables are derivable from
-  the card one partition at a time; the arithmetic must be fitted as BC1 to BC5 were.
+- (Done in round 4: BC6H and BC7 textures. The card decodes both exactly as the Khronos Data Format Specification's
+  BPTC chapter says, apart from BC6H's signed zero; `bc-modes/*` in `runtime_texture_gaps` and `driver_texture_gaps`
+  hash 512 blocks of every mode, point sampled and filtered.)
 - External memory and semaphore import (needs Vulkan, Direct3D or NvSciBuf; the card's runtime crashes on invalid handles).
 - `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (SM-to-GPC layout).
 
@@ -1976,8 +1976,7 @@ Still open, each with the reason:
 
 - `tex.grad`: the level of detail an RTX 3060 derives from gradients fits no formula tried (12,000 fetches
   measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
-  fetches, measured; the runtime accepts any `maxAnisotropy` and does not model that); BC6H and BC7 texture
-  objects (the arrays work; see the runtime and driver section).
+  fetches, measured; the runtime accepts any `maxAnisotropy` and does not model that).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
   `.ue5m3x2` and UE5M3 scale factors: the ISA gives no exponent bias; `tcgen05.mma.ashift` and
   `decompress::lut::b`: only figures; `.kind::mxf4`'s K = 128 and sparsity version 1; K = 128 sparse for the

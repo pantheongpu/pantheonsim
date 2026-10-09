@@ -1239,8 +1239,7 @@ uint64_t bc_texel_bits(const MemoryManager& mem, const TextureDesc& d, uint32_t 
   if (!t_bc.valid || t_bc.addr != addr || t_bc.format != d.block) {
     uint8_t raw[16];
     mem.read(addr, raw, bb);
-    if (!decode_block(d.block, raw, &t_bc.block))
-      tex_fail(Err::Unsupported, "a texture of BC6H or BC7 blocks: these two formats are not implemented (BC1 to BC5 are)");
+    if (!decode_block(d.block, raw, &t_bc.block)) tex_fail(Err::Unsupported, "a block-compressed texture of an unknown format");
     t_bc.valid = true;
     t_bc.addr = addr;
     t_bc.format = d.block;

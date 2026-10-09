@@ -1474,9 +1474,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   compressed-marker-label functions built on it, and the rest of NPP's ten
   thousand entry points, which are absent rather than approximated, so a
   program that needs more fails at link time with a name.
-- **CUDA runtime and driver**: textures of BC6H and BC7 blocks (arrays of them can be made and filled; creating
-  a texture object answers `cudaErrorNotSupported` / `CUDA_ERROR_NOT_SUPPORTED` by name; see nvidia/docs/textures.md);
-  `cudaImportExternalMemory` and
+- **CUDA runtime and driver**: `cudaImportExternalMemory` and
   `cudaImportExternalSemaphore` (the handles come from Vulkan, Direct3D or NvSciBuf, which this machine does not
   have; NVIDIA's library crashes on the invalid handles a test could pass, so there is nothing to check
   against); `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (no profile records the
