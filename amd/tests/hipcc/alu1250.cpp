@@ -156,6 +156,14 @@ __global__ void k_perm_pk16(const uint32_t* a, const uint32_t* b, const uint32_t
   for (int k = 0; k < 4; ++k) o[i + 2560 + 512 * k] = r8[k];
 }
 
+__global__ void k_swap_b32(const uint32_t* a, const uint32_t* b, const uint32_t*, uint32_t* o) {
+  const int i = blockIdx.x * 32 + threadIdx.x;
+  uint32_t x = a[i], y = b[i];
+  asm volatile("v_swap_b32 %0, %1" : "+v"(x), "+v"(y));
+  o[i] = x;
+  o[i + 512] = y;
+}
+
 // Doubles, in pairs of the 32-bit arrays (a: low words, b: high words of x; c, d of y -- here passed as a, b and c, o2).
 __global__ void k_f64(const uint32_t* xlo, const uint32_t* xhi, const uint32_t* ylo, uint32_t* o) {
   const int i = blockIdx.x * 32 + threadIdx.x;
@@ -792,6 +800,20 @@ int main() {
     report("v_perm_pk16_b4_u4", w4, N, &failed);
     report("v_perm_pk16_b6_u4", w6, N, &failed);
     report("v_perm_pk16_b8_u4", w8, N, &failed);
+  }
+
+  // --- v_swap_b32: both registers are written ---
+  {
+    std::vector<uint32_t> X(N), Y(N);
+    for (int i = 0; i < N; ++i) X[i] = rnd32(), Y[i] = rnd32();
+    uint32_t* x = up(X);
+    uint32_t* y = up(Y);
+    k_swap_b32<<<N / 32, 32>>>(x, y, y, dout);
+    CHECK(hipDeviceSynchronize());
+    const auto out = fetch(1024);
+    int wrong = 0;
+    for (int i = 0; i < N; ++i) wrong += out[i] != Y[i] || out[i + 512] != X[i];
+    report("v_swap_b32", wrong, N, &failed);
   }
 
   // --- doubles ---

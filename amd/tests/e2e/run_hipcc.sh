@@ -353,7 +353,7 @@ done
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx1250.gfx1250" 2>&1)
 status=$?
 expect "the gfx1250 instruction program runs to the end" "0" "$status"
-expect "every gfx1250 instruction check holds" "7 of 7" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+expect "every gfx1250 instruction check holds" "8 of 8" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 8"
 
 # gfx1250's matrix instructions (hipcc/wmma1250.cpp): dense WMMA in half, bfloat16, float and 8-bit float and integer,
 # sparse SWMMAC, the mixed 8-, 6- and 4-bit forms and the block-scaled forms, each against the host. The dense checks
@@ -403,9 +403,10 @@ status=$?
 expect "the gfx1250 high-register program runs to the end" "0" "$status"
 expect "every gfx1250 high-register check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
-# gfx1250's block loads and stores and cluster loads (hipcc/block1250.cpp), and its Tensor Data Mover (hipcc/tensor1250.cpp):
-# tiles of one to five dimensions between memory and LDS, with padding, gather, iteration and the out-of-bounds rules.
-for prog in block1250 tensor1250; do
+# gfx1250's block loads and stores and cluster loads (hipcc/block1250.cpp), its Tensor Data Mover (hipcc/tensor1250.cpp: tiles of
+# one to five dimensions between memory and LDS, with padding, gather, iteration and the out-of-bounds rules) and its LDS atomics
+# and exchanges (hipcc/ds1250.cpp).
+for prog in block1250 tensor1250 ds1250; do
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$prog.gfx1250" 2>&1)
   status=$?
   expect "the gfx1250 $prog program runs to the end" "0" "$status"

@@ -32,7 +32,7 @@ const char* enc_name(Enc e);
 // zero and drops what is written to it, SCC as a vector operand, and the
 // apertures' limits beside their bases.
 enum class OperandKind {
-  Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, Inline, InlineFloat, Literal,
+  Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, FlatScratchLo, FlatScratchHi, Inline, InlineFloat, Literal,
   Ttmp, Null, Scc, SharedLimit, PrivateLimit, None
 };
 struct Operand {

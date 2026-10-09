@@ -287,6 +287,9 @@ Operand operand(uint32_t code, uint32_t width) {
   } else if (code >= 193 && code <= 208) {
     o.kind = OperandKind::Inline;
     o.value = -static_cast<int64_t>(code - 192);
+  } else if (g_cdna5 && (code == 230 || code == 231)) {
+    // gfx1250: the base of the flat address a scratch (private) object has, which a kernel adds its offset to to make a pointer.
+    o.kind = code == 230 ? OperandKind::FlatScratchLo : OperandKind::FlatScratchHi;
   } else if (code == 235 || code == 237) {
     o.kind = code == 235 ? OperandKind::SharedBase : OperandKind::PrivateBase;
   } else if (code == 236 || code == 238) {

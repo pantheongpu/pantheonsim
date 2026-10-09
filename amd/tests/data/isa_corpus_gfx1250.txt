@@ -5153,3 +5153,8 @@ EE15C002 00000000 00000001	global_load_tr16_b128 v[0:3], v1, s[2:3]
 EE180004 00000001 00000002	global_load_async_to_lds_b32 v1, v2, s[4:5]
 EE190004 01000000 00000001	global_store_async_from_lds_b32 v1, v2, s[4:5]
 EE154006 02100000 00000002	global_atomic_add_f64 v[0:1], v2, v[4:5], s[6:7] th:TH_ATOMIC_RETURN
+BE8001E6	s_mov_b64 s[0:1], src_flat_scratch_base_lo
+BE8000E7	s_mov_b32 s0, src_flat_scratch_base_hi
+7E0002E6	v_mov_b32_e32 v0, src_flat_scratch_base_lo
+4A0002E7	v_add_nc_u32_e32 v0, src_flat_scratch_base_hi, v1
+7E003AE6	v_mov_b64_e32 v[0:1], src_flat_scratch_base_lo

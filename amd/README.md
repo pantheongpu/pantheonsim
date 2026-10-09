@@ -415,6 +415,11 @@ false` throughout. gfx1251 (MI430X) is not covered.
   the bits through the MODE register). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
 - **DPP8** (all eight selects, with and without `fi`, on the VALU and compare instructions) and DPP on the compares, which
   were refused.
+- **LDS atomics and exchanges** (`tests/hipcc/ds1250.cpp`): `ds_cond_sub_*`, `ds_sub_clamp_*`, `ds_pk_add_{f16,bf16}` (with and
+  without a return), `ds_mskor_*`, `ds_cmpstore_b64`, `ds_storexchg_2addr_*` (and the stride-64 forms), `ds_condxchg32_rtn_b64`,
+  `ds_store_addtid_b32` / `ds_load_addtid_b32` (which named no address register, and crashed the executor before) and
+  `ds_bpermute_fi_b32`; and flat pointers to private memory, which gfx1250 builds from `src_flat_scratch_base` with the
+  lane's number in bits 56:52 (`tests/hipcc/gfx1250.cpp`).
 - **Cube faces and lookup-table permutes:** `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32`, `v_cubema_f32`, and
   `v_perm_pk16_b{4,6,8}_u4` (sixteen lookups, by 4-bit indices, in a table of sixteen 4-, 6- or 8-bit entries).
 - **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic
@@ -431,7 +436,7 @@ false` throughout. gfx1251 (MI430X) is not covered.
   run as the global loads they downgrade to outside a cluster; `tests/hipcc/block1250.cpp`).
 - **Decoded and printed, but refused when executed:** the 6- and 4-bit transposed loads
   (`*_load_tr6_*`, `*_load_tr4_*`); the `v_cvt_scale*` and `v_cvt_scalef32*` families (the ISA's pseudocode calls scaling
-  helpers it does not define); a few DS atomics (`ds_condsub`, `ds_clampsub`, `ds_pk_add`, the LDS barrier arrives). Each says so by name
+  helpers it does not define); the LDS barrier arrives (`ds_atomic_*barrier_arrive*`: the barrier's width is not fixed by the ISA's text). Each says so by name
   when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes

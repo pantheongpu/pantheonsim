@@ -520,6 +520,25 @@ struct Machine {
   }
 
   // A scalar operand's value: a register, a special register, or a constant.
+  // gfx1250's flat addresses of scratch (private) memory: a base in the top bits (src_flat_scratch_base), the number of the
+  // lane whose memory it is in bits 56:52, and the offset in that lane's memory below. A kernel makes a pointer from a
+  // scratch offset by adding it to that base with its lane number shifted into place.
+  uint64_t flat_scratch_base() const { return d.object && d.object->gfx1250() ? uint64_t{1} << 58 : kPrivateBase; }
+  // Whether a flat address is in private memory, and whose and where: another target's is the private aperture, the
+  // offset in the memory of the lane that used it.
+  bool private_flat(uint32_t lane, uint64_t addr, uint32_t* owner, uint64_t* offset) const {
+    if (d.object && d.object->gfx1250() && (addr >> 58) == 1) {
+      *owner = static_cast<uint32_t>((addr >> 52) & 31);
+      *offset = addr & ((uint64_t{1} << 52) - 1);
+      return true;
+    }
+    if (addr >= kPrivateBase && addr < kPrivateBase + kPrivateSize) {
+      *owner = lane;
+      *offset = addr - kPrivateBase;
+      return true;
+    }
+    return false;
+  }
   uint64_t scalar(const Wave& w, const Operand& o) const {
     switch (o.kind) {
       case OperandKind::Sgpr: return o.width >= 2 ? sgpr64(w, o.index) : sgpr(w, o.index);
@@ -537,6 +556,9 @@ struct Machine {
       // high half of it, which is what a kernel puts above an offset.
       case OperandKind::SharedBase: return o.width >= 2 ? kSharedBase : kSharedBase >> 32;
       case OperandKind::PrivateBase: return o.width >= 2 ? kPrivateBase : kPrivateBase >> 32;
+      // gfx1250's base of the flat addresses of scratch: the private aperture, as 64 bits, or its low or high half.
+      case OperandKind::FlatScratchLo: return o.width >= 2 ? flat_scratch_base() : flat_scratch_base() & 0xFFFFFFFFull;
+      case OperandKind::FlatScratchHi: return flat_scratch_base() >> 32;
       case OperandKind::Inline:
       case OperandKind::Literal: return static_cast<uint64_t>(o.value);
       case OperandKind::M0: return w.m0;
@@ -3056,9 +3078,11 @@ struct Machine {
       });
     } else if (op == "v_swap_b32"_op) {
       each([&](uint32_t lane) {
-        const uint32_t a = w.vgpr[in.dst[0].index][lane], b = w.vgpr[in.src[0].index][lane];
+        // (gfx1250's table lists both registers as outputs, so the second is a destination there.)
+        const uint32_t other = (in.src.empty() ? in.dst[1] : in.src[0]).index;
+        const uint32_t a = w.vgpr[in.dst[0].index][lane], b = w.vgpr[other][lane];
         w.vgpr[in.dst[0].index][lane] = b;
-        w.vgpr[in.src[0].index][lane] = a;
+        w.vgpr[other][lane] = a;
       });
     } else if (op == "v_permlane32_swap_b32_e32"_op || op == "v_permlane32_swap_b32_e64"_op ||
                op == "v_permlane16_swap_b32_e32"_op || op == "v_permlane16_swap_b32_e64"_op) {
@@ -4411,10 +4435,10 @@ struct Machine {
     // The two that move values between lanes read every lane's value before
     // any lane's result is written: the destination may be the very register
     // they read, and a lane further on must still see what was there.
-    const bool across = op == "ds_bpermute_b32"_op || op == "ds_swizzle_b32"_op;
+    const bool across = op == "ds_bpermute_b32"_op || op == "ds_bpermute_fi_b32"_op || op == "ds_swizzle_b32"_op;
     std::array<uint32_t, kLanes> before{};
     if (across) {
-      const Operand& data = op == "ds_bpermute_b32"_op ? in.src[1] : in.src[0];
+      const Operand& data = op == "ds_bpermute_b32"_op || op == "ds_bpermute_fi_b32"_op ? in.src[1] : in.src[0];
       for (uint32_t lane = 0; lane < kLanes; ++lane) before[lane] = w.vgpr[data.index][lane];
     }
     if (op == "ds_read_b64_tr_b16"_op || op == "ds_read_b64_tr_b8"_op || op == "ds_read_b64_tr_b4"_op) {
@@ -4468,7 +4492,10 @@ struct Machine {
     }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint32_t addr = across ? 0 : lane_src(w, in.src[0], lane);
+      // (The two that address by M0 and the lane's number name no address register.)
+      const bool by_lane = op == "ds_store_addtid_b32"_op || op == "ds_write_addtid_b32"_op || op == "ds_load_addtid_b32"_op ||
+                           op == "ds_read_addtid_b32"_op;
+      const uint32_t addr = across || by_lane ? 0 : lane_src(w, in.src[0], lane);
       // Where an access lands. On a card, an access past the work-group's
       // LDS reads zero and its write goes nowhere: Tensile's GEMMs read from
       // far past the 64 KB a compute unit has to clear registers, and
@@ -4510,6 +4537,110 @@ struct Machine {
         // thread then zero is returned" (the MI300 ISA guide, DS_BPERMUTE_B32).
         const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (w.lanes - 1);
         write_lane(w, in.dst[0], lane, w.exec >> from & 1 ? before[from] : 0);
+      } else if (op == "ds_bpermute_fi_b32"_op) {
+        // gfx1250's backward permute that fetches from lanes that are off too (EXEC says only which lanes are written).
+        const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (w.lanes - 1);
+        write_lane(w, in.dst[0], lane, before[from]);
+      } else if (op == "ds_cond_sub_u32"_op || op == "ds_cond_sub_rtn_u32"_op || op == "ds_sub_clamp_u32"_op ||
+                 op == "ds_sub_clamp_rtn_u32"_op) {
+        // gfx1250's conditional subtract (only where memory is at least the operand) and subtract clamped at zero.
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        const bool cond = op == "ds_cond_sub_u32"_op || op == "ds_cond_sub_rtn_u32"_op;
+        const uint32_t now = cond ? (was >= v ? was - v : was) : (was < v ? 0u : was - v);
+        std::memcpy(at(off), &now, 4);
+        if (op == "ds_cond_sub_rtn_u32"_op || op == "ds_sub_clamp_rtn_u32"_op) write_lane(w, in.dst[0], lane, was);
+      } else if (op == "ds_pk_add_f16"_op || op == "ds_pk_add_rtn_f16"_op || op == "ds_pk_add_bf16"_op ||
+                 op == "ds_pk_add_rtn_bf16"_op) {
+        // Two halves (or bfloat16s) added in place.
+        const bool bf = op == "ds_pk_add_bf16"_op || op == "ds_pk_add_rtn_bf16"_op;
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const uint32_t v = lane_src(w, in.src[1], lane);
+        uint32_t now = 0;
+        for (uint32_t h = 0; h < 2; ++h) {
+          const uint16_t x = static_cast<uint16_t>(was >> (16 * h)), y = static_cast<uint16_t>(v >> (16 * h));
+          const uint32_t r = bf ? to_bf16(as_float(uint32_t{x} << 16) + as_float(uint32_t{y} << 16))
+                                : uint32_t{as_bits(static_cast<_Float16>(static_cast<float>(as_half(x)) + static_cast<float>(as_half(y))))};
+          now |= (r & 0xFFFFu) << (16 * h);
+        }
+        std::memcpy(at(off), &now, 4);
+        if (op == "ds_pk_add_rtn_f16"_op || op == "ds_pk_add_rtn_bf16"_op) write_lane(w, in.dst[0], lane, was);
+      } else if (op == "ds_mskor_b32"_op || op == "ds_mskor_rtn_b32"_op) {
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const uint32_t now = (was & ~lane_src(w, in.src[1], lane)) | lane_src(w, in.src[2], lane);
+        std::memcpy(at(off), &now, 4);
+        if (op == "ds_mskor_rtn_b32"_op) write_lane(w, in.dst[0], lane, was);
+      } else if (op == "ds_mskor_b64"_op || op == "ds_mskor_rtn_b64"_op) {
+        uint64_t was = 0;
+        std::memcpy(&was, at(off, 8), 8);
+        const uint64_t now = (was & ~lane_src64(w, in.src[1], lane)) | lane_src64(w, in.src[2], lane);
+        std::memcpy(at(off, 8), &now, 8);
+        if (op == "ds_mskor_rtn_b64"_op) write_lane64(w, in.dst[0], lane, was);
+      } else if (op == "ds_cmpstore_b64"_op || op == "ds_cmpst_b64"_op) {
+        // As the _rtn form, with nothing handed back.
+        uint64_t was = 0;
+        std::memcpy(&was, at(off, 8), 8);
+        if (was == lane_src64(w, in.src[1], lane)) {
+          const uint64_t v = lane_src64(w, in.src[2], lane);
+          std::memcpy(at(off, 8), &v, 8);
+        }
+      } else if (op == "ds_storexchg_2addr_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b32"_op ||
+                 op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op) {
+        // Two stores that each hand back what they replaced, to two addresses a count of elements (or of 64 elements) on.
+        const bool wide = op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op;
+        const bool stride = op == "ds_storexchg_2addr_stride64_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op;
+        const uint64_t unit = (wide ? 8 : 4) * (stride ? 64 : 1), n = wide ? 8 : 4;
+        uint8_t* const a0 = at(uint64_t{static_cast<uint32_t>(in.offset)} * unit, n);
+        uint8_t* const a1 = at(uint64_t{static_cast<uint32_t>(in.offset1)} * unit, n);
+        uint64_t t0 = 0, t1 = 0;
+        std::memcpy(&t0, a0, n);
+        std::memcpy(&t1, a1, n);
+        if (wide) {
+          const uint64_t v0 = lane_src64(w, in.src[1], lane), v1 = lane_src64(w, in.src[2], lane);
+          std::memcpy(a0, &v0, 8);
+          std::memcpy(a1, &v1, 8);
+          set_word(w, in.dst[0], 0, lane, static_cast<uint32_t>(t0)), set_word(w, in.dst[0], 1, lane, static_cast<uint32_t>(t0 >> 32));
+          set_word(w, in.dst[0], 2, lane, static_cast<uint32_t>(t1)), set_word(w, in.dst[0], 3, lane, static_cast<uint32_t>(t1 >> 32));
+        } else {
+          const uint32_t v0 = lane_src(w, in.src[1], lane), v1 = lane_src(w, in.src[2], lane);
+          std::memcpy(a0, &v0, 4);
+          std::memcpy(a1, &v1, 4);
+          set_word(w, in.dst[0], 0, lane, static_cast<uint32_t>(t0)), set_word(w, in.dst[0], 1, lane, static_cast<uint32_t>(t1));
+        }
+      } else if (op == "ds_condxchg32_rtn_b64"_op) {
+        // Two conditional exchanges of the neighbouring dwords at an 8-byte aligned address: each stores its half of the
+        // data, without the top bit, only where that bit is set, and hands back what was there.
+        const uint32_t base = (addr + static_cast<uint32_t>(in.offset)) & 0xFFF8u;
+        const uint64_t data = lane_src64(w, in.src[1], lane);
+        uint8_t* const p0 = at(base - addr, 4);
+        uint8_t* const p1 = at(base + 4 - addr, 4);
+        uint32_t t0 = 0, t1 = 0;
+        std::memcpy(&t0, p0, 4);
+        std::memcpy(&t1, p1, 4);
+        if ((data >> 31) & 1) {
+          const uint32_t v = static_cast<uint32_t>(data) & 0x7FFFFFFFu;
+          std::memcpy(p0, &v, 4);
+        }
+        if ((data >> 63) & 1) {
+          const uint32_t v = static_cast<uint32_t>(data >> 32) & 0x7FFFFFFFu;
+          std::memcpy(p1, &v, 4);
+        }
+        set_word(w, in.dst[0], 0, lane, t0);
+        set_word(w, in.dst[0], 1, lane, t1);
+      } else if (by_lane) {
+        // The address is the instruction's offset, M0's low 20 bits and four bytes a lane.
+        const uint64_t where = uint64_t{static_cast<uint32_t>(in.offset)} + (w.m0 & 0xFFFFF) + 4 * lane;
+        if (op == "ds_store_addtid_b32"_op || op == "ds_write_addtid_b32"_op) {
+          const uint32_t v = lane_src(w, in.src[0], lane);
+          std::memcpy(at(where, 4), &v, 4);
+        } else {
+          uint32_t v = 0;
+          std::memcpy(&v, at(where, 4), 4);
+          write_lane(w, in.dst[0], lane, v);
+        }
       } else if (op == "ds_swizzle_b32"_op) {
         // The same: "thread_valid[j] ? thread_in[j] : 0".
         const uint32_t from = swizzle_source(static_cast<uint32_t>(in.offset), lane);
@@ -4947,14 +5078,15 @@ struct Machine {
 
   bool flat_access(Wave& w, const Inst& in, Group& g) {
     const auto in_lds = [](uint64_t a) { return a >= kSharedBase && a < kSharedBase + kSharedSize; };
-    const auto in_private = [](uint64_t a) { return a >= kPrivateBase && a < kPrivateBase + kPrivateSize; };
     const uint32_t bytes_per_lane = access_bytes(in);
     bool lds = false, priv = false;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
       lds = lds || in_lds(addr);
-      priv = priv || in_private(addr);
+      uint32_t owner;
+      uint64_t where;
+      priv = priv || private_flat(lane, addr, &owner, &where);
     }
     if (!lds && !priv) {
       global_access(w, in);
@@ -4972,14 +5104,15 @@ struct Machine {
         uint64_t v = 0, expected = 0, before = 0;
         atomic_data(w, in, a, lane, &v, &expected);
         uint8_t* host = nullptr;
+        uint64_t where_in_private = 0;
         if (in_lds(addr)) {
           const uint64_t where = addr - kSharedBase;
           if (where + a.bytes > g.lds.size())
             throw Error::make(Err::InvalidValue, "a flat atomic reaches LDS at ", where, ", past the ", g.lds.size(),
                               " bytes the kernel reserved");
           host = &g.lds[where];
-        } else if (in_private(addr)) {
-          host = scratch_at(g, w, lane, addr - kPrivateBase, a.bytes);
+        } else if (uint32_t owner; private_flat(lane, addr, &owner, &where_in_private)) {
+          host = scratch_at(g, w, owner, where_in_private, a.bytes);
         }
         if (host) {
           std::memcpy(&before, host, a.bytes);
@@ -5005,14 +5138,15 @@ struct Machine {
       if (!(w.exec >> lane & 1)) continue;
       const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
       uint8_t* host = nullptr;   // where LDS or private memory keeps it; null for the device's
+      uint64_t where_in_private = 0;
       if (in_lds(addr)) {
         const uint64_t where = addr - kSharedBase;
         if (where + bytes > g.lds.size())
           throw Error::make(Err::InvalidValue, "a flat access reaches LDS at ", where, ", past the ", g.lds.size(),
                             " bytes the kernel reserved");
         host = &g.lds[where];
-      } else if (in_private(addr)) {
-        host = scratch_at(g, w, lane, addr - kPrivateBase, bytes);
+      } else if (uint32_t owner; private_flat(lane, addr, &owner, &where_in_private)) {
+        host = scratch_at(g, w, owner, where_in_private, bytes);
       }
       if (part && storing) {
         const uint32_t v = lane_src(w, in.src[1], lane);
