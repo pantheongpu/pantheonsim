@@ -197,6 +197,12 @@ class Runtime {
   // fails with that code until a reset -- whichever library launched the
   // kernel and whichever is asked, since they share one context. Atomic: it is
   // read without the API lock.
+  // The error every CUDA call answers when CUDA_VISIBLE_DEVICES shows the
+  // program no device (cudaErrorNoDevice) or a bad list (cudaErrorInvalidDevice):
+  // 0 otherwise (runtime/visible_devices.hpp). A machine still exists then,
+  // one device of it, so the calls that report the error have something to ask.
+  int visibility_error() const { return visibility_error_; }
+  void set_visibility_error(int code) { visibility_error_ = code; }
   int context_fault() const { return context_fault_.load(); }
   void set_context_fault(int code) { context_fault_.store(code); }
 
@@ -208,6 +214,7 @@ class Runtime {
   std::map<void*, HostRange> host_registrations_;
   std::map<void*, HostRange> host_allocations_;
   std::atomic<int> context_fault_{0};
+  int visibility_error_ = 0;
 };
 
 }  // namespace vgpu::runtime

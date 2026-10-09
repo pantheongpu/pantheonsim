@@ -10,4 +10,4 @@ third-party material.
 | Joe-Kuo Sobol' direction numbers | `nvidia/third_party/joe_kuo/` | BSD-style (text at the top of the file) |
 | AMD GPU register headers | `amd/registers/` | see `amd/registers/LICENSES/` |
 | NVIDIA open-gpu-kernel-modules register headers | `nvidia/registers/` | see `nvidia/registers/LICENSES/` |
-| NVIDIA cuDNN headers | **not included**; downloaded at build time by `nvidia/third_party/fetch-cudnn-headers.sh` from the `nvidia-cudnn-cu12` wheel | NVIDIA SDK license (in the wheel); not redistributed here |
+| NVIDIA cuDNN headers | **not included**; downloaded at build time by `scripts/fetch-cudnn-headers.py` from the `nvidia-cudnn-cu12` wheel into the build directory, each file checked against `scripts/cudnn-headers.sha256` | NVIDIA SDK license (in the wheel); not redistributed |

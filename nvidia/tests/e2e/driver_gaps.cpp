@@ -865,6 +865,42 @@ static void texture_objects(CUfunction ktex, CUfunction ksurf) {
 }
 
 // ---- the rest ----
+// A stream answers the context it was made in, and so does the legacy default
+// stream, which is how Kokkos' CUDA backend finds the context behind a stream
+// it was handed. With no context current the driver answers
+// CUDA_ERROR_INVALID_CONTEXT and leaves the output as it was; a null output is
+// an invalid value. The CUDA 12.5 form sets the green-context output to null for
+// an ordinary stream. Checked on an RTX 3080 Ti (CUDA 12.6 toolkit).
+static void stream_context(CUcontext ctx) {
+  CUstream s = nullptr;
+  IS(cuStreamCreate(&s, 0), CUDA_SUCCESS);
+  CUcontext c = nullptr;
+  IS(cuStreamGetCtx(s, &c), CUDA_SUCCESS);
+  check(c == ctx, "cuStreamGetCtx returns the context the stream was made in");
+  c = nullptr;
+  IS(cuStreamGetCtx(nullptr, &c), CUDA_SUCCESS);
+  check(c == ctx, "and the legacy default stream answers the current context");
+#if CUDA_VERSION >= 12050   // the v2 form came with CUDA 12.5
+  c = nullptr;
+  CUgreenCtx green = reinterpret_cast<CUgreenCtx>(0x1);
+  IS(cuStreamGetCtx_v2(s, &c, &green), CUDA_SUCCESS);
+  check(c == ctx && green == nullptr, "cuStreamGetCtx_v2 returns it and no green context");
+  c = nullptr;
+  IS(cuStreamGetCtx_v2(s, &c, nullptr), CUDA_SUCCESS);
+  check(c == ctx, "the green-context output is optional");
+  IS(cuStreamGetCtx_v2(s, nullptr, nullptr), CUDA_ERROR_INVALID_VALUE);
+#endif
+  IS(cuStreamGetCtx(s, nullptr), CUDA_ERROR_INVALID_VALUE);
+  IS(cuStreamDestroy(s), CUDA_SUCCESS);
+  // with nothing current: the answer, and the output untouched
+  CUcontext popped = nullptr;
+  IS(cuCtxPopCurrent(&popped), CUDA_SUCCESS);
+  CUcontext none = reinterpret_cast<CUcontext>(0x1);
+  IS(cuStreamGetCtx(nullptr, &none), CUDA_ERROR_INVALID_CONTEXT);
+  check(none == reinterpret_cast<CUcontext>(0x1), "and with no context current the output is left alone");
+  IS(cuCtxPushCurrent(popped), CUDA_SUCCESS);
+}
+
 static void misc(CUcontext ctx, CUdevice dev) {
   CUdevprop p{};
   IS(cuDeviceGetProperties(&p, dev), CUDA_SUCCESS);
@@ -1004,6 +1040,7 @@ int main() {
   texrefs(mod, kfill);
   texture_objects(ktex, ksurf);
   misc(ctx, dev);
+  stream_context(ctx);
   IS(cuModuleUnload(mod), CUDA_SUCCESS);
   IS(cuCtxDestroy(ctx), CUDA_SUCCESS);
   std::printf(failures ? "FAIL: %d driver checks\n" : "PASS: every driver check\n", failures);

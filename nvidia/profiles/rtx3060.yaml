@@ -22,6 +22,7 @@ limits:
   max_blocks_per_sm: 16
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
+  l2_cache_bytes: 2359296          # read from the card
 features:
   fp16: true
   bf16: true
@@ -38,3 +39,11 @@ telemetry:
   ecc: false                   # GeForce: no ECC
   memory: gddr                 # no ECC, so nothing is retired
   pcie_link: "Gen4 x16"        # most common link on real cards (275 of 335 runs in the benchmark database)
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Read from an RTX 3060 (cudaDeviceProp, driver 13.0): bus width, L2, clockRate, copy engines and the persisting L2 maximum.
+cuda:
+  memory_bus_width_bits: 192
+  clock_khz: 1837000
+  async_engine_count: 1
+  persisting_l2_bytes: 1622016

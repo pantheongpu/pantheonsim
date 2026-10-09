@@ -1054,6 +1054,29 @@ VTEST(vmm_refuses_what_a_device_would) {
   VCHECK_EQ(mm.reservations(), size_t{0});
 }
 
+VTEST(vmm_unmaps_a_run_of_whole_mappings_in_one_call) {
+  // ggml's VMM pool maps a chunk at a time and unmaps the whole pool at once.
+  MemoryManager mm(8 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  uint64_t va = mm.reserve(4 * g, 0);
+  uint64_t h[3];
+  for (int i = 0; i < 3; ++i) {
+    h[i] = mm.create_handle(g);
+    mm.map(va + i * g, g, 0, h[i]);
+  }
+  // Not a run of whole mappings: it ends inside one, or reaches past the last.
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.unmap(va, g / 2)).what(), "no mapping of exactly");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.unmap(va, 4 * g)).what(), "no mapping of exactly");
+  VCHECK_CONTAINS(VCAPTURE(Error, mm.unmap(va + g / 2, g)).what(), "no mapping of exactly");
+  mm.unmap(va, 3 * g);
+  // All three are gone: each can be mapped again, and the handles are free to go.
+  mm.map(va, g, 0, h[0]);
+  mm.unmap(va, g);
+  for (int i = 0; i < 3; ++i) mm.release_handle(h[i]);
+  mm.address_free(va, 4 * g);
+  VCHECK_EQ(mm.reservations(), size_t{0});
+}
+
 VTEST(a_device_reset_takes_mappings_reservations_and_handles) {
   MemoryManager mm(4 << 20);
   const uint64_t g = MemoryManager::kVmmGranularity;

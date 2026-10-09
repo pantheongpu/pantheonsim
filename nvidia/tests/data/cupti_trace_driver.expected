@@ -1,0 +1,225 @@
+# setup
+CB resource 5
+CB driver cuDeviceGet ENTER ordinal=0 corr=c0
+CB driver cuDeviceGet EXIT ret=0 ordinal=0 corr=c0
+CB driver cuCtxCreate_v2 ENTER flags=0 dev=0 corr=c1
+CB resource 1
+CB driver cuCtxCreate_v2 EXIT ret=0 flags=0 dev=0 corr=c1
+# callbacks
+CB driver cuInit ENTER flags=0 corr=c2
+CB driver cuInit EXIT ret=0 flags=0 corr=c2
+CB driver cuDeviceGetCount ENTER corr=c3
+CB driver cuDeviceGetCount EXIT ret=0 corr=c3
+CB driver cuDeviceGetName ENTER len=64 dev=0 corr=c4
+CB driver cuDeviceGetName EXIT ret=0 len=64 dev=0 corr=c4
+CB driver cuDeviceGetAttribute ENTER attrib=10 dev=0 corr=c5
+CB driver cuDeviceGetAttribute EXIT ret=0 attrib=10 dev=0 corr=c5
+CB driver cuDeviceTotalMem_v2 ENTER corr=c6
+CB driver cuDeviceTotalMem_v2 EXIT ret=0 corr=c6
+CB driver cuModuleLoadData ENTER corr=c7
+CB driver cuModuleLoadData EXIT ret=0 corr=c7
+CB driver cuModuleGetFunction ENTER name=scale corr=c8
+CB driver cuModuleGetFunction EXIT ret=0 name=scale corr=c8
+CB driver cuModuleGetFunction ENTER name=reverse_block corr=c9
+CB driver cuModuleGetFunction EXIT ret=0 name=reverse_block corr=c9
+CB driver cuModuleLoad ENTER corr=c10
+CB driver cuModuleLoad EXIT ret=0 corr=c10
+CB driver cuModuleUnload ENTER corr=c11
+CB driver cuModuleUnload EXIT ret=0 corr=c11
+CB driver cuModuleLoadDataEx ENTER options=0 corr=c12
+CB driver cuModuleLoadDataEx EXIT ret=0 options=0 corr=c12
+CB driver cuModuleUnload ENTER corr=c13
+CB driver cuModuleUnload EXIT ret=0 corr=c13
+CB driver cuStreamCreate ENTER flags=0 corr=c14
+CB resource 3
+CB driver cuStreamCreate EXIT ret=0 flags=0 corr=c14
+CB driver cuStreamCreateWithPriority ENTER flags=1 priority=-1 corr=c15
+CB resource 3
+CB driver cuStreamCreateWithPriority EXIT ret=0 flags=1 priority=-1 corr=c15
+CB driver cuEventCreate ENTER flags=0 corr=c16
+CB driver cuEventCreate EXIT ret=0 flags=0 corr=c16
+CB driver cuEventCreate ENTER flags=0 corr=c17
+CB driver cuEventCreate EXIT ret=0 flags=0 corr=c17
+CB driver cuEventCreate ENTER flags=0 corr=c18
+CB driver cuEventCreate EXIT ret=0 flags=0 corr=c18
+CB driver cuMemAlloc_v2 ENTER size=2048 corr=c19
+CB driver cuMemAlloc_v2 EXIT ret=0 size=2048 corr=c19
+CB driver cuMemAlloc_v2 ENTER size=2048 corr=c20
+CB driver cuMemAlloc_v2 EXIT ret=0 size=2048 corr=c20
+CB driver cuMemAllocHost_v2 ENTER size=2048 corr=c21
+CB driver cuMemAllocHost_v2 EXIT ret=0 size=2048 corr=c21
+CB driver cuMemHostAlloc ENTER size=2048 flags=0 corr=c22
+CB driver cuMemHostAlloc EXIT ret=0 size=2048 flags=0 corr=c22
+CB driver cuMemcpyHtoD_v2 ENTER count=2048 corr=c23
+CB driver cuMemcpyHtoD_v2 EXIT ret=0 count=2048 corr=c23
+CB driver cuMemcpyHtoDAsync_v2 ENTER count=2048 corr=c24
+CB driver cuMemcpyHtoDAsync_v2 EXIT ret=0 count=2048 corr=c24
+CB driver cuMemsetD8_v2 ENTER value=0 n=64 corr=c25
+CB driver cuMemsetD8_v2 EXIT ret=0 value=0 n=64 corr=c25
+CB driver cuMemsetD16_v2 ENTER value=0 n=8 corr=c26
+CB driver cuMemsetD16_v2 EXIT ret=0 value=0 n=8 corr=c26
+CB driver cuMemsetD32_v2 ENTER value=0 n=1 corr=c27
+CB driver cuMemsetD32_v2 EXIT ret=0 value=0 n=1 corr=c27
+CB driver cuMemsetD8Async ENTER value=0 n=8 corr=c28
+CB driver cuMemsetD8Async EXIT ret=0 value=0 n=8 corr=c28
+CB driver cuMemsetD16Async ENTER value=0 n=4 corr=c29
+CB driver cuMemsetD16Async EXIT ret=0 value=0 n=4 corr=c29
+CB driver cuMemsetD32Async ENTER value=1065353216 n=32 corr=c30
+CB driver cuMemsetD32Async EXIT ret=0 value=1065353216 n=32 corr=c30
+CB driver cuEventRecord ENTER corr=c31
+CB driver cuEventRecord EXIT ret=0 corr=c31
+CB driver cuLaunchKernel ENTER grid=2x1x1 block=256x1x1 shared=0 symbol=scale corr=c32
+CB driver cuLaunchKernel EXIT ret=0 grid=2x1x1 block=256x1x1 shared=0 symbol=scale corr=c32
+CB driver cuLaunchKernel ENTER grid=4x1x1 block=128x1x1 shared=512 symbol=reverse_block corr=c33
+CB driver cuLaunchKernel EXIT ret=0 grid=4x1x1 block=128x1x1 shared=512 symbol=reverse_block corr=c33
+CB driver cuEventRecord ENTER corr=c34
+CB driver cuEventRecord EXIT ret=0 corr=c34
+CB driver cuEventRecord ENTER corr=c35
+CB driver cuEventRecord EXIT ret=0 corr=c35
+CB driver cuStreamWaitEvent ENTER flags=0 corr=c36
+CB driver cuStreamWaitEvent EXIT ret=0 flags=0 corr=c36
+CB driver cuEventSynchronize ENTER corr=c37
+CB driver cuEventSynchronize EXIT ret=0 corr=c37
+CB driver cuStreamSynchronize ENTER corr=c38
+CB synchronize 1
+CB driver cuStreamSynchronize EXIT ret=0 corr=c38
+CB driver cuEventElapsedTime ENTER corr=c39
+CB driver cuEventElapsedTime EXIT ret=0 corr=c39
+CB driver cuStreamQuery ENTER corr=c40
+CB synchronize 1
+CB driver cuStreamQuery EXIT ret=0 corr=c40
+CB driver cuEventQuery ENTER corr=c41
+CB driver cuEventQuery EXIT ret=0 corr=c41
+CB driver cuMemcpyDtoH_v2 ENTER count=2048 corr=c42
+CB driver cuMemcpyDtoH_v2 EXIT ret=0 count=2048 corr=c42
+CB driver cuMemcpyDtoHAsync_v2 ENTER count=2048 corr=c43
+CB driver cuMemcpyDtoHAsync_v2 EXIT ret=0 count=2048 corr=c43
+CB driver cuStreamSynchronize ENTER corr=c44
+CB synchronize 1
+CB driver cuStreamSynchronize EXIT ret=0 corr=c44
+CB driver cuMemcpyDtoD_v2 ENTER count=2048 corr=c45
+CB driver cuMemcpyDtoD_v2 EXIT ret=0 count=2048 corr=c45
+CB driver cuMemcpyDtoDAsync_v2 ENTER count=2048 corr=c46
+CB driver cuMemcpyDtoDAsync_v2 EXIT ret=0 count=2048 corr=c46
+CB driver cuCtxSynchronize ENTER corr=c47
+CB synchronize 2
+CB driver cuCtxSynchronize EXIT ret=0 corr=c47
+CB driver cuMemFreeHost ENTER corr=c48
+CB driver cuMemFreeHost EXIT ret=0 corr=c48
+CB driver cuMemFreeHost ENTER corr=c49
+CB driver cuMemFreeHost EXIT ret=0 corr=c49
+CB driver cuMemFree_v2 ENTER corr=c50
+CB driver cuMemFree_v2 EXIT ret=0 corr=c50
+CB driver cuMemFree_v2 ENTER corr=c51
+CB driver cuMemFree_v2 EXIT ret=0 corr=c51
+CB driver cuEventDestroy_v2 ENTER corr=c52
+CB driver cuEventDestroy_v2 EXIT ret=0 corr=c52
+CB driver cuEventDestroy_v2 ENTER corr=c53
+CB driver cuEventDestroy_v2 EXIT ret=0 corr=c53
+CB driver cuEventDestroy_v2 ENTER corr=c54
+CB driver cuEventDestroy_v2 EXIT ret=0 corr=c54
+CB driver cuStreamDestroy_v2 ENTER corr=c55
+CB resource 4
+CB driver cuStreamDestroy_v2 EXIT ret=0 corr=c55
+CB driver cuStreamDestroy_v2 ENTER corr=c56
+CB resource 4
+CB driver cuStreamDestroy_v2 EXIT ret=0 corr=c56
+CB driver cuModuleUnload ENTER corr=c57
+CB driver cuModuleUnload EXIT ret=0 corr=c57
+CB driver cuCtxGetCurrent ENTER corr=c58
+CB driver cuCtxGetCurrent EXIT ret=0 corr=c58
+CB driver cuCtxSetCurrent ENTER corr=c59
+CB driver cuCtxSetCurrent EXIT ret=0 corr=c59
+CB driver cuCtxSetCurrent ENTER corr=c60
+CB driver cuCtxSetCurrent EXIT ret=0 corr=c60
+CB driver cuCtxDestroy_v2 ENTER corr=c61
+CB resource 2
+CB driver cuCtxDestroy_v2 EXIT ret=0 corr=c61
+# resources
+REC device id=0 name=NVIDIA GeForce RTX 3060 cc=8.6 sms=28
+REC context device=0
+# activity
+REC driver cuInit ret=0 corr=c2
+REC driver cuDeviceGetCount ret=0 corr=c3
+REC driver cuDeviceGetName ret=0 corr=c4
+REC driver cuDeviceGetAttribute ret=0 corr=c5
+REC driver cuDeviceTotalMem_v2 ret=0 corr=c6
+REC driver cuModuleLoadData ret=0 corr=c7
+REC driver cuModuleGetFunction ret=0 corr=c8
+REC driver cuModuleGetFunction ret=0 corr=c9
+REC driver cuModuleLoad ret=0 corr=c10
+REC driver cuModuleUnload ret=0 corr=c11
+REC driver cuModuleLoadDataEx ret=0 corr=c12
+REC driver cuModuleUnload ret=0 corr=c13
+REC stream flag=1 priority=0 corr=c14
+REC driver cuStreamCreate ret=0 corr=c14
+REC stream flag=2 priority=4294967295 corr=c15
+REC driver cuStreamCreateWithPriority ret=0 corr=c15
+REC driver cuEventCreate ret=0 corr=c16
+REC driver cuEventCreate ret=0 corr=c17
+REC driver cuEventCreate ret=0 corr=c18
+REC driver cuMemAlloc_v2 ret=0 corr=c19
+REC driver cuMemAlloc_v2 ret=0 corr=c20
+REC driver cuMemAllocHost_v2 ret=0 corr=c21
+REC driver cuMemHostAlloc ret=0 corr=c22
+REC memcpy kind=HtoD src=pageable dst=device bytes=2048 async=0 stream=s0 corr=c23
+REC driver cuMemcpyHtoD_v2 ret=0 corr=c23
+REC memcpy kind=HtoD src=pinned dst=device bytes=2048 async=1 stream=s1 corr=c24
+REC driver cuMemcpyHtoDAsync_v2 ret=0 corr=c24
+REC memset value=0 bytes=64 kind=device async=0 stream=s0 corr=c25
+REC driver cuMemsetD8_v2 ret=0 corr=c25
+REC memset value=0 bytes=16 kind=device async=0 stream=s0 corr=c26
+REC driver cuMemsetD16_v2 ret=0 corr=c26
+REC memset value=0 bytes=4 kind=device async=0 stream=s0 corr=c27
+REC driver cuMemsetD32_v2 ret=0 corr=c27
+REC memset value=0 bytes=8 kind=device async=1 stream=s1 corr=c28
+REC driver cuMemsetD8Async ret=0 corr=c28
+REC memset value=0 bytes=8 kind=device async=1 stream=s1 corr=c29
+REC driver cuMemsetD16Async ret=0 corr=c29
+REC memset value=1065353216 bytes=128 kind=device async=1 stream=s1 corr=c30
+REC driver cuMemsetD32Async ret=0 corr=c30
+REC driver cuEventRecord ret=0 corr=c31
+REC kernel name=scale grid=2x1x1 block=256x1x1 dynShared=0 statShared=0 stream=s0 corr=c32
+REC driver cuLaunchKernel ret=0 corr=c32
+REC kernel name=reverse_block grid=4x1x1 block=128x1x1 dynShared=512 statShared=32 stream=s1 corr=c33
+REC driver cuLaunchKernel ret=0 corr=c33
+REC driver cuEventRecord ret=0 corr=c34
+REC driver cuEventRecord ret=0 corr=c35
+REC sync type=2 stream=set corr=c36
+REC driver cuStreamWaitEvent ret=0 corr=c36
+REC sync type=1 stream=none corr=c37
+REC driver cuEventSynchronize ret=0 corr=c37
+REC sync type=3 stream=set corr=c38
+REC driver cuStreamSynchronize ret=0 corr=c38
+REC driver cuEventElapsedTime ret=0 corr=c39
+REC sync type=3 stream=set corr=c40
+REC driver cuStreamQuery ret=0 corr=c40
+REC sync type=1 stream=none corr=c41
+REC driver cuEventQuery ret=0 corr=c41
+REC memcpy kind=DtoH src=device dst=pageable bytes=2048 async=0 stream=s0 corr=c42
+REC driver cuMemcpyDtoH_v2 ret=0 corr=c42
+REC memcpy kind=DtoH src=device dst=pinned bytes=2048 async=1 stream=s1 corr=c43
+REC driver cuMemcpyDtoHAsync_v2 ret=0 corr=c43
+REC sync type=3 stream=set corr=c44
+REC driver cuStreamSynchronize ret=0 corr=c44
+REC memcpy kind=DtoD src=device dst=device bytes=2048 async=0 stream=s0 corr=c45
+REC driver cuMemcpyDtoD_v2 ret=0 corr=c45
+REC memcpy kind=DtoD src=device dst=device bytes=2048 async=1 stream=s1 corr=c46
+REC driver cuMemcpyDtoDAsync_v2 ret=0 corr=c46
+REC sync type=4 stream=none corr=c47
+REC driver cuCtxSynchronize ret=0 corr=c47
+REC driver cuMemFreeHost ret=0 corr=c48
+REC driver cuMemFreeHost ret=0 corr=c49
+REC driver cuMemFree_v2 ret=0 corr=c50
+REC driver cuMemFree_v2 ret=0 corr=c51
+REC driver cuEventDestroy_v2 ret=0 corr=c52
+REC driver cuEventDestroy_v2 ret=0 corr=c53
+REC driver cuEventDestroy_v2 ret=0 corr=c54
+REC driver cuStreamDestroy_v2 ret=0 corr=c55
+REC driver cuStreamDestroy_v2 ret=0 corr=c56
+REC driver cuModuleUnload ret=0 corr=c57
+REC driver cuCtxGetCurrent ret=0 corr=c58
+REC driver cuCtxSetCurrent ret=0 corr=c59
+REC driver cuCtxSetCurrent ret=0 corr=c60
+REC driver cuCtxDestroy_v2 ret=0 corr=c61
+# end (0 records ending before they start)

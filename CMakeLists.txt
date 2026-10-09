@@ -161,6 +161,8 @@ add_library(vgpu STATIC
   src/exec/interpreter.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
+  src/runtime/visible_devices.cpp
+  nvidia/src/device_attributes.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -409,6 +411,50 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   vgpu_toolkit_soversion(cupti 13 SO_CUPTI)
   vgpu_version_script(cupti ${SO_CUPTI} _cupti_map)
+  # The runtime-API callback IDs are the toolkit's, so the table of them is
+  # read from its header here rather than kept by hand: {function, versioned
+  # name, ID} for every one the header names. Without cupti.h beside it there is
+  # no CUPTI to build, and the guard on the target below says so.
+  set(_cbid_header "${CUDA_ABI_INCLUDE}/cupti_runtime_cbid.h")
+  set(_cbid_inc "${CMAKE_BINARY_DIR}/gen/cupti_runtime_cbids.inc")
+  set(_cbid_text "")
+  if(EXISTS "${_cbid_header}")
+    file(STRINGS "${_cbid_header}" _cbid_lines REGEX "CUPTI_RUNTIME_TRACE_CBID_[A-Za-z0-9_]+_v[0-9]+ *=")
+    foreach(_line IN LISTS _cbid_lines)
+      if(_line MATCHES "CUPTI_RUNTIME_TRACE_CBID_([A-Za-z0-9_]+)_v([0-9]+) *=")
+        set(_fn "${CMAKE_MATCH_1}")
+        set(_ver "${CMAKE_MATCH_2}")
+        string(APPEND _cbid_text
+               "VGPU_CBID_ROW(\"${_fn}\", \"${_fn}_v${_ver}\", CUPTI_RUNTIME_TRACE_CBID_${_fn}_v${_ver})\n")
+      endif()
+    endforeach()
+  endif()
+  file(WRITE "${_cbid_inc}.tmp" "${_cbid_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cbid_inc}.tmp" "${_cbid_inc}")
+  # The driver-API ones, from cupti_driver_cbid.h. The names are not versioned
+  # the runtime's way (cudaMalloc_v3020): they are the driver function's own
+  # spelling, cuMemAlloc_v2 and cuMemAlloc being two functions with an ID each,
+  # and the name a subscriber is told is exactly that. A second file says which
+  # exist, because the toolkits differ (cuCtxCreate_v4 is newer than 12.0).
+  set(_dcbid_header "${CUDA_ABI_INCLUDE}/cupti_driver_cbid.h")
+  set(_dcbid_inc "${CMAKE_BINARY_DIR}/gen/cupti_driver_cbids.inc")
+  set(_dcbid_have "${CMAKE_BINARY_DIR}/gen/cupti_driver_have.h")
+  set(_dcbid_text "")
+  set(_dcbid_have_text "")
+  if(EXISTS "${_dcbid_header}")
+    file(STRINGS "${_dcbid_header}" _dcbid_lines REGEX "CUPTI_DRIVER_TRACE_CBID_cu[A-Za-z0-9_]+ *=")
+    foreach(_line IN LISTS _dcbid_lines)
+      if(_line MATCHES "CUPTI_DRIVER_TRACE_CBID_(cu[A-Za-z0-9_]+) *=")
+        set(_fn "${CMAKE_MATCH_1}")
+        string(APPEND _dcbid_text "VGPU_DRIVER_CBID_ROW(\"${_fn}\", CUPTI_DRIVER_TRACE_CBID_${_fn})\n")
+        string(APPEND _dcbid_have_text "#define VGPU_HAVE_DRIVER_CBID_${_fn} 1\n")
+      endif()
+    endforeach()
+  endif()
+  file(WRITE "${_dcbid_inc}.tmp" "${_dcbid_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_inc}.tmp" "${_dcbid_inc}")
+  file(WRITE "${_dcbid_have}.tmp" "${_dcbid_have_text}")
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_have}.tmp" "${_dcbid_have}")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -416,7 +462,7 @@ if(CUDA_ABI_INCLUDE)
   # turn recording on in one and the runtime would keep reading the other, and
   # a profiler would attach successfully and receive nothing.
   target_link_libraries(vgpucupti PRIVATE vgpucudart)
-  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include)
+  target_include_directories(vgpucupti PRIVATE ${CUDA_ABI_INCLUDE} include "${CMAKE_BINARY_DIR}/gen")
   set_target_properties(vgpucupti PROPERTIES
     OUTPUT_NAME cupti SOVERSION ${SO_CUPTI} VERSION ${SO_CUPTI}.0)
   target_link_options(vgpucupti PRIVATE "-Wl,--version-script=${_cupti_map}")
@@ -845,35 +891,35 @@ libcutensor.2.7.0 {
 
   # ---------------------------------------------------------------------------
   # libvgpucudnn: cuDNN, presented as libcudnn.so.9. Built against the real
-  # cuDNN headers -- hand-writing a vendor struct layout has silently produced
-  # garbage twice, so we never do it. The headers are NVIDIA's and are not
-  # redistributed in this tree: they are fetched from the nvidia-cudnn-cu12 wheel
-  # into nvidia/third_party/cudnn_include (git-ignored), or taken from
-  # $CUDNN_HEADER_DIR if set. Set VGPU_FETCH_CUDNN_HEADERS=OFF to skip the download.
+  # cuDNN API headers -- hand-writing a vendor struct layout has silently
+  # produced garbage twice, so we never do it. The headers are NVIDIA's and are
+  # not kept in this tree: CUDNN_HEADER_DIR (environment) names a directory that
+  # has them, and otherwise they are fetched into the build directory from the
+  # nvidia-cudnn-cu12 wheel on PyPI (scripts/fetch-cudnn-headers.py: about 1 MB,
+  # each file checked against scripts/cudnn-headers.sha256). Without network
+  # access, or with VGPU_FETCH_CUDNN_HEADERS=OFF, libvgpucudnn is skipped.
   # Real cuDNN exports versioned symbols tagged "libcudnn.so.9"; the version
   # script gives ours the same tag so the loader binds without the
   # "no version information available" warning.
   # ---------------------------------------------------------------------------
-  option(VGPU_FETCH_CUDNN_HEADERS
-         "Download the cuDNN headers from the nvidia-cudnn-cu12 wheel when they are not found" ON)
+  option(VGPU_FETCH_CUDNN_HEADERS "Fetch cuDNN's API headers from PyPI when none are given" ON)
   vgpu_forget_stale_path(CUDNN_INCLUDE cudnn.h)
   find_path(CUDNN_INCLUDE cudnn.h
-    PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/cudnn_include" ENV CUDNN_HEADER_DIR
+    PATHS ENV CUDNN_HEADER_DIR "${CMAKE_BINARY_DIR}/cudnn_include"
     NO_DEFAULT_PATH)
   if(NOT CUDNN_INCLUDE AND VGPU_FETCH_CUDNN_HEADERS)
-    message(STATUS "cuDNN headers not found: fetching them from the nvidia-cudnn-cu12 wheel")
-    execute_process(
-      COMMAND bash "${CMAKE_SOURCE_DIR}/nvidia/third_party/fetch-cudnn-headers.sh"
-      RESULT_VARIABLE _cudnn_fetch_rc
-      OUTPUT_VARIABLE _cudnn_fetch_out
-      ERROR_VARIABLE _cudnn_fetch_out)
-    if(_cudnn_fetch_rc EQUAL 0)
-      unset(CUDNN_INCLUDE CACHE)
-      find_path(CUDNN_INCLUDE cudnn.h
-        PATHS "${CMAKE_SOURCE_DIR}/nvidia/third_party/cudnn_include"
-        NO_DEFAULT_PATH)
-    else()
-      message(WARNING "Could not fetch the cuDNN headers; libvgpucudnn will not be built:\n${_cudnn_fetch_out}")
+    find_program(VGPU_PYTHON NAMES python3 python)
+    if(VGPU_PYTHON)
+      execute_process(
+        COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/fetch-cudnn-headers.py" "${CMAKE_BINARY_DIR}/cudnn_include"
+        RESULT_VARIABLE _cudnn_fetch_rc OUTPUT_VARIABLE _cudnn_fetch_out ERROR_VARIABLE _cudnn_fetch_err)
+      if(_cudnn_fetch_rc EQUAL 0)
+        message(STATUS "${_cudnn_fetch_out}")
+        unset(CUDNN_INCLUDE CACHE)
+        find_path(CUDNN_INCLUDE cudnn.h PATHS "${CMAKE_BINARY_DIR}/cudnn_include" NO_DEFAULT_PATH)
+      else()
+        message(STATUS "cuDNN headers could not be fetched: ${_cudnn_fetch_err}")
+      endif()
     endif()
   endif()
   if(CUDNN_INCLUDE)
@@ -895,7 +941,7 @@ libcutensor.2.7.0 {
               "${CMAKE_BINARY_DIR}/shim/libcudnn.so"
       COMMENT "Creating cuDNN shim symlinks (build/shim/libcudnn.so.9)")
   else()
-    message(STATUS "cuDNN headers not found: skipping libvgpucudnn")
+    message(STATUS "cuDNN headers not found (set CUDNN_HEADER_DIR, or allow VGPU_FETCH_CUDNN_HEADERS): skipping libvgpucudnn")
   endif()
 
   # ---------------------------------------------------------------------------
@@ -1000,6 +1046,7 @@ vgpu_unit_test(test_e2e_parity)
 # cuDSS's sparse direct solver on its own, host arithmetic only: orderings,
 # LU, LDL^T and Cholesky with their pivoting, inertia, on random matrices.
 vgpu_unit_test(test_cudss_solver nvidia/tests/unit/test_cudss_solver.cpp)
+vgpu_unit_test(test_cuda_attributes nvidia/tests/unit/test_cuda_attributes.cpp)
 target_sources(test_cudss_solver PRIVATE nvidia/src/cudss_solver.cpp)
 target_include_directories(test_cudss_solver PRIVATE nvidia/src)
 # nvCOMP's host codecs on their own: round trips at every size and effort,
@@ -1279,6 +1326,16 @@ set_tests_properties(amd_rocm_versions PROPERTIES DEPENDS vgpuhip
 add_test(NAME amd_rocblas COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocblas.sh)
 set_tests_properties(amd_rocblas PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# OpenMP target offloading (LLVM's libomptarget, whose AMD plugin drives the HSA
+# runtime directly), built by ROCm's amdclang++ for every simulated GPU's ISA.
+add_test(NAME amd_openmp COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_openmp.sh)
+set_tests_properties(amd_openmp PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# OpenCL (ROCm's runtime and compiler library over the simulator's HSA runtime)
+# on every simulated GPU.
+add_test(NAME amd_opencl COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_opencl.sh)
+set_tests_properties(amd_opencl PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # AMD's hipFFT, hipRAND, hipSOLVER and hipSPARSE, unmodified, where ROCm with
 # them is installed or PyTorch's ROCm wheel is.
 add_test(NAME amd_libraries COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_libraries.sh)
@@ -1435,6 +1492,10 @@ set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIM
 # The HIP version the runtime reports, by the library name a program was built to ask for.
 add_test(NAME amd_hip_version COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_version.sh)
 set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# When a captured copy takes its host source: at launch for heap and live locals, at capture for a gone frame's.
+add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)
+set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
@@ -1833,6 +1894,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_bsync_across_calls
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_across_calls.sh)
+  set_tests_properties(e2e_bsync_across_calls PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_device_functions
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_functions.sh)
   set_tests_properties(e2e_device_functions PROPERTIES
@@ -1847,9 +1915,23 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_lop3_pred_chain
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
+  set_tests_properties(e2e_lop3_pred_chain PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_host_atomics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
   set_tests_properties(e2e_host_atomics PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_uldc_narrow
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_uldc_narrow.sh)
+  set_tests_properties(e2e_uldc_narrow PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
@@ -2027,6 +2109,45 @@ if(TARGET vgpucupti)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # The trace a program gets of itself -- callbacks and activity records --
+  # against the one NVIDIA's CUPTI printed for the same program on an RTX 3060.
+  add_test(NAME e2e_cupti_trace
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh trace)
+  set_tests_properties(e2e_cupti_trace PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # NVTX markers and ranges through CUPTI, against what NVIDIA's printed.
+  add_test(NAME e2e_cupti_nvtx
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh nvtx)
+  set_tests_properties(e2e_cupti_nvtx PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # External correlation ids, which a framework's profiler uses to tie a kernel
+  # to the operator that launched it.
+  add_test(NAME e2e_cupti_extcorr
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh extcorr)
+  set_tests_properties(e2e_cupti_extcorr PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # The same for a program that uses only the driver API: the driver calls, the
+  # kernels, copies, fills and waits they issue, and the context and streams.
+  add_test(NAME e2e_cupti_trace_driver
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_trace_driver.sh)
+  set_tests_properties(e2e_cupti_trace_driver PROPERTIES
+    DEPENDS vgpucupti
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   # And the same thing through a tool nobody here wrote.
   add_test(NAME e2e_nvprof COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvprof.sh)
   set_tests_properties(e2e_nvprof PROPERTIES
@@ -2074,6 +2195,14 @@ set_tests_properties(e2e_texture_layers PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
+
+# Global loads of __constant__ data, through the window bank 0 advertises for it.
+add_test(NAME e2e_constant_global_load
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_global_load.sh)
+set_tests_properties(e2e_constant_global_load PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
 
 # Mipmapped textures: explicit level of detail and plain fetches, every
 # filter combination, biases and clamps, bit for bit with an RTX 3060.
@@ -2214,6 +2343,12 @@ set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
 
+# No file under NVIDIA's proprietary terms in the tree, and the fetch that
+# stands in for the cuDNN headers that used to be vendored.
+add_test(NAME lint_no_proprietary_nvidia COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_no_proprietary_nvidia.sh)
+add_test(NAME lint_cudnn_header_fetch COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_cudnn_header_fetch.sh)
+set_tests_properties(lint_cudnn_header_fetch PROPERTIES TIMEOUT 300)
+
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
 if(TARGET vgpucudart)
@@ -2251,6 +2386,26 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_stream_identity COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_stream_identity.sh)
   set_tests_properties(e2e_stream_identity PROPERTIES
     DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# What a program is told about its device: the runtime, the driver and
+# cudaDeviceProp agree, a device has one identity for CUDA and NVML, and the
+# simulated RTX 3060 answers what the card does.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_test(NAME e2e_device_attributes COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_attributes.sh)
+  set_tests_properties(e2e_device_attributes PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+endif()
+
+# CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER, as the driver reads them.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_test(NAME e2e_cuda_visible_devices COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cuda_visible_devices.sh)
+  set_tests_properties(e2e_cuda_visible_devices PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 endif()

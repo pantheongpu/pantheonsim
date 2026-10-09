@@ -405,7 +405,8 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory
   if (!d || !memory) return bad(device);
   memory->total = d->vram_total_bytes;
   memory->used = d->vram_used_bytes;
-  memory->free = d->vram_total_bytes - d->vram_used_bytes;
+  // Free is what a program can still take: the driver's own reserve is neither used nor free.
+  memory->free = d->vram_total_bytes - d->vram_reserved_bytes - d->vram_used_bytes;
   return NVML_SUCCESS;
 }
 
@@ -417,8 +418,8 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMem
   memory->version = nvmlMemory_v2;
   memory->total = d->vram_total_bytes;
   memory->used = d->vram_used_bytes;
-  memory->free = d->vram_total_bytes - d->vram_used_bytes;
-  memory->reserved = 0;
+  memory->free = d->vram_total_bytes - d->vram_reserved_bytes - d->vram_used_bytes;
+  memory->reserved = d->vram_reserved_bytes;
   return NVML_SUCCESS;
 }
 

@@ -151,7 +151,12 @@ jobs:
     # their PTX (nvidia/tests/e2e/run_sass_archs.sh). A run started by hand
     # with cutlass_sass also builds the CUTLASS tests' SASS (sm_90a, sm_100a,
     # sm_120a) and requires it to run, which takes a few hours.
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
+    # another pool, e.g. ["pantheonsim-burst"]: AWS instances
+    # started while the pull request backlog is long and terminated when it is
+    # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
+    # the pool, and it runs in the toolchain image there as it does here.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
     # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
     # the runner itself with the install step below.
@@ -206,6 +211,13 @@ jobs:
           if grep -E '\*\*\*Skipped' cutlass.log; then
             echo "::error::a CUTLASS test skipped; this job installs what they need"; exit 1
           fi
+
+      # The jobs run as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
+      # next job's checkout cannot clean it. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
 
   ollama:
     name: ollama on every GPU
@@ -478,10 +490,12 @@ jobs:
         #   e2e_nvshmem_device   NVIDIA's NVSHMEM (headers, libnvshmem_device.a)
         #                        is not in the image (yet); NVSHMEM_HOME or the
         #                        nvidia-nvshmem-cu13 pip package turns it on.
-        # The last three are the image's to fix; drop them here when it is.
+        #   amd_opencl           ROCm's OpenCL runtime (rocm-opencl) is not in the
+        #                        image; the rocm-libraries workflow runs it.
+        # The last four are the image's to fix; drop them here when it is.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device)$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|amd_opencl)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
@@ -502,7 +516,12 @@ jobs:
 
   sanitizers:
     name: ASan + UBSan
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
+    # another pool, e.g. ["pantheonsim-burst"]: AWS instances
+    # started while the pull request backlog is long and terminated when it is
+    # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
+    # the pool, and it runs in the toolchain image there as it does here.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -545,9 +564,21 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-san --output-on-failure -E pantheon_workloads
 
+      # The jobs run as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
+      # next job's checkout cannot clean it. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
   threads:
     name: ThreadSanitizer
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
+    # another pool, e.g. ["pantheonsim-burst"]: AWS instances
+    # started while the pull request backlog is long and terminated when it is
+    # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
+    # the pool, and it runs in the toolchain image there as it does here.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -589,3 +620,11 @@ jobs:
         # the run needs randomization off. Without this every test aborts with
         # "unexpected memory mapping" before it starts.
         run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E pantheon_workloads
+
+      # The jobs run as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
+      # next job's checkout cannot clean it. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+

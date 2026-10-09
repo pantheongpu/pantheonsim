@@ -27,7 +27,7 @@
 // breaking, rounding); nvidia/docs/libraries.md says where the arithmetic
 // order makes results differ in the last bits.
 //
-// Compiled against the real cuDNN headers (nvidia/third_party/cudnn_include) so the
+// Compiled against the real cuDNN headers (fetched at configure time by scripts/fetch-cudnn-headers.py) so the
 // ABI is the vendor's, not a guess.
 #include "cudnn_common.hpp"
 
