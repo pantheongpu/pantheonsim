@@ -34,6 +34,13 @@
 
 #include <cuda_runtime.h>
 
+#include "capture_defer.hpp"
+
+// Every read and write of device memory below is the commit point of a call made on a capturing stream
+// (capture_defer.hpp).
+#define cudaMemcpy ::vgpu_capture::memcpy_commit
+#define cudaMemset ::vgpu_capture::memset_commit
+
 // The signal API's length parameter is `int` in NPP 12.0 and `size_t` by 12.8.
 // Guarding on the version means guessing the release it changed in, and a
 // definition that disagrees with the header is a hard compile error. So take
@@ -65,6 +72,10 @@ using NppSignalBufferSize = std::remove_pointer_t<
     typename npp_ctx_bufsize_of<decltype(&nppsSumGetBufferSize_32f_Ctx)>::type>;
 
 namespace {
+
+// No NPP object is copied for a captured call: everything a call takes is a value or a pointer.
+vgpu_capture::Registry g_reg;
+
 
 // Pitched images: row r begins `step` bytes into the image, and only the first
 // width*channels elements of each row are inside the ROI. Rows are copied one
@@ -198,8 +209,14 @@ VGPU_EXPORT void nppsFree(void* p) { cudaFree(p); }
    Generates the _Ctx twin of an entry point already defined above. The context
    carries only stream and device identity, and this implementation is
    synchronous on the host, so it is accepted and dropped. */
-#define VGPU_NPP_CTX(RET, NAME, PARAMS, ARGS) \
-  VGPU_EXPORT RET NAME##_Ctx PARAMS { return NAME ARGS; }
+#define VGPU_NPP_CTX(RET, NAME, PARAMS, ARGS)                                                            \
+  VGPU_EXPORT RET NAME##_Ctx PARAMS {                                                                    \
+    /* On a capturing stream the call is recorded, and made at each launch of the graph. */             \
+    if (vgpu_capture::stream_capturing(ctx_.hStream) &&                                                  \
+        vgpu_record_host_op_if_capturing(ctx_.hStream, [=] { (void)NAME ARGS; }))                        \
+      return NPP_SUCCESS;                                                                                \
+    return NAME ARGS;                                                                                    \
+  }
 
 namespace {
 
@@ -278,11 +295,11 @@ NppStatus unop_32f(const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, int
   }                                                                                             \
   VGPU_NPP_CTX(NppStatus, nppi##NAME##_8u_C1RSfs,                                               \
                (const Npp8u* s1, int ss1, const Npp8u* s2, int ss2, Npp8u* d, int ds,           \
-                NppiSize roi, int sf, NppStreamContext),                                        \
+                NppiSize roi, int sf, NppStreamContext ctx_),                                        \
                (s1, ss1, s2, ss2, d, ds, roi, sf))                                              \
   VGPU_NPP_CTX(NppStatus, nppi##NAME##_8u_C3RSfs,                                               \
                (const Npp8u* s1, int ss1, const Npp8u* s2, int ss2, Npp8u* d, int ds,           \
-                NppiSize roi, int sf, NppStreamContext),                                        \
+                NppiSize roi, int sf, NppStreamContext ctx_),                                        \
                (s1, ss1, s2, ss2, d, ds, roi, sf))
 
 #define VGPU_NPP_BIN32F(NAME, EXPR)                                                             \
@@ -296,11 +313,11 @@ NppStatus unop_32f(const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, int
   }                                                                                             \
   VGPU_NPP_CTX(NppStatus, nppi##NAME##_32f_C1R,                                                 \
                (const Npp32f* s1, int ss1, const Npp32f* s2, int ss2, Npp32f* d, int ds,        \
-                NppiSize roi, NppStreamContext),                                                \
+                NppiSize roi, NppStreamContext ctx_),                                                \
                (s1, ss1, s2, ss2, d, ds, roi))                                                  \
   VGPU_NPP_CTX(NppStatus, nppi##NAME##_32f_C3R,                                                 \
                (const Npp32f* s1, int ss1, const Npp32f* s2, int ss2, Npp32f* d, int ds,        \
-                NppiSize roi, NppStreamContext),                                                \
+                NppiSize roi, NppStreamContext ctx_),                                                \
                (s1, ss1, s2, ss2, d, ds, roi))
 
 VGPU_NPP_BIN8U(Add, a + b)
@@ -322,7 +339,7 @@ VGPU_NPP_BIN32F(AbsDiff, std::fabs(a - b))
   }                                                                                             \
   VGPU_NPP_CTX(NppStatus, nppiAbsDiff_##SUFFIX,                                                 \
                (const Npp8u* s1, int ss1, const Npp8u* s2, int ss2, Npp8u* d, int ds,           \
-                NppiSize roi, NppStreamContext),                                                \
+                NppiSize roi, NppStreamContext ctx_),                                                \
                (s1, ss1, s2, ss2, d, ds, roi))
 VGPU_NPP_ABSDIFF(8u_C1R, 1)
 VGPU_NPP_ABSDIFF(8u_C3R, 3)
@@ -345,7 +362,7 @@ VGPU_NPP_ABSDIFF(8u_C3R, 3)
   }                                                                                             \
   VGPU_NPP_CTX(NppStatus, nppi##NAME##_8u_C1R,                                                  \
                (const Npp8u* s1, int ss1, const Npp8u* s2, int ss2, Npp8u* d, int ds,           \
-                NppiSize roi, NppStreamContext),                                                \
+                NppiSize roi, NppStreamContext ctx_),                                                \
                (s1, ss1, s2, ss2, d, ds, roi))
 
 VGPU_NPP_LOGIC(And, a & b)
@@ -356,7 +373,7 @@ VGPU_EXPORT NppStatus nppiNot_8u_C1R(const Npp8u* s, int ss, Npp8u* d, int ds, N
   return unop_8u(s, ss, d, ds, roi, 1, 0, [](double v, int) { return 255.0 - v; });
 }
 VGPU_NPP_CTX(NppStatus, nppiNot_8u_C1R,
-             (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, NppStreamContext),
+             (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, NppStreamContext ctx_),
              (s, ss, d, ds, roi))
 
 VGPU_EXPORT NppStatus nppiAbs_32f_C1R(const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi) {
@@ -369,13 +386,13 @@ VGPU_EXPORT NppStatus nppiSqrt_32f_C1R(const Npp32f* s, int ss, Npp32f* d, int d
   return unop_32f(s, ss, d, ds, roi, 1, [](double v, int) { return std::sqrt(v); });
 }
 VGPU_NPP_CTX(NppStatus, nppiAbs_32f_C1R,
-             (const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext),
+             (const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext ctx_),
              (s, ss, d, ds, roi))
 VGPU_NPP_CTX(NppStatus, nppiSqr_32f_C1R,
-             (const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext),
+             (const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext ctx_),
              (s, ss, d, ds, roi))
 VGPU_NPP_CTX(NppStatus, nppiSqrt_32f_C1R,
-             (const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext),
+             (const Npp32f* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext ctx_),
              (s, ss, d, ds, roi))
 
 /* ---- constant operands ---- */
@@ -397,15 +414,15 @@ VGPU_EXPORT NppStatus nppiSubC_8u_C1RSfs(const Npp8u* s, int ss, const Npp8u c, 
 }
 VGPU_NPP_CTX(NppStatus, nppiAddC_8u_C1RSfs,
              (const Npp8u* s, int ss, const Npp8u c, Npp8u* d, int ds, NppiSize roi, int sf,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, c, d, ds, roi, sf))
 VGPU_NPP_CTX(NppStatus, nppiMulC_8u_C1RSfs,
              (const Npp8u* s, int ss, const Npp8u c, Npp8u* d, int ds, NppiSize roi, int sf,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, c, d, ds, roi, sf))
 VGPU_NPP_CTX(NppStatus, nppiSubC_8u_C1RSfs,
              (const Npp8u* s, int ss, const Npp8u c, Npp8u* d, int ds, NppiSize roi, int sf,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, c, d, ds, roi, sf))
 
 VGPU_EXPORT NppStatus nppiAddC_32f_C1R(const Npp32f* s, int ss, const Npp32f c, Npp32f* d, int ds,
@@ -420,11 +437,11 @@ VGPU_EXPORT NppStatus nppiMulC_32f_C1R(const Npp32f* s, int ss, const Npp32f c, 
 }
 VGPU_NPP_CTX(NppStatus, nppiAddC_32f_C1R,
              (const Npp32f* s, int ss, const Npp32f c, Npp32f* d, int ds, NppiSize roi,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, c, d, ds, roi))
 VGPU_NPP_CTX(NppStatus, nppiMulC_32f_C1R,
              (const Npp32f* s, int ss, const Npp32f c, Npp32f* d, int ds, NppiSize roi,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, c, d, ds, roi))
 
 /* ---- data exchange and initialisation (nppidei) ---- */
@@ -439,7 +456,7 @@ VGPU_NPP_CTX(NppStatus, nppiMulC_32f_C1R,
     return NPP_SUCCESS;                                                                      \
   }                                                                                          \
   VGPU_NPP_CTX(NppStatus, nppiCopy_##SUFFIX,                                                 \
-               (const TYPE* s, int ss, TYPE* d, int ds, NppiSize roi, NppStreamContext),     \
+               (const TYPE* s, int ss, TYPE* d, int ds, NppiSize roi, NppStreamContext ctx_),     \
                (s, ss, d, ds, roi))
 VGPU_NPP_COPY(8u_C1R, Npp8u, 1)
 VGPU_NPP_COPY(8u_C3R, Npp8u, 3)
@@ -470,11 +487,17 @@ VGPU_EXPORT NppStatus nppiSet_32f_C1R(const Npp32f value, Npp32f* d, int ds, Npp
   return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiSet_8u_C1R,
-             (const Npp8u v, Npp8u* d, int ds, NppiSize roi, NppStreamContext), (v, d, ds, roi))
-VGPU_NPP_CTX(NppStatus, nppiSet_8u_C3R,
-             (const Npp8u v[3], Npp8u* d, int ds, NppiSize roi, NppStreamContext), (v, d, ds, roi))
+             (const Npp8u v, Npp8u* d, int ds, NppiSize roi, NppStreamContext ctx_), (v, d, ds, roi))
+// The constant is an array read when the call is made, so a captured call keeps a copy.
+VGPU_EXPORT NppStatus nppiSet_8u_C3R_Ctx(const Npp8u v[3], Npp8u* d, int ds, NppiSize roi, NppStreamContext ctx_) {
+  if (v && vgpu_capture::stream_capturing(ctx_.hStream)) {
+    const Npp8u copy[3] = {v[0], v[1], v[2]};
+    if (vgpu_record_host_op_if_capturing(ctx_.hStream, [=] { (void)nppiSet_8u_C3R(copy, d, ds, roi); })) return NPP_SUCCESS;
+  }
+  return nppiSet_8u_C3R(v, d, ds, roi);
+}
 VGPU_NPP_CTX(NppStatus, nppiSet_32f_C1R,
-             (const Npp32f v, Npp32f* d, int ds, NppiSize roi, NppStreamContext), (v, d, ds, roi))
+             (const Npp32f v, Npp32f* d, int ds, NppiSize roi, NppStreamContext ctx_), (v, d, ds, roi))
 
 VGPU_EXPORT NppStatus nppiConvert_8u32f_C1R(const Npp8u* s, int ss, Npp32f* d, int ds,
                                             NppiSize roi) {
@@ -504,11 +527,11 @@ VGPU_EXPORT NppStatus nppiConvert_32f8u_C1R(const Npp32f* s, int ss, Npp8u* d, i
   return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiConvert_8u32f_C1R,
-             (const Npp8u* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext),
+             (const Npp8u* s, int ss, Npp32f* d, int ds, NppiSize roi, NppStreamContext ctx_),
              (s, ss, d, ds, roi))
 VGPU_NPP_CTX(NppStatus, nppiConvert_32f8u_C1R,
              (const Npp32f* s, int ss, Npp8u* d, int ds, NppiSize roi, NppRoundMode m,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, d, ds, roi, m))
 
 // oSrcROI describes the *source*; the destination is its transpose.
@@ -527,7 +550,7 @@ VGPU_NPP_CTX(NppStatus, nppiConvert_32f8u_C1R,
     return NPP_SUCCESS;                                                                     \
   }                                                                                          \
   VGPU_NPP_CTX(NppStatus, nppiTranspose_##SUFFIX,                                            \
-               (const TYPE* s, int ss, TYPE* d, int ds, NppiSize r, NppStreamContext),       \
+               (const TYPE* s, int ss, TYPE* d, int ds, NppiSize r, NppStreamContext ctx_),       \
                (s, ss, d, ds, r))
 VGPU_NPP_TRANSPOSE(8u_C1R, Npp8u)
 VGPU_NPP_TRANSPOSE(32f_C1R, Npp32f)
@@ -547,7 +570,7 @@ VGPU_EXPORT NppStatus nppiSwapChannels_8u_C3R(const Npp8u* s, int ss, Npp8u* d, 
 }
 VGPU_NPP_CTX(NppStatus, nppiSwapChannels_8u_C3R,
              (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, const int o[3],
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, d, ds, roi, o))
 
 /* ---- colour conversion (nppicc) ---- */
@@ -565,7 +588,7 @@ VGPU_EXPORT NppStatus nppiRGBToGray_8u_C3C1R(const Npp8u* s, int ss, Npp8u* d, i
   return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiRGBToGray_8u_C3C1R,
-             (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, NppStreamContext),
+             (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, NppStreamContext ctx_),
              (s, ss, d, ds, roi))
 
 /* ---- threshold and compare (nppitc) ---- */
@@ -583,11 +606,11 @@ VGPU_EXPORT NppStatus nppiCompare_8u_C1R(const Npp8u* s1, int ss1, const Npp8u* 
 }
 VGPU_NPP_CTX(NppStatus, nppiThreshold_8u_C1R,
              (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, const Npp8u t, NppCmpOp op,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, d, ds, roi, t, op))
 VGPU_NPP_CTX(NppStatus, nppiCompare_8u_C1R,
              (const Npp8u* s1, int ss1, const Npp8u* s2, int ss2, Npp8u* d, int ds, NppiSize roi,
-              NppCmpOp op, NppStreamContext),
+              NppCmpOp op, NppStreamContext ctx_),
              (s1, ss1, s2, ss2, d, ds, roi, op))
 
 /* ---- image statistics (nppist) ----
@@ -609,10 +632,10 @@ VGPU_EXPORT NppStatus nppiMinMaxGetBufferHostSize_8u_C1R(NppiSize roi, NppBuffer
 VGPU_EXPORT NppStatus nppiMeanStdDevGetBufferHostSize_8u_C1R(NppiSize roi, NppBufferSize* bytes) {
   return nppiSumGetBufferHostSize_8u_C1R(roi, bytes);
 }
-VGPU_NPP_CTX(NppStatus, nppiSumGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
-VGPU_NPP_CTX(NppStatus, nppiMeanGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
-VGPU_NPP_CTX(NppStatus, nppiMinMaxGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
-VGPU_NPP_CTX(NppStatus, nppiMeanStdDevGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiSumGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext ctx_), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiMeanGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext ctx_), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiMinMaxGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext ctx_), (r, b))
+VGPU_NPP_CTX(NppStatus, nppiMeanStdDevGetBufferHostSize_8u_C1R, (NppiSize r, NppBufferSize* b, NppStreamContext ctx_), (r, b))
 
 VGPU_EXPORT NppStatus nppiSum_8u_C1R(const Npp8u* s, int ss, NppiSize roi, Npp8u*, Npp64f* sum) {
   if (!s || !sum) return NPP_NULL_POINTER_ERROR;
@@ -660,18 +683,18 @@ VGPU_EXPORT NppStatus nppiMinMax_8u_C1R(const Npp8u* s, int ss, NppiSize roi, Np
   return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiSum_8u_C1R,
-             (const Npp8u* s, int ss, NppiSize r, Npp8u* b, Npp64f* o, NppStreamContext),
+             (const Npp8u* s, int ss, NppiSize r, Npp8u* b, Npp64f* o, NppStreamContext ctx_),
              (s, ss, r, b, o))
 VGPU_NPP_CTX(NppStatus, nppiMean_8u_C1R,
-             (const Npp8u* s, int ss, NppiSize r, Npp8u* b, Npp64f* o, NppStreamContext),
+             (const Npp8u* s, int ss, NppiSize r, Npp8u* b, Npp64f* o, NppStreamContext ctx_),
              (s, ss, r, b, o))
 VGPU_NPP_CTX(NppStatus, nppiMean_StdDev_8u_C1R,
              (const Npp8u* s, int ss, NppiSize r, Npp8u* b, Npp64f* m, Npp64f* sd,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, r, b, m, sd))
 VGPU_NPP_CTX(NppStatus, nppiMinMax_8u_C1R,
              (const Npp8u* s, int ss, NppiSize r, Npp8u* mn, Npp8u* mx, Npp8u* b,
-              NppStreamContext),
+              NppStreamContext ctx_),
              (s, ss, r, mn, mx, b))
 
 /* ---- filtering (nppif) and morphology (nppim) ----
@@ -721,7 +744,7 @@ VGPU_EXPORT NppStatus nppiFilterBox_8u_C1R(const Npp8u* s, Npp32s ss, Npp8u* d, 
 }
 VGPU_NPP_CTX(NppStatus, nppiFilterBox_8u_C1R,
              (const Npp8u* s, Npp32s ss, Npp8u* d, Npp32s ds, NppiSize roi, NppiSize m,
-              NppiPoint a, NppStreamContext),
+              NppiPoint a, NppStreamContext ctx_),
              (s, ss, d, ds, roi, m, a))
 
 VGPU_EXPORT NppStatus nppiFilter_32f_C1R(const Npp32f* s, Npp32s ss, Npp32f* d, Npp32s ds,
@@ -768,7 +791,7 @@ VGPU_EXPORT NppStatus nppiFilter_32f_C1R(const Npp32f* s, Npp32s ss, Npp32f* d, 
 }
 VGPU_NPP_CTX(NppStatus, nppiFilter_32f_C1R,
              (const Npp32f* s, Npp32s ss, Npp32f* d, Npp32s ds, NppiSize roi, const Npp32f* k,
-              NppiSize ks, NppiPoint a, NppStreamContext),
+              NppiSize ks, NppiPoint a, NppStreamContext ctx_),
              (s, ss, d, ds, roi, k, ks, a))
 
 // 3x3 morphology with the anchor at the centre, which is what these fixed-size
@@ -795,7 +818,7 @@ VGPU_NPP_CTX(NppStatus, nppiFilter_32f_C1R,
     return NPP_SUCCESS;                                                                      \
   }                                                                                          \
   VGPU_NPP_CTX(NppStatus, nppi##NAME##3x3_8u_C1R,                                            \
-               (const Npp8u* s, Npp32s ss, Npp8u* d, Npp32s ds, NppiSize r, NppStreamContext),\
+               (const Npp8u* s, Npp32s ss, Npp8u* d, Npp32s ds, NppiSize r, NppStreamContext ctx_),\
                (s, ss, d, ds, r))
 VGPU_NPP_MORPH3(Dilate, 0, std::max(acc, v))
 VGPU_NPP_MORPH3(Erode, 255, std::min(acc, v))
@@ -818,7 +841,7 @@ VGPU_EXPORT NppStatus nppiMirror_8u_C1R(const Npp8u* s, int ss, Npp8u* d, int ds
   return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiMirror_8u_C1R,
-             (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize r, NppiAxis f, NppStreamContext),
+             (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize r, NppiAxis f, NppStreamContext ctx_),
              (s, ss, d, ds, r, f))
 
 // Resize maps destination pixels back into the source rectangle. NPP's factors
@@ -894,11 +917,11 @@ VGPU_EXPORT NppStatus nppiResize_8u_C3R(const Npp8u* s, int ss, NppiSize ssz, Np
 }
 VGPU_NPP_CTX(NppStatus, nppiResize_8u_C1R,
              (const Npp8u* s, int ss, NppiSize ssz, NppiRect sroi, Npp8u* d, int ds, NppiSize dsz,
-              NppiRect droi, int i, NppStreamContext),
+              NppiRect droi, int i, NppStreamContext ctx_),
              (s, ss, ssz, sroi, d, ds, dsz, droi, i))
 VGPU_NPP_CTX(NppStatus, nppiResize_8u_C3R,
              (const Npp8u* s, int ss, NppiSize ssz, NppiRect sroi, Npp8u* d, int ds, NppiSize dsz,
-              NppiRect droi, int i, NppStreamContext),
+              NppiRect droi, int i, NppStreamContext ctx_),
              (s, ss, ssz, sroi, d, ds, dsz, droi, i))
 
 /* ---- signal processing (npps) ---- */
@@ -929,7 +952,7 @@ template <class T> void store_signal(T* d, const std::vector<T>& h) {
     return NPP_SUCCESS;                                                                  \
   }                                                                                      \
   VGPU_NPP_CTX(NppStatus, npps##NAME##_32f,                                              \
-               (const Npp32f* s1, const Npp32f* s2, Npp32f* d, NppSignalLen n, NppStreamContext), \
+               (const Npp32f* s1, const Npp32f* s2, Npp32f* d, NppSignalLen n, NppStreamContext ctx_), \
                (s1, s2, d, n))
 // npps follows the same convention as nppi: Sub is pSrc2 - pSrc1.
 VGPU_NPPS_BIN(Add, x + y)
@@ -950,7 +973,7 @@ VGPU_NPPS_BIN(Div, x == 0.0 ? 0.0 : y / x)
     return NPP_SUCCESS;                                                                  \
   }                                                                                      \
   VGPU_NPP_CTX(NppStatus, npps##NAME##_32f,                                              \
-               (const Npp32f* s, Npp32f v, Npp32f* d, NppSignalLen n, NppStreamContext),       \
+               (const Npp32f* s, Npp32f v, Npp32f* d, NppSignalLen n, NppStreamContext ctx_),       \
                (s, v, d, n))
 VGPU_NPPS_CONST(AddC, x + k)
 VGPU_NPPS_CONST(SubC, x - k)
@@ -970,7 +993,7 @@ VGPU_NPPS_CONST(DivC, k == 0.0 ? 0.0 : x / k)
     return NPP_SUCCESS;                                                                  \
   }                                                                                      \
   VGPU_NPP_CTX(NppStatus, npps##NAME##_32f,                                              \
-               (const Npp32f* s, Npp32f* d, NppSignalLen n, NppStreamContext), (s, d, n))
+               (const Npp32f* s, Npp32f* d, NppSignalLen n, NppStreamContext ctx_), (s, d, n))
 VGPU_NPPS_UNARY(Abs, std::fabs(x))
 VGPU_NPPS_UNARY(Sqr, x * x)
 VGPU_NPPS_UNARY(Sqrt, std::sqrt(x))
@@ -989,9 +1012,9 @@ VGPU_EXPORT NppStatus nppsCopy_32f(const Npp32f* s, Npp32f* d, NppSignalLen n) {
   store_signal(d, fetch_signal(s, n));
   return NPP_SUCCESS;
 }
-VGPU_NPP_CTX(NppStatus, nppsSet_32f, (Npp32f v, Npp32f* d, NppSignalLen n, NppStreamContext), (v, d, n))
-VGPU_NPP_CTX(NppStatus, nppsZero_32f, (Npp32f* d, NppSignalLen n, NppStreamContext), (d, n))
-VGPU_NPP_CTX(NppStatus, nppsCopy_32f, (const Npp32f* s, Npp32f* d, NppSignalLen n, NppStreamContext),
+VGPU_NPP_CTX(NppStatus, nppsSet_32f, (Npp32f v, Npp32f* d, NppSignalLen n, NppStreamContext ctx_), (v, d, n))
+VGPU_NPP_CTX(NppStatus, nppsZero_32f, (Npp32f* d, NppSignalLen n, NppStreamContext ctx_), (d, n))
+VGPU_NPP_CTX(NppStatus, nppsCopy_32f, (const Npp32f* s, Npp32f* d, NppSignalLen n, NppStreamContext ctx_),
              (s, d, n))
 
 #define VGPU_NPPS_BUFSIZE(NAME)                                                          \
@@ -1001,7 +1024,7 @@ VGPU_NPP_CTX(NppStatus, nppsCopy_32f, (const Npp32f* s, Npp32f* d, NppSignalLen 
     *bytes = 4096;                                                                       \
     return NPP_SUCCESS;                                                                  \
   }                                                                                      \
-  VGPU_NPP_CTX(NppStatus, npps##NAME##GetBufferSize_32f, (NppSignalLen n, NppSignalBufferSize* b, NppStreamContext), \
+  VGPU_NPP_CTX(NppStatus, npps##NAME##GetBufferSize_32f, (NppSignalLen n, NppSignalBufferSize* b, NppStreamContext ctx_), \
                (n, b))
 VGPU_NPPS_BUFSIZE(Sum)
 VGPU_NPPS_BUFSIZE(Mean)
@@ -1041,7 +1064,7 @@ VGPU_EXPORT NppStatus nppsMin_32f(const Npp32f* s, NppSignalLen n, Npp32f* mn, N
   put_scalar<Npp32f>(mn, best);
   return NPP_SUCCESS;
 }
-VGPU_NPP_CTX(NppStatus, nppsSum_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
-VGPU_NPP_CTX(NppStatus, nppsMean_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
-VGPU_NPP_CTX(NppStatus, nppsMax_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
-VGPU_NPP_CTX(NppStatus, nppsMin_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsSum_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext ctx_), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsMean_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext ctx_), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsMax_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext ctx_), (s, n, o, b))
+VGPU_NPP_CTX(NppStatus, nppsMin_32f, (const Npp32f* s, NppSignalLen n, Npp32f* o, Npp8u* b, NppStreamContext ctx_), (s, n, o, b))

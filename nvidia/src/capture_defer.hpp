@@ -96,8 +96,8 @@ struct Host {
   const void* p;
   std::function<size_t()> bytes;
   template <class T>
-  operator const T*() const {
-    return static_cast<const T*>(p);
+  operator T*() const {
+    return const_cast<T*>(static_cast<const T*>(p));
   }
 };
 
