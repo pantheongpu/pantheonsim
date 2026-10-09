@@ -54,7 +54,7 @@ telemetry:
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # L2 98304 KB and the 384-bit memory interface: NVIDIA RTX Blackwell whitepaper v1.1, Table 1. Persisting L2 copied
-# from nvidia/l40s (the same AD102 die and L2), whose ratio was measured; NVIDIA does not publish it.
+# from nvidia/l40s (the same AD102 die and L2), whose value was read from a card (2026-10-09); NVIDIA does not publish it.
 cuda:
   memory_bus_width_bits: 384
-  persisting_l2_bytes: 75497472
+  persisting_l2_bytes: 69206016

@@ -1,0 +1,2 @@
+SKIP: FP8 attention needs a Hopper or Blackwell GPU (or profile)
+PASS

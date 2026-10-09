@@ -123,3 +123,21 @@ await call_boto3(service_name='ec2',operation_name='TerminateInstances',region_n
 ```
 
 Nothing else was created (the key pair and security group are shared and stay).
+
+## Notes from the 2026-10-09 session (g6e.2xlarge, L40S)
+
+* Capacity: g7e.2xlarge, p5.4xlarge and g6e.xlarge were refused in every zone, by default placement and zone by
+  zone, at six polls over three hours; `g6e.2xlarge` (the same L40S, two more vCPUs) launched at the fifth poll in
+  us-east-1b. Try the neighbouring sizes (g6e.2xlarge, g7e.4xlarge) in every poll. A launch call can take over
+  100 seconds to fail (three retries inside the SDK): wrap it in `asyncio.wait_for`, launch one type at a time, and if the
+  tool times out, list instances tagged `purpose=<branch>` before doing anything else.
+* The instance (8 vCPUs, 61 GB, the DLAMI with CUDA 12.8, 12.9, 13.0 and 13.2) builds the simulator in about 15 minutes
+  (`cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8 -- -k`), which lets the simulator's side of
+  every comparison run next to the card: `VGPU_BUILD_DIR=$HOME/vgpu/build PATH=/usr/local/cuda-13.2/bin:$PATH
+  nvidia/tests/e2e/run_lowprec.sh lt|sparselt|cvt` and `nvidia/tools/verify-profile.sh nvidia/<slug> <dir with
+  <slug>.ptx_semantics.ref.txt and <slug>.control_flow.ref.txt>`. Build with CUDA 13.2 (the shims need its cuBLASLt
+  emulation types; 13.0's headers fail in `cublaslt_api.cpp`); that tree needs the `runtime_api.cpp` fix for
+  `cudaMemcpyNodeParams::reserved` (an int in 13.2, int[3] before). `vgpucupti` and `vgpunvenc` do not build on the
+  AMI (no `cupti.h` beside the CUDA 13.2 include path, no `cuda_runtime.h` for the NVENC target); `-k` skips them.
+* The whole remote session took 3 minutes on the L40S (the probes are fast; the 1278-descriptor cuBLASLt sweep took 30
+  seconds). The cost of a session is the wait for capacity, not the run.

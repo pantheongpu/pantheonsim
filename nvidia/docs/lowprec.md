@@ -41,9 +41,10 @@ at another set of NVIDIA libraries (a pip wheel's, for instance).
 | Profile | Read from | What |
 | --- | --- | --- |
 | `nvidia/l4` (sm_89) | an AWS g6.xlarge (three sessions), driver 595.91, cuBLAS 13.3 (CUDA 13.2), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`; `cuda_attributes_l4.card.txt`; `nvidia-smi -q` (serial number, PDI and UUID redacted) |
+| `nvidia/l40s` (sm_89) | an AWS g6e.2xlarge (2026-10-09), driver 595.91.07, cuBLAS 13.3 (wheel `nvidia-cublas==13.3.*`), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`: line for line the L4's (the simulator's `l40s` profile reproduces them) |
 | `nvidia/rtx3060` (sm_86) | the development machine, the same libraries | `lt`, `sparselt`; cuDNN 9.27 for `dnn_int8x32` |
 
-Nothing was measured on Hopper or Blackwell: AWS had no `p5.4xlarge` or
+Nothing was measured on Hopper or Blackwell (a later session, 2026-10-09 evening, got only an L40S, which answered exactly as the L4 did): AWS had no `p5.4xlarge` or
 `g7e.2xlarge` capacity in us-east-1 at nine attempts over four hours (every zone
 for `p5.4xlarge`; for a while no `g6.xlarge` or `g6e.xlarge` either), the Spot
 quota for the G and P families is 0, and no other region has any quota for them.

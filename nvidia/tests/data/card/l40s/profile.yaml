@@ -22,27 +22,20 @@ limits:
   max_blocks_per_sm: 24
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
-  l2_cache_bytes: 100663296          # AD102 datasheet
 features:
   fp16: true
   bf16: true
   fp64: true
   tensor_cores: true
+cuda:
+  memory_bus_width_bits: 384
+  clock_khz: 2520000
+  async_engine_count: 2
+  persisting_l2_bytes: 69206016
 telemetry:
-  framebuffer_mb: 46068          # nvidia-smi total on real cards (510 runs in the benchmark database)
   power_limit_w: 350
   sm_clock_max_mhz: 2520
   mem_clock_max_mhz: 9001
   # temperature_max_c: this driver did not report a thermal threshold
   pci_vendor_id: 4318          # 0x10DE
   pci_device_id: 9913          # 0x26B9
-  ecc: true                    # supported and on by default (NVIDIA datasheet)
-  memory: gddr                 # GDDR; Ampere and later remap rows rather than retire pages (see telemetry.cpp)
-  pcie_link: "Gen4 x8"         # most common link on real cards (510 runs in the benchmark database)
-
-# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
-# Datasheet: AD102 memory interface and 96 MB L2. The persisting L2 maximum (69206016, eleven sixteenths of L2, the L4's ratio) was read
-# from an AWS g6e.2xlarge on 2026-10-09 (driver 595.91.07); the three quarters this profile carried before was a guess.
-cuda:
-  memory_bus_width_bits: 384
-  persisting_l2_bytes: 69206016

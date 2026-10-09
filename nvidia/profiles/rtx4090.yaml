@@ -60,8 +60,9 @@ telemetry:
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # L2 73728 KB and the 384-bit memory interface: NVIDIA Ada whitepaper, Tables 1 and 2.
-# Persisting L2 is 3/4 of the L2 (56623104), the ratio nvidia/l40s measured (75497472 of 100663296);
-# NVIDIA does not publish it, so this is derived, unverified.
+# Persisting L2 is 3/4 of the L2 (56623104), the ratio this profile carried for nvidia/l40s before an L40S was
+# read (2026-10-09: 69206016 of 100663296, eleven sixteenths, as the L4); NVIDIA does not publish it, so this
+# is derived and unverified, and probably 51904512 on the same ratio.
 cuda:
   memory_bus_width_bits: 384
   persisting_l2_bytes: 56623104

@@ -1,0 +1,2 @@
+name, driver_version, compute_cap, memory.total [MiB], power.max_limit [W], clocks.max.sm [MHz], clocks.max.memory [MHz], pci.device_id, pci.sub_device_id
+NVIDIA L40S, 595.91.07, 8.9, 46068 MiB, 350.00 W, 2520 MHz, 9001 MHz, 0x26B910DE, 0x185110DE

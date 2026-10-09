@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <type_traits>
 #include <cctype>
 #include <cstring>
 #include <functional>
@@ -10405,7 +10406,15 @@ static cudaError_t graph_add_node_impl(cudaGraphNode_t* pNode, cudaGraph_t graph
       return cudaGraphAddKernelNode(pNode, graph, deps, numDeps, &k);
     }
     case cudaGraphNodeTypeMemcpy:
-      if (p->memcpy.flags || p->memcpy.reserved[0] || p->memcpy.reserved[1] || p->memcpy.reserved[2])
+      // `reserved` is int[3] up to CUDA 13.0 and a single int (beside a context handle) in 13.2.
+      if (p->memcpy.flags || [](const auto& m) {
+            if constexpr (std::is_array_v<std::remove_reference_t<decltype(m.reserved)>>) {
+              for (int v : m.reserved) if (v) return true;
+              return false;
+            } else {
+              return m.reserved != 0;
+            }
+          }(p->memcpy))
         return cudaErrorInvalidValue;
       return cudaGraphAddMemcpyNode(pNode, graph, deps, numDeps, &p->memcpy.copyParams);
     case cudaGraphNodeTypeMemset: {
