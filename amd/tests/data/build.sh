@@ -27,6 +27,13 @@ for src in vector_add ops math memory globals grid bytes int64 atomics mixed hal
   echo "wrote $(pwd)/$src.gfx1100.o, $src.gfx1201.o and $src.gfx1030.o"
 done
 
+# And for gfx1250 (CDNA 5, MI455X; wave32), with a clang that knows it (ROCm 7.2's). Built by compiler, run by
+# the simulator: no card has checked what these kernels do on it.
+for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds; do
+  "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1250 -nogpulib -O2 -c "$src.c" -o "$src.gfx1250.o"
+  echo "wrote $(pwd)/$src.gfx1250.o"
+done
+
 # vector_add for the RDNA generic targets (test_amd_gcn_asm), which need a
 # clang that knows them (ROCm's; LLVM 19 and later).
 for t in gfx11-generic gfx12-generic; do

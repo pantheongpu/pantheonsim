@@ -630,7 +630,7 @@ struct Machine {
       kBf6{2, 3, 28.0, F8::Finite, 6}, kFp4{1, 1, 6.0, F8::Finite, 4};
   // The 8-bit formats the code's processor has.
   // gfx950 and RDNA4 use the OCP formats; gfx942's are FNUZ.
-  bool ocp8() const { return d.object->gfx950() || target() == gcn::Target::Gfx1200; }
+  bool ocp8() const { return d.object->gfx950() || gcn::is_gfx12(target()); }
   const F8& fp8() const { return ocp8() ? kOcpFp8 : kFp8; }
   const F8& bf8() const { return ocp8() ? kOcpBf8 : kBf8; }
   static float f8_to_float(uint32_t v, const F8& t) {
@@ -1078,7 +1078,7 @@ struct Machine {
       const uint32_t id = static_cast<uint32_t>(in.simm) & 0x3F, at = (static_cast<uint32_t>(in.simm) >> 6) & 0x1F,
                      width = ((static_cast<uint32_t>(in.simm) >> 11) & 0x1F) + 1;
       const uint32_t mask = (width >= 32 ? ~0u : (1u << width) - 1) << at;
-      const bool sched = id == 26 && in.arch == gcn::Target::Gfx1200;
+      const bool sched = id == 26 && gcn::is_gfx12(in.arch);
       const bool flat_scr = (id == 20 || id == 21) && in.arch == gcn::Target::Gfx1030;
       if (op != "s_getreg_b32"_op) {
         if (id != 1 && !sched && !flat_scr)
@@ -1095,7 +1095,7 @@ struct Machine {
         if (id == 1) reg = w.mode;
         else if (sched) reg = w.sched_mode;
         else if (flat_scr) reg = w.flat_scratch[id - 20];
-        else if (id == 4 && in.arch == gcn::Target::Gfx1200) {
+        else if (id == 4 && gcn::is_gfx12(in.arch)) {
           // gfx12's STATE_PRIV, where register 4 was HW_ID before: of its
           // fields only SCC (bit 9) has a value here. The barrier, priority,
           // halt, debug and trace states read as a running wave's are, 0.
@@ -1124,9 +1124,12 @@ struct Machine {
         // count on gfx10.3 and gfx11; on gfx12 its low word (29) and high
         // word (30). The count is s_memtime's, the instructions retired.
         else if (id == 29 && is_rdna(in.arch))
-          reg = in.arch == gcn::Target::Gfx1200 ? static_cast<uint32_t>(stats.instructions)
+          reg = gcn::is_gfx12(in.arch) ? static_cast<uint32_t>(stats.instructions)
                                                 : static_cast<uint32_t>(stats.instructions) & 0xFFFFF;
-        else if (id == 30 && in.arch == gcn::Target::Gfx1200) reg = static_cast<uint32_t>(stats.instructions >> 32);
+        else if (id == 30 && gcn::is_gfx12(in.arch)) reg = static_cast<uint32_t>(stats.instructions >> 32);
+        // gfx1250's IB_STS2, whose bits 9:6 are the wave's number in its work-group (llvm.amdgcn.wave.id reads
+        // them, where gfx12 read TTMP8).
+        else if (id == 28 && in.arch == gcn::Target::Gfx1250) reg = (static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF) << 6;
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);
       }
@@ -1202,8 +1205,25 @@ struct Machine {
       const uint64_t to = scalar(w, in.src[0]);
       write_scalar(w, in.dst[0], w.pc);
       w.pc = to;
-    } else if (op == "s_setpc_b64"_op) {
+    } else if (op == "s_setpc_b64"_op || op == "s_set_pc_i64"_op) {
       w.pc = scalar(w, in.src[0]);   // the return
+    } else if (op == "s_get_pc_i64"_op) {
+      write_scalar(w, in.dst[0], w.pc);   // (gfx1250's s_getpc_b64: the next instruction's address)
+    } else if (op == "s_swap_pc_i64"_op) {
+      const uint64_t to = scalar(w, in.src[0]);
+      write_scalar(w, in.dst[0], w.pc);
+      w.pc = to;
+    } else if (op == "s_add_pc_i64"_op) {
+      // The program counter (already past this instruction) moved by a signed offset; a 32-bit literal is sign-extended.
+      const int64_t off = in.src[0].kind == OperandKind::Literal && !in.src[0].lit64
+                              ? static_cast<int64_t>(static_cast<int32_t>(a))
+                              : static_cast<int64_t>(a);
+      w.pc = static_cast<uint64_t>(static_cast<int64_t>(w.pc) + off);
+    } else if (op == "s_call_i64"_op) {
+      write_scalar(w, in.dst[0], w.pc);
+      w.pc = in.target;
+    } else if (op == "s_get_shader_cycles_u64"_op) {
+      write_scalar(w, in.dst[0], stats.instructions);
     } else if (op == "s_lshr_b32"_op) {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> (b & 31));
       w.scc = static_cast<uint32_t>(a) >> (b & 31);
@@ -1433,7 +1453,10 @@ struct Machine {
     // zero, where there is none.)
     const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset) +
                           (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) +
-                          (gcn::is_rdna(in.arch) && in.src.size() > 1 ? static_cast<uint32_t>(scalar(w, in.src[1])) : 0);
+                          (gcn::is_rdna(in.arch) && in.src.size() > 1
+                               ? scaled_offset(in, static_cast<uint32_t>(scalar(w, in.src[1])),
+                                               in.dst.empty() ? 4 : 4 * in.dst[0].width)
+                               : 0);
     if (in.name.rfind("s_store_dword", 0) == 0) {
       for (uint32_t i = 0; i < in.dst[0].width; ++i)
         at(base + 4 * i).store_scalar(base + 4 * i, 4, sgpr(w, in.dst[0].index + i));
@@ -1701,6 +1724,128 @@ struct Machine {
   // and xor, and relative register addressing. A 16-bit source reads its
   // half of the register (sel) and the result goes to its half of the
   // destination (Narrowed). Returns whether `op` was one.
+  // gfx1250's vector instructions that gfx12 does not have: 64-bit integer arithmetic, the three-operand
+  // add-then-clamp forms, packed saturating conversions, tanh and the bfloat16 transcendentals, and the
+  // 8-bit float conversions to halves. False for an instruction that is not one of them.
+  bool cdna5_alu(Wave& w, const Inst& in, const OpName& op_in) {
+    std::string name = op_in;
+    if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
+      name.resize(name.size() - 4);
+    const OpName op(name);
+    const auto each = [&](auto&& body) {
+      for (uint32_t lane = 0; lane < kLanes; ++lane)
+        if (w.exec >> lane & 1) body(lane);
+    };
+    const auto u = [&](uint32_t k, uint32_t lane) { return lane_src(w, in.src[k], lane); };
+    const auto u64 = [&](uint32_t k, uint32_t lane) { return lane_src64(w, in.src[k], lane); };
+    const auto bf = [&](uint32_t k, uint32_t lane) { return as_float((lane_src(w, in.src[k], lane) & 0xFFFFu) << 16); };
+    const auto sat8 = [](int64_t v, bool is_signed) -> uint32_t {
+      return static_cast<uint32_t>(is_signed ? std::clamp<int64_t>(v, -128, 127) : std::clamp<int64_t>(v, 0, 255)) & 0xFF;
+    };
+    if (op == "v_add_nc_u64"_op) {
+      each([&](uint32_t lane) { write_lane64(w, in.dst[0], lane, u64(0, lane) + u64(1, lane)); });
+    } else if (op == "v_sub_nc_u64"_op) {
+      each([&](uint32_t lane) { write_lane64(w, in.dst[0], lane, u64(0, lane) - u64(1, lane)); });
+    } else if (op == "v_mul_u64"_op) {
+      each([&](uint32_t lane) { write_lane64(w, in.dst[0], lane, u64(0, lane) * u64(1, lane)); });
+    } else if (op == "v_min_u64"_op || op == "v_max_u64"_op) {
+      each([&](uint32_t lane) {
+        const uint64_t a = u64(0, lane), b = u64(1, lane);
+        write_lane64(w, in.dst[0], lane, op == "v_min_u64"_op ? std::min(a, b) : std::max(a, b));
+      });
+    } else if (op == "v_min_i64"_op || op == "v_max_i64"_op) {
+      each([&](uint32_t lane) {
+        const int64_t a = static_cast<int64_t>(u64(0, lane)), b = static_cast<int64_t>(u64(1, lane));
+        write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(op == "v_min_i64"_op ? std::min(a, b) : std::max(a, b)));
+      });
+    } else if (op == "v_mad_u32"_op) {
+      each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, u(0, lane) * u(1, lane) + u(2, lane)); });
+    } else if (op == "v_mad_nc_u64_u32"_op) {
+      each([&](uint32_t lane) {
+        write_lane64(w, in.dst[0], lane, uint64_t{u(0, lane)} * u(1, lane) + u64(2, lane));
+      });
+    } else if (op == "v_mad_nc_i64_i32"_op) {
+      each([&](uint32_t lane) {
+        const int64_t p = int64_t{static_cast<int32_t>(u(0, lane))} * static_cast<int32_t>(u(1, lane));
+        write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p + static_cast<int64_t>(u64(2, lane))));
+      });
+    } else if (op == "v_add_max_i32"_op || op == "v_add_min_i32"_op || op == "v_add_max_u32"_op || op == "v_add_min_u32"_op) {
+      // The sum held to the type's range, then the larger or smaller of it and the third source.
+      const bool is_signed = name.find("_i32") != std::string::npos, is_max = name.find("_max_") != std::string::npos;
+      each([&](uint32_t lane) {
+        if (is_signed) {
+          const int64_t sum = std::clamp<int64_t>(int64_t{static_cast<int32_t>(u(0, lane))} + static_cast<int32_t>(u(1, lane)),
+                                                  INT32_MIN, INT32_MAX);
+          const int64_t c = static_cast<int32_t>(u(2, lane));
+          write_lane(w, in.dst[0], lane, static_cast<uint32_t>(is_max ? std::max(sum, c) : std::min(sum, c)));
+        } else {
+          const uint64_t sum = std::min<uint64_t>(uint64_t{u(0, lane)} + u(1, lane), 0xFFFFFFFFu);
+          const uint64_t c = u(2, lane);
+          write_lane(w, in.dst[0], lane, static_cast<uint32_t>(is_max ? std::max(sum, c) : std::min(sum, c)));
+        }
+      });
+    } else if (op == "v_ashr_pk_i8_i32"_op || op == "v_ashr_pk_u8_i32"_op) {
+      const bool is_signed = op == "v_ashr_pk_i8_i32"_op;
+      each([&](uint32_t lane) {
+        const uint32_t n = u(2, lane) & 31;
+        write_lane(w, in.dst[0], lane,
+                   sat8(static_cast<int32_t>(u(0, lane)) >> n, is_signed) | sat8(static_cast<int32_t>(u(1, lane)) >> n, is_signed) << 8);
+      });
+    } else if (op == "v_sat_pk4_i4_i8"_op || op == "v_sat_pk4_u4_u8"_op) {
+      const bool is_signed = op == "v_sat_pk4_i4_i8"_op;
+      each([&](uint32_t lane) {
+        const uint32_t x = u(0, lane);
+        uint32_t r = 0;
+        for (uint32_t k = 0; k < 4; ++k) {
+          const int64_t b = is_signed ? static_cast<int8_t>(x >> (8 * k)) : static_cast<int64_t>((x >> (8 * k)) & 0xFF);
+          r |= (static_cast<uint32_t>(is_signed ? std::clamp<int64_t>(b, -8, 7) : std::clamp<int64_t>(b, 0, 15)) & 0xF) << (4 * k);
+        }
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_tanh_f32"_op) {
+      each([&](uint32_t lane) { write_float(w, in, lane, std::tanh(lane_float(w, in.src[0], lane))); });
+    } else if (op == "v_tanh_f16"_op) {
+      each([&](uint32_t lane) { write_half(w, in, lane, static_cast<_Float16>(std::tanh(static_cast<float>(lane_half(w, in.src[0], lane))))); });
+    } else if (op == "v_tanh_bf16"_op) {
+      each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, to_bf16(std::tanh(bf(0, lane)))); });
+    } else if (op == "v_rcp_bf16"_op || op == "v_sqrt_bf16"_op || op == "v_rsq_bf16"_op || op == "v_log_bf16"_op ||
+               op == "v_exp_bf16"_op || op == "v_sin_bf16"_op || op == "v_cos_bf16"_op) {
+      // The operand is a bfloat16 and so is the result; sine and cosine take the angle in turns, as the f32 forms do.
+      each([&](uint32_t lane) {
+        const float x = bf(0, lane);
+        float r;
+        if (op == "v_rcp_bf16"_op) r = 1.0f / x;
+        else if (op == "v_sqrt_bf16"_op) r = std::sqrt(x);
+        else if (op == "v_rsq_bf16"_op) r = 1.0f / std::sqrt(x);
+        else if (op == "v_log_bf16"_op) r = std::log2(x);
+        else if (op == "v_exp_bf16"_op) r = std::exp2(x);
+        else if (op == "v_sin_bf16"_op) r = std::sin(x * 6.283185307179586f);
+        else r = std::cos(x * 6.283185307179586f);
+        write_lane(w, in.dst[0], lane, to_bf16(r));
+      });
+    } else if (op == "v_cvt_f16_fp8"_op || op == "v_cvt_f16_bf8"_op) {
+      const F8& t = op == "v_cvt_f16_fp8"_op ? fp8() : bf8();
+      each([&](uint32_t lane) {
+        write_half(w, in, lane, static_cast<_Float16>(f8_to_float(u(0, lane) & 0xFF, t)));
+      });
+    } else if (op == "v_cvt_pk_f16_fp8"_op || op == "v_cvt_pk_f16_bf8"_op) {
+      const F8& t = op == "v_cvt_pk_f16_fp8"_op ? fp8() : bf8();
+      each([&](uint32_t lane) {
+        const auto h = [&](uint32_t byte) {
+          const _Float16 v = static_cast<_Float16>(f8_to_float(byte, t));
+          uint16_t b;
+          std::memcpy(&b, &v, 2);
+          return uint32_t{b};
+        };
+        const uint32_t x = u(0, lane);
+        write_lane(w, in.dst[0], lane, h(x & 0xFF) | h((x >> 8) & 0xFF) << 16);
+      });
+    } else {
+      return false;
+    }
+    return true;
+  }
+
   bool rdna_alu(Wave& w, const Inst& in, const OpName& op_in) {
     std::string name = op_in;
     if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
@@ -1858,7 +2003,7 @@ struct Machine {
   void wmma(Wave& w, const Inst& in, const OpName& op) {
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu)
       throw Error::make(Err::Unsupported, in.name, " with lanes switched off, or in a wave64, which this does not model");
-    const bool g12 = in.arch == gcn::Target::Gfx1200;
+    const bool g12 = gcn::is_gfx12(in.arch);
     const std::string name = op;   // v_wmma_<out>_16x16x<K>_<a>[_<b>]
     const std::string out = name.substr(7, name.find('_', 7) - 7);
     const size_t shape_at = name.find("16x16x");
@@ -2274,6 +2419,7 @@ struct Machine {
       return;
     }
     Narrowed narrowed(*this, in);
+    if (in.arch == gcn::Target::Gfx1250 && cdna5_alu(w, in, op)) return;
     if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) return;
     if (carry_alu(w, in)) return;
     if (more_alu(w, in, op)) return;
@@ -3845,13 +3991,35 @@ struct Machine {
   // everything else is the device's. Most flat accesses reach only the
   // device's, and those are global accesses by another name.
   // Returns whether any lane's address was in LDS.
+  // How many bytes a global or flat access moves per lane, for SCALE_OFFSET.
+  static uint32_t access_bytes(const Inst& in) {
+    const std::string_view body = std::string_view(in.name).substr(in.name.find('_') + 1);
+    Narrow n;
+    Half h;
+    AtomicOp a;
+    if (narrow(in.name, &n)) return n.bytes;
+    if (half_access(body, &h)) return h.bytes;
+    if ((body.rfind("load_dword", 0) == 0 || body.rfind("load_monitor_b", 0) == 0) && !in.dst.empty()) return 4 * in.dst[0].width;
+    if (body.rfind("store_dword", 0) == 0 && in.src.size() > 1) return 4 * in.src[1].width;
+    if (parse_atomic(body, &a)) return a.bytes;
+    return 4;
+  }
+  // A lane's address in a flat access: a 64-bit one in a register pair, or -- gfx1250 -- a scalar pair's with a 32-bit
+  // offset register added (scaled, where SCALE_OFFSET asks).
+  uint64_t flat_address(Wave& w, const Inst& in, uint32_t lane, uint32_t bytes) {
+    const uint64_t base = in.has_saddr ? scalar_field(w, in.saddr, true) + scaled_offset(in, lane_src(w, in.src[0], lane), bytes)
+                                       : lane_src64(w, in.src[0], lane);
+    return base + static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+  }
+
   bool flat_access(Wave& w, const Inst& in, Group& g) {
     const auto in_lds = [](uint64_t a) { return a >= kSharedBase && a < kSharedBase + kSharedSize; };
     const auto in_private = [](uint64_t a) { return a >= kPrivateBase && a < kPrivateBase + kPrivateSize; };
+    const uint32_t bytes_per_lane = access_bytes(in);
     bool lds = false, priv = false;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+      const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
       lds = lds || in_lds(addr);
       priv = priv || in_private(addr);
     }
@@ -3867,7 +4035,7 @@ struct Machine {
     if (AtomicOp a; parse_atomic(body, &a)) {
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         if (!(w.exec >> lane & 1)) continue;
-        const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+        const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
         uint64_t v = 0, expected = 0, before = 0;
         atomic_data(w, in, a, lane, &v, &expected);
         uint8_t* host = nullptr;
@@ -3902,7 +4070,7 @@ struct Machine {
     const uint32_t bytes = part ? n.bytes : 4 * words;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint64_t addr = lane_src64(w, in.src[0], lane) + static_cast<uint64_t>(in.offset);
+      const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
       uint8_t* host = nullptr;   // where LDS or private memory keeps it; null for the device's
       if (in_lds(addr)) {
         const uint64_t where = addr - kSharedBase;
@@ -3948,7 +4116,7 @@ struct Machine {
       if (!(w.exec >> lane & 1)) continue;
       // An offset in a register, one in a scalar register, and the
       // instruction's own, as many of them as it has.
-      const uint64_t offset = (in.has_vaddr ? lane_src(w, in.src[0], lane) : 0) +
+      const uint64_t offset = (in.has_vaddr ? scaled_offset(in, lane_src(w, in.src[0], lane), 4 * words) : 0) +
                               (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) + static_cast<uint64_t>(in.offset);
       // A narrow access moves one byte or two; every other one moves whole
       // registers.
@@ -4707,7 +4875,7 @@ struct Machine {
         {"smax", Rmw::SMax},     {"umax", Rmw::UMax},       {"inc", Rmw::Inc},           {"dec", Rmw::Dec},
         {"cmpswap", Rmw::CmpSwap}, {"add_f32", Rmw::AddF32}, {"pk_add_f16", Rmw::PkAddF16},
         {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
-        {"max_f64", Rmw::MaxF64},
+        {"max_f64", Rmw::MaxF64}, {"min_num_f64", Rmw::MinF64}, {"max_num_f64", Rmw::MaxF64},
         // RDNA's float min and max, as each generation spells them: gfx10's
         // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
         {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
@@ -4847,6 +5015,13 @@ struct Machine {
     return before;
   }
 
+  // A 32-bit offset register's contribution to an address: as it is, or -- with gfx1250's SCALE_OFFSET -- as a
+  // signed number times the size of what is moved.
+  static uint64_t scaled_offset(const Inst& in, uint32_t reg, uint32_t bytes) {
+    if (!in.scale_offset) return reg;
+    return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(reg)) * bytes);
+  }
+
   void global_access(Wave& w, const Inst& in) {
     if (!w.exec) return;   // no lane to reach memory for
     const std::string& op = in.name;
@@ -4864,7 +5039,9 @@ struct Machine {
       narrow_store = body.rfind("store", 0) == 0;
     } else if (half_access(body, &half)) {
       kind = Kind::HalfReg;
-    } else if (body.rfind("load_dword", 0) == 0) {
+    } else if (body.rfind("prefetch_", 0) == 0) {
+      return;   // gfx1250's prefetch into the cache: there is none to warm
+    } else if (body.rfind("load_dword", 0) == 0 || body.rfind("load_monitor_b", 0) == 0) {
       kind = Kind::Load;
     } else if (body.rfind("store_dword", 0) == 0) {
       kind = Kind::Store;
@@ -4887,11 +5064,19 @@ struct Machine {
       if (!memo || memo_addr != addr) memo_value = load(addr, bytes), memo_addr = addr, memo = true;
       return memo_value;
     };
+    // gfx1250's SCALE_OFFSET multiplies the 32-bit offset register by what the access moves.
+    const uint32_t access_bytes = kind == Kind::Narrow    ? n.bytes
+                                  : kind == Kind::HalfReg ? half.bytes
+                                  : kind == Kind::Load    ? 4 * in.dst[0].width
+                                  : kind == Kind::Store   ? 4 * in.src[1].width
+                                  : kind == Kind::StoreHi16 ? 2
+                                                            : atomic.bytes;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
       // a 32-bit offset per lane.
-      const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + lane_src(w, in.src[0], lane)
+      const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
+      const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg
                                           : lane_src64(w, in.src[0], lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
       switch (kind) {
@@ -5555,21 +5740,24 @@ struct Machine {
         if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, false);
         const Inst& x = in.dual[0];
         const Inst& y = in.dual[1];
-        const uint32_t xd = x.dst.at(0).index;
-        std::array<uint32_t, kLanes> before = {};
-        std::copy(std::begin(w.vgpr[xd]), std::end(w.vgpr[xd]), before.begin());
+        const uint32_t xd = x.dst.at(0).index, xw = std::max(1u, x.dst[0].width);   // (a 64-bit result is two registers)
+        std::array<std::array<uint32_t, kLanes>, 2> before = {}, after = {};
+        for (uint32_t k = 0; k < xw && k < 2; ++k)
+          std::copy(std::begin(w.vgpr[xd + k]), std::end(w.vgpr[xd + k]), before[k].begin());
         vector_alu(w, x);
         bool y_reads_x = false;
-        for (const Operand& o : y.src) y_reads_x = y_reads_x || (o.kind == OperandKind::Vgpr && o.index == xd);
+        for (const Operand& o : y.src)
+          y_reads_x = y_reads_x || (o.kind == OperandKind::Vgpr && o.index < xd + xw && xd < o.index + std::max(1u, o.width));
         if (!y_reads_x) {
           vector_alu(w, y);
           return true;
         }
-        std::array<uint32_t, kLanes> after = {};
-        std::copy(std::begin(w.vgpr[xd]), std::end(w.vgpr[xd]), after.begin());
-        std::copy(before.begin(), before.end(), std::begin(w.vgpr[xd]));
+        for (uint32_t k = 0; k < xw && k < 2; ++k) {
+          std::copy(std::begin(w.vgpr[xd + k]), std::end(w.vgpr[xd + k]), after[k].begin());
+          std::copy(before[k].begin(), before[k].end(), std::begin(w.vgpr[xd + k]));
+        }
         vector_alu(w, y);
-        std::copy(after.begin(), after.end(), std::begin(w.vgpr[xd]));
+        for (uint32_t k = 0; k < xw && k < 2; ++k) std::copy(after[k].begin(), after[k].end(), std::begin(w.vgpr[xd + k]));
         return true;
       }
       case gcn::Enc::Vopc: {
@@ -5628,6 +5816,8 @@ struct Machine {
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mimg:
+        if (in.name.rfind("tensor_", 0) == 0)
+          throw Error::make(Err::Unsupported, in.name, " (gfx1250's tensor data mover) is decoded but not modeled");
         ++n.vmem;
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
         else ++n.vmem_rd;
@@ -5661,7 +5851,15 @@ struct Machine {
     // Giving the wave's vector registers back as it ends (RDNA's
     // MSG_DEALLOC_VGPRS), before its s_endpgm.
     if (OpName(in.name) == "s_sendmsg"_op && gcn::is_rdna(in.arch) && in.simm == 3) return true;
-    if (OpName(in.name) == "s_setprio"_op) return true;   // waves are not scheduled by priority here
+    if (OpName(in.name) == "s_setprio"_op || OpName(in.name) == "s_setprio_inc_wg"_op) return true;   // waves are not scheduled by priority here
+    // gfx1250 addresses up to 1024 vector registers by setting the top bits of every VGPR number; a program that
+    // sets any is not one this runs yet.
+    if (OpName(in.name) == "s_set_vgpr_msb"_op) {
+      if (in.simm != 0)
+        throw Error::make(Err::Unsupported, "s_set_vgpr_msb ", in.simm, ", which addresses vector registers past v255 and is not modeled");
+      return true;
+    }
+    if (OpName(in.name) == "s_monitor_sleep"_op) return false;
     // No wave sleeps past its own s_sleep to be woken, and there is no
     // instruction cache to invalidate.
     if (OpName(in.name) == "s_wakeup"_op || OpName(in.name) == "s_icache_inv"_op) return true;
@@ -5912,7 +6110,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // LLVM reads it (llvm.amdgcn.wave.id). Without it every wave of a Triton
     // kernel took itself for the first, and only a group's first 32 work-items'
     // share of the work was done right.
-    if (m.target() == gcn::Target::Gfx1200) {
+    if (gcn::is_gfx12(m.target())) {
       w.ttmp[9] = gx;
       w.ttmp[7] = (gy & 0xFFFF) | gz << 16;
       w.ttmp[8] = (i & 0x1F) << 25;

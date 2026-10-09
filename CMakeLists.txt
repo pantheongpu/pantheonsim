@@ -45,6 +45,7 @@ set(VGPU_PROFILES
   amd/mi300x
   amd/mi325x
   amd/mi350x
+  amd/mi455x
   amd/rx7900xtx
   amd/rx9070xt
   amd/rx6900xt
@@ -1138,6 +1139,9 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   # way round, and a register per work-item id.
   add_test(NAME test_amd_gcn_${_t}_gfx1030 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1030 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1030")
+  # And for gfx1250 (CDNA 5, MI455X): gfx12's encodings with its additions, built by ROCm's clang.
+  add_test(NAME test_amd_gcn_${_t}_gfx1250 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1250 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1250")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
@@ -1195,7 +1199,7 @@ set_tests_properties(test_amd_amd_smi_radeon PROPERTIES ENVIRONMENT
   "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
 # What ROCm Validation Suite asks AMD SMI (clock levels, temperature, power, energy,
 # ECC) on every other profile: the sensors and counters follow each one's class.
-foreach(_g mi250x mi325x mi350x rx6900xt rx9070xt)
+foreach(_g mi250x mi325x mi350x mi455x rx6900xt rx9070xt)
   file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
   add_test(NAME test_amd_amd_smi_rvs_${_g} COMMAND test_amd_amd_smi rvs)
   set_tests_properties(test_amd_amd_smi_rvs_${_g} PROPERTIES ENVIRONMENT

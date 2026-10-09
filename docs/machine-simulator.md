@@ -21,6 +21,7 @@ build/bin/vgpu shell
     amd/mi300x     AMD Instinct MI300X          192 GiB
     amd/mi325x     AMD Instinct MI325X          256 GiB
     amd/mi350x     AMD Instinct MI350X          288 GiB
+    amd/mi455x     AMD Instinct MI455X          432 GiB
 
   GPU model [nvidia/h100]: nvidia/h200
   How many GPUs [1]: 8

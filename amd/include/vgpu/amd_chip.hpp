@@ -34,6 +34,9 @@ struct Chip {
 inline Chip chip(const char* architecture) {
   const auto is = [&](const char* a) { return std::strcmp(architecture, a) == 0; };
   if (is("cdna4")) return {"gfx950", "HBM3E", 1, 4, 32, 1, 8, 32, 4096, 256, 8192, 2000, 24};  // MI350X: 8 XCDs of 4 engines
+  // MI455X: 8 compute dies of 32 workgroup processors, 12 HBM4 stacks of 2048 bits, 192 MB of cache. The rest
+  // (L1, L2, engine counts, firmware) AMD has not published; chosen like gfx950's.
+  if (is("cdna5")) return {"gfx1250", "HBM4", 2, 2, 8, 1, 8, 32, 4096, 192, 24576, 3200, 0};
   if (is("cdna2")) return {"gfx90a", "HBM2E", 1, 4, 8, 1, 1, 16, 8192, 0, 4096, 1600};      // MI250X, one die
   if (is("rdna3")) return {"gfx1100", "GDDR6", 2, 2, 6, 2, 1, 32, 6144, 96, 384, 2500};     // RX 7900 XTX, Navi 31
   if (is("rdna4")) return {"gfx1201", "GDDR6", 2, 2, 4, 2, 1, 32, 8192, 64, 256, 2518};     // RX 9070 XT, Navi 48
