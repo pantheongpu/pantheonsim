@@ -252,6 +252,21 @@ for run in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt"; do
   done
 done
 
+# A gfx1031 card refuses code built for gfx1030, as the real card's runtime does, until
+# HSA_OVERRIDE_GFX_VERSION=10.3.0 makes it report itself as gfx1030 (what PyTorch's wheels, which carry no
+# gfx1031 kernels, need on an RX 6700 XT). Any other value is ignored.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6700xt LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2.gfx1030" 2>&1)
+expect "an RX 6700 XT is refused code built for gfx1030 (no check of the program's passes)" "0" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6700xt HSA_OVERRIDE_GFX_VERSION=11.0.0 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2.gfx1030" 2>&1)
+expect "another override changes nothing" "0" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6700xt HSA_OVERRIDE_GFX_VERSION=10.3.0 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/rdna2.gfx1030" 2>&1)
+expect "HSA_OVERRIDE_GFX_VERSION=10.3.0 runs gfx1030 code on it" "13 of 13" \
+  "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 13"
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/rx6700xt HSA_OVERRIDE_GFX_VERSION=10.3.0 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/smid.all" 2>&1)
+expect "and HIP then names the device gfx1030" "gfx1030: 20 of 20 multiprocessors" "$(cut -d, -f1 <<< "$out")"
+
 # Streams that run at once, as a card's do (hipcc/streams.cpp). Each waiting
 # kernel gives up after a bounded time, so a runtime that ran the streams one
 # after another fails these rather than hanging.

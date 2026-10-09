@@ -393,6 +393,15 @@ hipError_t ensure_runtime(State& s) {
   } catch (const std::exception& e) {
     return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
   }
+  // HSA_OVERRIDE_GFX_VERSION=10.3.0 makes ROCm's runtime report a gfx103x card (an RX 6700 XT's gfx1031) as
+  // gfx1030, so the code objects built for gfx1030 -- the only RDNA2 kernels PyTorch and the ROCm libraries
+  // ship -- load on it. The two share an instruction set. No other override is honoured: the code of another
+  // family would not run on the card.
+  if (const char* o = std::getenv("HSA_OVERRIDE_GFX_VERSION");
+      o && std::strcmp(o, "10.3.0") == 0 && p.gcn_arch.rfind("gfx103", 0) == 0 && p.gcn_arch != "gfx1030") {
+    p.gcn_arch_full.replace(0, p.gcn_arch.size(), "gfx1030");
+    p.gcn_arch = "gfx1030";
+  }
   // The devices a program is shown, as ROCm shows them: ROCR_VISIBLE_DEVICES
   // picks from the machine's, then HIP_VISIBLE_DEVICES (or
   // CUDA_VISIBLE_DEVICES) from those -- each a list read up to the first

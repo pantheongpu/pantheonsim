@@ -1406,10 +1406,11 @@ add_test(NAME amd_pytorch_rx6900xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run
 set_tests_properties(amd_pytorch_rx6900xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # And on a gfx1031 card (Navi 22, the RX 6700 XT): the same instruction set as gfx1030 under a target
-# name of its own, which PyTorch's kernels must be found for.
+# name of its own. PyTorch's wheels carry no gfx1031 kernels, so, as on the card, it runs with
+# HSA_OVERRIDE_GFX_VERSION=10.3.0 and loads the gfx1030 ones.
 add_test(NAME amd_pytorch_rx6700xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx6700xt)
 set_tests_properties(amd_pytorch_rx6700xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};HSA_OVERRIDE_GFX_VERSION=10.3.0" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.
 add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)

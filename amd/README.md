@@ -510,6 +510,7 @@ does on the card.
   - occupancy from gfx10.3's register file.
 - **Checks:** the executor's unit kernels pass on gfx1030 (ctests `*_gfx1030`), and `tests/hipcc/rdna2.cpp` checks SDWA, M0-relative registers, the permlanes and the DPP modes, in wave32 and wave64. The hipcc-built programs for textures, `__smid`, work-group shapes, the memory test and `rdna2.cpp` were also run on a real RX 6800 and RX 6700 XT, and give the same answers there as on the simulated cards.
 - **Where a wave runs:** `HW_ID1` carries the SIMD a wave is on (bits 9:8) as well as its workgroup processor. On gfx10.3 a card puts the waves of a group on SIMDs 0, 2, 1, 3 in turn and moves to the next slot after four; the simulator does the same, so HIP's `__smid` (whose lowest bit is the SIMD's) takes two values within a group, as on the card. `HW_ID2` is not modelled and a wave that reads it is refused by name.
+- **`HSA_OVERRIDE_GFX_VERSION=10.3.0`:** an RX 6700 XT reports itself as gfx1030, as ROCm's runtime does, so the code PyTorch and the ROCm libraries ship for gfx1030 (they carry no gfx1031 kernels) loads on it; without it that code is refused. Other values are ignored.
 - **sRGB textures:** the card's conversion to linear is approximate (within 2e-3 of the exact curve in the middle of the range); the simulator's is exact.
 
 `VGPU_TRACE_WAVE=1` prints each instruction a work-group's first wave runs,
