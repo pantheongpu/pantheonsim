@@ -279,7 +279,7 @@ inline bool parse_sps(const uint8_t* rbsp, size_t n, Sps* s) {
   s->direct_8x8_inference = static_cast<int>(b.u(1));
   s->cropping = b.u(1) != 0;
   if (s->cropping)
-    for (int i = 0; i < 4; ++i) s->crop[i] = static_cast<int>(b.ue());
+    for (int i = 0; i < 4; ++i) s->crop[i] = static_cast<int>(std::min<uint32_t>(b.ue(), 1u << 20));
   s->vui_present = b.u(1) != 0;
   if (s->vui_present) {
     s->aspect_present = b.u(1) != 0;
@@ -622,9 +622,13 @@ inline bool parse_slice_header(BitReader& b, const HeaderCtx& c, int nal_ref_idc
       }
     }
   }
-  if (c.cabac && !h->is_intra()) h->cabac_init_idc = static_cast<int>(b.ue());
+  if (c.cabac && !h->is_intra()) {
+    h->cabac_init_idc = static_cast<int>(b.ue());
+    if (h->cabac_init_idc > 2) return false;
+  }
   h->slice_qp_delta = b.se();
   h->qp = c.pic_init_qp + h->slice_qp_delta;
+  if (h->qp < 0 || h->qp > 51) return false;   // SliceQPY ranges over -QpBdOffsetY..51; 8-bit samples only here
   if (h->slice_type == kSP || h->slice_type == kSI) {
     if (h->slice_type == kSP) b.u(1);
     b.se();
@@ -633,8 +637,10 @@ inline bool parse_slice_header(BitReader& b, const HeaderCtx& c, int nal_ref_idc
     h->disable_deblocking_filter_idc = static_cast<int>(b.ue());
     if (h->disable_deblocking_filter_idc > 2) return false;
     if (h->disable_deblocking_filter_idc != 1) {
-      h->alpha_c0_offset = b.se() * 2;
-      h->beta_offset = b.se() * 2;
+      const int32_t a = b.se(), bt = b.se();
+      if (a < -6 || a > 6 || bt < -6 || bt > 6) return false;
+      h->alpha_c0_offset = a * 2;
+      h->beta_offset = bt * 2;
     }
   }
   if (c.num_slice_groups > 1 && c.slice_group_map_type >= 3 && c.slice_group_map_type <= 5) {

@@ -408,6 +408,13 @@ struct H264Parser::Impl {
     i.disp_right = i.coded_w - s.crop[1] * cux;
     i.disp_top = s.crop[2] * cuy;
     i.disp_bottom = i.coded_h - s.crop[3] * cuy;
+    const bool crop_ok = s.crop[0] >= 0 && s.crop[1] >= 0 && s.crop[2] >= 0 && s.crop[3] >= 0 && s.crop[0] <= i.coded_w && s.crop[1] <= i.coded_w &&
+                         s.crop[2] <= i.coded_h && s.crop[3] <= i.coded_h && i.disp_right > i.disp_left && i.disp_bottom > i.disp_top;
+    if (!crop_ok) {   // a cropping rectangle outside the picture (not a conforming stream): the whole picture
+      i.disp_left = i.disp_top = 0;
+      i.disp_right = i.coded_w;
+      i.disp_bottom = i.coded_h;
+    }
     i.progressive = s.frame_mbs_only != 0;
     i.chroma_format = s.chroma_format_idc;
     i.bit_depth_luma_minus8 = s.bit_depth_luma - 8;

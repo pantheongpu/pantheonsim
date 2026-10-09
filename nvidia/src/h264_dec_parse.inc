@@ -285,7 +285,7 @@ int Dec::cabac_residual_block(int cat, int cbf_inc, int max_coef, int* levels, b
     if (abs_m1 == 0) ++num_eq1;
     else ++num_gt1;
     const int level = abs_m1 + 1;
-    levels[sig_pos[k]] = cab_.bypass() ? -level : level;
+    levels[sig_pos[k]] = std::max(-(1 << 17), std::min(cab_.bypass() ? -level : level, 1 << 17));   // a conforming level fits 16 bits
   }
   return n;
 }
@@ -412,7 +412,7 @@ int Dec::cavlc_residual_block(int nC, int max_coef, int* levels) {
   for (int i = tc - 1; i >= 0; --i) {
     coeff_num += run[i] + 1;
     if (coeff_num >= max_coef) return -1;
-    levels[coeff_num] = level[i];
+    levels[coeff_num] = std::max(-(1 << 17), std::min(level[i], 1 << 17));   // a conforming level fits 16 bits
   }
   return tc;
 }
@@ -495,7 +495,7 @@ bool Dec::parse_residual() {
     for (int s = 0; s < 4; ++s) {
       const int blk = b8 * 4 + s;
       const int bx = blk_x(blk), by = blk_y(blk);
-      std::memset(levels, 0, 16 * sizeof(levels[0]));
+      std::fill_n(levels, 16, 0);
       int n;
       const int maxc = i16 ? 15 : 16;
       if (cabac_) {
@@ -530,7 +530,7 @@ bool Dec::parse_residual() {
     for (int c = 0; c < 2; ++c)
       for (int b = 0; b < 4; ++b) {
         const int bx = b & 1, by = b >> 1;
-        std::memset(levels, 0, 16 * sizeof(levels[0]));
+        std::fill_n(levels, 16, 0);
         int n;
         if (cabac_) n = cabac_residual_block(4, cabac_cbf_ctx(4, c, bx, by), 15, levels, fscan);
         else n = cavlc_residual_block(nc_chroma(c, bx, by), 15, levels);

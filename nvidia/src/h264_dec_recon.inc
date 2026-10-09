@@ -17,6 +17,10 @@ inline int norm8(int m, int i, int j) {
   return kNorm8[m][k];
 }
 
+// Scaled coefficients of a conforming stream fit 16 bits (8.5.12.1 limits them); a damaged stream may not, and
+// saturating at 2^20 keeps every transform in int32 without changing the conforming ones.
+inline int32_t sat_coef(int64_t v) { return static_cast<int32_t>(v > (1 << 20) ? (1 << 20) : (v < -(1 << 20) ? -(1 << 20) : v)); }
+
 // 4x4 inverse transform (8.5.12.2) of the scaled coefficients d (raster) added to dst.
 void idct4_add(int32_t* d, uint8_t* dst, int stride) {
   int t[16];
@@ -84,7 +88,7 @@ void scale4(const int32_t* c, int qp, const uint8_t* ws, bool dc_given, int32_t*
       continue;
     }
     const int ls = ws[k] * norm4(m, k >> 2, k & 3);
-    d[k] = qp >= 24 ? (c[k] * ls) << (sh - 4) : (c[k] * ls + (1 << (3 - sh))) >> (4 - sh);
+    d[k] = sat_coef(qp >= 24 ? (static_cast<int64_t>(c[k]) * ls) * (int64_t{1} << (sh - 4)) : (static_cast<int64_t>(c[k]) * ls + (1 << (3 - sh))) >> (4 - sh));
   }
 }
 
@@ -96,7 +100,7 @@ void scale8(const int32_t* c, int qp, const uint8_t* ws, int32_t* d) {
       continue;
     }
     const int ls = ws[k] * norm8(m, k >> 3, k & 7);
-    d[k] = qp >= 36 ? (c[k] * ls) << (sh - 6) : (c[k] * ls + (1 << (5 - sh))) >> (6 - sh);
+    d[k] = sat_coef(qp >= 36 ? (static_cast<int64_t>(c[k]) * ls) * (int64_t{1} << (sh - 6)) : (static_cast<int64_t>(c[k]) * ls + (1 << (5 - sh))) >> (6 - sh));
   }
 }
 
@@ -229,7 +233,9 @@ void Dec::recon_intra() {
         for (int i = 8; i < 16; ++i) nb.top[1 + i] = nb.top[1 + 7];
       }
       // reference sample filtering (8.3.2.2.1)
-      int ft[17], fl[8];
+      int ft[17], fl[8];   // a mode that needs unavailable samples is not a conforming stream; it reads 128s
+      std::fill_n(ft, 17, 128);
+      std::fill_n(fl, 8, 128);
       ft[0] = nb.top[0];
       if (nb.top_av) {
         if (nb.tl) ft[1] = (nb.top[0] + 2 * nb.top[1] + nb.top[2] + 2) >> 2;
@@ -288,6 +294,8 @@ void Dec::gather_intra_nb(int xo, int yo, int n, bool tr_blocked, IntraNb* nb) {
 
 void Dec::predict_intra16(int mode) {
   int top[16], left[16], tl = 128;
+  std::fill_n(top, 16, 128);
+  std::fill_n(left, 16, 128);
   bool top_av = true, left_av = true, tl_av = false;
   auto get = [&](int x, int y, int* out) -> bool {
     const Nb l = locate_l(x, y);
@@ -341,6 +349,8 @@ void Dec::predict_chroma(int mode) {
   for (int c = 0; c < 2; ++c) {
     uint8_t* dst = c == 0 ? lu_ : lv_;
     int top[8], left[8], tl = 128;
+    std::fill_n(top, 8, 128);
+    std::fill_n(left, 8, 128);
     bool top_av = true;
     bool left_av[2] = {true, true};   // upper and lower half
     auto get = [&](int x, int y, int* out) -> bool {
@@ -429,7 +439,7 @@ void Dec::add_residual_luma() {
     }
     const int ls0 = pp_.ws4[0][0] * kNorm4[qp % 6][0];
     for (int k = 0; k < 16; ++k) {
-      dc[k] = qp >= 36 ? (f[k] * ls0) << (qp / 6 - 6) : (f[k] * ls0 + (1 << (5 - qp / 6))) >> (6 - qp / 6);
+      dc[k] = sat_coef(qp >= 36 ? (static_cast<int64_t>(f[k]) * ls0) * (int64_t{1} << (qp / 6 - 6)) : (static_cast<int64_t>(f[k]) * ls0 + (1 << (5 - qp / 6))) >> (6 - qp / 6));
     }
     for (int blk = 0; blk < 16; ++blk) {
       const int bx = blk_x(blk), by = blk_y(blk);
@@ -475,7 +485,7 @@ void Dec::add_residual_chroma() {
     int f[4] = {cd[0] + cd[1] + cd[2] + cd[3], cd[0] - cd[1] + cd[2] - cd[3], cd[0] + cd[1] - cd[2] - cd[3], cd[0] - cd[1] - cd[2] + cd[3]};
     const int ls0 = ws[0] * kNorm4[qpc % 6][0];
     int dcc[4];
-    for (int k = 0; k < 4; ++k) dcc[k] = ((f[k] * ls0) << (qpc / 6)) >> 5;
+    for (int k = 0; k < 4; ++k) dcc[k] = sat_coef(((static_cast<int64_t>(f[k]) * ls0) * (int64_t{1} << (qpc / 6))) >> 5);
     uint8_t* dst = c == 0 ? lu_ : lv_;
     for (int b = 0; b < 4; ++b) {
       int32_t cc[16];

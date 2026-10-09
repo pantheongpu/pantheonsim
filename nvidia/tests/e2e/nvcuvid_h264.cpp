@@ -9,7 +9,7 @@
 // One line per fact. nvcuvid_h264.rtx3060.txt is what the card printed;
 // run_nvcuvid.sh compares this program's output with it.
 //
-//   nvcuvid_h264 [--dump DIR] [--only NAME] DATA_DIR
+//   nvcuvid_h264 [--dump DIR] [--only NAME] [--skip NAME,NAME] [--tolerance N] [--update DIR] DATA_DIR
 #include <dlfcn.h>
 #include <cuda.h>
 
@@ -391,17 +391,18 @@ static void play(const std::string& name, const std::vector<uint8_t>& data, cons
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::string base, only, codecs = "h264";
+  std::string base, only, skip, codecs = "h264";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) dump_dir = argv[++i];
     else if (!std::strcmp(argv[i], "--update") && i + 1 < argc) update_dir = argv[++i];
     else if (!std::strcmp(argv[i], "--tolerance") && i + 1 < argc) tolerance = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--codecs") && i + 1 < argc) codecs = argv[++i];
     else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
+    else if (!std::strcmp(argv[i], "--skip") && i + 1 < argc) skip = argv[++i];
     else base = argv[i];
   }
   if (base.empty()) {
-    std::fprintf(stderr, "usage: nvcuvid_h264 [--dump DIR] [--only NAME] DATA_DIR\n");
+    std::fprintf(stderr, "usage: nvcuvid_h264 [--dump DIR] [--only NAME] [--skip NAMES] DATA_DIR\n");
     return 2;
   }
   data_dir = base;
@@ -521,6 +522,7 @@ int main(int argc, char** argv) {
   auto load = [&](const char* n) { return slurp(base + "/h264/" + n + ".h264"); };
   for (const char* n : names) {
     if (!only.empty() && only != n) continue;
+    if (("," + skip + ",").find(std::string(",") + n + ",") != std::string::npos) continue;
     const std::vector<uint8_t> data = load(n);
     if (data.empty()) {
       std::printf("FAIL: %s/h264/%s.h264 is missing\n", base.c_str(), n);

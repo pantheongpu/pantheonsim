@@ -3,20 +3,24 @@
 // Neighbouring samples gathered for Intra_NxN prediction: top[0] is the corner p[-1,-1], top[1 + x] is p[x, -1]
 // (x < 2n), left[y] is p[-1, y].
 struct IntraNb {
-  int top[1 + 16];
-  int left[8];
+  int top[1 + 16] = {128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128};
+  int left[8] = {128, 128, 128, 128, 128, 128, 128, 128};
   bool tl = false, top_av = false, tr_av = false, left_av = false;
 };
 
 class Dec {
  public:
-  Dec(Frame* cur, const PicParams& pp) : cur_(cur), pp_(pp), hc_(header_ctx(pp)) {}
+  Dec(Frame* cur, const PicParams& pp) : cur_(cur), pp_(pp), hc_(header_ctx(pp)) {
+    // a reference picture of another size (the stream changed size without an IDR picture) cannot be predicted from
+    auto& d = pp_.dpb;
+    d.erase(std::remove_if(d.begin(), d.end(), [&](const DpbEntry& e) { return !e.frame || e.frame->mbs_w != pp.mbs_w || e.frame->mbs_h != pp.mbs_h || e.frame->y.empty(); }), d.end());
+  }
   bool run(const std::vector<SliceData>& slices, std::string* err);
 
  private:
   // ---- picture ----
   Frame* cur_;
-  const PicParams& pp_;
+  PicParams pp_;
   HeaderCtx hc_;
   PicData* pd_ = nullptr;
   int W_ = 0, H_ = 0, nmb_ = 0;        // picture size in macroblocks (a field has half the frame's height)

@@ -225,9 +225,40 @@ card's to within one level on the baseline and restart-interval fixtures
 (`nvidia/tests/data/jpeg`, card output in `nvidia/tests/data/nvdec`). The
 subset is sequential 8-bit Huffman JPEG; the card refuses progressive pictures
 (`CUDA_ERROR_INVALID_IMAGE`, the picture's status `Error`) and four-component
-ones (the parser skips them), and so does this. Every other codec reports
-`bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser` answer
-`CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, H.264, HEVC, VP8, VP9
+ones (the parser skips them), and so does this. **H.264 is decoded too**, by a decoder written from ITU-T H.264 (03/2009) alone
+(`nvidia/src/h264_decode.cpp`, `h264_dec_*.inc`; the CAVLC, CABAC, scan, QP and
+deblocking tables are extracted from the Recommendation's PDF by
+`nvidia/tools/gen_h264_tables.py`, which is how a transcription error is kept out)
+and a video parser (`h264_parser.cpp`) that produces the sequence, decode and
+display callbacks. H.264 output is defined sample for sample, so a conformant
+decoder is bit-exact: Baseline, Main and High progressive 4:2:0 8-bit streams with
+CAVLC or CABAC, I, P and B slices, 4x4 and 8x8 transforms, scaling matrices,
+explicit and implicit weighted prediction, spatial and temporal direct prediction,
+multiple slices and references, long-term references, every deblocking setting,
+odd sizes with cropping, all decode to the checksums of the card's NVDEC
+(`nvidia/tests/data/h264`: 33 streams in 85 parser-driving runs; the card's
+transcript is `nvcuvid_h264.rtx3060.txt`, 12 991 lines, and holds the CRC-32 of
+every displayed frame, with `run_nvcuvid_h264.sh --card` running the same program
+against the driver). The parser reproduces what the card's does and the Recommendation
+leaves open: when a picture is complete, the number of decode surfaces it asks for,
+the picture indices handed out, the reference slots of every picture, display order,
+display delay, and timestamps (given, derived and absent); the rules were fitted to
+the card's callbacks. Where the fit is approximate it is
+listed in the test: with `ulMaxDisplayDelay` above one on a stream with B pictures, and
+around IDR pictures, the interleaving of display callbacks with later decode callbacks
+is the card's only to within one picture. A rescaled surface (a target size that
+is not the display area) is the card's scaler approximated: bilinear to enlarge,
+area-averaging to shrink by more than half, compared with the card's pixels to within
+one level. The capability answer is the card's: H.264 4:2:0 8-bit, 48x16 to 4096x4096,
+and 4:0:0, 4:2:2, 4:4:4 and every deeper bit depth are reported unsupported;
+`cuvidCreateDecoder` refuses them as the card does (`CUDA_ERROR_NOT_SUPPORTED`),
+as it does the `H264_SVC` codec type. Not decoded: macroblock-adaptive frame/field
+frames and PAFF (field) pictures, flexible macroblock ordering, redundant
+pictures, SP/SI slices. Pictures that cannot be decoded report
+`CUDA_ERROR_INVALID_IMAGE` from `cuvidDecodePicture`; damaged streams never crash
+(`test_h264_decode` flips bits in streams under ASan and UBSan). Every other codec
+reports `bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser`
+answer `CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, HEVC, VP8, VP9
 and AV1 engines, and a software decoder for them is a large separate project --
 none is here, so an application falls back to its CPU decoder instead of
 receiving a wrong picture. `cuvidCreateVideoSource` (files and URLs) needs a
