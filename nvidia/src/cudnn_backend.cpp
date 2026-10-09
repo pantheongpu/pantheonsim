@@ -2650,12 +2650,63 @@ struct Runner {
   cudnnStatus_t run_op(const Op& op);
 };
 
-// Attention's dropout decision for element (b, h, i, j) of the [B, H, Sq,
-// Skv] probabilities: kept (1) with probability 1 - p.
-// The same draw and test as the RNG operation's Bernoulli with probability
-// 1 - p, so the single operation and the composite graph agree.
-double dropout_keep(uint64_t seed, uint64_t offset, size_t linear, double p) {
-  return unit(draw(seed, offset, linear)) < 1.0 - p ? 1.0 : 0.0;
+// Attention's dropout mask for the [B, H, Sq, Skv] probabilities: 1 where an element is kept (chance 1 - p), else 0.
+//
+// This is the layout of cuDNN's fused attention kernels' dropout, measured on an RTX 3060 (cuDNN 9, the graph API's SDPA
+// node, rng_dump read back; black-box -- the values were read off the card by bisecting the probability, never from
+// its code). Each element draws a 16-bit number r from a Philox4x32-7 call (seven rounds, key = {seed low, seed high}),
+// and is kept when r <= floor((1 - p) * 65536), in float. A call covers eight elements, two 32-bit words each holding
+// two halves (low half first), and the call an element belongs to is picked by its position (i, j) in its (b, h) plane:
+//
+//   counter = {c0, c1, c2, c3} = the 128-bit number  (tile << 64) + (offset + ri) / 4 + 8 * (b * H + h) + (j % 8)
+//     tile = i / 16 + ceil(Sq / 16) * (j / 16)          the 16x16 tile, numbered down the rows first
+//     ri   = (i % 8) / 2                                 offset advances by one for every second row of eight
+//   the half taken, 0..7 = word * 2 + (low ? 0 : 1):    (i % 2) + 2 * ((j / 8) % 2) + 4 * ((i / 8) % 2)
+//
+// (so rows i, i + 2, i + 4, i + 6 of a group of eight draw from counters that differ only through ri, which is why
+// they agree until the offset reaches into the next counter). The offset is the graph's offset tensor read as a signed
+// 64-bit number; for a negative offset the card's value of every eighth column was not matched (a negative offset is
+// not a meaningful input, and the others are right), and the layout was checked on batches and heads up to 4 x 8,
+// sequence lengths 1 to 1000 (not multiples of 16 included), head sizes 32 to 256, half and bfloat16, seeds and
+// offsets up to 2^62 -- all bit for bit. Where the card's kernel does not write the dump (a single query row over
+// 257 to 512 keys writes only the first 32 columns of every 128) nothing was observable, and the same formula is used.
+void sdpa_dropout_mask(uint64_t seed, int64_t offset, int64_t B, int64_t H, int64_t Sq, int64_t Skv, double p, std::vector<double>* mask) {
+  typedef unsigned __int128 u128;
+  mask->assign(static_cast<size_t>(B * H * Sq * Skv), 0.0);
+  const float threshold = std::floor((1.0f - static_cast<float>(p)) * 65536.0f);
+  const int64_t rows = (Sq + 15) / 16, cols = (Skv + 15) / 16;
+  const uint32_t k0 = static_cast<uint32_t>(seed), k1 = static_cast<uint32_t>(seed >> 32);
+  for (int64_t bh = 0; bh < B * H; ++bh)
+    for (int64_t ri = 0; ri < 4; ++ri) {
+      const u128 base = static_cast<u128>(static_cast<__int128>((offset + ri) >> 2) + 8 * bh);
+      for (int64_t ib = 0; ib < rows; ++ib)
+        for (int64_t jb = 0; jb < cols; ++jb) {
+          const u128 tile = static_cast<u128>(ib + rows * jb) << 64;
+          for (int64_t c = 0; c < 8; ++c) {
+            const u128 n = tile + base + static_cast<u128>(c);
+            uint32_t v[4] = {static_cast<uint32_t>(n), static_cast<uint32_t>(n >> 32), static_cast<uint32_t>(n >> 64),
+                             static_cast<uint32_t>(n >> 96)};
+            uint32_t k[2] = {k0, k1};
+            for (int r = 0; r < 7; ++r) {
+              const uint64_t p0 = 0xD2511F53ull * v[0], p1 = 0xCD9E8D57ull * v[2];
+              const uint32_t n0 = static_cast<uint32_t>(p1 >> 32) ^ v[1] ^ k[0], n2 = static_cast<uint32_t>(p0 >> 32) ^ v[3] ^ k[1];
+              v[0] = n0, v[1] = static_cast<uint32_t>(p1), v[2] = n2, v[3] = static_cast<uint32_t>(p0);
+              k[0] += 0x9E3779B9u, k[1] += 0xBB67AE85u;
+            }
+            // The elements of this call: rows 2 * ri + {0, 1} (+ 8 for the second half) of the tile, columns c and c + 8.
+            for (int64_t hi = 0; hi < 2; ++hi)
+              for (int64_t hj = 0; hj < 2; ++hj)
+                for (int64_t par = 0; par < 2; ++par) {
+                  const int64_t i = ib * 16 + hi * 8 + 2 * ri + par, j = jb * 16 + hj * 8 + c;
+                  if (i >= Sq || j >= Skv) continue;
+                  const int k_half = static_cast<int>(par + 2 * hj + 4 * hi);
+                  const uint32_t w = v[k_half / 2];
+                  const uint32_t r16 = (k_half % 2) ? (w >> 16) : (w & 0xffffu);
+                  (*mask)[static_cast<size_t>(((bh * Sq) + i) * Skv + j)] = static_cast<float>(r16) <= threshold ? 1.0 : 0.0;
+                }
+          }
+        }
+    }
 }
 
 // Scaled dot-product attention, forward and backward, as cuDNN's fused
@@ -2761,12 +2812,9 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
     std::vector<double> mask;
     if (op.dropout > 0.0) {
       const uint64_t seed = static_cast<uint64_t>(static_cast<int64_t>((*in[op.role[kSeed]])[0]));
-      const uint64_t offset = static_cast<uint64_t>(static_cast<int64_t>((*in[op.role[kOffset]])[0]));
-      mask.resize(nS);
-      for (size_t e = 0; e < nS; ++e) {
-        mask[e] = dropout_keep(seed, offset, e, op.dropout);
-        P[e] *= mask[e] / (1.0 - op.dropout);
-      }
+      const int64_t offset = static_cast<int64_t>((*in[op.role[kOffset]])[0]);
+      sdpa_dropout_mask(seed, offset, B, Hq, Sq, Skv, op.dropout, &mask);
+      for (size_t e = 0; e < nS; ++e) P[e] *= mask[e] / (1.0 - op.dropout);
     }
     double amax_s = 0.0, amax_o = 0.0;
     if (fp8)

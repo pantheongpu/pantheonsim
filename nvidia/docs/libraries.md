@@ -551,13 +551,23 @@ grouped-query heads; bias and its gradient; padding; paged K and V caches; packe
 sequences; an interleaved layout; dropout -- and NVIDIA's library agrees in
 every one it has an engine for (it has none for float's backward pass), as
 VirtualGPU does in all of them. Dropout keeps each probability with chance
-1 - p from a Philox4x32-10 stream keyed by the graph's seed and offset, as
-cuDNN documents its RNG operation, and the backward pass regenerates the
-forward pass's mask from the same pair; the mask's layout is cuDNN's
-kernel's own (on an RTX 3060 it repeats with the row's position in an MMA
-tile and depends on the sequence length's tiling) and is not reproduced, so
-the kept fraction, scaling and reproducibility match while the individual
-elements kept differ. Also measured and matched: max pooling's index tensor
+1 - p, and the unified operation's mask is the card's, element for element:
+each element is a 16-bit number from a Philox4x32-**7** call keyed by the
+seed, kept when it is at most floor((1 - p) * 65536); a call covers eight
+elements and is picked by the 16x16 tile (numbered down the rows first), the
+column mod 8, the batch-and-head plane (eight counters apart), and the offset
+(a quarter of it, plus one for every second row of eight). Measured on the RTX
+3060 through the rng_dump tensor and by bisecting the probability (nothing
+read from cuDNN's code), `e2e_dnn_sdpa_mask` holds the layout on the host and
+checks it on both, over lengths from 1 to 1000 (multiples of 16 or not),
+batches and heads up to 4 x 8, head sizes 32 to 256, half and bfloat16, seeds
+past 32 bits and offsets past 2^32. Two edges: a negative offset is not
+matched for every eighth column, and a single query row over 257 to 512 keys
+leaves most of the dump unwritten on the card (the same formula is used there).
+Seeds and offsets are read through a double, so those past 2^53 lose their low
+bits. The composite graph's RNG operation is not the unified node's generator
+(it follows the documented Philox4x32-10 stream); the unified node's
+backward pass with dropout was not examined. Also measured and matched: max pooling's index tensor
 is INT8, the maximum's row-major position within its window with padded taps
 counted, and the backward pass may read it in place of x; nearest and
 bilinear resampling refuse a window other than 2 when the descriptor is
@@ -653,6 +663,7 @@ runs them; each is a ctest of its own.
 | `e2e_dnn_multigpu_norm` | multi-GPU batch normalization, forward and backward, half and float, two GPUs and two threads, peer tensors in pinned host memory | apex-style synchronized batch norm through cudnn-frontend |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch/group norm forward and backward, backward without saved statistics, max and average pooling both ways, max pooling's index tensor, asymmetric padding, concatenation, statistics generation, RNG, reshape, transpose, slice, an INT8x4 vectorized convolution | `cudnn_convolution_add_relu`, cudnn-frontend |
 | `e2e_dnn_fp8_attention`, `e2e_dnn_fp8_attention_frontend` | per-tensor FP8 attention forward (descale of Q, K, V and S, scale of S and O, amax of S and O) on a Hopper profile, built from the backend API and by cudnn-frontend's `sdpa_fp8`, against the documented formulas (documentation-derived; no card), and MXFP8's refusal | Transformer Engine's FP8 attention |
+| `e2e_dnn_sdpa_mask` | the unified attention node's dropout mask (the rng_dump tensor) cell by cell against a host model of the card's layout (Philox4x32-7, 16x16 tiles, row groups, heads), 21 shapes, offsets, seeds and types, and the output over the kept probabilities; run on the RTX 3060 too (`run_dnn_card.sh dnn_sdpa_mask`) | `scaled_dot_product_attention` with dropout through cuDNN |
 | `e2e_dnn_attention` | cuDNN scaled dot-product attention built by cudnn-frontend 1.30 (fetched): the unified and composite forms forward and backward, causal (both alignments) and sliding-window masks, bias, grouped-query heads, padding, paged K/V caches, ragged sequences, dropout, half/bfloat16/float | `scaled_dot_product_attention` with the cuDNN backend, Transformer Engine |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -1265,8 +1276,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   newer than this stack's), band-matrix and standalone RoPE operations (no
   engine on the RTX 3060, the only GPU measured; whether Hopper and Blackwell
   have one was not checked: the AWS H100 launch for it was denied), and the
-  dropout mask layout of the fused attention kernels (the mask is drawn from
-  the documented Philox generator but not placed as the kernels place it; the
+  (the unified attention node's dropout mask is the card's, element for element; see the cuDNN section)
   classic API's dropout, RNN and multi-head attention included, is cuDNN's own
   bit for bit); in the classic API, the fused ops cuDNN's header marks
   "reserved for future use" (`CONV_SCALE_BIAS_ADD_ACTIVATION` and the two
