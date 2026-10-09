@@ -151,13 +151,12 @@ static void exchange() {
 
   cudaStream_t s;
   cudaStreamCreate(&s);
-  int bad = 3;
-  cudaStreamCaptureMode b;
-  std::memcpy(&b, &bad, sizeof bad);
-  IS(cudaStreamBeginCapture(s, b), cudaErrorInvalidValue);
-  bad = -1;
-  std::memcpy(&b, &bad, sizeof bad);
-  IS(cudaStreamBeginCapture(s, b), cudaErrorInvalidValue);
+  // These numbers are no mode, and holding one in an enum-typed object is undefined behaviour (UBSan reports it):
+  // the mode is an int in the ABI, so call the entry point as taking one.
+  using BeginWithInt = cudaError_t (*)(cudaStream_t, int);
+  const BeginWithInt begin_with_int = reinterpret_cast<BeginWithInt>(&cudaStreamBeginCapture);
+  IS(begin_with_int(s, 3), cudaErrorInvalidValue);
+  IS(begin_with_int(s, -1), cudaErrorInvalidValue);
   cudaStreamDestroy(s);
 }
 

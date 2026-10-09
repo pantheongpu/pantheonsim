@@ -470,10 +470,6 @@ static void fetches() {
     std::vector<uint8_t> blocks(blocky ? (size_t)bw * bh * f.block_bytes : (size_t)bw * 4 * bh * 4 * texel_bytes(f));
     for (auto& b : blocks) b = next_byte();
     for (int pass = 0; pass < 5; ++pass) {
-      // Linear filtering of signed 8-bit normalized texels is refused by name in the simulator (the card's
-      // result is not a plain rounded weighted sum and has not been reproduced), so the three linear passes
-      // are left out for those formats; point sampling (passes 3 and 4) is checked.
-      if (f.code >= 0xc6 && f.code <= 0xc8 && pass < 3) continue;
       observe(std::string("fetch/") + f.name + "/pass" + std::to_string(pass), fetch_array(f, blocks, bw, bh, pass));
     }
   }
