@@ -304,8 +304,8 @@ the real card's but for the IDs and the BAR addresses, and the
 host's firmware chose. Other cards use the generic layout.
 
 An NVIDIA GPU whose id NVIDIA has not published (`nvidia/vr200`, `nvidia/thor`)
-carries a placeholder id from 0xFE00 up, above every id in NVIDIA's open kernel
-modules name table; `vgpu regs export` says so in the file's header. See
+carries a placeholder id (0x7F10, 0x7F11: in no entry of NVIDIA's open kernel
+modules name table, and below 0x8000 so CUDA's signed id does not overflow); `vgpu regs export` says so in the file's header. See
 `nvidia/docs/profiles.md`.
 
 `--space mmio` on an NVIDIA GPU is its BAR0 (`nvidia/registers/mmio.yaml`).

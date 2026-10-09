@@ -974,9 +974,15 @@ std::string export_registers(const std::string& profile, const telemetry::Device
       "# (registers/pci-config.yaml, <vendor>/registers/mmio.yaml) and the profile.\n"
       "# Change those and regenerate: a test fails\n"
       "# when this file and what they give differ. docs/registers.md has the details.\n";
-  // A PCI id from 0xFE00 up is this project's placeholder: NVIDIA's open GPU
-  // kernel modules name table ends at 0xC838, and has no id yet for the part.
-  if (std::strcmp(d.vendor, "nvidia") == 0 && (d.pci_device_id >> 16) >= 0xFE00u) {
+  // The ids this project made up for GPUs NVIDIA has published none for
+  // (Rubin, Jetson Thor). Each is in no entry of NVIDIA's open GPU kernel modules
+  // name table, and below 0x8000, as a real id is: CUDA reports the id as
+  // (device << 16 | vendor) in a signed int. Add an id here when a profile gets one.
+  constexpr uint32_t kPlaceholderNvidiaIds[] = {0x7F10, 0x7F11};
+  const bool placeholder = std::strcmp(d.vendor, "nvidia") == 0 &&
+                           std::find(std::begin(kPlaceholderNvidiaIds), std::end(kPlaceholderNvidiaIds),
+                                     d.pci_device_id >> 16) != std::end(kPlaceholderNvidiaIds);
+  if (placeholder) {
     std::snprintf(line, sizeof line, "#\n# THE PCI DEVICE ID BELOW (0x%04x) IS A PLACEHOLDER, not NVIDIA's: NVIDIA has not\n",
                   d.pci_device_id >> 16);
     out += line;

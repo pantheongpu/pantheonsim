@@ -13,17 +13,17 @@
 # Change those and regenerate: a test fails
 # when this file and what they give differ. docs/registers.md has the details.
 #
-# THE PCI DEVICE ID BELOW (0xfe10) IS A PLACEHOLDER, not NVIDIA's: NVIDIA has not
+# THE PCI DEVICE ID BELOW (0x7f10) IS A PLACEHOLDER, not NVIDIA's: NVIDIA has not
 # published an id for this GPU. Replace it, in the profile's telemetry
 # pci_device_id, when NVIDIA does, and regenerate this file.
 
 profile: nvidia/vr200
-pci_device_id: 0xfe10
+pci_device_id: 0x7f10
 layout: generic
 
 config:
   vendor_id:                   [0x000, 16, ro, 0x10de]
-  device_id:                   [0x002, 16, ro, 0xfe10]
+  device_id:                   [0x002, 16, ro, 0x7f10]
   command:                     [0x004, 16, rw, 0x0406]
   status:                      [0x006, 16, ro, 0x0010]
   revision:                    [0x008, 8, ro, 0xa1]
@@ -38,7 +38,7 @@ config:
   bar4:                        [0x020, 32, bar, 0x00002080, bar.4]
   bar5:                        [0x024, 32, bar, 0x00000000, bar.5]
   subsystem_vendor_id:         [0x02c, 16, ro, 0x10de]
-  subsystem_id:                [0x02e, 16, ro, 0xfe10]
+  subsystem_id:                [0x02e, 16, ro, 0x7f10]
   expansion_rom:               [0x030, 32, ro, 0x00000000]
   capabilities_pointer:        [0x034, 8, ro, 0x60]
   interrupt_line:              [0x03c, 8, rw, 0xff]

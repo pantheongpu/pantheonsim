@@ -1,10 +1,11 @@
 # VirtualGPU device profile: NVIDIA Rubin (Vera Rubin, VR200; compute capability 10.7).
 # Public values; verified: false -- nothing here has been measured on a card.
 #
-# !! The PCI device id below (0xFE10) is a PLACEHOLDER, not NVIDIA's. NVIDIA has
+# !! The PCI device id below (0x7F10) is a PLACEHOLDER, not NVIDIA's. NVIDIA has
 # !! not published a Rubin id: NVIDIA's open GPU kernel modules name table
-# !! (g_nv_name_released.h) has no Rubin entry. 0xFE10 is above every id in that
-# !! table (the highest is 0xC838), so it collides with no NVIDIA part. Replace it
+# !! (g_nv_name_released.h) has no Rubin entry. 0x7F10 is in no entry of that
+# !! table, so it collides with no NVIDIA part, and is below 0x8000 because CUDA reports
+# !! (device << 16 | vendor) as a signed int. Replace it
 # !! when NVIDIA publishes one, as the MI300X and MI350X placeholders are.
 #
 # Where each value comes from:
@@ -63,7 +64,7 @@ telemetry:
   sm_clock_max_mhz: 1965          # unpublished; the B200's until measured
   mem_clock_max_mhz: 4000         # unpublished; the B200's until measured
   pci_vendor_id: 4318             # 0x10DE NVIDIA
-  pci_device_id: 65040            # 0xFE10: PLACEHOLDER, NVIDIA has published no Rubin id (see the header)
+  pci_device_id: 32528            # 0x7F10: PLACEHOLDER, NVIDIA has published no Rubin id (see the header)
   ecc: true                       # copied from the other HBM parts; unpublished
   memory: hbm
   pcie_link: "Gen6 x16"           # NVIDIA: "x16 PCIe Gen 6"

@@ -1707,8 +1707,8 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `nvidia/b300` | NVIDIA | Blackwell Ultra | 10.3 | **no** |
 | `nvidia/rtx5090` | NVIDIA | Blackwell | 12.0 | **no** |
 | `nvidia/gb200` | NVIDIA | Blackwell | 10.0 | **no** (B200's limits; memory from NVIDIA's per-superchip figure) |
-| `nvidia/vr200` | NVIDIA | Rubin | 10.7 | **no** (placeholder PCI id 0xFE10) |
-| `nvidia/thor` | NVIDIA | Blackwell | 11.0 | **no** (placeholder PCI id 0xFE11; SM count derived) |
+| `nvidia/vr200` | NVIDIA | Rubin | 10.7 | **no** (placeholder PCI id 0x7F10) |
+| `nvidia/thor` | NVIDIA | Blackwell | 11.0 | **no** (placeholder PCI id 0x7F11; SM count derived) |
 | `nvidia/rtx-pro-6000` | NVIDIA | Blackwell | 12.0 | **no** |
 | `nvidia/gb10` | NVIDIA | Blackwell | 12.1 | **no** (SM count derived from the 6,144 CUDA cores) |
 | `nvidia/rtx4090` | NVIDIA | Ada | 8.9 | **no** |
