@@ -1920,7 +1920,7 @@ if(TARGET vgpucublas)
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_frontend:cudnn"
                           "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
                           "dnn_attn_dropout:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_decomp_paths:cutensornet"
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_state_gradient:cutensornet" "cutensornet_decomp_paths:cutensornet"
                           "solver_metis_paths:cusolver:cusparse"
                           "blas_u8gemm_paths:cublas" "blas_emulation_paths:cublas" "sparse_color_paths:cusparse"
                           "lt_emulation_paths:cublasLt:cublas")

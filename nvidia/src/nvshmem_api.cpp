@@ -27,8 +27,10 @@
 // stores and loads, quiet and fence are fences, barriers and signals are
 // stores and polling.
 //
-// Not here: the MPI and OpenSHMEM bootstraps (refused by name; use the unique
-// ID), PEs on more than one node, NVLink SHARP multicast (nvshmemx_mc_ptr is
+// MPI, OpenSHMEM and PMIx also give the job (the application's own MPI or
+// OpenSHMEM library, or libpmix, see "bootstraps through a launcher" below).
+//
+// Not here: the PMI-1 and PMI-2 bootstraps through libpmi, PEs on more than one node, NVLink SHARP multicast (nvshmemx_mc_ptr is
 // NULL, as on hardware without it), and host-side reductions. Device-side
 // atomics between PEs are atomic within a process but not across the PE
 // processes; nvidia/docs/libraries.md says so.

@@ -16,8 +16,10 @@
 // descriptor-and-plan API, slice groups, the optimizer configuration and
 // information (with packing), tensor descriptors, QR, SVD with every
 // truncation and partition option, and gate splitting. The state API
-// (states, operators, expectations, marginals, samplers, MPS projection),
-// gradients and distributed execution answer NOT_SUPPORTED.
+// (states, operators, expectations, marginals, samplers, MPS), gradients of
+// networks and of expectation values, and distributed execution (the
+// communicator, slices dealt to ranks, sums of their outputs) are implemented;
+// the MPS projection and distributed tensors answer NOT_SUPPORTED.
 //
 // What is ours. The contraction path is found by a greedy pairwise search
 // and slicing picks the contracted modes that shrink the largest
@@ -2836,7 +2838,7 @@ const SvdConfig kDefaultSvd{};
 // truncated, normalized and partitioned as the configuration asks.
 Status do_svd(Handle* h, const TensorDesc& in, const void* x, TensorDesc& ud, void* u, void* sv, TensorDesc& vd, void* v,
               const SvdConfig* cfg, SvdInfo* out_info, const Workspace* w, cudaStream_t stream, const char* api,
-              bool own_host = false) {
+              bool own_host = false, int* solver_info = nullptr) {
   if (!x || !u || !v) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "a data pointer is null");
   if (!cfg) cfg = &kDefaultSvd;
   const cudaDataType_t t = in.type;
@@ -2940,6 +2942,10 @@ Status do_svd(Handle* h, const TensorDesc& in, const void* x, TensorDesc& ud, vo
       break;
   }
   cudaStreamSynchronize(stream);
+  if (solver_info) {
+    *solver_info = 0;
+    cudaMemcpy(solver_info, info, sizeof(int), cudaMemcpyDeviceToHost);
+  }
   std::vector<cd> hu, hvt, hs;
   if (!download(U, t, (size_t)(mm * nn), hu) || !download(VT, t, (size_t)(nn * nn), hvt) ||
       !download(S, real_bytes(t) == 8 ? CUDA_R_64F : CUDA_R_32F, (size_t)nn, hs))

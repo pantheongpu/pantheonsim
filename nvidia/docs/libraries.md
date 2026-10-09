@@ -243,9 +243,26 @@ address space: the single-node, all-peer-to-peer case of NVSHMEM, where a
 kernel's store to a peer's heap is a store to shared memory. The PEs meet
 through a rendezvous file named by the job's unique ID
 (`nvshmemx_get_uniqueid` and `NVSHMEMX_INIT_WITH_UNIQUEID`, the bootstrap that
-needs no MPI) or, for scripts, `VGPU_NVSHMEM_RANK`, `VGPU_NVSHMEM_NPES` and
-`VGPU_NVSHMEM_ID`; `nvshmem_init()` with neither is a job of one PE, as with
-NVIDIA's library outside a launcher.
+needs no MPI), by an MPI communicator (`NVSHMEMX_INIT_WITH_MPI_COMM`,
+`nvshmemx_set_attr_mpi_comm_args`, `NVSHMEM_BOOTSTRAP=MPI`), by OpenSHMEM
+(`NVSHMEMX_INIT_WITH_SHMEM`, `NVSHMEM_BOOTSTRAP=SHMEM`) or by PMIx
+(`NVSHMEM_BOOTSTRAP=PMI` with `NVSHMEM_BOOTSTRAP_PMI=PMIX`, which needs pmix.h when the
+simulator is built and libpmix.so.2 when it runs), or, for scripts,
+`VGPU_NVSHMEM_RANK`, `VGPU_NVSHMEM_NPES` and `VGPU_NVSHMEM_ID`; `nvshmem_init()` with none
+of these (and PMI, the default, without libpmi.so) is a job of one PE, as with
+NVIDIA's library outside a launcher. NVSHMEM's bootstraps are plugin libraries that call MPI,
+OpenSHMEM or PMIx; here the job's rank, size and one token come through the application's own MPI
+(Open MPI's or MPICH's handles, found by name in the process) or OpenSHMEM, or through
+libpmix, and `NVSHMEM_BOOTSTRAP=plugin` accepts NVSHMEM's own plugin file names
+(`nvshmem_bootstrap_mpi.so.3`, `_shmem`, `_pmix`, `_pmi`, `_pmi2`) and nothing else. The
+settings NVSHMEM refuses are refused here with its words
+(`bogus` and `UID` without init flags, a PMI kind it does not know, a plugin that is not named or
+cannot be opened). `e2e_nvshmem_bootstrap` runs these as MPI and OpenSHMEM jobs of two PEs and compares
+the shim with what NVIDIA's NVSHMEM 3.8 did on an RTX 3060 (`run_nvshmem_bootstrap.sh --card`).
+PEs on one GPU make NVSHMEM's multiple-processes-per-GPU mode, status 3
+(`NVSHMEM_STATUS_LIMITED_MPG`): the card ran its two PEs only that way, and so does the status
+here for PEs with the same device index. The status after `nvshmem_finalize()` stays
+bootstrapped (1) for every launcher's bootstrap and is 0 for a unique ID's, as measured.
 
 The host API is implemented here: the symmetric heap, blocking, strided,
 typed and stream-ordered puts and gets, signals, barriers, teams (strided and
@@ -281,12 +298,15 @@ adding into one word at once lose no update (`e2e_ipc` races two processes'
 kernels on CUDA-IPC memory; `e2e_host_atomics` races a kernel against host
 atomics).
 
-Card ground truth is thin: on an RTX 3060 under WSL NVIDIA's library
-initializes a job of one PE and then has no symmetric heap (`nvshmem_malloc`
-returns NULL), and two 3060s have no peer-to-peer path. What a multi-PE job
+Card ground truth is thin: on two RTX 3060s under WSL NVIDIA's library starts no job of PEs on
+two different GPUs (the cards have no peer access, so the topology refuses with
+`Peer GPU 1 is not accessible`, `NVSHMEMX_ERROR_NOT_SUPPORTED`, and the program exits with 255), and
+two PEs on one GPU run in its multiple-processes-per-GPU mode with a working heap; this simulator's
+RTX 3060 profile reports peer access, so PEs on two simulated 3060s start here. What a multi-PE job
 computes here follows NVSHMEM's documentation, and so does all of the typed API above
 (none of it has been compared with a card). `e2e_nvshmem_host` runs the host
-API in jobs of one and three PEs; `e2e_nvshmem_device` runs the device API in a
+API in jobs of one and three PEs (the three share a GPU when the machine has fewer, and
+are then in the multiple-processes-per-GPU mode); `e2e_nvshmem_device` runs the device API in a
 job of three, and skips unless NVIDIA's NVSHMEM is installed (`NVSHMEM_HOME`, or
 the `nvidia-nvshmem-cu13` pip package), since its headers and device library
 are not the simulator's to ship.
@@ -348,6 +368,34 @@ documentation and is followed: `cutensorCreatePlan` requires a plan
 preference, a contraction refuses an alignment of 0, CONJ is refused on real
 data, and a repeated mode is that operand's diagonal.
 
+### cuTensorNet distributed over MPI
+
+`cutensornetDistributedResetConfiguration` takes a communicator (`MPI_Comm`, by pointer and size) and,
+as in NVIDIA's library, the communication goes through the library `$CUTENSORNET_COMM_LIB` names,
+which exports the table `cutensornetCommInterface` (`cutensornet/typesDistributed.h`, version 2;
+cuQuantum ships `cutensornet_distributed_interface_mpi.c` to build one). Every choice was measured on
+NVIDIA's library 2.14 on two RTX 3060s with a communication library that logs each primitive it is asked
+for (`nvidia/tests/e2e/cutn_comm_mpi.c`, which also stages the device buffers through the host since the
+Open MPI of a distribution is not CUDA-aware):
+
+* A reset asks the old communicator for a barrier, then the new one for its rank, a barrier and the size
+  of its shared-memory group; the library opens `$CUTENSORNET_COMM_LIB` at the first reset. A missing library
+  is `DISTRIBUTED_FAILURE` only when a communicator is given, a library without the table (or with another version)
+  is that either way; a primitive that fails is `DISTRIBUTED_FAILURE` (`INTERNAL_ERROR` for the rank and size
+  queries of the Get calls and of a reset). Without a communicator the world is one rank.
+* A contraction (`cutensornetNetworkContract`, `cutensornetContractSlices`) deals the slices of the
+  group, or all of them, round robin to the ranks (the i-th of a group to rank i modulo the size, in the order a
+  hash set of the ids iterates, which `std::unordered_set` with room for one more reproduces), clears the
+  output unless it accumulates (an accumulating call adds to each rank's own output, so the sum holds the old
+  one once per rank), and sums the outputs in place. The optimizer slices to at least one slice per rank and
+  leaves every rank the plan of the lowest estimate. `cutensornetContraction` of one slice does not communicate.
+* The state API's amplitudes, marginals, expectation values and norms are summed the same way. An expectation
+  value of at least as many terms as ranks gives rank r the terms c with c modulo the size equal to r,
+  whole and with that rank's coefficients, and sums once; with fewer, every term is contracted by all
+  ranks and summed on its own.
+* `cutensornetCreateDistributedTensorDescriptor` needs a configured communicator
+  (`NOT_INITIALIZED` without) and gathers a word from every rank; NVIDIA's library then loads NCCL.
+
 What each library chooses for itself is not NVIDIA's. Kernel selection is not
 modelled, so every workspace estimate is zero and a plan cache entry records
 the problem only (which plans NVIDIA's cache keeps is its own rule). The
@@ -376,10 +424,10 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration (user-space file system handles register but, as on the card, do no I/O), batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
 | nvCOMP | `libnvcomp.so.5`, `libnvcomp_cpu.so.5` | the low-level batched API and the C++ manager API for LZ4 (bitshuffle included), Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, CRC32, streaming gzip compression, and the CPU GDeflate library; Cascaded, Bitcomp and ANS refused (no public bitstream) |
-| NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID: every type of the RMA lists (half and bfloat16 included) with nonblocking, strided and stream-ordered forms, typed collectives and reductions, atomics, waits in stream order, teams (also from a unique ID); the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
+| NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID, MPI, OpenSHMEM or PMIx: every type of the RMA lists (half and bfloat16 included) with nonblocking, strided and stream-ordered forms, typed collectives and reductions, atomics, waits in stream order, teams (also from a unique ID); the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
 | cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32, int8 (into int8, int32, fp16, bf16) and, on an sm_89 profile, E4M3 and E5M2 (into fp16, bf16, fp32) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
-| cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition; the gesvd, gesvdj, gesvdp and gesvdr algorithms) and gate splitting on cuSOLVER; gradients of a network. Built on the simulator's cuTENSOR and cuSOLVER |
+| cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition; the gesvd, gesvdj, gesvdp and gesvdr algorithms) and gate splitting on cuSOLVER; gradients of a network and of a state's expectation value; distributed execution over an MPI communication library. Built on the simulator's cuTENSOR and cuSOLVER |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ at run time with the toolkit's own NVRTC: PTX, the cubin of an sm_ target, LTO-IR, OptiX-IR, precompiled headers, time tables (below) |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; LTO-IR through the toolkit's linker (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- compressed as NVIDIA's are, that the driver loads |
@@ -615,6 +663,9 @@ runs them; each is a ctest of its own.
 | `e2e_fft_callbacks` | LTO load and store callbacks in C2C (strided, batched, callerInfo), R2C, Z2Z and C2R; what cufftXtSetJITCallback and planning refuse; libcufft.so's NOT_IMPLEMENTED legacy callbacks | cuFFT callbacks (CUDA 12.6+) |
 | `e2e_fft_legacy_callbacks` | `cufftXtSetCallback`: `CUFFT_NOT_IMPLEMENTED` from the shim and from NVIDIA's `libcufft.so` (`--card --dynamic`); with `--card`, the documented route through NVIDIA's static cuFFT on an RTX 3060 (load and store callbacks in C2C, R2C, Z2Z, C2R; callerInfo; clearing one), which cannot run on the simulator | cuFFT callbacks (before CUDA 12.6) |
 | `e2e_fft_lto_callbacks` | `cufftXtSetJITCallback` given as LTO-IR (nvcc -dlto): C2C, R2C, Z2Z with separate load and store images; passes against NVIDIA's cuFFT on an RTX 3060 (`--card`), and on the simulator where the host has the CUDA toolkit | cuFFT callbacks (CUDA 12.6+) |
+| `e2e_cutensornet_state_gradient` | the gradients of a state's expectation value (`cutensornetExpectationComputeWithGradientsBackward`): PyTorch's convention for complex data, checked against finite differences of the forward value for one-mode and two-mode gates, strided buffers, mixed states and the norm's adjoint; the zeros for adjoint gates and gates outside the light cone; overwrite and accumulate; the arguments and their order; real and single-precision states | quantum tensor-network libraries |
+| `e2e_cutensornet_mpi` | cuTensorNet over MPI (Open MPI, two and three ranks, one simulated GPU each): the communicator calls and the primitives behind each, which rank contracts which slice, the sums, failing primitives, the state API's sums and an expectation value's terms, libraries that cannot be loaded; the checks pass against NVIDIA's library on two RTX 3060s (`run_cutensornet_mpi.sh --card`) | multi-GPU quantum simulation |
+| `e2e_nvshmem_bootstrap` | NVSHMEM bootstrapped by an MPI communicator, `NVSHMEM_BOOTSTRAP=MPI`, the MPI plugin by name, PMIx, OpenSHMEM and PMI without its library, and the settings it refuses; the shim and NVIDIA's NVSHMEM 3.8 on an RTX 3060 print the same (`run_nvshmem_bootstrap.sh --card`) | multi-GPU jobs |
 | `e2e_cutensornet_decomp_paths` | cuTensorNet's SVD with every algorithm (reconstruction, singular values, residual and sweeps, error in sigma, gesvdr's host scratch and rank rule), half precision and capture refusals, workspace statuses, network gradients (real and complex, overwrite and accumulate, argument errors) | quantum tensor-network libraries |
 | `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
 | `e2e_solver_sparse_paths` | cusolverSp: LU, QR and Cholesky solves in S/D/C/Z with every reorder, singularity, least squares, shift-inverse eigenvalues, reorderings (NVIDIA's permutations for symrcm, symamd, symmdq), permutations, batched QR | `scipy`-style sparse solves |
@@ -1361,9 +1412,28 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   answer NOT_SUPPORTED. A permutation whose input has a mode its output lacks
   is planned by NVIDIA's library and writes zeros on an RTX 3060; here its
   plan is refused (NOT_SUPPORTED).
-- **cuTensorNet**: the state API's gradients (`cutensornetStateApplyTensorOperatorWithGradient`,
-  `cutensornetExpectationComputeWithGradientsBackward`), the MPS projection,
-  distributed execution and the undocumented exports answer NOT_SUPPORTED. Network gradients
+- **cuTensorNet**: the MPS projection, distributed tensor descriptors
+  (`cutensornetCreateDistributedTensorDescriptor`, whose distributed QR and SVD need NCCL,
+  cuTensorMp and cuSOLVERMp: NVIDIA's library answers NOT_SUPPORTED on a machine without NCCL and
+  so does this one on any, after the argument checks that library makes first) and the
+  undocumented exports answer NOT_SUPPORTED. Distributed execution is done for contractions and
+  the state API's amplitudes, marginals and expectation values (see below): not done are the
+  sampler's exchange of samples (every rank samples alone, with the same seed), the hyper-optimizer
+  exchanges of the preparation calls (the search here is deterministic, so the optimizer and the
+  state API's prepare calls keep what each rank finds; the optimizer does exchange its plan, as
+  NVIDIA's does), and a PMI or NCCL communication library (the interface is the MPI one,
+  `cutensornetCommInterface` of `$CUTENSORNET_COMM_LIB`). Gradients of an expectation value are done
+  (`cutensornetExpectationComputeWithGradientsBackward`, PyTorch's convention, measured on an RTX
+  3060 and checked against finite differences; a distributed handle refuses them, as NVIDIA's
+  does at prepare). A state's MPS honours its SVD algorithm; what differs from NVIDIA's there: its
+  gesvdj with a loose tolerance gives a less accurate MPS and with few sweeps ends StateCompute
+  with INTERNAL_ERROR (the cuSOLVER here is exact and does neither), its gesvdp differs from gesvd's in
+  the seventh digit of the norm (here it is exact), and its gesvdr always ends StateCompute with
+  INTERNAL_ERROR, as here. Where the card's distributed contraction has a defect it is kept: the
+  clearing and the sum cover the first `volume` elements of the output buffer whatever strides it
+  has, so an output with padding comes out wrong where the padding is (measured). The profile of an
+  RTX 3060 here reports peer access between two cards, which the real cards do not have, so the
+  NVSHMEM job that NVIDIA's library refuses on two GeForce GPUs starts here. Network gradients
   (`cutensornetNetworkComputeGradientsBackward`) are done and match NVIDIA's on an RTX 3060:
   a real network's gradient is the adjoint contracted with the other tensors, a complex
   one is the adjoint times the conjugate of the other tensors; they are computed as
@@ -1438,14 +1508,20 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   sources, and the card's decode of truncated or damaged pictures (the card
   returns success with whatever its engine makes of them; a picture the host
   decoder cannot parse is `CUDA_ERROR_INVALID_IMAGE` here).
-- **NVSHMEM**: the MPI and OpenSHMEM bootstraps (refused by name: use the
-  unique ID; OpenMPI is installed on the host used here but `mpirun` does not start a job on
-  it, so a bootstrap through MPI could be written and not run), PEs on more than one node
+- **NVSHMEM**: the PMI-1 and PMI-2 bootstraps through libpmi.so and libpmi2.so (the machine this was
+  made on has neither, and there NVIDIA's library makes a job of one PE too; with them present NVIDIA's
+  would form a job from Slurm's or MPICH's launcher, which was not checked and is not done here), bootstrap
+  plugins other than NVSHMEM's own (`NVSHMEM_BOOTSTRAP=plugin`), the UID bootstrap through sockets
+  (`NVSHMEM_BOOTSTRAP=UID`, which needs init flags in NVIDIA's too), PEs on more than one node
   and proxy or network transports, NVLink SHARP multicast (`nvshmemx_mc_ptr` is NULL), the
   device API's own proxy and IBGDA paths (never taken: every PE is a peer), regions
   (`nvshmemx_region_start` and `_stop` answer a refusal), queue pairs, externally mapped
-  symmetric buffers, and the PMI bootstrap a launcher gives `nvshmem_init()`. NVSHMEM_MAX_TEAMS
-  is read (default 32 here, 256 on NVIDIA's: each team costs symmetric heap).
+  symmetric buffers. The MPI bootstrap reads the handles of Open MPI and of the MPICH family; the
+  OpenSHMEM one needs `shmem_getmem` and symmetric allocation of the application's library. NVSHMEM_MAX_TEAMS
+  is read (default 32 here, 256 on NVIDIA's: each team costs symmetric heap). PEs on one GPU report the
+  multiple-processes-per-GPU status (3) and nothing else of its limits: the features NVIDIA's disables there
+  stay on. An OpenSHMEM job under Open MPI crashes now and then in UCX on the machine this was made on, with
+  NVIDIA's NVSHMEM and with a plain `shmem_init` program alike; the test runs such a job again.
 - **NVRTC**: without the toolkit's libnvrtc on the machine, LTO-IR, OptiX-IR
   and Tile IR output and the precompiled-header and time-trace options (NVVM
   bitcode and vendor formats only NVIDIA's NVRTC writes: refused by name; the
