@@ -5418,6 +5418,7 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
       d.mip_filter = mipfilter == cudaFilterModeLinear ? vgpu::exec::TexFilter::Linear
                                                        : vgpu::exec::TexFilter::Point;
+      d.max_aniso = tex->maxAnisotropy;
       d.mip_bias = q(tex->mipmapLevelBias);
       d.mip_min = q(tex->minMipmapLevelClamp);
       d.mip_max = q(tex->maxMipmapLevelClamp);

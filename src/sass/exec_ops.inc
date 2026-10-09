@@ -52,10 +52,10 @@ bool executes(const Instr& ins) {
       if (shape == 9) return fmt != 0;
       return false;
     }
-    case Op::TEX: case Op::TLD: case Op::TLD4: {
+    case Op::TEX: case Op::TLD: case Op::TLD4: case Op::TXD: {
       const Word& w = ins.w;
       const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59
-      const unsigned lod = ins.op == Op::TLD4 ? 0
+      const unsigned lod = ins.op == Op::TLD4 || ins.op == Op::TXD ? 0
                            : bw               ? static_cast<unsigned>(w.field(59, 1) | (w.field(87, 2) << 1))
                                               : static_cast<unsigned>(w.field(87, 3));
       if (lod == 4 || lod == 5 || (ins.op == Op::TEX && lod == 2)) return false;   // LOD clamps, bias
@@ -115,7 +115,7 @@ exec::InstClass inst_class(Op op) {
       return C::Control;
     case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: case Op::LD: case Op::ST:
     case Op::LDC: case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::RED: case Op::LDGSTS: case Op::LDSM:
-    case Op::SULD: case Op::SUST: case Op::TEX: case Op::TLD: case Op::TLD4: case Op::MEMBAR: case Op::CCTL:
+    case Op::SULD: case Op::SUST: case Op::TEX: case Op::TLD: case Op::TLD4: case Op::TXD: case Op::MEMBAR: case Op::CCTL:
       return C::Memory;
     case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM:
     case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
@@ -164,7 +164,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
       case Op::RED: case Op::LDGSTS: case Op::LDGDEPBAR: case Op::LDSM: case Op::STSM:
         exec_mem(blk, w, ins, ex);
         break;
-      case Op::TEX: case Op::TLD: case Op::TLD4: case Op::SULD: case Op::SUST:
+      case Op::TEX: case Op::TLD: case Op::TLD4: case Op::TXD: case Op::SULD: case Op::SUST:
         exec_tex(blk, w, ins, ex);
         break;
       case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MATCH: case Op::REDUX:
@@ -2457,7 +2457,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const uint32_t dims = cube ? 3 : (dim & 3) + 1;
   // The LOD mode (87-89; from sm_100 split, its low bit at 59). A fetch's
   // (TLD) is explicit, so sm_100's 0 means .LZ.
-  unsigned lod_mode = ins.op == Op::TLD4 ? 0
+  const bool txd = ins.op == Op::TXD;   // tex.grad: no LOD mode, the gradients come in registers
+  unsigned lod_mode = ins.op == Op::TLD4 || txd ? 0
                       : m_.sm >= 100    ? static_cast<unsigned>(word.field(59, 1) | (word.field(87, 2) << 1))
                                         : static_cast<unsigned>(word.field(87, 3));
   if (ins.op == Op::TLD && m_.sm >= 100 && lod_mode == 0) lod_mode = 1;
@@ -2469,6 +2470,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   // offsets, is no PTX form and was refused by executes().
   const bool has_off = ins.f[3] == 1, has_dc = ins.f[4] != 0;
   if (ins.f[3] > 1) fault(w, ins, 0, "texture fetches with per-texel offsets are not implemented", Err::UnsupportedPtx);
+  if (txd && (has_off || has_dc))
+    fault(w, ins, 0, "tex.grad with offsets or a depth reference is not implemented in the SASS engine (the register layout was not measured); run with VGPU_SASS=0", Err::UnsupportedPtx);
   if (ins.op == Op::TEX && lod_mode == 2)
     fault(w, ins, 0, "texture fetches with a LOD bias are not implemented yet", Err::UnsupportedPtx);
   const unsigned n0 = (layered ? 1 : 0) + dims, n1 = (has_lod ? 1 : 0) + (has_off ? 1 : 0) + (has_dc ? 1 : 0);
@@ -2493,8 +2496,20 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     f.layered = layered;
     f.cube = cube;
     unsigned k = 0;
-    if (layered) f.layer = comp[k++];
+    if (layered && !txd) f.layer = comp[k++];
     for (unsigned i = 0; i < dims; ++i) f.coord[i] = comp[k++];
+    if (layered && txd) f.layer = comp[k++];   // TXD puts the layer after the coordinates
+    if (txd) {
+      // ddx.x, ddy.x, ddx.y, ddy.y in four registers from the one at 32 (the second pair only for a 2D texture).
+      const unsigned gr = static_cast<unsigned>(word.field(32, 8));
+      f.grad = true;
+      f.ddx[0] = rd(gr, l);
+      f.ddy[0] = rd(gr + 1, l);
+      if (dims >= 2) {
+        f.ddx[1] = rd(gr + 2, l);
+        f.ddy[1] = rd(gr + 3, l);
+      }
+    }
     f.float_coords = !int_coords;
     // The result's type is the texture's (its format and read mode), not
     // the instruction's: SASS has one TEX for every PTX destination type.

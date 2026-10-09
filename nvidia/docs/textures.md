@@ -296,16 +296,37 @@ on the card. A resource view reinterprets the same bytes as another format of th
 size (a `uint2` array as BC1 blocks, with four times the extent); the read mode is checked
 against the array's own format, then the view.
 
+## tex.grad
+
+The level of detail of a fetch with explicit gradients (`tex2DGrad` and friends) is derived from them by the
+texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D and 2D textures, layered or
+not, of power-of-two size (the program `texture_grad` hashes 96,000 fetches of the card on both engines). It was
+found by reading the level of detail straight off the card: a mipmapped texture whose level k holds the constant
+k, filtered trilinearly, returns the LOD in 1/256ths of a level itself, and about 5 million such fetches (random
+and gridded gradients of every size, sign and relation) were fitted. What the card does is in
+`include/vgpu/exec/texture_grad.hpp`: every gradient component is cut to 10 significant bits; the length of a
+gradient is the larger component plus 11/32 of the smaller (the smaller's mantissa times 11/8, rounded half up);
+the largest of the lengths of dPdx and dPdy and 11/16 of the lengths of dPdx + dPdy and dPdx - dPdy (the quad's
+diagonals; their components are added with one guard bit below the larger's last bit) is taken; and log2 of it
+comes from a 256-entry table indexed by the top 8 bits of the mantissa, added to 256 times the exponent. The result
+is truncated to 1/256ths like an explicit LOD, then the level bias and clamps apply as for `tex.level`; a gradient of
+zero (or NaN) is a level of minus infinity, an infinite one the last level. A texture that is not mipmapped is
+fetched at level 0 whatever the gradients. The level of a gradient is not `log2` of its Euclidean length: a pair
+of parallel gradients along one axis reads 1.375 times as long as either, the octagonal norm that earlier
+measurements ran into.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
 
-- **`tex.grad`.** The level of detail comes out of the GPU's approximate log2 and
-  length units, and 12,000 fetches of an RTX 3060 on a texture whose levels each hold
-  their own number do not follow any formula tried: with one dominant gradient it is
-  the log2 of its length to within a few 256ths, but with two comparable ones it
-  runs up to 25% longer than either, and neither the Euclidean length nor the largest
-  component nor an alpha-max-beta-min sum of one gradient explains it.
+- **`tex.grad` beyond the cases that are exact.** 1D and 2D textures (and their layered forms; SASS `TXD`) of
+  power-of-two size derive their level of detail from the gradients exactly as the card does (below). Not
+  reproduced, and refused by name: 3D and cube textures (the card's length of three gradient components is
+  larger + 11/32 middle + 1/4 smallest to a part in a thousand, but its rounding was not recovered, and ptxas
+  builds those fetches from quads of `TEX.NDV` instructions in SASS); textures whose size is not a power of two
+  (the card's product of a gradient and the size is rounded in a way that none of the pipelines tried
+  reproduces: about one fetch in ten differs by one or two 256ths of a level); and a texture with
+  `maxAnisotropy` above 1 (the card then filters along the major axis of the gradients' ellipse).
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.

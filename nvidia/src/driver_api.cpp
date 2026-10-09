@@ -3999,6 +3999,7 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
       std::memcpy(d.border_bits, t->border, sizeof d.border_bits);
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
       d.mip_filter = t->mip_filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
+      d.max_aniso = t->max_anisotropy;
       d.mip_bias = q(t->mip_bias);
       d.mip_min = q(t->mip_min);
       d.mip_max = q(t->mip_max);

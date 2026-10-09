@@ -1668,8 +1668,9 @@ scripts/run-pantheon-workloads.sh.
    every sample matched bit for bit (weights in 1/256ths split z, x, y with
    measured rounding sides, one exact sum rounded ties-away, 1D as 2D at
    y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
-   of results against the hardware's. Refused by name: `tex.grad` (its LOD
-   comes from undocumented approximate units). (BC1 to BC7, 10:10:10:2, resource views, any anisotropy, linear
+   of results against the hardware's. `tex.grad` is done for 1D and 2D
+   textures (layered or not) of power-of-two size, bit for bit (round 4; see "Textures" in nvidia/docs/textures.md).
+   (BC1 to BC7, 10:10:10:2, resource views, any anisotropy, linear
    filtering of signed 8-bit normalized texels and `tld4` on layered and
    cubemap textures are done: nvidia/docs/textures.md). The `.clamp`/`.zero` surface policies are done, as an
    RTX 3060 applies them. See nvidia/docs/textures.md. Border
@@ -1974,8 +1975,11 @@ are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking w
 
 Still open, each with the reason:
 
-- `tex.grad`: the level of detail an RTX 3060 derives from gradients fits no formula tried (12,000 fetches
-  measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
+- `tex.grad` on 3D and cube textures (ptxas builds those from quads of `TEX.NDV` fetches in SASS; the card's
+  length of three gradient components is max + 11/32 mid + 1/4 min to a part in a thousand, its rounding not
+  recovered), on textures whose size is not a power of two (the card's scaling of the gradients by the size is
+  rounded in a way no tried pipeline reproduces; about one fetch in ten differs by 1-2 256ths of a level) and with
+  `maxAnisotropy` above 1; `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
   fetches, measured; the runtime accepts any `maxAnisotropy` and does not model that).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
   `.ue5m3x2` and UE5M3 scale factors: the ISA gives no exponent bias; `tcgen05.mma.ashift` and

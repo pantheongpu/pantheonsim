@@ -62,6 +62,9 @@ struct TextureDesc {
   uint32_t mip_slice = 0;
   TexFilter mip_filter = TexFilter::Point;
   int32_t mip_bias = 0, mip_min = 0, mip_max = 0;
+  // cudaTextureDesc::maxAnisotropy as given (0 reads as 1). Only tex.grad looks at it: a fetch with gradients
+  // is the one place anisotropic filtering acts, and it is not modelled (see texture_fetch).
+  uint32_t max_aniso = 1;
   uint32_t pitch_bytes = 0; // distance between rows; width*texel_bytes if dense
   uint32_t channels = 1;    // 1..4
   uint32_t channel_bits[4] = {32, 0, 0, 0};
@@ -121,6 +124,9 @@ struct TexFetch {
   bool float_result = true;    // f32 destination (else s32/u32)
   bool explicit_lod = false;
   double lod = 0;
+  // tex.grad: dPdx and dPdy in the texture's coordinate units, one float per spatial coordinate (register bits).
+  bool grad = false;
+  uint32_t ddx[3] = {}, ddy[3] = {};
   int gather = -1;             // tld4: the component (0..3) gathered, or -1
   int32_t offset[3] = {0, 0, 0};   // the offset operand's texels, already in range
 };
