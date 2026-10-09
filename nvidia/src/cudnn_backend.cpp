@@ -33,16 +33,20 @@
 #include "cudnn_common.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -431,6 +435,12 @@ struct Op {
   // return no configuration, and this says why (the reason cuDNN's own
   // support check gives). Such an operation is never run.
   std::string gap;
+  // An operation whose engine the heuristics offer but whose execution plan
+  // cannot be built (cudnn-frontend's build_plans fails with "No valid
+  // execution plans built"): why.
+  std::string late_gap;
+  // Multi-GPU batch normalization: the unique ids of the peer statistics tensors.
+  std::vector<int64_t> peers;
   // MoE grouped matmul: the routing mode (cudnnMoeGroupedMatmulMode_t's value) and top-k;
   // rotary embedding: the output scale and the rotated width (0: all of it).
   int64_t moe_mode = 0, top_k = 1, rope_dim = 0;
@@ -787,17 +797,13 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         return false;
       }
       const bool interp = op->resample == CUDNN_RESAMPLE_NEAREST || op->resample == CUDNN_RESAMPLE_BILINEAR;
-      // Interpolation: cuDNN documents neither how the window, strides and
-      // paddings place the samples nor how bilinear weights them, and an RTX
-      // 3060 with cuDNN 9.27 offers no engine for either mode (forward or
-      // backward, NCHW or NHWC, upsampling or downsampling -- measured), so
-      // there is nothing to match: the operation and its graph finalize, the
-      // heuristics offer no configuration and cudnn-frontend's
-      // create_execution_plans fails with "No valid engine configs", as on
-      // that hardware (an interpolation window of anything but 2 is refused
-      // earlier, when the resample descriptor is finalized).
-      if (interp)
-        op->gap = "CUDNN_STATUS_NOT_SUPPORTED; Reason: no engine supports resampling by nearest or bilinear interpolation";
+      // Interpolation: the engines. Nearest has none, for any parameters (cuDNN
+      // documents that, and an RTX 3060 with cuDNN 9.27 agrees); bilinear has
+      // one, for upsampling by 2 in NHWC with float data, window 2, strides 1/2,
+      // pre-padding 1/2 and post-padding 1 -- documented as the only
+      // configuration, and measured to be (every other parameter set tried has
+      // no engine; half and bfloat16 data get an engine whose plan cannot be
+      // built). That is decided below, once the tensors are known.
       op->padding = static_cast<cudnnPaddingMode_t>(rd->i64(CUDNN_ATTR_RESAMPLE_PADDING_MODE, CUDNN_ZERO_PAD));
       op->nsp = static_cast<int>(rd->i64(CUDNN_ATTR_RESAMPLE_SPATIAL_DIMS));
       // Each setting: integers, or fractions (interpolation's strides and
@@ -903,6 +909,20 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
           return false;
         }
       }
+      if (interp) {
+        const char* no_engine = "CUDNN_STATUS_NOT_SUPPORTED; Reason: no engine supports resampling by this interpolation";
+        auto nhwc = [](const vc::Layout& l) {
+          return l.rank == 4 && l.strides[1] == 1 && l.strides[3] == l.dims[1] && l.strides[2] == l.dims[1] * l.dims[3] &&
+                 l.strides[0] == l.dims[1] * l.dims[2] * l.dims[3];
+        };
+        bool bilinear_config = op->resample == CUDNN_RESAMPLE_BILINEAR && fwd && op->nsp == 2 && op->role[kIdx] < 0 &&
+                               (op->padding == CUDNN_ZERO_PAD || op->padding == CUDNN_EDGE_VAL_PAD) && nhwc(*X) && nhwc(*Y);
+        for (int i = 0; i < op->nsp && bilinear_config; ++i)
+          bilinear_config = op->fstr[i] == 0.5 && op->fpre[i] == 0.5 && op->fpost[i] == 1.0 && op->fwin[i] == 2.0;
+        if (!bilinear_config) op->gap = no_engine;
+        else if (X->type != CUDNN_DATA_FLOAT || Y->type != CUDNN_DATA_FLOAT)
+          op->late_gap = "CUDNN_STATUS_NOT_SUPPORTED; Reason: bilinear resampling runs on FLOAT data only";
+      }
       if (op->role[kIdx] >= 0) {
         const vc::Layout& I = fwd ? op->more[0].l : op->in[op->role[kIdx]].l;
         if (!I.same_dims(*Y) || (op->resample != CUDNN_RESAMPLE_MAXPOOL && op->resample != CUDNN_RESAMPLE_NEAREST)) {
@@ -930,9 +950,42 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
         *why = "batch normalization's inference phase is not supported (nor is it by cuDNN's graph API)";
         return false;
       }
-      if (d->get(fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS : CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS)) {
-        *why = "multi-GPU normalization (peer statistics) is not supported";
-        return false;
+      // Multi-GPU batch normalization: the peer statistics tensors are how
+      // the participating GPUs, one execution each, exchange their local
+      // statistics. cuDNN documents the contract (the list has one tensor
+      // per GPU, at most 32, each [num_gpu, 4 * C] floats, zeroed before the
+      // run; batch normalization's training forward and its backward only);
+      // the words inside are its own protocol, which this library does not
+      // use: it meets the executions in memory instead (peer_exchange), so
+      // they must be threads of one process.
+      const cudnnBackendAttributeName_t peer_attr =
+          fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS : CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS;
+      if (const Attr* ps = d->get(peer_attr)) {
+        if (op->norm != CUDNN_BATCH_NORM || (fwd && !op->training)) {
+          *why = "multi-GPU normalization (peer statistics) is for batch normalization's training forward and its backward";
+          return false;
+        }
+        if (ps->count < 1 || ps->count > 32) {
+          *why = "multi-GPU normalization: the peer statistics list has 1 to 32 tensors, one per participating GPU";
+          return false;
+        }
+        for (int64_t i = 0; i < ps->count; ++i) {
+          GTensor pt;
+          std::string w;
+          if (!tensor_of(d->desc(peer_attr, static_cast<size_t>(i)), &pt, &w)) {
+            *why = "multi-GPU normalization: a peer statistics tensor: " + w;
+            return false;
+          }
+          if (pt.is_virtual || pt.by_value || pt.l.type != CUDNN_DATA_FLOAT) {
+            *why = "multi-GPU normalization: the peer statistics tensors are non-virtual FLOAT device tensors";
+            return false;
+          }
+          op->peers.push_back(pt.uid);
+        }
+        if (!fwd && !(d->desc(CUDNN_ATTR_OPERATION_NORM_BWD_MEAN_DESC) && d->desc(CUDNN_ATTR_OPERATION_NORM_BWD_INV_VARIANCE_DESC))) {
+          *why = "multi-GPU normalization backward: the saved mean and inverse variance are required";
+          return false;
+        }
       }
       const bool rms = op->norm == CUDNN_RMS_NORM;
       bool ok;
@@ -1244,8 +1297,8 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       // Operations an RTX 3060 (cuDNN 9.27) finalizes and builds a graph
       // from but offers no engine for -- measured: the heuristics return
       // nothing for the band-matrix operations (which cudnn-frontend never
-      // emits) and the MoE backward pass (Hopper and Blackwell, and a
-      // cuBLASLt newer than 13.1) -- so there is no result to match and no
+      // emits) and the MoE backward pass (measured to want Hopper or Blackwell; and
+      // cudnn-frontend documents cuBLASLt 13.5, newer than this stack's) -- so there is no result to match and no
       // layout to learn: they are never run.
       op->kind = Kind::NoEngine;
       const bool moe = d->type == CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
@@ -1586,6 +1639,19 @@ std::string engine_gap(const Desc* graph) {
   return "";
 }
 
+// Why an execution plan cannot be built for a graph the heuristics offered an
+// engine for (empty: it can).
+std::string plan_gap(const Desc* graph) {
+  const Attr* ops = graph->get(CUDNN_ATTR_OPERATIONGRAPH_OPS);
+  for (int64_t i = 0; ops && i < ops->count; ++i) {
+    Op o;
+    std::string why;
+    const Desc* d = graph->desc(CUDNN_ATTR_OPERATIONGRAPH_OPS, static_cast<size_t>(i));
+    if (d && op_of(d, &o, &why) && !o.late_gap.empty()) return o.late_gap;
+  }
+  return "";
+}
+
 /* ---- running one operation ---- */
 
 double erf_gelu(double x) { return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0))); }
@@ -1777,7 +1843,87 @@ void run_reduction(const Op& op, const std::vector<double>& x, std::vector<doubl
 //   dx = inv * (g - mean(g) - xhat * mean(g * xhat)),  g = dy * scale
 // (no mean(g) term for RMS), and dscale, dbias summed over the dimensions
 // where they have extent 1. outs[0] is op.out; outs[k] is op.more[k - 1].
-void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs) {
+/* ---- multi-GPU batch normalization: the executions meet here ---- */
+
+// One round of a group's exchange: every participant adds its vector, and all
+// get the sum back. The group is named by its peer statistics tensors'
+// addresses (every participant passes the same list). The sum is taken in
+// sorted order, so every participant, and every run, gets the same bits.
+struct PeerRound {
+  size_t expected;
+  std::vector<std::vector<double>> parts;
+  std::vector<double> sum;
+  bool done = false, failed = false;
+  std::string error;
+  explicit PeerRound(size_t n) : expected(n) {}
+};
+std::mutex g_peer_mutex;
+std::condition_variable g_peer_cv;
+std::map<std::vector<uintptr_t>, std::shared_ptr<PeerRound>> g_peer_open;
+
+// How long a participant waits for the others: cuDNN's kernels wait for as
+// long as it takes, but a host thread that waits on a participant which never
+// comes (another process, or the same thread's next call) would hang the
+// program, so it fails instead. VGPU_CUDNN_PEER_TIMEOUT_MS overrides it.
+int64_t peer_timeout_ms() {
+  const char* e = std::getenv("VGPU_CUDNN_PEER_TIMEOUT_MS");
+  const long long v = e ? std::atoll(e) : 0;
+  return v > 0 ? v : 60000;
+}
+
+bool peer_exchange(const std::vector<uintptr_t>& group, std::vector<double>* v, std::string* why) {
+  std::unique_lock<std::mutex> lk(g_peer_mutex);
+  std::shared_ptr<PeerRound>& open = g_peer_open[group];
+  if (!open) open = std::make_shared<PeerRound>(group.size());
+  const std::shared_ptr<PeerRound> r = open;
+  r->parts.push_back(*v);
+  if (vc::trace()) {
+    std::fprintf(stderr, "[vgpu][trace] peer exchange: thread %zu, group of %zu (first buffer %p), %zu of %zu here\n",
+                 std::hash<std::thread::id>()(std::this_thread::get_id()) % 100000, group.size(),
+                 group.empty() ? nullptr : reinterpret_cast<void*>(group[0]), r->parts.size(), r->expected);
+  }
+  if (r->parts.size() == r->expected) {
+    // Ordered by the bits of their words (a NaN has no order of its own).
+    std::sort(r->parts.begin(), r->parts.end(), [](const std::vector<double>& a, const std::vector<double>& b) {
+      const size_t n = std::min(a.size(), b.size());
+      for (size_t i = 0; i < n; ++i) {
+        uint64_t x, y;
+        std::memcpy(&x, &a[i], sizeof x);
+        std::memcpy(&y, &b[i], sizeof y);
+        if (x != y) return x < y;
+      }
+      return a.size() < b.size();
+    });
+    r->sum.assign(r->parts[0].size(), 0.0);
+    for (const std::vector<double>& p : r->parts) {
+      if (p.size() != r->sum.size()) r->failed = true, r->error = "the participants' statistics do not have the same shape";
+      else for (size_t i = 0; i < p.size(); ++i) r->sum[i] += p[i];
+    }
+    r->done = true;
+    g_peer_open.erase(group);
+    g_peer_cv.notify_all();
+  } else if (!g_peer_cv.wait_for(lk, std::chrono::milliseconds(peer_timeout_ms()), [&] { return r->done; })) {
+    // The round is abandoned for everyone in it.
+    r->done = r->failed = true;
+    r->error = std::to_string(r->parts.size()) + " of " + std::to_string(r->expected) +
+               " participants arrived (they must be threads of this process, one per peer statistics tensor)";
+    auto it = g_peer_open.find(group);
+    if (it != g_peer_open.end() && it->second == r) g_peer_open.erase(it);
+    g_peer_cv.notify_all();
+  }
+  if (r->failed) {
+    *why = "multi-GPU normalization: " + r->error;
+    return false;
+  }
+  *v = r->sum;
+  return true;
+}
+
+// Sums a vector over the participants; false (and a reason) if they do not all come.
+using Exchange = std::function<bool(std::vector<double>*)>;
+
+bool run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, std::vector<std::vector<double>>* outs,
+              const Exchange& exchange) {
   const vc::Layout& X = op.in[op.role[kX]].l;
   const std::vector<double>& x = *in[op.role[kX]];
   const size_t n = x.size();
@@ -1816,10 +1962,27 @@ void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, s
   std::vector<double> mean(ns, 0.0), inv(ns, 0.0), var(ns, 0.0);
   const bool saved = op.role[kInv] >= 0 && (rms || op.role[kMean] >= 0);
   if ((op.kind == Kind::NormFwd && op.training) || (op.kind == Kind::NormBwd && !saved)) {
+    if (!op.peers.empty()) {
+      // Every participant's sums of x and x^2 and its count, per statistic:
+      // the batch is all of their batches together (measured on two RTX
+      // 3060s, cuDNN 9.27: the mean, inverse variance, output and running
+      // statistics are those of the combined batch).
+      std::vector<double> v(3 * ns, 0.0);
+      for (size_t i = 0; i < n; ++i) v[si[i]] += x[i], v[ns + si[i]] += x[i] * x[i];
+      for (size_t k = 0; k < ns; ++k) v[2 * ns + k] = cnt[k];
+      if (!exchange(&v)) return false;
+      for (size_t k = 0; k < ns; ++k) {
+        cnt[k] = v[2 * ns + k];
+        mean[k] = v[k] / cnt[k];
+        var[k] = std::max(0.0, v[ns + k] / cnt[k] - mean[k] * mean[k]);
+        inv[k] = 1.0 / std::sqrt(var[k] + eps);
+      }
+    } else {
     for (size_t i = 0; i < n; ++i) mean[si[i]] += rms ? 0.0 : x[i];
     for (size_t k = 0; k < ns; ++k) mean[k] /= cnt[k];
     for (size_t i = 0; i < n; ++i) { const double c = x[i] - mean[si[i]]; var[si[i]] += c * c; }
     for (size_t k = 0; k < ns; ++k) var[k] /= cnt[k], inv[k] = 1.0 / std::sqrt(var[k] + eps);
+    }
   } else {
     // From the given statistics, read in st's own order.
     const std::vector<size_t> mi = input(kMean) ? broadcast_index(*layout_in(kMean), st) : std::vector<size_t>{};
@@ -1864,7 +2027,7 @@ void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, s
         stats_out(kRunVarOut, rv);
       }
     }
-    return;
+    return true;
   }
   // Backward.
   const std::vector<double> dy = bcast(kDy, 0.0);
@@ -1875,20 +2038,46 @@ void run_norm(const Op& op, const std::vector<const std::vector<double>*>& in, s
     mg[si[i]] += g[i];
     mgx[si[i]] += g[i] * xhat[i];
   }
+  // The scale and bias gradients, over this batch.
+  std::vector<double> grads[2];
+  const int grad_roles[2] = {kDscale, kDbias};
+  for (int j = 0; j < 2; ++j) {
+    const vc::Layout* l = layout_out(grad_roles[j]);
+    if (!l) continue;
+    const std::vector<size_t> bi = broadcast_index(*l, X);
+    grads[j].assign(l->count(), 0.0);
+    for (size_t i = 0; i < n; ++i) grads[j][bi[i]] += j == 0 ? dy[i] * xhat[i] : dy[i];
+  }
+  if (!op.peers.empty()) {
+    // The batch is every participant's together (measured on two RTX 3060s,
+    // cuDNN 9.27): dx follows from the combined sums, and the gradients of
+    // the scale and bias come back as the combined sums divided by the
+    // number of participants -- their mean, which a data-parallel program
+    // sums again across GPUs.
+    std::vector<double> v;
+    v.insert(v.end(), mg.begin(), mg.end());
+    v.insert(v.end(), mgx.begin(), mgx.end());
+    v.insert(v.end(), cnt.begin(), cnt.end());
+    v.insert(v.end(), grads[0].begin(), grads[0].end());
+    v.insert(v.end(), grads[1].begin(), grads[1].end());
+    if (!exchange(&v)) return false;
+    size_t at = 0;
+    for (double* dst : {mg.data(), mgx.data(), cnt.data()}) {
+      std::copy(v.begin() + static_cast<std::ptrdiff_t>(at), v.begin() + static_cast<std::ptrdiff_t>(at + ns), dst);
+      at += ns;
+    }
+    for (std::vector<double>& gr : grads)
+      for (double& e : gr) e = v[at++] / static_cast<double>(op.peers.size());
+  }
   std::vector<double> dx(n);
   for (size_t i = 0; i < n; ++i) {
     const size_t k = si[i];
     dx[i] = inv[k] * (g[i] - (rms ? 0.0 : mg[k] / cnt[k]) - xhat[i] * mgx[k] / cnt[k]);
   }
   put(kDx, std::move(dx));
-  for (int r : {kDscale, kDbias}) {
-    const vc::Layout* l = layout_out(r);
-    if (!l) continue;
-    const std::vector<size_t> bi = broadcast_index(*l, X);
-    std::vector<double> o(l->count(), 0.0);
-    for (size_t i = 0; i < n; ++i) o[bi[i]] += r == kDscale ? dy[i] * xhat[i] : dy[i];
-    put(r, std::move(o));
-  }
+  for (int j = 0; j < 2; ++j)
+    if (layout_out(grad_roles[j])) put(grad_roles[j], std::move(grads[j]));
+  return true;
 }
 
 // Pooling as the graph API's resampling: per (n, c), each output's window
@@ -1905,6 +2094,31 @@ void run_pool(const Op& op, const std::vector<const std::vector<double>*>& in, s
   const bool fwd = op.kind == Kind::PoolFwd;
   const vc::Layout& X = fwd ? op.in[0].l : op.out.l;
   const vc::Layout& Y = fwd ? op.out.l : op.in[0].l;
+  if (op.resample == CUDNN_RESAMPLE_BILINEAR) {
+    // Bilinear upsampling (the one configuration with an engine: see op_of). Output i, in each
+    // spatial dimension, samples the input at s = i * stride - pre + window / 2 - 1/2, clamped to
+    // the input's extent, between the two pixels either side of it by their distance -- measured
+    // on an RTX 3060 (the weights are exact: s is a multiple of 1/2 here).
+    const int64_t C = X.dims[1], H = X.dims[2], W = X.dims[3], OH = Y.dims[2], OW = Y.dims[3];
+    auto s_of = [&](int64_t i, int dim) { return static_cast<double>(i) * op.fstr[dim] - op.fpre[dim] + op.fwin[dim] / 2 - 0.5; };
+    r->assign(static_cast<size_t>(X.dims[0] * C * OH * OW), 0.0);
+    for (int64_t n = 0; n < X.dims[0]; ++n)
+      for (int64_t c = 0; c < C; ++c)
+        for (int64_t i = 0; i < OH; ++i) {
+          const double sy = std::min(std::max(s_of(i, 0), 0.0), static_cast<double>(H - 1));
+          const int64_t y0 = static_cast<int64_t>(std::floor(sy)), y1 = std::min(y0 + 1, H - 1);
+          const double fy = sy - static_cast<double>(y0);
+          for (int64_t j = 0; j < OW; ++j) {
+            const double sx = std::min(std::max(s_of(j, 1), 0.0), static_cast<double>(W - 1));
+            const int64_t x0 = static_cast<int64_t>(std::floor(sx)), x1 = std::min(x0 + 1, W - 1);
+            const double fx = sx - static_cast<double>(x0);
+            auto at = [&](int64_t y, int64_t x) { return (*in[0])[static_cast<size_t>(((n * C + c) * H + y) * W + x)]; };
+            (*r)[static_cast<size_t>(((n * C + c) * OH + i) * OW + j)] =
+                (1 - fy) * ((1 - fx) * at(y0, x0) + fx * at(y0, x1)) + fy * ((1 - fx) * at(y1, x0) + fx * at(y1, x1));
+          }
+        }
+    return;
+  }
   int64_t I[3] = {1, 1, 1}, O[3] = {1, 1, 1}, Wn[3] = {1, 1, 1}, P[3] = {0, 0, 0}, S[3] = {1, 1, 1};
   for (int i = 0; i < op.nsp; ++i) {
     const int k = 3 - op.nsp + i;
@@ -2714,7 +2928,27 @@ cudnnStatus_t Runner::run_op(const Op& op) {
       break;
     case Kind::Concat: run_concat(op, in, &r); break;
     case Kind::NormFwd:
-    case Kind::NormBwd: run_norm(op, in, &outs); break;
+    case Kind::NormBwd: {
+      Exchange exchange;
+      std::string why;
+      std::vector<uintptr_t> group;  // outlives the exchange that refers to it
+      if (!op.peers.empty()) {
+        for (int64_t uid : op.peers) {
+          void* p = ptr_of(uid);
+          if (!p) return refuse(fn, "no data pointer for peer statistics tensor " + std::to_string(uid));
+          group.push_back(reinterpret_cast<uintptr_t>(p));
+        }
+        std::sort(group.begin(), group.end());
+        if (std::adjacent_find(group.begin(), group.end()) != group.end())
+          return vc::fail(CUDNN_STATUS_BAD_PARAM, fn, "multi-GPU normalization: two peer statistics tensors are one buffer");
+        exchange = [&group, &why](std::vector<double>* v) { return peer_exchange(group, v, &why); };
+      }
+      if (!run_norm(op, in, &outs, exchange)) {
+        if (!vc::quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", fn, why.c_str());
+        return vc::fail(CUDNN_STATUS_EXECUTION_FAILED, fn, why);
+      }
+      break;
+    }
     case Kind::Reshape: {
       const std::vector<double>*xr = nullptr, *yr = nullptr;
       for (auto [t, o] : {std::pair<const GTensor*, const std::vector<double>**>{&op.in[0], &xr}, {&op.out, &yr}})
@@ -2914,6 +3148,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBackendFinalize(cudnnBackendDescriptor_t desc) {
       const Desc* cfg = d->desc(CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG);
       const Desc* eng = cfg ? cfg->desc(CUDNN_ATTR_ENGINECFG_ENGINE) : nullptr;
       if (!eng || !eng->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH)) return CUDNN_STATUS_BAD_PARAM;
+      if (const std::string gap = plan_gap(eng->desc(CUDNN_ATTR_ENGINE_OPERATION_GRAPH)); !gap.empty())
+        return refuse("cudnnBackendFinalize(execution plan)", "no plan can be built for this graph: " + gap);
       break;
     }
     case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR:

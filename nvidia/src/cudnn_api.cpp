@@ -3535,6 +3535,14 @@ namespace {
 // One bit per element, least significant first, 1 for kept; the size rounded
 // up to whole 32-bit words (measured on the hardware: 10000 elements, 1252 bytes).
 size_t dropout_reserve(size_t elements) { return (elements + 31) / 32 * 4; }
+// Float, half and double (measured on an RTX 3060: bfloat16 and the integers are NOT_SUPPORTED).
+bool dropout_type(cudnnDataType_t t) { return t == CUDNN_DATA_FLOAT || t == CUDNN_DATA_HALF || t == CUDNN_DATA_DOUBLE; }
+// What a kept element is multiplied by: 1 / (1 - p) in float for float and half
+// data, in double for double (measured bit for bit).
+double dropout_scaled(cudnnDataType_t t, double v, float p) {
+  if (t == CUDNN_DATA_DOUBLE) return v * (1.0 / (1.0 - static_cast<double>(p)));
+  return static_cast<double>(static_cast<float>(v) * (1.0f / (1.0f - p)));
+}
 }  // namespace
 
 VGPU_EXPORT cudnnStatus_t cudnnCreateDropoutDescriptor(cudnnDropoutDescriptor_t* d) {
@@ -3549,7 +3557,7 @@ VGPU_EXPORT cudnnStatus_t cudnnDestroyDropoutDescriptor(cudnnDropoutDescriptor_t
 }
 VGPU_EXPORT cudnnStatus_t cudnnDropoutGetStatesSize(cudnnHandle_t h, size_t* size) {
   if (!known(h) || !size) return CUDNN_STATUS_BAD_PARAM;
-  *size = 256;
+  *size = dropout_states_bytes();
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnDropoutGetReserveSpaceSize(cudnnTensorDescriptor_t xd, size_t* size) {
@@ -3558,27 +3566,36 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutGetReserveSpaceSize(cudnnTensorDescriptor_
   *size = dropout_reserve(X->l.count());
   return CUDNN_STATUS_SUCCESS;
 }
-// Starts the generator over from the seed, in the states buffer if one is given.
+// Starts the generators over from the seed, in the states buffer if one is
+// given. Measured on an RTX 3060: a buffer smaller than cudnnDropoutGetStatesSize
+// says (even 0 bytes) is BAD_PARAM, a null buffer is accepted whatever its size
+// (it leaves the buffer the descriptor had; a descriptor that never had one is
+// BAD_PARAM in a forward pass), a larger one is fine,
+// and a probability outside [0, 1] is accepted (below 0 everything is kept, above 1
+// nothing is).
 VGPU_EXPORT cudnnStatus_t cudnnSetDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t h, float p,
                                                     void* states, size_t bytes, unsigned long long seed) {
-  if (!known(d) || !(p >= 0.0f && p <= 1.0f)) return CUDNN_STATUS_BAD_PARAM;
-  if (states && bytes < sizeof(DropoutState))
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  if (states && bytes < dropout_states_bytes())
     return BAD("cudnnSetDropoutDescriptor", "the states buffer is smaller than cudnnDropoutGetStatesSize says");
   auto* D = as<DropoutDesc>(d);
-  D->p = p, D->states = states, D->state_bytes = bytes, D->seed = seed, D->drawn = 0;
-  if (states) {
-    if (known(h)) sync_handle(h);
-    const DropoutState st{seed, 0};
-    if (cudaMemcpy(states, &st, sizeof st, cudaMemcpyHostToDevice) != cudaSuccess) return CUDNN_STATUS_EXECUTION_FAILED;
-  }
-  return CUDNN_STATUS_SUCCESS;
+  D->p = p, D->seed = seed, D->threads = dropout_threads();
+  if (!states) return CUDNN_STATUS_SUCCESS;  // measured: the buffer the descriptor had stays, and is not reseeded
+  D->states = states, D->state_bytes = bytes;
+  D->local.clear();
+  if (h && known(h)) sync_handle(h);
+  return dropout_seed(D) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
-// Picks up the generator wherever the states buffer says it is.
+// Picks up the generators wherever the states buffer says they are (measured:
+// the buffer is not touched).
 VGPU_EXPORT cudnnStatus_t cudnnRestoreDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t, float p,
                                                         void* states, size_t bytes, unsigned long long seed) {
-  if (!known(d) || !(p >= 0.0f && p <= 1.0f)) return CUDNN_STATUS_BAD_PARAM;
+  if (!known(d)) return CUDNN_STATUS_BAD_PARAM;
+  if (states && bytes < dropout_states_bytes())
+    return BAD("cudnnRestoreDropoutDescriptor", "the states buffer is smaller than cudnnDropoutGetStatesSize says");
   auto* D = as<DropoutDesc>(d);
-  D->p = p, D->states = states, D->state_bytes = bytes, D->seed = seed, D->drawn = 0;
+  D->p = p, D->seed = seed, D->threads = dropout_threads();
+  if (states) D->states = states, D->state_bytes = bytes, D->local.clear();
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnGetDropoutDescriptor(cudnnDropoutDescriptor_t d, cudnnHandle_t, float* p,
@@ -3601,19 +3618,21 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutForward(cudnnHandle_t h, const cudnnDropou
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !known(dd) || !X || !Y || !x || !y || !reserve) return BAD(fn, "invalid handle, descriptor or pointer");
   if (!X->l.same_dims(Y->l)) return BAD(fn, "x and y differ in shape");
-  if (!floating(X->l.type) || !floating(Y->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
+  if (!dropout_type(X->l.type) || !dropout_type(Y->l.type)) return UNSUPPORTED(fn, "this data type");
   const size_t n = X->l.count();
   if (reserve_bytes < dropout_reserve(n)) return BAD(fn, "the reserve space is smaller than cudnnDropoutGetReserveSpaceSize says");
   auto* D = as<DropoutDesc>(dd);
+  if (!D->states) return BAD(fn, "the dropout descriptor was set without a states buffer");
   sync_handle(h);
   std::vector<double> v;
   std::vector<uint8_t> keep;
   if (!read(X->l, x, &v) || !dropout_draw(D, n, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<uint8_t> mask(dropout_reserve(n), 0);
-  const double p = D->p;
+  // y = x * (1 / (1 - p)), in float (measured: bit for bit on the card,
+  // where x / (1 - p) and a double scale are not), rounded to y's type.
   for (size_t i = 0; i < n; ++i) {
     if (keep[i]) mask[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-    v[i] = keep[i] ? v[i] * (1.0 / (1.0 - p)) : 0.0;
+    v[i] = keep[i] ? dropout_scaled(X->l.type, v[i], D->p) : 0.0;
   }
   if (cudaMemcpy(reserve, mask.data(), mask.size(), cudaMemcpyHostToDevice) != cudaSuccess)
     return CUDNN_STATUS_EXECUTION_FAILED;
@@ -3630,17 +3649,17 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutBackward(cudnnHandle_t h, const cudnnDropo
   if (!known(h) || !known(dd) || !DY || !DX || !dy || !dx || !reserve)
     return BAD(fn, "invalid handle, descriptor or pointer");
   if (!DY->l.same_dims(DX->l)) return BAD(fn, "dy and dx differ in shape");
-  if (!floating(DY->l.type) || !floating(DX->l.type)) return UNSUPPORTED(fn, "non-floating-point data");
+  if (!dropout_type(DY->l.type) || !dropout_type(DX->l.type)) return UNSUPPORTED(fn, "this data type");
   const size_t n = DY->l.count();
   if (reserve_bytes < dropout_reserve(n)) return BAD(fn, "the reserve space is smaller than the forward pass's");
-  const double p = as<const DropoutDesc>(dd)->p;
+  const float drop_p = as<const DropoutDesc>(dd)->p;
   sync_handle(h);
   std::vector<uint8_t> mask(dropout_reserve(n));
   std::vector<double> v;
   if (cudaMemcpy(mask.data(), reserve, mask.size(), cudaMemcpyDeviceToHost) != cudaSuccess || !read(DY->l, dy, &v))
     return CUDNN_STATUS_EXECUTION_FAILED;
   for (size_t i = 0; i < n; ++i)
-    v[i] = (mask[i / 8] >> (i % 8)) & 1 ? v[i] * (1.0 / (1.0 - p)) : 0.0;
+    v[i] = (mask[i / 8] >> (i % 8)) & 1 ? dropout_scaled(DY->l.type, v[i], drop_p) : 0.0;
   return write(DX->l, dx, v) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_EXECUTION_FAILED;
 }
 
@@ -3741,10 +3760,11 @@ VGPU_EXPORT cudnnStatus_t cudnnGetFoldedConvBackwardDataDescriptors(
 //     or NCHW x is NOT_SUPPORTED): y = conv(act(x * eqScale + eqBias)) with
 //     the affine result rounded to half, and per-channel sums of y and y^2.
 //   - BN_FINALIZE_STATISTICS_TRAINING and _INFERENCE run.
-//   - SCALE_BIAS_ACTIVATION_WGRAD and CONV_SCALE_BIAS_ADD_ACTIVATION are
-//     NOT_SUPPORTED from cudnnMakeFusedOpsPlan on this card; the two
-//     undocumented ones (GEN_BITMASK, DACTIVATION_FORK_DBATCHNORM) are
-//     NOT_SUPPORTED here.
+//   - SCALE_BIAS_ACTIVATION_WGRAD runs (half or float; see its plan below for
+//     the configurations): dw = wgrad(activation(x * eqScale + eqBias), dy).
+//   - CONV_SCALE_BIAS_ADD_ACTIVATION is NOT_SUPPORTED from cudnnMakeFusedOpsPlan
+//     on this card, and cudnn_cnn.h marks it, GEN_BITMASK and
+//     DACTIVATION_FORK_DBATCHNORM "reserved for future use": NOT_SUPPORTED here.
 //   - Each op's packs take the labels its documentation lists (a label from
 //     another op's table is BAD_PARAM; CONV_SCALE_BIAS_ADD_ACTIVATION's const
 //     pack took none on the card); a descriptor label stores a copy of the
@@ -4039,11 +4059,52 @@ VGPU_EXPORT cudnnStatus_t cudnnMakeFusedOpsPlan(cudnnHandle_t h, cudnnFusedOpsPl
         return BAD(fn, why.empty() ? "the convolution's groups do not fit" : why);
       break;
     }
-    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD:
-      if (!c->tensor(CUDNN_PARAM_XDESC) || !c->has[CUDNN_PARAM_CONV_DESC] || !c->has[CUDNN_PARAM_DWDESC] ||
-          !c->tensor(CUDNN_PARAM_DYDESC))
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD: {
+      const TensorDesc *x = c->tensor(CUDNN_PARAM_XDESC), *dy = c->tensor(CUDNN_PARAM_DYDESC);
+      if (!x || !c->has[CUDNN_PARAM_CONV_DESC] || !c->has[CUDNN_PARAM_DWDESC] || !dy)
         return BAD(fn, "x, the convolution, dw and dy are required");
-      return UNSUPPORTED(fn, "SCALE_BIAS_ACTIVATION_WGRAD (NOT_SUPPORTED on the hardware measured, an sm_86 card)");
+      const FilterDesc& dw = c->f[CUDNN_PARAM_DWDESC];
+      if (x->l.rank != 4 || dy->l.rank != 4 || dw.l.rank != 4 || c->conv.nsp != 2)
+        return UNSUPPORTED(fn, "two-dimensional convolution only");
+      // The configurations an RTX 3060 (cuDNN 9.27) makes a plan for, measured:
+      // x, dy and dw all half or all float (a mix, bfloat16 and double are
+      // NOT_SUPPORTED); a float compute type; RELU or IDENTITY or no
+      // activation; per-channel scale and bias in half or float, either
+      // optional; any of NCHW and NHWC for x and dw, and dy NHWC unless dw is
+      // NCHW too (dy NCHW with dw NHWC is NOT_SUPPORTED); groups, strides,
+      // dilation and padding as the convolution has them.
+      if ((x->l.type != CUDNN_DATA_HALF && x->l.type != CUDNN_DATA_FLOAT) || dy->l.type != x->l.type || dw.l.type != x->l.type)
+        return UNSUPPORTED(fn, "x, dy and dw must be all half or all float");
+      if (c->conv.type != CUDNN_DATA_FLOAT) return UNSUPPORTED(fn, "the compute type must be float");
+      if (!dy->channels_last && dw.format == CUDNN_TENSOR_NHWC)
+        return UNSUPPORTED(fn, "dy in NCHW needs dw in NCHW");
+      if (c->has[CUDNN_PARAM_ACTIVATION_DESC] && c->act.mode != CUDNN_ACTIVATION_RELU && c->act.mode != CUDNN_ACTIVATION_IDENTITY)
+        return UNSUPPORTED(fn, "only RELU and IDENTITY activations");
+      // With nothing to fuse (no scale, no bias, no activation) it is a plain
+      // weight gradient, which the card plans only when the three layouts agree
+      // (and for x and dw in NCHW with dy in NHWC).
+      {
+        const bool scale = c->ph[CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER] != CUDNN_PTR_NULL;
+        const bool bias = c->ph[CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER] != CUDNN_PTR_NULL;
+        const bool xl = x->channels_last, yl = dy->channels_last, wl = dw.format == CUDNN_TENSOR_NHWC;
+        if (!scale && !bias && !c->has[CUDNN_PARAM_ACTIVATION_DESC] && !((xl == yl && yl == wl) || (!xl && yl && !wl)))
+          return UNSUPPORTED(fn, "nothing to fuse, and the layouts of x, dy and dw differ");
+      }
+      if (const TensorDesc* sb = c->tensor(CUDNN_PARAM_BN_EQSCALEBIAS_DESC)) {
+        // The card checks the scale/bias descriptor against x for spatial mode.
+        if (sb->l.rank != 4 || sb->l.dims[0] != 1 || sb->l.dims[1] != x->l.dims[1] || sb->l.dims[2] != 1 || sb->l.dims[3] != 1)
+          return BAD(fn, "the equivalent scale/bias descriptor must be [1, C, 1, 1]");
+        if (sb->l.type != CUDNN_DATA_HALF && sb->l.type != CUDNN_DATA_FLOAT)
+          return UNSUPPORTED(fn, "the equivalent scale and bias are half or float");
+      }
+      if (c->bn_mode != CUDNN_BATCHNORM_SPATIAL) return UNSUPPORTED(fn, "only spatial batch normalization mode");
+      ConvGeom g;
+      std::string why;
+      if (!conv_geometry(x->l, dw.l, dy->l, 2, c->conv.pad, c->conv.str, c->conv.dil, c->conv.mode == CUDNN_CONVOLUTION,
+                         &g, &why) || g.G != c->conv.groups)
+        return BAD(fn, why.empty() ? "the convolution's groups do not fit" : why);
+      break;
+    }
     case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:
       if (!c->tensor(CUDNN_PARAM_YSTATS_DESC) || c->ph[CUDNN_PARAM_YSUM_PLACEHOLDER] == CUDNN_PTR_NULL ||
           c->ph[CUDNN_PARAM_YSQSUM_PLACEHOLDER] == CUDNN_PTR_NULL)
@@ -4054,7 +4115,7 @@ VGPU_EXPORT cudnnStatus_t cudnnMakeFusedOpsPlan(cudnnHandle_t h, cudnnFusedOpsPl
       if (!c->tensor(CUDNN_PARAM_BN_SCALEBIAS_MEANVAR_DESC)) return BAD(fn, "the scale/bias/mean/var descriptor is required");
       break;
     case CUDNN_FUSED_CONV_SCALE_BIAS_ADD_ACTIVATION:
-      return UNSUPPORTED(fn, "CONV_SCALE_BIAS_ADD_ACTIVATION (NOT_SUPPORTED on the hardware measured, an sm_86 card)");
+      return UNSUPPORTED(fn, "CONV_SCALE_BIAS_ADD_ACTIVATION (reserved for future use in cuDNN, NOT_SUPPORTED on the card measured)");
     default:
       return UNSUPPORTED(fn, "this fused op is undocumented and not implemented");
   }
@@ -4123,6 +4184,41 @@ VGPU_EXPORT cudnnStatus_t cudnnFusedOpsExecute(cudnnHandle_t h, const cudnnFused
             }
         if ((sum && !write(ST->l, sum, s1)) || (sq && !write(ST->l, sq, s2))) return CUDNN_STATUS_EXECUTION_FAILED;
       }
+      return CUDNN_STATUS_SUCCESS;
+    }
+    case CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD: {
+      // dw = the weight gradient of conv(a), a = activation(round(x * eqScale
+      // + eqBias)) with the affine result rounded to the data type, as
+      // BNSTATS does; the sum is exact and rounded once to dw's type
+      // (measured on an RTX 3060: half and float, errors within one rounding).
+      const TensorDesc *X = c.tensor(CUDNN_PARAM_XDESC), *DY = c.tensor(CUDNN_PARAM_DYDESC);
+      const TensorDesc* SB = c.tensor(CUDNN_PARAM_BN_EQSCALEBIAS_DESC);
+      const FilterDesc& DW = c.f[CUDNN_PARAM_DWDESC];
+      void *x = v->p[CUDNN_PTR_XDATA], *dyp = v->p[CUDNN_PTR_DYDATA], *dwp = v->p[CUDNN_PTR_DWDATA];
+      if (!x || !dyp || !dwp) return BAD(fn, "x, dy and dw pointers are required");
+      std::vector<double> vx, vdy, vs, vb, r;
+      if (!read(X->l, x, &vx) || !read(DY->l, dyp, &vdy)) return CUDNN_STATUS_EXECUTION_FAILED;
+      const void* sp = ptr(CUDNN_PTR_BN_EQSCALE, CUDNN_PARAM_BN_EQSCALE_PLACEHOLDER);
+      const void* bp = ptr(CUDNN_PTR_BN_EQBIAS, CUDNN_PARAM_BN_EQBIAS_PLACEHOLDER);
+      if (SB && sp && !read_channels(SB, sp, &vs)) return CUDNN_STATUS_EXECUTION_FAILED;
+      if (SB && bp && !read_channels(SB, bp, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
+      int64_t N, C, S;
+      ncs(X->l, &N, &C, &S);
+      const bool relu = c.has[CUDNN_PARAM_ACTIVATION_DESC] && c.act.mode == CUDNN_ACTIVATION_RELU;
+      for (int64_t n = 0; n < N; ++n)
+        for (int64_t ch = 0; ch < C; ++ch)
+          for (int64_t s = 0; s < S; ++s) {
+            double& e = vx[static_cast<size_t>((n * C + ch) * S + s)];
+            if (!vs.empty()) e *= vs[static_cast<size_t>(ch)];
+            if (!vb.empty()) e += vb[static_cast<size_t>(ch)];
+            e = round_to(X->l.type, e);
+            if (relu && !(e > 0.0)) e = 0.0;
+          }
+      ConvGeom g;
+      std::string why;
+      conv_geometry(X->l, DW.l, DY->l, 2, c.conv.pad, c.conv.str, c.conv.dil, c.conv.mode == CUDNN_CONVOLUTION, &g, &why);
+      convolve(g, ConvDir::Filter, vdy, vx, &r, Accum::Exact);
+      if (!write(DW.l, dwp, r)) return CUDNN_STATUS_EXECUTION_FAILED;
       return CUDNN_STATUS_SUCCESS;
     }
     case CUDNN_FUSED_BN_FINALIZE_STATISTICS_TRAINING:

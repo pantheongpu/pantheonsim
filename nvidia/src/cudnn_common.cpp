@@ -421,26 +421,140 @@ void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, cons
   }
 }
 
+// ---- dropout's generators: cuRAND's XORWOW, one state per thread ----
+//
+// XORWOW is Marsaglia's xorshift generator with a Weyl sequence added. Each
+// state is a Weyl counter d and five words v0..v4; a step is
+//   t = v0 ^ (v0 >> 2); v0..v3 = v1..v4; v4 = (v4 ^ (v4 << 4)) ^ (t ^ (t << 1));
+//   d += 362437; output = d + v4.
+// The seeding below, and cuDNN's use of it, were measured on an RTX 3060 and
+// match its states buffer word for word: thread t starts at the seed's state
+// moved forward by t * 2^67 steps (the v words are a linear recurrence over
+// GF(2), so the move is a matrix power; d does not change, since 2^67 times
+// the Weyl increment is 0 mod 2^32).
+
 namespace {
-// Element i of the stream that starts at a seed is a hash of (seed, i), so
-// any position can be drawn without the ones before it.
-inline double uniform(unsigned long long seed, uint64_t i) {
-  uint64_t z = seed * 0x9e3779b97f4a7c15ull + i + 0x632be59bd9b4e019ull;
-  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-  z ^= z >> 31;
-  return static_cast<double>(z >> 11) * 0x1.0p-53;
+
+constexpr int kStateWords = 12;  // 48 bytes: d, v0..v4, then cuRAND's Box-Muller fields; word 9 is padding
+
+// The recurrence as a 160 x 160 matrix over GF(2), by columns: column k is the
+// image of bit k (word k / 32, bit k % 32).
+struct Gf2 {
+  uint32_t col[160][5];
+};
+
+void xorwow_v_step(uint32_t v[5]) {
+  const uint32_t t = v[0] ^ (v[0] >> 2);
+  const uint32_t n4 = (v[4] ^ (v[4] << 4)) ^ (t ^ (t << 1));
+  v[0] = v[1], v[1] = v[2], v[2] = v[3], v[3] = v[4], v[4] = n4;
 }
+
+void apply(const Gf2& m, const uint32_t in[5], uint32_t out[5]) {
+  uint32_t r[5] = {0, 0, 0, 0, 0};
+  for (int w = 0; w < 5; ++w)
+    for (uint32_t bits = in[w]; bits; bits &= bits - 1) {
+      const int k = w * 32 + __builtin_ctz(bits);
+      for (int j = 0; j < 5; ++j) r[j] ^= m.col[k][j];
+    }
+  for (int j = 0; j < 5; ++j) out[j] = r[j];
+}
+
+// 2^67 steps: the recurrence's matrix squared 67 times.
+const Gf2& subsequence_jump() {
+  static const Gf2 jump = [] {
+    Gf2 m;
+    for (int k = 0; k < 160; ++k) {
+      uint32_t v[5] = {0, 0, 0, 0, 0};
+      v[k / 32] = 1u << (k % 32);
+      xorwow_v_step(v);
+      for (int j = 0; j < 5; ++j) m.col[k][j] = v[j];
+    }
+    for (int i = 0; i < 67; ++i) {
+      Gf2 sq;
+      for (int k = 0; k < 160; ++k) apply(m, m.col[k], sq.col[k]);
+      m = sq;
+    }
+    return m;
+  }();
+  return jump;
+}
+
+// curand_init(seed, 0, 0)'s state.
+void xorwow_first_state(unsigned long long seed, uint32_t* d, uint32_t v[5]) {
+  const uint32_t s0 = static_cast<uint32_t>(seed) ^ 0xaad26b49u, s1 = static_cast<uint32_t>(seed >> 32) ^ 0xf7dcefddu;
+  const uint32_t t0 = 1099087573u * s0, t1 = 2591861531u * s1;
+  *d = 6615241u + t1 + t0;
+  v[0] = 123456789u + t0, v[1] = 362436069u ^ t0, v[2] = 521288629u + t1, v[3] = 88675123u ^ t1, v[4] = 5783321u + t0;
+}
+
+// curand_uniform: (0, 1], in float, the multiply and the add each rounded.
+inline float curand_uniform_of(uint32_t x) {
+  volatile float scaled = static_cast<float>(x) * 2.3283064365386963e-10f;
+  return scaled + 1.1641532182693481e-10f;
+}
+
 }  // namespace
 
+size_t dropout_threads() {
+  int dev = 0, sms = 28;
+  if (cudaGetDevice(&dev) == cudaSuccess) {
+    int n = 0;
+    if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0) sms = n;
+  }
+  return static_cast<size_t>(sms) * 768;
+}
+
+bool dropout_seed(DropoutDesc* d) {
+  const size_t T = d->threads;
+  std::vector<uint32_t> words(T * kStateWords, 0);
+  // Keep whatever sits in a buffer already (the padding word).
+  if (d->states && cudaMemcpy(words.data(), d->states, T * 48, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  uint32_t dw, v[5];
+  xorwow_first_state(d->seed, &dw, v);
+  const Gf2& jump = subsequence_jump();
+  for (size_t t = 0; t < T; ++t) {
+    uint32_t* w = &words[t * kStateWords];
+    w[0] = dw;
+    for (int j = 0; j < 5; ++j) w[1 + j] = v[j];
+    w[6] = w[7] = w[8] = w[10] = w[11] = 0;
+    uint32_t next[5];
+    apply(jump, v, next);
+    for (int j = 0; j < 5; ++j) v[j] = next[j];
+  }
+  if (!d->states) {
+    d->local = std::move(words);
+    return true;
+  }
+  return cudaMemcpy(d->states, words.data(), T * 48, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
 bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep) {
-  DropoutState st{d->seed, d->drawn};
-  if (d->states && cudaMemcpy(&st, d->states, sizeof st, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  const size_t T = d->threads ? d->threads : dropout_threads();
+  std::vector<uint32_t> words;
+  if (d->states) {
+    if (d->state_bytes < T * 48) return false;  // a buffer too small for these generators (set on another device)
+    words.resize(T * kStateWords);
+    if (cudaMemcpy(words.data(), d->states, T * 48, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  } else {
+    if (d->local.size() != T * kStateWords) {
+      d->threads = T;
+      if (!dropout_seed(d)) return false;
+    }
+    words = d->local;
+  }
   keep->resize(n);
-  for (size_t i = 0; i < n; ++i) (*keep)[i] = d->p < 1.0f && uniform(st.seed, st.drawn + i) >= d->p;
-  st.drawn += n;
-  d->drawn = st.drawn;
-  return !d->states || cudaMemcpy(d->states, &st, sizeof st, cudaMemcpyHostToDevice) == cudaSuccess;
+  const float p = d->p;
+  for (size_t i = 0; i < n; ++i) {
+    uint32_t* w = &words[(i % T) * kStateWords];
+    xorwow_v_step(w + 1);
+    w[0] += 362437u;
+    (*keep)[i] = curand_uniform_of(w[0] + w[5]) > p;
+  }
+  if (!d->states) {
+    d->local = std::move(words);
+    return true;
+  }
+  return cudaMemcpy(d->states, words.data(), T * 48, cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
 void sync_handle(cudnnHandle_t h) {

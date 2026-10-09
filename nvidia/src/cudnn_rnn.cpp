@@ -253,25 +253,30 @@ void pack(const Data& d, void* dev, const std::vector<real>& dense) {
 // The reserve space's layout, in reals.
 struct Reserve {
   size_t T, B, G, H, O;
-  std::vector<size_t> input;   // per layer: [T][B][in_l]
-  std::vector<size_t> mask;    // per layer but the last: dropout's scale on its output, [T][B][O*D]
+  int D;
+  std::vector<size_t> input;   // per layer and direction: [T][B][in_l], the layer's input after the dropout on it
+  std::vector<size_t> mask;    // per layer but the last, and direction: dropout's scale on its output, [T][B][O*D]
   size_t per_pl_start = 0;     // then per pseudo-layer: gates, c, h, rn, dgi, dgr, hr, dh
   size_t pl_stride = 0;
   size_t total = 0;
-  Reserve(const Rnn& r, int T_, int B_) : T(T_), B(B_), G(r.gates()), H(r.hid), O(r.out()) {
+  Reserve(const Rnn& r, int T_, int B_) : T(T_), B(B_), G(r.gates()), H(r.hid), O(r.out()), D(r.dirs) {
     size_t off = 0;
-    for (int l = 0; l < r.layers; ++l) {
-      input.push_back(off);
-      off += T * B * r.layer_in(l);
-    }
-    for (int l = 0; l + 1 < r.layers; ++l) {
-      mask.push_back(off);
-      off += T * B * O * r.dirs;
-    }
+    for (int l = 0; l < r.layers; ++l)
+      for (int d = 0; d < D; ++d) {
+        input.push_back(off);
+        off += T * B * r.layer_in(l);
+      }
+    for (int l = 0; l + 1 < r.layers; ++l)
+      for (int d = 0; d < D; ++d) {
+        mask.push_back(off);
+        off += T * B * O * D;
+      }
     per_pl_start = off;
     pl_stride = T * B * (G * H + H + O + H + G * H + G * H + H + O);
     total = off + pl_stride * r.layers * r.dirs;
   }
+  size_t input_at(int l, int dir) const { return input[(size_t)l * D + dir]; }
+  size_t mask_at(int l, int dir) const { return mask[(size_t)l * D + dir]; }
   size_t gates(int pl) const { return per_pl_start + pl * pl_stride; }
   size_t c(int pl) const { return gates(pl) + T * B * G * H; }    // the cell state, unclipped
   size_t h(int pl) const { return c(pl) + T * B * H; }           // the output state (projected)
@@ -305,17 +310,24 @@ inline int step_t(int dir, int s, int len) { return dir == 0 ? s : len - 1 - s; 
 // training (res != nullptr).
 // In training, dropout scales each layer's output but the last's before the
 // next layer reads it: by 0 or 1 / (1 - p), drawn from the dropout
-// descriptor and kept in the reserve for the backward pass.
+// descriptor and kept in the reserve for the backward pass. Each direction of
+// the next layer gets a mask of its own over the whole of the lower layer's
+// output, forward direction first -- as cuDNN draws them (measured on an RTX
+// 3060 through the descriptor's states: one grid-stride application of the
+// dropout kernel over [T][B][O*D] per direction, layer after layer).
 bool forward(const Rnn& r, const Data& xd, const std::vector<real>& x, const std::vector<real>& w,
              const std::vector<real>& hx, const std::vector<real>& cx, std::vector<real>* y,
              std::vector<real>* hy, std::vector<real>* cy, std::vector<real>* res, const Reserve& rv) {
   const int T = xd.T, B = xd.B, H = r.hid, G = r.gates(), D = r.dirs, O = r.out();
-  std::vector<real> in = x;  // this layer's input, dense [T][B][I]
+  std::vector<std::vector<real>> ins(D, x);  // each direction's input to this layer, dense [T][B][I]
+  std::vector<real> out;
   for (int l = 0; l < r.layers; ++l) {
     const int I = r.layer_in(l);
-    if (res) std::copy(in.begin(), in.end(), res->begin() + rv.input[l]);
-    std::vector<real> out((size_t)T * B * O * D, 0.0f);
+    if (res)
+      for (int dir = 0; dir < D; ++dir) std::copy(ins[dir].begin(), ins[dir].end(), res->begin() + rv.input_at(l, dir));
+    out.assign((size_t)T * B * O * D, 0.0f);
     for (int dir = 0; dir < D; ++dir) {
+      const std::vector<real>& in = ins[dir];
       const int pl = l * D + dir;
       const auto q = r.parts(w.data(), pl);
       for (int b = 0; b < B; ++b) {
@@ -380,21 +392,24 @@ bool forward(const Rnn& r, const Data& xd, const std::vector<real>& x, const std
         if (r.mode == CUDNN_LSTM) std::copy(c.begin(), c.end(), cy->begin() + ((size_t)pl * B + b) * H);
       }
     }
-    if (res && l + 1 < r.layers) {
+    if (l + 1 < r.layers) {
       const real p = r.dropout();
-      real* m = res->data() + rv.mask[l];
-      if (p > 0.0f) {
-        std::vector<uint8_t> keep;
-        if (!vgpu_cudnn::dropout_draw(r.drop, out.size(), &keep)) return false;
-        const real scale = p < 1.0f ? 1.0f / (1.0f - p) : 0.0f;
-        for (size_t i = 0; i < out.size(); ++i) m[i] = keep[i] ? scale : 0.0f, out[i] *= m[i];
-      } else {
-        std::fill(m, m + out.size(), 1.0f);
+      for (int dir = 0; dir < D; ++dir) {
+        ins[dir] = out;
+        if (!res) continue;  // inference: no dropout
+        real* m = res->data() + rv.mask_at(l, dir);
+        if (p > 0.0f) {
+          std::vector<uint8_t> keep;
+          if (!vgpu_cudnn::dropout_draw(r.drop, out.size(), &keep)) return false;
+          const real scale = p < 1.0f ? 1.0f / (1.0f - p) : 0.0f;
+          for (size_t i = 0; i < out.size(); ++i) m[i] = keep[i] ? scale : 0.0f, ins[dir][i] *= m[i];
+        } else {
+          std::fill(m, m + out.size(), 1.0f);
+        }
       }
     }
-    in = std::move(out);
   }
-  *y = std::move(in);
+  *y = std::move(out);
   return true;
 }
 
@@ -725,8 +740,9 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t h, cudnnRNNDescr
   std::vector<real> dout = unpack(*d.y, dy);  // gradient of this layer's output, dense [T][B][O*D]
   for (int l = r.layers - 1; l >= 0; --l) {
     const int I = r.layer_in(l);
-    std::vector<real> din((size_t)T * B * I, 0.0f);
+    std::vector<std::vector<real>> dind(D, std::vector<real>((size_t)T * B * I, 0.0f));  // each direction's input gradient
     for (int dir = 0; dir < D; ++dir) {
+      std::vector<real>& din = dind[dir];
       const int pl = l * D + dir;
       const auto q = r.parts(hw.data(), pl);
       for (int b = 0; b < B; ++b) {
@@ -802,12 +818,14 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t h, cudnnRNNDescr
         if (r.mode == CUDNN_LSTM) std::copy(dc.begin(), dc.end(), dcx_.begin() + ((size_t)pl * B + b) * H);
       }
     }
-    // Into the layer below, through the dropout that scaled its output.
-    if (l > 0) {
-      const real* m = res.data() + rv.mask[l - 1];
-      for (size_t i = 0; i < din.size(); ++i) din[i] *= m[i];
+    // Into the layer below, each direction's gradient through the dropout that scaled
+    // the output for it.
+    std::vector<real> below((size_t)T * B * I, 0.0f);
+    for (int dir = 0; dir < D; ++dir) {
+      const real* m = l > 0 ? res.data() + rv.mask_at(l - 1, dir) : nullptr;
+      for (size_t i = 0; i < below.size(); ++i) below[i] += m ? dind[dir][i] * m[i] : dind[dir][i];
     }
-    dout = std::move(din);
+    dout = std::move(below);
   }
   pack(*d.x, dx, dout);
   if (dhx) store(dhx, dhx_, r.type);
@@ -834,8 +852,8 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardWeights_v8(cudnnHandle_t h, cudnnRNNDe
   std::vector<real> g = add == CUDNN_WGRAD_MODE_ADD ? fetch(dw, r.weights(), r.type) : std::vector<real>(r.weights(), 0.0f);
   for (int l = 0; l < r.layers; ++l) {
     const int I = r.layer_in(l);
-    const real* in = res.data() + rv.input[l];
     for (int dir = 0; dir < D; ++dir) {
+      const real* in = res.data() + rv.input_at(l, dir);
       const int pl = l * D + dir;
       const auto q = r.parts(g.data(), pl);
       for (int b = 0; b < B; ++b) {
@@ -1306,17 +1324,35 @@ VGPU_EXPORT cudnnStatus_t cudnnMultiHeadAttnForward(cudnnHandle_t h, const cudnn
     std::memcpy(masks.data() + R.wins, win.data(), win.size() * sizeof(int));
   }
   const double ap = training ? drop_p(a->attn_drop) : 0.0, pp = training ? drop_p(a->post_drop) : 0.0;
-  if (training && ap > 0.0) {
-    std::vector<uint8_t> keep;
-    if (!vgpu_cudnn::dropout_draw(a->attn_drop, R.probs, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
-    std::copy(keep.begin(), keep.end(), masks.begin());
-  }
-  if (training && pp > 0.0) {
-    std::vector<uint8_t> keep;
-    if (!vgpu_cudnn::dropout_draw(a->post_drop, R.outs, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
-    std::copy(keep.begin(), keep.end(), masks.begin() + R.probs);
-  }
   const int O = a->oS();
+  // The dropout masks, drawn as cuDNN draws them (measured on an RTX 3060 through the descriptors'
+  // states): one application of the dropout kernel over the probabilities, [batch][beam][head][query
+  // step][key step], and one over the output vectors, [batch][beam][query step][O] -- over the
+  // dimensions of the data the call was given, padded steps included. The reserve keeps them in this
+  // library's own layout (see AttnReserve).
+  {
+    const size_t Bq = (size_t)q->B(), Jq = (size_t)q->beam(), Tqd = (size_t)q->T(), Tkd = (size_t)k->T(), Hh = (size_t)a->heads;
+    if (training && ap > 0.0) {
+      std::vector<uint8_t> keep;
+      if (!vgpu_cudnn::dropout_draw(a->attn_drop, Bq * Jq * Hh * Tqd * Tkd, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
+      for (size_t b = 0; b < Bq; ++b)
+        for (size_t j = 0; j < Jq; ++j)
+          for (size_t hh = 0; hh < Hh; ++hh)
+            for (size_t t = 0; t < Tqd; ++t)
+              for (size_t kk = 0; kk < Tkd; ++kk)
+                masks[mask_probs(*a, (int)b, (int)j, (int)t) + hh * (size_t)a->Tk + kk] =
+                    keep[(((b * Jq + j) * Hh + hh) * Tqd + t) * Tkd + kk];
+    }
+    if (training && pp > 0.0) {
+      std::vector<uint8_t> keep;
+      if (!vgpu_cudnn::dropout_draw(a->post_drop, Bq * Jq * Tqd * (size_t)O, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
+      for (size_t b = 0; b < Bq; ++b)
+        for (size_t j = 0; j < Jq; ++j)
+          for (size_t t = 0; t < Tqd; ++t)
+            for (int c = 0; c < O; ++c)
+              masks[mask_outs(*a, R, (int)b, (int)j, (int)t) + c] = keep[((b * Jq + j) * Tqd + t) * (size_t)O + c];
+    }
+  }
   std::vector<real> ov(O);
   StepState st;
   for (int b = 0; b < q->B(); ++b)

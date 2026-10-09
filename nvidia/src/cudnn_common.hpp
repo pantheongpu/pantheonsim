@@ -208,25 +208,36 @@ void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, cons
               std::vector<double>* out, Accum acc);
 
 // A dropout descriptor, which the classic API's dropout calls and the RNN
-// API both take. The generator's position (seed, elements drawn so far) lives
-// in the caller's states buffer when there is one, as cuDNN keeps its
-// generator there: cudnnRestoreDropoutDescriptor then resumes where the
-// buffer says, and a fresh cudnnSetDropoutDescriptor starts over.
+// API both take. The generator lives in the caller's states buffer, as
+// cuDNN keeps it there: one XORWOW state (cuRAND's, 48 bytes) per thread of
+// the dropout kernel, each seeded as curand_init(seed, thread, 0) seeds it.
+// cudnnRestoreDropoutDescriptor then resumes where the buffer says, and a
+// fresh cudnnSetDropoutDescriptor starts over.
 struct DropoutDesc {
   float p = 0.0f;
   void* states = nullptr;
   size_t state_bytes = 0;
   unsigned long long seed = 0;
-  uint64_t drawn = 0;  // when there is no states buffer to keep it in
+  size_t threads = 0;            // the kernel's generators, for the device it was set on
+  std::vector<uint32_t> local;   // their states (12 words each), when there is no states buffer
 };
 
+// The generators cuDNN's dropout kernel runs on the current device, and the
+// bytes of states they take (cudnnDropoutGetStatesSize). Measured on an RTX
+// 3060 (28 SMs): 21504 generators, 1032192 bytes, that is 768 per SM; other
+// devices follow the same rule here without a measurement to confirm it.
+size_t dropout_threads();
+inline size_t dropout_states_bytes() { return dropout_threads() * 48; }
+// Seeds the descriptor's generators: into its states buffer when it has one
+// (the words cuDNN writes; its padding word is left as it was), else into
+// the descriptor. False if the buffer cannot be written.
+bool dropout_seed(DropoutDesc* d);
 // Draws n keep (1) / drop (0) decisions, each kept with probability 1 - p,
-// from the descriptor's generator, and advances it. Not NVIDIA's generator:
-// the masks differ from the hardware's, though the fraction kept and the
-// reseeding are cuDNN's. (cudnn_common.cpp)
+// from the descriptor's generators, and advances them -- cuDNN's own draw,
+// measured on an RTX 3060 against its states buffer: element i is thread
+// i % threads's next XORWOW output, kept when curand_uniform of it exceeds p.
+// (cudnn_common.cpp)
 bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep);
-// The state a states buffer holds: the seed, and how many have been drawn.
-struct DropoutState { unsigned long long seed; uint64_t drawn; };
 
 // Waits for what the program queued on the handle's stream: this library
 // computes on the host, and the inputs must be there first.
