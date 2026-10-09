@@ -3,8 +3,8 @@ simulator) for forward and backward, training steps, dynamic shapes, CUDA
 graphs through mode="reduce-overhead", and flex_attention.
 
 Each Inductor compile costs 70-270 s on the CI runner, so the quick tier keeps the cheap ones (conv2d + batch norm
-at ~1 s, the half/bfloat16 chains and the fused matmul at ~70 s) and the two known failures, which fail fast;
-the full tier (the nightly) runs the rest. Tolerances are the same in both."""
+at ~1 s, the half/bfloat16 chains and the fused matmul at ~70 s); the full tier (the nightly) runs the rest.
+Tolerances are the same in both."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,7 +30,7 @@ x4 = rnd(2, 4, 16, 32, seed=2)
 reg('softmax, log_softmax and cross entropy', lambda t: F.cross_entropy(t, torch.arange(32, device=t.device) % 48), [x2], tier='full')
 reg('RMSNorm and rotary-style pointwise math', lambda t: (t * torch.rsqrt(t.square().mean(-1, keepdim=True) + 1e-6)) * torch.cos(t) + torch.sin(t.roll(1, -1)), [x2], tier='full')
 reg('cumsum, sort and argmax', lambda t: [t.cumsum(1), t.sort(1).values, t.argmax(1)], [x2], tier='full')
-reg('gather, scatter_add and index_select', lambda t: [t.gather(1, (torch.arange(48, device=t.device) % 48).expand(32, 48)), torch.zeros_like(t).scatter_add(0, (torch.arange(32, device=t.device) % 5).unsqueeze(1).expand(32, 48), t), t.index_select(0, torch.tensor([3, 1, 4], device=t.device))], [x2])
+reg('gather, scatter_add and index_select', lambda t: [t.gather(1, (torch.arange(48, device=t.device) % 48).expand(32, 48)), torch.zeros_like(t).scatter_add(0, (torch.arange(32, device=t.device) % 5).unsqueeze(1).expand(32, 48), t), t.index_select(0, torch.tensor([3, 1, 4], device=t.device))], [x2], tier='full')
 reg('half and bfloat16 pointwise chains', lambda t: [(t.half() * 2 + 1).sin().float(), (t.bfloat16().exp() - 1).float()], [x2], 2e-2)
 reg('integer and boolean math', lambda t: [((t * 100).long() % 7 + (t > 0).long()).float(), torch.where(t > 0, t, -t * 2)], [x2], tier='full')
 reg('where, clamp, masked_fill and max-reductions with dims', lambda t: [t.masked_fill(t > 1, 0).amax(0), t.clamp(-0.5, 0.5).sum(1), t.max(dim=1)[1]], [x2], tier='full')
@@ -104,7 +104,7 @@ def _reduce_overhead(d):
     return outs
 
 
-check(L, 'torch.compile: mode="reduce-overhead" (CUDA graphs under Inductor)', 1e-3)(_reduce_overhead)
+check(L, 'torch.compile: mode="reduce-overhead" (CUDA graphs under Inductor)', 1e-3, tier='full')(_reduce_overhead)
 
 
 def _flex(d):

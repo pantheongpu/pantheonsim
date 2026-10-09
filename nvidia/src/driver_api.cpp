@@ -19,6 +19,8 @@
 #include <cstring>
 #include <deque>
 #include <dlfcn.h>
+
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -1867,6 +1869,24 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     }
     cfg.nonportable_cluster = rec.nonportable_cluster;
     if (launches_graphs(*rec.fn)) return CUDA_ERROR_NOT_SUPPORTED;
+    // On a stream that is capturing (a CUDA graph PyTorch is recording; the
+    // capture itself is the runtime's) the launch belongs to the graph: it
+    // becomes a kernel node and runs, repeated with these arguments, at each
+    // launch of the graph.
+    using RecordFn = bool (*)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, size_t,
+                              const std::function<void()>*);
+    if (auto record = reinterpret_cast<RecordFn>(dlsym(RTLD_DEFAULT, "vgpu_record_driver_launch_v1"))) {
+      const std::function<void()> again = [api_name, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
+                                           blockDimZ, sharedMemBytes, args, cooperative, cluster] {
+        std::vector<void*> ptrs(args.size());
+        for (size_t i = 0; i < args.size(); ++i) ptrs[i] = const_cast<uint8_t*>(args[i].data());
+        launch_kernel_common(api_name, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+                             sharedMemBytes, nullptr, ptrs.data(), nullptr, cooperative, cluster);
+      };
+      if (record(reinterpret_cast<void*>(hStream), gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+                 sharedMemBytes, &again))
+        return CUDA_SUCCESS;
+    }
     // What the device is limited to, and what a kernel's device runtime asks of this library.
     const ShimState::Limits& lim = s.limits[rec.device];
     cfg.device_heap_bytes = lim.malloc_heap;
@@ -4143,14 +4163,32 @@ VGPU_EXPORT CUresult cuStreamGetCtx_v2(CUstream stream, CUcontext* pctx, CUgreen
   if (r == CUDA_SUCCESS && pgreen) *pgreen = nullptr;
   return r;
 }
-VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream, int* status, unsigned long long* id,
-                                               void*, const void**, size_t*) {
+// Capture is the runtime's (cudaStreamBeginCapture); the driver asks it by name,
+// so a program that never loaded libcudart has nothing capturing.
+VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream stream, int* status, unsigned long long* id,
+                                               void* graph, const void** deps, size_t* ndeps) {
+  using Fn = int (*)(void*, int*, unsigned long long*, void*, const void**, size_t*);
+  auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamGetCaptureInfo_v2"));
+  if (!fn) fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamGetCaptureInfo"));
+  if (fn) {
+    int st = 0;
+    unsigned long long cid = 0;
+    if (fn(stream, &st, &cid, graph, deps, ndeps) == 0) {
+      if (status) *status = st;   // the runtime's cudaStreamCaptureStatus has the driver's values
+      if (id) *id = cid;
+      return CUDA_SUCCESS;
+    }
+  }
   if (status) *status = 0;  // CU_STREAM_CAPTURE_STATUS_NONE
   if (id) *id = 0;
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream, int* status) {
-  if (status) *status = 0;
+VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream stream, int* status) {
+  using Fn = int (*)(void*, int*);
+  auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamIsCapturing"));
+  int st = 0;
+  if (fn && fn(stream, &st) != 0) st = 0;
+  if (status) *status = st;
   return CUDA_SUCCESS;
 }
 

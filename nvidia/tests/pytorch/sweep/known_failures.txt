@@ -2,9 +2,4 @@
 # The sweep prints them as XFAIL and does not fail for them; one that starts passing prints XPASS and does fail,
 # so remove its line then. Each is a gap listed in TODO.md ("PyTorch sweep: known failures"). A reason starting
 # with [sim-error] says the failure also prints a "VirtualGPU error [" line.
-tiny causal transformer, three AdamW steps	numeric: three AdamW steps of the tiny causal transformer differ from the CPU by 0.0027 (allowed 0.002); the layer or reduction that drifts is not identified
-capture and replay: convolution (cuDNN) and linear (cuBLAS)	stream capture: "operation failed due to a previous error during capture"; the call that errors under capture is not identified (cuDNN computes on the host, see libraries.md)
-a training step captured whole (forward, backward, SGD with momentum) and replayed	stream capture: same capture error as the cuDNN/cuBLAS capture check
-Adam with capturable=True inside a graph	stream capture: same capture error as the cuDNN/cuBLAS capture check
-make_graphed_callables: forward and backward graphs	stream capture: same capture error as the cuDNN/cuBLAS capture check
-torch.compile: mode="reduce-overhead" (CUDA graphs under Inductor)	numeric: 1.2 scaled difference; reduce-overhead replays a captured CUDA graph, probably the same capture gap as the graphs group
+tiny causal transformer, three AdamW steps	numeric, and not a simulator bug: the key bias of each attention layer has a gradient that is mathematically zero (softmax does not change when one number is added to every key), computed as ~1e-9 float noise, and AdamW divides it by its own square root so the update is +-lr whatever the size. The CPU, the simulator and a real RTX 3060 each draw different noise (a real RTX 3060 against the CPU: about 0.0020; the simulator 0.0024 to 0.0027, deterministic for a given PyTorch); with those gradients zeroed all three agree. The check below it leaves the key biases out of the update.

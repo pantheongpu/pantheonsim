@@ -5829,6 +5829,27 @@ bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()>
   return capture_record(stream, cudaGraphNodeTypeHost, std::move(r));
 }
 
+// For libcuda, which looks it up by name: a kernel launched through the driver
+// API (cuLaunchKernel, as Triton and CUTLASS's Python launchers do) on a
+// capturing stream is a kernel node of the graph, and `op` -- the launch,
+// repeated -- is what a launch of the graph runs for it. Returns false when the
+// stream is not capturing, and the caller launches now. The node reports its
+// shape; the kernel itself is not one this runtime registered, so its
+// parameters cannot be read back or changed through cudaGraphKernelNodeGetParams
+// or SetParams.
+extern "C" __attribute__((visibility("default"))) bool vgpu_record_driver_launch_v1(
+    void* stream, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, size_t shared,
+    const std::function<void()>* op) {
+  cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+  if (!op || !capture_active(s)) return false;
+  RecordedLaunch r;
+  r.grid = dim3(gx, gy, gz);
+  r.block = dim3(bx, by, bz);
+  r.shared = shared;
+  r.host_op = *op;
+  return capture_record(s, cudaGraphNodeTypeKernel, std::move(r));
+}
+
 void vgpu_drop_capture(cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   StreamCapture* sc = stream_capture(stream);
@@ -6510,6 +6531,12 @@ static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
       return run_conditional(*n, stream);
 #endif
     default: {
+      // A kernel the driver API launched during capture (vgpu_record_driver_launch_v1):
+      // the launch is a closure.
+      if (rl.host_op) {
+        rl.host_op();
+        return cudaSuccess;
+      }
       std::vector<void*> ptrs(rl.arg_bytes.size());
       for (size_t i = 0; i < rl.arg_bytes.size(); ++i) ptrs[i] = rl.arg_bytes[i].data();
       const cudaError_t rc = launch_kernel_impl("cudaGraphLaunch", rl.func, rl.grid, rl.block, ptrs.data(),
