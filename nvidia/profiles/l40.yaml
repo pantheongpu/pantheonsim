@@ -1,0 +1,68 @@
+# VirtualGPU device profile: NVIDIA L40 (Ada Lovelace, AD102, sm_89).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.9: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 142: NVIDIA Ada GPU Architecture whitepaper (v2.1), Appendix C, Table 4
+#     (L40: 142 SMs, 18176 CUDA Cores at 128 an SM, 568 Tensor Cores).
+#   - memory 48 GB GDDR6 with ECC, 864 GB/s, 300 W, PCIe Gen4: the same table and
+#     NVIDIA's L40 page. NVIDIA's "GB" for graphics memory is binary (see
+#     rtx2080ti.yaml), so vram_bytes is 49152 MiB; a real card's nvidia-smi total
+#     is a little smaller, so this is an upper bound.
+#   - memory clock: 864 GB/s on the 384-bit bus the AD102 has is 18 Gbps (derived;
+#     NVIDIA's L40 page gives the bandwidth only).
+#   - SM clock: NVIDIA does not publish the L40's boost clock in the documents read
+#     here; nvidia/l40s's measured 2520 MHz (the same die) stands in until measured.
+#   - PCI device 0x26B5, "NVIDIA L40", from the name table in NVIDIA's open GPU
+#     kernel modules (g_nv_name_released.h).
+#   - Per-SM limits are compute capability 8.9's, the same as nvidia/l40s, which
+#     was read from a physical card.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 98304 KB and the 384-bit bus: Ada whitepaper; persisting L2 copied from nvidia/l40s.
+id: nvidia/l40
+vendor: nvidia
+model: "NVIDIA L40"
+architecture: ada
+compute_capability: "8.9"
+warp_size: 32
+vram_bytes: 51539607552          # 48 GB as 49152 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 142
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 100663296
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 49152          # 48 GB in MiB; not measured on a card
+  power_limit_w: 300             # Max Thermal Design Power (whitepaper, L40 page)
+  sm_clock_max_mhz: 2520         # unpublished here; the L40S's measured value until measured
+  mem_clock_max_mhz: 9000        # half the 18 Gbps that 864 GB/s on 384 bits implies; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 9909            # 0x26B5 [L40]
+  ecc: true                      # "48 GB GDDR6 with ECC" (L40 page)
+  memory: gddr                   # GDDR; Ampere and later remap rows rather than retire pages (see telemetry.cpp)
+  pcie_link: "Gen4 x16"          # L40 page: PCI Express Gen 4; x16 is the slot the card is built for
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 98304 KB: NVIDIA Ada whitepaper, Appendix C Table 4. The 384-bit interface is AD102's (the same
+# 384 bits the L40 page's 864 GB/s needs at 18 Gbps).
+# Persisting L2 is nvidia/l40s's measured 75497472 (the same AD102 die and L2); NVIDIA does not
+# publish it, so it is carried over, unverified.
+cuda:
+  memory_bus_width_bits: 384
+  persisting_l2_bytes: 75497472

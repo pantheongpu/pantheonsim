@@ -1,0 +1,79 @@
+# VirtualGPU device profile: NVIDIA Rubin (Vera Rubin, VR200; compute capability 10.7).
+# Public values; verified: false -- nothing here has been measured on a card.
+#
+# !! The PCI device id below (0x7F10) is a PLACEHOLDER, not NVIDIA's. NVIDIA has
+# !! not published a Rubin id: NVIDIA's open GPU kernel modules name table
+# !! (g_nv_name_released.h) has no Rubin entry. 0x7F10 is in no entry of that
+# !! table, so it collides with no NVIDIA part, and is below 0x8000 because CUDA reports
+# !! (device << 16 | vendor) as a signed int. Replace it
+# !! when NVIDIA publishes one, as the MI300X and MI350X placeholders are.
+#
+# Where each value comes from:
+#   - compute capability 10.7: NVIDIA's CUDA 13.4 release notes, cuBLAS, "Added
+#     support for the NVIDIA Rubin (compute capability 10.7) GPU architecture".
+#   - SMs 224, 896 Tensor Cores, up to 288 GB HBM4, up to 22 TB/s, NVLink 6 at 3,600
+#     GB/s, PCIe Gen 6 x16: NVIDIA's developer blog "Inside NVIDIA Rubin GPU
+#     Architecture". vram_bytes is 288 GiB (NVIDIA's "GB" for HBM is binary, see
+#     nvidia/gb200.yaml), an upper bound.
+#   - Per-SM shared memory: the CUDA C++ Programming Guide's compute capability
+#     table has a 10.7 column: 328 KB an SM and 327 KB a block, the 328 KB mode
+#     opted in with cudaSharedMemoryModeAllowOversizedSharedMemory (the default
+#     block limit stays 48 KB), and 64K 32-bit registers an SM, 255 a thread.
+#   - COPIED from nvidia/b300 (sm_103) because NVIDIA has not published them for
+#     Rubin: resident threads (2048) and blocks (32) an SM; the 1100 W power limit
+#     (NVIDIA gives no Rubin TDP; the blog has only rack-level power); the clocks
+#     (the blog gives none); ECC on, as every HBM part here.
+#   - Not recorded: the L2 size (the blog says only "a large centralized L2"), the
+#     NVLink link count (3,600 GB/s is stated, the link speed is not), a
+#     temperature limit.
+#   - The architecture is "rubin": no NVML architecture or PMC_BOOT_0 id is known
+#     for it, so those report unknown / none rather than Blackwell's.
+#   - CUDA attributes (the `cuda:` section): the 16384-bit bus is derived from "HBM4 doubles interface width"; the L2 is unpublished and left unset.
+id: nvidia/vr200
+vendor: nvidia
+model: "NVIDIA Rubin"
+architecture: rubin
+compute_capability: "10.7"
+warp_size: 32
+vram_bytes: 309237645312         # 288 GiB (294912 MiB); an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 334848   # 327 KiB (compute capability 10.7, CUDA programming guide)
+  registers_per_block: 65536
+  multiprocessors: 224
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048       # copied from sm_103
+  max_blocks_per_sm: 32          # copied from sm_103
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 335872      # 328 KiB (compute capability 10.7, CUDA programming guide)
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 294912          # 288 GiB in MiB; not measured on a card
+  power_limit_w: 1100             # unpublished; the B300's until measured
+  sm_clock_max_mhz: 1965          # unpublished; the B200's until measured
+  mem_clock_max_mhz: 4000         # unpublished; the B200's until measured
+  pci_vendor_id: 4318             # 0x10DE NVIDIA
+  pci_device_id: 32528            # 0x7F10: PLACEHOLDER, NVIDIA has published no Rubin id (see the header)
+  ecc: true                       # copied from the other HBM parts; unpublished
+  memory: hbm
+  pcie_link: "Gen6 x16"           # NVIDIA: "x16 PCIe Gen 6"
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 16384 bits: DERIVED. NVIDIA's Rubin blog says HBM4 "doubles interface width relative to
+# HBM3e" and gives 288 GB in 12-Hi stacks; with the B300's eight HBM3e stacks (8192 bits) doubled that is 16384.
+# The stack count itself is not stated. Unverified.
+# The L2 size is not published ("a large centralized L2 cache"), so it is left unset, as for the B200 and B300,
+# and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 16384

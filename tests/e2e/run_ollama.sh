@@ -77,7 +77,30 @@ echo "      reference (CPU backend): $(printf %q "$reference")"
 
 preload="$shim/libcuda.so.1:$shim/libcudart.so.$major:$shim/libcublas.so.$major:$shim/libcublasLt.so.$major"
 profiles="${VGPU_OLLAMA_PROFILES:-$("$build/vgpu" list-gpus 2>/dev/null | grep -o 'nvidia/[a-z0-9-]*' | sort -u | tr '\n' ' ')}"
+# Profiles Ollama's own discovery rejects, with the reason. Ollama's ggml-cuda is
+# built for an exact list of compute capabilities (v0.21.0's CUDA 13 library has
+# SASS for 7.5 8.0 8.6 8.7 8.9 9.0 10.0 10.3 11.0 12.0 12.1, cuobjdump --list-elf),
+# and when discovery verifies a device (GGML_CUDA_INIT=1) ggml_cuda_init does
+# GGML_ASSERT(ggml_cuda_has_arch(cc)), which compares the device's compute
+# capability with that list for EQUALITY, not "same major, same or newer minor".
+# A Rubin (10.7) is therefore filtered out by Ollama itself, and a real Rubin
+# would be too until a build adds 10.7. It then runs on the CPU. Nothing here is
+# the simulator's: a test below fails the day Ollama finds the GPU, so the entry
+# gets removed. Recheck on every OLLAMA_VERSION bump.
+rejected="nvidia/vr200"
 for gpu in $profiles; do
+  if [[ " $rejected " == *" $gpu "* ]]; then
+    name=$(VGPU_GPU=$gpu "$build/vgpu" smi --query-gpu=name --format=csv,noheader 2>/dev/null)
+    log="$tmp/${gpu//\//-}.log"
+    serve "$log" LD_PRELOAD="$preload" LD_LIBRARY_PATH="$shim" VGPU_GPU="$gpu" VGPU_QUIET=1 \
+          VGPU_TELEMETRY_PATH="$tmp/run" VGPU_STATE_DIR="$tmp/state"
+    found=$(grep -o 'msg="inference compute".*library=CUDA.*description="[^"]*"' "$log" | grep -o 'description="[^"]*"')
+    expect "$gpu: ollama rejects the GPU (its ggml-cuda has no build for this compute capability; remove from \$rejected if it now finds it)" "" "$found"
+    reply=$(generate)
+    expect "$gpu: still generates what the CPU backend does" "$reference" "$reply"
+    stop
+    continue
+  fi
   vram_mb=$(VGPU_GPU=$gpu "$build/vgpu" smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null)
   name=$(VGPU_GPU=$gpu "$build/vgpu" smi --query-gpu=name --format=csv,noheader 2>/dev/null)
   log="$tmp/${gpu//\//-}.log"

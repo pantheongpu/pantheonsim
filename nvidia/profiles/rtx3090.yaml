@@ -1,0 +1,66 @@
+# VirtualGPU device profile: NVIDIA GeForce RTX 3090 (Ampere, GA102, sm_86).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.6: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 82: NVIDIA Ampere GA102 GPU Architecture whitepaper (v2), Appendix A,
+#     Table 9 (RTX 3090 FE: 82 SMs, 10496 CUDA Cores at 128 an SM, 328 Tensor Cores).
+#   - memory 24 GB GDDR6X, 19.5 Gbps, 384-bit, 936 GB/s: the same table, which gives
+#     the frame buffer as 24576 MB. NVIDIA's "GB" for graphics memory is binary
+#     (see rtx2080ti.yaml), so vram_bytes is 24576 MiB; a real card's nvidia-smi
+#     total is a little smaller, so this is an upper bound.
+#   - boost clock 1695 MHz (Founders Edition) and 350 W Total Graphics Power: the same table.
+#   - PCIe Gen4: the whitepaper's "PCIe Gen 4" section (a x16 slot, 64 GB/s); x16 is
+#     the slot the card is built for.
+#   - PCI device 0x2204, "NVIDIA GeForce RTX 3090", from the name table in NVIDIA's
+#     open GPU kernel modules (g_nv_name_released.h).
+#   - Per-SM limits are compute capability 8.6's, the same as nvidia/a10 and
+#     nvidia/rtx3080ti, which were read from physical cards.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 6144 KB and the 384-bit bus: GA102 whitepaper; persisting L2 copied from nvidia/a10.
+id: nvidia/rtx3090
+vendor: nvidia
+model: "NVIDIA GeForce RTX 3090"
+architecture: ampere
+compute_capability: "8.6"
+warp_size: 32
+vram_bytes: 25769803776          # 24576 MiB (GA102 whitepaper); an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 82
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 16
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 6291456
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 24576          # GA102 whitepaper; not measured on a card
+  power_limit_w: 350             # Total Graphics Power (GA102 whitepaper)
+  sm_clock_max_mhz: 1695         # Founders Edition boost clock (GA102 whitepaper)
+  mem_clock_max_mhz: 9750        # half the published 19.5 Gbps data rate; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8708            # 0x2204 [GeForce RTX 3090]
+  ecc: false                     # GeForce: no ECC
+  memory: gddr                   # GDDR6X
+  pcie_link: "Gen4 x16"          # see the header
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 6144 KB and the 384-bit memory interface: NVIDIA GA102 whitepaper, Table 9.
+# Persisting L2 is nvidia/a10's measured 4325376 (11/16 of the same 6 MiB L2 on the same GA10x family);
+# NVIDIA does not publish it, so it is carried over, unverified.
+cuda:
+  memory_bus_width_bits: 384
+  persisting_l2_bytes: 4325376

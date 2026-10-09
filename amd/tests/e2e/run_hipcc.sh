@@ -353,7 +353,65 @@ done
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx1250.gfx1250" 2>&1)
 status=$?
 expect "the gfx1250 instruction program runs to the end" "0" "$status"
-expect "every gfx1250 instruction check holds" "7 of 7" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+expect "every gfx1250 instruction check holds" "8 of 8" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 8"
+
+# gfx1250's matrix instructions (hipcc/wmma1250.cpp): dense WMMA in half, bfloat16, float and 8-bit float and integer,
+# sparse SWMMAC, the mixed 8-, 6- and 4-bit forms and the block-scaled forms, each against the host. The dense checks
+# do not depend on the order of K; the sparse, mixed-width and scaled ones use the layouts in AMD's CDNA 5 ISA document.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/wmma1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 matrix program runs to the end" "0" "$status"
+expect "every gfx1250 matrix check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's transposing loads (hipcc/trload1250.cpp): global_load_tr and ds_load_tr of 16- and 8-bit elements, loaded
+# into the operands of a WMMA and checked by its product.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/trload1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 transposing-load program runs to the end" "0" "$status"
+expect "every gfx1250 transposing-load check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's asynchronous copies between global memory and LDS (hipcc/async1250.cpp), in each width.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/async1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 asynchronous-copy program runs to the end" "0" "$status"
+expect "every gfx1250 asynchronous-copy check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's cross-lane permutes (hipcc/permlane1250.cpp): the _var forms, bcast, up, down, xor, idx_gen and the swap.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/permlane1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 permlane program runs to the end" "0" "$status"
+expect "every gfx1250 permlane check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's named barriers (hipcc/barrier1250.cpp): init, join, signal (with a member count in M0), wait, the state read,
+# and the error for a wait no wave can end.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 120 "$(dirname "$exe")/barrier1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 named-barrier program runs to the end" "0" "$status"
+expect "every gfx1250 named-barrier check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's arithmetic the compiler seldom emits (hipcc/alu1250.cpp): the IEEE minimum and maximum families, the _num
+# three-operand forms, 16-bit integer, half and packed operations, DX9 multiplies, scalar float and bit operations and the
+# EXEC-writing scalar operations, each against the ISA's pseudocode written out again for the host.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/alu1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 arithmetic program runs to the end" "0" "$status"
+expect "every gfx1250 arithmetic check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's vector registers past v255 (hipcc/vgprs1250.cpp): s_set_vgpr_msb, and 600 values live at once.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/vgprs1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 high-register program runs to the end" "0" "$status"
+expect "every gfx1250 high-register check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's block loads and stores and cluster loads (hipcc/block1250.cpp), its Tensor Data Mover (hipcc/tensor1250.cpp: tiles of
+# one to five dimensions between memory and LDS, with padding, gather, iteration and the out-of-bounds rules) and its LDS atomics
+# and exchanges (hipcc/ds1250.cpp).
+for prog in block1250 tensor1250 ds1250; do
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$prog.gfx1250" 2>&1)
+  status=$?
+  expect "the gfx1250 $prog program runs to the end" "0" "$status"
+  expect "every gfx1250 $prog check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+done
 
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made

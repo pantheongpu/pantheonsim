@@ -578,6 +578,39 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // The 16-bit forms of the three-way minimum and maximum, and a 16-bit
       // multiply added into 32 bits.
       {{Enc::Vop3, 0x1f1}, {"v_mad_u32_u16", 1, 3}},
+      // The rest of what a compiler emits from the VOP3 range, which the first kernels did not:
+      // the unsigned three-way maximum, a byte-aligned extract, the sums of absolute differences
+      // (a 64-bit pair of sources and a 64- or 128-bit accumulator for the quad forms), the median
+      // and three-way forms over halves, and the 16-bit and packed conversions.
+      {{Enc::Vop3, 0x1d5}, {"v_max3_u32", 1, 3}},
+      {{Enc::Vop3, 0x1cf}, {"v_alignbyte_b32", 1, 3}},
+      {{Enc::Vop3, 0x1cd}, {"v_lerp_u8", 1, 3}},
+      {{Enc::Vop3, 0x1d9}, {"v_sad_u8", 1, 3}},
+      {{Enc::Vop3, 0x1da}, {"v_sad_hi_u8", 1, 3}},
+      {{Enc::Vop3, 0x1db}, {"v_sad_u16", 1, 3}},
+      {{Enc::Vop3, 0x1dc}, {"v_sad_u32", 1, 3}},
+      {{Enc::Vop3, 0x1dd}, {"v_cvt_pk_u8_f32", 1, 3}},
+      {{Enc::Vop3, 0x1e4}, {"v_msad_u8", 1, 3}},
+      {{Enc::Vop3, 0x1e5}, {"v_qsad_pk_u16_u8", 2, 3, 2, 1, 2}},
+      {{Enc::Vop3, 0x1e6}, {"v_mqsad_pk_u16_u8", 2, 3, 2, 1, 2}},
+      {{Enc::Vop3, 0x1e7}, {"v_mqsad_u32_u8", 4, 3, 2, 1, 4}},
+      {{Enc::Vop3, 0x1f2}, {"v_mad_i32_i16", 1, 3}},
+      {{Enc::Vop3, 0x1f4}, {"v_min3_f16", 1, 3}},
+      {{Enc::Vop3, 0x1f7}, {"v_max3_f16", 1, 3}},
+      {{Enc::Vop3, 0x1fa}, {"v_med3_f16", 1, 3}},
+      {{Enc::Vop3, 0x1fb}, {"v_med3_i16", 1, 3}},
+      {{Enc::Vop3, 0x1fc}, {"v_med3_u16", 1, 3}},
+      {{Enc::Vop3, 0x203}, {"v_mad_f16", 1, 3}},
+      {{Enc::Vop3, 0x204}, {"v_mad_u16", 1, 3}},
+      {{Enc::Vop3, 0x205}, {"v_mad_i16", 1, 3}},
+      {{Enc::Vop3, 0x294}, {"v_cvt_pknorm_i16_f32", 1, 2}},
+      {{Enc::Vop3, 0x295}, {"v_cvt_pknorm_u16_f32", 1, 2}},
+      {{Enc::Vop3, 0x298}, {"v_cvt_pk_i16_i32", 1, 2}},
+      {{Enc::Vop3, 0x299}, {"v_cvt_pknorm_i16_f16", 1, 2}},
+      {{Enc::Vop3, 0x29a}, {"v_cvt_pknorm_u16_f16", 1, 2}},
+      {{Enc::Vop3, 0x29e}, {"v_add_i16", 1, 2}},
+      {{Enc::Vop3, 0x29f}, {"v_sub_i16", 1, 2}},
+      {{Enc::Vop3, 0x2a1}, {"v_mul_legacy_f32", 1, 2}},
       {{Enc::Vop3, 0x1f5}, {"v_min3_i16", 1, 3}},
       {{Enc::Vop3, 0x1f6}, {"v_min3_u16", 1, 3}},
       {{Enc::Vop3, 0x1f8}, {"v_max3_i16", 1, 3}},
@@ -1911,6 +1944,8 @@ std::string operand_text(const Operand& o) {
     case OperandKind::M0: return wrap("m0");
     case OperandKind::SharedBase: return wrap("src_shared_base");
     case OperandKind::PrivateBase: return wrap("src_private_base");
+    case OperandKind::FlatScratchLo: return wrap("src_flat_scratch_base_lo");
+    case OperandKind::FlatScratchHi: return wrap("src_flat_scratch_base_hi");
     case OperandKind::InlineFloat:
       // As the assembler writes them: 1.0, -0.5, and, for one over two pi,
       // the digits of the float it stands for.
