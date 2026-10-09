@@ -42,8 +42,35 @@ struct FatbinImage {
   std::string data;               // the payload (PTX text keeps any trailing NULs)
   std::string options;            // compile options recorded with a PTX entry
   bool stored = false;            // a non-PTX payload that would not decompress, as stored
+  // How the entry is written (write_fatbin). `flags` is the header's flag word: bit 0 the 64-bit
+  // image, 1 debug, 2 CUDA, 3 OpenCL, 4/5/6 a Linux/macOS/Windows host (nvcc and libnvfatbin write
+  // 0x11), plus kFatbinLz4 or kFatbinZstd when `data` is already the compressed payload (then
+  // `uncompressed_size` is the size it expands to, and any other flag bits ride along).
+  uint64_t flags = 0x11;
+  uint64_t uncompressed_size = 0;
+  // What a PTX entry read from a fatbin held, as it was stored (extract_images): the payload
+  // before decompression and the header's flag word, for copying the entry on unchanged.
+  std::string uncompressed_head;   // the first bytes of an LTO-IR entry's bitcode, kept for write_fatbin
+  std::string stored_payload;
+  uint64_t stored_flags = 0, stored_uncompressed = 0;
   bool is_ptx() const { return is_ptx_kind(kind); }
 };
+
+inline constexpr uint64_t kFatbinLz4 = 0x2000;
+inline constexpr uint64_t kFatbinZstd = 0x8000;
+inline constexpr uint64_t kFatbinLtoFlag = 0x10000;   // set on a compressed LTO-IR entry (measured)
+
+// Compresses `data` as a fatbin entry's payload: the LZ4 block format, or a zstd frame (libzstd is
+// opened when first needed). `high` asks zstd for its slow, small setting. Empty when it cannot be
+// done (no libzstd), in which case the caller stores the entry uncompressed.
+std::string compress_lz4(const std::string& data);
+std::string compress_zstd(const std::string& data, bool high);
+
+// PTX with its comments taken out, as nvFatbin stores it (measured against libnvfatbin 13.0): a
+// // comment goes to the end of its line (the newline stays), a /* */ comment goes whole -- also
+// when it never ends, and the closing */ is looked for from the opener's own *, so "/*/" is a
+// complete comment -- and text in double quotes is left alone.
+std::string strip_ptx_comments(const std::string& ptx);
 
 // Largest fatbin we will walk. The loader APIs hand us a bare pointer with no
 // length, so a corrupt or truncated image cannot be bounds-checked against the
@@ -98,11 +125,11 @@ std::string pick_cubin(const void* fatbin, uint32_t cc);
 std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* consumed = nullptr,
                                         uint16_t kinds = 0xffff);
 
-// A fatbin container holding `images`, uncompressed, laid out as NVIDIA's
-// libnvfatbin lays out an uncompressed one (-compress=false): the 16-byte
-// container header, then per entry a 64-byte header, the identifier, for PTX
-// an options record, and the payload padded to 8 bytes. extract_images reads
-// it back, and so does NVIDIA's driver.
+// A fatbin container holding `images`, laid out as NVIDIA's libnvfatbin lays it
+// out: the 16-byte container header, then per entry a 64-byte header, the
+// identifier, for PTX an options record, and the payload padded to 8 bytes --
+// the payload as `data` is, compressed where the entry's flags say it is.
+// extract_images reads it back, and so does NVIDIA's driver.
 std::string write_fatbin(const std::vector<FatbinImage>& images);
 
 // The sections of a 64-bit ELF file, as name and contents (empty for a

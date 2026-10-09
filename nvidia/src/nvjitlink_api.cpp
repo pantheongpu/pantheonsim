@@ -31,12 +31,24 @@
 // compiler here -- which is refused by name when the second kind arrives, and
 // LTO-IR (NVVM bitcode, which only NVIDIA's compiler reads).
 //
+// What it cannot do itself -- LTO-IR, which only NVIDIA's compiler reads, index
+// files, and SASS beside PTX that has no SASS, which needs a PTX compiler -- is
+// done by the toolkit's own libnvJitLink where that is installed (it is a host
+// library and needs no GPU), the way libvgpunvrtc uses the toolkit's NVRTC: the
+// inputs are handed to it as given and what it links, a cubin of SASS or the
+// PTX of `-lto -ptx`, comes back. Without it these inputs are refused by name,
+// as before. (Nothing else goes that way: everything this library links itself
+// stays its own.)
+//
 // Results, error-log text and the order checks happen in follow NVIDIA's
 // library as measured on CUDA 13.0's: a failed nvJitLinkCreate still returns
 // a handle whose log says why; an undefined reference fails the link with
 // NVJITLINK_ERROR_INTERNAL; a second definition of a symbol is logged and
 // dropped while the link succeeds.
 #include "../include/vgpu_nvjitlink.h"
+
+#include <dlfcn.h>
+#include <limits.h>
 
 #include <cctype>
 #include <cstdio>
@@ -47,6 +59,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "fatbin.hpp"
@@ -62,6 +75,96 @@
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
 namespace {
+
+// ---- the toolkit's nvJitLink, for what this library cannot link ----
+
+struct RealJitLink {
+  void* lib = nullptr;
+  nvJitLinkResult (*create)(nvJitLinkHandle*, uint32_t, const char**) = nullptr;
+  nvJitLinkResult (*destroy)(nvJitLinkHandle*) = nullptr;
+  nvJitLinkResult (*add_data)(nvJitLinkHandle, nvJitLinkInputType, const void*, size_t, const char*) = nullptr;
+  nvJitLinkResult (*complete)(nvJitLinkHandle) = nullptr;
+  nvJitLinkResult (*cubin_size)(nvJitLinkHandle, size_t*) = nullptr;
+  nvJitLinkResult (*cubin)(nvJitLinkHandle, void*) = nullptr;
+  nvJitLinkResult (*ptx_size)(nvJitLinkHandle, size_t*) = nullptr;
+  nvJitLinkResult (*ptx)(nvJitLinkHandle, char*) = nullptr;
+  nvJitLinkResult (*error_log_size)(nvJitLinkHandle, size_t*) = nullptr;
+  nvJitLinkResult (*error_log)(nvJitLinkHandle, char*) = nullptr;
+  nvJitLinkResult (*info_log_size)(nvJitLinkHandle, size_t*) = nullptr;
+  nvJitLinkResult (*info_log)(nvJitLinkHandle, char*) = nullptr;
+  std::string path;
+};
+
+std::string real_path_of(const std::string& p) {
+  char buf[PATH_MAX];
+  return ::realpath(p.c_str(), buf) ? std::string(buf) : std::string();
+}
+
+const RealJitLink* toolkit_linker() {
+  static const RealJitLink* found = []() -> const RealJitLink* {
+    if (const char* m = std::getenv("VGPU_NVJITLINK"); m && std::strcmp(m, "own") == 0) return nullptr;
+    const std::string so = "libnvJitLink.so." + std::to_string(VGPU_NVJITLINK_VERSION / 1000);
+    std::string self;
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&toolkit_linker), &info) && info.dli_fname) self = real_path_of(info.dli_fname);
+    std::vector<std::string> candidates;
+    if (const char* e = std::getenv("VGPU_NVJITLINK_LIB"); e && *e) candidates.push_back(e);
+    if (FILE* f = popen("command -v nvcc 2>/dev/null", "r")) {
+      char buf[PATH_MAX] = {0};
+      if (fgets(buf, sizeof buf, f)) {
+        const std::string nvcc = real_path_of(std::string(buf).substr(0, std::strcspn(buf, "\n")));
+        const size_t slash = nvcc.find_last_of('/');
+        if (slash != std::string::npos) {
+          const std::string root = nvcc.substr(0, slash) + "/..";
+          candidates.push_back(root + "/lib64/" + so);
+          candidates.push_back(root + "/targets/x86_64-linux/lib/" + so);
+          candidates.push_back(root + "/targets/sbsa-linux/lib/" + so);
+        }
+      }
+      pclose(f);
+    }
+    for (const char* dir : {"/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"})
+      candidates.push_back(std::string(dir) + "/" + so);
+    // As for NVRTC: the real library keeps its own calls to itself, where a
+    // sanitizer runtime allows the flag.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    const int flags = RTLD_NOW | RTLD_LOCAL;
+#else
+    const int flags = RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
+#endif
+    for (const std::string& c : candidates) {
+      const std::string rp = real_path_of(c);
+      if (rp.empty() || rp == self) continue;
+      void* lib = dlopen(rp.c_str(), flags);
+      if (!lib) continue;
+      auto* r = new RealJitLink();
+      r->lib = lib;
+      r->path = rp;
+      bool ok = true;
+      auto sym = [&](auto& fn, const char* name) {
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
+        ok = ok && fn;
+      };
+      sym(r->create, "nvJitLinkCreate");
+      sym(r->destroy, "nvJitLinkDestroy");
+      sym(r->add_data, "nvJitLinkAddData");
+      sym(r->complete, "nvJitLinkComplete");
+      sym(r->cubin_size, "nvJitLinkGetLinkedCubinSize");
+      sym(r->cubin, "nvJitLinkGetLinkedCubin");
+      sym(r->ptx_size, "nvJitLinkGetLinkedPtxSize");
+      sym(r->ptx, "nvJitLinkGetLinkedPtx");
+      sym(r->error_log_size, "nvJitLinkGetErrorLogSize");
+      sym(r->error_log, "nvJitLinkGetErrorLog");
+      sym(r->info_log_size, "nvJitLinkGetInfoLogSize");
+      sym(r->info_log, "nvJitLinkGetInfoLog");
+      if (ok) return r;
+      delete r;
+      dlclose(lib);
+    }
+    return nullptr;
+  }();
+  return found;
+}
 
 struct Link {
   std::string arch;          // "sm_86", as -arch named it
@@ -84,6 +187,18 @@ struct Link {
   std::vector<Piece> pieces;
   std::vector<vgpu::cuda::SassLinkInput> sass;
   bool linked_sass = false;   // `linked` is a cubin (ELF), not PTX text
+  // The toolkit's linker finishes the link when an input is one only it reads:
+  // every input as given is kept for it, and what it makes comes back here.
+  struct Raw {
+    nvJitLinkInputType type;
+    std::string data, label;
+  };
+  std::vector<std::string> option_strings;
+  std::vector<Raw> raw;
+  bool delegate = false;
+  // What the toolkit's linker made, as it made it, and what it answered to asking for each.
+  std::string d_cubin, d_ptx;
+  nvJitLinkResult d_cubin_rc = NVJITLINK_ERROR_INVALID_INPUT, d_ptx_rc = NVJITLINK_ERROR_INVALID_INPUT;
   size_t unnamed = 0;
   std::string linked;
   std::string error_log;
@@ -188,10 +303,14 @@ nvJitLinkResult refuse_ltoir(Link& L, const std::string& label) {
     L.error_log += "ERROR: LTO-IR input '" + label + "' cannot be used without LTO enabled (-lto)\n";
     return NVJITLINK_ERROR_LTO_NOT_ENABLED;
   }
+  if (toolkit_linker()) {   // NVIDIA's compiles it when the link completes
+    L.delegate = true;
+    return NVJITLINK_SUCCESS;
+  }
   L.error_log += "ERROR: LTO-IR input '" + label +
-                 "' is NVVM bitcode, which only NVIDIA's compiler reads; VirtualGPU links PTX. "
-                 "Build it with -gencode arch=compute_XX,code=compute_XX (NVRTC: without -dlto) "
-                 "and add the PTX\n";
+                 "' is NVVM bitcode, which only NVIDIA's compiler reads, and the toolkit's libnvJitLink "
+                 "(which this library hands such inputs to) was not found. Install the toolkit, or build "
+                 "the input as PTX (-gencode arch=compute_XX,code=compute_XX; NVRTC: without -dlto) and add that\n";
   return NVJITLINK_ERROR_NVVM_COMPILE;
 }
 
@@ -199,6 +318,10 @@ nvJitLinkResult refuse_ltoir(Link& L, const std::string& label) {
 // PTX for -arch first, and there is no compiler here. Refused when the second
 // kind arrives, naming both.
 nvJitLinkResult refuse_mixing(Link& L, const std::string& label, bool adding_sass) {
+  if (toolkit_linker()) {   // NVIDIA's compiles the PTX when the link completes
+    L.delegate = true;
+    return NVJITLINK_SUCCESS;
+  }
   std::string other;
   for (const Link::Piece& p : L.pieces)
     if (adding_sass ? p.sass < 0 : p.ptx < 0) {
@@ -208,12 +331,12 @@ nvJitLinkResult refuse_mixing(Link& L, const std::string& label, bool adding_sas
   if (adding_sass)
     L.error_log += "ERROR: '" + label + "' is relocatable SASS, and '" + other +
                    "' is PTX with no SASS for " + L.arch +
-                   ": VirtualGPU links SASS with SASS and PTX with PTX, and cannot compile PTX to SASS. "
-                   "Add the PTX this input was built from, or SASS for the PTX one\n";
+                   ": VirtualGPU links SASS with SASS and PTX with PTX, and compiling PTX to SASS is the "
+                   "toolkit's libnvJitLink's, which was not found. Add the PTX this input was built from, or SASS for the PTX one\n";
   else
     L.error_log += "ERROR: '" + label + "' is PTX with no SASS for " + L.arch + ", and '" + other +
-                   "' is relocatable SASS: VirtualGPU links SASS with SASS and PTX with PTX, and cannot "
-                   "compile PTX to SASS\n";
+                   "' is relocatable SASS: VirtualGPU links SASS with SASS and PTX with PTX, and compiling "
+                   "PTX to SASS is the toolkit's libnvJitLink's, which was not found\n";
   return NVJITLINK_ERROR_INVALID_INPUT;
 }
 bool has_sass_only(const Link& L) {
@@ -397,8 +520,12 @@ nvJitLinkResult add_input(Link& L, nvJitLinkInputType type, const void* data, si
     case NVJITLINK_INPUT_LTOIR:
       return refuse_ltoir(L, label);
     case NVJITLINK_INPUT_INDEX:
+      if (toolkit_linker()) {   // an index of LTO-IR libraries: the toolkit's linker reads it
+        L.delegate = true;
+        return NVJITLINK_SUCCESS;
+      }
       L.error_log += "ERROR: index file '" + label +
-                     "' names LTO-IR libraries, which VirtualGPU cannot link (it links PTX)\n";
+                     "' names LTO-IR libraries, which only the toolkit's libnvJitLink links, and it was not found\n";
       return NVJITLINK_ERROR_INVALID_INPUT;
     default:
       L.error_log += "unsupported input type: " + label + "\n";
@@ -431,6 +558,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkCreate(nvJitLinkHandle* handle, uint32_t nu
   for (uint32_t i = 0; i < numOptions; ++i)
     if (!options[i]) return NVJITLINK_ERROR_NULL_INPUT;
   auto* L = new Link;
+  for (uint32_t i = 0; i < numOptions; ++i) L->option_strings.push_back(options[i]);
   {
     std::lock_guard<std::mutex> l(g_mu);
     g_live.insert(L);
@@ -464,6 +592,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkAddData(nvJitLinkHandle handle, nvJitLinkIn
   if (size == 0) return NVJITLINK_ERROR_INVALID_INPUT;
   const std::string label =
       name ? std::string(name) : "(unnamed input " + std::to_string(++L->unnamed) + ")";
+  L->raw.push_back({inputType, std::string(static_cast<const char*>(data), size), label});
   return add_input(*L, inputType, data, size, label);
 }
 
@@ -480,7 +609,68 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkAddFile(nvJitLinkHandle handle, nvJitLinkIn
   }
   const std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   if (bytes.empty()) return NVJITLINK_ERROR_INVALID_INPUT;
+  L->raw.push_back({inputType, bytes, fileName});
   return add_input(*L, inputType, bytes.data(), bytes.size(), fileName);
+}
+
+// The link, done by the toolkit's libnvJitLink from the inputs as given.
+static nvJitLinkResult complete_with_toolkit(Link& L) {
+  const RealJitLink& r = *toolkit_linker();
+  std::vector<const char*> opts;
+  for (const std::string& o : L.option_strings) opts.push_back(o.c_str());
+  nvJitLinkHandle h = nullptr;
+  const auto take_logs = [&] {
+    size_t n = 0;
+    if (r.error_log_size(h, &n) == NVJITLINK_SUCCESS && n > 1) {
+      std::string text(n, '\0');
+      if (r.error_log(h, &text[0]) == NVJITLINK_SUCCESS) L.error_log += text.substr(0, n - 1);
+    }
+    n = 0;
+    if (r.info_log_size(h, &n) == NVJITLINK_SUCCESS && n > 1) {
+      std::string text(n, '\0');
+      if (r.info_log(h, &text[0]) == NVJITLINK_SUCCESS) L.info_log += text.substr(0, n - 1);
+    }
+  };
+  nvJitLinkResult rc = r.create(&h, static_cast<uint32_t>(opts.size()), opts.data());
+  if (rc != NVJITLINK_SUCCESS) {
+    if (h) {
+      take_logs();
+      r.destroy(&h);
+    }
+    return rc;
+  }
+  for (const Link::Raw& in : L.raw) {
+    // A "cubin" this library handed out earlier is PTX text.
+    nvJitLinkInputType type = in.type;
+    if (static_cast<int>(type) == NVJITLINK_INPUT_CUBIN &&
+        vgpu::cuda::classify_blob(in.data.data(), in.data.size()) == vgpu::cuda::BlobKind::Ptx)
+      type = NVJITLINK_INPUT_PTX;
+    rc = r.add_data(h, type, in.data.data(), in.data.size(), in.label.c_str());
+    if (rc != NVJITLINK_SUCCESS) {
+      take_logs();
+      r.destroy(&h);
+      return rc;
+    }
+  }
+  rc = r.complete(h);
+  take_logs();
+  if (rc == NVJITLINK_SUCCESS) {
+    size_t n = 0;
+    L.d_cubin_rc = r.cubin_size(h, &n);
+    if (L.d_cubin_rc == NVJITLINK_SUCCESS) {
+      L.d_cubin.assign(n, '\0');
+      if (n) L.d_cubin_rc = r.cubin(h, &L.d_cubin[0]);
+    }
+    n = 0;
+    L.d_ptx_rc = r.ptx_size(h, &n);
+    if (L.d_ptx_rc == NVJITLINK_SUCCESS) {
+      L.d_ptx.assign(n, '\0');
+      if (n) L.d_ptx_rc = r.ptx(h, &L.d_ptx[0]);
+    }
+    L.linked_ok = true;
+  }
+  r.destroy(&h);
+  return rc;
 }
 
 VGPU_EXPORT nvJitLinkResult nvJitLinkComplete(nvJitLinkHandle handle) {
@@ -489,6 +679,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkComplete(nvJitLinkHandle handle) {
   if (!L) return NVJITLINK_ERROR_INVALID_INPUT;
   if (L->failed_create || L->completed) return NVJITLINK_ERROR_INTERNAL;
   L->completed = true;
+  if (L->delegate) return complete_with_toolkit(*L);
   if (L->ptx_output && !L->inputs.empty()) {
     // -lto -ptx is LTO-IR in, PTX out; every input here is PTX already.
     L->error_log += "ERROR: -ptx requires that all inputs have LTOIR\n";
@@ -526,6 +717,11 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedCubinSize(nvJitLinkHandle handle, 
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!size) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->delegate) {
+    if (L->d_cubin_rc != NVJITLINK_SUCCESS) return L->d_cubin_rc;
+    *size = L->d_cubin.size();
+    return NVJITLINK_SUCCESS;
+  }
   if (L->linked_sass) {   // a real cubin: its own size, no terminator
     *size = L->linked.size();
     return NVJITLINK_SUCCESS;
@@ -537,6 +733,11 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedCubin(nvJitLinkHandle handle, void
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!cubin) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->delegate) {
+    if (L->d_cubin_rc != NVJITLINK_SUCCESS) return L->d_cubin_rc;
+    std::memcpy(cubin, L->d_cubin.data(), L->d_cubin.size());
+    return NVJITLINK_SUCCESS;
+  }
   if (L->linked_sass) {
     std::memcpy(cubin, L->linked.data(), L->linked.size());
     return NVJITLINK_SUCCESS;
@@ -548,6 +749,11 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedPtxSize(nvJitLinkHandle handle, si
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!size) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->delegate) {
+    if (L->d_ptx_rc != NVJITLINK_SUCCESS) return L->d_ptx_rc;
+    *size = L->d_ptx.size();
+    return NVJITLINK_SUCCESS;
+  }
   // A SASS link has no PTX to give: NVIDIA's 13.0 returned
   // NVJITLINK_ERROR_INVALID_INPUT for it.
   if (L->linked_sass) return NVJITLINK_ERROR_INVALID_INPUT;
@@ -558,6 +764,11 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetLinkedPtx(nvJitLinkHandle handle, char* 
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   if (!ptx) return NVJITLINK_ERROR_NULL_INPUT;
   if (!L->linked_ok) return NVJITLINK_ERROR_INTERNAL;
+  if (L->delegate) {
+    if (L->d_ptx_rc != NVJITLINK_SUCCESS) return L->d_ptx_rc;
+    std::memcpy(ptx, L->d_ptx.data(), L->d_ptx.size());
+    return NVJITLINK_SUCCESS;
+  }
   if (L->linked_sass) return NVJITLINK_ERROR_INVALID_INPUT;
   return copy_out(L->linked, ptx);
 }
@@ -581,6 +792,11 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkGetInfoLog(nvJitLinkHandle handle, char* lo
   Link* L = get(handle);
   if (!L) return handle ? NVJITLINK_ERROR_INVALID_INPUT : NVJITLINK_ERROR_NULL_INPUT;
   return copy_out(L->info_log, log);
+}
+
+// For tests: whether LTO-IR and PTX-beside-SASS links go to the toolkit's own linker.
+extern "C" __attribute__((visibility("default"))) int vgpu_nvjitlink_has_toolkit_linker(void) {
+  return toolkit_linker() != nullptr;
 }
 
 VGPU_EXPORT nvJitLinkResult nvJitLinkVersion(unsigned int* major, unsigned int* minor) {
