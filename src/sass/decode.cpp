@@ -5,6 +5,7 @@
 // (nvidia/tests/data/sass/, test_sass_decode).
 #include "vgpu/sass/sass.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -1711,16 +1712,24 @@ void dec_plop3_sign(Instr& ins, const Word& w) {
 void dec_viadd(Instr& ins, const Word& w) {
   ins.op = Op::VIADD;
   ins.mnemonic = "VIADD";
-  // sm_120: 74-75 the lanes (1 S32, 2 U8x4), 80 saturating (.ISAT).
+  // sm_120: 73-75 the lanes -- 0 U32 (nothing printed), 1 .16x2 (unsigned), 2 .S32, 3 .S16x2, 4 .U8x4,
+  // 5 .S8x4 -- 80 saturating (.ISAT), 72 the first source negated (the second's is 63's).
   const unsigned lanes = static_cast<unsigned>(w.field(74, 2));
-  if (lanes == 1) ins.mods.push_back("S32");
-  if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
+  const unsigned mode = static_cast<unsigned>(w.field(73, 3));
+  static const char* const kModes[] = {"", "16x2", "S32", "S16x2", "U8x4", "S8x4", "(6)", "(7)"};
+  if (ins.sm >= 120 && *kModes[mode]) ins.mods.push_back(kModes[mode]);
+  else if (ins.sm < 120) {   // before sm_120: S32 and the byte forms only
+    if (lanes == 1) ins.mods.push_back("S32");
+    if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
+  }
   if (w.bit(80)) ins.mods.push_back("ISAT");
   ins.f[0] = lanes;
   ins.f[1] = w.bit(80);
+  ins.f[2] = ins.sm >= 120 ? mode : (lanes == 1 ? 2 : lanes == 2 ? 4 + w.bit(73) : 0);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kUnsigned);
   int_neg(ins.src[1], w);
+  if (ins.sm >= 120 && w.bit(72)) ins.src[0].neg = true;
 }
 
 void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
@@ -2216,6 +2225,8 @@ void tex_object(Instr& ins, const Word& w) {
 }
 
 void tex_common(Instr& ins, const Word& w, bool with_mask) {
+  // 81-83: the predicate the fetch sets when the texel is resident (PT: none), printed first.
+  if (w.field(81, 3) != 7) ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(64, 8))));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
   ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
@@ -2239,13 +2250,45 @@ unsigned tex_lod(const Instr& ins, const Word& w) {
   return static_cast<unsigned>(w.field(87, 3));
 }
 
+// The offset and depth-compare flags every fetch shares: AOFFI (offsets
+// packed into a register after the LOD, four bits an axis) or PTP (per-texel
+// offsets, tld4 only) -- sm_100 puts the mode in 56-57, earlier parts in
+// 76-77 -- and DC (a depth reference in the register after them).
+void tex_flags(Instr& ins, const Word& w) {
+  unsigned mode = 0;   // 0 none, 1 AOFFI, 2 PTP
+  if (ins.sm >= 100 && ins.mnemonic != "TLD4") {
+    mode = static_cast<unsigned>(w.field(56, 2));
+  } else if (w.bit(77) && ins.mnemonic == "TLD4") {
+    mode = 2;
+  } else if (w.bit(76)) {
+    mode = 1;
+  }
+  if (mode == 1) ins.mods.push_back("AOFFI");
+  if (mode == 2) ins.mods.push_back("PTP");
+  if (w.bit(78)) ins.mods.push_back("DC");
+  ins.f[3] = mode;
+  ins.f[4] = static_cast<uint32_t>(w.bit(78));
+}
+
+// Before sm_90 a fetch can return packed halves: bit 79 asks for the texel
+// converted to f16, two a register (.F16.RN, ptxas's tex.v4.f16 and .f16x2).
+void tex_f16(Instr& ins, const Word& w) {
+  if (ins.sm < 90 && w.bit(79)) {
+    ins.mods.push_back("F16");
+    ins.mods.push_back("RN");
+    ins.f[5] = 1;
+  }
+}
+
 void dec_tex(Instr& ins, const Word& w) {
   ins.op = Op::TEX;
   ins.mnemonic = "TEX";
   if (w.bit(60)) ins.mods.push_back("SCR");
+  tex_f16(ins, w);
   const unsigned lod = tex_lod(ins, w);
   if (lod) ins.mods.push_back(kLod[lod]);
   ins.f[2] = lod;
+  tex_flags(ins, w);
   tex_common(ins, w, true);
 }
 
@@ -2253,11 +2296,13 @@ void dec_tld(Instr& ins, const Word& w) {
   ins.op = Op::TLD;
   ins.mnemonic = "TLD";
   if (w.bit(60)) ins.mods.push_back("SCR");
+  tex_f16(ins, w);
   unsigned lod = tex_lod(ins, w);
   if (ins.sm >= 100 && lod == 0) lod = 1;   // a fetch's LOD is explicit: 0 reads as .LZ
   static const char* const lods[] = {"", "LZ", "(2)", "LL", "(4)", "(5)", "(6)", "(7)"};
   if (lod) ins.mods.push_back(lods[lod]);
   ins.f[2] = lod;
+  tex_flags(ins, w);
   tex_common(ins, w, true);
 }
 
@@ -2268,6 +2313,7 @@ void dec_tld4(Instr& ins, const Word& w) {
   static const char* const comps[] = {"R", "G", "B", "A"};
   ins.mods.push_back(comps[w.field(87, 2)]);
   ins.f[2] = static_cast<uint32_t>(w.field(87, 2));
+  tex_flags(ins, w);
   tex_common(ins, w, false);
 }
 
@@ -2300,6 +2346,31 @@ void dec_suld(Instr& ins, const Word& w) {
   const unsigned size = static_cast<unsigned>(w.field(73, 3));
   ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8)), mem_regs(size)));
   ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", -1, 0, ins.sm));
+  tex_object(ins, w);
+}
+
+// SUST.P: a formatted store -- the values in consecutive registers from 32 converted to the
+// surface's format (R, RG, RGB or RGBA by the mask at 72-75, nothing printed for all four), x
+// counting texels where SUST.D's counts bytes. Printed: P, the dimension, the memory order, the
+// mask, then the out-of-bounds mode.
+void dec_sust_p(Instr& ins, const Word& w) {
+  ins.op = Op::SUST;
+  ins.mnemonic = "SUST";
+  ins.mods.push_back("P");
+  ins.mods.push_back(kImgDim[w.field(61, 3)]);
+  mem_order_mods(ins, w);
+  static const char* const masks[] = {"", "R", "G", "RG", "B", "RB", "GB", "RGB", "A", "RA", "GA", "RGA", "BA", "RBA", "GBA", ""};
+  const unsigned mask = static_cast<unsigned>(w.field(72, 4));
+  if (*masks[mask]) ins.mods.push_back(masks[mask]);
+  static const char* const oob[] = {"IGN", "", "TRAP", "(3)"};
+  const unsigned mode = static_cast<unsigned>(w.field(59, 2));
+  if (*oob[mode]) ins.mods.push_back(oob[mode]);
+  ins.f[0] = static_cast<uint32_t>(w.field(61, 3));
+  ins.f[1] = mask;
+  ins.f[4] = 1;   // formatted
+  ins.f[5] = mode;
+  ins.src.push_back(mem_addr(static_cast<unsigned>(w.field(24, 8)), false, "", -1, 0, ins.sm));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(32, 8)), std::max(1, std::popcount(mask))));
   tex_object(ins, w);
 }
 
@@ -3557,8 +3628,8 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0x98c, [](Instr& i, const Word& w) { dec_atoms(i, w, false); }},
       {0x38d, [](Instr& i, const Word& w) { dec_atoms(i, w, true); }},
       {0xf8c, dec_atoms_popc},
-      {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb99, dec_suld}, {0xb9d, dec_sust},
-      {0xf60, dec_tex}, {0xf66, dec_tld}, {0xf63, dec_tld4}, {0xf99, dec_suld}, {0xf9d, dec_sust},
+      {0xb60, dec_tex}, {0xb66, dec_tld}, {0xb63, dec_tld4}, {0xb99, dec_suld}, {0xb9d, dec_sust}, {0xb9b, dec_sust_p},
+      {0xf60, dec_tex}, {0xf66, dec_tld}, {0xf63, dec_tld4}, {0xf99, dec_suld}, {0xf9d, dec_sust}, {0xf9b, dec_sust_p},
       {0x34e, dec_lepc}, {0x98f, dec_cctl}, {0x31c, dec_b2r}, {0x3aa, dec_qspc}, {0x9aa, dec_qspc}, {0x9ab, dec_errbar},
       {0x942, dec_break}, {0x95c, dec_bpt},
       {0x3a9, [](Instr& i, const Word& w) { dec_atom_cas(i, w, Op::ATOMG, "ATOMG"); }},

@@ -30,6 +30,7 @@ namespace {
 
 const char* kHeader100a = ".version 8.7\n.target sm_100a\n.address_size 64\n";
 const char* kHeader103a = ".version 8.8\n.target sm_103a\n.address_size 64\n";
+const char* kHeader107a = ".version 9.4\n.target sm_107a\n.address_size 64\n";
 
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
@@ -920,6 +921,88 @@ VTEST(tcgen05_ld_red_f32_min_max_abs_nan) {
   VCHECK_EQ(hexes(run_ld_red(".max.NaN.f32", rows)), want({fbits(3.0f), kPZero, kCanon, kCanon, fbits(7.0f)}));
 }
 
+// tcgen05.ld{.red}.spcompress (sm_107a, PTX ISA 9.4): the four columns a thread loads, two of them
+// kept by the rowop, with their indices -- two bits each, low first -- in mdata. From the ISA's
+// text alone; the compression is spcompress's (figure 43), done on the way out of Tensor Memory.
+namespace {
+struct SpLd { std::vector<uint32_t> cdata0, cdata1, mdata, red; };
+SpLd run_ld_sp(const std::string& mods, bool red, const std::vector<std::array<uint32_t, 4>>& rows) {
+  const std::string ptx = std::string(kHeader107a) + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<6>;
+    .shared .align 4 .b32 slot;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd4, [out];
+    mov.u32 %r1, %tid.x;
+    tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [slot], 32;
+    ld.shared.u32 %r4, [slot];
+    mul.wide.u32 %rd3, %r1, 16;
+    add.u64 %rd2, %rd1, %rd3;
+    ld.global.v4.u32 {%r5, %r6, %r7, %r8}, [%rd2];
+    tcgen05.st.sync.aligned.32x32b.x4.b32 [%r4], {%r5, %r6, %r7, %r8};
+    tcgen05.wait::st.sync.aligned;
+)" + (red ? std::string("    tcgen05.ld.red.spcompress.sync.aligned.32x32b.x4") + mods + " {%r9}, {%r10, %r11}, %r13, [%r4];\n"
+            : std::string("    tcgen05.ld.spcompress.sync.aligned.32x32b.x4") + mods + " {%r9}, {%r10, %r11}, [%r4];\n") + R"(
+    tcgen05.wait::ld.sync.aligned;
+    mul.wide.u32 %rd3, %r1, 16;
+    add.u64 %rd5, %rd4, %rd3;
+    st.global.v4.u32 [%rd5], {%r9, %r10, %r11, %r13};
+    tcgen05.dealloc.cta_group::1.sync.aligned.b32 %r4, 32;
+    ret;
+}
+)";
+  MemoryManager mem{1 << 20};
+  std::vector<uint32_t> in(32 * 4, 0);
+  for (size_t t = 0; t < rows.size(); ++t) std::copy(rows[t].begin(), rows[t].end(), in.begin() + 4 * t);
+  const uint64_t pin = mem.alloc(in.size() * 4), out = mem.alloc(32 * 16);
+  mem.write(pin, in.data(), in.size() * 4);
+  LaunchConfig cfg;
+  cfg.block = {32, 1, 1};
+  exec::launch(ptx::parse(ptx).entries[0], cfg, {arg_u64(pin), arg_u64(out)}, mem, load_gpu("nvidia/vr200"));
+  std::vector<uint32_t> got(32 * 4);
+  mem.read(out, got.data(), got.size() * 4);
+  SpLd r;
+  for (size_t t = 0; t < rows.size(); ++t) {
+    r.mdata.push_back(got[t * 4]);
+    r.cdata0.push_back(got[t * 4 + 1]);
+    r.cdata1.push_back(got[t * 4 + 2]);
+    r.red.push_back(got[t * 4 + 3]);
+  }
+  return r;
+}
+}  // namespace
+
+VTEST(tcgen05_ld_spcompress) {
+  const std::vector<std::array<uint32_t, 4>> rows = {
+      {fbits(1.5f), fbits(-2.0f), fbits(0.25f), fbits(3.0f)},
+      {fbits(4.0f), kQNaN, fbits(-1.0f), fbits(2.0f)},
+  };
+  SpLd r = run_ld_sp(".max.sp::2:4.f32.b2", false, rows);   // 1.5 (0) and 3.0 (3); and 4.0 (0) with the NaN (1), which is always kept
+  VCHECK_EQ(hexes(r.cdata0), hexes(std::vector<uint32_t>{fbits(1.5f), fbits(4.0f)}));
+  VCHECK_EQ(hexes(r.cdata1), hexes(std::vector<uint32_t>{fbits(3.0f), kQNaN}));
+  VCHECK_EQ(hexes(r.mdata), hexes(std::vector<uint32_t>{0 | 3 << 2, 0 | 1 << 2}));
+  r = run_ld_sp(".min.sp::2:4.f32.b2", false, rows);        // -2.0 (1), 0.25 (2); and the NaN (1) with -1.0 (2)
+  VCHECK_EQ(hexes(r.cdata0), hexes(std::vector<uint32_t>{fbits(-2.0f), kQNaN}));
+  VCHECK_EQ(hexes(r.cdata1), hexes(std::vector<uint32_t>{fbits(0.25f), fbits(-1.0f)}));
+  VCHECK_EQ(hexes(r.mdata), hexes(std::vector<uint32_t>{1 | 2 << 2, 1 | 2 << 2}));
+  r = run_ld_sp(".max.sp::2:4.abs.f32.b2", false, rows);    // -2.0 (1) and 3.0 (3); and 4.0 (0) with the NaN (1)
+  VCHECK_EQ(hexes(r.cdata0), hexes(std::vector<uint32_t>{fbits(-2.0f), fbits(4.0f)}));
+  VCHECK_EQ(hexes(r.cdata1), hexes(std::vector<uint32_t>{fbits(3.0f), kQNaN}));
+}
+
+VTEST(tcgen05_ld_red_spcompress_reduces_the_whole_load) {
+  const std::vector<std::array<uint32_t, 4>> rows = {{fbits(1.5f), fbits(-2.0f), fbits(0.25f), fbits(3.0f)},
+                                                     {fbits(4.0f), kQNaN, fbits(-1.0f), fbits(2.0f)}};
+  VCHECK_EQ(hexes(run_ld_sp(".max.sp::2:4.f32.b2", true, rows).red), hexes(std::vector<uint32_t>{fbits(3.0f), fbits(4.0f)}));
+  VCHECK_EQ(hexes(run_ld_sp(".min.sp::2:4.f32.b2", true, rows).red), hexes(std::vector<uint32_t>{fbits(-2.0f), fbits(-1.0f)}));
+  // .NaN applies to the reduction only: row 1 reduces to the canonical NaN, and its selection is unchanged.
+  const SpLd n = run_ld_sp(".min.sp::2:4.NaN.f32.b2", true, rows);
+  VCHECK_EQ(hexes(n.red), hexes(std::vector<uint32_t>{fbits(-2.0f), kCanon}));
+  VCHECK_EQ(hexes(n.cdata0), hexes(std::vector<uint32_t>{fbits(-2.0f), kQNaN}));
+}
+
 VTEST(tcgen05_ld_red_integers) {
   const std::vector<std::array<uint32_t, 4>> rows = {{5u, 0xFFFFFFFFu, 7u, 2u}, {0x80000000u, 1u, 0u, 0x7FFFFFFFu}};
   VCHECK_EQ(hexes(run_ld_red(".max.u32", rows)), hexes(std::vector<uint32_t>{0xFFFFFFFFu, 0x80000000u}));
@@ -1289,6 +1372,92 @@ VTEST(tcgen05_mma_i8_saturates) {
     }
 }
 
+// .kind::ti16 (PTX ISA 9.4, sm_107a): s1z4m11 elements -- a sign and eleven bits of
+// magnitude -- into s32; negate and transpose are allowed, saturation is not. Written from the
+// ISA's tables 48, 51 and 62; not checked against a card (no CUDA toolkit assembles sm_107).
+uint64_t s1z4m11(int v) { return (v < 0 ? 0x8000u : 0u) | uint32_t(std::abs(v) & 0x7FF); }
+
+VTEST(tcgen05_mma_ti16) {
+  const int M = 128, N = 32, K = 16;
+  auto A = [](int m, int k) { return ((m * 37 + k * 101) % 4095) - 2047; };   // -2047 .. 2047
+  auto B = [](int k, int n) { return ((k * 211 + n * 53 + 7) % 4095) - 2047; };
+  const Operands o = images(1, M, N, K, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int k) { return s1z4m11(A(m, k)); },
+                            [&](int n, int k) { return s1z4m11(B(k, n)); });
+  Mma x;
+  x.kind = "ti16";
+  x.target = kHeader107a;
+  x.id = idesc(2, 3, 3, M, N, /*neg_a=*/true);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 32;
+  x.enable_d = "1";
+  x.d_in.assign(1, std::vector<uint32_t>(128 * 32, 0x7FFFFF00u));   // past 2^31 once added to: wraps, not saturates
+  const auto out = x.run();
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      int64_t want = 0x7FFFFF00;
+      for (int k = 0; k < K; ++k) want += int64_t(-A(m, k)) * B(k, n);
+      VCHECK_EQ(int32_t(out[0][size_t(m) * 32 + n]), int32_t(uint32_t(want)));
+    }
+}
+
+// Sparse ti16 (K = 32, A stored 128 x 16): the metadata is the f16's, 2:4, through selector 1.
+VTEST(tcgen05_mma_sp_ti16) {
+  const int M = 128, N = 32, K = 32;
+  const Sparse sp{4};
+  auto S = [](int m, int j) { return ((m * 29 + j * 71) % 4095) - 2047; };
+  auto A = [&](int m, int k) { return sp.dense(m, k, S); };
+  auto B = [](int k, int n) { return ((k * 17 + n * 41 + 3) % 4095) - 2047; };
+  const Operands o = images(1, M, N, K / 2, 2, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int j) { return s1z4m11(S(m, j)); }, [](int, int) { return 0; });
+  Mma x;
+  x.kind = "ti16";
+  x.target = kHeader107a;
+  x.sparse = true;
+  x.id = idesc(2, 3, 3, M, N) | 4 | 1;
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 512, 0);
+  x.smem_a = o.a;
+  x.smem_b = {std::vector<uint8_t>()};
+  for (int n = 0; n < N; ++n)
+    for (int k = 0; k < K; ++k)
+      put(x.smem_b[0], canonical(Major::K, 0, 2, 128, 512, n, k), s1z4m11(B(k, n)), 2);
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 4;
+  x.a_col = 32;
+  x.meta_col = 32;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 4));
+  put_meta(x.a_tmem[0], 4, 0, M, 32, 0, false, 1, K, sp);
+  const auto out = x.run();
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      int64_t want = 0;
+      for (int k = 0; k < K; ++k) want += int64_t(A(m, k)) * B(k, n);
+      VCHECK_EQ(int32_t(out[0][size_t(m) * 64 + n]), int32_t(want));
+    }
+}
+
+// ti16 only on sm_107, and without the 8-bit kinds' saturation bit.
+VTEST(tcgen05_mma_ti16_refusals) {
+  Mma x;
+  x.kind = "ti16";
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = x.smem_b = {std::vector<uint8_t>(4096)};
+  x.id = idesc(2, 3, 3, 128, 32);
+  x.target = kHeader100a;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107");
+  x.target = kHeader107a;
+  x.id = idesc(2, 3, 3, 128, 32, false, false, false, false, /*sat=*/true);
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+  x.id = idesc(1, 3, 3, 128, 32);   // D is s32
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+}
+
 // A from Tensor Memory: row m in lane m, K packed 32 bits to a column
 // (two f16s, low half first).
 VTEST(tcgen05_mma_a_from_tensor_memory) {
@@ -1474,6 +1643,139 @@ VTEST(tcgen05_mma_mxf4nvf4_ue4m3_block16) {
   put_scales(x.a_tmem[0], 8, 0, M, 4, 0, [&](int m, int j) { return e4m3_bits(sa(m, j)); });
   put_scales(x.a_tmem[0], 8, 4, N, 4, 0, [&](int n, int j) { return e4m3_bits(sb(n, j)); });
   check_scaled(x.run(), M, N, K, 16, 64, A, B, sa, sb);
+}
+
+// sm_107f (PTX ISA 9.4): UE4M3 scale factors with .block32 (two blocks of 32 over K = 64) --
+// from Table 69, not checked against a card.
+VTEST(tcgen05_mma_mxf4nvf4_ue4m3_block32_on_sm_107) {
+  const int M = 128, N = 32, K = 64;
+  auto A = [](int m, int k) { return val(m, k, 7); };
+  auto B = [](int k, int n) { return val(k, n, 2); };
+  const float steps[] = {0.5f, 1.0f, 1.5f, 2.0f, 0.75f};
+  auto sa = [&](int m, int j) { return steps[(m + j) % 5]; };
+  auto sb = [&](int n, int j) { return steps[(2 * n + 3 * j) % 5]; };
+  Mma x;
+  x.target = kHeader107a;
+  x.kind = "mxf4nvf4";
+  x.kind_mods = ".block_scale.block32";
+  x.block_scale = true;
+  x.id = idesc_mx(1, 1, M, N, 2, 0, 0);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = {packed_k_major(M, K, 4, 32, 128, 256, [&](int m, int k) { return e2m1_bits(A(m, k)); })};
+  x.smem_b = {packed_k_major(N, K, 4, 32, 128, 256, [&](int n, int k) { return e2m1_bits(B(k, n)); })};
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 36;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  put_scales(x.a_tmem[0], 8, 0, M, 2, 2, [&](int m, int j) { return e4m3_bits(sa(m, j)); });
+  put_scales(x.a_tmem[0], 8, 4, N, 2, 0, [&](int n, int j) { return e4m3_bits(sb(n, j)); });
+  check_scaled(x.run(), M, N, K, 32, 64, A, B, sa, sb);
+  x.target = kHeader100a;   // not the B200's
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+}
+
+// sm_107f's 128-lane scale-factor A layout (instruction descriptor bit 26; figures 238, 256): row m's
+// factors in Tensor Memory lane m, at the scale-A column and the one after, with none of the 32-lane
+// layout's column a 32 rows.
+VTEST(tcgen05_mma_scale_factor_a_in_128_lanes) {
+  const int M = 128, N = 32, K = 32;
+  auto A = [](int m, int k) { return val(m, k, 2); };
+  auto B = [](int k, int n) { return val(k, n, 6); };
+  auto sa = [](int m, int) { return uint8_t(124 + m % 7); };
+  auto sb = [](int n, int) { return uint8_t(125 + n % 5); };
+  Mma x;
+  x.target = kHeader107a;
+  x.kind = "mxf8f6f4";
+  x.kind_mods = ".block_scale.scale_vec::1X";
+  x.block_scale = true;
+  x.id = idesc_mx(0, 3, M, N, 1, 2, 1) | (1u << 26);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  const Operands o = images(1, M, N, K, 1, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int k) { return e4m3_bits(A(m, k)); }, [](int, int) { return 0; });
+  x.smem_a = o.a;
+  x.smem_b = {packed_k_major(N, K, 6, 16, 128, 256, [&](int n, int k) { return e2m3_bits(B(k, n)); })};
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 36;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  for (int m = 0; m < M; ++m) {   // one lane a row, byte SFA_ID (= 1) of the column
+    uint32_t& c = x.a_tmem[0][size_t(m) * 8];
+    c = 0xA5A5A5A5u;
+    c = (c & ~(0xFFu << 8)) | uint32_t(sa(m, 0)) << 8;
+  }
+  put_scales(x.a_tmem[0], 8, 4, N, 1, 2, sb);
+  auto ue8m0 = [](uint8_t v) { return std::ldexp(1.0f, int(v) - 127); };
+  check_scaled(x.run(), M, N, K, 32, 64, A, B, [&](int m, int j) { return ue8m0(sa(m, j)); },
+               [&](int n, int j) { return ue8m0(sb(n, j)); });
+  x.target = kHeader100a;   // sm_100 has the 32-lane layout only
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+}
+
+// sm_107f's K = 64 for the 8-bit types (instruction descriptor bit 29; Table 48's K1): from the
+// ISA alone.
+VTEST(tcgen05_mma_f8f6f4_k64_on_sm_107) {
+  const int M = 128, N = 32, K = 64;
+  auto A = [](int m, int k) { return val(m, k, 5); };
+  auto B = [](int k, int n) { return val(k, n, 2); };
+  const Operands o = images(1, M, N, K, 1, Major::K, Major::K, 0, 0, 128, 512, 128, 512,
+                            [&](int m, int k) { return e4m3_bits(A(m, k)); },
+                            [&](int n, int k) { return e4m3_bits(B(k, n)); });
+  Mma x;
+  x.target = kHeader107a;
+  x.kind = "f8f6f4";
+  x.id = idesc(1, 0, 0, M, N) | (1u << 29);
+  x.desc_a = desc(0, 128, 512, 0);
+  x.desc_b = desc(0, 128, 512, 0);
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 32;
+  check_d_f32(x.run(), 1, M, N, K, A, B, nullptr, 0, 32);
+  x.target = kHeader100a;
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "sm_107f");
+  x.target = kHeader107a;
+  x.id = idesc(1, 3, 3, M, N) | (1u << 29);   // e2m3: K = 64 takes e4m3 and e5m2 only
+  VCHECK_CONTAINS(VCAPTURE(Error, x.run()).message(), "Tables 51-53");
+}
+
+VTEST(tcgen05_mma_mxf8f6f4_k64_on_sm_107) {
+  const int M = 128, N = 32, K = 64;
+  auto A = [](int m, int k) { return val(m, k, 2); };
+  auto B = [](int k, int n) { return val(k, n, 6); };
+  auto sa = [](int m, int) { return uint8_t(124 + m % 7); };
+  auto sb = [](int n, int) { return uint8_t(125 + n % 5); };
+  Mma x;
+  x.target = kHeader107a;
+  x.kind = "mxf8f6f4";
+  x.kind_mods = ".block_scale.scale_vec::1X";
+  x.block_scale = true;
+  x.id = idesc_mx(0, 0, M, N, 1, 2, 1) | (1u << 31);
+  x.desc_a = desc(0, 128, 512, 0);
+  x.desc_b = desc(0, 128, 512, 0);
+  const Operands o = images(1, M, N, K, 1, Major::K, Major::K, 0, 0, 128, 512, 128, 512,
+                            [&](int m, int k) { return e4m3_bits(A(m, k)); },
+                            [&](int n, int k) { return e4m3_bits(B(k, n)); });
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 64;
+  x.a_is_tmem = false;
+  x.a_cols = 8;
+  x.a_col = 32;
+  x.sfa_col = 32;
+  x.sfb_col = 36;
+  x.a_tmem.assign(1, std::vector<uint32_t>(128 * 8));
+  put_scales(x.a_tmem[0], 8, 0, M, 1, 1, sa);
+  put_scales(x.a_tmem[0], 8, 4, N, 1, 2, sb);
+  auto ue8m0 = [](uint8_t v) { return std::ldexp(1.0f, int(v) - 127); };
+  check_scaled(x.run(), M, N, K, 64, 64, A, B, [&](int m, int j) { return ue8m0(sa(m, j)); },
+               [&](int n, int j) { return ue8m0(sb(n, j)); });   // one factor a row covers all 64
 }
 
 VTEST(tcgen05_mma_block_scale_refuses_what_the_isa_rules_out) {
@@ -3114,12 +3416,69 @@ VTEST(cvt_narrow_forms_refused_by_name) {
                                       "\n ret;\n}\n")).message();
   };
   VCHECK_CONTAINS(parse("cvt.rs.satfinite.e2m1x4.f32 a, {f, g, f, g}, b;"), "stochastic");
-  VCHECK_CONTAINS(parse("cvt.rz.satfinite.e2m1x2.f32 a, f, g;"), "sm_107f");
-  VCHECK_CONTAINS(parse("cvt.rn.satfinite.pzo.e2m1x2.f32 a, f, g;"), "sm_107f");
+  VCHECK_CONTAINS(parse("cvt.rz.satfinite.e2m1x2.f32 a, f, g;"), "sm_107");   // PTX ISA 9.4's, not the B200's
+  VCHECK_CONTAINS(parse("cvt.rn.satfinite.pzo.e2m1x2.f32 a, f, g;"), "sm_107");
+  VCHECK_CONTAINS(parse("cvt.rn.f16x2.ue5m3x2 a, b;"), "exponent bias");
   VCHECK_CONTAINS(parse("cvt.rn.satfinite.s2f6x2.bf16x2 a, b;"), "pseudocode");
   VCHECK_CONTAINS(parse("cvt.rn.e2m1x2.f32 a, f, g;"), "requires .satfinite");
   VCHECK_CONTAINS(parse("cvt.rn.ue8m0x2.f32 a, f, g;"), ".rz or .rp");
   VCHECK_CONTAINS(parse("cvt.rn.relu.f32.f16 f, a;"), ".relu");
+}
+
+// add, sub, mul and fma on four packed narrow floats (PTX ISA 9.7.6, sm_100a and sm_103a). Derived from
+// documentation, not checked against a card: ptxas rejects these forms for the sm_86 card, and no sm_100 card
+// was available. The expected words were worked out by hand from the formats.
+VTEST(f8x4_arithmetic) {
+  const std::string ptx = std::string(".version 9.4\n.target sm_100a\n.address_size 64\n") + R"(
+.visible .entry k(.param .u64 out)
+{
+  .reg .b32 a, c, r<8>;
+  .reg .b64 %rd<3>;
+  ld.param.u64 %rd1, [out];
+  cvta.to.global.u64 %rd2, %rd1;
+  // add: {1, 2, 448, .5} + {1, .5, 448, -.5} in e4m3: 2, 2.5, past the largest finite (NaN, or 448 saturated), 0
+  mov.b32 a, 0x307E4038;
+  mov.b32 c, 0xB07E3038;
+  add.rn.e4m3x4.e4m3x4 r0, a, c;
+  add.rn.satfinite.e4m3x4.e4m3x4 r1, a, c;
+  // mul into e5m2: e4m3 {1, 2, 1.5, .5} times e2m1 {1.5, 2, 3, 6}: 1.5, 4, 4.5 (a tie, to even: 4), 3
+  mov.b32 a, 0x303C4038;
+  mov.b32 c, 0x7543;
+  mul.rn.e5m2x4.e4m3x4.e2m1x4 r2, a, c;
+  // fma is fused: 448*2 - 448 is 448, not an overflow; 1*1 + 2^-9 rounds back to 1
+  mov.b32 a, 0x387E403C;
+  mov.b32 c, 0x3840303C;
+  mov.b32 r3, 0x01FEB828;
+  fma.rn.e4m3x4.e4m3x4.e4m3x4 r3, a, c, r3;
+  // scaling by powers of two: e8m0 codes {128, 126, 128, 255} on e4m3 {1, 1.5, 448, 1}
+  mov.b32 a, 0x387E3C38;
+  mov.b32 c, 0xFF807E80;
+  mul.rn.e4m3x4.e4m3x4.ue8m0x4 r4, a, c;
+  // sub: {1, 2, 448, .5} - {1, .5, 448, -.5} = 0, 1.5, 0, 1
+  mov.b32 a, 0x307E4038;
+  mov.b32 c, 0xB07E3038;
+  sub.rn.e4m3x4.e4m3x4 r5, a, c;
+  st.global.b32 [%rd2], r0;
+  st.global.b32 [%rd2+4], r1;
+  st.global.b32 [%rd2+8], r2;
+  st.global.b32 [%rd2+12], r3;
+  st.global.b32 [%rd2+16], r4;
+  st.global.b32 [%rd2+20], r5;
+  ret;
+}
+)";
+  MemoryManager mem(1 << 20);
+  const uint64_t out = mem.alloc(24);
+  exec::launch(ptx::parse(ptx).entries[0], LaunchConfig{}, {arg_u64(out)}, mem, load_gpu("nvidia/b200"));
+  const uint32_t want[6] = {0x007F4240u, 0x007E4240u, 0x4244443Eu, 0x387E0042u, 0x7F7F3440u, 0x38003C00u};
+  for (int i = 0; i < 6; ++i) VCHECK_EQ(static_cast<uint32_t>(mem.load_scalar(out + 4 * i, 4)), want[i]);
+}
+
+VTEST(f8x4_arithmetic_needs_sm100a) {
+  const auto msg = VCAPTURE(Error, ptx::parse(std::string(".version 9.4\n.target sm_120a\n.address_size 64\n") +
+                                              ".visible .entry k()\n{\n .reg .b32 a, b, c;\n"
+                                              " add.rn.e4m3x4.e4m3x4 a, b, c;\n ret;\n}\n")).message();
+  VCHECK_CONTAINS(msg, "sm_100a");
 }
 
 VTEST_MAIN

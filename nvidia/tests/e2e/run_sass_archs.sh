@@ -38,9 +38,9 @@ archs=(${VGPU_SASS_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_90a sm_100 sm_100a sm
 # sync_masks' values are what an RTX 3060's ptxas code did).
 progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
        runtime_conformance:75:75 symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75
-       texture_layers:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
+       texture_layers:75 texture_forms:75 surface_formatted:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75 block_semaphore:75 cooperative_grid:75 alloca_stack:75 managed_vars:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
        sync_masks:86:86 dynamic_parallelism:75 cdp_device_api:75 cdp1_device_sync:75:89 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
-       mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90
+       mma_fragment_layout:80 modern_dtypes:80 wmma_gemm:80 wmma_types:80 dsmem_cluster:90 cooperative_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
        stmatrix:90a setmaxnreg:90a setmaxnreg:100a bulk_copy:90a tcgen05_gemm:100a tmem_alloc_pair:100a mma_blockscale:120a ldmatrix_forms:100a ldmatrix_forms:120a narrow_cvt:100a narrow_cvt:120a})
 cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "

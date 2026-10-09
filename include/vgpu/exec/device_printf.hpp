@@ -18,8 +18,10 @@ namespace vgpu::exec {
 // The C format, formatted the way an RTX 3060's host side formats it: glibc's
 // text for every conversion (so "(nil)", "(null)", "-nan"), a `*` width taken
 // from the arguments, and a conversion it does not know printed as written,
-// consuming no argument. What the card does wrong is refused by name rather
-// than imitated: a `*` precision, hh, %Lf and %n.
+// consuming no argument -- %n is one of them: the card prints it as written and
+// stores nothing -- and a wide string (%ls) read as the narrow one it is
+// copied as: its bytes up to the first NUL, formatted as %s. What the card does
+// wrong is refused by name rather than imitated: a `*` precision, hh and %Lf.
 //
 // fetch(size) returns the next argument of `size` bytes, aligned naturally in
 // the argument buffer; cstring(address) reads a NUL-terminated string from
@@ -112,14 +114,17 @@ std::string format_device_printf(const std::string& fmt, Fetch&& fetch, CString&
         if (v == 0) {
           format(spec + 's', "(null)");
         } else {
-          if (lflag) refuse(Err::UnsupportedPtx, "printf's %ls with a wide string is not implemented");
+          // %ls: the device copies the argument as a narrow string (up to the first NUL) whatever
+          // the length modifier says, and the host prints it as that (an RTX 3060: L"hi!" prints h).
+          (void)lflag;
           const std::string str = cstring(v);
           format(spec + 's', str.c_str());
         }
         break;
       }
       case 'n':
-        refuse(Err::UnsupportedPtx, "printf's %n is not implemented");
+        // Stores nothing, consumes no argument, and prints as written (measured on an RTX 3060).
+        out.append(fmt, start, i - start + 1);
         break;
       default:
         // Not a conversion: the card prints it as written and moves on.

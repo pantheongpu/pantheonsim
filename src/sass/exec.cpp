@@ -313,6 +313,7 @@ class Runner {
   Block& shared_block(Block& blk, uint64_t addr, uint32_t* off);
   Block& cluster_block(Block& blk, uint32_t rank);
   void run_cluster(uint64_t k, unsigned worker);        // one cluster's blocks, together
+  void build_cluster(uint64_t k, unsigned worker, Block* blocks, Cluster& cl);   // cluster k's blocks, set up
   void cluster_barrier_check(Block& blk);                // UCGABAR: complete the phase if all are in
   void builtin_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
   bool device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex, const std::string& name);
@@ -830,8 +831,6 @@ exec::LaunchStats Runner::run() {
   if (block_threads_ == 0 || block_threads_ > 1024)
     throw Error(Err::LaunchConfig, "block of " + std::to_string(block_threads_) + " threads");
   const uint64_t blocks = static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1] * cfg_.grid[2];
-  if (clustered_ && cfg_.cooperative)
-    throw Error(Err::UnsupportedPtx, "SASS kernel " + k_.name + ": a cooperative launch with clusters is not implemented");
   // The unit of work: a block, or with clusters a cluster, whose blocks must
   // be resident together.
   const uint64_t units = clustered_ ? blocks / csize_ : blocks;
@@ -892,8 +891,15 @@ exec::LaunchStats Runner::run() {
   }
   if (cfg_.cooperative) {
     // Every block resident at once, taking turns, so one may wait on another.
+    // With clusters, each cluster's blocks are built as run_cluster builds them (cluster k's
+    // blocks consecutive here), every cluster resident at once.
     std::vector<Block> all(blocks);
-    for (uint64_t i = 0; i < blocks; ++i) init_block(all[i], i);
+    std::vector<Cluster> clusters(clustered_ ? units : 0);
+    if (clustered_) {
+      for (uint64_t k = 0; k < units; ++k) build_cluster(k, static_cast<unsigned>(k), &all[k * csize_], clusters[k]);
+    } else {
+      for (uint64_t i = 0; i < blocks; ++i) init_block(all[i], i);
+    }
     for (bool live = true; live;) {
       live = false;
       bool progress = false;
@@ -910,7 +916,13 @@ exec::LaunchStats Runner::run() {
             }
           w.yield = false;
         }
-      if (live && !progress) throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of the grid is waiting (deadlock)");
+      if (live && !progress) {
+        bool broke = false;
+        if (clustered_)
+          for (Block& blk : all) broke = break_warpsync_standoff(blk) || broke;
+        if (broke) continue;
+        throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of the grid is waiting (deadlock)");
+      }
     }
     for (Block& blk : all) stats_.add(blk.st);
   } else if (threads <= 1) {
@@ -1010,11 +1022,9 @@ void Runner::run_block(Block& blk) {
 // do, so that one may wait on another (barrier.cluster, a peer's mbarrier,
 // its shared memory). Ranks run x fastest, as %cluster_ctarank numbers them;
 // clusters tile the grid x fastest.
-void Runner::run_cluster(uint64_t k, unsigned worker) {
+void Runner::build_cluster(uint64_t k, unsigned worker, Block* blocks, Cluster& cl) {
   const uint64_t ncx = cfg_.grid[0] / cshape_[0], ncy = cfg_.grid[1] / cshape_[1];
   const uint64_t kx = k % ncx, ky = (k / ncx) % ncy, kz = k / (ncx * ncy);
-  std::vector<Block> blocks(csize_);
-  Cluster cl;
   for (uint32_t r = 0; r < csize_; ++r) {
     const uint64_t x = kx * cshape_[0] + r % cshape_[0], y = ky * cshape_[1] + (r / cshape_[0]) % cshape_[1],
                    z = kz * cshape_[2] + r / (cshape_[0] * cshape_[1]);
@@ -1025,6 +1035,12 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
     blocks[r].cluster = &cl;
     cl.blocks.push_back(&blocks[r]);
   }
+}
+
+void Runner::run_cluster(uint64_t k, unsigned worker) {
+  std::vector<Block> blocks(csize_);
+  Cluster cl;
+  build_cluster(k, worker, blocks.data(), cl);
   for (;;) {
     bool live = false, progress = false;
     for (Block& blk : blocks)

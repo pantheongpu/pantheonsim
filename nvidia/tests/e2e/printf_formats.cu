@@ -8,9 +8,10 @@
 // length, none of which is worth imitating.
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <cuda_runtime.h>
 
-__global__ void k(const char* s) {
+__global__ void k(const char* s, const wchar_t* w) {
   printf("a %a %A %.2a %10.1a %a|\n", 3.0, -0.1, 1.0, 2.5, 0.0);
   printf("b %p %p %-12p|\n", (void*)0, (void*)0x1234, (void*)0x1234);
   printf("c %.2s|%8s|%-8s|%8.3s|%s|\n", s, s, s, s, (const char*)0);
@@ -23,15 +24,28 @@ __global__ void k(const char* s) {
   printf("l %g %G %e %E %f %F|\n", 3.14159265358979, 3.14159265358979e20, 3.14, 3.14, 2.5, -2.5);
   printf("m %f %f %e|\n", 1.0 / 0.0, -1.0 / 0.0, -0.0);
   printf("n %lf %i %o %X %u|\n", 2.5, -300, 300, 300, -300);
+  // %ls prints the string as narrow bytes up to the first NUL, %lc as %c, and %n as written.
+  // One wide argument to a line: several in one make the card misread the rest.
+  printf("o %ls|\n", w);
+  printf("o2 %5ls|\n", w);
+  printf("o3 %.1ls|\n", w);
+  printf("o4 %ls|\n", (const wchar_t*)0);
+  printf("p %lc|\n", (wint_t)65);
+  printf("p2 %3lc|\n", (wint_t)66);
+  printf("q %d%n|\n", 3, (int*)0);
 }
 
 int main() {
   char* s;
   cudaMallocManaged(&s, 16);
   std::strcpy(s, "hello");
-  k<<<1, 1>>>(s);
+  wchar_t* w;
+  cudaMallocManaged(&w, 16 * sizeof(wchar_t));
+  w[0] = L'h'; w[1] = L'i'; w[2] = L'!'; w[3] = 0;
+  k<<<1, 1>>>(s, w);
   const cudaError_t e = cudaDeviceSynchronize();
   cudaFree(s);
+  cudaFree(w);
   if (e != cudaSuccess) {
     std::printf("launch failed: %s\n", cudaGetErrorString(e));
     return 1;

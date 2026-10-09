@@ -32,8 +32,10 @@ Checked, because each is a bug the hardware would not report clearly:
 - an allocation after `tcgen05.relinquish_alloc_permit`;
 - a `.cta_group::2` operation in a CTA with no peer.
 
-An allocation that does not fit would block until another warp frees columns;
-waiting for that is not implemented, so it fails with a message instead.
+An allocation that does not fit blocks, as the ISA says `tcgen05.alloc` may: the
+warp retries until another warp's `tcgen05.dealloc` frees enough columns (in a CTA
+pair, the peer's too). When no other warp that could free them is still running it
+is a deadlock, and says so instead of hanging.
 
 ## tcgen05.ld and tcgen05.st
 
@@ -280,13 +282,70 @@ before waiting for it is not caught here.
   and `_ATOM_64B` ("swizzle 32B/64B chunks within 128B span"), and
   `tensormap.replace` their atomicity field. The `_FLIP_8B` variant is refused.
 
+## Rubin (sm_107): PTX ISA 9.4
+
+A simulated Rubin (`VGPU_GPU=nvidia/vr200`, compute capability 10.7) runs PTX for
+`sm_107a` and `sm_107f`. None of this is checked against a card -- CUDA 13.2's ptxas
+has no sm_107 target and there is no such GPU -- so each form is written from the
+ISA's text and its figures, and its tests (`tests/unit/test_rubin.cpp`, and the
+`ti16` and `spcompress` tests of `tests/unit/test_blackwell.cpp`) are the ISA's own
+examples or cases it states. There is no SASS for these forms; the PTX engine runs
+them.
+
+- **`tcgen05.mma.kind::ti16`** (and `.sp`, `.ws`): 16-bit `s1z4m11` elements -- a
+  sign, four zero bits and eleven bits of magnitude, range -2047..2047, read as sign
+  and magnitude -- into `s32`, K = 16 (32 sparse), the shapes of Table 48. Negate and
+  transpose are allowed, saturation is not (the instruction descriptor's bit 3 must
+  be 0); the accumulator wraps. Its sparse metadata is `.kind::f16`'s (figures
+  287-290).
+- **`tcgen05.ld{.red}.spcompress`**: the `.32x32b.xN` (N from 4) load of f32 columns
+  compressed 2:4 on the way into registers -- see `spcompress` below, with the rowop
+  (`.max`/`.min`, `.abs`) as the selection. `cdata` is N/2 registers, `mdata` N/32 (two
+  bits an index, low first). With `.red` the reduction covers the whole load, and
+  `.NaN` applies to it alone.
+- **`spcompress` / `spdecompress`** (9.7.10.30-31), as figures 43 and 44 draw them: of
+  each four elements, the two the descriptor's selection keeps, in index order, with
+  their indices in `mdata` a nibble (`.b4`) or two bits (`.b2`) each, low first; a NaN
+  is always kept, -0.0 is below +0.0, and where the ISA leaves ties to the
+  implementation the lower index goes first. `spdecompress` takes every `.sp::N:M`
+  factor of the ISA; an index past M is dropped (the ISA says that case is
+  implementation-specific).
+- **`cvt`**: `.rz` to the fp8, fp6 and fp4 types, `.pzo` (a -0.0 result becomes +0.0),
+  and `.scaled::n1::ue8m0` (one scale factor, the low byte, divides both inputs).
+- **The packed integer forms**: `add{.sat}`, `sub{.sat}`, `neg`, `min`/`max{.relu}` and
+  `set.CmpOp` on `.u8x4`, `.s8x4`, `.u16x2` and `.s16x2`, a lane at a time.
+  The SASS engine matches the PTX one on sm_120f (checked against a host loop in
+  `packed_int_forms`; the card here is sm_86, so these forms are derived from the
+  documentation, not checked against a card).
+- **Four-wide narrow-float arithmetic** (9.7.6, sm_100a and sm_103a): `add`, `sub`,
+  `mul` and `fma` with `.rn` and `.satfinite`, destination `.e5m2x4` or `.e4m3x4`,
+  sources of any of `.e5m2x4`, `.e4m3x4`, `.e3m2x4`, `.e2m3x4`, `.e2m1x4`,
+  `.e2m1p4x4`, `.ue8m0x4`. Each lane is combined exactly and rounded once, so `fma`
+  is fused; without `.satfinite` an e4m3 result past 448 is NaN and an e5m2 one
+  infinity. Derived from documentation, not checked against a card: ptxas of CUDA 13.2
+  rejects these forms ('Unexpected instruction types'), so there is no SASS for the
+  SASS engine to run; the PTX interpreter is the only engine for them.
+
+Refused by name, and why:
+
+- **`.ashift`**, still: the ISA 9.4 says no more about it than 9.2 did.
+- **`cvt.rs` to the x4 types**: figures 41 and 42 give a and b, e and f one shared field
+  of random bits each, without saying how a pair splits it.
+- **`.ue5m3x2`** and the UE5M3 scale type: the ISA gives the format's width and its NaN
+  but not its exponent bias.
+- **`decompress::lut::b`**: the packing of the three-bit indices in shared memory, the
+  lookup table's place in Tensor Memory and the compressed matrix's descriptor are only
+  in figures 279-282.
+
 ## Refused by name
 
 - **`.ashift`.** The ISA says only that A's rows shift down one "except for
   the last row". It doesn't say whether the MMA reads A before or after the
   shift, whether rows cross the 32-lane quarters, or what row 0 holds. No
   public code uses it to check against.
-- **The sm_107 additions** (`kind::ti16`, `decompress::lut`).
+- **The rest of sm_107's tensor core** (the 128-lane scale-factor layout, UE5M3 scales,
+  UE4M3 with `.block32`, the larger K of descriptor bits 3, 29 and 31, sparsity version 1,
+  `decompress::lut`): see the Rubin section.
 - **TMA's `.im2col::w` modes.** The ISA shows their halo walk only in
   figures. They leave open where `::w::128`'s halos come from and whether a
   halo crosses into the next image. No kernel code uses them to check

@@ -108,6 +108,29 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           for (const auto& c : op.coords) use_operand(c);
         }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpCvtFp8>) use_operand(op.sf);
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpSpCompress>) {
+          for (const auto& r : op.mdata) defs.push_back(K(r));
+          for (const auto& r : op.cdata) defs.push_back(K(r));
+          for (const auto& o : op.data) use_operand(o);
+          use_operand(op.spdesc);
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpSpDecompress>) {
+          for (const auto& r : op.data) defs.push_back(K(r));
+          for (const auto& o : op.mdata) use_operand(o);
+          for (const auto& o : op.cdata) use_operand(o);
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTex>) {
+          use_operand(op.obj);
+          for (const auto& c : op.coords) use_operand(c);
+          if (op.level) use_operand(op.lod);
+          for (const auto& o : op.offset) use_operand(o);
+          if (op.has_dref) use_operand(op.dref);
+        }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpSuld> ||
+                      std::is_same_v<std::decay_t<decltype(op)>, OpSust>) {
+          use_operand(op.obj);
+          for (const auto& c : op.coords) use_operand(c);
+        }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpMma>)
           for (const Operand* o : {&op.sfa, &op.sfa_byte, &op.sfa_thread, &op.sfb, &op.sfb_byte, &op.sfb_thread})
             use_operand(*o);
@@ -123,6 +146,7 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTcgen05>) {
           for (const auto& r : op.regs) (op.kind == Tcgen05Kind::Ld ? defs : uses).push_back(K(r));
           if (op.red) defs.push_back(K(op.red_dst));
+          for (const auto& r : op.sp_mdata) defs.push_back(K(r));
           for (const Operand* o : {&op.taddr, &op.ncols, &op.cta_mask, &op.d_tmem, &op.b_desc,
                                    &op.idesc, &op.enable_d, &op.scale_a, &op.scale_b, &op.sp_meta,
                                    &op.zero_mask})

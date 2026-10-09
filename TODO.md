@@ -1938,20 +1938,35 @@ behaviour, timing).
 
 ### PTX and SASS execution
 
-- PTX parser: `.ashift`; sm_107 and sm_107f forms (src/ptx/parser.cpp:1790, :1851, :1860, :1884, :2952,
-  :2984-2988); cvt `.rs` for x4; `.hi` for anything but `mul` (:4138); `wmma` kinds other than
-  load/mma/store.d (:2218); multi-sample textures (:4472); `suld`/`sust` `.p` (:4534); `tex.level` LOD (:4480);
-  `tex.grad`, `tld4` on layered/cubemap and with a level (:4478-4498); signed 8-bit normalized linear
-  filtering (src/exec/interpreter.cpp:1326, :1445); anisotropy and resource views (driver_api.cpp:3252, :3261).
-- Device printf: `%ls` and `%n` (include/vgpu/exec/device_printf.hpp:115, :122). TMA: sub-byte im2col and
-  `.b4x16` alignment (include/vgpu/exec/tma.hpp:50, :64); tensor-map restrictions (tensormap.hpp:210, :262, :351).
-- SASS executor (nvidia/docs/sass.md "Coverage"): `LDGMC` (multimem); TMA `im2col::w` (src/sass/exec_ops.inc:3800);
-  texture forms with an LOD clamp, offsets, depth compare or LOD bias (exec_ops.inc:2381-2386);
-  `WARPSYNC.COLLECTIVE` from divergent paths (:2886); some `SYNCS.ARRIVE` modes (:3631, :3661); tcgen05 forms
-  (:4164); a cooperative launch with clusters (src/sass/exec.cpp:818); and five generic "SASS: <op> is not
-  implemented yet" sites (exec_ops.inc:857, :1708, :2141, :2238, :3185).
-- Blackwell (nvidia/docs/blackwell.md): the `tcgen05.alloc` blocking wait (:36) and the refused forms listed at
-  :81, :103, :118, :127, :157, :170, :214, :223, :232-233, :276-292.
+Done in round 3 (branch r3-ptx-sass; each with a test, and the texture, surface and printf ones
+bit for bit against an RTX 3060): the offset, depth-reference, destination-predicate and half-precision
+operands of `tex` and `tld4`, `tld4` on layered, cube and cube-array textures, linear filtering of
+signed 8-bit normalized texels (an exact fit), `sust.p`, device printf `%ls` and `%n`, a cooperative
+launch of clusters on SASS, and -- from PTX ISA 9.4, derived from the documentation and not checked
+against a card (no ptxas or GPU for sm_107) -- `spcompress`/`spdecompress`, `tcgen05.ld{.red}.spcompress`,
+`tcgen05.mma.kind::ti16`, `cvt` `.rz` / `.pzo` / `.scaled::n1::ue8m0`, the packed `.u8x4`/`.s8x4`/`.u16x2`/`.s16x2`
+integer instructions (the SASS side of them on sm_120f compared with a host loop), the four-wide narrow-float
+`add`/`sub`/`mul`/`fma` of sm_100a and sm_103a (PTX engine only: ptxas refuses them), K = 64 for the 8-bit tcgen05 kinds, the 128-lane scale-factor A layout, and UE4M3
+with `.block32`. Not items at all: `wmma` has only `load`, `mma` and `store.d` in the ISA, and `.hi` exists
+only for `mul`, `mad`, `mul24` and `mad24`; the five "not implemented yet" faults in `src/sass/exec_ops.inc`
+are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking wait was done long ago.
+
+Still open, each with the reason:
+
+- `tex.grad`: the level of detail an RTX 3060 derives from gradients fits no formula tried (12,000 fetches
+  measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
+  fetches, measured) and resource views (the runtime's, `driver_api.cpp:3440`).
+- `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
+  `.ue5m3x2` and UE5M3 scale factors: the ISA gives no exponent bias; `tcgen05.mma.ashift` and
+  `decompress::lut::b`: only figures; `.kind::mxf4`'s K = 128 and sparsity version 1; K = 128 sparse for the
+  8-bit kinds; the 128-lane A layout over a CTA pair at M = 128.
+- TMA: `im2col::w` / `im2col_no_offs::w` (figures 16-20 only), im2col of packed sub-byte types, interleaved
+  layouts and `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B` (`tensormap.hpp`), a `.b4x16` copy that does not start
+  on a group of 16 (the ISA is silent).
+- SASS executor: `LDGMC` / `multimem` (needs `cuMulticast*`, which are the runtime's and refuse), texture
+  fetches with a LOD bias or clamp and per-texel gather offsets (no PTX produces them), `WARPSYNC.COLLECTIVE`
+  from different paths (no document, no sample), `SYNCS.ARRIVE` modes 6 and 7 and `UTCCP` shapes 1 and 7
+  (no PTX produces them).
 - Static cudart, `cuGetExportTable`: blocked (see "Next milestones" 4; nvidia/docs/dark-api.md).
 - CUPTI (nvidia/docs/cupti.md): per-API activity controls, the timestamp callback and device-side timestamps
   (:70); no Callback API deliveries, no Event or Profiling metrics, nothing derived from time (:121-139).
