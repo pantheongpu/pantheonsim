@@ -18,7 +18,7 @@ what was written (D, the auxiliary output, the amax values, the block scales).
 
 | Probe | Program | Library | Cases |
 | --- | --- | --- | --- |
-| `lt` | `nvidia/tests/e2e/lowprec_lt.cu` | cuBLASLt | 1247 descriptors |
+| `lt` | `nvidia/tests/e2e/lowprec_lt.cu` | cuBLASLt | 1278 descriptors |
 | `sparselt` | `nvidia/tests/e2e/lowprec_sparselt.cpp` | cuSPARSELt | 1096 problems |
 | `cvt` | `nvidia/tests/e2e/lowprec_cvt.cu` | PTX `cvt` to and from e4m3x2, e5m2x2 | 9 forms x 512 values |
 | `ptx120` | `mma_blockscale.cu`, `narrow_cvt.cu`, `ldmatrix_forms.cu` | sm_120a's `mma.sync` block-scaled forms, fp4/fp6 conversions, ldmatrix expansions | (no card transcript yet, below) |
@@ -40,7 +40,7 @@ at another set of NVIDIA libraries (a pip wheel's, for instance).
 
 | Profile | Read from | What |
 | --- | --- | --- |
-| `nvidia/l4` (sm_89) | an AWS g6.xlarge, driver 595.91, cuBLAS 13.3 (CUDA 13.2), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`; `cuda_attributes_l4.card.txt`; `nvidia-smi -q` |
+| `nvidia/l4` (sm_89) | an AWS g6.xlarge (three sessions), driver 595.91, cuBLAS 13.3 (CUDA 13.2), cuSPARSELt 0.10.0.12 | `lt`, `sparselt`, `cvt`; `cuda_attributes_l4.card.txt`; `nvidia-smi -q` (serial number, PDI and UUID redacted) |
 | `nvidia/rtx3060` (sm_86) | the development machine, the same libraries | `lt`, `sparselt`; cuDNN 9.27 for `dnn_int8x32` |
 
 Nothing was measured on Hopper or Blackwell: AWS had no p5.4xlarge or
@@ -49,10 +49,20 @@ attempts (ledger lines in the hand-back; no instance was created). So the
 H100, RTX PRO 6000 and B200 columns are documentation-derived (below), and the
 `ptx120` probe has its program and runner but no transcript.
 
-The same cuBLAS version matters: on the L4 the CUDA 13.2 library differs from
-13.0's on 9 lines of the 1247 (only the per-batch scale mode, which 13.0's header
-does not have), from 12.9's on 93 and from 12.8's on 172, so the transcripts are
-cuBLAS 13.3's and a program built for an older cuBLAS can see older answers.
+The cuBLAS version matters. The transcripts are cuBLAS 13.3's (CUDA 13.2). On the
+L4 the CUDA 13.0 library differs from it on 9 lines of the first 1247 (only the
+per-batch scale mode, which 13.0's header does not have), 12.9's on 93 and 12.8's on
+172, so a program built for an older cuBLAS can see older answers. cuBLAS 13.8
+(the pip wheel, `nvidia-cublas==13.8.1.7`, kept as
+`nvidia/tests/data/lowprec/other/lt.l4.cublas13.8.txt`) differs on 52 lines: it
+knows the packed `VEC128/VEC32_MN_K4_UE8M0` modes (it answers `NOT_SUPPORTED` on the
+L4, in the same family as `VEC32_UE8M0`, where 13.3 answers `INVALID_VALUE` for an
+unknown mode) and has fp32-output kernels for `GELU_BIAS`, `RELU_AUX_BIAS` and
+`GELU_AUX_BIAS` that 13.3 refuses. The shim follows 13.3.
+
+A transcript lists the cases its card ran. `run_lowprec.sh` compares those and not
+the cases a probe has grown since, so a probe can gain a group before every card has
+run it (the L4 and RTX 3060 transcripts are the same 1278 now).
 
 ## What the cards say
 

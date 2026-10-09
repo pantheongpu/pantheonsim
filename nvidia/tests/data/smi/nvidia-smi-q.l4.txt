@@ -1,7 +1,7 @@
 
 ==============NVSMI LOG==============
 
-Timestamp                                              : Fri Oct  9 14:34:55 2026
+Timestamp                                              : Fri Oct  9 15:23:19 2026
 Driver Version                                         : 595.91.07
 CUDA Version                                           : 13.2
 
@@ -92,7 +92,7 @@ GPU 00000000:31:00.0
     Fan Speed                                          : N/A
     Performance State                                  : P0
     Clocks Event Reasons
-        Idle                                           : Not Active
+        Idle                                           : Active
         Applications Clocks Setting                    : Not Active
         SW Power Cap                                   : Not Active
         HW Slowdown                                    : Not Active
@@ -123,8 +123,8 @@ GPU 00000000:31:00.0
         Free                                           : 0 MiB
     Compute Mode                                       : Default
     Utilization
-        GPU                                            : 4 %
-        Memory                                         : 1 %
+        GPU                                            : 0 %
+        Memory                                         : 0 %
         Encoder                                        : 0 %
         Decoder                                        : 0 %
         JPEG                                           : 0 %
@@ -184,8 +184,8 @@ GPU 00000000:31:00.0
             Low                                        : 0 bank(s)
             None                                       : 0 bank(s)
     Temperature
-        GPU Current Temp                               : 63 C
-        GPU T.Limit Temp                               : 23 C
+        GPU Current Temp                               : 55 C
+        GPU T.Limit Temp                               : 29 C
         GPU Shutdown T.Limit Temp                      : -5 C
         GPU Slowdown T.Limit Temp                      : -2 C
         GPU Max Operating T.Limit Temp                 : 0 C
@@ -193,8 +193,8 @@ GPU 00000000:31:00.0
         Memory Current Temp                            : N/A
         Memory Max Operating T.Limit Temp              : N/A
     GPU Power Readings
-        Average Power Draw                             : 31.91 W
-        Instantaneous Power Draw                       : 31.59 W
+        Average Power Draw                             : 29.93 W
+        Instantaneous Power Draw                       : 30.90 W
         Current Power Limit                            : 72.00 W
         Requested Power Limit                          : 72.00 W
         Default Power Limit                            : 72.00 W

@@ -76,7 +76,7 @@ was read from the card, and these runs read only what is listed.
 | Profile | Card | What was read | Result |
 | --- | --- | --- | --- |
 | `nvidia/l4` | AWS g6.xlarge, driver 595.91.07, CUDA 13.2 | `device_attributes --dump` (`nvidia/tests/data/cuda_attributes_l4.card.txt`), `nvidia-smi -q`, PCI ids, clocks, power limit, memory total | Matches the profile except: `persistingL2CacheMaxSize` is 34603008 (the profile had the A100's three quarters of L2, 37748736: **corrected**); `cudaDevAttrMemoryPoolSupportedHandleTypes` 9; the PCI bus, UUID and subsystem id (where the card sits, not the model's); and the capabilities the simulator does not implement (43 attributes, host memory pools, DMA-BUF, RDMA, fabric handles ...). The nvidia-smi values in the profile (23034 MiB, 72 W, 2040 and 6251 MHz, 0x27B8) are the card's. |
-| `nvidia/l4` | the same | cuBLASLt, cuSPARSELt and the FP8 conversions, 2700 cases | reproduced line for line ([lowprec.md](lowprec.md)) |
+| `nvidia/l4` | the same | cuBLASLt, cuSPARSELt and the FP8 conversions, 6900 lines | reproduced line for line ([lowprec.md](lowprec.md)) |
 | `nvidia/rtx3060` | the development machine | the same probes | reproduced line for line |
 | `nvidia/l40s`, `nvidia/rtx4090`, `nvidia/l40` | none | none | Same compute capability as the L4, so the FP8 kernel table the L4 answered is applied to them; not a measurement of them. |
 | `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb`, `nvidia/h200` | none | none | AWS had no `p5.4xlarge` capacity (three attempts, six zones). The Hopper FP8 rules are documentation-derived. |

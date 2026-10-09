@@ -1,5 +1,5 @@
 # device NVIDIA L4 sm_89
-# cublasLt 130300
+# cublasLt 130801
 fp8types/NN_e4m3e4m3_cbf16_dbf16 h=15:0 m=15
 fp8types/NN_e4m3e4m3_cf16_df16 h=15:0 m=15
 fp8types/NN_e4m3e4m3_cf32_df32 h=15:0 m=15
@@ -549,12 +549,12 @@ fp8epi/relu_bias_df32 h=0:1 m=0 d=4cd8a4293a995e2b
 fp8epi/relu_bias_df32_biasbf16 h=0:1 m=0 d=4cd8a4293a995e2b
 fp8epi/relu_bias_df32_biasf16 h=15:0 m=15
 fp8epi/relu_bias_df32_biasf32 h=15:0 m=15
-fp8epi/relu_aux_bias_df32 h=15:0 m=15
+fp8epi/relu_aux_bias_df32 h=0:1 m=0 d=4cd8a4293a995e2b aux=5dbe08fb7c1756a9
 fp8epi/relu_aux_bias_df32_auxf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_auxf32 h=7:0 m=7
-fp8epi/relu_aux_bias_df32_biasbf16 h=15:0 m=15
+fp8epi/relu_aux_bias_df32_biasbf16 h=0:1 m=0 d=4cd8a4293a995e2b aux=5dbe08fb7c1756a9
 fp8epi/relu_aux_bias_df32_biasbf16_auxf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_biasbf16_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_biasbf16_auxe4m3 h=7:0 m=7
@@ -575,20 +575,20 @@ fp8epi/gelu_aux_df32_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_df32_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_df32_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_df32_auxf32 h=0:1 m=0 gelu=ok aux=7848276900548470
-fp8epi/gelu_bias_df32 h=15:0 m=15
-fp8epi/gelu_bias_df32_biasbf16 h=15:0 m=15
+fp8epi/gelu_bias_df32 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_df32_biasbf16 h=0:1 m=0 gelu=ok
 fp8epi/gelu_bias_df32_biasf16 h=15:0 m=15
 fp8epi/gelu_bias_df32_biasf32 h=15:0 m=15
-fp8epi/gelu_aux_bias_df32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
 fp8epi/gelu_aux_bias_df32_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df32_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df32_auxe4m3 h=7:0 m=7
-fp8epi/gelu_aux_bias_df32_auxf32 h=15:0 m=15
-fp8epi/gelu_aux_bias_df32_biasbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32_auxf32 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
+fp8epi/gelu_aux_bias_df32_biasbf16 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
 fp8epi/gelu_aux_bias_df32_biasbf16_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df32_biasbf16_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df32_biasbf16_auxe4m3 h=7:0 m=7
-fp8epi/gelu_aux_bias_df32_biasbf16_auxf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32_biasbf16_auxf32 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
 fp8epi/gelu_aux_bias_df32_biasf16 h=15:0 m=15
 fp8epi/gelu_aux_bias_df32_biasf16_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df32_biasf16_auxbf16 h=7:0 m=7
@@ -1015,8 +1015,8 @@ scalemix/v32_outer_e4m3 h=7:0 m=7
 scalemix/v32_v128_e4m3 h=7:0 m=7
 scalemix/v32_b128_e4m3 h=7:0 m=7
 scalemix/v32_pb_e4m3 h=7:0 m=7
-scalemix/v32_mk128_e4m3 h=7:0 m=7
-scalemix/v32_mk32_e4m3 h=7:0 m=7
+scalemix/v32_mk128_e4m3 h=15:0 m=15
+scalemix/v32_mk32_e4m3 h=15:0 m=15
 scalemix/v16_sc_e4m3 h=7:0 m=7
 scalemix/v16_v32_e4m3 h=7:0 m=7
 scalemix/v16_v16_e4m3 h=7:0 m=7
@@ -1063,23 +1063,23 @@ scalemix/pb_pb_e4m3 h=15:0 m=15
 scalemix/pb_mk128_e4m3 h=7:0 m=7
 scalemix/pb_mk32_e4m3 h=7:0 m=7
 scalemix/mk128_sc_e4m3 h=7:0 m=7
-scalemix/mk128_v32_e4m3 h=7:0 m=7
+scalemix/mk128_v32_e4m3 h=15:0 m=15
 scalemix/mk128_v16_e4m3 h=7:0 m=7
 scalemix/mk128_outer_e4m3 h=7:0 m=7
 scalemix/mk128_v128_e4m3 h=7:0 m=7
 scalemix/mk128_b128_e4m3 h=7:0 m=7
 scalemix/mk128_pb_e4m3 h=7:0 m=7
-scalemix/mk128_mk128_e4m3 h=7:0 m=7
-scalemix/mk128_mk32_e4m3 h=7:0 m=7
+scalemix/mk128_mk128_e4m3 h=15:0 m=15
+scalemix/mk128_mk32_e4m3 h=15:0 m=15
 scalemix/mk32_sc_e4m3 h=7:0 m=7
-scalemix/mk32_v32_e4m3 h=7:0 m=7
+scalemix/mk32_v32_e4m3 h=15:0 m=15
 scalemix/mk32_v16_e4m3 h=7:0 m=7
 scalemix/mk32_outer_e4m3 h=7:0 m=7
 scalemix/mk32_v128_e4m3 h=7:0 m=7
 scalemix/mk32_b128_e4m3 h=7:0 m=7
 scalemix/mk32_pb_e4m3 h=7:0 m=7
-scalemix/mk32_mk128_e4m3 h=7:0 m=7
-scalemix/mk32_mk32_e4m3 h=7:0 m=7
+scalemix/mk32_mk128_e4m3 h=15:0 m=15
+scalemix/mk32_mk32_e4m3 h=15:0 m=15
 fp4/NN_v16_dbf16 h=15:0 m=15
 fp4/NN_v16_df16 h=15:0 m=15
 fp4/NN_v16_df32 h=15:0 m=15
@@ -1210,51 +1210,51 @@ hopshape/TN_v128_v128_16x16x64 h=15:0 m=15
 hopshape/TN_b128_v128_16x16x64 h=15:0 m=15
 hopout/de4m3 h=7:0 m=7
 hopout/dfp4 h=15:0 m=15
-mnk4/NN_mk128_dbf16 h=7:0 m=7
-mnk4/NN_mk128_df32 h=7:0 m=7
-mnk4/NN_mk32_dbf16 h=7:0 m=7
-mnk4/NN_mk32_df32 h=7:0 m=7
-mnk4/NT_mk128_dbf16 h=7:0 m=7
-mnk4/NT_mk128_df32 h=7:0 m=7
-mnk4/NT_mk32_dbf16 h=7:0 m=7
-mnk4/NT_mk32_df32 h=7:0 m=7
-mnk4/TN_mk128_dbf16 h=7:0 m=7
-mnk4/TN_mk128_df32 h=7:0 m=7
-mnk4/TN_mk32_dbf16 h=7:0 m=7
-mnk4/TN_mk32_df32 h=7:0 m=7
-mnk4/TT_mk128_dbf16 h=7:0 m=7
-mnk4/TT_mk128_df32 h=7:0 m=7
-mnk4/TT_mk32_dbf16 h=7:0 m=7
-mnk4/TT_mk32_df32 h=7:0 m=7
-mnk4shape/TN_mk128_128x128x256 h=7:0 m=7
-mnk4shape/TN_mk32_128x128x256 h=7:0 m=7
-mnk4shape/TN_mk128_64x64x64 h=7:0 m=7
-mnk4shape/TN_mk32_64x64x64 h=7:0 m=7
-mnk4shape/TN_mk128_32x32x32 h=7:0 m=7
-mnk4shape/TN_mk32_32x32x32 h=7:0 m=7
-mnk4shape/TN_mk128_160x96x192 h=7:0 m=7
-mnk4shape/TN_mk32_160x96x192 h=7:0 m=7
-mnk4shape/TN_mk128_128x128x96 h=7:0 m=7
-mnk4shape/TN_mk32_128x128x96 h=7:0 m=7
-mnk4shape/TN_mk128_192x64x512 h=7:0 m=7
-mnk4shape/TN_mk32_192x64x512 h=7:0 m=7
-mnk4shape/TN_mk128_256x256x1024 h=7:0 m=7
-mnk4shape/TN_mk32_256x256x1024 h=7:0 m=7
-mnk4shape/TN_mk128_128x128x640 h=7:0 m=7
-mnk4shape/TN_mk32_128x128x640 h=7:0 m=7
-mnk4shape/TN_mk128_16x16x64 h=7:0 m=7
-mnk4shape/TN_mk32_16x16x64 h=7:0 m=7
+mnk4/NN_mk128_dbf16 h=15:0 m=15
+mnk4/NN_mk128_df32 h=15:0 m=15
+mnk4/NN_mk32_dbf16 h=15:0 m=15
+mnk4/NN_mk32_df32 h=15:0 m=15
+mnk4/NT_mk128_dbf16 h=15:0 m=15
+mnk4/NT_mk128_df32 h=15:0 m=15
+mnk4/NT_mk32_dbf16 h=15:0 m=15
+mnk4/NT_mk32_df32 h=15:0 m=15
+mnk4/TN_mk128_dbf16 h=15:0 m=15
+mnk4/TN_mk128_df32 h=15:0 m=15
+mnk4/TN_mk32_dbf16 h=15:0 m=15
+mnk4/TN_mk32_df32 h=15:0 m=15
+mnk4/TT_mk128_dbf16 h=15:0 m=15
+mnk4/TT_mk128_df32 h=15:0 m=15
+mnk4/TT_mk32_dbf16 h=15:0 m=15
+mnk4/TT_mk32_df32 h=15:0 m=15
+mnk4shape/TN_mk128_128x128x256 h=15:0 m=15
+mnk4shape/TN_mk32_128x128x256 h=15:0 m=15
+mnk4shape/TN_mk128_64x64x64 h=15:0 m=15
+mnk4shape/TN_mk32_64x64x64 h=15:0 m=15
+mnk4shape/TN_mk128_32x32x32 h=15:0 m=15
+mnk4shape/TN_mk32_32x32x32 h=15:0 m=15
+mnk4shape/TN_mk128_160x96x192 h=15:0 m=15
+mnk4shape/TN_mk32_160x96x192 h=15:0 m=15
+mnk4shape/TN_mk128_128x128x96 h=15:0 m=15
+mnk4shape/TN_mk32_128x128x96 h=15:0 m=15
+mnk4shape/TN_mk128_192x64x512 h=15:0 m=15
+mnk4shape/TN_mk32_192x64x512 h=15:0 m=15
+mnk4shape/TN_mk128_256x256x1024 h=15:0 m=15
+mnk4shape/TN_mk32_256x256x1024 h=15:0 m=15
+mnk4shape/TN_mk128_128x128x640 h=15:0 m=15
+mnk4shape/TN_mk32_128x128x640 h=15:0 m=15
+mnk4shape/TN_mk128_16x16x64 h=15:0 m=15
+mnk4shape/TN_mk32_16x16x64 h=15:0 m=15
 bsbatch/v32_b2 h=15:0 m=15
 bsbatch/v32_odd_b2 h=15:0 m=15
 bsbatch/v16_b2 h=15:0 m=15
 bsbatch/hop_b2 h=15:0 m=15
-bsbatch/mnk4_b2 h=7:0 m=7
+bsbatch/mnk4_b2 h=15:0 m=15
 bsbatch/v32_dout_b2 h=15:0 m=15
 bsbatch/v32_b3 h=15:0 m=15
 bsbatch/v32_odd_b3 h=15:0 m=15
 bsbatch/v16_b3 h=15:0 m=15
 bsbatch/hop_b3 h=15:0 m=15
-bsbatch/mnk4_b3 h=7:0 m=7
+bsbatch/mnk4_b3 h=15:0 m=15
 bsbatch/v32_dout_b3 h=15:0 m=15
 bsepi/mx8_bias h=15:0 m=15
 bsepi/nv4_bias h=15:0 m=15
