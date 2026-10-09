@@ -433,10 +433,10 @@ static void argument_checks() {
 // older headers lack them. Skipped where the library has no such entry (CUDA 12 before 12.8) or,
 // for this shim without the toolkit's NVRTC, refuses the option.
 static void pch_time_and_flow() {
-  using PchStatus = nvrtcResult (*)(nvrtcProgram);
-  using HeapGet = nvrtcResult (*)(size_t*);
-  using HeapSet = nvrtcResult (*)(size_t);
-  using FlowSet = nvrtcResult (*)(nvrtcProgram, int (*)(void*, void*), void*);
+  using PchStatus = int (*)(nvrtcProgram);   // (results past 11 are ints: CUDA 12's enum has no such values)
+  using HeapGet = int (*)(size_t*);
+  using HeapSet = int (*)(size_t);
+  using FlowSet = int (*)(nvrtcProgram, int (*)(void*, void*), void*);
   auto status = reinterpret_cast<PchStatus>(dlsym(RTLD_DEFAULT, "nvrtcGetPCHCreateStatus"));
   auto heap_get = reinterpret_cast<HeapGet>(dlsym(RTLD_DEFAULT, "nvrtcGetPCHHeapSize"));
   auto heap_set = reinterpret_cast<HeapSet>(dlsym(RTLD_DEFAULT, "nvrtcSetPCHHeapSize"));
@@ -460,47 +460,47 @@ static void pch_time_and_flow() {
   char dir[] = "/tmp/vgpu_nvrtc_pch_XXXXXX";
   if (!mkdtemp(dir)) { check(false, "a scratch directory"); return; }
   const std::string d = dir;
-  auto build = [&](std::vector<std::string> extra, std::string* log, nvrtcResult* st) {
+  auto build = [&](std::vector<std::string> extra, std::string* log, int* st) {
     nvrtcProgram p;
     nvrtcCreateProgram(&p, src, "p.cu", 1, &hdr, &hdr_name);
     std::vector<std::string> o = {"--gpu-architecture=compute_80"};
     o.insert(o.end(), extra.begin(), extra.end());
     std::vector<const char*> argv;
     for (auto& s : o) argv.push_back(s.c_str());
-    const nvrtcResult rc = nvrtcCompileProgram(p, (int)argv.size(), argv.data());
+    const int rc = static_cast<int>(nvrtcCompileProgram(p, (int)argv.size(), argv.data()));
     *log = log_of(p);
     *st = status(p);
     nvrtcDestroyProgram(&p);
     return rc;
   };
   std::string log;
-  nvrtcResult st;
-  nvrtcResult rc = build({"--create-pch=" + d + "/a.pch"}, &log, &st);
+  int st;
+  int rc = build({"--create-pch=" + d + "/a.pch"}, &log, &st);
   if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim() && log.find("libnvrtc") != std::string::npos) {
     std::printf("skip precompiled headers need the toolkit's libnvrtc, which is not installed\n");
   } else {
     struct stat sb;
     check(rc == NVRTC_SUCCESS && st == NVRTC_SUCCESS && stat((d + "/a.pch").c_str(), &sb) == 0 && sb.st_size > 0,
           "--create-pch writes the header and the creation status reads SUCCESS");
-    const nvrtcResult rc2 = build({"--use-pch=" + d + "/a.pch"}, &log, &st);
-    check(rc2 == NVRTC_SUCCESS && st == static_cast<nvrtcResult>(13) && log.find("using precompiled header") != std::string::npos,
+    const int rc2 = build({"--use-pch=" + d + "/a.pch"}, &log, &st);
+    check(rc2 == NVRTC_SUCCESS && st == 13 && log.find("using precompiled header") != std::string::npos,
           "--use-pch uses it, and no creation was attempted");
-    const nvrtcResult rc3 = build({"--use-pch=" + d + "/missing.pch"}, &log, &st);
+    const int rc3 = build({"--use-pch=" + d + "/missing.pch"}, &log, &st);
     check(rc3 == NVRTC_ERROR_COMPILATION && log.find("missing.pch") != std::string::npos, "a missing PCH file is a compile error naming it");
     rc = build({"--pch", "--pch-dir=" + d}, &log, &st);
-    const nvrtcResult again = build({"--pch", "--pch-dir=" + d}, &log, &st);
-    check(rc == NVRTC_SUCCESS && again == NVRTC_SUCCESS && st == static_cast<nvrtcResult>(13), "--pch creates a header once and then reuses it");
+    const int again = build({"--pch", "--pch-dir=" + d}, &log, &st);
+    check(rc == NVRTC_SUCCESS && again == NVRTC_SUCCESS && st == 13, "--pch creates a header once and then reuses it");
     // A heap too small for the header: the program still compiles, the status says so, the required size is reported.
     heap_set(4096);
     nvrtcProgram p;
     nvrtcCreateProgram(&p, src, "p.cu", 1, &hdr, &hdr_name);
     const std::string tiny = "--create-pch=" + d + "/tiny.pch";
     const char* o[] = {"--gpu-architecture=compute_80", tiny.c_str()};
-    rc = nvrtcCompileProgram(p, 2, o);
-    using Req = nvrtcResult (*)(nvrtcProgram, size_t*);
+    rc = static_cast<int>(nvrtcCompileProgram(p, 2, o));
+    using Req = int (*)(nvrtcProgram, size_t*);
     auto required = reinterpret_cast<Req>(dlsym(RTLD_DEFAULT, "nvrtcGetPCHHeapSizeRequired"));
     size_t need = 0;
-    check(rc == NVRTC_SUCCESS && status(p) == static_cast<nvrtcResult>(14) && required && required(p, &need) == NVRTC_SUCCESS && need > 4096,
+    check(rc == NVRTC_SUCCESS && status(p) == 14 && required && required(p, &need) == NVRTC_SUCCESS && need > 4096,
           "a PCH heap that is too small reports PCH_CREATE_HEAP_EXHAUSTED and the size it needs");
     nvrtcDestroyProgram(&p);
     heap_set(before);
@@ -510,7 +510,7 @@ static void pch_time_and_flow() {
   nvrtcCreateProgram(&t, src, "p.cu", 1, &hdr, &hdr_name);
   const std::string csv = "--time=" + d + "/time.csv";
   const char* to[] = {"--gpu-architecture=compute_80", csv.c_str()};
-  rc = nvrtcCompileProgram(t, 2, to);
+  rc = static_cast<int>(nvrtcCompileProgram(t, 2, to));
   if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim()) {
     std::printf("skip --time needs the toolkit's libnvrtc, which is not installed\n");
   } else {
@@ -524,8 +524,8 @@ static void pch_time_and_flow() {
     nvrtcProgram u;
     nvrtcCreateProgram(&u, src, "p.cu", 1, &hdr, &hdr_name);
     const char* bad[] = {"--gpu-architecture=compute_80", "--time=/nonexistent_vgpu_dir/t.csv"};
-    const nvrtcResult brc = nvrtcCompileProgram(u, 2, bad);
-    check(brc == static_cast<nvrtcResult>(12) && log_of(u).find("failed to open file") != std::string::npos,
+    const int brc = static_cast<int>(nvrtcCompileProgram(u, 2, bad));
+    check(brc == 12 && log_of(u).find("failed to open file") != std::string::npos,
           "an unwritable --time path is NVRTC_ERROR_TIME_FILE_WRITE_FAILED");
     nvrtcDestroyProgram(&u);
   }
@@ -541,9 +541,9 @@ static void pch_time_and_flow() {
   flow(f, Cb::cancel, nullptr);
   const char* fo[] = {"--gpu-architecture=sm_80"};
   calls = 0;
-  const nvrtcResult frc = nvrtcCompileProgram(f, 1, fo);
+  const int frc = static_cast<int>(nvrtcCompileProgram(f, 1, fo));
   size_t cs = 7;
-  check(frc == static_cast<nvrtcResult>(16) && calls >= 1 && nvrtcGetCUBINSize(f, &cs) == NVRTC_SUCCESS && cs == 0,
+  check(frc == 16 && calls >= 1 && nvrtcGetCUBINSize(f, &cs) == NVRTC_SUCCESS && cs == 0,
         "a callback that returns 1 cancels the compile: NVRTC_ERROR_CANCELLED, no cubin");
   nvrtcDestroyProgram(&f);
   nvrtcProgram g;

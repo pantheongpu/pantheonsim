@@ -1880,6 +1880,15 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # An sm_XYa cubin on the GPUs that do and do not run it: a B300 and a Vera Rubin fall back to the
+  # fatbin's PTX, a Hopper has nothing to run.
+  add_test(NAME e2e_arch_specific_cubins
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_arch_specific.sh)
+  set_tests_properties(e2e_arch_specific_cubins PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)
   set_tests_properties(e2e_rdc_link PROPERTIES

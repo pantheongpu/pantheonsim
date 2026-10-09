@@ -82,7 +82,7 @@ struct RealJitLink {
   void* lib = nullptr;
   nvJitLinkResult (*create)(nvJitLinkHandle*, uint32_t, const char**) = nullptr;
   nvJitLinkResult (*destroy)(nvJitLinkHandle*) = nullptr;
-  nvJitLinkResult (*add_data)(nvJitLinkHandle, nvJitLinkInputType, const void*, size_t, const char*) = nullptr;
+  nvJitLinkResult (*add_data)(nvJitLinkHandle, int, const void*, size_t, const char*) = nullptr;   // (the input type is an int on the wire)
   nvJitLinkResult (*complete)(nvJitLinkHandle) = nullptr;
   nvJitLinkResult (*cubin_size)(nvJitLinkHandle, size_t*) = nullptr;
   nvJitLinkResult (*cubin)(nvJitLinkHandle, void*) = nullptr;
@@ -190,7 +190,7 @@ struct Link {
   // The toolkit's linker finishes the link when an input is one only it reads:
   // every input as given is kept for it, and what it makes comes back here.
   struct Raw {
-    nvJitLinkInputType type;
+    int type;   // the input type as the caller gave it (maybe past what this header's enum holds)
     std::string data, label;
   };
   std::vector<std::string> option_strings;
@@ -592,7 +592,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkAddData(nvJitLinkHandle handle, nvJitLinkIn
   if (size == 0) return NVJITLINK_ERROR_INVALID_INPUT;
   const std::string label =
       name ? std::string(name) : "(unnamed input " + std::to_string(++L->unnamed) + ")";
-  L->raw.push_back({inputType, std::string(static_cast<const char*>(data), size), label});
+  L->raw.push_back({static_cast<int>(inputType), std::string(static_cast<const char*>(data), size), label});
   return add_input(*L, inputType, data, size, label);
 }
 
@@ -609,7 +609,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkAddFile(nvJitLinkHandle handle, nvJitLinkIn
   }
   const std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   if (bytes.empty()) return NVJITLINK_ERROR_INVALID_INPUT;
-  L->raw.push_back({inputType, bytes, fileName});
+  L->raw.push_back({static_cast<int>(inputType), bytes, fileName});
   return add_input(*L, inputType, bytes.data(), bytes.size(), fileName);
 }
 
@@ -641,8 +641,8 @@ static nvJitLinkResult complete_with_toolkit(Link& L) {
   }
   for (const Link::Raw& in : L.raw) {
     // A "cubin" this library handed out earlier is PTX text.
-    nvJitLinkInputType type = in.type;
-    if (static_cast<int>(type) == NVJITLINK_INPUT_CUBIN &&
+    int type = in.type;
+    if (type == NVJITLINK_INPUT_CUBIN &&
         vgpu::cuda::classify_blob(in.data.data(), in.data.size()) == vgpu::cuda::BlobKind::Ptx)
       type = NVJITLINK_INPUT_PTX;
     rc = r.add_data(h, type, in.data.data(), in.data.size(), in.label.c_str());
