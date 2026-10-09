@@ -656,12 +656,15 @@ struct Part {
 };
 
 // The path and slicing of the network within `limit` bytes of scratch.
-Status plan_part(NetBuild& b, uint64_t limit, Part& part, const char* api) {
+Status plan_part(Handle* h, NetBuild& b, uint64_t limit, Part& part, const char* api) {
   if (b.net.in.empty()) return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "an empty network");
   const auto ext = extent_map(b.net);
   Path p;
   p.steps = greedy_path(b.net, ext);
-  if (!choose_slicing(b.net, p, limit, 1))
+  // Distributed: at least a slice for each rank (as the optimizer of the network API).
+  World world;
+  if (Status st = world_of(h, world, api)) return st;
+  if (!choose_slicing(b.net, p, limit, std::max<int32_t>(1, world.size)))
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Max device workspace size is less than minimally required!");
   Info info;
   describe(b.net, p, info);
@@ -672,15 +675,29 @@ Status plan_part(NetBuild& b, uint64_t limit, Part& part, const char* api) {
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
-// Contracts the planned network into `out`.
+// Contracts the planned network into `out`. With a communicator, the
+// computations of values (amplitudes, marginals, expectation values and the
+// norms) deal the slices to the ranks and sum their outputs in place
+// (Dist::Sum, measured on NVIDIA's library: one in-place sum for each output
+// tensor and for each norm, and one for an expectation value's components
+// together); Dist::Part leaves the sum to the caller.
+enum class Dist { None, Sum, Part };
+
 Status run_part(Handle* h, NetBuild& b, const Part& part, void* out, const Workspace* w, cudaStream_t stream,
-                const char* api) {
+                const char* api, Dist dist = Dist::None) {
   for (const void* d : b.data)
     if (!d) return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "a tensor of the network has no memory");
   const auto ext = extent_map(b.net);
   const int64_t total = slices_of(part.path, ext);
   std::vector<int64_t> ids((size_t)total);
   std::iota(ids.begin(), ids.end(), (int64_t)0);
+  if (dist != Dist::None) {
+    World world;
+    if (Status st = world_of(h, world, api)) return st;
+    if (world.distributed)
+      return contract_distributed(h, world, b.net, part.path, b.data, out, false, w, nullptr, ids, stream, api,
+                                  dist == Dist::Sum);
+  }
   return contract_slices(h, b.net, part.path, b.data, out, false, w, ids, stream, api);
 }
 
@@ -2397,7 +2414,7 @@ cutensornetStatus_t cutensornetStatePrepare(const cutensornetHandle_t handle, cu
     c.choice.assign(s->ops.size(), 0);
     if (Status st = build_dense_state(*s, true, b, c, api)) return st;
     Part part;
-    if (Status st = plan_part(b, maxWorkspaceSizeDevice, part, api)) return st;
+    if (Status st = plan_part(h, b, maxWorkspaceSizeDevice, part, api)) return st;
     if (Status st = prepare_workspace(w, part.need, maxWorkspaceSizeDevice, api)) return st;
     s->path = part.path;
     s->need = part.need;
@@ -2715,9 +2732,9 @@ cutensornetStatus_t cutensornetAccessorPrepare(const cutensornetHandle_t handle,
   c1.choice.assign(a->s->ops.size(), 0);
   c2.choice = c1.choice;
   if (Status st = build_amplitudes(*a->s, *a, true, b1, c1, api)) return st;
-  if (Status st = plan_part(b1, limit, a->amp, api)) return st;
+  if (Status st = plan_part(handle_of(handle), b1, limit, a->amp, api)) return st;
   if (Status st = build_norm(*a->s, true, b2, c2, api)) return st;
-  if (Status st = plan_part(b2, limit, a->norm, api)) return st;
+  if (Status st = plan_part(handle_of(handle), b2, limit, a->norm, api)) return st;
   const int64_t need = std::max(a->amp.need, a->norm.need) + kExtra;
   if (Status st = prepare_workspace(w, need, maxWorkspaceSizeDevice, api)) return st;
   a->need = need;
@@ -2778,12 +2795,12 @@ cutensornetStatus_t cutensornetAccessorCompute(const cutensornetHandle_t handle,
   Circ c;
   resolve_channels(s, c, s.rng, true);
   if (Status st = build_amplitudes(s, *a, false, b, c, api)) return st;
-  if (Status st = run_part(h, b, a->amp, amplitudesTensor, &sp.rest, cudaStream, api)) return st;
+  if (Status st = run_part(h, b, a->amp, amplitudesTensor, &sp.rest, cudaStream, api, Dist::Sum)) return st;
   if (stateNorm) {
     NetBuild nb;
     Circ nc = c;
     if (Status st = build_norm(s, false, nb, nc, api)) return st;
-    if (Status st = run_part(h, nb, a->norm, sp.scalars, &sp.rest, cudaStream, api)) return st;
+    if (Status st = run_part(h, nb, a->norm, sp.scalars, &sp.rest, cudaStream, api, Dist::Sum)) return st;
     cd v;
     if (!fetch_scalar(sp.scalars, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     put_scalar(stateNorm, s.type, v);
@@ -2886,7 +2903,7 @@ cutensornetStatus_t cutensornetMarginalPrepare(const cutensornetHandle_t handle,
   Circ c;
   c.choice.assign(m->s->ops.size(), 0);
   if (Status st = build_marginal(*m->s, m->open, m->proj, m->diagonal, m->strides, std::vector<const void*>(m->proj.size(), nullptr), true, b, c, api)) return st;
-  if (Status st = plan_part(b, limit, m->part, api)) return st;
+  if (Status st = plan_part(handle_of(handle), b, limit, m->part, api)) return st;
   const int64_t need = m->part.need + kExtra;
   if (Status st = prepare_workspace(w, need, maxWorkspaceSizeDevice, api)) return st;
   m->need = need;
@@ -2943,7 +2960,7 @@ cutensornetStatus_t cutensornetMarginalCompute(const cutensornetHandle_t handle,
   std::vector<const void*> oh;
   for (auto& o : m->onehot) oh.push_back(o->p);
   if (Status st = build_marginal(s, m->open, m->proj, m->diagonal, m->strides, oh, false, b, c, api)) return st;
-  if (Status st = run_part(h, b, m->part, marginalTensor, &sp.rest, cudaStream, api)) return st;
+  if (Status st = run_part(h, b, m->part, marginalTensor, &sp.rest, cudaStream, api, Dist::Sum)) return st;
   cudaStreamSynchronize(cudaStream);
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -3070,7 +3087,7 @@ cutensornetStatus_t cutensornetSamplerPrepare(const cutensornetHandle_t handle,
     c.choice.assign(s.ops.size(), 0);
     if (Status st = build_marginal(s, open, proj, true, {}, std::vector<const void*>(proj.size(), nullptr), true, b, c, api))
       return st;
-    if (Status st = plan_part(b, limit, sp->parts[l], api)) return st;
+    if (Status st = plan_part(handle_of(handle), b, limit, sp->parts[l], api)) return st;
     need = std::max(need, sp->parts[l].need);
     flops += sp->parts[l].flops;
     proj.insert(proj.end(), open.begin(), open.end());
@@ -3261,7 +3278,7 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
     Circ c;
     c.choice.assign(s.ops.size(), 0);
     if (Status st = build_component(s, e->op->comps[k], true, b, c, api)) return st;
-    if (Status st = plan_part(b, limit, e->parts[k], api)) return st;
+    if (Status st = plan_part(handle_of(handle), b, limit, e->parts[k], api)) return st;
     need = std::max(need, e->parts[k].need);
     flops += e->parts[k].flops;
   }
@@ -3269,7 +3286,7 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
   Circ nc;
   nc.choice.assign(s.ops.size(), 0);
   if (Status st = build_norm(s, true, nb, nc, api)) return st;
-  if (Status st = plan_part(nb, limit, e->norm, api)) return st;
+  if (Status st = plan_part(handle_of(handle), nb, limit, e->norm, api)) return st;
   need = std::max(need, e->norm.need) + extra;
   if (Status st = prepare_workspace(w, need, maxWorkspaceSizeDevice, api)) return st;
   e->need = need;
@@ -3320,17 +3337,29 @@ cutensornetStatus_t cutensornetExpectationCompute(const cutensornetHandle_t hand
     NetBuild b;
     Circ c = c0;
     if (Status st = build_component(s, e->op->comps[k], false, b, c, api)) return st;
-    if (Status st = run_part(h, b, e->parts[k], sp.scalars, &sp.rest, cudaStream, api)) return st;
+    if (Status st = run_part(h, b, e->parts[k], sp.scalars, &sp.rest, cudaStream, api, Dist::Part)) return st;
     cd v;
     if (!fetch_scalar(sp.scalars, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     total += e->op->comps[k].coef * v;
+  }
+  World world;
+  if (Status st = world_of(h, world, api)) return st;
+  if (world.distributed && world.size > 1) {  // the ranks' parts of the value, summed
+    alignas(16) unsigned char host[16] = {0};
+    put_scalar(host, s.type, total);
+    const auto comm = comm_of(h);
+    if (cudaMemcpy(sp.scalars, host, elem_bytes(s.type), cudaMemcpyHostToDevice) != cudaSuccess ||
+        g_comm_iface->AllreduceInPlace(&comm, sp.scalars, 1, s.type) ||
+        cudaMemcpy(host, sp.scalars, elem_bytes(s.type), cudaMemcpyDeviceToHost) != cudaSuccess)
+      return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+    total = get_scalar(host, s.type);
   }
   put_scalar(expectationValue, s.type, total);
   if (stateNorm) {
     NetBuild nb;
     Circ nc = c0;
     if (Status st = build_norm(s, false, nb, nc, api)) return st;
-    if (Status st = run_part(h, nb, e->norm, sp.scalars + kExtra, &sp.rest, cudaStream, api)) return st;
+    if (Status st = run_part(h, nb, e->norm, sp.scalars + kExtra, &sp.rest, cudaStream, api, Dist::Sum)) return st;
     cd v;
     if (!fetch_scalar(sp.scalars + kExtra, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     put_scalar(stateNorm, s.type, v);

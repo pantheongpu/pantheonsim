@@ -31,6 +31,7 @@
 
 #include <cuda_runtime_api.h>
 #include <cusolverDn.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <array>
@@ -47,6 +48,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -194,6 +196,10 @@ struct Handle {
   cusolverDnHandle_t solver = nullptr;
   bool has_mem = false;
   cutensornetDeviceMemHandler_t mem{};
+  // The distributed communicator, copied as the library copies it
+  // (cutensornetDistributedResetConfiguration); empty: not distributed.
+  bool has_comm = false;
+  std::vector<unsigned char> comm_bytes;
 };
 
 struct TensorDesc {
@@ -308,6 +314,75 @@ TensorDesc* tensor_of(const cutensornetTensorDescriptor_t t) { return as<TensorD
 Workspace* work_of(const cutensornetWorkspaceDescriptor_t w) { return as<Workspace>(w, kMagicWork); }
 Config* config_of(const cutensornetContractionOptimizerConfig_t c) { return as<Config>(c, kMagicConfig); }
 Info* info_of(const cutensornetContractionOptimizerInfo_t i) { return as<Info>(i, kMagicInfo); }
+
+// ---- distributed execution ----
+//
+// $CUTENSORNET_COMM_LIB names a shared library that exports the table
+// `cutensornetCommInterface` (cutensornet/typesDistributed.h): the
+// communication primitives cuTensorNet uses between its processes. Measured
+// against NVIDIA's libcutensornet 2.14 on two RTX 3060s, with a library that
+// logs each primitive it is asked for (nvidia/tests/e2e/cutn_comm_mpi.c):
+//  * the library is opened by the first cutensornetDistributedResetConfiguration;
+//    a missing one is an error only when a communicator is given;
+//    a library without the table, or with another version, is an error
+//    (DISTRIBUTED_FAILURE) either way;
+//  * a reset asks the old communicator for a barrier, then the new one for
+//    its rank, a barrier and the size of its shared-memory group;
+//  * with a communicator, a contraction of slices splits the slices over the
+//    ranks (the i-th slice of the group to rank i % size), sums the ranks'
+//    outputs with AllreduceInPlace (the output's element count and data type,
+//    a device pointer, always as a compact tensor), and a primitive that
+//    fails is DISTRIBUTED_FAILURE;
+//  * the optimizer slices to at least as many slices as there are ranks and
+//    leaves every rank the plan of the rank whose estimate is lowest.
+enum class CommLoad { None, Loaded, Failed };
+
+const cutensornetDistributedInterface_t* g_comm_iface = nullptr;
+std::mutex g_comm_mu;
+
+CommLoad load_comm_library(std::string& why) {
+  std::lock_guard<std::mutex> g(g_comm_mu);
+  if (g_comm_iface) return CommLoad::Loaded;
+  const char* path = std::getenv("CUTENSORNET_COMM_LIB");
+  if (!path || !*path) return CommLoad::None;
+  void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (!lib) return CommLoad::None;
+  void* sym = dlsym(lib, "cutensornetCommInterface");
+  if (!sym) {
+    why = std::string("dlsym error detected: ") + dlerror();
+    dlclose(lib);
+    return CommLoad::Failed;
+  }
+  auto* table = static_cast<const cutensornetDistributedInterface_t*>(sym);
+  if (table->version != CUTENSORNET_DISTRIBUTED_INTERFACE_VERSION) {
+    why = "The dynamically loaded cuTensorNet distributed service library has a wrong version: " +
+          std::to_string(table->version) + " VS " + std::to_string(CUTENSORNET_DISTRIBUTED_INTERFACE_VERSION);
+    dlclose(lib);
+    return CommLoad::Failed;
+  }
+  g_comm_iface = table;
+  return CommLoad::Loaded;
+}
+
+cutensornetDistributedCommunicator_t comm_of(const Handle* h) {
+  return {const_cast<unsigned char*>(h->comm_bytes.data()), h->comm_bytes.size()};
+}
+
+// The handle's distributed world, as its communicator reports it on each use.
+struct World {
+  int32_t size = 1, rank = 0;
+  bool distributed = false;
+};
+
+Status world_of(Handle* h, World& w, const char* api) {
+  w = World{};
+  if (!h->has_comm || !g_comm_iface) return CUTENSORNET_STATUS_SUCCESS;
+  const auto c = comm_of(h);
+  if (g_comm_iface->getNumRanks(&c, &w.size) || g_comm_iface->getProcRank(&c, &w.rank))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  w.distributed = true;
+  return CUTENSORNET_STATUS_SUCCESS;
+}
 
 }  // namespace
 
@@ -644,6 +719,51 @@ Status contract_slices(Handle* h, Network& n, const Path& p, const std::vector<c
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
+// The order in which a distributed run deals the slices of a group to the
+// ranks. A group of ids is dealt in the order a hash set of them iterates
+// (measured: libstdc++'s unordered_set<int64_t> given room for one more than
+// the ids reproduces the order NVIDIA's library dealt them in, in twelve
+// groups of 1 to 40 ids on two and three ranks); a range, and all the slices,
+// in ascending order.
+std::vector<int64_t> deal_order(const SliceGroup* g, const std::vector<int64_t>& ids) {
+  if (!g || g->range) return ids;
+  std::unordered_set<int64_t> set;
+  set.reserve(ids.size() + 1);
+  for (int64_t id : ids) set.insert(id);
+  return std::vector<int64_t>(set.begin(), set.end());
+}
+
+// One rank's share of a distributed contraction of the slices `ids`: the
+// slices whose place in the dealing order is this rank's (modulo the number of
+// ranks) are contracted, onto the output zeroed first unless the caller
+// accumulates, and the ranks' outputs are summed in place. Measured
+// on NVIDIA's library: an output the caller accumulates into is added to by
+// every rank from its own contents, so the sum holds the old output once per
+// rank; the output is a compact column-major tensor whatever strides the
+// caller set (the strides are honoured only without a communicator); a
+// failing primitive is DISTRIBUTED_FAILURE and leaves each rank its own part.
+Status contract_distributed(Handle* h, const World& w, Network& n, const Path& p, const std::vector<const void*>& in,
+                            void* out, bool accumulate, const Workspace* ws, const SliceGroup* group,
+                            const std::vector<int64_t>& ids, cudaStream_t stream, const char* api, bool reduce = true) {
+  const std::vector<int64_t> order = deal_order(group, ids);
+  std::vector<int64_t> mine;
+  for (size_t i = 0; i < order.size(); ++i)
+    if ((int64_t)(i % (size_t)std::max<int32_t>(w.size, 1)) == w.rank) mine.push_back(order[i]);
+  Network compact = n;
+  compact.out.strides.clear();
+  const size_t bytes = (size_t)volume(compact.out.extents) * elem_bytes(n.type);
+  if (!accumulate && bytes && cudaMemsetAsync(out, 0, bytes, stream) != cudaSuccess)
+    return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "the output could not be cleared");
+  if (Status s = contract_slices(h, compact, p, in, out, true, ws, mine, stream, api)) return s;
+  if (w.size <= 1 || !reduce) return CUTENSORNET_STATUS_SUCCESS;
+  if (cudaStreamSynchronize(stream) != cudaSuccess)
+    return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "the stream failed");
+  const auto c = comm_of(h);
+  if (g_comm_iface->AllreduceInPlace(&c, out, (int32_t)volume(compact.out.extents), n.type))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
 }  // namespace
 
 extern "C" {
@@ -704,6 +824,10 @@ cutensornetStatus_t cutensornetCreate(cutensornetHandle_t* handle) {
 cutensornetStatus_t cutensornetDestroy(cutensornetHandle_t handle) {
   Handle* h = handle_of(handle);
   if (!h) return CUTENSORNET_STATUS_INVALID_VALUE;
+  if (h->has_comm && g_comm_iface) {  // leaves the group: the communicator's barrier, as a reset to none does
+    const auto c = comm_of(h);
+    g_comm_iface->Barrier(&c);
+  }
   if (h->solver) cusolverDnDestroy(h->solver);
   cutensorDestroy(h->ct);
   h->magic = 0;
@@ -1688,6 +1812,14 @@ cutensornetStatus_t cutensornetDestroyContractionOptimizerInfo(cutensornetContra
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
+}  // extern "C"
+
+namespace {
+Status agree_on_info(Handle* h, const World& w, Network* n, Info* info, const char* api);
+}  // namespace
+
+extern "C" {
+
 cutensornetStatus_t cutensornetContractionOptimize(const cutensornetHandle_t handle,
                                                    const cutensornetNetworkDescriptor_t networkDesc,
                                                    const cutensornetContractionOptimizerConfig_t optimizerConfig,
@@ -1705,7 +1837,11 @@ cutensornetStatus_t cutensornetContractionOptimize(const cutensornetHandle_t han
   Path p;
   p.steps = greedy_path(*n, ext);
   const bool no_slicing = config_value(c, CUTENSORNET_CONTRACTION_OPTIMIZER_CONFIG_SLICER_DISABLE_SLICING, 0) != 0;
-  const int32_t min_slices = config_value(c, CUTENSORNET_CONTRACTION_OPTIMIZER_CONFIG_SLICER_MIN_SLICES, 1);
+  World world;
+  if (Status s = world_of(handle_of(handle), world, api)) return s;
+  // Every rank gets slices to work on: at least as many as there are ranks.
+  const int32_t min_slices =
+      std::max(config_value(c, CUTENSORNET_CONTRACTION_OPTIMIZER_CONFIG_SLICER_MIN_SLICES, 1), world.size);
   if (!no_slicing && !choose_slicing(*n, p, workspaceSizeConstraint, min_slices))
     return fail(CUTENSORNET_STATUS_INSUFFICIENT_WORKSPACE, api, "no slicing fits the workspace constraint");
   if (no_slicing && (uint64_t)scratch_need(*n, p) > workspaceSizeConstraint)
@@ -1714,7 +1850,7 @@ cutensornetStatus_t cutensornetContractionOptimize(const cutensornetHandle_t han
   n->path = p;
   n->has_path = true;
   n->prepared = false;
-  return CUTENSORNET_STATUS_SUCCESS;
+  return agree_on_info(handle_of(handle), world, n, info, api);
 }
 
 cutensornetStatus_t cutensornetNetworkSetOptimizerInfo(const cutensornetHandle_t handle,
@@ -1829,6 +1965,42 @@ Status refresh(Info* info, const Path& p, const char* api) {
     if (!ext.count(m) || se <= 0 || se > ext.at(m))
       return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid sliced mode or extent");
   describe(*n, p, *info);
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
+// The ranks leave the optimizer with one plan: the rank whose estimate of the
+// work is lowest (the lowest rank on a tie) sends its optimizer information
+// (measured on NVIDIA's library: AllreduceDoubleIntMinloc on the estimate and
+// the rank, then a Bcast of the packed size and of the packed information).
+Status agree_on_info(Handle* h, const World& w, Network* n, Info* info, const char* api) {
+  if (!w.distributed || w.size <= 1) return CUTENSORNET_STATUS_SUCCESS;
+  const auto c = comm_of(h);
+  int64_t found = 1;  // the ranks first agree that every one of them found a plan
+  if (g_comm_iface->AllreduceInPlaceMin(&c, &found, 1, CUDA_R_64I))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  struct {
+    double cost;
+    int rank;
+  } mine{info->flops, w.rank}, best{0, 0};
+  if (g_comm_iface->AllreduceDoubleIntMinloc(&c, &mine, &best))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  std::vector<uint8_t> packed;
+  int32_t size = 0;
+  if (w.rank == best.rank) {
+    packed = pack(*info);
+    size = (int32_t)packed.size();
+  }
+  if (g_comm_iface->Bcast(&c, &size, 1, CUDA_R_32I, best.rank))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  packed.resize((size_t)size);
+  if (g_comm_iface->Bcast(&c, packed.data(), size, CUDA_R_8I, best.rank))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  if (w.rank == best.rank) return CUTENSORNET_STATUS_SUCCESS;
+  Info other;
+  if (!unpack(packed.data(), packed.size(), other) || other.num_inputs != info->num_inputs)
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "another rank's plan is not for this network");
+  if (Status s = refresh(info, other.path, api)) return s;
+  n->path = other.path;
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -2162,7 +2334,7 @@ Status slice_ids(const SliceGroup* g, int64_t total, std::vector<int64_t>& ids, 
 
 Status run_network(Handle* h, Network& n, const Path& p, const std::vector<const void*>& in, void* out,
                    bool accumulate, cutensornetWorkspaceDescriptor_t workDesc, const SliceGroup* group,
-                   cudaStream_t stream, const char* api) {
+                   cudaStream_t stream, const char* api, bool distribute = false) {
   Workspace* w = work_of(workDesc);
   if (workDesc && !w) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid workspace descriptor");
   if (!out) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the output has no memory");
@@ -2171,6 +2343,10 @@ Status run_network(Handle* h, Network& n, const Path& p, const std::vector<const
   fill_output(n);
   std::vector<int64_t> ids;
   if (Status s = slice_ids(group, slices_of(p, extent_map(n)), ids, api)) return s;
+  World world;
+  if (distribute)
+    if (Status s = world_of(h, world, api)) return s;
+  if (world.distributed) return contract_distributed(h, world, n, p, in, out, accumulate, w, group, ids, stream, api);
   return contract_slices(h, n, p, in, out, accumulate, w, ids, stream, api);
 }
 
@@ -2207,7 +2383,7 @@ cutensornetStatus_t cutensornetContractSlices(const cutensornetHandle_t handle, 
   const SliceGroup* g = as<SliceGroup>(sliceGroup, kMagicSlices);
   if (sliceGroup && !g) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid slice group");
   std::vector<const void*> in(rawDataIn, rawDataIn + p->net->in.size());
-  return run_network(h, *p->net, p->path, in, rawDataOut, accumulateOutput != 0, workDesc, g, stream, api);
+  return run_network(h, *p->net, p->path, in, rawDataOut, accumulateOutput != 0, workDesc, g, stream, api, true);
 }
 
 cutensornetStatus_t cutensornetNetworkContract(const cutensornetHandle_t handle,
@@ -2224,7 +2400,7 @@ cutensornetStatus_t cutensornetNetworkContract(const cutensornetHandle_t handle,
   if (sliceGroup && !g) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid slice group");
   std::vector<const void*> in;
   for (const NetTensor& t : n->in) in.push_back(t.data);
-  return run_network(h, *n, n->path, in, n->out_data, accumulateOutput != 0, workDesc, g, stream, api);
+  return run_network(h, *n, n->path, in, n->out_data, accumulateOutput != 0, workDesc, g, stream, api, true);
 }
 
 }  // extern "C"
@@ -3227,9 +3403,110 @@ cutensornetStatus_t cutensornetGateSplit(
 // ---- the state API ----
 #include "cutensornet_state.inc"
 
+extern "C" {
+
+// ---- distributed execution: the communicator ----
+// (the calls that use it are in the contraction and the state API)
+
+cutensornetStatus_t cutensornetDistributedResetConfiguration(cutensornetHandle_t handle, const void* commPtr,
+                                                             size_t commSize) {
+  const char* api = "cutensornetDistributedResetConfiguration";
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "cuTensorNet library handle may not be nullptr!");
+  if (commPtr && commSize == 0)
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "A non-empty communicator may not have zero length!");
+  std::string why;
+  const CommLoad load = load_comm_library(why);
+  if (load == CommLoad::Failed) return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, why);
+  if (load == CommLoad::None && commPtr)
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api,
+                "Make sure $CUTENSORNET_COMM_LIB points to the cuTensorNet-MPI wrapper library.");
+  if (h->has_comm && g_comm_iface) {
+    const auto old = comm_of(h);
+    if (g_comm_iface->Barrier(&old))
+      return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  }
+  h->has_comm = false;
+  h->comm_bytes.clear();
+  if (!commPtr) return CUTENSORNET_STATUS_SUCCESS;
+  h->comm_bytes.assign(static_cast<const unsigned char*>(commPtr), static_cast<const unsigned char*>(commPtr) + commSize);
+  h->has_comm = true;
+  const auto c = comm_of(h);
+  int32_t rank = 0, shared = 0;
+  if (g_comm_iface->getProcRank(&c, &rank))
+    return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "the distributed communication service failed to give a rank");
+  if (g_comm_iface->Barrier(&c))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  g_comm_iface->getNumRanksShared(&c, &shared);  // a failure here is not reported
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
+cutensornetStatus_t cutensornetDistributedGetNumRanks(const cutensornetHandle_t handle, int32_t* numRanks) {
+  const char* api = "cutensornetDistributedGetNumRanks";
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "cuTensorNet library handle may not be nullptr!");
+  if (!numRanks) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument numRanks may not be nullptr!");
+  *numRanks = 1;
+  if (!h->has_comm || !g_comm_iface) return CUTENSORNET_STATUS_SUCCESS;
+  const auto c = comm_of(h);
+  if (g_comm_iface->getNumRanks(&c, numRanks))
+    return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "the distributed communication service failed");
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
+cutensornetStatus_t cutensornetDistributedGetProcRank(const cutensornetHandle_t handle, int32_t* procRank) {
+  const char* api = "cutensornetDistributedGetProcRank";
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "cuTensorNet library handle may not be nullptr!");
+  if (!procRank) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument procRank may not be nullptr!");
+  *procRank = 0;
+  if (!h->has_comm || !g_comm_iface) return CUTENSORNET_STATUS_SUCCESS;
+  const auto c = comm_of(h);
+  if (g_comm_iface->getProcRank(&c, procRank))
+    return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "the distributed communication service failed");
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
+cutensornetStatus_t cutensornetDistributedSynchronize(const cutensornetHandle_t handle) {
+  const char* api = "cutensornetDistributedSynchronize";
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "cuTensorNet library handle may not be nullptr!");
+  if (!h->has_comm || !g_comm_iface) return CUTENSORNET_STATUS_SUCCESS;
+  const auto c = comm_of(h);
+  if (g_comm_iface->Barrier(&c))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
+// Distributed tensors need the NCCL, cuTensorMp and cuSOLVERMp backends,
+// which NVIDIA's library loads when the first one is made; the checks that
+// come first are measured on the library (the arguments are not looked at).
+cutensornetStatus_t cutensornetCreateDistributedTensorDescriptor(
+    const cutensornetHandle_t handle, int32_t, const int64_t[], const int64_t[], const int64_t[], const int64_t[],
+    const int64_t[], const int32_t[], cudaDataType_t, cutensornetTensorDescriptor_t*) {
+  const char* api = "cutensornetCreateDistributedTensorDescriptor";
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_NOT_INITIALIZED, api, "cuTensorNet library handle may not be nullptr!");
+  if (!h->has_comm)
+    return fail(CUTENSORNET_STATUS_NOT_INITIALIZED, api,
+                "A configured communicator is required for distributed tensor operations, including at world size one.");
+  // NVIDIA's library first gathers a word from every rank (to compare the descriptors' metadata) and
+  // then fails to load NCCL; the gather is made so that the ranks stay in step.
+  World w;
+  if (Status st = world_of(h, w, api)) return st;
+  std::vector<int32_t> all((size_t)std::max<int32_t>(w.size, 1));
+  int32_t mine = 0;
+  const auto c = comm_of(h);
+  if (g_comm_iface->Allgather(&c, &mine, all.data(), 1, CUDA_R_32I))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  return refuse(api, "distributed tensor descriptors (block-distributed tensors with distributed QR and SVD) are not implemented");
+}
+
+}  // extern "C"
+
 // ---- not implemented ----
 //
-// Gradients, the MPS projection, distributed execution and NVIDIA's
+// Gradients, the MPS projection, distributed tensors and NVIDIA's
 // undocumented exports. Each is exported, so a program linked against
 // NVIDIA's library loads, and answers NOT_SUPPORTED with a message.
 extern "C" {
@@ -3241,14 +3518,9 @@ VGPU_TN_NOT_IMPLEMENTED(cutensornetBinaryTensorContractionCompute)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetBinaryTensorContractionPrepare)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateBinaryTensorContraction)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateCopyContractionOptimizerInfo)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateDistributedTensorDescriptor)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetCreateStateProjectionMPS)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyBinaryTensorContraction)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetDestroyStateProjectionMPS)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedGetNumRanks)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedGetProcRank)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedResetConfiguration)
-VGPU_TN_NOT_IMPLEMENTED(cutensornetDistributedSynchronize)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSComputeTensorEnv)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSConfigure)
 VGPU_TN_NOT_IMPLEMENTED(cutensornetStateProjectionMPSExtractTensor)
