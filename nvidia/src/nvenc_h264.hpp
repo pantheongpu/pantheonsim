@@ -74,6 +74,7 @@ inline void append_nal(std::vector<uint8_t>& out, int ref_idc, int type, const s
 struct H264Stream {
   int width = 0, height = 0;   // luma samples of the picture, as the application sees it
   int fps_num = 30, fps_den = 1;
+  int profile_idc = 66;        // 66 Baseline, 77 Main, 100 High: the same tools are used in all three
   int mbs_x() const { return (width + 15) / 16; }
   int mbs_y() const { return (height + 15) / 16; }
   int coded_width() const { return (width + 1) & ~1; }
@@ -94,13 +95,20 @@ struct H264Stream {
       if (fs <= l.max_fs && mbps <= l.max_mbps) return l.idc;
     return 62;
   }
-  // Baseline profile: I_PCM and CAVLC are all this stream uses.
+  // Baseline profile unless profile_idc says otherwise: I_PCM or CAVLC with 4x4 transforms, one reference frame.
   std::vector<uint8_t> sps() const {
     BitWriter w;
-    w.put(66, 8);          // profile_idc: Baseline
+    w.put(static_cast<uint32_t>(profile_idc), 8);
     w.put(0, 8);           // constraint_set flags and reserved bits
     w.put(static_cast<uint32_t>(level_idc()), 8);
     w.ue(0);               // seq_parameter_set_id
+    if (profile_idc >= 100) {
+      w.ue(1);             // chroma_format_idc: 4:2:0
+      w.ue(0);             // bit_depth_luma_minus8
+      w.ue(0);             // bit_depth_chroma_minus8
+      w.bit(0);            // qpprime_y_zero_transform_bypass_flag
+      w.bit(0);            // seq_scaling_matrix_present_flag
+    }
     w.ue(0);               // log2_max_frame_num_minus4
     w.ue(2);               // pic_order_cnt_type 2: output order is decoding order
     w.ue(1);               // max_num_ref_frames

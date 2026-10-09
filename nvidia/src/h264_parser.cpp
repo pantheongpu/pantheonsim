@@ -383,7 +383,10 @@ struct H264Parser::Impl {
     std::shared_ptr<Pps> pps;
     std::shared_ptr<Sps> sps;
     if (!parse_header(nal, n, &h, &pps, &sps)) return;
-    if (cur && is_new_picture(cur->last, h, *cur->sps)) finish_picture();
+    // A slice that starts at macroblock 0 when the picture already has one is the next picture's, even when its header
+    // says otherwise (consecutive IDR pictures with one idr_pic_id, which the Recommendation forbids and some encoders write).
+    if (cur && (is_new_picture(cur->last, h, *cur->sps) || (h.first_mb == 0 && cur->first.first_mb == 0 && h.redundant_pic_cnt == 0 && !cur->desc.slice_offsets.empty())))
+      finish_picture();
     if (!cur) {
       if (!begin_picture(h, pps, sps, abs_offset)) return;
     }
