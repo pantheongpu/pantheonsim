@@ -235,4 +235,23 @@ void sync_handle(cudnnHandle_t h);
 // (cudnn_api.cpp)
 void clear_tensor(cudnnTensorDescriptor_t d);
 
+// cudnnReorderFilterAndBias's permutation of an INT8x32 filter, measured on
+// the RTX 3060 by reordering filters whose bytes count their own positions
+// (K 4 to 96, C 32 and 64, 1x1 to 3x3): the filter is a [K][L] byte matrix
+// (L = C/32 * R * S * 32) cut into 32-byte column chunks; the output holds
+// chunk 0 of every row first, then chunk 1, ..., each as groups of 8 rows,
+// and within a group output vector j (0..7), lane l takes row
+// 8g + j/4 + 2((l%16)/4), byte (j%4)*8 + (l/16)*4 + l%4 of the chunk. Rows
+// past K (K not a multiple of 8) come out as zeros. Calls f(output byte,
+// source byte or -1).
+template <class F>
+inline void x32_filter_map(int64_t K, int64_t L, size_t bytes, F&& f) {
+  const int64_t G = (K + 7) / 8;
+  for (size_t d = 0; d < bytes; ++d) {
+    const int64_t l = static_cast<int64_t>(d % 32), t = static_cast<int64_t>(d / 32);
+    const int64_t j = t % 8, g = (t / 8) % G, c = t / 8 / G;
+    const int64_t row = g * 8 + j / 4 + 2 * ((l % 16) / 4), col = c * 32 + (j % 4) * 8 + (l / 16) * 4 + l % 4;
+    f(d, row < K && col < L ? row * L + col : -1);
+  }
+}
 }  // namespace vgpu_cudnn

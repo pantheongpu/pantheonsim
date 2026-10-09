@@ -190,6 +190,9 @@ struct GTensor {
   // mem_strides are the descriptor's own.
   int64_t vcount = 1;
   int vdim = -1;
+  // A filter reordered for the INT8x32 tensor-core kernels (CUDNN_TENSOR_REORDERING_INT8x32): its memory holds
+  // what cudnnReorderFilterAndBias makes of the plain [K][C/32][R][S][32] filter.
+  bool int8x32_reordered = false;
   int64_t mem_dims[vc::kMaxRank] = {}, mem_strides[vc::kMaxRank] = {};
   // A ragged tensor (CUDNN_ATTR_TENSOR_RAGGED_OFFSET_DESC): batch b's first
   // element is at offset[b] * mult elements rather than b * strides[0] --
@@ -238,10 +241,19 @@ bool tensor_of(const Desc* d, GTensor* t, std::string* why) {
     if (t->ragged_mult < 1) { *why = "tensor " + std::to_string(t->uid) + ": the ragged offset multiplier is below 1"; return false; }
   }
   if (const Attr* cv = d->get(CUDNN_ATTR_TENSOR_CONSTANT_VALUE)) t->constant = cv->bytes;
-  // A reordered filter (INT8x32's interleaving for IMMA) is in a layout cuDNN
-  // does not document.
-  if (d->i64(CUDNN_ATTR_TENSOR_REORDERING_MODE, CUDNN_TENSOR_REORDERING_NONE) != CUDNN_TENSOR_REORDERING_NONE) {
-    *why = "tensor " + std::to_string(t->uid) + " is reordered (INT8x32 or F16x16 interleaving), which is not supported";
+  // A reordered filter: INT8x32's interleaving for the tensor cores, the layout cudnnReorderFilterAndBias makes
+  // (vgpu_cudnn::x32_filter_map, measured on an RTX 3060). The other reorderings (F16x16, and FP8's 128x4 blocks
+  // of scale factors) are in layouts that were not measured here.
+  const int64_t reorder = d->i64(CUDNN_ATTR_TENSOR_REORDERING_MODE, CUDNN_TENSOR_REORDERING_NONE);
+  if (reorder == CUDNN_TENSOR_REORDERING_INT8x32) {
+    if (t->l.type != CUDNN_DATA_INT8 || t->vcount != 32 || t->vdim != 1 || dims.size() < 3) {
+      *why = "tensor " + std::to_string(t->uid) + " is reordered as INT8x32, which needs an INT8 filter whose channel dimension "
+             "holds vectors of 32";
+      return false;
+    }
+    t->int8x32_reordered = true;
+  } else if (reorder != CUDNN_TENSOR_REORDERING_NONE) {
+    *why = "tensor " + std::to_string(t->uid) + " is reordered (F16x16 or FP8 128x4 interleaving), which is not supported";
     return false;
   }
   if (!vc::storable(t->l.type)) {
@@ -290,6 +302,15 @@ std::vector<int64_t> element_offsets(const GTensor& t, const std::vector<double>
       if (++at[d] < L.dims[d]) break;
       at[d] = 0;
     }
+  }
+  if (t.int8x32_reordered && !o.empty()) {
+    // The plain byte at o[i] sits where the reordering moved it (K rows of L bytes, K padded to 8 rows).
+    const int64_t K = L.dims[0], cols = static_cast<int64_t>(o.size()) / K;
+    std::vector<int64_t> moved(o.size(), -1);
+    vc::x32_filter_map(K, cols, static_cast<size_t>((K + 7) / 8 * 8 * cols),
+                       [&](size_t at_byte, int64_t from) { if (from >= 0) moved[static_cast<size_t>(from)] = static_cast<int64_t>(at_byte); });
+    for (auto& v : o)
+      if (v >= 0) v = moved[static_cast<size_t>(v)];
   }
   return o;
 }
