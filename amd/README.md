@@ -379,6 +379,11 @@ false` throughout. gfx1251 (MI430X) is not covered.
   fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
   `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
   sparse, mixed-width and scaled ones depend on the layout read from the document.
+- **Named barriers:** `s_barrier_init`, `_join`, `_signal` (with the member count in M0), `_signal_isfirst`, `_wait`,
+  `_leave`, `s_get_barrier_state` and `s_wakeup_barrier`, from the ISA document's section 5.6; the work-group barrier's
+  signal count is kept too, for `isfirst`. The trap and cluster barriers do nothing (a cluster is one work-group here),
+  every named barrier counts as allocated, and a wave that ends is not taken out of a barrier's member count. A wait
+  that no wave can end is an error naming the barrier, not a hang (`tests/hipcc/barrier1250.cpp`).
 - **Cross-lane permutes:** `v_permlane16_var_b32`, `v_permlanex16_var_b32`, `v_permlane_{bcast,up,down,xor}_b32` (lane
   groups of a power-of-two width a scalar gives; any other width is refused, the ISA leaving it undefined),
   `v_permlane_idx_gen_b32`, and `v_permlane16_swap_b32` (writing only the lanes that are on), from the ISA document's
@@ -391,7 +396,7 @@ false` throughout. gfx1251 (MI430X) is not covered.
   document's figure; `tests/hipcc/trload1250.cpp` feeds them to a WMMA). EXEC must be all ones.
 - **Decoded and printed, but refused when executed:** the tensor data mover (`tensor_load_to_lds`,
   `tensor_store_from_lds`); cluster loads, the 6- and 4-bit transposed loads
-  (`*_load_tr6_*`, `*_load_tr4_*`); the named-barrier instructions; `s_set_vgpr_msb` with a non-zero value (vector
+  (`*_load_tr6_*`, `*_load_tr4_*`); `s_set_vgpr_msb` with a non-zero value (vector
   registers past v255); `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16
   packed arithmetic and the other 16-bit packed additions. Each says so by name when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.

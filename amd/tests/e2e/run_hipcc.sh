@@ -382,6 +382,13 @@ status=$?
 expect "the gfx1250 permlane program runs to the end" "0" "$status"
 expect "every gfx1250 permlane check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's named barriers (hipcc/barrier1250.cpp): init, join, signal (with a member count in M0), wait, the state read,
+# and the error for a wait no wave can end.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 120 "$(dirname "$exe")/barrier1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 named-barrier program runs to the end" "0" "$status"
+expect "every gfx1250 named-barrier check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

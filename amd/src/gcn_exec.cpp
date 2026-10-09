@@ -194,6 +194,10 @@ struct Wave {
   uint64_t pc = 0;
   bool done = false;
   bool at_barrier = false;
+  // gfx1250's named barriers: the one this wave has joined (0: none), whether it completed while the wave was not yet
+  // waiting on it, and whether the wave is waiting on it now.
+  uint8_t nb_joined = 0;
+  bool nb_complete = false, nb_wait = false;
   // At a GWS barrier (Machine::gws_barrier): counted there, and waiting for
   // the barrier's generation to move past this one.
   bool gws_waiting = false;
@@ -288,6 +292,10 @@ struct Group {
   uint32_t scratch_per_lane = 0;
   std::vector<Wave> waves;
   uint32_t id[3] = {};   // the work-group's id, for the debugger to say
+  // gfx1250's barrier unit: each named barrier's member and signal counts (1 to 16), and how many waves have signalled
+  // the work-group barrier in this round.
+  uint32_t nb_members[17] = {}, nb_signaled[17] = {};
+  uint32_t wg_signaled = 0;
 };
 
 struct Machine {
@@ -6095,6 +6103,83 @@ struct Machine {
     return false;
   }
 
+  // gfx1250's barriers, after the CDNA 5 ISA document's section 5.6. The work-group barrier (-1) is the scheduler's own:
+  // a wave signals it here and waits at it in step(). A named barrier (1 to 16) holds a count of the waves that must
+  // signal it; a wave joins one, and waits for it to complete. The trap barrier and the cluster barriers do nothing
+  // (a cluster here is one work-group), and so does barrier 0, the null barrier. Every named barrier is taken as
+  // allocated, though a dispatch may have asked for fewer. A wave that ends is not taken out of a named barrier's
+  // member count.
+  struct BarrierRef {
+    int id;
+    uint32_t members;   // M0[22:16], where M0 names the barrier; zero for an inline constant
+  };
+  static BarrierRef barrier_ref(const Wave& w, const Operand& o) {
+    if (o.kind == OperandKind::M0) return {static_cast<int>(w.m0 & 31), (w.m0 >> 16) & 0x7F};
+    return {static_cast<int>(static_cast<int32_t>(o.value)), 0};
+  }
+  // A barrier completes: the waves that joined it hear of it, and those waiting go on.
+  static void named_barrier_complete(Group& g, int id) {
+    g.nb_signaled[id] = 0;
+    for (Wave& wv : g.waves) {
+      if (wv.nb_joined != id) continue;
+      if (wv.nb_wait) wv.nb_wait = false, wv.nb_complete = false;
+      else wv.nb_complete = true;
+    }
+  }
+  bool gfx1250_barrier(Wave& w, const Inst& in, Group& g) {
+    const OpName op(in.name);
+    const BarrierRef b = barrier_ref(w, in.src.empty() ? Operand{} : in.src.back());
+    const bool named = b.id >= 1 && b.id <= 16;
+    if (op == "s_barrier_signal"_op || op == "s_barrier_signal_isfirst"_op) {
+      const bool isfirst = op == "s_barrier_signal_isfirst"_op;
+      if (b.id == -1) {
+        if (isfirst) w.scc = g.wg_signaled == 0;
+        ++g.wg_signaled;
+      } else if (named) {
+        if (b.members) g.nb_members[b.id] = b.members;
+        if (isfirst) w.scc = g.nb_signaled[b.id] == 0;
+        ++g.nb_signaled[b.id];
+        if (g.nb_members[b.id] && g.nb_signaled[b.id] >= g.nb_members[b.id]) named_barrier_complete(g, b.id);
+      }
+    } else if (op == "s_barrier_init"_op) {
+      if (named) {
+        if (b.members) g.nb_members[b.id] = b.members;
+        g.nb_signaled[b.id] = 0;
+      }
+    } else if (op == "s_barrier_join"_op) {
+      w.nb_joined = named ? static_cast<uint8_t>(b.id) : 0;
+      w.nb_complete = false;
+    } else if (op == "s_get_barrier_state"_op) {
+      // { 0:5, namedBarrierCount / 4 : 3, 0, signalCnt : 7, 0:5, memberCnt : 7, 0:3, valid }
+      uint32_t members = 0, signaled = 0, valid = 0;
+      if (b.id == -1) members = static_cast<uint32_t>(g.waves.size()), signaled = g.wg_signaled, valid = 1;
+      else if (named) members = g.nb_members[b.id], signaled = g.nb_signaled[b.id], valid = 1;
+      write_scalar(w, in.dst[0], (4u << 24) | (signaled & 0x7F) << 16 | (members & 0x7F) << 4 | valid);
+    }
+    // s_wakeup_barrier wakes sleeping waves, and none here sleeps for good.
+    return true;
+  }
+  // s_barrier_wait on a barrier other than the work-group's: false where the wave has to wait.
+  bool gfx1250_named_wait(Wave& w, int id) {
+    if (id < 1 || id > 16 || w.nb_joined == 0) return true;   // the null, trap and cluster barriers, and no barrier joined
+    if (w.nb_complete) {
+      w.nb_complete = false;
+      return true;
+    }
+    w.nb_wait = true;
+    return false;
+  }
+  void gfx1250_barrier_leave(Wave& w, Group& g) {
+    const int id = w.nb_joined;
+    w.nb_joined = 0;
+    w.nb_complete = w.nb_wait = false;
+    w.scc = true;
+    if (id == 0) return;
+    if (g.nb_members[id]) --g.nb_members[id];
+    w.scc = g.nb_members[id] == 0;
+    if (g.nb_members[id] && g.nb_signaled[id] >= g.nb_members[id]) named_barrier_complete(g, id);
+  }
+
   bool step(Wave& w, Group& g) {
     if (debug::active() &&
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
@@ -6120,6 +6205,9 @@ struct Machine {
       case gcn::Enc::Sop2:
       case gcn::Enc::Sopk:
         ++n.salu;
+        if (in.arch == gcn::Target::Gfx1250 && in.enc == gcn::Enc::Sop1 &&
+            (in.name.rfind("s_barrier_", 0) == 0 || in.name == "s_get_barrier_state" || in.name == "s_wakeup_barrier"))
+          return gfx1250_barrier(w, in, g);
         scalar_alu(w, in);
         return true;
       case gcn::Enc::Sopc:
@@ -6272,7 +6360,14 @@ struct Machine {
       return true;
     // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
     if (in.name.rfind("s_wait_", 0) == 0 && in.name != "s_wait_event") return true;
+    if (in.arch == gcn::Target::Gfx1250 && OpName(in.name) == "s_barrier_leave"_op) {
+      gfx1250_barrier_leave(w, g);
+      return true;
+    }
     if (OpName(in.name) == "s_barrier_wait"_op) {
+      // gfx1250: only the work-group barrier (-1) is the scheduler's; a named one has a count of its own.
+      if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) != -1)
+        return gfx1250_named_wait(w, static_cast<int16_t>(in.simm));
       w.at_barrier = true;
       ++stats.barriers;
       return false;
@@ -6594,7 +6689,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   bool runnable = false;
   for (Wave& w : group.waves) {
-    if (w.done || w.at_barrier) continue;
+    if (w.done || w.at_barrier || w.nb_wait) continue;
     runnable = true;
     uint64_t pc = w.pc;
     try {
@@ -6615,6 +6710,12 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
       w.at_barrier = false;
       any = true;
     }
+  group.wg_signaled = 0;
+  if (!any)
+    for (const Wave& w : group.waves)
+      if (w.nb_wait)
+        throw Error::make(Err::ExecLimit, "every wave of the work-group is done or waiting on a named barrier (barrier ",
+                          static_cast<int>(w.nb_joined), " among them) that no wave is left to complete");
   return !any;
 }
 
@@ -6623,7 +6724,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
 // done.
 bool waiting(const Group& group) {
   for (const Wave& w : group.waves)
-    if (!w.done && !w.at_barrier) return true;
+    if (!w.done && !w.at_barrier && !w.nb_wait) return true;
   return false;
 }
 
