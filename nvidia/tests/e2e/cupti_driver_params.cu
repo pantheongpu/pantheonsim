@@ -70,6 +70,27 @@ std::string params_of(CUpti_CallbackId id, const void* d) {
 
 bool g_on = false;
 
+// The DRIVER activity records, by the name of the call each is of.
+std::vector<std::string> g_records;
+
+void CUPTIAPI buffer_requested(uint8_t** buffer, size_t* size, size_t* max_records) {
+  static uint8_t storage[1 << 22] __attribute__((aligned(8)));
+  *buffer = storage;
+  *size = sizeof storage;
+  *max_records = 0;
+}
+
+void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size_t, size_t valid) {
+  CUpti_Activity* r = nullptr;
+  while (cuptiActivityGetNextRecord(buffer, valid, &r) == CUPTI_SUCCESS) {
+    if (r->kind != CUPTI_ACTIVITY_KIND_DRIVER) continue;
+    const auto* a = reinterpret_cast<const CUpti_ActivityAPI*>(r);
+    const char* name = nullptr;
+    cuptiGetCallbackName(CUPTI_CB_DOMAIN_DRIVER_API, a->cbid, &name);
+    g_records.push_back(std::string("REC driver ") + (name ? name : "?") + " ret=" + std::to_string(a->returnValue));
+  }
+}
+
 void CUPTIAPI on_callback(void*, CUpti_CallbackDomain domain, CUpti_CallbackId cbid, const void* data) {
   if (domain != CUPTI_CB_DOMAIN_DRIVER_API || !g_on) return;
   const auto* cb = static_cast<const CUpti_CallbackData*>(data);
@@ -141,9 +162,12 @@ int main() {
   if (cuptiSubscribe(&sub, on_callback, nullptr) != CUPTI_SUCCESS) return 1;
   cuptiEnableDomain(1, sub, CUPTI_CB_DOMAIN_DRIVER_API);
 
+  cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed);
+
   // The first cuInit is how the profiler is attached: not reported. Everything
   // after is.
   NEED(cuInit(0));
+  cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER);
   g_on = true;
 
   // ---- devices ----
@@ -496,8 +520,11 @@ int main() {
   CALL(cuDevicePrimaryCtxReset(dev));
 
   g_on = false;
+  cuptiActivityFlushAll(0);
   cuptiUnsubscribe(sub);
   for (const std::string& l : g_lines) std::printf("%s\n", l.c_str());
+  std::printf("# records: %zu\n", g_records.size());
+  for (const std::string& l : g_records) std::printf("%s\n", l.c_str());
   std::printf("# end\n");
   return 0;
 }
