@@ -182,3 +182,5 @@ VTEST(of_two_cubins_for_one_architecture_the_arch_specific_one_wins_where_it_run
   VCHECK(picks(cuda::write_fatbin({plain, newer}), b300, newer.data));
   VCHECK(picks(cuda::write_fatbin({newer, plain}), b200, plain.data));
 }
+
+VTEST_MAIN
