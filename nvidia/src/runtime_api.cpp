@@ -957,8 +957,14 @@ static void announce_driver_init() { vgpu::profiling::notify_init_finished(); }
 
 // Notes the arguments of the call about to be made, as pointers to the
 // parameters in declaration order (vgpu/profiling.hpp).
+// The arguments are taken by value, and traced_call passes its own by value
+// too: an argument whose address the caller takes (a const reference here) is
+// a memory object, and handing it on to the body then loads it as its type --
+// which, for an enum a program filled with a value the enum does not declare,
+// is undefined behaviour that UBSan reports. A parameter nobody takes the
+// address of is not loaded that way.
 template <class... A>
-void note_all(const A&... a) {
+void note_all(A... a) {
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
     announce_driver_init();
     const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
@@ -4688,7 +4694,8 @@ void apply_format(vgpu::exec::TextureDesc* d, const vgpu::cuda::TexFormat& f) {
   d->texel_bytes = sampled_bytes(f);
 }
 
-bool address_mode_of(cudaTextureAddressMode m, vgpu::exec::TexAddress* out) {
+// `m` is the descriptor's integer (enum_value): a program may put any number there.
+bool address_mode_of(int m, vgpu::exec::TexAddress* out) {
   switch (m) {
     case cudaAddressModeWrap: *out = vgpu::exec::TexAddress::Wrap; return true;
     case cudaAddressModeClamp: *out = vgpu::exec::TexAddress::Clamp; return true;
@@ -5401,7 +5408,7 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
     bool normalized_read = false;
     if (tex) {
       for (int i = 0; i < 3; ++i)
-        if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
+        if (!address_mode_of(enum_value(tex->addressMode[i]), &d.address[i])) return cudaErrorInvalidValue;
       const int filter = enum_value(tex->filterMode), mipfilter = enum_value(tex->mipmapFilterMode);
       if ((filter != cudaFilterModePoint && filter != cudaFilterModeLinear) ||
           (mipfilter != cudaFilterModePoint && mipfilter != cudaFilterModeLinear))

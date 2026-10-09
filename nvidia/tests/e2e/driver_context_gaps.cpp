@@ -5,6 +5,8 @@
 // as file descriptors, and multicast objects. Every check passes on the card as
 // well as on this simulator; where the answer depends on what the device
 // supports, the check asks the device first.
+// VGPU_E2E_EXPECTS_REFUSALS: these checks pass invalid arguments (and fault a kernel) on purpose, so the
+// library's "VirtualGPU error" lines on stderr are expected (see run_lib_check.sh).
 #include <cuda.h>
 
 #include <cstdio>

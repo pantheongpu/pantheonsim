@@ -4,6 +4,8 @@
 // under WSL) as well as on this simulator. Where the answer depends on what the
 // device supports -- pool handle types, read-only registration -- the check asks
 // the device first and expects what its attribute says.
+// VGPU_E2E_EXPECTS_REFUSALS: these checks pass invalid arguments (and fault a kernel) on purpose, so the
+// library's "VirtualGPU error" lines on stderr are expected (see run_lib_check.sh).
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -77,12 +79,14 @@ static void pool_handle_types() {
     cudaMemPool_t def;
     IS(cudaDeviceGetDefaultMemPool(&def, 0), cudaSuccess);
     int fd = -7;
+    // The type is an enum, and 8 is not one of its values: loading it into an enum-typed object is undefined
+    // behaviour (UBSan reports it). The enum is an int in the ABI, so call the entry point as taking one.
+    using ExportWithInt = cudaError_t (*)(void*, cudaMemPool_t, int, unsigned int);
+    const ExportWithInt export_with_int = reinterpret_cast<ExportWithInt>(&cudaMemPoolExportToShareableHandle);
     for (int t : {0, 1, 2, 8}) {
-      cudaMemAllocationHandleType type;
-      std::memcpy(&type, &t, sizeof t);
       char what[96];
       std::snprintf(what, sizeof what, "cudaMemPoolExportToShareableHandle (type %d) is invalid", t);
-      check(cudaMemPoolExportToShareableHandle(&fd, def, type, 0) == cudaErrorInvalidValue, what);
+      check(export_with_int(&fd, def, t, 0) == cudaErrorInvalidValue, what);
     }
     IS(cudaMemPoolExportToShareableHandle(nullptr, def, cudaMemHandleTypePosixFileDescriptor, 0), cudaErrorInvalidValue);
     IS(cudaMemPoolExportToShareableHandle(&fd, nullptr, cudaMemHandleTypePosixFileDescriptor, 0), cudaErrorInvalidValue);

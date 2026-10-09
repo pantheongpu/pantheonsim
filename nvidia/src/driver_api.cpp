@@ -707,12 +707,21 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 
 // Reports one driver call from the program's side. `name` is NVIDIA's own
 // spelling of the function (cuMemAlloc_v2), which is what a subscriber is told.
-template <class Body, class... A>
-CUresult traced(const char* name, Body body, A... a) {
+// The arguments are taken by value, and traced() passes its own by value
+// too: a parameter whose address traced() took would be a memory object, and
+// handing it on to the body would load an enum argument a program filled with
+// an undeclared value as its type (undefined behaviour, which UBSan reports).
+template <class... A>
+void note_driver_args(A... a) {
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
     const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
     vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)));
   }
+}
+
+template <class Body, class... A>
+CUresult traced(const char* name, Body body, A... a) {
+  note_driver_args(a...);
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));
@@ -1936,25 +1945,35 @@ VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long* handle, 
 }
 
 // Multicast objects span several devices' memory; there is no such fabric here.
-VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long*, const void*) {
+// Every entry point answers CUDA_ERROR_NOT_SUPPORTED, and the first call says so on stderr.
+static CUresult multicast_not_supported(const char* api) {
+  static std::once_flag said;
+  std::call_once(said, [&] {
+    if (!quiet())
+      std::fprintf(stderr, "[vgpu] %s: multicast objects (NVLink SHARP) are not simulated; "
+                           "returning CUDA_ERROR_NOT_SUPPORTED\n", api);
+  });
   return CUDA_ERROR_NOT_SUPPORTED;
 }
+VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long*, const void*) {
+  return multicast_not_supported("cuMulticastCreate");
+}
 VGPU_EXPORT CUresult cuMulticastAddDevice(unsigned long long, CUdevice) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastAddDevice");
 }
 VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long, size_t, unsigned long long, size_t,
                                         size_t, unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastBindMem");
 }
 VGPU_EXPORT CUresult cuMulticastBindAddr(unsigned long long, size_t, unsigned long long, size_t,
                                          unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastBindAddr");
 }
 VGPU_EXPORT CUresult cuMulticastUnbind(unsigned long long, CUdevice, size_t, size_t) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastUnbind");
 }
 VGPU_EXPORT CUresult cuMulticastGetGranularity(size_t*, const void*, int) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastGetGranularity");
 }
 
 // Stream memory ops. Work is synchronous, so the write happens now.
@@ -3451,7 +3470,9 @@ VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR*
   CUDA_ARRAY3D_DESCRIPTOR d{};
   d.Width = desc->Width;
   d.Height = desc->Height;
-  d.Format = desc->Format;
+  // Copied as bytes: a program may pass a format the enum does not name (the card refuses it), and loading that
+  // as the enum is undefined behaviour.
+  std::memcpy(&d.Format, &desc->Format, sizeof d.Format);
   d.NumChannels = desc->NumChannels;
   return cuArray3DCreate_v2(out, &d);
 }
