@@ -29,6 +29,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -296,9 +297,11 @@ void run_decompress(const DecompressArgs& a) {
     st[i] = chunk_status(r);
     if (r != Result::Ok) continue;
     if (a.unshuffle_mode) {
-      std::vector<uint8_t> plain(produced);
-      bitunshuffle(dst.data(), produced, a.es, a.unshuffle_mode, plain.data());
-      std::memcpy(dst.data(), plain.data(), produced);
+      if (produced) {
+        std::vector<uint8_t> plain(produced);
+        bitunshuffle(dst.data(), produced, a.es, a.unshuffle_mode, plain.data());
+        std::memcpy(dst.data(), plain.data(), produced);
+      }
     }
     if (!put(out[i], dst.data(), produced)) {
       st[i] = nvcompErrorCudaError;
@@ -914,9 +917,8 @@ extern "C" nvcompStatus_t nvcompBatchedCRC32SearchConf(const void* const* ptrs, 
 nvcompStatus_t nvcompGzipStreamingDecompressGetTempSize(size_t*) { return nvcompErrorInvalidValue; }
 
 nvcompStatus_t nvcompGzipStreamingDecompress(std::istream&, std::ostream&, const size_t, void* const, cudaStream_t) {
-  static bool said = false;
-  if (!said && !quiet()) {
-    said = true;
+  static std::atomic<bool> said{false};
+  if (!said.exchange(true) && !quiet()) {
     std::fprintf(stderr, "[vgpu] nvcompGzipStreamingDecompress needs the hardware decompression engine, which the simulated GPUs "
                          "(like an RTX 3060) do not have: nvcompErrorInvalidValue\n");
   }

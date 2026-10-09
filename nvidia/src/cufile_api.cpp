@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -387,9 +388,8 @@ ssize_t io(CUfileHandle_t fh, void* bufPtr_base, size_t size, off_t file_offset,
   if (h->userspace) {
     if (file_offset < 0) return fail(CU_FILE_INVALID_VALUE);
     if (size == 0 && s.bufs.count(reinterpret_cast<uintptr_t>(bufPtr_base))) return 0;
-    static bool said = false;
-    if (!said && !quiet()) {
-      said = true;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true) && !quiet()) {
       std::fprintf(stderr, "[vgpu] cuFileRead/cuFileWrite: user-space file system handles do no I/O in "
                            "compatibility mode (they need nvidia-fs); the call returns 5006 as the card's does\n");
     }
