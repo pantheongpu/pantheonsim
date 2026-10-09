@@ -1,0 +1,58 @@
+# VirtualGPU device profile: NVIDIA H100 NVL (Hopper, GH100, sm_90). One GPU of the NVL pair.
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 9.0 and every per-SM limit: read from physical H100s (nvidia/h100, nvidia/h100-pcie); the NVL is the same GH100.
+#   - SMs 132: derived, not published. NVIDIA's H100 page gives 30 TFLOPS FP64 for the NVL (34 for the SXM5 at 132 SMs, 26 for the
+#     PCIe at 114), which at the 1755 MHz boost clock the PCIe reads is 132 SMs of 64 FP64 lanes. The SXM5 H100 has 132.
+#   - memory 94 GB HBM3, 3.9 TB/s, max TDP 350-400 W, PCIe Gen5, NVLink bridge: NVIDIA's H100 page (the page does not say whether
+#     the figures are per GPU or per pair; the 94 GB and the 12 GB MIG slices are per GPU). NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml),
+#     so vram_bytes is 96256 MiB (an upper bound, as for the H200).
+#   - PCI device 0x2321, "NVIDIA H100 NVL", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+id: nvidia/h100-nvl
+vendor: nvidia
+model: "NVIDIA H100 NVL"
+architecture: hopper
+compute_capability: "9.0"
+warp_size: 32
+vram_bytes: 100931731456          # 96256 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448
+  registers_per_block: 65536
+  multiprocessors: 132
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 233472
+  l2_cache_bytes: 52428800
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 96256          # 94 GB in MiB; not measured on a card
+  power_limit_w: 400             # Max TDP "350-400W (configurable)" (NVIDIA's H100 page): the top of the range
+  sm_clock_max_mhz: 1755         # the H100 PCIe's 1755 MHz (read from a card); consistent with the page's 30 TFLOPS FP64 on 132 SMs (132 x 64 x 2 x 1.755 GHz = 29.7)
+  mem_clock_max_mhz: 2539       # derived: 3.9 TB/s on 6144 bits is 5.08 Gbps, half of it; not a published clock
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8993            # 0x2321 [H100 NVL]
+  ecc: true                     # supported and on by default (NVIDIA datasheet)
+  memory: hbm                   # rows are remapped on failure
+  pcie_link: "Gen5 x16"          # NVIDIA's H100 page: PCIe Gen5 128 GB/s
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: six active HBM3 stacks (derived from 94 GB and 3.9 TB/s: six 16 GB stacks, 6144 bits), 50 MB L2. The persisting L2 maximum is three
+# quarters of L2, as the A100's: not read from a card.
+cuda:
+  memory_bus_width_bits: 6144
+  persisting_l2_bytes: 39321600

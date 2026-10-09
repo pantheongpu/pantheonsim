@@ -52,6 +52,16 @@ set(VGPU_PROFILES
   nvidia/gb200
   nvidia/vr200
   nvidia/thor
+  nvidia/rtx-pro-6000-server
+  nvidia/rtx-pro-6000-max-q
+  nvidia/rtx6000-ada
+  nvidia/rtx-a6000
+  nvidia/rtx-a5000
+  nvidia/a100-80gb-pcie
+  nvidia/h100-nvl
+  nvidia/h200-nvl
+  nvidia/rtx4080
+  nvidia/rtx3070
   amd/mi250x
   amd/mi300x
   amd/mi325x

@@ -1,0 +1,62 @@
+# VirtualGPU device profile: NVIDIA RTX PRO 6000 Blackwell Server Edition (GB202, sm_120).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 12.0: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus); the same GB202 die as nvidia/rtx-pro-6000.
+#   - SMs 188: NVIDIA RTX Blackwell GPU Architecture whitepaper (v1.1), Table 1 (RTX PRO 6000 Blackwell
+#     Workstation Edition: 188 SMs, 24064 CUDA Cores); NVIDIA's Server Edition page gives the same 24,064
+#     cores. This is the part AWS sells as the g7e instances ("RTX PRO Server 6000").
+#   - memory 96 GB GDDR7 with ECC on a 512-bit interface, 1597 GB/s, up to 600 W (configurable), PCIe Gen 5:
+#     NVIDIA's RTX PRO 6000 Blackwell Server Edition page. NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml),
+#     so vram_bytes is 98304 MiB; a real card's nvidia-smi total is a little smaller, so this is an upper bound.
+#     The Server Edition's bandwidth (1597 GB/s) is below the Workstation Edition's 1792 GB/s: its memory runs slower.
+#   - SM clock: NVIDIA's Server Edition page gives none; the Workstation Edition's 2617 MHz (whitepaper) stands in until measured.
+#   - PCI device 0x2BB5, "NVIDIA RTX PRO 6000 Blackwell Server Edition", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+#   - Per-SM limits are compute capability 12.0's, the same as nvidia/rtx-pro-6000 and nvidia/rtx5090.
+id: nvidia/rtx-pro-6000-server
+vendor: nvidia
+model: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+architecture: blackwell
+compute_capability: "12.0"
+warp_size: 32
+vram_bytes: 103079215104          # 98304 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 188
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 134217728
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 98304          # 96 GB in MiB; not measured on a card
+  power_limit_w: 600             # Max power "up to 600 W, configurable" (NVIDIA's Server Edition page)
+  sm_clock_max_mhz: 2617         # the Workstation Edition's boost clock (whitepaper); NVIDIA's Server Edition page gives none
+  mem_clock_max_mhz: 12475       # half of 24.95 Gbps, derived from the 1597 GB/s on the 512-bit bus; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 11189            # 0x2BB5 [RTX PRO 6000 Blackwell Server Edition]
+  ecc: true                     # "96 GB GDDR7, with ECC" (NVIDIA's Server Edition page)
+  memory: gddr                   # GDDR7
+  pcie_link: "Gen5 x16"          # NVIDIA's Server Edition page: PCIe Gen 5; x16 is the slot the card is built for
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 131072 KB (full GB202, as RTX PRO 6000 Workstation Edition: NVIDIA RTX Blackwell whitepaper v1.1) and the 512-bit memory interface (NVIDIA's Server Edition page).
+# Persisting L2 is nvidia/rtx-pro-6000's derived 3/4 of the L2; NVIDIA does not publish it.
+cuda:
+  memory_bus_width_bits: 512
+  persisting_l2_bytes: 100663296

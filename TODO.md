@@ -1685,7 +1685,7 @@ public headers, tested by their authors under ASan + UBSan, and are awaiting CI 
 
 ## Profile inventory (rev 6)
 
-34 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
+45 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles and rev 7 ten more, built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
 profile's values were read from a physical device (see "Hardware characterization").
 
 | id | vendor | arch | cc / gfx | verified |
@@ -1717,6 +1717,16 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `nvidia/a40` | NVIDIA | Ampere | 8.6 | **no** |
 | `nvidia/a30` | NVIDIA | Ampere | 8.0 | **no** (SM count derived from OEM Tensor Core counts) |
 | `nvidia/rtx2080ti` | NVIDIA | Turing | 7.5 | **no** |
+| `nvidia/rtx-pro-6000-server` | NVIDIA | Blackwell | 12.0 | **no** (the g7e part; the rental was not obtained, see nvidia/docs/profiles.md) |
+| `nvidia/rtx-pro-6000-max-q` | NVIDIA | Blackwell | 12.0 | **no** |
+| `nvidia/rtx6000-ada` | NVIDIA | Ada | 8.9 | **no** |
+| `nvidia/rtx-a6000` | NVIDIA | Ampere | 8.6 | **no** |
+| `nvidia/rtx-a5000` | NVIDIA | Ampere | 8.6 | **no** |
+| `nvidia/a100-80gb-pcie` | NVIDIA | Ampere | 8.0 | **no** (limits inherited from the read A100s) |
+| `nvidia/h100-nvl` | NVIDIA | Hopper | 9.0 | **no** (SM count derived from the published FP64 rate) |
+| `nvidia/h200-nvl` | NVIDIA | Hopper | 9.0 | **no** (SM count derived the same way) |
+| `nvidia/rtx4080` | NVIDIA | Ada | 8.9 | **no** |
+| `nvidia/rtx3070` | NVIDIA | Ampere | 8.6 | **no** |
 | `amd/mi325x` | AMD | CDNA3 | gfx942 | yes (rocminfo on a physical card) |
 | `amd/mi300x` | AMD | CDNA3 | gfx942 | **no** |
 | `amd/mi250x` | AMD | CDNA2 | gfx90a | **no** (one die: 110 CUs, 64 GB) |

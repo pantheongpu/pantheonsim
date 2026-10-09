@@ -1,0 +1,56 @@
+# VirtualGPU device profile: NVIDIA A100 80GB PCIe (Ampere, GA100, sm_80).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.0 and every per-SM limit: read from a physical A100 SXM4 80GB (nvidia/a100) and 40GB (nvidia/a100-sxm4-40gb);
+#     the PCIe card is the same GA100 die with the same 108 SMs, so the limits are inherited from those profiles.
+#   - memory 80 GB HBM2e, 1935 GB/s, max TDP 300 W, PCIe Gen4: NVIDIA's A100 page (80GB PCIe column). The SXM4 card read 85095874560
+#     bytes of an "80 GB" part; this profile keeps the label's 81920 MiB as an upper bound until a PCIe card is read.
+#   - memory clock: 1935 GB/s on the 5120-bit bus is 1512 MHz (derived); the SXM4's 2039 GB/s is 1593 MHz, which a card reports.
+#   - PCI device 0x20B5, "NVIDIA A100 80GB PCIe", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+id: nvidia/a100-80gb-pcie
+vendor: nvidia
+model: "NVIDIA A100 80GB PCIe"
+architecture: ampere
+compute_capability: "8.0"
+warp_size: 32
+vram_bytes: 85899345920          # 81920 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 166912
+  registers_per_block: 65536
+  multiprocessors: 108
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 167936
+  l2_cache_bytes: 41943040
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 81920          # 80 GB in MiB; not measured on a card
+  power_limit_w: 300             # Max TDP 300 W (NVIDIA's A100 page)
+  sm_clock_max_mhz: 1410         # the A100's boost clock; read from a card on nvidia/a100 (SXM4 80GB), the same GA100 die
+  mem_clock_max_mhz: 1512       # half of 3.024 Gbps, derived from the 1935 GB/s on the 5120-bit bus; nvidia/a100 (SXM4) reads 1593 for 2039 GB/s
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8373            # 0x20B5 [A100 80GB PCIe]
+  ecc: true                     # supported and on by default (NVIDIA datasheet)
+  memory: hbm                   # rows are remapped on failure
+  pcie_link: "Gen4 x16"          # NVIDIA's A100 page: PCIe Gen4
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: five active HBM2e stacks, 40 MB L2. NVIDIA's A100 documentation sets aside up to 30 MB of it for persisting accesses.
+cuda:
+  memory_bus_width_bits: 5120
+  persisting_l2_bytes: 31457280

@@ -1,0 +1,61 @@
+# VirtualGPU device profile: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (GB202, sm_120).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 12.0: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus); the same GB202 die as nvidia/rtx-pro-6000.
+#   - SMs 188: 24,064 CUDA cores (NVIDIA's Max-Q datasheet) at 128 an SM; the RTX Blackwell whitepaper (v1.1) gives 188 SMs
+#     for the Workstation Edition and says the full GB202's 128 MB L2 is used in the Max-Q too.
+#   - memory 96 GB GDDR7 with ECC, 512-bit, 1792 GB/s, total board power 300 W, PCIe 5.0 x16: the Max-Q datasheet (Apr25).
+#     NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml), so vram_bytes is
+#     98304 MiB; a real card's nvidia-smi total is a little smaller, so this is an upper bound.
+#   - SM clock 2286 MHz is derived from the datasheet's 110 TFLOPS single precision (24,064 cores x 2 x clock); NVIDIA does not
+#     list the Max-Q's boost clock.
+#   - PCI device 0x2BB4, "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+#   - Per-SM limits are compute capability 12.0's, the same as nvidia/rtx-pro-6000.
+id: nvidia/rtx-pro-6000-max-q
+vendor: nvidia
+model: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+architecture: blackwell
+compute_capability: "12.0"
+warp_size: 32
+vram_bytes: 103079215104          # 98304 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 188
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 134217728
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 98304          # 96 GB in MiB; not measured on a card
+  power_limit_w: 300             # Total board power: 300 W (Max-Q datasheet, Apr25)
+  sm_clock_max_mhz: 2286         # derived: the datasheet's 110 TFLOPS single precision over 24,064 cores x 2 is 2.286 GHz
+  mem_clock_max_mhz: 14000       # half the 28 Gbps data rate that 1792 GB/s gives on a 512-bit bus; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 11188            # 0x2BB4 [RTX PRO 6000 Blackwell Max-Q Workstation Edition]
+  ecc: true                     # "96 GB GDDR7 with ECC" (Max-Q datasheet)
+  memory: gddr                   # GDDR7
+  pcie_link: "Gen5 x16"          # Max-Q datasheet: PCIe 5.0 x16
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 131072 KB (full GB202: NVIDIA RTX Blackwell whitepaper v1.1, which names the Max-Q Workstation Edition) and the 512-bit memory interface (Max-Q datasheet).
+# Persisting L2 is nvidia/rtx-pro-6000's derived 3/4 of the L2; NVIDIA does not publish it.
+cuda:
+  memory_bus_width_bits: 512
+  persisting_l2_bytes: 100663296

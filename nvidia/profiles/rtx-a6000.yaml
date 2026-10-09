@@ -1,0 +1,61 @@
+# VirtualGPU device profile: NVIDIA RTX A6000 (Ampere, GA102, sm_86).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.6: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 84: NVIDIA's RTX A6000 data sheet (Jan21: 10,752 CUDA cores, 336 Tensor Cores, 84 RT Cores) at 128 cores an SM; the RTX
+#     Blackwell whitepaper (v1.1), Table 1, and the Ampere GA102 whitepaper (v2), Appendix C, agree.
+#   - memory 48 GB GDDR6 with ECC, 384-bit, 768 GB/s, total board power 300 W, PCIe 4.0 x16: the data sheet. NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml), so
+#     vram_bytes is 49152 MiB; a real card's nvidia-smi total is a little smaller, so this is an upper bound.
+#     (The RTX Blackwell whitepaper's Table 1 gives 19.5 Gbps / 936 GB/sec for this card, which contradicts the data sheet and
+#     is the RTX 3090's figure; the data sheet is used.)
+#   - boost clock 1800 MHz: the RTX Blackwell whitepaper's Table 1, consistent with the data sheet's 38.7 TFLOPS.
+#   - PCI device 0x2230, "NVIDIA RTX A6000", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+#   - Per-SM limits are compute capability 8.6's, the same as nvidia/a10 and nvidia/rtx3080ti, which were read from physical cards.
+id: nvidia/rtx-a6000
+vendor: nvidia
+model: "NVIDIA RTX A6000"
+architecture: ampere
+compute_capability: "8.6"
+warp_size: 32
+vram_bytes: 51539607552          # 49152 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 84
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 16
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 6291456
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 49152          # 48 GB in MiB; not measured on a card
+  power_limit_w: 300             # Total board power: 300 W (data sheet, Jan21)
+  sm_clock_max_mhz: 1800         # boost clock (RTX Blackwell whitepaper v1.1, Table 1); the data sheet's 38.7 TFLOPS is 10,752 cores x 2 x 1.8 GHz
+  mem_clock_max_mhz: 8000       # half of 16 Gbps, which the data sheet's 768 GB/s gives on a 384-bit bus; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8752            # 0x2230 [RTX A6000]
+  ecc: true                     # "Error-correcting code (ECC): Yes" (data sheet)
+  memory: gddr                   # GDDR; Ampere and later remap rows rather than retire pages (see telemetry.cpp)
+  pcie_link: "Gen4 x16"          # data sheet: PCI Express 4.0 x16
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 6144 KB: whitepaper Table 1 (RTX A6000: 6144 KB); the 384-bit memory interface: data sheet.
+# Persisting L2 is nvidia/a10's measured 4325376 (the same GA102 die and 6 MiB L2); NVIDIA does not publish it, so it is carried over, unverified.
+cuda:
+  memory_bus_width_bits: 384
+  persisting_l2_bytes: 4325376

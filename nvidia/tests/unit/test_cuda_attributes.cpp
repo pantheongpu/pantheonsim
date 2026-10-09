@@ -11,6 +11,7 @@
 #include <cstring>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vgpu/cuda_attributes.hpp"
@@ -80,6 +81,35 @@ VTEST(rtx3060_matches_the_card) {
     if (got != c.want) std::fprintf(stderr, "attribute %d: card %d, here %d\n", c.id, c.want, got);
     VCHECK_EQ(got, c.want);
   }
+}
+
+// The single- to double-precision ratio follows NVIDIA's "Throughput of Native
+// Arithmetic Instructions" table (CUDA C++ Best Practices Guide 13.4), fp32 over
+// fp64 results per clock per multiprocessor: 7.5 is 64/2, 8.0 is 64/32, 8.6 and
+// 8.9 are 128/2, 9.0 and 10.0 are 128/64, and 10.3 and 12.x are 128/2. The 10.3
+// column shares its fp64 cell with 12.x, so a B300 is not a B200 here. 10.7 (Rubin)
+// is derived from the 130 and 33 TFLOPS in NVIDIA's Rubin blog, and 11.0 (Thor)
+// has no published rate, so it carries the 12.x stand-in (see device_attributes.cpp).
+VTEST(single_to_double_ratio_follows_the_arithmetic_table) {
+  const std::pair<int, int> want[] = {{75, 32}, {80, 2}, {86, 64}, {89, 64}, {90, 2}, {100, 2},
+                                      {103, 64}, {107, 4}, {110, 64}, {120, 64}, {121, 64}};
+  int seen = 0;
+  for (const std::string& id : nvidia_gpus()) {
+    const vgpu::DeviceProfile p = vgpu::load_gpu(id);
+    const int cc = p.cc_major * 10 + p.cc_minor;
+    bool found = false;
+    for (const auto& w : want) {
+      if (w.first != cc) continue;
+      found = true;
+      if (attr(p, A::kSingleToDoublePrecisionPerfRatio) != w.second)
+        std::fprintf(stderr, "%s (cc %d): ratio %d, table says %d\n", id.c_str(), cc,
+                     attr(p, A::kSingleToDoublePrecisionPerfRatio), w.second);
+      VCHECK_EQ(attr(p, A::kSingleToDoublePrecisionPerfRatio), w.second);
+    }
+    VCHECK(found);   // a profile of a new compute capability must be added to the table above
+    ++seen;
+  }
+  VCHECK(seen >= 12);
 }
 
 // Whatever a profile says, the table answers every attribute CUDA 13.2 has and
