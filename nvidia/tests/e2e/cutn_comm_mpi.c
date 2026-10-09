@@ -82,16 +82,14 @@ static size_t type_bytes(cudaDataType_t t) {
 }
 
 /*
- * Test hooks. CUTN_COMM_FAIL=<name> makes the primitive of that name (as in
+ * Test hooks. cutn_comm_fail("<name>") makes the primitive of that name (as in
  * the log: Barrier, Bcast, AllreduceInPlace, getProcRank, ...) return 1
- * without communicating once the process has called cutn_comm_arm_failure()
- * (a test arms it around the call it wants to fail); CUTN_COMM_VERSION=<n>
+ * without communicating, until cutn_comm_fail(NULL); CUTN_COMM_VERSION=<n>
  * sets the version field of the table.
  */
-static int g_armed = 0;
 static const char* g_fail = NULL;
-void cutn_comm_arm_failure(int on) { g_armed = on; }
-static int failing(const char* name) { return g_armed && g_fail && strcmp(g_fail, name) == 0; }
+void cutn_comm_fail(const char* name) { g_fail = name; }
+static int failing(const char* name) { return g_fail && strcmp(g_fail, name) == 0; }
 
 int cutn_comm_log_size(void) { return g_log_n; }
 const char* cutn_comm_log_line(int i) { return i >= 0 && i < g_log_n ? g_log[i] : ""; }
@@ -260,7 +258,6 @@ cutensornetDistributedInterface_t cutensornetCommInterface;
 
 __attribute__((constructor)) static void init_table(void) {
   const char* v = getenv("CUTN_COMM_VERSION");
-  g_fail = getenv("CUTN_COMM_FAIL");
   cutensornetCommInterface = (cutensornetDistributedInterface_t){
       v ? atoi(v) : CUTENSORNET_DISTRIBUTED_INTERFACE_VERSION,
       comm_size,

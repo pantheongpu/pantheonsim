@@ -331,7 +331,7 @@ Info* info_of(const cutensornetContractionOptimizerInfo_t i) { return as<Info>(i
 //  * with a communicator, a contraction of slices splits the slices over the
 //    ranks (the i-th slice of the group to rank i % size), sums the ranks'
 //    outputs with AllreduceInPlace (the output's element count and data type,
-//    a device pointer, always as a compact tensor), and a primitive that
+//    a device pointer: the first elements of the buffer whatever the strides), and a primitive that
 //    fails is DISTRIBUTED_FAILURE;
 //  * the optimizer slices to at least as many slices as there are ranks and
 //    leaves every rank the plan of the rank whose estimate is lowest.
@@ -739,27 +739,27 @@ std::vector<int64_t> deal_order(const SliceGroup* g, const std::vector<int64_t>&
 // accumulates, and the ranks' outputs are summed in place. Measured
 // on NVIDIA's library: an output the caller accumulates into is added to by
 // every rank from its own contents, so the sum holds the old output once per
-// rank; the output is a compact column-major tensor whatever strides the
-// caller set (the strides are honoured only without a communicator); a
-// failing primitive is DISTRIBUTED_FAILURE and leaves each rank its own part.
+// rank; the clearing and the sum cover the first volume-many elements of the
+// output buffer, as a compact tensor would lie, while the slices are written
+// with the strides the caller set (so the sum is wrong where an output with
+// padding has its padding: measured, and kept); a failing primitive is
+// DISTRIBUTED_FAILURE and leaves each rank its own part.
 Status contract_distributed(Handle* h, const World& w, Network& n, const Path& p, const std::vector<const void*>& in,
                             void* out, bool accumulate, const Workspace* ws, const SliceGroup* group,
-                            const std::vector<int64_t>& ids, cudaStream_t stream, const char* api, bool reduce = true) {
+                            const std::vector<int64_t>& ids, cudaStream_t stream, const char* api) {
   const std::vector<int64_t> order = deal_order(group, ids);
   std::vector<int64_t> mine;
   for (size_t i = 0; i < order.size(); ++i)
     if ((int64_t)(i % (size_t)std::max<int32_t>(w.size, 1)) == w.rank) mine.push_back(order[i]);
-  Network compact = n;
-  compact.out.strides.clear();
-  const size_t bytes = (size_t)volume(compact.out.extents) * elem_bytes(n.type);
+  const size_t bytes = (size_t)volume(n.out.extents) * elem_bytes(n.type);
   if (!accumulate && bytes && cudaMemsetAsync(out, 0, bytes, stream) != cudaSuccess)
     return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "the output could not be cleared");
-  if (Status s = contract_slices(h, compact, p, in, out, true, ws, mine, stream, api)) return s;
-  if (w.size <= 1 || !reduce) return CUTENSORNET_STATUS_SUCCESS;
+  if (Status s = contract_slices(h, n, p, in, out, true, ws, mine, stream, api)) return s;
+  if (w.size <= 1) return CUTENSORNET_STATUS_SUCCESS;
   if (cudaStreamSynchronize(stream) != cudaSuccess)
     return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "the stream failed");
   const auto c = comm_of(h);
-  if (g_comm_iface->AllreduceInPlace(&c, out, (int32_t)volume(compact.out.extents), n.type))
+  if (g_comm_iface->AllreduceInPlace(&c, out, (int32_t)volume(n.out.extents), n.type))
     return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -3492,11 +3492,11 @@ cutensornetStatus_t cutensornetCreateDistributedTensorDescriptor(
                 "A configured communicator is required for distributed tensor operations, including at world size one.");
   // NVIDIA's library first gathers a word from every rank (to compare the descriptors' metadata) and
   // then fails to load NCCL; the gather is made so that the ranks stay in step.
-  World w;
-  if (Status st = world_of(h, w, api)) return st;
-  std::vector<int32_t> all((size_t)std::max<int32_t>(w.size, 1));
-  int32_t mine = 0;
+  int32_t size = 1, mine = 0;
   const auto c = comm_of(h);
+  if (g_comm_iface->getNumRanks(&c, &size))
+    return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+  std::vector<int32_t> all((size_t)std::max<int32_t>(size, 1));
   if (g_comm_iface->Allgather(&c, &mine, all.data(), 1, CUDA_R_32I))
     return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
   return refuse(api, "distributed tensor descriptors (block-distributed tensors with distributed QR and SVD) are not implemented");

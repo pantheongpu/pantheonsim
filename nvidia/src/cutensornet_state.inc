@@ -679,9 +679,8 @@ Status plan_part(Handle* h, NetBuild& b, uint64_t limit, Part& part, const char*
 // computations of values (amplitudes, marginals, expectation values and the
 // norms) deal the slices to the ranks and sum their outputs in place
 // (Dist::Sum, measured on NVIDIA's library: one in-place sum for each output
-// tensor and for each norm, and one for an expectation value's components
-// together); Dist::Part leaves the sum to the caller.
-enum class Dist { None, Sum, Part };
+// tensor and for each norm).
+enum class Dist { None, Sum };
 
 Status run_part(Handle* h, NetBuild& b, const Part& part, void* out, const Workspace* w, cudaStream_t stream,
                 const char* api, Dist dist = Dist::None) {
@@ -695,8 +694,7 @@ Status run_part(Handle* h, NetBuild& b, const Part& part, void* out, const Works
     World world;
     if (Status st = world_of(h, world, api)) return st;
     if (world.distributed)
-      return contract_distributed(h, world, b.net, part.path, b.data, out, false, w, nullptr, ids, stream, api,
-                                  dist == Dist::Sum);
+      return contract_distributed(h, world, b.net, part.path, b.data, out, false, w, nullptr, ids, stream, api);
   }
   return contract_slices(h, b.net, part.path, b.data, out, false, w, ids, stream, api);
 }
@@ -3332,19 +3330,28 @@ cutensornetStatus_t cutensornetExpectationCompute(const cutensornetHandle_t hand
   ScratchSplit sp = split_scratch(w, 2 * kExtra);
   Circ c0;
   resolve_channels(s, c0, s.rng, true);
+  // With a communicator and at least as many terms as ranks, rank r contracts the terms c with c % ranks == r
+  // whole, with its own coefficients, and the ranks' sums of terms are summed in place; with fewer terms every term
+  // is contracted by all the ranks, slice by slice, and summed in place on its own (measured on NVIDIA's library
+  // with ranks scaling their coefficients and with 1 to 5 terms on 2 to 4 ranks).
+  World world;
+  if (Status st = world_of(h, world, api)) return st;
+  const size_t nterms = e->op->comps.size();
+  const bool by_term = world.distributed && world.size > 1 && (int64_t)nterms >= world.size;
+  const bool by_slice = world.distributed && world.size > 1 && !by_term;
   cd total = 0;
-  for (size_t k = 0; k < e->op->comps.size(); ++k) {
+  for (size_t k = 0; k < nterms; ++k) {
+    if (by_term && (int64_t)k % world.size != world.rank) continue;
     NetBuild b;
     Circ c = c0;
     if (Status st = build_component(s, e->op->comps[k], false, b, c, api)) return st;
-    if (Status st = run_part(h, b, e->parts[k], sp.scalars, &sp.rest, cudaStream, api, Dist::Part)) return st;
+    if (Status st = run_part(h, b, e->parts[k], sp.scalars, &sp.rest, cudaStream, api, by_slice ? Dist::Sum : Dist::None))
+      return st;
     cd v;
     if (!fetch_scalar(sp.scalars, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     total += e->op->comps[k].coef * v;
   }
-  World world;
-  if (Status st = world_of(h, world, api)) return st;
-  if (world.distributed && world.size > 1) {  // the ranks' parts of the value, summed
+  if (by_term) {
     alignas(16) unsigned char host[16] = {0};
     put_scalar(host, s.type, total);
     const auto comm = comm_of(h);

@@ -944,7 +944,7 @@ libcutensor.2.7.0 {
   # ---------------------------------------------------------------------------
   vgpu_version_script(cutensornet 0 _cutensornet_map)
   add_library(vgpucutensornet SHARED nvidia/src/cutensornet_api.cpp)
-  target_link_libraries(vgpucutensornet PRIVATE vgpucutensor vgpucusolver vgpucudart)
+  target_link_libraries(vgpucutensornet PRIVATE vgpucutensor vgpucusolver vgpucudart ${CMAKE_DL_LIBS})
   target_include_directories(vgpucutensornet PRIVATE ${CUDA_ABI_INCLUDE} include)
   set_target_properties(vgpucutensornet PROPERTIES OUTPUT_NAME cutensornet SOVERSION 2 VERSION 2.14)
   target_link_options(vgpucutensornet PRIVATE "-Wl,--version-script=${_cutensornet_map}")
@@ -1978,6 +1978,14 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
+  # cuTensorNet distributed over MPI (Open MPI): jobs of two and three ranks, each with its
+  # own simulated GPU, and communication libraries that cannot be used. The checks pass on
+  # NVIDIA's library on two RTX 3060s (run_cutensornet_mpi.sh --card). Skips without Open MPI.
+  add_test(NAME e2e_cutensornet_mpi COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cutensornet_mpi.sh)
+  set_tests_properties(e2e_cutensornet_mpi PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # nvJitLink linking relocatable SASS (-rdc cubins, a host object, a static
   # library) for each generation, and running what it links. The program
   # passes on an RTX 3060 with NVIDIA's nvJitLink and with this one.
