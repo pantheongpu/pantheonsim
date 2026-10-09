@@ -109,9 +109,9 @@ GraphWork::~GraphWork() {
 }
 
 namespace {
-std::atomic<void (*)(const Event&)> g_record_hook{nullptr};
+std::atomic<void (*)(Event&)> g_record_hook{nullptr};
 }
-void set_record_hook(void (*fn)(const Event&)) { g_record_hook.store(fn, std::memory_order_release); }
+void set_record_hook(void (*fn)(Event&)) { g_record_hook.store(fn, std::memory_order_release); }
 
 void record(Event&& e) {
   if (!enabled()) return;

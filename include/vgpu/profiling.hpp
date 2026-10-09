@@ -103,6 +103,11 @@ struct Event {
   // leaves them zero.
   uint32_t context_id = 0;
   uint32_t stream_id = 0;
+  // The id a front end gave the stream of this event when the event was recorded
+  // (0: not yet). A handle can be handed out again once its stream is destroyed;
+  // the id the front end kept for the stream the event was made on must not move
+  // to the new stream.
+  uint32_t stream_pin = 0;
   // Memcpy: on one of the driver's own streams in the device's context rather
   // than a stream of the program's -- the nth of the eight made with the
   // context (-1: the stream above).
@@ -119,8 +124,9 @@ std::vector<Event> drain();
 
 // Told of each event as it is recorded, on the recording thread, with no lock
 // of the engine's held: a front end that hands out buffers as the first record
-// for one is made (CUPTI does) learns of it here. One hook; null to remove.
-void set_record_hook(void (*fn)(const Event&));
+// for one is made (CUPTI does) learns of it here, and may complete it (stream_pin).
+// One hook; null to remove.
+void set_record_hook(void (*fn)(Event&));
 
 // Monotonic, and the same clock the events carry.
 uint64_t now_ns();
