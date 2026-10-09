@@ -823,32 +823,39 @@ int main() {
     // group. Bit 0 suspends, anything else is a successful no-op; suspending
     // twice or resuming what is running is ncclInvalidUsage; a suspended
     // communicator still answers queries and splits.
-    auto suspended = [&](int i) { uint64_t x = 9; ncclCommMemStats(ch[i], ncclStatGpuMemSuspended, &x); return x; };
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSuspend(ch[i], 0)); }
-    NK(ncclGroupEnd());
-    expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "suspend: flags 0 do nothing");
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSuspend(ch[i], NCCL_SUSPEND_MEM)); }
-    NK(ncclGroupEnd());
-    expect(suspended(0) == 1 && suspended(nranks - 1) == 1, "suspend: NCCL_SUSPEND_MEM suspends every rank");
-    cudaSetDevice(0);
-    expect_rc(ncclCommSuspend(ch[0], NCCL_SUSPEND_MEM), ncclInvalidUsage, "suspend: twice");
-    {
-      int n = -1;
-      expect(ncclCommCount(ch[0], &n) == ncclSuccess && n == nranks, "suspend: still answers ncclCommCount");
-      ncclUniqueId u;
-      expect_rc(ncclCommGetUniqueId(ch[0], &u), ncclSuccess, "suspend: still gives unique ids");
+    // NCCL 2.29.7 (RTX 3060 pair) hangs when one thread suspends or resumes the
+    // ranks in a group, which 2.31.2 accepts (2.30 was not measured), so this part
+    // runs from 2.30.
+    if (g_ver >= NCCL_VERSION(2, 30, 0)) {
+      auto suspended = [&](int i) { uint64_t x = 9; ncclCommMemStats(ch[i], ncclStatGpuMemSuspended, &x); return x; };
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSuspend(ch[i], 0)); }
+      NK(ncclGroupEnd());
+      expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "suspend: flags 0 do nothing");
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommSuspend(ch[i], NCCL_SUSPEND_MEM)); }
+      NK(ncclGroupEnd());
+      expect(suspended(0) == 1 && suspended(nranks - 1) == 1, "suspend: NCCL_SUSPEND_MEM suspends every rank");
+      cudaSetDevice(0);
+      expect_rc(ncclCommSuspend(ch[0], NCCL_SUSPEND_MEM), ncclInvalidUsage, "suspend: twice");
+      {
+        int n = -1;
+        expect(ncclCommCount(ch[0], &n) == ncclSuccess && n == nranks, "suspend: still answers ncclCommCount");
+        ncclUniqueId u;
+        expect_rc(ncclCommGetUniqueId(ch[0], &u), ncclSuccess, "suspend: still gives unique ids");
+      }
+      NK(ncclGroupStart());
+      for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommResume(ch[i])); }
+      NK(ncclGroupEnd());
+      expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "resume: back to running");
+      cudaSetDevice(0);
+      expect_rc(ncclCommResume(ch[0]), ncclInvalidUsage, "resume: not suspended");
+      expect_rc(ncclCommSuspend(nullptr, NCCL_SUSPEND_MEM), ncclInvalidArgument, "suspend: NULL comm");
+      expect_rc(ncclCommResume(nullptr), ncclInvalidArgument, "resume: NULL comm");
+      expect(gathered_order(ch, everyone, everyone), "resume: the communicator works again");
+    } else {
+      std::printf("skipped: suspending and resuming in a group needs libnccl 2.30 (this is %d)\n", g_ver);
     }
-    NK(ncclGroupStart());
-    for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommResume(ch[i])); }
-    NK(ncclGroupEnd());
-    expect(suspended(0) == 0 && suspended(nranks - 1) == 0, "resume: back to running");
-    cudaSetDevice(0);
-    expect_rc(ncclCommResume(ch[0]), ncclInvalidUsage, "resume: not suspended");
-    expect_rc(ncclCommSuspend(nullptr, NCCL_SUSPEND_MEM), ncclInvalidArgument, "suspend: NULL comm");
-    expect_rc(ncclCommResume(nullptr), ncclInvalidArgument, "resume: NULL comm");
-    expect(gathered_order(ch, everyone, everyone), "resume: the communicator works again");
     destroy_all(ch);
 
     // card: revoke is local. It refuses new work with ncclInvalidUsage, can be
@@ -1025,12 +1032,18 @@ int main() {
     ncclCommProperties_t pr = NCCL_COMM_PROPERTIES_INITIALIZER;
     cudaSetDevice(1);
     const ncclResult_t rq = ncclCommQueryProperties(world[1], &pr);
-    expect(rq == ncclSuccess && pr.rank == 1 && pr.nRanks == nranks && pr.cudaDev == 1 && pr.devCommRuntimeVersionSize > 0,
+    expect(rq == ncclSuccess && pr.rank == 1 && pr.nRanks == nranks && pr.cudaDev == 1
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
+               && pr.devCommRuntimeVersionSize > 0  // nccl.h 2.29's struct stops before this
+#endif
+               ,
            "properties: rank, size, device");
     ncclCommProperties_t pr0 = NCCL_COMM_PROPERTIES_INITIALIZER;
     cudaSetDevice(0);
     ncclCommQueryProperties(world[0], &pr0);
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 0)
     expect(pr0.commHash == pr.commHash, "properties: every rank sees one communicator hash");
+#endif
     ncclCommProperties_t junk;
     std::memset(&junk, 0, sizeof junk);
     expect_rc(ncclCommQueryProperties(world[0], &junk), ncclInvalidUsage, "properties: not initialised");
@@ -1437,7 +1450,11 @@ int main() {
 #endif
 
   // card: a blocking communicator finalizes once; the second is an error.
+  // NVIDIA's libnccl (2.31.2, an RTX 3060 pair) hangs when one thread
+  // finalizes the ranks one after another outside a group, so they go in one.
+  NK(ncclGroupStart());
   for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); NK(ncclCommFinalize(world[i])); }
+  NK(ncclGroupEnd());
   cudaSetDevice(0);
   expect_rc(ncclCommFinalize(world[0]), ncclInvalidArgument, "blocking: second finalize");
   for (int i = 0; i < nranks; ++i) { cudaSetDevice(i); ncclCommDestroy(world[i]); cudaStreamDestroy(streams[i]); }
