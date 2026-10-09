@@ -3987,21 +3987,19 @@ VGPU_EXPORT CUresult cuMemPoolCreate(void** pool, const void* poolProps) {
     if (!pool || !poolProps) return CUDA_ERROR_INVALID_VALUE;
     const auto* props = static_cast<const MemPoolPropsABI*>(poolProps);
     if (props->alloc_type != kMemAllocationTypePinned) return CUDA_ERROR_INVALID_VALUE;
-    // A pool on the host, or on a NUMA node, would hold host memory the
-    // device reaches; only device pools are made here.
+    // Measured on an RTX 3060 (driver 13.2): a location that is none, a device that does not exist and
+    // a handle type (the device supports none: cuDeviceGetAttribute
+    // CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES is 0) are all CUDA_ERROR_INVALID_VALUE. A pool on
+    // the host, or on a NUMA node, would hold host memory the device reaches: the card makes one, and
+    // only device pools are made here.
+    if (props->location.type == 0) return CUDA_ERROR_INVALID_VALUE;
     if (props->location.type != kMemLocationTypeDevice) {
       report("cuMemPoolCreate", "only a pool located on a device is implemented (a host or NUMA "
                                 "location is not)");
       return CUDA_ERROR_NOT_SUPPORTED;
     }
-    if (props->location.id < 0 || props->location.id >= s.rt->device_count()) return CUDA_ERROR_INVALID_DEVICE;
-    // A pool another process could allocate from would have to share this
-    // process's own memory.
-    if (props->handle_types != 0) {
-      report("cuMemPoolCreate", "a pool that exports shareable handles is not implemented: device "
-                                "memory here is this process's own");
-      return CUDA_ERROR_NOT_SUPPORTED;
-    }
+    if (props->location.id < 0 || props->location.id >= s.rt->device_count()) return CUDA_ERROR_INVALID_VALUE;
+    if (props->handle_types != 0) return CUDA_ERROR_INVALID_VALUE;
     s.pools.emplace_back();
     PoolRec& p = s.pools.back();
     p.device = props->location.id;
@@ -4128,21 +4126,26 @@ VGPU_EXPORT CUresult cuMemPoolGetAccess(int* flags, void* pool, void* location) 
 
 // Sharing a pool, or one of its allocations, with another process needs memory
 // that process can map; device memory here is this process's own sparse backing.
+// Sharing a pool, or a pointer from one, with another process: the device supports no handle type for pools
+// (CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES is 0), so no pool can be exported. Measured on an
+// RTX 3060, as the runtime's calls of the same names are: the exports are CUDA_ERROR_INVALID_VALUE
+// whatever is passed; an import checks its pointers, flags (0 only) and type first -- the file descriptor, Win32 and
+// fabric types the device does not support are CUDA_ERROR_NOT_SUPPORTED, any other type
+// CUDA_ERROR_INVALID_VALUE; the pointer calls are CUDA_ERROR_INVALID_VALUE.
 VGPU_EXPORT CUresult cuMemPoolExportToShareableHandle(void*, void*, int, unsigned long long) {
-  report("cuMemPoolExportToShareableHandle", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return api("cuMemPoolExportToShareableHandle", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
-VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void**, void*, int, unsigned long long) {
-  report("cuMemPoolImportFromShareableHandle", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void** pool, void* handle, int type, unsigned long long flags) {
+  return api("cuMemPoolImportFromShareableHandle", true, false, [&](ShimState&) {
+    if (!pool || !handle || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    return type == 1 || type == 2 || type == 8 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+  });
 }
 VGPU_EXPORT CUresult cuMemPoolExportPointer(void*, CUdeviceptr) {
-  report("cuMemPoolExportPointer", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return api("cuMemPoolExportPointer", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
 VGPU_EXPORT CUresult cuMemPoolImportPointer(CUdeviceptr*, void*, void*) {
-  report("cuMemPoolImportPointer", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return api("cuMemPoolImportPointer", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
 
 /* ---- pitched memory, module globals, context configuration ----
