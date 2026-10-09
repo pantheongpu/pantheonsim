@@ -48,6 +48,7 @@
 
 #include "enum_value.hpp"
 #include "error_names.hpp"
+#include "texture_formats.hpp"
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -4003,8 +4004,13 @@ struct ArrayRec {
   uint32_t width = 0, height = 0, depth = 0;   // as allocated: depth counts slices of any kind
   cudaChannelFormatDesc fmt{};
   uint32_t texel_bytes = 0;
+  // For a block-compressed array, `width` and `height` count 4 x 4 blocks (and `texel_bytes` is a block's),
+  // which is what the copies address; the array's size in texels is lw x lh.
+  vgpu::cuda::TexFormat tf;
+  uint32_t lw = 0, lh = 0;
   unsigned int flags = 0;                      // cudaArrayLayered, cudaArrayCubemap, ...
   int device = 0;
+  bool blocky() const { return tf.block != vgpu::exec::BlockFormat::None; }
   uint64_t row_bytes() const { return uint64_t{width} * texel_bytes; }
   uint64_t slice_bytes() const { return row_bytes() * (height ? height : 1); }
   uint32_t slices() const { return depth ? depth : 1; }
@@ -4023,20 +4029,25 @@ struct MipmappedRec {
 std::unordered_map<uint64_t, MipmappedRec> g_mipmapped;
 uint64_t g_next_mipmapped = 1;
 
-uint32_t texel_bytes_of(const cudaChannelFormatDesc& f) {
-  return static_cast<uint32_t>((f.x + f.y + f.z + f.w + 7) / 8);
+// A channel descriptor as the texture unit sees it, or false for one the card refuses.
+bool format_of(const cudaChannelFormatDesc& f, vgpu::cuda::TexFormat* out) {
+  return vgpu::cuda::texture_format_from_runtime(static_cast<int>(f.f), f.x, f.y, f.z, f.w, out);
 }
-uint32_t channels_of(const cudaChannelFormatDesc& f) {
-  return (f.x ? 1u : 0u) + (f.y ? 1u : 0u) + (f.z ? 1u : 0u) + (f.w ? 1u : 0u);
+// What a sampled texel of this format takes in the descriptor's (virtual) layout.
+uint32_t sampled_bytes(const vgpu::cuda::TexFormat& f) {
+  if (f.block == vgpu::exec::BlockFormat::None) return f.texel_bytes;
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < f.channels; ++i) n += f.bits[i] / 8;
+  return n;
 }
-
-bool channel_kind_of(const cudaChannelFormatDesc& f, vgpu::exec::ChannelKind* out) {
-  switch (f.f) {
-    case cudaChannelFormatKindSigned: *out = vgpu::exec::ChannelKind::Signed; return true;
-    case cudaChannelFormatKindUnsigned: *out = vgpu::exec::ChannelKind::Unsigned; return true;
-    case cudaChannelFormatKindFloat: *out = vgpu::exec::ChannelKind::Float; return true;
-    default: return false;  // NV12, block-compressed and the rest
-  }
+// Puts a format into a texture descriptor.
+void apply_format(vgpu::exec::TextureDesc* d, const vgpu::cuda::TexFormat& f) {
+  d->kind = f.kind;
+  d->channels = f.channels;
+  for (int i = 0; i < 4; ++i) d->channel_bits[i] = f.bits[i];
+  d->block = f.block;
+  d->packed_1010102 = f.packed_1010102;
+  d->texel_bytes = sampled_bytes(f);
 }
 
 bool address_mode_of(cudaTextureAddressMode m, vgpu::exec::TexAddress* out) {
@@ -4054,95 +4065,118 @@ bool address_mode_of(cudaTextureAddressMode m, vgpu::exec::TexAddress* out) {
 // forgotten initialisation looks like the invalid handle it is.
 uint64_t g_next_texobj = 0x1000;
 
-// Fills in the parts of the descriptor that come from the resource, whichever
-// kind it is. Returns an error code on the forms not implemented.
-cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureDesc* d) {
-  switch (res->resType) {
+// What a view may call a texel: the resource view formats (cudaResViewFormat*) as storage.
+bool view_format(int v, vgpu::cuda::TexFormat* f) {
+  using vgpu::exec::BlockFormat;
+  using vgpu::exec::ChannelKind;
+  *f = vgpu::cuda::TexFormat{};
+  auto plain = [&](ChannelKind k, uint32_t bits, uint32_t channels) {
+    f->kind = k;
+    f->channels = channels;
+    for (uint32_t i = 0; i < channels; ++i) f->bits[i] = bits;
+    f->texel_bytes = bits * channels / 8;
+    f->integer = k != ChannelKind::Float;
+    f->is_int32 = bits == 32 && k != ChannelKind::Float;
+    f->elem_only = k == ChannelKind::Float;
+    return true;
+  };
+  static const uint32_t kCh[3] = {1, 2, 4};
+  if (v >= 0x01 && v <= 0x03) return plain(ChannelKind::Unsigned, 8, kCh[v - 1]);
+  if (v >= 0x04 && v <= 0x06) return plain(ChannelKind::Signed, 8, kCh[v - 4]);
+  if (v >= 0x07 && v <= 0x09) return plain(ChannelKind::Unsigned, 16, kCh[v - 7]);
+  if (v >= 0x0a && v <= 0x0c) return plain(ChannelKind::Signed, 16, kCh[v - 0x0a]);
+  if (v >= 0x0d && v <= 0x0f) return plain(ChannelKind::Unsigned, 32, kCh[v - 0x0d]);
+  if (v >= 0x10 && v <= 0x12) return plain(ChannelKind::Signed, 32, kCh[v - 0x10]);
+  if (v >= 0x13 && v <= 0x15) return plain(ChannelKind::Float, 16, kCh[v - 0x13]);
+  if (v >= 0x16 && v <= 0x18) return plain(ChannelKind::Float, 32, kCh[v - 0x16]);
+  // The block-compressed views have the descriptors of the block-compressed channel kinds.
+  static const struct { int view, kind, x, y, z, w; } kBlock[] = {
+      {0x19, 17, 8, 8, 8, 8}, {0x1a, 19, 8, 8, 8, 8}, {0x1b, 21, 8, 8, 8, 8}, {0x1c, 23, 8, 0, 0, 0},
+      {0x1d, 24, 8, 0, 0, 0}, {0x1e, 25, 8, 8, 0, 0}, {0x1f, 26, 8, 8, 0, 0}, {0x20, 27, 16, 16, 16, 0},
+      {0x21, 28, 16, 16, 16, 0}, {0x22, 29, 8, 8, 8, 8}};
+  for (const auto& e : kBlock)
+    if (e.view == v) return vgpu::cuda::texture_format_from_runtime(e.kind, e.x, e.y, e.z, e.w, f);
+  return false;
+}
+
+// Fills in the parts of the descriptor that come from the resource, whichever kind it is. `format`
+// receives the format the texels are in. The errors are the card's: a pointer that is null or not aligned
+// to the texture alignment (512 bytes), or a pitch that is short of a row or not a multiple of 32, is
+// cudaErrorInvalidValue; a channel descriptor that names no format is cudaErrorInvalidChannelDescriptor;
+// an array that does not exist is cudaErrorInvalidResourceHandle.
+cudaError_t fill_from_resource(const cudaResourceDesc* res, vgpu::exec::TextureDesc* d, vgpu::cuda::TexFormat* format) {
+  switch (enum_value(res->resType)) {
     case cudaResourceTypeLinear: {
+      vgpu::cuda::TexFormat f;
+      if (!format_of(res->res.linear.desc, &f)) return cudaErrorInvalidChannelDescriptor;
+      if (!res->res.linear.devPtr || reinterpret_cast<uint64_t>(res->res.linear.devPtr) % 512) return cudaErrorInvalidValue;
+      if (f.block != vgpu::exec::BlockFormat::None) return cudaErrorNotSupported;   // block-compressed data in linear memory
       d->base = reinterpret_cast<uint64_t>(res->res.linear.devPtr);
-      d->texel_bytes = texel_bytes_of(res->res.linear.desc);
-      if (d->texel_bytes == 0) return cudaErrorInvalidValue;
-      d->width = static_cast<uint32_t>(res->res.linear.sizeInBytes / d->texel_bytes);
+      apply_format(d, f);
+      d->width = static_cast<uint32_t>(res->res.linear.sizeInBytes / f.texel_bytes);
       d->height = 0;
       d->depth = 0;
       d->pitch_bytes = 0;
-      d->channels = channels_of(res->res.linear.desc);
-      d->channel_bits[0] = static_cast<uint32_t>(res->res.linear.desc.x);
-      d->channel_bits[1] = static_cast<uint32_t>(res->res.linear.desc.y);
-      d->channel_bits[2] = static_cast<uint32_t>(res->res.linear.desc.z);
-      d->channel_bits[3] = static_cast<uint32_t>(res->res.linear.desc.w);
-      if (!channel_kind_of(res->res.linear.desc, &d->kind)) return cudaErrorNotSupported;
+      *format = f;
       return cudaSuccess;
     }
     case cudaResourceTypePitch2D: {
+      vgpu::cuda::TexFormat f;
+      if (!format_of(res->res.pitch2D.desc, &f)) return cudaErrorInvalidChannelDescriptor;
+      if (!res->res.pitch2D.devPtr || reinterpret_cast<uint64_t>(res->res.pitch2D.devPtr) % 512) return cudaErrorInvalidValue;
+      if (f.block != vgpu::exec::BlockFormat::None) return cudaErrorNotSupported;
+      if (res->res.pitch2D.pitchInBytes % 32 || res->res.pitch2D.pitchInBytes < res->res.pitch2D.width * f.texel_bytes)
+        return cudaErrorInvalidValue;
       d->base = reinterpret_cast<uint64_t>(res->res.pitch2D.devPtr);
-      d->texel_bytes = texel_bytes_of(res->res.pitch2D.desc);
-      if (d->texel_bytes == 0) return cudaErrorInvalidValue;
+      apply_format(d, f);
       d->width = static_cast<uint32_t>(res->res.pitch2D.width);
       d->height = static_cast<uint32_t>(res->res.pitch2D.height);
       d->depth = 0;
       d->pitch_bytes = static_cast<uint32_t>(res->res.pitch2D.pitchInBytes);
-      d->channels = channels_of(res->res.pitch2D.desc);
-      d->channel_bits[0] = static_cast<uint32_t>(res->res.pitch2D.desc.x);
-      d->channel_bits[1] = static_cast<uint32_t>(res->res.pitch2D.desc.y);
-      d->channel_bits[2] = static_cast<uint32_t>(res->res.pitch2D.desc.z);
-      d->channel_bits[3] = static_cast<uint32_t>(res->res.pitch2D.desc.w);
-      if (!channel_kind_of(res->res.pitch2D.desc, &d->kind)) return cudaErrorNotSupported;
+      *format = f;
       return cudaSuccess;
     }
-    case cudaResourceTypeArray: {
-      auto it = g_arrays.find(reinterpret_cast<uint64_t>(res->res.array.array));
-      if (it == g_arrays.end()) return cudaErrorInvalidValue;
-      const ArrayRec& a = it->second;
-      d->base = a.base;
-      d->width = a.width;
-      d->height = a.height;
-      d->depth = a.depth;
-      d->cubemap = a.flags & cudaArrayCubemap;
-      if (a.flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
-      if (d->cubemap || d->layers) d->depth = 0;
-      d->pitch_bytes = a.width * a.texel_bytes;
-      d->texel_bytes = a.texel_bytes;
-      d->channels = channels_of(a.fmt);
-      d->channel_bits[0] = static_cast<uint32_t>(a.fmt.x);
-      d->channel_bits[1] = static_cast<uint32_t>(a.fmt.y);
-      d->channel_bits[2] = static_cast<uint32_t>(a.fmt.z);
-      d->channel_bits[3] = static_cast<uint32_t>(a.fmt.w);
-      d->from_array = true;
-      if (!channel_kind_of(a.fmt, &d->kind)) return cudaErrorNotSupported;
-      return cudaSuccess;
-    }
+    case cudaResourceTypeArray:
     case cudaResourceTypeMipmappedArray: {
-      auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(res->res.mipmap.mipmap));
-      if (it == g_mipmapped.end()) return cudaErrorInvalidValue;
-      const auto& lv = it->second.levels;
-      if (lv.empty() || lv.size() > 17) return cudaErrorInvalidValue;
-      const ArrayRec& a = g_arrays.at(lv[0]);
+      const bool mip = enum_value(res->resType) == cudaResourceTypeMipmappedArray;
+      const std::vector<uint64_t>* levels = nullptr;
+      unsigned int flags = 0;
+      uint64_t first = 0;
+      if (mip) {
+        auto it = g_mipmapped.find(reinterpret_cast<uint64_t>(res->res.mipmap.mipmap));
+        if (it == g_mipmapped.end()) return cudaErrorInvalidResourceHandle;
+        levels = &it->second.levels;
+        if (levels->empty() || levels->size() > 17) return cudaErrorInvalidValue;
+        flags = it->second.flags;
+        first = levels->front();
+      } else {
+        first = reinterpret_cast<uint64_t>(res->res.array.array);
+      }
+      auto it = g_arrays.find(first);
+      if (it == g_arrays.end()) return cudaErrorInvalidResourceHandle;
+      const ArrayRec& a = it->second;
+      if (!mip) flags = a.flags;
       d->base = a.base;
-      d->width = a.width;
-      d->height = a.height;
+      d->width = a.blocky() ? a.lw : a.width;
+      d->height = a.blocky() ? a.lh : a.height;
       d->depth = a.depth;
-      // Layered and cubemap mipmaps: every level has all the layers (and
-      // faces), each of that level's size. Level 0's depth is the slice
-      // count, as cudaMallocMipmappedArray keeps extent.depth for them.
-      d->cubemap = it->second.flags & cudaArrayCubemap;
-      if (it->second.flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
+      // Layered and cubemap (mipmapped) arrays: every level has all the layers (and faces), each of that
+      // level's size; level 0's depth is the slice count.
+      d->cubemap = flags & cudaArrayCubemap;
+      if (flags & cudaArrayLayered) d->layers = d->cubemap ? a.depth / 6 : a.depth;
       if (d->cubemap || d->layers) d->depth = 0;
       d->pitch_bytes = a.width * a.texel_bytes;
-      d->texel_bytes = a.texel_bytes;
-      d->channels = channels_of(a.fmt);
-      d->channel_bits[0] = static_cast<uint32_t>(a.fmt.x);
-      d->channel_bits[1] = static_cast<uint32_t>(a.fmt.y);
-      d->channel_bits[2] = static_cast<uint32_t>(a.fmt.z);
-      d->channel_bits[3] = static_cast<uint32_t>(a.fmt.w);
+      apply_format(d, a.tf);
       d->from_array = true;
-      d->mip_levels = static_cast<uint32_t>(lv.size());
-      for (size_t l = 0; l < lv.size(); ++l) d->level_base[l] = g_arrays.at(lv[l]).base;
-      if (!channel_kind_of(a.fmt, &d->kind)) return cudaErrorNotSupported;
+      if (mip) {
+        d->mip_levels = static_cast<uint32_t>(levels->size());
+        for (size_t l = 0; l < levels->size(); ++l) d->level_base[l] = g_arrays.at((*levels)[l]).base;
+      }
+      *format = a.tf;
       return cudaSuccess;
     }
     default:
-      return cudaErrorNotSupported;
+      return cudaErrorInvalidValue;
   }
 }
 
@@ -4176,10 +4210,16 @@ VGPU_EXPORT cudaError_t cudaMallocArray(cudaArray_t* array, const cudaChannelFor
     (void)flags;  // cudaArraySurfaceLoadStore changes nothing about the storage here
     ArrayRec rec;
     rec.fmt = *desc;
-    rec.texel_bytes = texel_bytes_of(*desc);
-    if (rec.texel_bytes == 0 || width == 0) return cudaErrorInvalidValue;
-    rec.width = static_cast<uint32_t>(width);
-    rec.height = static_cast<uint32_t>(height);
+    // Measured on an RTX 3060: a descriptor that names no format is cudaErrorInvalidChannelDescriptor, and a
+    // block-compressed array cannot be a surface.
+    if (!format_of(*desc, &rec.tf)) return cudaErrorInvalidChannelDescriptor;
+    if (rec.blocky() && (flags & cudaArraySurfaceLoadStore)) return cudaErrorNotSupported;
+    if (width == 0) return cudaErrorInvalidValue;
+    rec.texel_bytes = rec.tf.texel_bytes;
+    rec.lw = static_cast<uint32_t>(width);
+    rec.lh = static_cast<uint32_t>(height);
+    rec.width = rec.blocky() ? (rec.lw + 3) / 4 : rec.lw;
+    rec.height = rec.blocky() ? (rec.lh + 3) / 4 : rec.lh;
     rec.depth = 0;
     rec.bytes = uint64_t{rec.width} * (rec.height ? rec.height : 1) * rec.texel_bytes;
     rec.device = t_current_device;
@@ -4201,8 +4241,10 @@ VGPU_EXPORT cudaError_t cudaMalloc3DArray(cudaArray_t* array, const cudaChannelF
     if (!array || !desc) return cudaErrorInvalidValue;
     ArrayRec rec;
     rec.fmt = *desc;
-    rec.texel_bytes = texel_bytes_of(*desc);
-    if (rec.texel_bytes == 0 || extent.width == 0) return cudaErrorInvalidValue;
+    if (!format_of(*desc, &rec.tf)) return cudaErrorInvalidChannelDescriptor;
+    if (rec.blocky() && (flags & cudaArraySurfaceLoadStore)) return cudaErrorNotSupported;
+    rec.texel_bytes = rec.tf.texel_bytes;
+    if (extent.width == 0) return cudaErrorInvalidValue;
     const bool layered = flags & cudaArrayLayered, cube = flags & cudaArrayCubemap;
     // Gather works on 2D arrays only; with a layered or cubemap flag the
     // hardware's runtime returns cudaErrorInvalidValue, and so does this.
@@ -4216,8 +4258,10 @@ VGPU_EXPORT cudaError_t cudaMalloc3DArray(cudaArray_t* array, const cudaChannelF
     } else if (extent.depth && !extent.height) {
       return cudaErrorInvalidValue;   // a 3D array has a height
     }
-    rec.width = static_cast<uint32_t>(extent.width);
-    rec.height = static_cast<uint32_t>(extent.height);
+    rec.lw = static_cast<uint32_t>(extent.width);
+    rec.lh = static_cast<uint32_t>(extent.height);
+    rec.width = rec.blocky() ? (rec.lw + 3) / 4 : rec.lw;
+    rec.height = rec.blocky() ? (rec.lh + 3) / 4 : rec.lh;
     rec.depth = static_cast<uint32_t>(extent.depth);
     rec.flags = flags;
     rec.bytes = rec.slice_bytes() * rec.slices();
@@ -4286,7 +4330,10 @@ VGPU_EXPORT cudaError_t cudaArrayGetInfo(cudaChannelFormatDesc* desc, cudaExtent
     auto it = g_arrays.find(reinterpret_cast<uint64_t>(array));
     if (it == g_arrays.end()) return cudaErrorInvalidResourceHandle;
     if (desc) *desc = it->second.fmt;
-    if (extent) *extent = cudaExtent{it->second.width, it->second.height, it->second.depth};
+    if (extent) {
+      const ArrayRec& a = it->second;
+      *extent = a.blocky() ? cudaExtent{a.lw, a.lh, a.depth} : cudaExtent{a.width, a.height, a.depth};
+    }
     if (flags) *flags = it->second.flags;
     return cudaSuccess;
   });
@@ -4313,19 +4360,29 @@ VGPU_EXPORT cudaError_t cudaMemcpy3D(const cudaMemcpy3DParms* p) {
     da = &it->second;
   }
   if ((!sa && !p->srcPtr.ptr) || (!da && !p->dstPtr.ptr)) return cudaErrorInvalidValue;
+  // Block-compressed arrays hold 4 x 4 blocks: the extent and the array's side of the positions are in
+  // texels, and cover whole blocks.
+  cudaExtent ext = p->extent;
+  cudaPos spos = p->srcPos, dpos = p->dstPos;
+  if ((sa && sa->blocky()) || (da && da->blocky())) {
+    ext.width = (ext.width + 3) / 4;
+    ext.height = ext.height ? (ext.height + 3) / 4 : 0;
+    if (sa && sa->blocky()) spos.x /= 4, spos.y /= 4;
+    if (da && da->blocky()) dpos.x /= 4, dpos.y /= 4;
+  }
   if (sa && da && sa->texel_bytes != da->texel_bytes) return cudaErrorInvalidValue;
   const uint64_t elem = sa ? sa->texel_bytes : (da ? da->texel_bytes : 1);
-  const uint64_t row = p->extent.width * elem;
-  const uint64_t rows = p->extent.height ? p->extent.height : 1;
-  const uint64_t depth = p->extent.depth ? p->extent.depth : 1;
+  const uint64_t row = ext.width * elem;
+  const uint64_t rows = ext.height ? ext.height : 1;
+  const uint64_t depth = ext.depth ? ext.depth : 1;
   if (row == 0) return cudaSuccess;
   auto in_array = [](const ArrayRec& a, const cudaPos& pos, uint64_t w, uint64_t h, uint64_t d) {
     return pos.x + w <= a.width && pos.y + h <= (a.height ? a.height : 1) && pos.z + d <= a.slices();
   };
-  if (sa && !in_array(*sa, p->srcPos, p->extent.width, rows, depth)) return cudaErrorInvalidValue;
-  if (da && !in_array(*da, p->dstPos, p->extent.width, rows, depth)) return cudaErrorInvalidValue;
-  if (!sa && (p->srcPos.x + row > p->srcPtr.pitch)) return cudaErrorInvalidPitchValue;
-  if (!da && (p->dstPos.x + row > p->dstPtr.pitch)) return cudaErrorInvalidPitchValue;
+  if (sa && !in_array(*sa, spos, ext.width, rows, depth)) return cudaErrorInvalidValue;
+  if (da && !in_array(*da, dpos, ext.width, rows, depth)) return cudaErrorInvalidValue;
+  if (!sa && (spos.x + row > p->srcPtr.pitch)) return cudaErrorInvalidPitchValue;
+  if (!da && (dpos.x + row > p->dstPtr.pitch)) return cudaErrorInvalidPitchValue;
   auto address = [&](const ArrayRec* a, const cudaPitchedPtr& ptr, const cudaPos& pos, uint64_t y,
                      uint64_t z) -> char* {
     if (a)
@@ -4336,8 +4393,8 @@ VGPU_EXPORT cudaError_t cudaMemcpy3D(const cudaMemcpy3DParms* p) {
   };
   for (uint64_t z = 0; z < depth; ++z)
     for (uint64_t y = 0; y < rows; ++y) {
-      const cudaError_t e = cudaMemcpy(address(da, p->dstPtr, p->dstPos, y, z),
-                                       address(sa, p->srcPtr, p->srcPos, y, z), row, p->kind);
+      const cudaError_t e = cudaMemcpy(address(da, p->dstPtr, dpos, y, z),
+                                       address(sa, p->srcPtr, spos, y, z), row, p->kind);
       if (e != cudaSuccess) return e;
     }
   return cudaSuccess;
@@ -4640,9 +4697,62 @@ namespace {
 struct ObjectDescs {
   cudaResourceDesc res;
   cudaTextureDesc tex;
+  bool has_view = false;
+  cudaResourceViewDesc view{};
 };
 std::unordered_map<uint64_t, ObjectDescs> g_object_descs;
 }  // namespace
+
+// A resource view reinterprets the texels of what it views: the same storage, named as another format of the
+// same size. Measured on an RTX 3060: the format is a real view format (cudaResViewFormatNone with a zero
+// descriptor is invalid), its texel is as many bytes as the resource's, and the extent given is the
+// resource's own -- for a block-compressed view of a 64- or 128-bit-texel array, four times it in each of
+// width and height, the array holding blocks. A first mipmap level, or a layer range, is not modelled.
+cudaError_t apply_view(const cudaResourceViewDesc* v, const cudaResourceDesc* res, vgpu::exec::TextureDesc* d,
+                       vgpu::cuda::TexFormat* format) {
+  vgpu::cuda::TexFormat vf;
+  if (!view_format(enum_value(v->format), &vf)) return cudaErrorInvalidValue;
+  // What is viewed: its storage texel in bytes, and its extent.
+  uint64_t storage_texel = 0, w = 0, h = 0;
+  const bool array = enum_value(res->resType) == cudaResourceTypeArray ||
+                     enum_value(res->resType) == cudaResourceTypeMipmappedArray;
+  if (array) {
+    storage_texel = format->texel_bytes;
+    if (d->mip_levels || d->layers || d->cubemap) return cudaErrorNotSupported;   // a view's level and layer range
+    w = format->block != vgpu::exec::BlockFormat::None ? d->width : d->width;
+    h = d->height;
+  } else {
+    storage_texel = format->texel_bytes;
+    w = d->width;
+    h = d->height;
+  }
+  if (vf.texel_bytes != storage_texel) return cudaErrorInvalidValue;
+  if (v->firstMipmapLevel != 0 || v->lastMipmapLevel != 0 || v->firstLayer != 0 || v->lastLayer != 0)
+    return cudaErrorInvalidValue;
+  uint64_t want_w = w, want_h = h;
+  const bool from_block = format->block != vgpu::exec::BlockFormat::None;
+  if (vf.block != vgpu::exec::BlockFormat::None && !from_block) {
+    want_w = w * 4;
+    want_h = h ? h * 4 : 0;
+  } else if (from_block && vf.block == vgpu::exec::BlockFormat::None) {
+    want_w = (w + 3) / 4;
+    want_h = h ? (h + 3) / 4 : 0;
+  }
+  if (v->width != want_w || v->height != want_h || v->depth != d->depth) return cudaErrorInvalidValue;
+  // The view's format over the same bytes.
+  const uint64_t row_bytes = d->pitch_bytes ? d->pitch_bytes : w * storage_texel;
+  d->block = vf.block;
+  d->packed_1010102 = vf.packed_1010102;
+  d->kind = vf.kind;
+  d->channels = vf.channels;
+  for (int i = 0; i < 4; ++i) d->channel_bits[i] = vf.bits[i];
+  d->texel_bytes = sampled_bytes(vf);
+  d->width = static_cast<uint32_t>(v->width);
+  d->height = static_cast<uint32_t>(v->height);
+  d->pitch_bytes = static_cast<uint32_t>(row_bytes);
+  *format = vf;
+  return cudaSuccess;
+}
 
 VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
                                                 const cudaResourceDesc* res,
@@ -4651,19 +4761,48 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaCreateTextureObject")) return unsafe_;
   return guard("cudaCreateTextureObject", [&](State& s) -> cudaError_t {
     if (!out || !res) return cudaErrorInvalidValue;
-    if (view) return cudaErrorNotSupported;  // resource views reinterpret the format
     vgpu::exec::TextureDesc d;
     d.object = vgpu::exec::TexKind::Texture;
-    if (cudaError_t e = fill_from_resource(res, &d); e != cudaSuccess) return e;
+    vgpu::cuda::TexFormat format;
+    if (cudaError_t e = fill_from_resource(res, &d, &format); e != cudaSuccess) return e;
+    if (view) {
+      // A view's own format decides what may be done with it.
+      if (cudaError_t e = apply_view(view, res, &d, &format); e != cudaSuccess) return e;
+    }
+    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
+    // sampled here: their decoders are not written. Say so, by name, once (the real library takes them).
+    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
+        d.block == vgpu::exec::BlockFormat::BC7) {
+      static std::once_flag said;
+      std::call_once(said, [] {
+        if (!quiet())
+          std::fprintf(stderr, "[vgpu] cudaCreateTextureObject: textures of BC6H and BC7 blocks are not implemented "
+                               "(BC1 to BC5 are); returning cudaErrorNotSupported\n");
+      });
+      return cudaErrorNotSupported;
+    }
+    bool normalized_read = false;
     if (tex) {
       for (int i = 0; i < 3; ++i)
         if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
+      const int filter = enum_value(tex->filterMode), mipfilter = enum_value(tex->mipmapFilterMode);
+      if ((filter != cudaFilterModePoint && filter != cudaFilterModeLinear) ||
+          (mipfilter != cudaFilterModePoint && mipfilter != cudaFilterModeLinear))
+        return cudaErrorInvalidValue;
+      // Only a cubemap can be seamless.
+      if (tex->seamlessCubemap && !d.cubemap) return cudaErrorInvalidValue;
+      // The read mode, the filter and the sRGB flag against the format; the card's answers (see
+      // texture_read_check). A read mode that is neither is the element type, as the card takes it.
+      normalized_read = enum_value(tex->readMode) == cudaReadModeNormalizedFloat;
+      if (const int bad = vgpu::cuda::texture_read_check(format, normalized_read, filter == cudaFilterModeLinear,
+                                                         tex->sRGB != 0))
+        return static_cast<cudaError_t>(bad);
       // Linear filtering and sRGB decoding are done at the fetch, as the
-      // texture unit does them. Anisotropy changes the result too and is
-      // refused rather than approximated.
-      if (tex->filterMode == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
+      // texture unit does them. Anisotropy changes a result only when a sample's footprint is
+      // stretched, which a fetch with no derivatives (LOD 0, or an explicit one) never is: the
+      // value is accepted, as the card accepts any, and has nothing to act on.
+      if (filter == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
       d.srgb = tex->sRGB != 0;
-      if (tex->maxAnisotropy > 1) return cudaErrorNotSupported;
       // What border addressing returns outside the texture, converted to the
       // texture's format at the fetch.
       static_assert(sizeof d.border_bits == sizeof tex->borderColor);
@@ -4672,16 +4811,23 @@ VGPU_EXPORT cudaError_t cudaCreateTextureObject(cudaTextureObject_t* out,
       // Mip selection, held as the hardware does in 1/256ths of a level,
       // truncated toward zero.
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
-      d.mip_filter = tex->mipmapFilterMode == cudaFilterModeLinear ? vgpu::exec::TexFilter::Linear
-                                                                   : vgpu::exec::TexFilter::Point;
+      d.mip_filter = mipfilter == cudaFilterModeLinear ? vgpu::exec::TexFilter::Linear
+                                                       : vgpu::exec::TexFilter::Point;
       d.mip_bias = q(tex->mipmapLevelBias);
       d.mip_min = q(tex->minMipmapLevelClamp);
       d.mip_max = q(tex->maxMipmapLevelClamp);
-      d.read_as_normalized_float = tex->readMode == cudaReadModeNormalizedFloat;
+    } else if (const int bad = vgpu::cuda::texture_read_check(format, false, false, false)) {
+      return static_cast<cudaError_t>(bad);   // a format that only a normalized read can take, with no descriptor
     }
+    d.read_as_normalized_float = normalized_read || format.norm_only || format.packed_1010102;
     const uint64_t handle = g_next_texobj++;
     current(s).textures()[handle] = d;
-    g_object_descs[handle] = ObjectDescs{*res, tex ? *tex : cudaTextureDesc{}};
+    ObjectDescs od{*res, tex ? *tex : cudaTextureDesc{}};
+    if (view) {
+      od.has_view = true;
+      od.view = *view;
+    }
+    g_object_descs[handle] = od;
     *out = static_cast<cudaTextureObject_t>(handle);
     return cudaSuccess;
   });
@@ -4703,7 +4849,10 @@ VGPU_EXPORT cudaError_t cudaCreateSurfaceObject(cudaSurfaceObject_t* out,
     if (!out || !res) return cudaErrorInvalidValue;
     vgpu::exec::TextureDesc d;
     d.object = vgpu::exec::TexKind::Surface;
-    if (cudaError_t e = fill_from_resource(res, &d); e != cudaSuccess) return e;
+    vgpu::cuda::TexFormat format;
+    if (cudaError_t e = fill_from_resource(res, &d, &format); e != cudaSuccess) return e;
+    // A block-compressed array cannot be read or written as a surface (measured on an RTX 3060).
+    if (format.block != vgpu::exec::BlockFormat::None) return cudaErrorInvalidValue;
     const uint64_t handle = g_next_texobj++;
     current(s).textures()[handle] = d;
     g_object_descs[handle] = ObjectDescs{*res, cudaTextureDesc{}};
@@ -4744,10 +4893,11 @@ VGPU_EXPORT cudaError_t cudaGetTextureObjectTextureDesc(cudaTextureDesc* desc, c
 }
 VGPU_EXPORT cudaError_t cudaGetTextureObjectResourceViewDesc(cudaResourceViewDesc* desc, cudaTextureObject_t obj) {
   return guard("cudaGetTextureObjectResourceViewDesc", [&](State& s) -> cudaError_t {
-    (void)desc;
-    (void)obj;
-    (void)s;
-    return cudaErrorInvalidValue;   // no object made here has a resource view
+    if (!desc || !current(s).textures().count(static_cast<uint64_t>(obj))) return cudaErrorInvalidValue;
+    const auto it = g_object_descs.find(static_cast<uint64_t>(obj));
+    if (it == g_object_descs.end() || !it->second.has_view) return cudaErrorInvalidValue;   // the documented answer for an object with none
+    *desc = it->second.view;
+    return cudaSuccess;
   });
 }
 VGPU_EXPORT cudaError_t cudaGetSurfaceObjectResourceDesc(cudaResourceDesc* desc, cudaSurfaceObject_t obj) {

@@ -16,6 +16,8 @@
 #include <map>
 #include <optional>
 
+#include "vgpu/exec/block_compression.hpp"
+
 namespace vgpu {
 class MemoryManager;
 }
@@ -64,6 +66,12 @@ struct TextureDesc {
   uint32_t channels = 1;    // 1..4
   uint32_t channel_bits[4] = {32, 0, 0, 0};
   uint32_t texel_bytes = 4;
+  // Block-compressed storage: `base` is where the 4 x 4 blocks are (row after row, ceil(width / 4) blocks a
+  // row), width and height are in texels, and a texel is decoded as the format describes (channel_bits and
+  // kind say what comes out). Not set for the plain formats.
+  BlockFormat block = BlockFormat::None;
+  // 10:10:10:2 unsigned normalized, packed in one 32-bit word (channel_bits say 10, 10, 10, 2).
+  bool packed_1010102 = false;
   ChannelKind kind = ChannelKind::Float;
   TexKind object = TexKind::Texture;
   // Coordinates in [0,1) rather than [0,size). Independent of the filter.
