@@ -434,11 +434,20 @@ __global__ void run(int form, unsigned* mem, const unsigned* bv, unsigned* olds)
 #endif
 }
 
+// Through the raw types, which every toolkit's headers offer on the host.
 static float half_val(const char* ty, unsigned short x) {
-  return std::strncmp(ty, "bf16", 4) == 0 ? __bfloat162float(__ushort_as_bfloat16(x)) : __half2float(__ushort_as_half(x));
+  if (std::strncmp(ty, "bf16", 4) == 0) {
+    __nv_bfloat16_raw r;
+    r.x = x;
+    return __bfloat162float(__nv_bfloat16(r));
+  }
+  __half_raw r;
+  r.x = x;
+  return __half2float(__half(r));
 }
 static unsigned short half_bits(const char* ty, float f) {
-  return std::strncmp(ty, "bf16", 4) == 0 ? __bfloat16_as_ushort(__float2bfloat16_rn(f)) : __half_as_ushort(__float2half_rn(f));
+  if (std::strncmp(ty, "bf16", 4) == 0) return static_cast<__nv_bfloat16_raw>(__float2bfloat16_rn(f)).x;
+  return static_cast<__half_raw>(__float2half_rn(f)).x;
 }
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::printf("FAIL %s: %s\n", #x, cudaGetErrorString(e_)); return 1; } } while (0)
