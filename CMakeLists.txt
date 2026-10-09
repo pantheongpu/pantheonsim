@@ -1945,6 +1945,19 @@ if(TARGET vgpucublas)
     set_tests_properties(e2e_nvenc PROPERTIES
       DEPENDS vgpunvenc
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};NVENC_INCLUDE=${NVENC_INCLUDE}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
+
+  # NVDEC's cuvid API (Motion JPEG), against what an RTX 3060's libnvcuvid printed
+  # and the NV12 pixels it wrote (nvidia/tests/data/nvdec).
+  if(TARGET vgpunvcuvid)
+    add_test(NAME e2e_nvcuvid
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvcuvid.sh)
+    set_tests_properties(e2e_nvcuvid PROPERTIES
+      DEPENDS vgpunvcuvid
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endif()
 

@@ -54,6 +54,8 @@
 
 #include <cuda_runtime.h>
 
+#include "nvjpeg_codec.hpp"
+
 namespace {
 
 bool quiet() {
@@ -2255,3 +2257,32 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncoderParamsCopyHuffmanTables(nvjpegEncoderSta
     return NVJPEG_STATUS_INVALID_PARAMETER;
   return NVJPEG_STATUS_SUCCESS;
 }
+
+/* ======================================================================== */
+/* The decoder for the other libraries                                      */
+/* ======================================================================== */
+
+namespace vgpu_jpeg {
+
+bool decode_planes(const uint8_t* data, size_t length, Decoded* out) {
+  Image im;
+  if (parse_jpeg(data, length, &im, /*decode=*/true) != NVJPEG_STATUS_SUCCESS || !im.decodable) return false;
+  if (im.comps.size() != 1 && im.comps.size() != 3) return false;
+  out->width = im.width;
+  out->height = im.height;
+  out->hmax = im.hmax;
+  out->vmax = im.vmax;
+  out->planes.clear();
+  for (Component& c : im.comps) {
+    Plane p;
+    p.h_samp = c.h;
+    p.v_samp = c.v;
+    p.width = c.bw * 8;
+    p.height = c.bh * 8;
+    p.data = std::move(c.plane);
+    out->planes.push_back(std::move(p));
+  }
+  return true;
+}
+
+}  // namespace vgpu_jpeg

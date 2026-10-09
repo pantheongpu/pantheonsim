@@ -53,6 +53,15 @@ static uint64_t fnv(const void* p, size_t n) {
   return h;
 }
 
+// Store a number into an enum field the API defines no name for: the card accepts or
+// refuses those by value, and loading one back as its enum type is undefined, so it
+// is written byte for byte and never read as the enum.
+template <class E>
+static void poke(E& field, uint32_t v) {
+  static_assert(sizeof(E) == sizeof v, "a 32-bit enum");
+  std::memcpy(&field, &v, sizeof v);
+}
+
 static void last_error(const char* what) {
   const char* e = f.nvEncGetLastErrorString ? f.nvEncGetLastErrorString(enc) : nullptr;
   std::printf("  last error after %s: \"%s\"\n", what, e ? e : "(null)");
@@ -63,7 +72,7 @@ static bool open_session(void** out, int device_type = NV_ENC_DEVICE_TYPE_CUDA) 
   cuCtxGetCurrent(&ctx);
   NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS op{};
   op.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
-  op.deviceType = static_cast<NV_ENC_DEVICE_TYPE>(device_type);
+  poke(op.deviceType, static_cast<uint32_t>(device_type));
   op.device = ctx;
   op.apiVersion = NVENCAPI_VERSION;
   return f.nvEncOpenEncodeSessionEx(&op, out) == NV_ENC_SUCCESS;
@@ -149,7 +158,7 @@ int main(int argc, char** argv) {
     attempt("api version 0", &op, &e);
     op.apiVersion = NVENCAPI_VERSION;
     for (int dt : {static_cast<int>(NV_ENC_DEVICE_TYPE_DIRECTX), static_cast<int>(NV_ENC_DEVICE_TYPE_OPENGL), 7}) {
-      op.deviceType = static_cast<NV_ENC_DEVICE_TYPE>(dt);
+      poke(op.deviceType, static_cast<uint32_t>(dt));
       attempt(("device type " + std::to_string(dt)).c_str(), &op, &e);
     }
     op.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
@@ -204,7 +213,7 @@ int main(int argc, char** argv) {
     for (int cap = 0; cap < 70; ++cap) {
       NV_ENC_CAPS_PARAM cp{};
       cp.version = NV_ENC_CAPS_PARAM_VER;
-      cp.capsToQuery = static_cast<NV_ENC_CAPS>(cap);
+      poke(cp.capsToQuery, static_cast<uint32_t>(cap));
       int v = -12345;
       const int cs = f.nvEncGetEncodeCaps(enc, cg, &cp, &v);
       if (cs)
@@ -357,7 +366,7 @@ int main(int argc, char** argv) {
     trial("async mode", [](NV_ENC_INITIALIZE_PARAMS* i, NV_ENC_PRESET_CONFIG*) { i->enableEncodeAsync = 1; });
     trial("tuning 0", [](NV_ENC_INITIALIZE_PARAMS* i, NV_ENC_PRESET_CONFIG*) { i->tuningInfo = NV_ENC_TUNING_INFO_UNDEFINED; });
     trial("tuning lossless", [](NV_ENC_INITIALIZE_PARAMS* i, NV_ENC_PRESET_CONFIG*) { i->tuningInfo = NV_ENC_TUNING_INFO_LOSSLESS; });
-    trial("tuning 9", [](NV_ENC_INITIALIZE_PARAMS* i, NV_ENC_PRESET_CONFIG*) { i->tuningInfo = static_cast<NV_ENC_TUNING_INFO>(9); });
+    trial("tuning 9", [](NV_ENC_INITIALIZE_PARAMS* i, NV_ENC_PRESET_CONFIG*) { poke(i->tuningInfo, 9); });
     trial("unknown profile guid", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.profileGUID = GUID{1, 2, 3, {4, 5, 6, 7, 8, 9, 10, 11}}; });
     trial("hevc profile for h264", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID; });
     trial("baseline profile", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID; });
@@ -368,7 +377,7 @@ int main(int argc, char** argv) {
     trial("gop 1 with frameIntervalP 2", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.gopLength = 1; c->presetCfg.frameIntervalP = 2; });
     trial("gop 2 with frameIntervalP 2", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.gopLength = 2; c->presetCfg.frameIntervalP = 2; });
     trial("gop 0 with frameIntervalP 5", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.gopLength = 0; c->presetCfg.frameIntervalP = 5; });
-    trial("rate control mode 99", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { c->presetCfg.rcParams.rateControlMode = static_cast<NV_ENC_PARAMS_RC_MODE>(99); });
+    trial("rate control mode 99", [](NV_ENC_INITIALIZE_PARAMS*, NV_ENC_PRESET_CONFIG* c) { poke(c->presetCfg.rcParams.rateControlMode, 99); });
     // Initialising twice.
     enc = session();
     init_params(&ip, &pc, NV_ENC_CODEC_H264_GUID, 192, 128);
@@ -415,21 +424,21 @@ int main(int argc, char** argv) {
     // Input buffers: the pitch the driver chooses, per format and width.
     const struct {
       const char* name;
-      NV_ENC_BUFFER_FORMAT fmt;
-    } formats[] = {{"NV12", NV_ENC_BUFFER_FORMAT_NV12},       {"YV12", NV_ENC_BUFFER_FORMAT_YV12},
-                   {"IYUV", NV_ENC_BUFFER_FORMAT_IYUV},       {"YUV444", NV_ENC_BUFFER_FORMAT_YUV444},
-                   {"P010", NV_ENC_BUFFER_FORMAT_YUV420_10BIT}, {"444-10", NV_ENC_BUFFER_FORMAT_YUV444_10BIT},
-                   {"ARGB", NV_ENC_BUFFER_FORMAT_ARGB},       {"ARGB10", NV_ENC_BUFFER_FORMAT_ARGB10},
-                   {"AYUV", NV_ENC_BUFFER_FORMAT_AYUV},       {"ABGR", NV_ENC_BUFFER_FORMAT_ABGR},
-                   {"ABGR10", NV_ENC_BUFFER_FORMAT_ABGR10},   {"U8", NV_ENC_BUFFER_FORMAT_U8},
-                   {"undefined", NV_ENC_BUFFER_FORMAT_UNDEFINED}, {"bogus", static_cast<NV_ENC_BUFFER_FORMAT>(0x7)}};
+      uint32_t fmt;
+    } formats[] = {{"NV12", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_NV12)},       {"YV12", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_YV12)},
+                   {"IYUV", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_IYUV)},       {"YUV444", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_YUV444)},
+                   {"P010", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_YUV420_10BIT)}, {"444-10", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_YUV444_10BIT)},
+                   {"ARGB", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_ARGB)},       {"ARGB10", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_ARGB10)},
+                   {"AYUV", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_AYUV)},       {"ABGR", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_ABGR)},
+                   {"ABGR10", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_ABGR10)},   {"U8", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_U8)},
+                   {"undefined", static_cast<uint32_t>(NV_ENC_BUFFER_FORMAT_UNDEFINED)}, {"bogus", 7u}};
     for (const auto& fm : formats)
       for (uint32_t w : {W, uint32_t(200)}) {
         NV_ENC_CREATE_INPUT_BUFFER ib{};
         ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
         ib.width = w;
         ib.height = H;
-        ib.bufferFmt = fm.fmt;
+        poke(ib.bufferFmt, fm.fmt);
         const int r = f.nvEncCreateInputBuffer(enc, &ib);
         uint32_t pitch = 0;
         int lr = -1;
@@ -452,7 +461,7 @@ int main(int argc, char** argv) {
         ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
         ib.width = w;
         ib.height = 128;
-        ib.bufferFmt = fm.fmt;
+        poke(ib.bufferFmt, fm.fmt);
         uint32_t pitch = 0;
         if (!f.nvEncCreateInputBuffer(enc, &ib)) {
           NV_ENC_LOCK_INPUT_BUFFER lk{};
@@ -583,7 +592,7 @@ int main(int argc, char** argv) {
       std::printf("EncodePicture (wrong format): %d\n", r);
       if (!r) drain("wrong format");
       pp = pic(ib.inputBuffer, ob.bitstreamBuffer);
-      pp.pictureStruct = static_cast<NV_ENC_PIC_STRUCT>(9);
+      poke(pp.pictureStruct, 9);
       std::printf("EncodePicture (bad picture structure): %d\n", f.nvEncEncodePicture(enc, &pp));
     }
     // Sequence parameters: SPS then PPS.

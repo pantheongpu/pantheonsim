@@ -1,0 +1,293 @@
+caps JPEG chroma 0 depth 8: 0 supported 1 max 32768x16384 mb 67108864 min 64x64 outputs 0x41
+caps JPEG chroma 0 depth 10: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 0 depth 12: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 1 depth 8: 0 supported 1 max 32768x16384 mb 67108864 min 64x64 outputs 0x41
+caps JPEG chroma 1 depth 10: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 1 depth 12: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 2 depth 8: 0 supported 1 max 32768x16384 mb 67108864 min 64x64 outputs 0x41
+caps JPEG chroma 2 depth 10: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 2 depth 12: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 3 depth 8: 0 supported 1 max 32768x16384 mb 67108864 min 64x64 outputs 0x41
+caps JPEG chroma 3 depth 10: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 3 depth 12: 0 supported 0 max 0x0 mb 0 min 0x0 outputs 0x0
+caps JPEG chroma 9: supported 1
+caps codec 99: 0 supported 0
+CreateDecoder(valid): 0
+CreateDecoder(width 0): 100
+CreateDecoder(height 0): 100
+CreateDecoder(0 decode surfaces): 100
+CreateDecoder(32 decode surfaces): 0
+CreateDecoder(33 decode surfaces): 100
+CreateDecoder(0 output surfaces): 100
+CreateDecoder(64 output surfaces): 0
+CreateDecoder(width 32): 0
+CreateDecoder(width 40000): 100
+CreateDecoder(monochrome): 0
+CreateDecoder(422): 0
+CreateDecoder(444): 0
+CreateDecoder(chroma 9): 0
+CreateDecoder(10 bit): 0
+CreateDecoder(P016 output): 1
+CreateDecoder(YUV444 output): 100
+CreateDecoder(YUV444 16-bit output): 1
+CreateDecoder(output format 9): 1
+CreateDecoder(target 96x64): 0
+CreateDecoder(codec 77): 1
+CreateDecoder(PreferCUDA): 0
+CreateDecoder(max size 0): 0
+CreateDecoder(max size below size): 0
+CreateDecoder(display area outside): 0
+DestroyDecoder(null): 400
+GetDecodeStatus(0): 0, status 0
+GetDecodeStatus(9): 1, status 0
+GetDecodeStatus(-1): 1, status 0
+MapVideoFrame (never decoded): 0, pitch 512
+MapVideoFrame (again): 0, same pointer 1
+MapVideoFrame (index 9): 1
+MapVideoFrame (index -1): 1
+MapVideoFrame (no parameters): 0
+UnmapVideoFrame: 0, again: 0, unknown pointer: 0
+DecodePicture: 0
+GetDecodeStatus(0): 0, status 2
+GetDecodeStatus(1): 0, status 0
+DecodePicture (index 1): 0
+GetDecodeStatus(1): 0, status 2
+DecodePicture (index 5 of 2): 1
+DecodePicture (index -1): 1
+DecodePicture (4:4:4 picture, 4:2:0 decoder): 0
+DecodePicture (junk): 200
+GetDecodeStatus(0): 0, status 8
+DecodePicture (progressive JPEG): 200
+GetDecodeStatus(1): 0, status 8
+DecodePicture (empty parameters): 1
+DecodePicture (length 0): 200
+DecodePicture (null decoder): 400
+ReconfigureDecoder (same): 0
+ReconfigureDecoder (larger than the maximum): 1
+ReconfigureDecoder (smaller): 0
+ReconfigureDecoder (4 surfaces): 0
+ReconfigureDecoder (zeros): 1
+Destroy: 0
+CtxLockCreate: 0
+CtxLock: 0, CtxUnlock: 0, CtxUnlock (unlocked): 0
+CtxLockDestroy: 0
+CtxLock (null): 400, CtxUnlock (null): 400, CtxLockDestroy (null): 400
+CtxLockCreate (no context): 0
+CreateVideoParser (null params): 1
+CreateVideoParser (codec 99): 300
+CreateVideoParser (0 surfaces): 0
+CreateVideoParser (no callbacks): 0
+ParseVideoData (no callbacks): 0
+ParseVideoData (empty packet): 0
+ParseVideoData (garbage): 0
+ParseVideoData (end of stream): 0
+DestroyVideoParser: 0
+ParseVideoData (null parser): 400
+DestroyVideoParser (null): 400
+== two pictures in one packet, timestamp 1000
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1911 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1033; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 2 frames displayed
+== a picture split over two packets, timestamp on the first
+  first half: 0, 0 frames
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 7000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  second half: 0, 1 frames
+== timestamps over several packets, then none
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 5000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 9000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 9033; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+== no timestamp flag, and the default clock
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1911 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 333333; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+== sequence callback returns 2 (picture indices cycle)
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  decode: mbs 4x3 index 1 field 0 bottom 0 second 0 intra 1 ref 0 length 1911 slices 1
+  cuvidDecodePicture: 0
+  display: index 1 progressive 1 top-field-first 0 repeat 0 timestamp 33; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 66; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  decode: mbs 4x3 index 1 field 0 bottom 0 second 0 intra 1 ref 0 length 1911 slices 1
+  cuvidDecodePicture: 0
+  display: index 1 progressive 1 top-field-first 0 repeat 0 timestamp 99; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+== decode callback returns 0 (no display)
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1911 slices 1
+  cuvidDecodePicture: 0
+  parse: 0
+== b420.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1586 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels b420: match the card's
+== b422.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 2 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1719 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels b422: match the card's
+== b444.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1911 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels b444: match the card's
+== p420.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1389 slices 1
+  cuvidDecodePicture: 200
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, failed
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels p420: match the card's
+== p444.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 3 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1661 slices 1
+  cuvidDecodePicture: 200
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, failed
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels p444: match the card's
+== r420.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 1601 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels r420: match the card's
+== gray.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 0 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 839 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels gray: match the card's
+== pgray.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 0 surfaces 1 coded 64x48 display 0,0,61,45 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 4x3 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 719 slices 1
+  cuvidDecodePicture: 200
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, failed
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels pgray: match the card's
+== big_q5.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 336x256 display 0,0,333,251 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 21x16 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 2469 slices 1
+  cuvidDecodePicture: 0
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels big_q5: match the card's
+== big_pr.jpg
+  sequence: codec 5 rate 0/0 progressive 1 depth 0/0 chroma 1 surfaces 1 coded 336x256 display 0,0,333,251 bitrate 0 aspect 0:0 signal 08 00 00 00
+  cuvidCreateDecoder: 0
+  decode: mbs 21x16 index 0 field 0 bottom 0 second 0 intra 1 ref 0 length 17440 slices 1
+  cuvidDecodePicture: 200
+  display: index 0 progressive 1 top-field-first 0 repeat 0 timestamp 1000; decode status call 0, failed
+  cuvidMapVideoFrame64: 0, pitch 512
+  cuvidParseVideoData: 0
+  end of stream: 0, 1 frames displayed
+pixels big_pr: match the card's
+== the CMYK fixture (not decodable by NVDEC)
+  cuvidParseVideoData: 0
+  end of stream: 0, 0 frames displayed
+  frames displayed: 0
+== big_q5_up_400x300
+  frames displayed: 1, pitch 512
+pixels big_q5_up_400x300: match the card's
+== big_q5_half_168x128
+  frames displayed: 1, pitch 512
+pixels big_q5_half_168x128: match the card's
+== big_q5_cut_200x150
+  frames displayed: 1, pitch 512
+pixels big_q5_cut_200x150: match the card's
+== b420_into_128x96
+  frames displayed: 1, pitch 512
+pixels b420_into_128x96: match the card's
+== b420_crop_62x46
+  frames displayed: 1, pitch 512
+pixels b420_crop_62x46: match the card's
+== b420_wide_80x48
+  frames displayed: 1, pitch 512
+pixels b420_wide_80x48: match the card's
+== big_q5_tall_336x300
+  frames displayed: 1, pitch 512
+pixels big_q5_tall_336x300: match the card's
+PASS

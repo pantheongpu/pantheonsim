@@ -54,6 +54,19 @@ bool quiet() {
 // card does not look at (a list built with API 14's version is accepted).
 bool version_ok(uint32_t got, uint32_t want) { return (got & 0xFFFF0000u) == (want & 0xFFFF0000u); }
 
+// A value out of an application's structure, as the integer it holds: the API's
+// enum fields take values outside their enumerators (the card accepts or refuses
+// them by number), and loading such a value as its enum type is undefined.
+template <class E>
+uint32_t raw(const E& e) {
+  static_assert(sizeof(E) == sizeof(uint32_t), "an enum the API passes as a 32-bit word");
+  uint32_t v;
+  std::memcpy(&v, &e, sizeof v);
+  return v;
+}
+template <class E>
+constexpr uint32_t num(E e) { return static_cast<uint32_t>(e); }
+
 enum Codec { kNoCodec = -1, kH264 = 0, kHevc = 1 };
 
 bool same_guid(const GUID& a, const GUID& b) { return !std::memcmp(&a, &b, sizeof a); }
@@ -92,7 +105,7 @@ const GUID* const kPresetGuids[7] = {&NV_ENC_PRESET_P1_GUID, &NV_ENC_PRESET_P2_G
 struct Input {
   void* dev = nullptr;
   uint32_t w = 0, h = 0, pitch = 0;
-  NV_ENC_BUFFER_FORMAT fmt = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+  uint32_t fmt = 0;   // an NV_ENC_BUFFER_FORMAT, as the number the application gave
   bool locked = false;
 };
 struct Picture {
@@ -109,7 +122,7 @@ struct Output {
 struct Registered {
   void* dev = nullptr;
   uint32_t w = 0, h = 0, pitch = 0;
-  NV_ENC_BUFFER_FORMAT fmt = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+  uint32_t fmt = 0;   // an NV_ENC_BUFFER_FORMAT, as the number the application gave
   bool mapped = false;
 };
 struct Mapped {
@@ -151,28 +164,28 @@ uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 // rounded up to 64 bytes for the semi-planar and 4:4:4 formats and to 512 for
 // the three-plane 4:2:0 ones and the packed 32-bit ones (measured at twelve widths from 145 to 4096
 // pixels; the table is in nvidia/tests/e2e/nvenc_api.cpp and fits exactly).
-uint32_t buffer_pitch(NV_ENC_BUFFER_FORMAT fmt, uint32_t width) {
+uint32_t buffer_pitch(uint32_t fmt, uint32_t width) {
   switch (fmt) {
-    case NV_ENC_BUFFER_FORMAT_NV12:
-    case NV_ENC_BUFFER_FORMAT_YUV444: return align_up(width, 64);
-    case NV_ENC_BUFFER_FORMAT_YV12:
-    case NV_ENC_BUFFER_FORMAT_IYUV: return align_up(width, 512);
+    case num(NV_ENC_BUFFER_FORMAT_NV12):
+    case num(NV_ENC_BUFFER_FORMAT_YUV444): return align_up(width, 64);
+    case num(NV_ENC_BUFFER_FORMAT_YV12):
+    case num(NV_ENC_BUFFER_FORMAT_IYUV): return align_up(width, 512);
     default: return align_up(width * 4, 512);
   }
 }
 
 // Rows of `pitch` bytes a buffer of this format holds.
-uint32_t buffer_rows(NV_ENC_BUFFER_FORMAT fmt, uint32_t height) {
+uint32_t buffer_rows(uint32_t fmt, uint32_t height) {
   switch (fmt) {
-    case NV_ENC_BUFFER_FORMAT_NV12:
-    case NV_ENC_BUFFER_FORMAT_YV12:
-    case NV_ENC_BUFFER_FORMAT_IYUV: return height + (height + 1) / 2;
-    case NV_ENC_BUFFER_FORMAT_YUV444: return 3 * height;
+    case num(NV_ENC_BUFFER_FORMAT_NV12):
+    case num(NV_ENC_BUFFER_FORMAT_YV12):
+    case num(NV_ENC_BUFFER_FORMAT_IYUV): return height + (height + 1) / 2;
+    case num(NV_ENC_BUFFER_FORMAT_YUV444): return 3 * height;
     default: return height;
   }
 }
 
-bool format_listed(int codec, NV_ENC_BUFFER_FORMAT fmt) {
+bool format_listed(int codec, uint32_t fmt) {
   const NV_ENC_BUFFER_FORMAT* l = codec == kHevc ? kFormatsHevc : kFormatsH264;
   const size_t n = codec == kHevc ? sizeof kFormatsHevc / sizeof *kFormatsHevc : sizeof kFormatsH264 / sizeof *kFormatsH264;
   for (size_t i = 0; i < n; ++i)
@@ -182,13 +195,13 @@ bool format_listed(int codec, NV_ENC_BUFFER_FORMAT fmt) {
 
 // Whether this encoder can take the format as encode input (the 8-bit 4:2:0 ones
 // and 32-bit RGB).
-bool encodable(NV_ENC_BUFFER_FORMAT fmt) {
+bool encodable(uint32_t fmt) {
   switch (fmt) {
-    case NV_ENC_BUFFER_FORMAT_NV12:
-    case NV_ENC_BUFFER_FORMAT_YV12:
-    case NV_ENC_BUFFER_FORMAT_IYUV:
-    case NV_ENC_BUFFER_FORMAT_ARGB:
-    case NV_ENC_BUFFER_FORMAT_ABGR: return true;
+    case num(NV_ENC_BUFFER_FORMAT_NV12):
+    case num(NV_ENC_BUFFER_FORMAT_YV12):
+    case num(NV_ENC_BUFFER_FORMAT_IYUV):
+    case num(NV_ENC_BUFFER_FORMAT_ARGB):
+    case num(NV_ENC_BUFFER_FORMAT_ABGR): return true;
     default: return false;
   }
 }
@@ -228,7 +241,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeCaps(void*, GUID, NV_ENC_CAPS_PAR
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetCount(void*, GUID, uint32_t*);
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetGUIDs(void*, GUID, GUID*, uint32_t, uint32_t*);
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfig(void*, GUID, GUID, NV_ENC_PRESET_CONFIG*);
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfigEx(void*, GUID, GUID, NV_ENC_TUNING_INFO, NV_ENC_PRESET_CONFIG*);
+static NVENCSTATUS NVENCAPI PresetConfigExImpl(void*, GUID, GUID, uint32_t, NV_ENC_PRESET_CONFIG*);
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInitializeEncoder(void*, NV_ENC_INITIALIZE_PARAMS*);
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateInputBuffer(void*, NV_ENC_CREATE_INPUT_BUFFER*);
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncDestroyInputBuffer(void*, NV_ENC_INPUT_PTR);
@@ -296,7 +309,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTIO
   list->nvEncOpenEncodeSessionEx = NvEncOpenEncodeSessionEx;
   list->nvEncRegisterResource = NvEncRegisterResource;
   list->nvEncUnregisterResource = NvEncUnregisterResource;
-  list->nvEncGetEncodePresetConfigEx = NvEncGetEncodePresetConfigEx;
+  list->nvEncGetEncodePresetConfigEx = reinterpret_cast<PNVENCGETENCODEPRESETCONFIGEX>(PresetConfigExImpl);
   list->nvEncRegisterAsyncEvent = NvEncRegisterAsyncEvent;
   list->nvEncUnregisterAsyncEvent = NvEncUnregisterAsyncEvent;
   list->nvEncInvalidateRefFrames = NvEncInvalidateRefFrames;
@@ -317,9 +330,9 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncodeAPICreateInstance(NV_ENCODE_API_FUNCTIO
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncOpenEncodeSessionEx(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS* params, void** encoder) {
   if (!params || !encoder) return NV_ENC_ERR_INVALID_PTR;
   if (!version_ok(params->version, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER)) return NV_ENC_ERR_INVALID_VERSION;
-  switch (params->deviceType) {
-    case NV_ENC_DEVICE_TYPE_CUDA: break;
-    case NV_ENC_DEVICE_TYPE_OPENGL: return NV_ENC_ERR_INVALID_DEVICE;
+  switch (raw(params->deviceType)) {
+    case num(NV_ENC_DEVICE_TYPE_CUDA): break;
+    case num(NV_ENC_DEVICE_TYPE_OPENGL): return NV_ENC_ERR_INVALID_DEVICE;
     default: return NV_ENC_ERR_UNSUPPORTED_DEVICE;   // DirectX, and values outside the enum
   }
   if (!params->device) return NV_ENC_ERR_INVALID_PTR;
@@ -426,7 +439,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodeCaps(void* encoder, GUID codec, N
   if (!param || !value) return NV_ENC_ERR_INVALID_PTR;
   const int c = codec_of(codec);
   if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
-  const int cap = static_cast<int>(param->capsToQuery);
+  const int cap = static_cast<int>(raw(param->capsToQuery));
   if (cap < 0 || cap > 60) return NV_ENC_ERR_INVALID_PARAM;
   *value = (c == kH264 ? kCapsH264 : kCapsHevc)[cap];
   return NV_ENC_SUCCESS;
@@ -458,7 +471,8 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfig(void* encoder, GUID,
   if (!config) return NV_ENC_ERR_INVALID_PTR;
   return NV_ENC_ERR_UNSUPPORTED_PARAM;
 }
-VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfigEx(void* encoder, GUID codec, GUID preset, NV_ENC_TUNING_INFO tuning,
+// (The tuning is taken as a number: an application may pass one the enum has no name for.)
+static NVENCSTATUS NVENCAPI PresetConfigExImpl(void* encoder, GUID codec, GUID preset, uint32_t tuning_word,
                                                               NV_ENC_PRESET_CONFIG* config) {
   NEED_SESSION(s);
   (void)s;
@@ -467,7 +481,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetEncodePresetConfigEx(void* encoder, GUI
   const int c = codec_of(codec);
   if (c == kNoCodec) return NV_ENC_ERR_INVALID_PARAM;
   const int p = preset_index(preset);
-  const int t = static_cast<int>(tuning);
+  const int t = static_cast<int>(tuning_word);
   if (p == 0 || t < 1 || t > 4) return NV_ENC_ERR_UNSUPPORTED_PARAM;
   preset_config(c, p, t, config);
   return NV_ENC_SUCCESS;
@@ -494,12 +508,12 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncInitializeEncoder(void* encoder, NV_ENC_IN
   }
   if (preset_index(params->presetGUID) == 0)
     return fail(s, NV_ENC_ERR_INVALID_PARAM, "NV_ENC_RC_PARAMS::lowDelayKeyFrameScale is supported with P1-P7 presets\n");
-  const int tuning = static_cast<int>(params->tuningInfo);
+  const int tuning = static_cast<int>(raw(params->tuningInfo));
   if (tuning == 0)
     return fail(s, NV_ENC_ERR_INVALID_PARAM, "Presets P1-P7 are only supported with valid NV_ENC_INITIALIZE_PARAMS::tuningInfo\n");
   if (tuning < 0 || tuning > 4) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Invalid Tuning Info");
   if (tuning == NV_ENC_TUNING_INFO_LOSSLESS && params->encodeConfig &&
-      params->encodeConfig->rcParams.rateControlMode != NV_ENC_PARAMS_RC_CONSTQP)
+      raw(params->encodeConfig->rcParams.rateControlMode) != num(NV_ENC_PARAMS_RC_CONSTQP))
     return fail(s, NV_ENC_ERR_INVALID_PARAM,
                 "With lossless preset, RC Mode / Profile not supported with qpPrimeYZeroTransformBypassFlag.");
   // Measured over gop lengths 0..30 and 2^32-1 and frameIntervalP 0..9, both codecs: a
@@ -552,13 +566,14 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncCreateInputBuffer(void* encoder, NV_ENC_CR
   if (!version_ok(params->version, NV_ENC_CREATE_INPUT_BUFFER_VER)) return NV_ENC_ERR_INVALID_VERSION;
   if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
   if (!params->width || !params->height) return NV_ENC_ERR_OUT_OF_MEMORY;
-  if (!format_listed(s->codec, params->bufferFmt) ||
-      (s->codec == kH264 && (params->bufferFmt == NV_ENC_BUFFER_FORMAT_YUV420_10BIT || params->bufferFmt == NV_ENC_BUFFER_FORMAT_YUV444_10BIT)))
+  const uint32_t want_fmt = raw(params->bufferFmt);
+  if (!format_listed(s->codec, want_fmt) ||
+      (s->codec == kH264 && (want_fmt == num(NV_ENC_BUFFER_FORMAT_YUV420_10BIT) || want_fmt == num(NV_ENC_BUFFER_FORMAT_YUV444_10BIT))))
     return NV_ENC_ERR_INVALID_PARAM;
   auto in = std::make_unique<Input>();
   in->w = params->width;
   in->h = params->height;
-  in->fmt = params->bufferFmt;
+  in->fmt = want_fmt;
   in->pitch = buffer_pitch(in->fmt, in->w);
   const size_t bytes = static_cast<size_t>(in->pitch) * buffer_rows(in->fmt, in->h);
   // Managed memory: the CPU writes a locked buffer directly, as on the card, and
@@ -630,7 +645,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncRegisterResource(void* encoder, NV_ENC_REG
   r->w = params->width;
   r->h = params->height;
   r->pitch = params->pitch;
-  r->fmt = params->bufferFormat;
+  r->fmt = raw(params->bufferFormat);
   void* handle = r.get();
   s->registered[handle] = std::move(r);
   params->registeredResource = handle;
@@ -657,7 +672,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncMapInputResource(void* encoder, NV_ENC_MAP
   void* handle = m.get();
   s->mapped[handle] = std::move(m);
   params->mappedResource = handle;
-  params->mappedBufferFmt = it->second->fmt;
+  std::memcpy(&params->mappedBufferFmt, &it->second->fmt, sizeof it->second->fmt);
   return NV_ENC_SUCCESS;
 }
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnmapInputResource(void* encoder, NV_ENC_INPUT_PTR mapped) {
@@ -690,7 +705,7 @@ uint8_t chroma_of(double sum, int n) {
   return static_cast<uint8_t>(std::min(255L, std::max(0L, std::lround(128.0 + sum / (255.0 * n)))));
 }
 
-Frame read_frame(const uint8_t* dev, uint32_t pitch, NV_ENC_BUFFER_FORMAT fmt, int w, int h, const uint32_t chroma_rows_offset) {
+Frame read_frame(const uint8_t* dev, uint32_t pitch, uint32_t fmt, int w, int h, const uint32_t chroma_rows_offset) {
   Frame f;
   f.w = w;
   f.h = h;
@@ -703,7 +718,7 @@ Frame read_frame(const uint8_t* dev, uint32_t pitch, NV_ENC_BUFFER_FORMAT fmt, i
     cudaMemcpy2D(dst.data(), width, src, src_pitch, width, rows, cudaMemcpyDefault);
   };
   switch (fmt) {
-    case NV_ENC_BUFFER_FORMAT_NV12: {
+    case num(NV_ENC_BUFFER_FORMAT_NV12): {
       copy2d(f.y, dev, pitch, w, h);
       std::vector<uint8_t> uv(static_cast<size_t>(f.cw) * 2 * f.ch);
       copy2d(uv, dev + static_cast<size_t>(pitch) * chroma_rows_offset, pitch, f.cw * 2, f.ch);
@@ -713,13 +728,13 @@ Frame read_frame(const uint8_t* dev, uint32_t pitch, NV_ENC_BUFFER_FORMAT fmt, i
       }
       break;
     }
-    case NV_ENC_BUFFER_FORMAT_YV12:
-    case NV_ENC_BUFFER_FORMAT_IYUV: {
+    case num(NV_ENC_BUFFER_FORMAT_YV12):
+    case num(NV_ENC_BUFFER_FORMAT_IYUV): {
       copy2d(f.y, dev, pitch, w, h);
       const uint8_t* p1 = dev + static_cast<size_t>(pitch) * chroma_rows_offset;
       const uint8_t* p2 = p1 + static_cast<size_t>(pitch / 2) * f.ch;
-      std::vector<uint8_t>& first = fmt == NV_ENC_BUFFER_FORMAT_IYUV ? f.u : f.v;
-      std::vector<uint8_t>& second = fmt == NV_ENC_BUFFER_FORMAT_IYUV ? f.v : f.u;
+      std::vector<uint8_t>& first = fmt == num(NV_ENC_BUFFER_FORMAT_IYUV) ? f.u : f.v;
+      std::vector<uint8_t>& second = fmt == num(NV_ENC_BUFFER_FORMAT_IYUV) ? f.v : f.u;
       copy2d(first, p1, pitch / 2, f.cw, f.ch);
       copy2d(second, p2, pitch / 2, f.cw, f.ch);
       break;
@@ -727,7 +742,7 @@ Frame read_frame(const uint8_t* dev, uint32_t pitch, NV_ENC_BUFFER_FORMAT fmt, i
     default: {   // ARGB / ABGR: 32-bit words, converted
       std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
       copy2d(px, dev, pitch, w * 4, h);
-      const bool abgr = fmt == NV_ENC_BUFFER_FORMAT_ABGR;
+      const bool abgr = fmt == num(NV_ENC_BUFFER_FORMAT_ABGR);
       auto rgb = [&](int x, int y, int* r, int* g, int* b) {
         const uint8_t* p = &px[(static_cast<size_t>(y) * w + x) * 4];
         // ARGB is a word with A in the top byte: B, G, R, A in memory; ABGR: R, G, B, A.
@@ -791,13 +806,13 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
   if (params->encodePicFlags & NV_ENC_PIC_FLAG_EOS) return NV_ENC_SUCCESS;   // nothing is held back
   if (!params->inputBuffer || !params->outputBitstream) return NV_ENC_ERR_INVALID_PARAM;
-  const int ps = static_cast<int>(params->pictureStruct);
+  const int ps = static_cast<int>(raw(params->pictureStruct));
   if (ps < 1 || ps > 3) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Invalid value for NV_ENC_PIC_STRUCT.");
   auto out = s->outputs.find(params->outputBitstream);
   if (out == s->outputs.end()) return NV_ENC_ERR_INVALID_PARAM;
   const uint8_t* dev;
   uint32_t pitch, in_w, in_h;
-  NV_ENC_BUFFER_FORMAT fmt;
+  uint32_t fmt;
   if (auto in = s->inputs.find(params->inputBuffer); in != s->inputs.end()) {
     dev = static_cast<const uint8_t*>(in->second->dev);
     pitch = in->second->pitch;
