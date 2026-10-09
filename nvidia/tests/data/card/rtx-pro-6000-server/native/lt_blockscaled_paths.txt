@@ -1,0 +1,13 @@
+ok   MXFP8: E4M3 A and B, a UE8M0 scale per 32 of K in the tiled layout, fp32 D
+FAIL MXFP8 D: block amax over 448 rounded up to a UE8M0 scale, written to the D_OUT scale tensor
+ok   NVFP4: E2M1 A and B packed two to a byte, a UE4M3 scale per 16 of K, fp32 D
+FAIL NVFP4 D: D's input scale, then e4m3(amax / 6) per 16, the values rounded to E2M1
+FAIL FP8 with VEC128_32F A scales and BLK128x128_32F B scales
+ok   BLK128x128 for both A and B is not supported
+FAIL the 128-element modes need M and N multiples of 4
+ok   a block scale for A without one for B is not supported
+ok   VEC16_UE4M3 scales go with FP4, not FP8
+ok   FP4 operands without block scales are not supported
+ok   a block-scaled matmul without its scale tensors is refused
+ok   D's block scales are set through D_OUT_SCALE_MODE, not D_SCALE_MODE
+FAIL: 4 block-scaled cuBLASLt checks

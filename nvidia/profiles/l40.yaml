@@ -61,11 +61,11 @@ telemetry:
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
 # L2 98304 KB: NVIDIA Ada whitepaper, Appendix C Table 4. The 384-bit interface is AD102's (the same
 # 384 bits the L40 page's 864 GB/s needs at 18 Gbps).
-# Persisting L2 is nvidia/l40s's measured 75497472 (the same AD102 die and L2); NVIDIA does not
+# Persisting L2 is nvidia/l40s's measured 69206016 (the same AD102 die and L2); NVIDIA does not
 # publish it, so it is carried over, unverified.
 cuda:
   memory_bus_width_bits: 384
-  persisting_l2_bytes: 75497472
+  persisting_l2_bytes: 69206016
 
 # How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
 # (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are

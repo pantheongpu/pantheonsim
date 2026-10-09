@@ -1,0 +1,1 @@
+PASS: every narrow constant read

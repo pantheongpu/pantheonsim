@@ -1,0 +1,15 @@
+[18:32:23] slug=l40s compute_cap=89 arch=sm_89 toolkit=/usr/local/cuda-13.2
+[18:33:53] lowprec-lt rc=0 30s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/lt.l40s.txt
+[18:33:55] lowprec-sparselt rc=0 2s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/sparselt.l40s.txt
+[18:33:57] lowprec-cvt rc=0 2s: wrote /home/ubuntu/vgpu/nvidia/tests/data/lowprec/cvt.l40s.txt
+[18:34:01] dnn-fp8-attention rc=0 1s: PASS
+[18:34:26] dnn-fp8-attention-frontend rc=0 25s: PASS
+[18:34:35] native mma_forms rc=0 5s: PASS: 123 of 123 mma forms match the RTX 3060
+[18:34:37] native mma_fragment_layout rc=0 2s: PASS
+[18:34:39] native wmma_gemm rc=0 2s: PASS
+[18:34:41] native wmma_types rc=0 2s: PASS
+[18:34:42] native uldc_narrow rc=0 1s: PASS: every narrow constant read
+[18:34:43] native stmatrix rc=255 1s: ptxas fatal   : Ptx assembly aborted due to errors
+[18:34:45] characterize: 41 lines of profile
+[18:34:48] device_attributes --dump: 409 lines
+[18:34:52] done

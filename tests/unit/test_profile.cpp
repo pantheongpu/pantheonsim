@@ -50,7 +50,7 @@ VTEST(all_builtin_profiles_parse) {
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
                           p.id == "nvidia/a10g" || p.id == "nvidia/l4" ||
-                          p.id == "nvidia/l40s" ||
+                          p.id == "nvidia/l40s" || p.id == "nvidia/rtx-pro-6000-server" ||
                           p.id == "amd/mi325x");
     // AMD parts have no compute capability, and the profile that carried a
     // plausible "9.4" was inventing one. Each vendor is asked for the thing it

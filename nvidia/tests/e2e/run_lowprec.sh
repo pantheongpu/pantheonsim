@@ -23,6 +23,7 @@
 # The expected files are nvidia/tests/data/lowprec/<probe>.<slug>.txt, where <slug>
 # names the profile (nvidia/<slug>): l4, h100, rtx-pro-6000, rtx3060 ...
 # Lines starting with '#' (the device, the library version) are not compared.
+# LOWPREC_KEEP=<dir> keeps the simulator's output beside the comparison (<probe>.<slug>[.<engine>].sim.txt).
 # VGPU_LOWPREC_EXTRA_LIBS names libraries to add to the link line; PROBE_DUMP=<dir>
 # makes the probe write every case's inputs and outputs there.
 set -euo pipefail
@@ -32,6 +33,9 @@ probe="${1:?usage: $0 <probe> [slug...|--card slug [--update]]}"
 shift
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 data="$root/nvidia/tests/data/lowprec"
+# known-gaps.txt lists <probe>.<slug> pairs whose card transcript the simulator does not reproduce yet: they run, report
+# XFAIL and do not fail the test; one that starts to match (XPASS) fails it, so that the line is removed.
+known_gap() { grep -qE "^$1[[:space:]]*(#.*)?$" "$data/known-gaps.txt" 2>/dev/null; }
 src="$root/nvidia/tests/e2e/lowprec_${probe}.cu"
 [[ -f "$src" ]] || src="${src%.cu}.cpp"
 [[ "$probe" == ptx120 ]] || [[ -f "$src" ]] || { echo "no such probe: $probe" >&2; exit 2; }
@@ -101,8 +105,12 @@ if [[ "$probe" == ptx120 ]]; then
         { echo "== $p"
           VGPU_QUIET=1 VGPU_GPU="nvidia/$slug" VGPU_SASS=$([[ $engine == sass ]] && echo 1 || echo 0) LD_LIBRARY_PATH="$shim" "$work/$p"; } >> "$work/sim.txt" 2>&1 || true
       done
+      [[ -n "${LOWPREC_KEEP:-}" ]] && { mkdir -p "$LOWPREC_KEEP"; cp "$work/sim.txt" "$LOWPREC_KEEP/$probe.$slug.$engine.sim.txt"; }
       if diff <(grep -v '^#' "$data/$probe.$slug.txt") <(grep -v '^#' "$work/sim.txt") > "$work/d.txt"; then
-        echo "ok   $slug ($engine)"
+        if known_gap "$probe.$slug"; then echo "XPASS $slug ($engine): matches the card now; remove $probe.$slug from known-gaps.txt"; fails=1
+        else echo "ok   $slug ($engine)"; fi
+      elif known_gap "$probe.$slug"; then
+        echo "XFAIL $slug ($engine): $(grep -c '^>' "$work/d.txt") lines differ from the card's transcript (known gap)"
       else
         echo "FAIL $slug ($engine): differs from the card's transcript"; head -10 "$work/d.txt"; fails=1
       fi
@@ -187,8 +195,12 @@ for slug in "${slugs[@]}"; do
   rc=$?
   set -e
   if [[ $rc != 0 ]]; then echo "FAIL $slug: exit $rc"; tail -5 "$out.$slug.err"; fails=1; continue; fi
+  [[ -n "${LOWPREC_KEEP:-}" ]] && { mkdir -p "$LOWPREC_KEEP"; cp "$out.$slug.txt" "$LOWPREC_KEEP/$probe.$slug.sim.txt"; }
   if compare "$expected" "$out.$slug.txt" > "$out.$slug.diff"; then
-    echo "ok   $slug ($(grep -vc '^#' "$expected") lines)"
+    if known_gap "$probe.$slug"; then echo "XPASS $slug: matches the card now; remove $probe.$slug from known-gaps.txt"; fails=1
+    else echo "ok   $slug ($(grep -vc '^#' "$expected") lines)"; fi
+  elif known_gap "$probe.$slug"; then
+    echo "XFAIL $slug: $(grep -c '^[<>]' "$out.$slug.diff") diff lines against the card's transcript (known gap)"
   else
     echo "FAIL $slug: differs from the card's transcript ($(grep -c '^[<>]' "$out.$slug.diff") lines differ)"
     head -12 "$out.$slug.diff"

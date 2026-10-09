@@ -1,0 +1,6 @@
+ok   an FP8 attention operation finalizes
+ok   it runs
+FAIL O, quantized to E4M3 with scale_O, is the documented attention within one FP8 step (4.7619)
+ok   amax of S is the largest softmax probability
+ok   amax of O is the largest magnitude before scale_O
+FAIL

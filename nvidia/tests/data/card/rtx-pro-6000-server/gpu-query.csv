@@ -1,0 +1,2 @@
+name, driver_version, compute_cap, memory.total [MiB], power.max_limit [W], clocks.max.sm [MHz], clocks.max.memory [MHz], pci.device_id, pci.sub_device_id
+NVIDIA RTX PRO 6000 Blackwell Server Edition, 595.91.07, 12.0, 97887 MiB, 600.00 W, 2430 MHz, 12481 MHz, 0x2BB510DE, 0x204E10DE

@@ -1,0 +1,22 @@
+f16, f32 acc, 16x16x16 row.col               no error, 0 of 256 wrong
+f16, f16 acc, 16x16x16 row.row               no error, 0 of 256 wrong
+f16, f16 acc, 16x16x16 col.col               no error, 0 of 256 wrong
+f16, f32 acc, 32x8x16 row.col                no error, 0 of 256 wrong
+f16, f32 acc, 8x32x16 col.row                no error, 0 of 256 wrong
+f16, f16 acc, 32x8x16 row.row                no error, 0 of 256 wrong
+f16, f16 acc, 8x32x16 col.col                no error, 0 of 256 wrong
+bf16, 16x16x16 row.col                       no error, 0 of 256 wrong
+bf16, 32x8x16 col.row                        no error, 0 of 256 wrong
+bf16, 8x32x16 row.row                        no error, 0 of 256 wrong
+tf32, 16x16x8 row.col                        no error, 0 of 256 wrong
+s8, 16x16x16 row.col                         no error, 0 of 256 wrong
+s8, 32x8x16 col.row                          no error, 0 of 256 wrong
+u8, 8x32x16 row.row                          no error, 0 of 256 wrong
+u8, 16x16x16 col.col                         no error, 0 of 256 wrong
+f64, 8x8x4 row.col                           no error, 0 of 64 wrong
+f64, 8x8x4 col.row                           no error, 0 of 64 wrong
+s4, 8x8x32 row.col                           no error, 0 of 64 wrong
+u4, 8x8x32 row.col                           no error, 0 of 64 wrong
+b1 xor.popc, 8x8x128 row.col                 no error, 0 of 64 wrong
+b1 and.popc, 8x8x128 row.col                 no error, 0 of 64 wrong
+PASS

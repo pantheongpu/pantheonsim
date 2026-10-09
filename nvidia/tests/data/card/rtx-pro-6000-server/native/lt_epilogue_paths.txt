@@ -1,0 +1,153 @@
+ok   fp16 m 8: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   fp16 m 8: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   fp16 m 8: GELU_AUX_BIAS writes GELU's input exactly, D within 0.004
+ok   fp16 m 8: DGELU_BGRAD, D = AB GELU'(aux), within 0.004
+ok   fp16 m 8: BGRADA, op(A) 0, op(B) 0
+ok   fp16 m 8: BGRADA, op(A) 0, op(B) 1
+ok   fp16 m 8: BGRADB, op(A) 0, op(B) 1
+ok   fp16 m 8: BGRADB, op(A) 1, op(B) 1
+ok   fp16 m 8: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 8: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 8: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp16 m 8: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 8: GELU_AUX, an aux type that is not D's -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 8: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp16 m 8: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp16 m 8: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp16 m 8: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp16 m 8: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp16 m 8: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp16 m 5: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   fp16 m 5: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   fp16 m 5: GELU_AUX_BIAS writes GELU's input exactly, D within 0.004
+ok   fp16 m 5: DGELU_BGRAD, D = AB GELU'(aux), within 0.004
+ok   fp16 m 5: BGRADA, op(A) 0, op(B) 0
+ok   fp16 m 5: BGRADA, op(A) 0, op(B) 1
+ok   fp16 m 5: BGRADB, op(A) 0, op(B) 1
+ok   fp16 m 5: BGRADB, op(A) 1, op(B) 1
+ok   fp16 m 5: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 5: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 5: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp16 m 5: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 5: GELU_AUX, an aux type that is not D's -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp16 m 5: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp16 m 5: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp16 m 5: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp16 m 5: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp16 m 5: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp16 m 5: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   bf16 m 8: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   bf16 m 8: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   bf16 m 8: GELU_AUX_BIAS writes GELU's input exactly, D within 0.016
+ok   bf16 m 8: DGELU_BGRAD, D = AB GELU'(aux), within 0.016
+ok   bf16 m 8: BGRADA, op(A) 0, op(B) 0
+ok   bf16 m 8: BGRADA, op(A) 0, op(B) 1
+ok   bf16 m 8: BGRADB, op(A) 0, op(B) 1
+ok   bf16 m 8: BGRADB, op(A) 1, op(B) 1
+ok   bf16 m 8: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 8: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 8: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   bf16 m 8: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 8: GELU_AUX, an aux type that is not D's -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 8: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   bf16 m 8: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   bf16 m 8: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   bf16 m 8: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   bf16 m 8: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   bf16 m 8: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   bf16 m 5: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   bf16 m 5: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   bf16 m 5: GELU_AUX_BIAS writes GELU's input exactly, D within 0.016
+ok   bf16 m 5: DGELU_BGRAD, D = AB GELU'(aux), within 0.016
+ok   bf16 m 5: BGRADA, op(A) 0, op(B) 0
+ok   bf16 m 5: BGRADA, op(A) 0, op(B) 1
+ok   bf16 m 5: BGRADB, op(A) 0, op(B) 1
+ok   bf16 m 5: BGRADB, op(A) 1, op(B) 1
+ok   bf16 m 5: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 5: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 5: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   bf16 m 5: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 5: GELU_AUX, an aux type that is not D's -> heuristic 7, matmul 7 (got 7, 7)
+ok   bf16 m 5: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   bf16 m 5: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   bf16 m 5: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   bf16 m 5: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   bf16 m 5: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   bf16 m 5: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp32 m 8: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   fp32 m 8: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   fp32 m 8: GELU_AUX_BIAS writes GELU's input exactly, D within 0.0002
+ok   fp32 m 8: DGELU_BGRAD, D = AB GELU'(aux), within 0.0002
+ok   fp32 m 8: BGRADA, op(A) 0, op(B) 0
+ok   fp32 m 8: BGRADA, op(A) 0, op(B) 1
+ok   fp32 m 8: BGRADB, op(A) 0, op(B) 1
+ok   fp32 m 8: BGRADB, op(A) 1, op(B) 1
+ok   fp32 m 8: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp32 m 8: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp32 m 8: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp32 m 8: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp32 m 8: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp32 m 8: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp32 m 8: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp32 m 8: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp32 m 8: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp32 m 8: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp32 m 5: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   fp32 m 5: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   fp32 m 5: GELU_AUX_BIAS writes GELU's input exactly, D within 0.0002
+ok   fp32 m 5: DGELU_BGRAD, D = AB GELU'(aux), within 0.0002
+ok   fp32 m 5: BGRADA, op(A) 0, op(B) 0
+ok   fp32 m 5: BGRADA, op(A) 0, op(B) 1
+ok   fp32 m 5: BGRADB, op(A) 0, op(B) 1
+ok   fp32 m 5: BGRADB, op(A) 1, op(B) 1
+ok   fp32 m 5: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp32 m 5: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp32 m 5: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp32 m 5: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp32 m 5: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp32 m 5: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp32 m 5: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp32 m 5: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp32 m 5: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp32 m 5: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp64 m 8: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   fp64 m 8: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   fp64 m 8: GELU_AUX_BIAS writes GELU's input exactly, D within 1e-05
+ok   fp64 m 8: DGELU_BGRAD, D = AB GELU'(aux), within 1e-05
+ok   fp64 m 8: BGRADA, op(A) 0, op(B) 0
+ok   fp64 m 8: BGRADA, op(A) 0, op(B) 1
+ok   fp64 m 8: BGRADB, op(A) 0, op(B) 1
+ok   fp64 m 8: BGRADB, op(A) 1, op(B) 1
+ok   fp64 m 8: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 8: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 8: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp64 m 8: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 8: GELU_AUX, an aux type that is not D's -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 8: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp64 m 8: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp64 m 8: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp64 m 8: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp64 m 8: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp64 m 8: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp64 m 5: RELU_AUX_BIAS with beta, the mask's bits past m untouched
+ok   fp64 m 5: DRELU_BGRAD reads the mask, the bias gradient is each row's sum
+ok   fp64 m 5: GELU_AUX_BIAS writes GELU's input exactly, D within 1e-05
+ok   fp64 m 5: DGELU_BGRAD, D = AB GELU'(aux), within 1e-05
+ok   fp64 m 5: BGRADA, op(A) 0, op(B) 0
+ok   fp64 m 5: BGRADA, op(A) 0, op(B) 1
+ok   fp64 m 5: BGRADB, op(A) 0, op(B) 1
+ok   fp64 m 5: BGRADB, op(A) 1, op(B) 1
+ok   fp64 m 5: RELU_AUX, mask ld 64 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 5: RELU_AUX, mask ld 0 -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 5: RELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp64 m 5: GELU_AUX, ld below m -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 5: GELU_AUX, an aux type that is not D's -> heuristic 7, matmul 7 (got 7, 7)
+ok   fp64 m 5: GELU_AUX, no aux pointer -> heuristic 0, matmul 15 (got 0, 15)
+ok   fp64 m 5: DGELU, no aux pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp64 m 5: DRELU_BGRAD, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   fp64 m 5: BGRADA with op(A) = T -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp64 m 5: BGRADB with op(B) = N -> heuristic 15, matmul 15 (got 15, 15)
+ok   fp64 m 5: BGRADB, no bias pointer -> heuristic 0, matmul 7 (got 0, 7)
+ok   the epilogue attributes' defaults
+ok   the epilogue attributes read back as set; a short buffer is refused
+PASS: every cuBLASLt epilogue check

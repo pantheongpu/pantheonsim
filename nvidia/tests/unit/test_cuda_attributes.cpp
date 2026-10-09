@@ -83,6 +83,37 @@ VTEST(rtx3060_matches_the_card) {
   }
 }
 
+// The L40S and the RTX PRO 6000 Blackwell Server Edition were read on AWS (g6e.2xlarge and
+// g7e.2xlarge, driver 595.91.07, 2026-10-09): the full dumps are
+// nvidia/tests/data/cuda_attributes_{l40s,rtx-pro-6000-server}.card.txt. These are the
+// attributes that are facts of the model (clocks, caches, interface), where the profiles had
+// guessed some (the L40S's persisting L2 was three quarters of its L2, the RTX PRO 6000's
+// boost clock the Workstation Edition's).
+VTEST(l40s_and_rtx_pro_6000_server_match_their_cards) {
+  struct Want { int id; int want; };
+  const struct { const char* gpu; std::vector<Want> card; } cases[] = {
+      {"nvidia/l40s", {{A::kClockRate, 2520000}, {A::kMemoryClockRate, 9001000},
+                       {A::kGlobalMemoryBusWidth, 384}, {A::kL2CacheSize, 100663296},
+                       {A::kMaxPersistingL2CacheSize, 69206016}, {A::kMaxAccessPolicyWindowSize, 134213632},
+                       {A::kMultiprocessorCount, 142}, {A::kAsyncEngineCount, 2}, {A::kClusterLaunch, 0},
+                       {A::kUnifiedFunctionPointers, 0}, {A::kMaxBlocksPerMultiprocessor, 24}}},
+      {"nvidia/rtx-pro-6000-server",
+       {{A::kClockRate, 2430000}, {A::kMemoryClockRate, 12481000}, {A::kGlobalMemoryBusWidth, 512},
+        {A::kL2CacheSize, 134217728}, {A::kMaxPersistingL2CacheSize, 83886080},
+        {A::kMaxAccessPolicyWindowSize, 134217728}, {A::kMultiprocessorCount, 188},
+        {A::kAsyncEngineCount, 2}, {A::kClusterLaunch, 1}, {A::kUnifiedFunctionPointers, 1},
+        {A::kMaxBlocksPerMultiprocessor, 24}, {A::kMemSyncDomainCount, 4}}},
+  };
+  for (const auto& c : cases) {
+    const vgpu::DeviceProfile p = vgpu::load_gpu(c.gpu);
+    for (const Want& w : c.card) {
+      const int got = attr(p, w.id);
+      if (got != w.want) std::fprintf(stderr, "%s attribute %d: card %d, here %d\n", c.gpu, w.id, w.want, got);
+      VCHECK_EQ(got, w.want);
+    }
+  }
+}
+
 // The single- to double-precision ratio follows NVIDIA's "Throughput of Native
 // Arithmetic Instructions" table (CUDA C++ Best Practices Guide 13.4), fp32 over
 // fp64 results per clock per multiprocessor: 7.5 is 64/2, 8.0 is 64/32, 8.6 and

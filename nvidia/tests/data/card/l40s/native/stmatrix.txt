@@ -1,0 +1,5 @@
+ptxas /tmp/tmpxft_00000ae5_00000000-6_stmatrix.ptx, line 59; error   : Feature 'stmatrix' requires .target sm_90 or higher
+ptxas /tmp/tmpxft_00000ae5_00000000-6_stmatrix.ptx, line 91; error   : Feature 'stmatrix' requires .target sm_90 or higher
+ptxas /tmp/tmpxft_00000ae5_00000000-6_stmatrix.ptx, line 119; error   : Feature 'stmatrix' requires .target sm_90 or higher
+ptxas /tmp/tmpxft_00000ae5_00000000-6_stmatrix.ptx, line 180; error   : Feature 'stmatrix' requires .target sm_90 or higher
+ptxas fatal   : Ptx assembly aborted due to errors

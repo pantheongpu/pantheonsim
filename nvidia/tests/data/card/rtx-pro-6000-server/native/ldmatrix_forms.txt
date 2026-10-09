@@ -1,0 +1,12 @@
+m8n8.x4.b16                  22d6c1e5
+m8n8.x4.trans.b16            2c070245
+m8n16.x4.b4x16_p64           81c04f25
+m8n16.x4.b6x16_p32           4cebda25
+m8n16.x2.b4x16_p64           78a81d65
+m8n16.x1.b6x16_p32           1b59de25
+m16n16.x1.trans.b8           b6d4dc05
+m16n16.x2.trans.b8           1d6097e5
+m16n16.x2.trans.b4x16_p64    ebca175d
+m16n16.x1.trans.b6x16_p32    278b9f91
+m8n16.x1.b4x16_p64 (lane 5's word) 0c0a0a05
+m16n16.x1.trans.b6x16_p32 (lane 5's 2nd) 383b3938

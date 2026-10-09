@@ -1,0 +1,3 @@
+cluster shared memory: 0 of 512 wrong
+grid barrier: 0 of 512 wrong
+PASS

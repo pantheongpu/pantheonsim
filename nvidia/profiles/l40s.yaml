@@ -41,10 +41,11 @@ telemetry:
   pcie_link: "Gen4 x8"         # most common link on real cards (510 runs in the benchmark database)
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
-# Datasheet: AD102 memory interface and 96 MB L2. The persisting L2 maximum is three quarters of L2, as the A100's: not read from a card.
+# Datasheet: AD102 memory interface and 96 MB L2. The persisting L2 maximum (69206016, eleven sixteenths of L2, the L4's ratio) was read
+# from an AWS g6e.2xlarge on 2026-10-09 (driver 595.91.07); the three quarters this profile carried before was a guess.
 cuda:
   memory_bus_width_bits: 384
-  persisting_l2_bytes: 75497472
+  persisting_l2_bytes: 69206016
 
 # How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
 # (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
