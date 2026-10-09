@@ -3800,8 +3800,65 @@ struct Machine {
     return (lane & ~31u) | ((((lane & 31u) & and_mask) | or_mask) ^ xor_mask);
   }
 
+  // gfx1250's transposing loads (ds_load_tr*, global_load_tr*), after the CDNA 5 ISA document's section on them: each
+  // lane reads 8 contiguous 16-bit (or 8-bit) elements from an address of its own, one column of a matrix held in
+  // memory column by column, and the hardware deals them out so that each lane holds, in the registers of a WMMA
+  // A or B operand, 8 elements along K of one row. The document's figure puts the 8 elements of lane L at
+  // row M = 8 * (half of the lane) + 0..7 and column K = L mod 8 + 8 * (L / 16) (16-bit) or 4 * (L / 8) + L mod 4
+  // (8-bit), where the half is bit 3 of L (16-bit) or bit 2 (8-bit); the registers hold K along the lane's
+  // elements, M along the lanes (lane = M + 16 * (K / 8)), in order. Only the 16-bit and 8-bit kinds are done:
+  // the 6- and 4-bit kinds have 16x32 tiles whose figures this code does not rely on. EXEC must be all ones.
+  void transpose_regs(Wave& w, const Inst& in, uint32_t elem_bits, const uint8_t (&raw)[32][16]) {
+    const uint32_t words = elem_bits == 16 ? 4 : 2;
+    for (uint32_t o = 0; o < 32; ++o) {
+      uint8_t out[16] = {};
+      const uint32_t m = o % 16, e = o % 8;
+      for (uint32_t j = 0; j < 8; ++j) {
+        const uint32_t k = 8 * (o / 16) + j;   // K of the j-th element this lane ends up with
+        if (elem_bits == 16) {
+          const uint32_t l = (k % 8) + 8 * (m / 8) + 16 * (k / 8);
+          std::memcpy(out + 2 * j, raw[l] + 2 * e, 2);
+        } else {
+          const uint32_t l = 8 * (k / 4) + 4 * (m / 8) + k % 4;
+          out[j] = raw[l][e];
+        }
+      }
+      for (uint32_t k = 0; k < words; ++k) {
+        uint32_t v;
+        std::memcpy(&v, out + 4 * k, 4);
+        set_word(w, in.dst[0], k, o, v);
+      }
+    }
+  }
+  static bool transpose_kind(std::string_view body, uint32_t* elem_bits) {
+    if (body == "load_tr16_b128") return *elem_bits = 16, true;
+    if (body == "load_tr8_b64") return *elem_bits = 8, true;
+    return false;
+  }
+  // Whether the wave can do one at all: a wave of 32 with every lane on (an EXEC of zero is a no-op).
+  bool transpose_ready(const Wave& w, const Inst& in) {
+    if (!w.exec) return false;
+    if (w.lanes != 32 || w.exec != 0xFFFFFFFFull)
+      throw Error::make(Err::Unsupported, in.name, " needs a wave of 32 with EXEC all ones; the ISA leaves anything else undefined");
+    return true;
+  }
+
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in.name);
+    if (uint32_t bits; in.name.rfind("ds_", 0) == 0 && transpose_kind(std::string_view(in.name).substr(3), &bits)) {
+      if (!transpose_ready(w, in)) return;
+      uint8_t raw[32][16] = {};
+      for (uint32_t lane = 0; lane < 32; ++lane) {
+        const uint64_t a = static_cast<uint32_t>(lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset));
+        const uint32_t n = bits == 16 ? 16 : 8;
+        if (a + n <= g.lds.size()) std::memcpy(raw[lane], &g.lds[a], n);
+        else if (g.lds.empty())
+          throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
+                            "did not pay for the LDS its kernel uses");
+      }
+      transpose_regs(w, in, bits, raw);
+      return;
+    }
     // The two that move values between lanes read every lane's value before
     // any lane's result is written: the destination may be the very register
     // they read, and a lane further on must still see what was there.
@@ -5292,6 +5349,18 @@ struct Machine {
     // A flat access that reaches only the device's memory comes here too, so
     // what it does is read from its name past the segment ("load_dwordx4").
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
+    if (uint32_t bits; transpose_kind(body, &bits)) {
+      if (!transpose_ready(w, in)) return;
+      const uint32_t n = bits == 16 ? 16 : 8;
+      uint8_t raw[32][16] = {};
+      for (uint32_t lane = 0; lane < 32; ++lane) {
+        uint32_t words[kMaxWords];
+        load_words(flat_address(w, in, lane, n), n / 4, words);
+        std::memcpy(raw[lane], words, n);
+      }
+      transpose_regs(w, in, bits, raw);
+      return;
+    }
     enum class Kind { Narrow, HalfReg, Load, Store, StoreHi16, Atomic } kind;
     Half half;
     AtomicOp atomic;

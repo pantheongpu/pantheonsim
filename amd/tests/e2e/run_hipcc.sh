@@ -363,6 +363,13 @@ status=$?
 expect "the gfx1250 matrix program runs to the end" "0" "$status"
 expect "every gfx1250 matrix check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's transposing loads (hipcc/trload1250.cpp): global_load_tr and ds_load_tr of 16- and 8-bit elements, loaded
+# into the operands of a WMMA and checked by its product.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/trload1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 transposing-load program runs to the end" "0" "$status"
+expect "every gfx1250 transposing-load check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.
