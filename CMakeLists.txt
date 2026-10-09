@@ -2965,6 +2965,15 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The driver API's explicit graphs: every kind of node built with cuGraphAdd*Node, its parameters
+  # read and changed on the graph and on the executable graph, clones, updates, user objects and capture
+  # into an existing graph (run_graph_capture.sh graph_driver "" --card: NVIDIA's driver).
+  add_test(NAME e2e_graph_driver COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh graph_driver "")
+  set_tests_properties(e2e_graph_driver PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # The rest of cuDNN's classic API -- vectorized INT8x4/INT8x32 layouts and
   # convolution, INT8 pooling and activation, divisive normalization, tensor
   # transform descriptors, LSTM projections and the RNN getters -- against

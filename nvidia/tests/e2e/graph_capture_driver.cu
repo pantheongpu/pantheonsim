@@ -207,6 +207,17 @@ static void stream_ordered_allocation(Runner& r) {
   }, {{dst, (size_t)n, Dt::F32}});
 }
 
+static CUresult prefetch(CUdeviceptr d, size_t bytes, CUstream s) {
+#if CUDA_VERSION >= 13000
+  CUmemLocation l;
+  l.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  l.id = 0;
+  return cuMemPrefetchAsync(d, bytes, l, 0, s);
+#else
+  return cuMemPrefetchAsync(d, bytes, 0, s);
+#endif
+}
+
 /* ---- what a capture refuses -------------------------------------------------------------- */
 
 // Each is called in a capture of its own: the call's answer, whether the stream still captures after
@@ -235,7 +246,7 @@ static void refusals(Runner& r) {
     {"cuStreamSynchronize", [&] { return cuStreamSynchronize(S(r)); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
     {"cuStreamQuery", [&] { return cuStreamQuery(S(r)); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
     {"cuCtxSynchronize", [&] { return cuCtxSynchronize(); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
-    {"cuMemPrefetchAsync", [&] { CUmemLocation l; l.type = CU_MEM_LOCATION_TYPE_DEVICE; l.id = 0; return cuMemPrefetchAsync(d, 4096, l, 0, S(r)); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
+    {"cuMemPrefetchAsync", [&] { return prefetch(d, 4096, S(r)); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
     {"cuStreamAttachMemAsync", [&] { return cuStreamAttachMemAsync(S(r), d, 0, CU_MEM_ATTACH_GLOBAL); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
     {"cuMemcpyPeerAsync", [&] { CUcontext c; cuCtxGetCurrent(&c); return cuMemcpyPeerAsync(d, c, d + 2048, c, 64, S(r)); }, unsupported, CU_STREAM_CAPTURE_STATUS_INVALIDATED},
     {"cuStreamAddCallback (refused, the capture goes on)", [&] { return cuStreamAddCallback(S(r), [](CUstream, CUresult, void*) {}, nullptr, 0); }, unsupported, CU_STREAM_CAPTURE_STATUS_ACTIVE},

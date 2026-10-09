@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A graph_capture_<name>.cu program (see graph_capture_common.h): library calls recorded
+# A graph_capture_<name>.cu program (or, named graph_<name>, a program of its own) (see graph_capture_common.h): library calls recorded
 # into a captured CUDA graph, their descriptors destroyed, and the graph launched with new
 # inputs.
 #
@@ -21,7 +21,8 @@ name="$1"
 libs_csv="${2:-}"
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/graph_capture_$name.cu"
-out="${TMPDIR:-/tmp}/vgpu_e2e_graph_capture_${name}_$$"
+[[ "$name" == graph_* ]] && src="$root/nvidia/tests/e2e/$name.cu"   # a program of its own (graph_driver)
+out="${TMPDIR:-/tmp}/vgpu_e2e_${name}_$$"
 card=0
 [[ "${3:-}" == --card ]] && card=1
 IFS=, read -r -a libs <<< "$libs_csv"
@@ -79,4 +80,5 @@ else
   result="$(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim") "$out" 2>&1 || true)"
 fi
 echo "$result"
+[[ "$(tail -1 <<< "$result")" == SKIP:* ]] && exit 0   # the program says what it needs
 [[ "$(tail -1 <<< "$result")" == "PASS" ]]

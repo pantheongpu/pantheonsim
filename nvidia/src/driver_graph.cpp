@@ -166,7 +166,7 @@ struct NodeParams {
   CUkernel kern = nullptr;
   unsigned grid[3] = {1, 1, 1}, block[3] = {1, 1, 1}, shared = 0;
   std::vector<std::vector<uint8_t>> args;
-  void** kernel_params = nullptr;   // as given: GetParams hands the pointers back
+  std::vector<void*> arg_ptrs;      // one per parameter, into args: what GetParams gives back as kernelParams
   void** extra = nullptr;
   CUcontext ctx = nullptr;
   // memcpy
@@ -682,13 +682,13 @@ CUresult make_kernel_params(const CUDA_KERNEL_NODE_PARAMS_v3& in, std::shared_pt
   p->grid[0] = in.gridDimX, p->grid[1] = in.gridDimY, p->grid[2] = in.gridDimZ;
   p->block[0] = in.blockDimX, p->block[1] = in.blockDimY, p->block[2] = in.blockDimZ;
   p->shared = in.sharedMemBytes;
-  p->kernel_params = in.kernelParams;
   p->extra = in.extra;
   p->ctx = in.ctx;
   void* handle = in.func ? static_cast<void*>(in.func) : static_cast<void*>(in.kern);
-  if (!handle) return kInvalidValue;
+  if (!handle) return kInvalidHandle;   // measured: a kernel node with no function
   if (!p->grid[0] || !p->grid[1] || !p->grid[2] || !p->block[0] || !p->block[1] || !p->block[2]) return kInvalidValue;
   if (const int rc = vgpu_driver::copy_kernel_args(handle, in.kernelParams, in.extra, &p->args)) return res(rc);
+  for (auto& a : p->args) p->arg_ptrs.push_back(a.data());
   *out = std::move(p);
   return CUDA_SUCCESS;
 }
@@ -743,6 +743,9 @@ CUresult make_memset_params(const CUDA_MEMSET_NODE_PARAMS_v2& in, std::shared_pt
 }
 
 CUresult make_memcpy_params(const CUDA_MEMCPY3D& in, CUcontext ctx, std::shared_ptr<NodeParams>* out) {
+  // Measured: a zero descriptor is CUDA_ERROR_INVALID_VALUE.
+  const auto valid_type = [](int m) { return m >= CU_MEMORYTYPE_HOST && m <= CU_MEMORYTYPE_UNIFIED; };
+  if (!valid_type(in.srcMemoryType) || !valid_type(in.dstMemoryType) || !in.WidthInBytes) return kInvalidValue;
   auto p = std::make_shared<NodeParams>();
   p->kind = Kind::Memcpy;
   p->copy = in;
@@ -795,7 +798,7 @@ void fill_kernel_out(const NodeParams& p, CUDA_KERNEL_NODE_PARAMS_v3* out) {
   out->gridDimX = p.grid[0], out->gridDimY = p.grid[1], out->gridDimZ = p.grid[2];
   out->blockDimX = p.block[0], out->blockDimY = p.block[1], out->blockDimZ = p.block[2];
   out->sharedMemBytes = p.shared;
-  out->kernelParams = p.kernel_params;
+  out->kernelParams = const_cast<void**>(p.arg_ptrs.data());   // the node's own copy, as NVIDIA's gives
   out->extra = p.extra;
   out->kern = p.kern;
   out->ctx = p.ctx;
@@ -838,7 +841,7 @@ CUresult exec_set_kernel(Exec exec, Node node, const CUDA_KERNEL_NODE_PARAMS_v3*
 CUresult add_memcpy(CUgraphNode* out, CUgraph graph, const CUgraphNode* deps, size_t n, const CUDA_MEMCPY3D* in, CUcontext ctx) {
   if (!in || !out) return kInvalidValue;
   std::shared_ptr<NodeParams> p;
-  make_memcpy_params(*in, ctx, &p);
+  if (const CUresult r = make_memcpy_params(*in, ctx, &p)) return r;
   return add_closure_node(out, graph, deps, n, p, 1, memcpy_closure(p));
 }
 
@@ -859,7 +862,7 @@ CUresult add_memops(CUgraphNode* out, CUgraph graph, const CUgraphNode* deps, si
 /* ---- host, child, empty ---- */
 
 CUresult add_host(CUgraphNode* out, CUgraph graph, const CUgraphNode* deps, size_t n, const CUDA_HOST_NODE_PARAMS_v2* in) {
-  if (!in || !in->fn) return kInvalidValue;
+  if (!in) return kInvalidValue;
   FORWARD("cudaGraphAddHostNode", int (*)(void**, void*, const void* const*, size_t, const void*), reinterpret_cast<void**>(out), graph,
           reinterpret_cast<const void* const*>(deps), n, in);
 }
@@ -1056,13 +1059,13 @@ VGPU_EXPORT CUresult cuGraphMemcpyNodeSetParams(CUgraphNode node, const CUDA_MEM
   std::shared_ptr<const NodeParams> old;
   if (const CUresult r = need_kind(node, Kind::Memcpy, &old)) return r;
   std::shared_ptr<NodeParams> p;
-  make_memcpy_params(*params, old->ctx, &p);
+  if (const CUresult r = make_memcpy_params(*params, old->ctx, &p)) return r;
   return replace_closure(node, p, memcpy_closure(p));
 }
 VGPU_EXPORT CUresult cuGraphExecMemcpyNodeSetParams(CUgraphExec exec, CUgraphNode node, const CUDA_MEMCPY3D* params, CUcontext ctx) {
   if (!params) return kInvalidValue;
   std::shared_ptr<NodeParams> p;
-  make_memcpy_params(*params, ctx, &p);
+  if (const CUresult r = make_memcpy_params(*params, ctx, &p)) return r;
   return replace_exec_closure(exec, node, memcpy_closure(p));
 }
 

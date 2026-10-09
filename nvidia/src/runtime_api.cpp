@@ -6823,6 +6823,7 @@ std::map<int, GraphMemStats> g_graph_mem;
 // the auto-free flag is about its allocations.
 std::map<void*, void*> g_exec_source;        // exec handle -> graph handle
 std::set<void*> g_exec_auto_free;            // execs instantiated with the flag
+std::unordered_map<void*, unsigned long long> g_exec_flags;   // the flags each exec was instantiated with
 
 uint64_t round_up_to(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
 
@@ -7663,6 +7664,7 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   exec_retain_graph_objects(handle, static_cast<void*>(graph));
+  g_exec_flags[handle] = flags;
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
@@ -10807,6 +10809,8 @@ static cudaError_t cudaGraphDestroy_traced(cudaGraph_t graph) {
   if (g_borrowed_graphs.count(static_cast<void*>(graph)) &&
       !g_graphs.count(static_cast<void*>(graph)))
     return cudaErrorInvalidValue;
+  // A graph already destroyed, or never made, is not one (an RTX 3060: cudaErrorInvalidValue).
+  if (!graph_from(graph) && !g_borrowed_graphs.count(static_cast<void*>(graph))) return cudaErrorInvalidValue;
   // Nor a graph a capture is adding to (cudaStreamBeginCaptureToGraph): an RTX
   // 3060 answers cudaErrorIllegalState until the capture ends.
   for (const auto& [origin, cap] : g_captures)
@@ -10926,6 +10930,7 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
     }
   }
   g_exec_auto_free.erase(static_cast<void*>(exec));
+  g_exec_flags.erase(static_cast<void*>(exec));
   g_device_graphs.erase(static_cast<void*>(exec));
   lock.unlock();
   user_objects_release_all(std::move(held));
@@ -10935,6 +10940,21 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   return traced_call("cudaGraphExecDestroy", cudaGraphExecDestroy_traced, exec);
 }
+#if CUDART_VERSION >= 12050
+// The flags the executable graph was instantiated with.
+static cudaError_t cudaGraphExecGetFlags_traced(cudaGraphExec_t exec, unsigned long long* flags) {
+  if (!flags) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto it = g_exec_flags.find(static_cast<void*>(exec));
+  if (it == g_exec_flags.end()) return cudaErrorInvalidValue;
+  *flags = it->second;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphExecGetFlags(cudaGraphExec_t exec, unsigned long long* flags) {
+  return traced_call("cudaGraphExecGetFlags", cudaGraphExecGetFlags_traced, exec, flags);
+}
+#endif
 // What a library asks before it adds work to a stream that might be capturing:
 // whether it is, which capture, the graph being built, and the nodes the next
 // operation will depend on. With the graph and the dependencies a library can
