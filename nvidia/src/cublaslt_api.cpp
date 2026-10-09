@@ -78,6 +78,8 @@ struct MatmulDesc {
   int32_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
   const void *a_scale = nullptr, *b_scale = nullptr, *c_scale = nullptr, *d_scale = nullptr;
   void* amax_d = nullptr;
+  const void* aux_scale = nullptr;
+  void* aux_amax = nullptr;
   int32_t a_scale_mode = kScaleScalar, b_scale_mode = kScaleScalar;
   int32_t c_scale_mode = kScaleScalar, d_scale_mode = kScaleScalar;
   int8_t fast_accum = 0;
@@ -307,6 +309,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
     case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: take(&m->c_scale); break;
     case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER: take(&m->d_scale); break;
     case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: take(&m->amax_d); break;
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER: take(&m->aux_scale); break;
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: take(&m->aux_amax); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER: take(&m->aux); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD: take(&m->aux_ld); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_BATCH_STRIDE: take(&m->aux_batch_stride); break;
@@ -576,6 +580,20 @@ void encode(double v, int t, uint8_t* p) {
   }
 }
 
+// v rounded to type t and back (the value a store of that type keeps).
+double quantize(double v, int t) {
+  uint8_t raw[8] = {};
+  encode(v, t, raw);
+  switch (t) {
+    case CUDA_R_8F_E4M3: return from_bits_fp8(raw[0], true);
+    case CUDA_R_8F_E5M2: return from_bits_fp8(raw[0], false);
+    case CUDA_R_16F: { uint16_t h; std::memcpy(&h, raw, 2); return from_half(h); }
+    case CUDA_R_16BF: { uint16_t h; std::memcpy(&h, raw, 2); return from_bf16(h); }
+    case CUDA_R_32F: { float f; std::memcpy(&f, raw, 4); return f; }
+    default: return v;
+  }
+}
+
 // The span, in elements, a layout's one matrix occupies.
 size_t span(const MatrixLayout& l) {
   if (!l.rows || !l.cols) return 0;
@@ -839,6 +857,126 @@ float gelu_grad(float x) {
 bool block_mode(int m) { return m == kScaleVec16UE4M3 || m == kScaleVec32UE8M0; }
 bool hopper_mode(int m) { return m == kScaleVec128 || m == kScaleBlk128x128; }
 
+
+/* ---- what an FP8/FP4 matmul is refused for, by the descriptor and by the card ----
+   Measured on an NVIDIA L4 (sm_89, cuBLAS 13.3 from CUDA 13.2) and an RTX 3060 (sm_86) with
+   nvidia/tests/e2e/lowprec_lt.cu, 1247 descriptors on each (nvidia/tests/data/lowprec/lt.*.txt);
+   cuBLAS 13.0 answers the same but for PER_BATCH_SCALAR_32F, which only 13.2 knows. Two layers,
+   in this order, as the card has them:
+     the descriptor's own consistency, whatever the GPU (INVALID_VALUE, and a few NOT_SUPPORTED that
+     are made before any kernel is looked for), then
+     whether a kernel exists on this GPU (NOT_SUPPORTED).
+   Below compute capability 8.9 there is no FP8 kernel at all. On 8.9 the kernels are the table below
+   (every row measured). From 9.0 up the descriptor layer applies and the kernel layer is the
+   documentation's, not a card's: the older permissive checks that follow decide, and the features
+   only those GPUs have (outer-vector and 128-element scales, auxiliary scale and amax, the block-scaled
+   MXFP8 and NVFP4 modes) are implemented from NVIDIA's documentation, not checked against a card. */
+int device_cc() {
+  int dev = 0, major = 0, minor = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+  return major * 10 + minor;
+}
+
+// The scale-mode families the card keeps apart: modes of different families cannot be A's and B's.
+// -1: a mode the library does not know.
+int scale_family(int mode) {
+  switch (mode) {
+    case kScaleScalar: return 0;
+    case kScaleVec16UE4M3: return 1;
+    case kScaleVec32UE8M0: return 2;
+    case kScaleOuterVec: case kScaleVec128: case kScaleBlk128x128: return 3;
+    case 6: return 4;   // PER_BATCH_SCALAR_32F (CUDA 13.2)
+    default: return -1;
+  }
+}
+
+bool narrow_involved(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb, const MatrixLayout& lc,
+                     const MatrixLayout& ld) {
+  return narrow(la.type) || narrow(lb.type) || narrow(lc.type) || narrow(ld.type) || md.a_scale_mode != kScaleScalar ||
+         md.b_scale_mode != kScaleScalar || md.d_out_scale_mode != kScaleScalar || md.amax_d || md.aux_scale || md.aux_amax;
+}
+
+// The descriptor layer. Returns SUCCESS when nothing in the descriptor is wrong in itself.
+cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb,
+                                       const MatrixLayout& lc, const MatrixLayout& ld, int cc) {
+  const int at = la.type, bt = lb.type, dt = ld.type;
+  if (at == CUDA_R_8F_E5M2 && bt == CUDA_R_8F_E5M2) return CUBLAS_STATUS_NOT_SUPPORTED;   // no E5M2 x E5M2 kernel anywhere
+  const bool compute32 = md.compute == CUBLAS_COMPUTE_32F || md.compute == CUBLAS_COMPUTE_32F_FAST_16F ||
+                         md.compute == CUBLAS_COMPUTE_32F_FAST_16BF || md.compute == CUBLAS_COMPUTE_32F_FAST_TF32;
+  if (compute32 && md.scale != CUDA_R_32F) return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.amax_d && (dt == CUDA_R_16F || dt == CUDA_R_16BF || dt == CUDA_R_32F)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((md.aux_scale || md.aux_amax) && cc < 90) return CUBLAS_STATUS_INVALID_VALUE;
+  const int e = enum_value(md.epilogue);
+  const bool aux = (e & 128) != 0, relu = (e & 2) != 0 || (e & 8) != 0;
+  if (aux && md.aux_type >= 0) {
+    if (relu) return CUBLAS_STATUS_INVALID_VALUE;   // the mask has no type to choose
+    const int allowed = is_fp8(dt) ? CUDA_R_16BF : dt;
+    if (md.aux_type != allowed) return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  if (lc.order != ld.order) return CUBLAS_STATUS_INVALID_VALUE;
+  const int fa = scale_family(md.a_scale_mode), fb = scale_family(md.b_scale_mode);
+  if (fa < 0 || fb < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  const bool compatible = fa == fb || ((fa == 0 || fa == 4) && (fb == 0 || fb == 4));
+  if (!compatible) return CUBLAS_STATUS_INVALID_VALUE;
+  if (is_fp4(at) && md.a_scale_mode != kScaleVec16UE4M3) return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.a_scale_mode == kScaleVec16UE4M3 && !is_fp4(at)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.a_scale_mode == kScaleVec32UE8M0 && !is_fp8(at)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 1 || fa == 2) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (is_fp4(dt) && md.d_out_scale_mode == kScaleVec32UE8M0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (dt == CUDA_R_8F_E4M3 && (fa == 2 || fa == 3) && md.d_out_scale_mode == kScaleScalar) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 1 || fa == 2) && aux) return CUBLAS_STATUS_INVALID_VALUE;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// The kernel layer for GPUs the card was measured on: below 8.9 nothing; on 8.9 this table.
+cublasStatus_t narrow_kernel_check(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb,
+                                   const MatrixLayout& lc, const MatrixLayout& ld, int cc) {
+  if (cc < 89) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (cc > 89) return CUBLAS_STATUS_SUCCESS;   // documentation-derived, below
+  const int at = la.type, bt = lb.type, ct = lc.type, dt = ld.type;
+  auto e4 = [](int t) { return t == CUDA_R_8F_E4M3; };
+  auto e5 = [](int t) { return t == CUDA_R_8F_E5M2; };
+  // Types: E4M3 x E4M3, E4M3 x E5M2 or E5M2 x E4M3, into the output below (C is D's type, or BF16/FP16 under FP8).
+  if (!(is_fp8(at) && is_fp8(bt))) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (md.compute != CUBLAS_COMPUTE_32F && md.compute != CUBLAS_COMPUTE_32F_FAST_16F && md.compute != CUBLAS_COMPUTE_32F_FAST_TF32)
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  bool types = false;
+  if (ct == CUDA_R_16BF && dt == CUDA_R_16BF) types = true;
+  if (ct == CUDA_R_16F && dt == CUDA_R_16F) types = true;
+  if (ct == CUDA_R_32F && dt == CUDA_R_32F) types = true;
+  if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e4(dt)) types = true;
+  if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e5(dt) && (e5(at) != e5(bt))) types = true;
+  if (!types) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Layout: A and B both contiguous along K (op(A) = T and op(B) = N for column-major storage).
+  const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
+  const bool ka = ta != (la.order == CUBLASLT_ORDER_ROW), kb = (!tb) != (lb.order == CUBLASLT_ORDER_ROW);
+  if (!ka || !kb) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (md.a_scale_mode != kScaleScalar || md.b_scale_mode != kScaleScalar) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Alignment: every leading dimension a multiple of 16 bytes.
+  for (const MatrixLayout* l : {&la, &lb, &lc, &ld})
+    if ((l->ld * (int64_t)elem_bytes(l->type)) % 16) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Epilogues, by output type; the bias is BF16 under an FP8 or fp32 D, else D's type.
+  const int e = enum_value(md.epilogue);
+  const bool bias = (e & 4) != 0;
+  const int bias_ok = (dt == CUDA_R_16F) ? CUDA_R_16F : CUDA_R_16BF;
+  if (bias && md.bias_type >= 0 && md.bias_type != bias_ok) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (dt == CUDA_R_32F && (e == (CUBLASLT_EPILOGUE_GELU_BIAS) || e == CUBLASLT_EPILOGUE_RELU_AUX_BIAS ||
+                           e == CUBLASLT_EPILOGUE_GELU_AUX_BIAS))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (is_fp8(dt) && (e == CUBLASLT_EPILOGUE_DRELU || e == CUBLASLT_EPILOGUE_DRELU_BGRAD || e == CUBLASLT_EPILOGUE_DGELU ||
+                     e == CUBLASLT_EPILOGUE_DGELU_BGRAD))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (dt == CUDA_R_32F && (e == CUBLASLT_EPILOGUE_DRELU_BGRAD || e == CUBLASLT_EPILOGUE_DGELU_BGRAD))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (e == CUBLASLT_EPILOGUE_BGRADA || e == CUBLASLT_EPILOGUE_BGRADB) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (e5(dt) && e != CUBLASLT_EPILOGUE_DEFAULT && e != CUBLASLT_EPILOGUE_RELU && e != CUBLASLT_EPILOGUE_BIAS &&
+      e != CUBLASLT_EPILOGUE_RELU_BIAS)
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 // Everything that can be refused before the matmul runs, shared with
 // cublasLtMatmulAlgoGetHeuristic (which on the card refuses the same
 // descriptors); `at_matmul` adds the pointer checks the card makes only
@@ -847,6 +985,13 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
                         const MatrixLayout& ld, bool at_matmul) {
   if (!known_type(la.type) || !known_type(lb.type) || !known_type(lc.type) || !known_type(ld.type))
     return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (narrow_involved(md, la, lb, lc, ld)) {
+    const int cc = device_cc();
+    if (cc) {
+      if (const cublasStatus_t st = narrow_descriptor_check(md, la, lb, lc, ld, cc)) return st;
+      if (const cublasStatus_t st = narrow_kernel_check(md, la, lb, lc, ld, cc)) return st;
+    }
+  }
   // Integer matmul (PyTorch's torch._int_mm): int8 x int8 into int32 with CUBLAS_COMPUTE_32I, and nothing else
   // mixes integer and floating types.
   const bool any_int = is_int(la.type) || is_int(lb.type) || is_int(lc.type) || is_int(ld.type);
@@ -975,7 +1120,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
                         : 1.0;
 
   int bias_type = md.bias_type;
-  if (md.bias_type < 0) bias_type = narrow(ld.type) ? CUDA_R_16BF : ld.type;
+  // Measured (L4, cuBLAS 13.3): the default bias is BF16 under an fp32 or FP8 D, as the header's exceptions say.
+  if (md.bias_type < 0) bias_type = (narrow(ld.type) || ld.type == CUDA_R_32F) ? CUDA_R_16BF : ld.type;
   if ((ep.bias || ep.bgrad || ep.bgrada || ep.bgradb) && !elem_bytes(bias_type)) return CUBLAS_STATUS_NOT_SUPPORTED;
 
   const int batch = ld.batch;
@@ -1024,9 +1170,14 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           acc += ea.get(ta ? at(la, p, i) : at(la, i, p)) * sa.at((size_t)i, (size_t)p) *
                  eb.get(tb ? at(lb, j, p) : at(lb, p, j)) * sb.at((size_t)j, (size_t)p);
         const double al = alphas[alpha_vec ? (size_t)i : 0], be = betas[beta_vec ? (size_t)i : 0];
-        double v = al * acc;
-        if (be != 0.0 && !ec.raw.empty()) v += be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j));
-        if (!hbias.empty()) v += hbias[(size_t)i];
+        // The epilogue runs in fp32 as the card's does: the product, the C term and the bias are each rounded to
+        // fp32 (measured on an L4: a bias that is not exact in fp32 moves FP8 rounding ties).
+        double v = (float)(al * acc);
+        if (be != 0.0 && !ec.raw.empty()) v = (float)(v + (float)(be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j))));
+        // RELU_AUX_BIAS adds the bias to the product already rounded to the output type (measured: a bf16 D
+        // rounds 9.21875 to 9.25 before adding -2, where RELU_BIAS and BIAS keep 7.21875).
+        if (!hbias.empty() && ep.relu && ep.aux_out) v = quantize(v, narrow(ld.type) ? (int)CUDA_R_16BF : ld.type);
+        if (!hbias.empty()) v = (float)(v + (float)hbias[(size_t)i]);
         const size_t ax = (size_t)(j * aux_ld + i);
         if (ep.relu) {
           if (relu_aux) {
@@ -1042,7 +1193,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
         } else if (ep.dgelu) {
           v *= gelu_grad((float)aux.get(ax));
         }
-        if (ep.bgrad) bgrad[(size_t)i] += v;
+        // The bias gradient sums the values as stored in D's type, in fp32 (measured: DRELU_BGRAD into bf16).
+        if (ep.bgrad) bgrad[(size_t)i] = (float)(bgrad[(size_t)i] + quantize(v, narrow(ld.type) ? (int)CUDA_R_16BF : ld.type));
         amax = std::fmax(amax, std::fabs(v));
         col[(size_t)i] = v;
       }
@@ -1051,7 +1203,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           for (auto& v : col) v *= sd;
         quantize_column(ed, ld, j, col, md.d_out_scale_mode, out_scales, (size_t)m);
       } else {
-        for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), col[(size_t)i] * sd);
+        for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), (double)(float)(col[(size_t)i] * sd));
       }
     }
     ed.save(dptr);
