@@ -22,6 +22,12 @@
 // says so in its name and the program expects what the card does.
 #pragma once
 
+// With GC_DRIVER_API defined before this header, the capture itself (begin, end, instantiate, launch,
+// destroy) goes through the driver API's cuStreamBeginCapture and cuGraph*, and the stream is a driver
+// stream: the program checks those calls as well as what is captured.
+#ifdef GC_DRIVER_API
+#include <cuda.h>
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -84,19 +90,57 @@ struct Out {
 };
 inline size_t dt_bytes(Dt t) { return t == Dt::F64 ? 8 : t == Dt::F16 ? 2 : t == Dt::Bytes ? 1 : 4; }
 
+// The graph calls, in whichever API the program checks. 0 is success.
+struct GraphApi {
+#ifdef GC_DRIVER_API
+  static int begin(cudaStream_t st) { return cuStreamBeginCapture(reinterpret_cast<CUstream>(st), CU_STREAM_CAPTURE_MODE_GLOBAL); }
+  static int end(cudaStream_t st, void** graph) { return cuStreamEndCapture(reinterpret_cast<CUstream>(st), reinterpret_cast<CUgraph*>(graph)); }
+  static int instantiate(void** exec, void* graph) {
+    return cuGraphInstantiateWithFlags(reinterpret_cast<CUgraphExec*>(exec), reinterpret_cast<CUgraph>(graph), 0);
+  }
+  static int launch(void* exec, cudaStream_t st) { return cuGraphLaunch(reinterpret_cast<CUgraphExec>(exec), reinterpret_cast<CUstream>(st)); }
+  static void destroy_exec(void* exec) { cuGraphExecDestroy(reinterpret_cast<CUgraphExec>(exec)); }
+  static void destroy(void* graph) { cuGraphDestroy(reinterpret_cast<CUgraph>(graph)); }
+  static int sync(cudaStream_t st) { return cuStreamSynchronize(reinterpret_cast<CUstream>(st)); }
+  static cudaStream_t make_stream() {
+    cudaFree(nullptr);   // brings up the primary context the driver stream belongs to
+    CUstream s = nullptr;
+    cuStreamCreate(&s, CU_STREAM_NON_BLOCKING);
+    return reinterpret_cast<cudaStream_t>(s);
+  }
+  static void destroy_stream(cudaStream_t st) { cuStreamDestroy(reinterpret_cast<CUstream>(st)); }
+#else
+  static int begin(cudaStream_t st) { return cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal); }
+  static int end(cudaStream_t st, void** graph) { return cudaStreamEndCapture(st, reinterpret_cast<cudaGraph_t*>(graph)); }
+  static int instantiate(void** exec, void* graph) {
+    return cudaGraphInstantiate(reinterpret_cast<cudaGraphExec_t*>(exec), static_cast<cudaGraph_t>(graph), 0);
+  }
+  static int launch(void* exec, cudaStream_t st) { return cudaGraphLaunch(static_cast<cudaGraphExec_t>(exec), st); }
+  static void destroy_exec(void* exec) { cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(exec)); }
+  static void destroy(void* graph) { cudaGraphDestroy(static_cast<cudaGraph_t>(graph)); }
+  static int sync(cudaStream_t st) { return cudaStreamSynchronize(st); }
+  static cudaStream_t make_stream() {
+    cudaStream_t s = nullptr;
+    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    return s;
+  }
+  static void destroy_stream(cudaStream_t st) { cudaStreamDestroy(st); }
+#endif
+};
+
 struct Runner {
   cudaStream_t st = nullptr;
   int* counter = nullptr;
   std::vector<void*> allocs;
 
   Runner() {
-    cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+    st = GraphApi::make_stream();
     cudaMalloc(&counter, sizeof(int));
   }
   ~Runner() {
     release();
     cudaFree(counter);
-    cudaStreamDestroy(st);
+    GraphApi::destroy_stream(st);
   }
   template <class T>
   T* alloc(size_t n) {
@@ -159,7 +203,7 @@ struct Runner {
     set_counter(counters[0]);
     zero(outs);
     const bool eager_ok = issue();
-    cudaStreamSynchronize(st);
+    GraphApi::sync(st);
     expect(name + ", eager", eager_ok);
     if (!eager_ok) return;
     bool produced = false;
@@ -174,24 +218,24 @@ struct Runner {
     expect(name + ": its results are finite", finite);
 
     zero(outs);
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t exec = nullptr;
-    cudaError_t b = cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal);
-    bool rec_ok = b == cudaSuccess && issue();
-    cudaError_t e = cudaStreamEndCapture(st, &graph);
-    expect(name + ", recorded into a capture", rec_ok && e == cudaSuccess, e);
-    if (!rec_ok || e != cudaSuccess) {
-      if (graph) cudaGraphDestroy(graph);
+    void* graph = nullptr;
+    void* exec = nullptr;
+    const int b = GraphApi::begin(st);
+    bool rec_ok = b == 0 && issue();
+    const int e = GraphApi::end(st, &graph);
+    expect(name + ", recorded into a capture", rec_ok && e == 0, e);
+    if (!rec_ok || e != 0) {
+      if (graph) GraphApi::destroy(graph);
       cudaGetLastError();
-      cudaStreamSynchronize(st);
+      GraphApi::sync(st);
       return;
     }
-    if (cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+    if (GraphApi::instantiate(&exec, graph) != 0) {
       expect(name + ", graph instantiates", false);
-      cudaGraphDestroy(graph);
+      GraphApi::destroy(graph);
       return;
     }
-    cudaStreamSynchronize(st);
+    GraphApi::sync(st);
     bool untouched = true;
     for (const Out& o : outs) untouched = untouched && !any_nonzero(read(o));
     expect(name + ": the capture did not run the call", untouched);
@@ -203,15 +247,15 @@ struct Runner {
       if (!check) {
         zero(outs);
         const bool ok = issue();
-        cudaStreamSynchronize(st);
+        GraphApi::sync(st);
         if (!ok) { expect(name + ", reference run " + std::to_string(r), false); break; }
         for (const Out& o : outs) want.push_back(read(o));
       }
       zero(outs);
-      const cudaError_t l = cudaGraphLaunch(exec, st);
-      const cudaError_t s = cudaStreamSynchronize(st);
+      const int l = GraphApi::launch(exec, st);
+      const int s = GraphApi::sync(st);
       const std::string what = name + ", graph launch " + std::to_string(r) + " (counter " + std::to_string(c) + ")";
-      if (l != cudaSuccess || s != cudaSuccess) { expect(what, false, l ? l : s); break; }
+      if (l != 0 || s != 0) { expect(what, false, l ? l : s); break; }
       if (check) {
         expect(what, check(c, r));
         continue;
@@ -220,9 +264,9 @@ struct Runner {
       for (size_t i = 0; i < outs.size(); ++i) worst = std::fmax(worst, distance(read(outs[i]), want[i], outs[i].t));
       expect(what, worst <= tol, worst);
     }
-    cudaGraphExecDestroy(exec);
-    cudaGraphDestroy(graph);
-    cudaStreamSynchronize(st);
+    GraphApi::destroy_exec(exec);
+    GraphApi::destroy(graph);
+    GraphApi::sync(st);
   }
 };
 

@@ -191,7 +191,7 @@ add_library(vgpu STATIC
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
 # libvgpucuda: the CUDA Driver API shim external programs link against.
-add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
@@ -2953,6 +2953,15 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_graph_capture_dnn COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh dnn cudnn)
   set_tests_properties(e2e_graph_capture_dnn PROPERTIES
     DEPENDS "vgpucudart;vgpucudnn"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # The driver API's stream calls inside a captured graph, captured and launched through the driver
+  # API's own cuStreamBeginCapture and cuGraph* (run_graph_capture.sh driver "" --card runs the same
+  # program against NVIDIA's driver).
+  add_test(NAME e2e_graph_capture_driver COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh driver "")
+  set_tests_properties(e2e_graph_capture_driver PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
