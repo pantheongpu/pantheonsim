@@ -2036,9 +2036,10 @@ only on a new failure or on a listed one that starts passing (`XPASS`: delete it
 - **torch.compile gather / scatter_add / index_select**: an Inductor kernel fails to load, `cuModuleLoadData`
   answers `unsupported-ptx` (the log shows only that line, not the unsupported feature) and the driver call
   returns "operation not supported". Find the PTX feature first.
-- **Numeric**: the tiny causal transformer after three AdamW steps (0.0027 against 0.002), SGD with OneCycleLR
-  and gradient clipping (0.32), and `clip_grad_norm_` (foreach) / `clip_grad_value_` (0.0012 against 0.0001).
-  The kernel or reduction order that drifts is not isolated; no tolerance was loosened.
+- **Numeric**: the tiny causal transformer after three AdamW steps (0.0027 against 0.002). The kernel or
+  reduction order that drifts is not isolated; no tolerance was loosened. (SGD with OneCycleLR and gradient
+  clipping, and `clip_grad_norm_` (foreach) / `clip_grad_value_`, drifted when the sweep was written and match
+  the CPU on the current main; they are no longer listed.)
 
 ### Tooling, CI and process
 
