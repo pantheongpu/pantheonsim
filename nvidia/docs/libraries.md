@@ -46,7 +46,15 @@ entropy-coded data decodes what is there; NV12 only from 4:2:0, YUY2 only from
 4:2:2, CMYK to RGB only with CMYK allowed; the decoupled transfer needs a
 device buffer attached; the hardware backend is `NVJPEG_STATUS_ARCH_MISMATCH`
 (an RTX 3060 has no JPEG engine; NVIDIA's A100 and H100 do, and the simulator
-answers the same on every profile); the batched API's argument checks;
+answers the same on every profile); the batched API's argument checks; which
+backends make a handle and a decoder; the frame types it parses without
+decoding (lossless, and samples of 2, 9, 12 or 16 bits -- encoding and
+precision reported, support flag 2, decode `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`)
+and those it will not parse (arithmetic and differential frames, and a
+hierarchical stream everywhere but the header-only parsers);
+`nvjpegEncoderParamsCopyMetadata` (every APPn segment of the parsed stream
+ahead of the encoder's JFIF header, which an APP0 replaces; COM left out; empty
+markers if the stream was parsed without `save_metadata`);
 `nvjpegEncodeGetBufferSize`'s bound. `e2e_nvjpeg_paths` checks all of it --
 the decodes against the card's output by checksum -- and passes against
 NVIDIA's libnvjpeg 13.0 on the card and against this one. An encoded
@@ -1057,12 +1065,23 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   child that waits for its parent, hangs here where it runs on the card. A
   device-side `cudaMemsetAsync` fills with its value; the card's wrote zeros
   whatever it was.
-- **nvJPEG**: 12-bit samples, arithmetic coding, lossless and hierarchical
-  JPEG (refused by name, `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`); the hardware
-  backend and what only it does (`nvjpegDecodeBatchedEx`, scaled decodes,
-  applying an EXIF orientation, `nvjpegDecodeBatchedParseJpegTables`);
-  carrying metadata or Huffman tables from a parsed image into an encode; and
-  the transcoding entry points.
+- **nvJPEG**: decoding 12-bit (or any non-8-bit) samples, arithmetic coding,
+  lossless and hierarchical JPEG -- the card refuses all of them on its
+  default backend (`NVJPEG_STATUS_JPEG_NOT_SUPPORTED` at decode; arithmetic and
+  differential frames already at the parse) and so do we. The card has one
+  lossless path, the lossless backend through the batched API with 16-bit
+  interleaved output, and on the RTX 3060 it is not usable: for
+  predictor-1 streams it returns the right samples for the first ~40 bytes of
+  entropy-coded data and wrong ones after (checked against ffmpeg's decode of
+  the same files, with fixed-length and optimal tables, 8, 12 and 16 bits),
+  zeros for any stream with a restart interval, and
+  `NVJPEG_STATUS_JPEG_NOT_SUPPORTED` for predictors 2 to 7 and for 3-component
+  files; the simulator refuses lossless the same way (`JPEG_NOT_SUPPORTED`)
+  rather than invent that output. The hardware backend and what only it does
+  (`nvjpegDecodeBatchedEx`, scaled decodes, applying an EXIF orientation,
+  `nvjpegDecodeBatchedParseJpegTables`) is the card's `ARCH_MISMATCH`/refusal
+  on the default backend too; `nvjpegEncoderParamsCopyHuffmanTables` is a
+  no-op (the 13.0 library does not export it).
 
 Add them the way the PTX subset grew: hit one, implement it, prove it against
 hardware.
