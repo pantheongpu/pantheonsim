@@ -147,6 +147,16 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   if (auto it = lim.map.find("l2_cache_bytes"); it != lim.map.end() && it->second.kind == Value::Kind::Int)
     p.limits.l2_cache_bytes = static_cast<uint64_t>(it->second.i);
 
+  // Optional: the facts of the card CUDA reports beyond its limits.
+  if (auto it = doc.map.find("cuda"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::Map) fail(origin, "'cuda' must be a map");
+    const Value& c = it->second;
+    p.cuda.memory_bus_width_bits = static_cast<uint32_t>(opt_int(c, "memory_bus_width_bits", origin, 0));
+    p.cuda.clock_khz = static_cast<uint32_t>(opt_int(c, "clock_khz", origin, 0));
+    p.cuda.async_engine_count = static_cast<uint32_t>(opt_int(c, "async_engine_count", origin, 0));
+    p.cuda.persisting_l2_bytes = static_cast<uint64_t>(opt_int(c, "persisting_l2_bytes", origin, 0));
+  }
+
   // Optional: presentation-only values for monitoring tools.
   if (auto it = doc.map.find("telemetry"); it != doc.map.end()) {
     if (it->second.kind != Value::Kind::Map) fail(origin, "'telemetry' must be a map");

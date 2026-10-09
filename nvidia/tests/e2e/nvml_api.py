@@ -56,6 +56,17 @@ if len(sys.argv) > 2 and sys.argv[2] == "--described":
     mem = Memory()
     rc = lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(mem))
     check("memory is total and unused", rc == SUCCESS and mem.total > 0 and mem.used == 0, (rc, mem.total, mem.used))
+    # Free is what a program can still take: total less the driver's reserve less what is used.
+    # (Ollama sized a model by NVML's free memory and counted the reserve as its own.)
+    class Memory2(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint), ("total", ctypes.c_ulonglong), ("reserved", ctypes.c_ulonglong),
+                    ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+    m2 = Memory2()
+    m2.version = ctypes.sizeof(Memory2) | (2 << 24)
+    rc = lib.nvmlDeviceGetMemoryInfo_v2(h, ctypes.byref(m2))
+    check("memory v2: the driver's reserve is reported, and neither free nor used",
+          rc == SUCCESS and m2.reserved > 0 and m2.total == m2.reserved + m2.free + m2.used, (rc, m2.total, m2.reserved, m2.free, m2.used))
+    check("memory v1 free agrees", mem.free == m2.free, (mem.free, m2.free))
     check("shutdown", lib.nvmlShutdown() == SUCCESS)
     print(f"{fails} failed")
     sys.exit(1 if fails else 0)
