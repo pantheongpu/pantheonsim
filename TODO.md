@@ -1902,7 +1902,8 @@ signed 8-bit normalized texels (an exact fit), `sust.p`, device printf `%ls` and
 launch of clusters on SASS, and -- from PTX ISA 9.4, derived from the documentation and not checked
 against a card (no ptxas or GPU for sm_107) -- `spcompress`/`spdecompress`, `tcgen05.ld{.red}.spcompress`,
 `tcgen05.mma.kind::ti16`, `cvt` `.rz` / `.pzo` / `.scaled::n1::ue8m0`, the packed `.u8x4`/`.s8x4`/`.u16x2`/`.s16x2`
-integer instructions, K = 64 for the 8-bit tcgen05 kinds, the 128-lane scale-factor A layout, and UE4M3
+integer instructions (the SASS side of them on sm_120f compared with a host loop), the four-wide narrow-float
+`add`/`sub`/`mul`/`fma` of sm_100a and sm_103a (PTX engine only: ptxas refuses them), K = 64 for the 8-bit tcgen05 kinds, the 128-lane scale-factor A layout, and UE4M3
 with `.block32`. Not items at all: `wmma` has only `load`, `mma` and `store.d` in the ISA, and `.hi` exists
 only for `mul`, `mad`, `mul24` and `mad24`; the five "not implemented yet" faults in `src/sass/exec_ops.inc`
 are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking wait was done long ago.
