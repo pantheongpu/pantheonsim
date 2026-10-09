@@ -251,6 +251,7 @@ static void two_threads() {
 
 // A capture into a graph the program made fails like any other; the graph goes with it.
 static void to_graph() {
+#if CUDART_VERSION >= 12030  // cudaStreamBeginCaptureToGraph arrived in CUDA 12.3
   cudaStream_t cs;
   cudaStreamCreate(&cs);
   cudaGraph_t graph;
@@ -262,6 +263,7 @@ static void to_graph() {
   IS(cudaStreamEndCapture(cs, &out), cudaErrorStreamCaptureInvalidated);
   cudaGetLastError();
   cudaStreamDestroy(cs);
+#endif
 }
 
 int main() {

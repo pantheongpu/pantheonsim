@@ -79,7 +79,9 @@ static void no_context() {
   IS(cuCtxGetLimit(&lim, CU_LIMIT_STACK_SIZE), CUDA_ERROR_INVALID_CONTEXT);
   IS(cuCtxSetLimit(CU_LIMIT_STACK_SIZE, 1024), CUDA_ERROR_INVALID_CONTEXT);
   IS(cuCtxGetFlags(&f), CUDA_ERROR_INVALID_CONTEXT);
+#if CUDA_VERSION >= 12010  // cuCtxSetFlags arrived in CUDA 12.1
   IS(cuCtxSetFlags(0), CUDA_ERROR_INVALID_CONTEXT);
+#endif
   IS(cuCtxGetId(nullptr, &id), CUDA_ERROR_INVALID_CONTEXT);
   IS(cuCtxGetApiVersion(nullptr, &ver), CUDA_ERROR_INVALID_CONTEXT);
   IS(cuCtxGetStreamPriorityRange(&lo, &hi), CUDA_ERROR_INVALID_CONTEXT);
@@ -174,6 +176,7 @@ static void flags_and_ids() {
   // flags are accepted and not kept.
   CUcontext c;
   IS(make_ctx(&c, 0, dev), CUDA_SUCCESS);
+#if CUDA_VERSION >= 12010  // cuCtxSetFlags arrived in CUDA 12.1
   IS(cuCtxSetFlags(1), CUDA_SUCCESS);
   check(flags_of_current() == 1, "SetFlags(SPIN) is reported");
   IS(cuCtxSetFlags(4), CUDA_SUCCESS);
@@ -187,6 +190,7 @@ static void flags_and_ids() {
   IS(cuCtxSetFlags(3), CUDA_ERROR_INVALID_VALUE);
   IS(cuCtxSetFlags(0x100), CUDA_ERROR_INVALID_VALUE);
   check(flags_of_current() == 0x80, "a refused SetFlags changes nothing");
+#endif
   IS(cuCtxGetFlags(nullptr), CUDA_ERROR_INVALID_VALUE);
   // Ids count up from 1 in the order contexts are made.
   unsigned long long id1 = 0, id2 = 0, idnull = 0;
@@ -402,7 +406,9 @@ static void exported_memory() {
   IS(cuMemImportFromShareableHandle(&imp, reinterpret_cast<void*>(static_cast<intptr_t>(-1)), CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
      CUDA_ERROR_INVALID_DEVICE);
   IS(cuMemImportFromShareableHandle(nullptr, reinterpret_cast<void*>(3), CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR), CUDA_ERROR_INVALID_VALUE);
+#if CUDA_VERSION >= 12030  // fabric handles arrived in CUDA 12.3
   IS(cuMemImportFromShareableHandle(&imp, reinterpret_cast<void*>(3), CU_MEM_HANDLE_TYPE_FABRIC), CUDA_ERROR_NOT_SUPPORTED);
+#endif
   IS(cuMemImportFromShareableHandle(&imp, reinterpret_cast<void*>(3), static_cast<CUmemAllocationHandleType>(3)), CUDA_ERROR_INVALID_VALUE);
 
   if (attr(CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED) == 1) {

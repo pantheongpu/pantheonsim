@@ -619,7 +619,16 @@ if(CUDA_ABI_INCLUDE)
   target_include_directories(vgpumetis PRIVATE "${_metis_dir}/include" "${_metis_dir}/GKlib" "${_metis_dir}/libmetis")
   target_compile_definitions(vgpumetis PRIVATE LINUX _FILE_OFFSET_BITS=64 _GNU_SOURCE NDEBUG NDEBUG2)
   target_compile_options(vgpumetis PRIVATE -std=gnu99 -O2 -fno-strict-aliasing -fvisibility=hidden -w)
-  set_target_properties(vgpumetis PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+  # Never link-time optimized. The project-wide IPO setting makes every C
+  # object carry GIMPLE for the C compiler's LTO version, but the link is
+  # driven by the C++ compiler; when the two are different GCCs (CC=cc is
+  # gcc 11 beside CXX=g++-12 on Ubuntu 22.04) the link dies with "bytecode
+  # stream ... generated with LTO version 11.3 instead of the expected 12.0".
+  # METIS is plain C with nothing to inline across the C/C++ boundary, so
+  # plain machine-code objects lose nothing and link with any compiler.
+  set_target_properties(vgpumetis PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
+                        INTERPROCEDURAL_OPTIMIZATION OFF)
+  target_compile_options(vgpumetis PRIVATE -fno-lto)
   target_sources(vgpucusolver PRIVATE $<TARGET_OBJECTS:vgpumetis>)
   target_include_directories(vgpucusolver PRIVATE "${_metis_dir}/include")
   target_link_libraries(vgpucusolver PRIVATE m)
@@ -1028,7 +1037,10 @@ libcutensor.2.7.0 {
     message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
     add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp)
     target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
-    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE} nvidia/src)
+    # nvenc_api.cpp includes cuda_runtime.h: with the toolkit outside the
+    # compiler's default include path (NVIDIA's repository installs under
+    # /usr/local/cuda-X.Y) it is only found through CUDA_ABI_INCLUDE.
+    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE} ${CUDA_ABI_INCLUDE} nvidia/src)
     set_target_properties(vgpunvenc PROPERTIES OUTPUT_NAME nvidia-encode SOVERSION 1)
     add_custom_command(TARGET vgpunvenc POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"

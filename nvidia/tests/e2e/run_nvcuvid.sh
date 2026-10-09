@@ -50,8 +50,13 @@ else
   if [[ ! -e "$shim/libnvcuvid.so.1" ]]; then
     echo "SKIP: libvgpunvcuvid not built (the CUDA ABI headers were absent at build time)"; exit 0
   fi
+  # The shim holds libnvcuvid.so.1 only, like the driver; -lnvcuvid wants the
+  # unversioned name (a machine with the driver's dev symlink found that one,
+  # a CI runner without it failed to link), so name it from a directory of ours.
+  mkdir -p "$out.lib"
+  ln -sf "$shim/libnvcuvid.so.1" "$out.lib/libnvcuvid.so"
   # shellcheck disable=SC2207
-  flags+=($(shim_sanitizer_nvcc_flags "$shim") -L "$shim")
+  flags+=($(shim_sanitizer_nvcc_flags "$shim") -L "$out.lib" -L "$shim")
   env_prefix=(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim" "VGPU_E2E_DATA=$data")
 fi
 nvcc "${flags[@]}" "$here/nvcuvid_paths.cpp" -o "$out" -ldl -lcuda -lnvcuvid
