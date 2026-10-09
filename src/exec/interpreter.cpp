@@ -13453,10 +13453,13 @@ void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetc
              "in a way that rounds differently from every pipeline tried (about one fetch in ten differs by 1-2 "
              "256ths of a level); a power of two is exact");
   const double w = d.width, h = one_d ? 1.0 : d.height;
-  auto c = [](uint32_t bits) { return tex_grad::component(std::bit_cast<float>(bits)); };
+  // A gradient in texels of the base level; an infinite gradient (1e300 here) times a size stays finite.
+  auto c = [](uint32_t bits, double scale) {
+    return std::clamp(tex_grad::component(std::bit_cast<float>(bits)) * scale, -1e300, 1e300);
+  };
   g.explicit_lod = true;
-  g.lod = static_cast<double>(tex_grad::lod_q_2d(c(f.ddx[0]) * w, one_d ? 0.0 : c(f.ddx[1]) * h, c(f.ddy[0]) * w,
-                                                 one_d ? 0.0 : c(f.ddy[1]) * h)) / 256.0;
+  g.lod = static_cast<double>(tex_grad::lod_q_2d(c(f.ddx[0], w), one_d ? 0.0 : c(f.ddx[1], h), c(f.ddy[0], w),
+                                                 one_d ? 0.0 : c(f.ddy[1], h))) / 256.0;
   fetch_texel(mem, d, g, out);
 }
 

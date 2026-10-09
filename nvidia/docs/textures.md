@@ -300,7 +300,7 @@ against the array's own format, then the view.
 
 The level of detail of a fetch with explicit gradients (`tex2DGrad` and friends) is derived from them by the
 texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D and 2D textures, layered or
-not, of power-of-two size (the program `texture_grad` hashes 96,000 fetches of the card on both engines). It was
+not, of power-of-two size (the program `texture_grad` hashes 288,000 fetches of the card on both engines). It was
 found by reading the level of detail straight off the card: a mipmapped texture whose level k holds the constant
 k, filtered trilinearly, returns the LOD in 1/256ths of a level itself, and about 5 million such fetches (random
 and gridded gradients of every size, sign and relation) were fitted. What the card does is in

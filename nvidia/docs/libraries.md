@@ -928,6 +928,32 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
   pattern that depends on the image width and none of the shapes tried fits
   (it is under 0.5% of a 512x512 image for the skull and teapot, a few tenths
   of a percent for rocks); the simulator writes them.
+- **Why the equal-value labels are not exact: NPP merges in 16-pixel tiles and does not finish.** Round 4
+  probed it with about 15,000 one-row images of 3 values, flat images of every width and 4-way images of both
+  shapes (`tools/probes/npp_watershed_probe.cu` prints what the card writes; compare with the model in
+  `npp_core.hpp`). What was found, none of it reproduced:
+  - the rules of `npp_core.hpp` are exact on every row of up to 16 pixels (every row of 2 to 8 pixels of 3
+    values was compared) except those that start with two equal pixels and a different third (`a a b ...`):
+    then the region holding pixel 0 is labelled 1, not 0, and a pixel 0 that was a separate root joins its
+    neighbour's region. (`a a a b`, `a b ...` and a pair anywhere else, a tile start at x = 16 included, are
+    as the model has them);
+  - the pull rule (a pixel whose two lowest neighbours are tied makes a root take the other one's pixel index as a
+    label) holds inside a tile; across a tile border (the pixel at x = 15 with a non-root at 14 and a root at 16)
+    the root keeps the plain label (the pixel index above and to its left), 15 instead of the model's 14;
+  - **a plateau wider than a tile is not always merged into one label.** A flat row of width w (any value) comes
+    back as one label 0 up to a position and then as strips: for every w up to 600 the strips start at the
+    positions x = c + 16 k that are at least x0 and below w, where (c, x0) is (0, 48) for w mod 16 in 0..4,
+    (5, 37) for 5..9, (6, 70) for 10 and (11, 59) for 11..15, and the strips are labelled 14, 30, 46, ... in order
+    (16 i + 14, wherever they start). Taller flat images split into column and row strips the same way, but at
+    other positions (a 256 x 100 one at x = 221, 237, 253: the positions depend on the height too), and on the
+    teapot the black background is one label up to x = 495 and another (14) from x = 496 on, in every row of the
+    top 69. The labels are merged through some number of passes that leaves a width-dependent remainder;
+  - **4-way connectivity**: the pixels that differ from the model's segmented image lie in a band of columns
+    and a band of rows that depend on the width and on the height separately (a 16 x 16 image: columns and rows
+    9..13; 20 x 20: 11..13; 32 wide: 25..27; 64 wide: 61, 62; 40 wide: 37, 38). In the bands a pixel takes its lowest
+    neighbour's value after one step, not after following the chain to the root; the labels there follow.
+  The segmented image is exact for 8-way connectivity regardless; the compressed labels of the Samples' images
+  differ because a label that differs moves every rank after it.
 - Label compression is exact for any label image: labels below
   `nStartingNumber` take their rank among the labels present plus 0, which is
   always counted, so 0 stays 0, an image with no 0 starts at 1 and
