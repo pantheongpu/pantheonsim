@@ -204,30 +204,45 @@ NVIDIA's). Enabled domains and callbacks are delivered as the call happens:
   program passed; the activity `RUNTIME` records cover every call. A function
   that takes no arguments is delivered with no structure, as on the card.
   `run_cupti_case.sh params` compares the structures of about
-  100 calls, field by field, with the card's.
+  130 calls, field by field, with the card's. Every row also checks that the
+  runtime passed arguments of the sizes the toolkit's fields have (as the
+  driver's do), and every exported runtime function is reported
+  (`lint_cupti_coverage`): the pool-sharing, external-memory and
+  external-semaphore calls, the GPUDirect flush and the kernel-node attributes
+  were not until this check existed.
+
+  A shim built against the CUDA 12.x headers (12.3 to 12.9) also exports the
+  `_v2` / `_v3` spellings those toolkits use for the edge-data graph calls,
+  the capture queries, prefetch and advise, and reports each under that name,
+  with the callback id whose name carries it (`cudaGraphAddNode_v2_v12030`):
+  measured on an RTX 3060 with the CUDA 12.8 runtime and CUPTI, which
+  `run_cupti_case.sh compat12` compares (`CUPTI_CUDA12_ROOT=<dir with include/
+  and lib64/>` builds it with g++ against such a toolkit where only its
+  libraries are at hand). The CUDA 13 headers give those functions the plain
+  names, and a 13 shim reports them so.
 - **NVTX**: one callback per call, before it, with the toolkit's parameter structures.
-- **Driver API**: the same, for the calls a program makes itself. Delivered
-  for the ~55 whose structures are filled completely, under NVIDIA's own
-  spelling of each (`functionName` is `cuMemAlloc_v2`, as `cuptiGetCallbackName`
-  gives it):
-  `cuInit`, `cuDeviceGet`, `cuDeviceGetCount`, `cuDeviceGetName`,
-  `cuDeviceGetAttribute`, `cuDeviceTotalMem_v2`, `cuDeviceComputeCapability`;
-  `cuCtxCreate_v2` / `_v3` / `_v4`, `cuCtxDestroy_v2`, `cuCtxSetCurrent`,
-  `cuCtxGetCurrent`, `cuCtxSynchronize`; `cuMemAlloc_v2`, `cuMemFree_v2`,
-  `cuMemAllocHost_v2`, `cuMemFreeHost`, `cuMemHostAlloc`; the host-to-device,
-  device-to-host and device-to-device copies in `_v2` and `Async_v2` spellings;
-  `cuMemsetD8` / `D16` / `D32` (`_v2`) and their `Async` forms;
-  `cuModuleLoad`, `LoadData`, `LoadDataEx`, `LoadFatBinary`, `GetFunction`,
-  `Unload`; `cuLaunchKernel` (with `symbolName`); `cuStreamCreate`,
-  `CreateWithPriority`, `Destroy_v2`, `Synchronize`, `WaitEvent`, `Query`;
-  `cuEventCreate`, `Record`, `Synchronize`, `Query`, `Destroy_v2`,
-  `ElapsedTime` (and `_v2` where the toolkit has it). The callback-id table is
-  read from the toolkit's `cupti_driver_cbid.h` at configure time, as the
-  runtime's is. The pre-CUDA 3.2 spellings (`cuMemAlloc`, whose parameters are
-  32-bit) are not reported. Other driver calls are in neither the callbacks nor
-  the activity records; the work they issue (a kernel launched with
-  `cuLaunchCooperativeKernel`, a copy made with `cuMemcpy`) still is, with a
-  correlation id of its own.
+- **Driver API**: the same, for the calls a program makes itself: every driver
+  function the shim exports that the toolkit gives a callback id (about 310,
+  under NVIDIA's own spelling of each: `functionName` is `cuMemAlloc_v2`, as
+  `cuptiGetCallbackName` gives it). The parameter structures are the toolkit's
+  own, made from its `generated_cuda_meta.h` at configure time
+  (`scripts/gen_cupti_driver_conv.py`) the way the runtime's are, plus the ~55
+  written by hand and checked first (`cuInit`, `cuDeviceGet*`, `cuCtxCreate_v2` /
+  `_v3` / `_v4`, the allocations and copies in `_v2` and `Async_v2` spellings,
+  `cuModule*`, `cuLaunchKernel` with `symbolName`, streams and events). The
+  callback-id table is read from the toolkit's `cupti_driver_cbid.h`. A function
+  whose structure has an array, a bit-field or a function-pointer declarator for a
+  field is not delivered as a callback (the `DRIVER` activity record still has
+  it). Every generated row also checks, call by call, that the shim passed as many
+  arguments of the sizes the toolkit's fields have, and a call that did not is not
+  delivered (`VGPU_TRACE=1` says which): the pre-CUDA 3.2 spellings (`cuMemAlloc`,
+  whose parameters are 32-bit) are the calls that fall here, and still make their
+  `DRIVER` records. `lint_driver_arg_sizes` compiles the shim's declarations
+  against the toolkit's `cuda.h` and fails if any argument differs in size, and
+  `lint_cupti_coverage` fails if a runtime or driver export is neither reported
+  to a profiler nor listed with the reason it is not.
+  `run_cupti_case.sh driver_params` calls about 150 driver functions of every
+  family and compares each callback's fields and result with the card's.
 - **Resource**, every callback id the toolkit names for these:
   * context created, and destroyed (`CONTEXT_DESTROY_STARTING`, for a driver
     context and for a runtime program at `cudaDeviceReset`, which first tells
@@ -342,7 +357,9 @@ first correlation id seen, so only which records share an id is compared):
 | case | what it compares with the card |
 | --- | --- |
 | `trace`, `nvtx`, `extcorr` | callbacks and records of both APIs; NVTX; external correlation |
-| `params` | the parameter structure of about 100 runtime calls, field by field (197 lines) |
+| `params` | the parameter structure of about 130 runtime calls, field by field, and what they return (251 lines) |
+| `driver_params` | the same for about 150 driver calls of a driver-only program |
+| `compat12` | the CUDA 12.3-12.9 spellings (`cudaGraphAddNode_v2`, `cudaStreamGetCaptureInfo_v3`, `cudaMemPrefetchAsync_v2`, ...) on a shim built against 12.x, against a CUDA 12.8 CUPTI on the card; SKIPs with any other toolkit |
 | `memory` | allocation, release and pool records, and the older memory kind |
 | `graph` | graph ids, graph-trace records, and the graph resource callbacks |
 | `resource` | module, stream-attribute and context callbacks; context, stream and function records |

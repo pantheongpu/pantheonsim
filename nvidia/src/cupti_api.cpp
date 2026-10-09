@@ -1815,7 +1815,11 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   // The arguments are what the parameter structure is built from; without
   // them there is nothing true to put in it.
   if (conv.fill && !info.args) return;
-  if (conv.nargs >= 0 && info.nargs != conv.nargs) return;
+  if (conv.nargs >= 0 && info.nargs != conv.nargs) {
+    CUPTI_TRACE("%s not delivered to callbacks: %d arguments, the toolkit's structure has %d", info.name, info.nargs,
+                conv.nargs);
+    return;
+  }
   // A field is filled from the argument's bytes, so a field the toolkit makes
   // of another size than the argument is not delivered rather than filled from
   // the wrong bytes.
