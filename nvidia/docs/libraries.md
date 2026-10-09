@@ -189,24 +189,28 @@ the card's), and `nvidia/tests/e2e/nvcuvid_paths.cpp` with
 `nvcuvid_paths.rtx3060.txt` (293 lines). `run_nvenc.sh --card` and
 `run_nvcuvid.sh --card` run the same programs against the real libraries.
 
-**NVENC.** The encoder is not NVIDIA's. An H.264 frame is written as a Baseline
-IDR picture whose every macroblock is I_PCM (`nvidia/src/nvenc_h264.hpp`,
-written from ITU-T H.264): lossless, conformant, and read back exactly by
-ffmpeg (`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR at sizes that
-are not multiples of 16 and are odd, and compares every decoded sample;
-`test_nvenc_h264` does the same with a decoder of its own, no ffmpeg needed).
-It is not compression, and rate control, GOP structure, B-frames and every
-preset setting are accepted and change nothing; every picture is an IDR with
-one `idr_pic_id`, so encoding a frame twice gives the same bytes, which
-encoder SDC tests (pantheon's `media_enc_virus`) rely on. RGB input is converted
-with the BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input
-is refused (`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it. HEVC is
-the API surface only: a session opens, answers its queries and takes every
-input format, but the bytes it returns are a stand-in (a short header and a hash
-of each tile of the input) with the same determinism, not an HEVC stream; a
-real one needs a CABAC writer that is not here. The card's own streams
-(I then P frames) decode with ffmpeg too, which is how the layouts above were
-checked.
+**NVENC.** The encoder is not NVIDIA's. A frame is written as an IDR picture
+whose every coding unit is PCM: macroblocks in H.264 (CAVLC,
+`nvidia/src/nvenc_h264.hpp`, written from ITU-T H.264) and 16x16 coding tree
+blocks in HEVC (`nvidia/src/nvenc_hevc.hpp`, written from ITU-T H.265, with the
+CABAC encoder HEVC cannot do without: one context-coded bin, `split_cu_flag`, and
+the terminate bins for `pcm_flag` and `end_of_slice_segment_flag`). Both are
+lossless and conformant, and read back exactly by ffmpeg
+(`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR through both codecs at
+sizes that are not multiples of 16 and are odd, up to 4K in the HEVC writer's own
+check, and compares every decoded sample); `test_nvenc_h264` and
+`test_nvenc_hevc` do the same with decoders of their own, no ffmpeg needed. It is
+not compression, and rate control, GOP structure, B-frames and every preset
+setting are accepted and change nothing; every picture is an IDR with one
+`idr_pic_id`, so encoding a frame twice gives the same bytes, which encoder SDC
+tests (pantheon's `media_enc_virus`: 4K HEVC, ARGB, forced IDR with the
+parameter sets on every frame, the first bitstream compared with each later one)
+rely on; `nvenc_encode.cu` replays that flow. RGB input is converted with the
+BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input is refused
+(`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it; AV1 sessions are
+refused at initialisation as the card refuses them. The card's own streams (an
+IDR, then P pictures) decode with ffmpeg too, which is how the layouts above
+were checked.
 
 **NVDEC.** Motion JPEG is a sequence of independent JPEG pictures, and the
 simulator has a JPEG decoder, so `cudaVideoCodec_JPEG` is decoded on the host
@@ -368,7 +372,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring, watershed segmentation -- every entry point OpenCV, DALI, FFmpeg, jetson-utils and the CUDA Samples call (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
-| NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; H.264 frames written as lossless I_PCM streams any decoder reads, HEVC sessions with a stand-in bitstream (below) |
+| NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; H.264 and HEVC frames written as lossless PCM streams any decoder reads (below) |
 | NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
 
 ## Why the math runs on the host
@@ -1101,12 +1105,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `nvcomp::LZ4CPUManager`; streaming gzip decompression (the card refuses it
   too: no hardware decompression engine); and the hardware decompression
   engine itself (the backend option is accepted; everything runs on the host).
-- **NVENC**: HEVC (and AV1) bitstreams -- an HEVC session answers every query
-  and takes frames, returning a deterministic stand-in rather than a stream --
-  10-bit and 4:4:4 encoding (`NV_ENC_ERR_UNSUPPORTED_PARAM`), motion-only
-  encoding, asynchronous mode (refused with the card's message), and real
-  compression: H.264 frames are lossless I_PCM IDR pictures. P and B pictures
-  and rate control act on nothing.
+- **NVENC**: AV1 (refused at initialisation, as on the card), 10-bit and 4:4:4
+  encoding (`NV_ENC_ERR_UNSUPPORTED_PARAM`), motion-only encoding, asynchronous
+  mode (refused with the card's message), and real compression: H.264 and HEVC
+  frames are lossless PCM IDR pictures, and P and B pictures, rate control, lookahead
+  and the preset act on nothing. The bytes are not NVIDIA's.
 - **NVDEC**: every codec but JPEG (reported unsupported), progressive JPEG
   (the card refuses it too), display-area and target-rectangle cropping,
   deinterlacing, output formats other than NV12 (the card refuses those), video

@@ -11,25 +11,18 @@
 // the locked bitstream's fields, sequence parameters, reconfiguration, and the
 // calls that are NVIDIA's "not supported here" on this part.
 //
-// What is not NVIDIA's: the encoder. An H.264 frame is written as an IDR
-// picture whose every macroblock is I_PCM (nvenc_h264.hpp): a conformant,
-// lossless stream any H.264 decoder returns the input from (ffmpeg's does:
-// nvidia/tests/e2e/nvenc_h264.cpp), but not compression -- rate control, GOP
-// structure, B-frames, the preset and every quality setting are accepted and
-// change nothing, and every picture is an IDR with the same idr_pic_id, so
-// encoding a frame twice gives the same bytes (encoder SDC tests compare a
-// golden bitstream). The input is 8-bit 4:2:0 (NV12, YV12, IYUV) or 32-bit RGB
-// (ARGB, ABGR; converted to BT.601 limited-range YCbCr, the matrix the card
-// applies); the 10-bit and 4:4:4 formats the card takes are refused.
-//
-// HEVC is the API surface only: a session opens, answers every query and takes
-// every input format the card does, but the bytes it returns are a stand-in --
-// a short header and a hash of each 64-row, 256-byte tile of the input -- not an
-// HEVC stream, no decoder reads them. They have the one property encoder
-// stress and SDC checks rely on (the same frame encodes to the same bytes and
-// any changed byte changes them), which is what keeps the pantheon workload
-// media_enc_virus (4K HEVC, ARGB, forced IDR) running. A conformant HEVC stream
-// needs a CABAC writer that is not here.
+// What is not NVIDIA's: the encoder. A frame is written as an IDR picture whose
+// every coding unit is PCM: macroblocks in H.264 (nvenc_h264.hpp, CAVLC) and
+// 16x16 coding tree blocks in HEVC (nvenc_hevc.hpp, with the CABAC encoder HEVC
+// requires). Both are conformant, lossless streams any decoder returns the input
+// from (ffmpeg's do: nvidia/tests/e2e/nvenc_h264.cpp), but not compression --
+// rate control, GOP structure, B-frames, the preset and every quality setting are
+// accepted and change nothing, and every picture is an IDR, with one idr_pic_id,
+// so encoding a frame twice gives the same bytes (encoder SDC tests compare a
+// golden bitstream, as pantheon's media_enc_virus does with a forced IDR and the
+// parameter sets on every frame). The input is 8-bit 4:2:0 (NV12, YV12, IYUV) or
+// 32-bit RGB (ARGB, ABGR; converted to BT.601 limited-range YCbCr, the matrix the
+// card applies); the 10-bit and 4:4:4 formats the card takes are refused.
 #include <cuda_runtime.h>
 #include <nvEncodeAPI.h>
 
@@ -48,6 +41,7 @@
 #include <vector>
 
 #include "nvenc_h264.hpp"
+#include "nvenc_hevc.hpp"
 
 #include "nvenc_tables.inc"
 
@@ -785,35 +779,26 @@ Frame read_frame(const uint8_t* dev, uint32_t pitch, uint32_t fmt, int w, int h,
   return f;
 }
 
-// The HEVC stand-in: FNV-1a over each tile of 64 rows by 256 bytes of the buffer (all of
-// it, chroma and padding included), after a short header. See the top of the file.
-std::vector<uint8_t> content_stream(const std::vector<uint8_t>& frame, uint32_t pitch, uint32_t rows, uint32_t width, uint32_t height) {
-  std::vector<uint8_t> out = {0x00, 0x00, 0x00, 0x01, 'V', 'G', 'P', 'U'};
-  auto push32 = [&out](uint32_t v) {
-    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
-  };
-  push32(width);
-  push32(height);
-  constexpr uint32_t kTileRows = 64, kTileBytes = 256;
-  for (uint32_t ty = 0; ty < rows; ty += kTileRows)
-    for (uint32_t tx = 0; tx < pitch; tx += kTileBytes) {
-      uint32_t h = 2166136261u;
-      for (uint32_t y = ty; y < std::min(ty + kTileRows, rows); ++y) {
-        const uint8_t* row = frame.data() + static_cast<size_t>(y) * pitch;
-        for (uint32_t x = tx; x < std::min(tx + kTileBytes, pitch); ++x) h = (h ^ row[x]) * 16777619u;
-      }
-      push32(h);
-    }
-  return out;
+std::vector<uint8_t> parameter_sets_of(int codec, int width, int height, uint32_t rate_num, uint32_t rate_den) {
+  const int fps_num = rate_num ? static_cast<int>(rate_num) : 30, fps_den = rate_den ? static_cast<int>(rate_den) : 1;
+  if (codec == kHevc) {
+    vgpu_nvenc::HevcStream st;
+    st.width = width;
+    st.height = height;
+    st.fps_num = fps_num;
+    st.fps_den = fps_den;
+    return st.parameter_sets();
+  }
+  vgpu_nvenc::H264Stream st;
+  st.width = width;
+  st.height = height;
+  st.fps_num = fps_num;
+  st.fps_den = fps_den;
+  return st.parameter_sets();
 }
 
 std::vector<uint8_t> parameter_sets(const Session& s) {
-  vgpu_nvenc::H264Stream st;
-  st.width = static_cast<int>(s.width);
-  st.height = static_cast<int>(s.height);
-  st.fps_num = s.init.frameRateNum ? static_cast<int>(s.init.frameRateNum) : 30;
-  st.fps_den = s.init.frameRateDen ? static_cast<int>(s.init.frameRateDen) : 1;
-  return st.parameter_sets();
+  return parameter_sets_of(s.codec, static_cast<int>(s.width), static_cast<int>(s.height), s.init.frameRateNum, s.init.frameRateDen);
 }
 
 }  // namespace
@@ -824,7 +809,6 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParams(void* encoder, NV_ENC_SE
   if (!version_ok(params->version, NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER)) return NV_ENC_ERR_INVALID_VERSION;
   if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
   if (!params->spsppsBuffer || !params->outSPSPPSPayloadSize) return NV_ENC_ERR_INVALID_PARAM;
-  if (s->codec != kH264) return NV_ENC_ERR_UNSUPPORTED_PARAM;
   const std::vector<uint8_t> ps = parameter_sets(*s);
   if (params->inBufferSize < ps.size()) return NV_ENC_ERR_OUT_OF_MEMORY;
   std::memcpy(params->spsppsBuffer, ps.data(), ps.size());
@@ -862,28 +846,6 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   } else {
     return NV_ENC_ERR_INVALID_PARAM;
   }
-  if (s->codec != kH264) {
-    // HEVC: the stand-in stream (see the top of this file): a header and one hash per
-    // tile of the whole input buffer, whatever its format.
-    static bool said = false;
-    if (!said && !quiet()) {
-      said = true;
-      std::fprintf(stderr, "[vgpu] NVENC: HEVC output is a deterministic stand-in (a hash of each tile of the frame), not an HEVC stream\n");
-    }
-    if (in_w == 0 || in_h == 0) return NV_ENC_ERR_INVALID_PARAM;
-    const uint32_t rows = buffer_rows(fmt, in_h);
-    std::vector<uint8_t> frame(static_cast<size_t>(pitch) * rows);
-    if (cudaMemcpy(frame.data(), dev, frame.size(), cudaMemcpyDefault) != cudaSuccess) {
-      cudaGetLastError();
-      return NV_ENC_ERR_INVALID_PARAM;
-    }
-    std::vector<uint8_t> bits = content_stream(frame, pitch, rows, static_cast<uint32_t>(std::min<uint32_t>(s->width, in_w)),
-                                               static_cast<uint32_t>(std::min<uint32_t>(s->height, in_h)));
-    s->sent_parameter_sets = true;
-    s->outputs.find(params->outputBitstream)->second->pending.push_back(
-        {std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps});
-    return NV_ENC_SUCCESS;
-  }
   if (!encodable(fmt)) {
     if (!quiet()) std::fprintf(stderr, "[vgpu] NVENC: this input format is not encoded by VirtualGPU (8-bit 4:2:0 and 32-bit RGB only)\n");
     return NV_ENC_ERR_UNSUPPORTED_PARAM;
@@ -893,19 +855,32 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   const int w = static_cast<int>(std::min<uint32_t>(s->width, in_w)), h = static_cast<int>(std::min<uint32_t>(s->height, in_h));
   if (w <= 0 || h <= 0) return NV_ENC_ERR_INVALID_PARAM;
   const Frame f = read_frame(dev, pitch, fmt, w, h, in_h);
-  vgpu_nvenc::H264Stream st;
-  st.width = w;
-  st.height = h;
-  st.fps_num = s->init.frameRateNum ? static_cast<int>(s->init.frameRateNum) : 30;
-  st.fps_den = s->init.frameRateDen ? static_cast<int>(s->init.frameRateDen) : 1;
-  std::vector<uint8_t> bits;
-  const bool first = !s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.h264Config.repeatSPSPPS;
-  if (first) bits = st.parameter_sets();
+  const int rate_num = s->init.frameRateNum ? static_cast<int>(s->init.frameRateNum) : 30;
+  const int rate_den = s->init.frameRateDen ? static_cast<int>(s->init.frameRateDen) : 1;
+  const auto luma = [&](int x, int y) { return f.y[static_cast<size_t>(y) * f.w + x]; };
+  const auto chroma = [&](int plane, int x, int y) { return (plane ? f.v : f.u)[static_cast<size_t>(y) * f.cw + x]; };
+  std::vector<uint8_t> bits, picture;
+  if (s->codec == kHevc) {
+    vgpu_nvenc::HevcStream st;
+    st.width = w;
+    st.height = h;
+    st.fps_num = rate_num;
+    st.fps_den = rate_den;
+    if (!s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.hevcConfig.repeatSPSPPS)
+      bits = st.parameter_sets();
+    picture = st.idr(luma, chroma);
+  } else {
+    vgpu_nvenc::H264Stream st;
+    st.width = w;
+    st.height = h;
+    st.fps_num = rate_num;
+    st.fps_den = rate_den;
+    if (!s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.h264Config.repeatSPSPPS)
+      bits = st.parameter_sets();
+    picture = st.idr(luma, chroma, 0);
+  }
   s->sent_parameter_sets = true;
-  const std::vector<uint8_t> idr = st.idr([&](int x, int y) { return f.y[static_cast<size_t>(y) * f.w + x]; },
-                                          [&](int plane, int x, int y) { return (plane ? f.v : f.u)[static_cast<size_t>(y) * f.cw + x]; },
-                                          0);
-  bits.insert(bits.end(), idr.begin(), idr.end());
+  bits.insert(bits.end(), picture.begin(), picture.end());
   Output& o = *out->second;
   o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps});
   return NV_ENC_SUCCESS;
@@ -1015,14 +990,11 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParamEx(void* encoder, NV_ENC_I
   if (!init || !params) return NV_ENC_ERR_INVALID_PTR;
   if (!version_ok(params->version, NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER)) return NV_ENC_ERR_INVALID_VERSION;
   if (!params->spsppsBuffer || !params->outSPSPPSPayloadSize) return NV_ENC_ERR_INVALID_PARAM;
-  if (codec_of(init->encodeGUID) != kH264) return NV_ENC_ERR_UNSUPPORTED_PARAM;
-  vgpu_nvenc::H264Stream st;
-  st.width = static_cast<int>(init->encodeWidth);
-  st.height = static_cast<int>(init->encodeHeight);
-  st.fps_num = init->frameRateNum ? static_cast<int>(init->frameRateNum) : 30;
-  st.fps_den = init->frameRateDen ? static_cast<int>(init->frameRateDen) : 1;
-  if (st.width <= 0 || st.height <= 0) return NV_ENC_ERR_INVALID_PARAM;
-  const std::vector<uint8_t> ps = st.parameter_sets();
+  const int codec = codec_of(init->encodeGUID);
+  if (codec == kNoCodec) return NV_ENC_ERR_UNSUPPORTED_PARAM;
+  if (init->encodeWidth == 0 || init->encodeHeight == 0) return NV_ENC_ERR_INVALID_PARAM;
+  const std::vector<uint8_t> ps = parameter_sets_of(codec, static_cast<int>(init->encodeWidth), static_cast<int>(init->encodeHeight),
+                                                    init->frameRateNum, init->frameRateDen);
   if (params->inBufferSize < ps.size()) return NV_ENC_ERR_OUT_OF_MEMORY;
   std::memcpy(params->spsppsBuffer, ps.data(), ps.size());
   *params->outSPSPPSPayloadSize = static_cast<uint32_t>(ps.size());

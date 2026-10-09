@@ -255,7 +255,7 @@ int main() {
   }
 
   const uint32_t width = 256, height = 128;
-  // H.264 is a real (I_PCM) stream; HEVC a deterministic stand-in (see nvenc_api.cpp).
+  // Both codecs write real (PCM) streams; nvenc_h264.cpp decodes them.
   for (const GUID& codec : {NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID}) {
     if (&codec != &NV_ENC_CODEC_H264_GUID) {
       // A session of its own for each codec.

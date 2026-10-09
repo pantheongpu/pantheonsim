@@ -1,9 +1,10 @@
-// NVENC's H.264 output, read back by an independent decoder (ffmpeg).
+// NVENC's H.264 and HEVC output, read back by an independent decoder (ffmpeg).
 //
 // Frames of known content are encoded through the NVENC API -- NV12, YV12, IYUV
 // and the 32-bit RGB formats, at sizes that are and are not multiples of 16 and
 // not even -- and the stream is decoded with ffmpeg. VirtualGPU's encoder writes
-// lossless I_PCM macroblocks, so the decoded samples must equal the input exactly
+// lossless PCM coding units (macroblocks, or 16x16 coding tree blocks in HEVC),
+// so the decoded samples must equal the input exactly
 // (RGB input: the BT.601 limited-range conversion the card's encoder applies, to
 // within one level); with --lossy, which is for NVIDIA's real library, the encoder
 // is lossy and the check is a peak signal-to-noise ratio of at least 30 dB.
@@ -154,17 +155,22 @@ int main(int argc, char** argv) {
   cuCtxGetCurrent(&ctx);
 
   const std::string tmp = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/vgpu_nvenc_h264_" + std::to_string(getpid());
-  const std::string file = tmp + ".h264";
+  const std::string file = tmp + ".es";
 
   const struct {
     const char* name;
     NV_ENC_BUFFER_FORMAT fmt;
     int w, h;
+    bool hevc;
   } cases[] = {
-      {"NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128}, {"NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49},
-      {"NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65},   {"YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100},
-      {"IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180}, {"IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51},
-      {"ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128}, {"ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70}};
+      {"H.264 NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false}, {"H.264 NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false},
+      {"H.264 NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, false},   {"H.264 YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false},
+      {"H.264 IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, false}, {"H.264 IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, false},
+      {"H.264 ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false}, {"H.264 ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, false},
+      {"HEVC NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true},   {"HEVC NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, true},
+      {"HEVC NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, true},     {"HEVC YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, true},
+      {"HEVC IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, true},   {"HEVC IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, true},
+      {"HEVC ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, true},   {"HEVC ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, true}};
   constexpr int kFrames = 3;
   int failures = 0;
 
@@ -184,12 +190,13 @@ int main(int argc, char** argv) {
     NV_ENC_PRESET_CONFIG pc{};
     pc.version = NV_ENC_PRESET_CONFIG_VER;
     pc.presetCfg.version = NV_ENC_CONFIG_VER;
-    f.nvEncGetEncodePresetConfigEx(enc, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, &pc);
+    const GUID& codec = c.hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+    f.nvEncGetEncodePresetConfigEx(enc, codec, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, &pc);
     pc.presetCfg.gopLength = 30;
     pc.presetCfg.frameIntervalP = 1;   // no B frames: output order is coding order
     NV_ENC_INITIALIZE_PARAMS ip{};
     ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    ip.encodeGUID = codec;
     ip.presetGUID = NV_ENC_PRESET_P4_GUID;
     ip.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
     ip.encodeWidth = ip.darWidth = static_cast<uint32_t>(c.w);
@@ -316,10 +323,10 @@ int main(int argc, char** argv) {
 
     // Dimensions as the decoder reports them, then the frames.
     std::vector<uint8_t> dims, raw;
-    run_capture("ffprobe -v error -f h264 -select_streams v:0 -show_entries stream=width,height -of csv=p=0 " + file + " 2>&1", &dims);
+    run_capture(std::string("ffprobe -v error -f ") + (c.hevc ? "hevc" : "h264") + " -select_streams v:0 -show_entries stream=width,height -of csv=p=0 " + file + " 2>&1", &dims);
     int dw = 0, dh = 0;
     std::sscanf(std::string(dims.begin(), dims.end()).c_str(), "%d,%d", &dw, &dh);
-    const std::string err = run_capture("ffmpeg -v error -f h264 -i " + file + " -f rawvideo -pix_fmt yuv420p - 2>/dev/null", &raw);
+    const std::string err = run_capture(std::string("ffmpeg -v error -f ") + (c.hevc ? "hevc" : "h264") + " -i " + file + " -f rawvideo -pix_fmt yuv420p - 2>/dev/null", &raw);
     std::remove(file.c_str());
     if (!err.empty() || dw <= 0 || dh <= 0) {
       std::printf("FAIL %s: ffmpeg could not decode the stream (%s, %d bytes, dims %dx%d)\n", c.name, err.c_str(), static_cast<int>(stream.size()), dw, dh);
