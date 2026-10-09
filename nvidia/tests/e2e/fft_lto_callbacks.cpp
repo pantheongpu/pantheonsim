@@ -77,9 +77,13 @@ static int run() {
     // No toolkit nvJitLink to read LTO-IR with: the plan does not link.
     cufftHandle h2;
     const cufftResult rl = plan_with(&h2, CUFFT_C2C, n, "ld_scale", CUFFT_CB_LD_COMPLEX, d_scale, nullptr, 0);
+    cufftDestroy(h2);
     const cufftResult rs = plan_with(&h2, CUFFT_C2C, n, nullptr, 0, nullptr, "st_conj", CUFFT_CB_ST_COMPLEX);
     std::printf("SKIP: the plan with LTO-IR callbacks failed (%d; load alone %d, store alone %d); the host needs the CUDA "
                 "toolkit's libnvJitLink\n", (int)r, (int)rl, (int)rs);
+    cufftDestroy(h);
+    cufftDestroy(h2);
+    cudaFree(d_scale);
     return 0;
   }
   std::vector<cufftComplex> in(n);
@@ -165,6 +169,7 @@ static int run() {
   // A symbol the fatbin does not define: the plan does not link.
   r = plan_with(&h, CUFFT_C2C, n, "no_such_callback", CUFFT_CB_LD_COMPLEX, nullptr, nullptr, 0);
   check(r != CUFFT_SUCCESS, "a callback the image does not define fails the plan");
+  cufftDestroy(h);
   return failures ? 1 : 0;
 }
 #endif
