@@ -85,6 +85,10 @@ struct TextureDesc {
   // view over linear device memory. The distinction matters for diagnostics
   // only: both are ordinary memory here.
   bool from_array = false;
+  // Within one fetch only: the texel offsets (tex's operand e, -8..7 per
+  // axis, applied to the texel indices before the address mode), as
+  // fetch_texel copies them into its working descriptor.
+  int32_t fetch_offset[3] = {0, 0, 0};
 };
 
 // Handle -> descriptor, owned by the device and consulted during a launch.
@@ -110,6 +114,7 @@ struct TexFetch {
   bool explicit_lod = false;
   double lod = 0;
   int gather = -1;             // tld4: the component (0..3) gathered, or -1
+  int32_t offset[3] = {0, 0, 0};   // the offset operand's texels, already in range
 };
 // out: the four components (tld4: the four texels' component).
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]);
@@ -129,5 +134,13 @@ struct SurfaceAccess {
 // The address the access reads or writes, or none for a .zero access out of
 // range.
 std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a);
+
+// sust.p: the texel a formatted store writes, from the values of its R, G, B and A operands (as many
+// as the instruction gave: `n`). Each channel of the surface's format takes one: an unsigned channel
+// the value clamped to its range, a signed one the value as an s32 clamped to its range, a 32-bit
+// float channel the bits as they are and a 16-bit one the f32 rounded toward zero; a channel the
+// operands do not reach is written 0 (measured on an RTX 3060, over every CUDA surface format).
+// Returns the texel's bytes in out.
+uint32_t surface_pack_texel(const TextureDesc& d, const uint32_t* values, uint32_t n, uint8_t out[16]);
 
 }  // namespace vgpu::exec

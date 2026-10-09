@@ -1553,6 +1553,52 @@ class Parser {
         if (a->base_kind == Addr::Base::CallSlot || a->base_kind == Addr::Base::EntryParam)
           return unsupported(op0 + ".async through a parameter/slot name");
       ins.op = op;
+    } else if ((op0 == "add" || op0 == "sub" || op0 == "min" || op0 == "max" || op0 == "neg" || op0 == "set") &&
+               std::any_of(parts.begin() + 1, parts.end(), [](const std::string& p) {
+                 return p == "u8x4" || p == "s8x4" || p == "u16x2" || p == "s16x2";
+               })) {
+      // add{.sat}, sub{.sat}, neg, min{.relu}, max{.relu} and set.CmpOp on .u8x4/.s8x4/.u16x2/.s16x2
+      // (PTX ISA 8.0 for add/min/max.{u,s}16x2 on sm_90; 9.2 and 9.4 for the rest, sm_107f and sm_120f).
+      OpPackedInt op;
+      bool have_ty = false, have_cmp = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "u8x4" || p == "s8x4" || p == "u16x2" || p == "s16x2") {
+          op.lane_bits = p[1] == '8' ? 8 : 16;
+          op.is_signed = p[0] == 's';
+          have_ty = true;
+        } else if (p == "sat") op.sat = true;
+        else if (p == "relu") op.relu = true;
+        else if (op0 == "set" && cmp_table().count(p)) { op.cmp = cmp_table().at(p); have_cmp = true; }
+        else return unsupported(opcode + " modifier '." + p + "'");
+      }
+      (void)have_ty;
+      if (op0 == "set" && !have_cmp) fail(ins.line, "set needs a comparison");
+      op.kind = op0 == "add" ? PackedIntOp::Add : op0 == "sub" ? PackedIntOp::Sub : op0 == "neg" ? PackedIntOp::Neg
+                : op0 == "min" ? PackedIntOp::Min : op0 == "max" ? PackedIntOp::Max : PackedIntOp::Set;
+      if (op.kind == PackedIntOp::Neg && !(op.is_signed && op.lane_bits == 8)) return unsupported("neg on a packed type other than .s8x4");
+      if (op.kind == PackedIntOp::Sub && op.lane_bits == 16) return unsupported("sub on a 16-bit packed type (the ISA has .u8x4 and .s8x4)");
+      if (op.relu && (!op.is_signed || (op.kind != PackedIntOp::Min && op.kind != PackedIntOp::Max)))
+        return unsupported(".relu is for min and max on a signed packed type");
+      if (op.sat && op.kind != PackedIntOp::Add && op.kind != PackedIntOp::Sub) return unsupported(".sat on " + op0 + " of a packed type");
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        const bool v8 = op.lane_bits == 16 && !op.sat && (op.kind == PackedIntOp::Add || op.kind == PackedIntOp::Min || op.kind == PackedIntOp::Max);
+        const bool ok = v8 ? sm >= 90 : (sm == 107 || sm == 120 || sm == 121);
+        if (!ok)
+          fail(ins.line, opcode + (v8 ? " requires an sm_90 or later target; this module targets "
+                                      : " (PTX ISA 9.2 and 9.4) requires an sm_107f or sm_120f target; this module targets ") +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
+      op.dst = expect_reg_operand("destination");
+      expect_punct(",");
+      op.a = parse_operand();
+      if (op.kind != PackedIntOp::Neg) {
+        expect_punct(",");
+        op.b = parse_operand();
+      }
+      ins.op = std::move(op);
     } else if (op0 == "st" && parts.size() > 1 && parts[1] == "bulk") {
       // st.bulk{.weak}{.shared::cta} [a], size, initval (PTX ISA 9.7.10.14,
       // sm_100): zero `size` bytes of shared memory from a.
@@ -1812,7 +1858,7 @@ class Parser {
       std::string packed;  // "f16x2"/"bf16x2": two f32 sources packed into one register
       std::string fp8;     // the narrow side: e4m3x2, e2m1x2, ue8m0x2, s2f6x2, ...
       bool satfinite = false, sat = false, ftz = false, relu = false, scaled = false, tf32 = false,
-           rna = false;
+           rna = false, pzo = false, scaled_n1 = false;
       Round round = Round::None;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -1841,8 +1887,12 @@ class Parser {
           return unsupported("cvt.rs (stochastic rounding): for the x4 types the ISA's figures 41-42 "
                              "give a and b one shared field of random bits without saying how they "
                              "split it, so it is not implemented");
-        else if (p == "pzo" || p == "scaled::n1::ue8m0" || p == "ue5m3x2")
-          return unsupported("cvt ." + p + " (sm_107f) is not implemented");
+        else if (p == "pzo") pzo = true;
+        else if (p == "scaled::n1::ue8m0") scaled_n1 = true;
+        else if (p == "ue5m3x2")
+          return unsupported("cvt .ue5m3x2 (sm_107f): the ISA gives the format's width (5 exponent bits, 3 mantissa "
+                             "bits, no infinity, NaN 0xff) but not its exponent bias, so its values cannot be "
+                             "worked out from the documentation");
         else if (auto t2 = parse_type_token(p)) tys.push_back(*t2);
         else return unsupported("unrecognized cvt modifier '." + p + "'");
       }
@@ -1856,6 +1906,7 @@ class Parser {
         op.rz = round == Round::Rz;
         op.satfinite = satfinite;
         op.relu = relu;
+        op.pzo = pzo;
         op.dst = expect_reg_operand("cvt destination");
         expect_punct(",");
         op.src = parse_operand();
@@ -1864,6 +1915,16 @@ class Parser {
         return ins;
       }
       if (rna) return unsupported("cvt .rna is for tf32");
+      // PTX ISA 9.4's additions -- .pzo, .scaled::n1::ue8m0, and .rz to the narrow floating-point
+      // types -- are sm_107f's.
+      if (pzo || scaled_n1 || (round == Round::Rz && !fp8.empty() && fp8 != "ue8m0x2" && fp8 != "s2f6x2")) {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm != 107)
+          fail(ins.line, "cvt ." + std::string(pzo ? "pzo" : scaled_n1 ? "scaled::n1::ue8m0" : "rz to a narrow floating-point type") +
+                             " (PTX ISA 9.4) requires an sm_107a or sm_107f target; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
       if (!fp8.empty()) {
         OpCvtFp8 op;
         op.fmt = fp8 == "e4m3x2"  ? NarrowFmt::E4M3
@@ -1877,6 +1938,8 @@ class Parser {
         op.satfinite = satfinite;
         op.relu = relu;
         op.scaled = scaled;
+        op.scaled_n1 = scaled_n1;
+        op.pzo = pzo;
         // Which side of the dot the narrow type sat on decides the direction,
         // and `packed`/`tys` carry whatever the other side was.
         const size_t fp8_pos = opcode.find("." + fp8);
@@ -1893,19 +1956,19 @@ class Parser {
         if (!op.to_fp8 && op.src_f32_pair)
           return unsupported("cvt from " + fp8 + " to f32 (PTX unpacks to f16x2 or bf16x2)");
         // Rounding: .rn, and .rz for s2f6; ue8m0 is .rz or .rp. (.rz on the
-        // floating-point types is sm_107f's.)
+        // floating-point types is PTX ISA 9.4's, for sm_107f; derived from the
+        // documentation, not checked against a card.)
         const bool ue8m0 = op.fmt == NarrowFmt::UE8M0, s2f6 = op.fmt == NarrowFmt::S2F6;
         op.rz = round == Round::Rz;
         op.rp = round == Round::Rp;
         const bool round_ok = !op.to_fp8     ? round == Round::Rn
                               : ue8m0        ? (op.rz || op.rp)
                               : s2f6         ? (round == Round::Rn || op.rz)
-                                             : round == Round::Rn || (round == Round::None && fp8 != "e2m1x2" &&
-                                                                     (op.fmt == NarrowFmt::E4M3 || op.e5m2));
+                                             : round == Round::Rn || round == Round::Rz ||
+                                                   (round == Round::None && fp8 != "e2m1x2" &&
+                                                    (op.fmt == NarrowFmt::E4M3 || op.e5m2));
         if (!round_ok)
-          return round == Round::Rz ? unsupported("cvt.rz to " + fp8 + " (sm_107f) is not implemented")
-                                    : unsupported("cvt with " + fp8 + " takes " +
-                                                  std::string(ue8m0 && op.to_fp8 ? ".rz or .rp" : ".rn"));
+          return unsupported("cvt with " + fp8 + " takes " + std::string(ue8m0 && op.to_fp8 ? ".rz or .rp" : ".rn or .rz"));
         if (op.to_fp8 && !ue8m0 && !satfinite && op.fmt != NarrowFmt::E4M3 && !op.e5m2)
           return unsupported("cvt to " + fp8 + " requires .satfinite");
         if (ue8m0 && (relu || (op.to_fp8 && !packed.empty() && !op.bf16) || (!op.to_fp8 && !op.bf16)))
@@ -1916,6 +1979,11 @@ class Parser {
         if (s2f6 && !op.to_fp8 && !op.bf16) return unsupported("cvt from s2f6x2 is to bf16x2 only");
         if (scaled && !s2f6 && (op.to_fp8 || !op.bf16))
           return unsupported("cvt .scaled::n2::ue8m0 goes with a bf16x2 destination or s2f6x2");
+        if (scaled_n1 && (!op.to_fp8 || ue8m0 || s2f6))
+          return unsupported("cvt .scaled::n1::ue8m0 goes with a conversion to fp8, fp6 or fp4");
+        if (scaled_n1 && scaled) return unsupported("cvt with both .scaled::n1 and .scaled::n2");
+        if (op.pzo && (!op.to_fp8 || ue8m0 || s2f6))
+          return unsupported("cvt .pzo goes with a conversion to a narrow floating-point type");
         op.dst = expect_reg_operand("cvt destination");
         expect_punct(",");
         op.a = parse_operand();
@@ -1923,12 +1991,15 @@ class Parser {
           expect_punct(",");
           op.b = parse_operand();
         }
-        if (scaled && peek_punct(",")) {
+        if ((scaled || scaled_n1) && peek_punct(",")) {
           next();
           op.sf = parse_operand();
         } else if (scaled) {
           op.sf = ImmInt{0x7F7F};   // the default: 1 for both
+        } else if (scaled_n1) {
+          op.sf = ImmInt{0x7F};     // the default: 1
         }
+        op.scaled = scaled || scaled_n1;
         ins.op = op;
         expect_punct(";");
         return ins;
@@ -1948,6 +2019,7 @@ class Parser {
         op.rz = round == Round::Rz;
         op.relu = relu;
         op.satfinite = satfinite;
+        op.pzo = pzo;
         op.dst = expect_reg_operand("cvt destination");
         expect_punct(",");
         op.a = parse_operand();
@@ -1968,6 +2040,9 @@ class Parser {
       op.sat = sat;
       op.ftz = ftz;
       op.relu = relu;
+      op.pzo = pzo;
+      if (pzo && !(tys[0].bits == 16 && tys[0].is_real() && tys[1].bits == 32 && tys[1].is_float()))
+        return unsupported("cvt .pzo goes with a conversion to a smaller floating-point type");
       op.dst = expect_reg_operand("cvt destination");
       expect_punct(",");
       op.src = parse_operand();
@@ -2976,6 +3051,8 @@ class Parser {
         else if (p == "kind::tf32") { op.mma_kind = Tcgen05MmaKind::TF32; have_kind = true; }
         else if (p == "kind::f8f6f4") { op.mma_kind = Tcgen05MmaKind::F8F6F4; have_kind = true; }
         else if (p == "kind::i8") { op.mma_kind = Tcgen05MmaKind::I8; have_kind = true; }
+        // .kind::ti16 (PTX ISA 9.4, sm_107f and its family): 16-bit s1z4m11 integers into s32.
+        else if (p == "kind::ti16") { op.mma_kind = Tcgen05MmaKind::TI16; have_kind = true; }
         // The collector buffer lets the tensor core keep A or B between MMAs
         // instead of reading it again. Reuse is only ever permission -- the
         // ISA says the operand may be reloaded anyway and must not change
@@ -2999,12 +3076,13 @@ class Parser {
           return unsupported("tcgen05.mma.ws takes a B collector (.collector::b0-b3::op), not '." + p + "'");
         else if (p.rfind("collector::", 0) == 0) ;
         else if (p == "red" && op.kind == Tcgen05Kind::Ld) op.red = true;
-        else if (op.red && (p == "min" || p == "max")) { op.red_max = p == "max"; have_red_op = true; }
-        else if (op.red && p == "abs") op.red_abs = true;
+        else if (p == "spcompress" && op.kind == Tcgen05Kind::Ld) op.spcompress = true;
+        else if ((op.red || op.spcompress) && (p == "min" || p == "max")) { op.red_max = p == "max"; have_red_op = true; }
+        else if ((op.red || op.spcompress) && p == "abs") op.red_abs = true;
         else if (op.red && p == "NaN") op.red_nan = true;
-        else if (op.red && (p == "f32" || p == "u32" || p == "s32")) { op.red_type = p[0]; have_red_ty = true; }
-        else if (p == "spcompress")
-          return unsupported("tcgen05.ld." + p + " (sm_107) is not implemented");
+        else if ((op.red || op.spcompress) && (p == "f32" || p == "u32" || p == "s32")) { op.red_type = p[0]; have_red_ty = true; }
+        else if (op.spcompress && p == "sp::2:4") ;
+        else if (op.spcompress && p == "b2") ;
         else if (p == "sp" && op.kind == Tcgen05Kind::Mma) op.sparse = true;
         else if (p == "ws" && op.kind == Tcgen05Kind::Mma) op.ws = true;
         else if (p == "kind::mxf8f6f4") { op.mma_kind = Tcgen05MmaKind::MXF8F6F4; have_kind = true; }
@@ -3037,7 +3115,7 @@ class Parser {
                              "for the last row\" -- not whether the MMA reads A before or after the "
                              "shift, whether rows cross the 32-lane quarters, or what row 0 holds -- "
                              "and no public code uses it to check against, so it is not implemented");
-        else if (p.rfind("decompress", 0) == 0 || p == "kind::ti16")
+        else if (p.rfind("decompress", 0) == 0)
           return unsupported("tcgen05.mma." + p + " (sm_107) is not implemented");
         else if (p.rfind("multicast::cluster::32b", 0) == 0 || p.rfind("sync_restrict", 0) == 0)
           return unsupported("tcgen05.commit." + p + " (sm_107) is not implemented");
@@ -3077,6 +3155,38 @@ class Parser {
             if (!imm || imm->value < 0) fail(ins.line, ".16x32bx2 needs an immediate immHalfSplitoff");
             op.half_split = static_cast<uint32_t>(imm->value);
           };
+          if (op.spcompress) {
+            // tcgen05.ld{.red}.spcompress (9.7.18.8.3, PTX ISA 9.4): sm_107a only; .32x32b over f32,
+            // .x4 to .x128, 2:4 with b2 indices. From the documentation, not checked against a card.
+            const std::string arch = target_.substr(0, target_.find(','));
+            if (arch != "sm_107a")
+              fail(ins.line, "tcgen05.ld.spcompress requires an sm_107a target; this module targets " +
+                                 (arch.empty() ? std::string("nothing") : arch));
+            if (op.kind != Tcgen05Kind::Ld) return unsupported("spcompress on tcgen05.st");
+            if (op.shape != Tcgen05Shape::S32x32b) return unsupported("tcgen05.ld.spcompress takes .32x32b only");
+            if (op.num < 4) return unsupported("tcgen05.ld.spcompress needs .x4 or more");
+            if (!have_red_op || !have_red_ty || op.red_type != 'f')
+              return unsupported("tcgen05.ld.spcompress needs .min or .max and .f32");
+            if (op.pack16) return unsupported("tcgen05.ld.spcompress takes no .pack::16b");
+            if (op.red_nan && !op.red) return unsupported("tcgen05.ld.spcompress's .NaN goes with .red");
+            op.sp_mdata = parse_reg_vector_any();
+            expect_punct(",");
+            op.regs = parse_reg_vector_any();
+            expect_punct(",");
+            if (op.red) {
+              op.red_dst = expect_reg_operand("tcgen05.ld.red.spcompress's redval");
+              if (op.red_dst.wide) return unsupported("tcgen05.ld.red's redval is a 32-bit register");
+              expect_punct(",");
+            }
+            op.taddr = bracketed();
+            if (op.regs.size() != op.num / 2 || op.sp_mdata.size() != (op.num + 31) / 32)
+              return unsupported("tcgen05.ld.spcompress with " + std::to_string(op.sp_mdata.size()) + " mdata and " +
+                                 std::to_string(op.regs.size()) + " cdata registers; .x" + std::to_string(op.num) +
+                                 " takes " + std::to_string((op.num + 31) / 32) + " and " + std::to_string(op.num / 2));
+            for (const Reg& r : op.regs)
+              if (r.wide) return unsupported("tcgen05.ld registers are .b32");
+            break;
+          }
           if (op.red) {
             // tcgen05.ld.red (9.7.18.8.3): sm_103f and the family targets after
             // it, and sm_101a/sm_110a -- not the B200's sm_100.
@@ -3200,6 +3310,8 @@ class Parser {
               return unsupported("scale-input-d is for .kind::f16 and .kind::tf32 only");
             op.scale_d = static_cast<int>(imm->value);
           }
+          if (op.mma_kind == Tcgen05MmaKind::TI16 && op.target_sm != 107)
+            fail(ins.line, "tcgen05.mma.kind::ti16 requires an sm_107a or sm_107f target; this module targets " + target_);
           // .kind::i8 is sm_100a/sm_101a/sm_110a only, not the family targets.
           if (op.mma_kind == Tcgen05MmaKind::I8 && !target_.empty() && target_.back() != 'a')
             fail(ins.line, "tcgen05.mma.kind::i8 requires an sm_100a, sm_101a or sm_110a target; "
@@ -4517,13 +4629,14 @@ class Parser {
       op.breakpoint = true;
       ins.op = op;
     } else if (op0 == "tex" || op0 == "tld4") {
-      // tex.<geom>[.level|.grad].v4.<dtype>.<ctype> {d,d,d,d}, [obj, {c,...}]
+      // tex.<geom>[.base|.level|.grad].v4.<dtype>.<ctype> d[|p], [obj, {c,...}] [, lod | , dPdx, dPdy] [, {offset}] [, depth_ref]
+      // tex.<geom>.v2.f16x2.<ctype> {d0,d1}[|p], ...
+      // tld4.<comp>.<geom>.v4.<dtype>.f32 d[|p], [obj, {c,...}] [, {offset}] [, depth_ref]
       uint32_t dims = 0;
       TexGeom geom = TexGeom::D1;
-      bool level = false;
+      bool level = false, grad = false, f16x2 = false, v2 = false;
       int gather = -1;
       Type dtype{}, ctype{};
-      bool have_d = false;
       std::vector<std::string> types;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
@@ -4535,34 +4648,47 @@ class Parser {
         else if (p == "cube") { dims = 3; geom = TexGeom::Cube; }
         else if (p == "acube") { dims = 3; geom = TexGeom::ACube; }
         else if (p == "v4") ;
+        else if (p == "v2") v2 = true;
+        else if (p == "f16x2") f16x2 = true;
         else if (p == "2dms" || p == "a2dms")
-          return unsupported("multi-sample textures are not implemented");
+          return unsupported("multi-sample textures (tex.2dms, tex.a2dms): CUDA has no way to create "
+                             "a multi-sample texture (they come from graphics interop), so there is "
+                             "no layout to read and nothing on a card to measure it against");
         else if (op0 == "tld4" && p.size() == 1 && std::string("rgba").find(p[0]) != std::string::npos)
           gather = static_cast<int>(std::string("rgba").find(p[0]));
         else if (p == "level") level = true;
         else if (p == "base") ;
-        else if (p == "grad")
-          return unsupported("tex.grad: the level of detail a GPU derives from gradients goes "
-                             "through its approximate log2 and length units, which are not "
-                             "documented, so it is refused rather than approximated (tex.level "
-                             "and plain fetches of mipmapped textures are implemented)");
+        else if (p == "grad") grad = true;
         else if (auto t2 = parse_type_token(p)) types.push_back(p);
         else return unsupported("tex modifier '." + p + "'");
       }
+      if (grad)
+        return unsupported("tex.grad: the level of detail an RTX 3060 derives from gradients is "
+                           "not a function of their lengths that this could reproduce -- it grows "
+                           "with the second-largest component in ways that depend on both "
+                           "gradients (measured over 12,000 fetches), and a level off by a few "
+                           "256ths changes the filtered result. Refused rather than approximated "
+                           "(tex.level and plain fetches of mipmapped textures are implemented)");
       if (!dims) return unsupported("tex geometry");
-      if (types.size() != 2) return unsupported("tex needs a destination and a coordinate type");
-      dtype = *parse_type_token(types[0]);
-      ctype = *parse_type_token(types[1]);
-      have_d = true;
-      (void)have_d;
+      if (f16x2) {
+        if (!v2 || op0 == "tld4") return unsupported("f16x2 results are tex.v2.f16x2");
+        if (types.size() != 1) return unsupported("tex.v2.f16x2 needs a coordinate type");
+        dtype = Type{Type::Kind::F, 16};
+        ctype = *parse_type_token(types[0]);
+      } else {
+        if (types.size() != 2) return unsupported("tex needs a destination and a coordinate type");
+        if (v2) return unsupported("tex.v2 is the .f16x2 form");
+        dtype = *parse_type_token(types[0]);
+        ctype = *parse_type_token(types[1]);
+      }
       if (op0 == "tld4") {
         if (gather < 0) return unsupported("tld4 needs a component (.r, .g, .b or .a)");
-        // The ISA also has .a2d, .cube and .acube, but gather is allowed only
-        // on 2D arrays (a layered or cubemap array with cudaArrayTextureGather
-        // is refused by the runtime), so there is nothing to measure them on.
-        if (geom != TexGeom::D2)
-          return unsupported("tld4 on a layered or cubemap texture (only .2d is implemented)");
-        if (level) return unsupported("tld4 with a level of detail");
+        if (dtype.bits == 16) return unsupported("tld4 returns .u32, .s32 or .f32");
+        // The ISA also has .a2d, .cube and .acube. They are checked against
+        // the texture when they run: the CUDA runtime refuses a gather
+        // texture that is layered or a cubemap, so a program that gets one
+        // has built it some other way.
+        if (geom == TexGeom::D1 || geom == TexGeom::D3) return unsupported("tld4 gathers 2D textures (.2d, .a2d, .cube, .acube)");
       }
       OpTex op;
       op.gather = gather;
@@ -4570,10 +4696,16 @@ class Parser {
       op.dims = dims;
       op.dtype = dtype;
       op.ctype = ctype;
+      op.f16x2 = f16x2;
       if ((geom == TexGeom::Cube || geom == TexGeom::ACube) && !ctype.is_float())
         return unsupported("a cubemap fetch takes float coordinates");
       op.dsts = parse_reg_vector_any();
-      if (op.dsts.size() != 4) return unsupported("tex destination arity (ptxas emits .v4)");
+      if (op.dsts.size() != (f16x2 ? 2u : 4u))
+        return unsupported(f16x2 ? "tex.v2.f16x2 has two destination registers" : "tex destination arity (ptxas emits .v4)");
+      if (peek_punct("|")) {
+        next();
+        op.pred_dst = expect_reg_operand("tex predicate destination");
+      }
       expect_punct(",");
       expect_punct("[");
       op.obj = parse_operand();
@@ -4588,17 +4720,43 @@ class Parser {
         expect_punct(",");
         op.lod = parse_operand();
       }
+      // {, e} {, f}: a braced offset vector, then a scalar depth reference
+      // (either may come alone).
+      if (peek_punct(",")) {
+        next();
+        if (peek_punct("{")) {
+          op.offset = parse_operand_vector_any();
+          if (geom == TexGeom::Cube || geom == TexGeom::ACube)
+            return unsupported("tex offsets on a cubemap (the ISA does not support them)");
+          if (op.offset.size() < dims)
+            return unsupported("tex offset vector shorter than the texture's dimensions");
+          if (peek_punct(",")) {
+            next();
+            op.dref = parse_operand();
+            op.has_dref = true;
+          }
+        } else {
+          op.dref = parse_operand();
+          op.has_dref = true;
+        }
+      }
       ins.op = std::move(op);
     } else if (op0 == "suld" || op0 == "sust") {
       // suld.b.<geom>.<type>.<clamp> {d,...}, [obj, {x,y}]
       // sust.b.<geom>.<type>.<clamp> [obj, {x,y}], {s,...}
       uint32_t dims = 0, bytes = 0;
-      bool layered = false;
+      bool layered = false, formatted = false;
       uint8_t oob = kSurfTrap;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
         if (p == "b") ;              // byte-addressed, the only form ptxas emits
-        else if (p == "p") return unsupported("suld/sust '.p' (formatted) is not implemented");
+        else if (p == "p") {
+          // sust.p (PTX ISA 9.7.13.2): the values converted to the surface's format. There is no
+          // suld.p: ptxas of CUDA 13 does not assemble one.
+          if (op0 == "suld")
+            return unsupported("suld.p: ptxas assembles no formatted surface load (the ISA has sust.p only)");
+          formatted = true;
+        }
         else if (p == "1d") dims = 1;
         else if (p == "2d") dims = 2;
         else if (p == "3d") dims = 3;
@@ -4619,6 +4777,7 @@ class Parser {
       }
       if (!dims) return unsupported(op0 + " geometry");
       if (!bytes) return unsupported(op0 + " component width");
+      if (formatted && (layered || bytes != 4)) return unsupported("sust.p takes .1d, .2d or .3d and .b32 components");
       if (op0 == "suld") {
         OpSuld op;
         op.dims = dims;
@@ -4640,6 +4799,7 @@ class Parser {
         op.oob = oob;
         op.layered = layered;
         op.bytes = bytes;
+        op.formatted = formatted;
         expect_punct("[");
         op.obj = parse_operand();
         expect_punct(",");
@@ -4667,6 +4827,80 @@ class Parser {
       // duration nothing here can meaningfully honour.
       (void)parse_operand();
       ins.op = OpNop{};
+    } else if (op0 == "spcompress" || op0 == "spdecompress") {
+      // spcompress.{b8,b16}.{b2,b4}.sp::2:4.xN {mdata}, {cdata}, {data}, spdesc
+      // spdecompress.{b8,b16}.{b2,b4}.sp::S:T.xN {data}, {mdata}, {cdata}
+      // PTX ISA 9.4, sm_107a (9.7.10.30-31). Derived from the documentation and its figures 43
+      // and 44; not checked against a card.
+      {
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        const std::string arch = target_.substr(0, target_.find(','));
+        if (sm != 107 || arch.back() != 'a')
+          fail(ins.line, opcode + " requires an sm_107a target; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+      }
+      uint32_t elem = 0, idx = 0, num = 0, src = 0, target = 0;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "b8") elem = 8;
+        else if (p == "b16") elem = 16;
+        else if (p == "b2") idx = 2;
+        else if (p == "b4") idx = 4;
+        else if (p.rfind("sp::", 0) == 0 && std::sscanf(p.c_str(), "sp::%u:%u", &src, &target) == 2) ;
+        else if (p.size() > 1 && p[0] == 'x' && std::isdigit(static_cast<unsigned char>(p[1]))) num = static_cast<uint32_t>(std::atoi(p.c_str() + 1));
+        else return unsupported(op0 + " modifier '." + p + "'");
+      }
+      if (!elem || !idx || !num || !src) fail(ins.line, opcode + " needs .elemsize, .idxsize, .sp::N:M and .xN");
+      if (num != 1 && num != 2 && num != 4 && num != 8 && num != 16 && num != 32 && num != 64)
+        fail(ins.line, opcode + ": .num must be x1, x2, x4, x8, x16, x32 or x64");
+      const auto ceil_div = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+      if (op0 == "spcompress") {
+        if (src != 2 || target != 4) return unsupported("spcompress with a sparsity factor other than .sp::2:4 (the ISA has only that)");
+        OpSpCompress op;
+        op.elem_bits = elem;
+        op.idx_bits = idx;
+        op.num = num;
+        op.mdata = parse_reg_vector_any();
+        expect_punct(",");
+        op.cdata = parse_reg_vector_any();
+        expect_punct(",");
+        op.data = parse_operand_vector_any();
+        expect_punct(",");
+        op.spdesc = parse_operand();
+        const uint32_t m_regs = ceil_div(num * idx, elem);
+        if (op.mdata.size() != m_regs || op.cdata.size() != num || op.data.size() != 2 * num)
+          fail(ins.line, opcode + " takes " + std::to_string(m_regs) + " mdata, " + std::to_string(num) + " cdata and " +
+                             std::to_string(2 * num) + " data registers");
+        if (op.mdata.size() + op.cdata.size() + op.data.size() > 253) fail(ins.line, opcode + ": more than 253 registers in all");
+        ins.op = std::move(op);
+      } else {
+        static const uint32_t ok[][2] = {{1, 2}, {1, 4}, {1, 8}, {1, 16}, {2, 4}, {2, 8}, {2, 16}, {4, 8}, {4, 16}};
+        bool valid = false;
+        for (const auto& f : ok) valid = valid || (f[0] == src && f[1] == target);
+        if (!valid) fail(ins.line, opcode + ": .sp::" + std::to_string(src) + ":" + std::to_string(target) + " is not a sparsity factor");
+        if (src * elem > 32) fail(ins.line, opcode + ": a source span of " + std::to_string(src * elem) + " bits does not fit one register");
+        if (idx == 2 && target > 4) fail(ins.line, opcode + ": .b2 indices cannot address " + std::to_string(target) + " elements");
+        if (target * elem * num < 32 || target * elem * num > 4096) fail(ins.line, opcode + ": the data operand must be 1 to 128 registers");
+        OpSpDecompress op;
+        op.elem_bits = elem;
+        op.idx_bits = idx;
+        op.num = num;
+        op.n_src = src;
+        op.n_target = target;
+        op.data = parse_reg_vector_any();
+        expect_punct(",");
+        op.mdata = parse_operand_vector_any();
+        expect_punct(",");
+        op.cdata = parse_operand_vector_any();
+        const uint32_t d_regs = ceil_div(target * elem * num, 32), m_regs = ceil_div(src * idx * num, 32),
+                       c_regs = ceil_div(src * elem * num, 32);
+        if (op.data.size() != d_regs || op.mdata.size() != m_regs || op.cdata.size() != c_regs)
+          fail(ins.line, opcode + " takes " + std::to_string(d_regs) + " data, " + std::to_string(m_regs) + " mdata and " +
+                             std::to_string(c_regs) + " cdata registers");
+        if (op.data.size() + op.mdata.size() + op.cdata.size() > 253) fail(ins.line, opcode + ": more than 253 registers in all");
+        ins.op = std::move(op);
+      }
     } else if (op0 == "movmatrix") {
       bool trans = false, b16 = false, shape = false;
       for (size_t i = 1; i < parts.size(); ++i) {

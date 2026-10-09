@@ -1038,6 +1038,8 @@ vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
 vgpu_unit_test(test_blackwell)
+# Rubin (sm_107a): the forms of PTX ISA 9.4, from the documentation alone.
+vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
 # Distributed shared memory: blocks of a cluster reaching each other's.
@@ -2250,6 +2252,23 @@ set_tests_properties(e2e_texture_mipmaps PROPERTIES
 # component, bit for bit with an RTX 3060.
 add_test(NAME e2e_texture_gather COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_gather.sh)
 set_tests_properties(e2e_texture_gather PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Texture operands beyond a plain fetch -- offsets, a depth reference, the destination
+# predicate, half-precision results, tld4 on layered, cube and cube-array textures, and
+# signed 8-bit normalized filtering -- bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_forms COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_forms.sh)
+set_tests_properties(e2e_texture_forms PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Formatted surface stores (sust.p): the values converted to every surface format, bit for bit
+# with an RTX 3060.
+add_test(NAME e2e_surface_formatted COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_surface_formatted.sh)
+set_tests_properties(e2e_surface_formatted PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)

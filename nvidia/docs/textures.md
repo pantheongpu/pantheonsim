@@ -1,7 +1,8 @@
 # Textures and surfaces
 
-Texture and surface objects work -- point and linear filtering, layered and
-cubemap textures, mipmaps with an explicit level of detail, and gather -- and
+Texture and surface objects work -- point and linear filtering (signed 8-bit
+normalized texels included), layered and cubemap textures, mipmaps with an explicit
+level of detail, gather, offsets, and formatted stores -- and
 every rule a result depends on was measured on an RTX 3060 (sm_86) and
 matched bit for bit:
 
@@ -44,7 +45,7 @@ timing.
 
 | | |
 | --- | --- |
-| Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}`, `tex.level`, `tld4.{r,g,b,a}.2d`, `suld.b`/`sust.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d` |
+| Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}` with `.level`, an offset vector, a depth reference, a destination predicate, and `.v4.f16` / `.v2.f16x2` results; `tld4.{r,g,b,a}.{2d,a2d,cube,acube}` with the same operands; `suld.b`/`sust.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d`; `sust.p` (formatted) in `.1d`/`.2d`/`.3d` |
 | Backing memory | linear (`cudaResourceTypeLinear`), pitched 2D, `cudaArray` (1D/2D/3D, layered, cubemap, layered cubemap), mipmapped arrays |
 | Filtering | point and linear, within and between mip levels |
 | Addressing | clamp, wrap, mirror, border (any colour) |
@@ -101,6 +102,12 @@ was then measured, sample by sample, until every result matched:
   unsigned normalized texels filter as 16-bit integers (an 8-bit `u` is
   `u*257`) and 16-bit signed ones as themselves, rounded half up, read out
   as `K/65535` or `K/32767` (signed clamped to -32767 after the blend).
+  **Signed 8-bit** normalized texels blend as their 8-bit codes: with S the
+  weighted sum (weights summing to 256, so S is in -32768..32512), the result is
+  `K = S + ((257 * (S >> 4) + 1024) >> 11)` over 32767, clamped at -32767 -- an
+  exact fit, found by sweeping every pair of neighbours at every weight (all 65,281
+  sums an RTX 3060 can make of two texels); the result depends on S alone, and
+  the `>> 4` is why it first looked irregular.
 - **Wrap and mirror** apply only to normalized coordinates; with
   unnormalized ones the hardware clamps.
 - **Layers**: the index is unsigned, and past the end (a negative index
@@ -122,7 +129,10 @@ was then measured, sample by sample, until every result matched:
   weight rounding's carry, and clamp applied to each index. A NaN comes out
   as all ones, a subnormal float as zero, and a signed 8-bit normalized
   texel as its 16-bit form over 32767 (`|k| * 258`, plus one from 64 up --
-  65 when negative), not `k/127`.
+  65 when negative), not `k/127`. It works on layered 2D textures (`.a2d`), cubemaps
+  and cubemap arrays too -- the runtime refuses `cudaArrayTextureGather` on those
+  but the instruction does not need the flag -- gathering within the face under the
+  texture's address mode whatever the filter.
 - **Mipmapped textures** take normalized coordinates whether or not the
   descriptor asks for them; without `normalizedCoords`, wrap and mirror
   still act as clamp. Layered and cubemap ones have every layer (and face)
@@ -208,21 +218,62 @@ This used to be refused ("linear filtering with integer coordinates"), and
 out-of-range integer coordinates were clamped. e2e_texture_int_coords checks
 both against the card.
 
+## The operands after the coordinates
+
+`tex` and `tld4` take, after the coordinates (and the level of detail), an offset
+vector `e` and a depth reference `f`, and a destination predicate `d|p`. All three
+were measured on an RTX 3060 (`e2e_texture_forms` hashes 98 cases of them against
+the card, and runs the same on every generation's SASS).
+
+- **The offset** is a whole number of texels, -8 to 7, added to the texel index
+  before the address mode. For linear filtering it moves the coordinate, so clamp
+  addressing limits the shifted coordinate, not the filter's footprint afterwards.
+  On a mipmapped texture it counts texels of the level that is read. ptxas hands
+  the hardware the offsets in one register: four bits an axis for `tex` -- x, y, z,
+  and a register holding more than four bits wraps, so an offset of 8 is -8 -- and
+  six bits an axis for `tld4`. A **1D** texture is a 2D one of height 1, and its one
+  offset is passed on whole: a negative x offset also sets the nibble above it, so the
+  fetch lands on row -1 and, under border addressing, reads the border colour (all of
+  it, point or linear). The simulator reads the nibbles as the hardware does, from
+  the immediate or the register, and so reproduces that.
+- **The depth reference** has no effect. A CUDA texture has no depth-compare state,
+  and an RTX 3060 returns the plain fetch -- point and linear, `tex` and `tld4` -- so
+  the operand is read (a bad register still faults) and ignored. The same for the
+  residency predicate: every texel is resident, so `p` is set (in SASS it is the
+  *fault* predicate, which ptxas turns round with a `SEL`).
+- **`.v4.f16` and `.v2.f16x2`** results are the f32 result rounded to nearest to a
+  half, two to a register with component 0 low (before sm_90 ptxas asks the texture
+  unit for that conversion, `TEX.F16.RN`; from sm_90 it converts afterwards).
+
+## Formatted stores: sust.p
+
+`sust.p` writes up to four 32-bit values -- the R, G, B and A of the instruction --
+converted to the surface's channel format, at a texel index (where `sust.b` counts
+bytes). Measured over every format a CUDA surface can have: an unsigned channel takes
+the value clamped to its range, a signed one the value as an s32 clamped to its range,
+a 32-bit float channel the bits as they are, and a 16-bit float channel the f32
+rounded **toward zero** (a magnitude past the largest finite half gives the largest
+finite one; a NaN keeps the top of its payload). A channel the operands do not reach is
+written 0. There is no `suld.p`: ptxas of CUDA 13 does not assemble one.
+`e2e_surface_formatted` hashes 140 cases, with `.trap`, `.clamp` and `.zero`.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
 
-- **`tex.grad`.** The level of detail it needs comes out of the GPU's
-  approximate log2 and length units -- axis-aligned gradients land within
-  1/256 of log2, others on no textbook formula -- which are not documented.
-- **Linear filtering of signed 8-bit normalized texels.** The result is a
-  function of the blended sum alone, but not one reproduced here. (A later
-  attempt with the texels' measured 16-bit forms, and with fixed-point
-  texels and the border colour's output rounding, peaked at 96.7% of 18,176
-  two-texel blends.)
-- `tld4` on layered or cubemap textures (the runtime refuses a gather array
-  that is layered or a cubemap, so there is nothing to measure them on).
-- Resource views and anisotropic filtering.
+- **`tex.grad`.** The level of detail comes out of the GPU's approximate log2 and
+  length units, and 12,000 fetches of an RTX 3060 on a texture whose levels each hold
+  their own number do not follow any formula tried: with one dominant gradient it is
+  the log2 of its length to within a few 256ths, but with two comparable ones it
+  runs up to 25% longer than either, and neither the Euclidean length nor the largest
+  component nor an alpha-max-beta-min sum of one gradient explains it.
+- **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
+  come from graphics interop -- so there is no layout to read and nothing on the card
+  to measure.
+- **Resource views and anisotropic filtering.** A plain `tex` fetch is not affected by
+  `maxAnisotropy` (the same hashes for 1, 4 and 16), but an explicit-level
+  `tex.level` one is -- the hardware filters along an axis the instruction does not
+  give -- so a texture with `maxAnisotropy` above 1 stays refused.
 
 ## Surfaces out of range: .trap, .clamp and .zero
 

@@ -87,10 +87,24 @@ Every generation from Turing to Blackwell runs, sm_75 through sm_120a:
 | sm_120 | RTX 5090 | sm_120's integer and float forms, block-scaled MMA |
 
 Instructions the executor does not run, and so leave a kernel to its PTX:
-`LDGMC` (multimem; the PTX engine has no multicast memory either), TMA's `im2col::w` modes (nor does the
-PTX engine), and the texture forms with a LOD clamp, a LOD bias, offsets or a
-depth compare. A `WARPSYNC.COLLECTIVE` reached from different code paths of
-one warp is refused when it happens.
+`LDGMC` (multimem: it needs a multicast object, which `cuMulticastCreate` and the
+rest do not make here, and the PTX engine has no multicast memory either), TMA's
+`im2col::w` modes (nor does the PTX engine: the halo walk is in the ISA's figures
+only), texture fetches with a LOD bias or clamp (`TEX.LB`, `.LC` -- ptxas emits
+none from PTX, whose `tex` has no such operand) and per-texel gather offsets
+(`TLD4.PTP`). A `WARPSYNC.COLLECTIVE` reached from different code paths of
+one warp is refused when it happens: what the hardware does with the lanes then is not in
+any document, and no PTX this was tried with produced one.
+
+What does run, besides the plain forms: texture fetches with an offset (`.AOFFI`, the
+packed register after the LOD), a depth reference (`.DC`), a residency predicate and
+half-precision results (`.F16.RN`, before sm_90); `SUST.P`; and a cooperative launch
+(`cudaLaunchAttributeCooperative`) of clusters, every block resident, each cluster with
+its own barrier and distributed shared memory. `executes()` lists the opcodes the
+executor runs; a decoded opcode outside it (`HMNMX2`, `F2IP`, `JMP`, `LDGMC` --
+the first three no decoder produces) takes the kernel to its PTX, and the "not
+implemented yet" faults at the foot of the instruction groups are unreachable for
+the ones it lists.
 
 Dynamic parallelism runs on SASS as on PTX. A program using it links CUDA's
 device runtime library into its cubin; the loader resolves the relocations

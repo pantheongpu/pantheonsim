@@ -198,12 +198,13 @@ struct OpCvt {
   Type dst_ty; Type src_ty; Round round = Round::None; Reg dst; Operand src;
   bool sat = false, ftz = false;
   bool relu = false;   // cvt.rn.relu.{f16,bf16}.f32: a negative result to +0, NaN to canonical
+  bool pzo = false;    // .pzo: a -0.0 result is +0.0
 };
 // cvt.{rna,rn,rz}[.satfinite][.relu].tf32.f32 d, a: a rounded to tf32, which
 // keeps f32's layout with the low 13 mantissa bits zero. .rna rounds ties
 // away, on the bits (add 0x1000, clear 13); a NaN is truncated, not rounded
 // (measured on an RTX 3060).
-struct OpCvtTf32 { bool rna = false, rz = false, satfinite = false, relu = false; Reg dst; Operand src; };
+struct OpCvtTf32 { bool rna = false, rz = false, satfinite = false, relu = false, pzo = false; Reg dst; Operand src; };
 struct OpNot { Type ty; Reg dst; Operand src; bool logical = false; };   // bitwise not; cnot when logical (d = a == 0)
 struct OpNeg { Type ty; Reg dst; Operand src; bool ftz = false; };   // arithmetic negate (int/float)
 struct OpAbs { Type ty; Reg dst; Operand src; bool ftz = false; };
@@ -261,7 +262,7 @@ struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; Opera
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 // cvt.{rn,rz}[.relu][.satfinite].{f16x2,bf16x2}.f32 d, a, b.
-struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; bool rz = false, relu = false, satfinite = false; };
+struct OpCvtF16x2 { Reg dst; Operand a, b; bool bf16 = false; bool rz = false, relu = false, satfinite = false, pzo = false; };
 // cvt.pack.sat.<to>.s32[.b32] d, a, b[, c]: a and b saturated to a 16-, 8-,
 // 4- or 2-bit integer type and packed, b in the low field and a above it;
 // for the narrower types the rest of d comes from the low bits of c.
@@ -389,7 +390,7 @@ enum class Tcgen05Kind {
 enum class Tcgen05Shape { S32x32b, S16x64b, S16x128b, S16x256b, S16x32bx2 };
 // tcgen05.mma's .kind: the element family, the exact types coming from the
 // instruction descriptor.
-enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4 };
+enum class Tcgen05MmaKind { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4, TI16 };
 // tcgen05.cp shapes (9.7.18.9.2): lanes x bits a lane.
 enum class Tcgen05CpShape { S128x256b, S4x256b, S128x128b, S64x128b, S32x128b };
 enum class Tcgen05Collector { Fill, Use, LastUse, Discard };
@@ -448,6 +449,11 @@ struct OpTcgen05 {
   bool red = false, red_max = false, red_abs = false, red_nan = false;
   char red_type = 'f';   // 'f' f32, 'u' u32, 's' s32
   Reg red_dst;
+  // tcgen05.ld.spcompress (sm_107a, PTX ISA 9.4): the loaded f32 columns compressed 2:4 on the
+  // way into `regs` (num / 2 registers), their indices (two bits each) into `sp_mdata`; the rowop
+  // (red_max, red_abs) says which two of each four are kept -- and with .red, what is reduced.
+  bool spcompress = false;
+  std::vector<Reg> sp_mdata;
   bool has_zero_mask = false;
   Operand zero_mask;
   Operand d_tmem, a, b_desc, idesc, enable_d;
@@ -647,6 +653,8 @@ struct OpCvtFp8 {
   bool relu = false;
   bool rz = false, rp = false;   // otherwise .rn
   bool scaled = false;      // .scaled::n2::ue8m0 with a scale-factor operand
+  bool scaled_n1 = false;   // .scaled::n1::ue8m0: one factor (the low byte) divides both inputs
+  bool pzo = false;         // .pzo: a -0.0 result is +0.0
   Reg dst;
   Operand a, b, sf;
 };
@@ -1004,6 +1012,19 @@ struct OpTex {
   // tld4 (texture gather): the component 0..3 (r, g, b, a) whose four
   // bilinear-footprint texels are returned, or -1 for an ordinary fetch.
   int gather = -1;
+  // `d|p`: the destination predicate (set when the texel is resident, which
+  // is always, here: nothing is paged out), or kNoReg.
+  Reg pred_dst;
+  // The optional offset vector `e` (texels, -8..7, applied before the fetch)
+  // and the depth-compare reference `f`.
+  std::vector<Operand> offset;
+  bool has_dref = false;
+  Operand dref;
+  // .grad: dPdx and dPdy, one operand per coordinate.
+  bool grad = false;
+  std::vector<Operand> ddx, ddy;
+  // tex.v2.f16x2: two packed-half destinations instead of four components.
+  bool f16x2 = false;
 };
 // suld/sust's out-of-range policy: fault, clamp to the nearest location, or
 // read zero / drop the store.
@@ -1021,6 +1042,7 @@ struct OpSuld {
 struct OpSust {
   uint32_t dims = 1;
   bool layered = false;
+  bool formatted = false;   // sust.p: srcs are values converted to the surface's format; x is in texels
   uint32_t bytes = 4;
   uint8_t oob = 0;
   Operand obj;
@@ -1105,10 +1127,40 @@ struct OpCall {
   Reg target_reg;
 };
 
+// The packed integer forms of PTX ISA 8.0 and 9.2-9.4: add, sub, neg, min, max and set on a
+// register of two 16-bit or four 8-bit lanes, signed or unsigned, each lane on its own.
+// .sat clamps each lane to its range, .relu (min/max.s) clamps a negative result to 0, and set
+// writes all ones to a lane whose comparison holds.
+enum class PackedIntOp : uint8_t { Add, Sub, Neg, Min, Max, Set };
+struct OpPackedInt {
+  PackedIntOp kind = PackedIntOp::Add;
+  uint32_t lane_bits = 8;
+  bool is_signed = false, sat = false, relu = false;
+  CmpOp cmp = CmpOp::Eq;
+  Reg dst;
+  Operand a, b;
+};
+// spcompress.<elemsize>.<idxsize>.sp::2:4.xN {mdata}, {cdata}, {data}, spdesc
+// (sm_107a): from every group of four elements of the dense `data`, the two the
+// descriptor's selection picks, in index order, into `cdata`, with their
+// indices in `mdata`. spdecompress goes back: each of `src` elements of
+// `cdata` to the position `mdata` gives among `target`, the rest zero.
+struct OpSpCompress {
+  uint32_t elem_bits = 8, idx_bits = 2, num = 1;
+  std::vector<Reg> mdata, cdata;
+  std::vector<Operand> data;
+  Operand spdesc;
+};
+struct OpSpDecompress {
+  uint32_t elem_bits = 8, idx_bits = 2, num = 1, n_src = 2, n_target = 4;
+  std::vector<Reg> data;
+  std::vector<Operand> mdata, cdata;
+};
+
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt>;
 
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics
