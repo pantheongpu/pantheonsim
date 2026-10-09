@@ -24,7 +24,9 @@ on:
 jobs:
   find:
     name: find the toolchain images
-    runs-on: ubuntu-24.04
+    # With the burst pool (BURST_RUNS_ON, ci.yml) it runs there too: every other job
+    # of a run waits for this one, so in GitHub's queue it holds the whole run up.
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 10
     outputs:
       cuda12_0: ${{ steps.find.outputs.cuda12_0 }}

@@ -1473,6 +1473,10 @@ set_tests_properties(amd_hip_abi PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIM
 add_test(NAME amd_hip_version COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_hip_version.sh)
 set_tests_properties(amd_hip_version PROPERTIES DEPENDS vgpuhip
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
+# When a captured copy takes its host source: at launch for heap and live locals, at capture for a gone frame's.
+add_test(NAME amd_graph_host_source COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_graph_host_source.sh)
+set_tests_properties(amd_graph_host_source PROPERTIES DEPENDS vgpuhip
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 120)
 # The GCN decoder against the real assembler, on a code object built here and now.
 add_test(NAME amd_gcn_disasm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_gcn_disasm.sh)
 set_tests_properties(amd_gcn_disasm PROPERTIES DEPENDS test_amd_gcn
@@ -1880,6 +1884,13 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_atomic_cas
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_cas.sh)
   set_tests_properties(e2e_atomic_cas PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_lop3_pred_chain
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
+  set_tests_properties(e2e_lop3_pred_chain PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)

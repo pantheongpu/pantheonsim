@@ -4194,6 +4194,27 @@ VGPU_EXPORT CUresult cuStreamGetFlags(CUstream, unsigned int* f) {
   if (f) *f = 0;
   return CUDA_SUCCESS;
 }
+// A stream belongs to the context that was current when it was created, and the
+// simulator keeps one context per thread's stack, so that is the answer here;
+// the legacy default stream (NULL) answers the current context as well. With
+// no context current the driver answers CUDA_ERROR_INVALID_CONTEXT and leaves
+// the output alone. Kokkos' CUDA backend asks for it when it wraps a stream.
+VGPU_EXPORT CUresult cuStreamGetCtx(CUstream, CUcontext* pctx) {
+  return api("cuStreamGetCtx", true, false, [&](ShimState&) {
+    if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    *pctx = reinterpret_cast<CUcontext>(ctx_stack().back());
+    return CUDA_SUCCESS;
+  });
+}
+// The CUDA 12.5 form also reports a green context when the stream belongs to
+// one. The simulator has none, so for every stream the answer is NULL, as an
+// RTX 3080 Ti's driver answers for an ordinary stream.
+VGPU_EXPORT CUresult cuStreamGetCtx_v2(CUstream stream, CUcontext* pctx, CUgreenCtx* pgreen) {
+  const CUresult r = cuStreamGetCtx(stream, pctx);
+  if (r == CUDA_SUCCESS && pgreen) *pgreen = nullptr;
+  return r;
+}
 VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream, int* status, unsigned long long* id,
                                                void*, const void**, size_t*) {
   if (status) *status = 0;  // CU_STREAM_CAPTURE_STATUS_NONE
@@ -5214,7 +5235,8 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuMemsetD8Async), VGPU_PROC(cuMemsetD16Async), VGPU_PROC(cuMemsetD32Async),
     VGPU_PROC(cuStreamCreate), VGPU_PROC(cuStreamCreateWithPriority), VGPU_PROC(cuStreamDestroy),
     VGPU_PROC(cuStreamSynchronize), VGPU_PROC(cuStreamQuery), VGPU_PROC(cuStreamWaitEvent),
-    VGPU_PROC(cuStreamGetPriority), VGPU_PROC(cuStreamGetFlags),
+    VGPU_PROC(cuStreamGetPriority), VGPU_PROC(cuStreamGetFlags), VGPU_PROC(cuStreamGetCtx),
+    VGPU_PROC(cuStreamGetCtx_v2),
     VGPU_PROC(cuStreamGetCaptureInfo_v2), VGPU_PROC(cuStreamIsCapturing),
     VGPU_PROC(cuEventCreate), VGPU_PROC(cuEventRecord), VGPU_PROC(cuEventQuery),
     VGPU_PROC(cuEventSynchronize), VGPU_PROC(cuEventDestroy), VGPU_PROC(cuEventElapsedTime),
