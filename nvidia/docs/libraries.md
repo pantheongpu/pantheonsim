@@ -253,7 +253,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | CUDA runtime | `libcudart.so.13` | the nvcc registration ABI, streams, events |
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (band and packed storage included; the plane rotations bit for bit), batched GEMV in every type, triangular solves, batched LU (`getrfBatched`/`getrsBatched`/`getriBatched`/`matinvBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`), the `_64` forms, cuBLASXt over several devices and the legacy (`cublas.h`) API; see [cublas.md](cublas.md) |
-| cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4 and int8 x int8 into int32 (`CUBLAS_COMPUTE_32I`, what `torch._int_mm` calls), strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 tensor-wise and row-wise scales with amax, and the block-scaled FP8/FP4 modes (documentation-derived) |
+| cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4 and int8 x int8 into int32 (`CUBLAS_COMPUTE_32I`, what `torch._int_mm` calls), strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 on an Ada profile (sm_89) as an L4's cuBLAS 13.3 answers it, and none below it (see [narrow-precision probes](lowprec.md)), FP8 tensor-wise and row-wise scales with amax, an FP8 auxiliary output with its scale and amax, and the block-scaled FP8/FP4 modes with one scale tensor per batch (Hopper and Blackwell: documentation-derived) |
 | cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout, the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans, LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
@@ -266,7 +266,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration, batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
 | nvCOMP | `libnvcomp.so.5` | the low-level batched API and the C++ manager API for LZ4, Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, and CRC32; Cascaded, Bitcomp and ANS refused (no public bitstream) |
 | NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID; the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
-| cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32 and int8 (into int8, int32, fp16, bf16) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
+| cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32, int8 (into int8, int32, fp16, bf16) and, on an sm_89 profile, E4M3 and E5M2 (into fp16, bf16, fp32) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition) and gate splitting on cuSOLVER. Built on the simulator's cuTENSOR and cuSOLVER |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ at run time with the toolkit's own NVRTC: PTX, the cubin of an sm_ target, LTO-IR, OptiX-IR, precompiled headers, time tables (below) |
@@ -451,10 +451,15 @@ runs them; each is a ctest of its own.
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_lt_epilogue_paths` | RELU_AUX/GELU_AUX's mask and input, DRELU/DGELU and their bias gradients, BGRADA/BGRADB, in fp16/bf16/fp32/fp64, and what the card refuses | a training step's backward pass (cuBLASLt-fused linear layers) |
 | `e2e_lt_blockscaled_paths` | MXFP8 and NVFP4 block scales in the tiled layout, the 128-element and 128x128 FP32 forms, D's block quantization and its output scales (simulator only: documentation-derived) | `_scaled_mm` with block scales |
+| `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4 and an RTX 3060 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
+| `e2e_lowprec_sparselt` | 1096 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4 and an RTX 3060 | FP8 2:4 sparse inference |
+| `e2e_lowprec_cvt` | the packed FP8 conversions (e4m3x2, e5m2x2 from f32 and f16x2, .relu, and back) over 512 values with NaN, infinities, zeros, subnormals and ties, on SASS and PTX, against an L4 | `__nv_fp8` conversions on sm_89 and later |
+| `e2e_dnn_int8x32` | an INT8x32 convolution through the graph API with the filter reordered by `cudnnReorderFilterAndBias` (`CUDNN_TENSOR_REORDERING_INT8x32`); the same program passes against NVIDIA's cuDNN on an RTX 3060 | INT8 inference engines built on cudnn-frontend |
 | `e2e_blas_packed_paths`, `e2e_blas_batched_paths`, `e2e_blas_64_paths`, `e2e_blas_legacy_paths`, `e2e_blas_xt_paths` | cuBLAS's band and packed level 2, batched GEMV, getri/matinv, syrkx/herkx, the `_64` forms, the handle settings, the legacy API and cuBLASXt on two devices | SciPy-style BLAS callers, multi-GPU GEMM |
 | `e2e_dnn_backward` | cuDNN's convolution passes against each other, every backward pass against finite differences, algorithm lists, status codes, dropout, an LSTM's gradients through dropout, LSTMs in half, bfloat16 and double, CTC's gradient | `conv2d`, pooling and activation backward, `nn.LSTM(dropout=)`, `ctc_loss` |
 | `e2e_dnn_classic_paths` | cuDNN's classic API beyond the training paths: INT8x4/UINT8x4/INT8x32 convolution and fused bias-ReLU against an integer reference (also through `cudnnReorderFilterAndBias`), transforms to and from `NCHW_VECT_C`, INT8 pooling and activation, divisive normalization against its formula and finite differences, padding/folding/unfolding transforms and the folded backward-data pipeline, LSTM projections and clipping against a host LSTM and finite differences, the RNN getters, fused-ops plans, multi-head attention forward and both gradients | `nn.LSTM(proj_size=)`, `nn.MultiheadAttention`-style models, INT8 inference engines |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch/group norm forward and backward, backward without saved statistics, max and average pooling both ways, max pooling's index tensor, asymmetric padding, concatenation, statistics generation, RNG, reshape, transpose, slice, an INT8x4 vectorized convolution | `cudnn_convolution_add_relu`, cudnn-frontend |
+| `e2e_dnn_fp8_attention`, `e2e_dnn_fp8_attention_frontend` | per-tensor FP8 attention forward (descale of Q, K, V and S, scale of S and O, amax of S and O) on a Hopper profile, built from the backend API and by cudnn-frontend's `sdpa_fp8`, against the documented formulas (documentation-derived; no card), and MXFP8's refusal | Transformer Engine's FP8 attention |
 | `e2e_dnn_attention` | cuDNN scaled dot-product attention built by cudnn-frontend 1.30 (fetched): the unified and composite forms forward and backward, causal (both alignments) and sliding-window masks, bias, grouped-query heads, padding, paged K/V caches, ragged sequences, dropout, half/bfloat16/float | `scaled_dot_product_attention` with the cuDNN backend, Transformer Engine |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -464,8 +469,10 @@ matrix's row offsets for every member (13.2 follows the stride, as documented
 and as this does), NVIDIA's SDDMM refuses a NULL buffer even when it asked
 for none, and it takes a conjugate transpose of a complex operand, which it
 does not document, and computes neither A^H B nor anything else with it (this
-refuses one with NOT_SUPPORTED). The FP8 matmuls need an sm_89 card to compare against; their output
-encoding is checked against `cuda_fp8.h`'s conversion, bit for bit.
+refuses one with NOT_SUPPORTED). The FP8 matmuls were compared against an NVIDIA L4 (sm_89) rented for the
+purpose, over 1247 descriptors, and against the RTX 3060's refusal of all of them
+([narrow-precision probes](lowprec.md)); their output encoding is also checked
+against `cuda_fp8.h`'s conversion, bit for bit.
 
 The same suite runs on a rented multi-GPU machine through
 `nvidia/tools/verify-multigpu-cloud.sh`, which builds VirtualGPU there and compares
@@ -950,21 +957,30 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   with the card's defaults and refusals, and its matmul checks one as the card
   does, but does not emulate with it -- NVIDIA's did not on the RTX 3060. The complex form is four real
   emulated products, derived from the real one, not measured.
-- **cuBLASLt**: the auxiliary buffer's own scale and amax for FP8 epilogues
-  (`EPILOGUE_AUX_SCALE_POINTER`, `EPILOGUE_AUX_AMAX_POINTER`), per-batch block
-  scales, and the experimental scaling modes (`VEC32_MN_K4_UE8M0`,
-  `VEC128_MN_K4_UE8M0`, per-batch tensor-wide scales). The block-scaled FP8
-  and FP4 modes are implemented from NVIDIA's documentation only --
-  documentation-derived, not card-verified -- since no card here (an RTX
-  3060, sm_86) runs them; the backward epilogues match the card, except that
-  GELU and its derivative are exact where the card's fp32 tanh is
-  approximate (within about 5e-5).
+- **cuBLASLt**: on Hopper and Blackwell profiles (sm_90 and later) the FP8 kernel
+  table, the scale modes each GPU takes, and the auxiliary scale and amax
+  are documentation-derived, not card-verified, because no H100 or RTX PRO 6000 was
+  available (AWS had no capacity when they were tried): the FP8 table
+  below sm_89 is an RTX 3060's (every FP8 or FP4 descriptor refused), on sm_89 an
+  L4's (TN only, 16-byte leading dimensions, no FP8 outer-vector or block scales,
+  no auxiliary scale or amax), and from sm_90 up the descriptor checks measured on
+  those two apply and the rest is permissive. Block-scaled FP8 and FP4 modes
+  (`VEC16_UE4M3`, `VEC32_UE8M0`, `VEC128_32F`, `BLK128x128_32F`, the packed
+  `VEC128/VEC32_MN_K4_UE8M0` of cuBLAS 13.8, `PER_BATCH_SCALAR_32F`) follow
+  NVIDIA's documentation, with one scale tensor per batch laid out back to back
+  (an assumption). The backward epilogues match the card, except that GELU and
+  its derivative are exact where the card's fp32 tanh is approximate (within
+  about 5e-5), which is why the probe checks GELU against the function, not a hash.
 - **cuDNN**: in the graph API, interpolating resampling (nearest,
-  bilinear: no engine on the hardware, no documented sampling rule), FP8
-  and block-scaled (MXFP8) attention and the block-scale (de)quantize
-  operations, attention's block masks and cumulative sequence lengths,
-  sinks in the backward attention operation, reordered (INT8x32-interleaved)
-  filters, multi-GPU normalization, the MoE, RoPE and band-matrix
+  bilinear: no engine on the hardware, no documented sampling rule),
+  block-scaled (MXFP8) attention (E8M0 scales in the F8_128x4 layout), FP8
+  attention's backward pass and the block-scale (de)quantize operations (per-tensor
+  FP8 attention forward works from a Hopper profile, **documentation-derived**: no
+  Hopper card was available, `e2e_dnn_fp8_attention`, and through cudnn-frontend's
+  `sdpa_fp8`, `e2e_dnn_fp8_attention_frontend`; FP8 is a graph tensor type now), attention's block masks and cumulative sequence lengths,
+  sinks in the backward attention operation, F16x16 and FP8-128x4 reordered
+  tensors (the INT8x32 filter reordering works: `e2e_dnn_int8x32`), multi-GPU
+  normalization, the MoE, RoPE and band-matrix
   operations, and cuDNN's own dropout mask layout (the mask is drawn from
   the documented generator but not placed as its kernels place it); in the
   classic API, the fused ops cuDNN runs only on
@@ -1016,10 +1032,14 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   with an algo other than 0 is NOT_SUPPORTED (the documentation: "only support
   algo = 0 (QR)"; NVIDIA's does nothing and reports success). The solvers
   agree with NVIDIA's to rounding, not bit for bit: they compute in double.
-- **cuSPARSELt**: FP8 and FP4 inputs (sm_89 and later on NVIDIA's library;
-  their scale modes are accepted and ignored), fp16 compute (no sm_86 kernel on NVIDIA's library
-  either), and GELU outside int8 output (refused there too); see the section
-  above for where the compressed layout and the search differ.
+- **cuSPARSELt**: FP4 (E2M1) inputs past the descriptor (an L4 and an RTX 3060 accept
+  the descriptor and refuse the algorithm; later GPUs' sparse FP4 format is not
+  implemented), FP8 outputs and the block scale modes `VEC32_UE4M3` and
+  `VEC64_UE8M0` (the same GPUs refuse them too), FP8 on Hopper and Blackwell
+  (documentation-derived: the L4's table is what is implemented), fp16 compute
+  (no kernel on sm_86 or sm_89 on NVIDIA's library either), and GELU outside int8
+  and FP8-into-bf16 output (refused there too); see the section above for where
+  the compressed layout and the search differ.
 - **cuSOLVER**: left eigenvectors from `Xgeev` (NVIDIA's CUDA 13.0 and 13.2
   libraries answer jobvl = VECTOR with INTERNAL_ERROR and document right
   eigenvectors only; this does the same), cusolverSp's `csrlsvlu` on the

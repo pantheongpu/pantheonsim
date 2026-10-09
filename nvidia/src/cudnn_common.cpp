@@ -128,6 +128,45 @@ I saturate(double v) {
 }
 }  // namespace
 
+namespace {
+// FP8 by the formats' definitions: E4M3 has no infinity and one NaN, E5M2 is a truncated half. Conversion to FP8
+// rounds to nearest even and saturates to the largest finite value (the cvt .satfinite every FP8 store uses), a NaN
+// becomes 0x7F (measured on an L4: both formats).
+double fp8_decode(uint8_t b, bool e4m3) {
+  const int ebits = e4m3 ? 4 : 5, mbits = e4m3 ? 3 : 2, bias = e4m3 ? 7 : 15;
+  const int e = (b >> mbits) & ((1 << ebits) - 1), m = b & ((1 << mbits) - 1);
+  double v;
+  if (e4m3 && e == 15 && m == 7) v = std::numeric_limits<double>::quiet_NaN();
+  else if (!e4m3 && e == 31) v = m ? std::numeric_limits<double>::quiet_NaN() : std::numeric_limits<double>::infinity();
+  else if (e == 0) v = std::ldexp(static_cast<double>(m), 1 - bias - mbits);
+  else v = std::ldexp(static_cast<double>(m | (1 << mbits)), e - bias - mbits);
+  return (b & 0x80) ? -v : v;
+}
+uint8_t fp8_encode(double v, bool e4m3) {
+  const int mbits = e4m3 ? 3 : 2, bias = e4m3 ? 7 : 15;
+  const double maxv = e4m3 ? 448.0 : 57344.0;
+  const uint8_t maxcode = e4m3 ? 0x7e : 0x7b;
+  if (std::isnan(v)) return 0x7f;
+  const uint8_t sign = std::signbit(v) ? 0x80 : 0;
+  const double a = std::fabs(v);
+  if (a >= maxv) return sign | maxcode;
+  int e;
+  std::frexp(a, &e);
+  int exp = e - 1;
+  const int emin = 1 - bias;
+  if (exp < emin) exp = emin;
+  const double quantum = std::ldexp(1.0, exp - mbits);
+  const double r = std::nearbyint(a / quantum) * quantum;
+  if (r >= maxv) return sign | maxcode;
+  if (r == 0) return sign;
+  int re;
+  std::frexp(r, &re);
+  const int rexp = re - 1;
+  if (rexp < emin) return sign | static_cast<uint8_t>(static_cast<int>(r / std::ldexp(1.0, emin - mbits)));
+  return sign | static_cast<uint8_t>(((rexp + bias) << mbits) | (static_cast<int>(r / std::ldexp(1.0, rexp - mbits)) - (1 << mbits)));
+}
+}  // namespace
+
 double decode(cudnnDataType_t t, const uint8_t* p) {
   switch (t) {
     case CUDNN_DATA_FLOAT: { float f; std::memcpy(&f, p, 4); return f; }
@@ -135,6 +174,8 @@ double decode(cudnnDataType_t t, const uint8_t* p) {
     case CUDNN_DATA_HALF: { uint16_t b; std::memcpy(&b, p, 2); return half_to_float(b); }
     case CUDNN_DATA_BFLOAT16: { uint16_t b; std::memcpy(&b, p, 2); return bf16_to_float(b); }
     case CUDNN_DATA_INT8: return static_cast<int8_t>(*p);
+    case CUDNN_DATA_FP8_E4M3: return fp8_decode(*p, true);
+    case CUDNN_DATA_FP8_E5M2: return fp8_decode(*p, false);
     case CUDNN_DATA_UINT8: return *p;
     case CUDNN_DATA_BOOLEAN: return *p ? 1.0 : 0.0;
     case CUDNN_DATA_INT32: { int32_t i; std::memcpy(&i, p, 4); return i; }
@@ -156,6 +197,8 @@ void encode(cudnnDataType_t t, double v, uint8_t* p) {
     // which rounds to 2, where the exact product would round to 3).
     case CUDNN_DATA_INT8: { const int8_t i = saturate<int8_t>(static_cast<float>(v)); std::memcpy(p, &i, 1); break; }
     case CUDNN_DATA_UINT8: *p = saturate<uint8_t>(static_cast<float>(v)); break;
+    case CUDNN_DATA_FP8_E4M3: *p = fp8_encode(static_cast<float>(v), true); break;
+    case CUDNN_DATA_FP8_E5M2: *p = fp8_encode(static_cast<float>(v), false); break;
     case CUDNN_DATA_BOOLEAN: *p = v != 0.0; break;
     case CUDNN_DATA_INT32: { const int32_t i = saturate<int32_t>(v); std::memcpy(p, &i, 4); break; }
     case CUDNN_DATA_INT64: { const int64_t i = saturate<int64_t>(v); std::memcpy(p, &i, 8); break; }

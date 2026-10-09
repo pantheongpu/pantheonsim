@@ -791,8 +791,8 @@ uint32_t double_to_fp8(double d, const Fp8Format& f, bool satfinite) {
   const uint32_t man_mask = (1u << f.man_bits) - 1u;
   const uint32_t exp_mask = (1u << f.exp_bits) - 1u;
   const uint32_t sign_bit = 1u << (f.exp_bits + f.man_bits);
-  const uint32_t nan_bits = f.has_inf ? ((exp_mask << f.man_bits) | 1u)
-                                      : ((exp_mask << f.man_bits) | man_mask);
+  // Measured on an L4 (sm_89): a NaN converts to the all-ones code in both formats (0x7F for E5M2 too).
+  const uint32_t nan_bits = (exp_mask << f.man_bits) | man_mask;
   if (std::isnan(d)) return nan_bits;
   const uint32_t sign = std::signbit(d) ? sign_bit : 0u;
   double a = std::fabs(d);
@@ -5390,7 +5390,8 @@ class Interpreter {
       };
       // One value to the narrow type (9.7.10.24's .relu and .satfinite).
       auto encode = [&](double v, uint32_t lane) -> uint32_t {
-        if (op->relu && v < 0) v = 0.0;
+        // Measured on an L4 (sm_89): .relu sends -0 and every negative to +0.
+        if (op->relu && !std::isnan(v) && std::signbit(v)) v = 0.0;
         uint32_t code;
         switch (fmt) {
           case NarrowFmt::E4M3:
