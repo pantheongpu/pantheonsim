@@ -68,3 +68,6 @@ for r in 2 3; do gen b_ref$r 64x48 14 main "cabac=1:bframes=2:b-pyramid=none:ref
 # message before every slice, an access unit delimiter before every slice, and the parameter sets (changed and unchanged) repeated
 # before one of the last slices. The card's parser must give the same callbacks as for the plain streams.
 python3 make_nal_variants.py
+
+# Field pictures (PAFF): written by the NVENC H.264 encoder's field mode from the MBAFF fixtures above; see make_paff.cpp for how to
+# build and run it (paff, paff_bff, paff_nodeblock, paff_intra, paff_crop).

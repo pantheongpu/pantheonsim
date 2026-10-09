@@ -63,6 +63,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
@@ -131,7 +132,7 @@ struct Decoder {
   std::vector<std::unique_ptr<vgpu_h264::Frame>> h264_frames;   // the decoded picture behind each surface
 };
 
-int g_next_uid = 1;
+std::atomic<int> g_next_uid{1};
 
 std::set<Decoder*> g_decoders;
 

@@ -169,12 +169,12 @@ void idct4_add(const int* d, uint8_t* dst, int stride) {
 // Quantises the coefficients of a 4x4 block into scan-order levels. `first` is 1 when the DC coefficient is
 // coded elsewhere (Intra16x16, chroma): then lev[i] is scan position i + 1. Returns the number of non-zero
 // levels. `dq` receives the dequantised coefficients (raster; DC left as given in dq[0]).
-int quant_block(const int* w, int qp, bool intra, int first, int* lev, int* dq) {
+int quant_block(const int* w, int qp, bool intra, int first, int* lev, int* dq, const uint8_t* scan) {
   const int qbits = 15 + qp / 6, m = qp % 6;
   const int f = (1 << qbits) / (intra ? 3 : 6);
   int nz = 0;
   for (int i = first; i < 16; ++i) {
-    const int k = kZigzag4x4[i];
+    const int k = scan[i];
     const int cls = pos_class(k);
     const int a = std::abs(w[k]);
     const int q = (a * kMF[m][cls] + f) >> qbits;
@@ -302,6 +302,7 @@ struct MbCode {
   int i4[16] = {};              // Intra4x4PredMode by luma4x4BlkIdx
   int cbp_l = 0, cbp_c = 0;
   int mvx = 0, mvy = 0;         // quarter samples
+  int ref = 0;                  // ref_idx_l0 of an inter macroblock
   int dc[16] = {};              // Intra16x16 DC levels, scan order
   int lv[16][16] = {};          // luma levels by blkIdx, scan order (Intra16x16: AC, scan positions 1..15 at 0..14)
   int cdc[2][4] = {};           // chroma DC levels
@@ -335,10 +336,30 @@ struct H264Encoder::Impl {
   std::vector<uint8_t> sy, su, sv;   // the picture, padded to whole macroblocks
   std::vector<uint8_t> ry, ru, rv;   // reconstruction before the loop filter
   std::unique_ptr<vgpu_h264::Frame> ref;   // the decoded picture the next P picture predicts from
-  RefPlanes rp;
   bool have_ref = false;
   int frame_num = 0, ref_frame_num = 0, pic_count = 0, uid = 0;
   bool decode_failed_reported = false;
+
+  // The reference pictures of the P picture being coded (RefPicList0): the previous frame, or, in field coding, fields of the
+  // previous frame and of the current one. Each is a picture of this encoder's size, with its interpolation planes.
+  struct RefPic {
+    RefPlanes rp;
+    std::vector<uint8_t> u, v;
+    int chroma_offset = 0;   // Table 8-10: added to the vertical chroma vector when the field's parity differs from the current one
+  };
+  std::vector<RefPic> refs;
+  std::vector<int8_t> mbref;   // ref_idx of every inter macroblock
+
+  // Field coding (interlaced test streams): this encoder's pictures are fields of a frame `frame_h` rows high.
+  bool field_coding = false;
+  int frame_h = 0;
+  struct FieldCtx {
+    bool bottom = false, second = false;
+  } fld;
+  std::unique_ptr<vgpu_h264::Frame> fr_cur, fr_prev;   // the frame stores: the one being coded (both fields), the previous one
+  int cur_first_parity = 0;                              // parity of the first field of fr_cur
+  bool cur_idr = false;                                  // the frame being coded starts with an IDR field: nothing before it is a reference
+  int field_count = 0;                                   // frames coded since the last IDR picture (for picture order counts)
 
   // per picture
   int qp = 26, qpc = 26;
@@ -351,8 +372,8 @@ struct H264Encoder::Impl {
   int skip_run = 0;
   EncStats st;
 
-  Impl(int width, int height, int fn, int fd, int prof, bool dbk)
-      : w(width), h(height), fps_num(fn), fps_den(fd), profile(prof), deblock(dbk) {
+  Impl(int width, int height, int fn, int fd, int prof, bool dbk, bool fields = false)
+      : w(width), h(fields ? height / 2 : height), fps_num(fn), fps_den(fd), profile(prof), deblock(dbk), field_coding(fields), frame_h(height) {
     mw = (w + 15) / 16;
     mh = (h + 15) / 16;
     ys = mw * 16;
@@ -360,7 +381,9 @@ struct H264Encoder::Impl {
     cw = (w + 1) / 2;
     ch = (h + 1) / 2;
     stream.width = w;
-    stream.height = h;
+    stream.height = frame_h;
+    stream.interlaced = fields;
+    stream.num_ref_frames = fields ? 2 : 1;
     stream.fps_num = fn;
     stream.fps_den = fd;
     stream.profile_idc = prof;
@@ -368,6 +391,9 @@ struct H264Encoder::Impl {
     ru.assign(static_cast<size_t>(cs) * mh * 8, 128);
     rv = ru;
   }
+
+  // the coefficient scan: field pictures scan the other way (8.5.6)
+  const uint8_t* scan4() const { return field_coding ? kField4x4 : kZigzag4x4; }
 
   // ---- neighbour bookkeeping ----------------------------------------------------------------------------------
 
@@ -404,13 +430,14 @@ struct H264Encoder::Impl {
     n.avail = true;
     const size_t a = static_cast<size_t>(my) * mw + mx;
     if (mb_inter[a]) {
-      n.ref = 0;
+      n.ref = mbref[a];
       n.x = mvx[a];
       n.y = mvy[a];
     }
     return n;
   }
-  void mv_pred(int mx, int my, int* px, int* py, bool* skip_zero) {
+  // The predictor for reference index `ref`; skip_zero says whether P_Skip (reference 0) takes the zero vector.
+  void mv_pred(int mx, int my, int ref, int* px, int* py, bool* skip_zero) {
     const Nb a = nb_mv(mx - 1, my), b = nb_mv(mx, my - 1);
     Nb c = nb_mv(mx + 1, my - 1);
     if (!c.avail) c = nb_mv(mx - 1, my - 1);
@@ -420,9 +447,9 @@ struct H264Encoder::Impl {
       B = a;
       C = a;
     }
-    const int matches = (a.ref == 0) + (B.ref == 0) + (C.ref == 0);
+    const int matches = (a.ref == ref) + (B.ref == ref) + (C.ref == ref);
     if (matches == 1) {
-      const Nb& m = a.ref == 0 ? a : (B.ref == 0 ? B : C);
+      const Nb& m = a.ref == ref ? a : (B.ref == ref ? B : C);
       *px = m.x;
       *py = m.y;
     } else {
@@ -454,8 +481,13 @@ struct H264Encoder::Impl {
 
   // ---- reference interpolation planes (8.4.2.2.1) -------------------------------------------------------------
 
-  void build_ref_planes() {
-    const vgpu_h264::Frame& f = *ref;
+  // The interpolation planes of a reference picture: rows `row0 + step * y` of the frame store f, for a frame (step 1) or one field
+  // of it (step 2, row0 = the parity).
+  void add_ref(const vgpu_h264::Frame& f, int row0, int step, int chroma_offset) {
+    refs.emplace_back();
+    RefPic& r = refs.back();
+    r.chroma_offset = chroma_offset;
+    RefPlanes& rp = r.rp;
     const int W = ys, H = mh * 16;
     rp.w = W;
     rp.h = H;
@@ -464,7 +496,13 @@ struct H264Encoder::Impl {
     rp.g.assign(n, 0);
     for (int y = -kPad; y < H + kPad; ++y)
       for (int x = -kPad; x < W + kPad; ++x)
-        rp.g[static_cast<size_t>(y + kPad) * rp.stride + (x + kPad)] = f.y[static_cast<size_t>(clip3(0, H - 1, y)) * f.stride_y + clip3(0, W - 1, x)];
+        rp.g[static_cast<size_t>(y + kPad) * rp.stride + (x + kPad)] = f.y[static_cast<size_t>(row0 + step * clip3(0, H - 1, y)) * f.stride_y + clip3(0, W - 1, x)];
+    r.u.resize(static_cast<size_t>(cs) * mh * 8);
+    r.v.resize(r.u.size());
+    for (int y = 0; y < mh * 8; ++y) {
+      std::memcpy(&r.u[static_cast<size_t>(y) * cs], &f.u[static_cast<size_t>(row0 + step * y) * f.stride_c], static_cast<size_t>(cs));
+      std::memcpy(&r.v[static_cast<size_t>(y) * cs], &f.v[static_cast<size_t>(row0 + step * y) * f.stride_c], static_cast<size_t>(cs));
+    }
     const int PW = rp.stride, PH = H + 2 * kPad;
     auto G = [&](int x, int y) { return static_cast<int>(rp.g[static_cast<size_t>(clip3(0, PH - 1, y)) * PW + clip3(0, PW - 1, x)]); };
     std::vector<int16_t> b1(n);   // horizontal intermediate values
@@ -488,7 +526,8 @@ struct H264Encoder::Impl {
   }
 
   // The 16x16 luma prediction at quarter-sample vector (mvx, mvy) for macroblock (mx, my).
-  void pred_luma(int mx, int my, int vx, int vy, uint8_t* out) const {
+  void pred_luma(int ri, int mx, int my, int vx, int vy, uint8_t* out) const {
+    const RefPlanes& rp = refs[static_cast<size_t>(ri)].rp;
     const int fx = vx & 3, fy = vy & 3;
     const int X0 = mx * 16 + (vx >> 2), Y0 = my * 16 + (vy >> 2);
     for (int y = 0; y < 16; ++y)
@@ -522,8 +561,9 @@ struct H264Encoder::Impl {
   }
 
   // The 8x8 chroma predictions (8.4.2.2.2) of both planes at the luma vector.
-  void pred_chroma(int mx, int my, int vx, int vy, uint8_t* out_u, uint8_t* out_v) const {
-    const vgpu_h264::Frame& f = *ref;
+  void pred_chroma(int ri, int mx, int my, int vx, int vy_luma, uint8_t* out_u, uint8_t* out_v) const {
+    const RefPic& f = refs[static_cast<size_t>(ri)];
+    const int vy = vy_luma + f.chroma_offset;
     const int fx = vx & 7, fy = vy & 7;
     const int X0 = mx * 8 + (vx >> 3), Y0 = my * 8 + (vy >> 3);
     const int W = mw * 8, H = mh * 8;
@@ -532,7 +572,7 @@ struct H264Encoder::Impl {
       uint8_t* out = c ? out_v : out_u;
       for (int y = 0; y < 8; ++y)
         for (int x = 0; x < 8; ++x) {
-          auto at = [&](int dx, int dy) { return static_cast<int>(p[static_cast<size_t>(clip3(0, H - 1, Y0 + y + dy)) * f.stride_c + clip3(0, W - 1, X0 + x + dx)]); };
+          auto at = [&](int dx, int dy) { return static_cast<int>(p[static_cast<size_t>(clip3(0, H - 1, Y0 + y + dy)) * cs + clip3(0, W - 1, X0 + x + dx)]); };
           out[y * 8 + x] = static_cast<uint8_t>(((8 - fx) * (8 - fy) * at(0, 0) + fx * (8 - fy) * at(1, 0) + (8 - fx) * fy * at(0, 1) + fx * fy * at(1, 1) + 32) >> 6);
         }
     }
@@ -648,7 +688,7 @@ struct H264Encoder::Impl {
       dcl[k] = had[k] < 0 ? -q : q;
       any_dc |= q != 0;
     }
-    for (int i = 0; i < 16; ++i) mc.dc[i] = dcl[kZigzag4x4[i]];
+    for (int i = 0; i < 16; ++i) mc.dc[i] = dcl[scan4()[i]];
     // DC reconstruction (8.5.10)
     int ft[16], fdc[16];
     for (int i = 0; i < 4; ++i) {
@@ -674,7 +714,7 @@ struct H264Encoder::Impl {
     int dqs[16][16];
     for (int blk = 0; blk < 16; ++blk) {
       int dq[16] = {};
-      const int nz = quant_block(W[blk], qp, true, 1, mc.lv[blk], dq);
+      const int nz = quant_block(W[blk], qp, true, 1, mc.lv[blk], dq, scan4());
       any_ac |= nz != 0;
       std::memcpy(dqs[blk], dq, sizeof dq);
     }
@@ -770,7 +810,7 @@ struct H264Encoder::Impl {
       for (int y = 0; y < 4; ++y)
         for (int x = 0; x < 4; ++x) r[y * 4 + x] = s[(by * 4 + y) * ys + bx * 4 + x] - best_pred[y * 4 + x];
       fwd4x4(r, wc);
-      const int nz = quant_block(wc, qp, true, 0, mc.lv[blk], dq);
+      const int nz = quant_block(wc, qp, true, 0, mc.lv[blk], dq, scan4());
       uint8_t* d = rec_y(mx, my) + by * 4 * ys + bx * 4;
       for (int y = 0; y < 4; ++y)
         for (int x = 0; x < 4; ++x) d[y * ys + x] = best_pred[y * 4 + x];
@@ -794,7 +834,7 @@ struct H264Encoder::Impl {
         for (int x = 0; x < 4; ++x) r[y * 4 + x] = s[(by * 4 + y) * ys + bx * 4 + x] - pred[(by * 4 + y) * 16 + bx * 4 + x];
       fwd4x4(r, wc);
       std::memset(dqs[blk], 0, sizeof dqs[blk]);
-      const int nz = quant_block(wc, qp, false, 0, mc.lv[blk], dqs[blk]);
+      const int nz = quant_block(wc, qp, false, 0, mc.lv[blk], dqs[blk], scan4());
       any[blk >> 2] |= nz != 0;
     }
     // A lone +-1 level high in the scan costs more bits than it is worth: drop an 8x8 block's levels when they are that few.
@@ -917,7 +957,7 @@ struct H264Encoder::Impl {
         fwd4x4(r, wc);
         dcw[b] = wc[0];
         std::memset(dqs[c][b], 0, sizeof dqs[c][b]);
-        const int nz = quant_block(wc, qpcv, intra, 1, mc.cac[c][b], dqs[c][b]);
+        const int nz = quant_block(wc, qpcv, intra, 1, mc.cac[c][b], dqs[c][b], scan4());
         any_ac |= nz != 0;
       }
       const int hd[4] = {dcw[0] + dcw[1] + dcw[2] + dcw[3], dcw[0] - dcw[1] + dcw[2] - dcw[3], dcw[0] + dcw[1] - dcw[2] - dcw[3], dcw[0] - dcw[1] - dcw[2] + dcw[3]};
@@ -965,10 +1005,13 @@ struct H264Encoder::Impl {
       for (int by = 0; by < 2; ++by)
         for (int bx = 0; bx < 2; ++bx) NZC(c, mx * 2 + bx, my * 2 + by) = 0;
     if (mc.type == kMbInter) {
-      w.ue(0);   // P_L0_16x16 (num_ref_idx_active is 1: no ref_idx)
+      w.ue(0);   // P_L0_16x16
+      const int nref = static_cast<int>(refs.size());
+      if (nref == 2) w.bit(mc.ref ? 0 : 1);   // ref_idx_l0: te(v) with a largest value of 1 is one inverted bit
+      else if (nref > 2) w.ue(static_cast<uint32_t>(mc.ref));
       int px, py;
       bool sz;
-      mv_pred(mx, my, &px, &py, &sz);
+      mv_pred(mx, my, mc.ref, &px, &py, &sz);
       w.se(mc.mvx - px);
       w.se(mc.mvy - py);
       const int cbp = mc.cbp_l | (mc.cbp_c << 4);
@@ -1051,8 +1094,8 @@ struct H264Encoder::Impl {
     int cost;
     int sad;
   };
-  MvCost eval_mv(int mx, int my, int vx, int vy, int px, int py, uint8_t* pred) const {
-    pred_luma(mx, my, vx, vy, pred);
+  MvCost eval_mv(int ri, int mx, int my, int vx, int vy, int px, int py, uint8_t* pred) const {
+    pred_luma(ri, mx, my, vx, vy, pred);
     const int sad = sad16(src_y(mx, my), ys, pred);
     return {sad + static_cast<int>(lam_sad * mv_bits(vx - px, vy - py) + 0.5), sad};
   }
@@ -1063,13 +1106,13 @@ struct H264Encoder::Impl {
            std::abs(vx) <= (kSearch + 2) * 4 && std::abs(vy) <= (kSearch + 2) * 4;
   }
 
-  void search(int mx, int my, int px, int py, int* bx, int* by, int* bcost, int* bsad) const {
+  void search(int ri, int mx, int my, int px, int py, int* bx, int* by, int* bcost, int* bsad) const {
     uint8_t pred[256];
     int best_x = 0, best_y = 0;
-    MvCost best = eval_mv(mx, my, 0, 0, px, py, pred);
+    MvCost best = eval_mv(ri, mx, my, 0, 0, px, py, pred);
     auto try_mv = [&](int vx, int vy) {
       if (!mv_in_range(mx, my, vx, vy)) return false;
-      const MvCost c = eval_mv(mx, my, vx, vy, px, py, pred);
+      const MvCost c = eval_mv(ri, mx, my, vx, vy, px, py, pred);
       if (c.cost < best.cost) {
         best = c;
         best_x = vx;
@@ -1082,8 +1125,8 @@ struct H264Encoder::Impl {
     try_mv((px >> 2) * 4, (py >> 2) * 4);
     {
       const Nb a = nb_mv(mx - 1, my), b = nb_mv(mx, my - 1);
-      if (a.ref == 0) try_mv((a.x >> 2) * 4, (a.y >> 2) * 4);
-      if (b.ref == 0) try_mv((b.x >> 2) * 4, (b.y >> 2) * 4);
+      if (a.ref == ri) try_mv((a.x >> 2) * 4, (a.y >> 2) * 4);
+      if (b.ref == ri) try_mv((b.x >> 2) * 4, (b.y >> 2) * 4);
     }
     // whole-sample diamond refinement
     for (int it = 0; it < 2 * kSearch; ++it) {
@@ -1224,7 +1267,10 @@ struct H264Encoder::Impl {
   }
 
   std::vector<uint8_t> encode_picture(const EncPicture& in, PicType t, int q, EncStats* stats);
+  std::vector<uint8_t> code_picture(const EncPicture& in, PicType t, int q);
+  std::vector<uint8_t> encode_field_pair(const EncPicture& frame, bool top_first, PicType t, int q, EncStats* stats);
   bool deblock_with_decoder(const std::vector<uint8_t>& nal, bool idr, int frame_num_now);
+  bool deblock_field(const std::vector<uint8_t>& nal, bool idr);
 };
 
 bool H264Encoder::Impl::deblock_with_decoder(const std::vector<uint8_t>& nal, bool idr, int fn) {
@@ -1278,19 +1324,49 @@ bool H264Encoder::Impl::deblock_with_decoder(const std::vector<uint8_t>& nal, bo
 
 std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, PicType t, int q, EncStats* stats) {
   if ((t == PicType::kInter || t == PicType::kIntra) && !have_ref) t = PicType::kIdr;
+  std::vector<uint8_t> out = code_picture(in, t, q);
+  st.bytes = out.size();
+  if (stats) {
+    double sse = 0;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const int d = in.y[static_cast<size_t>(y) * w + x] - ref->y[static_cast<size_t>(y) * ref->stride_y + x];
+        sse += static_cast<double>(d) * d;
+      }
+    st.psnr_y = sse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 * static_cast<double>(w) * h / sse);
+    *stats = st;
+  }
+  return out;
+}
+
+// Codes one picture: a frame, or (in field coding) the field described by `fld`.
+std::vector<uint8_t> H264Encoder::Impl::code_picture(const EncPicture& in, PicType t, int q) {
   type = t;
   qp = clip3(0, 51, q);
   qpc = qpc_of(qp);
   lambda = 0.85 * std::pow(2.0, (qp - 12) / 3.0);
   lam_sad = std::sqrt(lambda);
-  const bool idr = t == PicType::kIdr;
+  const bool idr = t == PicType::kIdr && !(field_coding && fld.second);
   const bool inter_pic = t == PicType::kInter;
-  if (idr) {
-    pic_count = 0;
-    frame_num = 0;
+  int poc_lsb = 0;
+  if (!field_coding) {
+    if (idr) {
+      pic_count = 0;
+      frame_num = 0;
+    } else {
+      frame_num = (ref_frame_num + 1) & 15;
+      ++pic_count;
+    }
   } else {
-    frame_num = (ref_frame_num + 1) & 15;
-    ++pic_count;
+    if (!fld.second) {
+      if (idr) {
+        field_count = 0;
+        frame_num = 0;
+      } else {
+        frame_num = (ref_frame_num + 1) & 15;
+      }
+    }
+    poc_lsb = (4 * field_count + (fld.second ? 1 : 0)) & 0xFFFF;
   }
   load_source(in);
   nz_y.assign(static_cast<size_t>(mw) * 4 * mh * 4, 0);
@@ -1300,7 +1376,25 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
   mb_inter.assign(static_cast<size_t>(mw) * mh, 0);
   mvx.assign(mb_inter.size(), 0);
   mvy = mvx;
-  if (inter_pic) build_ref_planes();
+  mbref.assign(mb_inter.size(), 0);
+  refs.clear();
+  if (inter_pic) {
+    if (!field_coding) {
+      add_ref(*ref, 0, 1, 0);
+    } else {
+      // 8.2.4.2.5: the fields of the reference frames, the same parity first, the frame being coded counted among them
+      const int cp = fld.bottom ? 1 : 0;
+      if (!fld.second) {
+        if (fr_prev) {
+          add_ref(*fr_prev, cp, 2, 0);
+          add_ref(*fr_prev, 1 - cp, 2, 2 * (cp - (1 - cp)));
+        }
+      } else {
+        if (fr_prev && !cur_idr) add_ref(*fr_prev, cp, 2, 0);
+        add_ref(*fr_cur, 1 - cp, 2, 2 * (cp - (1 - cp)));
+      }
+    }
+  }
 
   BitWriter bw;
   // slice_header
@@ -1308,9 +1402,19 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
   bw.ue(inter_pic ? 5 : 7);                  // slice_type: P / I, every slice of the picture
   bw.ue(0);                                  // pic_parameter_set_id
   bw.put(static_cast<uint32_t>(frame_num), 4);
+  if (field_coding) {
+    bw.bit(1);                               // field_pic_flag
+    bw.bit(fld.bottom ? 1 : 0);              // bottom_field_flag
+  }
   if (idr) bw.ue(0);                         // idr_pic_id
+  if (field_coding) bw.put(static_cast<uint32_t>(poc_lsb), 16);   // pic_order_cnt_lsb
   if (inter_pic) {
-    bw.bit(0);                               // num_ref_idx_active_override_flag
+    if (refs.size() == 1) {
+      bw.bit(0);                             // num_ref_idx_active_override_flag
+    } else {
+      bw.bit(1);
+      bw.ue(static_cast<uint32_t>(refs.size() - 1));   // num_ref_idx_l0_active_minus1
+    }
     bw.bit(0);                               // ref_pic_list_modification_flag_l0
   }
   if (idr) {
@@ -1340,18 +1444,33 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
       if (inter_pic) {
         int px, py;
         bool skip_zero;
-        mv_pred(mx, my, &px, &py, &skip_zero);
+        mv_pred(mx, my, 0, &px, &py, &skip_zero);
         const int skx = skip_zero ? 0 : px, sky = skip_zero ? 0 : py;
-        int vx, vy, vcost, vsad;
-        search(mx, my, px, py, &vx, &vy, &vcost, &vsad);
-        // P_Skip candidate
+        // the reference picture and vector with the least cost
+        int vx = 0, vy = 0, vcost = 0x7fffffff, vsad = 0, vref = 0;
+        for (int ri = 0; ri < static_cast<int>(refs.size()); ++ri) {
+          int qx, qy, qcost, qsad, rx, ry2;
+          bool unused;
+          mv_pred(mx, my, ri, &rx, &ry2, &unused);
+          search(ri, mx, my, rx, ry2, &qx, &qy, &qcost, &qsad);
+          qcost += static_cast<int>(lam_sad * (ri == 0 ? 1 : 3) + 0.5) * (refs.size() > 1 ? 1 : 0);
+          if (qcost < vcost) {
+            vcost = qcost;
+            vx = qx;
+            vy = qy;
+            vsad = qsad;
+            vref = ri;
+          }
+        }
+        // P_Skip candidate (reference 0)
         uint8_t pl_skip[256], pu_skip[64], pv_skip[64];
-        pred_luma(mx, my, skx, sky, pl_skip);
-        pred_chroma(mx, my, skx, sky, pu_skip, pv_skip);
+        pred_luma(0, mx, my, skx, sky, pl_skip);
+        pred_chroma(0, mx, my, skx, sky, pu_skip, pv_skip);
         MbCode sk;
         sk.type = kMbInter;
         sk.mvx = skx;
         sk.mvy = sky;
+        sk.ref = 0;
         code_luma_inter(mx, my, pl_skip, sk);
         code_chroma(mx, my, pu_skip, pv_skip, false, sk);
         const bool skip_ok = sk.cbp_l == 0 && sk.cbp_c == 0;
@@ -1367,11 +1486,12 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
         ic.type = kMbInter;
         ic.mvx = vx;
         ic.mvy = vy;
-        const bool same_as_skip = vx == skx && vy == sky;
+        ic.ref = vref;
+        const bool same_as_skip = vx == skx && vy == sky && vref == 0;
         if (!(same_as_skip && skip_ok)) {
           uint8_t pl[256], pu[64], pv[64];
-          pred_luma(mx, my, vx, vy, pl);
-          pred_chroma(mx, my, vx, vy, pu, pv);
+          pred_luma(vref, mx, my, vx, vy, pl);
+          pred_chroma(vref, mx, my, vx, vy, pu, pv);
           code_luma_inter(mx, my, pl, ic);
           code_chroma(mx, my, pu, pv, false, ic);
           j_inter = mb_cost(mx, my, ic, true);
@@ -1414,6 +1534,7 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
       // state for the neighbours
       const bool is_inter = best.type == kMbInter || skipped;
       mb_inter[mbi] = is_inter ? 1 : 0;
+      mbref[mbi] = static_cast<int8_t>(is_inter ? best.ref : 0);
       mvx[mbi] = is_inter ? best.mvx : 0;
       mvy[mbi] = is_inter ? best.mvy : 0;
       if (best.type != kMbI4x4)
@@ -1442,8 +1563,9 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
 
   std::vector<uint8_t> out;
   append_nal(out, idr || t == PicType::kIntra ? 3 : 2, idr ? 5 : 1, bw.bytes());
-  deblock_with_decoder(out, idr, frame_num);
-  ref_frame_num = frame_num;
+  if (field_coding) deblock_field(out, idr);
+  else deblock_with_decoder(out, idr, frame_num);
+  if (!field_coding) ref_frame_num = frame_num;
   have_ref = true;
   if (idr || t == PicType::kIntra) {
     // Intra pictures carry a digest of the picture they were made from (a user_data_unregistered SEI message that every
@@ -1467,22 +1589,130 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
     out = std::move(with_sei);
   }
 
+  return out;
+}
+
+// The field pictures' loop filter and reference: like deblock_with_decoder, with the frame store shared by the two fields.
+bool H264Encoder::Impl::deblock_field(const std::vector<uint8_t>& nal, bool idr) {
+  vgpu_h264::PicParams pp;
+  pp.log2_max_frame_num = 4;
+  pp.poc_type = 0;
+  pp.log2_max_poc_lsb = 16;
+  pp.frame_mbs_only = 0;
+  pp.direct_8x8_inference = 1;
+  pp.num_ref_frames = 2;
+  pp.chroma_format_idc = 1;
+  pp.bit_depth_luma = pp.bit_depth_chroma = 8;
+  pp.cabac = 0;
+  pp.num_ref_idx_default[0] = pp.num_ref_idx_default[1] = 1;
+  pp.pic_init_qp = 26;
+  pp.deblocking_control_present = 1;
+  pp.mbs_w = mw;
+  pp.mbs_h = 2 * mh;
+  pp.field_pic = 1;
+  pp.bottom_field = fld.bottom;
+  pp.second_field = fld.second;
+  pp.frame_num = frame_num;
+  const int first_poc = 4 * field_count, this_poc = first_poc + (fld.second ? 1 : 0);
+  pp.poc[fld.bottom ? 1 : 0] = this_poc;
+  pp.poc[fld.bottom ? 0 : 1] = fld.second ? first_poc : this_poc;
+  pp.ref_pic = 1;
+  pp.idr = idr;
+  if (!fld.second) {
+    fr_cur = std::make_unique<vgpu_h264::Frame>();
+    fr_cur->uid = ++uid;
+    fr_cur->alloc(mw, 2 * mh);
+    cur_first_parity = fld.bottom ? 1 : 0;
+    cur_idr = idr;
+  }
+  if (!cur_idr && fr_prev) {
+    vgpu_h264::DpbEntry e;
+    e.frame = fr_prev.get();
+    e.frame_num = ref_frame_num;
+    e.used = 3;
+    e.poc[0] = fr_prev->poc[0];
+    e.poc[1] = fr_prev->poc[1];
+    pp.dpb.push_back(e);
+  }
+  if (fld.second) {
+    vgpu_h264::DpbEntry e;
+    e.frame = fr_cur.get();
+    e.frame_num = frame_num;
+    e.used = 1 << cur_first_parity;
+    e.poc[cur_first_parity] = first_poc;
+    e.poc[1 - cur_first_parity] = first_poc;
+    pp.dpb.push_back(e);
+  }
+  std::vector<vgpu_h264::SliceData> slices{{nal.data() + 4, nal.size() - 4}};
+  std::string err;
+  const bool ok = vgpu_h264::decode_picture(fr_cur.get(), pp, slices, &err);
+  if (!ok) {
+    if (!decode_failed_reported) {
+      std::fprintf(stderr, "[vgpu] NVENC: the H.264 encoder's own field did not decode (%s); the reference is its reconstruction\n", err.c_str());
+      decode_failed_reported = true;
+    }
+    const int par = fld.bottom ? 1 : 0;
+    for (int y = 0; y < mh * 16; ++y) std::memcpy(&fr_cur->y[static_cast<size_t>(2 * y + par) * fr_cur->stride_y], &ry[static_cast<size_t>(y) * ys], static_cast<size_t>(ys));
+    for (int y = 0; y < mh * 8; ++y) {
+      std::memcpy(&fr_cur->u[static_cast<size_t>(2 * y + par) * fr_cur->stride_c], &ru[static_cast<size_t>(y) * cs], static_cast<size_t>(cs));
+      std::memcpy(&fr_cur->v[static_cast<size_t>(2 * y + par) * fr_cur->stride_c], &rv[static_cast<size_t>(y) * cs], static_cast<size_t>(cs));
+    }
+  }
+  fr_cur->poc[fld.bottom ? 1 : 0] = this_poc;
+  if (!fld.second) fr_cur->poc[fld.bottom ? 0 : 1] = this_poc;
+  return ok;
+}
+
+// A frame as two field pictures: the first field (an IDR, intra or P picture), then a P field that may predict from it.
+std::vector<uint8_t> H264Encoder::Impl::encode_field_pair(const EncPicture& frame, bool top_first, PicType t, int q, EncStats* stats) {
+  if (!field_coding) return {};
+  if ((t == PicType::kInter || t == PicType::kIntra) && !fr_prev) t = PicType::kIdr;
+  const int fh = frame.h / 2, cwf = (frame.w + 1) / 2, chf = (frame.h / 2 + 1) / 2;
+  EncPicture f[2];
+  for (int par = 0; par < 2; ++par) {
+    f[par].w = frame.w;
+    f[par].h = fh;
+    f[par].y.resize(static_cast<size_t>(frame.w) * fh);
+    f[par].u.resize(static_cast<size_t>(cwf) * chf);
+    f[par].v.resize(f[par].u.size());
+    for (int y = 0; y < fh; ++y) std::memcpy(&f[par].y[static_cast<size_t>(y) * frame.w], &frame.y[static_cast<size_t>(2 * y + par) * frame.w], static_cast<size_t>(frame.w));
+    // 4:2:0 chroma of an interlaced frame: its rows alternate between the fields as well
+    for (int y = 0; y < chf; ++y) {
+      const int src = std::min(2 * y + par, (frame.h + 1) / 2 - 1);
+      std::memcpy(&f[par].u[static_cast<size_t>(y) * cwf], &frame.u[static_cast<size_t>(src) * cwf], static_cast<size_t>(cwf));
+      std::memcpy(&f[par].v[static_cast<size_t>(y) * cwf], &frame.v[static_cast<size_t>(src) * cwf], static_cast<size_t>(cwf));
+    }
+  }
+  const int p0 = top_first ? 0 : 1;
+  fld.bottom = p0 == 1;
+  fld.second = false;
+  std::vector<uint8_t> out = code_picture(f[p0], t, q);
+  const size_t first_bytes = out.size();
+  fld.bottom = p0 != 1;
+  fld.second = true;
+  const std::vector<uint8_t> second = code_picture(f[1 - p0], PicType::kInter, q);
+  out.insert(out.end(), second.begin(), second.end());
+  ref_frame_num = frame_num;
+  ++field_count;
+  fr_prev = std::move(fr_cur);
+  have_ref = true;
   st.bytes = out.size();
+  (void)first_bytes;
   if (stats) {
     double sse = 0;
-    for (int y = 0; y < h; ++y)
-      for (int x = 0; x < w; ++x) {
-        const int d = in.y[static_cast<size_t>(y) * w + x] - ref->y[static_cast<size_t>(y) * ref->stride_y + x];
+    for (int y = 0; y < frame.h; ++y)
+      for (int x = 0; x < frame.w; ++x) {
+        const int d = frame.y[static_cast<size_t>(y) * frame.w + x] - fr_prev->y[static_cast<size_t>(y) * fr_prev->stride_y + x];
         sse += static_cast<double>(d) * d;
       }
-    st.psnr_y = sse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 * static_cast<double>(w) * h / sse);
+    st.psnr_y = sse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 * static_cast<double>(frame.w) * frame.h / sse);
     *stats = st;
   }
   return out;
 }
 
-H264Encoder::H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock)
-    : p_(new Impl(width, height, fps_num, fps_den, profile_idc, deblock)) {}
+H264Encoder::H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock, bool field_pictures)
+    : p_(new Impl(width, height, fps_num, fps_den, profile_idc, deblock, field_pictures)) {}
 H264Encoder::~H264Encoder() = default;
 
 std::vector<uint8_t> H264Encoder::parameter_sets() const { return p_->stream.parameter_sets(); }
@@ -1491,9 +1721,15 @@ std::vector<uint8_t> H264Encoder::encode(const EncPicture& in, PicType type, int
   return p_->encode_picture(in, type, qp, stats);
 }
 
+std::vector<uint8_t> H264Encoder::encode_field_pair(const EncPicture& frame, bool top_field_first, PicType type, int qp, EncStats* stats) {
+  return p_->encode_field_pair(frame, top_field_first, type, qp, stats);
+}
+
 void H264Encoder::reset() {
   p_->have_ref = false;
   p_->ref.reset();
+  p_->fr_prev.reset();
+  p_->fr_cur.reset();
 }
 
 int H264Encoder::coded_width() const { return p_->ys; }

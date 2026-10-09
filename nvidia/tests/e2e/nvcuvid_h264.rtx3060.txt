@@ -5839,6 +5839,414 @@ stream p_ps_mid [packets]
   frame 9: 96x64 crc d3fd7cab luma d0bc091e
   end of stream: 0, 10 frames displayed, 0 decode failures
   summary p_ps_mid: frames 10 crc 63fdb82e
+stream paff [packets]
+  cuvidCreateVideoParser: 0
+  packet 0: 1363 bytes, NAL types 7 8 6 5
+  packet 1: 1198 bytes, NAL types 1
+  sequence: codec 4 rate 0/0 progressive 0 depth 0/0 chroma 1 surfaces 9 coded 128x96 display 0,0,128,96 bitrate 0 aspect 4:3 signal 05 02 02 02 seqhdr 0
+  cuvidCreateDecoder: 0
+  decode: mbs 8x6 index 0 field 1 bottom 0 second 0 intra 1 ref 1 length 1310 slices 1 offsets 0 head 00 00 01 65 88 85
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 2: 889 bytes, NAL types 1
+  decode: mbs 8x6 index 0 field 1 bottom 1 second 1 intra 0 ref 1 length 1198 slices 1 offsets 0 head 00 00 01 41 9a 18
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 1 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 1 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 3: 881 bytes, NAL types 1
+  decode: mbs 8x6 index 1 field 1 bottom 0 second 0 intra 0 ref 1 length 889 slices 1 offsets 0 head 00 00 01 41 9a 30
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 4 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 4: 822 bytes, NAL types 1
+  decode: mbs 8x6 index 1 field 1 bottom 1 second 1 intra 0 ref 1 length 881 slices 1 offsets 0 head 00 00 01 41 9a 38
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 0 5 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; [1] pic 1 fn 1 lt 0 ne 0 used 1 poc 4 5; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 5: 874 bytes, NAL types 1
+  decode: mbs 8x6 index 2 field 1 bottom 0 second 0 intra 0 ref 1 length 822 slices 1 offsets 0 head 00 00 01 41 9a 50
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 8 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 6: 915 bytes, NAL types 1
+  decode: mbs 8x6 index 2 field 1 bottom 1 second 1 intra 0 ref 1 length 874 slices 1 offsets 0 head 00 00 01 41 9a 58
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 0 9 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; [2] pic 2 fn 2 lt 0 ne 0 used 1 poc 8 9; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 7: 1010 bytes, NAL types 1
+  decode: mbs 8x6 index 3 field 1 bottom 0 second 0 intra 0 ref 1 length 915 slices 1 offsets 0 head 00 00 01 41 9a 70
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 12 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 8: 1054 bytes, NAL types 1
+  decode: mbs 8x6 index 3 field 1 bottom 1 second 1 intra 0 ref 1 length 1010 slices 1 offsets 0 head 00 00 01 41 9a 78
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 0 13 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; [3] pic 3 fn 3 lt 0 ne 0 used 1 poc 12 13; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 9: 931 bytes, NAL types 1
+  decode: mbs 8x6 index 4 field 1 bottom 0 second 0 intra 0 ref 1 length 1054 slices 1 offsets 0 head 00 00 01 41 9a 90
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 16 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 10: 950 bytes, NAL types 1
+  decode: mbs 8x6 index 4 field 1 bottom 1 second 1 intra 0 ref 1 length 931 slices 1 offsets 0 head 00 00 01 41 9a 98
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 0 17 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; [4] pic 4 fn 4 lt 0 ne 0 used 1 poc 16 17; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 11: 987 bytes, NAL types 1
+  decode: mbs 8x6 index 5 field 1 bottom 0 second 0 intra 0 ref 1 length 950 slices 1 offsets 0 head 00 00 01 41 9a b0
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 5 poc 20 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; [4] pic 4 fn 4 lt 0 ne 0 used 3 poc 16 17; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  end of stream call
+  decode: mbs 8x6 index 5 field 1 bottom 1 second 1 intra 0 ref 1 length 986 slices 1 offsets 0 head 00 00 01 41 9a b8
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 5 poc 0 21 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [4] pic 4 fn 4 lt 0 ne 0 used 3 poc 16 17; [5] pic 5 fn 5 lt 0 ne 0 used 1 poc 20 21; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  display: index 0 progressive 0 top-field-first 1 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 0: 128x96 crc 273e34b3 luma e7fa0b47
+  display: index 1 progressive 0 top-field-first 1 repeat 0 timestamp 66; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 1: 128x96 crc f3d9f839 luma 46f940f3
+  display: index 2 progressive 0 top-field-first 1 repeat 0 timestamp 132; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 2: 128x96 crc 6d14cfca luma ce445adc
+  display: index 3 progressive 0 top-field-first 1 repeat 0 timestamp 198; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 3: 128x96 crc 5d21b5d3 luma b509a752
+  display: index 4 progressive 0 top-field-first 1 repeat 0 timestamp 264; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 4: 128x96 crc 0c29ef04 luma fbff21cd
+  display: index 5 progressive 0 top-field-first 1 repeat 0 timestamp 330; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 5: 128x96 crc 4080c9be luma 5bcb4df0
+  end of stream: 0, 6 frames displayed, 0 decode failures
+  summary paff: frames 6 crc 7afdf2a8
+stream paff_bff [packets]
+  cuvidCreateVideoParser: 0
+  packet 0: 1410 bytes, NAL types 7 8 6 5
+  packet 1: 1127 bytes, NAL types 1
+  sequence: codec 4 rate 0/0 progressive 0 depth 0/0 chroma 1 surfaces 9 coded 128x96 display 0,0,128,96 bitrate 0 aspect 4:3 signal 05 02 02 02 seqhdr 0
+  cuvidCreateDecoder: 0
+  decode: mbs 8x6 index 0 field 1 bottom 1 second 0 intra 1 ref 1 length 1357 slices 1 offsets 0 head 00 00 01 65 88 87
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 2: 920 bytes, NAL types 1
+  decode: mbs 8x6 index 0 field 1 bottom 0 second 1 intra 0 ref 1 length 1127 slices 1 offsets 0 head 00 00 01 41 9a 10
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 1 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 2 poc 1 0; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 3: 870 bytes, NAL types 1
+  decode: mbs 8x6 index 1 field 1 bottom 1 second 0 intra 0 ref 1 length 920 slices 1 offsets 0 head 00 00 01 41 9a 38
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 0 4 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 1 0; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 4: 876 bytes, NAL types 1
+  decode: mbs 8x6 index 1 field 1 bottom 0 second 1 intra 0 ref 1 length 870 slices 1 offsets 0 head 00 00 01 41 9a 30
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 5 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 1 0; [1] pic 1 fn 1 lt 0 ne 0 used 2 poc 5 4; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 5: 884 bytes, NAL types 1
+  decode: mbs 8x6 index 2 field 1 bottom 1 second 0 intra 0 ref 1 length 876 slices 1 offsets 0 head 00 00 01 41 9a 58
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 0 8 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 1 0; [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 5 4; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 6: 1009 bytes, NAL types 1
+  decode: mbs 8x6 index 2 field 1 bottom 0 second 1 intra 0 ref 1 length 884 slices 1 offsets 0 head 00 00 01 41 9a 50
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 9 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 5 4; [2] pic 2 fn 2 lt 0 ne 0 used 2 poc 9 8; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 7: 918 bytes, NAL types 1
+  decode: mbs 8x6 index 3 field 1 bottom 1 second 0 intra 0 ref 1 length 1009 slices 1 offsets 0 head 00 00 01 41 9a 78
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 0 12 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 5 4; [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 9 8; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 8: 987 bytes, NAL types 1
+  decode: mbs 8x6 index 3 field 1 bottom 0 second 1 intra 0 ref 1 length 918 slices 1 offsets 0 head 00 00 01 41 9a 70
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 13 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 9 8; [3] pic 3 fn 3 lt 0 ne 0 used 2 poc 13 12; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 9: 928 bytes, NAL types 1
+  decode: mbs 8x6 index 4 field 1 bottom 1 second 0 intra 0 ref 1 length 987 slices 1 offsets 0 head 00 00 01 41 9a 98
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 0 16 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 9 8; [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 13 12; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 10: 962 bytes, NAL types 1
+  decode: mbs 8x6 index 4 field 1 bottom 0 second 1 intra 0 ref 1 length 928 slices 1 offsets 0 head 00 00 01 41 9a 90
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 17 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 13 12; [4] pic 4 fn 4 lt 0 ne 0 used 2 poc 17 16; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 11: 915 bytes, NAL types 1
+  decode: mbs 8x6 index 5 field 1 bottom 1 second 0 intra 0 ref 1 length 962 slices 1 offsets 0 head 00 00 01 41 9a b8
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 5 poc 0 20 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 13 12; [4] pic 4 fn 4 lt 0 ne 0 used 3 poc 17 16; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  end of stream call
+  decode: mbs 8x6 index 5 field 1 bottom 0 second 1 intra 0 ref 1 length 914 slices 1 offsets 0 head 00 00 01 41 9a b0
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 5 poc 21 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [4] pic 4 fn 4 lt 0 ne 0 used 3 poc 17 16; [5] pic 5 fn 5 lt 0 ne 0 used 2 poc 21 20; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  display: index 0 progressive 0 top-field-first 0 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 0: 128x96 crc cc2fc60e luma 58ebdcf1
+  display: index 1 progressive 0 top-field-first 0 repeat 0 timestamp 66; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 1: 128x96 crc 017da1b5 luma 63f8b909
+  display: index 2 progressive 0 top-field-first 0 repeat 0 timestamp 132; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 2: 128x96 crc 7a85150c luma ae87a468
+  display: index 3 progressive 0 top-field-first 0 repeat 0 timestamp 198; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 3: 128x96 crc 7cc9cb91 luma 30b22064
+  display: index 4 progressive 0 top-field-first 0 repeat 0 timestamp 264; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 4: 128x96 crc 49a28800 luma 69cce884
+  display: index 5 progressive 0 top-field-first 0 repeat 0 timestamp 330; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 5: 128x96 crc 13260aa1 luma 48c8f8b9
+  end of stream: 0, 6 frames displayed, 0 decode failures
+  summary paff_bff: frames 6 crc 5ef771d1
+stream paff_nodeblock [packets]
+  cuvidCreateVideoParser: 0
+  packet 0: 1699 bytes, NAL types 7 8 6 5
+  packet 1: 1542 bytes, NAL types 1
+  sequence: codec 4 rate 0/0 progressive 0 depth 0/0 chroma 1 surfaces 9 coded 128x96 display 0,0,128,96 bitrate 0 aspect 4:3 signal 05 02 02 02 seqhdr 0
+  cuvidCreateDecoder: 0
+  decode: mbs 8x6 index 0 field 1 bottom 0 second 0 intra 1 ref 1 length 1647 slices 1 offsets 0 head 00 00 01 65 88 85
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 2: 1195 bytes, NAL types 1
+  decode: mbs 8x6 index 0 field 1 bottom 1 second 1 intra 0 ref 1 length 1542 slices 1 offsets 0 head 00 00 01 41 9a 18
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 1 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 1 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 3: 1148 bytes, NAL types 1
+  decode: mbs 8x6 index 1 field 1 bottom 0 second 0 intra 0 ref 1 length 1195 slices 1 offsets 0 head 00 00 01 41 9a 30
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 4 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 4: 1113 bytes, NAL types 1
+  decode: mbs 8x6 index 1 field 1 bottom 1 second 1 intra 0 ref 1 length 1148 slices 1 offsets 0 head 00 00 01 41 9a 38
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 0 5 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; [1] pic 1 fn 1 lt 0 ne 0 used 1 poc 4 5; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 5: 1164 bytes, NAL types 1
+  decode: mbs 8x6 index 2 field 1 bottom 0 second 0 intra 0 ref 1 length 1113 slices 1 offsets 0 head 00 00 01 41 9a 50
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 8 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 6: 1185 bytes, NAL types 1
+  decode: mbs 8x6 index 2 field 1 bottom 1 second 1 intra 0 ref 1 length 1164 slices 1 offsets 0 head 00 00 01 41 9a 58
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 0 9 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; [2] pic 2 fn 2 lt 0 ne 0 used 1 poc 8 9; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 7: 1321 bytes, NAL types 1
+  decode: mbs 8x6 index 3 field 1 bottom 0 second 0 intra 0 ref 1 length 1185 slices 1 offsets 0 head 00 00 01 41 9a 70
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 12 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 8: 1347 bytes, NAL types 1
+  decode: mbs 8x6 index 3 field 1 bottom 1 second 1 intra 0 ref 1 length 1321 slices 1 offsets 0 head 00 00 01 41 9a 78
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 0 13 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; [3] pic 3 fn 3 lt 0 ne 0 used 1 poc 12 13; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 9: 1243 bytes, NAL types 1
+  decode: mbs 8x6 index 4 field 1 bottom 0 second 0 intra 0 ref 1 length 1347 slices 1 offsets 0 head 00 00 01 41 9a 90
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 16 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  end of stream call
+  decode: mbs 8x6 index 4 field 1 bottom 1 second 1 intra 0 ref 1 length 1242 slices 1 offsets 0 head 00 00 01 41 9a 98
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 0 17 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; [4] pic 4 fn 4 lt 0 ne 0 used 1 poc 16 17; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  display: index 0 progressive 0 top-field-first 1 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 0: 128x96 crc e8feae06 luma 138b3359
+  display: index 1 progressive 0 top-field-first 1 repeat 0 timestamp 66; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 1: 128x96 crc 9c370520 luma dbbf04b2
+  display: index 2 progressive 0 top-field-first 1 repeat 0 timestamp 132; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 2: 128x96 crc 1d3feb4d luma 97974a9c
+  display: index 3 progressive 0 top-field-first 1 repeat 0 timestamp 198; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 3: 128x96 crc 5ccb87fc luma dd1728b7
+  display: index 4 progressive 0 top-field-first 1 repeat 0 timestamp 264; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 4: 128x96 crc c030f940 luma 2d630b82
+  end of stream: 0, 5 frames displayed, 0 decode failures
+  summary paff_nodeblock: frames 5 crc fe080f8d
+stream paff_intra [packets]
+  cuvidCreateVideoParser: 0
+  packet 0: 1525 bytes, NAL types 7 8 6 5
+  packet 1: 1348 bytes, NAL types 1
+  sequence: codec 4 rate 0/0 progressive 0 depth 0/0 chroma 1 surfaces 9 coded 128x96 display 0,0,128,96 bitrate 0 aspect 4:3 signal 05 02 02 02 seqhdr 0
+  cuvidCreateDecoder: 0
+  decode: mbs 8x6 index 0 field 1 bottom 0 second 0 intra 1 ref 1 length 1472 slices 1 offsets 0 head 00 00 01 65 88 85
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 2: 1633 bytes, NAL types 6 5
+  decode: mbs 8x6 index 0 field 1 bottom 1 second 1 intra 0 ref 1 length 1348 slices 1 offsets 0 head 00 00 01 41 9a 18
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 1 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 1 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 3: 1425 bytes, NAL types 1
+  display: index 0 progressive 0 top-field-first 1 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 0: 128x96 crc dd415505 luma 52e28a25
+  decode: mbs 8x6 index 1 field 1 bottom 0 second 0 intra 1 ref 1 length 1601 slices 1 offsets 0 head 00 00 01 65 88 85
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 4: 1685 bytes, NAL types 6 5
+  decode: mbs 8x6 index 1 field 1 bottom 1 second 1 intra 0 ref 1 length 1425 slices 1 offsets 0 head 00 00 01 41 9a 18
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 1 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 1 fn 0 lt 0 ne 0 used 1 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 5: 1562 bytes, NAL types 1
+  display: index 1 progressive 0 top-field-first 1 repeat 0 timestamp 66; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 1: 128x96 crc d5e227e7 luma d17388b9
+  decode: mbs 8x6 index 2 field 1 bottom 0 second 0 intra 1 ref 1 length 1653 slices 1 offsets 0 head 00 00 01 65 88 85
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  end of stream call
+  decode: mbs 8x6 index 2 field 1 bottom 1 second 1 intra 0 ref 1 length 1561 slices 1 offsets 0 head 00 00 01 41 9a 18
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 1 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 2 fn 0 lt 0 ne 0 used 1 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  display: index 2 progressive 0 top-field-first 1 repeat 0 timestamp 132; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 2: 128x96 crc 3c4727b2 luma 67661080
+  end of stream: 0, 3 frames displayed, 0 decode failures
+  summary paff_intra: frames 3 crc fd171812
 stream b_spatial [onepacket]
   cuvidCreateVideoParser: 0
   sequence: codec 4 rate 30/1 progressive 1 depth 0/0 chroma 1 surfaces 5 coded 96x64 display 0,0,96,64 bitrate 0 aspect 3:2 signal 05 02 02 02 seqhdr 0
@@ -13932,6 +14340,108 @@ stream mbaff_field_crop [cropped]
   frame 5: 100x60 crc 6e232ad6 luma a07fbb87
   end of stream: 0, 6 frames displayed, 0 decode failures
   summary mbaff_field_crop: frames 6 crc ca8a4abd
+stream paff_crop [cropped]
+  cuvidCreateVideoParser: 0
+  packet 0: 970 bytes, NAL types 7 8 6 5
+  packet 1: 641 bytes, NAL types 1
+  sequence: codec 4 rate 0/0 progressive 0 depth 0/0 chroma 1 surfaces 15 coded 112x64 display 0,0,100,60 bitrate 0 aspect 5:3 signal 05 02 02 02 seqhdr 0
+  cuvidCreateDecoder: 0
+  decode: mbs 7x4 index 0 field 1 bottom 0 second 0 intra 1 ref 1 length 916 slices 1 offsets 0 head 00 00 01 65 88 85
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: (16 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 2: 203 bytes, NAL types 1
+  packet 3: 197 bytes, NAL types 1
+  decode: mbs 7x4 index 0 field 1 bottom 1 second 1 intra 0 ref 1 length 641 slices 1 offsets 0 head 00 00 01 41 9a 18
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 0 poc 0 1 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 1 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 4: 170 bytes, NAL types 1
+  decode: mbs 7x4 index 1 field 1 bottom 0 second 0 intra 0 ref 1 length 203 slices 1 offsets 0 head 00 00 01 41 9a 30
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 4 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; (15 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 5: 159 bytes, NAL types 1
+  decode: mbs 7x4 index 1 field 1 bottom 1 second 1 intra 0 ref 1 length 197 slices 1 offsets 0 head 00 00 01 41 9a 38
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 1 poc 0 5 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; [1] pic 1 fn 1 lt 0 ne 0 used 1 poc 4 5; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 6: 173 bytes, NAL types 1
+  decode: mbs 7x4 index 2 field 1 bottom 0 second 0 intra 0 ref 1 length 170 slices 1 offsets 0 head 00 00 01 41 9a 50
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 8 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [0] pic 0 fn 0 lt 0 ne 0 used 3 poc 0 1; [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 7: 158 bytes, NAL types 1
+  decode: mbs 7x4 index 2 field 1 bottom 1 second 1 intra 0 ref 1 length 159 slices 1 offsets 0 head 00 00 01 41 9a 58
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 2 poc 0 9 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; [2] pic 2 fn 2 lt 0 ne 0 used 1 poc 8 9; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 8: 226 bytes, NAL types 1
+  decode: mbs 7x4 index 3 field 1 bottom 0 second 0 intra 0 ref 1 length 173 slices 1 offsets 0 head 00 00 01 41 9a 70
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 12 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [1] pic 1 fn 1 lt 0 ne 0 used 3 poc 4 5; [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  packet 9: 215 bytes, NAL types 1
+  decode: mbs 7x4 index 3 field 1 bottom 1 second 1 intra 0 ref 1 length 158 slices 1 offsets 0 head 00 00 01 41 9a 78
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 3 poc 0 13 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; [3] pic 3 fn 3 lt 0 ne 0 used 1 poc 12 13; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  end of stream call
+  decode: mbs 7x4 index 4 field 1 bottom 0 second 0 intra 0 ref 1 length 226 slices 1 offsets 0 head 00 00 01 41 9a 90
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 16 0 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [2] pic 2 fn 2 lt 0 ne 0 used 3 poc 8 9; [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  decode: mbs 7x4 index 4 field 1 bottom 1 second 1 intra 0 ref 1 length 214 slices 1 offsets 0 head 00 00 01 41 9a 98
+    sps: log2fn 0 poc_type 0 log2poc 12 dpaz 0 fmo 0 d8x8 1 refs 2 rct 0 depth 0/0 bypass 0
+    pps: cabac 0 poc_present 0 l0 0 l1 0 wp 0 wbi 0 qp 0 dfc 1 redundant 0 t8x8 0 mbaff 0 cip 0 cqp 0 cqp2 0
+    pic: ref 1 frame_num 4 poc 0 17 fmo 0 groups 0 type 0 qs 0 change 0
+    dpb: [3] pic 3 fn 3 lt 0 ne 0 used 3 poc 12 13; [4] pic 4 fn 4 lt 0 ne 0 used 1 poc 16 17; (14 empty)
+    scaling: non-flat 4x4 0 8x8 0
+  cuvidDecodePicture: 0
+  display: index 0 progressive 0 top-field-first 1 repeat 0 timestamp 0; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 0: 100x60 crc 5d28a1c6 luma 5dcc4225
+  display: index 1 progressive 0 top-field-first 1 repeat 0 timestamp 66; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 1: 100x60 crc 380f4f81 luma 1051e21a
+  display: index 2 progressive 0 top-field-first 1 repeat 0 timestamp 132; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 2: 100x60 crc a81bbaae luma 23952715
+  display: index 3 progressive 0 top-field-first 1 repeat 0 timestamp 198; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 3: 100x60 crc 91858d66 luma 0f981002
+  display: index 4 progressive 0 top-field-first 1 repeat 0 timestamp 264; decode status call 0, decoded
+  cuvidMapVideoFrame64: 0, pitch 512
+  frame 4: 100x60 crc a854e1e6 luma 33540433
+  end of stream: 0, 5 frames displayed, 0 decode failures
+  summary paff_crop: frames 5 crc 675f6a3e
 stream odd_size [scaled]
   cuvidCreateVideoParser: 0
   packet 0: 1746 bytes, NAL types 7 8 6 5

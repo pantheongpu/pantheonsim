@@ -39,7 +39,9 @@ struct EncStats {
 class H264Encoder {
  public:
   // profile_idc: 66 (Baseline), 77 (Main) or 100 (High); the tools used are the same in all three.
-  H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock);
+  // `field_pictures`: interlaced coding with field pictures, for test streams (frames go through encode_field_pair(); the card's
+  // NVENC refuses field encoding, so no API path reaches this). `height` is then the frame's, and a multiple of 4.
+  H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock, bool field_pictures = false);
   ~H264Encoder();
 
   std::vector<uint8_t> parameter_sets() const;   // Annex B: SPS then PPS
@@ -48,6 +50,10 @@ class H264Encoder {
   // with no reference picture to predict from (the first, or after reset()) becomes an IDR picture.
   // `qp` is the slice QP, 0..51. `stats` may be null.
   std::vector<uint8_t> encode(const EncPicture& in, PicType type, int qp, EncStats* stats = nullptr);
+
+  // Field coding only: codes a frame as two field pictures (the first an IDR, intra or P picture, the second a P picture that may
+  // predict from the first). Returns both slice NAL units.
+  std::vector<uint8_t> encode_field_pair(const EncPicture& frame, bool top_field_first, PicType type, int qp, EncStats* stats = nullptr);
 
   // Forget the reference picture and start a new coded video sequence at the next picture.
   void reset();

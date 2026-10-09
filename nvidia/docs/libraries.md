@@ -270,7 +270,7 @@ CAVLC or CABAC, I, P and B slices, 4x4 and 8x8 transforms, scaling matrices,
 explicit and implicit weighted prediction, spatial and temporal direct prediction,
 multiple slices and references, long-term references, every deblocking setting,
 odd sizes with cropping, all decode to the checksums of the card's NVDEC
-(`nvidia/tests/data/h264`: 46 streams in 98 parser-driving runs; the card's
+(`nvidia/tests/data/h264`: 51 streams in 103 parser-driving runs; the card's
 transcript is `nvcuvid_h264.rtx3060.txt`, 12 991 lines, and holds the CRC-32 of
 every displayed frame, with `run_nvcuvid_h264.sh --card` running the same program
 against the driver). The parser reproduces what the card's does and the Recommendation
@@ -291,9 +291,11 @@ and 4:0:0, 4:2:2, 4:4:4 and every deeper bit depth are reported unsupported;
 as it does the `H264_SVC` codec type. Macroblock-adaptive frame/field frames (MBAFF) are decoded, field and frame pairs mixed,
 with the deblocking filter's mixed edges (`mbaff_field*` in `nvidia/tests/data/h264`: interlaced test content coded with half
 or more of its macroblocks as field pairs, in CABAC and CAVLC, with P, B (spatial and temporal direct), weighted prediction,
-several slices and cropping, all equal to the card's frames and to ffmpeg's). Field pictures (PAFF) are decoded by the same
-code but no stream with field pictures is among the fixtures (the only encoder here that writes them is none: x264 writes
-MBAFF, and the card's NVENC refuses field encoding), so that path has not been checked against the card or ffmpeg. Not decoded:
+several slices and cropping, all equal to the card's frames and to ffmpeg's). Field pictures (PAFF) are decoded too, field pairs
+shown as one frame, two reference fields per picture and the chroma offset between fields of different parity included
+(`paff*` fixtures: the only encoder that writes field pictures is this tree's own NVENC H.264 encoder in its test-only field
+mode, `make_paff.cpp`; the streams are equal to ffmpeg's decode and to the card's, and the card's callbacks -- the field
+pair, its picture order counts, its display -- are reproduced). Not decoded:
 flexible macroblock ordering, redundant pictures, SP/SI slices, data partitioning. Pictures that cannot be decoded report
 `CUDA_ERROR_INVALID_IMAGE` from `cuvidDecodePicture`; damaged streams never crash
 (`test_h264_decode` flips bits in streams under ASan and UBSan). Every other codec

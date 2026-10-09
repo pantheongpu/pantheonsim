@@ -1097,11 +1097,10 @@ struct H264Parser::Impl {
     if (c.structure == 0) {
       d.pp.poc[0] = c.poc[0];
       d.pp.poc[1] = c.poc[1];
-    } else if (c.second_field) {
-      d.pp.poc[0] = fs.poc[0];
-      d.pp.poc[1] = fs.poc[1];
     } else {
-      d.pp.poc[0] = d.pp.poc[1] = c.poc[c.structure - 1];
+      // a field picture: CurrFieldOrderCnt holds the field's own count, and zero for the other parity (measured)
+      d.pp.poc[0] = d.pp.poc[1] = 0;
+      d.pp.poc[c.structure - 1] = c.second_field ? fs.poc[c.structure - 1] : c.poc[c.structure - 1];
     }
     // the reference pictures as DPB slots
     for (int i = 0; i < 16; ++i) {

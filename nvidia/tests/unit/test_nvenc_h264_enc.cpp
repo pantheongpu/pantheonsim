@@ -241,6 +241,42 @@ VTEST(a_p_picture_without_a_reference_is_an_idr_picture_and_headers_name_the_pro
   }
 }
 
+VTEST(field_pictures_decode_to_the_encoders_reconstruction_and_predict_across_parities) {
+  // Interlaced frames coded as pairs of field pictures (the field coding mode that makes the PAFF fixtures): the second field of
+  // every frame is the encoder's last reconstruction, and the decoder must return exactly it, whichever parity comes first.
+  for (const bool tff : {true, false})
+    for (const int profile : {66, 100}) {
+      const int w = 64, h = 64;
+      H264Encoder enc(w, h, 30, 1, profile, false, true);
+      std::vector<uint8_t> stream = enc.parameter_sets();
+      std::vector<EncPicture> input;
+      std::vector<std::vector<uint8_t>> second_field;   // the encoder's reconstruction of each frame's second field
+      for (int t = 0; t < 4; ++t) {
+        EncPicture in = scene(w, h, 3 * t, t);
+        EncStats st;
+        const auto nal = enc.encode_field_pair(in, tff, t == 0 ? PicType::kIdr : PicType::kInter, 26, &st);
+        stream.insert(stream.end(), nal.begin(), nal.end());
+        second_field.push_back(enc.recon_y());
+        VCHECK(st.psnr_y > 30.0);
+        input.push_back(std::move(in));
+      }
+      const auto frames = decode(stream);
+      VCHECK_EQ(frames.size(), size_t{4});
+      for (size_t i = 0; i < frames.size() && i < 4; ++i) {
+        const int par = tff ? 1 : 0;   // the parity of the second field
+        bool same = frames[i].width == w && frames[i].height == h;
+        for (int y = 0; y < h / 2 && same; ++y)
+          for (int x = 0; x < w; ++x)
+            if (second_field[i][static_cast<size_t>(y) * enc.coded_width() + x] != frames[i].y[static_cast<size_t>(2 * y + par) * w + x]) {
+              same = false;
+              break;
+            }
+        VCHECK(same);
+        VCHECK(psnr_y(input[i], frames[i]) > 30.0);
+      }
+    }
+}
+
 VTEST(the_initial_qp_falls_as_the_bit_rate_rises) {
   int prev = 100;
   for (const long rate : {50000L, 200000L, 800000L, 3000000L, 12000000L}) {

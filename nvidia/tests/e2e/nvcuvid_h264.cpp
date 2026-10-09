@@ -520,7 +520,8 @@ int main(int argc, char** argv) {
                                       "p_ref1",   "p_ref2",      "p_ref4",       "p_ref6",      "b_ref2",        "b_ref3",
                                       "mbaff_field", "mbaff_field_cavlc", "mbaff_field_intra", "mbaff_field_temporal", "mbaff_field_spatial",
                                       "mbaff_field_wp", "mbaff_field_slices", "mbaff_field_bff",
-                                      "p_sei",    "b_sei",       "p_aud",        "p_ps_mid"};
+                                      "p_sei",    "b_sei",       "p_aud",        "p_ps_mid",
+                                      "paff",     "paff_bff",    "paff_nodeblock", "paff_intra"};
   const Mode plain{"packets"};
   auto load = [&](const char* n) { return slurp(base + "/h264/" + n + ".h264"); };
   if (!only.empty() && std::find_if(std::begin(names), std::end(names), [&](const char* n) { return only == n; }) == std::end(names)) {
@@ -598,7 +599,8 @@ int main(int argc, char** argv) {
     stream("b_ref3", Mode{"delay1", true, 1});
     // Display area and target size: a crop that fills the target is exact, a rescale is close to the card's.
     stream("odd_size", Mode{"cropped", true, 0, true});
-    stream("mbaff_field_crop", Mode{"cropped", true, 0, true});   // a cropped interlaced picture: the surface is the display rectangle
+    stream("mbaff_field_crop", Mode{"cropped", true, 0, true});
+    stream("paff_crop", Mode{"cropped", true, 0, true});   // a cropped interlaced picture: the surface is the display rectangle
     {
       Mode m{"scaled", true};
       m.scaled = true;
