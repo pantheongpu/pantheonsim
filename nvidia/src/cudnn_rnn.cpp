@@ -1324,17 +1324,35 @@ VGPU_EXPORT cudnnStatus_t cudnnMultiHeadAttnForward(cudnnHandle_t h, const cudnn
     std::memcpy(masks.data() + R.wins, win.data(), win.size() * sizeof(int));
   }
   const double ap = training ? drop_p(a->attn_drop) : 0.0, pp = training ? drop_p(a->post_drop) : 0.0;
-  if (training && ap > 0.0) {
-    std::vector<uint8_t> keep;
-    if (!vgpu_cudnn::dropout_draw(a->attn_drop, R.probs, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
-    std::copy(keep.begin(), keep.end(), masks.begin());
-  }
-  if (training && pp > 0.0) {
-    std::vector<uint8_t> keep;
-    if (!vgpu_cudnn::dropout_draw(a->post_drop, R.outs, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
-    std::copy(keep.begin(), keep.end(), masks.begin() + R.probs);
-  }
   const int O = a->oS();
+  // The dropout masks, drawn as cuDNN draws them (measured on an RTX 3060 through the descriptors'
+  // states): one application of the dropout kernel over the probabilities, [batch][beam][head][query
+  // step][key step], and one over the output vectors, [batch][beam][query step][O] -- over the
+  // dimensions of the data the call was given, padded steps included. The reserve keeps them in this
+  // library's own layout (see AttnReserve).
+  {
+    const size_t Bq = (size_t)q->B(), Jq = (size_t)q->beam(), Tqd = (size_t)q->T(), Tkd = (size_t)k->T(), Hh = (size_t)a->heads;
+    if (training && ap > 0.0) {
+      std::vector<uint8_t> keep;
+      if (!vgpu_cudnn::dropout_draw(a->attn_drop, Bq * Jq * Hh * Tqd * Tkd, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
+      for (size_t b = 0; b < Bq; ++b)
+        for (size_t j = 0; j < Jq; ++j)
+          for (size_t hh = 0; hh < Hh; ++hh)
+            for (size_t t = 0; t < Tqd; ++t)
+              for (size_t kk = 0; kk < Tkd; ++kk)
+                masks[mask_probs(*a, (int)b, (int)j, (int)t) + hh * (size_t)a->Tk + kk] =
+                    keep[(((b * Jq + j) * Hh + hh) * Tqd + t) * Tkd + kk];
+    }
+    if (training && pp > 0.0) {
+      std::vector<uint8_t> keep;
+      if (!vgpu_cudnn::dropout_draw(a->post_drop, Bq * Jq * Tqd * (size_t)O, &keep)) return CUDNN_STATUS_EXECUTION_FAILED;
+      for (size_t b = 0; b < Bq; ++b)
+        for (size_t j = 0; j < Jq; ++j)
+          for (size_t t = 0; t < Tqd; ++t)
+            for (int c = 0; c < O; ++c)
+              masks[mask_outs(*a, R, (int)b, (int)j, (int)t) + c] = keep[((b * Jq + j) * Tqd + t) * (size_t)O + c];
+    }
+  }
   std::vector<real> ov(O);
   StepState st;
   for (int b = 0; b < q->B(); ++b)
