@@ -140,17 +140,23 @@ static void worker(int r, const std::vector<Case>* cases) {
       if (!nonzero && (c.writers >> r & 1)) { nccl_errors++; std::printf("     %s: the eager call wrote nothing\n", c.name); }
     }
     drop_premul();
-    barrier.wait();
-    // The capture.
+    // The capture, one rank at a time: while a capture goes on, the other threads make no CUDA calls (a call that
+    // waits on the device would invalidate it), and the recorded call does not wait for the other ranks.
     make_premul();
     cudaMemset(rk[r].recv, 0, 2 * N * sizeof(float));
     set_counter(values[0]);
-    cudaDeviceSynchronize();
-    bool ok = cudaStreamBeginCapture(rk[r].st, cudaStreamCaptureModeRelaxed) == cudaSuccess;
-    write_inputs(r);
-    issue(c, r);
-    ok = ok && cudaStreamEndCapture(rk[r].st, &rk[r].graph) == cudaSuccess && rk[r].graph &&
-         cudaGraphInstantiate(&rk[r].exec, rk[r].graph, 0) == cudaSuccess;
+    barrier.wait();
+    bool ok = true;
+    for (int turn = 0; turn < R; ++turn) {
+      if (turn == r) {
+        ok = cudaStreamBeginCapture(rk[r].st, cudaStreamCaptureModeRelaxed) == cudaSuccess;
+        write_inputs(r);
+        issue(c, r);
+        ok = ok && cudaStreamEndCapture(rk[r].st, &rk[r].graph) == cudaSuccess && rk[r].graph &&
+             cudaGraphInstantiate(&rk[r].exec, rk[r].graph, 0) == cudaSuccess;
+      }
+      barrier.wait();
+    }
     drop_premul();   // the operator is gone before the graphs run
     f.captured[r] = ok;
     cudaDeviceSynchronize();
@@ -160,25 +166,26 @@ static void worker(int r, const std::vector<Case>* cases) {
       f.untouched[r] = untouched;
     }
     barrier.wait();
-    for (int k = 0; k < 2 && ok; ++k) {
+    for (int k = 0; k < 2; ++k) {
       set_counter(values[k]);
       cudaMemset(rk[r].recv, 0, 2 * N * sizeof(float));
       cudaDeviceSynchronize();
       barrier.wait();
-      cudaGraphLaunch(rk[r].exec, rk[r].st);
-      cudaStreamSynchronize(rk[r].st);
-      const std::vector<float> got = read_recv(r);
-      f.matches[k][r] = got == refs[(ci * 2 + k) * R + r];
-      if (!f.matches[k][r]) {
-        size_t bad = 0, first = 0;
-        const std::vector<float>& want = refs[(ci * 2 + k) * R + r];
-        for (size_t i = 0; i < got.size(); ++i)
-          if (got[i] != want[i]) { if (!bad) first = i; ++bad; }
-        std::printf("     %s, rank %d, counter %d: %zu of %zu elements differ, the first %zu: got %g, want %g\n", c.name, r, values[k], bad, got.size(), first, got[first], want[first]);
+      if (ok) {
+        cudaGraphLaunch(rk[r].exec, rk[r].st);
+        cudaStreamSynchronize(rk[r].st);
+        const std::vector<float> got = read_recv(r);
+        f.matches[k][r] = got == refs[(ci * 2 + k) * R + r];
+        if (!f.matches[k][r]) {
+          size_t bad = 0, first = 0;
+          const std::vector<float>& want = refs[(ci * 2 + k) * R + r];
+          for (size_t i = 0; i < got.size(); ++i)
+            if (got[i] != want[i]) { if (!bad) first = i; ++bad; }
+          std::printf("     %s, rank %d, counter %d: %zu of %zu elements differ, the first %zu: got %g, want %g\n", c.name, r, values[k], bad, got.size(), first, got[first], want[first]);
+        }
       }
       barrier.wait();
     }
-    if (!ok) { barrier.wait(); barrier.wait(); barrier.wait(); }   // keep in step with the ranks that launched
     cudaGraphExecDestroy(rk[r].exec);
     cudaGraphDestroy(rk[r].graph);
     rk[r].exec = nullptr, rk[r].graph = nullptr;
