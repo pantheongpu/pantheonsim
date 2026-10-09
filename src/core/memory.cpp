@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 #if defined(__x86_64__)
@@ -10,6 +11,7 @@
 #endif
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "vgpu/error.hpp"
@@ -404,7 +406,7 @@ void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_
     uint64_t chunk_off = off % kChunkSize;
     uint64_t n = std::min(len, kChunkSize - chunk_off);
     uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
-    if (pattern_len == 1 && chunk_off == 0 && n == kChunkSize) {
+    if (pattern_len == 1 && chunk_off == 0 && n == kChunkSize && !a.external) {
       // A whole chunk of one byte is that byte: no RAM, no disk. Whatever it
       // held goes back to the backing, and zero is simply untouched memory.
       // Host calls do not run beside kernels -- launches are synchronous -- so
@@ -616,7 +618,7 @@ void MemoryManager::address_free(uint64_t va, uint64_t size) {
   reserved_.erase(it);
 }
 
-uint64_t MemoryManager::create_handle(uint64_t size) {
+uint64_t MemoryManager::create_handle(uint64_t size, int shareable_types) {
   ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0 || size % kVmmGranularity)
     throw Error::make(Err::InvalidValue, "creating ", size,
@@ -628,9 +630,103 @@ uint64_t MemoryManager::create_handle(uint64_t size) {
   used_ += size;
   Handle h;
   h.size = size;
+  h.types = shareable_types;
   h.mem.size = size;
   h.mem.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
   h.mem.chunks = std::make_unique<std::atomic<uint8_t*>[]>(h.mem.chunk_count);
+  const uint64_t id = next_handle_++;
+  handles_.emplace(id, std::move(h));
+  notify_usage();
+  return id;
+}
+
+int MemoryManager::handle_types(uint64_t handle) const {
+  SharedGuard table_guard(table_lock_.get());
+  auto it = handles_.find(handle);
+  if (it == handles_.end())
+    throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
+  return it->second.types;
+}
+
+// Moves a handle's memory into an anonymous file mapped shared, once. The chunks become pieces of
+// that one mapping (Allocation::external), so reads, writes and kernels reach it as they reach any
+// handle's memory, and a process that maps the file reaches the same bytes.
+int MemoryManager::export_handle(uint64_t handle) {
+  ExclusiveGuard table_guard(table_lock_.get());
+  auto it = handles_.find(handle);
+  if (it == handles_.end())
+    throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
+  Handle& h = it->second;
+  if (!(h.types & 1))
+    throw Error::make(Err::InvalidValue, "exporting memory handle ", handle,
+                      ", which was not created with a handle type to export it as");
+  if (h.fd < 0) {
+    const int fd = ::memfd_create("vgpu-vmm", MFD_CLOEXEC);
+    if (fd < 0)
+      throw Error::make(Err::Internal, "exporting a memory handle: memfd_create: ", std::strerror(errno));
+    void* host = nullptr;
+    if (::ftruncate(fd, static_cast<off_t>(h.size)) == 0) {
+      host = ::mmap(nullptr, h.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (host == MAP_FAILED) host = nullptr;
+    }
+    if (!host) {
+      const int err = errno;
+      ::close(fd);
+      throw Error::make(Err::Internal, "exporting a memory handle: could not map the file: ",
+                        std::strerror(err));
+    }
+    // What is there now goes into the file; a file reads as zeros, so only what differs is written.
+    Allocation& a = h.mem;
+    for (size_t i = 0; i < a.chunk_count; ++i) {
+      uint8_t* old = a.chunks[i].load(std::memory_order_acquire);
+      uint8_t* dst = static_cast<uint8_t*>(host) + i * kChunkSize;
+      const uint64_t n = std::min<uint64_t>(kChunkSize, h.size - i * kChunkSize);
+      if (old && is_uniform(old)) {
+        if (uniform_byte(old)) std::memset(dst, uniform_byte(old), n);
+      } else if (old) {
+        std::memcpy(dst, old, n);
+        backing::release(old);
+      }
+      a.chunks[i].store(dst, std::memory_order_release);
+    }
+    a.external = static_cast<uint8_t*>(host);
+    a.external_len = h.size;
+    h.fd = fd;
+  }
+  const int out = ::dup(h.fd);
+  if (out < 0)
+    throw Error::make(Err::Internal, "exporting a memory handle: dup: ", std::strerror(errno));
+  return out;
+}
+
+uint64_t MemoryManager::import_handle(int fd) {
+  struct stat st;
+  if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size <= 0)
+    throw Error::make(Err::NotFound, "importing a memory handle: ", fd, " is not an exported handle");
+  const uint64_t size = static_cast<uint64_t>(st.st_size);
+  ExclusiveGuard table_guard(table_lock_.get());
+  if (size % kVmmGranularity)
+    throw Error::make(Err::NotFound, "importing a memory handle: the file is ", size,
+                      " bytes, not a whole number of the ", kVmmGranularity, "-byte granularity");
+  if (used_ + size > capacity_ || used_ + size < used_)
+    throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
+                      " of ", capacity_, " bytes already in use");
+  void* host = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (host == MAP_FAILED)
+    throw Error::make(Err::NotFound, "importing a memory handle: could not map ", fd, ": ", std::strerror(errno));
+  const int keep = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);   // the importer's own reference to the file
+  used_ += size;
+  Handle h;
+  h.size = size;
+  h.types = 1;
+  h.fd = keep;
+  h.mem.size = size;
+  h.mem.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
+  h.mem.chunks = std::make_unique<std::atomic<uint8_t*>[]>(h.mem.chunk_count);
+  for (size_t i = 0; i < h.mem.chunk_count; ++i)
+    h.mem.chunks[i].store(static_cast<uint8_t*>(host) + i * kChunkSize, std::memory_order_relaxed);
+  h.mem.external = static_cast<uint8_t*>(host);
+  h.mem.external_len = size;
   const uint64_t id = next_handle_++;
   handles_.emplace(id, std::move(h));
   notify_usage();

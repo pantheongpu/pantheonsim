@@ -22,6 +22,9 @@
 //  - Every access is bounds-checked and produces a rich diagnostic on failure
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
+
+#include <sys/mman.h>
+#include <unistd.h>
 #include <mutex>
 #include "vgpu/brlock.hpp"
 
@@ -267,8 +270,17 @@ class MemoryManager {
 
   // Physical memory with no address, counted against the device's capacity.
   // Returns a handle; handles are never 0 and are never reused.
-  uint64_t create_handle(uint64_t size);
+  // `shareable_types` is the handle types the memory was asked to be exportable as (CUmemAllocationHandleType
+  // bits); only the POSIX file descriptor (1) can be exported.
+  uint64_t create_handle(uint64_t size, int shareable_types = 0);
   uint64_t handle_size(uint64_t handle) const;
+  int handle_types(uint64_t handle) const;
+  // A file descriptor another process can map to reach a handle's memory (cuMemExportToShareableHandle):
+  // the memory moves into an anonymous file the first time, and every descriptor made from it
+  // (a dup) names that file. Throws InvalidValue for a handle not made shareable.
+  int export_handle(uint64_t handle);
+  // A new handle over the memory behind a descriptor export_handle made, in this process or another.
+  uint64_t import_handle(int fd);
   // The handle mapped at `va` (retaining a reference), or 0 when nothing is.
   uint64_t retain_handle_at(uint64_t va);
   void retain_handle(uint64_t handle);
@@ -374,15 +386,20 @@ class MemoryManager {
     uint64_t size = 0;
     size_t chunk_count = 0;
     std::unique_ptr<std::atomic<uint8_t*>[]> chunks;
+    // Set when the chunks are pieces of one shared file mapping (export_handle, import_handle).
+    uint8_t* external = nullptr;
+    size_t external_len = 0;
 
     Allocation() = default;
     // The move has to clear the source's count as well as its pointer: a
     // defaulted move leaves chunk_count behind, and the moved-from destructor
     // then walks a null array.
     Allocation(Allocation&& o) noexcept
-        : size(o.size), chunk_count(o.chunk_count), chunks(std::move(o.chunks)) {
+        : size(o.size), chunk_count(o.chunk_count), chunks(std::move(o.chunks)),
+          external(o.external), external_len(o.external_len) {
       o.size = 0;
       o.chunk_count = 0;
+      o.external = nullptr;
     }
     Allocation& operator=(Allocation&& o) noexcept {
       if (this != &o) {
@@ -390,8 +407,11 @@ class MemoryManager {
         size = o.size;
         chunk_count = o.chunk_count;
         chunks = std::move(o.chunks);
+        external = o.external;
+        external_len = o.external_len;
         o.size = 0;
         o.chunk_count = 0;
+        o.external = nullptr;
       }
       return *this;
     }
@@ -402,6 +422,13 @@ class MemoryManager {
    private:
     void release() {
       if (!chunks) return;
+      // Memory in a file two processes map: the chunks are pieces of that mapping, which goes in one
+      // piece.
+      if (external) {
+        ::munmap(external, external_len);
+        external = nullptr;
+        return;
+      }
       for (size_t i = 0; i < chunk_count; ++i) {
         uint8_t* c = chunks[i].load(std::memory_order_relaxed);
         if (!is_uniform(c)) backing::release(c);
@@ -469,7 +496,17 @@ class MemoryManager {
     uint64_t size = 0;
     uint32_t refs = 1;      // cuMemCreate's own reference, plus every retain
     uint32_t mapped = 0;    // mappings pointing at it
+    int types = 0;          // the handle types it can be exported as
+    int fd = -1;            // the anonymous file holding it once exported or imported (owned)
     Allocation mem;
+    Handle() = default;
+    Handle(Handle&& o) noexcept
+        : size(o.size), refs(o.refs), mapped(o.mapped), types(o.types), fd(o.fd), mem(std::move(o.mem)) {
+      o.fd = -1;
+    }
+    ~Handle() {
+      if (fd >= 0) ::close(fd);
+    }
   };
   struct Mapping {
     uint64_t size = 0;

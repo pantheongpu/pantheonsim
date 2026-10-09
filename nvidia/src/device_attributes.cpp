@@ -186,9 +186,10 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     case kDirectManagedMemAccessFromHost: v = 0; break;
     // cuMemAddressReserve, cuMemCreate, cuMemMap and cuMemSetAccess work.
     case kVirtualAddressManagementSupported: v = 1; break;
-    // cuMemCreate does not hand out file descriptors, and nothing else here
-    // is shared between processes through a handle.
-    case kHandleTypePosixFileDescriptorSupported: v = 0; break;
+    // cuMemCreate with the POSIX file descriptor handle type exports the memory as a descriptor
+    // another process can import (cuMemExportToShareableHandle); the other handle types do not exist
+    // here. An RTX 3060 answers 1 as well.
+    case kHandleTypePosixFileDescriptorSupported: v = 1; break;
     case kHandleTypeWin32HandleSupported: v = 0; break;
     case kHandleTypeWin32KmtHandleSupported: v = 0; break;
     // A real quantity: a divisor in occupancy arithmetic (CUB's scan launched
