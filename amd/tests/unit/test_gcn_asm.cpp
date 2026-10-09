@@ -1388,7 +1388,7 @@ VTEST(vop3_instructions_a_compiler_emits_give_what_the_isa_says) {
       const uint32_t shift = 8 * (w[1] & 3);
       check(l, 16, at(16), (w[2] & ~(0xFFu << shift)) | byte << shift, "v_cvt_pk_u8_f32");
     }
-    check(l, 17, at(17), u(int32_t{s0} * s1 + static_cast<int32_t>(w[2])), "v_mad_i32_i16");
+    check(l, 17, at(17), u(int32_t{s0} * s1) + w[2], "v_mad_i32_i16");   // the add wraps in unsigned arithmetic, as the hardware's does
     {
       const auto sat = [](int32_t v) { return static_cast<uint16_t>(std::clamp<int32_t>(v, INT16_MIN, INT16_MAX)); };
       check(l, 18, at(18), sat(static_cast<int32_t>(w[0])) | uint32_t{sat(static_cast<int32_t>(w[1]))} << 16, "v_cvt_pk_i16_i32");
