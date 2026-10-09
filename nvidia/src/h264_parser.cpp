@@ -151,7 +151,7 @@ struct H264Parser::Impl {
     return -1;
   }
 
-  void feed(const uint8_t* d, size_t n, bool has_ts, int64_t ts, bool discontinuity) {
+  void feed(const uint8_t* d, size_t n, bool has_ts, int64_t ts, bool discontinuity, bool end_of_picture) {
     if (discontinuity) {
       finish_picture();
       buf.clear();
@@ -161,6 +161,11 @@ struct H264Parser::Impl {
     buf.insert(buf.end(), d, d + n);
     total_fed += n;
     process(false);
+    if (end_of_picture) {
+      // the packet holds whole pictures: its last NAL unit is complete, and so is the picture
+      process(true);
+      finish_picture();
+    }
   }
 
   void end_of_stream() {
@@ -1198,7 +1203,9 @@ struct H264Parser::Impl {
 H264Parser::H264Parser(ParserSink* sink, unsigned max_decode_surfaces, unsigned clock_rate, unsigned max_display_delay, bool want_sei)
     : p_(new Impl(sink, max_decode_surfaces, clock_rate, max_display_delay, want_sei)) {}
 H264Parser::~H264Parser() = default;
-void H264Parser::feed(const uint8_t* data, size_t n, bool has_ts, int64_t ts, bool discontinuity) { p_->feed(data, n, has_ts, ts, discontinuity); }
+void H264Parser::feed(const uint8_t* data, size_t n, bool has_ts, int64_t ts, bool discontinuity, bool end_of_picture) {
+  p_->feed(data, n, has_ts, ts, discontinuity, end_of_picture);
+}
 void H264Parser::end_of_stream() { p_->end_of_stream(); }
 
 }  // namespace vgpu_h264

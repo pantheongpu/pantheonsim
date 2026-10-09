@@ -612,10 +612,12 @@ void Dec::finish_mb() {
 // A macroblock whose syntax has been parsed: build its samples.
 void Dec::complete_mb() {
   finish_mb();
+#ifdef VGPU_H264_DEBUG
   if (std::getenv("VGPU_H264_TRACE")) {
     std::fprintf(stderr, "mb %d %s kind %d t8 %d cbp %02x qp %d i16 %d chroma %d shape %d ref0 %d mv0 %d,%d ref1 %d mv1 %d,%d\n", addr_, mb_->intra ? "intra" : "inter", mb_->kind, mb_->t8x8, mb_->cbp, mb_->qp, i16_mode_,
                  mb_->chroma_mode, part_shape_, mb_->ref_idx[0][0], mb_->mv[0][0][0], mb_->mv[0][0][1], mb_->ref_idx[1][0], mb_->mv[1][0][0], mb_->mv[1][0][1]);
   }
+#endif
   if (mb_->intra) {
     recon_intra();
   } else {
@@ -626,7 +628,9 @@ void Dec::complete_mb() {
 
 // P_Skip and B_Skip: motion inferred, no residual.
 void Dec::do_skip_mb() {
+#ifdef VGPU_H264_DEBUG
   if (std::getenv("VGPU_H264_TRACE")) std::fprintf(stderr, "mb %d skip\n", addr_);
+#endif
   is_skip_ = true;
   mb_->skip = true;
   mb_->intra = false;

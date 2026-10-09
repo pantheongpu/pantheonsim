@@ -94,7 +94,9 @@ static int boundary_strength(const MbInfo& p, int bp, const MbInfo& q, int bq, b
 }
 
 void Dec::deblock_picture() {
-  if (std::getenv("VGPU_H264_NODEBLOCK")) return;   // debugging aid
+#ifdef VGPU_H264_DEBUG
+  if (std::getenv("VGPU_H264_NODEBLOCK")) return;
+#endif
   for (int a = 0; a < nmb_; ++a) {
     if (pd_->mb[a].slice < 0) continue;
     deblock_mb(a);

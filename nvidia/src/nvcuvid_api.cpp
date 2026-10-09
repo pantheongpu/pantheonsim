@@ -217,7 +217,9 @@ CUresult check_h264_create(const CUVIDDECODECREATEINFO& ci) {
   if (raw(ci.ChromaFormat) != cudaVideoChromaFormat_420 || ci.bitDepthMinus8 != 0) return CUDA_ERROR_NOT_SUPPORTED;
   if (raw(ci.OutputFormat) != cudaVideoSurfaceFormat_NV12) return CUDA_ERROR_INVALID_VALUE;
   if (ci.ulNumDecodeSurfaces == 0 || ci.ulNumDecodeSurfaces > 32) return CUDA_ERROR_INVALID_VALUE;
-  if (ci.ulWidth < 48 || ci.ulHeight < 16 || ci.ulWidth > 4096 || ci.ulHeight > 4096) return CUDA_ERROR_INVALID_VALUE;
+  // sizes: at least three macroblocks across (47 and 48 wide are accepted, 32 is not), at most 4096 either way
+  if (ci.ulWidth < 33 || ci.ulHeight < 1 || ci.ulWidth > 4096 || ci.ulHeight > 4096) return CUDA_ERROR_INVALID_VALUE;
+  if (ci.ulTargetWidth == 0 || ci.ulTargetHeight == 0) return CUDA_ERROR_OUT_OF_MEMORY;
   return CUDA_SUCCESS;
 }
 }  // namespace
@@ -302,10 +304,16 @@ bool keeps_size(uint32_t source, uint32_t target) {
 }
 
 // The source samples and weights that make output sample i of a resampled axis.
-std::vector<double> axis_weights(uint32_t s, uint32_t t, uint32_t i, std::vector<uint32_t>* idx) {
+// `down`: how far a shrink stays bilinear (the target must be at least down_num / down_den of the source) before it
+// averages whole footprints. JPEG pictures were measured at 9/10; H.264 surfaces (80x48 to 72x40, 0.9 and 0.83) at 1/2.
+struct ScaleMode {
+  uint32_t down_num = 9, down_den = 10;
+};
+
+std::vector<double> axis_weights(uint32_t s, uint32_t t, uint32_t i, std::vector<uint32_t>* idx, ScaleMode m = {}) {
   std::vector<double> w;
   idx->clear();
-  if (t >= s || t * 10 >= s * 9) {   // bilinear, pixel centres aligned (enlarging, and shrinking by under 10%)
+  if (t >= s || t * m.down_den >= s * m.down_num) {   // bilinear, pixel centres aligned (enlarging, and shrinking a little)
     const double f = (i + 0.5) * s / t - 0.5;
     const long long f0 = static_cast<long long>(std::floor(f));
     const double a = f - static_cast<double>(f0);
@@ -328,7 +336,7 @@ std::vector<double> axis_weights(uint32_t s, uint32_t t, uint32_t i, std::vector
   return w;
 }
 
-std::vector<uint8_t> resample(const std::vector<uint8_t>& src, uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th) {
+std::vector<uint8_t> resample(const std::vector<uint8_t>& src, uint32_t sw, uint32_t sh, uint32_t tw, uint32_t th, ScaleMode sm = {}) {
   const bool same_w = keeps_size(sw, tw), same_h = keeps_size(sh, th);
   std::vector<uint8_t> out(static_cast<size_t>(tw) * th, 0);
   if (same_w && same_h) {
@@ -342,7 +350,7 @@ std::vector<uint8_t> resample(const std::vector<uint8_t>& src, uint32_t sw, uint
   std::vector<uint32_t> idx;
   for (uint32_t x = 0; x < mw; ++x) {
     std::vector<double> w;
-    if (!same_w) w = axis_weights(sw, tw, x, &idx);
+    if (!same_w) w = axis_weights(sw, tw, x, &idx, sm);
     for (uint32_t y = 0; y < sh; ++y) {
       double v = 0;
       if (same_w) {
@@ -356,7 +364,7 @@ std::vector<uint8_t> resample(const std::vector<uint8_t>& src, uint32_t sw, uint
   const uint32_t mh = same_h ? std::min(sh, th) : th;
   for (uint32_t y = 0; y < mh; ++y) {
     std::vector<double> w;
-    if (!same_h) w = axis_weights(sh, th, y, &idx);
+    if (!same_h) w = axis_weights(sh, th, y, &idx, sm);
     for (uint32_t x = 0; x < mw; ++x) {
       double v = 0;
       if (same_h) {
@@ -677,14 +685,17 @@ VGPU_API CUresult CUDAAPI cuvidCreateVideoParser(CUvideoparser* out, CUVIDPARSER
   if (!out || !params) return CUDA_ERROR_INVALID_VALUE;
   const int codec = raw(params->CodecType);
   if (codec < 0 || codec >= kCodecs) return CUDA_ERROR_INVALID_SOURCE;
-  if (codec != cudaVideoCodec_JPEG && codec != cudaVideoCodec_H264) {
+  // measured: the card's parser takes H.264 and its MVC variant (the base view is what is decoded here), and refuses SVC
+  // with CUDA_ERROR_INVALID_SOURCE
+  if (codec == cudaVideoCodec_H264_SVC) return CUDA_ERROR_INVALID_SOURCE;
+  if (codec != cudaVideoCodec_JPEG && codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_H264_MVC) {
     say_once("only Motion JPEG and H.264 are parsed; other codecs are not supported by VirtualGPU");
     return CUDA_ERROR_NOT_SUPPORTED;
   }
   auto* p = new Parser();
-  p->codec = codec;
+  p->codec = codec == cudaVideoCodec_H264_MVC ? static_cast<int>(cudaVideoCodec_H264) : codec;
   p->params = *params;
-  if (codec == cudaVideoCodec_H264) {
+  if (p->codec == cudaVideoCodec_H264) {
     p->sink = std::make_unique<CuvidSink>(*params);
     p->h264 = std::make_unique<vgpu_h264::H264Parser>(p->sink.get(), params->ulMaxNumDecodeSurfaces, params->ulClockRate, params->ulMaxDisplayDelay,
                                                       params->pfnGetSEIMsg != nullptr);
@@ -707,7 +718,7 @@ VGPU_API CUresult CUDAAPI cuvidParseVideoData(CUvideoparser obj, CUVIDSOURCEDATA
   if (p->codec == cudaVideoCodec_H264) {
     if (packet->payload && packet->payload_size)
       p->h264->feed(packet->payload, packet->payload_size, (packet->flags & CUVID_PKT_TIMESTAMP) != 0, static_cast<int64_t>(packet->timestamp),
-                    (packet->flags & CUVID_PKT_DISCONTINUITY) != 0);
+                    (packet->flags & CUVID_PKT_DISCONTINUITY) != 0, (packet->flags & CUVID_PKT_ENDOFPICTURE) != 0);
     if (packet->flags & CUVID_PKT_ENDOFSTREAM) p->h264->end_of_stream();
     return CUDA_SUCCESS;
   }

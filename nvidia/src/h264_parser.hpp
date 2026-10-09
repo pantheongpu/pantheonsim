@@ -89,7 +89,8 @@ class H264Parser {
   H264Parser(ParserSink* sink, unsigned max_decode_surfaces, unsigned clock_rate, unsigned max_display_delay, bool want_sei);
   ~H264Parser();
   // `has_ts`: the packet carries a timestamp. `discontinuity`: bytes buffered so far are dropped first.
-  void feed(const uint8_t* data, size_t n, bool has_ts, int64_t ts, bool discontinuity);
+  // `end_of_picture`: the packet ends a picture (CUVID_PKT_ENDOFPICTURE): its last NAL unit is complete.
+  void feed(const uint8_t* data, size_t n, bool has_ts, int64_t ts, bool discontinuity, bool end_of_picture = false);
   void end_of_stream();
 
  private:

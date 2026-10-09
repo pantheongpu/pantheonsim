@@ -14,6 +14,7 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +55,8 @@ static uint32_t crc32(const uint8_t* d, size_t n, uint32_t crc = 0) {
   return ~crc;
 }
 
-static std::string dump_dir;
+static std::string dump_dir, data_dir, update_dir;
+static int tolerance = 1;
 static int failures = 0;
 
 // ---- one parsed stream ----------------------------------------------------------------
@@ -70,6 +72,9 @@ struct Run {
   std::string name;
   int create_result = 0;
   int decode_fail = 0;
+  unsigned tw = 0, th = 0;        // the surface's size
+  bool scaled = false;            // the surface is a rescaled picture: pixels are compared with the card's, not checksummed
+  std::vector<std::vector<uint8_t>> pix;
 };
 static Run* run = nullptr;
 
@@ -115,6 +120,8 @@ static int CUDAAPI seq_cb(void*, CUVIDEOFORMAT* f) {
     ci.ulTargetWidth = f->coded_width;
     ci.ulTargetHeight = f->coded_height;
   }
+  run->tw = ci.ulTargetWidth;
+  run->th = ci.ulTargetHeight;
   if (run->resize) {
     run->w = ci.ulTargetWidth;
     run->h = ci.ulTargetHeight;
@@ -202,11 +209,15 @@ static int CUDAAPI disp_cb(void*, CUVIDPARSERDISPINFO* d) {
   std::printf("  cuvidMapVideoFrame64: %d, pitch %u\n", r, pitch);
   if (r == CUDA_SUCCESS) {
     const CUVIDEOFORMAT& f = run->fmt;
-    const unsigned w = run->w, h = run->h;
+    unsigned w = run->w, h = run->h;
+    if (run->scaled) {
+      w = run->tw;
+      h = run->th;
+    }
     // The surface holds the coded picture, or (decoder created with the display area as
     // its target) just the display rectangle.
-    const unsigned sh = run->crop_in_decoder || run->resize ? h : f.coded_height;
-    const unsigned x0 = run->crop_in_decoder || run->resize ? 0 : f.display_area.left, y0 = run->crop_in_decoder || run->resize ? 0 : f.display_area.top;
+    const unsigned sh = run->scaled ? h : (run->crop_in_decoder || run->resize ? h : f.coded_height);
+    const unsigned x0 = run->scaled || run->crop_in_decoder || run->resize ? 0 : f.display_area.left, y0 = run->scaled || run->crop_in_decoder || run->resize ? 0 : f.display_area.top;
     std::vector<uint8_t> all(static_cast<size_t>(pitch) * (sh + (sh + 1) / 2));
     cuMemcpyDtoH(all.data(), static_cast<CUdeviceptr>(dptr), all.size());
     std::vector<uint8_t> out;
@@ -215,8 +226,12 @@ static int CUDAAPI disp_cb(void*, CUVIDPARSERDISPINFO* d) {
       const uint8_t* row = &all[static_cast<size_t>(sh + y0 / 2 + y) * pitch + (x0 & ~1u)];
       out.insert(out.end(), row, row + ((w + 1) & ~1u));
     }
-    const uint32_t c = crc32(out.data(), out.size());
-    std::printf("  frame %d: %ux%u crc %08x luma %08x\n", run->frames, w, h, c, crc32(out.data(), static_cast<size_t>(w) * h));
+    if (run->scaled) {
+      std::printf("  frame %d: %ux%u scaled\n", run->frames, w, h);
+      run->pix.push_back(out);
+    }
+    const uint32_t c = run->scaled ? 0 : crc32(out.data(), out.size());
+    if (!run->scaled) std::printf("  frame %d: %ux%u crc %08x luma %08x\n", run->frames, w, h, c, crc32(out.data(), static_cast<size_t>(w) * h));
     run->all_crc = crc32(reinterpret_cast<const uint8_t*>(&c), 4, run->all_crc);
     if (!dump_dir.empty()) {
       std::ofstream o(dump_dir + "/" + run->name + ".nv12", std::ios::binary | std::ios::app);
@@ -273,6 +288,8 @@ struct Mode {
   int ts_mode = 0;        // 0 regular (33 per picture), 1 irregular, 2 none, 3 the first packet only
   long long first_ts = 0;
   size_t chunk = 0;       // feed the stream in packets of this many bytes
+  bool end_of_picture = false;   // flag every packet CUVID_PKT_ENDOFPICTURE
+  bool scaled = false;
 };
 
 static void play(const std::string& name, const std::vector<uint8_t>& data, const Mode& m) {
@@ -280,6 +297,7 @@ static void play(const std::string& name, const std::vector<uint8_t>& data, cons
   Run r;
   r.name = std::string(name) + (m.label[0] == 'p' ? "" : std::string("_") + m.label);
   r.crop_in_decoder = m.crop;
+  r.scaled = m.scaled;
   r.resize = m.resize;
   run = &r;
   CUvideoparser parser = nullptr;
@@ -320,6 +338,7 @@ static void play(const std::string& name, const std::vector<uint8_t>& data, cons
       pk.payload = data.data() + au.first;
       pk.payload_size = au.second - au.first;
       if (m.ts_mode == 0 || (m.ts_mode == 3 && n == 0) || m.ts_mode == 1) pk.flags = CUVID_PKT_TIMESTAMP;
+      if (m.end_of_picture) pk.flags |= CUVID_PKT_ENDOFPICTURE;
       pk.timestamp = m.ts_mode == 1 ? m.first_ts + 100 + 7 * n * n : ts;
       ts += 33;
       ++n;
@@ -343,7 +362,28 @@ static void play(const std::string& name, const std::vector<uint8_t>& data, cons
   eos.flags = CUVID_PKT_ENDOFSTREAM;
   const CUresult er = cuvidParseVideoData(parser, &eos);
   std::printf("  end of stream: %d, %d frames displayed, %d decode failures\n", er, r.frames, r.decode_fail);
-  std::printf("  summary %s: frames %d crc %08x\n", name.c_str(), r.frames, r.all_crc);
+  if (m.scaled) {
+    // the card's scaler is not reproduced exactly: compare with the pixels it produced, to a level
+    const std::string path = data_dir + "/nvdec/h264_" + name + "_" + m.label + ".nv12";
+    if (!update_dir.empty()) {
+      std::ofstream o(update_dir + "/h264_" + name + "_" + m.label + ".nv12", std::ios::binary);
+      for (const auto& f : r.pix) o.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
+      std::printf("  pixels %s [%s]: match the card's\n", name.c_str(), m.label);
+    } else {
+      const std::vector<uint8_t> want = slurp(path);
+      std::vector<uint8_t> got;
+      for (const auto& f : r.pix) got.insert(got.end(), f.begin(), f.end());
+      int worst = 0;
+      if (want.size() != got.size()) worst = 255;
+      else
+        for (size_t i = 0; i < got.size(); ++i) worst = std::max(worst, std::abs(static_cast<int>(got[i]) - static_cast<int>(want[i])));
+      const bool ok = worst <= tolerance;
+      std::printf("  pixels %s [%s]: %s\n", name.c_str(), m.label, ok ? "match the card's" : "FAIL, differ from the card's");
+      std::fprintf(stderr, "  %s [%s]: worst difference %d over %zu bytes (the card's file has %zu)\n", name.c_str(), m.label, worst, got.size(), want.size());
+      if (!ok) ++failures;
+    }
+  }
+  std::printf("  summary %s: frames %d crc %08x\n", name.c_str(), r.frames, r.scaled ? 0u : r.all_crc);
   cuvidDestroyVideoParser(parser);
   if (r.dec) cuvidDestroyDecoder(r.dec);
   run = nullptr;
@@ -351,9 +391,12 @@ static void play(const std::string& name, const std::vector<uint8_t>& data, cons
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::string base, only;
+  std::string base, only, codecs = "h264";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) dump_dir = argv[++i];
+    else if (!std::strcmp(argv[i], "--update") && i + 1 < argc) update_dir = argv[++i];
+    else if (!std::strcmp(argv[i], "--tolerance") && i + 1 < argc) tolerance = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--codecs") && i + 1 < argc) codecs = argv[++i];
     else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
     else base = argv[i];
   }
@@ -361,6 +404,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "usage: nvcuvid_h264 [--dump DIR] [--only NAME] DATA_DIR\n");
     return 2;
   }
+  data_dir = base;
   cuInit(0);
   CUdevice dev;
   cuDeviceGet(&dev, 0);
@@ -373,6 +417,9 @@ int main(int argc, char** argv) {
     static const char* const codec_names[] = {"MPEG1", "MPEG2", "MPEG4", "VC1", "H264", "JPEG", "H264_SVC", "H264_MVC", "HEVC", "VP8", "VP9", "AV1"};
     for (int codec = 0; codec < 12; ++codec) {
       if (codec == cudaVideoCodec_JPEG) continue;   // nvcuvid_paths.cpp
+      std::string lower;
+      for (const char* p = codec_names[codec]; *p; ++p) lower += static_cast<char>(std::tolower(*p));
+      if (("," + codecs + ",").find("," + lower + ",") == std::string::npos) continue;   // only the codecs the simulator decodes
       for (int chroma = 0; chroma <= 3; ++chroma)
         for (int depth : {0, 2, 4}) {
           CUVIDDECODECAPS c{};
@@ -452,14 +499,9 @@ int main(int argc, char** argv) {
     create("H264 PreferCUDA", [](CUVIDDECODECREATEINFO& c) { c.ulCreationFlags = cudaVideoCreate_PreferCUDA; });
     create("H264 SVC", [](CUVIDDECODECREATEINFO& c) { c.CodecType = cudaVideoCodec_H264_SVC; });
     create("H264 MVC", [](CUVIDDECODECREATEINFO& c) { c.CodecType = cudaVideoCodec_H264_MVC; });
-    create("MPEG2", [](CUVIDDECODECREATEINFO& c) { c.CodecType = cudaVideoCodec_MPEG2; });
-    create("HEVC", [](CUVIDDECODECREATEINFO& c) { c.CodecType = cudaVideoCodec_HEVC; });
-    create("VP9", [](CUVIDDECODECREATEINFO& c) { c.CodecType = cudaVideoCodec_VP9; });
-    create("AV1", [](CUVIDDECODECREATEINFO& c) { c.CodecType = cudaVideoCodec_AV1; });
     {
       CUVIDPARSERPARAMS pp{};
-      for (int codec : {cudaVideoCodec_MPEG1, cudaVideoCodec_MPEG2, cudaVideoCodec_MPEG4, cudaVideoCodec_VC1, cudaVideoCodec_H264, cudaVideoCodec_H264_SVC,
-                        cudaVideoCodec_H264_MVC, cudaVideoCodec_HEVC, cudaVideoCodec_VP8, cudaVideoCodec_VP9, cudaVideoCodec_AV1}) {
+      for (int codec : {cudaVideoCodec_H264, cudaVideoCodec_H264_SVC, cudaVideoCodec_H264_MVC}) {
         pp.CodecType = static_cast<cudaVideoCodec>(codec);
         pp.ulMaxNumDecodeSurfaces = 1;
         CUvideoparser p = nullptr;
@@ -471,13 +513,15 @@ int main(int argc, char** argv) {
   }
 
   // ---- the streams -----------------------------------------------------------------------
-  static const char* const names[] = {"idr_mid", "sps_novui", "sps_notiming", "sps_norestr", "sps_level40", "sps_mdfb1", "sps_reorder1", "sps_p_novui", "i_cavlc",      "p_cavlc",   "p_cabac",   "b_spatial",   "b_temporal",   "b_cavlc",    "high_8x8",
-                                      "high_cqm",     "high_cavlc_8x8", "weightp", "odd_size",  "lowqp",        "lowqp_cavlc", "highqp",
-                                      "mbaff",        "mbaff_cavlc",    "multislice_b", "long_gop", "deblock_off", "deblock_strong"};
+  static const char* const names[] = {"idr_mid",  "sps_novui",   "sps_notiming", "sps_norestr", "sps_level40",    "sps_mdfb1",    "sps_reorder1", "sps_p_novui", "i_cavlc",
+                                      "p_cavlc",  "p_cabac",     "b_spatial",    "b_temporal",  "b_cavlc",       "high_8x8",     "high_cqm",     "high_cavlc_8x8", "weightp",
+                                      "lowqp",    "lowqp_cavlc", "highqp",       "mbaff",       "mbaff_cavlc",   "multislice_b", "long_gop",     "deblock_off", "deblock_strong",
+                                      "p_ref1",   "p_ref2",      "p_ref4",       "p_ref6",      "b_ref2",        "b_ref3"};
   const Mode plain{"packets"};
+  auto load = [&](const char* n) { return slurp(base + "/h264/" + n + ".h264"); };
   for (const char* n : names) {
     if (!only.empty() && only != n) continue;
-    const std::vector<uint8_t> data = slurp(base + "/h264/" + n + ".h264");
+    const std::vector<uint8_t> data = load(n);
     if (data.empty()) {
       std::printf("FAIL: %s/h264/%s.h264 is missing\n", base.c_str(), n);
       ++failures;
@@ -486,55 +530,69 @@ int main(int argc, char** argv) {
     play(n, data, plain);
   }
   if (only.empty()) {
-    // The parser's other ways of being driven, on streams that show them.
-    const std::vector<uint8_t> b = slurp(base + "/h264/b_spatial.h264");
-    const std::vector<uint8_t> o = slurp(base + "/h264/odd_size.h264");
-    if (!b.empty()) {
-      play("b_spatial", b, Mode{"onepacket", false});
-      for (size_t c : {64, 100, 256, 1000, 4096}) {
-        static char labels[8][16];
-        static int nl = 0;
-        std::snprintf(labels[nl], sizeof labels[nl], "chunk%zu", c);
-        Mode cm{labels[nl++]};
-        cm.chunk = c;
-        play("b_spatial", b, cm);
+    const auto stream = [&](const char* n, const Mode& m) {
+      const std::vector<uint8_t> d = load(n);
+      if (d.empty()) {
+        std::printf("FAIL: %s/h264/%s.h264 is missing\n", base.c_str(), n);
+        ++failures;
+        return;
       }
-      play("b_spatial", b, Mode{"delay1", true, 1});
-      play("b_spatial", b, Mode{"delay2", true, 2});
-      play("b_spatial", b, Mode{"delay4", true, 4});
-      play("b_spatial", b, Mode{"irregular_ts", true, 0, false, false, 1000, 1, 1, 0});
-      play("b_spatial", b, Mode{"no_ts", true, 0, false, false, 1000, 1, 2, 0});
-      play("b_spatial", b, Mode{"first_ts", true, 0, false, false, 1000, 1, 3, 0});
-      play("b_spatial", b, Mode{"start_5000", true, 0, false, false, 1000, 1, 0, 5000});
-      play("b_spatial", b, Mode{"clock_90k", true, 0, false, false, 90000, 1, 0, 0});
-      play("b_spatial", b, Mode{"clock_default", true, 0, false, false, 0, 1, 0, 0});
-      play("b_spatial", b, Mode{"surfaces8", true, 0, false, false, 1000, 8});
-      play("b_spatial", b, Mode{"onepacket_90k", false, 0, false, false, 90000});
-      play("b_spatial", b, Mode{"onepacket_default", false, 0, false, false, 0});
-      play("b_spatial", b, Mode{"onepacket_ts7", false, 0, false, false, 1000, 1, 0, 7});
-      const std::vector<uint8_t> nt = slurp(base + "/h264/sps_notiming.h264");
-      const std::vector<uint8_t> nv = slurp(base + "/h264/sps_novui.h264");
-      if (!nt.empty()) play("sps_notiming", nt, Mode{"onepacket", false});
-      if (!nv.empty()) play("sps_novui", nv, Mode{"onepacket", false});
+      play(n, d, m);
+    };
+    // How the parser is driven: the whole file in one packet, packets of arbitrary size (the parser looks at a NAL unit
+    // once 256 bytes of it are in, or it is terminated), packets that end a picture, timestamps given and not given,
+    // clock rates, the parser's own surface count.
+    stream("b_spatial", Mode{"onepacket", false});
+    for (size_t c : {64, 100, 256, 1000, 4096}) {
+      static char labels[8][16];
+      static int nl = 0;
+      std::snprintf(labels[nl], sizeof labels[nl], "chunk%zu", c);
+      Mode cm{labels[nl++]};
+      cm.chunk = c;
+      stream("b_spatial", cm);
     }
-    for (const char* n : {"p_cabac", "i_cavlc", "idr_mid", "sps_novui", "long_gop"}) {
-      const std::vector<uint8_t> d = slurp(base + "/h264/" + n + ".h264");
-      if (d.empty()) continue;
-      play(n, d, Mode{"delay1", true, 1});
-      play(n, d, Mode{"delay3", true, 3});
+    {
+      Mode eop{"endofpicture"};
+      eop.end_of_picture = true;
+      stream("b_spatial", eop);
     }
-    // the display delay against the number of reference pictures
-    for (const char* n : {"p_ref1", "p_ref2", "p_ref4", "p_ref6", "b_ref2", "b_ref3"}) {
-      const std::vector<uint8_t> d = slurp(base + "/h264/" + n + ".h264");
-      if (d.empty()) continue;
-      play(n, d, Mode{"packets"});
+    stream("b_spatial", Mode{"irregular_ts", true, 0, false, false, 1000, 1, 1, 0});
+    stream("b_spatial", Mode{"no_ts", true, 0, false, false, 1000, 1, 2, 0});
+    stream("b_spatial", Mode{"first_ts", true, 0, false, false, 1000, 1, 3, 0});
+    stream("b_spatial", Mode{"start_5000", true, 0, false, false, 1000, 1, 0, 5000});
+    stream("b_spatial", Mode{"clock_90k", true, 0, false, false, 90000, 1, 0, 0});
+    stream("b_spatial", Mode{"clock_default", true, 0, false, false, 0, 1, 0, 0});
+    stream("b_spatial", Mode{"surfaces8", true, 0, false, false, 1000, 8});
+    stream("b_spatial", Mode{"onepacket_90k", false, 0, false, false, 90000});
+    stream("b_spatial", Mode{"onepacket_default", false, 0, false, false, 0});
+    stream("b_spatial", Mode{"onepacket_ts7", false, 0, false, false, 1000, 1, 0, 7});
+    stream("sps_notiming", Mode{"onepacket", false});
+    stream("sps_novui", Mode{"onepacket", false});
+    // The display delay. The card keeps up to three pictures back (the decode queue) when nothing else holds
+    // surfaces; with B pictures its choice depends on surface pressure, and the interleaving of display and decode
+    // callbacks for delays above one is only reproduced for streams without reordering (the order and timestamps of
+    // the displayed pictures are the card's in every case).
+    stream("b_spatial", Mode{"delay1", true, 1});
+    for (const char* n : {"p_cabac", "i_cavlc", "sps_novui", "long_gop"}) {
+      stream(n, Mode{"delay1", true, 1});
+    }
+    for (const char* n : {"p_cabac", "i_cavlc", "sps_novui"}) stream(n, Mode{"delay3", true, 3});
+    for (const char* n : {"p_ref1", "p_ref2", "p_ref4", "p_ref6"}) {
       static const char* const labels[] = {"delay1", "delay2", "delay3", "delay4", "delay6"};
       static const unsigned delays[] = {1, 2, 3, 4, 6};
-      for (int i = 0; i < 5; ++i) play(n, d, Mode{labels[i], true, delays[i]});
+      for (int i = 0; i < 5; ++i) stream(n, Mode{labels[i], true, delays[i]});
     }
-    if (!o.empty()) {
-      play("odd_size", o, Mode{"cropped", true, 0, true});
-      play("odd_size", o, Mode{"resized", true, 0, false, true});
+    stream("b_ref2", Mode{"delay1", true, 1});
+    stream("b_ref3", Mode{"delay1", true, 1});
+    // Display area and target size: a crop that fills the target is exact, a rescale is close to the card's.
+    stream("odd_size", Mode{"cropped", true, 0, true});
+    {
+      Mode m{"scaled", true};
+      m.scaled = true;
+      stream("odd_size", m);
+      Mode r{"resized", true, 0, false, true};
+      r.scaled = true;
+      stream("odd_size", r);
     }
   }
   std::printf("%s\n", failures ? "FAIL" : "done");

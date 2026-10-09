@@ -8,7 +8,10 @@ std::vector<uint8_t> window_to_target(const uint8_t* src, int stride, int x0, in
   std::vector<uint8_t> win(static_cast<size_t>(w) * h);
   for (int y = 0; y < h; ++y) std::memcpy(&win[static_cast<size_t>(y) * w], src + static_cast<ptrdiff_t>(y0 + y) * stride + x0, static_cast<size_t>(w));
   if (static_cast<uint32_t>(w) == tw && static_cast<uint32_t>(h) == th) return win;
-  return resample(win, static_cast<uint32_t>(w), static_cast<uint32_t>(h), tw, th);
+  ScaleMode sm;
+  sm.down_num = 1;
+  sm.down_den = 2;
+  return resample(win, static_cast<uint32_t>(w), static_cast<uint32_t>(h), tw, th, sm);
 }
 
 // The decoded frame as NV12 in the decoder's surface: the display area of the picture, scaled to the target size.
