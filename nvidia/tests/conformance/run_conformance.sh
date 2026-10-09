@@ -9,6 +9,7 @@
 # virtual side uses -cudart shared so the shim can be substituted.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
+. "$root/tests/shim_guard.sh"
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 out="${TMPDIR:-/tmp}/vgpu-conformance"
 mkdir -p "$out"
@@ -82,9 +83,11 @@ for src in "$root"/nvidia/tests/conformance/*.cu; do
     fi
   fi
   if grep -q "cudnn" "$src"; then
-    # cuDNN is not part of the CUDA toolkit: its headers are vendored here and
-    # the reference library comes from wherever the wheel or package put it.
-    inc="-I$root/nvidia/third_party/cudnn_include"
+    # cuDNN is not part of the CUDA toolkit: its headers are fetched by the
+    # CMake configure (cudnn_include_dir) and the reference library comes from
+    # wherever the wheel or package put it.
+    cudnn_inc="$(cudnn_include_dir)" || { echo "skip  $name: no cuDNN headers (see scripts/fetch-cudnn-headers.py)"; continue; }
+    inc="-I$cudnn_inc"
     libs="$libs -lcudnn"
     if [[ -e "${VGPU_CUDNN_LIB:-/nonexistent}/libcudnn.so.9" ]]; then
       reallib="$VGPU_CUDNN_LIB"

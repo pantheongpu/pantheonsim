@@ -1,27 +1,31 @@
 # Vendored headers
 
-`cudnn_include/` and `nccl_include/` are the public API headers from the
-redistributable `nvidia-cudnn-cu12` and `nvidia-nccl-cu12` wheels. They are
-here so the shims are compiled against the *real* ABI rather than a
-hand-written approximation — writing struct layouts by hand has silently
-produced garbage twice in this project (`cudaDeviceProp`, `cudaFuncAttributes`),
-and there is no reason to risk it a third time.
+`nccl_include/` is the public API headers of NCCL (Apache-2.0, as its headers
+say) and `nvenc_include/nvEncodeAPI.h` is the public NVENC API header from
+NVIDIA's Video Codec SDK, which NVIDIA licenses under the MIT terms printed at
+the top of the file. They are here so the shims are compiled against the *real*
+ABI rather than a hand-written approximation -- writing struct layouts by hand
+has silently produced garbage twice in this project (`cudaDeviceProp`,
+`cudaFuncAttributes`) -- and so `libvgpunvenc` (presented as
+`libnvidia-encode.so.1`) builds from this tree alone.
 
 They are build-time only: nothing here is redistributed in a binary, and the
 shims implement the documented APIs, not any NVIDIA code.
 
-Refresh with:
+Refresh NCCL with:
 
-    pip download --no-deps --dest /tmp/nvpkg nvidia-cudnn-cu12 nvidia-nccl-cu12
+    pip download --no-deps --dest /tmp/nvpkg nvidia-nccl-cu12
 
-`nvenc_include/nvEncodeAPI.h` is the public NVENC API header from NVIDIA's
-Video Codec SDK, which NVIDIA licenses under the MIT terms printed at the top of
-the file. It lets `libvgpunvenc` (presented as `libnvidia-encode.so.1`) build
-from this tree alone. Refresh it from the SDK's `Interface/` directory.
+and NVENC from the SDK's `Interface/` directory.
 
-`joe_kuo/sobol_directions.inc` packs S. Joe and F. Y. Kuo's Sobol' direction
-numbers (`new-joe-kuo-6.21201`, the first 20,000 dimensions), which cuRAND
-documents as the source of its direction vectors. Unlike the headers above it
-is compiled into `libvgpucurand`, under the BSD-style licence reproduced at the
-top of the file. `joe_kuo/gen_sobol_directions.py` regenerates it from the file
-published at https://web.maths.unsw.edu.au/~fkuo/sobol/.
+## cuDNN is not here
+
+cuDNN's API headers carry NVIDIA's proprietary licence notice, which does not
+allow publishing them, so they are not kept in this repository. The same headers
+are built against all the same: the CMake configure fetches them into
+`build/cudnn_include` from the `nvidia-cudnn-cu12` wheel on PyPI with
+`scripts/fetch-cudnn-headers.py` (about 1 MB, by range requests, each file checked
+against `scripts/cudnn-headers.sha256`). To use headers you already have, set
+`CUDNN_HEADER_DIR`; to build without cuDNN, configure with
+`-DVGPU_FETCH_CUDNN_HEADERS=OFF`. `tests/lint/check_no_proprietary_nvidia.sh` fails
+if a file with that notice is ever added back.

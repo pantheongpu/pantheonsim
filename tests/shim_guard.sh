@@ -112,6 +112,19 @@ pick_nvcc_for_shim() {
   return 0
 }
 
+# cudnn_include_dir
+# The directory with cuDNN's API headers, which are NVIDIA's and are not kept in
+# this tree: CUDNN_HEADER_DIR when it names one, otherwise the copy the CMake
+# configure fetched into the build directory (scripts/fetch-cudnn-headers.py).
+# Prints it and returns 0, or returns 1 when there are none.
+cudnn_include_dir() {
+  local d
+  for d in "${CUDNN_HEADER_DIR:-}" "${VGPU_BUILD_DIR:-$root/build}/cudnn_include"; do
+    if [[ -n "$d" && -e "$d/cudnn.h" ]]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+
 # nvcc_host_compiler_fix
 # CUDA 12's nvcc rejects GCC 13's <bits/floatn.h> on _Float128 and fails inside
 # <math.h> before it sees any of our code. Pointing it at g++-12 is the standard

@@ -38,7 +38,8 @@ for spec in cublas_level1:-lcublas cusparse_ops:-lcusparse cudnn_backward:-lcudn
   lib="${lib//,/ }"
   if [[ "$lib" == -lcudnn ]]; then
     [[ -e "$shim/libcudnn.so" ]] || { echo "skip  $name: libvgpucudnn not built"; continue; }
-    inc="-I$root/nvidia/third_party/cudnn_include -Xcompiler -Wno-deprecated-declarations"
+    cudnn_inc="$(cudnn_include_dir)" || { echo "skip  $name: no cuDNN headers (see scripts/fetch-cudnn-headers.py)"; continue; }
+    inc="-I$cudnn_inc -Xcompiler -Wno-deprecated-declarations"
   fi
   if ! nvcc -std=c++17 -cudart shared -arch=compute_75 -code=compute_75 -Wno-deprecated-gpu-targets \
         $(shim_sanitizer_nvcc_flags "$shim") $inc "$conf/$name.cu" -o "$out/$name" -L"$shim" $lib \

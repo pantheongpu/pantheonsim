@@ -41,11 +41,14 @@ for lib in "$@"; do
   # cuStateVec, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuDNN, nvCOMP and NVSHMEM are not
   # part of the toolkit, and cuFile is not part of CUDA 12.0's, so nvcc has no
   # copy to link against: link against the shim's, which follows NVIDIA's ABI.
-  # cuDNN's headers are vendored; the others' are the simulator's own
+  # cuDNN's headers are fetched at configure time; the others' are the simulator's own
   # (nvidia/include/vgpu_*.h).
   [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cusparseLt || "$lib" == cutensor || "$lib" == cutensornet || "$lib" == cudnn ||
      "$lib" == cufile || "$lib" == nvcomp || "$lib" == nvshmem_host ]] && links+=("-L$shim")
-  [[ "$lib" == cudnn ]] && links+=("-I$root/nvidia/third_party/cudnn_include")
+  if [[ "$lib" == cudnn ]]; then
+    cudnn_inc="$(cudnn_include_dir)" || { echo "SKIP: no cuDNN headers (see scripts/fetch-cudnn-headers.py)"; exit 0; }
+    links+=("-I$cudnn_inc")
+  fi
   links+=("-l$lib")
 done
 # A graph-API test built on NVIDIA's cudnn-frontend (header-only) gets it
