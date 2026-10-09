@@ -305,6 +305,25 @@ static void cubin_is_real() {
   bool right = ok;
   for (int i = 0; i < 32; ++i) right = right && out[i] == i * 3 + 1;
   check(right, "the cubin loads through cuModuleLoadData and its kernel gives the right answers");
+  {  // The same cubin through the library API (cuda.core's ObjectCode loads it so).
+    CUlibrary lib = nullptr;
+    CUkernel kern = nullptr;
+    CUfunction lfn = nullptr;
+    int lout[32] = {0};
+    bool lok = cuLibraryLoadData(&lib, cubin.data(), nullptr, nullptr, 0, nullptr, nullptr, 0) == CUDA_SUCCESS &&
+               cuLibraryGetKernel(&kern, lib, "fill") == CUDA_SUCCESS && cuKernelGetFunction(&lfn, kern) == CUDA_SUCCESS;
+    if (lok) {
+      CUdeviceptr d;
+      cuMemAlloc(&d, sizeof lout);
+      void* args[] = {&d};
+      lok = cuLaunchKernel(lfn, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr) == CUDA_SUCCESS && cuCtxSynchronize() == CUDA_SUCCESS;
+      cuMemcpyDtoH(lout, d, sizeof lout);
+      cuMemFree(d);
+    }
+    for (int i = 0; i < 32; ++i) lok = lok && lout[i] == i * 3 + 1;
+    check(lok, "and through cuLibraryLoadData");
+    if (lib) cuLibraryUnload(lib);
+  }
   if (is_vgpu_shim() && !ptx_engine()) {
     // The SASS engine refusing an instruction of the cubin (VGPU_SASS_REFUSE tests this): the PTX
     // NVRTC made it from runs in its place, as for a fatbin that carries both.
