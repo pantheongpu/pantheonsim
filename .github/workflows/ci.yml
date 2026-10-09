@@ -302,6 +302,15 @@ jobs:
         env:
           VGPU_OLLAMA_PULL: '1'
         run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
+
+      # The job runs as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what it leaves there is root's, and a job
+      # that is not in a container (the AMD ollama jobs, the image finder) then cannot clean
+      # it at checkout. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
   ollama-amd:
     name: ollama on ${{ matrix.gpu }}
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
