@@ -21,6 +21,17 @@ using namespace gc;
 #define OK(x) do { NppStatus s_ = (x); if (s_ != NPP_SUCCESS) { \
   std::printf("     %s -> %d\n", #x, (int)s_); ok = false; } } while (0)
 
+// The buffer size is an int* in NPP 12.0 and a size_t* by 12.8: whichever the header takes is the one that
+// compiles.
+template <class T>
+static auto sum_bytes(NppStreamContext ctx, int) -> decltype(nppsSumGetBufferSize_32f_Ctx(256, static_cast<T*>(nullptr), ctx), size_t()) {
+  T bytes = 0;
+  nppsSumGetBufferSize_32f_Ctx(256, &bytes, ctx);
+  return static_cast<size_t>(bytes);
+}
+template <class T>
+static size_t sum_bytes(NppStreamContext, long) { return 0; }   // the header takes the other type
+
 int main() {
   Runner r;
   NppStreamContext ctx{};   // filled in by hand: CUDA 13's NPP no longer has nppGetStreamContext
@@ -106,8 +117,7 @@ int main() {
   {
     // A reduction: needs a scratch buffer (sized beforehand) and writes a device scalar.
     float *a = r.alloc<float>(256), *sum = r.alloc<float>(1);
-    size_t bytes = 0;
-    nppsSumGetBufferSize_32f_Ctx(256, &bytes, ctx);
+    const size_t bytes = sum_bytes<size_t>(ctx, 0) + sum_bytes<int>(ctx, 0);
     unsigned char* scratch = r.alloc<unsigned char>(bytes + 16);
     r.run("nppsSum_32f_Ctx (a scratch buffer)", [&] {
       bool ok = true;

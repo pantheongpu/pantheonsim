@@ -638,6 +638,8 @@ runs them; each is a ctest of its own.
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_lt_epilogue_paths` | RELU_AUX/GELU_AUX's mask and input, DRELU/DGELU and their bias gradients, BGRADA/BGRADB, in fp16/bf16/fp32/fp64, and what the card refuses | a training step's backward pass (cuBLASLt-fused linear layers) |
 | `e2e_graph_capture_libs` | cuBLASLt's matmul with a bias epilogue, cuDNN's graph-API convolution and a driver-API `cuLaunchKernel` recorded into a captured CUDA graph, their descriptors, plan and pack destroyed after the capture, then launched with new inputs: the capture runs nothing, every launch reads what the graph's kernels wrote before it (`run_graph_capture_libs.sh --card` runs the same program on NVIDIA's libraries; it passes there) | PyTorch's CUDA graphs: `torch.cuda.graph`, `make_graphed_callables`, `mode="reduce-overhead"`, Triton kernels inside a graph |
+| `e2e_graph_capture_dnn`, `e2e_graph_capture_fft`, `e2e_graph_capture_solver`, `e2e_graph_capture_rand`, `e2e_graph_capture_jpeg`, `e2e_graph_capture_npp` | cuDNN's classic API, cuFFT, cuSOLVER's dense API, cuRAND, nvJPEG's decode and NPP's `_Ctx` functions recorded into a captured CUDA graph (descriptors, plans and parameter objects destroyed after the capture), then launched with new inputs, each compared with an eager run; the calls NVIDIA's library cannot capture answer as it does and invalidate the capture. `graph_capture_common.h` is the harness; `run_graph_capture.sh <name> <libs> --card` runs the same program on NVIDIA's libraries (all pass there) | PyTorch's CUDA graphs with BatchNorm, RNNs, FFTs, linear algebra; XLA, Warp |
+| `e2e_graph_capture_driver`, `e2e_graph_driver` | the driver API's stream calls inside a capture made with `cuStreamBeginCapture` (copies of every shape, fills, host functions, events across streams, stream memory operations, stream-ordered allocation, and the calls a capture refuses) and the driver's explicit graphs (`cuGraphAdd*Node`, Get/SetParams, executable-graph updates, clones, user objects, capture into a graph); both run on NVIDIA's driver too | XLA, Warp, cuda-python |
 | `e2e_lt_blockscaled_paths` | MXFP8 and NVFP4 block scales in the tiled layout, the 128-element and 128x128 FP32 forms, D's block quantization and its output scales (simulator only: documentation-derived) | `_scaled_mm` with block scales |
 | `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4 and an RTX 3060 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
 | `e2e_lowprec_sparselt` | 1096 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4 and an RTX 3060 | FP8 2:4 sparse inference |
@@ -1196,16 +1198,55 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   (an assumption). The backward epilogues match the card, except that GELU and
   its derivative are exact where the card's fp32 tanh is approximate (within
   about 5e-5), which is why the probe checks GELU against the function, not a hash.
-- **Stream capture**: cuBLAS, cuBLASLt (`cublasLtMatmul`), cuDNN's graph API
-  (`cudnnBackendExecute`), cuSPARSE, cuSPARSELt, cuTENSOR, cuDSS and the driver
-  API's `cuLaunchKernel`/`cuLaunchKernelEx` are recorded into a captured CUDA
-  graph and run at each launch (a library call as a host node, a driver launch
-  as a kernel node whose parameters `cudaGraphKernelNodeGetParams` and
-  `SetParams` do not give back). Not recorded yet, and so refused when the
-  stream is capturing -- they fail the capture -- cuDNN's classic API
-  (`cudnnConvolutionForward`, BatchNorm, RNNs, ...) and `cudnnBackendPopulateCudaGraph`,
-  and the other driver-API stream calls (`cuMemcpyAsync`, `cuMemsetD*Async`,
-  events, `cuStreamWaitEvent`, `cuGraph*`), which still run when called.
+- **Stream capture**: a library call made while its stream is captured is
+  recorded into the graph and runs at each launch, over what the graph's own
+  kernels have written by then, with the descriptors, plans and parameter
+  objects it was given as they were at the call (the program may destroy them
+  as soon as the capture function returns). Recorded: cuBLAS, cuBLASLt,
+  cuSPARSE, cuSPARSELt, cuTENSOR, cuDSS, cuDNN's graph API and its **whole
+  classic API** (convolution, activation, pooling, softmax, LRN, divisive
+  normalization, tensor arithmetic and transforms, batch normalization and the
+  normalization API with their Ex forms, the spatial transformer, CTC, dropout,
+  fused ops, RNNs and multi-head attention: `VGPU_DEFER`, which probes the call
+  with the caller's arguments so every status comes back at the call, then
+  copies the descriptors and host scalars and arrays), **cuFFT** (`cufftExec*`
+  with a copy of the plan), **cuSOLVER's dense API** (the routines NVIDIA's
+  library captures; `gesvd`, `syevd`, `sygvd`, `sytrf` and the 64-bit
+  `Xsyevd`, `Xgesvd`, ... cannot be captured on the card -- they wait for the
+  stream -- and answer INTERNAL_ERROR here and invalidate the capture; `syevj`
+  answers success and invalidates it), **cuRAND** (the capture takes its place
+  in the generator's stream, the first launch draws what an eager call would
+  have, later launches of a pseudorandom generator draw other numbers, a
+  quasirandom one repeats: as the card), **NPP**'s `_Ctx` functions, and
+  **nvJPEG**'s decode (parsed at the call, the pixels written at each launch;
+  the encoders wait for the stream and fail with EXECUTION_FAILED, the capture
+  invalidated, as on the card). The **driver API**: a copy, fill or host
+  function on a capturing stream is a node (`cuMemcpy*Async`,
+  `cuMemsetD*Async`, `cuLaunchHostFunc`, stream memory operations, `cuLaunchKernel`),
+  `cuMemAllocAsync`/`cuMemFreeAsync` are graph allocation nodes, events and
+  `cuStreamWaitEvent` fork and join streams, and the calls CUDA refuses while
+  capturing (`cuMemAlloc*`, `cuStreamSynchronize`, `cuCtxSynchronize`,
+  `cuMemPrefetchAsync`, `cuMemcpyPeerAsync`, ...) answer
+  CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED and invalidate the capture. libcuda also
+  has the driver's own capture and graph API now (`cuStreamBeginCapture`,
+  `cuGraph*`, user objects, `cuStreamWaitValue*`/`WriteValue*`/`BatchMemOp`; it
+  forwards to the runtime's graphs). Kernel, copy, fill and batch memory
+  operation nodes of the driver are closures over a copy of the driver's
+  parameters; a node a capture made, or a graph the runtime made, gives no
+  parameters back through `cuGraph*NodeGetParams`.
+  Every program that checks this (`e2e_graph_capture_*`, `e2e_graph_driver`)
+  also runs against NVIDIA's libraries on the card
+  (`run_graph_capture.sh <name> <libs> --card`) and passes there.
+  **Not recorded** (they run when called, so a replay misses them -- or, for
+  the ones that wait on the stream, fail the capture): cuSOLVER's sparse
+  (`cusolverSp`), refactorization (`cusolverRf`) and multi-GPU (`cusolverMg`)
+  APIs and the IRS solvers' iteration counts, multi-GPU cuFFT descriptors and
+  cuFFT callbacks, cuTensorNet and cuStateVec, `cudnnFindConvolution*Ex`, and
+  `cudnnBackendPopulateCudaGraph`. Not copied for a captured call: a cuFFT plan
+  with LTO callbacks, a cuRAND generator, an nvJPEG handle or state, a cuSOLVER
+  workspace -- these have to outlive the graph, as NVIDIA's do. The driver API
+  does not refuse module loading while capturing (NVIDIA's invalidates the
+  capture) so that lazily loaded kernels (Triton's) keep working.
 - **cuDNN**: in the graph API, interpolating resampling beyond bilinear
   upsampling by 2 (the one configuration cuDNN has an engine for; nearest
   has none, which cuDNN documents), block-scaled (MXFP8) attention (E8M0

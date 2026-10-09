@@ -75,7 +75,9 @@ paths tested here do not call them.
   graph-API call made while the stream captures becomes a node that runs at
   each launch over what the graph's kernels wrote before it, and a Triton
   kernel (the driver API's `cuLaunchKernel`) becomes a kernel node. The classic
-  cuDNN API (BatchNorm, RNNs, classic convolutions) does not capture yet.
+  cuDNN API (BatchNorm, RNNs, classic convolutions, CTC, dropout), cuFFT,
+  cuSOLVER's dense API, cuRAND and the driver API's copies, fills and events
+  capture too (`nvidia/docs/libraries.md`, "Stream capture").
   (`e2e_graph_capture_libs`, which also passes against NVIDIA's libraries.)
 - **Both CUDA APIs:** PyTorch calls the driver API too. `libcudart` and
   `libcuda` share one simulated machine and one API lock

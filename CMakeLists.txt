@@ -2956,6 +2956,22 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # The host-computed vendor libraries inside a captured graph: each call recorded, run at each launch
+  # of the graph over new inputs, its plan or parameter objects destroyed in between (the program
+  # also runs against NVIDIA's library with run_graph_capture.sh <name> <libs> --card).
+  foreach(_cap "fft:cufft" "solver:cusolver,cublas" "rand:curand" "jpeg:nvjpeg"
+               "npp:nppc,nppial,nppicc,nppig,nppif,nppidei,npps,nppist")
+    string(REPLACE ":" ";" _cap_parts "${_cap}")
+    list(GET _cap_parts 0 _cap_name)
+    list(GET _cap_parts 1 _cap_libs)
+    add_test(NAME e2e_graph_capture_${_cap_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh ${_cap_name} ${_cap_libs})
+    set_tests_properties(e2e_graph_capture_${_cap_name} PROPERTIES
+      DEPENDS "vgpucudart"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
   # The driver API's stream calls inside a captured graph, captured and launched through the driver
   # API's own cuStreamBeginCapture and cuGraph* (run_graph_capture.sh driver "" --card runs the same
   # program against NVIDIA's driver).

@@ -53,6 +53,9 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <memory>
+
+#include "capture_defer.hpp"
 
 #include "nvjpeg_codec.hpp"
 
@@ -1568,6 +1571,22 @@ VGPU_EXPORT nvjpegStatus_t nvjpegGetImageInfo(nvjpegHandle_t h, const unsigned c
   return NVJPEG_STATUS_SUCCESS;
 }
 
+// On a capturing stream the device half of a decode is recorded: the bitstream is parsed now (host work, as
+// NVIDIA's does at the call) and the pixels are written to the destination at each launch of the graph.
+// Measured on an RTX 3060: nvjpegDecode records and the capture goes on; the encoders do not (below).
+static bool record_decode(cudaStream_t stream, std::shared_ptr<Image> im, OutputSpec o, const nvjpegImage_t* dst) {
+  if (!vgpu_capture::stream_capturing(stream)) return false;
+  const nvjpegImage_t where = *dst;
+  return vgpu_record_host_op_if_capturing(stream, [im, o, where] {
+    nvjpegImage_t d = where;
+    write_image(*im, o, &d);
+  });
+}
+
+// A wait on the stream, which a capturing stream does not allow: the call fails, as NVIDIA's encoders do
+// there, and the capture is invalidated (the runtime's wait did that).
+static bool stream_wait_refused(cudaStream_t stream) { return cudaStreamSynchronize(stream) != cudaSuccess; }
+
 VGPU_EXPORT nvjpegStatus_t nvjpegDecode(nvjpegHandle_t h, nvjpegJpegState_t s, const unsigned char* data,
                                         size_t length, nvjpegOutputFormat_t fmt, nvjpegImage_t* dst,
                                         cudaStream_t stream) {
@@ -1579,9 +1598,10 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecode(nvjpegHandle_t h, nvjpegJpegState_t s, c
   Image im;
   nvjpegStatus_t st = parse_jpeg(data, length, &im, /*decode=*/true);
   if (st != NVJPEG_STATUS_SUCCESS) return st;
-  cudaStreamSynchronize(stream);
   OutputSpec o;
   o.format = fmt;
+  if (record_decode(stream, std::make_shared<Image>(im), o, dst)) return NVJPEG_STATUS_SUCCESS;
+  cudaStreamSynchronize(stream);
   return write_image(im, o, dst);
 }
 
@@ -1631,6 +1651,25 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecodeBatched(nvjpegHandle_t h, nvjpegJpegState
     if (!quiet())
       std::fprintf(stderr, "[vgpu] nvJPEG: lossless JPEG decode is not supported by VirtualGPU\n");
     return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;
+  }
+  if (vgpu_capture::stream_capturing(stream)) {
+    // Parsed now, written at each launch; a failure in the batch is the call's answer now.
+    auto images = std::make_shared<std::vector<std::shared_ptr<Image>>>();
+    auto wheres = std::make_shared<std::vector<nvjpegImage_t>>(dst, dst + st.batch_size);
+    nvjpegStatus_t first = NVJPEG_STATUS_SUCCESS;
+    for (int i = 0; i < st.batch_size; ++i) {
+      auto im = std::make_shared<Image>();
+      const nvjpegStatus_t r = data[i] ? parse_jpeg(data[i], lengths[i], im.get(), /*decode=*/true) : NVJPEG_STATUS_INVALID_PARAMETER;
+      if (r != NVJPEG_STATUS_SUCCESS && first == NVJPEG_STATUS_SUCCESS) first = r;
+      images->push_back(r == NVJPEG_STATUS_SUCCESS ? im : nullptr);
+    }
+    OutputSpec o;
+    o.format = st.batch_format;
+    if (vgpu_record_host_op_if_capturing(stream, [images, wheres, o] {
+          for (size_t i = 0; i < images->size(); ++i)
+            if ((*images)[i]) write_image(*(*images)[i], o, &(*wheres)[i]);
+        }))
+      return first;
   }
   cudaStreamSynchronize(stream);
   nvjpegStatus_t first = NVJPEG_STATUS_SUCCESS;
@@ -1993,6 +2032,7 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecodeJpegDevice(nvjpegHandle_t h, nvjpegJpegDe
     return NVJPEG_STATUS_INVALID_PARAMETER;
   auto& st = *reinterpret_cast<State*>(s);
   if (st.phase < 2 || !st.image) return NVJPEG_STATUS_INVALID_PARAMETER;
+  if (record_decode(stream, std::make_shared<Image>(*st.image), st.out, dst)) return NVJPEG_STATUS_SUCCESS;
   cudaStreamSynchronize(stream);
   return write_image(*st.image, st.out, dst);
 }
@@ -2106,7 +2146,7 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncodeImage(nvjpegHandle_t h, nvjpegEncoderStat
   if (!known(h, Kind::Handle) || !known(st, Kind::EncoderState) || !known(pp, Kind::EncoderParams) || !src)
     return NVJPEG_STATUS_INVALID_PARAMETER;
   if (width <= 0 || height <= 0) return NVJPEG_STATUS_INVALID_PARAMETER;
-  cudaStreamSynchronize(stream);
+  if (stream_wait_refused(stream)) return NVJPEG_STATUS_EXECUTION_FAILED;
   std::vector<Plane> ycc;
   if (const nvjpegStatus_t r = read_rgb(src, ifmt, width, height, &ycc); r != NVJPEG_STATUS_SUCCESS) return r;
   const auto& prm = *reinterpret_cast<const EncoderParams*>(pp);
@@ -2162,7 +2202,7 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncodeYUV(nvjpegHandle_t h, nvjpegEncoderState_
   if (!known(h, Kind::Handle) || !known(st, Kind::EncoderState) || !known(pp, Kind::EncoderParams) || !src)
     return NVJPEG_STATUS_INVALID_PARAMETER;
   if (width <= 0 || height <= 0) return NVJPEG_STATUS_INVALID_PARAMETER;
-  cudaStreamSynchronize(stream);
+  if (stream_wait_refused(stream)) return NVJPEG_STATUS_EXECUTION_FAILED;
   return encode_yuv(*reinterpret_cast<EncoderState*>(st), *reinterpret_cast<const EncoderParams*>(pp), src, css,
                     false, width, height);
 }
