@@ -70,6 +70,7 @@ struct Link {
   bool lto = false;
   bool ptx_output = false;
   bool verbose = false;
+  vgpu::cuda::SassLinkOptions sass_options;   // -g, -kernels-used
   bool failed_create = false;   // the handle exists only so its log can be read
   bool completed = false;
   bool linked_ok = false;
@@ -152,7 +153,11 @@ nvJitLinkResult parse_options(Link& L, uint32_t n, const char* const* options) {
       L.ptx_output = true;
     } else if (o == "-verbose") {
       L.verbose = true;
-    } else if (o == "-time" || o == "-g" || o == "-lineinfo" || o == "-no-cache" ||
+    } else if (o == "-g") {
+      L.sass_options.keep_unused = true;
+    } else if (o.rfind("-kernels-used=", 0) == 0 && o.size() > 14) {
+      L.sass_options.kernels_used.push_back(o.substr(14));
+    } else if (o == "-time" || o == "-lineinfo" || o == "-no-cache" ||
                o == "-optimize-unused-variables" ||
                (o.size() == 3 && o[0] == '-' && o[1] == 'O' && std::isdigit(static_cast<unsigned char>(o[2]))) ||
                accepts_value(o)) {
@@ -493,7 +498,7 @@ VGPU_EXPORT nvJitLinkResult nvJitLinkComplete(nvJitLinkHandle handle) {
     // Machine code: every piece has SASS for -arch (add_sass saw to that).
     std::vector<vgpu::cuda::SassLinkInput> in;
     for (const Link::Piece& p : L->pieces) in.push_back(L->sass[static_cast<size_t>(p.sass)]);
-    vgpu::cuda::SassLinkResult r = vgpu::cuda::link_sass(in, L->arch_number);
+    vgpu::cuda::SassLinkResult r = vgpu::cuda::link_sass(in, L->arch_number, L->sass_options);
     L->error_log += r.errors;
     if (!r.ok) return NVJITLINK_ERROR_INTERNAL;
     L->linked.assign(r.cubin.begin(), r.cubin.end());

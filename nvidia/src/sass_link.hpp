@@ -21,11 +21,23 @@ struct SassLinkResult {
   std::string errors;           // nvJitLink's error-log lines, one per problem
 };
 
+struct SassLinkOptions {
+  // -g: keep every function, called or not (a debugger may want to stop in
+  // one). Without it a function nothing reaches is dropped.
+  bool keep_unused = false;
+  // -kernels-used=<pattern>, once per option: when any is given, a kernel is
+  // kept only if its (mangled) name matches one -- as a substring, where `*`
+  // stands for any run of characters -- and the functions only they reach go
+  // with the ones that are dropped.
+  std::vector<std::string> kernels_used;
+};
+
 // Links `inputs` for SASS architecture `arch` (86 for sm_86). Fails -- with
 // the reason in `errors` -- on an undefined reference, a relocation or section
 // it does not know, and anything malformed; a second definition of a symbol is
 // reported in `errors` and dropped, and the link succeeds, as NVIDIA's does.
-SassLinkResult link_sass(const std::vector<SassLinkInput>& inputs, uint32_t arch);
+SassLinkResult link_sass(const std::vector<SassLinkInput>& inputs, uint32_t arch,
+                         const SassLinkOptions& options = {});
 
 // True for a relocatable cubin (ELF type ET_REL), the kind link_sass takes.
 bool cubin_relocatable(const void* data, size_t size);

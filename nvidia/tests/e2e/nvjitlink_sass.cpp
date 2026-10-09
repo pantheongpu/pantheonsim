@@ -10,7 +10,10 @@
 // fails the link and names the symbol; a second definition is reported and
 // the link still succeeds; a cubin for an architecture -arch cannot run is
 // refused when added; a SASS link has no PTX to hand out; a host object's and
-// a static library's relocatable SASS link like a cubin.
+// a static library's relocatable SASS link like a cubin. And what a link
+// keeps: a function nothing reaches is left out unless -g asks for it,
+// -kernels-used drops the kernels it does not name, and the frame table and
+// the other debug sections of the modules come along.
 //
 // Every check passes against NVIDIA's libnvJitLink 13.0 and driver on an RTX
 // 3060 (sm_86), and with VirtualGPU's libnvJitLink in its place there, whose
@@ -22,10 +25,13 @@
 #include <nvJitLink.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -58,11 +64,13 @@ struct Input {
 
 // Links the inputs; returns the result of nvJitLinkComplete (or of the first
 // add that failed), the cubin in *out and the error log in *log.
-static int link(const std::string& arch, const std::vector<Input>& inputs, std::vector<char>* out, std::string* log) {
+static int link(const std::string& arch, const std::vector<Input>& inputs, std::vector<char>* out, std::string* log,
+                const std::vector<std::string>& extra = {}) {
   const std::string opt = "-arch=" + arch;
-  const char* opts[] = {opt.c_str()};
+  std::vector<const char*> opts = {opt.c_str()};
+  for (const std::string& e : extra) opts.push_back(e.c_str());
   nvJitLinkHandle h = nullptr;
-  int r = nvJitLinkCreate(&h, 1, opts);
+  int r = nvJitLinkCreate(&h, static_cast<uint32_t>(opts.size()), opts.data());
   if (r != NVJITLINK_SUCCESS) return r;
   for (const Input& in : inputs) {
     const std::vector<char> bytes = slurp(in.path);
@@ -86,6 +94,34 @@ static int link(const std::string& arch, const std::vector<Input>& inputs, std::
   }
   nvJitLinkDestroy(&h);
   return r;
+}
+
+// The names of a cubin's functions and of its sections (ELF64: the section table, the symbol table).
+template <class T>
+static T at(const std::vector<char>& b, size_t off) {
+  T v{};
+  if (off + sizeof v <= b.size()) std::memcpy(&v, b.data() + off, sizeof v);
+  return v;
+}
+static void names_in(const std::vector<char>& elf, std::set<std::string>* functions, std::set<std::string>* sections,
+                     std::map<std::string, size_t>* section_size = nullptr) {
+  const size_t shoff = at<uint64_t>(elf, 0x28);
+  const unsigned shentsize = at<uint16_t>(elf, 0x3a), shnum = at<uint16_t>(elf, 0x3c), shstrndx = at<uint16_t>(elf, 0x3e);
+  const size_t str = at<uint64_t>(elf, shoff + size_t{shstrndx} * shentsize + 24);
+  auto cstr = [&](size_t off) { return std::string(elf.data() + std::min(off, elf.size()), strnlen(elf.data() + std::min(off, elf.size()), elf.size() - std::min(off, elf.size()))); };
+  for (unsigned i = 0; i < shnum; ++i) {
+    const size_t h = shoff + size_t{i} * shentsize;
+    const std::string name = cstr(str + at<uint32_t>(elf, h));
+    if (sections) sections->insert(name);
+    if (section_size) (*section_size)[name] = at<uint64_t>(elf, h + 32);
+    if (at<uint32_t>(elf, h + 4) != 2 /* SHT_SYMTAB */ || !functions) continue;
+    const size_t symoff = at<uint64_t>(elf, h + 24), symsize = at<uint64_t>(elf, h + 32);
+    const unsigned link = at<uint32_t>(elf, h + 40);
+    const size_t strtab = at<uint64_t>(elf, shoff + size_t{link} * shentsize + 24);
+    for (size_t o = symoff; o + 24 <= symoff + symsize; o += 24)
+      if ((at<uint8_t>(elf, o + 4) & 0xf) == 2 /* STT_FUNC */ && at<uint16_t>(elf, o + 6) != 0)
+        functions->insert(cstr(strtab + at<uint32_t>(elf, o)));
+  }
 }
 
 // Loads a linked cubin and runs both modules' kernels, checking every answer.
@@ -149,6 +185,54 @@ static void run(const std::vector<char>& cubin, const char* what) {
   cuModuleUnload(m);
 }
 
+// What a link keeps and leaves out.
+static void dead_code_and_debug_info(const std::string& arch, const char* main_cubin, const char* lib_cubin) {
+  const std::vector<Input> in = {{NVJITLINK_INPUT_CUBIN, main_cubin}, {NVJITLINK_INPUT_CUBIN, lib_cubin}};
+  std::vector<char> cubin;
+  std::string log;
+  std::set<std::string> fns, secs;
+  std::map<std::string, size_t> sizes;
+  is(link(arch, in, &cubin, &log), NVJITLINK_SUCCESS, "the two modules link (for what is kept)");
+  names_in(cubin, &fns, &secs, &sizes);
+  check(fns.count("_Z7run_allPii") && fns.count("_Z10lib_kernelPi") && fns.count("_Z7lib_addi"),
+        "the kernels and the function they call stay");
+  check(!fns.count("_Z10lib_unusedi") && !fns.count("_Z15lib_unused_leafi"),
+        "a function nothing calls goes, and so does the one only it calls");
+  check(fns.count("_Z10main_twicei") && fns.count("_Z10lib_negatei"),
+        "while functions whose addresses a kept variable holds stay");
+  check(secs.count(".debug_frame"), "the frame table of the modules is carried");
+  std::map<std::string, size_t> main_sizes, lib_sizes;
+  names_in(slurp(main_cubin), nullptr, nullptr, &main_sizes);
+  names_in(slurp(lib_cubin), nullptr, nullptr, &lib_sizes);
+  // (From sm_100 NVIDIA's link also takes the dropped functions' entries out of the table.)
+  if (std::atoi(arch.c_str() + 3) < 100)
+    check(sizes[".debug_frame"] == main_sizes[".debug_frame"] + lib_sizes[".debug_frame"],
+          "and is the two modules' tables one after the other, the dropped functions' entries included");
+
+  is(link(arch, in, &cubin, &log, {"-g"}), NVJITLINK_SUCCESS, "-g links");
+  fns.clear();
+  names_in(cubin, &fns, nullptr);
+  check(fns.count("_Z10lib_unusedi") && fns.count("_Z15lib_unused_leafi"), "and keeps every function, called or not");
+  run(cubin, "linked with -g");
+
+  is(link(arch, in, &cubin, &log, {"-kernels-used=run_all"}), NVJITLINK_SUCCESS, "-kernels-used links");
+  fns.clear();
+  names_in(cubin, &fns, nullptr);
+  check(fns.count("_Z7run_allPii") && !fns.count("_Z10lib_kernelPi"),
+        "-kernels-used=run_all keeps that kernel (a substring of its mangled name) and drops the other");
+  check(fns.count("_Z7lib_addi"), "and what the kernel still reaches");
+  is(link(arch, in, &cubin, &log, {"-kernels-used=lib_k*l", "-kernels-used=nosuch"}), NVJITLINK_SUCCESS, "two patterns link");
+  fns.clear();
+  names_in(cubin, &fns, nullptr);
+  check(fns.count("_Z10lib_kernelPi") && !fns.count("_Z7run_allPii"),
+        "a * in a pattern stands for any run of characters");
+  is(link(arch, in, &cubin, &log, {"-kernels-used=nosuch"}), NVJITLINK_SUCCESS, "a pattern nothing matches links");
+  fns.clear();
+  names_in(cubin, &fns, nullptr);
+  check(!fns.count("_Z7run_allPii") && !fns.count("_Z10lib_kernelPi") && !fns.count("_Z7lib_addi"),
+        "and leaves no kernel, nor any function only they reach");
+}
+
 int main(int argc, char** argv) {
   if (argc < 4) {
     std::printf("usage: %s <arch> <main.cubin> <lib.cubin> [other-arch.cubin [lib.o lib.a]]\n", argv[0]);
@@ -175,6 +259,8 @@ int main(int argc, char** argv) {
   is(link(arch, {{NVJITLINK_INPUT_CUBIN, lib_cubin}, {NVJITLINK_INPUT_CUBIN, main_cubin}}, &cubin, &log),
      NVJITLINK_SUCCESS, "the other order links");
   run(cubin, "linked library first");
+
+  dead_code_and_debug_info(arch, main_cubin, lib_cubin);
 
   // A reference nothing defines.
   is(link(arch, {{NVJITLINK_INPUT_CUBIN, main_cubin}}, nullptr, &log), 6 /* NVJITLINK_ERROR_INTERNAL */,
