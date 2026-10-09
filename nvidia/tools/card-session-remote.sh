@@ -23,7 +23,7 @@ say() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$summary"; }
 
 # ---- the toolkit: the newest /usr/local/cuda-13.x, else /usr/local/cuda
 cuda=""
-for d in $(ls -d /usr/local/cuda-13.* 2>/dev/null | sort -V | tac) /usr/local/cuda; do
+for d in ${VGPU_SESSION_CUDA:-} $(ls -d /usr/local/cuda-13.* 2>/dev/null | sort -V | tac) /usr/local/cuda; do
   [[ -x "$d/bin/nvcc" ]] && { cuda="$d"; break; }
 done
 [[ -n "$cuda" ]] || { say "FATAL no CUDA toolkit under /usr/local"; exit 1; }
@@ -52,8 +52,8 @@ step() {
 }
 
 # ---- NVIDIA's other libraries from pip wheels (cuSPARSELt, cuDNN; cuBLAS 13.3 as the L4 transcripts used)
-wheels=/tmp/wheels
-if [[ ! -d "$wheels" ]]; then
+wheels="${VGPU_SESSION_WHEELS:-/tmp/wheels}"
+if [[ ! -d "$wheels" && -z "${VGPU_SESSION_NO_PIP:-}" ]]; then
   python3 -m pip install -q --target "$wheels" nvidia-cusparselt-cu13 nvidia-cudnn-cu13 > "$out/pip.log" 2>&1 \
     || say "pip: cu13 wheels failed (see pip.log)"
   python3 -m pip install -q --target "$wheels/cublas133" "nvidia-cublas==13.3.*" >> "$out/pip.log" 2>&1 \
@@ -130,6 +130,7 @@ case "$cc" in
   89)  progs="mma_forms mma_fragment_layout wmma_gemm wmma_types uldc_narrow stmatrix" ;;
   *)   progs="" ;;
 esac
+progs="${VGPU_SESSION_PROGS:-$progs}"
 for p in $progs; do native "$p"; done
 # tcgen05_gemm needs sm_100a (a data-center Blackwell); not buildable here.
 # library programs on the real libraries: cuBLASLt with and without block scales, cuSPARSELt paths
