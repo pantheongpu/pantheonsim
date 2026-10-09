@@ -17,9 +17,13 @@
 // Epilogues -- bias, ReLU and GELU, their auxiliary outputs, and the
 // backward ones (DRELU, DGELU, the bias gradients) -- follow the documented
 // semantics and an RTX 3060's measured behaviour (see "epilogues" below).
-// The block-scaled FP8 and FP4 modes (VEC16_UE4M3, VEC32_UE8M0, VEC128_32F,
-// BLK128x128_32F) are implemented from NVIDIA's documentation alone: no card
-// here can run them, so they are documentation-derived, not card-verified.
+// FP8 is refused as an NVIDIA L4 (sm_89) and an RTX 3060 (sm_86) refuse it, descriptor by
+// descriptor, and its arithmetic and epilogues reproduce the L4's (nvidia/docs/lowprec.md,
+// nvidia/tests/data/lowprec/lt.*.txt). From sm_90 the kernel table, the FP32-scale modes, the
+// auxiliary output's scale and amax and the block-scaled FP8 and FP4 modes (VEC16_UE4M3,
+// VEC32_UE8M0, VEC128_32F, BLK128x128_32F, PER_BATCH_SCALAR_32F and the packed
+// VEC128/VEC32_MN_K4_UE8M0) are implemented from NVIDIA's documentation alone: no Hopper or
+// Blackwell GPU was available, so they are documentation-derived, not card-verified.
 // Anything not implemented returns CUBLAS_STATUS_NOT_SUPPORTED so a caller
 // falls back rather than receiving a plausible wrong answer.
 #include <cublasLt.h>

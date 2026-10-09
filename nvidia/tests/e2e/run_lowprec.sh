@@ -15,7 +15,6 @@
 # Probes (nvidia/tests/e2e/lowprec_<probe>.{cu,cpp}), libraries they link:
 #   lt        cuBLASLt: FP8 and block-scaled matmuls          cublasLt
 #   sparselt  cuSPARSELt: FP8/FP4 structured-sparse matmuls   cusparseLt
-#   dnn       cuDNN: FP8 and INT8x32                          cudnn
 #   cvt       the packed FP8 conversions of sm_89 and later (PTX)
 #   ptx120    sm_120's block-scaled mma.sync forms, fp4/fp6/fp8 conversions and ldmatrix
 #             expansions (mma_blockscale.cu, narrow_cvt.cu, ldmatrix_forms.cu), run on SASS
@@ -39,7 +38,6 @@ src="$root/nvidia/tests/e2e/lowprec_${probe}.cu"
 case "$probe" in
   lt) libs=(cublasLt) ;;
   sparselt) libs=(cusparseLt) ;;
-  dnn) libs=(cudnn) ;;
   cvt) libs=() ;;
   ptx120) libs=() ;;
   *) echo "unknown probe $probe" >&2; exit 2 ;;
