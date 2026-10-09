@@ -41,7 +41,8 @@ telemetry:
   pcie_link: "Gen4 x8"         # most common link on real cards (594 runs in the benchmark database)
 
 # What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
-# Datasheet: AD104 memory interface and 48 MB L2. The persisting L2 maximum is three quarters of L2, as the A100's: not read from a card.
+# Datasheet: AD104 memory interface and 48 MB L2. The persisting L2 maximum was read from an L4 (driver 595.91, AWS g6.xlarge,
+# 2026-10-09): 34603008 bytes (33 MiB; the A100's three quarters of L2 would have been 36 MiB).
 cuda:
   memory_bus_width_bits: 192
-  persisting_l2_bytes: 37748736
+  persisting_l2_bytes: 34603008

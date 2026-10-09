@@ -294,6 +294,8 @@ before waiting for it is not caught here.
 
 ## How it is checked
 
+- Nothing in this page has been compared with a Blackwell GPU: the forms are written from the PTX ISA's text and CUTLASS's usage. The `mma.sync` block-scaled and fp4/fp6 forms of sm_120a (not `tcgen05`, which sm_120 does not have) have a card runner, `nvidia/tests/e2e/run_lowprec.sh ptx120 --card <profile> --update` (three programs that print hashes of their results), which needs a g7e instance; the `tcgen05` and Tensor Memory forms need an sm_100 GPU, which AWS rents only as an eight-GPU p6-b200.48xlarge. Until one is rented, this page is documentation-derived throughout.
+
 - `tests/unit/test_blackwell.cpp`: the ld/st fragments against figures 186-190
   written as tables; the MMA against a host GEMM with operands laid out from
   the ISA's CuTe canonical layouts, for each kind, both majors, the swizzles,

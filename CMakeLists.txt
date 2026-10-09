@@ -2175,7 +2175,7 @@ if(TARGET vgpucupti)
   # The narrow-precision library probes (FP8, MXFP8, NVFP4; nvidia/docs/lowprec.md): each prints
   # one line per descriptor, and the lines are compared with what NVIDIA's own library printed on a
   # real GPU for the same program (an L4, an RTX 3060: nvidia/tests/data/lowprec/<probe>.<profile>.txt).
-  foreach(_probe IN ITEMS lt sparselt cvt)
+  foreach(_probe IN ITEMS lt sparselt cvt ptx120)
     add_test(NAME e2e_lowprec_${_probe}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lowprec.sh ${_probe})
     set_tests_properties(e2e_lowprec_${_probe} PROPERTIES
