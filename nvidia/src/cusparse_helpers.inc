@@ -222,14 +222,16 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyPruneInfo(pruneInfo_t info) {
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneDense2csrNnz(cusparseHandle_t h, int m, int n, const T* A,        \
                                                               int lda, const T* th, const cusparseMatDescr_t dC,   \
-                                                              int* offC, int* total, void*) {                      \
+                                                              int* offC, int* total, void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneDense2csrNnz, h, m, n, A, lda, th, dC, offC, total, unused9); \
     if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;                                                          \
     return prune_dense<T>(h, m, n, A, lda, read_threshold(h, th), false, 0.0f, dC, nullptr, offC, nullptr, total,  \
                           nullptr);                                                                                 \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneDense2csr(cusparseHandle_t h, int m, int n, const T* A, int lda,  \
                                                            const T* th, const cusparseMatDescr_t dC, T* valC,      \
-                                                           const int*, int* colC, void*) {                         \
+                                                           const int* unused8, int* colC, void* unused10) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneDense2csr, h, m, n, A, lda, th, dC, valC, unused8, colC, unused10); \
     if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;                                                          \
     return prune_dense<T>(h, m, n, A, lda, read_threshold(h, th), false, 0.0f, dC, valC, nullptr, colC, nullptr,   \
                           nullptr);                                                                                 \
@@ -241,14 +243,16 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyPruneInfo(pruneInfo_t info) {
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneCsr2csrNnz(                                                        \
       cusparseHandle_t h, int m, int n, int nnzA, const cusparseMatDescr_t dA, const T* valA, const int* offA,     \
-      const int* colA, const T* th, const cusparseMatDescr_t dC, int* offC, int* total, void*) {                   \
+      const int* colA, const T* th, const cusparseMatDescr_t dC, int* offC, int* total, void* unused12) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneCsr2csrNnz, h, m, n, nnzA, dA, valA, offA, colA, th, dC, offC, total, unused12); \
     if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;                                                          \
     return prune_csr<T>(h, m, n, nnzA, dA, valA, offA, colA, read_threshold(h, th), false, 0.0f, dC, nullptr,      \
                         offC, nullptr, total, nullptr);                                                             \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneCsr2csr(                                                           \
       cusparseHandle_t h, int m, int n, int nnzA, const cusparseMatDescr_t dA, const T* valA, const int* offA,     \
-      const int* colA, const T* th, const cusparseMatDescr_t dC, T* valC, const int*, int* colC, void*) {          \
+      const int* colA, const T* th, const cusparseMatDescr_t dC, T* valC, const int* unused11, int* colC, void* unused13) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneCsr2csr, h, m, n, nnzA, dA, valA, offA, colA, th, dC, valC, unused11, colC, unused13);          \
     if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;                                                          \
     return prune_csr<T>(h, m, n, nnzA, dA, valA, offA, colA, read_threshold(h, th), false, 0.0f, dC, valC,         \
                         nullptr, colC, nullptr, nullptr);                                                           \
@@ -260,12 +264,14 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyPruneInfo(pruneInfo_t info) {
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneDense2csrNnzByPercentage(                                          \
       cusparseHandle_t h, int m, int n, const T* A, int lda, float pct, const cusparseMatDescr_t dC, int* offC,    \
-      int* total, pruneInfo_t info, void*) {                                                                        \
+      int* total, pruneInfo_t info, void* unused10) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneDense2csrNnzByPercentage, h, m, n, A, lda, pct, dC, offC, total, info, unused10); \
     return prune_dense<T>(h, m, n, A, lda, 0.0, true, pct, dC, nullptr, offC, nullptr, total, info);               \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneDense2csrByPercentage(                                             \
       cusparseHandle_t h, int m, int n, const T* A, int lda, float pct, const cusparseMatDescr_t dC, T* valC,      \
-      const int*, int* colC, pruneInfo_t info, void*) {                                                             \
+      const int* unused8, int* colC, pruneInfo_t info, void* unused11) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneDense2csrByPercentage, h, m, n, A, lda, pct, dC, valC, unused8, colC, info, unused11); \
     return prune_dense<T>(h, m, n, A, lda, 0.0, true, pct, dC, valC, nullptr, colC, nullptr, info);                \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneCsr2csrByPercentage_bufferSizeExt(                                \
@@ -275,14 +281,16 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyPruneInfo(pruneInfo_t info) {
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneCsr2csrNnzByPercentage(                                            \
       cusparseHandle_t h, int m, int n, int nnzA, const cusparseMatDescr_t dA, const T* valA, const int* offA,     \
-      const int* colA, float pct, const cusparseMatDescr_t dC, int* offC, int* total, pruneInfo_t info, void*) {   \
+      const int* colA, float pct, const cusparseMatDescr_t dC, int* offC, int* total, pruneInfo_t info, void* unused13) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneCsr2csrNnzByPercentage, h, m, n, nnzA, dA, valA, offA, colA, pct, dC, offC, total, info, unused13);   \
     return prune_csr<T>(h, m, n, nnzA, dA, valA, offA, colA, 0.0, true, pct, dC, nullptr, offC, nullptr, total,    \
                         info);                                                                                      \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##pruneCsr2csrByPercentage(                                               \
       cusparseHandle_t h, int m, int n, int nnzA, const cusparseMatDescr_t dA, const T* valA, const int* offA,     \
-      const int* colA, float pct, const cusparseMatDescr_t dC, T* valC, const int*, int* colC, pruneInfo_t info,   \
-      void*) {                                                                                                      \
+      const int* colA, float pct, const cusparseMatDescr_t dC, T* valC, const int* unused11, int* colC, pruneInfo_t info,   \
+      void* unused14) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##pruneCsr2csrByPercentage, h, m, n, nnzA, dA, valA, offA, colA, pct, dC, valC, unused11, colC, info, unused14); \
     return prune_csr<T>(h, m, n, nnzA, dA, valA, offA, colA, 0.0, true, pct, dC, valC, nullptr, colC, nullptr,     \
                         info);                                                                                      \
   }
@@ -398,17 +406,20 @@ cusparseStatus_t csr2csr_compress(cusparseHandle_t h, int m, int n, cusparseMatD
 #define VGPU_NNZ(P, T)                                                                                              \
   VGPU_EXPORT cusparseStatus_t cusparse##P##nnz(cusparseHandle_t h, cusparseDirection_t dir, int m, int n,         \
                                                 const cusparseMatDescr_t d, const T* A, int lda, int* per,         \
-                                                int* total) {                                                       \
+                                                int* total) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##nnz, h, dir, m, n, d, A, lda, per, total); \
     return nnz_dense<T>(h, dir, m, n, d, A, lda, per, total);                                                       \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##nnz_compress(cusparseHandle_t h, int m, const cusparseMatDescr_t d,    \
                                                          const T* val, const int* off, int* per, int* total,       \
-                                                         T tol) {                                                   \
+                                                         T tol) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##nnz_compress, h, m, d, val, off, per, total, tol); \
     return nnz_compress<T>(h, m, d, val, off, per, total, tol);                                                     \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csr2csr_compress(                                                       \
       cusparseHandle_t h, int m, int n, const cusparseMatDescr_t d, const T* valA, const int* colA,                \
-      const int* offA, int nnzA, const int* per, T* valC, int* colC, int* offC, T tol) {                           \
+      const int* offA, int nnzA, const int* per, T* valC, int* colC, int* offC, T tol) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csr2csr_compress, h, m, n, d, valA, colA, offA, nnzA, per, valC, colC, offC, tol); \
     return csr2csr_compress<T>(h, m, n, d, valA, colA, offA, nnzA, per, valC, colC, offC, tol);                     \
   }
 VGPU_NNZ(S, float)
@@ -489,12 +500,14 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyCsru2csrInfo(csru2csrInfo_t info) {
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csru2csr(cusparseHandle_t h, int m, int n, int nnz,                    \
                                                      const cusparseMatDescr_t d, T* val, const int* off, int* col, \
-                                                     csru2csrInfo_t info, void*) {                                  \
+                                                     csru2csrInfo_t info, void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csru2csr, h, m, n, nnz, d, val, off, col, info, unused9); \
     return csru<T>(h, m, n, nnz, d, val, off, col, info, true);                                                     \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csr2csru(cusparseHandle_t h, int m, int n, int nnz,                    \
                                                      const cusparseMatDescr_t d, T* val, const int* off, int* col, \
-                                                     csru2csrInfo_t info, void*) {                                  \
+                                                     csru2csrInfo_t info, void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csr2csru, h, m, n, nnz, d, val, off, col, info, unused9); \
     return csru<T>(h, m, n, nnz, d, val, off, col, info, false);                                                    \
   }
 VGPU_CSRU(S, float)
@@ -623,7 +636,8 @@ cusparseStatus_t gebsr2gebsc(cusparseHandle_t h, int mb, int nb, int nnzb, const
 VGPU_EXPORT cusparseStatus_t cusparseXgebsr2gebsrNnz(cusparseHandle_t h, cusparseDirection_t dir, int mb, int nb,
                                                      int nnzb, const cusparseMatDescr_t dA, const int* offA,
                                                      const int* colA, int rbdA, int cbdA, const cusparseMatDescr_t dC,
-                                                     int* offC, int rbdC, int cbdC, int* total, void*) {
+                                                     int* offC, int rbdC, int cbdC, int* total, void* unused15) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXgebsr2gebsrNnz, h, dir, mb, nb, nnzb, dA, offA, colA, rbdA, cbdA, dC, offC, rbdC, cbdC, total, unused15);
   return gebsr2gebsr<float>(h, dir, mb, nb, nnzb, dA, nullptr, offA, colA, rbdA, cbdA, dC, nullptr, offC, nullptr,
                             rbdC, cbdC, total);
 }
@@ -642,7 +656,8 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2gebsrNnz(cusparseHandle_t h, cuspars
   VGPU_EXPORT cusparseStatus_t cusparse##P##gebsr2gebsr(                                                            \
       cusparseHandle_t h, cusparseDirection_t dir, int mb, int nb, int nnzb, const cusparseMatDescr_t dA,          \
       const T* valA, const int* offA, const int* colA, int rbdA, int cbdA, const cusparseMatDescr_t dC, T* valC,   \
-      int* offC, int* colC, int rbdC, int cbdC, void*) {                                                            \
+      int* offC, int* colC, int rbdC, int cbdC, void* unused17) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gebsr2gebsr, h, dir, mb, nb, nnzb, dA, valA, offA, colA, rbdA, cbdA, dC, valC, offC, colC, rbdC, cbdC, unused17); \
     if (!valC) return CUSPARSE_STATUS_INVALID_VALUE;                                                                \
     return gebsr2gebsr<T>(h, dir, mb, nb, nnzb, dA, valA, offA, colA, rbdA, cbdA, dC, valC, offC, colC, rbdC,      \
                           cbdC, nullptr);                                                                           \
@@ -658,7 +673,8 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2gebsrNnz(cusparseHandle_t h, cuspars
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gebsr2gebsc(                                                            \
       cusparseHandle_t h, int mb, int nb, int nnzb, const T* val, const int* off, const int* col, int rbd,         \
-      int cbd, T* bscVal, int* bscRow, int* bscColPtr, cusparseAction_t action, cusparseIndexBase_t base, void*) { \
+      int cbd, T* bscVal, int* bscRow, int* bscColPtr, cusparseAction_t action, cusparseIndexBase_t base, void* unused14) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gebsr2gebsc, h, mb, nb, nnzb, val, off, col, rbd, cbd, bscVal, bscRow, bscColPtr, action, base, unused14); \
     return gebsr2gebsc<T>(h, mb, nb, nnzb, val, off, col, rbd, cbd, bscVal, bscRow, bscColPtr, action, base);       \
   }
 VGPU_GEBSR(S, float)
@@ -780,9 +796,10 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyColorInfo(cusparseColorInfo_t info) 
 // The fraction is single precision for S and C, double for D and Z.
 #define VGPU_COLOR(P, T, F)                                                                                         \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csrcolor(cusparseHandle_t h, int m, int nnz, const cusparseMatDescr_t d,\
-                                                     const T*, const int* off, const int* col,                     \
+                                                     const T* unused4, const int* off, const int* col,                     \
                                                      const F* fraction, int* ncolors, int* coloring,               \
-                                                     int* reordering, const cusparseColorInfo_t) {                 \
+                                                     int* reordering, const cusparseColorInfo_t unused11) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csrcolor, h, m, nnz, d, unused4, off, col, fraction, ncolors, coloring, reordering, unused11); \
     return csrcolor<T, F>(h, m, nnz, d, off, col, fraction, ncolors, coloring, reordering);                            \
   }
 VGPU_COLOR(S, float, float)

@@ -137,8 +137,9 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     if (lwork) *lwork = lwork_hint(std::max(m, n));                                                               \
     return CUSOLVER_STATUS_SUCCESS;                                                                               \
   }                                                                                                               \
-  VGPU_EXPORT cusolverStatus_t cusolverDn##P##getrf(cusolverDnHandle_t h, int m, int n, T* A, int lda, T*,       \
-                                                    int* devIpiv, int* info) {                                   \
+  VGPU_EXPORT cusolverStatus_t cusolverDn##P##getrf(cusolverDnHandle_t h, int m, int n, T* A, int lda, T* unused5,       \
+                                                    int* devIpiv, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##getrf, h, m, n, A, lda, unused5, devIpiv, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                             \
     CMat a;                                                                                                       \
@@ -152,7 +153,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##getrs(cusolverDnHandle_t h, cublasOperation_t t, int n, int nrhs,  \
                                                     const T* A, int lda, const int* devIpiv, T* B, int ldb,      \
-                                                    int* info) {                                                 \
+                                                    int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##getrs, h, t, n, nrhs, A, lda, devIpiv, B, ldb, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     CMat a, b;                                                                                                    \
     if (!cload<T>(A, lda, n, &a) || !cload<T>(B, ldb, nrhs, &b)) return CUSOLVER_STATUS_EXECUTION_FAILED;         \
@@ -173,18 +175,21 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     return CUSOLVER_STATUS_SUCCESS;                                                                               \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrf(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,    \
-                                                    int lda, T*, int, int* info) {                               \
+                                                    int lda, T* unused5, int unused6, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potrf, h, uplo, n, A, lda, unused5, unused6, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                      \
     return c_potrf<T>(A, n, lda, uplo == CUBLAS_FILL_MODE_LOWER, info);                                           \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrs(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, int nrhs, \
-                                                    const T* A, int lda, T* B, int ldb, int* info) {             \
+                                                    const T* A, int lda, T* B, int ldb, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potrs, h, uplo, n, nrhs, A, lda, B, ldb, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     return c_potrs<T>(A, n, lda, uplo == CUBLAS_FILL_MODE_LOWER, B, nrhs, ldb, info);                             \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrfBatched(cusolverDnHandle_t h, cublasFillMode_t uplo, int n,   \
-                                                           T* Aarray[], int lda, int* infos, int batch) {        \
+                                                           T* Aarray[], int lda, int* infos, int batch) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potrfBatched, h, uplo, n, Aarray, lda, infos, batch);        \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || batch < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                         \
     const auto ptrs = pointers<T>(Aarray, batch);                                                                 \
@@ -196,7 +201,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potrsBatched(cusolverDnHandle_t h, cublasFillMode_t uplo, int n,   \
                                                            int nrhs, T* Aarray[], int lda, T* Barray[], int ldb, \
-                                                           int* info, int batch) {                               \
+                                                           int* info, int batch) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potrsBatched, h, uplo, n, nrhs, Aarray, lda, Barray, ldb, info, batch); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (nrhs != 1) return CUSOLVER_STATUS_INVALID_VALUE; /* cuSOLVER supports one right-hand side here */         \
     const auto pa = pointers<T>(Aarray, batch), pb = pointers<T>(Barray, batch);                                  \
@@ -216,7 +222,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     return CUSOLVER_STATUS_SUCCESS;                                                                               \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##geqrf(cusolverDnHandle_t h, int m, int n, T* A, int lda, T* tau,   \
-                                                    T*, int, int* info) {                                        \
+                                                    T* unused6, int unused7, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##geqrf, h, m, n, A, lda, tau, unused6, unused7, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                             \
     return c_geqrf<T>(A, m, n, lda, tau, info);                                                                   \
@@ -228,7 +235,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     return CUSOLVER_STATUS_SUCCESS;                                                                               \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##ungqr(cusolverDnHandle_t h, int m, int n, int k, T* A, int lda,    \
-                                                    const T* tau, T*, int, int* info) {                          \
+                                                    const T* tau, T* unused7, int unused8, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##ungqr, h, m, n, k, A, lda, tau, unused7, unused8, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || n > m || k < 0 || k > n || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;  \
     CMat a, t;                                                                                                    \
@@ -246,7 +254,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##unmqr(cusolverDnHandle_t h, cublasSideMode_t side,                 \
                                                     cublasOperation_t trans, int m, int n, int k, const T* A,    \
-                                                    int lda, const T* tau, T* C, int ldc, T*, int, int* info) {  \
+                                                    int lda, const T* tau, T* C, int ldc, T* unused11, int unused12, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##unmqr, h, side, trans, m, n, k, A, lda, tau, C, ldc, unused11, unused12, info);  \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (trans == CUBLAS_OP_T) return CUSOLVER_STATUS_INVALID_VALUE; /* complex Q takes N or C */                  \
     const bool left = side == CUBLAS_SIDE_LEFT;                                                                   \
@@ -266,8 +275,9 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     return CUSOLVER_STATUS_SUCCESS;                                                                               \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevd(cusolverDnHandle_t h, cusolverEigMode_t jobz,                \
-                                                    cublasFillMode_t uplo, int n, T* A, int lda, R* W, T*, int,  \
-                                                    int* info) {                                                 \
+                                                    cublasFillMode_t uplo, int n, T* A, int lda, R* W, T* unused7, int unused8,  \
+                                                    int* info) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##heevd, h, jobz, uplo, n, A, lda, W, unused7, unused8, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                      \
     return c_heev<T>(A, n, lda, W, jobz, uplo, info);                                                             \
@@ -280,8 +290,9 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
     return CUSOLVER_STATUS_SUCCESS;                                                                               \
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevj(cusolverDnHandle_t h, cusolverEigMode_t jobz,                \
-                                                    cublasFillMode_t uplo, int n, T* A, int lda, R* W, T*, int,  \
-                                                    int* info, syevjInfo_t jp) {                                    \
+                                                    cublasFillMode_t uplo, int n, T* A, int lda, R* W, T* unused7, int unused8,  \
+                                                    int* info, syevjInfo_t jp) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##heevj, h, jobz, uplo, n, A, lda, W, unused7, unused8, info, jp); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                                      \
     const cusolverStatus_t st = c_heev<T>(A, n, lda, W, jobz, uplo, info);                                        \
@@ -297,7 +308,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##heevjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz,         \
                                                            cublasFillMode_t uplo, int n, T* A, int lda, R* W,    \
-                                                           T*, int, int* info, syevjInfo_t jp, int batch) {         \
+                                                           T* unused7, int unused8, int* info, syevjInfo_t jp, int batch) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##heevjBatched, h, jobz, uplo, n, A, lda, W, unused7, unused8, info, jp, batch);         \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (n < 0 || batch < 0 || lda < std::max(1, n)) return CUSOLVER_STATUS_INVALID_VALUE;                         \
     jacobi_note(jp, true);                                                                                        \
@@ -317,7 +329,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   /* U and VT = V^H; hardware's gesvd needs m >= n, as the real one here does. */                                 \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvd(cusolverDnHandle_t h, signed char jobu, signed char jobvt,   \
                                                     int m, int n, T* A, int lda, R* S, T* U, int ldu, T* VT,     \
-                                                    int ldvt, T*, int, R*, int* info) {                          \
+                                                    int ldvt, T* unused12, int unused13, R* unused14, int* info) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##gesvd, h, jobu, jobvt, m, n, A, lda, S, U, ldu, VT, ldvt, unused12, unused13, unused14, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < n) return CUSOLVER_STATUS_NOT_SUPPORTED;                                                              \
     if (jobu == 'O' || jobvt == 'O') return CUSOLVER_STATUS_NOT_SUPPORTED;                                        \
@@ -346,7 +359,8 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdj(cusolverDnHandle_t h, cusolverEigMode_t jobz, int econ,     \
                                                      int m, int n, T* A, int lda, R* S, T* U, int ldu, T* V,     \
-                                                     int ldv, T*, int, int* info, gesvdjInfo_t jp) {                \
+                                                     int ldv, T* unused12, int unused13, int* info, gesvdjInfo_t jp) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##gesvdj, h, jobz, econ, m, n, A, lda, S, U, ldu, V, ldv, unused12, unused13, info, jp); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                             \
     const cusolverStatus_t st = c_svd<T>(A, m, n, lda, !econ, jobz, S, U, ldu, V, ldv, info);                     \
@@ -363,8 +377,9 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   /* Each matrix at A + b * lda * n; full U (m x m) and V (n x n), as the batched form computes. */             \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdjBatched(cusolverDnHandle_t h, cusolverEigMode_t jobz, int m, \
                                                             int n, T* A, int lda, R* S, T* U, int ldu, T* V,     \
-                                                            int ldv, T*, int, int* info, gesvdjInfo_t jp,           \
-                                                            int batch) {                                         \
+                                                            int ldv, T* unused11, int unused12, int* info, gesvdjInfo_t jp,           \
+                                                            int batch) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##gesvdjBatched, h, jobz, m, n, A, lda, S, U, ldu, V, ldv, unused11, unused12, info, jp, batch); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < 0 || n < 0 || batch < 0 || lda < std::max(1, m)) return CUSOLVER_STATUS_INVALID_VALUE;                \
     jacobi_note(jp, true);                                                                                        \
@@ -386,8 +401,9 @@ template <class F> cusolverStatus_t by_ctype(cudaDataType t, F&& body) {
   }                                                                                                               \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gesvdaStridedBatched(                                              \
       cusolverDnHandle_t h, cusolverEigMode_t jobz, int rank, int m, int n, const T* A, int lda, long long sA,    \
-      R* S, long long sS, T* U, int ldu, long long sU, T* V, int ldv, long long sV, T*, int, int* info,           \
-      double* nrm, int batch) {                                                                                   \
+      R* S, long long sS, T* U, int ldu, long long sU, T* V, int ldv, long long sV, T* unused16, int unused17, int* info,           \
+      double* nrm, int batch) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##gesvdaStridedBatched, h, jobz, rank, m, n, A, lda, sA, S, sS, U, ldu, sU, V, ldv, sV, unused16, unused17, info, nrm, batch); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                        \
     if (m < n || rank < 1 || rank > n) return CUSOLVER_STATUS_INVALID_VALUE;                                      \
     for (int b = 0; b < batch; ++b) {                                                                             \

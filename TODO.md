@@ -1890,11 +1890,11 @@ behaviour, timing).
 - **cuBLASLt**: FP8 aux scale/amax, per-batch block scales, UE8M0 modes; the block-scaled modes are
   derived from documentation, not checked against a card.
 - **cuDNN graph API**: interpolating resample beyond bilinear upsampling by 2 (the one configuration with an
-  engine), FP8/MXFP8 attention, block masks, INT8x32 reordered filters, multi-GPU norm across processes,
-  MoE backward / band ops / standalone RoPE (no engine on the RTX 3060; Hopper/Blackwell unchecked), the fused
-  attention kernels' dropout-mask layout (Philox). Done in round 3: multi-GPU norm (threads of one process),
+  engine), FP8/MXFP8 attention, block masks, INT8x32 reordered filters, multi-GPU norm gradient scaling with more than two GPUs (assumed),
+  MoE backward / band ops / standalone RoPE (no engine on the RTX 3060; Hopper/Blackwell unchecked). Done in
+  round 4: multi-GPU norm across processes (shared pinned file on the card, IPC memory on the sim; `e2e_dnn_multigpu_norm`), the unified SDPA node's dropout mask, element for element (Philox4x32-7, `e2e_dnn_sdpa_mask`). Done in round 3: multi-GPU norm (threads of one process),
   bilinear 2x, classic/RNN/attention dropout bit for bit (cuRAND XORWOW states), SCALE_BIAS_ACTIVATION_WGRAD.
-  **Classic API**: the fused ops marked "reserved for future use", RNN dropout with padded I/O.
+  **Classic API**: the fused ops marked "reserved for future use", (RNN dropout with padded I/O: done in round 4, `e2e_dnn_rnn_dropout`.)
 - **cuFFT**: legacy callbacks (`CUFFT_NOT_IMPLEMENTED`), LTO-IR callbacks; multi-GPU layouts measured on
   two GPUs only.
 - **cuSPARSE**: SDDMM conjugate transpose (NVIDIA's computes garbage for complex), SpMMOp (LTO-IR),

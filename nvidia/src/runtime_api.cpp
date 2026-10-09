@@ -6273,15 +6273,31 @@ VGPU_EXPORT cudaError_t cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventH
   return traced_call("cudaIpcOpenEventHandle", cudaIpcOpenEventHandle_traced, event, handle);
 }
 
+bool capture_id_alive(unsigned long long id);
+
+// What an event last recorded in a capture answers to a query, a wait for it or a time: while that
+// capture goes on, cudaErrorCapturedEvent (which invalidates the capture, as any such call does); once
+// it has ended, the event is gone and the answer is cudaErrorInvalidValue until it is recorded again --
+// both measured on an RTX 3060 (driver 13.2), against the documented CapturedEvent alone.
+static cudaError_t captured_event_answer(unsigned long long capture_id) {
+  return capture_id_alive(capture_id) ? cudaErrorCapturedEvent : cudaErrorInvalidValue;
+}
+
 static cudaError_t cudaEventSynchronize_body(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
-  if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventSynchronize")) return unsafe_;
+  const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventSynchronize");
   SyncScope waited(vgpu::profiling::SyncKind::Event, nullptr, e);
   pool_waited_for(t_current_device, nullptr, true);
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  const RtEvent* r = find_event(e);
-  if (!r) return cudaErrorInvalidResourceHandle;
-  return r->captured ? cudaErrorCapturedEvent : cudaSuccess;
+  bool captured = false;
+  unsigned long long id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    const RtEvent* r = find_event(e);
+    if (!r) return unsafe_ ? unsafe_ : cudaErrorInvalidResourceHandle;
+    captured = r->captured, id = r->capture_id;
+  }
+  if (captured) return captured_event_answer(id);
+  return unsafe_;
 }
 
 VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
@@ -6289,11 +6305,17 @@ VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
 }
 static cudaError_t cudaEventQuery_body(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
-  if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventQuery")) return unsafe_;
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  const RtEvent* r = find_event(e);
-  if (!r) return cudaErrorInvalidResourceHandle;
-  return r->captured ? cudaErrorCapturedEvent : cudaSuccess;   // it stands for work not yet run
+  const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventQuery");
+  bool captured = false;
+  unsigned long long id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    const RtEvent* r = find_event(e);
+    if (!r) return unsafe_ ? unsafe_ : cudaErrorInvalidResourceHandle;
+    captured = r->captured, id = r->capture_id;   // it stands for work not yet run
+  }
+  if (captured) return captured_event_answer(id);
+  return unsafe_;
 }
 
 VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
@@ -6309,7 +6331,7 @@ static cudaError_t cudaEventElapsedTime_traced(float* ms, cudaEvent_t start, cud
   // cudaEventDisableTiming, is cudaErrorInvalidResourceHandle.
   // cudaErrorNotReady is for recorded work that has not finished, which a
   // synchronous engine never leaves behind.
-  if (a && b && (a->captured || b->captured)) return cudaErrorCapturedEvent;
+  if (a && b && (a->captured || b->captured)) return captured_event_answer(a->captured ? a->capture_id : b->capture_id);
   if (!a || !b || !a->recorded || !b->recorded || !a->timing || !b->timing)
     return cudaErrorInvalidResourceHandle;
   *ms = std::chrono::duration<float, std::milli>(b->when - a->when).count();
@@ -6874,6 +6896,7 @@ std::map<int, GraphMemStats> g_graph_mem;
 // the auto-free flag is about its allocations.
 std::map<void*, void*> g_exec_source;        // exec handle -> graph handle
 std::set<void*> g_exec_auto_free;            // execs instantiated with the flag
+std::unordered_map<void*, unsigned long long> g_exec_flags;   // the flags each exec was instantiated with
 
 uint64_t round_up_to(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
 
@@ -7183,6 +7206,54 @@ extern "C" __attribute__((visibility("default"))) bool vgpu_record_driver_launch
   r.shared = shared;
   r.host_op = *op;
   return capture_record(s, cudaGraphNodeTypeKernel, std::move(r));
+}
+
+// More of what libcuda hands to the runtime by name (the driver API has no capture of its own).
+//
+// vgpu_record_driver_node_v1: a stream-ordered copy, fill, host function or the like of the driver API
+// on a capturing stream is a node of `node_type` (cudaGraphNodeType) whose launch is `op`. Returns false
+// when the stream is not capturing, and the caller does the work now.
+extern "C" __attribute__((visibility("default"))) bool vgpu_record_driver_node_v1(void* stream, int node_type,
+                                                                                 const std::function<void()>* op) {
+  cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+  if (!op || !capture_active(s)) return false;
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Host;
+  r.host_op = *op;
+  return capture_record(s, static_cast<cudaGraphNodeType>(node_type), std::move(r));
+}
+
+// vgpu_capture_refuse_v1: the driver call `what` is not allowed on a capturing stream. Invalidates the
+// capture and returns 1 if `stream` is capturing, else 0 and nothing happens.
+extern "C" __attribute__((visibility("default"))) int vgpu_capture_refuse_v1(void* stream, const char* what) {
+  return capture_refuse(reinterpret_cast<cudaStream_t>(stream), what ? what : "a driver call") ? 1 : 0;
+}
+
+// vgpu_capture_refuse_any_v1: the same for a call that synchronizes the whole context. Returns 1 if any
+// capture was going on.
+extern "C" __attribute__((visibility("default"))) int vgpu_capture_refuse_any_v1(const char* api) {
+  return capture_refuse_any(api ? api : "a driver call") != cudaSuccess ? 1 : 0;
+}
+
+// vgpu_capture_unsafe_gate_v1: the "potentially unsafe" calls (see capture_unsafe_gate) for the driver's
+// own spellings of them. 0 allowed; 1 refused, the capture invalidated.
+extern "C" __attribute__((visibility("default"))) int vgpu_capture_unsafe_gate_v1(const char* api) {
+  return capture_unsafe_gate(api ? api : "a driver call") != cudaSuccess ? 1 : 0;
+}
+
+// vgpu_host_address_v1: the host address behind a device pointer into memory that is also host memory -- shared
+// with another process (cudaIpcGetMemHandle / cudaIpcOpenMemHandle), managed, or pinned and registered.
+// nullptr for ordinary device memory. cuDNN's multi-GPU normalization asks, to tell which file-backed memory
+// its peer statistics tensors are, and so which processes make up the group.
+extern "C" __attribute__((visibility("default"))) void* vgpu_host_address_v1(const void* p, size_t len) {
+  void* out = nullptr;
+  guard("vgpu_host_address", [&](State& s) -> cudaError_t {
+    const auto addr = reinterpret_cast<uint64_t>(p);
+    for (int d = 0; d < s.rt->device_count() && !out; ++d)
+      out = s.rt->device(d).memory().host_address(addr, len ? len : 1);
+    return cudaSuccess;
+  });
+  return out;
 }
 
 void vgpu_drop_capture(cudaStream_t stream) {
@@ -7681,6 +7752,7 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   exec_retain_graph_objects(handle, static_cast<void*>(graph));
+  g_exec_flags[handle] = flags;
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
@@ -7965,6 +8037,12 @@ static cudaError_t run_conditional(const GraphNodeRec& n, cudaStream_t stream) {
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
   RecordedLaunch& rl = n->work;
   if (!n->enabled) return cudaSuccess;   // switched off: it still orders its neighbours
+  // A copy or fill the driver API recorded (vgpu_record_driver_node_v1, vgpu_graph_add_closure_node_v1)
+  // is a closure of that type.
+  if (rl.host_op && (n->type == cudaGraphNodeTypeMemcpy || n->type == cudaGraphNodeTypeMemset)) {
+    rl.host_op();
+    return cudaSuccess;
+  }
   switch (n->type) {
     case cudaGraphNodeTypeEmpty:
       return cudaSuccess;
@@ -9248,6 +9326,60 @@ VGPU_EXPORT cudaError_t cudaGraphAddHostNode(cudaGraphNode_t* pNode, cudaGraph_t
   return traced_call("cudaGraphAddHostNode", cudaGraphAddHostNode_traced, pNode, graph, deps, numDeps, params);
 }
 
+// For libcuda: a node of the explicit-graph driver API (cuGraphAddKernelNode, cuGraphAddMemcpyNode,
+// cuGraphAddMemsetNode) is a node of that type whose launch is the closure `op`, which holds the driver's
+// own parameters. `shape` is the launch shape of a kernel node (grid x y z, block x y z, shared bytes), or
+// null. Returns a cudaError_t.
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_add_closure_node_v1(
+    void* graph, int node_type, const void* const* deps, size_t num_deps, const std::function<void()>* op,
+    const unsigned* shape, void** node) {
+  if (!node || !op) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(static_cast<cudaGraph_t>(graph));
+  if (!g) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, reinterpret_cast<const cudaGraphNode_t*>(const_cast<void**>(deps)), num_deps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  w.kind = RecordedLaunch::Kind::Host;
+  w.host_op = *op;
+  if (shape) {
+    w.grid = dim3(shape[0], shape[1], shape[2]);
+    w.block = dim3(shape[3], shape[4], shape[5]);
+    w.shared = shape[6];
+  }
+  *node = g->add(static_cast<cudaGraphNodeType>(node_type), std::move(w), pred);
+  return cudaSuccess;
+}
+
+// Replaces what a closure node runs (cuGraphKernelNodeSetParams and the like).
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_set_closure_v1(void* node, const std::function<void()>* op,
+                                                                                const unsigned* shape) {
+  if (!node || !op) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = static_cast<GraphNodeRec*>(node);
+  if (!n->work.host_op) return cudaErrorInvalidValue;
+  n->work.host_op = *op;
+  if (shape) {
+    n->work.grid = dim3(shape[0], shape[1], shape[2]);
+    n->work.block = dim3(shape[3], shape[4], shape[5]);
+    n->work.shared = shape[6];
+  }
+  return cudaSuccess;
+}
+
+// The same on an instantiated graph, for the node `node` of the graph it was made from.
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_exec_set_closure_v1(void* exec, void* node,
+                                                                                      const std::function<void()>* op) {
+  if (!exec || !node || !op) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto it = g_graph_execs.find(exec);
+  if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+  GraphNodeRec* target = exec_twin(*it->second, static_cast<GraphNodeRec*>(node));
+  if (!target || !target->work.host_op) return cudaErrorInvalidValue;
+  target->work.host_op = *op;
+  return cudaSuccess;
+}
+
 static cudaError_t cudaGraphHostNodeGetParams_traced(cudaGraphNode_t node, cudaHostNodeParams* params) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
@@ -10073,6 +10205,13 @@ bool capture_event_node(cudaStream_t stream, bool record, cudaEvent_t e, unsigne
   return true;
 }
 
+bool capture_id_alive(unsigned long long id) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  for (auto& [origin, c] : g_captures)
+    if (c->id == id) return true;
+  return false;
+}
+
 cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
                          const std::vector<void*>& deps) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
@@ -10094,7 +10233,7 @@ cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long 
   Capture* cap = nullptr;
   for (auto& [origin, c] : g_captures)
     if (c->id == id) cap = c.get();
-  if (!cap) return cudaErrorCapturedEvent;   // the capture it was recorded in has ended
+  if (!cap) return cudaErrorInvalidValue;   // the capture it was recorded in has ended (measured: not CapturedEvent)
   std::vector<GraphNodeRec*> pos;
   for (void* d : deps)
     if (auto* n = static_cast<GraphNodeRec*>(d); cap->graph->holds(n)) pos.push_back(n);
@@ -10871,6 +11010,8 @@ static cudaError_t cudaGraphDestroy_traced(cudaGraph_t graph) {
   if (g_borrowed_graphs.count(static_cast<void*>(graph)) &&
       !g_graphs.count(static_cast<void*>(graph)))
     return cudaErrorInvalidValue;
+  // A graph already destroyed, or never made, is not one (an RTX 3060: cudaErrorInvalidValue).
+  if (!graph_from(graph) && !g_borrowed_graphs.count(static_cast<void*>(graph))) return cudaErrorInvalidValue;
   // Nor a graph a capture is adding to (cudaStreamBeginCaptureToGraph): an RTX
   // 3060 answers cudaErrorIllegalState until the capture ends.
   for (const auto& [origin, cap] : g_captures)
@@ -10990,6 +11131,7 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
     }
   }
   g_exec_auto_free.erase(static_cast<void*>(exec));
+  g_exec_flags.erase(static_cast<void*>(exec));
   g_device_graphs.erase(static_cast<void*>(exec));
   lock.unlock();
   user_objects_release_all(std::move(held));
@@ -10999,6 +11141,21 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   return traced_call("cudaGraphExecDestroy", cudaGraphExecDestroy_traced, exec);
 }
+#if CUDART_VERSION >= 12050
+// The flags the executable graph was instantiated with.
+static cudaError_t cudaGraphExecGetFlags_traced(cudaGraphExec_t exec, unsigned long long* flags) {
+  if (!flags) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto it = g_exec_flags.find(static_cast<void*>(exec));
+  if (it == g_exec_flags.end()) return cudaErrorInvalidValue;
+  *flags = it->second;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphExecGetFlags(cudaGraphExec_t exec, unsigned long long* flags) {
+  return traced_call("cudaGraphExecGetFlags", cudaGraphExecGetFlags_traced, exec, flags);
+}
+#endif
 // What a library asks before it adds work to a stream that might be capturing:
 // whether it is, which capture, the graph being built, and the nodes the next
 // operation will depend on. With the graph and the dependencies a library can

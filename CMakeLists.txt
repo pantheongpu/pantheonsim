@@ -191,7 +191,7 @@ add_library(vgpu STATIC
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
 # libvgpucuda: the CUDA Driver API shim external programs link against.
-add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
@@ -1936,7 +1936,7 @@ if(TARGET vgpucublas)
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_frontend:cudnn"
                           "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
-                          "dnn_attn_dropout:cudnn" "cutensor_paths:cutensor"
+                          "dnn_attn_dropout:cudnn" "dnn_sdpa_mask:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_state_gradient:cutensornet" "cutensornet_decomp_paths:cutensornet"
                           "solver_metis_paths:cusolver:cusparse"
                           "blas_u8gemm_paths:cublas" "blas_emulation_paths:cublas" "sparse_color_paths:cusparse"
@@ -3017,6 +3017,58 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_graph_capture_libs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture_libs.sh)
   set_tests_properties(e2e_graph_capture_libs PROPERTIES
     DEPENDS "vgpucudart;vgpucudnn;vgpucublaslt"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # cuDNN's classic API (convolution, activation, pooling, softmax, normalization, tensor
+  # arithmetic, the spatial transformer, CTC, dropout, RNNs, attention) inside a captured
+  # CUDA graph: each call is recorded, its descriptors destroyed, and the graph launched with
+  # new inputs (run_graph_capture.sh dnn cudnn --card runs the same program against NVIDIA's).
+  add_test(NAME e2e_graph_capture_dnn COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh dnn cudnn)
+  set_tests_properties(e2e_graph_capture_dnn PROPERTIES
+    DEPENDS "vgpucudart;vgpucudnn"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # The host-computed vendor libraries inside a captured graph: each call recorded, run at each launch
+  # of the graph over new inputs, its plan or parameter objects destroyed in between (the program
+  # also runs against NVIDIA's library with run_graph_capture.sh <name> <libs> --card).
+  foreach(_cap "fft:cufft" "solver:cusolver,cublas" "solver_sp:cusolver,cusparse" "rand:curand" "jpeg:nvjpeg" "sparse:cusparse"
+               "npp:nppc,nppial,nppicc,nppig,nppif,nppidei,npps,nppist")
+    string(REPLACE ":" ";" _cap_parts "${_cap}")
+    list(GET _cap_parts 0 _cap_name)
+    list(GET _cap_parts 1 _cap_libs)
+    add_test(NAME e2e_graph_capture_${_cap_name}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh ${_cap_name} ${_cap_libs})
+    set_tests_properties(e2e_graph_capture_${_cap_name} PROPERTIES
+      DEPENDS "vgpucudart"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
+  # The driver API's stream calls inside a captured graph, captured and launched through the driver
+  # API's own cuStreamBeginCapture and cuGraph* (run_graph_capture.sh driver "" --card runs the same
+  # program against NVIDIA's driver).
+  add_test(NAME e2e_graph_capture_driver COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh driver "")
+  set_tests_properties(e2e_graph_capture_driver PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # The driver API's explicit graphs: every kind of node built with cuGraphAdd*Node, its parameters
+  # read and changed on the graph and on the executable graph, clones, updates, user objects and capture
+  # into an existing graph (run_graph_capture.sh graph_driver "" --card: NVIDIA's driver).
+  add_test(NAME e2e_graph_driver COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh graph_driver "")
+  set_tests_properties(e2e_graph_driver PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # NCCL's collectives and point-to-point operations recorded into captured graphs, a rank per thread on
+  # two devices, launched together (run_graph_capture_nccl.sh --card: NVIDIA's NCCL on two GPUs).
+  add_test(NAME e2e_graph_capture_nccl COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture_nccl.sh)
+  set_tests_properties(e2e_graph_capture_nccl PROPERTIES
+    DEPENDS "vgpucudart"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)

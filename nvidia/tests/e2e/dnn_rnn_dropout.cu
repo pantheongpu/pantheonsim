@@ -6,11 +6,14 @@
 // 9.27 through the states buffer and the outputs of RNNs whose weights are identity matrices, so that a
 // layer's output is the previous layer's, dropped and scaled by 1 / (1 - p) in float. This program holds that
 // on the host and checks the library against it, on a real GPU with NVIDIA's libcudnn.so.9 (it passes) and on
-// VirtualGPU. What is not covered: sequences shorter than the longest (padded batches), whose masks were not
-// measured, and the attention API's dropout descriptors.
+// VirtualGPU. Sequences shorter than the longest (padded I/O enabled, in the sequence-major and batch-major
+// unpadded-layout data and in packed data) draw nothing for their padded steps: a mask covers the valid steps
+// only, step after step, and at each step the batch entries from the longest sequence to the shortest (equal
+// lengths in their own order), whatever the layout. Not covered: the attention API's dropout descriptors.
 #include <cudnn.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -53,7 +56,11 @@ static cudnnHandle_t H;
 
 // A ReLU RNN of L layers (one or two directions) whose weights are identity matrices (the input matrix of every
 // pseudo-layer, on its first H input channels), no recurrence, no bias, run in training with dropout p.
-static void one(const char* name, int L, bool bidir, int T, int B, int Hd, float p, unsigned long long seed) {
+// layout: 0 sequence-major unpacked, 1 batch-major unpacked, 2 sequence-major packed (lengths longest first);
+// lens: the sequence lengths (empty: all T).
+static void one(const char* name, int L, bool bidir, int T, int B, int Hd, float p, unsigned long long seed, int layout = 0,
+                std::vector<int> lens = {}) {
+  if (lens.empty()) lens.assign(B, T);
   const int D = bidir ? 2 : 1;
   size_t ssz = 0;
   CK(cudnnDropoutGetStatesSize(H, &ssz));
@@ -66,13 +73,35 @@ static void one(const char* name, int L, bool bidir, int T, int B, int Hd, float
   CK(cudnnCreateRNNDescriptor(&rd));
   CK(cudnnSetRNNDescriptor_v8(rd, CUDNN_RNN_ALGO_STANDARD, CUDNN_RNN_RELU, CUDNN_RNN_SINGLE_INP_BIAS,
                               bidir ? CUDNN_BIDIRECTIONAL : CUDNN_UNIDIRECTIONAL, CUDNN_LINEAR_INPUT, CUDNN_DATA_FLOAT,
-                              CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, Hd, Hd, Hd, L, drop, 0));
+                              CUDNN_DATA_FLOAT, CUDNN_DEFAULT_MATH, Hd, Hd, Hd, L, drop, CUDNN_RNN_PADDED_IO_ENABLED));
   cudnnRNNDataDescriptor_t xd, yd;
   CK(cudnnCreateRNNDataDescriptor(&xd));
   CK(cudnnCreateRNNDataDescriptor(&yd));
-  const std::vector<int> lens(B, T);
-  CK(cudnnSetRNNDataDescriptor(xd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, Hd, lens.data(), nullptr));
-  CK(cudnnSetRNNDataDescriptor(yd, CUDNN_DATA_FLOAT, CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED, T, B, Hd * D, lens.data(), nullptr));
+  const cudnnRNNDataLayout_t lay = layout == 0   ? CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED
+                                   : layout == 1 ? CUDNN_RNN_DATA_LAYOUT_BATCH_MAJOR_UNPACKED
+                                                 : CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_PACKED;
+  float pad = 0.0f;
+  CK(cudnnSetRNNDataDescriptor(xd, CUDNN_DATA_FLOAT, lay, T, B, Hd, lens.data(), &pad));
+  CK(cudnnSetRNNDataDescriptor(yd, CUDNN_DATA_FLOAT, lay, T, B, Hd * D, lens.data(), &pad));
+  // Where step t of batch entry b sits in the data, in steps.
+  auto at = [&](int t, int b) -> size_t {
+    if (layout == 0) return (size_t)t * B + b;
+    if (layout == 1) return (size_t)b * T + t;
+    size_t s = 0;
+    for (int t2 = 0; t2 < t; ++t2)
+      for (int b2 = 0; b2 < B; ++b2) s += lens[b2] > t2;
+    for (int b2 = 0; b2 < b; ++b2) s += lens[b2] > t;
+    return s;
+  };
+  // The order the masks are drawn in: valid steps, step after step, the longest sequence first.
+  std::vector<int> by_len(B);
+  for (int b = 0; b < B; ++b) by_len[b] = b;
+  std::stable_sort(by_len.begin(), by_len.end(), [&](int a, int c) { return lens[a] > lens[c]; });
+  std::vector<size_t> drawn((size_t)T * B, (size_t)-1);   // drawn[t * B + b]: the step's place in that order
+  size_t nvalid = 0;
+  for (int t = 0; t < T; ++t)
+    for (int b : by_len)
+      if (t < lens[b]) drawn[(size_t)t * B + b] = nvalid++;
   size_t wbytes = 0, work = 0, reserve = 0;
   CK(cudnnGetRNNWeightSpaceSize(H, rd, &wbytes));
   CK(cudnnGetRNNTempSpaceSizes(H, rd, CUDNN_FWD_MODE_TRAINING, xd, &work, &reserve));
@@ -102,12 +131,13 @@ static void one(const char* name, int L, bool bidir, int T, int B, int Hd, float
   CK(cudnnCreateTensorDescriptor(&hd));
   const int h3[3] = {L * D, B, Hd}, s3[3] = {B * Hd, Hd, 1};
   CK(cudnnSetTensorNdDescriptor(hd, CUDNN_DATA_FLOAT, 3, h3, s3));
-  CK(cudnnRNNForward(H, rd, CUDNN_FWD_MODE_TRAINING, nullptr, xd, x.p, yd, y.p, hd, nullptr, nullptr, hd, nullptr, nullptr,
+  Buf<int> dev_lens(lens);
+  CK(cudnnRNNForward(H, rd, CUDNN_FWD_MODE_TRAINING, dev_lens.p, xd, x.p, yd, y.p, hd, nullptr, nullptr, hd, nullptr, nullptr,
                      wbytes, w.p, work, wk.p, reserve, rs.p));
   cudaDeviceSynchronize();
   // The model: after each layer but the last, a mask per direction over the output, [T][B][Hd * D].
   std::vector<host::State> model = host::seeded(seed, threads);
-  const size_t n = (size_t)T * B * Hd * D;
+  const size_t n = nvalid * Hd * D;
   std::vector<std::vector<std::vector<uint8_t>>> keeps;  // [boundary][direction]
   for (int b = 0; b + 1 < L; ++b) {
     keeps.emplace_back();
@@ -117,23 +147,25 @@ static void one(const char* name, int L, bool bidir, int T, int B, int Hd, float
   const std::vector<float> gy = y.get();
   size_t wrong = 0;
   for (int t = 0; t < T; ++t)
-    for (int b = 0; b < B; ++b)
+    for (int b = 0; b < B; ++b) {
+      if (t >= lens[b]) continue;
       for (int d = 0; d < D; ++d)
         for (int j = 0; j < Hd; ++j) {
           // Layer l's unit j of direction dir reads channel j of the layer below -- its forward direction's --
           // through the mask drawn for dir at the boundary below it.
-          float v = hx[((size_t)t * B + b) * Hd + j];
+          float v = hx[at(t, b) * Hd + j];
           bool zero = false;
           for (int l = 1; l < L; ++l) {
             const int dir = l == L - 1 ? d : 0;  // only the top layer's direction shows in y; below it the forward one feeds on
-            const size_t e = ((size_t)t * B + b) * (Hd * D) + j;
+            const size_t e = drawn[(size_t)t * B + b] * (Hd * D) + j;
             if (!keeps[l - 1][dir][e]) zero = true;
             v = v * scale;
           }
-          const float got = gy[((size_t)t * B + b) * (Hd * D) + (size_t)d * Hd + j];
+          const float got = gy[at(t, b) * (Hd * D) + (size_t)d * Hd + j];
           const float want = zero ? 0.0f : v;
           wrong += std::fabs(got - want) > 1e-5f * (1.0f + std::fabs(want));
         }
+    }
   char what[200];
   std::snprintf(what, sizeof what, "RNN dropout, %s: the outputs follow the host model's masks", name);
   expect(what, wrong == 0, (double)wrong);
@@ -165,6 +197,13 @@ int main() {
   one("three layers, odd sizes", 3, false, 5, 3, 100, 0.3f, 12345);
   one("two bidirectional layers", 2, true, 8, 4, 64, 0.5f, 77);
   one("three bidirectional layers", 3, true, 6, 3, 48, 0.4f, 99);
+  // Padded I/O: the masks cover the valid steps only.
+  one("padded, sorted, sequence-major", 2, false, 5, 4, 32, 0.5f, 5, 0, {5, 4, 2, 1});
+  one("padded, unsorted with ties, sequence-major", 2, false, 5, 5, 16, 0.5f, 77, 0, {3, 5, 3, 2, 5});
+  one("padded, batch-major", 2, false, 5, 4, 32, 0.4f, 21, 1, {2, 5, 1, 3});
+  one("padded, packed", 3, false, 4, 3, 24, 0.3f, 8, 2, {4, 3, 1});
+  one("padded, bidirectional, three layers", 3, true, 6, 3, 16, 0.5f, 31, 0, {4, 6, 2});
+  one("padded, bidirectional, batch-major", 2, true, 5, 4, 16, 0.5f, 99, 1, {5, 1, 3, 3});
   cudnnDestroy(H);
   std::printf("%s\n", fails ? "FAIL" : "PASS");
   return fails ? 1 : 0;

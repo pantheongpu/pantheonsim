@@ -23,11 +23,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <vector>
 
 #include <cuda_runtime.h>
+
+#include "capture_defer.hpp"
 
 namespace {
 
@@ -43,6 +46,7 @@ struct Generator {
   unsigned long long counter = 0;
   curandOrdering_t ordering = CURAND_ORDERING_PSEUDO_DEFAULT;   // kept; see curandSetGeneratorOrdering
   unsigned dims = 1;   // a quasirandom generator's dimensions
+  cudaStream_t stream = nullptr;   // curandSetStream
 
   bool quasi() const { return type >= CURAND_RNG_QUASI_DEFAULT; }
   bool quasi64() const { return type == CURAND_RNG_QUASI_SOBOL64 || type == CURAND_RNG_QUASI_SCRAMBLED_SOBOL64; }
@@ -58,6 +62,41 @@ bool valid(curandGenerator_t g) {
   std::lock_guard<std::mutex> lock(g_mu);
   return g && g_gens.count(reinterpret_cast<Generator*>(g));
 }
+
+// On a capturing stream a generate call is recorded, not made. Measured on an RTX 3060 (cuRAND 13): the
+// capture takes its place in the generator's stream -- the next eager call carries on after it -- the
+// first launch of the graph draws exactly what an eager call would have at that point, the launches
+// after it draw other numbers (a pseudorandom generator's state moves on in device memory, apart from the
+// position the host sees), and a quasirandom generator repeats the same points at every launch. Here the
+// later launches of a pseudorandom generator draw from a far part of the same stream. The generator has to
+// outlive the graph.
+template <class Call>
+bool record_generate(curandGenerator_t gen, size_t n, Call call) {
+  auto* g = reinterpret_cast<Generator*>(gen);
+  if (!vgpu_capture::stream_capturing(g->stream)) return false;
+  struct Replay {
+    unsigned long long c0 = 0, launches = 0;
+  };
+  auto state = std::make_shared<Replay>();
+  state->c0 = g->counter;
+  const bool quasi = g->quasi();
+  const unsigned long long consumed = quasi ? n / g->dims : n;
+  constexpr unsigned long long kFar = 1ull << 48;
+  if (!vgpu_record_host_op_if_capturing(g->stream, [g, state, consumed, quasi, call] {
+        const unsigned long long saved = g->counter;
+        g->counter = quasi || state->launches == 0 ? state->c0 : kFar + (state->launches - 1) * consumed;
+        call();
+        g->counter = saved;
+        ++state->launches;
+      }))
+    return false;
+  g->counter += consumed;
+  return true;
+}
+#define VGPU_RECORD_IF_CAPTURING(gen, n, call) \
+  do {                                         \
+    if (record_generate((gen), (n), [=] { (void)(call); })) return CURAND_STATUS_SUCCESS; \
+  } while (0)
 
 // Philox-style counter-based bijection. Counter-based generation is what makes
 // this reproducible without carrying hidden state: value i depends only on
@@ -401,8 +440,10 @@ VGPU_EXPORT curandStatus_t curandGetScrambleConstants64(unsigned long long** con
   return CURAND_STATUS_SUCCESS;
 }
 
-VGPU_EXPORT curandStatus_t curandSetStream(curandGenerator_t gen, cudaStream_t) {
-  return valid(gen) ? CURAND_STATUS_SUCCESS : CURAND_STATUS_NOT_INITIALIZED;
+VGPU_EXPORT curandStatus_t curandSetStream(curandGenerator_t gen, cudaStream_t stream) {
+  if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
+  reinterpret_cast<Generator*>(gen)->stream = stream;
+  return CURAND_STATUS_SUCCESS;
 }
 VGPU_EXPORT curandStatus_t curandGetVersion(int* version) {
   if (version) *version = CURAND_VERSION;
@@ -413,6 +454,7 @@ VGPU_EXPORT curandStatus_t curandGenerate(curandGenerator_t gen, unsigned int* o
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
   auto* g = reinterpret_cast<Generator*>(gen);
   if (g->quasi64()) return CURAND_STATUS_TYPE_ERROR;   // curandGenerateLongLong's
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerate(gen, out, n));
   if (g->quasi()) return quasi_fill(g, out, n, [](auto x) { return static_cast<unsigned int>(x); });
   std::vector<unsigned int> h(n);
   for (size_t i = 0; i < n; ++i) h[i] = draw32(g->seed, g->offset + g->counter + i);
@@ -426,12 +468,14 @@ VGPU_EXPORT curandStatus_t curandGenerateLongLong(curandGenerator_t gen, unsigne
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
   auto* g = reinterpret_cast<Generator*>(gen);
   if (!g->quasi64()) return CURAND_STATUS_TYPE_ERROR;
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateLongLong(gen, out, n));
   return quasi_fill(g, out, n, [](auto x) { return static_cast<unsigned long long>(x); });
 }
 
 VGPU_EXPORT curandStatus_t curandGenerateUniform(curandGenerator_t gen, float* out, size_t n) {
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
   auto* g = reinterpret_cast<Generator*>(gen);
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateUniform(gen, out, n));
   if (g->quasi()) return quasi_fill(g, out, n, [](auto x) { return quasi_float(x); });
   std::vector<float> h(n);
   for (size_t i = 0; i < n; ++i) h[i] = uniform_float(draw32(g->seed, g->offset + g->counter + i));
@@ -444,6 +488,7 @@ VGPU_EXPORT curandStatus_t curandGenerateUniformDouble(curandGenerator_t gen, do
                                                        size_t n) {
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
   auto* g = reinterpret_cast<Generator*>(gen);
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateUniformDouble(gen, out, n));
   if (g->quasi()) return quasi_fill(g, out, n, [](auto x) { return quasi_double(x); });
   std::vector<double> h(n);
   for (size_t i = 0; i < n; ++i)
@@ -459,6 +504,8 @@ VGPU_EXPORT curandStatus_t curandGenerateUniformDouble(curandGenerator_t gen, do
 VGPU_EXPORT curandStatus_t curandGenerateNormal(curandGenerator_t gen, float* out, size_t n,
                                                 float mean, float stddev) {
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
+  if (!reinterpret_cast<Generator*>(gen)->quasi() && n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateNormal(gen, out, n, mean, stddev));
   if (auto* q = reinterpret_cast<Generator*>(gen); q->quasi())
     return quasi_fill(q, out, n, [&](auto x) {
       return mean + stddev * static_cast<float>(normal_quantile(quasi_float(x)));
@@ -481,6 +528,8 @@ VGPU_EXPORT curandStatus_t curandGenerateNormal(curandGenerator_t gen, float* ou
 VGPU_EXPORT curandStatus_t curandGenerateNormalDouble(curandGenerator_t gen, double* out, size_t n,
                                                       double mean, double stddev) {
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
+  if (!reinterpret_cast<Generator*>(gen)->quasi() && n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateNormalDouble(gen, out, n, mean, stddev));
   if (auto* q = reinterpret_cast<Generator*>(gen); q->quasi())
     return quasi_fill(q, out, n, [&](auto x) { return mean + stddev * normal_quantile(quasi_double(x)); });
   if (n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
@@ -500,6 +549,9 @@ VGPU_EXPORT curandStatus_t curandGenerateNormalDouble(curandGenerator_t gen, dou
 
 VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float* out, size_t n,
                                                    float mean, float stddev) {
+  if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
+  if (!reinterpret_cast<Generator*>(gen)->quasi() && n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateLogNormal(gen, out, n, mean, stddev));
   curandStatus_t s = curandGenerateNormal(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
   std::vector<float> h(n);
@@ -511,6 +563,9 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float*
 
 VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, double* out,
                                                          size_t n, double mean, double stddev) {
+  if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
+  if (!reinterpret_cast<Generator*>(gen)->quasi() && n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
+  VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateLogNormalDouble(gen, out, n, mean, stddev));
   curandStatus_t s = curandGenerateNormalDouble(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
   std::vector<double> h(n);
