@@ -311,11 +311,12 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       const uint32_t kind = static_cast<uint32_t>(info), sym = static_cast<uint32_t>(info >> 32);
       // R_AMDGPU_REL32_LO and _HI: the halves of an address relative to the
       // instruction that reads it.
-      if (kind != 10 && kind != 11) continue;
+      // R_AMDGPU_REL64 (5): all of it, in the 64-bit literal gfx1250 adds to the program counter.
+      if (kind != 10 && kind != 11 && kind != 5) continue;
       const auto named = symbol_name.find(sym);
       if (named == symbol_name.end()) continue;
       if (const auto found = symbol_at.find(named->second); found != symbol_at.end()) {
-        out.relocations.push_back({where, found->second, addend, kind == 11, false});
+        out.relocations.push_back({where, found->second, addend, kind == 11, false, kind == 5});
         continue;
       }
       // A call: the symbol is a function in this module's own code.
@@ -323,7 +324,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       if (called == code.end())
         throw Error::make(Err::ProfileParse, origin, ": the code refers to ", named->second,
                           ", which is not a variable or a function this module defines");
-      out.relocations.push_back({where, called->second.first, addend, kind == 11, true});
+      out.relocations.push_back({where, called->second.first, addend, kind == 11, true, kind == 5});
     }
   }
 
@@ -499,8 +500,12 @@ void place_globals(CodeObject& o, uint64_t base) {
     const uint64_t place = o.text_addr + rel.at;
     const uint64_t value = symbol + static_cast<uint64_t>(rel.addend) - place;
     const uint32_t half = static_cast<uint32_t>(rel.high ? value >> 32 : value);
-    if (rel.at + 4 > o.text.size())
+    if (rel.at + (rel.wide ? 8 : 4) > o.text.size())
       throw Error::make(Err::ProfileParse, "a relocation points past the end of the code");
+    if (rel.wide) {
+      for (uint32_t b = 0; b < 8; ++b) o.text[rel.at + b] = static_cast<uint8_t>(value >> (8 * b));
+      continue;
+    }
     for (uint32_t b = 0; b < 4; ++b) o.text[rel.at + b] = static_cast<uint8_t>(half >> (8 * b));
   }
   o.placed = true;

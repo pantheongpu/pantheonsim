@@ -264,6 +264,33 @@ VTEST(a_permute_or_swizzle_that_reads_a_switched_off_lane_gets_zero) {
   VCHECK(zeros > 10);   // the pattern does read disabled lanes
 }
 
+VTEST(a_wave_that_waits_for_a_load_lets_the_waves_beside_it_read_lds_first) {
+  // Thread 0 writes an LDS word; after a barrier every thread reads it and the first wave then
+  // does a global load and overwrites the word. A card's second wave reads within cycles of the
+  // barrier and the first overwrites after the load's hundreds, so every thread reads the 7
+  // thread 0 wrote (rocPRIM's ordered block id is read and clobbered exactly so). Running the first
+  // wave on to its write before the second one read gave the second wave 99.
+  const amd::CodeObject o = object("asm_barrier_order");
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(128 * 4);
+  const amd::Kernel* k = amd::find_kernel(o, "order");
+  VCHECK(k != nullptr);
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  for (int b = 0; b < 8; ++b) args[b] = static_cast<uint8_t>(out >> (8 * b));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 128;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(128);
+  mem.read(out, r.data(), 128 * 4);
+  int wrong = 0;
+  for (uint32_t v : r) wrong += v != 7;
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(xf32_matrix_instructions_cut_a_floats_mantissa_to_ten_bits) {
   // v_mfma_f32_16x16x8_xf32 and v_mfma_f32_32x32x4_xf32 take floats and multiply them with the
   // mantissa truncated to 10 bits (the MI300 ISA guide, 7.1), accumulating into a float. Inputs are

@@ -32,7 +32,7 @@ ENCODINGS = {
     'ENC_SMEM': 'Smem', 'ENC_VOP1': 'Vop1', 'ENC_VOP2': 'Vop2', 'ENC_VOPC': 'Vopc', 'ENC_VOP3': 'Vop3',
     'VOP3_SDST_ENC': 'Vop3', 'ENC_VOP3P': 'Vop3p', 'ENC_DS': 'Ds', 'ENC_FLAT': 'Flat',
     'ENC_FLAT_GLOBAL': 'Flat', 'ENC_FLAT_SCRATCH': 'Flat', 'ENC_MUBUF': 'Mubuf', 'ENC_MTBUF': 'Mtbuf',
-    'VOPDXY': 'Vopd',
+    'VOPDXY': 'Vopd', 'VOPDXY_X': 'Vopd', 'VOPDXY_Y': 'Vopd', 'VOPD3XY': 'Vopd', 'ENC_VOP3PX2': 'Vop3p', 'ENC_VOP3PX3': 'Vop3p',   # CDNA 5 lists the X and Y halves apart
     # RDNA4's names for the same encodings.
     'ENC_VOP3SD': 'Vop3', 'ENC_VFLAT': 'Flat', 'ENC_VGLOBAL': 'Flat', 'ENC_VSCRATCH': 'Flat',
     'ENC_VBUFFER': 'Mubuf', 'ENC_VOPD': 'Vopd', 'ENC_VDS': 'Ds', 'ENC_FLAT_GLBL': 'Flat',
@@ -49,6 +49,12 @@ KINDS = {
     'OPR_SREG_M0': 'Ssrc', 'OPR_SREG_LITERAL': 'Ssrc', 'OPR_SMEM_OFFSET_NOK': 'Ssrc', 'OPR_SIMM5': 'Simm16',
     'OPR_SENDMSG_RTN': 'Sendmsg', 'OPR_SSRC_BARRIER_ID': 'Ssrc', 'OPR_WAIT_MEM_DS': 'Waitcnt', 'OPR_SLEEP': 'Simm16',
     'OPR_WAIT_ALU': 'Depctr', 'OPR_WAIT_EVENT': 'Simm16',
+    # CDNA 5's. Most are implicit operands (the memory a load reads, the PC a call writes) and never reach the
+    # table; the explicit ones are an s_set_vgpr_msb immediate, a scalar register of a tensor instruction, a
+    # 64-bit literal, and the plain and no-inline-constant vector sources.
+    'OPR_SET_VGPR_MSB': 'Simm16', 'OPR_SGPR': 'Sreg', 'OPR_SIMM64': 'Simm64', 'OPR_SRC_NOINLINE': 'Src',
+    'OPR_SRC_SIMPLE': 'Src', 'OPR_DSMEM': 'Ssrc', 'OPR_GPUMEM': 'Ssrc', 'OPR_SDST_EXEC': 'Sdst',
+    'OPR_SSRC_SPECIAL_SCC': 'Ssrc', 'OPR_PC': 'Ssrc', 'OPR_SDST_M0': 'Sdst',
     # RDNA2's.
     'OPR_SREG_NONULL': 'Sreg', 'OPR_SRC_NOLDS': 'Src', 'OPR_SSRC_NOLDS': 'Ssrc', 'OPR_VGPR_OR_LDS': 'Src',
     'OPR_ATTR': 'Simm16', 'OPR_PARAM': 'Simm16',
@@ -58,6 +64,8 @@ KINDS = {
 IMAGE_ENCODINGS = {'ENC_MIMG': 0, 'ENC_VIMAGE': 0, 'ENC_VSAMPLE': 1}
 if images:
     ENCODINGS = {e: 'Mimg' for e in IMAGE_ENCODINGS}
+elif 'CDNA 5' in arch:
+    ENCODINGS['ENC_VIMAGE'] = 'Mimg'   # CDNA 5 has the tensor data mover's two, which are not image accesses
 # Fields the decoder reads itself rather than as operands.
 SKIP_FIELDS = {'LITERAL'}
 
@@ -75,14 +83,15 @@ for inst in isa.find('Instructions'):
         # An instruction that always carries a literal (v_fmaak_f32) is only
         # listed under its encoding's _INST_LITERAL form, which stands in.
         priority = 0
-        if enc_xml.endswith('_INST_LITERAL') and cond == 'default':
+        if (enc_xml.endswith('_INST_LITERAL') or enc_xml.endswith(('_INST_LITERAL_X', '_INST_LITERAL_Y'))) and cond == 'default':
             enc_xml, priority = {'VOP2_INST_LITERAL': 'ENC_VOP2', 'VOPDXY_INST_LITERAL': 'VOPDXY',
+                                 'VOPDXY_INST_LITERAL_X': 'VOPDXY_X', 'VOPDXY_INST_LITERAL_Y': 'VOPDXY_Y',
                                  'SOPK_INST_LITERAL': 'ENC_SOPK', 'SOP2_INST_LITERAL': 'ENC_SOP2'}.get(enc_xml, enc_xml), 1
-        if enc_xml not in ENCODINGS or not (cond == 'default' or cond.startswith('Nothas')):
+        if enc_xml not in ENCODINGS or not (cond == 'default' or cond.startswith(('Nothas', '!has_'))):
             continue
         enc = ENCODINGS[enc_xml]
         opcode = int(ie.find('Opcode').text, int(ie.find('Opcode').get('Radix', '10')))
-        segment = {'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
+        segment = {'ENC_VIMAGE': 3, 'ENC_VOP3PX2': 1, 'ENC_VOP3PX3': 2, 'VOPD3XY': 1, 'ENC_FLAT_GLOBAL': 1, 'ENC_FLAT_GLBL': 1, 'ENC_VGLOBAL': 1, 'ENC_FLAT_SCRATCH': 2, 'ENC_VSCRATCH': 2}.get(enc_xml, 0)
         if images:
             segment = IMAGE_ENCODINGS[enc_xml]
         ops = []
