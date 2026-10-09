@@ -1,0 +1,70 @@
+# VirtualGPU device profile: NVIDIA GeForce RTX 2080 Ti (Turing, TU102, sm_75).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 7.5: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 68: NVIDIA Turing GPU Architecture whitepaper (WP-09183-001), Table 1
+#     (68 SMs, 4352 CUDA cores at 64 an SM, 544 Tensor Cores); the Ada
+#     whitepaper's Table 1 repeats it.
+#   - memory 11 GB GDDR6, 14 Gbps, 352-bit, 616 GB/s: the same Turing table, which
+#     gives the frame buffer as 11264 MB. NVIDIA's "GB" for graphics memory is
+#     binary (the whitepapers' MB figures are 1024 x the GB), so vram_bytes is
+#     11264 MiB; a real card's nvidia-smi total is a little smaller, so this is
+#     an upper bound.
+#   - boost clock 1545 MHz and board power 250 W: the Turing whitepaper's
+#     reference-card figures (the Founders Edition is 1635 MHz and 260 W).
+#   - PCIe Gen3: the Ada whitepaper's Table 2 "PCI Express Interface" row; x16 is
+#     the slot the card is built for, not a figure NVIDIA states there.
+#   - PCI device 0x1E04, "NVIDIA GeForce RTX 2080 Ti", from the name table in
+#     NVIDIA's open GPU kernel modules (g_nv_name_released.h). The table also
+#     lists 0x1E07 for the same name (a later revision); 0x1E04 is the first.
+#   - Per-SM limits are compute capability 7.5's: the same as nvidia/t4, which was
+#     read from a physical card (registers 64K, 1024 threads, 16 blocks, 64 KB
+#     shared memory), and as the CUDA C++ Programming Guide's table gives.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 5632 KB and the 352-bit bus: Turing whitepaper Table 1; no persisting L2 before 8.0 (as nvidia/t4).
+id: nvidia/rtx2080ti
+vendor: nvidia
+model: "NVIDIA GeForce RTX 2080 Ti"
+architecture: turing
+compute_capability: "7.5"
+warp_size: 32
+vram_bytes: 11811160064          # 11264 MiB (Turing whitepaper); an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 65536
+  registers_per_block: 65536
+  multiprocessors: 68
+  registers_per_sm: 65536
+  max_threads_per_sm: 1024
+  max_blocks_per_sm: 16
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 65536
+  l2_cache_bytes: 5767168
+features:
+  fp16: true
+  bf16: false                    # no bf16 arithmetic before compute capability 8.0 (same as nvidia/t4)
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 11264          # Turing whitepaper; not measured on a card
+  power_limit_w: 250             # reference card (Turing whitepaper); Founders Edition 260 W
+  sm_clock_max_mhz: 1545         # reference boost clock (Turing whitepaper)
+  mem_clock_max_mhz: 7000        # half the published 14 Gbps data rate; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 7684            # 0x1E04 [GeForce RTX 2080 Ti]
+  ecc: false                     # GeForce: no ECC
+  memory: gddr
+  pcie_link: "Gen3 x16"          # see the header
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 5632 KB and the 352-bit memory interface: NVIDIA Turing whitepaper, Table 1.
+# Persisting L2 is 0: the access policy window starts at compute capability 8.0 (as nvidia/t4).
+cuda:
+  memory_bus_width_bits: 352
+  persisting_l2_bytes: 0

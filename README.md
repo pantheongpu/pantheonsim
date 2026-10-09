@@ -42,7 +42,7 @@ Working today, all CPU-only:
 
 | Area | State |
 | --- | --- |
-| Device profiles | Twelve NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized. AMD: MI325X is read from a physical card; MI300X and MI350X are placeholders. Each profile's header says where its values came from |
+| Device profiles | Twelve NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized. Fifteen more NVIDIA profiles (H200, B200, B300, GB200, Rubin, Jetson Thor, RTX 5090, RTX PRO 6000, GB10 in the DGX Spark, RTX 4090, L40, RTX 3090, A40, A30, RTX 2080 Ti) are built from public documents only and marked `verified: false`: nothing in them was measured, and Rubin and Thor carry placeholder PCI ids because NVIDIA has published none. [nvidia/docs/profiles.md](nvidia/docs/profiles.md) lists them. AMD: MI325X is read from a physical card; MI300X and MI350X are placeholders. Each profile's header says where its values came from |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host, and past `VGPU_MEMORY_RAM_MB` it spills to disk; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |

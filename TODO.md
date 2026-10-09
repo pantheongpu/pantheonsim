@@ -1683,9 +1683,9 @@ public headers, tested by their authors under ASan + UBSan, and are awaiting CI 
 | pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
 | pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
 
-## Profile inventory (rev 5)
+## Profile inventory (rev 6)
 
-23 profiles, read from each profile's YAML at 2ce1f45. `verified: true` means the
+34 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
 profile's values were read from a physical device (see "Hardware characterization").
 
 | id | vendor | arch | cc / gfx | verified |
@@ -1706,6 +1706,17 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `nvidia/b200` | NVIDIA | Blackwell | 10.0 | **no** (framebuffer measured, the rest public documentation) |
 | `nvidia/b300` | NVIDIA | Blackwell Ultra | 10.3 | **no** |
 | `nvidia/rtx5090` | NVIDIA | Blackwell | 12.0 | **no** |
+| `nvidia/gb200` | NVIDIA | Blackwell | 10.0 | **no** (B200's limits; memory from NVIDIA's per-superchip figure) |
+| `nvidia/vr200` | NVIDIA | Rubin | 10.7 | **no** (placeholder PCI id 0x7F10) |
+| `nvidia/thor` | NVIDIA | Blackwell | 11.0 | **no** (placeholder PCI id 0x7F11; SM count derived) |
+| `nvidia/rtx-pro-6000` | NVIDIA | Blackwell | 12.0 | **no** |
+| `nvidia/gb10` | NVIDIA | Blackwell | 12.1 | **no** (SM count derived from the 6,144 CUDA cores) |
+| `nvidia/rtx4090` | NVIDIA | Ada | 8.9 | **no** |
+| `nvidia/l40` | NVIDIA | Ada | 8.9 | **no** |
+| `nvidia/rtx3090` | NVIDIA | Ampere | 8.6 | **no** |
+| `nvidia/a40` | NVIDIA | Ampere | 8.6 | **no** |
+| `nvidia/a30` | NVIDIA | Ampere | 8.0 | **no** (SM count derived from OEM Tensor Core counts) |
+| `nvidia/rtx2080ti` | NVIDIA | Turing | 7.5 | **no** |
 | `amd/mi325x` | AMD | CDNA3 | gfx942 | yes (rocminfo on a physical card) |
 | `amd/mi300x` | AMD | CDNA3 | gfx942 | **no** |
 | `amd/mi250x` | AMD | CDNA2 | gfx90a | **no** (one die: 110 CUs, 64 GB) |
