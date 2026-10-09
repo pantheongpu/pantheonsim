@@ -7545,7 +7545,11 @@ struct LoweredGraph {
 };
 std::unordered_map<void*, std::unique_ptr<LoweredGraph>> g_exec_lowered;   // by executable graph
 
-void announce_lowered(GraphRec& exec, void* source) {
+// Tells a profiler of the executable graph `exec` made from `source`, and returns
+// what it was told (to be kept in g_exec_lowered). The callbacks run with no lock
+// of ours held: a subscriber that asks the driver for its context takes the
+// driver's lock, and a launch holds that one while it takes g_graph_mu.
+std::unique_ptr<LoweredGraph> announce_lowered(GraphRec& exec, void* source) {
   using R = vgpu::profiling::Resource;
   auto lowered = std::make_unique<LoweredGraph>();
   const size_t n = exec.nodes.size();
@@ -7580,12 +7584,12 @@ void announce_lowered(GraphRec& exec, void* source) {
     lowered->removed.insert(up.get());
   }
   graph_event(R::GraphExecCreated, source, nullptr, nullptr, nullptr, 0, nullptr, &exec, true);
-  g_exec_lowered[&exec] = std::move(lowered);
+  return lowered;
 }
 
 cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long long flags,
                         cudaGraphInstantiateResult* result) {
-  std::lock_guard<std::mutex> lock(g_graph_mu);
+  std::unique_lock<std::mutex> lock(g_graph_mu);
   *result = cudaGraphInstantiateError;
   auto it = g_graphs.find(static_cast<void*>(graph));
   if (it == g_graphs.end()) {
@@ -7613,12 +7617,18 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   if (const cudaError_t rc = check_conditionals(*it->second, result); rc != cudaSuccess) return rc;
   auto exec = clone_graph(*it->second, nullptr, 2);     // a snapshot, as CUDA takes
   void* handle = exec.get();
-  announce_lowered(*exec, static_cast<void*>(graph));
+  GraphRec* made = exec.get();
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   exec_retain_graph_objects(handle, static_cast<void*>(graph));
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
+  // Nothing else knows the handle until this returns, so the profiler can be told
+  // with the lock released.
+  lock.unlock();
+  auto lowered = announce_lowered(*made, static_cast<void*>(graph));
+  lock.lock();
+  g_exec_lowered[handle] = std::move(lowered);
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
   *result = cudaGraphInstantiateSuccess;
   return cudaSuccess;
@@ -10286,11 +10296,12 @@ VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes_v2(cudaGraphNode_t node, 
                                                          cudaGraphEdgeData* edgeData, size_t* numDependentNodes) {
   return node_get_dependents(node, dependent, edgeData, numDependentNodes);
 }
+#endif
 
+// The CUDA 12 signature (no edge data) is exported whatever 12.x this is built against.
 VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node, cudaGraphNode_t* dependent, size_t* numDependentNodes) {
   return traced_call("cudaGraphNodeGetDependentNodes", cudaGraphNodeGetDependentNodes_traced, node, dependent, numDependentNodes);
 }
-#endif
 #endif
 
 #if CUDART_VERSION >= 12030
