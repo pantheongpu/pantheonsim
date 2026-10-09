@@ -20,6 +20,9 @@ VTEST(every_amd_profile_has_its_own_chip) {
     const vgpu::amd::Chip c = vgpu::amd::chip(p.architecture.c_str());
     // The target the chip table gives is the profile's own.
     VCHECK_EQ(std::string(c.gfx), p.gcn_arch);
+    // gfx10 and later (gfx1250 too) have no sramecc or xnack settings in their target ID: the compiler rejects
+    // "gfx1250:sramecc+:xnack-" ("invalid target ID"), which is what hiprtc then reported for a device named so.
+    if (p.gcn_arch.rfind("gfx1", 0) == 0) VCHECK_EQ(p.gcn_arch_full, p.gcn_arch);
     // RDNA counts a workgroup processor as HIP's multiprocessor, two compute
     // units, and so does CDNA 5 (gfx1250, built on gfx12); CDNA one; and each has a memory interface and an L1 and L2.
     VCHECK_EQ(c.cus_per_mp, p.architecture.rfind("rdna", 0) == 0 || p.architecture == "cdna5" ? 2u : 1u);

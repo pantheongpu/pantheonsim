@@ -28,10 +28,15 @@ IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN_IMDS" http://169.254.169.254/
 curl -sL -o /tmp/runner.tgz "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
 for i in $(seq 1 $NRUNNERS); do
   d=/home/runner/r$i
-  mkdir -p "$d" && tar xzf /tmp/runner.tgz -C "$d" && chown -R runner:runner "$d"
-  (cd "$d" && sudo -u runner ./config.sh --unattended --url "https://github.com/$REPO" --token "$TOKEN" \
+  mkdir -p "$d" && tar xzf /tmp/runner.tgz -C "$d"
+  # As root, not as the runner user: container jobs run as root and a cancelled one leaves
+  # processes writing root-owned files into the workspace after the job's last step has run
+  # (docker exec children outlive the runner's wait), which a non-root runner then cannot
+  # delete at its next checkout. Root can, and these instances are disposable.
+  (cd "$d" && echo RUNNER_ALLOW_RUNASROOT=1 >> .env \
+   && RUNNER_ALLOW_RUNASROOT=1 ./config.sh --unattended --url "https://github.com/$REPO" --token "$TOKEN" \
       --name "burst-$IID-$i" --no-default-labels --labels pantheonsim-burst --replace --work _work \
-   && ./svc.sh install runner && ./svc.sh start)
+   && ./svc.sh install root && ./svc.sh start)
 done
 
 mkdir -p /var/lib/burst

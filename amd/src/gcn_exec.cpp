@@ -2228,9 +2228,8 @@ struct Machine {
       each([&](uint32_t lane) {
         const auto source = [&](uint32_t k) {
           const Operand& o = in.src[k];
-          float f;
-          if (!((in.op_sel_hi >> k) & 1)) f = lane_float(w, o, lane);
-          else f = as_float((lane_src(w, o, lane) >> (((in.op_sel >> k) & 1) ? 16 : 0) & 0xFFFFu) << 16);
+          if (!((in.op_sel_hi >> k) & 1)) return lane_float(w, o, lane);   // (which applies the modifiers itself)
+          float f = as_float((lane_src(w, o, lane) >> (((in.op_sel >> k) & 1) ? 16 : 0) & 0xFFFFu) << 16);
           if (o.abs) f = std::fabs(f);
           return o.neg ? -f : f;
         };
@@ -2243,6 +2242,12 @@ struct Machine {
         const uint32_t bits = to_bf16(r);
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         w.vgpr[in.dst[0].index][lane] = op == "v_fma_mixlo_bf16"_op ? (was & 0xFFFF0000u) | bits : (was & 0x0000FFFFu) | bits << 16;
+      });
+    } else if (op == "v_fmamk_f64"_op || op == "v_fmaak_f64"_op) {
+      // A double multiply-add with a 64-bit constant: s0 * K + s1 (fmamk), or s0 * s1 + K (fmaak); the sources come in
+      // that order either way, the constant in its place.
+      each([&](uint32_t lane) {
+        write_double(w, in, lane, std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane), lane_double(w, in.src[2], lane)));
       });
     } else if (op == "v_cubeid_f32"_op || op == "v_cubesc_f32"_op || op == "v_cubetc_f32"_op || op == "v_cubema_f32"_op) {
       // The cube-face instructions, as the ISA has them: the face a direction (x, y, z) points at, a coordinate on it, and

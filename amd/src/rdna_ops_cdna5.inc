@@ -797,6 +797,8 @@
 {Enc::Vop2, 0, 32, false, "v_add_co_ci_u32", {{"VDST", K::Vgpr, 32, true}, {"", K::Vcc, 64, true}, {"SRC0", K::Src, 32, false}, {"VSRC1", K::Vgpr, 32, false}, {"", K::Vcc, 64, false}}},
 {Enc::Vop2, 0, 33, false, "v_sub_co_ci_u32", {{"VDST", K::Vgpr, 32, true}, {"", K::Vcc, 64, true}, {"SRC0", K::Src, 32, false}, {"VSRC1", K::Vgpr, 32, false}, {"", K::Vcc, 64, false}}},
 {Enc::Vop2, 0, 34, false, "v_subrev_co_ci_u32", {{"VDST", K::Vgpr, 32, true}, {"", K::Vcc, 64, true}, {"SRC0", K::Src, 32, false}, {"VSRC1", K::Vgpr, 32, false}, {"", K::Vcc, 64, false}}},
+{Enc::Vop2, 0, 35, false, "v_fmamk_f64", {{"VDST", K::Vgpr, 64, true}, {"SRC0", K::Src, 64, false}, {"LITERAL", K::Simm64, 64, false}, {"VSRC1", K::Vgpr, 64, false}}},
+{Enc::Vop2, 0, 36, false, "v_fmaak_f64", {{"VDST", K::Vgpr, 64, true}, {"SRC0", K::Src, 64, false}, {"VSRC1", K::Vgpr, 64, false}, {"LITERAL", K::Simm64, 64, false}}},
 {Enc::Vop2, 0, 37, false, "v_add_nc_u32", {{"VDST", K::Vgpr, 32, true}, {"SRC0", K::Src, 32, false}, {"VSRC1", K::Vgpr, 32, false}}},
 {Enc::Vop2, 0, 38, false, "v_sub_nc_u32", {{"VDST", K::Vgpr, 32, true}, {"SRC0", K::Src, 32, false}, {"VSRC1", K::Vgpr, 32, false}}},
 {Enc::Vop2, 0, 39, false, "v_subrev_nc_u32", {{"VDST", K::Vgpr, 32, true}, {"SRC0", K::Src, 32, false}, {"VSRC1", K::Vgpr, 32, false}}},

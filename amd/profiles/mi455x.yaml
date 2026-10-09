@@ -13,9 +13,9 @@ vendor: amd
 model: "AMD Instinct MI455X"
 architecture: cdna5
 gcn_arch: "gfx1250"
-# As HIP would name it with the features LLVM's gfx1250 ships with (xnack and sramecc
-# are both advertised by the target).
-gcn_arch_full: "gfx1250:sramecc+:xnack-"
+# As HIP names it: gfx1250's target ID takes no sramecc or xnack setting (ROCm's clang rejects
+# "gfx1250:sramecc+:xnack-" as an invalid target ID, as it does for every gfx10 and later target).
+gcn_arch_full: "gfx1250"
 warp_size: 32
 vram_bytes: 463856467968       # 432 GiB
 verified: false
