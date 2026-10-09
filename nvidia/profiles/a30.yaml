@@ -23,6 +23,7 @@
 #     kernel modules (g_nv_name_released.h).
 #   - The optional NVLink bridge (200 GB/s, two GPUs) is not recorded, as for
 #     nvidia/h100-pcie.
+#   - CUDA attributes (the `cuda:` section): the 3072-bit bus is a retailer figure (see the cuda section); the L2 is unpublished and left unset.
 id: nvidia/a30
 vendor: nvidia
 model: "NVIDIA A30"
@@ -62,3 +63,12 @@ telemetry:
   ecc: true
   memory: hbm                    # rows are remapped on failure
   pcie_link: "Gen4 x16"          # data sheet: "PCIe Gen4: 64GB/s"
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 3072 bits: PNY's and other retailers' A30 listings, not an NVIDIA page; it is what NVIDIA's
+# 933 GB/s needs at the 1215 MHz (2.43 Gbps) HBM2 clock the A100 40 GB has (3072 x 2.43 / 8 = 933), and three
+# 1024-bit stacks would hold 24 GB. Unverified.
+# The L2 size is not published by NVIDIA for the A30 (the 24 MB seen for the related A30X is a third party's), so it
+# is left unset, as for the B200 and B300, and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 3072

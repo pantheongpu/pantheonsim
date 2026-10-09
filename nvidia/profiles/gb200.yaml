@@ -16,6 +16,7 @@
 # 1000 W power limit (the page lists no TDP), the 90 C limit and the memory
 # sensor. The Grace link is NVLink-C2C, so the PCIe link is left out rather than
 # taken from the B200.
+#   - CUDA attributes (the `cuda:` section): the bus width is the B200's; the L2 is unpublished and left unset.
 id: nvidia/gb200
 vendor: nvidia
 model: "NVIDIA GB200"
@@ -57,3 +58,9 @@ telemetry:
   memory: hbm
   memory_temperature: true
   nvlink: "NVLink5 x18"          # see the header
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 8192 bits: COPIED from nvidia/b200 (eight HBM3e stacks); NVIDIA's GB200 page gives no width.
+# The L2 size is not published, so it is left unset, as for the B200 and B300, and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 8192

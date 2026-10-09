@@ -98,8 +98,12 @@ VTEST(every_nvidia_profile_answers_every_attribute_and_stays_consistent) {
       VCHECK(!device_attribute(p, 0, a, &v));
       VCHECK_EQ(v, 77);   // untouched
     }
-    // The L2 and the memory interface are facts of the card, not zeros.
-    if (id != "nvidia/b200" && id != "nvidia/b300") VCHECK(attr(p, A::kL2CacheSize) > 0);
+    // The L2 and the memory interface are facts of the card, not zeros -- except
+    // where NVIDIA has not published the L2 (the profile leaves it unset).
+    const bool l2_unpublished = id == "nvidia/b200" || id == "nvidia/b300" || id == "nvidia/gb200" ||
+                                id == "nvidia/vr200" || id == "nvidia/thor" || id == "nvidia/gb10" ||
+                                id == "nvidia/a30";
+    if (!l2_unpublished) VCHECK(attr(p, A::kL2CacheSize) > 0);
     VCHECK(attr(p, A::kGlobalMemoryBusWidth) >= 128);
     VCHECK(attr(p, A::kClockRate) >= 1000000);
     VCHECK(attr(p, A::kMemoryClockRate) >= 1000000);
@@ -108,7 +112,7 @@ VTEST(every_nvidia_profile_answers_every_attribute_and_stays_consistent) {
     const int cc = p.cc_major * 10 + p.cc_minor;
     // The access policy window and its L2 set-aside come with 8.0.
     VCHECK_EQ(attr(p, A::kMaxAccessPolicyWindowSize) > 0, cc >= 80);
-    VCHECK_EQ(attr(p, A::kMaxPersistingL2CacheSize) > 0, cc >= 80 && id != "nvidia/b200" && id != "nvidia/b300");
+    VCHECK_EQ(attr(p, A::kMaxPersistingL2CacheSize) > 0, cc >= 80 && !l2_unpublished);
     // Clusters and the tensor map are Hopper's.
     VCHECK_EQ(attr(p, A::kClusterLaunch), cc >= 90 ? 1 : 0);
     VCHECK_EQ(attr(p, A::kTensorMapAccessSupported), cc >= 90 ? 1 : 0);

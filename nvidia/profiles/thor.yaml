@@ -30,6 +30,7 @@
 #     an SM. power_limit_w is the top of the configurable range, 130 W.
 #   - Not recorded: ECC, a memory type (LPDDR5X is neither "hbm" nor "gddr"), PCIe
 #     and NVLink links (Thor is an SoC), a temperature limit.
+#   - CUDA attributes (the `cuda:` section): the 256-bit bus is NVIDIA's; the L2 is unpublished and left unset.
 id: nvidia/thor
 vendor: nvidia
 model: "NVIDIA Jetson AGX Thor"
@@ -66,3 +67,9 @@ telemetry:
   mem_clock_max_mhz: 4266        # see the header
   pci_vendor_id: 4318            # 0x10DE NVIDIA
   pci_device_id: 65041           # 0xFE11: PLACEHOLDER, NVIDIA has published no Thor id (see the header)
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 256 bits: NVIDIA's Jetson Thor page ("256-bit LPDDR5X").
+# The L2 size is not published, so it is left unset, as for the B200 and B300, and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 256

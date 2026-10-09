@@ -27,6 +27,7 @@
 #     temperature limit.
 #   - The architecture is "rubin": no NVML architecture or PMC_BOOT_0 id is known
 #     for it, so those report unknown / none rather than Blackwell's.
+#   - CUDA attributes (the `cuda:` section): the 16384-bit bus is derived from "HBM4 doubles interface width"; the L2 is unpublished and left unset.
 id: nvidia/vr200
 vendor: nvidia
 model: "NVIDIA Rubin"
@@ -66,3 +67,12 @@ telemetry:
   ecc: true                       # copied from the other HBM parts; unpublished
   memory: hbm
   pcie_link: "Gen6 x16"           # NVIDIA: "x16 PCIe Gen 6"
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 16384 bits: DERIVED. NVIDIA's Rubin blog says HBM4 "doubles interface width relative to
+# HBM3e" and gives 288 GB in 12-Hi stacks; with the B300's eight HBM3e stacks (8192 bits) doubled that is 16384.
+# The stack count itself is not stated. Unverified.
+# The L2 size is not published ("a large centralized L2 cache"), so it is left unset, as for the B200 and B300,
+# and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 16384

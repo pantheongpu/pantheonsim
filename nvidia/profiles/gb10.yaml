@@ -20,6 +20,7 @@
 #   - SM clock: not published; the RTX PRO 6000's 2617 MHz (another GB20x) until measured.
 #   - Not recorded, because the GB10 is a SoC and NVIDIA states neither: the PCIe
 #     link, NVLink, ECC, and a memory type (LPDDR5x is neither "hbm" nor "gddr").
+#   - CUDA attributes (the `cuda:` section): the 256-bit bus is NVIDIA's; the L2 is unpublished and left unset.
 id: nvidia/gb10
 vendor: nvidia
 model: "NVIDIA GB10"
@@ -56,3 +57,10 @@ telemetry:
   mem_clock_max_mhz: 4266        # "4266 MHz" (DGX Spark hardware overview)
   pci_vendor_id: 4318            # 0x10DE NVIDIA
   pci_device_id: 11794           # 0x2E12 [GB10]
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 256 bits: NVIDIA's DGX Spark hardware overview ("256-bit interface").
+# The L2 size is not in the NVIDIA pages read (the 24 MB in Hot Chips coverage is a third party's), so it is left
+# unset, as for the B200 and B300, and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 256

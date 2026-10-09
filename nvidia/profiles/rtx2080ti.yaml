@@ -20,6 +20,7 @@
 #   - Per-SM limits are compute capability 7.5's: the same as nvidia/t4, which was
 #     read from a physical card (registers 64K, 1024 threads, 16 blocks, 64 KB
 #     shared memory), and as the CUDA C++ Programming Guide's table gives.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 5632 KB and the 352-bit bus: Turing whitepaper Table 1; no persisting L2 before 8.0 (as nvidia/t4).
 id: nvidia/rtx2080ti
 vendor: nvidia
 model: "NVIDIA GeForce RTX 2080 Ti"
@@ -41,6 +42,7 @@ limits:
   max_blocks_per_sm: 16
   max_registers_per_thread: 255
   shared_mem_per_sm: 65536
+  l2_cache_bytes: 5767168
 features:
   fp16: true
   bf16: false                    # no bf16 arithmetic before compute capability 8.0 (same as nvidia/t4)
@@ -59,3 +61,10 @@ telemetry:
   ecc: false                     # GeForce: no ECC
   memory: gddr
   pcie_link: "Gen3 x16"          # see the header
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 5632 KB and the 352-bit memory interface: NVIDIA Turing whitepaper, Table 1.
+# Persisting L2 is 0: the access policy window starts at compute capability 8.0 (as nvidia/t4).
+cuda:
+  memory_bus_width_bits: 352
+  persisting_l2_bytes: 0

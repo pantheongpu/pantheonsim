@@ -16,6 +16,7 @@
 #     kernel modules (g_nv_name_released.h).
 #   - Per-SM limits are compute capability 8.9's, the same as nvidia/l40s, which
 #     was read from a physical card.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 98304 KB and the 384-bit bus: Ada whitepaper; persisting L2 copied from nvidia/l40s.
 id: nvidia/l40
 vendor: nvidia
 model: "NVIDIA L40"
@@ -37,6 +38,7 @@ limits:
   max_blocks_per_sm: 24
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
+  l2_cache_bytes: 100663296
 features:
   fp16: true
   bf16: true
@@ -55,3 +57,12 @@ telemetry:
   ecc: true                      # "48 GB GDDR6 with ECC" (L40 page)
   memory: gddr                   # GDDR; Ampere and later remap rows rather than retire pages (see telemetry.cpp)
   pcie_link: "Gen4 x16"          # L40 page: PCI Express Gen 4; x16 is the slot the card is built for
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 98304 KB: NVIDIA Ada whitepaper, Appendix C Table 4. The 384-bit interface is AD102's (the same
+# 384 bits the L40 page's 864 GB/s needs at 18 Gbps).
+# Persisting L2 is nvidia/l40s's measured 75497472 (the same AD102 die and L2); NVIDIA does not
+# publish it, so it is carried over, unverified.
+cuda:
+  memory_bus_width_bits: 384
+  persisting_l2_bytes: 75497472

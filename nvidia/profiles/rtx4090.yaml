@@ -16,6 +16,7 @@
 #     open GPU kernel modules (g_nv_name_released.h).
 #   - Per-SM limits are compute capability 8.9's, the same as nvidia/l4 and
 #     nvidia/l40s, which were read from physical cards.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 73728 KB and the 384-bit bus: Ada whitepaper; persisting L2 is 3/4 of the L2, nvidia/l40s's measured ratio.
 id: nvidia/rtx4090
 vendor: nvidia
 model: "NVIDIA GeForce RTX 4090"
@@ -37,6 +38,7 @@ limits:
   max_blocks_per_sm: 24
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
+  l2_cache_bytes: 75497472
 features:
   fp16: true
   bf16: true
@@ -55,3 +57,11 @@ telemetry:
   ecc: false                     # GeForce: no ECC
   memory: gddr                   # GDDR6X
   pcie_link: "Gen4 x16"          # see the header
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 73728 KB and the 384-bit memory interface: NVIDIA Ada whitepaper, Tables 1 and 2.
+# Persisting L2 is 3/4 of the L2 (56623104), the ratio nvidia/l40s measured (75497472 of 100663296);
+# NVIDIA does not publish it, so this is derived, unverified.
+cuda:
+  memory_bus_width_bits: 384
+  persisting_l2_bytes: 56623104

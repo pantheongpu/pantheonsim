@@ -18,6 +18,7 @@
 #     CUDA C++ Programming Guide's table (64K registers, 1536 threads, 24 blocks,
 #     100 KB shared memory an SM, 99 KB a block), and the whitepaper's 256 KB
 #     register file an SM.
+#   - CUDA attributes (the `cuda:` section and l2_cache_bytes): L2 131072 KB and the 512-bit bus: RTX Blackwell whitepaper; persisting L2 is 3/4 of the L2, nvidia/rtx5090's ratio.
 id: nvidia/rtx-pro-6000
 vendor: nvidia
 model: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
@@ -39,6 +40,7 @@ limits:
   max_blocks_per_sm: 24
   max_registers_per_thread: 255
   shared_mem_per_sm: 102400
+  l2_cache_bytes: 134217728
 features:
   fp16: true
   bf16: true
@@ -57,3 +59,11 @@ telemetry:
   ecc: true                      # "96 GB GDDR7 with ECC" (data sheet)
   memory: gddr
   pcie_link: "Gen5 x16"          # Max-Q data sheet: PCIe 5.0 x16; the whitepaper: Gen 5
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 131072 KB and the 512-bit memory interface: NVIDIA RTX Blackwell whitepaper, Table 1.
+# Persisting L2 is 3/4 of the L2 (100663296), the ratio nvidia/rtx5090 carries (75497472 of
+# 100663296); NVIDIA does not publish it, so this is derived, unverified.
+cuda:
+  memory_bus_width_bits: 512
+  persisting_l2_bytes: 100663296
