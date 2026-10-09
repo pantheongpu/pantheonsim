@@ -2,9 +2,10 @@
 // legacy ones, as libcufft.so answers them.
 //
 // The callbacks are device functions handed over as PTX text -- which
-// NVIDIA's library accepts in place of an LTO-IR fatbin, and which is the
-// form VirtualGPU can run (it executes PTX; LTO-IR is NVVM bitcode, which only
-// NVIDIA's compiler reads). The PTX below is what nvcc -ptx -rdc=true
+// NVIDIA's library accepts in place of an LTO-IR fatbin, and which runs on
+// every VirtualGPU (it executes PTX). LTO-IR proper -- NVVM bitcode, which only
+// NVIDIA's compiler reads -- runs where the host has the CUDA toolkit: see
+// fft_lto_callbacks.cpp. The PTX below is what nvcc -ptx -rdc=true
 // -arch=compute_75 makes of these functions:
 //
 //   cufftComplex ld_scale(void* in, unsigned long long off, void* info, void*)

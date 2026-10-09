@@ -757,6 +757,7 @@ struct Accessor {
   std::vector<int64_t> strides;   // of the amplitudes tensor; empty: default
   int32_t hyper = 0;
   bool prepared = false;
+  bool broken = false;  // a projected value out of range was given: it computes nothing after that
   int64_t need = 0;
   Part amp, norm;
   std::vector<std::unique_ptr<DevBuf>> onehot;
@@ -2754,7 +2755,14 @@ cutensornetStatus_t cutensornetAccessorCompute(const cutensornetHandle_t handle,
   Workspace* w = work_of(workDesc);
   if (!h || !a || !w || !amplitudesTensor) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
   State& s = *a->s;
-  if (Status st = check_values(s, a->proj, projectedModeValues, api)) return st;
+  // RTX 3060, cuTensorNet 2.14: a call with a projected value out of range leaves the accessor
+  // refusing every call after it (INVALID_VALUE, valid arguments included); a NULL list of
+  // values, a NULL output or a NULL workspace do not.
+  if (a->broken) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "an earlier call gave a projected value out of range");
+  if (Status st = check_values(s, a->proj, projectedModeValues, api)) {
+    if (projectedModeValues) a->broken = true;
+    return st;
+  }
   if (Status st = check_scratch(w, 0, api)) return st;
   if (Status st = check_epoch_prepared(s, a->epoch, a->prepared, "Amplitudes Accessor", api)) return st;
   if (Status st = check_scratch(w, a->need, api)) return st;
@@ -3198,9 +3206,15 @@ cutensornetStatus_t cutensornetCreateExpectation(const cutensornetHandle_t handl
   if (Status st = state_args(handle, tensorNetworkState, h, s, api)) return st;
   NetOp* op = netop_of(tensorNetworkOperator);
   if (!op || !tensorNetworkExpectation) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
-  if (op->n != s->n || op->ext != s->ext || op->type != s->type)
-    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the operator does not match the state's modes and data type");
+  // RTX 3060, cuTensorNet 2.14: an operator made for another number of modes, or in another data
+  // type, is accepted -- its terms act on the state modes they name, and the rest of the state
+  // is left alone -- and so is computing with it. Here its terms must name modes of the state,
+  // and a data type other than the state's is refused when the expectation is prepared.
   if (op->comps.empty()) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the operator has no components");
+  for (const NetComponent& comp : op->comps)
+    for (const auto& f : comp.fmodes)
+      for (int32_t m : f)
+        if (m < 0 || m >= s->n) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the operator names a mode the state does not have");
   if (awaits_mps(*s)) return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "cuTensorNet internal error");
   auto e = std::make_unique<Expectation>();
   e->s = s;
@@ -3234,6 +3248,8 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
   if (!w) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid workspace descriptor");
   State& s = *e->s;
   if (s.epoch != e->epoch || e->op->version != e->op_version) return outdated("Expectation value", api);
+  if (e->op->type != s.type)
+    return refuse(api, "an operator in another data type than the state's is not read in its own type here");
   if (Status st = check_channels(s, api)) return st;
   const int64_t extra = 2 * kExtra;
   const uint64_t limit = maxWorkspaceSizeDevice > (uint64_t)extra ? maxWorkspaceSizeDevice - (uint64_t)extra : 0;

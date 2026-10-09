@@ -984,6 +984,12 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   oversampling that fits in min(m, n). Half-precision tensors are legal descriptors and every
   decomposition of them is `INVALID_VALUE`, as on the card; so is a decomposition under stream
   capture, `CUDA_ERROR` rather (a QR also invalidates the capture, an SVD leaves it empty).
+  State API, measured on the card and followed: an accessor that is given a projected
+  value out of range refuses every call after it (a NULL list of values, output or
+  workspace does not), and an expectation of an operator made for another number of
+  modes is accepted and computes; one in another data type than the state's is accepted
+  and then refused when prepared (NOT_SUPPORTED), since NVIDIA's reads the tensors in
+  the operator's own type and this library reads them in the state's.
   Distributed execution needs MPI (the interface plugin is an MPI library) and an MPI launcher;
   `mpirun` does not start a job on the host used here, and there is no card behaviour to
   follow, so it is not attempted. Autotuning has nothing to tune and returns at once; the cache
