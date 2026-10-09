@@ -3,8 +3,8 @@
 // MBAFF, and the card's NVENC refuses field encoding. The streams are checked against ffmpeg and against the card's NVDEC (the
 // transcript in nvidia/tests/e2e/nvcuvid_h264.rtx3060.txt), not against the encoder.
 //
-//   g++-12 -std=c++20 -I nvidia/src nvidia/tests/data/h264/make_paff.cpp nvidia/src/{nvenc_h264_enc,h264_decode,h264_parser,h264_stream}.cpp \
-//       -o /tmp/make_paff && cd nvidia/tests/data/h264 && /tmp/make_paff
+//   g++-12 -std=c++20 -I nvidia/src nvidia/tests/data/h264/make_paff.cpp nvidia/src/{nvenc_h264_enc,h264_decode,h264_parser,h264_stream}.cpp
+//   -o /tmp/make_paff && cd nvidia/tests/data/h264 && /tmp/make_paff
 #include <cstdio>
 #include <fstream>
 #include <iterator>
