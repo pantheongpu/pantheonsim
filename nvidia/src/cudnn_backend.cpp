@@ -33,6 +33,8 @@
 #include "cudnn_common.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -49,9 +51,17 @@
 #include <thread>
 #include <vector>
 
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cuda_runtime.h>
 
 #include "vgpu/runtime/capture.hpp"
+#include "vgpu/telemetry.hpp"
 
 namespace {
 
@@ -958,8 +968,9 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       // per GPU, at most 32, each [num_gpu, 4 * C] floats, zeroed before the
       // run; batch normalization's training forward and its backward only);
       // the words inside are its own protocol, which this library does not
-      // use: it meets the executions in memory instead (peer_exchange), so
-      // they must be threads of one process.
+      // use: it meets the executions in memory (peer_exchange: threads of
+      // one process) or, for tensors that are memory shared between
+      // processes, through files (peer_exchange_files) instead.
       const cudnnBackendAttributeName_t peer_attr =
           fwd ? CUDNN_ATTR_OPERATION_NORM_FWD_PEER_STAT_DESCS : CUDNN_ATTR_OPERATION_NORM_BWD_PEER_STAT_DESCS;
       if (const Attr* ps = d->get(peer_attr)) {
@@ -1873,6 +1884,30 @@ int64_t peer_timeout_ms() {
   return v > 0 ? v : 60000;
 }
 
+// The sum of the participants' vectors, in the order of their bits (a NaN has no order of its own), so that every
+// participant and every run gets the same bits. False if they differ in length.
+bool sum_parts(std::vector<std::vector<double>>* parts, std::vector<double>* sum, std::string* error) {
+  std::sort(parts->begin(), parts->end(), [](const std::vector<double>& a, const std::vector<double>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+      uint64_t x, y;
+      std::memcpy(&x, &a[i], sizeof x);
+      std::memcpy(&y, &b[i], sizeof y);
+      if (x != y) return x < y;
+    }
+    return a.size() < b.size();
+  });
+  sum->assign((*parts)[0].size(), 0.0);
+  for (const std::vector<double>& p : *parts) {
+    if (p.size() != sum->size()) {
+      *error = "the participants' statistics do not have the same shape";
+      return false;
+    }
+    for (size_t i = 0; i < p.size(); ++i) (*sum)[i] += p[i];
+  }
+  return true;
+}
+
 bool peer_exchange(const std::vector<uintptr_t>& group, std::vector<double>* v, std::string* why) {
   std::unique_lock<std::mutex> lk(g_peer_mutex);
   std::shared_ptr<PeerRound>& open = g_peer_open[group];
@@ -1885,22 +1920,7 @@ bool peer_exchange(const std::vector<uintptr_t>& group, std::vector<double>* v, 
                  group.empty() ? nullptr : reinterpret_cast<void*>(group[0]), r->parts.size(), r->expected);
   }
   if (r->parts.size() == r->expected) {
-    // Ordered by the bits of their words (a NaN has no order of its own).
-    std::sort(r->parts.begin(), r->parts.end(), [](const std::vector<double>& a, const std::vector<double>& b) {
-      const size_t n = std::min(a.size(), b.size());
-      for (size_t i = 0; i < n; ++i) {
-        uint64_t x, y;
-        std::memcpy(&x, &a[i], sizeof x);
-        std::memcpy(&y, &b[i], sizeof y);
-        if (x != y) return x < y;
-      }
-      return a.size() < b.size();
-    });
-    r->sum.assign(r->parts[0].size(), 0.0);
-    for (const std::vector<double>& p : r->parts) {
-      if (p.size() != r->sum.size()) r->failed = true, r->error = "the participants' statistics do not have the same shape";
-      else for (size_t i = 0; i < p.size(); ++i) r->sum[i] += p[i];
-    }
+    if (!sum_parts(&r->parts, &r->sum, &r->error)) r->failed = true;
     r->done = true;
     g_peer_open.erase(group);
     g_peer_cv.notify_all();
@@ -1908,7 +1928,7 @@ bool peer_exchange(const std::vector<uintptr_t>& group, std::vector<double>* v, 
     // The round is abandoned for everyone in it.
     r->done = r->failed = true;
     r->error = std::to_string(r->parts.size()) + " of " + std::to_string(r->expected) +
-               " participants arrived (they must be threads of this process, one per peer statistics tensor)";
+               " participants arrived (threads of this process, one per peer statistics tensor, or processes whose tensors are shared memory)";
     auto it = g_peer_open.find(group);
     if (it != g_peer_open.end() && it->second == r) g_peer_open.erase(it);
     g_peer_cv.notify_all();
@@ -1918,6 +1938,203 @@ bool peer_exchange(const std::vector<uintptr_t>& group, std::vector<double>* v, 
     return false;
   }
   *v = r->sum;
+  return true;
+}
+
+// ---- participants in other processes ----
+//
+// A peer statistics tensor that is memory shared between processes -- a file mapped MAP_SHARED, which is what
+// cudaIpcOpenMemHandle gives, and what a program that has pinned a shared mapping (cudaHostRegister) has -- names its
+// group by the file and offset, the same in every process however each maps it. Such a group meets through files
+// in the machine directory instead: a round is a set of files r<k>.<participant>, each holding one participant's
+// vector, written whole and renamed into place. A participant joins the newest round if it is not complete yet,
+// else starts the next, waits for all of the group's files, and sums them as peer_exchange does. A round's files
+// are removed two rounds on, when every participant has certainly read them (a round starts only once the one
+// before it is complete); files of processes that no longer exist are ignored.
+
+// The (device, inode, byte offset) of the file mapping `addr` is in, as a string; empty if it is not in a
+// MAP_SHARED mapping of a file (or of shared memory) -- ordinary memory, which another process cannot see.
+std::string shared_identity(uintptr_t addr) {
+  using HostAddr = void* (*)(const void*, size_t);
+  static const HostAddr host_address = reinterpret_cast<HostAddr>(dlsym(RTLD_DEFAULT, "vgpu_host_address_v1"));
+  uintptr_t host = addr;
+  if (host_address)
+    if (void* h = host_address(reinterpret_cast<const void*>(addr), 1)) host = reinterpret_cast<uintptr_t>(h);
+  FILE* f = std::fopen("/proc/self/maps", "r");
+  if (!f) return {};
+  std::string id;
+  char line[1024];
+  while (std::fgets(line, sizeof line, f)) {
+    unsigned long long lo = 0, hi = 0, off = 0, inode = 0;
+    char perms[8] = {0}, dev[16] = {0};
+    if (std::sscanf(line, "%llx-%llx %7s %llx %15s %llu", &lo, &hi, perms, &off, dev, &inode) != 6) continue;
+    if (host < lo || host >= hi) continue;
+    if (perms[3] == 's' && inode != 0) id = std::string(dev) + ":" + std::to_string(inode) + ":" + std::to_string(off + (host - lo));
+    break;
+  }
+  std::fclose(f);
+  return id;
+}
+
+// The files of round `k` in `dir` that belong to live processes: their names.
+std::vector<std::string> round_files(const std::string& dir, uint64_t k) {
+  std::vector<std::string> out;
+  DIR* d = ::opendir(dir.c_str());
+  if (!d) return out;
+  const std::string prefix = "r" + std::to_string(k) + ".";
+  while (dirent* e = ::readdir(d)) {
+    const std::string n = e->d_name;
+    if (n.compare(0, prefix.size(), prefix) != 0 || n.find(".tmp") != std::string::npos) continue;
+    // r<k>.<pid>.<participant>: a process that is gone left it behind.
+    const long pid = std::atol(n.c_str() + prefix.size());
+    if (pid > 0 && ::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) continue;
+    out.push_back(n);
+  }
+  ::closedir(d);
+  return out;
+}
+
+// The round directories this process used. At exit, a directory whose files all belong to this process or to
+// processes that are gone is removed (the last participant out does it); one a peer still has files in is left,
+// and the next group to start sweeps the leftovers.
+std::mutex g_peer_dirs_mutex;
+std::set<std::string> g_peer_dirs;
+
+bool peer_dir_is_stale(const std::string& dir) {
+  DIR* d = ::opendir(dir.c_str());
+  if (!d) return false;
+  bool stale = true;
+  while (dirent* e = ::readdir(d)) {
+    const std::string n = e->d_name;
+    if (n[0] != 'r' || n.size() < 2 || n[1] < '0' || n[1] > '9') continue;
+    const size_t dot = n.find('.');
+    const long pid = dot == std::string::npos ? 0 : std::atol(n.c_str() + dot + 1);
+    if (pid > 0 && pid != static_cast<long>(::getpid()) && !(::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH)) stale = false;
+  }
+  ::closedir(d);
+  return stale;
+}
+
+void remove_peer_dir(const std::string& dir) {
+  if (DIR* d = ::opendir(dir.c_str())) {
+    std::vector<std::string> names;
+    while (dirent* e = ::readdir(d))
+      if (e->d_name[0] == 'r') names.push_back(e->d_name);
+    ::closedir(d);
+    for (const std::string& n : names) ::unlink((dir + "/" + n).c_str());
+  }
+  ::rmdir(dir.c_str());
+}
+
+void sweep_peer_dirs_at_exit() {
+  std::lock_guard<std::mutex> lk(g_peer_dirs_mutex);
+  for (const std::string& dir : g_peer_dirs)
+    if (peer_dir_is_stale(dir)) remove_peer_dir(dir);
+}
+
+// Leftovers of groups whose processes are all gone.
+void sweep_old_peer_dirs(const std::string& root, const std::string& keep) {
+  DIR* d = ::opendir(root.c_str());
+  if (!d) return;
+  std::vector<std::string> dirs;
+  while (dirent* e = ::readdir(d))
+    if (std::strncmp(e->d_name, "cudnn-peers-", 12) == 0) dirs.push_back(root + "/" + e->d_name);
+  ::closedir(d);
+  for (const std::string& dir : dirs)
+    if (dir != keep && peer_dir_is_stale(dir)) remove_peer_dir(dir);
+}
+
+bool peer_exchange_files(const std::vector<std::string>& ids, std::vector<double>* v, std::string* why) {
+  uint64_t h = 1469598103934665603ull;
+  for (const std::string& s : ids)
+    for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+  char name[64];
+  std::snprintf(name, sizeof name, "/cudnn-peers-%016llx", static_cast<unsigned long long>(h));
+  const std::string dir = vgpu::telemetry::default_path() + name;
+  ::mkdir(vgpu::telemetry::default_path().c_str(), 0700);
+  ::mkdir(dir.c_str(), 0700);
+  {
+    std::lock_guard<std::mutex> lk(g_peer_dirs_mutex);
+    static const bool registered = (std::atexit(sweep_peer_dirs_at_exit), true);
+    (void)registered;
+    if (g_peer_dirs.insert(dir).second) sweep_old_peer_dirs(vgpu::telemetry::default_path(), dir);
+  }
+  const size_t expected = ids.size();
+  static std::atomic<unsigned> seq{0};
+  const std::string who = std::to_string(::getpid()) + "." + std::to_string(seq.fetch_add(1));
+  // The round: the newest one with files, if it is not complete, else the next.
+  uint64_t k = 0;
+  {
+    std::vector<uint64_t> seen;
+    if (DIR* d = ::opendir(dir.c_str())) {
+      while (dirent* e = ::readdir(d))
+        if (e->d_name[0] == 'r' && e->d_name[1] >= '0' && e->d_name[1] <= '9') seen.push_back(std::strtoull(e->d_name + 1, nullptr, 10));
+      ::closedir(d);
+    }
+    for (uint64_t r : seen) k = std::max(k, r);
+    if (!seen.empty() && round_files(dir, k).size() >= expected) ++k;
+  }
+  const std::string mine = "r" + std::to_string(k) + "." + who;
+  {
+    const std::string tmp = dir + "/" + mine + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+      *why = "multi-GPU normalization: cannot write " + tmp;
+      return false;
+    }
+    const uint64_t n = v->size();
+    std::fwrite(&n, sizeof n, 1, f);
+    std::fwrite(v->data(), sizeof(double), v->size(), f);
+    std::fclose(f);
+    ::rename(tmp.c_str(), (dir + "/" + mine).c_str());
+  }
+  if (k >= 2) {
+    DIR* d = ::opendir(dir.c_str());
+    std::vector<std::string> old;
+    if (d) {
+      while (dirent* e = ::readdir(d))
+        if (e->d_name[0] == 'r' && e->d_name[1] >= '0' && e->d_name[1] <= '9' && std::strtoull(e->d_name + 1, nullptr, 10) + 2 <= k) old.push_back(e->d_name);
+      ::closedir(d);
+    }
+    for (const std::string& n : old) ::unlink((dir + "/" + n).c_str());
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(peer_timeout_ms());
+  std::vector<std::string> files;
+  for (;;) {
+    files = round_files(dir, k);
+    if (files.size() >= expected) break;
+    if (std::chrono::steady_clock::now() > deadline) {
+      ::unlink((dir + "/" + mine).c_str());
+      *why = "multi-GPU normalization: " + std::to_string(files.size()) + " of " + std::to_string(expected) +
+             " participants arrived (one process or thread per peer statistics tensor)";
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::vector<std::vector<double>> parts;
+  for (const std::string& n : files) {
+    FILE* f = std::fopen((dir + "/" + n).c_str(), "rb");
+    uint64_t cnt = 0;
+    if (!f || std::fread(&cnt, sizeof cnt, 1, f) != 1) {
+      if (f) std::fclose(f);
+      *why = "multi-GPU normalization: cannot read " + n;
+      return false;
+    }
+    parts.emplace_back(cnt);
+    if (std::fread(parts.back().data(), sizeof(double), cnt, f) != cnt) {
+      std::fclose(f);
+      *why = "multi-GPU normalization: " + n + " is cut short";
+      return false;
+    }
+    std::fclose(f);
+  }
+  std::vector<double> sum;
+  std::string error;
+  if (!sum_parts(&parts, &sum, &error)) {
+    *why = "multi-GPU normalization: " + error;
+    return false;
+  }
+  *v = std::move(sum);
   return true;
 }
 
@@ -2991,7 +3208,18 @@ cudnnStatus_t Runner::run_op(const Op& op) {
         std::sort(group.begin(), group.end());
         if (std::adjacent_find(group.begin(), group.end()) != group.end())
           return vc::fail(CUDNN_STATUS_BAD_PARAM, fn, "multi-GPU normalization: two peer statistics tensors are one buffer");
-        exchange = [&group, &why](std::vector<double>* v) { return peer_exchange(group, v, &why); };
+        // Peers in other processes: every tensor is memory shared through a file.
+        std::vector<std::string> ids;
+        for (uintptr_t a : group) ids.push_back(shared_identity(a));
+        const bool across = std::none_of(ids.begin(), ids.end(), [](const std::string& i) { return i.empty(); });
+        if (across) {
+          std::sort(ids.begin(), ids.end());
+          if (std::adjacent_find(ids.begin(), ids.end()) != ids.end())
+            return vc::fail(CUDNN_STATUS_BAD_PARAM, fn, "multi-GPU normalization: two peer statistics tensors are one buffer");
+          exchange = [ids, &why](std::vector<double>* v) { return peer_exchange_files(ids, v, &why); };
+        } else {
+          exchange = [&group, &why](std::vector<double>* v) { return peer_exchange(group, v, &why); };
+        }
       }
       if (!run_norm(op, in, &outs, exchange)) {
         if (!vc::quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", fn, why.c_str());

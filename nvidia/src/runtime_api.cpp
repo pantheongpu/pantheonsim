@@ -7168,6 +7168,21 @@ extern "C" __attribute__((visibility("default"))) int vgpu_capture_unsafe_gate_v
   return capture_unsafe_gate(api ? api : "a driver call") != cudaSuccess ? 1 : 0;
 }
 
+// vgpu_host_address_v1: the host address behind a device pointer into memory that is also host memory -- shared
+// with another process (cudaIpcGetMemHandle / cudaIpcOpenMemHandle), managed, or pinned and registered.
+// nullptr for ordinary device memory. cuDNN's multi-GPU normalization asks, to tell which file-backed memory
+// its peer statistics tensors are, and so which processes make up the group.
+extern "C" __attribute__((visibility("default"))) void* vgpu_host_address_v1(const void* p, size_t len) {
+  void* out = nullptr;
+  guard("vgpu_host_address", [&](State& s) -> cudaError_t {
+    const auto addr = reinterpret_cast<uint64_t>(p);
+    for (int d = 0; d < s.rt->device_count() && !out; ++d)
+      out = s.rt->device(d).memory().host_address(addr, len ? len : 1);
+    return cudaSuccess;
+  });
+  return out;
+}
+
 void vgpu_drop_capture(cudaStream_t stream) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   StreamCapture* sc = stream_capture(stream);

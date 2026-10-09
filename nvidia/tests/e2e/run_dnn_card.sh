@@ -27,7 +27,7 @@ lib="$cuda_root/lib64"
 [[ -d "$lib" ]] || lib="$cuda_root/targets/x86_64-linux/lib"
 trap 'rm -f "$out"' EXIT
 nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets -Xcompiler -Wno-deprecated-declarations \
-     -I"$cudnn_inc" -I"$fe" "$src" -o "$out" -L"$lib" -ldl
+     -I"$cudnn_inc" -I"$fe" "$src" -o "$out" -L"$lib" -L"$cudnn_lib" -l:libcudnn.so.9 -ldl
 result="$(LD_LIBRARY_PATH="$cudnn_lib:$lib" "$out" 2>&1 || true)"
 echo "$result"
 [[ "$(tail -1 <<< "$result")" == SKIP:* ]] && exit 0
