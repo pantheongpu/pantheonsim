@@ -2211,6 +2211,44 @@ struct Machine {
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         w.vgpr[in.dst[0].index][lane] = op == "v_fma_mixlo_bf16"_op ? (was & 0xFFFF0000u) | bits : (was & 0x0000FFFFu) | bits << 16;
       });
+    } else if (op == "v_cubeid_f32"_op || op == "v_cubesc_f32"_op || op == "v_cubetc_f32"_op || op == "v_cubema_f32"_op) {
+      // The cube-face instructions, as the ISA has them: the face a direction (x, y, z) points at, a coordinate on it, and
+      // twice the major axis.
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane), z = lane_float(w, in.src[2], lane);
+        const bool z_major = std::fabs(z) >= std::fabs(x) && std::fabs(z) >= std::fabs(y), y_major = !z_major && std::fabs(y) >= std::fabs(x);
+        float r;
+        if (op == "v_cubeid_f32"_op) r = z_major ? (z < 0 ? 5.0f : 4.0f) : y_major ? (y < 0 ? 3.0f : 2.0f) : (x < 0 ? 1.0f : 0.0f);
+        else if (op == "v_cubesc_f32"_op) r = z_major ? (z < 0 ? -x : x) : y_major ? x : (x < 0 ? z : -z);
+        else if (op == "v_cubetc_f32"_op) r = z_major ? -y : y_major ? (y < 0 ? -z : z) : -y;
+        else r = (z_major ? z : y_major ? y : x) * 2.0f;
+        write_float(w, in, lane, r);
+      });
+    } else if (op == "v_perm_pk16_b4_u4"_op || op == "v_perm_pk16_b6_u4"_op || op == "v_perm_pk16_b8_u4"_op) {
+      // Sixteen lookups in a table of sixteen 4-, 6- or 8-bit entries, each by a 4-bit index of the third source's 64: the
+      // table is the first source over the second (the first the more significant), and the result 16 entries wide.
+      const uint32_t width = op == "v_perm_pk16_b4_u4"_op ? 4 : op == "v_perm_pk16_b6_u4"_op ? 6 : 8;
+      each([&](uint32_t lane) {
+        uint32_t table[4] = {}, result[4] = {};
+        if (width == 4) {
+          table[0] = u(1, lane);
+          table[1] = u(0, lane);
+        } else if (width == 6) {
+          const uint64_t lo = u64(1, lane);
+          table[0] = static_cast<uint32_t>(lo), table[1] = static_cast<uint32_t>(lo >> 32), table[2] = u(0, lane);
+        } else {
+          const uint64_t lo = u64(1, lane), hi = u64(0, lane);
+          table[0] = static_cast<uint32_t>(lo), table[1] = static_cast<uint32_t>(lo >> 32);
+          table[2] = static_cast<uint32_t>(hi), table[3] = static_cast<uint32_t>(hi >> 32);
+        }
+        const uint64_t index = u64(2, lane);
+        const auto bit = [](const uint32_t* v, uint32_t pos) { return (v[pos / 32] >> (pos % 32)) & 1u; };
+        for (uint32_t i = 0; i < 16; ++i) {
+          const uint32_t from = static_cast<uint32_t>((index >> (4 * i)) & 15) * width;
+          for (uint32_t b = 0; b < width; ++b) result[(i * width + b) / 32] |= bit(table, from + b) << ((i * width + b) % 32);
+        }
+        for (uint32_t k = 0; k < width / 2; ++k) set_word(w, in.dst[0], k, lane, result[k]);
+      });
     } else {
       return false;
     }

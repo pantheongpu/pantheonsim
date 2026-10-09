@@ -131,6 +131,31 @@ V2(k_cvt_sr_bf8_f16, "v_cvt_sr_bf8_f16 %0, %1, %2")
 V3(k_cvt_sr_pk_bf16_f32, "v_cvt_sr_pk_bf16_f32 %0, %1, %2, %3")
 V3(k_cvt_sr_pk_f16_f32, "v_cvt_sr_pk_f16_f32 %0, %1, %2, %3")
 
+V3(k_cubeid_f32, "v_cubeid_f32 %0, %1, %2, %3")
+V3(k_cubesc_f32, "v_cubesc_f32 %0, %1, %2, %3")
+V3(k_cubetc_f32, "v_cubetc_f32 %0, %1, %2, %3")
+V3(k_cubema_f32, "v_cubema_f32 %0, %1, %2, %3")
+
+typedef uint32_t u32x3 __attribute__((ext_vector_type(3)));
+typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+// The lookup-table permutes: a table in the first two sources, sixteen 4-bit indices in the third (a pair of registers).
+__global__ void k_perm_pk16(const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t* o) {
+  const int i = blockIdx.x * 32 + threadIdx.x;
+  const uint32_t lo = a[i], hi = b[i];
+  const uint64_t pair0 = uint64_t{a[i]} | uint64_t{b[i]} << 32, pair1 = uint64_t{c[i]} | uint64_t{a[(i + 5) % 512]} << 32,
+                 idx = uint64_t{c[(i + 3) % 512]} | uint64_t{b[(i + 9) % 512]} << 32;
+  uint64_t r4;
+  u32x3 r6;
+  u32x4 r8;
+  asm volatile("v_perm_pk16_b4_u4 %0, %1, %2, %3" : "=v"(r4) : "v"(lo), "v"(hi), "v"(idx));
+  asm volatile("v_perm_pk16_b6_u4 %0, %1, %2, %3" : "=v"(r6) : "v"(lo), "v"(pair1), "v"(idx));
+  asm volatile("v_perm_pk16_b8_u4 %0, %1, %2, %3" : "=v"(r8) : "v"(pair0), "v"(pair1), "v"(idx));
+  o[i] = static_cast<uint32_t>(r4);
+  o[i + 512] = static_cast<uint32_t>(r4 >> 32);
+  for (int k = 0; k < 3; ++k) o[i + 1024 + 512 * k] = r6[k];
+  for (int k = 0; k < 4; ++k) o[i + 2560 + 512 * k] = r8[k];
+}
+
 // Doubles, in pairs of the 32-bit arrays (a: low words, b: high words of x; c, d of y -- here passed as a, b and c, o2).
 __global__ void k_f64(const uint32_t* xlo, const uint32_t* xhi, const uint32_t* ylo, uint32_t* o) {
   const int i = blockIdx.x * 32 + threadIdx.x;
@@ -710,6 +735,63 @@ int main() {
     run3("v_cvt_sr_pk_f16_f32", k_cvt_sr_pk_f16_f32, A2, B2, Z, [](uint32_t a, uint32_t b, uint32_t seed) {
       return uint32_t{f2h(bf(a + (seed & 0xFFFF)))} | uint32_t{f2h(bf(b + (seed >> 16)))} << 16;
     }, 32, false, false, &failed);
+  }
+
+  // --- cube faces ---
+  {
+    const auto cube = [](const char* what, uint32_t a, uint32_t b, uint32_t c) -> uint32_t {
+      const float x = bf(a), y = bf(b), z = bf(c);
+      const bool zm = std::fabs(z) >= std::fabs(x) && std::fabs(z) >= std::fabs(y), ym = std::fabs(y) >= std::fabs(x);
+      const std::string w = what;
+      if (w == "id") return fb(zm ? (z < 0 ? 5.f : 4.f) : ym ? (y < 0 ? 3.f : 2.f) : (x < 0 ? 1.f : 0.f));
+      if (w == "sc") return fb(zm ? (z < 0 ? -x : x) : ym ? x : (x < 0 ? z : -z));
+      if (w == "tc") return fb(zm ? -y : ym ? (y < 0 ? -z : z) : -y);
+      return fb((zm ? z : ym ? y : x) * 2.0f);
+    };
+    std::vector<uint32_t> X(N), Y(N), Z(N);
+    for (int i = 0; i < N; ++i) X[i] = fb((static_cast<int>(rnd32() % 41) - 20) / 4.0f), Y[i] = fb((static_cast<int>(rnd32() % 41) - 20) / 4.0f), Z[i] = fb((static_cast<int>(rnd32() % 41) - 20) / 4.0f);
+    run3("v_cubeid_f32", k_cubeid_f32, X, Y, Z, [&](uint32_t a, uint32_t b, uint32_t c) { return cube("id", a, b, c); }, 32, false, false, &failed);
+    run3("v_cubesc_f32", k_cubesc_f32, X, Y, Z, [&](uint32_t a, uint32_t b, uint32_t c) { return cube("sc", a, b, c); }, 32, false, false, &failed);
+    run3("v_cubetc_f32", k_cubetc_f32, X, Y, Z, [&](uint32_t a, uint32_t b, uint32_t c) { return cube("tc", a, b, c); }, 32, false, false, &failed);
+    run3("v_cubema_f32", k_cubema_f32, X, Y, Z, [&](uint32_t a, uint32_t b, uint32_t c) { return cube("ma", a, b, c); }, 32, false, false, &failed);
+  }
+
+  // --- the lookup-table permutes ---
+  {
+    std::vector<uint32_t> A(N), B(N), C(N);
+    for (int i = 0; i < N; ++i) A[i] = rnd32(), B[i] = rnd32(), C[i] = rnd32();
+    uint32_t* a = up(A);
+    uint32_t* b = up(B);
+    uint32_t* c = up(C);
+    uint32_t* o = nullptr;
+    CHECK(hipMalloc(&o, 4608 * 4));
+    k_perm_pk16<<<N / 32, 32>>>(a, b, c, o);
+    CHECK(hipDeviceSynchronize());
+    std::vector<uint32_t> out(4608);
+    CHECK(hipMemcpy(out.data(), o, 4608 * 4, hipMemcpyDeviceToHost));
+    int w4 = 0, w6 = 0, w8 = 0;
+    for (int i = 0; i < N; ++i) {
+      const uint32_t lo = A[i], hi = B[i];
+      const uint64_t pair0 = uint64_t{A[i]} | uint64_t{B[i]} << 32, pair1 = uint64_t{C[i]} | uint64_t{A[(i + 5) % 512]} << 32,
+                     idx = uint64_t{C[(i + 3) % 512]} | uint64_t{B[(i + 9) % 512]} << 32;
+      // table as one wide number, the first source on top
+      const unsigned __int128 t4 = (static_cast<unsigned __int128>(lo) << 32) | hi;
+      const unsigned __int128 t6 = (static_cast<unsigned __int128>(lo) << 64) | pair1;
+      const unsigned __int128 t8 = (static_cast<unsigned __int128>(pair0) << 64) | pair1;
+      unsigned __int128 r4 = 0, r6 = 0, r8 = 0;
+      for (int k = 0; k < 16; ++k) {
+        const int n = static_cast<int>((idx >> (4 * k)) & 15);
+        r4 |= ((t4 >> (4 * n)) & 0xF) << (4 * k);
+        r6 |= ((t6 >> (6 * n)) & 0x3F) << (6 * k);
+        r8 |= ((t8 >> (8 * n)) & 0xFF) << (8 * k);
+      }
+      w4 += out[i] != static_cast<uint32_t>(r4) || out[i + 512] != static_cast<uint32_t>(r4 >> 32);
+      for (int k = 0; k < 3; ++k) w6 += out[i + 1024 + 512 * k] != static_cast<uint32_t>(r6 >> (32 * k));
+      for (int k = 0; k < 4; ++k) w8 += out[i + 2560 + 512 * k] != static_cast<uint32_t>(r8 >> (32 * k));
+    }
+    report("v_perm_pk16_b4_u4", w4, N, &failed);
+    report("v_perm_pk16_b6_u4", w6, N, &failed);
+    report("v_perm_pk16_b8_u4", w8, N, &failed);
   }
 
   // --- doubles ---

@@ -415,6 +415,8 @@ false` throughout. gfx1251 (MI430X) is not covered.
   the bits through the MODE register). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
 - **DPP8** (all eight selects, with and without `fi`, on the VALU and compare instructions) and DPP on the compares, which
   were refused.
+- **Cube faces and lookup-table permutes:** `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32`, `v_cubema_f32`, and
+  `v_perm_pk16_b{4,6,8}_u4` (sixteen lookups, by 4-bit indices, in a table of sixteen 4-, 6- or 8-bit entries).
 - **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic
   `v_cvt_sr_{fp8,bf8}_f16` (the seed's top bits added to the half's mantissa, as the ISA's pseudocode has it),
   `v_cvt_sr_pk_{bf16,f16}_f32` and `v_fma_mix{,lo,hi}_bf16`.
@@ -428,8 +430,9 @@ false` throughout. gfx1251 (MI430X) is not covered.
   mask in M0; a scaled offset is refused) and the **cluster loads** (`cluster_load_b{32,64,128}` and `cluster_load_async_to_lds_*`,
   run as the global loads they downgrade to outside a cluster; `tests/hipcc/block1250.cpp`).
 - **Decoded and printed, but refused when executed:** the 6- and 4-bit transposed loads
-  (`*_load_tr6_*`, `*_load_tr4_*`); `v_perm_pk16_*` and the `v_cvt_scale*` family (the ISA's pseudocode calls scaling
-  helpers it does not define); the cube-face instructions and a few more. Each says so by name when a kernel reaches it. The
+  (`*_load_tr6_*`, `*_load_tr4_*`); the `v_cvt_scale*` and `v_cvt_scalef32*` families (the ISA's pseudocode calls scaling
+  helpers it does not define); a few DS atomics (`ds_condsub`, `ds_clampsub`, `ds_pk_add`, the LDS barrier arrives). Each says so by name
+  when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes
   0x37/0xBD (32-bit scales) and 0x3B/0xBA (64-bit), which are also ordinary opcodes in the same XML (0x37 is
