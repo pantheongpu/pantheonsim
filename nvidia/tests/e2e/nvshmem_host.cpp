@@ -261,7 +261,7 @@ static int pe_main(int rank, int npes, nvshmemx_uniqueid_t* id) {
       check(nvshmem_uint_atomic_fetch_and(bits, 0x0ff00ff0u, 0) == 0xff00ff00u, "fetch_and returns the old value");
       nvshmem_uint_atomic_or(bits, 0x1u, 0);
       nvshmem_uint_atomic_xor(bits, 0x8u, 0);
-      check(nvshmem_uint_atomic_fetch(bits, 0) == ((0xff00ff00u & 0x0ff00ff0u) | 1u) ^ 8u, "and, or, xor");
+      check(nvshmem_uint_atomic_fetch(bits, 0) == ((((0xff00ff00u & 0x0ff00ff0u) | 1u) ^ 8u)), "and, or, xor");
     }
     // floating point and half precision
     nvshmem_barrier_all();
