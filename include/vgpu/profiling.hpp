@@ -147,6 +147,10 @@ struct ApiInfo {
   uint32_t correlation = 0;
   const void* const* args = nullptr;   // pointers to the caller's arguments; null if not captured
   int nargs = 0;
+  // sizeof each argument as the shim declares it, where the caller said (null
+  // otherwise). A front end that copies an argument into a field of a size the
+  // toolkit names checks the two agree before it reads the bytes.
+  const uint16_t* arg_sizes = nullptr;
   const char* symbol = nullptr;        // a kernel launch: the kernel's name
   int32_t result = 0;                  // on exit
   // On exit, the call's return value where it is not a status code (a string, a
@@ -209,7 +213,7 @@ uint64_t host_ns();
 // The arguments of the call about to be made: pointers to its parameters, in
 // declaration order. Taken by the next ApiCall on this thread. Costs nothing
 // when nobody listens.
-void note_args(const void* const* args, int n);
+void note_args(const void* const* args, int n, const uint16_t* sizes = nullptr);
 void note_symbol(const char* name);
 
 // External correlation ids: a framework tags the work it is about to issue
@@ -322,7 +326,9 @@ class ApiCall {
   bool outermost_ = false;       // a call made through another public call is not a call of its own
   bool hooked_ = false;
   const void* saved_[16] = {};
+  uint16_t saved_sizes_[16] = {};
   const void* const* args_ = nullptr;
+  const uint16_t* sizes_ = nullptr;
   int nargs_ = 0;
   const char* symbol_ = nullptr;
   uint32_t correlation_ = 0, outer_ = 0;

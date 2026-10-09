@@ -54,11 +54,17 @@ def main(meta_path, cbid_path, out_path):
             copies = " ".join(
                 f"std::memcpy(&p->{f}, a[{i}], sizeof p->{f});" for i, f in enumerate(fields)
             )
+            # The arguments the runtime passes are checked against the sizes of
+            # the toolkit's fields before they are read as those fields.
+            checks = " && ".join(
+                f"z[{i}] == sizeof(std::declval<{key}_params&>().{f})" for i, f in enumerate(fields)
+            )
             rows.append(
                 f'{{"{fn}", Conv{{CUPTI_RUNTIME_TRACE_CBID_{key}, '
                 f"[](void* st, const void* const* a) {{ auto* p = new (st) {key}_params(); "
                 f"static_assert(sizeof({key}_params) <= 512, \"parameter structure too large\"); "
-                f"{copies if copies else '(void)a;'} }}, {len(fields)}}}}},"
+                f"{copies if copies else '(void)a;'} }}, {len(fields)}, "
+                f"[](const uint16_t* z) {{ return {checks if checks else '(void)z, true'}; }}}}}},"
             )
         else:
             # No structure: the function takes no arguments.

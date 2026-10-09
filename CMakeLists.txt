@@ -500,6 +500,23 @@ if(CUDA_ABI_INCLUDE)
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_conv_inc}.tmp" "${_conv_inc}")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
                "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py")
+  # The driver calls' parameter structures, from generated_cuda_meta.h the same
+  # way (scripts/gen_cupti_driver_conv.py).
+  set(_dconv_inc "${CMAKE_BINARY_DIR}/gen/cupti_driver_conv.inc")
+  if(VGPU_PYTHON AND EXISTS "${CUDA_ABI_INCLUDE}/generated_cuda_meta.h" AND EXISTS "${_dcbid_header}")
+    execute_process(
+      COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_driver_conv.py"
+              "${CUDA_ABI_INCLUDE}/generated_cuda_meta.h" "${_dcbid_header}" "${_dconv_inc}.tmp"
+      RESULT_VARIABLE _dconv_rc)
+    if(NOT _dconv_rc EQUAL 0)
+      file(WRITE "${_dconv_inc}.tmp" "")
+    endif()
+  else()
+    file(WRITE "${_dconv_inc}.tmp" "")
+  endif()
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dconv_inc}.tmp" "${_dconv_inc}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_driver_conv.py")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -2357,7 +2374,7 @@ if(TARGET vgpucupti)
   # allocation and pool records, graphs, modules and streams, and the switches
   # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
   # an RTX 3060 (nvidia/docs/cupti.md).
-  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um)
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um compat12)
     add_test(NAME e2e_cupti_${_case}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
     set_tests_properties(e2e_cupti_${_case} PROPERTIES

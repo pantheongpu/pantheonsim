@@ -1556,6 +1556,9 @@ struct Conv {
   CUpti_CallbackId cbid;
   void (*fill)(void* storage, const void* const* a);   // null: the call has no parameters
   int nargs = -1;   // how many arguments the structure is made from, where that is checked
+  // Whether the arguments the shim declares are the sizes of the fields the
+  // toolkit names (null: not checked, for the rows made by hand against a card).
+  bool (*sizes_ok)(const uint16_t* sizes) = nullptr;
 };
 
 template <class T>
@@ -1744,6 +1747,30 @@ const std::unordered_map<std::string, Conv>& driver_conversions() {
 #undef DCONV
 #undef DCONV0
 
+/* Every other driver function whose parameter structure the toolkit defines is
+   converted by rows made from its own generated_cuda_meta.h at configure time
+   (scripts/gen_cupti_driver_conv.py), as the runtime's are. The functions that
+   take no arguments, which that header gives no structure, are listed here. A
+   row checks that the shim declares the function with arguments of the sizes the
+   toolkit's fields have. The rows above, which are checked against an RTX 3060,
+   win. */
+const GeneratedConv kGeneratedDriverConversions[] = {
+#include "cupti_driver_conv.inc"
+};
+
+const std::unordered_map<std::string, Conv>& all_driver_conversions() {
+  static const std::unordered_map<std::string, Conv> table = [] {
+    std::unordered_map<std::string, Conv> t = driver_conversions();
+    for (const auto& g : kGeneratedDriverConversions) t.emplace(g.fn, g.conv);
+    for (const char* no_args : {"cuProfilerStart", "cuProfilerStop"}) {
+      const CUpti_CallbackId id = driver_cbid(no_args);
+      if (id != CUPTI_DRIVER_TRACE_CBID_INVALID) t.emplace(no_args, Conv{id, nullptr, 0});
+    }
+    return t;
+  }();
+  return table;
+}
+
 std::mutex g_cb_mu;
 CUpti_CallbackFunc g_cb_fn = nullptr;
 void* g_cb_user = nullptr;
@@ -1778,7 +1805,7 @@ thread_local uint64_t t_correlation_data = 0;   // the subscriber's, from entry 
 
 void on_api(const vgpu::profiling::ApiInfo& info) {
   const bool driver = info.domain == vgpu::profiling::Domain::Driver;
-  const auto& table = driver ? driver_conversions() : all_conversions();
+  const auto& table = driver ? all_driver_conversions() : all_conversions();
   // CUPTI calls cudaLaunchKernelEx by the C entry point it goes through.
   const std::string name = (!driver && std::strcmp(info.name, "cudaLaunchKernelEx") == 0) ? "cudaLaunchKernelExC" : info.name;
   const auto it = table.find(name);
@@ -1789,6 +1816,13 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   // them there is nothing true to put in it.
   if (conv.fill && !info.args) return;
   if (conv.nargs >= 0 && info.nargs != conv.nargs) return;
+  // A field is filled from the argument's bytes, so a field the toolkit makes
+  // of another size than the argument is not delivered rather than filled from
+  // the wrong bytes.
+  if (conv.sizes_ok && (!info.arg_sizes || !conv.sizes_ok(info.arg_sizes))) {
+    CUPTI_TRACE("%s not delivered to callbacks: an argument is not the size of the toolkit's field", info.name);
+    return;
+  }
   CUpti_CallbackFunc fn = nullptr;
   void* user = nullptr;
   if (!cb_enabled(domain, conv.cbid, &fn, &user)) return;

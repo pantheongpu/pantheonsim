@@ -1,0 +1,71 @@
+CB cudaGraphCreate [cudaGraphCreate_v10000] ENTER
+CB cudaGraphCreate [cudaGraphCreate_v10000] EXIT ret=0
+CB cudaGraphAddEmptyNode [cudaGraphAddEmptyNode_v10000] ENTER
+CB cudaGraphAddEmptyNode [cudaGraphAddEmptyNode_v10000] EXIT ret=0
+CB cudaGraphAddEmptyNode [cudaGraphAddEmptyNode_v10000] ENTER
+CB cudaGraphAddEmptyNode [cudaGraphAddEmptyNode_v10000] EXIT ret=0
+CB cudaGraphAddDependencies_v2 [cudaGraphAddDependencies_v2_v12030] ENTER graph=set from=set to=set edgeData=null numDependencies=1
+CB cudaGraphAddDependencies_v2 [cudaGraphAddDependencies_v2_v12030] EXIT ret=0
+CB cudaGraphGetEdges_v2 [cudaGraphGetEdges_v2_v12030] ENTER graph=set from=null to=null edgeData=null numEdges=set
+CB cudaGraphGetEdges_v2 [cudaGraphGetEdges_v2_v12030] EXIT ret=0
+CB cudaGraphGetEdges_v2 [cudaGraphGetEdges_v2_v12030] ENTER graph=set from=set to=set edgeData=set numEdges=set
+CB cudaGraphGetEdges_v2 [cudaGraphGetEdges_v2_v12030] EXIT ret=0
+CB cudaGraphNodeGetDependencies_v2 [cudaGraphNodeGetDependencies_v2_v12030] ENTER node=set pDependencies=null edgeData=null pNumDependencies=set
+CB cudaGraphNodeGetDependencies_v2 [cudaGraphNodeGetDependencies_v2_v12030] EXIT ret=0
+CB cudaGraphNodeGetDependentNodes_v2 [cudaGraphNodeGetDependentNodes_v2_v12030] ENTER node=set pDependentNodes=null edgeData=null pNumDependentNodes=set
+CB cudaGraphNodeGetDependentNodes_v2 [cudaGraphNodeGetDependentNodes_v2_v12030] EXIT ret=0
+CB cudaGraphAddNode_v2 [cudaGraphAddNode_v2_v12030] ENTER pGraphNode=set graph=set pDependencies=set dependencyData=null numDependencies=1 nodeParams=set
+CB cudaGraphAddNode_v2 [cudaGraphAddNode_v2_v12030] EXIT ret=0
+CB cudaGraphRemoveDependencies_v2 [cudaGraphRemoveDependencies_v2_v12030] ENTER graph=set from=set to=set edgeData=null numDependencies=1
+CB cudaGraphRemoveDependencies_v2 [cudaGraphRemoveDependencies_v2_v12030] EXIT ret=0
+CB cudaGraphDestroy [cudaGraphDestroy_v10000] ENTER
+CB cudaGraphDestroy [cudaGraphDestroy_v10000] EXIT ret=0
+CB cudaStreamCreate [cudaStreamCreate_v3020] ENTER
+CB cudaStreamCreate [cudaStreamCreate_v3020] EXIT ret=0
+CB cudaStreamBeginCapture [cudaStreamBeginCapture_v10000] ENTER
+CB cudaStreamBeginCapture [cudaStreamBeginCapture_v10000] EXIT ret=0
+CB cudaStreamGetCaptureInfo_v3 [cudaStreamGetCaptureInfo_v3_v12030] ENTER stream=set captureStatus_out=set id_out=set graph_out=set dependencies_out=set edgeData_out=set numDependencies_out=set
+CB cudaStreamGetCaptureInfo_v3 [cudaStreamGetCaptureInfo_v3_v12030] EXIT ret=0
+CB cudaStreamGetCaptureInfo_v2 [cudaStreamGetCaptureInfo_v2_v11030] ENTER stream=set captureStatus_out=set id_out=set graph_out=set dependencies_out=set numDependencies_out=set
+CB cudaStreamGetCaptureInfo_v2 [cudaStreamGetCaptureInfo_v2_v11030] EXIT ret=0
+CB cudaStreamUpdateCaptureDependencies_v2 [cudaStreamUpdateCaptureDependencies_v2_v12030] ENTER stream=set dependencies=null dependencyData=null numDependencies=0 flags=0
+CB cudaStreamUpdateCaptureDependencies_v2 [cudaStreamUpdateCaptureDependencies_v2_v12030] EXIT ret=0
+CB cudaStreamUpdateCaptureDependencies [cudaStreamUpdateCaptureDependencies_v11030] ENTER stream=set dependencies=null numDependencies=0 flags=0
+CB cudaStreamUpdateCaptureDependencies [cudaStreamUpdateCaptureDependencies_v11030] EXIT ret=0
+CB cudaStreamEndCapture [cudaStreamEndCapture_v10000] ENTER
+CB cudaStreamEndCapture [cudaStreamEndCapture_v10000] EXIT ret=0
+CB cudaGraphDestroy [cudaGraphDestroy_v10000] ENTER
+CB cudaGraphDestroy [cudaGraphDestroy_v10000] EXIT ret=0
+CB cudaMallocManaged [cudaMallocManaged_v6000] ENTER
+CB cudaMallocManaged [cudaMallocManaged_v6000] EXIT ret=0
+CB cudaMemAdvise_v2 [cudaMemAdvise_v2_v12020] ENTER devPtr=set count=4096 advice=1 location=<8 bytes>
+CB cudaMemAdvise_v2 [cudaMemAdvise_v2_v12020] EXIT ret=0
+CB cudaMemPrefetchAsync_v2 [cudaMemPrefetchAsync_v2_v12020] ENTER devPtr=set count=4096 location=<8 bytes> flags=0 stream=set
+CB cudaMemPrefetchAsync_v2 [cudaMemPrefetchAsync_v2_v12020] EXIT ret=1
+CB cudaFree [cudaFree_v3020] ENTER
+CB cudaFree [cudaFree_v3020] EXIT ret=0
+CB cudaEventCreate [cudaEventCreate_v3020] ENTER
+CB cudaEventCreate [cudaEventCreate_v3020] EXIT ret=0
+CB cudaEventCreate [cudaEventCreate_v3020] ENTER
+CB cudaEventCreate [cudaEventCreate_v3020] EXIT ret=0
+CB cudaEventRecord [cudaEventRecord_v3020] ENTER
+CB cudaEventRecord [cudaEventRecord_v3020] EXIT ret=0
+CB cudaEventRecord [cudaEventRecord_v3020] ENTER
+CB cudaEventRecord [cudaEventRecord_v3020] EXIT ret=0
+CB cudaStreamSynchronize [cudaStreamSynchronize_v3020] ENTER
+CB cudaStreamSynchronize [cudaStreamSynchronize_v3020] EXIT ret=0
+CB cudaEventElapsedTime [cudaEventElapsedTime_v3020] ENTER
+CB cudaEventElapsedTime [cudaEventElapsedTime_v3020] EXIT ret=0
+CB cudaEventElapsedTime_v2 [cudaEventElapsedTime_v2_v12080] ENTER ms=set start=set end=set
+CB cudaEventElapsedTime_v2 [cudaEventElapsedTime_v2_v12080] EXIT ret=0
+CB cudaEventDestroy [cudaEventDestroy_v3020] ENTER
+CB cudaEventDestroy [cudaEventDestroy_v3020] EXIT ret=0
+CB cudaEventDestroy [cudaEventDestroy_v3020] ENTER
+CB cudaEventDestroy [cudaEventDestroy_v3020] EXIT ret=0
+CB cudaStreamDestroy [cudaStreamDestroy_v5050] ENTER
+CB cudaStreamDestroy [cudaStreamDestroy_v5050] EXIT ret=0
+CB cudaGetDeviceProperties_v2 [cudaGetDeviceProperties_v2_v12000] ENTER prop=set device=0
+CB cudaGetDeviceProperties_v2 [cudaGetDeviceProperties_v2_v12000] EXIT ret=0
+CB cudaGetDeviceProperties_v2 [cudaGetDeviceProperties_v2_v12000] ENTER prop=set device=0
+CB cudaGetDeviceProperties_v2 [cudaGetDeviceProperties_v2_v12000] EXIT ret=0
+# end
