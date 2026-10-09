@@ -121,6 +121,8 @@ V3(k_pk_min3_i16, "v_pk_min3_i16 %0, %1, %2, %3")
 V3(k_pk_min3_u16, "v_pk_min3_u16 %0, %1, %2, %3")
 
 V3(k_fma_mix_f32_bf16, "v_fma_mix_f32_bf16 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,1]")
+V3(k_fma_mix_f32_bf16_neg, "v_fma_mix_f32_bf16 %0, %1, %2, -%3 op_sel:[1,0,0] op_sel_hi:[1,0,0]")
+V3(k_fma_mix_f32_bf16_abs, "v_fma_mix_f32_bf16 %0, |%1|, %2, |%3| op_sel:[1,0,0] op_sel_hi:[1,0,1]")
 V3(k_fma_mixlo_bf16, "v_fma_mixlo_bf16 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,1]")
 V3(k_fma_mixhi_bf16, "v_fma_mixhi_bf16 %0, %1, %2, %3 op_sel:[1,0,0] op_sel_hi:[1,0,1]")
 V1(k_cvt_pk_fp8_f16, "v_cvt_pk_fp8_f16 %0, %1")
@@ -162,6 +164,22 @@ __global__ void k_swap_b32(const uint32_t* a, const uint32_t* b, const uint32_t*
   asm volatile("v_swap_b32 %0, %1" : "+v"(x), "+v"(y));
   o[i] = x;
   o[i + 512] = y;
+}
+
+// v_fmamk_f64 and v_fmaak_f64: a 64-bit constant in the instruction stream. The first takes 2.0 (the high half of the double
+// alone, as the assembler writes it) and the second a constant with a low half too.
+__global__ void k_fma_k64(const uint32_t* xlo, const uint32_t* xhi, const uint32_t* ylo, uint32_t* o) {
+  const int i = blockIdx.x * 32 + threadIdx.x;
+  const uint64_t x = uint64_t{xlo[i]} | uint64_t{xhi[i]} << 32, y = uint64_t{ylo[i]} | uint64_t{ylo[i + 512]} << 32;
+  uint64_t mk, ak, mk2, ak2;
+  asm volatile("v_fmamk_f64 %0, %1, 0x40000000, %2" : "=v"(mk) : "v"(x), "v"(y));
+  asm volatile("v_fmaak_f64 %0, %1, %2, 0x40080000" : "=v"(ak) : "v"(x), "v"(y));
+  asm volatile("v_fmamk_f64 %0, %1, lit64(0x3ff0000000000001), %2" : "=v"(mk2) : "v"(x), "v"(y));
+  asm volatile("v_fmaak_f64 %0, %1, %2, lit64(0x4008000000000001)" : "=v"(ak2) : "v"(x), "v"(y));
+  o[i] = static_cast<uint32_t>(mk); o[i + 512] = static_cast<uint32_t>(mk >> 32);
+  o[i + 1024] = static_cast<uint32_t>(ak); o[i + 1536] = static_cast<uint32_t>(ak >> 32);
+  o[i + 2048] = static_cast<uint32_t>(mk2); o[i + 2560] = static_cast<uint32_t>(mk2 >> 32);
+  o[i + 3072] = static_cast<uint32_t>(ak2); o[i + 3584] = static_cast<uint32_t>(ak2 >> 32);
 }
 
 // Doubles, in pairs of the 32-bit arrays (a: low words, b: high words of x; c, d of y -- here passed as a, b and c, o2).
@@ -661,6 +679,9 @@ int main() {
     for (int i = 0; i < N; ++i) M1[i] = fb((static_cast<int>(rnd32() % 65) - 32) / 16.0f);
     const auto mix = [](uint32_t a, uint32_t b, uint32_t c) { return std::fma(bf16f(static_cast<uint16_t>(a >> 16)), bf(b), bf16f(static_cast<uint16_t>(c))); };
     run3("v_fma_mix_f32_bf16", k_fma_mix_f32_bf16, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return fb(mix(a, b, c)); }, 32, false, false, &failed);
+    // A negated float source (what the compiler's exp of a bfloat16 relies on), and absolute values (neg_hi on a mix form).
+    run3("v_fma_mix_f32_bf16 with -src2", k_fma_mix_f32_bf16_neg, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return fb(std::fma(bf16f(static_cast<uint16_t>(a >> 16)), bf(b), -bf(c))); }, 32, false, false, &failed);
+    run3("v_fma_mix_f32_bf16 with abs on sources 0 and 2", k_fma_mix_f32_bf16_abs, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return fb(std::fma(std::fabs(bf16f(static_cast<uint16_t>(a >> 16))), bf(b), std::fabs(bf16f(static_cast<uint16_t>(c))))); }, 32, false, false, &failed);
     run3("v_fma_mixlo_bf16", k_fma_mixlo_bf16, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return uint32_t{bf16_bits(mix(a, b, c))}; }, 32, false, false, &failed);
     run3("v_fma_mixhi_bf16", k_fma_mixhi_bf16, M0, M1, M2, [&](uint32_t a, uint32_t b, uint32_t c) { return uint32_t{bf16_bits(mix(a, b, c))} << 16; }, 32, false, false, &failed);
   }
@@ -814,6 +835,41 @@ int main() {
     int wrong = 0;
     for (int i = 0; i < N; ++i) wrong += out[i] != Y[i] || out[i + 512] != X[i];
     report("v_swap_b32", wrong, N, &failed);
+  }
+
+  // --- fused multiply-adds with a 64-bit constant ---
+  {
+    std::vector<uint32_t> xlo(N), xhi(N), ylo(2 * N);
+    std::vector<double> xs(N), ys(N);
+    for (int i = 0; i < N; ++i) {
+      xs[i] = (static_cast<int>(rnd32() % 2001) - 1000) / 16.0, ys[i] = (static_cast<int>(rnd32() % 2001) - 1000) / 8.0;
+      uint64_t xb, yb;
+      std::memcpy(&xb, &xs[i], 8), std::memcpy(&yb, &ys[i], 8);
+      xlo[i] = static_cast<uint32_t>(xb), xhi[i] = static_cast<uint32_t>(xb >> 32);
+      ylo[i] = static_cast<uint32_t>(yb), ylo[i + N] = static_cast<uint32_t>(yb >> 32);
+    }
+    uint32_t* a = up(xlo);
+    uint32_t* b = up(xhi);
+    uint32_t* c = up(ylo);
+    uint32_t* o = nullptr;
+    CHECK(hipMalloc(&o, 4096 * 4));
+    k_fma_k64<<<N / 32, 32>>>(a, b, c, o);
+    CHECK(hipDeviceSynchronize());
+    std::vector<uint32_t> out(4096);
+    CHECK(hipMemcpy(out.data(), o, 4096 * 4, hipMemcpyDeviceToHost));
+    const auto get = [&](int part, int i) { return uint64_t{out[i + 1024 * part]} | uint64_t{out[i + 1024 * part + 512]} << 32; };
+    int w1 = 0, w2 = 0, w3 = 0, w4 = 0;
+    const double k_mk2 = bd(0x3ff0000000000001ull), k_ak2 = bd(0x4008000000000001ull);
+    for (int i = 0; i < N; ++i) {
+      w1 += get(0, i) != db(std::fma(xs[i], 2.0, ys[i]));
+      w2 += get(1, i) != db(std::fma(xs[i], ys[i], 3.0));
+      w3 += get(2, i) != db(std::fma(xs[i], k_mk2, ys[i]));
+      w4 += get(3, i) != db(std::fma(xs[i], ys[i], k_ak2));
+    }
+    report("v_fmamk_f64 with a constant", w1, N, &failed);
+    report("v_fmaak_f64 with a constant", w2, N, &failed);
+    report("v_fmamk_f64 with a lit64 constant", w3, N, &failed);
+    report("v_fmaak_f64 with a lit64 constant", w4, N, &failed);
   }
 
   // --- doubles ---

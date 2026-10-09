@@ -112,6 +112,14 @@ for inst in isa.find('Instructions'):
         if key not in rows or rows[key][2] > priority:
             rows[key] = (name, ops, priority)
 
+# Instructions ROCm's LLVM and AMD's ISA document have but the XML leaves out. V_FMAMK_F64 and V_FMAAK_F64 (VOP2 35 and 36)
+# are in the document's instruction list, which says they "imply the use of a 64-bit literal"; hip-tests' double-precision
+# math functions use them. Each takes the 64-bit constant as K (SIMM64 here), as the 32-bit forms take a 32-bit one.
+if 'CDNA 5' in arch and not images:
+    f64 = [('VDST', 'Vgpr', 64, True)]
+    rows.setdefault(('Vop2', 0, 35, False), ('v_fmamk_f64', f64 + [('SRC0', 'Src', 64, False), ('LITERAL', 'Simm64', 64, False), ('VSRC1', 'Vgpr', 64, False)], 0))
+    rows.setdefault(('Vop2', 0, 36, False), ('v_fmaak_f64', f64 + [('SRC0', 'Src', 64, False), ('VSRC1', 'Vgpr', 64, False), ('LITERAL', 'Simm64', 64, False)], 0))
+
 with open(out_path, 'w') as f:
     what = 'every image instruction' if images else 'every instruction the RDNA decoder handles'
     f.write(f'// {arch}: {what}, from AMD\'s machine-readable\n'

@@ -420,6 +420,9 @@ false` throughout. gfx1251 (MI430X) is not covered.
   `ds_store_addtid_b32` / `ds_load_addtid_b32` (which named no address register, and crashed the executor before) and
   `ds_bpermute_fi_b32`; and flat pointers to private memory, which gfx1250 builds from `src_flat_scratch_base` with the
   lane's number in bits 56:52 (`tests/hipcc/gfx1250.cpp`).
+- **`v_fmamk_f64` and `v_fmaak_f64`** (VOP2 35 and 36), which the XML leaves out but the ISA document lists ("imply the use of a 64-bit
+  literal") and the compiler emits for double-precision math (found by hip-tests' `Unit_hipTrigDeviceFunc_Double`). They are
+  added to the generated table by `tools/rdna-ops.py` as supplementary rows.
 - **Cube faces and lookup-table permutes:** `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32`, `v_cubema_f32`, and
   `v_perm_pk16_b{4,6,8}_u4` (sixteen lookups, by 4-bit indices, in a table of sixteen 4-, 6- or 8-bit entries).
 - **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic

@@ -916,6 +916,16 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
         literal = true;
         continue;
       }
+      case K::Simm64: {
+        // v_fmamk_f64 and v_fmaak_f64's constant: 64 bits, whatever the instruction word says.
+        Operand l;
+        l.kind = OperandKind::Literal;
+        l.constant_k = true;
+        l.lit64 = true;
+        in.src.push_back(l);
+        literal = true;
+        continue;
+      }
       case K::Vgpr: {
         uint32_t v = field(f);
         // A 9-bit source field names a vector register from 256.
@@ -1218,7 +1228,9 @@ std::string hex(uint32_t v) {
 
 // An operand with its modifiers: -v1, |s2|, -|v[3:4]|.
 std::string op_text(const Operand& o) {
-  if (o.constant_k) return hex(static_cast<uint32_t>(o.value));
+  // A 64-bit constant K that has only its high half set is written as that half, as for any 64-bit float literal.
+  if (o.constant_k && o.lit64 && (o.value & 0xFFFFFFFFll) == 0) return hex(static_cast<uint32_t>(static_cast<uint64_t>(o.value) >> 32));
+  if (o.constant_k && !o.lit64) return hex(static_cast<uint32_t>(o.value));
   if (o.kind == OperandKind::Literal && o.lit64) {
     char b[48];
     std::snprintf(b, sizeof b, "lit64(0x%llx)", static_cast<unsigned long long>(o.value));
