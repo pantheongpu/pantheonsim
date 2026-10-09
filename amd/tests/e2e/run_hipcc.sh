@@ -426,7 +426,7 @@ expect "every gfx1250 high-register check holds" "0 failed" "$(grep -o '[0-9]* f
 # gfx1250's block loads and stores and cluster loads (hipcc/block1250.cpp), its Tensor Data Mover (hipcc/tensor1250.cpp: tiles of
 # one to five dimensions between memory and LDS, with padding, gather, iteration and the out-of-bounds rules) and its LDS atomics
 # and exchanges (hipcc/ds1250.cpp).
-for prog in block1250 tensor1250 ds1250; do
+for prog in block1250 tensor1250 ds1250 preload1250.3 preload1250.16; do
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$prog.gfx1250" 2>&1)
   status=$?
   expect "the gfx1250 $prog program runs to the end" "0" "$status"

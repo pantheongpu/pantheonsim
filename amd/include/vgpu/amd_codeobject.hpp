@@ -57,6 +57,9 @@ struct Kernel {
   bool kernarg_segment_ptr = false, dispatch_ptr = false, queue_ptr = false;
   bool dispatch_id = false, flat_scratch_init = false, private_segment_buffer = false;
   uint32_t user_sgpr_count = 0;
+  // Kernarg preload (descriptor bytes 58-59): how many dwords of the kernel's arguments the hardware puts in the last of
+  // the user SGPRs, and the dword of the kernarg segment they start at.
+  uint32_t kernarg_preload_length = 0, kernarg_preload_offset = 0;
   // Which of the work-group's ids the hardware puts in scalar registers
   // after the user ones (COMPUTE_PGM_RSRC2's enable bits): only those, one
   // after another, so a kernel that asks for x and z finds z where y would

@@ -423,6 +423,10 @@ false` throughout. gfx1251 (MI430X) is not covered.
 - **`v_fmamk_f64` and `v_fmaak_f64`** (VOP2 35 and 36), which the XML leaves out but the ISA document lists ("imply the use of a 64-bit
   literal") and the compiler emits for double-precision math (found by hip-tests' `Unit_hipTrigDeviceFunc_Double`). They are
   added to the generated table by `tools/rdna-ops.py` as supplementary rows.
+- **Kernel argument preloading:** where the kernel descriptor asks for the first dwords of the arguments in the last user SGPRs
+  (`kernarg_preload`, bytes 58-59), the wave starts with them there. gfx942's compiler output carries a prologue that loads
+  them itself, which is why only gfx1250's kernels (hip-tests' `Unit_KerArgOptimization_Saxpy`) showed the gap
+  (`tests/hipcc/preload1250.cpp`, built with 3 and with 16 dwords preloaded).
 - **Cube faces and lookup-table permutes:** `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32`, `v_cubema_f32`, and
   `v_perm_pk16_b{4,6,8}_u4` (sixteen lookups, by 4-bit indices, in a table of sixteen 4-, 6- or 8-bit entries).
 - **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic

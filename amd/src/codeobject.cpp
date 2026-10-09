@@ -163,7 +163,7 @@ struct Descriptor {
   uint32_t group_segment = 0, private_segment = 0, kernarg_size = 0;
   int64_t entry_offset = 0;
   uint32_t rsrc1 = 0, rsrc2 = 0;
-  uint16_t properties = 0;
+  uint16_t properties = 0, preload = 0;   // preload: kernarg_preload, bytes 58-59 of the descriptor
   uint64_t at = 0;   // the .kd symbol's value: its address, in a linked object
 };
 
@@ -294,6 +294,7 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       d.rsrc1 = r.u32(kd + 48);
       d.rsrc2 = r.u32(kd + 52);
       d.properties = r.u16(kd + 56);
+      d.preload = r.u16(kd + 58);
       d.at = value;
       descriptors[name.substr(0, name.size() - 3)] = d;
     }
@@ -457,6 +458,11 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.user_sgpr_count = 2 * kern.private_segment_buffer + 2 * kern.dispatch_ptr + 2 * kern.queue_ptr +
                            2 * kern.kernarg_segment_ptr + 2 * kern.dispatch_id + 2 * kern.flat_scratch_init;
     kern.user_sgpr_count = std::max(kern.user_sgpr_count, (d.rsrc2 >> 1) & 0x1F);
+    // The kernarg preload: the first `length` dwords of arguments from dword `offset` of the segment, which the hardware
+    // puts in the last user SGPRs. (Where the compiler adds the compatibility prologue -- gfx942 -- the kernel also
+    // loads them itself; gfx1250's does not.)
+    kern.kernarg_preload_length = d.preload & 0x7F;
+    kern.kernarg_preload_offset = (d.preload >> 7) & 0x1FF;
     out.kernels.push_back(std::move(kern));
   }
   // An object may have no kernels at all: a translation unit of a hipcc
