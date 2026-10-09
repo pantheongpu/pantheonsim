@@ -370,6 +370,12 @@ status=$?
 expect "the gfx1250 transposing-load program runs to the end" "0" "$status"
 expect "every gfx1250 transposing-load check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's asynchronous copies between global memory and LDS (hipcc/async1250.cpp), in each width.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/async1250.gfx1250" 2>&1)
+status=$?
+expect "the gfx1250 asynchronous-copy program runs to the end" "0" "$status"
+expect "every gfx1250 asynchronous-copy check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
 # Events shared between processes (hipcc/ipc.cpp): an interprocess event's
 # handle opened in a process it forks, whose wait waits for the record made
 # here.

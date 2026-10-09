@@ -379,11 +379,14 @@ false` throughout. gfx1251 (MI430X) is not covered.
   fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
   `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
   sparse, mixed-width and scaled ones depend on the layout read from the document.
+- **Asynchronous copies:** `global_load_async_to_lds_b{8,32,64,128}` and `global_store_async_from_lds_*` move each
+  lane's bytes between its global address and its LDS address, as the ISA document's pseudocode has it; the copy is done
+  when the instruction is, so `s_wait_asynccnt` has nothing to wait for (`tests/hipcc/async1250.cpp`).
 - **Transposing loads:** `global_load_tr16_b128`, `global_load_tr8_b64`, `ds_load_tr16_b128` and `ds_load_tr8_b64`, which
   load a 16x16 tile held column by column straight into the registers of a WMMA operand (lane map from the ISA
   document's figure; `tests/hipcc/trload1250.cpp` feeds them to a WMMA). EXEC must be all ones.
 - **Decoded and printed, but refused when executed:** the tensor data mover (`tensor_load_to_lds`,
-  `tensor_store_from_lds`); cluster loads, asynchronous loads to and from LDS, the 6- and 4-bit transposed loads
+  `tensor_store_from_lds`); cluster loads, the 6- and 4-bit transposed loads
   (`*_load_tr6_*`, `*_load_tr4_*`); the named-barrier instructions; `s_set_vgpr_msb` with a non-zero value (vector
   registers past v255); `v_permlane_*` of the new kinds, `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16
   packed arithmetic and the other 16-bit packed additions. Each says so by name when a kernel reaches it. The

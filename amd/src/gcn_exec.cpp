@@ -5171,6 +5171,44 @@ struct Machine {
     }
   }
 
+  // gfx1250's asynchronous copies between global memory and LDS (global_load_async_to_lds_b{8,32,64,128} and
+  // global_store_async_from_lds_*), as the CDNA 5 ISA document's pseudocode has them: each lane moves 1, 4, 8 or 16 bytes
+  // between its global address -- a 64-bit one, or a scalar base plus a 32-bit offset register (scaled where SCALE_OFFSET
+  // asks) -- and the LDS address in its other register, the instruction's offset added to both. They are asynchronous
+  // only in that a wave must wait on ASYNCcnt before using what a load wrote; here the copy is done when the instruction
+  // is, so that wait has nothing to wait for.
+  void global_async_lds(Wave& w, const Inst& in, Group& g) {
+    const bool loading = in.name.find("_load_") != std::string::npos;
+    const std::string& op = in.name;
+    const uint32_t bytes = op.ends_with("_b128") ? 16 : op.ends_with("_b64") ? 8 : op.ends_with("_b32") ? 4 : 1;
+    const Operand& lds_reg = loading ? in.src[0] : in.src[1];
+    const Operand& vaddr = loading ? in.src[1] : in.src[0];
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint64_t base = in.has_saddr ? scalar_field(w, in.saddr, true) + scaled_offset(in, lane_src(w, vaddr, lane), bytes)
+                                         : lane_src64(w, vaddr, lane);
+      const uint64_t addr = base + static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+      const uint64_t at = static_cast<uint32_t>(lane_src(w, lds_reg, lane) + static_cast<uint32_t>(in.offset));
+      if (at + bytes > g.lds.size())
+        throw Error::make(Err::InvalidValue, op, " reaches LDS at ", at, ", past the ", g.lds.size(),
+                          " bytes the work-group has");
+      if (loading) {
+        if (bytes == 1) g.lds[at] = static_cast<uint8_t>(load(addr, 1));
+        else {
+          uint32_t v[4];
+          load_words(addr, bytes / 4, v);
+          std::memcpy(&g.lds[at], v, bytes);
+        }
+      } else if (bytes == 1) {
+        store(addr, 1, g.lds[at]);
+      } else {
+        uint32_t v[4];
+        std::memcpy(v, &g.lds[at], bytes);
+        store_words(addr, bytes / 4, v);
+      }
+    }
+  }
+
   // A read-modify-write of global or flat memory: what it does, and how
   // wide it is.
   enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
@@ -6121,6 +6159,8 @@ struct Machine {
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else if (in.name.find("_load_lds_") != std::string::npos) global_load_lds(w, in, g), ++n.lds;
+        else if (in.name.find("_async_to_lds_") != std::string::npos || in.name.find("_async_from_lds_") != std::string::npos)
+          global_async_lds(w, in, g), ++n.lds;
         else global_access(w, in);
         return true;
       case gcn::Enc::Mubuf:
