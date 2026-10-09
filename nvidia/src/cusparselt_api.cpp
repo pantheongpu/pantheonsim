@@ -37,8 +37,10 @@
 // matmul descriptor and refuses the algorithm), and FP4 reaches the algorithm selection as on
 // those cards (nvidia/docs/lowprec.md, nvidia/tests/data/lowprec/sparselt.*.txt). Refused, with a
 // message: fp16 compute (no kernel on sm_86 or sm_89 on NVIDIA's library either), FP8 outputs,
-// the block scale modes, and FP4 and FP8 on Hopper and Blackwell (documentation only: no
-// such GPU was available); scale pointers are accepted and ignored, as those cards ignore them;
+// the block scale modes, and sparse FP4 past the algorithm selection (Blackwell's format).
+// Hopper and Blackwell GPUs are taken to answer as the L4 does for FP8 -- no such GPU was
+// available, so that is documentation-derived, not measured; scale pointers are accepted and
+// ignored, as the L4 and the 3060 ignore them;
 // GELU outside int8 and FP8-into-bf16 output is INVALID_VALUE, as on the card. A call on a
 // stream that is capturing a graph is recorded and runs at each launch.
 #include "../include/vgpu_cusparselt.h"
