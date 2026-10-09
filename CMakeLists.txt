@@ -2187,6 +2187,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # maxAnisotropy and explicit-level fetches (295 cases, both engines), against an RTX 3060.
+  add_test(NAME e2e_texture_anisotropy
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_anisotropy.sh)
+  set_tests_properties(e2e_texture_anisotropy PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_texture_srgb
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_srgb.sh)
   set_tests_properties(e2e_texture_srgb PROPERTIES

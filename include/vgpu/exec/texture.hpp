@@ -62,6 +62,11 @@ struct TextureDesc {
   uint32_t mip_slice = 0;
   TexFilter mip_filter = TexFilter::Point;
   int32_t mip_bias = 0, mip_min = 0, mip_max = 0;
+  // cudaTextureDesc::maxAnisotropy as given (any value is accepted), and the bias in
+  // 1/256ths of a level without the truncation mip_bias has. They matter to an
+  // explicit-level fetch that blends two levels: see tex_mip_lod in interpreter.cpp.
+  uint32_t max_anisotropy = 1;
+  double mip_bias_exact = 0;
   uint32_t pitch_bytes = 0; // distance between rows; width*texel_bytes if dense
   uint32_t channels = 1;    // 1..4
   uint32_t channel_bits[4] = {32, 0, 0, 0};

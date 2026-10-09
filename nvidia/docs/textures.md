@@ -285,10 +285,46 @@ covering every endpoint pair of every channel, and the decoders reproduce them v
 
 Linear filtering, wrapped and mirrored addressing of all of these return exactly the card's
 floats (`runtime_texture_gaps` hashes them; the same program passes against NVIDIA's runtime).
-`maxAnisotropy` of any value is accepted and changes nothing for a fetch with no derivatives, as
-on the card. A resource view reinterprets the same bytes as another format of the same texel
+`maxAnisotropy` of any value is accepted, as on the card, and changes nothing for a plain fetch
+(no explicit level, no derivatives); what it does to a fetch at an explicit level is below. A resource view reinterprets the same bytes as another format of the same texel
 size (a `uint2` array as BC1 blocks, with four times the extent); the read mode is checked
 against the array's own format, then the view.
+
+## Anisotropy and an explicit level
+
+A texture whose descriptor has `maxAnisotropy` of 2 or more and a **linear mip filter** blends the
+two levels an explicit level of detail falls between (`tex.level`, `tex2DLod` and the other
+`...Lod` forms) with a sharper weight than the fraction of the level. The hardware does not
+filter along any axis here: a fetch has no derivatives to give it one. Measured on an RTX 3060
+on constant levels (level *l* holds *l*, so a result is the blended level itself), then on random
+data in every geometry: only the level weight changes, and the levels are fetched as before.
+
+With the fraction *k* in 256ths, the weight is 0 until the ramp starts, then rises at 3/2, 7/4 or 2 times the
+rate and stays at 256 (the upper level alone):
+
+| `maxAnisotropy` | rate | ramp starts at | weight |
+| --- | --- | --- | --- |
+| 0, 1 | -- | -- | k (an ordinary blend) |
+| 2, 3 | 3/2 | 128/3 = 42.67 | floor(3 (k - 42) / 2) |
+| 4 to 7 | 7/4 | 3 * 128/7 = 54.86 | floor(7 (k - 54) / 4) |
+| 8 and more (16, 17, 100, 2^32-1 alike) | 2 | 64 | 2 (k - 64) |
+
+The ramp's start is not where the fraction is read from, because the bias does not simply add to
+the level of detail as it does without anisotropy. The card takes
+`lod + trunc(bias - lo) + trunc(lo)`, with the bias in 256ths *not* truncated first and
+`trunc` toward zero, `lo` the start above. A bias of 0 gives the table; a bias at or above `lo`
+moves the start up by one 256th (to 43 or 55: `lo` itself is not a whole number, and the
+truncation of a positive number is not the truncation of a negative one); a fractional bias
+moves it by one 256th when its fraction passes `lo`'s own (0.667, 0.857, 0). That was measured for
+biases from -300 to 300 256ths in steps of 1/8, and at 1/2048 next to 128/3 and 3 * 128/7. The level
+clamps (`minMipmapLevelClamp`, `maxMipmapLevelClamp`) act on the level of detail this makes, so a level
+that a clamp sets has its plain fraction.
+
+A point mip filter is not affected, nor is a fetch with no explicit level, nor is the filter
+within a level (point or linear). The fetch itself is the same as without anisotropy.
+`texture_anisotropy` checks 295 combinations -- every geometry (1D, 2D, 3D, cubemap, layered
+forms), both texel types, both filters, 17 `maxAnisotropy` values, 18 biases against each
+threshold, fractional biases and clamps -- in both engines against the card's hashes.
 
 ## Refused, and why
 
@@ -303,12 +339,6 @@ Each with its own message, rather than a plausible wrong number:
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.
-- **Anisotropic filtering with an explicit level.** A plain `tex` fetch is not affected by
-  `maxAnisotropy` (the same hashes for 1, 4 and 16), and a texture descriptor with any value
-  is accepted, as the card accepts it; but an explicit-level `tex.level` one is affected on
-  an RTX 3060 -- the hardware filters along an axis the instruction does not give -- and
-  that is not modelled, so such a fetch of a texture with `maxAnisotropy` above 1 differs
-  from the card.
 - `tld4` on layered or cubemap textures (the runtime refuses a gather array
   that is layered or a cubemap, so there is nothing to measure them on).
 - **BC6H and BC7.** Arrays of these formats can be made, filled and copied, but

@@ -5443,9 +5443,10 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
                                                          filter == cudaFilterModeLinear, tex->sRGB != 0))
         return static_cast<cudaError_t>(bad);
       // Linear filtering and sRGB decoding are done at the fetch, as the
-      // texture unit does them. Anisotropy changes a result only when a sample's footprint is
-      // stretched, which a fetch with no derivatives (LOD 0, or an explicit one) never is: the
-      // value is accepted, as the card accepts any, and has nothing to act on.
+      // texture unit does them. Anisotropy is kept as given (the card accepts any value): it
+      // sharpens the blend between two levels of an explicit-level fetch (tex_mip_lod), and
+      // acts on nothing else a fetch with no derivatives does.
+      d.max_anisotropy = tex->maxAnisotropy;
       if (filter == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
       d.srgb = tex->sRGB != 0;
       // What border addressing returns outside the texture, converted to the
@@ -5459,6 +5460,8 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
       d.mip_filter = mipfilter == cudaFilterModeLinear ? vgpu::exec::TexFilter::Linear
                                                        : vgpu::exec::TexFilter::Point;
       d.mip_bias = q(tex->mipmapLevelBias);
+      d.mip_bias_exact = std::isfinite(tex->mipmapLevelBias)
+                             ? static_cast<double>(std::clamp(tex->mipmapLevelBias, -1e6f, 1e6f)) * 256 : 0.0;
       d.mip_min = q(tex->minMipmapLevelClamp);
       d.mip_max = q(tex->maxMipmapLevelClamp);
     } else if (const int bad = vgpu::cuda::texture_read_check(checked_format, false, false, false)) {

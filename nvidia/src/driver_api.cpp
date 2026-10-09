@@ -4322,9 +4322,10 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
         if (t->address[i] < 0 || t->address[i] > 3) return CUDA_ERROR_INVALID_VALUE;
         d.address[i] = static_cast<vgpu::exec::TexAddress>(t->address[i]);   // the same order
       }
-      // Anisotropy changes a result only when a sample's footprint is stretched, which a fetch with no
-      // derivatives (LOD 0, or an explicit one) never is: any value is accepted, as the card accepts any
-      // (measured: 0, 1, 2, 8, 16, 17, 100 and 2^32-1), and has nothing to act on.
+      // Any anisotropy is accepted, as the card accepts any (measured: 0, 1, 2, 8, 16, 17, 100 and
+      // 2^32-1). It sharpens the blend between two levels of an explicit-level fetch (tex_mip_lod in
+      // interpreter.cpp) and acts on nothing else a fetch with no derivatives does.
+      d.max_anisotropy = t->max_anisotropy;
       d.filter = t->filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
       d.normalized_coords = t->flags & CU_TRSF_NORMALIZED_COORDINATES;
       srgb_flag = t->flags & CU_TRSF_SRGB;
@@ -4341,6 +4342,7 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
       d.mip_filter = t->mip_filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
       d.mip_bias = q(t->mip_bias);
+      d.mip_bias_exact = std::isfinite(t->mip_bias) ? static_cast<double>(std::clamp(t->mip_bias, -1e6f, 1e6f)) * 256 : 0.0;
       d.mip_min = q(t->mip_min);
       d.mip_max = q(t->mip_max);
     } else {
