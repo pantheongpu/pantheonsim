@@ -61,11 +61,11 @@ def _body_at(text, start):
 def traced_bodies(text):
     """The bodies of the entry points a profiler can subscribe to by name.
 
-    Those are exported as a one-line wrapper (traced_call) around `NAME_body`,
+    Those are exported as a one-line wrapper (traced_call) around `NAME_body` (or `NAME_traced`),
     which holds what the function does; capture state is consulted there.
     """
     return {m.group(1): _body_at(text, m.end())
-            for m in re.finditer(r"static\s+cudaError_t\s+(cuda\w+?)_body\s*\(([^)]*)\)\s*\{", text)}
+            for m in re.finditer(r"static\s+cudaError_t\s+(cuda\w+?)_(?:body|traced)\s*\(([^)]*)\)\s*\{", text)}
 
 
 def exported_stream_functions(text):
