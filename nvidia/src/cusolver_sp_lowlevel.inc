@@ -431,6 +431,8 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrqrAnalysisHost(cusolverSpHandle_t h, 
 VGPU_EXPORT cusolverStatus_t cusolverSpXcsrqrAnalysis(cusolverSpHandle_t h, int m, int n, int nnz,
                                                       const cusparseMatDescr_t d, const int* off, const int* col,
                                                       csrqrInfo_t info) {
+  VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSpXcsrqrAnalysis, h, m, n, nnz, d, off, col,
+                   info);
   QrInfo* qi = known(info) ? reinterpret_cast<QrInfo*>(info) : nullptr;
   const cusolverStatus_t st = qr_analysis(h, m, n, nnz, d, off, col, qi ? &qi->ll : nullptr, true);
   if (st == CUSOLVER_STATUS_SUCCESS) {
@@ -458,6 +460,8 @@ VGPU_EXPORT cusolverStatus_t cusolverSpXcsrcholAnalysisHost(cusolverSpHandle_t h
 VGPU_EXPORT cusolverStatus_t cusolverSpXcsrcholAnalysis(cusolverSpHandle_t h, int n, int nnz,
                                                         const cusparseMatDescr_t d, const int* off, const int* col,
                                                         csrcholInfo_t info) {
+  VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSpXcsrcholAnalysis, h, n, nnz, d, off, col,
+                   info);
   return chol_analysis(h, n, nnz, d, off, col, ll_info<CholLL>(info), true);
 }
 
@@ -575,6 +579,7 @@ template <class T>
 cusolverStatus_t qr_factor_ll(cusolverSpHandle_t h, int m, int n, int nnz, T* b, T* x, QrLL* q, bool device) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (!q || !q->setup || !q->buffered || q->m != m || q->n != n || q->nnz != nnz) return CUSOLVER_STATUS_INVALID_VALUE;
+  if (device) vgpu_capture::commit_point();   // the device work of the factorization
   qr_ll_factor(q);
   if (b && x) return qr_solve_ll<T>(q, m, n, b, x, device);
   return CUSOLVER_STATUS_SUCCESS;
@@ -595,6 +600,9 @@ cusolverStatus_t chol_factor_ll(cusolverSpHandle_t h, int n, int nnz, cusparseMa
                                 bool device) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (!c || !c->analyzed || !c->buffered || c->n != n || c->nnz != nnz || !d) return CUSOLVER_STATUS_INVALID_VALUE;
+  // The factorization allocates its scratch memory on every call (measured on an RTX 3060): in a capture in the
+  // global mode that is refused and the capture invalidated; in the others it is recorded.
+  if (device && vgpu_capture::unsafe_allocation(sp_stream(h))) return CUSOLVER_STATUS_ALLOC_FAILED;
   std::vector<cd> v;
   if (!read_cd<T>(val, (size_t)nnz, device, &v)) return CUSOLVER_STATUS_INVALID_VALUE;
   chol_ll_factor(c, v);
@@ -680,13 +688,16 @@ template <class S> cusolverStatus_t put_position(int* position, int v) {
     return qr_buffer_ll<T>(h, m, n, nnz, d, qi ? &qi->ll : nullptr, internal, work);                                \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrqrSetup(cusolverSpHandle_t h, int m, int n, int nnz,               \
-                                                         const cusparseMatDescr_t d, const T* val, const int*,      \
-                                                         const int*, T mu, csrqrInfo_t info) {                      \
+                                                         const cusparseMatDescr_t d, const T* val, const int* rp,   \
+                                                         const int* ci, T mu, csrqrInfo_t info) {                   \
+    DescrScope descr_(d);                                                                                           \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrqrSetup, h, m, n, nnz, d, val, rp, ci, mu, info);        \
     QrInfo* qi = known(info) ? reinterpret_cast<QrInfo*>(info) : nullptr;                                           \
     return qr_setup_ll<T>(h, m, n, nnz, d, val, mu, qi ? &qi->ll : nullptr, true);                                  \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrqrFactor(cusolverSpHandle_t h, int m, int n, int nnz, T* b, T* x,  \
-                                                          csrqrInfo_t info, void*) {                                \
+                                                          csrqrInfo_t info, void* buf) {                            \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrqrFactor, h, m, n, nnz, b, x, info, buf);                \
     QrInfo* qi = known(info) ? reinterpret_cast<QrInfo*>(info) : nullptr;                                           \
     return qr_factor_ll<T>(h, m, n, nnz, b, x, qi ? &qi->ll : nullptr, true);                                       \
   }                                                                                                                 \
@@ -695,10 +706,14 @@ template <class S> cusolverStatus_t put_position(int* position, int v) {
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                          \
     QrInfo* qi = known(info) ? reinterpret_cast<QrInfo*>(info) : nullptr;                                           \
     if (!qi || !qi->ll.factored) return CUSOLVER_STATUS_INVALID_VALUE;                                              \
+    VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSp##P##csrqrZeroPivot, h, info, tol,     \
+                     position);                                                                                     \
+    vgpu_capture::commit_point();   /* it waits for the device: a capture cannot have it */                         \
     return put_position<T>(position, qr_ll_zero_pivot(qi->ll, tol));                                               \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrqrSolve(cusolverSpHandle_t h, int m, int n, T* b, T* x,            \
-                                                         csrqrInfo_t info, void*) {                                 \
+                                                         csrqrInfo_t info, void* buf) {                             \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrqrSolve, h, m, n, b, x, info, buf);                      \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                          \
     QrInfo* qi = known(info) ? reinterpret_cast<QrInfo*>(info) : nullptr;                                           \
     return qi ? qr_solve_ll<T>(&qi->ll, m, n, b, x, true) : CUSOLVER_STATUS_INVALID_VALUE;                          \
@@ -721,8 +736,10 @@ template <class S> cusolverStatus_t put_position(int* position, int v) {
     return chol_factor_ll<T>(h, n, nnz, d, val, ll_info<CholLL>(info), false);                                      \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrcholFactor(cusolverSpHandle_t h, int n, int nnz,                   \
-                                                            const cusparseMatDescr_t d, const T* val, const int*,   \
-                                                            const int*, csrcholInfo_t info, void*) {                \
+                                                            const cusparseMatDescr_t d, const T* val, const int* rp, \
+                                                            const int* ci, csrcholInfo_t info, void* buf) {         \
+    DescrScope descr_(d);                                                                                           \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrcholFactor, h, n, nnz, d, val, rp, ci, info, buf);       \
     return chol_factor_ll<T>(h, n, nnz, d, val, ll_info<CholLL>(info), true);                                       \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrcholZeroPivotHost(cusolverSpHandle_t h, csrcholInfoHost_t info,    \
@@ -738,6 +755,9 @@ template <class S> cusolverStatus_t put_position(int* position, int v) {
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                          \
     CholLL* c = ll_info<CholLL>(info);                                                                              \
     if (!c || !c->factored) return CUSOLVER_STATUS_INVALID_VALUE;                                                   \
+    VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSp##P##csrcholZeroPivot, h, info, tol,   \
+                     position);                                                                                     \
+    vgpu_capture::commit_point();   /* it waits for the device: a capture cannot have it */                         \
     const int k = chol_ll_zero_pivot(*c, tol);                                                                      \
     return put_position<T>(position, k < 0 ? -1 : k + 1);                                                          \
   }                                                                                                                 \
@@ -746,12 +766,14 @@ template <class S> cusolverStatus_t put_position(int* position, int v) {
     return chol_solve_ll<T>(h, n, b, x, ll_info<CholLL>(info), false);                                              \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrcholSolve(cusolverSpHandle_t h, int n, const T* b, T* x,           \
-                                                           csrcholInfo_t info, void*) {                             \
+                                                           csrcholInfo_t info, void* buf) {                         \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrcholSolve, h, n, b, x, info, buf);                       \
     return chol_solve_ll<T>(h, n, b, x, ll_info<CholLL>(info), true);                                               \
   }                                                                                                                 \
   /* L's diagonal, in the factorization's order, on the device. */                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrcholDiag(cusolverSpHandle_t h, csrcholInfo_t info,                 \
                                                           El<T>::R* diag) {                                         \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrcholDiag, h, info, diag);                                \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                          \
     CholLL* c = ll_info<CholLL>(info);                                                                              \
     if (!c || !c->factored || !diag) return CUSOLVER_STATUS_INVALID_VALUE;                                          \

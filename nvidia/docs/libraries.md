@@ -661,7 +661,7 @@ runs them; each is a ctest of its own.
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_lt_epilogue_paths` | RELU_AUX/GELU_AUX's mask and input, DRELU/DGELU and their bias gradients, BGRADA/BGRADB, in fp16/bf16/fp32/fp64, and what the card refuses | a training step's backward pass (cuBLASLt-fused linear layers) |
 | `e2e_graph_capture_libs` | cuBLASLt's matmul with a bias epilogue, cuDNN's graph-API convolution and a driver-API `cuLaunchKernel` recorded into a captured CUDA graph, their descriptors, plan and pack destroyed after the capture, then launched with new inputs: the capture runs nothing, every launch reads what the graph's kernels wrote before it (`run_graph_capture_libs.sh --card` runs the same program on NVIDIA's libraries; it passes there) | PyTorch's CUDA graphs: `torch.cuda.graph`, `make_graphed_callables`, `mode="reduce-overhead"`, Triton kernels inside a graph |
-| `e2e_graph_capture_dnn`, `e2e_graph_capture_fft`, `e2e_graph_capture_solver`, `e2e_graph_capture_rand`, `e2e_graph_capture_jpeg`, `e2e_graph_capture_npp` | cuDNN's classic API, cuFFT, cuSOLVER's dense API, cuRAND, nvJPEG's decode and NPP's `_Ctx` functions recorded into a captured CUDA graph (descriptors, plans and parameter objects destroyed after the capture), then launched with new inputs, each compared with an eager run; the calls NVIDIA's library cannot capture answer as it does and invalidate the capture. `graph_capture_common.h` is the harness; `run_graph_capture.sh <name> <libs> --card` runs the same program on NVIDIA's libraries (all pass there) | PyTorch's CUDA graphs with BatchNorm, RNNs, FFTs, linear algebra; XLA, Warp |
+| `e2e_graph_capture_dnn`, `e2e_graph_capture_fft`, `e2e_graph_capture_solver`, `e2e_graph_capture_solver_sp`, `e2e_graph_capture_rand`, `e2e_graph_capture_jpeg`, `e2e_graph_capture_npp` | cuDNN's classic API, cuFFT, cuSOLVER's dense API, cuRAND, nvJPEG's decode and NPP's `_Ctx` functions recorded into a captured CUDA graph (descriptors, plans and parameter objects destroyed after the capture), then launched with new inputs, each compared with an eager run; the calls NVIDIA's library cannot capture answer as it does and invalidate the capture. `graph_capture_common.h` is the harness; `run_graph_capture.sh <name> <libs> --card` runs the same program on NVIDIA's libraries (all pass there) | PyTorch's CUDA graphs with BatchNorm, RNNs, FFTs, linear algebra; XLA, Warp |
 | `e2e_graph_capture_nccl` | NCCL's all-reduce (sum, max, average, in place, with a pre-multiplied operator destroyed after the capture), broadcast, reduce, all-gather, reduce-scatter and send/recv recorded into captured graphs, a rank per thread on two devices, launched together and compared with eager calls, the order of collectives still in step afterwards; `run_graph_capture_nccl.sh --card` runs it on NVIDIA's NCCL (2.28.9) on two RTX 3060s | PyTorch DDP and `torch.cuda.graph` with NCCL collectives, Megatron |
 | `e2e_graph_capture_driver`, `e2e_graph_driver` | the driver API's stream calls inside a capture made with `cuStreamBeginCapture` (copies of every shape, fills, host functions, events across streams, stream memory operations, stream-ordered allocation, and the calls a capture refuses) and the driver's explicit graphs (`cuGraphAdd*Node`, Get/SetParams, executable-graph updates, clones, user objects, capture into a graph); both run on NVIDIA's driver too | XLA, Warp, cuda-python |
 | `e2e_lt_blockscaled_paths` | MXFP8 and NVFP4 block scales in the tiled layout, the 128-element and 128x128 FP32 forms, D's block quantization and its output scales (simulator only: documentation-derived) | `_scaled_mm` with block scales |
@@ -1267,16 +1267,33 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   Every program that checks this (`e2e_graph_capture_*`, `e2e_graph_driver`)
   also runs against NVIDIA's libraries on the card
   (`run_graph_capture.sh <name> <libs> --card`) and passes there.
+  **cuSOLVER's sparse API** (`cusolverSp`): the low-level Cholesky's
+  `csrcholFactor`, `csrcholSolve` and `csrcholDiag`, the low-level QR's
+  `csrqrSetup`, `csrqrFactor` and `csrqrSolve`, and `csrqrsvBatched` are
+  recorded (the info objects they share are not copied: they have to outlive
+  the graph); the buffer-size queries and the `...Host` forms do not touch the
+  stream and leave the capture alone; what waits for the device -- `csrlsvqr`,
+  `csrlsvchol`, `csreigvsi`, the two `csr*ZeroPivot` and the three analyses --
+  answers INTERNAL_ERROR and invalidates the capture, and `csrcholFactor`,
+  which allocates scratch memory on every call, answers ALLOC_FAILED in a
+  capture in the global mode (all measured on an RTX 3060; `csrqrSetup` and
+  `csrqrsvBatched` are refused in the global mode too when they are the first
+  call on a handle that needs scratch memory, which is not modelled). The classic cuDNN
+  `cudnnFindConvolution*Algorithm` calls time kernels: the `Ex` forms answer
+  and invalidate the capture, the others are refused with 4004 in the global
+  mode as well, as the card does.
   **Not recorded** (they run when called, so a replay misses them -- or, for
-  the ones that wait on the stream, fail the capture): cuSOLVER's sparse
-  (`cusolverSp`), refactorization (`cusolverRf`) and multi-GPU (`cusolverMg`)
-  APIs and the IRS solvers' iteration counts, multi-GPU cuFFT descriptors and
-  cuFFT callbacks, cuTensorNet and cuStateVec, `cudnnFindConvolution*Ex`, and
-  `cudnnBackendPopulateCudaGraph`. Not copied for a captured call: a cuFFT plan
-  with LTO callbacks, a cuRAND generator, an nvJPEG handle or state, a cuSOLVER
-  workspace -- these have to outlive the graph, as NVIDIA's do. The driver API
-  does not refuse module loading while capturing (NVIDIA's invalidates the
-  capture) so that lazily loaded kernels (Triton's) keep working.
+  the ones that wait on the stream, fail the capture): the IRS solvers'
+  iteration counts, multi-GPU cuFFT descriptors and cuFFT callbacks,
+  cuTensorNet and cuStateVec (no NVIDIA library here to measure against), and
+  `cudnnBackendPopulateCudaGraph`, which answers NOT_SUPPORTED as cuDNN does
+  for an engine without native CUDA-graph support. cusolverRf and cusolverMg
+  take no stream (they work on the default one, which cannot be captured). Not
+  copied for a captured call: a cuFFT plan with LTO callbacks, a cuRAND
+  generator, an nvJPEG handle or state, a cuSOLVER workspace -- these have to
+  outlive the graph, as NVIDIA's do. The driver API does not refuse module
+  loading while capturing (NVIDIA's invalidates the capture) so that lazily
+  loaded kernels (Triton's) keep working.
 - **cuDNN**: in the graph API, interpolating resampling beyond bilinear
   upsampling by 2 (the one configuration cuDNN has an engine for; nearest
   has none, which cuDNN documents), block-scaled (MXFP8) attention (E8M0

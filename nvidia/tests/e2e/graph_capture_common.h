@@ -41,6 +41,8 @@
 
 namespace gc {
 
+// The capture mode the runtime-API harness captures in (the driver API's is always global).
+inline cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal;
 inline int fails = 0;
 inline int checks = 0;
 
@@ -110,7 +112,7 @@ struct GraphApi {
   }
   static void destroy_stream(cudaStream_t st) { cuStreamDestroy(reinterpret_cast<CUstream>(st)); }
 #else
-  static int begin(cudaStream_t st) { return cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal); }
+  static int begin(cudaStream_t st) { return cudaStreamBeginCapture(st, capture_mode); }
   static int end(cudaStream_t st, void** graph) { return cudaStreamEndCapture(st, reinterpret_cast<cudaGraph_t*>(graph)); }
   static int instantiate(void** exec, void* graph) {
     return cudaGraphInstantiate(reinterpret_cast<cudaGraphExec_t*>(exec), static_cast<cudaGraph_t>(graph), 0);

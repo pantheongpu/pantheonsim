@@ -818,6 +818,69 @@ static void attention(Runner& r, cudnnHandle_t h) {
         {{o, no, Dt::F32}, {dq, nq, Dt::F32}, {dk, nk, Dt::F32}, {dv, nv, Dt::F32}, {dw, nw, Dt::F32}}, 1e-3);
 }
 
+
+// The Find calls run and time kernels, which a capture cannot have. Measured on an RTX 3060 (cuDNN 9.15): the Ex forms
+// answer success and invalidate the capture, in every capture mode; the others do the same in the relaxed mode, and in
+// the global one are refused for the memory they allocate: CUDNN_STATUS_INTERNAL_ERROR_DEVICE_ALLOCATION_FAILED
+// (4004), the capture invalidated. The Get..._v7 calls (heuristics, no kernels) leave a capture as it was.
+static void find_calls(Runner& r, cudnnHandle_t h) {
+  Tensor x({1, 3, 8, 8}), y({1, 4, 8, 8});
+  Filter w({4, 3, 3, 3});
+  Conv c;
+  float *xp = r.alloc<float>(1 << 12), *wp = r.alloc<float>(1 << 12), *yp = r.alloc<float>(1 << 12);
+  void* work = r.alloc<char>(1 << 24);
+  cudnnConvolutionFwdAlgoPerf_t perf[8];
+  cudnnConvolutionBwdDataAlgoPerf_t perf_d[8];
+  cudnnConvolutionBwdFilterAlgoPerf_t perf_f[8];
+  int count = 0;
+  struct Find {
+    const char* name;
+    bool ex;
+    std::function<int()> call;
+  };
+  const std::vector<Find> finds = {
+      {"cudnnFindConvolutionForwardAlgorithm", false, [&] { return (int)cudnnFindConvolutionForwardAlgorithm(h, x, w, c, y, 8, &count, perf); }},
+      {"cudnnFindConvolutionForwardAlgorithmEx", true, [&] { return (int)cudnnFindConvolutionForwardAlgorithmEx(h, x, xp, w, wp, c, y, yp, 8, &count, perf, work, 1 << 24); }},
+      {"cudnnFindConvolutionBackwardDataAlgorithm", false, [&] { return (int)cudnnFindConvolutionBackwardDataAlgorithm(h, w, y, c, x, 8, &count, perf_d); }},
+      {"cudnnFindConvolutionBackwardDataAlgorithmEx", true, [&] { return (int)cudnnFindConvolutionBackwardDataAlgorithmEx(h, w, wp, y, yp, c, x, xp, 8, &count, perf_d, work, 1 << 24); }},
+      {"cudnnFindConvolutionBackwardFilterAlgorithm", false, [&] { return (int)cudnnFindConvolutionBackwardFilterAlgorithm(h, x, y, c, w, 8, &count, perf_f); }},
+      {"cudnnFindConvolutionBackwardFilterAlgorithmEx", true, [&] { return (int)cudnnFindConvolutionBackwardFilterAlgorithmEx(h, x, xp, y, yp, c, w, wp, 8, &count, perf_f, work, 1 << 24); }},
+  };
+  for (const Find& f : finds) {
+    for (const cudaStreamCaptureMode mode : {cudaStreamCaptureModeGlobal, cudaStreamCaptureModeRelaxed}) {
+      count = 0;
+      const bool global = mode == cudaStreamCaptureModeGlobal;
+      cudaStreamSynchronize(r.st);
+      cudaGraph_t g = nullptr;
+      const cudaError_t bc = cudaStreamBeginCapture(r.st, mode);
+      const int rc = f.call();
+      cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+      cudaStreamIsCapturing(r.st, &status);
+      const cudaError_t e = cudaStreamEndCapture(r.st, &g);
+      if (g) cudaGraphDestroy(g);
+      cudaGetLastError();
+      cudaStreamSynchronize(r.st);
+      const int want = !f.ex && global ? 4004 : 0;
+      expect(std::string(f.name) + (global ? " in a global capture" : " in a relaxed capture") + ": " +
+                 (want ? "refused (4004)" : "answers") + ", and the capture is invalidated",
+             bc == cudaSuccess && rc == want && (want || count > 0) && status == cudaStreamCaptureStatusInvalidated &&
+                 e == cudaErrorStreamCaptureInvalidated,
+             rc);
+    }
+  }
+  {
+    cudaGraph_t g = nullptr;
+    cudaStreamBeginCapture(r.st, cudaStreamCaptureModeGlobal);
+    const int rc = (int)cudnnGetConvolutionForwardAlgorithm_v7(h, x, w, c, y, 8, &count, perf);
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(r.st, &status);
+    const cudaError_t e = cudaStreamEndCapture(r.st, &g);
+    if (g) cudaGraphDestroy(g);
+    expect("cudnnGetConvolutionForwardAlgorithm_v7 in a capture: answers, and leaves it valid",
+           rc == 0 && count > 0 && status == cudaStreamCaptureStatusActive && e == cudaSuccess, rc);
+  }
+}
+
 int main() {
   Runner r;
   cudnnHandle_t h = make_handle(r.st);
@@ -833,6 +896,7 @@ int main() {
   rnn(r, h, {true, 2, 5, 4, 5, 3, false}, "cudnnRNNForward (LSTM, 2 layers)");
   rnn(r, h, {false, 1, 4, 3, 4, 2, true}, "cudnnRNNForward (bidirectional GRU)");
   attention(r, h);
+  find_calls(r, h);
   cudnnDestroy(h);
   return finish();
 }

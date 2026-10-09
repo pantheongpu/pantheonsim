@@ -30,6 +30,7 @@
 // Compiled against the real cuDNN headers (fetched at configure time by scripts/fetch-cudnn-headers.py) so the
 // ABI is the vendor's, not a guess.
 #include "cudnn_common.hpp"
+#include "capture_defer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1090,6 +1091,16 @@ cudnnStatus_t enumerate(const char* fn, ConvDir dir, cudnnHandle_t h, const void
   ConvCall call;
   cudnnStatus_t s = conv_check(fn, dir, xd, wd, cd, yd, &call);
   if (s == CUDNN_STATUS_BAD_PARAM) return s;
+  // The Find calls run and time kernels, which a capture cannot have (measured on an RTX 3060): the Ex forms answer
+  // as usual and invalidate the capture; the others allocate memory too, which the global capture mode refuses
+  // (CUDNN_STATUS_INTERNAL_ERROR_DEVICE_ALLOCATION_FAILED, 4004, the capture invalidated).
+  cudaStream_t capturing = nullptr;
+  if (timed && cudnnGetStream(h, &capturing) == CUDNN_STATUS_SUCCESS && ::vgpu_capture::stream_capturing(capturing)) {
+    const size_t len = std::strlen(fn);
+    const bool ex = len > 2 && std::strcmp(fn + len - 2, "Ex") == 0;
+    if (!ex && ::vgpu_capture::unsafe_allocation(capturing)) return static_cast<cudnnStatus_t>(4004);
+    ::vgpu_capture::refuse_capture(capturing, fn);
+  }
   const int* order = dir == ConvDir::Forward ? kFwdAlgos : dir == ConvDir::Data ? kDataAlgos : kFilterAlgos;
   const int count = dir == ConvDir::Forward ? kFwdCount : dir == ConvDir::Data ? kDataCount : kFilterCount;
   list_algos(dir, order, count, requested, returned, perf, s == CUDNN_STATUS_SUCCESS,

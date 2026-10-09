@@ -47,6 +47,8 @@
 // are independent of one another (its internal order differs), and
 // its Cholesky with reorder = 1 reading the upper triangle it documents as
 // ignored.
+// The deprecated routines are what this file defines, and refers to by address when it records them.
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include <cusolverSp.h>
 #include <cusolverSp_LOWLEVEL_PREVIEW.h>
 
@@ -67,8 +69,13 @@
 
 #include <cuda_runtime.h>
 
+#include "capture_defer.hpp"
 #include "complex_linalg.hpp"
 #include "cusolver_metis.hpp"
+
+// Every device access below goes through this, so that the first one a call makes is its commit point (see
+// capture_defer.hpp).
+#define cudaMemcpy ::vgpu_capture::memcpy_commit
 
 namespace {
 
@@ -94,9 +101,19 @@ struct QrInfo {
 
 std::mutex& g_mu = *new std::mutex;
 std::set<const void*>& g_live = *new std::set<const void*>;
+// The handles, and the matrix descriptors of a call being recorded into a graph, with how to copy each: what a
+// recorded call runs on when the graph does (the program may destroy them as soon as the capture ends). The info
+// objects are not copied -- they are the state the factorization and the solve share, and have to outlive the graph.
+vgpu_capture::Registry& g_reg = *new vgpu_capture::Registry;
 template <class T> T* track(T* p) { std::lock_guard<std::mutex> l(g_mu); g_live.insert(p); return p; }
-bool known(const void* p) { std::lock_guard<std::mutex> l(g_mu); return p && g_live.count(p); }
+bool known(const void* p) {
+  if (g_reg.known(p)) return true;   // a handle's copy, in a recorded call
+  std::lock_guard<std::mutex> l(g_mu);
+  return p && g_live.count(p);
+}
 void untrack(const void* p) { std::lock_guard<std::mutex> l(g_mu); g_live.erase(p); }
+// The stream a call on `h` is on (null for a handle that is not one).
+cudaStream_t sp_stream(cusolverSpHandle_t h) { return h && known(h) ? reinterpret_cast<SpHandle*>(h)->stream : nullptr; }
 
 // Element types: the host or device type, the arithmetic type, the type tol and
 // norms come in.
@@ -941,14 +958,35 @@ cusolverStatus_t zero_free_diagonal(cusolverSpHandle_t h, int n, int nnz, cuspar
 
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
+// A matrix descriptor, copied for a recorded call (the descriptor itself is cuSPARSE's).
+namespace {
+void* clone_descr(const void* q, vgpu_capture::Snapshot&) {
+  cusparseMatDescr_t o = const_cast<cusparseMatDescr_t>(reinterpret_cast<const cusparseMatDescr*>(q)), c = nullptr;
+  if (cusparseCreateMatDescr(&c) != CUSPARSE_STATUS_SUCCESS) return nullptr;
+  cusparseSetMatType(c, cusparseGetMatType(o));
+  cusparseSetMatFillMode(c, cusparseGetMatFillMode(o));
+  cusparseSetMatDiagType(c, cusparseGetMatDiagType(o));
+  cusparseSetMatIndexBase(c, cusparseGetMatIndexBase(o));
+  return c;
+}
+void destroy_descr(void* q) { cusparseDestroyMatDescr(reinterpret_cast<cusparseMatDescr_t>(q)); }
+// Makes `d` something a recorded call can copy, for as long as the call is being made.
+struct DescrScope {
+  const void* d;
+  explicit DescrScope(cusparseMatDescr_t desc) : d(desc) { if (d) g_reg.track_raw(d, clone_descr, destroy_descr); }
+  ~DescrScope() { if (d) g_reg.untrack(d); }
+};
+}  // namespace
+
 VGPU_EXPORT cusolverStatus_t cusolverSpCreate(cusolverSpHandle_t* h) {
   if (!h) return CUSOLVER_STATUS_INVALID_VALUE;
-  *h = reinterpret_cast<cusolverSpHandle_t>(track(new SpHandle()));
+  *h = reinterpret_cast<cusolverSpHandle_t>(g_reg.track(track(new SpHandle())));
   return CUSOLVER_STATUS_SUCCESS;
 }
 VGPU_EXPORT cusolverStatus_t cusolverSpDestroy(cusolverSpHandle_t h) {
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   untrack(h);
+  g_reg.untrack(h);
   delete reinterpret_cast<SpHandle*>(h);
   return CUSOLVER_STATUS_SUCCESS;
 }
@@ -1105,6 +1143,8 @@ VGPU_EXPORT cusolverStatus_t cusolverSpDestroyCsrqrInfo(csrqrInfo_t info) {
 VGPU_EXPORT cusolverStatus_t cusolverSpXcsrqrAnalysisBatched(cusolverSpHandle_t h, int m, int n, int nnz,
                                                              const cusparseMatDescr_t d, const int* off,
                                                              const int* col, csrqrInfo_t info) {
+  VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSpXcsrqrAnalysisBatched, h, m, n, nnz, d, off,
+                   col, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (!known(info) || m < n || n < 0 || nnz < 0) return CUSOLVER_STATUS_INVALID_VALUE;
   if (const cusolverStatus_t st = check_descr(d); st != CUSOLVER_STATUS_SUCCESS) return st;
@@ -1166,6 +1206,8 @@ template <class T> cd to_cd(T v) { return cd(El<T>::in(v)); }
                                                        const cusparseMatDescr_t d, const T* val, const int* off,    \
                                                        const int* col, const T* b, El<T>::R tol, int reorder, T* x, \
                                                        int* singularity) {                                          \
+    VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSp##P##csrlsvqr, h, m, nnz, d, val, off, \
+                     col, b, tol, reorder, x, singularity);                                                         \
     return linear_solve<T>(Method::Qr, h, m, nnz, d, val, off, col, b, tol, reorder, x, singularity, true);         \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrlsvqrHost(                                                         \
@@ -1182,6 +1224,8 @@ template <class T> cd to_cd(T v) { return cd(El<T>::in(v)); }
                                                          const cusparseMatDescr_t d, const T* val, const int* off,  \
                                                          const int* col, const T* b, El<T>::R tol, int reorder,     \
                                                          T* x, int* singularity) {                                  \
+    VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSp##P##csrlsvchol, h, m, nnz, d, val,    \
+                     off, col, b, tol, reorder, x, singularity);                                                    \
     return linear_solve<T>(Method::Chol, h, m, nnz, d, val, off, col, b, tol, reorder, x, singularity, true);       \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrlsqvqrHost(                                                        \
@@ -1198,6 +1242,8 @@ template <class T> cd to_cd(T v) { return cd(El<T>::in(v)); }
                                                         const cusparseMatDescr_t d, const T* val, const int* off,   \
                                                         const int* col, T mu0, const T* x0, int maxite,             \
                                                         El<T>::R eps, T* mu, T* x) {                                \
+    VGPU_REFUSE_CALL(sp_stream(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverSp##P##csreigvsi, h, m, nnz, d, val,     \
+                     off, col, mu0, x0, maxite, eps, mu, x);                                                        \
     return eig_shift_inverse<T>(h, m, nnz, d, val, off, col, mu0, x0, maxite, eps, mu, x, true);                    \
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrzfdHost(cusolverSpHandle_t h, int n, int nnz,                      \
@@ -1212,7 +1258,10 @@ template <class T> cd to_cd(T v) { return cd(El<T>::in(v)); }
   }                                                                                                                 \
   VGPU_EXPORT cusolverStatus_t cusolverSp##P##csrqrsvBatched(                                                       \
       cusolverSpHandle_t h, int m, int n, int nnz, const cusparseMatDescr_t d, const T* val, const int* off,        \
-      const int* col, const T* b, T* x, int batch, csrqrInfo_t info, void*) {                                       \
+      const int* col, const T* b, T* x, int batch, csrqrInfo_t info, void* buf) {                                    \
+    DescrScope descr_(d);                                                                                           \
+    VGPU_DEFER_CALL(g_reg, sp_stream(h), cusolverSp##P##csrqrsvBatched, h, m, n, nnz, d, val, off, col, b, x,       \
+                    batch, info, buf);                                                                              \
     return qr_solve_batched<T>(h, m, n, nnz, d, val, off, col, b, x, batch, info);                                  \
   }
 VGPU_SP(S, float)

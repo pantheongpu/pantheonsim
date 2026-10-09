@@ -66,6 +66,12 @@ class Registry {
     live_[p] = Entry{clone, del};
     return p;
   }
+  // An object of a library that is not this one's own, copied by `clone` and deleted by `del`: registered for as
+  // long as the caller keeps it so (untrack).
+  void track_raw(const void* p, Clone clone, Delete del) {
+    std::lock_guard<std::mutex> l(mu_);
+    live_[p] = Entry{clone, del};
+  }
   bool known(const void* p) const {
     std::lock_guard<std::mutex> l(mu_);
     return p && live_.count(p);
@@ -223,6 +229,15 @@ inline bool refuse_capture(cudaStream_t stream, const char* what) {
   using Fn = int (*)(void*, const char*);
   static const Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_capture_refuse_v1"));
   return fn && fn(stream, what) != 0;
+}
+
+// A call that allocates device memory while its stream captures: in the global capture mode (the default) that
+// is refused, the capture invalidated -- as NVIDIA's library finds when it cudaMallocs in the middle of one. True
+// if refused. Not capturing, or in a mode that allows it: false.
+inline bool unsafe_allocation(cudaStream_t stream) {
+  using Fn = int (*)(const char*);
+  static const Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_capture_unsafe_gate_v1"));
+  return fn && !t_replay && stream_capturing(stream) && fn("cudaMalloc") != 0;
 }
 
 template <class Status, class... P, class... A>

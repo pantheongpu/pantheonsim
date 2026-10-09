@@ -2959,7 +2959,7 @@ if(TARGET vgpucudart)
   # The host-computed vendor libraries inside a captured graph: each call recorded, run at each launch
   # of the graph over new inputs, its plan or parameter objects destroyed in between (the program
   # also runs against NVIDIA's library with run_graph_capture.sh <name> <libs> --card).
-  foreach(_cap "fft:cufft" "solver:cusolver,cublas" "rand:curand" "jpeg:nvjpeg" "sparse:cusparse"
+  foreach(_cap "fft:cufft" "solver:cusolver,cublas" "solver_sp:cusolver,cusparse" "rand:curand" "jpeg:nvjpeg" "sparse:cusparse"
                "npp:nppc,nppial,nppicc,nppig,nppif,nppidei,npps,nppist")
     string(REPLACE ":" ";" _cap_parts "${_cap}")
     list(GET _cap_parts 0 _cap_name)
