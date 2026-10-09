@@ -323,7 +323,7 @@ RSMI_API int rsmi_dev_vbios_version_get(uint32_t d, char*, uint32_t) {
 RSMI_API int rsmi_dev_firmware_version_get(uint32_t d, int block, uint64_t* fw_version) {
   if (!fw_version) return kInvalidArgs;
   DEVICE(d, s);
-  const uint32_t mec = vgpu::amd::chip(s.architecture).mec_fw;
+  const uint32_t mec = vgpu::amd::chip(s.architecture, s.pci_device_id).mec_fw;
   constexpr int kBlockMec = 5;   // RSMI_FW_BLOCK_MEC
   if (block != kBlockMec || mec == 0) return kNotSupported;
   *fw_version = mec;
@@ -363,7 +363,7 @@ RSMI_API int rsmi_dev_partition_id_get(uint32_t d, uint32_t* id) {
 RSMI_API int rsmi_dev_target_graphics_version_get(uint32_t d, uint64_t* v) {
   if (!v) return kInvalidArgs;
   DEVICE(d, s);
-  *v = std::strtoull(vgpu::amd::chip(s.architecture).gfx + 3, nullptr, 16);
+  *v = std::strtoull(vgpu::amd::chip(s.architecture, s.pci_device_id).gfx + 3, nullptr, 16);
   return kSuccess;
 }
 

@@ -1187,7 +1187,7 @@ void print_rocm(const vgpu::telemetry::Shared& s, const std::vector<uint32_t>& s
 }
 
 // CDNA3 -> gfx942, CDNA4 -> gfx950 (the targets these parts report).
-const char* gfx_target(const vgpu::telemetry::DeviceSample& d) { return vgpu::amd::chip(d.architecture).gfx; }
+const char* gfx_target(const vgpu::telemetry::DeviceSample& d) { return vgpu::amd::chip(d.architecture, d.pci_device_id).gfx; }
 
 // rocm_agent_enumerator output: one ISA target per line, CPU agent first.
 // `-t GPU` lists only the GPUs and `-t CPU` only the CPU, as ROCm's does;

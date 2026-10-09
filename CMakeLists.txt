@@ -60,6 +60,8 @@ set(VGPU_PROFILES
   amd/rx7900xtx
   amd/rx9070xt
   amd/rx6900xt
+  amd/rx6800
+  amd/rx6700xt
 )
 set(_gen_dir "${CMAKE_BINARY_DIR}/generated")
 set(_gen "${_gen_dir}/vgpu/embedded_profiles.hpp")
@@ -1210,7 +1212,7 @@ set_tests_properties(test_amd_amd_smi_radeon PROPERTIES ENVIRONMENT
   "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
 # What ROCm Validation Suite asks AMD SMI (clock levels, temperature, power, energy,
 # ECC) on every other profile: the sensors and counters follow each one's class.
-foreach(_g mi250x mi325x mi350x mi455x rx6900xt rx9070xt)
+foreach(_g mi250x mi325x mi350x mi455x rx6900xt rx6800 rx6700xt rx9070xt)
   file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
   add_test(NAME test_amd_amd_smi_rvs_${_g} COMMAND test_amd_amd_smi rvs)
   set_tests_properties(test_amd_amd_smi_rvs_${_g} PROPERTIES ENVIRONMENT
@@ -1402,6 +1404,11 @@ set_tests_properties(amd_pytorch_rx9070xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL 
 # instructions, fp8 refused).
 add_test(NAME amd_pytorch_rx6900xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx6900xt)
 set_tests_properties(amd_pytorch_rx6900xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# And on a gfx1031 card (Navi 22, the RX 6700 XT): the same instruction set as gfx1030 under a target
+# name of its own, which PyTorch's kernels must be found for.
+add_test(NAME amd_pytorch_rx6700xt COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh check.py 20 1 amd/rx6700xt)
+set_tests_properties(amd_pytorch_rx6700xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.

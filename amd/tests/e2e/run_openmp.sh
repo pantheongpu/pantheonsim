@@ -36,8 +36,8 @@ if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libhsa-runtime64.so.1" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
 
-# The GPUs this ISA runs on: one simulated model per target, and all six.
-cases="amd/mi300x:gfx942 amd/mi250x:gfx90a amd/mi350x:gfx950 amd/rx7900xtx:gfx1100 amd/rx9070xt:gfx1201 amd/rx6900xt:gfx1030"
+# The GPUs this ISA runs on: one simulated model per target, and the RDNA2 cards that share one.
+cases="amd/mi300x:gfx942 amd/mi250x:gfx90a amd/mi350x:gfx950 amd/rx7900xtx:gfx1100 amd/rx9070xt:gfx1201 amd/rx6900xt:gfx1030 amd/rx6800:gfx1030 amd/rx6700xt:gfx1031"
 [[ -n "${VGPU_OPENMP_GPUS:-}" ]] && cases="$VGPU_OPENMP_GPUS"
 for pair in $cases; do
   gpu=${pair%:*} arch=${pair#*:}

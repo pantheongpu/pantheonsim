@@ -25,7 +25,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/rtx-pro-6000", "nvidia/gb10", "nvidia/gb200",
       "nvidia/vr200", "nvidia/thor",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt",
-      "amd/rx6900xt"};
+      "amd/rx6900xt", "amd/rx6800", "amd/rx6700xt"};
   VCHECK_EQ(ids.size(), expected.size());
   for (const auto& want : expected)
     VCHECK(std::find(ids.begin(), ids.end(), want) != ids.end());

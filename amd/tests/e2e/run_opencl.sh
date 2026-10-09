@@ -43,7 +43,7 @@ if command -v objdump >/dev/null; then
   preload=$(objdump -p "$shim/libhsa-runtime64.so.1" 2>/dev/null | awk '/NEEDED/ && /lib(asan|tsan)\.so/ {print $2}')
 fi
 
-cases="amd/mi300x amd/mi250x amd/mi350x amd/rx7900xtx amd/rx9070xt amd/rx6900xt"
+cases="amd/mi300x amd/mi250x amd/mi350x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
 [[ -n "${VGPU_OPENCL_GPUS:-}" ]] && cases="$VGPU_OPENCL_GPUS"
 for gpu in $cases; do
   # MI250X's texture units are real, and the gfx9 image instructions are not

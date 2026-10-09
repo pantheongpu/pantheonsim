@@ -107,7 +107,7 @@ bool valid_agent(hsa_agent_t a) { return a.handle == kCpuAgent || gpu_of(a) >= 0
 hsa_agent_t gpu_agent(int i) { return {kGpuAgentBase + static_cast<uint64_t>(i)}; }
 
 // The chip's facts beyond the profile (vgpu/amd_chip.hpp).
-vgpu::amd::Chip chip(const vgpu::DeviceProfile& p) { return vgpu::amd::chip(p.architecture.c_str()); }
+vgpu::amd::Chip chip(const vgpu::DeviceProfile& p) { return vgpu::amd::chip(p.architecture.c_str(), p.telemetry.pci_device_id); }
 uint32_t chip_id(const vgpu::DeviceProfile& p) { return p.telemetry.pci_device_id ? p.telemetry.pci_device_id : 0x74a1; }
 uint32_t compute_units(const vgpu::DeviceProfile& p) {
   return static_cast<uint32_t>(p.limits.multiprocessors) * chip(p).cus_per_mp;
