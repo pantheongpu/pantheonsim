@@ -21,13 +21,13 @@ VTEST(every_amd_profile_has_its_own_chip) {
     // The target the chip table gives is the profile's own.
     VCHECK_EQ(std::string(c.gfx), p.gcn_arch);
     // RDNA counts a workgroup processor as HIP's multiprocessor, two compute
-    // units; CDNA one; and each has a memory interface and an L1 and L2.
-    VCHECK_EQ(c.cus_per_mp, p.architecture.rfind("rdna", 0) == 0 ? 2u : 1u);
+    // units, and so does CDNA 5 (gfx1250, built on gfx12); CDNA one; and each has a memory interface and an L1 and L2.
+    VCHECK_EQ(c.cus_per_mp, p.architecture.rfind("rdna", 0) == 0 || p.architecture == "cdna5" ? 2u : 1u);
     VCHECK(c.mem_bits > 0 && c.l1_kb > 0 && c.l2_kb > 0 && c.engines > 0 && c.simds > 0);
     // The L2 is the profile's too, per compute die.
     VCHECK_EQ(uint64_t{c.l2_kb} * 1024, p.limits.l2_cache_bytes);
   }
-  VCHECK(amd >= 7);
+  VCHECK(amd >= 8);
 }
 
 VTEST_MAIN

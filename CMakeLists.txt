@@ -56,6 +56,7 @@ set(VGPU_PROFILES
   amd/mi300x
   amd/mi325x
   amd/mi350x
+  amd/mi455x
   amd/rx7900xtx
   amd/rx9070xt
   amd/rx6900xt
@@ -1149,6 +1150,9 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   # way round, and a register per work-item id.
   add_test(NAME test_amd_gcn_${_t}_gfx1030 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1030 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1030")
+  # And for gfx1250 (CDNA 5, MI455X): gfx12's encodings with its additions, built by ROCm's clang.
+  add_test(NAME test_amd_gcn_${_t}_gfx1250 COMMAND test_amd_gcn_${_t})
+  set_tests_properties(test_amd_gcn_${_t}_gfx1250 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1250")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
@@ -1206,7 +1210,7 @@ set_tests_properties(test_amd_amd_smi_radeon PROPERTIES ENVIRONMENT
   "VGPU_GPU=amd/rx7900xtx;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;VGPU_TELEMETRY_PATH=${CMAKE_BINARY_DIR}/telemetry-amd-smi-radeon")
 # What ROCm Validation Suite asks AMD SMI (clock levels, temperature, power, energy,
 # ECC) on every other profile: the sensors and counters follow each one's class.
-foreach(_g mi250x mi325x mi350x rx6900xt rx9070xt)
+foreach(_g mi250x mi325x mi350x mi455x rx6900xt rx9070xt)
   file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/telemetry-amd-smi-rvs-${_g}")
   add_test(NAME test_amd_amd_smi_rvs_${_g} COMMAND test_amd_amd_smi rvs)
   set_tests_properties(test_amd_amd_smi_rvs_${_g} PROPERTIES ENVIRONMENT
@@ -1609,6 +1613,18 @@ if(TARGET vgpunccl)
     set_tests_properties(e2e_nccl_comm_ops_${_n} PROPERTIES DEPENDS vgpunccl TIMEOUT 300
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:")
   endforeach()
+  # A network trained across processes, one simulated GPU each, split four ways --
+  # data, tensor, pipeline (two ranks) and sharded parallel -- with cuBLAS for the
+  # products and NCCL between the processes, against one process on the whole
+  # batch. At two, three and four ranks, so the splits come out even and odd.
+  if(TARGET vgpucublas)
+    foreach(_n 2 3 4)
+      add_test(NAME e2e_parallel_training_${_n}
+               COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_parallel_training.sh ${_n})
+      set_tests_properties(e2e_parallel_training_${_n} PROPERTIES DEPENDS "vgpunccl;vgpucublas" TIMEOUT 600
+        ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:")
+    endforeach()
+  endif()
 endif()
 
 # What PyTorch 2.14 binds at load time and the runtime lacked: user objects (and
@@ -1929,6 +1945,13 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_lop3_pred_chain
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
   set_tests_properties(e2e_lop3_pred_chain PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_warpsync_bsync_standoff
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_warpsync_bsync_standoff.sh)
+  set_tests_properties(e2e_warpsync_bsync_standoff PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
@@ -2607,6 +2630,17 @@ if(TARGET vgpucudart)
            ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/ops.py 71 nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_ops_rtx5090 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # torch.distributed across two processes (nvidia/tests/pytorch/distributed.py): the
+  # collectives, then a network trained with DistributedDataParallel, tensor
+  # parallelism, pipeline parallelism and FullyShardedDataParallel, each against one
+  # process on the whole batch. PyTorch's NCCL backend on the simulator's libnccl.
+  add_test(NAME e2e_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_distributed.sh)
+  set_tests_properties(e2e_pytorch_distributed PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpunccl"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE

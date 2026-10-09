@@ -1003,10 +1003,33 @@ ncclResult_t settle(Op& op) {
 ncclResult_t execute(std::vector<Op>& ops) {
   ncclResult_t rc = ncclSuccess;
   auto keep = [&](ncclResult_t r) { if (rc == ncclSuccess) rc = r; };
-  for (auto& op : ops) keep(deposit(op));
-  if (rc == ncclSuccess) for (auto& op : ops) keep(collect(op));
-  for (auto& op : ops) release(op);
-  if (rc == ncclSuccess) for (auto& op : ops) keep(settle(op));
+  // Every collective publishes its data in its rank's one file on its communicator, so a
+  // pass that deposited two collectives of the same communicator before collecting either
+  // would have the second overwrite the first (two all-reduces in one group read each
+  // other's data). Collectives of different communicators do not meet there, and must run
+  // together: one thread drives every rank's communicator in a single group, and it
+  // cannot wait for a rank whose operation it has not deposited yet. So the group runs
+  // in rounds: the k-th collective of each communicator in round k, the point-to-point
+  // operations (which have a file each) in round 0, every round in the four passes.
+  // Collectives of a communicator are issued in the same order on every rank, so the
+  // rounds line up.
+  std::unordered_map<Comm*, size_t> seen;
+  std::vector<size_t> round(ops.size(), 0);
+  size_t rounds = 1;
+  for (size_t i = 0; i < ops.size(); ++i) {
+    if (!is_collective(ops[i].kind)) continue;
+    round[i] = seen[ops[i].comm]++;
+    rounds = std::max(rounds, round[i] + 1);
+  }
+  for (size_t r = 0; r < rounds && rc == ncclSuccess; ++r) {
+    std::vector<Op*> in_round;
+    for (size_t i = 0; i < ops.size(); ++i)
+      if (round[i] == r) in_round.push_back(&ops[i]);
+    for (Op* op : in_round) keep(deposit(*op));
+    if (rc == ncclSuccess) for (Op* op : in_round) keep(collect(*op));
+    for (Op* op : in_round) release(*op);
+    if (rc == ncclSuccess) for (Op* op : in_round) keep(settle(*op));
+  }
   return rc;
 }
 

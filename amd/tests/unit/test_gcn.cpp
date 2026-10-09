@@ -146,7 +146,7 @@ void check_corpus(const std::string& file, amd::gcn::Target target = amd::gcn::T
       got = std::string("(refused: ") + e.what() + ")";
     }
     ++checked;
-    if (got != want && wrong_count++ < 40) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
+    if (got != want && wrong_count++ < (std::getenv("VGPU_CORPUS_ALL") ? 100000 : 40)) wrong += "\n  want \"" + want + "\"\n  got  \"" + got + "\"";
   }
   VCHECK(checked > at_least);
   if (wrong_count)
@@ -180,6 +180,14 @@ VTEST(every_gfx1100_instruction_shape_decodes_as_llvm_prints_it) {
 // cache policy.
 VTEST(every_gfx1201_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200);
+}
+
+// And gfx1250 (CDNA 5, MI455X): gfx12's encodings with the matrix, tensor, cluster and 64-bit
+// additions. No library has code for it yet, so the corpus is made from AMD's ISA specification by
+// amd/tools/isa-fuzz.py -- every instruction's plain encodings with zero, random and sparse fields --
+// and what LLVM's disassembler prints for them. There is no card to check this against.
+VTEST(every_gfx1250_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250, 2000);
 }
 
 // RDNA's image instructions (MIMG; RDNA4's VIMAGE and VSAMPLE): what HIP's
