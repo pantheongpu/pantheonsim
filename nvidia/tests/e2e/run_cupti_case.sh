@@ -57,6 +57,36 @@ if [[ "$case_name" == nvtx ]]; then
 fi
 trap 'rm -f "$out" "$out.txt" "$out.cubin"' EXIT
 
+# The expected files are what a CUDA 13.0 libcupti printed. A case whose program
+# leaves out what an older toolkit's cupti.h cannot name (it is built under
+# CUPTI_API_VERSION guards, as the trace's records and callbacks are) prints a
+# different, shorter trace there, which says nothing about the shim: SKIP below
+# the CUPTI_API_VERSION that the case needs for its whole trace to be asked for.
+#   graph     executable-graph ids (22: CUDA 12.4)
+#   resource  the stream-attribute callback (22)
+#   filter, filter_driver  the per-function activity switches (24: CUDA 12.5)
+#   misc      CUDA event records, device timestamps and the per-function switches
+#             of the newer records (13.0)
+case "$case_name" in
+  graph|resource) need_api=22 ;;
+  filter|filter_driver) need_api=24 ;;
+  misc) need_api=130000 ;;
+  *) need_api=0 ;;
+esac
+if (( need_api > 0 )); then
+  nvcc_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+  api_header=""
+  for d in "$nvcc_root/include" "$nvcc_root/targets/x86_64-linux/include" /usr/include; do
+    [[ -f "$d/cupti_version.h" ]] && api_header="$d/cupti_version.h" && break
+  done
+  have_api=0
+  [[ -n "$api_header" ]] && have_api="$(sed -n 's/^#define CUPTI_API_VERSION[[:space:]]\+\([0-9]\+\).*/\1/p' "$api_header" | head -1)"
+  have_api="${have_api:-0}"
+  if (( have_api < need_api )); then
+    echo "SKIP: this toolkit's CUPTI (API version $have_api) is older than the $need_api the $case_name case needs"; exit 0
+  fi
+fi
+
 # The resource case loads a cubin through the driver API; nvcc makes it for the
 # device both runs use, so the card and the shim are handed the same bytes.
 cubin=""

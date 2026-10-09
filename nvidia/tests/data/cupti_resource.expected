@@ -20,19 +20,19 @@ REC runtime cudaFree_v3020 corr=c1
 CB runtime cudaMalloc ENTER
 CB runtime cudaMalloc EXIT
 CB runtime cudaLaunchKernel ENTER
-RES 6 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
-RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 6 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
 CB runtime cudaLaunchKernel EXIT
 CB runtime cudaLaunchKernel ENTER
-RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
 CB runtime cudaLaunchKernel EXIT
 CB runtime cudaLaunchKernel ENTER
-RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
 CB runtime cudaLaunchKernel EXIT
 CB runtime cudaFuncGetAttributes ENTER
 CB runtime cudaFuncGetAttributes EXIT
 CB runtime cudaLaunchKernel ENTER
-RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
 CB runtime cudaLaunchKernel EXIT
 REC runtime cudaMalloc_v3020 corr=c2
 REC function name=_Z10kernel_onePfi module=m0 context=x1
@@ -70,10 +70,10 @@ REC runtime cudaStreamSetAttribute_v11000 corr=c11
 REC runtime cudaStreamCopyAttributes_v11000 corr=c12
 REC runtime cudaStreamDestroy_v5050 corr=c13
 # driver module
-RES 6 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
-RES 8 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
-RES 8 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
-RES 7 context=x0 module=m1 cubin=set magic=7f454c46 size=4712
+RES 6 context=x0 module=m1 cubin=set magic=7f454c46 size=elf
+RES 8 context=x0 module=m1 cubin=set magic=7f454c46 size=elf
+RES 8 context=x0 module=m1 cubin=set magic=7f454c46 size=elf
+RES 7 context=x0 module=m1 cubin=set magic=7f454c46 size=elf
 # second context
 RES 1 context=x2 stream=s0
 RES 2 context=x2 stream=s0
@@ -91,7 +91,7 @@ REC context id=x3 device=0 nullstream=s14
 # reset
 CB runtime cudaDeviceReset ENTER
 RES 2 context=x0 stream=s0
-RES 7 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 7 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
 RES 4 context=x0 stream=s9
 CB runtime cudaDeviceReset EXIT
 CB runtime cudaFree ENTER
@@ -101,8 +101,8 @@ CB runtime cudaFree EXIT
 CB runtime cudaMalloc ENTER
 CB runtime cudaMalloc EXIT
 CB runtime cudaLaunchKernel ENTER
-RES 6 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
-RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=6440
+RES 6 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
+RES 8 context=x0 module=m0 cubin=set magic=7f454c46 size=elf
 CB runtime cudaLaunchKernel EXIT
 REC runtime cudaDeviceReset_v3020 corr=c15
 REC stream id=s21 context=x4 flag=1 priority=0 corr=c16
