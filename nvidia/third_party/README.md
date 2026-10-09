@@ -3,7 +3,9 @@
 `nccl_include/` is the public API headers of NCCL (Apache-2.0, as its headers
 say) and `nvenc_include/nvEncodeAPI.h` is the public NVENC API header from
 NVIDIA's Video Codec SDK, which NVIDIA licenses under the MIT terms printed at
-the top of the file. They are here so the shims are compiled against the *real*
+the top of the file; `nvdec_include/` is the public NVDECODE API (`cuviddec.h`, `nvcuvid.h`)
+from the same SDK under the same MIT terms, copied from a published MIT-licensed
+redistribution of it. They are here so the shims are compiled against the *real*
 ABI rather than a hand-written approximation -- writing struct layouts by hand
 has silently produced garbage twice in this project (`cudaDeviceProp`,
 `cudaFuncAttributes`) -- and so `libvgpunvenc` (presented as

@@ -11,15 +11,25 @@
 // the locked bitstream's fields, sequence parameters, reconfiguration, and the
 // calls that are NVIDIA's "not supported here" on this part.
 //
-// What is not NVIDIA's: the encoder. A frame is written as an H.264 IDR
+// What is not NVIDIA's: the encoder. An H.264 frame is written as an IDR
 // picture whose every macroblock is I_PCM (nvenc_h264.hpp): a conformant,
-// lossless stream any H.264 decoder returns the input from, but not
-// compression -- rate control, GOP structure, B-frames, the preset and every
-// quality setting are accepted and change nothing, and every picture is an
-// IDR. HEVC sessions open and answer every query, but encoding refuses with
-// NV_ENC_ERR_UNSUPPORTED_PARAM: no HEVC stream is written. The input is 8-bit
-// 4:2:0 (NV12, YV12, IYUV) or 32-bit RGB (ARGB, ABGR; converted to BT.601
-// limited-range YCbCr); the 10-bit and 4:4:4 formats the card takes are refused.
+// lossless stream any H.264 decoder returns the input from (ffmpeg's does:
+// nvidia/tests/e2e/nvenc_h264.cpp), but not compression -- rate control, GOP
+// structure, B-frames, the preset and every quality setting are accepted and
+// change nothing, and every picture is an IDR with the same idr_pic_id, so
+// encoding a frame twice gives the same bytes (encoder SDC tests compare a
+// golden bitstream). The input is 8-bit 4:2:0 (NV12, YV12, IYUV) or 32-bit RGB
+// (ARGB, ABGR; converted to BT.601 limited-range YCbCr, the matrix the card
+// applies); the 10-bit and 4:4:4 formats the card takes are refused.
+//
+// HEVC is the API surface only: a session opens, answers every query and takes
+// every input format the card does, but the bytes it returns are a stand-in --
+// a short header and a hash of each 64-row, 256-byte tile of the input -- not an
+// HEVC stream, no decoder reads them. They have the one property encoder
+// stress and SDC checks rely on (the same frame encodes to the same bytes and
+// any changed byte changes them), which is what keeps the pantheon workload
+// media_enc_virus (4K HEVC, ARGB, forced IDR) running. A conformant HEVC stream
+// needs a CABAC writer that is not here.
 #include <cuda_runtime.h>
 #include <nvEncodeAPI.h>
 
@@ -141,7 +151,6 @@ struct Session {
   std::map<void*, std::unique_ptr<Registered>> registered;
   std::map<void*, std::unique_ptr<Mapped>> mapped;
   uint64_t frames = 0;
-  uint32_t idr_id = 0;
   bool sent_parameter_sets = false;
 };
 
@@ -179,8 +188,10 @@ uint32_t buffer_rows(uint32_t fmt, uint32_t height) {
   switch (fmt) {
     case num(NV_ENC_BUFFER_FORMAT_NV12):
     case num(NV_ENC_BUFFER_FORMAT_YV12):
-    case num(NV_ENC_BUFFER_FORMAT_IYUV): return height + (height + 1) / 2;
-    case num(NV_ENC_BUFFER_FORMAT_YUV444): return 3 * height;
+    case num(NV_ENC_BUFFER_FORMAT_IYUV):
+    case num(NV_ENC_BUFFER_FORMAT_YUV420_10BIT): return height + (height + 1) / 2;
+    case num(NV_ENC_BUFFER_FORMAT_YUV444):
+    case num(NV_ENC_BUFFER_FORMAT_YUV444_10BIT): return 3 * height;
     default: return height;
   }
 }
@@ -774,6 +785,28 @@ Frame read_frame(const uint8_t* dev, uint32_t pitch, uint32_t fmt, int w, int h,
   return f;
 }
 
+// The HEVC stand-in: FNV-1a over each tile of 64 rows by 256 bytes of the buffer (all of
+// it, chroma and padding included), after a short header. See the top of the file.
+std::vector<uint8_t> content_stream(const std::vector<uint8_t>& frame, uint32_t pitch, uint32_t rows, uint32_t width, uint32_t height) {
+  std::vector<uint8_t> out = {0x00, 0x00, 0x00, 0x01, 'V', 'G', 'P', 'U'};
+  auto push32 = [&out](uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+  };
+  push32(width);
+  push32(height);
+  constexpr uint32_t kTileRows = 64, kTileBytes = 256;
+  for (uint32_t ty = 0; ty < rows; ty += kTileRows)
+    for (uint32_t tx = 0; tx < pitch; tx += kTileBytes) {
+      uint32_t h = 2166136261u;
+      for (uint32_t y = ty; y < std::min(ty + kTileRows, rows); ++y) {
+        const uint8_t* row = frame.data() + static_cast<size_t>(y) * pitch;
+        for (uint32_t x = tx; x < std::min(tx + kTileBytes, pitch); ++x) h = (h ^ row[x]) * 16777619u;
+      }
+      push32(h);
+    }
+  return out;
+}
+
 std::vector<uint8_t> parameter_sets(const Session& s) {
   vgpu_nvenc::H264Stream st;
   st.width = static_cast<int>(s.width);
@@ -830,8 +863,26 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
     return NV_ENC_ERR_INVALID_PARAM;
   }
   if (s->codec != kH264) {
-    if (!quiet()) std::fprintf(stderr, "[vgpu] NVENC: HEVC streams are not written by VirtualGPU\n");
-    return NV_ENC_ERR_UNSUPPORTED_PARAM;
+    // HEVC: the stand-in stream (see the top of this file): a header and one hash per
+    // tile of the whole input buffer, whatever its format.
+    static bool said = false;
+    if (!said && !quiet()) {
+      said = true;
+      std::fprintf(stderr, "[vgpu] NVENC: HEVC output is a deterministic stand-in (a hash of each tile of the frame), not an HEVC stream\n");
+    }
+    if (in_w == 0 || in_h == 0) return NV_ENC_ERR_INVALID_PARAM;
+    const uint32_t rows = buffer_rows(fmt, in_h);
+    std::vector<uint8_t> frame(static_cast<size_t>(pitch) * rows);
+    if (cudaMemcpy(frame.data(), dev, frame.size(), cudaMemcpyDefault) != cudaSuccess) {
+      cudaGetLastError();
+      return NV_ENC_ERR_INVALID_PARAM;
+    }
+    std::vector<uint8_t> bits = content_stream(frame, pitch, rows, static_cast<uint32_t>(std::min<uint32_t>(s->width, in_w)),
+                                               static_cast<uint32_t>(std::min<uint32_t>(s->height, in_h)));
+    s->sent_parameter_sets = true;
+    s->outputs.find(params->outputBitstream)->second->pending.push_back(
+        {std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps});
+    return NV_ENC_SUCCESS;
   }
   if (!encodable(fmt)) {
     if (!quiet()) std::fprintf(stderr, "[vgpu] NVENC: this input format is not encoded by VirtualGPU (8-bit 4:2:0 and 32-bit RGB only)\n");
@@ -853,7 +904,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   s->sent_parameter_sets = true;
   const std::vector<uint8_t> idr = st.idr([&](int x, int y) { return f.y[static_cast<size_t>(y) * f.w + x]; },
                                           [&](int plane, int x, int y) { return (plane ? f.v : f.u)[static_cast<size_t>(y) * f.cw + x]; },
-                                          static_cast<int>(s->idr_id++));
+                                          0);
   bits.insert(bits.end(), idr.begin(), idr.end());
   Output& o = *out->second;
   o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps});

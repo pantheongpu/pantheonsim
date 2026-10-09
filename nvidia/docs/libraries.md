@@ -97,6 +97,11 @@ count, staged and running parameters, handle and buffer registration,
 batch API, the stream-ordered API, the statistics -- follows NVIDIA's libcufile
 from CUDA 13.0 on an RTX 3060 without nvidia-fs, statuses included (a data-path
 failure is -1 with the cuFile status in `errno`, as the card answers).
+A user-space file system handle (`CU_FILE_HANDLE_TYPE_USERSPACE_FS`, whose
+operation table is nvidia-fs's RDMA path's) registers, with any table but none
+(`CU_FILE_IO_NOT_SUPPORTED`), and then every `cuFileRead` and `cuFileWrite` on it
+returns 5006 -- the number, not -1 -- without calling the table or writing the
+buffer, as the card's does; this library says so once on stderr.
 `nvidia/tests/e2e/cufile_paths.cpp` passes against both libraries, the
 stream-ordered calls excepted: NVIDIA's blocks in stream memory operations
 under WSL, so those are checked on the simulator only.
@@ -134,6 +139,34 @@ checksums whose algorithm is not public (no standard CRC or hash matches
 them): a policy that computes them is refused, and one that verifies them if
 present decompresses and reports `nvcompErrorCannotVerifyChecksums`.
 
+LZ4's bitshuffle option (`nvcomp/lz4.h` documents that it works in 8 KiB
+sub-chunks over whole groups of eight elements, not the layout) is written to
+the layout the card wrote: for each bit plane, one byte per group of eight
+elements, element 0 in its low bit, the planes from the element's top bit down
+(`NVCOMP_BITSHUFFLE_MSB_FIRST`) or its bottom bit up, over 1-, 2- and 4-byte
+types (`BITS` as bytes), the elements past the last whole group left as they
+are. The card's oddities are kept: any non-zero mode but 1 compresses
+LSB-first while decompression unshuffles only modes 1 and 2; the temporary
+space is `32768 + chunk` rounded to 32 bytes per chunk with bitshuffle, 32768
+without; the decompression output alignment is the element size; and the
+8-byte integers are refused (`nvcompErrorNotSupported`) at the compress queries
+and at the decompress call. The manager classes still refuse the option.
+`nvcompGzipStreamingCompress` (`nvcomp/native/streaming_gzip.hpp`) reads a
+stream and writes it as one gzip member (the batched API reads it back), with
+the card's gigabyte workspace sizes and statuses; the streaming decompressor
+answers `nvcompErrorInvalidValue` for everything, as the RTX 3060 does -- it
+needs the hardware decompression engine, which no simulated GPU has either.
+`libnvcomp_cpu.so.5` carries `gdeflate::compressCPU`, `decompressCPU` and the
+bound `compressCPUGetMaxOutputChunkSize` with the card's limits and exception
+messages (`nvidia/tests/e2e/nvcomp_cpu.cpp`: chunks cross between the CPU and
+batched GPU interfaces both ways); `nvcomp::LZ4CPUManager` is not here.
+`nvcomp_paths`, `nvcomp_streaming` and `nvcomp_cpu` run against NVIDIA's
+libraries on the card too. Cascaded, Bitcomp and ANS stay refused, by name, once
+on stderr: nvCOMP's headers and documentation describe their options and not their
+bitstreams (nor Bitcomp's native API), so there is nothing documented to
+implement and a chunk written from guesswork would be unreadable by NVIDIA's
+library.
+
 The compressed bytes differ from NVIDIA's (another encoder makes other
 choices); the decompressed bytes never do. The queries -- alignments, maximum
 output sizes, status strings, which options are refused -- answer what nvCOMP
@@ -142,6 +175,59 @@ NVIDIA's to within 8 bytes and the temporary sizes are the simulator's (it
 needs none). A buffer too small and a corrupt chunk are
 `nvcompErrorCannotDecompress`, as documented; NVIDIA's LZ4 detects neither,
 which on the card is a write past the buffer or a fault.
+
+## NVENC and NVDEC: video, on the host
+
+`libnvidia-encode.so.1` and `libnvcuvid.so.1` are driver components that
+applications `dlopen` by their bare sonames, so the simulator supplies them the
+way it supplies `libcuda.so.1`. Everything an application can ask of either
+API is answered as an RTX 3060 (driver 595, NVENC API 13.0) answered it, from
+transcripts the card printed: `nvidia/tests/e2e/nvenc_api.cpp` with
+`nvenc_api.rtx3060.txt` (342 lines: every query, capability, preset
+configuration, limit and error string; the session's last error is sticky, as
+the card's), and `nvidia/tests/e2e/nvcuvid_paths.cpp` with
+`nvcuvid_paths.rtx3060.txt` (293 lines). `run_nvenc.sh --card` and
+`run_nvcuvid.sh --card` run the same programs against the real libraries.
+
+**NVENC.** The encoder is not NVIDIA's. An H.264 frame is written as a Baseline
+IDR picture whose every macroblock is I_PCM (`nvidia/src/nvenc_h264.hpp`,
+written from ITU-T H.264): lossless, conformant, and read back exactly by
+ffmpeg (`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR at sizes that
+are not multiples of 16 and are odd, and compares every decoded sample;
+`test_nvenc_h264` does the same with a decoder of its own, no ffmpeg needed).
+It is not compression, and rate control, GOP structure, B-frames and every
+preset setting are accepted and change nothing; every picture is an IDR with
+one `idr_pic_id`, so encoding a frame twice gives the same bytes, which
+encoder SDC tests (pantheon's `media_enc_virus`) rely on. RGB input is converted
+with the BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input
+is refused (`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it. HEVC is
+the API surface only: a session opens, answers its queries and takes every
+input format, but the bytes it returns are a stand-in (a short header and a hash
+of each tile of the input) with the same determinism, not an HEVC stream; a
+real one needs a CABAC writer that is not here. The card's own streams
+(I then P frames) decode with ffmpeg too, which is how the layouts above were
+checked.
+
+**NVDEC.** Motion JPEG is a sequence of independent JPEG pictures, and the
+simulator has a JPEG decoder, so `cudaVideoCodec_JPEG` is decoded on the host
+(nvJPEG's codec, compiled into `libnvcuvid`) and written to NV12 surfaces
+as the card writes them: the pitch (the target width rounded to 512), the
+decoded padding past the right edge of the last MCU and the zeros below the
+picture, chroma at 4:2:0 -- a 4:4:4 or 4:2:2 picture resampled bilinearly, not
+averaged in blocks, as measured -- a picture cut or padded to the decoder's
+size, and a target size resampled (bilinear to enlarge; averaging to shrink,
+which is the card's exactly only for whole factors). Pixels agree with the
+card's to within one level on the baseline and restart-interval fixtures
+(`nvidia/tests/data/jpeg`, card output in `nvidia/tests/data/nvdec`). The
+subset is sequential 8-bit Huffman JPEG; the card refuses progressive pictures
+(`CUDA_ERROR_INVALID_IMAGE`, the picture's status `Error`) and four-component
+ones (the parser skips them), and so does this. Every other codec reports
+`bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser` answer
+`CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, H.264, HEVC, VP8, VP9
+and AV1 engines, and a software decoder for them is a large separate project --
+none is here, so an application falls back to its CPU decoder instead of
+receiving a wrong picture. `cuvidCreateVideoSource` (files and URLs) needs a
+demuxer and is refused the same way.
 
 ## NVSHMEM: one GPU per process, every heap shared
 
@@ -271,8 +357,8 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included, and the `nccl*Config` forms of each) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommGetUniqueId + ncclCommGrow, ncclCommRevoke, ncclCommSuspend/Resume/MemStats, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars, the `ncclParam*` registry; the device API's host side answers as the RTX 3060 pair does (unsupported) |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
-| cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration, batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
-| nvCOMP | `libnvcomp.so.5` | the low-level batched API and the C++ manager API for LZ4, Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, and CRC32; Cascaded, Bitcomp and ANS refused (no public bitstream) |
+| cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration (user-space file system handles register but, as on the card, do no I/O), batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
+| nvCOMP | `libnvcomp.so.5`, `libnvcomp_cpu.so.5` | the low-level batched API and the C++ manager API for LZ4 (bitshuffle included), Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, CRC32, streaming gzip compression, and the CPU GDeflate library; Cascaded, Bitcomp and ANS refused (no public bitstream) |
 | NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID; the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
 | cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32 and int8 (into int8, int32, fp16, bf16) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
@@ -282,7 +368,8 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring, watershed segmentation -- every entry point OpenCV, DALI, FFmpeg, jetson-utils and the CUDA Samples call (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
-| NVENC | `libnvidia-encode.so.1` | video encode |
+| NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; H.264 frames written as lossless I_PCM streams any decoder reads, HEVC sessions with a stand-in bitstream (below) |
+| NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
 
 ## Why the math runs on the host
 
@@ -1001,17 +1088,31 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   arrives first, and work issued to a suspended communicator (a fault on the
   card, `ncclInvalidUsage` here). Shrink refuses an excluded rank outside the
   communicator, which NCCL 2.29.7 accepts and miscounts.
-- **cuFile**: the nvidia-fs (DMA) path itself, RDMA and user-space file system
-  handles (`CU_FILE_HANDLE_TYPE_USERSPACE_FS`, refused as
-  `CU_FILE_IO_NOT_SUPPORTED`), and the POSIX bounce-buffer pool's
+- **cuFile**: the nvidia-fs (DMA) path itself and RDMA -- a user-space file
+  system handle registers and its I/O returns 5006, as on the card without
+  nvidia-fs, the table never called -- and the POSIX bounce-buffer pool's
   configuration (accepted, nothing to configure).
 - **nvCOMP**: Cascaded, Bitcomp and ANS, whose bitstreams NVIDIA does not
-  publish -- every entry point answers `nvcompErrorNotSupported` -- and LZ4's
-  bitshuffle option, likewise; the container's checksums (their algorithm is
-  not public: computing them is refused, verifying them reports
-  `nvcompErrorCannotVerifyChecksums`); the CPU and streaming gzip APIs; and
-  the hardware decompression engine (the backend option is accepted;
-  everything runs on the host).
+  publish (its headers describe the options, not the formats) -- every entry
+  point answers `nvcompErrorNotSupported` and says why once; LZ4's bitshuffle
+  through the manager classes (the batched API has it); the container's
+  checksums (their algorithm is not public: computing them is refused,
+  verifying them reports `nvcompErrorCannotVerifyChecksums`);
+  `nvcomp::LZ4CPUManager`; streaming gzip decompression (the card refuses it
+  too: no hardware decompression engine); and the hardware decompression
+  engine itself (the backend option is accepted; everything runs on the host).
+- **NVENC**: HEVC (and AV1) bitstreams -- an HEVC session answers every query
+  and takes frames, returning a deterministic stand-in rather than a stream --
+  10-bit and 4:4:4 encoding (`NV_ENC_ERR_UNSUPPORTED_PARAM`), motion-only
+  encoding, asynchronous mode (refused with the card's message), and real
+  compression: H.264 frames are lossless I_PCM IDR pictures. P and B pictures
+  and rate control act on nothing.
+- **NVDEC**: every codec but JPEG (reported unsupported), progressive JPEG
+  (the card refuses it too), display-area and target-rectangle cropping,
+  deinterlacing, output formats other than NV12 (the card refuses those), video
+  sources, and the card's decode of truncated or damaged pictures (the card
+  returns success with whatever its engine makes of them; a picture the host
+  decoder cannot parse is `CUDA_ERROR_INVALID_IMAGE` here).
 - **NVSHMEM**: the MPI and OpenSHMEM bootstraps (refused by name: use the
   unique ID), PEs on more than one node and proxy or network transports, NVLink
   SHARP multicast (`nvshmemx_mc_ptr` is NULL), host-side reductions, the

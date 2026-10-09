@@ -6,10 +6,10 @@ command line -- is vendor-neutral and lives at the top of the repository.
 
 | Folder | What |
 | --- | --- |
-| `src/` | The CUDA driver and runtime, NVML, CUPTI, NVENC and the vendor libraries (cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuStateVec, cuDSS, nvJitLink, nvFatbin, cuFile, nvCOMP, NVSHMEM), each built under its real soname |
+| `src/` | The CUDA driver and runtime, NVML, CUPTI, NVENC, NVDEC (Motion JPEG) and the vendor libraries (cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuStateVec, cuDSS, nvJitLink, nvFatbin, cuFile, nvCOMP, NVSHMEM), each built under its real soname |
 | `include/` | `vgpu_cuda.h`, the driver ABI a C program links against |
 | `profiles/` | Device profiles, one per GPU. Verified profiles were measured on a physical card; each file's header says where its values came from |
-| `third_party/` | Public NCCL and NVENC headers the libraries are built against; cuDNN's are NVIDIA's and are fetched at configure time (`scripts/fetch-cudnn-headers.py`) |
+| `third_party/` | Public NCCL, NVENC and NVDEC (cuviddec.h, nvcuvid.h) headers the libraries are built against; cuDNN's are NVIDIA's and are fetched at configure time (`scripts/fetch-cudnn-headers.py`) |
 | `tools/` | `nvidia-smi` and `nvcc` for simulated machines, and the scripts that characterize and verify a profile on real hardware |
 | `tests/` | End-to-end tests that compile and run CUDA programs, conformance tests against NVIDIA's own libraries, and the C driver harness |
 | `docs/` | cuBLAS, CUPTI, the driver export tables, Python JIT frameworks, the libraries, textures |
