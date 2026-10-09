@@ -46,3 +46,10 @@ telemetry:
 cuda:
   memory_bus_width_bits: 5120
   persisting_l2_bytes: 39321600
+
+# How the SMs are grouped. NVIDIA's Hopper Architecture In-Depth gives the PCIe card '7 or 8 GPCs, 57
+# TPCs, 2 SMs/TPC, 114 SMs': the TPC count is published, the number of GPCs is not, so the layout is
+# left without it and a question that needs the GPCs (how many clusters fit) is refused by name.
+layout:
+  tpcs: 57
+  sms_per_tpc: 2

@@ -48,3 +48,12 @@ cuda:
   memory_bus_width_bits: 384
   clock_khz: 1665000
   persisting_l2_bytes: 4325376
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA Ada GPU Architecture whitepaper, Table 3 (GeForce RTX 3080 Ti): GPCs 7, TPCs 40, SMs 80.
+layout:
+  gpcs: 7
+  tpcs: 40
+  sms_per_tpc: 2

@@ -1955,7 +1955,7 @@ Still open:
 - BC6H and BC7 decoders (the arrays work; texture objects over them are refused by name). The tables are derivable from
   the card one partition at a time; the arithmetic must be fitted as BC1 to BC5 were.
 - External memory and semaphore import (needs Vulkan, Direct3D or NvSciBuf; the card's runtime crashes on invalid handles).
-- `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (SM-to-GPC layout).
+- Cluster occupancy on a part whose GPC count NVIDIA does not publish (H100 PCIe, B200, B300, GB200, GB10, Thor, Rubin): refused by name; see nvidia/docs/clusters.md.
 
 ### PTX and SASS execution
 
@@ -1975,8 +1975,7 @@ are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking w
 Still open, each with the reason:
 
 - `tex.grad`: the level of detail an RTX 3060 derives from gradients fits no formula tried (12,000 fetches
-  measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
-  fetches, measured; the runtime accepts any `maxAnisotropy` and does not model that); BC6H and BC7 texture
+  measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; BC6H and BC7 texture
   objects (the arrays work; see the runtime and driver section).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
   `.ue5m3x2` and UE5M3 scale factors: the ISA gives no exponent bias; `tcgen05.mma.ashift` and
@@ -2060,9 +2059,7 @@ with what `nvidia/src` defines):
   generic `cudaGraph*NodeSetParams`, the 12.3 `_v2` edge-data graph calls; the external memory and semaphore
   interop family; `cudaMemcpyBatchAsync`; `cudaOccupancyAvailableDynamicSMemPerBlock` (the semantics for
   infeasible requests are unclear); `cudaDeviceGetTexture1DLinearMaxWidth`; `cudaSetValidDevices`.
-- **Cluster occupancy**: `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` need the
-  SM-to-GPC grouping, which no profile records and the public documentation does not give; they refuse by
-  name once the runtime-exports PR (#309) merges.
+- **Cluster occupancy** is answered where the profile has GPC and TPC counts from NVIDIA (derived spread of the SMs over the GPCs, said once on stderr); parts without them are refused by name. Nothing is checked against a card with clusters. See nvidia/docs/clusters.md.
 - **NVML setters**: persistence mode, compute mode, power limit, clock locks, fan control, MIG/GPU-instance
   and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
   not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process

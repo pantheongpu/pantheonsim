@@ -24,6 +24,8 @@ thread_local int t_api_depth = 0;              // public calls this thread is in
 thread_local int t_silence = 0;                // Silence scopes this thread is inside
 thread_local int t_sync_depth = 0;             // waits this thread is inside
 thread_local const void* t_args[16];           // the next call's arguments (note_args)
+thread_local uint16_t t_sizes[16];
+thread_local bool t_have_sizes = false;
 thread_local int t_nargs = 0;
 thread_local const char* t_symbol = nullptr;
 
@@ -121,6 +123,7 @@ void record(Event&& e) {
     e.graph_id = t_graph_id;
     e.graph_node_id = (uint64_t{t_graph_id} << 32) | t_graph_node;
   }
+  if (const uint64_t h = e.kind == EventKind::Stream ? e.handle : e.stream) e.stream_gen = stream_generation(h);
   if (const auto hook = g_record_hook.load(std::memory_order_acquire)) hook(e);
   std::lock_guard<std::mutex> lock(g_mu);
   if (g_events.size() >= kMaxBuffered) g_events.erase(g_events.begin());
@@ -163,7 +166,21 @@ void set_hooks(const Hooks& h) {
 }
 bool hooked() { return g_hooked.load(std::memory_order_acquire); }
 
+namespace {
+std::mutex g_stream_gen_mu;
+std::unordered_map<uint64_t, uint32_t> g_stream_gen;
+}  // namespace
+uint32_t stream_generation(uint64_t handle) {
+  std::lock_guard<std::mutex> lock(g_stream_gen_mu);
+  const auto it = g_stream_gen.find(handle);
+  return it == g_stream_gen.end() ? 0u : it->second;
+}
+
 void notify_resource(const ResourceInfo& info) {
+  if (info.what == Resource::StreamDestroyStarting) {
+    std::lock_guard<std::mutex> lock(g_stream_gen_mu);
+    ++g_stream_gen[info.handle];
+  }
   if (!hooked()) return;
   Hooks h;
   {
@@ -198,10 +215,13 @@ void notify_sync(SyncKind what, uint64_t stream) {
   if (h.sync) h.sync(what, stream);
 }
 
-void note_args(const void* const* args, int n) {
+void note_args(const void* const* args, int n, const uint16_t* sizes) {
   if (!enabled() && !hooked()) return;
   t_nargs = n > 16 ? 16 : n;
   for (int i = 0; i < t_nargs; ++i) t_args[i] = args[i];
+  t_have_sizes = sizes != nullptr;
+  if (sizes)
+    for (int i = 0; i < t_nargs; ++i) t_sizes[i] = sizes[i];
 }
 void note_symbol(const char* name) {
   if (enabled() || hooked()) t_symbol = name;
@@ -261,6 +281,11 @@ ApiCall::ApiCall(const char* name, Domain domain) {
   // the one that reports them.
   const int nargs = t_nargs;
   const char* symbol = t_symbol;
+  const bool have_sizes = t_have_sizes;
+  uint16_t sizes[16];
+  if (have_sizes)
+    for (int i = 0; i < nargs; ++i) sizes[i] = t_sizes[i];
+  t_have_sizes = false;
   t_nargs = 0;
   t_symbol = nullptr;
   outermost_ = t_api_depth++ == 0;
@@ -277,6 +302,10 @@ ApiCall::ApiCall(const char* name, Domain domain) {
   // call, in storage this object owns.
   for (int i = 0; i < nargs; ++i) saved_[i] = t_args[i];
   args_ = nargs ? saved_ : nullptr;
+  if (have_sizes && nargs) {
+    for (int i = 0; i < nargs; ++i) saved_sizes_[i] = sizes[i];
+    sizes_ = saved_sizes_;
+  }
   symbol_ = symbol;
   start_ = host_ns();
   if (hooked_) {
@@ -293,6 +322,7 @@ ApiCall::ApiCall(const char* name, Domain domain) {
       info.correlation = correlation_;
       info.args = args_;
       info.nargs = nargs_;
+      info.arg_sizes = sizes_;
       info.symbol = symbol_;
       h.api(info);
     }
@@ -318,6 +348,7 @@ ApiCall::~ApiCall() {
       info.correlation = correlation_;
       info.args = args_;
       info.nargs = nargs_;
+      info.arg_sizes = sizes_;
       info.symbol = symbol_;
       info.result = result_;
       info.return_value = return_value_;

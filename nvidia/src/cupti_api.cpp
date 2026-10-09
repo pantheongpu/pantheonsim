@@ -258,12 +258,16 @@ uint32_t g_next_stream_id = 14;
 uint32_t g_next_context_id = 1;
 bool g_first_context_streams_done = false;
 
-uint32_t stream_id_of(uint64_t handle) {
+// `generation`: how many times the handle had been destroyed when the work was done
+// (vgpu::profiling::stream_generation). A real driver numbers a stream made after another
+// was destroyed afresh even when it gets the same pointer, and so does this.
+uint32_t stream_id_of(uint64_t handle, uint32_t generation) {
   if (handle == 0 || handle == 1 || handle == 2) return 7;   // 0, cudaStreamLegacy, cudaStreamPerThread
   std::lock_guard<std::mutex> lock(g_id_mu);
-  const auto it = g_stream_ids.find(handle);
+  const uint64_t key = handle ^ (uint64_t{generation} << 48);   // user-space pointers have 47 bits
+  const auto it = g_stream_ids.find(key);
   if (it != g_stream_ids.end()) return it->second;
-  return g_stream_ids.emplace(handle, g_next_stream_id++).first->second;
+  return g_stream_ids.emplace(key, g_next_stream_id++).first->second;
 }
 
 uint32_t event_id_of(uint64_t handle) {
@@ -352,7 +356,7 @@ size_t fill_kernel(uint8_t* out, const vgpu::profiling::Event& e) {
   k->deviceId = e.device;
   k->contextId = ctx_of_device(e.device);
   k->correlationId = e.correlation;
-  k->streamId = stream_id_of(e.stream);
+  k->streamId = stream_id_of(e.stream, e.stream_gen);
   k->gridX = static_cast<int32_t>(e.grid[0]);
   k->gridY = static_cast<int32_t>(e.grid[1]);
   k->gridZ = static_cast<int32_t>(e.grid[2]);
@@ -390,7 +394,7 @@ size_t fill_memcpy(uint8_t* out, const vgpu::profiling::Event& e) {
   m->deviceId = e.device;
   m->contextId = ctx_of_device(e.device);
   m->correlationId = e.correlation;
-  m->streamId = e.internal_stream >= 0 ? internal_stream_id(e.device, e.internal_stream) : stream_id_of(e.stream);
+  m->streamId = e.internal_stream >= 0 ? internal_stream_id(e.device, e.internal_stream) : stream_id_of(e.stream, e.stream_gen);
   m->bytes = e.bytes;
   m->srcKind = memory_kind(e.src_kind);
   m->dstKind = memory_kind(e.dst_kind);
@@ -415,7 +419,7 @@ size_t fill_memset(uint8_t* out, const vgpu::profiling::Event& e) {
   m->deviceId = e.device;
   m->contextId = ctx_of_device(e.device);
   m->correlationId = e.correlation;
-  m->streamId = stream_id_of(e.stream);
+  m->streamId = stream_id_of(e.stream, e.stream_gen);
   m->bytes = e.bytes;
   // A fill that is a node of a launched graph reports neither its value nor its
   // memory kind (an RTX 3060's records for one carry zero for both).
@@ -436,7 +440,7 @@ size_t fill_sync(uint8_t* out, const vgpu::profiling::Event& e) {
   r->end = e.end_ns;
   r->correlationId = e.correlation;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = (e.sync_kind == 1 || e.sync_kind == 4) ? CUPTI_SYNCHRONIZATION_INVALID_VALUE : stream_id_of(e.stream);
+  r->streamId = (e.sync_kind == 1 || e.sync_kind == 4) ? CUPTI_SYNCHRONIZATION_INVALID_VALUE : stream_id_of(e.stream, e.stream_gen);
   r->cudaEventId = e.handle ? event_id_of(e.handle) : CUPTI_SYNCHRONIZATION_INVALID_VALUE;
   return sizeof *r;
 }
@@ -455,7 +459,7 @@ size_t fill_stream(uint8_t* out, const vgpu::profiling::Event& e) {
     return sizeof *r;
   }
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.handle);
+  r->streamId = stream_id_of(e.handle, e.stream_gen);
   r->priority = static_cast<uint32_t>(e.priority);
   r->flag = (e.flags & cudaStreamNonBlocking) ? CUPTI_ACTIVITY_STREAM_CREATE_FLAG_NON_BLOCKING
                                               : CUPTI_ACTIVITY_STREAM_CREATE_FLAG_DEFAULT;
@@ -470,7 +474,7 @@ size_t fill_context(uint8_t* out, const vgpu::profiling::Event& e) {
   r->contextId = e.context_id ? e.context_id : ctx_of_device(e.device);
   r->deviceId = e.device;
   r->computeApiKind = CUPTI_ACTIVITY_COMPUTE_API_CUDA;
-  r->nullStreamId = static_cast<uint16_t>(e.stream_id ? e.stream_id : stream_id_of(0));
+  r->nullStreamId = static_cast<uint16_t>(e.stream_id ? e.stream_id : stream_id_of(0, 0));
   return sizeof *r;
 }
 
@@ -579,7 +583,7 @@ size_t fill_memory2(uint8_t* out, const vgpu::profiling::Event& e) {
   r->processId = e.process_id;
   r->deviceId = e.device;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = e.async ? stream_id_of(e.stream) : kInvalidStreamId;
+  r->streamId = e.async ? stream_id_of(e.stream, e.stream_gen) : kInvalidStreamId;
   r->isAsync = e.async ? 1 : 0;
   r->memoryPoolConfig.memoryPoolType = pool_type_of(e);
   r->memoryPoolConfig.address = e.pool_handle;
@@ -636,7 +640,7 @@ size_t fill_graph_trace(uint8_t* out, const vgpu::profiling::Event& e) {
   r->deviceId = e.device;
   r->graphId = e.graph_id;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.stream);
+  r->streamId = stream_id_of(e.stream, e.stream_gen);
 #if CUPTI_API_VERSION >= 22
   r->endDeviceId = e.device;
   r->endContextId = ctx_of_device(e.device);
@@ -657,7 +661,7 @@ size_t fill_peer_copy(uint8_t* out, const vgpu::profiling::Event& e) {
   r->end = e.end_ns;
   r->deviceId = e.device;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.stream);
+  r->streamId = stream_id_of(e.stream, e.stream_gen);
   r->srcDeviceId = e.src_device;
   r->srcContextId = ctx_of_device(e.src_device);
   r->dstDeviceId = e.dst_device;
@@ -676,7 +680,7 @@ size_t fill_cuda_event(uint8_t* out, const vgpu::profiling::Event& e) {
   r->kind = static_cast<CUpti_ActivityKind>(akind::kCudaEvent);
   r->correlationId = e.correlation;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.stream);
+  r->streamId = stream_id_of(e.stream, e.stream_gen);
   r->eventId = event_id_of(e.handle);
 #if CUPTI_API_VERSION >= 26
   r->deviceId = e.device;
@@ -1556,6 +1560,9 @@ struct Conv {
   CUpti_CallbackId cbid;
   void (*fill)(void* storage, const void* const* a);   // null: the call has no parameters
   int nargs = -1;   // how many arguments the structure is made from, where that is checked
+  // Whether the arguments the shim declares are the sizes of the fields the
+  // toolkit names (null: not checked, for the rows made by hand against a card).
+  bool (*sizes_ok)(const uint16_t* sizes) = nullptr;
 };
 
 template <class T>
@@ -1744,6 +1751,30 @@ const std::unordered_map<std::string, Conv>& driver_conversions() {
 #undef DCONV
 #undef DCONV0
 
+/* Every other driver function whose parameter structure the toolkit defines is
+   converted by rows made from its own generated_cuda_meta.h at configure time
+   (scripts/gen_cupti_driver_conv.py), as the runtime's are. The functions that
+   take no arguments, which that header gives no structure, are listed here. A
+   row checks that the shim declares the function with arguments of the sizes the
+   toolkit's fields have. The rows above, which are checked against an RTX 3060,
+   win. */
+const GeneratedConv kGeneratedDriverConversions[] = {
+#include "cupti_driver_conv.inc"
+};
+
+const std::unordered_map<std::string, Conv>& all_driver_conversions() {
+  static const std::unordered_map<std::string, Conv> table = [] {
+    std::unordered_map<std::string, Conv> t = driver_conversions();
+    for (const auto& g : kGeneratedDriverConversions) t.emplace(g.fn, g.conv);
+    for (const char* no_args : {"cuProfilerStart", "cuProfilerStop"}) {
+      const CUpti_CallbackId id = driver_cbid(no_args);
+      if (id != CUPTI_DRIVER_TRACE_CBID_INVALID) t.emplace(no_args, Conv{id, nullptr, 0});
+    }
+    return t;
+  }();
+  return table;
+}
+
 std::mutex g_cb_mu;
 CUpti_CallbackFunc g_cb_fn = nullptr;
 void* g_cb_user = nullptr;
@@ -1778,7 +1809,7 @@ thread_local uint64_t t_correlation_data = 0;   // the subscriber's, from entry 
 
 void on_api(const vgpu::profiling::ApiInfo& info) {
   const bool driver = info.domain == vgpu::profiling::Domain::Driver;
-  const auto& table = driver ? driver_conversions() : all_conversions();
+  const auto& table = driver ? all_driver_conversions() : all_conversions();
   // CUPTI calls cudaLaunchKernelEx by the C entry point it goes through.
   const std::string name = (!driver && std::strcmp(info.name, "cudaLaunchKernelEx") == 0) ? "cudaLaunchKernelExC" : info.name;
   const auto it = table.find(name);
@@ -1788,7 +1819,18 @@ void on_api(const vgpu::profiling::ApiInfo& info) {
   // The arguments are what the parameter structure is built from; without
   // them there is nothing true to put in it.
   if (conv.fill && !info.args) return;
-  if (conv.nargs >= 0 && info.nargs != conv.nargs) return;
+  if (conv.nargs >= 0 && info.nargs != conv.nargs) {
+    CUPTI_TRACE("%s not delivered to callbacks: %d arguments, the toolkit's structure has %d", info.name, info.nargs,
+                conv.nargs);
+    return;
+  }
+  // A field is filled from the argument's bytes, so a field the toolkit makes
+  // of another size than the argument is not delivered rather than filled from
+  // the wrong bytes.
+  if (conv.sizes_ok && (!info.arg_sizes || !conv.sizes_ok(info.arg_sizes))) {
+    CUPTI_TRACE("%s not delivered to callbacks: an argument is not the size of the toolkit's field", info.name);
+    return;
+  }
   CUpti_CallbackFunc fn = nullptr;
   void* user = nullptr;
   if (!cb_enabled(domain, conv.cbid, &fn, &user)) return;
@@ -2332,7 +2374,7 @@ VGPU_EXPORT CUptiResult cuptiGetDeviceId(CUcontext, uint32_t* id) {
 }
 VGPU_EXPORT CUptiResult cuptiGetStreamId(CUcontext, CUstream stream, uint32_t* id) {
   if (!id) return CUPTI_ERROR_INVALID_PARAMETER;
-  *id = stream_id_of(reinterpret_cast<uint64_t>(stream));
+  *id = stream_id_of(reinterpret_cast<uint64_t>(stream), vgpu::profiling::stream_generation(reinterpret_cast<uint64_t>(stream)));
   return CUPTI_SUCCESS;
 }
 // The numbers a profiler gives graphs, executable graphs and their nodes

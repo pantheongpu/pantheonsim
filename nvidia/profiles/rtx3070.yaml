@@ -55,3 +55,12 @@ telemetry:
 cuda:
   memory_bus_width_bits: 256
   persisting_l2_bytes: 2883584
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA Ampere GA102 GPU Architecture whitepaper, GeForce RTX 3070 table: GPCs 6, TPCs 23, SMs 46.
+layout:
+  gpcs: 6
+  tpcs: 23
+  sms_per_tpc: 2

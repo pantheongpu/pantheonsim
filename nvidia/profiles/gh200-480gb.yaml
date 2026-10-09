@@ -48,3 +48,13 @@ telemetry:
 cuda:
   memory_bus_width_bits: 6144
   persisting_l2_bytes: 39321600
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: the H100 SXM5's figures (8 GPCs, 66 TPCs, 132 SMs, NVIDIA Hopper Architecture In-Depth): the GH200's GPU has the same SM count and NVIDIA gives no separate GPC count for it.
+layout:
+  gpcs: 8
+  tpcs: 66
+  sms_per_tpc: 2
+  counts_derived: true   # not this part's own published figures; see the source above

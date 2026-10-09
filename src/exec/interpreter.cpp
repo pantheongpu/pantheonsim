@@ -1759,15 +1759,44 @@ void tex_linear(const MemoryManager& mem, const TextureDesc& d, uint32_t dims, c
   tex_finish(mem, d, terms, n, out);
 }
 
+// An explicit level of detail through a texture whose descriptor has a
+// maxAnisotropy of 2 or more and whose mip filter is linear is blended between its
+// two levels with a sharper weight than the fraction of the level (measured on an
+// RTX 3060, every fraction of every geometry): the weight is 0 for the first part
+// of the fraction and 256 (the upper level alone) for the last, and goes up at 3/2,
+// 7/4 or 2 times the rate in between -- for a maxAnisotropy of 2-3, 4-7 and 8 or
+// more. The ramp starts at lo = 128 (1 - 1/rate) 256ths of a level: 128/3, 128 * 3/7
+// and 64. The bias is not added to the level of detail first, as it is without
+// anisotropy: the card takes lod + trunc(bias - lo) + trunc(lo), with the bias in
+// 256ths and not truncated, truncating toward zero both times -- so a bias of 0 starts
+// the ramp at the floor of lo (42, 54, 64), a bias above lo at the ceiling of it, and a
+// fractional bias moves the ramp a whole 256th when it passes lo's own fraction (checked
+// for biases from -300 to 300 256ths in steps of 1/8, and next to 128/3 and 3 * 128/7
+// to 1/2048). A texture whose mip filter is point, and a fetch with no explicit level,
+// are not affected; the level clamps apply to the level of detail this makes.
+int64_t tex_aniso_lod(const TextureDesc& d, int64_t lod256) {
+  const uint32_t n = d.max_anisotropy;
+  const double lo = n < 4 ? 128.0 / 3 : n < 8 ? 128.0 * 3 / 7 : 64.0;
+  const int64_t lo_floor = static_cast<int64_t>(std::trunc(lo));
+  const int64_t t = lod256 + static_cast<int64_t>(std::trunc(d.mip_bias_exact - lo)) + lo_floor;
+  const int64_t level = t >> 8, k = t & 255;
+  const int64_t num = n < 4 ? 3 : n < 8 ? 7 : 2, den = n < 4 ? 2 : n < 8 ? 4 : 1;
+  const int64_t weight = k <= lo_floor ? 0 : std::min<int64_t>(256, num * (k - lo_floor) / den);
+  return level * 256 + weight;
+}
+
 // A mipmapped fetch's level of detail, in 1/256ths of a level (measured on
 // an RTX 3060): an explicit lod is truncated toward zero to 1/256 and the
-// bias added, a plain fetch is level 0 without the bias; then the texture's
-// level clamps, then the levels that exist.
+// bias added, a plain fetch is level 0 without the bias; an anisotropic
+// texture with a linear mip filter instead sharpens the blend between the two
+// levels (tex_aniso_lod); then the texture's level clamps, then the levels
+// that exist.
 int32_t tex_mip_lod(const TextureDesc& d, bool explicit_lod, double lod) {
   int64_t q = 0;
   if (explicit_lod) {
     const double scaled = std::trunc(lod * 256);
-    q = static_cast<int64_t>(std::clamp(scaled, -1e9, 1e9)) + d.mip_bias;
+    q = static_cast<int64_t>(std::clamp(scaled, -1e9, 1e9));
+    q = d.max_anisotropy >= 2 && d.mip_filter == TexFilter::Linear ? tex_aniso_lod(d, q) : q + d.mip_bias;
   }
   q = std::clamp<int64_t>(q, d.mip_min, std::max(d.mip_min, d.mip_max));
   q = std::clamp<int64_t>(q, 0, int64_t{d.mip_levels - 1} * 256);

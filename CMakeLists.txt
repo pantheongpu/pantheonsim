@@ -500,6 +500,23 @@ if(CUDA_ABI_INCLUDE)
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_conv_inc}.tmp" "${_conv_inc}")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
                "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py")
+  # The driver calls' parameter structures, from generated_cuda_meta.h the same
+  # way (scripts/gen_cupti_driver_conv.py).
+  set(_dconv_inc "${CMAKE_BINARY_DIR}/gen/cupti_driver_conv.inc")
+  if(VGPU_PYTHON AND EXISTS "${CUDA_ABI_INCLUDE}/generated_cuda_meta.h" AND EXISTS "${_dcbid_header}")
+    execute_process(
+      COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_driver_conv.py"
+              "${CUDA_ABI_INCLUDE}/generated_cuda_meta.h" "${_dcbid_header}" "${_dconv_inc}.tmp"
+      RESULT_VARIABLE _dconv_rc)
+    if(NOT _dconv_rc EQUAL 0)
+      file(WRITE "${_dconv_inc}.tmp" "")
+    endif()
+  else()
+    file(WRITE "${_dconv_inc}.tmp" "")
+  endif()
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dconv_inc}.tmp" "${_dconv_inc}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_driver_conv.py")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -2170,6 +2187,24 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # maxAnisotropy and explicit-level fetches (295 cases, both engines), against an RTX 3060.
+  add_test(NAME e2e_texture_anisotropy
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_anisotropy.sh)
+  set_tests_properties(e2e_texture_anisotropy PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
+  # Cluster occupancy (nvidia/docs/clusters.md): an RTX 3060's own answers, and the GPC layouts of the parts with clusters.
+  add_test(NAME e2e_cluster_occupancy
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cluster_occupancy.sh)
+  set_tests_properties(e2e_cluster_occupancy PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_texture_srgb
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_srgb.sh)
   set_tests_properties(e2e_texture_srgb PROPERTIES
@@ -2357,7 +2392,7 @@ if(TARGET vgpucupti)
   # allocation and pool records, graphs, modules and streams, and the switches
   # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
   # an RTX 3060 (nvidia/docs/cupti.md).
-  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um)
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um compat12 driver_params)
     add_test(NAME e2e_cupti_${_case}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
     set_tests_properties(e2e_cupti_${_case} PROPERTIES
@@ -2608,6 +2643,15 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME lint_capture_coverage
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+  # Every exported runtime and driver function is a call a profiler is told of,
+  # and the driver shim takes the argument sizes the toolkit declares (CUPTI
+  # reads them by those sizes).
+  add_test(NAME lint_cupti_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_cupti_coverage.py)
+  add_test(NAME lint_driver_arg_sizes
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_arg_sizes.py
+                   ${CUDA_ABI_INCLUDE})
+  set_tests_properties(lint_driver_arg_sizes PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES

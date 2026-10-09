@@ -57,6 +57,12 @@ The memory column is NVIDIA's "GB", which for these boards is binary (an A100
 40 GB reports 40960 MiB). A real card shows a little less in `nvidia-smi`
 because the driver keeps some, so each figure is an upper bound until measured.
 
+## GPC layout
+
+A profile may carry a `layout:` section (`gpcs`, `tpcs`, `sms_per_tpc`): the GPC and TPC counts NVIDIA's
+whitepapers publish for the part, which cluster occupancy needs. The spread of the SMs over the GPCs is always derived,
+and a part with no published GPC count has none. See [clusters.md](clusters.md) for the table and the rules.
+
 ## Placeholder PCI ids
 
 NVIDIA has published no PCI device id for Rubin or for Thor's GPU. Rechecked on
