@@ -32,10 +32,14 @@
 //     integers, ReLU's signed zero, the bias type, and alpha-vector scaling.
 // What is not the card's: the configuration a search picks (the simulator
 // has one kernel), and the workspace a plan asks for is the card's for the
-// default split-K but is never used. Refused, with a message: FP8/FP4 inputs
-// and fp16 compute (the card refuses both on sm_86); scale modes are
-// accepted and ignored, as the card accepts them on these types;
-// GELU outside int8 output is INVALID_VALUE, as on the card. A call on a
+// default split-K but is never used. FP8 (E4M3, E5M2) products are the L4's (sm_89: fp32
+// compute into fp16, bf16 or fp32, K-contiguous operands, GELU into bf16; an RTX 3060 accepts the
+// matmul descriptor and refuses the algorithm), and FP4 reaches the algorithm selection as on
+// those cards (nvidia/docs/lowprec.md, nvidia/tests/data/lowprec/sparselt.*.txt). Refused, with a
+// message: fp16 compute (no kernel on sm_86 or sm_89 on NVIDIA's library either), FP8 outputs,
+// the block scale modes, and FP4 and FP8 on Hopper and Blackwell (documentation only: no
+// such GPU was available); scale pointers are accepted and ignored, as those cards ignore them;
+// GELU outside int8 and FP8-into-bf16 output is INVALID_VALUE, as on the card. A call on a
 // stream that is capturing a graph is recorded and runs at each launch.
 #include "../include/vgpu_cusparselt.h"
 
