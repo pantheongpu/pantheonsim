@@ -489,6 +489,7 @@ bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep) {
   const size_t T = d->threads ? d->threads : dropout_threads();
   std::vector<uint32_t> words;
   if (d->states) {
+    if (d->state_bytes < T * 48) return false;  // a buffer too small for these generators (set on another device)
     words.resize(T * kStateWords);
     if (cudaMemcpy(words.data(), d->states, T * 48, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
   } else {

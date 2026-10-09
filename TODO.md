@@ -1856,11 +1856,12 @@ behaviour, timing).
   (nvidia/src/generated/cublas_stubs.cpp:29).
 - **cuBLASLt**: FP8 aux scale/amax, per-batch block scales, UE8M0 modes; the block-scaled modes are
   derived from documentation, not checked against a card.
-- **cuDNN graph API**: interpolating resample, FP8/MXFP8 attention, block masks, sinks in backward
-  attention, INT8x32 reordered filters, multi-GPU norm, MoE/RoPE/band ops, dropout-mask layout; PyTorch's
-  cuDNN graphs with ops beyond convolution, matmul, pointwise, reduction, normalization and pooling are
-  refused at finalize (nvidia/docs/pytorch.md:76-82). **Classic API**: Volta/Turing fused ops, undocumented
-  ops, RNN/attention dropout masks.
+- **cuDNN graph API**: interpolating resample beyond bilinear upsampling by 2 (the one configuration with an
+  engine), FP8/MXFP8 attention, block masks, INT8x32 reordered filters, multi-GPU norm across processes,
+  MoE backward / band ops / standalone RoPE (no engine on the RTX 3060; Hopper/Blackwell unchecked), the fused
+  attention kernels' dropout-mask layout (Philox). Done in round 3: multi-GPU norm (threads of one process),
+  bilinear 2x, classic/RNN/attention dropout bit for bit (cuRAND XORWOW states), SCALE_BIAS_ACTIVATION_WGRAD.
+  **Classic API**: the fused ops marked "reserved for future use", RNN dropout with padded I/O.
 - **cuFFT**: legacy callbacks (`CUFFT_NOT_IMPLEMENTED`), LTO-IR callbacks; multi-GPU layouts measured on
   two GPUs only.
 - **cuSPARSE**: the `csrmv` family, SDDMM conjugate transpose, SpMMOp (LTO-IR), `csrcolor` colours

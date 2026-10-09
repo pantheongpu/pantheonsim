@@ -376,10 +376,16 @@ outside [0, 1] is accepted, bfloat16 is `NOT_SUPPORTED`. An RNN's dropout
 between layers is the same kernel: after each layer but the last, each
 direction of the next layer gets a mask of its own over the whole of the
 lower layer's output, `[T][B][hidden * dirs]`, forward direction first, layer
-after layer. `e2e_dnn_dropout` and `e2e_dnn_rnn_dropout` check all of it
-against a host model on the card's library and on this one. Not measured, and
-so not claimed: sequences shorter than the longest in a padded batch, and the
-attention API's dropout descriptors (see "What is not implemented").
+after layer. The classic multi-head attention API's two dropouts are the same
+kernel too: the attention dropout is one application over the probabilities,
+`[batch][beam][head][query step][key step]`, the post dropout one over the
+output vectors, `[batch][beam][query step][output]`, applied after the output
+projection and before the residual is added, both over the dimensions of the
+data the call was given, padded steps included.
+`e2e_dnn_dropout`, `e2e_dnn_rnn_dropout` and `e2e_dnn_attn_dropout` check all of
+it against a host model on the card's library and on this one. Not measured,
+and so not claimed: an RNN batch of sequences shorter than the longest
+(padded I/O), and the states size of GPUs other than the RTX 3060.
 
 Two more things the card does that were first taken for refusals. The classic
 API's fused `CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD` (the weight gradient of
@@ -443,9 +449,19 @@ is INT8, the maximum's row-major position within its window with padded taps
 counted, and the backward pass may read it in place of x; nearest and
 bilinear resampling refuse a window other than 2 when the descriptor is
 finalized (cuDNN documents this for bilinear; the hardware also does it for
-nearest), and the RTX 3060 offers no engine for either in any layout,
-direction or scale, so with no documented sampling rule they are refused
-here; an INT8x4 vectorized convolution (a channel dimension holding vectors
+nearest). Interpolation has one configuration with an engine, which cuDNN
+documents for its runtime-fusion engines: bilinear upsampling by 2 (NHWC, float,
+window 2, strides 1/2, pre-padding 1/2, post-padding 1, so that the output
+is twice the input). It runs on the RTX 3060: output i samples the input at
+`s = i * stride - pre + window / 2 - 1/2` per dimension (that is i / 2),
+clamped to the input, between the pixels either side of s by their distance
+(zero and edge-value padding give the same output); half and bfloat16 data get an engine
+whose plan cannot be built (cudnn-frontend's build_plans fails). Everything
+else has no engine -- nearest in every configuration (cuDNN documents that),
+NCHW, other scales and paddings, backward upsampling (cuDNN documents that
+too) -- and is refused here the same way. An earlier version of this
+paragraph said the card had no interpolation engine at all; it had been probed
+with parameters outside the documented ones. An INT8x4 vectorized convolution (a channel dimension holding vectors
 of 4) saturates as the classic API's INT8 convolution does.
 
 The rest of the classic API was measured on the same card and matched.
@@ -907,21 +923,27 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   3060, sm_86) runs them; the backward epilogues match the card, except that
   GELU and its derivative are exact where the card's fp32 tanh is
   approximate (within about 5e-5).
-- **cuDNN**: in the graph API, interpolating resampling (nearest,
-  bilinear: no engine on the hardware, no documented sampling rule), FP8
+- **cuDNN**: in the graph API, interpolating resampling beyond bilinear
+  upsampling by 2 (the one configuration cuDNN has an engine for; nearest
+  has none, which cuDNN documents), FP8
   and block-scaled (MXFP8) attention and the block-scale (de)quantize
   operations, attention's block masks and cumulative sequence lengths,
   sinks in the backward attention operation, reordered (INT8x32-interleaved)
-  filters, multi-GPU normalization, the MoE, RoPE and band-matrix
-  operations, and cuDNN's own dropout mask layout (the mask is drawn from
-  the documented generator but not placed as its kernels place it); in the
-  classic API, the fused ops cuDNN runs only on
-  Volta and Turing (`SCALE_BIAS_ACTIVATION_WGRAD`,
-  `CONV_SCALE_BIAS_ADD_ACTIVATION`, which an RTX 3060 refuses too) and the
-  two undocumented ones, multi-head attention's one-to-one query mapping
-  with beams (refused by the hardware as well), and NVIDIA's own dropout
-  masks in RNNs and attention (the fraction kept and the scaling are
-  cuDNN's; the generator is this library's).
+  filters, multi-GPU normalization across processes (its executions meet
+  in memory, so they must be threads of one process; with more than two GPUs
+  the gradients' division by the number of GPUs is assumed), the MoE
+  backward, band-matrix and standalone RoPE operations (no engine on the
+  RTX 3060, the only GPU measured; whether Hopper and Blackwell have one
+  was not checked), and the dropout mask layout of the fused attention
+  kernels (the mask is drawn from the documented Philox generator but not
+  placed as the kernels place it; the classic API's dropout, RNN and
+  multi-head attention included, is cuDNN's own bit for bit); in the
+  classic API, the fused ops cuDNN's header marks "reserved for future use"
+  (`CONV_SCALE_BIAS_ADD_ACTIVATION` and the two undocumented ones), which
+  the card refuses too, multi-head attention's one-to-one query mapping
+  with beams (refused by the hardware as well), and the dropout masks of
+  an RNN batch of sequences shorter than the longest (padded I/O), whose
+  layout was not measured.
 - **cuFFT**: legacy callbacks (`cufftXtSetCallback` with a device function
   pointer), which NVIDIA ships only in its static library: its `libcufft.so`
   answers every legacy callback call with `CUFFT_NOT_IMPLEMENTED`, and so does
