@@ -932,9 +932,10 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   filters, multi-GPU normalization across processes (its executions meet
   in memory, so they must be threads of one process; with more than two GPUs
   the gradients' division by the number of GPUs is assumed), the MoE
-  backward, band-matrix and standalone RoPE operations (no engine on the
-  RTX 3060, the only GPU measured; whether Hopper and Blackwell have one
-  was not checked), and the dropout mask layout of the fused attention
+  backward (cuDNN's engine for it wants Hopper or Blackwell and, documented, cuBLASLt 13.5, newer than this stack's),
+  band-matrix and standalone RoPE operations (no engine on the RTX 3060, the
+  only GPU measured; whether Hopper and Blackwell have one was not checked:
+  the AWS H100 launch for it was denied), and the dropout mask layout of the fused attention
   kernels (the mask is drawn from the documented Philox generator but not
   placed as the kernels place it; the classic API's dropout, RNN and
   multi-head attention included, is cuDNN's own bit for bit); in the

@@ -1274,8 +1274,8 @@ bool op_of(const Desc* d, Op* op, std::string* why) {
       // Operations an RTX 3060 (cuDNN 9.27) finalizes and builds a graph
       // from but offers no engine for -- measured: the heuristics return
       // nothing for the band-matrix operations (which cudnn-frontend never
-      // emits) and the MoE backward pass (Hopper and Blackwell, and a
-      // cuBLASLt newer than 13.1) -- so there is no result to match and no
+      // emits) and the MoE backward pass (measured to want Hopper or Blackwell; and
+      // cudnn-frontend documents cuBLASLt 13.5, newer than this stack's) -- so there is no result to match and no
       // layout to learn: they are never run.
       op->kind = Kind::NoEngine;
       const bool moe = d->type == CUDNN_BACKEND_OPERATION_MOE_GROUPED_MATMUL_BWD_DESCRIPTOR;
