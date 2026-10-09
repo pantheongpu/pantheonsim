@@ -213,6 +213,15 @@ struct Wave {
   // waiting on it, and whether the wave is waiting on it now.
   uint8_t nb_joined = 0;
   bool nb_complete = false, nb_wait = false;
+  // How many global loads the wave has issued that no s_waitcnt has waited for yet (capped), and
+  // whether it gave up its turn at such a wait (run_round). A load takes a card hundreds of cycles
+  // and a barrier, an LDS read or a wave next to this one a few: the waves of a group that wait for
+  // a load let the others on, so that a wave that read LDS after a barrier sees what it did before
+  // the wave that went on to a load overwrote it.
+  uint32_t loads_in_flight = 0;
+  bool soft_yield = false;
+  bool round_stopped = false;
+  uint64_t round_steps = 0;
   // At a GWS barrier (Machine::gws_barrier): counted there, and waiting for
   // the barrier's generation to move past this one.
   bool gws_waiting = false;
@@ -6720,6 +6729,25 @@ struct Machine {
     w.scc = g.nb_members[id] == 0;
     if (g.nb_members[id] && g.nb_signaled[id] >= g.nb_members[id]) named_barrier_complete(g, id);
   }
+  static void issued_load(Wave& w) {
+    if (w.loads_in_flight < 63) ++w.loads_in_flight;
+  }
+  // The number of loads an s_waitcnt lets stay outstanding: vmcnt, in the bits the target puts it
+  // (gfx9 and gfx10: 3:0 and 15:14; gfx11: 15:10).
+  static uint32_t vm_count_of_waitcnt(const Inst& in) {
+    const uint32_t imm = in.simm;
+    if (in.arch == gcn::Target::Gfx1100) return (imm >> 10) & 0x3F;
+    return (imm & 0xF) | ((imm >> 14) & 3) << 4;
+  }
+  // A wait for loads: all but `allowed` of them must have arrived. A wave of a group with others to run
+  // that has loads to wait for gives them a turn first (Wave::soft_yield; run_round).
+  static bool waited_for_loads(Wave& w, const Group& g, const Inst&, uint32_t allowed) {
+    if (w.loads_in_flight <= allowed) return true;
+    w.loads_in_flight = allowed;
+    if (g.waves.size() < 2) return true;
+    w.soft_yield = true;
+    return false;
+  }
 
   bool step(Wave& w, Group& g) {
     if (debug::active() &&
@@ -6848,7 +6876,7 @@ struct Machine {
         ++n.flat;
         if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic, ++n.vmem_wr;
         else if (in.name.find("_store") != std::string::npos) ++n.flat_write, ++n.vmem_wr;
-        else ++n.flat_read, ++n.vmem_rd;
+        else ++n.flat_read, ++n.vmem_rd, issued_load(w);
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
         else if (in.name.find("_load_lds_") != std::string::npos) global_load_lds(w, in, g), ++n.lds;
@@ -6871,13 +6899,13 @@ struct Machine {
           return true;
         }
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
-        else ++n.vmem_rd;
+        else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mtbuf:
         ++n.vmem;
         if (in.name.find("_store") != std::string::npos) ++n.vmem_wr;
-        else ++n.vmem_rd;
+        else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mimg:
@@ -6887,7 +6915,7 @@ struct Machine {
         }
         ++n.vmem;
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
-        else ++n.vmem_rd;
+        else ++n.vmem_rd, issued_load(w);
         image_access(w, in);
         return true;
       case gcn::Enc::Sopp: break;
@@ -6901,7 +6929,8 @@ struct Machine {
       w.done = true;
       return false;
     }
-    if (OpName(in.name) == "s_nop"_op || OpName(in.name) == "s_waitcnt"_op) return true;   // nothing is out of order here
+    if (OpName(in.name) == "s_waitcnt"_op) return waited_for_loads(w, g, in, vm_count_of_waitcnt(in));
+    if (OpName(in.name) == "s_nop"_op) return true;   // nothing is out of order here
     // RDNA's scheduling hints -- a clause of memory instructions, the delay
     // an ALU result needs, the dependency and prefetch controls -- change
     // nothing where every instruction completes before the next begins.
@@ -6909,6 +6938,7 @@ struct Machine {
         OpName(in.name) == "s_waitcnt_depctr"_op || OpName(in.name) == "s_set_inst_prefetch_distance"_op)
       return true;
     // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
+    if (OpName(in.name) == "s_wait_loadcnt"_op) return waited_for_loads(w, g, in, in.simm & 0x3F);
     if (in.name.rfind("s_wait_", 0) == 0 && in.name != "s_wait_event") return true;
     if (in.arch == gcn::Target::Gfx1250 && OpName(in.name) == "s_barrier_leave"_op) {
       gfx1250_barrier_leave(w, g);
@@ -7239,20 +7269,36 @@ std::atomic<bool> g_abandoned{false};
 bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   bool runnable = false;
-  for (Wave& w : group.waves) {
-    if (w.done || w.at_barrier || w.nb_wait) continue;
-    runnable = true;
-    uint64_t pc = w.pc;
-    try {
-      for (uint64_t n = 0; m.step(w, group); ++n) {
-        pc = w.pc;
-        if (slice && n + 1 >= slice) break;
-        if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
+  // A wave that waits for a global load gives the others its turn (Wave::soft_yield), as the load's
+  // latency does on a card, and has the rest of the round after them; the turn counts across those
+  // pauses, so a wave polling memory with loads in its loop still ends its round.
+  for (Wave& w : group.waves) w.round_stopped = false, w.round_steps = 0;
+  bool again;
+  do {
+    again = false;
+    for (Wave& w : group.waves) {
+      if (w.done || w.at_barrier || w.nb_wait || w.round_stopped) continue;
+      runnable = true;
+      uint64_t pc = w.pc;
+      try {
+        uint64_t n = w.round_steps;
+        for (; m.step(w, group); ++n) {
+          pc = w.pc;
+          if (slice && n + 1 >= slice) break;
+          if ((n & 4095) == 4095 && g_abandoned.load(std::memory_order_relaxed)) abandon();
+        }
+        w.round_steps = n;
+      } catch (const Error& e) {
+        throw m.at_instruction(e, pc);
       }
-    } catch (const Error& e) {
-      throw m.at_instruction(e, pc);
+      if (w.soft_yield) {
+        w.soft_yield = false;
+        again = true;
+      } else {
+        w.round_stopped = true;
+      }
     }
-  }
+  } while (again);
   if (runnable) return false;
   // Every wave is stopped or waiting: release the barrier.
   bool any = false;
