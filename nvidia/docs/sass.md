@@ -40,7 +40,12 @@ fatbin -> cubin (ELF) loader -> decoder (per-arch tables) -> SASS warp executor
 
 - **Selection** (`driver_api.cpp`, `runtime_api.cpp`): a fatbin's ELF image for
   the device's architecture wins over its PTX, by the driver's rules: `sm_XY`
-  SASS runs on the same major at minor Y or newer; `sm_XYa` only on XY.
+  SASS runs on the same major at minor Y or newer; `sm_XYa` only on XY (an
+  `sm_100a` cubin is no candidate on a B300, 10.3, or a Vera Rubin, 10.7, and
+  the fatbin's plain PTX, when it has some, runs there instead). Whether a
+  cubin is `a` is not in `e_flags`: it is the record with attribute 9 in
+  `.nv.compat` (1 for `a`, 0 for plain and for `f`, measured on cubins CUDA
+  12.0's and 13.0's nvcc write).
 - **Loader**: kernel sections `.text.<name>`, per-kernel attributes from
   `.nv.info.<name>` (parameter layout, register count, shared memory, barrier
   count), constant sections, globals and relocations.
