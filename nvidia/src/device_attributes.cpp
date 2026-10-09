@@ -207,9 +207,9 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     // Sparse and deferred-mapped CUDA arrays are not implemented: a card
     // says 1, and a program that sees it makes one.
     case kSparseCudaArraySupported: v = 0; break;
-    // cuMemHostRegister refuses CU_MEMHOSTREGISTER_READ_ONLY, because nothing
-    // here would stop a kernel writing the memory.
-    case kReadOnlyHostRegisterSupported: v = 0; break;
+    // cuMemHostRegister takes CU_MEMHOSTREGISTER_READ_ONLY: a kernel's store or atomic to the
+    // range faults, as on an RTX 3060, which answers 1.
+    case kReadOnlyHostRegisterSupported: v = 1; break;
     case kTimelineSemaphoreInteropSupported: v = 0; break;
     // The stream-ordered allocator is implemented (cudaMallocAsync, the
     // cudaMemPool* API), and the runtime says so.

@@ -335,7 +335,10 @@ class MemoryManager {
   //
   // Cost when unused is one relaxed atomic load, so a program with no managed
   // memory pays nothing.
-  void map_host(uint64_t addr, void* host, uint64_t len);
+  //
+  // `read_only` is memory registered with cudaHostRegisterReadOnly: the device may read it, and a
+  // store or atomic to it faults (an RTX 3060: cudaErrorLaunchFailure at the next synchronize).
+  void map_host(uint64_t addr, void* host, uint64_t len, bool read_only = false);
   void unmap_host(uint64_t addr);
   // True when `addr` falls in a mapped host buffer rather than device VA.
   bool is_host_mapped(uint64_t addr) const;
@@ -503,6 +506,7 @@ class MemoryManager {
     uint64_t base = 0;
     uint64_t len = 0;
     uint8_t* host = nullptr;
+    bool read_only = false;
   };
   // Behind a pointer, and not for indirection's sake: a mutex and an atomic as
   // direct members make MemoryManager non-movable, and it is moved (a test
@@ -552,7 +556,7 @@ class MemoryManager {
     uint8_t* host;
     uint64_t offset, len;
   };
-  bool host_pieces(uint64_t addr, uint64_t len, std::vector<HostPiece>* pieces) const;
+  bool host_pieces(uint64_t addr, uint64_t len, std::vector<HostPiece>* pieces, bool for_write = false) const;
   // Where a kernel's scalar access lands: bytes in a chunk, memory nothing has
   // written (a load reads zero and must not copy), a uniform chunk (a load reads
   // its byte; a store of that same byte changes nothing), or a managed host

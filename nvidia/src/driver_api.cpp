@@ -1140,6 +1140,17 @@ static CUresult memcpy_htod(CUdeviceptr dst, const void* src, size_t n, CUstream
 static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyDtoH", true, false, [&](ShimState& s) {
     if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
+    // Memory registered read-only is not a destination for a copy (an RTX 3060: INVALID_VALUE).
+    if (n) {
+      const auto& regs = s.rt->host_registrations();
+      auto it = regs.lower_bound(static_cast<char*>(dst) + n);
+      if (it != regs.begin()) {
+        --it;
+        if ((it->second.flags & CU_MEMHOSTREGISTER_READ_ONLY) &&
+            static_cast<const char*>(it->first) + it->second.size > static_cast<const char*>(dst))
+          return CUDA_ERROR_INVALID_VALUE;
+      }
+    }
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
     dev_read(s, dst, src, n);
     record_copy(s, 2, dst, reinterpret_cast<const void*>(src), n, t0, stream, async);
@@ -2682,12 +2693,10 @@ VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
 
 VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int flags) {
   return api("cuMemHostRegister", true, false, [&](ShimState& s) {
-    // PORTABLE, DEVICEMAP, IOMEMORY and READ_ONLY; nothing else. Read-only
-    // registration is not supported -- nothing here would stop a kernel
-    // writing -- which READ_ONLY_HOST_REGISTER_SUPPORTED (113) says, and
-    // which the documented answer for a device without it is.
+    // PORTABLE, DEVICEMAP, IOMEMORY and READ_ONLY; nothing else. Read-only registration works
+    // (READ_ONLY_HOST_REGISTER_SUPPORTED, 113, is 1): the device reads the range and a kernel's
+    // store or atomic to it faults, as on an RTX 3060.
     if (!p || bytesize == 0 || (flags & ~0xFu)) return CUDA_ERROR_INVALID_VALUE;
-    if (flags & CU_MEMHOSTREGISTER_READ_ONLY) return CUDA_ERROR_NOT_SUPPORTED;
     auto& regs = registrations(s);
     const char* lo = static_cast<const char*>(p);
     void* hi = static_cast<char*>(p) + bytesize;
@@ -2704,7 +2713,8 @@ VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int
       return CUDA_ERROR_INVALID_VALUE;
     const int dev = current_device(s);
     for (int d = 0; d < s.rt->device_count(); ++d)
-      s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
+      s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize,
+                                        (flags & CU_MEMHOSTREGISTER_READ_ONLY) != 0);
     regs[p] = vgpu::runtime::HostRange{bytesize, dev, flags};
     return CUDA_SUCCESS;
   });

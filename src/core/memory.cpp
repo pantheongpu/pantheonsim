@@ -376,11 +376,18 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
   return expected;
 }
 
+// A device store, atomic or copy into memory registered read-only. The card faults the kernel and
+// the context ends (cudaErrorLaunchFailure), so this is a trap, not a bad pointer.
+[[noreturn]] static void throw_read_only_host_write(uint64_t addr, uint64_t len) {
+  throw Error::make(Err::Trap, "write of ", len, " bytes at ", Hex{addr},
+                    " to host memory registered with cudaHostRegisterReadOnly");
+}
+
 void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
   if (len == 0) return;
   // Host memory mapped here is filled where it is, the pattern's phase
   // running on across pieces.
-  if (std::vector<HostPiece> pieces; host_pieces(dst, len, &pieces)) {
+  if (std::vector<HostPiece> pieces; host_pieces(dst, len, &pieces, true)) {
     for (const HostPiece& p : pieces)
       for (uint64_t i = 0; i < p.len; ++i) p.host[i] = pattern[(p.offset + i) % pattern_len];
     return;
@@ -443,11 +450,12 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (host_maps_ && host_maps_->may_contain(dst)) {
     std::lock_guard<std::mutex> lock(host_maps_->mu);
     if (const HostMap* m = find_host_map_locked(dst, len)) {
+      if (m->read_only) throw_read_only_host_write(dst, len);
       std::memcpy(m->host + (dst - m->base), src, len);
       return;
     }
   }
-  if (std::vector<HostPiece> pieces; src && host_pieces(dst, len, &pieces)) {
+  if (std::vector<HostPiece> pieces; src && host_pieces(dst, len, &pieces, true)) {
     for (const HostPiece& p : pieces) std::memcpy(p.host, static_cast<const uint8_t*>(src) + p.offset, p.len);
     return;
   }
@@ -479,13 +487,15 @@ void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   }
 }
 
-bool MemoryManager::host_pieces(uint64_t addr, uint64_t len, std::vector<HostPiece>* pieces) const {
+bool MemoryManager::host_pieces(uint64_t addr, uint64_t len, std::vector<HostPiece>* pieces,
+                                bool for_write) const {
   if (!host_maps_ || !host_maps_->may_contain(addr)) return false;
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   pieces->clear();
   for (uint64_t at = addr, left = len; left;) {
     const HostMap* m = find_host_map_locked(at, 1);
     if (!m) return false;
+    if (for_write && m->read_only) throw_read_only_host_write(at, left);
     const uint64_t n = std::min(left, m->base + m->len - at);
     pieces->push_back({m->host + (at - m->base), at - addr, n});
     at += n;
@@ -502,9 +512,9 @@ const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
   return nullptr;
 }
 
-void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len) {
+void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len, bool read_only) {
   std::lock_guard<std::mutex> lock(host_maps_->mu);
-  host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host)});
+  host_maps_->maps.push_back(HostMap{addr, len, static_cast<uint8_t*>(host), read_only});
   // The allocator hands freed host addresses out again, so an old record of a
   // free at this address now describes someone else's live buffer.
   std::erase_if(host_maps_->retired, [&](const HostMap& r) {
@@ -876,6 +886,8 @@ uint8_t* MemoryManager::host_address(uint64_t addr, uint64_t len) const {
   if (!host_maps_->may_contain(addr)) return nullptr;
   std::lock_guard<std::mutex> lock(host_maps_->mu);
   const HostMap* m = find_host_map_locked(addr, len);
+  // The one caller that gets a pointer to write through is an atomic.
+  if (m && m->read_only) throw_read_only_host_write(addr, len);
   return m ? m->host + (addr - m->base) : nullptr;
 }
 
@@ -1026,11 +1038,22 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
-  if (up == live_.begin()) return false;
-  auto prev = std::prev(up);
-  if (addr >= prev->first + prev->second.size) return false;
-  if (base) *base = prev->first;
-  if (size) *size = prev->second.size;
+  if (up != live_.begin()) {
+    auto prev = std::prev(up);
+    if (addr < prev->first + prev->second.size) {
+      if (base) *base = prev->first;
+      if (size) *size = prev->second.size;
+      return true;
+    }
+  }
+  // Memory exported for another process to map (cudaIpcGetMemHandle) leaves the chunk table for
+  // a file of its own, and an imported one lives only there; both are still allocations.
+  auto sh = shared_.upper_bound(addr);
+  if (sh == shared_.begin()) return false;
+  --sh;
+  if (addr >= sh->second.va + sh->second.size) return false;
+  if (base) *base = sh->second.va;
+  if (size) *size = sh->second.size;
   return true;
 }
 
@@ -1102,6 +1125,7 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       // An atomic store of its width, as load_scalar's load is.
       std::lock_guard<std::mutex> lock(host_maps_->mu);
       if (const HostMap* m = find_host_map_locked(addr, size)) {
+        if (m->read_only) throw_read_only_host_write(addr, size);
         store_at(m->host + (addr - m->base), size, value);
         return;
       }
