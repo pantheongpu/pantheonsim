@@ -2946,6 +2946,16 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # cuDNN's classic API (convolution, activation, pooling, softmax, normalization, tensor
+  # arithmetic, the spatial transformer, CTC, dropout, RNNs, attention) inside a captured
+  # CUDA graph: each call is recorded, its descriptors destroyed, and the graph launched with
+  # new inputs (run_graph_capture.sh dnn cudnn --card runs the same program against NVIDIA's).
+  add_test(NAME e2e_graph_capture_dnn COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture.sh dnn cudnn)
+  set_tests_properties(e2e_graph_capture_dnn PROPERTIES
+    DEPENDS "vgpucudart;vgpucudnn"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # The rest of cuDNN's classic API -- vectorized INT8x4/INT8x32 layouts and
   # convolution, INT8 pooling and activation, divisive normalization, tensor
   # transform descriptors, LSTM projections and the RNN getters -- against

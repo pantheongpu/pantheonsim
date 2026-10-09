@@ -165,6 +165,13 @@ struct Runner {
     bool produced = false;
     for (const Out& o : outs) produced = produced || any_nonzero(read(o));
     expect(name + ": the call writes something", produced);
+    bool finite = true;
+    for (const Out& o : outs)
+      if (o.t == Dt::F32 || o.t == Dt::F64 || o.t == Dt::F16) {
+        const auto b = read(o);
+        for (size_t i = 0; i + dt_bytes(o.t) <= b.size(); i += dt_bytes(o.t)) finite = finite && std::isfinite(value(b.data() + i, o.t));
+      }
+    expect(name + ": its results are finite", finite);
 
     zero(outs);
     cudaGraph_t graph = nullptr;
