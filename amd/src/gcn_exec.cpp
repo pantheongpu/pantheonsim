@@ -898,6 +898,17 @@ struct Machine {
   }
   // Register k of an operand that covers several, in whichever bank it names:
   // memory instructions move vector or accumulation registers alike.
+  // The sum of the absolute differences of the four bytes of two words; the masked form (v_msad_u8) leaves out
+  // the bytes where the second, the reference, is zero.
+  static uint32_t sad_bytes(uint32_t a, uint32_t b, bool masked) {
+    uint32_t sum = 0;
+    for (uint32_t k = 0; k < 4; ++k) {
+      const uint32_t x = a >> 8 * k & 0xFF, y = b >> 8 * k & 0xFF;
+      if (masked && y == 0) continue;
+      sum += x > y ? x - y : y - x;
+    }
+    return sum;
+  }
   static uint32_t word(Wave& w, const Operand& o, uint32_t k, uint32_t lane) {
     return o.kind == OperandKind::Agpr ? acc(w, o.index + k)[lane] : w.vgpr[o.index + k][lane];
   }
@@ -2371,7 +2382,7 @@ struct Machine {
       });
     } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
       each([&](uint32_t lane) {
-        const uint32_t v = op == "v_mad_u16"_op ? u16(0, lane) * u16(1, lane) + u16(2, lane)
+        const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
       });
@@ -2961,6 +2972,142 @@ struct Machine {
       each([&](uint32_t lane) {
         const uint32_t x = lane_src(w, in.src[0], lane), y = lane_src(w, in.src[1], lane), z = lane_src(w, in.src[2], lane);
         write_lane(w, in.dst[0], lane, std::max(std::min(x, y), std::min(std::max(x, y), z)));
+      });
+    } else if (op == "v_max3_u32"_op) {
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane,
+                   std::max({lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane), lane_src(w, in.src[2], lane)}));
+      });
+    } else if (op == "v_alignbyte_b32"_op) {
+      // As v_alignbit_b32, in bytes: the 32 bits that start where the third source's low two bits say.
+      each([&](uint32_t lane) {
+        const uint64_t pair = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) << 32 | lane_src(w, in.src[1], lane);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(pair >> (8 * (lane_src(w, in.src[2], lane) & 3))));
+      });
+    } else if (op == "v_lerp_u8"_op) {
+      // Each byte: the average of the two sources', 0.5 rounded up where the third's byte has its low bit set.
+      each([&](uint32_t lane) {
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane), c = lane_src(w, in.src[2], lane);
+        uint32_t r = 0;
+        for (uint32_t k = 0; k < 4; ++k)
+          r |= (((a >> 8 * k & 0xFF) + (b >> 8 * k & 0xFF) + (c >> 8 * k & 1)) >> 1) << 8 * k;
+        write_lane(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_sad_u8"_op || op == "v_sad_hi_u8"_op || op == "v_msad_u8"_op) {
+      // The sum of the absolute differences of the four bytes, added to the third source (shifted up 16 first
+      // for the hi form); the masked form leaves out the bytes where the second source, the reference, is zero.
+      each([&](uint32_t lane) {
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        write_lane(w, in.dst[0], lane,
+                   (sad_bytes(a, b, op == "v_msad_u8"_op) << (op == "v_sad_hi_u8"_op ? 16 : 0)) + lane_src(w, in.src[2], lane));
+      });
+    } else if (op == "v_sad_u16"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        const auto d = [](uint32_t x, uint32_t y) { return x > y ? x - y : y - x; };
+        write_lane(w, in.dst[0], lane, d(a & 0xFFFF, b & 0xFFFF) + d(a >> 16, b >> 16) + lane_src(w, in.src[2], lane));
+      });
+    } else if (op == "v_sad_u32"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
+        uint64_t r = uint64_t{a > b ? a - b : b - a} + lane_src(w, in.src[2], lane);
+        if (in.clamp) r = std::min<uint64_t>(r, 0xFFFFFFFFu);
+        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
+      });
+    } else if (op == "v_qsad_pk_u16_u8"_op || op == "v_mqsad_pk_u16_u8"_op) {
+      // Four sums over the first source's (a 64-bit array of eight bytes) four overlapping windows of four
+      // bytes, against the second source's four; each added to a 16-bit piece of the third, and kept to 16 bits.
+      each([&](uint32_t lane) {
+        const uint64_t a = lane_src64(w, in.src[0], lane), c = lane_src64(w, in.src[2], lane);
+        const uint32_t ref = lane_src(w, in.src[1], lane);
+        uint64_t r = 0;
+        for (uint32_t k = 0; k < 4; ++k)
+          r |= uint64_t{(sad_bytes(static_cast<uint32_t>(a >> 8 * k), ref, op == "v_mqsad_pk_u16_u8"_op) +
+                         static_cast<uint32_t>(c >> 16 * k)) & 0xFFFF} << 16 * k;
+        write_lane64(w, in.dst[0], lane, r);
+      });
+    } else if (op == "v_mqsad_u32_u8"_op) {
+      each([&](uint32_t lane) {
+        const uint64_t a = lane_src64(w, in.src[0], lane);
+        const uint32_t ref = lane_src(w, in.src[1], lane);
+        uint32_t acc[4];
+        for (uint32_t k = 0; k < 4; ++k) acc[k] = word(w, in.src[2], k, lane);
+        for (uint32_t k = 0; k < 4; ++k)
+          set_word(w, in.dst[0], k, lane, sad_bytes(static_cast<uint32_t>(a >> 8 * k), ref, true) + acc[k]);
+      });
+    } else if (op == "v_cvt_pk_u8_f32"_op) {
+      // The first source as a byte (toward zero, held to 0..255) in the byte the second names, in the third.
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane);
+        const uint32_t at = 8 * (lane_src(w, in.src[1], lane) & 3);
+        const uint32_t byte = std::isnan(x) || x <= 0 ? 0 : x >= 255 ? 255 : static_cast<uint32_t>(x);
+        write_lane(w, in.dst[0], lane, (lane_src(w, in.src[2], lane) & ~(0xFFu << at)) | byte << at);
+      });
+    } else if (op == "v_mad_i32_i16"_op) {
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane,
+                   static_cast<uint32_t>(i16(0, lane) * i16(1, lane)) + lane_src(w, in.src[2], lane));   // wraps, as the hardware's 32-bit add does
+      });
+    } else if (op == "v_med3_i16"_op || op == "v_med3_u16"_op) {
+      each([&](uint32_t lane) {
+        if (op == "v_med3_i16"_op) {
+          const int16_t x = i16(0, lane), y = i16(1, lane), z = i16(2, lane);
+          write_lane(w, in.dst[0], lane, static_cast<uint16_t>(std::max(std::min(x, y), std::min(std::max(x, y), z))));
+        } else {
+          const uint16_t x = u16(0, lane), y = u16(1, lane), z = u16(2, lane);
+          write_lane(w, in.dst[0], lane, std::max(std::min(x, y), std::min(std::max(x, y), z)));
+        }
+      });
+    } else if (op == "v_min3_f16"_op || op == "v_max3_f16"_op || op == "v_med3_f16"_op || op == "v_mad_f16"_op) {
+      each([&](uint32_t lane) {
+        const float x = half(0, lane), y = half(1, lane), z = half(2, lane);
+        float r;
+        if (op == "v_min3_f16"_op) r = std::fmin(std::fmin(x, y), z);
+        else if (op == "v_max3_f16"_op) r = std::fmax(std::fmax(x, y), z);
+        else if (op == "v_mad_f16"_op) r = x * y + z;
+        else r = std::isnan(x) || std::isnan(y) || std::isnan(z) ? std::fmin(std::fmin(x, y), z)
+                                                                  : std::fmax(std::fmin(x, y), std::fmin(std::fmax(x, y), z));
+        write_half(w, in, lane, static_cast<_Float16>(r));
+      });
+    } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
+      each([&](uint32_t lane) {
+        const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
+                                                : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
+        write_lane(w, in.dst[0], lane, v & 0xFFFF);
+      });
+    } else if (op == "v_cvt_pk_i16_i32"_op) {
+      each([&](uint32_t lane) {
+        const auto sat = [](int32_t v) { return static_cast<uint16_t>(std::clamp<int32_t>(v, INT16_MIN, INT16_MAX)); };
+        write_lane(w, in.dst[0], lane,
+                   sat(static_cast<int32_t>(lane_src(w, in.src[0], lane))) |
+                       static_cast<uint32_t>(sat(static_cast<int32_t>(lane_src(w, in.src[1], lane)))) << 16);
+      });
+    } else if (op == "v_cvt_pknorm_i16_f32"_op || op == "v_cvt_pknorm_u16_f32"_op ||
+               op == "v_cvt_pknorm_i16_f16"_op || op == "v_cvt_pknorm_u16_f16"_op) {
+      // Two floats (or halves) held to -1..1 (0..1 unsigned) and scaled to the 16-bit range, to nearest even;
+      // a NaN gives zero.
+      each([&](uint32_t lane) {
+        const bool half_in = op == "v_cvt_pknorm_i16_f16"_op || op == "v_cvt_pknorm_u16_f16"_op;
+        const bool is_signed = op == "v_cvt_pknorm_i16_f32"_op || op == "v_cvt_pknorm_i16_f16"_op;
+        const auto norm = [&](uint32_t k) -> uint32_t {
+          const double x = half_in ? static_cast<double>(half(k, lane)) : static_cast<double>(lane_float(w, in.src[k], lane));
+          if (std::isnan(x)) return 0;
+          if (is_signed) return static_cast<uint16_t>(static_cast<int16_t>(std::nearbyint(std::clamp(x, -1.0, 1.0) * 32767.0)));
+          return static_cast<uint16_t>(std::nearbyint(std::clamp(x, 0.0, 1.0) * 65535.0));
+        };
+        write_lane(w, in.dst[0], lane, norm(0) | norm(1) << 16);
+      });
+    } else if (op == "v_add_i16"_op || op == "v_sub_i16"_op) {
+      each([&](uint32_t lane) {
+        int32_t r = op == "v_add_i16"_op ? i16(0, lane) + i16(1, lane) : i16(0, lane) - i16(1, lane);
+        if (in.clamp) r = std::clamp<int32_t>(r, INT16_MIN, INT16_MAX);
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(r));
+      });
+    } else if (op == "v_mul_legacy_f32"_op) {
+      // The DX9 multiply: zero times anything (infinity and NaN too) is zero.
+      each([&](uint32_t lane) {
+        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane);
+        write_float(w, in, lane, x == 0 || y == 0 ? 0.0f : x * y);
       });
     } else if (op == "v_mad_u32_u16"_op) {
       each([&](uint32_t lane) {
