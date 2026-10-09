@@ -148,6 +148,7 @@ struct CodeObject {
   // FNUZ on gfx942 and OCP on gfx950 -- this says which.
   uint32_t mach = 0;
   bool gfx950() const { return mach == 0x4f; }
+  bool gfx1250() const { return mach == 0x49; }   // CDNA 5: 320 KB of LDS a work-group (LLVM's limit)
 };
 
 // Writes the addresses of the module's globals into its code, for a data

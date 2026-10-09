@@ -1,0 +1,66 @@
+# VirtualGPU device profile: NVIDIA GB10 (DGX Spark; Blackwell, sm_121).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 12.1: NVIDIA's CUDA GPUs table ("NVIDIA GB10 (DGX Spark)",
+#     developer.nvidia.com/cuda-gpus).
+#   - CUDA cores 6,144: NVIDIA's DGX Spark hardware overview. NVIDIA publishes no
+#     SM count for the GB10. 48 is DERIVED: 6144 / 128 CUDA cores an SM, the figure
+#     NVIDIA gives every GB20x SM (RTX Blackwell whitepaper, Table 1); unverified.
+#   - memory: 128 GB LPDDR5x unified system memory, 256-bit, 4266 MHz, 273 GB/s
+#     (DGX Spark hardware overview). The GPU shares it with the 20-core Arm CPU,
+#     so this is the whole pool, not what a CUDA program can allocate; an
+#     upper bound. NVIDIA's "GB" is binary here as elsewhere, 131072 MiB.
+#   - power: the hardware overview gives the GB10 SoC's TDP as 140 W. That is the
+#     CPU and GPU together, not the GPU alone.
+#   - PCI device 0x2E12, "NVIDIA GB10", from the name table in NVIDIA's open GPU
+#     kernel modules (g_nv_name_released.h).
+#   - Per-SM limits are compute capability 12.x's, the same as nvidia/rtx5090: the
+#     CUDA C++ Programming Guide lists 12.0 and 12.1 in one column (64K registers,
+#     1536 threads, 24 blocks, 100 KB shared memory an SM).
+#   - SM clock: not published; the RTX PRO 6000's 2617 MHz (another GB20x) until measured.
+#   - Not recorded, because the GB10 is a SoC and NVIDIA states neither: the PCIe
+#     link, NVLink, ECC, and a memory type (LPDDR5x is neither "hbm" nor "gddr").
+#   - CUDA attributes (the `cuda:` section): the 256-bit bus is NVIDIA's; the L2 is unpublished and left unset.
+id: nvidia/gb10
+vendor: nvidia
+model: "NVIDIA GB10"
+architecture: blackwell
+compute_capability: "12.1"
+warp_size: 32
+vram_bytes: 137438953472         # 131072 MiB, the unified pool; an upper bound
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376   # 99 KiB (compute capability 12.x)
+  registers_per_block: 65536
+  multiprocessors: 48            # derived, see the header; unverified
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 131072         # 128 GB in MiB, shared with the CPU; not measured on a card
+  power_limit_w: 140             # GB10 SoC TDP (DGX Spark hardware overview)
+  sm_clock_max_mhz: 2617         # unpublished; the RTX PRO 6000's until measured
+  mem_clock_max_mhz: 4266        # "4266 MHz" (DGX Spark hardware overview)
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 11794           # 0x2E12 [GB10]
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 256 bits: NVIDIA's DGX Spark hardware overview ("256-bit interface").
+# The L2 size is not in the NVIDIA pages read (the 24 MB in Hot Chips coverage is a third party's), so it is left
+# unset, as for the B200 and B300, and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 256

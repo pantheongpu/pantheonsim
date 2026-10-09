@@ -175,12 +175,12 @@ jobs:
       - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
@@ -223,7 +223,8 @@ jobs:
     name: ollama on every GPU
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
     if: ${{ !inputs.nvidia_only }}
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # Fourteen GPUs take about 18 minutes on 8 cores; a 4-core runner is slower.
     timeout-minutes: 90
     # The toolchain image (.github/ci-image), or, when there is none, the
@@ -250,15 +251,15 @@ jobs:
       - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
           wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i /tmp/keyring.deb
-          sudo apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
           # Every library the simulator stands in for: each shim is compiled
           # against that library's own header, so a missing one fails the build
           # (libcurand-dev did).
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
             cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
             libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
@@ -301,11 +302,21 @@ jobs:
         env:
           VGPU_OLLAMA_PULL: '1'
         run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
+
+      # The job runs as root in the container, in a workspace that belongs to the runner's
+      # user. On a runner that lasts (the burst pool) what it leaves there is root's, and a job
+      # that is not in a container (the AMD ollama jobs, the image finder) then cannot clean
+      # it at checkout. Hand it back, whatever the outcome.
+      - name: Return the workspace to the runner's user
+        if: always() && job.container.id
+        run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
   ollama-amd:
     name: ollama on ${{ matrix.gpu }}
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
     if: ${{ !inputs.nvidia_only }}
-    runs-on: ubuntu-24.04
+    # GitHub's hosted runner unless BURST_RUNS_ON names a pool (see the SASS job).
+    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # A simulated GPU takes some 3 to 17 minutes to load a model and generate
     # three tokens, so each GPU has a job of its own.
     timeout-minutes: 120
@@ -323,8 +334,8 @@ jobs:
 
       - name: Install ollama and its ROCm backend
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
           mkdir -p "$RUNNER_TEMP/ollama"
           for t in ollama-linux-amd64.tar.zst ollama-linux-amd64-rocm.tar.zst; do
             wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/$t" |
@@ -547,8 +558,8 @@ jobs:
       - name: Install toolchain
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
 
       - name: Build instrumented
@@ -604,8 +615,8 @@ jobs:
       - name: Install toolchain
         if: ${{ !job.container.id }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
+          sudo flock /tmp/pool-apt.lock apt-get update -qq
+          sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends \
             build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit
 
       - name: Build instrumented

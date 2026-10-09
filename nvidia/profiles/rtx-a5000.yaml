@@ -1,0 +1,58 @@
+# VirtualGPU device profile: NVIDIA RTX A5000 (Ampere, GA102, sm_86).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.6: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 64: NVIDIA's RTX A5000 data sheet (8,192 CUDA cores, 256 Tensor Cores, 64 RT Cores) at 128 cores an SM.
+#   - memory 24 GB GDDR6 with ECC, 384-bit, 768 GB/s, total board power 230 W, PCIe 4.0 x16: the data sheet. NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml), so
+#     vram_bytes is 24576 MiB; a real card's nvidia-smi total is a little smaller, so this is an upper bound.
+#   - SM clock 1695 MHz is derived from the data sheet's 27.8 TFLOPS (8,192 x 2 x clock = 1.697 GHz); NVIDIA's data sheet lists no clock.
+#   - PCI device 0x2231, "NVIDIA RTX A5000", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+#   - Per-SM limits are compute capability 8.6's, the same as nvidia/a10 and nvidia/rtx3080ti, which were read from physical cards.
+id: nvidia/rtx-a5000
+vendor: nvidia
+model: "NVIDIA RTX A5000"
+architecture: ampere
+compute_capability: "8.6"
+warp_size: 32
+vram_bytes: 25769803776          # 24576 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 64
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 16
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 6291456
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 24576          # 24 GB in MiB; not measured on a card
+  power_limit_w: 230             # Total board power: 230 W (data sheet)
+  sm_clock_max_mhz: 1695         # derived: the data sheet's 27.8 TFLOPS single precision over 8,192 cores x 2 is 1.697 GHz; the page lists no clock
+  mem_clock_max_mhz: 8000       # half of 16 Gbps, which the data sheet's 768 GB/s gives on a 384-bit bus; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8753            # 0x2231 [RTX A5000]
+  ecc: true                     # ECC supported (data sheet)
+  memory: gddr                   # GDDR; Ampere and later remap rows rather than retire pages (see telemetry.cpp)
+  pcie_link: "Gen4 x16"          # data sheet: PCI Express 4.0 x16
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# The 384-bit memory interface: data sheet. L2 6144 KB: GA102's L2 (whitepaper Table 3); NVIDIA's data sheet does not list the A5000's L2, so
+# this is derived. Persisting L2 is nvidia/a10's measured 4325376 (GA102, 6 MiB L2); carried over, unverified.
+cuda:
+  memory_bus_width_bits: 384
+  persisting_l2_bytes: 4325376

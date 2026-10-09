@@ -47,7 +47,8 @@ static const char* arch_of(int major, int minor) {
         case 7: return minor < 5 ? "volta" : "turing";
         case 8: return minor == 0 ? "ampere" : (minor == 9 ? "ada" : "ampere");
         case 9: return "hopper";
-        case 10: return "blackwell";
+        case 10: return minor == 7 ? "rubin" : "blackwell";
+        case 11: return "blackwell";   // Thor
         case 12: return "blackwell";
         default: return "unknown";
     }
@@ -113,6 +114,17 @@ int main(int argc, char** argv) {
     std::printf("  bf16: %s\n", p.major >= 8 ? "true" : "false");
     std::printf("  fp64: true\n");
     std::printf("  tensor_cores: %s\n", p.major >= 7 ? "true" : "false");
+    // What CUDA reports beyond the limits above -- the `cuda:` section the
+    // device-attribute table reads (nvidia/src/device_attributes.cpp). Written
+    // before `telemetry:`, which characterize-cloud.sh and characterize-aws.sh
+    // cut at and replace with characterize-telemetry.sh's. Until this was
+    // here, every profile's `cuda:` section was the datasheet's, whatever its
+    // `verified` flag said.
+    std::printf("cuda:\n");
+    std::printf("  memory_bus_width_bits: %d\n", p.memoryBusWidth);
+    std::printf("  clock_khz: %d\n", clock_khz);
+    std::printf("  async_engine_count: %d\n", p.asyncEngineCount);
+    std::printf("  persisting_l2_bytes: %d\n", p.persistingL2CacheMaxSize);
     std::printf("telemetry:\n");
     std::printf("  power_limit_w: %d\n", 0);  // filled below from NVML if available
     std::printf("  sm_clock_max_mhz: %d\n", clock_khz / 1000);

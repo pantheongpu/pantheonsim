@@ -377,13 +377,67 @@ false` throughout. gfx1251 (MI430X) is not covered.
   `v_mad_u32`, `v_mad_nc_u64_u32`, `v_mad_nc_i64_i32`, `v_add_max`/`v_add_min` (clamped add, then the other
   operand); `v_ashr_pk_i8_i32`, `v_sat_pk4_*`, `v_tanh_{f32,f16,bf16}` and the bfloat16 transcendentals, fp8 to half
   conversions; f64 atomics, `*_prefetch_b8` (a no-op) and `*_load_monitor_*` (a load).
-- **Decoded and printed, but refused when executed:** the matrix instructions (`v_wmma_*`, `v_swmmac_*`, including the
-  scaled forms), because the register layouts they use are in AMD's ISA document, not in the XML or in anything
-  available here, and a guess would pass its own tests; the tensor data mover (`tensor_load_to_lds`,
-  `tensor_store_from_lds`); cluster loads, asynchronous loads to and from LDS, the transposed loads
-  (`*_load_tr*`, `ds_load_tr*`); the named-barrier instructions; `s_set_vgpr_msb` with a non-zero value (vector
-  registers past v255); `v_permlane_*` of the new kinds, `v_perm_pk16_*`, the `v_cvt_scale*` family, bfloat16
-  packed arithmetic and the other 16-bit packed additions. Each says so by name when a kernel reaches it. The
+- **Matrix instructions, executed from AMD's CDNA 5 ISA document:** `v_wmma_*` (f16, bf16, f32, fp8/bf8, iu8, the
+  mixed 8-, 6- and 4-bit `f8f6f4` forms, and the block-scaled forms with E8M0, E5M3 and E4M3 scales), and the sparse
+  `v_swmmac_*`. The lane layouts, the sparse index words and the scale selection come from the document's tables and
+  pseudocode. Each product is summed exactly and rounded once, so the last bit can differ from hardware that sums in a
+  fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
+  `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
+  sparse, mixed-width and scaled ones depend on the layout read from the document.
+- **Arithmetic the compiler seldom emits** (`tests/hipcc/alu1250.cpp`, each against the ISA's pseudocode written out for
+  the host): the IEEE `v_minimum_*` and `v_maximum_*` families in f16, f32 and f64 (a signaling NaN comes back quieted,
+  -0 is below +0) with their three-operand and combined forms, the `_num` three-operand forms (a number beats a NaN;
+  they keep their own names rather than the older instructions' they replaced), 16-bit integer add, subtract, min, max
+  and shift, `v_cvt_i32_i16`, `v_cvt_u32_u16`, `v_sat_pk_u8_i16`, half sine, cosine, frexp and ldexp,
+  `v_cvt_nearest_i32_f32`, `v_cvt_off_f32_i4`, `v_cvt_norm_*_f16`, the DX9 and lighting multiplies, `v_sqrt_f64`,
+  the packed bfloat16, half and 16-bit integer instructions (`v_pk_*_bf16`, `v_pk_fmac_f16`, `v_pk_{minimum,maximum}*_f16`,
+  `v_pk_add_{max,min}_*16`, `v_pk_{max,min}3_*16`), and the scalar `s_{minimum,maximum}_f{16,32}`, `s_{ceil,floor,trunc,
+  rndne}_f16`, `s_cvt_pk_rtz_f16_f32`, `s_quadmask_*`, `s_bitset{0,1}_b64`, `s_bitreplicate_b64_b32`, `s_cls_i32_i64` and
+  the `s_{nand,nor,xnor}_saveexec_*`, `s_and_not{0,1}_wrexec_*` and further EXEC-writing forms.
+- **Named barriers:** `s_barrier_init`, `_join`, `_signal` (with the member count in M0), `_signal_isfirst`, `_wait`,
+  `_leave`, `s_get_barrier_state` and `s_wakeup_barrier`, from the ISA document's section 5.6; the work-group barrier's
+  signal count is kept too, for `isfirst`. The trap and cluster barriers do nothing (a cluster is one work-group here),
+  every named barrier counts as allocated, and a wave that ends is not taken out of a barrier's member count. A wait
+  that no wave can end is an error naming the barrier, not a hang (`tests/hipcc/barrier1250.cpp`).
+- **Cross-lane permutes:** `v_permlane16_var_b32`, `v_permlanex16_var_b32`, `v_permlane_{bcast,up,down,xor}_b32` (lane
+  groups of a power-of-two width a scalar gives; any other width is refused, the ISA leaving it undefined),
+  `v_permlane_idx_gen_b32`, and `v_permlane16_swap_b32` (writing only the lanes that are on), from the ISA document's
+  pseudocode (`tests/hipcc/permlane1250.cpp`).
+- **Asynchronous copies:** `global_load_async_to_lds_b{8,32,64,128}` and `global_store_async_from_lds_*` move each
+  lane's bytes between its global address and its LDS address, as the ISA document's pseudocode has it; the copy is done
+  when the instruction is, so `s_wait_asynccnt` has nothing to wait for (`tests/hipcc/async1250.cpp`).
+- **Transposing loads:** `global_load_tr16_b128`, `global_load_tr8_b64`, `ds_load_tr16_b128` and `ds_load_tr8_b64`, which
+  load a 16x16 tile held column by column straight into the registers of a WMMA operand (lane map from the ISA
+  document's figure; `tests/hipcc/trload1250.cpp` feeds them to a WMMA). EXEC must be all ones.
+- **Vector registers past v255:** a wave's register file grows to what a kernel names, up to the 1024 a gfx1250 wave may
+  have, and `s_set_vgpr_msb` puts the two high bits on the numbers each following instruction's destination and sources
+  name (VALU, FLAT/GLOBAL and DS instructions; the buffer and image forms and `v_movrel*` are not covered, nor is writing
+  the bits through the MODE register). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
+- **DPP8** (all eight selects, with and without `fi`, on the VALU and compare instructions) and DPP on the compares, which
+  were refused.
+- **LDS atomics and exchanges** (`tests/hipcc/ds1250.cpp`): `ds_cond_sub_*`, `ds_sub_clamp_*`, `ds_pk_add_{f16,bf16}` (with and
+  without a return), `ds_mskor_*`, `ds_cmpstore_b64`, `ds_storexchg_2addr_*` (and the stride-64 forms), `ds_condxchg32_rtn_b64`,
+  `ds_store_addtid_b32` / `ds_load_addtid_b32` (which named no address register, and crashed the executor before) and
+  `ds_bpermute_fi_b32`; and flat pointers to private memory, which gfx1250 builds from `src_flat_scratch_base` with the
+  lane's number in bits 56:52 (`tests/hipcc/gfx1250.cpp`).
+- **Cube faces and lookup-table permutes:** `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32`, `v_cubema_f32`, and
+  `v_perm_pk16_b{4,6,8}_u4` (sixteen lookups, by 4-bit indices, in a table of sixteen 4-, 6- or 8-bit entries).
+- **Conversions:** `v_cvt_pk_{fp8,bf8}_f16` (nearest even, into the half of the destination op_sel names), the stochastic
+  `v_cvt_sr_{fp8,bf8}_f16` (the seed's top bits added to the half's mantissa, as the ISA's pseudocode has it),
+  `v_cvt_sr_pk_{bf16,f16}_f32` and `v_fma_mix{,lo,hi}_bf16`.
+- **Tensor Data Mover:** `tensor_load_to_lds` and `tensor_store_from_lds`, from the ISA document's descriptor tables: tiles of
+  one to five dimensions, 1- to 8-byte elements, zero fill (load) or dropped writes (store) outside the tensor, LDS padding
+  on loads, gather and scatter by 16- or 32-bit row indices, and iteration (`tests/hipcc/tensor1250.cpp`, which builds
+  each descriptor bit range by bit range from the tables). Done when issued. Not modelled: multicast to other work-groups
+  (a cluster is one work-group here, so the mask is ignored), and the LDS barrier a descriptor can ask to be signalled
+  (`atomic_barrier_enable` is refused, since the ISA's text does not fix that barrier's width).
+- **Block loads and stores** (`global_load_block`, `global_store_block`: up to 32 dwords to or from consecutive registers, by the
+  mask in M0; a scaled offset is refused) and the **cluster loads** (`cluster_load_b{32,64,128}` and `cluster_load_async_to_lds_*`,
+  run as the global loads they downgrade to outside a cluster; `tests/hipcc/block1250.cpp`).
+- **Decoded and printed, but refused when executed:** the 6- and 4-bit transposed loads
+  (`*_load_tr6_*`, `*_load_tr4_*`); the `v_cvt_scale*` and `v_cvt_scalef32*` families (the ISA's pseudocode calls scaling
+  helpers it does not define); the LDS barrier arrives (`ds_atomic_*barrier_arrive*`: the barrier's width is not fixed by the ISA's text). Each says so by name
+  when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes
   0x37/0xBD (32-bit scales) and 0x3B/0xBA (64-bit), which are also ordinary opcodes in the same XML (0x37 is

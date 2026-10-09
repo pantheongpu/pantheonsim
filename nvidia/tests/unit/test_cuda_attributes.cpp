@@ -11,6 +11,7 @@
 #include <cstring>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vgpu/cuda_attributes.hpp"
@@ -82,6 +83,35 @@ VTEST(rtx3060_matches_the_card) {
   }
 }
 
+// The single- to double-precision ratio follows NVIDIA's "Throughput of Native
+// Arithmetic Instructions" table (CUDA C++ Best Practices Guide 13.4), fp32 over
+// fp64 results per clock per multiprocessor: 7.5 is 64/2, 8.0 is 64/32, 8.6 and
+// 8.9 are 128/2, 9.0 and 10.0 are 128/64, and 10.3 and 12.x are 128/2. The 10.3
+// column shares its fp64 cell with 12.x, so a B300 is not a B200 here. 10.7 (Rubin)
+// is derived from the 130 and 33 TFLOPS in NVIDIA's Rubin blog, and 11.0 (Thor)
+// has no published rate, so it carries the 12.x stand-in (see device_attributes.cpp).
+VTEST(single_to_double_ratio_follows_the_arithmetic_table) {
+  const std::pair<int, int> want[] = {{75, 32}, {80, 2}, {86, 64}, {89, 64}, {90, 2}, {100, 2},
+                                      {103, 64}, {107, 4}, {110, 64}, {120, 64}, {121, 64}};
+  int seen = 0;
+  for (const std::string& id : nvidia_gpus()) {
+    const vgpu::DeviceProfile p = vgpu::load_gpu(id);
+    const int cc = p.cc_major * 10 + p.cc_minor;
+    bool found = false;
+    for (const auto& w : want) {
+      if (w.first != cc) continue;
+      found = true;
+      if (attr(p, A::kSingleToDoublePrecisionPerfRatio) != w.second)
+        std::fprintf(stderr, "%s (cc %d): ratio %d, table says %d\n", id.c_str(), cc,
+                     attr(p, A::kSingleToDoublePrecisionPerfRatio), w.second);
+      VCHECK_EQ(attr(p, A::kSingleToDoublePrecisionPerfRatio), w.second);
+    }
+    VCHECK(found);   // a profile of a new compute capability must be added to the table above
+    ++seen;
+  }
+  VCHECK(seen >= 12);
+}
+
 // Whatever a profile says, the table answers every attribute CUDA 13.2 has and
 // refuses every number that is not one, and the answers do not contradict one
 // another or the hardware's rules.
@@ -98,8 +128,12 @@ VTEST(every_nvidia_profile_answers_every_attribute_and_stays_consistent) {
       VCHECK(!device_attribute(p, 0, a, &v));
       VCHECK_EQ(v, 77);   // untouched
     }
-    // The L2 and the memory interface are facts of the card, not zeros.
-    if (id != "nvidia/b200" && id != "nvidia/b300") VCHECK(attr(p, A::kL2CacheSize) > 0);
+    // The L2 and the memory interface are facts of the card, not zeros -- except
+    // where NVIDIA has not published the L2 (the profile leaves it unset).
+    const bool l2_unpublished = id == "nvidia/b200" || id == "nvidia/b300" || id == "nvidia/gb200" ||
+                                id == "nvidia/vr200" || id == "nvidia/thor" || id == "nvidia/gb10" ||
+                                id == "nvidia/a30";
+    if (!l2_unpublished) VCHECK(attr(p, A::kL2CacheSize) > 0);
     VCHECK(attr(p, A::kGlobalMemoryBusWidth) >= 128);
     VCHECK(attr(p, A::kClockRate) >= 1000000);
     VCHECK(attr(p, A::kMemoryClockRate) >= 1000000);
@@ -108,7 +142,7 @@ VTEST(every_nvidia_profile_answers_every_attribute_and_stays_consistent) {
     const int cc = p.cc_major * 10 + p.cc_minor;
     // The access policy window and its L2 set-aside come with 8.0.
     VCHECK_EQ(attr(p, A::kMaxAccessPolicyWindowSize) > 0, cc >= 80);
-    VCHECK_EQ(attr(p, A::kMaxPersistingL2CacheSize) > 0, cc >= 80 && id != "nvidia/b200" && id != "nvidia/b300");
+    VCHECK_EQ(attr(p, A::kMaxPersistingL2CacheSize) > 0, cc >= 80 && !l2_unpublished);
     // Clusters and the tensor map are Hopper's.
     VCHECK_EQ(attr(p, A::kClusterLaunch), cc >= 90 ? 1 : 0);
     VCHECK_EQ(attr(p, A::kTensorMapAccessSupported), cc >= 90 ? 1 : 0);

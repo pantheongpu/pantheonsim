@@ -1,0 +1,57 @@
+# VirtualGPU device profile: NVIDIA H200 NVL (Hopper, GH100, sm_90).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 9.0 and every per-SM limit: read from physical H100s (nvidia/h100, nvidia/h100-pcie); the H200 NVL is the same
+#     GH100 as the H200 (nvidia/h200 argues this at length), with the 132 SMs of the SXM part.
+#   - memory 141 GB, 4.8 TB/s, max TDP up to 600 W, FP64 30 TFLOPS, PCIe Gen5, 2- or 4-way NVLink bridge: NVIDIA's H200 page (NVL
+#     column). The page lists no SM count; the SXM part's 132 are used, and the FP64 rate (30 TFLOPS against the SXM's 34) is consistent
+#     with 132 SMs at a lower clock. This is derived, not published. NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml), so vram_bytes is
+#     144384 MiB (141 GiB), an upper bound.
+#   - PCI device 0x233B, "NVIDIA H200 NVL", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+id: nvidia/h200-nvl
+vendor: nvidia
+model: "NVIDIA H200 NVL"
+architecture: hopper
+compute_capability: "9.0"
+warp_size: 32
+vram_bytes: 151397597184          # 144384 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 232448
+  registers_per_block: 65536
+  multiprocessors: 132
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 233472
+  l2_cache_bytes: 52428800
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 144384          # 141 GB in MiB; not measured on a card
+  power_limit_w: 600             # Max TDP "up to 600 W (configurable)" (NVIDIA's H200 page)
+  sm_clock_max_mhz: 1755         # derived: the page's 30 TFLOPS FP64 (34 for the SXM at 1980 MHz) is 1.75 GHz; the H100 PCIe's 1755 MHz is used (the page lists no clock)
+  mem_clock_max_mhz: 3201       # copied from nvidia/h200 (the same six HBM3e stacks and 4.8 TB/s)
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 9019            # 0x233B [H200 NVL]
+  ecc: true                     # supported and on by default (NVIDIA datasheet)
+  memory: hbm                   # rows are remapped on failure
+  pcie_link: "Gen5 x16"          # NVIDIA's H200 page: PCIe Gen5 128 GB/s
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Datasheet: six HBM3e stacks (as nvidia/h200), 50 MB L2. The persisting L2 maximum is three quarters of L2, as the A100's: not read from a card.
+cuda:
+  memory_bus_width_bits: 6144
+  persisting_l2_bytes: 39321600

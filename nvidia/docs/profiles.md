@@ -1,0 +1,113 @@
+# NVIDIA device profiles
+
+`VGPU_GPU=nvidia/<name>` (or `vgpu list`) picks the GPU being simulated. A
+profile (`nvidia/profiles/<name>.yaml`) holds what a program can ask a GPU: its
+compute capability, SM count, per-SM limits and memory, and the values
+`nvidia-smi` shows. The compute capability decides which modules load: PTX for
+a target newer than the device is refused, SASS runs on the same major version
+and the same or a later minor, and the `a` and `f` targets are narrower still.
+
+**Nothing in the second table has been measured on a card.** Each is
+`verified: false`, built only from public documents, and its header comment says
+where every number came from, which ones are derived, and which were copied from
+the nearest profile because NVIDIA has not published them. Read the header
+before trusting a number.
+
+## Read from a physical device (`verified: true`)
+
+| Profile | Architecture | Compute capability | SMs |
+| --- | --- | --- | --- |
+| `nvidia/t4` | Turing | 7.5 | 40 |
+| `nvidia/a100`, `nvidia/a100-sxm4-40gb` | Ampere | 8.0 | 108 |
+| `nvidia/a10`, `nvidia/a10g`, `nvidia/rtx3060`, `nvidia/rtx3080ti` | Ampere | 8.6 | 72, 80, 28, 80 |
+| `nvidia/l4`, `nvidia/l40s` | Ada Lovelace | 8.9 | 58, 142 |
+| `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb` | Hopper | 9.0 | 132, 114, 132 |
+
+## Public documentation only (`verified: false`)
+
+| Profile | Architecture | Compute capability | SMs | Memory | What is not NVIDIA's own figure |
+| --- | --- | --- | --- | --- | --- |
+| `nvidia/h200` | Hopper | 9.0 | 132 | 141 GiB HBM3e | inherits the H100 |
+| `nvidia/b200` | Blackwell | 10.0 | 148 | 179 GiB (measured total) HBM3e | SM count |
+| `nvidia/b300` | Blackwell Ultra | 10.3 | 148 | 268 GiB HBM3e | SM count |
+| `nvidia/gb200` | Blackwell | 10.0 | 148 | 186 GiB HBM3e | SM count and clocks are the B200's; the memory is half of NVIDIA's per-superchip figure |
+| `nvidia/rtx5090` | Blackwell | 12.0 | 170 | 32 GiB GDDR7 | |
+| `nvidia/rtx-pro-6000` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | none: NVIDIA's whitepaper gives the SM count |
+| `nvidia/vr200` (Rubin) | Rubin | 10.7 | 224 | 288 GiB HBM4 | **placeholder PCI id 0x7F10**; shared memory per SM from the CUDA programming guide's 10.7 column; threads, blocks, power, clocks copied from the B300/B200; Ollama 0.21.0's ggml-cuda has no build for exactly 10.7, so Ollama itself rejects the GPU |
+| `nvidia/thor` (Jetson AGX Thor) | Blackwell | 11.0 | 20 | 128 GiB LPDDR5X, shared with the CPU | **placeholder PCI id 0x7F11**; SM count derived from NVIDIA's 2560 CUDA cores; threads and blocks copied from sm_100 |
+| `nvidia/gb10` (DGX Spark) | Blackwell | 12.1 | 48 | 128 GiB LPDDR5x, shared with the CPU | SM count derived from NVIDIA's 6,144 CUDA cores |
+| `nvidia/rtx4090` | Ada Lovelace | 8.9 | 128 | 24 GiB GDDR6X | none |
+| `nvidia/l40` | Ada Lovelace | 8.9 | 142 | 48 GiB GDDR6 | SM clock is the L40S's |
+| `nvidia/rtx3090` | Ampere | 8.6 | 82 | 24 GiB GDDR6X | none |
+| `nvidia/a40` | Ampere | 8.6 | 84 | 48 GiB GDDR6 | none |
+| `nvidia/a30` | Ampere | 8.0 | 56 | 24 GiB HBM2 | SM count derived from two OEM listings' 224 Tensor Cores; clocks are the A100's |
+| `nvidia/rtx2080ti` | Turing | 7.5 | 68 | 11 GiB GDDR6 | none |
+| `nvidia/rtx-pro-6000-server` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | the part AWS sells as g7e (its GPU is named "RTX PRO Server 6000"); SM clock is the Workstation Edition's |
+| `nvidia/rtx-pro-6000-max-q` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | SM clock derived from the data sheet's 110 TFLOPS |
+| `nvidia/rtx6000-ada` | Ada Lovelace | 8.9 | 142 | 48 GiB GDDR6 | persisting L2 copied from the L40S |
+| `nvidia/rtx-a6000` | Ampere | 8.6 | 84 | 48 GiB GDDR6 | none |
+| `nvidia/rtx-a5000` | Ampere | 8.6 | 64 | 24 GiB GDDR6 | SM clock derived from the data sheet's 27.8 TFLOPS; L2 is GA102's |
+| `nvidia/a100-80gb-pcie` | Ampere | 8.0 | 108 | 80 GiB HBM2e | limits inherited from the A100 SXM4 profiles that were read from cards |
+| `nvidia/h100-nvl` | Hopper | 9.0 | 132 | 94 GiB HBM3 | **SM count derived** from the published 30 TFLOPS FP64; clock copied from the H100 PCIe; memory clock derived |
+| `nvidia/h200-nvl` | Hopper | 9.0 | 132 | 141 GiB HBM3e | SM count and clock derived the same way |
+| `nvidia/rtx4080` | Ada Lovelace | 8.9 | 76 | 16 GiB GDDR6X | none |
+| `nvidia/rtx3070` | Ampere | 8.6 | 46 | 8 GiB GDDR6 | none |
+
+The memory column is NVIDIA's "GB", which for these boards is binary (an A100
+40 GB reports 40960 MiB). A real card shows a little less in `nvidia-smi`
+because the driver keeps some, so each figure is an upper bound until measured.
+
+## Placeholder PCI ids
+
+NVIDIA has published no PCI device id for Rubin or for Thor's GPU. Rechecked on
+2026-10-09 against the current main branch of NVIDIA's open GPU kernel modules
+(commit ca2d03e, 2026-10-07): the name table (`g_nv_name_released.h`) has no entry
+for either, and the same table does carry B200 (0x2901), GB200 (0x2941), GB10
+(0x2E12), B300 (0x3182), GB300 (0x31C2, 0x31C3) and every RTX PRO Blackwell
+(the ids of the existing profiles are all in it). The driver source names the Rubin dies
+(GR100, GR102) and publishes two **ranges** of self-hosted Rubin ids in
+`detect-self-hosted.h` (0x3040-0x307f and 0x30c0-0x30ff), which say where Rubin ids
+will fall and not which one a product has; Thor, an integrated Tegra part, is in
+neither the table nor the ranges.
+Every profile needs a unique id (its register file is found by it), so these two
+carry **placeholders, not NVIDIA's ids**: `nvidia/vr200` is 0x7F10 and
+`nvidia/thor` is 0x7F11. Neither appears in any entry of that table or in either
+range, so neither collides with a real NVIDIA part, and both are below 0x8000: CUDA reports the id as
+`device << 16 | vendor` in a signed int, which a real id (always below 0x8000)
+never overflows. The profile header, the
+`telemetry.pci_device_id` comment and the generated register file's header all
+say so (the generator marks these two ids, listed in `src/core/regs.cpp`). Replace them, in the
+profile, and regenerate with `vgpu regs export`, when NVIDIA publishes the ids.
+The AMD MI300X and MI350X placeholders are placeholders too.
+
+## Double-precision rate
+
+`cudaDevAttrSingleToDoublePrecisionPerfRatio` (`device_attributes.cpp`) follows
+the "Throughput of Native Arithmetic Instructions" table in NVIDIA's CUDA C++
+Best Practices Guide: fp32 over fp64 results per clock per SM is 32 for 7.5, 2
+for 8.0, 64 for 8.6 and 8.9, 2 for 9.0 and 10.0, and **64 for 10.3 and 12.x** (the
+table gives 10.3 and 12.x one fp64 cell, 2 against 128 for fp32; the code said 2 for
+10.3, the B200's rate, until 2026-10-09). The table has no 10.7 or 11.0 column.
+Rubin (10.7) is **4**, derived from the 130 TFLOPS fp32 and 33 TFLOPS fp64 vector rates
+in NVIDIA's "Inside the NVIDIA Rubin Platform" blog (Table 3), not from a card or from
+CUDA's table. Thor (11.0) is **unpublished**: NVIDIA's Jetson Thor data sheet lists AI
+throughput only, and the value 64 is the 12.x stand-in, labelled as one in the code.
+
+## Rented-card characterization, 2026-10-09: not done
+
+Closing the unverified list needs a card of each model. On 2026-10-09 a g7e.2xlarge
+(RTX PRO 6000 Blackwell Server Edition) was asked for in us-east-1: the first zone had no capacity
+and the second launch was refused by the permission system, so no instance ran and nothing was
+read. H200 and B200 are only sold as p5en.48xlarge and p6-b200.48xlarge (192 vCPUs, 8 GPUs); the
+account's "Running On-Demand P instances" and "All P Spot Instance Requests" quotas are 64 vCPUs,
+so neither can launch before a quota increase. `nvidia/tools/characterize.cu` now also writes the
+`cuda:` section (bus width, clock, copy engines, persisting L2) from the card, so the next run
+replaces the datasheet values in that section too. L40 is not rentable: g6e is the L40S.
+
+## Not yet profiles
+
+- **H20**: NVIDIA publishes no SM count for it.
+- **GH200 144GB** (0x2348): the GPU's memory bandwidth and power are in no NVIDIA page read for this.
+- **A100 40GB PCIe** (0x20F1): NVIDIA's A100 page lists no column for it.
+- **Jetson Orin and T4G** (compute capability 8.7): integrated Tegra parts, which the device model
+  (a PCI card with its own memory) does not describe, and no SM 8.7 SASS has been exercised.

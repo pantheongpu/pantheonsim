@@ -1,0 +1,74 @@
+# VirtualGPU device profile: NVIDIA A30 (Ampere, GA100, sm_80).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.0: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - memory 24 GB HBM2, 933 GB/s, 165 W TDP, PCIe Gen4 (64 GB/s, which is x16): the
+#     A30 data sheet. NVIDIA's "GB" for HBM is binary (an A100 40 GB reports
+#     40960 MiB, nvidia/a100-sxm4-40gb), so vram_bytes is 24576 MiB; a real
+#     card's nvidia-smi total is a little smaller, so this is an upper bound.
+#   - SMs 56: NVIDIA publishes no A30 SM count in the documents read here (the data
+#     sheet, the MIG user guide, which gives 1/4 of the SMs to its 1g.6gb
+#     profile, and the developer blogs). The figure is DERIVED: Lenovo's and
+#     PNY's product pages give 224 third-generation Tensor Cores, and NVIDIA's
+#     A100 whitepaper gives GA100 four Tensor Cores and 64 FP32 cores an SM,
+#     so 224 / 4 = 56 (3584 CUDA cores, the figure the retail listings quote).
+#     Unverified; the one number here that no NVIDIA page states.
+#   - Per-SM limits are compute capability 8.0's, the same as nvidia/a100, which
+#     was read from a physical card (A100 whitepaper: 64K registers, 2048 threads,
+#     32 blocks, 164 KB shared memory an SM).
+#   - ECC: HBM2 with ECC on, as on the A100 (the data sheet does not list it).
+#   - SM clock 1410 MHz and memory clock 1215 MHz are the A100 40 GB's (NVIDIA
+#     publishes neither for the A30) until measured.
+#   - PCI device 0x20B7, "NVIDIA A30", from the name table in NVIDIA's open GPU
+#     kernel modules (g_nv_name_released.h).
+#   - The optional NVLink bridge (200 GB/s, two GPUs) is not recorded, as for
+#     nvidia/h100-pcie.
+#   - CUDA attributes (the `cuda:` section): the 3072-bit bus is a retailer figure (see the cuda section); the L2 is unpublished and left unset.
+id: nvidia/a30
+vendor: nvidia
+model: "NVIDIA A30"
+architecture: ampere
+compute_capability: "8.0"
+warp_size: 32
+vram_bytes: 25769803776          # 24576 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 166912   # 163 KiB (sm_80)
+  registers_per_block: 65536
+  multiprocessors: 56            # derived, see the header; unverified
+  registers_per_sm: 65536
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 167936
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 24576          # 24 GB in MiB; not measured on a card
+  power_limit_w: 165             # TDP (data sheet)
+  sm_clock_max_mhz: 1410         # unpublished; the A100's until measured
+  mem_clock_max_mhz: 1215        # unpublished; the A100 40 GB's until measured
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 8375            # 0x20B7 [A30]
+  ecc: true
+  memory: hbm                    # rows are remapped on failure
+  pcie_link: "Gen4 x16"          # data sheet: "PCIe Gen4: 64GB/s"
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# Memory interface 3072 bits: PNY's and other retailers' A30 listings, not an NVIDIA page; it is what NVIDIA's
+# 933 GB/s needs at the 1215 MHz (2.43 Gbps) HBM2 clock the A100 40 GB has (3072 x 2.43 / 8 = 933), and three
+# 1024-bit stacks would hold 24 GB. Unverified.
+# The L2 size is not published by NVIDIA for the A30 (the 24 MB seen for the related A30X is a third party's), so it
+# is left unset, as for the B200 and B300, and so is the persisting L2.
+cuda:
+  memory_bus_width_bits: 3072

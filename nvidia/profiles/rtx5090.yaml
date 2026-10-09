@@ -40,7 +40,7 @@ telemetry:
   mem_clock_max_mhz: 14001       # GDDR7 at 28 Gbps (spec sheet)
   temperature_max_c: 90
   pci_vendor_id: 4318          # 0x10DE NVIDIA
-  pci_device_id: 11141         # 0x2B85 [GeForce RTX 5090] -- public PCI id listing
+  pci_device_id: 11141         # 0x2B85 [GeForce RTX 5090] -- NVIDIA's open GPU kernel modules name table (g_nv_name_released.h)
   ecc: false                   # GeForce: no ECC
   memory: gddr
   pcie_link: "Gen5 x8"         # most common link on real cards (40 of 61 runs in the benchmark database)

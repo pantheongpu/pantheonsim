@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
     SAME(gpuPciSubsystemID, 140);
 #endif
     // The figures a program divides or sizes by are not zero.
-    // (A profile that does not say its L2 reports none; the Blackwell parts' is not published.)
+    // (A profile that does not say its L2 reports none: B200, B300, GB200, Rubin, Thor, GB10 and A30, whose L2 NVIDIA has not published.)
     CHECK(p.memoryBusWidth > 0 && p.multiProcessorCount > 0 && p.l2CacheSize >= 0);
     CHECK(p.persistingL2CacheMaxSize <= p.l2CacheSize);
 

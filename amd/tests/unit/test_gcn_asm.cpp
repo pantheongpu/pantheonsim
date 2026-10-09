@@ -6,11 +6,13 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -1306,6 +1308,143 @@ VTEST(the_24_bit_multiplies_take_the_low_24_bits_signed_or_not_and_give_the_low_
     wrong += r[5 * l + 3] != static_cast<uint32_t>(up >> 32);
     wrong += r[5 * l + 4] != u(sp >> 32);
   }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(vop3_instructions_a_compiler_emits_give_what_the_isa_says) {
+  // rocPRIM's merge sort stopped on v_med3_u16 (VOP3 0x1fc); the whole range around it was missing: the
+  // 16-bit median, three-way and multiply-add, v_max3_u32, v_alignbyte_b32, the sums of absolute
+  // differences (and the quad forms over a 64-bit window), v_lerp_u8, and the packed conversions.
+  const amd::CodeObject o = object("asm_vop3_gaps");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> in(64 * 8);
+  std::vector<float> fin(64 * 3);
+  uint32_t seed = 31337;
+  const auto next = [&] {
+    seed = seed * 1103515245u + 12345u;
+    return seed;
+  };
+  // Halves that are exact, so the float and half arithmetic agree; infinity and zero for the DX9 multiply.
+  const float table[] = {0.25f, -0.5f, 1.5f, 3.0f, -2.0f, 0.0f, 300.0f, -7.0f, 0.75f, 100.0f, 2.0f, 1.0f, -1.0f};
+  const float inf = std::numeric_limits<float>::infinity();
+  for (uint32_t l = 0; l < 64; ++l) {
+    for (uint32_t k = 0; k < 8; ++k) in[8 * l + k] = next();
+    for (uint32_t k = 0; k < 3; ++k) fin[3 * l + k] = table[(next() >> 8) % 13];
+  }
+  in[0] = 0x00FF0080; in[1] = 0x7FFF8000; in[2] = 0xFFFF0001;   // the edges of the 16-bit orders
+  in[8] = 0; in[9] = 0xFFFFFFFF; in[10] = 0;
+  fin[3 * 5] = inf; fin[3 * 5 + 1] = 0.0f;                        // zero times infinity
+  fin[3 * 6] = 0.0f; fin[3 * 6 + 1] = inf;
+  fin[3 * 7] = 5.0f; fin[3 * 7 + 1] = -3.0f;                      // beyond the normalized range
+  const uint64_t in_d = mem.alloc(in.size() * 4), fin_d = mem.alloc(fin.size() * 4), out = mem.alloc(64 * 34 * 4);
+  mem.write(in_d, in.data(), in.size() * 4);
+  mem.write(fin_d, fin.data(), fin.size() * 4);
+  const std::vector<uint32_t> r = run(o, "gaps", mem, out, 64 * 34, {in_d, fin_d, out});
+  const auto half_bits = [](float f) {
+    const _Float16 h = static_cast<_Float16>(f);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return b;
+  };
+  const auto half_val = [](float f) { return static_cast<float>(static_cast<_Float16>(f)); };
+  const auto med = [](auto x, auto y, auto z) { return std::max(std::min(x, y), std::min(std::max(x, y), z)); };
+  const auto sad = [](uint32_t a, uint32_t b, bool masked) {
+    uint32_t sum = 0;
+    for (int k = 0; k < 4; ++k) {
+      const int x = a >> 8 * k & 0xFF, y = b >> 8 * k & 0xFF;
+      if (!(masked && y == 0)) sum += std::abs(x - y);
+    }
+    return sum;
+  };
+  const auto snorm = [](double x) -> uint16_t {
+    return std::isnan(x) ? 0 : static_cast<uint16_t>(static_cast<int16_t>(std::nearbyint(std::clamp(x, -1.0, 1.0) * 32767.0)));
+  };
+  const auto unorm = [](double x) -> uint16_t {
+    return std::isnan(x) ? 0 : static_cast<uint16_t>(std::nearbyint(std::clamp(x, 0.0, 1.0) * 65535.0));
+  };
+  const auto both_nan = [](uint32_t a, uint32_t b) {
+    const auto nan = [](uint32_t v) { return (v & 0x7C00) == 0x7C00 && (v & 0x3FF); };
+    return nan(a) && nan(b);
+  };
+  std::string first;
+  int wrong = 0;
+  const auto check = [&](uint32_t lane, int slot, uint32_t got, uint32_t want, const char* what) {
+    if (got == want) return;
+    if (++wrong == 1) {
+      char buf[160];
+      std::snprintf(buf, sizeof buf, "%s: lane %u got 0x%08x, wanted 0x%08x", what, lane, got, want);
+      first = buf;
+    }
+    (void)slot;
+  };
+  for (uint32_t l = 0; l < 64; ++l) {
+    const uint32_t* w = &in[8 * l];
+    const float f0 = fin[3 * l], f1 = fin[3 * l + 1], f2 = fin[3 * l + 2];
+    const float h0 = half_val(f0), h1 = half_val(f1), h2 = half_val(f2);
+    const auto at = [&](int k) { return r[34 * l + k]; };
+    const uint16_t u0 = w[0], u1 = w[1], u2 = w[2];
+    const int16_t s0 = static_cast<int16_t>(u0), s1 = static_cast<int16_t>(u1), s2 = static_cast<int16_t>(u2);
+    check(l, 0, at(0), med(u0, u1, u2), "v_med3_u16");
+    check(l, 1, at(1), static_cast<uint16_t>(med(s0, s1, s2)), "v_med3_i16");
+    check(l, 2, at(2), half_bits(med(h0, h1, h2)), "v_med3_f16");
+    check(l, 3, at(3), half_bits(std::min({h0, h1, h2})), "v_min3_f16");
+    check(l, 4, at(4), half_bits(std::max({h0, h1, h2})), "v_max3_f16");
+    {
+      const uint32_t want = half_bits(h0 * h1 + h2);
+      if (!both_nan(at(5), want)) check(l, 5, at(5), want, "v_mad_f16");
+    }
+    check(l, 6, at(6), static_cast<uint16_t>(uint32_t{u0} * u1 + u2), "v_mad_u16");   // unsigned, or two uint16_t promote to a signed int that overflows
+    check(l, 7, at(7), static_cast<uint16_t>(s0 * s1 + s2), "v_mad_i16");
+    check(l, 8, at(8), std::max({w[0], w[1], w[2]}), "v_max3_u32");
+    check(l, 9, at(9), static_cast<uint32_t>((uint64_t{w[0]} << 32 | w[1]) >> 8 * (w[2] & 3)), "v_alignbyte_b32");
+    {
+      uint32_t want = 0;
+      for (int k = 0; k < 4; ++k) want |= (((w[0] >> 8 * k & 0xFF) + (w[1] >> 8 * k & 0xFF) + (w[2] >> 8 * k & 1)) >> 1) << 8 * k;
+      check(l, 10, at(10), want, "v_lerp_u8");
+    }
+    check(l, 11, at(11), sad(w[0], w[1], false) + w[2], "v_sad_u8");
+    check(l, 12, at(12), (sad(w[0], w[1], false) << 16) + w[2], "v_sad_hi_u8");
+    {
+      const auto d = [](uint32_t x, uint32_t y) { return x > y ? x - y : y - x; };
+      check(l, 13, at(13), d(w[0] & 0xFFFF, w[1] & 0xFFFF) + d(w[0] >> 16, w[1] >> 16) + w[2], "v_sad_u16");
+      check(l, 14, at(14), d(w[0], w[1]) + w[2], "v_sad_u32");
+    }
+    check(l, 15, at(15), sad(w[0], w[1], true) + w[2], "v_msad_u8");
+    {
+      const uint32_t byte = std::isnan(f0) || f0 <= 0 ? 0 : f0 >= 255 ? 255 : static_cast<uint32_t>(f0);
+      const uint32_t shift = 8 * (w[1] & 3);
+      check(l, 16, at(16), (w[2] & ~(0xFFu << shift)) | byte << shift, "v_cvt_pk_u8_f32");
+    }
+    check(l, 17, at(17), u(int32_t{s0} * s1) + w[2], "v_mad_i32_i16");   // the add wraps in unsigned arithmetic, as the hardware's does
+    {
+      const auto sat = [](int32_t v) { return static_cast<uint16_t>(std::clamp<int32_t>(v, INT16_MIN, INT16_MAX)); };
+      check(l, 18, at(18), sat(static_cast<int32_t>(w[0])) | uint32_t{sat(static_cast<int32_t>(w[1]))} << 16, "v_cvt_pk_i16_i32");
+    }
+    check(l, 19, at(19), snorm(f0) | uint32_t{snorm(f1)} << 16, "v_cvt_pknorm_i16_f32");
+    check(l, 20, at(20), unorm(f0) | uint32_t{unorm(f1)} << 16, "v_cvt_pknorm_u16_f32");
+    check(l, 21, at(21), snorm(h0) | uint32_t{snorm(h1)} << 16, "v_cvt_pknorm_i16_f16");
+    check(l, 22, at(22), unorm(h0) | uint32_t{unorm(h1)} << 16, "v_cvt_pknorm_u16_f16");
+    check(l, 23, at(23), static_cast<uint16_t>(s0 + s1), "v_add_i16");
+    check(l, 24, at(24), static_cast<uint16_t>(s0 - s1), "v_sub_i16");
+    check(l, 25, at(25), f0 == 0 || f1 == 0 ? 0u : [&] { const float p = f0 * f1; uint32_t b; std::memcpy(&b, &p, 4); return b; }(),
+          "v_mul_legacy_f32");
+    {
+      const uint64_t a = uint64_t{w[1]} << 32 | w[0], acc = uint64_t{w[5]} << 32 | w[4];
+      uint64_t q = 0, m = 0;
+      uint32_t mq[4];
+      for (int k = 0; k < 4; ++k) {
+        q |= uint64_t{(sad(static_cast<uint32_t>(a >> 8 * k), w[2], false) + static_cast<uint32_t>(acc >> 16 * k)) & 0xFFFF} << 16 * k;
+        m |= uint64_t{(sad(static_cast<uint32_t>(a >> 8 * k), w[2], true) + static_cast<uint32_t>(acc >> 16 * k)) & 0xFFFF} << 16 * k;
+        mq[k] = sad(static_cast<uint32_t>(a >> 8 * k), w[2], true) + w[4 + k];
+      }
+      check(l, 26, at(26), static_cast<uint32_t>(q), "v_qsad_pk_u16_u8 (low)");
+      check(l, 27, at(27), static_cast<uint32_t>(q >> 32), "v_qsad_pk_u16_u8 (high)");
+      check(l, 28, at(28), static_cast<uint32_t>(m), "v_mqsad_pk_u16_u8 (low)");
+      check(l, 29, at(29), static_cast<uint32_t>(m >> 32), "v_mqsad_pk_u16_u8 (high)");
+      for (int k = 0; k < 4; ++k) check(l, 30 + k, at(30 + k), mq[k], "v_mqsad_u32_u8");
+    }
+  }
+  if (wrong) std::fprintf(stderr, "%d wrong; first: %s\n", wrong, first.c_str());
   VCHECK_EQ(wrong, 0);
 }
 

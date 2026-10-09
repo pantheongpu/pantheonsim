@@ -80,6 +80,23 @@ __global__ void f64_atomic(double* sum) {
 }
 
 static int g_checks = 0, g_failed = 0;
+// A pointer to a work-item's own array and one into LDS, as a function that cannot see where they point takes them: flat
+// addresses, the first made from src_flat_scratch_base with the lane's number in it.
+__attribute__((noinline)) __device__ int weighted_sum(const int* p, int n) {
+  int s = 0;
+  for (int i = 0; i < n; ++i) s += p[i] * (i + 1);
+  return s;
+}
+__global__ void flat_pointers(int* o) {
+  int a[8];
+  for (int i = 0; i < 8; ++i) a[i] = static_cast<int>(threadIdx.x) * 10 + i;
+  __shared__ int lds[64];
+  lds[threadIdx.x] = static_cast<int>(threadIdx.x) + 100;
+  __syncthreads();
+  o[2 * threadIdx.x] = weighted_sum(a, 8);
+  o[2 * threadIdx.x + 1] = weighted_sum(lds + threadIdx.x, 1);
+}
+
 static void report(const char* name, int wrong, int n) {
   ++g_checks;
   if (wrong) ++g_failed;
@@ -253,6 +270,18 @@ int main() {
       wrong_f8 += std::fabs(half_of(out[7 * l + 6] >> 16) - e5m2((f8[l] >> 8) & 0xFF)) > 1e-6f;
     }
     report("fp8 and bf8 to half", wrong_f8, 3 * kLanes);
+  }
+  // Flat pointers to private and to shared memory.
+  {
+    int* d = nullptr;
+    CHECK(hipMalloc(&d, 2 * kLanes * sizeof(int)));
+    flat_pointers<<<1, kLanes>>>(d);
+    CHECK(hipDeviceSynchronize());
+    std::vector<int> out(2 * kLanes);
+    CHECK(hipMemcpy(out.data(), d, out.size() * sizeof(int), hipMemcpyDeviceToHost));
+    int wrong = 0;
+    for (int l = 0; l < kLanes; ++l) wrong += out[2 * l] != 360 * l + 168 || out[2 * l + 1] != l + 100;
+    report("flat pointers to private and shared memory", wrong, kLanes);
   }
   // An f64 atomic add.
   {

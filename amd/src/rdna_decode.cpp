@@ -13,6 +13,7 @@
 // comparison's result, a carry -- is one scalar register.
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -206,10 +207,22 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
       {"v_add_nc_i16", "v_add_i16"},         {"v_sub_nc_i16", "v_sub_i16"},
       {"v_dot2acc_f32_f16", "v_dot2c_f32_f16"},
   };
+  // gfx1250's three-operand "_num" minimum and maximum forms take a number over a NaN and order the zeros, as the
+  // older instructions they replaced did not: they keep their own names, and the executor has them.
+  static const std::set<std::string> kOwnNames = {
+      "v_min3_num_f32", "v_max3_num_f32", "v_minmax_num_f32", "v_maxmin_num_f32", "v_med3_num_f32",
+      "v_min3_num_f16", "v_max3_num_f16", "v_minmax_num_f16", "v_maxmin_num_f16", "v_med3_num_f16"};
+  const bool own = g_cdna5 && kOwnNames.count(name);
   std::vector<std::string> candidates;
   if (const auto it = kRenamed.find(name); it != kRenamed.end()) candidates.push_back(it->second);
-  if (const auto it = kAliases.find(name); it != kAliases.end())
+  if (const auto it = kAliases.find(name); it != kAliases.end() && !own)
     candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+  // gfx1250's cluster loads return the data to the work-groups of a cluster the mask in M0 names; used outside a cluster,
+  // as every dispatch here is, "they are downgraded to global loads", which is what they run as.
+  if (g_cdna5 && name.rfind("cluster_load_b", 0) == 0) {
+    const std::string width = name.substr(14);
+    candidates.insert(candidates.begin(), width == "32" ? "global_load_dword" : width == "64" ? "global_load_dwordx2" : "global_load_dwordx4");
+  }
   candidates.push_back(name);
   const bool short_form = enc == Enc::Vop1 || enc == Enc::Vop2 || enc == Enc::Vopc || enc == Enc::Vopd;
   // gfx9's table keeps a flat, global or scratch access by the name after
@@ -274,6 +287,9 @@ Operand operand(uint32_t code, uint32_t width) {
   } else if (code >= 193 && code <= 208) {
     o.kind = OperandKind::Inline;
     o.value = -static_cast<int64_t>(code - 192);
+  } else if (g_cdna5 && (code == 230 || code == 231)) {
+    // gfx1250: the base of the flat address a scratch (private) object has, which a kernel adds its offset to to make a pointer.
+    o.kind = code == 230 ? OperandKind::FlatScratchLo : OperandKind::FlatScratchHi;
   } else if (code == 235 || code == 237) {
     o.kind = code == 235 ? OperandKind::SharedBase : OperandKind::PrivateBase;
   } else if (code == 236 || code == 238) {
@@ -502,6 +518,12 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
       main.src.push_back(operand(bits(prefix, 40, 32), x2 ? 1 : 2));
       main.src.push_back(operand(bits(prefix, 49, 41), x2 ? 1 : 2));
       main.src[main.src.size() - 2].scale_src = main.src.back().scale_src = true;
+      // The prefix's SCL_NEG (A's scale format, bits 62:61), SCL_NEG_HI (B's, 9:8) and the lane-half selects
+      // (SCL_OPSEL bit 11 for A, SCL_OPSEL_HI bit 59 for B).
+      main.scale_fmt_a = static_cast<uint8_t>(bits(prefix, 62, 61));
+      main.scale_fmt_b = static_cast<uint8_t>(bits(prefix, 9, 8));
+      main.scale_hi_a = bits(prefix, 11, 11);
+      main.scale_hi_b = bits(prefix, 59, 59);
       main.pc = pc;
       main.size = 16;
       return main;
