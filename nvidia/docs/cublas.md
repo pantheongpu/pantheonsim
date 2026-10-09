@@ -115,12 +115,32 @@ dimension, pinning mode and CPU-ratio settings, and every routine (`gemm`,
 `trsm`, `trmm`) over host or device memory. GEMM is cut into blockDim tiles
 handed round-robin to the selected devices, run one after another; the
 other routines run whole on the first device. A handle takes one
-`cublasXtDeviceSelect`, as on the card.
+`cublasXtDeviceSelect`, as on the card. GEMM also honours the CPU share: with a
+Fortran-style routine set by `cublasXtSetCpuRoutine` and a ratio above 0 from
+`cublasXtSetCpuRatio`, the last `floor(ratio * d)` rows (columns when n >= m)
+of C -- d being the longer of m and n -- are computed by the caller's
+routine, handed the caller's own memory, as the card does (found with a probe
+routine that records its arguments).
 
-The handle settings -- atomics mode, SM count target and CUDA 13's emulation
-controls -- are kept and read back with the card's defaults and refusals,
-and `cublasLoggerConfigure`, the logger callback and `cublasXerbla` are
-there. What remains is listed in [libraries.md](libraries.md#what-is-not-implemented).
+**`cublasUint8gemmBias`** (deprecated, declared without a formula) is
+`C = clamp(round((sum (op(A) - A_bias)(op(B) - B_bias) + C_bias) C_mult / 2^C_shift), 0, 255)`,
+found by experiment on the card and checked on 10,505 outputs; C is not read.
+
+**Fixed-point emulation of double precision** (`fixed_point_gemm.hpp`): under
+strategy `EAGER`, a GemmEx with `CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT` (or any
+double or double-complex GEMM when the handle's math mode has
+`CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH`) is computed on integer slices of the
+operands as NVIDIA's Ozaki-style algorithm does: each row of A and column of B
+shares one exponent, elements become 7 + 8 (s - 1)-bit integers cut into s
+balanced base-256 digits (as digits of the signed integer), and the digit products with i + j <= s + 1 are
+added exactly and scaled. The strategy, the mantissa control, the maximum
+bit count, the offset and the bit count pointer all take effect. The slicing was
+found by probing an RTX 3060 (14,000 single-element products and random
+matrices for every slice count); see `e2e_blas_emulation_paths`.
+
+The handle settings -- atomics mode and SM count target -- are kept and read
+back with the card's defaults and refusals, and `cublasLoggerConfigure`, the
+logger callback and `cublasXerbla` are there. What remains is listed in [libraries.md](libraries.md#what-is-not-implemented).
 
 ## The rest of the stack
 

@@ -1819,7 +1819,8 @@ if(TARGET vgpucublas)
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_attention:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet" "solver_metis_paths:cusolver:cusparse"
-                          "blas_u8gemm_paths:cublas")
+                          "blas_u8gemm_paths:cublas" "blas_emulation_paths:cublas" "sparse_color_paths:cusparse"
+                          "lt_emulation_paths:cublasLt:cublas")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}

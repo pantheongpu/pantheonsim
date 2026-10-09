@@ -442,6 +442,11 @@ runs them; each is a ctest of its own.
 | `e2e_sparse_tridiag_paths` | gtsv2 (pivoting), gtsv2_nopivot and gtsv2StridedBatch (PCR, and CR past 2048 and 512 unknowns: which unknowns a zero pivot spoils), the interleaved Thomas, LU and QR and the pentadiagonal QR with what each leaves in its inputs, in S, D, C and Z | ADI and spline solvers, PyTorch's `torch.linalg` tridiagonal paths |
 | `e2e_sparse_vector_paths` | sparse vectors (SpVV in every compute type, Axpby, Gather, Scatter, Rot), gemvi, Blocked-ELL SpMM and DenseToSparse, sliced-ELL SpMV, and what NVIDIA's refuses for each | sparse optimizers, block-sparse attention |
 | `e2e_sparse_helper_paths` | pruning (by threshold and percentage), nnz and compression, unsorted CSR, gebsr2gebsr/gebsr2gebsc, csrcolor, SpGEMMreuse, SpGEMM's product count and memory estimate, SpMMOp's refusal, SpSV/SpSM updateMatrix, the logger, the CSC sort | model pruning, multigrid setup |
+| `e2e_solver_metis_paths` | cusolverSpXcsrmetisndHost on 78 graphs (meshes, bands, trees, random, with isolated vertices) against the permutations the card printed (`run_metis_card.sh` re-checks them on a card), the options array, base-one input, and the arguments the card refuses | sparse direct solvers' fill-reducing orderings |
+| `e2e_sparse_color_paths` | csrcolor: proper colorings at every fraction, ncolors, reordering, the descriptor's index base, device pointer mode, the refusals | graph coloring for parallel smoothers |
+| `e2e_blas_u8gemm_paths` | cublasUint8gemmBias: 400 random calls against the card's formula (10,505 outputs), rounding, saturation, shifts, transposes, the arguments the card refuses | |
+| `e2e_blas_emulation_paths` | fixed-point emulation of double precision: bit for bit the card's results at every mantissa bit count from 4 to 64 (`run_blas_emulation_card.sh` re-checks them), the strategy and environment variable, the math mode, dynamic control, batches, Zgemm | |
+| `e2e_lt_emulation_paths` | cublasLtEmulationDesc_t and its matmul attribute: defaults, refusals, in-place initialisation, the checks at the matmul | |
 | `e2e_complex_paths` | complex cuBLAS (GEMM in every batched form, GEMV, level 1, trsm, batched LU, herk, hemv) and cuSOLVER (LU, Cholesky, QR with ungqr/unmqr, heevd/heevj, gesvd/gesvdj, the X API on complex types) | complex tensors in `torch.linalg`, `@` |
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_lt_epilogue_paths` | RELU_AUX/GELU_AUX's mask and input, DRELU/DGELU and their bias gradients, BGRADA/BGRADB, in fp16/bf16/fp32/fp64, and what the card refuses | a training step's backward pass (cuBLASLt-fused linear layers) |
@@ -748,16 +753,34 @@ same card, whose driver then runs the linked PTX and SASS.
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
-- **cuBLAS**: `cublasUint8gemmBias` (deprecated, and undocumented in
-  cuBLAS 13: the card runs it, but there is no definition to implement), and
-  the exported names the header does not declare (`cublas?bdmm`,
+- **cuBLAS**: the exported names the header does not declare (`cublas?bdmm`,
   `cublasGet/SetBackdoor`, `cublasGet/SetEnvironmentMode`); a program that
-  needs one fails to load with the name. cuBLASXt runs GEMM's tiles across
-  the selected devices but every other routine whole on the first, and never
-  hands work to the CPU (`cublasXtSetCpuRatio` is kept, not used). The
-  emulation controls (`cublasSetEmulationStrategy` and the fixed-point
-  mantissa settings) are kept and read back; nothing is emulated, every GEMM
-  being exact to its precision already.
+  needs one fails to load with the name. cuBLASXt runs GEMM's tiles across the
+  selected devices but every other routine whole on the first (the results are
+  the same either way; NVIDIA spreads them over the devices, which nothing a
+  program can read shows). GEMM's CPU share is real: a routine set with
+  `cublasXtSetCpuRoutine` and a ratio from `cublasXtSetCpuRatio` is called, as
+  the card calls it, on the tail of the longer dimension of C, and no other
+  routine ever calls one (the card takes a routine and ratio for the complex
+  Hermitian routines and ignores them). Fixed-point emulation of double
+  precision (`CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT`, the FP64 emulated math
+  mode) works under strategy EAGER for GemmEx, its batched forms, Dgemm and
+  Zgemm. With FIXED mantissa control it is NVIDIA's slicing, bit for bit the
+  card's on 41,538 outputs at every mantissa bit count from 4 to 64. With
+  DYNAMIC control the bit count is this library's rule, not NVIDIA's
+  automatic dynamic precision (the card chose 54 to 97 bits for the matrices
+  tried and its rule is not public; this one is cautious, 54 bits plus the
+  widest spread of a dot product's term exponents): the products come out as
+  accurate as the card's, and the number the bit count pointer receives
+  differs. PERFORMANT never emulates, as on the RTX 3060 (where double
+  precision is 1/64 of single); `CUBLAS_COMPUTE_32F_EMULATED_16BFX9` runs as
+  plain single precision, which is what the card does below compute
+  capability 10 -- the BF16x9 scheme itself is not implemented (no card here
+  runs it), nor is the special-values mask. cuBLASLt has the emulation
+  descriptor (`cublasLtEmulationDesc*`, the matmul descriptor's attribute 38)
+  with the card's defaults and refusals, and its matmul checks one as the card
+  does, but does not emulate with it -- NVIDIA's did not on the RTX 3060. The complex form is four real
+  emulated products, derived from the real one, not measured.
 - **cuBLASLt**: the auxiliary buffer's own scale and amax for FP8 epilogues
   (`EPILOGUE_AUX_SCALE_POINTER`, `EPILOGUE_AUX_AMAX_POINTER`), per-batch block
   scales, and the experimental scaling modes (`VEC32_MN_K4_UE8M0`,
@@ -795,34 +818,66 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   documentation (batches and planes dealt out in order, 1‑D strings over the
   GPUs in order), and the 1‑D factor choice past 2^27 points keeps the last
   measured one.
-- **cuSPARSE**: the legacy `cusparse<t>csrmv` family (removed by NVIDIA in
-  CUDA 12); SDDMM with a conjugate transpose (NVIDIA's documents none and
-  computes something else when given one); `cusparseSpMMOp`, whose operators
-  are LTO-IR (NVVM bitcode) that VirtualGPU cannot compile -- `_createPlan`
-  answers as NVIDIA's does when nvJitLink refuses them (INTERNAL_ERROR).
-  `csrcolor` gives a proper coloring, but not NVIDIA's colors (its algorithm is
-  undocumented and randomized). Where NVIDIA's 13.0 does something no caller
-  can mean, this does what the documentation says instead: `csr2csr_compress`
+- **cuSPARSE**: the legacy `cusparse<t>csrmv` family (and `csrmm`, `csrsv`,
+  the HYB routines): NVIDIA's `libcusparse.so.12` exports none of them and
+  CUDA 12 and 13's headers declare none (removed in 12.0), so there is nothing
+  to match; a program that calls them was built for a `libcusparse.so.11` or
+  older, whose soname this library does not answer to. SDDMM with a conjugate
+  transpose: NVIDIA's library refuses it for real data
+  (`INVALID_VALUE`, "conjugate transpose is not valid for ... data type") and
+  accepts it for complex data without computing anything its documentation
+  describes (measured: `B^H` is read as `B`, and `A^H` mixes the entries of
+  different rows), so this refuses it (`NOT_SUPPORTED`); `cusparseSpMMOp`,
+  deprecated and in preview, whose operators are LTO-IR (NVVM bitcode) that
+  VirtualGPU cannot compile and whose calling convention only a sample
+  documents -- `_createPlan` answers as NVIDIA's does when nvJitLink refuses
+  them (INTERNAL_ERROR) and says why on stderr. `csrcolor` is colored by
+  Jones-Plassmann-Luby rounds on a fixed hash: neighbours never share a color,
+  rounds stop once `fractionToColor` of the nodes are colored and each
+  remaining node gets a color of its own, `ncolors` is the largest color plus
+  one, `reordering` lists the nodes by color, and all follow the descriptor's
+  index base, each as checked on the card (`e2e_sparse_color_paths`); NVIDIA's
+  colors are a randomized multi-hash scheme whose numbers are not public (a
+  6-node path gets 0, 8, 4, 8, 0, 10 and 11 colors), so the colors themselves
+  differ. Where NVIDIA's 13.0 does something no caller can mean, this does what
+  the documentation says instead: `csr2csr_compress`
   keeps |a| > tol as `nnz_compress` counts (NVIDIA's drops negative real
   entries and leaves their slots unwritten), a negative pruning threshold keeps
   every entry (NVIDIA's returns column indices past n), `gpsvInterleavedBatch`
-  with an algo other than 0 is NOT_SUPPORTED (NVIDIA's does nothing and
-  reports success). The solvers agree with NVIDIA's to rounding, not bit for
-  bit: they compute in double.
+  with an algo other than 0 is NOT_SUPPORTED (the documentation: "only support
+  algo = 0 (QR)"; NVIDIA's does nothing and reports success). The solvers
+  agree with NVIDIA's to rounding, not bit for bit: they compute in double.
 - **cuSPARSELt**: FP8 and FP4 inputs (sm_89 and later on NVIDIA's library;
   their scale modes are accepted and ignored), fp16 compute (no sm_86 kernel on NVIDIA's library
   either), and GELU outside int8 output (refused there too); see the section
   above for where the compressed layout and the search differ.
 - **cuSOLVER**: left eigenvectors from `Xgeev` (NVIDIA's CUDA 13.0 and 13.2
   libraries answer jobvl = VECTOR with INTERNAL_ERROR and document right
-  eigenvectors only; this does the same), `csrmetisnd`'s METIS permutation
-  (NVIDIA's runs METIS 5.1.0's `METIS_NodeND` with its default options on
-  A + A^T without the diagonal -- a reference METIS 5.1.0 build gave its
-  permutation on 99 of 100 matrices -- and VirtualGPU carries no METIS, so it
-  returns `symmdq`'s minimum-degree permutation instead), cusolverSp's
-  `csrlsvlu` on the device (NVIDIA ships only the host one), and cusolverMg
-  grids with more than one row of devices (NVIDIA's refuses them too, at
-  `cusolverMgCreateDeviceGrid`). Measured differences: when several columns of
+  eigenvectors only; this does the same), cusolverSp's `csrlsvlu` on the
+  device (NVIDIA exports only `csrlsvluHost`), and cusolverMg grids with more
+  than one row of devices (NVIDIA's refuses them too, at
+  `cusolverMgCreateDeviceGrid`) are not implemented because NVIDIA's own
+  library does not implement them. `csrmetisnd` runs METIS 5.1.0's
+  `METIS_NodeND` -- NVIDIA documents it as "a wrapper of METIS_NodeND" linking
+  the 64-bit metis-5.1.0 -- on the pattern of A + A^T without its diagonal.
+  The METIS source (Apache-2.0, like this repository) is vendored in
+  `nvidia/third_party/metis` rather than fetched at build time, so the build
+  needs no network: only what `METIS_NodeND` reaches, compiled into
+  libcusolver with hidden symbols. Three changes from the distribution, each
+  marked in the files and in that directory's README: 64-bit indices, a
+  thread-local copy of glibc's `rand()` sequence (the original reseeds the
+  host process's generator), and the vertex-compression step sorted by key and
+  then vertex, which is what the card's compression does (without it the 
+  complete graphs differ). 77 of 78 test matrices give the card's permutation
+  exactly (`e2e_solver_metis_paths` compares them with what the card printed,
+  `run_metis_card.sh` re-checks the data on a card); the one that differs is a
+  graph with no edges, where no run of METIS 5.1.0 here gives the card's
+  answer and any permutation is a correct one. Arguments are answered as the
+  card answers them (n <= 0 or nnz = 0 is INVALID_VALUE, a negative nnz
+  ALLOC_FAILED, a null descriptor MATRIX_TYPE_NOT_SUPPORTED, an option METIS
+  rejects INTERNAL_ERROR) except where the card crashes (a NULL p, Fortran
+  numbering in the options) or reads past its arrays (offsets that disagree
+  with nnz, columns out of range): INVALID_VALUE here. Measured differences: when several columns of
   a Cholesky factorization are independent of one another NVIDIA's names a
   different one in `singularity`. `Xgeev` on a complex matrix returns its
   eigenvalues in NVIDIA's order up to n = 74 (both are LAPACK's single-shift
@@ -844,8 +899,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   documentation allows.
 - **cuTENSOR**: block-sparse contractions are created and checked but not
   planned (NOT_SUPPORTED; an RTX 3060 cannot plan them either, so there is no
-  card to check a kernel against); just-in-time kernels (the JIT mode is
-  accepted and changes nothing); the undocumented exports
+  card to check a kernel against); just-in-time kernels (the JIT mode is accepted
+  and changes nothing, as on NVIDIA's library for the plan and its results;
+  what differs there is the kernel cache, which holds compiled kernels after
+  a batched contraction and is empty here, and plan creation, which took
+  394 ms once); the undocumented exports
   (`cutensorCreateComputeDescriptor`, extraction and insertion, ...), which
   answer NOT_SUPPORTED. A permutation whose input has a mode its output lacks
   is planned by NVIDIA's library and writes zeros on an RTX 3060; here its

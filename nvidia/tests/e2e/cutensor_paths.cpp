@@ -1053,6 +1053,7 @@ static void infrastructure() {
   IS(cutensorReadKernelCacheFromFile(h3, fe.c_str()), 0);
   IS(cutensorReadKernelCacheFromFile(h3, fj.c_str()), CUTENSOR_STATUS_INTERNAL_ERROR);
   IS(cutensorReadKernelCacheFromFile(h3, "/nonexistent/kernels.bin"), CUTENSOR_STATUS_IO_ERROR);
+  IS(cutensorWriteKernelCacheToFile(h3, "/nonexistent/kernels.bin"), 0);   // the card: SUCCESS, there is nothing to write
   for (const std::string& s : {f1, fj, fe, fk}) std::remove(s.c_str());
   cutensorDestroy(h2);
   cutensorDestroy(h3);

@@ -1840,9 +1840,10 @@ behaviour, timing).
 
 ### NVIDIA vendor libraries (nvidia/docs/libraries.md "What is not implemented", from line 746)
 
-- **cuBLAS**: `cublasUint8gemmBias`; undeclared exports (`cublas?bdmm`, `Get/SetBackdoor`,
-  `Get/SetEnvironmentMode`); cuBLASXt tiles GEMM only, with no CPU offload; emulation controls are
-  inert. Generated stubs answer `..._NOT_SUPPORTED` and print "is not implemented by VirtualGPU"
+- **cuBLAS**: undeclared exports (`cublas?bdmm`, `Get/SetBackdoor`, `Get/SetEnvironmentMode`);
+  cuBLASXt tiles GEMM only (its CPU share works for GEMM); FP64 fixed-point emulation works under
+  EAGER (FIXED control bit-exact to the card; DYNAMIC chooses its own bit count), BF16x9 does not exist.
+  Generated stubs answer `..._NOT_SUPPORTED` and print "is not implemented by VirtualGPU"
   (nvidia/src/generated/cublas_stubs.cpp:29).
 - **cuBLASLt**: FP8 aux scale/amax, per-batch block scales, UE8M0 modes; the block-scaled modes are
   derived from documentation, not checked against a card.
@@ -1853,12 +1854,16 @@ behaviour, timing).
   ops, RNN/attention dropout masks.
 - **cuFFT**: legacy callbacks (`CUFFT_NOT_IMPLEMENTED`), LTO-IR callbacks; multi-GPU layouts measured on
   two GPUs only.
-- **cuSPARSE**: the `csrmv` family, SDDMM conjugate transpose, SpMMOp (LTO-IR), `csrcolor` colours
-  differ from NVIDIA's, `gpsvInterleavedBatch` with algo != 0; solvers compute in double.
+- **cuSPARSE**: SDDMM conjugate transpose (NVIDIA's computes garbage for complex), SpMMOp (LTO-IR),
+  `csrcolor` colours differ from NVIDIA's (documented properties checked on the card),
+  `gpsvInterleavedBatch` with algo != 0 (documented as unsupported); solvers compute in double. The
+  `csrmv` family is not in NVIDIA's CUDA 12/13 libraries, so there is nothing to match.
   **cuSPARSELt**: FP8/FP4, fp16 compute, GELU outside int8.
-- **cuSOLVER**: `Xgeev` left eigenvectors, `csrmetisnd` (no METIS), `csrlsvlu` on device, Mg multi-row
-  grids; a list of measured differences from NVIDIA's output in libraries.md.
-- **cuTENSOR**: block-sparse (not planned), JIT mode is a no-op. **cuTensorNet**: state API, gradients,
+- **cuSOLVER**: `Xgeev` left eigenvectors, `csrlsvlu` on device and Mg multi-row grids (NVIDIA's own
+  library has none of the three); `csrmetisnd` runs a vendored METIS 5.1.0 (77/78 test permutations
+  equal the card's); a list of measured differences from NVIDIA's output in libraries.md.
+- **cuTENSOR**: block-sparse (not planned), JIT mode is a no-op (the card's kernel cache fills after
+  a batched contraction; ours stays empty). **cuTensorNet**: state API, gradients,
   distributed execution, non-gesvd SVD, half-precision decompositions, capture; cuQuantum Python 26.09
   does not start (static cudart).
 - **NCCL**: symmetric-memory windows, the network plugin; stubs that answer `ncclInvalidUsage`:
