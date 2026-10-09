@@ -2196,6 +2196,15 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # Cluster occupancy (nvidia/docs/clusters.md): an RTX 3060's own answers, and the GPC layouts of the parts with clusters.
+  add_test(NAME e2e_cluster_occupancy
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cluster_occupancy.sh)
+  set_tests_properties(e2e_cluster_occupancy PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_texture_srgb
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_srgb.sh)
   set_tests_properties(e2e_texture_srgb PROPERTIES

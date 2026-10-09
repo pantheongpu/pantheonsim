@@ -37,6 +37,7 @@
 #include <stdexcept>
 
 #include "error_names.hpp"
+#include "vgpu/exec/cluster.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
 #include "texture_formats.hpp"
@@ -5769,6 +5770,79 @@ int blocks_per_sm(ShimState& s, const FuncRec& f, int block, size_t dyn) {
                               .occupancy.blocks_per_sm);
 }
 }  // namespace
+
+/* ---- clusters ----
+ * cuOccupancyMaxActiveClusters and cuOccupancyMaxPotentialClusterSize, which
+ * vgpu/exec/cluster.hpp answers: from the profile's GPC layout where it has one
+ * (derived, and said once), by the card's own answers where the part has no
+ * clusters (measured on an RTX 3060: CUDA_SUCCESS with 0, unless the configuration
+ * names a cluster dimension, which is CUDA_ERROR_INVALID_CLUSTER_SIZE). */
+namespace {
+struct ClusterLaunchConfigABI {   // CUlaunchConfig
+  unsigned gx, gy, gz, bx, by, bz;
+  unsigned shared_bytes;
+  CUstream stream;
+  const LaunchAttrABI* attrs;
+  unsigned num_attrs;
+};
+
+CUresult cluster_occupancy_impl(const char* api_name, bool active, int* out, CUfunction f, const void* config) {
+  using S = vgpu::exec::ClusterAnswer::Status;
+  if (!out || !f || !config) return CUDA_ERROR_INVALID_VALUE;   // the card: invalid value for a null function
+  return api(api_name, true, false, [&](ShimState& s) -> CUresult {
+    const FuncRec* rec = occupancy_func(s, f);
+    if (!rec) return CUDA_ERROR_INVALID_HANDLE;
+    const vgpu::DeviceProfile& p = s.rt->device(rec->device).profile();
+    const auto* c = static_cast<const ClusterLaunchConfigABI*>(config);
+    if (c->num_attrs != 0 && c->attrs == nullptr) return CUDA_ERROR_INVALID_VALUE;
+    bool has_dim = false;
+    std::array<uint32_t, 3> dim{0, 0, 0};
+    for (unsigned i = 0; i < c->num_attrs; ++i) {
+      if (c->attrs[i].id != kLaunchAttrClusterDimension) continue;
+      has_dim = true;
+      dim = {c->attrs[i].value.cluster_dim.x, c->attrs[i].value.cluster_dim.y, c->attrs[i].value.cluster_dim.z};
+    }
+    uint32_t per_sm = 0;
+    if (vgpu::exec::supports_clusters(p)) {
+      const uint64_t threads = uint64_t{c->bx} * c->by * c->bz;
+      if (threads == 0 || threads > p.limits.max_threads_per_block) return CUDA_ERROR_INVALID_VALUE;
+      per_sm = static_cast<uint32_t>(blocks_per_sm(s, *rec, static_cast<int>(threads), c->shared_bytes));
+    }
+    const vgpu::exec::ClusterAnswer a = vgpu::exec::cluster_occupancy(
+        p, active, has_dim, dim, rec->fn->req_cluster, rec->nonportable_cluster, per_sm);
+    if (!quiet()) {
+      static std::atomic<bool> said_missing{false}, said_derived{false};
+      if (a.status == S::NotSupported && !said_missing.exchange(true))
+        std::fprintf(stderr, "[vgpu] %s is not implemented for %s: %s\n", api_name, p.id.c_str(), a.why);
+      if (a.status == S::Ok && a.uses_layout && !said_derived.exchange(true))
+        std::fprintf(stderr,
+                     "[vgpu] %s: %s has %u GPCs and %u TPCs (%s), spread evenly over the GPCs because NVIDIA "
+                     "does not publish how many each has; the answer is derived from that and is not checked "
+                     "against a card\n",
+                     api_name, p.id.c_str(), p.layout.gpcs, p.layout.tpcs,
+                     p.layout.counts_derived ? "figures of a part with the same SM count" : "NVIDIA's figures for this part");
+    }
+    switch (a.status) {
+      case S::Ok: *out = static_cast<int>(a.value); return CUDA_SUCCESS;
+      case S::InvalidValue: return CUDA_ERROR_INVALID_VALUE;
+      case S::InvalidClusterSize: return static_cast<CUresult>(912);   // CUDA_ERROR_INVALID_CLUSTER_SIZE
+      case S::NotSupported: return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    return CUDA_ERROR_UNKNOWN;
+  });
+}
+}  // namespace
+
+static CUresult cuOccupancyMaxActiveClusters_impl(int* numClusters, CUfunction f, const void* config);
+VGPU_EXPORT CUresult cuOccupancyMaxActiveClusters(int* numClusters, CUfunction f, const void* config) { return traced("cuOccupancyMaxActiveClusters", cuOccupancyMaxActiveClusters_impl, numClusters, f, config); }
+static CUresult cuOccupancyMaxActiveClusters_impl(int* numClusters, CUfunction f, const void* config) {
+  return cluster_occupancy_impl("cuOccupancyMaxActiveClusters", true, numClusters, f, config);
+}
+static CUresult cuOccupancyMaxPotentialClusterSize_impl(int* clusterSize, CUfunction f, const void* config);
+VGPU_EXPORT CUresult cuOccupancyMaxPotentialClusterSize(int* clusterSize, CUfunction f, const void* config) { return traced("cuOccupancyMaxPotentialClusterSize", cuOccupancyMaxPotentialClusterSize_impl, clusterSize, f, config); }
+static CUresult cuOccupancyMaxPotentialClusterSize_impl(int* clusterSize, CUfunction f, const void* config) {
+  return cluster_occupancy_impl("cuOccupancyMaxPotentialClusterSize", false, clusterSize, f, config);
+}
 
 static CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor_impl(int* num, CUfunction f, int blockSize, size_t dyn);
 VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* num, CUfunction f, int blockSize, size_t dyn) { return traced("cuOccupancyMaxActiveBlocksPerMultiprocessor", cuOccupancyMaxActiveBlocksPerMultiprocessor_impl, num, f, blockSize, dyn); }

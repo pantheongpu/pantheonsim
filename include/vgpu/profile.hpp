@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace vgpu {
 
@@ -106,6 +107,34 @@ struct CudaClass {
   uint64_t persisting_l2_bytes = 0;
 };
 
+// How the multiprocessors of a part are grouped, which decides what thread-block
+// clusters can be scheduled: a cluster lives in one GPC (CUDA programming guide).
+// NVIDIA publishes the GPC and TPC counts of many parts (the architecture
+// whitepapers' tables: "GPCs 8, TPCs 66, SMs 132") and not how many TPCs each
+// GPC of a part with some disabled has. So a profile records the counts it has a
+// source for, and the spread across GPCs is always derived, never read: the
+// enabled TPCs are split as evenly as they go, the first GPCs getting the extra.
+// Zero means the profile does not say, and a question that needs it is refused
+// by name instead of answered from a layout made up for it.
+struct GpuLayout {
+  uint32_t gpcs = 0;          // GPCs with at least one TPC enabled
+  uint32_t tpcs = 0;          // TPCs enabled in all
+  uint32_t sms_per_tpc = 0;   // 2 on every part from Volta on
+  // True where the counts above are not the part's own published figures but
+  // follow from another part with the same SM count (a GH200's GPU is an
+  // H100 SXM5 in everything NVIDIA says), and the profile's comment says which.
+  bool counts_derived = false;
+
+  bool known() const { return gpcs && tpcs && sms_per_tpc; }
+  // SMs in each GPC, largest first: the spread described above.
+  std::vector<uint32_t> gpc_sms() const {
+    std::vector<uint32_t> v;
+    if (!known()) return v;
+    for (uint32_t g = 0; g < gpcs; ++g) v.push_back((tpcs / gpcs + (g < tpcs % gpcs ? 1 : 0)) * sms_per_tpc);
+    return v;
+  }
+};
+
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
   std::string vendor;        // "nvidia" | "amd"
@@ -126,6 +155,7 @@ struct DeviceProfile {
   Limits limits;
   TelemetryClass telemetry;
   CudaClass cuda;
+  GpuLayout layout;
   std::map<std::string, bool> features;
 
   // Shared memory the driver keeps back in every block, on top of what the

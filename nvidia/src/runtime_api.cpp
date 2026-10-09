@@ -54,6 +54,7 @@
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/exec/cluster.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
@@ -2255,29 +2256,82 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(i
   return traced_call("cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_traced, n, f, bs, dyn, p4);
 }
 
-// How many clusters can be active, and the largest cluster that can launch,
-// depend on how the device's SMs are grouped into GPCs -- a cluster lives in
-// one -- and no profile here records that grouping, and the documentation does
-// not give it for any part. So these are refused by name rather than answered
-// from a made-up layout: a program that calls them (CUTLASS sizes its
-// persistent grid with the first) is told which question could not be answered.
-static cudaError_t cudaOccupancyMaxActiveClusters_traced(int* numClusters, const void* p1, const cudaLaunchConfig_t* p2) {
-  if (!numClusters) return cudaErrorInvalidValue;
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] cudaOccupancyMaxActiveClusters is not implemented: it needs the "
-                         "device's SM-to-GPC layout, which no profile records\n");
-  return cudaErrorNotSupported;
+// How many clusters can be active, and the largest cluster that can launch
+// (vgpu/exec/cluster.hpp has the rules and what each answer rests on). A cluster
+// lives in one GPC, so the first needs the profile's GPC layout (GpuLayout): where
+// a profile has none the call is refused by name rather than answered from a layout
+// made up for it, and where it has one the SMs are spread over the GPCs evenly, which
+// NVIDIA does not publish, so the answer is said once to be derived.
+static void cluster_note(const char* api, const vgpu::DeviceProfile& p, const vgpu::exec::ClusterAnswer& a) {
+  using S = vgpu::exec::ClusterAnswer::Status;
+  static std::atomic<bool> said_missing{false}, said_derived{false};
+  if (quiet()) return;
+  if (a.status == S::NotSupported && !said_missing.exchange(true))
+    std::fprintf(stderr, "[vgpu] %s is not implemented for %s: %s\n", api, p.id.c_str(), a.why);
+  if (a.status == S::Ok && a.uses_layout && !said_derived.exchange(true))
+    std::fprintf(stderr,
+                 "[vgpu] %s: %s has %u GPCs and %u TPCs (%s), spread evenly over the GPCs because NVIDIA "
+                 "does not publish how many each has; the answer is derived from that and is not checked "
+                 "against a card\n",
+                 api, p.id.c_str(), p.layout.gpcs, p.layout.tpcs,
+                 p.layout.counts_derived ? "figures of a part with the same SM count" : "NVIDIA's figures for this part");
+}
+
+static cudaError_t cluster_occupancy_query(const char* api, bool active, int* out, const void* func,
+                                           const cudaLaunchConfig_t* config) {
+  using S = vgpu::exec::ClusterAnswer::Status;
+  if (!out || !config) return cudaErrorInvalidValue;   // a null configuration crashes the card's runtime
+  return guard(api, [&](State& s) -> cudaError_t {
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) {
+      if (!quiet() && func) std::fprintf(stderr, "[vgpu] %s: unregistered kernel stub %p\n", api, func);
+      return cudaErrorInvalidDeviceFunction;
+    }
+    KernelInfo& ki = it->second;
+    vgpu::runtime::Device& dev = current(s);
+    const vgpu::DeviceProfile& p = dev.profile();
+    bool has_dim = false;
+    std::array<uint32_t, 3> dim{0, 0, 0};
+    for (unsigned i = 0; config->attrs && i < config->numAttrs; ++i) {
+      if (config->attrs[i].id != cudaLaunchAttributeClusterDimension) continue;
+      has_dim = true;
+      dim = {config->attrs[i].val.clusterDim.x, config->attrs[i].val.clusterDim.y, config->attrs[i].val.clusterDim.z};
+    }
+    std::array<uint32_t, 3> required{0, 0, 0};
+    uint32_t blocks_per_sm = 0;
+    if (vgpu::exec::supports_clusters(p)) {
+      if (!ki.mod || !registered_ptx(s, *ki.mod)) return cudaErrorInvalidDeviceFunction;
+      const uint64_t mid = module_on_current(s, *ki.mod);
+      const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+      required = fn->req_cluster;
+      const uint64_t threads = uint64_t{config->blockDim.x} * config->blockDim.y * config->blockDim.z;
+      if (threads == 0 || threads > p.limits.max_threads_per_block) return cudaErrorInvalidValue;
+      blocks_per_sm = vgpu::exec::kernel_resources(*fn, p, static_cast<uint32_t>(threads),
+                                                   static_cast<uint32_t>(config->dynamicSmemBytes))
+                          .occupancy.blocks_per_sm;
+    }
+    const vgpu::exec::ClusterAnswer a = vgpu::exec::cluster_occupancy(p, active, has_dim, dim, required,
+                                                                       ki.nonportable_cluster, blocks_per_sm);
+    cluster_note(api, p, a);
+    switch (a.status) {
+      case S::Ok: *out = static_cast<int>(a.value); return cudaSuccess;
+      case S::InvalidValue: return cudaErrorInvalidValue;
+      case S::InvalidClusterSize: return cudaErrorInvalidClusterSize;
+      case S::NotSupported: return cudaErrorNotSupported;
+    }
+    return cudaErrorUnknown;
+  });
+}
+
+static cudaError_t cudaOccupancyMaxActiveClusters_traced(int* numClusters, const void* func, const cudaLaunchConfig_t* config) {
+  return cluster_occupancy_query("cudaOccupancyMaxActiveClusters", true, numClusters, func, config);
 }
 
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveClusters(int* numClusters, const void* p1, const cudaLaunchConfig_t* p2) {
   return traced_call("cudaOccupancyMaxActiveClusters", cudaOccupancyMaxActiveClusters_traced, numClusters, p1, p2);
 }
-static cudaError_t cudaOccupancyMaxPotentialClusterSize_traced(int* clusterSize, const void* p1, const cudaLaunchConfig_t* p2) {
-  if (!clusterSize) return cudaErrorInvalidValue;
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] cudaOccupancyMaxPotentialClusterSize is not implemented: it needs "
-                         "the device's SM-to-GPC layout, which no profile records\n");
-  return cudaErrorNotSupported;
+static cudaError_t cudaOccupancyMaxPotentialClusterSize_traced(int* clusterSize, const void* func, const cudaLaunchConfig_t* config) {
+  return cluster_occupancy_query("cudaOccupancyMaxPotentialClusterSize", false, clusterSize, func, config);
 }
 
 VGPU_EXPORT cudaError_t cudaOccupancyMaxPotentialClusterSize(int* clusterSize, const void* p1, const cudaLaunchConfig_t* p2) {

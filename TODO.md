@@ -1955,7 +1955,7 @@ Still open:
 - BC6H and BC7 decoders (the arrays work; texture objects over them are refused by name). The tables are derivable from
   the card one partition at a time; the arithmetic must be fitted as BC1 to BC5 were.
 - External memory and semaphore import (needs Vulkan, Direct3D or NvSciBuf; the card's runtime crashes on invalid handles).
-- `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (SM-to-GPC layout).
+- Cluster occupancy on a part whose GPC count NVIDIA does not publish (H100 PCIe, B200, B300, GB200, GB10, Thor, Rubin): refused by name; see nvidia/docs/clusters.md.
 
 ### PTX and SASS execution
 
@@ -2059,9 +2059,7 @@ with what `nvidia/src` defines):
   generic `cudaGraph*NodeSetParams`, the 12.3 `_v2` edge-data graph calls; the external memory and semaphore
   interop family; `cudaMemcpyBatchAsync`; `cudaOccupancyAvailableDynamicSMemPerBlock` (the semantics for
   infeasible requests are unclear); `cudaDeviceGetTexture1DLinearMaxWidth`; `cudaSetValidDevices`.
-- **Cluster occupancy**: `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` need the
-  SM-to-GPC grouping, which no profile records and the public documentation does not give; they refuse by
-  name once the runtime-exports PR (#309) merges.
+- **Cluster occupancy** is answered where the profile has GPC and TPC counts from NVIDIA (derived spread of the SMs over the GPCs, said once on stderr); parts without them are refused by name. Nothing is checked against a card with clusters. See nvidia/docs/clusters.md.
 - **NVML setters**: persistence mode, compute mode, power limit, clock locks, fan control, MIG/GPU-instance
   and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
   not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process

@@ -1479,8 +1479,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `cudaImportExternalMemory` and
   `cudaImportExternalSemaphore` (the handles come from Vulkan, Direct3D or NvSciBuf, which this machine does not
   have; NVIDIA's library crashes on the invalid handles a test could pass, so there is nothing to check
-  against); `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (no profile records the
-  SM-to-GPC layout); the memory pool and VMM handle types other than the POSIX file descriptor
+  against); cluster occupancy for a part whose GPC count NVIDIA does not publish
+  (nvidia/docs/clusters.md); the memory pool and VMM handle types other than the POSIX file descriptor
   (Win32, fabric), which the RTX 3060 refuses too; and exec-affinity types the device does not offer.
 - **Device runtime** (cudadevrt, dynamic parallelism), on both engines: all of
   `cuda_device_runtime_api.h` that CUDA 12 and 13 still offer to a kernel --

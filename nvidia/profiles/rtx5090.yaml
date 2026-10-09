@@ -51,3 +51,12 @@ cuda:
   memory_bus_width_bits: 512
   clock_khz: 2407000
   persisting_l2_bytes: 75497472
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA RTX Blackwell GPU Architecture whitepaper, Table 1 (GeForce RTX 5090): GPCs 11, TPCs 85, SMs 170.
+layout:
+  gpcs: 11
+  tpcs: 85
+  sms_per_tpc: 2
