@@ -440,6 +440,24 @@ uintptr_t check_handle(uintptr_t h, uintptr_t tag, const char* what) {
 }
 
 // Picks the PTX image the driver would JIT -- see pick_ptx for the rule.
+// The PTX the NVRTC shim noted for a cubin it handed out (empty for any other
+// cubin, and when the toolkit's own NVRTC is the library loaded). Found by name
+// in whichever libnvrtc is loaded, since a program may have opened it privately.
+std::string nvrtc_ptx_for_cubin(const void* cubin, size_t size) {
+  using Fn = char* (*)(const void*, size_t);
+  Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_nvrtc_ptx_for_cubin"));
+  for (const char* so : {"libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2", "libnvrtc.so"}) {
+    if (fn) break;
+    if (void* h = dlopen(so, RTLD_NOLOAD | RTLD_LAZY)) fn = reinterpret_cast<Fn>(dlsym(h, "vgpu_nvrtc_ptx_for_cubin"));
+  }
+  if (!fn) return {};
+  char* copy = fn(cubin, size);
+  if (!copy) return {};
+  std::string ptx(copy);
+  std::free(copy);
+  return ptx;
+}
+
 std::string best_ptx(const void* image) {
   auto ptxs = vgpu::cuda::extract_ptx(image);
   if (ptxs.empty())
@@ -1228,8 +1246,27 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       // An sm_XYa cubin runs on XY alone, a plain one on its major from XY up.
       if (!vgpu::sass::runs_on(sm, vgpu::sass::cubin_arch_specific(b, size), static_cast<int>(cc)))
         return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      // A cubin NVRTC made comes with its PTX: where the SASS engine cannot
+      // run all of the cubin yet, run that, as for a fatbin that has both
+      // (VGPU_SASS=1 insists on the SASS).
+      const char* force = std::getenv("VGPU_SASS");
+      std::string aside;
+      if (!(force && (force[0] == '1' || force[0] == '0'))) {
+        aside = nvrtc_ptx_for_cubin(b, size);
+        if (!aside.empty()) {
+          std::string why;
+          try {
+            why = vgpu::sass::unsupported(b, size);
+          } catch (const vgpu::Error& e) {
+            why = e.message();
+          }
+          if (why.empty()) aside.clear();
+          else if (const char* log = std::getenv("VGPU_SASS_LOG"); log && log[0] == '1')
+            std::fprintf(stderr, "[vgpu] running PTX instead of SASS: %s\n", why.c_str());
+        }
+      }
       try {
-        mid = s.rt->device(dev).load_cubin(b, size);
+        mid = !aside.empty() ? s.rt->device(dev).load_module(aside.c_str()) : s.rt->device(dev).load_cubin(b, size);
       } catch (const vgpu::Error& e) {
         if (e.code() == vgpu::Err::InvalidValue) return CUDA_ERROR_INVALID_IMAGE;
         throw;

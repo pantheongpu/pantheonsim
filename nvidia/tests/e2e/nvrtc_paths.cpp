@@ -8,9 +8,13 @@
 // architecture, sm_80, which NVRTC compiles to SASS, while VirtualGPU needs
 // PTX; the shim targets the matching virtual architecture instead.
 #include <cuda.h>
+#include <dlfcn.h>
 #include <nvrtc.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -225,6 +229,331 @@ static void compile_error() {
   nvrtcDestroyProgram(&p);
 }
 
+
+// ---- what the card's NVRTC does beyond PTX: measured on an RTX 3060 with CUDA 13.0's
+// libnvrtc, and the same here ----
+
+static bool is_vgpu_shim() { return dlsym(RTLD_DEFAULT, "vgpu_nvrtc_ptx_for_cubin") != nullptr; }
+static bool ptx_engine() {
+  const char* v = std::getenv("VGPU_SASS");
+  const char* c = std::getenv("VGPU_NVRTC_CUBIN");
+  return (v && v[0] == '0') || (c && std::strcmp(c, "ptx") == 0);
+}
+static std::string bytes_of(nvrtcResult (*size)(nvrtcProgram, size_t*), nvrtcResult (*get)(nvrtcProgram, char*),
+                            nvrtcProgram p, size_t* n_out = nullptr) {
+  size_t n = 0;
+  if (size(p, &n) != NVRTC_SUCCESS) return {};
+  std::string s(n, '\0');
+  if (n && get(p, &s[0]) != NVRTC_SUCCESS) return {};
+  if (n_out) *n_out = n;
+  return s;
+}
+
+// The cubin of a real architecture is an ELF image of SASS, which the driver
+// loads and runs; PTX alone for a virtual one (size 0 for the cubin).
+static void cubin_is_real() {
+  int cc_major = 0, cc_minor = 0;
+  CUdevice dev;
+  cuDeviceGet(&dev, 0);
+  cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+  cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+  const int sm = cc_major * 10 + cc_minor;
+  int n = 0;
+  nvrtcGetNumSupportedArchs(&n);
+  std::vector<int> archs(n);
+  nvrtcGetSupportedArchs(archs.data());
+  bool ascending = n > 0, has = false;
+  for (int i = 0; i < n; ++i) {
+    has = has || archs[i] == sm;
+    if (i && archs[i] <= archs[i - 1]) ascending = false;
+  }
+  check(ascending, "the supported architectures come back in ascending order");
+  if (!has) {
+    std::printf("skip this device's architecture sm_%d is not one this NVRTC compiles for\n", sm);
+    return;
+  }
+  const char* src = "extern \"C\" __global__ void fill(int* p) { p[threadIdx.x] = (int)threadIdx.x * 3 + 1; }\n";
+  const std::string arch = "--gpu-architecture=sm_" + std::to_string(sm);
+  nvrtcProgram p;
+  nvrtcCreateProgram(&p, src, "fill.cu", 0, nullptr, nullptr);
+  const char* opts[] = {arch.c_str()};
+  const bool compiled = nvrtcCompileProgram(p, 1, opts) == NVRTC_SUCCESS;
+  check(compiled, "a program compiles for the device's own sm_ architecture");
+  if (!compiled) { nvrtcDestroyProgram(&p); return; }
+  size_t csize = 0, psize = 0;
+  const std::string cubin = bytes_of(nvrtcGetCUBINSize, nvrtcGetCUBIN, p, &csize);
+  nvrtcGetPTXSize(p, &psize);
+  if (ptx_engine()) {
+    check(csize > 1 && cubin.find(".version") != std::string::npos, "the PTX engine's \"cubin\" is the PTX");
+  } else {
+    check(csize > 64 && cubin.compare(0, 4, "\x7f" "ELF") == 0, "the cubin of an sm_ target is an ELF image");
+    check(psize > 1, "and the PTX comes with it");
+  }
+  CUmodule mod;
+  CUfunction fn;
+  bool ok = cuModuleLoadData(&mod, cubin.data()) == CUDA_SUCCESS && cuModuleGetFunction(&fn, mod, "fill") == CUDA_SUCCESS;
+  int out[32] = {0};
+  if (ok) {
+    CUdeviceptr d;
+    cuMemAlloc(&d, sizeof out);
+    void* args[] = {&d};
+    ok = cuLaunchKernel(fn, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr) == CUDA_SUCCESS && cuCtxSynchronize() == CUDA_SUCCESS;
+    cuMemcpyDtoH(out, d, sizeof out);
+    cuMemFree(d);
+    cuModuleUnload(mod);
+  }
+  bool right = ok;
+  for (int i = 0; i < 32; ++i) right = right && out[i] == i * 3 + 1;
+  check(right, "the cubin loads through cuModuleLoadData and its kernel gives the right answers");
+  if (is_vgpu_shim() && !ptx_engine()) {
+    // The SASS engine refusing an instruction of the cubin (VGPU_SASS_REFUSE tests this): the PTX
+    // NVRTC made it from runs in its place, as for a fatbin that carries both.
+    setenv("VGPU_SASS_REFUSE", "EXIT", 1);
+    CUmodule again;
+    CUfunction fn2;
+    int out2[32] = {0};
+    bool ok2 = cuModuleLoadData(&again, cubin.data()) == CUDA_SUCCESS && cuModuleGetFunction(&fn2, again, "fill") == CUDA_SUCCESS;
+    if (ok2) {
+      CUdeviceptr d;
+      cuMemAlloc(&d, sizeof out2);
+      void* args[] = {&d};
+      ok2 = cuLaunchKernel(fn2, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr) == CUDA_SUCCESS && cuCtxSynchronize() == CUDA_SUCCESS;
+      cuMemcpyDtoH(out2, d, sizeof out2);
+      cuMemFree(d);
+      cuModuleUnload(again);
+    }
+    unsetenv("VGPU_SASS_REFUSE");
+    for (int i = 0; i < 32; ++i) ok2 = ok2 && out2[i] == i * 3 + 1;
+    check(ok2, "and where the SASS engine refuses an instruction, the PTX it came from runs instead");
+  }
+  nvrtcDestroyProgram(&p);
+
+  // A virtual architecture has PTX and no cubin.
+  nvrtcProgram v;
+  nvrtcCreateProgram(&v, src, "fill.cu", 0, nullptr, nullptr);
+  const char* vopts[] = {"--gpu-architecture=compute_80"};
+  nvrtcCompileProgram(v, 1, vopts);
+  size_t vc = 99, vp = 0;
+  const nvrtcResult rc = nvrtcGetCUBINSize(v, &vc);
+  nvrtcGetPTXSize(v, &vp);
+  check(rc == NVRTC_SUCCESS && vc == 0 && vp > 1, "for compute_80 the PTX is there and the cubin's size is 0");
+  nvrtcDestroyProgram(&v);
+}
+
+// LTO-IR (-dlto) and OptiX-IR (--optix-ir) are NVVM bitcode that only NVIDIA's compiler makes; with
+// the toolkit's NVRTC they come back as it makes them, without it they are refused by name.
+static void lto_and_optix() {
+  const char* src = "extern \"C\" __global__ void k(int* p) { p[threadIdx.x] = (int)threadIdx.x * 2; }\n";
+  struct Case { const char* flag; bool lto; };
+  for (const Case& c : {Case{"-dlto", true}, Case{"--optix-ir", false}}) {
+    nvrtcProgram p;
+    nvrtcCreateProgram(&p, src, "k.cu", 0, nullptr, nullptr);
+    const char* opts[] = {"--gpu-architecture=compute_80", c.flag};
+    const nvrtcResult rc = nvrtcCompileProgram(p, 2, opts);
+    if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim() && log_of(p).find("libnvrtc") != std::string::npos) {
+      std::printf("skip %s needs the toolkit's libnvrtc, which is not installed\n", c.flag);
+      nvrtcDestroyProgram(&p);
+      continue;
+    }
+    size_t ptx = 0, cubin = 7, lto = 0, optix = 0;
+    nvrtcGetPTXSize(p, &ptx);
+    nvrtcGetCUBINSize(p, &cubin);
+    nvrtcGetLTOIRSize(p, &lto);
+    nvrtcGetOptiXIRSize(p, &optix);
+    const std::string bits = c.lto ? bytes_of(nvrtcGetLTOIRSize, nvrtcGetLTOIR, p)
+                                   : bytes_of(nvrtcGetOptiXIRSize, nvrtcGetOptiXIR, p);
+    check(rc == NVRTC_SUCCESS && (c.lto ? lto : optix) > 4 && (c.lto ? optix : lto) == 0 && cubin == 0,
+          c.lto ? "-dlto makes LTO-IR and neither a cubin nor OptiX-IR" : "--optix-ir makes OptiX-IR and neither a cubin nor LTO-IR");
+    check(ptx == 1, c.lto ? "and no PTX (its size is the terminator alone)" : "and no PTX either");
+    check(bits.size() > 4 && bits.compare(0, 4, "\xed" "CN\x7f") == 0, "the bitcode starts with NVVM's magic (0x7f4e43ed)");
+    nvrtcDestroyProgram(&p);
+  }
+  nvrtcProgram p;
+  nvrtcCreateProgram(&p, src, "k.cu", 0, nullptr, nullptr);
+  const char* both[] = {"--gpu-architecture=compute_80", "-dlto", "--optix-ir"};
+  const nvrtcResult rc = nvrtcCompileProgram(p, 3, both);
+  check(rc == NVRTC_ERROR_INVALID_OPTION, "-dlto and --optix-ir together are refused as options");
+  nvrtcDestroyProgram(&p);
+}
+
+// What every query answers before a compile, with no output pointer, and for no program.
+static void argument_checks() {
+  nvrtcProgram p;
+  nvrtcCreateProgram(&p, "extern \"C\" __global__ void k() {}", "k.cu", 0, nullptr, nullptr);
+  size_t n = 77;
+  char c[8];
+  check(nvrtcGetPTXSize(p, &n) == NVRTC_SUCCESS && nvrtcGetCUBINSize(p, &n) == NVRTC_SUCCESS &&
+            nvrtcGetLTOIRSize(p, &n) == NVRTC_SUCCESS && nvrtcGetOptiXIRSize(p, &n) == NVRTC_SUCCESS &&
+            nvrtcGetProgramLogSize(p, &n) == NVRTC_SUCCESS,
+        "the size queries succeed before any compile");
+  check(nvrtcGetPTX(p, c) == NVRTC_SUCCESS && nvrtcGetCUBIN(p, c) == NVRTC_SUCCESS && nvrtcGetLTOIR(p, c) == NVRTC_SUCCESS &&
+            nvrtcGetOptiXIR(p, c) == NVRTC_SUCCESS,
+        "and so do the outputs, there being nothing to copy");
+  const char* opts[] = {"--gpu-architecture=sm_80"};
+  nvrtcCompileProgram(p, 1, opts);
+  check(nvrtcGetCUBINSize(p, nullptr) == NVRTC_ERROR_INVALID_INPUT && nvrtcGetCUBIN(p, nullptr) == NVRTC_ERROR_INVALID_INPUT &&
+            nvrtcGetLTOIR(p, nullptr) == NVRTC_ERROR_INVALID_INPUT && nvrtcGetOptiXIR(p, nullptr) == NVRTC_ERROR_INVALID_INPUT,
+        "a null destination is INVALID_INPUT");
+  check(nvrtcGetCUBINSize(nullptr, &n) == NVRTC_ERROR_INVALID_PROGRAM && nvrtcGetCUBIN(nullptr, c) == NVRTC_ERROR_INVALID_PROGRAM &&
+            nvrtcGetLTOIRSize(nullptr, &n) == NVRTC_ERROR_INVALID_PROGRAM && nvrtcGetOptiXIRSize(nullptr, &n) == NVRTC_ERROR_INVALID_PROGRAM,
+        "a null program is INVALID_PROGRAM");
+  nvrtcProgram none = nullptr;
+  nvrtcProgram q;
+  check(nvrtcDestroyProgram(&none) == NVRTC_ERROR_INVALID_PROGRAM && nvrtcDestroyProgram(nullptr) == NVRTC_ERROR_INVALID_PROGRAM &&
+            nvrtcCreateProgram(nullptr, "x", "a", 0, nullptr, nullptr) == NVRTC_ERROR_INVALID_PROGRAM &&
+            nvrtcCreateProgram(&q, nullptr, "a", 0, nullptr, nullptr) == NVRTC_ERROR_INVALID_INPUT &&
+            nvrtcCreateProgram(&q, "x", "a", -1, nullptr, nullptr) == NVRTC_ERROR_INVALID_INPUT &&
+            nvrtcCreateProgram(&q, "x", "a", 1, nullptr, nullptr) == NVRTC_ERROR_INVALID_INPUT,
+        "a null handle, source or header array is refused as NVIDIA's refuses it");
+  check(nvrtcAddNameExpression(p, "k") == NVRTC_ERROR_NO_NAME_EXPRESSIONS_AFTER_COMPILATION,
+        "a name expression after the compile is refused by name");
+  nvrtcDestroyProgram(&p);
+  // The names of the result codes, and what an unknown one reads as.
+  static const char* kNames[] = {"NVRTC_SUCCESS", "NVRTC_ERROR_OUT_OF_MEMORY", "NVRTC_ERROR_PROGRAM_CREATION_FAILURE",
+                                 "NVRTC_ERROR_INVALID_INPUT", "NVRTC_ERROR_INVALID_PROGRAM", "NVRTC_ERROR_INVALID_OPTION",
+                                 "NVRTC_ERROR_COMPILATION", "NVRTC_ERROR_BUILTIN_OPERATION_FAILURE",
+                                 "NVRTC_ERROR_NO_NAME_EXPRESSIONS_AFTER_COMPILATION",
+                                 "NVRTC_ERROR_NO_LOWERED_NAMES_BEFORE_COMPILATION", "NVRTC_ERROR_NAME_EXPRESSION_NOT_VALID",
+                                 "NVRTC_ERROR_INTERNAL_ERROR", "NVRTC_ERROR_TIME_FILE_WRITE_FAILED",
+                                 "NVRTC_ERROR_NO_PCH_CREATE_ATTEMPTED", "NVRTC_ERROR_PCH_CREATE_HEAP_EXHAUSTED",
+                                 "NVRTC_ERROR_PCH_CREATE", "NVRTC_ERROR_CANCELLED", "NVRTC_ERROR_TIME_TRACE_FILE_WRITE_FAILED"};
+  int major = 0, minor = 0;
+  nvrtcVersion(&major, &minor);
+  // 13.0 has the names up to 17; CUDA 12's NVRTC answers only as far as it goes.
+  const int top = is_vgpu_shim() || major >= 13 ? 17 : 11;
+  bool names = true;
+  for (int i = 0; i <= top; ++i) names = names && std::strcmp(nvrtcGetErrorString(static_cast<nvrtcResult>(i)), kNames[i]) == 0;
+  check(names, "the result codes have NVIDIA's names");
+  check(std::strcmp(nvrtcGetErrorString(static_cast<nvrtcResult>(99)), "NVRTC_ERROR unknown") == 0 ||
+            (major < 13 && !is_vgpu_shim()),
+        "an unknown code reads \"NVRTC_ERROR unknown\"");
+}
+
+// Precompiled headers, the time table, and the flow callback: NVRTC's own, reached by name since
+// older headers lack them. Skipped where the library has no such entry (CUDA 12 before 12.8) or,
+// for this shim without the toolkit's NVRTC, refuses the option.
+static void pch_time_and_flow() {
+  using PchStatus = nvrtcResult (*)(nvrtcProgram);
+  using HeapGet = nvrtcResult (*)(size_t*);
+  using HeapSet = nvrtcResult (*)(size_t);
+  using FlowSet = nvrtcResult (*)(nvrtcProgram, int (*)(void*, void*), void*);
+  auto status = reinterpret_cast<PchStatus>(dlsym(RTLD_DEFAULT, "nvrtcGetPCHCreateStatus"));
+  auto heap_get = reinterpret_cast<HeapGet>(dlsym(RTLD_DEFAULT, "nvrtcGetPCHHeapSize"));
+  auto heap_set = reinterpret_cast<HeapSet>(dlsym(RTLD_DEFAULT, "nvrtcSetPCHHeapSize"));
+  auto flow = reinterpret_cast<FlowSet>(dlsym(RTLD_DEFAULT, "nvrtcSetFlowCallback"));
+  if (!status || !heap_get || !heap_set || !flow) {
+    std::printf("skip this libnvrtc has no precompiled-header or flow-callback entry points\n");
+    return;
+  }
+  // The heap rounds a request up to 4096.
+  size_t before = 0, h = 0;
+  heap_get(&before);
+  bool round = heap_set(12345) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == 16384;
+  round = round && heap_set(1) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == 4096;
+  round = round && heap_set(1 << 20) == NVRTC_SUCCESS && heap_get(&h) == NVRTC_SUCCESS && h == (1u << 20);
+  heap_set(before);
+  check(round && heap_get(nullptr) == NVRTC_ERROR_INVALID_INPUT, "the PCH heap size rounds up to 4096, and a null destination is refused");
+
+  const char* hdr = "#pragma once\n__device__ inline int twice(int x) { return 2 * x; }\n";
+  const char* hdr_name = "hdr.h";
+  const char* src = "#include \"hdr.h\"\nextern \"C\" __global__ void k(int* p) { p[threadIdx.x] = twice((int)threadIdx.x); }\n";
+  char dir[] = "/tmp/vgpu_nvrtc_pch_XXXXXX";
+  if (!mkdtemp(dir)) { check(false, "a scratch directory"); return; }
+  const std::string d = dir;
+  auto build = [&](std::vector<std::string> extra, std::string* log, nvrtcResult* st) {
+    nvrtcProgram p;
+    nvrtcCreateProgram(&p, src, "p.cu", 1, &hdr, &hdr_name);
+    std::vector<std::string> o = {"--gpu-architecture=compute_80"};
+    o.insert(o.end(), extra.begin(), extra.end());
+    std::vector<const char*> argv;
+    for (auto& s : o) argv.push_back(s.c_str());
+    const nvrtcResult rc = nvrtcCompileProgram(p, (int)argv.size(), argv.data());
+    *log = log_of(p);
+    *st = status(p);
+    nvrtcDestroyProgram(&p);
+    return rc;
+  };
+  std::string log;
+  nvrtcResult st;
+  nvrtcResult rc = build({"--create-pch=" + d + "/a.pch"}, &log, &st);
+  if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim() && log.find("libnvrtc") != std::string::npos) {
+    std::printf("skip precompiled headers need the toolkit's libnvrtc, which is not installed\n");
+  } else {
+    struct stat sb;
+    check(rc == NVRTC_SUCCESS && st == NVRTC_SUCCESS && stat((d + "/a.pch").c_str(), &sb) == 0 && sb.st_size > 0,
+          "--create-pch writes the header and the creation status reads SUCCESS");
+    const nvrtcResult rc2 = build({"--use-pch=" + d + "/a.pch"}, &log, &st);
+    check(rc2 == NVRTC_SUCCESS && st == static_cast<nvrtcResult>(13) && log.find("using precompiled header") != std::string::npos,
+          "--use-pch uses it, and no creation was attempted");
+    const nvrtcResult rc3 = build({"--use-pch=" + d + "/missing.pch"}, &log, &st);
+    check(rc3 == NVRTC_ERROR_COMPILATION && log.find("missing.pch") != std::string::npos, "a missing PCH file is a compile error naming it");
+    rc = build({"--pch", "--pch-dir=" + d}, &log, &st);
+    const nvrtcResult again = build({"--pch", "--pch-dir=" + d}, &log, &st);
+    check(rc == NVRTC_SUCCESS && again == NVRTC_SUCCESS && st == static_cast<nvrtcResult>(13), "--pch creates a header once and then reuses it");
+    // A heap too small for the header: the program still compiles, the status says so, the required size is reported.
+    heap_set(4096);
+    nvrtcProgram p;
+    nvrtcCreateProgram(&p, src, "p.cu", 1, &hdr, &hdr_name);
+    const std::string tiny = "--create-pch=" + d + "/tiny.pch";
+    const char* o[] = {"--gpu-architecture=compute_80", tiny.c_str()};
+    rc = nvrtcCompileProgram(p, 2, o);
+    using Req = nvrtcResult (*)(nvrtcProgram, size_t*);
+    auto required = reinterpret_cast<Req>(dlsym(RTLD_DEFAULT, "nvrtcGetPCHHeapSizeRequired"));
+    size_t need = 0;
+    check(rc == NVRTC_SUCCESS && status(p) == static_cast<nvrtcResult>(14) && required && required(p, &need) == NVRTC_SUCCESS && need > 4096,
+          "a PCH heap that is too small reports PCH_CREATE_HEAP_EXHAUSTED and the size it needs");
+    nvrtcDestroyProgram(&p);
+    heap_set(before);
+  }
+  // --time writes a CSV table of the compile's phases; an unwritable path is its own error.
+  nvrtcProgram t;
+  nvrtcCreateProgram(&t, src, "p.cu", 1, &hdr, &hdr_name);
+  const std::string csv = "--time=" + d + "/time.csv";
+  const char* to[] = {"--gpu-architecture=compute_80", csv.c_str()};
+  rc = nvrtcCompileProgram(t, 2, to);
+  if (rc == NVRTC_ERROR_INVALID_OPTION && is_vgpu_shim()) {
+    std::printf("skip --time needs the toolkit's libnvrtc, which is not installed\n");
+  } else {
+    std::string first;
+    if (FILE* f = std::fopen((d + "/time.csv").c_str(), "r")) {
+      char line[200] = {0};
+      if (std::fgets(line, sizeof line, f)) first = line;
+      std::fclose(f);
+    }
+    check(rc == NVRTC_SUCCESS && first.rfind("File name, phase name, metric, unit", 0) == 0, "--time writes a CSV table with NVRTC's header row");
+    nvrtcProgram u;
+    nvrtcCreateProgram(&u, src, "p.cu", 1, &hdr, &hdr_name);
+    const char* bad[] = {"--gpu-architecture=compute_80", "--time=/nonexistent_vgpu_dir/t.csv"};
+    const nvrtcResult brc = nvrtcCompileProgram(u, 2, bad);
+    check(brc == static_cast<nvrtcResult>(12) && log_of(u).find("failed to open file") != std::string::npos,
+          "an unwritable --time path is NVRTC_ERROR_TIME_FILE_WRITE_FAILED");
+    nvrtcDestroyProgram(&u);
+  }
+  nvrtcDestroyProgram(&t);
+  (void)std::system(("rm -rf '" + d + "'").c_str());
+
+  // The flow callback may cancel a compile; nothing else about when or how often it is called is promised.
+  static int calls;
+  struct Cb { static int cancel(void*, void*) { ++calls; return 1; } static int go_on(void*, void*) { ++calls; return 0; } };
+  nvrtcProgram f;
+  nvrtcCreateProgram(&f, "extern \"C\" __global__ void k() {}", "k.cu", 0, nullptr, nullptr);
+  check(flow(f, nullptr, nullptr) == NVRTC_ERROR_INVALID_INPUT, "a null flow callback is refused");
+  flow(f, Cb::cancel, nullptr);
+  const char* fo[] = {"--gpu-architecture=sm_80"};
+  calls = 0;
+  const nvrtcResult frc = nvrtcCompileProgram(f, 1, fo);
+  size_t cs = 7;
+  check(frc == static_cast<nvrtcResult>(16) && calls >= 1 && nvrtcGetCUBINSize(f, &cs) == NVRTC_SUCCESS && cs == 0,
+        "a callback that returns 1 cancels the compile: NVRTC_ERROR_CANCELLED, no cubin");
+  nvrtcDestroyProgram(&f);
+  nvrtcProgram g;
+  nvrtcCreateProgram(&g, "extern \"C\" __global__ void k() {}", "k.cu", 0, nullptr, nullptr);
+  flow(g, Cb::go_on, nullptr);
+  calls = 0;
+  check(nvrtcCompileProgram(g, 1, fo) == NVRTC_SUCCESS && calls >= 1, "and one that returns 0 lets it finish, having been called");
+  nvrtcDestroyProgram(&g);
+}
+
 int main() {
   CUdevice dev;
   CUcontext ctx;
@@ -238,6 +567,10 @@ int main() {
   struct_parameter();
   function_outlives_later_modules();
   compile_error();
+  cubin_is_real();
+  lto_and_optix();
+  argument_checks();
+  pch_time_and_flow();
   cuDevicePrimaryCtxRelease(dev);
   std::printf(failures ? "FAIL: %d NVRTC checks\n" : "PASS: every NVRTC check\n", failures);
   return failures ? 1 : 0;
