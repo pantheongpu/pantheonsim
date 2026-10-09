@@ -16,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace vgpu_npp {
@@ -273,6 +274,170 @@ inline void warp_perspective_back(const Image<T>& src, const Rect& sroi, Image<T
     *sy = row(c[1], x, y) / w;
     return true;
   });
+}
+
+
+/* ---- watershed segmentation ----
+
+   nppiSegmentWatershed has no published algorithm, so this is what NPP 13.0
+   was measured to do on an RTX 3060 (nvidia/tests/e2e/npp_segment.cpp pins it,
+   and the card's output is its expected file).
+
+   Every pixel flows to its lowest neighbour -- the 8 neighbours for
+   nppiNormInf, the 4 for nppiNormL1 -- when that neighbour is strictly lower,
+   taking the first of equal ones in raster order; a pixel with no strictly
+   lower neighbour is a root. The image comes back with each pixel replaced by
+   its root's value (measured exactly, on random images of 2x2 to 512x512 with
+   many equal values and on the CUDA Samples' teapot, skull and rocks images).
+   The pixel's marker label is `neighbourhood_min` of its root: the smallest
+   linear index in the root's closed neighbourhood -- the pixel above and to
+   the left of it for 8-way connectivity (observed on all distinct-valued
+   images, where the labels are exactly that).
+
+   Where values are equal the labels follow rules that were fitted rather
+   than documented, and they are not exact:
+   - roots that are 8-neighbours and equal share one label (the smallest);
+   - a pixel whose lowest neighbours are tied makes the later roots among them
+     share the first one's label if it is a root too, and otherwise take its
+     pixel index as a candidate label (found on teapot-image events, where it
+     reproduces NVIDIA's label for a root);
+   - NPP leaves some plateau groups unmerged and treats a plateau at the
+     image's first pixel differently (its label is one higher): not
+     reproduced. On the three CUDA Samples images 98.5% to 99.5% of the pixels
+     carry NVIDIA's label (the images themselves are exact); on images
+     of pure noise, every one.
+
+   Boundaries are drawn on the segmented image: a pixel is a boundary pixel
+   when the pixel above it or the one to its left has another segmented
+   value (measured exactly, with ties). */
+enum class WsNorm { k8, k4 };
+
+struct Watershed {
+  std::vector<int32_t> root;      // the pixel each one flows to
+  std::vector<uint32_t> label;
+  std::vector<uint8_t> is_root;
+};
+
+inline int ws_neighbours(int i, int w, int h, bool four, int out[8]) {
+  const int y = i / w, x = i % w;
+  int n = 0;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      if (!dy && !dx) continue;
+      if (four && dy && dx) continue;
+      const int yy = y + dy, xx = x + dx;
+      if (yy < 0 || yy >= h || xx < 0 || xx >= w) continue;
+      out[n++] = yy * w + xx;
+    }
+  return n;
+}
+
+// The smallest linear index in the closed neighbourhood of pixel i.
+inline int ws_nbhd_min(int i, int w, int h, bool four) {
+  int nb[8];
+  int m = i;
+  const int n = ws_neighbours(i, w, h, four, nb);
+  for (int k = 0; k < n; ++k) m = std::min(m, nb[k]);
+  return m;
+}
+
+template <class T>
+inline Watershed watershed(const T* v, int w, int h, bool four) {
+  const int n = w * h;
+  Watershed r;
+  r.root.assign(n, -1);
+  r.label.assign(n, 0);
+  r.is_root.assign(n, 0);
+  std::vector<int32_t> ptr(n, -1);
+  for (int i = 0; i < n; ++i) {
+    int nb[8];
+    const int k = ws_neighbours(i, w, h, four, nb);
+    int best = -1;
+    for (int j = 0; j < k; ++j)
+      if (v[nb[j]] < v[i] && (best < 0 || v[nb[j]] < v[best])) best = nb[j];
+    ptr[i] = best;
+    r.is_root[i] = best < 0;
+  }
+  // Pointer chains run to strictly smaller values, so they end; resolve them
+  // with path compression.
+  std::vector<int32_t> stack;
+  for (int i = 0; i < n; ++i) {
+    if (r.root[i] >= 0) continue;
+    int a = i;
+    stack.clear();
+    while (r.root[a] < 0 && ptr[a] >= 0) {
+      stack.push_back(a);
+      a = ptr[a];
+    }
+    const int rt = r.root[a] >= 0 ? r.root[a] : a;
+    r.root[a] = rt;
+    for (int b : stack) r.root[b] = rt;
+  }
+  // Union-find over the roots, smallest index as the representative.
+  std::vector<int32_t> par(n);
+  for (int i = 0; i < n; ++i) par[i] = i;
+  auto find = [&](int a) {
+    while (par[a] != a) {
+      par[a] = par[par[a]];
+      a = par[a];
+    }
+    return a;
+  };
+  auto unite = [&](int a, int b) {
+    a = find(a);
+    b = find(b);
+    if (a != b) par[std::max(a, b)] = std::min(a, b);
+  };
+  std::vector<std::pair<int32_t, int32_t>> pulls;  // (root, pixel index candidate)
+  for (int i = 0; i < n; ++i) {
+    int nb[8];
+    const int k = ws_neighbours(i, w, h, four, nb);
+    if (r.is_root[i]) {
+      for (int j = 0; j < k; ++j)
+        if (nb[j] > i && r.is_root[nb[j]] && v[nb[j]] == v[i]) unite(i, nb[j]);
+      continue;
+    }
+    int low[8], nl = 0;
+    for (int j = 0; j < k; ++j)
+      if (v[nb[j]] == v[ptr[i]]) low[nl++] = nb[j];
+    for (int j = 1; j < nl; ++j) {
+      if (!r.is_root[low[j]]) continue;
+      if (r.is_root[low[0]])
+        unite(low[0], low[j]);
+      else
+        pulls.emplace_back(low[j], low[0]);
+    }
+  }
+  std::vector<uint32_t> group(n, std::numeric_limits<uint32_t>::max());
+  for (int i = 0; i < n; ++i)
+    if (r.is_root[i]) {
+      const int g = find(i);
+      group[g] = std::min<uint32_t>(group[g], static_cast<uint32_t>(ws_nbhd_min(i, w, h, four)));
+    }
+  for (const auto& p : pulls) {
+    const int g = find(p.first);
+    group[g] = std::min<uint32_t>(group[g], static_cast<uint32_t>(p.second));
+  }
+  for (int i = 0; i < n; ++i) r.label[i] = group[find(r.root[i])];
+  return r;
+}
+
+// Marker labels renumbered: the labels below `limit` (a label is a pixel index
+// of the image the markers were generated for) take their rank among those
+// present plus 0, which is always counted -- so 0 stays 0 and an image with
+// no 0 starts at 1; labels from `limit` up stay. Returns the number of
+// distinct labels counted, 0 included. Measured on 300 random label images.
+inline int compress_labels(uint32_t* labels, size_t count, long long limit) {
+  std::vector<uint32_t> used;
+  used.push_back(0);
+  for (size_t i = 0; i < count; ++i)
+    if (static_cast<long long>(labels[i]) < limit) used.push_back(labels[i]);
+  std::sort(used.begin(), used.end());
+  used.erase(std::unique(used.begin(), used.end()), used.end());
+  for (size_t i = 0; i < count; ++i)
+    if (static_cast<long long>(labels[i]) < limit)
+      labels[i] = static_cast<uint32_t>(std::lower_bound(used.begin(), used.end(), labels[i]) - used.begin());
+  return static_cast<int>(used.size());
 }
 
 }  // namespace vgpu_npp

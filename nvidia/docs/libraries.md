@@ -272,7 +272,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ to PTX at run time |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- that the driver loads |
-| NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring -- every entry point OpenCV, DALI, FFmpeg and the CUDA Samples call but four (below) |
+| NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring, watershed segmentation -- every entry point OpenCV, DALI, FFmpeg, jetson-utils and the CUDA Samples call (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
 | NVENC | `libnvidia-encode.so.1` | video encode |
 
@@ -315,11 +315,12 @@ output. Anything that differs is a bug in this implementation.
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
 | `npp_imgproc` | 289 results: every integer image identical (a dozen near-ties marked approximate, within a count on a pixel or two), floats to 1e‑5 -- warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and shifts, alpha compositing, gamma, demosaicing, lookup, statistics, histograms, integral images, rank and morphological filters, Prewitt gradients and Canny |
+| `npp_segment` | watershed segmentation and marker-label compression: every buffer size and status; the segmented image under 8-way connectivity, every boundary type, 8- and 16-bit, a padded pitch; the marker labels of images without equal values; 4-way on images up to 4x4; label compression of any label image -- all identical. Labels of images with equal neighbouring values and 4-way on larger images are not (below) |
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
 | `multi_gpu` | all 13 identical to two physical GPUs |
 
-Five of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward`,
-`cudnn_types` and `npp_imgproc`, also run in CI on every pull request: `e2e_library_goldens`
+Six of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward`,
+`cudnn_types`, `npp_imgproc` and `npp_segment`, also run in CI on every pull request: `e2e_library_goldens`
 compiles them against the simulator alone and compares the output with what
 the RTX 3060 printed (`nvidia/tests/conformance/golden/`), so a change that
 makes a routine disagree with the hardware fails on a runner with no GPU.
@@ -682,21 +683,55 @@ NPP has some ten thousand entry points; which of them matter was settled by
 reading the programs that use it -- OpenCV's cudaarithm, cudaimgproc,
 cudawarping and cudafilters (and its core), DALI, FFmpeg's `scale_npp`,
 jetson-utils, torchvision (which calls none) and the CUDA Samples -- and
-collecting every `npp*` name they call: 253 functions. 249 of them are
-implemented:
+collecting every `npp*` name they call: 253 functions, all implemented:
 
 | user | calls | here |
 | --- | --- | --- |
 | OpenCV | 194 | all: warps (affine, perspective, both directions, every depth and channel count), rotation, mirroring in place and not, the logical and shift operators with constants, magnitude, alpha compositing and premultiplication, gamma, channel swaps, masked and float mean/standard deviation, even and ranged histograms with their level and buffer helpers, rectangle standard deviation, windowed sums, box, max and min filters, dilation and erosion with masks, float thresholds, transpose |
 | DALI | 12 | all: `nppiRemap` at every depth it uses, `nppiCFAToRGB` 8- and 16-bit |
 | FFmpeg | 3 | all: `nppiResizeSqrPixel_8u_C1R` (nearest, linear, cubic), the YCbCr 4:2:0 plane layouts |
-| CUDA Samples | 51 | all but the two in `watershedSegmentationNPP`: Canny, Prewitt gradient vectors, `nppiLUT_Linear`, `nppiCompareC`, border-replicating box filter, constant-border copy, every allocator |
+| CUDA Samples | 51 | all, `watershedSegmentationNPP` included (below): Canny, Prewitt gradient vectors, `nppiLUT_Linear`, `nppiCompareC`, border-replicating box filter, constant-border copy, every allocator, watershed segmentation and marker-label compression |
 | jetson-utils | 1 | `nppiCFAToRGB_8u_C1C3R` |
 
-What is left, ranked by those users: `nppiSegmentWatershed_8u_C1IR` and
-`nppiCompressMarkerLabelsUF_32u_C1IR` (with their buffer-size queries), one
-CUDA Sample between them -- both absent, so the sample fails at link time with
-the name. Beyond the list, nothing else of NPP's is implemented.
+Watershed segmentation (`nppiSegmentWatershed_8u_C1IR`, `_16u_`), its
+buffer-size queries and `nppiCompressMarkerLabelsUF_32u_C1IR` with its own
+(`watershedSegmentationNPP`) were the last of the 253. Beyond the list,
+nothing else of NPP's is implemented -- `nppiLabelMarkersUF` and the
+compressed-marker-label info and contour functions among it, which the same
+sample does not call.
+
+NVIDIA publishes no algorithm for the watershed, so it is reproduced from
+what NPP 13.0 does on an RTX 3060, probed with random, exhaustive and
+photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
+
+- **The segmented image is exact** under 8-way connectivity (`nppiNormInf`):
+  a pixel flows to its lowest strictly lower neighbour (the first of equal
+  ones in raster order) and takes the value where the flow ends. This held on
+  every probe, 300 images full of equal values included, and on the teapot,
+  skull and rocks images of the CUDA Samples. Boundary types are drawn on the
+  result exactly: a pixel whose upper or left neighbour has another value is
+  black, white, black-or-white by half the range (`CONTRAST`), or -- in
+  `ONLY` -- black on white.
+- **The marker labels are the pixel index above and to the left of the
+  region's lowest pixel** (the smallest index in its neighbourhood), exact on
+  every image whose values are all different. Where neighbouring values are
+  equal NPP's labels follow plateau rules nobody wrote down; the simulator
+  fits them (equal roots share a label, tied lowest neighbours link roots),
+  and on the three Samples images 96.2% (teapot), 98.5% (skull) and 99.5%
+  (rocks) of the labels are NVIDIA's. A label that differs moves every rank
+  after it in `nppiCompressMarkerLabelsUF`, so the compressed labels of
+  those images differ over most of the image though the regions agree.
+- **4-way connectivity** (`nppiNormL1`) matches on images up to 4x4. On larger
+  ones NPP leaves pixels near the right and bottom edges unwritten, in a
+  pattern that depends on the image width and none of the shapes tried fits
+  (it is under 0.5% of a 512x512 image for the skull and teapot, a few tenths
+  of a percent for rocks); the simulator writes them.
+- Label compression is exact for any label image: labels below
+  `nStartingNumber` take their rank among the labels present plus 0, which is
+  always counted, so 0 stays 0, an image with no 0 starts at 1 and
+  `*pNewNumber` counts 0; larger labels are left alone.
+- Statuses and buffer sizes (72 bytes plus, per row, 24 or 32 bytes a pixel
+  rounded up to 128; the compression's 65,556 plus 8 a label) are NVIDIA's.
 
 The conventions NPP leaves unwritten were measured on an RTX 3060 against
 NPP 13.0 and are recorded at each function in `npp_core.hpp` and
@@ -990,10 +1025,13 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   Samples call (see "NPP: what real programs call") plus the original subset
   -- allocation, per-pixel arithmetic and logic, data exchange, colour
   conversion, thresholding, statistics, filters, morphology, resizing, and
-  the signal-processing equivalents. Not implemented: watershed segmentation
-  and marker-label compression (one CUDA Sample), and the rest of NPP's ten thousand entry
-  points, which are absent rather than approximated, so a program that needs
-  more fails at link time with a name.
+  the signal-processing equivalents, watershed segmentation and marker-label
+  compression (labels inexact where neighbouring values are equal; 4-way
+  connectivity inexact near the edges of images wider than 4: see "NPP: what
+  real programs call"). Not implemented: `nppiLabelMarkersUF` and the
+  compressed-marker-label functions built on it, and the rest of NPP's ten
+  thousand entry points, which are absent rather than approximated, so a
+  program that needs more fails at link time with a name.
 - **Device runtime** (cudadevrt, dynamic parallelism), on both engines: all of
   `cuda_device_runtime_api.h` that CUDA 12 and 13 still offer to a kernel --
   device-side launches (`<<<>>>`, `cudaGetParameterBuffer` /
