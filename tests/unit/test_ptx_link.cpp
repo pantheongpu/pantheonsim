@@ -4,6 +4,7 @@
 // nvjitlink_paths' (jitlink_ptx.inc), whose link an RTX 3060 runs through
 // NVIDIA's nvJitLink and VirtualGPU's alike; here the linked module also runs
 // on a simulated A100.
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -287,7 +288,18 @@ VTEST(an_entry_that_will_not_decompress_is_kept_unless_it_is_ptx) {
   // Set the zstd flag on the second entry (its flags are at +40 of its header).
   auto first = cuda::extract_images(image.data(), image.size());
   VCHECK_EQ(first.size(), size_t{2});
-  const size_t second = image.rfind("not a zstd frame") - 64 - 8;   // header + name
+  // Walk to the second entry: the container header is 16 bytes, and an entry
+  // is header_size (u32 at +4) plus its padded payload (u64 at +8). Its header
+  // length varies (an LTO-IR entry carries an options record), so it is read,
+  // not assumed.
+  size_t second = 16;
+  {
+    uint32_t header_size = 0;
+    uint64_t padded = 0;
+    std::memcpy(&header_size, image.data() + second + 4, 4);
+    std::memcpy(&padded, image.data() + second + 8, 8);
+    second += header_size + padded;
+  }
   image[second + 41] = static_cast<char>(0x80);
   auto out = cuda::extract_images(image.data(), image.size());
   VCHECK_EQ(out.size(), size_t{2});
