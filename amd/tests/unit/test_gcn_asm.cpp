@@ -1366,7 +1366,7 @@ VTEST(vop3_instructions_a_compiler_emits_give_what_the_isa_says) {
       const uint32_t want = half_bits(h0 * h1 + h2);
       if (!both_nan(at(5), want)) check(l, 5, at(5), want, "v_mad_f16");
     }
-    check(l, 6, at(6), static_cast<uint16_t>(u0 * u1 + u2), "v_mad_u16");
+    check(l, 6, at(6), static_cast<uint16_t>(uint32_t{u0} * u1 + u2), "v_mad_u16");   // unsigned, or two uint16_t promote to a signed int that overflows
     check(l, 7, at(7), static_cast<uint16_t>(s0 * s1 + s2), "v_mad_i16");
     check(l, 8, at(8), std::max({w[0], w[1], w[2]}), "v_max3_u32");
     check(l, 9, at(9), static_cast<uint32_t>((uint64_t{w[0]} << 32 | w[1]) >> 8 * (w[2] & 3)), "v_alignbyte_b32");
