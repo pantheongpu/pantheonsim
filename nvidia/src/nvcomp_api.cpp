@@ -24,6 +24,7 @@
 // open -- a status, a size, an alignment -- it is what nvCOMP 5.3 answered on
 // an RTX 3060, and the code says so where it is applied.
 #include "../include/vgpu_nvcomp.h"
+#include "../include/vgpu_nvcomp.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -194,9 +195,14 @@ using vgpu::codec::Result;
 
 // ---- the batched operations ----------------------------------------------------
 
+void bitshuffle(const uint8_t* in, size_t n, int es, int mode, uint8_t* out);
+void bitunshuffle(const uint8_t* in, size_t n, int es, int mode, uint8_t* out);
+
 struct CompressArgs {
   Fmt fmt;
   int level;
+  int es;       // LZ4 bitshuffle: element size
+  int shuffle;  // and mode (0: none)
   const void* const* ptrs;
   const size_t* sizes;
   size_t num;
@@ -227,6 +233,11 @@ void run_compress(const CompressArgs& a) {
       st[i] = nvcompErrorCudaError;
       continue;
     }
+    if (a.shuffle) {
+      std::vector<uint8_t> shuffled(buf.size());
+      bitshuffle(buf.data(), buf.size(), a.es, a.shuffle, shuffled.data());
+      buf.swap(shuffled);
+    }
     const Bytes c = compress(a.fmt, buf.data(), buf.size(), a.level);
     if (!put(out[i], c.data(), c.size())) {
       st[i] = nvcompErrorCudaError;
@@ -240,6 +251,8 @@ void run_compress(const CompressArgs& a) {
 
 struct DecompressArgs {
   Fmt fmt;
+  int unshuffle_mode;  // LZ4 bitshuffle: mode (0: none) and element size
+  int es;
   const void* const* ptrs;
   const size_t* sizes;
   const size_t* buffer_sizes;
@@ -282,6 +295,11 @@ void run_decompress(const DecompressArgs& a) {
     const Result r = decompress(a.fmt, src.data(), src.size(), dst.data(), dst.size(), &produced);
     st[i] = chunk_status(r);
     if (r != Result::Ok) continue;
+    if (a.unshuffle_mode) {
+      std::vector<uint8_t> plain(produced);
+      bitunshuffle(dst.data(), produced, a.es, a.unshuffle_mode, plain.data());
+      std::memcpy(dst.data(), plain.data(), produced);
+    }
     if (!put(out[i], dst.data(), produced)) {
       st[i] = nvcompErrorCudaError;
       continue;
@@ -324,7 +342,82 @@ void run_sizes(Fmt fmt, const void* const* ptrs, const size_t* sizes_p, size_t* 
 struct Opts {
   bool ok = true;
   int level = 1;
+  int es = 1;       // LZ4: bytes per element of the data type
+  int shuffle = 0;  // LZ4: 0 none, 1 bitshuffle with the most significant bit plane first, 2 least first
 };
+
+// The bytes per element of an nvcompType_t, 0 for a type bitshuffle cannot take.
+int type_size(int t) {
+  switch (t) {
+    case NVCOMP_TYPE_CHAR:
+    case NVCOMP_TYPE_UCHAR:
+    case NVCOMP_TYPE_BITS: return 1;
+    case NVCOMP_TYPE_SHORT:
+    case NVCOMP_TYPE_USHORT: return 2;
+    case NVCOMP_TYPE_INT:
+    case NVCOMP_TYPE_UINT: return 4;
+    default: return 0;
+  }
+}
+
+// An application's nvcompBitshuffleMode_t as the number it holds (a value the enum has
+// no name for is legal input, and loading it as the enum is undefined).
+int mode_word(const nvcompBitshuffleMode_t& m) {
+  int v;
+  std::memcpy(&v, &m, sizeof v);
+  return v;
+}
+int type_word(const nvcompType_t& t) {
+  int v;
+  std::memcpy(&v, &t, sizeof v);
+  return v;
+}
+
+// LZ4's bitshuffle pre-pass (nvcomp/lz4.h; measured on nvCOMP 5.3 / RTX 3060): the
+// chunk is cut into sub-chunks of 8 KiB; in each, the elements in whole groups of
+// eight are transposed bit-wise -- for each bit plane, one byte per group of eight
+// elements, element 0 in the byte's least significant bit; planes run from the
+// element's most significant bit down (mode 1) or its least significant up (any
+// other non-zero mode on compress, mode 2 on decompress) -- and the remaining
+// elements and bytes are left as they are.
+void bitshuffle(const uint8_t* in, size_t n, int es, int mode, uint8_t* out) {
+  for (size_t off = 0; off < n; off += 8192) {
+    const size_t len = std::min<size_t>(8192, n - off);
+    const size_t groups = len / es / 8;
+    const uint8_t* src = in + off;
+    uint8_t* dst = out + off;
+    for (int plane = 0; plane < 8 * es; ++plane) {
+      const int bit = mode == 1 ? 8 * es - 1 - plane : plane;
+      const int byte = bit / 8, sh = bit % 8;
+      for (size_t g = 0; g < groups; ++g) {
+        unsigned v = 0;
+        for (int e = 0; e < 8; ++e) v |= ((src[(g * 8 + e) * es + byte] >> sh) & 1u) << e;
+        dst[static_cast<size_t>(plane) * groups + g] = static_cast<uint8_t>(v);
+      }
+    }
+    const size_t done = groups * 8 * es;
+    std::memcpy(dst + done, src + done, len - done);
+  }
+}
+void bitunshuffle(const uint8_t* in, size_t n, int es, int mode, uint8_t* out) {
+  for (size_t off = 0; off < n; off += 8192) {
+    const size_t len = std::min<size_t>(8192, n - off);
+    const size_t groups = len / es / 8;
+    const uint8_t* src = in + off;
+    uint8_t* dst = out + off;
+    const size_t done = groups * 8 * es;
+    std::memset(dst, 0, done);
+    for (int plane = 0; plane < 8 * es; ++plane) {
+      const int bit = mode == 1 ? 8 * es - 1 - plane : plane;
+      const int byte = bit / 8, sh = bit % 8;
+      for (size_t g = 0; g < groups; ++g) {
+        const unsigned v = src[static_cast<size_t>(plane) * groups + g];
+        for (int e = 0; e < 8; ++e) dst[(g * 8 + e) * es + byte] |= static_cast<uint8_t>(((v >> e) & 1u) << sh);
+      }
+    }
+    std::memcpy(dst + done, src + done, len - done);
+  }
+}
 
 // The reserved bytes are not checked (NVIDIA's library accepts nonzero ones).
 // An option outside its documented values is nvcompErrorNotSupported on the
@@ -332,9 +425,13 @@ struct Opts {
 // a Deflate algorithm outside 0..5.
 Opts check(const nvcompBatchedLZ4CompressOpts_t& o) {
   Opts r;
-  const int t = o.data_type;
-  r.ok = t == NVCOMP_TYPE_CHAR || t == NVCOMP_TYPE_UCHAR || t == NVCOMP_TYPE_SHORT || t == NVCOMP_TYPE_USHORT ||
-         t == NVCOMP_TYPE_INT || t == NVCOMP_TYPE_UINT || t == NVCOMP_TYPE_BITS;
+  const int t = type_word(o.data_type);
+  r.ok = type_size(t) != 0;
+  r.es = std::max(1, type_size(t));
+  // Bitshuffle: mode 1 is MSB-first, every other non-zero value (the enum's 2 and
+  // values it has no name for) is LSB-first.
+  const int m = mode_word(o.bitshuffle_mode);
+  r.shuffle = m == 0 ? 0 : (m == 1 ? 1 : 2);
   return r;
 }
 Opts check(const nvcompBatchedSnappyCompressOpts_t&) { return {true, 1}; }
@@ -356,7 +453,7 @@ Opts check(const nvcompBatchedGzipCompressOpts_t& o) {
 Opts check(const nvcompBatchedZstdCompressOpts_t&) { return {true, 1}; }
 
 size_t lz4_input_alignment(const nvcompBatchedLZ4CompressOpts_t& o) {
-  switch (o.data_type) {
+  switch (type_word(o.data_type)) {
     case NVCOMP_TYPE_SHORT:
     case NVCOMP_TYPE_USHORT: return 2;
     case NVCOMP_TYPE_INT:
@@ -379,20 +476,43 @@ bool check(const nvcompBatchedGdeflateDecompressOpts_t& o) { return backend_ok(o
 bool check(const nvcompBatchedGzipDecompressOpts_t& o) { return backend_ok(o.backend); }
 bool check(const nvcompBatchedZstdDecompressOpts_t& o) { return backend_ok(o.backend); }
 
-// LZ4's bitshuffle pre-pass is not implemented: refused by name rather than
-// compressed without it, which NVIDIA's library would then un-shuffle wrongly.
-bool lz4_bitshuffle(nvcompBitshuffleMode_t m, const char* api) {
-  if (m == NVCOMP_BITSHUFFLE_NONE) return false;
-  (void)api;
-  say_once("nvcomp-bitshuffle", "nvCOMP LZ4: the bitshuffle option is refused (nvcompErrorNotSupported); "
-                                "VirtualGPU's LZ4 has no bitshuffle pass");
-  return true;
-}
 template <class O>
 bool unsupported_option(const O&) { return false; }
-bool unsupported_option(const nvcompBatchedLZ4CompressOpts_t& o) { return lz4_bitshuffle(o.bitshuffle_mode, ""); }
-bool unsupported_option(const nvcompBatchedLZ4DecompressOpts_t& o) {
-  return lz4_bitshuffle(o.bitshuffle_mode, "");
+
+// Decompression with bitshuffle: mode 1 and 2 unshuffle by the data type's size; any
+// other mode value does not unshuffle at all (measured). A data type bitshuffle
+// cannot take (the 8-byte integers, anything else) is nvcompErrorNotSupported at the
+// decompress call -- but not at the alignment and temporary size queries.
+struct Unshuffle {
+  int mode = 0;
+  int es = 1;
+  bool refused = false;
+};
+template <class O>
+Unshuffle unshuffle_of(const O&) { return {}; }
+Unshuffle unshuffle_of(const nvcompBatchedLZ4DecompressOpts_t& o) {
+  Unshuffle u;
+  const int m = mode_word(o.bitshuffle_mode);
+  if (m != 1 && m != 2) return u;
+  u.mode = m;
+  const int t = type_word(o.data_type);
+  u.es = type_size(t);
+  u.refused = u.es == 0;
+  if (u.refused) u.es = (t == NVCOMP_TYPE_LONGLONG || t == NVCOMP_TYPE_ULONGLONG) ? 8 : 1;
+  return u;
+}
+// The temporary space bitshuffle adds on compress: a chunk-sized scratch per chunk, to 32 bytes.
+template <class O>
+size_t extra_temp(const O&, size_t, size_t) { return 0; }
+size_t extra_temp(const nvcompBatchedLZ4CompressOpts_t& o, size_t num, size_t max_chunk) {
+  return check(o).shuffle ? num * ((max_chunk + 31) / 32 * 32) : 0;
+}
+// The output alignment a decompression asks for: the element size, with bitshuffle on.
+template <class O>
+size_t out_alignment(const O&, size_t dflt) { return dflt; }
+size_t out_alignment(const nvcompBatchedLZ4DecompressOpts_t& o, size_t dflt) {
+  const Unshuffle u = unshuffle_of(o);
+  return u.mode ? static_cast<size_t>(u.es) : dflt;
 }
 
 // Temporary storage: the simulator needs none, but a program allocates what
@@ -419,13 +539,14 @@ struct Api {
     if (!a || !check(o)) return nvcompErrorInvalidValue;
     if (unsupported_option(o)) return nvcompErrorNotSupported;
     *a = facts(F).decomp_align;
+    a->output = out_alignment(o, a->output);
     return nvcompSuccess;
   }
   static nvcompStatus_t comp_temp(size_t num, size_t max_chunk, CO o, size_t* temp, size_t) {
     if (!temp) return nvcompErrorInvalidValue;
     if (!check(o).ok || unsupported_option(o)) return nvcompErrorNotSupported;
     if (max_chunk > facts(F).max_compress_chunk) return nvcompErrorChunkSizeTooLarge;
-    *temp = temp_compress(F, num, max_chunk);
+    *temp = temp_compress(F, num, max_chunk) + extra_temp(o, num, max_chunk);
     return nvcompSuccess;
   }
   static nvcompStatus_t decomp_temp(size_t num, size_t max_chunk, DO o, size_t* temp, size_t) {
@@ -453,7 +574,7 @@ struct Api {
     if (num == 0) return nvcompSuccess;
     if (!ptrs || !sizes || !out_ptrs || !out_sizes) return nvcompErrorInvalidValue;
     if (max_chunk > facts(F).max_compress_chunk) return nvcompErrorChunkSizeTooLarge;
-    CompressArgs a{F, op.level, ptrs, sizes, num, out_ptrs, out_sizes, statuses};
+    CompressArgs a{F, op.level, op.es, op.shuffle, ptrs, sizes, num, out_ptrs, out_sizes, statuses};
     return in_stream_order(stream, [a] { run_compress(a); });
   }
   static nvcompStatus_t sizes(const void* const* ptrs, const size_t* sizes_p, size_t* out, size_t num,
@@ -468,10 +589,11 @@ struct Api {
     (void)temp;
     (void)temp_bytes;
     if (!check(o)) return nvcompErrorInvalidValue;
-    if (unsupported_option(o)) return nvcompErrorNotSupported;
+    const Unshuffle u = unshuffle_of(o);
+    if (u.refused) return nvcompErrorNotSupported;
     if (num == 0) return nvcompSuccess;
     if (!ptrs || !sizes_p || !buffer_sizes || !out_ptrs) return nvcompErrorInvalidValue;
-    DecompressArgs a{F, ptrs, sizes_p, buffer_sizes, actual, num, out_ptrs, statuses};
+    DecompressArgs a{F, u.mode, u.es, ptrs, sizes_p, buffer_sizes, actual, num, out_ptrs, statuses};
     return in_stream_order(stream, [a] { run_decompress(a); });
   }
   static nvcompStatus_t decomp_temp_sync(const void* const* ptrs, const size_t* sizes_p, size_t num,
@@ -774,4 +896,58 @@ extern "C" nvcompStatus_t nvcompBatchedCRC32SearchConf(const void* const* ptrs, 
     return nvcompErrorCudaError;
   }
   return nvcompSuccess;
+}
+
+// ---- streaming gzip ---------------------------------------------------------------------
+//
+// nvcomp/native/streaming_gzip.hpp, C++ entry points. Compression reads a stream to its
+// end, as one gzip member written to another, and decodes with any gzip reader (and
+// nvCOMP's batched Gzip, whose chunk it is). Measured on an RTX 3060:
+//   * the workspace it asks for is gigabytes, by algorithm; a smaller one is
+//     nvcompErrorInvalidValue; an algorithm outside 0..5 is nvcompErrorInternal; a null
+//     size pointer is nvcompErrorInvalidValue;
+//   * an input stream that cannot be read is an empty input (a 20-byte gzip member), an
+//     output stream that cannot be written is nvcompErrorInternal;
+//   * decompression is nvcompErrorInvalidValue for every input and every workspace,
+//     as is its workspace query: it needs the GPU's hardware decompression engine, which
+//     the part has none of, and neither has any GPU VirtualGPU simulates.
+nvcompStatus_t nvcompGzipStreamingDecompressGetTempSize(size_t*) { return nvcompErrorInvalidValue; }
+
+nvcompStatus_t nvcompGzipStreamingDecompress(std::istream&, std::ostream&, const size_t, void* const, cudaStream_t) {
+  static bool said = false;
+  if (!said && !quiet()) {
+    said = true;
+    std::fprintf(stderr, "[vgpu] nvcompGzipStreamingDecompress needs the hardware decompression engine, which the simulated GPUs "
+                         "(like an RTX 3060) do not have: nvcompErrorInvalidValue\n");
+  }
+  return nvcompErrorInvalidValue;
+}
+
+namespace {
+bool streaming_workspace(const nvcompBatchedGzipCompressOpts_t& o, size_t* bytes) {
+  static const size_t table[6] = {876299944u, 2487174824u, 4903093928ull, 4903093928ull, 5440293544ull, 5708729000ull};
+  if (o.algorithm < 0 || o.algorithm > 5) return false;
+  *bytes = table[o.algorithm];
+  return true;
+}
+}  // namespace
+
+nvcompStatus_t nvcompGzipStreamingCompressGetTempSize(nvcompBatchedGzipCompressOpts_t opts, size_t* temp_bytes) {
+  if (!temp_bytes) return nvcompErrorInvalidValue;
+  return streaming_workspace(opts, temp_bytes) ? nvcompSuccess : nvcompErrorInternal;
+}
+
+nvcompStatus_t nvcompGzipStreamingCompress(std::istream& in, std::ostream& out, const size_t temp_bytes, void* const,
+                                           nvcompBatchedGzipCompressOpts_t opts, cudaStream_t) {
+  size_t need = 0;
+  if (!streaming_workspace(opts, &need)) return nvcompErrorInternal;
+  if (temp_bytes < need) return nvcompErrorInvalidValue;
+  std::vector<char> data;
+  char buf[1 << 16];
+  while (in.read(buf, sizeof buf) || in.gcount() > 0) data.insert(data.end(), buf, buf + in.gcount());
+  const Bytes c = vgpu::codec::gzip_compress(reinterpret_cast<const uint8_t*>(data.data()), data.size(), opts.algorithm);
+  if (!out) return nvcompErrorInternal;
+  out.write(reinterpret_cast<const char*>(c.data()), static_cast<std::streamsize>(c.size()));
+  out.flush();
+  return out ? nvcompSuccess : nvcompErrorInternal;
 }

@@ -15,9 +15,12 @@
 // gave on an RTX 3060 in compatibility mode (no nvidia-fs, CUDA 13.0, the
 // stock /etc/cufile.json); each such rule says so where it is applied.
 //
-// Not implemented: the user-space file system handle type (its operation
+// Not implemented: I/O through a user-space file system handle. Its operation
 // table is called by nvidia-fs's RDMA path, which compatibility mode never
-// takes), which is refused as CU_FILE_IO_NOT_SUPPORTED like a Windows handle.
+// takes: the card registers such a handle (with a non-null table), then returns
+// 5006 from every cuFileRead and cuFileWrite on it without calling the table or
+// touching the buffer, and this library does the same. Nor are nvidia-fs's DMA
+// paths (GPUDirect proper): there is no kernel module to take them.
 #include "../include/vgpu_cufile.h"
 
 #include <cuda_runtime_api.h>
@@ -108,6 +111,7 @@ bool string_readable(int p) { return p != CUFILE_PARAM_ENV_LOGFILE_PATH; }
 struct Handle {
   int fd = -1;
   int accmode = O_RDWR;
+  bool userspace = false;   // a CU_FILE_HANDLE_TYPE_USERSPACE_FS handle: registers, never does I/O
 };
 
 struct BatchEntry {
@@ -375,6 +379,23 @@ ssize_t io(CUfileHandle_t fh, void* bufPtr_base, size_t size, off_t file_offset,
     return fail(CU_FILE_HANDLE_NOT_REGISTERED);
   }
   if (!bufPtr_base) return fail(EINVAL);
+  // A user-space file system handle registers, but without nvidia-fs its I/O does
+  // not run: the card returns 5006 (the number of CU_FILE_DRIVER_CLOSING, as the
+  // value of the call, not -1 with errno), without calling the table, touching the
+  // buffer or setting errno. A negative offset is checked first; a size of 0 on a
+  // registered buffer is 0 as for any handle, on an unregistered one 5006.
+  if (h->userspace) {
+    if (file_offset < 0) return fail(CU_FILE_INVALID_VALUE);
+    if (size == 0 && s.bufs.count(reinterpret_cast<uintptr_t>(bufPtr_base))) return 0;
+    static bool said = false;
+    if (!said && !quiet()) {
+      said = true;
+      std::fprintf(stderr, "[vgpu] cuFileRead/cuFileWrite: user-space file system handles do no I/O in "
+                           "compatibility mode (they need nvidia-fs); the call returns 5006 as the card's does\n");
+    }
+    count(s, write, -1, size);
+    return static_cast<ssize_t>(5006);
+  }
   if (size == 0) return 0;
   if (file_offset < 0) return fail(CU_FILE_INVALID_VALUE);
   if (buf_offset < 0) return fail(CU_FILE_INTERNAL_ERROR);
@@ -497,13 +518,16 @@ CUFILE_EXPORT CUfileError_t cuFileHandleRegister(CUfileHandle_t* fh, CUfileDescr
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   ensure_open(s);
-  // Only a Linux file descriptor: a Windows handle and an unknown type are
-  // CU_FILE_IO_NOT_SUPPORTED on the card. A user-space file system's table is
-  // for nvidia-fs's RDMA path, which compatibility mode does not have.
-  if (descr->type != CU_FILE_HANDLE_TYPE_OPAQUE_FD) {
-    if (descr->type == CU_FILE_HANDLE_TYPE_USERSPACE_FS && !quiet())
-      std::fprintf(stderr, "[vgpu] cuFileHandleRegister: user-space file system handles are not "
-                           "supported (compatibility mode only)\n");
+  // A Linux file descriptor, or a user-space file system's (a table of read and
+  // write callbacks over a descriptor, for nvidia-fs's RDMA path). The card
+  // registers the second whatever the table holds -- even zeroed -- but a null
+  // table is CU_FILE_IO_NOT_SUPPORTED, and so are a Windows handle and an unknown
+  // type. Its I/O does not work without nvidia-fs (see io below).
+  bool userspace = false;
+  if (descr->type == CU_FILE_HANDLE_TYPE_USERSPACE_FS) {
+    if (!descr->fs_ops) return status(CU_FILE_IO_NOT_SUPPORTED);
+    userspace = true;
+  } else if (descr->type != CU_FILE_HANDLE_TYPE_OPAQUE_FD) {
     return status(CU_FILE_IO_NOT_SUPPORTED);
   }
   const int fd = descr->handle.fd;
@@ -522,6 +546,7 @@ CUFILE_EXPORT CUfileError_t cuFileHandleRegister(CUfileHandle_t* fh, CUfileDescr
   Handle* h = new Handle;
   h->fd = fd;
   h->accmode = fl & O_ACCMODE;
+  h->userspace = userspace;
   s.handles.insert(h);
   if (s.stats_level >= 1) ++s.stats.l1.hdl_register_ops.ok;
   *fh = h;

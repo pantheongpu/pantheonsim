@@ -16,7 +16,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <istream>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -212,3 +214,12 @@ NVCOMP_EXPORT nvcompFormatType_t get_compression_format(const uint8_t* comp_buff
 }  // namespace nvcomp
 
 #endif /* VGPU_NVCOMP_HPP_ */
+
+// nvcomp/native/streaming_gzip.hpp: gzip from one C++ stream to another, in windows,
+// with the workspace the caller allocates on the device. (C++ linkage, as NVIDIA's.)
+nvcompStatus_t nvcompGzipStreamingDecompressGetTempSize(size_t* temp_bytes);
+nvcompStatus_t nvcompGzipStreamingDecompress(std::istream& input_stream, std::ostream& output_stream, const size_t temp_bytes,
+                                             void* const device_temp_ptr, cudaStream_t stream);
+nvcompStatus_t nvcompGzipStreamingCompressGetTempSize(nvcompBatchedGzipCompressOpts_t opts, size_t* temp_bytes);
+nvcompStatus_t nvcompGzipStreamingCompress(std::istream& input_stream, std::ostream& output_stream, const size_t temp_bytes,
+                                           void* const device_temp_ptr, nvcompBatchedGzipCompressOpts_t opts, cudaStream_t stream);

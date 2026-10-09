@@ -745,7 +745,7 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
   file(WRITE "${_nvcomp_map}"
-       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; };\n  local: *;\n};\n")
+       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; nvcompGzipStreaming*; };\n  local: *;\n};\n")
   add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
               nvidia/src/nvcomp_gdeflate.cpp nvidia/src/nvcomp_manager.cpp)
   target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
@@ -1832,7 +1832,7 @@ if(TARGET vgpucublas)
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
                           "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp"
+                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
                           "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
