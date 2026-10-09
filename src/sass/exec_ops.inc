@@ -2071,9 +2071,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const uint64_t g = address(a, l, e || ins.w.bit(90), ins.w.bit(91) && !e, 64, 0);
           sp = ins.op == Op::ATOM ? classify(g, &addr) : (addr = g, Space::Global);
         }
+        // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
+        // in consecutive registers, aligned to all of them, each its own atomic.
+        const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
+        if (nwords > 1 && addr % (4ull * nwords))
+          fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
+                Err::MisalignedAccess);
+        const uint64_t addr0 = addr;
+        for (unsigned word = 0; word < nwords; ++word) {
+        addr = addr0 + 4ull * word;
         std::unique_lock<std::mutex> lock;
         if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
-        const Operand& vop = red ? ins.src[1] : ins.src[1];
+        Operand vtmp;
+        const Operand* vp = &ins.src[1];
+        if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
+        const Operand& vop = *vp;
         const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
         const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
         // The value the atomic stores, given the one it finds.
@@ -2082,6 +2094,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         if (cas) {
           if (old == v) nw = swap;
         } else {
+          if (type == 4 || type == 7) {   // F16x2, BF16x2 (and their vectors): add, min or max on each half
+            const ptx::AtomOp fop = ins.f[0] == 1 ? ptx::AtomOp::Min : ins.f[0] == 2 ? ptx::AtomOp::Max : ptx::AtomOp::Add;
+            nw = exec::atom_word(fop, type == 7 ? 2 : 1, static_cast<uint32_t>(old), static_cast<uint32_t>(v));
+          } else
           switch (popc_inc ? 3 : ins.f[0]) {
             case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
               if (type == 3) {
@@ -2138,7 +2154,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
         if (!red) {
-          const Operand& d = ins.op == Op::ATOMS ? ins.dst[0] : ins.dst[1];
+          Operand dtmp;
+          const Operand* dp = ins.op == Op::ATOMS ? &ins.dst[0] : &ins.dst[1];
+          if (word) { dtmp = *dp; if (dtmp.reg != kRZ) dtmp.reg += word; dp = &dtmp; }
+          const Operand& d = *dp;
           // ATOM/ATOMG's predicate: done in hardware (a generic CAS of a
           // shared address included, so no software path is needed).
           if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
@@ -2155,6 +2174,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             else write32(w, d, l, old == v ? 1 : 0);
           }
         }
+        }   // for each word of a vector atomic
       });
       return;
     }

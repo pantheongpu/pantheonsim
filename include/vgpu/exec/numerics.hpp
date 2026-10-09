@@ -17,6 +17,13 @@ namespace vgpu::exec {
 // when one is NaN.
 uint64_t reduce_value(ptx::AtomOp op, const ptx::Type& ty, uint64_t old, uint64_t b);
 
+// One 32-bit word of a vector atom/red (sm_90): `old` combined with `b`. kind 0
+// is one f32 (add only: subnormal inputs and results flush to zero, a NaN
+// result is the canonical one, as the scalar f32 atomic does), kind 1 a pair of
+// f16 and kind 2 a pair of bf16 (add, min, max on each half by reduce_value's
+// rules: subnormals kept, min and max return the other operand when one is NaN).
+uint32_t atom_word(ptx::AtomOp op, int kind, uint32_t old, uint32_t b);
+
 // The element type a tensor map gives cp.reduce.async.bulk.tensor, and
 // whether `op` is defined for it (9.7.10.28.5.4); nothing if not.
 std::optional<ptx::Type> tensor_reduce_type(TmapType t, ptx::AtomOp op);

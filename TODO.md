@@ -458,6 +458,15 @@ The status snapshot, the inventories and the gap register at the end are new in 
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
+- The vector atomics `atom`/`red` `.v2`/`.v4`/`.v8` (PTX ISA 8.1, sm_90; Triton's `tl.atomic_add` on a pair of
+  floats, which Inductor's `scatter_add` uses): `.add` on `.f32` in two or four, `.add`/`.min`/`.max` on `.f16`,
+  `.bf16` in two, four or eight and on `.f16x2`/`.bf16x2` in two or four. Each 32-bit word is its own atomic
+  under the striped lock, the vector aligned to its whole size (`MisalignedAccess` otherwise), in both
+  engines; the SASS twin is REDG/ATOMG's F32x2/F32x4/F16x4/F16x8/BF16x4/BF16x8 forms (decoder checked against
+  nvdisasm for sm_90 to sm_120, `probes/vector_atomics.cu`; `e2e_sass_archs` runs `vector_atomics` on every
+  Hopper and Blackwell profile, SASS and PTX). Derived from the PTX documentation and ptxas's output, not checked on a card
+  (the local cards are sm_86): how a NaN, a subnormal or a signed zero combines follows the scalar atomics'
+  rules and is not asserted by the test.
 - `atom.{exch,cas}.b128` (sm_90): 16 aligned bytes, the operands `.b128`
   register pairs, under the atomics' striped lock. `st.bulk` (sm_100): zeroes
   shared memory, a multiple of 8 bytes up to 16 MiB. `istypep`: false for every

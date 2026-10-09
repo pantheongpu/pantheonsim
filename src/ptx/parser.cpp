@@ -4038,9 +4038,14 @@ class Parser {
       Type ty{};
       bool have_ty = false;
       bool packed_half = false, b128 = false;
+      uint8_t vec = 1;
+      bool explicit_global = false;
       for (size_t i = 1; i < parts.size(); ++i) {
         const std::string& p = parts[i];
-        if (p == "global") space = Space::Global;
+        if (p == "v2") vec = 2;
+        else if (p == "v4") vec = 4;
+        else if (p == "v8") vec = 8;
+        else if (p == "global") { space = Space::Global; explicit_global = true; }
         else if (p == "shared" || p == "shared::cluster") space = Space::Shared;
         else if (inert_mem_modifier(p)) ;
         else if (p == "add") aop = AtomOp::Add;
@@ -4062,6 +4067,29 @@ class Parser {
         } else return unsupported("atom operation '." + p + "'");
       }
       if (!aop || !have_ty) return unsupported("atom form");
+      if (vec > 1) {
+        // The vector atomics (PTX ISA 8.1, sm_90, .global only): .add on .f32 in
+        // two or four, and .add/.min/.max on 16-bit floats in two, four or
+        // eight, or on packed pairs in two or four words. Each 32-bit word is
+        // its own atomic; nothing makes the whole vector one.
+        const std::string what = op0 + ".v" + std::to_string(vec);
+        if (b128) return unsupported(what + ".b128");
+        if (!explicit_global) return unsupported(what + " outside .global");
+        if (*aop != AtomOp::Add && *aop != AtomOp::Min && *aop != AtomOp::Max)
+          return unsupported(what + " defined for .add, .min and .max only");
+        const bool f32v = ty.kind == Type::Kind::F && ty.bits == 32;
+        const bool halfv = (ty.kind == Type::Kind::F || ty.kind == Type::Kind::BF) && ty.bits == 16;
+        if (!f32v && !halfv) return unsupported(what + " on a type other than .f32, .f16, .bf16, .f16x2, .bf16x2");
+        if (f32v && (*aop != AtomOp::Add || vec == 8))
+          return unsupported(what + ".f32 (only .add in .v2 and .v4)");
+        if (packed_half && vec == 8) return unsupported(what + " on a packed type (.v2 and .v4 only)");
+        const std::string arch = target_.substr(0, target_.find(','));
+        int sm = 0;
+        std::sscanf(arch.c_str(), "sm_%d", &sm);
+        if (sm < 90)
+          fail(ins.line, what + " requires sm_90 or later; this module targets " +
+                             (arch.empty() ? std::string("nothing") : arch));
+      }
       if (b128) {
         // .b128 (PTX ISA 8.3, sm_90): .exch and .cas only.
         if (*aop != AtomOp::Exch && *aop != AtomOp::Cas)
@@ -4087,8 +4115,10 @@ class Parser {
             *aop != AtomOp::Max)
           return unsupported("atom." + std::string(*aop == AtomOp::Cas ? "cas" : "bitwise") +
                              " on a float type (CUDA has no such instruction; use .b32)");
-        if (ty.bits == 16 && *aop != AtomOp::Add)
-          return unsupported("only atom.add is defined for f16/bf16");
+        if (ty.bits == 16 && *aop != AtomOp::Add && vec == 1)
+          return unsupported("only atom.add is defined for f16/bf16 without a vector form");
+        if (ty.bits == 16 && *aop != AtomOp::Add && vec > 1 && *aop != AtomOp::Min && *aop != AtomOp::Max)
+          return unsupported("vector atom on f16/bf16 is .add, .min or .max");
         if (ty.bits != 16 && ty.bits != 32 && ty.bits != 64)
           return unsupported("float atomics are implemented for f16, bf16, f32 and f64");
       }
@@ -4102,7 +4132,18 @@ class Parser {
       op.discards_result = discards;
       op.packed_half = packed_half;
       op.b128 = b128;
-      if (b128) {
+      op.vec = vec;
+      if (vec > 1) {
+        if (!discards) {
+          op.dsts = parse_reg_vector(vec);
+          expect_punct(",");
+        }
+        op.addr = parse_addr(fn);
+        if (op.addr.base_kind == Addr::Base::CallSlot || op.addr.base_kind == Addr::Base::EntryParam)
+          return unsupported("atom through a parameter/slot name");
+        expect_punct(",");
+        op.srcs = parse_operand_vector(vec);
+      } else if (b128) {
         const auto [lo, hi] = b128_halves("atom.b128 destination");
         op.dst = lo;
         op.dst_hi = hi;
@@ -4134,6 +4175,12 @@ class Parser {
           expect_punct(",");
           op.c = parse_operand();
         }
+      }
+      // A trailing cache policy (.L2::cache_hint, which the splitter drops):
+      // a hint, read by nothing.
+      if (peek_punct(",")) {
+        next();
+        (void)parse_operand();
       }
       ins.op = op;
     } else if (op0 == "add" || op0 == "sub" || op0 == "mul" || op0 == "min" || op0 == "max" ||

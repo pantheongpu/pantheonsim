@@ -7,5 +7,4 @@ capture and replay: convolution (cuDNN) and linear (cuBLAS)	stream capture: "ope
 a training step captured whole (forward, backward, SGD with momentum) and replayed	stream capture: same capture error as the cuDNN/cuBLAS capture check
 Adam with capturable=True inside a graph	stream capture: same capture error as the cuDNN/cuBLAS capture check
 make_graphed_callables: forward and backward graphs	stream capture: same capture error as the cuDNN/cuBLAS capture check
-torch.compile: gather, scatter_add and index_select	[sim-error] Inductor kernel fails to load: cuModuleLoadData reports unsupported PTX (the PTX feature is not named in the log) and the driver call answers "operation not supported"
 torch.compile: mode="reduce-overhead" (CUDA graphs under Inductor)	numeric: 1.2 scaled difference; reduce-overhead replays a captured CUDA graph, probably the same capture gap as the graphs group

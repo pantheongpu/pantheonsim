@@ -10288,7 +10288,69 @@ class Interpreter {
     write_reg(w, op.dst, m, r, 32);
   }
 
+  // atom/red .v2/.v4/.v8 (sm_90): the vector is a run of 32-bit words, aligned to
+  // its whole size, each updated by its own atomic read-modify-write (the ISA
+  // makes no promise about the vector as a whole). A .f32 element is a word, a
+  // packed .f16x2/.bf16x2 element is a word, and two .f16/.bf16 elements share
+  // one: register 2i is its low half and 2i+1 its high.
+  void exec_atom_vec(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    const bool wide = op.ty.bits == 32 || op.packed_half;   // one register per word
+    const uint32_t nwords = wide ? op.vec : op.vec / 2u;
+    const uint32_t bytes = nwords * 4u;
+    const int kind = op.ty.bits == 32 ? 0 : op.ty.is_bfloat() ? 2 : 1;
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    std::vector<Lanes> bs(op.vec);
+    for (uint32_t i = 0; i < op.vec; ++i) {
+      Lanes tmp;
+      bs[i] = read_operand(w, ctx, ins, op.srcs[i], tmp);
+    }
+    std::vector<Lanes> rs(op.vec);
+    const uint64_t sbase = space_base(op.space);
+    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      if (addr % bytes)
+        ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                 "a vector atomic of " + std::to_string(bytes) + " bytes at an address not aligned to them");
+      for (uint32_t j = 0; j < nwords; ++j) {
+        const uint64_t wa = addr + 4ull * j;
+        const uint32_t bw = wide ? static_cast<uint32_t>(bs[j][lane])
+                                 : (static_cast<uint32_t>(bs[2 * j][lane]) & 0xffffu) |
+                                       (static_cast<uint32_t>(bs[2 * j + 1][lane]) << 16);
+        std::unique_lock<std::mutex> guard;
+        if (lock_needed) guard = std::unique_lock<std::mutex>(atomic_lock_for(wa));
+        ++stats_.atomics;
+        stats_.atomic_bytes += 4;
+        const auto compute = [&](const uint64_t old) -> uint64_t {
+          return exec::atom_word(op.op, kind, static_cast<uint32_t>(old), bw);
+        };
+        uint64_t old;
+        uint8_t* host = !is_shared(wa) && !is_local(wa) ? mem_.host_address(wa, 4) : nullptr;
+        if (host && reinterpret_cast<uintptr_t>(host) % 4 == 0) {
+          old = vgpu::exec::host_atomic_rmw(host, 4, compute);
+        } else {
+          old = load_routed(w, ctx, ins, lane, wa, 4);
+          store_routed(w, ctx, ins, lane, wa, 4, compute(old));
+        }
+        if (wide) {
+          rs[j][lane] = old;
+        } else {
+          rs[2 * j][lane] = old & 0xffffu;
+          rs[2 * j + 1][lane] = (old >> 16) & 0xffffu;
+        }
+      }
+    }
+    if (!op.discards_result)
+      for (uint32_t i = 0; i < op.vec; ++i) write_reg(w, op.dsts[i], m, rs[i], wide ? 32u : 16u);
+  }
+
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    if (op.vec > 1) {
+      exec_atom_vec(w, ctx, ins, op, m);
+      return;
+    }
     if (op.b128) {
       exec_atom128(w, ctx, ins, op, m);
       return;
@@ -12371,6 +12433,17 @@ uint64_t reduce_value(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
     case AtomOp::Dec: return (old == 0 || old > b) ? b : old - 1;
     default: return b;
   }
+}
+uint32_t atom_word(AtomOp op, int kind, uint32_t old, uint32_t b) {
+  if (kind == 0) {
+    const auto ftz = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+    const float r = ftz(ftz(std::bit_cast<float>(old)) + ftz(std::bit_cast<float>(b)));
+    return std::isnan(r) ? 0x7fffffffu : std::bit_cast<uint32_t>(r);
+  }
+  const Type ht{kind == 2 ? Type::Kind::BF : Type::Kind::F, 16};
+  const uint32_t lo = static_cast<uint32_t>(reduce_value(op, ht, old & 0xffff, b & 0xffff));
+  const uint32_t hi = static_cast<uint32_t>(reduce_value(op, ht, old >> 16, b >> 16));
+  return (lo & 0xffff) | (hi << 16);
 }
 std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
   using K = Type::Kind;
