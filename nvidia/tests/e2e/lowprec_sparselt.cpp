@@ -13,6 +13,7 @@
 // machine and are not compared. PROBE_DUMP=<dir> dumps each case's data.
 #include <cuda_runtime_api.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -33,7 +34,7 @@ constexpr int S_NONE = 0, S_SCALAR = 1, S_V32 = 2, S_V64 = 3;
 struct Spec {
   std::string name;
   int ab = CUDA_R_16F, cd = CUDA_R_16F, compute = CUSPARSE_COMPUTE_32F;
-  cusparseOperation_t opA = N, opB = N;
+  cusparseOperation_t opA = N, opB = T;   // row-major, both contiguous along K: the layout the 8-bit types take
   cusparseOrder_t oA = ROW, oB = ROW, oC = ROW;
   int m = 64, n = 64, k = 64, batches = 1;
   bool sparseB = false;
@@ -106,7 +107,7 @@ void run(const Spec& s) {
       const uint32_t r = mix((uint32_t)i * 40503u + salt);
       if (mode == S_V32) { static const uint8_t t[4] = {0x30, 0x38, 0x40, 0x28}; b[i] = t[r & 3]; }
       else if (mode == S_V64) { static const uint8_t t[4] = {126, 127, 128, 125}; b[i] = t[r & 3]; }
-      else if (i % 4 == 0) { float v = mode == S_SCALAR ? (salt == 21 ? 2.f : salt == 22 ? 0.5f : salt == 24 ? 4.f : 1.f) : f[r & 3]; std::memcpy(&b[i], &v, 4); }
+      else if (i % 4 == 0) { float v = mode == S_SCALAR ? (salt == 21 ? 2.f : salt == 22 ? 0.25f : salt == 24 ? 4.f : 1.f) : f[r & 3]; std::memcpy(&b[i], &v, 4); }
     }
     d.put(b);
   };
@@ -168,26 +169,64 @@ void run(const Spec& s) {
   ws.fill(wsz, 0);
   line += " ws=" + num(wst) + ":" + std::to_string(wsz);
   const float alpha = s.alpha, beta = s.beta;
+  // With alpha-vector scaling the alpha argument is a device vector of m floats (0.5, 1, 1.5, 2 ... cycling).
+  if (s.alpha_vec) {
+    std::vector<uint8_t> v((size_t)m * 4 + 64, 0);
+    for (int64_t i = 0; i < m; ++i) { const float f = 0.5f * (float)(1 + i % 4); std::memcpy(&v[(size_t)i * 4], &f, 4); }
+    dAv.put(v);
+  }
+  const void* alpha_arg = s.alpha_vec ? dAv.p : (const void*)&alpha;
   const void* opA = s.sparseB ? dA.p : comp.p;
   const void* opB = s.sparseB ? comp.p : dB.p;
   int mm;
-  if (s.search) mm = cusparseLtMatmulSearch(&g_h, &plan, &alpha, opA, opB, &beta, dC.p, dD.p, ws.p, nullptr, 0);
-  else mm = cusparseLtMatmul(&g_h, &plan, &alpha, opA, opB, &beta, dC.p, dD.p, ws.p, nullptr, 0);
+  if (s.search) mm = cusparseLtMatmulSearch(&g_h, &plan, alpha_arg, opA, opB, &beta, dC.p, dD.p, ws.p, nullptr, 0);
+  else mm = cusparseLtMatmul(&g_h, &plan, alpha_arg, opA, opB, &beta, dC.p, dD.p, ws.p, nullptr, 0);
   const cudaError_t sync = cudaDeviceSynchronize();
   line += " mm=" + num(mm);
   if (sync != cudaSuccess) line += " rt=" + num((int)sync);
+  // The compressed buffer's layout is NVIDIA's own and measured only for the shapes the library's
+  // tests (sparselt_paths.cpp) cover, so only its size is compared; PROBE_DUMP keeps the bytes.
   if (cp == 0 && cs) {
     const auto c = comp.get();
-    char buf[48];
-    std::snprintf(buf, sizeof buf, " c=%016llx", (unsigned long long)fnv(c.data(), c.size()));
-    line += buf;
     dump(s.name, "comp", c.data(), c.size());
   }
   if (mm == 0) {
     const auto d = dD.get();
     char buf[48];
-    std::snprintf(buf, sizeof buf, " d=%016llx", (unsigned long long)fnv(d.data(), d.size()));
-    line += buf;
+    if (s.gelu && s.cd != CUDA_R_8I) {
+      // GELU is approximated differently on each GPU (and by VirtualGPU), so it is not hashed: the same product
+      // is run again without it and D must be the GELU (scaled) of that product, within a tolerance.
+      cusparseLtMatmulDescriptor_t md2 = md;
+      const int zero = 0;
+      cusparseLtMatmulDescSetAttribute(&g_h, &md2, CUSPARSELT_MATMUL_ACTIVATION_GELU, &zero, 4);
+      cusparseLtMatmulAlgSelection_t alg2;
+      cusparseLtMatmulPlan_t plan2;
+      std::string verdict = "na";
+      const bool checkable = bad.find("gelu") == std::string::npos && (s.cd == CUDA_R_16F || s.cd == CUDA_R_16BF || s.cd == CUDA_R_32F);
+      if (checkable && !cusparseLtMatmulAlgSelectionInit(&g_h, &alg2, &md2, CUSPARSELT_MATMUL_ALG_DEFAULT) &&
+          !cusparseLtMatmulPlanInit(&g_h, &plan2, &md2, &alg2)) {
+        Dev d2;
+        d2.fill(bytes_of(s.cd, (size_t)szC * nb), 0);
+        if (!cusparseLtMatmul(&g_h, &plan2, alpha_arg, opA, opB, &beta, dC.p, d2.p, ws.p, nullptr, 0) && cudaDeviceSynchronize() == cudaSuccess) {
+          const auto x = d2.get();
+          verdict = "ok";
+          for (int64_t i = 0; i < m && verdict == "ok"; ++i)
+            for (int64_t j = 0; j < n; ++j) {
+              const size_t off = (size_t)(s.oC == ROW ? i * ldc + j : j * ldc + i);
+              const double v = dec_elem(s.cd, x.data(), off), got = dec_elem(s.cd, d.data(), off);
+              const double ref = (double)s.gelu_scale * 0.5 * v * (1 + std::tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)));
+              const double rel = s.cd == CUDA_R_32F ? 1e-3 : 0.03;
+              if (!(std::fabs(got - ref) <= rel * (std::fabs(ref) + 0.25 * std::fabs(v)) + (s.cd == CUDA_R_8I ? 1.01 : 1e-3))) { verdict = "BAD"; break; }
+            }
+        }
+        cusparseLtMatmulPlanDestroy(&plan2);
+        cusparseLtMatmulAlgSelectionDestroy(&alg2);
+      }
+      line += " gelu=" + verdict;
+    } else {
+      std::snprintf(buf, sizeof buf, " d=%016llx", (unsigned long long)fnv(d.data(), d.size()));
+      line += buf;
+    }
     dump(s.name, "d", d.data(), d.size());
     dump(s.name, "a", dA.get().data(), dA.n);
     dump(s.name, "b", dB.get().data(), dB.n);

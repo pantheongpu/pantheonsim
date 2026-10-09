@@ -165,6 +165,11 @@ int type_bits(int t) {
   }
 }
 size_t type_bytes(int t) { return (size_t)type_bits(t) / 8; }
+// The 8-bit types share one compressed layout and one set of descriptor rules (measured: an L4 compresses
+// E4M3 and E5M2 exactly as it does int8, and its descriptor checks treat E2M1 like them).
+bool is_fp8(int t) { return t == kR8F_E4M3 || t == kR8F_E5M2; }
+bool is8(int t) { return t == CUDA_R_8I || is_fp8(t); }
+
 // Measured: a descriptor takes these value types, and refuses fp64, complex
 // and unsigned with INVALID_VALUE. FP8 and FP4 descriptors are accepted; the
 // matmul descriptor is what refuses them on sm_86.
@@ -262,6 +267,42 @@ float tf32_truncate_bits(uint32_t x) {
   return f;
 }
 
+// FP8 by the formats' definitions (OCP E4M3 has no infinity and one NaN; E5M2 is a truncated half).
+float fp8_to_float(uint8_t b, bool e4m3) {
+  const int ebits = e4m3 ? 4 : 5, mbits = e4m3 ? 3 : 2, bias = e4m3 ? 7 : 15;
+  const int e = (b >> mbits) & ((1 << ebits) - 1), m = b & ((1 << mbits) - 1);
+  float v;
+  if (e4m3 && e == 15 && m == 7) v = NAN;
+  else if (!e4m3 && e == 31) v = m ? NAN : INFINITY;
+  else if (e == 0) v = std::ldexp((float)m, 1 - bias - mbits);
+  else v = std::ldexp((float)(m | (1 << mbits)), e - bias - mbits);
+  return (b & 0x80) ? -v : v;
+}
+// Round to nearest even, saturating to the largest finite value (448, 57344), NaN to the canonical NaN.
+uint8_t float_to_fp8(float f, bool e4m3) {
+  const int mbits = e4m3 ? 3 : 2, bias = e4m3 ? 7 : 15;
+  const double maxv = e4m3 ? 448.0 : 57344.0;
+  if (std::isnan(f)) return 0x7f;
+  const uint8_t sign = std::signbit(f) ? 0x80 : 0;
+  const double a = std::fabs((double)f);
+  const uint8_t maxcode = e4m3 ? 0x7e : 0x7b;
+  if (a >= maxv) return sign | maxcode;
+  int e;
+  std::frexp(a, &e);
+  int exp = e - 1;
+  const int emin = 1 - bias;
+  if (exp < emin) exp = emin;
+  const double quantum = std::ldexp(1.0, exp - mbits);
+  const double r = std::nearbyint(a / quantum) * quantum;
+  if (r >= maxv) return sign | maxcode;
+  if (r == 0) return sign;
+  int re;
+  std::frexp(r, &re);
+  const int rexp = re - 1;
+  if (rexp < emin) return sign | (uint8_t)(int)(r / std::ldexp(1.0, emin - mbits));
+  return sign | (uint8_t)(((rexp + bias) << mbits) | ((int)(r / std::ldexp(1.0, rexp - mbits)) - (1 << mbits)));
+}
+
 // One element at a byte address, as float (int8/int32 exactly representable
 // in the ranges that matter, and kept as integers where it counts).
 float load(const uint8_t* p, int t) {
@@ -271,6 +312,7 @@ float load(const uint8_t* p, int t) {
     case CUDA_R_16F: { uint16_t h; std::memcpy(&h, p, 2); return half_to_float(h); }
     case CUDA_R_16BF: { uint16_t h; std::memcpy(&h, p, 2); return bf16_to_float(h); }
     case CUDA_R_8I: return (float)(int8_t)*p;
+    case kR8F_E4M3: case kR8F_E5M2: return fp8_to_float(*p, t == kR8F_E4M3);
     default: return 0.f;
   }
 }
@@ -282,6 +324,7 @@ void store(uint8_t* p, int t, float v) {
     case CUDA_R_32F: std::memcpy(p, &v, 4); break;
     case CUDA_R_16F: { const uint16_t h = float_to_half(v); std::memcpy(p, &h, 2); break; }
     case CUDA_R_16BF: { const uint16_t h = float_to_bf16(v); std::memcpy(p, &h, 2); break; }
+    case kR8F_E4M3: case kR8F_E5M2: *p = float_to_fp8(v, t == kR8F_E4M3); break;
     case CUDA_R_8I: {
       float r = std::isnan(v) ? 0.f : std::nearbyint(v);
       r = std::min(127.f, std::max(-128.f, r));
@@ -401,7 +444,7 @@ size_t meta_bytes(int t, int64_t nk, int64_t k) {
   switch (t) {
     case CUDA_R_16F: case CUDA_R_16BF:
       return (size_t)std::max(round_up(nk, 32) * round_up(k, 64), round_up(nk, 64) * round_up(k, 32)) / 8;
-    case CUDA_R_8I: return (size_t)(round_up(nk, 64) * round_up(k, 128) / 4);
+    case CUDA_R_8I: case kR8F_E4M3: case kR8F_E5M2: return (size_t)(round_up(nk, 64) * round_up(k, 128) / 4);
     case CUDA_R_32F:
       return (size_t)std::max(round_up(nk, 16) * round_up(k, 64), round_up(nk, 64) * round_up(k, 16)) / 2;
     default: return 0;
@@ -410,13 +453,13 @@ size_t meta_bytes(int t, int64_t nk, int64_t k) {
 size_t buffer_bytes(int t, int64_t nk, int64_t k) {
   switch (t) {
     case CUDA_R_16F: case CUDA_R_16BF: return meta_bytes(t, nk, k);
-    case CUDA_R_8I: return meta_bytes(t, nk, k) / 2;
+    case CUDA_R_8I: case kR8F_E4M3: case kR8F_E5M2: return meta_bytes(t, nk, k) / 2;
     case CUDA_R_32F: return meta_bytes(t, nk, k) / 2;
     default: return 0;
   }
 }
 bool compressible_type(int t) {
-  return t == CUDA_R_16F || t == CUDA_R_16BF || t == CUDA_R_8I || t == CUDA_R_32F;
+  return t == CUDA_R_16F || t == CUDA_R_16BF || is8(t) || t == CUDA_R_32F;
 }
 size_t values_bytes(int t, int64_t nk, int64_t k) { return (size_t)(nk * (k / 2)) * type_bytes(t); }
 // One batch's compressed bytes for a structured descriptor, which does not
@@ -472,7 +515,7 @@ struct MetaCodec {
   // fp32: the plain copy fills the first half, the blocked copy the second.
   size_t index(int64_t r, int64_t g, int copy) const {
     if (plain) return (size_t)(r * (t == CUDA_R_32F ? k / 2 : k / 4) + g) + (copy ? bytes : 0);
-    if (t == CUDA_R_8I) return nibble8(r, g, nk);
+    if (is8(t)) return nibble8(r, g, nk);
     if (t == CUDA_R_32F) return copy == 0 ? (size_t)(r * (k / 2) + g) : bytes + nibble16(r, g, nk);
     return nibble16(r, g, nk);
   }
@@ -732,12 +775,25 @@ bool k_contiguous_dense(const MatImpl& m, bool isA, int op) {
   return k_along_cols == (m.order == CUSPARSE_ORDER_ROW);
 }
 
+int sm_of_current_device();
+
 // NOT_SUPPORTED reasons at MatmulDescriptorInit, empty when supported.
 std::string unsupported_combination(const MatmulImpl& d) {
   const int ab = d.A.type, cd = d.C.type;
   if (d.A.type != d.B.type) return "A and B of different types";
-  if (ab == kR8F_E4M3 || ab == kR8F_E5M2 || ab == kR4F_E2M1)
-    return "FP8 and FP4 inputs (sm_89 and later on NVIDIA's library; not simulated)";
+  if (is_fp8(ab) || ab == kR4F_E2M1) {
+    // Measured on an L4 (sm_89) and an RTX 3060 (sm_86), cuSPARSELt 0.10: FP32 compute into fp16, bf16 or
+    // fp32, with both operands contiguous along K; no FP8 or FP4 output, no other compute type; for E2M1
+    // also K a multiple of 128. (These GPUs accept the descriptor and refuse at the algorithm selection;
+    // see there.)
+    if (d.compute != CUSPARSE_COMPUTE_32F) return "FP8 or FP4 with a compute type other than fp32";
+    if (cd != CUDA_R_16F && cd != CUDA_R_16BF && cd != CUDA_R_32F) return "FP8 or FP4 into this output type";
+    if (!k_contiguous_dense(d.A, true, d.opA) || !k_contiguous_dense(d.B, false, d.opB))
+      return "FP8 or FP4 operands that are not both contiguous along K (NVIDIA's library takes only that layout)";
+    const int64_t k = d.opA == CUSPARSE_OPERATION_NON_TRANSPOSE ? d.A.cols : d.A.rows;
+    if (ab == kR4F_E2M1 && k % 128) return "FP4 with K not a multiple of 128";
+    return "";
+  }
   if (ab == CUDA_R_16F && cd == CUDA_R_16F && (d.compute == CUSPARSE_COMPUTE_32F || d.compute == CUSPARSE_COMPUTE_16F))
     return "";
   if (ab == CUDA_R_16BF && cd == CUDA_R_16BF && d.compute == CUSPARSE_COMPUTE_32F) return "";
@@ -774,7 +830,7 @@ Status init_descriptor(const char* api, const cusparseLtHandle_t* handle, cuspar
   // Measured: rows, cols and ld must each be a multiple of 16 bytes' worth of
   // elements (32 bytes' for a structured matrix), the alignment a positive
   // multiple of 16; NOT_SUPPORTED otherwise.
-  const int64_t mult = (structured ? 256 : 128) / type_bits(type);
+  const int64_t mult = (structured ? 256 : 128) / (type == kR4F_E2M1 ? 8 : type_bits(type));   // measured: E2M1 as the 8-bit types
   if (rows % mult || cols % mult || ld % mult)
     return refuse(api, "rows, columns and leading dimension must be multiples of " + std::to_string(mult) +
                            " for this type");
@@ -819,12 +875,11 @@ Status check_size(const char* api, size_t got, size_t want, const char* ctype) {
 // fp32), at least 256 bytes for 16-bit, 512 for fp32 and 1024 for int8. The
 // simulator uses none of it.
 size_t workspace_bytes(const MatmulImpl& d) {
-  const int64_t mn = d.C.rows * d.C.cols;
-  switch (d.A.type) {
-    case CUDA_R_32F: return (size_t)std::max<int64_t>(mn / 4, 512);
-    case CUDA_R_8I: return (size_t)std::max<int64_t>(mn / 8, 1024);
-    default: return (size_t)std::max<int64_t>(mn / 8, 256);
-  }
+  // Measured on an RTX 3060 and an L4 over 280 shapes in fp16, int8 and FP8: the plan asks for exactly the
+  // compression buffer of its structured operand (which for the square shapes measured earlier is an eighth of a
+  // byte per output element, a quarter for fp32). The simulator uses none of it.
+  const MatImpl& S = d.A.structured ? d.A : d.B;
+  return buffer_bytes(S.type, lines(S), line_length(S)) * (size_t)compressed_batches(S);
 }
 
 
@@ -1348,7 +1403,8 @@ cusparseStatus_t cusparseLtMatmulDescSetAttribute(const cusparseLtHandle_t* hand
     std::memcpy(&out, data, sizeof(void*));
     return CUSPARSE_STATUS_SUCCESS;
   };
-  const bool gelu_ok = d->A.type == CUDA_R_8I && d->C.type == CUDA_R_8I;
+  // Measured on an L4: GELU takes int8 into int8, and E4M3 or E5M2 into bf16 (no other output, no fp16 or fp32).
+  const bool gelu_ok = (d->A.type == CUDA_R_8I && d->C.type == CUDA_R_8I) || (is_fp8(d->A.type) && d->C.type == CUDA_R_16BF);
   int32_t iv = 0;
   switch (a) {
     case CUSPARSELT_MATMUL_ACTIVATION_RELU:
@@ -1454,7 +1510,15 @@ cusparseStatus_t cusparseLtMatmulAlgSelectionInit(const cusparseLtHandle_t* hand
   // Measured: a scale mode set on an fp16 product is accepted here and by
   // the plan; the scaling modes belong to FP8/FP4, which the matmul
   // descriptor has already refused, and this library ignores them.
-  if (d->compute == CUSPARSE_COMPUTE_16F) return refuse(api, "fp16 compute (NVIDIA's library has no sm_86 kernel for it)");
+  if (d->compute == CUSPARSE_COMPUTE_16F) return refuse(api, "fp16 compute (NVIDIA's library has no sm_86 or sm_89 kernel for it)");
+  // Measured: FP8 kernels start at sm_89 (an RTX 3060 takes the descriptor and refuses here), and a block
+  // scale mode (VEC32/VEC64) is refused here on sm_86 and sm_89 whatever the type.
+  const int sm = sm_of_current_device();
+  if (is_fp8(d->A.type) && sm > 0 && sm < 89) return refuse(api, "FP8 kernels (sm_89 and later)");
+  if (d->A.type == kR4F_E2M1 && sm > 0 && sm < 100) return refuse(api, "FP4 kernels (Blackwell: sm_100 and later)");
+  for (int i = 0; i < 5; ++i)
+    if (d->scale_mode[i] == CUSPARSELT_MATMUL_MATRIX_SCALE_VEC32_UE4M3 || d->scale_mode[i] == CUSPARSELT_MATMUL_MATRIX_SCALE_VEC64_UE8M0)
+      return refuse(api, "block-scaled matmuls (not implemented here; sm_86 and sm_89 refuse them too)");
   std::memset(algSelection, 0, sizeof *algSelection);
   AlgImpl* a = impl<AlgImpl>(algSelection);
   a->magic = kAlgMagic;

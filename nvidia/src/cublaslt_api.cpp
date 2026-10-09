@@ -62,6 +62,9 @@ constexpr int kDOutScalePointer = 36, kDOutScaleMode = 37;
 // The block-scaled modes (cublasLtMatmulMatrixScale_t, CUDA 12.8) and the
 // narrow types they come with (library_types.h, CUDA 12.8).
 constexpr int32_t kScaleVec16UE4M3 = 1, kScaleVec32UE8M0 = 2, kScaleVec128 = 4, kScaleBlk128x128 = 5;
+// Newer than CUDA 13.2's header: one scalar per batch (13.2, experimental) and the UE8M0 modes whose scales are
+// packed four to a 32-bit word along K (cuBLAS 13.8's header), 128 or 32 elements to a scale.
+constexpr int32_t kScalePerBatch = 6, kScaleMnK4_128 = 12, kScaleMnK4_32 = 13;
 constexpr int kTypeUE8M0 = 30, kTypeFP4 = 33;
 
 struct MatmulDesc {
@@ -702,18 +705,23 @@ struct Scales {
   int mode = kScaleScalar;
   std::vector<uint8_t> bytes;    // the tiled forms
   std::vector<double> values;    // the 32F forms (one value for a scalar)
-  size_t inner_blocks = 0, outer = 0;
+  size_t inner_blocks = 0, outer = 0, outer_pad = 0;
   int block = 1;
   // The multiplier for the element at (outer index o, inner index k).
   double at(size_t o, size_t k) const {
     switch (mode) {
-      case kScaleScalar: return values.empty() ? 1.0 : values[0];
+      case kScaleScalar: case kScalePerBatch: return values.empty() ? 1.0 : values[0];
       case kScaleOuterVec: return values[o];
       case kScaleVec16UE4M3:
       case kScaleVec32UE8M0: {
         const size_t b = k / block, dim = (inner_blocks + 3) / 4 * 4;
         const size_t off = ((b / 4) * 4 + (o / 128) * dim) * 128 + (o % 32) * 16 + (o % 128 / 32) * 4 + b % 4;
         return mode == kScaleVec16UE4M3 ? from_ue4m3(bytes[off]) : from_ue8m0(bytes[off]);
+      }
+      case kScaleMnK4_128:
+      case kScaleMnK4_32: {   // a column-major (outer rounded up to 4) x ceil(K / 4 blocks) matrix of words of four exponents
+        const size_t b = k / block;
+        return from_ue8m0(bytes[((b / 4) * outer_pad + o) * 4 + b % 4]);
       }
       case kScaleVec128: return values[o + (k / 128) * outer];
       default: return values[(k / 128) + (o / 128) * ((inner_blocks + 3) / 4 * 4)];   // kScaleBlk128x128
@@ -722,18 +730,42 @@ struct Scales {
 };
 size_t tiled_bytes(size_t outer, size_t inner_blocks) { return (outer + 127) / 128 * 128 * ((inner_blocks + 3) / 4 * 4); }
 
-Scales load_scales(const void* p, int mode, size_t outer, size_t inner) {
+// The bytes one scale tensor of this mode takes for `outer` rows and `inner` elements along its blocks; the
+// next batch's tensor follows it (documentation-derived: a batched matmul of block-scaled operands has one
+// scale tensor per batch, back to back).
+size_t scale_tensor_bytes(int mode, size_t outer, size_t inner) {
+  switch (mode) {
+    case kScaleVec16UE4M3: return tiled_bytes(outer, (inner + 15) / 16);
+    case kScaleVec32UE8M0: return tiled_bytes(outer, (inner + 31) / 32);
+    case kScaleMnK4_128: return (outer + 3) / 4 * 4 * ((inner + 511) / 512) * 4;
+    case kScaleMnK4_32: return (outer + 3) / 4 * 4 * ((inner + 127) / 128) * 4;
+    case kScaleVec128: return outer * ((inner + 127) / 128) * 4;
+    case kScaleBlk128x128: return (((inner + 127) / 128 + 3) / 4 * 4) * ((outer + 127) / 128) * 4;
+    case kScalePerBatch: return 4;
+    default: return 0;   // scalar and outer-vector scales are shared by every batch
+  }
+}
+
+Scales load_scales(const void* p, int mode, size_t outer, size_t inner, int batch_index = 0) {
   Scales s;
   s.mode = mode;
   s.outer = outer;
+  if (p) p = static_cast<const uint8_t*>(p) + (size_t)batch_index * scale_tensor_bytes(mode, outer, inner);
   switch (mode) {
-    case kScaleScalar: s.values = p ? read_as_double(p, 1, CUDA_R_32F) : std::vector<double>{1.0}; break;
+    case kScaleScalar: case kScalePerBatch: s.values = p ? read_as_double(p, 1, CUDA_R_32F) : std::vector<double>{1.0}; break;
     case kScaleOuterVec: s.values = p ? read_as_double(p, outer, CUDA_R_32F) : std::vector<double>(outer, 1.0); break;
     case kScaleVec16UE4M3:
     case kScaleVec32UE8M0:
       s.block = mode == kScaleVec16UE4M3 ? 16 : 32;
       s.inner_blocks = (inner + s.block - 1) / s.block;
       s.bytes.assign(tiled_bytes(outer, s.inner_blocks), 0);
+      if (p) cudaMemcpy(s.bytes.data(), p, s.bytes.size(), cudaMemcpyDeviceToHost);
+      break;
+    case kScaleMnK4_128:
+    case kScaleMnK4_32:
+      s.block = mode == kScaleMnK4_128 ? 128 : 32;
+      s.outer_pad = (outer + 3) / 4 * 4;
+      s.bytes.assign(scale_tensor_bytes(mode, outer, inner), 0);
       if (p) cudaMemcpy(s.bytes.data(), p, s.bytes.size(), cudaMemcpyDeviceToHost);
       break;
     case kScaleVec128:
@@ -760,7 +792,7 @@ Scales load_scales(const void* p, int mode, size_t outer, size_t inner) {
 //     scale (D_SCALE_POINTER); S = e4m3(amax / 6), and each value is
 //     multiplied by 1 / S and rounded to E2M1.
 void quantize_column(Elems& d, const MatrixLayout& l, int64_t j, const std::vector<double>& col, int mode,
-                     std::vector<uint8_t>& out_scales, size_t m) {
+                     std::vector<uint8_t>& out_scales, size_t m, size_t out_base = 0) {
   const int block = mode == kScaleVec16UE4M3 ? 16 : 32;
   const size_t blocks = (m + block - 1) / block, dim = (blocks + 3) / 4 * 4;
   const double dmax = is_fp4(d.t) ? 6.0 : d.t == CUDA_R_8F_E4M3 ? 448.0 : 57344.0;
@@ -785,7 +817,7 @@ void quantize_column(Elems& d, const MatrixLayout& l, int64_t j, const std::vect
     }
     const size_t off = ((b / 4) * 4 + ((size_t)j / 128) * dim) * 128 + ((size_t)j % 32) * 16 + ((size_t)j % 128 / 32) * 4 +
                        b % 4;
-    if (off < out_scales.size()) out_scales[off] = code;
+    if (out_base + off < out_scales.size()) out_scales[out_base + off] = code;
     const double r = scale > 0 && std::isfinite(scale) ? 1.0 / (float)scale : 0.0;
     for (size_t i = b * block; i < std::min(m, (b + 1) * block); ++i) d.set(at(l, (int64_t)i, j), col[i] * r);
   }
@@ -881,8 +913,10 @@ int device_cc() {
 
 // The scale-mode families the card keeps apart: modes of different families cannot be A's and B's.
 // -1: a mode the library does not know.
-int scale_family(int mode) {
+int scale_family(int mode, int cc) {
   switch (mode) {
+    case kScaleMnK4_128: return cc >= 100 ? 5 : -1;   // cuBLAS 13.8's UE8M0 modes: Blackwell's block-scaled kernels
+    case kScaleMnK4_32: return cc >= 100 ? 6 : -1;
     case kScaleScalar: return 0;
     case kScaleVec16UE4M3: return 1;
     case kScaleVec32UE8M0: return 2;
@@ -913,17 +947,21 @@ cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout&
   if (aux && md.aux_type >= 0) {
     if (relu) return CUBLAS_STATUS_INVALID_VALUE;   // the mask has no type to choose
     const int allowed = is_fp8(dt) ? CUDA_R_16BF : dt;
-    if (md.aux_type != allowed) return CUBLAS_STATUS_INVALID_VALUE;
+    // From sm_90 an E4M3 output's auxiliary buffer may also be E4M3 or fp16 (cublasLt.h's description of
+    // EPILOGUE_AUX_DATA_TYPE; documentation-derived, an L4 and an RTX 3060 take only the types above).
+    const bool fp8_aux = cc >= 90 && dt == CUDA_R_8F_E4M3 && (md.aux_type == CUDA_R_8F_E4M3 || md.aux_type == CUDA_R_16F);
+    if (md.aux_type != allowed && !fp8_aux) return CUBLAS_STATUS_INVALID_VALUE;
   }
   if (lc.order != ld.order) return CUBLAS_STATUS_INVALID_VALUE;
-  const int fa = scale_family(md.a_scale_mode), fb = scale_family(md.b_scale_mode);
+  const int fa = scale_family(md.a_scale_mode, cc), fb = scale_family(md.b_scale_mode, cc);
   if (fa < 0 || fb < 0) return CUBLAS_STATUS_INVALID_VALUE;
   const bool compatible = fa == fb || ((fa == 0 || fa == 4) && (fb == 0 || fb == 4));
   if (!compatible) return CUBLAS_STATUS_INVALID_VALUE;
   if (is_fp4(at) && md.a_scale_mode != kScaleVec16UE4M3) return CUBLAS_STATUS_INVALID_VALUE;
   if (md.a_scale_mode == kScaleVec16UE4M3 && !is_fp4(at)) return CUBLAS_STATUS_INVALID_VALUE;
   if (md.a_scale_mode == kScaleVec32UE8M0 && !is_fp8(at)) return CUBLAS_STATUS_INVALID_VALUE;
-  if ((fa == 1 || fa == 2) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 1 || fa == 2 || fa == 5 || fa == 6) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 5 || fa == 6) && !is_fp8(at)) return CUBLAS_STATUS_INVALID_VALUE;
   if (is_fp4(dt) && md.d_out_scale_mode == kScaleVec32UE8M0) return CUBLAS_STATUS_INVALID_VALUE;
   if (dt == CUDA_R_8F_E4M3 && (fa == 2 || fa == 3) && md.d_out_scale_mode == kScaleScalar) return CUBLAS_STATUS_INVALID_VALUE;
   if ((fa == 1 || fa == 2) && aux) return CUBLAS_STATUS_INVALID_VALUE;
@@ -934,7 +972,16 @@ cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout&
 cublasStatus_t narrow_kernel_check(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb,
                                    const MatrixLayout& lc, const MatrixLayout& ld, int cc) {
   if (cc < 89) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (cc > 89) return CUBLAS_STATUS_SUCCESS;   // documentation-derived, below
+  if (cc > 89) {
+    // Hopper and later: documentation-derived, not checked against a card. The FP32-scale modes (outer
+    // vector, 128-element, 128x128) and the auxiliary scale and amax are Hopper's and later; the UE8M0 and
+    // UE4M3 block scales (MXFP8, NVFP4, and cuBLAS 13.8's packed forms) and FP4 are Blackwell's (cc 10.0 and up).
+    const int fa = scale_family(md.a_scale_mode, cc);
+    const bool blackwell = cc >= 100;
+    if ((fa == 1 || fa == 2 || fa == 5 || fa == 6) && !blackwell) return CUBLAS_STATUS_NOT_SUPPORTED;
+    if ((is_fp4(la.type) || is_fp4(lb.type) || is_fp4(ld.type)) && !blackwell) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return CUBLAS_STATUS_SUCCESS;
+  }
   const int at = la.type, bt = lb.type, ct = lc.type, dt = ld.type;
   auto e4 = [](int t) { return t == CUDA_R_8F_E4M3; };
   auto e5 = [](int t) { return t == CUDA_R_8F_E5M2; };
@@ -1012,25 +1059,32 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
   // none, the card's heuristic finds an algorithm and the matmul refuses.
   if (md.aux && ep.relu_aux() && (md.aux_ld <= 0 || md.aux_ld % 128 || md.aux_ld < m))
     return CUBLAS_STATUS_INVALID_VALUE;
+  // (Under an FP8 or block-scaled matmul the auxiliary type has its own rule, in narrow_descriptor_check.)
+  const bool narrow_path = narrow_involved(md, la, lb, lc, ld);
   if (md.aux && ep.gelu_aux() &&
-      (md.aux_ld <= 0 || md.aux_ld < m || (md.aux_type >= 0 && md.aux_type != (int32_t)ld.type)))
+      (md.aux_ld <= 0 || md.aux_ld < m || (!narrow_path && md.aux_type >= 0 && md.aux_type != (int32_t)ld.type)))
     return CUBLAS_STATUS_INVALID_VALUE;
   // The scaling modes (documentation-derived for the block forms).
   const int am = md.a_scale_mode, bm = md.b_scale_mode;
-  auto mode_ok = [](int x) { return x == kScaleScalar || x == kScaleOuterVec || block_mode(x) || hopper_mode(x); };
+  auto mnk4 = [](int x) { return x == kScaleMnK4_128 || x == kScaleMnK4_32; };
+  auto mode_ok = [&](int x) {
+    return x == kScaleScalar || x == kScaleOuterVec || x == kScalePerBatch || block_mode(x) || hopper_mode(x) || mnk4(x);
+  };
   if (!mode_ok(am) || !mode_ok(bm) || !(md.c_scale_mode == kScaleScalar || block_mode(md.c_scale_mode)) ||
-      md.d_scale_mode != kScaleScalar || !(md.d_out_scale_mode == kScaleScalar || block_mode(md.d_out_scale_mode)))
+      !(md.d_scale_mode == kScaleScalar || md.d_scale_mode == kScalePerBatch) ||
+      !(md.d_out_scale_mode == kScaleScalar || block_mode(md.d_out_scale_mode)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   if (block_mode(am) || block_mode(bm)) {
-    // FP4 with UE4M3 per 16, or FP8 with UE8M0 per 32; A and B alike.
+    // FP4 with UE4M3 per 16, or FP8 with UE8M0 per 32; A and B alike. One scale tensor per batch.
     if (am != bm) return CUBLAS_STATUS_NOT_SUPPORTED;
     const bool fp4 = am == kScaleVec16UE4M3;
     if (fp4 ? !(is_fp4(la.type) && is_fp4(lb.type)) : !(is_fp8(la.type) && is_fp8(lb.type)))
       return CUBLAS_STATUS_NOT_SUPPORTED;
-    if (ld.batch > 1) return CUBLAS_STATUS_NOT_SUPPORTED;   // per-batch scale tensors are not modelled
+  } else if (mnk4(am) || mnk4(bm)) {
+    if (am != bm || !is_fp8(la.type) || !is_fp8(lb.type)) return CUBLAS_STATUS_NOT_SUPPORTED;
   } else if (hopper_mode(am) || hopper_mode(bm)) {
     if (!hopper_mode(am) || !hopper_mode(bm) || (am == kScaleBlk128x128 && bm == kScaleBlk128x128) ||
-        !is_fp8(la.type) || !is_fp8(lb.type) || narrow(ld.type) || ld.batch > 1)
+        !is_fp8(la.type) || !is_fp8(lb.type) || narrow(ld.type))
       return CUBLAS_STATUS_NOT_SUPPORTED;
     if (m % 4 || n % 4) return CUBLAS_STATUS_INVALID_VALUE;
   } else if (is_fp4(la.type) || is_fp4(lb.type)) {
@@ -1040,7 +1094,7 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
       (md.c_scale_mode == kScaleVec16UE4M3 ? !is_fp4(lc.type) : !is_fp8(lc.type)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   if (block_mode(md.d_out_scale_mode)
-          ? (md.d_out_scale_mode == kScaleVec16UE4M3 ? !is_fp4(ld.type) : !is_fp8(ld.type)) || ld.batch > 1
+          ? (md.d_out_scale_mode == kScaleVec16UE4M3 ? !is_fp4(ld.type) : !is_fp8(ld.type))
           : is_fp4(ld.type))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   const int pm = md.pointer_mode;
@@ -1051,7 +1105,7 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
     if ((ep.drelu || ep.dgelu) && !md.aux) return CUBLAS_STATUS_INVALID_VALUE;
     if ((ep.bgrad || ep.bgrada || ep.bgradb) && !md.bias) return CUBLAS_STATUS_INVALID_VALUE;
     if (block_mode(md.d_out_scale_mode) && !md.d_out_scale) return CUBLAS_STATUS_INVALID_VALUE;
-    if ((block_mode(am) || hopper_mode(am)) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
+    if ((block_mode(am) || hopper_mode(am) || mnk4(am)) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
   }
   return CUBLAS_STATUS_SUCCESS;
 }
@@ -1076,6 +1130,9 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
   const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
   const auto& lc = known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld;
 
+  // Measured on an RTX 3060 and an L4: beta != 0 with no C is refused before any algorithm is looked for.
+  if (!C && beta && md.pointer_mode == CUBLASLT_POINTER_MODE_HOST && read_scalar(beta, md.scale, false) != 0.0)
+    return CUBLAS_STATUS_INVALID_VALUE;
   const cublasStatus_t verdict = validate(md, la, lb, lc, ld, true);
   if (verdict != CUBLAS_STATUS_SUCCESS) {
     if (trace() || (!quiet() && verdict == CUBLAS_STATUS_NOT_SUPPORTED))
@@ -1104,20 +1161,15 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
                  : std::vector<double>{beta ? read_scalar(beta, md.scale, pm == CUBLASLT_POINTER_MODE_DEVICE) : 0.0};
   bool any_beta = false;
   for (double b : betas) any_beta = any_beta || b != 0.0;
+  if (any_beta && !C) return CUBLAS_STATUS_INVALID_VALUE;   // measured: beta != 0 with no C
 
   // A's and B's scales (row-wise, column-wise or by block along K; an unset
   // scale is 1), C's (scalar, or by block down C's columns, for a narrow C),
   // and D's: its tensor-wide scale for an FP8 D, or the input scale an FP4 D
   // is quantized with.
-  const Scales sa = load_scales(md.a_scale, md.a_scale_mode, (size_t)m, (size_t)k);
-  const Scales sb = load_scales(md.b_scale, md.b_scale_mode, (size_t)n, (size_t)k);
   const bool c_blocks = block_mode(md.c_scale_mode);
-  const Scales sc = c_blocks ? load_scales(md.c_scale, md.c_scale_mode, (size_t)n, (size_t)m)
-                             : load_scales(narrow(lc.type) ? md.c_scale : nullptr, kScaleScalar, 1, 1);
   const bool d_blocks = block_mode(md.d_out_scale_mode);
-  const double sd = (is_fp8(ld.type) && !d_blocks) || (is_fp4(ld.type) && d_blocks)
-                        ? load_scales(md.d_scale, kScaleScalar, 1, 1).values[0]
-                        : 1.0;
+  // (Each batch's scales are read in its turn below: block scales and per-batch scalars have one tensor per batch.)
 
   int bias_type = md.bias_type;
   // Measured (L4, cuBLAS 13.3): the default bias is BF16 under an fp32 or FP8 D, as the header's exceptions say.
@@ -1128,12 +1180,25 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
   if ((la.batch != 1 && la.batch != batch) || (lb.batch != 1 && lb.batch != batch)) return CUBLAS_STATUS_INVALID_VALUE;
   double amax = 0.0;
   std::vector<uint8_t> out_scales;
-  if (d_blocks)
-    out_scales.assign(tiled_bytes((size_t)n, ((size_t)m + (md.d_out_scale_mode == kScaleVec16UE4M3 ? 15 : 31)) /
-                                                 (md.d_out_scale_mode == kScaleVec16UE4M3 ? 16 : 32)),
-                      0);
+  const size_t out_tensor = d_blocks ? scale_tensor_bytes(md.d_out_scale_mode, (size_t)n, (size_t)m) : 0;
+  if (d_blocks) out_scales.assign(out_tensor * (size_t)batch, 0);
+  // The auxiliary buffer's element type, and (for an FP8 one) its scale and the amax it reports.
+  // (Measured on an L4: under an FP8 D the default auxiliary type is BF16, while the product is rounded to fp16 before
+  // the bias of RELU_AUX_BIAS and GELU_AUX_BIAS is added.)
+  const int auxt = md.aux_type >= 0 ? md.aux_type : (narrow(ld.type) ? (int)CUDA_R_16BF : ld.type);
+  double aux_amax = 0.0;
+  double aux_scale = 1.0;
+  if (md.aux_scale && narrow(auxt)) aux_scale = read_as_double(md.aux_scale, 1, CUDA_R_32F)[0];
   for (int bi = 0; bi < batch; ++bi) {
     auto base = [&](const void* p, const MatrixLayout& l) { return static_cast<const uint8_t*>(p) + batch_offset_bytes(l, bi); };
+    // A's, B's and C's scales and D's, for this batch (an unset scale is 1).
+    const Scales sa = load_scales(md.a_scale, md.a_scale_mode, (size_t)m, (size_t)k, bi);
+    const Scales sb = load_scales(md.b_scale, md.b_scale_mode, (size_t)n, (size_t)k, bi);
+    const Scales sc = c_blocks ? load_scales(md.c_scale, md.c_scale_mode, (size_t)n, (size_t)m, bi)
+                               : load_scales(narrow(lc.type) ? md.c_scale : nullptr, kScaleScalar, 1, 1);
+    const double sd = (is_fp8(ld.type) && !d_blocks) || (is_fp4(ld.type) && d_blocks)
+                          ? load_scales(md.d_scale, md.d_scale_mode == kScalePerBatch ? kScalePerBatch : kScaleScalar, 1, 1, bi).values[0]
+                          : 1.0;
     Elems ea, eb, ec, ed;
     ea.load(base(A, la), span(la), la.type);
     eb.load(base(B, lb), span(lb), lb.type);
@@ -1153,8 +1218,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
       mask.assign((size_t)((n - 1) * aux_ld + m + 7) / 8, 0);
       cudaMemcpy(mask.data(), aux_base, mask.size(), cudaMemcpyDeviceToHost);
     } else if (gelu_aux) {
-      aux_base = static_cast<uint8_t*>(md.aux) + (size_t)bi * (size_t)md.aux_batch_stride * elem_bytes(ld.type);
-      aux.load(aux_base, (size_t)((n - 1) * aux_ld + m), ld.type);
+      aux_base = static_cast<uint8_t*>(md.aux) + (size_t)bi * (size_t)md.aux_batch_stride * elem_bytes(auxt);
+      aux.load(aux_base, (size_t)((n - 1) * aux_ld + m), auxt);
     }
     std::vector<double> hbias;
     if (ep.bias && md.bias)
@@ -1174,9 +1239,9 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
         // fp32 (measured on an L4: a bias that is not exact in fp32 moves FP8 rounding ties).
         double v = (float)(al * acc);
         if (be != 0.0 && !ec.raw.empty()) v = (float)(v + (float)(be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j))));
-        // RELU_AUX_BIAS adds the bias to the product already rounded to the output type (measured: a bf16 D
-        // rounds 9.21875 to 9.25 before adding -2, where RELU_BIAS and BIAS keep 7.21875).
-        if (!hbias.empty() && ep.relu && ep.aux_out) v = quantize(v, narrow(ld.type) ? (int)CUDA_R_16BF : ld.type);
+        // RELU_AUX_BIAS and GELU_AUX_BIAS add the bias to the product already rounded to the output type (measured: a bf16 D
+        // rounds 9.21875 to 9.25 before adding -2, where RELU_BIAS and BIAS keep 7.21875; an FP8 D rounds to fp16).
+        if (!hbias.empty() && (ep.relu || ep.gelu) && ep.aux_out) v = quantize(v, narrow(ld.type) ? (int)CUDA_R_16F : ld.type);
         if (!hbias.empty()) v = (float)(v + (float)hbias[(size_t)i]);
         const size_t ax = (size_t)(j * aux_ld + i);
         if (ep.relu) {
@@ -1186,7 +1251,10 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           }
           v = v > 0.0 ? v : 0.0;
         } else if (ep.gelu) {
-          if (gelu_aux) aux.set(ax, v);
+          if (gelu_aux) {
+            aux.set(ax, v * aux_scale);   // an FP8 auxiliary output is scaled by EPILOGUE_AUX_SCALE (documentation-derived)
+            aux_amax = std::fmax(aux_amax, std::fabs(v));
+          }
           v = gelu((float)v);
         } else if (ep.drelu) {
           if (!((mask[ax / 8] >> (ax % 8)) & 1)) v = 0.0;
@@ -1201,7 +1269,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
       if (d_blocks) {   // an FP4 D's input scale applies before the quantization
         if (sd != 1.0)
           for (auto& v : col) v *= sd;
-        quantize_column(ed, ld, j, col, md.d_out_scale_mode, out_scales, (size_t)m);
+        quantize_column(ed, ld, j, col, md.d_out_scale_mode, out_scales, (size_t)m, (size_t)bi * out_tensor);
       } else {
         for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), (double)(float)(col[(size_t)i] * sd));
       }
@@ -1228,6 +1296,10 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
   if (md.amax_d) {
     const float a = (float)amax;
     cudaMemcpy(md.amax_d, &a, sizeof a, cudaMemcpyHostToDevice);
+  }
+  if (md.aux_amax && ep.gelu_aux() && ep.gelu) {   // the largest magnitude written to the auxiliary buffer, before its scale
+    const float a = (float)aux_amax;
+    cudaMemcpy(md.aux_amax, &a, sizeof a, cudaMemcpyHostToDevice);
   }
   return CUBLAS_STATUS_SUCCESS;
 }

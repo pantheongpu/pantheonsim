@@ -16,6 +16,7 @@
 #   lt        cuBLASLt: FP8 and block-scaled matmuls          cublasLt
 #   sparselt  cuSPARSELt: FP8/FP4 structured-sparse matmuls   cusparseLt
 #   dnn       cuDNN: FP8 and INT8x32                          cudnn
+#   cvt       the packed FP8 conversions of sm_89 and later (PTX)
 #
 # The expected files are nvidia/tests/data/lowprec/<probe>.<slug>.txt, where <slug>
 # names the profile (nvidia/<slug>): l4, h100, rtx-pro-6000, rtx3060 ...
@@ -36,6 +37,7 @@ case "$probe" in
   lt) libs=(cublasLt) ;;
   sparselt) libs=(cusparseLt) ;;
   dnn) libs=(cudnn) ;;
+  cvt) libs=() ;;
   *) echo "unknown probe $probe" >&2; exit 2 ;;
 esac
 
@@ -103,7 +105,8 @@ if grep -q '#include <cudnn_frontend.h>' "$src"; then
   fe="$("$root/nvidia/tests/e2e/fetch_cudnn_frontend.sh")" || { echo "SKIP: cudnn-frontend could not be fetched"; exit 0; }
   links+=("-I$fe")
 fi
-nvcc -std=c++17 -cudart "$cudart" -arch=compute_80 -code=compute_80 -Wno-deprecated-gpu-targets \
+sim_arch=compute_80; [[ "$probe" == cvt ]] && sim_arch=compute_89
+nvcc -std=c++17 -cudart "$cudart" -arch=$sim_arch -code=$sim_arch -Wno-deprecated-gpu-targets \
      -Xcompiler -Wno-deprecated-declarations $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" "${links[@]}"
 require_shim_libs "$shim" "$out" || exit 0
 fails=0

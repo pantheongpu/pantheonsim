@@ -1434,7 +1434,7 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
           }
         };
         const auto encode = [&](double v, unsigned l) -> uint32_t {
-          if (relu && v < 0) v = 0.0;
+          if (relu && !std::isnan(v) && std::signbit(v)) v = 0.0;   // .relu sends -0 and negatives to +0 (measured)
           switch (fmt) {
             case 10: return exec::fp8_bits(v, false, sat);
             case 11: return exec::fp8_bits(v, true, sat);

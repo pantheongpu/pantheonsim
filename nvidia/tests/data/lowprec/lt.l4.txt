@@ -408,24 +408,24 @@ fp8epi/relu_aux_bias_dbf16_biasf32_auxf16 h=7:0 m=7
 fp8epi/relu_aux_bias_dbf16_biasf32_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_bias_dbf16_biasf32_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_bias_dbf16_biasf32_auxf32 h=7:0 m=7
-fp8epi/gelu_dbf16 h=0:1 m=0 d=9fdf09a6318fbb36
-fp8epi/gelu_aux_dbf16 h=0:1 m=0 d=9fdf09a6318fbb36 aux=9eace79d97f2a620
+fp8epi/gelu_dbf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_aux_dbf16 h=0:1 m=0 gelu=ok aux=9eace79d97f2a620
 fp8epi/gelu_aux_dbf16_auxf16 h=7:0 m=7
-fp8epi/gelu_aux_dbf16_auxbf16 h=0:1 m=0 d=9fdf09a6318fbb36 aux=9eace79d97f2a620
+fp8epi/gelu_aux_dbf16_auxbf16 h=0:1 m=0 gelu=ok aux=9eace79d97f2a620
 fp8epi/gelu_aux_dbf16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_dbf16_auxf32 h=7:0 m=7
-fp8epi/gelu_bias_dbf16 h=0:1 m=0 d=86d5ac201eb8502a
-fp8epi/gelu_bias_dbf16_biasbf16 h=0:1 m=0 d=86d5ac201eb8502a
+fp8epi/gelu_bias_dbf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_dbf16_biasbf16 h=0:1 m=0 gelu=ok
 fp8epi/gelu_bias_dbf16_biasf16 h=15:0 m=15
 fp8epi/gelu_bias_dbf16_biasf32 h=15:0 m=15
-fp8epi/gelu_aux_bias_dbf16 h=0:1 m=0 d=86d5ac201eb8502a aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
 fp8epi/gelu_aux_bias_dbf16_auxf16 h=7:0 m=7
-fp8epi/gelu_aux_bias_dbf16_auxbf16 h=0:1 m=0 d=86d5ac201eb8502a aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_auxbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
 fp8epi/gelu_aux_bias_dbf16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_dbf16_auxf32 h=7:0 m=7
-fp8epi/gelu_aux_bias_dbf16_biasbf16 h=0:1 m=0 d=86d5ac201eb8502a aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_biasbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
 fp8epi/gelu_aux_bias_dbf16_biasbf16_auxf16 h=7:0 m=7
-fp8epi/gelu_aux_bias_dbf16_biasbf16_auxbf16 h=0:1 m=0 d=86d5ac201eb8502a aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_biasbf16_auxbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
 fp8epi/gelu_aux_bias_dbf16_biasbf16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_dbf16_biasbf16_auxf32 h=7:0 m=7
 fp8epi/gelu_aux_bias_dbf16_biasf16 h=15:0 m=15
@@ -473,18 +473,18 @@ fp8epi/relu_aux_bias_df16_biasf32_auxf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df16_biasf32_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df16_biasf32_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_bias_df16_biasf32_auxf32 h=7:0 m=7
-fp8epi/gelu_df16 h=0:1 m=0 d=0bc107262b5d55d0
-fp8epi/gelu_aux_df16 h=0:1 m=0 d=0bc107262b5d55d0 aux=797de96d1a489c36
-fp8epi/gelu_aux_df16_auxf16 h=0:1 m=0 d=0bc107262b5d55d0 aux=797de96d1a489c36
+fp8epi/gelu_df16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_aux_df16 h=0:1 m=0 gelu=ok aux=797de96d1a489c36
+fp8epi/gelu_aux_df16_auxf16 h=0:1 m=0 gelu=ok aux=797de96d1a489c36
 fp8epi/gelu_aux_df16_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_df16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_df16_auxf32 h=7:0 m=7
-fp8epi/gelu_bias_df16 h=0:1 m=0 d=c180c1d540d23b23
+fp8epi/gelu_bias_df16 h=0:1 m=0 gelu=ok
 fp8epi/gelu_bias_df16_biasbf16 h=15:0 m=15
-fp8epi/gelu_bias_df16_biasf16 h=0:1 m=0 d=c180c1d540d23b23
+fp8epi/gelu_bias_df16_biasf16 h=0:1 m=0 gelu=ok
 fp8epi/gelu_bias_df16_biasf32 h=15:0 m=15
-fp8epi/gelu_aux_bias_df16 h=0:1 m=0 d=c180c1d540d23b23 aux=1f379febb72e72bc
-fp8epi/gelu_aux_bias_df16_auxf16 h=0:1 m=0 d=c180c1d540d23b23 aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_auxf16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
 fp8epi/gelu_aux_bias_df16_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_df16_auxf32 h=7:0 m=7
@@ -493,8 +493,8 @@ fp8epi/gelu_aux_bias_df16_biasbf16_auxf16 h=15:0 m=15
 fp8epi/gelu_aux_bias_df16_biasbf16_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df16_biasbf16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_df16_biasbf16_auxf32 h=7:0 m=7
-fp8epi/gelu_aux_bias_df16_biasf16 h=0:1 m=0 d=c180c1d540d23b23 aux=1f379febb72e72bc
-fp8epi/gelu_aux_bias_df16_biasf16_auxf16 h=0:1 m=0 d=c180c1d540d23b23 aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_biasf16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_biasf16_auxf16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
 fp8epi/gelu_aux_bias_df16_biasf16_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_df16_biasf16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_df16_biasf16_auxf32 h=7:0 m=7
@@ -510,11 +510,11 @@ fp8epi/relu_aux_df32_auxf16 h=7:0 m=7
 fp8epi/relu_aux_df32_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_df32_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_df32_auxf32 h=7:0 m=7
-fp8epi/bias_df32 h=0:1 m=0 d=5fbecddc6fa29dac
+fp8epi/bias_df32 h=0:1 m=0 d=97828079a7ef0a79
 fp8epi/bias_df32_biasbf16 h=0:1 m=0 d=97828079a7ef0a79
 fp8epi/bias_df32_biasf16 h=15:0 m=15
 fp8epi/bias_df32_biasf32 h=15:0 m=15
-fp8epi/relu_bias_df32 h=0:1 m=0 d=65b7348b37f9a68c
+fp8epi/relu_bias_df32 h=0:1 m=0 d=4cd8a4293a995e2b
 fp8epi/relu_bias_df32_biasbf16 h=0:1 m=0 d=4cd8a4293a995e2b
 fp8epi/relu_bias_df32_biasf16 h=15:0 m=15
 fp8epi/relu_bias_df32_biasf32 h=15:0 m=15
@@ -538,12 +538,12 @@ fp8epi/relu_aux_bias_df32_biasf32_auxf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_biasf32_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_biasf32_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_bias_df32_biasf32_auxf32 h=7:0 m=7
-fp8epi/gelu_df32 h=0:1 m=0 d=85f3d012970fc55d
-fp8epi/gelu_aux_df32 h=0:1 m=0 d=85f3d012970fc55d aux=7848276900548470
+fp8epi/gelu_df32 h=0:1 m=0 gelu=ok
+fp8epi/gelu_aux_df32 h=0:1 m=0 gelu=ok aux=7848276900548470
 fp8epi/gelu_aux_df32_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_df32_auxbf16 h=7:0 m=7
 fp8epi/gelu_aux_df32_auxe4m3 h=7:0 m=7
-fp8epi/gelu_aux_df32_auxf32 h=0:1 m=0 d=85f3d012970fc55d aux=7848276900548470
+fp8epi/gelu_aux_df32_auxf32 h=0:1 m=0 gelu=ok aux=7848276900548470
 fp8epi/gelu_bias_df32 h=15:0 m=15
 fp8epi/gelu_bias_df32_biasbf16 h=15:0 m=15
 fp8epi/gelu_bias_df32_biasf16 h=15:0 m=15
@@ -578,15 +578,15 @@ fp8epi/relu_aux_de4m3_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_de4m3_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_de4m3_auxe4m3_auxscale h=7:0 m=7
 fp8epi/relu_aux_de4m3_auxf32 h=7:0 m=7
-fp8epi/bias_de4m3 h=0:1 m=0 d=23fbfebc7450b2b6 amax=48c000e8
+fp8epi/bias_de4m3 h=0:1 m=0 d=c374f7f49ebc6035 amax=41954000
 fp8epi/bias_de4m3_biasbf16 h=0:1 m=0 d=c374f7f49ebc6035 amax=41954000
 fp8epi/bias_de4m3_biasf16 h=15:0 m=15
 fp8epi/bias_de4m3_biasf32 h=15:0 m=15
-fp8epi/relu_bias_de4m3 h=0:1 m=0 d=4edba5034454f6c7 amax=48c000e8
+fp8epi/relu_bias_de4m3 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000
 fp8epi/relu_bias_de4m3_biasbf16 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000
 fp8epi/relu_bias_de4m3_biasf16 h=15:0 m=15
 fp8epi/relu_bias_de4m3_biasf32 h=15:0 m=15
-fp8epi/relu_aux_bias_de4m3 h=0:1 m=0 d=4edba5034454f6c7 amax=48c000e8 aux=f129b4956d0b6e38
+fp8epi/relu_aux_bias_de4m3 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000 aux=5dbe08fb7c1756a9
 fp8epi/relu_aux_bias_de4m3_auxdflt_auxscale h=7:0 m=7
 fp8epi/relu_aux_bias_de4m3_auxf16 h=7:0 m=7
 fp8epi/relu_aux_bias_de4m3_auxf16_auxscale h=7:0 m=7
@@ -618,32 +618,32 @@ fp8epi/relu_aux_bias_de4m3_biasf32_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_bias_de4m3_biasf32_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_bias_de4m3_biasf32_auxe4m3_auxscale h=7:0 m=7
 fp8epi/relu_aux_bias_de4m3_biasf32_auxf32 h=7:0 m=7
-fp8epi/gelu_de4m3 h=0:1 m=0 d=50dd2a31c369f42a amax=417a8000
-fp8epi/gelu_aux_de4m3 h=0:1 m=0 d=50dd2a31c369f42a amax=417a8000 aux=e1bdeab4bbecb620
+fp8epi/gelu_de4m3 h=0:1 m=0 gelu=ok amax=417a8000
+fp8epi/gelu_aux_de4m3 h=0:1 m=0 gelu=ok amax=417a8000 aux=e1bdeab4bbecb620
 fp8epi/gelu_aux_de4m3_auxdflt_auxscale h=7:0 m=7
 fp8epi/gelu_aux_de4m3_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_de4m3_auxf16_auxscale h=7:0 m=7
-fp8epi/gelu_aux_de4m3_auxbf16 h=0:1 m=0 d=50dd2a31c369f42a amax=417a8000 aux=9eace79d97f2a620
+fp8epi/gelu_aux_de4m3_auxbf16 h=0:1 m=0 gelu=ok amax=417a8000 aux=9eace79d97f2a620
 fp8epi/gelu_aux_de4m3_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_de4m3_auxe4m3_auxscale h=7:0 m=7
 fp8epi/gelu_aux_de4m3_auxf32 h=7:0 m=7
-fp8epi/gelu_bias_de4m3 h=0:1 m=0 d=6f94922749b1bd65 amax=48c000e8
-fp8epi/gelu_bias_de4m3_biasbf16 h=0:1 m=0 d=4297e1b48becba5f amax=41954000
+fp8epi/gelu_bias_de4m3 h=0:1 m=0 gelu=ok amax=41954000
+fp8epi/gelu_bias_de4m3_biasbf16 h=0:1 m=0 gelu=ok amax=41954000
 fp8epi/gelu_bias_de4m3_biasf16 h=15:0 m=15
 fp8epi/gelu_bias_de4m3_biasf32 h=15:0 m=15
-fp8epi/gelu_aux_bias_de4m3 h=0:1 m=0 d=6f94922749b1bd65 amax=48c000e8 aux=9a3654c0770a3e8a
+fp8epi/gelu_aux_bias_de4m3 h=0:1 m=0 gelu=ok amax=41954000 aux=ceb978e791213e26
 fp8epi/gelu_aux_bias_de4m3_auxdflt_auxscale h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_auxf16_auxscale h=7:0 m=7
-fp8epi/gelu_aux_bias_de4m3_auxbf16 h=0:1 m=0 d=6f94922749b1bd65 amax=48c000e8 aux=44f7fa13f750ae8a
+fp8epi/gelu_aux_bias_de4m3_auxbf16 h=0:1 m=0 gelu=ok amax=41954000 aux=c5d7bce3c1e2ae26
 fp8epi/gelu_aux_bias_de4m3_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_auxe4m3_auxscale h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_auxf32 h=7:0 m=7
-fp8epi/gelu_aux_bias_de4m3_biasbf16 h=0:1 m=0 d=4297e1b48becba5f amax=41954000 aux=ceb978e791213e26
+fp8epi/gelu_aux_bias_de4m3_biasbf16 h=0:1 m=0 gelu=ok amax=41954000 aux=ceb978e791213e26
 fp8epi/gelu_aux_bias_de4m3_biasbf16_auxdflt_auxscale h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_biasbf16_auxf16 h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_biasbf16_auxf16_auxscale h=7:0 m=7
-fp8epi/gelu_aux_bias_de4m3_biasbf16_auxbf16 h=0:1 m=0 d=4297e1b48becba5f amax=41954000 aux=c5d7bce3c1e2ae26
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxbf16 h=0:1 m=0 gelu=ok amax=41954000 aux=c5d7bce3c1e2ae26
 fp8epi/gelu_aux_bias_de4m3_biasbf16_auxe4m3 h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_biasbf16_auxe4m3_auxscale h=7:0 m=7
 fp8epi/gelu_aux_bias_de4m3_biasbf16_auxf32 h=7:0 m=7
@@ -673,11 +673,11 @@ fp8epi/relu_aux_de5m2_auxbf16 h=7:0 m=7
 fp8epi/relu_aux_de5m2_auxe4m3 h=7:0 m=7
 fp8epi/relu_aux_de5m2_auxe4m3_auxscale h=7:0 m=7
 fp8epi/relu_aux_de5m2_auxf32 h=7:0 m=7
-fp8epi/bias_de5m2 h=0:1 m=0 d=69841ac3a27bf173 amax=44c0e800
+fp8epi/bias_de5m2 h=0:1 m=0 d=eec34633b17ca18e amax=41954000
 fp8epi/bias_de5m2_biasbf16 h=0:1 m=0 d=eec34633b17ca18e amax=41954000
 fp8epi/bias_de5m2_biasf16 h=15:0 m=15
 fp8epi/bias_de5m2_biasf32 h=15:0 m=15
-fp8epi/relu_bias_de5m2 h=0:1 m=0 d=71adacc497c275c0 amax=44c0e800
+fp8epi/relu_bias_de5m2 h=0:1 m=0 d=1adcf4da033f176d amax=41954000
 fp8epi/relu_bias_de5m2_biasbf16 h=0:1 m=0 d=1adcf4da033f176d amax=41954000
 fp8epi/relu_bias_de5m2_biasf16 h=15:0 m=15
 fp8epi/relu_bias_de5m2_biasf32 h=15:0 m=15
@@ -772,8 +772,8 @@ fp8bwd/bgrada_NT_dbf16 h=15:0 m=15
 fp8bwd/bgradb_NT_dbf16 h=15:0 m=15
 fp8bwd/drelu_TN_dbf16 h=0:1 m=0 d=5f571a2101230427
 fp8bwd/drelu_bgrad_TN_dbf16 h=0:1 m=0 d=5f571a2101230427 bgrad=00b5e1a44275ceef
-fp8bwd/dgelu_TN_dbf16 h=0:1 m=0 d=abce402c3c809662
-fp8bwd/dgelu_bgrad_TN_dbf16 h=0:1 m=0 d=abce402c3c809662 bgrad=e5cf10e7844c0514
+fp8bwd/dgelu_TN_dbf16 h=0:1 m=0 gelu=ok
+fp8bwd/dgelu_bgrad_TN_dbf16 h=0:1 m=0 gelu=ok
 fp8bwd/bgrada_TN_dbf16 h=15:0 m=15
 fp8bwd/bgradb_TN_dbf16 h=15:0 m=15
 fp8bwd/drelu_TT_dbf16 h=15:0 m=15
@@ -788,8 +788,8 @@ fp8bwd/bgrada_NT_df16 h=15:0 m=15
 fp8bwd/bgradb_NT_df16 h=15:0 m=15
 fp8bwd/drelu_TN_df16 h=0:1 m=0 d=8edf2fdc5cff2669
 fp8bwd/drelu_bgrad_TN_df16 h=0:1 m=0 d=8edf2fdc5cff2669 bgrad=ebf1281e36488e28
-fp8bwd/dgelu_TN_df16 h=0:1 m=0 d=e39b6744829a8fde
-fp8bwd/dgelu_bgrad_TN_df16 h=0:1 m=0 d=e39b6744829a8fde bgrad=dc3eca7f82fd8a16
+fp8bwd/dgelu_TN_df16 h=0:1 m=0 gelu=ok
+fp8bwd/dgelu_bgrad_TN_df16 h=0:1 m=0 gelu=ok
 fp8bwd/bgrada_TN_df16 h=15:0 m=15
 fp8bwd/bgradb_TN_df16 h=15:0 m=15
 fp8bwd/bgrada_TT_df16 h=15:0 m=15
@@ -800,7 +800,7 @@ fp8bwd/bgrada_NT_df32 h=15:0 m=15
 fp8bwd/bgradb_NT_df32 h=15:0 m=15
 fp8bwd/drelu_TN_df32 h=0:1 m=0 d=60acc09eff2dc37b
 fp8bwd/drelu_bgrad_TN_df32 h=15:0 m=15
-fp8bwd/dgelu_TN_df32 h=0:1 m=0 d=06db529475da4eca
+fp8bwd/dgelu_TN_df32 h=0:1 m=0 gelu=ok
 fp8bwd/dgelu_bgrad_TN_df32 h=15:0 m=15
 fp8bwd/bgrada_TN_df32 h=15:0 m=15
 fp8bwd/bgradb_TN_df32 h=15:0 m=15
