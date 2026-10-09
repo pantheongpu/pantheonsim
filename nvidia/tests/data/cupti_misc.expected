@@ -1,0 +1,239 @@
+# enabling kinds
+enable kind 0 -> CUPTI_ERROR_NOT_COMPATIBLE
+enable kind 1 -> CUPTI_SUCCESS
+enable kind 2 -> CUPTI_SUCCESS
+enable kind 3 -> CUPTI_SUCCESS
+enable kind 4 -> CUPTI_SUCCESS
+enable kind 5 -> CUPTI_SUCCESS
+enable kind 6 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 7 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 8 -> CUPTI_SUCCESS
+enable kind 9 -> CUPTI_SUCCESS
+enable kind 10 -> CUPTI_SUCCESS
+enable kind 11 -> CUPTI_SUCCESS
+enable kind 12 -> CUPTI_SUCCESS
+enable kind 13 -> CUPTI_SUCCESS
+enable kind 14 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 15 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 16 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 17 -> CUPTI_SUCCESS
+enable kind 18 -> CUPTI_ERROR_NOT_COMPATIBLE
+enable kind 19 -> CUPTI_SUCCESS
+enable kind 20 -> CUPTI_ERROR_NOT_COMPATIBLE
+enable kind 21 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 22 -> CUPTI_SUCCESS
+enable kind 23 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 24 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 26 -> CUPTI_SUCCESS
+enable kind 27 -> CUPTI_ERROR_INVALID_KIND
+enable kind 28 -> CUPTI_ERROR_NOT_COMPATIBLE
+enable kind 29 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 30 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 31 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 32 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 33 -> CUPTI_SUCCESS
+enable kind 34 -> CUPTI_SUCCESS
+enable kind 35 -> CUPTI_SUCCESS
+enable kind 36 -> CUPTI_SUCCESS
+enable kind 37 -> CUPTI_SUCCESS
+enable kind 38 -> CUPTI_SUCCESS
+enable kind 39 -> CUPTI_SUCCESS
+enable kind 40 -> CUPTI_SUCCESS
+enable kind 41 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 42 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 43 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 44 -> CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED
+enable kind 45 -> CUPTI_SUCCESS
+enable kind 46 -> CUPTI_SUCCESS
+enable kind 47 -> CUPTI_SUCCESS
+enable kind 48 -> CUPTI_SUCCESS
+enable kind 49 -> CUPTI_SUCCESS
+enable kind 50 -> CUPTI_SUCCESS
+enable kind 51 -> CUPTI_SUCCESS
+enable kind 52 -> CUPTI_SUCCESS
+enable kind 53 -> CUPTI_ERROR_INVALID_KIND
+enable kind 54 -> CUPTI_SUCCESS
+enable kind 55 -> CUPTI_SUCCESS
+enable kind 56 -> CUPTI_ERROR_NOT_COMPATIBLE
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) -> CUPTI_SUCCESS
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL) -> CUPTI_ERROR_NOT_COMPATIBLE
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) -> CUPTI_SUCCESS
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL) -> CUPTI_SUCCESS
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) -> CUPTI_ERROR_NOT_COMPATIBLE
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_KERNEL) -> CUPTI_SUCCESS
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_KERNEL) -> CUPTI_SUCCESS
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) -> CUPTI_SUCCESS
+cuptiActivityEnableCudaEventDeviceTimestamps(1) -> CUPTI_SUCCESS
+cuptiActivityEnableCudaEventDeviceTimestamps(0) -> CUPTI_SUCCESS
+# result strings
+result -1: <unknown> (1)
+result 0: CUPTI_SUCCESS (0)
+result 1: CUPTI_ERROR_INVALID_PARAMETER (0)
+result 12: CUPTI_ERROR_MAX_LIMIT_REACHED (0)
+result 13: CUPTI_ERROR_NOT_READY (0)
+result 14: CUPTI_ERROR_NOT_COMPATIBLE (0)
+result 18: CUPTI_ERROR_QUEUE_EMPTY (0)
+result 21: CUPTI_ERROR_INVALID_KIND (0)
+result 27: CUPTI_ERROR_NOT_SUPPORTED (0)
+result 30: CUPTI_ERROR_UM_PROFILING_NOT_SUPPORTED_ON_NON_P2P_DEVICES (0)
+result 36: <unknown> (1)
+result 37: <unknown> (1)
+result 38: CUPTI_ERROR_LEGACY_PROFILER_NOT_SUPPORTED (0)
+result 39: CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED (0)
+result 42: CUPTI_ERROR_CMP_DEVICE_NOT_SUPPORTED (0)
+result 43: CUPTI_ERROR_MIG_DEVICE_NOT_SUPPORTED (0)
+result 46: CUPTI_ERROR_INVALID_CHIP_NAME (0)
+result 47: <unknown> (1)
+result 100: <unknown> (1)
+result 999: CUPTI_ERROR_UNKNOWN (0)
+result 1000: CUPTI_ERROR_CANT_OPEN_FILE (0)
+# callbacks
+cuptiSubscribe(&sub, on_callback, nullptr) -> CUPTI_SUCCESS
+cuptiSubscribe(&second, on_callback, nullptr) -> CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED
+cuptiSubscribe(nullptr, on_callback, nullptr) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, bad, CUPTI_CB_DOMAIN_RUNTIME_API, 1) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_INVALID, 1) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, sub, static_cast<CUpti_CallbackDomain>(99), 1) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_RUNTIME_API, 0) -> CUPTI_SUCCESS
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_RUNTIME_API, 99999) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_RESOURCE, 0) -> CUPTI_SUCCESS
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_RESOURCE, 99) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_SYNCHRONIZE, 3) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_NVTX, 99999) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableDomain(1, sub, CUPTI_CB_DOMAIN_INVALID) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableDomain(1, sub, static_cast<CUpti_CallbackDomain>(99)) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableDomain(1, bad, CUPTI_CB_DOMAIN_RUNTIME_API) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiEnableAllDomains(1, bad) -> CUPTI_ERROR_INVALID_PARAMETER
+- the domain on, then cudaMalloc off
+cuptiEnableDomain(1, sub, CUPTI_CB_DOMAIN_RUNTIME_API) -> CUPTI_SUCCESS
+cuptiEnableCallback(0, sub, CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020) -> CUPTI_SUCCESS
+  callback: cudaFree
+- the domain off, then cudaFree on
+cuptiEnableDomain(0, sub, CUPTI_CB_DOMAIN_RUNTIME_API) -> CUPTI_SUCCESS
+cuptiEnableCallback(1, sub, CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020) -> CUPTI_SUCCESS
+  callback: cudaFree
+- the domain on again
+cuptiEnableDomain(1, sub, CUPTI_CB_DOMAIN_RUNTIME_API) -> CUPTI_SUCCESS
+  callback: cudaMalloc
+  callback: cudaFree
+- all off
+cuptiEnableAllDomains(0, sub) -> CUPTI_SUCCESS
+cuptiUnsubscribe(sub) -> CUPTI_SUCCESS
+cuptiUnsubscribe(sub) -> CUPTI_SUCCESS
+cuptiSubscribe(&second, on_callback, nullptr) -> CUPTI_SUCCESS
+cuptiUnsubscribe(second) -> CUPTI_SUCCESS
+# per-function records
+cuptiActivityEnableRuntimeApi(0, 1) -> CUPTI_SUCCESS
+cuptiActivityEnableRuntimeApi(99999, 1) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiActivityEnableDriverApi(0, 1) -> CUPTI_SUCCESS
+cuptiActivityEnableDriverApi(99999, 1) -> CUPTI_ERROR_INVALID_PARAMETER
+- only cudaMalloc
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020, 1) -> CUPTI_SUCCESS
+# only cudaMalloc
+- and cudaFree
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020, 1) -> CUPTI_SUCCESS
+# malloc and free
+- the kind on, cudaMalloc off
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020, 0) -> CUPTI_SUCCESS
+# kind on, malloc off
+  runtime cudaMemcpy_v3020
+  runtime cudaFree_v3020
+- the kind on again
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+# kind on again
+  runtime cudaMalloc_v3020
+  runtime cudaMemcpy_v3020
+  runtime cudaFree_v3020
+- cudaFree off
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020, 0) -> CUPTI_SUCCESS
+# free off
+  runtime cudaMalloc_v3020
+  runtime cudaMemcpy_v3020
+- the kind off, then cudaMemcpy on
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020, 1) -> CUPTI_SUCCESS
+# kind off
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+- the driver's, with the kind never on
+cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuMemAlloc_v2, 1) -> CUPTI_SUCCESS
+# driver: only cuMemAlloc
+  driver cuMemAlloc_v2
+cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuMemFree_v2, 1) -> CUPTI_SUCCESS
+# driver: alloc and free
+  driver cuMemAlloc_v2
+  driver cuMemFree_v2
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuMemsetD8_v2, 0) -> CUPTI_SUCCESS
+# driver: kind on, memset off
+  driver cuMemAlloc_v2
+  driver cuMemFree_v2
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+# cuda events
+# without device timestamps
+  runtime cudaStreamCreate_v3020
+  runtime cudaEventCreate_v3020
+  runtime cudaEventCreate_v3020
+  cuda-event id=e0 stream=s0 corr=c0
+    device timestamp none, sync id 1
+  runtime cudaEventRecord_v3020
+  runtime cudaLaunchKernel_v7000
+  cuda-event id=e1 stream=s0 corr=c1
+    device timestamp none, sync id 2
+  runtime cudaEventRecord_v3020
+  sync type=1 event=e1 corr=c2
+  runtime cudaEventSynchronize_v3020
+  sync type=2 event=e1 corr=c3
+  runtime cudaStreamWaitEvent_v3020
+  cuda-event id=e0 stream=s1 corr=c4
+    device timestamp none, sync id 3
+  runtime cudaEventRecord_v3020
+  sync type=4 event=e2 corr=c5
+  runtime cudaDeviceSynchronize_v3020
+cuptiActivityEnableCudaEventDeviceTimestamps(1) -> CUPTI_SUCCESS
+# with device timestamps
+  cuda-event id=e0 stream=s0 corr=c6
+    device timestamp set, sync id 4
+  runtime cudaEventRecord_v3020
+  sync type=4 event=e2 corr=c7
+  runtime cudaDeviceSynchronize_v3020
+cuptiActivityEnableCudaEventDeviceTimestamps(0) -> CUPTI_SUCCESS
+# copies between devices
+# setup
+  runtime cudaEventDestroy_v3020
+  runtime cudaEventDestroy_v3020
+  runtime cudaStreamDestroy_v5050
+  runtime cudaSetDevice_v3020
+  runtime cudaMalloc_v3020
+  runtime cudaSetDevice_v3020
+  runtime cudaMalloc_v3020
+  runtime cudaSetDevice_v3020
+  runtime cudaStreamCreate_v3020
+# copies
+  memcpy kind=2 src=device dst=device bytes=4096 async=0 device=0 context=x0 stream=s1 corr=c8
+  memcpy kind=1 src=device dst=device bytes=4096 async=0 device=1 context=x1 stream=s2 corr=c8
+  runtime cudaMemcpyPeer_v4000
+  memcpy kind=2 src=device dst=device bytes=4096 async=1 device=0 context=x0 stream=s3 corr=c9
+  memcpy kind=1 src=device dst=device bytes=4096 async=1 device=1 context=x1 stream=s2 corr=c9
+  runtime cudaMemcpyPeerAsync_v4000
+  runtime cudaStreamSynchronize_v3020
+  memcpy kind=2 src=device dst=device bytes=4096 async=0 device=0 context=x0 stream=s1 corr=c10
+  memcpy kind=1 src=device dst=device bytes=4096 async=0 device=1 context=x1 stream=s2 corr=c10
+  runtime cudaMemcpy_v3020
+  memcpy kind=2 src=device dst=device bytes=4096 async=1 device=0 context=x0 stream=s3 corr=c11
+  memcpy kind=1 src=device dst=device bytes=4096 async=1 device=1 context=x1 stream=s2 corr=c11
+  runtime cudaMemcpyAsync_v3020
+  runtime cudaStreamSynchronize_v3020
+# the program's clock
+  runtime cudaStreamDestroy_v5050
+  runtime cudaFree_v3020
+  runtime cudaSetDevice_v3020
+  runtime cudaFree_v3020
+  runtime cudaSetDevice_v3020
+cuptiActivityRegisterTimestampCallback(nullptr) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiActivityRegisterTimestampCallback(program_clock) -> CUPTI_SUCCESS
+API records on the program's clock: all
+work records on the program's clock: all
+cuptiGetTimestamp reads it: yes, one call apart by 1000
+# end

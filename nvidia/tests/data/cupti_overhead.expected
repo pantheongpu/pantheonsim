@@ -1,0 +1,5 @@
+first launch of a kernel: function loading yes, buffer request yes, flush cost no, times in order yes
+second launch of it: function loading no, buffer request no, flush cost no, times in order yes
+first launch of another: function loading yes, buffer request yes, flush cost no, times in order yes
+nothing since: function loading no, buffer request no, flush cost no, times in order yes
+# end

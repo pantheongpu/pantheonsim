@@ -97,6 +97,9 @@ class Device {
   std::vector<std::string> managed_globals(uint64_t module_id) const;
   // Whether the module defines a kernel of that name.
   bool has_kernel(uint64_t module_id, const std::string& name) const;
+  // The names of the kernels the module defines, in the order it declares them.
+  // Empty for a module that is not loaded.
+  std::vector<std::string> kernel_names(uint64_t module_id) const;
 
   void launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
               const std::vector<std::vector<uint8_t>>& args,

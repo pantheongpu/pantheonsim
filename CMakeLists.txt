@@ -479,6 +479,27 @@ if(CUDA_ABI_INCLUDE)
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_inc}.tmp" "${_dcbid_inc}")
   file(WRITE "${_dcbid_have}.tmp" "${_dcbid_have_text}")
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_have}.tmp" "${_dcbid_have}")
+  # The runtime calls' parameter structures for the callback API, from the
+  # toolkit's own generated_cuda_runtime_api_meta.h (scripts/gen_cupti_runtime_conv.py).
+  # Without Python the table is empty and only the calls converted by hand are
+  # delivered to callbacks; the activity records are not affected.
+  set(_conv_inc "${CMAKE_BINARY_DIR}/gen/cupti_runtime_conv.inc")
+  find_program(VGPU_PYTHON NAMES python3 python)
+  file(WRITE "${_conv_inc}.empty" "")
+  if(VGPU_PYTHON AND EXISTS "${CUDA_ABI_INCLUDE}/generated_cuda_runtime_api_meta.h" AND EXISTS "${_cbid_header}")
+    execute_process(
+      COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py"
+              "${CUDA_ABI_INCLUDE}/generated_cuda_runtime_api_meta.h" "${_cbid_header}" "${_conv_inc}.tmp"
+      RESULT_VARIABLE _conv_rc)
+    if(NOT _conv_rc EQUAL 0)
+      file(WRITE "${_conv_inc}.tmp" "")
+    endif()
+  else()
+    file(WRITE "${_conv_inc}.tmp" "")
+  endif()
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_conv_inc}.tmp" "${_conv_inc}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -508,7 +529,10 @@ if(CUDA_ABI_INCLUDE)
   add_library(vgpucublas SHARED nvidia/src/cublas_api.cpp nvidia/src/generated/cublas_stubs.cpp
               nvidia/src/cublas_xt.cpp nvidia/src/cublas_legacy_core.cpp
               nvidia/src/generated/cublas_64.cpp nvidia/src/generated/cublas_legacy.cpp)
-  target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
+  # The runtime ahead of the static core: the profiling state the routines
+  # silence while they stage operands (their copies are not the program's) must
+  # be the runtime's, not a private copy of it.
+  target_link_libraries(vgpucublas PRIVATE vgpucudart vgpu)
   target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE} nvidia/src)
   set_target_properties(vgpucublas PROPERTIES
     OUTPUT_NAME cublas SOVERSION ${SO_CUBLAS} VERSION ${SO_CUBLAS}.0)
@@ -560,6 +584,11 @@ if(CUDA_ABI_INCLUDE)
       # simulator and no runtime, as NVIDIA's has none. Linking libcudart here
       # put a second simulator into every driver-API program that uses NVRTC.
       target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})
+    elseif(_lower STREQUAL "cublaslt")
+      # The runtime ahead of the static core, so the profiling state the
+      # routines silence while they stage operands is the runtime's, not a
+      # private copy of it (as for cuBLAS above).
+      target_link_libraries(vgpu${_lower} PRIVATE vgpucudart vgpu)
     else()
       target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
     endif()
@@ -2216,6 +2245,20 @@ if(TARGET vgpucupti)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
+
+  # The rest of what a profiler reads: the parameter structures of runtime calls,
+  # allocation and pool records, graphs, modules and streams, and the switches
+  # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
+  # an RTX 3060 (nvidia/docs/cupti.md).
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um)
+    add_test(NAME e2e_cupti_${_case}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
+    set_tests_properties(e2e_cupti_${_case} PROPERTIES
+      DEPENDS vgpucupti
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
 
   # The same for a program that uses only the driver API: the driver calls, the
   # kernels, copies, fills and waits they issue, and the context and streams.

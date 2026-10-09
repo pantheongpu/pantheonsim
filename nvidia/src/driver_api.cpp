@@ -20,6 +20,7 @@
 #include <deque>
 #include <dlfcn.h>
 #include <fstream>
+#include <unistd.h>
 #include <iterator>
 #include <sstream>
 #include <memory>
@@ -477,14 +478,20 @@ std::string nvrtc_ptx_for_cubin(const void* cubin, size_t size) {
   return ptx;
 }
 
-// A bare cubin's size: the end of its section table (all the driver has to go by, handed a pointer).
+// A bare cubin's size: where the image ends, the later of its section table and its program header
+// table, which a cubin keeps after the sections (an RTX 3060 reports the cubin it loaded as that size).
+// All the driver has to go by, handed a pointer.
 size_t bare_cubin_size(const uint8_t* b) {
-  uint64_t shoff;
-  uint16_t shentsize, shnum;
+  uint64_t shoff, phoff;
+  uint16_t shentsize, shnum, phentsize, phnum;
   std::memcpy(&shoff, b + 0x28, 8);
   std::memcpy(&shentsize, b + 0x3a, 2);
   std::memcpy(&shnum, b + 0x3c, 2);
-  return static_cast<size_t>(shoff + static_cast<uint64_t>(shentsize) * shnum);
+  std::memcpy(&phoff, b + 0x20, 8);
+  std::memcpy(&phentsize, b + 0x36, 2);
+  std::memcpy(&phnum, b + 0x38, 2);
+  return static_cast<size_t>(std::max(shoff + static_cast<uint64_t>(shentsize) * shnum,
+                                      phoff + static_cast<uint64_t>(phentsize) * phnum));
 }
 
 // The PTX the NVRTC shim noted for this cubin, when the SASS engine cannot run all of the cubin yet --
@@ -687,6 +694,7 @@ void record_memset(ShimState& s, CUdeviceptr dst, uint32_t value, size_t bytes, 
 
 // A context coming into being: a subscriber is told, and a context record made.
 void announce_context_created(ShimState& s, uintptr_t handle) {
+  vgpu::profiling::note_context_made();
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   const uint32_t device = profiled_device(s);
   vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextCreated, handle, device);
@@ -696,6 +704,7 @@ void announce_context_created(ShimState& s, uintptr_t handle) {
     ev.device = device;
     ev.start_ns = ev.end_ns = vgpu::profiling::now_ns();
     ev.correlation = vgpu::profiling::work_correlation();
+    ev.handle = handle;   // a context of the driver's own, not the device's primary one
     vgpu::profiling::record(std::move(ev));
   }
 }
@@ -1142,10 +1151,28 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease(CUdevice dev) {
 
 /* ---- memory ---- */
 
+// A profiler's record of memory coming or going (vgpu/profiling.hpp), as the
+// runtime tells it.
+static void profile_memory(uint8_t op, uint64_t address, uint64_t bytes, vgpu::profiling::MemKind kind, int device) {
+  if (!vgpu::profiling::enabled()) return;
+  vgpu::profiling::Event e;
+  e.kind = vgpu::profiling::EventKind::Memory;
+  e.op = op;
+  e.start_ns = e.end_ns = vgpu::profiling::host_ns();
+  e.device = static_cast<uint32_t>(device);
+  e.correlation = vgpu::profiling::work_correlation();
+  e.process_id = static_cast<uint32_t>(::getpid());
+  e.address = address;
+  e.bytes = bytes;
+  e.src_kind = kind;
+  vgpu::profiling::record(std::move(e));
+}
+
 static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   return api("cuMemAlloc", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     *dptr = current(s).memory().alloc(bytesize);
+    profile_memory(1, *dptr, bytesize, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -1159,6 +1186,7 @@ VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
 static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
     if (auto it = s.managed.find(dptr); it != s.managed.end()) {
+      profile_memory(2, dptr, it->second, vgpu::profiling::MemKind::Managed, current_device(s));
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
       std::free(reinterpret_cast<void*>(dptr));
       s.managed_device.erase(dptr);
@@ -1168,7 +1196,10 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
     }
     // The device heap's blocks are not the host's to free (as cudaFree).
     if (owner_memory(s, dptr).heap_contains(dptr)) return CUDA_ERROR_INVALID_VALUE;
+    uint64_t base = 0, size = 0;
+    const bool known = owner_memory(s, dptr).find_allocation(dptr, &base, &size);
     owner_memory(s, dptr).free(dptr);
+    profile_memory(2, dptr, known ? size : 0, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -1259,6 +1290,57 @@ VGPU_EXPORT CUresult cuMemGetInfo(size_t* f, size_t* t) { return cuMemGetInfo_v2
 
 /* ---- modules / launch ---- */
 
+// What a profiler is told of a module loaded through the driver API (the same
+// callbacks as the runtime's, vgpu/profiling.hpp): the driver loads a module
+// when asked, with its code when that is a cubin this engine holds (the module
+// came as a cubin, or as a fatbin with SASS for the device) and no code when it
+// is PTX the engine compiles itself.
+struct ModuleProf {
+  uint32_t id = 0;
+  int device = 0;
+  std::string cubin;
+};
+static std::mutex g_module_prof_mu;
+static std::unordered_map<uintptr_t, ModuleProf> g_module_prof;
+
+static void announce_module_event(vgpu::profiling::Resource what, const ModuleProf& m) {
+  if (!vgpu::profiling::hooked() || vgpu::profiling::silenced()) return;
+  vgpu::profiling::ResourceInfo info;
+  info.what = what;
+  info.device = static_cast<uint32_t>(m.device);
+  info.module_id = m.id;
+  info.cubin = m.cubin.empty() ? nullptr : m.cubin.data();
+  info.cubin_size = m.cubin.size();
+  vgpu::profiling::notify_resource(info);
+}
+
+static void announce_module_loaded(uintptr_t handle, int device, const uint8_t* cubin, size_t cubin_size,
+                                   const std::vector<std::string>& functions) {
+  ModuleProf m;
+  m.id = vgpu::profiling::next_module_id(static_cast<uint32_t>(device));
+  m.device = device;
+  if (cubin && cubin_size) m.cubin.assign(reinterpret_cast<const char*>(cubin), cubin_size);
+  {
+    std::lock_guard<std::mutex> lock(g_module_prof_mu);
+    g_module_prof[handle] = m;
+  }
+  announce_module_event(vgpu::profiling::Resource::ModuleLoaded, m);
+  if (!vgpu::profiling::enabled()) return;
+  uint32_t index = 0;
+  for (const std::string& name : functions) {   // in the order the source declares them (see the runtime's)
+    vgpu::profiling::Event e;
+    e.kind = vgpu::profiling::EventKind::Function;
+    e.start_ns = e.end_ns = vgpu::profiling::host_ns();
+    e.device = static_cast<uint32_t>(device);
+    e.correlation = vgpu::profiling::work_correlation();
+    e.module_id = m.id;
+    e.function_index = index++;
+    e.name = name;
+    e.handle = vgpu::profiling::next_function_id();
+    vgpu::profiling::record(std::move(e));
+  }
+}
+
 static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
   return api("cuModuleLoadData", true, false, [&](ShimState& s) {
     if (!module || !image) return CUDA_ERROR_INVALID_VALUE;
@@ -1268,6 +1350,7 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     std::memcpy(&magic, image, 4);
     int dev = current_device(s);
     uint64_t mid = 0;
+    std::vector<uint8_t> loaded_cubin;   // the module's code, when it is a cubin (for a profiler)
     const vgpu::DeviceProfile& prof = s.rt->device(dev).profile();
     const uint32_t cc = static_cast<uint32_t>(prof.cc_major * 10 + prof.cc_minor);
     if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
@@ -1276,6 +1359,7 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       const std::string cubin = vgpu::cuda::pick_cubin(image, cc);
       if (!cubin.empty()) {
         mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size());
+        loaded_cubin.assign(cubin.begin(), cubin.end());
       } else {
         extracted = best_ptx(image);
         text = extracted.c_str();
@@ -1288,13 +1372,8 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       const auto* b = static_cast<const uint8_t*>(image);
       // OS/ABI 0x41 is CUDA 13's (ELF ABI version 8), 0x33 CUDA 12's (7).
       if (b[4] != 2 || (b[7] != 0x41 && b[7] != 0x33)) return CUDA_ERROR_INVALID_IMAGE;
-      // A bare cubin: its size is in its own headers (the section table ends it).
-      uint64_t shoff;
-      uint16_t shentsize, shnum;
-      std::memcpy(&shoff, b + 0x28, 8);
-      std::memcpy(&shentsize, b + 0x3a, 2);
-      std::memcpy(&shnum, b + 0x3c, 2);
-      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;   // (bare_cubin_size)
+      // A bare cubin: its size is in its own headers (see bare_cubin_size).
+      const uint64_t size = bare_cubin_size(b);
       uint32_t eflags;
       std::memcpy(&eflags, b + 0x30, 4);
       // The architecture is in e_flags' second byte from ABI version 8 on,
@@ -1311,6 +1390,7 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
         if (e.code() == vgpu::Err::InvalidValue) return CUDA_ERROR_INVALID_IMAGE;
         throw;
       }
+      loaded_cubin.assign(b, b + size);
     } else {
       mid = s.rt->device(dev).load_module(text);
     }
@@ -1318,6 +1398,13 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};
     *module = reinterpret_cast<CUmodule>(h);
+    announce_module_loaded(h, dev, loaded_cubin.data(), loaded_cubin.size(),
+                           [&] {
+                             std::vector<std::string> names;
+                             if (vgpu::profiling::enabled()) names = s.rt->device(dev).kernel_names(mid);
+                             if (!loaded_cubin.empty()) std::reverse(names.begin(), names.end());
+                             return names;
+                           }());
     return CUDA_SUCCESS;
   });
 }
@@ -1732,6 +1819,20 @@ static CUresult cuModuleUnload_impl(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
+    {
+      ModuleProf m;
+      bool known = false;
+      {
+        std::lock_guard<std::mutex> lock(g_module_prof_mu);
+        const auto p = g_module_prof.find(h);
+        if (p != g_module_prof.end()) {
+          m = std::move(p->second);
+          g_module_prof.erase(p);
+          known = true;
+        }
+      }
+      if (known) announce_module_event(vgpu::profiling::Resource::ModuleUnloadStarting, m);
+    }
     unload_module(s, dev, mid);
     s.modules.erase(it);
     for (auto fit = s.functions.begin(); fit != s.functions.end();) {
@@ -1927,6 +2028,19 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     cfg.device_heap_bytes = lim.malloc_heap;
     cfg.stack_bytes = lim.stack;
     cfg.devrt = &driver_devrt_services();
+    if (vgpu::profiling::hooked()) {
+      ModuleProf m;
+      bool known = false;
+      {
+        std::lock_guard<std::mutex> lock(g_module_prof_mu);
+        const auto p = g_module_prof.find(rec.module_handle);
+        if (p != g_module_prof.end()) {
+          m = p->second;
+          known = true;
+        }
+      }
+      if (known) announce_module_event(vgpu::profiling::Resource::ModuleProfiled, m);
+    }
     const bool profiling = vgpu::profiling::enabled();
     const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
@@ -2710,6 +2824,7 @@ static CUresult cuMemHostAlloc_impl(void** pp, size_t bytesize, unsigned int fla
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
     pinned(s)[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
     *pp = p;
+    profile_memory(1, reinterpret_cast<uint64_t>(p), bytesize, vgpu::profiling::MemKind::Pinned, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -2727,6 +2842,7 @@ static CUresult cuMemFreeHost_impl(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
     auto it = pinned(s).find(p);
     if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
+    profile_memory(2, reinterpret_cast<uint64_t>(p), it->second.size, vgpu::profiling::MemKind::Pinned, current_device(s));
     for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
     pinned(s).erase(it);
     std::free(p);
@@ -4232,12 +4348,22 @@ static CUresult cuEventCreate_impl(void** ev, unsigned int flags) {
 VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
   return traced("cuEventCreate", cuEventCreate_impl, ev, flags);
 }
-static CUresult cuEventRecord_impl(void* ev, CUstream) {
+static CUresult cuEventRecord_impl(void* ev, CUstream stream) {
   return api("cuEventRecord", true, false, [&](ShimState& s) {
     auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
     if (it == s.events.end()) return CUDA_ERROR_INVALID_VALUE;
     it->second.recorded = true;
     clock_gettime(CLOCK_MONOTONIC, &it->second.when);
+    if (vgpu::profiling::enabled()) {
+      vgpu::profiling::Event e;
+      e.kind = vgpu::profiling::EventKind::CudaEvent;
+      e.start_ns = e.end_ns = vgpu::profiling::now_ns();
+      e.device = static_cast<uint32_t>(current_device(s));
+      e.correlation = vgpu::profiling::work_correlation();
+      e.stream = reinterpret_cast<uint64_t>(stream);
+      e.handle = reinterpret_cast<uint64_t>(ev);
+      vgpu::profiling::record(std::move(e));
+    }
     return CUDA_SUCCESS;
   });
 }
