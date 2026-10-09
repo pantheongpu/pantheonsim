@@ -44,7 +44,7 @@ for lib in "$@"; do
   # cuDNN's headers are fetched at configure time; the others' are the simulator's own
   # (nvidia/include/vgpu_*.h).
   [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cusparseLt || "$lib" == cutensor || "$lib" == cutensornet || "$lib" == cudnn ||
-     "$lib" == cufile || "$lib" == nvcomp || "$lib" == nvshmem_host ]] && links+=("-L$shim")
+     "$lib" == cufile || "$lib" == nvcomp || "$lib" == nvcomp_cpu || "$lib" == nvshmem_host ]] && links+=("-L$shim")
   if [[ "$lib" == cudnn ]]; then
     cudnn_inc="$(cudnn_include_dir)" || { echo "SKIP: no cuDNN headers (see scripts/fetch-cudnn-headers.py)"; exit 0; }
     links+=("-I$cudnn_inc")

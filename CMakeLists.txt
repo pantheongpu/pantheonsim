@@ -809,7 +809,7 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
   file(WRITE "${_nvcomp_map}"
-       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; };\n  local: *;\n};\n")
+       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; nvcompGzipStreaming*; };\n  local: *;\n};\n")
   add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
               nvidia/src/nvcomp_gdeflate.cpp nvidia/src/nvcomp_manager.cpp)
   target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
@@ -1028,7 +1028,7 @@ libcutensor.2.7.0 {
     message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
     add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp)
     target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
-    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE})
+    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE} nvidia/src)
     set_target_properties(vgpunvenc PROPERTIES OUTPUT_NAME nvidia-encode SOVERSION 1)
     add_custom_command(TARGET vgpunvenc POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
@@ -1038,6 +1038,46 @@ libcutensor.2.7.0 {
   else()
     message(STATUS "nvEncodeAPI.h not found: skipping libvgpunvenc")
   endif()
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvcuvid: NVDEC's API (cuvid*), presented as libnvcuvid.so.1. Motion
+  # JPEG is decoded on the host by the nvJPEG library's codec, compiled in here
+  # (hidden: only cuvid* is exported); every other codec reports itself
+  # unsupported. The Video Codec SDK headers are vendored in
+  # nvidia/third_party/nvdec_include.
+  # ---------------------------------------------------------------------------
+  if(EXISTS "${CMAKE_SOURCE_DIR}/nvidia/third_party/nvdec_include/nvcuvid.h")
+    set(_nvcuvid_map "${CMAKE_BINARY_DIR}/maps/libnvcuvid.so.1.map")
+    file(WRITE "${_nvcuvid_map}" "{\n  global: cuvid*;\n  local: *;\n};\n")
+    add_library(vgpunvcuvid SHARED nvidia/src/nvcuvid_api.cpp nvidia/src/nvjpeg_api.cpp)
+    target_link_libraries(vgpunvcuvid PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpunvcuvid PRIVATE ${CUDA_ABI_INCLUDE} nvidia/third_party/nvdec_include)
+    set_target_properties(vgpunvcuvid PROPERTIES OUTPUT_NAME nvcuvid SOVERSION 1 VERSION 1.0)
+    target_link_options(vgpunvcuvid PRIVATE "-Wl,--version-script=${_nvcuvid_map}")
+    add_custom_command(TARGET vgpunvcuvid POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcuvid.so.1.0"
+              "${CMAKE_BINARY_DIR}/shim/libnvcuvid.so.1"
+      COMMENT "Creating NVDEC shim symlink (build/shim/libnvcuvid.so.1)")
+  endif()
+
+  # libvgpunvcomp_cpu: nvCOMP's CPU library (libnvcomp_cpu.so.5), the GDeflate
+  # compressor and decompressor that run on the host. It carries its own copy of
+  # the GDeflate codec and exports only gdeflate::*.
+  set(_nvcomp_cpu_map "${CMAKE_BINARY_DIR}/maps/libnvcomp_cpu.so.5.map")
+  file(WRITE "${_nvcomp_cpu_map}"
+       "{\n  global:\n    extern \"C++\" { gdeflate::*; };\n  local: *;\n};\n")
+  add_library(vgpunvcomp_cpu SHARED nvidia/src/nvcomp_cpu_api.cpp nvidia/src/nvcomp_codecs.cpp nvidia/src/nvcomp_gdeflate.cpp)
+  target_include_directories(vgpunvcomp_cpu PRIVATE ${CUDA_ABI_INCLUDE} include nvidia/src)
+  set_target_properties(vgpunvcomp_cpu PROPERTIES OUTPUT_NAME nvcomp_cpu SOVERSION 5 VERSION 5.3)
+  target_link_options(vgpunvcomp_cpu PRIVATE "-Wl,--version-script=${_nvcomp_cpu_map}")
+  add_custom_command(TARGET vgpunvcomp_cpu POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp_cpu.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp_cpu.so.5"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp_cpu.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp_cpu.so"
+    COMMENT "Creating nvCOMP CPU shim symlinks (build/shim/libnvcomp_cpu.so.5)")
 else()
   message(STATUS "CUDA ABI headers not found: skipping libvgpucudart (core unaffected)")
 endif()
@@ -1134,6 +1174,9 @@ add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpu
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # CDNA machine code, decoded and checked against what the assembler wrote.
+# The H.264 and HEVC writers behind NVENC, read back by decoders of their own.
+vgpu_unit_test(test_nvenc_h264 nvidia/tests/unit/test_nvenc_h264.cpp)
+vgpu_unit_test(test_nvenc_hevc nvidia/tests/unit/test_nvenc_hevc.cpp)
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
@@ -1862,7 +1905,7 @@ if(TARGET vgpucublas)
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
                           "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp"
+                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
                           "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
@@ -1999,6 +2042,19 @@ if(TARGET vgpucublas)
     set_tests_properties(e2e_nvenc PROPERTIES
       DEPENDS vgpunvenc
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};NVENC_INCLUDE=${NVENC_INCLUDE}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
+
+  # NVDEC's cuvid API (Motion JPEG), against what an RTX 3060's libnvcuvid printed
+  # and the NV12 pixels it wrote (nvidia/tests/data/nvdec).
+  if(TARGET vgpunvcuvid)
+    add_test(NAME e2e_nvcuvid
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvcuvid.sh)
+    set_tests_properties(e2e_nvcuvid PROPERTIES
+      DEPENDS vgpunvcuvid
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endif()
 

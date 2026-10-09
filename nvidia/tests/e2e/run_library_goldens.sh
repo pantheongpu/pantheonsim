@@ -28,10 +28,11 @@ fail=0
 # library, since cuDNN is not part of the toolkit; cudnn_types prints
 # half-precision results, so it is compared to half precision. npp_imgproc's
 # integer results are compared exactly whatever the tolerance; its floats
-# (single-precision image arithmetic, summed) to 1e-4.
+# (single-precision image arithmetic, summed) to 1e-4. npp_segment is all
+# integers (the watershed and marker-label compression).
 npp_libs=-lnppc,-lnppial,-lnppicc,-lnppidei,-lnppif,-lnppig,-lnppim,-lnppist,-lnppisu,-lnppitc,-lnpps
 for spec in cublas_level1:-lcublas cusparse_ops:-lcusparse cudnn_backward:-lcudnn cudnn_types:-lcudnn:1e-3 \
-            npp_imgproc:$npp_libs:1e-4; do
+            npp_imgproc:$npp_libs:1e-4 npp_segment:$npp_libs:1e-4; do
   name="${spec%%:*}" rest="${spec#*:}"
   lib="${rest%%:*}" tol=1e-5 inc=""
   [[ "$rest" == *:* ]] && tol="${rest#*:}"

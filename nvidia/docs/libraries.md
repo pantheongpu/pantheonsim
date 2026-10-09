@@ -46,7 +46,15 @@ entropy-coded data decodes what is there; NV12 only from 4:2:0, YUY2 only from
 4:2:2, CMYK to RGB only with CMYK allowed; the decoupled transfer needs a
 device buffer attached; the hardware backend is `NVJPEG_STATUS_ARCH_MISMATCH`
 (an RTX 3060 has no JPEG engine; NVIDIA's A100 and H100 do, and the simulator
-answers the same on every profile); the batched API's argument checks;
+answers the same on every profile); the batched API's argument checks; which
+backends make a handle and a decoder; the frame types it parses without
+decoding (lossless, and samples of 2, 9, 12 or 16 bits -- encoding and
+precision reported, support flag 2, decode `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`)
+and those it will not parse (arithmetic and differential frames, and a
+hierarchical stream everywhere but the header-only parsers);
+`nvjpegEncoderParamsCopyMetadata` (every APPn segment of the parsed stream
+ahead of the encoder's JFIF header, which an APP0 replaces; COM left out; empty
+markers if the stream was parsed without `save_metadata`);
 `nvjpegEncodeGetBufferSize`'s bound. `e2e_nvjpeg_paths` checks all of it --
 the decodes against the card's output by checksum -- and passes against
 NVIDIA's libnvjpeg 13.0 on the card and against this one. An encoded
@@ -89,6 +97,11 @@ count, staged and running parameters, handle and buffer registration,
 batch API, the stream-ordered API, the statistics -- follows NVIDIA's libcufile
 from CUDA 13.0 on an RTX 3060 without nvidia-fs, statuses included (a data-path
 failure is -1 with the cuFile status in `errno`, as the card answers).
+A user-space file system handle (`CU_FILE_HANDLE_TYPE_USERSPACE_FS`, whose
+operation table is nvidia-fs's RDMA path's) registers, with any table but none
+(`CU_FILE_IO_NOT_SUPPORTED`), and then every `cuFileRead` and `cuFileWrite` on it
+returns 5006 -- the number, not -1 -- without calling the table or writing the
+buffer, as the card's does; this library says so once on stderr.
 `nvidia/tests/e2e/cufile_paths.cpp` passes against both libraries, the
 stream-ordered calls excepted: NVIDIA's blocks in stream memory operations
 under WSL, so those are checked on the simulator only.
@@ -126,6 +139,34 @@ checksums whose algorithm is not public (no standard CRC or hash matches
 them): a policy that computes them is refused, and one that verifies them if
 present decompresses and reports `nvcompErrorCannotVerifyChecksums`.
 
+LZ4's bitshuffle option (`nvcomp/lz4.h` documents that it works in 8 KiB
+sub-chunks over whole groups of eight elements, not the layout) is written to
+the layout the card wrote: for each bit plane, one byte per group of eight
+elements, element 0 in its low bit, the planes from the element's top bit down
+(`NVCOMP_BITSHUFFLE_MSB_FIRST`) or its bottom bit up, over 1-, 2- and 4-byte
+types (`BITS` as bytes), the elements past the last whole group left as they
+are. The card's oddities are kept: any non-zero mode but 1 compresses
+LSB-first while decompression unshuffles only modes 1 and 2; the temporary
+space is `32768 + chunk` rounded to 32 bytes per chunk with bitshuffle, 32768
+without; the decompression output alignment is the element size; and the
+8-byte integers are refused (`nvcompErrorNotSupported`) at the compress queries
+and at the decompress call. The manager classes still refuse the option.
+`nvcompGzipStreamingCompress` (`nvcomp/native/streaming_gzip.hpp`) reads a
+stream and writes it as one gzip member (the batched API reads it back), with
+the card's gigabyte workspace sizes and statuses; the streaming decompressor
+answers `nvcompErrorInvalidValue` for everything, as the RTX 3060 does -- it
+needs the hardware decompression engine, which no simulated GPU has either.
+`libnvcomp_cpu.so.5` carries `gdeflate::compressCPU`, `decompressCPU` and the
+bound `compressCPUGetMaxOutputChunkSize` with the card's limits and exception
+messages (`nvidia/tests/e2e/nvcomp_cpu.cpp`: chunks cross between the CPU and
+batched GPU interfaces both ways); `nvcomp::LZ4CPUManager` is not here.
+`nvcomp_paths`, `nvcomp_streaming` and `nvcomp_cpu` run against NVIDIA's
+libraries on the card too. Cascaded, Bitcomp and ANS stay refused, by name, once
+on stderr: nvCOMP's headers and documentation describe their options and not their
+bitstreams (nor Bitcomp's native API), so there is nothing documented to
+implement and a chunk written from guesswork would be unreadable by NVIDIA's
+library.
+
 The compressed bytes differ from NVIDIA's (another encoder makes other
 choices); the decompressed bytes never do. The queries -- alignments, maximum
 output sizes, status strings, which options are refused -- answer what nvCOMP
@@ -134,6 +175,63 @@ NVIDIA's to within 8 bytes and the temporary sizes are the simulator's (it
 needs none). A buffer too small and a corrupt chunk are
 `nvcompErrorCannotDecompress`, as documented; NVIDIA's LZ4 detects neither,
 which on the card is a write past the buffer or a fault.
+
+## NVENC and NVDEC: video, on the host
+
+`libnvidia-encode.so.1` and `libnvcuvid.so.1` are driver components that
+applications `dlopen` by their bare sonames, so the simulator supplies them the
+way it supplies `libcuda.so.1`. Everything an application can ask of either
+API is answered as an RTX 3060 (driver 595, NVENC API 13.0) answered it, from
+transcripts the card printed: `nvidia/tests/e2e/nvenc_api.cpp` with
+`nvenc_api.rtx3060.txt` (342 lines: every query, capability, preset
+configuration, limit and error string; the session's last error is sticky, as
+the card's), and `nvidia/tests/e2e/nvcuvid_paths.cpp` with
+`nvcuvid_paths.rtx3060.txt` (293 lines). `run_nvenc.sh --card` and
+`run_nvcuvid.sh --card` run the same programs against the real libraries.
+
+**NVENC.** The encoder is not NVIDIA's. A frame is written as an IDR picture
+whose every coding unit is PCM: macroblocks in H.264 (CAVLC,
+`nvidia/src/nvenc_h264.hpp`, written from ITU-T H.264) and 16x16 coding tree
+blocks in HEVC (`nvidia/src/nvenc_hevc.hpp`, written from ITU-T H.265, with the
+CABAC encoder HEVC cannot do without: one context-coded bin, `split_cu_flag`, and
+the terminate bins for `pcm_flag` and `end_of_slice_segment_flag`). Both are
+lossless and conformant, and read back exactly by ffmpeg
+(`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR through both codecs at
+sizes that are not multiples of 16 and are odd, up to 4K in the HEVC writer's own
+check, and compares every decoded sample); `test_nvenc_h264` and
+`test_nvenc_hevc` do the same with decoders of their own, no ffmpeg needed. It is
+not compression, and rate control, GOP structure, B-frames and every preset
+setting are accepted and change nothing; every picture is an IDR with one
+`idr_pic_id`, so encoding a frame twice gives the same bytes, which encoder SDC
+tests (pantheon's `media_enc_virus`: 4K HEVC, ARGB, forced IDR with the
+parameter sets on every frame, the first bitstream compared with each later one)
+rely on; `nvenc_encode.cu` replays that flow. RGB input is converted with the
+BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input is refused
+(`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it; AV1 sessions are
+refused at initialisation as the card refuses them. The card's own streams (an
+IDR, then P pictures) decode with ffmpeg too, which is how the layouts above
+were checked.
+
+**NVDEC.** Motion JPEG is a sequence of independent JPEG pictures, and the
+simulator has a JPEG decoder, so `cudaVideoCodec_JPEG` is decoded on the host
+(nvJPEG's codec, compiled into `libnvcuvid`) and written to NV12 surfaces
+as the card writes them: the pitch (the target width rounded to 512), the
+decoded padding past the right edge of the last MCU and the zeros below the
+picture, chroma at 4:2:0 -- a 4:4:4 or 4:2:2 picture resampled bilinearly, not
+averaged in blocks, as measured -- a picture cut or padded to the decoder's
+size, and a target size resampled (bilinear to enlarge; averaging to shrink,
+which is the card's exactly only for whole factors). Pixels agree with the
+card's to within one level on the baseline and restart-interval fixtures
+(`nvidia/tests/data/jpeg`, card output in `nvidia/tests/data/nvdec`). The
+subset is sequential 8-bit Huffman JPEG; the card refuses progressive pictures
+(`CUDA_ERROR_INVALID_IMAGE`, the picture's status `Error`) and four-component
+ones (the parser skips them), and so does this. Every other codec reports
+`bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser` answer
+`CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, H.264, HEVC, VP8, VP9
+and AV1 engines, and a software decoder for them is a large separate project --
+none is here, so an application falls back to its CPU decoder instead of
+receiving a wrong picture. `cuvidCreateVideoSource` (files and URLs) needs a
+demuxer and is refused the same way.
 
 ## NVSHMEM: one GPU per process, every heap shared
 
@@ -276,8 +374,8 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NCCL | `libnccl.so.2` | collectives (all-to-all, gather and scatter included, and the `nccl*Config` forms of each) and point-to-point across ranks; ncclCommSplit, ncclCommShrink, ncclCommGetUniqueId + ncclCommGrow, ncclCommRevoke, ncclCommSuspend/Resume/MemStats, ncclCommInitRankScalable, non-blocking communicators, pre-multiplied sums with host or device scalars, the `ncclParam*` registry; the device API's host side answers as the RTX 3060 pair does (unsupported) |
 | cuStateVec (cuQuantum) | `libcustatevec.so.1` | dense and diagonal gates with any controls, controlled index-bit swaps, probabilities, projection and Pauli expectation values: what QuEST's cuQuantum backend calls. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
-| cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration, batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
-| nvCOMP | `libnvcomp.so.5` | the low-level batched API and the C++ manager API for LZ4, Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, and CRC32; Cascaded, Bitcomp and ANS refused (no public bitstream) |
+| cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration (user-space file system handles register but, as on the card, do no I/O), batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
+| nvCOMP | `libnvcomp.so.5`, `libnvcomp_cpu.so.5` | the low-level batched API and the C++ manager API for LZ4 (bitshuffle included), Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, CRC32, streaming gzip compression, and the CPU GDeflate library; Cascaded, Bitcomp and ANS refused (no public bitstream) |
 | NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID: every type of the RMA lists (half and bfloat16 included) with nonblocking, strided and stream-ordered forms, typed collectives and reductions, atomics, waits in stream order, teams (also from a unique ID); the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
 | cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32, int8 (into int8, int32, fp16, bf16) and, on an sm_89 profile, E4M3 and E5M2 (into fp16, bf16, fp32) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
@@ -285,9 +383,10 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ at run time with the toolkit's own NVRTC: PTX, the cubin of an sm_ target, LTO-IR, OptiX-IR, precompiled headers, time tables (below) |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; LTO-IR through the toolkit's linker (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- compressed as NVIDIA's are, that the driver loads |
-| NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring -- every entry point OpenCV, DALI, FFmpeg and the CUDA Samples call but four (below) |
+| NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring, watershed segmentation -- every entry point OpenCV, DALI, FFmpeg, jetson-utils and the CUDA Samples call (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
-| NVENC | `libnvidia-encode.so.1` | video encode |
+| NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; H.264 and HEVC frames written as lossless PCM streams any decoder reads (below) |
+| NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
 
 ## Why the math runs on the host
 
@@ -328,11 +427,12 @@ output. Anything that differs is a bug in this implementation.
 | `nvrtc_jit` | identical: compile a kernel at run time, load the PTX, launch it, same numbers |
 | `npp_ops` | all 48 bit-identical, across arithmetic, logic, conversion, colour, statistics, morphology and resizing |
 | `npp_imgproc` | 289 results: every integer image identical (a dozen near-ties marked approximate, within a count on a pixel or two), floats to 1e‑5 -- warps, rotation, remapping, ResizeSqrPixel, mirroring, logic and shifts, alpha compositing, gamma, demosaicing, lookup, statistics, histograms, integral images, rank and morphological filters, Prewitt gradients and Canny |
+| `npp_segment` | watershed segmentation and marker-label compression: every buffer size and status; the segmented image under 8-way connectivity, every boundary type, 8- and 16-bit, a padded pitch; the marker labels of images without equal values; 4-way on images up to 4x4; label compression of any label image -- all identical. Labels of images with equal neighbouring values and 4-way on larger images are not (below) |
 | `nvjpeg_codec` | all 24 identical: header parsing exactly, pixels to within the IDCT's own tolerance |
 | `multi_gpu` | all 13 identical to two physical GPUs |
 
-Five of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward`,
-`cudnn_types` and `npp_imgproc`, also run in CI on every pull request: `e2e_library_goldens`
+Six of those suites, `cublas_level1`, `cusparse_ops`, `cudnn_backward`,
+`cudnn_types`, `npp_imgproc` and `npp_segment`, also run in CI on every pull request: `e2e_library_goldens`
 compiles them against the simulator alone and compares the output with what
 the RTX 3060 printed (`nvidia/tests/conformance/golden/`), so a change that
 makes a routine disagree with the hardware fails on a runner with no GPU.
@@ -785,21 +885,55 @@ NPP has some ten thousand entry points; which of them matter was settled by
 reading the programs that use it -- OpenCV's cudaarithm, cudaimgproc,
 cudawarping and cudafilters (and its core), DALI, FFmpeg's `scale_npp`,
 jetson-utils, torchvision (which calls none) and the CUDA Samples -- and
-collecting every `npp*` name they call: 253 functions. 249 of them are
-implemented:
+collecting every `npp*` name they call: 253 functions, all implemented:
 
 | user | calls | here |
 | --- | --- | --- |
 | OpenCV | 194 | all: warps (affine, perspective, both directions, every depth and channel count), rotation, mirroring in place and not, the logical and shift operators with constants, magnitude, alpha compositing and premultiplication, gamma, channel swaps, masked and float mean/standard deviation, even and ranged histograms with their level and buffer helpers, rectangle standard deviation, windowed sums, box, max and min filters, dilation and erosion with masks, float thresholds, transpose |
 | DALI | 12 | all: `nppiRemap` at every depth it uses, `nppiCFAToRGB` 8- and 16-bit |
 | FFmpeg | 3 | all: `nppiResizeSqrPixel_8u_C1R` (nearest, linear, cubic), the YCbCr 4:2:0 plane layouts |
-| CUDA Samples | 51 | all but the two in `watershedSegmentationNPP`: Canny, Prewitt gradient vectors, `nppiLUT_Linear`, `nppiCompareC`, border-replicating box filter, constant-border copy, every allocator |
+| CUDA Samples | 51 | all, `watershedSegmentationNPP` included (below): Canny, Prewitt gradient vectors, `nppiLUT_Linear`, `nppiCompareC`, border-replicating box filter, constant-border copy, every allocator, watershed segmentation and marker-label compression |
 | jetson-utils | 1 | `nppiCFAToRGB_8u_C1C3R` |
 
-What is left, ranked by those users: `nppiSegmentWatershed_8u_C1IR` and
-`nppiCompressMarkerLabelsUF_32u_C1IR` (with their buffer-size queries), one
-CUDA Sample between them -- both absent, so the sample fails at link time with
-the name. Beyond the list, nothing else of NPP's is implemented.
+Watershed segmentation (`nppiSegmentWatershed_8u_C1IR`, `_16u_`), its
+buffer-size queries and `nppiCompressMarkerLabelsUF_32u_C1IR` with its own
+(`watershedSegmentationNPP`) were the last of the 253. Beyond the list,
+nothing else of NPP's is implemented -- `nppiLabelMarkersUF` and the
+compressed-marker-label info and contour functions among it, which the same
+sample does not call.
+
+NVIDIA publishes no algorithm for the watershed, so it is reproduced from
+what NPP 13.0 does on an RTX 3060, probed with random, exhaustive and
+photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
+
+- **The segmented image is exact** under 8-way connectivity (`nppiNormInf`):
+  a pixel flows to its lowest strictly lower neighbour (the first of equal
+  ones in raster order) and takes the value where the flow ends. This held on
+  every probe, 300 images full of equal values included, and on the teapot,
+  skull and rocks images of the CUDA Samples. Boundary types are drawn on the
+  result exactly: a pixel whose upper or left neighbour has another value is
+  black, white, black-or-white by half the range (`CONTRAST`), or -- in
+  `ONLY` -- black on white.
+- **The marker labels are the pixel index above and to the left of the
+  region's lowest pixel** (the smallest index in its neighbourhood), exact on
+  every image whose values are all different. Where neighbouring values are
+  equal NPP's labels follow plateau rules nobody wrote down; the simulator
+  fits them (equal roots share a label, tied lowest neighbours link roots),
+  and on the three Samples images 96.2% (teapot), 98.5% (skull) and 99.5%
+  (rocks) of the labels are NVIDIA's. A label that differs moves every rank
+  after it in `nppiCompressMarkerLabelsUF`, so the compressed labels of
+  those images differ over most of the image though the regions agree.
+- **4-way connectivity** (`nppiNormL1`) matches on images up to 4x4. On larger
+  ones NPP leaves pixels near the right and bottom edges unwritten, in a
+  pattern that depends on the image width and none of the shapes tried fits
+  (it is under 0.5% of a 512x512 image for the skull and teapot, a few tenths
+  of a percent for rocks); the simulator writes them.
+- Label compression is exact for any label image: labels below
+  `nStartingNumber` take their rank among the labels present plus 0, which is
+  always counted, so 0 stays 0, an image with no 0 starts at 1 and
+  `*pNewNumber` counts 0; larger labels are left alone.
+- Statuses and buffer sizes (72 bytes plus, per row, 24 or 32 bytes a pixel
+  rounded up to 128; the compression's 65,556 plus 8 a label) are NVIDIA's.
 
 The conventions NPP leaves unwritten were measured on an RTX 3060 against
 NPP 13.0 and are recorded at each function in `npp_core.hpp` and
@@ -1280,17 +1414,30 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   code's expectations (LSA barriers in the resource window, flat peer address ranges, GIN
   contexts) and the `libnccl_device` bitcode that links such kernels is LTO-IR -- none of which
   can be checked here. A hardware check of those wants an NVLink machine (an AWS p4d or p5).
-- **cuFile**: the nvidia-fs (DMA) path itself, RDMA and user-space file system
-  handles (`CU_FILE_HANDLE_TYPE_USERSPACE_FS`, refused as
-  `CU_FILE_IO_NOT_SUPPORTED`), and the POSIX bounce-buffer pool's
+- **cuFile**: the nvidia-fs (DMA) path itself and RDMA -- a user-space file
+  system handle registers and its I/O returns 5006, as on the card without
+  nvidia-fs, the table never called -- and the POSIX bounce-buffer pool's
   configuration (accepted, nothing to configure).
 - **nvCOMP**: Cascaded, Bitcomp and ANS, whose bitstreams NVIDIA does not
-  publish -- every entry point answers `nvcompErrorNotSupported` -- and LZ4's
-  bitshuffle option, likewise; the container's checksums (their algorithm is
-  not public: computing them is refused, verifying them reports
-  `nvcompErrorCannotVerifyChecksums`); the CPU and streaming gzip APIs; and
-  the hardware decompression engine (the backend option is accepted;
-  everything runs on the host).
+  publish (its headers describe the options, not the formats) -- every entry
+  point answers `nvcompErrorNotSupported` and says why once; LZ4's bitshuffle
+  through the manager classes (the batched API has it); the container's
+  checksums (their algorithm is not public: computing them is refused,
+  verifying them reports `nvcompErrorCannotVerifyChecksums`);
+  `nvcomp::LZ4CPUManager`; streaming gzip decompression (the card refuses it
+  too: no hardware decompression engine); and the hardware decompression
+  engine itself (the backend option is accepted; everything runs on the host).
+- **NVENC**: AV1 (refused at initialisation, as on the card), 10-bit and 4:4:4
+  encoding (`NV_ENC_ERR_UNSUPPORTED_PARAM`), motion-only encoding, asynchronous
+  mode (refused with the card's message), and real compression: H.264 and HEVC
+  frames are lossless PCM IDR pictures, and P and B pictures, rate control, lookahead
+  and the preset act on nothing. The bytes are not NVIDIA's.
+- **NVDEC**: every codec but JPEG (reported unsupported), progressive JPEG
+  (the card refuses it too), display-area and target-rectangle cropping,
+  deinterlacing, output formats other than NV12 (the card refuses those), video
+  sources, and the card's decode of truncated or damaged pictures (the card
+  returns success with whatever its engine makes of them; a picture the host
+  decoder cannot parse is `CUDA_ERROR_INVALID_IMAGE` here).
 - **NVSHMEM**: the MPI and OpenSHMEM bootstraps (refused by name: use the
   unique ID; OpenMPI is installed on the host used here but `mpirun` does not start a job on
   it, so a bootstrap through MPI could be written and not run), PEs on more than one node
@@ -1320,10 +1467,13 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   Samples call (see "NPP: what real programs call") plus the original subset
   -- allocation, per-pixel arithmetic and logic, data exchange, colour
   conversion, thresholding, statistics, filters, morphology, resizing, and
-  the signal-processing equivalents. Not implemented: watershed segmentation
-  and marker-label compression (one CUDA Sample), and the rest of NPP's ten thousand entry
-  points, which are absent rather than approximated, so a program that needs
-  more fails at link time with a name.
+  the signal-processing equivalents, watershed segmentation and marker-label
+  compression (labels inexact where neighbouring values are equal; 4-way
+  connectivity inexact near the edges of images wider than 4: see "NPP: what
+  real programs call"). Not implemented: `nppiLabelMarkersUF` and the
+  compressed-marker-label functions built on it, and the rest of NPP's ten
+  thousand entry points, which are absent rather than approximated, so a
+  program that needs more fails at link time with a name.
 - **CUDA runtime and driver**: textures of BC6H and BC7 blocks (arrays of them can be made and filled; creating
   a texture object answers `cudaErrorNotSupported` / `CUDA_ERROR_NOT_SUPPORTED` by name; see nvidia/docs/textures.md);
   `cudaImportExternalMemory` and
@@ -1357,12 +1507,23 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   child that waits for its parent, hangs here where it runs on the card. A
   device-side `cudaMemsetAsync` fills with its value; the card's wrote zeros
   whatever it was.
-- **nvJPEG**: 12-bit samples, arithmetic coding, lossless and hierarchical
-  JPEG (refused by name, `NVJPEG_STATUS_JPEG_NOT_SUPPORTED`); the hardware
-  backend and what only it does (`nvjpegDecodeBatchedEx`, scaled decodes,
-  applying an EXIF orientation, `nvjpegDecodeBatchedParseJpegTables`);
-  carrying metadata or Huffman tables from a parsed image into an encode; and
-  the transcoding entry points.
+- **nvJPEG**: decoding 12-bit (or any non-8-bit) samples, arithmetic coding,
+  lossless and hierarchical JPEG -- the card refuses all of them on its
+  default backend (`NVJPEG_STATUS_JPEG_NOT_SUPPORTED` at decode; arithmetic and
+  differential frames already at the parse) and so do we. The card has one
+  lossless path, the lossless backend through the batched API with 16-bit
+  interleaved output, and on the RTX 3060 it is not usable: for
+  predictor-1 streams it returns the right samples for the first ~40 bytes of
+  entropy-coded data and wrong ones after (checked against ffmpeg's decode of
+  the same files, with fixed-length and optimal tables, 8, 12 and 16 bits),
+  zeros for any stream with a restart interval, and
+  `NVJPEG_STATUS_JPEG_NOT_SUPPORTED` for predictors 2 to 7 and for 3-component
+  files; the simulator refuses lossless the same way (`JPEG_NOT_SUPPORTED`)
+  rather than invent that output. The hardware backend and what only it does
+  (`nvjpegDecodeBatchedEx`, scaled decodes, applying an EXIF orientation,
+  `nvjpegDecodeBatchedParseJpegTables`) is the card's `ARCH_MISMATCH`/refusal
+  on the default backend too; `nvjpegEncoderParamsCopyHuffmanTables` is a
+  no-op (the 13.0 library does not export it).
 
 Add them the way the PTX subset grew: hit one, implement it, prove it against
 hardware.

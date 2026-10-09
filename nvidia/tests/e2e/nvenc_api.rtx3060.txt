@@ -1,0 +1,342 @@
+GetMaxSupportedVersion: 0, 13.0
+GetMaxSupportedVersion(null): 6
+CreateInstance(null): 6
+CreateInstance(version+1): 0
+CreateInstance(version 0): 15
+CreateInstance: 0
+function table: slots missing: none
+OpenEncodeSessionEx(null params): 6
+OpenEncodeSessionEx(null encoder out): 6
+OpenEncodeSessionEx(null device): 6
+OpenEncodeSessionEx(version 0): 15
+OpenEncodeSessionEx(api version too new): 0
+OpenEncodeSessionEx(api version 0): 0
+OpenEncodeSessionEx(device type 0): 2
+OpenEncodeSessionEx(device type 2): 4
+OpenEncodeSessionEx(device type 7): 2
+OpenEncodeSessionEx: 0
+  last error after open: "Success."
+GetEncodeGUIDCount: 0, 2
+GetEncodeGUIDs: 0, 2: NV_ENC_CODEC_H264_GUID NV_ENC_CODEC_HEVC_GUID
+GetEncodeGUIDs(room for 1): 0
+  got 1
+GetEncodeGUIDCount(null): 6
+GetEncodeGUIDCount(null session): 3
+== H264
+profiles: count 0, 6; list 0, 6: NV_ENC_H264_PROFILE_BASELINE_GUID NV_ENC_H264_PROFILE_MAIN_GUID NV_ENC_H264_PROFILE_HIGH_GUID NV_ENC_H264_PROFILE_STEREO_GUID NV_ENC_H264_PROFILE_HIGH_444_GUID NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID
+input formats: 0/0, 9: 0x1 0x10 0x100 0x1000 0x1000000 0x10000000 0x4000000 0x2000000 0x20000000
+caps: 0:4 1:3 2:0 3:0 4:0 5:1 6:1 7:1 8:1 9:1 10:4 11:1 12:1 13:62 14:10 15:1 16:4096 17:4096 18:1 19:1 20:1 21:1 22:0 23:1 24:1 25:1 26:1 27:1 28:1 29:0 30:0 31:65536 32:983040 33:1 34:1 35:0 36:1 37:1 38:1 39:0 40:8 41:1 42:0 43:3 44:1 45:145 46:49 47:1 48:0 49:1 50:1 51:1 52:1 53:0 54:1 55:1 56:0 57:0 58:0 59:0 60:0 61:st8 62:st8 63:st8 64:st8 65:st8 66:st8 67:st8 68:st8 69:st8
+presets: 0/0, 7: NV_ENC_PRESET_P1_GUID NV_ENC_PRESET_P2_GUID NV_ENC_PRESET_P3_GUID NV_ENC_PRESET_P4_GUID NV_ENC_PRESET_P5_GUID NV_ENC_PRESET_P6_GUID NV_ENC_PRESET_P7_GUID
+preset p1 tuning 1: hash 805fc107a504fb31 gop 250 P 1 rc 1 qp 28/31/25 maxbitrate 0
+preset p1 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p1 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p1 tuning 4: hash 97287644426b3819 gop 250 P 1 rc 0 qp 0/0/0 maxbitrate 0
+preset p2 tuning 1: hash 805fc107a504fb31 gop 250 P 1 rc 1 qp 28/31/25 maxbitrate 0
+preset p2 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p2 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p2 tuning 4: hash 97287644426b3819 gop 250 P 1 rc 0 qp 0/0/0 maxbitrate 0
+preset p3 tuning 1: hash 7e3c572d7453e811 gop 250 P 2 rc 1 qp 28/31/25 maxbitrate 0
+preset p3 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p3 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p3 tuning 4: hash 97287644426b3819 gop 250 P 1 rc 0 qp 0/0/0 maxbitrate 0
+preset p4 tuning 1: hash 83f5a91283c6a915 gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p4 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p4 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p4 tuning 4: hash b4e095a843257ddf gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+preset p5 tuning 1: hash 83f5a91283c6a915 gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p5 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p5 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p5 tuning 4: hash f43dc463a6263aec gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+preset p6 tuning 1: hash 442bf5bad03dcb65 gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p6 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p6 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p6 tuning 4: hash ac8756185b67df3c gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+preset p7 tuning 1: hash 9e0841f37523af49 gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p7 tuning 2: hash 423f317f2093aa1b gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p7 tuning 3: hash ec6407e5b6059d99 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p7 tuning 4: hash b3e1c0140c73dc20 gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+GetEncodePresetConfig (legacy form): 12
+GetEncodePresetConfigEx(bad preset guid): 12
+GetEncodePresetConfigEx(tuning 0): 12
+GetEncodePresetConfigEx(tuning 9): 12
+GetEncodePresetConfigEx(version 0): 15
+GetEncodePresetConfigEx(null): 6
+== HEVC
+profiles: count 0, 4; list 0, 4: NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID NV_ENC_HEVC_PROFILE_MAIN_GUID NV_ENC_HEVC_PROFILE_MAIN10_GUID NV_ENC_HEVC_PROFILE_FREXT_GUID
+input formats: 0/0, 11: 0x1 0x10 0x100 0x1000 0x10000 0x100000 0x1000000 0x10000000 0x4000000 0x2000000 0x20000000
+caps: 0:5 1:3 2:0 3:0 4:0 5:1 6:0 7:1 8:0 9:0 10:4 11:0 12:0 13:186 14:30 15:0 16:8192 17:8192 18:1 19:1 20:1 21:1 22:0 23:1 24:1 25:1 26:1 27:1 28:1 29:0 30:0 31:262144 32:983040 33:1 34:1 35:1 36:1 37:1 38:1 39:1 40:7 41:1 42:0 43:3 44:0 45:129 46:33 47:1 48:1 49:1 50:1 51:1 52:1 53:0 54:1 55:1 56:3 57:1 58:1 59:0 60:1 61:st8 62:st8 63:st8 64:st8 65:st8 66:st8 67:st8 68:st8 69:st8
+presets: 0/0, 7: NV_ENC_PRESET_P1_GUID NV_ENC_PRESET_P2_GUID NV_ENC_PRESET_P3_GUID NV_ENC_PRESET_P4_GUID NV_ENC_PRESET_P5_GUID NV_ENC_PRESET_P6_GUID NV_ENC_PRESET_P7_GUID
+preset p1 tuning 1: hash 91b671eba45138f4 gop 250 P 1 rc 1 qp 28/31/25 maxbitrate 0
+preset p1 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p1 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p1 tuning 4: hash d383ca6a16ab79c1 gop 250 P 1 rc 0 qp 0/0/0 maxbitrate 0
+preset p2 tuning 1: hash fdd9333be67e36db gop 250 P 2 rc 1 qp 28/31/25 maxbitrate 0
+preset p2 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p2 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p2 tuning 4: hash 7fd4c7bd1f12e1c6 gop 250 P 2 rc 0 qp 0/0/0 maxbitrate 0
+preset p3 tuning 1: hash b2a41ec3543369ce gop 250 P 3 rc 1 qp 28/31/25 maxbitrate 0
+preset p3 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p3 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p3 tuning 4: hash b640f9243c1b3f33 gop 250 P 3 rc 0 qp 0/0/0 maxbitrate 0
+preset p4 tuning 1: hash 1386b859f2b8853e gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p4 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p4 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p4 tuning 4: hash f3cc0f8a02a043e3 gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+preset p5 tuning 1: hash 1386b859f2b8853e gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p5 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p5 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p5 tuning 4: hash f3cc0f8a02a043e3 gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+preset p6 tuning 1: hash 1386b859f2b8853e gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p6 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p6 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p6 tuning 4: hash f3cc0f8a02a043e3 gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+preset p7 tuning 1: hash 1386b859f2b8853e gop 250 P 4 rc 1 qp 28/31/25 maxbitrate 0
+preset p7 tuning 2: hash 26fee6599d168003 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p7 tuning 3: hash 5ac02047e682a651 gop 4294967295 P 1 rc 2 qp 28/31/25 maxbitrate 0
+preset p7 tuning 4: hash f3cc0f8a02a043e3 gop 250 P 4 rc 0 qp 0/0/0 maxbitrate 0
+GetEncodePresetConfig (legacy form): 12
+GetEncodePresetConfigEx(bad preset guid): 12
+GetEncodePresetConfigEx(tuning 0): 12
+GetEncodePresetConfigEx(tuning 9): 12
+GetEncodePresetConfigEx(version 0): 15
+GetEncodePresetConfigEx(null): 6
+== AV1
+profiles: count 8, 0; list 8, 0:
+input formats: 8/8, 0:
+caps: 0:st8 1:st8 2:st8 3:st8 4:st8 5:st8 6:st8 7:st8 8:st8 9:st8 10:st8 11:st8 12:st8 13:st8 14:st8 15:st8 16:st8 17:st8 18:st8 19:st8 20:st8 21:st8 22:st8 23:st8 24:st8 25:st8 26:st8 27:st8 28:st8 29:st8 30:st8 31:st8 32:st8 33:st8 34:st8 35:st8 36:st8 37:st8 38:st8 39:st8 40:st8 41:st8 42:st8 43:st8 44:st8 45:st8 46:st8 47:st8 48:st8 49:st8 50:st8 51:st8 52:st8 53:st8 54:st8 55:st8 56:st8 57:st8 58:st8 59:st8 60:st8 61:st8 62:st8 63:st8 64:st8 65:st8 66:st8 67:st8 68:st8 69:st8
+presets: 8/8, 0:
+preset p1 tuning 1: status 8
+preset p1 tuning 2: status 8
+preset p1 tuning 3: status 8
+preset p1 tuning 4: status 8
+preset p2 tuning 1: status 8
+preset p2 tuning 2: status 8
+preset p2 tuning 3: status 8
+preset p2 tuning 4: status 8
+preset p3 tuning 1: status 8
+preset p3 tuning 2: status 8
+preset p3 tuning 3: status 8
+preset p3 tuning 4: status 8
+preset p4 tuning 1: status 8
+preset p4 tuning 2: status 8
+preset p4 tuning 3: status 8
+preset p4 tuning 4: status 8
+preset p5 tuning 1: status 8
+preset p5 tuning 2: status 8
+preset p5 tuning 3: status 8
+preset p5 tuning 4: status 8
+preset p6 tuning 1: status 8
+preset p6 tuning 2: status 8
+preset p6 tuning 3: status 8
+preset p6 tuning 4: status 8
+preset p7 tuning 1: status 8
+preset p7 tuning 2: status 8
+preset p7 tuning 3: status 8
+preset p7 tuning 4: status 8
+GetEncodePresetConfig (legacy form): 12
+GetEncodePresetConfigEx(bad preset guid): 8
+GetEncodePresetConfigEx(tuning 0): 8
+GetEncodePresetConfigEx(tuning 9): 8
+GetEncodePresetConfigEx(version 0): 15
+GetEncodePresetConfigEx(null): 6
+GetEncodeProfileGUIDCount(unknown codec): 8, 77
+GetInputFormatCount(unknown codec): 8
+GetEncodePresetCount(unknown codec): 8
+GetEncodeCaps(unknown codec): 8
+GetEncodeCaps(version 0): 0
+GetEncodeCaps(null value): 6
+GetEncodeCaps(null param): 6
+InitializeEncoder(null): 6
+InitializeEncoder(version 0): 15
+InitializeEncoder(config version 0): 15
+  last error after config version 0: "Success."
+InitializeEncoder(h264 0x0): 8
+  last error after h264 0x0: "Frame Dimension less than the minimum supported value."
+InitializeEncoder(h264 144x48): 8
+  last error after h264 144x48: "Frame Dimension less than the minimum supported value."
+InitializeEncoder(h264 145x49): 0
+InitializeEncoder(h264 146x50): 0
+InitializeEncoder(h264 192x128): 0
+InitializeEncoder(h264 193x129): 0
+InitializeEncoder(h264 4096x2304): 0
+InitializeEncoder(h264 4097x2304): 8
+  last error after h264 4097x2304: "Frame Dimension greater than the maximum supported value."
+InitializeEncoder(h264 4096x4097): 8
+  last error after h264 4096x4097: "Frame Dimension greater than the maximum supported value."
+InitializeEncoder(hevc 128x64): 8
+  last error after hevc 128x64: "Frame dimensions are less than the minimum supported value."
+InitializeEncoder(hevc 129x65): 0
+InitializeEncoder(hevc 192x128): 0
+InitializeEncoder(hevc 8192x8192): 0
+InitializeEncoder(hevc 8193x4096): 8
+  last error after hevc 8193x4096: "Width greater than supported value."
+InitializeEncoder(av1 192x128): 8
+  last error after av1 192x128: "EncodeAPI Internal Error."
+InitializeEncoder(h264 145x48): 8
+  last error after h264 145x48: "Frame Dimension less than the minimum supported value."
+InitializeEncoder(h264 144x49): 8
+  last error after h264 144x49: "Frame Dimension less than the minimum supported value."
+InitializeEncoder(h264 4096x49): 0
+InitializeEncoder(h264 145x4096): 0
+InitializeEncoder(h264 4096x4096): 0
+InitializeEncoder(h264 145x4097): 8
+  last error after h264 145x4097: "Frame Dimension greater than the maximum supported value."
+InitializeEncoder(h264 16x16): 8
+  last error after h264 16x16: "Frame Dimension less than the minimum supported value."
+InitializeEncoder(h264 1x1): 8
+  last error after h264 1x1: "Frame Dimension less than the minimum supported value."
+InitializeEncoder(hevc 129x32): 8
+  last error after hevc 129x32: "Frame dimensions are less than the minimum supported value."
+InitializeEncoder(hevc 128x65): 8
+  last error after hevc 128x65: "Frame dimensions are less than the minimum supported value."
+InitializeEncoder(hevc 129x33): 0
+InitializeEncoder(hevc 8192x129): 0
+InitializeEncoder(hevc 129x8192): 0
+InitializeEncoder(hevc 129x8193): 8
+  last error after hevc 129x8193: "Height greater than supported value."
+InitializeEncoder(no encode config): 0
+InitializeEncoder(zero codec guid): 12
+  last error after zero codec guid: "Success."
+InitializeEncoder(zero preset guid): 8
+  last error after zero preset guid: "NV_ENC_RC_PARAMS::lowDelayKeyFrameScale is supported with P1-P7 presets
+"
+InitializeEncoder(codec guid used as preset): 8
+  last error after codec guid used as preset: "NV_ENC_RC_PARAMS::lowDelayKeyFrameScale is supported with P1-P7 presets
+"
+InitializeEncoder(zero frame rate): 0
+InitializeEncoder(zero frame rate denominator): 0
+InitializeEncoder(zero aspect ratio): 0
+InitializeEncoder(PTD off): 0
+InitializeEncoder(max size below size): 8
+  last error after max size below size: "Encode Width / Height is greater than MaxWidth / MaxHeight."
+InitializeEncoder(max size above size): 0
+InitializeEncoder(async mode): 8
+  last error after async mode: "Async mode not supported."
+InitializeEncoder(tuning 0): 8
+  last error after tuning 0: "Presets P1-P7 are only supported with valid NV_ENC_INITIALIZE_PARAMS::tuningInfo
+"
+InitializeEncoder(tuning lossless): 8
+  last error after tuning lossless: "With lossless preset, RC Mode / Profile not supported with qpPrimeYZeroTransformBypassFlag."
+InitializeEncoder(tuning 9): 8
+  last error after tuning 9: "Invalid Tuning Info"
+InitializeEncoder(unknown profile guid): 0
+InitializeEncoder(hevc profile for h264): 0
+InitializeEncoder(baseline profile): 0
+InitializeEncoder(gop length 0): 0
+InitializeEncoder(frameIntervalP 9): 0
+InitializeEncoder(gop 5 with frameIntervalP 9): 8
+  last error after gop 5 with frameIntervalP 9: "Gop Length should be greater than number of B frames + 1"
+InitializeEncoder(gop 9 with frameIntervalP 9): 0
+InitializeEncoder(gop 1 with frameIntervalP 2): 8
+  last error after gop 1 with frameIntervalP 2: "Gop Length should be greater than number of B frames + 1"
+InitializeEncoder(gop 2 with frameIntervalP 2): 0
+InitializeEncoder(gop 0 with frameIntervalP 5): 0
+InitializeEncoder(rate control mode 99): 0
+InitializeEncoder: 0
+InitializeEncoder (again): 0
+DestroyEncoder(null): 3
+CreateInputBuffer (before init): 5
+CreateBitstreamBuffer (before init): 5
+GetSequenceParams (before init): 5
+EncodePicture (before init): 5
+InitializeEncoder: 0
+CreateInputBuffer NV12      192x128: 0; lock 0 pitch 192
+CreateInputBuffer NV12      200x128: 0; lock 0 pitch 256
+CreateInputBuffer YV12      192x128: 0; lock 0 pitch 512
+CreateInputBuffer YV12      200x128: 0; lock 0 pitch 512
+CreateInputBuffer IYUV      192x128: 0; lock 0 pitch 512
+CreateInputBuffer IYUV      200x128: 0; lock 0 pitch 512
+CreateInputBuffer YUV444    192x128: 0; lock 0 pitch 192
+CreateInputBuffer YUV444    200x128: 0; lock 0 pitch 256
+CreateInputBuffer P010      192x128: 8; lock -1 pitch 0
+CreateInputBuffer P010      200x128: 8; lock -1 pitch 0
+CreateInputBuffer 444-10    192x128: 8; lock -1 pitch 0
+CreateInputBuffer 444-10    200x128: 8; lock -1 pitch 0
+CreateInputBuffer ARGB      192x128: 0; lock 0 pitch 1024
+CreateInputBuffer ARGB      200x128: 0; lock 0 pitch 1024
+CreateInputBuffer ARGB10    192x128: 0; lock 0 pitch 1024
+CreateInputBuffer ARGB10    200x128: 0; lock 0 pitch 1024
+CreateInputBuffer AYUV      192x128: 0; lock 0 pitch 1024
+CreateInputBuffer AYUV      200x128: 0; lock 0 pitch 1024
+CreateInputBuffer ABGR      192x128: 0; lock 0 pitch 1024
+CreateInputBuffer ABGR      200x128: 0; lock 0 pitch 1024
+CreateInputBuffer ABGR10    192x128: 0; lock 0 pitch 1024
+CreateInputBuffer ABGR10    200x128: 0; lock 0 pitch 1024
+CreateInputBuffer U8        192x128: 8; lock -1 pitch 0
+CreateInputBuffer U8        200x128: 8; lock -1 pitch 0
+CreateInputBuffer undefined 192x128: 8; lock -1 pitch 0
+CreateInputBuffer undefined 200x128: 8; lock -1 pitch 0
+CreateInputBuffer bogus     192x128: 8; lock -1 pitch 0
+CreateInputBuffer bogus     200x128: 8; lock -1 pitch 0
+pitch NV12   : 145:192 192:192 200:256 257:320 320:320 513:576 640:640 1000:1024 1280:1280 1920:1920 3000:3008 4096:4096
+pitch YV12   : 145:512 192:512 200:512 257:512 320:512 513:1024 640:1024 1000:1024 1280:1536 1920:2048 3000:3072 4096:4096
+pitch YUV444 : 145:192 192:192 200:256 257:320 320:320 513:576 640:640 1000:1024 1280:1280 1920:1920 3000:3008 4096:4096
+pitch ARGB   : 145:1024 192:1024 200:1024 257:1536 320:1536 513:2560 640:2560 1000:4096 1280:5120 1920:7680 3000:12288 4096:16384
+CreateInputBuffer (0x0): 10
+CreateInputBuffer (version 0): 15
+CreateInputBuffer (null): 6
+DestroyInputBuffer (null buffer): 8
+LockInputBuffer (null): 6
+LockInputBuffer (null buffer): 8
+UnlockInputBuffer (null): 8
+CreateBitstreamBuffer: 0
+CreateBitstreamBuffer (version 0): 15
+CreateBitstreamBuffer (null): 6
+DestroyBitstreamBuffer (null): 6
+EncodePicture: 0
+LockBitstream: 0 size>0 1 ptr 1 ts 90000 duration 3000 frameIdx 0 type 3 struct 1 slices 1 hw 2 temporal 0
+first frame NAL types: 7 8 5
+UnlockBitstream: 0
+UnlockBitstream (unlocked): 0
+UnlockBitstream (null): 6
+LockBitstream (version 0): 15
+LockBitstream (null buffer): 8
+LockBitstream (null): 6
+EncodePicture (version 0): 15
+EncodePicture (null): 6
+EncodePicture (null input): 8
+EncodePicture (null output): 8
+EncodePicture (wrong width): 0
+  (wrong width) lock 0, size>0 1
+EncodePicture (wrong format): 0
+  (wrong format) lock 0, size>0 1
+EncodePicture (bad picture structure): 8
+GetSequenceParams: 0, NAL types: 7 8
+GetSequenceParams (8 bytes of room): 10
+GetSequenceParams (version 0): 15
+GetSequenceParams (null buffer): 8
+GetEncodeStats: 8
+RegisterResource: 0
+MapInputResource: 0, format 0x1
+EncodePicture (mapped resource): 0
+LockBitstream: 0
+MapInputResource (again): 0
+UnmapInputResource: 0
+UnmapInputResource (again): 25
+UnregisterResource: 0
+RegisterResource (null pointer): 0
+RegisterResource (version 0): 15
+RegisterResource (undefined format): 0
+RegisterResource (zero width): 0
+UnregisterResource (null): 6
+MapInputResource (null): 6
+ReconfigureEncoder (same): 0
+ReconfigureEncoder (larger): 0
+  last error after reconfigure to a larger size: "Invalid value for NV_ENC_PIC_STRUCT."
+ReconfigureEncoder (smaller): 0
+ReconfigureEncoder (version 0): 15
+ReconfigureEncoder (null): 6
+InvalidateRefFrames: 0
+RegisterAsyncEvent: 22
+UnregisterAsyncEvent: 22
+SetIOCudaStreams: 0
+CreateMVBuffer: 22
+DestroyMVBuffer: 6
+RunMotionEstimationOnly: 6
+LookaheadPicture: 8
+RestoreEncoderState: 8
+GetSequenceParamEx: 0
+EncodePicture (end of stream): 0
+DestroyInputBuffer: 0
+DestroyEncoder: 0
+DONE

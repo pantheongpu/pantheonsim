@@ -1905,3 +1905,141 @@ VGPU_NPPS_ALLOC(32sc, Npp32sc)
 VGPU_NPPS_ALLOC(64sc, Npp64sc)
 VGPU_NPPS_ALLOC(32fc, Npp32fc)
 VGPU_NPPS_ALLOC(64fc, Npp64fc)
+
+/* ======================================================================
+   Watershed segmentation and marker-label compression (nppif).
+
+   nppiSegmentWatershed*_C1IR, its buffer-size queries, and
+   nppiCompressMarkerLabelsUF_32u_C1IR -- the three functions of the CUDA
+   Samples' watershedSegmentationNPP. The algorithm is in npp_core.hpp
+   (watershed()), with what was measured and what is not reproduced.
+
+   Statuses, measured on NPP 13.0 (an RTX 3060):
+   - null pointers (the image, the work buffer) are NPP_NULL_POINTER_ERROR,
+     checked first, then a non-positive ROI is NPP_SIZE_ERROR, then a norm
+     other than nppiNormInf and nppiNormL1 is NPP_BAD_ARGUMENT_ERROR, then a
+     boundary type outside the enum is NPP_ERROR;
+   - the steps are not validated: the image's is used as given, the marker
+     labels' is ignored -- labels are always written W*4 bytes apart, as the
+     header says -- and a null label pointer just means no labels;
+   - the buffer is not used here (NPP's work memory is for its kernels), but
+     its size is NPP's: 72 bytes plus, for every row, 24 (8-bit) or 32
+     (16-bit) bytes per pixel rounded up to 128.
+   ====================================================================== */
+
+namespace {
+
+template <class T>
+NppStatus segment_watershed(T* img, int step, Npp32u* labels, NppiNorm norm, int boundary, NppiSize roi,
+                            Npp8u* buffer) {
+  if (!img || !buffer) return NPP_NULL_POINTER_ERROR;
+  if (bad(roi)) return NPP_SIZE_ERROR;
+  const int ni = static_cast<int>(norm);
+  if (ni != static_cast<int>(nppiNormInf) && ni != static_cast<int>(nppiNormL1)) return NPP_BAD_ARGUMENT_ERROR;
+  if (boundary < 0 || boundary > 4) return NPP_ERROR;
+  const int W = roi.width, H = roi.height;
+  std::vector<T> px = fetch<T>(img, step, W, H);
+  const Watershed ws = watershed(px.data(), W, H, ni == static_cast<int>(nppiNormL1));
+  const size_t n = static_cast<size_t>(W) * H;
+  std::vector<T> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = px[static_cast<size_t>(ws.root[i])];
+  if (labels) put_n(labels, ws.label.data(), n);
+  if (boundary != NPP_WATERSHED_SEGMENT_BOUNDARIES_NONE) {
+    constexpr T white = std::numeric_limits<T>::max();
+    constexpr T half = static_cast<T>((static_cast<unsigned>(white) + 1) / 2);
+    // A boundary pixel is one whose upper or left neighbour has another
+    // segmented value; the segmented image is what is compared, not the
+    // regions' roots or labels (measured with ties).
+    std::vector<T> marked(out);
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        const size_t i = static_cast<size_t>(y) * W + x;
+        const bool edge = (y > 0 && out[i - W] != out[i]) || (x > 0 && out[i - 1] != out[i]);
+        switch (boundary) {
+          case NPP_WATERSHED_SEGMENT_BOUNDARIES_BLACK:
+            if (edge) marked[i] = 0;
+            break;
+          case NPP_WATERSHED_SEGMENT_BOUNDARIES_WHITE:
+            if (edge) marked[i] = white;
+            break;
+          case NPP_WATERSHED_SEGMENT_BOUNDARIES_CONTRAST:  // black on a bright region, white on a dark one
+            if (edge) marked[i] = out[i] >= half ? 0 : white;
+            break;
+          default:  // BOUNDARIES_ONLY: black lines on white
+            marked[i] = edge ? 0 : white;
+        }
+      }
+    out.swap(marked);
+  }
+  store<T>(img, step, W, H, out);
+  return NPP_SUCCESS;
+}
+
+template <class T, class SizeOut>
+NppStatus watershed_buffer_size(NppiSize roi, SizeOut* size) {
+  if (!size) return NPP_NULL_POINTER_ERROR;
+  if (bad(roi)) return NPP_SIZE_ERROR;
+  const unsigned long long row = (static_cast<unsigned long long>(roi.width) * (sizeof(T) == 1 ? 24 : 32) + 127) / 128 * 128;
+  *size = static_cast<SizeOut>(72 + row * roi.height);
+  return NPP_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT NppStatus nppiSegmentWatershedGetBufferSize_8u_C1R(NppiSize roi,
+                                                               arg_of<1, decltype(&nppiSegmentWatershedGetBufferSize_8u_C1R)>::type size) {
+  return watershed_buffer_size<Npp8u>(roi, size);
+}
+VGPU_EXPORT NppStatus nppiSegmentWatershedGetBufferSize_16u_C1R(NppiSize roi,
+                                                                arg_of<1, decltype(&nppiSegmentWatershedGetBufferSize_16u_C1R)>::type size) {
+  return watershed_buffer_size<Npp16u>(roi, size);
+}
+VGPU_EXPORT NppStatus nppiSegmentWatershed_8u_C1IR_Ctx(Npp8u* img, Npp32s step, Npp32u* labels, Npp32s,
+                                                       NppiNorm norm, NppiWatershedSegmentBoundaryType boundary,
+                                                       NppiSize roi, Npp8u* buffer, NppStreamContext) {
+  return segment_watershed<Npp8u>(img, step, labels, norm, static_cast<int>(boundary), roi, buffer);
+}
+VGPU_PLAIN(nppiSegmentWatershed_8u_C1IR,
+           (Npp8u* img, Npp32s step, Npp32u* labels, Npp32s lstep, NppiNorm norm,
+            NppiWatershedSegmentBoundaryType boundary, NppiSize roi, Npp8u* buffer),
+           (img, step, labels, lstep, norm, boundary, roi, buffer, NppStreamContext{}))
+VGPU_EXPORT NppStatus nppiSegmentWatershed_16u_C1IR_Ctx(Npp16u* img, Npp32s step, Npp32u* labels, Npp32s,
+                                                        NppiNorm norm, NppiWatershedSegmentBoundaryType boundary,
+                                                        NppiSize roi, Npp8u* buffer, NppStreamContext) {
+  return segment_watershed<Npp16u>(img, step, labels, norm, static_cast<int>(boundary), roi, buffer);
+}
+VGPU_PLAIN(nppiSegmentWatershed_16u_C1IR,
+           (Npp16u* img, Npp32s step, Npp32u* labels, Npp32s lstep, NppiNorm norm,
+            NppiWatershedSegmentBoundaryType boundary, NppiSize roi, Npp8u* buffer),
+           (img, step, labels, lstep, norm, boundary, roi, buffer, NppStreamContext{}))
+
+/* ---- CompressMarkerLabelsUF ----
+   Renumbers marker labels (pixel indices, as nppiLabelMarkersUF and
+   nppiSegmentWatershed write them) to consecutive integers. Measured exactly
+   on random label images: labels below nStartingNumber take their rank
+   among the labels present plus 0 -- 0 is always counted, so 0 stays 0, an
+   image without 0 starts at 1, and *pNewNumber is the count including 0 --
+   and labels from nStartingNumber up are left alone. Rows are
+   nSrcDstStep bytes apart, whatever the width (a step of 0 reads row 0 for
+   every row); a start of 0 or less is NPP_BAD_ARGUMENT_ERROR after the size
+   check, and the buffer is 65536 + 20 + 8 * nStartingNumber bytes. */
+VGPU_EXPORT NppStatus nppiCompressMarkerLabelsGetBufferSize_32u_C1R(int start, int* size) {
+  if (!size) return NPP_NULL_POINTER_ERROR;
+  if (start <= 0) return NPP_SIZE_ERROR;
+  *size = static_cast<int>(65536LL + 20 + 8LL * start);
+  return NPP_SUCCESS;
+}
+VGPU_EXPORT NppStatus nppiCompressMarkerLabelsUF_32u_C1IR_Ctx(Npp32u* img, int step, NppiSize roi, int start,
+                                                              int* new_number, Npp8u* buffer, NppStreamContext) {
+  if (!img || !new_number || !buffer) return NPP_NULL_POINTER_ERROR;
+  if (bad(roi)) return NPP_SIZE_ERROR;
+  if (start <= 0) return NPP_BAD_ARGUMENT_ERROR;
+  const int W = roi.width, H = roi.height;
+  std::vector<Npp32u> px = fetch<Npp32u>(img, step, W, H);
+  *new_number = compress_labels(px.data(), px.size(), start);
+  store<Npp32u>(img, step, W, H, px);
+  return NPP_SUCCESS;
+}
+VGPU_PLAIN(nppiCompressMarkerLabelsUF_32u_C1IR,
+           (Npp32u* img, int step, NppiSize roi, int start, int* new_number, Npp8u* buffer),
+           (img, step, roi, start, new_number, buffer, NppStreamContext{}))

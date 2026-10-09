@@ -896,8 +896,10 @@ narrows what counts as observable, not what the detector looks at.
   skipped on hosts with the real driver libraries): `OUT_OF_SCOPE="rt_virus"` in
   `tests/workloads/run_pantheon_workloads.sh`, docs/pantheon-workloads.md.
   (`media_enc_virus` runs per the prose in that document: `libvgpunvenc`
-  implements NVENC; its status block still lists it as skipped, which is a
-  contradiction inside that document, not here.)
+  implements NVENC, now writing real (lossless PCM) H.264 and HEVC streams that are
+  identical for identical frames, as the workload's golden-bitstream check needs; its
+  status block still lists it as skipped, which is a contradiction inside that
+  document, not here.)
 - Nsight Systems and Nsight Compute as the vendor ships them. `vgpu ncu` is this
   project's own `ncu` (src/cli/ncu.cpp, `e2e_ncu`); `nsys` runs but collects no
   CUDA data (it uses its own bundled CUPTI, see nvidia/docs/cupti.md).
@@ -1923,10 +1925,14 @@ behaviour, timing).
   layout across a kernel and device functions in two modules (valid, not the same offsets).
   **nvFatbin**: `nvFatbinAddIndex` (NVIDIA's takes an index file no tool can write), and compressed
   bytes identical to NVIDIA's (the same flags and sizes within a few percent).
-- **NPP**: watershed, marker-label compression, ResizeSqrPixel super-sampling and Lanczos
-  (`NPP_INTERPOLATION_ERROR`). **nvJPEG**: 12-bit, arithmetic, lossless and hierarchical JPEG, the
-  hardware backend, EXIF orientation, transcoding. **NVENC**: unimplemented function-table slots
-  return `NV_ENC_ERR_UNIMPLEMENTED` (nvidia/src/nvenc_api.cpp:348-355). No NVTX or nvcuvid/NVDEC.
+- **NPP**: ResizeSqrPixel super-sampling and Lanczos (`NPP_INTERPOLATION_ERROR`); watershed labels
+  where neighbouring values are equal and 4-way watershed beyond 4x4 are inexact. **nvJPEG**: 12-bit,
+  arithmetic, lossless and hierarchical JPEG (the card refuses or gets them wrong), the hardware
+  backend, EXIF orientation. **NVENC**: AV1, 10-bit and 4:4:4
+  input, P/B pictures and rate control (H.264 and HEVC are lossless PCM IDR pictures). **NVDEC**: every codec but Motion
+  JPEG; progressive JPEG (refused as the card refuses it). **nvCOMP**: Cascaded, Bitcomp and ANS
+  (unpublished bitstreams), the container checksums, `LZ4CPUManager`, LZ4 bitshuffle through the
+  managers. **cuFile**: nvidia-fs DMA. No NVTX.
 - **Device runtime**: `cudaMemcpyAsync`, `cudaMemsetAsync` and `cudaMalloc` from a kernel,
   `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, occupancy queries and
   `cudaGetParameterBuffer`/`cudaLaunchDevice` (libraries.md:920-928).

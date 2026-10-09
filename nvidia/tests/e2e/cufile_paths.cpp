@@ -424,6 +424,62 @@ int main() {
   IS(cuFileGetStatsL1(nullptr), CU_FILE_INVALID_VALUE);
   IS(cuFileStatsStop(), CU_FILE_SUCCESS);
 
+
+  // ---- user-space file system handles: registered, never serviced -----------------
+  // The operation table is nvidia-fs's RDMA path's; compatibility mode accepts the
+  // handle (whatever the table holds, but not none) and then answers every read and
+  // write with the number 5006 -- not -1 -- without calling the table or writing the
+  // buffer. (This block runs on NVIDIA's library too.)
+  {
+    static int table_calls = 0;
+    struct Ops {
+      static ssize_t rd(void*, char* buf, size_t n, loff_t, cufileRDMAInfo_t*) {
+        ++table_calls;
+        std::memset(buf, 0x5a, n);
+        return (ssize_t)n;
+      }
+      static ssize_t wr(void*, const char*, size_t n, loff_t, cufileRDMAInfo_t*) {
+        ++table_calls;
+        return (ssize_t)n;
+      }
+    };
+    CUfileFSOps_t table{}, empty{};
+    table.read = Ops::rd;
+    table.write = Ops::wr;
+    const int ufd = open(path.c_str(), O_RDWR);
+    CUfileDescr_t ud{};
+    ud.type = CU_FILE_HANDLE_TYPE_USERSPACE_FS;
+    ud.handle.fd = ufd;
+    ud.fs_ops = &table;
+    CUfileHandle_t uh = nullptr, uh2 = nullptr;
+    CUfileDescr_t none = ud;
+    none.fs_ops = nullptr;
+    IS(cuFileHandleRegister(&uh2, &none), CU_FILE_IO_NOT_SUPPORTED);
+    none.fs_ops = &empty;
+    IS(cuFileHandleRegister(&uh2, &none), CU_FILE_SUCCESS);  // a zeroed table registers
+    cuFileHandleDeregister(uh2);
+    none = ud;
+    none.handle.fd = -1;
+    IS(cuFileHandleRegister(&uh2, &none), CU_FILE_INVALID_VALUE);
+    none.handle.fd = 9999;
+    IS(cuFileHandleRegister(&uh2, &none), CU_FILE_INVALID_VALUE);
+    IS(cuFileHandleRegister(&uh, &ud), CU_FILE_SUCCESS);
+    IS(cuFileHandleRegister(&uh2, &ud), CU_FILE_HANDLE_ALREADY_REGISTERED);
+    cudaMemset(dev, 0, 8192);
+    errno = 0;
+    check(cuFileRead(uh, dev, 4096, 0, 0) == 5006 && errno == 0, "a user-space handle's cuFileRead returns 5006");
+    errno = 0;
+    check(cuFileWrite(uh, dev, 4096, 0, 0) == 5006 && errno == 0, "a user-space handle's cuFileWrite returns 5006");
+    errno = 0;
+    check(cuFileRead(uh, dev, 0, 0, 0) == 0, "... a size of 0 on a registered buffer returns 0");
+    RET(cuFileRead(uh, nullptr, 4096, 0, 0), -1, EINVAL);
+    RET(cuFileRead(uh, dev, 4096, -1, 0), -1, CU_FILE_INVALID_VALUE);
+    check(table_calls == 0, "the operation table is never called");
+    check(device_bytes(dev, 8)[0] == 0, "the buffer is not written");
+    cuFileHandleDeregister(uh);
+    close(ufd);
+  }
+
   TRACE_USES("closing");
   // ---- closing ----
   cuFileHandleDeregister(fh);
