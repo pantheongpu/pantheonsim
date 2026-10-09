@@ -10175,11 +10175,12 @@ VGPU_EXPORT cudaError_t cudaStreamUpdateCaptureDependencies_v2(cudaStream_t stre
                                                                unsigned int flags) {
   return update_capture_deps(stream, dependencies, dependencyData, numDependencies, flags);
 }
+#endif
 
+// The CUDA 12 signature (no edge data) is exported whatever 12.x this is built against.
 VGPU_EXPORT cudaError_t cudaStreamUpdateCaptureDependencies(cudaStream_t stream, cudaGraphNode_t* dependencies, size_t numDependencies, unsigned int flags) {
   return traced_call("cudaStreamUpdateCaptureDependencies", cudaStreamUpdateCaptureDependencies_traced, stream, dependencies, numDependencies, flags);
 }
-#endif
 #endif
 
 #if CUDART_VERSION >= 13000
