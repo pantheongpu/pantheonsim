@@ -126,9 +126,10 @@ Nothing else was created (the key pair and security group are shared and stay).
 
 ## Notes from the 2026-10-09 session (g6e.2xlarge, L40S)
 
-* Capacity: g7e.2xlarge, p5.4xlarge and g6e.xlarge were refused in every zone, by default placement and zone by
-  zone, at six polls over three hours; `g6e.2xlarge` (the same L40S, two more vCPUs) launched at the fifth poll in
-  us-east-1b. Try the neighbouring sizes (g6e.2xlarge, g7e.4xlarge) in every poll. A launch call can take over
+* Capacity: g7e.2xlarge, p5.4xlarge and g6e.xlarge were refused in every zone (default placement and zone by zone)
+  at the polls of 17:46, 18:00 and 18:15 UTC; `g6e.2xlarge` (the same L40S, two more vCPUs) launched at the 18:30 poll in
+  us-east-1b, and g7e.2xlarge, g7e.4xlarge and p5.4xlarge stayed refused at 18:45, 19:02 and 19:17. Try the neighbouring
+  sizes (g6e.2xlarge, g7e.4xlarge) in every poll. A launch call can take over
   100 seconds to fail (three retries inside the SDK): wrap it in `asyncio.wait_for`, launch one type at a time, and if the
   tool times out, list instances tagged `purpose=<branch>` before doing anything else.
 * The instance (8 vCPUs, 61 GB, the DLAMI with CUDA 12.8, 12.9, 13.0 and 13.2) builds the simulator in about 15 minutes
