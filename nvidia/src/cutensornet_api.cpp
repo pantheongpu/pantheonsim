@@ -208,6 +208,8 @@ struct NetTensor {
   std::vector<int64_t> extents, strides;  // strides empty: column-major
   cutensornetTensorQualifiers_t q{0, 0, 0};
   const void* data = nullptr;
+  void* grad = nullptr;               // where this input's gradient goes (gradients)
+  std::vector<int64_t> grad_strides;  // empty: column-major
 };
 
 struct Path {
@@ -229,6 +231,8 @@ struct Network {
   bool has_path = false;
   Path path;
   bool prepared = false;
+  const void* adjoint = nullptr;      // the output's adjoint, for gradients
+  std::vector<int64_t> adjoint_strides;
 };
 
 struct Workspace {
@@ -288,6 +292,8 @@ struct SvdInfo {
   int64_t full = 0, reduced = 0;
   double discarded = 0;
   int32_t algo = CUTENSORNET_TENSOR_SVD_ALGO_GESVD;
+  cutensornetGesvdjStatus_t jstatus{0, 0};  // gesvdj: residual and sweeps of the last decomposition
+  cutensornetGesvdpStatus_t pstatus{0};     // gesvdp: the error in the singular values
 };
 
 template <class T>
@@ -1123,14 +1129,19 @@ cutensornetStatus_t cutensornetNetworkSetAttribute(const cutensornetHandle_t han
   if (which < 0) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "unknown or read-only attribute");
   if (sizeInBytes != sizeof(cutensornetTensorIDList_t)) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "size mismatch");
   const auto* l = static_cast<const cutensornetTensorIDList_t*>(buffer);
-  if (which == 2 && l->numTensors != 0)
-    return refuse(api, "gradients are not implemented, so no tensor can require one");
-  for (NetTensor& t : n->in) (which == 0 ? t.q.isConstant : t.q.isConjugate) = l->numTensors < 0 ? 1 : 0;
-  for (int32_t k = 0; k < l->numTensors; ++k) {
+  // RTX 3060, cuTensorNet 2.14: tensors that require gradients are named by id; -1 ("all") is
+  // INVALID_VALUE for them though not for the constant and conjugated lists, and an id out of
+  // range is INVALID_VALUE.
+  if (which == 2 && l->numTensors < 0)
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the tensors that require gradients must be named");
+  for (int32_t k = 0; k < l->numTensors; ++k)
     if (!l->data || l->data[k] < 0 || l->data[k] >= (int32_t)n->in.size())
       return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid tensor id");
-    (which == 0 ? n->in[l->data[k]].q.isConstant : n->in[l->data[k]].q.isConjugate) = 1;
-  }
+  auto flag_of = [&](NetTensor& t) -> int32_t& {
+    return which == 0 ? t.q.isConstant : which == 1 ? t.q.isConjugate : t.q.requiresGradient;
+  };
+  for (NetTensor& t : n->in) flag_of(t) = l->numTensors < 0 ? 1 : 0;
+  for (int32_t k = 0; k < l->numTensors; ++k) flag_of(n->in[l->data[k]]) = 1;
   n->prepared = false;
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -1210,6 +1221,54 @@ int64_t scratch_need(const Network& n, const Path& p) {
   int64_t b = 0;
   for (size_t s = 0; s + 1 < pc.inter.size(); ++s) b += align_up((int64_t)mode_volume(pc.inter[s], se) * (int64_t)elem_bytes(n.type));
   return b;
+}
+
+// The network whose contraction is the gradient of input `i`: the output's adjoint
+// contracted with every other input, conjugated (RTX 3060, 2.14: the gradient of a complex
+// network is adjoint x conj(the other tensors), the convention frameworks like PyTorch use;
+// a real network's is the plain contraction), into a tensor with input i's modes.
+struct GradNet {
+  Network net;
+  Path path;
+};
+
+Status build_grad_net(const Network& n, size_t i, const Path& fwd, GradNet& g, const char* api) {
+  const NetTensor& ti = n.in[i];
+  for (size_t a = 0; a < ti.modes.size(); ++a)
+    for (size_t b = a + 1; b < ti.modes.size(); ++b)
+      if (ti.modes[a] == ti.modes[b])
+        return fail(CUTENSORNET_STATUS_NOT_SUPPORTED, api, "the gradient of a tensor with a repeated mode is not implemented");
+  g.net.type = n.type;
+  g.net.type_set = true;
+  g.net.compute = n.compute;
+  g.net.compute_set = true;
+  NetTensor adj;
+  adj.modes = n.out.modes;
+  adj.extents = n.out.extents;
+  adj.strides = n.adjoint_strides;
+  adj.data = n.adjoint;
+  g.net.in.push_back(adj);
+  for (size_t j = 0; j < n.in.size(); ++j) {
+    if (j == i) continue;
+    NetTensor t = n.in[j];
+    t.q.isConjugate = t.q.isConjugate ? 0 : 1;
+    t.q.requiresGradient = 0;
+    t.grad = nullptr;
+    g.net.in.push_back(std::move(t));
+  }
+  g.net.out.modes = ti.modes;
+  g.net.out.extents = ti.extents;
+  g.net.out.strides = ti.grad_strides;
+  g.net.out_set = true;
+  const auto ext = extent_map(g.net);
+  // A mode of the input that no other tensor and not the output carries was summed over by
+  // the forward contraction; its gradient is the adjoint repeated along it, which a
+  // contraction cannot write.
+  for (int32_t m : ti.modes)
+    if (!ext.count(m)) return fail(CUTENSORNET_STATUS_NOT_SUPPORTED, api, "the gradient of a mode summed over inside one tensor is not implemented");
+  g.path.steps = greedy_path(g.net, ext);
+  g.path.slices = fwd.slices;
+  return CUTENSORNET_STATUS_SUCCESS;
 }
 
 // Fills `info` for path `p` on network `n`: FLOP counts before and after
@@ -1354,12 +1413,15 @@ namespace {
 // At least one aligned block, so that a caller who allocates what is asked
 // for never allocates nothing (cuQuantum Python allocates the recommended
 // size and passes the pointer).
-void set_scratch_need(Workspace* w, int64_t need) {
+void set_scratch_need(Workspace* w, int64_t need, int64_t host_need = 0) {
   need = std::max<int64_t>(need, kAlign);
   for (auto& pref : w->need)
     for (auto& mem : pref)
       for (int64_t& k : mem) k = 0;
-  for (int p = 0; p < 3; ++p) w->need[p][CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] = need;
+  for (int p = 0; p < 3; ++p) {
+    w->need[p][CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] = need;
+    w->need[p][CUTENSORNET_MEMSPACE_HOST][CUTENSORNET_WORKSPACE_SCRATCH] = host_need;
+  }
 }
 
 bool valid_ws_enums(int pref, int mem, int kind) {
@@ -1389,7 +1451,25 @@ cutensornetStatus_t cutensornetWorkspaceComputeContractionSizes(const cutensorne
   const Path* p = path_for(n, info);
   if (!p) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the network has no contraction path yet");
   fill_output(*n);
-  set_scratch_need(w, scratch_need(*n, *p));
+  int64_t need = scratch_need(*n, *p), cache = 0;
+  if (std::any_of(n->in.begin(), n->in.end(), [](const NetTensor& t) { return t.q.requiresGradient != 0; })) {
+    // Gradients need the contraction's intermediates kept (the cache) and scratch for
+    // contracting the adjoint with the other tensors.
+    const auto ext = extent_map(*n);
+    PathCost pc;
+    if (cost_of(*n, p->steps, ext, pc))
+      for (const auto& m : pc.inter) cache += align_up((int64_t)mode_volume(m, sliced_extents(*p, ext)) * (int64_t)elem_bytes(n->type));
+    cache = std::max<int64_t>(cache, kAlign);
+    for (size_t i = 0; i < n->in.size(); ++i) {
+      if (!n->in[i].q.requiresGradient) continue;
+      GradNet g;
+      if (build_grad_net(*n, i, *p, g, api)) continue;  // refused later, when the gradient is asked for
+      need = std::max(need, scratch_need(g.net, g.path));
+    }
+  }
+  set_scratch_need(w, need);
+  if (cache)
+    for (int pf = 0; pf < 3; ++pf) w->need[pf][CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_CACHE] = cache;
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -1913,9 +1993,12 @@ cutensornetStatus_t cutensornetNetworkPrepareContraction(const cutensornetHandle
   if (!n || (workDesc && !w)) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
   if (!n->has_path) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "optimize the network or set an optimizer info first");
   fill_output(*n);
-  const int64_t have = w ? w->size[0][0] : 0;
-  if (have >= 0 && have < scratch_need(*n, n->path) && !(!w || (!w->ptr[0][0] && h->has_mem)))
-    return fail(CUTENSORNET_STATUS_INSUFFICIENT_WORKSPACE, api, "the workspace is smaller than the contraction needs");
+  // RTX 3060, cuTensorNet 2.14: preparing with no scratch memory (no workspace, no memory set, or
+  // less than the sizes asked for) and no memory handler to draw on is INTERNAL_ERROR.
+  const bool pooled = h->has_mem && (!w || !w->ptr[0][0]);
+  const int64_t have = w && w->ptr[0][0] ? w->size[0][0] : 0;
+  if (!pooled && have < std::max<int64_t>(scratch_need(*n, n->path), kAlign))
+    return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "the workspace has no scratch memory, or less than the contraction needs");
   n->prepared = true;
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -2252,20 +2335,99 @@ int64_t qr_need(cusolverDnHandle_t sh, cudaDataType_t t, const Split& s) {
   return c.used;
 }
 
-int64_t svd_need(cusolverDnHandle_t sh, cudaDataType_t t, const Split& s) {
+cudaDataType_t solver_real_type(cudaDataType_t t) { return (t == CUDA_R_64F || t == CUDA_C_64F) ? CUDA_R_64F : CUDA_R_32F; }
+
+// cuSOLVER's parameter objects for the SVD algorithms that take them.
+struct SolverParams {
+  gesvdjInfo_t j = nullptr;
+  cusolverDnParams_t p = nullptr;
+  ~SolverParams() {
+    if (j) cusolverDnDestroyGesvdjInfo(j);
+    if (p) cusolverDnDestroyParams(p);
+  }
+};
+
+// What the algorithm's cuSOLVER call needs beyond the matrices, for an M x N
+// matrix (M >= N) and, for gesvdr, rank k.
+struct SolverNeed {
+  int lwork = 0;   // gesvd, gesvdj: elements of the work array
+  size_t dev = 0;  // gesvdp, gesvdr: bytes on the device
+  size_t host = 0; // ... and on the host
+  bool ok = true;
+};
+
+SolverNeed solver_need(cusolverDnHandle_t sh, cudaDataType_t t, const Split& s, const SvdConfig& cfg, int64_t k) {
+  SolverNeed n;
+  const int64_t mm = std::max(s.m, s.n), nn = std::min(s.m, s.n);
+  const int M = (int)mm, N = (int)nn;
+  const cudaDataType_t rt = solver_real_type(t);
+  switch (cfg.algo) {
+    case CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ: {
+      SolverParams sp;
+      cusolverDnCreateGesvdjInfo(&sp.j);
+      int a = 0;
+      switch (t) {
+        case CUDA_R_32F: cusolverDnSgesvdj_bufferSize(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, nullptr, M, nullptr, nullptr, M, nullptr, N, &a, sp.j); break;
+        case CUDA_R_64F: cusolverDnDgesvdj_bufferSize(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, nullptr, M, nullptr, nullptr, M, nullptr, N, &a, sp.j); break;
+        case CUDA_C_32F: cusolverDnCgesvdj_bufferSize(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, nullptr, M, nullptr, nullptr, M, nullptr, N, &a, sp.j); break;
+        default: cusolverDnZgesvdj_bufferSize(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, nullptr, M, nullptr, nullptr, M, nullptr, N, &a, sp.j); break;
+      }
+      n.lwork = std::max(a, 1);
+      break;
+    }
+    case CUTENSORNET_TENSOR_SVD_ALGO_GESVDP: {
+      SolverParams sp;
+      cusolverDnCreateParams(&sp.p);
+      if (cusolverDnXgesvdp_bufferSize(sh, sp.p, CUSOLVER_EIG_MODE_VECTOR, 1, mm, nn, t, nullptr, mm, rt, nullptr, t, nullptr,
+                                       mm, t, nullptr, nn, t, &n.dev, &n.host) != CUSOLVER_STATUS_SUCCESS)
+        n.ok = false;
+      break;
+    }
+    case CUTENSORNET_TENSOR_SVD_ALGO_GESVDR: {
+      SolverParams sp;
+      cusolverDnCreateParams(&sp.p);
+      if (cusolverDnXgesvdr_bufferSize(sh, sp.p, 'S', 'S', mm, nn, k, cfg.gesvdr.oversampling, cfg.gesvdr.niters, t, nullptr, mm,
+                                       rt, nullptr, t, nullptr, mm, t, nullptr, nn, t, &n.dev, &n.host) !=
+          CUSOLVER_STATUS_SUCCESS)
+        n.ok = false;
+      // NVIDIA's library asks for 256 * (1 + element bytes / 4) bytes of host scratch for gesvdr
+      // (512, 768 for R64F and C32F, 1280; RTX 3060, 2.14), whatever the shape, and fails
+      // without it.
+      n.host = std::max(n.host, (size_t)(256 * (1 + elem_bytes(t) / 4)));
+      break;
+    }
+    default:
+      n.lwork = solver_lwork(sh, t, (int)s.m, (int)s.n, false);
+      break;
+  }
+  return n;
+}
+
+struct SvdNeed {
+  int64_t dev = 0, host = 0;
+  bool ok = true;
+};
+
+SvdNeed svd_need(cusolverDnHandle_t sh, cudaDataType_t t, const Split& s, const SvdConfig& cfg, int64_t k) {
   const int64_t eb = (int64_t)elem_bytes(t), rb = (int64_t)real_bytes(t);
   const int64_t mm = std::max(s.m, s.n), nn = std::min(s.m, s.n);
+  const SolverNeed sn = solver_need(sh, t, s, cfg, k);
+  const int64_t work = sn.lwork ? (int64_t)sn.lwork * eb : (int64_t)sn.dev;
   Carve c;
   c.take(mm * nn * eb);                                      // the matrix (or its adjoint)
   c.take(nn * rb);                                           // S
   c.take(mm * nn * eb);                                      // U
   c.take(nn * nn * eb);                                      // VT
-  c.take((int64_t)solver_lwork(sh, t, (int)s.m, (int)s.n, false) * eb);
+  c.take(work);
   c.take(nn * rb);                                           // rwork
   c.take(4);                                                 // devInfo
   c.take(s.m * nn * eb);                                     // U, laid out for the output
   c.take(nn * s.n * eb);                                     // V
-  return c.used;
+  SvdNeed r;
+  r.dev = c.used;
+  r.host = (int64_t)sn.host;
+  r.ok = sn.ok;
+  return r;
 }
 
 // Copies tensor `src` (modes/ext/str) into `dst` (its own modes/ext/str),
@@ -2372,10 +2534,30 @@ bool capturing(cudaStream_t s) {
   return on;
 }
 
-Status settle(cudaStream_t stream, const char* api) {
-  if (capturing(stream))
-    return refuse(api, "decompositions read their results back to the host and cannot be captured into a CUDA "
-                       "graph; call it outside capture");
+// The scratch of a decomposition. RTX 3060, cuTensorNet 2.14: a workspace with no memory, with
+// too little (16 bytes; a little under the recommended size is enough) or none at all, and no
+// memory handler to fall back on, is NO_DEVICE_ALLOCATOR.
+Status get_decomp_scratch(Handle* h, const Workspace* w, int64_t need, cudaStream_t stream, Scratch& s, const char* api) {
+  void* ptr = w ? w->ptr[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] : nullptr;
+  const int64_t size = w ? w->size[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] : 0;
+  if (!h->has_mem && (!ptr || size < need))
+    return fail(CUTENSORNET_STATUS_NO_DEVICE_ALLOCATOR, api, "the workspace has no (or too little) scratch memory and no memory handler is set");
+  return get_scratch(h, w, need, stream, s, api);
+}
+
+Status settle(cudaStream_t stream, const char* api, bool invalidates) {
+  if (capturing(stream)) {
+    // RTX 3060, cuTensorNet 2.14: a decomposition reads results back to the host in the middle of
+    // the call, which a capturing stream does not allow. The call answers CUDA_ERROR either way. A
+    // QR also leaves the capture invalidated (cudaStreamEndCapture says
+    // cudaErrorStreamCaptureInvalidated); an SVD fails before touching the stream and the capture
+    // goes on, with nothing captured. The stream is fine outside capture afterwards.
+    if (invalidates) cudaStreamSynchronize(stream);
+    cudaGetLastError();
+    return fail(CUTENSORNET_STATUS_CUDA_ERROR, api,
+                "decompositions read their results back to the host and cannot be captured into a CUDA "
+                "graph; call it outside capture");
+  }
   cudaGetLastError();
   if (cudaStreamSynchronize(stream) != cudaSuccess) {
     cudaGetLastError();
@@ -2392,6 +2574,24 @@ bool solver_type(cudaDataType_t t) {
   return t == CUDA_R_32F || t == CUDA_R_64F || t == CUDA_C_32F || t == CUDA_C_64F;
 }
 
+// RTX 3060, cuTensorNet 2.14: half-precision tensors are legal descriptors (CUDA_R_16F and
+// CUDA_R_16BF; the complex half type is refused when the descriptor is made), but every
+// decomposition of one -- the size queries and the calls -- answers INVALID_VALUE.
+Status half_refused(const char* api) {
+  return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "QR, SVD and gate splitting take single and double precision, real or complex");
+}
+
+// gesvdr finds the leading k singular triplets from a random sketch of k + oversampling columns:
+// k + oversampling must fit in min(m, n) (measured: k = 8 with 2 of oversampling is accepted,
+// k = 9 is not; oversampling 10 at k = 4 is not).
+Status check_algo(const SvdConfig& cfg, const Split& s, const char* api) {
+  if (cfg.algo != CUTENSORNET_TENSOR_SVD_ALGO_GESVDR) return CUTENSORNET_STATUS_SUCCESS;
+  const int64_t full = std::min(s.m, s.n);
+  if (cfg.gesvdr.oversampling < 0 || cfg.gesvdr.niters < 0 || s.k + cfg.gesvdr.oversampling > full)
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "gesvdr needs the rank plus the oversampling to fit in min(m, n)");
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
 #define VGPU_SOLVE(call)                                                         \
   do {                                                                           \
     if ((call) != CUSOLVER_STATUS_SUCCESS)                                       \
@@ -2403,16 +2603,16 @@ Status do_qr(Handle* h, const TensorDesc& in, const void* x, const TensorDesc& q
   if (!x || !q || !r) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "a data pointer is null");
   const cudaDataType_t t = in.type;
   if (qd.type != t || rd.type != t) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the tensors' types differ");
-  if (!solver_type(t)) return refuse(api, "QR of half-precision tensors is not implemented");
+  if (!solver_type(t)) return half_refused(api);
   Split s;
   if (Status st = split_of(in, qd, rd, s, api)) return st;
   const int64_t k = std::min(s.m, s.n);
   if (s.k != k) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the shared mode's extent must be min(m, n)");
-  if (Status st = settle(stream, api)) return st;
+  if (Status st = settle(stream, api, true)) return st;
   cusolverDnHandle_t sh = solver_of(h);
   if (!sh) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cusolverDnCreate failed");
   Scratch scratch;
-  if (Status st = get_scratch(h, w, qr_need(sh, t, s), stream, scratch, api)) return st;
+  if (Status st = get_decomp_scratch(h, w, qr_need(sh, t, s), stream, scratch, api)) return st;
   const int64_t eb = (int64_t)elem_bytes(t);
   const int lwork = solver_lwork(sh, t, (int)s.m, (int)s.n, true);
   Carve c{static_cast<char*>(scratch.ptr)};
@@ -2459,35 +2659,56 @@ const SvdConfig kDefaultSvd{};
 // U S V^H of the tensor split as rows (U's modes) by columns (V's modes),
 // truncated, normalized and partitioned as the configuration asks.
 Status do_svd(Handle* h, const TensorDesc& in, const void* x, TensorDesc& ud, void* u, void* sv, TensorDesc& vd, void* v,
-              const SvdConfig* cfg, SvdInfo* out_info, const Workspace* w, cudaStream_t stream, const char* api) {
+              const SvdConfig* cfg, SvdInfo* out_info, const Workspace* w, cudaStream_t stream, const char* api,
+              bool own_host = false) {
   if (!x || !u || !v) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "a data pointer is null");
   if (!cfg) cfg = &kDefaultSvd;
   const cudaDataType_t t = in.type;
   if (ud.type != t || vd.type != t) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the tensors' types differ");
-  if (!solver_type(t)) return refuse(api, "SVD of half-precision tensors is not implemented");
-  if (cfg->algo != CUTENSORNET_TENSOR_SVD_ALGO_GESVD)
-    return refuse(api, "only the gesvd algorithm is implemented (gesvdj, gesvdp and gesvdr are not)");
+  if (!solver_type(t)) return half_refused(api);
   if (cfg->partition == CUTENSORNET_TENSOR_SVD_PARTITION_NONE && !sv)
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "S is needed when the singular values are not partitioned");
   Split s;
   if (Status st = split_of(in, ud, vd, s, api)) return st;
   const int64_t full = std::min(s.m, s.n);
   if (s.k < 1 || s.k > full) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the shared extent exceeds min(m, n)");
-  if (Status st = settle(stream, api)) return st;
+  if (Status st = check_algo(*cfg, s, api)) return st;
+  if (Status st = settle(stream, api, false)) return st;
   cusolverDnHandle_t sh = solver_of(h);
   if (!sh) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cusolverDnCreate failed");
+  const SvdNeed need = svd_need(sh, t, s, *cfg, s.k);
+  if (!need.ok) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cuSOLVER refused the problem");
   Scratch scratch;
-  if (Status st = get_scratch(h, w, svd_need(sh, t, s), stream, scratch, api)) return st;
+  if (Status st = get_decomp_scratch(h, w, need.dev, stream, scratch, api)) return st;
+  // The host scratch: gesvdr needs one, and NVIDIA's library fails with INTERNAL_ERROR when it is
+  // not provided (RTX 3060, 2.14); calls this library makes itself bring their own.
+  std::vector<char> own;
+  void* host_buf = nullptr;
+  if (need.host > 0) {
+    void* hp = w ? w->ptr[CUTENSORNET_MEMSPACE_HOST][CUTENSORNET_WORKSPACE_SCRATCH] : nullptr;
+    const int64_t hs = w ? w->size[CUTENSORNET_MEMSPACE_HOST][CUTENSORNET_WORKSPACE_SCRATCH] : 0;
+    if (hp && hs >= need.host) {
+      host_buf = hp;
+    } else if (own_host || cfg->algo != CUTENSORNET_TENSOR_SVD_ALGO_GESVDR) {
+      // (gesvdp asks for none on NVIDIA's library, so it takes its own when none is given)
+      own.assign((size_t)need.host, 0);
+      host_buf = own.data();
+    } else {
+      return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "this SVD algorithm needs a host scratch workspace");
+    }
+  }
+  const SolverNeed sn = solver_need(sh, t, s, *cfg, s.k);
   const int64_t eb = (int64_t)elem_bytes(t), rb = (int64_t)real_bytes(t);
-  const bool tr = s.m < s.n;  // factor the adjoint: gesvd needs rows >= columns
+  const bool tr = s.m < s.n;  // factor the adjoint: the solvers here need rows >= columns
   const int64_t mm = std::max(s.m, s.n), nn = full;
-  const int lwork = solver_lwork(sh, t, (int)s.m, (int)s.n, false);
+  const int lwork = sn.lwork;
+  const int64_t work_bytes = lwork ? (int64_t)lwork * eb : (int64_t)sn.dev;
   Carve c{static_cast<char*>(scratch.ptr)};
   void* A = c.take(mm * nn * eb);
   void* S = c.take(nn * rb);
   void* U = c.take(mm * nn * eb);
   void* VT = c.take(nn * nn * eb);
-  void* work = c.take((int64_t)lwork * eb);
+  void* work = c.take(work_bytes);
   void* rwork = c.take(nn * rb);
   int* info = static_cast<int*>(c.take(4));
   void* Ubuf = c.take(s.m * nn * eb);
@@ -2498,17 +2719,72 @@ Status do_svd(Handle* h, const TensorDesc& in, const void* x, TensorDesc& ud, vo
   cudaStreamSynchronize(stream);
   cusolverDnSetStream(sh, stream);
   const int M = (int)mm, N = (int)nn;
-  switch (t) {
-    case CUDA_R_32F: VGPU_SOLVE(cusolverDnSgesvd(sh, 'S', 'S', M, N, (float*)A, M, (float*)S, (float*)U, M, (float*)VT, N, (float*)work, lwork, (float*)rwork, info)); break;
-    case CUDA_R_64F: VGPU_SOLVE(cusolverDnDgesvd(sh, 'S', 'S', M, N, (double*)A, M, (double*)S, (double*)U, M, (double*)VT, N, (double*)work, lwork, (double*)rwork, info)); break;
-    case CUDA_C_32F: VGPU_SOLVE(cusolverDnCgesvd(sh, 'S', 'S', M, N, (cuComplex*)A, M, (float*)S, (cuComplex*)U, M, (cuComplex*)VT, N, (cuComplex*)work, lwork, (float*)rwork, info)); break;
-    default: VGPU_SOLVE(cusolverDnZgesvd(sh, 'S', 'S', M, N, (cuDoubleComplex*)A, M, (double*)S, (cuDoubleComplex*)U, M, (cuDoubleComplex*)VT, N, (cuDoubleComplex*)work, lwork, (double*)rwork, info)); break;
+  // How many singular triplets the algorithm finds: all of them, or the rank gesvdr was asked for.
+  const bool rsvd = cfg->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDR;
+  const int64_t avail = rsvd ? s.k : nn;
+  bool v_not_vh = false;  // gesvdj, gesvdp and gesvdr give V; gesvd gives V^H
+  double err_sigma = 0, residual = 0;
+  int sweeps = 0;
+  SolverParams sp;
+  switch (cfg->algo) {
+    case CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ:
+      v_not_vh = true;
+      cusolverDnCreateGesvdjInfo(&sp.j);
+      if (cfg->gesvdj.tol > 0) cusolverDnXgesvdjSetTolerance(sp.j, cfg->gesvdj.tol);
+      if (cfg->gesvdj.maxSweeps > 0) cusolverDnXgesvdjSetMaxSweeps(sp.j, cfg->gesvdj.maxSweeps);
+      switch (t) {
+        case CUDA_R_32F: VGPU_SOLVE(cusolverDnSgesvdj(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, (float*)A, M, (float*)S, (float*)U, M, (float*)VT, N, (float*)work, lwork, info, sp.j)); break;
+        case CUDA_R_64F: VGPU_SOLVE(cusolverDnDgesvdj(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, (double*)A, M, (double*)S, (double*)U, M, (double*)VT, N, (double*)work, lwork, info, sp.j)); break;
+        case CUDA_C_32F: VGPU_SOLVE(cusolverDnCgesvdj(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, (cuComplex*)A, M, (float*)S, (cuComplex*)U, M, (cuComplex*)VT, N, (cuComplex*)work, lwork, info, sp.j)); break;
+        default: VGPU_SOLVE(cusolverDnZgesvdj(sh, CUSOLVER_EIG_MODE_VECTOR, 1, M, N, (cuDoubleComplex*)A, M, (double*)S, (cuDoubleComplex*)U, M, (cuDoubleComplex*)VT, N, (cuDoubleComplex*)work, lwork, info, sp.j)); break;
+      }
+      cudaStreamSynchronize(stream);
+      cusolverDnXgesvdjGetResidual(sh, sp.j, &residual);
+      cusolverDnXgesvdjGetSweeps(sh, sp.j, &sweeps);
+      break;
+    case CUTENSORNET_TENSOR_SVD_ALGO_GESVDP:
+      v_not_vh = true;
+      cusolverDnCreateParams(&sp.p);
+      VGPU_SOLVE(cusolverDnXgesvdp(sh, sp.p, CUSOLVER_EIG_MODE_VECTOR, 1, mm, nn, t, A, mm, solver_real_type(t), S, t, U, mm, t, VT, nn,
+                                   t, work, sn.dev, host_buf, sn.host, info, &err_sigma));
+      break;
+    case CUTENSORNET_TENSOR_SVD_ALGO_GESVDR:
+      v_not_vh = true;
+      cusolverDnCreateParams(&sp.p);
+      VGPU_SOLVE(cusolverDnXgesvdr(sh, sp.p, 'S', 'S', mm, nn, s.k, cfg->gesvdr.oversampling, cfg->gesvdr.niters, t, A, mm,
+                                   solver_real_type(t), S, t, U, mm, t, VT, nn, t, work, sn.dev, host_buf, sn.host, info));
+      break;
+    default:
+      switch (t) {
+        case CUDA_R_32F: VGPU_SOLVE(cusolverDnSgesvd(sh, 'S', 'S', M, N, (float*)A, M, (float*)S, (float*)U, M, (float*)VT, N, (float*)work, lwork, (float*)rwork, info)); break;
+        case CUDA_R_64F: VGPU_SOLVE(cusolverDnDgesvd(sh, 'S', 'S', M, N, (double*)A, M, (double*)S, (double*)U, M, (double*)VT, N, (double*)work, lwork, (double*)rwork, info)); break;
+        case CUDA_C_32F: VGPU_SOLVE(cusolverDnCgesvd(sh, 'S', 'S', M, N, (cuComplex*)A, M, (float*)S, (cuComplex*)U, M, (cuComplex*)VT, N, (cuComplex*)work, lwork, (float*)rwork, info)); break;
+        default: VGPU_SOLVE(cusolverDnZgesvd(sh, 'S', 'S', M, N, (cuDoubleComplex*)A, M, (double*)S, (cuDoubleComplex*)U, M, (cuDoubleComplex*)VT, N, (cuDoubleComplex*)work, lwork, (double*)rwork, info)); break;
+      }
+      break;
   }
   cudaStreamSynchronize(stream);
   std::vector<cd> hu, hvt, hs;
   if (!download(U, t, (size_t)(mm * nn), hu) || !download(VT, t, (size_t)(nn * nn), hvt) ||
       !download(S, real_bytes(t) == 8 ? CUDA_R_64F : CUDA_R_32F, (size_t)nn, hs))
     return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
+  // Only the first `avail` triplets exist; the rest of the buffers are not meaningful.
+  if (avail < nn) {
+    for (int64_t j = avail; j < nn; ++j) {
+      for (int64_t i = 0; i < mm; ++i) hu[(size_t)(i + j * mm)] = 0;
+      hs[(size_t)j] = 0;
+    }
+    // V is N x avail with leading dimension N
+    for (int64_t j = avail; j < nn; ++j)
+      for (int64_t i = 0; i < nn; ++i) hvt[(size_t)(i + j * nn)] = 0;
+  }
+  // The solvers other than gesvd return V; the code below works with V^H.
+  if (v_not_vh) {
+    std::vector<cd> vh((size_t)(nn * nn));
+    for (int64_t j = 0; j < nn; ++j)
+      for (int64_t c2 = 0; c2 < nn; ++c2) vh[(size_t)(j + c2 * nn)] = std::conj(hvt[(size_t)(c2 + j * nn)]);
+    hvt.swap(vh);
+  }
   // U_A (m x full) and V_A^H (full x n), column-major.
   std::vector<cd> ua((size_t)(s.m * full)), vha((size_t)(full * s.n));
   for (int64_t j = 0; j < full; ++j)
@@ -2583,8 +2859,11 @@ Status do_svd(Handle* h, const TensorDesc& in, const void* x, TensorDesc& ud, vo
   if (out_info) {
     out_info->full = full;
     out_info->reduced = keep;
-    out_info->discarded = discarded;
+    // gesvdr never sees the weight it leaves out and reports none (RTX 3060, 2.14).
+    out_info->discarded = rsvd ? 0.0 : discarded;
     out_info->algo = cfg->algo;
+    out_info->jstatus = cutensornetGesvdjStatus_t{residual, sweeps};
+    out_info->pstatus = cutensornetGesvdpStatus_t{err_sigma};
   }
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -2632,8 +2911,16 @@ cutensornetStatus_t cutensornetTensorSVDConfigGetAttribute(const cutensornetHand
     case CUTENSORNET_TENSOR_SVD_CONFIG_ALGO: return put(&c->algo, 4);
     case CUTENSORNET_TENSOR_SVD_CONFIG_DISCARDED_WEIGHT_CUTOFF: return put(&c->discarded_cutoff, 8);
     case CUTENSORNET_TENSOR_SVD_CONFIG_ALGO_PARAMS:
-      if (c->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ) return put(&c->gesvdj, sizeof c->gesvdj);
-      if (c->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDR) return put(&c->gesvdr, sizeof c->gesvdr);
+      // RTX 3060, cuTensorNet 2.14: gesvd and gesvdp take no parameters (INVALID_VALUE); gesvdj
+      // and gesvdr read back as zeros until set, into a buffer of at least their size (a larger
+      // one is taken, a smaller one is INVALID_VALUE).
+      if (c->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ || c->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDR) {
+        const bool j = c->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ;
+        const size_t n = j ? sizeof c->gesvdj : sizeof c->gesvdr;
+        if (sizeInBytes < n) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "size mismatch");
+        std::memcpy(buffer, j ? static_cast<const void*>(&c->gesvdj) : static_cast<const void*>(&c->gesvdr), n);
+        return CUTENSORNET_STATUS_SUCCESS;
+      }
       return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "the algorithm takes no parameters");
     default: return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "unknown attribute");
   }
@@ -2719,6 +3006,19 @@ cutensornetStatus_t cutensornetTensorSVDInfoGetAttribute(const cutensornetHandle
     case CUTENSORNET_TENSOR_SVD_INFO_REDUCED_EXTENT: return put(&i->reduced, 8);
     case CUTENSORNET_TENSOR_SVD_INFO_DISCARDED_WEIGHT: return put(&i->discarded, 8);
     case CUTENSORNET_TENSOR_SVD_INFO_ALGO: return put(&i->algo, 4);
+    case CUTENSORNET_TENSOR_SVD_INFO_ALGO_STATUS: {
+      // gesvdj: the residual and the number of sweeps; gesvdp: the error in sigma. A buffer at
+      // least that large is filled (RTX 3060, 2.14: 16 and 24 bytes for gesvdj, 8 is
+      // INVALID_VALUE; 8 and up for gesvdp); gesvd and gesvdr have no status, nor has an info
+      // that no decomposition has filled in.
+      const void* v = i->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ   ? static_cast<const void*>(&i->jstatus)
+                      : i->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDP ? static_cast<const void*>(&i->pstatus)
+                                                                       : nullptr;
+      const size_t n = i->algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ ? sizeof i->jstatus : sizeof i->pstatus;
+      if (!v || sizeInBytes < n) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "no status of this size for this algorithm");
+      std::memcpy(buffer, v, n);
+      return CUTENSORNET_STATUS_SUCCESS;
+    }
     default: return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "no status for this algorithm");
   }
 }
@@ -2736,7 +3036,7 @@ cutensornetStatus_t cutensornetWorkspaceComputeQRSizes(const cutensornetHandle_t
   if (!in || !q || !r || !w) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
   Split s;
   if (Status st = split_of(*in, *q, *r, s, api)) return st;
-  if (!solver_type(in->type)) return refuse(api, "QR of half-precision tensors is not implemented");
+  if (!solver_type(in->type)) return half_refused(api);
   set_scratch_need(w, qr_need(solver_of(h), in->type, s));
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -2754,10 +3054,14 @@ cutensornetStatus_t cutensornetWorkspaceComputeSVDSizes(const cutensornetHandle_
   Workspace* w = work_of(workDesc);
   if (!in || !u || !v || !w || (svdConfig && !as<SvdConfig>(svdConfig, kMagicSvdConfig)))
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
+  if (!solver_type(in->type)) return half_refused(api);
   Split s;
   if (Status st = split_of(*in, *u, *v, s, api)) return st;
-  if (!solver_type(in->type)) return refuse(api, "SVD of half-precision tensors is not implemented");
-  set_scratch_need(w, svd_need(solver_of(h), in->type, s));
+  const SvdConfig* cfg = svdConfig ? as<SvdConfig>(svdConfig, kMagicSvdConfig) : &kDefaultSvd;
+  if (Status st = check_algo(*cfg, s, api)) return st;
+  const SvdNeed need = svd_need(solver_of(h), in->type, s, *cfg, s.k);
+  if (!need.ok) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cuSOLVER refused the problem");
+  set_scratch_need(w, need.dev, need.host);
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -2865,10 +3169,14 @@ cutensornetStatus_t cutensornetWorkspaceComputeGateSplitSizes(
   if (!a || !b || !g || !u || !v || !w || (gateAlgo != 0 && gateAlgo != 1) ||
       (svdConfig && !as<SvdConfig>(svdConfig, kMagicSvdConfig)))
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
-  if (!solver_type(a->type)) return refuse(api, "gate splitting of half-precision tensors is not implemented");
+  if (!solver_type(a->type)) return half_refused(api);
   GateSetup gs;
   if (Status st = gate_setup(*a, *b, *g, *u, *v, computeType, gs, api)) return st;
-  set_scratch_need(w, gs.theta_bytes + std::max(gs.contract_need, svd_need(solver_of(h), a->type, gs.s)));
+  const SvdConfig* scfg = svdConfig ? as<SvdConfig>(svdConfig, kMagicSvdConfig) : &kDefaultSvd;
+  if (Status st = check_algo(*scfg, gs.s, api)) return st;
+  const SvdNeed sneed = svd_need(solver_of(h), a->type, gs.s, *scfg, gs.s.k);
+  if (!sneed.ok) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cuSOLVER refused the problem");
+  set_scratch_need(w, gs.theta_bytes + std::max(gs.contract_need, sneed.dev), sneed.host);
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -2891,13 +3199,17 @@ cutensornetStatus_t cutensornetGateSplit(
       (svdInfo && !info) || (workDesc && !w))
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid argument");
   if (!rawDataInA || !rawDataInB || !rawDataInG) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "a data pointer is null");
-  if (!solver_type(a->type)) return refuse(api, "gate splitting of half-precision tensors is not implemented");
+  if (!solver_type(a->type)) return half_refused(api);
   GateSetup gs;
   if (Status st = gate_setup(*a, *b, *g, *ud, *vd, computeType, gs, api)) return st;
-  if (Status st = settle(stream, api)) return st;
-  const int64_t need = gs.theta_bytes + std::max(gs.contract_need, svd_need(solver_of(h), a->type, gs.s));
+  if (Status st = settle(stream, api, false)) return st;
+  const SvdConfig* scfg = cfg ? cfg : &kDefaultSvd;
+  if (Status st = check_algo(*scfg, gs.s, api)) return st;
+  const SvdNeed sneed = svd_need(solver_of(h), a->type, gs.s, *scfg, gs.s.k);
+  if (!sneed.ok) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cuSOLVER refused the problem");
+  const int64_t need = gs.theta_bytes + std::max(gs.contract_need, sneed.dev);
   Scratch scratch;
-  if (Status st = get_scratch(h, w, need, stream, scratch, api)) return st;
+  if (Status st = get_decomp_scratch(h, w, need, stream, scratch, api)) return st;
   // theta first, then the rest of the scratch for the contraction and, after
   // it, the SVD.
   Workspace rest;
@@ -2907,7 +3219,7 @@ cutensornetStatus_t cutensornetGateSplit(
   if (Status st = contract_slices(h, gs.net, gs.path, {rawDataInA, rawDataInB, rawDataInG}, scratch.ptr, false, &rest,
                                   ids, stream, api))
     return st;
-  return do_svd(h, gs.theta, scratch.ptr, *ud, u, s, *vd, v, cfg, info, &rest, stream, api);
+  return do_svd(h, gs.theta, scratch.ptr, *ud, u, s, *vd, v, cfg, info, &rest, stream, api, true);
 }
 
 }  // extern "C"

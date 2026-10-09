@@ -1796,7 +1796,8 @@ if(TARGET vgpucublas)
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet")
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet"
+                          "cutensornet_decomp_paths:cutensornet")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -2124,8 +2125,8 @@ if(TARGET vgpucublas)
     TIMEOUT 300)
 endif()
 
-# cuFFT's legacy callbacks through NVIDIA's static library, which carries its own
-# cuFFT (skips while the driver shim lacks entry points that library needs).
+# cuFFT's legacy callbacks: NOT_IMPLEMENTED from libcufft.so's replacement, as from NVIDIA's (the
+# static route, which works on a card, cannot run on the simulator: see the script).
 if(TARGET vgpucufft)
   add_test(NAME e2e_fft_legacy_callbacks
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_legacy_callbacks.sh)
@@ -2134,6 +2135,18 @@ if(TARGET vgpucufft)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 900)
+endif()
+
+# cuFFT's LTO callbacks as LTO-IR (nvcc -dlto), which the simulator turns into machine
+# code with the host toolkit's libnvJitLink.
+if(TARGET vgpucufft)
+  add_test(NAME e2e_fft_lto_callbacks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_lto_callbacks.sh)
+  set_tests_properties(e2e_fft_lto_callbacks PROPERTIES
+    DEPENDS vgpucufft
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
 endif()
 
 # A program profiling itself through CUPTI, which is how every profiler reads a
