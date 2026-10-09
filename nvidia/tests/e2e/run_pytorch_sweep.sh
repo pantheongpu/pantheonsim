@@ -71,6 +71,10 @@ cap=()
 if command -v systemd-run >/dev/null && systemd-run --user --scope -q true 2>/dev/null; then
   cap=(systemd-run --user --scope -q -p "MemoryMax=${VGPU_TORCH_MEMORY_MAX:-10G}" -p MemorySwapMax=0)
 fi
+# A group's time limit: the quick tier is for every PR and finishes in minutes; the full tier's torch.compile
+# group alone has eighteen checks, most of them an Inductor compile of 70-270 s on the CI runner.
+group_timeout=1500
+[[ $tier == full ]] && group_timeout=10800
 fail=0 total=0 passed=0 known=0
 for g in $groups; do
   want=$(printf '%s\n' "${listing[@]}" | cut -f1 | grep -cx "$g")
@@ -78,7 +82,7 @@ for g in $groups; do
   [[ $g == multi ]] && count=2
   start=$SECONDS
   out=$(cd "$tmp" && VGPU_SWEEP_GROUPS=$g TRITON_CACHE_DIR="$tmp/triton" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" \
-    timeout "${VGPU_SWEEP_GROUP_TIMEOUT:-1500}" "${cap[@]}" "$vgpu" run --gpu "$gpu" --count "$count" --preload "$python" "$sweep" 2>&1)
+    timeout "${VGPU_SWEEP_GROUP_TIMEOUT:-$group_timeout}" "${cap[@]}" "$vgpu" run --gpu "$gpu" --count "$count" --preload "$python" "$sweep" 2>&1)
   status=$?
   secs=$((SECONDS - start))
   echo "$out" | grep -E '^(ok|FAIL|skip|XFAIL|XPASS) ' | sed "s/^/      [$g] /"

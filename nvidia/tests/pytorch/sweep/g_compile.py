@@ -1,6 +1,10 @@
 """torch.compile: Inductor's Triton kernels (compiled to PTX, run by the
 simulator) for forward and backward, training steps, dynamic shapes, CUDA
-graphs through mode="reduce-overhead", and flex_attention."""
+graphs through mode="reduce-overhead", and flex_attention.
+
+Each Inductor compile costs 70-270 s on the CI runner, so the quick tier keeps the cheap ones (conv2d + batch norm
+at ~1 s, the half/bfloat16 chains and the fused matmul at ~70 s) and the two known failures, which fail fast;
+the full tier (the nightly) runs the rest. Tolerances are the same in both."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,17 +27,17 @@ def reg(name, f, args, tol=1e-3, tier='quick', **kw):
 x2 = rnd(32, 48, seed=1)
 x4 = rnd(2, 4, 16, 32, seed=2)
 
-reg('softmax, log_softmax and cross entropy', lambda t: F.cross_entropy(t, torch.arange(32, device=t.device) % 48), [x2])
-reg('RMSNorm and rotary-style pointwise math', lambda t: (t * torch.rsqrt(t.square().mean(-1, keepdim=True) + 1e-6)) * torch.cos(t) + torch.sin(t.roll(1, -1)), [x2])
-reg('cumsum, sort and argmax', lambda t: [t.cumsum(1), t.sort(1).values, t.argmax(1)], [x2])
+reg('softmax, log_softmax and cross entropy', lambda t: F.cross_entropy(t, torch.arange(32, device=t.device) % 48), [x2], tier='full')
+reg('RMSNorm and rotary-style pointwise math', lambda t: (t * torch.rsqrt(t.square().mean(-1, keepdim=True) + 1e-6)) * torch.cos(t) + torch.sin(t.roll(1, -1)), [x2], tier='full')
+reg('cumsum, sort and argmax', lambda t: [t.cumsum(1), t.sort(1).values, t.argmax(1)], [x2], tier='full')
 reg('gather, scatter_add and index_select', lambda t: [t.gather(1, (torch.arange(48, device=t.device) % 48).expand(32, 48)), torch.zeros_like(t).scatter_add(0, (torch.arange(32, device=t.device) % 5).unsqueeze(1).expand(32, 48), t), t.index_select(0, torch.tensor([3, 1, 4], device=t.device))], [x2])
 reg('half and bfloat16 pointwise chains', lambda t: [(t.half() * 2 + 1).sin().float(), (t.bfloat16().exp() - 1).float()], [x2], 2e-2)
-reg('integer and boolean math', lambda t: [((t * 100).long() % 7 + (t > 0).long()).float(), torch.where(t > 0, t, -t * 2)], [x2])
-reg('where, clamp, masked_fill and max-reductions with dims', lambda t: [t.masked_fill(t > 1, 0).amax(0), t.clamp(-0.5, 0.5).sum(1), t.max(dim=1)[1]], [x2])
+reg('integer and boolean math', lambda t: [((t * 100).long() % 7 + (t > 0).long()).float(), torch.where(t > 0, t, -t * 2)], [x2], tier='full')
+reg('where, clamp, masked_fill and max-reductions with dims', lambda t: [t.masked_fill(t > 1, 0).amax(0), t.clamp(-0.5, 0.5).sum(1), t.max(dim=1)[1]], [x2], tier='full')
 reg('matmul with a fused bias, GELU and residual', lambda a, w, b: F.gelu(a @ w + b) * 2, [x2, rnd(48, 24, seed=3), rnd(24, seed=4)], 2e-3)
 reg('conv2d, batch norm (eval) and ReLU', lambda t, w: F.relu(F.batch_norm(F.conv2d(t, w, padding=1), torch.zeros(6, device=t.device), torch.ones(6, device=t.device))), [rnd(2, 3, 12, 12, seed=2), rnd(6, 3, 3, 3, seed=3)], 2e-3)
-reg('layer norm backward (AOTAutograd)', lambda t: _grad(lambda u: F.layer_norm(u, (48,)).square().mul(torch.arange(48, device=u.device)).sum(), t), [x2], 2e-3)
-reg('attention block with a causal mask', lambda q, k, v: _grad_multi(lambda a, b, c: (torch.softmax((a @ b.transpose(-1, -2)) / 5.6 + torch.triu(torch.full((16, 16), float('-inf'), device=a.device), 1), -1) @ c).square().sum(), q, k, v), [x4, x4.flip(-1), x4 * 0.5], 3e-2)
+reg('layer norm backward (AOTAutograd)', lambda t: _grad(lambda u: F.layer_norm(u, (48,)).square().mul(torch.arange(48, device=u.device)).sum(), t), [x2], 2e-3, tier='full')
+reg('attention block with a causal mask', lambda q, k, v: _grad_multi(lambda a, b, c: (torch.softmax((a @ b.transpose(-1, -2)) / 5.6 + torch.triu(torch.full((16, 16), float('-inf'), device=a.device), 1), -1) @ c).square().sum(), q, k, v), [x4, x4.flip(-1), x4 * 0.5], 3e-2, tier='full')
 reg('dynamic shapes: the same function at three lengths', lambda t: _dyn(t), [x2], 1e-3, tier='full')
 reg('graph breaks and a data-dependent branch', lambda t: t.sum() if t.sum() > 0 else -t.sum(), [x2], 1e-3, tier='full')
 reg('max-autotune-no-cudagraphs: a matmul template', lambda a, b: a @ b + 1, [rnd(64, 64, seed=1), rnd(64, 64, seed=2)], 5e-3, tier='full', mode='max-autotune-no-cudagraphs')
@@ -72,7 +76,7 @@ def _train(d):
     return [torch.stack(ls), list(net.parameters())]
 
 
-check(L, 'torch.compile: a model trained three AdamW steps (forward and backward kernels)', 3e-3)(_train)
+check(L, 'torch.compile: a model trained three AdamW steps (forward and backward kernels)', 3e-3, tier='full')(_train)
 
 
 def _compiled_opt(d):
