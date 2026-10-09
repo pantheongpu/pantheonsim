@@ -969,6 +969,7 @@ cudnnStatus_t run_conv(const char* fn, ConvDir dir, cudnnHandle_t h, int algo, c
 VGPU_EXPORT cudnnStatus_t cudnnReorderFilterAndBias(cudnnHandle_t h, const cudnnFilterDescriptor_t wd,
                                                     cudnnReorderType_t type, const void* w, void* rw, int reorder_bias,
                                                     const void* b, void* rb) {
+  VGPU_DEFER(h, cudnnReorderFilterAndBias, h, wd, type, w, rw, reorder_bias, b, rb);
   static const char* fn = "cudnnReorderFilterAndBias";
   const FilterDesc* W = fdesc(wd);
   if (!known(h) || !W || !w || !rw) return BAD(fn, "invalid handle, filter descriptor or pointer");
@@ -1009,6 +1010,7 @@ VGPU_EXPORT cudnnStatus_t cudnnReorderFilterAndBias(cudnnHandle_t h, const cudnn
 VGPU_EXPORT cudnnStatus_t cudnnIm2Col(cudnnHandle_t h, const cudnnTensorDescriptor_t xd, const void* x,
                                       const cudnnFilterDescriptor_t wd, const cudnnConvolutionDescriptor_t cd,
                                       void* col) {
+  VGPU_DEFER(h, cudnnIm2Col, h, xd, x, wd, cd, col);
   static const char* fn = "cudnnIm2Col";
   const TensorDesc* X = tdesc(xd);
   const FilterDesc* W = fdesc(wd);
@@ -1202,8 +1204,10 @@ VGPU_EXPORT cudnnStatus_t cudnnGetConvolutionBackwardFilterWorkspaceSize(
 VGPU_EXPORT cudnnStatus_t cudnnConvolutionForward(cudnnHandle_t h, const void* alpha, const cudnnTensorDescriptor_t xd,
                                                   const void* x, const cudnnFilterDescriptor_t wd, const void* w,
                                                   const cudnnConvolutionDescriptor_t cd, cudnnConvolutionFwdAlgo_t algo,
-                                                  void*, size_t, const void* beta, const cudnnTensorDescriptor_t yd,
+                                                  void* unused8, size_t unused9, const void* beta, const cudnnTensorDescriptor_t yd,
                                                   void* y) {
+  VGPU_DEFER(h, cudnnConvolutionForward, h, scalar(alpha, yd), xd, x, wd, w, cd, algo, unused8, unused9,
+      scalar(beta, yd), yd, y);
   static const char* fn = "cudnnConvolutionForward";
   if (!known(h)) return BAD(fn, "invalid handle");
   ConvCall call;
@@ -1216,8 +1220,10 @@ VGPU_EXPORT cudnnStatus_t cudnnConvolutionBackwardData(cudnnHandle_t h, const vo
                                                        const cudnnFilterDescriptor_t wd, const void* w,
                                                        const cudnnTensorDescriptor_t dyd, const void* dy,
                                                        const cudnnConvolutionDescriptor_t cd,
-                                                       cudnnConvolutionBwdDataAlgo_t algo, void*, size_t,
+                                                       cudnnConvolutionBwdDataAlgo_t algo, void* unused8, size_t unused9,
                                                        const void* beta, const cudnnTensorDescriptor_t dxd, void* dx) {
+  VGPU_DEFER(h, cudnnConvolutionBackwardData, h, scalar(alpha, dxd), wd, w, dyd, dy, cd, algo, unused8, unused9,
+      scalar(beta, dxd), dxd, dx);
   static const char* fn = "cudnnConvolutionBackwardData";
   if (!known(h)) return BAD(fn, "invalid handle");
   ConvCall call;
@@ -1230,9 +1236,11 @@ VGPU_EXPORT cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t h, const 
                                                          const cudnnTensorDescriptor_t xd, const void* x,
                                                          const cudnnTensorDescriptor_t dyd, const void* dy,
                                                          const cudnnConvolutionDescriptor_t cd,
-                                                         cudnnConvolutionBwdFilterAlgo_t algo, void*, size_t,
+                                                         cudnnConvolutionBwdFilterAlgo_t algo, void* unused8, size_t unused9,
                                                          const void* beta, const cudnnFilterDescriptor_t dwd,
                                                          void* dw) {
+  VGPU_DEFER(h, cudnnConvolutionBackwardFilter, h, scalar(alpha, dwd), xd, x, dyd, dy, cd, algo, unused8, unused9,
+      scalar(beta, dwd), dwd, dw);
   static const char* fn = "cudnnConvolutionBackwardFilter";
   if (!known(h)) return BAD(fn, "invalid handle");
   ConvCall call;
@@ -1245,6 +1253,7 @@ VGPU_EXPORT cudnnStatus_t cudnnConvolutionBackwardFilter(cudnnHandle_t h, const 
 VGPU_EXPORT cudnnStatus_t cudnnConvolutionBackwardBias(cudnnHandle_t h, const void* alpha,
                                                        const cudnnTensorDescriptor_t dyd, const void* dy,
                                                        const void* beta, const cudnnTensorDescriptor_t dbd, void* db) {
+  VGPU_DEFER(h, cudnnConvolutionBackwardBias, h, scalar(alpha, dbd), dyd, dy, scalar(beta, dbd), dbd, db);
   static const char* fn = "cudnnConvolutionBackwardBias";
   const TensorDesc* Y = tdesc(dyd);
   const TensorDesc* B = tdesc(dbd);
@@ -1328,6 +1337,7 @@ bool activate(const ActDesc& a, double v, double* r) {
 VGPU_EXPORT cudnnStatus_t cudnnActivationForward(cudnnHandle_t h, cudnnActivationDescriptor_t ad, const void* alpha,
                                                  const cudnnTensorDescriptor_t xd, const void* x, const void* beta,
                                                  const cudnnTensorDescriptor_t yd, void* y) {
+  VGPU_DEFER(h, cudnnActivationForward, h, ad, scalar(alpha, yd), xd, x, scalar(beta, yd), yd, y);
   static const char* fn = "cudnnActivationForward";
   const TensorDesc* X = tdesc(xd);
   const TensorDesc* Y = tdesc(yd);
@@ -1370,6 +1380,8 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationBackward(cudnnHandle_t h, cudnnActivati
                                                   const cudnnTensorDescriptor_t dyd, const void* dy,
                                                   const cudnnTensorDescriptor_t xd, const void* x, const void* beta,
                                                   const cudnnTensorDescriptor_t dxd, void* dx) {
+  VGPU_DEFER(h, cudnnActivationBackward, h, ad, scalar(alpha, dxd), yd, y, dyd, dy, xd, x, scalar(beta, dxd), dxd,
+      dx);
   static const char* fn = "cudnnActivationBackward";
   const TensorDesc *Y = tdesc(yd), *DY = tdesc(dyd), *X = tdesc(xd), *DX = tdesc(dxd);
   if (!known(h) || !known(ad) || !Y || !DY || !X || !DX || !alpha || !beta || !dy || !dx)
@@ -1414,9 +1426,11 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationBackward(cudnnHandle_t h, cudnnActivati
 VGPU_EXPORT cudnnStatus_t cudnnConvolutionBiasActivationForward(
     cudnnHandle_t h, const void* alpha1, const cudnnTensorDescriptor_t xd, const void* x,
     const cudnnFilterDescriptor_t wd, const void* w, const cudnnConvolutionDescriptor_t cd,
-    cudnnConvolutionFwdAlgo_t algo, void*, size_t, const void* alpha2, const cudnnTensorDescriptor_t zd, const void* z,
+    cudnnConvolutionFwdAlgo_t algo, void* unused8, size_t unused9, const void* alpha2, const cudnnTensorDescriptor_t zd, const void* z,
     const cudnnTensorDescriptor_t bd, const void* bias, const cudnnActivationDescriptor_t ad,
     const cudnnTensorDescriptor_t yd, void* y) {
+  VGPU_DEFER(h, cudnnConvolutionBiasActivationForward, h, scalar(alpha1, yd), xd, x, wd, w, cd, algo, unused8,
+      unused9, scalar(alpha2, yd), zd, z, bd, bias, ad, yd, y);
   static const char* fn = "cudnnConvolutionBiasActivationForward";
   if (!known(h) || !known(ad)) return BAD(fn, "invalid handle or activation descriptor");
   ConvCall call;
@@ -1602,6 +1616,7 @@ cudnnStatus_t pool_geometry(const char* fn, const PoolDesc& p, const Layout& x, 
 VGPU_EXPORT cudnnStatus_t cudnnPoolingForward(cudnnHandle_t h, const cudnnPoolingDescriptor_t pd, const void* alpha,
                                               const cudnnTensorDescriptor_t xd, const void* x, const void* beta,
                                               const cudnnTensorDescriptor_t yd, void* y) {
+  VGPU_DEFER(h, cudnnPoolingForward, h, pd, scalar(alpha, yd), xd, x, scalar(beta, yd), yd, y);
   static const char* fn = "cudnnPoolingForward";
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !known(pd) || !X || !Y || !alpha || !beta || !x || !y)
@@ -1651,6 +1666,7 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t h, const cudnnPooli
                                                const cudnnTensorDescriptor_t dyd, const void* dy,
                                                const cudnnTensorDescriptor_t xd, const void* x, const void* beta,
                                                const cudnnTensorDescriptor_t dxd, void* dx) {
+  VGPU_DEFER(h, cudnnPoolingBackward, h, pd, scalar(alpha, dxd), yd, y, dyd, dy, xd, x, scalar(beta, dxd), dxd, dx);
   static const char* fn = "cudnnPoolingBackward";
   const TensorDesc *Y = tdesc(yd), *DY = tdesc(dyd), *X = tdesc(xd), *DX = tdesc(dxd);
   if (!known(h) || !known(pd) || !Y || !DY || !X || !DX || !alpha || !beta || !dy || !dx)
@@ -1729,6 +1745,7 @@ void softmax_groups(const Layout& t, cudnnSoftmaxMode_t mode, F&& f) {
 VGPU_EXPORT cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t h, cudnnSoftmaxAlgorithm_t algo, cudnnSoftmaxMode_t mode,
                                               const void* alpha, const cudnnTensorDescriptor_t xd, const void* x,
                                               const void* beta, const cudnnTensorDescriptor_t yd, void* y) {
+  VGPU_DEFER(h, cudnnSoftmaxForward, h, algo, mode, scalar(alpha, yd), xd, x, scalar(beta, yd), yd, y);
   static const char* fn = "cudnnSoftmaxForward";
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !X || !Y || !alpha || !beta || !x || !y) return BAD(fn, "invalid handle, descriptor or pointer");
@@ -1755,6 +1772,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t h, cudnnSoftmaxAlgo
                                                const void* alpha, const cudnnTensorDescriptor_t yd, const void* y,
                                                const cudnnTensorDescriptor_t dyd, const void* dy, const void* beta,
                                                const cudnnTensorDescriptor_t dxd, void* dx) {
+  VGPU_DEFER(h, cudnnSoftmaxBackward, h, algo, mode, scalar(alpha, dxd), yd, y, dyd, dy, scalar(beta, dxd), dxd, dx);
   static const char* fn = "cudnnSoftmaxBackward";
   const TensorDesc *Y = tdesc(yd), *DY = tdesc(dyd), *DX = tdesc(dxd);
   if (!known(h) || !Y || !DY || !DX || !alpha || !beta || !y || !dy || !dx)
@@ -1848,6 +1866,7 @@ VGPU_EXPORT cudnnStatus_t cudnnLRNCrossChannelForward(cudnnHandle_t h, cudnnLRND
                                                       const void* alpha, const cudnnTensorDescriptor_t xd,
                                                       const void* x, const void* beta,
                                                       const cudnnTensorDescriptor_t yd, void* y) {
+  VGPU_DEFER(h, cudnnLRNCrossChannelForward, h, ld, mode, scalar(alpha, yd), xd, x, scalar(beta, yd), yd, y);
   static const char* fn = "cudnnLRNCrossChannelForward";
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !known(ld) || !X || !Y || !alpha || !beta || !x || !y)
@@ -1872,6 +1891,8 @@ VGPU_EXPORT cudnnStatus_t cudnnLRNCrossChannelBackward(cudnnHandle_t h, cudnnLRN
                                                        const void* y, const cudnnTensorDescriptor_t dyd,
                                                        const void* dy, const cudnnTensorDescriptor_t xd, const void* x,
                                                        const void* beta, const cudnnTensorDescriptor_t dxd, void* dx) {
+  VGPU_DEFER(h, cudnnLRNCrossChannelBackward, h, ld, mode, scalar(alpha, dxd), yd, y, dyd, dy, xd, x, scalar(beta,
+      dxd), dxd, dx);
   static const char* fn = "cudnnLRNCrossChannelBackward";
   const TensorDesc *Y = tdesc(yd), *DY = tdesc(dyd), *X = tdesc(xd), *DX = tdesc(dxd);
   if (!known(h) || !known(ld) || !Y || !DY || !X || !DX || !alpha || !beta || !y || !dy || !x || !dx)
@@ -1988,11 +2009,13 @@ std::vector<double> divnorm_base(const LrnDesc& L, const DivNormCall& c, const s
 }  // namespace
 
 VGPU_EXPORT cudnnStatus_t cudnnDivisiveNormalizationForward(cudnnHandle_t h, cudnnLRNDescriptor_t ld,
-                                                            cudnnDivNormMode_t, const void* alpha,
+                                                            cudnnDivNormMode_t unused2, const void* alpha,
                                                             const cudnnTensorDescriptor_t xd, const void* x,
                                                             const void* means, void* temp, void* temp2,
                                                             const void* beta, const cudnnTensorDescriptor_t yd,
                                                             void* y) {
+  VGPU_DEFER(h, cudnnDivisiveNormalizationForward, h, ld, unused2, scalar(alpha, yd), xd, x, means, temp, temp2,
+      scalar(beta, yd), yd, y);
   static const char* fn = "cudnnDivisiveNormalizationForward";
   DivNormCall c;
   // The mode is not checked (measured: an undefined mode runs as
@@ -2017,12 +2040,14 @@ VGPU_EXPORT cudnnStatus_t cudnnDivisiveNormalizationForward(cudnnHandle_t h, cud
 // rather than over the windows that contain it (they differ only when the
 // window is not symmetric); matched.
 VGPU_EXPORT cudnnStatus_t cudnnDivisiveNormalizationBackward(cudnnHandle_t h, cudnnLRNDescriptor_t ld,
-                                                             cudnnDivNormMode_t, const void* alpha,
+                                                             cudnnDivNormMode_t unused2, const void* alpha,
                                                              const cudnnTensorDescriptor_t xd, const void* x,
                                                              const void* means, const void* dy, void* temp,
                                                              void* temp2, const void* beta,
                                                              const cudnnTensorDescriptor_t dxd, void* dx,
                                                              void* dmeans) {
+  VGPU_DEFER(h, cudnnDivisiveNormalizationBackward, h, ld, unused2, scalar(alpha, dxd), xd, x, means, dy, temp,
+      temp2, scalar(beta, dxd), dxd, dx, dmeans);
   static const char* fn = "cudnnDivisiveNormalizationBackward";
   DivNormCall c;
   if (cudnnStatus_t s = divnorm_check(fn, h, ld, alpha, beta, tdesc(xd), tdesc(dxd), {x, dy, dx, temp, temp2}, &c);
@@ -2061,6 +2086,7 @@ VGPU_EXPORT cudnnStatus_t cudnnDivisiveNormalizationBackward(cudnnHandle_t h, cu
 // extent 1 -- the usual bias add has A shaped [1, C, 1, 1].
 VGPU_EXPORT cudnnStatus_t cudnnAddTensor(cudnnHandle_t h, const void* alpha, const cudnnTensorDescriptor_t ad,
                                          const void* A, const void* beta, const cudnnTensorDescriptor_t cd, void* C) {
+  VGPU_DEFER(h, cudnnAddTensor, h, scalar(alpha, cd), ad, A, scalar(beta, cd), cd, C);
   static const char* fn = "cudnnAddTensor";
   const TensorDesc *Ad = tdesc(ad), *Cd = tdesc(cd);
   if (!known(h) || !Ad || !Cd || !alpha || !beta || !A || !C) return BAD(fn, "invalid handle, descriptor or pointer");
@@ -2110,6 +2136,7 @@ VGPU_EXPORT cudnnStatus_t cudnnOpTensor(cudnnHandle_t h, const cudnnOpTensorDesc
                                         const cudnnTensorDescriptor_t ad, const void* A, const void* alpha2,
                                         const cudnnTensorDescriptor_t bd, const void* Bp, const void* beta,
                                         const cudnnTensorDescriptor_t cd, void* C) {
+  VGPU_DEFER(h, cudnnOpTensor, h, od, scalar(alpha1, cd), ad, A, scalar(alpha2, cd), bd, Bp, scalar(beta, cd), cd, C);
   static const char* fn = "cudnnOpTensor";
   const TensorDesc *Ad = tdesc(ad), *Bd = tdesc(bd), *Cd = tdesc(cd);
   if (!known(h) || !known(od) || !Ad || !Bd || !Cd || !alpha1 || !alpha2 || !beta || !A || !Bp || !C)
@@ -2219,9 +2246,11 @@ VGPU_EXPORT cudnnStatus_t cudnnGetReductionWorkspaceSize(cudnnHandle_t h, const 
 // MIN, MAX and AMAX can also give each result's index: its position among the
 // elements reduced, row-major over the reduced dimensions, first one on a tie.
 VGPU_EXPORT cudnnStatus_t cudnnReduceTensor(cudnnHandle_t h, const cudnnReduceTensorDescriptor_t rd, void* indices,
-                                            size_t indices_bytes, void*, size_t, const void* alpha,
+                                            size_t indices_bytes, void* unused4, size_t unused5, const void* alpha,
                                             const cudnnTensorDescriptor_t ad, const void* A, const void* beta,
                                             const cudnnTensorDescriptor_t cd, void* C) {
+  VGPU_DEFER(h, cudnnReduceTensor, h, rd, indices, indices_bytes, unused4, unused5, scalar(alpha, cd), ad, A,
+      scalar(beta, cd), cd, C);
   static const char* fn = "cudnnReduceTensor";
   const TensorDesc *Ad = tdesc(ad), *Cd = tdesc(cd);
   if (!known(h) || !alpha || !beta || !A || !C) return BAD(fn, "invalid handle or pointer");
@@ -2313,6 +2342,7 @@ cudnnStatus_t vect_transform_check(const char* fn, const TensorDesc* X, const Te
 VGPU_EXPORT cudnnStatus_t cudnnTransformTensor(cudnnHandle_t h, const void* alpha, const cudnnTensorDescriptor_t xd,
                                                const void* x, const void* beta, const cudnnTensorDescriptor_t yd,
                                                void* y) {
+  VGPU_DEFER(h, cudnnTransformTensor, h, scalar(alpha, yd), xd, x, scalar(beta, yd), yd, y);
   static const char* fn = "cudnnTransformTensor";
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !X || !Y || !alpha || !beta || !x || !y) return BAD(fn, "invalid handle, descriptor or pointer");
@@ -2545,6 +2575,7 @@ VGPU_EXPORT cudnnStatus_t cudnnInitTransformDest(const cudnnTensorTransformDescr
 VGPU_EXPORT cudnnStatus_t cudnnTransformTensorEx(cudnnHandle_t h, const cudnnTensorTransformDescriptor_t td,
                                                  const void* alpha, const cudnnTensorDescriptor_t sd, const void* src,
                                                  const void* beta, const cudnnTensorDescriptor_t dd, void* dst) {
+  VGPU_DEFER(h, cudnnTransformTensorEx, h, td, scalar(alpha, dd), sd, src, scalar(beta, dd), dd, dst);
   static const char* fn = "cudnnTransformTensorEx";
   const TransDesc* t = trdesc(td);
   const TensorDesc *S = tdesc(sd), *D = tdesc(dd);
@@ -2559,6 +2590,7 @@ VGPU_EXPORT cudnnStatus_t cudnnTransformTensorEx(cudnnHandle_t h, const cudnnTen
 VGPU_EXPORT cudnnStatus_t cudnnTransformFilter(cudnnHandle_t h, const cudnnTensorTransformDescriptor_t td,
                                                const void* alpha, const cudnnFilterDescriptor_t sd, const void* src,
                                                const void* beta, const cudnnFilterDescriptor_t dd, void* dst) {
+  VGPU_DEFER(h, cudnnTransformFilter, h, td, scalar(alpha, dd), sd, src, scalar(beta, dd), dd, dst);
   static const char* fn = "cudnnTransformFilter";
   const TransDesc* t = trdesc(td);
   const FilterDesc *S = fdesc(sd), *D = fdesc(dd);
@@ -2573,6 +2605,7 @@ VGPU_EXPORT cudnnStatus_t cudnnTransformFilter(cudnnHandle_t h, const cudnnTenso
 // double for double ones; integer tensors are NOT_SUPPORTED.
 VGPU_EXPORT cudnnStatus_t cudnnSetTensor(cudnnHandle_t h, const cudnnTensorDescriptor_t yd, void* y,
                                          const void* value) {
+  VGPU_DEFER(h, cudnnSetTensor, h, yd, y, scalar(value, yd));
   static const char* fn = "cudnnSetTensor";
   const TensorDesc* Y = tdesc(yd);
   if (!known(h) || !Y || !y || !value) return BAD(fn, "invalid handle, descriptor or pointer");
@@ -2583,6 +2616,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSetTensor(cudnnHandle_t h, const cudnnTensorDescr
 }
 VGPU_EXPORT cudnnStatus_t cudnnScaleTensor(cudnnHandle_t h, const cudnnTensorDescriptor_t yd, void* y,
                                            const void* alpha) {
+  VGPU_DEFER(h, cudnnScaleTensor, h, yd, y, scalar(alpha, yd));
   static const char* fn = "cudnnScaleTensor";
   const TensorDesc* Y = tdesc(yd);
   if (!known(h) || !Y || !y || !alpha) return BAD(fn, "invalid handle, descriptor or pointer");
@@ -2884,6 +2918,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardInference(
     cudnnHandle_t h, cudnnBatchNormMode_t mode, const void* alpha, const void* beta, const cudnnTensorDescriptor_t xd,
     const void* x, const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale,
     const void* bias, const void* mean, const void* var, double eps) {
+  VGPU_DEFER(h, cudnnBatchNormalizationForwardInference, h, mode, scalar(alpha, yd), scalar(beta, yd), xd, x, yd,
+      y, bnd, scale, bias, mean, var, eps);
   return bn_inference("cudnnBatchNormalizationForwardInference", h, mode, alpha, beta, xd, x, yd, y, bnd, scale, bias,
                       bnd, mean, var, eps, BnFusion{});
 }
@@ -2893,6 +2929,8 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTraining(
     const void* x, const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale,
     const void* bias, double exp_avg_factor, void* running_mean, void* running_var, double eps, void* save_mean,
     void* save_inv_var) {
+  VGPU_DEFER(h, cudnnBatchNormalizationForwardTraining, h, mode, scalar(alpha, yd), scalar(beta, yd), xd, x, yd, y,
+      bnd, scale, bias, exp_avg_factor, running_mean, running_var, eps, save_mean, save_inv_var);
   return bn_forward_training("cudnnBatchNormalizationForwardTraining", h, mode, alpha, beta, xd, x, yd, y, bnd, scale,
                              bias, exp_avg_factor, running_mean, running_var, eps, save_mean, save_inv_var, BnFusion{});
 }
@@ -2927,7 +2965,10 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationForwardTrainingEx(
     const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t zd, const void* z,
     const cudnnTensorDescriptor_t yd, void* y, const cudnnTensorDescriptor_t bnd, const void* scale, const void* bias,
     double factor, void* running_mean, void* running_var, double eps, void* save_mean, void* save_inv_var,
-    cudnnActivationDescriptor_t ad, void*, size_t, void* reserve, size_t reserve_bytes) {
+    cudnnActivationDescriptor_t ad, void* unused21, size_t unused22, void* reserve, size_t reserve_bytes) {
+  VGPU_DEFER(h, cudnnBatchNormalizationForwardTrainingEx, h, mode, ops, scalar(alpha, yd), scalar(beta, yd), xd, x,
+      zd, z, yd, y, bnd, scale, bias, factor, running_mean, running_var, eps, save_mean, save_inv_var, ad, unused21,
+      unused22, reserve, reserve_bytes);
   static const char* fn = "cudnnBatchNormalizationForwardTrainingEx";
   const TensorDesc* X = tdesc(xd);
   if (!X) return BAD(fn, "x's descriptor is null, destroyed or never set");
@@ -2943,6 +2984,9 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackward(
     const void* beta_param, const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t dyd,
     const void* dy, const cudnnTensorDescriptor_t dxd, void* dx, const cudnnTensorDescriptor_t bnd, const void* scale,
     void* dscale_out, void* dbias_out, double eps, const void* saved_mean, const void* saved_inv) {
+  VGPU_DEFER(h, cudnnBatchNormalizationBackward, h, mode, scalar(alpha_data, dxd), scalar(beta_data, dxd),
+      scalar(alpha_param, bnd), scalar(beta_param, bnd), xd, x, dyd, dy, dxd, dx, bnd, scale, dscale_out, dbias_out, eps,
+      saved_mean, saved_inv);
   return bn_backward("cudnnBatchNormalizationBackward", h, mode, alpha_data, beta_data, alpha_param, beta_param, xd, x,
                      nullptr, nullptr, dyd, dy, nullptr, nullptr, dxd, dx, bnd, scale, nullptr, dscale_out, dbias_out,
                      eps, saved_mean, saved_inv, BnFusion{});
@@ -2954,8 +2998,11 @@ VGPU_EXPORT cudnnStatus_t cudnnBatchNormalizationBackwardEx(
     const cudnnTensorDescriptor_t yd, const void* y, const cudnnTensorDescriptor_t dyd, const void* dy,
     const cudnnTensorDescriptor_t dzd, void* dz, const cudnnTensorDescriptor_t dxd, void* dx,
     const cudnnTensorDescriptor_t bnd, const void* scale, const void* bias, void* dscale, void* dbias, double eps,
-    const void* saved_mean, const void* saved_inv, cudnnActivationDescriptor_t ad, void*, size_t, void* reserve,
+    const void* saved_mean, const void* saved_inv, cudnnActivationDescriptor_t ad, void* unused26, size_t unused27, void* reserve,
     size_t reserve_bytes) {
+  VGPU_DEFER(h, cudnnBatchNormalizationBackwardEx, h, mode, ops, scalar(alpha_data, dxd), scalar(beta_data, dxd),
+      scalar(alpha_param, bnd), scalar(beta_param, bnd), xd, x, yd, y, dyd, dy, dzd, dz, dxd, dx, bnd, scale, bias,
+      dscale, dbias, eps, saved_mean, saved_inv, ad, unused26, unused27, reserve, reserve_bytes);
   static const char* fn = "cudnnBatchNormalizationBackwardEx";
   const TensorDesc* X = tdesc(xd);
   if (!X) return BAD(fn, "x's descriptor is null, destroyed or never set");
@@ -2993,11 +3040,13 @@ VGPU_EXPORT cudnnStatus_t cudnnDeriveNormTensorDescriptor(cudnnTensorDescriptor_
 }
 
 VGPU_EXPORT cudnnStatus_t cudnnNormalizationForwardInference(
-    cudnnHandle_t h, cudnnNormMode_t mode, cudnnNormOps_t ops, cudnnNormAlgo_t, const void* alpha, const void* beta,
+    cudnnHandle_t h, cudnnNormMode_t mode, cudnnNormOps_t ops, cudnnNormAlgo_t unused3, const void* alpha, const void* beta,
     const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t sbd, const void* scale,
     const void* bias, const cudnnTensorDescriptor_t mvd, const void* mean, const void* var,
     const cudnnTensorDescriptor_t zd, const void* z, cudnnActivationDescriptor_t ad, const cudnnTensorDescriptor_t yd,
     void* y, double eps, int groups) {
+  VGPU_DEFER(h, cudnnNormalizationForwardInference, h, mode, ops, unused3, scalar(alpha, yd), scalar(beta, yd), xd,
+      x, sbd, scale, bias, mvd, mean, var, zd, z, ad, yd, y, eps, groups);
   static const char* fn = "cudnnNormalizationForwardInference";
   cudnnBatchNormMode_t bn;
   cudnnStatus_t s = norm_mode(fn, mode, groups, &bn);
@@ -3040,12 +3089,15 @@ VGPU_EXPORT cudnnStatus_t cudnnGetNormalizationTrainingReserveSpaceSize(cudnnHan
 }
 
 VGPU_EXPORT cudnnStatus_t cudnnNormalizationForwardTraining(
-    cudnnHandle_t h, cudnnNormMode_t mode, cudnnNormOps_t ops, cudnnNormAlgo_t, const void* alpha, const void* beta,
+    cudnnHandle_t h, cudnnNormMode_t mode, cudnnNormOps_t ops, cudnnNormAlgo_t unused3, const void* alpha, const void* beta,
     const cudnnTensorDescriptor_t xd, const void* x, const cudnnTensorDescriptor_t sbd, const void* scale,
     const void* bias, double factor, const cudnnTensorDescriptor_t mvd, void* running_mean, void* running_var,
     double eps, void* save_mean, void* save_inv_var, cudnnActivationDescriptor_t ad, const cudnnTensorDescriptor_t zd,
-    const void* z, const cudnnTensorDescriptor_t yd, void* y, void*, size_t, void* reserve, size_t reserve_bytes,
+    const void* z, const cudnnTensorDescriptor_t yd, void* y, void* unused23, size_t unused24, void* reserve, size_t reserve_bytes,
     int groups) {
+  VGPU_DEFER(h, cudnnNormalizationForwardTraining, h, mode, ops, unused3, scalar(alpha, yd), scalar(beta, yd), xd,
+      x, sbd, scale, bias, factor, mvd, running_mean, running_var, eps, save_mean, save_inv_var, ad, zd, z, yd, y,
+      unused23, unused24, reserve, reserve_bytes, groups);
   static const char* fn = "cudnnNormalizationForwardTraining";
   cudnnBatchNormMode_t bn;
   cudnnStatus_t s = norm_mode(fn, mode, groups, &bn);
@@ -3063,13 +3115,16 @@ VGPU_EXPORT cudnnStatus_t cudnnNormalizationForwardTraining(
 }
 
 VGPU_EXPORT cudnnStatus_t cudnnNormalizationBackward(
-    cudnnHandle_t h, cudnnNormMode_t mode, cudnnNormOps_t ops, cudnnNormAlgo_t, const void* alpha_data,
+    cudnnHandle_t h, cudnnNormMode_t mode, cudnnNormOps_t ops, cudnnNormAlgo_t unused3, const void* alpha_data,
     const void* beta_data, const void* alpha_param, const void* beta_param, const cudnnTensorDescriptor_t xd,
     const void* x, const cudnnTensorDescriptor_t yd, const void* y, const cudnnTensorDescriptor_t dyd, const void* dy,
     const cudnnTensorDescriptor_t dzd, void* dz, const cudnnTensorDescriptor_t dxd, void* dx,
     const cudnnTensorDescriptor_t sbd, const void* scale, const void* bias, void* dscale, void* dbias, double eps,
     const cudnnTensorDescriptor_t mvd, const void* saved_mean, const void* saved_inv, cudnnActivationDescriptor_t ad,
-    void*, size_t, void* reserve, size_t reserve_bytes, int groups) {
+    void* unused28, size_t unused29, void* reserve, size_t reserve_bytes, int groups) {
+  VGPU_DEFER(h, cudnnNormalizationBackward, h, mode, ops, unused3, scalar(alpha_data, dxd), scalar(beta_data, dxd),
+      scalar(alpha_param, sbd), scalar(beta_param, sbd), xd, x, yd, y, dyd, dy, dzd, dz, dxd, dx, sbd, scale, bias,
+      dscale, dbias, eps, mvd, saved_mean, saved_inv, ad, unused28, unused29, reserve, reserve_bytes, groups);
   static const char* fn = "cudnnNormalizationBackward";
   cudnnBatchNormMode_t bn;
   cudnnStatus_t s = norm_mode(fn, mode, groups, &bn);
@@ -3139,6 +3194,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSetSpatialTransformerNdDescriptor(cudnnSpatialTra
 VGPU_EXPORT cudnnStatus_t cudnnSpatialTfGridGeneratorForward(cudnnHandle_t h,
                                                              const cudnnSpatialTransformerDescriptor_t d,
                                                              const void* theta, void* grid) {
+  VGPU_DEFER(h, cudnnSpatialTfGridGeneratorForward, h, d, theta, grid);
   if (!known(h) || !known(d) || !theta || !grid || !as<const StDesc>(d)->set) return CUDNN_STATUS_BAD_PARAM;
   const StDesc& D = *as<const StDesc>(d);
   const Layout tl = st_array(D, {D.n, 2, 3}), gl = st_array(D, {D.n, D.h, D.w, 2});
@@ -3160,6 +3216,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSpatialTfGridGeneratorForward(cudnnHandle_t h,
 VGPU_EXPORT cudnnStatus_t cudnnSpatialTfGridGeneratorBackward(cudnnHandle_t h,
                                                               const cudnnSpatialTransformerDescriptor_t d,
                                                               const void* dgrid, void* dtheta) {
+  VGPU_DEFER(h, cudnnSpatialTfGridGeneratorBackward, h, d, dgrid, dtheta);
   if (!known(h) || !known(d) || !dgrid || !dtheta || !as<const StDesc>(d)->set) return CUDNN_STATUS_BAD_PARAM;
   const StDesc& D = *as<const StDesc>(d);
   const Layout tl = st_array(D, {D.n, 2, 3}), gl = st_array(D, {D.n, D.h, D.w, 2});
@@ -3204,6 +3261,7 @@ VGPU_EXPORT cudnnStatus_t cudnnSpatialTfSamplerForward(cudnnHandle_t h, cudnnSpa
                                                        const void* alpha, const cudnnTensorDescriptor_t xd,
                                                        const void* x, const void* grid, const void* beta,
                                                        cudnnTensorDescriptor_t yd, void* y) {
+  VGPU_DEFER(h, cudnnSpatialTfSamplerForward, h, d, scalar(alpha, yd), xd, x, grid, scalar(beta, yd), yd, y);
   static const char* fn = "cudnnSpatialTfSamplerForward";
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !known(d) || !X || !Y || !alpha || !beta || !x || !grid || !y)
@@ -3244,6 +3302,8 @@ VGPU_EXPORT cudnnStatus_t cudnnSpatialTfSamplerBackward(cudnnHandle_t h, cudnnSp
                                                         const void* alpha_grid, const cudnnTensorDescriptor_t dyd,
                                                         const void* dy, const void* grid, const void* beta_grid,
                                                         void* dgrid) {
+  VGPU_DEFER(h, cudnnSpatialTfSamplerBackward, h, d, scalar(alpha, dxd), xd, x, scalar(beta, dxd), dxd, dx,
+      scalar(alpha_grid, dyd), dyd, dy, grid, scalar(beta_grid, dyd), dgrid);
   static const char* fn = "cudnnSpatialTfSamplerBackward";
   const TensorDesc *X = tdesc(xd), *DX = tdesc(dxd), *DY = tdesc(dyd);
   if (!known(h) || !known(d) || !X || !DX || !DY || !alpha || !beta || !alpha_grid || !beta_grid || !x || !dx ||
@@ -3497,7 +3557,21 @@ VGPU_EXPORT cudnnStatus_t cudnnGetCTCLossWorkspaceSize_v8(cudnnHandle_t h, cudnn
 VGPU_EXPORT cudnnStatus_t cudnnCTCLoss(cudnnHandle_t h, const cudnnTensorDescriptor_t pd, const void* probs,
                                        const int labels[], const int label_len[], const int input_len[], void* costs,
                                        const cudnnTensorDescriptor_t gd, void* grads, cudnnCTCLossAlgo_t algo,
-                                       cudnnCTCLossDescriptor_t d, void*, size_t) {
+                                       cudnnCTCLossDescriptor_t d, void* workspace, size_t workspace_bytes) {
+  // The labels and lengths are host arrays read when the call is made, so a graph keeps copies.
+  const auto sequences = [pd] {
+    const TensorDesc* P = tdesc(pd);
+    return P ? static_cast<size_t>(P->l.dims[1]) : size_t(0);
+  };
+  const auto labels_total = [=] {
+    size_t total = 0;
+    for (size_t i = 0, n = sequences(); i < n; ++i) total += label_len[i] > 0 ? static_cast<size_t>(label_len[i]) : 0;
+    return total;
+  };
+  VGPU_DEFER(h, cudnnCTCLoss, h, pd, probs, Host{labels, [=] { return labels_total() * sizeof(int); }},
+             Host{label_len, [=] { return sequences() * sizeof(int); }},
+             Host{input_len, [=] { return sequences() * sizeof(int); }}, costs, gd, grads, algo, d, workspace,
+             workspace_bytes);
   static const char* fn = "cudnnCTCLoss";
   const TensorDesc* P = tdesc(pd);
   if (!known(d) || !P || P->l.rank != 3 || !labels || !label_len || !input_len) return BAD(fn, "invalid descriptor or pointer");
@@ -3514,7 +3588,9 @@ VGPU_EXPORT cudnnStatus_t cudnnCTCLoss(cudnnHandle_t h, const cudnnTensorDescrip
 VGPU_EXPORT cudnnStatus_t cudnnCTCLoss_v8(cudnnHandle_t h, cudnnCTCLossAlgo_t algo, cudnnCTCLossDescriptor_t d,
                                           const cudnnTensorDescriptor_t pd, const void* probs, const int labels[],
                                           const int label_len[], const int input_len[], void* costs,
-                                          const cudnnTensorDescriptor_t gd, void* grads, size_t, void*) {
+                                          const cudnnTensorDescriptor_t gd, void* grads, size_t unused11, void* unused12) {
+  VGPU_DEFER(h, cudnnCTCLoss_v8, h, algo, d, pd, probs, labels, label_len, input_len, costs, gd, grads, unused11,
+      unused12);
   static const char* fn = "cudnnCTCLoss_v8";
   const TensorDesc* P = tdesc(pd);
   if (!known(h) || !known(d) || !P || P->l.rank != 3 || !labels || !label_len || !input_len)
@@ -3614,6 +3690,7 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutForward(cudnnHandle_t h, const cudnnDropou
                                               const cudnnTensorDescriptor_t xd, const void* x,
                                               const cudnnTensorDescriptor_t yd, void* y, void* reserve,
                                               size_t reserve_bytes) {
+  VGPU_DEFER(h, cudnnDropoutForward, h, dd, xd, x, yd, y, reserve, reserve_bytes);
   static const char* fn = "cudnnDropoutForward";
   const TensorDesc *X = tdesc(xd), *Y = tdesc(yd);
   if (!known(h) || !known(dd) || !X || !Y || !x || !y || !reserve) return BAD(fn, "invalid handle, descriptor or pointer");
@@ -3644,6 +3721,7 @@ VGPU_EXPORT cudnnStatus_t cudnnDropoutBackward(cudnnHandle_t h, const cudnnDropo
                                                const cudnnTensorDescriptor_t dyd, const void* dy,
                                                const cudnnTensorDescriptor_t dxd, void* dx, void* reserve,
                                                size_t reserve_bytes) {
+  VGPU_DEFER(h, cudnnDropoutBackward, h, dd, dyd, dy, dxd, dx, reserve, reserve_bytes);
   static const char* fn = "cudnnDropoutBackward";
   const TensorDesc *DY = tdesc(dyd), *DX = tdesc(dxd);
   if (!known(h) || !known(dd) || !DY || !DX || !dy || !dx || !reserve)
@@ -4022,7 +4100,13 @@ VGPU_EXPORT cudnnStatus_t cudnnCreateFusedOpsPlan(cudnnFusedOpsPlan_t* plan, cud
   if (!plan || !valid_fused_op(op)) return CUDNN_STATUS_BAD_PARAM;
   auto* p = new FusedPlan();
   p->op = op;
-  *plan = reinterpret_cast<cudnnFusedOpsPlan_t>(track(p));
+  *plan = reinterpret_cast<cudnnFusedOpsPlan_t>(track(p, [](const void* q, Snapshot&) -> void* {
+    const auto* from = static_cast<const FusedPlan*>(q);
+    auto* c = new FusedPlan();
+    c->op = from->op, c->made = from->made;
+    if (from->c) c->c = std::make_unique<FusedConst>(*from->c);
+    return c;
+  }));
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnDestroyFusedOpsPlan(cudnnFusedOpsPlan_t plan) {
@@ -4127,6 +4211,7 @@ VGPU_EXPORT cudnnStatus_t cudnnMakeFusedOpsPlan(cudnnHandle_t h, cudnnFusedOpsPl
 
 VGPU_EXPORT cudnnStatus_t cudnnFusedOpsExecute(cudnnHandle_t h, const cudnnFusedOpsPlan_t plan,
                                                cudnnFusedOpsVariantParamPack_t pack) {
+  VGPU_DEFER(h, cudnnFusedOpsExecute, h, plan, pack);
   static const char* fn = "cudnnFusedOpsExecute";
   if (!known(h) || !known(plan) || !known(pack)) return BAD(fn, "invalid handle, plan or pack");
   const auto* p = as<const FusedPlan>(plan);

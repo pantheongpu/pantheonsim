@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
+
+#include "vgpu/runtime/capture.hpp"
 
 namespace vgpu_cudnn {
 
@@ -13,13 +16,19 @@ namespace vgpu_cudnn {
 
 namespace {
 std::mutex g_mu;
-std::set<const void*> g_live;
+struct Entry {
+  CloneFn clone;
+  void (*del)(void*);
+};
+std::map<const void*, Entry> g_live;
 thread_local std::string t_last_error;
+thread_local bool t_probe = false;
+thread_local bool t_replay = false;
 }  // namespace
 
-void* track_raw(void* p) {
+void* track_raw(void* p, CloneFn clone, void (*del)(void*)) {
   std::lock_guard<std::mutex> l(g_mu);
-  g_live.insert(p);
+  g_live[p] = Entry{clone, del};
   return p;
 }
 bool known(const void* p) {
@@ -30,6 +39,65 @@ void untrack(const void* p) {
   std::lock_guard<std::mutex> l(g_mu);
   g_live.erase(p);
 }
+
+/* ---- stream capture ---- */
+
+Snapshot::~Snapshot() {
+  for (auto& [orig, c] : done_) {
+    untrack(c.p);
+    if (c.del) c.del(c.p);
+  }
+}
+
+void* Snapshot::of(const void* p) {
+  if (!p) return nullptr;
+  for (auto& [orig, c] : done_)
+    if (orig == p) return c.p;
+  Entry e{};
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto it = g_live.find(p);
+    if (it == g_live.end()) return const_cast<void*>(p);   // device memory, a function, an index
+    e = it->second;
+  }
+  if (!e.clone || !e.del) return const_cast<void*>(p);   // not copyable: used as it is
+  void* c = e.clone(p, *this);
+  track_raw(c, e.clone, e.del);
+  done_.push_back({p, Copy{c, e.del}});
+  return c;
+}
+
+const void* Snapshot::keep(const void* p, size_t bytes) {
+  if (!p) return nullptr;
+  const auto* b = static_cast<const uint8_t*>(p);
+  bufs_.push_back(std::make_shared<std::vector<uint8_t>>(b, b + bytes));
+  return bufs_.back()->data();
+}
+
+bool replaying() { return t_replay; }
+
+// Layout is the first member of tensor and filter descriptors alike.
+Host scalar(const void* p, const void* owner) {
+  return Host{p, [owner] {
+                return known(owner) && reinterpret_cast<const Layout*>(owner)->type == CUDNN_DATA_DOUBLE
+                           ? sizeof(double)
+                           : sizeof(float);
+              }};
+}
+namespace detail {
+bool probe_active() { return t_probe; }
+void set_probe(bool on) { t_probe = on; }
+void set_replaying(bool on) { t_replay = on; }
+bool capturing_stream(cudnnHandle_t h, cudaStream_t* stream) {
+  cudaStream_t s = nullptr;
+  if (!h || !known(h) || cudnnGetStream(h, &s) != CUDNN_STATUS_SUCCESS || !s) return false;
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(s, &st) != cudaSuccess || st != cudaStreamCaptureStatusActive) return false;
+  *stream = s;
+  return true;
+}
+bool record_closure(cudaStream_t stream, std::function<void()> op) { return vgpu_record_host_op_if_capturing(stream, std::move(op)); }
+}  // namespace detail
 
 void set_last_error(const std::string& msg) { t_last_error = msg; }
 std::string last_error() { return t_last_error; }
@@ -558,6 +626,8 @@ bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep) {
 }
 
 void sync_handle(cudnnHandle_t h) {
+  if (t_probe) throw ProbeCommit{};   // see defer_call
+  if (t_replay) return;               // a graph runs its nodes in order
   cudaStream_t s = nullptr;
   if (cudnnGetStream(h, &s) == CUDNN_STATUS_SUCCESS) cudaStreamSynchronize(s);
 }
