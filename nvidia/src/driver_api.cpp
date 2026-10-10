@@ -37,6 +37,7 @@
 #include <stdexcept>
 
 #include "error_names.hpp"
+#include "kept_args.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
 #include "texture_formats.hpp"
@@ -707,21 +708,12 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 
 // Reports one driver call from the program's side. `name` is NVIDIA's own
 // spelling of the function (cuMemAlloc_v2), which is what a subscriber is told.
-// The arguments are taken by value, and traced() passes its own by value
-// too: a parameter whose address traced() took would be a memory object, and
-// handing it on to the body would load an enum argument a program filled with
-// an undeclared value as its type (undefined behaviour, which UBSan reports).
-template <class... A>
-void note_driver_args(A... a) {
-  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
-    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
-    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)));
-  }
-}
-
+// The arguments are kept as bytes in this frame for the whole call (kept_args.hpp): the profiler reads them at
+// the call's exit too.
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
-  note_driver_args(a...);
+  const vgpu_traced::KeptArgs<A...> kept(a...);
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) vgpu::profiling::note_args(kept.argv(), kept.count());
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));

@@ -27,6 +27,7 @@
 #include <vector_types.h>
 
 #include <chrono>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,7 @@
 #include <vector>
 
 #include "enum_value.hpp"
+#include "kept_args.hpp"
 #include "error_names.hpp"
 #include "texture_formats.hpp"
 #include "fatbin.hpp"
@@ -957,24 +959,20 @@ static void announce_driver_init() { vgpu::profiling::notify_init_finished(); }
 
 // Notes the arguments of the call about to be made, as pointers to the
 // parameters in declaration order (vgpu/profiling.hpp).
-// The arguments are taken by value, and traced_call passes its own by value
-// too: an argument whose address the caller takes (a const reference here) is
-// a memory object, and handing it on to the body then loads it as its type --
-// which, for an enum a program filled with a value the enum does not declare,
-// is undefined behaviour that UBSan reports. A parameter nobody takes the
-// address of is not loaded that way.
+// Notes the arguments of the call about to be made for the profiler. The caller keeps `kept` (the bytes of the
+// arguments, see kept_args.hpp) in its own frame for the whole call: the profiler reads them at the call's exit.
 template <class... A>
-void note_all(A... a) {
+void note_kept(const vgpu_traced::KeptArgs<A...>& kept) {
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
     announce_driver_init();
-    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
-    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)));
+    vgpu::profiling::note_args(kept.argv(), kept.count());
   }
 }
 
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
-  note_all(a...);
+  const vgpu_traced::KeptArgs<A...> kept(a...);
+  note_kept(kept);
   vgpu::profiling::ApiCall call(api);
   const cudaError_t rc = body(a...);
   call.set_result(rc);
@@ -4807,7 +4805,8 @@ static void forget_arrays_on(int device) {
 VGPU_EXPORT cudaChannelFormatDesc cudaCreateChannelDesc(int x, int y, int z, int w,
                                                         cudaChannelFormatKind f) {
   cudaChannelFormatDesc d;
-  note_all(x, y, z, w, f);
+  const vgpu_traced::KeptArgs<int, int, int, int, cudaChannelFormatKind> kept(x, y, z, w, f);
+  note_kept(kept);
   vgpu::profiling::ApiCall call("cudaCreateChannelDesc");
   d.x = x;
   d.y = y;
@@ -6313,7 +6312,8 @@ VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) {
 // and a subscriber is shown the string they return.
 VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
   const char* text = nullptr;
-  note_all(error);
+  const vgpu_traced::KeptArgs<cudaError_t> kept(error);
+  note_kept(kept);
   vgpu::profiling::ApiCall call("cudaGetErrorString");
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
   text = e && e->runtime_name ? e->text : "unrecognized error code";
@@ -6322,7 +6322,8 @@ VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
 }
 VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
   const char* text = nullptr;
-  note_all(error);
+  const vgpu_traced::KeptArgs<cudaError_t> kept(error);
+  note_kept(kept);
   vgpu::profiling::ApiCall call("cudaGetErrorName");
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
   text = e && e->runtime_name ? e->runtime_name : "unrecognized error code";

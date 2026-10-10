@@ -1589,7 +1589,11 @@ struct Conv {
 
 template <class T>
 T arg(const void* const* a, int i) {
-  return *static_cast<const T*>(a[i]);
+  // Copied as bytes: an enum argument may hold a number the enum does not declare, and loading that as the
+  // enum is undefined behaviour (UBSan).
+  T v;
+  std::memcpy(static_cast<void*>(&v), a[i], sizeof v);
+  return v;
 }
 #define P(i, field) p->field = arg<std::remove_reference_t<decltype(p->field)>>(a, i)
 #define CONV(fn, ver, body)                                                                      \
