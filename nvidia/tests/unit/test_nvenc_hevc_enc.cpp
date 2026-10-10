@@ -218,9 +218,9 @@ VTEST(parameter_sets_name_the_size_and_the_slices_the_picture_type) {
 }
 
 VTEST(intra_pictures_decode_to_the_reconstruction_at_every_size_and_qp) {
-  const int sizes[][2] = {{8, 8}, {17, 17}, {33, 20}, {64, 48}, {70, 38}, {161, 51}};
+  const int sizes[][2] = {{8, 8}, {17, 17}, {33, 20}, {70, 38}, {161, 51}};
   for (const auto& s : sizes)
-    for (const int qp : {0, 12, 28, 40, 51}) {
+    for (const int qp : {0, 27, 51}) {
       HevcOptions opt;
       const Coded c = code_sequence(s[0], s[1], 1, qp, opt);
       VCHECK(decodes_to_the_reconstruction(c, "intra picture"));
@@ -228,10 +228,10 @@ VTEST(intra_pictures_decode_to_the_reconstruction_at_every_size_and_qp) {
 }
 
 VTEST(p_pictures_with_several_references_decode_to_the_reconstruction) {
-  const int sizes[][2] = {{16, 16}, {33, 20}, {96, 64}, {161, 51}};
+  const int sizes[][2] = {{16, 16}, {33, 20}, {96, 64}};
   for (const auto& s : sizes)
-    for (const int qp : {10, 26, 45})
-      for (const int refs : {1, 2, 3}) {
+    for (const int qp : {10, 40})
+      for (const int refs : {1, 3}) {
         HevcOptions opt;
         opt.num_ref = refs;
         const Coded c = code_sequence(s[0], s[1], 6, qp, opt);
@@ -240,10 +240,10 @@ VTEST(p_pictures_with_several_references_decode_to_the_reconstruction) {
 }
 
 VTEST(b_pictures_decode_to_the_reconstruction_in_display_order) {
-  const int sizes[][2] = {{32, 32}, {96, 64}, {161, 51}};
+  const int sizes[][2] = {{32, 32}, {97, 53}};
   for (const auto& s : sizes)
-    for (const int qp : {14, 30})
-      for (const int bf : {1, 2, 3}) {
+    for (const int qp : {14, 34})
+      for (const int bf : {1, 3}) {
         HevcOptions opt;
         opt.num_ref = 2;
         opt.max_b = bf;

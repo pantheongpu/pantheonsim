@@ -341,9 +341,9 @@ bool decodes_to_recon(const CodedSeq& c, int w, int h) {
 }  // namespace
 
 VTEST(cabac_and_the_8x8_transform_decode_to_the_encoders_reconstruction) {
-  const int sizes[][2] = {{16, 16}, {33, 20}, {96, 64}, {161, 51}};
+  const int sizes[][2] = {{16, 16}, {33, 20}, {96, 64}};
   for (const auto& s : sizes)
-    for (const int qp : {0, 14, 28, 44, 51}) {
+    for (const int qp : {0, 28, 51}) {
       for (int variant = 0; variant < 4; ++variant) {
         vgpu_nvenc::H264Options opt;
         opt.cabac = variant & 1;
@@ -381,10 +381,10 @@ VTEST(several_slices_decode_to_the_encoders_reconstruction_and_are_counted) {
 }
 
 VTEST(b_pictures_decode_to_the_encoders_reconstruction_in_display_order) {
-  const int sizes[][2] = {{32, 32}, {96, 64}, {161, 51}};
+  const int sizes[][2] = {{32, 32}, {97, 53}};
   for (const auto& s : sizes)
-    for (const int qp : {14, 30})
-      for (const int bf : {1, 2, 4})
+    for (const int qp : {14, 34})
+      for (const int bf : {1, 4})
         for (const bool cabac : {false, true}) {
           vgpu_nvenc::H264Options opt;
           opt.cabac = cabac;

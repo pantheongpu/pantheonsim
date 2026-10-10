@@ -103,7 +103,7 @@ applications load it by its bare soname, so `libvgpunvenc` stands in as
 `libnvidia-encode.so.1`: the documented encode API with a deterministic,
 content-derived bitstream. Identical frames encode identically and any changed
 pixel changes the output, which is what the workload's golden-bitstream check
-relies on. The output is not a decodable video stream. The runner skips the
+relies on. The output is a real H.264 or HEVC stream (ffmpeg decodes it). The runner skips the
 workload only when the shim was not built.
 
 ## In CI

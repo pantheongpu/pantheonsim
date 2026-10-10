@@ -11,18 +11,22 @@
 // the locked bitstream's fields, sequence parameters, reconfiguration, and the
 // calls that are NVIDIA's "not supported here" on this part.
 //
-// What is not NVIDIA's: the encoder. A frame is written as an IDR picture whose
-// every coding unit is PCM: macroblocks in H.264 (nvenc_h264.hpp, CAVLC) and
-// 16x16 coding tree blocks in HEVC (nvenc_hevc.hpp, with the CABAC encoder HEVC
-// requires). Both are conformant, lossless streams any decoder returns the input
-// from (ffmpeg's do: nvidia/tests/e2e/nvenc_h264.cpp), but not compression --
-// rate control, GOP structure, B-frames, the preset and every quality setting are
-// accepted and change nothing, and every picture is an IDR, with one idr_pic_id,
-// so encoding a frame twice gives the same bytes (encoder SDC tests compare a
-// golden bitstream, as pantheon's media_enc_virus does with a forced IDR and the
-// parameter sets on every frame). The input is 8-bit 4:2:0 (NV12, YV12, IYUV) or
-// 32-bit RGB (ARGB, ABGR; converted to BT.601 limited-range YCbCr, the matrix the
-// card applies); the 10-bit and 4:4:4 formats the card takes are refused.
+// What is not NVIDIA's: the encoders. H.264 and HEVC pictures are compressed by
+// encoders of this tree (nvenc_h264_enc.cpp: intra, P and B pictures, CAVLC or
+// CABAC, 4x4 and 8x8 transforms, slices; nvenc_hevc_enc.cpp: intra, P and B
+// pictures, CABAC, deblocking), driven through nvenc_encoder.hpp, with a rate
+// controller (nvenc_rc.hpp) for CBR / VBR and the card's NEED_MORE_INPUT protocol
+// for B pictures (frameIntervalP > 1). Their output is conformant: ffmpeg decodes it
+// (nvidia/tests/e2e/nvenc_nvdec.cpp, nvenc_h264.cpp) and this tree's NVDEC returns
+// the same pictures from the H.264 stream. The bytes are not NVIDIA's. The lossless
+// tuning stays the PCM stream (nvenc_h264.hpp, nvenc_hevc.hpp). Encoding is a pure
+// function of the pictures and the settings, so encoding a frame twice gives the
+// same bytes, and intra pictures carry a digest SEI so that a changed pixel always
+// changes the bytes (encoder SDC tests compare a golden bitstream, as pantheon's
+// media_enc_virus does with a forced IDR and the parameter sets on every frame).
+// The input is 8-bit 4:2:0 (NV12, YV12, IYUV) or 32-bit RGB (ARGB, ABGR; converted
+// to BT.601 limited-range YCbCr, the matrix the card applies); the 10-bit and 4:4:4
+// formats the card takes are refused.
 #include <cuda_runtime.h>
 #include <nvEncodeAPI.h>
 
@@ -1126,7 +1130,6 @@ Packet code_picture(Session& s, const Input1& in, vgpu_nvenc::PicType t, int rat
       }
     }
     s.rc.update(rt, qp, bits);
-    if (std::getenv("VGPU_NVENC_RC_TRACE")) std::fprintf(stderr, "rc: type %d qp %d bits %.0f target %.0f afford %.0f spent %.0f budget %.0f\n", static_cast<int>(rt), qp, bits, target, 0.0, s.rc.spent(), s.rc.budget());
   }
   Packet pk;
   pk.ts = in.ts;
