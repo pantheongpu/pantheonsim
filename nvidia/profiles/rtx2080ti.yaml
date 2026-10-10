@@ -68,3 +68,12 @@ telemetry:
 cuda:
   memory_bus_width_bits: 352
   persisting_l2_bytes: 0
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA Ada GPU Architecture whitepaper, Table 1 (GeForce RTX 2080 Ti): GPCs 6, TPCs 34, SMs 68.
+layout:
+  gpcs: 6
+  tpcs: 34
+  sms_per_tpc: 2

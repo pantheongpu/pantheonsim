@@ -5,6 +5,7 @@
 #include "vgpu/profile.hpp"
 
 #include "vgpu/error.hpp"
+#include "vgpu/exec/cluster.hpp"
 #include "vgpu/registry.hpp"
 #include "vtest.hpp"
 
@@ -49,7 +50,7 @@ VTEST(all_builtin_profiles_parse) {
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
                           p.id == "nvidia/a10g" || p.id == "nvidia/l4" ||
-                          p.id == "nvidia/l40s" ||
+                          p.id == "nvidia/l40s" || p.id == "nvidia/rtx-pro-6000-server" ||
                           p.id == "amd/mi325x" || p.id == "amd/rx6800" || p.id == "amd/rx6700xt");
     // AMD parts have no compute capability, and the profile that carried a
     // plausible "9.4" was inventing one. Each vendor is asked for the thing it
@@ -254,6 +255,89 @@ VTEST(measured_framebuffers_match_real_nvidia_smi) {
     DeviceProfile p = vgpu::load_gpu(id);
     VCHECK_EQ(p.vram_bytes + p.telemetry.framebuffer_reserve_bytes, mib * kMiB);
   }
+}
+
+VTEST(builtin_gpc_layouts_add_up_and_name_their_source) {
+  int with_layout = 0;
+  for (const auto& id : vgpu::available_gpus()) {
+    DeviceProfile p = vgpu::load_gpu(id);
+    if (!p.layout.known()) continue;
+    ++with_layout;
+    uint32_t sum = 0, biggest = 0, smallest = ~0u;
+    for (uint32_t sms : p.layout.gpc_sms()) {
+      sum += sms;
+      biggest = std::max(biggest, sms);
+      smallest = std::min(smallest, sms);
+    }
+    VCHECK_EQ(p.layout.gpc_sms().size(), p.layout.gpcs);
+    VCHECK_EQ(sum, p.limits.multiprocessors);
+    VCHECK(biggest - smallest <= p.layout.sms_per_tpc);   // an even spread: GPCs differ by at most a TPC
+    VCHECK(p.vendor == "nvidia");
+  }
+  VCHECK(with_layout >= 20);
+  // The numbers NVIDIA publishes: GH100's SXM5 (8 GPCs, 66 TPCs), the RTX 5090 (11 GPCs, 85 TPCs), an A100 (7, 54).
+  VCHECK_EQ(vgpu::load_gpu("nvidia/h100").layout.gpcs, 8u);
+  VCHECK_EQ(vgpu::load_gpu("nvidia/h100").layout.tpcs, 66u);
+  VCHECK_EQ(vgpu::load_gpu("nvidia/rtx5090").layout.tpcs, 85u);
+  VCHECK_EQ(vgpu::load_gpu("nvidia/a100").layout.gpcs, 7u);
+  // A part whose GPC count NVIDIA does not give has none here.
+  VCHECK(!vgpu::load_gpu("nvidia/h100-pcie").layout.known());
+  VCHECK(!vgpu::load_gpu("nvidia/b200").layout.known());
+  VCHECK(vgpu::load_gpu("nvidia/gh200-480gb").layout.counts_derived);
+  VCHECK(!vgpu::load_gpu("nvidia/h100").layout.counts_derived);
+}
+
+VTEST(a_layout_that_does_not_add_up_is_refused) {
+  // 66 TPCs of two SMs are the 132 multiprocessors; 67 are not.
+  DeviceProfile ok = DeviceProfile::from_yaml(
+      profile_with_telemetry("") + "layout:\n  gpcs: 8\n  tpcs: 66\n  sms_per_tpc: 2\n", "t");
+  VCHECK(ok.layout.known());
+  auto err = VCAPTURE(Error, DeviceProfile::from_yaml(
+      profile_with_telemetry("") + "layout:\n  gpcs: 8\n  tpcs: 67\n  sms_per_tpc: 2\n", "test-origin"));
+  VCHECK(err.code() == Err::ProfileParse);
+  VCHECK_CONTAINS(err.what(), "multiprocessors");
+}
+
+VTEST(cluster_occupancy_follows_the_documented_rules) {
+  using vgpu::exec::ClusterAnswer;
+  using S = ClusterAnswer::Status;
+  const DeviceProfile h = vgpu::load_gpu("nvidia/h100");   // GPCs of 18, 18, 16, 16, 16, 16, 16, 16 SMs (derived spread)
+  const std::array<uint32_t, 3> none{0, 0, 0};
+  auto active = [&](uint32_t size, uint32_t per_sm, bool nonportable = false) {
+    return vgpu::exec::cluster_occupancy(h, true, true, {size, 1, 1}, none, nonportable, per_sm);
+  };
+  VCHECK_EQ(active(1, 1).value, 132);
+  VCHECK_EQ(active(2, 1).value, 9 * 2 + 8 * 6);   // 66: every GPC splits into pairs
+  VCHECK_EQ(active(4, 1).value, 4 * 2 + 4 * 6);   // 32
+  VCHECK_EQ(active(8, 1).value, 2 * 2 + 2 * 6);   // 16
+  VCHECK(active(16, 1, true).status == S::Ok);
+  VCHECK_EQ(active(16, 1, true).value, 8);        // one cluster in each GPC
+  VCHECK(active(16, 1).status == S::InvalidClusterSize);   // not without the opt-in
+  VCHECK(active(17, 1, true).status == S::InvalidClusterSize);
+  VCHECK_EQ(active(8, 0).value, 0);               // no block fits an SM: nothing is active
+  VCHECK(active(4, 2).uses_layout);
+  VCHECK(!active(1, 2).uses_layout);
+  // Without a cluster dimension anywhere the call is an error on a part with clusters ...
+  VCHECK(vgpu::exec::cluster_occupancy(h, true, false, none, none, false, 1).status == S::InvalidValue);
+  // ... the kernel's own size is used, and must agree with the configuration's.
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(h, true, false, none, {2, 1, 1}, false, 1).value, 66);
+  VCHECK(vgpu::exec::cluster_occupancy(h, true, true, {4, 1, 1}, {2, 1, 1}, false, 1).status == S::InvalidClusterSize);
+  // The largest size: 8 by default and 16 for a kernel that allows it, a required size when the kernel has one.
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(h, false, false, none, none, false, 1).value, 8);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(h, false, false, none, none, true, 1).value, 16);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(h, false, false, none, {4, 2, 1}, false, 1).value, 8);
+  // A part whose GPCs are not published answers what needs none and refuses what does.
+  const DeviceProfile pcie = vgpu::load_gpu("nvidia/h100-pcie");
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, true, true, {1, 1, 1}, none, false, 2).value, 228);
+  VCHECK(vgpu::exec::cluster_occupancy(pcie, true, true, {2, 1, 1}, none, false, 2).status == S::NotSupported);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(pcie, false, false, none, none, false, 2).value, 8);
+  VCHECK(vgpu::exec::cluster_occupancy(pcie, false, false, none, none, true, 2).status == S::NotSupported);
+  // A part without clusters answers as the RTX 3060 does (measured): 0 unless a dimension is named.
+  const DeviceProfile a = vgpu::load_gpu("nvidia/rtx3060");
+  VCHECK(vgpu::exec::cluster_occupancy(a, true, false, none, none, false, 8).status == S::Ok);
+  VCHECK_EQ(vgpu::exec::cluster_occupancy(a, true, false, none, none, false, 8).value, 0);
+  VCHECK(vgpu::exec::cluster_occupancy(a, true, true, {1, 1, 1}, none, false, 8).status == S::InvalidClusterSize);
+  VCHECK(vgpu::exec::cluster_occupancy(a, false, true, {2, 1, 1}, none, false, 8).status == S::InvalidClusterSize);
 }
 
 VTEST_MAIN

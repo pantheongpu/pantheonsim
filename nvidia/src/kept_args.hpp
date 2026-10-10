@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <tuple>
 #include <utility>
@@ -43,6 +44,8 @@ class KeptArgs {
   // Pointers to the arguments in declaration order, null-terminated.
   const void* const* argv() const { return argv_; }
   static constexpr int count() { return static_cast<int>(sizeof...(A)); }
+  // The size of each argument in bytes (for the profiler's argument-size guard), then a 0.
+  const std::uint16_t* sizes() const { return sizes_; }
 
  private:
   template <std::size_t... I>
@@ -50,6 +53,7 @@ class KeptArgs {
     ((argv_[I] = std::get<I>(slots_).b), ...);
     argv_[sizeof...(A)] = nullptr;
   }
+  static constexpr std::uint16_t sizes_[sizeof...(A) + 1] = {static_cast<std::uint16_t>(sizeof(A))..., 0};
   std::tuple<ArgSlot<A>...> slots_;
   const void* argv_[sizeof...(A) + 1];
 };

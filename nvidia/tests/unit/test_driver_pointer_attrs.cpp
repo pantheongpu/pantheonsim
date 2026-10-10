@@ -15,6 +15,11 @@
 
 #include "vtest.hpp"
 
+// The driver shim loads the runtime shim on demand, and both carry src/core/regs.cpp: AddressSanitizer's default
+// ODR check aborts a run of this program under it. Say so here, as test_runtime_user_objects does (the
+// ASAN_OPTIONS variable still wins when set). Leak detection stays on.
+extern "C" const char* __asan_default_options() { return "detect_leaks=1:detect_odr_violation=0"; }
+
 namespace {
 
 struct Env {

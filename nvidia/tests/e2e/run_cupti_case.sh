@@ -28,10 +28,16 @@
 #   misc     which kinds can be enabled, per-function records, callback switches,
 #            CUDA event records, copies between devices, overhead, a program clock
 #            (needs two GPUs on the card)
+#   compat12 the _v2 / _v3 entry points of the CUDA 12.3-12.9 headers (edge-data
+#            graph calls, location prefetch and advise, capture queries): a CUDA 12
+#            program on a runtime shim built against them. SKIPs with any other
+#            toolkit. CUPTI_CUDA12_ROOT=<dir with include/ and lib64/> builds it with
+#            g++ against that toolkit instead of nvcc, which is how it is run
+#            where only the CUDA 12 runtime and CUPTI libraries are at hand
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
-case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|peer> [--card [--update]]}"
+case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|peer|compat12|driver_params> [--card [--update]]}"
 shift
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/cupti_${case_name}.cu"
@@ -55,7 +61,7 @@ if [[ "$case_name" == nvtx ]]; then
     echo "SKIP: NVTX headers not found"; exit 0
   fi
 fi
-trap 'rm -f "$out" "$out.txt" "$out.cubin"' EXIT
+trap 'rm -f "$out" "$out.txt" "$out.cubin" "$out.expected"' EXIT
 
 # The expected files are what a CUDA 13.0 libcupti printed. A case whose program
 # leaves out what an older toolkit's cupti.h cannot name (it is built under
@@ -111,10 +117,16 @@ if (( card )); then
      (( $(nvidia-smi -L 2>/dev/null | grep -c GPU) < 2 )); then
     echo "SKIP: the misc case's expected output was made on two GPUs"; exit 0
   fi
+  if [[ -n "${CUPTI_CUDA12_ROOT:-}" && "$case_name" == compat12 ]]; then
+    c12="$CUPTI_CUDA12_ROOT"
+    g++ -std=c++17 -x c++ -I"$c12/include" "$src" -o "$out" -L"$c12/lib64" -l:libcudart.so.12 -l:libcupti.so.12 -ldl
+    LD_LIBRARY_PATH="$c12/lib64:/usr/lib/wsl/lib" "$out" > "$out.txt"
+  else
   nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets "$src" -o "$out" -lcupti -L"$libs" -lcuda -L"$stubs"
   # NVTX reaches a tool through the library named here, as a profiler sets it.
   CUPTI_TEST_CUBIN="$cubin" NVTX_INJECTION64_PATH="$(ls "$libs"/libcupti.so.[0-9]* | head -1)" \
       LD_LIBRARY_PATH="$libs" "$out" > "$out.txt"
+  fi
 else
   shopt -s nullglob
   cupti_libs=("$shim"/libcupti.so.[0-9]*)
@@ -125,8 +137,12 @@ else
   if [[ "$case_name" == nvtx ]] && ! nm -D "${cupti_libs[0]}" 2>/dev/null | grep InitializeInjectionNvtx2 >/dev/null; then
     echo "SKIP: libvgpucupti built without NVTX (no nvtx3 headers at build time)"; exit 0
   fi
-  nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets \
-       $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcupti -lcuda -L"$shim"
+  if [[ -n "${CUPTI_CUDA12_ROOT:-}" && "$case_name" == compat12 ]]; then
+    g++ -std=c++17 -x c++ -I"$CUPTI_CUDA12_ROOT/include" "$src" -o "$out" -L"$shim" -lcudart -lcupti -ldl
+  else
+    nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets \
+         $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out" -lcupti -lcuda -L"$shim"
+  fi
   if ! require_shim_libs "$shim" "$out"; then exit 0; fi
   # The RTX 3060 profile: the trace names the device it ran on. Both shims in one
   # process (libcuda and libcudart) need the sanitizer builds told so.
@@ -134,8 +150,30 @@ else
       NVTX_INJECTION64_PATH="${cupti_libs[0]}" LD_LIBRARY_PATH="$shim" "$out" > "$out.txt"
 fi
 
+# A case that does not apply to the toolkit or the library at hand says so on
+# its first line.
+if head -1 "$out.txt" | grep -q "^SKIP"; then
+  head -1 "$out.txt"; exit 0
+fi
 if (( card )) && [[ "$case_name" == peer ]] && head -1 "$out.txt" | grep -q ": no$"; then
   echo "SKIP: no peer path between this machine's first two GPUs"; exit 0
+fi
+# compat12 on a toolkit older than 12.8: the program leaves out the call cudaEventElapsedTime_v2 (12.8's), and the
+# card's trace, made with 12.8, has its two callbacks.
+if [[ "$case_name" == compat12 ]]; then
+  nvcc_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+  cudart_version=0
+  for d in ${CUPTI_CUDA12_ROOT:+"$CUPTI_CUDA12_ROOT/include"} "$nvcc_root/include" "$nvcc_root/targets/x86_64-linux/include" /usr/include; do
+    if [[ -f "$d/cuda_runtime_api.h" ]]; then
+      cudart_version="$(sed -n 's/^#define CUDART_VERSION[[:space:]]\+\([0-9]\+\).*/\1/p' "$d/cuda_runtime_api.h" | head -1)"
+      break
+    fi
+  done
+  if (( ${cudart_version:-0} > 0 && cudart_version < 12080 )); then
+    if (( card && update )); then echo "FAIL: --update needs the CUDA 12.8 headers (this toolkit is $cudart_version)"; exit 1; fi
+    grep -v 'cudaEventElapsedTime_v2' "$expected" > "$out.expected"
+    expected="$out.expected"
+  fi
 fi
 if (( card && update )); then
   cp "$out.txt" "$expected"

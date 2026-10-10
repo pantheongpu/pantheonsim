@@ -38,6 +38,13 @@
 
 #include <cuda_runtime.h>
 
+#include "capture_defer.hpp"
+
+// The reads and writes of device memory below are the commit points of a call made on a capturing stream
+// (capture_defer.hpp); the calls that record themselves (SpMV, SpMM, ...) do not need them.
+#define cudaMemcpy ::vgpu_capture::memcpy_commit
+#define cudaMemset ::vgpu_capture::memset_commit
+
 #include "vgpu/runtime/capture.hpp"
 
 namespace {
@@ -103,11 +110,12 @@ struct Handle {
 // The live-descriptor registry is never destroyed: a graph a program leaks
 // holds copies of descriptors (see Held), and it is released by libcudart's
 // destructors at exit, which may run after this library's.
-std::mutex& g_mu = *new std::mutex;
-std::set<const void*>& g_live = *new std::set<const void*>;
-template <class T> T* track(T* p) { std::lock_guard<std::mutex> l(g_mu); g_live.insert(p); return p; }
-bool known(const void* p) { std::lock_guard<std::mutex> l(g_mu); return p && g_live.count(p); }
-void untrack(const void* p) { std::lock_guard<std::mutex> l(g_mu); g_live.erase(p); }
+vgpu_capture::Registry& g_reg = *new vgpu_capture::Registry;
+template <class T> T* track(T* p) { return g_reg.track(p); }
+bool known(const void* p) { return g_reg.known(p); }
+void untrack(const void* p) { g_reg.untrack(p); }
+// The stream a call on `h` is on; null for a handle that is not one.
+cudaStream_t stream_of(const void* h) { return known(h) ? static_cast<const Handle*>(h)->stream : nullptr; }
 
 bool is_complex(cudaDataType t) {
   return t == CUDA_C_16F || t == CUDA_C_16BF || t == CUDA_C_32F || t == CUDA_C_64F;
@@ -958,11 +966,12 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMV(cusparseHandle_t h, cusparseOperation_
                                                          : spmv<double>(h, op, alpha, A, X, beta, Y, ct);
 }
 
-VGPU_EXPORT cusparseStatus_t cusparseSpMV_preprocess(cusparseHandle_t, cusparseOperation_t,
-                                                     const void*, cusparseConstSpMatDescr_t,
-                                                     cusparseConstDnVecDescr_t, const void*,
-                                                     cusparseDnVecDescr_t, cudaDataType,
-                                                     cusparseSpMVAlg_t, void*) {
+VGPU_EXPORT cusparseStatus_t cusparseSpMV_preprocess(cusparseHandle_t unused0, cusparseOperation_t unused1,
+                                                     const void* unused2, cusparseConstSpMatDescr_t unused3,
+                                                     cusparseConstDnVecDescr_t unused4, const void* unused5,
+                                                     cusparseDnVecDescr_t unused6, cudaDataType unused7,
+                                                     cusparseSpMVAlg_t unused8, void* unused9) {
+  VGPU_DEFER_CALL(g_reg, stream_of(unused0), cusparseSpMV_preprocess, unused0, unused1, unused2, unused3, unused4, unused5, unused6, unused7, unused8, unused9);
   return CUSPARSE_STATUS_SUCCESS;   // nothing to precompute
 }
 
@@ -1120,12 +1129,13 @@ VGPU_EXPORT cusparseStatus_t cusparseSpMM(cusparseHandle_t h, cusparseOperation_
                                                          : spmm<double>(h, opA, opB, alpha, A, B, beta, C, ct);
 }
 
-VGPU_EXPORT cusparseStatus_t cusparseSpMM_preprocess(cusparseHandle_t, cusparseOperation_t,
-                                                     cusparseOperation_t, const void*,
-                                                     cusparseConstSpMatDescr_t,
-                                                     cusparseConstDnMatDescr_t, const void*,
-                                                     cusparseDnMatDescr_t, cudaDataType,
-                                                     cusparseSpMMAlg_t, void*) {
+VGPU_EXPORT cusparseStatus_t cusparseSpMM_preprocess(cusparseHandle_t unused0, cusparseOperation_t unused1,
+                                                     cusparseOperation_t unused2, const void* unused3,
+                                                     cusparseConstSpMatDescr_t unused4,
+                                                     cusparseConstDnMatDescr_t unused5, const void* unused6,
+                                                     cusparseDnMatDescr_t unused7, cudaDataType unused8,
+                                                     cusparseSpMMAlg_t unused9, void* unused10) {
+  VGPU_DEFER_CALL(g_reg, stream_of(unused0), cusparseSpMM_preprocess, unused0, unused1, unused2, unused3, unused4, unused5, unused6, unused7, unused8, unused9, unused10);
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1280,7 +1290,8 @@ VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_bufferSize(cusparseHandle_t,
 VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_analysis(cusparseHandle_t h,
                                                             cusparseConstDnMatDescr_t matA,
                                                             cusparseSpMatDescr_t matB,
-                                                            cusparseDenseToSparseAlg_t, void*) {
+                                                            cusparseDenseToSparseAlg_t unused3, void* unused4) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseDenseToSparse_analysis, h, matA, matB, unused3, unused4);
   if (!known(h) || !known(matA) || !known(matB)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   const auto& A = *reinterpret_cast<const DnMat*>(matA);
   auto& B = *reinterpret_cast<SpMat*>(matB);
@@ -1292,7 +1303,8 @@ VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_analysis(cusparseHandle_t h,
 VGPU_EXPORT cusparseStatus_t cusparseDenseToSparse_convert(cusparseHandle_t h,
                                                            cusparseConstDnMatDescr_t matA,
                                                            cusparseSpMatDescr_t matB,
-                                                           cusparseDenseToSparseAlg_t, void*) {
+                                                           cusparseDenseToSparseAlg_t unused3, void* unused4) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseDenseToSparse_convert, h, matA, matB, unused3, unused4);
   if (!known(h) || !known(matA) || !known(matB)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   const auto& A = *reinterpret_cast<const DnMat*>(matA);
   auto& B = *reinterpret_cast<SpMat*>(matB);
@@ -1569,6 +1581,7 @@ template <class Less> cusparseStatus_t sort_with(int nnz, int* P, Less less, con
 
 VGPU_EXPORT cusparseStatus_t cusparseXcoo2csr(cusparseHandle_t h, const int* rows, int nnz, int m,
                                               int* offsets, cusparseIndexBase_t base) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcoo2csr, h, rows, nnz, m, offsets, base);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (nnz < 0 || m < 0) return CUSPARSE_STATUS_INVALID_VALUE;
   const int b = base == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
@@ -1584,6 +1597,7 @@ VGPU_EXPORT cusparseStatus_t cusparseXcoo2csr(cusparseHandle_t h, const int* row
 }
 VGPU_EXPORT cusparseStatus_t cusparseXcsr2coo(cusparseHandle_t h, const int* offsets, int nnz, int m,
                                               int* rows, cusparseIndexBase_t base) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcsr2coo, h, offsets, nnz, m, rows, base);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (nnz < 0 || m < 0) return CUSPARSE_STATUS_INVALID_VALUE;
   const int b = base == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
@@ -1627,12 +1641,14 @@ static cusparseStatus_t coosort(cusparseHandle_t h, int nnz, int* rows, int* col
       });
   return !ok ? CUSPARSE_STATUS_EXECUTION_FAILED : st;
 }
-VGPU_EXPORT cusparseStatus_t cusparseXcoosortByRow(cusparseHandle_t h, int, int, int nnz, int* rows, int* cols,
-                                                   int* P, void*) {
+VGPU_EXPORT cusparseStatus_t cusparseXcoosortByRow(cusparseHandle_t h, int unused1, int unused2, int nnz, int* rows, int* cols,
+                                                   int* P, void* unused7) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcoosortByRow, h, unused1, unused2, nnz, rows, cols, P, unused7);
   return coosort(h, nnz, rows, cols, P, true);
 }
-VGPU_EXPORT cusparseStatus_t cusparseXcoosortByColumn(cusparseHandle_t h, int, int, int nnz, int* rows, int* cols,
-                                                      int* P, void*) {
+VGPU_EXPORT cusparseStatus_t cusparseXcoosortByColumn(cusparseHandle_t h, int unused1, int unused2, int nnz, int* rows, int* cols,
+                                                      int* P, void* unused7) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcoosortByColumn, h, unused1, unused2, nnz, rows, cols, P, unused7);
   return coosort(h, nnz, rows, cols, P, false);
 }
 VGPU_EXPORT cusparseStatus_t cusparseXcsrsort_bufferSizeExt(cusparseHandle_t h, int, int, int, const int*,
@@ -1642,8 +1658,9 @@ VGPU_EXPORT cusparseStatus_t cusparseXcsrsort_bufferSizeExt(cusparseHandle_t h, 
   return CUSPARSE_STATUS_SUCCESS;
 }
 // Sorts the column indices within each row.
-VGPU_EXPORT cusparseStatus_t cusparseXcsrsort(cusparseHandle_t h, int m, int, int nnz, const cusparseMatDescr_t d,
-                                              const int* offsets, int* cols, int* P, void*) {
+VGPU_EXPORT cusparseStatus_t cusparseXcsrsort(cusparseHandle_t h, int m, int unused2, int nnz, const cusparseMatDescr_t d,
+                                              const int* offsets, int* cols, int* P, void* unused8) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcsrsort, h, m, unused2, nnz, d, offsets, cols, P, unused8);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (m < 0 || nnz < 0) return CUSPARSE_STATUS_INVALID_VALUE;
   const int b = base_of(d);
@@ -1739,10 +1756,11 @@ cusparseStatus_t csrgeam2(cusparseHandle_t h, int m, int n, const T* alpha, cusp
 }
 }  // namespace
 
-VGPU_EXPORT cusparseStatus_t cusparseXcsrgeam2Nnz(cusparseHandle_t h, int m, int, cusparseMatDescr_t dA, int nnzA,
+VGPU_EXPORT cusparseStatus_t cusparseXcsrgeam2Nnz(cusparseHandle_t h, int m, int unused2, cusparseMatDescr_t dA, int nnzA,
                                                   const int* offA, const int* colA, cusparseMatDescr_t dB,
                                                   int nnzB, const int* offB, const int* colB,
-                                                  cusparseMatDescr_t dC, int* offC, int* nnz_total, void*) {
+                                                  cusparseMatDescr_t dC, int* offC, int* nnz_total, void* unused14) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcsrgeam2Nnz, h, m, unused2, dA, nnzA, offA, colA, dB, nnzB, offB, colB, dC, offC, nnz_total, unused14);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (m < 0 || nnzA < 0 || nnzB < 0) return CUSPARSE_STATUS_INVALID_VALUE;
   Csr<> a, b;
@@ -1776,7 +1794,8 @@ VGPU_EXPORT cusparseStatus_t cusparseXcsrgeam2Nnz(cusparseHandle_t h, int m, int
   VGPU_EXPORT cusparseStatus_t cusparse##P##csrgeam2(                                                            \
       cusparseHandle_t h, int m, int n, const T* alpha, const cusparseMatDescr_t dA, int nnzA, const T* valA,    \
       const int* offA, const int* colA, const T* beta, const cusparseMatDescr_t dB, int nnzB, const T* valB,     \
-      const int* offB, const int* colB, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC, void*) {     \
+      const int* offB, const int* colB, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC, void* unused19) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csrgeam2, h, m, n, alpha, dA, nnzA, valA, offA, colA, beta, dB, nnzB, valB, offB, colB, dC, valC, offC, colC, unused19);     \
     return csrgeam2<T>(h, m, n, alpha, dA, nnzA, valA, offA, colA, beta, dB, nnzB, valB, offB, colB, dC, valC,   \
                        offC, colC);                                                                              \
   }
@@ -1858,12 +1877,13 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_destroyDescr(cusparseSpGEMMDescr_t d
 // Both phases follow the two-call protocol: a NULL buffer asks for its size.
 // The size is a token, never zero, so the second call is told apart by its
 // non-NULL buffer.
-VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_workEstimation(cusparseHandle_t h, cusparseOperation_t,
-                                                           cusparseOperation_t, const void*,
+VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_workEstimation(cusparseHandle_t h, cusparseOperation_t unused1,
+                                                           cusparseOperation_t unused2, const void* unused3,
                                                            cusparseConstSpMatDescr_t matA, cusparseConstSpMatDescr_t matB,
-                                                           const void*, cusparseSpMatDescr_t, cudaDataType,
-                                                           cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d,
+                                                           const void* unused6, cusparseSpMatDescr_t unused7, cudaDataType unused8,
+                                                           cusparseSpGEMMAlg_t unused9, cusparseSpGEMMDescr_t d,
                                                            size_t* bytes, void* buffer) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMM_workEstimation, h, unused1, unused2, unused3, matA, matB, unused6, unused7, unused8, unused9, d, bytes, buffer);
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!buffer && bytes) *bytes = 16;
   if (buffer && known(matA) && known(matB))
@@ -1875,8 +1895,9 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_compute(cusparseHandle_t h, cusparse
                                                     cusparseOperation_t opB, const void* alpha,
                                                     cusparseConstSpMatDescr_t matA, cusparseConstSpMatDescr_t matB,
                                                     const void* beta, cusparseSpMatDescr_t matC, cudaDataType ct,
-                                                    cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d, size_t* bytes,
+                                                    cusparseSpGEMMAlg_t unused9, cusparseSpGEMMDescr_t d, size_t* bytes,
                                                     void* buffer) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMM_compute, h, opA, opB, alpha, matA, matB, beta, matC, ct, unused9, d, bytes, buffer);
   if (!known(h) || !known(d) || !known(matA) || !known(matB) || !known(matC))
     return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!buffer) {
@@ -1898,10 +1919,11 @@ VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_compute(cusparseHandle_t h, cusparse
              ? spgemm<cd>(h, alpha, A, B, beta, C, ct, &g)
              : spgemm<double>(h, alpha, A, B, beta, C, ct, &g);
 }
-VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_copy(cusparseHandle_t h, cusparseOperation_t, cusparseOperation_t,
-                                                 const void*, cusparseConstSpMatDescr_t, cusparseConstSpMatDescr_t,
-                                                 const void*, cusparseSpMatDescr_t matC, cudaDataType,
-                                                 cusparseSpGEMMAlg_t, cusparseSpGEMMDescr_t d) {
+VGPU_EXPORT cusparseStatus_t cusparseSpGEMM_copy(cusparseHandle_t h, cusparseOperation_t unused1, cusparseOperation_t unused2,
+                                                 const void* unused3, cusparseConstSpMatDescr_t unused4, cusparseConstSpMatDescr_t unused5,
+                                                 const void* unused6, cusparseSpMatDescr_t matC, cudaDataType unused8,
+                                                 cusparseSpGEMMAlg_t unused9, cusparseSpGEMMDescr_t d) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpGEMM_copy, h, unused1, unused2, unused3, unused4, unused5, unused6, matC, unused8, unused9, d);
   if (!known(h) || !known(d) || !known(matC)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   auto& C = *reinterpret_cast<SpMat*>(matC);
   const auto& g = *reinterpret_cast<const SpGEMMDescr*>(d);
@@ -1978,10 +2000,11 @@ VGPU_EXPORT cusparseStatus_t cusparseSDDMM_bufferSize(cusparseHandle_t h, cuspar
                        *reinterpret_cast<const SpMat*>(matC), ct);
   return CUSPARSE_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusparseStatus_t cusparseSDDMM_preprocess(cusparseHandle_t h, cusparseOperation_t, cusparseOperation_t,
-                                                      const void*, cusparseConstDnMatDescr_t,
-                                                      cusparseConstDnMatDescr_t, const void*, cusparseSpMatDescr_t,
-                                                      cudaDataType, cusparseSDDMMAlg_t, void*) {
+VGPU_EXPORT cusparseStatus_t cusparseSDDMM_preprocess(cusparseHandle_t h, cusparseOperation_t unused1, cusparseOperation_t unused2,
+                                                      const void* unused3, cusparseConstDnMatDescr_t unused4,
+                                                      cusparseConstDnMatDescr_t unused5, const void* unused6, cusparseSpMatDescr_t unused7,
+                                                      cudaDataType unused8, cusparseSDDMMAlg_t unused9, void* unused10) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSDDMM_preprocess, h, unused1, unused2, unused3, unused4, unused5, unused6, unused7, unused8, unused9, unused10);
   return known(h) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_NOT_INITIALIZED;
 }
 VGPU_EXPORT cusparseStatus_t cusparseSDDMM(cusparseHandle_t h, cusparseOperation_t opA, cusparseOperation_t opB,
@@ -2171,10 +2194,11 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSV_bufferSize(cusparseHandle_t h, cuspars
                       reinterpret_cast<const DnVec*>(vecY)->type, ct);
   return CUSPARSE_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusparseStatus_t cusparseSpSV_analysis(cusparseHandle_t h, cusparseOperation_t op, const void*,
+VGPU_EXPORT cusparseStatus_t cusparseSpSV_analysis(cusparseHandle_t h, cusparseOperation_t op, const void* unused2,
                                                    cusparseConstSpMatDescr_t matA, cusparseConstDnVecDescr_t vecX,
-                                                   cusparseDnVecDescr_t vecY, cudaDataType ct, cusparseSpSVAlg_t,
-                                                   cusparseSpSVDescr_t d, void*) {
+                                                   cusparseDnVecDescr_t vecY, cudaDataType ct, cusparseSpSVAlg_t unused7,
+                                                   cusparseSpSVDescr_t d, void* unused9) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpSV_analysis, h, op, unused2, matA, vecX, vecY, ct, unused7, d, unused9);
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (known(matA)) {
     reinterpret_cast<TriDescr*>(d)->mat = *reinterpret_cast<const SpMat*>(matA);
@@ -2224,10 +2248,11 @@ VGPU_EXPORT cusparseStatus_t cusparseSpSM_bufferSize(cusparseHandle_t h, cuspars
   return CUSPARSE_STATUS_SUCCESS;
 }
 VGPU_EXPORT cusparseStatus_t cusparseSpSM_analysis(cusparseHandle_t h, cusparseOperation_t opA,
-                                                   cusparseOperation_t opB, const void*,
+                                                   cusparseOperation_t opB, const void* unused3,
                                                    cusparseConstSpMatDescr_t matA, cusparseConstDnMatDescr_t matB,
-                                                   cusparseDnMatDescr_t matC, cudaDataType ct, cusparseSpSMAlg_t,
-                                                   cusparseSpSMDescr_t d, void*) {
+                                                   cusparseDnMatDescr_t matC, cudaDataType ct, cusparseSpSMAlg_t unused8,
+                                                   cusparseSpSMDescr_t d, void* unused10) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpSM_analysis, h, opA, opB, unused3, matA, matB, matC, ct, unused8, d, unused10);
   if (!known(h) || !known(d)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (known(matA)) {
     reinterpret_cast<TriDescr*>(d)->mat = *reinterpret_cast<const SpMat*>(matA);
@@ -2617,7 +2642,8 @@ void factor0(HostBsr<V>& a, bool cholesky, LegacyInfo* info) {
     return CUSPARSE_STATUS_SUCCESS;                                                              \
   }                                                                                              \
   VGPU_EXPORT cusparseStatus_t cusparseX##Name##_zeroPivot(cusparseHandle_t h, Name##Info_t info, \
-                                                           int* position) {                      \
+                                                           int* position) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseX##Name##_zeroPivot, h, info, position); \
     return zero_pivot(h, info, position);                                                        \
   }
 VGPU_LEGACY_INFO(Bsrsv2, bsrsv2)
@@ -2802,20 +2828,23 @@ cusparseStatus_t gebsr2csr(cusparseHandle_t h, cusparseDirection_t dir, int mb, 
 }
 }  // namespace
 
-VGPU_EXPORT cusparseStatus_t cusparseXcsr2bsrNnz(cusparseHandle_t h, cusparseDirection_t, int m, int n,
+VGPU_EXPORT cusparseStatus_t cusparseXcsr2bsrNnz(cusparseHandle_t h, cusparseDirection_t unused1, int m, int n,
                                                  const cusparseMatDescr_t dA, const int* off, const int* col, int bd,
                                                  const cusparseMatDescr_t dC, int* offC, int* nnz_total) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcsr2bsrNnz, h, unused1, m, n, dA, off, col, bd, dC, offC, nnz_total);
   return csr2gebsr_nnz(h, m, n, dA, off, col, dC, offC, bd, bd, nnz_total);
 }
-VGPU_EXPORT cusparseStatus_t cusparseXcsr2gebsrNnz(cusparseHandle_t h, cusparseDirection_t, int m, int n,
+VGPU_EXPORT cusparseStatus_t cusparseXcsr2gebsrNnz(cusparseHandle_t h, cusparseDirection_t unused1, int m, int n,
                                                    const cusparseMatDescr_t dA, const int* off, const int* col,
                                                    const cusparseMatDescr_t dC, int* offC, int rbd, int cbd,
-                                                   int* nnz_total, void*) {
+                                                   int* nnz_total, void* unused12) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXcsr2gebsrNnz, h, unused1, m, n, dA, off, col, dC, offC, rbd, cbd, nnz_total, unused12);
   return csr2gebsr_nnz(h, m, n, dA, off, col, dC, offC, rbd, cbd, nnz_total);
 }
 VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDirection_t dir, int mb, int nb,
                                                 const cusparseMatDescr_t dA, const int* off, const int* col, int rbd,
                                                 int cbd, const cusparseMatDescr_t dC, int* offC, int* colC) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseXgebsr2csr, h, dir, mb, nb, dA, off, col, rbd, cbd, dC, offC, colC);
   return gebsr2csr<float>(h, dir, mb, nb, dA, nullptr, off, col, rbd, cbd, dC, nullptr, offC, colC);
 }
 
@@ -2823,20 +2852,23 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrmv(                                                                  \
       cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t trans, int mb, int nb, int nnzb,            \
       const T* alpha, const cusparseMatDescr_t d, const T* val, const int* off, const int* col, int bd, const T* x, \
-      const T* beta, T* y) {                                                                                        \
+      const T* beta, T* y) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrmv, h, dir, trans, mb, nb, nnzb, alpha, d, val, off, col, bd, x, beta, y); \
     return bsrmv<T>(h, dir, trans, 0, nullptr, nullptr, mb, nb, nnzb, alpha, d, val, off, col, bd, x, beta, y);     \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrxmv(                                                                 \
       cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t trans, int mask_size, int mb, int nb,       \
       int nnzb, const T* alpha, const cusparseMatDescr_t d, const T* val, const int* mask, const int* off,          \
-      const int* end, const int* col, int bd, const T* x, const T* beta, T* y) {                                    \
+      const int* end, const int* col, int bd, const T* x, const T* beta, T* y) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrxmv, h, dir, trans, mask_size, mb, nb, nnzb, alpha, d, val, mask, off, end, col, bd, x, beta, y); \
     if (!mask || !end) return CUSPARSE_STATUS_INVALID_VALUE;                                                        \
     return bsrmv<T>(h, dir, trans, mask_size, mask, end, mb, nb, nnzb, alpha, d, val, off, col, bd, x, beta, y);    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrmm(                                                                  \
       cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t transA, cusparseOperation_t transB, int mb, \
       int n, int kb, int nnzb, const T* alpha, const cusparseMatDescr_t d, const T* val, const int* off,            \
-      const int* col, const int bd, const T* B, const int ldb, const T* beta, T* C, int ldc) {                      \
+      const int* col, const int bd, const T* B, const int ldb, const T* beta, T* C, int ldc) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrmm, h, dir, transA, transB, mb, n, kb, nnzb, alpha, d, val, off, col, bd, B, ldb, beta, C, ldc); \
     return bsrmm<T>(h, dir, transA, transB, mb, n, kb, nnzb, alpha, d, val, off, col, bd, B, ldb, beta, C, ldc);    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrsv2_bufferSize(cusparseHandle_t h, cusparseDirection_t,             \
@@ -2852,15 +2884,17 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
     return token_size(h, bytes);                                                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrsv2_analysis(                                                        \
-      cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t, int mb, int nnzb,                          \
+      cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t unused2, int mb, int nnzb,                          \
       const cusparseMatDescr_t d, const T* val, const int* off, const int* col, int bd, bsrsv2Info_t info,         \
-      cusparseSolvePolicy_t, void*) {                                                                               \
+      cusparseSolvePolicy_t unused11, void* unused12) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrsv2_analysis, h, dir, unused2, mb, nnzb, d, val, off, col, bd, info, unused11, unused12); \
     return bsrsv2_analysis<T>(h, dir, mb, nnzb, d, val, off, col, bd, info);                                        \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrsv2_solve(                                                           \
       cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t trans, int mb, int nnzb, const T* alpha,    \
       const cusparseMatDescr_t d, const T* val, const int* off, const int* col, int bd, bsrsv2Info_t info,         \
-      const T* f, T* x, cusparseSolvePolicy_t, void*) {                                                             \
+      const T* f, T* x, cusparseSolvePolicy_t unused14, void* unused15) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrsv2_solve, h, dir, trans, mb, nnzb, alpha, d, val, off, col, bd, info, f, x, unused14, unused15); \
     return bsrsm<T>(h, dir, trans, false, mb, 1, nnzb, alpha, d, val, off, col, bd, info, f, std::max(1, mb * bd),  \
                     x, std::max(1, mb * bd));                                                                       \
   }                                                                                                                 \
@@ -2878,16 +2912,18 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
     return token_size(h, bytes);                                                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrsm2_analysis(                                                        \
-      cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t, cusparseOperation_t, int mb, int,          \
+      cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t unused2, cusparseOperation_t unused3, int mb, int unused5,          \
       int nnzb, const cusparseMatDescr_t d, const T* val, const int* off, const int* col, int bd,                  \
-      bsrsm2Info_t info, cusparseSolvePolicy_t, void*) {                                                            \
+      bsrsm2Info_t info, cusparseSolvePolicy_t unused13, void* unused14) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrsm2_analysis, h, dir, unused2, unused3, mb, unused5, nnzb, d, val, off, col, bd, info, unused13, unused14); \
     return bsrsv2_analysis<T>(h, dir, mb, nnzb, d, val, off, col, bd, info);                                        \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrsm2_solve(                                                           \
       cusparseHandle_t h, cusparseDirection_t dir, cusparseOperation_t transA, cusparseOperation_t transXY,        \
       int mb, int n, int nnzb, const T* alpha, const cusparseMatDescr_t d, const T* val, const int* off,           \
-      const int* col, int bd, bsrsm2Info_t info, const T* B, int ldb, T* X, int ldx, cusparseSolvePolicy_t,        \
-      void*) {                                                                                                      \
+      const int* col, int bd, bsrsm2Info_t info, const T* B, int ldb, T* X, int ldx, cusparseSolvePolicy_t unused18,        \
+      void* unused19) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrsm2_solve, h, dir, transA, transXY, mb, n, nnzb, alpha, d, val, off, col, bd, info, B, ldb, X, ldx, unused18, unused19); \
     if (transXY == CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE) return CUSPARSE_STATUS_INVALID_VALUE;                    \
     return bsrsm<T>(h, dir, transA, transXY == CUSPARSE_OPERATION_TRANSPOSE, mb, n, nnzb, alpha, d, val, off, col, \
                     bd, info, B, ldb, X, ldx);                                                                      \
@@ -2903,18 +2939,21 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
     return token_size(h, bytes);                                                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsric02_analysis(                                                       \
-      cusparseHandle_t h, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t d, const T*,         \
-      const int* off, const int* col, int bd, bsric02Info_t info, cusparseSolvePolicy_t, void*) {                  \
+      cusparseHandle_t h, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t d, const T* unused5,         \
+      const int* off, const int* col, int bd, bsric02Info_t info, cusparseSolvePolicy_t unused10, void* unused11) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsric02_analysis, h, dir, mb, nnzb, d, unused5, off, col, bd, info, unused10, unused11); \
     return factor_analysis<T>(h, dir, mb, nnzb, d, off, col, bd, info);                                            \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsric02(cusparseHandle_t h, cusparseDirection_t dir, int mb, int nnzb, \
                                                     const cusparseMatDescr_t d, T* val, const int* off,            \
                                                     const int* col, int bd, bsric02Info_t info,                    \
-                                                    cusparseSolvePolicy_t, void*) {                                \
+                                                    cusparseSolvePolicy_t unused10, void* unused11) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsric02, h, dir, mb, nnzb, d, val, off, col, bd, info, unused10, unused11); \
     return factor<T>(h, dir, mb, nnzb, d, val, off, col, bd, info, true);                                           \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrilu02_numericBoost(cusparseHandle_t h, bsrilu02Info_t info,         \
-                                                                  int enable, double* tol, T* boost) {             \
+                                                                  int enable, double* tol, T* boost) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrilu02_numericBoost, h, info, enable, tol, boost); \
     return numeric_boost<T>(h, info, enable, tol, boost);                                                           \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrilu02_bufferSize(cusparseHandle_t h, cusparseDirection_t, int, int, \
@@ -2928,14 +2967,16 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
     return token_size(h, bytes);                                                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrilu02_analysis(                                                      \
-      cusparseHandle_t h, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t d, T*,               \
-      const int* off, const int* col, int bd, bsrilu02Info_t info, cusparseSolvePolicy_t, void*) {                 \
+      cusparseHandle_t h, cusparseDirection_t dir, int mb, int nnzb, const cusparseMatDescr_t d, T* unused5,               \
+      const int* off, const int* col, int bd, bsrilu02Info_t info, cusparseSolvePolicy_t unused10, void* unused11) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrilu02_analysis, h, dir, mb, nnzb, d, unused5, off, col, bd, info, unused10, unused11); \
     return factor_analysis<T>(h, dir, mb, nnzb, d, off, col, bd, info);                                            \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsrilu02(cusparseHandle_t h, cusparseDirection_t dir, int mb,          \
                                                      int nnzb, const cusparseMatDescr_t d, T* val, const int* off, \
                                                      const int* col, int bd, bsrilu02Info_t info,                  \
-                                                     cusparseSolvePolicy_t, void*) {                               \
+                                                     cusparseSolvePolicy_t unused10, void* unused11) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsrilu02, h, dir, mb, nnzb, d, val, off, col, bd, info, unused10, unused11); \
     return factor<T>(h, dir, mb, nnzb, d, val, off, col, bd, info, false);                                          \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csric02_bufferSize(cusparseHandle_t h, int, int,                       \
@@ -2949,18 +2990,21 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
     return token_size(h, bytes);                                                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csric02_analysis(cusparseHandle_t h, int m, int nnz,                   \
-                                                             const cusparseMatDescr_t d, const T*, const int* off, \
+                                                             const cusparseMatDescr_t d, const T* unused4, const int* off, \
                                                              const int* col, csric02Info_t info,                   \
-                                                             cusparseSolvePolicy_t, void*) {                       \
+                                                             cusparseSolvePolicy_t unused8, void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csric02_analysis, h, m, nnz, d, unused4, off, col, info, unused8, unused9); \
     return factor_analysis<T>(h, CUSPARSE_DIRECTION_ROW, m, nnz, d, off, col, 1, info);                            \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csric02(cusparseHandle_t h, int m, int nnz, const cusparseMatDescr_t d, \
                                                     T* val, const int* off, const int* col, csric02Info_t info,    \
-                                                    cusparseSolvePolicy_t, void*) {                                \
+                                                    cusparseSolvePolicy_t unused8, void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csric02, h, m, nnz, d, val, off, col, info, unused8, unused9); \
     return factor<T>(h, CUSPARSE_DIRECTION_ROW, m, nnz, d, val, off, col, 1, info, true);                           \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csrilu02_numericBoost(cusparseHandle_t h, csrilu02Info_t info,         \
-                                                                  int enable, double* tol, T* boost) {             \
+                                                                  int enable, double* tol, T* boost) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csrilu02_numericBoost, h, info, enable, tol, boost); \
     return numeric_boost<T>(h, info, enable, tol, boost);                                                           \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csrilu02_bufferSize(cusparseHandle_t h, int, int,                      \
@@ -2974,25 +3018,29 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
     return token_size(h, bytes);                                                                                    \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csrilu02_analysis(cusparseHandle_t h, int m, int nnz,                  \
-                                                              const cusparseMatDescr_t d, const T*,                \
+                                                              const cusparseMatDescr_t d, const T* unused4,                \
                                                               const int* off, const int* col,                      \
-                                                              csrilu02Info_t info, cusparseSolvePolicy_t, void*) { \
+                                                              csrilu02Info_t info, cusparseSolvePolicy_t unused8, void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csrilu02_analysis, h, m, nnz, d, unused4, off, col, info, unused8, unused9); \
     return factor_analysis<T>(h, CUSPARSE_DIRECTION_ROW, m, nnz, d, off, col, 1, info);                            \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csrilu02(cusparseHandle_t h, int m, int nnz,                           \
                                                      const cusparseMatDescr_t d, T* val, const int* off,           \
-                                                     const int* col, csrilu02Info_t info, cusparseSolvePolicy_t,   \
-                                                     void*) {                                                      \
+                                                     const int* col, csrilu02Info_t info, cusparseSolvePolicy_t unused8,   \
+                                                     void* unused9) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csrilu02, h, m, nnz, d, val, off, col, info, unused8, unused9); \
     return factor<T>(h, CUSPARSE_DIRECTION_ROW, m, nnz, d, val, off, col, 1, info, false);                          \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csr2bsr(                                                                \
       cusparseHandle_t h, cusparseDirection_t dir, int m, int n, const cusparseMatDescr_t dA, const T* val,        \
-      const int* off, const int* col, int bd, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC) {        \
+      const int* off, const int* col, int bd, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csr2bsr, h, dir, m, n, dA, val, off, col, bd, dC, valC, offC, colC);        \
     return csr2gebsr<T>(h, dir, m, n, dA, val, off, col, dC, valC, offC, colC, bd, bd);                            \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##bsr2csr(                                                                \
       cusparseHandle_t h, cusparseDirection_t dir, int mb, int nb, const cusparseMatDescr_t dA, const T* val,      \
-      const int* off, const int* col, int bd, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC) {        \
+      const int* off, const int* col, int bd, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##bsr2csr, h, dir, mb, nb, dA, val, off, col, bd, dC, valC, offC, colC);        \
     return gebsr2csr<T>(h, dir, mb, nb, dA, val, off, col, bd, bd, dC, valC, offC, colC);                          \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##csr2gebsr_bufferSize(cusparseHandle_t h, cusparseDirection_t, int,     \
@@ -3009,13 +3057,15 @@ VGPU_EXPORT cusparseStatus_t cusparseXgebsr2csr(cusparseHandle_t h, cusparseDire
   VGPU_EXPORT cusparseStatus_t cusparse##P##csr2gebsr(                                                              \
       cusparseHandle_t h, cusparseDirection_t dir, int m, int n, const cusparseMatDescr_t dA, const T* val,        \
       const int* off, const int* col, const cusparseMatDescr_t dC, T* valC, int* offC, int* colC, int rbd,         \
-      int cbd, void*) {                                                                                             \
+      int cbd, void* unused14) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##csr2gebsr, h, dir, m, n, dA, val, off, col, dC, valC, offC, colC, rbd, cbd, unused14); \
     return csr2gebsr<T>(h, dir, m, n, dA, val, off, col, dC, valC, offC, colC, rbd, cbd);                          \
   }                                                                                                                 \
   VGPU_EXPORT cusparseStatus_t cusparse##P##gebsr2csr(                                                              \
       cusparseHandle_t h, cusparseDirection_t dir, int mb, int nb, const cusparseMatDescr_t dA, const T* val,      \
       const int* off, const int* col, int rbd, int cbd, const cusparseMatDescr_t dC, T* valC, int* offC,           \
-      int* colC) {                                                                                                  \
+      int* colC) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gebsr2csr, h, dir, mb, nb, dA, val, off, col, rbd, cbd, dC, valC, offC, colC); \
     return gebsr2csr<T>(h, dir, mb, nb, dA, val, off, col, rbd, cbd, dC, valC, offC, colC);                        \
   }
 VGPU_LEGACY_BSR(S, float)

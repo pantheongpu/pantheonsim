@@ -11,6 +11,12 @@
 
 #include "vtest.hpp"
 
+// The runtime and the driver shim each carry the simulator's core, by design; one process that loads both is an
+// ODR violation to AddressSanitizer's default check, which aborts a bare run of this program. CMake's test
+// environment says the same, but a program run by hand has no such environment, so it says it itself (the
+// ASAN_OPTIONS variable still wins when set). Leak detection stays on.
+extern "C" const char* __asan_default_options() { return "detect_leaks=1:detect_odr_violation=0"; }
+
 namespace {
 int g_destroyed = 0;
 void* g_last = nullptr;

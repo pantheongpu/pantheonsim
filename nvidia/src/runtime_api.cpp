@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <type_traits>
 #include <cctype>
 #include <cstring>
 #include <functional>
@@ -56,6 +57,7 @@
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/exec/cluster.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
@@ -965,9 +967,20 @@ template <class... A>
 void note_kept(const vgpu_traced::KeptArgs<A...>& kept) {
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
     announce_driver_init();
-    vgpu::profiling::note_args(kept.argv(), kept.count());
+    vgpu::profiling::note_args(kept.argv(), kept.count(), kept.sizes());
   }
 }
+
+// What a profiler calls an entry point that CUDA 12 spells with a _v2: CUDA 13's
+// headers (and callback ids) give the edge-data, location-taking and
+// event-kind forms the plain spelling, and 12.x's keep both, so a shim built
+// against 12.x reports (as NVIDIA's 12.8 does, measured) cudaGetDeviceProperties_v2
+// and cudaEventElapsedTime_v2 under their own names.
+#if CUDART_VERSION >= 13000
+#define VGPU_CB_V2(plain) plain
+#else
+#define VGPU_CB_V2(plain) plain "_v2"
+#endif
 
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
@@ -2107,7 +2120,7 @@ static cudaError_t cudaGetDeviceProperties_v2_traced(cudaDeviceProp* prop, int d
 }
 
 VGPU_EXPORT cudaError_t cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int device) {
-  return traced_call("cudaGetDeviceProperties", cudaGetDeviceProperties_v2_traced, prop, device);
+  return traced_call(VGPU_CB_V2("cudaGetDeviceProperties"), cudaGetDeviceProperties_v2_traced, prop, device);
 }
 
 // A device attribute, by its number: the host's cudaDeviceGetAttribute and a kernel's (the device runtime
@@ -2247,29 +2260,82 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(i
   return traced_call("cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_traced, n, f, bs, dyn, p4);
 }
 
-// How many clusters can be active, and the largest cluster that can launch,
-// depend on how the device's SMs are grouped into GPCs -- a cluster lives in
-// one -- and no profile here records that grouping, and the documentation does
-// not give it for any part. So these are refused by name rather than answered
-// from a made-up layout: a program that calls them (CUTLASS sizes its
-// persistent grid with the first) is told which question could not be answered.
-static cudaError_t cudaOccupancyMaxActiveClusters_traced(int* numClusters, const void* p1, const cudaLaunchConfig_t* p2) {
-  if (!numClusters) return cudaErrorInvalidValue;
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] cudaOccupancyMaxActiveClusters is not implemented: it needs the "
-                         "device's SM-to-GPC layout, which no profile records\n");
-  return cudaErrorNotSupported;
+// How many clusters can be active, and the largest cluster that can launch
+// (vgpu/exec/cluster.hpp has the rules and what each answer rests on). A cluster
+// lives in one GPC, so the first needs the profile's GPC layout (GpuLayout): where
+// a profile has none the call is refused by name rather than answered from a layout
+// made up for it, and where it has one the SMs are spread over the GPCs evenly, which
+// NVIDIA does not publish, so the answer is said once to be derived.
+static void cluster_note(const char* api, const vgpu::DeviceProfile& p, const vgpu::exec::ClusterAnswer& a) {
+  using S = vgpu::exec::ClusterAnswer::Status;
+  static std::atomic<bool> said_missing{false}, said_derived{false};
+  if (quiet()) return;
+  if (a.status == S::NotSupported && !said_missing.exchange(true))
+    std::fprintf(stderr, "[vgpu] %s is not implemented for %s: %s\n", api, p.id.c_str(), a.why);
+  if (a.status == S::Ok && a.uses_layout && !said_derived.exchange(true))
+    std::fprintf(stderr,
+                 "[vgpu] %s: %s has %u GPCs and %u TPCs (%s), spread evenly over the GPCs because NVIDIA "
+                 "does not publish how many each has; the answer is derived from that and is not checked "
+                 "against a card\n",
+                 api, p.id.c_str(), p.layout.gpcs, p.layout.tpcs,
+                 p.layout.counts_derived ? "figures of a part with the same SM count" : "NVIDIA's figures for this part");
+}
+
+static cudaError_t cluster_occupancy_query(const char* api, bool active, int* out, const void* func,
+                                           const cudaLaunchConfig_t* config) {
+  using S = vgpu::exec::ClusterAnswer::Status;
+  if (!out || !config) return cudaErrorInvalidValue;   // a null configuration crashes the card's runtime
+  return guard(api, [&](State& s) -> cudaError_t {
+    auto it = s.kernels.find(func);
+    if (it == s.kernels.end()) {
+      if (!quiet() && func) std::fprintf(stderr, "[vgpu] %s: unregistered kernel stub %p\n", api, func);
+      return cudaErrorInvalidDeviceFunction;
+    }
+    KernelInfo& ki = it->second;
+    vgpu::runtime::Device& dev = current(s);
+    const vgpu::DeviceProfile& p = dev.profile();
+    bool has_dim = false;
+    std::array<uint32_t, 3> dim{0, 0, 0};
+    for (unsigned i = 0; config->attrs && i < config->numAttrs; ++i) {
+      if (config->attrs[i].id != cudaLaunchAttributeClusterDimension) continue;
+      has_dim = true;
+      dim = {config->attrs[i].val.clusterDim.x, config->attrs[i].val.clusterDim.y, config->attrs[i].val.clusterDim.z};
+    }
+    std::array<uint32_t, 3> required{0, 0, 0};
+    uint32_t blocks_per_sm = 0;
+    if (vgpu::exec::supports_clusters(p)) {
+      if (!ki.mod || !registered_ptx(s, *ki.mod)) return cudaErrorInvalidDeviceFunction;
+      const uint64_t mid = module_on_current(s, *ki.mod);
+      const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+      required = fn->req_cluster;
+      const uint64_t threads = uint64_t{config->blockDim.x} * config->blockDim.y * config->blockDim.z;
+      if (threads == 0 || threads > p.limits.max_threads_per_block) return cudaErrorInvalidValue;
+      blocks_per_sm = vgpu::exec::kernel_resources(*fn, p, static_cast<uint32_t>(threads),
+                                                   static_cast<uint32_t>(config->dynamicSmemBytes))
+                          .occupancy.blocks_per_sm;
+    }
+    const vgpu::exec::ClusterAnswer a = vgpu::exec::cluster_occupancy(p, active, has_dim, dim, required,
+                                                                       ki.nonportable_cluster, blocks_per_sm);
+    cluster_note(api, p, a);
+    switch (a.status) {
+      case S::Ok: *out = static_cast<int>(a.value); return cudaSuccess;
+      case S::InvalidValue: return cudaErrorInvalidValue;
+      case S::InvalidClusterSize: return cudaErrorInvalidClusterSize;
+      case S::NotSupported: return cudaErrorNotSupported;
+    }
+    return cudaErrorUnknown;
+  });
+}
+
+static cudaError_t cudaOccupancyMaxActiveClusters_traced(int* numClusters, const void* func, const cudaLaunchConfig_t* config) {
+  return cluster_occupancy_query("cudaOccupancyMaxActiveClusters", true, numClusters, func, config);
 }
 
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveClusters(int* numClusters, const void* p1, const cudaLaunchConfig_t* p2) {
   return traced_call("cudaOccupancyMaxActiveClusters", cudaOccupancyMaxActiveClusters_traced, numClusters, p1, p2);
 }
-static cudaError_t cudaOccupancyMaxPotentialClusterSize_traced(int* clusterSize, const void* p1, const cudaLaunchConfig_t* p2) {
-  if (!clusterSize) return cudaErrorInvalidValue;
-  if (!quiet())
-    std::fprintf(stderr, "[vgpu] cudaOccupancyMaxPotentialClusterSize is not implemented: it needs "
-                         "the device's SM-to-GPC layout, which no profile records\n");
-  return cudaErrorNotSupported;
+static cudaError_t cudaOccupancyMaxPotentialClusterSize_traced(int* clusterSize, const void* func, const cudaLaunchConfig_t* config) {
+  return cluster_occupancy_query("cudaOccupancyMaxPotentialClusterSize", false, clusterSize, func, config);
 }
 
 VGPU_EXPORT cudaError_t cudaOccupancyMaxPotentialClusterSize(int* clusterSize, const void* p1, const cudaLaunchConfig_t* p2) {
@@ -2338,22 +2404,33 @@ VGPU_EXPORT cudaError_t cudaFuncGetParamInfo(const void* func, size_t paramIndex
 }
 #endif
 
+// Whether `device` can reach `peer`'s memory over a peer path: two devices whose profiles both have one
+// (CudaClass::peer_access). Two RTX 3060s have none (measured), a data-centre pair does.
+static bool peer_path(State& s, int device, int peer) {
+  return device != peer && s.rt->device(device).profile().cuda.peer_access &&
+         s.rt->device(peer).profile().cuda.peer_access;
+}
+
 // What one device can do with another's memory. The answers follow
-// cudaDeviceCanAccessPeer: distinct simulated devices reach each other, and
-// atomics on a peer's memory are as atomic as on one's own. A device is not
-// asked about itself: an RTX 3060 answers that, like a device that does not
-// exist, with cudaErrorInvalidDevice. There is no performance to rank.
+// cudaDeviceCanAccessPeer: devices with a peer path between them reach each other, and atomics on a
+// peer's memory are as atomic as on one's own; without one every attribute is 0 (an RTX 3060 pair, measured:
+// attributes 1 to 5 are all 0, 0 and 6 and above are cudaErrorInvalidValue). A device is not asked about
+// itself: an RTX 3060 answers that, like a device that does not exist, with cudaErrorInvalidDevice. There is
+// no performance to rank.
 static cudaError_t cudaDeviceGetP2PAttribute_traced(int* value, cudaDeviceP2PAttr attr, int srcDevice, int dstDevice) {
+  const int attr_value = enum_value(attr);
   return guard("cudaDeviceGetP2PAttribute", [&](State& s) {
     if (!value) return cudaErrorInvalidValue;
     const int n = s.rt->device_count();
     if (srcDevice < 0 || srcDevice >= n || dstDevice < 0 || dstDevice >= n || srcDevice == dstDevice)
       return cudaErrorInvalidDevice;
-    switch (attr) {
-      case cudaDevP2PAttrPerformanceRank: *value = 0; break;
-      case cudaDevP2PAttrAccessSupported: *value = 1; break;
-      case cudaDevP2PAttrNativeAtomicSupported: *value = 1; break;
-      case cudaDevP2PAttrCudaArrayAccessSupported: *value = 0; break;
+    const bool path = peer_path(s, srcDevice, dstDevice);
+    switch (attr_value) {
+      case 1: *value = 0; break;                  // cudaDevP2PAttrPerformanceRank
+      case 2: *value = path ? 1 : 0; break;       // AccessSupported
+      case 3: *value = path ? 1 : 0; break;       // NativeAtomicSupported
+      case 4: *value = 0; break;                  // CudaArrayAccessSupported
+      case 5: *value = 0; break;                  // OnlyPartialNativeAtomicSupported (CUDA 13)
       default: return cudaErrorInvalidValue;
     }
     return cudaSuccess;
@@ -2370,9 +2447,9 @@ static cudaError_t cudaDeviceCanAccessPeer_traced(int* can, int device, int peer
     if (device < 0 || device >= s.rt->device_count() || peerDevice < 0 ||
         peerDevice >= s.rt->device_count())
       return cudaErrorInvalidDevice;
-    // Distinct virtual devices can always reach each other; a device is not
-    // its own peer (matching the runtime API contract).
-    *can = (device != peerDevice) ? 1 : 0;
+    // Devices with a peer path reach each other; a device is not its own peer (cudaSuccess and 0, as an
+    // RTX 3060 answers).
+    *can = peer_path(s, device, peerDevice) ? 1 : 0;
     return cudaSuccess;
   });
 }
@@ -2386,13 +2463,18 @@ VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDe
 // cudaErrorPeerAccessAlreadyEnabled, which frameworks deliberately tolerate,
 // and disabling what was never enabled is cudaErrorPeerAccessNotEnabled. Both
 // used to succeed unconditionally, whatever the flags, and so did disabling a
-// device that does not exist.
+// device that does not exist. Without a peer path (an RTX 3060 pair, measured) enabling is
+// cudaErrorPeerAccessUnsupported, for the device itself as well; the flags are checked first
+// (cudaErrorInvalidValue), a device that does not exist before them.
 static cudaError_t cudaDeviceEnablePeerAccess_traced(int peerDevice, unsigned int flags) {
   return guard("cudaDeviceEnablePeerAccess", [&](State& s) -> cudaError_t {
     if (peerDevice < 0 || peerDevice >= s.rt->device_count()) return cudaErrorInvalidDevice;
-    // A device is not its own peer; cudaDeviceCanAccessPeer says so.
-    if (peerDevice == t_current_device) return cudaErrorInvalidDevice;
     if (flags != 0) return cudaErrorInvalidValue;  // reserved, must be 0
+    if (peerDevice == t_current_device) {
+      // A device is not its own peer; cudaDeviceCanAccessPeer says so.
+      return s.rt->device(peerDevice).profile().cuda.peer_access ? cudaErrorInvalidDevice : cudaErrorPeerAccessUnsupported;
+    }
+    if (!peer_path(s, t_current_device, peerDevice)) return cudaErrorPeerAccessUnsupported;
     if (!s.peer_access.emplace(t_current_device, peerDevice).second)
       return cudaErrorPeerAccessAlreadyEnabled;
     return cudaSuccess;
@@ -3861,13 +3943,21 @@ VGPU_EXPORT cudaError_t cudaMemPoolDestroy(cudaMemPool_t pool) {
 // ImportFromShareableHandle checks the pointers and the flags (0 only) first, and then answers
 // cudaErrorNotSupported for POSIX file descriptor, Win32, Win32 KMT and fabric handles, and
 // cudaErrorInvalidValue for anything else; ImportPointer is cudaErrorInvalidValue.
-VGPU_EXPORT cudaError_t cudaMemPoolExportToShareableHandle(void* shareableHandle, cudaMemPool_t memPool,
+static cudaError_t cudaMemPoolExportToShareableHandle_traced(void* shareableHandle, cudaMemPool_t memPool, cudaMemAllocationHandleType handleType, unsigned int flags);
+VGPU_EXPORT cudaError_t cudaMemPoolExportToShareableHandle(void* shareableHandle, cudaMemPool_t memPool, cudaMemAllocationHandleType handleType, unsigned int flags) {
+  return traced_call("cudaMemPoolExportToShareableHandle", cudaMemPoolExportToShareableHandle_traced, shareableHandle, memPool, handleType, flags);
+}
+static cudaError_t cudaMemPoolExportToShareableHandle_traced(void* shareableHandle, cudaMemPool_t memPool,
                                                            cudaMemAllocationHandleType handleType,
                                                            unsigned int flags) {
   (void)shareableHandle; (void)memPool; (void)handleType; (void)flags;
   return guard("cudaMemPoolExportToShareableHandle", [&](State&) -> cudaError_t { return cudaErrorInvalidValue; });
 }
-VGPU_EXPORT cudaError_t cudaMemPoolImportFromShareableHandle(cudaMemPool_t* memPool, void* shareableHandle,
+static cudaError_t cudaMemPoolImportFromShareableHandle_traced(cudaMemPool_t* memPool, void* shareableHandle, cudaMemAllocationHandleType handleType, unsigned int flags);
+VGPU_EXPORT cudaError_t cudaMemPoolImportFromShareableHandle(cudaMemPool_t* memPool, void* shareableHandle, cudaMemAllocationHandleType handleType, unsigned int flags) {
+  return traced_call("cudaMemPoolImportFromShareableHandle", cudaMemPoolImportFromShareableHandle_traced, memPool, shareableHandle, handleType, flags);
+}
+static cudaError_t cudaMemPoolImportFromShareableHandle_traced(cudaMemPool_t* memPool, void* shareableHandle,
                                                              cudaMemAllocationHandleType handleType,
                                                              unsigned int flags) {
   const int type = enum_value(handleType);
@@ -3886,11 +3976,19 @@ VGPU_EXPORT cudaError_t cudaMemPoolImportFromShareableHandle(cudaMemPool_t* memP
     }
   });
 }
+static cudaError_t cudaMemPoolExportPointer_traced(cudaMemPoolPtrExportData* exportData, void* ptr);
 VGPU_EXPORT cudaError_t cudaMemPoolExportPointer(cudaMemPoolPtrExportData* exportData, void* ptr) {
+  return traced_call("cudaMemPoolExportPointer", cudaMemPoolExportPointer_traced, exportData, ptr);
+}
+static cudaError_t cudaMemPoolExportPointer_traced(cudaMemPoolPtrExportData* exportData, void* ptr) {
   (void)exportData; (void)ptr;
   return guard("cudaMemPoolExportPointer", [&](State&) -> cudaError_t { return cudaErrorInvalidValue; });
 }
-VGPU_EXPORT cudaError_t cudaMemPoolImportPointer(void** ptr, cudaMemPool_t memPool,
+static cudaError_t cudaMemPoolImportPointer_traced(void** ptr, cudaMemPool_t memPool, cudaMemPoolPtrExportData* exportData);
+VGPU_EXPORT cudaError_t cudaMemPoolImportPointer(void** ptr, cudaMemPool_t memPool, cudaMemPoolPtrExportData* exportData) {
+  return traced_call("cudaMemPoolImportPointer", cudaMemPoolImportPointer_traced, ptr, memPool, exportData);
+}
+static cudaError_t cudaMemPoolImportPointer_traced(void** ptr, cudaMemPool_t memPool,
                                                  cudaMemPoolPtrExportData* exportData) {
   (void)ptr; (void)memPool; (void)exportData;
   return guard("cudaMemPoolImportPointer", [&](State&) -> cudaError_t { return cudaErrorInvalidValue; });
@@ -4338,42 +4436,8 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
   return traced_call("cudaDeviceGetCacheConfig", cudaDeviceGetCacheConfig_traced, config);
 }
 
-// Shared memory banks are four bytes wide on every GPU this simulates, as the
-// driver's cuCtxSetSharedMemConfig answers: a configuration in the enumeration
-// is accepted and has no effect, and the answer stays the four-byte bank size.
-// Deprecated in 12.4, and removed with CUDA 13.
+// Removed with CUDA 13.
 #if CUDART_VERSION < 13000
-// The configuration travels as an int: a caller's out-of-range value must not
-// be loaded as the enum (UBSan), and traced_call copies its arguments on.
-static cudaError_t cudaDeviceSetSharedMemConfig_traced(int c) {
-  return c >= 0 && c <= 2 ? cudaSuccess : cudaErrorInvalidValue;
-}
-
-VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
-  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced,
-                     enum_value(config));
-}
-static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* config) {
-  if (!config) return cudaErrorInvalidValue;
-  *config = cudaSharedMemBankSizeFourByte;
-  return cudaSuccess;
-}
-
-VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
-  return traced_call("cudaDeviceGetSharedMemConfig", cudaDeviceGetSharedMemConfig_traced, config);
-}
-static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, int c) {
-  if (c < 0 || c > 2) return cudaErrorInvalidValue;
-  return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
-    return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
-  });
-}
-
-VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
-  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func,
-                     enum_value(config));
-}
-
 // The cudaThread* calls are the pre-cudaDevice* names, deprecated since CUDA
 // 4 and documented as the same operations; cudaThreadSynchronize already was.
 static cudaError_t cudaThreadExit_traced() { return cudaDeviceReset(); }
@@ -5394,18 +5458,6 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
     // integer array allows, and refuses the normalized one with cudaErrorInvalidNormSetting, whatever the
     // view is); what a fetch returns is the view's format, though.
     const vgpu::cuda::TexFormat checked_format = format;
-    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
-    // sampled here: their decoders are not written. Say so, by name, once (the real library takes them).
-    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
-        d.block == vgpu::exec::BlockFormat::BC7) {
-      static std::once_flag said;
-      std::call_once(said, [] {
-        if (!quiet())
-          std::fprintf(stderr, "[vgpu] cudaCreateTextureObject: textures of BC6H and BC7 blocks are not implemented "
-                               "(BC1 to BC5 are); returning cudaErrorNotSupported\n");
-      });
-      return cudaErrorNotSupported;
-    }
     bool normalized_read = false;
     if (tex) {
       for (int i = 0; i < 3; ++i)
@@ -5423,9 +5475,10 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
                                                          filter == cudaFilterModeLinear, tex->sRGB != 0))
         return static_cast<cudaError_t>(bad);
       // Linear filtering and sRGB decoding are done at the fetch, as the
-      // texture unit does them. Anisotropy changes a result only when a sample's footprint is
-      // stretched, which a fetch with no derivatives (LOD 0, or an explicit one) never is: the
-      // value is accepted, as the card accepts any, and has nothing to act on.
+      // texture unit does them. Anisotropy is kept as given (the card accepts any value): it
+      // sharpens the blend between two levels of an explicit-level fetch (tex_mip_lod), and
+      // acts on nothing else a fetch with no derivatives does.
+      d.max_anisotropy = tex->maxAnisotropy;
       if (filter == cudaFilterModeLinear) d.filter = vgpu::exec::TexFilter::Linear;
       d.srgb = tex->sRGB != 0;
       // What border addressing returns outside the texture, converted to the
@@ -5439,6 +5492,8 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
       d.mip_filter = mipfilter == cudaFilterModeLinear ? vgpu::exec::TexFilter::Linear
                                                        : vgpu::exec::TexFilter::Point;
       d.mip_bias = q(tex->mipmapLevelBias);
+      d.mip_bias_exact = std::isfinite(tex->mipmapLevelBias)
+                             ? static_cast<double>(std::clamp(tex->mipmapLevelBias, -1e6f, 1e6f)) * 256 : 0.0;
       d.mip_min = q(tex->minMipmapLevelClamp);
       d.mip_max = q(tex->maxMipmapLevelClamp);
     } else if (const int bad = vgpu::cuda::texture_read_check(checked_format, false, false, false)) {
@@ -5622,9 +5677,33 @@ std::pair<void* const, HostRange>* managed_range(State& s, const void* p, size_t
   return nullptr;
 }
 
+// Whether the current device pages managed memory on demand (cudaDevAttrConcurrentManagedAccess). One
+// that does not (an RTX 3060 under WSL, measured) cannot prefetch, and refuses the advice that names a device.
+bool pages_managed_memory(State& s) {
+  return s.rt->device(t_current_device).profile().cuda.concurrent_managed_access;
+}
+
 cudaError_t advise(State& s, const void* p, size_t n, cudaMemoryAdvise kind, int device) {
+  const bool paged = pages_managed_memory(s);
+  if (!paged && device != cudaCpuDeviceId) {
+    // Refused before the range is looked at: a preferred location that is a device (cudaErrorInvalidDevice),
+    // and a device in the accessed-by list (cudaErrorInvalidDevice, or cudaErrorInvalidValue for a device
+    // that does not exist).
+    if (kind == cudaMemAdviseSetPreferredLocation) return cudaErrorInvalidDevice;
+    if (kind == cudaMemAdviseSetAccessedBy || kind == cudaMemAdviseUnsetAccessedBy)
+      return device >= 0 && device < s.rt->device_count() ? cudaErrorInvalidDevice : cudaErrorInvalidValue;
+  }
   auto* range = managed_range(s, p, n);
   if (!range) return cudaErrorInvalidValue;
+  if (!paged) {
+    // Accepted and not kept: cudaMemRangeGetAttribute reads back the defaults (0 and the invalid device id).
+    switch (kind) {
+      case cudaMemAdviseSetReadMostly: case cudaMemAdviseUnsetReadMostly:
+      case cudaMemAdviseSetPreferredLocation: case cudaMemAdviseUnsetPreferredLocation:
+      case cudaMemAdviseSetAccessedBy: case cudaMemAdviseUnsetAccessedBy: return cudaSuccess;
+      default: return cudaErrorInvalidValue;
+    }
+  }
   const bool needs_device = kind == cudaMemAdviseSetAccessedBy || kind == cudaMemAdviseUnsetAccessedBy ||
                             kind == cudaMemAdviseSetPreferredLocation ||
                             kind == cudaMemAdviseUnsetPreferredLocation;
@@ -5650,6 +5729,8 @@ cudaError_t prefetch(State& s, const void* p, size_t n, int device) {
   if (!range) return cudaErrorInvalidValue;
   if (device != cudaCpuDeviceId && (device < 0 || device >= s.rt->device_count()))
     return cudaErrorInvalidDevice;
+  // A device that does not page managed memory on demand cannot prefetch, to a device or to the host.
+  if (!pages_managed_memory(s)) return cudaErrorInvalidDevice;
   const auto begin = reinterpret_cast<uint64_t>(p);
   s.managed_advice[range->first].last_prefetch.set(begin, begin + n, device);
   return cudaSuccess;
@@ -5711,8 +5792,9 @@ cudaError_t range_attribute(State& s, void* data, size_t data_size, cudaMemRange
 
 #if CUDART_VERSION >= 13000
 static cudaError_t cudaMemPrefetchAsync_body(const void* p, size_t n, struct cudaMemLocation loc,
-                                             unsigned int, cudaStream_t) {
+                                             unsigned int flags, cudaStream_t) {
   return guard("cudaMemPrefetchAsync", [&](State& s) -> cudaError_t {
+    if (flags != 0) return cudaErrorInvalidValue;   // reserved, must be 0 (an RTX 3060 refuses others)
     if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
       return cudaErrorInvalidValue;
     return prefetch(s, p, n, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
@@ -5757,9 +5839,9 @@ VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise 
 // for a location -- a host location, a NUMA node -- calls these.
 #if CUDART_VERSION >= 12020 && CUDART_VERSION < 13000
 static cudaError_t cudaMemPrefetchAsync_v2_traced(const void* p, size_t n, struct cudaMemLocation loc, unsigned int flags, cudaStream_t stream) {
-  (void)flags;   // reserved, as the documentation says
   (void)stream;
   return guard("cudaMemPrefetchAsync_v2", [&](State& s) -> cudaError_t {
+    if (flags != 0) return cudaErrorInvalidValue;   // reserved, must be 0
     if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
       return cudaErrorInvalidValue;
     return prefetch(s, p, n, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
@@ -5767,7 +5849,7 @@ static cudaError_t cudaMemPrefetchAsync_v2_traced(const void* p, size_t n, struc
 }
 
 VGPU_EXPORT cudaError_t cudaMemPrefetchAsync_v2(const void* p, size_t n, struct cudaMemLocation loc, unsigned int flags, cudaStream_t stream) {
-  return traced_call("cudaMemPrefetchAsync", cudaMemPrefetchAsync_v2_traced, p, n, loc, flags, stream);
+  return traced_call("cudaMemPrefetchAsync_v2", cudaMemPrefetchAsync_v2_traced, p, n, loc, flags, stream);
 }
 static cudaError_t cudaMemAdvise_v2_traced(const void* p, size_t n, cudaMemoryAdvise kind, struct cudaMemLocation loc) {
   if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaMemAdvise_v2")) return unsafe_;
@@ -5779,7 +5861,7 @@ static cudaError_t cudaMemAdvise_v2_traced(const void* p, size_t n, cudaMemoryAd
 }
 
 VGPU_EXPORT cudaError_t cudaMemAdvise_v2(const void* p, size_t n, cudaMemoryAdvise kind, struct cudaMemLocation loc) {
-  return traced_call("cudaMemAdvise", cudaMemAdvise_v2_traced, p, n, kind, loc);
+  return traced_call("cudaMemAdvise_v2", cudaMemAdvise_v2_traced, p, n, kind, loc);
 }
 #endif
 
@@ -6208,15 +6290,31 @@ VGPU_EXPORT cudaError_t cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventH
   return traced_call("cudaIpcOpenEventHandle", cudaIpcOpenEventHandle_traced, event, handle);
 }
 
+bool capture_id_alive(unsigned long long id);
+
+// What an event last recorded in a capture answers to a query, a wait for it or a time: while that
+// capture goes on, cudaErrorCapturedEvent (which invalidates the capture, as any such call does); once
+// it has ended, the event is gone and the answer is cudaErrorInvalidValue until it is recorded again --
+// both measured on an RTX 3060 (driver 13.2), against the documented CapturedEvent alone.
+static cudaError_t captured_event_answer(unsigned long long capture_id) {
+  return capture_id_alive(capture_id) ? cudaErrorCapturedEvent : cudaErrorInvalidValue;
+}
+
 static cudaError_t cudaEventSynchronize_body(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
-  if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventSynchronize")) return unsafe_;
+  const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventSynchronize");
   SyncScope waited(vgpu::profiling::SyncKind::Event, nullptr, e);
   pool_waited_for(t_current_device, nullptr, true);
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  const RtEvent* r = find_event(e);
-  if (!r) return cudaErrorInvalidResourceHandle;
-  return r->captured ? cudaErrorCapturedEvent : cudaSuccess;
+  bool captured = false;
+  unsigned long long id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    const RtEvent* r = find_event(e);
+    if (!r) return unsafe_ ? unsafe_ : cudaErrorInvalidResourceHandle;
+    captured = r->captured, id = r->capture_id;
+  }
+  if (captured) return captured_event_answer(id);
+  return unsafe_;
 }
 
 VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
@@ -6224,11 +6322,17 @@ VGPU_EXPORT cudaError_t cudaEventSynchronize(cudaEvent_t e) {
 }
 static cudaError_t cudaEventQuery_body(cudaEvent_t e) {
   if (const cudaError_t dead = dead_context()) return dead;
-  if (const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventQuery")) return unsafe_;
-  std::lock_guard<std::mutex> lock(g_event_mu);
-  const RtEvent* r = find_event(e);
-  if (!r) return cudaErrorInvalidResourceHandle;
-  return r->captured ? cudaErrorCapturedEvent : cudaSuccess;   // it stands for work not yet run
+  const cudaError_t unsafe_ = capture_unsafe_gate("cudaEventQuery");
+  bool captured = false;
+  unsigned long long id = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_event_mu);
+    const RtEvent* r = find_event(e);
+    if (!r) return unsafe_ ? unsafe_ : cudaErrorInvalidResourceHandle;
+    captured = r->captured, id = r->capture_id;   // it stands for work not yet run
+  }
+  if (captured) return captured_event_answer(id);
+  return unsafe_;
 }
 
 VGPU_EXPORT cudaError_t cudaEventQuery(cudaEvent_t e) {
@@ -6244,7 +6348,7 @@ static cudaError_t cudaEventElapsedTime_traced(float* ms, cudaEvent_t start, cud
   // cudaEventDisableTiming, is cudaErrorInvalidResourceHandle.
   // cudaErrorNotReady is for recorded work that has not finished, which a
   // synchronous engine never leaves behind.
-  if (a && b && (a->captured || b->captured)) return cudaErrorCapturedEvent;
+  if (a && b && (a->captured || b->captured)) return captured_event_answer(a->captured ? a->capture_id : b->capture_id);
   if (!a || !b || !a->recorded || !b->recorded || !a->timing || !b->timing)
     return cudaErrorInvalidResourceHandle;
   *ms = std::chrono::duration<float, std::milli>(b->when - a->when).count();
@@ -6262,7 +6366,7 @@ static cudaError_t cudaEventElapsedTime_v2_traced(float* ms, cudaEvent_t start, 
 }
 
 VGPU_EXPORT cudaError_t cudaEventElapsedTime_v2(float* ms, cudaEvent_t start, cudaEvent_t end) {
-  return traced_call("cudaEventElapsedTime", cudaEventElapsedTime_v2_traced, ms, start, end);
+  return traced_call(VGPU_CB_V2("cudaEventElapsedTime"), cudaEventElapsedTime_v2_traced, ms, start, end);
 }
 #endif
 static cudaError_t cudaEventDestroy_body(cudaEvent_t e) {
@@ -6811,6 +6915,7 @@ std::map<int, GraphMemStats> g_graph_mem;
 // the auto-free flag is about its allocations.
 std::map<void*, void*> g_exec_source;        // exec handle -> graph handle
 std::set<void*> g_exec_auto_free;            // execs instantiated with the flag
+std::unordered_map<void*, unsigned long long> g_exec_flags;   // the flags each exec was instantiated with
 
 uint64_t round_up_to(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
 
@@ -7120,6 +7225,54 @@ extern "C" __attribute__((visibility("default"))) bool vgpu_record_driver_launch
   r.shared = shared;
   r.host_op = *op;
   return capture_record(s, cudaGraphNodeTypeKernel, std::move(r));
+}
+
+// More of what libcuda hands to the runtime by name (the driver API has no capture of its own).
+//
+// vgpu_record_driver_node_v1: a stream-ordered copy, fill, host function or the like of the driver API
+// on a capturing stream is a node of `node_type` (cudaGraphNodeType) whose launch is `op`. Returns false
+// when the stream is not capturing, and the caller does the work now.
+extern "C" __attribute__((visibility("default"))) bool vgpu_record_driver_node_v1(void* stream, int node_type,
+                                                                                 const std::function<void()>* op) {
+  cudaStream_t s = reinterpret_cast<cudaStream_t>(stream);
+  if (!op || !capture_active(s)) return false;
+  RecordedLaunch r;
+  r.kind = RecordedLaunch::Kind::Host;
+  r.host_op = *op;
+  return capture_record(s, static_cast<cudaGraphNodeType>(node_type), std::move(r));
+}
+
+// vgpu_capture_refuse_v1: the driver call `what` is not allowed on a capturing stream. Invalidates the
+// capture and returns 1 if `stream` is capturing, else 0 and nothing happens.
+extern "C" __attribute__((visibility("default"))) int vgpu_capture_refuse_v1(void* stream, const char* what) {
+  return capture_refuse(reinterpret_cast<cudaStream_t>(stream), what ? what : "a driver call") ? 1 : 0;
+}
+
+// vgpu_capture_refuse_any_v1: the same for a call that synchronizes the whole context. Returns 1 if any
+// capture was going on.
+extern "C" __attribute__((visibility("default"))) int vgpu_capture_refuse_any_v1(const char* api) {
+  return capture_refuse_any(api ? api : "a driver call") != cudaSuccess ? 1 : 0;
+}
+
+// vgpu_capture_unsafe_gate_v1: the "potentially unsafe" calls (see capture_unsafe_gate) for the driver's
+// own spellings of them. 0 allowed; 1 refused, the capture invalidated.
+extern "C" __attribute__((visibility("default"))) int vgpu_capture_unsafe_gate_v1(const char* api) {
+  return capture_unsafe_gate(api ? api : "a driver call") != cudaSuccess ? 1 : 0;
+}
+
+// vgpu_host_address_v1: the host address behind a device pointer into memory that is also host memory -- shared
+// with another process (cudaIpcGetMemHandle / cudaIpcOpenMemHandle), managed, or pinned and registered.
+// nullptr for ordinary device memory. cuDNN's multi-GPU normalization asks, to tell which file-backed memory
+// its peer statistics tensors are, and so which processes make up the group.
+extern "C" __attribute__((visibility("default"))) void* vgpu_host_address_v1(const void* p, size_t len) {
+  void* out = nullptr;
+  guard("vgpu_host_address", [&](State& s) -> cudaError_t {
+    const auto addr = reinterpret_cast<uint64_t>(p);
+    for (int d = 0; d < s.rt->device_count() && !out; ++d)
+      out = s.rt->device(d).memory().host_address(addr, len ? len : 1);
+    return cudaSuccess;
+  });
+  return out;
 }
 
 void vgpu_drop_capture(cudaStream_t stream) {
@@ -7622,6 +7775,7 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   exec_retain_graph_objects(handle, static_cast<void*>(graph));
+  g_exec_flags[handle] = flags;
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
   // Nothing else knows the handle until this returns, so the profiler can be told
@@ -7912,6 +8066,12 @@ static cudaError_t run_conditional(const GraphNodeRec& n, cudaStream_t stream) {
 static cudaError_t run_graph_node(GraphNodeRec* n, cudaStream_t stream) {
   RecordedLaunch& rl = n->work;
   if (!n->enabled) return cudaSuccess;   // switched off: it still orders its neighbours
+  // A copy or fill the driver API recorded (vgpu_record_driver_node_v1, vgpu_graph_add_closure_node_v1)
+  // is a closure of that type.
+  if (rl.host_op && (n->type == cudaGraphNodeTypeMemcpy || n->type == cudaGraphNodeTypeMemset)) {
+    rl.host_op();
+    return cudaSuccess;
+  }
   switch (n->type) {
     case cudaGraphNodeTypeEmpty:
       return cudaSuccess;
@@ -8881,7 +9041,11 @@ static bool kernel_attr_known(int id, int cc_major, cudaError_t* why) {
       return false;
   }
 }
-VGPU_EXPORT cudaError_t cudaGraphKernelNodeSetAttribute(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr,
+static cudaError_t cudaGraphKernelNodeSetAttribute_traced(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr, const cudaKernelNodeAttrValue* value);
+VGPU_EXPORT cudaError_t cudaGraphKernelNodeSetAttribute(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr, const cudaKernelNodeAttrValue* value) {
+  return traced_call("cudaGraphKernelNodeSetAttribute", cudaGraphKernelNodeSetAttribute_traced, hNode, attr, value);
+}
+static cudaError_t cudaGraphKernelNodeSetAttribute_traced(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr,
                                                         const cudaKernelNodeAttrValue* value) {
   const int id = enum_value(attr);
   const int cc = current_cc_major();
@@ -8893,7 +9057,11 @@ VGPU_EXPORT cudaError_t cudaGraphKernelNodeSetAttribute(cudaGraphNode_t hNode, c
   std::memcpy(n->attrs[id].data(), value, sizeof *value);
   return cudaSuccess;
 }
-VGPU_EXPORT cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr,
+static cudaError_t cudaGraphKernelNodeGetAttribute_traced(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr, cudaKernelNodeAttrValue* value_out);
+VGPU_EXPORT cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr, cudaKernelNodeAttrValue* value_out) {
+  return traced_call("cudaGraphKernelNodeGetAttribute", cudaGraphKernelNodeGetAttribute_traced, hNode, attr, value_out);
+}
+static cudaError_t cudaGraphKernelNodeGetAttribute_traced(cudaGraphNode_t hNode, cudaKernelNodeAttrID attr,
                                                         cudaKernelNodeAttrValue* value_out) {
   const int id = enum_value(attr);
   const int cc = current_cc_major();
@@ -8911,7 +9079,11 @@ VGPU_EXPORT cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t hNode, c
   else std::memcpy(value_out, it->second.data(), sizeof *value_out);
   return cudaSuccess;
 }
+static cudaError_t cudaGraphKernelNodeCopyAttributes_traced(cudaGraphNode_t hDst, cudaGraphNode_t hSrc);
 VGPU_EXPORT cudaError_t cudaGraphKernelNodeCopyAttributes(cudaGraphNode_t hDst, cudaGraphNode_t hSrc) {
+  return traced_call("cudaGraphKernelNodeCopyAttributes", cudaGraphKernelNodeCopyAttributes_traced, hDst, hSrc);
+}
+static cudaError_t cudaGraphKernelNodeCopyAttributes_traced(cudaGraphNode_t hDst, cudaGraphNode_t hSrc) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* dst = reinterpret_cast<GraphNodeRec*>(hDst);
   auto* src = reinterpret_cast<GraphNodeRec*>(hSrc);
@@ -9183,6 +9355,60 @@ VGPU_EXPORT cudaError_t cudaGraphAddHostNode(cudaGraphNode_t* pNode, cudaGraph_t
   return traced_call("cudaGraphAddHostNode", cudaGraphAddHostNode_traced, pNode, graph, deps, numDeps, params);
 }
 
+// For libcuda: a node of the explicit-graph driver API (cuGraphAddKernelNode, cuGraphAddMemcpyNode,
+// cuGraphAddMemsetNode) is a node of that type whose launch is the closure `op`, which holds the driver's
+// own parameters. `shape` is the launch shape of a kernel node (grid x y z, block x y z, shared bytes), or
+// null. Returns a cudaError_t.
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_add_closure_node_v1(
+    void* graph, int node_type, const void* const* deps, size_t num_deps, const std::function<void()>* op,
+    const unsigned* shape, void** node) {
+  if (!node || !op) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(static_cast<cudaGraph_t>(graph));
+  if (!g) return cudaErrorInvalidValue;
+  std::vector<GraphNodeRec*> pred;
+  if (!deps_ok(*g, reinterpret_cast<const cudaGraphNode_t*>(const_cast<void**>(deps)), num_deps, &pred)) return cudaErrorInvalidValue;
+  RecordedLaunch w;
+  w.kind = RecordedLaunch::Kind::Host;
+  w.host_op = *op;
+  if (shape) {
+    w.grid = dim3(shape[0], shape[1], shape[2]);
+    w.block = dim3(shape[3], shape[4], shape[5]);
+    w.shared = shape[6];
+  }
+  *node = g->add(static_cast<cudaGraphNodeType>(node_type), std::move(w), pred);
+  return cudaSuccess;
+}
+
+// Replaces what a closure node runs (cuGraphKernelNodeSetParams and the like).
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_set_closure_v1(void* node, const std::function<void()>* op,
+                                                                                const unsigned* shape) {
+  if (!node || !op) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto* n = static_cast<GraphNodeRec*>(node);
+  if (!n->work.host_op) return cudaErrorInvalidValue;
+  n->work.host_op = *op;
+  if (shape) {
+    n->work.grid = dim3(shape[0], shape[1], shape[2]);
+    n->work.block = dim3(shape[3], shape[4], shape[5]);
+    n->work.shared = shape[6];
+  }
+  return cudaSuccess;
+}
+
+// The same on an instantiated graph, for the node `node` of the graph it was made from.
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_exec_set_closure_v1(void* exec, void* node,
+                                                                                      const std::function<void()>* op) {
+  if (!exec || !node || !op) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  auto it = g_graph_execs.find(exec);
+  if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+  GraphNodeRec* target = exec_twin(*it->second, static_cast<GraphNodeRec*>(node));
+  if (!target || !target->work.host_op) return cudaErrorInvalidValue;
+  target->work.host_op = *op;
+  return cudaSuccess;
+}
+
 static cudaError_t cudaGraphHostNodeGetParams_traced(cudaGraphNode_t node, cudaHostNodeParams* params) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(node);
@@ -9422,7 +9648,11 @@ static void external_interop_note(const char* api) {
                          "Vulkan, Direct3D or NvSciBuf, which this machine does not have\n", api);
 }
 
-VGPU_EXPORT cudaError_t cudaImportExternalMemory(cudaExternalMemory_t* extMem_out,
+static cudaError_t cudaImportExternalMemory_traced(cudaExternalMemory_t* extMem_out, const cudaExternalMemoryHandleDesc* memHandleDesc);
+VGPU_EXPORT cudaError_t cudaImportExternalMemory(cudaExternalMemory_t* extMem_out, const cudaExternalMemoryHandleDesc* memHandleDesc) {
+  return traced_call("cudaImportExternalMemory", cudaImportExternalMemory_traced, extMem_out, memHandleDesc);
+}
+static cudaError_t cudaImportExternalMemory_traced(cudaExternalMemory_t* extMem_out,
                                                  const cudaExternalMemoryHandleDesc* memHandleDesc) {
   return guard("cudaImportExternalMemory", [&](State&) -> cudaError_t {
     if (!extMem_out || !memHandleDesc || memHandleDesc->size == 0) return cudaErrorInvalidValue;
@@ -9431,14 +9661,22 @@ VGPU_EXPORT cudaError_t cudaImportExternalMemory(cudaExternalMemory_t* extMem_ou
     return cudaErrorNotSupported;
   });
 }
-VGPU_EXPORT cudaError_t cudaExternalMemoryGetMappedBuffer(void** devPtr, cudaExternalMemory_t extMem,
+static cudaError_t cudaExternalMemoryGetMappedBuffer_traced(void** devPtr, cudaExternalMemory_t extMem, const cudaExternalMemoryBufferDesc* bufferDesc);
+VGPU_EXPORT cudaError_t cudaExternalMemoryGetMappedBuffer(void** devPtr, cudaExternalMemory_t extMem, const cudaExternalMemoryBufferDesc* bufferDesc) {
+  return traced_call("cudaExternalMemoryGetMappedBuffer", cudaExternalMemoryGetMappedBuffer_traced, devPtr, extMem, bufferDesc);
+}
+static cudaError_t cudaExternalMemoryGetMappedBuffer_traced(void** devPtr, cudaExternalMemory_t extMem,
                                                           const cudaExternalMemoryBufferDesc* bufferDesc) {
   return guard("cudaExternalMemoryGetMappedBuffer", [&](State&) -> cudaError_t {
     if (!devPtr || !extMem || !bufferDesc) return cudaErrorInvalidValue;
     return cudaErrorInvalidResourceHandle;   // none was imported
   });
 }
-VGPU_EXPORT cudaError_t cudaExternalMemoryGetMappedMipmappedArray(cudaMipmappedArray_t* mipmap,
+static cudaError_t cudaExternalMemoryGetMappedMipmappedArray_traced(cudaMipmappedArray_t* mipmap, cudaExternalMemory_t extMem, const cudaExternalMemoryMipmappedArrayDesc* mipmapDesc);
+VGPU_EXPORT cudaError_t cudaExternalMemoryGetMappedMipmappedArray(cudaMipmappedArray_t* mipmap, cudaExternalMemory_t extMem, const cudaExternalMemoryMipmappedArrayDesc* mipmapDesc) {
+  return traced_call("cudaExternalMemoryGetMappedMipmappedArray", cudaExternalMemoryGetMappedMipmappedArray_traced, mipmap, extMem, mipmapDesc);
+}
+static cudaError_t cudaExternalMemoryGetMappedMipmappedArray_traced(cudaMipmappedArray_t* mipmap,
                                                                   cudaExternalMemory_t extMem,
                                                                   const cudaExternalMemoryMipmappedArrayDesc* mipmapDesc) {
   return guard("cudaExternalMemoryGetMappedMipmappedArray", [&](State&) -> cudaError_t {
@@ -9452,13 +9690,21 @@ VGPU_EXPORT cudaError_t cudaExternalMemoryGetMappedMipmappedArray(cudaMipmappedA
     return cudaErrorInvalidResourceHandle;
   });
 }
+static cudaError_t cudaDestroyExternalMemory_traced(cudaExternalMemory_t extMem);
 VGPU_EXPORT cudaError_t cudaDestroyExternalMemory(cudaExternalMemory_t extMem) {
+  return traced_call("cudaDestroyExternalMemory", cudaDestroyExternalMemory_traced, extMem);
+}
+static cudaError_t cudaDestroyExternalMemory_traced(cudaExternalMemory_t extMem) {
   return guard("cudaDestroyExternalMemory", [&](State&) -> cudaError_t {
     return extMem ? cudaErrorInvalidResourceHandle : cudaErrorInvalidValue;
   });
 }
 
-VGPU_EXPORT cudaError_t cudaImportExternalSemaphore(cudaExternalSemaphore_t* extSem_out,
+static cudaError_t cudaImportExternalSemaphore_traced(cudaExternalSemaphore_t* extSem_out, const cudaExternalSemaphoreHandleDesc* semHandleDesc);
+VGPU_EXPORT cudaError_t cudaImportExternalSemaphore(cudaExternalSemaphore_t* extSem_out, const cudaExternalSemaphoreHandleDesc* semHandleDesc) {
+  return traced_call("cudaImportExternalSemaphore", cudaImportExternalSemaphore_traced, extSem_out, semHandleDesc);
+}
+static cudaError_t cudaImportExternalSemaphore_traced(cudaExternalSemaphore_t* extSem_out,
                                                     const cudaExternalSemaphoreHandleDesc* semHandleDesc) {
   return guard("cudaImportExternalSemaphore", [&](State&) -> cudaError_t {
     if (!extSem_out || !semHandleDesc) return cudaErrorInvalidValue;
@@ -9477,20 +9723,32 @@ static cudaError_t external_semaphores_async(const char* api, const cudaExternal
     return cudaErrorInvalidResourceHandle;   // none was imported
   });
 }
-VGPU_EXPORT cudaError_t cudaSignalExternalSemaphoresAsync(const cudaExternalSemaphore_t* extSemArray,
+static cudaError_t cudaSignalExternalSemaphoresAsync_traced(const cudaExternalSemaphore_t* extSemArray, const cudaExternalSemaphoreSignalParams* paramsArray, unsigned int numExtSems, cudaStream_t stream);
+VGPU_EXPORT cudaError_t cudaSignalExternalSemaphoresAsync(const cudaExternalSemaphore_t* extSemArray, const cudaExternalSemaphoreSignalParams* paramsArray, unsigned int numExtSems, cudaStream_t stream) {
+  return traced_call("cudaSignalExternalSemaphoresAsync", cudaSignalExternalSemaphoresAsync_traced, extSemArray, paramsArray, numExtSems, stream);
+}
+static cudaError_t cudaSignalExternalSemaphoresAsync_traced(const cudaExternalSemaphore_t* extSemArray,
                                                           const cudaExternalSemaphoreSignalParams* paramsArray,
                                                           unsigned int numExtSems, cudaStream_t stream) {
   // On a capturing stream the call would become a node; there is nothing it could name.
   (void)capture_active(stream);
   return external_semaphores_async("cudaSignalExternalSemaphoresAsync", extSemArray, paramsArray, numExtSems, stream);
 }
-VGPU_EXPORT cudaError_t cudaWaitExternalSemaphoresAsync(const cudaExternalSemaphore_t* extSemArray,
+static cudaError_t cudaWaitExternalSemaphoresAsync_traced(const cudaExternalSemaphore_t* extSemArray, const cudaExternalSemaphoreWaitParams* paramsArray, unsigned int numExtSems, cudaStream_t stream);
+VGPU_EXPORT cudaError_t cudaWaitExternalSemaphoresAsync(const cudaExternalSemaphore_t* extSemArray, const cudaExternalSemaphoreWaitParams* paramsArray, unsigned int numExtSems, cudaStream_t stream) {
+  return traced_call("cudaWaitExternalSemaphoresAsync", cudaWaitExternalSemaphoresAsync_traced, extSemArray, paramsArray, numExtSems, stream);
+}
+static cudaError_t cudaWaitExternalSemaphoresAsync_traced(const cudaExternalSemaphore_t* extSemArray,
                                                         const cudaExternalSemaphoreWaitParams* paramsArray,
                                                         unsigned int numExtSems, cudaStream_t stream) {
   (void)capture_active(stream);
   return external_semaphores_async("cudaWaitExternalSemaphoresAsync", extSemArray, paramsArray, numExtSems, stream);
 }
+static cudaError_t cudaDestroyExternalSemaphore_traced(cudaExternalSemaphore_t extSem);
 VGPU_EXPORT cudaError_t cudaDestroyExternalSemaphore(cudaExternalSemaphore_t extSem) {
+  return traced_call("cudaDestroyExternalSemaphore", cudaDestroyExternalSemaphore_traced, extSem);
+}
+static cudaError_t cudaDestroyExternalSemaphore_traced(cudaExternalSemaphore_t extSem) {
   return guard("cudaDestroyExternalSemaphore", [&](State&) -> cudaError_t {
     return extSem ? cudaErrorInvalidResourceHandle : cudaErrorInvalidValue;
   });
@@ -9498,7 +9756,11 @@ VGPU_EXPORT cudaError_t cudaDestroyExternalSemaphore(cudaExternalSemaphore_t ext
 
 // GPUDirect RDMA is not there (cudaDevAttrGPUDirectRDMASupported is 0), which the card answers with
 // cudaErrorNotSupported.
-VGPU_EXPORT cudaError_t cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTarget target,
+static cudaError_t cudaDeviceFlushGPUDirectRDMAWrites_traced(cudaFlushGPUDirectRDMAWritesTarget target, cudaFlushGPUDirectRDMAWritesScope scope);
+VGPU_EXPORT cudaError_t cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTarget target, cudaFlushGPUDirectRDMAWritesScope scope) {
+  return traced_call("cudaDeviceFlushGPUDirectRDMAWrites", cudaDeviceFlushGPUDirectRDMAWrites_traced, target, scope);
+}
+static cudaError_t cudaDeviceFlushGPUDirectRDMAWrites_traced(cudaFlushGPUDirectRDMAWritesTarget target,
                                                            cudaFlushGPUDirectRDMAWritesScope scope) {
   (void)target; (void)scope;
   return guard("cudaDeviceFlushGPUDirectRDMAWrites", [&](State&) -> cudaError_t { return cudaErrorNotSupported; });
@@ -9543,31 +9805,51 @@ cudaError_t set_ext_sem_node(cudaGraphNodeType type, GraphNodeRec* n, const Node
   return cudaSuccess;
 }
 }  // namespace
-VGPU_EXPORT cudaError_t cudaGraphAddExternalSemaphoresSignalNode(cudaGraphNode_t* pGraphNode, cudaGraph_t graph,
+static cudaError_t cudaGraphAddExternalSemaphoresSignalNode_traced(cudaGraphNode_t* pGraphNode, cudaGraph_t graph, const cudaGraphNode_t* pDependencies, size_t numDependencies, const cudaExternalSemaphoreSignalNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphAddExternalSemaphoresSignalNode(cudaGraphNode_t* pGraphNode, cudaGraph_t graph, const cudaGraphNode_t* pDependencies, size_t numDependencies, const cudaExternalSemaphoreSignalNodeParams* nodeParams) {
+  return traced_call("cudaGraphAddExternalSemaphoresSignalNode", cudaGraphAddExternalSemaphoresSignalNode_traced, pGraphNode, graph, pDependencies, numDependencies, nodeParams);
+}
+static cudaError_t cudaGraphAddExternalSemaphoresSignalNode_traced(cudaGraphNode_t* pGraphNode, cudaGraph_t graph,
                                                                  const cudaGraphNode_t* pDependencies,
                                                                  size_t numDependencies,
                                                                  const cudaExternalSemaphoreSignalNodeParams* nodeParams) {
   return add_ext_sem_node<cudaExternalSemaphoreSignalNodeParams, cudaExternalSemaphoreSignalParams>(
       cudaGraphNodeTypeExtSemaphoreSignal, pGraphNode, graph, pDependencies, numDependencies, nodeParams);
 }
-VGPU_EXPORT cudaError_t cudaGraphAddExternalSemaphoresWaitNode(cudaGraphNode_t* pGraphNode, cudaGraph_t graph,
+static cudaError_t cudaGraphAddExternalSemaphoresWaitNode_traced(cudaGraphNode_t* pGraphNode, cudaGraph_t graph, const cudaGraphNode_t* pDependencies, size_t numDependencies, const cudaExternalSemaphoreWaitNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphAddExternalSemaphoresWaitNode(cudaGraphNode_t* pGraphNode, cudaGraph_t graph, const cudaGraphNode_t* pDependencies, size_t numDependencies, const cudaExternalSemaphoreWaitNodeParams* nodeParams) {
+  return traced_call("cudaGraphAddExternalSemaphoresWaitNode", cudaGraphAddExternalSemaphoresWaitNode_traced, pGraphNode, graph, pDependencies, numDependencies, nodeParams);
+}
+static cudaError_t cudaGraphAddExternalSemaphoresWaitNode_traced(cudaGraphNode_t* pGraphNode, cudaGraph_t graph,
                                                                const cudaGraphNode_t* pDependencies,
                                                                size_t numDependencies,
                                                                const cudaExternalSemaphoreWaitNodeParams* nodeParams) {
   return add_ext_sem_node<cudaExternalSemaphoreWaitNodeParams, cudaExternalSemaphoreWaitParams>(
       cudaGraphNodeTypeExtSemaphoreWait, pGraphNode, graph, pDependencies, numDependencies, nodeParams);
 }
-VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresSignalNodeGetParams(cudaGraphNode_t hNode,
+static cudaError_t cudaGraphExternalSemaphoresSignalNodeGetParams_traced(cudaGraphNode_t hNode, cudaExternalSemaphoreSignalNodeParams* params_out);
+VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresSignalNodeGetParams(cudaGraphNode_t hNode, cudaExternalSemaphoreSignalNodeParams* params_out) {
+  return traced_call("cudaGraphExternalSemaphoresSignalNodeGetParams", cudaGraphExternalSemaphoresSignalNodeGetParams_traced, hNode, params_out);
+}
+static cudaError_t cudaGraphExternalSemaphoresSignalNodeGetParams_traced(cudaGraphNode_t hNode,
                                                                        cudaExternalSemaphoreSignalNodeParams* params_out) {
   return get_ext_sem_node<cudaExternalSemaphoreSignalNodeParams, cudaExternalSemaphoreSignalParams>(
       cudaGraphNodeTypeExtSemaphoreSignal, hNode, params_out);
 }
-VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresWaitNodeGetParams(cudaGraphNode_t hNode,
+static cudaError_t cudaGraphExternalSemaphoresWaitNodeGetParams_traced(cudaGraphNode_t hNode, cudaExternalSemaphoreWaitNodeParams* params_out);
+VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresWaitNodeGetParams(cudaGraphNode_t hNode, cudaExternalSemaphoreWaitNodeParams* params_out) {
+  return traced_call("cudaGraphExternalSemaphoresWaitNodeGetParams", cudaGraphExternalSemaphoresWaitNodeGetParams_traced, hNode, params_out);
+}
+static cudaError_t cudaGraphExternalSemaphoresWaitNodeGetParams_traced(cudaGraphNode_t hNode,
                                                                      cudaExternalSemaphoreWaitNodeParams* params_out) {
   return get_ext_sem_node<cudaExternalSemaphoreWaitNodeParams, cudaExternalSemaphoreWaitParams>(
       cudaGraphNodeTypeExtSemaphoreWait, hNode, params_out);
 }
-VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresSignalNodeSetParams(cudaGraphNode_t hNode,
+static cudaError_t cudaGraphExternalSemaphoresSignalNodeSetParams_traced(cudaGraphNode_t hNode, const cudaExternalSemaphoreSignalNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresSignalNodeSetParams(cudaGraphNode_t hNode, const cudaExternalSemaphoreSignalNodeParams* nodeParams) {
+  return traced_call("cudaGraphExternalSemaphoresSignalNodeSetParams", cudaGraphExternalSemaphoresSignalNodeSetParams_traced, hNode, nodeParams);
+}
+static cudaError_t cudaGraphExternalSemaphoresSignalNodeSetParams_traced(cudaGraphNode_t hNode,
                                                                        const cudaExternalSemaphoreSignalNodeParams* nodeParams) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(hNode);
@@ -9575,7 +9857,11 @@ VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresSignalNodeSetParams(cudaGraph
   return set_ext_sem_node<cudaExternalSemaphoreSignalNodeParams, cudaExternalSemaphoreSignalParams>(
       cudaGraphNodeTypeExtSemaphoreSignal, n, nodeParams);
 }
-VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresWaitNodeSetParams(cudaGraphNode_t hNode,
+static cudaError_t cudaGraphExternalSemaphoresWaitNodeSetParams_traced(cudaGraphNode_t hNode, const cudaExternalSemaphoreWaitNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresWaitNodeSetParams(cudaGraphNode_t hNode, const cudaExternalSemaphoreWaitNodeParams* nodeParams) {
+  return traced_call("cudaGraphExternalSemaphoresWaitNodeSetParams", cudaGraphExternalSemaphoresWaitNodeSetParams_traced, hNode, nodeParams);
+}
+static cudaError_t cudaGraphExternalSemaphoresWaitNodeSetParams_traced(cudaGraphNode_t hNode,
                                                                      const cudaExternalSemaphoreWaitNodeParams* nodeParams) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto* n = reinterpret_cast<GraphNodeRec*>(hNode);
@@ -9583,7 +9869,11 @@ VGPU_EXPORT cudaError_t cudaGraphExternalSemaphoresWaitNodeSetParams(cudaGraphNo
   return set_ext_sem_node<cudaExternalSemaphoreWaitNodeParams, cudaExternalSemaphoreWaitParams>(
       cudaGraphNodeTypeExtSemaphoreWait, n, nodeParams);
 }
-VGPU_EXPORT cudaError_t cudaGraphExecExternalSemaphoresSignalNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node,
+static cudaError_t cudaGraphExecExternalSemaphoresSignalNodeSetParams_traced(cudaGraphExec_t exec, cudaGraphNode_t node, const cudaExternalSemaphoreSignalNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphExecExternalSemaphoresSignalNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node, const cudaExternalSemaphoreSignalNodeParams* nodeParams) {
+  return traced_call("cudaGraphExecExternalSemaphoresSignalNodeSetParams", cudaGraphExecExternalSemaphoresSignalNodeSetParams_traced, exec, node, nodeParams);
+}
+static cudaError_t cudaGraphExecExternalSemaphoresSignalNodeSetParams_traced(cudaGraphExec_t exec, cudaGraphNode_t node,
                                                                            const cudaExternalSemaphoreSignalNodeParams* nodeParams) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_graph_execs.find(static_cast<void*>(exec));
@@ -9592,7 +9882,11 @@ VGPU_EXPORT cudaError_t cudaGraphExecExternalSemaphoresSignalNodeSetParams(cudaG
   return set_ext_sem_node<cudaExternalSemaphoreSignalNodeParams, cudaExternalSemaphoreSignalParams>(
       cudaGraphNodeTypeExtSemaphoreSignal, exec_twin(*it->second, original), nodeParams);
 }
-VGPU_EXPORT cudaError_t cudaGraphExecExternalSemaphoresWaitNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node,
+static cudaError_t cudaGraphExecExternalSemaphoresWaitNodeSetParams_traced(cudaGraphExec_t exec, cudaGraphNode_t node, const cudaExternalSemaphoreWaitNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphExecExternalSemaphoresWaitNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node, const cudaExternalSemaphoreWaitNodeParams* nodeParams) {
+  return traced_call("cudaGraphExecExternalSemaphoresWaitNodeSetParams", cudaGraphExecExternalSemaphoresWaitNodeSetParams_traced, exec, node, nodeParams);
+}
+static cudaError_t cudaGraphExecExternalSemaphoresWaitNodeSetParams_traced(cudaGraphExec_t exec, cudaGraphNode_t node,
                                                                          const cudaExternalSemaphoreWaitNodeParams* nodeParams) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   auto it = g_graph_execs.find(static_cast<void*>(exec));
@@ -9940,6 +10234,13 @@ bool capture_event_node(cudaStream_t stream, bool record, cudaEvent_t e, unsigne
   return true;
 }
 
+bool capture_id_alive(unsigned long long id) {
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  for (auto& [origin, c] : g_captures)
+    if (c->id == id) return true;
+  return false;
+}
+
 cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long id,
                          const std::vector<void*>& deps) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
@@ -9961,7 +10262,7 @@ cudaError_t capture_wait(cudaStream_t stream, bool captured, unsigned long long 
   Capture* cap = nullptr;
   for (auto& [origin, c] : g_captures)
     if (c->id == id) cap = c.get();
-  if (!cap) return cudaErrorCapturedEvent;   // the capture it was recorded in has ended
+  if (!cap) return cudaErrorInvalidValue;   // the capture it was recorded in has ended (measured: not CapturedEvent)
   std::vector<GraphNodeRec*> pos;
   for (void* d : deps)
     if (auto* n = static_cast<GraphNodeRec*>(d); cap->graph->holds(n)) pos.push_back(n);
@@ -10180,7 +10481,11 @@ static cudaError_t cudaStreamUpdateCaptureDependencies_traced(cudaStream_t strea
   return update_capture_deps(stream, dependencies, nullptr, numDependencies, flags);
 }
 #if CUDART_VERSION >= 12030
-VGPU_EXPORT cudaError_t cudaStreamGetCaptureInfo_v3(cudaStream_t stream,
+static cudaError_t cudaStreamGetCaptureInfo_v3_traced(cudaStream_t stream, cudaStreamCaptureStatus* status, unsigned long long* id, cudaGraph_t* graph, const cudaGraphNode_t** deps, const cudaGraphEdgeData** edgeData, size_t* numDeps);
+VGPU_EXPORT cudaError_t cudaStreamGetCaptureInfo_v3(cudaStream_t stream, cudaStreamCaptureStatus* status, unsigned long long* id, cudaGraph_t* graph, const cudaGraphNode_t** deps, const cudaGraphEdgeData** edgeData, size_t* numDeps) {
+  return traced_call("cudaStreamGetCaptureInfo_v3", cudaStreamGetCaptureInfo_v3_traced, stream, status, id, graph, deps, edgeData, numDeps);
+}
+static cudaError_t cudaStreamGetCaptureInfo_v3_traced(cudaStream_t stream,
                                                     cudaStreamCaptureStatus* status,
                                                     unsigned long long* id, cudaGraph_t* graph,
                                                     const cudaGraphNode_t** deps,
@@ -10188,7 +10493,11 @@ VGPU_EXPORT cudaError_t cudaStreamGetCaptureInfo_v3(cudaStream_t stream,
                                                     size_t* numDeps) {
   return capture_info(stream, status, id, graph, deps, edgeData, numDeps);
 }
-VGPU_EXPORT cudaError_t cudaStreamUpdateCaptureDependencies_v2(cudaStream_t stream,
+static cudaError_t cudaStreamUpdateCaptureDependencies_v2_traced(cudaStream_t stream, cudaGraphNode_t* dependencies, const cudaGraphEdgeData* dependencyData, size_t numDependencies, unsigned int flags);
+VGPU_EXPORT cudaError_t cudaStreamUpdateCaptureDependencies_v2(cudaStream_t stream, cudaGraphNode_t* dependencies, const cudaGraphEdgeData* dependencyData, size_t numDependencies, unsigned int flags) {
+  return traced_call("cudaStreamUpdateCaptureDependencies_v2", cudaStreamUpdateCaptureDependencies_v2_traced, stream, dependencies, dependencyData, numDependencies, flags);
+}
+static cudaError_t cudaStreamUpdateCaptureDependencies_v2_traced(cudaStream_t stream,
                                                                cudaGraphNode_t* dependencies,
                                                                const cudaGraphEdgeData* dependencyData,
                                                                size_t numDependencies,
@@ -10274,26 +10583,46 @@ static cudaError_t cudaGraphNodeGetDependentNodes_traced(cudaGraphNode_t node, c
 }
 #if CUDART_VERSION >= 12030
 // CUDA 12.3 to 12.9 name the edge-data forms with a _v2; CUDA 13 gave them the plain names.
-VGPU_EXPORT cudaError_t cudaGraphAddDependencies_v2(cudaGraph_t graph, const cudaGraphNode_t* from,
+static cudaError_t cudaGraphAddDependencies_v2_traced(cudaGraph_t graph, const cudaGraphNode_t* from, const cudaGraphNode_t* to, const cudaGraphEdgeData* edgeData, size_t numDeps);
+VGPU_EXPORT cudaError_t cudaGraphAddDependencies_v2(cudaGraph_t graph, const cudaGraphNode_t* from, const cudaGraphNode_t* to, const cudaGraphEdgeData* edgeData, size_t numDeps) {
+  return traced_call("cudaGraphAddDependencies_v2", cudaGraphAddDependencies_v2_traced, graph, from, to, edgeData, numDeps);
+}
+static cudaError_t cudaGraphAddDependencies_v2_traced(cudaGraph_t graph, const cudaGraphNode_t* from,
                                                    const cudaGraphNode_t* to,
                                                    const cudaGraphEdgeData* edgeData, size_t numDeps) {
   return graph_add_deps(graph, from, to, edgeData, numDeps);
 }
-VGPU_EXPORT cudaError_t cudaGraphRemoveDependencies_v2(cudaGraph_t graph, const cudaGraphNode_t* from,
+static cudaError_t cudaGraphRemoveDependencies_v2_traced(cudaGraph_t graph, const cudaGraphNode_t* from, const cudaGraphNode_t* to, const cudaGraphEdgeData* edgeData, size_t numDeps);
+VGPU_EXPORT cudaError_t cudaGraphRemoveDependencies_v2(cudaGraph_t graph, const cudaGraphNode_t* from, const cudaGraphNode_t* to, const cudaGraphEdgeData* edgeData, size_t numDeps) {
+  return traced_call("cudaGraphRemoveDependencies_v2", cudaGraphRemoveDependencies_v2_traced, graph, from, to, edgeData, numDeps);
+}
+static cudaError_t cudaGraphRemoveDependencies_v2_traced(cudaGraph_t graph, const cudaGraphNode_t* from,
                                                       const cudaGraphNode_t* to,
                                                       const cudaGraphEdgeData* edgeData, size_t numDeps) {
   (void)edgeData;
   return graph_remove_deps(graph, from, to, numDeps);
 }
-VGPU_EXPORT cudaError_t cudaGraphGetEdges_v2(cudaGraph_t graph, cudaGraphNode_t* from, cudaGraphNode_t* to,
+static cudaError_t cudaGraphGetEdges_v2_traced(cudaGraph_t graph, cudaGraphNode_t* from, cudaGraphNode_t* to, cudaGraphEdgeData* edgeData, size_t* numEdges);
+VGPU_EXPORT cudaError_t cudaGraphGetEdges_v2(cudaGraph_t graph, cudaGraphNode_t* from, cudaGraphNode_t* to, cudaGraphEdgeData* edgeData, size_t* numEdges) {
+  return traced_call("cudaGraphGetEdges_v2", cudaGraphGetEdges_v2_traced, graph, from, to, edgeData, numEdges);
+}
+static cudaError_t cudaGraphGetEdges_v2_traced(cudaGraph_t graph, cudaGraphNode_t* from, cudaGraphNode_t* to,
                                             cudaGraphEdgeData* edgeData, size_t* numEdges) {
   return graph_get_edges(graph, from, to, edgeData, numEdges);
 }
-VGPU_EXPORT cudaError_t cudaGraphNodeGetDependencies_v2(cudaGraphNode_t node, cudaGraphNode_t* deps,
+static cudaError_t cudaGraphNodeGetDependencies_v2_traced(cudaGraphNode_t node, cudaGraphNode_t* deps, cudaGraphEdgeData* edgeData, size_t* numDeps);
+VGPU_EXPORT cudaError_t cudaGraphNodeGetDependencies_v2(cudaGraphNode_t node, cudaGraphNode_t* deps, cudaGraphEdgeData* edgeData, size_t* numDeps) {
+  return traced_call("cudaGraphNodeGetDependencies_v2", cudaGraphNodeGetDependencies_v2_traced, node, deps, edgeData, numDeps);
+}
+static cudaError_t cudaGraphNodeGetDependencies_v2_traced(cudaGraphNode_t node, cudaGraphNode_t* deps,
                                                        cudaGraphEdgeData* edgeData, size_t* numDeps) {
   return node_get_deps(node, deps, edgeData, numDeps);
 }
-VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes_v2(cudaGraphNode_t node, cudaGraphNode_t* dependent,
+static cudaError_t cudaGraphNodeGetDependentNodes_v2_traced(cudaGraphNode_t node, cudaGraphNode_t* dependent, cudaGraphEdgeData* edgeData, size_t* numDependentNodes);
+VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes_v2(cudaGraphNode_t node, cudaGraphNode_t* dependent, cudaGraphEdgeData* edgeData, size_t* numDependentNodes) {
+  return traced_call("cudaGraphNodeGetDependentNodes_v2", cudaGraphNodeGetDependentNodes_v2_traced, node, dependent, edgeData, numDependentNodes);
+}
+static cudaError_t cudaGraphNodeGetDependentNodes_v2_traced(cudaGraphNode_t node, cudaGraphNode_t* dependent,
                                                          cudaGraphEdgeData* edgeData, size_t* numDependentNodes) {
   return node_get_dependents(node, dependent, edgeData, numDependentNodes);
 }
@@ -10427,7 +10756,15 @@ static cudaError_t graph_add_node_impl(cudaGraphNode_t* pNode, cudaGraph_t graph
       return cudaGraphAddKernelNode(pNode, graph, deps, numDeps, &k);
     }
     case cudaGraphNodeTypeMemcpy:
-      if (p->memcpy.flags || p->memcpy.reserved[0] || p->memcpy.reserved[1] || p->memcpy.reserved[2])
+      // `reserved` is int[3] up to CUDA 13.0 and a single int (beside a context handle) in 13.2.
+      if (p->memcpy.flags || [](const auto& m) {
+            if constexpr (std::is_array_v<std::remove_reference_t<decltype(m.reserved)>>) {
+              for (int v : m.reserved) if (v) return true;
+              return false;
+            } else {
+              return m.reserved != 0;
+            }
+          }(p->memcpy))
         return cudaErrorInvalidValue;
       return cudaGraphAddMemcpyNode(pNode, graph, deps, numDeps, &p->memcpy.copyParams);
     case cudaGraphNodeTypeMemset: {
@@ -10503,7 +10840,11 @@ static cudaError_t cudaGraphAddNode_traced(cudaGraphNode_t* pNode, cudaGraph_t g
   return graph_add_node(pNode, graph, deps, nullptr, numDeps, nodeParams);
 }
 #if CUDART_VERSION >= 12030
-VGPU_EXPORT cudaError_t cudaGraphAddNode_v2(cudaGraphNode_t* pNode, cudaGraph_t graph, const cudaGraphNode_t* deps,
+static cudaError_t cudaGraphAddNode_v2_traced(cudaGraphNode_t* pNode, cudaGraph_t graph, const cudaGraphNode_t* deps, const cudaGraphEdgeData* edgeData, size_t numDeps, cudaGraphNodeParams* nodeParams);
+VGPU_EXPORT cudaError_t cudaGraphAddNode_v2(cudaGraphNode_t* pNode, cudaGraph_t graph, const cudaGraphNode_t* deps, const cudaGraphEdgeData* edgeData, size_t numDeps, cudaGraphNodeParams* nodeParams) {
+  return traced_call("cudaGraphAddNode_v2", cudaGraphAddNode_v2_traced, pNode, graph, deps, edgeData, numDeps, nodeParams);
+}
+static cudaError_t cudaGraphAddNode_v2_traced(cudaGraphNode_t* pNode, cudaGraph_t graph, const cudaGraphNode_t* deps,
                                            const cudaGraphEdgeData* edgeData, size_t numDeps,
                                            cudaGraphNodeParams* nodeParams) {
   return graph_add_node(pNode, graph, deps, edgeData, numDeps, nodeParams);
@@ -10707,6 +11048,8 @@ static cudaError_t cudaGraphDestroy_traced(cudaGraph_t graph) {
   if (g_borrowed_graphs.count(static_cast<void*>(graph)) &&
       !g_graphs.count(static_cast<void*>(graph)))
     return cudaErrorInvalidValue;
+  // A graph already destroyed, or never made, is not one (an RTX 3060: cudaErrorInvalidValue).
+  if (!graph_from(graph) && !g_borrowed_graphs.count(static_cast<void*>(graph))) return cudaErrorInvalidValue;
   // Nor a graph a capture is adding to (cudaStreamBeginCaptureToGraph): an RTX
   // 3060 answers cudaErrorIllegalState until the capture ends.
   for (const auto& [origin, cap] : g_captures)
@@ -10826,6 +11169,7 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
     }
   }
   g_exec_auto_free.erase(static_cast<void*>(exec));
+  g_exec_flags.erase(static_cast<void*>(exec));
   g_device_graphs.erase(static_cast<void*>(exec));
   lock.unlock();
   user_objects_release_all(std::move(held));
@@ -10835,6 +11179,32 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   return traced_call("cudaGraphExecDestroy", cudaGraphExecDestroy_traced, exec);
 }
+// The flags the executable graph was instantiated with.
+static cudaError_t cudaGraphExecGetFlags_traced(cudaGraphExec_t exec, unsigned long long* flags) {
+  if (!flags) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto it = g_exec_flags.find(static_cast<void*>(exec));
+  if (it == g_exec_flags.end()) return cudaErrorInvalidValue;
+  *flags = it->second;
+  return cudaSuccess;
+}
+
+VGPU_EXPORT cudaError_t cudaGraphExecGetFlags(cudaGraphExec_t exec, unsigned long long* flags) {
+  return traced_call("cudaGraphExecGetFlags", cudaGraphExecGetFlags_traced, exec, flags);
+}
+#if CUDART_VERSION < 13000
+// Deprecated (CUDA 7.5) and removed from CUDA 13's headers: on a device with double precision they do nothing.
+// Measured with libcudart.so.12 (12.8) on an RTX 3060: both return cudaSuccess and leave the value alone,
+// a null pointer included.
+static cudaError_t cudaSetDoubleForDevice_traced(double*) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaSetDoubleForDevice(double* d) {
+  return traced_call("cudaSetDoubleForDevice", cudaSetDoubleForDevice_traced, d);
+}
+static cudaError_t cudaSetDoubleForHost_traced(double*) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaSetDoubleForHost(double* d) {
+  return traced_call("cudaSetDoubleForHost", cudaSetDoubleForHost_traced, d);
+}
+#endif
 // What a library asks before it adds work to a stream that might be capturing:
 // whether it is, which capture, the graph being built, and the nodes the next
 // operation will depend on. With the graph and the dependencies a library can
@@ -10927,6 +11297,9 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCap
   return traced_call("cudaStreamIsCapturing", cudaStreamIsCapturing_traced, stream, status);
 }
 
+// The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
+#include "runtime_sweep.inc"
+
 /* ===================================================================== */
 /* Per-thread default stream                                             */
 /* ===================================================================== */
@@ -11002,8 +11375,47 @@ VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
 VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
 VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
 VGPU_PT_ALIAS(cudaGraphInstantiateWithParams_ptsz, cudaGraphInstantiateWithParams)
+#if CUDART_VERSION >= 12050
+VGPU_PT_ALIAS(cudaGetDriverEntryPointByVersion_ptsz, cudaGetDriverEntryPointByVersion)
+#endif
+VGPU_PT_ALIAS(cudaGetDriverEntryPoint_ptsz, cudaGetDriverEntryPoint)
+// CUDA 12's headers spell these two with a _v2 (the plain name is the v1 parameter structure), and the shim's
+// definitions are named by that macro, so the alias names the _v2 form there.
+#if CUDART_VERSION >= 13000
+VGPU_PT_ALIAS(cudaSignalExternalSemaphoresAsync_ptsz, cudaSignalExternalSemaphoresAsync)
+#else
+VGPU_PT_ALIAS(cudaSignalExternalSemaphoresAsync_v2_ptsz, cudaSignalExternalSemaphoresAsync_v2)
+#endif
+#if CUDART_VERSION >= 13000
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_ptsz, cudaStreamGetCaptureInfo)
+#endif
+VGPU_PT_ALIAS(cudaStreamGetDevice_ptsz, cudaStreamGetDevice)
+#if CUDART_VERSION >= 13000
+VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_ptsz, cudaWaitExternalSemaphoresAsync)
+#else
+VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_v2_ptsz, cudaWaitExternalSemaphoresAsync_v2)
+#endif
 #if CUDART_VERSION >= 12030
 VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
+#endif
+// CUDA 12.2 to 12.9 spell the location-taking prefetch and the capture queries with edge data under _v2 / _v3
+// names (CUDA 13 gave them the plain names, aliased above), and a program built with the per-thread default stream
+// calls their _ptsz forms.
+#if CUDART_VERSION >= 12020 && CUDART_VERSION < 13000
+VGPU_PT_ALIAS(cudaMemPrefetchAsync_v2_ptsz, cudaMemPrefetchAsync_v2)
+#endif
+#if CUDART_VERSION >= 12030 && CUDART_VERSION < 13000
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_v3_ptsz, cudaStreamGetCaptureInfo_v3)
+VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_v2_ptsz, cudaStreamUpdateCaptureDependencies_v2)
+#endif
+#if CUDART_VERSION >= 12080
+VGPU_PT_ALIAS(cudaMemcpyBatchAsync_ptsz, cudaMemcpyBatchAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DBatchAsync_ptsz, cudaMemcpy3DBatchAsync)
+#endif
+#if CUDART_VERSION >= 13000
+VGPU_PT_ALIAS(cudaMemPrefetchBatchAsync_ptsz, cudaMemPrefetchBatchAsync)
+VGPU_PT_ALIAS(cudaMemDiscardBatchAsync_ptsz, cudaMemDiscardBatchAsync)
+VGPU_PT_ALIAS(cudaMemDiscardAndPrefetchBatchAsync_ptsz, cudaMemDiscardAndPrefetchBatchAsync)
 #endif
 #undef VGPU_PT_ALIAS
 #if defined(__GNUC__) && !defined(__clang__)

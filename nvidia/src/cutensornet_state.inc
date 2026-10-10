@@ -263,6 +263,8 @@ const void* vacuum_vector(const State& s, int64_t d) {
 struct NetBuild {
   Network net;
   std::vector<const void*> data;
+  std::vector<int> owner;  // the operator (index in the state's list) a gate's tensor belongs to; -1: none
+  int cur_owner = -1;
   int32_t next_label = 0;
   std::vector<std::unique_ptr<DevBuf>> temps;
   bool dry = false;  // preparing: shapes only, no tensors are made
@@ -277,6 +279,7 @@ struct NetBuild {
     t.q.isConjugate = conj ? 1 : 0;
     net.in.push_back(std::move(t));
     data.push_back(ptr);
+    owner.push_back(cur_owner);
   }
   // A tensor made here, owned until the network is dropped.
   const void* make(cudaDataType_t type, const std::vector<cd>& v) {
@@ -457,7 +460,11 @@ Status emit_op(NetBuild& b, const State& s, const Op& op, size_t idx, Circ& c, S
     for (size_t j = 0; j < op.modes.size(); ++j) side.wire[(size_t)op.modes[j]] = out[j];
   };
   switch (op.kind) {
-    case OP_GATE: gate(op.tensors[0], cj, op.adjoint); break;
+    case OP_GATE:
+      b.cur_owner = (int)idx;
+      gate(op.tensors[0], cj, op.adjoint);
+      b.cur_owner = -1;
+      break;
     case OP_DIAG: {
       std::vector<int32_t> w;
       for (int32_t m : op.modes) w.push_back(side.wire[(size_t)m]);
@@ -656,12 +663,15 @@ struct Part {
 };
 
 // The path and slicing of the network within `limit` bytes of scratch.
-Status plan_part(NetBuild& b, uint64_t limit, Part& part, const char* api) {
+Status plan_part(Handle* h, NetBuild& b, uint64_t limit, Part& part, const char* api) {
   if (b.net.in.empty()) return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "an empty network");
   const auto ext = extent_map(b.net);
   Path p;
   p.steps = greedy_path(b.net, ext);
-  if (!choose_slicing(b.net, p, limit, 1))
+  // Distributed: at least a slice for each rank (as the optimizer of the network API).
+  World world;
+  if (Status st = world_of(h, world, api)) return st;
+  if (!choose_slicing(b.net, p, limit, std::max<int32_t>(1, world.size)))
     return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Max device workspace size is less than minimally required!");
   Info info;
   describe(b.net, p, info);
@@ -672,15 +682,27 @@ Status plan_part(NetBuild& b, uint64_t limit, Part& part, const char* api) {
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
-// Contracts the planned network into `out`.
+// Contracts the planned network into `out`. With a communicator, the
+// computations of values (amplitudes, marginals, expectation values and the
+// norms) deal the slices to the ranks and sum their outputs in place
+// (Dist::Sum, measured on NVIDIA's library: one in-place sum for each output
+// tensor and for each norm).
+enum class Dist { None, Sum };
+
 Status run_part(Handle* h, NetBuild& b, const Part& part, void* out, const Workspace* w, cudaStream_t stream,
-                const char* api) {
+                const char* api, Dist dist = Dist::None) {
   for (const void* d : b.data)
     if (!d) return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "a tensor of the network has no memory");
   const auto ext = extent_map(b.net);
   const int64_t total = slices_of(part.path, ext);
   std::vector<int64_t> ids((size_t)total);
   std::iota(ids.begin(), ids.end(), (int64_t)0);
+  if (dist != Dist::None) {
+    World world;
+    if (Status st = world_of(h, world, api)) return st;
+    if (world.distributed)
+      return contract_distributed(h, world, b.net, part.path, b.data, out, false, w, nullptr, ids, stream, api);
+  }
   return contract_slices(h, b.net, part.path, b.data, out, false, w, ids, stream, api);
 }
 
@@ -1253,9 +1275,12 @@ cutensornetStatus_t cutensornetStateUpdateTensorOperatorGradient(const cutensorn
   Op* op = nullptr;
   size_t t = 0;
   bool internal = false;
-  if (!gradientData || !find_tensor(*s, tensorId, op, t, internal) || !op->grad)
-    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "no tensor operator with a gradient has this id");
-  op->grad = gradientData;
+  if (!gradientData) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument gradientData may not be nullptr!");
+  // NVIDIA's library aborts the process for an id that names no tensor ("Gate 999 not found!"); this is an error
+  // status. A tensor that was applied without a gradient is accepted and stays without one (measured).
+  if (!find_tensor(*s, tensorId, op, t, internal))
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "no tensor operator has this id");
+  if (op->grad) op->grad = gradientData;
   return CUTENSORNET_STATUS_SUCCESS;
 }
 
@@ -1586,11 +1611,87 @@ int64_t kept_count(const MpsCfg& cfg, const std::vector<double>& S, int64_t limi
   return std::max<int64_t>(keep, 1);
 }
 
+// The same split with the algorithm the state was configured with, by the SVD of cutensornetTensorSVD:
+// U sqrt(S) and sqrt(S) V^H, truncated to the bond limit and the cutoffs. On NVIDIA's library (RTX 3060, 2.14)
+// the state's MPS honours the algorithm:
+//  * gesvdp gives a norm that differs from gesvd's in the seventh digit (its polar decomposition is not exact);
+//    here cuSOLVER's gesvdp is exact, so the MPS of gesvdp equals gesvd's;
+//  * gesvdj with its default settings equals gesvd's; with a tolerance of 0.1 the card's MPS is visibly less
+//    accurate, and with too few sweeps (up to 3 for a tolerance of 1e-14 on 4 x 4 matrices, up to 3 with no tolerance)
+//    StateCompute ends with INTERNAL_ERROR ("SVD kernel 1 has nonzero info"). cuSOLVER's here is exact, takes the
+//    tolerance and sweeps as settings with nothing to tune, and does not do either;
+//  * gesvdr: every attempt (default parameters or any oversampling and iteration count, bond extents 1 to 3) ended
+//    StateCompute with INTERNAL_ERROR, which is what it does here too.
+Status split_matrix_algo(const MpsCfg& cfg, int64_t rows, int64_t cols, const std::vector<cd>& M, int64_t limit,
+                         std::vector<cd>& left, std::vector<cd>& right, int64_t& k, const char* api) {
+  const int64_t full = std::min(rows, cols);
+  const int64_t rank = std::min(full, std::max<int64_t>(limit, 1));
+  SvdConfig sc;
+  sc.abs_cutoff = cfg.abs_cutoff;
+  sc.rel_cutoff = cfg.rel_cutoff;
+  sc.discarded_cutoff = cfg.discarded;
+  sc.normalization = cfg.normalization;
+  sc.partition = CUTENSORNET_TENSOR_SVD_PARTITION_UV_EQUAL;
+  sc.algo = cfg.algo;
+  sc.gesvdj = cutensornetGesvdjParams_t{cfg.gesvdj_tol, cfg.gesvdj_sweeps};
+  sc.gesvdr = cutensornetGesvdrParams_t{cfg.gesvdr_oversampling, cfg.gesvdr_niters};
+  auto internal = [&](const char* why) {
+    fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, why);
+    return fail(CUTENSORNET_STATUS_INTERNAL_ERROR, api, "cuTensorNet internal error");
+  };
+  if (cfg.algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDR) {
+    if (sc.gesvdr.oversampling > 0 && rank + sc.gesvdr.oversampling > full)
+      return internal("For gesvdr, the user-provided oversampling parameter must not exceed the room left in min(m, n)");
+    return internal("Internal error.");
+  }
+  TensorDesc in, ud, vd;
+  in.type = ud.type = vd.type = CUDA_C_64F;
+  in.modes = {0, 1};
+  in.extents = {rows, cols};
+  in.strides = {1, rows};
+  ud.modes = {0, 2};
+  ud.extents = {rows, rank};
+  ud.strides = {1, rows};
+  vd.modes = {2, 1};
+  vd.extents = {rank, cols};
+  vd.strides = {1, rank};
+  DevBuf x, u, v, dev;
+  if (!x.alloc((size_t)(rows * cols) * 16) || !u.alloc((size_t)(rows * rank) * 16) || !v.alloc((size_t)(rank * cols) * 16) ||
+      !upload(x.p, CUDA_C_64F, M))
+    return fail(CUTENSORNET_STATUS_ALLOC_FAILED, api, "no device memory for an SVD");
+  cusolverDnHandle_t sh = solver_of(cfg.h);
+  if (!sh) return fail(CUTENSORNET_STATUS_CUSOLVER_ERROR, api, "cusolverDnCreate failed");
+  Split sp;
+  if (Status st = split_of(in, ud, vd, sp, api)) return st;
+  const SvdNeed need = svd_need(sh, CUDA_C_64F, sp, sc, rank);
+  Workspace tmp;
+  if (need.dev > 0) {
+    if (!dev.alloc((size_t)need.dev)) return fail(CUTENSORNET_STATUS_ALLOC_FAILED, api, "no device memory for an SVD");
+    tmp.ptr[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] = dev.p;
+    tmp.size[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] = need.dev;
+  }
+  int solver_info = 0;
+  SvdInfo info;
+  if (do_svd(cfg.h, in, x.p, ud, u.p, nullptr, vd, v.p, &sc, &info, &tmp, nullptr, api, true, &solver_info))
+    return internal("the SVD failed");
+  if (solver_info != 0) {
+    char why[96];
+    std::snprintf(why, sizeof why, "SVD kernel 1 has nonzero info (%d)", solver_info);
+    return internal(why);
+  }
+  k = ud.extents[1];
+  if (!download(u.p, CUDA_C_64F, (size_t)(rows * k), left) || !download(v.p, CUDA_C_64F, (size_t)(k * cols), right))
+    return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
+  return CUTENSORNET_STATUS_SUCCESS;
+}
+
 // Splits the (rows x cols) matrix M by SVD into U sqrt(S) (rows x k) and
 // sqrt(S) Vh (k x cols), truncated to the bond limit and cutoffs, with the
 // singular values normalized if asked.
 Status split_matrix(const MpsCfg& cfg, int64_t rows, int64_t cols, const std::vector<cd>& M, int64_t limit,
                     std::vector<cd>& left, std::vector<cd>& right, int64_t& k, const char* api) {
+  if (cfg.algo != CUTENSORNET_TENSOR_SVD_ALGO_GESVD)
+    return split_matrix_algo(cfg, rows, cols, M, limit, left, right, k, api);
   std::vector<cd> U, Vh;
   std::vector<double> S;
   if (Status st = host_svd(cfg, rows, cols, M, U, S, Vh, api)) return st;
@@ -2117,6 +2218,17 @@ MpsCfg mps_config(const State& s) {
   c.discarded = s.svd_discarded;
   c.normalization = s.svd_norm;
   c.algo = s.svd_algo;
+  if (c.algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ) {
+    cutensornetGesvdjParams_t p;
+    std::memcpy(&p, s.algo_params, sizeof p);
+    c.gesvdj_tol = p.tol;
+    c.gesvdj_sweeps = p.maxSweeps;
+  } else if (c.algo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDR) {
+    cutensornetGesvdrParams_t p;
+    std::memcpy(&p, s.algo_params, sizeof p);
+    c.gesvdr_oversampling = p.oversampling;
+    c.gesvdr_niters = p.niters;
+  }
   for (int i = 0; i + 1 < s.n; ++i)
     c.maxb.push_back(std::min(s.mps_max_ext[(size_t)i].back(), s.mps_max_ext[(size_t)i + 1].front()));
   return c;
@@ -2397,7 +2509,7 @@ cutensornetStatus_t cutensornetStatePrepare(const cutensornetHandle_t handle, cu
     c.choice.assign(s->ops.size(), 0);
     if (Status st = build_dense_state(*s, true, b, c, api)) return st;
     Part part;
-    if (Status st = plan_part(b, maxWorkspaceSizeDevice, part, api)) return st;
+    if (Status st = plan_part(h, b, maxWorkspaceSizeDevice, part, api)) return st;
     if (Status st = prepare_workspace(w, part.need, maxWorkspaceSizeDevice, api)) return st;
     s->path = part.path;
     s->need = part.need;
@@ -2715,9 +2827,9 @@ cutensornetStatus_t cutensornetAccessorPrepare(const cutensornetHandle_t handle,
   c1.choice.assign(a->s->ops.size(), 0);
   c2.choice = c1.choice;
   if (Status st = build_amplitudes(*a->s, *a, true, b1, c1, api)) return st;
-  if (Status st = plan_part(b1, limit, a->amp, api)) return st;
+  if (Status st = plan_part(handle_of(handle), b1, limit, a->amp, api)) return st;
   if (Status st = build_norm(*a->s, true, b2, c2, api)) return st;
-  if (Status st = plan_part(b2, limit, a->norm, api)) return st;
+  if (Status st = plan_part(handle_of(handle), b2, limit, a->norm, api)) return st;
   const int64_t need = std::max(a->amp.need, a->norm.need) + kExtra;
   if (Status st = prepare_workspace(w, need, maxWorkspaceSizeDevice, api)) return st;
   a->need = need;
@@ -2778,12 +2890,12 @@ cutensornetStatus_t cutensornetAccessorCompute(const cutensornetHandle_t handle,
   Circ c;
   resolve_channels(s, c, s.rng, true);
   if (Status st = build_amplitudes(s, *a, false, b, c, api)) return st;
-  if (Status st = run_part(h, b, a->amp, amplitudesTensor, &sp.rest, cudaStream, api)) return st;
+  if (Status st = run_part(h, b, a->amp, amplitudesTensor, &sp.rest, cudaStream, api, Dist::Sum)) return st;
   if (stateNorm) {
     NetBuild nb;
     Circ nc = c;
     if (Status st = build_norm(s, false, nb, nc, api)) return st;
-    if (Status st = run_part(h, nb, a->norm, sp.scalars, &sp.rest, cudaStream, api)) return st;
+    if (Status st = run_part(h, nb, a->norm, sp.scalars, &sp.rest, cudaStream, api, Dist::Sum)) return st;
     cd v;
     if (!fetch_scalar(sp.scalars, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     put_scalar(stateNorm, s.type, v);
@@ -2886,7 +2998,7 @@ cutensornetStatus_t cutensornetMarginalPrepare(const cutensornetHandle_t handle,
   Circ c;
   c.choice.assign(m->s->ops.size(), 0);
   if (Status st = build_marginal(*m->s, m->open, m->proj, m->diagonal, m->strides, std::vector<const void*>(m->proj.size(), nullptr), true, b, c, api)) return st;
-  if (Status st = plan_part(b, limit, m->part, api)) return st;
+  if (Status st = plan_part(handle_of(handle), b, limit, m->part, api)) return st;
   const int64_t need = m->part.need + kExtra;
   if (Status st = prepare_workspace(w, need, maxWorkspaceSizeDevice, api)) return st;
   m->need = need;
@@ -2943,7 +3055,7 @@ cutensornetStatus_t cutensornetMarginalCompute(const cutensornetHandle_t handle,
   std::vector<const void*> oh;
   for (auto& o : m->onehot) oh.push_back(o->p);
   if (Status st = build_marginal(s, m->open, m->proj, m->diagonal, m->strides, oh, false, b, c, api)) return st;
-  if (Status st = run_part(h, b, m->part, marginalTensor, &sp.rest, cudaStream, api)) return st;
+  if (Status st = run_part(h, b, m->part, marginalTensor, &sp.rest, cudaStream, api, Dist::Sum)) return st;
   cudaStreamSynchronize(cudaStream);
   return CUTENSORNET_STATUS_SUCCESS;
 }
@@ -3070,7 +3182,7 @@ cutensornetStatus_t cutensornetSamplerPrepare(const cutensornetHandle_t handle,
     c.choice.assign(s.ops.size(), 0);
     if (Status st = build_marginal(s, open, proj, true, {}, std::vector<const void*>(proj.size(), nullptr), true, b, c, api))
       return st;
-    if (Status st = plan_part(b, limit, sp->parts[l], api)) return st;
+    if (Status st = plan_part(handle_of(handle), b, limit, sp->parts[l], api)) return st;
     need = std::max(need, sp->parts[l].need);
     flops += sp->parts[l].flops;
     proj.insert(proj.end(), open.begin(), open.end());
@@ -3248,6 +3360,13 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
   if (!w) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid workspace descriptor");
   State& s = *e->s;
   if (s.epoch != e->epoch || e->op->version != e->op_version) return outdated("Expectation value", api);
+  if (handle_of(handle)->has_comm)
+    for (const Op& o : s.ops)
+      if (o.grad) {  // measured: the prepare fails, and the expectation stays unprepared
+        e->prepared = false;
+        return fail(CUTENSORNET_STATUS_NOT_SUPPORTED, api,
+                    "cuTensorNet exception: Not Supported: Gradient computation with a distributed cuTensorNet handle is not supported.");
+      }
   if (e->op->type != s.type)
     return refuse(api, "an operator in another data type than the state's is not read in its own type here");
   if (Status st = check_channels(s, api)) return st;
@@ -3261,7 +3380,7 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
     Circ c;
     c.choice.assign(s.ops.size(), 0);
     if (Status st = build_component(s, e->op->comps[k], true, b, c, api)) return st;
-    if (Status st = plan_part(b, limit, e->parts[k], api)) return st;
+    if (Status st = plan_part(handle_of(handle), b, limit, e->parts[k], api)) return st;
     need = std::max(need, e->parts[k].need);
     flops += e->parts[k].flops;
   }
@@ -3269,7 +3388,7 @@ cutensornetStatus_t cutensornetExpectationPrepare(const cutensornetHandle_t hand
   Circ nc;
   nc.choice.assign(s.ops.size(), 0);
   if (Status st = build_norm(s, true, nb, nc, api)) return st;
-  if (Status st = plan_part(nb, limit, e->norm, api)) return st;
+  if (Status st = plan_part(handle_of(handle), nb, limit, e->norm, api)) return st;
   need = std::max(need, e->norm.need) + extra;
   if (Status st = prepare_workspace(w, need, maxWorkspaceSizeDevice, api)) return st;
   e->need = need;
@@ -3315,22 +3434,43 @@ cutensornetStatus_t cutensornetExpectationCompute(const cutensornetHandle_t hand
   ScratchSplit sp = split_scratch(w, 2 * kExtra);
   Circ c0;
   resolve_channels(s, c0, s.rng, true);
+  // With a communicator and at least as many terms as ranks, rank r contracts the terms c with c % ranks == r
+  // whole, with its own coefficients, and the ranks' sums of terms are summed in place; with fewer terms every term
+  // is contracted by all the ranks, slice by slice, and summed in place on its own (measured on NVIDIA's library
+  // with ranks scaling their coefficients and with 1 to 5 terms on 2 to 4 ranks).
+  World world;
+  if (Status st = world_of(h, world, api)) return st;
+  const size_t nterms = e->op->comps.size();
+  const bool by_term = world.distributed && world.size > 1 && (int64_t)nterms >= world.size;
+  const bool by_slice = world.distributed && world.size > 1 && !by_term;
   cd total = 0;
-  for (size_t k = 0; k < e->op->comps.size(); ++k) {
+  for (size_t k = 0; k < nterms; ++k) {
+    if (by_term && (int64_t)k % world.size != world.rank) continue;
     NetBuild b;
     Circ c = c0;
     if (Status st = build_component(s, e->op->comps[k], false, b, c, api)) return st;
-    if (Status st = run_part(h, b, e->parts[k], sp.scalars, &sp.rest, cudaStream, api)) return st;
+    if (Status st = run_part(h, b, e->parts[k], sp.scalars, &sp.rest, cudaStream, api, by_slice ? Dist::Sum : Dist::None))
+      return st;
     cd v;
     if (!fetch_scalar(sp.scalars, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     total += e->op->comps[k].coef * v;
+  }
+  if (by_term) {
+    alignas(16) unsigned char host[16] = {0};
+    put_scalar(host, s.type, total);
+    const auto comm = comm_of(h);
+    if (cudaMemcpy(sp.scalars, host, elem_bytes(s.type), cudaMemcpyHostToDevice) != cudaSuccess ||
+        g_comm_iface->AllreduceInPlace(&comm, sp.scalars, 1, s.type) ||
+        cudaMemcpy(host, sp.scalars, elem_bytes(s.type), cudaMemcpyDeviceToHost) != cudaSuccess)
+      return fail(CUTENSORNET_STATUS_DISTRIBUTED_FAILURE, api, "the distributed communication service failed");
+    total = get_scalar(host, s.type);
   }
   put_scalar(expectationValue, s.type, total);
   if (stateNorm) {
     NetBuild nb;
     Circ nc = c0;
     if (Status st = build_norm(s, false, nb, nc, api)) return st;
-    if (Status st = run_part(h, nb, e->norm, sp.scalars + kExtra, &sp.rest, cudaStream, api)) return st;
+    if (Status st = run_part(h, nb, e->norm, sp.scalars + kExtra, &sp.rest, cudaStream, api, Dist::Sum)) return st;
     cd v;
     if (!fetch_scalar(sp.scalars + kExtra, s.type, cudaStream, v)) return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a copy failed");
     put_scalar(stateNorm, s.type, v);
@@ -3447,9 +3587,127 @@ cutensornetStatus_t cutensornetNetworkComputeGradientsBackward(const cutensornet
 }
 
 cutensornetStatus_t cutensornetExpectationComputeWithGradientsBackward(
-    const cutensornetHandle_t, cutensornetStateExpectation_t, int32_t, const void*, const void*,
-    cutensornetWorkspaceDescriptor_t, void*, void*, cudaStream_t) {
-  return refuse("cutensornetExpectationComputeWithGradientsBackward", "gradients are not implemented");
+    const cutensornetHandle_t handle, cutensornetStateExpectation_t tensorNetworkExpectation,
+    int32_t accumulateGradients, const void* expectationValueAdjoint, const void* stateNormAdjoint,
+    cutensornetWorkspaceDescriptor_t workDesc, void* expectationValue, void* stateNorm, cudaStream_t cudaStream) {
+  const char* api = "cutensornetExpectationComputeWithGradientsBackward";
+  // The arguments are checked in this order (measured on the card, whose messages these are).
+  Handle* h = handle_of(handle);
+  if (!h) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument handle may not be nullptr!");
+  Expectation* e = expectation_of(tensorNetworkExpectation);
+  if (!tensorNetworkExpectation) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument tensorNetworkExpectation may not be nullptr!");
+  if (!e) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid expectation");
+  Workspace* w = work_of(workDesc);
+  if (!workDesc) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument workDesc may not be nullptr!");
+  if (!w) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "invalid workspace descriptor");
+  if (!expectationValueAdjoint) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument expectationValueAdjoint may not be nullptr!");
+  if (!expectationValue) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Argument expectationValue may not be nullptr!");
+  if ((stateNorm == nullptr) != (stateNormAdjoint == nullptr))
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "Arguments stateNorm and stateNormAdjoint must both be nullptr or both be non-nullptr!");
+  State& s = *e->s;
+  if (!e->prepared)
+    return fail(CUTENSORNET_STATUS_INVALID_VALUE, api,
+                "cuTensorNet exception: Invalid argument: Expectation with gradients is not prepared: call prepare() successfully with a workspace large enough for the expectation object!");
+  if (s.epoch != e->epoch || e->op->version != e->op_version) return outdated("Expectation Value representation", api);
+  if (Status st = check_scratch(w, e->need, api)) return st;
+  Status cap;
+  if (graph_capture_refused(cudaStream, api, cap)) return cap;
+  std::vector<size_t> graded;  // the operators applied with a gradient
+  for (size_t i = 0; i < s.ops.size(); ++i)
+    if (s.ops[i].grad) graded.push_back(i);
+  // With no gradient registered the call is the forward evaluation alone (as documented and measured in a fresh
+  // process); either way the values are written.
+  if (Status st = cutensornetExpectationCompute(handle, tensorNetworkExpectation, workDesc, expectationValue, stateNorm, cudaStream))
+    return st;
+  if (graded.empty()) return CUTENSORNET_STATUS_SUCCESS;
+
+  // The gradient written for each operator, in the state's convention for complex data (checked on an RTX 3060,
+  // cuTensorNet 2.14, against finite differences): with E the expectation value and N the squared norm, and an
+  // operator's tensor A,
+  //   gradient = Ebar conj(dE/dA) + conj(Ebar) dE/dA* + Nbar conj(dN/dA) + conj(Nbar) dN/dA*
+  // (A and A* the Wirtinger derivatives; the convention of PyTorch). The network of each term holds A as a tensor
+  // of the ket side and its conjugate on the bra side; the first gives dE/dA, the second dE/dA*. A gate applied as
+  // an adjoint gets a gradient of zeros, and a gate that cancels against its adjoint in a unitary circuit (not in
+  // the light cone of the operator) has no tensor in the network and so gets zeros too.
+  const cd Ebar = get_scalar(expectationValueAdjoint, s.type);
+  const cd Nbar = stateNormAdjoint ? get_scalar(stateNormAdjoint, s.type) : cd{};
+  std::vector<std::vector<cd>> total(graded.size());
+  std::vector<std::vector<int64_t>> dims(graded.size());
+  Circ c0;
+  resolve_channels(s, c0, s.rng, true);
+  auto add_network = [&](NetBuild& b, cd adjoint) -> Status {
+    for (size_t i = 0; i < b.net.in.size(); ++i) b.net.in[i].data = b.data[i];  // the gradient networks read them from here
+    for (size_t gi = 0; gi < graded.size(); ++gi) {
+      const Op& op = s.ops[graded[gi]];
+      if (op.adjoint) continue;
+      for (size_t i = 0; i < b.net.in.size(); ++i) {
+        if (b.owner[i] != (int)graded[gi]) continue;
+        DevBuf adj;
+        if (!adj.alloc(16) || !upload(adj.p, s.type, {adjoint}))
+          return fail(CUTENSORNET_STATUS_ALLOC_FAILED, api, "no device memory for the adjoint");
+        b.net.adjoint = adj.p;
+        b.net.adjoint_strides.clear();
+        GradNet g;
+        if (Status st = build_grad_net(b.net, i, Path{}, g, api)) return st;
+        const NetTensor& slot = b.net.in[i];
+        DevBuf out, scratch;
+        if (!out.alloc(slot.extents.empty() ? 16 : (size_t)volume(slot.extents) * elem_bytes(s.type)))
+          return fail(CUTENSORNET_STATUS_ALLOC_FAILED, api, "no device memory for a gradient");
+        const int64_t need = scratch_need(g.net, g.path);
+        Workspace tmp;
+        if (need > 0) {
+          if (!scratch.alloc((size_t)need)) return fail(CUTENSORNET_STATUS_ALLOC_FAILED, api, "no device memory for a gradient");
+          tmp.ptr[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] = scratch.p;
+          tmp.size[CUTENSORNET_MEMSPACE_DEVICE][CUTENSORNET_WORKSPACE_SCRATCH] = need;
+        }
+        std::vector<const void*> in;
+        for (const NetTensor& t : g.net.in) in.push_back(t.data);
+        std::vector<int64_t> ids(1, 0);
+        if (Status st = contract_slices(h, g.net, g.path, in, out.p, false, &tmp, ids, cudaStream, api)) return st;
+        cudaStreamSynchronize(cudaStream);
+        std::vector<cd> v;
+        if (!read_tensor(out.p, s.type, slot.extents, {}, v))
+          return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a gradient could not be read");
+        const bool bra = slot.q.isConjugate != 0;
+        if (total[gi].empty()) total[gi].assign(v.size(), cd{});
+        dims[gi] = slot.extents;
+        for (size_t k = 0; k < v.size(); ++k) total[gi][k] += bra ? std::conj(v[k]) : v[k];
+      }
+    }
+    return CUTENSORNET_STATUS_SUCCESS;
+  };
+  for (size_t k = 0; k < e->op->comps.size(); ++k) {
+    NetBuild b;
+    Circ c = c0;
+    if (Status st = build_component(s, e->op->comps[k], false, b, c, api)) return st;
+    if (Status st = add_network(b, Ebar * std::conj(e->op->comps[k].coef))) return st;
+  }
+  if (stateNormAdjoint) {
+    NetBuild nb;
+    Circ nc = c0;
+    if (Status st = build_norm(s, false, nb, nc, api)) return st;
+    if (Status st = add_network(nb, Nbar)) return st;
+  }
+  for (size_t gi = 0; gi < graded.size(); ++gi) {
+    Op& op = s.ops[graded[gi]];
+    std::vector<int64_t> ext;  // the gate's own shape when no tensor of it was in any network
+    if (!dims[gi].empty() || !total[gi].empty()) ext = dims[gi];
+    else {
+      for (int rep = 0; rep < 2; ++rep)
+        for (int32_t m : rev32(op.modes)) ext.push_back(s.ext[(size_t)m]);
+      total[gi].assign((size_t)volume(ext), cd{});
+    }
+    std::vector<cd> out = total[gi];
+    if (accumulateGradients) {
+      std::vector<cd> old;
+      if (!read_tensor(op.grad, s.type, ext, op.grad_strides, old))
+        return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a gradient could not be read");
+      for (size_t k = 0; k < out.size(); ++k) out[k] += old[k];
+    }
+    if (!write_tensor(op.grad, s.type, ext, op.grad_strides, out))
+      return fail(CUTENSORNET_STATUS_CUDA_ERROR, api, "a gradient could not be written");
+  }
+  return CUTENSORNET_STATUS_SUCCESS;
 }
 
 }  // extern "C"

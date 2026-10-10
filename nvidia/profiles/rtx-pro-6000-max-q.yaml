@@ -59,3 +59,12 @@ telemetry:
 cuda:
   memory_bus_width_bits: 512
   persisting_l2_bytes: 100663296
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA RTX Blackwell GPU Architecture whitepaper (RTX PRO 6000 Blackwell Max-Q Workstation Edition): GPCs 12, TPCs 94, SMs 188.
+layout:
+  gpcs: 12
+  tpcs: 94
+  sms_per_tpc: 2

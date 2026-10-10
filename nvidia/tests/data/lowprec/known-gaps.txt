@@ -1,0 +1,5 @@
+# <probe>.<slug> pairs whose card transcript the simulator does not reproduce yet (nvidia/tests/e2e/run_lowprec.sh reports
+# them as XFAIL; one that starts to match fails the test until its line is removed). Each is a measurement of a real GPU
+# that the simulator's rules for that architecture do not follow: see nvidia/docs/lowprec.md, "What the RTX PRO 6000 says".
+sparselt.rtx-pro-6000-server  # 1 of 1097 cases: scales/e4m3_vec32_128x128x256, 14 of 16384 cells one denormal bit or sign of zero off
+ptx120.rtx-pro-6000-server    # 11 of 29 mma_blockscale hashes: the E4M3/E5M2 forms with a wide-range operand and specials, and sp_mx8

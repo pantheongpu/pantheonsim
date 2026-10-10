@@ -52,10 +52,10 @@ bool executes(const Instr& ins) {
       if (shape == 9) return fmt != 0;
       return false;
     }
-    case Op::TEX: case Op::TLD: case Op::TLD4: {
+    case Op::TEX: case Op::TLD: case Op::TLD4: case Op::TXD: {
       const Word& w = ins.w;
       const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59
-      const unsigned lod = ins.op == Op::TLD4 ? 0
+      const unsigned lod = ins.op == Op::TLD4 || ins.op == Op::TXD ? 0
                            : bw               ? static_cast<unsigned>(w.field(59, 1) | (w.field(87, 2) << 1))
                                               : static_cast<unsigned>(w.field(87, 3));
       if (lod == 4 || lod == 5 || (ins.op == Op::TEX && lod == 2)) return false;   // LOD clamps, bias
@@ -76,7 +76,7 @@ bool executes(const Instr& ins) {
     case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
     case Op::UTCSHIFT: case Op::UTCATOMSWS: case Op::STAS: case Op::REDAS: case Op::UGETNEXTWORKID:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2I:
-    case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
+    case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL: case Op::FSWZADD:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
     case Op::I2F: case Op::I2FP: case Op::I2I: case Op::I2IP: case Op::MUFU:
     case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::LD: case Op::LDC: case Op::LDG: case Op::LDGDEPBAR:
@@ -102,7 +102,7 @@ exec::InstClass inst_class(Op op) {
   using C = exec::InstClass;
   switch (op) {
     case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET: case Op::FSEL:
-    case Op::FCHK: case Op::MUFU:
+    case Op::FCHK: case Op::MUFU: case Op::FSWZADD:
       return C::Fp32;
     case Op::DADD: case Op::DMUL: case Op::DFMA: case Op::DSETP: return C::Fp64;
     case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2: return C::Fp16;
@@ -115,7 +115,7 @@ exec::InstClass inst_class(Op op) {
       return C::Control;
     case Op::LDG: case Op::STG: case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: case Op::LD: case Op::ST:
     case Op::LDC: case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::RED: case Op::LDGSTS: case Op::LDSM:
-    case Op::SULD: case Op::SUST: case Op::TEX: case Op::TLD: case Op::TLD4: case Op::MEMBAR: case Op::CCTL:
+    case Op::SULD: case Op::SUST: case Op::TEX: case Op::TLD: case Op::TLD4: case Op::TXD: case Op::MEMBAR: case Op::CCTL:
       return C::Memory;
     case Op::HMMA: case Op::IMMA: case Op::BMMA: case Op::DMMA: case Op::QMMA: case Op::MOVM:
     case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
@@ -131,7 +131,9 @@ exec::InstClass inst_class(Op op) {
 }
 
 void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance) {
-  const Mask ex = guard_mask(w, ins, group);
+  // After BMOV.PQUAD MACTIVE every thread of a quad that has one running takes part (see dec_bmov_active); the
+  // ones outside the issuing group run as helpers and keep their own program counters.
+  const Mask ex = guard_mask(w, ins, w.mactive_force ? w.mactive_force : group);
   {
     exec::LaunchStats& st = blk.st;
     const uint64_t lanes = static_cast<uint64_t>(std::popcount(ex));
@@ -164,7 +166,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
       case Op::RED: case Op::LDGSTS: case Op::LDGDEPBAR: case Op::LDSM: case Op::STSM:
         exec_mem(blk, w, ins, ex);
         break;
-      case Op::TEX: case Op::TLD: case Op::TLD4: case Op::SULD: case Op::SUST:
+      case Op::TEX: case Op::TLD: case Op::TLD4: case Op::TXD: case Op::SULD: case Op::SUST:
         exec_tex(blk, w, ins, ex);
         break;
       case Op::SHFL: case Op::VOTE: case Op::VOTEU: case Op::MATCH: case Op::REDUX:
@@ -193,7 +195,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
         exec_clc(blk, w, ins, ex);
         break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
-      case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
+      case Op::FSEL: case Op::FCHK: case Op::FSWZADD: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
       case Op::DSETP: case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2:
       case Op::I2F: case Op::I2FP: case Op::F2I: case Op::F2IP: case Op::F2F: case Op::F2FP:
       case Op::FRND: case Op::I2I: case Op::I2IP: case Op::HSET2: case Op::FMNMX3:
@@ -335,6 +337,14 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       }
       if (ins.f[1]) {   // MOV.64
         each_lane(ex, [&](unsigned l) { write64(w, ins.dst[0], l, read64(w, ins.src[0], l)); });
+        return;
+      }
+      // MOV Rd, Rs, mask (bits 72-75): only the threads whose place in their quad (lane & 3) is in the mask write
+      // (ptxas gathers the four threads' results of tex.grad's quad of fetches with it: 1, 2, 4, 8).
+      if (!uniform && ins.f[0] != 0xf) {
+        each_lane(ex, [&](unsigned l) {
+          if ((ins.f[0] >> (l & 3)) & 1) write32(w, ins.dst[0], l, read32(w, ins.src[0], l));
+        });
         return;
       }
       each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, read32(w, ins.src[0], l)); });
@@ -1089,7 +1099,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   };
   switch (ins.op) {
     case Op::MOV: {
-      if (ins.mnemonic != "MOV" || ins.f[1] || ins.src.empty() || !plain(ins.src[0])) return false;
+      if (ins.mnemonic != "MOV" || ins.f[1] || ins.f[0] != 0xf || ins.src.empty() || !plain(ins.src[0])) return false;
       const uint32_t* a = lanes(0, ins.src[0], Same{});
       for (unsigned l = 0; l < 32; ++l) r[l] = a[l];
       store(ins.dst[0]);
@@ -1272,6 +1282,20 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     return d;
   };
   switch (ins.op) {
+    case Op::FSWZADD: {
+      // Rd = (the thread's pattern pair says Ra goes in ? Ra + Rb : Rb), a single-precision add (ptxas builds the
+      // coordinates of tex.grad's quad on 3D and cube textures with it: P, P + dPdx, P + dPdy, ...). A thread
+      // that leaves Ra out takes Rb as it is, NaN or not.
+      const uint32_t pattern = ins.f[0];
+      each_lane(ex, [&](unsigned l) {
+        const float a = as_f32(read32(w, ins.src[0], l)), b = as_f32(read32(w, ins.src[1], l));
+        const bool with_a = ((pattern >> (2 * (l & 3))) & 3) == 3;
+        float r = b;
+        if (with_a) r = a + b;
+        write32(w, ins.dst[0], l, r != r ? 0x7fffffffu : f32_bits(r));
+      });
+      return;
+    }
     case Op::FADD: case Op::FMUL: case Op::FFMA: {
       const unsigned rnd = ins.f[0];
       const bool fz = ins.f[1], st = ins.f[2];
@@ -2319,7 +2343,7 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
 // after every 128 bits of K; 1-bit ones counting .AND/.XOR bits.
 namespace {
 // E3M2, E2M3 and E2M1 each in a byte (QMMA, mma.sync .kind::f8f6f4: the
-// FP6 in bits 0-5, FP4 in 2-5); E2M1P packed two to a byte (OMMA).
+// FP6 in bits 0-5, FP4 in 2-5, read as an E2M3 of bits 0-5); E2M1P packed two to a byte (OMMA).
 enum class MmaT { F16, BF16, TF32, S8, U8, S4, U4, B1, F64, E4M3, E5M2, E3M2, E2M3, E2M1, E2M1P };
 unsigned mma_bits(MmaT t) {
   switch (t) {
@@ -2345,7 +2369,9 @@ double mma_elem(MmaT t, uint64_t v, unsigned e) {
     case MmaT::E5M2: return exec::fp8_value(static_cast<uint32_t>(v >> (8 * e)), true);
     case MmaT::E3M2: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 3, 2, 3);
     case MmaT::E2M3: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 2, 3, 1);
-    case MmaT::E2M1: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e + 2)) & 0xF, 2, 1, 1);
+    // (An E2M1 operand in a byte is read as the byte's low six bits as an E2M3: an RTX PRO 6000 does, and it is the
+    // same number when bits 0-1 and 6-7 are zero, as the ISA's layout leaves them.)
+    case MmaT::E2M1: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 2, 3, 1);
     case MmaT::E2M1P: return exec::mx_float_value(static_cast<uint32_t>(v >> (4 * e)) & 0xF, 2, 1, 1);
     case MmaT::U8: return static_cast<uint8_t>(v >> (8 * e));
     case MmaT::S4: return static_cast<int8_t>(static_cast<uint8_t>(((v >> (4 * e)) & 0xf) << 4)) >> 4;
@@ -2465,7 +2491,9 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const uint32_t dims = cube ? 3 : (dim & 3) + 1;
   // The LOD mode (87-89; from sm_100 split, its low bit at 59). A fetch's
   // (TLD) is explicit, so sm_100's 0 means .LZ.
-  unsigned lod_mode = ins.op == Op::TLD4 ? 0
+  const bool txd = ins.op == Op::TXD;   // tex.grad: no LOD mode, the gradients come in registers
+  const bool ndv = ins.op == Op::TEX && word.bit(77);   // TEX.NDV: see below
+  unsigned lod_mode = ins.op == Op::TLD4 || txd ? 0
                       : m_.sm >= 100    ? static_cast<unsigned>(word.field(59, 1) | (word.field(87, 2) << 1))
                                         : static_cast<unsigned>(word.field(87, 3));
   if (ins.op == Op::TLD && m_.sm >= 100 && lod_mode == 0) lod_mode = 1;
@@ -2477,6 +2505,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   // offsets, is no PTX form and was refused by executes().
   const bool has_off = ins.f[3] == 1, has_dc = ins.f[4] != 0;
   if (ins.f[3] > 1) fault(w, ins, 0, "texture fetches with per-texel offsets are not implemented", Err::UnsupportedPtx);
+  if (txd && (has_off || has_dc))
+    fault(w, ins, 0, "tex.grad with offsets or a depth reference is not implemented in the SASS engine (the register layout was not measured); run with VGPU_SASS=0", Err::UnsupportedPtx);
   if (ins.op == Op::TEX && lod_mode == 2)
     fault(w, ins, 0, "texture fetches with a LOD bias are not implemented yet", Err::UnsupportedPtx);
   const unsigned n0 = (layered ? 1 : 0) + dims, n1 = (has_lod ? 1 : 0) + (has_off ? 1 : 0) + (has_dc ? 1 : 0);
@@ -2501,9 +2531,46 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     f.layered = layered;
     f.cube = cube;
     unsigned k = 0;
-    if (layered) f.layer = comp[k++];
+    if (layered && !txd) f.layer = comp[k++];
     for (unsigned i = 0; i < dims; ++i) f.coord[i] = comp[k++];
+    if (layered && txd) f.layer = comp[k++];   // TXD puts the layer after the coordinates
+    if (txd) {
+      // ddx.x, ddy.x, ddx.y, ddy.y in four registers from the one at 32 (the second pair only for a 2D texture).
+      const unsigned gr = static_cast<unsigned>(word.field(32, 8));
+      f.grad = true;
+      f.ddx[0] = rd(gr, l);
+      f.ddy[0] = rd(gr + 1, l);
+      if (dims >= 2) {
+        f.ddx[1] = rd(gr + 2, l);
+        f.ddy[1] = rd(gr + 3, l);
+      }
+    }
     f.float_coords = !int_coords;
+    // TEX.NDV on a 3D texture, with no LOD operand: the level comes from the coordinates of the quad this thread is
+    // in -- threads 0, 1 and 2 of it are P, P + dPdx and P + dPdy, the way ptxas builds tex.grad (the threads
+    // below the fetch's own are helpers, see BMOV.PQUAD MACTIVE).
+    if (ndv && !has_lod && cube && d.mip_levels > 0)
+      fault(w, ins, l,
+            "tex.grad on a cube texture: the card finds the level of detail from the four coordinates of a quad of "
+            "normalized directions, which is not reproduced bit for bit (VGPU_SASS=0 refuses it too)",
+            Err::UnsupportedPtx);
+    if (ndv && !has_lod && dims == 3 && !cube && !layered && d.mip_levels > 0) {
+      const unsigned qb = l & ~3u;
+      double dq[2][3];
+      const unsigned sizes[3] = {d.width, d.height, d.depth};
+      for (unsigned i = 0; i < 3; ++i) {
+        const auto coord_at = [&](unsigned lane) {
+          return as_f32(i < in0 ? rd(r0 + i, lane) : rd(r1 + (i - in0), lane));
+        };
+        const float c0 = coord_at(qb);
+        for (unsigned k = 0; k < 2; ++k)
+          dq[k][i] = std::clamp(exec::tex_grad::scale_by_size(exec::tex_grad::lane_difference(c0, coord_at(qb + 1 + k)),
+                                                              sizes[i]),
+                                -1e300, 1e300);
+      }
+      f.explicit_lod = true;
+      f.lod = static_cast<double>(exec::tex_grad::lod_q_3d(dq[0], dq[1])) / 256.0;
+    }
     // The result's type is the texture's (its format and read mode), not
     // the instruction's: SASS has one TEX for every PTX destination type.
     f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
@@ -2899,6 +2966,10 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       C[cd(l, s)] = v;
     }
   double D[16 * kN] = {};
+  const auto narrow_elem = [](MmaT t) {
+    return t == MmaT::E4M3 || t == MmaT::E5M2 || t == MmaT::E3M2 || t == MmaT::E2M3 || t == MmaT::E2M1 || t == MmaT::E2M1P;
+  };
+  const bool narrow_tensor_core = m_.sm / 10 == 12 && narrow_elem(at) && narrow_elem(bt) && acc == AccF32;
   for (unsigned i = 0; i < M; ++i)
     for (unsigned j = 0; j < kN; ++j) {
       if (at == MmaT::B1) {
@@ -2923,6 +2994,14 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           for (unsigned k = 0; k < K; ++k) a = std::fma(A[i * K + k], B[k * kN + j], a);
           return a;
         });
+      } else if (narrow_tensor_core) {
+        // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (exec::mma_narrow_sum).
+        double terms[256];
+        const unsigned sblock = K / scale_vec;
+        for (unsigned k = 0; k < K; ++k)
+          terms[k] = block_scaled ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
+                                  : A[i * K + k] * B[k * kN + j];
+        D[i * kN + j] = exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j]));
       } else {
         float a = static_cast<float>(C[i * kN + j]);
         const unsigned sblock = K / scale_vec;
@@ -3059,6 +3138,19 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
   };
   switch (ins.op) {
     case Op::BMOV:   // a convergence barrier's thread mask, to or from a register
+      if (ins.f[0] >= 2) {   // MACTIVE, the mask the warp runs with: f[0] 2 saves it in Bn, 3 sets it from Bn
+        if (ins.f[0] == 2) {
+          w.b[ins.f[1] & 15] = w.mactive_force ? w.mactive_force : ex;
+        } else if (ins.f[2]) {   // .PQUAD: every thread of every quad that has one of the saved threads
+          Mask q = 0;
+          for (Mask m = w.b[ins.f[1] & 15]; m; m &= m - 1) q |= Mask{0xf} << (std::countr_zero(m) & ~3);
+          w.mactive_force = q;   // the quad's other threads take part even when they have exited or are not in the block
+        } else {
+          w.mactive_force = 0;
+        }
+        each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
+        return true;
+      }
       if (ins.f[0]) {
         const unsigned bar = ins.src[0].reg & 15;
         const Mask m = w.b[bar];

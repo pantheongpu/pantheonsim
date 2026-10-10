@@ -189,28 +189,136 @@ the card's), and `nvidia/tests/e2e/nvcuvid_paths.cpp` with
 `nvcuvid_paths.rtx3060.txt` (293 lines). `run_nvenc.sh --card` and
 `run_nvcuvid.sh --card` run the same programs against the real libraries.
 
-**NVENC.** The encoder is not NVIDIA's. A frame is written as an IDR picture
-whose every coding unit is PCM: macroblocks in H.264 (CAVLC,
-`nvidia/src/nvenc_h264.hpp`, written from ITU-T H.264) and 16x16 coding tree
-blocks in HEVC (`nvidia/src/nvenc_hevc.hpp`, written from ITU-T H.265, with the
-CABAC encoder HEVC cannot do without: one context-coded bin, `split_cu_flag`, and
-the terminate bins for `pcm_flag` and `end_of_slice_segment_flag`). Both are
-lossless and conformant, and read back exactly by ffmpeg
-(`nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB and ABGR through both codecs at
-sizes that are not multiples of 16 and are odd, up to 4K in the HEVC writer's own
-check, and compares every decoded sample); `test_nvenc_h264` and
-`test_nvenc_hevc` do the same with decoders of their own, no ffmpeg needed. It is
-not compression, and rate control, GOP structure, B-frames and every preset
-setting are accepted and change nothing; every picture is an IDR with one
-`idr_pic_id`, so encoding a frame twice gives the same bytes, which encoder SDC
-tests (pantheon's `media_enc_virus`: 4K HEVC, ARGB, forced IDR with the
-parameter sets on every frame, the first bitstream compared with each later one)
-rely on; `nvenc_encode.cu` replays that flow. RGB input is converted with the
-BT.601 limited-range matrix the card applies. 10-bit and 4:4:4 input is refused
-(`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the card takes it; AV1 sessions are
-refused at initialisation as the card refuses them. The card's own streams (an
-IDR, then P pictures) decode with ffmpeg too, which is how the layouts above
-were checked.
+**NVENC.** The encoders are not NVIDIA's. H.264 and HEVC are compressed by two
+encoders written for this tree from ITU-T H.264 and H.265; the lossless tuning stays
+the PCM stream described at the end of this paragraph. Which bitstream a picture becomes is a
+pure function of the picture, its type, the QP and the pictures before it, so
+encoding a frame twice gives the same bytes. What both write is read by ffmpeg, and
+the card's NVDEC and the NVDEC of this tree return the same pictures from the H.264
+stream.
+
+*H.264* (`nvidia/src/nvenc_h264_enc.cpp`, with `nvenc_h264_xform.inc` and
+`nvenc_h264_cabac.inc`): Intra16x16, Intra4x4 and (High profile) Intra8x8 prediction;
+the 4x4 and 8x8 integer transforms with quantisation; P pictures with P_Skip and
+16x16, 16x8, 8x16 and 8x8 partitions, up to four reference pictures and
+quarter-sample motion search; B pictures (Main and High profile) with B_Skip and
+B_Direct_16x16 by spatial direct prediction and 16x16, 16x8, 8x16 and 8x8 partitions
+predicted from list 0, list 1 or both; CAVLC or CABAC with every context the syntax
+uses (`entropyCodingMode`); several slices (`sliceMode` 0, 2 and 3 exactly, 1 by an
+estimate of the bytes a macroblock takes); and the loop filter. Every choice is by
+squared error plus lambda times the bits the entropy coder would spend, taken from the
+CABAC contexts' own states. The reference picture of a P or B picture is the one this
+tree's decoder (`h264_decode.cpp`) makes from the bytes just written, so encoder and
+decoder cannot disagree about it. The SPS names the profile the configuration asks for
+(Baseline 66, Main 77, High 100; Baseline takes no CABAC, no 8x8 transform and no B
+pictures, as the card's does not) and the level the frame size and rate need.
+
+*HEVC* (`nvidia/src/nvenc_hevc_enc.cpp`): 32x32 coding tree blocks split into coding
+units of 32, 16 and 8 samples; all 35 intra modes with the filtering and boundary rules
+of 8.4.4.2, NxN prediction blocks of 4x4; the DST and the 4x4 to 32x32 DCTs with
+quantisation and a transform tree; P and B slices with merge and AMVP candidates (no
+temporal ones), 2Nx2N, 2NxN and Nx2N units, bi-prediction and several references;
+the deblocking filter, in the loop; and CABAC with every context its syntax elements
+use, decided by rate-distortion cost with the bits taken from the context states. The
+headers are the first VPS, SPS and PPS of the Main profile.
+
+*Behaviour as the card's.* The API follows what an application sets: the GOP
+(`gopLength` / `idrPeriod`: an IDR picture every that many pictures; `frameIntervalP = 0`:
+an IDR picture and then I pictures), `NV_ENC_PIC_FLAG_FORCEIDR` and `FORCEINTRA`, the
+picture type of an `enablePTD = 0` session, constant QP (`qpIntra` / `qpInterP` /
+`qpInterB`, bounded by `minQP` / `maxQP`), and `frameIntervalP > 1`, which makes B
+pictures. As on the card (probed: `frameIntervalP` 2, 3 and 4, gop lengths, forced IDR
+pictures and the end of the stream), a picture that has to wait for the P picture that
+follows it in display order is answered `NV_ENC_ERR_NEED_MORE_INPUT`; when that P
+picture arrives the group is coded, P picture first, and the output buffers of the
+calls that were answered "need more input" are filled, in the order of the calls, with
+the group's pictures in coding order, the buffer of the call that made the group
+complete last; a forced IDR picture, the end of a GOP (the group is shorter by then) and
+`NV_ENC_PIC_FLAG_EOS` code what waits first. `NvEncLockBitstream` reports IDR, I, P or
+B and the number of slices. The card's own encoder codes the B pictures of a group in a
+pyramid (the middle one first and as a reference); this one codes them in display order
+and as non-reference pictures, so the bytes differ and the protocol does not. Baseline
+profile sessions take no B pictures (the card, given Baseline and `frameIntervalP` 3,
+codes P pictures only), and `entropyCodingMode`, `adaptiveTransformMode`, `sliceMode`,
+`sliceModeData`, `numRefL0` and `disableDeblockingFilterIDC` act as set.
+
+*Rate control* (`nvidia/src/nvenc_rc.hpp`): for `averageBitRate` under CBR or VBR the
+QP of every picture follows from a size model per picture type, learned from the
+pictures coded so far, and the bits the stream may still spend; a picture that misses
+its target by more than 6% is encoded again at a corrected QP after the encoder rolled
+the first attempt back. Streams of 30 to 45 pictures land within 5% of the
+target in the e2e tests (`nvenc_nvdec`, CBR and VBR, H.264 and HEVC): 403, 251, 1546
+and 81 kbit/s for targets of 400, 250, 1500 and 80, where the card's own encoder gives
+445, 219, 1877 and 91 on the same streams (its rate control is a few percent to a
+quarter off at these short lengths). The
+QP of an IDR picture is a search on a scratch encoder that sees only that picture, so one frame gives one
+bitstream whatever came before. Intra pictures carry a digest of the input as an SEI
+message (decoders skip it): a lossy encoder can lose a one-sample change in
+quantisation, and encoder corruption checks (pantheon's `media_enc_virus`: one frame, a
+forced IDR with the parameter sets every time, the bitstream compared with a golden
+one) need the same frame to give the same bytes and a changed frame to give different
+ones.
+
+*Quality, measured and unflattering.* Scored by luma PSNR against libx264 and libx265
+(`medium`, and `veryslow` as the best the codecs do; tune psnr, no adaptive
+quantisation, their SEI removed) on three synthetic 352x288 clips (a panning
+natural-image texture `nat352`, a zooming Mandelbrot `mandel352` and the test pattern
+`test352`; 1 picture for intra, 20 for P and B), at QP 18 to 42 in steps of 4. The
+table is the size our stream needs for the PSNR the reference reaches (interpolated
+between the two QPs that bracket it), so `+10%` means ten percent more bytes. These
+are PSNR numbers on synthetic content, not a viewing test, and the clips are small:
+read them as an order of magnitude.
+
+| clip | mode | H.264 vs x264 medium | vs veryslow | HEVC vs x265 medium | vs veryslow |
+|---|---|---|---|---|---|
+| nat352 | intra | +3.9% | +9.6% | +1.8% | +6.9% |
+| nat352 | P | +8.6% | +14.4% | +0.7% | +16.0% |
+| nat352 | B (3 per group) | +17.2% | +30.5% | +4.2% | +12.7% |
+| mandel352 | intra | +3.0% | +6.0% | +4.0% | +7.3% |
+| mandel352 | P | +27.2% | +42.9% | +13.0% | +62.3% |
+| mandel352 | B | +27.5% | +38.1% | +7.2% | +52.4% |
+| test352 | intra | +5.0% | +9.8% | +2.4% | +10.9% |
+| test352 | P | +30.9% | +53.7% | +5.4% | +44.2% |
+| test352 | B | +40.1% | +62.8% | +4.1% | +45.7% |
+
+At the same QP the quantisers agree (the QP means the same step in both encoders) but
+the encoders spend it differently: on `nat352` P pictures at QP 26 ours is 12901 bytes
+at 40.98 dB against x264's 14425 at 41.11 dB; at QP 34, 5681 bytes at 38.49 dB against
+5913 at 39.12 dB. Intra pictures are close to the references (a few percent, about
+ten against `veryslow`); inter pictures are where the encoders are weak, most on the
+clips with large motion or sharp edges (`mandel352`, `test352`), because the motion
+search is a whole-sample diamond from predictor seeds with half and quarter-sample
+refinement (a local search, which loses on fast motion) and the partitions stop
+at 8x8 (H.264) or 2NxN / Nx2N (HEVC), with no RDOQ, trellis, lookahead or
+adaptive quantisation. Our B pictures help less than x264's (the group is coded in display order, as non-reference pictures)
+and on H.264 they cost more than P pictures on the harder clips. The H.264 numbers
+are for High profile, CABAC, 8x8 transform and two references.
+
+*The lossless tuning* (and `qpPrimeYZeroTransformBypassFlag`) is PCM: macroblocks in
+H.264 (CAVLC, `nvidia/src/nvenc_h264.hpp`) and 16x16 coding tree blocks in HEVC
+(`nvidia/src/nvenc_hevc.hpp`, with the CABAC encoder HEVC cannot do without: one
+context-coded bin, `split_cu_flag`, and the terminate bins). Both are lossless and
+conformant, every picture is an IDR picture.
+
+*Tests.* `nvenc_nvdec.cpp` decodes the H.264 streams with ffmpeg and with this tree's
+NVDEC and requires the same samples; it covers GOP structures, forced pictures, the
+`NEED_MORE_INPUT` protocol and its order of pictures (B pictures, a GOP that ends in the
+middle of a group, a forced IDR with pictures waiting), CABAC, the 8x8 transform,
+slices, the profiles and the bit rate (CBR and VBR, within 5%); without ffmpeg only
+the comparison with ffmpeg is skipped. `nvenc_h264.cpp` encodes NV12, YV12, IYUV, ARGB
+and ABGR through both codecs, at sizes that are not multiples of 16 and are odd, with and
+without B pictures and at a bit rate, and decodes with ffmpeg. `test_nvenc_h264_enc`
+decodes the encoder's streams with this tree's decoder and requires each decoded
+picture to equal the encoder's reconstruction (CABAC, 8x8, slices, references, B
+pictures, rollback); `test_nvenc_hevc_enc` has ffmpeg's HEVC decoder do the same for
+the HEVC encoder, where ffmpeg is installed (`test_nvenc_h264` and `test_nvenc_hevc`
+still check the PCM writers with decoders of their own). `run_nvenc.sh --card` runs
+`nvenc_api`, `nvenc_h264` and `nvenc_nvdec` against the driver's libraries: the card's
+streams pass the same checks, and its picture types, call statuses, order of pictures,
+profile bytes and slice counts agree with the simulator's. `nvenc_encode.cu` replays the
+encoder SDC flow. RGB input is converted with the BT.601 limited-range matrix the card
+applies. 10-bit and 4:4:4 input is refused (`NV_ENC_ERR_UNSUPPORTED_PARAM`) although the
+card takes it; AV1 sessions are refused at initialisation as the card refuses them.
 
 **NVDEC.** Motion JPEG is a sequence of independent JPEG pictures, and the
 simulator has a JPEG decoder, so `cudaVideoCodec_JPEG` is decoded on the host
@@ -225,13 +333,109 @@ card's to within one level on the baseline and restart-interval fixtures
 (`nvidia/tests/data/jpeg`, card output in `nvidia/tests/data/nvdec`). The
 subset is sequential 8-bit Huffman JPEG; the card refuses progressive pictures
 (`CUDA_ERROR_INVALID_IMAGE`, the picture's status `Error`) and four-component
-ones (the parser skips them), and so does this. Every other codec reports
-`bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser` answer
-`CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, H.264, HEVC, VP8, VP9
+ones (the parser skips them), and so does this. **H.264 is decoded too**, by a decoder written from ITU-T H.264 (03/2009) alone
+(`nvidia/src/h264_decode.cpp`, `h264_dec_*.inc`; the CAVLC, CABAC, scan, QP and
+deblocking tables are extracted from the Recommendation's PDF by
+`nvidia/tools/gen_h264_tables.py`, which is how a transcription error is kept out)
+and a video parser (`h264_parser.cpp`) that produces the sequence, decode and
+display callbacks. H.264 output is defined sample for sample, so a conformant
+decoder is bit-exact: Baseline, Main and High progressive 4:2:0 8-bit streams with
+CAVLC or CABAC, I, P and B slices, 4x4 and 8x8 transforms, scaling matrices,
+explicit and implicit weighted prediction, spatial and temporal direct prediction,
+multiple slices and references, long-term references, every deblocking setting,
+odd sizes with cropping, all decode to the checksums of the card's NVDEC
+(`nvidia/tests/data/h264`: 51 streams in 103 parser-driving runs; the card's
+transcript is `nvcuvid_h264.rtx3060.txt`, 12 991 lines, and holds the CRC-32 of
+every displayed frame, with `run_nvcuvid_h264.sh --card` running the same program
+against the driver). The parser reproduces what the card's does and the Recommendation
+leaves open: when a picture is complete, the number of decode surfaces it asks for,
+the picture indices handed out, the reference slots of every picture, display order,
+display delay, and timestamps (given, derived and absent); the rules were fitted to
+the card's callbacks, including what does and does not complete a picture (a slice of the next one, an access unit
+delimiter or an end of sequence do; SEI messages and parameter sets, repeated or changed, do not -- streams carrying one
+before every slice are among the fixtures). Where the fit is approximate it is
+listed in the test: with `ulMaxDisplayDelay` above one on a stream with B pictures, and
+around IDR pictures, the interleaving of display callbacks with later decode callbacks
+is the card's only to within one picture. A rescaled surface (a target size that
+is not the display area) is the card's scaler approximated: bilinear to enlarge,
+area-averaging to shrink by more than half, compared with the card's pixels to within
+one level. The capability answer is the card's: H.264 4:2:0 8-bit, 48x16 to 4096x4096,
+and 4:0:0, 4:2:2, 4:4:4 and every deeper bit depth are reported unsupported;
+`cuvidCreateDecoder` refuses them as the card does (`CUDA_ERROR_NOT_SUPPORTED`),
+as it does the `H264_SVC` codec type. Macroblock-adaptive frame/field frames (MBAFF) are decoded, field and frame pairs mixed,
+with the deblocking filter's mixed edges (`mbaff_field*` in `nvidia/tests/data/h264`: interlaced test content coded with half
+or more of its macroblocks as field pairs, in CABAC and CAVLC, with P, B (spatial and temporal direct), weighted prediction,
+several slices and cropping, all equal to the card's frames and to ffmpeg's). Field pictures (PAFF) are decoded too, field pairs
+shown as one frame, two reference fields per picture and the chroma offset between fields of different parity included
+(`paff*` fixtures: the only encoder that writes field pictures is this tree's own NVENC H.264 encoder in its test-only field
+mode, `make_paff.cpp`; the streams are equal to ffmpeg's decode and to the card's, and the card's callbacks -- the field
+pair, its picture order counts, its display -- are reproduced). Not decoded:
+flexible macroblock ordering, redundant pictures, SP/SI slices, data partitioning. Pictures that cannot be decoded report
+`CUDA_ERROR_INVALID_IMAGE` from `cuvidDecodePicture`; damaged streams never crash
+(`test_h264_decode` flips bits in streams under ASan and UBSan). HEVC and MPEG-2 are decoded too
+(below). Every other codec
+reports `bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser`
+answer `CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/4, VC-1, VP8, VP9
 and AV1 engines, and a software decoder for them is a large separate project --
 none is here, so an application falls back to its CPU decoder instead of
 receiving a wrong picture. `cuvidCreateVideoSource` (files and URLs) needs a
 demuxer and is refused the same way.
+
+**HEVC** is decoded by a decoder written from ITU-T H.265 (v4, 12/2016) alone
+(`nvidia/src/hevc_decode.cpp`, `hevc_dec_slice.inc`, `hevc_syntax.cpp`; CABAC, intra prediction in
+35 modes, merge and AMVP with temporal candidates, the transforms, transform skip,
+scaling lists, PCM, lossless coding, tiles, wavefronts, dependent slice segments,
+the deblocking filter and sample adaptive offset), driven by `CUVIDHEVCPICPARAMS` and the
+slice NAL units as the hardware is, behind a video parser (`hevc_parser.cpp`) that
+reproduces the card's callbacks: the sequence format, the surface count
+(`sps_max_dec_pic_buffering + 4`), the picture indices, the reference picture
+set as slots of a picture table, display order by output bumping, the two-stage
+treatment of a picture (the reference picture set at its first slice, the
+decode and the bumping at the next picture's), display delay and timestamps. Main, Main 10 and
+the 4:2:0 range extension tools (12 bits, transform-skip extensions, implicit and explicit
+residual DPCM, persistent Rice adaptation, 32x32 transform skip) decode to the checksums of the
+card's frames: 91 streams (`nvidia/tests/data/hevc`: 44 from x265 and the card's NVENC, 47
+from HM, the reference encoder, for tiles, dependent slice segments, PCM, custom scaling lists,
+`cu_qp_delta`, chroma QP offsets, filtering across slices and tiles switched off, parallel merge
+level, weighted prediction, several temporal layers and intra periods), 128 parser-driving runs and
+27 438 lines in the card's transcript (`nvcuvid_hevc.rtx3060.txt`; `run_nvcuvid_hevc.sh --card`
+runs the same program against the driver). Every HM stream's frames equal HM's own
+reconstruction and FFmpeg's decode as well. Three HM streams are checked against HM's
+reconstruction only (`hm_spec_only.txt`): the card does not decode `cu_chroma_qp_offset` as specified
+(its P pictures come out wrong), gets some pictures of a hierarchical field-coded stream
+wrong, and reports a frame rate for a 27 MHz time scale that this library does not derive the same way. The
+card's capabilities are reproduced for 4:2:0 at 8, 10 and 12 bits (129 to 8192 samples); 4:4:4 is
+decoded by the card and reported unsupported here, and 4:2:2, monochrome, extended precision and
+CABAC bypass alignment are refused as the card refuses them. Where the parser is only approximate: a
+`ulMaxDisplayDelay` of 2 or more on a stream with B pictures hands the pictures out in the card's order
+but a few of them one decode callback earlier, a VUI time scale above 250001 is scaled down by powers
+of two where the card also divides by other common factors, and the sequence callback reports no bit
+rate (as the card does).
+
+**MPEG-2** (H.262) is decoded by `nvidia/src/mpeg2_decode.cpp`, written from Rec. ITU-T H.262
+(02/2000) clauses 6 and 7 and Annex B: the variable-length code tables are generated from the
+Recommendation's tables (`nvidia/tools/gen_mpeg2_tables.py`), with the inverse quantisation and mismatch
+control, both scans, both coefficient tables, the four DC precisions, downloaded matrices, both quantiser
+scale types, frame and field pictures, frame, field, 16x8 and dual prime motion compensation, concealment
+motion vectors, field and frame DCTs, skipped macroblocks and multiple slices per row, and a parser
+(`mpeg2_parser.cpp`) that reproduces what the card's does: sequence format, picture parameters
+(reference indices, `second_field`, `PicWidthInMbs` as the card reports it, the slice offsets), the surface count,
+picture indices, display order (a reference picture is shown when the next is decoded), the repeat counts of pulldown
+flags, the pictures a decoder starting in the middle of a stream has to drop, the handling of damaged
+and repeated headers, and timestamps. MPEG-2 leaves the inverse DCT to the decoder (Annex A bounds its error only), and the card's is
+not bit-reproducible: this decoder's is an exact one with the mismatch control, so its frames differ from the card's by a
+level in a few percent of the samples of an intra picture and the differences carry into the pictures predicted from
+it. The tests therefore compare each frame with the card's pixels (`nvidia/tests/data/nvdec/mpeg2`, 48 streams)
+within 6 levels in at most a quarter of the samples, while every callback
+of 100 streams in 155 runs (16 648 lines, `nvcuvid_mpeg2.rtx3060.txt`) is the card's exactly: frame pictures
+(I, P and B), field pictures with second fields, dual prime, pulldown, sequence changes, damaged and truncated streams.
+Not reproduced: MPEG-1 (the card decodes it and reports it as codec MPEG-1; here it is not decoded and its
+capabilities are reported unsupported), 4:2:2 and 4:4:4 (refused as on the card), the scalable extensions,
+display delays of 3 or more on streams with B pictures (the same pictures in the same order, a few of them one callback
+later on the card), a display delay of 2 on a stream with field pictures (some pictures one callback early or late),
+and a picture that is not a multiple of 16 samples wide, where the card's last macroblock column holds garbage
+the Recommendation does not define. `test_mpeg2_decode` truncates, flips bits in
+and fills with random bytes the streams (it runs in the ASan, UBSan and TSan jobs).
 
 ## NVSHMEM: one GPU per process, every heap shared
 
@@ -243,9 +447,26 @@ address space: the single-node, all-peer-to-peer case of NVSHMEM, where a
 kernel's store to a peer's heap is a store to shared memory. The PEs meet
 through a rendezvous file named by the job's unique ID
 (`nvshmemx_get_uniqueid` and `NVSHMEMX_INIT_WITH_UNIQUEID`, the bootstrap that
-needs no MPI) or, for scripts, `VGPU_NVSHMEM_RANK`, `VGPU_NVSHMEM_NPES` and
-`VGPU_NVSHMEM_ID`; `nvshmem_init()` with neither is a job of one PE, as with
-NVIDIA's library outside a launcher.
+needs no MPI), by an MPI communicator (`NVSHMEMX_INIT_WITH_MPI_COMM`,
+`nvshmemx_set_attr_mpi_comm_args`, `NVSHMEM_BOOTSTRAP=MPI`), by OpenSHMEM
+(`NVSHMEMX_INIT_WITH_SHMEM`, `NVSHMEM_BOOTSTRAP=SHMEM`) or by PMIx
+(`NVSHMEM_BOOTSTRAP=PMI` with `NVSHMEM_BOOTSTRAP_PMI=PMIX`, which needs pmix.h when the
+simulator is built and libpmix.so.2 when it runs), or, for scripts,
+`VGPU_NVSHMEM_RANK`, `VGPU_NVSHMEM_NPES` and `VGPU_NVSHMEM_ID`; `nvshmem_init()` with none
+of these (and PMI, the default, without libpmi.so) is a job of one PE, as with
+NVIDIA's library outside a launcher. NVSHMEM's bootstraps are plugin libraries that call MPI,
+OpenSHMEM or PMIx; here the job's rank, size and one token come through the application's own MPI
+(Open MPI's or MPICH's handles, found by name in the process) or OpenSHMEM, or through
+libpmix, and `NVSHMEM_BOOTSTRAP=plugin` accepts NVSHMEM's own plugin file names
+(`nvshmem_bootstrap_mpi.so.3`, `_shmem`, `_pmix`, `_pmi`, `_pmi2`) and nothing else. The
+settings NVSHMEM refuses are refused here with its words
+(`bogus` and `UID` without init flags, a PMI kind it does not know, a plugin that is not named or
+cannot be opened). `e2e_nvshmem_bootstrap` runs these as MPI and OpenSHMEM jobs of two PEs and compares
+the shim with what NVIDIA's NVSHMEM 3.8 did on an RTX 3060 (`run_nvshmem_bootstrap.sh --card`).
+PEs on one GPU make NVSHMEM's multiple-processes-per-GPU mode, status 3
+(`NVSHMEM_STATUS_LIMITED_MPG`): the card ran its two PEs only that way, and so does the status
+here for PEs with the same device index. The status after `nvshmem_finalize()` stays
+bootstrapped (1) for every launcher's bootstrap and is 0 for a unique ID's, as measured.
 
 The host API is implemented here: the symmetric heap, blocking, strided,
 typed and stream-ordered puts and gets, signals, barriers, teams (strided and
@@ -281,12 +502,16 @@ adding into one word at once lose no update (`e2e_ipc` races two processes'
 kernels on CUDA-IPC memory; `e2e_host_atomics` races a kernel against host
 atomics).
 
-Card ground truth is thin: on an RTX 3060 under WSL NVIDIA's library
-initializes a job of one PE and then has no symmetric heap (`nvshmem_malloc`
-returns NULL), and two 3060s have no peer-to-peer path. What a multi-PE job
+Card ground truth is thin: on two RTX 3060s under WSL NVIDIA's library starts no job of PEs on
+two different GPUs (the cards have no peer access, so the topology refuses with
+`Peer GPU 1 is not accessible`, `NVSHMEMX_ERROR_NOT_SUPPORTED`, and the program exits with 255), and
+two PEs on one GPU run in its multiple-processes-per-GPU mode with a working heap; this simulator's
+RTX 3060 profile has no peer access either, so PEs on two simulated 3060s are refused the same way
+(`two_gpus` in `run_nvshmem_bootstrap.sh`, `e2e_nvshmem_peerless`), while PEs on two data-centre profiles start. What a multi-PE job
 computes here follows NVSHMEM's documentation, and so does all of the typed API above
 (none of it has been compared with a card). `e2e_nvshmem_host` runs the host
-API in jobs of one and three PEs; `e2e_nvshmem_device` runs the device API in a
+API in jobs of one and three PEs (the three share a GPU when the machine has fewer, and
+are then in the multiple-processes-per-GPU mode); `e2e_nvshmem_device` runs the device API in a
 job of three, and skips unless NVIDIA's NVSHMEM is installed (`NVSHMEM_HOME`, or
 the `nvidia-nvshmem-cu13` pip package), since its headers and device library
 are not the simulator's to ship.
@@ -348,6 +573,34 @@ documentation and is followed: `cutensorCreatePlan` requires a plan
 preference, a contraction refuses an alignment of 0, CONJ is refused on real
 data, and a repeated mode is that operand's diagonal.
 
+### cuTensorNet distributed over MPI
+
+`cutensornetDistributedResetConfiguration` takes a communicator (`MPI_Comm`, by pointer and size) and,
+as in NVIDIA's library, the communication goes through the library `$CUTENSORNET_COMM_LIB` names,
+which exports the table `cutensornetCommInterface` (`cutensornet/typesDistributed.h`, version 2;
+cuQuantum ships `cutensornet_distributed_interface_mpi.c` to build one). Every choice was measured on
+NVIDIA's library 2.14 on two RTX 3060s with a communication library that logs each primitive it is asked
+for (`nvidia/tests/e2e/cutn_comm_mpi.c`, which also stages the device buffers through the host since the
+Open MPI of a distribution is not CUDA-aware):
+
+* A reset asks the old communicator for a barrier, then the new one for its rank, a barrier and the size
+  of its shared-memory group; the library opens `$CUTENSORNET_COMM_LIB` at the first reset. A missing library
+  is `DISTRIBUTED_FAILURE` only when a communicator is given, a library without the table (or with another version)
+  is that either way; a primitive that fails is `DISTRIBUTED_FAILURE` (`INTERNAL_ERROR` for the rank and size
+  queries of the Get calls and of a reset). Without a communicator the world is one rank.
+* A contraction (`cutensornetNetworkContract`, `cutensornetContractSlices`) deals the slices of the
+  group, or all of them, round robin to the ranks (the i-th of a group to rank i modulo the size, in the order a
+  hash set of the ids iterates, which `std::unordered_set` with room for one more reproduces), clears the
+  output unless it accumulates (an accumulating call adds to each rank's own output, so the sum holds the old
+  one once per rank), and sums the outputs in place. The optimizer slices to at least one slice per rank and
+  leaves every rank the plan of the lowest estimate. `cutensornetContraction` of one slice does not communicate.
+* The state API's amplitudes, marginals, expectation values and norms are summed the same way. An expectation
+  value of at least as many terms as ranks gives rank r the terms c with c modulo the size equal to r,
+  whole and with that rank's coefficients, and sums once; with fewer, every term is contracted by all
+  ranks and summed on its own.
+* `cutensornetCreateDistributedTensorDescriptor` needs a configured communicator
+  (`NOT_INITIALIZED` without) and gathers a word from every rank; NVIDIA's library then loads NCCL.
+
 What each library chooses for itself is not NVIDIA's. Kernel selection is not
 modelled, so every workspace estimate is zero and a plan cache entry records
 the problem only (which plans NVIDIA's cache keeps is its own rule). The
@@ -365,7 +618,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NVML | `libnvidia-ml.so.1` | discovery and telemetry (`pynvml`, nvitop) |
 | cuBLAS | `libcublas.so.13` | GEMM (fp32/fp64/fp16/bf16/int8 and complex) with the Ex forms' type tables and grouped batches, levels 1, 2 and 3 in every type they come in (band and packed storage included; the plane rotations bit for bit), batched GEMV in every type, triangular solves, batched LU (`getrfBatched`/`getrsBatched`/`getriBatched`/`matinvBatched`), QR (`geqrfBatched`) and least squares (`gelsBatched`), the `_64` forms, cuBLASXt over several devices and the legacy (`cublas.h`) API; see [cublas.md](cublas.md) |
 | cuBLASLt | `libcublasLt.so.13` | descriptor matmul in fp64/fp32/fp16/bf16/fp8/fp4 and int8 x int8 into int32 (`CUBLAS_COMPUTE_32I`, what `torch._int_mm` calls), strided batches, row-major layouts, bias/ReLU/GELU epilogues with their auxiliary outputs and the backward ones (DRELU, DGELU, bias gradients), FP8 on an Ada profile (sm_89) as an L4's cuBLAS 13.3 answers it, and none below it (see [narrow-precision probes](lowprec.md)), FP8 tensor-wise and row-wise scales with amax, an FP8 auxiliary output with its scale and amax, and the block-scaled FP8/FP4 modes with one scale tensor per batch (Hopper and Blackwell: documentation-derived) |
-| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout (cuDNN's own generator, mask for mask, also between an RNN's layers), the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans (the scale-bias-activation weight gradient among them), LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics; batch normalization across the GPUs of one process), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
+| cuDNN | `libcudnn.so.9` | training and inference in the classic API: convolution forward, backward-data, backward-filter and backward-bias (every algorithm cuDNN lists, fused bias-activation), activation, pooling, softmax, LRN, batch normalization (with its fused add and activation, and as the cuDNN 8 normalization API), dropout (cuDNN's own generator, mask for mask, also between an RNN's layers), the spatial transformer, CTC loss, im2col, reductions and tensor arithmetic, each in NCHW, NHWC or any strides, in float, double, half (float or half compute) and bfloat16, INT8 convolution in NHWC and, vectorized, in `NCHW_VECT_C` (INT8x4, INT8x32), divisive normalization, tensor transforms and folding, fused-ops plans (the scale-bias-activation weight gradient among them), LSTM projections and the multi-head attention API; the graph API's convolution, matmul, pointwise, reduction, normalization (layer, instance, batch, RMS, group; backward with or without the saved statistics; batch normalization across the GPUs, in one process or several), pooling (with max pooling's index tensor), concatenation, reshape, transpose, slice, RNG, statistics-generation and softmax graphs, and scaled dot-product attention forward and backward -- the single SDPA operation and cudnn-frontend's composite graph alike, with causal, sliding-window and padding masks, bias, grouped-query heads, dropout, paged K/V caches and ragged (packed) sequences -- over ragged and INT8x4/INT8x32-vectorized tensors; RNNs |
 | cuFFT | `libcufft.so.12` | C2C/R2C/C2R in 1‑D, 2‑D and 3‑D, batched, in any advanced (strided, padded) layout; the cufftXt plan and exec API, half precision included; multi-GPU plans (`cufftXtSetGPUs`, `cufftXtMalloc`/`cufftXtMemcpy` descriptors, `cufftXtExecDescriptor*`, `cufftXtQueryPlan`) with each GPU's part on its own simulated device, in NVIDIA's natural, shuffled and 1‑D string orders; LTO callbacks (`cufftXtSetJITCallback`) given as PTX, or as LTO-IR where the host has the CUDA toolkit (its libnvJitLink links it into machine code for the simulated device) |
 | cuRAND | `libcurand.so.10` | host-side uniform and normal generation; Sobol' direction vectors (Joe and Kuo's, the card's to the bit) and scramble constants |
 | cuSPARSE | `libcusparse.so.12` | every entry point NVIDIA's 13.0 exports. CSR/CSC/COO/BSR SpMV, SpMM (strided batches, fp16/bf16/int8), SpGEMM (and SpGEMMreuse), SDDMM, SpSV/SpSM (with updateMatrix), format conversion, CSR to CSC, in real and complex values (A, A^T and A^H); Blocked-ELL SpMM and sliced-ELL SpMV; sparse vectors (SpVV, Axpby, Gather, Scatter, Rot); the tridiagonal and pentadiagonal solvers (gtsv2, gtsv2_nopivot, gtsv2StridedBatch, gtsvInterleavedBatch, gpsvInterleavedBatch); legacy coo2csr, the CSR/CSC/COO sorts, csrgeam2, gemvi, the BSR family (bsrmv, bsrxmv, bsrmm, bsrsv2, bsrsm2, bsric02, bsrilu02, CSR to BSR and back, gebsr2gebsr, gebsr2gebsc), csric02 and csrilu02, pruning, csrcolor, nnz and compression, unsorted CSR. SpMV, SpMM, SDDMM, SpSV/SpSM solves, sparse to dense and CSR to CSC are recorded into a captured CUDA graph and run at each launch |
@@ -376,16 +629,16 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | cuDSS | `libcudss.so.0` | the sparse direct solver, the whole 0.8 API: LU, LDL^T, LDL^H and Cholesky in every index width, view, base and value type, several right-hand sides, the solve sub-phases, iterative refinement, batches, a factorization or solve captured into a CUDA graph -- and SCS's GPU direct backend. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuFile (GPUDirect Storage) | `libcufile.so.0` | compatibility mode: file I/O staged through host memory into device memory, the driver and parameter API, handle and buffer registration (user-space file system handles register but, as on the card, do no I/O), batch and stream-ordered I/O, statistics; NVIDIA's statuses (CUDA 13.0) |
 | nvCOMP | `libnvcomp.so.5`, `libnvcomp_cpu.so.5` | the low-level batched API and the C++ manager API for LZ4 (bitshuffle included), Snappy, Deflate, GDeflate, Gzip and Zstd, chunks and containers interoperable with NVIDIA's in both directions, CRC32, streaming gzip compression, and the CPU GDeflate library; Cascaded, Bitcomp and ANS refused (no public bitstream) |
-| NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID: every type of the RMA lists (half and bfloat16 included) with nonblocking, strided and stream-ordered forms, typed collectives and reductions, atomics, waits in stream order, teams (also from a unique ID); the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
+| NVSHMEM | `libnvshmem_host.so.3` | the host API across a job of PEs, one simulated GPU per process, bootstrapped by unique ID, MPI, OpenSHMEM or PMIx: every type of the RMA lists (half and bfloat16 included) with nonblocking, strided and stream-ordered forms, typed collectives and reductions, atomics, waits in stream order, teams (also from a unique ID); the device API of kernels built with NVIDIA's NVSHMEM headers and device library, all PEs peer to peer |
 | cuSPARSELt | `libcusparseLt.so.0` | 2:4 structured sparse matrix products, the whole 0.10 API: dense and structured descriptors with batches, fp16, bf16, tf32, int8 (into int8, int32, fp16, bf16) and, on an sm_89 profile, E4M3 and E5M2 (into fp16, bf16, fp32) in either operand, transposes and both orders, STRIP and TILE pruning and the prune check value for value with the card, compression with the card's sizes and layout, bias, ReLU, GELU and alpha/beta vectors, the search, graph capture. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
 | cuTENSOR | `libcutensor.so.2` | the 2.x API: contractions and trinary contractions in every type and compute combination an RTX 3060 plans (R16F, R16BF, R32F, C32F, R64F, C64F, R64F x C64F; 16F to 8XINT8), permutations with type conversion and padding, elementwise binary and trinary operations with every unary and binary operator, reductions (ADD, MUL, MAX, MIN), plan preferences, the plan cache and its file, workspace estimation, every execute call captured into a CUDA graph. NVIDIA's own carries a static CUDA runtime that cannot reach a simulated driver; this one is written from the documented API |
-| cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition; the gesvd, gesvdj, gesvdp and gesvdr algorithms) and gate splitting on cuSOLVER; gradients of a network. Built on the simulator's cuTENSOR and cuSOLVER |
+| cuTensorNet (cuQuantum) | `libcutensornet.so.2` | what cuQuantum Python's tensor-network contraction calls: networks built tensor by tensor (and the older descriptor and plan API), the contraction optimizer (a greedy path; slicing to a workspace limit and a minimum slice count) with its configuration and information, packed infos, workspace sizing, slice groups, conjugated inputs and hyperedges; QR, SVD (every truncation, normalization and partition; the gesvd, gesvdj, gesvdp and gesvdr algorithms) and gate splitting on cuSOLVER; gradients of a network and of a state's expectation value; distributed execution over an MPI communication library. Built on the simulator's cuTENSOR and cuSOLVER |
 | NVRTC | `libnvrtc.so.13` | compiling CUDA C++ at run time with the toolkit's own NVRTC: PTX, the cubin of an sm_ target, LTO-IR, OptiX-IR, precompiled headers, time tables (below) |
 | nvJitLink | `libnvJitLink.so.13` | linking PTX, or relocatable SASS, from cubins, fatbins, and host objects' and static libraries' device code into one loadable image, with the device linker's rules; LTO-IR through the toolkit's linker (below) |
 | nvFatbin | `libnvfatbin.so.13` | writing fatbins at run time -- PTX, cubins, LTO-IR, a host object's relocatable PTX -- compressed as NVIDIA's are, that the driver loads |
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring, watershed segmentation -- every entry point OpenCV, DALI, FFmpeg, jetson-utils and the CUDA Samples call (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
-| NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; H.264 and HEVC frames written as lossless PCM streams any decoder reads (below) |
+| NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; compressing H.264 (CAVLC and CABAC, 8x8 transform, P and B pictures, slices) and HEVC (intra, P and B pictures, in-loop deblocking) encoders, rate control, and the card's NEED_MORE_INPUT protocol for B pictures (below) |
 | NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
 
 ## Why the math runs on the host
@@ -489,16 +742,21 @@ outside [0, 1] is accepted, bfloat16 is `NOT_SUPPORTED`. An RNN's dropout
 between layers is the same kernel: after each layer but the last, each
 direction of the next layer gets a mask of its own over the whole of the
 lower layer's output, `[T][B][hidden * dirs]`, forward direction first, layer
-after layer. The classic multi-head attention API's two dropouts are the same
+after layer. With sequences shorter than the longest (padded I/O enabled, in
+the sequence-major, batch-major and packed layouts alike) a mask covers the
+valid steps only: time step after time step, and at each step the batch
+entries from the longest sequence to the shortest (equal lengths in their own
+order), whatever order the data is in. The classic multi-head attention API's two dropouts are the same
 kernel too: the attention dropout is one application over the probabilities,
 `[batch][beam][head][query step][key step]`, the post dropout one over the
 output vectors, `[batch][beam][query step][output]`, applied after the output
 projection and before the residual is added, both over the dimensions of the
 data the call was given, padded steps included.
 `e2e_dnn_dropout`, `e2e_dnn_rnn_dropout` and `e2e_dnn_attn_dropout` check all of
-it against a host model on the card's library and on this one. Not measured,
-and so not claimed: an RNN batch of sequences shorter than the longest
-(padded I/O), and the states size of GPUs other than the RTX 3060.
+it against a host model on the card's library and on this one (the RNN one
+with padded batches in all three layouts, unsorted and tied lengths,
+bidirectional and three layers). Not measured, and so not claimed: the states
+size of GPUs other than the RTX 3060.
 
 Two more things the card does that were first taken for refusals. The classic
 API's fused `CUDNN_FUSED_SCALE_BIAS_ACTIVATION_WGRAD` (the weight gradient of
@@ -525,11 +783,19 @@ gradients of the scale and bias come back as the combined sums divided by the
 number of GPUs (measured with two; with more it is assumed). The words inside
 the peer tensors are cuDNN's own protocol (a pair of a value and a flag for
 each statistic, as far as the tensors show), which this library does not use:
-its executions meet in memory, so they must be threads of one process, and a
-lone execution of a two-GPU graph fails after `VGPU_CUDNN_PEER_TIMEOUT_MS`
+its executions meet in memory (threads of one process) or, when the peer
+tensors are memory shared between processes -- a file mapped `MAP_SHARED`
+(pinned with `cudaHostRegister`, which the card's driver accepts for tmpfs
+only, and whose device address is `cudaHostGetDevicePointer`'s, not the
+host's) or CUDA IPC memory -- through files in the machine directory, each
+process naming the group by the files and offsets behind its tensors; a lone
+execution of a two-GPU graph fails after `VGPU_CUDNN_PEER_TIMEOUT_MS`
 (60 s) with `CUDNN_STATUS_EXECUTION_FAILED` where NVIDIA's kernel would wait.
 `e2e_dnn_multigpu_norm` (two GPUs) checks half and float, forward and
-backward, on both libraries.
+backward, on both libraries, with two threads and with two processes (one
+GPU each) on the shared pinned file; the IPC form runs on the simulator only
+(the card's two GPUs have no peer access, so it cannot open the other's
+memory there).
 
 The graph API's attention was pinned down against cuDNN 9.27 on an RTX 3060
 through cudnn-frontend 1.30, the frontend PyTorch and Transformer Engine
@@ -551,13 +817,23 @@ grouped-query heads; bias and its gradient; padding; paged K and V caches; packe
 sequences; an interleaved layout; dropout -- and NVIDIA's library agrees in
 every one it has an engine for (it has none for float's backward pass), as
 VirtualGPU does in all of them. Dropout keeps each probability with chance
-1 - p from a Philox4x32-10 stream keyed by the graph's seed and offset, as
-cuDNN documents its RNG operation, and the backward pass regenerates the
-forward pass's mask from the same pair; the mask's layout is cuDNN's
-kernel's own (on an RTX 3060 it repeats with the row's position in an MMA
-tile and depends on the sequence length's tiling) and is not reproduced, so
-the kept fraction, scaling and reproducibility match while the individual
-elements kept differ. Also measured and matched: max pooling's index tensor
+1 - p, and the unified operation's mask is the card's, element for element:
+each element is a 16-bit number from a Philox4x32-**7** call keyed by the
+seed, kept when it is at most floor((1 - p) * 65536); a call covers eight
+elements and is picked by the 16x16 tile (numbered down the rows first), the
+column mod 8, the batch-and-head plane (eight counters apart), and the offset
+(a quarter of it, plus one for every second row of eight). Measured on the RTX
+3060 through the rng_dump tensor and by bisecting the probability (nothing
+read from cuDNN's code), `e2e_dnn_sdpa_mask` holds the layout on the host and
+checks it on both, over lengths from 1 to 1000 (multiples of 16 or not),
+batches and heads up to 4 x 8, head sizes 32 to 256, half and bfloat16, seeds
+past 32 bits and offsets past 2^32. Two edges: a negative offset is not
+matched for every eighth column, and a single query row over 257 to 512 keys
+leaves most of the dump unwritten on the card (the same formula is used there).
+Seeds and offsets are read through a double, so those past 2^53 lose their low
+bits. The composite graph's RNG operation is not the unified node's generator
+(it follows the documented Philox4x32-10 stream); the unified node's
+backward pass with dropout was not examined. Also measured and matched: max pooling's index tensor
 is INT8, the maximum's row-major position within its window with padded taps
 counted, and the backward pass may read it in place of x; nearest and
 bilinear resampling refuse a window other than 2 when the descriptor is
@@ -615,6 +891,9 @@ runs them; each is a ctest of its own.
 | `e2e_fft_callbacks` | LTO load and store callbacks in C2C (strided, batched, callerInfo), R2C, Z2Z and C2R; what cufftXtSetJITCallback and planning refuse; libcufft.so's NOT_IMPLEMENTED legacy callbacks | cuFFT callbacks (CUDA 12.6+) |
 | `e2e_fft_legacy_callbacks` | `cufftXtSetCallback`: `CUFFT_NOT_IMPLEMENTED` from the shim and from NVIDIA's `libcufft.so` (`--card --dynamic`); with `--card`, the documented route through NVIDIA's static cuFFT on an RTX 3060 (load and store callbacks in C2C, R2C, Z2Z, C2R; callerInfo; clearing one), which cannot run on the simulator | cuFFT callbacks (before CUDA 12.6) |
 | `e2e_fft_lto_callbacks` | `cufftXtSetJITCallback` given as LTO-IR (nvcc -dlto): C2C, R2C, Z2Z with separate load and store images; passes against NVIDIA's cuFFT on an RTX 3060 (`--card`), and on the simulator where the host has the CUDA toolkit | cuFFT callbacks (CUDA 12.6+) |
+| `e2e_cutensornet_state_gradient` | the gradients of a state's expectation value (`cutensornetExpectationComputeWithGradientsBackward`): PyTorch's convention for complex data, checked against finite differences of the forward value for one-mode and two-mode gates, strided buffers, mixed states and the norm's adjoint; the zeros for adjoint gates and gates outside the light cone; overwrite and accumulate; the arguments and their order; real and single-precision states | quantum tensor-network libraries |
+| `e2e_cutensornet_mpi` | cuTensorNet over MPI (Open MPI, two and three ranks, one simulated GPU each): the communicator calls and the primitives behind each, which rank contracts which slice, the sums, failing primitives, the state API's sums and an expectation value's terms, libraries that cannot be loaded; the checks pass against NVIDIA's library on two RTX 3060s (`run_cutensornet_mpi.sh --card`) | multi-GPU quantum simulation |
+| `e2e_nvshmem_bootstrap` | NVSHMEM bootstrapped by an MPI communicator, `NVSHMEM_BOOTSTRAP=MPI`, the MPI plugin by name, PMIx, OpenSHMEM and PMI without its library, and the settings it refuses; the shim and NVIDIA's NVSHMEM 3.8 on an RTX 3060 print the same (`run_nvshmem_bootstrap.sh --card`) | multi-GPU jobs |
 | `e2e_cutensornet_decomp_paths` | cuTensorNet's SVD with every algorithm (reconstruction, singular values, residual and sweeps, error in sigma, gesvdr's host scratch and rank rule), half precision and capture refusals, workspace statuses, network gradients (real and complex, overwrite and accumulate, argument errors) | quantum tensor-network libraries |
 | `e2e_solver_paths` | cuSOLVER X API, gesvdj/syevj and their batched forms, gesvdaStridedBatched, batched potrf/potrs; cuBLAS batched LU | `torch.linalg` |
 | `e2e_solver_sparse_paths` | cusolverSp: LU, QR and Cholesky solves in S/D/C/Z with every reorder, singularity, least squares, shift-inverse eigenvalues, reorderings (NVIDIA's permutations for symrcm, symamd, symmdq), permutations, batched QR | `scipy`-style sparse solves |
@@ -638,9 +917,12 @@ runs them; each is a ctest of its own.
 | `e2e_lt_paths` | fp16/bf16 matmul with bias epilogues, strided batches, row-major layouts, FP8 scales and amax | `addmm`, `bmm`, `_scaled_mm` |
 | `e2e_lt_epilogue_paths` | RELU_AUX/GELU_AUX's mask and input, DRELU/DGELU and their bias gradients, BGRADA/BGRADB, in fp16/bf16/fp32/fp64, and what the card refuses | a training step's backward pass (cuBLASLt-fused linear layers) |
 | `e2e_graph_capture_libs` | cuBLASLt's matmul with a bias epilogue, cuDNN's graph-API convolution and a driver-API `cuLaunchKernel` recorded into a captured CUDA graph, their descriptors, plan and pack destroyed after the capture, then launched with new inputs: the capture runs nothing, every launch reads what the graph's kernels wrote before it (`run_graph_capture_libs.sh --card` runs the same program on NVIDIA's libraries; it passes there) | PyTorch's CUDA graphs: `torch.cuda.graph`, `make_graphed_callables`, `mode="reduce-overhead"`, Triton kernels inside a graph |
+| `e2e_graph_capture_dnn`, `e2e_graph_capture_fft`, `e2e_graph_capture_solver`, `e2e_graph_capture_solver_sp`, `e2e_graph_capture_rand`, `e2e_graph_capture_jpeg`, `e2e_graph_capture_npp` | cuDNN's classic API, cuFFT, cuSOLVER's dense API, cuRAND, nvJPEG's decode and NPP's `_Ctx` functions recorded into a captured CUDA graph (descriptors, plans and parameter objects destroyed after the capture), then launched with new inputs, each compared with an eager run; the calls NVIDIA's library cannot capture answer as it does and invalidate the capture. `graph_capture_common.h` is the harness; `run_graph_capture.sh <name> <libs> --card` runs the same program on NVIDIA's libraries (all pass there) | PyTorch's CUDA graphs with BatchNorm, RNNs, FFTs, linear algebra; XLA, Warp |
+| `e2e_graph_capture_nccl` | NCCL's all-reduce (sum, max, average, in place, with a pre-multiplied operator destroyed after the capture), broadcast, reduce, all-gather, reduce-scatter and send/recv recorded into captured graphs, a rank per thread on two devices, launched together and compared with eager calls, the order of collectives still in step afterwards; `run_graph_capture_nccl.sh --card` runs it on NVIDIA's NCCL (2.28.9) on two RTX 3060s | PyTorch DDP and `torch.cuda.graph` with NCCL collectives, Megatron |
+| `e2e_graph_capture_driver`, `e2e_graph_driver` | the driver API's stream calls inside a capture made with `cuStreamBeginCapture` (copies of every shape, fills, host functions, events across streams, stream memory operations, stream-ordered allocation, and the calls a capture refuses) and the driver's explicit graphs (`cuGraphAdd*Node`, Get/SetParams, executable-graph updates, clones, user objects, capture into a graph); both run on NVIDIA's driver too | XLA, Warp, cuda-python |
 | `e2e_lt_blockscaled_paths` | MXFP8 and NVFP4 block scales in the tiled layout, the 128-element and 128x128 FP32 forms, D's block quantization and its output scales (simulator only: documentation-derived) | `_scaled_mm` with block scales |
-| `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4 and an RTX 3060 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
-| `e2e_lowprec_sparselt` | 1096 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4 and an RTX 3060 | FP8 2:4 sparse inference |
+| `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4, an L40S, an RTX 3060 and an RTX PRO 6000 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
+| `e2e_lowprec_sparselt` | 1097 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4, an L40S, an RTX 3060 and an RTX PRO 6000 (one case of the last differs, `known-gaps.txt`) | FP8 2:4 sparse inference |
 | `e2e_lowprec_cvt` | the packed FP8 conversions (e4m3x2, e5m2x2 from f32 and f16x2, .relu, and back) over 512 values with NaN, infinities, zeros, subnormals and ties, on SASS and PTX, against an L4 | `__nv_fp8` conversions on sm_89 and later |
 | `e2e_dnn_int8x32` | an INT8x32 convolution through the graph API with the filter reordered by `cudnnReorderFilterAndBias` (`CUDNN_TENSOR_REORDERING_INT8x32`); the same program passes against NVIDIA's cuDNN on an RTX 3060 | INT8 inference engines built on cudnn-frontend |
 | `e2e_blas_packed_paths`, `e2e_blas_batched_paths`, `e2e_blas_64_paths`, `e2e_blas_legacy_paths`, `e2e_blas_xt_paths` | cuBLAS's band and packed level 2, batched GEMV, getri/matinv, syrkx/herkx, the `_64` forms, the handle settings, the legacy API and cuBLASXt on two devices | SciPy-style BLAS callers, multi-GPU GEMM |
@@ -651,6 +933,7 @@ runs them; each is a ctest of its own.
 | `e2e_dnn_multigpu_norm` | multi-GPU batch normalization, forward and backward, half and float, two GPUs and two threads, peer tensors in pinned host memory | apex-style synchronized batch norm through cudnn-frontend |
 | `e2e_dnn_graph` | cuDNN graphs: conv + bias + ReLU, dgrad + ReLU backward, matmul + bias + GELU, reductions, pointwise forward and backward, layer/RMS/batch/group norm forward and backward, backward without saved statistics, max and average pooling both ways, max pooling's index tensor, asymmetric padding, concatenation, statistics generation, RNG, reshape, transpose, slice, an INT8x4 vectorized convolution | `cudnn_convolution_add_relu`, cudnn-frontend |
 | `e2e_dnn_fp8_attention`, `e2e_dnn_fp8_attention_frontend` | per-tensor FP8 attention forward (descale of Q, K, V and S, scale of S and O, amax of S and O) on a Hopper profile, built from the backend API and by cudnn-frontend's `sdpa_fp8`, against the documented formulas (documentation-derived; no card), and MXFP8's refusal | Transformer Engine's FP8 attention |
+| `e2e_dnn_sdpa_mask` | the unified attention node's dropout mask (the rng_dump tensor) cell by cell against a host model of the card's layout (Philox4x32-7, 16x16 tiles, row groups, heads), 21 shapes, offsets, seeds and types, and the output over the kept probabilities; run on the RTX 3060 too (`run_dnn_card.sh dnn_sdpa_mask`) | `scaled_dot_product_attention` with dropout through cuDNN |
 | `e2e_dnn_attention` | cuDNN scaled dot-product attention built by cudnn-frontend 1.30 (fetched): the unified and composite forms forward and backward, causal (both alignments) and sliding-window masks, bias, grouped-query heads, padding, paged K/V caches, ragged sequences, dropout, half/bfloat16/float | `scaled_dot_product_attention` with the cuDNN backend, Transformer Engine |
 
 The programs were also run against NVIDIA's own libraries on an RTX 3060, so
@@ -928,6 +1211,84 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
   pattern that depends on the image width and none of the shapes tried fits
   (it is under 0.5% of a 512x512 image for the skull and teapot, a few tenths
   of a percent for rocks); the simulator writes them.
+- **Why the equal-value labels are not exact: NPP merges in 16-pixel tiles and does not finish.** Round 4
+  probed it with about 15,000 one-row images of 3 values, flat images of every width and 4-way images of both
+  shapes (`tools/probes/npp_watershed_probe.cu` prints what the card writes; compare with the model in
+  `npp_core.hpp`). What was found (round 5 solved the 4-way item below and added the findings marked R5); the
+  equal-value labels are still not reproduced:
+  - the rules of `npp_core.hpp` are exact on every row of up to 16 pixels (every row of 2 to 8 pixels of 3
+    values was compared) except those that start with two equal pixels and a different third (`a a b ...`):
+    then the region holding pixel 0 is labelled 1, not 0, and a pixel 0 that was a separate root joins its
+    neighbour's region. (`a a a b`, `a b ...` and a pair anywhere else, a tile start at x = 16 included, are
+    as the model has them);
+  - the pull rule (a pixel whose two lowest neighbours are tied makes a root take the other one's pixel index as a
+    label) holds inside a tile; across a tile border (the pixel at x = 15 with a non-root at 14 and a root at 16)
+    the root keeps the plain label (the pixel index above and to its left), 15 instead of the model's 14;
+  - **a plateau wider than a tile is not always merged into one label.** A flat row of width w (any value) comes
+    back as one label 0 up to a position and then as strips: for every w up to 600 the strips start at the
+    positions x = c + 16 k that are at least x0 and below w, where (c, x0) is (0, 48) for w mod 16 in 0..4,
+    (5, 37) for 5..9, (6, 70) for 10 and (11, 59) for 11..15, and the strips are labelled 14, 30, 46, ... in order
+    (16 i + 14, wherever they start). Taller flat images split into column and row strips the same way, but at
+    other positions (a 256 x 100 one at x = 221, 237, 253: the positions depend on the height too), and on the
+    teapot the black background is one label up to x = 495 and another (14) from x = 496 on, in every row of the
+    top 69. The labels are merged through some number of passes that leaves a width-dependent remainder;
+  - R5, what the strips look like (measured on the card, none reproduced):
+    * a row of 2 or more pixels is exact in the model except the "a a b" rule above, which holds for every row up to
+      36 pixels and every leading run of exactly two equal pixels (the first region is labelled 1 instead of 0):
+      600 random 3-valued rows of 2 to 36 pixels match the model with that one rule;
+    * a flat image's labels depend on x alone (every row is the same) when it is tall enough, and on y alone when
+      it is narrow; a column (w = 1) behaves like a row. The first strip starts at x0(w % 16, h): 48 for w % 16 in
+      0..4 and h <= 16, 37 for 5..9, 70 for 10, 59 for 11..15, and with more rows it grows: for w % 16 = 0, x0 = 60,
+      61, ... 64 for h = 17..21, 76 for 22, ... 78 for 27..37, 112 for 38, 124 ... 128 for 39..46, and so on
+      (roughly 2 h + 16: the reach in x is about 2 n + 1 tiles for n tiles of 16 rows, and the vertical merge is
+      complete from a few tile rows up). The h at which x0 steps are the same for every w % 16 while the size of the
+      steps (1 or 12) is not, and rows below row 0 change it (raising the bottom rows to a ramp moves x0 as if h had
+      changed), so the labels of row 0 depend on the whole image;
+    * a bump (one pixel higher than a flat zero row) at p changes only the pixels x >= p + 34 up to the end of the
+      16-pixel tile that holds p + 34, which take the label p + 1: the union across the bump reaches two tiles and
+      two pixels to the right and no further;
+    * the unwritten pixels of 4-way mode (below) repeat every 112 in the width, the lcm of 14 (a tile of 16 with a
+      pixel of halo each side) and 16, while the strips repeat every 16: the merge passes that finish the labels are
+      not those that finish the flow;
+  - **4-way connectivity** (solved in round 5, for the segmented image and for the labels of images with no equal
+    neighbours): NPP 13.0 leaves some pixels unwritten. A pixel whose lowest neighbour is the one to its right (below)
+    keeps its own value, as if it were a root, when its column (row) is in a set that depends on the width (height)
+    alone: with t = width - 1 - x, the set is a function of the width % 112 (kUnwritten4 in `npp_core.hpp`, one
+    bit per t from 1 to 11; it repeats from a width of 12, and below that it is the same set cut at t <= width - 1;
+    the same for rows), measured on east-flowing ramps of every width from 2 to 1099 and checked on random images
+    of 5 to 300 pixels a side, with and without equal values, 8-bit and 16-bit (no image differs). Such a pixel's
+    label is its own index; a root's is the smallest index of its closed 4-neighbourhood. The pixels that flow to an
+    unwritten one end there, so the segmented values follow. NPP also keeps state between calls: after a 16-bit run of
+    100 x 90 the next large 8-bit image of another type can differ in a pixel or two (found as one line of the
+    conformance program, `npp_segment`, that moved when the work buffer was zeroed and still differed; the
+    simulator is the state-free behaviour);
+  - **Round 6: the equal-neighbour labels were tried again and are NOT reproducible from outside** (exhaustive
+    small images, `tools/probes/npp_watershed_ties.py`). The card is deterministic (the same batch twice, and in
+    reverse order, gives the same bytes), so this is a rule nobody has, not noise. What the 2-valued images of
+    every pattern up to 4 x 3 show:
+    * the simulator's labels differ from the card's on 44 of the 512 3x3 images (8-way), 96 of 512 (4-way),
+      466 of 4096 4x3 images (8-way) and 927 (4-way); on random 3-valued images the labels differ in most images
+      from 12x12 up;
+    * the "pull" rule (a pixel whose lowest neighbours are tied merges the later roots among them into the first
+      one's region) is right in a row (`0 1 0 1 0` is one region, label 0) and wrong in a plane: in
+      `1 1 0 0 / 0 1 0 0` the pixel at x = 1 ties the roots 2, 4 and 6, yet the card keeps root 4 (label 0)
+      apart from the plateau of 2, 3, 6, 7 (label 1). Switching the rule off or restricting it to opposite
+      neighbours is worse (3x3, 8-way: 44 images of 512 differ with the rule, 69 with it restricted to opposite
+      neighbours, 143 without it), so none of these is right;
+    * pixel 0 behaves differently from every other pixel and not locally: `1 1 0 / 1 1 0 / 0 0 0` labels the
+      whole image 1, including the root at pixel 0 whose own closed neighbourhood starts at 0, while the same
+      two columns over two rows (`1 1 0 / 1 1 0`) keep pixel 0 and pixel 3 at label 0; `0 0 1 / 0 0 0 / 1 0 0` is
+      all 1 and `0 0 1 / 0 0 0 / 0 0 1` is all 0 -- which pixel of the bottom row is 1 decides whether the
+      plateau holding pixel 0 is labelled 0 or 1;
+    * flat images split into strips whose start depends on the width mod 16 and, in steps that are not
+      periodic (48; 60-64; 76-78; 112; 124-128; 140 ... for w = 320 and h = 16, 17-21, 22-37, 38, 39-46, 58),
+      on the height.
+    These are the signature of a parallel union that runs a fixed schedule of tile passes and does not converge,
+    with a pass count that depends on the whole image. A rule would have to be the schedule itself, which
+    cannot be read off black-box output; the simulator keeps the fitted model, and the conformance program keeps
+    pinning only what is exact (the segmented image, labels of images without equal neighbours).
+  The segmented image is exact for both connectivities regardless; the compressed labels of the Samples' images
+  differ because a label that differs moves every rank after it.
 - Label compression is exact for any label image: labels below
   `nStartingNumber` take their rank among the labels present plus 0, which is
   always counted, so 0 stays 0, an image with no 0 starts at 1 and
@@ -1154,6 +1515,34 @@ documentation; the local card has no `a` target).
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
 
+- **Every function cuda_runtime_api.h and cuda.h declare is exported**
+  (`tests/lint/check_header_exports.py`, test `lint_header_exports`, preprocesses
+  both headers with and without `CUDA_API_PER_THREAD_DEFAULT_STREAM` and
+  compares them with the built shims' dynamic symbols; against the CUDA 13.0
+  headers it finds 0 missing, where the sweep found 64 in the runtime and 200 in
+  the driver). A program that binds by name (PyTorch is linked `-z now`) no
+  longer fails to load for a missing function. What each one does is in
+  `runtime_sweep.inc` and `driver_sweep.inc`, and `e2e_exports_sweep_runtime` /
+  `e2e_exports_sweep_driver` call them with argument cases that an RTX 3060
+  printed (`exports_sweep_*.rtx3060.expected`, regenerated from the card with
+  `run_exports_sweep.sh runtime|driver --card --update`). Where the library
+  runs a function the sweep implements it (batched copies, the 3D peer copy,
+  `cudaGetFuncBySymbol`, the coredump attributes, `cuDeviceGetDevResource`,
+  the `_ptsz`/`_ptds` per-thread-stream names, ...). Where it cannot, the name
+  answers the library's own "not supported" status, once, with a note on stderr:
+  green contexts and their resources, conditional graph handles, external
+  semaphore graph nodes, pools in host memory, and file-descriptor external
+  memory. One differs from the card in a way the sweep test leaves out: the
+  card answers a valid `cuDeviceGetLuid` where the shim refuses, and the card
+  segfaults on a garbage handle, a null stream in some calls and a second
+  unregister, which the shim answers with the documented status instead.
+  Not covered: the functions only the CUDA 13.2 headers declare (26 in the
+  runtime, 24 in the driver), because no 13.2 header is part of the build.
+  Not changed: `cudaFuncGetAttributes` reports the opt-in shared-memory limit as
+  `maxDynamicSharedSizeBytes` of every kernel, where the card reports 48 KiB
+  less the kernel's static shared memory (48896 for 256 bytes) until
+  `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` raises it.
+
 - **cuBLAS**: the exported names the header does not declare (`cublas?bdmm`,
   `cublasGet/SetBackdoor`, `cublasGet/SetEnvironmentMode`); a program that
   needs one fails to load with the name. cuBLASXt runs GEMM's tiles across the
@@ -1196,16 +1585,78 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   (an assumption). The backward epilogues match the card, except that GELU and
   its derivative are exact where the card's fp32 tanh is approximate (within
   about 5e-5), which is why the probe checks GELU against the function, not a hash.
-- **Stream capture**: cuBLAS, cuBLASLt (`cublasLtMatmul`), cuDNN's graph API
-  (`cudnnBackendExecute`), cuSPARSE, cuSPARSELt, cuTENSOR, cuDSS and the driver
-  API's `cuLaunchKernel`/`cuLaunchKernelEx` are recorded into a captured CUDA
-  graph and run at each launch (a library call as a host node, a driver launch
-  as a kernel node whose parameters `cudaGraphKernelNodeGetParams` and
-  `SetParams` do not give back). Not recorded yet, and so refused when the
-  stream is capturing -- they fail the capture -- cuDNN's classic API
-  (`cudnnConvolutionForward`, BatchNorm, RNNs, ...) and `cudnnBackendPopulateCudaGraph`,
-  and the other driver-API stream calls (`cuMemcpyAsync`, `cuMemsetD*Async`,
-  events, `cuStreamWaitEvent`, `cuGraph*`), which still run when called.
+- **Stream capture**: a library call made while its stream is captured is
+  recorded into the graph and runs at each launch, over what the graph's own
+  kernels have written by then, with the descriptors, plans and parameter
+  objects it was given as they were at the call (the program may destroy them
+  as soon as the capture function returns). Recorded: cuBLAS, cuBLASLt,
+  cuSPARSE, cuSPARSELt, cuTENSOR, cuDSS, cuDNN's graph API and its **whole
+  classic API** (convolution, activation, pooling, softmax, LRN, divisive
+  normalization, tensor arithmetic and transforms, batch normalization and the
+  normalization API with their Ex forms, the spatial transformer, CTC, dropout,
+  fused ops, RNNs and multi-head attention: `VGPU_DEFER`, which probes the call
+  with the caller's arguments so every status comes back at the call, then
+  copies the descriptors and host scalars and arrays), **cuFFT** (`cufftExec*`
+  with a copy of the plan), **cuSOLVER's dense API** (the routines NVIDIA's
+  library captures; `gesvd`, `syevd`, `sygvd`, `sytrf` and the 64-bit
+  `Xsyevd`, `Xgesvd`, ... cannot be captured on the card -- they wait for the
+  stream -- and answer INTERNAL_ERROR here and invalidate the capture, as do
+  `syevj` and the iterative-refinement solvers `DSgesv`, `DSgels`, `IRSXgesv`
+  and their kin), **cuRAND** (the capture takes its place
+  in the generator's stream, the first launch draws what an eager call would
+  have, later launches of a pseudorandom generator draw other numbers, a
+  quasirandom one repeats: as the card), **NPP**'s `_Ctx` functions, and
+  **nvJPEG**'s decode (parsed at the call, the pixels written at each launch;
+  the encoders wait for the stream and fail with EXECUTION_FAILED, the capture
+  invalidated, as on the card), and **NCCL**'s collectives and
+  point-to-point operations (a host node of the graph that does the operation
+  at each launch, taking its place in the communicator's order then; the
+  ranks' graphs have to be launched concurrently, a thread or process each,
+  because a launch runs its graph in the calling thread; inside a group the
+  sends are recorded first). The **driver API**: a copy, fill or host
+  function on a capturing stream is a node (`cuMemcpy*Async`,
+  `cuMemsetD*Async`, `cuLaunchHostFunc`, stream memory operations, `cuLaunchKernel`),
+  `cuMemAllocAsync`/`cuMemFreeAsync` are graph allocation nodes, events and
+  `cuStreamWaitEvent` fork and join streams, and the calls CUDA refuses while
+  capturing (`cuMemAlloc*`, `cuStreamSynchronize`, `cuCtxSynchronize`,
+  `cuMemPrefetchAsync`, `cuMemcpyPeerAsync`, ...) answer
+  CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED and invalidate the capture. libcuda also
+  has the driver's own capture and graph API now (`cuStreamBeginCapture`,
+  `cuGraph*`, user objects, `cuStreamWaitValue*`/`WriteValue*`/`BatchMemOp`; it
+  forwards to the runtime's graphs). Kernel, copy, fill and batch memory
+  operation nodes of the driver are closures over a copy of the driver's
+  parameters; a node a capture made, or a graph the runtime made, gives no
+  parameters back through `cuGraph*NodeGetParams`.
+  Every program that checks this (`e2e_graph_capture_*`, `e2e_graph_driver`)
+  also runs against NVIDIA's libraries on the card
+  (`run_graph_capture.sh <name> <libs> --card`) and passes there.
+  **cuSOLVER's sparse API** (`cusolverSp`): the low-level Cholesky's
+  `csrcholFactor`, `csrcholSolve` and `csrcholDiag`, the low-level QR's
+  `csrqrSetup`, `csrqrFactor` and `csrqrSolve`, and `csrqrsvBatched` are
+  recorded (the info objects they share are not copied: they have to outlive
+  the graph); the buffer-size queries and the `...Host` forms do not touch the
+  stream and leave the capture alone; what waits for the device -- `csrlsvqr`,
+  `csrlsvchol`, `csreigvsi`, the two `csr*ZeroPivot` and the three analyses --
+  answers INTERNAL_ERROR and invalidates the capture, and `csrcholFactor`,
+  which allocates scratch memory on every call, answers ALLOC_FAILED in a
+  capture in the global mode (all measured on an RTX 3060; `csrqrSetup` and
+  `csrqrsvBatched` are refused in the global mode too when they are the first
+  call on a handle that needs scratch memory, which is not modelled). The classic cuDNN
+  `cudnnFindConvolution*Algorithm` calls time kernels: the `Ex` forms answer
+  and invalidate the capture, the others are refused with 4004 in the global
+  mode as well, as the card does.
+  **Not recorded** (they run when called, so a replay misses them -- or, for
+  the ones that wait on the stream, fail the capture): multi-GPU cuFFT
+  descriptors and cuFFT callbacks,
+  cuTensorNet and cuStateVec (no NVIDIA library here to measure against), and
+  `cudnnBackendPopulateCudaGraph`, which answers NOT_SUPPORTED as cuDNN does
+  for an engine without native CUDA-graph support. cusolverRf and cusolverMg
+  take no stream (they work on the default one, which cannot be captured). Not
+  copied for a captured call: a cuFFT plan with LTO callbacks, a cuRAND
+  generator, an nvJPEG handle or state, a cuSOLVER workspace -- these have to
+  outlive the graph, as NVIDIA's do. The driver API does not refuse module
+  loading while capturing (NVIDIA's invalidates the capture) so that lazily
+  loaded kernels (Triton's) keep working.
 - **cuDNN**: in the graph API, interpolating resampling beyond bilinear
   upsampling by 2 (the one configuration cuDNN has an engine for; nearest
   has none, which cuDNN documents), block-scaled (MXFP8) attention (E8M0
@@ -1216,23 +1667,17 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `e2e_dnn_fp8_attention_frontend`; FP8 is a graph tensor type now),
   attention's block masks and cumulative sequence lengths, sinks in the
   backward attention operation, F16x16 and FP8-128x4 reordered tensors (the
-  INT8x32 filter reordering works: `e2e_dnn_int8x32`), multi-GPU
-  normalization across processes (its executions meet in memory, so they
-  must be threads of one process; with more than two GPUs the gradients'
-  division by the number of GPUs is assumed), the MoE backward (cuDNN's
+  INT8x32 filter reordering works: `e2e_dnn_int8x32`), the gradients'
+  division by the number of GPUs of multi-GPU normalization with more than
+  two GPUs (assumed; the card has two), the MoE backward (cuDNN's
   engine for it wants Hopper or Blackwell and, documented, cuBLASLt 13.5,
   newer than this stack's), band-matrix and standalone RoPE operations (no
   engine on the RTX 3060, the only GPU measured; whether Hopper and Blackwell
-  have one was not checked: the AWS H100 launch for it was denied), and the
-  dropout mask layout of the fused attention kernels (the mask is drawn from
-  the documented Philox generator but not placed as the kernels place it; the
-  classic API's dropout, RNN and multi-head attention included, is cuDNN's own
-  bit for bit); in the classic API, the fused ops cuDNN's header marks
-  "reserved for future use" (`CONV_SCALE_BIAS_ADD_ACTIVATION` and the two
-  undocumented ones), which the card refuses too, multi-head attention's
-  one-to-one query mapping with beams (refused by the hardware as well), and
-  the dropout masks of an RNN batch of sequences shorter than the longest
-  (padded I/O), whose layout was not measured.
+  have one was not checked: the AWS H100 launch for it was denied); in the
+  classic API, the fused ops cuDNN's header marks "reserved for future use"
+  (`CONV_SCALE_BIAS_ADD_ACTIVATION` and the two undocumented ones), which the
+  card refuses too, and multi-head attention's one-to-one query mapping with
+  beams (refused by the hardware as well).
 - **cuFFT**: legacy callbacks (`cufftXtSetCallback` with a device function
   pointer) through this library: NVIDIA ships them only in its static library,
   its `libcufft.so` answers every legacy callback call with
@@ -1295,14 +1740,15 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   with an algo other than 0 is NOT_SUPPORTED (the documentation: "only support
   algo = 0 (QR)"; NVIDIA's does nothing and reports success). The solvers
   agree with NVIDIA's to rounding, not bit for bit: they compute in double.
-- **cuSPARSELt**: FP4 (E2M1) inputs past the descriptor (an L4 and an RTX 3060 accept
-  the descriptor and refuse the algorithm; later GPUs' sparse FP4 format is not
-  implemented), FP8 outputs and the block scale modes `VEC32_UE4M3` and
-  `VEC64_UE8M0` (the same GPUs refuse them too), FP8 on Hopper and Blackwell
+- **cuSPARSELt**: FP4 (E2M1) inputs past the descriptor on any GPU but an RTX PRO 6000 (an L4 and an RTX 3060
+  accept the descriptor and refuse the algorithm; the RTX PRO 6000's sparse FP4, 4:8 in pairs, is implemented from
+  its card transcript, and its compressed *metadata layout* is not the card's, only the sizes are), FP8 outputs and the
+  block scale modes `VEC32_UE4M3` and `VEC64_UE8M0` (on C, D and D's output everywhere; on A and B, the GPUs
+  other than an RTX PRO 6000 refuse them), FP8 on Hopper and the data-center Blackwell GPUs
   (documentation-derived: the L4's table is what is implemented), fp16 compute
   (no kernel on sm_86 or sm_89 on NVIDIA's library either), and GELU outside int8
-  and FP8-into-bf16 output (refused there too); see the section above for where
-  the compressed layout and the search differ.
+  and FP8-into-bf16 output (refused there too; an RTX PRO 6000 takes FP8 into fp16, bf16 and fp32); see the
+  section above for where the compressed layout and the search differ.
 - **cuSOLVER**: left eigenvectors from `Xgeev` (NVIDIA's CUDA 13.0 and 13.2
   libraries answer jobvl = VECTOR with INTERNAL_ERROR and document right
   eigenvectors only; this does the same), cusolverSp's `csrlsvlu` on the
@@ -1361,9 +1807,28 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   answer NOT_SUPPORTED. A permutation whose input has a mode its output lacks
   is planned by NVIDIA's library and writes zeros on an RTX 3060; here its
   plan is refused (NOT_SUPPORTED).
-- **cuTensorNet**: the state API's gradients (`cutensornetStateApplyTensorOperatorWithGradient`,
-  `cutensornetExpectationComputeWithGradientsBackward`), the MPS projection,
-  distributed execution and the undocumented exports answer NOT_SUPPORTED. Network gradients
+- **cuTensorNet**: the MPS projection, distributed tensor descriptors
+  (`cutensornetCreateDistributedTensorDescriptor`, whose distributed QR and SVD need NCCL,
+  cuTensorMp and cuSOLVERMp: NVIDIA's library answers NOT_SUPPORTED on a machine without NCCL and
+  so does this one on any, after the argument checks that library makes first) and the
+  undocumented exports answer NOT_SUPPORTED. Distributed execution is done for contractions and
+  the state API's amplitudes, marginals and expectation values (see below): not done are the
+  sampler's exchange of samples (every rank samples alone, with the same seed), the hyper-optimizer
+  exchanges of the preparation calls (the search here is deterministic, so the optimizer and the
+  state API's prepare calls keep what each rank finds; the optimizer does exchange its plan, as
+  NVIDIA's does), and a PMI or NCCL communication library (the interface is the MPI one,
+  `cutensornetCommInterface` of `$CUTENSORNET_COMM_LIB`). Gradients of an expectation value are done
+  (`cutensornetExpectationComputeWithGradientsBackward`, PyTorch's convention, measured on an RTX
+  3060 and checked against finite differences; a distributed handle refuses them, as NVIDIA's
+  does at prepare). A state's MPS honours its SVD algorithm; what differs from NVIDIA's there: its
+  gesvdj with a loose tolerance gives a less accurate MPS and with few sweeps ends StateCompute
+  with INTERNAL_ERROR (the cuSOLVER here is exact and does neither), its gesvdp differs from gesvd's in
+  the seventh digit of the norm (here it is exact), and its gesvdr always ends StateCompute with
+  INTERNAL_ERROR, as here. Where the card's distributed contraction has a defect it is kept: the
+  clearing and the sum cover the first `volume` elements of the output buffer whatever strides it
+  has, so an output with padding comes out wrong where the padding is (measured). The profile of an
+  RTX 3060 here reports peer access between two cards, which the real cards do not have, so the
+  NVSHMEM job that NVIDIA's library refuses on two GeForce GPUs starts here. Network gradients
   (`cutensornetNetworkComputeGradientsBackward`) are done and match NVIDIA's on an RTX 3060:
   a real network's gradient is the adjoint contracted with the other tensors, a complex
   one is the adjoint times the conjugate of the other tensors; they are computed as
@@ -1429,23 +1894,34 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   engine itself (the backend option is accepted; everything runs on the host).
 - **NVENC**: AV1 (refused at initialisation, as on the card), 10-bit and 4:4:4
   encoding (`NV_ENC_ERR_UNSUPPORTED_PARAM`), motion-only encoding, asynchronous
-  mode (refused with the card's message), and real compression: H.264 and HEVC
-  frames are lossless PCM IDR pictures, and P and B pictures, rate control, lookahead
-  and the preset act on nothing. The bytes are not NVIDIA's.
+  mode (refused with the card's message), lookahead, adaptive quantisation,
+  weighted prediction, long-term references, intra refresh, temporal layers and
+  field/interlaced encoding. H.264: partitions smaller than 8x8, temporal direct
+  prediction, B pictures as references (the card pyramids), one reference picture
+  per list for B pictures, per-macroblock QP changes. HEVC: temporal motion
+  vector prediction, asymmetric partitions, sample adaptive offset, transform skip,
+  sign data hiding, scaling lists, several slices, tiles and wavefronts. The bytes are
+  not NVIDIA's.
 - **NVDEC**: every codec but JPEG (reported unsupported), progressive JPEG
   (the card refuses it too), display-area and target-rectangle cropping,
   deinterlacing, output formats other than NV12 (the card refuses those), video
   sources, and the card's decode of truncated or damaged pictures (the card
   returns success with whatever its engine makes of them; a picture the host
   decoder cannot parse is `CUDA_ERROR_INVALID_IMAGE` here).
-- **NVSHMEM**: the MPI and OpenSHMEM bootstraps (refused by name: use the
-  unique ID; OpenMPI is installed on the host used here but `mpirun` does not start a job on
-  it, so a bootstrap through MPI could be written and not run), PEs on more than one node
+- **NVSHMEM**: the PMI-1 and PMI-2 bootstraps through libpmi.so and libpmi2.so (the machine this was
+  made on has neither, and there NVIDIA's library makes a job of one PE too; with them present NVIDIA's
+  would form a job from Slurm's or MPICH's launcher, which was not checked and is not done here), bootstrap
+  plugins other than NVSHMEM's own (`NVSHMEM_BOOTSTRAP=plugin`), the UID bootstrap through sockets
+  (`NVSHMEM_BOOTSTRAP=UID`, which needs init flags in NVIDIA's too), PEs on more than one node
   and proxy or network transports, NVLink SHARP multicast (`nvshmemx_mc_ptr` is NULL), the
   device API's own proxy and IBGDA paths (never taken: every PE is a peer), regions
   (`nvshmemx_region_start` and `_stop` answer a refusal), queue pairs, externally mapped
-  symmetric buffers, and the PMI bootstrap a launcher gives `nvshmem_init()`. NVSHMEM_MAX_TEAMS
-  is read (default 32 here, 256 on NVIDIA's: each team costs symmetric heap).
+  symmetric buffers. The MPI bootstrap reads the handles of Open MPI and of the MPICH family; the
+  OpenSHMEM one needs `shmem_getmem` and symmetric allocation of the application's library. NVSHMEM_MAX_TEAMS
+  is read (default 32 here, 256 on NVIDIA's: each team costs symmetric heap). PEs on one GPU report the
+  multiple-processes-per-GPU status (3) and nothing else of its limits: the features NVIDIA's disables there
+  stay on. An OpenSHMEM job under Open MPI crashes now and then in UCX on the machine this was made on, with
+  NVIDIA's NVSHMEM and with a plain `shmem_init` program alike; the test runs such a job again.
 - **NVRTC**: without the toolkit's libnvrtc on the machine, LTO-IR, OptiX-IR
   and Tile IR output and the precompiled-header and time-trace options (NVVM
   bitcode and vendor formats only NVIDIA's NVRTC writes: refused by name; the
@@ -1474,13 +1950,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   compressed-marker-label functions built on it, and the rest of NPP's ten
   thousand entry points, which are absent rather than approximated, so a
   program that needs more fails at link time with a name.
-- **CUDA runtime and driver**: textures of BC6H and BC7 blocks (arrays of them can be made and filled; creating
-  a texture object answers `cudaErrorNotSupported` / `CUDA_ERROR_NOT_SUPPORTED` by name; see nvidia/docs/textures.md);
-  `cudaImportExternalMemory` and
+- **CUDA runtime and driver**: `cudaImportExternalMemory` and
   `cudaImportExternalSemaphore` (the handles come from Vulkan, Direct3D or NvSciBuf, which this machine does not
   have; NVIDIA's library crashes on the invalid handles a test could pass, so there is nothing to check
-  against); `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (no profile records the
-  SM-to-GPC layout); the memory pool and VMM handle types other than the POSIX file descriptor
+  against); cluster occupancy for a part whose GPC count NVIDIA does not publish
+  (nvidia/docs/clusters.md); the memory pool and VMM handle types other than the POSIX file descriptor
   (Win32, fabric), which the RTX 3060 refuses too; and exec-affinity types the device does not offer.
 - **Device runtime** (cudadevrt, dynamic parallelism), on both engines: all of
   `cuda_device_runtime_api.h` that CUDA 12 and 13 still offer to a kernel --

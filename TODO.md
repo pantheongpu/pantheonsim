@@ -1668,9 +1668,9 @@ scripts/run-pantheon-workloads.sh.
    every sample matched bit for bit (weights in 1/256ths split z, x, y with
    measured rounding sides, one exact sum rounded ties-away, 1D as 2D at
    y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
-   of results against the hardware's. Refused by name: `tex.grad` (its LOD
-   comes from undocumented approximate units) and textures of BC6H and BC7
-   blocks (BC1 to BC5, 10:10:10:2, resource views, any anisotropy, linear
+   of results against the hardware's. `tex.grad` is done for 1D and 2D
+   textures (layered or not) of power-of-two size, bit for bit (round 4; see "Textures" in nvidia/docs/textures.md).
+   (BC1 to BC7, 10:10:10:2, resource views, any anisotropy, linear
    filtering of signed 8-bit normalized texels and `tld4` on layered and
    cubemap textures are done: nvidia/docs/textures.md). The `.clamp`/`.zero` surface policies are done, as an
    RTX 3060 applies them. See nvidia/docs/textures.md. Border
@@ -1892,11 +1892,11 @@ behaviour, timing).
 - **cuBLASLt**: FP8 aux scale/amax, per-batch block scales, UE8M0 modes; the block-scaled modes are
   derived from documentation, not checked against a card.
 - **cuDNN graph API**: interpolating resample beyond bilinear upsampling by 2 (the one configuration with an
-  engine), FP8/MXFP8 attention, block masks, INT8x32 reordered filters, multi-GPU norm across processes,
-  MoE backward / band ops / standalone RoPE (no engine on the RTX 3060; Hopper/Blackwell unchecked), the fused
-  attention kernels' dropout-mask layout (Philox). Done in round 3: multi-GPU norm (threads of one process),
+  engine), FP8/MXFP8 attention, block masks, INT8x32 reordered filters, multi-GPU norm gradient scaling with more than two GPUs (assumed),
+  MoE backward / band ops / standalone RoPE (no engine on the RTX 3060; Hopper/Blackwell unchecked). Done in
+  round 4: multi-GPU norm across processes (shared pinned file on the card, IPC memory on the sim; `e2e_dnn_multigpu_norm`), the unified SDPA node's dropout mask, element for element (Philox4x32-7, `e2e_dnn_sdpa_mask`). Done in round 3: multi-GPU norm (threads of one process),
   bilinear 2x, classic/RNN/attention dropout bit for bit (cuRAND XORWOW states), SCALE_BIAS_ACTIVATION_WGRAD.
-  **Classic API**: the fused ops marked "reserved for future use", RNN dropout with padded I/O.
+  **Classic API**: the fused ops marked "reserved for future use", (RNN dropout with padded I/O: done in round 4, `e2e_dnn_rnn_dropout`.)
 - **cuFFT**: legacy callbacks (`CUFFT_NOT_IMPLEMENTED`), LTO-IR callbacks; multi-GPU layouts measured on
   two GPUs only.
 - **cuSPARSE**: SDDMM conjugate transpose (NVIDIA's computes garbage for complex), SpMMOp (LTO-IR),
@@ -1954,10 +1954,11 @@ and `cuCtxSetCurrent(NULL)` removes the current context from the stack as a pop 
 
 Still open:
 
-- BC6H and BC7 decoders (the arrays work; texture objects over them are refused by name). The tables are derivable from
-  the card one partition at a time; the arithmetic must be fitted as BC1 to BC5 were.
+- (Done in round 4: BC6H and BC7 textures. The card decodes both exactly as the Khronos Data Format Specification's
+  BPTC chapter says, apart from BC6H's signed zero; `bc-modes/*` in `runtime_texture_gaps` and `driver_texture_gaps`
+  hash 512 blocks of every mode, point sampled and filtered.)
 - External memory and semaphore import (needs Vulkan, Direct3D or NvSciBuf; the card's runtime crashes on invalid handles).
-- `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (SM-to-GPC layout).
+- Cluster occupancy on a part whose GPC count NVIDIA does not publish (H100 PCIe, B200, B300, GB200, GB10, Thor, Rubin): refused by name; see nvidia/docs/clusters.md.
 
 ### PTX and SASS execution
 
@@ -1976,9 +1977,10 @@ are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking w
 
 Still open, each with the reason:
 
-- `tex.grad`: the level of detail an RTX 3060 derives from gradients fits no formula tried (12,000 fetches
-  measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
-  fetches, measured; the runtime accepts any `maxAnisotropy` and does not model that); BC6H and BC7 texture
+- `tex.grad` on cube textures (the model is in `nvidia/docs/textures.md` and matches the card on 31,083 of
+  31,083 fetches with the card's own `MUFU.RCP`, but the simulator's reciprocal is the correctly rounded one and the
+  card's differs by an ulp on 13% of inputs: a table with a quadratic interpolation, not reproduced) and with
+  `maxAnisotropy` above 1; `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; BC6H and BC7 texture
   objects (the arrays work; see the runtime and driver section).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
   `.ue5m3x2` and UE5M3 scale factors: the ISA gives no exponent bias; `tcgen05.mma.ashift` and
@@ -2062,9 +2064,7 @@ with what `nvidia/src` defines):
   generic `cudaGraph*NodeSetParams`, the 12.3 `_v2` edge-data graph calls; the external memory and semaphore
   interop family; `cudaMemcpyBatchAsync`; `cudaOccupancyAvailableDynamicSMemPerBlock` (the semantics for
   infeasible requests are unclear); `cudaDeviceGetTexture1DLinearMaxWidth`; `cudaSetValidDevices`.
-- **Cluster occupancy**: `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` need the
-  SM-to-GPC grouping, which no profile records and the public documentation does not give; they refuse by
-  name once the runtime-exports PR (#309) merges.
+- **Cluster occupancy** is answered where the profile has GPC and TPC counts from NVIDIA (derived spread of the SMs over the GPCs, said once on stderr); parts without them are refused by name. Nothing is checked against a card with clusters. See nvidia/docs/clusters.md.
 - **NVML setters**: persistence mode, compute mode, power limit, clock locks, fan control, MIG/GPU-instance
   and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
   not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process

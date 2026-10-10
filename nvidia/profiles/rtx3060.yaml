@@ -47,3 +47,7 @@ cuda:
   clock_khz: 1837000
   async_engine_count: 1
   persisting_l2_bytes: 1622016
+  # Measured on this pair of RTX 3060s (driver 13.0, WSL2, nvidia/tests/e2e/p2p_managed.cu): no peer path
+  # between them, and no concurrent managed access (WSL's driver does not page managed memory on demand).
+  peer_access: false
+  concurrent_managed_access: false

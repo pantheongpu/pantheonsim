@@ -312,6 +312,7 @@ void describe_device(const DeviceProfile& p, int ordinal, DeviceSample* d) {
                       arch == "hopper" || arch == "blackwell";
   d->memory_retirement = !p.telemetry.ecc ? 0 : remaps ? 2 : 1;
   d->nvlink_version = p.telemetry.nvlink_version;
+  d->peer_access = p.cuda.peer_access ? 1 : 0;
   d->nvlink_count = p.telemetry.nvlink_count;
   d->has_memory_temperature = p.telemetry.memory_temperature ? 1 : 0;
   d->pcie_gen = d->pcie_gen_max = p.telemetry.pcie_gen;

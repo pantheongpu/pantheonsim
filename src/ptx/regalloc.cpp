@@ -123,6 +123,8 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           use_operand(op.obj);
           for (const auto& c : op.coords) use_operand(c);
           if (op.level) use_operand(op.lod);
+          for (const auto& o : op.ddx) use_operand(o);
+          for (const auto& o : op.ddy) use_operand(o);
           for (const auto& o : op.offset) use_operand(o);
           if (op.has_dref) use_operand(op.dref);
         }

@@ -421,7 +421,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
     return CUSOLVER_STATUS_SUCCESS;                                                                                  \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##SY##trd(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,      \
-                                                      int lda, Re<T>* d, Re<T>* e, T* tau, T*, int, int* info) {     \
+                                                      int lda, Re<T>* d, Re<T>* e, T* tau, T* unused8, int unused9, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##SY##trd, h, uplo, n, A, lda, d, e, tau, unused8, unused9, info);     \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_uplo_n_lda(uplo, n, lda)) return bad_arg(bad, info);                                     \
     return sytrd_body<T>(uplo, n, A, lda, d, e, tau, info);                                                          \
@@ -434,7 +435,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
     return CUSOLVER_STATUS_SUCCESS;                                                                                  \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##OR##gtr(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,      \
-                                                      int lda, const T* tau, T*, int, int* info) {                   \
+                                                      int lda, const T* tau, T* unused6, int unused7, int* info) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##OR##gtr, h, uplo, n, A, lda, tau, unused6, unused7, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_uplo_n_lda(uplo, n, lda)) return bad_arg(bad, info);                                     \
     return orgtr_body<T>(uplo, n, A, lda, tau, info);                                                                \
@@ -449,7 +451,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##OR##mtr(cusolverDnHandle_t h, cublasSideMode_t side,                   \
                                                       cublasFillMode_t uplo, cublasOperation_t trans, int m, int n,  \
-                                                      T* A, int lda, T* tau, T* C, int ldc, T*, int, int* info) {    \
+                                                      T* A, int lda, T* tau, T* C, int ldc, T* unused11, int unused12, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##OR##mtr, h, side, uplo, trans, m, n, A, lda, tau, C, ldc, unused11, unused12, info);    \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     const int nq = side == CUBLAS_SIDE_LEFT ? m : n;                                                                 \
     if (const int bad = arg_ormtr<T>(side, uplo, trans, m, n, lda, ldc)) return bad_arg(bad, info);                  \
@@ -463,7 +466,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
     return CUSOLVER_STATUS_SUCCESS;                                                                                  \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##gebrd(cusolverDnHandle_t h, int m, int n, T* A, int lda, Re<T>* D,     \
-                                                    Re<T>* E, T* tauq, T* taup, T*, int, int* info) {                \
+                                                    Re<T>* E, T* tauq, T* taup, T* unused9, int unused10, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##gebrd, h, m, n, A, lda, D, E, tauq, taup, unused9, unused10, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (m < 0) return bad_arg(1, info);                                                                              \
     if (n < 0) return bad_arg(2, info);                                                                              \
@@ -483,7 +487,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
     return CUSOLVER_STATUS_SUCCESS;                                                                                  \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##OR##gbr(cusolverDnHandle_t h, cublasSideMode_t side, int m, int n,     \
-                                                      int k, T* A, int lda, const T* tau, T*, int, int* info) {      \
+                                                      int k, T* A, int lda, const T* tau, T* unused8, int unused9, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##OR##gbr, h, side, m, n, k, A, lda, tau, unused8, unused9, info);      \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_orgbr(side, m, n, k, lda)) return bad_arg(bad, info);                                    \
     return orgbr_body<T>(side, m, n, k, A, lda, tau, info);                                                          \
@@ -496,7 +501,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
     return CUSOLVER_STATUS_SUCCESS;                                                                                  \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##potri(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,        \
-                                                    int lda, T*, int, int* info) {                                   \
+                                                    int lda, T* unused5, int unused6, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##potri, h, uplo, n, A, lda, unused5, unused6, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_uplo_n_lda(uplo, n, lda)) return bad_arg(bad, info);                                     \
     return potri_body<T>(uplo == CUBLAS_FILL_MODE_UPPER, n, A, lda, info, true);                                     \
@@ -509,7 +515,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
     return CUSOLVER_STATUS_SUCCESS;                                                                                  \
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##lauum(cusolverDnHandle_t h, cublasFillMode_t uplo, int n, T* A,        \
-                                                    int lda, T*, int, int* info) {                                   \
+                                                    int lda, T* unused5, int unused6, int* info) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDn##P##lauum, h, uplo, n, A, lda, unused5, unused6, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     /* NVIDIA's lauum leaves info alone on a bad argument (RTX 3060, CUDA 13.0) */                                  \
     if (arg_uplo_n_lda(uplo, n, lda)) return CUSOLVER_STATUS_INVALID_VALUE;                                          \
@@ -525,7 +532,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##HE##evdx(                                                              \
       cusolverDnHandle_t h, cusolverEigMode_t jobz, cusolverEigRange_t range, cublasFillMode_t uplo, int n, T* A,    \
-      int lda, Re<T> vl, Re<T> vu, int il, int iu, int* meig, Re<T>* W, T*, int, int* info) {                        \
+      int lda, Re<T> vl, Re<T> vu, int il, int iu, int* meig, Re<T>* W, T* unused13, int unused14, int* info) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##HE##evdx, h, jobz, range, uplo, n, A, lda, vl, vu, il, iu, meig, W, unused13, unused14, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_syevdx(jobz, range, uplo, n, lda, vl, vu, il, iu)) return bad_arg(bad, info);           \
     int64_t m64 = 0;                                                                                                 \
@@ -543,7 +551,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##SY##gvd(cusolverDnHandle_t h, cusolverEigType_t itype,                 \
                                                       cusolverEigMode_t jobz, cublasFillMode_t uplo, int n, T* A,    \
-                                                      int lda, T* B, int ldb, Re<T>* W, T*, int, int* info) {        \
+                                                      int lda, T* B, int ldb, Re<T>* W, T* unused10, int unused11, int* info) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##SY##gvd, h, itype, jobz, uplo, n, A, lda, B, ldb, W, unused10, unused11, info);        \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_sygvd(itype, jobz, uplo, n, lda, ldb)) return bad_arg(bad, info);                        \
     return sygv_body<T>((int)itype, jobz, CUSOLVER_EIG_RANGE_ALL, uplo, n, A, lda, B, ldb, 0, 0, 0, 0, nullptr, W,   \
@@ -560,7 +569,8 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##SY##gvdx(                                                              \
       cusolverDnHandle_t h, cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange_t range,               \
       cublasFillMode_t uplo, int n, T* A, int lda, T* B, int ldb, Re<T> vl, Re<T> vu, int il, int iu, int* meig,     \
-      Re<T>* W, T*, int, int* info) {                                                                                \
+      Re<T>* W, T* unused16, int unused17, int* info) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##SY##gvdx, h, itype, jobz, range, uplo, n, A, lda, B, ldb, vl, vu, il, iu, meig, W, unused16, unused17, info); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_sygvdx(itype, jobz, range, uplo, n, lda, ldb, vl, vu, il, iu)) return bad_arg(bad, info); \
     return sygv_body<T>((int)itype, jobz, range, uplo, n, A, lda, B, ldb, vl, vu, il, iu, meig, W, info, false);     \
@@ -575,8 +585,9 @@ int arg_sygvdx(cusolverEigType_t itype, cusolverEigMode_t jobz, cusolverEigRange
   }                                                                                                                  \
   VGPU_EXPORT cusolverStatus_t cusolverDn##P##SY##gvj(cusolverDnHandle_t h, cusolverEigType_t itype,                 \
                                                       cusolverEigMode_t jobz, cublasFillMode_t uplo, int n, T* A,    \
-                                                      int lda, T* B, int ldb, Re<T>* W, T*, int, int* info,          \
-                                                      syevjInfo_t jp) {                                              \
+                                                      int lda, T* B, int ldb, Re<T>* W, T* unused10, int unused11, int* info,          \
+                                                      syevjInfo_t jp) { \
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDn##P##SY##gvj, h, itype, jobz, uplo, n, A, lda, B, ldb, W, unused10, unused11, info, jp); \
     if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;                                                           \
     if (const int bad = arg_sygvd(itype, jobz, uplo, n, lda, ldb)) return bad_arg(bad, info);                        \
     const cusolverStatus_t st = sygv_body<T>((int)itype, jobz, CUSOLVER_EIG_RANGE_ALL, uplo, n, A, lda, B, ldb, 0, 0, \
@@ -761,9 +772,10 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf_bufferSize(cusolverDnHandle_t h, c
   if (host) *host = 0;
   return CUSOLVER_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf(cusolverDnHandle_t h, cusolverDnParams_t, int64_t m, int64_t n,
+VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf(cusolverDnHandle_t h, cusolverDnParams_t unused1, int64_t m, int64_t n,
                                               cudaDataType ta, void* A, int64_t lda, int64_t* ipiv, cudaDataType tc,
-                                              void*, size_t, void*, size_t, int* info) {
+                                              void* unused9, size_t unused10, void* unused11, size_t unused12, int* info) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDnXgetrf, h, unused1, m, n, ta, A, lda, ipiv, tc, unused9, unused10, unused11, unused12, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   // What an RTX 3060 (CUDA 13.0) answers: an element type it has no LU for is
   // INVALID_VALUE with info 0; a bad size is info -i in LAPACK's numbering (m,
@@ -791,9 +803,10 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgetrf(cusolverDnHandle_t h, cusolverDnPa
     return from_cmat<T>(A, a) ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_EXECUTION_FAILED;
   });
 }
-VGPU_EXPORT cusolverStatus_t cusolverDnXgetrs(cusolverDnHandle_t h, cusolverDnParams_t, cublasOperation_t trans,
+VGPU_EXPORT cusolverStatus_t cusolverDnXgetrs(cusolverDnHandle_t h, cusolverDnParams_t unused1, cublasOperation_t trans,
                                               int64_t n, int64_t nrhs, cudaDataType ta, const void* A, int64_t lda,
                                               const int64_t* ipiv, cudaDataType tb, void* B, int64_t ldb, int* info) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDnXgetrs, h, unused1, trans, n, nrhs, ta, A, lda, ipiv, tb, B, ldb, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (n < 0 || nrhs < 0 || lda < std::max<int64_t>(1, n) || ldb < std::max<int64_t>(1, n) ||
       (trans != CUBLAS_OP_N && trans != CUBLAS_OP_T && trans != CUBLAS_OP_C) || !is_elem(ta) || tb != ta)
@@ -823,8 +836,9 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXtrtri_bufferSize(cusolverDnHandle_t h, c
   return CUSOLVER_STATUS_SUCCESS;
 }
 VGPU_EXPORT cusolverStatus_t cusolverDnXtrtri(cusolverDnHandle_t h, cublasFillMode_t uplo, cublasDiagType_t diag,
-                                              int64_t n, cudaDataType ta, void* A, int64_t lda, void*, size_t, void*,
-                                              size_t, int* info) {
+                                              int64_t n, cudaDataType ta, void* A, int64_t lda, void* unused7, size_t unused8, void* unused9,
+                                              size_t unused10, int* info) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDnXtrtri, h, uplo, diag, n, ta, A, lda, unused7, unused8, unused9, unused10, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   // info -i numbers the arguments after the handle, the data type included
   // (uplo 1, diag 2, n 3, lda 6); an element type it has none for is
@@ -857,11 +871,12 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXsyevdx_bufferSize(cusolverDnHandle_t h, 
   if (host) *host = 0;
   return CUSOLVER_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusolverStatus_t cusolverDnXsyevdx(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobz,
+VGPU_EXPORT cusolverStatus_t cusolverDnXsyevdx(cusolverDnHandle_t h, cusolverDnParams_t unused1, cusolverEigMode_t jobz,
                                                cusolverEigRange_t range, cublasFillMode_t uplo, int64_t n,
                                                cudaDataType ta, void* A, int64_t lda, void* vl, void* vu, int64_t il,
                                                int64_t iu, int64_t* meig, cudaDataType tw, void* W, cudaDataType tc,
-                                               void*, size_t, void*, size_t, int* info) {
+                                               void* unused17, size_t unused18, void* unused19, size_t unused20, int* info) {
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDnXsyevdx, h, unused1, jobz, range, uplo, n, ta, A, lda, vl, vu, il, iu, meig, tw, W, tc, unused17, unused18, unused19, unused20, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   // A type it does not take: INVALID_VALUE, info 0. A bad argument: info -i
   // counting everything after the handle (params 1, jobz 2, range 3, uplo 4,
@@ -905,11 +920,12 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvd_bufferSize(cusolverDnHandle_t h, c
   if (host) *host = 0;
   return CUSOLVER_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusolverStatus_t cusolverDnXgesvd(cusolverDnHandle_t h, cusolverDnParams_t, signed char jobu,
+VGPU_EXPORT cusolverStatus_t cusolverDnXgesvd(cusolverDnHandle_t h, cusolverDnParams_t unused1, signed char jobu,
                                               signed char jobvt, int64_t m64, int64_t n64, cudaDataType ta, void* A,
                                               int64_t lda, cudaDataType ts, void* S, cudaDataType tu, void* U,
                                               int64_t ldu, cudaDataType tv, void* VT, int64_t ldvt, cudaDataType tc,
-                                              void*, size_t, void*, size_t, int* info) {
+                                              void* unused18, size_t unused19, void* unused20, size_t unused21, int* info) {
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDnXgesvd, h, unused1, jobu, jobvt, m64, n64, ta, A, lda, ts, S, tu, U, ldu, tv, VT, ldvt, tc, unused18, unused19, unused20, unused21, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (!svd_types_ok(ta, ts, tu, tv, tc)) return CUSOLVER_STATUS_INVALID_VALUE;
   if (const int bad = xgesvd_bad_arg(jobu, jobvt, m64, n64, lda, ldu, ldvt)) return bad_arg(bad, info);
@@ -965,11 +981,12 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdp_bufferSize(cusolverDnHandle_t h, 
 }
 // The SVD through a polar decomposition on NVIDIA's; here the Jacobi SVD,
 // which needs no perturbation, so h_err_sigma is 0.
-VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdp(cusolverDnHandle_t h, cusolverDnParams_t, cusolverEigMode_t jobz,
+VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdp(cusolverDnHandle_t h, cusolverDnParams_t unused1, cusolverEigMode_t jobz,
                                                int econ, int64_t m64, int64_t n64, cudaDataType ta, void* A,
                                                int64_t lda, cudaDataType ts, void* S, cudaDataType tu, void* U,
                                                int64_t ldu, cudaDataType tv, void* V, int64_t ldv, cudaDataType tc,
-                                               void*, size_t, void*, size_t, int* info, double* err_sigma) {
+                                               void* unused18, size_t unused19, void* unused20, size_t unused21, int* info, double* err_sigma) {
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDnXgesvdp, h, unused1, jobz, econ, m64, n64, ta, A, lda, ts, S, tu, U, ldu, tv, V, ldv, tc, unused18, unused19, unused20, unused21, info, err_sigma);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   // A type it does not take: INVALID_VALUE, info untouched. A bad argument:
   // info -i, LAPACK-style (jobz 1, econ 2, m 3, n 4, lda 6, ldu 9, ldv 11);
@@ -1017,12 +1034,13 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdr_bufferSize(cusolverDnHandle_t h, 
 // singular triplets; here they are computed exactly (the full SVD,
 // truncated), which is what the approximation converges to. p and niters
 // have nothing to tune.
-VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdr(cusolverDnHandle_t h, cusolverDnParams_t, signed char jobu,
+VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdr(cusolverDnHandle_t h, cusolverDnParams_t unused1, signed char jobu,
                                                signed char jobv, int64_t m64, int64_t n64, int64_t k64, int64_t p,
                                                int64_t niters, cudaDataType ta, void* A, int64_t lda,
                                                cudaDataType ts, void* S, cudaDataType tu, void* U, int64_t ldu,
-                                               cudaDataType tv, void* V, int64_t ldv, cudaDataType tc, void*, size_t,
-                                               void*, size_t, int* info) {
+                                               cudaDataType tv, void* V, int64_t ldv, cudaDataType tc, void* unused21, size_t unused22,
+                                               void* unused23, size_t unused24, int* info) {
+  VGPU_REFUSE_CALL(stream_of(h), CUSOLVER_STATUS_INTERNAL_ERROR, cusolverDnXgesvdr, h, unused1, jobu, jobv, m64, n64, k64, p, niters, ta, A, lda, ts, S, tu, U, ldu, tv, V, ldv, tc, unused21, unused22, unused23, unused24, info);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   // info -i counts params as 1 (p 7, niters 8); a type it does not take is
   // INVALID_VALUE with info 0 (RTX 3060, CUDA 13.0).
@@ -1065,11 +1083,12 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXlarft_bufferSize(cusolverDnHandle_t h, c
   if (host) *host = 0;
   return CUSOLVER_STATUS_SUCCESS;
 }
-VGPU_EXPORT cusolverStatus_t cusolverDnXlarft(cusolverDnHandle_t h, cusolverDnParams_t, cusolverDirectMode_t direct,
+VGPU_EXPORT cusolverStatus_t cusolverDnXlarft(cusolverDnHandle_t h, cusolverDnParams_t unused1, cusolverDirectMode_t direct,
                                               cusolverStorevMode_t storev, int64_t n, int64_t k, cudaDataType tv,
                                               const void* V, int64_t ldv, cudaDataType ttau, const void* tau,
-                                              cudaDataType tt, void* Tm, int64_t ldt, cudaDataType tc, void*, size_t,
-                                              void*, size_t) {
+                                              cudaDataType tt, void* Tm, int64_t ldt, cudaDataType tc, void* unused15, size_t unused16,
+                                              void* unused17, size_t unused18) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusolverDnXlarft, h, unused1, direct, storev, n, k, tv, V, ldv, ttau, tau, tt, Tm, ldt, tc, unused15, unused16, unused17, unused18);
   if (!known(h)) return CUSOLVER_STATUS_NOT_INITIALIZED;
   if (!larft_args_ok(direct, storev, n, k, ldv, ldt)) return CUSOLVER_STATUS_INVALID_VALUE;
   if (!is_elem(tv) || ttau != tv || tt != tv || tc != tv) return CUSOLVER_STATUS_INVALID_VALUE;

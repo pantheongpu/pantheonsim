@@ -116,6 +116,14 @@ CB cudaMemPoolGetAttribute ENTER memPool=set attr=4 value=set
 CB cudaMemPoolGetAttribute EXIT ret=0
 CB cudaMallocFromPoolAsync ENTER ptr=set size=65536 memPool=set stream=set
 CB cudaMallocFromPoolAsync EXIT ret=0
+CB cudaMemPoolExportToShareableHandle ENTER shareableHandle=set memPool=set handleType=1 flags=0
+CB cudaMemPoolExportToShareableHandle EXIT ret=1
+CB cudaMemPoolImportFromShareableHandle ENTER memPool=set shareableHandle=set handleType=1 flags=0
+CB cudaMemPoolImportFromShareableHandle EXIT ret=801
+CB cudaMemPoolExportPointer ENTER exportData=set ptr=set
+CB cudaMemPoolExportPointer EXIT ret=1
+CB cudaMemPoolImportPointer ENTER ptr=set memPool=set exportData=set
+CB cudaMemPoolImportPointer EXIT ret=1
 CB cudaFreeAsync ENTER devPtr=set hStream=set
 CB cudaFreeAsync EXIT ret=0
 CB cudaStreamSynchronize ENTER stream=set
@@ -130,6 +138,22 @@ CB cudaFreeAsync ENTER devPtr=set hStream=set
 CB cudaFreeAsync EXIT ret=0
 CB cudaStreamSynchronize ENTER stream=set
 CB cudaStreamSynchronize EXIT ret=0
+CB cudaImportExternalMemory ENTER extMem_out=set memHandleDesc=set
+CB cudaImportExternalMemory EXIT ret=801
+CB cudaExternalMemoryGetMappedBuffer ENTER devPtr=set extMem=null bufferDesc=set
+CB cudaExternalMemoryGetMappedBuffer EXIT ret=1
+CB cudaDestroyExternalMemory ENTER extMem=null
+CB cudaDestroyExternalMemory EXIT ret=1
+CB cudaImportExternalSemaphore ENTER extSem_out=set semHandleDesc=set
+CB cudaImportExternalSemaphore EXIT ret=801
+CB cudaSignalExternalSemaphoresAsync ENTER
+CB cudaSignalExternalSemaphoresAsync EXIT ret=1
+CB cudaWaitExternalSemaphoresAsync ENTER
+CB cudaWaitExternalSemaphoresAsync EXIT ret=1
+CB cudaDestroyExternalSemaphore ENTER extSem=null
+CB cudaDestroyExternalSemaphore EXIT ret=1
+CB cudaDeviceFlushGPUDirectRDMAWrites ENTER target=0 scope=100
+CB cudaDeviceFlushGPUDirectRDMAWrites EXIT ret=801
 CB cudaFuncSetCacheConfig ENTER func=set cacheConfig=0
 CB cudaFuncSetCacheConfig EXIT ret=0
 CB cudaFuncSetAttribute ENTER func=set attr=8 value=1024
@@ -166,6 +190,12 @@ CB cudaGraphGetNodes ENTER graph=set nodes=set numNodes=set
 CB cudaGraphGetNodes EXIT ret=0
 CB cudaGraphNodeGetType ENTER node=set pType=set
 CB cudaGraphNodeGetType EXIT ret=0
+CB cudaGraphKernelNodeGetAttribute ENTER hNode=set attr=1 value_out=set
+CB cudaGraphKernelNodeGetAttribute EXIT ret=0
+CB cudaGraphKernelNodeSetAttribute ENTER hNode=set attr=1 value=set
+CB cudaGraphKernelNodeSetAttribute EXIT ret=0
+CB cudaGraphKernelNodeCopyAttributes ENTER
+CB cudaGraphKernelNodeCopyAttributes EXIT ret=0
 CB cudaGraphClone ENTER pGraphClone=set originalGraph=set
 CB cudaGraphClone EXIT ret=0
 CB cudaGraphNodeFindInClone ENTER pNode=set originalNode=set clonedGraph=set
@@ -184,6 +214,30 @@ CB cudaGraphDestroy ENTER graph=set
 CB cudaGraphDestroy EXIT ret=0
 CB cudaGraphDestroy ENTER graph=set
 CB cudaGraphDestroy EXIT ret=0
+CB cudaGraphDestroy ENTER graph=set
+CB cudaGraphDestroy EXIT ret=0
+CB cudaGraphCreate ENTER pGraph=set flags=0
+CB cudaGraphCreate EXIT ret=0
+CB cudaGraphAddExternalSemaphoresSignalNode ENTER pGraphNode=set graph=set pDependencies=null numDependencies=0 nodeParams=set
+CB cudaGraphAddExternalSemaphoresSignalNode EXIT ret=0
+CB cudaGraphAddExternalSemaphoresWaitNode ENTER pGraphNode=set graph=set pDependencies=null numDependencies=0 nodeParams=set
+CB cudaGraphAddExternalSemaphoresWaitNode EXIT ret=0
+CB cudaGraphExternalSemaphoresSignalNodeGetParams ENTER hNode=set params_out=set
+CB cudaGraphExternalSemaphoresSignalNodeGetParams EXIT ret=0
+CB cudaGraphExternalSemaphoresSignalNodeSetParams ENTER hNode=set nodeParams=set
+CB cudaGraphExternalSemaphoresSignalNodeSetParams EXIT ret=0
+CB cudaGraphExternalSemaphoresWaitNodeGetParams ENTER hNode=set params_out=set
+CB cudaGraphExternalSemaphoresWaitNodeGetParams EXIT ret=0
+CB cudaGraphExternalSemaphoresWaitNodeSetParams ENTER hNode=set nodeParams=set
+CB cudaGraphExternalSemaphoresWaitNodeSetParams EXIT ret=0
+CB cudaGraphInstantiate ENTER pGraphExec=set graph=set flags=0
+CB cudaGraphInstantiate EXIT ret=0
+CB cudaGraphExecExternalSemaphoresSignalNodeSetParams ENTER hGraphExec=set hNode=set nodeParams=set
+CB cudaGraphExecExternalSemaphoresSignalNodeSetParams EXIT ret=0
+CB cudaGraphExecExternalSemaphoresWaitNodeSetParams ENTER hGraphExec=set hNode=set nodeParams=set
+CB cudaGraphExecExternalSemaphoresWaitNodeSetParams EXIT ret=0
+CB cudaGraphExecDestroy ENTER graphExec=set
+CB cudaGraphExecDestroy EXIT ret=0
 CB cudaGraphDestroy ENTER graph=set
 CB cudaGraphDestroy EXIT ret=0
 CB cudaStreamDestroy ENTER stream=set

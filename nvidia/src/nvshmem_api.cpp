@@ -27,8 +27,10 @@
 // stores and loads, quiet and fence are fences, barriers and signals are
 // stores and polling.
 //
-// Not here: the MPI and OpenSHMEM bootstraps (refused by name; use the unique
-// ID), PEs on more than one node, NVLink SHARP multicast (nvshmemx_mc_ptr is
+// MPI, OpenSHMEM and PMIx also give the job (the application's own MPI or
+// OpenSHMEM library, or libpmix, see "bootstraps through a launcher" below).
+//
+// Not here: the PMI-1 and PMI-2 bootstraps through libpmi, PEs on more than one node, NVLink SHARP multicast (nvshmemx_mc_ptr is
 // NULL, as on hardware without it), and host-side reductions. Device-side
 // atomics between PEs are atomic within a process but not across the PE
 // processes; nvidia/docs/libraries.md says so.
@@ -56,6 +58,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__has_include)
+#if __has_include(<pmix.h>)
+#include <pmix.h>
+#define VGPU_NVSHMEM_HAVE_PMIX 1
+#endif
+#endif
+#include <strings.h>
 
 #include "nvshmem_abi.hpp"
 #include "vgpu/runtime/capture.hpp"
@@ -206,6 +216,8 @@ struct State {
   unsigned long long* dev_wait_any = nullptr;
   int* dev_exit = nullptr;  // request state, then code
   std::vector<void*> state_targets;  // device-library copies of nvshmemi_device_state_d
+  bool bootstrapped_by_launcher = false;  // MPI, OpenSHMEM or PMI(x): the status after nvshmem_finalize
+  void (*close_bootstrap)() = nullptr;    // what finalize undoes of it (PMIx_Finalize)
 };
 
 State& st() {
@@ -547,6 +559,8 @@ void write_device_state(State& s, void* target) {
 struct Bootstrap {
   int rank = 0, nranks = 1;
   std::string id;
+  bool launcher = false;  // MPI, OpenSHMEM or PMI(x): not a unique ID
+  void (*close)() = nullptr;
 };
 
 std::string random_token() {
@@ -565,15 +579,293 @@ struct UidPayload {
   char token[48];
 };
 
+// ---- bootstraps through a launcher's library ---------------------------------
+//
+// NVSHMEM's MPI, OpenSHMEM and PMIx bootstraps are plugins that call those
+// libraries. The PEs here need only their rank, the size of the job and one
+// token to name the rendezvous file, so the calls are made through the
+// application's own MPI or OpenSHMEM (found by name in the process, as the
+// plugins link against it), or the system's libpmix. Measured against NVIDIA's
+// NVSHMEM 3.8 on two RTX 3060s: NVSHMEMX_INIT_WITH_MPI_COMM and
+// NVSHMEM_BOOTSTRAP=MPI take the job from a communicator (MPI_COMM_WORLD for the
+// variable), likewise NVSHMEMX_INIT_WITH_SHMEM and =SHMEM from the OpenSHMEM job,
+// NVSHMEM_BOOTSTRAP=PMI with NVSHMEM_BOOTSTRAP_PMI=PMIX from PMIx; PMI and PMI-2
+// are libpmi.so and libpmi2.so, which a machine without them answers with a job of
+// one PE; the variable also names a plugin library (=plugin with
+// NVSHMEM_BOOTSTRAP_PLUGIN) and the init flags say which bootstrap a call uses.
+
+constexpr size_t kTokenBytes = 64;
+
+// MPI: Open MPI's handles are the addresses of its predefined objects; the
+// MPICH family's are integer constants.
+struct MpiApi {
+  int (*initialized)(int*) = nullptr;
+  int (*rank)(uintptr_t, int*) = nullptr;
+  int (*size)(uintptr_t, int*) = nullptr;
+  int (*bcast)(void*, int, uintptr_t, int, uintptr_t) = nullptr;
+  uintptr_t byte = 0, world = 0;
+  bool wide = false;  // 8-byte handles (Open MPI)
+};
+
+bool load_mpi(MpiApi& m) {
+  m.initialized = reinterpret_cast<int (*)(int*)>(dlsym(RTLD_DEFAULT, "MPI_Initialized"));
+  m.rank = reinterpret_cast<int (*)(uintptr_t, int*)>(dlsym(RTLD_DEFAULT, "MPI_Comm_rank"));
+  m.size = reinterpret_cast<int (*)(uintptr_t, int*)>(dlsym(RTLD_DEFAULT, "MPI_Comm_size"));
+  m.bcast = reinterpret_cast<int (*)(void*, int, uintptr_t, int, uintptr_t)>(dlsym(RTLD_DEFAULT, "MPI_Bcast"));
+  if (!m.initialized || !m.rank || !m.size || !m.bcast) return false;
+  if (void* w = dlsym(RTLD_DEFAULT, "ompi_mpi_comm_world")) {
+    m.world = reinterpret_cast<uintptr_t>(w);
+    m.byte = reinterpret_cast<uintptr_t>(dlsym(RTLD_DEFAULT, "ompi_mpi_byte"));
+    m.wide = true;
+    return m.byte != 0;
+  }
+  m.world = 0x44000000u;  // MPI_COMM_WORLD of MPICH and its relatives
+  m.byte = 0x4c00010du;   // MPI_BYTE
+  return true;
+}
+
+// A communicator, however it is in memory: `comm` points to an MPI_Comm.
+int mpi_bootstrap(const void* comm_ptr, bool world, Bootstrap* b, const char* why) {
+  MpiApi m;
+  if (!load_mpi(m)) {
+    say("%s needs the MPI library the program is linked with, and none is loaded in this process", why);
+    return 1;
+  }
+  int up = 0;
+  m.initialized(&up);
+  if (!up) {
+    say("%s: MPI is not initialized; call MPI_Init first", why);
+    return 1;
+  }
+  uintptr_t comm = m.world;  // no communicator in the attributes (measured): MPI_COMM_WORLD
+  if (!world && comm_ptr) {
+    if (m.wide) {
+      std::memcpy(&comm, comm_ptr, sizeof comm);
+    } else {
+      int c = 0;
+      std::memcpy(&c, comm_ptr, sizeof c);
+      comm = uintptr_t(unsigned(c));
+    }
+  }
+  int rank = 0, size = 1;
+  if (m.rank(comm, &rank) || m.size(comm, &size) || size < 1 || size > kMaxPes) {
+    say("the MPI communicator is not usable (at most %d PEs)", kMaxPes);
+    return 1;
+  }
+  char token[kTokenBytes] = {0};
+  if (rank == 0) std::snprintf(token, sizeof token, "%s", random_token().c_str());
+  if (m.bcast(token, int(sizeof token), m.byte, 0, comm)) {
+    say("MPI_Bcast failed in the MPI bootstrap");
+    return 1;
+  }
+  b->rank = rank;
+  b->nranks = size;
+  b->id = token;
+  b->launcher = true;
+  return 0;
+}
+
+// OpenSHMEM: the token travels in a symmetric buffer.
+int shmem_bootstrap(Bootstrap* b) {
+  auto my_pe = reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT, "shmem_my_pe"));
+  auto n_pes = reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT, "shmem_n_pes"));
+  auto malloc_ = reinterpret_cast<void* (*)(size_t)>(dlsym(RTLD_DEFAULT, "shmem_malloc"));
+  auto free_ = reinterpret_cast<void (*)(void*)>(dlsym(RTLD_DEFAULT, "shmem_free"));
+  auto getmem = reinterpret_cast<void (*)(void*, const void*, size_t, int)>(dlsym(RTLD_DEFAULT, "shmem_getmem"));
+  auto barrier = reinterpret_cast<void (*)()>(dlsym(RTLD_DEFAULT, "shmem_barrier_all"));
+  if (!my_pe || !n_pes || !malloc_ || !free_ || !getmem || !barrier) {
+    say("the OpenSHMEM bootstrap needs the OpenSHMEM library the program is linked with, and none is loaded in this process");
+    return 1;
+  }
+  const int rank = my_pe(), size = n_pes();
+  if (size < 1 || size > kMaxPes) {
+    say("the OpenSHMEM job has %d PEs (at most %d)", size, kMaxPes);
+    return 1;
+  }
+  char* buf = static_cast<char*>(malloc_(kTokenBytes));
+  if (!buf) {
+    say("shmem_malloc failed in the OpenSHMEM bootstrap");
+    return 1;
+  }
+  std::memset(buf, 0, kTokenBytes);
+  if (rank == 0) std::snprintf(buf, kTokenBytes, "%s", random_token().c_str());
+  barrier();
+  if (rank != 0) getmem(buf, buf, kTokenBytes, 0);
+  barrier();
+  b->id.assign(buf, strnlen(buf, kTokenBytes));
+  free_(buf);
+  b->rank = rank;
+  b->nranks = size;
+  b->launcher = true;
+  return 0;
+}
+
+#ifdef VGPU_NVSHMEM_HAVE_PMIX
+struct PmixApi {
+  pmix_status_t (*init)(pmix_proc_t*, pmix_info_t[], size_t) = nullptr;
+  pmix_status_t (*fin)(const pmix_info_t[], size_t) = nullptr;
+  pmix_status_t (*put)(pmix_scope_t, const pmix_key_t, pmix_value_t*) = nullptr;
+  pmix_status_t (*commit)() = nullptr;
+  pmix_status_t (*fence)(const pmix_proc_t[], size_t, const pmix_info_t[], size_t) = nullptr;
+  pmix_status_t (*get)(const pmix_proc_t*, const pmix_key_t, const pmix_info_t[], size_t, pmix_value_t**) = nullptr;
+  void (*value_free)(pmix_value_t*, size_t) = nullptr;
+};
+PmixApi g_pmix;
+bool g_pmix_up = false;
+
+void pmix_close() {
+  if (g_pmix_up && g_pmix.fin) g_pmix.fin(nullptr, 0);
+  g_pmix_up = false;
+}
+
+int pmix_bootstrap(Bootstrap* b) {
+  static void* lib = nullptr;
+  if (!lib) {
+    for (const char* name : {"libpmix.so.2", "libpmix.so"})
+      if ((lib = dlopen(name, RTLD_NOW | RTLD_GLOBAL))) break;
+  }
+  if (!lib) {
+    say("the PMIx bootstrap needs libpmix.so.2");
+    return 1;
+  }
+  auto sym = [&](const char* n) { return dlsym(lib, n); };
+  g_pmix.init = reinterpret_cast<decltype(g_pmix.init)>(sym("PMIx_Init"));
+  g_pmix.fin = reinterpret_cast<decltype(g_pmix.fin)>(sym("PMIx_Finalize"));
+  g_pmix.put = reinterpret_cast<decltype(g_pmix.put)>(sym("PMIx_Put"));
+  g_pmix.commit = reinterpret_cast<decltype(g_pmix.commit)>(sym("PMIx_Commit"));
+  g_pmix.fence = reinterpret_cast<decltype(g_pmix.fence)>(sym("PMIx_Fence"));
+  g_pmix.get = reinterpret_cast<decltype(g_pmix.get)>(sym("PMIx_Get"));
+  g_pmix.value_free = reinterpret_cast<decltype(g_pmix.value_free)>(sym("PMIx_Value_free"));
+  if (!g_pmix.init || !g_pmix.fin || !g_pmix.put || !g_pmix.commit || !g_pmix.fence || !g_pmix.get) {
+    say("libpmix.so.2 lacks the PMIx client calls");
+    return 1;
+  }
+  pmix_proc_t me;
+  std::memset(&me, 0, sizeof me);
+  if (g_pmix.init(&me, nullptr, 0) != PMIX_SUCCESS) {
+    say("PMIx_Init failed: this process was not started by a PMIx launcher (mpirun, srun, prterun)");
+    return 1;
+  }
+  g_pmix_up = true;
+  pmix_proc_t wild, root;
+  std::memset(&wild, 0, sizeof wild);
+  std::memcpy(wild.nspace, me.nspace, sizeof wild.nspace);
+  wild.rank = PMIX_RANK_WILDCARD;
+  root = wild;
+  root.rank = 0;
+  pmix_value_t* v = nullptr;
+  uint32_t size = 0;
+  if (g_pmix.get(&wild, PMIX_JOB_SIZE, nullptr, 0, &v) != PMIX_SUCCESS || !v) {
+    say("PMIx cannot tell the size of the job");
+    pmix_close();
+    return 1;
+  }
+  size = v->data.uint32;
+  if (g_pmix.value_free) g_pmix.value_free(v, 1);
+  else std::free(v);
+  if (size < 1 || size > unsigned(kMaxPes)) {
+    say("the PMIx job has %u PEs (at most %d)", size, kMaxPes);
+    pmix_close();
+    return 1;
+  }
+  const char* key = "vgpu.nvshmem.token";
+  std::string token = random_token();
+  if (me.rank == 0) {
+    pmix_value_t val;
+    std::memset(&val, 0, sizeof val);
+    val.type = PMIX_STRING;
+    val.data.string = const_cast<char*>(token.c_str());
+    if (g_pmix.put(PMIX_GLOBAL, key, &val) != PMIX_SUCCESS || g_pmix.commit() != PMIX_SUCCESS) {
+      say("PMIx_Put failed in the PMIx bootstrap");
+      pmix_close();
+      return 1;
+    }
+  }
+  pmix_info_t collect;
+  std::memset(&collect, 0, sizeof collect);
+  std::snprintf(collect.key, sizeof collect.key, "%s", PMIX_COLLECT_DATA);
+  collect.value.type = PMIX_BOOL;
+  collect.value.data.flag = true;
+  if (g_pmix.fence(&wild, 1, &collect, 1) != PMIX_SUCCESS) {
+    say("PMIx_Fence failed in the PMIx bootstrap");
+    pmix_close();
+    return 1;
+  }
+  if (me.rank != 0) {
+    pmix_value_t* t = nullptr;
+    if (g_pmix.get(&root, key, nullptr, 0, &t) != PMIX_SUCCESS || !t || t->type != PMIX_STRING || !t->data.string) {
+      say("PMIx_Get of the job's token failed in the PMIx bootstrap");
+      pmix_close();
+      return 1;
+    }
+    token = t->data.string;
+    if (g_pmix.value_free) g_pmix.value_free(t, 1);
+  }
+  b->rank = int(me.rank);
+  b->nranks = int(size);
+  b->id = token;
+  b->launcher = true;
+  b->close = pmix_close;
+  return 0;
+}
+#else
+int pmix_bootstrap(Bootstrap*) {
+  say("this build of VirtualGPU's NVSHMEM has no PMIx support (pmix.h was not found at build time)");
+  return 1;
+}
+#endif
+
+// NVSHMEM_BOOTSTRAP and what it names (the documented values), for a call without init flags.
+int env_bootstrap(Bootstrap* b) {
+  const char* mode = std::getenv("NVSHMEM_BOOTSTRAP");
+  std::string name = mode && *mode ? mode : "PMI";
+  if (!strcasecmp(name.c_str(), "plugin")) {
+    const char* plugin = std::getenv("NVSHMEM_BOOTSTRAP_PLUGIN");
+    if (!plugin || !*plugin) {
+      say("Plugin bootstrap requires NVSHMEM_BOOTSTRAP_PLUGIN to be set");
+      return 1;
+    }
+    std::string file = plugin;
+    const size_t slash = file.rfind('/');
+    if (slash != std::string::npos) file = file.substr(slash + 1);
+    // NVSHMEM's own plugins by their file names; the plugin interface itself is NVIDIA's and not implemented.
+    if (file.rfind("nvshmem_bootstrap_mpi.so", 0) == 0) name = "MPI";
+    else if (file.rfind("nvshmem_bootstrap_shmem.so", 0) == 0) name = "SHMEM";
+    else if (file.rfind("nvshmem_bootstrap_pmix.so", 0) == 0) { name = "PMI"; setenv("NVSHMEM_BOOTSTRAP_PMI", "PMIX", 1); }
+    else if (file.rfind("nvshmem_bootstrap_pmi2.so", 0) == 0) { name = "PMI"; setenv("NVSHMEM_BOOTSTRAP_PMI", "PMI-2", 1); }
+    else if (file.rfind("nvshmem_bootstrap_pmi.so", 0) == 0) { name = "PMI"; setenv("NVSHMEM_BOOTSTRAP_PMI", "PMI", 1); }
+    else if (::access(plugin, R_OK) != 0 && file.find('/') == std::string::npos && file.rfind("nvshmem_bootstrap_", 0) != 0) {
+      say("Bootstrap library dlopen failed for %s", plugin);
+      return 1;
+    } else {
+      say("the bootstrap plugin %s is not one of NVSHMEM's (mpi, shmem, pmi, pmi2, pmix); other plugins are not supported", plugin);
+      return 1;
+    }
+  }
+  if (!strcasecmp(name.c_str(), "MPI")) return mpi_bootstrap(nullptr, true, b, "NVSHMEM_BOOTSTRAP=MPI");
+  if (!strcasecmp(name.c_str(), "SHMEM")) return shmem_bootstrap(b);
+  if (!strcasecmp(name.c_str(), "PMI")) {
+    const char* pmi = std::getenv("NVSHMEM_BOOTSTRAP_PMI");
+    std::string kind = pmi && *pmi ? pmi : "PMI";
+    if (!strcasecmp(kind.c_str(), "PMIX")) return pmix_bootstrap(b);
+    if (strcasecmp(kind.c_str(), "PMI") && strcasecmp(kind.c_str(), "PMI-2")) {
+      say("bootstrap_pmi_init invalid PMI bootstrap '%s'", kind.c_str());
+      return 1;
+    }
+    // libpmi.so and libpmi2.so (of Slurm, MPICH, ...) are not used here: without them NVIDIA's library makes a job of one PE.
+    b->rank = 0;
+    b->nranks = 1;
+    b->id = random_token();
+    b->launcher = true;
+    return 0;
+  }
+  say("Missing init flags for bootstrap %s. Retry with nvshmemx_init_attr and non-zero flags", name.c_str());
+  return 1;
+}
+
 int choose_bootstrap(unsigned flags, nvshmemx_init_attr_t* attr, Bootstrap* b) {
-  if (flags & NVSHMEMX_INIT_WITH_MPI_COMM) {
-    say("the MPI bootstrap is not available in VirtualGPU; use NVSHMEMX_INIT_WITH_UNIQUEID");
-    return 1;
-  }
-  if (flags & NVSHMEMX_INIT_WITH_SHMEM) {
-    say("the OpenSHMEM bootstrap is not available in VirtualGPU; use NVSHMEMX_INIT_WITH_UNIQUEID");
-    return 1;
-  }
+  if (flags & NVSHMEMX_INIT_WITH_MPI_COMM) return mpi_bootstrap(attr ? attr->mpi_comm : nullptr, false, b, "NVSHMEMX_INIT_WITH_MPI_COMM");
+  if (flags & NVSHMEMX_INIT_WITH_SHMEM) return shmem_bootstrap(b);
   if (flags & NVSHMEMX_INIT_WITH_UNIQUEID) {
     if (!attr || !attr->args.uid_args.id) {
       say("NVSHMEMX_INIT_WITH_UNIQUEID without a unique ID in the attributes");
@@ -604,10 +896,7 @@ int choose_bootstrap(unsigned flags, nvshmemx_init_attr_t* attr, Bootstrap* b) {
     }
     return 0;
   }
-  b->rank = 0;
-  b->nranks = 1;
-  b->id = random_token();
-  return 0;
+  return env_bootstrap(b);
 }
 
 bool attach_segment(State& s, const Bootstrap& b) {
@@ -662,6 +951,8 @@ int init(unsigned flags, nvshmemx_init_attr_t* attr) {
   }
   s.mype = b.rank;
   s.npes = b.nranks;
+  s.bootstrapped_by_launcher = b.launcher;
+  s.close_bootstrap = b.close;
   if (!attach_segment(s, b)) return 1;
   s.status = NVSHMEM_STATUS_IS_BOOTSTRAPPED;
 
@@ -739,6 +1030,15 @@ int init(unsigned flags, nvshmemx_init_attr_t* attr) {
     // PE's kernels reach it once peer access to that device is enabled.
     const int pd = s.seg->pe[pe].device;
     if (pd != s.device) {
+      // NVIDIA's NVSHMEM starts no job whose PEs sit on two GPUs that cannot reach each other: "Peer GPU 1 is not
+      // accessible", NVSHMEMX_ERROR_NOT_SUPPORTED (3) (measured on two RTX 3060s, which have no peer path; the
+      // launcher's program then ends with status 255).
+      int can = 0;
+      if (cudaDeviceCanAccessPeer(&can, s.device, pd) != cudaSuccess || !can) {
+        cudaGetLastError();
+        say("Peer GPU %d is not accessible", pd);
+        return 3;
+      }
       const cudaError_t e = cudaDeviceEnablePeerAccess(pd, 0);
       if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
         say("cannot enable peer access from device %d to device %d", s.device, pd);
@@ -776,7 +1076,12 @@ int init(unsigned flags, nvshmemx_init_attr_t* attr) {
   make_team(s, NVSHMEMI_TEAM_SAME_GPU, {s.mype}, s.mype, 1);  // a GPU each
   make_team(s, NVSHMEMI_TEAM_GPU_LEADERS, world, 0, 1);       // each PE leads its GPU
   build_device_state(s);
-  s.status = NVSHMEM_STATUS_IS_INITIALIZED;
+  // PEs on one GPU (the same device index; here every PE has a GPU of its own, so this is the index): the multiple
+  // processes per GPU mode of NVSHMEM, as measured on the card (status 3, nvshmem_malloc and nvshmem_ptr still work).
+  bool shares_gpu = false;
+  for (int pe = 0; pe < s.npes; ++pe)
+    if (pe != s.mype && s.seg->pe[pe].device == s.device) shares_gpu = true;
+  s.status = shares_gpu ? NVSHMEM_STATUS_LIMITED_MPG : NVSHMEM_STATUS_IS_INITIALIZED;
   team_barrier(s, NVSHMEM_TEAM_WORLD);
   // Every PE has mapped every heap: the files' names are no longer needed,
   // and without them a PE that dies leaves nothing behind.
@@ -812,7 +1117,10 @@ void finalize() {
   s.heap = nullptr;
   s.peer.clear();
   s.state_targets.clear();
-  s.status = NVSHMEM_STATUS_NOT_INITIALIZED;
+  if (s.close_bootstrap) s.close_bootstrap();
+  s.close_bootstrap = nullptr;
+  // MPI, OpenSHMEM and PMI bootstraps stay bootstrapped after the finalize (measured); a unique ID's does not.
+  s.status = s.bootstrapped_by_launcher ? NVSHMEM_STATUS_IS_BOOTSTRAPPED : NVSHMEM_STATUS_NOT_INITIALIZED;
 }
 
 // Collectives on the host: synchronized, then plain puts.
@@ -1029,9 +1337,12 @@ NVSHMEM_EXPORT int nvshmemx_set_attr_uniqueid_args(const int myrank, const int n
   return 0;
 }
 
-NVSHMEM_EXPORT int nvshmemx_set_attr_mpi_comm_args(void*, nvshmemx_init_attr_t*) {
-  say("the MPI bootstrap is not available in VirtualGPU; use nvshmemx_set_attr_uniqueid_args");
-  return 1;
+NVSHMEM_EXPORT int nvshmemx_set_attr_mpi_comm_args(void* mpi_comm, nvshmemx_init_attr_t* nvshmem_attr) {
+  if (!nvshmem_attr) return 1;
+  nvshmem_attr->version = NVSHMEM_INIT_ATTR_V2_IDENTIFIER;
+  nvshmem_attr->args.version = NVSHMEM_INIT_ARGS_V2_IDENTIFIER;
+  nvshmem_attr->mpi_comm = mpi_comm;
+  return 0;
 }
 
 // A module loaded with the driver API carries its own nvshmemi_device_state_d.

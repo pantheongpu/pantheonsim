@@ -59,3 +59,12 @@ telemetry:
 cuda:
   memory_bus_width_bits: 384
   persisting_l2_bytes: 4325376
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA Ampere GA102 GPU Architecture whitepaper, the RTX A6000 / A40 table: GPCs 7, TPCs 42, SMs 84.
+layout:
+  gpcs: 7
+  tpcs: 42
+  sms_per_tpc: 2

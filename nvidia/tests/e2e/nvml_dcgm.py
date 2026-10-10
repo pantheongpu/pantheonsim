@@ -235,7 +235,14 @@ check("two GPUs share a host bridge", (rc, lvl.value) == (SUCCESS, 30), (rc, lvl
 check("a GPU against itself is refused", lib.nvmlDeviceGetTopologyCommonAncestor(h0, h0, ctypes.byref(lvl)) == INVALID_ARGUMENT)
 st = ctypes.c_int(-1)
 rc = lib.nvmlDeviceGetP2PStatus(h0, h1, 0, ctypes.byref(st))
-check("peer reads work", (rc, st.value) == (SUCCESS, 0), (rc, st.value))
+if gpu == "nvidia/rtx3060":
+    # A pair of RTX 3060s has no peer path: `nvidia-smi topo -p2p r` reads CNS (1), and the
+    # NVLink, atomics and PCIe-property columns NS (5), on the card.
+    check("peer reads are CHIPSET_NOT_SUPPORTED", (rc, st.value) == (SUCCESS, 1), (rc, st.value))
+    rc = lib.nvmlDeviceGetP2PStatus(h0, h1, 3, ctypes.byref(st))
+    check("peer atomics are NOT_SUPPORTED", (rc, st.value) == (SUCCESS, 5), (rc, st.value))
+else:
+    check("peer reads work", (rc, st.value) == (SUCCESS, 0), (rc, st.value))
 rc = lib.nvmlDeviceGetP2PStatus(h0, h1, 2, ctypes.byref(st))
 check("NVLink peer access is not offered", rc == SUCCESS and st.value != 0, (rc, st.value))
 # NVLink: only the profiles that name their links have any (as the data sheet

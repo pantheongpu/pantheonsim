@@ -1,4 +1,6 @@
 #include <cstdio>
+#include <string>
+#include <utility>
 #include "vgpu/profile.hpp"
 
 #include "vgpu/error.hpp"
@@ -155,6 +157,31 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     p.cuda.clock_khz = static_cast<uint32_t>(opt_int(c, "clock_khz", origin, 0));
     p.cuda.async_engine_count = static_cast<uint32_t>(opt_int(c, "async_engine_count", origin, 0));
     p.cuda.persisting_l2_bytes = static_cast<uint64_t>(opt_int(c, "persisting_l2_bytes", origin, 0));
+    for (const auto& [key, field] : {std::pair<const char*, bool*>{"peer_access", &p.cuda.peer_access},
+                                     {"concurrent_managed_access", &p.cuda.concurrent_managed_access}}) {
+      if (auto b = c.map.find(key); b != c.map.end()) {
+        if (b->second.kind != Value::Kind::Bool) fail(origin, std::string("cuda.") + key + " must be true/false");
+        *field = b->second.b;
+      }
+    }
+  }
+
+  // Optional: how the SMs are grouped (GpuLayout). The counts must add up to the SM count.
+  if (auto it = doc.map.find("layout"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::Map) fail(origin, "'layout' must be a map");
+    const Value& l = it->second;
+    p.layout.gpcs = static_cast<uint32_t>(opt_int(l, "gpcs", origin, 0));
+    p.layout.tpcs = static_cast<uint32_t>(opt_int(l, "tpcs", origin, 0));
+    p.layout.sms_per_tpc = static_cast<uint32_t>(opt_int(l, "sms_per_tpc", origin, 0));
+    if (auto d = l.map.find("counts_derived"); d != l.map.end()) {
+      if (d->second.kind != Value::Kind::Bool) fail(origin, "layout.counts_derived must be true/false");
+      p.layout.counts_derived = d->second.b;
+    }
+    if (p.layout.tpcs && p.layout.sms_per_tpc &&
+        uint64_t{p.layout.tpcs} * p.layout.sms_per_tpc != p.limits.multiprocessors)
+      fail(origin, "layout: " + std::to_string(p.layout.tpcs) + " TPCs of " + std::to_string(p.layout.sms_per_tpc) +
+                       " SMs are not the " + std::to_string(p.limits.multiprocessors) + " multiprocessors");
+    if (p.layout.gpcs > p.layout.tpcs) fail(origin, "layout: more GPCs than TPCs");
   }
 
   // Optional: presentation-only values for monitoring tools.

@@ -14,7 +14,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -34,10 +39,26 @@ inline bool trace() {
 // registered when created, so a stale or foreign pointer is refused rather
 // than dereferenced. One registry for the whole library: the RNN API takes the
 // dropout descriptor the classic API's dropout calls take. (cudnn_api.cpp)
-void* track_raw(void* p);
+//
+// A descriptor can also be copied (Snapshot, below), which is how a call made
+// during stream capture keeps what it was given: the caller destroys its
+// descriptors as soon as the capture function returns, and the graph runs the
+// call later.
+class Snapshot;
+using CloneFn = void* (*)(const void*, Snapshot&);
+void* track_raw(void* p, CloneFn clone = nullptr, void (*del)(void*) = nullptr);
 bool known(const void* p);
 void untrack(const void* p);
-template <class T> T* track(T* p) { return static_cast<T*>(track_raw(p)); }
+// `fix`, when given, copies an object whose members point at other descriptors
+// (an RNN's dropout descriptor) and says which copies those pointers must name.
+template <class T>
+T* track(T* p, CloneFn fix = nullptr) {
+  void (*del)(void*) = [](void* q) { delete static_cast<T*>(q); };
+  if (fix) return static_cast<T*>(track_raw(p, fix, del));
+  if constexpr (std::is_copy_constructible_v<T>)
+    return static_cast<T*>(track_raw(p, [](const void* q, Snapshot&) -> void* { return new T(*static_cast<const T*>(q)); }, del));
+  return static_cast<T*>(track_raw(p, nullptr, del));
+}
 
 // cudnnGetLastErrorString's message: the reason the last call on this thread
 // failed. fail() records it and returns the status; a NOT_SUPPORTED is also
@@ -240,8 +261,110 @@ bool dropout_seed(DropoutDesc* d);
 bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep);
 
 // Waits for what the program queued on the handle's stream: this library
-// computes on the host, and the inputs must be there first.
+// computes on the host, and the inputs must be there first. (During a probe, or
+// when a call is replayed from a graph, see defer_call below.)
 void sync_handle(cudnnHandle_t h);
+
+/* ---- stream capture ------------------------------------------------------------- */
+
+// On NVIDIA's cuDNN a call made while its handle's stream is capturing is recorded
+// into the graph, and runs at each launch over what the graph's own kernels
+// have written by then -- with the descriptors it was given as they were at the
+// call, though the caller destroys them at once. This library computes on the
+// host, so such a call is handed to the graph as a closure over copies.
+//
+// defer_call is the first line of an entry point (VGPU_DEFER). While the
+// handle's stream is capturing it runs the entry point once as a PROBE, with
+// the caller's own arguments: the validation happens, in the entry point's
+// order, and every status it would return is returned. The first thing past
+// validation is sync_handle, which during a probe throws ProbeCommit instead of
+// waiting; that is the answer "this call is good and would touch the device".
+// The arguments are then copied (every argument that is a registered
+// descriptor, by Snapshot, and the host arrays and scalars named by Host) and the
+// entry point is recorded to run again at each launch of the graph, on the
+// copies, with sync_handle a no-op.
+struct ProbeCommit {};
+bool replaying();   // the call is running from a graph launch
+
+// A host-side input whose extent only the call knows -- a scalar, a host array --
+// as the entry point reads it: `bytes()` says how many bytes, and is asked only
+// once the probe has validated the call (so what it reads is sound).
+struct Host {
+  const void* p;
+  std::function<size_t()> bytes;
+  template <class T> operator const T*() const { return static_cast<const T*>(p); }
+};
+// A scalar (alpha, beta) in the type of the tensor or filter `layout_owner`
+// describes: double for double data, else float.
+Host scalar(const void* p, const void* layout_owner);
+
+class Snapshot {
+ public:
+  Snapshot() = default;
+  Snapshot(const Snapshot&) = delete;
+  Snapshot& operator=(const Snapshot&) = delete;
+  ~Snapshot();
+  // The copy of a registered object (made once); anything else as it is.
+  void* of(const void* p);
+  // A host buffer kept for the life of the snapshot.
+  const void* keep(const void* p, size_t bytes);
+
+ private:
+  struct Copy { void* p; void (*del)(void*); };
+  std::vector<std::pair<const void*, Copy>> done_;
+  std::vector<std::shared_ptr<std::vector<uint8_t>>> bufs_;
+};
+
+namespace detail {
+bool capturing_stream(cudnnHandle_t h, cudaStream_t* stream);
+bool probe_active();
+void set_probe(bool on);
+bool record_closure(cudaStream_t stream, std::function<void()> op);
+void set_replaying(bool on);
+
+template <class P, class A>
+P snap_arg(Snapshot& s, const A& a) {
+  if constexpr (std::is_same_v<A, Host>) {
+    return (P)(a.p ? s.keep(a.p, a.bytes()) : nullptr);
+  } else if constexpr (std::is_pointer_v<P> && std::is_convertible_v<A, const void*>) {
+    return (P)s.of(static_cast<const void*>(a));
+  } else {
+    return static_cast<P>(a);
+  }
+}
+}  // namespace detail
+
+template <class... P, class... A>
+std::optional<cudnnStatus_t> defer_call(cudnnHandle_t h, cudnnStatus_t (*fn)(P...), A... a) {
+  static_assert(sizeof...(P) == sizeof...(A), "defer_call: one argument per parameter");
+  if (detail::probe_active() || replaying()) return std::nullopt;
+  cudaStream_t stream = nullptr;
+  if (!detail::capturing_stream(h, &stream)) return std::nullopt;
+  {
+    struct ProbeScope {
+      ProbeScope() { detail::set_probe(true); }
+      ~ProbeScope() { detail::set_probe(false); }
+    } probe;
+    try {
+      return fn(a...);   // refused, or nothing to do on the device
+    } catch (const ProbeCommit&) {
+    }
+  }
+  auto snap = std::make_shared<Snapshot>();
+  auto args = std::make_shared<std::tuple<std::decay_t<P>...>>(detail::snap_arg<std::decay_t<P>>(*snap, a)...);
+  if (!detail::record_closure(stream, [fn, args, snap] {
+        detail::set_replaying(true);
+        std::apply(fn, *args);
+        detail::set_replaying(false);
+      }))
+    return std::nullopt;   // the capture ended meanwhile: run it now
+  return CUDNN_STATUS_SUCCESS;
+}
+
+#define VGPU_DEFER(h, fn, ...)                                                                         \
+  do {                                                                                                 \
+    if (auto vgpu_deferred_ = ::vgpu_cudnn::defer_call((h), &fn, __VA_ARGS__)) return *vgpu_deferred_; \
+  } while (0)
 
 // Leaves a tensor descriptor with no dimensions, as cuDNN reports a weight
 // matrix or bias that does not exist (cudnnGetRNNWeightParams).

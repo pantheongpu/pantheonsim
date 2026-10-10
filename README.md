@@ -59,7 +59,7 @@ Working today, all CPU-only:
 | Registers | PCI configuration space from a register database: header, PM, MSI, PCI Express and AER, live link and error state, BAR sizing; `vgpu regs list/read/write/dump/log` with an access log; AMD MMIO (engine status, the SMU mailbox) from the amdgpu headers; a C API, `vgpu_regs.h` — see [docs/registers.md](docs/registers.md) |
 | AMD | unmodified hipcc-built programs, from ROCm 6.4, 7.0, 7.1 or 7.2, run on a simulated MI300X: the HIP runtime ABI, CDNA3 (gfx942) code checked instruction by instruction against ROCm's llvm-objdump and executed on every host core, device-side `printf`, and every pantheon workload with `--verify`. AMD's `rocprofv3` runs unmodified, with the counters the interpreter counts exactly. So does rocBLAS: AMD's own quick tests pass (162,807 float and double ones, and the half, bfloat16, int8 and FP8 GEMMs run) — see [amd/README.md](amd/README.md) |
 | Profiling | CUPTI under its real soname: the Activity API (kernels, copies, fills, waits, streams, devices, runtime API calls, memory and pool records, graph traces, events and overhead, correlated) and the Callback API (every runtime function, resource including modules and graphs, and synchronize domains); `torch.profiler` collects a GPU trace, checked against the trace NVIDIA's CUPTI prints on an RTX 3060; unmodified nvprof traces a program on the T4 profile. `vgpu ncu` is this project's own `ncu`; Nsight Systems and Nsight Compute as NVIDIA ships them are not supported (`nsys` collects no CUDA data). See [nvidia/docs/cupti.md](nvidia/docs/cupti.md) |
-| NVENC / NVDEC | `libnvidia-encode.so.1` answering the API as an RTX 3060 does, with lossless PCM H.264 and HEVC streams that ffmpeg decodes (and, being deterministic, video-encode SDC tests run), and `libnvcuvid.so.1` decoding Motion JPEG into the card's NV12 surfaces — see [nvidia/docs/libraries.md](nvidia/docs/libraries.md) |
+| NVENC / NVDEC | `libnvidia-encode.so.1` answering the API as an RTX 3060 does, with compressing H.264 (CABAC or CAVLC, 8x8 transform, P and B pictures, slices) and HEVC (intra, P and B pictures) encoders and rate control, a lossless PCM stream for the lossless tuning, all of which ffmpeg decodes (and, being deterministic, video-encode SDC tests run), and `libnvcuvid.so.1` decoding Motion JPEG, H.264 (Baseline, Main and High, progressive and interlaced), HEVC (Main, Main 10 and the 4:2:0 range extension tools) and MPEG-2 (Main profile, frame and field pictures) into the card's surfaces, bit-exact with the card except MPEG-2's inverse DCT, which is within a level — see [nvidia/docs/libraries.md](nvidia/docs/libraries.md) |
 | Proof | an nvcc-compiled CUDA program **and** the unmodified pantheon stress kernels run on the CPU; `memory_read` differential-matches a physical RTX 3060 (incl. fault injection + device printf) |
 
 Known limitations (deliberate, documented):
@@ -82,10 +82,14 @@ Known limitations (deliberate, documented):
   unit tests, its convolutions among them. Every gap fails loudly
   (instruction, PTX line, kernel, profile), never silently.
 - NVENC (video encode) is served by `libvgpunvenc`, presented as
-  `libnvidia-encode.so.1`: the API as an RTX 3060 answers it, with H.264 and HEVC
-  written as lossless PCM pictures any decoder reads (ffmpeg's is the test), so
-  encoder stress and corruption checks run; it is not compression. NVDEC (`libvgpunvcuvid`, presented as
-  `libnvcuvid.so.1`) decodes Motion JPEG and reports every other codec
+  `libnvidia-encode.so.1`: the API as an RTX 3060 answers it, with compressing
+  H.264 (CABAC or CAVLC, 8x8 transform, P and B pictures, slices) and HEVC (intra,
+  P and B pictures) encoders and rate control, and the lossless tuning written as
+  lossless PCM pictures; any decoder reads them (ffmpeg's is the test) and encoder
+  stress and corruption checks run. NVDEC
+  (`libvgpunvcuvid`, presented as `libnvcuvid.so.1`) decodes Motion JPEG and
+  H.264 (Baseline, Main and High profile, progressive frames, bit-exact with the
+  card's NVDEC) and reports every other codec
   unsupported. OptiX (ray tracing) is a separate
   NVIDIA subsystem, not CUDA, and is out of scope.
 - AMD runs gfx942 (MI300X, MI325X), gfx950 (MI350X), gfx90a (MI250X),

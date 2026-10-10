@@ -181,7 +181,8 @@ VGPU_EXPORT cusparseStatus_t cusparseSpVV_bufferSize(cusparseHandle_t h, cuspars
   return spvv_check(op, *spvec(vecX), *reinterpret_cast<const DnVec*>(vecY), ct);
 }
 VGPU_EXPORT cusparseStatus_t cusparseSpVV(cusparseHandle_t h, cusparseOperation_t op, cusparseConstSpVecDescr_t vecX,
-                                          cusparseConstDnVecDescr_t vecY, void* result, cudaDataType ct, void*) {
+                                          cusparseConstDnVecDescr_t vecY, void* result, cudaDataType ct, void* unused6) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseSpVV, h, op, vecX, vecY, result, ct, unused6);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!spvec(vecX) || !known(vecY) || !result) return CUSPARSE_STATUS_INVALID_VALUE;
   const SpVec& x = *spvec(vecX);
@@ -243,6 +244,7 @@ cusparseStatus_t rot(cusparseHandle_t h, const void* c_p, const void* s_p, const
 
 VGPU_EXPORT cusparseStatus_t cusparseAxpby(cusparseHandle_t h, const void* alpha, cusparseConstSpVecDescr_t vecX,
                                            const void* beta, cusparseDnVecDescr_t vecY) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseAxpby, h, alpha, vecX, beta, vecY);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!spvec(vecX) || !known(vecY) || !alpha || !beta) return CUSPARSE_STATUS_INVALID_VALUE;
   const SpVec& x = *spvec(vecX);
@@ -255,6 +257,7 @@ VGPU_EXPORT cusparseStatus_t cusparseAxpby(cusparseHandle_t h, const void* alpha
 // element type of the right size works and comes through unchanged.
 VGPU_EXPORT cusparseStatus_t cusparseGather(cusparseHandle_t h, cusparseConstDnVecDescr_t vecY,
                                             cusparseSpVecDescr_t vecX) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseGather, h, vecY, vecX);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!spvec(vecX) || !known(vecY)) return CUSPARSE_STATUS_INVALID_VALUE;
   const SpVec& x = *spvec(vecX);
@@ -276,6 +279,7 @@ VGPU_EXPORT cusparseStatus_t cusparseGather(cusparseHandle_t h, cusparseConstDnV
 }
 VGPU_EXPORT cusparseStatus_t cusparseScatter(cusparseHandle_t h, cusparseConstSpVecDescr_t vecX,
                                              cusparseDnVecDescr_t vecY) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseScatter, h, vecX, vecY);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!spvec(vecX) || !known(vecY)) return CUSPARSE_STATUS_INVALID_VALUE;
   const SpVec& x = *spvec(vecX);
@@ -297,6 +301,7 @@ VGPU_EXPORT cusparseStatus_t cusparseScatter(cusparseHandle_t h, cusparseConstSp
 }
 VGPU_EXPORT cusparseStatus_t cusparseRot(cusparseHandle_t h, const void* c, const void* s, cusparseSpVecDescr_t vecX,
                                          cusparseDnVecDescr_t vecY) {
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparseRot, h, c, s, vecX, vecY);
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (!spvec(vecX) || !known(vecY) || !c || !s) return CUSPARSE_STATUS_INVALID_VALUE;
   const SpVec& x = *spvec(vecX);
@@ -358,7 +363,8 @@ cusparseStatus_t gemvi(cusparseHandle_t h, cusparseOperation_t op, int m, int n,
   VGPU_EXPORT cusparseStatus_t cusparse##P##gemvi(cusparseHandle_t h, cusparseOperation_t op, int m, int n,        \
                                                   const T* alpha, const T* A, int lda, int nnz, const T* xv,       \
                                                   const int* xi, const T* beta, T* y, cusparseIndexBase_t base,    \
-                                                  void*) {                                                          \
+                                                  void* unused13) { \
+  VGPU_DEFER_CALL(g_reg, stream_of(h), cusparse##P##gemvi, h, op, m, n, alpha, A, lda, nnz, xv, xi, beta, y, base, unused13); \
     return gemvi<T>(h, op, m, n, alpha, A, lda, nnz, xv, xi, beta, y, base);                                        \
   }
 VGPU_GEMVI(S, float)

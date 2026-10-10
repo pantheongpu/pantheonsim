@@ -22,6 +22,7 @@ before trusting a number.
 | `nvidia/a10`, `nvidia/a10g`, `nvidia/rtx3060`, `nvidia/rtx3080ti` | Ampere | 8.6 | 72, 80, 28, 80 |
 | `nvidia/l4`, `nvidia/l40s` | Ada Lovelace | 8.9 | 58, 142 |
 | `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb` | Hopper | 9.0 | 132, 114, 132 |
+| `nvidia/rtx-pro-6000-server` | Blackwell | 12.0 | 188 |
 
 ## Public documentation only (`verified: false`)
 
@@ -42,7 +43,6 @@ before trusting a number.
 | `nvidia/a40` | Ampere | 8.6 | 84 | 48 GiB GDDR6 | none |
 | `nvidia/a30` | Ampere | 8.0 | 56 | 24 GiB HBM2 | SM count derived from two OEM listings' 224 Tensor Cores; clocks are the A100's |
 | `nvidia/rtx2080ti` | Turing | 7.5 | 68 | 11 GiB GDDR6 | none |
-| `nvidia/rtx-pro-6000-server` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | the part AWS sells as g7e (its GPU is named "RTX PRO Server 6000"); SM clock is the Workstation Edition's |
 | `nvidia/rtx-pro-6000-max-q` | Blackwell | 12.0 | 188 | 96 GiB GDDR7 | SM clock derived from the data sheet's 110 TFLOPS |
 | `nvidia/rtx6000-ada` | Ada Lovelace | 8.9 | 142 | 48 GiB GDDR6 | persisting L2 copied from the L40S |
 | `nvidia/rtx-a6000` | Ampere | 8.6 | 84 | 48 GiB GDDR6 | none |
@@ -56,6 +56,31 @@ before trusting a number.
 The memory column is NVIDIA's "GB", which for these boards is binary (an A100
 40 GB reports 40960 MiB). A real card shows a little less in `nvidia-smi`
 because the driver keeps some, so each figure is an upper bound until measured.
+
+## Peer access and managed memory (`cuda: peer_access`, `concurrent_managed_access`)
+
+Two facts about a board that the other profile fields do not say, both `true` unless a profile says `false`:
+
+* `peer_access`: two devices of this profile can reach each other's memory (NVLink or a PCIe peer path).
+  `cudaDeviceCanAccessPeer`, `cudaDeviceGetP2PAttribute`, `cuDeviceGetP2PAttribute` and NVML's
+  `nvmlDeviceGetP2PStatus` answer from it, `cudaDeviceEnablePeerAccess` and `cuCtxEnablePeerAccess` are
+  `cudaErrorPeerAccessUnsupported` without it, and NVSHMEM starts no job whose PEs sit on such devices
+  ("Peer GPU 1 is not accessible"). A copy between the two devices still works, through the host.
+* `concurrent_managed_access`: `cudaDevAttrConcurrentManagedAccess`. Without it `cudaMemPrefetchAsync` is
+  `cudaErrorInvalidDevice` and so is the advice that names a device; the other advice is accepted and forgotten.
+
+`nvidia/rtx3060` says `false` for both: measured on the pair of RTX 3060s this was developed on (driver 13.0, WSL2;
+`nvidia/tests/data/p2p_managed.rtx3060.expected`, from `run_p2p_managed.sh --card`). The `false` of
+`concurrent_managed_access` is WSL's: a native Linux GeForce card answers 1 (the RTX 3080 Ti of
+`managed_paths.cpp` does, and its profile keeps the default). The `false` of `peer_access` is the pair's, and it is
+not known whether a GeForce pair under native Linux answers the same; no other GeForce profile says `false`
+because none was measured (the RTX 3080 Ti is a single card on its machine).
+
+## GPC layout
+
+A profile may carry a `layout:` section (`gpcs`, `tpcs`, `sms_per_tpc`): the GPC and TPC counts NVIDIA's
+whitepapers publish for the part, which cluster occupancy needs. The spread of the SMs over the GPCs is always derived,
+and a part with no published GPC count has none. See [clusters.md](clusters.md) for the table and the rules.
 
 ## Placeholder PCI ids
 
@@ -96,9 +121,7 @@ throughput only, and the value 64 is the 12.x stand-in, labelled as one in the c
 ## Rented-card characterization, 2026-10-09: not done
 
 Closing the unverified list needs a card of each model. On 2026-10-09 a g7e.2xlarge
-(RTX PRO 6000 Blackwell Server Edition) was asked for in us-east-1: the first zone had no capacity
-and the second launch was refused by the permission system, so no instance ran and nothing was
-read. H200 and B200 are only sold as p5en.48xlarge and p6-b200.48xlarge (192 vCPUs, 8 GPUs); the
+(RTX PRO 6000 Blackwell Server Edition) was asked for in us-east-1 and had no capacity; it was read later that night in us-east-2 (see the table below). H200 and B200 are only sold as p5en.48xlarge and p6-b200.48xlarge (192 vCPUs, 8 GPUs); the
 account's "Running On-Demand P instances" and "All P Spot Instance Requests" quotas are 64 vCPUs,
 so neither can launch before a quota increase. `nvidia/tools/characterize.cu` now also writes the
 `cuda:` section (bus width, clock, copy engines, persisting L2) from the card, so the next run
@@ -124,7 +147,10 @@ was read from the card, and these runs read only what is listed.
 | `nvidia/l4` | AWS g6.xlarge, driver 595.91.07, CUDA 13.2 | `device_attributes --dump` (`nvidia/tests/data/cuda_attributes_l4.card.txt`), `nvidia-smi -q`, PCI ids, clocks, power limit, memory total | Matches the profile except: `persistingL2CacheMaxSize` is 34603008 (the profile had the A100's three quarters of L2, 37748736: **corrected**); `cudaDevAttrMemoryPoolSupportedHandleTypes` 9; the PCI bus, UUID and subsystem id (where the card sits, not the model's); and the capabilities the simulator does not implement (43 attributes, host memory pools, DMA-BUF, RDMA, fabric handles ...). The nvidia-smi values in the profile (23034 MiB, 72 W, 2040 and 6251 MHz, 0x27B8) are the card's. |
 | `nvidia/l4` | the same | cuBLASLt, cuSPARSELt and the FP8 conversions, 6900 lines | reproduced line for line ([lowprec.md](lowprec.md)) |
 | `nvidia/rtx3060` | the development machine | the same probes | reproduced line for line |
-| `nvidia/l40s`, `nvidia/rtx4090`, `nvidia/l40` | none | none | Same compute capability as the L4, so the FP8 kernel table the L4 answered is applied to them; not a measurement of them. |
+| `nvidia/l40s` | AWS g6e.2xlarge, driver 595.91.07, CUDA 13.2, cuBLAS 13.3, cuSPARSELt 0.10.0.12 (2026-10-09, `r4-aws-verify`) | the whole characterization (`profile.yaml`, 142 SMs, 384-bit, 350 W, 2520/9001 MHz, 0x26B9), `ptx_semantics` and `control_flow` (512 values), `device_attributes --dump` (`nvidia/tests/data/cuda_attributes_l40s.card.txt`), `nvidia-smi -q` (`nvidia/tests/data/smi/nvidia-smi-q.l40s.txt`), `lt`, `sparselt`, `cvt` ([lowprec.md](lowprec.md)) | `nvidia/l40s` was already `verified: true`; the profile reproduces the conformance values and all three narrow-precision transcripts, which are **byte-identical to the L4's** (the sm_89 FP8 kernel tables of cuBLASLt and cuSPARSELt do not depend on the part). One value was a guess and is **corrected**: `persisting_l2_bytes` is 69206016 (eleven sixteenths of the 96 MB L2, the ratio the L4 showed), not 75497472 (three quarters). `nvidia/l40` and `nvidia/rtx6000-ada` (the same AD102 die and L2) follow it. `nvidia/rtx4090` (derived as three quarters of its 72 MB L2, 56623104) and `nvidia/rtx5090` and the RTX PRO 6000 profiles (three quarters) are NOT changed: the ratio is two data points (L4, L40S), not a rule. The same attribute dump differs from the simulator on 58 lines, all of the kinds listed for the L4 (capabilities the simulator does not implement, bus ids). |
+| `nvidia/rtx4090` | none | none | Same compute capability as the L4, so the FP8 kernel table the L4 answered is applied to it; not a measurement of it. |
+| `nvidia/l40` | none | none | The L40S's die; not a measurement of it. |
 | `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb`, `nvidia/h200` | none | none | AWS had no `p5.4xlarge` capacity (three attempts, six zones). The Hopper FP8 rules are documentation-derived. |
-| `nvidia/rtx-pro-6000` | none | none | AWS had no `g7e.2xlarge` capacity. `ptx120` has its programs and no transcript. |
+| `nvidia/rtx-pro-6000-server` | AWS g7e.2xlarge (us-east-2), driver 595.91.07, CUDA 13.2, cuBLAS 13.3 (2026-10-09, `r4-aws-verify`) | the whole characterization (188 SMs, 512-bit, 600 W, 2430/12481 MHz, 0x2BB5), `ptx_semantics` and `control_flow` (512 values), `device_attributes --dump`, `nvidia-smi -q` (`nvidia/tests/data/smi/nvidia-smi-q.rtx-pro-6000-server.txt`), `lt`, `sparselt`, `cvt`, `ptx120` and the natively run programs ([lowprec.md](lowprec.md), `nvidia/tests/data/card/rtx-pro-6000-server/`) | **`verified: true`**: the simulator reproduces the 512 conformance values. **Corrected**: boost clock 2430 MHz (was the Workstation Edition's 2617), memory clock 12481, persisting L2 83886080 (five sixths of L2, was 3/4), CUDA memory total 101975851008 B (97252 MiB; nvidia-smi 97887 MiB). The narrow-precision probes are NOT reproduced yet (`known-gaps.txt`). `nvidia/rtx-pro-6000` (the Workstation Edition, same GB202) still carries the derived 3/4 persisting L2 and 2617 MHz. |
+| `nvidia/rtx-pro-6000` | none | none | The Workstation Edition; not a measurement of it (see the Server Edition's row for the GB202's numbers). |
 | `nvidia/b200`, `nvidia/b300` and the other Blackwell profiles | none | none | An eight-GPU instance is the only way to rent them and the round's rules exclude it. |

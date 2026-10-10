@@ -1,0 +1,37 @@
+cluster launch 0
+blocks per sm 12
+non-portable sizes not allowed
+active, no dimension: cudaSuccess 0 | driver CUDA_SUCCESS 0
+potential, no dimension: cudaSuccess 0 | driver CUDA_SUCCESS 0
+active, cluster  1: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  2: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  3: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  4: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  5: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  8: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  9: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 12: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 16: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 17: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 2x4: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+potential, cluster 2: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+potential, 1 MiB of shared memory: cudaSuccess 0
+non-portable sizes allowed
+active, no dimension: cudaSuccess 0 | driver CUDA_SUCCESS 0
+potential, no dimension: cudaSuccess 0 | driver CUDA_SUCCESS 0
+active, cluster  1: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  2: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  3: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  4: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  5: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  8: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster  9: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 12: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 16: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 17: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+active, cluster 2x4: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+potential, cluster 2: cudaErrorInvalidClusterSize -7 | driver CUDA_ERROR_INVALID_CLUSTER_SIZE -7
+potential, 1 MiB of shared memory: cudaSuccess 0
+null count: cudaErrorInvalidValue
+null size: cudaErrorInvalidValue
+null function: cudaErrorInvalidDeviceFunction -7

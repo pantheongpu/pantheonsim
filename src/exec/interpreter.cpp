@@ -53,6 +53,7 @@
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
+#include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/faults.hpp"
 #include "vgpu/host_cpus.hpp"
@@ -1239,8 +1240,7 @@ uint64_t bc_texel_bits(const MemoryManager& mem, const TextureDesc& d, uint32_t 
   if (!t_bc.valid || t_bc.addr != addr || t_bc.format != d.block) {
     uint8_t raw[16];
     mem.read(addr, raw, bb);
-    if (!decode_block(d.block, raw, &t_bc.block))
-      tex_fail(Err::Unsupported, "a texture of BC6H or BC7 blocks: these two formats are not implemented (BC1 to BC5 are)");
+    if (!decode_block(d.block, raw, &t_bc.block)) tex_fail(Err::Unsupported, "a block-compressed texture of an unknown format");
     t_bc.valid = true;
     t_bc.addr = addr;
     t_bc.format = d.block;
@@ -1537,6 +1537,27 @@ void tex_check_filterable(const TextureDesc& d) {
         tex_fail(Err::Unsupported, "linear filtering of a texture whose channels differ in width");
 }
 
+// A normalized texture coordinate in texels of a level that is `size` wide. For a power of two that is the
+// coordinate times the size, exactly. For any other size the card first floors the coordinate to a fixed-point
+// number of 21 fractional bits (the integer part whole, negative coordinates toward minus infinity) and then
+// multiplies it by the size: a point fetch at 0.04 on a 25-texel level reads texel 0 where the exact product
+// (1.0000000708 for the float above 0.04) says 1, and the filter's weights follow the floored coordinate.
+// Measured on an RTX 3060 over 300,000 coordinates of five sizes (the switch from texel k-1 to k at
+// ceil(k 2^21 / size) / 2^21, and every 8-bit weight of a linear fetch).
+double texel_coordinate(float x, uint32_t size) {
+  if (size != 0 && (size & (size - 1)) == 0) return static_cast<double>(x * static_cast<float>(size));
+  return std::floor(static_cast<double>(x) * 2097152.0) / 2097152.0 * static_cast<double>(size);
+}
+
+// floor(v) as an integer, saturating (an infinite or huge coordinate lands past the edge: the address mode
+// decides, the clamp mode reads the edge texel, as the card does).
+int64_t floor_index(double v) {
+  const double f = std::floor(v);
+  if (f >= 4e18) return int64_t{4000000000000000000};
+  if (f <= -4e18) return int64_t{-4000000000000000000};
+  return static_cast<int64_t>(f);
+}
+
 // The texels a linear filter reads and their weights, which sum to `total`.
 int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[3], bool true_1d, int total,
                          TexTerm* out) {
@@ -1547,11 +1568,13 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
   int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
   for (uint32_t i = 0; i < fdims; ++i) {
     float x = i < dims ? coord[i] : 0.0f;
-    if (d.normalized_coords) x *= static_cast<float>(size[i]);
+    if (std::isnan(x)) x = 0.0f;   // a NaN coordinate reads as 0 (measured on an RTX 3060, clamp mode, all filters)
+    double xd = static_cast<double>(x);
+    if (d.normalized_coords) xd = texel_coordinate(x, size[i]);
     // The offset moves the coordinate by whole texels before the clamp mode
     // limits it (measured on an RTX 3060: clamp and linear filtering with
     // offsets, where the weights show the difference).
-    double v = static_cast<double>(x) + d.fetch_offset[i];
+    double v = xd + d.fetch_offset[i];
     if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
     const double xb = v - 0.5;
     double fl = std::floor(xb);
@@ -1590,9 +1613,10 @@ int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3
   uint32_t idx[3] = {0, 0, 0};
   bool inside = true;
   for (uint32_t i = 0; i < dims; ++i) {
-    float f = coord[i];
-    if (d.normalized_coords) f *= static_cast<float>(size[i]);
-    if (!wrap_coord(effective_address(d, i), static_cast<int64_t>(std::floor(f)) + d.fetch_offset[i], size[i], &idx[i]))
+    const float xi = std::isnan(coord[i]) ? 0.0f : coord[i];   // a NaN coordinate reads as 0
+    double f = static_cast<double>(xi);
+    if (d.normalized_coords) f = texel_coordinate(xi, size[i]);
+    if (!wrap_coord(effective_address(d, i), floor_index(f) + d.fetch_offset[i], size[i], &idx[i]))
       inside = false;
   }
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
@@ -1759,15 +1783,44 @@ void tex_linear(const MemoryManager& mem, const TextureDesc& d, uint32_t dims, c
   tex_finish(mem, d, terms, n, out);
 }
 
+// An explicit level of detail through a texture whose descriptor has a
+// maxAnisotropy of 2 or more and whose mip filter is linear is blended between its
+// two levels with a sharper weight than the fraction of the level (measured on an
+// RTX 3060, every fraction of every geometry): the weight is 0 for the first part
+// of the fraction and 256 (the upper level alone) for the last, and goes up at 3/2,
+// 7/4 or 2 times the rate in between -- for a maxAnisotropy of 2-3, 4-7 and 8 or
+// more. The ramp starts at lo = 128 (1 - 1/rate) 256ths of a level: 128/3, 128 * 3/7
+// and 64. The bias is not added to the level of detail first, as it is without
+// anisotropy: the card takes lod + trunc(bias - lo) + trunc(lo), with the bias in
+// 256ths and not truncated, truncating toward zero both times -- so a bias of 0 starts
+// the ramp at the floor of lo (42, 54, 64), a bias above lo at the ceiling of it, and a
+// fractional bias moves the ramp a whole 256th when it passes lo's own fraction (checked
+// for biases from -300 to 300 256ths in steps of 1/8, and next to 128/3 and 3 * 128/7
+// to 1/2048). A texture whose mip filter is point, and a fetch with no explicit level,
+// are not affected; the level clamps apply to the level of detail this makes.
+int64_t tex_aniso_lod(const TextureDesc& d, int64_t lod256) {
+  const uint32_t n = d.max_anisotropy;
+  const double lo = n < 4 ? 128.0 / 3 : n < 8 ? 128.0 * 3 / 7 : 64.0;
+  const int64_t lo_floor = static_cast<int64_t>(std::trunc(lo));
+  const int64_t t = lod256 + static_cast<int64_t>(std::trunc(d.mip_bias_exact - lo)) + lo_floor;
+  const int64_t level = t >> 8, k = t & 255;
+  const int64_t num = n < 4 ? 3 : n < 8 ? 7 : 2, den = n < 4 ? 2 : n < 8 ? 4 : 1;
+  const int64_t weight = k <= lo_floor ? 0 : std::min<int64_t>(256, num * (k - lo_floor) / den);
+  return level * 256 + weight;
+}
+
 // A mipmapped fetch's level of detail, in 1/256ths of a level (measured on
 // an RTX 3060): an explicit lod is truncated toward zero to 1/256 and the
-// bias added, a plain fetch is level 0 without the bias; then the texture's
-// level clamps, then the levels that exist.
+// bias added, a plain fetch is level 0 without the bias; an anisotropic
+// texture with a linear mip filter instead sharpens the blend between the two
+// levels (tex_aniso_lod); then the texture's level clamps, then the levels
+// that exist.
 int32_t tex_mip_lod(const TextureDesc& d, bool explicit_lod, double lod) {
   int64_t q = 0;
   if (explicit_lod) {
     const double scaled = std::trunc(lod * 256);
-    q = static_cast<int64_t>(std::clamp(scaled, -1e9, 1e9)) + d.mip_bias;
+    q = static_cast<int64_t>(std::clamp(scaled, -1e9, 1e9));
+    q = d.max_anisotropy >= 2 && d.mip_filter == TexFilter::Linear ? tex_aniso_lod(d, q) : q + d.mip_bias;
   }
   q = std::clamp<int64_t>(q, d.mip_min, std::max(d.mip_min, d.mip_max));
   q = std::clamp<int64_t>(q, 0, int64_t{d.mip_levels - 1} * 256);
@@ -1865,9 +1918,10 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     const uint32_t size[2] = {v.width, v.height ? v.height : 1};
     int64_t b[2];
     for (uint32_t i = 0; i < 2; ++i) {
-      float x = cf[i];
-      if (v.normalized_coords) x *= static_cast<float>(size[i]);
-      const double xb = static_cast<double>(x) - 0.5;
+      const float xi = std::isnan(cf[i]) ? 0.0f : cf[i];
+      double xd = static_cast<double>(xi);
+      if (v.normalized_coords) xd = texel_coordinate(xi, size[i]);
+      const double xb = xd - 0.5;
       double fl = std::floor(xb);
       if (std::floor((xb - fl) * 256 + 0.5) >= 256) fl += 1;
       b[i] = static_cast<int64_t>(fl) + v.fetch_offset[i];
@@ -1951,11 +2005,12 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   for (uint32_t i = 0; i < dims; ++i) {
     int64_t c;
     if (f.float_coords) {
-      float x = cf[i];
-      if (v.normalized_coords) x *= static_cast<float>(size[i]);
+      const float xi = std::isnan(cf[i]) ? 0.0f : cf[i];
+      double xd = static_cast<double>(xi);
+      if (v.normalized_coords) xd = texel_coordinate(xi, size[i]);
       // Point sampling takes the texel the coordinate falls in. CUDA's
       // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
-      c = static_cast<int64_t>(std::floor(x)) + v.fetch_offset[i];
+      c = floor_index(xd) + v.fetch_offset[i];
     } else {
       // An integer coordinate names a texel directly, and outside the extent
       // reads zero: an RTX 3060 applies neither the address mode nor the
@@ -7057,6 +7112,14 @@ class Interpreter {
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     Lanes _s_lod;
     const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
+    // .grad: dPdx and dPdy, one operand per spatial coordinate (a 3D or cube texture's vectors carry a fourth,
+    // unused one).
+    std::array<Lanes, 3> ddx, ddy, ddx_scratch, ddy_scratch;
+    if (op.grad)
+      for (uint32_t i = 0; i < op.dims; ++i) {
+        ddx[i] = read_operand(w, ctx, ins, op.ddx[i], ddx_scratch[i]);
+        ddy[i] = read_operand(w, ctx, ins, op.ddy[i], ddy_scratch[i]);
+      }
     std::array<Lanes, 3> offs;
     std::array<Lanes, 3> offs_scratch;
     const uint32_t noff = std::min<uint32_t>(3, static_cast<uint32_t>(op.offset.size()));
@@ -7086,6 +7149,13 @@ class Interpreter {
         f.lod = op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
                                     : static_cast<double>(static_cast<int32_t>((*lod)[lane]));
       f.gather = op.gather;
+      if (op.grad) {
+        f.grad = true;
+        for (uint32_t i = 0; i < op.dims; ++i) {
+          f.ddx[i] = static_cast<uint32_t>(ddx[i][lane]);
+          f.ddy[i] = static_cast<uint32_t>(ddy[i][lane]);
+        }
+      }
       // Offsets are two's complement fields, as ptxas packs them into a
       // register for the instruction: four bits for tex (-8..7, a register
       // holding more wraps: measured), six for tld4 (to be measured).
@@ -7102,7 +7172,7 @@ class Interpreter {
         f.offset[1] = static_cast<int32_t>((static_cast<uint32_t>(offs[0][lane]) >> 4 & 15u) ^ 8u) - 8;
       uint32_t r[4];
       try {
-        fetch_texel(mem_, d, f, r);
+        texture_fetch(mem_, d, f, r);   // the shared entry: it resets the block cache and resolves .grad
       } catch (const Error& e) {
         rethrow_with_context(e, ins, static_cast<int>(lane));
       }
@@ -7334,7 +7404,10 @@ class Interpreter {
       // kinds.
       case MmaElem::E3M2: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 3, 2, 3);
       case MmaElem::E2M3: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 2, 3, 1);
-      case MmaElem::E2M1: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot + 2)) & 0xF, 2, 1, 1);
+      // (An RTX PRO 6000 reads the byte's low six bits as an E2M3 for an E2M1 operand too -- the hash of a form
+      // with random bytes in the containers says so -- which is the same number when bits 0-1 and 6-7 are zero,
+      // as CUTLASS's and the ISA's layout leaves them.)
+      case MmaElem::E2M1: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 2, 3, 1);
       case MmaElem::E2M1P: return small_float_value(static_cast<uint32_t>(reg >> (4 * slot)) & 0xF, 2, 1, 1);
       case MmaElem::S8:
       case MmaElem::U8: {
@@ -7499,6 +7572,13 @@ class Interpreter {
     // integers accumulate exactly and then wrap or saturate; .b1 counts the
     // bits of A's row and B's column that .and/.xor leave set.
     std::array<double, 16 * kN> D{};
+    // The narrow-float tensor core of sm_120 (E4M3, E5M2, E3M2, E2M3, E2M1 and packed E2M1 operands, float accumulate).
+    const auto narrow_elem = [](MmaElem t) {
+      return t == MmaElem::E4M3 || t == MmaElem::E5M2 || t == MmaElem::E3M2 || t == MmaElem::E2M3 ||
+             t == MmaElem::E2M1 || t == MmaElem::E2M1P;
+    };
+    const bool narrow_tensor_core = profile_.cc_major == 12 && narrow_elem(op.ab_type) && narrow_elem(op.b_type) &&
+                                    !op.acc_int && !op.acc_f64 && !op.acc_f16;
     const int prev_round = std::fegetround();
     if (op.acc_f64) {
       switch (op.rnd) {
@@ -7536,6 +7616,13 @@ class Interpreter {
           double acc = C[i * kN + j];
           for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[i * K + k], B[k * kN + j], acc);
           D[i * kN + j] = acc;
+        } else if (narrow_tensor_core) {
+          // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (mma_narrow_sum).
+          double terms[256];
+          for (uint32_t k = 0; k < K; ++k)
+            terms[k] = op.block_scale ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
+                                      : A[i * K + k] * B[k * kN + j];
+          D[i * kN + j] = static_cast<double>(vgpu::exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j])));
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           if (op.block_scale)
@@ -13411,7 +13498,51 @@ const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, Te
 
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
   t_bc.valid = false;   // the memory a block was decoded from may have changed since the last fetch
-  fetch_texel(mem, d, f, out);
+  if (!f.grad) {
+    fetch_texel(mem, d, f, out);
+    return;
+  }
+  // tex.grad: the level of detail comes from the gradients (see exec/texture_grad.hpp for what is reproduced).
+  TexFetch g = f;
+  g.grad = false;
+  if (d.max_anisotropy > 1)
+    tex_fail(Err::Unsupported,
+             "tex.grad on a texture with maxAnisotropy above 1: the card then filters along the major axis of "
+             "the gradients' ellipse, which is not reproduced (set maxAnisotropy to 0 or 1)");
+  if (d.mip_levels == 0) {   // one level: the gradients choose nothing
+    fetch_texel(mem, d, g, out);
+    return;
+  }
+  if (f.cube)
+    tex_fail(Err::Unsupported,
+             "tex.grad on a cube texture: the card finds the level of detail from the four coordinates of a quad "
+             "of normalized directions, which is not reproduced bit for bit");
+  if (f.dims == 3) {   // see exec/texture_grad.hpp: the card's unit sees (P + d) - P, scaled by the size
+    const uint32_t size[3] = {d.width, d.height, d.depth};
+    double dx[3], dy[3];
+    for (int i = 0; i < 3; ++i) {
+      const float p = std::bit_cast<float>(f.coord[i]);
+      dx[i] = std::clamp(tex_grad::scale_by_size(tex_grad::quad_difference(p, std::bit_cast<float>(f.ddx[i])), size[i]),
+                         -1e300, 1e300);
+      dy[i] = std::clamp(tex_grad::scale_by_size(tex_grad::quad_difference(p, std::bit_cast<float>(f.ddy[i])), size[i]),
+                         -1e300, 1e300);
+    }
+    g.explicit_lod = true;
+    g.lod = static_cast<double>(tex_grad::lod_q_3d(dx, dy)) / 256.0;
+    fetch_texel(mem, d, g, out);
+    return;
+  }
+  const bool one_d = f.dims == 1;
+  // A gradient in texels of the base level, as the card's multiplier gives it (exact for a power-of-two size);
+  // an infinite gradient (1e300 here) times a size stays finite.
+  auto c = [](uint32_t bits, uint32_t size) {
+    return std::clamp(tex_grad::scale_by_size(tex_grad::component(std::bit_cast<float>(bits)), size), -1e300, 1e300);
+  };
+  const uint32_t w = d.width, h = one_d ? 1u : d.height;
+  g.explicit_lod = true;
+  g.lod = static_cast<double>(tex_grad::lod_q_2d(c(f.ddx[0], w), one_d ? 0.0 : c(f.ddx[1], h), c(f.ddy[0], w),
+                                                 one_d ? 0.0 : c(f.ddy[1], h))) / 256.0;
+  fetch_texel(mem, d, g, out);
 }
 
 std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a) { return surface_at(d, a); }
@@ -13471,6 +13602,44 @@ uint32_t ue8m0_bits(double v, bool round_up, bool satfinite) {
 }
 uint16_t f16_bits(double v) { return static_cast<uint16_t>(double_to_f16(v)); }
 uint16_t bf16_bits(double v) { return static_cast<uint16_t>(double_to_bf16(v)); }
+
+float mma_narrow_sum(const double* terms, size_t n, float c) {
+  bool nan = std::isnan(c), pinf = std::isinf(c) && c > 0, ninf = std::isinf(c) && c < 0;
+  bool all_neg_zero = c == 0.0f && std::signbit(c);
+  int max_e = std::numeric_limits<int>::min();
+  auto look = [&](double t) {
+    if (std::isnan(t)) { nan = true; all_neg_zero = false; return; }
+    if (std::isinf(t)) { (t > 0 ? pinf : ninf) = true; all_neg_zero = false; return; }
+    if (t != 0) { max_e = std::max(max_e, std::ilogb(t)); all_neg_zero = false; }
+    else if (!std::signbit(t)) all_neg_zero = false;
+  };
+  for (size_t i = 0; i < n; ++i) look(terms[i]);
+  if (std::isfinite(c) && c != 0.0f) max_e = std::max(max_e, std::ilogb(static_cast<double>(c)));
+  if (nan || (pinf && ninf)) return std::bit_cast<float>(0x7fffffffu);
+  if (pinf) return std::numeric_limits<float>::infinity();
+  if (ninf) return -std::numeric_limits<float>::infinity();
+  if (max_e == std::numeric_limits<int>::min()) return all_neg_zero ? -0.0f : 0.0f;
+  const int lsb = max_e - 118;   // the unit of the fixed-point sum: 2^lsb, the largest term in 119 bits of an __int128
+  __int128 acc = 0;
+  auto add = [&](double t) {
+    if (t == 0) return;
+    acc += static_cast<__int128>(std::floor(std::ldexp(t, -lsb)));   // below the unit: toward minus infinity
+  };
+  for (size_t i = 0; i < n; ++i) add(terms[i]);
+  add(static_cast<double>(c));
+  if (acc == 0) return 0.0f;
+  const bool neg = acc < 0;
+  unsigned __int128 mag = neg ? -static_cast<unsigned __int128>(acc) : static_cast<unsigned __int128>(acc);
+  const uint64_t hi = static_cast<uint64_t>(mag >> 64), lo = static_cast<uint64_t>(mag);
+  const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
+  // fp32 keeps 24 bits and nothing below 2^-149
+  const int shift = std::max(top - 23, -149 - lsb);
+  const uint64_t m = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  if (m == 0) return 0.0f;
+  const double v = std::ldexp(static_cast<double>(m), lsb + shift);
+  if (v >= 0x1p128) return neg ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+  return neg ? -static_cast<float>(v) : static_cast<float>(v);
+}
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
   validate(fn, cfg, profile);

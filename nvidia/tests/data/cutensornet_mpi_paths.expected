@@ -1,0 +1,132 @@
+-- the communicator
+ok   cutensornetDistributedGetNumRanks(h, &v) -> 0
+ok   without a communicator the world is one rank
+ok   cutensornetDistributedGetProcRank(h, &v) -> 0
+ok   and this is rank 0
+ok   cutensornetDistributedSynchronize(h) -> 0
+ok   cutensornetDistributedGetNumRanks(h, nullptr) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedGetNumRanks(nullptr, &v) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedGetProcRank(h, nullptr) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedGetProcRank(nullptr, &v) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedSynchronize(nullptr) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedResetConfiguration(nullptr, &comm, sizeof comm) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedResetConfiguration(h, &comm, 0) -> CUTENSORNET_STATUS_INVALID_VALUE
+ok   cutensornetDistributedResetConfiguration(h, nullptr, 0) -> 0
+ok   the communication library is loaded and exports the test hooks
+ok   cutensornetDistributedResetConfiguration(h, nullptr, sizeof comm) -> 0
+ok   the primitives called are 
+ok   cutensornetDistributedResetConfiguration(h, &comm, sizeof comm) -> 0
+ok   the primitives called are getProcRank Barrier getNumRanksShared
+ok   cutensornetDistributedGetNumRanks(h, &v) -> 0
+ok   the world has every rank
+ok   the primitives called are getNumRanks
+ok   cutensornetDistributedGetProcRank(h, &v) -> 0
+ok   this process has its rank in the communicator
+ok   the primitives called are getProcRank
+ok   cutensornetDistributedSynchronize(h) -> 0
+ok   the primitives called are Barrier
+ok   cutensornetDistributedResetConfiguration(h, &comm, sizeof comm) -> 0
+ok   the primitives called are Barrier getProcRank Barrier getNumRanksShared
+ok   cutensornetDistributedResetConfiguration(h, nullptr, 0) -> 0
+ok   the primitives called are Barrier
+ok   cutensornetDistributedGetNumRanks(h, &v) -> 0
+ok   a reset to no communicator leaves one rank
+ok   cutensornetDistributedResetConfiguration(h, nullptr, 0) -> 0
+ok   the primitives called are 
+-- failing primitives
+ok   cutensornetDistributedGetNumRanks(h, &v) -> CUTENSORNET_STATUS_INTERNAL_ERROR
+ok   cutensornetDistributedGetProcRank(h, &v) -> CUTENSORNET_STATUS_INTERNAL_ERROR
+ok   cutensornetDistributedResetConfiguration(h, &comm, sizeof comm) -> CUTENSORNET_STATUS_INTERNAL_ERROR
+ok   cutensornetDistributedSynchronize(h) -> CUTENSORNET_STATUS_DISTRIBUTED_FAILURE
+ok   cutensornetDistributedResetConfiguration(h, &comm, sizeof comm) -> CUTENSORNET_STATUS_DISTRIBUTED_FAILURE
+ok   cutensornetDistributedResetConfiguration(h, nullptr, 0) -> CUTENSORNET_STATUS_DISTRIBUTED_FAILURE
+ok   cutensornetDistributedResetConfiguration(h, &comm, sizeof comm) -> 0
+ok   os -> CUTENSORNET_STATUS_DISTRIBUTED_FAILURE
+ok   the optimizer fails with AllreduceInPlaceMin
+ok   the optimizer fails with AllreduceDoubleIntMinloc
+ok   the optimizer fails with Bcast
+ok   os -> 0
+ok   cutensornetNetworkContract(h, n.net, 0, n.work, nullptr, 0) -> CUTENSORNET_STATUS_DISTRIBUTED_FAILURE
+ok   cutensornetNetworkContract(h, n.net, 0, n.work, nullptr, 0) -> CUTENSORNET_STATUS_DISTRIBUTED_FAILURE
+ok   cutensornetNetworkContract(h, n.net, 0, n.work, nullptr, 0) -> 0
+-- slices dealt to the ranks
+ok   os -> 0
+ok   the optimizer slices to at least one slice for each rank
+ok   os -> 0
+ok   a network of at least eight slices for the groups below
+ok   cutensornetNetworkContract(h, n.net, 0, n.work, g, 0) -> 0
+ok   the slices contracted alone add up to the whole network
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   all slices: the outputs are summed with one in-place sum of 8 doubles
+ok   all slices: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   ids 1 3 5: the outputs are summed with one in-place sum of 8 doubles
+ok   ids 1 3 5: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   id 5: the outputs are summed with one in-place sum of 8 doubles
+ok   id 5: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   range 2..7 step 2: the outputs are summed with one in-place sum of 8 doubles
+ok   range 2..7 step 2: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   id 0: the outputs are summed with one in-place sum of 8 doubles
+ok   id 0: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   ids 7 6 5 4: the outputs are summed with one in-place sum of 8 doubles
+ok   ids 7 6 5 4: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   ids 2 3: the outputs are summed with one in-place sum of 8 doubles
+ok   ids 2 3: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   all slices, accumulating: the outputs are summed with one in-place sum of 8 doubles
+ok   all slices, accumulating: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   ids 1 3 5, accumulating: the outputs are summed with one in-place sum of 8 doubles
+ok   ids 1 3 5, accumulating: every slice is contracted by the rank it is dealt to
+ok   cutensornetNetworkContract(h, n.net, c.accumulate, n.work, g, 0) -> 0
+ok   id 5, accumulating: the outputs are summed with one in-place sum of 8 doubles
+ok   id 5, accumulating: every slice is contracted by the rank it is dealt to
+-- the descriptor and plan API
+ok   cutensornetCreateNetworkDescriptor(h, 3, nmi, exts, nullptr, mds, nullptr, 2, oe, nullptr, om, CUDA_R_64F, CUTENSORNET_COMPUTE_64F, &net) -> 0
+ok   cutensornetContractionOptimize(h, net, cfg, 1ull << 30, info) -> 0
+ok   cutensornetCreateContractionPlan(h, net, info, work, &plan) -> 0
+ok   cutensornetContractSlices(h, plan, (const void* const*)in, o, 0, work, nullptr, 0) -> 0
+ok   ContractSlices sums the ranks' outputs
+ok   ContractSlices deals the slices to the ranks
+ok   cutensornetContraction(h, plan, (const void* const*)in, o, work, 3, 0) -> 0
+ok   Contraction of one slice does not communicate
+ok   and every rank contracts the slice it is given
+-- output strides
+ok   cutensornetNetworkSetOutputTensorMemory(h, net, out, padded) -> 0
+ok   cutensornetContractionOptimize(h, net, cfg, 1ull << 30, info) -> 0
+ok   cutensornetNetworkPrepareContraction(h, net, work) -> 0
+ok   cutensornetNetworkContract(h, net, 0, work, nullptr, 0) -> 0
+ok   the strides are honoured by the contraction, the sum covers the first 8 elements and the clearing too (measured)
+ok   and nothing past the strided tensor is written
+-- the state API
+ok   without a communicator no primitive is called
+ok   the amplitudes are the same
+ok   and the norm
+ok   the expectation value of the two terms
+ok   and its norm
+ok   the reduced density matrix
+ok   amplitudes, then the norm, are summed in place
+ok   the value of two terms, then the norm, are summed in place
+ok   the reduced density matrix is summed in place
+-- the terms of an expectation value
+ok   1 term: the sums of the primitives
+ok   1 term: the value, with the coefficients of the rank that contracts each term
+ok   2 terms: the sums of the primitives
+ok   2 terms: the value, with the coefficients of the rank that contracts each term
+ok   3 terms: the sums of the primitives
+ok   3 terms: the value, with the coefficients of the rank that contracts each term
+ok   4 terms: the sums of the primitives
+ok   4 terms: the value, with the coefficients of the rank that contracts each term
+ok   5 terms: the sums of the primitives
+ok   5 terms: the value, with the coefficients of the rank that contracts each term
+-- distributed tensor descriptors
+ok   cutensornetCreateDistributedTensorDescriptor(h, 2, ex, nullptr, nullptr, nullptr, nr, ml, CUDA_R_64F, &td) -> CUTENSORNET_STATUS_NOT_INITIALIZED
+ok   cutensornetCreateDistributedTensorDescriptor(nullptr, 2, ex, nullptr, nullptr, nullptr, nr, ml, CUDA_R_64F, &td) -> CUTENSORNET_STATUS_NOT_INITIALIZED
+ok   a distributed descriptor needs the optional backends (NOT_SUPPORTED without)
+ok   after gathering one word from every rank
+PASS

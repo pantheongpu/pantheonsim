@@ -2,12 +2,16 @@
 //
 // Frames of known content are encoded through the NVENC API -- NV12, YV12, IYUV
 // and the 32-bit RGB formats, at sizes that are and are not multiples of 16 and
-// not even -- and the stream is decoded with ffmpeg. VirtualGPU's encoder writes
-// lossless PCM coding units (macroblocks, or 16x16 coding tree blocks in HEVC),
-// so the decoded samples must equal the input exactly
-// (RGB input: the BT.601 limited-range conversion the card's encoder applies, to
-// within one level); with --lossy, which is for NVIDIA's real library, the encoder
-// is lossy and the check is a peak signal-to-noise ratio of at least 30 dB.
+// not even -- and the stream is decoded with ffmpeg.
+//
+// VirtualGPU's H.264 and HEVC encoders compress (the high-quality tuning): the decoded
+// frames must reach a peak signal-to-noise ratio of 30 dB, the stream must be smaller than
+// the raw frames, and the pictures must be typed IDR, P, P, ... as the application's GOP
+// settings say. The lossless tuning writes lossless PCM macroblocks, so those decoded
+// samples must equal the input exactly (RGB input: the BT.601 limited-range conversion the
+// card's encoder applies, to within one level).
+// With --card, for NVIDIA's real library, every case is lossy and the check is the
+// 30 dB signal-to-noise ratio.
 //
 // Without ffmpeg or ffprobe it prints a note and passes (the unit tests test_nvenc_h264 and
 // test_nvenc_hevc cover the same streams); it SKIPs only when libnvidia-encode.so.1 is missing.
@@ -44,7 +48,16 @@ int tri(int v) {
   return v < 128 ? v : 255 - v;
 }
 
-// Smooth test content that moves from frame to frame.
+// Deterministic pseudo-random noise in -amp..amp: texture for the encoder to work on, the same on every run.
+int noise(int x, int y, int t, int amp) {
+  uint32_t v = static_cast<uint32_t>(x) * 73856093u ^ static_cast<uint32_t>(y) * 19349663u ^ static_cast<uint32_t>(t) * 83492791u;
+  v ^= v >> 13;
+  v *= 0x5bd1e995u;
+  v ^= v >> 15;
+  return static_cast<int>(v % static_cast<uint32_t>(2 * amp + 1)) - amp;
+}
+
+// Smooth test content that moves from frame to frame, with a little noise on it.
 Planes make_planes(int w, int h, int t) {
   Planes p;
   p.w = w;
@@ -53,10 +66,10 @@ Planes make_planes(int w, int h, int t) {
   p.u.resize(static_cast<size_t>(p.cw()) * p.ch());
   p.v.resize(p.u.size());
   for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x) p.y[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(40 + tri(x + 2 * y + 11 * t) * 3 / 4);
+    for (int x = 0; x < w; ++x) p.y[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(40 + tri(x + 2 * y + 11 * t) * 3 / 4 + noise(x, y, t, 10));
   for (int y = 0; y < p.ch(); ++y)
     for (int x = 0; x < p.cw(); ++x) {
-      p.u[static_cast<size_t>(y) * p.cw() + x] = static_cast<uint8_t>(80 + tri(3 * x + y + 7 * t) / 2);
+      p.u[static_cast<size_t>(y) * p.cw() + x] = static_cast<uint8_t>(80 + tri(3 * x + y + 7 * t) / 2 + noise(x, y, t + 100, 3));
       p.v[static_cast<size_t>(y) * p.cw() + x] = static_cast<uint8_t>(90 + tri(x + 2 * y + 5 * t) / 2);
     }
   return p;
@@ -78,7 +91,7 @@ Rgb make_rgb(int w, int h, int t) {
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const size_t i = static_cast<size_t>(y) * w + x;
-      c.r[i] = static_cast<uint8_t>(30 + tri(x + 11 * t) * 3 / 2);
+      c.r[i] = static_cast<uint8_t>(30 + tri(x + 11 * t) * 3 / 2 + noise(x, y, t, 8));
       c.g[i] = static_cast<uint8_t>(40 + tri(2 * y + 7 * t));
       c.b[i] = static_cast<uint8_t>(200 - tri(x + y + 3 * t));
     }
@@ -135,7 +148,7 @@ bool tool_exists(const char* name) {
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  const bool lossy = argc > 1 && !std::strcmp(argv[1], "--lossy");
+  const bool card = argc > 1 && (!std::strcmp(argv[1], "--lossy") || !std::strcmp(argv[1], "--card"));
   void* lib = dlopen("libnvidia-encode.so.1", RTLD_NOW);
   if (!lib) {
     std::printf("SKIP: no libnvidia-encode.so.1\n");
@@ -167,16 +180,26 @@ int main(int argc, char** argv) {
     NV_ENC_BUFFER_FORMAT fmt;
     int w, h;
     bool hevc;
+    bool lossless;   // the lossless tuning
+    int fip = 1;     // frameIntervalP: 1 is IPPP, 3 has two B pictures between P pictures
+    int frames = 4;
+    int kbps = 0;    // constant bit rate, in kbit/s (0: the preset's constant QP)
   } cases[] = {
-      {"H.264 NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false}, {"H.264 NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false},
-      {"H.264 NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, false},   {"H.264 YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false},
-      {"H.264 IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, false}, {"H.264 IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, false},
-      {"H.264 ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false}, {"H.264 ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, false},
-      {"HEVC NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true},   {"HEVC NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, true},
-      {"HEVC NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, true},     {"HEVC YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, true},
-      {"HEVC IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, true},   {"HEVC IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, true},
-      {"HEVC ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, true},   {"HEVC ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, true}};
-  constexpr int kFrames = 3;
+      {"H.264 NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, false}, {"H.264 NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false, false},
+      {"H.264 NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, false, false},   {"H.264 YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false, false},
+      {"H.264 IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, false, false}, {"H.264 IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, false, false},
+      {"H.264 ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false, false}, {"H.264 ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, false, false},
+      {"H.264 lossless NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, true}, {"H.264 lossless NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false, true},
+      {"H.264 lossless YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false, true}, {"H.264 lossless ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false, true},
+      {"H.264 NV12 192x128 with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, false, 3, 7},
+      {"HEVC NV12 192x128 with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true, false, 3, 7},
+      {"H.264 NV12 320x180 at 300 kbit/s", NV_ENC_BUFFER_FORMAT_NV12, 320, 180, false, false, 1, 30, 300},
+      {"HEVC NV12 320x180 at 300 kbit/s", NV_ENC_BUFFER_FORMAT_NV12, 320, 180, true, false, 1, 30, 300},
+      {"HEVC NV12 320x180 at 200 kbit/s with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 320, 180, true, false, 3, 30, 200},
+      {"HEVC NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true, false},   {"HEVC NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, true, false},
+      {"HEVC NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, true, false},     {"HEVC YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, true, false},
+      {"HEVC IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, true, false},   {"HEVC IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, true, false},
+      {"HEVC ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, true, false},   {"HEVC ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, true, false}};
   int failures = 0;
 
   for (const auto& c : cases) {
@@ -196,14 +219,19 @@ int main(int argc, char** argv) {
     pc.version = NV_ENC_PRESET_CONFIG_VER;
     pc.presetCfg.version = NV_ENC_CONFIG_VER;
     const GUID& codec = c.hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
-    f.nvEncGetEncodePresetConfigEx(enc, codec, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, &pc);
+    const NV_ENC_TUNING_INFO tuning = c.lossless ? NV_ENC_TUNING_INFO_LOSSLESS : NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    f.nvEncGetEncodePresetConfigEx(enc, codec, NV_ENC_PRESET_P4_GUID, tuning, &pc);
     pc.presetCfg.gopLength = 30;
-    pc.presetCfg.frameIntervalP = 1;   // no B frames: output order is coding order
+    pc.presetCfg.frameIntervalP = c.fip;   // 1: no B frames, output order is coding order
+    if (c.kbps) {
+      pc.presetCfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+      pc.presetCfg.rcParams.averageBitRate = pc.presetCfg.rcParams.maxBitRate = static_cast<uint32_t>(c.kbps) * 1000;
+    }
     NV_ENC_INITIALIZE_PARAMS ip{};
     ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
     ip.encodeGUID = codec;
     ip.presetGUID = NV_ENC_PRESET_P4_GUID;
-    ip.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    ip.tuningInfo = tuning;
     ip.encodeWidth = ip.darWidth = static_cast<uint32_t>(c.w);
     ip.encodeHeight = ip.darHeight = static_cast<uint32_t>(c.h);
     ip.frameRateNum = 30;
@@ -216,24 +244,58 @@ int main(int argc, char** argv) {
       ++failures;
       continue;
     }
-    NV_ENC_CREATE_INPUT_BUFFER ib{};
-    ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-    ib.width = static_cast<uint32_t>(c.w);
-    ib.height = static_cast<uint32_t>(c.h);
-    ib.bufferFmt = c.fmt;
-    NV_ENC_CREATE_BITSTREAM_BUFFER ob{};
-    ob.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-    if (f.nvEncCreateInputBuffer(enc, &ib) != NV_ENC_SUCCESS || f.nvEncCreateBitstreamBuffer(enc, &ob) != NV_ENC_SUCCESS) {
-      std::printf("FAIL %s: buffer creation refused\n", c.name);
+    // buffers come from pools: the encoder may hold an input buffer until its picture is coded (B pictures), and a call it answers
+    // NV_ENC_ERR_NEED_MORE_INPUT leaves its output buffer to be filled by a later call
+    constexpr int kPool = 8;
+    NV_ENC_INPUT_PTR in_buf[kPool] = {};
+    NV_ENC_OUTPUT_PTR out_buf[kPool] = {};
+    int made_in = 0, made_out = 0;
+    for (int i = 0; i < kPool; ++i) {
+      NV_ENC_CREATE_INPUT_BUFFER ib{};
+      ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+      ib.width = static_cast<uint32_t>(c.w);
+      ib.height = static_cast<uint32_t>(c.h);
+      ib.bufferFmt = c.fmt;
+      if (f.nvEncCreateInputBuffer(enc, &ib) != NV_ENC_SUCCESS) break;
+      in_buf[made_in++] = ib.inputBuffer;
+      NV_ENC_CREATE_BITSTREAM_BUFFER ob{};
+      ob.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+      if (f.nvEncCreateBitstreamBuffer(enc, &ob) != NV_ENC_SUCCESS) break;
+      out_buf[made_out++] = ob.bitstreamBuffer;
+    }
+    auto destroy_buffers = [&] {
+      for (int i = 0; i < made_out; ++i) f.nvEncDestroyBitstreamBuffer(enc, out_buf[i]);
+      for (int i = 0; i < made_in; ++i) f.nvEncDestroyInputBuffer(enc, in_buf[i]);
       f.nvEncDestroyEncoder(enc);
+    };
+    if (made_in < kPool || made_out < kPool) {
+      std::printf("FAIL %s: buffer creation refused\n", c.name);
+      destroy_buffers();
       ++failures;
       continue;
     }
 
     std::vector<Planes> expected;
     std::vector<uint8_t> stream;
+    std::vector<int> types;   // NV_ENC_PIC_TYPE of each picture
     bool ok = true;
-    for (int t = 0; t < kFrames && ok; ++t) {
+    std::vector<int> outstanding;   // output buffers of calls that returned NV_ENC_ERR_NEED_MORE_INPUT
+    auto collect = [&]() {
+      for (int b : outstanding) {
+        NV_ENC_LOCK_BITSTREAM lb{};
+        lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+        lb.outputBitstream = out_buf[b];
+        if (f.nvEncLockBitstream(enc, &lb) != NV_ENC_SUCCESS) return false;
+        const auto* bytes = static_cast<const uint8_t*>(lb.bitstreamBufferPtr);
+        stream.insert(stream.end(), bytes, bytes + lb.bitstreamSizeInBytes);
+        types.push_back(static_cast<int>(lb.pictureType));
+        f.nvEncUnlockBitstream(enc, out_buf[b]);
+      }
+      outstanding.clear();
+      return true;
+    };
+    for (int t = 0; t < c.frames && ok; ++t) {
+      const int slot = t % kPool;
       Planes in;
       Rgb col;
       if (rgb) {
@@ -244,7 +306,7 @@ int main(int argc, char** argv) {
       }
       NV_ENC_LOCK_INPUT_BUFFER lk{};
       lk.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-      lk.inputBuffer = ib.inputBuffer;
+      lk.inputBuffer = in_buf[slot];
       if (f.nvEncLockInputBuffer(enc, &lk) != NV_ENC_SUCCESS) {
         ok = false;
         break;
@@ -282,35 +344,36 @@ int main(int argc, char** argv) {
           }
         }
       }
-      f.nvEncUnlockInputBuffer(enc, ib.inputBuffer);
+      f.nvEncUnlockInputBuffer(enc, in_buf[slot]);
       NV_ENC_PIC_PARAMS pp{};
       pp.version = NV_ENC_PIC_PARAMS_VER;
-      pp.inputBuffer = ib.inputBuffer;
-      pp.outputBitstream = ob.bitstreamBuffer;
+      pp.inputBuffer = in_buf[slot];
+      pp.outputBitstream = out_buf[slot];
       pp.bufferFmt = c.fmt;
       pp.inputWidth = static_cast<uint32_t>(c.w);
       pp.inputHeight = static_cast<uint32_t>(c.h);
       pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
       pp.inputTimeStamp = static_cast<uint64_t>(t) * 3000;
-      if (f.nvEncEncodePicture(enc, &pp) != NV_ENC_SUCCESS) {
+      const NVENCSTATUS est = f.nvEncEncodePicture(enc, &pp);
+      outstanding.push_back(slot);
+      if (est == NV_ENC_SUCCESS) {
+        if (!collect()) {
+          ok = false;
+          break;
+        }
+      } else if (est != NV_ENC_ERR_NEED_MORE_INPUT) {
         ok = false;
         break;
       }
-      NV_ENC_LOCK_BITSTREAM lb{};
-      lb.version = NV_ENC_LOCK_BITSTREAM_VER;
-      lb.outputBitstream = ob.bitstreamBuffer;
-      if (f.nvEncLockBitstream(enc, &lb) != NV_ENC_SUCCESS) {
-        ok = false;
-        break;
-      }
-      const auto* bytes = static_cast<const uint8_t*>(lb.bitstreamBufferPtr);
-      stream.insert(stream.end(), bytes, bytes + lb.bitstreamSizeInBytes);
-      f.nvEncUnlockBitstream(enc, ob.bitstreamBuffer);
       expected.push_back(std::move(in));
     }
-    f.nvEncDestroyBitstreamBuffer(enc, ob.bitstreamBuffer);
-    f.nvEncDestroyInputBuffer(enc, ib.inputBuffer);
-    f.nvEncDestroyEncoder(enc);
+    if (ok && !outstanding.empty()) {   // end of stream: the pictures still waiting are coded
+      NV_ENC_PIC_PARAMS eos{};
+      eos.version = NV_ENC_PIC_PARAMS_VER;
+      eos.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+      if (f.nvEncEncodePicture(enc, &eos) != NV_ENC_SUCCESS || !collect()) ok = false;
+    }
+    destroy_buffers();
     if (!ok) {
       std::printf("FAIL %s: an encode call failed\n", c.name);
       ++failures;
@@ -339,15 +402,15 @@ int main(int argc, char** argv) {
       continue;
     }
     const size_t frame_bytes = static_cast<size_t>(dw) * dh + 2 * static_cast<size_t>((dw + 1) / 2) * ((dh + 1) / 2);
-    if (raw.size() != frame_bytes * kFrames || dw < c.w || dh < c.h || dw > c.w + 1 || dh > c.h + 1) {
-      std::printf("FAIL %s: decoded %zu bytes of %dx%d, wanted %d frames covering %dx%d\n", c.name, raw.size(), dw, dh, kFrames, c.w, c.h);
+    if (raw.size() != frame_bytes * c.frames || dw < c.w || dh < c.h || dw > c.w + 1 || dh > c.h + 1) {
+      std::printf("FAIL %s: decoded %zu bytes of %dx%d, wanted %d frames covering %dx%d\n", c.name, raw.size(), dw, dh, c.frames, c.w, c.h);
       ++failures;
       continue;
     }
     // Compare the picture region of every frame.
     double worst_psnr = 1e9;
     int worst_diff = 0;
-    for (int t = 0; t < kFrames; ++t) {
+    for (int t = 0; t < c.frames; ++t) {
       const uint8_t* y = &raw[frame_bytes * t];
       const uint8_t* u = y + static_cast<size_t>(dw) * dh;
       const uint8_t* v = u + static_cast<size_t>((dw + 1) / 2) * ((dh + 1) / 2);
@@ -370,9 +433,35 @@ int main(int argc, char** argv) {
       worst_psnr = std::min(worst_psnr, mse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse));
     }
     const int tolerance = rgb ? 1 : 0;
-    const bool pass = lossy ? worst_psnr >= 30.0 : worst_diff <= tolerance;
-    std::printf("%s %s: %d frames decoded as %dx%d, worst sample difference %d, PSNR %.1f dB%s\n", pass ? "PASS" : "FAIL", c.name, kFrames,
-                dw, dh, worst_diff, worst_psnr, lossy ? " (lossy)" : "");
+    // The lossless tuning is PCM here: exact. The encoders compress: a signal-to-noise
+    // floor, fewer bytes than the raw frames, and IDR, P, P, ... (the card's pictures are typed the same way).
+    const bool exact = !card && c.lossless;
+    const size_t raw_bytes = frame_bytes * c.frames;
+    std::string detail;
+    bool pass = exact ? worst_diff <= tolerance : worst_psnr >= (c.kbps ? 24.0 : 30.0);   // a rate-controlled stream has the quality its rate gives
+    if (!exact && !c.lossless && !card) {
+      char buf[160];
+      std::snprintf(buf, sizeof buf, ", %zu bytes for %zu raw (%.1f%%)", stream.size(), raw_bytes, 100.0 * static_cast<double>(stream.size()) / static_cast<double>(raw_bytes));
+      detail = buf;
+      if (stream.size() * 2 >= raw_bytes) pass = false;
+      for (size_t i = 0; i < types.size(); ++i)
+        if (types[i] != (i == 0 ? NV_ENC_PIC_TYPE_IDR : (c.fip <= 1 || (i - 1) % static_cast<size_t>(c.fip) == 0 ? NV_ENC_PIC_TYPE_P : NV_ENC_PIC_TYPE_B))) {
+          pass = false;
+          detail += ", wrong picture type";
+        }
+    }
+    if (c.kbps) {
+      const double kbps = static_cast<double>(stream.size()) * 8 / (static_cast<double>(c.frames) / 30.0) / 1000.0;
+      char buf[96];
+      std::snprintf(buf, sizeof buf, ", %.0f kbit/s for a target of %d", kbps, c.kbps);
+      detail += buf;
+      if (!card && std::fabs(kbps - c.kbps) > 0.06 * c.kbps) pass = false;
+    }
+    if (!card && c.lossless)
+      for (int t : types)
+        if (t != NV_ENC_PIC_TYPE_IDR) pass = false;   // PCM pictures are all IDR
+    std::printf("%s %s: %d frames decoded as %dx%d, worst sample difference %d, PSNR %.1f dB%s%s\n", pass ? "PASS" : "FAIL", c.name, c.frames,
+                dw, dh, worst_diff, worst_psnr, card ? " (card)" : (exact ? "" : " (lossy)"), detail.c_str());
     if (!pass) ++failures;
   }
   std::printf("%s\n", failures ? "FAIL" : "PASS");

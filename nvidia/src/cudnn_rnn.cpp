@@ -155,6 +155,14 @@ struct Rnn {
   }
 };
 
+// A copy for a graph (Snapshot): the dropout descriptor it names is copied as well, since the
+// caller may destroy it before the graph runs.
+void* clone_rnn(const void* p, vgpu_cudnn::Snapshot& s) {
+  auto* c = new Rnn(*static_cast<const Rnn*>(p));
+  c->drop = c->drop_alive() ? static_cast<vgpu_cudnn::DropoutDesc*>(s.of(c->drop)) : nullptr;
+  return c;
+}
+
 struct Data {
   cudnnRNNDataLayout_t layout = CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED;
   int T = 0, B = 0, V = 0;
@@ -217,9 +225,7 @@ void store_res(void* dev, const std::vector<real>& h) {
   if (dev && !h.empty()) cudaMemcpy(dev, h.data(), h.size() * sizeof(real), cudaMemcpyHostToDevice);
 }
 void drain(cudnnHandle_t h) {
-  cudaStream_t s = nullptr;
-  cudnnGetStream(h, &s);
-  cudaStreamSynchronize(s);
+  vgpu_cudnn::sync_handle(h);
 }
 
 real sigmoid(real x) { return 1.0f / (1.0f + std::exp(-x)); }
@@ -399,10 +405,27 @@ bool forward(const Rnn& r, const Data& xd, const std::vector<real>& x, const std
         if (!res) continue;  // inference: no dropout
         real* m = res->data() + rv.mask_at(l, dir);
         if (p > 0.0f) {
+          // The mask covers the valid steps only (padded steps draw nothing), time step after time step, and at each
+          // step the batch entries from the longest sequence to the shortest (equal lengths in their own order) --
+          // whatever the data layout. Measured on an RTX 3060 (cuDNN 9.27, padded I/O enabled, lengths unsorted,
+          // tied, and in all three layouts) through the descriptor's states and the outputs.
+          const size_t width = (size_t)O * D;
+          std::vector<size_t> order;   // the dense [T][B] position of each valid step, in the order drawn
+          std::vector<int> by_len(B);
+          for (int b = 0; b < B; ++b) by_len[b] = b;
+          std::stable_sort(by_len.begin(), by_len.end(), [&](int a, int c) { return xd.len[a] > xd.len[c]; });
+          for (int t = 0; t < T; ++t)
+            for (int b : by_len)
+              if (t < xd.len[b]) order.push_back((size_t)t * B + b);
           std::vector<uint8_t> keep;
-          if (!vgpu_cudnn::dropout_draw(r.drop, out.size(), &keep)) return false;
+          if (!vgpu_cudnn::dropout_draw(r.drop, order.size() * width, &keep)) return false;
           const real scale = p < 1.0f ? 1.0f / (1.0f - p) : 0.0f;
-          for (size_t i = 0; i < out.size(); ++i) m[i] = keep[i] ? scale : 0.0f, ins[dir][i] *= m[i];
+          std::fill(m, m + out.size(), 1.0f);
+          for (size_t q = 0; q < order.size(); ++q)
+            for (size_t j = 0; j < width; ++j) {
+              const size_t i = order[q] * width + j;
+              m[i] = keep[q * width + j] ? scale : 0.0f, ins[dir][i] *= m[i];
+            }
         } else {
           std::fill(m, m + out.size(), 1.0f);
         }
@@ -453,7 +476,7 @@ cudnnStatus_t resolve(cudnnRNNDescriptor_t rd, cudnnRNNDataDescriptor_t xd, cudn
 
 VGPU_EXPORT cudnnStatus_t cudnnCreateRNNDescriptor(cudnnRNNDescriptor_t* d) {
   if (!d) return CUDNN_STATUS_BAD_PARAM;
-  *d = reinterpret_cast<cudnnRNNDescriptor_t>(track(new Rnn()));
+  *d = reinterpret_cast<cudnnRNNDescriptor_t>(track(new Rnn(), clone_rnn));
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnDestroyRNNDescriptor(cudnnRNNDescriptor_t d) {
@@ -679,11 +702,13 @@ VGPU_EXPORT cudnnStatus_t cudnnGetRNNTempSpaceSizes(cudnnHandle_t, cudnnRNNDescr
 /* ---- the passes ---- */
 
 VGPU_EXPORT cudnnStatus_t cudnnRNNForward(cudnnHandle_t h, cudnnRNNDescriptor_t rd, cudnnForwardMode_t mode,
-                                          const int32_t*, cudnnRNNDataDescriptor_t xd, const void* x,
+                                          const int32_t* unused3, cudnnRNNDataDescriptor_t xd, const void* x,
                                           cudnnRNNDataDescriptor_t yd, void* y, cudnnTensorDescriptor_t hd,
                                           const void* hx, void* hy, cudnnTensorDescriptor_t cd, const void* cx,
-                                          void* cy, size_t wsize, const void* w, size_t, void*, size_t rsize,
+                                          void* cy, size_t wsize, const void* w, size_t unused16, void* unused17, size_t rsize,
                                           void* reserve) {
+  VGPU_DEFER(h, cudnnRNNForward, h, rd, mode, unused3, xd, x, yd, y, hd, hx, hy, cd, cx, cy, wsize, w, unused16,
+      unused17, rsize, reserve);
   Rnns d;
   if (const cudnnStatus_t s = resolve(rd, xd, yd, hd, cd, &d); s != CUDNN_STATUS_SUCCESS) return s;
   const Rnn& r = *d.r;
@@ -715,13 +740,15 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNForward(cudnnHandle_t h, cudnnRNNDescriptor_t 
 // recurrent side (they differ only in GRU's new gate), and with a
 // projection the gradient reaching each projected h. The clip passes a
 // gradient where the state it limited was inside its bounds.
-VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t h, cudnnRNNDescriptor_t rd, const int32_t*,
-                                                  cudnnRNNDataDescriptor_t yd, const void*, const void* dy,
+VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t h, cudnnRNNDescriptor_t rd, const int32_t* unused2,
+                                                  cudnnRNNDataDescriptor_t yd, const void* unused4, const void* dy,
                                                   cudnnRNNDataDescriptor_t xd, void* dx, cudnnTensorDescriptor_t hd,
                                                   const void* hx, const void* dhy, void* dhx,
                                                   cudnnTensorDescriptor_t cd, const void* cx, const void* dcy,
-                                                  void* dcx, size_t wsize, const void* w, size_t, void*,
+                                                  void* dcx, size_t wsize, const void* w, size_t unused18, void* unused19,
                                                   size_t rsize, void* reserve) {
+  VGPU_DEFER(h, cudnnRNNBackwardData_v8, h, rd, unused2, yd, unused4, dy, xd, dx, hd, hx, dhy, dhx, cd, cx, dcy,
+      dcx, wsize, w, unused18, unused19, rsize, reserve);
   Rnns d;
   if (const cudnnStatus_t s = resolve(rd, xd, yd, hd, cd, &d); s != CUDNN_STATUS_SUCCESS) return s;
   const Rnn& r = *d.r;
@@ -835,10 +862,12 @@ VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardData_v8(cudnnHandle_t h, cudnnRNNDescr
 }
 
 VGPU_EXPORT cudnnStatus_t cudnnRNNBackwardWeights_v8(cudnnHandle_t h, cudnnRNNDescriptor_t rd, cudnnWgradMode_t add,
-                                                     const int32_t*, cudnnRNNDataDescriptor_t xd, const void*,
+                                                     const int32_t* unused3, cudnnRNNDataDescriptor_t xd, const void* unused5,
                                                      cudnnTensorDescriptor_t hd, const void* hx,
-                                                     cudnnRNNDataDescriptor_t yd, const void*, size_t wsize,
-                                                     void* dw, size_t, void*, size_t rsize, void* reserve) {
+                                                     cudnnRNNDataDescriptor_t yd, const void* unused9, size_t wsize,
+                                                     void* dw, size_t unused12, void* unused13, size_t rsize, void* reserve) {
+  VGPU_DEFER(h, cudnnRNNBackwardWeights_v8, h, rd, add, unused3, xd, unused5, hd, hx, yd, unused9, wsize, dw,
+      unused12, unused13, rsize, reserve);
   Rnns d;
   if (const cudnnStatus_t s = resolve(rd, xd, yd, hd, nullptr, &d); s != CUDNN_STATUS_SUCCESS) return s;
   const Rnn& r = *d.r;
@@ -952,6 +981,17 @@ struct Attn {
   }
 };
 
+// A copy for a graph (Snapshot), with the dropout descriptors it names copied too.
+void* clone_attn(const void* p, vgpu_cudnn::Snapshot& s) {
+  auto* c = new Attn(*static_cast<const Attn*>(p));
+  auto own = [&](vgpu_cudnn::DropoutDesc* d) {
+    return d && known(d) ? static_cast<vgpu_cudnn::DropoutDesc*>(s.of(d)) : nullptr;
+  };
+  c->attn_drop = own(c->attn_drop);
+  c->post_drop = own(c->post_drop);
+  return c;
+}
+
 struct SeqData {
   bool set = false;
   cudnnDataType_t type = CUDNN_DATA_FLOAT;
@@ -1033,7 +1073,7 @@ struct AttnPass {
 
 VGPU_EXPORT cudnnStatus_t cudnnCreateAttnDescriptor(cudnnAttnDescriptor_t* d) {
   if (!d) return CUDNN_STATUS_BAD_PARAM;
-  *d = reinterpret_cast<cudnnAttnDescriptor_t>(track(new Attn()));
+  *d = reinterpret_cast<cudnnAttnDescriptor_t>(track(new Attn(), clone_attn));
   return CUDNN_STATUS_SUCCESS;
 }
 VGPU_EXPORT cudnnStatus_t cudnnDestroyAttnDescriptor(cudnnAttnDescriptor_t d) {
@@ -1287,16 +1327,26 @@ size_t mask_outs(const Attn& a, const AttnReserve& R, int b, int j, int t) {
   return R.probs + (((size_t)b * a.maxBeam + j) * a.Tq + t) * a.oS();
 }
 double drop_p(const vgpu_cudnn::DropoutDesc* d) { return d && known(d) ? d->p : 0.0; }
+// The attention windows a caller gives in host memory, one int per query step: read when the
+// call is made, and so copied when it is recorded into a graph.
+vgpu_cudnn::Host window_ints(const int* p, const cudnnSeqDataDescriptor_t qd) {
+  return vgpu_cudnn::Host{p, [qd] {
+                            const SeqData* q = seq(qd);
+                            return q ? sizeof(int) * static_cast<size_t>(q->T()) : size_t(0);
+                          }};
+}
 }  // namespace
 
 VGPU_EXPORT cudnnStatus_t cudnnMultiHeadAttnForward(cudnnHandle_t h, const cudnnAttnDescriptor_t d, int curr,
-                                                    const int lo[], const int hi[], const int*, const int*,
+                                                    const int lo[], const int hi[], const int* unused5, const int* unused6,
                                                     const cudnnSeqDataDescriptor_t qd, const void* queries,
                                                     const void* residuals, const cudnnSeqDataDescriptor_t kd,
                                                     const void* keys, const cudnnSeqDataDescriptor_t vd,
                                                     const void* values, const cudnnSeqDataDescriptor_t od, void* out,
-                                                    size_t wbytes, const void* weights, size_t, void*, size_t rbytes,
+                                                    size_t wbytes, const void* weights, size_t unused18, void* unused19, size_t rbytes,
                                                     void* reserve) {
+  VGPU_DEFER(h, cudnnMultiHeadAttnForward, h, d, curr, window_ints(lo, qd), window_ints(hi, qd), unused5, unused6, qd,
+      queries, residuals, kd, keys, vd, values, od, out, wbytes, weights, unused18, unused19, rbytes, reserve);
   const Attn* a = attn(d);
   const SeqData *q = seq(qd), *k = seq(kd), *v = seq(vd), *o = seq(od);
   if (!known(h)) return CUDNN_STATUS_BAD_PARAM;
@@ -1513,11 +1563,13 @@ cudnnStatus_t attn_backward(cudnnHandle_t h, const Attn* a, const int* lo, const
 }  // namespace
 
 VGPU_EXPORT cudnnStatus_t cudnnMultiHeadAttnBackwardData(
-    cudnnHandle_t h, const cudnnAttnDescriptor_t d, const int lo[], const int hi[], const int*, const int*,
+    cudnnHandle_t h, const cudnnAttnDescriptor_t d, const int lo[], const int hi[], const int* unused4, const int* unused5,
     const cudnnSeqDataDescriptor_t dod, const void* dout, const cudnnSeqDataDescriptor_t dqd, void* dq,
     const void* queries, const cudnnSeqDataDescriptor_t dkd, void* dk, const void* keys,
-    const cudnnSeqDataDescriptor_t dvd, void* dv, const void* values, size_t wbytes, const void* weights, size_t,
-    void*, size_t rbytes, void* reserve) {
+    const cudnnSeqDataDescriptor_t dvd, void* dv, const void* values, size_t wbytes, const void* weights, size_t unused19,
+    void* unused20, size_t rbytes, void* reserve) {
+  VGPU_DEFER(h, cudnnMultiHeadAttnBackwardData, h, d, window_ints(lo, dqd), window_ints(hi, dqd), unused4, unused5, dod,
+      dout, dqd, dq, queries, dkd, dk, keys, dvd, dv, values, wbytes, weights, unused19, unused20, rbytes, reserve);
   if (!known(h) || !lo || !hi || !dq || !dk || !dv) return CUDNN_STATUS_BAD_PARAM;
   return attn_backward(h, attn(d), lo, hi, seq(dqd), seq(dkd), seq(dvd), seq(dod), dout, queries, keys, values, wbytes,
                        weights, rbytes, reserve, dq, dk, dv, nullptr, false);
@@ -1528,7 +1580,9 @@ VGPU_EXPORT cudnnStatus_t cudnnMultiHeadAttnBackwardWeights(
     cudnnHandle_t h, const cudnnAttnDescriptor_t d, cudnnWgradMode_t add, const cudnnSeqDataDescriptor_t qd,
     const void* queries, const cudnnSeqDataDescriptor_t kd, const void* keys, const cudnnSeqDataDescriptor_t vd,
     const void* values, const cudnnSeqDataDescriptor_t dod, const void* dout, size_t wbytes, const void* weights,
-    void* dw, size_t, void*, size_t rbytes, void* reserve) {
+    void* dw, size_t unused14, void* unused15, size_t rbytes, void* reserve) {
+  VGPU_DEFER(h, cudnnMultiHeadAttnBackwardWeights, h, d, add, qd, queries, kd, keys, vd, values, dod,
+      dout, wbytes, weights, dw, unused14, unused15, rbytes, reserve);
   if (!known(h) || !dw) return CUDNN_STATUS_BAD_PARAM;
   return attn_backward(h, attn(d), nullptr, nullptr, seq(qd), seq(kd), seq(vd), seq(dod), dout, queries, keys,
                        values, wbytes, weights, rbytes, reserve, nullptr, nullptr, nullptr, dw,

@@ -24,6 +24,11 @@ void __cudaRegisterFunction(void** fatCubinHandle, const char* hostFun, char* de
                             void* gDim, int* wSize);
 }
 
+// The test carries its own copy of the fatbin writer that the runtime also carries, which AddressSanitizer's
+// default ODR check aborts on when the program is run by hand (CMake's test environment says the same, and
+// ASAN_OPTIONS still wins when set). Leak detection stays on.
+extern "C" const char* __asan_default_options() { return "detect_leaks=1:detect_odr_violation=0"; }
+
 namespace {
 
 // --- cudaMemset3D -----------------------------------------------------------
@@ -238,22 +243,32 @@ VTEST(advice_and_prefetch_take_a_location_under_their_v2_names) {
   cudaMemLocation dev0{};
   dev0.type = cudaMemLocationTypeDevice;
   dev0.id = 0;
-  VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, dev0), cudaSuccess);
-  int preferred = -2;
-  VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
-            cudaSuccess);
-  VCHECK_EQ(preferred, 0);
   cudaMemLocation host{};
   host.type = cudaMemLocationTypeHost;
-  VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, host), cudaSuccess);
-  VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
-            cudaSuccess);
-  VCHECK_EQ(preferred, cudaCpuDeviceId);
-  VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 0, nullptr), cudaSuccess);
-  int last = -2;
-  VCHECK_EQ(cudaMemRangeGetAttribute(&last, sizeof last, cudaMemRangeAttributeLastPrefetchLocation, p, 1 << 16),
-            cudaSuccess);
-  VCHECK_EQ(last, 0);
+  int paged = -1;   // a device that does not page managed memory on demand (an RTX 3060 under WSL) refuses these
+  VCHECK_EQ(cudaDeviceGetAttribute(&paged, cudaDevAttrConcurrentManagedAccess, 0), cudaSuccess);
+  if (paged) {
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, dev0), cudaSuccess);
+    int preferred = -2;
+    VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
+              cudaSuccess);
+    VCHECK_EQ(preferred, 0);
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, host), cudaSuccess);
+    VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
+              cudaSuccess);
+    VCHECK_EQ(preferred, cudaCpuDeviceId);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 0, nullptr), cudaSuccess);
+    int last = -2;
+    VCHECK_EQ(cudaMemRangeGetAttribute(&last, sizeof last, cudaMemRangeAttributeLastPrefetchLocation, p, 1 << 16),
+              cudaSuccess);
+    VCHECK_EQ(last, 0);
+  } else {
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, dev0), cudaErrorInvalidDevice);
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, host), cudaSuccess);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 0, nullptr), cudaErrorInvalidDevice);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, host, 0, nullptr), cudaErrorInvalidDevice);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 1, nullptr), cudaErrorInvalidValue);   // flags are reserved
+  }
   cudaMemLocation bad{};
   bad.type = cudaMemLocationTypeInvalid;
   VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetReadMostly, bad), cudaErrorInvalidValue);
@@ -331,12 +346,12 @@ VTEST(a_registered_kernel_reports_its_name_and_where_its_parameters_sit) {
 
 // --- what cluster occupancy needs and no profile has ------------------------
 
-VTEST(cluster_occupancy_is_refused_by_name_not_answered_from_a_made_up_layout) {
+VTEST(cluster_occupancy_looks_the_function_up_and_checks_its_pointers) {
   cudaLaunchConfig_t cfg{};
   int n = 0;
-  static const char probe = 0;   // any address: the refusal does not look the function up (kKernelPtx exists only from 12.4)
-  VCHECK_EQ(cudaOccupancyMaxActiveClusters(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorNotSupported);
-  VCHECK_EQ(cudaOccupancyMaxPotentialClusterSize(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorNotSupported);
+  static const char probe = 0;   // an address no kernel was registered under
+  VCHECK_EQ(cudaOccupancyMaxActiveClusters(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorInvalidDeviceFunction);
+  VCHECK_EQ(cudaOccupancyMaxPotentialClusterSize(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorInvalidDeviceFunction);
   VCHECK_EQ(cudaOccupancyMaxActiveClusters(nullptr, nullptr, &cfg), cudaErrorInvalidValue);
 }
 

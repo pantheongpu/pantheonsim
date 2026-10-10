@@ -1,0 +1,148 @@
+== mpi_attr (exit status 0)
+before init: status 0
+set_attr_mpi_comm_args: 0
+init_attr(MPI_COMM): 0
+after init: status 3
+PE 0 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+set_attr_mpi_comm_args: 0
+init_attr(MPI_COMM): 0
+after init: status 3
+PE 1 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== mpi_attr_reversed (exit status 0)
+before init: status 0
+set_attr_mpi_comm_args: 0
+init_attr(MPI_COMM): 0
+after init: status 3
+PE 1 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+before init: status 0
+set_attr_mpi_comm_args: 0
+init_attr(MPI_COMM): 0
+after init: status 3
+PE 0 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+== mpi_attr_null (exit status 0)
+before init: status 0
+init_attr(MPI_COMM): 0
+after init: status 3
+PE 0 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+init_attr(MPI_COMM): 0
+after init: status 3
+PE 1 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== two_gpus (exit status 255)
+== env_mpi (exit status 0)
+before init: status 0
+after init: status 3
+PE 0 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+after init: status 3
+PE 1 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== plugin_mpi (exit status 0)
+before init: status 0
+after init: status 3
+PE 0 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+after init: status 3
+PE 1 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== pmix (exit status 0)
+before init: status 0
+after init: status 3
+PE 0 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+after init: status 3
+PE 1 of 2, 2 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== pmi_without_library (exit status 0)
+before init: status 0
+after init: status 2
+PE 0 of 1, 1 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+before init: status 0
+after init: status 2
+PE 0 of 1, 1 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== pmi2_without_library (exit status 0)
+before init: status 0
+after init: status 2
+PE 0 of 1, 1 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+before init: status 0
+after init: status 2
+PE 0 of 1, 1 on this node
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== bogus_bootstrap (exit status 255)
+== uid_without_flags (exit status 255)
+== bogus_pmi (exit status 255)
+== plugin_not_named (exit status 255)
+== plugin_missing (exit status 255)
+== shmem_flag (exit status 0)
+before init: status 0
+init_attr(SHMEM): 0
+after init: status 3
+PE 0 of 2
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+init_attr(SHMEM): 0
+after init: status 3
+PE 1 of 2
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1
+== shmem_env (exit status 0)
+before init: status 0
+after init: status 3
+PE 0 of 2
+nvshmem_malloc: memory
+read from the next PE: 101
+after finalize: status 1
+before init: status 0
+after init: status 3
+PE 1 of 2
+nvshmem_malloc: memory
+read from the next PE: 100
+after finalize: status 1

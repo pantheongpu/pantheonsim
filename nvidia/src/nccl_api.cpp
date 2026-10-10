@@ -39,6 +39,8 @@
 //    on the RTX 3060 pair.
 #include <nccl.h>
 
+#include "vgpu/runtime/capture.hpp"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -739,6 +741,9 @@ struct Op {
   uint64_t shrink_epoch = 0;
 };
 
+// True while a graph launch runs a recorded operation (see capture_op): the stream it was issued on is the
+// graph's own, and waiting for it from inside the graph would wait for the graph.
+thread_local bool t_replay = false;
 thread_local int t_group_depth = 0;
 thread_local std::vector<Op> t_pending;
 // card: an argument error on a split or a collective inside a group is also
@@ -827,7 +832,7 @@ ncclResult_t deposit(Op& op) {
       return ncclSystemError;
     {
       DeviceGuard g(c->cuda_dev);
-      cudaStreamSynchronize(op.stream);
+      if (!t_replay) cudaStreamSynchronize(op.stream);
       if (bytes && cudaMemcpy(m.addr, op.send, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
         return ncclUnhandledCudaError;
     }
@@ -848,7 +853,7 @@ ncclResult_t deposit(Op& op) {
     Mapping* m = writer_for(c->rz, c->rank, total);
     if (!m) return ncclSystemError;
     DeviceGuard g(c->cuda_dev);
-    cudaStreamSynchronize(op.stream);
+    if (!t_replay) cudaStreamSynchronize(op.stream);
     if (cudaMemcpy(m->addr, op.send, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
       return ncclUnhandledCudaError;
     if (op.premul) {
@@ -861,7 +866,7 @@ ncclResult_t deposit(Op& op) {
     msync(m->addr, m->len, MS_ASYNC);
   } else if (op.kind != Kind::Suspend && op.kind != Kind::Resume) {
     DeviceGuard g(c->cuda_dev);
-    cudaStreamSynchronize(op.stream);
+    if (!t_replay) cudaStreamSynchronize(op.stream);
   }
   c->rz->meta->phase[c->rank].store(op.seq, std::memory_order_release);
   return ncclSuccess;
@@ -1177,6 +1182,51 @@ ncclResult_t check_comm(Comm* c, bool poison = false) {
   return busy(c, poison) ? ncclInvalidArgument : ncclSuccess;
 }
 
+// A collective or point-to-point operation issued on a stream that is capturing is recorded as a host node of the
+// graph, which does it when the graph runs (NCCL: a kernel node of the captured stream). Its place in the
+// communicator's order of collectives is taken then (every rank's graphs launch in the same order, as the
+// collectives of an eager program are issued), not at the capture; the operation's buffers are read and written
+// then, and the stream is not waited for (it is the graph's own). The communicator and the buffers have to outlive
+// the graph, as NCCL's do. Each rank's graph waits at its node for the other ranks' nodes, so the ranks' graphs
+// have to be launched concurrently (a rank per thread or process, as a program that runs graphs on several GPUs
+// does) -- a launch here runs the graph in the calling thread.
+bool capturable(const Op& op) {
+  const bool stream_op = op.kind != Kind::Split && op.kind != Kind::Shrink && op.kind != Kind::Suspend && op.kind != Kind::Resume;
+  if (!stream_op || !op.stream) return false;
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(op.stream, &st) == cudaSuccess && st == cudaStreamCaptureStatusActive;
+}
+
+bool record_captured(const Op& op) {
+  CUstream_st* stream = reinterpret_cast<CUstream_st*>(op.stream);
+  auto shared = std::make_shared<Op>(op);
+  return vgpu_record_host_op_if_capturing(stream, [shared] {
+    Op o = *shared;
+    Comm* c = o.comm;
+    if (is_collective(o.kind)) o.seq = ++c->seq;
+    std::vector<Op> ops;
+    ops.push_back(std::move(o));
+    t_replay = true;
+    const ncclResult_t rc = execute(ops);
+    t_replay = false;
+    if (rc != ncclSuccess) c->state.store(rc, std::memory_order_release);
+  });
+}
+
+// The captured operations of the open group. A group's operations run together on NCCL, so a send need not be
+// issued before the receive that matches the one the peer issues; recorded one after another they have to be, so
+// the sends go first.
+thread_local std::vector<Op> t_captured;
+
+ncclResult_t record_group_captured() {
+  std::vector<Op> ops;
+  ops.swap(t_captured);
+  std::stable_partition(ops.begin(), ops.end(), [](const Op& o) { return o.kind == Kind::Send; });
+  for (const Op& o : ops)
+    if (!record_captured(o)) return ncclInvalidUsage;   // the capture ended meanwhile
+  return ncclSuccess;
+}
+
 ncclResult_t enqueue(Op op) {
   Comm* c = op.comm;
   if (ncclResult_t r = check_comm(c, true); r != ncclSuccess) return fail_call(r);
@@ -1229,6 +1279,15 @@ ncclResult_t enqueue(Op op) {
     op.premul = true;
     op.scalar = c->redops[idx];
     op.red = ncclSum;
+  }
+  // On a capturing stream the operation is recorded into the graph and happens at each launch, among the same
+  // launches of the other ranks' graphs (see capturable).
+  if (capturable(op)) {
+    if (t_group_depth > 0) {
+      t_captured.push_back(std::move(op));
+      return ncclSuccess;
+    }
+    return record_captured(op) ? ncclSuccess : fail_call(ncclInvalidUsage);
   }
   if (is_collective(op.kind)) op.seq = ++c->seq;  // p2p has its own handshake
   t_pending.push_back(std::move(op));
@@ -1851,8 +1910,14 @@ VGPU_EXPORT ncclResult_t ncclGroupEnd(void) {
     const ncclResult_t r = t_group_error;
     t_group_error = ncclSuccess;
     t_pending.clear();
+    t_captured.clear();
     return r;
   }
+  if (!t_captured.empty())
+    if (const ncclResult_t rc = record_group_captured(); rc != ncclSuccess) {
+      t_pending.clear();
+      return rc;
+    }
   bool async = false;
   const ncclResult_t r = run_pending(&async);
   return async ? ncclInProgress : r;   // card: a non-blocking group returns ncclInProgress
@@ -1863,6 +1928,7 @@ VGPU_EXPORT ncclResult_t ncclGroupSimulateEnd(ncclSimInfo_t* info) {
   if (info) info->estimatedTime = 0.0f;
   if (t_group_depth > 0) --t_group_depth;
   t_pending.clear();
+  t_captured.clear();
   t_group_error = ncclSuccess;
   return ncclSuccess;
 }

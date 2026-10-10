@@ -36,7 +36,10 @@
 #include <set>
 #include <stdexcept>
 
+#include "driver_graph.hpp"
+#include "vgpu_cuda_graph.h"
 #include "error_names.hpp"
+#include "vgpu/exec/cluster.hpp"
 #include "kept_args.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
@@ -99,6 +102,7 @@ struct EventRec {
   bool recorded = false;
   bool timing = true;   // false for CU_EVENT_DISABLE_TIMING
   struct timespec when {};
+  void* rt_event = nullptr;   // the runtime event standing for this one in a capture (driver_capture.inc)
 };
 
 // A CUDA array: its descriptor and the device memory behind it, laid out row
@@ -135,6 +139,13 @@ struct TexRefRec {
   int channels = 1;
   CUdeviceptr address_base = 0;  // bound linear memory, or 0
   CUarray array = nullptr;       // bound array, or null
+  // The mipmap state (cuTexRefSetMipmapFilterMode and the rest), the anisotropy and the border colour: kept
+  // and read back, zeros until set.
+  CUmipmappedArray mip_array = nullptr;
+  int mip_filter = 0;
+  float mip_bias = 0, mip_clamp[2] = {0, 0};
+  unsigned max_anisotropy = 0;
+  float border[4] = {0, 0, 0, 0};
 };
 
 // A stream-ordered memory pool (CUmemoryPool). Every stream here is
@@ -214,6 +225,11 @@ struct ShimState {
   // card answers a handle from either with CUDA_ERROR_CONTEXT_IS_DESTROYED.
   std::set<uintptr_t> retired;
   std::unordered_map<uintptr_t, TexRefRec> texrefs;  // cuTexRefCreate results
+  // The runtime's modules and functions under driver names (vgpu_driver_function_for_v1, cuFuncGetModule), by
+  // (device, module id) and (module handle, kernel name): one handle each, however often it is asked for.
+  std::map<std::pair<int, uint64_t>, uintptr_t> runtime_modules;
+  std::map<std::pair<uintptr_t, std::string>, uintptr_t> runtime_functions;
+  std::unordered_map<uintptr_t, int> stream_device;   // the device a stream was made on
   // Peer access enabled, as (context, peer context): cuCtxEnablePeerAccess
   // is about contexts, and enabling it one way says nothing of the other.
   std::set<std::pair<uintptr_t, uintptr_t>> peer_access;
@@ -560,6 +576,8 @@ std::string nvrtc_ptx_for_cubin(const void* cubin, size_t size) {
   return ptx;
 }
 
+#include "driver_capture.inc"
+
 // A bare cubin's size: where the image ends, the later of its section table and its program header
 // table, which a cubin keeps after the sections (an RTX 3060 reports the cubin it loaded as that size).
 // All the driver has to go by, handed a pointer.
@@ -713,7 +731,8 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
   const vgpu_traced::KeptArgs<A...> kept(a...);
-  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) vgpu::profiling::note_args(kept.argv(), kept.count());
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked())
+    vgpu::profiling::note_args(kept.argv(), kept.count(), kept.sizes());
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));
@@ -887,7 +906,9 @@ VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   });
 }
 
-VGPU_EXPORT CUresult cuDriverGetVersion(int* driverVersion) {
+static CUresult cuDriverGetVersion_impl(int* driverVersion);
+VGPU_EXPORT CUresult cuDriverGetVersion(int* driverVersion) { return traced("cuDriverGetVersion", cuDriverGetVersion_impl, driverVersion); }
+static CUresult cuDriverGetVersion_impl(int* driverVersion) {
   if (!driverVersion) return CUDA_ERROR_INVALID_VALUE;
   *driverVersion = vgpu::driver_version();
   return CUDA_SUCCESS;
@@ -899,14 +920,18 @@ VGPU_EXPORT CUresult cuDriverGetVersion(int* driverVersion) {
 // the name of CUDA_ERROR_NO_DEVICE or CUDA_ERROR_NOT_READY -- codes it can
 // receive from any library -- was told the code itself was invalid. A code no
 // header declares still gets CUDA_ERROR_INVALID_VALUE and NULL, as documented.
-VGPU_EXPORT CUresult cuGetErrorName(CUresult error, const char** pStr) {
+static CUresult cuGetErrorName_impl(CUresult error, const char** pStr);
+VGPU_EXPORT CUresult cuGetErrorName(CUresult error, const char** pStr) { return traced("cuGetErrorName", cuGetErrorName_impl, error, pStr); }
+static CUresult cuGetErrorName_impl(CUresult error, const char** pStr) {
   if (!pStr) return CUDA_ERROR_INVALID_VALUE;
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
   *pStr = e ? e->driver_name : nullptr;
   return *pStr ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
-VGPU_EXPORT CUresult cuGetErrorString(CUresult error, const char** pStr) {
+static CUresult cuGetErrorString_impl(CUresult error, const char** pStr);
+VGPU_EXPORT CUresult cuGetErrorString(CUresult error, const char** pStr) { return traced("cuGetErrorString", cuGetErrorString_impl, error, pStr); }
+static CUresult cuGetErrorString_impl(CUresult error, const char** pStr) {
   if (!pStr) return CUDA_ERROR_INVALID_VALUE;
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
   *pStr = e && e->driver_name ? e->text : nullptr;
@@ -962,7 +987,9 @@ static CUresult cuDeviceTotalMem_v2_impl(size_t* bytes, CUdevice dev) {
 VGPU_EXPORT CUresult cuDeviceTotalMem_v2(size_t* bytes, CUdevice dev) {
   return traced("cuDeviceTotalMem_v2", cuDeviceTotalMem_v2_impl, bytes, dev);
 }
-VGPU_EXPORT CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
+static CUresult cuDeviceTotalMem_impl(size_t* bytes, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) { return traced("cuDeviceTotalMem", cuDeviceTotalMem_impl, bytes, dev); }
+static CUresult cuDeviceTotalMem_impl(size_t* bytes, CUdevice dev) {
   return cuDeviceTotalMem_v2_impl(bytes, dev);
 }
 
@@ -1019,7 +1046,9 @@ VGPU_EXPORT CUresult cuDeviceComputeCapability(int* major, int* minor, CUdevice 
 }
 
 // The deprecated CUdevprop: the same limits cuDeviceGetAttribute reports.
-VGPU_EXPORT CUresult cuDeviceGetProperties(CUdevprop* prop, CUdevice dev) {
+static CUresult cuDeviceGetProperties_impl(CUdevprop* prop, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetProperties(CUdevprop* prop, CUdevice dev) { return traced("cuDeviceGetProperties", cuDeviceGetProperties_impl, prop, dev); }
+static CUresult cuDeviceGetProperties_impl(CUdevprop* prop, CUdevice dev) {
   return api("cuDeviceGetProperties", true, false, [&](ShimState& s) {
     if (!prop) return CUDA_ERROR_INVALID_VALUE;
     if (dev < 0 || dev >= s.rt->device_count()) return CUDA_ERROR_INVALID_DEVICE;
@@ -1058,7 +1087,9 @@ static CUresult cuCtxCreate_v2_impl(CUcontext* pctx, unsigned int flags, CUdevic
 VGPU_EXPORT CUresult cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevice dev) {
   return traced("cuCtxCreate_v2", cuCtxCreate_v2_impl, pctx, flags, dev);
 }
-VGPU_EXPORT CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) {
+static CUresult cuCtxCreate_impl(CUcontext* pctx, unsigned int flags, CUdevice dev);
+VGPU_EXPORT CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev) { return traced("cuCtxCreate", cuCtxCreate_impl, pctx, flags, dev); }
+static CUresult cuCtxCreate_impl(CUcontext* pctx, unsigned int flags, CUdevice dev) {
   return cuCtxCreate_v2_impl(pctx, flags, dev);
 }
 // CUDA 13's header maps cuCtxCreate to cuCtxCreate_v4, which takes a parameter
@@ -1107,7 +1138,9 @@ VGPU_EXPORT CUresult cuCtxCreate_v4(CUcontext* pctx, void* ctx_create_params, un
 }
 // Whether execution affinity of a type is supported on a device: never here, for any type
 // (measured: a type CUDA has no such value for is answered too, with 0).
-VGPU_EXPORT CUresult cuDeviceGetExecAffinitySupport(int* pi, int type, CUdevice dev) {
+static CUresult cuDeviceGetExecAffinitySupport_impl(int* pi, int type, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetExecAffinitySupport(int* pi, int type, CUdevice dev) { return traced("cuDeviceGetExecAffinitySupport", cuDeviceGetExecAffinitySupport_impl, pi, type, dev); }
+static CUresult cuDeviceGetExecAffinitySupport_impl(int* pi, int type, CUdevice dev) {
   (void)type;
   return api("cuDeviceGetExecAffinitySupport", true, false, [&](ShimState& s) {
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
@@ -1118,7 +1151,9 @@ VGPU_EXPORT CUresult cuDeviceGetExecAffinitySupport(int* pi, int type, CUdevice 
 }
 // The affinity of the current context: all the device's multiprocessors, since none is confined.
 // A type but SM_COUNT is CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY (measured).
-VGPU_EXPORT CUresult cuCtxGetExecAffinity(void* pExecAffinity, int type) {
+static CUresult cuCtxGetExecAffinity_impl(void* pExecAffinity, int type);
+VGPU_EXPORT CUresult cuCtxGetExecAffinity(void* pExecAffinity, int type) { return traced("cuCtxGetExecAffinity", cuCtxGetExecAffinity_impl, pExecAffinity, type); }
+static CUresult cuCtxGetExecAffinity_impl(void* pExecAffinity, int type) {
   return api("cuCtxGetExecAffinity", true, false, [&](ShimState& s) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     if (!pExecAffinity) return CUDA_ERROR_INVALID_VALUE;
@@ -1149,13 +1184,17 @@ static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
 VGPU_EXPORT CUresult cuCtxDestroy_v2(CUcontext ctx) {
   return traced("cuCtxDestroy_v2", cuCtxDestroy_v2_impl, ctx);
 }
-VGPU_EXPORT CUresult cuCtxDestroy(CUcontext ctx) { return cuCtxDestroy_v2_impl(ctx); }
+static CUresult cuCtxDestroy_impl(CUcontext ctx);
+VGPU_EXPORT CUresult cuCtxDestroy(CUcontext ctx) { return traced("cuCtxDestroy", cuCtxDestroy_impl, ctx); }
+static CUresult cuCtxDestroy_impl(CUcontext ctx) { return cuCtxDestroy_v2_impl(ctx); }
 
 // The deprecated usage count: cuCtxAttach takes another reference to the
 // current context and returns it (flags must be 0), cuCtxDetach drops one,
 // and the context goes when its creator's reference does -- one detach more
 // than there were attaches.
-VGPU_EXPORT CUresult cuCtxAttach(CUcontext* pctx, unsigned int flags) {
+static CUresult cuCtxAttach_impl(CUcontext* pctx, unsigned int flags);
+VGPU_EXPORT CUresult cuCtxAttach(CUcontext* pctx, unsigned int flags) { return traced("cuCtxAttach", cuCtxAttach_impl, pctx, flags); }
+static CUresult cuCtxAttach_impl(CUcontext* pctx, unsigned int flags) {
   return api("cuCtxAttach", true, false, [&](ShimState& s) {
     if (!pctx || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
@@ -1165,7 +1204,9 @@ VGPU_EXPORT CUresult cuCtxAttach(CUcontext* pctx, unsigned int flags) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxDetach(CUcontext ctx) {
+static CUresult cuCtxDetach_impl(CUcontext ctx);
+VGPU_EXPORT CUresult cuCtxDetach(CUcontext ctx) { return traced("cuCtxDetach", cuCtxDetach_impl, ctx); }
+static CUresult cuCtxDetach_impl(CUcontext ctx) {
   {
     ShimState& s = state();
     std::lock_guard<std::recursive_mutex> lock(s.mu);
@@ -1211,7 +1252,9 @@ VGPU_EXPORT CUresult cuCtxGetCurrent(CUcontext* pctx) {
 // With no context current, both answer CUDA_ERROR_INVALID_CONTEXT, as the
 // driver does on an RTX 3060 (CUDA 13.0); cuda.core asks cuCtxGetDevice first
 // and takes that answer as "no device chosen yet".
-VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) {
+static CUresult cuCtxGetDevice_impl(CUdevice* device);
+VGPU_EXPORT CUresult cuCtxGetDevice(CUdevice* device) { return traced("cuCtxGetDevice", cuCtxGetDevice_impl, device); }
+static CUresult cuCtxGetDevice_impl(CUdevice* device) {
   return api("cuCtxGetDevice", true, false, [&](ShimState& s) {
     if (!device) return CUDA_ERROR_INVALID_VALUE;
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
@@ -1228,9 +1271,14 @@ static CUresult cuCtxSynchronize_impl(void) {
     return CUDA_SUCCESS;      // everything is synchronous today
   });
 }
-VGPU_EXPORT CUresult cuCtxSynchronize(void) { return traced("cuCtxSynchronize", cuCtxSynchronize_impl); }
+VGPU_EXPORT CUresult cuCtxSynchronize(void) {
+  if (capture_forbidden_anywhere("cuCtxSynchronize")) return kCaptureUnsupported;
+  return traced("cuCtxSynchronize", cuCtxSynchronize_impl);
+}
 
-VGPU_EXPORT CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
+static CUresult cuDevicePrimaryCtxRetain_impl(CUcontext* pctx, CUdevice dev);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) { return traced("cuDevicePrimaryCtxRetain", cuDevicePrimaryCtxRetain_impl, pctx, dev); }
+static CUresult cuDevicePrimaryCtxRetain_impl(CUcontext* pctx, CUdevice dev) {
   return api("cuDevicePrimaryCtxRetain", true, false, [&](ShimState& s) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -1248,7 +1296,9 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
 // it never retained, and so dropping a reference some other component holds.
 // The context handle survives a count of zero -- a later retain gets the same
 // one back -- but cuDevicePrimaryCtxGetState reports it inactive.
-VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+static CUresult cuDevicePrimaryCtxRelease_v2_impl(CUdevice dev);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) { return traced("cuDevicePrimaryCtxRelease_v2", cuDevicePrimaryCtxRelease_v2_impl, dev); }
+static CUresult cuDevicePrimaryCtxRelease_v2_impl(CUdevice dev) {
   return api("cuDevicePrimaryCtxRelease", true, false, [&](ShimState& s) {
     check_device(s, dev);
     auto it = s.primary_refs.find(dev);
@@ -1262,7 +1312,9 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease(CUdevice dev) {
+static CUresult cuDevicePrimaryCtxRelease_impl(CUdevice dev);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease(CUdevice dev) { return traced("cuDevicePrimaryCtxRelease", cuDevicePrimaryCtxRelease_impl, dev); }
+static CUresult cuDevicePrimaryCtxRelease_impl(CUdevice dev) {
   return cuDevicePrimaryCtxRelease_v2(dev);
 }
 
@@ -1294,9 +1346,13 @@ static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   });
 }
 VGPU_EXPORT CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+  VGPU_CAPTURE_UNSAFE("cuMemAlloc_v2");
   return traced("cuMemAlloc_v2", cuMemAlloc_v2_impl, dptr, bytesize);
 }
-VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
+static CUresult cuMemAlloc_impl(CUdeviceptr* dptr, size_t bytesize);
+VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) { return traced("cuMemAlloc", cuMemAlloc_impl, dptr, bytesize); }
+static CUresult cuMemAlloc_impl(CUdeviceptr* dptr, size_t bytesize) {
+  VGPU_CAPTURE_UNSAFE("cuMemAlloc");
   return cuMemAlloc_v2_impl(dptr, bytesize);
 }
 
@@ -1322,9 +1378,15 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
   });
 }
 VGPU_EXPORT CUresult cuMemFree_v2(CUdeviceptr dptr) {
+  VGPU_CAPTURE_UNSAFE("cuMemFree_v2");
   return traced("cuMemFree_v2", cuMemFree_v2_impl, dptr);
 }
-VGPU_EXPORT CUresult cuMemFree(CUdeviceptr dptr) { return cuMemFree_v2_impl(dptr); }
+static CUresult cuMemFree_impl(CUdeviceptr dptr);
+VGPU_EXPORT CUresult cuMemFree(CUdeviceptr dptr) { return traced("cuMemFree", cuMemFree_impl, dptr); }
+static CUresult cuMemFree_impl(CUdeviceptr dptr) {
+  VGPU_CAPTURE_UNSAFE("cuMemFree");
+  return cuMemFree_v2_impl(dptr);
+}
 
 // The three directions, in their synchronous and stream-ordered spellings. Every
 // stream is synchronous here, so the stream orders nothing; it is still the one
@@ -1390,23 +1452,34 @@ VGPU_EXPORT CUresult cuMemcpyDtoD_v2(CUdeviceptr d, CUdeviceptr s, size_t n) {
   return traced("cuMemcpyDtoD_v2", cuMemcpyDtoD_v2_impl, d, s, n);
 }
 VGPU_EXPORT CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr d, const void* h, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyHtoDAsync_v2_impl(d, h, n, st));
   return traced("cuMemcpyHtoDAsync_v2", cuMemcpyHtoDAsync_v2_impl, d, h, n, st);
 }
 VGPU_EXPORT CUresult cuMemcpyDtoHAsync_v2(void* h, CUdeviceptr d, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyDtoHAsync_v2_impl(h, d, n, st));
   return traced("cuMemcpyDtoHAsync_v2", cuMemcpyDtoHAsync_v2_impl, h, d, n, st);
 }
 VGPU_EXPORT CUresult cuMemcpyDtoDAsync_v2(CUdeviceptr d, CUdeviceptr s, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyDtoDAsync_v2_impl(d, s, n, st));
   return traced("cuMemcpyDtoDAsync_v2", cuMemcpyDtoDAsync_v2_impl, d, s, n, st);
 }
 // The pre-CUDA 3.2 spellings are not reported: their parameters are 32-bit and a
 // profiler would be handed a structure that says so about 64-bit arguments.
-VGPU_EXPORT CUresult cuMemcpyHtoD(CUdeviceptr d, const void* h, size_t n) { return cuMemcpyHtoD_v2_impl(d, h, n); }
-VGPU_EXPORT CUresult cuMemcpyDtoH(void* h, CUdeviceptr d, size_t n) { return cuMemcpyDtoH_v2_impl(h, d, n); }
-VGPU_EXPORT CUresult cuMemcpyDtoD(CUdeviceptr d, CUdeviceptr sptr, size_t n) {
+static CUresult cuMemcpyHtoD_impl(CUdeviceptr d, const void* h, size_t n);
+VGPU_EXPORT CUresult cuMemcpyHtoD(CUdeviceptr d, const void* h, size_t n) { return traced("cuMemcpyHtoD", cuMemcpyHtoD_impl, d, h, n); }
+static CUresult cuMemcpyHtoD_impl(CUdeviceptr d, const void* h, size_t n) { return cuMemcpyHtoD_v2_impl(d, h, n); }
+static CUresult cuMemcpyDtoH_impl(void* h, CUdeviceptr d, size_t n);
+VGPU_EXPORT CUresult cuMemcpyDtoH(void* h, CUdeviceptr d, size_t n) { return traced("cuMemcpyDtoH", cuMemcpyDtoH_impl, h, d, n); }
+static CUresult cuMemcpyDtoH_impl(void* h, CUdeviceptr d, size_t n) { return cuMemcpyDtoH_v2_impl(h, d, n); }
+static CUresult cuMemcpyDtoD_impl(CUdeviceptr d, CUdeviceptr sptr, size_t n);
+VGPU_EXPORT CUresult cuMemcpyDtoD(CUdeviceptr d, CUdeviceptr sptr, size_t n) { return traced("cuMemcpyDtoD", cuMemcpyDtoD_impl, d, sptr, n); }
+static CUresult cuMemcpyDtoD_impl(CUdeviceptr d, CUdeviceptr sptr, size_t n) {
   return cuMemcpyDtoD_v2_impl(d, sptr, n);
 }
 
-VGPU_EXPORT CUresult cuMemGetInfo_v2(size_t* free_out, size_t* total) {
+static CUresult cuMemGetInfo_v2_impl(size_t* free_out, size_t* total);
+VGPU_EXPORT CUresult cuMemGetInfo_v2(size_t* free_out, size_t* total) { return traced("cuMemGetInfo_v2", cuMemGetInfo_v2_impl, free_out, total); }
+static CUresult cuMemGetInfo_v2_impl(size_t* free_out, size_t* total) {
   return api("cuMemGetInfo", true, false, [&](ShimState& s) {
     if (!free_out || !total) return CUDA_ERROR_INVALID_VALUE;
     vgpu::MemoryManager& mm = current(s).memory();
@@ -1415,7 +1488,9 @@ VGPU_EXPORT CUresult cuMemGetInfo_v2(size_t* free_out, size_t* total) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemGetInfo(size_t* f, size_t* t) { return cuMemGetInfo_v2(f, t); }
+static CUresult cuMemGetInfo_impl(size_t* f, size_t* t);
+VGPU_EXPORT CUresult cuMemGetInfo(size_t* f, size_t* t) { return traced("cuMemGetInfo", cuMemGetInfo_impl, f, t); }
+static CUresult cuMemGetInfo_impl(size_t* f, size_t* t) { return cuMemGetInfo_v2(f, t); }
 
 /* ---- modules / launch ---- */
 
@@ -1571,7 +1646,9 @@ VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
 // Measured on an RTX 3060: the reset leaves the retain count alone (the release that follows it
 // succeeds, a second one is CUDA_ERROR_INVALID_CONTEXT), takes the context out of the active state,
 // and sets the flags back to 0; a device that does not exist is CUDA_ERROR_INVALID_DEVICE.
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice dev) {
+static CUresult cuDevicePrimaryCtxReset_impl(CUdevice dev);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice dev) { return traced("cuDevicePrimaryCtxReset", cuDevicePrimaryCtxReset_impl, dev); }
+static CUresult cuDevicePrimaryCtxReset_impl(CUdevice dev) {
   return api("cuDevicePrimaryCtxReset", true, false, [&](ShimState& s) {
     check_device(s, dev);
     s.rt->set_context_fault(0);
@@ -1676,7 +1753,9 @@ void link_add(LinkState& st, int type, const void* data, size_t size, const char
   st.inputs.emplace_back(text, len);
 }
 
-VGPU_EXPORT CUresult cuLinkAddFile_v2(void* state, int type, const char* path, unsigned int,
+static CUresult cuLinkAddFile_v2_impl(void* state, int type, const char* path, unsigned int, void*, void*);
+VGPU_EXPORT CUresult cuLinkAddFile_v2(void* state, int type, const char* path, unsigned int a3, void* a4, void* a5) { return traced("cuLinkAddFile_v2", cuLinkAddFile_v2_impl, state, type, path, a3, a4, a5); }
+static CUresult cuLinkAddFile_v2_impl(void* state, int type, const char* path, unsigned int,
                                       void*, void*) {
   return api("cuLinkAddFile_v2", true, false, [&](ShimState&) {
     if (!state || !path) return CUDA_ERROR_INVALID_VALUE;
@@ -1689,12 +1768,16 @@ VGPU_EXPORT CUresult cuLinkAddFile_v2(void* state, int type, const char* path, u
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuLinkAddFile(void* state, int type, const char* path, unsigned int n,
+static CUresult cuLinkAddFile_impl(void* state, int type, const char* path, unsigned int n, void* keys, void* vals);
+VGPU_EXPORT CUresult cuLinkAddFile(void* state, int type, const char* path, unsigned int n, void* keys, void* vals) { return traced("cuLinkAddFile", cuLinkAddFile_impl, state, type, path, n, keys, vals); }
+static CUresult cuLinkAddFile_impl(void* state, int type, const char* path, unsigned int n,
                                    void* keys, void* vals) {
   return cuLinkAddFile_v2(state, type, path, n, keys, vals);
 }
 
-VGPU_EXPORT CUresult cuLinkDestroy(void* state) {
+static CUresult cuLinkDestroy_impl(void* state);
+VGPU_EXPORT CUresult cuLinkDestroy(void* state) { return traced("cuLinkDestroy", cuLinkDestroy_impl, state); }
+static CUresult cuLinkDestroy_impl(void* state) {
   return api("cuLinkDestroy", true, false, [&](ShimState&) {
     if (!state) return CUDA_ERROR_INVALID_VALUE;
     std::lock_guard<std::mutex> g(link_mutex());
@@ -1719,7 +1802,7 @@ VGPU_EXPORT CUresult cuLinkDestroy(void* state) {
 // A handle id the engine gave out, as the API's opaque handle. The engine's
 // ids start at 1, so 0 stays available as "no handle".
 namespace {
-constexpr size_t kVmmGranularity = 64u * 1024u;
+constexpr size_t kVmmGranularity = vgpu::MemoryManager::kVmmGranularity;   // 2 MiB
 
 // The property struct a caller passes. Only a device-local pinned allocation
 // exists here; anything else is refused rather than quietly treated as one.
@@ -1739,10 +1822,17 @@ CUresult check_prop(const CUmemAllocationProp* prop, ShimState& s, int* device_o
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment,
+static CUresult cuMemAddressReserve_impl(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags);
+VGPU_EXPORT CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags) { return traced("cuMemAddressReserve", cuMemAddressReserve_impl, ptr, size, alignment, addr, flags); }
+static CUresult cuMemAddressReserve_impl(CUdeviceptr* ptr, size_t size, size_t alignment,
                                          CUdeviceptr addr, unsigned long long flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemAddressReserve");
   return api("cuMemAddressReserve", true, false, [&](ShimState& s) {
     if (!ptr || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    // The size is whole granules (2 MiB) and the alignment a power of two, else CUDA_ERROR_INVALID_VALUE (an
+    // RTX 3060: sizes of 1, 4096, 65536 and 2 MiB + 1 and an alignment of 5 or 3 granules are refused, and an
+    // alignment below 2 MiB is accepted and raised to it).
+    if (size % kVmmGranularity || (alignment & (alignment - 1))) return CUDA_ERROR_INVALID_VALUE;
     // A fixed address is a request for one particular range; the engine hands
     // out address space monotonically and cannot honour it.
     if (addr != 0) return CUDA_ERROR_NOT_SUPPORTED;
@@ -1751,15 +1841,21 @@ VGPU_EXPORT CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t a
   });
 }
 
-VGPU_EXPORT CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
+static CUresult cuMemAddressFree_impl(CUdeviceptr ptr, size_t size);
+VGPU_EXPORT CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) { return traced("cuMemAddressFree", cuMemAddressFree_impl, ptr, size); }
+static CUresult cuMemAddressFree_impl(CUdeviceptr ptr, size_t size) {
+  VGPU_CAPTURE_UNSAFE("cuMemAddressFree");
   return api("cuMemAddressFree", true, false, [&](ShimState& s) {
     owner_memory(s, ptr).address_free(ptr, size);
     return CUDA_SUCCESS;
   });
 }
 
-VGPU_EXPORT CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size,
+static CUresult cuMemCreate_impl(CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags);
+VGPU_EXPORT CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags) { return traced("cuMemCreate", cuMemCreate_impl, handle, size, prop, flags); }
+static CUresult cuMemCreate_impl(CUmemGenericAllocationHandle* handle, size_t size,
                                  const CUmemAllocationProp* prop, unsigned long long flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemCreate");
   return api("cuMemCreate", true, false, [&](ShimState& s) {
     if (!handle || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     int device = 0;
@@ -1769,7 +1865,10 @@ VGPU_EXPORT CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t si
   });
 }
 
-VGPU_EXPORT CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
+static CUresult cuMemRelease_impl(CUmemGenericAllocationHandle handle);
+VGPU_EXPORT CUresult cuMemRelease(CUmemGenericAllocationHandle handle) { return traced("cuMemRelease", cuMemRelease_impl, handle); }
+static CUresult cuMemRelease_impl(CUmemGenericAllocationHandle handle) {
+  VGPU_CAPTURE_UNSAFE("cuMemRelease");
   return api("cuMemRelease", true, false, [&](ShimState& s) {
     // A handle belongs to the device it was created on, and nothing in the
     // handle says which that is, so every device is asked.
@@ -1786,24 +1885,51 @@ VGPU_EXPORT CUresult cuMemRelease(CUmemGenericAllocationHandle handle) {
   });
 }
 
-VGPU_EXPORT CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
+static CUresult cuMemMap_impl(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags);
+VGPU_EXPORT CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags) { return traced("cuMemMap", cuMemMap_impl, ptr, size, offset, handle, flags); }
+static CUresult cuMemMap_impl(CUdeviceptr ptr, size_t size, size_t offset,
                               CUmemGenericAllocationHandle handle, unsigned long long flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemMap");
   return api("cuMemMap", true, false, [&](ShimState& s) {
-    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    owner_memory(s, ptr).map(ptr, size, offset, handle);
+    // Measured on an RTX 3060: a size of 0, flags and no handle are CUDA_ERROR_INVALID_VALUE; an address,
+    // size or offset that is not a multiple of the granularity, an offset (cuMemMap takes only 0), a size larger
+    // than the handle, and a range that already has something mapped are CUDA_ERROR_NOT_SUPPORTED.
+    if (flags != 0 || size == 0 || handle == 0) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    uint64_t handle_bytes = 0;
+    try {
+      handle_bytes = mem.handle_size(handle);
+    } catch (const vgpu::Error&) {
+      return CUDA_ERROR_INVALID_VALUE;   // no such handle
+    }
+    if (ptr % kVmmGranularity || size % kVmmGranularity || offset != 0 || size > handle_bytes ||
+        mem.range_mapped(ptr, size))
+      return CUDA_ERROR_NOT_SUPPORTED;
+    mem.map(ptr, size, offset, handle);
     return CUDA_SUCCESS;
   });
 }
 
-VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) {
+static CUresult cuMemUnmap_impl(CUdeviceptr ptr, size_t size);
+VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) { return traced("cuMemUnmap", cuMemUnmap_impl, ptr, size); }
+static CUresult cuMemUnmap_impl(CUdeviceptr ptr, size_t size) {
+  VGPU_CAPTURE_UNSAFE("cuMemUnmap");
   return api("cuMemUnmap", true, false, [&](ShimState& s) {
-    owner_memory(s, ptr).unmap(ptr, size);
+    // An address or size that is not whole granules is CUDA_ERROR_INVALID_VALUE; a range with nothing mapped in
+    // it is CUDA_SUCCESS (an RTX 3060 unmaps twice without complaint); a part of a mapping is refused by the engine.
+    if (size == 0 || size % kVmmGranularity || ptr % kVmmGranularity) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    if (!mem.range_mapped(ptr, size)) return CUDA_SUCCESS;
+    mem.unmap(ptr, size);
     return CUDA_SUCCESS;
   });
 }
 
-VGPU_EXPORT CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc,
+static CUresult cuMemSetAccess_impl(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
+VGPU_EXPORT CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count) { return traced("cuMemSetAccess", cuMemSetAccess_impl, ptr, size, desc, count); }
+static CUresult cuMemSetAccess_impl(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc,
                                     size_t count) {
+  VGPU_CAPTURE_UNSAFE("cuMemSetAccess");
   return api("cuMemSetAccess", true, false, [&](ShimState& s) {
     if (!desc || count == 0) return CUDA_ERROR_INVALID_VALUE;
     vgpu::MemoryManager& mem = owner_memory(s, ptr);
@@ -1827,7 +1953,9 @@ VGPU_EXPORT CUresult cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAcc
   });
 }
 
-VGPU_EXPORT CUresult cuMemGetAccess(unsigned long long* flags, const CUmemLocation* location,
+static CUresult cuMemGetAccess_impl(unsigned long long* flags, const CUmemLocation* location, CUdeviceptr ptr);
+VGPU_EXPORT CUresult cuMemGetAccess(unsigned long long* flags, const CUmemLocation* location, CUdeviceptr ptr) { return traced("cuMemGetAccess", cuMemGetAccess_impl, flags, location, ptr); }
+static CUresult cuMemGetAccess_impl(unsigned long long* flags, const CUmemLocation* location,
                                     CUdeviceptr ptr) {
   return api("cuMemGetAccess", true, false, [&](ShimState& s) {
     if (!flags || !location) return CUDA_ERROR_INVALID_VALUE;
@@ -1841,20 +1969,26 @@ VGPU_EXPORT CUresult cuMemGetAccess(unsigned long long* flags, const CUmemLocati
   });
 }
 
-VGPU_EXPORT CUresult cuMemGetAllocationGranularity(size_t* granularity,
+static CUresult cuMemGetAllocationGranularity_impl(size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option);
+VGPU_EXPORT CUresult cuMemGetAllocationGranularity(size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option) { return traced("cuMemGetAllocationGranularity", cuMemGetAllocationGranularity_impl, granularity, prop, option); }
+static CUresult cuMemGetAllocationGranularity_impl(size_t* granularity,
                                                    const CUmemAllocationProp* prop,
                                                    CUmemAllocationGranularity_flags option) {
   if (!granularity) return CUDA_ERROR_INVALID_VALUE;
   if (option != CU_MEM_ALLOC_GRANULARITY_MINIMUM && option != CU_MEM_ALLOC_GRANULARITY_RECOMMENDED)
     return CUDA_ERROR_INVALID_VALUE;
-  (void)prop;
-  // The chunk the sparse backing materializes, which is the unit every
-  // reservation, handle and mapping here is measured in.
+  // Measured on an RTX 3060: no property is looked at beyond its being there (a host location, a location type
+  // that does not exist and a device that does not exist all get the answer), and the minimum and the
+  // recommended granularity are the same 2 MiB, which is the unit every reservation, handle and mapping
+  // here is measured in.
+  if (!prop) return CUDA_ERROR_INVALID_VALUE;
   *granularity = kVmmGranularity;
   return CUDA_SUCCESS;
 }
 
-VGPU_EXPORT CUresult cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp* prop,
+static CUresult cuMemGetAllocationPropertiesFromHandle_impl(CUmemAllocationProp* prop, CUmemGenericAllocationHandle handle);
+VGPU_EXPORT CUresult cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp* prop, CUmemGenericAllocationHandle handle) { return traced("cuMemGetAllocationPropertiesFromHandle", cuMemGetAllocationPropertiesFromHandle_impl, prop, handle); }
+static CUresult cuMemGetAllocationPropertiesFromHandle_impl(CUmemAllocationProp* prop,
                                                             CUmemGenericAllocationHandle handle) {
   return api("cuMemGetAllocationPropertiesFromHandle", true, false, [&](ShimState& s) {
     if (!prop) return CUDA_ERROR_INVALID_VALUE;
@@ -1875,7 +2009,9 @@ VGPU_EXPORT CUresult cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp*
   });
 }
 
-VGPU_EXPORT CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handle, void* addr) {
+static CUresult cuMemRetainAllocationHandle_impl(CUmemGenericAllocationHandle* handle, void* addr);
+VGPU_EXPORT CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handle, void* addr) { return traced("cuMemRetainAllocationHandle", cuMemRetainAllocationHandle_impl, handle, addr); }
+static CUresult cuMemRetainAllocationHandle_impl(CUmemGenericAllocationHandle* handle, void* addr) {
   return api("cuMemRetainAllocationHandle", true, false, [&](ShimState& s) {
     if (!handle || !addr) return CUDA_ERROR_INVALID_VALUE;
     const auto va = static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(addr));
@@ -1893,7 +2029,9 @@ VGPU_EXPORT CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* h
 // descriptor that names no such file is CUDA_ERROR_INVALID_DEVICE (so is a Win32 type, which the
 // card cannot take), the fabric type is CUDA_ERROR_NOT_SUPPORTED, and a type that is no single
 // type is CUDA_ERROR_INVALID_VALUE.
-VGPU_EXPORT CUresult cuMemExportToShareableHandle(void* shareableHandle, unsigned long long handle,
+static CUresult cuMemExportToShareableHandle_impl(void* shareableHandle, unsigned long long handle, int handleType, unsigned long long flags);
+VGPU_EXPORT CUresult cuMemExportToShareableHandle(void* shareableHandle, unsigned long long handle, int handleType, unsigned long long flags) { return traced("cuMemExportToShareableHandle", cuMemExportToShareableHandle_impl, shareableHandle, handle, handleType, flags); }
+static CUresult cuMemExportToShareableHandle_impl(void* shareableHandle, unsigned long long handle,
                                                   int handleType, unsigned long long flags) {
   return api("cuMemExportToShareableHandle", true, false, [&](ShimState& s) {
     if (!shareableHandle || !handle || flags != 0 || handleType != 1) return CUDA_ERROR_INVALID_VALUE;
@@ -1914,7 +2052,9 @@ VGPU_EXPORT CUresult cuMemExportToShareableHandle(void* shareableHandle, unsigne
     return CUDA_ERROR_INVALID_VALUE;
   });
 }
-VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long* handle, void* osHandle, int shHandleType) {
+static CUresult cuMemImportFromShareableHandle_impl(unsigned long long* handle, void* osHandle, int shHandleType);
+VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long* handle, void* osHandle, int shHandleType) { return traced("cuMemImportFromShareableHandle", cuMemImportFromShareableHandle_impl, handle, osHandle, shHandleType); }
+static CUresult cuMemImportFromShareableHandle_impl(unsigned long long* handle, void* osHandle, int shHandleType) {
   return api("cuMemImportFromShareableHandle", true, false, [&](ShimState& s) {
     if (!handle) return CUDA_ERROR_INVALID_VALUE;
     switch (shHandleType) {
@@ -1947,34 +2087,37 @@ static CUresult multicast_not_supported(const char* api) {
   });
   return CUDA_ERROR_NOT_SUPPORTED;
 }
-VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long*, const void*) {
+static CUresult cuMulticastCreate_impl(unsigned long long*, const void*);
+VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long* a0, const void* a1) { return traced("cuMulticastCreate", cuMulticastCreate_impl, a0, a1); }
+static CUresult cuMulticastCreate_impl(unsigned long long*, const void*) {
   return multicast_not_supported("cuMulticastCreate");
 }
-VGPU_EXPORT CUresult cuMulticastAddDevice(unsigned long long, CUdevice) {
+static CUresult cuMulticastAddDevice_impl(unsigned long long, CUdevice);
+VGPU_EXPORT CUresult cuMulticastAddDevice(unsigned long long a0, CUdevice a1) { return traced("cuMulticastAddDevice", cuMulticastAddDevice_impl, a0, a1); }
+static CUresult cuMulticastAddDevice_impl(unsigned long long, CUdevice) {
   return multicast_not_supported("cuMulticastAddDevice");
 }
-VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long, size_t, unsigned long long, size_t,
+static CUresult cuMulticastBindMem_impl(unsigned long long, size_t, unsigned long long, size_t, size_t, unsigned long long);
+VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long a0, size_t a1, unsigned long long a2, size_t a3, size_t a4, unsigned long long a5) { return traced("cuMulticastBindMem", cuMulticastBindMem_impl, a0, a1, a2, a3, a4, a5); }
+static CUresult cuMulticastBindMem_impl(unsigned long long, size_t, unsigned long long, size_t,
                                         size_t, unsigned long long) {
   return multicast_not_supported("cuMulticastBindMem");
 }
-VGPU_EXPORT CUresult cuMulticastBindAddr(unsigned long long, size_t, unsigned long long, size_t,
+static CUresult cuMulticastBindAddr_impl(unsigned long long, size_t, unsigned long long, size_t, unsigned long long);
+VGPU_EXPORT CUresult cuMulticastBindAddr(unsigned long long a0, size_t a1, unsigned long long a2, size_t a3, unsigned long long a4) { return traced("cuMulticastBindAddr", cuMulticastBindAddr_impl, a0, a1, a2, a3, a4); }
+static CUresult cuMulticastBindAddr_impl(unsigned long long, size_t, unsigned long long, size_t,
                                          unsigned long long) {
   return multicast_not_supported("cuMulticastBindAddr");
 }
-VGPU_EXPORT CUresult cuMulticastUnbind(unsigned long long, CUdevice, size_t, size_t) {
+static CUresult cuMulticastUnbind_impl(unsigned long long, CUdevice, size_t, size_t);
+VGPU_EXPORT CUresult cuMulticastUnbind(unsigned long long a0, CUdevice a1, size_t a2, size_t a3) { return traced("cuMulticastUnbind", cuMulticastUnbind_impl, a0, a1, a2, a3); }
+static CUresult cuMulticastUnbind_impl(unsigned long long, CUdevice, size_t, size_t) {
   return multicast_not_supported("cuMulticastUnbind");
 }
-VGPU_EXPORT CUresult cuMulticastGetGranularity(size_t*, const void*, int) {
+static CUresult cuMulticastGetGranularity_impl(size_t*, const void*, int);
+VGPU_EXPORT CUresult cuMulticastGetGranularity(size_t* a0, const void* a1, int a2) { return traced("cuMulticastGetGranularity", cuMulticastGetGranularity_impl, a0, a1, a2); }
+static CUresult cuMulticastGetGranularity_impl(size_t*, const void*, int) {
   return multicast_not_supported("cuMulticastGetGranularity");
-}
-
-// Stream memory ops. Work is synchronous, so the write happens now.
-VGPU_EXPORT CUresult cuStreamWriteValue32(CUstream, CUdeviceptr addr, unsigned int value,
-                                          unsigned int) {
-  return api("cuStreamWriteValue32", true, false, [&](ShimState& s) {
-    dev_write(s, addr, &value, sizeof value);
-    return CUDA_SUCCESS;
-  });
 }
 
 // JIT options are performance and verbosity hints, and ignored -- except the
@@ -2022,6 +2165,9 @@ static CUresult cuModuleUnload_impl(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
+    // A module the runtime loaded (cudaGetFuncBySymbol, cuFuncGetModule of a library's kernel) is the runtime's or the
+    // library's to unload: unloading it here is accepted and does nothing.
+    if (s.runtime_modules.count({dev, mid}) && s.runtime_modules[{dev, mid}] == h) return CUDA_SUCCESS;
     {
       ModuleProf m;
       bool known = false;
@@ -2297,6 +2443,45 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
 }
 }  // namespace
 
+// For the driver's graphs (driver_graph.hpp): a kernel node keeps a copy of its parameters.
+int vgpu_driver::copy_kernel_args(void* func, void** kernel_params, void** extra, std::vector<std::vector<uint8_t>>* out) {
+  if (extra) return CUDA_ERROR_NOT_SUPPORTED;   // as cuLaunchKernel: only kernelParams are packed here
+  return api("cuGraphAddKernelNode", true, false, [&](ShimState& s) {
+    uintptr_t fh = reinterpret_cast<uintptr_t>(func);
+    if ((fh & 7) == kTagKernel) fh = kernel_to_function(s, fh);
+    check_handle(fh, kTagFunc, "function");
+    auto it = s.functions.find(fh);
+    if (it == s.functions.end()) return CUDA_ERROR_NOT_FOUND;
+    const auto& params = it->second.fn->params;
+    if (!kernel_params && !params.empty()) return CUDA_ERROR_INVALID_VALUE;
+    out->assign(params.size(), {});
+    for (size_t i = 0; i < params.size(); ++i) {
+      if (!kernel_params[i]) return CUDA_ERROR_INVALID_VALUE;
+      (*out)[i].resize(params[i].size);
+      std::memcpy((*out)[i].data(), kernel_params[i], params[i].size);
+    }
+    return CUDA_SUCCESS;
+  });
+}
+
+void* vgpu_driver::runtime_event_for(void* ev) { return shadow_event(static_cast<CUevent>(ev), true); }
+
+void* vgpu_driver::driver_event_of(void* rt_event) {
+  ShimState& s = state();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  for (const auto& [h, rec] : s.events)
+    if (rec.rt_event == rt_event) return reinterpret_cast<void*>(h);
+  return nullptr;
+}
+
+int vgpu_driver::run_kernel(void* func, const unsigned grid[3], const unsigned block[3], unsigned shared,
+                            const std::vector<std::vector<uint8_t>>& args) {
+  std::vector<void*> ptrs(args.size());
+  for (size_t i = 0; i < args.size(); ++i) ptrs[i] = const_cast<uint8_t*>(args[i].data());
+  return launch_kernel_common("cuLaunchKernel", reinterpret_cast<CUfunction>(func), grid[0], grid[1], grid[2], block[0],
+                              block[1], block[2], shared, nullptr, ptrs.data(), nullptr, false);
+}
+
 static CUresult cuLaunchKernel_impl(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
                                     unsigned int gridDimZ, unsigned int blockDimX,
                                     unsigned int blockDimY, unsigned int blockDimZ,
@@ -2322,7 +2507,9 @@ VGPU_EXPORT CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigne
 
 /* ---- context-independent libraries (CUDA 12+ cuLibrary API) ---- */
 
-VGPU_EXPORT CUresult cuLibraryLoadData(void** library, const void* code, void* jitOptions,
+static CUresult cuLibraryLoadData_impl(void** library, const void* code, void* jitOptions, void** jitOptionValues, unsigned int numJitOptions, void* libraryOptions, void** libraryOptionValues, unsigned int numLibraryOptions);
+VGPU_EXPORT CUresult cuLibraryLoadData(void** library, const void* code, void* jitOptions, void** jitOptionValues, unsigned int numJitOptions, void* libraryOptions, void** libraryOptionValues, unsigned int numLibraryOptions) { return traced("cuLibraryLoadData", cuLibraryLoadData_impl, library, code, jitOptions, jitOptionValues, numJitOptions, libraryOptions, libraryOptionValues, numLibraryOptions); }
+static CUresult cuLibraryLoadData_impl(void** library, const void* code, void* jitOptions,
                                        void** jitOptionValues, unsigned int numJitOptions,
                                        void* libraryOptions, void** libraryOptionValues,
                                        unsigned int numLibraryOptions) {
@@ -2358,7 +2545,9 @@ VGPU_EXPORT CUresult cuLibraryLoadData(void** library, const void* code, void* j
   });
 }
 
-VGPU_EXPORT CUresult cuLibraryUnload(void* library) {
+static CUresult cuLibraryUnload_impl(void* library);
+VGPU_EXPORT CUresult cuLibraryUnload(void* library) { return traced("cuLibraryUnload", cuLibraryUnload_impl, library); }
+static CUresult cuLibraryUnload_impl(void* library) {
   return api("cuLibraryUnload", true, false, [&](ShimState& s) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(library), kTagLibrary, "library");
     auto it = s.libraries.find(h);
@@ -2374,7 +2563,9 @@ VGPU_EXPORT CUresult cuLibraryUnload(void* library) {
   });
 }
 
-VGPU_EXPORT CUresult cuLibraryGetKernel(void** pKernel, void* library, const char* name) {
+static CUresult cuLibraryGetKernel_impl(void** pKernel, void* library, const char* name);
+VGPU_EXPORT CUresult cuLibraryGetKernel(void** pKernel, void* library, const char* name) { return traced("cuLibraryGetKernel", cuLibraryGetKernel_impl, pKernel, library, name); }
+static CUresult cuLibraryGetKernel_impl(void** pKernel, void* library, const char* name) {
   return api("cuLibraryGetKernel", true, false, [&](ShimState& s) {
     if (!pKernel || !name) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(library), kTagLibrary, "library");
@@ -2391,7 +2582,9 @@ VGPU_EXPORT CUresult cuLibraryGetKernel(void** pKernel, void* library, const cha
   });
 }
 
-VGPU_EXPORT CUresult cuLibraryGetModule(CUmodule* pMod, void* library) {
+static CUresult cuLibraryGetModule_impl(CUmodule* pMod, void* library);
+VGPU_EXPORT CUresult cuLibraryGetModule(CUmodule* pMod, void* library) { return traced("cuLibraryGetModule", cuLibraryGetModule_impl, pMod, library); }
+static CUresult cuLibraryGetModule_impl(CUmodule* pMod, void* library) {
   return api("cuLibraryGetModule", true, false, [&](ShimState& s) {
     if (!pMod) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(library), kTagLibrary, "library");
@@ -2404,7 +2597,9 @@ VGPU_EXPORT CUresult cuLibraryGetModule(CUmodule* pMod, void* library) {
   });
 }
 
-VGPU_EXPORT CUresult cuKernelGetFunction(CUfunction* pFunc, void* kernel) {
+static CUresult cuKernelGetFunction_impl(CUfunction* pFunc, void* kernel);
+VGPU_EXPORT CUresult cuKernelGetFunction(CUfunction* pFunc, void* kernel) { return traced("cuKernelGetFunction", cuKernelGetFunction_impl, pFunc, kernel); }
+static CUresult cuKernelGetFunction_impl(CUfunction* pFunc, void* kernel) {
   return api("cuKernelGetFunction", true, false, [&](ShimState& s) {
     if (!pFunc) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t fh = kernel_to_function(s, reinterpret_cast<uintptr_t>(kernel));
@@ -2413,7 +2608,9 @@ VGPU_EXPORT CUresult cuKernelGetFunction(CUfunction* pFunc, void* kernel) {
   });
 }
 
-VGPU_EXPORT CUresult cuKernelGetName(const char** name, void* kernel) {
+static CUresult cuKernelGetName_impl(const char** name, void* kernel);
+VGPU_EXPORT CUresult cuKernelGetName(const char** name, void* kernel) { return traced("cuKernelGetName", cuKernelGetName_impl, name, kernel); }
+static CUresult cuKernelGetName_impl(const char** name, void* kernel) {
   return api("cuKernelGetName", true, false, [&](ShimState& s) {
     if (!name) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t kh = check_handle(reinterpret_cast<uintptr_t>(kernel), kTagKernel, "kernel");
@@ -2446,7 +2643,9 @@ int func_attribute(const vgpu::ptx::EntryFn* fn, const vgpu::DeviceProfile& p, i
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuFuncGetAttribute(int* pi, int attrib, CUfunction hfunc) {
+static CUresult cuFuncGetAttribute_impl(int* pi, int attrib, CUfunction hfunc);
+VGPU_EXPORT CUresult cuFuncGetAttribute(int* pi, int attrib, CUfunction hfunc) { return traced("cuFuncGetAttribute", cuFuncGetAttribute_impl, pi, attrib, hfunc); }
+static CUresult cuFuncGetAttribute_impl(int* pi, int attrib, CUfunction hfunc) {
   return api("cuFuncGetAttribute", true, false, [&](ShimState& s) {
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     auto it = s.functions.find(reinterpret_cast<uintptr_t>(hfunc));
@@ -2456,7 +2655,9 @@ VGPU_EXPORT CUresult cuFuncGetAttribute(int* pi, int attrib, CUfunction hfunc) {
   });
 }
 
-VGPU_EXPORT CUresult cuKernelGetAttribute(int* pi, int attrib, void* kernel, CUdevice dev) {
+static CUresult cuKernelGetAttribute_impl(int* pi, int attrib, void* kernel, CUdevice dev);
+VGPU_EXPORT CUresult cuKernelGetAttribute(int* pi, int attrib, void* kernel, CUdevice dev) { return traced("cuKernelGetAttribute", cuKernelGetAttribute_impl, pi, attrib, kernel, dev); }
+static CUresult cuKernelGetAttribute_impl(int* pi, int attrib, void* kernel, CUdevice dev) {
   return api("cuKernelGetAttribute", true, false, [&](ShimState& s) {
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -2467,7 +2668,9 @@ VGPU_EXPORT CUresult cuKernelGetAttribute(int* pi, int attrib, void* kernel, CUd
   });
 }
 
-VGPU_EXPORT CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value) {
+static CUresult cuFuncSetAttribute_impl(CUfunction hfunc, int attrib, int value);
+VGPU_EXPORT CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value) { return traced("cuFuncSetAttribute", cuFuncSetAttribute_impl, hfunc, attrib, value); }
+static CUresult cuFuncSetAttribute_impl(CUfunction hfunc, int attrib, int value) {
   // The non-portable cluster size changes what may launch, and the dynamic
   // shared memory ceiling what occupancy counts; the others are tuning knobs
   // the interpreter has no use for.
@@ -2481,13 +2684,21 @@ VGPU_EXPORT CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value)
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuKernelSetAttribute(int, int, void*, CUdevice) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuFuncSetCacheConfig(CUfunction, int) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuFuncIsLoaded(int* state, CUfunction) {
+static CUresult cuKernelSetAttribute_impl(int, int, void*, CUdevice);
+VGPU_EXPORT CUresult cuKernelSetAttribute(int a0, int a1, void* a2, CUdevice a3) { return traced("cuKernelSetAttribute", cuKernelSetAttribute_impl, a0, a1, a2, a3); }
+static CUresult cuKernelSetAttribute_impl(int, int, void*, CUdevice) { return CUDA_SUCCESS; }
+static CUresult cuFuncSetCacheConfig_impl(CUfunction, int);
+VGPU_EXPORT CUresult cuFuncSetCacheConfig(CUfunction a0, int a1) { return traced("cuFuncSetCacheConfig", cuFuncSetCacheConfig_impl, a0, a1); }
+static CUresult cuFuncSetCacheConfig_impl(CUfunction, int) { return CUDA_SUCCESS; }
+static CUresult cuFuncIsLoaded_impl(int* state, CUfunction);
+VGPU_EXPORT CUresult cuFuncIsLoaded(int* state, CUfunction a1) { return traced("cuFuncIsLoaded", cuFuncIsLoaded_impl, state, a1); }
+static CUresult cuFuncIsLoaded_impl(int* state, CUfunction) {
   if (state) *state = 1;  // CU_FUNCTION_LOADING_STATE_LOADED
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuFuncLoad(CUfunction) { return CUDA_SUCCESS; }
+static CUresult cuFuncLoad_impl(CUfunction);
+VGPU_EXPORT CUresult cuFuncLoad(CUfunction a0) { return traced("cuFuncLoad", cuFuncLoad_impl, a0); }
+static CUresult cuFuncLoad_impl(CUfunction) { return CUDA_SUCCESS; }
 
 // CUlaunchAttribute, as the driver ABI fixes it: a 4-byte id, padded to 8, then
 // a union padded to 64 bytes -- 72 bytes an entry. cuda.h of every CUDA 12
@@ -2511,7 +2722,9 @@ constexpr uint32_t kLaunchAttrCooperative = 2;       // CU_LAUNCH_ATTRIBUTE_COOP
 constexpr uint32_t kLaunchAttrClusterDimension = 4;  // CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
 }  // namespace
 
-VGPU_EXPORT CUresult cuLaunchKernelEx(const void* config, CUfunction f, void** kernelParams,
+static CUresult cuLaunchKernelEx_impl(const void* config, CUfunction f, void** kernelParams, void** extra);
+VGPU_EXPORT CUresult cuLaunchKernelEx(const void* config, CUfunction f, void** kernelParams, void** extra) { return traced("cuLaunchKernelEx", cuLaunchKernelEx_impl, config, f, kernelParams, extra); }
+static CUresult cuLaunchKernelEx_impl(const void* config, CUfunction f, void** kernelParams,
                                       void** extra) {
   // CUlaunchConfig: 6x u32 dims, u32 sharedMemBytes, CUstream, attrs*, numAttrs.
   struct LaunchCfgABI {
@@ -2619,7 +2832,9 @@ CUresult launch_grid(const char* name, CUfunction f, int width, int height, CUst
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuFuncSetBlockShape(CUfunction f, int x, int y, int z) {
+static CUresult cuFuncSetBlockShape_impl(CUfunction f, int x, int y, int z);
+VGPU_EXPORT CUresult cuFuncSetBlockShape(CUfunction f, int x, int y, int z) { return traced("cuFuncSetBlockShape", cuFuncSetBlockShape_impl, f, x, y, z); }
+static CUresult cuFuncSetBlockShape_impl(CUfunction f, int x, int y, int z) {
   return api("cuFuncSetBlockShape", true, false, [&](ShimState& s) {
     FuncRec* rec = legacy_func(s, f);
     if (!rec) return CUDA_ERROR_INVALID_HANDLE;
@@ -2634,7 +2849,9 @@ VGPU_EXPORT CUresult cuFuncSetBlockShape(CUfunction f, int x, int y, int z) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuFuncSetSharedSize(CUfunction f, unsigned int bytes) {
+static CUresult cuFuncSetSharedSize_impl(CUfunction f, unsigned int bytes);
+VGPU_EXPORT CUresult cuFuncSetSharedSize(CUfunction f, unsigned int bytes) { return traced("cuFuncSetSharedSize", cuFuncSetSharedSize_impl, f, bytes); }
+static CUresult cuFuncSetSharedSize_impl(CUfunction f, unsigned int bytes) {
   return api("cuFuncSetSharedSize", true, false, [&](ShimState& s) {
     FuncRec* rec = legacy_func(s, f);
     if (!rec) return CUDA_ERROR_INVALID_HANDLE;
@@ -2643,7 +2860,9 @@ VGPU_EXPORT CUresult cuFuncSetSharedSize(CUfunction f, unsigned int bytes) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuParamSetSize(CUfunction f, unsigned int numbytes) {
+static CUresult cuParamSetSize_impl(CUfunction f, unsigned int numbytes);
+VGPU_EXPORT CUresult cuParamSetSize(CUfunction f, unsigned int numbytes) { return traced("cuParamSetSize", cuParamSetSize_impl, f, numbytes); }
+static CUresult cuParamSetSize_impl(CUfunction f, unsigned int numbytes) {
   return api("cuParamSetSize", true, false, [&](ShimState& s) {
     FuncRec* rec = legacy_func(s, f);
     if (!rec) return CUDA_ERROR_INVALID_HANDLE;
@@ -2652,75 +2871,126 @@ VGPU_EXPORT CUresult cuParamSetSize(CUfunction f, unsigned int numbytes) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuParamSeti(CUfunction f, int offset, unsigned int value) {
+static CUresult cuParamSeti_impl(CUfunction f, int offset, unsigned int value);
+VGPU_EXPORT CUresult cuParamSeti(CUfunction f, int offset, unsigned int value) { return traced("cuParamSeti", cuParamSeti_impl, f, offset, value); }
+static CUresult cuParamSeti_impl(CUfunction f, int offset, unsigned int value) {
   return param_set(f, offset, &value, sizeof value);
 }
-VGPU_EXPORT CUresult cuParamSetf(CUfunction f, int offset, float value) {
+static CUresult cuParamSetf_impl(CUfunction f, int offset, float value);
+VGPU_EXPORT CUresult cuParamSetf(CUfunction f, int offset, float value) { return traced("cuParamSetf", cuParamSetf_impl, f, offset, value); }
+static CUresult cuParamSetf_impl(CUfunction f, int offset, float value) {
   return param_set(f, offset, &value, sizeof value);
 }
-VGPU_EXPORT CUresult cuParamSetv(CUfunction f, int offset, void* ptr, unsigned int numbytes) {
+static CUresult cuParamSetv_impl(CUfunction f, int offset, void* ptr, unsigned int numbytes);
+VGPU_EXPORT CUresult cuParamSetv(CUfunction f, int offset, void* ptr, unsigned int numbytes) { return traced("cuParamSetv", cuParamSetv_impl, f, offset, ptr, numbytes); }
+static CUresult cuParamSetv_impl(CUfunction f, int offset, void* ptr, unsigned int numbytes) {
   return param_set(f, offset, ptr, numbytes);
 }
 // Texture references are bound to a module's kernels by name, not passed; the
 // card takes this call and it has nothing to do.
-VGPU_EXPORT CUresult cuParamSetTexRef(CUfunction f, int, CUtexref tex) {
+static CUresult cuParamSetTexRef_impl(CUfunction f, int, CUtexref tex);
+VGPU_EXPORT CUresult cuParamSetTexRef(CUfunction f, int a1, CUtexref tex) { return traced("cuParamSetTexRef", cuParamSetTexRef_impl, f, a1, tex); }
+static CUresult cuParamSetTexRef_impl(CUfunction f, int, CUtexref tex) {
   return api("cuParamSetTexRef", true, false, [&](ShimState& s) {
     if (!legacy_func(s, f) || !s.texrefs.count(reinterpret_cast<uintptr_t>(tex))) return CUDA_ERROR_INVALID_HANDLE;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuLaunchGrid(CUfunction f, int grid_width, int grid_height) {
+static CUresult cuLaunchGrid_impl(CUfunction f, int grid_width, int grid_height);
+VGPU_EXPORT CUresult cuLaunchGrid(CUfunction f, int grid_width, int grid_height) { return traced("cuLaunchGrid", cuLaunchGrid_impl, f, grid_width, grid_height); }
+static CUresult cuLaunchGrid_impl(CUfunction f, int grid_width, int grid_height) {
   return launch_grid("cuLaunchGrid", f, grid_width, grid_height, nullptr);
 }
-VGPU_EXPORT CUresult cuLaunchGridAsync(CUfunction f, int grid_width, int grid_height, CUstream stream) {
+static CUresult cuLaunchGridAsync_impl(CUfunction f, int grid_width, int grid_height, CUstream stream);
+VGPU_EXPORT CUresult cuLaunchGridAsync(CUfunction f, int grid_width, int grid_height, CUstream stream) { return traced("cuLaunchGridAsync", cuLaunchGridAsync_impl, f, grid_width, grid_height, stream); }
+static CUresult cuLaunchGridAsync_impl(CUfunction f, int grid_width, int grid_height, CUstream stream) {
   return launch_grid("cuLaunchGridAsync", f, grid_width, grid_height, stream);
 }
-VGPU_EXPORT CUresult cuLaunch(CUfunction f) { return launch_grid("cuLaunch", f, 1, 1, nullptr); }
+static CUresult cuLaunch_impl(CUfunction f);
+VGPU_EXPORT CUresult cuLaunch(CUfunction f) { return traced("cuLaunch", cuLaunch_impl, f); }
+static CUresult cuLaunch_impl(CUfunction f) { return launch_grid("cuLaunch", f, 1, 1, nullptr); }
 
 /* ---- memcpy/memset variants (everything is synchronous) ---- */
 
-VGPU_EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr d, const void* h, size_t n, CUstream st) {
+static CUresult cuMemcpyHtoDAsync_impl(CUdeviceptr d, const void* h, size_t n, CUstream st);
+VGPU_EXPORT CUresult cuMemcpyHtoDAsync(CUdeviceptr d, const void* h, size_t n, CUstream st) { return traced("cuMemcpyHtoDAsync", cuMemcpyHtoDAsync_impl, d, h, n, st); }
+static CUresult cuMemcpyHtoDAsync_impl(CUdeviceptr d, const void* h, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyHtoDAsync_v2_impl(d, h, n, st));
   return cuMemcpyHtoDAsync_v2_impl(d, h, n, st);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoHAsync(void* h, CUdeviceptr d, size_t n, CUstream st) {
+static CUresult cuMemcpyDtoHAsync_impl(void* h, CUdeviceptr d, size_t n, CUstream st);
+VGPU_EXPORT CUresult cuMemcpyDtoHAsync(void* h, CUdeviceptr d, size_t n, CUstream st) { return traced("cuMemcpyDtoHAsync", cuMemcpyDtoHAsync_impl, h, d, n, st); }
+static CUresult cuMemcpyDtoHAsync_impl(void* h, CUdeviceptr d, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyDtoHAsync_v2_impl(h, d, n, st));
   return cuMemcpyDtoHAsync_v2_impl(h, d, n, st);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream st) {
+static CUresult cuMemcpyDtoDAsync_impl(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream st);
+VGPU_EXPORT CUresult cuMemcpyDtoDAsync(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream st) { return traced("cuMemcpyDtoDAsync", cuMemcpyDtoDAsync_impl, a, b, n, st); }
+static CUresult cuMemcpyDtoDAsync_impl(CUdeviceptr a, CUdeviceptr b, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyDtoDAsync_v2_impl(a, b, n, st));
   return cuMemcpyDtoDAsync_v2_impl(a, b, n, st);
 }
 
 // No profiler collects anything to start or stop; the card succeeds.
-VGPU_EXPORT CUresult cuProfilerStart(void) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuProfilerStop(void) { return CUDA_SUCCESS; }
+static CUresult cuProfilerStart_impl(void);
+VGPU_EXPORT CUresult cuProfilerStart(void) { return traced("cuProfilerStart", cuProfilerStart_impl); }
+static CUresult cuProfilerStart_impl(void) {
+  VGPU_CAPTURE_UNSAFE("cuProfilerStart");
+  return CUDA_SUCCESS;
+}
+static CUresult cuProfilerStop_impl(void);
+VGPU_EXPORT CUresult cuProfilerStop(void) { return traced("cuProfilerStop", cuProfilerStop_impl); }
+static CUresult cuProfilerStop_impl(void) {
+  VGPU_CAPTURE_UNSAFE("cuProfilerStop");
+  return CUDA_SUCCESS;
+}
 
 /* ---- graphics interop ----
  * There is no OpenGL, Direct3D or Vulkan here to register a resource with, so
  * no CUgraphicsResource ever exists: each of these is answered as an RTX 3060
  * answers a null one (INVALID_HANDLE), and mapping or unmapping no resources
  * as it answers that (INVALID_VALUE). */
-VGPU_EXPORT CUresult cuGraphicsUnregisterResource(CUgraphicsResource) { return CUDA_ERROR_INVALID_HANDLE; }
-VGPU_EXPORT CUresult cuGraphicsMapResources(unsigned int count, CUgraphicsResource* res, CUstream) {
+static CUresult cuGraphicsUnregisterResource_impl(CUgraphicsResource);
+VGPU_EXPORT CUresult cuGraphicsUnregisterResource(CUgraphicsResource a0) { return traced("cuGraphicsUnregisterResource", cuGraphicsUnregisterResource_impl, a0); }
+static CUresult cuGraphicsUnregisterResource_impl(CUgraphicsResource) { return CUDA_ERROR_INVALID_HANDLE; }
+static CUresult cuGraphicsMapResources_impl(unsigned int count, CUgraphicsResource* res, CUstream);
+VGPU_EXPORT CUresult cuGraphicsMapResources(unsigned int count, CUgraphicsResource* res, CUstream a2) { return traced("cuGraphicsMapResources", cuGraphicsMapResources_impl, count, res, a2); }
+static CUresult cuGraphicsMapResources_impl(unsigned int count, CUgraphicsResource* res, CUstream) {
   return count == 0 || !res ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_INVALID_HANDLE;
 }
-VGPU_EXPORT CUresult cuGraphicsUnmapResources(unsigned int count, CUgraphicsResource* res, CUstream) {
+static CUresult cuGraphicsUnmapResources_impl(unsigned int count, CUgraphicsResource* res, CUstream);
+VGPU_EXPORT CUresult cuGraphicsUnmapResources(unsigned int count, CUgraphicsResource* res, CUstream a2) { return traced("cuGraphicsUnmapResources", cuGraphicsUnmapResources_impl, count, res, a2); }
+static CUresult cuGraphicsUnmapResources_impl(unsigned int count, CUgraphicsResource* res, CUstream) {
   return count == 0 || !res ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_INVALID_HANDLE;
 }
-VGPU_EXPORT CUresult cuGraphicsResourceSetMapFlags_v2(CUgraphicsResource, unsigned int) {
+static CUresult cuGraphicsResourceSetMapFlags_v2_impl(CUgraphicsResource, unsigned int);
+VGPU_EXPORT CUresult cuGraphicsResourceSetMapFlags_v2(CUgraphicsResource a0, unsigned int a1) { return traced("cuGraphicsResourceSetMapFlags_v2", cuGraphicsResourceSetMapFlags_v2_impl, a0, a1); }
+static CUresult cuGraphicsResourceSetMapFlags_v2_impl(CUgraphicsResource, unsigned int) {
   return CUDA_ERROR_INVALID_HANDLE;
 }
-VGPU_EXPORT CUresult cuGraphicsResourceSetMapFlags(CUgraphicsResource r, unsigned int f) {
+static CUresult cuGraphicsResourceSetMapFlags_impl(CUgraphicsResource r, unsigned int f);
+VGPU_EXPORT CUresult cuGraphicsResourceSetMapFlags(CUgraphicsResource r, unsigned int f) { return traced("cuGraphicsResourceSetMapFlags", cuGraphicsResourceSetMapFlags_impl, r, f); }
+static CUresult cuGraphicsResourceSetMapFlags_impl(CUgraphicsResource r, unsigned int f) {
   return cuGraphicsResourceSetMapFlags_v2(r, f);
 }
-VGPU_EXPORT CUresult cuGraphicsResourceGetMappedPointer_v2(CUdeviceptr*, size_t*, CUgraphicsResource) {
+static CUresult cuGraphicsResourceGetMappedPointer_v2_impl(CUdeviceptr*, size_t*, CUgraphicsResource);
+VGPU_EXPORT CUresult cuGraphicsResourceGetMappedPointer_v2(CUdeviceptr* a0, size_t* a1, CUgraphicsResource a2) { return traced("cuGraphicsResourceGetMappedPointer_v2", cuGraphicsResourceGetMappedPointer_v2_impl, a0, a1, a2); }
+static CUresult cuGraphicsResourceGetMappedPointer_v2_impl(CUdeviceptr*, size_t*, CUgraphicsResource) {
   return CUDA_ERROR_INVALID_HANDLE;
 }
-VGPU_EXPORT CUresult cuGraphicsResourceGetMappedPointer(CUdeviceptr* p, size_t* n, CUgraphicsResource r) {
+static CUresult cuGraphicsResourceGetMappedPointer_impl(CUdeviceptr* p, size_t* n, CUgraphicsResource r);
+VGPU_EXPORT CUresult cuGraphicsResourceGetMappedPointer(CUdeviceptr* p, size_t* n, CUgraphicsResource r) { return traced("cuGraphicsResourceGetMappedPointer", cuGraphicsResourceGetMappedPointer_impl, p, n, r); }
+static CUresult cuGraphicsResourceGetMappedPointer_impl(CUdeviceptr* p, size_t* n, CUgraphicsResource r) {
   return cuGraphicsResourceGetMappedPointer_v2(p, n, r);
 }
-VGPU_EXPORT CUresult cuGraphicsSubResourceGetMappedArray(CUarray*, CUgraphicsResource, unsigned int, unsigned int) {
+static CUresult cuGraphicsSubResourceGetMappedArray_impl(CUarray*, CUgraphicsResource, unsigned int, unsigned int);
+VGPU_EXPORT CUresult cuGraphicsSubResourceGetMappedArray(CUarray* a0, CUgraphicsResource a1, unsigned int a2, unsigned int a3) { return traced("cuGraphicsSubResourceGetMappedArray", cuGraphicsSubResourceGetMappedArray_impl, a0, a1, a2, a3); }
+static CUresult cuGraphicsSubResourceGetMappedArray_impl(CUarray*, CUgraphicsResource, unsigned int, unsigned int) {
   return CUDA_ERROR_INVALID_HANDLE;
 }
-VGPU_EXPORT CUresult cuGraphicsResourceGetMappedMipmappedArray(CUmipmappedArray*, CUgraphicsResource) {
+static CUresult cuGraphicsResourceGetMappedMipmappedArray_impl(CUmipmappedArray*, CUgraphicsResource);
+VGPU_EXPORT CUresult cuGraphicsResourceGetMappedMipmappedArray(CUmipmappedArray* a0, CUgraphicsResource a1) { return traced("cuGraphicsResourceGetMappedMipmappedArray", cuGraphicsResourceGetMappedMipmappedArray_impl, a0, a1); }
+static CUresult cuGraphicsResourceGetMappedMipmappedArray_impl(CUmipmappedArray*, CUgraphicsResource) {
   return CUDA_ERROR_INVALID_HANDLE;
 }
 
@@ -2729,7 +2999,9 @@ bool is_device_ptr(uint64_t p) { return vgpu::is_device_va(p); }
 }  // namespace
 
 // Direction-inferring copies (UVA style): device-range vs host pointers.
-VGPU_EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) {
+static CUresult cuMemcpy_impl(CUdeviceptr dst, CUdeviceptr src, size_t n);
+VGPU_EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) { return traced("cuMemcpy", cuMemcpy_impl, dst, src, n); }
+static CUresult cuMemcpy_impl(CUdeviceptr dst, CUdeviceptr src, size_t n) {
   bool dd = is_device_ptr(dst), sd = is_device_ptr(src);
   if (dd && sd) return cuMemcpyDtoD_v2_impl(dst, src, n);
   if (dd) return cuMemcpyHtoD_v2_impl(dst, reinterpret_cast<const void*>(src), n);
@@ -2737,7 +3009,10 @@ VGPU_EXPORT CUresult cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t n) {
   std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), n);
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream) {
+static CUresult cuMemcpyAsync_impl(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream);
+VGPU_EXPORT CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream a3) { return traced("cuMemcpyAsync", cuMemcpyAsync_impl, dst, src, n, a3); }
+static CUresult cuMemcpyAsync_impl(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy(dst, src, n));
   return cuMemcpy(dst, src, n);
 }
 
@@ -2829,7 +3104,9 @@ CUresult memset_impl(const char* name, CUdeviceptr dptr, size_t pitch, T value, 
  * results if run as an ordinary launch, and a JIT-linked module that quietly
  * did nothing would surface much later as a wrong answer.
  */
-VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+static CUresult cuLaunchCooperativeKernel_impl(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams);
+VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream, void** kernelParams) { return traced("cuLaunchCooperativeKernel", cuLaunchCooperativeKernel_impl, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams); }
+static CUresult cuLaunchCooperativeKernel_impl(CUfunction f, unsigned int gridDimX,
                                                unsigned int gridDimY, unsigned int gridDimZ,
                                                unsigned int blockDimX, unsigned int blockDimY,
                                                unsigned int blockDimZ, unsigned int sharedMemBytes,
@@ -2840,7 +3117,9 @@ VGPU_EXPORT CUresult cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDi
 }
 // The JIT-link types are not in the header subset this file compiles against;
 // these take opaque parameters because they only need to exist and refuse.
-VGPU_EXPORT CUresult cuLinkCreate_v2(unsigned int, void*, void*, void** stateOut) {
+static CUresult cuLinkCreate_v2_impl(unsigned int, void*, void*, void** stateOut);
+VGPU_EXPORT CUresult cuLinkCreate_v2(unsigned int a0, void* a1, void* a2, void** stateOut) { return traced("cuLinkCreate_v2", cuLinkCreate_v2_impl, a0, a1, a2, stateOut); }
+static CUresult cuLinkCreate_v2_impl(unsigned int, void*, void*, void** stateOut) {
   return api("cuLinkCreate_v2", true, false, [&](ShimState&) {
     if (!stateOut) return CUDA_ERROR_INVALID_VALUE;
     // JIT options (register caps, optimisation level, log buffers) describe a
@@ -2856,11 +3135,15 @@ VGPU_EXPORT CUresult cuLinkCreate_v2(unsigned int, void*, void*, void** stateOut
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuLinkCreate(unsigned int n, void* keys, void* vals, void** stateOut) {
+static CUresult cuLinkCreate_impl(unsigned int n, void* keys, void* vals, void** stateOut);
+VGPU_EXPORT CUresult cuLinkCreate(unsigned int n, void* keys, void* vals, void** stateOut) { return traced("cuLinkCreate", cuLinkCreate_impl, n, keys, vals, stateOut); }
+static CUresult cuLinkCreate_impl(unsigned int n, void* keys, void* vals, void** stateOut) {
   return cuLinkCreate_v2(n, keys, vals, stateOut);
 }
 
-VGPU_EXPORT CUresult cuLinkAddData_v2(void* state, int type, void* data, size_t size,
+static CUresult cuLinkAddData_v2_impl(void* state, int type, void* data, size_t size, const char* name, unsigned int, void*, void*);
+VGPU_EXPORT CUresult cuLinkAddData_v2(void* state, int type, void* data, size_t size, const char* name, unsigned int a5, void* a6, void* a7) { return traced("cuLinkAddData_v2", cuLinkAddData_v2_impl, state, type, data, size, name, a5, a6, a7); }
+static CUresult cuLinkAddData_v2_impl(void* state, int type, void* data, size_t size,
                                       const char* name, unsigned int, void*, void*) {
   return api("cuLinkAddData_v2", true, false, [&](ShimState&) {
     if (!state) return CUDA_ERROR_INVALID_VALUE;
@@ -2868,12 +3151,16 @@ VGPU_EXPORT CUresult cuLinkAddData_v2(void* state, int type, void* data, size_t 
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuLinkAddData(void* state, int type, void* data, size_t size, const char* name,
+static CUresult cuLinkAddData_impl(void* state, int type, void* data, size_t size, const char* name, unsigned int n, void* keys, void* vals);
+VGPU_EXPORT CUresult cuLinkAddData(void* state, int type, void* data, size_t size, const char* name, unsigned int n, void* keys, void* vals) { return traced("cuLinkAddData", cuLinkAddData_impl, state, type, data, size, name, n, keys, vals); }
+static CUresult cuLinkAddData_impl(void* state, int type, void* data, size_t size, const char* name,
                                    unsigned int n, void* keys, void* vals) {
   return cuLinkAddData_v2(state, type, data, size, name, n, keys, vals);
 }
 
-VGPU_EXPORT CUresult cuLinkComplete(void* state, void** imageOut, size_t* sizeOut) {
+static CUresult cuLinkComplete_impl(void* state, void** imageOut, size_t* sizeOut);
+VGPU_EXPORT CUresult cuLinkComplete(void* state, void** imageOut, size_t* sizeOut) { return traced("cuLinkComplete", cuLinkComplete_impl, state, imageOut, sizeOut); }
+static CUresult cuLinkComplete_impl(void* state, void** imageOut, size_t* sizeOut) {
   return api("cuLinkComplete", true, false, [&](ShimState&) {
     if (!state || !imageOut) return CUDA_ERROR_INVALID_VALUE;
     LinkState& st = link_state(state);
@@ -2893,7 +3180,9 @@ VGPU_EXPORT CUresult cuLinkComplete(void* state, void** imageOut, size_t* sizeOu
 // requirements cuda.h documents, and each one is checked, so a map that the
 // real driver would refuse is refused here with the rule it broke. Encoding
 // needs no context: it touches no device, and CUTLASS calls it before any.
-VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void* tensorMap, unsigned int dataType, unsigned int rank,
+static CUresult cuTensorMapEncodeTiled_impl(void* tensorMap, unsigned int dataType, unsigned int rank, void* globalAddress, const unsigned long long* globalDim, const unsigned long long* globalStrides, const unsigned int* boxDim, const unsigned int* elementStrides, unsigned int interleave, unsigned int swizzle, unsigned int l2Promotion, unsigned int oobFill);
+VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void* tensorMap, unsigned int dataType, unsigned int rank, void* globalAddress, const unsigned long long* globalDim, const unsigned long long* globalStrides, const unsigned int* boxDim, const unsigned int* elementStrides, unsigned int interleave, unsigned int swizzle, unsigned int l2Promotion, unsigned int oobFill) { return traced("cuTensorMapEncodeTiled", cuTensorMapEncodeTiled_impl, tensorMap, dataType, rank, globalAddress, globalDim, globalStrides, boxDim, elementStrides, interleave, swizzle, l2Promotion, oobFill); }
+static CUresult cuTensorMapEncodeTiled_impl(void* tensorMap, unsigned int dataType, unsigned int rank,
                                             void* globalAddress, const unsigned long long* globalDim,
                                             const unsigned long long* globalStrides,
                                             const unsigned int* boxDim,
@@ -2915,7 +3204,9 @@ VGPU_EXPORT CUresult cuTensorMapEncodeTiled(void* tensorMap, unsigned int dataTy
 }
 
 // Points an existing map at a new base address, keeping everything else.
-VGPU_EXPORT CUresult cuTensorMapReplaceAddress(void* tensorMap, void* globalAddress) {
+static CUresult cuTensorMapReplaceAddress_impl(void* tensorMap, void* globalAddress);
+VGPU_EXPORT CUresult cuTensorMapReplaceAddress(void* tensorMap, void* globalAddress) { return traced("cuTensorMapReplaceAddress", cuTensorMapReplaceAddress_impl, tensorMap, globalAddress); }
+static CUresult cuTensorMapReplaceAddress_impl(void* tensorMap, void* globalAddress) {
   return api("cuTensorMapReplaceAddress", false, false, [&](ShimState&) -> CUresult {
     std::string why;
     if (vgpu::exec::replace_address(tensorMap, globalAddress, &why) != vgpu::exec::TmapResult::Ok)
@@ -2924,7 +3215,9 @@ VGPU_EXPORT CUresult cuTensorMapReplaceAddress(void* tensorMap, void* globalAddr
   });
 }
 
-VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void* tensorMap, unsigned int dataType, unsigned int rank,
+static CUresult cuTensorMapEncodeIm2col_impl(void* tensorMap, unsigned int dataType, unsigned int rank, void* globalAddress, const unsigned long long* globalDim, const unsigned long long* globalStrides, const int* lowerCorner, const int* upperCorner, unsigned int channelsPerPixel, unsigned int pixelsPerColumn, const unsigned int* elementStrides, unsigned int interleave, unsigned int swizzle, unsigned int l2Promotion, unsigned int oobFill);
+VGPU_EXPORT CUresult cuTensorMapEncodeIm2col(void* tensorMap, unsigned int dataType, unsigned int rank, void* globalAddress, const unsigned long long* globalDim, const unsigned long long* globalStrides, const int* lowerCorner, const int* upperCorner, unsigned int channelsPerPixel, unsigned int pixelsPerColumn, const unsigned int* elementStrides, unsigned int interleave, unsigned int swizzle, unsigned int l2Promotion, unsigned int oobFill) { return traced("cuTensorMapEncodeIm2col", cuTensorMapEncodeIm2col_impl, tensorMap, dataType, rank, globalAddress, globalDim, globalStrides, lowerCorner, upperCorner, channelsPerPixel, pixelsPerColumn, elementStrides, interleave, swizzle, l2Promotion, oobFill); }
+static CUresult cuTensorMapEncodeIm2col_impl(void* tensorMap, unsigned int dataType, unsigned int rank,
                                              void* globalAddress, const unsigned long long* globalDim,
                                              const unsigned long long* globalStrides,
                                              const int* lowerCorner, const int* upperCorner,
@@ -2973,51 +3266,83 @@ VGPU_EXPORT CUresult cuMemsetD16_v2(CUdeviceptr d, unsigned short v, size_t n) {
 VGPU_EXPORT CUresult cuMemsetD32_v2(CUdeviceptr d, unsigned int v, size_t n) {
   return traced("cuMemsetD32_v2", cuMemsetD32_v2_impl, d, v, n);
 }
-VGPU_EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { return cuMemsetD8_v2_impl(d, v, n); }
-VGPU_EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { return cuMemsetD16_v2_impl(d, v, n); }
-VGPU_EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { return cuMemsetD32_v2_impl(d, v, n); }
+static CUresult cuMemsetD8_impl(CUdeviceptr d, unsigned char v, size_t n);
+VGPU_EXPORT CUresult cuMemsetD8(CUdeviceptr d, unsigned char v, size_t n) { return traced("cuMemsetD8", cuMemsetD8_impl, d, v, n); }
+static CUresult cuMemsetD8_impl(CUdeviceptr d, unsigned char v, size_t n) { return cuMemsetD8_v2_impl(d, v, n); }
+static CUresult cuMemsetD16_impl(CUdeviceptr d, unsigned short v, size_t n);
+VGPU_EXPORT CUresult cuMemsetD16(CUdeviceptr d, unsigned short v, size_t n) { return traced("cuMemsetD16", cuMemsetD16_impl, d, v, n); }
+static CUresult cuMemsetD16_impl(CUdeviceptr d, unsigned short v, size_t n) { return cuMemsetD16_v2_impl(d, v, n); }
+static CUresult cuMemsetD32_impl(CUdeviceptr d, unsigned int v, size_t n);
+VGPU_EXPORT CUresult cuMemsetD32(CUdeviceptr d, unsigned int v, size_t n) { return traced("cuMemsetD32", cuMemsetD32_impl, d, v, n); }
+static CUresult cuMemsetD32_impl(CUdeviceptr d, unsigned int v, size_t n) { return cuMemsetD32_v2_impl(d, v, n); }
 VGPU_EXPORT CUresult cuMemsetD8Async(CUdeviceptr d, unsigned char v, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemset, cuMemsetD8Async_impl(d, v, n, st));
   return traced("cuMemsetD8Async", cuMemsetD8Async_impl, d, v, n, st);
 }
 VGPU_EXPORT CUresult cuMemsetD16Async(CUdeviceptr d, unsigned short v, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemset, cuMemsetD16Async_impl(d, v, n, st));
   return traced("cuMemsetD16Async", cuMemsetD16Async_impl, d, v, n, st);
 }
 VGPU_EXPORT CUresult cuMemsetD32Async(CUdeviceptr d, unsigned int v, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemset, cuMemsetD32Async_impl(d, v, n, st));
   return traced("cuMemsetD32Async", cuMemsetD32Async_impl, d, v, n, st);
 }
 // Width counts elements, the pitch bytes.
-VGPU_EXPORT CUresult cuMemsetD2D8_v2(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) {
+static CUresult cuMemsetD2D8_v2_impl(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h);
+VGPU_EXPORT CUresult cuMemsetD2D8_v2(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) { return traced("cuMemsetD2D8_v2", cuMemsetD2D8_v2_impl, d, pitch, v, w, h); }
+static CUresult cuMemsetD2D8_v2_impl(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) {
   return memset_impl("cuMemsetD2D8", d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D16_v2(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h) {
+static CUresult cuMemsetD2D16_v2_impl(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h);
+VGPU_EXPORT CUresult cuMemsetD2D16_v2(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h) { return traced("cuMemsetD2D16_v2", cuMemsetD2D16_v2_impl, d, pitch, v, w, h); }
+static CUresult cuMemsetD2D16_v2_impl(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h) {
   return memset_impl("cuMemsetD2D16", d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D32_v2(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h) {
+static CUresult cuMemsetD2D32_v2_impl(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h);
+VGPU_EXPORT CUresult cuMemsetD2D32_v2(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h) { return traced("cuMemsetD2D32_v2", cuMemsetD2D32_v2_impl, d, pitch, v, w, h); }
+static CUresult cuMemsetD2D32_v2_impl(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h) {
   return memset_impl("cuMemsetD2D32", d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D8(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) {
+static CUresult cuMemsetD2D8_impl(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h);
+VGPU_EXPORT CUresult cuMemsetD2D8(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) { return traced("cuMemsetD2D8", cuMemsetD2D8_impl, d, pitch, v, w, h); }
+static CUresult cuMemsetD2D8_impl(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h) {
   return cuMemsetD2D8_v2(d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D16(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h) {
+static CUresult cuMemsetD2D16_impl(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h);
+VGPU_EXPORT CUresult cuMemsetD2D16(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h) { return traced("cuMemsetD2D16", cuMemsetD2D16_impl, d, pitch, v, w, h); }
+static CUresult cuMemsetD2D16_impl(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h) {
   return cuMemsetD2D16_v2(d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D32(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h) {
+static CUresult cuMemsetD2D32_impl(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h);
+VGPU_EXPORT CUresult cuMemsetD2D32(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h) { return traced("cuMemsetD2D32", cuMemsetD2D32_impl, d, pitch, v, w, h); }
+static CUresult cuMemsetD2D32_impl(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h) {
   return cuMemsetD2D32_v2(d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D8Async(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h,
-                                       CUstream) {
+static CUresult cuMemsetD2D8Async_impl(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h, CUstream);
+VGPU_EXPORT CUresult cuMemsetD2D8Async(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h, CUstream a5) { return traced("cuMemsetD2D8Async", cuMemsetD2D8Async_impl, d, pitch, v, w, h, a5); }
+static CUresult cuMemsetD2D8Async_impl(CUdeviceptr d, size_t pitch, unsigned char v, size_t w, size_t h,
+                                       CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemset, memset_impl("cuMemsetD2D8", d, pitch, v, w, h));
   return memset_impl("cuMemsetD2D8", d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D16Async(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h,
-                                        CUstream) {
+static CUresult cuMemsetD2D16Async_impl(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h, CUstream);
+VGPU_EXPORT CUresult cuMemsetD2D16Async(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h, CUstream a5) { return traced("cuMemsetD2D16Async", cuMemsetD2D16Async_impl, d, pitch, v, w, h, a5); }
+static CUresult cuMemsetD2D16Async_impl(CUdeviceptr d, size_t pitch, unsigned short v, size_t w, size_t h,
+                                        CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemset, memset_impl("cuMemsetD2D16", d, pitch, v, w, h));
   return memset_impl("cuMemsetD2D16", d, pitch, v, w, h);
 }
-VGPU_EXPORT CUresult cuMemsetD2D32Async(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h,
-                                        CUstream) {
+static CUresult cuMemsetD2D32Async_impl(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h, CUstream);
+VGPU_EXPORT CUresult cuMemsetD2D32Async(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h, CUstream a5) { return traced("cuMemsetD2D32Async", cuMemsetD2D32Async_impl, d, pitch, v, w, h, a5); }
+static CUresult cuMemsetD2D32Async_impl(CUdeviceptr d, size_t pitch, unsigned int v, size_t w, size_t h,
+                                        CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemset, memset_impl("cuMemsetD2D32", d, pitch, v, w, h));
   return memset_impl("cuMemsetD2D32", d, pitch, v, w, h);
 }
 
-VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) {
+static CUresult cuMemGetAddressRange_v2_impl(CUdeviceptr* base, size_t* size, CUdeviceptr dptr);
+VGPU_EXPORT CUresult cuMemGetAddressRange_v2(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) { return traced("cuMemGetAddressRange_v2", cuMemGetAddressRange_v2_impl, base, size, dptr); }
+static CUresult cuMemGetAddressRange_v2_impl(CUdeviceptr* base, size_t* size, CUdeviceptr dptr) {
   return api("cuMemGetAddressRange", true, false, [&](ShimState& s) {
     uint64_t b = 0, sz = 0;
     // Managed memory is the allocation it was made as -- for a module's
@@ -3056,15 +3381,22 @@ static CUresult cuMemHostAlloc_impl(void** pp, size_t bytesize, unsigned int fla
   });
 }
 VGPU_EXPORT CUresult cuMemHostAlloc(void** pp, size_t bytesize, unsigned int flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemHostAlloc");
   return traced("cuMemHostAlloc", cuMemHostAlloc_impl, pp, bytesize, flags);
 }
 static CUresult cuMemAllocHost_v2_impl(void** pp, size_t bytesize) {
   return cuMemHostAlloc_impl(pp, bytesize, 0);
 }
 VGPU_EXPORT CUresult cuMemAllocHost_v2(void** pp, size_t bytesize) {
+  VGPU_CAPTURE_UNSAFE("cuMemAllocHost_v2");
   return traced("cuMemAllocHost_v2", cuMemAllocHost_v2_impl, pp, bytesize);
 }
-VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return cuMemHostAlloc_impl(pp, bytesize, 0); }
+static CUresult cuMemAllocHost_impl(void** pp, size_t bytesize);
+VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return traced("cuMemAllocHost", cuMemAllocHost_impl, pp, bytesize); }
+static CUresult cuMemAllocHost_impl(void** pp, size_t bytesize) {
+  VGPU_CAPTURE_UNSAFE("cuMemAllocHost");
+  return cuMemHostAlloc_impl(pp, bytesize, 0);
+}
 static CUresult cuMemFreeHost_impl(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
     if (!p) return CUDA_SUCCESS;   // as cuMemFree(0): a no-op, with or without a context
@@ -3078,6 +3410,7 @@ static CUresult cuMemFreeHost_impl(void* p) {
   });
 }
 VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
+  VGPU_CAPTURE_UNSAFE("cuMemFreeHost");
   return traced("cuMemFreeHost", cuMemFreeHost_impl, p);
 }
 
@@ -3089,7 +3422,10 @@ VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
  * into every device at its host address, and that is the device pointer
  * cuMemHostGetDevicePointer reports. The answers below are an RTX 3060's. */
 
-VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int flags) {
+static CUresult cuMemHostRegister_v2_impl(void* p, size_t bytesize, unsigned int flags);
+VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int flags) { return traced("cuMemHostRegister_v2", cuMemHostRegister_v2_impl, p, bytesize, flags); }
+static CUresult cuMemHostRegister_v2_impl(void* p, size_t bytesize, unsigned int flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemHostRegister_v2");
   return api("cuMemHostRegister", true, false, [&](ShimState& s) {
     // PORTABLE, DEVICEMAP, IOMEMORY and READ_ONLY; nothing else. Read-only registration works
     // (READ_ONLY_HOST_REGISTER_SUPPORTED, 113, is 1): the device reads the range and a kernel's
@@ -3117,14 +3453,20 @@ VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemHostRegister(void* p, size_t bytesize, unsigned int flags) {
+static CUresult cuMemHostRegister_impl(void* p, size_t bytesize, unsigned int flags);
+VGPU_EXPORT CUresult cuMemHostRegister(void* p, size_t bytesize, unsigned int flags) { return traced("cuMemHostRegister", cuMemHostRegister_impl, p, bytesize, flags); }
+static CUresult cuMemHostRegister_impl(void* p, size_t bytesize, unsigned int flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemHostRegister");
   return cuMemHostRegister_v2(p, bytesize, flags);
 }
 
 // Only by the pointer that was registered: one inside a registration is
 // INVALID_VALUE, and so is memory CUDA allocated (pinned or managed); one
 // never registered is HOST_MEMORY_NOT_REGISTERED.
-VGPU_EXPORT CUresult cuMemHostUnregister(void* p) {
+static CUresult cuMemHostUnregister_impl(void* p);
+VGPU_EXPORT CUresult cuMemHostUnregister(void* p) { return traced("cuMemHostUnregister", cuMemHostUnregister_impl, p); }
+static CUresult cuMemHostUnregister_impl(void* p) {
+  VGPU_CAPTURE_UNSAFE("cuMemHostUnregister");
   return api("cuMemHostUnregister", true, false, [&](ShimState& s) {
     if (!p) return CUDA_ERROR_INVALID_VALUE;
     auto& regs = registrations(s);
@@ -3143,7 +3485,9 @@ VGPU_EXPORT CUresult cuMemHostUnregister(void* p) {
 // with PORTABLE (and, for pinned allocations, WRITECOMBINED) as requested.
 // IOMEMORY and READ_ONLY are not reported back. Managed memory answers
 // DEVICEMAP too.
-VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) {
+static CUresult cuMemHostGetFlags_impl(unsigned int* flags, void* p);
+VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) { return traced("cuMemHostGetFlags", cuMemHostGetFlags_impl, flags, p); }
+static CUresult cuMemHostGetFlags_impl(unsigned int* flags, void* p) {
   return api("cuMemHostGetFlags", true, false, [&](ShimState& s) {
     if (!flags || !p) return CUDA_ERROR_INVALID_VALUE;
     if (const auto* r = host_range_at(registrations(s), p)) {
@@ -3164,7 +3508,9 @@ VGPU_EXPORT CUresult cuMemHostGetFlags(unsigned int* flags, void* p) {
 
 // The device address of pinned or registered memory, the byte asked about
 // included: its host address, where every device maps it.
-VGPU_EXPORT CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr* dptr, void* p, unsigned int flags) {
+static CUresult cuMemHostGetDevicePointer_v2_impl(CUdeviceptr* dptr, void* p, unsigned int flags);
+VGPU_EXPORT CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr* dptr, void* p, unsigned int flags) { return traced("cuMemHostGetDevicePointer_v2", cuMemHostGetDevicePointer_v2_impl, dptr, p, flags); }
+static CUresult cuMemHostGetDevicePointer_v2_impl(CUdeviceptr* dptr, void* p, unsigned int flags) {
   return api("cuMemHostGetDevicePointer", true, false, [&](ShimState& s) {
     if (!dptr || !p || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     if (!host_range_at(registrations(s), p) && !host_range_at(pinned(s), p))
@@ -3173,7 +3519,9 @@ VGPU_EXPORT CUresult cuMemHostGetDevicePointer_v2(CUdeviceptr* dptr, void* p, un
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemHostGetDevicePointer(CUdeviceptr* dptr, void* p, unsigned int flags) {
+static CUresult cuMemHostGetDevicePointer_impl(CUdeviceptr* dptr, void* p, unsigned int flags);
+VGPU_EXPORT CUresult cuMemHostGetDevicePointer(CUdeviceptr* dptr, void* p, unsigned int flags) { return traced("cuMemHostGetDevicePointer", cuMemHostGetDevicePointer_impl, dptr, p, flags); }
+static CUresult cuMemHostGetDevicePointer_impl(CUdeviceptr* dptr, void* p, unsigned int flags) {
   return cuMemHostGetDevicePointer_v2(dptr, p, flags);
 }
 
@@ -3206,7 +3554,10 @@ CUmemLocation location_of(CUdevice dev) {
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsigned int flags) {
+static CUresult cuMemAllocManaged_impl(CUdeviceptr* dptr, size_t bytesize, unsigned int flags);
+VGPU_EXPORT CUresult cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsigned int flags) { return traced("cuMemAllocManaged", cuMemAllocManaged_impl, dptr, bytesize, flags); }
+static CUresult cuMemAllocManaged_impl(CUdeviceptr* dptr, size_t bytesize, unsigned int flags) {
+  VGPU_CAPTURE_UNSAFE("cuMemAllocManaged");
   return api("cuMemAllocManaged", true, false, [&](ShimState& s) {
     // CU_MEM_ATTACH_GLOBAL (1) or CU_MEM_ATTACH_HOST (2), exactly; a size of 0 is refused.
     if (!dptr || bytesize == 0 || (flags != 1 && flags != 2)) return CUDA_ERROR_INVALID_VALUE;
@@ -3224,7 +3575,11 @@ VGPU_EXPORT CUresult cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsig
 
 // Which stream may touch an allocation. The whole allocation, from its base
 // (length 0 or its full size), with GLOBAL (1), HOST (2) or SINGLE (4).
-VGPU_EXPORT CUresult cuStreamAttachMemAsync(CUstream, CUdeviceptr dptr, size_t length, unsigned int flags) {
+static CUresult cuStreamAttachMemAsync_impl(CUstream, CUdeviceptr dptr, size_t length, unsigned int flags);
+VGPU_EXPORT CUresult cuStreamAttachMemAsync(CUstream a0, CUdeviceptr dptr, size_t length, unsigned int flags) { return traced("cuStreamAttachMemAsync", cuStreamAttachMemAsync_impl, a0, dptr, length, flags); }
+static CUresult cuStreamAttachMemAsync_impl(CUstream st, CUdeviceptr dptr, size_t length, unsigned int flags) {
+  if (capture_forbidden(st, "cuStreamAttachMemAsync")) return kCaptureUnsupported;
+  VGPU_CAPTURE_UNSAFE("cuStreamAttachMemAsync");
   return api("cuStreamAttachMemAsync", true, false, [&](ShimState& s) {
     auto it = s.managed.find(dptr);
     if (it == s.managed.end() || (length != 0 && length != it->second) ||
@@ -3234,25 +3589,52 @@ VGPU_EXPORT CUresult cuStreamAttachMemAsync(CUstream, CUdeviceptr dptr, size_t l
   });
 }
 
-VGPU_EXPORT CUresult cuMemPrefetchAsync_v2(CUdeviceptr dptr, size_t count, CUmemLocation location,
-                                           unsigned int, CUstream) {
+static CUresult cuMemPrefetchAsync_v2_impl(CUdeviceptr dptr, size_t count, CUmemLocation location, unsigned int, CUstream);
+VGPU_EXPORT CUresult cuMemPrefetchAsync_v2(CUdeviceptr dptr, size_t count, CUmemLocation location, unsigned int a3, CUstream a4) { return traced("cuMemPrefetchAsync_v2", cuMemPrefetchAsync_v2_impl, dptr, count, location, a3, a4); }
+static CUresult cuMemPrefetchAsync_v2_impl(CUdeviceptr dptr, size_t count, CUmemLocation location,
+                                           unsigned int flags, CUstream st) {
+  // Measured: refused on a capturing stream before the arguments are looked at.
+  if (capture_forbidden(st, "cuMemPrefetchAsync")) return kCaptureUnsupported;
   return api("cuMemPrefetchAsync", true, false, [&](ShimState& s) {
-    if (!managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;
-    return check_location(s, location);
+    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;   // reserved (an RTX 3060: CUDA_ERROR_INVALID_VALUE)
+    if (count == 0 || !managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;   // a size of 0 is refused (RTX 3060)
+    if (const CUresult rc = check_location(s, location); rc != CUDA_SUCCESS) return rc;
+    // A device without concurrent managed access (an RTX 3060 under WSL, measured) cannot prefetch: to a
+    // device, to the host or to a device that does not exist, it is CUDA_ERROR_INVALID_DEVICE.
+    if (!s.rt->device(current_device(s)).profile().cuda.concurrent_managed_access) return CUDA_ERROR_INVALID_DEVICE;
+    return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemPrefetchAsync(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream) {
+static CUresult cuMemPrefetchAsync_impl(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream);
+VGPU_EXPORT CUresult cuMemPrefetchAsync(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream) { return traced("cuMemPrefetchAsync", cuMemPrefetchAsync_impl, dptr, count, dstDevice, stream); }
+static CUresult cuMemPrefetchAsync_impl(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream) {
   return cuMemPrefetchAsync_v2(dptr, count, location_of(dstDevice), 0, stream);
 }
-VGPU_EXPORT CUresult cuMemAdvise_v2(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location) {
+static CUresult cuMemAdvise_v2_impl(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location);
+VGPU_EXPORT CUresult cuMemAdvise_v2(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location) { return traced("cuMemAdvise_v2", cuMemAdvise_v2_impl, dptr, count, advice, location); }
+static CUresult cuMemAdvise_v2_impl(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location) {
+  VGPU_CAPTURE_UNSAFE("cuMemAdvise_v2");
   return api("cuMemAdvise", true, false, [&](ShimState& s) {
+    // Without concurrent managed access (an RTX 3060 under WSL, measured) the advice that names a device is
+    // refused before the range is looked at: a preferred location that is a device, or a device in the
+    // accessed-by list, is CUDA_ERROR_INVALID_DEVICE (a device that does not exist, for the accessed-by
+    // list, CUDA_ERROR_INVALID_VALUE). Everything else is accepted and has no effect.
+    const bool paged = s.rt->device(current_device(s)).profile().cuda.concurrent_managed_access;
+    if (!paged && location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
+      if (advice == 3) return CUDA_ERROR_INVALID_DEVICE;
+      if (advice == 5 || advice == 6)
+        return location.id >= 0 && location.id < s.rt->device_count() ? CUDA_ERROR_INVALID_DEVICE : CUDA_ERROR_INVALID_VALUE;
+    }
     if (!managed_range(s, dptr, count) || advice < 1 || advice > 6) return CUDA_ERROR_INVALID_VALUE;
     // Read-mostly (1, 2) names no location; the others name one.
     if (advice > 2) return check_location(s, location);
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemAdvise(CUdeviceptr dptr, size_t count, int advice, CUdevice device) {
+static CUresult cuMemAdvise_impl(CUdeviceptr dptr, size_t count, int advice, CUdevice device);
+VGPU_EXPORT CUresult cuMemAdvise(CUdeviceptr dptr, size_t count, int advice, CUdevice device) { return traced("cuMemAdvise", cuMemAdvise_impl, dptr, count, advice, device); }
+static CUresult cuMemAdvise_impl(CUdeviceptr dptr, size_t count, int advice, CUdevice device) {
+  VGPU_CAPTURE_UNSAFE("cuMemAdvise");
   return cuMemAdvise_v2(dptr, count, advice, location_of(device));
 }
 
@@ -3446,7 +3828,10 @@ uintptr_t create_array(ShimState& s, const CUDA_ARRAY3D_DESCRIPTOR& desc) {
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+static CUresult cuArray3DCreate_v2_impl(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc);
+VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) { return traced("cuArray3DCreate_v2", cuArray3DCreate_v2_impl, out, desc); }
+static CUresult cuArray3DCreate_v2_impl(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+  VGPU_CAPTURE_UNSAFE("cuArray3DCreate_v2");
   return api("cuArray3DCreate", true, false, [&](ShimState& s) {
     if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
     if (surface_on_blocks(*desc)) return CUDA_ERROR_NOT_SUPPORTED;
@@ -3454,10 +3839,16 @@ VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIP
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuArray3DCreate(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+static CUresult cuArray3DCreate_impl(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc);
+VGPU_EXPORT CUresult cuArray3DCreate(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) { return traced("cuArray3DCreate", cuArray3DCreate_impl, out, desc); }
+static CUresult cuArray3DCreate_impl(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
+  VGPU_CAPTURE_UNSAFE("cuArray3DCreate");
   return cuArray3DCreate_v2(out, desc);
 }
-VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+static CUresult cuArrayCreate_v2_impl(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc);
+VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) { return traced("cuArrayCreate_v2", cuArrayCreate_v2_impl, out, desc); }
+static CUresult cuArrayCreate_v2_impl(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+  VGPU_CAPTURE_UNSAFE("cuArrayCreate_v2");
   if (!desc) return CUDA_ERROR_INVALID_VALUE;
   CUDA_ARRAY3D_DESCRIPTOR d{};
   d.Width = desc->Width;
@@ -3468,10 +3859,15 @@ VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR*
   d.NumChannels = desc->NumChannels;
   return cuArray3DCreate_v2(out, &d);
 }
-VGPU_EXPORT CUresult cuArrayCreate(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+static CUresult cuArrayCreate_impl(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc);
+VGPU_EXPORT CUresult cuArrayCreate(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) { return traced("cuArrayCreate", cuArrayCreate_impl, out, desc); }
+static CUresult cuArrayCreate_impl(CUarray* out, const CUDA_ARRAY_DESCRIPTOR* desc) {
+  VGPU_CAPTURE_UNSAFE("cuArrayCreate");
   return cuArrayCreate_v2(out, desc);
 }
-VGPU_EXPORT CUresult cuArray3DGetDescriptor_v2(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
+static CUresult cuArray3DGetDescriptor_v2_impl(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a);
+VGPU_EXPORT CUresult cuArray3DGetDescriptor_v2(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) { return traced("cuArray3DGetDescriptor_v2", cuArray3DGetDescriptor_v2_impl, desc, a); }
+static CUresult cuArray3DGetDescriptor_v2_impl(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
   return api("cuArray3DGetDescriptor", true, false, [&](ShimState& s) {
     if (s.retired.count(reinterpret_cast<uintptr_t>(a))) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
     const ArrayRec* r = array_rec(s, a);
@@ -3480,11 +3876,15 @@ VGPU_EXPORT CUresult cuArray3DGetDescriptor_v2(CUDA_ARRAY3D_DESCRIPTOR* desc, CU
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuArray3DGetDescriptor(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
+static CUresult cuArray3DGetDescriptor_impl(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a);
+VGPU_EXPORT CUresult cuArray3DGetDescriptor(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) { return traced("cuArray3DGetDescriptor", cuArray3DGetDescriptor_impl, desc, a); }
+static CUresult cuArray3DGetDescriptor_impl(CUDA_ARRAY3D_DESCRIPTOR* desc, CUarray a) {
   return cuArray3DGetDescriptor_v2(desc, a);
 }
 // The 2D descriptor of any array, a 3D one included (the card answers for both).
-VGPU_EXPORT CUresult cuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
+static CUresult cuArrayGetDescriptor_v2_impl(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a);
+VGPU_EXPORT CUresult cuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) { return traced("cuArrayGetDescriptor_v2", cuArrayGetDescriptor_v2_impl, desc, a); }
+static CUresult cuArrayGetDescriptor_v2_impl(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
   CUDA_ARRAY3D_DESCRIPTOR d{};
   if (!desc) return CUDA_ERROR_INVALID_VALUE;
   if (CUresult r = cuArray3DGetDescriptor_v2(&d, a)) return r;
@@ -3494,10 +3894,15 @@ VGPU_EXPORT CUresult cuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR* desc, CUarra
   desc->NumChannels = d.NumChannels;
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
+static CUresult cuArrayGetDescriptor_impl(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a);
+VGPU_EXPORT CUresult cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) { return traced("cuArrayGetDescriptor", cuArrayGetDescriptor_impl, desc, a); }
+static CUresult cuArrayGetDescriptor_impl(CUDA_ARRAY_DESCRIPTOR* desc, CUarray a) {
   return cuArrayGetDescriptor_v2(desc, a);
 }
-VGPU_EXPORT CUresult cuArrayDestroy(CUarray a) {
+static CUresult cuArrayDestroy_impl(CUarray a);
+VGPU_EXPORT CUresult cuArrayDestroy(CUarray a) { return traced("cuArrayDestroy", cuArrayDestroy_impl, a); }
+static CUresult cuArrayDestroy_impl(CUarray a) {
+  VGPU_CAPTURE_UNSAFE("cuArrayDestroy");
   return api("cuArrayDestroy", true, false, [&](ShimState& s) {
     auto it = s.arrays.find(reinterpret_cast<uintptr_t>(a));
     if (it == s.arrays.end()) return CUDA_ERROR_INVALID_VALUE;
@@ -3510,7 +3915,9 @@ VGPU_EXPORT CUresult cuArrayDestroy(CUarray a) {
   });
 }
 
-VGPU_EXPORT CUresult cuMemcpyHtoA_v2(CUarray dst, size_t off, const void* src, size_t n) {
+static CUresult cuMemcpyHtoA_v2_impl(CUarray dst, size_t off, const void* src, size_t n);
+VGPU_EXPORT CUresult cuMemcpyHtoA_v2(CUarray dst, size_t off, const void* src, size_t n) { return traced("cuMemcpyHtoA_v2", cuMemcpyHtoA_v2_impl, dst, off, src, n); }
+static CUresult cuMemcpyHtoA_v2_impl(CUarray dst, size_t off, const void* src, size_t n) {
   return api("cuMemcpyHtoA", true, false, [&](ShimState& s) {
     CUdeviceptr at = 0;
     if (!src && n) return CUDA_ERROR_INVALID_VALUE;
@@ -3519,10 +3926,14 @@ VGPU_EXPORT CUresult cuMemcpyHtoA_v2(CUarray dst, size_t off, const void* src, s
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyHtoA(CUarray d, size_t off, const void* src, size_t n) {
+static CUresult cuMemcpyHtoA_impl(CUarray d, size_t off, const void* src, size_t n);
+VGPU_EXPORT CUresult cuMemcpyHtoA(CUarray d, size_t off, const void* src, size_t n) { return traced("cuMemcpyHtoA", cuMemcpyHtoA_impl, d, off, src, n); }
+static CUresult cuMemcpyHtoA_impl(CUarray d, size_t off, const void* src, size_t n) {
   return cuMemcpyHtoA_v2(d, off, src, n);
 }
-VGPU_EXPORT CUresult cuMemcpyAtoH_v2(void* dst, CUarray src, size_t off, size_t n) {
+static CUresult cuMemcpyAtoH_v2_impl(void* dst, CUarray src, size_t off, size_t n);
+VGPU_EXPORT CUresult cuMemcpyAtoH_v2(void* dst, CUarray src, size_t off, size_t n) { return traced("cuMemcpyAtoH_v2", cuMemcpyAtoH_v2_impl, dst, src, off, n); }
+static CUresult cuMemcpyAtoH_v2_impl(void* dst, CUarray src, size_t off, size_t n) {
   return api("cuMemcpyAtoH", true, false, [&](ShimState& s) {
     CUdeviceptr at = 0;
     if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
@@ -3531,10 +3942,14 @@ VGPU_EXPORT CUresult cuMemcpyAtoH_v2(void* dst, CUarray src, size_t off, size_t 
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyAtoH(void* dst, CUarray src, size_t off, size_t n) {
+static CUresult cuMemcpyAtoH_impl(void* dst, CUarray src, size_t off, size_t n);
+VGPU_EXPORT CUresult cuMemcpyAtoH(void* dst, CUarray src, size_t off, size_t n) { return traced("cuMemcpyAtoH", cuMemcpyAtoH_impl, dst, src, off, n); }
+static CUresult cuMemcpyAtoH_impl(void* dst, CUarray src, size_t off, size_t n) {
   return cuMemcpyAtoH_v2(dst, src, off, n);
 }
-VGPU_EXPORT CUresult cuMemcpyDtoA_v2(CUarray dst, size_t off, CUdeviceptr src, size_t n) {
+static CUresult cuMemcpyDtoA_v2_impl(CUarray dst, size_t off, CUdeviceptr src, size_t n);
+VGPU_EXPORT CUresult cuMemcpyDtoA_v2(CUarray dst, size_t off, CUdeviceptr src, size_t n) { return traced("cuMemcpyDtoA_v2", cuMemcpyDtoA_v2_impl, dst, off, src, n); }
+static CUresult cuMemcpyDtoA_v2_impl(CUarray dst, size_t off, CUdeviceptr src, size_t n) {
   return api("cuMemcpyDtoA", true, false, [&](ShimState& s) {
     CUdeviceptr at = 0;
     if (CUresult r = linear_part(s, dst, off, n, &at)) return r;
@@ -3544,10 +3959,14 @@ VGPU_EXPORT CUresult cuMemcpyDtoA_v2(CUarray dst, size_t off, CUdeviceptr src, s
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyDtoA(CUarray d, size_t off, CUdeviceptr src, size_t n) {
+static CUresult cuMemcpyDtoA_impl(CUarray d, size_t off, CUdeviceptr src, size_t n);
+VGPU_EXPORT CUresult cuMemcpyDtoA(CUarray d, size_t off, CUdeviceptr src, size_t n) { return traced("cuMemcpyDtoA", cuMemcpyDtoA_impl, d, off, src, n); }
+static CUresult cuMemcpyDtoA_impl(CUarray d, size_t off, CUdeviceptr src, size_t n) {
   return cuMemcpyDtoA_v2(d, off, src, n);
 }
-VGPU_EXPORT CUresult cuMemcpyAtoD_v2(CUdeviceptr dst, CUarray src, size_t off, size_t n) {
+static CUresult cuMemcpyAtoD_v2_impl(CUdeviceptr dst, CUarray src, size_t off, size_t n);
+VGPU_EXPORT CUresult cuMemcpyAtoD_v2(CUdeviceptr dst, CUarray src, size_t off, size_t n) { return traced("cuMemcpyAtoD_v2", cuMemcpyAtoD_v2_impl, dst, src, off, n); }
+static CUresult cuMemcpyAtoD_v2_impl(CUdeviceptr dst, CUarray src, size_t off, size_t n) {
   return api("cuMemcpyAtoD", true, false, [&](ShimState& s) {
     CUdeviceptr at = 0;
     if (CUresult r = linear_part(s, src, off, n, &at)) return r;
@@ -3557,12 +3976,16 @@ VGPU_EXPORT CUresult cuMemcpyAtoD_v2(CUdeviceptr dst, CUarray src, size_t off, s
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyAtoD(CUdeviceptr d, CUarray src, size_t off, size_t n) {
+static CUresult cuMemcpyAtoD_impl(CUdeviceptr d, CUarray src, size_t off, size_t n);
+VGPU_EXPORT CUresult cuMemcpyAtoD(CUdeviceptr d, CUarray src, size_t off, size_t n) { return traced("cuMemcpyAtoD", cuMemcpyAtoD_impl, d, src, off, n); }
+static CUresult cuMemcpyAtoD_impl(CUdeviceptr d, CUarray src, size_t off, size_t n) {
   return cuMemcpyAtoD_v2(d, src, off, n);
 }
 
 // Bytes between two arrays' first rows, as cuMemcpyHtoA and the rest take them.
-VGPU_EXPORT CUresult cuMemcpyAtoA_v2(CUarray dst, size_t dst_off, CUarray src, size_t src_off, size_t n) {
+static CUresult cuMemcpyAtoA_v2_impl(CUarray dst, size_t dst_off, CUarray src, size_t src_off, size_t n);
+VGPU_EXPORT CUresult cuMemcpyAtoA_v2(CUarray dst, size_t dst_off, CUarray src, size_t src_off, size_t n) { return traced("cuMemcpyAtoA_v2", cuMemcpyAtoA_v2_impl, dst, dst_off, src, src_off, n); }
+static CUresult cuMemcpyAtoA_v2_impl(CUarray dst, size_t dst_off, CUarray src, size_t src_off, size_t n) {
   return api("cuMemcpyAtoA", true, false, [&](ShimState& s) {
     CUdeviceptr from = 0, to = 0;
     if (CUresult r = linear_part(s, src, src_off, n, &from)) return r;
@@ -3573,19 +3996,31 @@ VGPU_EXPORT CUresult cuMemcpyAtoA_v2(CUarray dst, size_t dst_off, CUarray src, s
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemcpyAtoA(CUarray d, size_t doff, CUarray src, size_t soff, size_t n) {
+static CUresult cuMemcpyAtoA_impl(CUarray d, size_t doff, CUarray src, size_t soff, size_t n);
+VGPU_EXPORT CUresult cuMemcpyAtoA(CUarray d, size_t doff, CUarray src, size_t soff, size_t n) { return traced("cuMemcpyAtoA", cuMemcpyAtoA_impl, d, doff, src, soff, n); }
+static CUresult cuMemcpyAtoA_impl(CUarray d, size_t doff, CUarray src, size_t soff, size_t n) {
   return cuMemcpyAtoA_v2(d, doff, src, soff, n);
 }
-VGPU_EXPORT CUresult cuMemcpyHtoAAsync_v2(CUarray dst, size_t off, const void* src, size_t n, CUstream) {
+static CUresult cuMemcpyHtoAAsync_v2_impl(CUarray dst, size_t off, const void* src, size_t n, CUstream);
+VGPU_EXPORT CUresult cuMemcpyHtoAAsync_v2(CUarray dst, size_t off, const void* src, size_t n, CUstream a4) { return traced("cuMemcpyHtoAAsync_v2", cuMemcpyHtoAAsync_v2_impl, dst, off, src, n, a4); }
+static CUresult cuMemcpyHtoAAsync_v2_impl(CUarray dst, size_t off, const void* src, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyHtoA_v2(dst, off, src, n));
   return cuMemcpyHtoA_v2(dst, off, src, n);
 }
-VGPU_EXPORT CUresult cuMemcpyHtoAAsync(CUarray dst, size_t off, const void* src, size_t n, CUstream st) {
+static CUresult cuMemcpyHtoAAsync_impl(CUarray dst, size_t off, const void* src, size_t n, CUstream st);
+VGPU_EXPORT CUresult cuMemcpyHtoAAsync(CUarray dst, size_t off, const void* src, size_t n, CUstream st) { return traced("cuMemcpyHtoAAsync", cuMemcpyHtoAAsync_impl, dst, off, src, n, st); }
+static CUresult cuMemcpyHtoAAsync_impl(CUarray dst, size_t off, const void* src, size_t n, CUstream st) {
   return cuMemcpyHtoAAsync_v2(dst, off, src, n, st);
 }
-VGPU_EXPORT CUresult cuMemcpyAtoHAsync_v2(void* dst, CUarray src, size_t off, size_t n, CUstream) {
+static CUresult cuMemcpyAtoHAsync_v2_impl(void* dst, CUarray src, size_t off, size_t n, CUstream);
+VGPU_EXPORT CUresult cuMemcpyAtoHAsync_v2(void* dst, CUarray src, size_t off, size_t n, CUstream a4) { return traced("cuMemcpyAtoHAsync_v2", cuMemcpyAtoHAsync_v2_impl, dst, src, off, n, a4); }
+static CUresult cuMemcpyAtoHAsync_v2_impl(void* dst, CUarray src, size_t off, size_t n, CUstream st) {
+  VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpyAtoH_v2(dst, src, off, n));
   return cuMemcpyAtoH_v2(dst, src, off, n);
 }
-VGPU_EXPORT CUresult cuMemcpyAtoHAsync(void* dst, CUarray src, size_t off, size_t n, CUstream st) {
+static CUresult cuMemcpyAtoHAsync_impl(void* dst, CUarray src, size_t off, size_t n, CUstream st);
+VGPU_EXPORT CUresult cuMemcpyAtoHAsync(void* dst, CUarray src, size_t off, size_t n, CUstream st) { return traced("cuMemcpyAtoHAsync", cuMemcpyAtoHAsync_impl, dst, src, off, n, st); }
+static CUresult cuMemcpyAtoHAsync_impl(void* dst, CUarray src, size_t off, size_t n, CUstream st) {
   return cuMemcpyAtoHAsync_v2(dst, src, off, n, st);
 }
 
@@ -3598,8 +4033,11 @@ VGPU_EXPORT CUresult cuMemcpyAtoHAsync(void* dst, CUarray src, size_t off, size_
  * the last is INVALID_VALUE, and a destroyed mipmapped array -- or one of its
  * levels -- is CUDA_ERROR_CONTEXT_IS_DESTROYED. */
 
-VGPU_EXPORT CUresult cuMipmappedArrayCreate(CUmipmappedArray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc,
+static CUresult cuMipmappedArrayCreate_impl(CUmipmappedArray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc, unsigned int numLevels);
+VGPU_EXPORT CUresult cuMipmappedArrayCreate(CUmipmappedArray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc, unsigned int numLevels) { return traced("cuMipmappedArrayCreate", cuMipmappedArrayCreate_impl, out, desc, numLevels); }
+static CUresult cuMipmappedArrayCreate_impl(CUmipmappedArray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc,
                                             unsigned int numLevels) {
+  VGPU_CAPTURE_UNSAFE("cuMipmappedArrayCreate");
   return api("cuMipmappedArrayCreate", true, false, [&](ShimState& s) {
     if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
     if (surface_on_blocks(*desc)) return CUDA_ERROR_NOT_SUPPORTED;
@@ -3625,7 +4063,9 @@ VGPU_EXPORT CUresult cuMipmappedArrayCreate(CUmipmappedArray* out, const CUDA_AR
   });
 }
 
-VGPU_EXPORT CUresult cuMipmappedArrayGetLevel(CUarray* level, CUmipmappedArray mm, unsigned int l) {
+static CUresult cuMipmappedArrayGetLevel_impl(CUarray* level, CUmipmappedArray mm, unsigned int l);
+VGPU_EXPORT CUresult cuMipmappedArrayGetLevel(CUarray* level, CUmipmappedArray mm, unsigned int l) { return traced("cuMipmappedArrayGetLevel", cuMipmappedArrayGetLevel_impl, level, mm, l); }
+static CUresult cuMipmappedArrayGetLevel_impl(CUarray* level, CUmipmappedArray mm, unsigned int l) {
   return api("cuMipmappedArrayGetLevel", true, false, [&](ShimState& s) {
     if (!level) return CUDA_ERROR_INVALID_VALUE;
     const uintptr_t h = reinterpret_cast<uintptr_t>(mm);
@@ -3638,7 +4078,10 @@ VGPU_EXPORT CUresult cuMipmappedArrayGetLevel(CUarray* level, CUmipmappedArray m
   });
 }
 
-VGPU_EXPORT CUresult cuMipmappedArrayDestroy(CUmipmappedArray mm) {
+static CUresult cuMipmappedArrayDestroy_impl(CUmipmappedArray mm);
+VGPU_EXPORT CUresult cuMipmappedArrayDestroy(CUmipmappedArray mm) { return traced("cuMipmappedArrayDestroy", cuMipmappedArrayDestroy_impl, mm); }
+static CUresult cuMipmappedArrayDestroy_impl(CUmipmappedArray mm) {
+  VGPU_CAPTURE_UNSAFE("cuMipmappedArrayDestroy");
   return api("cuMipmappedArrayDestroy", true, false, [&](ShimState& s) {
     const uintptr_t h = reinterpret_cast<uintptr_t>(mm);
     if (s.retired.count(h)) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
@@ -3679,14 +4122,18 @@ CUresult with_texref(const char* name, CUtexref t, F&& body) {
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuModuleGetTexRef(CUtexref* out, CUmodule hmod, const char*) {
+static CUresult cuModuleGetTexRef_impl(CUtexref* out, CUmodule hmod, const char*);
+VGPU_EXPORT CUresult cuModuleGetTexRef(CUtexref* out, CUmodule hmod, const char* a2) { return traced("cuModuleGetTexRef", cuModuleGetTexRef_impl, out, hmod, a2); }
+static CUresult cuModuleGetTexRef_impl(CUtexref* out, CUmodule hmod, const char*) {
   return api("cuModuleGetTexRef", true, false, [&](ShimState& s) {
     if (!out) return CUDA_ERROR_INVALID_VALUE;
     if (!s.modules.count(reinterpret_cast<uintptr_t>(hmod))) return CUDA_ERROR_INVALID_HANDLE;
     return CUDA_ERROR_NOT_FOUND;
   });
 }
-VGPU_EXPORT CUresult cuModuleGetSurfRef(CUsurfref* out, CUmodule hmod, const char*) {
+static CUresult cuModuleGetSurfRef_impl(CUsurfref* out, CUmodule hmod, const char*);
+VGPU_EXPORT CUresult cuModuleGetSurfRef(CUsurfref* out, CUmodule hmod, const char* a2) { return traced("cuModuleGetSurfRef", cuModuleGetSurfRef_impl, out, hmod, a2); }
+static CUresult cuModuleGetSurfRef_impl(CUsurfref* out, CUmodule hmod, const char*) {
   return api("cuModuleGetSurfRef", true, false, [&](ShimState& s) {
     if (!out) return CUDA_ERROR_INVALID_VALUE;
     if (!s.modules.count(reinterpret_cast<uintptr_t>(hmod))) return CUDA_ERROR_INVALID_HANDLE;
@@ -3694,10 +4141,16 @@ VGPU_EXPORT CUresult cuModuleGetSurfRef(CUsurfref* out, CUmodule hmod, const cha
   });
 }
 // No surface reference exists to name.
-VGPU_EXPORT CUresult cuSurfRefSetArray(CUsurfref, CUarray, unsigned int) { return CUDA_ERROR_INVALID_HANDLE; }
-VGPU_EXPORT CUresult cuSurfRefGetArray(CUarray*, CUsurfref) { return CUDA_ERROR_INVALID_HANDLE; }
+static CUresult cuSurfRefSetArray_impl(CUsurfref, CUarray, unsigned int);
+VGPU_EXPORT CUresult cuSurfRefSetArray(CUsurfref a0, CUarray a1, unsigned int a2) { return traced("cuSurfRefSetArray", cuSurfRefSetArray_impl, a0, a1, a2); }
+static CUresult cuSurfRefSetArray_impl(CUsurfref, CUarray, unsigned int) { return CUDA_ERROR_INVALID_HANDLE; }
+static CUresult cuSurfRefGetArray_impl(CUarray*, CUsurfref);
+VGPU_EXPORT CUresult cuSurfRefGetArray(CUarray* a0, CUsurfref a1) { return traced("cuSurfRefGetArray", cuSurfRefGetArray_impl, a0, a1); }
+static CUresult cuSurfRefGetArray_impl(CUarray*, CUsurfref) { return CUDA_ERROR_INVALID_HANDLE; }
 
-VGPU_EXPORT CUresult cuTexRefCreate(CUtexref* out) {
+static CUresult cuTexRefCreate_impl(CUtexref* out);
+VGPU_EXPORT CUresult cuTexRefCreate(CUtexref* out) { return traced("cuTexRefCreate", cuTexRefCreate_impl, out); }
+static CUresult cuTexRefCreate_impl(CUtexref* out) {
   return api("cuTexRefCreate", true, false, [&](ShimState& s) {
     if (!out) return CUDA_ERROR_INVALID_VALUE;
     const uintptr_t h = make_handle(s, kTagArray);
@@ -3706,34 +4159,44 @@ VGPU_EXPORT CUresult cuTexRefCreate(CUtexref* out) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefDestroy(CUtexref t) {
+static CUresult cuTexRefDestroy_impl(CUtexref t);
+VGPU_EXPORT CUresult cuTexRefDestroy(CUtexref t) { return traced("cuTexRefDestroy", cuTexRefDestroy_impl, t); }
+static CUresult cuTexRefDestroy_impl(CUtexref t) {
   return api("cuTexRefDestroy", true, false, [&](ShimState& s) {
     return s.texrefs.erase(reinterpret_cast<uintptr_t>(t)) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_HANDLE;
   });
 }
 // Dimension 0 to 2; wrap, clamp, mirror or border.
-VGPU_EXPORT CUresult cuTexRefSetAddressMode(CUtexref t, int dim, int mode) {
+static CUresult cuTexRefSetAddressMode_impl(CUtexref t, int dim, int mode);
+VGPU_EXPORT CUresult cuTexRefSetAddressMode(CUtexref t, int dim, int mode) { return traced("cuTexRefSetAddressMode", cuTexRefSetAddressMode_impl, t, dim, mode); }
+static CUresult cuTexRefSetAddressMode_impl(CUtexref t, int dim, int mode) {
   return with_texref("cuTexRefSetAddressMode", t, [&](ShimState&, TexRefRec& r) {
     if (dim < 0 || dim > 2 || mode < 0 || mode > 3) return CUDA_ERROR_INVALID_VALUE;
     r.address[dim] = mode;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefGetAddressMode(int* mode, CUtexref t, int dim) {
+static CUresult cuTexRefGetAddressMode_impl(int* mode, CUtexref t, int dim);
+VGPU_EXPORT CUresult cuTexRefGetAddressMode(int* mode, CUtexref t, int dim) { return traced("cuTexRefGetAddressMode", cuTexRefGetAddressMode_impl, mode, t, dim); }
+static CUresult cuTexRefGetAddressMode_impl(int* mode, CUtexref t, int dim) {
   return with_texref("cuTexRefGetAddressMode", t, [&](ShimState&, TexRefRec& r) {
     if (!mode || dim < 0 || dim > 2) return CUDA_ERROR_INVALID_VALUE;
     *mode = r.address[dim];
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefSetFilterMode(CUtexref t, int mode) {
+static CUresult cuTexRefSetFilterMode_impl(CUtexref t, int mode);
+VGPU_EXPORT CUresult cuTexRefSetFilterMode(CUtexref t, int mode) { return traced("cuTexRefSetFilterMode", cuTexRefSetFilterMode_impl, t, mode); }
+static CUresult cuTexRefSetFilterMode_impl(CUtexref t, int mode) {
   return with_texref("cuTexRefSetFilterMode", t, [&](ShimState&, TexRefRec& r) {
     if (mode < 0 || mode > 1) return CUDA_ERROR_INVALID_VALUE;
     r.filter = mode;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefGetFilterMode(int* mode, CUtexref t) {
+static CUresult cuTexRefGetFilterMode_impl(int* mode, CUtexref t);
+VGPU_EXPORT CUresult cuTexRefGetFilterMode(int* mode, CUtexref t) { return traced("cuTexRefGetFilterMode", cuTexRefGetFilterMode_impl, mode, t); }
+static CUresult cuTexRefGetFilterMode_impl(int* mode, CUtexref t) {
   return with_texref("cuTexRefGetFilterMode", t, [&](ShimState&, TexRefRec& r) {
     if (!mode) return CUDA_ERROR_INVALID_VALUE;
     *mode = r.filter;
@@ -3741,7 +4204,9 @@ VGPU_EXPORT CUresult cuTexRefGetFilterMode(int* mode, CUtexref t) {
   });
 }
 // The CU_TRSF_* bits and no others.
-VGPU_EXPORT CUresult cuTexRefSetFlags(CUtexref t, unsigned int flags) {
+static CUresult cuTexRefSetFlags_impl(CUtexref t, unsigned int flags);
+VGPU_EXPORT CUresult cuTexRefSetFlags(CUtexref t, unsigned int flags) { return traced("cuTexRefSetFlags", cuTexRefSetFlags_impl, t, flags); }
+static CUresult cuTexRefSetFlags_impl(CUtexref t, unsigned int flags) {
   return with_texref("cuTexRefSetFlags", t, [&](ShimState&, TexRefRec& r) {
     const unsigned known = CU_TRSF_READ_AS_INTEGER | CU_TRSF_NORMALIZED_COORDINATES | CU_TRSF_SRGB |
                            CU_TRSF_DISABLE_TRILINEAR_OPTIMIZATION | CU_TRSF_SEAMLESS_CUBEMAP;
@@ -3750,7 +4215,9 @@ VGPU_EXPORT CUresult cuTexRefSetFlags(CUtexref t, unsigned int flags) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefGetFlags(unsigned int* flags, CUtexref t) {
+static CUresult cuTexRefGetFlags_impl(unsigned int* flags, CUtexref t);
+VGPU_EXPORT CUresult cuTexRefGetFlags(unsigned int* flags, CUtexref t) { return traced("cuTexRefGetFlags", cuTexRefGetFlags_impl, flags, t); }
+static CUresult cuTexRefGetFlags_impl(unsigned int* flags, CUtexref t) {
   return with_texref("cuTexRefGetFlags", t, [&](ShimState&, TexRefRec& r) {
     if (!flags) return CUDA_ERROR_INVALID_VALUE;
     *flags = r.flags;
@@ -3759,7 +4226,9 @@ VGPU_EXPORT CUresult cuTexRefGetFlags(unsigned int* flags, CUtexref t) {
 }
 // 1, 2 or 4 channels. The format is kept as given: the card takes one no
 // header names.
-VGPU_EXPORT CUresult cuTexRefSetFormat(CUtexref t, int format, int channels) {
+static CUresult cuTexRefSetFormat_impl(CUtexref t, int format, int channels);
+VGPU_EXPORT CUresult cuTexRefSetFormat(CUtexref t, int format, int channels) { return traced("cuTexRefSetFormat", cuTexRefSetFormat_impl, t, format, channels); }
+static CUresult cuTexRefSetFormat_impl(CUtexref t, int format, int channels) {
   return with_texref("cuTexRefSetFormat", t, [&](ShimState&, TexRefRec& r) {
     if (channels != 1 && channels != 2 && channels != 4) return CUDA_ERROR_INVALID_VALUE;
     r.format = format;
@@ -3767,7 +4236,9 @@ VGPU_EXPORT CUresult cuTexRefSetFormat(CUtexref t, int format, int channels) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefGetFormat(int* format, int* channels, CUtexref t) {
+static CUresult cuTexRefGetFormat_impl(int* format, int* channels, CUtexref t);
+VGPU_EXPORT CUresult cuTexRefGetFormat(int* format, int* channels, CUtexref t) { return traced("cuTexRefGetFormat", cuTexRefGetFormat_impl, format, channels, t); }
+static CUresult cuTexRefGetFormat_impl(int* format, int* channels, CUtexref t) {
   return with_texref("cuTexRefGetFormat", t, [&](ShimState&, TexRefRec& r) {
     if (!format && !channels) return CUDA_ERROR_INVALID_VALUE;
     if (format) *format = r.format;
@@ -3777,7 +4248,9 @@ VGPU_EXPORT CUresult cuTexRefGetFormat(int* format, int* channels, CUtexref t) {
 }
 // Linear memory, bound at the texture alignment (512 bytes) at or below the
 // address; the distance above it is returned as the offset a kernel adds.
-VGPU_EXPORT CUresult cuTexRefSetAddress_v2(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t) {
+static CUresult cuTexRefSetAddress_v2_impl(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t);
+VGPU_EXPORT CUresult cuTexRefSetAddress_v2(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t a3) { return traced("cuTexRefSetAddress_v2", cuTexRefSetAddress_v2_impl, offset, t, dptr, a3); }
+static CUresult cuTexRefSetAddress_v2_impl(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t) {
   return with_texref("cuTexRefSetAddress", t, [&](ShimState& s, TexRefRec& r) {
     const CUdeviceptr align = static_cast<CUdeviceptr>(extra_attribute(current(s).profile(), 14));
     r.address_base = dptr / align * align;
@@ -3786,13 +4259,17 @@ VGPU_EXPORT CUresult cuTexRefSetAddress_v2(size_t* offset, CUtexref t, CUdevicep
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefSetAddress(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t bytes) {
+static CUresult cuTexRefSetAddress_impl(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t bytes);
+VGPU_EXPORT CUresult cuTexRefSetAddress(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t bytes) { return traced("cuTexRefSetAddress", cuTexRefSetAddress_impl, offset, t, dptr, bytes); }
+static CUresult cuTexRefSetAddress_impl(size_t* offset, CUtexref t, CUdeviceptr dptr, size_t bytes) {
   return cuTexRefSetAddress_v2(offset, t, dptr, bytes);
 }
 // Pitched linear memory: the address at the texture alignment (512 bytes),
 // the pitch at the texture pitch alignment (32 bytes), and a pitch that holds
 // a row.
-VGPU_EXPORT CUresult cuTexRefSetAddress2D_v3(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr,
+static CUresult cuTexRefSetAddress2D_v3_impl(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr, size_t pitch);
+VGPU_EXPORT CUresult cuTexRefSetAddress2D_v3(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr, size_t pitch) { return traced("cuTexRefSetAddress2D_v3", cuTexRefSetAddress2D_v3_impl, t, desc, dptr, pitch); }
+static CUresult cuTexRefSetAddress2D_v3_impl(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr,
                                              size_t pitch) {
   return with_texref("cuTexRefSetAddress2D", t, [&](ShimState& s, TexRefRec& r) {
     const vgpu::DeviceProfile& p = current(s).profile();
@@ -3808,25 +4285,35 @@ VGPU_EXPORT CUresult cuTexRefSetAddress2D_v3(CUtexref t, const CUDA_ARRAY_DESCRI
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefSetAddress2D_v2(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr,
+static CUresult cuTexRefSetAddress2D_v2_impl(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr, size_t pitch);
+VGPU_EXPORT CUresult cuTexRefSetAddress2D_v2(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr, size_t pitch) { return traced("cuTexRefSetAddress2D_v2", cuTexRefSetAddress2D_v2_impl, t, desc, dptr, pitch); }
+static CUresult cuTexRefSetAddress2D_v2_impl(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr,
                                              size_t pitch) {
   return cuTexRefSetAddress2D_v3(t, desc, dptr, pitch);
 }
-VGPU_EXPORT CUresult cuTexRefSetAddress2D(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr,
+static CUresult cuTexRefSetAddress2D_impl(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr, size_t pitch);
+VGPU_EXPORT CUresult cuTexRefSetAddress2D(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr, size_t pitch) { return traced("cuTexRefSetAddress2D", cuTexRefSetAddress2D_impl, t, desc, dptr, pitch); }
+static CUresult cuTexRefSetAddress2D_impl(CUtexref t, const CUDA_ARRAY_DESCRIPTOR* desc, CUdeviceptr dptr,
                                           size_t pitch) {
   return cuTexRefSetAddress2D_v3(t, desc, dptr, pitch);
 }
 // Bound to linear memory only; bound to an array, or to nothing, is INVALID_VALUE.
-VGPU_EXPORT CUresult cuTexRefGetAddress_v2(CUdeviceptr* out, CUtexref t) {
+static CUresult cuTexRefGetAddress_v2_impl(CUdeviceptr* out, CUtexref t);
+VGPU_EXPORT CUresult cuTexRefGetAddress_v2(CUdeviceptr* out, CUtexref t) { return traced("cuTexRefGetAddress_v2", cuTexRefGetAddress_v2_impl, out, t); }
+static CUresult cuTexRefGetAddress_v2_impl(CUdeviceptr* out, CUtexref t) {
   return with_texref("cuTexRefGetAddress", t, [&](ShimState&, TexRefRec& r) {
     if (!out || !r.address_base) return CUDA_ERROR_INVALID_VALUE;
     *out = r.address_base;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefGetAddress(CUdeviceptr* out, CUtexref t) { return cuTexRefGetAddress_v2(out, t); }
+static CUresult cuTexRefGetAddress_impl(CUdeviceptr* out, CUtexref t);
+VGPU_EXPORT CUresult cuTexRefGetAddress(CUdeviceptr* out, CUtexref t) { return traced("cuTexRefGetAddress", cuTexRefGetAddress_impl, out, t); }
+static CUresult cuTexRefGetAddress_impl(CUdeviceptr* out, CUtexref t) { return cuTexRefGetAddress_v2(out, t); }
 // CU_TRSA_OVERRIDE_FORMAT, which takes the array's format, is the one flag.
-VGPU_EXPORT CUresult cuTexRefSetArray(CUtexref t, CUarray a, unsigned int flags) {
+static CUresult cuTexRefSetArray_impl(CUtexref t, CUarray a, unsigned int flags);
+VGPU_EXPORT CUresult cuTexRefSetArray(CUtexref t, CUarray a, unsigned int flags) { return traced("cuTexRefSetArray", cuTexRefSetArray_impl, t, a, flags); }
+static CUresult cuTexRefSetArray_impl(CUtexref t, CUarray a, unsigned int flags) {
   return with_texref("cuTexRefSetArray", t, [&](ShimState& s, TexRefRec& r) {
     const ArrayRec* arr = array_rec(s, a);
     if (!arr || (flags & ~unsigned{CU_TRSA_OVERRIDE_FORMAT})) return CUDA_ERROR_INVALID_VALUE;
@@ -3839,7 +4326,9 @@ VGPU_EXPORT CUresult cuTexRefSetArray(CUtexref t, CUarray a, unsigned int flags)
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuTexRefGetArray(CUarray* out, CUtexref t) {
+static CUresult cuTexRefGetArray_impl(CUarray* out, CUtexref t);
+VGPU_EXPORT CUresult cuTexRefGetArray(CUarray* out, CUtexref t) { return traced("cuTexRefGetArray", cuTexRefGetArray_impl, out, t); }
+static CUresult cuTexRefGetArray_impl(CUarray* out, CUtexref t) {
   return with_texref("cuTexRefGetArray", t, [&](ShimState&, TexRefRec& r) {
     if (!out || !r.array) return CUDA_ERROR_INVALID_VALUE;
     *out = r.array;
@@ -3976,6 +4465,16 @@ struct ViewDescABI {
   unsigned reserved[16];
 };
 
+// What a program is told about a texture or surface object it made, kept at creation: the three descriptors as it
+// passed them (the getters report zeros for one it did not give).
+struct ObjectDescs {
+  ResourceDescABI res{};
+  TextureDescABI tex{};
+  ViewDescABI view{};
+};
+std::mutex g_object_mu;
+std::unordered_map<unsigned long long, ObjectDescs> g_object_descs;
+
 CUresult make_object(const char* name, unsigned long long* out, const void* res, const void* tex,
                      const void* view, vgpu::exec::TexKind kind) {
   return api(name, true, false, [&](ShimState& s) -> CUresult {
@@ -3994,9 +4493,10 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
         if (t->address[i] < 0 || t->address[i] > 3) return CUDA_ERROR_INVALID_VALUE;
         d.address[i] = static_cast<vgpu::exec::TexAddress>(t->address[i]);   // the same order
       }
-      // Anisotropy changes a result only when a sample's footprint is stretched, which a fetch with no
-      // derivatives (LOD 0, or an explicit one) never is: any value is accepted, as the card accepts any
-      // (measured: 0, 1, 2, 8, 16, 17, 100 and 2^32-1), and has nothing to act on.
+      // Any anisotropy is accepted, as the card accepts any (measured: 0, 1, 2, 8, 16, 17, 100 and
+      // 2^32-1). It sharpens the blend between two levels of an explicit-level fetch (tex_mip_lod in
+      // interpreter.cpp) and acts on nothing else a fetch with no derivatives does.
+      d.max_anisotropy = t->max_anisotropy;
       d.filter = t->filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
       d.normalized_coords = t->flags & CU_TRSF_NORMALIZED_COORDINATES;
       srgb_flag = t->flags & CU_TRSF_SRGB;
@@ -4013,6 +4513,7 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
       d.mip_filter = t->mip_filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
       d.mip_bias = q(t->mip_bias);
+      d.mip_bias_exact = std::isfinite(t->mip_bias) ? static_cast<double>(std::clamp(t->mip_bias, -1e6f, 1e6f)) * 256 : 0.0;
       d.mip_min = q(t->mip_min);
       d.mip_max = q(t->mip_max);
     } else {
@@ -4028,20 +4529,16 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
         return static_cast<CUresult>(e);
       d.read_as_normalized_float = d.read_as_normalized_float || format.norm_only || format.packed_1010102;
     }
-    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
-    // sampled here: their decoders are not written. Say so, by name, once (the real driver takes them).
-    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
-        d.block == vgpu::exec::BlockFormat::BC7) {
-      static std::once_flag said;
-      std::call_once(said, [&] {
-        if (!quiet())
-          std::fprintf(stderr, "[vgpu] %s: textures of BC6H and BC7 blocks are not implemented (BC1 to BC5 are); "
-                               "returning CUDA_ERROR_NOT_SUPPORTED\n", name);
-      });
-      return CUDA_ERROR_NOT_SUPPORTED;
-    }
     const uint64_t handle = next_texobj++;
     current(s).textures()[handle] = d;
+    {
+      ObjectDescs kept;
+      kept.res = rdesc;
+      if (tex) kept.tex = *static_cast<const TextureDescABI*>(tex);
+      if (view) kept.view = *static_cast<const ViewDescABI*>(view);
+      std::lock_guard<std::mutex> lock(g_object_mu);
+      g_object_descs[handle] = kept;
+    }
     *out = handle;
     return CUDA_SUCCESS;
   });
@@ -4050,46 +4547,94 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
 CUresult destroy_object(const char* name, unsigned long long obj) {
   return api(name, true, false, [&](ShimState& s) {
     for (int dev = 0; dev < s.rt->device_count(); ++dev)
-      if (s.rt->device(dev).textures().erase(obj)) return CUDA_SUCCESS;
+      if (s.rt->device(dev).textures().erase(obj)) {
+        std::lock_guard<std::mutex> lock(g_object_mu);
+        g_object_descs.erase(obj);
+        return CUDA_SUCCESS;
+      }
     return CUDA_ERROR_INVALID_VALUE;
   });
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuTexObjectCreate(unsigned long long* out, const void* res, const void* tex,
+static CUresult cuTexObjectCreate_impl(unsigned long long* out, const void* res, const void* tex, const void* view);
+VGPU_EXPORT CUresult cuTexObjectCreate(unsigned long long* out, const void* res, const void* tex, const void* view) { return traced("cuTexObjectCreate", cuTexObjectCreate_impl, out, res, tex, view); }
+static CUresult cuTexObjectCreate_impl(unsigned long long* out, const void* res, const void* tex,
                                        const void* view) {
+  VGPU_CAPTURE_UNSAFE("cuTexObjectCreate");
   return make_object("cuTexObjectCreate", out, res, tex, view, vgpu::exec::TexKind::Texture);
 }
-VGPU_EXPORT CUresult cuTexObjectDestroy(unsigned long long obj) {
+static CUresult cuTexObjectDestroy_impl(unsigned long long obj);
+VGPU_EXPORT CUresult cuTexObjectDestroy(unsigned long long obj) { return traced("cuTexObjectDestroy", cuTexObjectDestroy_impl, obj); }
+static CUresult cuTexObjectDestroy_impl(unsigned long long obj) {
+  VGPU_CAPTURE_UNSAFE("cuTexObjectDestroy");
   return destroy_object("cuTexObjectDestroy", obj);
 }
-VGPU_EXPORT CUresult cuSurfObjectCreate(unsigned long long* out, const void* res) {
+static CUresult cuSurfObjectCreate_impl(unsigned long long* out, const void* res);
+VGPU_EXPORT CUresult cuSurfObjectCreate(unsigned long long* out, const void* res) { return traced("cuSurfObjectCreate", cuSurfObjectCreate_impl, out, res); }
+static CUresult cuSurfObjectCreate_impl(unsigned long long* out, const void* res) {
+  VGPU_CAPTURE_UNSAFE("cuSurfObjectCreate");
   return make_object("cuSurfObjectCreate", out, res, nullptr, nullptr, vgpu::exec::TexKind::Surface);
 }
-VGPU_EXPORT CUresult cuSurfObjectDestroy(unsigned long long obj) {
+static CUresult cuSurfObjectDestroy_impl(unsigned long long obj);
+VGPU_EXPORT CUresult cuSurfObjectDestroy(unsigned long long obj) { return traced("cuSurfObjectDestroy", cuSurfObjectDestroy_impl, obj); }
+static CUresult cuSurfObjectDestroy_impl(unsigned long long obj) {
+  VGPU_CAPTURE_UNSAFE("cuSurfObjectDestroy");
   return destroy_object("cuSurfObjectDestroy", obj);
 }
 
-VGPU_EXPORT CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D* p) {
+static CUresult cuMemcpy3D_v2_impl(const CUDA_MEMCPY3D* p);
+VGPU_EXPORT CUresult cuMemcpy3D_v2(const CUDA_MEMCPY3D* p) { return traced("cuMemcpy3D_v2", cuMemcpy3D_v2_impl, p); }
+static CUresult cuMemcpy3D_v2_impl(const CUDA_MEMCPY3D* p) {
   return api("cuMemcpy3D", true, false, [&](ShimState& s) {
     if (!p) return CUDA_ERROR_INVALID_VALUE;
     return copy3d(s, *p);
   });
 }
-VGPU_EXPORT CUresult cuMemcpy3D(const CUDA_MEMCPY3D* p) { return cuMemcpy3D_v2(p); }
-VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream) { return cuMemcpy3D_v2(p); }
-VGPU_EXPORT CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* p, CUstream st) { return cuMemcpy3DAsync_v2(p, st); }
-VGPU_EXPORT CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D* c) {
+static CUresult cuMemcpy3D_impl(const CUDA_MEMCPY3D* p);
+VGPU_EXPORT CUresult cuMemcpy3D(const CUDA_MEMCPY3D* p) { return traced("cuMemcpy3D", cuMemcpy3D_impl, p); }
+static CUresult cuMemcpy3D_impl(const CUDA_MEMCPY3D* p) { return cuMemcpy3D_v2(p); }
+static CUresult cuMemcpy3DAsync_v2_impl(const CUDA_MEMCPY3D* p, CUstream st);
+VGPU_EXPORT CUresult cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* p, CUstream st) { return traced("cuMemcpy3DAsync_v2", cuMemcpy3DAsync_v2_impl, p, st); }
+static CUresult cuMemcpy3DAsync_v2_impl(const CUDA_MEMCPY3D* p, CUstream st) {
+  if (p && stream_capturing(st)) {   // the descriptor is the caller's to reuse: the node keeps its own copy
+    const CUDA_MEMCPY3D copy = *p;
+    VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy3D_v2(&copy));
+  }
+  return cuMemcpy3D_v2(p);
+}
+static CUresult cuMemcpy3DAsync_impl(const CUDA_MEMCPY3D* p, CUstream st);
+VGPU_EXPORT CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* p, CUstream st) { return traced("cuMemcpy3DAsync", cuMemcpy3DAsync_impl, p, st); }
+static CUresult cuMemcpy3DAsync_impl(const CUDA_MEMCPY3D* p, CUstream st) { return cuMemcpy3DAsync_v2(p, st); }
+static CUresult cuMemcpy2D_v2_impl(const CUDA_MEMCPY2D* c);
+VGPU_EXPORT CUresult cuMemcpy2D_v2(const CUDA_MEMCPY2D* c) { return traced("cuMemcpy2D_v2", cuMemcpy2D_v2_impl, c); }
+static CUresult cuMemcpy2D_v2_impl(const CUDA_MEMCPY2D* c) {
   return api("cuMemcpy2D", true, false, [&](ShimState& s) {
     if (!c) return CUDA_ERROR_INVALID_VALUE;
     return copy3d(s, as3d(*c));
   });
 }
-VGPU_EXPORT CUresult cuMemcpy2D(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
-VGPU_EXPORT CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
-VGPU_EXPORT CUresult cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
-VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream) { return cuMemcpy2D_v2(c); }
-VGPU_EXPORT CUresult cuMemcpy2DAsync(const CUDA_MEMCPY2D* c, CUstream st) { return cuMemcpy2DAsync_v2(c, st); }
+static CUresult cuMemcpy2D_impl(const CUDA_MEMCPY2D* c);
+VGPU_EXPORT CUresult cuMemcpy2D(const CUDA_MEMCPY2D* c) { return traced("cuMemcpy2D", cuMemcpy2D_impl, c); }
+static CUresult cuMemcpy2D_impl(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+static CUresult cuMemcpy2DUnaligned_v2_impl(const CUDA_MEMCPY2D* c);
+VGPU_EXPORT CUresult cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D* c) { return traced("cuMemcpy2DUnaligned_v2", cuMemcpy2DUnaligned_v2_impl, c); }
+static CUresult cuMemcpy2DUnaligned_v2_impl(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+static CUresult cuMemcpy2DUnaligned_impl(const CUDA_MEMCPY2D* c);
+VGPU_EXPORT CUresult cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* c) { return traced("cuMemcpy2DUnaligned", cuMemcpy2DUnaligned_impl, c); }
+static CUresult cuMemcpy2DUnaligned_impl(const CUDA_MEMCPY2D* c) { return cuMemcpy2D_v2(c); }
+static CUresult cuMemcpy2DAsync_v2_impl(const CUDA_MEMCPY2D* c, CUstream st);
+VGPU_EXPORT CUresult cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* c, CUstream st) { return traced("cuMemcpy2DAsync_v2", cuMemcpy2DAsync_v2_impl, c, st); }
+static CUresult cuMemcpy2DAsync_v2_impl(const CUDA_MEMCPY2D* c, CUstream st) {
+  if (c && stream_capturing(st)) {
+    const CUDA_MEMCPY2D copy = *c;
+    VGPU_CAPTURE_NODE(st, kNodeMemcpy, cuMemcpy2D_v2(&copy));
+  }
+  return cuMemcpy2D_v2(c);
+}
+static CUresult cuMemcpy2DAsync_impl(const CUDA_MEMCPY2D* c, CUstream st);
+VGPU_EXPORT CUresult cuMemcpy2DAsync(const CUDA_MEMCPY2D* c, CUstream st) { return traced("cuMemcpy2DAsync", cuMemcpy2DAsync_impl, c, st); }
+static CUresult cuMemcpy2DAsync_impl(const CUDA_MEMCPY2D* c, CUstream st) { return cuMemcpy2DAsync_v2(c, st); }
 
 // ---- stream-ordered memory pools ----
 //
@@ -4191,8 +4736,27 @@ constexpr int kMemAccessNone = 0, kMemAccessRead = 1, kMemAccessReadWrite = 3;  
 
 }  // namespace
 
+// On a capturing stream an allocation is a node the graph owns (the runtime's, which does the book-keeping
+// of graph memory), and a free the node that ends it, and only of such an allocation (anything else is
+// CUDA_ERROR_INVALID_VALUE, as on the card). The pool the call names plays no part in a capture. On a
+// stream that is not capturing, while another capture is going on, the call is refused like any allocator.
+static bool capture_alloc(CUdeviceptr* dptr, size_t bytesize, CUstream st, CUresult* rc) {
+  if (!stream_capturing(st)) return false;
+  using Fn = int (*)(void**, size_t, void*);
+  static const Fn fn = runtime_fn<Fn>("cudaMallocAsync");
+  if (!fn || !dptr) return false;
+  void* p = nullptr;
+  *rc = static_cast<CUresult>(fn(&p, bytesize, st));
+  if (*rc == CUDA_SUCCESS) *dptr = reinterpret_cast<CUdeviceptr>(p);
+  return true;
+}
+
 // Zero bytes succeed, as the card's do, with a null pointer.
-VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream) {
+static CUresult cuMemAllocAsync_impl(CUdeviceptr* dptr, size_t bytesize, CUstream);
+VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream a2) { return traced("cuMemAllocAsync", cuMemAllocAsync_impl, dptr, bytesize, a2); }
+static CUresult cuMemAllocAsync_impl(CUdeviceptr* dptr, size_t bytesize, CUstream st) {
+  if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
+  VGPU_CAPTURE_UNSAFE("cuMemAllocAsync");
   return api("cuMemAllocAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     if (bytesize == 0) {
@@ -4203,7 +4767,11 @@ VGPU_EXPORT CUresult cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstrea
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream) {
+static CUresult cuMemAllocFromPoolAsync_impl(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream);
+VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream a3) { return traced("cuMemAllocFromPoolAsync", cuMemAllocFromPoolAsync_impl, dptr, bytesize, pool, a3); }
+static CUresult cuMemAllocFromPoolAsync_impl(CUdeviceptr* dptr, size_t bytesize, void* pool, CUstream st) {
+  if (CUresult rc; capture_alloc(dptr, bytesize, st, &rc)) return rc;
+  VGPU_CAPTURE_UNSAFE("cuMemAllocFromPoolAsync");
   return api("cuMemAllocFromPoolAsync", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     PoolRec* p = pool_from_handle(s, pool);
@@ -4218,7 +4786,15 @@ VGPU_EXPORT CUresult cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize,
 }
 // A pointer from a pool goes back to it; any other device allocation is freed
 // as cuMemFree frees it.
-VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
+static CUresult cuMemFreeAsync_impl(CUdeviceptr dptr, CUstream);
+VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream a1) { return traced("cuMemFreeAsync", cuMemFreeAsync_impl, dptr, a1); }
+static CUresult cuMemFreeAsync_impl(CUdeviceptr dptr, CUstream st) {
+  if (stream_capturing(st)) {
+    using Fn = int (*)(void*, void*);
+    static const Fn fn = runtime_fn<Fn>("cudaFreeAsync");
+    if (fn) return static_cast<CUresult>(fn(reinterpret_cast<void*>(dptr), st));
+  }
+  VGPU_CAPTURE_UNSAFE("cuMemFreeAsync");
   if (dptr == 0) return CUDA_SUCCESS;
   bool pooled = false;
   const CUresult r = api("cuMemFreeAsync", true, false, [&](ShimState& s) {
@@ -4231,7 +4807,9 @@ VGPU_EXPORT CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream) {
   return pooled || r != CUDA_SUCCESS ? r : cuMemFree_v2_impl(dptr);
 }
 
-VGPU_EXPORT CUresult cuDeviceGetDefaultMemPool(void** pool, CUdevice dev) {
+static CUresult cuDeviceGetDefaultMemPool_impl(void** pool, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetDefaultMemPool(void** pool, CUdevice dev) { return traced("cuDeviceGetDefaultMemPool", cuDeviceGetDefaultMemPool_impl, pool, dev); }
+static CUresult cuDeviceGetDefaultMemPool_impl(void** pool, CUdevice dev) {
   return api("cuDeviceGetDefaultMemPool", true, false, [&](ShimState& s) {
     if (!pool) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -4239,7 +4817,9 @@ VGPU_EXPORT CUresult cuDeviceGetDefaultMemPool(void** pool, CUdevice dev) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDeviceGetMemPool(void** pool, CUdevice dev) {
+static CUresult cuDeviceGetMemPool_impl(void** pool, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetMemPool(void** pool, CUdevice dev) { return traced("cuDeviceGetMemPool", cuDeviceGetMemPool_impl, pool, dev); }
+static CUresult cuDeviceGetMemPool_impl(void** pool, CUdevice dev) {
   return api("cuDeviceGetMemPool", true, false, [&](ShimState& s) {
     if (!pool) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -4247,7 +4827,9 @@ VGPU_EXPORT CUresult cuDeviceGetMemPool(void** pool, CUdevice dev) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDeviceSetMemPool(CUdevice dev, void* pool) {
+static CUresult cuDeviceSetMemPool_impl(CUdevice dev, void* pool);
+VGPU_EXPORT CUresult cuDeviceSetMemPool(CUdevice dev, void* pool) { return traced("cuDeviceSetMemPool", cuDeviceSetMemPool_impl, dev, pool); }
+static CUresult cuDeviceSetMemPool_impl(CUdevice dev, void* pool) {
   return api("cuDeviceSetMemPool", true, false, [&](ShimState& s) {
     check_device(s, dev);
     PoolRec* p = pool_from_handle(s, pool);
@@ -4258,7 +4840,10 @@ VGPU_EXPORT CUresult cuDeviceSetMemPool(CUdevice dev, void* pool) {
   });
 }
 
-VGPU_EXPORT CUresult cuMemPoolCreate(void** pool, const void* poolProps) {
+static CUresult cuMemPoolCreate_impl(void** pool, const void* poolProps);
+VGPU_EXPORT CUresult cuMemPoolCreate(void** pool, const void* poolProps) { return traced("cuMemPoolCreate", cuMemPoolCreate_impl, pool, poolProps); }
+static CUresult cuMemPoolCreate_impl(void** pool, const void* poolProps) {
+  VGPU_CAPTURE_UNSAFE("cuMemPoolCreate");
   return api("cuMemPoolCreate", true, false, [&](ShimState& s) {
     if (!pool || !poolProps) return CUDA_ERROR_INVALID_VALUE;
     const auto* props = static_cast<const MemPoolPropsABI*>(poolProps);
@@ -4284,7 +4869,10 @@ VGPU_EXPORT CUresult cuMemPoolCreate(void** pool, const void* poolProps) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemPoolDestroy(void* pool) {
+static CUresult cuMemPoolDestroy_impl(void* pool);
+VGPU_EXPORT CUresult cuMemPoolDestroy(void* pool) { return traced("cuMemPoolDestroy", cuMemPoolDestroy_impl, pool); }
+static CUresult cuMemPoolDestroy_impl(void* pool) {
+  VGPU_CAPTURE_UNSAFE("cuMemPoolDestroy");
   return api("cuMemPoolDestroy", true, false, [&](ShimState& s) {
     PoolRec* p = pool_from_handle(s, pool);
     if (!p || p->is_default) return CUDA_ERROR_INVALID_VALUE;   // the default pool is the device's
@@ -4302,7 +4890,10 @@ VGPU_EXPORT CUresult cuMemPoolDestroy(void* pool) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemPoolTrimTo(void* pool, size_t minBytesToKeep) {
+static CUresult cuMemPoolTrimTo_impl(void* pool, size_t minBytesToKeep);
+VGPU_EXPORT CUresult cuMemPoolTrimTo(void* pool, size_t minBytesToKeep) { return traced("cuMemPoolTrimTo", cuMemPoolTrimTo_impl, pool, minBytesToKeep); }
+static CUresult cuMemPoolTrimTo_impl(void* pool, size_t minBytesToKeep) {
+  VGPU_CAPTURE_UNSAFE("cuMemPoolTrimTo");
   return api("cuMemPoolTrimTo", true, false, [&](ShimState& s) {
     PoolRec* p = pool_from_handle(s, pool);
     if (!p) return CUDA_ERROR_INVALID_VALUE;
@@ -4317,7 +4908,10 @@ constexpr int kPoolReuseFollowEventDeps = 1, kPoolReuseAllowOpportunistic = 2, k
               kPoolReleaseThreshold = 4, kPoolReservedCurrent = 5, kPoolReservedHigh = 6, kPoolUsedCurrent = 7,
               kPoolUsedHigh = 8;
 }  // namespace
-VGPU_EXPORT CUresult cuMemPoolSetAttribute(void* pool, int attr, void* value) {
+static CUresult cuMemPoolSetAttribute_impl(void* pool, int attr, void* value);
+VGPU_EXPORT CUresult cuMemPoolSetAttribute(void* pool, int attr, void* value) { return traced("cuMemPoolSetAttribute", cuMemPoolSetAttribute_impl, pool, attr, value); }
+static CUresult cuMemPoolSetAttribute_impl(void* pool, int attr, void* value) {
+  VGPU_CAPTURE_UNSAFE("cuMemPoolSetAttribute");
   return api("cuMemPoolSetAttribute", true, false, [&](ShimState& s) {
     PoolRec* p = pool_from_handle(s, pool);
     if (!p || !value) return CUDA_ERROR_INVALID_VALUE;
@@ -4344,7 +4938,9 @@ VGPU_EXPORT CUresult cuMemPoolSetAttribute(void* pool, int attr, void* value) {
     }
   });
 }
-VGPU_EXPORT CUresult cuMemPoolGetAttribute(void* pool, int attr, void* value) {
+static CUresult cuMemPoolGetAttribute_impl(void* pool, int attr, void* value);
+VGPU_EXPORT CUresult cuMemPoolGetAttribute(void* pool, int attr, void* value) { return traced("cuMemPoolGetAttribute", cuMemPoolGetAttribute_impl, pool, attr, value); }
+static CUresult cuMemPoolGetAttribute_impl(void* pool, int attr, void* value) {
   return api("cuMemPoolGetAttribute", true, false, [&](ShimState& s) {
     PoolRec* p = pool_from_handle(s, pool);
     if (!p || !value) return CUDA_ERROR_INVALID_VALUE;
@@ -4370,7 +4966,10 @@ VGPU_EXPORT CUresult cuMemPoolGetAttribute(void* pool, int attr, void* value) {
 // on, read and write, and no other; a request can widen that to a peer or take
 // it away. Nothing enforces it -- every kernel here reaches every device's
 // memory -- so it is state a program reads back, not a fence.
-VGPU_EXPORT CUresult cuMemPoolSetAccess(void* pool, const void* map, size_t count) {
+static CUresult cuMemPoolSetAccess_impl(void* pool, const void* map, size_t count);
+VGPU_EXPORT CUresult cuMemPoolSetAccess(void* pool, const void* map, size_t count) { return traced("cuMemPoolSetAccess", cuMemPoolSetAccess_impl, pool, map, count); }
+static CUresult cuMemPoolSetAccess_impl(void* pool, const void* map, size_t count) {
+  VGPU_CAPTURE_UNSAFE("cuMemPoolSetAccess");
   return api("cuMemPoolSetAccess", true, false, [&](ShimState& s) {
     PoolRec* p = pool_from_handle(s, pool);
     if (!p || (!map && count)) return CUDA_ERROR_INVALID_VALUE;
@@ -4387,7 +4986,9 @@ VGPU_EXPORT CUresult cuMemPoolSetAccess(void* pool, const void* map, size_t coun
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemPoolGetAccess(int* flags, void* pool, void* location) {
+static CUresult cuMemPoolGetAccess_impl(int* flags, void* pool, void* location);
+VGPU_EXPORT CUresult cuMemPoolGetAccess(int* flags, void* pool, void* location) { return traced("cuMemPoolGetAccess", cuMemPoolGetAccess_impl, flags, pool, location); }
+static CUresult cuMemPoolGetAccess_impl(int* flags, void* pool, void* location) {
   return api("cuMemPoolGetAccess", true, false, [&](ShimState& s) {
     PoolRec* p = pool_from_handle(s, pool);
     if (!p || !flags || !location) return CUDA_ERROR_INVALID_VALUE;
@@ -4408,19 +5009,27 @@ VGPU_EXPORT CUresult cuMemPoolGetAccess(int* flags, void* pool, void* location) 
 // whatever is passed; an import checks its pointers, flags (0 only) and type first -- the file descriptor, Win32 and
 // fabric types the device does not support are CUDA_ERROR_NOT_SUPPORTED, any other type
 // CUDA_ERROR_INVALID_VALUE; the pointer calls are CUDA_ERROR_INVALID_VALUE.
-VGPU_EXPORT CUresult cuMemPoolExportToShareableHandle(void*, void*, int, unsigned long long) {
+static CUresult cuMemPoolExportToShareableHandle_impl(void*, void*, int, unsigned long long);
+VGPU_EXPORT CUresult cuMemPoolExportToShareableHandle(void* a0, void* a1, int a2, unsigned long long a3) { return traced("cuMemPoolExportToShareableHandle", cuMemPoolExportToShareableHandle_impl, a0, a1, a2, a3); }
+static CUresult cuMemPoolExportToShareableHandle_impl(void*, void*, int, unsigned long long) {
   return api("cuMemPoolExportToShareableHandle", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
-VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void** pool, void* handle, int type, unsigned long long flags) {
+static CUresult cuMemPoolImportFromShareableHandle_impl(void** pool, void* handle, int type, unsigned long long flags);
+VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void** pool, void* handle, int type, unsigned long long flags) { return traced("cuMemPoolImportFromShareableHandle", cuMemPoolImportFromShareableHandle_impl, pool, handle, type, flags); }
+static CUresult cuMemPoolImportFromShareableHandle_impl(void** pool, void* handle, int type, unsigned long long flags) {
   return api("cuMemPoolImportFromShareableHandle", true, false, [&](ShimState&) {
     if (!pool || !handle || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     return type == 1 || type == 2 || type == 8 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
   });
 }
-VGPU_EXPORT CUresult cuMemPoolExportPointer(void*, CUdeviceptr) {
+static CUresult cuMemPoolExportPointer_impl(void*, CUdeviceptr);
+VGPU_EXPORT CUresult cuMemPoolExportPointer(void* a0, CUdeviceptr a1) { return traced("cuMemPoolExportPointer", cuMemPoolExportPointer_impl, a0, a1); }
+static CUresult cuMemPoolExportPointer_impl(void*, CUdeviceptr) {
   return api("cuMemPoolExportPointer", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
-VGPU_EXPORT CUresult cuMemPoolImportPointer(CUdeviceptr*, void*, void*) {
+static CUresult cuMemPoolImportPointer_impl(CUdeviceptr*, void*, void*);
+VGPU_EXPORT CUresult cuMemPoolImportPointer(CUdeviceptr* a0, void* a1, void* a2) { return traced("cuMemPoolImportPointer", cuMemPoolImportPointer_impl, a0, a1, a2); }
+static CUresult cuMemPoolImportPointer_impl(CUdeviceptr*, void*, void*) {
   return api("cuMemPoolImportPointer", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
 
@@ -4429,8 +5038,11 @@ VGPU_EXPORT CUresult cuMemPoolImportPointer(CUdeviceptr*, void*, void*) {
 
 // Rows padded to 512 bytes; the element size must be 4, 8 or 16 and neither
 // dimension 0.
-VGPU_EXPORT CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
+static CUresult cuMemAllocPitch_v2_impl(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height, unsigned int elem);
+VGPU_EXPORT CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height, unsigned int elem) { return traced("cuMemAllocPitch_v2", cuMemAllocPitch_v2_impl, dptr, pitch, width, height, elem); }
+static CUresult cuMemAllocPitch_v2_impl(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
                                         unsigned int elem) {
+  VGPU_CAPTURE_UNSAFE("cuMemAllocPitch_v2");
   return api("cuMemAllocPitch", true, false, [&](ShimState& s) {
     if (!dptr || !pitch || width == 0 || height == 0 || (elem != 4 && elem != 8 && elem != 16))
       return CUDA_ERROR_INVALID_VALUE;
@@ -4439,15 +5051,20 @@ VGPU_EXPORT CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pitch, size_t
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuMemAllocPitch(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
+static CUresult cuMemAllocPitch_impl(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height, unsigned int elem);
+VGPU_EXPORT CUresult cuMemAllocPitch(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height, unsigned int elem) { return traced("cuMemAllocPitch", cuMemAllocPitch_impl, dptr, pitch, width, height, elem); }
+static CUresult cuMemAllocPitch_impl(CUdeviceptr* dptr, size_t* pitch, size_t width, size_t height,
                                      unsigned int elem) {
+  VGPU_CAPTURE_UNSAFE("cuMemAllocPitch");
   return cuMemAllocPitch_v2(dptr, pitch, width, height, elem);
 }
 
 // A module's __device__ variable: its address and size, either of which may be
 // omitted but not both. A name the module does not declare is NOT_FOUND; a
 // kernel's name is INVALID_VALUE, as on the card.
-VGPU_EXPORT CUresult cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
+static CUresult cuModuleGetGlobal_v2_impl(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name);
+VGPU_EXPORT CUresult cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) { return traced("cuModuleGetGlobal_v2", cuModuleGetGlobal_v2_impl, dptr, bytes, hmod, name); }
+static CUresult cuModuleGetGlobal_v2_impl(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
   return api("cuModuleGetGlobal", true, false, [&](ShimState& s) {
     if ((!dptr && !bytes) || !name) return CUDA_ERROR_INVALID_VALUE;
     auto it = s.modules.find(reinterpret_cast<uintptr_t>(hmod));
@@ -4461,20 +5078,27 @@ VGPU_EXPORT CUresult cuModuleGetGlobal_v2(CUdeviceptr* dptr, size_t* bytes, CUmo
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
+static CUresult cuModuleGetGlobal_impl(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name);
+VGPU_EXPORT CUresult cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) { return traced("cuModuleGetGlobal", cuModuleGetGlobal_impl, dptr, bytes, hmod, name); }
+static CUresult cuModuleGetGlobal_impl(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name) {
   return cuModuleGetGlobal_v2(dptr, bytes, hmod, name);
 }
 
 // The L1/shared split is a preference the simulator has no cache to apply to;
 // it is kept and read back, as the card reads it back.
-VGPU_EXPORT CUresult cuCtxSetCacheConfig(int config) {
+static CUresult cuCtxSetCacheConfig_impl(int config);
+VGPU_EXPORT CUresult cuCtxSetCacheConfig(int config) { return traced("cuCtxSetCacheConfig", cuCtxSetCacheConfig_impl, config); }
+static CUresult cuCtxSetCacheConfig_impl(int config) {
+  VGPU_CAPTURE_UNSAFE("cuCtxSetCacheConfig");
   return api("cuCtxSetCacheConfig", true, false, [&](ShimState& s) {
     if (config < 0 || config > 3) return CUDA_ERROR_INVALID_VALUE;
     s.cache_config = config;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxGetCacheConfig(int* config) {
+static CUresult cuCtxGetCacheConfig_impl(int* config);
+VGPU_EXPORT CUresult cuCtxGetCacheConfig(int* config) { return traced("cuCtxGetCacheConfig", cuCtxGetCacheConfig_impl, config); }
+static CUresult cuCtxGetCacheConfig_impl(int* config) {
   return api("cuCtxGetCacheConfig", true, false, [&](ShimState& s) {
     if (!config) return CUDA_ERROR_INVALID_VALUE;
     *config = s.cache_config;
@@ -4484,25 +5108,35 @@ VGPU_EXPORT CUresult cuCtxGetCacheConfig(int* config) {
 // Shared memory banks are four bytes wide on every GPU this simulates: a
 // configuration is accepted and has no effect, and the answer stays
 // CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE, as the card's does.
-VGPU_EXPORT CUresult cuCtxSetSharedMemConfig(int config) {
+static CUresult cuCtxSetSharedMemConfig_impl(int config);
+VGPU_EXPORT CUresult cuCtxSetSharedMemConfig(int config) { return traced("cuCtxSetSharedMemConfig", cuCtxSetSharedMemConfig_impl, config); }
+static CUresult cuCtxSetSharedMemConfig_impl(int config) {
   return api("cuCtxSetSharedMemConfig", true, false, [&](ShimState&) {
     return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
   });
 }
-VGPU_EXPORT CUresult cuCtxGetSharedMemConfig(int* config) {
+static CUresult cuCtxGetSharedMemConfig_impl(int* config);
+VGPU_EXPORT CUresult cuCtxGetSharedMemConfig(int* config) { return traced("cuCtxGetSharedMemConfig", cuCtxGetSharedMemConfig_impl, config); }
+static CUresult cuCtxGetSharedMemConfig_impl(int* config) {
   return api("cuCtxGetSharedMemConfig", true, false, [&](ShimState&) {
     if (!config) return CUDA_ERROR_INVALID_VALUE;
     *config = 1;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuFuncSetSharedMemConfig(CUfunction, int config) {
+static CUresult cuFuncSetSharedMemConfig_impl(CUfunction, int config);
+VGPU_EXPORT CUresult cuFuncSetSharedMemConfig(CUfunction a0, int config) { return traced("cuFuncSetSharedMemConfig", cuFuncSetSharedMemConfig_impl, a0, config); }
+static CUresult cuFuncSetSharedMemConfig_impl(CUfunction, int config) {
   return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
 // A stream callback runs at once: the stream is synchronous, so the work
 // queued before it is done. It is told the stream succeeded. Flags must be 0.
-VGPU_EXPORT CUresult cuStreamAddCallback(CUstream stream, CUstreamCallback cb, void* user, unsigned int flags) {
+static CUresult cuStreamAddCallback_impl(CUstream stream, CUstreamCallback cb, void* user, unsigned int flags);
+VGPU_EXPORT CUresult cuStreamAddCallback(CUstream stream, CUstreamCallback cb, void* user, unsigned int flags) { return traced("cuStreamAddCallback", cuStreamAddCallback_impl, stream, cb, user, flags); }
+static CUresult cuStreamAddCallback_impl(CUstream stream, CUstreamCallback cb, void* user, unsigned int flags) {
+  // Measured: refused on a capturing stream, which the refusal leaves capturing.
+  if (stream_capturing(stream)) return kCaptureUnsupported;
   if (!cb || flags != 0) return CUDA_ERROR_INVALID_VALUE;
   cb(stream, CUDA_SUCCESS, user);
   return CUDA_SUCCESS;
@@ -4516,6 +5150,7 @@ static CUresult stream_create(CUstream* s_out, unsigned int flags, int priority)
     if (!s_out) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagStream);
     s.streams.insert(h);
+    s.stream_device[h] = current_device(s);
     *s_out = reinterpret_cast<CUstream>(h);
     // A priority outside the range is clamped to it, as the card does, and read back by
     // cuStreamGetPriority; streams run in order, so it changes nothing else.
@@ -4542,6 +5177,7 @@ static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
     if (s.streams.count(h))
       vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting, h, profiled_device(s));
     s.streams.erase(h);
+    s.stream_device.erase(h);
     s.stream_priority.erase(h);
     return CUDA_SUCCESS;
   });
@@ -4549,7 +5185,9 @@ static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
 VGPU_EXPORT CUresult cuStreamDestroy_v2(CUstream stream) {
   return traced("cuStreamDestroy_v2", cuStreamDestroy_v2_impl, stream);
 }
-VGPU_EXPORT CUresult cuStreamDestroy(CUstream stream) { return cuStreamDestroy_v2_impl(stream); }
+static CUresult cuStreamDestroy_impl(CUstream stream);
+VGPU_EXPORT CUresult cuStreamDestroy(CUstream stream) { return traced("cuStreamDestroy", cuStreamDestroy_impl, stream); }
+static CUresult cuStreamDestroy_impl(CUstream stream) { return cuStreamDestroy_v2_impl(stream); }
 // A wait that returned is recorded for a profiler, and the stream and context
 // waits are told to a subscriber (vgpu/profiling.hpp).
 static CUresult cuStreamSynchronize_impl(CUstream stream) {
@@ -4562,12 +5200,17 @@ static CUresult cuStreamSynchronize_impl(CUstream stream) {
   });
 }
 VGPU_EXPORT CUresult cuStreamSynchronize(CUstream stream) {
+  if (capture_forbidden(stream, "cuStreamSynchronize")) return kCaptureUnsupported;
+  VGPU_CAPTURE_UNSAFE("cuStreamSynchronize");
   return traced("cuStreamSynchronize", cuStreamSynchronize_impl, stream);
 }
 // Streams are synchronous, so everything queued before the function has run
 // by the time it is called, which is all a host function is promised.
-VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
+static CUresult cuLaunchHostFunc_impl(CUstream, CUhostFn fn, void* user);
+VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream a0, CUhostFn fn, void* user) { return traced("cuLaunchHostFunc", cuLaunchHostFunc_impl, a0, fn, user); }
+static CUresult cuLaunchHostFunc_impl(CUstream st, CUhostFn fn, void* user) {
   if (!fn) return CUDA_ERROR_INVALID_VALUE;
+  VGPU_CAPTURE_NODE(st, kNodeHost, fn(user));
   fn(user);
   return CUDA_SUCCESS;
 }
@@ -4585,7 +5228,11 @@ static CUresult cuStreamQuery_impl(CUstream stream) {
                                       profiled_device());
   return r;
 }
-VGPU_EXPORT CUresult cuStreamQuery(CUstream stream) { return traced("cuStreamQuery", cuStreamQuery_impl, stream); }
+VGPU_EXPORT CUresult cuStreamQuery(CUstream stream) {
+  if (capture_forbidden(stream, "cuStreamQuery")) return kCaptureUnsupported;
+  VGPU_CAPTURE_UNSAFE("cuStreamQuery");
+  return traced("cuStreamQuery", cuStreamQuery_impl, stream);
+}
 static CUresult cuStreamWaitEvent_impl(CUstream stream, void* event, unsigned int) {
   const CUresult r = dead_context();
   if (r == CUDA_SUCCESS)
@@ -4594,10 +5241,38 @@ static CUresult cuStreamWaitEvent_impl(CUstream stream, void* event, unsigned in
                                       profiled_device());
   return r;
 }
+// In a capture a wait is how streams are joined (a fork brings the waiting stream into the capture), and it
+// is the runtime's: it knows where each event was recorded. A driver event first used in a capture stands
+// for a runtime event; one never recorded is no-op to wait for, and one recorded outside the capture is
+// CUDA_ERROR_STREAM_CAPTURE_ISOLATION (both measured).
 VGPU_EXPORT CUresult cuStreamWaitEvent(CUstream stream, void* event, unsigned int flags) {
+  using Wait = int (*)(void*, void*, unsigned);
+  static const Wait wait = runtime_fn<Wait>("cudaStreamWaitEvent");
+  if (wait && event) {
+    bool recorded = true, mine = false;
+    {
+      ShimState& s = state();
+      std::lock_guard<std::recursive_mutex> lock(s.mu);
+      auto it = s.events.find(reinterpret_cast<uintptr_t>(event));
+      mine = it != s.events.end();
+      recorded = !mine || it->second.recorded;
+    }
+    void* shadow = shadow_event(static_cast<CUevent>(event), false);
+    const bool capturing = stream_capturing(stream);
+    if (capturing && mine && !shadow && !recorded) return traced("cuStreamWaitEvent", cuStreamWaitEvent_impl, stream, event, flags);
+    if (shadow || (capturing && mine)) {
+      if (!shadow) shadow = shadow_event(static_cast<CUevent>(event), true);
+      if (shadow) {
+        const int rc = wait(stream, shadow, flags);
+        if (rc) return static_cast<CUresult>(rc);
+      }
+    }
+  }
   return traced("cuStreamWaitEvent", cuStreamWaitEvent_impl, stream, event, flags);
 }
-VGPU_EXPORT CUresult cuStreamGetPriority(CUstream stream, int* p) {
+static CUresult cuStreamGetPriority_impl(CUstream stream, int* p);
+VGPU_EXPORT CUresult cuStreamGetPriority(CUstream stream, int* p) { return traced("cuStreamGetPriority", cuStreamGetPriority_impl, stream, p); }
+static CUresult cuStreamGetPriority_impl(CUstream stream, int* p) {
   if (!p) return CUDA_SUCCESS;
   ShimState& s = state();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
@@ -4605,7 +5280,9 @@ VGPU_EXPORT CUresult cuStreamGetPriority(CUstream stream, int* p) {
   *p = it == s.stream_priority.end() ? 0 : it->second;
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamGetFlags(CUstream, unsigned int* f) {
+static CUresult cuStreamGetFlags_impl(CUstream, unsigned int* f);
+VGPU_EXPORT CUresult cuStreamGetFlags(CUstream a0, unsigned int* f) { return traced("cuStreamGetFlags", cuStreamGetFlags_impl, a0, f); }
+static CUresult cuStreamGetFlags_impl(CUstream, unsigned int* f) {
   if (f) *f = 0;
   return CUDA_SUCCESS;
 }
@@ -4614,7 +5291,9 @@ VGPU_EXPORT CUresult cuStreamGetFlags(CUstream, unsigned int* f) {
 // the legacy default stream (NULL) answers the current context as well. With
 // no context current the driver answers CUDA_ERROR_INVALID_CONTEXT and leaves
 // the output alone. Kokkos' CUDA backend asks for it when it wraps a stream.
-VGPU_EXPORT CUresult cuStreamGetCtx(CUstream, CUcontext* pctx) {
+static CUresult cuStreamGetCtx_impl(CUstream, CUcontext* pctx);
+VGPU_EXPORT CUresult cuStreamGetCtx(CUstream a0, CUcontext* pctx) { return traced("cuStreamGetCtx", cuStreamGetCtx_impl, a0, pctx); }
+static CUresult cuStreamGetCtx_impl(CUstream, CUcontext* pctx) {
   return api("cuStreamGetCtx", true, false, [&](ShimState&) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
@@ -4625,32 +5304,16 @@ VGPU_EXPORT CUresult cuStreamGetCtx(CUstream, CUcontext* pctx) {
 // The CUDA 12.5 form also reports a green context when the stream belongs to
 // one. The simulator has none, so for every stream the answer is NULL, as an
 // RTX 3080 Ti's driver answers for an ordinary stream.
-VGPU_EXPORT CUresult cuStreamGetCtx_v2(CUstream stream, CUcontext* pctx, CUgreenCtx* pgreen) {
+static CUresult cuStreamGetCtx_v2_impl(CUstream stream, CUcontext* pctx, CUgreenCtx* pgreen);
+VGPU_EXPORT CUresult cuStreamGetCtx_v2(CUstream stream, CUcontext* pctx, CUgreenCtx* pgreen) { return traced("cuStreamGetCtx_v2", cuStreamGetCtx_v2_impl, stream, pctx, pgreen); }
+static CUresult cuStreamGetCtx_v2_impl(CUstream stream, CUcontext* pctx, CUgreenCtx* pgreen) {
   const CUresult r = cuStreamGetCtx(stream, pctx);
   if (r == CUDA_SUCCESS && pgreen) *pgreen = nullptr;
   return r;
 }
-// Capture is the runtime's (cudaStreamBeginCapture); the driver asks it by name,
-// so a program that never loaded libcudart has nothing capturing.
-VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream stream, int* status, unsigned long long* id,
-                                               void* graph, const void** deps, size_t* ndeps) {
-  using Fn = int (*)(void*, int*, unsigned long long*, void*, const void**, size_t*);
-  auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamGetCaptureInfo_v2"));
-  if (!fn) fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamGetCaptureInfo"));
-  if (fn) {
-    int st = 0;
-    unsigned long long cid = 0;
-    if (fn(stream, &st, &cid, graph, deps, ndeps) == 0) {
-      if (status) *status = st;   // the runtime's cudaStreamCaptureStatus has the driver's values
-      if (id) *id = cid;
-      return CUDA_SUCCESS;
-    }
-  }
-  if (status) *status = 0;  // CU_STREAM_CAPTURE_STATUS_NONE
-  if (id) *id = 0;
-  return CUDA_SUCCESS;
-}
-VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream stream, int* status) {
+static CUresult cuStreamIsCapturing_impl(CUstream stream, int* status);
+VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream stream, int* status) { return traced("cuStreamIsCapturing", cuStreamIsCapturing_impl, stream, status); }
+static CUresult cuStreamIsCapturing_impl(CUstream stream, int* status) {
   using Fn = int (*)(void*, int*);
   auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamIsCapturing"));
   int st = 0;
@@ -4691,8 +5354,34 @@ static CUresult cuEventRecord_impl(void* ev, CUstream stream) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream a1) {
-  return traced("cuEventRecord", cuEventRecord_impl, ev, a1);
+// Recorded on a capturing stream, an event is where the capture has got to (a runtime event stands for it
+// -- see driver_capture.inc), and with CU_EVENT_RECORD_EXTERNAL a node of its own. Recorded outside a
+// capture, a driver event that has such a stand-in records it too, which makes it an ordinary event again.
+static CUresult event_record(void* ev, CUstream stream, unsigned int flags) {
+  using Rec = int (*)(void*, void*, unsigned);
+  static const Rec rec = runtime_fn<Rec>("cudaEventRecordWithFlags");
+  if (rec && ev) {
+    bool mine = false;
+    {
+      ShimState& s = state();
+      std::lock_guard<std::recursive_mutex> lock(s.mu);
+      mine = s.events.count(reinterpret_cast<uintptr_t>(ev)) != 0;
+    }
+    if (mine) {
+      void* shadow = shadow_event(static_cast<CUevent>(ev), stream_capturing(stream));
+      if (shadow) {
+        const int rc = rec(shadow, stream, flags);
+        if (rc) return static_cast<CUresult>(rc);
+        if (stream_capturing(stream)) return CUDA_SUCCESS;
+      }
+    }
+  }
+  return traced("cuEventRecord", cuEventRecord_impl, ev, stream);
+}
+VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream a1) { return event_record(ev, a1, 0); }
+VGPU_EXPORT CUresult cuEventRecordWithFlags(void* ev, CUstream a1, unsigned int flags) {
+  if (flags & ~1u) return CUDA_ERROR_INVALID_VALUE;   // CU_EVENT_RECORD_EXTERNAL is the only flag
+  return event_record(ev, a1, flags);
 }
 // Like a stream query, a query that finds the event done is recorded as a wait on it.
 //
@@ -4707,7 +5396,22 @@ static CUresult cuEventQuery_impl(void* event) {
                                       profiled_device());
   return r;
 }
-VGPU_EXPORT CUresult cuEventQuery(void* event) { return traced("cuEventQuery", cuEventQuery_impl, event); }
+// An event that has been in a capture asks the runtime what the card answers for it: CAPTURED_EVENT while
+// the capture goes on, INVALID_VALUE after it, and the refusal of a query during a capture.
+static CUresult event_in_capture_answer(void* event, const char* name, const char* rt_name) {
+  using Fn = int (*)(void*);
+  const Fn fn = reinterpret_cast<Fn>(runtime_symbol(rt_name));
+  if (fn) {
+    if (void* shadow = shadow_event(static_cast<CUevent>(event), false); shadow && shadow != event)
+      if (const int rc = fn(shadow); rc && rc != 600) return static_cast<CUresult>(rc);
+  }
+  if (capture_unsafe(name)) return kCaptureUnsupported;
+  return CUDA_SUCCESS;
+}
+VGPU_EXPORT CUresult cuEventQuery(void* event) {
+  if (const CUresult r = event_in_capture_answer(event, "cuEventQuery", "cudaEventQuery")) return r;
+  return traced("cuEventQuery", cuEventQuery_impl, event);
+}
 static CUresult cuEventSynchronize_impl(void* event) {
   CUresult r = dead_context();
   if (r == CUDA_SUCCESS) r = event_exists(event);
@@ -4717,18 +5421,29 @@ static CUresult cuEventSynchronize_impl(void* event) {
   return r;
 }
 VGPU_EXPORT CUresult cuEventSynchronize(void* event) {
+  if (const CUresult r = event_in_capture_answer(event, "cuEventSynchronize", "cudaEventSynchronize")) return r;
   return traced("cuEventSynchronize", cuEventSynchronize_impl, event);
 }
 static CUresult cuEventDestroy_v2_impl(void* ev) {
-  return api("cuEventDestroy", true, false, [&](ShimState& s) {
-    s.events.erase(reinterpret_cast<uintptr_t>(ev));
+  void* shadow = nullptr;
+  const CUresult r = api("cuEventDestroy", true, false, [&](ShimState& s) {
+    auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
+    if (it != s.events.end()) {
+      shadow = it->second.rt_event;
+      s.events.erase(it);
+    }
     return CUDA_SUCCESS;
   });
+  if (shadow)   // the runtime event that stood for it in a capture
+    if (auto destroy = runtime_fn<int (*)(void*)>("cudaEventDestroy")) destroy(shadow);
+  return r;
 }
 VGPU_EXPORT CUresult cuEventDestroy_v2(void* ev) {
   return traced("cuEventDestroy_v2", cuEventDestroy_v2_impl, ev);
 }
-VGPU_EXPORT CUresult cuEventDestroy(void* ev) { return cuEventDestroy_v2_impl(ev); }
+static CUresult cuEventDestroy_impl(void* ev);
+VGPU_EXPORT CUresult cuEventDestroy(void* ev) { return traced("cuEventDestroy", cuEventDestroy_impl, ev); }
+static CUresult cuEventDestroy_impl(void* ev) { return cuEventDestroy_v2_impl(ev); }
 static CUresult cuEventElapsedTime_impl(float* ms, void* start, void* end) {
   return api("cuEventElapsedTime", true, false, [&](ShimState& s) {
     auto a = s.events.find(reinterpret_cast<uintptr_t>(start));
@@ -4759,7 +5474,9 @@ VGPU_EXPORT CUresult cuEventElapsedTime_v2(float* ms, void* start, void* end) {
 
 /* ---- context odds and ends static cudart asks about ---- */
 
-VGPU_EXPORT CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
+static CUresult cuCtxPushCurrent_v2_impl(CUcontext ctx);
+VGPU_EXPORT CUresult cuCtxPushCurrent_v2(CUcontext ctx) { return traced("cuCtxPushCurrent_v2", cuCtxPushCurrent_v2_impl, ctx); }
+static CUresult cuCtxPushCurrent_v2_impl(CUcontext ctx) {
   return api("cuCtxPushCurrent", true, false, [&](ShimState& s) {
     uintptr_t h = check_handle(reinterpret_cast<uintptr_t>(ctx), kTagCtx, "context");
     if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
@@ -4767,8 +5484,12 @@ VGPU_EXPORT CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxPushCurrent(CUcontext ctx) { return cuCtxPushCurrent_v2(ctx); }
-VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
+static CUresult cuCtxPushCurrent_impl(CUcontext ctx);
+VGPU_EXPORT CUresult cuCtxPushCurrent(CUcontext ctx) { return traced("cuCtxPushCurrent", cuCtxPushCurrent_impl, ctx); }
+static CUresult cuCtxPushCurrent_impl(CUcontext ctx) { return cuCtxPushCurrent_v2(ctx); }
+static CUresult cuCtxPopCurrent_v2_impl(CUcontext* pctx);
+VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) { return traced("cuCtxPopCurrent_v2", cuCtxPopCurrent_v2_impl, pctx); }
+static CUresult cuCtxPopCurrent_v2_impl(CUcontext* pctx) {
   return api("cuCtxPopCurrent", true, false, [&](ShimState&) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     if (pctx) *pctx = reinterpret_cast<CUcontext>(ctx_stack().back());
@@ -4776,9 +5497,13 @@ VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxPopCurrent(CUcontext* pctx) { return cuCtxPopCurrent_v2(pctx); }
+static CUresult cuCtxPopCurrent_impl(CUcontext* pctx);
+VGPU_EXPORT CUresult cuCtxPopCurrent(CUcontext* pctx) { return traced("cuCtxPopCurrent", cuCtxPopCurrent_impl, pctx); }
+static CUresult cuCtxPopCurrent_impl(CUcontext* pctx) { return cuCtxPopCurrent_v2(pctx); }
 
-VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
+static CUresult cuCtxGetLimit_impl(size_t* v, int limit);
+VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) { return traced("cuCtxGetLimit", cuCtxGetLimit_impl, v, limit); }
+static CUresult cuCtxGetLimit_impl(size_t* v, int limit) {
   if (const CUresult dead = dead_context()) return dead;
   return api("cuCtxGetLimit", false, false, [&](ShimState& s) {
     // With no context current -- or no machine yet -- the card answers
@@ -4789,7 +5514,10 @@ VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
     return limit_value(s.limits[device], s.rt->device(device).profile(), limit, v);
   });
 }
-VGPU_EXPORT CUresult cuCtxSetLimit(int limit, size_t value) {
+static CUresult cuCtxSetLimit_impl(int limit, size_t value);
+VGPU_EXPORT CUresult cuCtxSetLimit(int limit, size_t value) { return traced("cuCtxSetLimit", cuCtxSetLimit_impl, limit, value); }
+static CUresult cuCtxSetLimit_impl(int limit, size_t value) {
+  VGPU_CAPTURE_UNSAFE("cuCtxSetLimit");
   if (const CUresult dead = dead_context()) return dead;
   return api("cuCtxSetLimit", false, false, [&](ShimState& s) {
     if (!s.initialized || ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
@@ -4839,7 +5567,9 @@ static CUresult named_or_current_context(ShimState& s, CUcontext ctx, uintptr_t*
   return CUDA_SUCCESS;
 }
 // 3020 is what an RTX 3060's driver 13.2 answers for any context.
-VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int* v) {
+static CUresult cuCtxGetApiVersion_impl(CUcontext ctx, unsigned int* v);
+VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int* v) { return traced("cuCtxGetApiVersion", cuCtxGetApiVersion_impl, ctx, v); }
+static CUresult cuCtxGetApiVersion_impl(CUcontext ctx, unsigned int* v) {
   return api("cuCtxGetApiVersion", true, false, [&](ShimState& s) {
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, ctx, &h); r != CUDA_SUCCESS) return r;
@@ -4848,7 +5578,9 @@ VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int* v) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxGetStreamPriorityRange(int* least, int* greatest) {
+static CUresult cuCtxGetStreamPriorityRange_impl(int* least, int* greatest);
+VGPU_EXPORT CUresult cuCtxGetStreamPriorityRange(int* least, int* greatest) { return traced("cuCtxGetStreamPriorityRange", cuCtxGetStreamPriorityRange_impl, least, greatest); }
+static CUresult cuCtxGetStreamPriorityRange_impl(int* least, int* greatest) {
   return api("cuCtxGetStreamPriorityRange", true, false, [&](ShimState&) {
     if (least) *least = vgpu::cuda::kLeastStreamPriority;
     if (greatest) *greatest = vgpu::cuda::kGreatestStreamPriority;
@@ -4858,7 +5590,9 @@ VGPU_EXPORT CUresult cuCtxGetStreamPriorityRange(int* least, int* greatest) {
 // The flags the current context reports: as it was created (cuCtxCreate), or, for a primary one,
 // the flags set for the device with MAP_HOST always on; cuCtxSetFlags changes the scheduling
 // mode, LMEM_RESIZE_TO_MAX and SYNC_MEMOPS (measured).
-VGPU_EXPORT CUresult cuCtxGetFlags(unsigned int* f) {
+static CUresult cuCtxGetFlags_impl(unsigned int* f);
+VGPU_EXPORT CUresult cuCtxGetFlags(unsigned int* f) { return traced("cuCtxGetFlags", cuCtxGetFlags_impl, f); }
+static CUresult cuCtxGetFlags_impl(unsigned int* f) {
   return api("cuCtxGetFlags", true, false, [&](ShimState& s) {
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, nullptr, &h); r != CUDA_SUCCESS) return r;
@@ -4867,7 +5601,9 @@ VGPU_EXPORT CUresult cuCtxGetFlags(unsigned int* f) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxSetFlags(unsigned int flags) {
+static CUresult cuCtxSetFlags_impl(unsigned int flags);
+VGPU_EXPORT CUresult cuCtxSetFlags(unsigned int flags) { return traced("cuCtxSetFlags", cuCtxSetFlags_impl, flags); }
+static CUresult cuCtxSetFlags_impl(unsigned int flags) {
   return api("cuCtxSetFlags", true, false, [&](ShimState& s) {
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, nullptr, &h); r != CUDA_SUCCESS) return r;
@@ -4878,7 +5614,9 @@ VGPU_EXPORT CUresult cuCtxSetFlags(unsigned int flags) {
   });
 }
 // Contexts are numbered from 1 in the order they are made, the primary ones among them.
-VGPU_EXPORT CUresult cuCtxGetId(CUcontext ctx, unsigned long long* id) {
+static CUresult cuCtxGetId_impl(CUcontext ctx, unsigned long long* id);
+VGPU_EXPORT CUresult cuCtxGetId(CUcontext ctx, unsigned long long* id) { return traced("cuCtxGetId", cuCtxGetId_impl, ctx, id); }
+static CUresult cuCtxGetId_impl(CUcontext ctx, unsigned long long* id) {
   return api("cuCtxGetId", true, false, [&](ShimState& s) {
     uintptr_t h = 0;
     if (const CUresult r = named_or_current_context(s, ctx, &h); r != CUDA_SUCCESS) return r;
@@ -4902,9 +5640,15 @@ static CUresult primary_set_flags(CUdevice dev, unsigned int flags) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags) { return primary_set_flags(dev, flags); }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags) { return primary_set_flags(dev, flags); }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flags, int* active) {
+static CUresult cuDevicePrimaryCtxSetFlags_v2_impl(CUdevice dev, unsigned int flags);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags) { return traced("cuDevicePrimaryCtxSetFlags_v2", cuDevicePrimaryCtxSetFlags_v2_impl, dev, flags); }
+static CUresult cuDevicePrimaryCtxSetFlags_v2_impl(CUdevice dev, unsigned int flags) { return primary_set_flags(dev, flags); }
+static CUresult cuDevicePrimaryCtxSetFlags_impl(CUdevice dev, unsigned int flags);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags) { return traced("cuDevicePrimaryCtxSetFlags", cuDevicePrimaryCtxSetFlags_impl, dev, flags); }
+static CUresult cuDevicePrimaryCtxSetFlags_impl(CUdevice dev, unsigned int flags) { return primary_set_flags(dev, flags); }
+static CUresult cuDevicePrimaryCtxGetState_impl(CUdevice dev, unsigned int* flags, int* active);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flags, int* active) { return traced("cuDevicePrimaryCtxGetState", cuDevicePrimaryCtxGetState_impl, dev, flags, active); }
+static CUresult cuDevicePrimaryCtxGetState_impl(CUdevice dev, unsigned int* flags, int* active) {
   return api("cuDevicePrimaryCtxGetState", true, false, [&](ShimState& s) {
     check_device(s, dev);
     if (!flags || !active) return CUDA_ERROR_INVALID_VALUE;
@@ -4913,15 +5657,21 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flag
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) { return cuDevicePrimaryCtxReset(dev); }
+static CUresult cuDevicePrimaryCtxReset_v2_impl(CUdevice dev);
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset_v2(CUdevice dev) { return traced("cuDevicePrimaryCtxReset_v2", cuDevicePrimaryCtxReset_v2_impl, dev); }
+static CUresult cuDevicePrimaryCtxReset_v2_impl(CUdevice dev) { return cuDevicePrimaryCtxReset(dev); }
 
-VGPU_EXPORT CUresult cuModuleGetLoadingMode(int* mode) {
+static CUresult cuModuleGetLoadingMode_impl(int* mode);
+VGPU_EXPORT CUresult cuModuleGetLoadingMode(int* mode) { return traced("cuModuleGetLoadingMode", cuModuleGetLoadingMode_impl, mode); }
+static CUresult cuModuleGetLoadingMode_impl(int* mode) {
   if (!mode) return CUDA_ERROR_INVALID_VALUE;
   *mode = 1;  // CU_MODULE_EAGER_LOADING
   return CUDA_SUCCESS;
 }
 
-VGPU_EXPORT CUresult cuDeviceGetUuid(void* uuid, CUdevice dev) {
+static CUresult cuDeviceGetUuid_impl(void* uuid, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetUuid(void* uuid, CUdevice dev) { return traced("cuDeviceGetUuid", cuDeviceGetUuid_impl, uuid, dev); }
+static CUresult cuDeviceGetUuid_impl(void* uuid, CUdevice dev) {
   return api("cuDeviceGetUuid", true, false, [&](ShimState& s) {
     if (!uuid) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -4933,11 +5683,15 @@ VGPU_EXPORT CUresult cuDeviceGetUuid(void* uuid, CUdevice dev) {
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuDeviceGetUuid_v2(void* uuid, CUdevice dev) { return cuDeviceGetUuid(uuid, dev); }
+static CUresult cuDeviceGetUuid_v2_impl(void* uuid, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetUuid_v2(void* uuid, CUdevice dev) { return traced("cuDeviceGetUuid_v2", cuDeviceGetUuid_v2_impl, uuid, dev); }
+static CUresult cuDeviceGetUuid_v2_impl(void* uuid, CUdevice dev) { return cuDeviceGetUuid(uuid, dev); }
 
 // A buffer too short for the id gets as much of it as fits, and
 // INVALID_VALUE, as on the card.
-VGPU_EXPORT CUresult cuDeviceGetPCIBusId(char* id, int len, CUdevice dev) {
+static CUresult cuDeviceGetPCIBusId_impl(char* id, int len, CUdevice dev);
+VGPU_EXPORT CUresult cuDeviceGetPCIBusId(char* id, int len, CUdevice dev) { return traced("cuDeviceGetPCIBusId", cuDeviceGetPCIBusId_impl, id, len, dev); }
+static CUresult cuDeviceGetPCIBusId_impl(char* id, int len, CUdevice dev) {
   return api("cuDeviceGetPCIBusId", true, false, [&](ShimState& s) {
     if (!id || len <= 0) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
@@ -4991,7 +5745,9 @@ bool parse_bus_id(const char* text, unsigned long out[4]) {
 // gives each device. A well-formed id naming no device -- another bus, a
 // function other than 0, a domain other than 0 -- is INVALID_DEVICE; a
 // malformed one is INVALID_VALUE.
-VGPU_EXPORT CUresult cuDeviceGetByPCIBusId(CUdevice* dev, const char* pciBusId) {
+static CUresult cuDeviceGetByPCIBusId_impl(CUdevice* dev, const char* pciBusId);
+VGPU_EXPORT CUresult cuDeviceGetByPCIBusId(CUdevice* dev, const char* pciBusId) { return traced("cuDeviceGetByPCIBusId", cuDeviceGetByPCIBusId_impl, dev, pciBusId); }
+static CUresult cuDeviceGetByPCIBusId_impl(CUdevice* dev, const char* pciBusId) {
   return api("cuDeviceGetByPCIBusId", true, false, [&](ShimState& s) {
     unsigned long want[4];
     if (!dev || !pciBusId || !parse_bus_id(pciBusId, want)) return CUDA_ERROR_INVALID_VALUE;
@@ -5008,15 +5764,50 @@ VGPU_EXPORT CUresult cuDeviceGetByPCIBusId(CUdevice* dev, const char* pciBusId) 
   });
 }
 
-// Distinct simulated devices reach each other's memory, as the runtime's
-// cudaDeviceCanAccessPeer answers; a device is not its own peer. (A pair of
-// RTX 3060s under WSL answers 0 for each other: that host has no peer path.)
-VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice dev, CUdevice peer) {
+// Whether `dev` can reach `peer`'s memory: two devices whose profiles both have a peer path
+// (CudaClass::peer_access). A pair of RTX 3060s has none (measured on a real pair: 0 for each other).
+static bool peer_path(ShimState& s, int dev, int peer) {
+  return dev != peer && s.rt->device(dev).profile().cuda.peer_access && s.rt->device(peer).profile().cuda.peer_access;
+}
+
+// cuDeviceCanAccessPeer answers like the runtime's cudaDeviceCanAccessPeer; a device is not its own peer
+// (CUDA_SUCCESS and 0, as an RTX 3060 answers).
+static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer);
+VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice dev, CUdevice peer) { return traced("cuDeviceCanAccessPeer", cuDeviceCanAccessPeer_impl, can, dev, peer); }
+static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer) {
   return api("cuDeviceCanAccessPeer", true, false, [&](ShimState& s) {
     if (!can) return CUDA_ERROR_INVALID_VALUE;
     const int n = s.rt->device_count();
     if (dev < 0 || dev >= n || peer < 0 || peer >= n) return CUDA_ERROR_INVALID_DEVICE;
-    *can = dev != peer ? 1 : 0;
+    *can = peer_path(s, dev, peer) ? 1 : 0;
+    return CUDA_SUCCESS;
+  });
+}
+
+// What one device can do with another's memory, as the runtime's cudaDeviceGetP2PAttribute answers it:
+// attributes 1 to 5 (CUDA 13 added the fifth, partial native atomics); without a peer path every one is 0
+// (measured on an RTX 3060 pair), and 0 and 6 and above are CUDA_ERROR_INVALID_VALUE. A device asked about
+// itself is CUDA_ERROR_INVALID_DEVICE, as the runtime's is cudaErrorInvalidDevice.
+static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice src, CUdevice dst);
+// attrib is a CUdevice_P2PAttribute, an enum of int's size; it is read as the int it is, since a caller
+// may pass a value the enum does not declare.
+VGPU_EXPORT CUresult cuDeviceGetP2PAttribute(int* value, int attrib, CUdevice srcDevice, CUdevice dstDevice) {
+  return traced("cuDeviceGetP2PAttribute", cuDeviceGetP2PAttribute_impl, value, attrib, srcDevice, dstDevice);
+}
+static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice src, CUdevice dst) {
+  return api("cuDeviceGetP2PAttribute", true, false, [&](ShimState& s) {
+    if (!value) return CUDA_ERROR_INVALID_VALUE;
+    const int n = s.rt->device_count();
+    if (src < 0 || src >= n || dst < 0 || dst >= n || src == dst) return CUDA_ERROR_INVALID_DEVICE;
+    const bool path = peer_path(s, src, dst);
+    switch (attrib) {
+      case 1: *value = 0; break;                // CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK
+      case 2: *value = path ? 1 : 0; break;     // ACCESS_SUPPORTED
+      case 3: *value = path ? 1 : 0; break;     // NATIVE_ATOMIC_SUPPORTED
+      case 4: *value = 0; break;                // CUDA_ARRAY_ACCESS_SUPPORTED
+      case 5: *value = 0; break;                // ONLY_PARTIAL_NATIVE_ATOMIC_SUPPORTED
+      default: return CUDA_ERROR_INVALID_VALUE;
+    }
     return CUDA_SUCCESS;
   });
 }
@@ -5027,18 +5818,24 @@ VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice dev, CUdevice peer
 // disabling what was never enabled PEER_ACCESS_NOT_ENABLED, and a context on
 // the same device as the current one is no peer (PEER_ACCESS_UNSUPPORTED, as
 // the card answers). Flags must be 0.
-VGPU_EXPORT CUresult cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int flags) {
+static CUresult cuCtxEnablePeerAccess_impl(CUcontext peerContext, unsigned int flags);
+VGPU_EXPORT CUresult cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int flags) { return traced("cuCtxEnablePeerAccess", cuCtxEnablePeerAccess_impl, peerContext, flags); }
+static CUresult cuCtxEnablePeerAccess_impl(CUcontext peerContext, unsigned int flags) {
   return api("cuCtxEnablePeerAccess", true, false, [&](ShimState& s) {
     if (flags != 0 || !peerContext) return CUDA_ERROR_INVALID_VALUE;
     const uintptr_t peer = check_handle(reinterpret_cast<uintptr_t>(peerContext), kTagCtx, "context");
     auto it = s.contexts.find(peer);
     if (it == s.contexts.end()) return CUDA_ERROR_INVALID_CONTEXT;
     if (it->second == current_device(s)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
+    // Without a peer path (an RTX 3060 pair, measured) a context on the other device is unsupported too.
+    if (!peer_path(s, current_device(s), it->second)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
     if (!s.peer_access.emplace(ctx_stack().back(), peer).second) return CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuCtxDisablePeerAccess(CUcontext peerContext) {
+static CUresult cuCtxDisablePeerAccess_impl(CUcontext peerContext);
+VGPU_EXPORT CUresult cuCtxDisablePeerAccess(CUcontext peerContext) { return traced("cuCtxDisablePeerAccess", cuCtxDisablePeerAccess_impl, peerContext); }
+static CUresult cuCtxDisablePeerAccess_impl(CUcontext peerContext) {
   return api("cuCtxDisablePeerAccess", true, false, [&](ShimState& s) {
     if (!peerContext) return CUDA_ERROR_INVALID_VALUE;
     const uintptr_t peer = check_handle(reinterpret_cast<uintptr_t>(peerContext), kTagCtx, "context");
@@ -5052,11 +5849,17 @@ VGPU_EXPORT CUresult cuCtxDisablePeerAccess(CUcontext peerContext) {
 // A copy between two contexts' memory. Device address windows are disjoint,
 // so each address names its own device and the contexts add nothing; the card
 // takes a null one as well.
-VGPU_EXPORT CUresult cuMemcpyPeer(CUdeviceptr dst, CUcontext, CUdeviceptr src, CUcontext, size_t n) {
+static CUresult cuMemcpyPeer_impl(CUdeviceptr dst, CUcontext, CUdeviceptr src, CUcontext, size_t n);
+VGPU_EXPORT CUresult cuMemcpyPeer(CUdeviceptr dst, CUcontext a1, CUdeviceptr src, CUcontext a3, size_t n) { return traced("cuMemcpyPeer", cuMemcpyPeer_impl, dst, a1, src, a3, n); }
+static CUresult cuMemcpyPeer_impl(CUdeviceptr dst, CUcontext, CUdeviceptr src, CUcontext, size_t n) {
   return cuMemcpyDtoD_v2_impl(dst, src, n);
 }
-VGPU_EXPORT CUresult cuMemcpyPeerAsync(CUdeviceptr dst, CUcontext dctx, CUdeviceptr src, CUcontext sctx,
-                                       size_t n, CUstream) {
+static CUresult cuMemcpyPeerAsync_impl(CUdeviceptr dst, CUcontext dctx, CUdeviceptr src, CUcontext sctx, size_t n, CUstream);
+VGPU_EXPORT CUresult cuMemcpyPeerAsync(CUdeviceptr dst, CUcontext dctx, CUdeviceptr src, CUcontext sctx, size_t n, CUstream a5) { return traced("cuMemcpyPeerAsync", cuMemcpyPeerAsync_impl, dst, dctx, src, sctx, n, a5); }
+static CUresult cuMemcpyPeerAsync_impl(CUdeviceptr dst, CUcontext dctx, CUdeviceptr src, CUcontext sctx,
+                                       size_t n, CUstream st) {
+  // Measured on an RTX 3060: refused on a capturing stream, which invalidates the capture.
+  if (capture_forbidden(st, "cuMemcpyPeerAsync")) return kCaptureUnsupported;
   return cuMemcpyPeer(dst, dctx, src, sctx, n);
 }
 
@@ -5201,7 +6004,9 @@ CUresult pointer_attribute(ShimState& s, int attribute, CUdeviceptr ptr, const P
 
 }  // namespace
 
-VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdeviceptr ptr) {
+static CUresult cuPointerGetAttribute_impl(void* data, int attribute, CUdeviceptr ptr);
+VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdeviceptr ptr) { return traced("cuPointerGetAttribute", cuPointerGetAttribute_impl, data, attribute, ptr); }
+static CUresult cuPointerGetAttribute_impl(void* data, int attribute, CUdeviceptr ptr) {
   if (!data) return CUDA_ERROR_INVALID_VALUE;
   return api("cuPointerGetAttribute", true, false, [&](ShimState& s) {
     const PtrInfo pi = describe_pointer(s, ptr);
@@ -5215,7 +6020,9 @@ VGPU_EXPORT CUresult cuPointerGetAttribute(void* data, int attribute, CUdevicept
 // a pointer CUDA does not know: each value is set to its NULL default (zero
 // bytes) and the call succeeds, which is how a caller asks "is this one of
 // yours?" of an arbitrary pointer.
-VGPU_EXPORT CUresult cuPointerGetAttributes(unsigned int numAttributes, int* attributes, void** data,
+static CUresult cuPointerGetAttributes_impl(unsigned int numAttributes, int* attributes, void** data, CUdeviceptr ptr);
+VGPU_EXPORT CUresult cuPointerGetAttributes(unsigned int numAttributes, int* attributes, void** data, CUdeviceptr ptr) { return traced("cuPointerGetAttributes", cuPointerGetAttributes_impl, numAttributes, attributes, data, ptr); }
+static CUresult cuPointerGetAttributes_impl(unsigned int numAttributes, int* attributes, void** data,
                                             CUdeviceptr ptr) {
   if (numAttributes == 0) return CUDA_SUCCESS;
   if (!attributes || !data) return CUDA_ERROR_INVALID_VALUE;
@@ -5237,7 +6044,9 @@ VGPU_EXPORT CUresult cuPointerGetAttributes(unsigned int numAttributes, int* att
 // The one attribute that can be set is SYNC_MEMOPS, a boolean. Every operation
 // here is already synchronous, so setting it changes nothing a program can
 // see but what a query of it reads back.
-VGPU_EXPORT CUresult cuPointerSetAttribute(const void* value, int attribute, CUdeviceptr ptr) {
+static CUresult cuPointerSetAttribute_impl(const void* value, int attribute, CUdeviceptr ptr);
+VGPU_EXPORT CUresult cuPointerSetAttribute(const void* value, int attribute, CUdeviceptr ptr) { return traced("cuPointerSetAttribute", cuPointerSetAttribute_impl, value, attribute, ptr); }
+static CUresult cuPointerSetAttribute_impl(const void* value, int attribute, CUdeviceptr ptr) {
   if (!value) return CUDA_ERROR_INVALID_VALUE;
   return api("cuPointerSetAttribute", true, false, [&](ShimState& s) {
     if (attribute != 6) return CUDA_ERROR_INVALID_VALUE;   // CU_POINTER_ATTRIBUTE_SYNC_MEMOPS
@@ -5284,7 +6093,82 @@ int blocks_per_sm(ShimState& s, const FuncRec& f, int block, size_t dyn) {
 }
 }  // namespace
 
-VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* num, CUfunction f, int blockSize,
+/* ---- clusters ----
+ * cuOccupancyMaxActiveClusters and cuOccupancyMaxPotentialClusterSize, which
+ * vgpu/exec/cluster.hpp answers: from the profile's GPC layout where it has one
+ * (derived, and said once), by the card's own answers where the part has no
+ * clusters (measured on an RTX 3060: CUDA_SUCCESS with 0, unless the configuration
+ * names a cluster dimension, which is CUDA_ERROR_INVALID_CLUSTER_SIZE). */
+namespace {
+struct ClusterLaunchConfigABI {   // CUlaunchConfig
+  unsigned gx, gy, gz, bx, by, bz;
+  unsigned shared_bytes;
+  CUstream stream;
+  const LaunchAttrABI* attrs;
+  unsigned num_attrs;
+};
+
+CUresult cluster_occupancy_impl(const char* api_name, bool active, int* out, CUfunction f, const void* config) {
+  using S = vgpu::exec::ClusterAnswer::Status;
+  if (!out || !f || !config) return CUDA_ERROR_INVALID_VALUE;   // the card: invalid value for a null function
+  return api(api_name, true, false, [&](ShimState& s) -> CUresult {
+    const FuncRec* rec = occupancy_func(s, f);
+    if (!rec) return CUDA_ERROR_INVALID_HANDLE;
+    const vgpu::DeviceProfile& p = s.rt->device(rec->device).profile();
+    const auto* c = static_cast<const ClusterLaunchConfigABI*>(config);
+    if (c->num_attrs != 0 && c->attrs == nullptr) return CUDA_ERROR_INVALID_VALUE;
+    bool has_dim = false;
+    std::array<uint32_t, 3> dim{0, 0, 0};
+    for (unsigned i = 0; i < c->num_attrs; ++i) {
+      if (c->attrs[i].id != kLaunchAttrClusterDimension) continue;
+      has_dim = true;
+      dim = {c->attrs[i].value.cluster_dim.x, c->attrs[i].value.cluster_dim.y, c->attrs[i].value.cluster_dim.z};
+    }
+    uint32_t per_sm = 0;
+    if (vgpu::exec::supports_clusters(p)) {
+      const uint64_t threads = uint64_t{c->bx} * c->by * c->bz;
+      if (threads == 0 || threads > p.limits.max_threads_per_block) return CUDA_ERROR_INVALID_VALUE;
+      per_sm = static_cast<uint32_t>(blocks_per_sm(s, *rec, static_cast<int>(threads), c->shared_bytes));
+    }
+    const vgpu::exec::ClusterAnswer a = vgpu::exec::cluster_occupancy(
+        p, active, has_dim, dim, rec->fn->req_cluster, rec->nonportable_cluster, per_sm);
+    if (!quiet()) {
+      static std::atomic<bool> said_missing{false}, said_derived{false};
+      if (a.status == S::NotSupported && !said_missing.exchange(true))
+        std::fprintf(stderr, "[vgpu] %s is not implemented for %s: %s\n", api_name, p.id.c_str(), a.why);
+      if (a.status == S::Ok && a.uses_layout && !said_derived.exchange(true))
+        std::fprintf(stderr,
+                     "[vgpu] %s: %s has %u GPCs and %u TPCs (%s), spread evenly over the GPCs because NVIDIA "
+                     "does not publish how many each has; the answer is derived from that and is not checked "
+                     "against a card\n",
+                     api_name, p.id.c_str(), p.layout.gpcs, p.layout.tpcs,
+                     p.layout.counts_derived ? "figures of a part with the same SM count" : "NVIDIA's figures for this part");
+    }
+    switch (a.status) {
+      case S::Ok: *out = static_cast<int>(a.value); return CUDA_SUCCESS;
+      case S::InvalidValue: return CUDA_ERROR_INVALID_VALUE;
+      case S::InvalidClusterSize: return static_cast<CUresult>(912);   // CUDA_ERROR_INVALID_CLUSTER_SIZE
+      case S::NotSupported: return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    return CUDA_ERROR_UNKNOWN;
+  });
+}
+}  // namespace
+
+static CUresult cuOccupancyMaxActiveClusters_impl(int* numClusters, CUfunction f, const void* config);
+VGPU_EXPORT CUresult cuOccupancyMaxActiveClusters(int* numClusters, CUfunction f, const void* config) { return traced("cuOccupancyMaxActiveClusters", cuOccupancyMaxActiveClusters_impl, numClusters, f, config); }
+static CUresult cuOccupancyMaxActiveClusters_impl(int* numClusters, CUfunction f, const void* config) {
+  return cluster_occupancy_impl("cuOccupancyMaxActiveClusters", true, numClusters, f, config);
+}
+static CUresult cuOccupancyMaxPotentialClusterSize_impl(int* clusterSize, CUfunction f, const void* config);
+VGPU_EXPORT CUresult cuOccupancyMaxPotentialClusterSize(int* clusterSize, CUfunction f, const void* config) { return traced("cuOccupancyMaxPotentialClusterSize", cuOccupancyMaxPotentialClusterSize_impl, clusterSize, f, config); }
+static CUresult cuOccupancyMaxPotentialClusterSize_impl(int* clusterSize, CUfunction f, const void* config) {
+  return cluster_occupancy_impl("cuOccupancyMaxPotentialClusterSize", false, clusterSize, f, config);
+}
+
+static CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor_impl(int* num, CUfunction f, int blockSize, size_t dyn);
+VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* num, CUfunction f, int blockSize, size_t dyn) { return traced("cuOccupancyMaxActiveBlocksPerMultiprocessor", cuOccupancyMaxActiveBlocksPerMultiprocessor_impl, num, f, blockSize, dyn); }
+static CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor_impl(int* num, CUfunction f, int blockSize,
                                                                  size_t dyn) {
   return api("cuOccupancyMaxActiveBlocksPerMultiprocessor", true, false, [&](ShimState& s) {
     if (!num || blockSize <= 0) return CUDA_ERROR_INVALID_VALUE;
@@ -5294,7 +6178,9 @@ VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* num, CUfun
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* num, CUfunction f,
+static CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_impl(int* num, CUfunction f, int blockSize, size_t dyn, unsigned int);
+VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* num, CUfunction f, int blockSize, size_t dyn, unsigned int a4) { return traced("cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_impl, num, f, blockSize, dyn, a4); }
+static CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_impl(int* num, CUfunction f,
                                                                           int blockSize, size_t dyn,
                                                                           unsigned int) {
   return cuOccupancyMaxActiveBlocksPerMultiprocessor(num, f, blockSize, dyn);
@@ -5308,7 +6194,9 @@ VGPU_EXPORT CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* n
 // the best occupancy and stopping at a full multiprocessor. Per-block dynamic
 // shared memory comes from the callback when one is given, and is otherwise
 // the constant. No block fits at all: 0 and 0, successfully, as on the card.
-VGPU_EXPORT CUresult cuOccupancyMaxPotentialBlockSizeWithFlags(int* minGridSize, int* blockSize,
+static CUresult cuOccupancyMaxPotentialBlockSizeWithFlags_impl(int* minGridSize, int* blockSize, CUfunction func, CUoccupancyB2DSize blockToSmem, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags);
+VGPU_EXPORT CUresult cuOccupancyMaxPotentialBlockSizeWithFlags(int* minGridSize, int* blockSize, CUfunction func, CUoccupancyB2DSize blockToSmem, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags) { return traced("cuOccupancyMaxPotentialBlockSizeWithFlags", cuOccupancyMaxPotentialBlockSizeWithFlags_impl, minGridSize, blockSize, func, blockToSmem, dynamicSMemSize, blockSizeLimit, flags); }
+static CUresult cuOccupancyMaxPotentialBlockSizeWithFlags_impl(int* minGridSize, int* blockSize,
                                                                CUfunction func,
                                                                CUoccupancyB2DSize blockToSmem,
                                                                size_t dynamicSMemSize, int blockSizeLimit,
@@ -5344,7 +6232,9 @@ VGPU_EXPORT CUresult cuOccupancyMaxPotentialBlockSizeWithFlags(int* minGridSize,
     return CUDA_SUCCESS;
   });
 }
-VGPU_EXPORT CUresult cuOccupancyMaxPotentialBlockSize(int* minGridSize, int* blockSize, CUfunction func,
+static CUresult cuOccupancyMaxPotentialBlockSize_impl(int* minGridSize, int* blockSize, CUfunction func, CUoccupancyB2DSize blockToSmem, size_t dynamicSMemSize, int blockSizeLimit);
+VGPU_EXPORT CUresult cuOccupancyMaxPotentialBlockSize(int* minGridSize, int* blockSize, CUfunction func, CUoccupancyB2DSize blockToSmem, size_t dynamicSMemSize, int blockSizeLimit) { return traced("cuOccupancyMaxPotentialBlockSize", cuOccupancyMaxPotentialBlockSize_impl, minGridSize, blockSize, func, blockToSmem, dynamicSMemSize, blockSizeLimit); }
+static CUresult cuOccupancyMaxPotentialBlockSize_impl(int* minGridSize, int* blockSize, CUfunction func,
                                                       CUoccupancyB2DSize blockToSmem, size_t dynamicSMemSize,
                                                       int blockSizeLimit) {
   return cuOccupancyMaxPotentialBlockSizeWithFlags(minGridSize, blockSize, func, blockToSmem,
@@ -5584,7 +6474,9 @@ std::map<CUdeviceptr, int> g_ipc_open;   // imported pointer -> device
 
 }  // namespace
 
-VGPU_EXPORT CUresult cuIpcGetMemHandle(CUipcMemHandle* handle, CUdeviceptr ptr) {
+static CUresult cuIpcGetMemHandle_impl(CUipcMemHandle* handle, CUdeviceptr ptr);
+VGPU_EXPORT CUresult cuIpcGetMemHandle(CUipcMemHandle* handle, CUdeviceptr ptr) { return traced("cuIpcGetMemHandle", cuIpcGetMemHandle_impl, handle, ptr); }
+static CUresult cuIpcGetMemHandle_impl(CUipcMemHandle* handle, CUdeviceptr ptr) {
   return api("cuIpcGetMemHandle", true, false, [&](ShimState& s) -> CUresult {
     if (!handle || !ptr) return CUDA_ERROR_INVALID_VALUE;
     int device = -1;
@@ -5607,7 +6499,9 @@ VGPU_EXPORT CUresult cuIpcGetMemHandle(CUipcMemHandle* handle, CUdeviceptr ptr) 
   });
 }
 
-VGPU_EXPORT CUresult cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle handle,
+static CUresult cuIpcOpenMemHandle_v2_impl(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags);
+VGPU_EXPORT CUresult cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags) { return traced("cuIpcOpenMemHandle_v2", cuIpcOpenMemHandle_v2_impl, ptr, handle, flags); }
+static CUresult cuIpcOpenMemHandle_v2_impl(CUdeviceptr* ptr, CUipcMemHandle handle,
                                            unsigned int flags) {
   return api("cuIpcOpenMemHandle", true, false, [&](ShimState& s) -> CUresult {
     if (!ptr) return CUDA_ERROR_INVALID_VALUE;
@@ -5629,12 +6523,16 @@ VGPU_EXPORT CUresult cuIpcOpenMemHandle_v2(CUdeviceptr* ptr, CUipcMemHandle hand
   });
 }
 
-VGPU_EXPORT CUresult cuIpcOpenMemHandle(CUdeviceptr* ptr, CUipcMemHandle handle,
+static CUresult cuIpcOpenMemHandle_impl(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags);
+VGPU_EXPORT CUresult cuIpcOpenMemHandle(CUdeviceptr* ptr, CUipcMemHandle handle, unsigned int flags) { return traced("cuIpcOpenMemHandle", cuIpcOpenMemHandle_impl, ptr, handle, flags); }
+static CUresult cuIpcOpenMemHandle_impl(CUdeviceptr* ptr, CUipcMemHandle handle,
                                         unsigned int flags) {
   return cuIpcOpenMemHandle_v2(ptr, handle, flags);
 }
 
-VGPU_EXPORT CUresult cuIpcCloseMemHandle(CUdeviceptr ptr) {
+static CUresult cuIpcCloseMemHandle_impl(CUdeviceptr ptr);
+VGPU_EXPORT CUresult cuIpcCloseMemHandle(CUdeviceptr ptr) { return traced("cuIpcCloseMemHandle", cuIpcCloseMemHandle_impl, ptr); }
+static CUresult cuIpcCloseMemHandle_impl(CUdeviceptr ptr) {
   return api("cuIpcCloseMemHandle", true, false, [&](ShimState& s) -> CUresult {
     int device = -1;
     {
@@ -5652,7 +6550,9 @@ VGPU_EXPORT CUresult cuIpcCloseMemHandle(CUdeviceptr ptr) {
 // An event handle carries its origin and nothing else: every operation here
 // finishes before the call that started it returns, so an event whose handle
 // another process can read is already complete.
-VGPU_EXPORT CUresult cuIpcGetEventHandle(CUipcEventHandle* handle, CUevent ev) {
+static CUresult cuIpcGetEventHandle_impl(CUipcEventHandle* handle, CUevent ev);
+VGPU_EXPORT CUresult cuIpcGetEventHandle(CUipcEventHandle* handle, CUevent ev) { return traced("cuIpcGetEventHandle", cuIpcGetEventHandle_impl, handle, ev); }
+static CUresult cuIpcGetEventHandle_impl(CUipcEventHandle* handle, CUevent ev) {
   return api("cuIpcGetEventHandle", true, false, [&](ShimState& s) -> CUresult {
     if (!handle) return CUDA_ERROR_INVALID_VALUE;
     if (!s.events.count(reinterpret_cast<uintptr_t>(ev))) return CUDA_ERROR_INVALID_VALUE;
@@ -5665,7 +6565,9 @@ VGPU_EXPORT CUresult cuIpcGetEventHandle(CUipcEventHandle* handle, CUevent ev) {
   });
 }
 
-VGPU_EXPORT CUresult cuIpcOpenEventHandle(CUevent* ev, CUipcEventHandle handle) {
+static CUresult cuIpcOpenEventHandle_impl(CUevent* ev, CUipcEventHandle handle);
+VGPU_EXPORT CUresult cuIpcOpenEventHandle(CUevent* ev, CUipcEventHandle handle) { return traced("cuIpcOpenEventHandle", cuIpcOpenEventHandle_impl, ev, handle); }
+static CUresult cuIpcOpenEventHandle_impl(CUevent* ev, CUipcEventHandle handle) {
   return api("cuIpcOpenEventHandle", true, false, [&](ShimState& s) -> CUresult {
     if (!ev) return CUDA_ERROR_INVALID_VALUE;
     IpcMemPayload p{};
@@ -5679,7 +6581,9 @@ VGPU_EXPORT CUresult cuIpcOpenEventHandle(CUevent* ev, CUipcEventHandle handle) 
   });
 }
 
-VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) {
+static CUresult cuGetExportTable_impl(const void** table, const void* uuid);
+VGPU_EXPORT CUresult cuGetExportTable(const void** table, const void* uuid) { return traced("cuGetExportTable", cuGetExportTable_impl, table, uuid); }
+static CUresult cuGetExportTable_impl(const void** table, const void* uuid) {
   if (!table || !uuid) return CUDA_ERROR_INVALID_VALUE;
   // Only a statically linked CUDA runtime asks for these: the shared runtime
   // never touches them, because VirtualGPU's libcudart answers instead. A
@@ -5735,7 +6639,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuGetErrorString), VGPU_PROC(cuDeviceGetCount), VGPU_PROC(cuDeviceGet),
     VGPU_PROC(cuDeviceGetName), VGPU_PROC(cuDeviceTotalMem), VGPU_PROC(cuDeviceGetAttribute),
     VGPU_PROC(cuDeviceComputeCapability), VGPU_PROC(cuDeviceGetUuid), VGPU_PROC(cuDeviceGetUuid_v2),
-    VGPU_PROC(cuDeviceGetPCIBusId), VGPU_PROC(cuDeviceCanAccessPeer),
+    VGPU_PROC(cuDeviceGetPCIBusId), VGPU_PROC(cuDeviceCanAccessPeer), VGPU_PROC(cuDeviceGetP2PAttribute),
     VGPU_PROC(cuCtxCreate), VGPU_PROC(cuCtxDestroy), VGPU_PROC(cuCtxSetCurrent),
     VGPU_PROC(cuCtxGetCurrent), VGPU_PROC(cuCtxGetDevice), VGPU_PROC(cuCtxSynchronize),
     VGPU_PROC(cuCtxPushCurrent), VGPU_PROC(cuCtxPopCurrent), VGPU_PROC(cuCtxGetLimit),
@@ -5876,7 +6780,9 @@ void* find_proc(const std::string& request) {
 VGPU_EXPORT CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion,
                                       unsigned long long flags);
 
-VGPU_EXPORT CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
+static CUresult cuGetProcAddress_v2_impl(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags, int* symbolStatus);
+VGPU_EXPORT CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags, int* symbolStatus) { return traced("cuGetProcAddress_v2", cuGetProcAddress_v2_impl, symbol, pfn, cudaVersion, flags, symbolStatus); }
+static CUresult cuGetProcAddress_v2_impl(const char* symbol, void** pfn, int cudaVersion,
                                          unsigned long long flags, int* symbolStatus) {
   if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
   (void)flags;
@@ -5895,7 +6801,108 @@ VGPU_EXPORT CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cud
   return fn ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND;
 }
 
-VGPU_EXPORT CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion,
+static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags);
+VGPU_EXPORT CUresult cuGetProcAddress(const char* symbol, void** pfn, int cudaVersion, unsigned long long flags) { return traced("cuGetProcAddress", cuGetProcAddress_impl, symbol, pfn, cudaVersion, flags); }
+static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVersion,
                                       unsigned long long flags) {
   return cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, nullptr);
 }
+
+// The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
+#include "driver_sweep.inc"
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with CUDA_API_PER_THREAD_DEFAULT_STREAM defined)
+// calls the driver's functions under the names cuMemcpyHtoD_v2_ptds, cuLaunchKernel_ptsz and the rest, where
+// stream 0 is the calling thread's own default stream rather than the legacy one. Every stream here is
+// synchronous, so the two defaults behave alike and each name is the plain function under another symbol
+// (the runtime does the same: runtime_api.cpp).
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cuEventRecordWithFlags_ptsz, cuEventRecordWithFlags)
+VGPU_PT_ALIAS(cuEventRecord_ptsz, cuEventRecord)
+VGPU_PT_ALIAS(cuGraphicsMapResources_ptsz, cuGraphicsMapResources)
+VGPU_PT_ALIAS(cuGraphicsUnmapResources_ptsz, cuGraphicsUnmapResources)
+VGPU_PT_ALIAS(cuLaunchCooperativeKernel_ptsz, cuLaunchCooperativeKernel)
+VGPU_PT_ALIAS(cuLaunchHostFunc_ptsz, cuLaunchHostFunc)
+VGPU_PT_ALIAS(cuLaunchKernelEx_ptsz, cuLaunchKernelEx)
+VGPU_PT_ALIAS(cuLaunchKernel_ptsz, cuLaunchKernel)
+VGPU_PT_ALIAS(cuMemAllocAsync_ptsz, cuMemAllocAsync)
+VGPU_PT_ALIAS(cuMemAllocFromPoolAsync_ptsz, cuMemAllocFromPoolAsync)
+VGPU_PT_ALIAS(cuMemFreeAsync_ptsz, cuMemFreeAsync)
+VGPU_PT_ALIAS(cuMemPrefetchAsync_v2_ptsz, cuMemPrefetchAsync_v2)
+VGPU_PT_ALIAS(cuMemPrefetchAsync_ptsz, cuMemPrefetchAsync)   // CUDA 12.0-12.1 spell the call without the _v2
+VGPU_PT_ALIAS(cuMemcpy2DAsync_v2_ptsz, cuMemcpy2DAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy2DUnaligned_v2_ptds, cuMemcpy2DUnaligned_v2)
+VGPU_PT_ALIAS(cuMemcpy2D_v2_ptds, cuMemcpy2D_v2)
+VGPU_PT_ALIAS(cuMemcpy3DAsync_v2_ptsz, cuMemcpy3DAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy3D_v2_ptds, cuMemcpy3D_v2)
+VGPU_PT_ALIAS(cuMemcpyAsync_ptsz, cuMemcpyAsync)
+VGPU_PT_ALIAS(cuMemcpyAtoA_v2_ptds, cuMemcpyAtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoD_v2_ptds, cuMemcpyAtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoHAsync_v2_ptsz, cuMemcpyAtoHAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoH_v2_ptds, cuMemcpyAtoH_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoA_v2_ptds, cuMemcpyDtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoDAsync_v2_ptsz, cuMemcpyDtoDAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoD_v2_ptds, cuMemcpyDtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoHAsync_v2_ptsz, cuMemcpyDtoHAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoH_v2_ptds, cuMemcpyDtoH_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoAAsync_v2_ptsz, cuMemcpyHtoAAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoA_v2_ptds, cuMemcpyHtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoDAsync_v2_ptsz, cuMemcpyHtoDAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoD_v2_ptds, cuMemcpyHtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyPeerAsync_ptsz, cuMemcpyPeerAsync)
+VGPU_PT_ALIAS(cuMemcpyPeer_ptds, cuMemcpyPeer)
+VGPU_PT_ALIAS(cuMemcpy_ptds, cuMemcpy)
+VGPU_PT_ALIAS(cuMemsetD16Async_ptsz, cuMemsetD16Async)
+VGPU_PT_ALIAS(cuMemsetD16_v2_ptds, cuMemsetD16_v2)
+VGPU_PT_ALIAS(cuMemsetD2D16Async_ptsz, cuMemsetD2D16Async)
+VGPU_PT_ALIAS(cuMemsetD2D16_v2_ptds, cuMemsetD2D16_v2)
+VGPU_PT_ALIAS(cuMemsetD2D32Async_ptsz, cuMemsetD2D32Async)
+VGPU_PT_ALIAS(cuMemsetD2D32_v2_ptds, cuMemsetD2D32_v2)
+VGPU_PT_ALIAS(cuMemsetD2D8Async_ptsz, cuMemsetD2D8Async)
+VGPU_PT_ALIAS(cuMemsetD2D8_v2_ptds, cuMemsetD2D8_v2)
+VGPU_PT_ALIAS(cuMemsetD32Async_ptsz, cuMemsetD32Async)
+VGPU_PT_ALIAS(cuMemsetD32_v2_ptds, cuMemsetD32_v2)
+VGPU_PT_ALIAS(cuMemsetD8Async_ptsz, cuMemsetD8Async)
+VGPU_PT_ALIAS(cuMemsetD8_v2_ptds, cuMemsetD8_v2)
+VGPU_PT_ALIAS(cuStreamAddCallback_ptsz, cuStreamAddCallback)
+VGPU_PT_ALIAS(cuStreamAttachMemAsync_ptsz, cuStreamAttachMemAsync)
+VGPU_PT_ALIAS(cuStreamGetCtx_ptsz, cuStreamGetCtx)
+VGPU_PT_ALIAS(cuStreamGetCtx_v2_ptsz, cuStreamGetCtx_v2)
+VGPU_PT_ALIAS(cuStreamGetFlags_ptsz, cuStreamGetFlags)
+VGPU_PT_ALIAS(cuStreamGetPriority_ptsz, cuStreamGetPriority)
+VGPU_PT_ALIAS(cuStreamIsCapturing_ptsz, cuStreamIsCapturing)
+VGPU_PT_ALIAS(cuStreamQuery_ptsz, cuStreamQuery)
+VGPU_PT_ALIAS(cuStreamSynchronize_ptsz, cuStreamSynchronize)
+VGPU_PT_ALIAS(cuStreamWaitEvent_ptsz, cuStreamWaitEvent)
+VGPU_PT_ALIAS(cuMemBatchDecompressAsync_ptsz, cuMemBatchDecompressAsync)
+VGPU_PT_ALIAS(cuMemDiscardAndPrefetchBatchAsync_ptsz, cuMemDiscardAndPrefetchBatchAsync)
+VGPU_PT_ALIAS(cuMemDiscardBatchAsync_ptsz, cuMemDiscardBatchAsync)
+VGPU_PT_ALIAS(cuMemMapArrayAsync_ptsz, cuMemMapArrayAsync)
+VGPU_PT_ALIAS(cuMemPrefetchBatchAsync_ptsz, cuMemPrefetchBatchAsync)
+VGPU_PT_ALIAS(cuMemcpy3DBatchAsync_v2_ptsz, cuMemcpy3DBatchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy3DPeerAsync_ptsz, cuMemcpy3DPeerAsync)
+VGPU_PT_ALIAS(cuMemcpyBatchAsync_v2_ptsz, cuMemcpyBatchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyBatchAsync_ptsz, cuMemcpyBatchAsync)   // CUDA 12.8 and 12.9's spelling, with the failure index
+VGPU_PT_ALIAS(cuMemcpy3DBatchAsync_ptsz, cuMemcpy3DBatchAsync)
+VGPU_PT_ALIAS(cuSignalExternalSemaphoresAsync_ptsz, cuSignalExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cuStreamCopyAttributes_ptsz, cuStreamCopyAttributes)
+VGPU_PT_ALIAS(cuStreamGetAttribute_ptsz, cuStreamGetAttribute)
+VGPU_PT_ALIAS(cuStreamGetDevice_ptsz, cuStreamGetDevice)
+VGPU_PT_ALIAS(cuStreamGetId_ptsz, cuStreamGetId)
+VGPU_PT_ALIAS(cuStreamSetAttribute_ptsz, cuStreamSetAttribute)
+VGPU_PT_ALIAS(cuWaitExternalSemaphoresAsync_ptsz, cuWaitExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cuMemcpy3DPeer_ptds, cuMemcpy3DPeer)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

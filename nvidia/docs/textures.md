@@ -262,7 +262,7 @@ written 0. There is no `suld.p`: ptxas of CUDA 13 does not assemble one.
 An array may be made from any channel descriptor (`cudaChannelFormatKind*`) or driver format
 (`CU_AD_FORMAT_*`) the card accepts, through one table (`nvidia/src/texture_formats.hpp`) that
 the runtime and the driver share: unsigned and signed normalized 8- and 16-bit formats, BC1 to
-BC5 (each with its sRGB variant where there is one), BC6H and BC7 (arrays only), and 10:10:10:2.
+BC5, BC6H and BC7 (each with its sRGB variant where there is one), and 10:10:10:2.
 What a descriptor makes, which read modes, filters and sRGB flags a format takes, the errors
 (`cudaErrorInvalidChannelDescriptor`, `cudaErrorInvalidNormSetting` for a read mode the format
 cannot be read in, `cudaErrorInvalidFilterSetting`) and the driver's own answers (a format fixes
@@ -270,9 +270,13 @@ its channel count; linear and pitched memory take the plain formats and 10:10:10
 data cannot be a surface or have the surface flag) are the card's, recorded in
 `runtime_texture_gaps_expected.inc` and `driver_texture_gaps_expected.inc`.
 
-The values are the card's. The block decoders (`include/vgpu/exec/block_compression.hpp`) are not
-the format descriptions' integer formulas: every number was measured with point-sampled blocks
-covering every endpoint pair of every channel, and the decoders reproduce them value for value.
+The values are the card's. For BC1 to BC5 the block decoders (`include/vgpu/exec/block_compression.hpp`)
+are not the format descriptions' integer formulas: every number was measured with point-sampled blocks
+covering every endpoint pair of every channel, and the decoders reproduce them value for value. BC6H
+and BC7 are the opposite: the card follows the specification (the partition, anchor and bit-position
+tables in `include/vgpu/exec/bc67_tables.hpp` are generated from the specification's tables by
+`scripts/gen_bc67_tables.py`), and random blocks of every mode, decoded by the card and by the header,
+agree texel for texel. Filtering BC6H uses the half-float blend measured for half textures, BC7 the 8-bit one.
 
 | Format | What the texture unit delivers |
 | --- | --- |
@@ -281,41 +285,169 @@ covering every endpoint pair of every channel, and the decoders reproduce them v
 | BC3 alpha | 8-bit: `floor((a0 * 2048 + (a1 - a0) * N + 1024) / 2048)`, N = 289, 578, 892, 1156, 1470, 1759 (eight values) or 385, 770, 1278, 1663 (six values and the two ends) |
 | BC4, BC5 unsigned | 16-bit: `a0 * (257 - W) + a1 * W` with W = 36, 72, 113, 144, 185, 221 (eight values) or 48, 96, 161, 209 (six values, then 0 and 65535) |
 | BC4, BC5 signed | 16-bit signed: endpoints widen by 32767/127 (-128 reads as -127) and blend with the same steps in that scale, rounded to nearest |
+| BC7 | 8-bit, and exactly the specification's (Khronos Data Format Specification, "BPTC Compressed Texture Image Formats"): P-bits and endpoint widening, the 2/3/4-bit weight tables with `(64 - w) * e0 + w * e1 + 32) >> 6`, rotation, index selection, anchor indices. Checked on 1.6 million random blocks of all eight modes, and a low byte of zero (all channels 0) |
+| BC6H | three half floats (the raw bits come out of the block), alpha 1.0. The specification's endpoint unquantization, wrap-around deltas, 6-bit weights and final `31/64` (unsigned) or `31/32` (signed) scaling, with one difference: a negative value whose scaled magnitude is zero comes out as +0, not -0. The reserved mode numbers 19, 23, 27 and 31 return (0, 0, 0, 1). Checked on 3 million random blocks of all 14 modes |
 | 10:10:10:2 | normalized floats; filtering widens the codes by bit replication to 16 bits (`(u << 6) \| (u >> 4)`), as the card does |
 
 Linear filtering, wrapped and mirrored addressing of all of these return exactly the card's
 floats (`runtime_texture_gaps` hashes them; the same program passes against NVIDIA's runtime).
-`maxAnisotropy` of any value is accepted and changes nothing for a fetch with no derivatives, as
-on the card. A resource view reinterprets the same bytes as another format of the same texel
+`maxAnisotropy` of any value is accepted, as on the card, and changes nothing for a plain fetch
+(no explicit level, no derivatives); what it does to a fetch at an explicit level is below. A resource view reinterprets the same bytes as another format of the same texel
 size (a `uint2` array as BC1 blocks, with four times the extent); the read mode is checked
 against the array's own format, then the view.
+
+## Anisotropy and an explicit level
+
+A texture whose descriptor has `maxAnisotropy` of 2 or more and a **linear mip filter** blends the
+two levels an explicit level of detail falls between (`tex.level`, `tex2DLod` and the other
+`...Lod` forms) with a sharper weight than the fraction of the level. The hardware does not
+filter along any axis here: a fetch has no derivatives to give it one. Measured on an RTX 3060
+on constant levels (level *l* holds *l*, so a result is the blended level itself), then on random
+data in every geometry: only the level weight changes, and the levels are fetched as before.
+
+With the fraction *k* in 256ths, the weight is 0 until the ramp starts, then rises at 3/2, 7/4 or 2 times the
+rate and stays at 256 (the upper level alone):
+
+| `maxAnisotropy` | rate | ramp starts at | weight |
+| --- | --- | --- | --- |
+| 0, 1 | -- | -- | k (an ordinary blend) |
+| 2, 3 | 3/2 | 128/3 = 42.67 | floor(3 (k - 42) / 2) |
+| 4 to 7 | 7/4 | 3 * 128/7 = 54.86 | floor(7 (k - 54) / 4) |
+| 8 and more (16, 17, 100, 2^32-1 alike) | 2 | 64 | 2 (k - 64) |
+
+The ramp's start is not where the fraction is read from, because the bias does not simply add to
+the level of detail as it does without anisotropy. The card takes
+`lod + trunc(bias - lo) + trunc(lo)`, with the bias in 256ths *not* truncated first and
+`trunc` toward zero, `lo` the start above. A bias of 0 gives the table; a bias at or above `lo`
+moves the start up by one 256th (to 43 or 55: `lo` itself is not a whole number, and the
+truncation of a positive number is not the truncation of a negative one); a fractional bias
+moves it by one 256th when its fraction passes `lo`'s own (0.667, 0.857, 0). That was measured for
+biases from -300 to 300 256ths in steps of 1/8, and at 1/2048 next to 128/3 and 3 * 128/7. The level
+clamps (`minMipmapLevelClamp`, `maxMipmapLevelClamp`) act on the level of detail this makes, so a level
+that a clamp sets has its plain fraction.
+
+A point mip filter is not affected, nor is a fetch with no explicit level, nor is the filter
+within a level (point or linear). The fetch itself is the same as without anisotropy.
+`texture_anisotropy` checks 295 combinations -- every geometry (1D, 2D, 3D, cubemap, layered
+forms), both texel types, both filters, 17 `maxAnisotropy` values, 18 biases against each
+threshold, fractional biases and clamps -- in both engines against the card's hashes.
+
+## tex.grad
+
+The level of detail of a fetch with explicit gradients (`tex2DGrad` and friends) is derived from them by the
+texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D, 2D and 3D textures, layered
+or not, of any size (the program `texture_grad` hashes the fetches of the card on both engines). It was
+found by reading the level of detail straight off the card: a mipmapped texture whose level k holds the constant
+k, filtered trilinearly, returns the LOD in 1/256ths of a level itself, and about 5 million such fetches (random
+and gridded gradients of every size, sign and relation) were fitted. What the card does is in
+`include/vgpu/exec/texture_grad.hpp`: every gradient component is cut to 10 significant bits; the length of a
+gradient is the larger component plus 11/32 of the smaller (the smaller's mantissa times 11/8, rounded half up);
+the largest of the lengths of dPdx and dPdy and 11/16 of the lengths of dPdx + dPdy and dPdx - dPdy (the quad's
+diagonals; their components are added with one guard bit below the larger's last bit) is taken; and log2 of it
+comes from a 256-entry table indexed by the top 8 bits of the mantissa, added to 256 times the exponent. The result
+is truncated to 1/256ths like an explicit LOD, then the level bias and clamps apply as for `tex.level`; a gradient of
+zero (or NaN) is a level of minus infinity, an infinite one the last level. A texture that is not mipmapped is
+fetched at level 0 whatever the gradients. The level of a gradient is not `log2` of its Euclidean length: a pair
+of parallel gradients along one axis reads 1.375 times as long as either, the octagonal norm that earlier
+measurements ran into.
+
+A gradient is scaled by the texture's size (in texels of the base level) before any of that. For a power-of-two
+size that is an exponent change and exact. For any other size the card multiplies the gradient's 10-bit
+significand by the size's significand, which is cut to 10 significant bits (a size of 1025 scales as 1024), as a
+sum of copies of the gradient shifted right by one position for each set bit of the size's fraction, each copy
+losing the bits below the twelfth fractional bit, and turns the sum back into a 10-bit float by adding 7 and
+shifting right by 3 bits (4 when the sum is 2 or more, where the extra integer bit sits). That is
+`tex_grad::scale_by_size`; it was found by reading the level off the card for single components first (the rounding
+of the product shows as a step function of the gradient's significand that moves with the size's bits) and then
+for every pair, over 14 sizes from 3 to 16383, about 1.5 million fetches with no difference.
+
+**3D textures** are not a TXD in SASS: ptxas builds `tex3DGrad` from a quad of `TEX.NDV` fetches. Each thread of
+the quad broadcasts its position P and gradients with `SHFL.IDX`, `FSWZADD.NDV` makes the four coordinates of a quad
+(P, P + dPdx, P + dPdy, and the sum of both) in single precision, a `TEX.NDV` with no level operand takes the level of
+detail from the coordinates of the quad it sits in, and `MOV Rd, Rs, mask` gathers the four results (the mask is the
+places of the quad that write: 1, 2, 4, 8). The whole is wrapped in `BMOV.32 B15, MACTIVE` / `BMOV.32.PQUAD MACTIVE,
+B15` and the restoring `BMOV`, which make every thread of a quad with one thread running take part (a thread that has
+exited or sits in another branch is a helper whose registers are written). The unit sees a gradient of c1 - c0
+where c1 = fl32(P + d), so the gradient is rounded to P's precision (a gradient of 2^-10 at P = 1.9 is read
+as 2^-10 to the nearest 2^-23); a coordinate that is NaN reads as 0, and one of 2^97 or more (infinities included)
+overflows the fetch to the last level. Given those differences the level follows the 2D pipeline with three
+components (`length3`, `diagonal3`, `lod_q_3d`): a length is larger + 11/32 middle + 1/4 smallest, the middle's
+share built as in two dimensions and cut to 10 bits, the smallest's quarter cut to the grid of that share before
+the three are added and cut again; a diagonal's shares are 11/16, 121/512 and 11/64 of the components. Fitted on
+~1.5 million fetches over eight sizes (powers of two or not, per-axis) and the special values, with no difference.
+The simulator runs the quad in the SASS engine (`BMOV`, `FSWZADD`, `MOV` with a quad mask and `TEX.NDV`) and the
+PTX engine computes the same level from P and the gradient, and both agree with the card on fetches where only some
+threads of a quad fetch (the `3d-divergent` cases).
+
+**Cube maps** were measured the same way but are refused. ptxas builds `texCubemapGrad` from the same quad of
+`TEX.NDV`, with each lane's direction normalized by its largest component (`FMNMX`, `MUFU.RCP`, `FMUL`). The unit
+then works in the face of the first lane: a lane on the same face gives the difference of the normalized
+coordinates, a lane on a neighbouring face is unfolded (its coordinate along the shared edge is 1 - r + the distance
+of the first lane to the edge, r being the neighbour's component along the first lane's axis, signed), a lane on the
+opposite face overflows the fetch, and the two diagonals of the quad count only when the first three lanes are on one
+face. That model matches an RTX 3060 on 31,083 of 31,083 random fetches when the card's own `MUFU.RCP` is used, but
+the simulator's reciprocal is the correctly rounded one and the card's differs from it by one unit in the last
+place on 13% of the inputs (it is a table with a quadratic interpolation, not reproduced), which changes the
+level of about one fetch in 15,000. So cube textures stay refused rather than right 99.99% of the time.
+
+**Texture coordinates on levels that are not a power of two wide** have a rule of their own, found while checking
+these fetches: the card floors the normalized coordinate to 21 fractional bits (negative ones toward minus
+infinity) before it multiplies by the width of the level (`texel_coordinate`). A point fetch at the float above 0.04
+on a 25-texel level reads texel 0, where the exact product 1.0000000708 says 1; the switch from texel k - 1 to k is at
+ceil(k 2^21 / width) / 2^21, and every 8-bit filter weight follows the floored coordinate. A NaN coordinate reads as 0.
+Powers of two are unaffected (the product is exact).
+
+## tex.grad with anisotropy, measured but not reproduced
+
+A texture with `maxAnisotropy` above 1 filters a `tex.grad` fetch with several taps along the major axis of the
+gradients. Round 6 probed it on an RTX 3060 (`tools/probes/texture_aniso_grad_probe.cu`: impulse textures with
+point filtering, so one query reads one tap's weight; mip level forced with the clamps; and level-id textures).
+This is what the card does; none of it is in the simulator, because the arithmetic behind the weights was not
+recovered exactly (last item), and a plausible wrong number is worse than a refusal.
+
+- **Taps.** Pmax = the larger of the two gradient lengths, Pmin = |det| / Pmax (the area of the parallelogram
+  over its longer side, not the shorter side: two orthogonal gradients of lengths 64 and 16 at 45 degrees give
+  an effective ratio of 3.6, at 10 degrees 4.38, at 0 exactly 4). With the effective ratio r = Pmax / Pmin and
+  A = `maxAnisotropy` (2, 4, 8, 16 all measured; the number of taps never exceeds A): r <= 1 is one tap; r between
+  1 and 2 is two equal taps, centred, spaced less than a texel (0.19 texel at r = 1.1, 0.34 at 1.2, 0.67 at 1.5,
+  0.95 at 1.9, 1 from 2); from r = 2 on, Nt = 2 ceil(r / 2) taps spaced exactly one texel of the fetched level
+  along the major axis, centred, the interior ones with weight 1/r and the two end ones with
+  (r - Nt + 2) / (2 r). Weights are integers in 1/1024 that sum to 1024; the end weight is
+  (1024 - (Nt - 2) w) / 2 for the interior weight w. The spacing follows the level actually fetched (a clamped
+  level keeps one texel).
+- **Level of detail** is log2(max(Pmin, Pmax / A)) (checked from the sharpened mip weights of "Anisotropy and
+  an explicit level" above, which the grad fetch uses too).
+- **Interior weight.** With diff = 2 L(Pmax) - L(Pmax Pmin) in 1/256ths of an octave, L the lod log2 table of
+  `texture_grad.hpp`, (q, f) = divmod(diff, 256) and E = round(256 2^(-f/256)), the interior weight is
+  (4 E) >> q. This reproduces all 3,000 weights measured when Pmax or Pmin is a power of two (every mantissa of
+  Pmin against Pmax = 64, and of Pmax against Pmin = 16), where the product's log is the plain table entry.
+  For two other values the product's mantissa has to be rounded to 10 bits before its table index is taken to
+  get close (4.3 % of 65,536 pairs still differ by one or two codes of diff, 14 % with the index truncated), and
+  no rounding rule tried closes that.
+- **Sum.** The taps' weighted bilinear values are added exactly and rounded to nearest, ties up (3,997 of 4,000
+  random float fetches; the other three are 0.50 to 0.52 ulp off, a narrower internal accumulator).
+
+Not found: how the product's log is formed exactly (the item above), the ratio thresholds at which the tap count
+steps up, the tap positions of rotated gradients (only the supports were looked at), the spacing in the 1 to 2
+range as a formula, and how the taps interact with the blend of two mip levels. Each is a further black-box fit
+of the size of the original LOD one, and the first is not closed.
 
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
 
-- **`tex.grad`.** The level of detail comes out of the GPU's approximate log2 and
-  length units, and 12,000 fetches of an RTX 3060 on a texture whose levels each hold
-  their own number do not follow any formula tried: with one dominant gradient it is
-  the log2 of its length to within a few 256ths, but with two comparable ones it
-  runs up to 25% longer than either, and neither the Euclidean length nor the largest
-  component nor an alpha-max-beta-min sum of one gradient explains it.
+- **`tex.grad` beyond the cases that are exact.** 1D, 2D and 3D textures (and their layered forms; SASS `TXD`
+  and the quad of `TEX.NDV`) of any size derive their level of detail from the gradients exactly as the card does
+  (above). Not reproduced, and refused by name: cube textures (the model above matches the card, but needs its
+  `MUFU.RCP` bit for bit) and a texture with `maxAnisotropy` above 1 (the card then filters along the major axis of
+  the gradients' ellipse).
+  Round 6 measured the anisotropic case on an RTX 3060 and could not reproduce it bit for bit, so it stays
+  refused; what was found is in "tex.grad with anisotropy, measured but not reproduced" below.
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.
-- **Anisotropic filtering with an explicit level.** A plain `tex` fetch is not affected by
-  `maxAnisotropy` (the same hashes for 1, 4 and 16), and a texture descriptor with any value
-  is accepted, as the card accepts it; but an explicit-level `tex.level` one is affected on
-  an RTX 3060 -- the hardware filters along an axis the instruction does not give -- and
-  that is not modelled, so such a fetch of a texture with `maxAnisotropy` above 1 differs
-  from the card.
 - `tld4` on layered or cubemap textures (the runtime refuses a gather array
   that is layered or a cubemap, so there is nothing to measure them on).
-- **BC6H and BC7.** Arrays of these formats can be made, filled and copied, but
-  creating a texture object over one answers `cudaErrorNotSupported` /
-  `CUDA_ERROR_NOT_SUPPORTED` with a message on stderr (once). Their decoders need
-  the mode and partition tables, which were not measured (they can be, one
-  partition at a time, from the card).
 
 ## Surfaces out of range: .trap, .clamp and .zero
 

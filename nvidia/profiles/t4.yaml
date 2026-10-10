@@ -46,3 +46,12 @@ cuda:
   memory_bus_width_bits: 256
   async_engine_count: 3
   persisting_l2_bytes: 0
+
+# How the SMs are grouped: the numbers NVIDIA publishes for this part, which a cluster launch needs
+# (a cluster lives in one GPC). NVIDIA does not say how many TPCs each GPC has when some are
+# disabled, so the spread across GPCs is always derived (even, larger first; vgpu::GpuLayout).
+# Source: NVIDIA Ada GPU Architecture whitepaper, Table 5 (NVIDIA T4): GPCs 5, TPCs 20, SMs 40.
+layout:
+  gpcs: 5
+  tpcs: 20
+  sms_per_tpc: 2

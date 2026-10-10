@@ -503,6 +503,10 @@ jobs:
         #                        nvidia-nvshmem-cu13 pip package turns it on.
         #   amd_opencl           ROCm's OpenCL runtime (rocm-opencl) is not in the
         #                        image; the rocm-libraries workflow runs it.
+        #   e2e_nvshmem_bootstrap
+        #                        the image has no Open MPI (mpicxx), which the MPI bootstrap needs.
+        #   e2e_cupti_compat12   it builds against the CUDA 12.3 to 12.9 headers, and this
+        #                        image has CUDA 13 only; the 12.4 and 12.8 jobs run it.
         #   e2e_fft_lto_callbacks
         #                        the CUDA toolkit's libnvJitLink (which turns LTO-IR into
         #                        machine code) is nowhere on the image: not beside nvcc, not
@@ -516,7 +520,7 @@ jobs:
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms)$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \

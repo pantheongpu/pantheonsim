@@ -46,6 +46,7 @@
 
 #include <cuda_runtime.h>
 
+#include "capture_defer.hpp"
 #include "fatbin.hpp"
 #include "ptx_link.hpp"
 #include "toolkit_nvjitlink.hpp"
@@ -405,6 +406,8 @@ void transform(const Plan& p, const Geometry& g, const std::vector<char>& hin,
 
 // The single implementation behind every single-GPU Exec entry point. Reads
 // the whole input, transforms batch by batch, writes the whole output.
+cufftResult exec_plan(const Plan* p, const void* idata, void* odata, int direction, bool wait);
+
 cufftResult exec(cufftHandle handle, const void* idata, void* odata, int direction) {
   Plan* p = find(handle);
   if (!p) return CUFFT_INVALID_PLAN;
@@ -414,7 +417,23 @@ cufftResult exec(cufftHandle handle, const void* idata, void* odata, int directi
   // INTERNAL_ERROR (RTX 3060 pair).
   if (p->gpus.size() > 1) return CUFFT_INTERNAL_ERROR;
   if (!idata || !odata) return CUFFT_INVALID_VALUE;
-  cudaStreamSynchronize(p->stream);
+  // On a capturing stream the transform is recorded and runs at each launch of the graph, over what the
+  // graph's kernels have written by then: it cannot wait for the stream, and it reads nothing now. A copy
+  // of the plan goes with it, since the program may destroy the plan once the capture is over.
+  if (vgpu_capture::stream_capturing(p->stream)) {
+    auto snapshot = std::make_shared<Plan>(*p);
+    if (vgpu_record_host_op_if_capturing(p->stream, [snapshot, idata, odata, direction] {
+          exec_plan(snapshot.get(), idata, odata, direction, false);
+        }))
+      return CUFFT_SUCCESS;
+  }
+  return exec_plan(p, idata, odata, direction, true);
+}
+
+// The transform itself, past the checks. `wait` is whether the stream is waited for first (not when the
+// graph that runs this is itself on that stream).
+cufftResult exec_plan(const Plan* p, const void* idata, void* odata, int direction, bool wait) {
+  if (wait) cudaStreamSynchronize(p->stream);
   const Geometry g = geometry(*p);
   // The output is read first so the gaps a strided or padded layout leaves
   // keep what they held; an in-place transform reads the input just after.

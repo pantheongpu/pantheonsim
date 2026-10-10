@@ -193,6 +193,19 @@ int main() {
   CK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold));
   void* pooled = nullptr;
   CK(cudaMallocFromPoolAsync(&pooled, 1 << 16, pool, s1));
+  // Sharing a pool, or a pointer from one, with another process: refused on
+  // this machine, and the callbacks carry the refusals.
+  {
+    int fd = -1;
+    cudaMemPool_t imported = nullptr;
+    cudaMemPoolPtrExportData exported;
+    std::memset(&exported, 0, sizeof exported);
+    void* imported_ptr = nullptr;
+    (void)cudaMemPoolExportToShareableHandle(&fd, pool, cudaMemHandleTypePosixFileDescriptor, 0);
+    (void)cudaMemPoolImportFromShareableHandle(&imported, &fd, cudaMemHandleTypePosixFileDescriptor, 0);
+    (void)cudaMemPoolExportPointer(&exported, pooled);
+    (void)cudaMemPoolImportPointer(&imported_ptr, pool, &exported);
+  }
   CK(cudaFreeAsync(pooled, s1));
   CK(cudaStreamSynchronize(s1));
   CK(cudaMemPoolTrimTo(pool, 0));
@@ -200,6 +213,38 @@ int main() {
   CK(cudaMallocAsync(&pooled, 1 << 12, s1));
   CK(cudaFreeAsync(pooled, s1));
   CK(cudaStreamSynchronize(s1));
+
+  // ---- external memory and semaphores: nothing to import on this machine ----
+  {
+    cudaExternalMemoryHandleDesc md;
+    std::memset(&md, 0, sizeof md);
+    md.type = cudaExternalMemoryHandleTypeOpaqueFd;
+    md.handle.fd = -1;
+    md.size = 4096;
+    cudaExternalMemory_t em = nullptr;
+    (void)cudaImportExternalMemory(&em, &md);
+    cudaExternalMemoryBufferDesc bd;
+    std::memset(&bd, 0, sizeof bd);
+    bd.size = 256;
+    void* mapped = nullptr;
+    (void)cudaExternalMemoryGetMappedBuffer(&mapped, em, &bd);
+    (void)cudaDestroyExternalMemory(em);
+    cudaExternalSemaphoreHandleDesc sd;
+    std::memset(&sd, 0, sizeof sd);
+    sd.type = cudaExternalSemaphoreHandleTypeOpaqueFd;
+    sd.handle.fd = -1;
+    cudaExternalSemaphore_t es = nullptr;
+    (void)cudaImportExternalSemaphore(&es, &sd);
+    cudaExternalSemaphoreSignalParams sp;
+    std::memset(&sp, 0, sizeof sp);
+    (void)cudaSignalExternalSemaphoresAsync(&es, &sp, 0, s1);   // a null handle crashes the card's
+    cudaExternalSemaphoreWaitParams wp;
+    std::memset(&wp, 0, sizeof wp);
+    (void)cudaWaitExternalSemaphoresAsync(&es, &wp, 0, s1);
+    (void)cudaDestroyExternalSemaphore(es);
+    (void)cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+                                             cudaFlushGPUDirectRDMAWritesToOwner);
+  }
 
   // ---- kernels ----
   CK(cudaFuncSetCacheConfig(reinterpret_cast<const void*>(touch), cudaFuncCachePreferNone));
@@ -245,6 +290,13 @@ int main() {
   CK(cudaGraphGetNodes(g, all.data(), &nodes));
   cudaGraphNodeType type;
   CK(cudaGraphNodeGetType(kn, &type));
+  {
+    cudaKernelNodeAttrValue av;
+    std::memset(&av, 0, sizeof av);
+    (void)cudaGraphKernelNodeGetAttribute(kn, cudaKernelNodeAttributeAccessPolicyWindow, &av);
+    (void)cudaGraphKernelNodeSetAttribute(kn, cudaKernelNodeAttributeAccessPolicyWindow, &av);
+    (void)cudaGraphKernelNodeCopyAttributes(kn, kn);
+  }
   CK(cudaGraphClone(&clone, g));
   cudaGraphNode_t found;
   CK(cudaGraphNodeFindInClone(&found, kn, clone));
@@ -257,6 +309,29 @@ int main() {
   CK(cudaGraphDestroy(clone));
   CK(cudaGraphDestroy(g));
   CK(cudaGraphDestroy(child));
+
+  // A graph with semaphore nodes that name no semaphore; it is never launched.
+  {
+    cudaGraph_t sg;
+    CK(cudaGraphCreate(&sg, 0));
+    cudaExternalSemaphoreSignalNodeParams ssp;
+    cudaExternalSemaphoreWaitNodeParams swp;
+    std::memset(&ssp, 0, sizeof ssp);
+    std::memset(&swp, 0, sizeof swp);
+    cudaGraphNode_t sn, wn;
+    (void)cudaGraphAddExternalSemaphoresSignalNode(&sn, sg, nullptr, 0, &ssp);
+    (void)cudaGraphAddExternalSemaphoresWaitNode(&wn, sg, nullptr, 0, &swp);
+    (void)cudaGraphExternalSemaphoresSignalNodeGetParams(sn, &ssp);
+    (void)cudaGraphExternalSemaphoresSignalNodeSetParams(sn, &ssp);
+    (void)cudaGraphExternalSemaphoresWaitNodeGetParams(wn, &swp);
+    (void)cudaGraphExternalSemaphoresWaitNodeSetParams(wn, &swp);
+    cudaGraphExec_t sge;
+    CK(cudaGraphInstantiate(&sge, sg, 0));
+    (void)cudaGraphExecExternalSemaphoresSignalNodeSetParams(sge, sn, &ssp);
+    (void)cudaGraphExecExternalSemaphoresWaitNodeSetParams(sge, wn, &swp);
+    CK(cudaGraphExecDestroy(sge));
+    CK(cudaGraphDestroy(sg));
+  }
 
   CK(cudaStreamDestroy(s1));
   CK(cudaStreamDestroy(s2));

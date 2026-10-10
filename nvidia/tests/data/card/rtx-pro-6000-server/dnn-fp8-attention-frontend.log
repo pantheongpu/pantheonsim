@@ -1,0 +1,7 @@
+cuDNN Frontend warning: Multiple libcudart libraries found: libcudart.so.12 and libcudart.so.13. Using libcudart.so.12. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.
+ok   cudnn-frontend's sdpa_fp8 plans on a Hopper profile
+ok   it runs
+FAIL O is the documented FP8 attention within one FP8 step (29)
+ok   amax of S
+ok   amax of O
+FAIL

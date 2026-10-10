@@ -18,8 +18,10 @@
  * optimizer, slicing, workspace management, the tensor decompositions
  * (QR, SVD, gate split), and the high-level state API (states, tensor
  * operators, network operators, accessors, expectations, marginals, samplers,
- * MPS). Distributed execution and the undocumented exports are exported by
- * the library but answer NOT_SUPPORTED, so they are not declared here.
+ * MPS), and distributed execution (the communicator and the table of
+ * communication primitives of cutensornet/typesDistributed.h). The
+ * undocumented exports are exported by the library but answer NOT_SUPPORTED,
+ * so they are not declared here.
  */
 #ifndef VGPU_CUTENSORNET_H_
 #define VGPU_CUTENSORNET_H_
@@ -881,6 +883,42 @@ cutensornetStatus_t cutensornetSamplerSample(const cutensornetHandle_t handle,
                                              cutensornetWorkspaceDescriptor_t workDesc, int64_t* samples,
                                              cudaStream_t cudaStream);
 cutensornetStatus_t cutensornetDestroySampler(cutensornetStateSampler_t tensorNetworkSampler);
+
+/* ---- distributed execution ---- */
+
+/* A communicator in type-erased form (cutensornet/typesDistributed.h). */
+typedef struct {
+  void* commPtr;    /* the MPI_Comm */
+  size_t commSize;  /* sizeof(MPI_Comm) */
+} cutensornetDistributedCommunicator_t;
+
+#define CUTENSORNET_DISTRIBUTED_INTERFACE_VERSION 2
+
+/* The table of communication primitives a shared library exports under the
+ * name `cutensornetCommInterface`; $CUTENSORNET_COMM_LIB names that library. */
+typedef struct {
+  int version;
+  int (*getNumRanks)(const cutensornetDistributedCommunicator_t*, int32_t*);
+  int (*getNumRanksShared)(const cutensornetDistributedCommunicator_t*, int32_t*);
+  int (*getProcRank)(const cutensornetDistributedCommunicator_t*, int32_t*);
+  int (*Barrier)(const cutensornetDistributedCommunicator_t*);
+  int (*Bcast)(const cutensornetDistributedCommunicator_t*, void*, int32_t, cudaDataType_t, int32_t);
+  int (*Allreduce)(const cutensornetDistributedCommunicator_t*, const void*, void*, int32_t, cudaDataType_t);
+  int (*AllreduceInPlace)(const cutensornetDistributedCommunicator_t*, void*, int32_t, cudaDataType_t);
+  int (*AllreduceInPlaceMin)(const cutensornetDistributedCommunicator_t*, void*, int32_t, cudaDataType_t);
+  int (*AllreduceDoubleIntMinloc)(const cutensornetDistributedCommunicator_t*, const void*, void*);
+  int (*Allgather)(const cutensornetDistributedCommunicator_t*, const void*, void*, int32_t, cudaDataType_t);
+} cutensornetDistributedInterface_t;
+
+cutensornetStatus_t cutensornetDistributedResetConfiguration(cutensornetHandle_t handle, const void* commPtr,
+                                                             size_t commSize);
+cutensornetStatus_t cutensornetDistributedGetNumRanks(const cutensornetHandle_t handle, int32_t* numRanks);
+cutensornetStatus_t cutensornetDistributedGetProcRank(const cutensornetHandle_t handle, int32_t* procRank);
+cutensornetStatus_t cutensornetDistributedSynchronize(const cutensornetHandle_t handle);
+cutensornetStatus_t cutensornetCreateDistributedTensorDescriptor(
+    const cutensornetHandle_t handle, int32_t numModes, const int64_t extents[], const int64_t elementStrides[],
+    const int64_t blockSizes[], const int64_t blockStrides[], const int64_t nranksPerMode[], const int32_t modeLabels[],
+    cudaDataType_t dataType, cutensornetTensorDescriptor_t* tensorDesc);
 
 #ifdef __cplusplus
 }
