@@ -1273,7 +1273,8 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
       one's region) is right in a row (`0 1 0 1 0` is one region, label 0) and wrong in a plane: in
       `1 1 0 0 / 0 1 0 0` the pixel at x = 1 ties the roots 2, 4 and 6, yet the card keeps root 4 (label 0)
       apart from the plateau of 2, 3, 6, 7 (label 1). Switching the rule off or restricting it to opposite
-      neighbours is worse on the whole (0 or 3 more images in 512 fail depending on size), so neither is right;
+      neighbours is worse (3x3, 8-way: 44 images of 512 differ with the rule, 69 with it restricted to opposite
+      neighbours, 143 without it), so none of these is right;
     * pixel 0 behaves differently from every other pixel and not locally: `1 1 0 / 1 1 0 / 0 0 0` labels the
       whole image 1, including the root at pixel 0 whose own closed neighbourhood starts at 0, while the same
       two columns over two rows (`1 1 0 / 1 1 0`) keep pixel 0 and pixel 3 at label 0; `0 0 1 / 0 0 0 / 1 0 0` is
