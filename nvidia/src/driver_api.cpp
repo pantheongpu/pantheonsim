@@ -6839,6 +6839,7 @@ VGPU_PT_ALIAS(cuMemAllocAsync_ptsz, cuMemAllocAsync)
 VGPU_PT_ALIAS(cuMemAllocFromPoolAsync_ptsz, cuMemAllocFromPoolAsync)
 VGPU_PT_ALIAS(cuMemFreeAsync_ptsz, cuMemFreeAsync)
 VGPU_PT_ALIAS(cuMemPrefetchAsync_v2_ptsz, cuMemPrefetchAsync_v2)
+VGPU_PT_ALIAS(cuMemPrefetchAsync_ptsz, cuMemPrefetchAsync)   // CUDA 12.0-12.1 spell the call without the _v2
 VGPU_PT_ALIAS(cuMemcpy2DAsync_v2_ptsz, cuMemcpy2DAsync_v2)
 VGPU_PT_ALIAS(cuMemcpy2DUnaligned_v2_ptds, cuMemcpy2DUnaligned_v2)
 VGPU_PT_ALIAS(cuMemcpy2D_v2_ptds, cuMemcpy2D_v2)

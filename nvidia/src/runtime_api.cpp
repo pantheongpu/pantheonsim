@@ -11179,7 +11179,6 @@ static cudaError_t cudaGraphExecDestroy_traced(cudaGraphExec_t exec) {
 VGPU_EXPORT cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   return traced_call("cudaGraphExecDestroy", cudaGraphExecDestroy_traced, exec);
 }
-#if CUDART_VERSION >= 12050
 // The flags the executable graph was instantiated with.
 static cudaError_t cudaGraphExecGetFlags_traced(cudaGraphExec_t exec, unsigned long long* flags) {
   if (!flags) return cudaErrorInvalidValue;
@@ -11192,6 +11191,18 @@ static cudaError_t cudaGraphExecGetFlags_traced(cudaGraphExec_t exec, unsigned l
 
 VGPU_EXPORT cudaError_t cudaGraphExecGetFlags(cudaGraphExec_t exec, unsigned long long* flags) {
   return traced_call("cudaGraphExecGetFlags", cudaGraphExecGetFlags_traced, exec, flags);
+}
+#if CUDART_VERSION < 13000
+// Deprecated (CUDA 7.5) and removed from CUDA 13's headers: on a device with double precision they do nothing.
+// Measured with libcudart.so.12 (12.8) on an RTX 3060: both return cudaSuccess and leave the value alone,
+// a null pointer included.
+static cudaError_t cudaSetDoubleForDevice_traced(double*) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaSetDoubleForDevice(double* d) {
+  return traced_call("cudaSetDoubleForDevice", cudaSetDoubleForDevice_traced, d);
+}
+static cudaError_t cudaSetDoubleForHost_traced(double*) { return cudaSuccess; }
+VGPU_EXPORT cudaError_t cudaSetDoubleForHost(double* d) {
+  return traced_call("cudaSetDoubleForHost", cudaSetDoubleForHost_traced, d);
 }
 #endif
 // What a library asks before it adds work to a stream that might be capturing:
@@ -11364,12 +11375,26 @@ VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
 VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
 VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
 VGPU_PT_ALIAS(cudaGraphInstantiateWithParams_ptsz, cudaGraphInstantiateWithParams)
+#if CUDART_VERSION >= 12050
 VGPU_PT_ALIAS(cudaGetDriverEntryPointByVersion_ptsz, cudaGetDriverEntryPointByVersion)
+#endif
 VGPU_PT_ALIAS(cudaGetDriverEntryPoint_ptsz, cudaGetDriverEntryPoint)
+// CUDA 12's headers spell these two with a _v2 (the plain name is the v1 parameter structure), and the shim's
+// definitions are named by that macro, so the alias names the _v2 form there.
+#if CUDART_VERSION >= 13000
 VGPU_PT_ALIAS(cudaSignalExternalSemaphoresAsync_ptsz, cudaSignalExternalSemaphoresAsync)
+#else
+VGPU_PT_ALIAS(cudaSignalExternalSemaphoresAsync_v2_ptsz, cudaSignalExternalSemaphoresAsync_v2)
+#endif
+#if CUDART_VERSION >= 13000
 VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_ptsz, cudaStreamGetCaptureInfo)
+#endif
 VGPU_PT_ALIAS(cudaStreamGetDevice_ptsz, cudaStreamGetDevice)
+#if CUDART_VERSION >= 13000
 VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_ptsz, cudaWaitExternalSemaphoresAsync)
+#else
+VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_v2_ptsz, cudaWaitExternalSemaphoresAsync_v2)
+#endif
 #if CUDART_VERSION >= 12030
 VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
 #endif
