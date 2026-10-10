@@ -1538,7 +1538,9 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   not checked against a card:** every runtime one, because NVIDIA's CUDA 13.2
   `libcudart` crashes on its first call on this machine (`cudaGetDeviceCount`),
   so there is no runtime of that toolkit to compare with; they answer the way
-  the driver's twin does. `cudaGraphConditionalHandleCreate_v2` takes only a null
+  the driver's twin does (`e2e_runtime_132` checks them against the driver's, and SKIPs
+  unless the runtime shim was built with 13.2 headers, as CI's are not).
+  `cudaGraphConditionalHandleCreate_v2` takes only a null
   execution context (any other is `cudaErrorInvalidResourceHandle`). Refused on
   purpose, once on stderr, with `cudaErrorNotSupported` /
   `CUDA_ERROR_NOT_SUPPORTED` where the card answers: the green-context and
