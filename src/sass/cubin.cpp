@@ -100,16 +100,21 @@ bool is_cubin(const void* data, size_t size) {
          (p[7] == 0x41 || p[7] == 0x33);
 }
 
-// sm_XYa or not: e_flags names the architecture the same for both, and the
-// difference is one record in .nv.compat -- attribute 0x09 holds 1 in an
-// arch-specific image and 0 otherwise (measured on cubins CUDA 12.0's and
-// 13.0's nvcc wrote for sm_90 to sm_120, each with and without the "a"; an "f"
-// image reads 0, as it runs across its major version). Only the section table
-// is read, so a fatbin's candidates can be told apart without parsing them.
+// sm_XYa or not. Two places say so, by toolkit (measured on the cubins CUDA 12.0's and 13.0's nvcc and
+// 12.8's ptxas write for sm_90 to sm_120, each with and without the "a"):
+//  - CUDA 13: the record with attribute 9 in .nv.compat holds 1 (0 for plain, and for an "f" image,
+//    which runs across its major version); e_flags is the same either way.
+//  - CUDA 12.8: no such record; e_flags has bit 3 set in the byte after the architecture's own
+//    (0x0a640006 for sm_100a, 0x02640006 for sm_100; 0x005a0d5a for sm_90a, 0x005a055a for sm_90).
+// Only the section table and the header are read, so a fatbin's candidates can be told apart without
+// parsing them.
 bool cubin_arch_specific(const uint8_t* data, size_t size) {
   if (!is_cubin(data, size)) return false;
   try {
     const Reader r{data, size};
+    const uint32_t eflags = r.at<uint32_t>(0x30);
+    const bool abi7 = data[7] == 0x33;   // CUDA 12.0's ELF ABI: the architecture is the low byte
+    if (((abi7 ? eflags >> 8 : eflags) & 0x8) != 0) return true;
     const uint64_t shoff = r.at<uint64_t>(0x28);
     const uint16_t shentsize = r.at<uint16_t>(0x3a), shnum = r.at<uint16_t>(0x3c), shstrndx = r.at<uint16_t>(0x3e);
     if (shentsize < 64 || shnum == 0 || shstrndx >= shnum) return false;

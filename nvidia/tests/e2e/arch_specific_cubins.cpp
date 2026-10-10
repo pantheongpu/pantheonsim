@@ -6,7 +6,7 @@
 //   arch_specific_cubins <fatbin> run|fail
 //
 // run_arch_specific.sh builds the fatbins with nvcc and runs this on each simulated GPU. The flag is read
-// from the cubin (the .nv.compat record nvcc writes for "a"); that the driver treats it so is the
+// from the cubin (the .nv.compat record CUDA 13's nvcc writes for "a", or the e_flags bit CUDA 12.8's does); that the driver treats it so is the
 // documented rule, derived from documentation and not checked against a card (the local RTX 3060 is sm_86,
 // which has no "a" target).
 #include <cuda.h>
