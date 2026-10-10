@@ -76,18 +76,6 @@ std::string gpu_metrics(const telemetry::DeviceSample& d, const ras::Counters& c
   return std::string(reinterpret_cast<const char*>(&m), sizeof m);
 }
 
-const char* const kDriverFiles[9] = {"gpu_busy_percent",        "mem_busy_percent",
-                                    "mem_info_vram_total",     "mem_info_vram_used",
-                                    "mem_info_vis_vram_total", "mem_info_vis_vram_used",
-                                    // Written from NBIO's registers (regs::write_sysfs_files).
-                                    "current_compute_partition", "current_memory_partition",
-                                    "available_memory_partition"};
-const char* const kHwmonFiles[21] = {
-    "name",          "temp2_input",   "temp2_label",    "temp2_crit",      "temp2_crit_hyst",
-    "temp2_emergency", "temp3_input", "temp3_label",    "temp3_crit",      "temp3_crit_hyst",
-    "temp3_emergency", "power1_average", "power1_label", "power1_cap",     "power1_cap_max",
-    "power1_cap_min", "power1_cap_default", "freq1_input", "freq1_label", "freq2_input", "freq2_label"};
-
 namespace {
 // Replaces a file whole, so a reader never sees half of one.
 void put(const std::string& path, const std::string& text) {
