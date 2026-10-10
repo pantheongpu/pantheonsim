@@ -42,7 +42,7 @@ void fdct1d(const int32_t* x, int32_t* y, int N) {
     return;
   }
   const DctMatrix& M = dct_matrix();
-  int32_t E[16], O[16], YE[16];
+  int32_t E[16] = {}, O[16] = {}, YE[16] = {};
   const int hn = N / 2;
   for (int n = 0; n < hn; ++n) {
     E[n] = x[n] + x[N - 1 - n];
@@ -70,7 +70,7 @@ void idct1d(const int32_t* y, int32_t* x, int N) {
   }
   const DctMatrix& M = dct_matrix();
   const int hn = N / 2;
-  int32_t ye[16], E[16];
+  int32_t ye[16] = {}, E[16] = {};
   for (int k = 0; k < hn; ++k) ye[k] = y[2 * k];
   idct1d(ye, E, hn);
   const int step = 32 / N;

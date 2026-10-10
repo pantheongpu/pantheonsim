@@ -120,6 +120,7 @@ struct Picture {
   uint32_t frame_idx = 0;
   int pic_struct = 1;
   uint32_t pic_type = NV_ENC_PIC_TYPE_IDR;   // NV_ENC_PIC_TYPE_*
+  uint32_t slices = 1;
 };
 struct Output {
   std::deque<Picture> pending;   // encoded, not yet locked: the card queues them per buffer
@@ -160,6 +161,7 @@ struct Session {
   // picture counters and the rate control state.
   std::unique_ptr<vgpu_nvenc::VideoEncoder> enc, trial;
   int enc_codec = -1, enc_w = 0, enc_h = 0, enc_fps_num = 0, enc_fps_den = 0, enc_profile = 0;
+  uint64_t enc_sig = 0;         // the tools the encoder was built with (entropy mode, transform, slices, references, B pictures)
   uint64_t since_idr = 0;       // pictures since (and including) the last IDR picture, in display order; 0 before the first picture
   bool force_idr_next = false;  // a reconfiguration asked for it
   double rc_qp = 28;            // the QP the next P picture is coded with
@@ -825,9 +827,26 @@ int h264_profile_idc(const NV_ENC_CONFIG& c) {
   return 100;   // High, and what the automatic choice picks
 }
 
+// The H.264 tools an application's configuration asks for.
+vgpu_nvenc::H264Options h264_options(const NV_ENC_CONFIG& c, int profile) {
+  const NV_ENC_CONFIG_H264& h = c.encodeCodecConfig.h264Config;
+  vgpu_nvenc::H264Options o;
+  const uint32_t entropy = raw(h.entropyCodingMode), adaptive = raw(h.adaptiveTransformMode);
+  o.cabac = profile >= 77 && entropy != num(NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC);
+  o.transform8x8 = profile >= 100 && adaptive != num(NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE);
+  o.slice_mode = static_cast<int>(h.sliceMode <= 3 ? h.sliceMode : 0);
+  o.slice_data = static_cast<int>(std::min<uint32_t>(h.sliceModeData, 1u << 20));
+  const uint32_t refs = raw(h.numRefL0);
+  o.num_ref = refs >= 1 && refs <= 7 ? static_cast<int>(std::min<uint32_t>(refs, 4)) : 2;
+  o.max_b = profile >= 77 && c.frameIntervalP > 1 ? c.frameIntervalP - 1 : 0;
+  o.deblock = h.disableDeblockingFilterIDC != 1;
+  return o;
+}
+
 std::unique_ptr<vgpu_nvenc::VideoEncoder> make_encoder(int codec, const NV_ENC_CONFIG& c, int w, int h, int fn, int fd) {
   if (codec == kHevc) return std::make_unique<vgpu_nvenc::HevcEncoder>(w, h, fn, fd);
-  return std::make_unique<vgpu_nvenc::H264Encoder>(w, h, fn, fd, h264_profile_idc(c), true);
+  const int profile = h264_profile_idc(c);
+  return std::make_unique<vgpu_nvenc::H264Encoder>(w, h, fn, fd, profile, h264_options(c, profile));
 }
 
 // The parameter sets the encoder of a configuration writes (for the lossless tuning, the PCM writers').
@@ -896,6 +915,7 @@ struct Packet {
   uint64_t ts = 0, dur = 0;
   int pic_struct = 1;
   uint32_t pic_type = NV_ENC_PIC_TYPE_IDR;
+  uint32_t slices = 1;
 };
 
 // The picture a call brought: the samples and what the call said about them.
@@ -907,10 +927,23 @@ struct Input1 {
   bool want_ps = false;   // the call asked for the parameter sets with this picture (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS)
 };
 
-// (Re)creates the encoder when the stream's size, rate or profile changed: a new coded video sequence.
+// A number that changes with every setting the encoder is built from.
+uint64_t config_sig(const Session& s) {
+  if (s.codec != kH264) return 0;
+  const int profile = h264_profile_idc(s.config);
+  const vgpu_nvenc::H264Options o = h264_options(s.config, profile);
+  uint64_t v = 1469598103934665603ull;
+  for (uint64_t x : {static_cast<uint64_t>(o.cabac), static_cast<uint64_t>(o.transform8x8), static_cast<uint64_t>(o.slice_mode), static_cast<uint64_t>(o.slice_data),
+                     static_cast<uint64_t>(o.num_ref), static_cast<uint64_t>(o.max_b), static_cast<uint64_t>(o.deblock)})
+    v = (v ^ x) * 1099511628211ull;
+  return v;
+}
+
+// (Re)creates the encoder when the stream's size, rate, profile or tools changed: a new coded video sequence.
 bool ensure_encoder(Session& s, int w, int h, int fn, int fd) {
   const int profile = s.codec == kH264 ? h264_profile_idc(s.config) : 1;
-  if (s.enc && s.enc_codec == s.codec && s.enc_w == w && s.enc_h == h && s.enc_fps_num == fn && s.enc_fps_den == fd && s.enc_profile == profile) return false;
+  const uint64_t sig = config_sig(s);
+  if (s.enc && s.enc_codec == s.codec && s.enc_w == w && s.enc_h == h && s.enc_fps_num == fn && s.enc_fps_den == fd && s.enc_profile == profile && s.enc_sig == sig) return false;
   s.enc = make_encoder(s.codec, s.config, w, h, fn, fd);
   s.trial.reset();
   s.enc_codec = s.codec;
@@ -919,6 +952,7 @@ bool ensure_encoder(Session& s, int w, int h, int fn, int fd) {
   s.enc_fps_num = fn;
   s.enc_fps_den = fd;
   s.enc_profile = profile;
+  s.enc_sig = sig;
   s.since_idr = 0;
   s.sent_parameter_sets = false;   // a new sequence: the decoder needs its headers
   return true;
@@ -996,6 +1030,7 @@ Packet code_picture(Session& s, const Input1& in, vgpu_nvenc::PicType t, int rat
   pk.ts = in.ts;
   pk.dur = in.dur;
   pk.pic_struct = in.pic_struct;
+  pk.slices = static_cast<uint32_t>(st.slices);
   pk.pic_type = t == vgpu_nvenc::PicType::kIdr ? num(NV_ENC_PIC_TYPE_IDR)
                 : (t == vgpu_nvenc::PicType::kIntra ? num(NV_ENC_PIC_TYPE_I) : (t == vgpu_nvenc::PicType::kBi ? num(NV_ENC_PIC_TYPE_B) : num(NV_ENC_PIC_TYPE_P)));
   size_t skip = 0;
@@ -1046,7 +1081,7 @@ void deliver(Session& s, std::vector<Packet>& packets, void* current_out) {
     auto it = s.outputs.find(bufs[i]);
     if (it == s.outputs.end()) continue;
     Packet& p = packets[i];
-    it->second->pending.push_back({std::move(p.data), p.ts, p.dur, static_cast<uint32_t>(s.frames++), p.pic_struct, p.pic_type});
+    it->second->pending.push_back({std::move(p.data), p.ts, p.dur, static_cast<uint32_t>(s.frames++), p.pic_struct, p.pic_type, p.slices});
   }
 }
 
@@ -1222,7 +1257,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
     }
     s->sent_parameter_sets = true;
     bits.insert(bits.end(), picture.begin(), picture.end());
-    o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps, num(NV_ENC_PIC_TYPE_IDR)});
+    o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps, num(NV_ENC_PIC_TYPE_IDR), 1});
     return NV_ENC_SUCCESS;
   }
   return encode_compressed(*s, f, *params, ps, params->outputBitstream, rate_num, rate_den);
@@ -1247,7 +1282,7 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockBitstream(void* encoder, NV_ENC_LOCK_B
   params->pictureType = static_cast<NV_ENC_PIC_TYPE>(o.current.pic_type);
   params->pictureStruct = static_cast<NV_ENC_PIC_STRUCT>(o.current.pic_struct);
   params->hwEncodeStatus = 2;
-  params->numSlices = 1;
+  params->numSlices = o.current.slices;
   params->temporalId = 0;
   params->sliceOffsets = nullptr;
   return NV_ENC_SUCCESS;

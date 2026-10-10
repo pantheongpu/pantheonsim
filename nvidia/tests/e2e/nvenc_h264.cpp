@@ -4,13 +4,12 @@
 // and the 32-bit RGB formats, at sizes that are and are not multiples of 16 and
 // not even -- and the stream is decoded with ffmpeg.
 //
-// VirtualGPU's H.264 encoder compresses (intra and P pictures, the high-quality
-// tuning): the decoded frames must reach a peak signal-to-noise ratio of 30 dB, the
-// stream must be smaller than the raw frames, and the pictures must be typed IDR, P, P,
-// ... as the application's GOP settings say. Its lossless tuning and its HEVC encoder
-// write lossless PCM coding units (macroblocks, or 16x16 coding tree blocks in HEVC),
-// so those decoded samples must equal the input exactly (RGB input: the BT.601
-// limited-range conversion the card's encoder applies, to within one level).
+// VirtualGPU's H.264 and HEVC encoders compress (the high-quality tuning): the decoded
+// frames must reach a peak signal-to-noise ratio of 30 dB, the stream must be smaller than
+// the raw frames, and the pictures must be typed IDR, P, P, ... as the application's GOP
+// settings say. The lossless tuning writes lossless PCM macroblocks, so those decoded
+// samples must equal the input exactly (RGB input: the BT.601 limited-range conversion the
+// card's encoder applies, to within one level).
 // With --card, for NVIDIA's real library, every case is lossy and the check is the
 // 30 dB signal-to-noise ratio.
 //
@@ -390,13 +389,13 @@ int main(int argc, char** argv) {
       worst_psnr = std::min(worst_psnr, mse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 / mse));
     }
     const int tolerance = rgb ? 1 : 0;
-    // The lossless tuning and the HEVC writer are PCM here: exact. The H.264 encoder compresses: a signal-to-noise
+    // The lossless tuning is PCM here: exact. The encoders compress: a signal-to-noise
     // floor, fewer bytes than the raw frames, and IDR, P, P, ... (the card's pictures are typed the same way).
-    const bool exact = !card && (c.hevc || c.lossless);
+    const bool exact = !card && c.lossless;
     const size_t raw_bytes = frame_bytes * kFrames;
     std::string detail;
     bool pass = exact ? worst_diff <= tolerance : worst_psnr >= 30.0;
-    if (!exact && !c.hevc && !c.lossless && !card) {
+    if (!exact && !c.lossless && !card) {
       char buf[160];
       std::snprintf(buf, sizeof buf, ", %zu bytes for %zu raw (%.1f%%)", stream.size(), raw_bytes, 100.0 * static_cast<double>(stream.size()) / static_cast<double>(raw_bytes));
       detail = buf;
@@ -407,7 +406,7 @@ int main(int argc, char** argv) {
           detail += ", wrong picture type";
         }
     }
-    if (!card && (c.hevc || c.lossless))
+    if (!card && c.lossless)
       for (int t : types)
         if (t != NV_ENC_PIC_TYPE_IDR) pass = false;   // PCM pictures are all IDR
     std::printf("%s %s: %d frames decoded as %dx%d, worst sample difference %d, PSNR %.1f dB%s%s\n", pass ? "PASS" : "FAIL", c.name, kFrames,

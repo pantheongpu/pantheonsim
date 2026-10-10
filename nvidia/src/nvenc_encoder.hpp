@@ -22,6 +22,7 @@ struct EncStats {
   size_t bytes = 0;
   int intra_mbs = 0, inter_mbs = 0, skipped_mbs = 0;   // macroblocks (H.264) or coding units (HEVC)
   double psnr_y = 0;   // against the picture as given, after the loop filter
+  int slices = 1;      // slices the picture was coded in
 };
 
 // The digest an intra picture carries (a user_data_unregistered SEI message every decoder ignores). A lossy encoder can lose a one-sample change in

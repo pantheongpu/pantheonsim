@@ -11,7 +11,7 @@
 // Run against VirtualGPU's libraries it checks the encoder with the decoder of the same tree;
 // run with --card it is NVIDIA's encoder and NVIDIA's decoder against ffmpeg.
 //
-// SKIP (exit 0) when libnvidia-encode.so.1, libnvcuvid.so.1, ffmpeg or ffprobe is missing.
+// SKIP (exit 0) when libnvidia-encode.so.1 or libnvcuvid.so.1 is missing. Without ffmpeg or ffprobe only the comparison with ffmpeg is skipped.
 #include <dlfcn.h>
 #include <cuda.h>
 
@@ -245,6 +245,9 @@ struct Encoded {
   std::vector<uint8_t> stream;
   std::vector<int> types;       // NV_ENC_PIC_TYPE of every picture
   std::vector<size_t> sizes;    // bytes of every picture (parameter sets included)
+  std::vector<uint64_t> timestamps;   // outputTimeStamp of every picture
+  std::vector<int> statuses;    // the status of every NvEncEncodePicture call
+  std::vector<int> slices;      // slice NAL units of every picture
   std::vector<Planes> input;
   std::string error;
 };
@@ -256,6 +259,12 @@ struct Case {
   std::function<uint32_t(int)> flags;   // NV_ENC_PIC_FLAGs of picture i
   std::function<std::string(const Encoded&, const std::vector<std::vector<uint8_t>>& decoded, int dw, int dh, bool card)> check;   // extra checks; "" = fine
 };
+
+// The encode loop of an application that tolerates reordering: input and output buffers come from pools (the encoder may hold an input buffer until its
+// picture is coded), a call answered NV_ENC_ERR_NEED_MORE_INPUT leaves its output buffer outstanding, and a call that succeeds fills the outstanding
+// buffers and its own, in the order of the calls; the end of the stream flushes the rest. Packets are collected in coding order.
+constexpr int kPool = 16;
+int slices_in(const uint8_t* p, size_t n);
 
 Encoded encode(CUcontext ctx, const Case& c) {
   Encoded e;
@@ -274,7 +283,7 @@ Encoded encode(CUcontext ctx, const Case& c) {
   pc.presetCfg.version = NV_ENC_CONFIG_VER;
   f.nvEncGetEncodePresetConfigEx(enc, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, &pc);
   pc.presetCfg.gopLength = 30;
-  pc.presetCfg.frameIntervalP = 1;   // no B pictures: output order is coding order
+  pc.presetCfg.frameIntervalP = 1;   // output order is coding order, unless the case asks for B pictures
   NV_ENC_INITIALIZE_PARAMS ip{};
   ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
   ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
@@ -292,23 +301,59 @@ Encoded encode(CUcontext ctx, const Case& c) {
     f.nvEncDestroyEncoder(enc);
     return e;
   }
-  NV_ENC_CREATE_INPUT_BUFFER ib{};
-  ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-  ib.width = static_cast<uint32_t>(c.w);
-  ib.height = static_cast<uint32_t>(c.h);
-  ib.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
-  NV_ENC_CREATE_BITSTREAM_BUFFER ob{};
-  ob.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-  if (f.nvEncCreateInputBuffer(enc, &ib) != NV_ENC_SUCCESS || f.nvEncCreateBitstreamBuffer(enc, &ob) != NV_ENC_SUCCESS) {
-    e.error = "buffer creation refused";
+  NV_ENC_INPUT_PTR in_buf[kPool];
+  NV_ENC_OUTPUT_PTR out_buf[kPool];
+  int created_in = 0, created_out = 0;
+  for (int i = 0; i < kPool; ++i) {
+    NV_ENC_CREATE_INPUT_BUFFER ib{};
+    ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+    ib.width = static_cast<uint32_t>(c.w);
+    ib.height = static_cast<uint32_t>(c.h);
+    ib.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+    if (f.nvEncCreateInputBuffer(enc, &ib) != NV_ENC_SUCCESS) break;
+    in_buf[created_in++] = ib.inputBuffer;
+    NV_ENC_CREATE_BITSTREAM_BUFFER ob{};
+    ob.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    if (f.nvEncCreateBitstreamBuffer(enc, &ob) != NV_ENC_SUCCESS) break;
+    out_buf[created_out++] = ob.bitstreamBuffer;
+  }
+  auto cleanup = [&] {
+    for (int i = 0; i < created_out; ++i) f.nvEncDestroyBitstreamBuffer(enc, out_buf[i]);
+    for (int i = 0; i < created_in; ++i) f.nvEncDestroyInputBuffer(enc, in_buf[i]);
     f.nvEncDestroyEncoder(enc);
+  };
+  if (created_in < kPool || created_out < kPool) {
+    e.error = "buffer creation refused";
+    cleanup();
     return e;
   }
+  std::vector<int> outstanding;   // output buffers of the calls that returned NV_ENC_ERR_NEED_MORE_INPUT
+  auto collect = [&](int upto_buf) {
+    for (int b : outstanding) {
+      NV_ENC_LOCK_BITSTREAM lb{};
+      lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+      lb.outputBitstream = out_buf[b];
+      if (f.nvEncLockBitstream(enc, &lb) != NV_ENC_SUCCESS) {
+        e.error = "lock bitstream";
+        return;
+      }
+      const auto* bytes = static_cast<const uint8_t*>(lb.bitstreamBufferPtr);
+      e.stream.insert(e.stream.end(), bytes, bytes + lb.bitstreamSizeInBytes);
+      e.types.push_back(static_cast<int>(lb.pictureType));
+      e.sizes.push_back(lb.bitstreamSizeInBytes);
+      e.timestamps.push_back(lb.outputTimeStamp);
+      e.slices.push_back(slices_in(bytes, lb.bitstreamSizeInBytes));
+      f.nvEncUnlockBitstream(enc, out_buf[b]);
+    }
+    (void)upto_buf;
+    outstanding.clear();
+  };
   for (int t = 0; t < c.frames && e.error.empty(); ++t) {
     Planes in = make_planes(c.w, c.h, t);
+    const int slot = t % kPool;
     NV_ENC_LOCK_INPUT_BUFFER lk{};
     lk.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-    lk.inputBuffer = ib.inputBuffer;
+    lk.inputBuffer = in_buf[slot];
     if (f.nvEncLockInputBuffer(enc, &lk) != NV_ENC_SUCCESS) {
       e.error = "lock input";
       break;
@@ -321,38 +366,35 @@ Encoded encode(CUcontext ctx, const Case& c) {
         chroma[static_cast<size_t>(y) * lk.pitch + 2 * x] = in.u[static_cast<size_t>(y) * in.cw() + x];
         chroma[static_cast<size_t>(y) * lk.pitch + 2 * x + 1] = in.v[static_cast<size_t>(y) * in.cw() + x];
       }
-    f.nvEncUnlockInputBuffer(enc, ib.inputBuffer);
+    f.nvEncUnlockInputBuffer(enc, in_buf[slot]);
     NV_ENC_PIC_PARAMS pp{};
     pp.version = NV_ENC_PIC_PARAMS_VER;
-    pp.inputBuffer = ib.inputBuffer;
-    pp.outputBitstream = ob.bitstreamBuffer;
+    pp.inputBuffer = in_buf[slot];
+    pp.outputBitstream = out_buf[slot];
     pp.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
     pp.inputWidth = static_cast<uint32_t>(c.w);
     pp.inputHeight = static_cast<uint32_t>(c.h);
     pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     pp.inputTimeStamp = static_cast<uint64_t>(t) * 3000;
     pp.encodePicFlags = c.flags ? c.flags(t) : 0;
-    if (f.nvEncEncodePicture(enc, &pp) != NV_ENC_SUCCESS) {
+    const NVENCSTATUS st = f.nvEncEncodePicture(enc, &pp);
+    outstanding.push_back(slot);
+    e.statuses.push_back(static_cast<int>(st));
+    if (st == NV_ENC_SUCCESS) collect(slot);
+    else if (st != NV_ENC_ERR_NEED_MORE_INPUT) {
       e.error = "encode call failed";
       break;
     }
-    NV_ENC_LOCK_BITSTREAM lb{};
-    lb.version = NV_ENC_LOCK_BITSTREAM_VER;
-    lb.outputBitstream = ob.bitstreamBuffer;
-    if (f.nvEncLockBitstream(enc, &lb) != NV_ENC_SUCCESS) {
-      e.error = "lock bitstream";
-      break;
-    }
-    const auto* bytes = static_cast<const uint8_t*>(lb.bitstreamBufferPtr);
-    e.stream.insert(e.stream.end(), bytes, bytes + lb.bitstreamSizeInBytes);
-    e.types.push_back(static_cast<int>(lb.pictureType));
-    e.sizes.push_back(lb.bitstreamSizeInBytes);
-    f.nvEncUnlockBitstream(enc, ob.bitstreamBuffer);
     e.input.push_back(std::move(in));
   }
-  f.nvEncDestroyBitstreamBuffer(enc, ob.bitstreamBuffer);
-  f.nvEncDestroyInputBuffer(enc, ib.inputBuffer);
-  f.nvEncDestroyEncoder(enc);
+  if (e.error.empty() && !outstanding.empty()) {
+    NV_ENC_PIC_PARAMS eos{};
+    eos.version = NV_ENC_PIC_PARAMS_VER;
+    eos.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+    if (f.nvEncEncodePicture(enc, &eos) != NV_ENC_SUCCESS) e.error = "end of stream refused";
+    else collect(0);
+  }
+  cleanup();
   return e;
 }
 
@@ -382,9 +424,38 @@ int profile_of(const std::vector<uint8_t>& s) {
   return -1;
 }
 
+// entropy_coding_mode_flag of the first PPS of an Annex B stream, or -1
+int pps_entropy_flag(const std::vector<uint8_t>& s) {
+  for (size_t i = 0; i + 8 < s.size(); ++i)
+    if (s[i] == 0 && s[i + 1] == 0 && s[i + 2] == 1 && (s[i + 3] & 31) == 8) {
+      std::vector<uint8_t> r;
+      int zeros = 0;
+      for (size_t k = i + 4; k < std::min(s.size(), i + 24); ++k) {
+        if (zeros >= 2 && s[k] == 3) { zeros = 0; continue; }
+        r.push_back(s[k]);
+        zeros = s[k] == 0 ? zeros + 1 : 0;
+      }
+      size_t pos = 0;
+      auto bit = [&]() { const int b = (r[pos >> 3] >> (7 - (pos & 7))) & 1; ++pos; return b; };
+      auto ue = [&]() { int z = 0; while (!bit() && z < 24) ++z; uint32_t v = 0; for (int k = 0; k < z; ++k) v = v << 1 | static_cast<uint32_t>(bit()); return (1u << z) - 1 + v; };
+      ue();
+      ue();
+      return bit();
+    }
+  return -1;
+}
+
+// slice NAL units (types 1 and 5) in the bytes of one packet
+int slices_in(const uint8_t* p, size_t n) {
+  int count = 0;
+  for (size_t i = 0; i + 4 < n; ++i)
+    if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1 && ((p[i + 3] & 31) == 1 || (p[i + 3] & 31) == 5)) ++count;
+  return count;
+}
+
 std::string types_string(const std::vector<int>& types) {
   std::string out;
-  for (int t : types) out += t == NV_ENC_PIC_TYPE_IDR ? 'I' : (t == NV_ENC_PIC_TYPE_P ? 'p' : (t == NV_ENC_PIC_TYPE_I ? 'i' : '?'));
+  for (int t : types) out += t == NV_ENC_PIC_TYPE_IDR ? 'I' : (t == NV_ENC_PIC_TYPE_P ? 'p' : (t == NV_ENC_PIC_TYPE_I ? 'i' : (t == NV_ENC_PIC_TYPE_B ? 'b' : '?')));
   return out;
 }
 
@@ -399,10 +470,9 @@ int main(int argc, char** argv) {
     std::printf("SKIP: no %s\n", !enclib ? "libnvidia-encode.so.1" : "libnvcuvid.so.1");
     return 0;
   }
-  if (!tool_exists("ffmpeg") || !tool_exists("ffprobe")) {
-    std::printf("SKIP: ffmpeg / ffprobe not found (the reference decoder)\n");
-    return 0;
-  }
+  // ffmpeg is the reference decoder; without it only that comparison is skipped -- NVDEC still decodes every stream and is held to the same quality floor.
+  const bool have_ffmpeg = tool_exists("ffmpeg") && tool_exists("ffprobe");
+  if (!have_ffmpeg) std::printf("note: ffmpeg / ffprobe not found, so NVDEC's output is not compared with ffmpeg's (the pictures are still decoded and measured)\n");
   auto create = reinterpret_cast<NVENCSTATUS (*)(NV_ENCODE_API_FUNCTION_LIST*)>(dlsym(enclib, "NvEncodeAPICreateInstance"));
   f.version = NV_ENCODE_API_FUNCTION_LIST_VER;
   if (!create || create(&f) != NV_ENC_SUCCESS) {
@@ -502,6 +572,89 @@ int main(int argc, char** argv) {
        [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
          return profile_of(e.stream) == 100 ? "" : "profile_idc " + std::to_string(profile_of(e.stream)) + ", wanted 100";
        }},
+
+      {"B pictures: frameIntervalP 3", 192, 128, 10,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.frameIntervalP = 3;
+         c.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+         c.rcParams.constQP.qpInterP = c.rcParams.constQP.qpIntra = 26;
+         c.rcParams.constQP.qpInterB = 28;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
+         // a P picture ends every group of three: the two pictures before it in display order wait (NEED_MORE_INPUT) and are coded after it
+         const std::vector<int> want = {0, NV_ENC_ERR_NEED_MORE_INPUT, NV_ENC_ERR_NEED_MORE_INPUT, 0, NV_ENC_ERR_NEED_MORE_INPUT, NV_ENC_ERR_NEED_MORE_INPUT, 0,
+                                        NV_ENC_ERR_NEED_MORE_INPUT, NV_ENC_ERR_NEED_MORE_INPUT, 0};
+         if (e.statuses != want) return "call statuses are not the group-of-three pattern";
+         if (types_string(e.types) != "Ipbbpbbpbb") return "picture types " + types_string(e.types) + ", wanted Ipbbpbbpbb";
+         // the packets of a group are its pictures: a P picture first, with the latest time stamp of the group, then the B pictures before it
+         for (size_t g = 1; g + 2 < e.timestamps.size(); g += 3) {
+           if (e.timestamps[g] < e.timestamps[g + 1] || e.timestamps[g] < e.timestamps[g + 2]) return "the P picture of a group is not the latest in display order";
+           if (e.timestamps[g] != static_cast<uint64_t>(g + 2) * 3000) return "time stamp of a P picture";
+           std::vector<uint64_t> ts = {e.timestamps[g], e.timestamps[g + 1], e.timestamps[g + 2]};
+           std::sort(ts.begin(), ts.end());
+           if (ts[0] != static_cast<uint64_t>(g) * 3000 || ts[1] != static_cast<uint64_t>(g + 1) * 3000) return "a group does not hold three consecutive pictures";
+         }
+         return "";
+       }},
+      {"B pictures: frameIntervalP 4, a GOP of 8, a short group at its end and at the end of the stream", 160, 96, 11,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.frameIntervalP = 4;
+         c.gopLength = 8;
+         c.encodeCodecConfig.h264Config.idrPeriod = 8;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
+         if (types_string(e.types) != "IpbbbpbbIpb") return "picture types " + types_string(e.types) + ", wanted IpbbbpbbIpb";
+         const std::vector<int> want = {0, 17, 17, 17, 0, 17, 17, 0, 0, 17, 17};
+         if (e.statuses != want) return "call statuses differ from the expected pattern";
+         return "";
+       }},
+      {"B pictures: a forced IDR picture codes the pictures that wait", 160, 96, 9,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) { c.frameIntervalP = 3; },
+       [](int i) -> uint32_t { return i == 5 ? NV_ENC_PIC_FLAG_FORCEIDR : 0u; },
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
+         if (types_string(e.types) != "IpbbpIpbb") return "picture types " + types_string(e.types) + ", wanted IpbbpIpbb";
+         return "";
+       }},
+      {"Baseline profile takes no B pictures", 160, 96, 6,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+         c.frameIntervalP = 3;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
+         for (int st : e.statuses)
+           if (st != 0) return "a call was answered with status " + std::to_string(st);
+         if (types_string(e.types) != "Ippppp") return "picture types " + types_string(e.types);
+         return pps_entropy_flag(e.stream) == 0 ? "" : "the PPS says CABAC";
+       }},
+      {"CABAC, the 8x8 transform and two slices", 192, 128, 5,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+         c.frameIntervalP = 1;
+         c.encodeCodecConfig.h264Config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+         c.encodeCodecConfig.h264Config.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
+         c.encodeCodecConfig.h264Config.sliceMode = 3;
+         c.encodeCodecConfig.h264Config.sliceModeData = 2;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
+         if (pps_entropy_flag(e.stream) != 1) return "the PPS does not say CABAC";
+         for (int s : e.slices)
+           if (s != 2) return "a picture has " + std::to_string(s) + " slices, wanted 2";
+         return "";
+       }},
+      {"CAVLC with the High profile", 192, 128, 4,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+         c.frameIntervalP = 1;
+         c.encodeCodecConfig.h264Config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
+         return pps_entropy_flag(e.stream) == 0 ? "" : "the PPS does not say CAVLC";
+       }},
   };
 
   int failures = 0;
@@ -512,35 +665,39 @@ int main(int argc, char** argv) {
       ++failures;
       continue;
     }
-    const Decoded ff = ffmpeg_decode(e.stream, tmp);
-    if (!ff.error.empty()) {
-      std::printf("FAIL %s: %s\n", c.name, ff.error.c_str());
-      ++failures;
-      continue;
+    Decoded ff;
+    if (have_ffmpeg) {
+      ff = ffmpeg_decode(e.stream, tmp);
+      if (!ff.error.empty()) {
+        std::printf("FAIL %s: %s\n", c.name, ff.error.c_str());
+        ++failures;
+        continue;
+      }
     }
     const Decoded nv = nvdec_decode(e.stream);
+    const Decoded& rf = have_ffmpeg ? ff : nv;   // the frames the quality is measured on
     std::string problem;
     if (!nv.error.empty()) problem = "NVDEC: " + nv.error;
-    else if (nv.frames.size() != ff.frames.size() || static_cast<int>(ff.frames.size()) != c.frames)
+    else if (static_cast<int>(nv.frames.size()) != c.frames || (have_ffmpeg && ff.frames.size() != nv.frames.size()))
       problem = "decoded " + std::to_string(nv.frames.size()) + " (NVDEC) and " + std::to_string(ff.frames.size()) + " (ffmpeg) frames of " + std::to_string(c.frames);
-    else if (nv.w != ff.w || nv.h != ff.h)
+    else if (have_ffmpeg && (nv.w != ff.w || nv.h != ff.h))
       problem = "sizes differ: NVDEC " + std::to_string(nv.w) + "x" + std::to_string(nv.h) + ", ffmpeg " + std::to_string(ff.w) + "x" + std::to_string(ff.h);
     double worst = 99.0;
     int differing = 0;
     if (problem.empty()) {
-      for (size_t i = 0; i < ff.frames.size(); ++i) {
-        if (nv.frames[i] != ff.frames[i]) ++differing;
-        worst = std::min(worst, psnr_of(e.input[i], ff.frames[i], ff.w, ff.h));
+      for (size_t i = 0; i < rf.frames.size(); ++i) {
+        if (have_ffmpeg && nv.frames[i] != ff.frames[i]) ++differing;
+        worst = std::min(worst, psnr_of(e.input[i], rf.frames[i], rf.w, rf.h));
       }
       if (differing) problem = std::to_string(differing) + " frames differ between NVDEC and ffmpeg";
       else if (worst < 30.0 && std::strstr(c.name, "bit rate") == nullptr) problem = "worst PSNR " + std::to_string(worst) + " dB";
       else if (worst < 24.0) problem = "worst PSNR " + std::to_string(worst) + " dB";
     }
-    if (problem.empty() && c.check) problem = c.check(e, ff.frames, ff.w, ff.h, card);
+    if (problem.empty() && c.check) problem = c.check(e, rf.frames, rf.w, rf.h, card);
     size_t total = 0;
     for (size_t s : e.sizes) total += s;
-    std::printf("%s %s: %zu frames, %zu bytes, types %s, worst PSNR %.1f dB, NVDEC == ffmpeg%s%s\n", problem.empty() ? "PASS" : "FAIL", c.name, ff.frames.size(), total,
-                types_string(e.types).c_str(), worst, problem.empty() ? "" : " -- ", problem.c_str());
+    std::printf("%s %s: %zu frames, %zu bytes, types %s, worst PSNR %.1f dB%s%s%s\n", problem.empty() ? "PASS" : "FAIL", c.name, rf.frames.size(), total,
+                types_string(e.types).c_str(), worst, have_ffmpeg ? ", NVDEC == ffmpeg" : "", problem.empty() ? "" : " -- ", problem.c_str());
     if (!problem.empty()) ++failures;
   }
   std::printf("%s\n", failures ? "FAIL" : "PASS");

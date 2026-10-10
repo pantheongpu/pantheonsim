@@ -7,11 +7,10 @@
 // written (here by a kernel) into the buffer the encoder hands out. That buffer
 // is managed memory in the simulator; nvenc_h264.cpp decodes the stream.
 //
-// Three encoders are checked: the H.264 encoder with the lossless tuning and the
-// HEVC encoder, which write an IDR picture every time (so successive encodes of one
-// frame are the same bytes), and the compressing H.264 encoder, whose pictures after the
-// first are P pictures -- there the contract is the forced-IDR one, which is what
-// pantheon's media_enc_virus does.
+// Three encoders are checked: the H.264 encoder with the lossless tuning, which writes an IDR
+// picture every time (so successive encodes of one frame are the same bytes), and the compressing
+// H.264 and HEVC encoders, whose pictures after the first are P pictures -- there the contract is
+// the forced-IDR one, which is what pantheon's media_enc_virus does.
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -261,14 +260,14 @@ int main() {
 
   const uint32_t width = 256, height = 128;
   // A session for each encoder: the H.264 encoder with the high-quality tuning (compressed pictures), the same codec with
-  // the lossless tuning (PCM, every picture IDR) and HEVC (PCM); nvenc_h264.cpp and nvenc_nvdec.cpp decode the streams.
+  // the lossless tuning (PCM, every picture IDR) and HEVC (compressed); nvenc_h264.cpp and nvenc_nvdec.cpp decode the streams.
   const struct {
     const GUID* codec;
     NV_ENC_TUNING_INFO tuning;
     bool every_picture_is_idr;
   } encoders[] = {{&NV_ENC_CODEC_H264_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, false},
                   {&NV_ENC_CODEC_H264_GUID, NV_ENC_TUNING_INFO_LOSSLESS, true},
-                  {&NV_ENC_CODEC_HEVC_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, true}};
+                  {&NV_ENC_CODEC_HEVC_GUID, NV_ENC_TUNING_INFO_HIGH_QUALITY, false}};
   bool first_session = true;
   for (const auto& enc : encoders) {
     if (!first_session) {
@@ -292,6 +291,17 @@ int main() {
     init.frameRateNum = 30;
     init.frameRateDen = 1;
     init.enablePTD = 1;
+    // The preset's own GOP structure has B pictures (frameIntervalP 4): the encoder then holds pictures back and answers NV_ENC_ERR_NEED_MORE_INPUT, a
+    // protocol nvenc_nvdec.cpp tests. Here every call must return a picture, so the sessions are IPPP.
+    NV_ENC_PRESET_CONFIG pc{};
+    pc.version = NV_ENC_PRESET_CONFIG_VER;
+    pc.presetCfg.version = NV_ENC_CONFIG_VER;
+    if (e.api.nvEncGetEncodePresetConfigEx(e.session, *enc.codec, init.presetGUID, init.tuningInfo, &pc) != NV_ENC_SUCCESS) {
+      std::printf("FAIL nvEncGetEncodePresetConfigEx\n");
+      return 1;
+    }
+    pc.presetCfg.frameIntervalP = 1;
+    init.encodeConfig = &pc.presetCfg;
     if (e.api.nvEncInitializeEncoder(e.session, &init) != NV_ENC_SUCCESS) {
       std::printf("FAIL nvEncInitializeEncoder\n");
       e.api.nvEncDestroyEncoder(e.session);
