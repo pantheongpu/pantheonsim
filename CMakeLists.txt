@@ -1224,6 +1224,9 @@ vgpu_unit_test(test_nvenc_hevc nvidia/tests/unit/test_nvenc_hevc.cpp)
 vgpu_unit_test(test_nvenc_h264_enc nvidia/tests/unit/test_nvenc_h264_enc.cpp)
 target_sources(test_nvenc_h264_enc PRIVATE nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
 target_compile_definitions(test_nvenc_h264_enc PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The compressing HEVC encoder behind NVENC, against ffmpeg's decoder where it is installed.
+vgpu_unit_test(test_nvenc_hevc_enc nvidia/tests/unit/test_nvenc_hevc_enc.cpp)
+target_sources(test_nvenc_hevc_enc PRIVATE nvidia/src/nvenc_hevc_enc.cpp)
 # The H.264 decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
 vgpu_unit_test(test_h264_decode nvidia/tests/unit/test_h264_decode.cpp)
 target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)

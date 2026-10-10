@@ -181,6 +181,8 @@ int main(int argc, char** argv) {
     int w, h;
     bool hevc;
     bool lossless;   // the lossless tuning
+    int fip = 1;     // frameIntervalP: 1 is IPPP, 3 has two B pictures between P pictures
+    int frames = 4;
   } cases[] = {
       {"H.264 NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, false}, {"H.264 NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false, false},
       {"H.264 NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, false, false},   {"H.264 YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false, false},
@@ -188,11 +190,12 @@ int main(int argc, char** argv) {
       {"H.264 ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false, false}, {"H.264 ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, false, false},
       {"H.264 lossless NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, true}, {"H.264 lossless NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false, true},
       {"H.264 lossless YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false, true}, {"H.264 lossless ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false, true},
+      {"H.264 NV12 192x128 with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, false, 3, 7},
+      {"HEVC NV12 192x128 with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true, false, 3, 7},
       {"HEVC NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true, false},   {"HEVC NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, true, false},
       {"HEVC NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, true, false},     {"HEVC YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, true, false},
       {"HEVC IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, true, false},   {"HEVC IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, true, false},
       {"HEVC ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, true, false},   {"HEVC ABGR 200x70", NV_ENC_BUFFER_FORMAT_ABGR, 200, 70, true, false}};
-  constexpr int kFrames = 4;
   int failures = 0;
 
   for (const auto& c : cases) {
@@ -215,7 +218,7 @@ int main(int argc, char** argv) {
     const NV_ENC_TUNING_INFO tuning = c.lossless ? NV_ENC_TUNING_INFO_LOSSLESS : NV_ENC_TUNING_INFO_HIGH_QUALITY;
     f.nvEncGetEncodePresetConfigEx(enc, codec, NV_ENC_PRESET_P4_GUID, tuning, &pc);
     pc.presetCfg.gopLength = 30;
-    pc.presetCfg.frameIntervalP = 1;   // no B frames: output order is coding order
+    pc.presetCfg.frameIntervalP = c.fip;   // 1: no B frames, output order is coding order
     NV_ENC_INITIALIZE_PARAMS ip{};
     ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
     ip.encodeGUID = codec;
@@ -233,16 +236,33 @@ int main(int argc, char** argv) {
       ++failures;
       continue;
     }
-    NV_ENC_CREATE_INPUT_BUFFER ib{};
-    ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-    ib.width = static_cast<uint32_t>(c.w);
-    ib.height = static_cast<uint32_t>(c.h);
-    ib.bufferFmt = c.fmt;
-    NV_ENC_CREATE_BITSTREAM_BUFFER ob{};
-    ob.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-    if (f.nvEncCreateInputBuffer(enc, &ib) != NV_ENC_SUCCESS || f.nvEncCreateBitstreamBuffer(enc, &ob) != NV_ENC_SUCCESS) {
-      std::printf("FAIL %s: buffer creation refused\n", c.name);
+    // buffers come from pools: the encoder may hold an input buffer until its picture is coded (B pictures), and a call it answers
+    // NV_ENC_ERR_NEED_MORE_INPUT leaves its output buffer to be filled by a later call
+    constexpr int kPool = 8;
+    NV_ENC_INPUT_PTR in_buf[kPool] = {};
+    NV_ENC_OUTPUT_PTR out_buf[kPool] = {};
+    int made_in = 0, made_out = 0;
+    for (int i = 0; i < kPool; ++i) {
+      NV_ENC_CREATE_INPUT_BUFFER ib{};
+      ib.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+      ib.width = static_cast<uint32_t>(c.w);
+      ib.height = static_cast<uint32_t>(c.h);
+      ib.bufferFmt = c.fmt;
+      if (f.nvEncCreateInputBuffer(enc, &ib) != NV_ENC_SUCCESS) break;
+      in_buf[made_in++] = ib.inputBuffer;
+      NV_ENC_CREATE_BITSTREAM_BUFFER ob{};
+      ob.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+      if (f.nvEncCreateBitstreamBuffer(enc, &ob) != NV_ENC_SUCCESS) break;
+      out_buf[made_out++] = ob.bitstreamBuffer;
+    }
+    auto destroy_buffers = [&] {
+      for (int i = 0; i < made_out; ++i) f.nvEncDestroyBitstreamBuffer(enc, out_buf[i]);
+      for (int i = 0; i < made_in; ++i) f.nvEncDestroyInputBuffer(enc, in_buf[i]);
       f.nvEncDestroyEncoder(enc);
+    };
+    if (made_in < kPool || made_out < kPool) {
+      std::printf("FAIL %s: buffer creation refused\n", c.name);
+      destroy_buffers();
       ++failures;
       continue;
     }
@@ -251,7 +271,23 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> stream;
     std::vector<int> types;   // NV_ENC_PIC_TYPE of each picture
     bool ok = true;
-    for (int t = 0; t < kFrames && ok; ++t) {
+    std::vector<int> outstanding;   // output buffers of calls that returned NV_ENC_ERR_NEED_MORE_INPUT
+    auto collect = [&]() {
+      for (int b : outstanding) {
+        NV_ENC_LOCK_BITSTREAM lb{};
+        lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+        lb.outputBitstream = out_buf[b];
+        if (f.nvEncLockBitstream(enc, &lb) != NV_ENC_SUCCESS) return false;
+        const auto* bytes = static_cast<const uint8_t*>(lb.bitstreamBufferPtr);
+        stream.insert(stream.end(), bytes, bytes + lb.bitstreamSizeInBytes);
+        types.push_back(static_cast<int>(lb.pictureType));
+        f.nvEncUnlockBitstream(enc, out_buf[b]);
+      }
+      outstanding.clear();
+      return true;
+    };
+    for (int t = 0; t < c.frames && ok; ++t) {
+      const int slot = t % kPool;
       Planes in;
       Rgb col;
       if (rgb) {
@@ -262,7 +298,7 @@ int main(int argc, char** argv) {
       }
       NV_ENC_LOCK_INPUT_BUFFER lk{};
       lk.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-      lk.inputBuffer = ib.inputBuffer;
+      lk.inputBuffer = in_buf[slot];
       if (f.nvEncLockInputBuffer(enc, &lk) != NV_ENC_SUCCESS) {
         ok = false;
         break;
@@ -300,36 +336,36 @@ int main(int argc, char** argv) {
           }
         }
       }
-      f.nvEncUnlockInputBuffer(enc, ib.inputBuffer);
+      f.nvEncUnlockInputBuffer(enc, in_buf[slot]);
       NV_ENC_PIC_PARAMS pp{};
       pp.version = NV_ENC_PIC_PARAMS_VER;
-      pp.inputBuffer = ib.inputBuffer;
-      pp.outputBitstream = ob.bitstreamBuffer;
+      pp.inputBuffer = in_buf[slot];
+      pp.outputBitstream = out_buf[slot];
       pp.bufferFmt = c.fmt;
       pp.inputWidth = static_cast<uint32_t>(c.w);
       pp.inputHeight = static_cast<uint32_t>(c.h);
       pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
       pp.inputTimeStamp = static_cast<uint64_t>(t) * 3000;
-      if (f.nvEncEncodePicture(enc, &pp) != NV_ENC_SUCCESS) {
+      const NVENCSTATUS est = f.nvEncEncodePicture(enc, &pp);
+      outstanding.push_back(slot);
+      if (est == NV_ENC_SUCCESS) {
+        if (!collect()) {
+          ok = false;
+          break;
+        }
+      } else if (est != NV_ENC_ERR_NEED_MORE_INPUT) {
         ok = false;
         break;
       }
-      NV_ENC_LOCK_BITSTREAM lb{};
-      lb.version = NV_ENC_LOCK_BITSTREAM_VER;
-      lb.outputBitstream = ob.bitstreamBuffer;
-      if (f.nvEncLockBitstream(enc, &lb) != NV_ENC_SUCCESS) {
-        ok = false;
-        break;
-      }
-      const auto* bytes = static_cast<const uint8_t*>(lb.bitstreamBufferPtr);
-      stream.insert(stream.end(), bytes, bytes + lb.bitstreamSizeInBytes);
-      types.push_back(static_cast<int>(lb.pictureType));
-      f.nvEncUnlockBitstream(enc, ob.bitstreamBuffer);
       expected.push_back(std::move(in));
     }
-    f.nvEncDestroyBitstreamBuffer(enc, ob.bitstreamBuffer);
-    f.nvEncDestroyInputBuffer(enc, ib.inputBuffer);
-    f.nvEncDestroyEncoder(enc);
+    if (ok && !outstanding.empty()) {   // end of stream: the pictures still waiting are coded
+      NV_ENC_PIC_PARAMS eos{};
+      eos.version = NV_ENC_PIC_PARAMS_VER;
+      eos.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+      if (f.nvEncEncodePicture(enc, &eos) != NV_ENC_SUCCESS || !collect()) ok = false;
+    }
+    destroy_buffers();
     if (!ok) {
       std::printf("FAIL %s: an encode call failed\n", c.name);
       ++failures;
@@ -358,15 +394,15 @@ int main(int argc, char** argv) {
       continue;
     }
     const size_t frame_bytes = static_cast<size_t>(dw) * dh + 2 * static_cast<size_t>((dw + 1) / 2) * ((dh + 1) / 2);
-    if (raw.size() != frame_bytes * kFrames || dw < c.w || dh < c.h || dw > c.w + 1 || dh > c.h + 1) {
-      std::printf("FAIL %s: decoded %zu bytes of %dx%d, wanted %d frames covering %dx%d\n", c.name, raw.size(), dw, dh, kFrames, c.w, c.h);
+    if (raw.size() != frame_bytes * c.frames || dw < c.w || dh < c.h || dw > c.w + 1 || dh > c.h + 1) {
+      std::printf("FAIL %s: decoded %zu bytes of %dx%d, wanted %d frames covering %dx%d\n", c.name, raw.size(), dw, dh, c.frames, c.w, c.h);
       ++failures;
       continue;
     }
     // Compare the picture region of every frame.
     double worst_psnr = 1e9;
     int worst_diff = 0;
-    for (int t = 0; t < kFrames; ++t) {
+    for (int t = 0; t < c.frames; ++t) {
       const uint8_t* y = &raw[frame_bytes * t];
       const uint8_t* u = y + static_cast<size_t>(dw) * dh;
       const uint8_t* v = u + static_cast<size_t>((dw + 1) / 2) * ((dh + 1) / 2);
@@ -392,7 +428,7 @@ int main(int argc, char** argv) {
     // The lossless tuning is PCM here: exact. The encoders compress: a signal-to-noise
     // floor, fewer bytes than the raw frames, and IDR, P, P, ... (the card's pictures are typed the same way).
     const bool exact = !card && c.lossless;
-    const size_t raw_bytes = frame_bytes * kFrames;
+    const size_t raw_bytes = frame_bytes * c.frames;
     std::string detail;
     bool pass = exact ? worst_diff <= tolerance : worst_psnr >= 30.0;
     if (!exact && !c.lossless && !card) {
@@ -401,7 +437,7 @@ int main(int argc, char** argv) {
       detail = buf;
       if (stream.size() * 2 >= raw_bytes) pass = false;
       for (size_t i = 0; i < types.size(); ++i)
-        if (types[i] != (i == 0 ? NV_ENC_PIC_TYPE_IDR : NV_ENC_PIC_TYPE_P)) {
+        if (types[i] != (i == 0 ? NV_ENC_PIC_TYPE_IDR : (c.fip <= 1 || (i - 1) % static_cast<size_t>(c.fip) == 0 ? NV_ENC_PIC_TYPE_P : NV_ENC_PIC_TYPE_B))) {
           pass = false;
           detail += ", wrong picture type";
         }
@@ -409,7 +445,7 @@ int main(int argc, char** argv) {
     if (!card && c.lossless)
       for (int t : types)
         if (t != NV_ENC_PIC_TYPE_IDR) pass = false;   // PCM pictures are all IDR
-    std::printf("%s %s: %d frames decoded as %dx%d, worst sample difference %d, PSNR %.1f dB%s%s\n", pass ? "PASS" : "FAIL", c.name, kFrames,
+    std::printf("%s %s: %d frames decoded as %dx%d, worst sample difference %d, PSNR %.1f dB%s%s\n", pass ? "PASS" : "FAIL", c.name, c.frames,
                 dw, dh, worst_diff, worst_psnr, card ? " (card)" : (exact ? "" : " (lossy)"), detail.c_str());
     if (!pass) ++failures;
   }
