@@ -61,7 +61,7 @@ if [[ "$case_name" == nvtx ]]; then
     echo "SKIP: NVTX headers not found"; exit 0
   fi
 fi
-trap 'rm -f "$out" "$out.txt" "$out.cubin"' EXIT
+trap 'rm -f "$out" "$out.txt" "$out.cubin" "$out.expected"' EXIT
 
 # The expected files are what a CUDA 13.0 libcupti printed. A case whose program
 # leaves out what an older toolkit's cupti.h cannot name (it is built under
@@ -157,6 +157,23 @@ if head -1 "$out.txt" | grep -q "^SKIP"; then
 fi
 if (( card )) && [[ "$case_name" == peer ]] && head -1 "$out.txt" | grep -q ": no$"; then
   echo "SKIP: no peer path between this machine's first two GPUs"; exit 0
+fi
+# compat12 on a toolkit older than 12.8: the program leaves out the call cudaEventElapsedTime_v2 (12.8's), and the
+# card's trace, made with 12.8, has its two callbacks.
+if [[ "$case_name" == compat12 ]]; then
+  nvcc_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+  cudart_version=0
+  for d in ${CUPTI_CUDA12_ROOT:+"$CUPTI_CUDA12_ROOT/include"} "$nvcc_root/include" "$nvcc_root/targets/x86_64-linux/include" /usr/include; do
+    if [[ -f "$d/cuda_runtime_api.h" ]]; then
+      cudart_version="$(sed -n 's/^#define CUDART_VERSION[[:space:]]\+\([0-9]\+\).*/\1/p' "$d/cuda_runtime_api.h" | head -1)"
+      break
+    fi
+  done
+  if (( ${cudart_version:-0} > 0 && cudart_version < 12080 )); then
+    if (( card && update )); then echo "FAIL: --update needs the CUDA 12.8 headers (this toolkit is $cudart_version)"; exit 1; fi
+    grep -v 'cudaEventElapsedTime_v2' "$expected" > "$out.expected"
+    expected="$out.expected"
+  fi
 fi
 if (( card && update )); then
   cp "$out.txt" "$expected"

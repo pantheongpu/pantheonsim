@@ -35,6 +35,16 @@ int main() {
 
 namespace {
 
+// The types of the four entry points whose declarations give trailing parameters a default
+// argument. They are spelled out because nvcc's front end (12.0 to 12.9) writes
+// decltype(&function) back out with those defaults, and the host compiler then refuses it.
+using CaptureInfoV3Fn = cudaError_t (*)(cudaStream_t, cudaStreamCaptureStatus*, unsigned long long*, cudaGraph_t*,
+                                        const cudaGraphNode_t**, const cudaGraphEdgeData**, size_t*);
+using CaptureInfoV2Fn = cudaError_t (*)(cudaStream_t, cudaStreamCaptureStatus*, unsigned long long*, cudaGraph_t*,
+                                        const cudaGraphNode_t**, size_t*);
+using UpdateCaptureV2Fn = cudaError_t (*)(cudaStream_t, cudaGraphNode_t*, const cudaGraphEdgeData*, size_t, unsigned int);
+using PrefetchV2Fn = cudaError_t (*)(const void*, size_t, cudaMemLocation, unsigned int, cudaStream_t);
+
 std::vector<std::string> g_lines;
 
 template <class T>
@@ -152,11 +162,11 @@ int main() {
   const auto get_dependents_v2 =
       lookup<decltype(&cudaGraphNodeGetDependentNodes_v2)>("cudaGraphNodeGetDependentNodes_v2");
   const auto add_node_v2 = lookup<decltype(&cudaGraphAddNode_v2)>("cudaGraphAddNode_v2");
-  const auto capture_info_v3 = lookup<decltype(&cudaStreamGetCaptureInfo_v3)>("cudaStreamGetCaptureInfo_v3");
-  const auto capture_info_v2 = lookup<decltype(&cudaStreamGetCaptureInfo_v2)>("cudaStreamGetCaptureInfo_v2");
+  const auto capture_info_v3 = lookup<CaptureInfoV3Fn>("cudaStreamGetCaptureInfo_v3");
+  const auto capture_info_v2 = lookup<CaptureInfoV2Fn>("cudaStreamGetCaptureInfo_v2");
   const auto update_capture_v2 =
-      lookup<decltype(&cudaStreamUpdateCaptureDependencies_v2)>("cudaStreamUpdateCaptureDependencies_v2");
-  const auto prefetch_v2 = lookup<decltype(&cudaMemPrefetchAsync_v2)>("cudaMemPrefetchAsync_v2");
+      lookup<UpdateCaptureV2Fn>("cudaStreamUpdateCaptureDependencies_v2");
+  const auto prefetch_v2 = lookup<PrefetchV2Fn>("cudaMemPrefetchAsync_v2");
   const auto advise_v2 = lookup<decltype(&cudaMemAdvise_v2)>("cudaMemAdvise_v2");
   const auto properties_v2 = lookup<decltype(&cudaGetDeviceProperties_v2)>("cudaGetDeviceProperties_v2");
 #if CUDART_VERSION >= 12080
