@@ -63,7 +63,7 @@ if [[ -z "${VGPU_NVJITLINK_LIB:-}" ]]; then
   if (( ! have )); then
     for py in "${VGPU_TORCH_CUDA_PYTHON:-}" "$HOME"/.local/share/torch-cu13*/bin/python python3; do
       [[ -n "$py" ]] && command -v "$py" >/dev/null 2>&1 || continue
-      d=$("$py" -I -c 'import importlib.util as u; s = u.find_spec("nvidia.cu13"); print(list(s.submodule_search_locations)[0] if s and s.submodule_search_locations else "")' 2>/dev/null)
+      d=$("$py" -I -c 'import importlib.util as u; s = u.find_spec("nvidia.cu13"); print(list(s.submodule_search_locations)[0] if s and s.submodule_search_locations else "")' 2>/dev/null || true)
       [[ -n "$d" && -e "$d/lib/libnvJitLink.so.13" ]] && { export VGPU_NVJITLINK_LIB="$d/lib/libnvJitLink.so.13"; break; }
     done
   fi
