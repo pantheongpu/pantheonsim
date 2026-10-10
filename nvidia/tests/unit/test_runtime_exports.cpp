@@ -24,6 +24,11 @@ void __cudaRegisterFunction(void** fatCubinHandle, const char* hostFun, char* de
                             void* gDim, int* wSize);
 }
 
+// The test carries its own copy of the fatbin writer that the runtime also carries, which AddressSanitizer's
+// default ODR check aborts on when the program is run by hand (CMake's test environment says the same, and
+// ASAN_OPTIONS still wins when set). Leak detection stays on.
+extern "C" const char* __asan_default_options() { return "detect_leaks=1:detect_odr_violation=0"; }
+
 namespace {
 
 // --- cudaMemset3D -----------------------------------------------------------
