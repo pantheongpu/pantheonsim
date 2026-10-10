@@ -397,6 +397,41 @@ on a 25-texel level reads texel 0, where the exact product 1.0000000708 says 1; 
 ceil(k 2^21 / width) / 2^21, and every 8-bit filter weight follows the floored coordinate. A NaN coordinate reads as 0.
 Powers of two are unaffected (the product is exact).
 
+## tex.grad with anisotropy, measured but not reproduced
+
+A texture with `maxAnisotropy` above 1 filters a `tex.grad` fetch with several taps along the major axis of the
+gradients. Round 6 probed it on an RTX 3060 (`tools/probes/texture_aniso_grad_probe.cu`: impulse textures with
+point filtering, so one query reads one tap's weight; mip level forced with the clamps; and level-id textures).
+This is what the card does; none of it is in the simulator, because the arithmetic behind the weights was not
+recovered exactly (last item), and a plausible wrong number is worse than a refusal.
+
+- **Taps.** Pmax = the larger of the two gradient lengths, Pmin = |det| / Pmax (the area of the parallelogram
+  over its longer side, not the shorter side: two orthogonal gradients of lengths 64 and 16 at 45 degrees give
+  an effective ratio of 3.6, at 10 degrees 4.38, at 0 exactly 4). With the effective ratio r = Pmax / Pmin and
+  A = `maxAnisotropy` (2, 4, 8, 16 all measured; the number of taps never exceeds A): r <= 1 is one tap; r between
+  1 and 2 is two equal taps, centred, spaced less than a texel (0.19 texel at r = 1.1, 0.34 at 1.2, 0.67 at 1.5,
+  0.95 at 1.9, 1 from 2); from r = 2 on, Nt = 2 ceil(r / 2) taps spaced exactly one texel of the fetched level
+  along the major axis, centred, the interior ones with weight 1/r and the two end ones with
+  (r - Nt + 2) / (2 r). Weights are integers in 1/1024 that sum to 1024; the end weight is
+  (1024 - (Nt - 2) w) / 2 for the interior weight w. The spacing follows the level actually fetched (a clamped
+  level keeps one texel).
+- **Level of detail** is log2(max(Pmin, Pmax / A)) (checked from the sharpened mip weights of "Anisotropy and
+  an explicit level" above, which the grad fetch uses too).
+- **Interior weight.** With diff = 2 L(Pmax) - L(Pmax Pmin) in 1/256ths of an octave, L the lod log2 table of
+  `texture_grad.hpp`, (q, f) = divmod(diff, 256) and E = round(256 2^(-f/256)), the interior weight is
+  (4 E) >> q. This reproduces all 3,000 weights measured when Pmax or Pmin is a power of two (every mantissa of
+  Pmin against Pmax = 64, and of Pmax against Pmin = 16), where the product's log is the plain table entry.
+  For two other values the product's mantissa has to be rounded to 10 bits before its table index is taken to
+  get close (4.3 % of 65,536 pairs still differ by one or two codes of diff, 14 % with the index truncated), and
+  no rounding rule tried closes that.
+- **Sum.** The taps' weighted bilinear values are added exactly and rounded to nearest, ties up (3,997 of 4,000
+  random float fetches; the other three are 0.50 to 0.52 ulp off, a narrower internal accumulator).
+
+Not found: how the product's log is formed exactly (the item above), the ratio thresholds at which the tap count
+steps up, the tap positions of rotated gradients (only the supports were looked at), the spacing in the 1 to 2
+range as a formula, and how the taps interact with the blend of two mip levels. Each is a further black-box fit
+of the size of the original LOD one, and the first is not closed.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
@@ -406,6 +441,8 @@ Each with its own message, rather than a plausible wrong number:
   (above). Not reproduced, and refused by name: cube textures (the model above matches the card, but needs its
   `MUFU.RCP` bit for bit) and a texture with `maxAnisotropy` above 1 (the card then filters along the major axis of
   the gradients' ellipse).
+  Round 6 measured the anisotropic case on an RTX 3060 and could not reproduce it bit for bit, so it stays
+  refused; what was found is in "tex.grad with anisotropy, measured but not reproduced" below.
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.
