@@ -128,12 +128,46 @@ VTEST(every_stream_decodes_to_the_frames_the_cards_nvdec_displayed) {
   VCHECK(checked > 30);
 }
 
+// Streams the card's NVDEC does not decode as the Recommendation says, or whose sequence callback this library cannot match: the CRC-32
+// of every frame HM (the reference encoder) reconstructed, in nvidia/tests/data/hevc/hm_spec_only.txt.
+VTEST(streams_the_card_gets_wrong_decode_to_the_reference_encoders_frames) {
+  const std::string src = source_dir();
+  std::ifstream f(src + "/nvidia/tests/data/hevc/hm_spec_only.txt");
+  std::string line;
+  std::map<std::string, std::vector<Expect>> want;
+  while (std::getline(f, line)) {
+    char name[64];
+    unsigned n, w, h, crc;
+    if (line.empty() || line[0] == '#') continue;
+    VCHECK(std::sscanf(line.c_str(), "%63s %u %u %u %x", name, &n, &w, &h, &crc) == 5);
+    VCHECK_EQ(want[name].size(), size_t(n));
+    want[name].push_back({static_cast<int>(w), static_cast<int>(h), crc});
+  }
+  VCHECK_EQ(want.size(), size_t(3));
+  for (const auto& kv : want) {
+    const std::vector<uint8_t> data = slurp(src + "/nvidia/tests/data/hevc/" + kv.first + ".h265");
+    VCHECK(!data.empty());
+    std::vector<vgpu_hevc::OutFrame> frames;
+    std::string err;
+    VCHECK(vgpu_hevc::decode_stream(data.data(), data.size(), &frames, &err));
+    VCHECK_EQ(frames.size(), kv.second.size());
+    for (size_t i = 0; i < frames.size() && i < kv.second.size(); ++i) {
+      if (frames[i].width != kv.second[i].w || frames[i].height != kv.second[i].h || frame_crc(frames[i]) != kv.second[i].crc) {
+        std::fprintf(stderr, "%s frame %zu differs from the reference encoder's\n", kv.first.c_str(), i);
+        VCHECK(false);
+        break;
+      }
+    }
+  }
+}
+
 VTEST(damaged_streams_do_not_crash_the_decoder) {
   const std::string src = source_dir();
-  // streams that between them use every tool: tiles-free wavefronts, several slices, 10 bits, transform skip, lossless, weighted
-  // prediction, scaling lists, long-term references, parameter sets between pictures, a resolution change
+  // streams that between them use every tool: tiles, wavefronts, several slices and dependent slice segments, 10 and 12 bits, transform skip,
+  // PCM, lossless, weighted prediction, scaling lists, cu_qp_delta, range extension tools, parameter sets between pictures, a resolution change
   for (const char* name : {"b_pyramid", "main10", "wpp", "slices", "tskip", "lossless", "cu_lossless", "weightb", "scaling_def", "amp_rect", "ctu16",
-                           "b_ps_mid", "res_change", "cra_first", "open_gop", "crop_odd"}) {
+                           "b_ps_mid", "res_change", "cra_first", "open_gop", "crop_odd", "hm_tiles_nonuni", "hm_tiles_slices", "hm_pcm", "hm_pcm10",
+                           "hm_depslices", "hm_wpp_depslices", "hm_sl_custom", "hm_cuqp", "hm_rext", "hm_main12", "hm_wp_ra", "hm_2tids", "hm_cuchroma"}) {
     std::vector<uint8_t> data = slurp(src + "/nvidia/tests/data/hevc/" + name + ".h265");
     VCHECK(!data.empty());
     // truncated anywhere

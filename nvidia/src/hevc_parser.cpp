@@ -30,15 +30,6 @@ struct Pic {
 };
 using PicPtr = std::shared_ptr<Pic>;
 
-int gcd_int(int a, int b) {
-  while (b) {
-    const int t = a % b;
-    a = b;
-    b = t;
-  }
-  return a;
-}
-
 struct ParamRaw {
   std::vector<uint8_t> raw;
 };
@@ -390,12 +381,20 @@ struct HevcParser::Impl {
     i.profile = s.profile_idc;
     i.level = s.level_idc;
     i.min_surfaces = min_surfaces_of(s);
-    if (s.timing_present && s.num_units_in_tick && s.time_scale) {
-      const unsigned g = static_cast<unsigned>(gcd_int(static_cast<int>(s.time_scale), static_cast<int>(s.num_units_in_tick)));
-      i.fps_num = s.time_scale / g;
-      i.fps_den = s.num_units_in_tick / g;
+    // The frame rate (measured with streams of every time scale): the VUI's time scale and number of units in a tick as they are, not
+    // reduced; none (0/0) when the rate is not above one frame per second; a time scale above 250001 is divided down by a power of
+    // two (rounding both up) until it is not -- the card divides by other factors too when the two have common ones (300000/10
+    // gives 60000/2), which is not reproduced.
+    if (s.timing_present && s.num_units_in_tick && s.time_scale && s.time_scale > s.num_units_in_tick) {
+      uint64_t n = s.time_scale, d = s.num_units_in_tick;
+      while (n > 250001) {
+        n = (n + 1) / 2;
+        d = (d + 1) / 2;
+      }
+      i.fps_num = static_cast<unsigned>(n);
+      i.fps_den = static_cast<unsigned>(d);
     }
-    i.bitrate = s.hrd_bit_rate;
+    i.bitrate = 0;   // measured: the card reports no bit rate for HEVC, with or without HRD parameters
     int sar_w = 1, sar_h = 1;
     if (s.aspect_present) {
       static const int tab[17][2] = {{1, 1}, {1, 1}, {12, 11}, {10, 11}, {16, 11}, {40, 33}, {24, 11}, {20, 11}, {32, 11}, {80, 33}, {18, 11}, {15, 11}, {64, 33}, {160, 99}, {4, 3}, {3, 2}, {2, 1}};

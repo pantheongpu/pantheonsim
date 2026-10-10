@@ -1093,7 +1093,8 @@ libcutensor.2.7.0 {
     file(WRITE "${_nvcuvid_map}" "{\n  global: cuvid*;\n  local: *;\n};\n")
     add_library(vgpunvcuvid SHARED nvidia/src/nvcuvid_api.cpp nvidia/src/nvjpeg_api.cpp
                 nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp
-                nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp)
+                nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp
+                nvidia/src/mpeg2_decode.cpp nvidia/src/mpeg2_parser.cpp nvidia/src/mpeg2_syntax.cpp)
     target_link_libraries(vgpunvcuvid PRIVATE vgpu vgpucudart)
     target_include_directories(vgpunvcuvid PRIVATE ${CUDA_ABI_INCLUDE} nvidia/third_party/nvdec_include)
     set_target_properties(vgpunvcuvid PROPERTIES OUTPUT_NAME nvcuvid SOVERSION 1 VERSION 1.0)
@@ -1233,6 +1234,10 @@ target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 vgpu_unit_test(test_hevc_decode nvidia/tests/unit/test_hevc_decode.cpp)
 target_sources(test_hevc_decode PRIVATE nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp nvidia/src/hevc_stream.cpp)
 target_compile_definitions(test_hevc_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The MPEG-2 decoder and parser behind NVDEC, against the frames an RTX 3060 displayed (within the inverse DCT's tolerance).
+vgpu_unit_test(test_mpeg2_decode nvidia/tests/unit/test_mpeg2_decode.cpp)
+target_sources(test_mpeg2_decode PRIVATE nvidia/src/mpeg2_decode.cpp nvidia/src/mpeg2_parser.cpp nvidia/src/mpeg2_syntax.cpp nvidia/src/mpeg2_stream.cpp)
+target_compile_definitions(test_mpeg2_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
@@ -2140,6 +2145,14 @@ if(TARGET vgpucublas)
     add_test(NAME e2e_nvcuvid_hevc
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvcuvid_hevc.sh)
     set_tests_properties(e2e_nvcuvid_hevc PROPERTIES
+      DEPENDS vgpunvcuvid
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 900)
+    # The MPEG-2 decoder and video parser, likewise against nvidia/tests/data/mpeg2 (frames within the inverse DCT's tolerance).
+    add_test(NAME e2e_nvcuvid_mpeg2
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvcuvid_mpeg2.sh)
+    set_tests_properties(e2e_nvcuvid_mpeg2 PROPERTIES
       DEPENDS vgpunvcuvid
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
       SKIP_REGULAR_EXPRESSION "^SKIP:"

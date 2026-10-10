@@ -473,7 +473,17 @@ static void run_hevc_suite(const std::string& base, const std::string& only, con
       "i_only",      "p_low",      "b_flat",    "b_pyramid",  "sao_off",   "deblock_off", "deblock_offs", "amp_rect",   "ctu16",   "ctu32",      "tskip",
       "lossless",    "cu_lossless", "no_signhide", "scaling_def", "wpp",     "slices",      "weightp",      "weightb",    "no_tmvp", "main10",     "main10_i",
       "main10_wide", "cip",        "no_strong", "open_gop",   "long_gop",  "lowqp",       "highqp",       "aud_hrd",    "max_merge2", "cutree_idr", "rd_deep",
-      "tu_deep",     "b_sei",      "b_aud",     "b_ps_mid",   "cra_first", "bla",         "eos_mid",      "res_change", "crop",       "crop_odd",    "size_136"};
+      "tu_deep",     "b_sei",      "b_aud",     "b_ps_mid",   "cra_first", "bla",         "eos_mid",      "res_change", "crop",       "crop_odd",    "size_136",
+      // streams from the HEVC reference encoder HM (make_hm_fixtures.sh): tiles, slices and dependent slice segments, PCM, scaling lists,
+      // cu_qp_delta, chroma QP offsets, the range extension tools, weighted prediction, hierarchical B pictures with several temporal layers
+      "hm_2tids", "hm_chroma_qp", "hm_chroma_qp_slice", "hm_cip", "hm_ctu64", "hm_cuqp",
+      "hm_cuqp_ra", "hm_deblock", "hm_deblock_slice", "hm_depslices", "hm_depslices_bytes", "hm_ld_b",
+      "hm_main12", "hm_main12_ra", "hm_merge1", "hm_pcm", "hm_pcm10", "hm_pcm_lf",
+      "hm_pml", "hm_pml_ctu16", "hm_ra", "hm_ra_cra16", "hm_ra_gop8", "hm_ra_idr16",
+      "hm_ra_main10", "hm_ra_slices", "hm_rext", "hm_rext_ra", "hm_sei_md5", "hm_sl_custom",
+      "hm_sl_custom10", "hm_sl_custom_ra", "hm_sl_default", "hm_slices_lf", "hm_slices_nolf", "hm_tiles",
+      "hm_tiles_main10", "hm_tiles_nolf", "hm_tiles_nonuni", "hm_tiles_ra", "hm_tiles_slices", "hm_tmvp_off",
+      "hm_wp", "hm_wp_b", "hm_wp_ra", "hm_wpp_depslices", "hm_wpp_slices"};
   const Mode plain{"packets"};
   auto load = [&](const char* n) { return slurp(base + "/hevc/" + n + ".h265"); };
   const auto stream = [&](const char* n, const Mode& m) {
