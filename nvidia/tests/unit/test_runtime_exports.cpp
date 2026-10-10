@@ -350,7 +350,10 @@ VTEST(shared_memory_banks_are_four_bytes_wide) {
   VCHECK_EQ(cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte), cudaSuccess);   // accepted, no effect
   VCHECK_EQ(cudaDeviceGetSharedMemConfig(&c), cudaSuccess);
   VCHECK_EQ(static_cast<int>(c), static_cast<int>(cudaSharedMemBankSizeFourByte));
-  VCHECK_EQ(cudaDeviceSetSharedMemConfig(static_cast<cudaSharedMemConfig>(7)), cudaErrorInvalidValue);
+  // An out-of-range enumerator. Holding one in an enum-typed object is itself UB (UBSan reports the load), so call
+  // the entry point as taking the int the enum is in the ABI.
+  using SetWithInt = cudaError_t (*)(int);
+  VCHECK_EQ(reinterpret_cast<SetWithInt>(&cudaDeviceSetSharedMemConfig)(7), cudaErrorInvalidValue);
   VCHECK_EQ(cudaDeviceGetSharedMemConfig(nullptr), cudaErrorInvalidValue);
 }
 

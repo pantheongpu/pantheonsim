@@ -791,8 +791,8 @@ uint32_t double_to_fp8(double d, const Fp8Format& f, bool satfinite) {
   const uint32_t man_mask = (1u << f.man_bits) - 1u;
   const uint32_t exp_mask = (1u << f.exp_bits) - 1u;
   const uint32_t sign_bit = 1u << (f.exp_bits + f.man_bits);
-  const uint32_t nan_bits = f.has_inf ? ((exp_mask << f.man_bits) | 1u)
-                                      : ((exp_mask << f.man_bits) | man_mask);
+  // Measured on an L4 (sm_89): a NaN converts to the all-ones code in both formats (0x7F for E5M2 too).
+  const uint32_t nan_bits = (exp_mask << f.man_bits) | man_mask;
   if (std::isnan(d)) return nan_bits;
   const uint32_t sign = std::signbit(d) ? sign_bit : 0u;
   double a = std::fabs(d);
@@ -840,6 +840,18 @@ double small_float_value(uint32_t code, int eb, int mb, int bias) {
   const double mag = exp ? std::ldexp(1.0 + mant / double(1u << mb), int(exp) - bias)
                          : std::ldexp(mant / double(1u << mb), 1 - bias);
   return (code >> (eb + mb)) & 1 ? -mag : mag;
+}
+// `v` rounded toward zero onto the grid of a float format with `mb` mantissa bits and
+// the given exponent bias (subnormals included), for cvt's .rz; NaN and infinity pass.
+// Overflow is left to the encoder (it saturates).
+double trunc_to_grid(double v, int mb, int bias) {
+  if (!std::isfinite(v) || v == 0.0) return v;
+  const double a = std::fabs(v);
+  int e = 0;
+  std::frexp(a, &e);
+  const int E = std::max(e - 1, 1 - bias);
+  const double t = std::ldexp(std::floor(std::ldexp(a, mb - E)), E - mb);
+  return std::signbit(v) ? -t : t;
 }
 uint32_t double_to_small_float(double v, int eb, int mb, int bias) {
   const uint32_t sign = std::signbit(v) ? 1u << (eb + mb) : 0u;
@@ -1193,11 +1205,54 @@ bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
 
 // Reads one channel's raw bits out of a texel.
 uint64_t texel_channel_bits(const MemoryManager& mem, const TextureDesc& d, uint64_t texel_addr, uint32_t ch) {
+  if (d.packed_1010102) {   // 10:10:10:2, x in the low bits
+    const uint64_t w = mem.load_scalar(texel_addr, 4);
+    static constexpr uint32_t kShift[4] = {0, 10, 20, 30}, kBits[4] = {10, 10, 10, 2};
+    return (w >> kShift[ch & 3]) & ((1u << kBits[ch & 3]) - 1);
+  }
   uint32_t offset = 0;
   for (uint32_t i = 0; i < ch; ++i) offset += d.channel_bits[i] / 8;
   const uint32_t bytes = d.channel_bits[ch] / 8;
   if (bytes == 0) return 0;
   return mem.load_scalar(texel_addr + offset, bytes);
+}
+
+// ---- block-compressed textures ----
+//
+// The texel at (x, y, z) of a block-compressed texture is a texel of the decoded block that holds it; a
+// fetch looks at one or a few blocks (a filter's footprint), so the last block decoded is kept, for the
+// length of the fetch (texture_fetch clears it first, the texture's memory being free to change between
+// fetches).
+struct BcCache {
+  bool valid = false;
+  uint64_t addr = 0;
+  BlockFormat format = BlockFormat::None;
+  DecodedBlock block{};
+};
+thread_local BcCache t_bc;
+
+uint64_t bc_texel_bits(const MemoryManager& mem, const TextureDesc& d, uint32_t x, uint32_t y, uint32_t z, uint32_t ch) {
+  const uint64_t bb = block_bytes(d.block);
+  const uint64_t blocks_per_row = (uint64_t{d.width} + 3) / 4;
+  const uint64_t block_rows = ((d.height ? d.height : 1u) + 3u) / 4u;
+  const uint64_t addr = d.base + uint64_t{z} * blocks_per_row * block_rows * bb + (y / 4) * blocks_per_row * bb + (x / 4) * bb;
+  if (!t_bc.valid || t_bc.addr != addr || t_bc.format != d.block) {
+    uint8_t raw[16];
+    mem.read(addr, raw, bb);
+    if (!decode_block(d.block, raw, &t_bc.block))
+      tex_fail(Err::Unsupported, "a texture of BC6H or BC7 blocks: these two formats are not implemented (BC1 to BC5 are)");
+    t_bc.valid = true;
+    t_bc.addr = addr;
+    t_bc.format = d.block;
+  }
+  return t_bc.block.v[(y & 3) * 4 + (x & 3)][ch & 3];
+}
+
+// One channel of the texel at (x, y, z), whose address in a plain layout is `addr`.
+uint64_t texel_raw(const MemoryManager& mem, const TextureDesc& d, uint64_t addr, uint32_t x, uint32_t y, uint32_t z,
+                   uint32_t ch) {
+  if (d.block != BlockFormat::None) return ch < d.channels ? bc_texel_bits(mem, d, x, y, z, ch) : 0;
+  return texel_channel_bits(mem, d, addr, ch);
 }
 
 // sRGB decoding, as an RTX 3060's texture unit does it: through a table, not
@@ -1296,7 +1351,10 @@ uint32_t convert_channel(const TextureDesc& d, uint32_t ch, uint64_t raw, bool f
   // A channel the format does not have reads 0 -- w too, measured on an RTX
   // 3060 for every format, read mode, filter and resource type (the
   // graphics APIs' w = 1 is not what CUDA's fetches return).
-  if (bits == 0) return 0;
+  if (bits == 0) {
+    // A block-compressed format without an alpha channel has alpha 1 (measured for BC4 and BC5).
+    return d.block != BlockFormat::None && ch == 3 ? f32bits(1.0f) : 0;
+  }
   if (d.kind == ChannelKind::Float) {
     if (bits == 32) return static_cast<uint32_t>(raw);
     if (bits == 16) {
@@ -1352,11 +1410,6 @@ uint32_t convert_channel(const TextureDesc& d, uint32_t ch, uint64_t raw, bool f
 //    and 16-bit signed ones as themselves, rounded half up and read out as
 //    K/65535 or K/32767 (clamped to -32767 after the blend).
 //
-// Signed 8-bit normalized texels are refused: their result is a function of
-// the blended sum alone, but not one this could reproduce, and a filter that
-// is off by one step in a few percent of samples is the difference testing
-// exists to catch.
-
 int tex_round_half_up(int64_t num, int64_t den) {   // floor(num/den + 1/2)
   const int64_t t = 2 * num + den, d = 2 * den;
   return static_cast<int>(t >= 0 ? t / d : -((-t + d - 1) / d));
@@ -1456,6 +1509,10 @@ float tex_round_sum(const ExactSum& sum, bool half) {
 struct TexTerm {
   int w = 0;
   uint64_t addr = 0;
+  // The texel's place, and the texture it is a texel of (a mip level of the fetched one): what a
+  // block-compressed texel is found by.
+  uint32_t x = 0, y = 0, z = 0;
+  const TextureDesc* src = nullptr;
   bool border = false;
   // Which 2x2 footprint the texel belongs to -- a 3D fetch's z-slice, a mip
   // blend's level -- since the float blend aligns each on its own (see
@@ -1465,21 +1522,19 @@ struct TexTerm {
 
 void tex_check_filterable(const TextureDesc& d) {
   const uint32_t bits = d.channel_bits[0];
+  const bool packed = d.packed_1010102;   // 10:10:10:2 filters as 16-bit unsigned normalized
   const bool is_float = d.kind == ChannelKind::Float && (bits == 32 || bits == 16);
-  const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16) && d.read_as_normalized_float;
-  const bool snorm16 = d.kind == ChannelKind::Signed && bits == 16 && d.read_as_normalized_float;
-  if (!is_float && !unorm && !snorm16)
+  const bool unorm = d.kind == ChannelKind::Unsigned && (bits == 8 || bits == 16 || packed) && d.read_as_normalized_float;
+  const bool snorm = d.kind == ChannelKind::Signed && (bits == 8 || bits == 16) && d.read_as_normalized_float;
+  if (!is_float && !unorm && !snorm)
     tex_fail(Err::Unsupported,
-             d.kind == ChannelKind::Signed && bits == 8
-                 ? "linear filtering of signed 8-bit normalized texels is not implemented: "
-                   "measured on hardware, the result is not the rounded weighted sum of the "
-                   "texels' 16-bit forms, and a filter that differs from the device in the last "
-                   "step would hide exactly what differential testing is for"
-                 : "linear filtering needs a float, half, or normalized 8/16-bit texture read as "
-                   "normalized float; this texture's format has no filtered form");
-  for (uint32_t ch = 1; ch < 4; ++ch)
-    if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
-      tex_fail(Err::Unsupported, "linear filtering of a texture whose channels differ in width");
+             "linear filtering needs a float, half, or normalized 8/16-bit texture read as "
+             "normalized float; this texture's format has no filtered form");
+  // The channels of a block-compressed or packed format may differ in width (BC3's colour and alpha, 10:10:10:2).
+  if (d.block == BlockFormat::None && !packed)
+    for (uint32_t ch = 1; ch < 4; ++ch)
+      if (d.channel_bits[ch] && d.channel_bits[ch] != bits)
+        tex_fail(Err::Unsupported, "linear filtering of a texture whose channels differ in width");
 }
 
 // The texels a linear filter reads and their weights, which sum to `total`.
@@ -1493,7 +1548,10 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
   for (uint32_t i = 0; i < fdims; ++i) {
     float x = i < dims ? coord[i] : 0.0f;
     if (d.normalized_coords) x *= static_cast<float>(size[i]);
-    double v = x;
+    // The offset moves the coordinate by whole texels before the clamp mode
+    // limits it (measured on an RTX 3060: clamp and linear filtering with
+    // offsets, where the weights show the difference).
+    double v = static_cast<double>(x) + d.fetch_offset[i];
     if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
     const double xb = v - 0.5;
     double fl = std::floor(xb);
@@ -1518,6 +1576,8 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     t.w = w[k];
     t.border = !inside;
     t.group = off[2];
+    t.src = &d;
+    t.x = idx[0], t.y = idx[1], t.z = idx[2];
     if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
   }
   return n;
@@ -1532,19 +1592,32 @@ int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3
   for (uint32_t i = 0; i < dims; ++i) {
     float f = coord[i];
     if (d.normalized_coords) f *= static_cast<float>(size[i]);
-    if (!wrap_coord(effective_address(d, i), static_cast<int64_t>(std::floor(f)), size[i], &idx[i])) inside = false;
+    if (!wrap_coord(effective_address(d, i), static_cast<int64_t>(std::floor(f)) + d.fetch_offset[i], size[i], &idx[i]))
+      inside = false;
   }
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
   const uint64_t plane = row * (d.height ? d.height : 1);
   out[0].w = total;
   out[0].border = !inside;
+  out[0].src = &d;
+  out[0].x = idx[0], out[0].y = idx[1], out[0].z = idx[2];
   out[0].addr = inside ? d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes : 0;
   return 1;
 }
 
+// An unsigned normalized channel of `bits` bits as the 16-bit integer the filter works in: the code's bits
+// repeated to fill 16 (8-bit codes are u * 257, the 10 and 2 bits of 10:10:10:2 are (u << 6) | (u >> 4) and
+// u * 21845), 16-bit ones as they are. Measured on an RTX 3060 with all 1024 codes of 10 bits (linear
+// filtering at texel centres): bit replication, not a rounded scaling.
+uint32_t unorm16(uint64_t raw, uint32_t bits) {
+  if (bits >= 16) return static_cast<uint32_t>(raw);
+  uint32_t v = static_cast<uint32_t>(raw) << (16 - bits);
+  for (uint32_t s = bits; s < 16; s *= 2) v |= v >> s;
+  return v;
+}
+
 // Sums weight x texel over the terms and rounds, by the format's rules.
 void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
-  const uint32_t bits = d.channel_bits[0];
   const bool is_float = d.kind == ChannelKind::Float;
   const bool unorm = d.kind == ChannelKind::Unsigned;
   int64_t isum[4] = {0, 0, 0, 0};
@@ -1554,7 +1627,10 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
     for (uint32_t ch = 0; ch < 4; ++ch) {
       if (!d.channel_bits[ch]) continue;
       if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
-      const uint64_t raw = terms[k].border ? tex_border_raw(d, ch) : texel_channel_bits(mem, d, terms[k].addr, ch);
+      const uint32_t bits = d.channel_bits[ch];   // the channels of a block-compressed format differ in width
+      const TextureDesc& at = terms[k].src ? *terms[k].src : d;
+      const uint64_t raw = terms[k].border ? tex_border_raw(d, ch)
+                                           : texel_raw(mem, at, terms[k].addr, terms[k].x, terms[k].y, terms[k].z, ch);
       if (is_float) {
         double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
         if (bits == 32 && std::fabs(t) < std::ldexp(1.0, -126)) t = std::copysign(0.0, t);   // flushed
@@ -1562,7 +1638,9 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
       } else if (tex_srgb(d, ch)) {
         codes[ch][k] = static_cast<uint32_t>(raw & 0xFF);
       } else if (unorm) {
-        isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(bits == 8 ? raw * 257 : raw);
+        isum[ch] += int64_t{terms[k].w} * static_cast<int64_t>(unorm16(raw, bits));
+      } else if (bits == 8) {
+        isum[ch] += int64_t{terms[k].w} * static_cast<int8_t>(raw);   // the 8-bit codes, see the blend below
       } else {
         isum[ch] += int64_t{terms[k].w} * static_cast<int16_t>(raw);
       }
@@ -1570,8 +1648,9 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
   }
   for (uint32_t ch = 0; ch < 4; ++ch) {
     float r;
+    const uint32_t bits = d.channel_bits[ch];
     if (!d.channel_bits[ch]) {
-      r = 0.0f;
+      r = d.block != BlockFormat::None && ch == 3 ? 1.0f : 0.0f;   // a block-compressed format without alpha has alpha 1
     } else if (tex_srgb(d, ch)) {
       // An sRGB channel blends its table values (measured over 134,316
       // two-texel blends): the table holds codes in blocks of eight sharing
@@ -1653,7 +1732,19 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
       // A NaN comes out as the filter's own, all ones in the format.
       if (std::isnan(r)) { out[ch] = bits == 32 ? 0x7FFFFFFFu : 0x7FFFE000u; continue; }
     } else {
-      const int K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
+      int K;
+      if (!unorm && bits == 8) {
+        // A signed 8-bit normalized blend: the weighted sum S of the 8-bit
+        // codes (weights summing to 256) comes out as S + (257 * (S >> 4) +
+        // 1024) >> 11, over 32767 -- the sum's 16-bit form being a function
+        // of S alone, found over all 65,281 sums an RTX 3060 can make of
+        // two texels (every sum from -32768 to 32512), where the fit is
+        // exact; clamped to -32767 after the blend.
+        const int64_t S = isum[ch];
+        K = static_cast<int>(std::max<int64_t>(S + ((257 * (S >> 4) + 1024) >> 11), -32767));
+      } else {
+        K = std::max(tex_round_half_up(isum[ch], 256), unorm ? 0 : -32767);
+      }
       r = static_cast<float>(static_cast<double>(K) / (unorm ? 65535.0 : 32767.0));
     }
     out[ch] = static_cast<uint32_t>(f32bits(r));
@@ -1708,6 +1799,8 @@ TextureDesc tex_level(const TextureDesc& d, uint32_t level) {
 // as the face coordinate; and filtering stays inside the face, under the
 // texture's address mode.
 uint64_t tex_slice_bytes(const TextureDesc& d) {
+  if (d.block != BlockFormat::None)   // a slice of blocks
+    return ((uint64_t{d.width} + 3) / 4) * (((d.height ? d.height : 1u) + 3u) / 4) * block_bytes(d.block);
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
   return row * (d.height ? d.height : 1);
 }
@@ -1719,6 +1812,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
                                     (d.cubemap ? (d.layers ? "a layered cubemap" : "a cubemap")
                                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
   TextureDesc v = d;
+  for (int i = 0; i < 3; ++i) v.fetch_offset[i] = f.offset[i];
   uint32_t dims = f.dims;
   bool true_1d = false;
   float cf[3] = {0, 0, 0};
@@ -1754,7 +1848,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     // filtering does; linear filtering applies the mode inside the face --
     // wrap takes the texel from the face's far edge, border blends in the
     // border colour (measured).
-    if (v.filter != TexFilter::Linear && !d.mip_levels)
+    if (v.filter != TexFilter::Linear && !d.mip_levels && f.gather < 0)
       for (auto& a : v.address) a = TexAddress::Clamp;
     cf[0] = (sc / ma + 1.0f) * 0.5f;
     cf[1] = (tc / ma + 1.0f) * 0.5f;
@@ -1776,7 +1870,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
       const double xb = static_cast<double>(x) - 0.5;
       double fl = std::floor(xb);
       if (std::floor((xb - fl) * 256 + 0.5) >= 256) fl += 1;
-      b[i] = static_cast<int64_t>(fl);
+      b[i] = static_cast<int64_t>(fl) + v.fetch_offset[i];
     }
     const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
     static constexpr int kOrder[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
@@ -1785,7 +1879,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
       const bool inside = wrap_coord(effective_address(v, 0), b[0] + kOrder[k][0], size[0], &ix) &&
                           wrap_coord(effective_address(v, 1), b[1] + kOrder[k][1], size[1], &iy);
       const uint32_t ch = static_cast<uint32_t>(f.gather);
-      const uint64_t raw = inside ? texel_channel_bits(mem, v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ch)
+      const uint64_t raw = inside ? texel_raw(mem, v, v.base + iy * row + uint64_t{ix} * v.texel_bytes, ix, iy, 0, ch)
                                   : tex_border_raw(v, ch);
       uint32_t r = convert_channel(v, ch, raw, f.float_result);
       if (v.kind == ChannelKind::Signed && v.channel_bits[ch] == 8 && v.read_as_normalized_float) {
@@ -1861,13 +1955,13 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
       if (v.normalized_coords) x *= static_cast<float>(size[i]);
       // Point sampling takes the texel the coordinate falls in. CUDA's
       // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
-      c = static_cast<int64_t>(std::floor(x));
+      c = static_cast<int64_t>(std::floor(x)) + v.fetch_offset[i];
     } else {
       // An integer coordinate names a texel directly, and outside the extent
       // reads zero: an RTX 3060 applies neither the address mode nor the
       // border colour to it (clamp and border alike, with a border colour
       // of 7, give 0).
-      c = ci[i];
+      c = ci[i] + v.fetch_offset[i];
       if (c < 0 || c >= static_cast<int64_t>(size[i])) { inside = false; int_outside = true; break; }
       idx[i] = static_cast<uint32_t>(c);
       continue;
@@ -1875,6 +1969,12 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     if (!wrap_coord(effective_address(v, i), c, size[i], &idx[i])) { inside = false; break; }
   }
 
+  // A 1D texture is a 2D one of height 1, and the offset the instruction carries is read as three
+  // nibbles -- x, y, z -- so a negative 1D offset, which ptxas sign-extends into the nibbles above
+  // x, moves the row to -1 (fetch_offset[1]): outside, under border addressing.
+  if (inside && !int_outside && dims == 1 && !true_1d && v.fetch_offset[1] != 0 &&
+      effective_address(v, 1) == TexAddress::Border)
+    inside = false;
   if (int_outside) {
     for (uint32_t ch = 0; ch < 4; ++ch) out[ch] = 0;
     return;
@@ -1888,7 +1988,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   const uint64_t plane = row * (v.height ? v.height : 1);
   const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
   for (uint32_t ch = 0; ch < 4; ++ch)
-    out[ch] = convert_channel(v, ch, texel_channel_bits(mem, v, addr, ch), f.float_result);
+    out[ch] = convert_channel(v, ch, texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
 }
 
 // suld/sust address a surface in *bytes* along x and in whole rows along y
@@ -2006,7 +2106,7 @@ uint32_t sparse_column(uint32_t bits, uint32_t K, uint32_t sel, const Lanes& met
 // group in shared memory, the 6- and 4-bit ones padded, and in 8-bit
 // containers in Tensor Memory -- fp6 in bits 0-5, fp4 in bits 2-5; under
 // .kind::mxf4/mxf4nvf4, fp4 is packed two to a byte in both.
-enum class TcType { F16, BF16, TF32, E4M3, E5M2, E2M3, E3M2, E2M1, S8, U8 };
+enum class TcType { F16, BF16, TF32, E4M3, E5M2, E2M3, E3M2, E2M1, S8, U8, TI16 };
 struct TcElem {
   TcType t = TcType::F16;
   uint32_t bits = 16;          // the element's own width
@@ -2035,10 +2135,36 @@ double tc_decode(TcType t, uint32_t raw) {
     case TcType::E2M1: return small_float(raw & 0xF, 2, 1, 1);
     case TcType::S8: return static_cast<double>(static_cast<int8_t>(raw & 0xFF));
     case TcType::U8: return static_cast<double>(raw & 0xFF);
+    // s1z4m11 (PTX ISA 9.4): a sign, four bits that are zero and eleven of
+    // magnitude -- the range -2047 to 2047 the ISA gives, so sign and magnitude.
+    case TcType::TI16: return (raw & 0x8000) ? -static_cast<double>(raw & 0x7FF) : static_cast<double>(raw & 0x7FF);
   }
   return 0.0;
 }
 
+
+// spcompress's choice (PTX ISA 9.7.10.30): the two of four elements a selection keeps, as
+// indices in ascending order. sel: 0 MAX, 1 MAXABS, 2 MIN, 3 MINABS. A NaN is always kept; -0.0 is
+// below +0.0; where the ISA leaves ties to the implementation, the lower index goes first.
+void sp24_pick(const double v[4], uint32_t sel, uint32_t pick[2]) {
+  bool nan[4];
+  for (uint32_t j = 0; j < 4; ++j) nan[j] = std::isnan(v[j]);
+  const auto better = [&](uint32_t a, uint32_t b) {   // is a strictly better than b
+    if (nan[a] != nan[b]) return nan[a];
+    if (nan[a]) return false;
+    double x = v[a], y = v[b];
+    if (sel == 1 || sel == 3) { x = std::fabs(x); y = std::fabs(y); }
+    if (x == y && (sel == 0 || sel == 2)) {
+      const bool sx = std::signbit(x), sy = std::signbit(y);
+      if (sx != sy) return sel == 0 ? sy : sx;
+    }
+    return (sel == 0 || sel == 1) ? x > y : x < y;
+  };
+  uint32_t order[4] = {0, 1, 2, 3};
+  std::stable_sort(order, order + 4, [&](uint32_t a, uint32_t b) { return better(a, b); });
+  pick[0] = std::min(order[0], order[1]);
+  pick[1] = std::max(order[0], order[1]);
+}
 
 class Interpreter {
  public:
@@ -5034,6 +5160,67 @@ class Interpreter {
       exec_movmatrix(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpPackedInt>(&ins.op)) {
+      Lanes _s_a, _s_b;
+      const Lanes a = read_operand(w, ctx, ins, op->a, _s_a);
+      const Lanes b = op->kind == PackedIntOp::Neg ? Lanes{} : Lanes(read_operand(w, ctx, ins, op->b, _s_b));
+      Lanes r;
+      const uint32_t bits = op->lane_bits, n = 32 / bits;
+      const uint32_t mask = (1u << bits) - 1;
+      const int64_t lo = op->is_signed ? -(int64_t{1} << (bits - 1)) : 0,
+                    hi = op->is_signed ? (int64_t{1} << (bits - 1)) - 1 : (int64_t{1} << bits) - 1;
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint32_t out = 0;
+        for (uint32_t k = 0; k < n; ++k) {
+          const auto part = [&](uint64_t v) -> int64_t {
+            const uint32_t u = static_cast<uint32_t>(v >> (bits * k)) & mask;
+            return op->is_signed ? static_cast<int64_t>(static_cast<int32_t>(u << (32 - bits)) >> (32 - bits)) : u;
+          };
+          const int64_t x = part(a[lane]), y = op->kind == PackedIntOp::Neg ? 0 : part(b[lane]);
+          int64_t v = 0;
+          switch (op->kind) {
+            case PackedIntOp::Add: v = x + y; break;
+            case PackedIntOp::Sub: v = x - y; break;
+            case PackedIntOp::Neg: v = -x; break;
+            case PackedIntOp::Min: v = std::min(x, y); break;
+            case PackedIntOp::Max: v = std::max(x, y); break;
+            case PackedIntOp::Set: {
+              bool c = false;
+              switch (op->cmp) {
+                case CmpOp::Eq: c = x == y; break;
+                case CmpOp::Ne: c = x != y; break;
+                case CmpOp::Lt: c = x < y; break;
+                case CmpOp::Le: c = x <= y; break;
+                case CmpOp::Gt: c = x > y; break;
+                case CmpOp::Ge: c = x >= y; break;
+                default: break;
+              }
+              v = c ? mask : 0;
+              break;
+            }
+          }
+          if (op->sat) v = std::clamp(v, lo, hi);
+          if (op->relu && v < 0) v = 0;
+          out |= (static_cast<uint32_t>(v) & mask) << (bits * k);
+        }
+        r[lane] = out;
+      }
+      write_reg(w, op->dst, m, r, 32);
+      return;
+    }
+    if (const auto* op = std::get_if<OpF8x4Arith>(&ins.op)) {
+      exec_f8x4_arith(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpSpCompress>(&ins.op)) {
+      exec_spcompress(w, ctx, ins, *op, m);
+      return;
+    }
+    if (const auto* op = std::get_if<OpSpDecompress>(&ins.op)) {
+      exec_spdecompress(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpWgmma>(&ins.op)) {
       require_warp32(ins, "wgmma");
       exec_wgmma(w, ctx, ins, *op, m);
@@ -5130,6 +5317,7 @@ class Interpreter {
         // .satfinite: an overflow stops at the largest finite value.
         if (op->satfinite && !std::isnan(x) && (op->bf16 ? (h & 0x7FFF) == 0x7F80 : (h & 0x7FFF) == 0x7C00))
           h = (h & 0x8000) | (op->bf16 ? 0x7F7F : 0x7BFF);
+        if (op->pzo && (h & 0xFFFF) == 0x8000) h = 0;   // .pzo: a -0.0 result is +0.0
         return h & 0xFFFF;
       };
       for (uint32_t lane = 0; lane < W_; ++lane)
@@ -5161,6 +5349,7 @@ class Interpreter {
           else t = (x + 0x0FFFu + ((x >> 13) & 1u)) & ~0x1FFFu;          // ties to even
           // Rounding up can carry into the exponent and out to infinity.
           if (op->satfinite && (t & 0x7FFFFFFFu) >= 0x7F800000u) t = (t & 0x80000000u) | 0x7F7FE000u;
+          if (op->pzo && t == 0x80000000u) t = 0;   // .pzo: a -0.0 result is +0.0
           r[lane] = t;
         }
       write_reg(w, op->dst, m, r, 32);
@@ -5269,20 +5458,30 @@ class Interpreter {
       // The scale factor of value h (1 = the upper one): a ue8m0 byte.
       auto scale = [&](uint32_t lane, int h) {
         if (!sfl) return 1.0;
-        const uint32_t byte = ((*sfl)[lane] >> (8 * h)) & 0xFF;
+        const uint32_t byte = ((*sfl)[lane] >> (op->scaled_n1 ? 0 : 8 * h)) & 0xFF;
         return byte == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(byte) - 127);
       };
       // One value to the narrow type (9.7.10.24's .relu and .satfinite).
       auto encode = [&](double v, uint32_t lane) -> uint32_t {
-        if (op->relu && v < 0) v = 0.0;
+        // Measured on an L4 (sm_89): .relu sends -0 and every negative to +0.
+        if (op->relu && !std::isnan(v) && std::signbit(v)) v = 0.0;
+        uint32_t code;
         switch (fmt) {
           case NarrowFmt::E4M3:
-          case NarrowFmt::E5M2: return double_to_fp8(v, f, op->satfinite);
+          case NarrowFmt::E5M2:
+            // .rz (PTX ISA 9.4): truncate onto the grid first; what is past the largest
+            // finite value is then the encoder's, as for .rn.
+            if (op->rz) v = trunc_to_grid(v, op->e5m2 ? 2 : 3, op->e5m2 ? 15 : 7);
+            code = double_to_fp8(v, f, op->satfinite);
+            return op->pzo && code == 0x80 ? 0u : code;
           case NarrowFmt::E2M3:
           case NarrowFmt::E3M2:
           case NarrowFmt::E2M1: {
             const int eb = fmt == NarrowFmt::E3M2 ? 3 : 2, mb = fmt == NarrowFmt::E2M3 ? 3 : fmt == NarrowFmt::E3M2 ? 2 : 1;
-            return exec::small_float_bits(v, eb, mb, fmt == NarrowFmt::E3M2 ? 3 : 1);
+            const int bias = fmt == NarrowFmt::E3M2 ? 3 : 1;
+            if (op->rz) v = trunc_to_grid(v, mb, bias);
+            code = exec::small_float_bits(v, eb, mb, bias);
+            return op->pzo && code == (1u << (eb + mb)) ? 0u : code;
           }
           case NarrowFmt::UE8M0: {
             const uint32_t code = exec::ue8m0_bits(v, op->rp, op->satfinite);
@@ -5325,7 +5524,7 @@ class Interpreter {
               const uint64_t bits = (a[lane] >> (16 * h)) & 0xFFFF;
               v = op->bf16 ? bf16_to_double(bits) : f16_to_double(bits);
             }
-            if (fmt == NarrowFmt::S2F6) v /= scale(lane, h);
+            if (fmt == NarrowFmt::S2F6 || op->scaled_n1) v /= scale(lane, h);
             out |= uint64_t{encode(v, lane)} << (width * h);
           } else {
             double v = decode((a[lane] >> (width * h)) & ((1u << width) - 1)) * scale(lane, h);
@@ -6579,6 +6778,165 @@ class Interpreter {
     }
   }
 
+  // add, sub, mul and fma on four packed narrow floats (PTX ISA 9.7.6): each lane's operands decoded,
+  // combined exactly, and rounded to nearest-even into e5m2 or e4m3 (.satfinite clamps; without it an e4m3
+  // result past its largest finite value is NaN, an e5m2 one infinity). A sum of two values whose
+  // exponents are too far apart for a double breaks a rounding tie by the sign of what the double lost.
+  void exec_f8x4_arith(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpF8x4Arith& op, Mask m) {
+    Lanes sa, sb, sc;
+    const Lanes a = read_operand(w, ctx, ins, op.a, sa);
+    const Lanes b = read_operand(w, ctx, ins, op.b, sb);
+    const bool fma = op.kind == F8x4Op::Fma;
+    const Lanes c = fma ? Lanes(read_operand(w, ctx, ins, op.c, sc)) : Lanes{};
+    const Fp8Format& df = op.dfmt == NarrowFmt::E5M2 ? kE5M2 : kE4M3;
+    const auto element = [&](const F8x4Src& s, uint64_t reg, uint32_t i) -> double {
+      uint32_t code;
+      if (s.nibbles) code = static_cast<uint32_t>(reg >> (4 * i)) & 0xF;
+      else {
+        code = static_cast<uint32_t>(reg >> (8 * i)) & 0xFF;
+        if (s.padded_nibble) code &= 0xF;
+      }
+      switch (s.fmt) {
+        case NarrowFmt::E4M3: return fp8_to_double(code, kE4M3);
+        case NarrowFmt::E5M2: return fp8_to_double(code, kE5M2);
+        case NarrowFmt::E2M3: return small_float_value(code & 0x3F, 2, 3, 1);
+        case NarrowFmt::E3M2: return small_float_value(code & 0x3F, 3, 2, 3);
+        case NarrowFmt::E2M1: return small_float_value(code & 0xF, 2, 1, 1);
+        case NarrowFmt::UE8M0: return code == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(code) - 127);
+        default: return 0.0;
+      }
+    };
+    Lanes r;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      uint32_t out = 0;
+      for (uint32_t i = 0; i < 4; ++i) {
+        const double x = element(op.asrc, a[lane], i), y = element(op.bsrc, b[lane], i);
+        double v;
+        switch (op.kind) {
+          case F8x4Op::Add: v = x + y; break;
+          case F8x4Op::Sub: v = x - y; break;
+          case F8x4Op::Mul: v = x * y; break;
+          default: {
+            const double z = fp8_to_double((static_cast<uint32_t>(c[lane]) >> (8 * i)) & 0xFF, df);
+            const double p = x * y;   // exact: at most 8 bits by 8
+            v = p + z;
+            if (std::isfinite(p) && std::isfinite(z) && std::isfinite(v)) {   // the sum's rounding error, as a nudge
+              const double bb = v - p, err = (p - (v - bb)) + (z - bb);
+              if (err != 0) v = std::nextafter(v, err > 0 ? INFINITY : -INFINITY);
+            }
+          }
+        }
+        if (op.kind == F8x4Op::Add || op.kind == F8x4Op::Sub) {
+          if (std::isfinite(x) && std::isfinite(y) && std::isfinite(v)) {
+            const double yy = op.kind == F8x4Op::Sub ? -y : y;
+            const double bb = v - x, err = (x - (v - bb)) + (yy - bb);
+            if (err != 0) v = std::nextafter(v, err > 0 ? INFINITY : -INFINITY);
+          }
+        }
+        out |= double_to_fp8(v, df, op.satfinite) << (8 * i);
+      }
+      r[lane] = out;
+    }
+    write_reg(w, op.dst, m, r, 32);
+  }
+
+  // spcompress (PTX ISA 9.4, 9.7.10.30; figure 43): per thread, every group of four
+  // elements of `data` gives its two selected ones, in index order, to `cdata`
+  // and their indices to `mdata` (low bits first, group after group). The
+  // descriptor picks the selection (MAX, MAXABS, MIN, MINABS) and the element
+  // type. Where the ISA leaves a tie to the implementation, the lower index
+  // goes first; a NaN is always selected, and -0.0 is below +0.0.
+  void exec_spcompress(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSpCompress& op, Mask m) {
+    std::vector<Lanes> data(op.data.size());
+    for (size_t i = 0; i < op.data.size(); ++i) {
+      Lanes scratch;
+      data[i] = read_operand(w, ctx, ins, op.data[i], scratch);
+    }
+    Lanes _s_desc;
+    const Lanes desc = read_operand(w, ctx, ins, op.spdesc, _s_desc);
+    std::vector<Lanes> cdata(op.cdata.size()), mdata(op.mdata.size());
+    const uint32_t per_reg = 32 / op.elem_bits, groups_per_unit = 8 / (op.elem_bits / 8) / 4;   // 2 for b8, 1 for b16
+    (void)per_reg;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint32_t d = static_cast<uint32_t>(desc[lane]);
+      const uint32_t sel = d & 3, type = (d >> 2) & 7;
+      TcType tt = TcType::U8;
+      if (op.elem_bits == 8) {
+        switch (type) {
+          case 0: tt = TcType::U8; break;
+          case 1: tt = TcType::S8; break;
+          case 2: tt = TcType::E5M2; break;
+          case 3: tt = TcType::E4M3; break;
+          case 4: tt = TcType::E3M2; break;
+          case 5: tt = TcType::E2M3; break;
+          default: ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue, "spcompress: the descriptor's element type " + std::to_string(type) + " does not exist");
+        }
+      } else {
+        if (type > 1) ctx_fail(ins, static_cast<int>(lane), Err::InvalidValue, "spcompress.b16: the descriptor's element type must be 0 (.f16) or 1 (.bf16), not " + std::to_string(type));
+        tt = type == 0 ? TcType::F16 : TcType::BF16;
+      }
+      const uint32_t emask = op.elem_bits == 8 ? 0xFFu : 0xFFFFu;
+      uint64_t cbits[64] = {}, mbits[64] = {};   // the output streams, 32-bit words packed into 64
+      uint32_t cpos = 0, mpos = 0;
+      const uint32_t ngroups = op.num * groups_per_unit * 1;
+      for (uint32_t g = 0; g < ngroups; ++g) {
+        uint32_t code[4];
+        double val[4];
+        for (uint32_t j = 0; j < 4; ++j) {
+          const uint32_t elem = g * 4 + j, bit = elem * op.elem_bits;
+          code[j] = static_cast<uint32_t>(data[bit / 32][lane] >> (bit % 32)) & emask;
+          val[j] = tc_decode(tt, code[j]);
+        }
+        uint32_t pick[2];
+        sp24_pick(val, sel, pick);
+        for (uint32_t k = 0; k < 2; ++k) {
+          const uint64_t cbit = uint64_t{cpos} * op.elem_bits, mbit = uint64_t{mpos} * op.idx_bits;
+          cbits[cbit / 32] |= uint64_t{code[pick[k]]} << (cbit % 32);
+          mbits[mbit / 32] |= uint64_t{pick[k]} << (mbit % 32);
+          ++cpos;
+          ++mpos;
+        }
+      }
+      for (size_t i = 0; i < op.cdata.size(); ++i) cdata[i][lane] = static_cast<uint32_t>(cbits[i]);
+      for (size_t i = 0; i < op.mdata.size(); ++i) mdata[i][lane] = static_cast<uint32_t>(mbits[i]);
+    }
+    for (size_t i = 0; i < op.cdata.size(); ++i) write_reg(w, op.cdata[i], m, cdata[i], 32);
+    for (size_t i = 0; i < op.mdata.size(); ++i) write_reg(w, op.mdata[i], m, mdata[i], 32);
+  }
+
+  // spdecompress (9.7.10.31; figure 44): iteration N of .num puts each of its n_src
+  // elements of `cdata` at the position `mdata` gives among n_target, the rest
+  // zero. All three operands are bit streams across their 32-bit registers,
+  // low bits first. An index past n_target is the ISA's implementation-specific
+  // case: here the element is dropped.
+  void exec_spdecompress(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpSpDecompress& op, Mask m) {
+    std::vector<Lanes> mdata(op.mdata.size()), cdata(op.cdata.size()), data(op.data.size());
+    for (size_t i = 0; i < op.mdata.size(); ++i) { Lanes s; mdata[i] = read_operand(w, ctx, ins, op.mdata[i], s); }
+    for (size_t i = 0; i < op.cdata.size(); ++i) { Lanes s; cdata[i] = read_operand(w, ctx, ins, op.cdata[i], s); }
+    const uint64_t emask = (uint64_t{1} << op.elem_bits) - 1, imask = (uint64_t{1} << op.idx_bits) - 1;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const auto bits_at = [&](const std::vector<Lanes>& v, uint64_t bit, uint32_t n) {
+        uint64_t x = 0;
+        for (uint32_t k = 0; k < n; ++k) x |= ((v[(bit + k) / 32][lane] >> ((bit + k) % 32)) & 1) << k;
+        return x;
+      };
+      std::vector<uint32_t> out(op.data.size(), 0);
+      for (uint32_t n = 0; n < op.num; ++n)
+        for (uint32_t s = 0; s < op.n_src; ++s) {
+          const uint64_t c = bits_at(cdata, (uint64_t{n} * op.n_src + s) * op.elem_bits, op.elem_bits) & emask;
+          const uint64_t idx = bits_at(mdata, (uint64_t{n} * op.n_src + s) * op.idx_bits, op.idx_bits) & imask;
+          if (idx >= op.n_target) continue;
+          const uint64_t at = (uint64_t{n} * op.n_target + idx) * op.elem_bits;
+          out[at / 32] |= static_cast<uint32_t>(c << (at % 32));
+        }
+      for (size_t i = 0; i < out.size(); ++i) data[i][lane] = out[i];
+    }
+    for (size_t i = 0; i < op.data.size(); ++i) write_reg(w, op.data[i], m, data[i], 32);
+  }
+
   // stmatrix: the inverse. Every lane hands over two consecutive 16-bit elements
   // of one row, the warp reassembles each 8x8 matrix, and row r of matrix i goes
   // to the address supplied by lane i*8+r -- the same lanes that would have
@@ -6699,6 +7057,16 @@ class Interpreter {
       coord[i] = read_operand(w, ctx, ins, op.coords[i], coord_scratch[i]);
     Lanes _s_lod;
     const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
+    std::array<Lanes, 3> offs;
+    std::array<Lanes, 3> offs_scratch;
+    const uint32_t noff = std::min<uint32_t>(3, static_cast<uint32_t>(op.offset.size()));
+    for (uint32_t i = 0; i < noff; ++i) offs[i] = read_operand(w, ctx, ins, op.offset[i], offs_scratch[i]);
+    // The depth-compare reference is read, so a bad register still faults, and
+    // otherwise has no effect: CUDA gives a texture no depth-compare state, and
+    // an RTX 3060 returns the plain fetch for tex and tld4 with a reference
+    // (measured, point and linear).
+    Lanes _s_dref;
+    if (op.has_dref) (void)read_operand(w, ctx, ins, op.dref, _s_dref);
 
     std::array<Lanes, 4> out;
     for (uint32_t lane = 0; lane < W_; ++lane) {
@@ -6711,12 +7079,27 @@ class Interpreter {
       f.layer = indexed ? static_cast<uint32_t>(coord[0][lane]) : 0;
       for (uint32_t i = 0; i < op.dims; ++i) f.coord[i] = static_cast<uint32_t>(coord[first + i][lane]);
       f.float_coords = op.ctype.is_float();
+      // A half-precision result is the f32 one narrowed.
       f.float_result = op.dtype.is_float();
       f.explicit_lod = lod != nullptr;
       if (lod)
         f.lod = op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
                                     : static_cast<double>(static_cast<int32_t>((*lod)[lane]));
       f.gather = op.gather;
+      // Offsets are two's complement fields, as ptxas packs them into a
+      // register for the instruction: four bits for tex (-8..7, a register
+      // holding more wraps: measured), six for tld4 (to be measured).
+      for (uint32_t i = 0; i < noff; ++i) {
+        const uint32_t v = static_cast<uint32_t>(offs[i][lane]);
+        f.offset[i] = op.gather >= 0 ? static_cast<int32_t>((v & 63u) ^ 32u) - 32   // tld4: six bits
+                                     : static_cast<int32_t>((v & 15u) ^ 8u) - 8;
+      }
+      // A 1D texture's offset is one value, which ptxas hands the hardware as it is (an immediate
+      // sign-extended, a register whole) and which reads as three nibbles: the second is the row of
+      // the 2D texture a 1D one is, so a negative x offset (or one past 15) puts the fetch outside
+      // it (measured with immediates and registers on an RTX 3060).
+      if (op.geom == TexGeom::D1 && noff >= 1)
+        f.offset[1] = static_cast<int32_t>((static_cast<uint32_t>(offs[0][lane]) >> 4 & 15u) ^ 8u) - 8;
       uint32_t r[4];
       try {
         fetch_texel(mem_, d, f, r);
@@ -6726,6 +7109,27 @@ class Interpreter {
       for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = r[ch];
     }
     count_memory(Space::Global, 4 * 4, popcount_mask(m), /*is_store=*/false);
+    if (op.pred_dst.id != kNoReg) {   // resident: every texel is
+      Mask& p = pred_slot(w, op.pred_dst);
+      p |= m;
+    }
+    if (op.dtype.is_float() && op.dtype.bits == 16) {
+      // .f16: four halves, one per register; .f16x2: two registers of two.
+      for (uint32_t lane = 0; lane < W_; ++lane) {
+        if (!(m & (Mask{1} << lane))) continue;
+        uint64_t h[4];
+        for (uint32_t ch = 0; ch < 4; ++ch) h[ch] = double_to_f16(static_cast<double>(f32(static_cast<uint32_t>(out[ch][lane])))) & 0xFFFF;
+        if (op.f16x2) {
+          out[0][lane] = h[0] | (h[1] << 16);
+          out[1][lane] = h[2] | (h[3] << 16);
+        } else {
+          for (uint32_t ch = 0; ch < 4; ++ch) out[ch][lane] = h[ch];
+        }
+      }
+      for (uint32_t ch = 0; ch < op.dsts.size(); ++ch)
+        write_reg(w, op.dsts[ch], m, out[ch], op.f16x2 ? 32 : 16);
+      return;
+    }
     for (uint32_t ch = 0; ch < 4 && ch < op.dsts.size(); ++ch)
       write_reg(w, op.dsts[ch], m, out[ch], 32);
   }
@@ -6795,6 +7199,27 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       const TextureDesc& d = texture_for(ins, static_cast<int>(lane), obj[lane], TexKind::Surface);
+      if (op.formatted) {
+        // sust.p: x counts texels, not bytes, and the values become the surface's format.
+        uint32_t vals[4] = {0, 0, 0, 0};
+        for (size_t c = 0; c < op.srcs.size() && c < 4; ++c) vals[c] = static_cast<uint32_t>(src[c][lane]);
+        uint8_t texel[16];
+        const uint32_t nb = surface_pack_texel(d, vals, static_cast<uint32_t>(std::min<size_t>(op.srcs.size(), 4)), texel);
+        SurfaceAccess a;
+        a.dims = op.dims;
+        a.x = int64_t{static_cast<int32_t>(coord[0][lane])} * nb;
+        a.y = op.dims > 1 ? static_cast<int32_t>(coord[1][lane]) : 0;
+        a.z = op.dims > 2 ? static_cast<int32_t>(coord[2][lane]) : 0;
+        a.bytes = nb;
+        a.oob = op.oob;
+        try {
+          const std::optional<uint64_t> at = surface_at(d, a);
+          if (at) mem_.write(*at, texel, nb);
+        } catch (const Error& e) {
+          rethrow_with_context(e, ins, static_cast<int>(lane));
+        }
+        continue;
+      }
       const std::optional<uint64_t> base = surface_address(
           ins, lane, d, coord, op.dims, op.bytes * static_cast<uint32_t>(op.srcs.size()), op.layered, op.oob);
       if (!base) continue;   // .zero, out of range: the store is dropped
@@ -7732,13 +8157,14 @@ class Interpreter {
     const char* name = ld ? "tcgen05.ld" : "tcgen05.st";
     const uint32_t lane0 = taddr >> 16, col0 = taddr & 0xFFFF;
     const uint32_t width = op.pack16 ? 2 : 1;   // columns per register
-    std::vector<Lanes> vals(op.regs.size());
+    // With .spcompress the load is num columns and the registers are half as many.
+    std::vector<Lanes> vals(op.spcompress ? op.num : op.regs.size());
     if (!ld)
       for (size_t j = 0; j < op.regs.size(); ++j) {
         Lanes _s;
         vals[j] = read_operand(w, ctx, ins, Operand{RegOperand{op.regs[j]}}, _s);
       }
-    for (uint32_t j = 0; j < op.regs.size(); ++j)
+    for (uint32_t j = 0; j < vals.size(); ++j)
       for (uint32_t th = 0; th < W_; ++th) {
         uint32_t dl, dc;
         tmem_fragment(op.shape, th, j, &dl, &dc);
@@ -7766,8 +8192,31 @@ class Interpreter {
           t.at(lane, col) = static_cast<uint32_t>(vals[j][th]);
         }
       }
-    if (ld)
+    if (ld && !op.spcompress)
       for (size_t j = 0; j < op.regs.size(); ++j) write_reg(w, op.regs[j], m, vals[j], 32);
+    if (op.spcompress) {
+      // Two of each four loaded columns, by the rowop (.max keeps the greatest, .min the smallest,
+      // .abs by magnitude), into the cdata registers in column order, with their indices, two bits
+      // each, in the mdata registers. A NaN is always kept; the reduction below is of the whole
+      // load, as without .spcompress.
+      const uint32_t sel = (op.red_max ? 0u : 2u) + (op.red_abs ? 1u : 0u);
+      std::vector<Lanes> cd(op.regs.size()), md(op.sp_mdata.size());
+      for (auto& l : md) l.fill(0);
+      for (uint32_t th = 0; th < W_; ++th)
+        for (uint32_t g = 0; g < op.num / 4; ++g) {
+          double v[4];
+          for (uint32_t j = 0; j < 4; ++j) v[j] = static_cast<double>(f32(static_cast<uint32_t>(vals[4 * g + j][th])));
+          uint32_t pick[2];
+          sp24_pick(v, sel, pick);
+          for (uint32_t k = 0; k < 2; ++k) {
+            const uint32_t e = 2 * g + k;
+            cd[e][th] = vals[4 * g + pick[k]][th];
+            md[e * 2 / 32][th] |= uint64_t{pick[k]} << (e * 2 % 32);
+          }
+        }
+      for (size_t j = 0; j < op.regs.size(); ++j) write_reg(w, op.regs[j], m, cd[j], 32);
+      for (size_t j = 0; j < op.sp_mdata.size(); ++j) write_reg(w, op.sp_mdata[j], m, md[j], 32);
+    }
     if (op.red) {
       // .red (9.7.18.8.3): each thread's loaded columns, reduced. f32 as min
       // and max define it: -0.0 below +0.0, a NaN input ignored unless .NaN
@@ -8593,7 +9042,10 @@ class Interpreter {
           if (std::isnan(x)) return kCanonicalNaN16;
           if (x < 0 || std::signbit(x)) x = 0.0;
         }
-        if (d.is_bfloat()) return double_to_bf16(x);
+        if (d.is_bfloat()) {
+          const uint64_t h = double_to_bf16(x);
+          return op->pzo && h == 0x8000 ? 0u : h;   // .pzo: a -0.0 result is +0.0
+        }
         // A NaN from f64 keeps its sign and the top of its payload in f16 on a
         // real GPU, made quiet, where one from f32 comes out 0x7FFF whatever
         // it was.
@@ -8601,7 +9053,10 @@ class Interpreter {
           const uint64_t b = std::bit_cast<uint64_t>(x);
           return ((b >> 48) & 0x8000u) | 0x7E00u | ((b >> 42) & 0x3FFu);
         }
-        if (d.bits == 16) return double_to_f16(x);
+        if (d.bits == 16) {
+          const uint64_t h = double_to_f16(x);
+          return op->pzo && h == 0x8000 ? 0u : h;   // .pzo: a -0.0 result is +0.0
+        }
         // With .ftz, an f32 NaN goes through f32 arithmetic first and comes
         // out as the canonical NaN widened (measured); without, its payload
         // is kept.
@@ -10288,7 +10743,69 @@ class Interpreter {
     write_reg(w, op.dst, m, r, 32);
   }
 
+  // atom/red .v2/.v4/.v8 (sm_90): the vector is a run of 32-bit words, aligned to
+  // its whole size, each updated by its own atomic read-modify-write (the ISA
+  // makes no promise about the vector as a whole). A .f32 element is a word, a
+  // packed .f16x2/.bf16x2 element is a word, and two .f16/.bf16 elements share
+  // one: register 2i is its low half and 2i+1 its high.
+  void exec_atom_vec(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    const bool wide = op.ty.bits == 32 || op.packed_half;   // one register per word
+    const uint32_t nwords = wide ? op.vec : op.vec / 2u;
+    const uint32_t bytes = nwords * 4u;
+    const int kind = op.ty.bits == 32 ? 0 : op.ty.is_bfloat() ? 2 : 1;
+    Lanes _s_base;
+    const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
+    std::vector<Lanes> bs(op.vec);
+    for (uint32_t i = 0; i < op.vec; ++i) {
+      Lanes tmp;
+      bs[i] = read_operand(w, ctx, ins, op.srcs[i], tmp);
+    }
+    std::vector<Lanes> rs(op.vec);
+    const uint64_t sbase = space_base(op.space);
+    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+      if (addr % bytes)
+        ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
+                 "a vector atomic of " + std::to_string(bytes) + " bytes at an address not aligned to them");
+      for (uint32_t j = 0; j < nwords; ++j) {
+        const uint64_t wa = addr + 4ull * j;
+        const uint32_t bw = wide ? static_cast<uint32_t>(bs[j][lane])
+                                 : (static_cast<uint32_t>(bs[2 * j][lane]) & 0xffffu) |
+                                       (static_cast<uint32_t>(bs[2 * j + 1][lane]) << 16);
+        std::unique_lock<std::mutex> guard;
+        if (lock_needed) guard = std::unique_lock<std::mutex>(atomic_lock_for(wa));
+        ++stats_.atomics;
+        stats_.atomic_bytes += 4;
+        const auto compute = [&](const uint64_t old) -> uint64_t {
+          return exec::atom_word(op.op, kind, static_cast<uint32_t>(old), bw);
+        };
+        uint64_t old;
+        uint8_t* host = !is_shared(wa) && !is_local(wa) ? mem_.host_address(wa, 4) : nullptr;
+        if (host && reinterpret_cast<uintptr_t>(host) % 4 == 0) {
+          old = vgpu::exec::host_atomic_rmw(host, 4, compute);
+        } else {
+          old = load_routed(w, ctx, ins, lane, wa, 4);
+          store_routed(w, ctx, ins, lane, wa, 4, compute(old));
+        }
+        if (wide) {
+          rs[j][lane] = old;
+        } else {
+          rs[2 * j][lane] = old & 0xffffu;
+          rs[2 * j + 1][lane] = (old >> 16) & 0xffffu;
+        }
+      }
+    }
+    if (!op.discards_result)
+      for (uint32_t i = 0; i < op.vec; ++i) write_reg(w, op.dsts[i], m, rs[i], wide ? 32u : 16u);
+  }
+
   void exec_atom(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpAtom& op, Mask m) {
+    if (op.vec > 1) {
+      exec_atom_vec(w, ctx, ins, op, m);
+      return;
+    }
     if (op.b128) {
       exec_atom128(w, ctx, ins, op, m);
       return;
@@ -11754,6 +12271,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
              }() + " has fields this .kind does not define (Tables 51-53)");
   };
   const bool mx = op.block_scale;
+  bool lane128 = false, k64 = false;
   const bool sm103a = op.target_sm == 103 && op.target_arch;
   const bool mxf4 = op.kind == Tcgen05MmaKind::MXF4 || op.kind == Tcgen05MmaKind::MXF4NVF4;
   // The instruction descriptor: Table 51, or 52/53 for the block-scaled kinds.
@@ -11776,8 +12294,21 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
     if ((!sp && (id & 3)) || (id & 0x40) || (!mxf4 && (id & 8)) || (mxf4 && (id >> 25 & 1)) ||
         (!mxf4 && (id >> 24 & 3)))
       h.fail(Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
-    if (id >> 26 & 1) refuse("the 128-lane scale-factor A layout (bit 26) is sm_107f's");
-    if ((!mxf4 && (id >> 31)) || (mxf4 && (id >> 3 & 1))) refuse("the larger K of bits 3 and 31 is sm_107f's");
+    // Bit 26: scale factor A in the 128-lane layout (figures 238-242, 256), which only sm_107f has.
+    lane128 = id >> 26 & 1;
+    if (lane128 && op.target_sm != 107)
+      refuse("the 128-lane scale-factor A layout (instruction descriptor bit 26) is sm_107f's; this module targets sm_" +
+             std::to_string(op.target_sm));
+    // Bit 31 of .kind::mxf8f6f4: K = 64 (dense), sm_107f's. The mxf4 kinds' bit 3 (K = 128) is not implemented:
+    // its scale-factor layouts for B are drawn only in figures.
+    if (!mxf4 && (id >> 31)) {
+      if (op.target_sm != 107)
+        refuse("K = 64 (instruction descriptor bit 31) is sm_107f's; this module targets sm_" + std::to_string(op.target_sm));
+      k64 = true;
+    }
+    if (mxf4 && (id >> 3 & 1))
+      refuse(".kind::mxf4's K = 128 (instruction descriptor bit 3) is not implemented: the layout of its scale factors "
+             "for B is drawn in figures only");
     // .kind::mxf4/mxf4nvf4 with bit 31: K = 96, dense, sm_103a (9.7.18.2.1.1;
     // sm_107a's is not implemented). CuTe's descriptor calls the sparse
     // K = 192 invalid, and the ISA's target note names only K = 96.
@@ -11793,7 +12324,13 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
       h.fail(Err::InvalidValue, "tcgen05.mma instruction descriptor sets a reserved bit");
     if ((id >> 30) && !op.ws)
       refuse("the instruction descriptor's B-reuse shift (bits 30-31) is for .ws only");
-    if (id >> 29 & 1) refuse("K = 64 for 8-bit types (instruction descriptor bit 29) is sm_107f's");
+    if (id >> 29 & 1) {
+      // Bit 29: K = 64 for .kind::f8f6f4 (dense), sm_107f's; no other kind defines it.
+      if (op.kind != Tcgen05MmaKind::F8F6F4) bad();
+      if (op.target_sm != 107)
+        refuse("K = 64 (instruction descriptor bit 29) is sm_107f's; this module targets sm_" + std::to_string(op.target_sm));
+      k64 = true;
+    }
   }
   // Element types by kind, and K: 256 bits of an 8-bit-container row.
   auto f8f6f4_elem = [&](uint32_t t) {
@@ -11834,6 +12371,13 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
       eb2 = f8f6f4_elem(btype);
       d_f16 = dtype == 0;
       K = 32;
+      if (k64) {
+        // K = 64 takes e4m3 and e5m2 only (Table 48), dense -- the sparse K = 128's metadata is not drawn --
+        // at M = 128 (a CTA) or 256 (a pair).
+        if (atype > 1 || btype > 1) bad();
+        if (sp) refuse("sparse A with K = 64 (a K of 128): the metadata for it is not drawn in the ISA's figures");
+        K = 64;
+      }
       break;
     case Tcgen05MmaKind::I8:
       if (atype > 1 || btype > 1 || dtype != 2) bad();
@@ -11842,6 +12386,14 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
       d_int = true;
       K = 32;
       if (neg_a || neg_b) bad();
+      break;
+    case Tcgen05MmaKind::TI16:
+      // sm_107's: s1z4m11 elements into s32, K = 16 (32 sparse), with negate and
+      // transpose but no saturation (Tables 48, 51 and 62); from the ISA alone.
+      if (atype != 3 || btype != 3 || dtype != 2 || sat) bad();
+      ea = eb2 = TcElem{TcType::TI16, 16, 8, 16};
+      d_int = true;
+      K = 16;
       break;
     case Tcgen05MmaKind::MXF4:
     case Tcgen05MmaKind::MXF4NVF4:
@@ -11856,7 +12408,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
   // field: 2:4 for most kinds, 1:2 for tf32 and 4:8 in pairs for mxf4*.
   // The 8-bit kinds keep a row's metadata in one lane and take no
   // selector; f16 and tf32 pick the column with it (figures 287-292).
-  const bool meta_rows = op.kind != Tcgen05MmaKind::F16 && op.kind != Tcgen05MmaKind::TF32;
+  const bool meta_rows = op.kind != Tcgen05MmaKind::F16 && op.kind != Tcgen05MmaKind::TF32 && op.kind != Tcgen05MmaKind::TI16;
   uint32_t sp_w = 0;
   if (sp) {
     K *= 2;
@@ -11895,7 +12447,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
         if (st == 2) refuse("UE5M3 scale factors are sm_107f's");
         if (st > 1) bad();
         ue4m3 = st == 0;
-        if (ue4m3 && sv == 2) refuse("UE4M3 scale factors with .block32 are sm_107f's");
+        if (ue4m3 && sv == 2 && op.target_sm != 107) refuse("UE4M3 scale factors with .block32 are sm_107f's");
         break;
       }
     }
@@ -11933,6 +12485,11 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
     h.fail(Err::InvalidValue,
              "tcgen05.mma.cta_group::" + std::to_string(G) + " of shape M=" + std::to_string(M) +
                  " N=" + std::to_string(N) + ", which Table 48 does not define");
+  if (lane128 && (op.ws || (G == 2 && M == 128)))
+    refuse("the 128-lane scale-factor A layout with a CTA pair at M = 128: each CTA's rows then sit in D lanes the "
+           "figures do not tie to a scale lane");
+  if (k64 && !((G == 1 && M == 128) || (G == 2 && M == 256)) || (k64 && op.ws))
+    h.fail(Err::InvalidValue, "tcgen05.mma with K = 64 is 128xNxK1 on one CTA or 256xNxK1 on a pair (Table 48), and not .ws");
   if (op.a_tmem && trans_a) bad();
   // Below M = 128 the ISA draws only D's .ws layouts (E and G), not where A
   // or the sparsity metadata sit in Tensor Memory.
@@ -12139,10 +12696,12 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
   // every other size's layout.
   const uint32_t sfb_stride = N > 128 ? 8 : 4;
   auto scale_of = [&](TensorMemory& t, uint32_t addr, uint32_t idx, uint32_t part, uint32_t sfid,
-                      uint32_t j, uint32_t stride = 4) -> double {
+                      uint32_t j, uint32_t stride = 4, bool lanes128 = false) -> double {
     const uint32_t b = sfid + j;
-    const uint32_t l = (addr >> 16) + idx % 32 + 32 * part;
-    const uint32_t col = (addr & 0xFFFF) + idx / 32 + stride * (b / 4);
+    // The 128-lane layout (sm_107f's, A only): row idx's factors in lane idx, a byte stream from
+    // SFA_ID one column on every four bytes, with none of the 32-lane layout's column per 32 rows.
+    const uint32_t l = lanes128 ? (addr >> 16) + idx : (addr >> 16) + idx % 32 + 32 * part;
+    const uint32_t col = lanes128 ? (addr & 0xFFFF) + b / 4 : (addr & 0xFFFF) + idx / 32 + stride * (b / 4);
     if (l >= TensorMemory::kLanes || col >= TensorMemory::kCols || !t.allocated(col))
       h.fail(Err::OutOfBounds,
                "tcgen05.mma reads a scale factor from Tensor Memory lane " + std::to_string(l) +
@@ -12307,7 +12866,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
           a_lane = dl;
         }
         for (uint32_t j = 0; j < sv; ++j) {
-          SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j);
+          SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j, 4, lane128);
           SB[j] = scale_of(t, sfb_addr, n, dl / 32, sfb_id, j, sfb_stride);
         }
         uint32_t& cell = t.at(dl, d_col0 + dc);
@@ -12371,6 +12930,17 @@ uint64_t reduce_value(AtomOp op, const Type& ty, uint64_t old, uint64_t b) {
     case AtomOp::Dec: return (old == 0 || old > b) ? b : old - 1;
     default: return b;
   }
+}
+uint32_t atom_word(AtomOp op, int kind, uint32_t old, uint32_t b) {
+  if (kind == 0) {
+    const auto ftz = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+    const float r = ftz(ftz(std::bit_cast<float>(old)) + ftz(std::bit_cast<float>(b)));
+    return std::isnan(r) ? 0x7fffffffu : std::bit_cast<uint32_t>(r);
+  }
+  const Type ht{kind == 2 ? Type::Kind::BF : Type::Kind::F, 16};
+  const uint32_t lo = static_cast<uint32_t>(reduce_value(op, ht, old & 0xffff, b & 0xffff));
+  const uint32_t hi = static_cast<uint32_t>(reduce_value(op, ht, old >> 16, b >> 16));
+  return (lo & 0xffff) | (hi << 16);
 }
 std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
   using K = Type::Kind;
@@ -12840,10 +13410,44 @@ const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, Te
 }
 
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
+  t_bc.valid = false;   // the memory a block was decoded from may have changed since the last fetch
   fetch_texel(mem, d, f, out);
 }
 
 std::optional<uint64_t> surface_address(const TextureDesc& d, const SurfaceAccess& a) { return surface_at(d, a); }
+
+// A f32 rounded toward zero to a half: the top ten mantissa bits, a magnitude past the largest finite
+// half the largest finite one (an RTX 3060's sust.p), and a NaN keeping the top ten bits of its payload (quiet
+// or not; a payload that truncates to nothing becomes 1, so it stays a NaN).
+static uint16_t f32_to_f16_rz(uint32_t b) {
+  const uint32_t s = b >> 31, e = (b >> 23) & 0xFF, m = b & 0x7FFFFF;
+  if (e == 0xFF) return static_cast<uint16_t>((s << 15) | 0x7C00 | (m ? std::max<uint32_t>(m >> 13, 1u) : 0u));
+  const int ex = static_cast<int>(e) - 127;
+  if (ex > 15) return static_cast<uint16_t>((s << 15) | 0x7BFF);
+  if (ex >= -14) return static_cast<uint16_t>((s << 15) | (static_cast<uint32_t>(ex + 15) << 10) | (m >> 13));
+  const int shift = 13 + (-14 - ex);   // a half subnormal: the significand shifted right
+  if (e == 0 || shift >= 24) return static_cast<uint16_t>(s << 15);
+  return static_cast<uint16_t>((s << 15) | ((0x800000u | m) >> shift));
+}
+
+uint32_t surface_pack_texel(const TextureDesc& d, const uint32_t* values, uint32_t n, uint8_t out[16]) {
+  uint32_t at = 0;
+  for (uint32_t c = 0; c < 4 && d.channel_bits[c]; ++c) {
+    const uint32_t bits = d.channel_bits[c], v = c < n ? values[c] : 0;
+    uint64_t raw;
+    if (d.kind == ChannelKind::Float) {
+      raw = bits == 16 ? f32_to_f16_rz(v) : v;
+    } else if (d.kind == ChannelKind::Signed) {
+      const int64_t sv = static_cast<int32_t>(v), lo = -(int64_t{1} << (bits - 1)), hi = (int64_t{1} << (bits - 1)) - 1;
+      raw = static_cast<uint64_t>(std::clamp(sv, lo, hi)) & ((uint64_t{1} << bits) - 1);
+    } else {
+      raw = std::min<uint64_t>(v, (bits >= 32 ? uint64_t{0xFFFFFFFFull} : (uint64_t{1} << bits) - 1));
+    }
+    for (uint32_t i = 0; i < bits / 8; ++i) out[at + i] = static_cast<uint8_t>(raw >> (8 * i));
+    at += bits / 8;
+  }
+  return at;
+}
 
 // ---- FP8, for the SASS executor (vgpu/exec/numerics.hpp) ----
 

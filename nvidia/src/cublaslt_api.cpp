@@ -17,9 +17,13 @@
 // Epilogues -- bias, ReLU and GELU, their auxiliary outputs, and the
 // backward ones (DRELU, DGELU, the bias gradients) -- follow the documented
 // semantics and an RTX 3060's measured behaviour (see "epilogues" below).
-// The block-scaled FP8 and FP4 modes (VEC16_UE4M3, VEC32_UE8M0, VEC128_32F,
-// BLK128x128_32F) are implemented from NVIDIA's documentation alone: no card
-// here can run them, so they are documentation-derived, not card-verified.
+// FP8 is refused as an NVIDIA L4 (sm_89) and an RTX 3060 (sm_86) refuse it, descriptor by
+// descriptor, and its arithmetic and epilogues reproduce the L4's (nvidia/docs/lowprec.md,
+// nvidia/tests/data/lowprec/lt.*.txt). From sm_90 the kernel table, the FP32-scale modes, the
+// auxiliary output's scale and amax and the block-scaled FP8 and FP4 modes (VEC16_UE4M3,
+// VEC32_UE8M0, VEC128_32F, BLK128x128_32F, PER_BATCH_SCALAR_32F and the packed
+// VEC128/VEC32_MN_K4_UE8M0) are implemented from NVIDIA's documentation alone: no Hopper or
+// Blackwell GPU was available, so they are documentation-derived, not card-verified.
 // Anything not implemented returns CUBLAS_STATUS_NOT_SUPPORTED so a caller
 // falls back rather than receiving a plausible wrong answer.
 #include <cublasLt.h>
@@ -29,14 +33,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <vector>
 
 #include <cuda_runtime.h>
 
+#include "vgpu/profiling.hpp"
 #include "enum_value.hpp"
+#include "vgpu/runtime/capture.hpp"
 
 namespace {
 
@@ -58,10 +67,13 @@ constexpr int32_t kScaleScalar = 0, kScaleOuterVec = 3;
 
 // Attribute numbers newer than the oldest header this builds against (CUDA
 // 12.0's), named by value.
-constexpr int kDOutScalePointer = 36, kDOutScaleMode = 37;
+constexpr int kDOutScalePointer = 36, kDOutScaleMode = 37, kEmulationDescriptor = 38;
 // The block-scaled modes (cublasLtMatmulMatrixScale_t, CUDA 12.8) and the
 // narrow types they come with (library_types.h, CUDA 12.8).
 constexpr int32_t kScaleVec16UE4M3 = 1, kScaleVec32UE8M0 = 2, kScaleVec128 = 4, kScaleBlk128x128 = 5;
+// Newer than CUDA 13.2's header: one scalar per batch (13.2, experimental) and the UE8M0 modes whose scales are
+// packed four to a 32-bit word along K (cuBLAS 13.8's header), 128 or 32 elements to a scale.
+constexpr int32_t kScalePerBatch = 6, kScaleMnK4_128 = 12, kScaleMnK4_32 = 13;
 constexpr int kTypeUE8M0 = 30, kTypeFP4 = 33;
 
 struct MatmulDesc {
@@ -78,6 +90,8 @@ struct MatmulDesc {
   int32_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
   const void *a_scale = nullptr, *b_scale = nullptr, *c_scale = nullptr, *d_scale = nullptr;
   void* amax_d = nullptr;
+  const void* aux_scale = nullptr;
+  void* aux_amax = nullptr;
   int32_t a_scale_mode = kScaleScalar, b_scale_mode = kScaleScalar;
   int32_t c_scale_mode = kScaleScalar, d_scale_mode = kScaleScalar;
   int8_t fast_accum = 0;
@@ -88,6 +102,8 @@ struct MatmulDesc {
   // Block-scaled output: where the scales D's quantization computes go.
   void* d_out_scale = nullptr;
   int32_t d_out_scale_mode = kScaleScalar;
+  // CUBLASLT_MATMUL_DESC_EMULATION_DESCRIPTOR (38): a cublasLtEmulationDesc_t, or NULL.
+  const void* emulation = nullptr;
   // Every attribute as last set, for cublasLtMatmulDescGetAttribute.
   std::map<int, std::vector<uint8_t>> raw;
 };
@@ -277,7 +293,7 @@ bool attr_info(int attr, AttrInfo* out) {
     case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER: case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER:
     case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER:
     case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER:
-    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: case kDOutScalePointer:
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: case kDOutScalePointer: case kEmulationDescriptor:
       *out = {sizeof(void*), 0}; return true;
     default: return false;
   }
@@ -292,7 +308,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
   const int a = enum_value(attr);   // attributes newer than the header are not its values
   AttrInfo info;
   if (!attr_info(a, &info)) return CUBLAS_STATUS_SUCCESS;   // attributes not modelled are inert
-  if (bytes < info.bytes) return CUBLAS_STATUS_INVALID_VALUE;
+  if (bytes < info.bytes || (a == kEmulationDescriptor && bytes != info.bytes)) return CUBLAS_STATUS_INVALID_VALUE;
   auto take = [&](void* field) { std::memcpy(field, buf, info.bytes); };
   switch (a) {
     case CUBLASLT_MATMUL_DESC_TRANSA: take(&m->transa); break;
@@ -307,6 +323,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
     case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER: take(&m->c_scale); break;
     case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER: take(&m->d_scale); break;
     case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER: take(&m->amax_d); break;
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER: take(&m->aux_scale); break;
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: take(&m->aux_amax); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER: take(&m->aux); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD: take(&m->aux_ld); break;
     case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_BATCH_STRIDE: take(&m->aux_batch_stride); break;
@@ -318,6 +336,7 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t d
     case kDScaleMode: take(&m->d_scale_mode); break;
     case kDOutScalePointer: take(&m->d_out_scale); break;
     case kDOutScaleMode: take(&m->d_out_scale_mode); break;
+    case kEmulationDescriptor: take(&m->emulation); break;
     default: break;
   }
   const auto* b = static_cast<const uint8_t*>(buf);
@@ -351,6 +370,99 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t d
   if (!buf) return bytes == 0 && written ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
   if (bytes < v.size()) return CUBLAS_STATUS_INVALID_VALUE;
   std::memcpy(buf, v.data(), v.size());
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+/* ---- cublasLtEmulationDesc_t ----
+   The settings of floating-point emulation (cublasLt.h, CUDA 13), held in a
+   64-byte opaque structure that the caller may allocate itself
+   (cublasLtEmulationDescInit). Measured on an RTX 3060 (cuBLAS 13.0): the
+   defaults are strategy 0, special values 0xFFFF, mantissa control 0, max
+   mantissa bit count 0, offset 0 and a NULL bit count pointer (8 bytes,
+   the others 4); a buffer of the wrong size, a NULL buffer and an unknown
+   attribute are INVALID_VALUE; a size query (size 0, NULL buffer) needs a
+   sizeWritten; no value is range-checked when it is set -- a strategy of 7 or
+   a mantissa control of 5 is taken. cublasLtMatmul checks them: a descriptor
+   on a matmul whose compute type is not an emulated one (CUBLAS_COMPUTE_64F
+   with one set), or with a negative max mantissa bit count, is INVALID_VALUE.
+   NVIDIA's matmul did not emulate with the descriptor on that card (the bit
+   count pointer stayed untouched, the result was the plain one), so neither
+   does this one. */
+// CUDA 13's header declares these with its own types; CUDA 12's declares nothing.
+#if CUBLAS_VER_MAJOR >= 13
+using vgpu_emu_desc = cublasLtEmulationDesc_t;
+using vgpu_emu_attr = cublasLtEmulationDescAttributes_t;
+#else
+using vgpu_emu_desc = void*;
+using vgpu_emu_attr = int;
+#endif
+namespace {
+constexpr uint64_t kEmulationMagic = 0x564755454d553031ULL;   // "VGUEMU01"
+struct EmulationDesc {
+  uint64_t magic = kEmulationMagic;
+  int32_t strategy = 0, special_values = 0xFFFF, mantissa_control = 0, max_bits = 0, bit_offset = 0;
+  int32_t* bit_count_pointer = nullptr;
+};
+static_assert(sizeof(EmulationDesc) <= 64, "an emulation descriptor must fit cublasLtEmulationDescOpaque_t");
+bool emulation_known(const void* p) {
+  return p && (known(p) || reinterpret_cast<const EmulationDesc*>(p)->magic == kEmulationMagic);
+}
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescInit_internal(vgpu_emu_desc d, size_t size) {
+  if (!d) return CUBLAS_STATUS_INVALID_VALUE;
+  if (size < 64) return CUBLAS_STATUS_ALLOC_FAILED;
+  new (d) EmulationDesc();
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescCreate(vgpu_emu_desc* d) {
+  if (!d) return CUBLAS_STATUS_INVALID_VALUE;
+  *d = reinterpret_cast<vgpu_emu_desc>(track(new EmulationDesc()));
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescDestroy(vgpu_emu_desc d) {
+  if (known(d)) {
+    untrack(d);
+    delete reinterpret_cast<EmulationDesc*>(d);
+  }
+  return CUBLAS_STATUS_SUCCESS;
+}
+namespace {
+// An attribute's field and width: 0 to 4 are int32, 5 a pointer.
+bool emulation_field(EmulationDesc* e, int attr, void** field, size_t* bytes) {
+  switch (attr) {
+    case 0: *field = &e->strategy; *bytes = 4; return true;
+    case 1: *field = &e->special_values; *bytes = 4; return true;
+    case 2: *field = &e->mantissa_control; *bytes = 4; return true;
+    case 3: *field = &e->max_bits; *bytes = 4; return true;
+    case 4: *field = &e->bit_offset; *bytes = 4; return true;
+    case 5: *field = &e->bit_count_pointer; *bytes = sizeof(void*); return true;
+    default: return false;
+  }
+}
+}  // namespace
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescSetAttribute(vgpu_emu_desc d, vgpu_emu_attr attr, const void* buf, size_t bytes) {
+  if (!emulation_known(d) || !buf) return CUBLAS_STATUS_INVALID_VALUE;
+  void* field;
+  size_t width;
+  if (!emulation_field(reinterpret_cast<EmulationDesc*>(d), enum_value(attr), &field, &width) || bytes != width)
+    return CUBLAS_STATUS_INVALID_VALUE;
+  std::memcpy(field, buf, width);
+  return CUBLAS_STATUS_SUCCESS;
+}
+VGPU_EXPORT cublasStatus_t cublasLtEmulationDescGetAttribute(vgpu_emu_desc d, vgpu_emu_attr attr, void* buf, size_t bytes, size_t* written) {
+  if (!emulation_known(d)) return CUBLAS_STATUS_INVALID_VALUE;
+  void* field;
+  size_t width;
+  if (!emulation_field(reinterpret_cast<EmulationDesc*>(d), enum_value(attr), &field, &width)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (bytes == 0) {
+    if (!written) return CUBLAS_STATUS_INVALID_VALUE;
+    *written = width;
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  if (!buf || bytes != width) return CUBLAS_STATUS_INVALID_VALUE;
+  std::memcpy(buf, field, width);
+  if (written) *written = width;
   return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -576,6 +688,20 @@ void encode(double v, int t, uint8_t* p) {
   }
 }
 
+// v rounded to type t and back (the value a store of that type keeps).
+double quantize(double v, int t) {
+  uint8_t raw[8] = {};
+  encode(v, t, raw);
+  switch (t) {
+    case CUDA_R_8F_E4M3: return from_bits_fp8(raw[0], true);
+    case CUDA_R_8F_E5M2: return from_bits_fp8(raw[0], false);
+    case CUDA_R_16F: { uint16_t h; std::memcpy(&h, raw, 2); return from_half(h); }
+    case CUDA_R_16BF: { uint16_t h; std::memcpy(&h, raw, 2); return from_bf16(h); }
+    case CUDA_R_32F: { float f; std::memcpy(&f, raw, 4); return f; }
+    default: return v;
+  }
+}
+
 // The span, in elements, a layout's one matrix occupies.
 size_t span(const MatrixLayout& l) {
   if (!l.rows || !l.cols) return 0;
@@ -684,18 +810,23 @@ struct Scales {
   int mode = kScaleScalar;
   std::vector<uint8_t> bytes;    // the tiled forms
   std::vector<double> values;    // the 32F forms (one value for a scalar)
-  size_t inner_blocks = 0, outer = 0;
+  size_t inner_blocks = 0, outer = 0, outer_pad = 0;
   int block = 1;
   // The multiplier for the element at (outer index o, inner index k).
   double at(size_t o, size_t k) const {
     switch (mode) {
-      case kScaleScalar: return values.empty() ? 1.0 : values[0];
+      case kScaleScalar: case kScalePerBatch: return values.empty() ? 1.0 : values[0];
       case kScaleOuterVec: return values[o];
       case kScaleVec16UE4M3:
       case kScaleVec32UE8M0: {
         const size_t b = k / block, dim = (inner_blocks + 3) / 4 * 4;
         const size_t off = ((b / 4) * 4 + (o / 128) * dim) * 128 + (o % 32) * 16 + (o % 128 / 32) * 4 + b % 4;
         return mode == kScaleVec16UE4M3 ? from_ue4m3(bytes[off]) : from_ue8m0(bytes[off]);
+      }
+      case kScaleMnK4_128:
+      case kScaleMnK4_32: {   // a column-major (outer rounded up to 4) x ceil(K / 4 blocks) matrix of words of four exponents
+        const size_t b = k / block;
+        return from_ue8m0(bytes[((b / 4) * outer_pad + o) * 4 + b % 4]);
       }
       case kScaleVec128: return values[o + (k / 128) * outer];
       default: return values[(k / 128) + (o / 128) * ((inner_blocks + 3) / 4 * 4)];   // kScaleBlk128x128
@@ -704,18 +835,42 @@ struct Scales {
 };
 size_t tiled_bytes(size_t outer, size_t inner_blocks) { return (outer + 127) / 128 * 128 * ((inner_blocks + 3) / 4 * 4); }
 
-Scales load_scales(const void* p, int mode, size_t outer, size_t inner) {
+// The bytes one scale tensor of this mode takes for `outer` rows and `inner` elements along its blocks; the
+// next batch's tensor follows it (documentation-derived: a batched matmul of block-scaled operands has one
+// scale tensor per batch, back to back).
+size_t scale_tensor_bytes(int mode, size_t outer, size_t inner) {
+  switch (mode) {
+    case kScaleVec16UE4M3: return tiled_bytes(outer, (inner + 15) / 16);
+    case kScaleVec32UE8M0: return tiled_bytes(outer, (inner + 31) / 32);
+    case kScaleMnK4_128: return (outer + 3) / 4 * 4 * ((inner + 511) / 512) * 4;
+    case kScaleMnK4_32: return (outer + 3) / 4 * 4 * ((inner + 127) / 128) * 4;
+    case kScaleVec128: return outer * ((inner + 127) / 128) * 4;
+    case kScaleBlk128x128: return (((inner + 127) / 128 + 3) / 4 * 4) * ((outer + 127) / 128) * 4;
+    case kScalePerBatch: return 4;
+    default: return 0;   // scalar and outer-vector scales are shared by every batch
+  }
+}
+
+Scales load_scales(const void* p, int mode, size_t outer, size_t inner, int batch_index = 0) {
   Scales s;
   s.mode = mode;
   s.outer = outer;
+  if (p) p = static_cast<const uint8_t*>(p) + (size_t)batch_index * scale_tensor_bytes(mode, outer, inner);
   switch (mode) {
-    case kScaleScalar: s.values = p ? read_as_double(p, 1, CUDA_R_32F) : std::vector<double>{1.0}; break;
+    case kScaleScalar: case kScalePerBatch: s.values = p ? read_as_double(p, 1, CUDA_R_32F) : std::vector<double>{1.0}; break;
     case kScaleOuterVec: s.values = p ? read_as_double(p, outer, CUDA_R_32F) : std::vector<double>(outer, 1.0); break;
     case kScaleVec16UE4M3:
     case kScaleVec32UE8M0:
       s.block = mode == kScaleVec16UE4M3 ? 16 : 32;
       s.inner_blocks = (inner + s.block - 1) / s.block;
       s.bytes.assign(tiled_bytes(outer, s.inner_blocks), 0);
+      if (p) cudaMemcpy(s.bytes.data(), p, s.bytes.size(), cudaMemcpyDeviceToHost);
+      break;
+    case kScaleMnK4_128:
+    case kScaleMnK4_32:
+      s.block = mode == kScaleMnK4_128 ? 128 : 32;
+      s.outer_pad = (outer + 3) / 4 * 4;
+      s.bytes.assign(scale_tensor_bytes(mode, outer, inner), 0);
       if (p) cudaMemcpy(s.bytes.data(), p, s.bytes.size(), cudaMemcpyDeviceToHost);
       break;
     case kScaleVec128:
@@ -742,7 +897,7 @@ Scales load_scales(const void* p, int mode, size_t outer, size_t inner) {
 //     scale (D_SCALE_POINTER); S = e4m3(amax / 6), and each value is
 //     multiplied by 1 / S and rounded to E2M1.
 void quantize_column(Elems& d, const MatrixLayout& l, int64_t j, const std::vector<double>& col, int mode,
-                     std::vector<uint8_t>& out_scales, size_t m) {
+                     std::vector<uint8_t>& out_scales, size_t m, size_t out_base = 0) {
   const int block = mode == kScaleVec16UE4M3 ? 16 : 32;
   const size_t blocks = (m + block - 1) / block, dim = (blocks + 3) / 4 * 4;
   const double dmax = is_fp4(d.t) ? 6.0 : d.t == CUDA_R_8F_E4M3 ? 448.0 : 57344.0;
@@ -767,7 +922,7 @@ void quantize_column(Elems& d, const MatrixLayout& l, int64_t j, const std::vect
     }
     const size_t off = ((b / 4) * 4 + ((size_t)j / 128) * dim) * 128 + ((size_t)j % 32) * 16 + ((size_t)j % 128 / 32) * 4 +
                        b % 4;
-    if (off < out_scales.size()) out_scales[off] = code;
+    if (out_base + off < out_scales.size()) out_scales[out_base + off] = code;
     const double r = scale > 0 && std::isfinite(scale) ? 1.0 / (float)scale : 0.0;
     for (size_t i = b * block; i < std::min(m, (b + 1) * block); ++i) d.set(at(l, (int64_t)i, j), col[i] * r);
   }
@@ -839,6 +994,141 @@ float gelu_grad(float x) {
 bool block_mode(int m) { return m == kScaleVec16UE4M3 || m == kScaleVec32UE8M0; }
 bool hopper_mode(int m) { return m == kScaleVec128 || m == kScaleBlk128x128; }
 
+
+/* ---- what an FP8/FP4 matmul is refused for, by the descriptor and by the card ----
+   Measured on an NVIDIA L4 (sm_89, cuBLAS 13.3 from CUDA 13.2) and an RTX 3060 (sm_86) with
+   nvidia/tests/e2e/lowprec_lt.cu, 1247 descriptors on each (nvidia/tests/data/lowprec/lt.*.txt);
+   cuBLAS 13.0 answers the same but for PER_BATCH_SCALAR_32F, which only 13.2 knows. Two layers,
+   in this order, as the card has them:
+     the descriptor's own consistency, whatever the GPU (INVALID_VALUE, and a few NOT_SUPPORTED that
+     are made before any kernel is looked for), then
+     whether a kernel exists on this GPU (NOT_SUPPORTED).
+   Below compute capability 8.9 there is no FP8 kernel at all. On 8.9 the kernels are the table below
+   (every row measured). From 9.0 up the descriptor layer applies and the kernel layer is the
+   documentation's, not a card's: the older permissive checks that follow decide, and the features
+   only those GPUs have (outer-vector and 128-element scales, auxiliary scale and amax, the block-scaled
+   MXFP8 and NVFP4 modes) are implemented from NVIDIA's documentation, not checked against a card. */
+int device_cc() {
+  int dev = 0, major = 0, minor = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+  return major * 10 + minor;
+}
+
+// The scale-mode families the card keeps apart: modes of different families cannot be A's and B's.
+// -1: a mode the library does not know.
+int scale_family(int mode, int cc) {
+  switch (mode) {
+    case kScaleMnK4_128: return cc >= 100 ? 5 : -1;   // cuBLAS 13.8's UE8M0 modes: Blackwell's block-scaled kernels
+    case kScaleMnK4_32: return cc >= 100 ? 6 : -1;
+    case kScaleScalar: return 0;
+    case kScaleVec16UE4M3: return 1;
+    case kScaleVec32UE8M0: return 2;
+    case kScaleOuterVec: case kScaleVec128: case kScaleBlk128x128: return 3;
+    case 6: return 4;   // PER_BATCH_SCALAR_32F (CUDA 13.2)
+    default: return -1;
+  }
+}
+
+bool narrow_involved(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb, const MatrixLayout& lc,
+                     const MatrixLayout& ld) {
+  return narrow(la.type) || narrow(lb.type) || narrow(lc.type) || narrow(ld.type) || md.a_scale_mode != kScaleScalar ||
+         md.b_scale_mode != kScaleScalar || md.d_out_scale_mode != kScaleScalar || md.amax_d || md.aux_scale || md.aux_amax;
+}
+
+// The descriptor layer. Returns SUCCESS when nothing in the descriptor is wrong in itself.
+cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb,
+                                       const MatrixLayout& lc, const MatrixLayout& ld, int cc) {
+  const int at = la.type, bt = lb.type, dt = ld.type;
+  if (at == CUDA_R_8F_E5M2 && bt == CUDA_R_8F_E5M2) return CUBLAS_STATUS_NOT_SUPPORTED;   // no E5M2 x E5M2 kernel anywhere
+  const bool compute32 = md.compute == CUBLAS_COMPUTE_32F || md.compute == CUBLAS_COMPUTE_32F_FAST_16F ||
+                         md.compute == CUBLAS_COMPUTE_32F_FAST_16BF || md.compute == CUBLAS_COMPUTE_32F_FAST_TF32;
+  if (compute32 && md.scale != CUDA_R_32F) return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.amax_d && (dt == CUDA_R_16F || dt == CUDA_R_16BF || dt == CUDA_R_32F)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((md.aux_scale || md.aux_amax) && cc < 90) return CUBLAS_STATUS_INVALID_VALUE;
+  const int e = enum_value(md.epilogue);
+  const bool aux = (e & 128) != 0, relu = (e & 2) != 0 || (e & 8) != 0;
+  if (aux && md.aux_type >= 0) {
+    if (relu) return CUBLAS_STATUS_INVALID_VALUE;   // the mask has no type to choose
+    const int allowed = is_fp8(dt) ? CUDA_R_16BF : dt;
+    // From sm_90 an E4M3 output's auxiliary buffer may also be E4M3 or fp16 (cublasLt.h's description of
+    // EPILOGUE_AUX_DATA_TYPE; documentation-derived, an L4 and an RTX 3060 take only the types above).
+    const bool fp8_aux = cc >= 90 && dt == CUDA_R_8F_E4M3 && (md.aux_type == CUDA_R_8F_E4M3 || md.aux_type == CUDA_R_16F);
+    if (md.aux_type != allowed && !fp8_aux) return CUBLAS_STATUS_INVALID_VALUE;
+  }
+  if (lc.order != ld.order) return CUBLAS_STATUS_INVALID_VALUE;
+  const int fa = scale_family(md.a_scale_mode, cc), fb = scale_family(md.b_scale_mode, cc);
+  if (fa < 0 || fb < 0) return CUBLAS_STATUS_INVALID_VALUE;
+  const bool compatible = fa == fb || ((fa == 0 || fa == 4) && (fb == 0 || fb == 4));
+  if (!compatible) return CUBLAS_STATUS_INVALID_VALUE;
+  if (is_fp4(at) && md.a_scale_mode != kScaleVec16UE4M3) return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.a_scale_mode == kScaleVec16UE4M3 && !is_fp4(at)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.a_scale_mode == kScaleVec32UE8M0 && !is_fp8(at)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 1 || fa == 2 || fa == 5 || fa == 6) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 5 || fa == 6) && !is_fp8(at)) return CUBLAS_STATUS_INVALID_VALUE;
+  if (is_fp4(dt) && md.d_out_scale_mode == kScaleVec32UE8M0) return CUBLAS_STATUS_INVALID_VALUE;
+  if (dt == CUDA_R_8F_E4M3 && (fa == 2 || fa == 3) && md.d_out_scale_mode == kScaleScalar) return CUBLAS_STATUS_INVALID_VALUE;
+  if ((fa == 1 || fa == 2) && aux) return CUBLAS_STATUS_INVALID_VALUE;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// The kernel layer for GPUs the card was measured on: below 8.9 nothing; on 8.9 this table.
+cublasStatus_t narrow_kernel_check(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb,
+                                   const MatrixLayout& lc, const MatrixLayout& ld, int cc) {
+  if (cc < 89) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (cc > 89) {
+    // Hopper and later: documentation-derived, not checked against a card. The FP32-scale modes (outer
+    // vector, 128-element, 128x128) and the auxiliary scale and amax are Hopper's and later; the UE8M0 and
+    // UE4M3 block scales (MXFP8, NVFP4, and cuBLAS 13.8's packed forms) and FP4 are Blackwell's (cc 10.0 and up).
+    const int fa = scale_family(md.a_scale_mode, cc);
+    const bool blackwell = cc >= 100;
+    if ((fa == 1 || fa == 2 || fa == 5 || fa == 6) && !blackwell) return CUBLAS_STATUS_NOT_SUPPORTED;
+    if ((is_fp4(la.type) || is_fp4(lb.type) || is_fp4(ld.type)) && !blackwell) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  const int at = la.type, bt = lb.type, ct = lc.type, dt = ld.type;
+  auto e4 = [](int t) { return t == CUDA_R_8F_E4M3; };
+  auto e5 = [](int t) { return t == CUDA_R_8F_E5M2; };
+  // Types: E4M3 x E4M3, E4M3 x E5M2 or E5M2 x E4M3, into the output below (C is D's type, or BF16/FP16 under FP8).
+  if (!(is_fp8(at) && is_fp8(bt))) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (md.compute != CUBLAS_COMPUTE_32F && md.compute != CUBLAS_COMPUTE_32F_FAST_16F && md.compute != CUBLAS_COMPUTE_32F_FAST_TF32)
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  bool types = false;
+  if (ct == CUDA_R_16BF && dt == CUDA_R_16BF) types = true;
+  if (ct == CUDA_R_16F && dt == CUDA_R_16F) types = true;
+  if (ct == CUDA_R_32F && dt == CUDA_R_32F) types = true;
+  if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e4(dt)) types = true;
+  if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e5(dt) && (e5(at) != e5(bt))) types = true;
+  if (!types) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Layout: A and B both contiguous along K (op(A) = T and op(B) = N for column-major storage).
+  const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
+  const bool ka = ta != (la.order == CUBLASLT_ORDER_ROW), kb = (!tb) != (lb.order == CUBLASLT_ORDER_ROW);
+  if (!ka || !kb) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (md.a_scale_mode != kScaleScalar || md.b_scale_mode != kScaleScalar) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Alignment: every leading dimension a multiple of 16 bytes.
+  for (const MatrixLayout* l : {&la, &lb, &lc, &ld})
+    if ((l->ld * (int64_t)elem_bytes(l->type)) % 16) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Epilogues, by output type; the bias is BF16 under an FP8 or fp32 D, else D's type.
+  const int e = enum_value(md.epilogue);
+  const bool bias = (e & 4) != 0;
+  const int bias_ok = (dt == CUDA_R_16F) ? CUDA_R_16F : CUDA_R_16BF;
+  if (bias && md.bias_type >= 0 && md.bias_type != bias_ok) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (dt == CUDA_R_32F && (e == (CUBLASLT_EPILOGUE_GELU_BIAS) || e == CUBLASLT_EPILOGUE_RELU_AUX_BIAS ||
+                           e == CUBLASLT_EPILOGUE_GELU_AUX_BIAS))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (is_fp8(dt) && (e == CUBLASLT_EPILOGUE_DRELU || e == CUBLASLT_EPILOGUE_DRELU_BGRAD || e == CUBLASLT_EPILOGUE_DGELU ||
+                     e == CUBLASLT_EPILOGUE_DGELU_BGRAD))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (dt == CUDA_R_32F && (e == CUBLASLT_EPILOGUE_DRELU_BGRAD || e == CUBLASLT_EPILOGUE_DGELU_BGRAD))
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (e == CUBLASLT_EPILOGUE_BGRADA || e == CUBLASLT_EPILOGUE_BGRADB) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (e5(dt) && e != CUBLASLT_EPILOGUE_DEFAULT && e != CUBLASLT_EPILOGUE_RELU && e != CUBLASLT_EPILOGUE_BIAS &&
+      e != CUBLASLT_EPILOGUE_RELU_BIAS)
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 // Everything that can be refused before the matmul runs, shared with
 // cublasLtMatmulAlgoGetHeuristic (which on the card refuses the same
 // descriptors); `at_matmul` adds the pointer checks the card makes only
@@ -847,6 +1137,20 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
                         const MatrixLayout& ld, bool at_matmul) {
   if (!known_type(la.type) || !known_type(lb.type) || !known_type(lc.type) || !known_type(ld.type))
     return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Measured on an RTX 3060 (every type, int8 included): a scale or amax pointer, an auxiliary scale, or a
+  // scale mode other than the scalar one on a matmul with no FP8 or FP4 operand or output is INVALID_VALUE.
+  if (!narrow(la.type) && !narrow(lb.type) && !narrow(lc.type) && !narrow(ld.type) &&
+      (md.a_scale || md.b_scale || md.c_scale || md.d_scale || md.amax_d || md.aux_scale || md.aux_amax || md.d_out_scale ||
+       md.a_scale_mode != kScaleScalar || md.b_scale_mode != kScaleScalar || md.c_scale_mode != kScaleScalar ||
+       md.d_scale_mode != kScaleScalar || md.d_out_scale_mode != kScaleScalar))
+    return CUBLAS_STATUS_INVALID_VALUE;
+  if (narrow_involved(md, la, lb, lc, ld)) {
+    const int cc = device_cc();
+    if (cc) {
+      if (const cublasStatus_t st = narrow_descriptor_check(md, la, lb, lc, ld, cc)) return st;
+      if (const cublasStatus_t st = narrow_kernel_check(md, la, lb, lc, ld, cc)) return st;
+    }
+  }
   // Integer matmul (PyTorch's torch._int_mm): int8 x int8 into int32 with CUBLAS_COMPUTE_32I, and nothing else
   // mixes integer and floating types.
   const bool any_int = is_int(la.type) || is_int(lb.type) || is_int(lc.type) || is_int(ld.type);
@@ -867,25 +1171,32 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
   // none, the card's heuristic finds an algorithm and the matmul refuses.
   if (md.aux && ep.relu_aux() && (md.aux_ld <= 0 || md.aux_ld % 128 || md.aux_ld < m))
     return CUBLAS_STATUS_INVALID_VALUE;
+  // (Under an FP8 or block-scaled matmul the auxiliary type has its own rule, in narrow_descriptor_check.)
+  const bool narrow_path = narrow_involved(md, la, lb, lc, ld);
   if (md.aux && ep.gelu_aux() &&
-      (md.aux_ld <= 0 || md.aux_ld < m || (md.aux_type >= 0 && md.aux_type != (int32_t)ld.type)))
+      (md.aux_ld <= 0 || md.aux_ld < m || (!narrow_path && md.aux_type >= 0 && md.aux_type != (int32_t)ld.type)))
     return CUBLAS_STATUS_INVALID_VALUE;
   // The scaling modes (documentation-derived for the block forms).
   const int am = md.a_scale_mode, bm = md.b_scale_mode;
-  auto mode_ok = [](int x) { return x == kScaleScalar || x == kScaleOuterVec || block_mode(x) || hopper_mode(x); };
+  auto mnk4 = [](int x) { return x == kScaleMnK4_128 || x == kScaleMnK4_32; };
+  auto mode_ok = [&](int x) {
+    return x == kScaleScalar || x == kScaleOuterVec || x == kScalePerBatch || block_mode(x) || hopper_mode(x) || mnk4(x);
+  };
   if (!mode_ok(am) || !mode_ok(bm) || !(md.c_scale_mode == kScaleScalar || block_mode(md.c_scale_mode)) ||
-      md.d_scale_mode != kScaleScalar || !(md.d_out_scale_mode == kScaleScalar || block_mode(md.d_out_scale_mode)))
+      !(md.d_scale_mode == kScaleScalar || md.d_scale_mode == kScalePerBatch) ||
+      !(md.d_out_scale_mode == kScaleScalar || block_mode(md.d_out_scale_mode)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   if (block_mode(am) || block_mode(bm)) {
-    // FP4 with UE4M3 per 16, or FP8 with UE8M0 per 32; A and B alike.
+    // FP4 with UE4M3 per 16, or FP8 with UE8M0 per 32; A and B alike. One scale tensor per batch.
     if (am != bm) return CUBLAS_STATUS_NOT_SUPPORTED;
     const bool fp4 = am == kScaleVec16UE4M3;
     if (fp4 ? !(is_fp4(la.type) && is_fp4(lb.type)) : !(is_fp8(la.type) && is_fp8(lb.type)))
       return CUBLAS_STATUS_NOT_SUPPORTED;
-    if (ld.batch > 1) return CUBLAS_STATUS_NOT_SUPPORTED;   // per-batch scale tensors are not modelled
+  } else if (mnk4(am) || mnk4(bm)) {
+    if (am != bm || !is_fp8(la.type) || !is_fp8(lb.type)) return CUBLAS_STATUS_NOT_SUPPORTED;
   } else if (hopper_mode(am) || hopper_mode(bm)) {
     if (!hopper_mode(am) || !hopper_mode(bm) || (am == kScaleBlk128x128 && bm == kScaleBlk128x128) ||
-        !is_fp8(la.type) || !is_fp8(lb.type) || narrow(ld.type) || ld.batch > 1)
+        !is_fp8(la.type) || !is_fp8(lb.type) || narrow(ld.type))
       return CUBLAS_STATUS_NOT_SUPPORTED;
     if (m % 4 || n % 4) return CUBLAS_STATUS_INVALID_VALUE;
   } else if (is_fp4(la.type) || is_fp4(lb.type)) {
@@ -895,49 +1206,40 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
       (md.c_scale_mode == kScaleVec16UE4M3 ? !is_fp4(lc.type) : !is_fp8(lc.type)))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   if (block_mode(md.d_out_scale_mode)
-          ? (md.d_out_scale_mode == kScaleVec16UE4M3 ? !is_fp4(ld.type) : !is_fp8(ld.type)) || ld.batch > 1
+          ? (md.d_out_scale_mode == kScaleVec16UE4M3 ? !is_fp4(ld.type) : !is_fp8(ld.type))
           : is_fp4(ld.type))
     return CUBLAS_STATUS_NOT_SUPPORTED;
   const int pm = md.pointer_mode;
   if (pm < CUBLASLT_POINTER_MODE_HOST || pm > CUBLASLT_POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST)
     return CUBLAS_STATUS_INVALID_VALUE;
+  if (md.emulation) {
+    // An emulation descriptor goes with an emulated compute type
+    // (CUBLAS_COMPUTE_32F_EMULATED_16BFX9 = 78 or _64F_EMULATED_FIXEDPOINT = 79), and a negative max mantissa bit count is refused.
+    if (md.compute != 78 && md.compute != 79) return CUBLAS_STATUS_INVALID_VALUE;
+    if (emulation_known(md.emulation) && reinterpret_cast<const EmulationDesc*>(md.emulation)->max_bits < 0)
+      return CUBLAS_STATUS_INVALID_VALUE;
+  }
   if (at_matmul) {
     if (ep.aux_out && !md.aux) return CUBLAS_STATUS_NOT_SUPPORTED;
     if ((ep.drelu || ep.dgelu) && !md.aux) return CUBLAS_STATUS_INVALID_VALUE;
     if ((ep.bgrad || ep.bgrada || ep.bgradb) && !md.bias) return CUBLAS_STATUS_INVALID_VALUE;
     if (block_mode(md.d_out_scale_mode) && !md.d_out_scale) return CUBLAS_STATUS_INVALID_VALUE;
-    if ((block_mode(am) || hopper_mode(am)) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
+    if ((block_mode(am) || hopper_mode(am) || mnk4(am)) && (!md.a_scale || !md.b_scale)) return CUBLAS_STATUS_INVALID_VALUE;
   }
   return CUBLAS_STATUS_SUCCESS;
 }
 
 }  // namespace
 
-VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc,
-                                          const void* alpha, const void* A,
-                                          cublasLtMatrixLayout_t Adesc, const void* B,
-                                          cublasLtMatrixLayout_t Bdesc, const void* beta,
-                                          const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
-                                          cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
-                                          void*, size_t, cudaStream_t stream) {
-  // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
-  // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
-  // library keeps nothing in a handle.
-  if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
-  if (!known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc)) return CUBLAS_STATUS_INVALID_VALUE;
-  const auto& md = *reinterpret_cast<MatmulDesc*>(desc);
-  const auto& la = *reinterpret_cast<MatrixLayout*>(Adesc);
-  const auto& lb = *reinterpret_cast<MatrixLayout*>(Bdesc);
-  const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
-  const auto& lc = known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld;
+namespace {
 
-  const cublasStatus_t verdict = validate(md, la, lb, lc, ld, true);
-  if (verdict != CUBLAS_STATUS_SUCCESS) {
-    if (trace() || (!quiet() && verdict == CUBLAS_STATUS_NOT_SUPPORTED))
-      std::fprintf(stderr, "[vgpu] cublasLtMatmul: refused, status %d (A=%d B=%d C=%d D=%d, epilogue %d)\n",
-                   (int)verdict, (int)la.type, (int)lb.type, (int)lc.type, (int)ld.type, (int)md.epilogue);
-    return verdict;
-  }
+// The matrix product itself, on the host (see cublasLtMatmul).
+cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb, const MatrixLayout& lc,
+                          const MatrixLayout& ld, const void* alpha, const void* A, const void* B, const void* beta,
+                          const void* C, void* D, cudaStream_t stream) {
+  // The copies this routine makes to reach its operands on the host are not
+  // the program's (see cublasLtMatmul); a recorded launch runs this too.
+  vgpu::profiling::Silence silent;
   const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
   const int64_t m = (int64_t)ld.rows, n = (int64_t)ld.cols;
   const int64_t k = ta ? (int64_t)la.rows : (int64_t)la.cols;
@@ -959,35 +1261,50 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
                  : std::vector<double>{beta ? read_scalar(beta, md.scale, pm == CUBLASLT_POINTER_MODE_DEVICE) : 0.0};
   bool any_beta = false;
   for (double b : betas) any_beta = any_beta || b != 0.0;
+  if (any_beta && !C) return CUBLAS_STATUS_INVALID_VALUE;   // measured: beta != 0 with no C
 
   // A's and B's scales (row-wise, column-wise or by block along K; an unset
   // scale is 1), C's (scalar, or by block down C's columns, for a narrow C),
   // and D's: its tensor-wide scale for an FP8 D, or the input scale an FP4 D
   // is quantized with.
-  const Scales sa = load_scales(md.a_scale, md.a_scale_mode, (size_t)m, (size_t)k);
-  const Scales sb = load_scales(md.b_scale, md.b_scale_mode, (size_t)n, (size_t)k);
   const bool c_blocks = block_mode(md.c_scale_mode);
-  const Scales sc = c_blocks ? load_scales(md.c_scale, md.c_scale_mode, (size_t)n, (size_t)m)
-                             : load_scales(narrow(lc.type) ? md.c_scale : nullptr, kScaleScalar, 1, 1);
   const bool d_blocks = block_mode(md.d_out_scale_mode);
-  const double sd = (is_fp8(ld.type) && !d_blocks) || (is_fp4(ld.type) && d_blocks)
-                        ? load_scales(md.d_scale, kScaleScalar, 1, 1).values[0]
-                        : 1.0;
+  // (Each batch's scales are read in its turn below: block scales and per-batch scalars have one tensor per batch.)
 
   int bias_type = md.bias_type;
-  if (md.bias_type < 0) bias_type = narrow(ld.type) ? CUDA_R_16BF : ld.type;
+  // Measured (L4, cuBLAS 13.3): under FP8 operands the default bias is BF16 for an fp32 or FP8 D, as the header's exceptions say.
+  if (md.bias_type < 0)
+    bias_type = (narrow(ld.type) || (ld.type == CUDA_R_32F && (narrow(la.type) || narrow(lb.type)))) ? CUDA_R_16BF : ld.type;
   if ((ep.bias || ep.bgrad || ep.bgrada || ep.bgradb) && !elem_bytes(bias_type)) return CUBLAS_STATUS_NOT_SUPPORTED;
 
+  // The epilogue runs in fp32 for the floating-point compute types (an fp64 or int32 matmul keeps its width).
+  const bool f32_epilogue = md.compute == CUBLAS_COMPUTE_32F || md.compute == CUBLAS_COMPUTE_32F_FAST_16F ||
+                            md.compute == CUBLAS_COMPUTE_32F_FAST_16BF || md.compute == CUBLAS_COMPUTE_32F_FAST_TF32 ||
+                            md.compute == CUBLAS_COMPUTE_32F_PEDANTIC;
+  auto rnd32 = [f32_epilogue](double x) { return f32_epilogue ? (double)(float)x : x; };
   const int batch = ld.batch;
   if ((la.batch != 1 && la.batch != batch) || (lb.batch != 1 && lb.batch != batch)) return CUBLAS_STATUS_INVALID_VALUE;
   double amax = 0.0;
   std::vector<uint8_t> out_scales;
-  if (d_blocks)
-    out_scales.assign(tiled_bytes((size_t)n, ((size_t)m + (md.d_out_scale_mode == kScaleVec16UE4M3 ? 15 : 31)) /
-                                                 (md.d_out_scale_mode == kScaleVec16UE4M3 ? 16 : 32)),
-                      0);
+  const size_t out_tensor = d_blocks ? scale_tensor_bytes(md.d_out_scale_mode, (size_t)n, (size_t)m) : 0;
+  if (d_blocks) out_scales.assign(out_tensor * (size_t)batch, 0);
+  // The auxiliary buffer's element type, and (for an FP8 one) its scale and the amax it reports.
+  // (Measured on an L4: under an FP8 D the default auxiliary type is BF16, while the product is rounded to fp16 before
+  // the bias of RELU_AUX_BIAS and GELU_AUX_BIAS is added.)
+  const int auxt = md.aux_type >= 0 ? md.aux_type : (narrow(ld.type) ? (int)CUDA_R_16BF : ld.type);
+  double aux_amax = 0.0;
+  double aux_scale = 1.0;
+  if (md.aux_scale && narrow(auxt)) aux_scale = read_as_double(md.aux_scale, 1, CUDA_R_32F)[0];
   for (int bi = 0; bi < batch; ++bi) {
     auto base = [&](const void* p, const MatrixLayout& l) { return static_cast<const uint8_t*>(p) + batch_offset_bytes(l, bi); };
+    // A's, B's and C's scales and D's, for this batch (an unset scale is 1).
+    const Scales sa = load_scales(md.a_scale, md.a_scale_mode, (size_t)m, (size_t)k, bi);
+    const Scales sb = load_scales(md.b_scale, md.b_scale_mode, (size_t)n, (size_t)k, bi);
+    const Scales sc = c_blocks ? load_scales(md.c_scale, md.c_scale_mode, (size_t)n, (size_t)m, bi)
+                               : load_scales(narrow(lc.type) ? md.c_scale : nullptr, kScaleScalar, 1, 1);
+    const double sd = (is_fp8(ld.type) && !d_blocks) || (is_fp4(ld.type) && d_blocks)
+                          ? load_scales(md.d_scale, md.d_scale_mode == kScalePerBatch ? kScalePerBatch : kScaleScalar, 1, 1, bi).values[0]
+                          : 1.0;
     Elems ea, eb, ec, ed;
     ea.load(base(A, la), span(la), la.type);
     eb.load(base(B, lb), span(lb), lb.type);
@@ -1007,8 +1324,8 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
       mask.assign((size_t)((n - 1) * aux_ld + m + 7) / 8, 0);
       cudaMemcpy(mask.data(), aux_base, mask.size(), cudaMemcpyDeviceToHost);
     } else if (gelu_aux) {
-      aux_base = static_cast<uint8_t*>(md.aux) + (size_t)bi * (size_t)md.aux_batch_stride * elem_bytes(ld.type);
-      aux.load(aux_base, (size_t)((n - 1) * aux_ld + m), ld.type);
+      aux_base = static_cast<uint8_t*>(md.aux) + (size_t)bi * (size_t)md.aux_batch_stride * elem_bytes(auxt);
+      aux.load(aux_base, (size_t)((n - 1) * aux_ld + m), auxt);
     }
     std::vector<double> hbias;
     if (ep.bias && md.bias)
@@ -1024,9 +1341,14 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           acc += ea.get(ta ? at(la, p, i) : at(la, i, p)) * sa.at((size_t)i, (size_t)p) *
                  eb.get(tb ? at(lb, j, p) : at(lb, p, j)) * sb.at((size_t)j, (size_t)p);
         const double al = alphas[alpha_vec ? (size_t)i : 0], be = betas[beta_vec ? (size_t)i : 0];
-        double v = al * acc;
-        if (be != 0.0 && !ec.raw.empty()) v += be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j));
-        if (!hbias.empty()) v += hbias[(size_t)i];
+        // The epilogue runs in fp32 as the card's does: the product, the C term and the bias are each rounded to
+        // fp32 (measured on an L4: a bias that is not exact in fp32 moves FP8 rounding ties).
+        double v = rnd32(al * acc);
+        if (be != 0.0 && !ec.raw.empty()) v = rnd32(v + rnd32(be * sc.at((size_t)j, (size_t)i) * ec.get(at(lc, i, j))));
+        // RELU_AUX_BIAS and GELU_AUX_BIAS add the bias to the product already rounded to the output type (measured: a bf16 D
+        // rounds 9.21875 to 9.25 before adding -2, where RELU_BIAS and BIAS keep 7.21875; an FP8 D rounds to fp16).
+        if (!hbias.empty() && (ep.relu || ep.gelu) && ep.aux_out) v = quantize(v, narrow(ld.type) ? (int)CUDA_R_16F : ld.type);
+        if (!hbias.empty()) v = rnd32(v + rnd32(hbias[(size_t)i]));
         const size_t ax = (size_t)(j * aux_ld + i);
         if (ep.relu) {
           if (relu_aux) {
@@ -1035,23 +1357,27 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
           }
           v = v > 0.0 ? v : 0.0;
         } else if (ep.gelu) {
-          if (gelu_aux) aux.set(ax, v);
+          if (gelu_aux) {
+            aux.set(ax, v * aux_scale);   // an FP8 auxiliary output is scaled by EPILOGUE_AUX_SCALE (documentation-derived)
+            aux_amax = std::fmax(aux_amax, std::fabs(v));
+          }
           v = gelu((float)v);
         } else if (ep.drelu) {
           if (!((mask[ax / 8] >> (ax % 8)) & 1)) v = 0.0;
         } else if (ep.dgelu) {
           v *= gelu_grad((float)aux.get(ax));
         }
-        if (ep.bgrad) bgrad[(size_t)i] += v;
+        // The bias gradient sums the values as stored in D's type, in fp32 (measured: DRELU_BGRAD into bf16).
+        if (ep.bgrad) bgrad[(size_t)i] = rnd32(bgrad[(size_t)i] + quantize(v, narrow(ld.type) ? (int)CUDA_R_16BF : ld.type));
         amax = std::fmax(amax, std::fabs(v));
         col[(size_t)i] = v;
       }
       if (d_blocks) {   // an FP4 D's input scale applies before the quantization
         if (sd != 1.0)
           for (auto& v : col) v *= sd;
-        quantize_column(ed, ld, j, col, md.d_out_scale_mode, out_scales, (size_t)m);
+        quantize_column(ed, ld, j, col, md.d_out_scale_mode, out_scales, (size_t)m, (size_t)bi * out_tensor);
       } else {
-        for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), col[(size_t)i] * sd);
+        for (int64_t i = 0; i < m; ++i) ed.set(at(ld, i, j), rnd32(col[(size_t)i] * sd));
       }
     }
     ed.save(dptr);
@@ -1077,7 +1403,76 @@ VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc
     const float a = (float)amax;
     cudaMemcpy(md.amax_d, &a, sizeof a, cudaMemcpyHostToDevice);
   }
+  if (md.aux_amax && ep.gelu_aux() && ep.gelu) {   // the largest magnitude written to the auxiliary buffer, before its scale
+    const float a = (float)aux_amax;
+    cudaMemcpy(md.aux_amax, &a, sizeof a, cudaMemcpyHostToDevice);
+  }
   return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+VGPU_EXPORT cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc,
+                                          const void* alpha, const void* A,
+                                          cublasLtMatrixLayout_t Adesc, const void* B,
+                                          cublasLtMatrixLayout_t Bdesc, const void* beta,
+                                          const void* C, cublasLtMatrixLayout_t Cdesc, void* D,
+                                          cublasLtMatrixLayout_t Ddesc, const cublasLtMatmulAlgo_t*,
+                                          void*, size_t, cudaStream_t stream) {
+  // The copies this routine makes to reach its operands on the host are not
+  // the program's: on a card the product is a kernel and whatever it moves is
+  // inside it. (No kernel record is made for it either.)
+  vgpu::profiling::Silence silent;
+  // Any handle will do, not only one cublasLtCreate made: a cuBLAS handle is
+  // a valid cuBLASLt handle, and PyTorch passes its cuBLAS handle here. This
+  // library keeps nothing in a handle.
+  if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!known(desc) || !known(Adesc) || !known(Bdesc) || !known(Ddesc)) return CUBLAS_STATUS_INVALID_VALUE;
+  const auto& md = *reinterpret_cast<MatmulDesc*>(desc);
+  const auto& la = *reinterpret_cast<MatrixLayout*>(Adesc);
+  const auto& lb = *reinterpret_cast<MatrixLayout*>(Bdesc);
+  const auto& ld = *reinterpret_cast<MatrixLayout*>(Ddesc);
+  const auto& lc = known(Cdesc) ? *reinterpret_cast<MatrixLayout*>(Cdesc) : ld;
+
+  // Measured on an RTX 3060 and an L4: beta != 0 with no C is refused before any algorithm is looked for.
+  if (!C && beta && md.pointer_mode == CUBLASLT_POINTER_MODE_HOST && read_scalar(beta, md.scale, false) != 0.0)
+    return CUBLAS_STATUS_INVALID_VALUE;
+  const cublasStatus_t verdict = validate(md, la, lb, lc, ld, true);
+  if (verdict != CUBLAS_STATUS_SUCCESS) {
+    if (trace() || (!quiet() && verdict == CUBLAS_STATUS_NOT_SUPPORTED))
+      std::fprintf(stderr, "[vgpu] cublasLtMatmul: refused, status %d (A=%d B=%d C=%d D=%d, epilogue %d)\n",
+                   (int)verdict, (int)la.type, (int)lb.type, (int)lc.type, (int)ld.type, (int)md.epilogue);
+    return verdict;
+  }
+  // Inside a captured region the call is recorded, not run: it executes at each
+  // launch of the graph, over what the graph's kernels have produced by then
+  // (cudaStreamSynchronize and the host copies in matmul_run are not allowed on
+  // a capturing stream, and would read operands that do not exist yet). The
+  // descriptors the caller destroys after the capture, and host-side alpha and
+  // beta, are copied into the closure; device pointers are read at launch.
+  cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+  if (stream && cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusActive) {
+    auto md2 = std::make_shared<MatmulDesc>(md);
+    auto la2 = std::make_shared<MatrixLayout>(la), lb2 = std::make_shared<MatrixLayout>(lb);
+    auto lc2 = std::make_shared<MatrixLayout>(lc), ld2 = std::make_shared<MatrixLayout>(ld);
+    const bool host_scalars = md.pointer_mode == CUBLASLT_POINTER_MODE_HOST;
+    const size_t sbytes = elem_bytes(md.scale) ? elem_bytes(md.scale) : 16;
+    auto hold = [&](const void* p) {
+      std::shared_ptr<std::vector<uint8_t>> v;
+      if (p && host_scalars) {
+        const auto* b = static_cast<const uint8_t*>(p);
+        v = std::make_shared<std::vector<uint8_t>>(b, b + sbytes);
+      }
+      return v;
+    };
+    auto ha = hold(alpha), hb = hold(beta);
+    const void *dalpha = alpha, *dbeta = beta;
+    if (vgpu_record_host_op_if_capturing(stream, [=] {
+          matmul_run(*md2, *la2, *lb2, *lc2, *ld2, ha ? ha->data() : dalpha, A, B, hb ? hb->data() : dbeta, C, D, stream);
+        }))
+      return CUBLAS_STATUS_SUCCESS;
+  }
+  return matmul_run(md, la, lb, lc, ld, alpha, A, B, beta, C, D, stream);
 }
 
 // One algorithm is offered: there is nothing to tune when the math runs on the

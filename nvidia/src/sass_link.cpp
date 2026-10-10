@@ -76,10 +76,30 @@
 //   0xffffffff, through recursion). The call graph and each kernel's list of
 //   driver functions it calls are rewritten for the new symbol table.
 //
-// Not linked: debug information (-G's .debug_* and .nv_debug_* sections are
-// dropped, so a debugger has no line table for linked code), the mercury
-// sections sm_100's cubins carry for the driver to re-finalize, and
-// texture/surface references. The output carries no program headers, which
+// - Functions nothing reaches are dropped (NVIDIA's link does this unless -g
+//   is given; measured with a function called by nothing, a chain of two, a
+//   function whose address only another dead function takes, and one whose
+//   address a kept variable holds, which stays). A kernel is a root, and
+//   so is a function a relocation outside the code names (a table in global
+//   memory); variables are never dropped. -kernels-used=<pattern> narrows
+//   the roots to the kernels whose mangled names match (a substring, `*`
+//   for any run of characters; "kk" keeps kk and kk2).
+//
+// - Debug information is carried, not interpreted: every .debug_* and
+//   .nv_debug_* section (the line tables, the frame table, the register and
+//   type tables, -G's DWARF) of each module is appended to the one of its
+//   name, as the toolkit's link does -- including the entries of dropped
+//   functions, whose relocations go. Relocations in them: against a function
+//   or variable the link kept, they stay (and follow it); against a debug
+//   section's own symbol they are applied (a frame entry's pointer to its
+//   CIE becomes the CIE's place in the merged table); type 73, which marks a
+//   function's length for the toolkit, goes.
+//
+// Not linked: the mercury sections sm_100's cubins carry for the driver to
+// re-finalize (the code is taken as ptxas wrote it; the format is NVIDIA's
+// and undocumented), and legacy texture/surface references, which the
+// driver patches at load and the SASS loader does not (a .texref symbol is
+// reported as undefined). The output carries no program headers, which
 // VirtualGPU's loader does not read.
 #include "sass_link.hpp"
 
@@ -235,6 +255,30 @@ In read_input(const SassLinkInput& input) {
 
 bool starts(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
 
+// The sections that carry debug information: DWARF and the toolkit's own
+// tables. (.nv_debug.shared, a device function's shared variables, is not one.)
+bool debug_section(const std::string& n) { return starts(n, ".debug_") || starts(n, ".nv_debug_"); }
+
+// A -kernels-used pattern against a kernel's name: found anywhere in it, with
+// `*` standing for any run of characters (measured: "kk" keeps kk and kk2,
+// "_Z2k*" keeps _Z2kkPi and _Z2ktILi3EEvPi, "kk2P" keeps only kk2).
+bool pattern_in(const std::string& name, const std::string& pattern) {
+  // Match pattern's parts, split at '*', in order and without overlap.
+  size_t at = 0;
+  size_t from = 0;
+  while (true) {
+    const size_t star = pattern.find('*', from);
+    const std::string part = pattern.substr(from, star == std::string::npos ? std::string::npos : star - from);
+    if (!part.empty()) {
+      const size_t found = name.find(part, at);
+      if (found == std::string::npos) return false;
+      at = found + part.size();
+    }
+    if (star == std::string::npos) return true;
+    from = star + 1;
+  }
+}
+
 // ".nv.constant<N>" -> N, or -1. With a suffix (".nv.constant0.<kernel>") the
 // bank belongs to that function.
 int bank_of(const std::string& name, std::string* owner) {
@@ -365,6 +409,7 @@ struct OutRel {
   uint32_t type;
   uint32_t sym;   // output symbol index
   int64_t addend;
+  int rela = -1;  // 1 in a .rela section, 0 in a .rel one; -1: by whether there is an addend
 };
 struct OutSec {
   Sec s;
@@ -374,7 +419,8 @@ struct OutSec {
 
 class Linker {
  public:
-  Linker(std::vector<In> ins, uint32_t arch) : in_(std::move(ins)), arch_(arch) {}
+  Linker(std::vector<In> ins, uint32_t arch, SassLinkOptions options)
+      : in_(std::move(ins)), arch_(arch), opts_(std::move(options)) {}
   SassLinkResult run();
 
  private:
@@ -387,6 +433,7 @@ class Linker {
   using Key = std::pair<size_t, uint32_t>;   // (input, symbol index)
 
   void resolve_globals();
+  void find_live();
   void place_sections();
   void lay_out_shared();
   void make_symbols();
@@ -427,6 +474,9 @@ class Linker {
 
   std::vector<In> in_;
   uint32_t arch_;
+  SassLinkOptions opts_;
+  bool prune_ = false;                 // functions nothing reaches are dropped
+  std::set<Key> live_;                 // (input, text section) of the functions that stay
   std::string errors_;
   std::map<std::string, Key> globals_;
   std::vector<OutSec> out_;
@@ -494,6 +544,55 @@ void Linker::resolve_globals() {
   if (undefined) throw LinkError("");
 }
 
+void Linker::find_live() {
+  prune_ = !opts_.keep_unused;
+  if (!prune_) return;
+  std::vector<Key> work;
+  const auto mark_section = [&](size_t di, uint32_t sec) {
+    if (sec == 0 || sec >= in_[di].secs.size() || !starts(in_[di].secs[sec].name, ".text.")) return;
+    if (live_.insert({di, sec}).second) work.push_back({di, sec});
+  };
+  // What a relocation's symbol names, if it is a function (by definition) or a
+  // function's section.
+  const auto mark_symbol = [&](size_t i, uint32_t j) {
+    if (j >= in_[i].syms.size()) return;
+    const Sym& s = in_[i].syms[j];
+    if (s.type() == kSttSection) {
+      mark_section(i, s.shndx);
+      return;
+    }
+    if (s.type() != kSttFunc) return;
+    const auto [di, dj] = definition(i, j);
+    if (di != SIZE_MAX) mark_section(di, in_[di].syms[dj].shndx);
+  };
+  // Roots: the kernels that stay, and the functions the relocations outside
+  // the code (and the debug tables) name.
+  for (size_t i = 0; i < in_.size(); ++i)
+    for (uint32_t j = 0; j < in_[i].syms.size(); ++j) {
+      const Sym& s = in_[i].syms[j];
+      if (s.type() != kSttFunc || s.shndx == 0 || !(s.other & kStoEntry)) continue;
+      if (s.bind() != kBindLocal && !kept_def(i, j)) continue;   // a dropped duplicate
+      bool wanted = opts_.kernels_used.empty();
+      for (const std::string& p : opts_.kernels_used) wanted = wanted || pattern_in(s.name, p);
+      if (wanted) mark_section(i, s.shndx);
+    }
+  std::vector<std::map<uint32_t, std::vector<size_t>>> by_target(in_.size());
+  for (size_t i = 0; i < in_.size(); ++i)
+    for (size_t r = 0; r < in_[i].rels.size(); ++r) {
+      const Rel& rel = in_[i].rels[r];
+      const std::string& t = in_[i].secs[rel.target].name;
+      if (starts(t, ".text.")) by_target[i][rel.target].push_back(r);
+      else if (!debug_section(t)) mark_symbol(i, rel.sym);
+    }
+  while (!work.empty()) {
+    const auto [i, k] = work.back();
+    work.pop_back();
+    const auto it = by_target[i].find(k);
+    if (it == by_target[i].end()) continue;
+    for (size_t r : it->second) mark_symbol(i, in_[i].rels[r].sym);
+  }
+}
+
 void Linker::place_sections() {
   for (size_t i = 0; i < in_.size(); ++i) {
     const In& in = in_[i];
@@ -504,12 +603,35 @@ void Linker::place_sections() {
       // The toolkit notes, from the first module: NVIDIA's driver reads the
       // toolkit version from .note.nv.cuinfo, and refuses an image without.
       if (n == ".note.nv.tkinfo" || n == ".note.nv.cuinfo") {
-        if (i == 0) note_[n] = add_section(s);
+        if (i == 0) {
+          note_[n] = add_section(s);
+          sec_map_[{i, k}] = note_[n];   // (its section symbol takes its place in the table)
+          sec_base_[{i, k}] = 0;
+        }
+        continue;
+      }
+      // What the image is compatible with, from the first module (sm_90 and up have it):
+      // the flag that makes a cubin sm_XYa's is one of its records. The last record,
+      // an SVAL with the toolkit's maximum-register value, is left out where
+      // it is zero, as NVIDIA's link leaves it (measured at sm_90; at sm_100 and
+      // sm_120 it holds a value and stays).
+      if (n == ".nv.compat") {
+        if (i == 0) {
+          Sec o = s;
+          if (o.bytes.size() >= 12) {
+            const size_t at = o.bytes.size() - 12;
+            bool zero = o.bytes[at] == 4 && o.bytes[at + 1] == 0x0b;
+            for (size_t b = at + 4; zero && b < o.bytes.size(); ++b) zero = o.bytes[b] == 0;
+            if (zero) o.bytes.resize(at);
+          }
+          o.size = o.bytes.size();
+          sec_map_[{i, k}] = add_section(std::move(o));
+          sec_base_[{i, k}] = 0;
+        }
         continue;
       }
       if (n == ".nv.info" || n == ".nv.callgraph" || n == ".nv.prototype" || n == ".nv.rel.action" ||
-          n == ".nv.compat" || n == ".nv_debug.shared" || starts(n, ".debug") || starts(n, ".nv_debug") ||
-          starts(n, ".note") || starts(n, ".nv.merc") || starts(n, ".nv.capmerc") || starts(n, ".nv.shared.") ||
+          n == ".nv.compat" || n == ".nv_debug.shared" || starts(n, ".note") || starts(n, ".nv.merc") || starts(n, ".nv.capmerc") || starts(n, ".nv.shared.") ||
           starts(n, ".nv.info."))
         continue;   // rebuilt below, laid out by the link, or not kept
       std::string owner;
@@ -524,6 +646,7 @@ void Linker::place_sections() {
         if (def == UINT32_MAX) throw LinkError("'" + in.label + "': " + n + " defines no function of its name");
         const Sym& d = in.syms[def];
         if (d.bind() != kBindLocal && !kept_def(i, def)) continue;   // a dropped duplicate
+        if (prune_ && !live_.count({i, k})) continue;                  // nothing reaches it
         std::string name = fn;
         if (d.bind() == kBindLocal) {
           // A file-scope function: renamed when another module has one of
@@ -543,7 +666,7 @@ void Linker::place_sections() {
       }
       if (bank > 0 && owner.empty()) {
         // A module constant bank: merged.
-      } else if (n == ".nv.global" || n == ".nv.global.init") {
+      } else if (n == ".nv.global" || n == ".nv.global.init" || debug_section(n)) {
       } else if (bank >= 0) {
         // A function's own bank (.nv.constant0.<kernel>): with its function.
         continue;   // placed with the function below
@@ -634,7 +757,8 @@ void Linker::lay_out_shared() {
     }
     for (const Rel& r : in.rels) {
       if (r.type == 58 || r.type == 75) continue;
-      if (!sec_map_.count({i, r.target})) continue;   // debug information names every function
+      if (!sec_map_.count({i, r.target}) || debug_section(in.secs[r.target].name))
+        continue;   // debug information names every function
       const Sym& s = in.syms[r.sym];
       if (s.type() != kSttFunc) continue;
       const std::string to = name_of(r.sym);
@@ -775,6 +899,7 @@ void Linker::make_symbols() {
   // come (NVIDIA's link keeps that order), interleaved with their locals.
   const auto section_symbol = [&](int s) {
     if (out_[static_cast<size_t>(s)].sym >= 0) return;
+    if (out_[static_cast<size_t>(s)].s.name == ".nv.compat") return;   // (no symbol in NVIDIA's)
     out_[static_cast<size_t>(s)].sym = static_cast<int>(syms_.size());
     syms_.push_back({out_[static_cast<size_t>(s)].s.name, static_cast<uint8_t>((kBindLocal << 4) | kSttSection), 0, s, 0, 0});
   };
@@ -867,6 +992,48 @@ void Linker::relocate() {
       OutSec& os = out_[static_cast<size_t>(m->second)];
       const uint64_t at = r.offset + sec_base_[{i, r.target}];
       const Sym& s = in.syms[r.sym];
+      if (debug_section(in.secs[r.target].name)) {
+        // Debug information is carried along (see the head of this file).
+        // Type 73 (R_CUDA_UNUSED_CLEAR64) marks a function's length field in the
+        // frame table: where the link dropped the function, it clears the field.
+        if (r.type == 73) {
+          const auto [ui, uj] = definition(i, r.sym);
+          if (ui == SIZE_MAX || !where_.count({ui, uj})) put_bits(os.s.bytes, at, 0, 64, 0);
+          continue;
+        }
+        if (r.type != 1 && r.type != 2 && r.type != 4)
+          throw LinkError("'" + in.label + "': relocation " + std::to_string(r.type) + " (" + reloc_name(r.type) +
+                          ") in " + in.secs[r.target].name + ": VirtualGPU's SASS linker does not know this relocation");
+        std::vector<uint8_t>& db = os.s.bytes;
+        if (s.type() == kSttSection && s.shndx < in.secs.size() && debug_section(in.secs[s.shndx].name)) {
+          // Into a debug section: a place in the merged table, applied. A REL
+          // entry's field holds the offset within the module's part.
+          const auto base = sec_base_.find({i, s.shndx});
+          if (base == sec_base_.end()) continue;
+          const unsigned len = r.type == 1 ? 32 : 64;
+          const uint64_t old = r.rela ? static_cast<uint64_t>(r.addend) : get_bits(db, at, 0, len);
+          put_bits(db, at, 0, len, base->second + old);
+          continue;
+        }
+        // A shared variable has no symbol in the linked image; its offset is what the field holds,
+        // and an extern __shared__ array's, which has no place of its own, reads all ones.
+        if (is_shared_sym(i, r.sym)) {
+          const uint64_t v = s.shndx == 0 ? ~uint64_t{0} : shared_off_[{i, r.sym}];
+          put_bits(db, at, 0, r.type == 1 ? 32 : 64, v);
+          continue;
+        }
+        // A duplicate's own copy (a weak template in each module) went: the debug info's reference to
+        // it follows the copy that stayed, and the line and frame tables' goes with it.
+        if (in.secs[r.target].name != ".debug_info" && s.shndx != 0 && s.bind() != kBindLocal && s.type() != kSttSection && !kept_def(i, r.sym)) continue;
+        const auto [dbi, dbj] = definition(i, r.sym);
+        if (dbi == SIZE_MAX) continue;   // nothing of the link's (an undefined name)
+        const auto w = where_.find({dbi, dbj});
+        if (w == where_.end()) continue;   // its function was dropped, or lives in a section not kept
+        int64_t addend = r.rela ? r.addend : 0;
+        if (in_[dbi].syms[dbj].type() == kSttSection) addend += static_cast<int64_t>(w->second.value);
+        os.rels.push_back({at, r.type, static_cast<uint32_t>(w->second.out_sym), addend, r.rela ? 1 : 0});
+        continue;
+      }
       const std::string fn = function_of(i, r.target);
       const std::string out_fn = fn.empty() ? std::string() : fn_name_[{i, r.target}];
       if (r.type == 68 || r.type == 69) continue;   // where the driver may yield: left as it is
@@ -1206,8 +1373,10 @@ std::vector<uint8_t> Linker::write_elf() {
   };
   const auto rank_of = [](const Sec& x) {
     std::string owner;
+    if (debug_section(x.name)) return -1;
     if (starts(x.name, ".note")) return 0;
     if (x.name == ".nv.info") return 1;
+    if (x.name == ".nv.compat") return 2;
     if (starts(x.name, ".nv.info.")) return 2;
     if (x.type == kShtCudaCallgraph) return 3;
     if (bank_of(x.name, &owner) >= 0) return owner.empty() ? 8 : 7;
@@ -1218,10 +1387,29 @@ std::vector<uint8_t> Linker::write_elf() {
   };
   std::vector<Item> items;
   for (size_t s = 0; s < out_.size(); ++s) items.push_back({rank_of(out_[s].s), out_[s].s, static_cast<int>(s), -1});
-  for (OutSec& o : out_)   // by offset, as NVIDIA's link lists them
-    std::stable_sort(o.rels.begin(), o.rels.end(), [](const OutRel& x, const OutRel& y) { return x.offset < y.offset; });
+  for (OutSec& o : out_) {
+    if (debug_section(o.s.name) || o.s.name == ".nv.global.init") {
+      // Where several modules' parts meet, NVIDIA's link lists the relocations
+      // last module first and, within one, in the reverse of the order they
+      // had in the module: the reverse of the modules' lists end to end.
+      std::reverse(o.rels.begin(), o.rels.end());
+    } else {   // by offset, as NVIDIA's link lists them
+      std::stable_sort(o.rels.begin(), o.rels.end(), [](const OutRel& x, const OutRel& y) { return x.offset < y.offset; });
+    }
+  }
   // Relocations: those with no addend in a .rel section, the rest in a .rela.
-  for (size_t s = 0; s < out_.size(); ++s) {
+  // The relocation sections of the debug tables come after the rest, in the
+  // order the toolkit's assembler writes them.
+  std::vector<size_t> rel_order;
+  for (size_t s = 0; s < out_.size(); ++s)
+    if (!debug_section(out_[s].s.name)) rel_order.push_back(s);
+  for (const char* n : {".debug_line", ".nv_debug_line_sass", ".debug_info", ".debug_frame"})
+    for (size_t s = 0; s < out_.size(); ++s)
+      if (out_[s].s.name == n) rel_order.push_back(s);
+  for (size_t s = 0; s < out_.size(); ++s)
+    if (debug_section(out_[s].s.name) && std::find(rel_order.begin(), rel_order.end(), s) == rel_order.end())
+      rel_order.push_back(s);
+  for (const size_t s : rel_order) {
     for (const bool with_addend : {false, true}) {
       Sec r;
       r.name = (with_addend ? ".rela" : ".rel") + out_[s].s.name;
@@ -1231,7 +1419,10 @@ std::vector<uint8_t> Linker::write_elf() {
       r.entsize = with_addend ? 24 : 16;
       r.link = 3;
       for (const OutRel& x : out_[s].rels) {
-        if ((x.addend != 0) != with_addend) continue;
+        // Before sm_90 a relocation with no addend is in a .rel section (a debug
+        // table's follow the module they came from); from sm_90 every one is in .rela.
+        const bool in_rela = arch_ >= 90 ? true : (x.rela >= 0 ? x.rela == 1 : x.addend != 0);
+        if (in_rela != with_addend) continue;
         const uint64_t inf = (uint64_t{x.sym} << 32) | x.type;
         const size_t at = r.bytes.size();
         r.bytes.resize(at + r.entsize);
@@ -1412,6 +1603,7 @@ SassLinkResult Linker::run() {
   SassLinkResult res;
   try {
     resolve_globals();
+    find_live();
     place_sections();
     lay_out_shared();
     make_symbols();
@@ -1434,7 +1626,7 @@ bool cubin_relocatable(const void* data, size_t size) {
          p[0x11] == 0;
 }
 
-SassLinkResult link_sass(const std::vector<SassLinkInput>& inputs, uint32_t arch) {
+SassLinkResult link_sass(const std::vector<SassLinkInput>& inputs, uint32_t arch, const SassLinkOptions& options) {
   std::vector<In> ins;
   SassLinkResult bad;
   for (const SassLinkInput& in : inputs) {
@@ -1449,7 +1641,7 @@ SassLinkResult link_sass(const std::vector<SassLinkInput>& inputs, uint32_t arch
     bad.errors += "error   : nothing to link\n";
     return bad;
   }
-  return Linker(std::move(ins), arch).run();
+  return Linker(std::move(ins), arch, options).run();
 }
 
 }  // namespace vgpu::cuda

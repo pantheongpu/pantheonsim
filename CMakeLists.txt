@@ -52,6 +52,16 @@ set(VGPU_PROFILES
   nvidia/gb200
   nvidia/vr200
   nvidia/thor
+  nvidia/rtx-pro-6000-server
+  nvidia/rtx-pro-6000-max-q
+  nvidia/rtx6000-ada
+  nvidia/rtx-a6000
+  nvidia/rtx-a5000
+  nvidia/a100-80gb-pcie
+  nvidia/h100-nvl
+  nvidia/h200-nvl
+  nvidia/rtx4080
+  nvidia/rtx3070
   amd/mi250x
   amd/mi300x
   amd/mi325x
@@ -471,6 +481,27 @@ if(CUDA_ABI_INCLUDE)
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_inc}.tmp" "${_dcbid_inc}")
   file(WRITE "${_dcbid_have}.tmp" "${_dcbid_have_text}")
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dcbid_have}.tmp" "${_dcbid_have}")
+  # The runtime calls' parameter structures for the callback API, from the
+  # toolkit's own generated_cuda_runtime_api_meta.h (scripts/gen_cupti_runtime_conv.py).
+  # Without Python the table is empty and only the calls converted by hand are
+  # delivered to callbacks; the activity records are not affected.
+  set(_conv_inc "${CMAKE_BINARY_DIR}/gen/cupti_runtime_conv.inc")
+  find_program(VGPU_PYTHON NAMES python3 python)
+  file(WRITE "${_conv_inc}.empty" "")
+  if(VGPU_PYTHON AND EXISTS "${CUDA_ABI_INCLUDE}/generated_cuda_runtime_api_meta.h" AND EXISTS "${_cbid_header}")
+    execute_process(
+      COMMAND "${VGPU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py"
+              "${CUDA_ABI_INCLUDE}/generated_cuda_runtime_api_meta.h" "${_cbid_header}" "${_conv_inc}.tmp"
+      RESULT_VARIABLE _conv_rc)
+    if(NOT _conv_rc EQUAL 0)
+      file(WRITE "${_conv_inc}.tmp" "")
+    endif()
+  else()
+    file(WRITE "${_conv_inc}.tmp" "")
+  endif()
+  execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_conv_inc}.tmp" "${_conv_inc}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_SOURCE_DIR}/scripts/gen_cupti_runtime_conv.py")
   add_library(vgpucupti SHARED nvidia/src/cupti_api.cpp)
   # Against the runtime shim rather than the static core, deliberately. The
   # profiling switch and its event queue are process-global state: linking the
@@ -500,7 +531,10 @@ if(CUDA_ABI_INCLUDE)
   add_library(vgpucublas SHARED nvidia/src/cublas_api.cpp nvidia/src/generated/cublas_stubs.cpp
               nvidia/src/cublas_xt.cpp nvidia/src/cublas_legacy_core.cpp
               nvidia/src/generated/cublas_64.cpp nvidia/src/generated/cublas_legacy.cpp)
-  target_link_libraries(vgpucublas PRIVATE vgpu vgpucudart)
+  # The runtime ahead of the static core: the profiling state the routines
+  # silence while they stage operands (their copies are not the program's) must
+  # be the runtime's, not a private copy of it.
+  target_link_libraries(vgpucublas PRIVATE vgpucudart vgpu)
   target_include_directories(vgpucublas PRIVATE ${CUDA_ABI_INCLUDE} nvidia/src)
   set_target_properties(vgpucublas PROPERTIES
     OUTPUT_NAME cublas SOVERSION ${SO_CUBLAS} VERSION ${SO_CUBLAS}.0)
@@ -552,6 +586,11 @@ if(CUDA_ABI_INCLUDE)
       # simulator and no runtime, as NVIDIA's has none. Linking libcudart here
       # put a second simulator into every driver-API program that uses NVRTC.
       target_link_libraries(vgpu${_lower} PRIVATE ${CMAKE_DL_LIBS})
+    elseif(_lower STREQUAL "cublaslt")
+      # The runtime ahead of the static core, so the profiling state the
+      # routines silence while they stage operands is the runtime's, not a
+      # private copy of it (as for cuBLAS above).
+      target_link_libraries(vgpu${_lower} PRIVATE vgpucudart vgpu)
     else()
       target_link_libraries(vgpu${_lower} PRIVATE vgpu vgpucudart)
     endif()
@@ -570,8 +609,31 @@ if(CUDA_ABI_INCLUDE)
   # cusolverSp is part of libcusolver and reads cuSPARSE's matrix descriptors
   # through cuSPARSE's getters, so like NVIDIA's libcusolver it links
   # libcusparse.
-  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp nvidia/src/cusolver_rf.cpp)
+  target_sources(vgpucusolver PRIVATE nvidia/src/cusolver_sp.cpp nvidia/src/cusolver_rf.cpp nvidia/src/cusolver_metis.cpp)
   target_link_libraries(vgpucusolver PRIVATE vgpucusparse)
+  # cusolverSpXcsrmetisndHost is NVIDIA's wrapper of METIS_NodeND, and so is
+  # ours: METIS 5.1.0 (Apache-2.0), vendored with only what NodeND reaches and
+  # built with hidden visibility into libcusolver -- see
+  # nvidia/third_party/metis/README.md.
+  set(_metis_dir "${CMAKE_SOURCE_DIR}/nvidia/third_party/metis")
+  file(GLOB _metis_srcs "${_metis_dir}/libmetis/*.c" "${_metis_dir}/GKlib/*.c")
+  add_library(vgpumetis OBJECT ${_metis_srcs})
+  target_include_directories(vgpumetis PRIVATE "${_metis_dir}/include" "${_metis_dir}/GKlib" "${_metis_dir}/libmetis")
+  target_compile_definitions(vgpumetis PRIVATE LINUX _FILE_OFFSET_BITS=64 _GNU_SOURCE NDEBUG NDEBUG2)
+  target_compile_options(vgpumetis PRIVATE -std=gnu99 -O2 -fno-strict-aliasing -fvisibility=hidden -w)
+  # Never link-time optimized. The project-wide IPO setting makes every C
+  # object carry GIMPLE for the C compiler's LTO version, but the link is
+  # driven by the C++ compiler; when the two are different GCCs (CC=cc is
+  # gcc 11 beside CXX=g++-12 on Ubuntu 22.04) the link dies with "bytecode
+  # stream ... generated with LTO version 11.3 instead of the expected 12.0".
+  # METIS is plain C with nothing to inline across the C/C++ boundary, so
+  # plain machine-code objects lose nothing and link with any compiler.
+  set_target_properties(vgpumetis PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
+                        INTERPROCEDURAL_OPTIMIZATION OFF)
+  target_compile_options(vgpumetis PRIVATE -fno-lto)
+  target_sources(vgpucusolver PRIVATE $<TARGET_OBJECTS:vgpumetis>)
+  target_include_directories(vgpucusolver PRIVATE "${_metis_dir}/include")
+  target_link_libraries(vgpucusolver PRIVATE m)
   # cusolverMg gathers a distributed matrix and runs cusolverDn on it.
   target_link_libraries(vgpucusolvermg PRIVATE vgpucusolver)
   # cuFFT's LTO callbacks: the callback image's PTX is read (fatbin.cpp) and
@@ -758,7 +820,7 @@ if(CUDA_ABI_INCLUDE)
   # ---------------------------------------------------------------------------
   set(_nvcomp_map "${CMAKE_BINARY_DIR}/maps/libnvcomp.so.5.map")
   file(WRITE "${_nvcomp_map}"
-       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; };\n  local: *;\n};\n")
+       "{\n  global: nvcomp*; _ZTVN6nvcomp*; _ZTIN6nvcomp*; _ZTSN6nvcomp*;\n  extern \"C++\" { nvcomp::*; nvcompGzipStreaming*; };\n  local: *;\n};\n")
   add_library(vgpunvcomp SHARED nvidia/src/nvcomp_api.cpp nvidia/src/nvcomp_codecs.cpp
               nvidia/src/nvcomp_gdeflate.cpp nvidia/src/nvcomp_manager.cpp)
   target_link_libraries(vgpunvcomp PRIVATE vgpucudart)
@@ -977,7 +1039,10 @@ libcutensor.2.7.0 {
     message(STATUS "NVENC header at ${NVENC_INCLUDE}: building libvgpunvenc")
     add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp)
     target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
-    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE})
+    # nvenc_api.cpp includes cuda_runtime.h: with the toolkit outside the
+    # compiler's default include path (NVIDIA's repository installs under
+    # /usr/local/cuda-X.Y) it is only found through CUDA_ABI_INCLUDE.
+    target_include_directories(vgpunvenc PRIVATE ${NVENC_INCLUDE} ${CUDA_ABI_INCLUDE} nvidia/src)
     set_target_properties(vgpunvenc PROPERTIES OUTPUT_NAME nvidia-encode SOVERSION 1)
     add_custom_command(TARGET vgpunvenc POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
@@ -987,6 +1052,46 @@ libcutensor.2.7.0 {
   else()
     message(STATUS "nvEncodeAPI.h not found: skipping libvgpunvenc")
   endif()
+
+  # ---------------------------------------------------------------------------
+  # libvgpunvcuvid: NVDEC's API (cuvid*), presented as libnvcuvid.so.1. Motion
+  # JPEG is decoded on the host by the nvJPEG library's codec, compiled in here
+  # (hidden: only cuvid* is exported); every other codec reports itself
+  # unsupported. The Video Codec SDK headers are vendored in
+  # nvidia/third_party/nvdec_include.
+  # ---------------------------------------------------------------------------
+  if(EXISTS "${CMAKE_SOURCE_DIR}/nvidia/third_party/nvdec_include/nvcuvid.h")
+    set(_nvcuvid_map "${CMAKE_BINARY_DIR}/maps/libnvcuvid.so.1.map")
+    file(WRITE "${_nvcuvid_map}" "{\n  global: cuvid*;\n  local: *;\n};\n")
+    add_library(vgpunvcuvid SHARED nvidia/src/nvcuvid_api.cpp nvidia/src/nvjpeg_api.cpp)
+    target_link_libraries(vgpunvcuvid PRIVATE vgpu vgpucudart)
+    target_include_directories(vgpunvcuvid PRIVATE ${CUDA_ABI_INCLUDE} nvidia/third_party/nvdec_include)
+    set_target_properties(vgpunvcuvid PROPERTIES OUTPUT_NAME nvcuvid SOVERSION 1 VERSION 1.0)
+    target_link_options(vgpunvcuvid PRIVATE "-Wl,--version-script=${_nvcuvid_map}")
+    add_custom_command(TARGET vgpunvcuvid POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcuvid.so.1.0"
+              "${CMAKE_BINARY_DIR}/shim/libnvcuvid.so.1"
+      COMMENT "Creating NVDEC shim symlink (build/shim/libnvcuvid.so.1)")
+  endif()
+
+  # libvgpunvcomp_cpu: nvCOMP's CPU library (libnvcomp_cpu.so.5), the GDeflate
+  # compressor and decompressor that run on the host. It carries its own copy of
+  # the GDeflate codec and exports only gdeflate::*.
+  set(_nvcomp_cpu_map "${CMAKE_BINARY_DIR}/maps/libnvcomp_cpu.so.5.map")
+  file(WRITE "${_nvcomp_cpu_map}"
+       "{\n  global:\n    extern \"C++\" { gdeflate::*; };\n  local: *;\n};\n")
+  add_library(vgpunvcomp_cpu SHARED nvidia/src/nvcomp_cpu_api.cpp nvidia/src/nvcomp_codecs.cpp nvidia/src/nvcomp_gdeflate.cpp)
+  target_include_directories(vgpunvcomp_cpu PRIVATE ${CUDA_ABI_INCLUDE} include nvidia/src)
+  set_target_properties(vgpunvcomp_cpu PROPERTIES OUTPUT_NAME nvcomp_cpu SOVERSION 5 VERSION 5.3)
+  target_link_options(vgpunvcomp_cpu PRIVATE "-Wl,--version-script=${_nvcomp_cpu_map}")
+  add_custom_command(TARGET vgpunvcomp_cpu POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp_cpu.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp_cpu.so.5"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "../libnvcomp_cpu.so.5.3"
+            "${CMAKE_BINARY_DIR}/shim/libnvcomp_cpu.so"
+    COMMENT "Creating nvCOMP CPU shim symlinks (build/shim/libnvcomp_cpu.so.5)")
 else()
   message(STATUS "CUDA ABI headers not found: skipping libvgpucudart (core unaffected)")
 endif()
@@ -1042,6 +1147,8 @@ vgpu_unit_test(test_exec3)
 vgpu_unit_test(test_hopper)
 # Blackwell (sm_100a): Tensor Memory and tcgen05, against the ISA's figures.
 vgpu_unit_test(test_blackwell)
+# Rubin (sm_107a): the forms of PTX ISA 9.4, from the documentation alone.
+vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
 # Distributed shared memory: blocks of a cluster reaching each other's.
@@ -1081,6 +1188,9 @@ add_test(NAME host_cpus COMMAND ${CMAKE_SOURCE_DIR}/tests/host_cpus/run_host_cpu
 vgpu_unit_test(test_amd_codeobject amd/tests/unit/test_codeobject.cpp)
 target_compile_definitions(test_amd_codeobject PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # CDNA machine code, decoded and checked against what the assembler wrote.
+# The H.264 and HEVC writers behind NVENC, read back by decoders of their own.
+vgpu_unit_test(test_nvenc_h264 nvidia/tests/unit/test_nvenc_h264.cpp)
+vgpu_unit_test(test_nvenc_hevc nvidia/tests/unit/test_nvenc_hevc.cpp)
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
@@ -1277,6 +1387,12 @@ vgpu_unit_test(test_robustness)
 target_include_directories(test_robustness PRIVATE nvidia/src)
 target_sources(test_robustness PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(test_robustness PRIVATE ${CMAKE_DL_LIBS})
+# Which cubin the driver picks from a fatbin: sm_XYa SASS runs on XY alone, so
+# a B300 (10.3) or Vera Rubin (10.7) falls back to the fatbin's PTX.
+vgpu_unit_test(test_pick_cubin)
+target_include_directories(test_pick_cubin PRIVATE nvidia/src)
+target_sources(test_pick_cubin PRIVATE nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
+target_link_libraries(test_pick_cubin PRIVATE ${CMAKE_DL_LIBS})
 # The PTX linker (-rdc builds, nvJitLink) and the fatbin writer and container
 # readers (nvFatbin, nvJitLink's object and library inputs), with no toolkit.
 vgpu_unit_test(test_ptx_link)
@@ -1809,19 +1925,33 @@ if(TARGET vgpucublas)
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
                           "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
-                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp"
+                          "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
                           "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
-                          "dnn_graph:cudnn" "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "cutensor_paths:cutensor"
-                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet")
+                          "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_frontend:cudnn"
+                          "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
+                          "dnn_attn_dropout:cudnn" "cutensor_paths:cutensor"
+                          "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_decomp_paths:cutensornet"
+                          "solver_metis_paths:cusolver:cusparse"
+                          "blas_u8gemm_paths:cublas" "blas_emulation_paths:cublas" "sparse_color_paths:cusparse"
+                          "lt_emulation_paths:cublasLt:cublas")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh ${_name} ${_parts})
+    # The FP8 and block-scaled matmuls need a GPU that has them (an A100 has no FP8 kernel).
+    set(_env "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}")
+    if(_name STREQUAL "lt_paths")
+      list(APPEND _env "VGPU_E2E_GPU=nvidia/h100")
+    elseif(_name STREQUAL "lt_blockscaled_paths")
+      list(APPEND _env "VGPU_E2E_GPU=nvidia/b200")
+    elseif(_name STREQUAL "dnn_fp8_attention" OR _name STREQUAL "dnn_fp8_attention_frontend")
+      list(APPEND _env "VGPU_E2E_GPU=nvidia/h100")   # cuDNN's FP8 attention is Hopper's and Blackwell's
+    endif()
     set_tests_properties(e2e_${_name} PROPERTIES
-      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      ENVIRONMENT "${_env}"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
@@ -1833,7 +1963,8 @@ if(TARGET vgpucublas)
   # and cusolverMg (solver_mg_paths.cu), which spreads a matrix over both, as
   # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles, and cuFFT's multi-GPU
   # descriptors (fft_multigpu.cu).
-  foreach(_check IN ITEMS "driver_gaps:cuda" "runtime_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft")
+  foreach(_check IN ITEMS "driver_gaps:cuda" "driver_context_gaps:cuda" "driver_texture_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
+                          "runtime_memory_gaps:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft" "dnn_multigpu_norm:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -1885,6 +2016,15 @@ if(TARGET vgpucublas)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # An sm_XYa cubin on the GPUs that do and do not run it: a B300 and a Vera Rubin fall back to the
+  # fatbin's PTX, a Hopper has nothing to run.
+  add_test(NAME e2e_arch_specific_cubins
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_arch_specific.sh)
+  set_tests_properties(e2e_arch_specific_cubins PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_rdc_link
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_link.sh)
   set_tests_properties(e2e_rdc_link PROPERTIES
@@ -1922,6 +2062,19 @@ if(TARGET vgpucublas)
     set_tests_properties(e2e_nvenc PROPERTIES
       DEPENDS vgpunvenc
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};NVENC_INCLUDE=${NVENC_INCLUDE}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
+
+  # NVDEC's cuvid API (Motion JPEG), against what an RTX 3060's libnvcuvid printed
+  # and the NV12 pixels it wrote (nvidia/tests/data/nvdec).
+  if(TARGET vgpunvcuvid)
+    add_test(NAME e2e_nvcuvid
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvcuvid.sh)
+    set_tests_properties(e2e_nvcuvid PROPERTIES
+      DEPENDS vgpunvcuvid
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endif()
 
@@ -2157,6 +2310,30 @@ if(TARGET vgpucublas)
     TIMEOUT 300)
 endif()
 
+# cuFFT's legacy callbacks: NOT_IMPLEMENTED from libcufft.so's replacement, as from NVIDIA's (the
+# static route, which works on a card, cannot run on the simulator: see the script).
+if(TARGET vgpucufft)
+  add_test(NAME e2e_fft_legacy_callbacks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_legacy_callbacks.sh)
+  set_tests_properties(e2e_fft_legacy_callbacks PROPERTIES
+    DEPENDS vgpucufft
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
+endif()
+
+# cuFFT's LTO callbacks as LTO-IR (nvcc -dlto), which the simulator turns into machine
+# code with the host toolkit's libnvJitLink.
+if(TARGET vgpucufft)
+  add_test(NAME e2e_fft_lto_callbacks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_fft_lto_callbacks.sh)
+  set_tests_properties(e2e_fft_lto_callbacks PROPERTIES
+    DEPENDS vgpucufft
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+endif()
+
 # A program profiling itself through CUPTI, which is how every profiler reads a
 # CUDA program. Checks the records describe the work that was actually issued.
 if(TARGET vgpucupti)
@@ -2187,6 +2364,19 @@ if(TARGET vgpucupti)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 
+  # The narrow-precision library probes (FP8, MXFP8, NVFP4; nvidia/docs/lowprec.md): each prints
+  # one line per descriptor, and the lines are compared with what NVIDIA's own library printed on a
+  # real GPU for the same program (an L4, an RTX 3060: nvidia/tests/data/lowprec/<probe>.<profile>.txt).
+  foreach(_probe IN ITEMS lt sparselt cvt ptx120)
+    add_test(NAME e2e_lowprec_${_probe}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lowprec.sh ${_probe})
+    set_tests_properties(e2e_lowprec_${_probe} PROPERTIES
+      DEPENDS "vgpucudart;vgpucublaslt;vgpucusparselt"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 900)
+  endforeach()
+
   # External correlation ids, which a framework's profiler uses to tie a kernel
   # to the operator that launched it.
   add_test(NAME e2e_cupti_extcorr
@@ -2196,6 +2386,20 @@ if(TARGET vgpucupti)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
+
+  # The rest of what a profiler reads: the parameter structures of runtime calls,
+  # allocation and pool records, graphs, modules and streams, and the switches
+  # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
+  # an RTX 3060 (nvidia/docs/cupti.md).
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um)
+    add_test(NAME e2e_cupti_${_case}
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
+    set_tests_properties(e2e_cupti_${_case} PROPERTIES
+      DEPENDS vgpucupti
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
 
   # The same for a program that uses only the driver API: the driver calls, the
   # kernels, copies, fills and waits they issue, and the context and streams.
@@ -2275,6 +2479,30 @@ set_tests_properties(e2e_texture_mipmaps PROPERTIES
 # component, bit for bit with an RTX 3060.
 add_test(NAME e2e_texture_gather COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_gather.sh)
 set_tests_properties(e2e_texture_gather PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Texture operands beyond a plain fetch -- offsets, a depth reference, the destination
+# predicate, half-precision results, tld4 on layered, cube and cube-array textures, and
+# signed 8-bit normalized filtering -- bit for bit with an RTX 3060.
+add_test(NAME e2e_texture_forms COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_forms.sh)
+set_tests_properties(e2e_texture_forms PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# Formatted surface stores (sust.p): the values converted to every surface format, bit for bit
+# with an RTX 3060.
+add_test(NAME e2e_surface_formatted COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_surface_formatted.sh)
+set_tests_properties(e2e_surface_formatted PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# PTX ISA 9.2's packed integer instructions on a simulated RTX 5090, SASS and PTX, against a host loop.
+add_test(NAME e2e_packed_int_forms COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_packed_int_forms.sh)
+set_tests_properties(e2e_packed_int_forms PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
@@ -2739,6 +2967,16 @@ if(TARGET vgpucudart)
   add_test(NAME e2e_dnn_paths COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_dnn_paths.sh)
   set_tests_properties(e2e_dnn_paths PROPERTIES
     DEPENDS "vgpucudart;vgpucudnn;vgpucublas"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # cuBLASLt's matmul and cuDNN's graph-API convolution inside a captured CUDA
+  # graph, as PyTorch's CUDA graphs call them: recorded, run at each launch over
+  # what the graph's own kernels wrote (run_graph_capture_libs.sh --card runs
+  # the same program against NVIDIA's libraries).
+  add_test(NAME e2e_graph_capture_libs COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_graph_capture_libs.sh)
+  set_tests_properties(e2e_graph_capture_libs PROPERTIES
+    DEPENDS "vgpucudart;vgpucudnn;vgpucublaslt"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)

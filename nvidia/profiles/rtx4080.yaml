@@ -1,0 +1,57 @@
+# VirtualGPU device profile: NVIDIA GeForce RTX 4080 (Ada Lovelace, AD103, sm_89).
+# Public values; verified: false -- nothing here has been measured on a card.
+# Where each value comes from:
+#   - compute capability 8.9: NVIDIA's CUDA GPUs table (developer.nvidia.com/cuda-gpus).
+#   - SMs 76: NVIDIA Ada GPU Architecture whitepaper, Appendix B, Table 3 (RTX 4080 16 GB: 76 SMs, 9728 CUDA Cores at 128 an SM, 304 Tensor Cores).
+#   - memory 16 GB GDDR6X, 22.4 Gbps, 256-bit, 716.8 GB/s, boost clock 2505 MHz and 320 W Total Graphics Power: the same table. NVIDIA's "GB" for graphics memory is binary (see rtx2080ti.yaml),
+#     so vram_bytes is 16384 MiB; a real card's nvidia-smi total is a little smaller, so this is an upper bound.
+#   - PCI device 0x2704, "NVIDIA GeForce RTX 4080", from the name table in NVIDIA's open GPU kernel modules (g_nv_name_released.h,
+#     main at ca2d03e, 2026-10-07).
+#   - Per-SM limits are compute capability 8.9's, the same as nvidia/l4 and nvidia/l40s, which were read from physical cards.
+id: nvidia/rtx4080
+vendor: nvidia
+model: "NVIDIA GeForce RTX 4080"
+architecture: ada
+compute_capability: "8.9"
+warp_size: 32
+vram_bytes: 17179869184          # 16384 MiB; an upper bound, as for the B200
+verified: false
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 64]
+  max_grid_dim: [2147483647, 65535, 65535]
+  shared_mem_per_block_bytes: 49152
+  shared_mem_per_block_optin_bytes: 101376
+  registers_per_block: 65536
+  multiprocessors: 76
+  registers_per_sm: 65536
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  max_registers_per_thread: 255
+  shared_mem_per_sm: 102400
+  l2_cache_bytes: 67108864
+features:
+  fp16: true
+  bf16: true
+  fp64: true
+  tensor_cores: true
+
+# Presentation-only values for monitoring tools (nvidia-smi / vgpu smi).
+# NOT used by the execution engine -- VirtualGPU does not model performance.
+telemetry:
+  framebuffer_mb: 16384          # 16 GB in MiB; not measured on a card
+  power_limit_w: 320             # Total Graphics Power (Ada whitepaper, Table 3)
+  sm_clock_max_mhz: 2505         # boost clock (Ada whitepaper, Table 3)
+  mem_clock_max_mhz: 11200       # half the published 22.4 Gbps data rate; nvidia-smi reports 1 MHz more on real cards
+  pci_vendor_id: 4318            # 0x10DE NVIDIA
+  pci_device_id: 9988            # 0x2704 [GeForce RTX 4080]
+  ecc: false                     # GeForce: no ECC
+  memory: gddr                   # GDDR6X
+  pcie_link: "Gen4 x16"          # Ada whitepaper, Table 3: PCI Express Gen 4; x16 is the slot the card is built for
+
+# What CUDA reports of the card beyond its limits (cudaDeviceProp, cuDeviceGetAttribute).
+# L2 65536 KB and the 256-bit memory interface: NVIDIA Ada GPU Architecture whitepaper, Table 3. Persisting L2 is 3/4 of the L2 (50331648),
+# the ratio nvidia/l40s measured; NVIDIA does not publish it, so this is derived, unverified.
+cuda:
+  memory_bus_width_bits: 256
+  persisting_l2_bytes: 50331648

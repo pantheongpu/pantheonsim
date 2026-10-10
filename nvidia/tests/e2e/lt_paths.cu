@@ -225,11 +225,13 @@ static void fp8_scaled() {
   check(e < 1e-2, "E4M3 A^T B with row-wise (outer-vector) scales", e);
 
   // A block scale on A with an outer-vector one on B is refused, not
-  // approximated (lt_blockscaled_paths.cu has the block-scaled modes).
+  // approximated (lt_blockscaled_paths.cu has the block-scaled modes). Modes of different
+  // families cannot go together: INVALID_VALUE, as an L4's cuBLASLt 13.3 answers
+  // (nvidia/tests/data/lowprec/lt.l4.txt, scalemix group).
   const int32_t block = 2;  // CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0
   CK(cublasLtMatmulDescSetAttribute(desc, (cublasLtMatmulDescAttributes_t)31, &block, sizeof block));
   check(cublasLtMatmul(lt, desc, &alpha, da, L.a, db, L.b, &beta, dd, L.c, dd, L.d, nullptr, nullptr, 0, 0) ==
-            CUBLAS_STATUS_NOT_SUPPORTED,
+            CUBLAS_STATUS_INVALID_VALUE,
         "a block scale on A alone is refused", 0);
   cublasLtMatmulDescDestroy(desc);
   cublasLtMatmulPreferenceDestroy(pref);

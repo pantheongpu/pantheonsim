@@ -14,8 +14,13 @@
 // torchvision.io.decode_jpeg uses on CUDA), and the decoupled, three-phase one
 // (nvjpegDecodeJpegHost / TransferToDevice / Device, and nvjpegDecodeJpeg) with
 // its streams, decoder states, buffers and decode parameters (output format,
-// region of interest, CMYK). 12-bit samples, arithmetic coding, hierarchical
-// and lossless JPEG are refused by name (NVJPEG_STATUS_JPEG_NOT_SUPPORTED).
+// region of interest, CMYK). Lossless frames and samples of any precision but
+// 8 bits parse -- the card reports their encoding and precision -- and are
+// refused at decode (NVJPEG_STATUS_JPEG_NOT_SUPPORTED, as on the card);
+// arithmetic coding, differential frames and hierarchical streams are refused
+// by name at the parse as well. The card's lossless backend (batched API,
+// 16-bit output) answers wrongly after the first ~40 bytes of entropy-coded
+// data, which cannot be reproduced, so it is refused too.
 //
 // What a decode produces was checked against NVIDIA's nvJPEG 13.0 on an RTX
 // 3060, sample for sample: the inverse DCT is a single-precision one rounded
@@ -48,6 +53,8 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+
+#include "nvjpeg_codec.hpp"
 
 namespace {
 
@@ -235,6 +242,13 @@ struct Image {
   bool quant_set[4] = {false, false, false, false};
   HuffTable dc[4], ac[4];
   int scans = 0;
+  // False for what the parser reads and the decoder refuses: lossless frames
+  // and samples of any precision but 8 bits (NVJPEG_STATUS_JPEG_NOT_SUPPORTED
+  // at decode, though the card parses them: see parse_jpeg).
+  bool decodable = true;
+  // Every APPn segment in file order, payload only (the APP markers a
+  // transcode carries over; COM is not one of them).
+  std::vector<std::pair<uint8_t, std::vector<uint8_t>>> apps;
   bool frame() const { return !comps.empty(); }
 };
 
@@ -419,13 +433,14 @@ int exif_orientation(const uint8_t* s, int n) {
 // before its first scan, is NVJPEG_STATUS_INCOMPLETE_BITSTREAM; one cut short
 // inside entropy-coded data decodes what is there and succeeds; bytes where a
 // marker must be are NVJPEG_STATUS_JPEG_NOT_SUPPORTED.
-nvjpegStatus_t parse_jpeg(const uint8_t* data, size_t len, Image* im, bool decode) {
+nvjpegStatus_t parse_jpeg(const uint8_t* data, size_t len, Image* im, bool decode, bool full_parse = false) {
   if (!data) return NVJPEG_STATUS_INVALID_PARAMETER;
   if (len < 2) return NVJPEG_STATUS_INCOMPLETE_BITSTREAM;
   if (data[0] != 0xFF || data[1] != 0xD8) return NVJPEG_STATUS_BAD_JPEG;
   size_t i = 2;
   const auto u16 = [&](size_t at) { return static_cast<int>(data[at]) << 8 | data[at + 1]; };
   bool sof_supported = true;
+  bool hierarchical = false;
   for (;;) {
     if (i >= len) break;
     if (data[i] != 0xFF) return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;
@@ -440,8 +455,9 @@ nvjpegStatus_t parse_jpeg(const uint8_t* data, size_t len, Image* im, bool decod
     if (i + seglen > len) return NVJPEG_STATUS_INCOMPLETE_BITSTREAM;
     const uint8_t* seg = data + i + 2;
     const int segn = seglen - 2;
+    if (marker >= 0xE0 && marker <= 0xEF) im->apps.emplace_back(marker, std::vector<uint8_t>(seg, seg + segn));
     switch (marker) {
-      case 0xC0: case 0xC1: case 0xC2: {
+      case 0xC0: case 0xC1: case 0xC2: case 0xC3: {
         if (im->frame()) return NVJPEG_STATUS_BAD_JPEG;   // a second frame
         if (segn < 6) return NVJPEG_STATUS_BAD_JPEG;
         im->encoding = marker;
@@ -465,7 +481,11 @@ nvjpegStatus_t parse_jpeg(const uint8_t* data, size_t len, Image* im, bool decod
         // 17 GB of planes. Refuse it here rather than in the allocator.
         if (im->width <= 0 || im->height <= 0 || static_cast<int64_t>(im->width) * im->height > 268435456LL)
           return NVJPEG_STATUS_BAD_JPEG;
-        if (im->precision != 8) sof_supported = false;   // 12-bit samples
+        // The card parses these and refuses to decode them (NVJPEG_STATUS_
+        // JPEG_NOT_SUPPORTED): lossless frames and samples of any precision
+        // but 8 bits, whatever the frame type. It reports the frame's own
+        // encoding and precision, and the components as for any other.
+        if (im->precision != 8 || marker == 0xC3) sof_supported = false;
         im->mcus_x = (im->width + im->hmax * 8 - 1) / (im->hmax * 8);
         im->mcus_y = (im->height + im->vmax * 8 - 1) / (im->vmax * 8);
         for (Component& co : im->comps) {
@@ -474,9 +494,14 @@ nvjpegStatus_t parse_jpeg(const uint8_t* data, size_t len, Image* im, bool decod
         }
         break;
       }
-      case 0xC3: case 0xC5: case 0xC6: case 0xC7:
+      case 0xC5: case 0xC6: case 0xC7:
       case 0xC9: case 0xCA: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
-        return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;   // lossless, arithmetic, hierarchical
+        return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;   // differential and arithmetic frames
+      case 0xDE:   // DHP, the hierarchical frame header
+        // The header parsers skip it (nvjpegGetImageInfo, ParseHeader); the
+        // stream parse and every decode refuse the stream at its first scan.
+        hierarchical = true;
+        break;
       case 0xC4: {   // DHT
         int p = 0;
         while (p < segn) {
@@ -527,8 +552,10 @@ nvjpegStatus_t parse_jpeg(const uint8_t* data, size_t len, Image* im, bool decod
         break;
       case 0xDA: {   // SOS: the entropy-coded data follows the segment
         if (!im->frame()) return NVJPEG_STATUS_BAD_JPEG;
-        if (!sof_supported) return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;
+        im->decodable = sof_supported && !hierarchical;
+        if (hierarchical && (decode || full_parse)) return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;
         if (!decode) return NVJPEG_STATUS_SUCCESS;
+        if (!sof_supported) return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;
         if (segn < 1) return NVJPEG_STATUS_BAD_JPEG;
         const int ns = seg[0];
         if (ns < 1 || ns > 4 || segn < 4 + 2 * ns) return NVJPEG_STATUS_BAD_JPEG;
@@ -881,6 +908,11 @@ struct Stream {
   std::vector<uint8_t> data;
   Image header;
   bool parsed = false;
+  bool attempted = false;   // a parse was tried, and perhaps failed
+  // What nvjpegJpegStreamParse(save_metadata) kept: every APPn segment, in
+  // file order. With save_metadata 0 only the markers are kept, with no
+  // payload (nvjpegEncoderParamsCopyMetadata then writes them empty).
+  std::vector<std::pair<uint8_t, std::vector<uint8_t>>> metadata;
 };
 
 struct DecodeParams {
@@ -1095,6 +1127,10 @@ struct EncoderParams {
   unsigned restart = 0;
   bool custom_quant = false;   // tables copied from a parsed image
   uint16_t quant[2][64] = {{0}};
+  // nvjpegEncoderParamsCopyMetadata: the APPn segments of a parsed stream,
+  // which replace the encoder's JFIF header.
+  bool copy_metadata = false;
+  std::vector<std::pair<uint8_t, std::vector<uint8_t>>> apps;
 };
 struct EncoderState {
   std::string bitstream;
@@ -1291,17 +1327,31 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
 
   BitWriter e;
   e.marker(0xD8);
-  // JFIF APP0, which is what every decoder expects to see first.
-  e.marker(0xE0);
-  e.word(16);
-  for (char ch : {'J', 'F', 'I', 'F', '\0'}) e.byte(static_cast<uint8_t>(ch));
-  e.byte(1);
-  e.byte(1);
-  e.byte(0);
-  e.word(1);
-  e.word(1);
-  e.byte(0);
-  e.byte(0);
+  // The encoder's own JFIF APP0 -- which is what every decoder expects to see
+  // first -- unless the APPn segments copied from a parsed stream include an
+  // APP0 (a JFXX one counts: measured on nvJPEG 13.0), which then takes its
+  // place among them; the copied segments follow, verbatim and in file order.
+  bool app0 = false;
+  if (prm.copy_metadata)
+    for (const auto& a : prm.apps) app0 = app0 || a.first == 0xE0;
+  if (!app0) {
+    e.marker(0xE0);
+    e.word(16);
+    for (char ch : {'J', 'F', 'I', 'F', '\0'}) e.byte(static_cast<uint8_t>(ch));
+    e.byte(1);
+    e.byte(1);
+    e.byte(0);
+    e.word(1);
+    e.word(1);
+    e.byte(0);
+    e.byte(0);
+  }
+  if (prm.copy_metadata)
+    for (const auto& a : prm.apps) {
+      e.marker(a.first);
+      e.word(static_cast<int>(a.second.size()) + 2);
+      for (uint8_t b : a.second) e.byte(b);
+    }
   for (int t = 0; t < (gray ? 1 : 2); ++t) {
     e.marker(0xDB);
     e.word(2 + 65);
@@ -1426,21 +1476,29 @@ VGPU_EXPORT nvjpegStatus_t nvjpegCreateSimple(nvjpegHandle_t* handle) {
 }
 // The hardware backends need the JPEG engine an A100 or H100 has and an RTX
 // 3060 does not; there the card's library answers NVJPEG_STATUS_ARCH_MISMATCH,
-// and so does this one, on every profile.
+// and so does this one, on every profile. A backend outside the enum is
+// NVJPEG_STATUS_INVALID_PARAMETER; every other one, the lossless backend
+// included, makes a handle (measured on nvJPEG 13.0, backends -1 to 7).
 static bool hardware_backend(int b) { return b == 3 || b == 5; }   // NVJPEG_BACKEND_HARDWARE(_DEVICE)
+static nvjpegStatus_t create_with_backend(nvjpegBackend_t backend, nvjpegHandle_t* handle) {
+  const int b = static_cast<int>(backend);
+  if (!handle) return NVJPEG_STATUS_INVALID_PARAMETER;
+  if (b < 0 || b > 6) return NVJPEG_STATUS_INVALID_PARAMETER;
+  if (hardware_backend(b)) return NVJPEG_STATUS_ARCH_MISMATCH;
+  const nvjpegStatus_t st = nvjpegCreateSimple(handle);
+  if (st == NVJPEG_STATUS_SUCCESS) reinterpret_cast<Handle*>(*handle)->backend = b;
+  return st;
+}
 VGPU_EXPORT nvjpegStatus_t nvjpegCreate(nvjpegBackend_t backend, nvjpegDevAllocator_t*, nvjpegHandle_t* handle) {
-  if (hardware_backend(backend)) return NVJPEG_STATUS_ARCH_MISMATCH;
-  return nvjpegCreateSimple(handle);
+  return create_with_backend(backend, handle);
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegCreateEx(nvjpegBackend_t backend, nvjpegDevAllocator_t*, nvjpegPinnedAllocator_t*,
                                           unsigned int, nvjpegHandle_t* handle) {
-  if (hardware_backend(backend)) return NVJPEG_STATUS_ARCH_MISMATCH;
-  return nvjpegCreateSimple(handle);
+  return create_with_backend(backend, handle);
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegCreateExV2(nvjpegBackend_t backend, nvjpegDevAllocatorV2_t*, nvjpegPinnedAllocatorV2_t*,
                                             unsigned int, nvjpegHandle_t* handle) {
-  if (hardware_backend(backend)) return NVJPEG_STATUS_ARCH_MISMATCH;
-  return nvjpegCreateSimple(handle);
+  return create_with_backend(backend, handle);
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegDestroy(nvjpegHandle_t h) { return destroy<Handle>(h, Kind::Handle); }
 VGPU_EXPORT nvjpegStatus_t nvjpegGetProperty(libraryPropertyType type, int* value) {
@@ -1514,7 +1572,10 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecode(nvjpegHandle_t h, nvjpegJpegState_t s, c
                                         size_t length, nvjpegOutputFormat_t fmt, nvjpegImage_t* dst,
                                         cudaStream_t stream) {
   if (!known(h, Kind::Handle) || !known(s, Kind::State) || !dst || !data) return NVJPEG_STATUS_INVALID_PARAMETER;
-  if (static_cast<int>(fmt) < 0 || static_cast<int>(fmt) > kOutYUY2) return NVJPEG_STATUS_INVALID_PARAMETER;
+  // The 16-bit interleaved output belongs to the lossless backend's batched
+  // decode: nvjpegDecode refuses it for every image, before it looks at one.
+  if (static_cast<int>(fmt) < 0 || static_cast<int>(fmt) > kOutYUY2 || static_cast<int>(fmt) == kOutUnchangedU16)
+    return NVJPEG_STATUS_INVALID_PARAMETER;
   Image im;
   nvjpegStatus_t st = parse_jpeg(data, length, &im, /*decode=*/true);
   if (st != NVJPEG_STATUS_SUCCESS) return st;
@@ -1537,7 +1598,11 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecodeBatchedInitialize(nvjpegHandle_t h, nvjpe
                                                          int max_cpu_threads, nvjpegOutputFormat_t fmt) {
   if (!known(h, Kind::Handle) || !known(s, Kind::State)) return NVJPEG_STATUS_INVALID_PARAMETER;
   if (batch_size <= 0 || max_cpu_threads <= 0) return NVJPEG_STATUS_INVALID_PARAMETER;
-  if (static_cast<int>(fmt) < 0 || static_cast<int>(fmt) > kOutYUY2 || static_cast<int>(fmt) == kOutUnchangedU16)
+  // The lossless backend takes the 16-bit interleaved output and nothing else;
+  // every other backend takes anything but that (measured, nvJPEG 13.0).
+  const bool lossless = reinterpret_cast<Handle*>(h)->backend == 6;
+  if (static_cast<int>(fmt) < 0 || static_cast<int>(fmt) > kOutYUY2 ||
+      (static_cast<int>(fmt) == kOutUnchangedU16) != lossless)
     return NVJPEG_STATUS_INVALID_PARAMETER;
   auto& st = *reinterpret_cast<State*>(s);
   st.batch_size = batch_size;
@@ -1554,6 +1619,19 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecodeBatched(nvjpegHandle_t h, nvjpegJpegState
     return NVJPEG_STATUS_INVALID_PARAMETER;
   auto& st = *reinterpret_cast<State*>(s);
   if (st.batch_size <= 0) return NVJPEG_STATUS_INVALID_PARAMETER;
+  // The lossless backend decodes lossless JPEG only: NVIDIA's answers
+  // NVJPEG_STATUS_JPEG_NOT_SUPPORTED for a lossy image, and for a lossless one
+  // returns samples that are right for the first ~40 bytes of entropy-coded
+  // data and wrong after (and zeros for a restart interval, and refuses every
+  // predictor but 1) -- nothing a simulator can reproduce. Lossless JPEG is
+  // refused with the same status.
+  if (reinterpret_cast<Handle*>(h)->backend == 6) {
+    for (int i = 0; i < st.batch_size; ++i)
+      if (!data[i]) return NVJPEG_STATUS_INVALID_PARAMETER;
+    if (!quiet())
+      std::fprintf(stderr, "[vgpu] nvJPEG: lossless JPEG decode is not supported by VirtualGPU\n");
+    return NVJPEG_STATUS_JPEG_NOT_SUPPORTED;
+  }
   cudaStreamSynchronize(stream);
   nvjpegStatus_t first = NVJPEG_STATUS_SUCCESS;
   for (int i = 0; i < st.batch_size; ++i) {
@@ -1605,25 +1683,34 @@ VGPU_EXPORT nvjpegStatus_t nvjpegJpegStreamCreate(nvjpegHandle_t h, nvjpegJpegSt
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegJpegStreamDestroy(nvjpegJpegStream_t js) { return destroy<Stream>(js, Kind::Stream); }
 
-static nvjpegStatus_t stream_parse(nvjpegHandle_t h, const unsigned char* data, size_t length, nvjpegJpegStream_t js) {
+static nvjpegStatus_t stream_parse(nvjpegHandle_t h, const unsigned char* data, size_t length, nvjpegJpegStream_t js,
+                                   int save_metadata = 0, bool full = true) {
   if (!known(h, Kind::Handle) || !known(js, Kind::Stream) || !data) return NVJPEG_STATUS_INVALID_PARAMETER;
   auto& s = *reinterpret_cast<Stream*>(js);
   s.parsed = false;
+  s.attempted = true;
+  s.metadata.clear();
   s.header = Image{};
-  const nvjpegStatus_t st = parse_jpeg(data, length, &s.header, /*decode=*/false);
+  const nvjpegStatus_t st = parse_jpeg(data, length, &s.header, /*decode=*/false, full);
   if (st != NVJPEG_STATUS_SUCCESS) return st;
+  s.metadata = s.header.apps;
+  if (!save_metadata)
+    for (auto& m : s.metadata) m.second.clear();
   // The data is kept, whatever save_stream says: the decode reads it later.
   s.data.assign(data, data + length);
   s.parsed = true;
   return NVJPEG_STATUS_SUCCESS;
 }
-VGPU_EXPORT nvjpegStatus_t nvjpegJpegStreamParse(nvjpegHandle_t h, const unsigned char* data, size_t length, int, int,
-                                                 nvjpegJpegStream_t js) {
-  return stream_parse(h, data, length, js);
+VGPU_EXPORT nvjpegStatus_t nvjpegJpegStreamParse(nvjpegHandle_t h, const unsigned char* data, size_t length,
+                                                 int save_metadata, int, nvjpegJpegStream_t js) {
+  return stream_parse(h, data, length, js, save_metadata);
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegJpegStreamParseHeader(nvjpegHandle_t h, const unsigned char* data, size_t length,
                                                        nvjpegJpegStream_t js) {
-  return stream_parse(h, data, length, js);
+  const nvjpegStatus_t st = stream_parse(h, data, length, js, 0, /*full=*/false);
+  // A header parse looks no further than the frame: nothing to carry over.
+  if (st == NVJPEG_STATUS_SUCCESS) reinterpret_cast<Stream*>(js)->metadata.clear();
+  return st;
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegJpegStreamParseTables(nvjpegHandle_t h, const unsigned char* data, size_t length,
                                                        nvjpegJpegStream_t js) {
@@ -1739,9 +1826,12 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecodeParamsSetExifOrientation(nvjpegDecodePara
 
 VGPU_EXPORT nvjpegStatus_t nvjpegDecoderCreate(nvjpegHandle_t h, nvjpegBackend_t backend, nvjpegJpegDecoder_t* d) {
   if (!known(h, Kind::Handle) || !d) return NVJPEG_STATUS_INVALID_PARAMETER;
-  if (hardware_backend(backend)) return NVJPEG_STATUS_ARCH_MISMATCH;
-  if (static_cast<int>(backend) == 6) return NVJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED;   // lossless
-  if (static_cast<int>(backend) < 0 || static_cast<int>(backend) > 6) return NVJPEG_STATUS_INVALID_PARAMETER;
+  // A decoder takes the default, hybrid and GPU-hybrid backends whatever the
+  // handle's backend; the hardware one is an engine this GPU lacks, and the
+  // device-input and lossless ones are not decoders (INVALID_PARAMETER on the
+  // card, backends -1 to 8 measured).
+  if (static_cast<int>(backend) == 3) return NVJPEG_STATUS_ARCH_MISMATCH;
+  if (static_cast<int>(backend) < 0 || static_cast<int>(backend) > 2) return NVJPEG_STATUS_INVALID_PARAMETER;
   auto* dec = new Decoder();
   dec->backend = backend;
   *d = reinterpret_cast<nvjpegJpegDecoder_t>(track(dec, Kind::Decoder));
@@ -1754,25 +1844,28 @@ VGPU_EXPORT nvjpegStatus_t nvjpegDecoderStateCreate(nvjpegHandle_t h, nvjpegJpeg
   return NVJPEG_STATUS_SUCCESS;
 }
 
-// Whether a decoder takes a stream: 0 for yes (the API's convention), as the
-// card answered for baseline, progressive, grey and CMYK alike.
-static int supported(const Stream* s) {
-  if (!s) return 1;
-  const Image& im = s->header;
-  return im.precision == 8 && (im.encoding == 0xC0 || im.encoding == 0xC1 || im.encoding == 0xC2) &&
-                 im.comps.size() != 2
-             ? 0
-             : 1;
+// Whether a decoder takes a stream: the flag is 0 for yes, as the card
+// answered for baseline, progressive, extended-sequential, grey and CMYK
+// alike, and 2 for what it parses and will not decode (lossless frames, and
+// samples of any precision but 8 bits). A stream that was never parsed is 2 as
+// well, and one whose parse failed 7 -- except for the batched queries, which
+// answer 0 for it (all measured on nvJPEG 13.0, the status always 0).
+static int supported_flag(const Stream* s, bool batched) {
+  if (!s->parsed) {
+    if (!s->attempted) return 2;
+    return batched ? 0 : 7;
+  }
+  return s->header.decodable ? 0 : 2;
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegDecoderJpegSupported(nvjpegJpegDecoder_t d, nvjpegJpegStream_t js,
                                                       nvjpegDecodeParams_t, int* is_supported) {
-  if (!known(d, Kind::Decoder) || !parsed(js) || !is_supported) return NVJPEG_STATUS_INVALID_PARAMETER;
-  *is_supported = supported(parsed(js));
+  if (!known(d, Kind::Decoder) || !known(js, Kind::Stream) || !is_supported) return NVJPEG_STATUS_INVALID_PARAMETER;
+  *is_supported = supported_flag(reinterpret_cast<Stream*>(js), false);
   return NVJPEG_STATUS_SUCCESS;
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegDecodeBatchedSupported(nvjpegHandle_t h, nvjpegJpegStream_t js, int* is_supported) {
-  if (!known(h, Kind::Handle) || !parsed(js) || !is_supported) return NVJPEG_STATUS_INVALID_PARAMETER;
-  *is_supported = supported(parsed(js));
+  if (!known(h, Kind::Handle) || !known(js, Kind::Stream) || !is_supported) return NVJPEG_STATUS_INVALID_PARAMETER;
+  *is_supported = supported_flag(reinterpret_cast<Stream*>(js), true);
   return NVJPEG_STATUS_SUCCESS;
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegDecodeBatchedSupportedEx(nvjpegHandle_t h, nvjpegJpegStream_t js,
@@ -1923,9 +2016,9 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncoderStateCreate(nvjpegHandle_t h, nvjpegEnco
 }
 // NVJPEG_ENC_BACKEND_HARDWARE needs a JPEG engine: NVJPEG_STATUS_ARCH_MISMATCH,
 // as on an RTX 3060.
-// (nvjpegEncBackend_t is CUDA 13's; CUDA 12.0's header has neither it nor
-// this function.)
-#if NVJPEG_VER_MAJOR >= 13
+// (nvjpegEncBackend_t and this function arrived in nvJPEG 12.4, CUDA 12.8; the
+// headers of CUDA 12.0 to 12.6 have neither, and declare it with the enum there.)
+#if NVJPEG_VER_MAJOR >= 13 || (NVJPEG_VER_MAJOR == 12 && NVJPEG_VER_MINOR >= 4)
 #define VGPU_ENC_BACKEND nvjpegEncBackend_t
 #else
 #define VGPU_ENC_BACKEND int
@@ -2140,12 +2233,22 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncoderParamsCopyQuantizationTables(nvjpegEncod
   prm.custom_quant = true;
   return NVJPEG_STATUS_SUCCESS;
 }
-// Metadata (JFIF, EXIF) is not carried over: the encoder writes its own JFIF
-// header. Huffman tables are the encoder's own, standard or optimised.
+// The APPn segments (JFIF, Exif, XMP, ICC, Adobe, ...) of a stream parsed with
+// save_metadata come with the encoder, in file order, ahead of the encoder's
+// own JFIF header -- which is dropped if one of them is an APP0. COM segments
+// are not carried. Parsed with save_metadata 0, the stream remembers only
+// which APP markers it saw, and the encoder writes each of them with an empty
+// payload (a length of 2). A stream never parsed, or parsed with
+// nvjpegJpegStreamParseHeader, has none: the call succeeds and copies
+// nothing. A second call replaces the first, and the copy outlives the
+// stream. All measured on nvJPEG 13.0.
 VGPU_EXPORT nvjpegStatus_t nvjpegEncoderParamsCopyMetadata(nvjpegEncoderState_t st, nvjpegEncoderParams_t p,
                                                            nvjpegJpegStream_t js, cudaStream_t) {
-  if (!known(st, Kind::EncoderState) || !known(p, Kind::EncoderParams) || !parsed(js))
+  if (!known(st, Kind::EncoderState) || !known(p, Kind::EncoderParams) || !known(js, Kind::Stream))
     return NVJPEG_STATUS_INVALID_PARAMETER;
+  auto& prm = *reinterpret_cast<EncoderParams*>(p);
+  prm.copy_metadata = true;
+  prm.apps = reinterpret_cast<Stream*>(js)->metadata;
   return NVJPEG_STATUS_SUCCESS;
 }
 VGPU_EXPORT nvjpegStatus_t nvjpegEncoderParamsCopyHuffmanTables(nvjpegEncoderState_t st, nvjpegEncoderParams_t p,
@@ -2154,3 +2257,32 @@ VGPU_EXPORT nvjpegStatus_t nvjpegEncoderParamsCopyHuffmanTables(nvjpegEncoderSta
     return NVJPEG_STATUS_INVALID_PARAMETER;
   return NVJPEG_STATUS_SUCCESS;
 }
+
+/* ======================================================================== */
+/* The decoder for the other libraries                                      */
+/* ======================================================================== */
+
+namespace vgpu_jpeg {
+
+bool decode_planes(const uint8_t* data, size_t length, Decoded* out) {
+  Image im;
+  if (parse_jpeg(data, length, &im, /*decode=*/true) != NVJPEG_STATUS_SUCCESS || !im.decodable) return false;
+  if (im.comps.size() != 1 && im.comps.size() != 3) return false;
+  out->width = im.width;
+  out->height = im.height;
+  out->hmax = im.hmax;
+  out->vmax = im.vmax;
+  out->planes.clear();
+  for (Component& c : im.comps) {
+    Plane p;
+    p.h_samp = c.h;
+    p.v_samp = c.v;
+    p.width = c.bw * 8;
+    p.height = c.bh * 8;
+    p.data = std::move(c.plane);
+    out->planes.push_back(std::move(p));
+  }
+  return true;
+}
+
+}  // namespace vgpu_jpeg

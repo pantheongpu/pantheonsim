@@ -1,0 +1,24 @@
+# configuring counters
+  kind 1, one device: CUPTI_SUCCESS
+  kind 2, one device: CUPTI_SUCCESS
+  kind 3, one device: CUPTI_SUCCESS
+  kind 4, one device: CUPTI_SUCCESS
+  kind 5, one device: CUPTI_SUCCESS
+  kind 6, one device: CUPTI_SUCCESS
+  kind 7, one device: CUPTI_SUCCESS
+  kind 8, one device: CUPTI_SUCCESS
+  kind 9, one device: CUPTI_SUCCESS
+  two kinds, all devices: CUPTI_SUCCESS
+  none of a non-null list: CUPTI_ERROR_INVALID_PARAMETER
+  kind 0: CUPTI_SUCCESS
+  kind 100: CUPTI_SUCCESS
+  scope 0: CUPTI_SUCCESS
+  scope 9: CUPTI_SUCCESS
+  disabling: CUPTI_SUCCESS
+  device 77: CUPTI_SUCCESS
+  nothing: CUPTI_ERROR_INVALID_PARAMETER
+  a null list: CUPTI_ERROR_INVALID_PARAMETER
+enable the kind: CUPTI_ERROR_NOT_READY
+enable it again: CUPTI_ERROR_NOT_READY
+disable it: CUPTI_ERROR_NOT_READY
+# end

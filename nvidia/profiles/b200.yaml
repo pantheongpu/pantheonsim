@@ -44,7 +44,7 @@ telemetry:
   mem_clock_max_mhz: 4000
   temperature_max_c: 90
   pci_vendor_id: 4318          # 0x10DE NVIDIA
-  pci_device_id: 10497        # 0x2901 [B200] -- not in the local pci.ids; public listing
+  pci_device_id: 10497        # 0x2901 [B200] -- NVIDIA's open GPU kernel modules name table (g_nv_name_released.h)
   ecc: true                    # supported and on by default (NVIDIA datasheet)
   memory: hbm                  # rows are remapped on failure
   memory_temperature: true     # reported on every real run in the benchmark database

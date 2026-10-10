@@ -1,0 +1,197 @@
+CB cudaGetDeviceCount ENTER count=set
+CB cudaGetDeviceCount EXIT ret=0
+CB cudaGetDevice ENTER device=set
+CB cudaGetDevice EXIT ret=0
+CB cudaDeviceGetAttribute ENTER value=set attr=1 device=0
+CB cudaDeviceGetAttribute EXIT ret=0
+CB cudaRuntimeGetVersion ENTER runtimeVersion=set
+CB cudaRuntimeGetVersion EXIT ret=0
+CB cudaDriverGetVersion ENTER driverVersion=set
+CB cudaDriverGetVersion EXIT ret=0
+CB cudaDeviceGetLimit ENTER pValue=set limit=0
+CB cudaDeviceGetLimit EXIT ret=0
+CB cudaDeviceGetStreamPriorityRange ENTER leastPriority=set greatestPriority=set
+CB cudaDeviceGetStreamPriorityRange EXIT ret=0
+CB cudaDeviceGetCacheConfig ENTER pCacheConfig=set
+CB cudaDeviceGetCacheConfig EXIT ret=0
+CB cudaMemGetInfo ENTER free=set total=set
+CB cudaMemGetInfo EXIT ret=0
+CB cudaDeviceGetPCIBusId ENTER pciBusId=set len=32 device=0
+CB cudaDeviceGetPCIBusId EXIT ret=0
+CB cudaDeviceGetByPCIBusId ENTER device=set pciBusId=set
+CB cudaDeviceGetByPCIBusId EXIT ret=0
+CB cudaStreamCreateWithFlags ENTER pStream=set flags=1
+CB cudaStreamCreateWithFlags EXIT ret=0
+CB cudaStreamCreateWithPriority ENTER pStream=set flags=0 priority=0
+CB cudaStreamCreateWithPriority EXIT ret=0
+CB cudaStreamGetFlags ENTER hStream=set flags=set
+CB cudaStreamGetFlags EXIT ret=0
+CB cudaStreamGetPriority ENTER hStream=set priority=set
+CB cudaStreamGetPriority EXIT ret=0
+CB cudaStreamQuery ENTER stream=set
+CB cudaStreamQuery EXIT ret=0
+CB cudaStreamIsCapturing ENTER stream=set pCaptureStatus=set
+CB cudaStreamIsCapturing EXIT ret=0
+CB cudaEventCreateWithFlags ENTER event=set flags=2
+CB cudaEventCreateWithFlags EXIT ret=0
+CB cudaEventRecord ENTER event=set stream=set
+CB cudaEventRecord EXIT ret=0
+CB cudaEventSynchronize ENTER event=set
+CB cudaEventSynchronize EXIT ret=0
+CB cudaStreamWaitEvent ENTER stream=set event=set flags=0
+CB cudaStreamWaitEvent EXIT ret=0
+CB cudaStreamAddCallback ENTER stream=set callback=set userData=null flags=0
+CB cudaStreamAddCallback EXIT ret=0
+CB cudaLaunchHostFunc ENTER stream=set fn=set userData=null
+CB cudaLaunchHostFunc EXIT ret=0
+CB cudaStreamSynchronize ENTER stream=set
+CB cudaStreamSynchronize EXIT ret=0
+CB cudaEventDestroy ENTER event=set
+CB cudaEventDestroy EXIT ret=0
+CB cudaMalloc ENTER devPtr=set size=4096
+CB cudaMalloc EXIT ret=0
+CB cudaMalloc ENTER devPtr=set size=4096
+CB cudaMalloc EXIT ret=0
+CB cudaMallocPitch ENTER devPtr=set pitch=set width=100 height=8
+CB cudaMallocPitch EXIT ret=0
+CB cudaMallocManaged ENTER devPtr=set size=4096 flags=1
+CB cudaMallocManaged EXIT ret=0
+CB cudaHostAlloc ENTER pHost=set size=4096 flags=2
+CB cudaHostAlloc EXIT ret=0
+CB cudaHostGetDevicePointer ENTER pDevice=set pHost=set flags=0
+CB cudaHostGetDevicePointer EXIT ret=0
+CB cudaHostGetFlags ENTER pFlags=set pHost=set
+CB cudaHostGetFlags EXIT ret=0
+CB cudaPointerGetAttributes ENTER attributes=set ptr=set
+CB cudaPointerGetAttributes EXIT ret=0
+CB cudaMemset ENTER devPtr=set value=0 count=4096
+CB cudaMemset EXIT ret=0
+CB cudaMemsetAsync ENTER devPtr=set value=0 count=4096 stream=set
+CB cudaMemsetAsync EXIT ret=0
+CB cudaMemset2D ENTER devPtr=set pitch=512 value=0 width=100 height=8
+CB cudaMemset2D EXIT ret=0
+CB cudaMemcpy ENTER dst=set src=set count=256 kind=1
+CB cudaMemcpy EXIT ret=0
+CB cudaMemcpyAsync ENTER dst=set src=set count=256 kind=2 stream=set
+CB cudaMemcpyAsync EXIT ret=0
+CB cudaMemcpy2D ENTER dst=set dpitch=256 src=set spitch=256 width=128 height=4 kind=3
+CB cudaMemcpy2D EXIT ret=0
+CB cudaMemcpy2DAsync ENTER dst=set dpitch=256 src=set spitch=256 width=128 height=4 kind=3 stream=set
+CB cudaMemcpy2DAsync EXIT ret=0
+CB cudaMemcpyToSymbol ENTER symbol=set src=set count=16 offset=0 kind=1
+CB cudaMemcpyToSymbol EXIT ret=0
+CB cudaMemcpyFromSymbol ENTER dst=set symbol=set count=16 offset=0 kind=2
+CB cudaMemcpyFromSymbol EXIT ret=0
+CB cudaGetSymbolAddress ENTER devPtr=set symbol=set
+CB cudaGetSymbolAddress EXIT ret=0
+CB cudaGetSymbolSize ENTER size=set symbol=set
+CB cudaGetSymbolSize EXIT ret=0
+CB cudaMemcpyPeer ENTER dst=set dstDevice=0 src=set srcDevice=0 count=256
+CB cudaMemcpyPeer EXIT ret=0
+CB cudaStreamSynchronize ENTER stream=set
+CB cudaStreamSynchronize EXIT ret=0
+CB cudaFreeHost ENTER ptr=set
+CB cudaFreeHost EXIT ret=0
+CB cudaFree ENTER devPtr=set
+CB cudaFree EXIT ret=0
+CB cudaFree ENTER devPtr=set
+CB cudaFree EXIT ret=0
+CB cudaCreateChannelDesc ENTER x=32 y=0 z=0 w=0 f=2
+CB cudaCreateChannelDesc EXIT
+CB cudaMallocArray ENTER array=set desc=set width=16 height=16 flags=0
+CB cudaMallocArray EXIT ret=0
+CB cudaMemcpy2DToArray ENTER dst=set wOffset=0 hOffset=0 src=set spitch=64 width=64 height=1 kind=1
+CB cudaMemcpy2DToArray EXIT ret=0
+CB cudaMemcpy2DFromArray ENTER dst=set dpitch=64 src=set wOffset=0 hOffset=0 width=64 height=1 kind=2
+CB cudaMemcpy2DFromArray EXIT ret=0
+CB cudaFreeArray ENTER array=set
+CB cudaFreeArray EXIT ret=0
+CB cudaDeviceGetDefaultMemPool ENTER memPool=set device=0
+CB cudaDeviceGetDefaultMemPool EXIT ret=0
+CB cudaMemPoolCreate ENTER memPool=set poolProps=set
+CB cudaMemPoolCreate EXIT ret=0
+CB cudaMemPoolSetAttribute ENTER memPool=set attr=4 value=set
+CB cudaMemPoolSetAttribute EXIT ret=0
+CB cudaMemPoolGetAttribute ENTER memPool=set attr=4 value=set
+CB cudaMemPoolGetAttribute EXIT ret=0
+CB cudaMallocFromPoolAsync ENTER ptr=set size=65536 memPool=set stream=set
+CB cudaMallocFromPoolAsync EXIT ret=0
+CB cudaFreeAsync ENTER devPtr=set hStream=set
+CB cudaFreeAsync EXIT ret=0
+CB cudaStreamSynchronize ENTER stream=set
+CB cudaStreamSynchronize EXIT ret=0
+CB cudaMemPoolTrimTo ENTER memPool=set minBytesToKeep=0
+CB cudaMemPoolTrimTo EXIT ret=0
+CB cudaMemPoolDestroy ENTER memPool=set
+CB cudaMemPoolDestroy EXIT ret=0
+CB cudaMallocAsync ENTER devPtr=set size=4096 hStream=set
+CB cudaMallocAsync EXIT ret=0
+CB cudaFreeAsync ENTER devPtr=set hStream=set
+CB cudaFreeAsync EXIT ret=0
+CB cudaStreamSynchronize ENTER stream=set
+CB cudaStreamSynchronize EXIT ret=0
+CB cudaFuncSetCacheConfig ENTER func=set cacheConfig=0
+CB cudaFuncSetCacheConfig EXIT ret=0
+CB cudaFuncSetAttribute ENTER func=set attr=8 value=1024
+CB cudaFuncSetAttribute EXIT ret=0
+CB cudaFuncGetAttributes ENTER attr=set func=set
+CB cudaFuncGetAttributes EXIT ret=0
+CB cudaOccupancyMaxActiveBlocksPerMultiprocessor ENTER numBlocks=set func=set blockSize=128 dynamicSMemSize=0
+CB cudaOccupancyMaxActiveBlocksPerMultiprocessor EXIT ret=0
+CB cudaLaunchKernel ENTER func=set gridDim=<12 bytes> blockDim=<12 bytes> args=set sharedMem=0 stream=set
+CB cudaLaunchKernel EXIT ret=0
+CB cudaLaunchKernel ENTER func=set gridDim=<12 bytes> blockDim=<12 bytes> args=set sharedMem=0 stream=set
+CB cudaLaunchKernel EXIT ret=0
+CB cudaStreamSynchronize ENTER stream=set
+CB cudaStreamSynchronize EXIT ret=0
+CB cudaGraphCreate ENTER pGraph=set flags=0
+CB cudaGraphCreate EXIT ret=0
+CB cudaGraphCreate ENTER pGraph=set flags=0
+CB cudaGraphCreate EXIT ret=0
+CB cudaGraphAddKernelNode ENTER pGraphNode=set graph=set pDependencies=null numDependencies=0 pNodeParams=set
+CB cudaGraphAddKernelNode EXIT ret=0
+CB cudaGraphAddEmptyNode ENTER pGraphNode=set graph=set pDependencies=set numDependencies=1
+CB cudaGraphAddEmptyNode EXIT ret=0
+CB cudaGraphAddMemsetNode ENTER pGraphNode=set graph=set pDependencies=set numDependencies=1 pMemsetParams=set
+CB cudaGraphAddMemsetNode EXIT ret=0
+CB cudaGraphAddMemcpyNode1D ENTER pGraphNode=set graph=set pDependencies=set numDependencies=1 dst=set src=set count=64 kind=3
+CB cudaGraphAddMemcpyNode1D EXIT ret=0
+CB cudaGraphAddEmptyNode ENTER pGraphNode=set graph=set pDependencies=null numDependencies=0
+CB cudaGraphAddEmptyNode EXIT ret=0
+CB cudaGraphAddChildGraphNode ENTER pGraphNode=set graph=set pDependencies=set numDependencies=1 childGraph=set
+CB cudaGraphAddChildGraphNode EXIT ret=0
+CB cudaGraphGetNodes ENTER graph=set nodes=null numNodes=set
+CB cudaGraphGetNodes EXIT ret=0
+CB cudaGraphGetNodes ENTER graph=set nodes=set numNodes=set
+CB cudaGraphGetNodes EXIT ret=0
+CB cudaGraphNodeGetType ENTER node=set pType=set
+CB cudaGraphNodeGetType EXIT ret=0
+CB cudaGraphClone ENTER pGraphClone=set originalGraph=set
+CB cudaGraphClone EXIT ret=0
+CB cudaGraphNodeFindInClone ENTER pNode=set originalNode=set clonedGraph=set
+CB cudaGraphNodeFindInClone EXIT ret=0
+CB cudaGraphInstantiate ENTER pGraphExec=set graph=set flags=0
+CB cudaGraphInstantiate EXIT ret=0
+CB cudaGraphLaunch ENTER graphExec=set stream=set
+CB cudaGraphLaunch EXIT ret=0
+CB cudaStreamSynchronize ENTER stream=set
+CB cudaStreamSynchronize EXIT ret=0
+CB cudaGraphExecDestroy ENTER graphExec=set
+CB cudaGraphExecDestroy EXIT ret=0
+CB cudaGraphDestroyNode ENTER node=set
+CB cudaGraphDestroyNode EXIT ret=0
+CB cudaGraphDestroy ENTER graph=set
+CB cudaGraphDestroy EXIT ret=0
+CB cudaGraphDestroy ENTER graph=set
+CB cudaGraphDestroy EXIT ret=0
+CB cudaGraphDestroy ENTER graph=set
+CB cudaGraphDestroy EXIT ret=0
+CB cudaStreamDestroy ENTER stream=set
+CB cudaStreamDestroy EXIT ret=0
+CB cudaStreamDestroy ENTER stream=set
+CB cudaStreamDestroy EXIT ret=0
+CB cudaFree ENTER devPtr=set
+CB cudaFree EXIT ret=0
+CB cudaFree ENTER devPtr=set
+CB cudaFree EXIT ret=0
+# end

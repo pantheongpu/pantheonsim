@@ -7,6 +7,11 @@
 # !! table, so it collides with no NVIDIA part, and is below 0x8000 because CUDA reports
 # !! (device << 16 | vendor) as a signed int. Replace it
 # !! when NVIDIA publishes one, as the MI300X and MI350X placeholders are.
+# !! Rechecked 2026-10-09 against main (ca2d03e, 2026-10-07): still no Rubin entry in the
+# !! name table. The driver source does name Rubin dies (GR100, GR102) and publishes two
+# !! RANGES of self-hosted Rubin device ids (detect-self-hosted.h: 0x3040-0x307f for GR100,
+# !! 0x30c0-0x30ff for GR102), but no id for a named product, so no single value can be
+# !! taken from it. 0x7F10 is in neither range.
 #
 # Where each value comes from:
 #   - compute capability 10.7: NVIDIA's CUDA 13.4 release notes, cuBLAS, "Added

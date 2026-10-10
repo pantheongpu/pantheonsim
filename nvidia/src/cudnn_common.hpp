@@ -57,6 +57,8 @@ inline size_t type_bytes(cudnnDataType_t t) {
     case CUDNN_DATA_INT64: return 8;
     case CUDNN_DATA_INT8:
     case CUDNN_DATA_UINT8:
+    case CUDNN_DATA_FP8_E4M3:
+    case CUDNN_DATA_FP8_E5M2:
     case CUDNN_DATA_BOOLEAN: return 1;
     default: return 4;  // FLOAT, INT32, and the packed INT8x4/UINT8x4
   }
@@ -66,7 +68,7 @@ inline bool storable(cudnnDataType_t t) {
   switch (t) {
     case CUDNN_DATA_FLOAT: case CUDNN_DATA_DOUBLE: case CUDNN_DATA_HALF: case CUDNN_DATA_BFLOAT16:
     case CUDNN_DATA_INT8: case CUDNN_DATA_UINT8: case CUDNN_DATA_INT32: case CUDNN_DATA_INT64:
-    case CUDNN_DATA_BOOLEAN:
+    case CUDNN_DATA_BOOLEAN: case CUDNN_DATA_FP8_E4M3: case CUDNN_DATA_FP8_E5M2:
       return true;
     default: return false;
   }
@@ -206,25 +208,36 @@ void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, cons
               std::vector<double>* out, Accum acc);
 
 // A dropout descriptor, which the classic API's dropout calls and the RNN
-// API both take. The generator's position (seed, elements drawn so far) lives
-// in the caller's states buffer when there is one, as cuDNN keeps its
-// generator there: cudnnRestoreDropoutDescriptor then resumes where the
-// buffer says, and a fresh cudnnSetDropoutDescriptor starts over.
+// API both take. The generator lives in the caller's states buffer, as
+// cuDNN keeps it there: one XORWOW state (cuRAND's, 48 bytes) per thread of
+// the dropout kernel, each seeded as curand_init(seed, thread, 0) seeds it.
+// cudnnRestoreDropoutDescriptor then resumes where the buffer says, and a
+// fresh cudnnSetDropoutDescriptor starts over.
 struct DropoutDesc {
   float p = 0.0f;
   void* states = nullptr;
   size_t state_bytes = 0;
   unsigned long long seed = 0;
-  uint64_t drawn = 0;  // when there is no states buffer to keep it in
+  size_t threads = 0;            // the kernel's generators, for the device it was set on
+  std::vector<uint32_t> local;   // their states (12 words each), when there is no states buffer
 };
 
+// The generators cuDNN's dropout kernel runs on the current device, and the
+// bytes of states they take (cudnnDropoutGetStatesSize). Measured on an RTX
+// 3060 (28 SMs): 21504 generators, 1032192 bytes, that is 768 per SM; other
+// devices follow the same rule here without a measurement to confirm it.
+size_t dropout_threads();
+inline size_t dropout_states_bytes() { return dropout_threads() * 48; }
+// Seeds the descriptor's generators: into its states buffer when it has one
+// (the words cuDNN writes; its padding word is left as it was), else into
+// the descriptor. False if the buffer cannot be written.
+bool dropout_seed(DropoutDesc* d);
 // Draws n keep (1) / drop (0) decisions, each kept with probability 1 - p,
-// from the descriptor's generator, and advances it. Not NVIDIA's generator:
-// the masks differ from the hardware's, though the fraction kept and the
-// reseeding are cuDNN's. (cudnn_common.cpp)
+// from the descriptor's generators, and advances them -- cuDNN's own draw,
+// measured on an RTX 3060 against its states buffer: element i is thread
+// i % threads's next XORWOW output, kept when curand_uniform of it exceeds p.
+// (cudnn_common.cpp)
 bool dropout_draw(DropoutDesc* d, size_t n, std::vector<uint8_t>* keep);
-// The state a states buffer holds: the seed, and how many have been drawn.
-struct DropoutState { unsigned long long seed; uint64_t drawn; };
 
 // Waits for what the program queued on the handle's stream: this library
 // computes on the host, and the inputs must be there first.
@@ -235,4 +248,23 @@ void sync_handle(cudnnHandle_t h);
 // (cudnn_api.cpp)
 void clear_tensor(cudnnTensorDescriptor_t d);
 
+// cudnnReorderFilterAndBias's permutation of an INT8x32 filter, measured on
+// the RTX 3060 by reordering filters whose bytes count their own positions
+// (K 4 to 96, C 32 and 64, 1x1 to 3x3): the filter is a [K][L] byte matrix
+// (L = C/32 * R * S * 32) cut into 32-byte column chunks; the output holds
+// chunk 0 of every row first, then chunk 1, ..., each as groups of 8 rows,
+// and within a group output vector j (0..7), lane l takes row
+// 8g + j/4 + 2((l%16)/4), byte (j%4)*8 + (l/16)*4 + l%4 of the chunk. Rows
+// past K (K not a multiple of 8) come out as zeros. Calls f(output byte,
+// source byte or -1).
+template <class F>
+inline void x32_filter_map(int64_t K, int64_t L, size_t bytes, F&& f) {
+  const int64_t G = (K + 7) / 8;
+  for (size_t d = 0; d < bytes; ++d) {
+    const int64_t l = static_cast<int64_t>(d % 32), t = static_cast<int64_t>(d / 32);
+    const int64_t j = t % 8, g = (t / 8) % G, c = t / 8 / G;
+    const int64_t row = g * 8 + j / 4 + 2 * ((l % 16) / 4), col = c * 32 + (j % 4) * 8 + (l / 16) * 4 + l % 4;
+    f(d, row < K && col < L ? row * L + col : -1);
+  }
+}
 }  // namespace vgpu_cudnn

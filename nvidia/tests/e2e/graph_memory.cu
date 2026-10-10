@@ -207,7 +207,10 @@ int main() {
   kkp.kernelParams = keep_args;
   cudaGraphNode_t keep_kern = nullptr;
   CK(cudaGraphAddKernelNode(&keep_kern, keeper, &keep_alloc, 1, &kkp));
-  CK(add_dep(keeper, &keep_alloc, &keep_kern, 1));
+  // The kernel node was added after the allocation node, so that edge exists
+  // already; asking for it again is refused (invalid value on an RTX 3060, CUDA
+  // 13.0 driver), where the test once expected it to be accepted.
+  WANT(add_dep(keeper, &keep_alloc, &keep_kern, 1), cudaErrorInvalidValue);
 
   cudaGraphExec_t keep_exec = nullptr;
   CK(cudaGraphInstantiate(&keep_exec, keeper, 0));
@@ -293,14 +296,14 @@ int main() {
   for (cudaGraphExec_t e : later) CK(cudaGraphExecDestroy(e));
   CK(cudaGraphExecDestroy(sl_exec));
 
-  // Sharing a graph allocation between processes would need a handle type this
-  // does not offer, and the API documents IPC as unsupported for these too.
+  // Sharing a graph allocation between processes would need a handle type the device
+  // does not offer (cudaDevAttrMemoryPoolSupportedHandleTypes is 0): invalid, as on an RTX 3060.
   cudaGraph_t shared = nullptr;
   CK(cudaGraphCreate(&shared, 0));
   cudaMemAllocNodeParams sap = ap;
   sap.poolProps.handleTypes = cudaMemHandleTypePosixFileDescriptor;
   cudaGraphNode_t shared_node = nullptr;
-  WANT(cudaGraphAddMemAllocNode(&shared_node, shared, nullptr, 0, &sap), cudaErrorNotSupported);
+  WANT(cudaGraphAddMemAllocNode(&shared_node, shared, nullptr, 0, &sap), cudaErrorInvalidValue);
 
   CK(cudaGraphExecDestroy(exec));
   CK(cudaGraphExecDestroy(auto_exec));

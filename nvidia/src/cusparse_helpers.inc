@@ -32,9 +32,10 @@
 //   * gebsr2gebsc moves whole blocks (no block is transposed); its index base
 //     is both the input's and the output's.
 //   * csrcolor colors the adjacency graph: neighbours never share a color,
-//     and reordering lists the nodes by color. NVIDIA's coloring algorithm is
-//     undocumented and randomized (a 6-node path gets 11 colors); this one is
-//     greedy, so the colors differ but have the same properties.
+//     rounds stop at `fraction` colored, the rest get colors of their own, and
+//     reordering lists the nodes by color (see csrcolor below). NVIDIA's
+//     hashes are not public, so the colors differ but have the documented
+//     properties.
 
 namespace {
 
@@ -671,11 +672,42 @@ VGPU_GEBSR(Z, cuDoubleComplex)
 namespace {
 struct ColorInfo {};
 
-template <class T>
+// The fraction argument, from where the pointer mode says (single precision
+// for S and C, double for D and Z).
+template <class F>
+F color_fraction(cusparseHandle_t h, const F* p) {
+  if (reinterpret_cast<const Handle*>(h)->mode != CUSPARSE_POINTER_MODE_DEVICE) return *p;
+  F v{};
+  cudaMemcpy(&v, p, sizeof v, cudaMemcpyDeviceToHost);
+  return v;
+}
+
+// Jones-Plassmann-Luby rounds on a fixed hash of the node number: in each
+// round every uncolored node that outranks (or is outranked by) all its
+// uncolored neighbours takes the next color of its kind, an independent set
+// each. The documentation's contract is what is kept and checked
+// (nvidia/tests/e2e/sparse_color_paths.cu, against an RTX 3060's): neighbours
+// never share a color, rounds stop once `fraction` of the nodes are colored
+// and every node left over gets a color of its own, counting on from the last
+// one used; ncolors is the number of colors; `reordering` lists the nodes
+// color by color, each color's nodes in ascending order; the arrays are in
+// the matrix descriptor's index base. NVIDIA's own hash functions and round
+// structure are not public, so the colors themselves differ from its (its
+// numbers are not contiguous either: ncolors there is the largest color plus
+// one, 47 colors in a count of 39 distinct on a 100000-node random graph).
+// Measured on the card (cuSPARSE 12.6.3): a fraction outside [0, 1] is
+// INVALID_VALUE, a symmetric (or any non-general) matrix type is
+// MATRIX_TYPE_NOT_SUPPORTED, m = 0 succeeds and writes nothing, a negative m
+// is INVALID_VALUE, a null reordering is skipped.
+template <class T, class F>
 cusparseStatus_t csrcolor(cusparseHandle_t h, int m, int nnz, cusparseMatDescr_t d, const int* off, const int* col,
-                          const void* fraction, int* ncolors, int* coloring, int* reordering) {
+                          const F* fraction, int* ncolors, int* coloring, int* reordering) {
   if (!known(h)) return CUSPARSE_STATUS_NOT_INITIALIZED;
   if (m < 0 || nnz < 0 || !descr(d) || !fraction || !ncolors || !coloring) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (descr(d)->type != CUSPARSE_MATRIX_TYPE_GENERAL) return CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED;
+  const F f = color_fraction(h, fraction);
+  if (!(f >= F(0) && f <= F(1))) return CUSPARSE_STATUS_INVALID_VALUE;
+  if (m == 0) return CUSPARSE_STATUS_SUCCESS;
   std::vector<int> o, c;
   if (!read_legacy_csr(m, nnz, d, off, col, &o, &c)) return CUSPARSE_STATUS_INVALID_VALUE;
   // The adjacency graph, made symmetric, without self-loops.
@@ -687,26 +719,47 @@ cusparseStatus_t csrcolor(cusparseHandle_t h, int m, int nnz, cusparseMatDescr_t
       adj[(size_t)i].push_back(j);
       adj[(size_t)j].push_back(i);
     }
-  // Greedy, in node order: the smallest color no colored neighbour has. It
-  // colors every node, which is at least the fraction asked for.
+  auto weight = [](int i) {   // a fixed integer hash: the ranking is the same on every run
+    uint32_t x = (uint32_t)i * 2654435761u + 0x9E3779B9u;
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13; x *= 3266489917u; x ^= x >> 16;
+    return x;
+  };
+  auto outranks = [&](int a, int b) { return weight(a) != weight(b) ? weight(a) > weight(b) : a > b; };
   std::vector<int> color((size_t)m, -1);
+  const size_t want = (size_t)std::ceil((double)f * (double)m);
+  size_t colored = 0;
   int used = 0;
+  while (colored < want && colored < (size_t)m) {
+    std::vector<int> high, low;
+    for (int i = 0; i < m; ++i) {
+      if (color[(size_t)i] >= 0) continue;
+      bool is_max = true, is_min = true;
+      for (int j : adj[(size_t)i]) {
+        if (color[(size_t)j] >= 0) continue;
+        if (outranks(j, i)) is_max = false; else is_min = false;
+      }
+      if (is_max) high.push_back(i); else if (is_min) low.push_back(i);
+    }
+    // Chosen against the round's start, so the nodes of one kind never touch.
+    for (const auto* set : {&high, &low}) {
+      if (set->empty()) continue;
+      for (int i : *set) color[(size_t)i] = used;
+      colored += set->size();
+      ++used;
+    }
+  }
+  for (int i = 0; i < m; ++i)
+    if (color[(size_t)i] < 0) color[(size_t)i] = used++;
+  const int base = base_of(d);
+  std::vector<int> out_color((size_t)m), order((size_t)m);
   for (int i = 0; i < m; ++i) {
-    std::vector<char> taken((size_t)used + 1, 0);
-    for (int j : adj[(size_t)i])
-      if (color[(size_t)j] >= 0 && color[(size_t)j] <= used) taken[(size_t)color[(size_t)j]] = 1;
-    int k = 0;
-    while (taken[(size_t)k]) ++k;
-    color[(size_t)i] = k;
-    used = std::max(used, k + 1);
+    out_color[(size_t)i] = color[(size_t)i] + base;
+    order[(size_t)i] = i;
   }
-  if (!put_ints(coloring, color)) return CUSPARSE_STATUS_EXECUTION_FAILED;
-  if (reordering) {
-    std::vector<int> order((size_t)m);
-    for (int i = 0; i < m; ++i) order[(size_t)i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return color[(size_t)x] < color[(size_t)y]; });
-    if (!put_ints(reordering, order)) return CUSPARSE_STATUS_EXECUTION_FAILED;
-  }
+  std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return color[(size_t)x] < color[(size_t)y]; });
+  for (int& v : order) v += base;
+  if (!put_ints(coloring, out_color)) return CUSPARSE_STATUS_EXECUTION_FAILED;
+  if (reordering && !put_ints(reordering, order)) return CUSPARSE_STATUS_EXECUTION_FAILED;
   put_count(h, ncolors, used);
   return CUSPARSE_STATUS_SUCCESS;
 }
@@ -730,7 +783,7 @@ VGPU_EXPORT cusparseStatus_t cusparseDestroyColorInfo(cusparseColorInfo_t info) 
                                                      const T*, const int* off, const int* col,                     \
                                                      const F* fraction, int* ncolors, int* coloring,               \
                                                      int* reordering, const cusparseColorInfo_t) {                 \
-    return csrcolor<T>(h, m, nnz, d, off, col, fraction, ncolors, coloring, reordering);                            \
+    return csrcolor<T, F>(h, m, nnz, d, off, col, fraction, ncolors, coloring, reordering);                            \
   }
 VGPU_COLOR(S, float, float)
 VGPU_COLOR(D, double, double)

@@ -458,6 +458,15 @@ The status snapshot, the inventories and the gap register at the end are new in 
   a kernel gets an mma result out of registers for the next stage. e2e_stmatrix
   checks where every element lands and that a fragment stored by one instruction
   and loaded by the other comes back unchanged.
+- The vector atomics `atom`/`red` `.v2`/`.v4`/`.v8` (PTX ISA 8.1, sm_90; Triton's `tl.atomic_add` on a pair of
+  floats, which Inductor's `scatter_add` uses): `.add` on `.f32` in two or four, `.add`/`.min`/`.max` on `.f16`,
+  `.bf16` in two, four or eight and on `.f16x2`/`.bf16x2` in two or four. Each 32-bit word is its own atomic
+  under the striped lock, the vector aligned to its whole size (`MisalignedAccess` otherwise), in both
+  engines; the SASS twin is REDG/ATOMG's F32x2/F32x4/F16x4/F16x8/BF16x4/BF16x8 forms (decoder checked against
+  nvdisasm for sm_90 to sm_120, `probes/vector_atomics.cu`; `e2e_sass_archs` runs `vector_atomics` on every
+  Hopper and Blackwell profile, SASS and PTX). Derived from the PTX documentation and ptxas's output, not checked on a card
+  (the local cards are sm_86): how a NaN, a subnormal or a signed zero combines follows the scalar atomics'
+  rules and is not asserted by the test.
 - `atom.{exch,cas}.b128` (sm_90): 16 aligned bytes, the operands `.b128`
   register pairs, under the atomics' striped lock. `st.bulk` (sm_100): zeroes
   shared memory, a multiple of 8 bytes up to 16 MiB. `istypep`: false for every
@@ -545,7 +554,9 @@ The status snapshot, the inventories and the gap register at the end are new in 
   inputs and outputs; matches NVIDIA's link byte for byte in code and
   relocations for sm_75-sm_90, and NVIDIA's driver runs its output.
   e2e_nvjitlink_sass, sm_75 to sm_120, passes on the card with either
-  nvJitLink.
+  nvJitLink. The link also drops functions nothing reaches (unless `-g`), honours
+  `-kernels-used`, and carries the modules' debug sections; LTO-IR, index files and SASS beside
+  PTX go to the toolkit's libnvJitLink where one is installed.
 - nvJPEG: progressive decoding, multi-scan and restart handling, CMYK/YCCK,
   NV12/YUY2 output; the batched API torchvision.io.decode_jpeg uses and the
   decoupled three-phase API with streams, decoder states, buffers and decode
@@ -737,9 +748,9 @@ across two physical GPUs. The math runs on the host rather than through the
 interpreter, because a vendor library is not user code — see nvidia/docs/libraries.md
 for the boundary, the per-library scope, and what each one deliberately refuses.
 
-NVRTC works by invoking the toolkit's own nvcc, which runs on the host and
-needs no GPU, so kernels compiled through NVRTC reach the interpreter through
-the driver API like any other PTX. The JIT frameworks are a separate question,
+NVRTC works by calling the toolkit's own libnvrtc (or, without it, nvcc), which runs on the host and
+needs no GPU, so kernels compiled through NVRTC reach the simulator through
+the driver API like any other kernel -- as PTX, or as the cubin of an sm_ target. The JIT frameworks are a separate question,
 because none of them uses NVRTC:
 
 - **Numba works.** It talks to `libcuda` directly and never loads a cudart. It
@@ -885,8 +896,10 @@ narrows what counts as observable, not what the detector looks at.
   skipped on hosts with the real driver libraries): `OUT_OF_SCOPE="rt_virus"` in
   `tests/workloads/run_pantheon_workloads.sh`, docs/pantheon-workloads.md.
   (`media_enc_virus` runs per the prose in that document: `libvgpunvenc`
-  implements NVENC; its status block still lists it as skipped, which is a
-  contradiction inside that document, not here.)
+  implements NVENC, now writing real (lossless PCM) H.264 and HEVC streams that are
+  identical for identical frames, as the workload's golden-bitstream check needs; its
+  status block still lists it as skipped, which is a contradiction inside that
+  document, not here.)
 - Nsight Systems and Nsight Compute as the vendor ships them. `vgpu ncu` is this
   project's own `ncu` (src/cli/ncu.cpp, `e2e_ncu`); `nsys` runs but collects no
   CUDA data (it uses its own bundled CUPTI, see nvidia/docs/cupti.md).
@@ -903,11 +916,8 @@ the sense that something specific is still missing, and each entry says what.
   control flow is not handled, and nothing pins that with a test. (The header
   comment at the top of interpreter.cpp still says barriers in divergent code
   are rejected and IPDOM is planned; it predates the min-PC code and is stale.)
-- cuCtxSetCurrent(NULL) pops the top of the context stack rather than clearing
-  the thread's binding (`nvidia/src/driver_api.cpp:938`; untested -- the
-  neighbouring `cuCtxPopCurrent` is covered by `driver_gaps.cpp`). The stack
-  itself is thread-local (`driver_api.cpp:175`); an earlier version of this
-  entry said it was process-global, which was wrong.
+- (cuCtxSetCurrent(NULL) pops the top of the context stack; the card does the same, measured and checked by
+  `driver_context_gaps`, so this is not a bug.)
 - Reliability: ECC counts by location, retired pages, remapped rows and PCIe
   error counters are injected with `vgpu fault` and read by nvidia-smi, NVML
   and rocm-smi (docs/telemetry.md). `vgpu fault arm` delivers bit flips and
@@ -1659,9 +1669,10 @@ scripts/run-pantheon-workloads.sh.
    measured rounding sides, one exact sum rounded ties-away, 1D as 2D at
    y = 0, the LOD's truncations), and the e2e tests hash tens of thousands
    of results against the hardware's. Refused by name: `tex.grad` (its LOD
-   comes from undocumented approximate units), linear filtering of signed
-   8-bit normalized texels, `tld4` on layered/cubemap textures, anisotropy
-   and resource views. The `.clamp`/`.zero` surface policies are done, as an
+   comes from undocumented approximate units) and textures of BC6H and BC7
+   blocks (BC1 to BC5, 10:10:10:2, resource views, any anisotropy, linear
+   filtering of signed 8-bit normalized texels and `tld4` on layered and
+   cubemap textures are done: nvidia/docs/textures.md). The `.clamp`/`.zero` surface policies are done, as an
    RTX 3060 applies them. See nvidia/docs/textures.md. Border
    colours are done: converted to the texture's format by rules measured over
    280,000 colours (e2e_border_colour, 705 cases). Measuring them turned up
@@ -1706,7 +1717,7 @@ public headers, tested by their authors under ASan + UBSan, and are awaiting CI 
 
 ## Profile inventory (rev 6)
 
-34 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
+45 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles and rev 7 ten more, built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
 profile's values were read from a physical device (see "Hardware characterization").
 
 | id | vendor | arch | cc / gfx | verified |
@@ -1738,6 +1749,16 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `nvidia/a40` | NVIDIA | Ampere | 8.6 | **no** |
 | `nvidia/a30` | NVIDIA | Ampere | 8.0 | **no** (SM count derived from OEM Tensor Core counts) |
 | `nvidia/rtx2080ti` | NVIDIA | Turing | 7.5 | **no** |
+| `nvidia/rtx-pro-6000-server` | NVIDIA | Blackwell | 12.0 | **no** (the g7e part; the rental was not obtained, see nvidia/docs/profiles.md) |
+| `nvidia/rtx-pro-6000-max-q` | NVIDIA | Blackwell | 12.0 | **no** |
+| `nvidia/rtx6000-ada` | NVIDIA | Ada | 8.9 | **no** |
+| `nvidia/rtx-a6000` | NVIDIA | Ampere | 8.6 | **no** |
+| `nvidia/rtx-a5000` | NVIDIA | Ampere | 8.6 | **no** |
+| `nvidia/a100-80gb-pcie` | NVIDIA | Ampere | 8.0 | **no** (limits inherited from the read A100s) |
+| `nvidia/h100-nvl` | NVIDIA | Hopper | 9.0 | **no** (SM count derived from the published FP64 rate) |
+| `nvidia/h200-nvl` | NVIDIA | Hopper | 9.0 | **no** (SM count derived the same way) |
+| `nvidia/rtx4080` | NVIDIA | Ada | 8.9 | **no** |
+| `nvidia/rtx3070` | NVIDIA | Ampere | 8.6 | **no** |
 | `amd/mi325x` | AMD | CDNA3 | gfx942 | yes (rocminfo on a physical card) |
 | `amd/mi300x` | AMD | CDNA3 | gfx942 | **no** |
 | `amd/mi250x` | AMD | CDNA2 | gfx90a | **no** (one die: 110 CUs, 64 GB) |
@@ -1863,25 +1884,31 @@ behaviour, timing).
 
 ### NVIDIA vendor libraries (nvidia/docs/libraries.md "What is not implemented", from line 746)
 
-- **cuBLAS**: `cublasUint8gemmBias`; undeclared exports (`cublas?bdmm`, `Get/SetBackdoor`,
-  `Get/SetEnvironmentMode`); cuBLASXt tiles GEMM only, with no CPU offload; emulation controls are
-  inert. Generated stubs answer `..._NOT_SUPPORTED` and print "is not implemented by VirtualGPU"
+- **cuBLAS**: undeclared exports (`cublas?bdmm`, `Get/SetBackdoor`, `Get/SetEnvironmentMode`);
+  cuBLASXt tiles GEMM only (its CPU share works for GEMM); FP64 fixed-point emulation works under
+  EAGER (FIXED control bit-exact to the card; DYNAMIC chooses its own bit count), BF16x9 does not exist.
+  Generated stubs answer `..._NOT_SUPPORTED` and print "is not implemented by VirtualGPU"
   (nvidia/src/generated/cublas_stubs.cpp:29).
 - **cuBLASLt**: FP8 aux scale/amax, per-batch block scales, UE8M0 modes; the block-scaled modes are
   derived from documentation, not checked against a card.
-- **cuDNN graph API**: interpolating resample, FP8/MXFP8 attention, block masks, sinks in backward
-  attention, INT8x32 reordered filters, multi-GPU norm, MoE/RoPE/band ops, dropout-mask layout; PyTorch's
-  cuDNN graphs with ops beyond convolution, matmul, pointwise, reduction, normalization and pooling are
-  refused at finalize (nvidia/docs/pytorch.md:76-82). **Classic API**: Volta/Turing fused ops, undocumented
-  ops, RNN/attention dropout masks.
+- **cuDNN graph API**: interpolating resample beyond bilinear upsampling by 2 (the one configuration with an
+  engine), FP8/MXFP8 attention, block masks, INT8x32 reordered filters, multi-GPU norm across processes,
+  MoE backward / band ops / standalone RoPE (no engine on the RTX 3060; Hopper/Blackwell unchecked), the fused
+  attention kernels' dropout-mask layout (Philox). Done in round 3: multi-GPU norm (threads of one process),
+  bilinear 2x, classic/RNN/attention dropout bit for bit (cuRAND XORWOW states), SCALE_BIAS_ACTIVATION_WGRAD.
+  **Classic API**: the fused ops marked "reserved for future use", RNN dropout with padded I/O.
 - **cuFFT**: legacy callbacks (`CUFFT_NOT_IMPLEMENTED`), LTO-IR callbacks; multi-GPU layouts measured on
   two GPUs only.
-- **cuSPARSE**: the `csrmv` family, SDDMM conjugate transpose, SpMMOp (LTO-IR), `csrcolor` colours
-  differ from NVIDIA's, `gpsvInterleavedBatch` with algo != 0; solvers compute in double.
+- **cuSPARSE**: SDDMM conjugate transpose (NVIDIA's computes garbage for complex), SpMMOp (LTO-IR),
+  `csrcolor` colours differ from NVIDIA's (documented properties checked on the card),
+  `gpsvInterleavedBatch` with algo != 0 (documented as unsupported); solvers compute in double. The
+  `csrmv` family is not in NVIDIA's CUDA 12/13 libraries, so there is nothing to match.
   **cuSPARSELt**: FP8/FP4, fp16 compute, GELU outside int8.
-- **cuSOLVER**: `Xgeev` left eigenvectors, `csrmetisnd` (no METIS), `csrlsvlu` on device, Mg multi-row
-  grids; a list of measured differences from NVIDIA's output in libraries.md.
-- **cuTENSOR**: block-sparse (not planned), JIT mode is a no-op. **cuTensorNet**: state API, gradients,
+- **cuSOLVER**: `Xgeev` left eigenvectors, `csrlsvlu` on device and Mg multi-row grids (NVIDIA's own
+  library has none of the three); `csrmetisnd` runs a vendored METIS 5.1.0 (77/78 test permutations
+  equal the card's); a list of measured differences from NVIDIA's output in libraries.md.
+- **cuTENSOR**: block-sparse (not planned), JIT mode is a no-op (the card's kernel cache fills after
+  a batched contraction; ours stays empty). **cuTensorNet**: state API, gradients,
   distributed execution, non-gesvd SVD, half-precision decompositions, capture; cuQuantum Python 26.09
   does not start (static cudart).
 - **NCCL**: symmetric-memory windows, the network plugin; stubs that answer `ncclInvalidUsage`:
@@ -1892,46 +1919,78 @@ behaviour, timing).
   NotSupported), LZ4 bitshuffle, checksums, CPU/streaming gzip, the hardware decompression engine.
   **NVSHMEM**: MPI/OpenSHMEM bootstrap, multi-node, proxy transports, multimem, host reductions;
   `NVSHMEM_MAX_TEAMS=32`.
-- **NVRTC**: CUBIN, LTO-IR and OptiX-IR output, precompiled headers, time traces. **nvJitLink**: LTO-IR,
-  SASS+PTX mixes, dead-function removal, re-finalizing sm_100/120, `-G` debug sections, texture refs.
-  **nvFatbin**: compression and `nvFatbinAddIndex`.
-- **NPP**: watershed, marker-label compression, ResizeSqrPixel super-sampling and Lanczos
-  (`NPP_INTERPOLATION_ERROR`). **nvJPEG**: 12-bit, arithmetic, lossless and hierarchical JPEG, the
-  hardware backend, EXIF orientation, transcoding. **NVENC**: unimplemented function-table slots
-  return `NV_ENC_ERR_UNIMPLEMENTED` (nvidia/src/nvenc_api.cpp:348-355). No NVTX or nvcuvid/NVDEC.
+- **NVRTC**: without the toolkit's libnvrtc, LTO-IR, OptiX-IR, Tile IR, precompiled headers and the
+  time traces (refused by name; with it every output is NVIDIA's own). **nvJitLink**: without the
+  toolkit's libnvJitLink, LTO-IR, index files and SASS+PTX mixes (refused by name); re-finalizing
+  sm_100/120 code from the mercury sections (the format is undocumented; the frame table of a dropped
+  function is cleared, not removed, there), legacy texture/surface references, and NVIDIA's shared-memory
+  layout across a kernel and device functions in two modules (valid, not the same offsets).
+  **nvFatbin**: `nvFatbinAddIndex` (NVIDIA's takes an index file no tool can write), and compressed
+  bytes identical to NVIDIA's (the same flags and sizes within a few percent).
+- **NPP**: ResizeSqrPixel super-sampling and Lanczos (`NPP_INTERPOLATION_ERROR`); watershed labels
+  where neighbouring values are equal and 4-way watershed beyond 4x4 are inexact. **nvJPEG**: 12-bit,
+  arithmetic, lossless and hierarchical JPEG (the card refuses or gets them wrong), the hardware
+  backend, EXIF orientation. **NVENC**: AV1, 10-bit and 4:4:4
+  input, P/B pictures and rate control (H.264 and HEVC are lossless PCM IDR pictures). **NVDEC**: every codec but Motion
+  JPEG; progressive JPEG (refused as the card refuses it). **nvCOMP**: Cascaded, Bitcomp and ANS
+  (unpublished bitstreams), the container checksums, `LZ4CPUManager`, LZ4 bitshuffle through the
+  managers. **cuFile**: nvidia-fs DMA. No NVTX.
 - **Device runtime**: `cudaMemcpyAsync`, `cudaMemsetAsync` and `cudaMalloc` from a kernel,
   `cudaFuncGetAttributes`, `cudaDeviceGetAttribute`, occupancy queries and
   `cudaGetParameterBuffer`/`cudaLaunchDevice` (libraries.md:920-928).
 
 ### CUDA runtime and driver (nvidia/src/runtime_api.cpp, driver_api.cpp)
 
-- Memory-pool handle types other than none (runtime_api.cpp:2706, :6959); `cudaHostRegisterReadOnly` (:2855);
-  texture/surface channel kinds (:3295-3366); resource views (:3742); `maxAnisotropy` above 1 (:3754).
-- Graphs: edge data other than the default (:5126, :7291, :7308, :7315, :7515); clone/parent restrictions
-  (:5345-5363, :5770); a CUDA array in a memcpy node (:5931); conditional-graph restrictions (:6199, :6476);
-  child-graph ownership (:7476, :7505); external semaphores not modelled (:7438). Capture modes other than
-  Relaxed (`cudaThreadExchangeStreamCaptureMode` is a stub, :3053).
-- Driver: exec affinity (driver_api.cpp:880), `requestedHandleTypes` (:1330), further stubs (:1485-1500).
-  `cudaDeviceGetAttribute` (runtime_api.cpp:1660) and `cuDeviceGetAttribute` (driver_api.cpp:587) answer 0
-  for an attribute the profile does not model, with a note on stderr.
-- `cuCtxSetCurrent(NULL)` pops instead of clearing (see "Partially implemented").
+Done in round 3 (branch r3-runtime-driver), each against the RTX 3060: capture modes (Global, ThreadLocal, Relaxed and
+`cudaThreadExchangeStreamCaptureMode`: `runtime_capture_modes`); memory-pool handle types, read-only host registration,
+exported VMM memory as a file descriptor (`runtime_memory_gaps`); graph edge data, clone/parent restrictions, a CUDA
+array in a memcpy node, child-graph ownership and external semaphore nodes (`runtime_graph_gaps`); driver contexts, flags,
+ids, exec affinity, limits, multicast stubs (`driver_context_gaps`);
+normalized, block-compressed (BC1 to BC5) and 10:10:10:2 texture formats, resource views and any `maxAnisotropy`, in the
+runtime and the driver (`runtime_texture_gaps`, `driver_texture_gaps`). The conditional-graph restrictions were already
+the card's, an attribute id the device-attribute table does not know is an error (`CUDA_ERROR_INVALID_VALUE`), not a 0,
+and `cuCtxSetCurrent(NULL)` removes the current context from the stack as a pop does -- that is what the card does
+(checked in `driver_context_gaps`), so the old register entries for the last two were not bugs.
+
+Still open:
+
+- BC6H and BC7 decoders (the arrays work; texture objects over them are refused by name). The tables are derivable from
+  the card one partition at a time; the arithmetic must be fitted as BC1 to BC5 were.
+- External memory and semaphore import (needs Vulkan, Direct3D or NvSciBuf; the card's runtime crashes on invalid handles).
+- `cudaOccupancyMaxActiveClusters` and `cudaOccupancyMaxPotentialClusterSize` (SM-to-GPC layout).
 
 ### PTX and SASS execution
 
-- PTX parser: `.ashift`; sm_107 and sm_107f forms (src/ptx/parser.cpp:1790, :1851, :1860, :1884, :2952,
-  :2984-2988); cvt `.rs` for x4; `.hi` for anything but `mul` (:4138); `wmma` kinds other than
-  load/mma/store.d (:2218); multi-sample textures (:4472); `suld`/`sust` `.p` (:4534); `tex.level` LOD (:4480);
-  `tex.grad`, `tld4` on layered/cubemap and with a level (:4478-4498); signed 8-bit normalized linear
-  filtering (src/exec/interpreter.cpp:1326, :1445); anisotropy and resource views (driver_api.cpp:3252, :3261).
-- Device printf: `%ls` and `%n` (include/vgpu/exec/device_printf.hpp:115, :122). TMA: sub-byte im2col and
-  `.b4x16` alignment (include/vgpu/exec/tma.hpp:50, :64); tensor-map restrictions (tensormap.hpp:210, :262, :351).
-- SASS executor (nvidia/docs/sass.md "Coverage"): `LDGMC` (multimem); TMA `im2col::w` (src/sass/exec_ops.inc:3800);
-  texture forms with an LOD clamp, offsets, depth compare or LOD bias (exec_ops.inc:2381-2386);
-  `WARPSYNC.COLLECTIVE` from divergent paths (:2886); some `SYNCS.ARRIVE` modes (:3631, :3661); tcgen05 forms
-  (:4164); a cooperative launch with clusters (src/sass/exec.cpp:818); and five generic "SASS: <op> is not
-  implemented yet" sites (exec_ops.inc:857, :1708, :2141, :2238, :3185).
-- Blackwell (nvidia/docs/blackwell.md): the `tcgen05.alloc` blocking wait (:36) and the refused forms listed at
-  :81, :103, :118, :127, :157, :170, :214, :223, :232-233, :276-292.
+Done in round 3 (branch r3-ptx-sass; each with a test, and the texture, surface and printf ones
+bit for bit against an RTX 3060): the offset, depth-reference, destination-predicate and half-precision
+operands of `tex` and `tld4`, `tld4` on layered, cube and cube-array textures, linear filtering of
+signed 8-bit normalized texels (an exact fit), `sust.p`, device printf `%ls` and `%n`, a cooperative
+launch of clusters on SASS, and -- from PTX ISA 9.4, derived from the documentation and not checked
+against a card (no ptxas or GPU for sm_107) -- `spcompress`/`spdecompress`, `tcgen05.ld{.red}.spcompress`,
+`tcgen05.mma.kind::ti16`, `cvt` `.rz` / `.pzo` / `.scaled::n1::ue8m0`, the packed `.u8x4`/`.s8x4`/`.u16x2`/`.s16x2`
+integer instructions (the SASS side of them on sm_120f compared with a host loop), the four-wide narrow-float
+`add`/`sub`/`mul`/`fma` of sm_100a and sm_103a (PTX engine only: ptxas refuses them), K = 64 for the 8-bit tcgen05 kinds, the 128-lane scale-factor A layout, and UE4M3
+with `.block32`. Not items at all: `wmma` has only `load`, `mma` and `store.d` in the ISA, and `.hi` exists
+only for `mul`, `mad`, `mul24` and `mad24`; the five "not implemented yet" faults in `src/sass/exec_ops.inc`
+are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking wait was done long ago.
+
+Still open, each with the reason:
+
+- `tex.grad`: the level of detail an RTX 3060 derives from gradients fits no formula tried (12,000 fetches
+  measured); `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; anisotropy (changes explicit-level
+  fetches, measured; the runtime accepts any `maxAnisotropy` and does not model that); BC6H and BC7 texture
+  objects (the arrays work; see the runtime and driver section).
+- `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;
+  `.ue5m3x2` and UE5M3 scale factors: the ISA gives no exponent bias; `tcgen05.mma.ashift` and
+  `decompress::lut::b`: only figures; `.kind::mxf4`'s K = 128 and sparsity version 1; K = 128 sparse for the
+  8-bit kinds; the 128-lane A layout over a CTA pair at M = 128.
+- TMA: `im2col::w` / `im2col_no_offs::w` (figures 16-20 only), im2col of packed sub-byte types, interleaved
+  layouts and `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B` (`tensormap.hpp`), a `.b4x16` copy that does not start
+  on a group of 16 (the ISA is silent).
+- SASS executor: `LDGMC` / `multimem` (needs `cuMulticast*`, which are the runtime's and refuse), texture
+  fetches with a LOD bias or clamp and per-texel gather offsets (no PTX produces them), `WARPSYNC.COLLECTIVE`
+  from different paths (no document, no sample), `SYNCS.ARRIVE` modes 6 and 7 and `UTCCP` shapes 1 and 7
+  (no PTX produces them).
 - Static cudart, `cuGetExportTable`: blocked (see "Next milestones" 4; nvidia/docs/dark-api.md).
 - CUPTI (nvidia/docs/cupti.md): per-API activity controls, the timestamp callback and device-side timestamps
   (:70); no Callback API deliveries, no Event or Profiling metrics, nothing derived from time (:121-139).
@@ -2038,21 +2097,17 @@ program that needs nvcc.
 
 `nvidia/tests/pytorch/sweep/known_failures.txt` lists the sweep's checks that do not match the CPU on the
 simulator (nvidia/rtx5090). The CI-wired `e2e_pytorch_sweep` prints each as `XFAIL` with its numbers and fails
-only on a new failure or on a listed one that starts passing (`XPASS`: delete its line). Each is work to do:
+only on a new failure or on a listed one that starts passing (`XPASS`: delete its line). One is left, and it is
+not work for the simulator:
 
-- **Graphs (4 checks)**: capture and replay of cuDNN + cuBLAS, a whole training step, Adam with
-  `capturable=True`, `make_graphed_callables` all fail with "operation failed due to a previous error during
-  capture". Which call errors under stream capture is not identified (cuDNN computes on the host, which a
-  capture cannot record).
-- **torch.compile `reduce-overhead`**: 1.2 scaled difference from the CPU (allowed 0.001); it replays a captured
-  CUDA graph, probably the same gap.
-- **torch.compile gather / scatter_add / index_select**: an Inductor kernel fails to load, `cuModuleLoadData`
-  answers `unsupported-ptx` (the log shows only that line, not the unsupported feature) and the driver call
-  returns "operation not supported". Find the PTX feature first.
-- **Numeric**: the tiny causal transformer after three AdamW steps (0.0027 against 0.002). The kernel or
-  reduction order that drifts is not isolated; no tolerance was loosened. (SGD with OneCycleLR and gradient
-  clipping, and `clip_grad_norm_` (foreach) / `clip_grad_value_`, drifted when the sweep was written and match
-  the CPU on the current main; they are no longer listed.)
+- **Numeric**: the tiny causal transformer after three AdamW steps (0.0024 to 0.0027 against 0.002) is not a
+  simulator bug and stays listed. The key bias of each attention layer has a gradient that is zero in exact
+  arithmetic (softmax is unchanged when the same number is added to every key) and ~1e-9 of rounding noise in
+  float; AdamW divides it by its own square root, so every device turns its own noise into a +-lr step. A real
+  RTX 3060 running the same PyTorch differs from the CPU by about 0.0020 the same way (the same two
+  `in_proj_bias` tensors), and with those gradients zeroed the CPU, the simulator and the 3060 agree
+  (`tiny causal transformer ... key biases left out of the update`, a full-tier check, passes). No tolerance was
+  loosened. The entry can only go if the check changes what it tests.
 
 ### Tooling, CI and process
 

@@ -40,7 +40,13 @@ fatbin -> cubin (ELF) loader -> decoder (per-arch tables) -> SASS warp executor
 
 - **Selection** (`driver_api.cpp`, `runtime_api.cpp`): a fatbin's ELF image for
   the device's architecture wins over its PTX, by the driver's rules: `sm_XY`
-  SASS runs on the same major at minor Y or newer; `sm_XYa` only on XY.
+  SASS runs on the same major at minor Y or newer; `sm_XYa` only on XY (an
+  `sm_100a` cubin is no candidate on a B300, 10.3, or a Vera Rubin, 10.7, and
+  the fatbin's plain PTX, when it has some, runs there instead). Whether a
+  cubin is `a` is not in `e_flags` from CUDA 13 on: it is the record with attribute 9 in
+  `.nv.compat` (1 for `a`, 0 for plain and for `f`). CUDA 12.8's ptxas writes no such
+  record and sets bit 3 of e_flags' byte after the architecture instead. Both are read
+  (measured on cubins CUDA 12.0's, 12.8's and 13.0's tools write).
 - **Loader**: kernel sections `.text.<name>`, per-kernel attributes from
   `.nv.info.<name>` (parameter layout, register count, shared memory, barrier
   count), constant sections, globals and relocations.
@@ -84,15 +90,32 @@ Every generation from Turing to Blackwell runs, sm_75 through sm_120a:
 | --- | --- | --- |
 | sm_75 | T4 | the base: integer/float ALU, memory, control, textures and surfaces, HMMA/IMMA |
 | sm_80, sm_86, sm_89 | A100, A10, RTX 3060/3080 Ti, L4, L40S | LDGSTS, LDSM, REDUX, bf16/tf32/fp8/sparse MMA, sm_80's mbarriers (ATOMS.ARRIVE) |
-| sm_90 | H100, H200, GH200 | clusters (UCGABAR, distributed shared memory, st.async, red.async), mbarriers (SYNCS), TMA (UTMA*, UBLK*: tile, im2col, multicast, reductions), warpgroup MMA (HGMMA/IGMMA/QGMMA/BGMMA), stmatrix, setmaxnreg, collectives |
+| sm_90 | H100, H200, GH200 | clusters (UCGABAR, distributed shared memory, st.async, red.async), mbarriers (SYNCS), TMA (UTMA*, UBLK*: tile, im2col, multicast, reductions), warpgroup MMA (HGMMA/IGMMA/QGMMA/BGMMA), stmatrix, setmaxnreg, collectives, vector atomics and reductions (REDG/ATOMG `F32x2`/`F32x4`/`F16x4`/`F16x8`/`BF16x4`/`BF16x8`: PTX `atom`/`red` `.v2`/`.v4`/`.v8`) |
 | sm_100, sm_103 | B200, B300 | the uniform float datapath, tcgen05 (LDTM/STTM, UTC*MMA of every kind, UTCCP, UTCSHIFT, the Tensor Memory allocator), TMA gather4/scatter4 and CTA pairs, cluster launch control |
 | sm_120 | RTX 5090 | sm_120's integer and float forms, block-scaled MMA |
 
 Instructions the executor does not run, and so leave a kernel to its PTX:
-`LDGMC` (multimem; the PTX engine has no multicast memory either), TMA's `im2col::w` modes (nor does the
-PTX engine), and the texture forms with a LOD clamp, a LOD bias, offsets or a
-depth compare. A `WARPSYNC.COLLECTIVE` reached from different code paths of
-one warp is refused when it happens.
+`LDGMC` (multimem: it needs a multicast object, which `cuMulticastCreate` and the
+rest do not make here, and the PTX engine has no multicast memory either), TMA's
+`im2col::w` modes (nor does the PTX engine: the halo walk is in the ISA's figures
+only), texture fetches with a LOD bias or clamp (`TEX.LB`, `.LC` -- ptxas emits
+none from PTX, whose `tex` has no such operand) and per-texel gather offsets
+(`TLD4.PTP`). A `WARPSYNC.COLLECTIVE` reached from different code paths of
+one warp is refused when it happens: what the hardware does with the lanes then is not in
+any document, and no PTX this was tried with produced one.
+
+What does run, besides the plain forms: texture fetches with an offset (`.AOFFI`, the
+packed register after the LOD), a depth reference (`.DC`), a residency predicate and
+half-precision results (`.F16.RN`, before sm_90); `SUST.P`; and a cooperative launch
+(`cudaLaunchAttributeCooperative`) of clusters, every block resident, each cluster with
+its own barrier and distributed shared memory; and, on sm_120f, the packed integer
+`VIADD`/`VIMNMX` forms (a lane at a time: 8- and 16-bit lanes, `.SAT`, negated A,
+`.RELU`; derived from ptxas output for the PTX forms, compared with a host loop,
+not checked against a card). `executes()` lists the opcodes the
+executor runs; a decoded opcode outside it (`HMNMX2`, `F2IP`, `JMP`, `LDGMC` --
+the first three no decoder produces) takes the kernel to its PTX, and the "not
+implemented yet" faults at the foot of the instruction groups are unreachable for
+the ones it lists.
 
 Dynamic parallelism runs on SASS as on PTX. A program using it links CUDA's
 device runtime library into its cubin; the loader resolves the relocations

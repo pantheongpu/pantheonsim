@@ -612,6 +612,21 @@ bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr,
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
+std::vector<std::string> Device::kernel_names(uint64_t module_id) const {
+  std::vector<std::string> names;
+  for (const auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    if (lm.lazy) {
+      std::lock_guard<std::recursive_mutex> lock(lm.lazy->mu);
+      names.assign(lm.lazy->entry_order.begin(), lm.lazy->entry_order.end());
+    } else if (lm.mod) {
+      for (const auto& e : lm.mod->entries) names.push_back(e.name);
+    }
+    break;
+  }
+  return names;
+}
+
 bool Device::has_kernel(uint64_t module_id, const std::string& name) const {
   for (const auto& lm : modules_) {
     if (lm.id != module_id || !lm.mod) continue;

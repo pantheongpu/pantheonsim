@@ -71,6 +71,13 @@ std::vector<Token> lex(const std::string& src) {
           i += 2;
           continue;
         }
+        // A sparsity factor, .sp::2:4 -- a single colon between two digits
+        // (a label's colon is followed by white space).
+        if (src[i] == ':' && i > 0 && i + 1 < n && std::isdigit(static_cast<unsigned char>(src[i - 1])) &&
+            std::isdigit(static_cast<unsigned char>(src[i + 1]))) {
+          ++i;
+          continue;
+        }
         break;
       }
       out.push_back({Token::Kind::Word, src.substr(start, i - start), line});

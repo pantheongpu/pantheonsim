@@ -56,6 +56,7 @@ enum Attr : uint8_t {
   kExplicitCluster = 0x3e,   // launched with a cluster, or refused
   kKparamInfoV2 = 0x45,      // KPARAM_INFO for parameters past 4 KiB
   kNumBarriers = 0x4c,
+  kArchSpecific = 0x09,      // in .nv.compat: 1 for an sm_XYa image
 };
 
 struct Record {
@@ -99,6 +100,40 @@ bool is_cubin(const void* data, size_t size) {
          (p[7] == 0x41 || p[7] == 0x33);
 }
 
+// sm_XYa or not. Two places say so, by toolkit (measured on the cubins CUDA 12.0's and 13.0's nvcc and
+// 12.8's ptxas write for sm_90 to sm_120, each with and without the "a"):
+//  - CUDA 13: the record with attribute 9 in .nv.compat holds 1 (0 for plain, and for an "f" image,
+//    which runs across its major version); e_flags is the same either way.
+//  - CUDA 12.8: no such record; e_flags has bit 3 set in the byte after the architecture's own
+//    (0x0a640006 for sm_100a, 0x02640006 for sm_100; 0x005a0d5a for sm_90a, 0x005a055a for sm_90).
+// Only the section table and the header are read, so a fatbin's candidates can be told apart without
+// parsing them.
+bool cubin_arch_specific(const uint8_t* data, size_t size) {
+  if (!is_cubin(data, size)) return false;
+  try {
+    const Reader r{data, size};
+    const uint32_t eflags = r.at<uint32_t>(0x30);
+    const bool abi7 = data[7] == 0x33;   // CUDA 12.0's ELF ABI: the architecture is the low byte
+    if (((abi7 ? eflags >> 8 : eflags) & 0x8) != 0) return true;
+    const uint64_t shoff = r.at<uint64_t>(0x28);
+    const uint16_t shentsize = r.at<uint16_t>(0x3a), shnum = r.at<uint16_t>(0x3c), shstrndx = r.at<uint16_t>(0x3e);
+    if (shentsize < 64 || shnum == 0 || shstrndx >= shnum) return false;
+    const uint64_t shstr = r.at<uint64_t>(shoff + static_cast<uint64_t>(shstrndx) * shentsize + 24);
+    for (uint16_t i = 1; i < shnum; ++i) {
+      const uint64_t o = shoff + static_cast<uint64_t>(i) * shentsize;
+      if (r.cstr(shstr + r.at<uint32_t>(o)) != ".nv.compat") continue;
+      const uint64_t off = r.at<uint64_t>(o + 24), len = r.at<uint64_t>(o + 32);
+      if (off > size || len > size - off) return false;
+      const std::vector<uint8_t> blob(data + off, data + off + len);
+      for (const Record& rec : records(blob))
+        if (rec.attr == kArchSpecific) return rec.payload[0] != 0;
+      return false;
+    }
+  } catch (const Error&) {
+  }
+  return false;
+}
+
 Cubin parse_cubin(const uint8_t* data, size_t size) {
   if (!is_cubin(data, size)) bad("not a 64-bit CUDA ELF image");
   const Reader r{data, size};
@@ -135,6 +170,8 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
     c.section_index[s.name] = c.sections.size();
     c.sections.push_back(std::move(s));
   }
+
+  c.arch_specific = cubin_arch_specific(data, size);
 
   // Symbols.
   std::vector<std::string> sym_names;

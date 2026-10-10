@@ -5,7 +5,10 @@
 // defines them ("Narrow Precision Data Types Usage": the scaling modes, the
 // 1D block scaling factors' tiled layout, 1D block quantization).
 //
-// Documentation-derived, not card-verified: these modes need an sm_100 (or,
+// The descriptor checks at the end (modes of different families, a mode that does not
+// go with the operands' type, FP4 without its scales: INVALID_VALUE) are what an L4's cuBLASLt
+// 13.3 answers (nvidia/tests/data/lowprec/lt.l4.txt); the matmuls themselves are
+// documentation-derived, not card-verified: these modes need an sm_100 (or,
 // for the 128-element ones, sm_90) GPU, and the only card here is an RTX 3060
 // (sm_86). So this runs on VirtualGPU (VGPU_GPU set, as run_lib_check.sh sets
 // it) or on a card of compute capability 9.0 or later, and anywhere else
@@ -312,17 +315,17 @@ static void hopper() {
   Desc mixed;
   mixed.set(kAScaleMode, kVec32UE8M0);
   mixed.set(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, (const void*)dsa);
-  check(matmul(mixed, kE4M3, CUDA_R_32F, m, n, k, dA, dB, dD) == CUBLAS_STATUS_NOT_SUPPORTED,
+  check(matmul(mixed, kE4M3, CUDA_R_32F, m, n, k, dA, dB, dD) == CUBLAS_STATUS_INVALID_VALUE,
         "a block scale for A without one for B is not supported");
   Desc wrong;
   wrong.set(kAScaleMode, kVec16UE4M3);
   wrong.set(kBScaleMode, kVec16UE4M3);
   wrong.set(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, (const void*)dsa);
   wrong.set(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, (const void*)dsa);
-  check(matmul(wrong, kE4M3, CUDA_R_32F, m, n, k, dA, dB, dD) == CUBLAS_STATUS_NOT_SUPPORTED,
+  check(matmul(wrong, kE4M3, CUDA_R_32F, m, n, k, dA, dB, dD) == CUBLAS_STATUS_INVALID_VALUE,
         "VEC16_UE4M3 scales go with FP4, not FP8");
   Desc none;
-  check(matmul(none, kFP4, CUDA_R_32F, m, n, 32, dA, dB, dD) == CUBLAS_STATUS_NOT_SUPPORTED,
+  check(matmul(none, kFP4, CUDA_R_32F, m, n, 32, dA, dB, dD) == CUBLAS_STATUS_INVALID_VALUE,
         "FP4 operands without block scales are not supported");
   Desc noptr;
   noptr.set(kAScaleMode, kVec32UE8M0);

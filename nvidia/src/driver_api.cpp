@@ -19,7 +19,10 @@
 #include <cstring>
 #include <deque>
 #include <dlfcn.h>
+
+#include <functional>
 #include <fstream>
+#include <unistd.h>
 #include <iterator>
 #include <sstream>
 #include <memory>
@@ -31,10 +34,13 @@
 #include <ctime>
 #include <map>
 #include <set>
+#include <stdexcept>
 
 #include "error_names.hpp"
+#include "kept_args.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
+#include "texture_formats.hpp"
 #include "vgpu/sass/cubin.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/cuda_attributes.hpp"
@@ -79,6 +85,8 @@ struct FuncRec {
 // text, instantiated per device on first use.
 struct LibRec {
   std::string ptx;
+  std::string cubin;   // a cubin (ELF) the library was loaded from, run as SASS
+
   std::unordered_map<int, uint64_t> per_device_module;  // device -> runtime module id
 };
 
@@ -98,7 +106,8 @@ struct EventRec {
 // a zero Height or Depth counts as one).
 struct ArrayRec {
   CUDA_ARRAY3D_DESCRIPTOR desc{};
-  size_t elem = 0;       // bytes an element takes, all channels
+  vgpu::cuda::TexFormat tf;   // what the descriptor's format is to the texture unit
+  size_t elem = 0;       // bytes an element takes, all channels (a block-compressed array's: a 4 x 4 block)
   size_t row = 0;        // bytes a row takes
   size_t rows = 1, slices = 1;
   int device = 0;
@@ -171,6 +180,18 @@ struct ShimState {
   uintptr_t next_id = 8;
 
   std::unordered_map<uintptr_t, int> contexts;         // ctx handle -> device ordinal
+  // What a context carries besides its device: the flags it reports (cuCtxGetFlags) and the id
+  // cuCtxGetId gives, numbered from 1 in the order contexts are made, the primary ones included.
+  struct CtxState {
+    unsigned flags = 0;
+    unsigned long long id = 0;
+  };
+  std::unordered_map<uintptr_t, CtxState> ctx_state;
+  unsigned long long next_ctx_id = 1;
+  // cuDevicePrimaryCtxSetFlags, per device, and whether the primary context is active: it is from
+  // a retain until a reset or until its last reference is released.
+  std::map<int, unsigned> primary_flags;
+  std::set<int> primary_active;
   std::unordered_map<int, uintptr_t> primary_ctx;      // device -> primary ctx handle
   // Retain count per device. A release with nothing retained is an error the
   // caller needs to see: it means some other component's retain is about to
@@ -347,6 +368,32 @@ CUresult dead_context() {
   return s.initialized ? static_cast<CUresult>(s.rt->context_fault()) : CUDA_SUCCESS;
 }
 
+// Thrown where a call needs the thread's current context and it has none (or it was destroyed
+// under the thread): CUDA_ERROR_INVALID_CONTEXT, which is what the card answers, where a missing
+// argument would be INVALID_VALUE.
+struct NoContext : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// The entry points that fail with CUDA_ERROR_INVALID_CONTEXT when the thread has no current
+// context. Measured on an RTX 3060: allocation (device, host, managed, pitched, pool, arrays),
+// copies and fills, streams, events, modules, kernel launches and the context queries. Others
+// (cuMemFree(NULL), cuMemFreeHost(NULL), the device queries, the primary-context calls) do not need
+// one.
+bool needs_current_context(const char* name) {
+  static const char* const kNeeds[] = {
+      "cuMemAlloc", "cuMemAllocPitch", "cuMemAllocManaged", "cuMemAllocAsync", "cuMemAllocFromPoolAsync",
+      "cuMemHostAlloc", "cuMemAllocHost", "cuMemGetInfo", "cuMemGetAddressRange", "cuMemcpy", "cuMemset",
+      "cuStreamCreate", "cuStreamSynchronize", "cuStreamQuery", "cuEventCreate", "cuModuleLoad",
+      "cuArrayCreate", "cuArray3DCreate", "cuMipmappedArrayCreate", "cuLaunchKernel", "cuCtxSynchronize",
+      "cuCtxGetLimit", "cuCtxSetLimit", "cuCtxGetCacheConfig", "cuCtxSetCacheConfig",
+      "cuCtxGetSharedMemConfig", "cuCtxSetSharedMemConfig", "cuCtxGetStreamPriorityRange", "cuCtxGetFlags",
+      "cuCtxSetFlags"};
+  for (const char* n : kNeeds)
+    if (std::strncmp(name, n, std::strlen(n)) == 0) return true;
+  return false;
+}
+
 // Wraps an API body: locks, checks init, catches and maps errors.
 template <class F>
 CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
@@ -355,6 +402,10 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
   if (needs_init && !s.initialized) {
     report(name, "cuInit has not been called");
     return CUDA_ERROR_NOT_INITIALIZED;
+  }
+  if (s.initialized && ctx_stack().empty() && needs_current_context(name)) {
+    report(name, "no current context (create one with cuCtxCreate or cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
+    return CUDA_ERROR_INVALID_CONTEXT;
   }
   if (s.initialized && !answers_dead_context(name))
     if (const int fault = s.rt->context_fault()) return static_cast<CUresult>(fault);
@@ -374,6 +425,9 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     }
     if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d (threw)\n", name, static_cast<int>(r));
     return r;
+  } catch (const NoContext& e) {
+    report(name, e.what());
+    return CUDA_ERROR_INVALID_CONTEXT;
   } catch (const std::exception& e) {
     report(name, std::string("unexpected: ") + e.what());
     return CUDA_ERROR_UNKNOWN;
@@ -382,21 +436,52 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
 
 int current_device(ShimState& s) {
   if (ctx_stack().empty())
-    throw vgpu::Error::make(vgpu::Err::InvalidValue,
-                            "no current context (create one with cuCtxCreate or "
-                            "cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
+    throw NoContext("no current context (create one with cuCtxCreate or "
+                    "cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
   // With a stack per thread, another thread can destroy the context this one
   // still has current. That is the caller's error, and it should be reported
   // as one rather than escaping as std::out_of_range and CUDA_ERROR_UNKNOWN.
   auto it = s.contexts.find(ctx_stack().back());
   if (it == s.contexts.end())
-    throw vgpu::Error::make(vgpu::Err::InvalidValue,
-                            "the current context has been destroyed (by cuCtxDestroy, possibly on "
-                            "another thread)");
+    throw NoContext("the current context has been destroyed (by cuCtxDestroy, possibly on "
+                    "another thread)");
   return it->second;
 }
 
 vgpu::runtime::Device& current(ShimState& s) { return s.rt->device(current_device(s)); }
+
+// Context flags (CUctx_flags): one scheduling mode (0 auto, 1 spin, 2 yield, 4 blocking sync), and
+// any of MAP_HOST 8, LMEM_RESIZE_TO_MAX 0x10, COREDUMP_ENABLE 0x20, USER_COREDUMP_ENABLE 0x40 and
+// SYNC_MEMOPS 0x80. Measured on an RTX 3060: anything above 0xff, and two scheduling bits at once,
+// are CUDA_ERROR_INVALID_VALUE. (The card under WSL answers UNKNOWN for the two core-dump flags,
+// which a Linux driver takes.)
+constexpr unsigned kCtxSchedMask = 0x7;
+constexpr unsigned kCtxMapHost = 0x8;
+bool ctx_flags_valid(unsigned flags) {
+  if (flags & ~0xFFu) return false;
+  const unsigned sched = flags & kCtxSchedMask;
+  return sched == 0 || sched == 1 || sched == 2 || sched == 4;
+}
+// What cuCtxSetFlags and cuDevicePrimaryCtxSetFlags keep: the scheduling mode, LMEM_RESIZE_TO_MAX
+// and SYNC_MEMOPS; MAP_HOST and the core-dump flags are taken and not stored (measured).
+constexpr unsigned kCtxSettableMask = kCtxSchedMask | 0x10u | 0x80u;
+
+uintptr_t make_handle(ShimState& s, uintptr_t tag);
+// Makes a context's record, with the next id. Caller holds the lock.
+uintptr_t new_context(ShimState& s, int dev, unsigned flags) {
+  const uintptr_t h = make_handle(s, kTagCtx);
+  s.contexts[h] = dev;
+  s.ctx_state[h] = ShimState::CtxState{flags, s.next_ctx_id++};
+  return h;
+}
+// The primary context of `dev`, made on first use. Its flags are the primary flags set so far with
+// MAP_HOST always on, as the card reports (0x8 for a fresh one).
+uintptr_t ensure_primary(ShimState& s, int dev) {
+  auto it = s.primary_ctx.find(dev);
+  if (it == s.primary_ctx.end())
+    it = s.primary_ctx.emplace(dev, new_context(s, dev, (s.primary_flags[dev] & kCtxSettableMask) | kCtxMapHost)).first;
+  return it->second;
+}
 
 // Device VA windows are disjoint, so a device pointer names its own device.
 // Resolving against the current context instead would make a copy between two
@@ -457,6 +542,60 @@ uintptr_t check_handle(uintptr_t h, uintptr_t tag, const char* what) {
 }
 
 // Picks the PTX image the driver would JIT -- see pick_ptx for the rule.
+// The PTX the NVRTC shim noted for a cubin it handed out (empty for any other
+// cubin, and when the toolkit's own NVRTC is the library loaded). Found by name
+// in whichever libnvrtc is loaded, since a program may have opened it privately.
+std::string nvrtc_ptx_for_cubin(const void* cubin, size_t size) {
+  using Fn = char* (*)(const void*, size_t);
+  Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "vgpu_nvrtc_ptx_for_cubin"));
+  for (const char* so : {"libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2", "libnvrtc.so"}) {
+    if (fn) break;
+    if (void* h = dlopen(so, RTLD_NOLOAD | RTLD_LAZY)) fn = reinterpret_cast<Fn>(dlsym(h, "vgpu_nvrtc_ptx_for_cubin"));
+  }
+  if (!fn) return {};
+  char* copy = fn(cubin, size);
+  if (!copy) return {};
+  std::string ptx(copy);
+  std::free(copy);
+  return ptx;
+}
+
+// A bare cubin's size: where the image ends, the later of its section table and its program header
+// table, which a cubin keeps after the sections (an RTX 3060 reports the cubin it loaded as that size).
+// All the driver has to go by, handed a pointer.
+size_t bare_cubin_size(const uint8_t* b) {
+  uint64_t shoff, phoff;
+  uint16_t shentsize, shnum, phentsize, phnum;
+  std::memcpy(&shoff, b + 0x28, 8);
+  std::memcpy(&shentsize, b + 0x3a, 2);
+  std::memcpy(&shnum, b + 0x3c, 2);
+  std::memcpy(&phoff, b + 0x20, 8);
+  std::memcpy(&phentsize, b + 0x36, 2);
+  std::memcpy(&phnum, b + 0x38, 2);
+  return static_cast<size_t>(std::max(shoff + static_cast<uint64_t>(shentsize) * shnum,
+                                      phoff + static_cast<uint64_t>(phentsize) * phnum));
+}
+
+// The PTX the NVRTC shim noted for this cubin, when the SASS engine cannot run all of the cubin yet --
+// the fallback a fatbin's PTX gives (VGPU_SASS=1 insists on the SASS, VGPU_SASS=0 asks for none).
+// Empty when the cubin is to run.
+std::string ptx_for_unsupported_cubin(const uint8_t* b, size_t size) {
+  const char* force = std::getenv("VGPU_SASS");
+  if (force && (force[0] == '1' || force[0] == '0')) return {};
+  std::string aside = nvrtc_ptx_for_cubin(b, size);
+  if (aside.empty()) return {};
+  std::string why;
+  try {
+    why = vgpu::sass::unsupported(b, size);
+  } catch (const vgpu::Error& e) {
+    why = e.message();
+  }
+  if (why.empty()) return {};
+  if (const char* log = std::getenv("VGPU_SASS_LOG"); log && log[0] == '1')
+    std::fprintf(stderr, "[vgpu] running PTX instead of SASS: %s\n", why.c_str());
+  return aside;
+}
+
 std::string best_ptx(const void* image) {
   auto ptxs = vgpu::cuda::extract_ptx(image);
   if (ptxs.empty())
@@ -534,7 +673,9 @@ uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   LibRec& lib = it->second;
   auto mit = lib.per_device_module.find(dev);
   if (mit != lib.per_device_module.end()) return mit->second;
-  uint64_t mid = s.rt->device(dev).load_module(lib.ptx);
+  uint64_t mid = !lib.cubin.empty()
+                     ? s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(lib.cubin.data()), lib.cubin.size())
+                     : s.rt->device(dev).load_module(lib.ptx);
   lib.per_device_module[dev] = mid;
   bind_managed_globals(s, dev, mid);
   return mid;
@@ -567,12 +708,12 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 
 // Reports one driver call from the program's side. `name` is NVIDIA's own
 // spelling of the function (cuMemAlloc_v2), which is what a subscriber is told.
+// The arguments are kept as bytes in this frame for the whole call (kept_args.hpp): the profiler reads them at
+// the call's exit too.
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
-  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
-    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
-    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)));
-  }
+  const vgpu_traced::KeptArgs<A...> kept(a...);
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) vgpu::profiling::note_args(kept.argv(), kept.count());
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));
@@ -635,6 +776,7 @@ void record_memset(ShimState& s, CUdeviceptr dst, uint32_t value, size_t bytes, 
 
 // A context coming into being: a subscriber is told, and a context record made.
 void announce_context_created(ShimState& s, uintptr_t handle) {
+  vgpu::profiling::note_context_made();
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   const uint32_t device = profiled_device(s);
   vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextCreated, handle, device);
@@ -644,6 +786,7 @@ void announce_context_created(ShimState& s, uintptr_t handle) {
     ev.device = device;
     ev.start_ns = ev.end_ns = vgpu::profiling::now_ns();
     ev.correlation = vgpu::profiling::work_correlation();
+    ev.handle = handle;   // a context of the driver's own, not the device's primary one
     vgpu::profiling::record(std::move(ev));
   }
 }
@@ -729,14 +872,11 @@ VGPU_EXPORT int vgpu_driver_bind_primary_v1(int dev) {
   if (cuInit_impl(0) != CUDA_SUCCESS) return CUDA_ERROR_NOT_INITIALIZED;
   return api("vgpu_driver_bind_primary", true, false, [&](ShimState& s) {
     check_device(s, dev);
+    ensure_primary(s, dev);
     auto it = s.primary_ctx.find(dev);
-    if (it == s.primary_ctx.end()) {
-      const uintptr_t h = make_handle(s, kTagCtx);
-      s.contexts[h] = dev;
-      it = s.primary_ctx.emplace(dev, h).first;
-    }
     static std::set<int> retained;   // the runtime's one reference per device
     if (retained.insert(dev).second) ++s.primary_refs[dev];
+    s.primary_active.insert(dev);
     auto& stack = ctx_stack();
     bool primary_current = false;
     if (!stack.empty())
@@ -904,11 +1044,11 @@ VGPU_EXPORT CUresult cuDeviceGetProperties(CUdevprop* prop, CUdevice dev) {
 
 static CUresult cuCtxCreate_v2_impl(CUcontext* pctx, unsigned int flags, CUdevice dev) {
   return api("cuCtxCreate", true, false, [&](ShimState& s) {
-    (void)flags;  // scheduling flags are performance hints; functionally inert here
-    if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+    // The scheduling flags are performance hints, kept for cuCtxGetFlags and otherwise inert; an
+    // invalid combination is refused as the card refuses it.
+    if (!pctx || !ctx_flags_valid(flags)) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
-    uintptr_t h = make_handle(s, kTagCtx);
-    s.contexts[h] = dev;
+    uintptr_t h = new_context(s, dev, flags);
     ctx_stack().push_back(h);  // cuCtxCreate makes the new context current
     *pctx = reinterpret_cast<CUcontext>(h);
     announce_context_created(s, h);
@@ -924,12 +1064,24 @@ VGPU_EXPORT CUresult cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice d
 // CUDA 13's header maps cuCtxCreate to cuCtxCreate_v4, which takes a parameter
 // block for green contexts and execution affinity. Without this symbol a
 // program built against that toolkit fails to load at all -- the plain name it
-// never calls is no help. Affinity and CIG parameters are not supported, and
-// say so rather than being ignored; a block that asks for neither is an
-// ordinary context. That is what CUDA 13's own samples pass (a zeroed
-// CUctxCreateParams), and the card takes it.
+// never calls is no help. A block that asks for neither is an ordinary context
+// (CUDA 13's own samples pass a zeroed CUctxCreateParams, and the card takes it).
+//
+// Execution affinity (CU_EXEC_AFFINITY_TYPE_SM_COUNT: a context confined to some number of
+// multiprocessors, as MPS gives) is not modelled, which cuDeviceGetExecAffinitySupport says (0). A
+// request for it is CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY (224), as on an RTX 3060 whatever the
+// type or count; a block that names parameters and a count of 0, or a count and no parameters, is
+// CUDA_ERROR_INVALID_VALUE. A CIG block (a graphics-queue context) is CUDA_ERROR_NOT_SUPPORTED.
+namespace {
+constexpr CUresult kUnsupportedExecAffinity = static_cast<CUresult>(224);
+struct ExecAffinityParamABI {   // CUexecAffinityParam: the type, then the SM count of a union
+  int type;
+  unsigned sm_count;
+};
+}  // namespace
 static CUresult cuCtxCreate_v3_impl(CUcontext* pctx, void* exec_affinity_params, int num_params, unsigned int flags, CUdevice dev) {
-  if (exec_affinity_params && num_params > 0) return CUDA_ERROR_NOT_SUPPORTED;
+  if (num_params < 0 || (exec_affinity_params == nullptr) != (num_params == 0)) return CUDA_ERROR_INVALID_VALUE;
+  if (num_params > 0) return kUnsupportedExecAffinity;
   return cuCtxCreate_v2_impl(pctx, flags, dev);
 }
 VGPU_EXPORT CUresult cuCtxCreate_v3(CUcontext* pctx, void* exec_affinity_params, int num_params, unsigned int flags, CUdevice dev) {
@@ -942,13 +1094,40 @@ static CUresult cuCtxCreate_v4_impl(CUcontext* pctx, void* ctx_create_params, un
     int num_exec_affinity;
     void* cig;
   };
-  if (const auto* p = static_cast<const CreateParamsABI*>(ctx_create_params);
-      p && ((p->exec_affinity && p->num_exec_affinity > 0) || p->cig))
-    return CUDA_ERROR_NOT_SUPPORTED;
+  if (const auto* p = static_cast<const CreateParamsABI*>(ctx_create_params)) {
+    if (p->num_exec_affinity < 0 || (p->exec_affinity == nullptr) != (p->num_exec_affinity == 0))
+      return CUDA_ERROR_INVALID_VALUE;
+    if (p->num_exec_affinity > 0) return kUnsupportedExecAffinity;
+    if (p->cig) return CUDA_ERROR_NOT_SUPPORTED;
+  }
   return cuCtxCreate_v2_impl(pctx, flags, dev);
 }
 VGPU_EXPORT CUresult cuCtxCreate_v4(CUcontext* pctx, void* ctx_create_params, unsigned int flags, CUdevice dev) {
   return traced("cuCtxCreate_v4", cuCtxCreate_v4_impl, pctx, ctx_create_params, flags, dev);
+}
+// Whether execution affinity of a type is supported on a device: never here, for any type
+// (measured: a type CUDA has no such value for is answered too, with 0).
+VGPU_EXPORT CUresult cuDeviceGetExecAffinitySupport(int* pi, int type, CUdevice dev) {
+  (void)type;
+  return api("cuDeviceGetExecAffinitySupport", true, false, [&](ShimState& s) {
+    if (!pi) return CUDA_ERROR_INVALID_VALUE;
+    check_device(s, dev);
+    *pi = 0;
+    return CUDA_SUCCESS;
+  });
+}
+// The affinity of the current context: all the device's multiprocessors, since none is confined.
+// A type but SM_COUNT is CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY (measured).
+VGPU_EXPORT CUresult cuCtxGetExecAffinity(void* pExecAffinity, int type) {
+  return api("cuCtxGetExecAffinity", true, false, [&](ShimState& s) {
+    if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    if (!pExecAffinity) return CUDA_ERROR_INVALID_VALUE;
+    if (type != 0) return kUnsupportedExecAffinity;
+    auto* out = static_cast<ExecAffinityParamABI*>(pExecAffinity);
+    out->type = 0;
+    out->sm_count = s.rt->device(current_device(s)).profile().limits.multiprocessors;
+    return CUDA_SUCCESS;
+  });
 }
 
 static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
@@ -958,7 +1137,10 @@ static CUresult cuCtxDestroy_v2_impl(CUcontext ctx) {
     // A subscriber is told before the context goes, while it can still be asked about.
     vgpu::profiling::notify_resource(vgpu::profiling::Resource::ContextDestroyStarting, h, profiled_device(s));
     s.contexts.erase(h);
-    std::erase(ctx_stack(), h);
+    s.ctx_state.erase(h);
+    // Measured on an RTX 3060: destroying the thread's current context makes the one below it
+    // current; destroying one further down the stack leaves it there, and a pop hands it back.
+    if (!ctx_stack().empty() && ctx_stack().back() == h) ctx_stack().pop_back();
     std::erase_if(s.peer_access, [h](const auto& p) { return p.first == h || p.second == h; });
     s.attached.erase(h);
     return CUDA_SUCCESS;
@@ -1052,14 +1234,10 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev) {
   return api("cuDevicePrimaryCtxRetain", true, false, [&](ShimState& s) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
-    auto it = s.primary_ctx.find(dev);
-    if (it == s.primary_ctx.end()) {
-      uintptr_t h = make_handle(s, kTagCtx);
-      s.contexts[h] = dev;
-      it = s.primary_ctx.emplace(dev, h).first;
-    }
+    const uintptr_t h = ensure_primary(s, dev);
     ++s.primary_refs[dev];
-    *pctx = reinterpret_cast<CUcontext>(it->second);  // NOTE: does not make it current
+    s.primary_active.insert(dev);
+    *pctx = reinterpret_cast<CUcontext>(h);  // NOTE: does not make it current
     return CUDA_SUCCESS;
   });
 }
@@ -1080,7 +1258,7 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
                  " released more times than it was retained");
       return CUDA_ERROR_INVALID_CONTEXT;
     }
-    --it->second;
+    if (--it->second == 0) s.primary_active.erase(dev);
     return CUDA_SUCCESS;
   });
 }
@@ -1090,10 +1268,28 @@ VGPU_EXPORT CUresult cuDevicePrimaryCtxRelease(CUdevice dev) {
 
 /* ---- memory ---- */
 
+// A profiler's record of memory coming or going (vgpu/profiling.hpp), as the
+// runtime tells it.
+static void profile_memory(uint8_t op, uint64_t address, uint64_t bytes, vgpu::profiling::MemKind kind, int device) {
+  if (!vgpu::profiling::enabled()) return;
+  vgpu::profiling::Event e;
+  e.kind = vgpu::profiling::EventKind::Memory;
+  e.op = op;
+  e.start_ns = e.end_ns = vgpu::profiling::host_ns();
+  e.device = static_cast<uint32_t>(device);
+  e.correlation = vgpu::profiling::work_correlation();
+  e.process_id = static_cast<uint32_t>(::getpid());
+  e.address = address;
+  e.bytes = bytes;
+  e.src_kind = kind;
+  vgpu::profiling::record(std::move(e));
+}
+
 static CUresult cuMemAlloc_v2_impl(CUdeviceptr* dptr, size_t bytesize) {
   return api("cuMemAlloc", true, false, [&](ShimState& s) {
     if (!dptr) return CUDA_ERROR_INVALID_VALUE;
     *dptr = current(s).memory().alloc(bytesize);
+    profile_memory(1, *dptr, bytesize, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -1106,7 +1302,9 @@ VGPU_EXPORT CUresult cuMemAlloc(CUdeviceptr* dptr, size_t bytesize) {
 
 static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
   return api("cuMemFree", true, false, [&](ShimState& s) {
+    if (dptr == 0) return CUDA_SUCCESS;   // a documented no-op, with or without a context
     if (auto it = s.managed.find(dptr); it != s.managed.end()) {
+      profile_memory(2, dptr, it->second, vgpu::profiling::MemKind::Managed, current_device(s));
       for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(dptr);
       std::free(reinterpret_cast<void*>(dptr));
       s.managed_device.erase(dptr);
@@ -1116,7 +1314,10 @@ static CUresult cuMemFree_v2_impl(CUdeviceptr dptr) {
     }
     // The device heap's blocks are not the host's to free (as cudaFree).
     if (owner_memory(s, dptr).heap_contains(dptr)) return CUDA_ERROR_INVALID_VALUE;
+    uint64_t base = 0, size = 0;
+    const bool known = owner_memory(s, dptr).find_allocation(dptr, &base, &size);
     owner_memory(s, dptr).free(dptr);
+    profile_memory(2, dptr, known ? size : 0, vgpu::profiling::MemKind::Device, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -1140,6 +1341,17 @@ static CUresult memcpy_htod(CUdeviceptr dst, const void* src, size_t n, CUstream
 static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyDtoH", true, false, [&](ShimState& s) {
     if (!dst && n) return CUDA_ERROR_INVALID_VALUE;
+    // Memory registered read-only is not a destination for a copy (an RTX 3060: INVALID_VALUE).
+    if (n) {
+      const auto& regs = s.rt->host_registrations();
+      auto it = regs.lower_bound(static_cast<char*>(dst) + n);
+      if (it != regs.begin()) {
+        --it;
+        if ((it->second.flags & CU_MEMHOSTREGISTER_READ_ONLY) &&
+            static_cast<const char*>(it->first) + it->second.size > static_cast<const char*>(dst))
+          return CUDA_ERROR_INVALID_VALUE;
+      }
+    }
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
     dev_read(s, dst, src, n);
     record_copy(s, 2, dst, reinterpret_cast<const void*>(src), n, t0, stream, async);
@@ -1207,6 +1419,57 @@ VGPU_EXPORT CUresult cuMemGetInfo(size_t* f, size_t* t) { return cuMemGetInfo_v2
 
 /* ---- modules / launch ---- */
 
+// What a profiler is told of a module loaded through the driver API (the same
+// callbacks as the runtime's, vgpu/profiling.hpp): the driver loads a module
+// when asked, with its code when that is a cubin this engine holds (the module
+// came as a cubin, or as a fatbin with SASS for the device) and no code when it
+// is PTX the engine compiles itself.
+struct ModuleProf {
+  uint32_t id = 0;
+  int device = 0;
+  std::string cubin;
+};
+static std::mutex g_module_prof_mu;
+static std::unordered_map<uintptr_t, ModuleProf> g_module_prof;
+
+static void announce_module_event(vgpu::profiling::Resource what, const ModuleProf& m) {
+  if (!vgpu::profiling::hooked() || vgpu::profiling::silenced()) return;
+  vgpu::profiling::ResourceInfo info;
+  info.what = what;
+  info.device = static_cast<uint32_t>(m.device);
+  info.module_id = m.id;
+  info.cubin = m.cubin.empty() ? nullptr : m.cubin.data();
+  info.cubin_size = m.cubin.size();
+  vgpu::profiling::notify_resource(info);
+}
+
+static void announce_module_loaded(uintptr_t handle, int device, const uint8_t* cubin, size_t cubin_size,
+                                   const std::vector<std::string>& functions) {
+  ModuleProf m;
+  m.id = vgpu::profiling::next_module_id(static_cast<uint32_t>(device));
+  m.device = device;
+  if (cubin && cubin_size) m.cubin.assign(reinterpret_cast<const char*>(cubin), cubin_size);
+  {
+    std::lock_guard<std::mutex> lock(g_module_prof_mu);
+    g_module_prof[handle] = m;
+  }
+  announce_module_event(vgpu::profiling::Resource::ModuleLoaded, m);
+  if (!vgpu::profiling::enabled()) return;
+  uint32_t index = 0;
+  for (const std::string& name : functions) {   // in the order the source declares them (see the runtime's)
+    vgpu::profiling::Event e;
+    e.kind = vgpu::profiling::EventKind::Function;
+    e.start_ns = e.end_ns = vgpu::profiling::host_ns();
+    e.device = static_cast<uint32_t>(device);
+    e.correlation = vgpu::profiling::work_correlation();
+    e.module_id = m.id;
+    e.function_index = index++;
+    e.name = name;
+    e.handle = vgpu::profiling::next_function_id();
+    vgpu::profiling::record(std::move(e));
+  }
+}
+
 static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
   return api("cuModuleLoadData", true, false, [&](ShimState& s) {
     if (!module || !image) return CUDA_ERROR_INVALID_VALUE;
@@ -1216,6 +1479,7 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     std::memcpy(&magic, image, 4);
     int dev = current_device(s);
     uint64_t mid = 0;
+    std::vector<uint8_t> loaded_cubin;   // the module's code, when it is a cubin (for a profiler)
     const vgpu::DeviceProfile& prof = s.rt->device(dev).profile();
     const uint32_t cc = static_cast<uint32_t>(prof.cc_major * 10 + prof.cc_minor);
     if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
@@ -1224,6 +1488,7 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       const std::string cubin = vgpu::cuda::pick_cubin(image, cc);
       if (!cubin.empty()) {
         mid = s.rt->device(dev).load_cubin(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size());
+        loaded_cubin.assign(cubin.begin(), cubin.end());
       } else {
         extracted = best_ptx(image);
         text = extracted.c_str();
@@ -1236,26 +1501,25 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
       const auto* b = static_cast<const uint8_t*>(image);
       // OS/ABI 0x41 is CUDA 13's (ELF ABI version 8), 0x33 CUDA 12's (7).
       if (b[4] != 2 || (b[7] != 0x41 && b[7] != 0x33)) return CUDA_ERROR_INVALID_IMAGE;
-      // A bare cubin: its size is in its own headers (the section table ends it).
-      uint64_t shoff;
-      uint16_t shentsize, shnum;
-      std::memcpy(&shoff, b + 0x28, 8);
-      std::memcpy(&shentsize, b + 0x3a, 2);
-      std::memcpy(&shnum, b + 0x3c, 2);
-      const uint64_t size = shoff + static_cast<uint64_t>(shentsize) * shnum;
+      // A bare cubin: its size is in its own headers (see bare_cubin_size).
+      const uint64_t size = bare_cubin_size(b);
       uint32_t eflags;
       std::memcpy(&eflags, b + 0x30, 4);
       // The architecture is in e_flags' second byte from ABI version 8 on,
       // and its low byte before (as sass::parse_cubin reads it): a CUDA 12
       // cubin for sm_86 carries 0x560556.
       const int sm = static_cast<int>(b[7] == 0x33 ? eflags & 0xff : (eflags >> 8) & 0xff);
-      if (!vgpu::sass::runs_on(sm, false, static_cast<int>(cc))) return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      // An sm_XYa cubin runs on XY alone, a plain one on its major from XY up.
+      if (!vgpu::sass::runs_on(sm, vgpu::sass::cubin_arch_specific(b, size), static_cast<int>(cc)))
+        return CUDA_ERROR_NO_BINARY_FOR_GPU;
+      const std::string aside = ptx_for_unsupported_cubin(b, size);
       try {
-        mid = s.rt->device(dev).load_cubin(b, size);
+        mid = !aside.empty() ? s.rt->device(dev).load_module(aside.c_str()) : s.rt->device(dev).load_cubin(b, size);
       } catch (const vgpu::Error& e) {
         if (e.code() == vgpu::Err::InvalidValue) return CUDA_ERROR_INVALID_IMAGE;
         throw;
       }
+      loaded_cubin.assign(b, b + size);
     } else {
       mid = s.rt->device(dev).load_module(text);
     }
@@ -1263,6 +1527,13 @@ static CUresult cuModuleLoadData_impl(CUmodule* module, const void* image) {
     uintptr_t h = make_handle(s, kTagModule);
     s.modules[h] = {dev, mid};
     *module = reinterpret_cast<CUmodule>(h);
+    announce_module_loaded(h, dev, loaded_cubin.data(), loaded_cubin.size(),
+                           [&] {
+                             std::vector<std::string> names;
+                             if (vgpu::profiling::enabled()) names = s.rt->device(dev).kernel_names(mid);
+                             if (!loaded_cubin.empty()) std::reverse(names.begin(), names.end());
+                             return names;
+                           }());
     return CUDA_SUCCESS;
   });
 }
@@ -1296,11 +1567,20 @@ VGPU_EXPORT CUresult cuModuleLoad(CUmodule* module, const char* fname) {
 // Releasing the primary context. Nothing is cached per context here, so this
 // succeeds without tearing down the device -- except a fault a kernel left the
 // context with, which a reset is the one way out of, as cudaDeviceReset is.
-VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice) {
-  ShimState& s = state();
-  std::lock_guard<std::recursive_mutex> lock(s.mu);
-  if (s.initialized) s.rt->set_context_fault(0);
-  return CUDA_SUCCESS;
+//
+// Measured on an RTX 3060: the reset leaves the retain count alone (the release that follows it
+// succeeds, a second one is CUDA_ERROR_INVALID_CONTEXT), takes the context out of the active state,
+// and sets the flags back to 0; a device that does not exist is CUDA_ERROR_INVALID_DEVICE.
+VGPU_EXPORT CUresult cuDevicePrimaryCtxReset(CUdevice dev) {
+  return api("cuDevicePrimaryCtxReset", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    s.rt->set_context_fault(0);
+    s.primary_flags[dev] = 0;
+    s.primary_active.erase(dev);
+    if (const auto it = s.primary_ctx.find(dev); it != s.primary_ctx.end())
+      s.ctx_state[it->second].flags = kCtxMapHost;
+    return CUDA_SUCCESS;
+  });
 }
 
 /* ---- runtime JIT linking ----
@@ -1449,8 +1729,11 @@ CUresult check_prop(const CUmemAllocationProp* prop, ShimState& s, int* device_o
   if (prop->location.type != CU_MEM_LOCATION_TYPE_DEVICE) return CUDA_ERROR_INVALID_VALUE;
   if (prop->location.id < 0 || prop->location.id >= s.rt->device_count())
     return CUDA_ERROR_INVALID_DEVICE;
-  // An exportable handle would have to mean something to another process.
-  if (prop->requestedHandleTypes != 0) return CUDA_ERROR_NOT_SUPPORTED;
+  // Measured on an RTX 3060: the POSIX file descriptor type (1) makes the memory exportable
+  // (cuMemExportToShareableHandle); the Win32 (2), Win32 KMT (4) and fabric (8) types, alone or
+  // with another, are CUDA_ERROR_INVALID_VALUE; a bit beyond them is ignored.
+  const int types = prop->requestedHandleTypes;
+  if (types & (2 | 4 | 8)) return CUDA_ERROR_INVALID_VALUE;
   if (device_out) *device_out = prop->location.id;
   return CUDA_SUCCESS;
 }
@@ -1481,7 +1764,7 @@ VGPU_EXPORT CUresult cuMemCreate(CUmemGenericAllocationHandle* handle, size_t si
     if (!handle || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     int device = 0;
     if (const CUresult rc = check_prop(prop, s, &device); rc != CUDA_SUCCESS) return rc;
-    *handle = s.rt->device(device).memory().create_handle(size);
+    *handle = s.rt->device(device).memory().create_handle(size, prop->requestedHandleTypes & 1);
     return CUDA_SUCCESS;
   });
 }
@@ -1583,6 +1866,7 @@ VGPU_EXPORT CUresult cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp*
       }
       *prop = CUmemAllocationProp{};
       prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop->requestedHandleTypes = s.rt->device(d).memory().handle_types(handle);
       prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
       prop->location.id = d;
       return CUDA_SUCCESS;
@@ -1602,25 +1886,86 @@ VGPU_EXPORT CUresult cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* h
   });
 }
 
-VGPU_EXPORT CUresult cuMemExportToShareableHandle(void*, unsigned long long, int, unsigned long long) {
-  // Another process would have to be able to map the same memory; device
-  // memory here lives in this process's own sparse backing.
-  return CUDA_ERROR_NOT_SUPPORTED;
+// A handle made with the POSIX file descriptor handle type exports as a descriptor for an anonymous
+// file that holds its memory, which another process (or this one) imports with
+// cuMemImportFromShareableHandle and maps. Measured on an RTX 3060: exporting a handle that was not
+// made with the type, with another type, or with flags is CUDA_ERROR_INVALID_VALUE; importing a
+// descriptor that names no such file is CUDA_ERROR_INVALID_DEVICE (so is a Win32 type, which the
+// card cannot take), the fabric type is CUDA_ERROR_NOT_SUPPORTED, and a type that is no single
+// type is CUDA_ERROR_INVALID_VALUE.
+VGPU_EXPORT CUresult cuMemExportToShareableHandle(void* shareableHandle, unsigned long long handle,
+                                                  int handleType, unsigned long long flags) {
+  return api("cuMemExportToShareableHandle", true, false, [&](ShimState& s) {
+    if (!shareableHandle || !handle || flags != 0 || handleType != 1) return CUDA_ERROR_INVALID_VALUE;
+    for (int d = 0; d < s.rt->device_count(); ++d) {
+      try {
+        s.rt->device(d).memory().handle_size(handle);
+      } catch (const vgpu::Error&) {
+        continue;
+      }
+      try {
+        *static_cast<int*>(shareableHandle) = s.rt->device(d).memory().export_handle(handle);
+      } catch (const vgpu::Error& e) {
+        if (e.code() != vgpu::Err::InvalidValue) throw;
+        return CUDA_ERROR_INVALID_VALUE;
+      }
+      return CUDA_SUCCESS;
+    }
+    return CUDA_ERROR_INVALID_VALUE;
+  });
 }
-VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long*, void*, int) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT CUresult cuMemImportFromShareableHandle(unsigned long long* handle, void* osHandle, int shHandleType) {
+  return api("cuMemImportFromShareableHandle", true, false, [&](ShimState& s) {
+    if (!handle) return CUDA_ERROR_INVALID_VALUE;
+    switch (shHandleType) {
+      case 1: break;
+      case 2:
+      case 4: return CUDA_ERROR_INVALID_DEVICE;
+      case 8: return CUDA_ERROR_NOT_SUPPORTED;
+      default: return CUDA_ERROR_INVALID_VALUE;
+    }
+    // The descriptor is passed as the pointer-sized value the API takes.
+    const int fd = static_cast<int>(reinterpret_cast<intptr_t>(osHandle));
+    try {
+      *handle = current(s).memory().import_handle(fd);
+    } catch (const vgpu::Error& e) {
+      if (e.code() == vgpu::Err::NotFound) return CUDA_ERROR_INVALID_DEVICE;
+      throw;
+    }
+    return CUDA_SUCCESS;
+  });
 }
 
 // Multicast objects span several devices' memory; there is no such fabric here.
-VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long*, const void*) {
+// Every entry point answers CUDA_ERROR_NOT_SUPPORTED, and the first call says so on stderr.
+static CUresult multicast_not_supported(const char* api) {
+  static std::once_flag said;
+  std::call_once(said, [&] {
+    if (!quiet())
+      std::fprintf(stderr, "[vgpu] %s: multicast objects (NVLink SHARP) are not simulated; "
+                           "returning CUDA_ERROR_NOT_SUPPORTED\n", api);
+  });
   return CUDA_ERROR_NOT_SUPPORTED;
 }
+VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long*, const void*) {
+  return multicast_not_supported("cuMulticastCreate");
+}
 VGPU_EXPORT CUresult cuMulticastAddDevice(unsigned long long, CUdevice) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastAddDevice");
 }
 VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long, size_t, unsigned long long, size_t,
                                         size_t, unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastBindMem");
+}
+VGPU_EXPORT CUresult cuMulticastBindAddr(unsigned long long, size_t, unsigned long long, size_t,
+                                         unsigned long long) {
+  return multicast_not_supported("cuMulticastBindAddr");
+}
+VGPU_EXPORT CUresult cuMulticastUnbind(unsigned long long, CUdevice, size_t, size_t) {
+  return multicast_not_supported("cuMulticastUnbind");
+}
+VGPU_EXPORT CUresult cuMulticastGetGranularity(size_t*, const void*, int) {
+  return multicast_not_supported("cuMulticastGetGranularity");
 }
 
 // Stream memory ops. Work is synchronous, so the write happens now.
@@ -1677,6 +2022,20 @@ static CUresult cuModuleUnload_impl(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
+    {
+      ModuleProf m;
+      bool known = false;
+      {
+        std::lock_guard<std::mutex> lock(g_module_prof_mu);
+        const auto p = g_module_prof.find(h);
+        if (p != g_module_prof.end()) {
+          m = std::move(p->second);
+          g_module_prof.erase(p);
+          known = true;
+        }
+      }
+      if (known) announce_module_event(vgpu::profiling::Resource::ModuleUnloadStarting, m);
+    }
     unload_module(s, dev, mid);
     s.modules.erase(it);
     for (auto fit = s.functions.begin(); fit != s.functions.end();) {
@@ -1746,7 +2105,8 @@ constexpr CUresult kUnsupportedLimit = static_cast<CUresult>(215);   // kUnsuppo
 // compute capability `cc_major`: what cuCtxGetLimit, and a kernel's
 // cudaDeviceGetLimit, read. kUnsupportedLimit for a number that
 // names none, and for the sync depth from compute capability 9.0, which has none.
-CUresult limit_value(const ShimState::Limits& l, int cc_major, int limit, size_t* v) {
+CUresult limit_value(const ShimState::Limits& l, const vgpu::DeviceProfile& profile, int limit, size_t* v) {
+  const int cc_major = profile.cc_major;
   switch (limit) {
     case 0: *v = l.stack; return CUDA_SUCCESS;
     case 1: *v = l.printf_fifo; return CUDA_SUCCESS;
@@ -1758,7 +2118,12 @@ CUresult limit_value(const ShimState::Limits& l, int cc_major, int limit, size_t
     case 4: *v = l.pending_launches; return CUDA_SUCCESS;
     case 5: *v = l.l2_fetch_granularity; return CUDA_SUCCESS;
     case 6: *v = l.persisting_l2; return CUDA_SUCCESS;
-    default: return kUnsupportedLimit;
+    // The shared memory a multiprocessor offers less what the system keeps back (an RTX 3060: 100 KiB
+    // less 1 KiB, 101376), and whether CUDA in Graphics is enabled (never).
+    case 7: *v = profile.limits.shared_mem_per_sm - profile.reserved_smem_per_block(); return CUDA_SUCCESS;
+    case 8: *v = 0; return CUDA_SUCCESS;
+    case 9: return kUnsupportedLimit;
+    default: return CUDA_ERROR_INVALID_VALUE;
   }
 }
 
@@ -1784,7 +2149,7 @@ struct DriverDevRt final : vgpu::exec::devrt::Services {
     std::lock_guard<std::recursive_mutex> lock(s.mu);
     if (!s.initialized || device < 0 || device >= s.rt->device_count()) return 101;   // cudaErrorInvalidDevice
     size_t v = 0;
-    const CUresult r = limit_value(s.limits[device], s.rt->device(device).profile().cc_major, id, &v);
+    const CUresult r = limit_value(s.limits[device], s.rt->device(device).profile(), id, &v);
     if (r == CUDA_SUCCESS) *value = v;
     // kUnsupportedLimit is cudaErrorUnsupportedLimit, 215, in both.
     return static_cast<int>(r);
@@ -1867,11 +2232,42 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     }
     cfg.nonportable_cluster = rec.nonportable_cluster;
     if (launches_graphs(*rec.fn)) return CUDA_ERROR_NOT_SUPPORTED;
+    // On a stream that is capturing (a CUDA graph PyTorch is recording; the
+    // capture itself is the runtime's) the launch belongs to the graph: it
+    // becomes a kernel node and runs, repeated with these arguments, at each
+    // launch of the graph.
+    using RecordFn = bool (*)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, size_t,
+                              const std::function<void()>*);
+    if (auto record = reinterpret_cast<RecordFn>(dlsym(RTLD_DEFAULT, "vgpu_record_driver_launch_v1"))) {
+      const std::function<void()> again = [api_name, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
+                                           blockDimZ, sharedMemBytes, args, cooperative, cluster] {
+        std::vector<void*> ptrs(args.size());
+        for (size_t i = 0; i < args.size(); ++i) ptrs[i] = const_cast<uint8_t*>(args[i].data());
+        launch_kernel_common(api_name, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+                             sharedMemBytes, nullptr, ptrs.data(), nullptr, cooperative, cluster);
+      };
+      if (record(reinterpret_cast<void*>(hStream), gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+                 sharedMemBytes, &again))
+        return CUDA_SUCCESS;
+    }
     // What the device is limited to, and what a kernel's device runtime asks of this library.
     const ShimState::Limits& lim = s.limits[rec.device];
     cfg.device_heap_bytes = lim.malloc_heap;
     cfg.stack_bytes = lim.stack;
     cfg.devrt = &driver_devrt_services();
+    if (vgpu::profiling::hooked()) {
+      ModuleProf m;
+      bool known = false;
+      {
+        std::lock_guard<std::mutex> lock(g_module_prof_mu);
+        const auto p = g_module_prof.find(rec.module_handle);
+        if (p != g_module_prof.end()) {
+          m = p->second;
+          known = true;
+        }
+      }
+      if (known) announce_module_event(vgpu::profiling::Resource::ModuleProfiled, m);
+    }
     const bool profiling = vgpu::profiling::enabled();
     const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
     s.rt->device(rec.device).launch(*rec.fn, cfg, args, rec.syms);
@@ -1941,10 +2337,20 @@ VGPU_EXPORT CUresult cuLibraryLoadData(void** library, const void* code, void* j
     uint32_t magic = 0;
     std::memcpy(&magic, code, 4);
     LibRec lib;
-    if (magic == 0x466243B1u || magic == 0xBA55ED50u)
+    if (magic == 0x466243B1u || magic == 0xBA55ED50u) {
       lib.ptx = best_ptx(code);
-    else
+    } else if (magic == 0x464c457fu) {
+      // A cubin (NVRTC's, for one): run as SASS, or as the PTX NVRTC made it from where the SASS engine
+      // cannot yet. The same checks as cuModuleLoadData's.
+      const auto* b = static_cast<const uint8_t*>(code);
+      if (b[4] != 2 || (b[7] != 0x41 && b[7] != 0x33)) return CUDA_ERROR_INVALID_IMAGE;
+      const size_t size = bare_cubin_size(b);
+      std::string aside = ptx_for_unsupported_cubin(b, size);
+      if (!aside.empty()) lib.ptx = std::move(aside);
+      else lib.cubin.assign(reinterpret_cast<const char*>(b), size);
+    } else {
       lib.ptx.assign(static_cast<const char*>(code));  // NUL-terminated PTX text
+    }
     uintptr_t h = make_handle(s, kTagLibrary);
     s.libraries[h] = std::move(lib);
     *library = reinterpret_cast<void*>(h);
@@ -2645,6 +3051,7 @@ static CUresult cuMemHostAlloc_impl(void** pp, size_t bytesize, unsigned int fla
       s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
     pinned(s)[p] = vgpu::runtime::HostRange{bytesize, 0, flags};
     *pp = p;
+    profile_memory(1, reinterpret_cast<uint64_t>(p), bytesize, vgpu::profiling::MemKind::Pinned, current_device(s));
     return CUDA_SUCCESS;
   });
 }
@@ -2660,8 +3067,10 @@ VGPU_EXPORT CUresult cuMemAllocHost_v2(void** pp, size_t bytesize) {
 VGPU_EXPORT CUresult cuMemAllocHost(void** pp, size_t bytesize) { return cuMemHostAlloc_impl(pp, bytesize, 0); }
 static CUresult cuMemFreeHost_impl(void* p) {
   return api("cuMemFreeHost", true, false, [&](ShimState& s) {
+    if (!p) return CUDA_SUCCESS;   // as cuMemFree(0): a no-op, with or without a context
     auto it = pinned(s).find(p);
     if (it == pinned(s).end()) return CUDA_ERROR_INVALID_VALUE;
+    profile_memory(2, reinterpret_cast<uint64_t>(p), it->second.size, vgpu::profiling::MemKind::Pinned, current_device(s));
     for (int d = 0; d < s.rt->device_count(); ++d) s.rt->device(d).memory().unmap_host(reinterpret_cast<uint64_t>(p));
     pinned(s).erase(it);
     std::free(p);
@@ -2682,12 +3091,10 @@ VGPU_EXPORT CUresult cuMemFreeHost(void* p) {
 
 VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int flags) {
   return api("cuMemHostRegister", true, false, [&](ShimState& s) {
-    // PORTABLE, DEVICEMAP, IOMEMORY and READ_ONLY; nothing else. Read-only
-    // registration is not supported -- nothing here would stop a kernel
-    // writing -- which READ_ONLY_HOST_REGISTER_SUPPORTED (113) says, and
-    // which the documented answer for a device without it is.
+    // PORTABLE, DEVICEMAP, IOMEMORY and READ_ONLY; nothing else. Read-only registration works
+    // (READ_ONLY_HOST_REGISTER_SUPPORTED, 113, is 1): the device reads the range and a kernel's
+    // store or atomic to it faults, as on an RTX 3060.
     if (!p || bytesize == 0 || (flags & ~0xFu)) return CUDA_ERROR_INVALID_VALUE;
-    if (flags & CU_MEMHOSTREGISTER_READ_ONLY) return CUDA_ERROR_NOT_SUPPORTED;
     auto& regs = registrations(s);
     const char* lo = static_cast<const char*>(p);
     void* hi = static_cast<char*>(p) + bytesize;
@@ -2704,7 +3111,8 @@ VGPU_EXPORT CUresult cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int
       return CUDA_ERROR_INVALID_VALUE;
     const int dev = current_device(s);
     for (int d = 0; d < s.rt->device_count(); ++d)
-      s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize);
+      s.rt->device(d).memory().map_host(reinterpret_cast<uint64_t>(p), p, bytesize,
+                                        (flags & CU_MEMHOSTREGISTER_READ_ONLY) != 0);
     regs[p] = vgpu::runtime::HostRange{bytesize, dev, flags};
     return CUDA_SUCCESS;
   });
@@ -2875,13 +3283,31 @@ size_t format_bytes(const CUarray_format& f) {
   return 0;
 }
 
+// The descriptor's format as the texture unit sees it, with the channel count the format has, or false
+// for one the card refuses (CUDA_ERROR_INVALID_VALUE): see texture_format_from_driver.
+bool array_format(const CUDA_ARRAY3D_DESCRIPTOR& d, vgpu::cuda::TexFormat* tf) {
+  unsigned raw;
+  static_assert(sizeof raw == sizeof d.Format);
+  std::memcpy(&raw, &d.Format, sizeof raw);
+  return vgpu::cuda::texture_format_from_driver(raw, d.NumChannels, tf);
+}
+
+// Block-compressed data cannot be read or written as a surface: asking for the surface flag on such an array
+// is CUDA_ERROR_NOT_SUPPORTED (measured on an RTX 3060, for plain and mipmapped arrays).
+bool surface_on_blocks(const CUDA_ARRAY3D_DESCRIPTOR& d) {
+  vgpu::cuda::TexFormat tf;
+  return array_format(d, &tf) && tf.block != vgpu::exec::BlockFormat::None && (d.Flags & CUDA_ARRAY3D_SURFACE_LDST);
+}
+
 bool valid_array(const CUDA_ARRAY3D_DESCRIPTOR& d) {
   const unsigned known = CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_SURFACE_LDST | CUDA_ARRAY3D_CUBEMAP |
                          CUDA_ARRAY3D_TEXTURE_GATHER;
   if (d.Flags & ~known) return false;
-  if (!format_bytes(d.Format)) return false;
-  if (d.NumChannels != 1 && d.NumChannels != 2 && d.NumChannels != 4) return false;
+  vgpu::cuda::TexFormat tf;
+  if (!array_format(d, &tf)) return false;
   if (d.Width == 0) return false;
+  // A block-compressed array has at least two dimensions (measured: a zero height is invalid).
+  if (tf.block != vgpu::exec::BlockFormat::None && d.Height == 0) return false;
   const bool layered = d.Flags & CUDA_ARRAY3D_LAYERED, cube = d.Flags & CUDA_ARRAY3D_CUBEMAP;
   if (cube) {
     if (d.Width != d.Height) return false;
@@ -3005,9 +3431,12 @@ namespace {
 uintptr_t create_array(ShimState& s, const CUDA_ARRAY3D_DESCRIPTOR& desc) {
   ArrayRec r;
   r.desc = desc;
-  r.elem = format_bytes(desc.Format) * desc.NumChannels;
-  r.row = desc.Width * r.elem;
-  r.rows = desc.Height ? desc.Height : 1;
+  array_format(desc, &r.tf);
+  r.elem = r.tf.texel_bytes;
+  const bool blocky = r.tf.block != vgpu::exec::BlockFormat::None;
+  // A block-compressed array holds 4 x 4 blocks: its rows are rows of blocks (which is what a copy addresses).
+  r.row = (blocky ? (desc.Width + 3) / 4 : desc.Width) * r.elem;
+  r.rows = blocky ? (desc.Height + 3) / 4 : (desc.Height ? desc.Height : 1);
   r.slices = desc.Depth ? desc.Depth : 1;
   r.device = current_device(s);
   r.mem = current(s).memory().alloc(r.row * r.rows * r.slices);
@@ -3020,6 +3449,7 @@ uintptr_t create_array(ShimState& s, const CUDA_ARRAY3D_DESCRIPTOR& desc) {
 VGPU_EXPORT CUresult cuArray3DCreate_v2(CUarray* out, const CUDA_ARRAY3D_DESCRIPTOR* desc) {
   return api("cuArray3DCreate", true, false, [&](ShimState& s) {
     if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
+    if (surface_on_blocks(*desc)) return CUDA_ERROR_NOT_SUPPORTED;
     *out = reinterpret_cast<CUarray>(create_array(s, *desc));
     return CUDA_SUCCESS;
   });
@@ -3032,7 +3462,9 @@ VGPU_EXPORT CUresult cuArrayCreate_v2(CUarray* out, const CUDA_ARRAY_DESCRIPTOR*
   CUDA_ARRAY3D_DESCRIPTOR d{};
   d.Width = desc->Width;
   d.Height = desc->Height;
-  d.Format = desc->Format;
+  // Copied as bytes: a program may pass a format the enum does not name (the card refuses it), and loading that
+  // as the enum is undefined behaviour.
+  std::memcpy(&d.Format, &desc->Format, sizeof d.Format);
   d.NumChannels = desc->NumChannels;
   return cuArray3DCreate_v2(out, &d);
 }
@@ -3170,6 +3602,7 @@ VGPU_EXPORT CUresult cuMipmappedArrayCreate(CUmipmappedArray* out, const CUDA_AR
                                             unsigned int numLevels) {
   return api("cuMipmappedArrayCreate", true, false, [&](ShimState& s) {
     if (!out || !desc || !valid_array(*desc)) return CUDA_ERROR_INVALID_VALUE;
+    if (surface_on_blocks(*desc)) return CUDA_ERROR_NOT_SUPPORTED;
     const bool layers = desc->Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP);
     const size_t largest = std::max({desc->Width, desc->Height, layers ? size_t{0} : desc->Depth});
     unsigned full = 1;
@@ -3453,31 +3886,24 @@ struct TextureDescABI {
 
 uint64_t next_texobj = uint64_t{1} << 40;
 
-// A driver format's channel kind and width, or false for one this does not read.
-bool format_kind(const CUarray_format& f, vgpu::exec::ChannelKind* kind, uint32_t* bits) {
-  unsigned raw;
-  std::memcpy(&raw, &f, sizeof raw);
-  switch (raw) {
-    case CU_AD_FORMAT_UNSIGNED_INT8: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 8; return true;
-    case CU_AD_FORMAT_UNSIGNED_INT16: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 16; return true;
-    case CU_AD_FORMAT_UNSIGNED_INT32: *kind = vgpu::exec::ChannelKind::Unsigned; *bits = 32; return true;
-    case CU_AD_FORMAT_SIGNED_INT8: *kind = vgpu::exec::ChannelKind::Signed; *bits = 8; return true;
-    case CU_AD_FORMAT_SIGNED_INT16: *kind = vgpu::exec::ChannelKind::Signed; *bits = 16; return true;
-    case CU_AD_FORMAT_SIGNED_INT32: *kind = vgpu::exec::ChannelKind::Signed; *bits = 32; return true;
-    case CU_AD_FORMAT_HALF: *kind = vgpu::exec::ChannelKind::Float; *bits = 16; return true;
-    case CU_AD_FORMAT_FLOAT: *kind = vgpu::exec::ChannelKind::Float; *bits = 32; return true;
-  }
-  return false;
+// The format part of a descriptor, from a format and channel count the texture unit takes.
+void apply_texture_format(vgpu::exec::TextureDesc* d, const vgpu::cuda::TexFormat& f) {
+  d->kind = f.kind;
+  d->channels = f.channels;
+  for (int c = 0; c < 4; ++c) d->channel_bits[c] = f.bits[c];
+  d->block = f.block;
+  d->packed_1010102 = f.packed_1010102;
+  d->texel_bytes = vgpu::cuda::sampled_texel_bytes(f);
 }
 
-// The format part of a descriptor: channels of one kind and width.
-CUresult set_format(vgpu::exec::TextureDesc* d, const CUarray_format& format, unsigned channels) {
-  uint32_t bits = 0;
-  if (!format_kind(format, &d->kind, &bits)) return CUDA_ERROR_NOT_SUPPORTED;
-  if (channels != 1 && channels != 2 && channels != 4) return CUDA_ERROR_INVALID_VALUE;
-  d->channels = channels;
-  for (unsigned c = 0; c < 4; ++c) d->channel_bits[c] = c < channels ? bits : 0;
-  d->texel_bytes = bits / 8 * channels;
+// A linear or pitched resource takes the plain formats and 10:10:10:2 only (measured on an RTX 3060: the
+// normalized and block-compressed ones are CUDA_ERROR_INVALID_VALUE there, as is a channel count the format
+// does not have); the format's checks are texture_format_from_driver's.
+CUresult linear_format(const CUarray_format& format, unsigned channels, vgpu::cuda::TexFormat* tf) {
+  unsigned raw;
+  std::memcpy(&raw, &format, sizeof raw);
+  if (!vgpu::cuda::texture_format_from_driver(raw, channels, tf)) return CUDA_ERROR_INVALID_VALUE;
+  if (tf->block != vgpu::exec::BlockFormat::None || tf->norm_only) return CUDA_ERROR_INVALID_VALUE;
   return CUDA_SUCCESS;
 }
 
@@ -3494,13 +3920,16 @@ void set_array_shape(vgpu::exec::TextureDesc* d, const ArrayRec& a) {
   d->from_array = true;
 }
 
-CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::TextureDesc* d) {
+CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::TextureDesc* d,
+                           vgpu::cuda::TexFormat* tf) {
   switch (r.type) {
     case 0: {   // CU_RESOURCE_TYPE_ARRAY
       const ArrayRec* a = array_rec(s, r.res.array.array);
       if (!a) return CUDA_ERROR_INVALID_HANDLE;
       set_array_shape(d, *a);
-      return set_format(d, a->desc.Format, a->desc.NumChannels);
+      *tf = a->tf;
+      apply_texture_format(d, *tf);
+      return CUDA_SUCCESS;
     }
     case 1: {   // CU_RESOURCE_TYPE_MIPMAPPED_ARRAY
       auto it = s.mipmaps.find(reinterpret_cast<uintptr_t>(r.res.mipmap.mipmap));
@@ -3511,11 +3940,14 @@ CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::T
       set_array_shape(d, a);
       d->mip_levels = static_cast<uint32_t>(lv.size());
       for (size_t l = 0; l < lv.size(); ++l) d->level_base[l] = s.arrays.at(lv[l]).mem;
-      return set_format(d, a.desc.Format, a.desc.NumChannels);
+      *tf = a.tf;
+      apply_texture_format(d, *tf);
+      return CUDA_SUCCESS;
     }
     case 2: {   // CU_RESOURCE_TYPE_LINEAR
       if (!r.res.linear.ptr) return CUDA_ERROR_INVALID_VALUE;
-      if (CUresult e = set_format(d, r.res.linear.format, r.res.linear.channels)) return e;
+      if (CUresult e = linear_format(r.res.linear.format, r.res.linear.channels, tf)) return e;
+      apply_texture_format(d, *tf);
       d->base = r.res.linear.ptr;
       d->width = static_cast<uint32_t>(r.res.linear.bytes / d->texel_bytes);
       d->pitch_bytes = 0;
@@ -3523,7 +3955,8 @@ CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::T
     }
     case 3: {   // CU_RESOURCE_TYPE_PITCH2D
       if (!r.res.pitch2d.ptr) return CUDA_ERROR_INVALID_VALUE;
-      if (CUresult e = set_format(d, r.res.pitch2d.format, r.res.pitch2d.channels)) return e;
+      if (CUresult e = linear_format(r.res.pitch2d.format, r.res.pitch2d.channels, tf)) return e;
+      apply_texture_format(d, *tf);
       d->base = r.res.pitch2d.ptr;
       d->width = static_cast<uint32_t>(r.res.pitch2d.width);
       d->height = static_cast<uint32_t>(r.res.pitch2d.height);
@@ -3535,28 +3968,46 @@ CUresult describe_resource(ShimState& s, const ResourceDescABI& r, vgpu::exec::T
   }
 }
 
+// CUDA_RESOURCE_VIEW_DESC.
+struct ViewDescABI {
+  int format;
+  size_t width, height, depth;
+  unsigned first_mip, last_mip, first_layer, last_layer;
+  unsigned reserved[16];
+};
+
 CUresult make_object(const char* name, unsigned long long* out, const void* res, const void* tex,
                      const void* view, vgpu::exec::TexKind kind) {
   return api(name, true, false, [&](ShimState& s) -> CUresult {
     if (!out || !res) return CUDA_ERROR_INVALID_VALUE;
-    if (view) return CUDA_ERROR_NOT_SUPPORTED;   // a resource view reinterprets the format
     vgpu::exec::TextureDesc d;
     d.object = kind;
-    if (CUresult e = describe_resource(s, *static_cast<const ResourceDescABI*>(res), &d)) return e;
+    vgpu::cuda::TexFormat format;
+    const auto& rdesc = *static_cast<const ResourceDescABI*>(res);
+    if (CUresult e = describe_resource(s, rdesc, &d, &format)) return e;
+    // A surface cannot be made over block-compressed data (measured on an RTX 3060: invalid value).
+    if (kind == vgpu::exec::TexKind::Surface && format.block != vgpu::exec::BlockFormat::None)
+      return CUDA_ERROR_INVALID_VALUE;
+    bool srgb_flag = false;
     if (const auto* t = static_cast<const TextureDescABI*>(tex)) {
       for (int i = 0; i < 3; ++i) {
         if (t->address[i] < 0 || t->address[i] > 3) return CUDA_ERROR_INVALID_VALUE;
         d.address[i] = static_cast<vgpu::exec::TexAddress>(t->address[i]);   // the same order
       }
-      if (t->max_anisotropy > 1) return CUDA_ERROR_NOT_SUPPORTED;
+      // Anisotropy changes a result only when a sample's footprint is stretched, which a fetch with no
+      // derivatives (LOD 0, or an explicit one) never is: any value is accepted, as the card accepts any
+      // (measured: 0, 1, 2, 8, 16, 17, 100 and 2^32-1), and has nothing to act on.
       d.filter = t->filter == 1 ? vgpu::exec::TexFilter::Linear : vgpu::exec::TexFilter::Point;
       d.normalized_coords = t->flags & CU_TRSF_NORMALIZED_COORDINATES;
-      d.srgb = t->flags & CU_TRSF_SRGB;
+      srgb_flag = t->flags & CU_TRSF_SRGB;
+      d.srgb = srgb_flag;
       // Integer texels come back as floats in [0, 1] or [-1, 1] unless
       // CU_TRSF_READ_AS_INTEGER keeps them integers -- the driver's default is
-      // the opposite of the runtime's. Only 8- and 16-bit channels promote.
-      d.read_as_normalized_float = !(t->flags & CU_TRSF_READ_AS_INTEGER) &&
-                                   d.kind != vgpu::exec::ChannelKind::Float && d.channel_bits[0] < 32;
+      // the opposite of the runtime's. Only 8- and 16-bit channels promote; the normalized,
+      // block-compressed and 10:10:10:2 formats always come back as floats.
+      d.read_as_normalized_float = format.norm_only || format.packed_1010102 ||
+                                   (!(t->flags & CU_TRSF_READ_AS_INTEGER) &&
+                                    d.kind != vgpu::exec::ChannelKind::Float && d.channel_bits[0] < 32);
       static_assert(sizeof d.border_bits == sizeof t->border);
       std::memcpy(d.border_bits, t->border, sizeof d.border_bits);
       auto q = [](float v) { return static_cast<int32_t>(std::trunc(std::clamp(v, -1e6f, 1e6f) * 256)); };
@@ -3564,6 +4015,30 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
       d.mip_bias = q(t->mip_bias);
       d.mip_min = q(t->mip_min);
       d.mip_max = q(t->mip_max);
+    } else {
+      d.read_as_normalized_float = format.norm_only || format.packed_1010102;
+    }
+    // The sRGB block-compressed formats need the sRGB flag (measured: invalid value without it).
+    if (format.srgb_only && !srgb_flag) return CUDA_ERROR_INVALID_VALUE;
+    if (view) {
+      const auto& v = *static_cast<const ViewDescABI*>(view);
+      const bool array = rdesc.type == 0 || rdesc.type == 1;
+      if (const int e = vgpu::cuda::apply_view_format(v.format, v.width, v.height, v.depth, v.first_mip,
+                                                      v.last_mip, v.first_layer, v.last_layer, array, &d, &format))
+        return static_cast<CUresult>(e);
+      d.read_as_normalized_float = d.read_as_normalized_float || format.norm_only || format.packed_1010102;
+    }
+    // BC6H and BC7 arrays can be made and filled (their blocks are only bytes), but a texture of them cannot be
+    // sampled here: their decoders are not written. Say so, by name, once (the real driver takes them).
+    if (d.block == vgpu::exec::BlockFormat::BC6HU || d.block == vgpu::exec::BlockFormat::BC6HS ||
+        d.block == vgpu::exec::BlockFormat::BC7) {
+      static std::once_flag said;
+      std::call_once(said, [&] {
+        if (!quiet())
+          std::fprintf(stderr, "[vgpu] %s: textures of BC6H and BC7 blocks are not implemented (BC1 to BC5 are); "
+                               "returning CUDA_ERROR_NOT_SUPPORTED\n", name);
+      });
+      return CUDA_ERROR_NOT_SUPPORTED;
     }
     const uint64_t handle = next_texobj++;
     current(s).textures()[handle] = d;
@@ -3788,21 +4263,19 @@ VGPU_EXPORT CUresult cuMemPoolCreate(void** pool, const void* poolProps) {
     if (!pool || !poolProps) return CUDA_ERROR_INVALID_VALUE;
     const auto* props = static_cast<const MemPoolPropsABI*>(poolProps);
     if (props->alloc_type != kMemAllocationTypePinned) return CUDA_ERROR_INVALID_VALUE;
-    // A pool on the host, or on a NUMA node, would hold host memory the
-    // device reaches; only device pools are made here.
+    // Measured on an RTX 3060 (driver 13.2): a location that is none, a device that does not exist and
+    // a handle type (the device supports none: cuDeviceGetAttribute
+    // CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES is 0) are all CUDA_ERROR_INVALID_VALUE. A pool on
+    // the host, or on a NUMA node, would hold host memory the device reaches: the card makes one, and
+    // only device pools are made here.
+    if (props->location.type == 0) return CUDA_ERROR_INVALID_VALUE;
     if (props->location.type != kMemLocationTypeDevice) {
       report("cuMemPoolCreate", "only a pool located on a device is implemented (a host or NUMA "
                                 "location is not)");
       return CUDA_ERROR_NOT_SUPPORTED;
     }
-    if (props->location.id < 0 || props->location.id >= s.rt->device_count()) return CUDA_ERROR_INVALID_DEVICE;
-    // A pool another process could allocate from would have to share this
-    // process's own memory.
-    if (props->handle_types != 0) {
-      report("cuMemPoolCreate", "a pool that exports shareable handles is not implemented: device "
-                                "memory here is this process's own");
-      return CUDA_ERROR_NOT_SUPPORTED;
-    }
+    if (props->location.id < 0 || props->location.id >= s.rt->device_count()) return CUDA_ERROR_INVALID_VALUE;
+    if (props->handle_types != 0) return CUDA_ERROR_INVALID_VALUE;
     s.pools.emplace_back();
     PoolRec& p = s.pools.back();
     p.device = props->location.id;
@@ -3929,21 +4402,26 @@ VGPU_EXPORT CUresult cuMemPoolGetAccess(int* flags, void* pool, void* location) 
 
 // Sharing a pool, or one of its allocations, with another process needs memory
 // that process can map; device memory here is this process's own sparse backing.
+// Sharing a pool, or a pointer from one, with another process: the device supports no handle type for pools
+// (CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES is 0), so no pool can be exported. Measured on an
+// RTX 3060, as the runtime's calls of the same names are: the exports are CUDA_ERROR_INVALID_VALUE
+// whatever is passed; an import checks its pointers, flags (0 only) and type first -- the file descriptor, Win32 and
+// fabric types the device does not support are CUDA_ERROR_NOT_SUPPORTED, any other type
+// CUDA_ERROR_INVALID_VALUE; the pointer calls are CUDA_ERROR_INVALID_VALUE.
 VGPU_EXPORT CUresult cuMemPoolExportToShareableHandle(void*, void*, int, unsigned long long) {
-  report("cuMemPoolExportToShareableHandle", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return api("cuMemPoolExportToShareableHandle", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
-VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void**, void*, int, unsigned long long) {
-  report("cuMemPoolImportFromShareableHandle", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void** pool, void* handle, int type, unsigned long long flags) {
+  return api("cuMemPoolImportFromShareableHandle", true, false, [&](ShimState&) {
+    if (!pool || !handle || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    return type == 1 || type == 2 || type == 8 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+  });
 }
 VGPU_EXPORT CUresult cuMemPoolExportPointer(void*, CUdeviceptr) {
-  report("cuMemPoolExportPointer", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return api("cuMemPoolExportPointer", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
 VGPU_EXPORT CUresult cuMemPoolImportPointer(CUdeviceptr*, void*, void*) {
-  report("cuMemPoolImportPointer", "not implemented: device memory here is this process's own");
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return api("cuMemPoolImportPointer", true, false, [&](ShimState&) { return CUDA_ERROR_INVALID_VALUE; });
 }
 
 /* ---- pitched memory, module globals, context configuration ----
@@ -4007,12 +4485,16 @@ VGPU_EXPORT CUresult cuCtxGetCacheConfig(int* config) {
 // configuration is accepted and has no effect, and the answer stays
 // CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE, as the card's does.
 VGPU_EXPORT CUresult cuCtxSetSharedMemConfig(int config) {
-  return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  return api("cuCtxSetSharedMemConfig", true, false, [&](ShimState&) {
+    return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  });
 }
 VGPU_EXPORT CUresult cuCtxGetSharedMemConfig(int* config) {
-  if (!config) return CUDA_ERROR_INVALID_VALUE;
-  *config = 1;
-  return CUDA_SUCCESS;
+  return api("cuCtxGetSharedMemConfig", true, false, [&](ShimState&) {
+    if (!config) return CUDA_ERROR_INVALID_VALUE;
+    *config = 1;
+    return CUDA_SUCCESS;
+  });
 }
 VGPU_EXPORT CUresult cuFuncSetSharedMemConfig(CUfunction, int config) {
   return config >= 0 && config <= 2 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
@@ -4092,6 +4574,11 @@ VGPU_EXPORT CUresult cuLaunchHostFunc(CUstream, CUhostFn fn, void* user) {
 // Always idle. The card records a query that finds the stream idle as a wait
 // on it, and tells a subscriber the stream was synchronized.
 static CUresult cuStreamQuery_impl(CUstream stream) {
+  {   // with no current context the card answers CUDA_ERROR_INVALID_CONTEXT
+    ShimState& st = state();
+    std::lock_guard<std::recursive_mutex> lock(st.mu);
+    if (st.initialized && ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+  }
   const CUresult r = dead_context();
   if (r == CUDA_SUCCESS)
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Stream, reinterpret_cast<uint64_t>(stream), 0,
@@ -4143,14 +4630,32 @@ VGPU_EXPORT CUresult cuStreamGetCtx_v2(CUstream stream, CUcontext* pctx, CUgreen
   if (r == CUDA_SUCCESS && pgreen) *pgreen = nullptr;
   return r;
 }
-VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream, int* status, unsigned long long* id,
-                                               void*, const void**, size_t*) {
+// Capture is the runtime's (cudaStreamBeginCapture); the driver asks it by name,
+// so a program that never loaded libcudart has nothing capturing.
+VGPU_EXPORT CUresult cuStreamGetCaptureInfo_v2(CUstream stream, int* status, unsigned long long* id,
+                                               void* graph, const void** deps, size_t* ndeps) {
+  using Fn = int (*)(void*, int*, unsigned long long*, void*, const void**, size_t*);
+  auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamGetCaptureInfo_v2"));
+  if (!fn) fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamGetCaptureInfo"));
+  if (fn) {
+    int st = 0;
+    unsigned long long cid = 0;
+    if (fn(stream, &st, &cid, graph, deps, ndeps) == 0) {
+      if (status) *status = st;   // the runtime's cudaStreamCaptureStatus has the driver's values
+      if (id) *id = cid;
+      return CUDA_SUCCESS;
+    }
+  }
   if (status) *status = 0;  // CU_STREAM_CAPTURE_STATUS_NONE
   if (id) *id = 0;
   return CUDA_SUCCESS;
 }
-VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream, int* status) {
-  if (status) *status = 0;
+VGPU_EXPORT CUresult cuStreamIsCapturing(CUstream stream, int* status) {
+  using Fn = int (*)(void*, int*);
+  auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "cudaStreamIsCapturing"));
+  int st = 0;
+  if (fn && fn(stream, &st) != 0) st = 0;
+  if (status) *status = st;
   return CUDA_SUCCESS;
 }
 
@@ -4167,12 +4672,22 @@ static CUresult cuEventCreate_impl(void** ev, unsigned int flags) {
 VGPU_EXPORT CUresult cuEventCreate(void** ev, unsigned int flags) {
   return traced("cuEventCreate", cuEventCreate_impl, ev, flags);
 }
-static CUresult cuEventRecord_impl(void* ev, CUstream) {
+static CUresult cuEventRecord_impl(void* ev, CUstream stream) {
   return api("cuEventRecord", true, false, [&](ShimState& s) {
     auto it = s.events.find(reinterpret_cast<uintptr_t>(ev));
     if (it == s.events.end()) return CUDA_ERROR_INVALID_VALUE;
     it->second.recorded = true;
     clock_gettime(CLOCK_MONOTONIC, &it->second.when);
+    if (vgpu::profiling::enabled()) {
+      vgpu::profiling::Event e;
+      e.kind = vgpu::profiling::EventKind::CudaEvent;
+      e.start_ns = e.end_ns = vgpu::profiling::now_ns();
+      e.device = static_cast<uint32_t>(current_device(s));
+      e.correlation = vgpu::profiling::work_correlation();
+      e.stream = reinterpret_cast<uint64_t>(stream);
+      e.handle = reinterpret_cast<uint64_t>(ev);
+      vgpu::profiling::record(std::move(e));
+    }
     return CUDA_SUCCESS;
   });
 }
@@ -4180,8 +4695,13 @@ VGPU_EXPORT CUresult cuEventRecord(void* ev, CUstream a1) {
   return traced("cuEventRecord", cuEventRecord_impl, ev, a1);
 }
 // Like a stream query, a query that finds the event done is recorded as a wait on it.
+//
+// A NULL event is CUDA_ERROR_INVALID_HANDLE, as on the card. (Events the runtime made are
+// handles here too, so a handle this library never saw is not necessarily wrong.)
+static CUresult event_exists(void* event) { return event ? CUDA_SUCCESS : CUDA_ERROR_INVALID_HANDLE; }
 static CUresult cuEventQuery_impl(void* event) {
-  const CUresult r = dead_context();
+  CUresult r = dead_context();
+  if (r == CUDA_SUCCESS) r = event_exists(event);
   if (r == CUDA_SUCCESS)
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Event, 0, reinterpret_cast<uint64_t>(event),
                                       profiled_device());
@@ -4189,7 +4709,8 @@ static CUresult cuEventQuery_impl(void* event) {
 }
 VGPU_EXPORT CUresult cuEventQuery(void* event) { return traced("cuEventQuery", cuEventQuery_impl, event); }
 static CUresult cuEventSynchronize_impl(void* event) {
-  const CUresult r = dead_context();
+  CUresult r = dead_context();
+  if (r == CUDA_SUCCESS) r = event_exists(event);
   if (r == CUDA_SUCCESS)
     vgpu::profiling::SyncScope waited(vgpu::profiling::SyncKind::Event, 0, reinterpret_cast<uint64_t>(event),
                                       profiled_device());
@@ -4248,7 +4769,7 @@ VGPU_EXPORT CUresult cuCtxPushCurrent_v2(CUcontext ctx) {
 }
 VGPU_EXPORT CUresult cuCtxPushCurrent(CUcontext ctx) { return cuCtxPushCurrent_v2(ctx); }
 VGPU_EXPORT CUresult cuCtxPopCurrent_v2(CUcontext* pctx) {
-  return api("cuCtxPopCurrent", true, false, [&](ShimState& s) {
+  return api("cuCtxPopCurrent", true, false, [&](ShimState&) {
     if (ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     if (pctx) *pctx = reinterpret_cast<CUcontext>(ctx_stack().back());
     ctx_stack().pop_back();
@@ -4259,62 +4780,136 @@ VGPU_EXPORT CUresult cuCtxPopCurrent(CUcontext* pctx) { return cuCtxPopCurrent_v
 
 VGPU_EXPORT CUresult cuCtxGetLimit(size_t* v, int limit) {
   if (const CUresult dead = dead_context()) return dead;
-  if (!v) return CUDA_ERROR_INVALID_VALUE;
   return api("cuCtxGetLimit", false, false, [&](ShimState& s) {
-    // With no context current -- or no machine yet -- the defaults of device 0.
-    if (!s.initialized || ctx_stack().empty()) return limit_value(ShimState::Limits{}, 8, limit, v);
+    // With no context current -- or no machine yet -- the card answers
+    // CUDA_ERROR_INVALID_CONTEXT, as it does for every call that needs one.
+    if (!s.initialized || ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
+    if (!v) return CUDA_ERROR_INVALID_VALUE;
     const int device = current_device(s);
-    return limit_value(s.limits[device], s.rt->device(device).profile().cc_major, limit, v);
+    return limit_value(s.limits[device], s.rt->device(device).profile(), limit, v);
   });
 }
 VGPU_EXPORT CUresult cuCtxSetLimit(int limit, size_t value) {
   if (const CUresult dead = dead_context()) return dead;
   return api("cuCtxSetLimit", false, false, [&](ShimState& s) {
-    if (!s.initialized || ctx_stack().empty()) return CUDA_SUCCESS;   // nothing to set on; as it always was
+    if (!s.initialized || ctx_stack().empty()) return CUDA_ERROR_INVALID_CONTEXT;
     const int device = current_device(s);
     ShimState::Limits& l = s.limits[device];
+    // Measured on an RTX 3060 (driver 13.2): a limit above its largest is CUDA_ERROR_INVALID_VALUE
+    // where the stack (more than the 512 KiB of local memory a thread has), the device runtime's
+    // synchronization depth (24) and the L2 fetch granularity (128) are concerned; the printf FIFO
+    // and the malloc heap are raised to their smallest instead; and the shared memory size and
+    // CIG limits (7 and 8) can be read and not set (CUDA_ERROR_NOT_PERMITTED).
     switch (limit) {
-      case 0: l.stack = (value + 15) / 16 * 16; return CUDA_SUCCESS;   // a whole element
-      case 1: l.printf_fifo = value; return CUDA_SUCCESS;
-      case 2: l.malloc_heap = value; return CUDA_SUCCESS;
+      case 0:
+        if (value > (512u << 10)) return CUDA_ERROR_INVALID_VALUE;
+        l.stack = (value + 15) / 16 * 16;   // a whole element
+        return CUDA_SUCCESS;
+      case 1: l.printf_fifo = std::max<size_t>(value, 393216); return CUDA_SUCCESS;
+      case 2: l.malloc_heap = std::max<size_t>(value, 4u << 20); return CUDA_SUCCESS;
       case 3:
         if (s.rt->device(device).profile().cc_major >= 9) return kUnsupportedLimit;
-        l.sync_depth = std::min<size_t>(value, 24);
+        if (value > 24) return CUDA_ERROR_INVALID_VALUE;
+        l.sync_depth = value;
         return CUDA_SUCCESS;
-      case 4: l.pending_launches = value; return CUDA_SUCCESS;
-      case 5: l.l2_fetch_granularity = std::min<size_t>(value, 128); return CUDA_SUCCESS;
+      case 4: l.pending_launches = std::max<size_t>(value, 32); return CUDA_SUCCESS;
+      case 5:
+        if (value > 128) return CUDA_ERROR_INVALID_VALUE;
+        l.l2_fetch_granularity = value;
+        return CUDA_SUCCESS;
       case 6: l.persisting_l2 = 0; return CUDA_SUCCESS;   // nothing to set aside
-      default: return kUnsupportedLimit;
+      case 7:
+      case 8: return static_cast<CUresult>(800);   // CUDA_ERROR_NOT_PERMITTED
+      case 9: return kUnsupportedLimit;
+      default: return CUDA_ERROR_INVALID_VALUE;
     }
   });
 }
-VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext, unsigned int* v) {
-  if (v) *v = 3020;
+// The context an entry point means: the one named, or the thread's current one for NULL.
+// CUDA_ERROR_INVALID_CONTEXT for none, or for one that does not exist.
+static CUresult named_or_current_context(ShimState& s, CUcontext ctx, uintptr_t* out) {
+  if (ctx) {
+    const uintptr_t h = reinterpret_cast<uintptr_t>(ctx);
+    if (!s.contexts.count(h)) return CUDA_ERROR_INVALID_CONTEXT;
+    *out = h;
+    return CUDA_SUCCESS;
+  }
+  if (ctx_stack().empty() || !s.contexts.count(ctx_stack().back())) return CUDA_ERROR_INVALID_CONTEXT;
+  *out = ctx_stack().back();
   return CUDA_SUCCESS;
+}
+// 3020 is what an RTX 3060's driver 13.2 answers for any context.
+VGPU_EXPORT CUresult cuCtxGetApiVersion(CUcontext ctx, unsigned int* v) {
+  return api("cuCtxGetApiVersion", true, false, [&](ShimState& s) {
+    uintptr_t h = 0;
+    if (const CUresult r = named_or_current_context(s, ctx, &h); r != CUDA_SUCCESS) return r;
+    if (!v) return CUDA_ERROR_INVALID_VALUE;
+    *v = 3020;
+    return CUDA_SUCCESS;
+  });
 }
 VGPU_EXPORT CUresult cuCtxGetStreamPriorityRange(int* least, int* greatest) {
-  if (least) *least = vgpu::cuda::kLeastStreamPriority;
-  if (greatest) *greatest = vgpu::cuda::kGreatestStreamPriority;
-  return CUDA_SUCCESS;
+  return api("cuCtxGetStreamPriorityRange", true, false, [&](ShimState&) {
+    if (least) *least = vgpu::cuda::kLeastStreamPriority;
+    if (greatest) *greatest = vgpu::cuda::kGreatestStreamPriority;
+    return CUDA_SUCCESS;
+  });
 }
+// The flags the current context reports: as it was created (cuCtxCreate), or, for a primary one,
+// the flags set for the device with MAP_HOST always on; cuCtxSetFlags changes the scheduling
+// mode, LMEM_RESIZE_TO_MAX and SYNC_MEMOPS (measured).
 VGPU_EXPORT CUresult cuCtxGetFlags(unsigned int* f) {
-  if (f) *f = 0;
-  return CUDA_SUCCESS;
+  return api("cuCtxGetFlags", true, false, [&](ShimState& s) {
+    uintptr_t h = 0;
+    if (const CUresult r = named_or_current_context(s, nullptr, &h); r != CUDA_SUCCESS) return r;
+    if (!f) return CUDA_ERROR_INVALID_VALUE;
+    *f = s.ctx_state[h].flags;
+    return CUDA_SUCCESS;
+  });
 }
-VGPU_EXPORT CUresult cuCtxSetFlags(unsigned int) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuCtxGetId(CUcontext, unsigned long long* id) {
-  if (id) *id = 1;
-  return CUDA_SUCCESS;
+VGPU_EXPORT CUresult cuCtxSetFlags(unsigned int flags) {
+  return api("cuCtxSetFlags", true, false, [&](ShimState& s) {
+    uintptr_t h = 0;
+    if (const CUresult r = named_or_current_context(s, nullptr, &h); r != CUDA_SUCCESS) return r;
+    if (!ctx_flags_valid(flags)) return CUDA_ERROR_INVALID_VALUE;
+    ShimState::CtxState& c = s.ctx_state[h];
+    c.flags = (flags & kCtxSettableMask) | (c.flags & kCtxMapHost);
+    return CUDA_SUCCESS;
+  });
+}
+// Contexts are numbered from 1 in the order they are made, the primary ones among them.
+VGPU_EXPORT CUresult cuCtxGetId(CUcontext ctx, unsigned long long* id) {
+  return api("cuCtxGetId", true, false, [&](ShimState& s) {
+    uintptr_t h = 0;
+    if (const CUresult r = named_or_current_context(s, ctx, &h); r != CUDA_SUCCESS) return r;
+    if (!id) return CUDA_ERROR_INVALID_VALUE;
+    *id = s.ctx_state[h].id;
+    return CUDA_SUCCESS;
+  });
 }
 
-VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags_v2(CUdevice, unsigned int) { return CUDA_SUCCESS; }
-VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags(CUdevice, unsigned int) { return CUDA_SUCCESS; }
+// The flags a device's primary context is made with. Measured on an RTX 3060: a scheduling mode
+// (one of 0, 1, 2, 4) with any of LMEM_RESIZE_TO_MAX, the two core-dump flags and SYNC_MEMOPS; MAP_HOST
+// is refused because a primary context always has it, and so is anything above 0xff. Setting them
+// on a context that is active is accepted and changes what it reports.
+static CUresult primary_set_flags(CUdevice dev, unsigned int flags) {
+  return api("cuDevicePrimaryCtxSetFlags", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    if (!ctx_flags_valid(flags) || (flags & kCtxMapHost)) return CUDA_ERROR_INVALID_VALUE;
+    s.primary_flags[dev] = flags;
+    if (const auto it = s.primary_ctx.find(dev); it != s.primary_ctx.end())
+      s.ctx_state[it->second].flags = (flags & kCtxSettableMask) | kCtxMapHost;
+    return CUDA_SUCCESS;
+  });
+}
+VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags) { return primary_set_flags(dev, flags); }
+VGPU_EXPORT CUresult cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags) { return primary_set_flags(dev, flags); }
 VGPU_EXPORT CUresult cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flags, int* active) {
   return api("cuDevicePrimaryCtxGetState", true, false, [&](ShimState& s) {
     check_device(s, dev);
-    if (flags) *flags = 0;
-    const auto refs = s.primary_refs.find(dev);
-    if (active) *active = refs != s.primary_refs.end() && refs->second > 0 ? 1 : 0;
+    if (!flags || !active) return CUDA_ERROR_INVALID_VALUE;
+    *flags = s.primary_flags[dev];
+    *active = s.primary_active.count(dev) ? 1 : 0;
     return CUDA_SUCCESS;
   });
 }
@@ -5146,6 +5741,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuCtxPushCurrent), VGPU_PROC(cuCtxPopCurrent), VGPU_PROC(cuCtxGetLimit),
     VGPU_PROC(cuCtxSetLimit), VGPU_PROC(cuCtxGetApiVersion), VGPU_PROC(cuCtxGetStreamPriorityRange),
     VGPU_PROC(cuCtxGetFlags), VGPU_PROC(cuCtxSetFlags), VGPU_PROC(cuCtxGetId),
+    VGPU_PROC(cuDeviceGetExecAffinitySupport), VGPU_PROC(cuCtxGetExecAffinity),
     VGPU_PROC(cuDevicePrimaryCtxRetain), VGPU_PROC(cuDevicePrimaryCtxRelease),
     VGPU_PROC(cuDevicePrimaryCtxSetFlags), VGPU_PROC(cuDevicePrimaryCtxGetState),
     VGPU_PROC(cuDevicePrimaryCtxReset_v2),

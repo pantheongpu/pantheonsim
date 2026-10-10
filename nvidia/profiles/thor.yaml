@@ -8,6 +8,7 @@
 # !! that table, so it collides with no NVIDIA part, and is below 0x8000 because CUDA
 # !! reports (device << 16 | vendor) as a signed int.
 # !! Replace it when NVIDIA publishes one, as the MI300X and MI350X placeholders are.
+# !! Rechecked 2026-10-09 against main (ca2d03e, 2026-10-07): still no Thor or Tegra entry.
 #
 # Where each value comes from:
 #   - compute capability 11.0 (sm_110): the CUDA C++ Programming Guide's table has

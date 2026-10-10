@@ -20,13 +20,34 @@ namespace vgpu::cuda {
 
 namespace {
 
-// The ratio of single- to double-precision throughput (the Programming
-// Guide's arithmetic-instruction table: fp32 results per clock per SM over fp64).
+// The ratio of single- to double-precision throughput.
+//
+// Compute capabilities 7.5 to 10.3 and 12.x come from the "Throughput of Native
+// Arithmetic Instructions" table in NVIDIA's CUDA C++ Best Practices Guide
+// (13.4; the Programming Guide's compute-capabilities appendix points to it): results per
+// clock cycle per multiprocessor, fp32 over fp64, add.f32 / add.f64:
+//   7.5: 64/2 = 32     8.0: 64/32 = 2     8.6 and 8.9: 128/2 = 64
+//   9.0: 128/64 = 2    10.0: 128/64 = 2   10.3: 128/2 = 64   12.0 and 12.1: 128/2 = 64
+// (10.3 shares its fp64 cell, 2, with 12.0 and 12.1. This used to say ratio 2
+// for 10.3, the B200's.)
+// 7.0 is not in that table any more; the V100's 2 is its datasheet's (7.8 / 15.7 TFLOPS).
+//
+// 10.7 (Rubin) and 11.0 (Thor) have no column in that table:
+//  - Rubin: NVIDIA's technical blog "Inside the NVIDIA Rubin Platform" (Table 3)
+//    gives 130 TFLOPS fp32 vector and 33 TFLOPS fp64 vector for a GPU, 130 / 33
+//    = 3.9, which is 4 (128 fp32 lanes and 32 fp64 lanes an SM at the same clock).
+//    Derived from those two published rates, not from a card or from CUDA's table.
+//  - Thor: NVIDIA publishes no fp64 rate for the T4000 or T5000 (the data sheet
+//    lists AI throughput only). 64 is the rate of every published consumer and
+//    workstation Blackwell (12.0, 12.1), the nearest part with a published
+//    figure; it is a stand-in, labelled as one, until NVIDIA states the rate.
 int single_to_double_ratio(int cc) {
   switch (cc) {
-    case 70: case 80: case 90: case 100: case 103: return 2;   // the data-centre parts
+    case 70: case 80: case 90: case 100: return 2;             // V100, A100, Hopper, B200
     case 75: return 32;                                        // Turing
-    default: return 64;                                        // consumer Ampere, Ada, Blackwell
+    case 107: return 4;                                        // Rubin: derived, see above
+    case 110: return 64;                                       // Thor: UNPUBLISHED, stand-in, see above
+    default: return 64;                                        // 8.6, 8.9, 10.3, 12.x and anything newer
   }
 }
 
@@ -186,9 +207,10 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     case kDirectManagedMemAccessFromHost: v = 0; break;
     // cuMemAddressReserve, cuMemCreate, cuMemMap and cuMemSetAccess work.
     case kVirtualAddressManagementSupported: v = 1; break;
-    // cuMemCreate does not hand out file descriptors, and nothing else here
-    // is shared between processes through a handle.
-    case kHandleTypePosixFileDescriptorSupported: v = 0; break;
+    // cuMemCreate with the POSIX file descriptor handle type exports the memory as a descriptor
+    // another process can import (cuMemExportToShareableHandle); the other handle types do not exist
+    // here. An RTX 3060 answers 1 as well.
+    case kHandleTypePosixFileDescriptorSupported: v = 1; break;
     case kHandleTypeWin32HandleSupported: v = 0; break;
     case kHandleTypeWin32KmtHandleSupported: v = 0; break;
     // A real quantity: a divisor in occupancy arithmetic (CUB's scan launched
@@ -207,9 +229,9 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     // Sparse and deferred-mapped CUDA arrays are not implemented: a card
     // says 1, and a program that sees it makes one.
     case kSparseCudaArraySupported: v = 0; break;
-    // cuMemHostRegister refuses CU_MEMHOSTREGISTER_READ_ONLY, because nothing
-    // here would stop a kernel writing the memory.
-    case kReadOnlyHostRegisterSupported: v = 0; break;
+    // cuMemHostRegister takes CU_MEMHOSTREGISTER_READ_ONLY: a kernel's store or atomic to the
+    // range faults, as on an RTX 3060, which answers 1.
+    case kReadOnlyHostRegisterSupported: v = 1; break;
     case kTimelineSemaphoreInteropSupported: v = 0; break;
     // The stream-ordered allocator is implemented (cudaMallocAsync, the
     // cudaMemPool* API), and the runtime says so.

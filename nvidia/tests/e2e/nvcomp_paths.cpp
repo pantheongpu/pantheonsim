@@ -13,6 +13,7 @@
 #include <cuda_runtime_api.h>
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -433,6 +434,210 @@ static void option_checks() {
         "nvcompGetStatusString describes a status");
 }
 
+
+// ---- LZ4 bitshuffle ----------------------------------------------------------------
+//
+// nvcomp/lz4.h documents the option (sub-chunks of 8 KiB; whole groups of eight
+// elements only) but not the layout, which is what the card wrote: for each bit
+// plane one byte per group of eight elements, element 0 in the byte's low bit; planes
+// from the element's top bit down (MSB-first, mode 1) or from bit 0 up (LSB-first). This
+// reference is written bit by bit from that description, apart from the code under test.
+
+static Bytes ref_bitshuffle(const Bytes& in, int es, bool msb_first) {
+  Bytes out;
+  for (size_t off = 0; off < in.size(); off += 8192) {
+    const size_t len = std::min<size_t>(8192, in.size() - off);
+    const size_t groups = len / es / 8;
+    for (int plane = 0; plane < 8 * es; ++plane)
+      for (size_t g = 0; g < groups; ++g) {
+        unsigned char v = 0;
+        for (int e = 0; e < 8; ++e) {
+          const int bit_of_element = msb_first ? 8 * es - 1 - plane : plane;
+          const unsigned char byte = in[off + (g * 8 + e) * es + bit_of_element / 8];
+          v |= (unsigned char)(((byte >> (bit_of_element % 8)) & 1) << e);
+        }
+        out.push_back(v);
+      }
+    out.insert(out.end(), in.begin() + off + groups * 8 * es, in.begin() + off + len);
+  }
+  return out;
+}
+
+static Bytes lz4_block_decode(const Bytes& src) {
+  Bytes out;
+  size_t i = 0;
+  while (i < src.size()) {
+    const unsigned tok = src[i++];
+    size_t lit = tok >> 4;
+    if (lit == 15)
+      for (;;) {
+        const unsigned b = src[i++];
+        lit += b;
+        if (b != 255) break;
+      }
+    out.insert(out.end(), src.begin() + i, src.begin() + i + lit);
+    i += lit;
+    if (i >= src.size()) break;
+    const size_t off = src[i] | (size_t)src[i + 1] << 8;
+    i += 2;
+    size_t ml = tok & 15;
+    if (ml == 15)
+      for (;;) {
+        const unsigned b = src[i++];
+        ml += b;
+        if (b != 255) break;
+      }
+    ml += 4;
+    for (size_t k = 0; k < ml; ++k) out.push_back(out[out.size() - off]);
+  }
+  return out;
+}
+
+// One chunk through the batched LZ4 API.
+static nvcompStatus_t lz4_compress_one(const nvcompBatchedLZ4CompressOpts_t& o, const Bytes& in, Bytes* out) {
+  size_t max_out = 0, temp = 0;
+  nvcompStatus_t st = nvcompBatchedLZ4CompressGetMaxOutputChunkSize(in.size(), o, &max_out);
+  if (st != nvcompSuccess) return st;
+  st = nvcompBatchedLZ4CompressGetTempSizeAsync(1, in.size(), o, &temp, in.size());
+  if (st != nvcompSuccess) return st;
+  unsigned char* din = upload(in);
+  unsigned char* dout = dev_alloc<unsigned char>(max_out);
+  void* dtemp = dev_alloc<unsigned char>(temp);
+  const void* hin[1] = {din};
+  void* hout[1] = {dout};
+  size_t hsz[1] = {in.size()};
+  const void** pin = upload(std::vector<const void*>{hin[0]});
+  void** pout = upload(std::vector<void*>{hout[0]});
+  size_t* psz = upload(std::vector<size_t>{hsz[0]});
+  size_t* pcomp = dev_alloc<size_t>(1);
+  nvcompStatus_t* pst = dev_alloc<nvcompStatus_t>(1);
+  st = nvcompBatchedLZ4CompressAsync(pin, psz, in.size(), 1, dtemp, temp, pout, pcomp, o, pst, 0);
+  const size_t n = download(pcomp, 1)[0];
+  const nvcompStatus_t chunk = download(pst, 1)[0];
+  if (st == nvcompSuccess && chunk == nvcompSuccess) *out = download(dout, n);
+  cudaFree(din); cudaFree(dout); cudaFree(dtemp); cudaFree(pin); cudaFree(pout); cudaFree(psz); cudaFree(pcomp); cudaFree(pst);
+  return st != nvcompSuccess ? st : chunk;
+}
+
+static nvcompStatus_t lz4_decompress_one(const nvcompBatchedLZ4DecompressOpts_t& o, const Bytes& comp, size_t cap, Bytes* out) {
+  size_t temp = 0;
+  nvcompStatus_t st = nvcompBatchedLZ4DecompressGetTempSizeAsync(1, cap, o, &temp, cap);
+  if (st != nvcompSuccess) return st;
+  unsigned char* din = upload(comp);
+  unsigned char* dout = dev_alloc<unsigned char>(cap);
+  void* dtemp = dev_alloc<unsigned char>(temp);
+  const void** pin = upload(std::vector<const void*>{din});
+  void** pout = upload(std::vector<void*>{dout});
+  size_t* psz = upload(std::vector<size_t>{comp.size()});
+  size_t* pcap = upload(std::vector<size_t>{cap});
+  size_t* pact = dev_alloc<size_t>(1);
+  nvcompStatus_t* pst = dev_alloc<nvcompStatus_t>(1);
+  st = nvcompBatchedLZ4DecompressAsync(pin, psz, pcap, pact, 1, dtemp, temp, pout, o, pst, 0);
+  const size_t n = download(pact, 1)[0];
+  const nvcompStatus_t chunk = download(pst, 1)[0];
+  if (st == nvcompSuccess && chunk == nvcompSuccess) *out = download(dout, n);
+  cudaFree(din); cudaFree(dout); cudaFree(dtemp); cudaFree(pin); cudaFree(pout); cudaFree(psz); cudaFree(pcap); cudaFree(pact); cudaFree(pst);
+  return st != nvcompSuccess ? st : chunk;
+}
+
+static void bitshuffle_checks() {
+  struct T {
+    nvcompType_t t;
+    int es;
+    const char* name;
+  } types[] = {{NVCOMP_TYPE_CHAR, 1, "char"},   {NVCOMP_TYPE_UCHAR, 1, "uchar"}, {NVCOMP_TYPE_SHORT, 2, "short"}, {NVCOMP_TYPE_USHORT, 2, "ushort"},
+               {NVCOMP_TYPE_INT, 4, "int"},     {NVCOMP_TYPE_UINT, 4, "uint"},   {NVCOMP_TYPE_BITS, 1, "bits"}};
+  const size_t sizes[] = {8, 61, 64, 100, 8216, 16384};
+  bool all_layouts = true, all_round = true;
+  for (const T& ty : types)
+    for (int mode : {1, 2, 3}) {  // 3: a value with no name, which the card treats as LSB-first
+      for (size_t n : sizes) {
+        Bytes in(n);
+        uint32_t x = (uint32_t)(n * 977 + ty.es);
+        for (auto& b : in) b = (unsigned char)((x = x * 1664525u + 1013904223u) >> 24);
+        nvcompBatchedLZ4CompressOpts_t co = nvcompBatchedLZ4CompressDefaultOpts;
+        co.data_type = ty.t;
+        std::memcpy(&co.bitshuffle_mode, &mode, sizeof mode);
+        Bytes comp;
+        if (lz4_compress_one(co, in, &comp) != nvcompSuccess) {
+          all_layouts = false;
+          continue;
+        }
+        if (lz4_block_decode(comp) != ref_bitshuffle(in, ty.es, mode == 1)) all_layouts = false;
+        nvcompBatchedLZ4DecompressOpts_t dopt = nvcompBatchedLZ4DecompressDefaultOpts;
+        dopt.data_type = ty.t;
+        dopt.bitshuffle_mode = mode == 1 ? NVCOMP_BITSHUFFLE_MSB_FIRST : NVCOMP_BITSHUFFLE_LSB_FIRST;
+        Bytes back;
+        if (lz4_decompress_one(dopt, comp, n, &back) != nvcompSuccess || back != in) all_round = false;
+      }
+    }
+  check(all_layouts, "LZ4 bitshuffle chunks decode to the documented bit-plane layout (every type, mode and size)");
+  check(all_round, "LZ4 bitshuffle chunks decompress back to their input");
+
+  // Options that do not match the compression: the data comes back as the options say.
+  Bytes in(100);
+  uint32_t x = 99;
+  for (auto& b : in) b = (unsigned char)((x = x * 1664525u + 1013904223u) >> 24);
+  nvcompBatchedLZ4CompressOpts_t co = nvcompBatchedLZ4CompressDefaultOpts;
+  co.data_type = NVCOMP_TYPE_SHORT;
+  co.bitshuffle_mode = NVCOMP_BITSHUFFLE_MSB_FIRST;
+  Bytes comp, got;
+  IS(lz4_compress_one(co, in, &comp), nvcompSuccess);
+  const Bytes shuffled = ref_bitshuffle(in, 2, true);
+  const struct {
+    nvcompType_t t;
+    int mode;
+    const char* what;
+  } mismatches[] = {{NVCOMP_TYPE_INT, 1, "a wider type"}, {NVCOMP_TYPE_SHORT, 2, "the other order"}, {NVCOMP_TYPE_SHORT, 0, "no bitshuffle"}, {NVCOMP_TYPE_SHORT, 3, "a mode with no name"}};
+  for (const auto& m : mismatches) {
+    nvcompBatchedLZ4DecompressOpts_t d = nvcompBatchedLZ4DecompressDefaultOpts;
+    d.data_type = m.t;
+    std::memcpy(&d.bitshuffle_mode, &m.mode, sizeof m.mode);
+    got.clear();
+    const nvcompStatus_t st = lz4_decompress_one(d, comp, 100, &got);
+    // Mode 0 and 3 leave the shuffled bytes as they are; 1 and 2 unshuffle by the type.
+    Bytes want = (m.mode == 1 || m.mode == 2) ? Bytes() : shuffled;
+    if (m.mode == 1 || m.mode == 2) {
+      // The inverse of ref_bitshuffle, by search over planes: shuffling `got` must give back `shuffled`.
+      want = got;
+    }
+    const bool ok = st == nvcompSuccess && got.size() == 100 &&
+                    ((m.mode == 1 || m.mode == 2) ? ref_bitshuffle(got, m.t == NVCOMP_TYPE_INT ? 4 : 2, m.mode == 1) == shuffled
+                                                  : got == shuffled);
+    check(ok, std::string("decompressing with ") + m.what + " gives what the options say");
+  }
+
+  // Queries: the temporary space grows with the chunk by 32-byte units, the alignments by the type.
+  nvcompBatchedLZ4CompressOpts_t q = nvcompBatchedLZ4CompressDefaultOpts;
+  size_t t0 = 0, t1 = 0, t2 = 0;
+  IS(nvcompBatchedLZ4CompressGetTempSizeAsync(3, 100, q, &t0, 300), nvcompSuccess);
+  q.bitshuffle_mode = NVCOMP_BITSHUFFLE_LSB_FIRST;
+  IS(nvcompBatchedLZ4CompressGetTempSizeAsync(3, 100, q, &t1, 300), nvcompSuccess);
+  q.bitshuffle_mode = NVCOMP_BITSHUFFLE_MSB_FIRST;
+  IS(nvcompBatchedLZ4CompressGetTempSizeAsync(2, 8216, q, &t2, 16432), nvcompSuccess);
+  check(t0 == 3 * 32768 && t1 == 3 * (32768 + 128) && t2 == 2 * (32768 + 8224), "bitshuffle adds the chunk, to 32 bytes, to the temporary space");
+  size_t mo = 0;
+  IS(nvcompBatchedLZ4CompressGetMaxOutputChunkSize(64, q, &mo), nvcompSuccess);
+  check(mo == 72, "bitshuffle leaves the maximum output size alone");
+  nvcompBatchedLZ4DecompressOpts_t dq = nvcompBatchedLZ4DecompressDefaultOpts;
+  nvcompAlignmentRequirements_t al{};
+  dq.data_type = NVCOMP_TYPE_INT;
+  dq.bitshuffle_mode = NVCOMP_BITSHUFFLE_MSB_FIRST;
+  IS(nvcompBatchedLZ4DecompressGetRequiredAlignments(dq, &al), nvcompSuccess);
+  check(al.output == 4, "decompressing with bitshuffle wants the output aligned to the type");
+  dq.bitshuffle_mode = NVCOMP_BITSHUFFLE_NONE;
+  IS(nvcompBatchedLZ4DecompressGetRequiredAlignments(dq, &al), nvcompSuccess);
+  check(al.output == 1, "... and without it, to a byte");
+  // Eight-byte integers: no bitshuffle for them, at the compress queries and the decompress call.
+  q.data_type = NVCOMP_TYPE_LONGLONG;
+  IS(nvcompBatchedLZ4CompressGetTempSizeAsync(1, 100, q, &t0, 100), nvcompErrorNotSupported);
+  dq.data_type = NVCOMP_TYPE_LONGLONG;
+  dq.bitshuffle_mode = NVCOMP_BITSHUFFLE_MSB_FIRST;
+  IS(nvcompBatchedLZ4DecompressGetTempSizeAsync(1, 100, dq, &t0, 100), nvcompSuccess);
+  got.clear();
+  IS(lz4_decompress_one(dq, comp, 100, &got), nvcompErrorNotSupported);
+}
+
 int main() {
   nvcompProperties_t p{};
   IS(nvcompGetProperties(&p), nvcompSuccess);
@@ -473,6 +678,7 @@ int main() {
 
   crc32_checks();
   option_checks();
+  bitshuffle_checks();
 
   std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
   return failures ? 1 : 0;

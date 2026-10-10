@@ -134,6 +134,14 @@ struct Segment {
   // The result of the latest split of each parent team.
   std::atomic<uint64_t> split_seq[kMaxTeamsCap];
   std::atomic<int32_t> split_index[kMaxTeamsCap];
+  // nvshmemx_team_init: the teams being made from a unique ID, by that ID.
+  struct UidSlot {
+    std::atomic<uint64_t> uid;       // 0: free
+    std::atomic<int32_t> index;      // the team index plus one, once the first member took it
+    std::atomic<uint32_t> arrived;   // members that have called
+    std::atomic<uint32_t> departed;  // members that have left the call
+    std::atomic<int32_t> member[kMaxPes];  // world PE plus one, by index in the team
+  } uid_slot[16];
   struct Pe {
     std::atomic<uint32_t> ready;
     int32_t pid;
@@ -917,6 +925,9 @@ int split_strided(nvshmem_team_t parent, int start, int stride, int size, const 
   return 0;
 }
 
+// Atomics, reductions and the arithmetic of the typed API.
+#include "nvshmem_typed_impl.inc"
+
 }  // namespace
 
 #define NVSHMEM_EXPORT __attribute__((visibility("default")))
@@ -1037,6 +1048,118 @@ NVSHMEM_EXPORT int nvshmemx_cumodule_init(CUmodule module) {
   return 0;
 }
 NVSHMEM_EXPORT int nvshmemx_cumodule_finalize(CUmodule) { return 0; }
+
+// The same for a library loaded with the driver's cuLibrary calls.
+NVSHMEM_EXPORT int nvshmemx_culibrary_init(CUlibrary library) {
+  using GetGlobal = CUresult (*)(CUdeviceptr*, size_t*, CUlibrary, const char*);
+  auto fn = reinterpret_cast<GetGlobal>(dlsym(RTLD_DEFAULT, "cuLibraryGetGlobal"));
+  State& s = st();
+  if (!fn || !initialized(s)) return 1;
+  CUdeviceptr p = 0;
+  size_t n = 0;
+  if (fn(&p, &n, library, "nvshmemi_device_state_d") != CUDA_SUCCESS || n < sizeof(abi::DeviceState)) return 1;
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  write_device_state(s, reinterpret_cast<void*>(p));
+  return 0;
+}
+NVSHMEM_EXPORT int nvshmemx_culibrary_finalize(CUlibrary) { return 0; }
+
+// Regions (hints for batching RMA), queue pairs (IBGDA) and externally mapped
+// symmetric buffers belong to transports and drivers this library does not have.
+NVSHMEM_EXPORT int nvshmemx_region_start(void*, const void*) {
+  say("nvshmemx_region_start: regions are not available in VirtualGPU");
+  return 1;
+}
+NVSHMEM_EXPORT int nvshmemx_region_stop(uint64_t) {
+  say("nvshmemx_region_stop: regions are not available in VirtualGPU");
+  return 1;
+}
+NVSHMEM_EXPORT int nvshmemx_region_is_active(uint32_t, int* active) {
+  if (active) *active = 0;
+  return 0;
+}
+NVSHMEM_EXPORT int nvshmemx_qp_create(int, void**) {
+  say("nvshmemx_qp_create: there are no queue pairs: every PE is a peer");
+  return 1;
+}
+NVSHMEM_EXPORT void* nvshmemx_buffer_register_symmetric(void*, size_t, int) {
+  say("nvshmemx_buffer_register_symmetric: external buffers cannot join the symmetric heap");
+  return nullptr;
+}
+NVSHMEM_EXPORT void* nvshmemx_buffer_register_symmetric_at_preferred_address(void*, size_t, void*, int) {
+  say("nvshmemx_buffer_register_symmetric_at_preferred_address: external buffers cannot join the symmetric heap");
+  return nullptr;
+}
+NVSHMEM_EXPORT int nvshmemx_buffer_unregister_symmetric(void*, size_t) { return 1; }
+
+// A team from a unique ID: one PE asks for the ID, the others get it from it
+// out of band, and every member calls nvshmemx_team_init with it, the team's
+// size and its own index. Derived from the documentation.
+NVSHMEM_EXPORT int nvshmemx_team_get_uniqueid(nvshmemx_team_uniqueid_t* uniqueid) {
+  if (!uniqueid) return 1;
+  uint64_t r = 0;
+  if (::getrandom(&r, sizeof r, 0) != sizeof r) r = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+  *uniqueid = (r & ~(1ull << 63)) | 1ull;  // not 0 (free slot) and not ~0 (no ID)
+  return 0;
+}
+NVSHMEM_EXPORT int nvshmemx_team_init(nvshmem_team_t* team, nvshmem_team_config_t* config, long config_mask, int npes,
+                                      int pe_idx_in_team) {
+  State& s = st();
+  std::lock_guard<std::recursive_mutex> lock(s.mu);
+  if (!team) return 1;
+  *team = NVSHMEM_TEAM_INVALID;
+  if (!initialized(s)) return say("nvshmemx_team_init before nvshmem_init"), 1;
+  if (!config || !(config_mask & NVSHMEM_TEAM_CONFIG_MASK_UNIQUEID) || config->uniqueid == 0 ||
+      config->uniqueid == ~0ull)
+    return say("nvshmemx_team_init needs a unique ID from nvshmemx_team_get_uniqueid in the configuration"), 1;
+  if (npes < 1 || npes > s.npes || pe_idx_in_team < 0 || pe_idx_in_team >= npes)
+    return say("nvshmemx_team_init: team index %d of %d PEs in a job of %d", pe_idx_in_team, npes, s.npes), 1;
+  const uint64_t uid = config->uniqueid;
+  Segment::UidSlot* slot = nullptr;
+  for (auto& u : s.seg->uid_slot) {
+    uint64_t cur = u.uid.load(std::memory_order_acquire);
+    if (cur == uid) { slot = &u; break; }
+  }
+  while (!slot) {
+    for (auto& u : s.seg->uid_slot) {
+      uint64_t free_slot = 0;
+      if (u.uid.compare_exchange_strong(free_slot, uid) || free_slot == uid) { slot = &u; break; }
+    }
+    if (!slot) std::this_thread::yield();
+  }
+  if (slot->arrived.fetch_add(1, std::memory_order_acq_rel) == 0) {
+    int idx = -1;
+    if (!take_team_index(s, &idx)) idx = -1;
+    slot->index.store(idx >= 0 ? idx + 1 : -1, std::memory_order_release);  // 0 means "not yet"
+  }
+  slot->member[pe_idx_in_team].store(s.mype + 1, std::memory_order_release);
+  wait_for([&] { return slot->index.load(std::memory_order_acquire) != 0; }, "the team's first member");
+  const int stored = slot->index.load(std::memory_order_acquire);
+  const int idx = stored > 0 ? stored - 1 : -1;
+  std::vector<int> members(size_t(npes), -1);
+  for (int i = 0; i < npes; ++i) {
+    wait_for([&] { return slot->member[i].load(std::memory_order_acquire) != 0; }, "the members of a team");
+    members[size_t(i)] = slot->member[i].load(std::memory_order_acquire) - 1;
+  }
+  if (idx < 0) {
+    say("nvshmemx_team_init: no team index left (NVSHMEM_MAX_TEAMS=%d)", s.max_teams);
+  } else {
+    make_team(s, idx, members, members[0], members.size() > 1 ? members[1] - members[0] : 1);
+    s.teams[idx].config.uniqueid = uid;
+    if (config_mask & NVSHMEM_TEAM_CONFIG_MASK_NUM_CONTEXTS) s.teams[idx].config.num_contexts = config->num_contexts;
+    *team = idx;
+    team_barrier(s, idx);  // the team exists on every member before any of them uses it
+  }
+  // The last member out frees the slot for the next team made with this ID.
+  if (slot->departed.fetch_add(1, std::memory_order_acq_rel) + 1 == uint32_t(npes)) {
+    for (auto& m : slot->member) m.store(0, std::memory_order_relaxed);
+    slot->index.store(0, std::memory_order_relaxed);
+    slot->arrived.store(0, std::memory_order_relaxed);
+    slot->departed.store(0, std::memory_order_relaxed);
+    slot->uid.store(0, std::memory_order_release);
+  }
+  return *team == NVSHMEM_TEAM_INVALID ? 1 : 0;
+}
 
 // ============================================================================
 // Who and where
@@ -1203,7 +1326,6 @@ VGPU_SIZED(128)
     in_stream_order(s, [=] { put(d, &v, sizeof(TYPE), pe, "nvshmemx_" #NAME "_p_on_stream"); });             \
   }
 VGPU_NVSHMEM_FOR_TYPES(VGPU_TYPED)
-#undef VGPU_TYPED
 
 NVSHMEM_EXPORT void nvshmemx_putmem_signal_on_stream(void* dest, const void* source, size_t bytes,
                                                      uint64_t* sig_addr, uint64_t signal, int sig_op, int pe,
@@ -1250,6 +1372,14 @@ NVSHMEM_EXPORT void nvshmem_quiet() {
 }
 NVSHMEM_EXPORT void nvshmem_fence() {}
 NVSHMEM_EXPORT void nvshmemx_quiet_on_stream(cudaStream_t s) { in_stream_order(s, [] {}); }
+// Host-side puts are finished when they return, so a flush has nothing to wait for.
+NVSHMEM_EXPORT void nvshmemx_flush() {}
+NVSHMEM_EXPORT void nvshmemx_flush_on_stream(cudaStream_t s) { in_stream_order(s, [] {}); }
+// A counted signal is a plain word that the host resets to zero.
+NVSHMEM_EXPORT void nvshmemx_signal_counted_reset(uint64_t* signal_addr) {
+  const uint64_t zero = 0;
+  copy(signal_addr, &zero, sizeof zero, "nvshmemx_signal_counted_reset");
+}
 
 // Equivalent to the on-stream form on the default stream, then a wait for it.
 NVSHMEM_EXPORT void nvshmem_barrier_all() {
@@ -1410,6 +1540,14 @@ NVSHMEM_EXPORT int nvshmemx_alltoallmem_on_stream(nvshmem_team_t team, void* des
 }
 
 // ============================================================================
+// The typed API: every type, nonblocking and stream-ordered forms, collectives,
+// reductions, atomics
+// ============================================================================
+
+#include "nvshmem_typed_api.inc"
+#undef VGPU_TYPED
+
+// ============================================================================
 // Kernels that use the device API
 // ============================================================================
 
@@ -1420,6 +1558,30 @@ NVSHMEM_EXPORT int nvshmemx_collective_launch(const void* func, dim3 gridDims, d
   const cudaError_t e = cudaLaunchCooperativeKernel(func, gridDims, blockDims, args, sharedMem, stream);
   if (e != cudaSuccess) {
     say("nvshmemx_collective_launch: %s", cudaGetErrorString(e));
+    return 1;
+  }
+  return 0;
+}
+// The attribute form: a cudaLaunchConfig_t, made cooperative unless the caller
+// said otherwise. Derived from the header's description.
+NVSHMEM_EXPORT int nvshmemx_collective_launch_attr(const nvshmemx_collective_launch_attr_t* attr, const void* func, void** args) {
+  if (!attr || !func) return 1;
+  cudaLaunchConfig_t cfg = attr->cuda_config;
+  std::vector<cudaLaunchAttribute> attrs(cfg.attrs, cfg.attrs + (cfg.attrs ? cfg.numAttrs : 0));
+  bool has_coop = false;
+  for (const auto& a : attrs) has_coop = has_coop || a.id == cudaLaunchAttributeCooperative;
+  if (!has_coop) {
+    cudaLaunchAttribute c{};
+    c.id = cudaLaunchAttributeCooperative;
+    c.val.cooperative = 1;
+    attrs.push_back(c);
+  }
+  cfg.attrs = attrs.data();
+  cfg.numAttrs = static_cast<unsigned>(attrs.size());
+  const cudaError_t e = cudaLaunchKernelExC(&cfg, func, args);
+  if (e != cudaSuccess) {
+    say("nvshmemx_collective_launch_attr: %s", cudaGetErrorString(e));
+    cudaGetLastError();
     return 1;
   }
   return 0;

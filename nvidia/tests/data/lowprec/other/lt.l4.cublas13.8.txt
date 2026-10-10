@@ -1,0 +1,1282 @@
+# device NVIDIA L4 sm_89
+# cublasLt 130801
+fp8types/NN_e4m3e4m3_cbf16_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf16_df16 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf32_df32 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cbf16_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf16_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/NN_e4m3e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cbf16_df32 h=15:0 m=15
+fp8types/NN_e4m3e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf16_df16 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf32_df32 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/NN_e4m3e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cbf16_df32 h=15:0 m=15
+fp8types/NN_e4m3e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/NN_e4m3e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/NN_e4m3e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cbf16_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf16_df16 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf32_df32 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cbf16_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf16_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/NN_e5m2e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cbf16_df32 h=15:0 m=15
+fp8types/NN_e5m2e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf16_df16 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf32_df32 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/NN_e5m2e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cbf16_df32 h=15:0 m=15
+fp8types/NN_e5m2e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/NN_e5m2e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/NN_e5m2e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cbf16_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf16_df16 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf32_df32 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cbf16_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf16_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/NT_e4m3e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cbf16_df32 h=15:0 m=15
+fp8types/NT_e4m3e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf16_df16 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf32_df32 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/NT_e4m3e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cbf16_df32 h=15:0 m=15
+fp8types/NT_e4m3e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/NT_e4m3e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/NT_e4m3e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cbf16_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf16_df16 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf32_df32 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cbf16_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf16_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/NT_e5m2e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cbf16_df32 h=15:0 m=15
+fp8types/NT_e5m2e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf16_df16 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf32_df32 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/NT_e5m2e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cbf16_df32 h=15:0 m=15
+fp8types/NT_e5m2e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/NT_e5m2e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/NT_e5m2e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/TN_e4m3e4m3_cbf16_dbf16 h=0:1 m=0 d=9eace79d97f2a620
+fp8types/TN_e4m3e4m3_cf16_df16 h=0:1 m=0 d=797de96d1a489c36
+fp8types/TN_e4m3e4m3_cf32_df32 h=0:1 m=0 d=7848276900548470
+fp8types/TN_e4m3e4m3_cbf16_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8types/TN_e4m3e4m3_cf16_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8types/TN_e4m3e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/TN_e4m3e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/TN_e4m3e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/TN_e4m3e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/TN_e4m3e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/TN_e4m3e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/TN_e4m3e4m3_cbf16_df32 h=15:0 m=15
+fp8types/TN_e4m3e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/TN_e4m3e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/TN_e4m3e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/TN_e4m3e5m2_cbf16_dbf16 h=0:1 m=0 d=9eace79d97f2a620
+fp8types/TN_e4m3e5m2_cf16_df16 h=0:1 m=0 d=797de96d1a489c36
+fp8types/TN_e4m3e5m2_cf32_df32 h=0:1 m=0 d=7848276900548470
+fp8types/TN_e4m3e5m2_cbf16_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8types/TN_e4m3e5m2_cf16_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8types/TN_e4m3e5m2_cbf16_de5m2 h=0:1 m=0 d=6124bb01f08019c5 amax=417a8000
+fp8types/TN_e4m3e5m2_cf16_de5m2 h=0:1 m=0 d=6124bb01f08019c5 amax=417a8000
+fp8types/TN_e4m3e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/TN_e4m3e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/TN_e4m3e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/TN_e4m3e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/TN_e4m3e5m2_cbf16_df32 h=15:0 m=15
+fp8types/TN_e4m3e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/TN_e4m3e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/TN_e4m3e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/TN_e5m2e4m3_cbf16_dbf16 h=0:1 m=0 d=9eace79d97f2a620
+fp8types/TN_e5m2e4m3_cf16_df16 h=0:1 m=0 d=797de96d1a489c36
+fp8types/TN_e5m2e4m3_cf32_df32 h=0:1 m=0 d=7848276900548470
+fp8types/TN_e5m2e4m3_cbf16_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8types/TN_e5m2e4m3_cf16_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8types/TN_e5m2e4m3_cbf16_de5m2 h=0:1 m=0 d=6124bb01f08019c5 amax=417a8000
+fp8types/TN_e5m2e4m3_cf16_de5m2 h=0:1 m=0 d=6124bb01f08019c5 amax=417a8000
+fp8types/TN_e5m2e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/TN_e5m2e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/TN_e5m2e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e4m3_cbf16_df32 h=15:0 m=15
+fp8types/TN_e5m2e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/TN_e5m2e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf16_df16 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf32_df32 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/TN_e5m2e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/TN_e5m2e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cbf16_df32 h=15:0 m=15
+fp8types/TN_e5m2e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/TN_e5m2e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/TN_e5m2e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cbf16_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf16_df16 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf32_df32 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cbf16_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf16_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/TT_e4m3e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cbf16_df32 h=15:0 m=15
+fp8types/TT_e4m3e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf16_df16 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf32_df32 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/TT_e4m3e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cbf16_df32 h=15:0 m=15
+fp8types/TT_e4m3e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/TT_e4m3e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/TT_e4m3e5m2_ce4m3_df16 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cbf16_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf16_df16 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf32_df32 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cbf16_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf16_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cbf16_de5m2 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf16_de5m2 h=15:0 m=15
+fp8types/TT_e5m2e4m3_ce4m3_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e4m3_ce5m2_de5m2 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf16_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf32_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cbf16_df32 h=15:0 m=15
+fp8types/TT_e5m2e4m3_cf32_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e4m3_ce4m3_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e4m3_ce4m3_df16 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cbf16_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf16_df16 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf32_df32 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cbf16_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf16_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cbf16_de5m2 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf16_de5m2 h=15:0 m=15
+fp8types/TT_e5m2e5m2_ce4m3_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e5m2_ce5m2_de5m2 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf16_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf32_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cbf16_df32 h=15:0 m=15
+fp8types/TT_e5m2e5m2_cf32_de4m3 h=15:0 m=15
+fp8types/TT_e5m2e5m2_ce4m3_dbf16 h=15:0 m=15
+fp8types/TT_e5m2e5m2_ce4m3_df16 h=15:0 m=15
+fp8amax/amax_dbf16 h=7:0 m=7
+fp8amax/amax_scale_dbf16 h=7:0 m=7
+fp8amax/amax_df16 h=7:0 m=7
+fp8amax/amax_scale_df16 h=7:0 m=7
+fp8amax/amax_df32 h=7:0 m=7
+fp8amax/amax_scale_df32 h=7:0 m=7
+fp8amax/e4m3_noscale_amax h=0:1 m=0 d=ca83af9b7c34a693 amax=417a8000
+fp8amax/e4m3_scale_noamax h=0:1 m=0 d=0c70b13b89916643
+fp8amax/e4m3_noscale_noamax h=0:1 m=0 d=ca83af9b7c34a693
+fp8amax/no_ab_scales h=0:1 m=0 d=e025c7e5013497eb
+fp8amax/a_scale_only h=0:1 m=0 d=cf06d3b66c2ed534
+fp8amax/b_scale_only h=0:1 m=0 d=0deb39aee9d7af6f
+fp8sat/de4m3 h=0:1 m=0 d=61cb183e147e2483 amax=486b0000
+fp8sat/de4m3_e5m2xe4m3 h=0:1 m=0 d=664eb897014a8b7d amax=4af20000
+fp8sat/de5m2 h=15:0 m=15
+fp8sat/de5m2_e5m2xe4m3 h=0:1 m=0 d=8bbccd9566d2f4a0 amax=4af20000
+fp8sat/f16_overflow h=15:0 m=15
+fp8fast/fast0 h=0:1 m=0 d=9eace79d97f2a620
+fp8fast/fast0_e4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8fast/fast1 h=0:1 m=0 d=9eace79d97f2a620
+fp8fast/fast1_e4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8dims/TN_16x16x16 h=0:1 m=0 d=af60d49a6c6c8c88
+fp8dims/TN_e4m3out_16x16x16 h=0:1 m=0 d=e7bd4ad1a73a46c5 amax=40b80000
+fp8dims/TN_8x8x8 h=15:0 m=15
+fp8dims/TN_e4m3out_8x8x8 h=15:0 m=15
+fp8dims/TN_8x8x16 h=0:1 m=0 d=53c452e4cdff7276
+fp8dims/TN_e4m3out_8x8x16 h=15:0 m=15
+fp8dims/TN_16x16x8 h=15:0 m=15
+fp8dims/TN_e4m3out_16x16x8 h=15:0 m=15
+fp8dims/TN_24x24x24 h=15:0 m=15
+fp8dims/TN_e4m3out_24x24x24 h=15:0 m=15
+fp8dims/TN_32x16x48 h=0:1 m=0 d=7ca4817a8e19e7e6
+fp8dims/TN_e4m3out_32x16x48 h=0:1 m=0 d=8c2f2f3630ac65f7 amax=413a8000
+fp8dims/TN_17x16x16 h=15:0 m=15
+fp8dims/TN_e4m3out_17x16x16 h=15:0 m=15
+fp8dims/TN_16x17x16 h=0:1 m=0 d=95564a6deafe8207
+fp8dims/TN_e4m3out_16x17x16 h=0:1 m=0 d=81bfcc3bae25c217 amax=40b80000
+fp8dims/TN_16x16x17 h=15:0 m=15
+fp8dims/TN_e4m3out_16x16x17 h=15:0 m=15
+fp8dims/TN_4x4x16 h=15:0 m=15
+fp8dims/TN_e4m3out_4x4x16 h=15:0 m=15
+fp8dims/TN_1x1x16 h=15:0 m=15
+fp8dims/TN_e4m3out_1x1x16 h=15:0 m=15
+fp8dims/TN_64x8x64 h=0:1 m=0 d=1942365c93081977
+fp8dims/TN_e4m3out_64x8x64 h=0:1 m=0 d=0ebea648bb33ae80 amax=41628000
+fp8dims/TN_64x64x128 h=0:1 m=0 d=c9c71aa9c08f3f94
+fp8dims/TN_e4m3out_64x64x128 h=0:1 m=0 d=7b031f701fa2b33e amax=41b28000
+fp8dims/TN_128x128x128 h=0:1 m=0 d=6476a3b25e5d6325
+fp8dims/TN_e4m3out_128x128x128 h=0:1 m=0 d=e002ec97e765765a amax=41d2c000
+fp8dims/TN_256x128x256 h=0:1 m=0 d=b0d29905bd432d63
+fp8dims/TN_e4m3out_256x128x256 h=0:1 m=0 d=c415fde88cf0e771 amax=4214a000
+fp8dims/TN_16x64x16 h=0:1 m=0 d=54b46ab218d23a83
+fp8dims/TN_e4m3out_16x64x16 h=0:1 m=0 d=1f822df2b7243337 amax=40d90000
+fp8dims/TN_48x80x32 h=0:1 m=0 d=416238e82585c890
+fp8dims/TN_e4m3out_48x80x32 h=0:1 m=0 d=68fd4291eb83f69d amax=414f8000
+fp8dims/TN_12x12x12 h=15:0 m=15
+fp8dims/TN_e4m3out_12x12x12 h=15:0 m=15
+fp8dims/TN_64x64x24 h=15:0 m=15
+fp8dims/TN_e4m3out_64x64x24 h=15:0 m=15
+fp8dims/TN_64x64x40 h=15:0 m=15
+fp8dims/TN_e4m3out_64x64x40 h=15:0 m=15
+fp8dims/TN_512x256x512 h=0:1 m=0 d=ae24dd71e0d7f1e2
+fp8dims/TN_e4m3out_512x256x512 h=0:1 m=0 d=2a1f6a617f8b7bd0 amax=42838000
+fp8scales/sc_sc_dbf16 h=0:1 m=0 d=9eace79d97f2a620
+fp8scales/NN_sc_sc_dbf16 h=15:0 m=15
+fp8scales/sc_sc_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8scales/NN_sc_sc_de4m3 h=15:0 m=15
+fp8scales/sc_outer_dbf16 h=7:0 m=7
+fp8scales/NN_sc_outer_dbf16 h=7:0 m=7
+fp8scales/sc_outer_de4m3 h=7:0 m=7
+fp8scales/NN_sc_outer_de4m3 h=7:0 m=7
+fp8scales/outer_sc_dbf16 h=7:0 m=7
+fp8scales/NN_outer_sc_dbf16 h=7:0 m=7
+fp8scales/outer_sc_de4m3 h=7:0 m=7
+fp8scales/NN_outer_sc_de4m3 h=7:0 m=7
+fp8scales/outer_outer_dbf16 h=15:0 m=15
+fp8scales/NN_outer_outer_dbf16 h=15:0 m=15
+fp8scales/outer_outer_de4m3 h=7:0 m=7
+fp8scales/NN_outer_outer_de4m3 h=7:0 m=7
+fp8beta/beta2_cbf16_dbf16 h=0:1 m=0 d=107e776a894ad406
+fp8beta/beta2_cbf16_df16 h=15:0 m=15
+fp8beta/beta2_cbf16_df32 h=15:0 m=15
+fp8beta/beta2_cbf16_de4m3 h=0:1 m=0 d=e4f0fbce8ba0358f amax=41894000
+fp8beta/beta2_cf16_dbf16 h=15:0 m=15
+fp8beta/beta2_cf16_df16 h=0:1 m=0 d=76966f8d15c006e6
+fp8beta/beta2_cf16_df32 h=15:0 m=15
+fp8beta/beta2_cf16_de4m3 h=0:1 m=0 d=e4f0fbce8ba0358f amax=41894000
+fp8beta/beta2_cf32_dbf16 h=15:0 m=15
+fp8beta/beta2_cf32_df16 h=15:0 m=15
+fp8beta/beta2_cf32_df32 h=0:1 m=0 d=367d33e9b83fca01
+fp8beta/beta2_cf32_de4m3 h=15:0 m=15
+fp8beta/beta2_ce4m3_dbf16 h=15:0 m=15
+fp8beta/beta2_ce4m3_df16 h=15:0 m=15
+fp8beta/beta2_ce4m3_df32 h=15:0 m=15
+fp8beta/beta2_ce4m3_de4m3 h=15:0 m=15
+fp8beta/beta1_cbf16_dbf16 h=0:1 m=0 d=ec8b76b622581944
+fp8beta/beta1_cbf16_df16 h=15:0 m=15
+fp8beta/beta1_cbf16_df32 h=15:0 m=15
+fp8beta/beta1_cbf16_de4m3 h=0:1 m=0 d=a841cfdf51149cff amax=417a8000
+fp8beta/beta1_cf16_dbf16 h=15:0 m=15
+fp8beta/beta1_cf16_df16 h=0:1 m=0 d=35aacb5dc01a46c8
+fp8beta/beta1_cf16_df32 h=15:0 m=15
+fp8beta/beta1_cf16_de4m3 h=0:1 m=0 d=a841cfdf51149cff amax=417a8000
+fp8beta/beta1_cf32_dbf16 h=15:0 m=15
+fp8beta/beta1_cf32_df16 h=15:0 m=15
+fp8beta/beta1_cf32_df32 h=0:1 m=0 d=1a639050241ce498
+fp8beta/beta1_cf32_de4m3 h=15:0 m=15
+fp8beta/beta1_ce4m3_dbf16 h=15:0 m=15
+fp8beta/beta1_ce4m3_df16 h=15:0 m=15
+fp8beta/beta1_ce4m3_df32 h=15:0 m=15
+fp8beta/beta1_ce4m3_de4m3 h=15:0 m=15
+fp8beta/beta1_noCscale h=0:1 m=0 d=107e776a894ad406
+fp8beta/beta1_Cnull h=0:1 m=7
+fp8alpha/alpha_half h=0:1 m=0 d=c46c45c44bcb4b39
+fp8alpha/alpha_3 h=0:1 m=0 d=fcb6bada46cf7405
+fp8alpha/device_pointer_mode h=0:1 m=0 d=cf06d3b66c2ed534
+fp8alpha/device_pointer_mode_beta1 h=0:1 m=0 d=4beeecba38258b27
+fp8batch/scalar_b2 h=0:1 m=0 d=f715c395244c11cc
+fp8batch/scalar_e4m3_b2 h=0:1 m=0 d=240dfad6a1ce4b29 amax=418d4000
+fp8batch/perbatch_b2 h=15:0 m=15
+fp8batch/perbatch_a_b2 h=15:0 m=15
+fp8batch/perbatch_b_b2 h=15:0 m=15
+fp8batch/outer_b2 h=15:0 m=15
+fp8batch/scalar_b3 h=0:1 m=0 d=752b0b3d8bd74ced
+fp8batch/scalar_e4m3_b3 h=0:1 m=0 d=23ece0167c8314b6 amax=418d4000
+fp8batch/perbatch_b3 h=15:0 m=15
+fp8batch/perbatch_a_b3 h=15:0 m=15
+fp8batch/perbatch_b_b3 h=15:0 m=15
+fp8batch/outer_b3 h=15:0 m=15
+fp8compute/16F h=15:0 m=15
+fp8compute/32F_FAST_16F h=0:1 m=0 d=9eace79d97f2a620
+fp8compute/32F_FAST_TF32 h=0:1 m=0 d=9eace79d97f2a620
+fp8compute/scale_f16 h=7:0 m=7
+fp8compute/scale_bf16 h=7:0 m=7
+fp8compute/64F h=15:0 m=15
+plainscales/f16_none h=0:1 m=0 d=fe6ae1bce5dd289a
+plainscales/f16_a h=7:0 m=7
+plainscales/f16_ab h=7:0 m=7
+plainscales/f16_d h=7:0 m=7
+plainscales/f16_amax h=7:0 m=7
+plainscales/f16_c_beta1 h=7:0 m=7
+plainscales/f16_aux_scale h=7:0 m=7
+plainscales/f16_aux_amax h=7:0 m=7
+plainscales/f16_outer h=7:0 m=7
+plainscales/bf16_none h=0:1 m=0 d=e025c7e5013497eb
+plainscales/bf16_a h=7:0 m=7
+plainscales/bf16_ab h=7:0 m=7
+plainscales/bf16_d h=7:0 m=7
+plainscales/bf16_amax h=7:0 m=7
+plainscales/bf16_c_beta1 h=7:0 m=7
+plainscales/bf16_aux_scale h=7:0 m=7
+plainscales/bf16_aux_amax h=7:0 m=7
+plainscales/bf16_outer h=7:0 m=7
+plainscales/f32_none h=0:1 m=0 d=7f87fe00e6bfc44f
+plainscales/f32_a h=7:0 m=7
+plainscales/f32_ab h=7:0 m=7
+plainscales/f32_d h=7:0 m=7
+plainscales/f32_amax h=7:0 m=7
+plainscales/f32_c_beta1 h=7:0 m=7
+plainscales/f32_aux_scale h=7:0 m=7
+plainscales/f32_aux_amax h=7:0 m=7
+plainscales/f32_outer h=7:0 m=7
+plainscales/i8_none h=0:1 m=0 d=264e5872272532d1
+plainscales/i8_a h=7:0 m=7
+fp8epi/default_dbf16 h=0:1 m=0 d=9eace79d97f2a620
+fp8epi/relu_dbf16 h=0:1 m=0 d=605d08c4c366779a
+fp8epi/relu_aux_dbf16 h=0:1 m=0 d=605d08c4c366779a aux=13a9fd6acf871bb0
+fp8epi/relu_aux_dbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_dbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_dbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_dbf16_auxf32 h=7:0 m=7
+fp8epi/bias_dbf16 h=0:1 m=0 d=c5d7bce3c1e2ae26
+fp8epi/bias_dbf16_biasbf16 h=0:1 m=0 d=c5d7bce3c1e2ae26
+fp8epi/bias_dbf16_biasf16 h=15:0 m=15
+fp8epi/bias_dbf16_biasf32 h=15:0 m=15
+fp8epi/relu_bias_dbf16 h=0:1 m=0 d=7ab365280f3e653b
+fp8epi/relu_bias_dbf16_biasbf16 h=0:1 m=0 d=7ab365280f3e653b
+fp8epi/relu_bias_dbf16_biasf16 h=15:0 m=15
+fp8epi/relu_bias_dbf16_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_dbf16 h=0:1 m=0 d=3ca4db9b3b668995 aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_dbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasbf16 h=0:1 m=0 d=3ca4db9b3b668995 aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_dbf16_biasbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasbf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf16 h=15:0 m=15
+fp8epi/relu_aux_bias_dbf16_biasf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_dbf16_biasf32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_dbf16_biasf32_auxf32 h=7:0 m=7
+fp8epi/gelu_dbf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_aux_dbf16 h=0:1 m=0 gelu=ok aux=9eace79d97f2a620
+fp8epi/gelu_aux_dbf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_dbf16_auxbf16 h=0:1 m=0 gelu=ok aux=9eace79d97f2a620
+fp8epi/gelu_aux_dbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_dbf16_auxf32 h=7:0 m=7
+fp8epi/gelu_bias_dbf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_dbf16_biasbf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_dbf16_biasf16 h=15:0 m=15
+fp8epi/gelu_bias_dbf16_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_dbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_auxbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_biasbf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasbf16_auxbf16 h=0:1 m=0 gelu=ok aux=56d94348011d20b0
+fp8epi/gelu_aux_bias_dbf16_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasbf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_dbf16_biasf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasf16_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_dbf16_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_dbf16_biasf32_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasf32_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_dbf16_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_dbf16_biasf32_auxf32 h=7:0 m=7
+fp8epi/default_df16 h=0:1 m=0 d=797de96d1a489c36
+fp8epi/relu_df16 h=0:1 m=0 d=2e2d67c730bdc3ff
+fp8epi/relu_aux_df16 h=0:1 m=0 d=2e2d67c730bdc3ff aux=13a9fd6acf871bb0
+fp8epi/relu_aux_df16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_df16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_df16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_df16_auxf32 h=7:0 m=7
+fp8epi/bias_df16 h=0:1 m=0 d=1f379febb72e72bc
+fp8epi/bias_df16_biasbf16 h=15:0 m=15
+fp8epi/bias_df16_biasf16 h=0:1 m=0 d=1f379febb72e72bc
+fp8epi/bias_df16_biasf32 h=15:0 m=15
+fp8epi/relu_bias_df16 h=0:1 m=0 d=368a5ca79aba35c4
+fp8epi/relu_bias_df16_biasbf16 h=15:0 m=15
+fp8epi/relu_bias_df16_biasf16 h=0:1 m=0 d=368a5ca79aba35c4
+fp8epi/relu_bias_df16_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_df16 h=0:1 m=0 d=368a5ca79aba35c4 aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_df16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasbf16 h=15:0 m=15
+fp8epi/relu_aux_bias_df16_biasbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasbf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf16 h=0:1 m=0 d=368a5ca79aba35c4 aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_df16_biasf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_df16_biasf32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df16_biasf32_auxf32 h=7:0 m=7
+fp8epi/gelu_df16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_aux_df16 h=0:1 m=0 gelu=ok aux=797de96d1a489c36
+fp8epi/gelu_aux_df16_auxf16 h=0:1 m=0 gelu=ok aux=797de96d1a489c36
+fp8epi/gelu_aux_df16_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_df16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_df16_auxf32 h=7:0 m=7
+fp8epi/gelu_bias_df16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_df16_biasbf16 h=15:0 m=15
+fp8epi/gelu_bias_df16_biasf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_df16_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_auxf16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_df16_biasbf16_auxf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_df16_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasbf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasf16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_biasf16_auxf16 h=0:1 m=0 gelu=ok aux=1f379febb72e72bc
+fp8epi/gelu_aux_bias_df16_biasf16_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df16_biasf32_auxf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_df16_biasf32_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df16_biasf32_auxf32 h=7:0 m=7
+fp8epi/default_df32 h=0:1 m=0 d=7848276900548470
+fp8epi/relu_df32 h=0:1 m=0 d=bca15ed73c54c6a9
+fp8epi/relu_aux_df32 h=0:1 m=0 d=bca15ed73c54c6a9 aux=13a9fd6acf871bb0
+fp8epi/relu_aux_df32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_df32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_df32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_df32_auxf32 h=7:0 m=7
+fp8epi/bias_df32 h=0:1 m=0 d=97828079a7ef0a79
+fp8epi/bias_df32_biasbf16 h=0:1 m=0 d=97828079a7ef0a79
+fp8epi/bias_df32_biasf16 h=15:0 m=15
+fp8epi/bias_df32_biasf32 h=15:0 m=15
+fp8epi/relu_bias_df32 h=0:1 m=0 d=4cd8a4293a995e2b
+fp8epi/relu_bias_df32_biasbf16 h=0:1 m=0 d=4cd8a4293a995e2b
+fp8epi/relu_bias_df32_biasf16 h=15:0 m=15
+fp8epi/relu_bias_df32_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_df32 h=0:1 m=0 d=4cd8a4293a995e2b aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_df32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasbf16 h=0:1 m=0 d=4cd8a4293a995e2b aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_df32_biasbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasbf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf16 h=15:0 m=15
+fp8epi/relu_aux_bias_df32_biasf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_df32_biasf32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_df32_biasf32_auxf32 h=7:0 m=7
+fp8epi/gelu_df32 h=0:1 m=0 gelu=ok
+fp8epi/gelu_aux_df32 h=0:1 m=0 gelu=ok aux=7848276900548470
+fp8epi/gelu_aux_df32_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_df32_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_df32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_df32_auxf32 h=0:1 m=0 gelu=ok aux=7848276900548470
+fp8epi/gelu_bias_df32 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_df32_biasbf16 h=0:1 m=0 gelu=ok
+fp8epi/gelu_bias_df32_biasf16 h=15:0 m=15
+fp8epi/gelu_bias_df32_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
+fp8epi/gelu_aux_bias_df32_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_auxf32 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
+fp8epi/gelu_aux_bias_df32_biasbf16 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
+fp8epi/gelu_aux_bias_df32_biasbf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasbf16_auxf32 h=0:1 m=0 gelu=ok aux=97828079a7ef0a79
+fp8epi/gelu_aux_bias_df32_biasf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32_biasf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasf16_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasf16_auxf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_df32_biasf32_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasf32_auxbf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_df32_biasf32_auxf32 h=15:0 m=15
+fp8epi/default_de4m3 h=0:1 m=0 d=0c70b13b89916643 amax=417a8000
+fp8epi/relu_de4m3 h=0:1 m=0 d=f5dcac028b312a08 amax=417a8000
+fp8epi/relu_aux_de4m3 h=0:1 m=0 d=f5dcac028b312a08 amax=417a8000 aux=13a9fd6acf871bb0
+fp8epi/relu_aux_de4m3_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_de4m3_auxf16 h=7:0 m=7
+fp8epi/relu_aux_de4m3_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_de4m3_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_de4m3_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_de4m3_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_de4m3_auxf32 h=7:0 m=7
+fp8epi/bias_de4m3 h=0:1 m=0 d=c374f7f49ebc6035 amax=41954000
+fp8epi/bias_de4m3_biasbf16 h=0:1 m=0 d=c374f7f49ebc6035 amax=41954000
+fp8epi/bias_de4m3_biasf16 h=15:0 m=15
+fp8epi/bias_de4m3_biasf32 h=15:0 m=15
+fp8epi/relu_bias_de4m3 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000
+fp8epi/relu_bias_de4m3_biasbf16 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000
+fp8epi/relu_bias_de4m3_biasf16 h=15:0 m=15
+fp8epi/relu_bias_de4m3_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_de4m3 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000 aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_de4m3_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16 h=0:1 m=0 d=5f2eb9a6af629904 amax=41954000 aux=5dbe08fb7c1756a9
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasbf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16 h=15:0 m=15
+fp8epi/relu_aux_bias_de4m3_biasf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_de4m3_biasf32_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de4m3_biasf32_auxf32 h=7:0 m=7
+fp8epi/gelu_de4m3 h=0:1 m=0 gelu=ok amax=417a8000
+fp8epi/gelu_aux_de4m3 h=0:1 m=0 gelu=ok amax=417a8000 aux=e1bdeab4bbecb620
+fp8epi/gelu_aux_de4m3_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_de4m3_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_de4m3_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_de4m3_auxbf16 h=0:1 m=0 gelu=ok amax=417a8000 aux=9eace79d97f2a620
+fp8epi/gelu_aux_de4m3_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_de4m3_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_de4m3_auxf32 h=7:0 m=7
+fp8epi/gelu_bias_de4m3 h=0:1 m=0 gelu=ok amax=41954000
+fp8epi/gelu_bias_de4m3_biasbf16 h=0:1 m=0 gelu=ok amax=41954000
+fp8epi/gelu_bias_de4m3_biasf16 h=15:0 m=15
+fp8epi/gelu_bias_de4m3_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_de4m3 h=0:1 m=0 gelu=ok amax=41954000 aux=ceb978e791213e26
+fp8epi/gelu_aux_bias_de4m3_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_auxbf16 h=0:1 m=0 gelu=ok amax=41954000 aux=c5d7bce3c1e2ae26
+fp8epi/gelu_aux_bias_de4m3_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasbf16 h=0:1 m=0 gelu=ok amax=41954000 aux=ceb978e791213e26
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxbf16 h=0:1 m=0 gelu=ok amax=41954000 aux=c5d7bce3c1e2ae26
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasbf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de4m3_biasf32_auxf32 h=7:0 m=7
+fp8epi/default_de5m2 h=0:1 m=0 d=6124bb01f08019c5 amax=417a8000
+fp8epi/relu_de5m2 h=0:1 m=0 d=bf9ad02015d1ddde amax=417a8000
+fp8epi/relu_aux_de5m2 h=15:0 m=15
+fp8epi/relu_aux_de5m2_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_de5m2_auxf16 h=7:0 m=7
+fp8epi/relu_aux_de5m2_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_de5m2_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_de5m2_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_de5m2_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_de5m2_auxf32 h=7:0 m=7
+fp8epi/bias_de5m2 h=0:1 m=0 d=eec34633b17ca18e amax=41954000
+fp8epi/bias_de5m2_biasbf16 h=0:1 m=0 d=eec34633b17ca18e amax=41954000
+fp8epi/bias_de5m2_biasf16 h=15:0 m=15
+fp8epi/bias_de5m2_biasf32 h=15:0 m=15
+fp8epi/relu_bias_de5m2 h=0:1 m=0 d=1adcf4da033f176d amax=41954000
+fp8epi/relu_bias_de5m2_biasbf16 h=0:1 m=0 d=1adcf4da033f176d amax=41954000
+fp8epi/relu_bias_de5m2_biasf16 h=15:0 m=15
+fp8epi/relu_bias_de5m2_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_de5m2 h=15:0 m=15
+fp8epi/relu_aux_bias_de5m2_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16 h=15:0 m=15
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasbf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16 h=15:0 m=15
+fp8epi/relu_aux_bias_de5m2_biasf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf16_auxf32 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32 h=15:0 m=15
+fp8epi/relu_aux_bias_de5m2_biasf32_auxdflt_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32_auxf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32_auxf16_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32_auxbf16 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32_auxe4m3_auxscale h=7:0 m=7
+fp8epi/relu_aux_bias_de5m2_biasf32_auxf32 h=7:0 m=7
+fp8epi/gelu_de5m2 h=15:0 m=15
+fp8epi/gelu_aux_de5m2 h=15:0 m=15
+fp8epi/gelu_aux_de5m2_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_de5m2_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_de5m2_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_de5m2_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_de5m2_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_de5m2_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_de5m2_auxf32 h=7:0 m=7
+fp8epi/gelu_bias_de5m2 h=15:0 m=15
+fp8epi/gelu_bias_de5m2_biasbf16 h=15:0 m=15
+fp8epi/gelu_bias_de5m2_biasf16 h=15:0 m=15
+fp8epi/gelu_bias_de5m2_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasbf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf16_auxf32 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf32 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxdflt_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxf16 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxf16_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxbf16 h=15:0 m=15
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxe4m3 h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxe4m3_auxscale h=7:0 m=7
+fp8epi/gelu_aux_bias_de5m2_biasf32_auxf32 h=7:0 m=7
+fp8bwd/drelu_NN_dbf16 h=15:0 m=15
+fp8bwd/drelu_bgrad_NN_dbf16 h=15:0 m=15
+fp8bwd/dgelu_NN_dbf16 h=15:0 m=15
+fp8bwd/dgelu_bgrad_NN_dbf16 h=15:0 m=15
+fp8bwd/bgrada_NN_dbf16 h=15:0 m=15
+fp8bwd/bgradb_NN_dbf16 h=15:0 m=15
+fp8bwd/drelu_NT_dbf16 h=15:0 m=15
+fp8bwd/drelu_bgrad_NT_dbf16 h=15:0 m=15
+fp8bwd/dgelu_NT_dbf16 h=15:0 m=15
+fp8bwd/dgelu_bgrad_NT_dbf16 h=15:0 m=15
+fp8bwd/bgrada_NT_dbf16 h=15:0 m=15
+fp8bwd/bgradb_NT_dbf16 h=15:0 m=15
+fp8bwd/drelu_TN_dbf16 h=0:1 m=0 d=5f571a2101230427
+fp8bwd/drelu_bgrad_TN_dbf16 h=0:1 m=0 d=5f571a2101230427 bgrad=00b5e1a44275ceef
+fp8bwd/dgelu_TN_dbf16 h=0:1 m=0 gelu=ok
+fp8bwd/dgelu_bgrad_TN_dbf16 h=0:1 m=0 gelu=ok
+fp8bwd/bgrada_TN_dbf16 h=15:0 m=15
+fp8bwd/bgradb_TN_dbf16 h=15:0 m=15
+fp8bwd/drelu_TT_dbf16 h=15:0 m=15
+fp8bwd/drelu_bgrad_TT_dbf16 h=15:0 m=15
+fp8bwd/dgelu_TT_dbf16 h=15:0 m=15
+fp8bwd/dgelu_bgrad_TT_dbf16 h=15:0 m=15
+fp8bwd/bgrada_TT_dbf16 h=15:0 m=15
+fp8bwd/bgradb_TT_dbf16 h=15:0 m=15
+fp8bwd/bgrada_NN_df16 h=15:0 m=15
+fp8bwd/bgradb_NN_df16 h=15:0 m=15
+fp8bwd/bgrada_NT_df16 h=15:0 m=15
+fp8bwd/bgradb_NT_df16 h=15:0 m=15
+fp8bwd/drelu_TN_df16 h=0:1 m=0 d=8edf2fdc5cff2669
+fp8bwd/drelu_bgrad_TN_df16 h=0:1 m=0 d=8edf2fdc5cff2669 bgrad=ebf1281e36488e28
+fp8bwd/dgelu_TN_df16 h=0:1 m=0 gelu=ok
+fp8bwd/dgelu_bgrad_TN_df16 h=0:1 m=0 gelu=ok
+fp8bwd/bgrada_TN_df16 h=15:0 m=15
+fp8bwd/bgradb_TN_df16 h=15:0 m=15
+fp8bwd/bgrada_TT_df16 h=15:0 m=15
+fp8bwd/bgradb_TT_df16 h=15:0 m=15
+fp8bwd/bgrada_NN_df32 h=15:0 m=15
+fp8bwd/bgradb_NN_df32 h=15:0 m=15
+fp8bwd/bgrada_NT_df32 h=15:0 m=15
+fp8bwd/bgradb_NT_df32 h=15:0 m=15
+fp8bwd/drelu_TN_df32 h=0:1 m=0 d=60acc09eff2dc37b
+fp8bwd/drelu_bgrad_TN_df32 h=15:0 m=15
+fp8bwd/dgelu_TN_df32 h=0:1 m=0 gelu=ok
+fp8bwd/dgelu_bgrad_TN_df32 h=15:0 m=15
+fp8bwd/bgrada_TN_df32 h=15:0 m=15
+fp8bwd/bgradb_TN_df32 h=15:0 m=15
+fp8bwd/bgrada_TT_df32 h=15:0 m=15
+fp8bwd/bgradb_TT_df32 h=15:0 m=15
+fp8bwd/bgrada_NN_de4m3 h=15:0 m=15
+fp8bwd/bgradb_NN_de4m3 h=15:0 m=15
+fp8bwd/bgrada_NT_de4m3 h=15:0 m=15
+fp8bwd/bgradb_NT_de4m3 h=15:0 m=15
+fp8bwd/drelu_TN_de4m3 h=15:0 m=15
+fp8bwd/drelu_bgrad_TN_de4m3 h=15:0 m=15
+fp8bwd/dgelu_TN_de4m3 h=15:0 m=15
+fp8bwd/dgelu_bgrad_TN_de4m3 h=15:0 m=15
+fp8bwd/bgrada_TN_de4m3 h=15:0 m=15
+fp8bwd/bgradb_TN_de4m3 h=15:0 m=15
+fp8bwd/bgrada_TT_de4m3 h=15:0 m=15
+fp8bwd/bgradb_TT_de4m3 h=15:0 m=15
+fp8bwd/bgrada_NN_de5m2 h=15:0 m=15
+fp8bwd/bgradb_NN_de5m2 h=15:0 m=15
+fp8bwd/bgrada_NT_de5m2 h=15:0 m=15
+fp8bwd/bgradb_NT_de5m2 h=15:0 m=15
+fp8bwd/drelu_TN_de5m2 h=15:0 m=15
+fp8bwd/drelu_bgrad_TN_de5m2 h=15:0 m=15
+fp8bwd/dgelu_TN_de5m2 h=15:0 m=15
+fp8bwd/dgelu_bgrad_TN_de5m2 h=15:0 m=15
+fp8bwd/bgrada_TN_de5m2 h=15:0 m=15
+fp8bwd/bgradb_TN_de5m2 h=15:0 m=15
+fp8bwd/bgrada_TT_de5m2 h=15:0 m=15
+fp8bwd/bgradb_TT_de5m2 h=15:0 m=15
+fp8order/TN_cccc h=0:1 m=0 d=9eace79d97f2a620
+fp8order/NT_cccc h=15:0 m=15
+fp8order/TN_rccc h=15:0 m=15
+fp8order/NT_rccc h=15:0 m=15
+fp8order/TN_crcc h=15:0 m=15
+fp8order/NT_crcc h=15:0 m=15
+fp8order/TN_rrcc h=15:0 m=15
+fp8order/NT_rrcc h=0:1 m=0 d=9eace79d97f2a620
+fp8order/TN_ccrc h=7:0 m=7
+fp8order/NT_ccrc h=7:0 m=7
+fp8order/TN_rcrc h=7:0 m=7
+fp8order/NT_rcrc h=7:0 m=7
+fp8order/TN_crrc h=7:0 m=7
+fp8order/NT_crrc h=7:0 m=7
+fp8order/TN_rrrc h=7:0 m=7
+fp8order/NT_rrrc h=7:0 m=7
+fp8order/TN_cccr h=7:0 m=7
+fp8order/NT_cccr h=7:0 m=7
+fp8order/TN_rccr h=7:0 m=7
+fp8order/NT_rccr h=7:0 m=7
+fp8order/TN_crcr h=7:0 m=7
+fp8order/NT_crcr h=7:0 m=7
+fp8order/TN_rrcr h=7:0 m=7
+fp8order/NT_rrcr h=7:0 m=7
+fp8order/TN_ccrr h=0:1 m=0 d=79822223a6aa3678
+fp8order/NT_ccrr h=15:0 m=15
+fp8order/TN_rcrr h=15:0 m=15
+fp8order/NT_rcrr h=15:0 m=15
+fp8order/TN_crrr h=15:0 m=15
+fp8order/NT_crrr h=15:0 m=15
+fp8order/TN_rrrr h=15:0 m=15
+fp8order/NT_rrrr h=0:1 m=0 d=79822223a6aa3678
+fp8ld/pad_a16 h=0:1 m=0 d=c4e3b325ec1af9d7
+fp8ld/pad_b16 h=0:1 m=0 d=b044e1861b1363a0
+fp8ld/pad_cd8 h=0:1 m=0 d=591c12e19edf2000
+fp8ld/pad_d8 h=0:1 m=0 d=591c12e19edf2000
+fp8ld/pad_d1 h=15:0 m=15
+fp8ld/pad_a1 h=15:0 m=15
+fp8ld/pad_all_e4m3 h=15:0 m=15
+fp8ld/pad_a16_b2 h=0:1 m=0 d=2d631f3ab47861e5
+fp8aux/gelu_aux_scale_amax_dbf16 h=7:0 m=7
+fp8aux/gelu_aux_e4m3_scale_amax_dbf16 h=7:0 m=7
+fp8aux/gelu_aux_e5m2_scale_amax_dbf16 h=7:0 m=7
+fp8aux/gelu_aux_bias_scale_amax_dbf16 h=7:0 m=7
+fp8aux/relu_aux_scale_amax_dbf16 h=7:0 m=7
+fp8aux/gelu_aux_scale_amax_df16 h=7:0 m=7
+fp8aux/gelu_aux_e4m3_scale_amax_df16 h=7:0 m=7
+fp8aux/gelu_aux_e5m2_scale_amax_df16 h=7:0 m=7
+fp8aux/gelu_aux_bias_scale_amax_df16 h=7:0 m=7
+fp8aux/relu_aux_scale_amax_df16 h=7:0 m=7
+mx8/NN_e4m3e4m3_dbf16 h=15:0 m=15
+mx8/NN_e4m3e4m3_df16 h=15:0 m=15
+mx8/NN_e4m3e4m3_df32 h=15:0 m=15
+mx8/NN_e4m3e5m2_dbf16 h=15:0 m=15
+mx8/NN_e4m3e5m2_df16 h=15:0 m=15
+mx8/NN_e4m3e5m2_df32 h=15:0 m=15
+mx8/NN_e5m2e4m3_dbf16 h=15:0 m=15
+mx8/NN_e5m2e4m3_df16 h=15:0 m=15
+mx8/NN_e5m2e4m3_df32 h=15:0 m=15
+mx8/NN_e5m2e5m2_dbf16 h=15:0 m=15
+mx8/NN_e5m2e5m2_df16 h=15:0 m=15
+mx8/NN_e5m2e5m2_df32 h=15:0 m=15
+mx8/NT_e4m3e4m3_dbf16 h=15:0 m=15
+mx8/NT_e4m3e4m3_df16 h=15:0 m=15
+mx8/NT_e4m3e4m3_df32 h=15:0 m=15
+mx8/NT_e4m3e5m2_dbf16 h=15:0 m=15
+mx8/NT_e4m3e5m2_df16 h=15:0 m=15
+mx8/NT_e4m3e5m2_df32 h=15:0 m=15
+mx8/NT_e5m2e4m3_dbf16 h=15:0 m=15
+mx8/NT_e5m2e4m3_df16 h=15:0 m=15
+mx8/NT_e5m2e4m3_df32 h=15:0 m=15
+mx8/NT_e5m2e5m2_dbf16 h=15:0 m=15
+mx8/NT_e5m2e5m2_df16 h=15:0 m=15
+mx8/NT_e5m2e5m2_df32 h=15:0 m=15
+mx8/TN_e4m3e4m3_dbf16 h=15:0 m=15
+mx8/TN_e4m3e4m3_df16 h=15:0 m=15
+mx8/TN_e4m3e4m3_df32 h=15:0 m=15
+mx8/TN_e4m3e5m2_dbf16 h=15:0 m=15
+mx8/TN_e4m3e5m2_df16 h=15:0 m=15
+mx8/TN_e4m3e5m2_df32 h=15:0 m=15
+mx8/TN_e5m2e4m3_dbf16 h=15:0 m=15
+mx8/TN_e5m2e4m3_df16 h=15:0 m=15
+mx8/TN_e5m2e4m3_df32 h=15:0 m=15
+mx8/TN_e5m2e5m2_dbf16 h=15:0 m=15
+mx8/TN_e5m2e5m2_df16 h=15:0 m=15
+mx8/TN_e5m2e5m2_df32 h=15:0 m=15
+mx8/TT_e4m3e4m3_dbf16 h=15:0 m=15
+mx8/TT_e4m3e4m3_df16 h=15:0 m=15
+mx8/TT_e4m3e4m3_df32 h=15:0 m=15
+mx8/TT_e4m3e5m2_dbf16 h=15:0 m=15
+mx8/TT_e4m3e5m2_df16 h=15:0 m=15
+mx8/TT_e4m3e5m2_df32 h=15:0 m=15
+mx8/TT_e5m2e4m3_dbf16 h=15:0 m=15
+mx8/TT_e5m2e4m3_df16 h=15:0 m=15
+mx8/TT_e5m2e4m3_df32 h=15:0 m=15
+mx8/TT_e5m2e5m2_dbf16 h=15:0 m=15
+mx8/TT_e5m2e5m2_df16 h=15:0 m=15
+mx8/TT_e5m2e5m2_df32 h=15:0 m=15
+mx8shape/TN_128x128x256 h=15:0 m=15
+mx8shape/TN_f32_128x128x256 h=15:0 m=15
+mx8shape/TN_64x64x64 h=15:0 m=15
+mx8shape/TN_f32_64x64x64 h=15:0 m=15
+mx8shape/TN_32x32x32 h=15:0 m=15
+mx8shape/TN_f32_32x32x32 h=15:0 m=15
+mx8shape/TN_160x96x192 h=15:0 m=15
+mx8shape/TN_f32_160x96x192 h=15:0 m=15
+mx8shape/TN_128x128x96 h=15:0 m=15
+mx8shape/TN_f32_128x128x96 h=15:0 m=15
+mx8shape/TN_192x64x512 h=15:0 m=15
+mx8shape/TN_f32_192x64x512 h=15:0 m=15
+mx8shape/TN_256x256x1024 h=15:0 m=15
+mx8shape/TN_f32_256x256x1024 h=15:0 m=15
+mx8shape/TN_128x128x640 h=15:0 m=15
+mx8shape/TN_f32_128x128x640 h=15:0 m=15
+mx8shape/TN_16x16x64 h=15:0 m=15
+mx8shape/TN_f32_16x16x64 h=15:0 m=15
+mx8out/dout_v32_de4m3_128x128x256 h=15:0 m=15
+mx8out/dout_v32_de4m3_64x64x64 h=15:0 m=15
+mx8out/dout_v32_de4m3_32x32x32 h=15:0 m=15
+mx8out/dout_v32_de4m3_160x96x192 h=15:0 m=15
+mx8out/dout_v32_de4m3_128x128x96 h=15:0 m=15
+mx8out/dout_v32_de4m3_192x64x512 h=15:0 m=15
+mx8out/dout_v32_de4m3_256x256x1024 h=15:0 m=15
+mx8out/dout_v32_de4m3_128x128x640 h=15:0 m=15
+mx8out/dout_v32_de4m3_16x16x64 h=15:0 m=15
+mx8out/scalar_dscale_de4m3 h=7:0 m=7
+mx8out/no_dscale_de4m3 h=7:0 m=7
+mx8out/dout_v32_de5m2_128x128x256 h=15:0 m=15
+mx8out/dout_v32_de5m2_64x64x64 h=15:0 m=15
+mx8out/dout_v32_de5m2_32x32x32 h=15:0 m=15
+mx8out/dout_v32_de5m2_160x96x192 h=15:0 m=15
+mx8out/dout_v32_de5m2_128x128x96 h=15:0 m=15
+mx8out/dout_v32_de5m2_192x64x512 h=15:0 m=15
+mx8out/dout_v32_de5m2_256x256x1024 h=15:0 m=15
+mx8out/dout_v32_de5m2_128x128x640 h=15:0 m=15
+mx8out/dout_v32_de5m2_16x16x64 h=15:0 m=15
+mx8out/scalar_dscale_de5m2 h=15:0 m=15
+mx8out/no_dscale_de5m2 h=15:0 m=15
+scalemix/sc_sc_e4m3 h=0:1 m=0 d=c86898224f34be73
+scalemix/sc_v32_e4m3 h=7:0 m=7
+scalemix/sc_v16_e4m3 h=7:0 m=7
+scalemix/sc_outer_e4m3 h=7:0 m=7
+scalemix/sc_v128_e4m3 h=7:0 m=7
+scalemix/sc_b128_e4m3 h=7:0 m=7
+scalemix/sc_pb_e4m3 h=15:0 m=15
+scalemix/sc_mk128_e4m3 h=7:0 m=7
+scalemix/sc_mk32_e4m3 h=7:0 m=7
+scalemix/v32_sc_e4m3 h=7:0 m=7
+scalemix/v32_v32_e4m3 h=15:0 m=15
+scalemix/v32_v16_e4m3 h=7:0 m=7
+scalemix/v32_outer_e4m3 h=7:0 m=7
+scalemix/v32_v128_e4m3 h=7:0 m=7
+scalemix/v32_b128_e4m3 h=7:0 m=7
+scalemix/v32_pb_e4m3 h=7:0 m=7
+scalemix/v32_mk128_e4m3 h=15:0 m=15
+scalemix/v32_mk32_e4m3 h=15:0 m=15
+scalemix/v16_sc_e4m3 h=7:0 m=7
+scalemix/v16_v32_e4m3 h=7:0 m=7
+scalemix/v16_v16_e4m3 h=7:0 m=7
+scalemix/v16_outer_e4m3 h=7:0 m=7
+scalemix/v16_v128_e4m3 h=7:0 m=7
+scalemix/v16_b128_e4m3 h=7:0 m=7
+scalemix/v16_pb_e4m3 h=7:0 m=7
+scalemix/v16_mk128_e4m3 h=7:0 m=7
+scalemix/v16_mk32_e4m3 h=7:0 m=7
+scalemix/outer_sc_e4m3 h=7:0 m=7
+scalemix/outer_v32_e4m3 h=7:0 m=7
+scalemix/outer_v16_e4m3 h=7:0 m=7
+scalemix/outer_outer_e4m3 h=15:0 m=15
+scalemix/outer_v128_e4m3 h=15:0 m=15
+scalemix/outer_b128_e4m3 h=15:0 m=15
+scalemix/outer_pb_e4m3 h=7:0 m=7
+scalemix/outer_mk128_e4m3 h=7:0 m=7
+scalemix/outer_mk32_e4m3 h=7:0 m=7
+scalemix/v128_sc_e4m3 h=7:0 m=7
+scalemix/v128_v32_e4m3 h=7:0 m=7
+scalemix/v128_v16_e4m3 h=7:0 m=7
+scalemix/v128_outer_e4m3 h=15:0 m=15
+scalemix/v128_v128_e4m3 h=15:0 m=15
+scalemix/v128_b128_e4m3 h=15:0 m=15
+scalemix/v128_pb_e4m3 h=7:0 m=7
+scalemix/v128_mk128_e4m3 h=7:0 m=7
+scalemix/v128_mk32_e4m3 h=7:0 m=7
+scalemix/b128_sc_e4m3 h=7:0 m=7
+scalemix/b128_v32_e4m3 h=7:0 m=7
+scalemix/b128_v16_e4m3 h=7:0 m=7
+scalemix/b128_outer_e4m3 h=15:0 m=15
+scalemix/b128_v128_e4m3 h=15:0 m=15
+scalemix/b128_b128_e4m3 h=15:0 m=15
+scalemix/b128_pb_e4m3 h=7:0 m=7
+scalemix/b128_mk128_e4m3 h=7:0 m=7
+scalemix/b128_mk32_e4m3 h=7:0 m=7
+scalemix/pb_sc_e4m3 h=15:0 m=15
+scalemix/pb_v32_e4m3 h=7:0 m=7
+scalemix/pb_v16_e4m3 h=7:0 m=7
+scalemix/pb_outer_e4m3 h=7:0 m=7
+scalemix/pb_v128_e4m3 h=7:0 m=7
+scalemix/pb_b128_e4m3 h=7:0 m=7
+scalemix/pb_pb_e4m3 h=15:0 m=15
+scalemix/pb_mk128_e4m3 h=7:0 m=7
+scalemix/pb_mk32_e4m3 h=7:0 m=7
+scalemix/mk128_sc_e4m3 h=7:0 m=7
+scalemix/mk128_v32_e4m3 h=15:0 m=15
+scalemix/mk128_v16_e4m3 h=7:0 m=7
+scalemix/mk128_outer_e4m3 h=7:0 m=7
+scalemix/mk128_v128_e4m3 h=7:0 m=7
+scalemix/mk128_b128_e4m3 h=7:0 m=7
+scalemix/mk128_pb_e4m3 h=7:0 m=7
+scalemix/mk128_mk128_e4m3 h=15:0 m=15
+scalemix/mk128_mk32_e4m3 h=15:0 m=15
+scalemix/mk32_sc_e4m3 h=7:0 m=7
+scalemix/mk32_v32_e4m3 h=15:0 m=15
+scalemix/mk32_v16_e4m3 h=7:0 m=7
+scalemix/mk32_outer_e4m3 h=7:0 m=7
+scalemix/mk32_v128_e4m3 h=7:0 m=7
+scalemix/mk32_b128_e4m3 h=7:0 m=7
+scalemix/mk32_pb_e4m3 h=7:0 m=7
+scalemix/mk32_mk128_e4m3 h=15:0 m=15
+scalemix/mk32_mk32_e4m3 h=15:0 m=15
+fp4/NN_v16_dbf16 h=15:0 m=15
+fp4/NN_v16_df16 h=15:0 m=15
+fp4/NN_v16_df32 h=15:0 m=15
+fp4/NN_v32_dbf16 h=7:0 m=7
+fp4/NN_v32_df16 h=7:0 m=7
+fp4/NN_v32_df32 h=7:0 m=7
+fp4/NT_v16_dbf16 h=15:0 m=15
+fp4/NT_v16_df16 h=15:0 m=15
+fp4/NT_v16_df32 h=15:0 m=15
+fp4/NT_v32_dbf16 h=7:0 m=7
+fp4/NT_v32_df16 h=7:0 m=7
+fp4/NT_v32_df32 h=7:0 m=7
+fp4/TN_v16_dbf16 h=15:0 m=15
+fp4/TN_v16_df16 h=15:0 m=15
+fp4/TN_v16_df32 h=15:0 m=15
+fp4/TN_v32_dbf16 h=7:0 m=7
+fp4/TN_v32_df16 h=7:0 m=7
+fp4/TN_v32_df32 h=7:0 m=7
+fp4/TT_v16_dbf16 h=15:0 m=15
+fp4/TT_v16_df16 h=15:0 m=15
+fp4/TT_v16_df32 h=15:0 m=15
+fp4/TT_v32_dbf16 h=7:0 m=7
+fp4/TT_v32_df16 h=7:0 m=7
+fp4/TT_v32_df32 h=7:0 m=7
+fp4shape/TN_128x128x256 h=15:0 m=15
+fp4shape/TN_f32_128x128x256 h=15:0 m=15
+fp4shape/TN_fp4out_128x128x256 h=15:0 m=15
+fp4shape/TN_64x64x64 h=15:0 m=15
+fp4shape/TN_f32_64x64x64 h=15:0 m=15
+fp4shape/TN_fp4out_64x64x64 h=15:0 m=15
+fp4shape/TN_32x32x32 h=15:0 m=15
+fp4shape/TN_f32_32x32x32 h=15:0 m=15
+fp4shape/TN_fp4out_32x32x32 h=15:0 m=15
+fp4shape/TN_160x96x192 h=15:0 m=15
+fp4shape/TN_f32_160x96x192 h=15:0 m=15
+fp4shape/TN_fp4out_160x96x192 h=15:0 m=15
+fp4shape/TN_128x128x96 h=15:0 m=15
+fp4shape/TN_f32_128x128x96 h=15:0 m=15
+fp4shape/TN_fp4out_128x128x96 h=15:0 m=15
+fp4shape/TN_192x64x512 h=15:0 m=15
+fp4shape/TN_f32_192x64x512 h=15:0 m=15
+fp4shape/TN_fp4out_192x64x512 h=15:0 m=15
+fp4shape/TN_256x256x1024 h=15:0 m=15
+fp4shape/TN_f32_256x256x1024 h=15:0 m=15
+fp4shape/TN_fp4out_256x256x1024 h=15:0 m=15
+fp4shape/TN_128x128x640 h=15:0 m=15
+fp4shape/TN_f32_128x128x640 h=15:0 m=15
+fp4shape/TN_fp4out_128x128x640 h=15:0 m=15
+fp4shape/TN_16x16x64 h=15:0 m=15
+fp4shape/TN_f32_16x16x64 h=15:0 m=15
+fp4shape/TN_fp4out_16x16x64 h=15:0 m=15
+fp4out/de4m3_dscale h=15:0 m=15
+fp4out/de4m3_nodscale h=15:0 m=15
+fp4out/de4m3_dout_v32 h=15:0 m=15
+fp4out/de4m3_dout_v16 h=15:0 m=15
+fp4out/de5m2_dscale h=15:0 m=15
+fp4out/de5m2_nodscale h=15:0 m=15
+fp4out/de5m2_dout_v32 h=15:0 m=15
+fp4out/de5m2_dout_v16 h=15:0 m=15
+fp4out/dfp4_dscale h=15:0 m=15
+fp4out/dfp4_nodscale h=15:0 m=15
+fp4out/dfp4_dout_v32 h=7:0 m=7
+fp4out/dfp4_dout_v16 h=15:0 m=15
+fp4mix/fp4_e4m3_v16 h=15:0 m=15
+fp4mix/e4m3_fp4_v32 h=15:0 m=15
+fp4mix/e4m3_v16 h=7:0 m=7
+fp4mix/fp4_noscale_mode h=7:0 m=7
+fp4mix/fp4_no_a_scale_ptr h=7:0 m=7
+fp4mix/e4m3_v32_no_ptrs h=7:0 m=7
+hop/NN_v128_v128_dbf16 h=15:0 m=15
+hop/NN_v128_v128_df32 h=15:0 m=15
+hop/NN_v128_b128_dbf16 h=15:0 m=15
+hop/NN_v128_b128_df32 h=15:0 m=15
+hop/NN_b128_v128_dbf16 h=15:0 m=15
+hop/NN_b128_v128_df32 h=15:0 m=15
+hop/NN_b128_b128_dbf16 h=15:0 m=15
+hop/NN_b128_b128_df32 h=15:0 m=15
+hop/NT_v128_v128_dbf16 h=15:0 m=15
+hop/NT_v128_v128_df32 h=15:0 m=15
+hop/NT_v128_b128_dbf16 h=15:0 m=15
+hop/NT_v128_b128_df32 h=15:0 m=15
+hop/NT_b128_v128_dbf16 h=15:0 m=15
+hop/NT_b128_v128_df32 h=15:0 m=15
+hop/NT_b128_b128_dbf16 h=15:0 m=15
+hop/NT_b128_b128_df32 h=15:0 m=15
+hop/TN_v128_v128_dbf16 h=15:0 m=15
+hop/TN_v128_v128_df32 h=15:0 m=15
+hop/TN_v128_b128_dbf16 h=15:0 m=15
+hop/TN_v128_b128_df32 h=15:0 m=15
+hop/TN_b128_v128_dbf16 h=15:0 m=15
+hop/TN_b128_v128_df32 h=15:0 m=15
+hop/TN_b128_b128_dbf16 h=15:0 m=15
+hop/TN_b128_b128_df32 h=15:0 m=15
+hop/TT_v128_v128_dbf16 h=15:0 m=15
+hop/TT_v128_v128_df32 h=15:0 m=15
+hop/TT_v128_b128_dbf16 h=15:0 m=15
+hop/TT_v128_b128_df32 h=15:0 m=15
+hop/TT_b128_v128_dbf16 h=15:0 m=15
+hop/TT_b128_v128_df32 h=15:0 m=15
+hop/TT_b128_b128_dbf16 h=15:0 m=15
+hop/TT_b128_b128_df32 h=15:0 m=15
+hopshape/TN_v128_b128_128x128x256 h=15:0 m=15
+hopshape/TN_v128_v128_128x128x256 h=15:0 m=15
+hopshape/TN_b128_v128_128x128x256 h=15:0 m=15
+hopshape/TN_v128_b128_64x64x64 h=15:0 m=15
+hopshape/TN_v128_v128_64x64x64 h=15:0 m=15
+hopshape/TN_b128_v128_64x64x64 h=15:0 m=15
+hopshape/TN_v128_b128_32x32x32 h=15:0 m=15
+hopshape/TN_v128_v128_32x32x32 h=15:0 m=15
+hopshape/TN_b128_v128_32x32x32 h=15:0 m=15
+hopshape/TN_v128_b128_160x96x192 h=15:0 m=15
+hopshape/TN_v128_v128_160x96x192 h=15:0 m=15
+hopshape/TN_b128_v128_160x96x192 h=15:0 m=15
+hopshape/TN_v128_b128_128x128x96 h=15:0 m=15
+hopshape/TN_v128_v128_128x128x96 h=15:0 m=15
+hopshape/TN_b128_v128_128x128x96 h=15:0 m=15
+hopshape/TN_v128_b128_192x64x512 h=15:0 m=15
+hopshape/TN_v128_v128_192x64x512 h=15:0 m=15
+hopshape/TN_b128_v128_192x64x512 h=15:0 m=15
+hopshape/TN_v128_b128_256x256x1024 h=15:0 m=15
+hopshape/TN_v128_v128_256x256x1024 h=15:0 m=15
+hopshape/TN_b128_v128_256x256x1024 h=15:0 m=15
+hopshape/TN_v128_b128_128x128x640 h=15:0 m=15
+hopshape/TN_v128_v128_128x128x640 h=15:0 m=15
+hopshape/TN_b128_v128_128x128x640 h=15:0 m=15
+hopshape/TN_v128_b128_16x16x64 h=15:0 m=15
+hopshape/TN_v128_v128_16x16x64 h=15:0 m=15
+hopshape/TN_b128_v128_16x16x64 h=15:0 m=15
+hopout/de4m3 h=7:0 m=7
+hopout/dfp4 h=15:0 m=15
+mnk4/NN_mk128_dbf16 h=15:0 m=15
+mnk4/NN_mk128_df32 h=15:0 m=15
+mnk4/NN_mk32_dbf16 h=15:0 m=15
+mnk4/NN_mk32_df32 h=15:0 m=15
+mnk4/NT_mk128_dbf16 h=15:0 m=15
+mnk4/NT_mk128_df32 h=15:0 m=15
+mnk4/NT_mk32_dbf16 h=15:0 m=15
+mnk4/NT_mk32_df32 h=15:0 m=15
+mnk4/TN_mk128_dbf16 h=15:0 m=15
+mnk4/TN_mk128_df32 h=15:0 m=15
+mnk4/TN_mk32_dbf16 h=15:0 m=15
+mnk4/TN_mk32_df32 h=15:0 m=15
+mnk4/TT_mk128_dbf16 h=15:0 m=15
+mnk4/TT_mk128_df32 h=15:0 m=15
+mnk4/TT_mk32_dbf16 h=15:0 m=15
+mnk4/TT_mk32_df32 h=15:0 m=15
+mnk4shape/TN_mk128_128x128x256 h=15:0 m=15
+mnk4shape/TN_mk32_128x128x256 h=15:0 m=15
+mnk4shape/TN_mk128_64x64x64 h=15:0 m=15
+mnk4shape/TN_mk32_64x64x64 h=15:0 m=15
+mnk4shape/TN_mk128_32x32x32 h=15:0 m=15
+mnk4shape/TN_mk32_32x32x32 h=15:0 m=15
+mnk4shape/TN_mk128_160x96x192 h=15:0 m=15
+mnk4shape/TN_mk32_160x96x192 h=15:0 m=15
+mnk4shape/TN_mk128_128x128x96 h=15:0 m=15
+mnk4shape/TN_mk32_128x128x96 h=15:0 m=15
+mnk4shape/TN_mk128_192x64x512 h=15:0 m=15
+mnk4shape/TN_mk32_192x64x512 h=15:0 m=15
+mnk4shape/TN_mk128_256x256x1024 h=15:0 m=15
+mnk4shape/TN_mk32_256x256x1024 h=15:0 m=15
+mnk4shape/TN_mk128_128x128x640 h=15:0 m=15
+mnk4shape/TN_mk32_128x128x640 h=15:0 m=15
+mnk4shape/TN_mk128_16x16x64 h=15:0 m=15
+mnk4shape/TN_mk32_16x16x64 h=15:0 m=15
+bsbatch/v32_b2 h=15:0 m=15
+bsbatch/v32_odd_b2 h=15:0 m=15
+bsbatch/v16_b2 h=15:0 m=15
+bsbatch/hop_b2 h=15:0 m=15
+bsbatch/mnk4_b2 h=15:0 m=15
+bsbatch/v32_dout_b2 h=15:0 m=15
+bsbatch/v32_b3 h=15:0 m=15
+bsbatch/v32_odd_b3 h=15:0 m=15
+bsbatch/v16_b3 h=15:0 m=15
+bsbatch/hop_b3 h=15:0 m=15
+bsbatch/mnk4_b3 h=15:0 m=15
+bsbatch/v32_dout_b3 h=15:0 m=15
+bsepi/mx8_bias h=15:0 m=15
+bsepi/nv4_bias h=15:0 m=15
+bsepi/mx8_relu h=15:0 m=15
+bsepi/nv4_relu h=15:0 m=15
+bsepi/mx8_gelu h=15:0 m=15
+bsepi/nv4_gelu h=15:0 m=15
+bsepi/mx8_gelu_aux h=7:0 m=7
+bsepi/nv4_gelu_aux h=7:0 m=7
+bsepi/mx8_relu_aux_bias h=7:0 m=7
+bsepi/nv4_relu_aux_bias h=7:0 m=7
+bsbeta/mx8_c_bf16_beta2 h=15:0 m=15
+bsbeta/mx8_c_e4m3_v32_beta2 h=15:0 m=15
+bsbeta/mx8_c_e4m3_scalar_beta2 h=15:0 m=15
+bsbeta/nv4_c_bf16_beta2 h=15:0 m=15
+bsbeta/mx8_c_bf16_beta1 h=15:0 m=15
+bsbeta/mx8_c_e4m3_v32_beta1 h=15:0 m=15
+bsbeta/mx8_c_e4m3_scalar_beta1 h=15:0 m=15
+bsbeta/nv4_c_bf16_beta1 h=15:0 m=15
+bscompute/fast_tf32 h=15:0 m=15
+bscompute/scale_f16 h=7:0 m=7
+bscompute/alpha_half h=15:0 m=15
+bscompute/device_alpha h=15:0 m=15
+# 1278 cases
+PASS

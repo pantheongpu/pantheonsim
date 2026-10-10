@@ -10,9 +10,16 @@
 //   - every other routine runs whole, as one cuBLAS call, on the first
 //     selected device: a correct answer, without the tiling across devices.
 // The arithmetic is cuBLAS's own (cublas_api.cpp), so the answers are the
-// ones the single-GPU routines give. The CPU share (cublasXtSetCpuRatio and
-// cublasXtSetCpuRoutine) is kept and never used: all the work is the
-// devices'.
+// ones the single-GPU routines give. GEMM's CPU share is real: with a CPU
+// routine set (cublasXtSetCpuRoutine) and a ratio above 0 (cublasXtSetCpuRatio)
+// the routine is called, Fortran-style (all arguments pointers), on the last
+// floor(ratio * d) rows of C if m > n, else columns, d being the longer of
+// m and n (ties go to n; the product is in float, so 0.57 * 1000 is 570).
+// Measured on an RTX 3060, cuBLAS 13.0: the pointers handed over are the
+// caller's own, offset into A, B and C. The routine is called even for 0 rows,
+// not at all for ratio 0 or without a routine, and no other routine ever calls
+// it. The card divides by zero for a ratio of 1 or more; here the GPUs get
+// the remainder, which may be nothing.
 //
 // The answers to bad arguments are an RTX 3060's (cuBLAS 13.0), measured.
 // Its getters (cublasXtGetBlockDim, cublasXtGetPinningMemMode,
@@ -147,6 +154,10 @@ VGPU_XT_BLAS(cuComplex, float, C)
 VGPU_XT_BLAS(cuDoubleComplex, double, Z)
 #undef VGPU_XT_BLAS
 
+template <class T> constexpr int xt_type_index() {
+  return std::is_same_v<T, float> ? 0 : std::is_same_v<T, double> ? 1 : std::is_same_v<T, cuComplex> ? 2 : 3;
+}
+
 // C = alpha op(A) op(B) + beta C, tile by tile over the selected devices.
 template <class T>
 cublasStatus_t xt_gemm(cublasXtHandle_t h, cublasOperation_t ta, cublasOperation_t tb, size_t m, size_t n, size_t k,
@@ -163,6 +174,28 @@ cublasStatus_t xt_gemm(cublasXtHandle_t h, cublasOperation_t ta, cublasOperation
     return CUBLAS_STATUS_INVALID_VALUE;
   if (!alpha || !beta) return CUBLAS_STATUS_INVALID_VALUE;
   if (!m || !n) return CUBLAS_STATUS_SUCCESS;
+  // The CPU's share: the tail of the longer dimension of C goes to the
+  // caller's routine, on the caller's memory; the devices take the head.
+  if (const int ty = xt_type_index<T>(); x->cpu_routine[CUBLASXT_GEMM][ty] && x->cpu_ratio[CUBLASXT_GEMM][ty] > 0.0f) {
+    using Fn = void (*)(const char*, const char*, const int*, const int*, const int*, const T*, const T*, const int*,
+                        const T*, const int*, const T*, T*, const int*);
+    const float ratio = std::min(x->cpu_ratio[CUBLASXT_GEMM][ty], 1.0f);
+    const bool split_n = n >= m;
+    const size_t whole = split_n ? n : m;
+    const size_t cpu = std::min(whole, (size_t)(ratio * (float)whole));
+    const size_t head = whole - cpu;
+    const char opc[3] = {'N', 'T', 'C'};
+    const char ca = opc[tav], cb = opc[tbv];
+    int im = (int)(split_n ? m : cpu), in = (int)(split_n ? cpu : n), ik = (int)k, ilda = (int)lda, ildb = (int)ldb,
+        ildc = (int)ldc;
+    const T* a_cpu = split_n ? A : (tav == CUBLAS_OP_N ? A + head : A + head * lda);
+    const T* b_cpu = split_n ? (tbv == CUBLAS_OP_N ? B + head * ldb : B + head) : B;
+    T* c_cpu = C + (split_n ? head * ldc : head);
+    reinterpret_cast<Fn>(x->cpu_routine[CUBLASXT_GEMM][ty])(&ca, &cb, &im, &in, &ik, alpha, a_cpu, &ilda, b_cpu, &ildb,
+                                                            beta, c_cpu, &ildc);
+    if (split_n) n = head; else m = head;
+    if (!m || !n) return CUBLAS_STATUS_SUCCESS;
+  }
   const auto hA = stage(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k));
   const auto hB = stage(B, tb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n));
   auto hC = stage(C, extent(ldc, n, m));
@@ -341,12 +374,20 @@ VGPU_EXPORT cublasStatus_t cublasXtSetPinningMemMode(cublasXtHandle_t handle, cu
   x->pinning = (cublasXtPinnedMemMode_t)v;
   return CUBLAS_STATUS_SUCCESS;
 }
+// The card takes a CPU routine and ratio for every type of GEMM, and for the
+// complex types of herk, hemm, her2k and herkx (which then never call it);
+// every other routine and type answers NOT_SUPPORTED (measured).
+static bool cpu_share_known(int op, int ty) {
+  if (op == CUBLASXT_GEMM) return true;
+  return (op == CUBLASXT_HERK || op == CUBLASXT_HEMM || op == CUBLASXT_HER2K || op == CUBLASXT_HERKX) && ty >= 2;
+}
 VGPU_EXPORT cublasStatus_t cublasXtSetCpuRoutine(cublasXtHandle_t handle, cublasXtBlasOp_t blasOp,
                                                  cublasXtOpType_t type, void* blasFunctor) {
   XtHandle* x = get(handle);
   if (!x) return CUBLAS_STATUS_NOT_INITIALIZED;
   const int op = enum_value(blasOp), ty = enum_value(type);
   if (op < 0 || op >= CUBLASXT_ROUTINE_MAX || ty < 0 || ty > 3) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!cpu_share_known(op, ty)) return CUBLAS_STATUS_NOT_SUPPORTED;
   x->cpu_routine[op][ty] = blasFunctor;
   return CUBLAS_STATUS_SUCCESS;
 }
@@ -357,6 +398,7 @@ VGPU_EXPORT cublasStatus_t cublasXtSetCpuRatio(cublasXtHandle_t handle, cublasXt
   // The card checks the routine and type, not the ratio (2 and -1 are taken).
   const int op = enum_value(blasOp), ty = enum_value(type);
   if (op < 0 || op >= CUBLASXT_ROUTINE_MAX || ty < 0 || ty > 3) return CUBLAS_STATUS_INVALID_VALUE;
+  if (!cpu_share_known(op, ty)) return CUBLAS_STATUS_NOT_SUPPORTED;
   x->cpu_ratio[op][ty] = ratio;
   return CUBLAS_STATUS_SUCCESS;
 }

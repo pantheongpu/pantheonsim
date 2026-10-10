@@ -25,7 +25,7 @@ CAPTURE_AWARE = re.compile(
     r"\b(capture_active|capture_record|capture_refuse|capture_host_fn|capture_malloc|"
     r"capture_free|capture_wait|capture_event_node|capture_position|capture_target|"
     r"stream_capture|capture_info|update_capture_deps|vgpu_record_\w+|vgpu_drop_capture|"
-    r"launch_kernel_impl)\s*\(")
+    r"launch_kernel_impl|capture_array_box)\s*\(")
 
 # Stream functions that need no capture handling, each with why. Adding a name
 # here is a claim about CUDA's semantics, so it needs a reason that holds.
@@ -61,11 +61,11 @@ def _body_at(text, start):
 def traced_bodies(text):
     """The bodies of the entry points a profiler can subscribe to by name.
 
-    Those are exported as a one-line wrapper (traced_call) around `NAME_body`,
+    Those are exported as a one-line wrapper (traced_call) around `NAME_body` (or `NAME_traced`),
     which holds what the function does; capture state is consulted there.
     """
     return {m.group(1): _body_at(text, m.end())
-            for m in re.finditer(r"static\s+cudaError_t\s+(cuda\w+?)_body\s*\(([^)]*)\)\s*\{", text)}
+            for m in re.finditer(r"static\s+cudaError_t\s+(cuda\w+?)_(?:body|traced)\s*\(([^)]*)\)\s*\{", text)}
 
 
 def exported_stream_functions(text):

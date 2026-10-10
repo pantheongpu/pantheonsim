@@ -10,8 +10,12 @@
 //     fails with "No valid engine configs" (its HEURISTIC_QUERY_FAILED). They
 //     are rotary embeddings outside a matrix-multiplication graph, the MoE
 //     backward pass, attention with a block mask, nearest and bilinear
-//     resampling; FP8 attention is refused by cudnn-frontend itself below
-//     compute capability 9.
+//     resampling outside its one documented configuration; FP8 attention is
+//     refused by cudnn-frontend itself below compute capability 9.
+//   - bilinear upsampling by 2, the one resampling cuDNN has an engine for
+//     (NHWC, float, window 2, strides 1/2, pre-padding 1/2, post-padding 1):
+//     checked against its formula, and the configurations around it that have
+//     no engine, or an engine whose plan cannot be built (half data).
 //
 // Each result is checked against a reference computed here from the same
 // rounded inputs. The same program runs against NVIDIA's libcudnn.so.9: where
@@ -355,6 +359,117 @@ static void moe_cases(cudnnHandle_t h) {
   }
 }
 
+// ---- bilinear upsampling ---------------------------------------------------------------------
+
+// cuDNN documents one configuration of bilinear resampling for its runtime-fusion engines: NHWC, float, window 2, strides
+// 1/2, pre-padding 1/2, post-padding 1, so that the output is twice the input; nearest has no configuration at all.
+// Measured on an RTX 3060 (cuDNN 9.27): output i samples the input at s = i * stride - pre + window / 2 - 1/2 in each
+// dimension (that is i / 2 here), clamped to the input, between the pixels either side of s by distance; zero or
+// edge-value padding give the same result. Half and bfloat16 data get an engine whose plan cannot be built; every
+// other parameter set tried has no engine.
+static void bilinear_cases(cudnnHandle_t h) {
+  const cudnnFraction_t half_{1, 2}, one{1, 1}, two{2, 1}, zero{0, 1}, third{1, 3};
+  const fe::DataType_t fl = fe::DataType_t::FLOAT;
+  struct Cfg {
+    std::string name;
+    int64_t N, C, H, W;
+    fe::PaddingMode_t pm;
+  };
+  auto build = [&](fe::graph::Graph& g, const Cfg& c, fe::DataType_t ty, bool nhwc, std::vector<cudnnFraction_t> win,
+                   std::vector<cudnnFraction_t> str, std::vector<cudnnFraction_t> pre, std::vector<cudnnFraction_t> post,
+                   int64_t OH, int64_t OW, fe::ResampleMode_t mode) {
+    g.set_io_data_type(ty).set_intermediate_data_type(fl).set_compute_data_type(fl);
+    const int64_t C = c.C, H = c.H, W = c.W;
+    std::vector<int64_t> xs = nhwc ? std::vector<int64_t>{C * H * W, 1, C * W, C} : std::vector<int64_t>{C * H * W, H * W, W, 1};
+    std::vector<int64_t> ys = nhwc ? std::vector<int64_t>{C * OH * OW, 1, C * OW, C} : std::vector<int64_t>{C * OH * OW, OH * OW, OW, 1};
+    auto x = g.tensor(TA().set_name("x").set_dim({c.N, C, H, W}).set_stride(xs).set_uid(1));
+    auto [y, idx] = g.resample(x, fe::graph::Resample_attributes().set_generate_index(false).set_resampling_mode(mode)
+                                      .set_padding_mode(c.pm).set_window(win).set_stride(str).set_pre_padding(pre).set_post_padding(post));
+    (void)idx;
+    y->set_output(true).set_uid(2).set_dim({c.N, C, OH, OW}).set_stride(ys);
+  };
+  const std::vector<Cfg> cases = {{"batch 2, 8 channels, 5 x 7", 2, 8, 5, 7, fe::PaddingMode_t::EDGE_VAL_PAD},
+                                  {"one pixel", 1, 4, 1, 1, fe::PaddingMode_t::EDGE_VAL_PAD},
+                                  {"one channel, 4 x 4", 1, 1, 4, 4, fe::PaddingMode_t::EDGE_VAL_PAD},
+                                  {"zero padding mode, 4 x 6", 1, 3, 4, 6, fe::PaddingMode_t::ZERO_PAD}};
+  for (const Cfg& c : cases) {
+    fe::graph::Graph g;
+    build(g, c, fl, true, {two, two}, {half_, half_}, {half_, half_}, {one, one}, 2 * c.H, 2 * c.W, fe::ResampleMode_t::BILINEAR);
+    const Outcome o = plan(g, h);
+    const std::string name = "bilinear upsampling by 2, " + c.name;
+    if (o.stage != Stage::Ran) {
+      std::printf("     %s: %s: %s\n", name.c_str(), o.at.c_str(), o.message.substr(0, 120).c_str());
+      expect(name + " plans", false);
+      continue;
+    }
+    const int64_t OH = 2 * c.H, OW = 2 * c.W;
+    std::vector<double> xv(static_cast<size_t>(c.N * c.C * c.H * c.W));
+    for (int64_t n = 0; n < c.N; ++n)
+      for (int64_t ch = 0; ch < c.C; ++ch)
+        for (int64_t i = 0; i < c.H; ++i)
+          for (int64_t j = 0; j < c.W; ++j)
+            xv[static_cast<size_t>(((n * c.H + i) * c.W + j) * c.C + ch)] =
+                static_cast<double>(n * 100 + ch * 7 + i * 10 + j) + 0.125 * static_cast<double>((i * 7 + j * 3) % 5);
+    Dev dx(xv.size() * 4), dy(static_cast<size_t>(c.N * c.C * OH * OW) * 4);
+    const std::vector<uint8_t> bx = pack(Ty::Float, xv);
+    cudaMemcpy(dx.p, bx.data(), bx.size(), cudaMemcpyHostToDevice);
+    Var v{{1, dx.p}, {2, dy.p}};
+    if (!run_plan(g, h, v)) {
+      expect(name + " runs", false);
+      continue;
+    }
+    std::vector<uint8_t> raw(dy.n);
+    cudaMemcpy(raw.data(), dy.p, raw.size(), cudaMemcpyDeviceToHost);
+    const std::vector<double> got = unpack(Ty::Float, raw);
+    auto at = [&](int64_t n, int64_t ch, int64_t i, int64_t j) { return xv[static_cast<size_t>(((n * c.H + i) * c.W + j) * c.C + ch)]; };
+    double err = 0;
+    for (int64_t n = 0; n < c.N; ++n)
+      for (int64_t ch = 0; ch < c.C; ++ch)
+        for (int64_t i = 0; i < OH; ++i)
+          for (int64_t j = 0; j < OW; ++j) {
+            // s = i / 2 here: i * (1/2) - 1/2 + 2/2 - 1/2, clamped to [0, size - 1].
+            const double sy = std::min(std::max(i * 0.5, 0.0), (double)(c.H - 1)), sx = std::min(std::max(j * 0.5, 0.0), (double)(c.W - 1));
+            const int64_t y0 = (int64_t)std::floor(sy), x0 = (int64_t)std::floor(sx), y1 = std::min(y0 + 1, c.H - 1), x1 = std::min(x0 + 1, c.W - 1);
+            const double fy = sy - (double)y0, fx = sx - (double)x0;
+            const double want = (1 - fy) * ((1 - fx) * at(n, ch, y0, x0) + fx * at(n, ch, y0, x1)) +
+                                fy * ((1 - fx) * at(n, ch, y1, x0) + fx * at(n, ch, y1, x1));
+            err = std::max(err, std::fabs(got[static_cast<size_t>(((n * OH + i) * OW + j) * c.C + ch)] - want));
+          }
+    expect(name, err < 1e-5, err);
+  }
+  // What has no engine, and what has one whose plan cannot be built.
+  const Cfg base{"", 1, 8, 4, 4, fe::PaddingMode_t::EDGE_VAL_PAD};
+  {
+    fe::graph::Graph g;
+    build(g, base, fl, false, {two, two}, {half_, half_}, {half_, half_}, {one, one}, 8, 8, fe::ResampleMode_t::BILINEAR);
+    expect_no_engine("bilinear upsampling in NCHW", g, h);
+  }
+  {
+    fe::graph::Graph g;
+    build(g, base, fl, true, {two, two}, {half_, half_}, {half_, half_}, {one, one}, 8, 8, fe::ResampleMode_t::NEAREST);
+    expect_no_engine("nearest upsampling, with the bilinear parameters", g, h);
+  }
+  {
+    fe::graph::Graph g;
+    build(g, base, fl, true, {two, two}, {half_, half_}, {half_, half_}, {half_, half_}, 7, 7, fe::ResampleMode_t::BILINEAR);
+    expect_no_engine("bilinear upsampling with post-padding 1/2", g, h);
+  }
+  {
+    fe::graph::Graph g;
+    build(g, base, fl, true, {two, two}, {half_, one}, {half_, zero}, {one, zero}, 8, 3, fe::ResampleMode_t::BILINEAR);
+    expect_no_engine("bilinear upsampling of the height alone", g, h);
+  }
+  for (fe::DataType_t ty : {fe::DataType_t::HALF, fe::DataType_t::BFLOAT16}) {
+    fe::graph::Graph g;
+    build(g, base, ty, true, {two, two}, {half_, half_}, {half_, half_}, {one, one}, 8, 8, fe::ResampleMode_t::BILINEAR);
+    const Outcome o = plan(g, h);
+    expect(std::string("bilinear upsampling in ") + (ty == fe::DataType_t::HALF ? "half" : "bfloat16") +
+               ": an engine is offered but its plan cannot be built",
+           o.stage == Stage::NoEngine && o.at == "build_plans", 0);
+  }
+  (void)third;
+}
+
 // ---- graphs without an engine ----------------------------------------------------------------
 
 static void refusals(cudnnHandle_t h) {
@@ -458,6 +573,7 @@ int main() {
               CUDNN_FRONTEND_MINOR_VERSION, CUDNN_FRONTEND_PATCH_VERSION);
   moe_cases(handle);
   try {
+    bilinear_cases(handle);
     refusals(handle);
   } catch (const std::exception& ex) {
     expect(std::string("refusals (exception: ") + ex.what() + ")", false);

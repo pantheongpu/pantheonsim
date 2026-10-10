@@ -54,13 +54,12 @@ bool executes(const Instr& ins) {
     }
     case Op::TEX: case Op::TLD: case Op::TLD4: {
       const Word& w = ins.w;
-      const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59 and the offsets to 56-57
+      const bool bw = ins.sm >= 100;   // Blackwell moves the LOD's low bit to 59
       const unsigned lod = ins.op == Op::TLD4 ? 0
                            : bw               ? static_cast<unsigned>(w.field(59, 1) | (w.field(87, 2) << 1))
                                               : static_cast<unsigned>(w.field(87, 3));
       if (lod == 4 || lod == 5 || (ins.op == Op::TEX && lod == 2)) return false;   // LOD clamps, bias
-      const bool offsets = bw ? w.field(56, 2) != 0 : (w.bit(76) || (ins.op == Op::TLD4 && w.bit(77)));
-      return !offsets && !w.bit(78);   // offsets, depth compare
+      return ins.f[3] != 2;   // per-texel offsets (PTP) are not run; AOFFI and DC are
     }
     case Op::BMSK: case Op::BREV: case Op::CS2R: case Op::FLO: case Op::IABS: case Op::IADD3: case Op::IDP:
     case Op::IMAD: case Op::IMNMX: case Op::ISETP: case Op::LEA: case Op::LOP3: case Op::MOV: case Op::P2R:
@@ -637,18 +636,33 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     case Op::VIADD:
       each_lane(ex, [&](unsigned l) {
         const uint32_t a = read32(w, ins.src[0], l), b = ival(w, ins.src[1], l);
+        // ins.f[2]: 0 U32, 1 .16x2, 2 .S32, 3 .S16x2, 4 .U8x4, 5 .S8x4; f[1] saturating (.ISAT)
+        const unsigned mode = ins.f[2];
         uint32_t r;
-        if (ins.f[0] == 1 && ins.f[1]) {   // .S32.ISAT: saturating
-          r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
-        } else if (ins.f[0] == 2) {   // per byte, wrapping; a negated b is negated byte by byte
-          const uint32_t braw = read32(w, ins.src[1], l);
+        if (mode >= 3 || mode == 1 || mode == 4) {
+          // Packed: each lane of the registers on its own, a negated source negated lane by lane,
+          // saturating to the lane's range with .ISAT (sm_120's add and sub .u8x4/.s8x4/.u16x2/.s16x2).
+          const unsigned bits = mode >= 4 ? 8 : 16, nl = 32 / bits;
+          const bool sgn = mode == 3 || mode == 5;
+          const uint32_t mask = (1u << bits) - 1, braw = read32(w, ins.src[1], l);
+          const int64_t lo = sgn ? -(int64_t{1} << (bits - 1)) : 0, hi = sgn ? (int64_t{1} << (bits - 1)) - 1 : (int64_t{1} << bits) - 1;
           r = 0;
-          for (int k = 0; k < 4; ++k) {
-            const uint32_t bk = (braw >> (8 * k)) & 0xff;
-            r |= ((((a >> (8 * k)) & 0xff) + (ins.src[1].neg ? 0u - bk : bk)) & 0xff) << (8 * k);
+          for (unsigned k = 0; k < nl; ++k) {
+            const auto part = [&](uint32_t v) -> int64_t {
+              const uint32_t u = (v >> (bits * k)) & mask;
+              return sgn ? static_cast<int64_t>(static_cast<int32_t>(u << (32 - bits)) >> (32 - bits)) : u;
+            };
+            int64_t x = part(a), y = part(braw);
+            if (ins.src[0].neg) x = -x;
+            if (ins.src[1].neg) y = -y;
+            int64_t v = x + y;
+            if (ins.f[1]) v = std::clamp(v, lo, hi);
+            r |= (static_cast<uint32_t>(v) & mask) << (bits * k);
           }
+        } else if (mode == 2 && ins.f[1]) {   // .S32.ISAT: saturating
+          r = static_cast<uint32_t>(std::clamp<int64_t>(int64_t{static_cast<int32_t>(a)} + static_cast<int32_t>(b), INT32_MIN, INT32_MAX));
         } else {
-          r = a + b;
+          r = (ins.src[0].neg ? 0u - a : a) + b;
         }
         write32(w, ins.dst[0], l, r);
       });
@@ -703,10 +717,11 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
               const uint32_t u = (v >> (bits * h)) & mask;
               return sgn ? static_cast<int32_t>(u << (32 - bits)) >> (32 - bits) : static_cast<int32_t>(u);
             };
-            const int32_t m = mn ? std::min({part(a), part(b), part(c)}) : std::max({part(a), part(b), part(c)});
+            int32_t m = mn ? std::min({part(a), part(b), part(c)}) : std::max({part(a), part(b), part(c)});
+            if (ins.f[2] && m < 0) m = 0;   // .RELU: a negative lane becomes 0
             r |= (static_cast<uint32_t>(m) & mask) << (bits * h);
           }
-          write32(w, ins.dst[0], l, relu(r));
+          write32(w, ins.dst[0], l, r);
         }
       });
       return;
@@ -1442,7 +1457,7 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
           }
         };
         const auto encode = [&](double v, unsigned l) -> uint32_t {
-          if (relu && v < 0) v = 0.0;
+          if (relu && !std::isnan(v) && std::signbit(v)) v = 0.0;   // .relu sends -0 and negatives to +0 (measured)
           switch (fmt) {
             case 10: return exec::fp8_bits(v, false, sat);
             case 11: return exec::fp8_bits(v, true, sat);
@@ -2079,9 +2094,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const uint64_t g = address(a, l, e || ins.w.bit(90), ins.w.bit(91) && !e, 64, 0);
           sp = ins.op == Op::ATOM ? classify(g, &addr) : (addr = g, Space::Global);
         }
+        // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
+        // in consecutive registers, aligned to all of them, each its own atomic.
+        const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
+        if (nwords > 1 && addr % (4ull * nwords))
+          fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
+                Err::MisalignedAccess);
+        const uint64_t addr0 = addr;
+        for (unsigned word = 0; word < nwords; ++word) {
+        addr = addr0 + 4ull * word;
         std::unique_lock<std::mutex> lock;
         if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
-        const Operand& vop = red ? ins.src[1] : ins.src[1];
+        Operand vtmp;
+        const Operand* vp = &ins.src[1];
+        if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
+        const Operand& vop = *vp;
         const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
         const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
         // The value the atomic stores, given the one it finds.
@@ -2090,6 +2117,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         if (cas) {
           if (old == v) nw = swap;
         } else {
+          if (type == 4 || type == 7) {   // F16x2, BF16x2 (and their vectors): add, min or max on each half
+            const ptx::AtomOp fop = ins.f[0] == 1 ? ptx::AtomOp::Min : ins.f[0] == 2 ? ptx::AtomOp::Max : ptx::AtomOp::Add;
+            nw = exec::atom_word(fop, type == 7 ? 2 : 1, static_cast<uint32_t>(old), static_cast<uint32_t>(v));
+          } else
           switch (popc_inc ? 3 : ins.f[0]) {
             case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
               if (type == 3) {
@@ -2146,7 +2177,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
         if (!red) {
-          const Operand& d = ins.op == Op::ATOMS ? ins.dst[0] : ins.dst[1];
+          Operand dtmp;
+          const Operand* dp = ins.op == Op::ATOMS ? &ins.dst[0] : &ins.dst[1];
+          if (word) { dtmp = *dp; if (dtmp.reg != kRZ) dtmp.reg += word; dp = &dtmp; }
+          const Operand& d = *dp;
           // ATOM/ATOMG's predicate: done in hardware (a generic CAS of a
           // shared address included, so no software path is needed).
           if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
@@ -2163,6 +2197,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             else write32(w, d, l, old == v ? 1 : 0);
           }
         }
+        }   // for each word of a vector atomic
       });
       return;
     }
@@ -2359,6 +2394,32 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   };
   const uint64_t n = static_cast<uint64_t>(std::popcount(ex));
 
+  if (surface && ins.op == Op::SUST && ins.f[4]) {
+    // SUST.P: the registers the mask names, from 32, converted to the surface's format; x counts
+    // texels, where SUST.D's counts bytes.
+    const unsigned dim = static_cast<unsigned>(word.field(61, 3)), mask = ins.f[1];
+    const unsigned cr = static_cast<unsigned>(word.field(24, 8)), dr = static_cast<unsigned>(word.field(32, 8));
+    if (dim > 5 || dim == 2 || dim == 4) fault(w, ins, 0, "SUST.P on a layered surface, which PTX has no form for");
+    static const uint8_t kOobP[4] = {exec::kSurfaceZero, exec::kSurfaceClamp, exec::kSurfaceTrap, exec::kSurfaceTrap};
+    each_lane(ex, [&](unsigned l) {
+      uint32_t vals[4] = {0, 0, 0, 0};
+      for (unsigned c = 0, k = 0; c < 4; ++c)
+        if (mask >> c & 1) vals[c] = rd(dr + k++, l);
+      uint8_t texel[16];
+      const uint32_t nb = exec::surface_pack_texel(d, vals, 4, texel);
+      exec::SurfaceAccess a;
+      a.dims = dim == 5 ? 3 : dim >= 3 ? 2 : 1;
+      a.x = int64_t{static_cast<int32_t>(rd(cr, l))} * nb;
+      if (a.dims > 1) a.y = static_cast<int32_t>(rd(cr + 1, l));
+      if (a.dims > 2) a.z = static_cast<int32_t>(rd(cr + 2, l));
+      a.bytes = nb;
+      a.oob = kOobP[word.field(59, 2)];
+      if (const std::optional<uint64_t> at = exec::surface_address(d, a)) mem_.write(*at, texel, nb);
+    });
+    blk.st.global_stores += n;
+    blk.st.global_bytes_written += n * 16;
+    return;
+  }
   if (surface) {
     const unsigned dim = static_cast<unsigned>(word.field(61, 3));   // 1D, 1D_BUFFER, 1D_ARRAY, 2D, 2D_ARRAY, 3D
     const unsigned size = static_cast<unsigned>(word.field(73, 3));  // U8, S8, U16, S16, 32, 64, 128
@@ -2411,12 +2472,14 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const bool has_lod = lod_mode == 2 || lod_mode == 3 || lod_mode == 5;
   if (lod_mode == 4 || lod_mode == 5)
     fault(w, ins, 0, "texture fetches with a LOD clamp are not implemented yet", Err::UnsupportedPtx);
-  if (m_.sm >= 100 ? word.field(56, 2) != 0 : (word.bit(76) || (ins.op == Op::TLD4 && word.bit(77))))
-    fault(w, ins, 0, "texture fetches with offsets are not implemented yet", Err::UnsupportedPtx);
-  if (word.bit(78)) fault(w, ins, 0, "depth-compare texture fetches are not implemented yet", Err::UnsupportedPtx);
+  // The offsets (AOFFI: four bits an axis packed into a register after the
+  // LOD) and the depth reference (DC: the register after those). PTP, per-texel
+  // offsets, is no PTX form and was refused by executes().
+  const bool has_off = ins.f[3] == 1, has_dc = ins.f[4] != 0;
+  if (ins.f[3] > 1) fault(w, ins, 0, "texture fetches with per-texel offsets are not implemented", Err::UnsupportedPtx);
   if (ins.op == Op::TEX && lod_mode == 2)
     fault(w, ins, 0, "texture fetches with a LOD bias are not implemented yet", Err::UnsupportedPtx);
-  const unsigned n0 = (layered ? 1 : 0) + dims, n1 = has_lod ? 1 : 0;
+  const unsigned n0 = (layered ? 1 : 0) + dims, n1 = (has_lod ? 1 : 0) + (has_off ? 1 : 0) + (has_dc ? 1 : 0);
   const unsigned total = n0 + n1;
   unsigned in0 = n0;   // components in the first vector
   if (word.bit(60)) {
@@ -2428,7 +2491,7 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned mask = static_cast<unsigned>(word.field(72, 4));
   const bool int_coords = ins.op == Op::TLD;
   each_lane(ex, [&](unsigned l) {
-    uint32_t comp[5] = {};   // a cube array's layer, x, y, z and LOD
+    uint32_t comp[7] = {};   // a cube array's layer, x, y, z, then the LOD, offsets and reference
     for (unsigned i = 0; i < total; ++i) comp[i] = i < in0 ? rd(r0 + i, l) : rd(r1 + (i - in0), l);
     exec::TexFetch f;
     // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
@@ -2447,11 +2510,42 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     if (has_lod) {
       f.explicit_lod = true;
       f.lod = int_coords ? static_cast<double>(static_cast<int32_t>(comp[k])) : static_cast<double>(std::bit_cast<float>(comp[k]));
+      ++k;
     }
+    if (has_off) {
+      // tex: four bits an axis, x first, two's complement. tld4: six bits an
+      // axis, in the low six of each byte (measured with ptxas's own packing).
+      const uint32_t packed = comp[k++];
+      if (ins.op == Op::TLD4) {
+        for (unsigned i = 0; i < 2; ++i) f.offset[i] = static_cast<int32_t>(((packed >> (8 * i)) & 63u) ^ 32u) - 32;
+      } else {
+        for (unsigned i = 0; i < 3; ++i) f.offset[i] = static_cast<int32_t>(((packed >> (4 * i)) & 15u) ^ 8u) - 8;
+      }
+    }
+    // A depth reference (DC) is in the register after: CUDA gives a texture no
+    // depth-compare state, so it changes nothing (see the PTX engine).
+    (void)has_dc;
     if (ins.op == Op::TLD4) f.gather = static_cast<int>(ins.f[2]);
     uint32_t out[4];
     exec::texture_fetch(mem_, d, f, out);
+    // The fault predicate (81-83), set when the texel is NOT resident (ptxas's SEL turns it round for
+    // PTX's `|p`): every texel is resident, so it is cleared.
+    if (!ins.dst.empty() && ins.dst[0].kind == Kind::Pred) set_pred(w, ins.dst[0], l, false);
     unsigned j = 0;
+    if (ins.f[5]) {
+      // .F16.RN: the enabled components narrowed to halves, two to a
+      // register -- the first pair in the register at 16, the next at 64.
+      uint32_t pair[2] = {0, 0};
+      for (unsigned c = 0; c < 4; ++c) {
+        if (!(mask >> c & 1)) continue;
+        const uint32_t h = static_cast<uint32_t>(exec::f16_bits(static_cast<double>(std::bit_cast<float>(out[c]))));
+        pair[j / 2] |= h << (16 * (j % 2));
+        ++j;
+      }
+      if (j > 0) wr(d0, l, pair[0]);
+      if (j > 2) wr(d1, l, pair[1]);
+      return;
+    }
     for (unsigned c = 0; c < 4; ++c) {
       if (!(mask >> c & 1)) continue;
       wr(j < 2 ? d0 + j : d1 + (j - 2), l, out[c]);

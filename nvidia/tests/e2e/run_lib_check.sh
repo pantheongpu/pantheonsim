@@ -44,7 +44,7 @@ for lib in "$@"; do
   # cuDNN's headers are fetched at configure time; the others' are the simulator's own
   # (nvidia/include/vgpu_*.h).
   [[ "$lib" == custatevec || "$lib" == cudss || "$lib" == cusparseLt || "$lib" == cutensor || "$lib" == cutensornet || "$lib" == cudnn ||
-     "$lib" == cufile || "$lib" == nvcomp || "$lib" == nvshmem_host ]] && links+=("-L$shim")
+     "$lib" == cufile || "$lib" == nvcomp || "$lib" == nvcomp_cpu || "$lib" == nvshmem_host ]] && links+=("-L$shim")
   if [[ "$lib" == cudnn ]]; then
     cudnn_inc="$(cudnn_include_dir)" || { echo "SKIP: no cuDNN headers (see scripts/fetch-cudnn-headers.py)"; exit 0; }
     links+=("-I$cudnn_inc")
@@ -76,9 +76,15 @@ if grep -q cudnn_dlhandle "$src"; then
   done
 fi
 status=0
-result="$(VGPU_GPU=nvidia/a100 VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
+# VGPU_E2E_GPU picks another profile (the FP8 and block-scaled checks need a GPU that has them).
+result="$(VGPU_GPU="${VGPU_E2E_GPU:-nvidia/a100}" VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
-if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU' <<< "$result"; then
+# A program that tests the error paths on purpose (invalid arguments, a kernel that must fault) gets the
+# library's "VirtualGPU error [...]" lines on stderr: it says VGPU_E2E_EXPECTS_REFUSALS in its source, and
+# only a call into a stub still fails it. Its own checks decide whether each refusal was the right one.
+refused='VirtualGPU error \[|is not implemented by VirtualGPU'
+if grep -q 'VGPU_E2E_EXPECTS_REFUSALS' "$src"; then refused='is not implemented by VirtualGPU'; fi
+if grep -qE "$refused" <<< "$result"; then
   echo "FAIL: the program reached an unimplemented entry point or a refused kernel"; exit 1
 fi
 [[ $status == 0 && "$(tail -1 <<< "$result")" == PASS* ]]

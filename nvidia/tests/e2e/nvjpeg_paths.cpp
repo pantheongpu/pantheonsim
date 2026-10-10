@@ -23,6 +23,8 @@
 #include <cuda_runtime.h>
 #include <nvjpeg.h>
 
+#include <dlfcn.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -617,6 +619,378 @@ int main(int argc, char** argv) {
     cudaFree(src.channel[0]);
     nvjpegEncoderParamsDestroy(ep);
     nvjpegEncoderStateDestroy(es);
+  }
+
+
+  // ---- frame types, precisions, backends and transcoding the card answers ---
+  //
+  // Everything below was measured on nvJPEG 13.0 on an RTX 3060 and passes
+  // against it. The files are the baseline and progressive fixtures with their
+  // frame header or their marker segments rewritten, so no entropy-coded data
+  // has to be valid for the parse-level answers.
+  {
+    using Bytes = std::vector<unsigned char>;
+    using Seg = std::pair<int, Bytes>;
+    // The marker segments before the first scan.
+    const auto segments = [](const Bytes& j) {
+      std::vector<Seg> out;
+      size_t i = 2;
+      while (i + 3 < j.size() && j[i] == 0xFF) {
+        const int m = j[i + 1];
+        if (m == 0xDA) break;
+        const size_t len = static_cast<size_t>(j[i + 2]) << 8 | j[i + 3];
+        out.emplace_back(m, Bytes(j.begin() + i + 4, j.begin() + i + 2 + len));
+        i += 2 + len;
+      }
+      return out;
+    };
+    const auto build = [&](const Bytes& base, const std::vector<Seg>& segs) {
+      // `segs` replace every APPn and COM of `base`, placed right after SOI.
+      Bytes out = {0xFF, 0xD8};
+      const auto put = [&](const Seg& g) {
+        out.push_back(0xFF);
+        out.push_back(static_cast<unsigned char>(g.first));
+        const size_t len = g.second.size() + 2;
+        out.push_back(static_cast<unsigned char>(len >> 8));
+        out.push_back(static_cast<unsigned char>(len));
+        out.insert(out.end(), g.second.begin(), g.second.end());
+      };
+      for (const Seg& g : segs) put(g);
+      for (const Seg& g : segments(base))
+        if (!((g.first >= 0xE0 && g.first <= 0xEF) || g.first == 0xFE)) put(g);
+      size_t i = 2;
+      while (i + 3 < base.size() && base[i] == 0xFF && base[i + 1] != 0xDA)
+        i += 2 + (static_cast<size_t>(base[i + 2]) << 8 | base[i + 3]);
+      out.insert(out.end(), base.begin() + i, base.end());
+      return out;
+    };
+    const auto patch_sof = [](Bytes d, int marker, int precision) {
+      for (size_t i = 2; i + 4 < d.size(); i += 2 + (static_cast<size_t>(d[i + 2]) << 8 | d[i + 3])) {
+        const int m = d[i + 1];
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+          d[i + 1] = static_cast<unsigned char>(marker);
+          d[i + 4] = static_cast<unsigned char>(precision);
+          break;
+        }
+      }
+      return d;
+    };
+    // nvjpegJpegStreamGetSamplePrecision is newer than CUDA 12.0's header.
+    using PrecisionFn = nvjpegStatus_t (*)(nvjpegJpegStream_t, unsigned int*);
+    const PrecisionFn get_precision =
+        reinterpret_cast<PrecisionFn>(dlsym(RTLD_DEFAULT, "nvjpegJpegStreamGetSamplePrecision"));
+
+    nvjpegJpegDecoder_t dec;
+    nvjpegDecodeParams_t dp;
+    nvjpegDecoderCreate(h, NVJPEG_BACKEND_DEFAULT, &dec);
+    nvjpegDecodeParamsCreate(h, &dp);
+    const auto supported = [&](nvjpegJpegStream_t js, int* flags /* decoder, batched */) {
+      flags[0] = flags[1] = -5;
+      const int a = nvjpegDecoderJpegSupported(dec, js, dp, &flags[0]);
+      const int b = nvjpegDecodeBatchedSupported(h, js, &flags[1]);
+      return a == 0 && b == 0;
+    };
+
+    // Frame types and precisions the card parses, and decodes only at 8 bits
+    // and not lossless: it reports the frame's encoding and precision, the
+    // components as for any other file, and refuses the decode with
+    // NVJPEG_STATUS_JPEG_NOT_SUPPORTED.
+    struct Frame {
+      const char* file;
+      int marker, precision;
+    };
+    const Frame frames[] = {{"b420.jpg", 0xC0, 8},  {"b420.jpg", 0xC1, 8},  {"b420.jpg", 0xC0, 12}, {"b420.jpg", 0xC0, 16},
+                            {"b420.jpg", 0xC0, 2},  {"b420.jpg", 0xC0, 9},  {"b420.jpg", 0xC1, 12}, {"b420.jpg", 0xC1, 16},
+                            {"p420.jpg", 0xC2, 12}, {"b420.jpg", 0xC3, 8},  {"b420.jpg", 0xC3, 12}, {"b420.jpg", 0xC3, 16},
+                            {"b420.jpg", 0xC3, 2},  {"b420.jpg", 0xC3, 9}};
+    for (const Frame& f : frames) {
+      const Bytes d = patch_sof(slurp(f.file), f.marker, f.precision);
+      char what[96];
+      std::snprintf(what, sizeof what, "SOF%d, %d-bit samples", f.marker - 0xC0, f.precision);
+      Info in;
+      is(nvjpegGetImageInfo(h, d.data(), d.size(), &in.nc, &in.css, in.w, in.h), NVJPEG_STATUS_SUCCESS,
+         std::string(what) + ": image info");
+      check(in.nc == 3 && in.css == NVJPEG_CSS_420 && in.w[0] == 61 && in.h[0] == 45,
+            std::string(what) + ": 3 components, 4:2:0, 61x45");
+      nvjpegJpegStream_t js;
+      nvjpegJpegStreamCreate(h, &js);
+      is(nvjpegJpegStreamParse(h, d.data(), d.size(), 0, 0, js), NVJPEG_STATUS_SUCCESS,
+         std::string(what) + ": stream parse");
+      nvjpegJpegEncoding_t enc = NVJPEG_ENCODING_UNKNOWN;
+      nvjpegJpegStreamGetJpegEncoding(js, &enc);
+      unsigned prec = 0;
+      if (get_precision) get_precision(js, &prec);
+      check(static_cast<int>(enc) == f.marker && (!get_precision || static_cast<int>(prec) == f.precision),
+            std::string(what) + ": the stream reports its encoding and precision");
+      const bool decodes = f.precision == 8 && f.marker != 0xC3;
+      int flags[2];
+      check(supported(js, flags) && flags[0] == (decodes ? 0 : 2) && flags[1] == (decodes ? 0 : 2),
+            std::string(what) + ": the decoder's support flag is " + (decodes ? "0" : "2"));
+      Planes p;
+      is(nvjpegDecode(h, st, d.data(), d.size(), NVJPEG_OUTPUT_RGBI, &p.im, 0),
+         decodes ? NVJPEG_STATUS_SUCCESS : NVJPEG_STATUS_JPEG_NOT_SUPPORTED, std::string(what) + ": decode");
+      cudaDeviceSynchronize();
+      nvjpegJpegStreamDestroy(js);
+    }
+    // Differential, arithmetic and hierarchical frames do not parse at all.
+    {
+      const int refused[] = {0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF};
+      std::vector<std::pair<std::string, Bytes>> files;
+      for (int m : refused) files.emplace_back("SOF" + std::to_string(m - 0xC0), patch_sof(slurp("b420.jpg"), m, 8));
+      for (const auto& f : files) {
+        const Bytes& d = f.second;
+        Info in;
+        is(nvjpegGetImageInfo(h, d.data(), d.size(), &in.nc, &in.css, in.w, in.h), NVJPEG_STATUS_JPEG_NOT_SUPPORTED,
+           f.first + ": image info is refused");
+        nvjpegJpegStream_t js;
+        nvjpegJpegStreamCreate(h, &js);
+        is(nvjpegJpegStreamParse(h, d.data(), d.size(), 0, 0, js), NVJPEG_STATUS_JPEG_NOT_SUPPORTED,
+           f.first + ": parse is refused");
+        int flags[2];
+        check(supported(js, flags) && flags[0] == 7 && flags[1] == 0,
+              f.first + ": after the failed parse the flags are 7 and 0");
+        Planes p;
+        is(nvjpegDecode(h, st, d.data(), d.size(), NVJPEG_OUTPUT_RGBI, &p.im, 0), NVJPEG_STATUS_JPEG_NOT_SUPPORTED,
+           f.first + ": decode is refused");
+        cudaDeviceSynchronize();
+        nvjpegJpegStreamDestroy(js);
+      }
+      nvjpegJpegStream_t fresh;
+      nvjpegJpegStreamCreate(h, &fresh);
+      int flags[2];
+      check(supported(fresh, flags) && flags[0] == 2 && flags[1] == 2, "a stream never parsed: both flags are 2");
+      nvjpegJpegStreamDestroy(fresh);
+      // A hierarchical stream (a DHP segment ahead of the frame) passes the
+      // header parsers -- image info, and the header-only stream parse -- and
+      // is refused by the stream parse and the decode.
+      Bytes hier = slurp("b420.jpg");
+      const Bytes dhp = {0xFF, 0xDE, 0x00, 0x11, 8, 0, 45, 0, 61, 3, 1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0};
+      hier.insert(hier.begin() + 2, dhp.begin(), dhp.end());
+      Info in;
+      is(nvjpegGetImageInfo(h, hier.data(), hier.size(), &in.nc, &in.css, in.w, in.h), NVJPEG_STATUS_SUCCESS,
+         "a hierarchical stream: image info reads the frame");
+      nvjpegJpegStream_t js;
+      nvjpegJpegStreamCreate(h, &js);
+      is(nvjpegJpegStreamParse(h, hier.data(), hier.size(), 0, 0, js), NVJPEG_STATUS_JPEG_NOT_SUPPORTED,
+         "a hierarchical stream: the stream parse is refused");
+      is(nvjpegJpegStreamParseHeader(h, hier.data(), hier.size(), js), NVJPEG_STATUS_SUCCESS,
+         "a hierarchical stream: the header-only parse reads it");
+      Planes p;
+      is(nvjpegDecode(h, st, hier.data(), hier.size(), NVJPEG_OUTPUT_RGBI, &p.im, 0), NVJPEG_STATUS_JPEG_NOT_SUPPORTED,
+         "a hierarchical stream: decode is refused");
+      cudaDeviceSynchronize();
+      nvjpegJpegStreamDestroy(js);
+    }
+
+    // Backends: a handle takes everything but the hardware ones (no JPEG
+    // engine) and values outside the enum; a decoder takes only the default,
+    // hybrid and GPU-hybrid ones.
+    {
+      const struct {
+        int backend, handle;
+      } creates[] = {{-1, 2}, {0, 0}, {1, 0}, {2, 0}, {3, 7}, {4, 0}, {5, 7}, {6, 0}, {7, 2}, {99, 2}};
+      for (const auto& c : creates) {
+        nvjpegHandle_t hh = nullptr;
+        const int r = nvjpegCreateEx(static_cast<nvjpegBackend_t>(c.backend), nullptr, nullptr, 0, &hh);
+        is(r, c.handle, "nvjpegCreateEx(backend " + std::to_string(c.backend) + ")");
+        if (r == 0) nvjpegDestroy(hh);
+        hh = nullptr;
+        is(nvjpegCreate(static_cast<nvjpegBackend_t>(c.backend), nullptr, &hh), c.handle,
+           "nvjpegCreate(backend " + std::to_string(c.backend) + ")");
+        if (hh) nvjpegDestroy(hh);
+      }
+      const int decoders[] = {2, 0, 0, 0, 7, 2, 2, 2, 2, 2};   // backends -1 to 8
+      for (int b = -1; b <= 8; ++b) {
+        nvjpegJpegDecoder_t d2 = nullptr;
+        const int r = nvjpegDecoderCreate(h, static_cast<nvjpegBackend_t>(b), &d2);
+        is(r, decoders[b + 1], "nvjpegDecoderCreate(backend " + std::to_string(b) + ")");
+        if (r == 0) nvjpegDecoderDestroy(d2);
+      }
+      // The batched API: the lossless backend takes the 16-bit output and only
+      // that, the others anything but it; nvjpegDecode never takes it.
+      nvjpegHandle_t lossless = nullptr;
+      is(nvjpegCreateEx(static_cast<nvjpegBackend_t>(6), nullptr, nullptr, 0, &lossless), NVJPEG_STATUS_SUCCESS,
+         "a lossless-backend handle");
+      nvjpegJpegState_t ls;
+      nvjpegJpegStateCreate(lossless, &ls);
+      const int fmts[] = {NVJPEG_OUTPUT_UNCHANGED, NVJPEG_OUTPUT_RGBI, 7};
+      for (int fmt : fmts) {
+        is(nvjpegDecodeBatchedInitialize(lossless, ls, 1, 1, static_cast<nvjpegOutputFormat_t>(fmt)), fmt == 7 ? 0 : 2,
+           "lossless backend, batched format " + std::to_string(fmt));
+        is(nvjpegDecodeBatchedInitialize(h, st, 1, 1, static_cast<nvjpegOutputFormat_t>(fmt)), fmt == 7 ? 2 : 0,
+           "default backend, batched format " + std::to_string(fmt));
+      }
+      nvjpegDecodeBatchedInitialize(lossless, ls, 1, 1, static_cast<nvjpegOutputFormat_t>(7));
+      const Bytes base = slurp("b420.jpg");
+      const unsigned char* data[1] = {base.data()};
+      const size_t lens[1] = {base.size()};
+      Planes lp;
+      is(nvjpegDecodeBatched(lossless, ls, data, lens, &lp.im, 0), NVJPEG_STATUS_JPEG_NOT_SUPPORTED,
+         "a lossy image through the lossless backend is refused");
+      cudaDeviceSynchronize();
+      nvjpegJpegStateDestroy(ls);
+      nvjpegDestroy(lossless);
+      nvjpegDecodeBatchedInitialize(h, st, 1, 1, NVJPEG_OUTPUT_RGBI);
+      Planes up;
+      is(nvjpegDecode(h, st, base.data(), base.size(), static_cast<nvjpegOutputFormat_t>(7), &up.im, 0),
+         NVJPEG_STATUS_INVALID_PARAMETER, "nvjpegDecode refuses the 16-bit output for every image");
+    }
+
+    // Transcoding: nvjpegEncoderParamsCopyMetadata carries the APPn segments of
+    // a parsed stream into the encoder's output.
+    {
+      nvjpegEncoderState_t es;
+      nvjpegEncoderStateCreate(h, &es, 0);
+      const int W = 32, H = 32;
+      std::vector<unsigned char> rgb(W * H * 3);
+      for (size_t i = 0; i < rgb.size(); ++i) rgb[i] = static_cast<unsigned char>(i * 7);
+      nvjpegImage_t src{};
+      cudaMalloc(&src.channel[0], rgb.size());
+      cudaMemcpy(src.channel[0], rgb.data(), rgb.size(), cudaMemcpyHostToDevice);
+      src.pitch[0] = W * 3;
+      const auto encode = [&](nvjpegEncoderParams_t ep) {
+        nvjpegEncoderParamsSetQuality(ep, 80, 0);
+        nvjpegEncoderParamsSetSamplingFactors(ep, NVJPEG_CSS_420, 0);
+        nvjpegEncodeImage(h, es, ep, &src, NVJPEG_INPUT_RGBI, W, H, 0);
+        size_t n = 0;
+        nvjpegEncodeRetrieveBitstream(h, es, nullptr, &n, 0);
+        Bytes out(n);
+        nvjpegEncodeRetrieveBitstream(h, es, out.data(), &n, 0);
+        cudaDeviceSynchronize();
+        out.resize(n);
+        return out;
+      };
+      const auto app_list = [&](const Bytes& j) {
+        std::vector<Seg> apps;
+        for (const Seg& g : segments(j))
+          if (g.first >= 0xE0 && g.first <= 0xEF) apps.push_back(g);
+        return apps;
+      };
+      const auto has_com = [&](const Bytes& j) {
+        for (const Seg& g : segments(j))
+          if (g.first == 0xFE) return true;
+        return false;
+      };
+      const Bytes jfif_in = {'J', 'F', 'I', 'F', 0, 1, 1, 1, 1, 0x2C, 1, 0x2C, 0, 0};
+      const Bytes exif = {'E', 'x', 'i', 'f', 0, 0, 'M', 'M', 0, '*', 0, 0, 0, 8, 0, 0};
+      Bytes icc = {'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0, 1, 1};
+      for (int i = 0; i < 300; ++i) icc.push_back(static_cast<unsigned char>(i));
+      const Bytes comment = {'h', 'e', 'l', 'l', 'o'};
+      const Bytes jfxx = {'J', 'F', 'X', 'X', 0, 0x10, 0, 0, 0, 0, 0, 0};
+      const Bytes photoshop = {'P', 'h', 'o', 't', 'o', 's', 'h', 'o', 'p', ' ', '3', '.', '0', 0, 1, 2};
+      const Bytes base = slurp("b420.jpg");
+      const Bytes with_all = build(base, {{0xE0, jfif_in}, {0xE1, exif}, {0xE2, icc}, {0xFE, comment}});
+      const Bytes no_app0 = build(base, {{0xE1, exif}, {0xED, photoshop}});
+      const Bytes only_jfxx = build(base, {{0xE0, jfxx}});
+      const Bytes only_com = build(base, {{0xFE, comment}});
+
+      nvjpegEncoderParams_t plain;
+      nvjpegEncoderParamsCreate(h, &plain, 0);
+      const Bytes default_out = encode(plain);
+      const std::vector<Seg> default_apps = app_list(default_out);
+      check(default_apps.size() == 1 && default_apps[0].first == 0xE0 && default_apps[0].second.size() == 14 &&
+                std::memcmp(default_apps[0].second.data(), "JFIF", 5) == 0,
+            "the encoder writes its own JFIF header");
+
+      const auto copy_from = [&](const Bytes& file, int save_metadata, bool header_only, nvjpegEncoderParams_t ep) {
+        nvjpegJpegStream_t js;
+        nvjpegJpegStreamCreate(h, &js);
+        if (header_only)
+          nvjpegJpegStreamParseHeader(h, file.data(), file.size(), js);
+        else
+          nvjpegJpegStreamParse(h, file.data(), file.size(), save_metadata, 0, js);
+        const int r = nvjpegEncoderParamsCopyMetadata(es, ep, js, 0);
+        nvjpegJpegStreamDestroy(js);
+        return r;
+      };
+      {
+        nvjpegEncoderParams_t ep;
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        is(copy_from(with_all, 1, false, ep), NVJPEG_STATUS_SUCCESS, "metadata copied from a stream parsed with it");
+        const Bytes out = encode(ep);   // the stream is gone by now: the copy outlives it
+        const std::vector<Seg> apps = app_list(out);
+        check(apps.size() == 3 && apps[0] == Seg(0xE0, jfif_in) && apps[1] == Seg(0xE1, exif) && apps[2] == Seg(0xE2, icc),
+              "the output carries the input's JFIF, Exif and ICC segments verbatim, in order, and no JFIF of its own");
+        check(!has_com(out), "a COM segment is not carried over");
+        check(encode(ep) == out, "and the next encode carries them again");
+        nvjpegEncoderParamsDestroy(ep);
+      }
+      {
+        nvjpegEncoderParams_t ep;
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        copy_from(with_all, 0, false, ep);
+        const std::vector<Seg> apps = app_list(encode(ep));
+        check(apps.size() == 3 && apps[0] == Seg(0xE0, Bytes()) && apps[1] == Seg(0xE1, Bytes()) &&
+                  apps[2] == Seg(0xE2, Bytes()),
+              "parsed without save_metadata, the same three markers come out empty");
+        nvjpegEncoderParamsDestroy(ep);
+      }
+      {
+        nvjpegEncoderParams_t ep;
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        is(copy_from(with_all, 1, true, ep), NVJPEG_STATUS_SUCCESS, "a header-only parse copies without error");
+        check(app_list(encode(ep)) == default_apps, "and carries nothing: the encoder's JFIF alone");
+        nvjpegEncoderParamsDestroy(ep);
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        nvjpegJpegStream_t fresh;
+        nvjpegJpegStreamCreate(h, &fresh);
+        is(nvjpegEncoderParamsCopyMetadata(es, ep, fresh, 0), NVJPEG_STATUS_SUCCESS, "so does a stream never parsed");
+        check(app_list(encode(ep)) == default_apps, "with the same result");
+        nvjpegJpegStreamDestroy(fresh);
+        nvjpegEncoderParamsDestroy(ep);
+      }
+      {
+        nvjpegEncoderParams_t ep;
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        copy_from(no_app0, 1, false, ep);
+        const std::vector<Seg> apps = app_list(encode(ep));
+        check(apps.size() == 3 && apps[0] == default_apps[0] && apps[1] == Seg(0xE1, exif) &&
+                  apps[2] == Seg(0xED, photoshop),
+              "without an APP0 among them the encoder's JFIF header comes first, then the copied segments");
+        copy_from(only_jfxx, 1, false, ep);
+        const std::vector<Seg> jfxx_apps = app_list(encode(ep));
+        check(jfxx_apps.size() == 1 && jfxx_apps[0] == Seg(0xE0, jfxx),
+              "a second copy replaces the first, and any APP0 -- a JFXX one too -- takes the JFIF header's place");
+        copy_from(only_com, 1, false, ep);
+        check(app_list(encode(ep)) == default_apps, "a stream with only a COM segment carries nothing");
+        copy_from(no_app0, 0, false, ep);
+        const std::vector<Seg> empty = app_list(encode(ep));
+        check(empty.size() == 3 && empty[0] == default_apps[0] && empty[1] == Seg(0xE1, Bytes()) &&
+                  empty[2] == Seg(0xED, Bytes()),
+              "parsed without save_metadata, with no APP0: the JFIF header, then empty markers");
+        nvjpegEncoderParamsDestroy(ep);
+      }
+      {
+        // Progressive and optimised-table output carry them the same way.
+        nvjpegEncoderParams_t ep;
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        copy_from(with_all, 1, false, ep);
+        nvjpegEncoderParamsSetEncoding(ep, NVJPEG_ENCODING_PROGRESSIVE_DCT_HUFFMAN, 0);
+        nvjpegEncoderParamsSetOptimizedHuffman(ep, 1, 0);
+        const std::vector<Seg> apps = app_list(encode(ep));
+        check(apps.size() == 3 && apps[1] == Seg(0xE1, exif), "progressive output with optimised tables carries them too");
+        nvjpegEncoderParamsDestroy(ep);
+      }
+      {
+        nvjpegEncoderParams_t ep;
+        nvjpegEncoderParamsCreate(h, &ep, 0);
+        nvjpegJpegStream_t js;
+        nvjpegJpegStreamCreate(h, &js);
+        is(nvjpegEncoderParamsCopyMetadata(nullptr, ep, js, 0), NVJPEG_STATUS_INVALID_PARAMETER,
+           "a null encoder state is refused");
+        is(nvjpegEncoderParamsCopyMetadata(es, nullptr, js, 0), NVJPEG_STATUS_INVALID_PARAMETER,
+           "null parameters are refused");
+        is(nvjpegEncoderParamsCopyMetadata(es, ep, nullptr, 0), NVJPEG_STATUS_INVALID_PARAMETER,
+           "a null stream is refused");
+        nvjpegJpegStreamDestroy(js);
+        nvjpegEncoderParamsDestroy(ep);
+      }
+      nvjpegEncoderParamsDestroy(plain);
+      cudaFree(src.channel[0]);
+      nvjpegEncoderStateDestroy(es);
+    }
+    nvjpegDecoderDestroy(dec);
+    nvjpegDecodeParamsDestroy(dp);
   }
 
   nvjpegJpegStateDestroy(st);

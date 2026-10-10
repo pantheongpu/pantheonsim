@@ -4,11 +4,10 @@
 // reduced density matrices, expectation values, samples -- by contraction or
 // from a matrix product state (MPS).
 //
-// The expectations hold for NVIDIA's libcutensornet 2.14 on an RTX 3060 too,
-// except three that are still the simulator's own and unmatched on the card
-// (the final successful AccessorCompute after the argument errors, and the
-// two CreateExpectation refusals for another set of modes and another data
-// type, which the card accepts). Conventions (the matrix layout of an operator,
+// The expectations hold for NVIDIA's libcutensornet 2.14 on an RTX 3060 too
+// (the last three that did not -- an accessor refusing everything after a projected
+// value out of range, and expectations of an operator for another set of modes or
+// another data type, which the card accepts -- were measured and are followed). Conventions (the matrix layout of an operator,
 // the order of modes, which operators cancel in a norm, what an integer id
 // is) were measured on the card and are checked here against a dense host
 // simulation. The contraction paths, workspace sizes and FLOP counts are each
@@ -1451,11 +1450,15 @@ static void test_errors() {
     IS(cutensornetAccessorPrepare(h, acc, (size_t)1 << 30, ws.d, 0), 0);
     int64_t big[1] = {2};
     ws.alloc();
-    IS(cutensornetAccessorCompute(h, acc, big, ws.d, o.p, nullptr, 0), 7);
+    // A NULL list of values, a NULL output and a NULL workspace leave the accessor as it was.
     IS(cutensornetAccessorCompute(h, acc, nullptr, ws.d, o.p, nullptr, 0), 7);
     IS(cutensornetAccessorCompute(h, acc, v1, ws.d, nullptr, nullptr, 0), 7);
     IS(cutensornetAccessorCompute(h, acc, v1, nullptr, o.p, nullptr, 0), 7);
     IS(cutensornetAccessorCompute(h, acc, v1, ws.d, o.p, nullptr, 0), 0);
+    // A projected value out of range does not: NVIDIA's accessor refuses every call after it.
+    IS(cutensornetAccessorCompute(h, acc, big, ws.d, o.p, nullptr, 0), 7);
+    IS(cutensornetAccessorCompute(h, acc, v1, ws.d, o.p, nullptr, 0), 7);
+    IS(cutensornetAccessorCompute(h, acc, v1, ws.d, o.p, nullptr, 0), 7);
     // attributes
     int32_t hv = 4;
     IS(cutensornetAccessorConfigure(h, acc, CUTENSORNET_ACCESSOR_CONFIG_NUM_HYPER_SAMPLES, &hv, 4), 0);
@@ -1550,8 +1553,20 @@ static void test_errors() {
     IS(cutensornetCreateExpectation(h, c.st, op, &ex), 0);
     cutensornetDestroyExpectation(ex);
     ex = nullptr;
-    IS(cutensornetCreateExpectation(h, c.st, op2, &ex), 7);  // other modes
-    IS(cutensornetCreateExpectation(h, c.st, op3, &ex), 7);  // another data type
+    // An operator made for another number of modes, or in another data type, is accepted and
+    // computes (the second needs its own type's tensors; this one's data are the state's).
+    {
+      cutensornetStateExpectation_t e2 = nullptr, e3 = nullptr;
+      IS(cutensornetCreateExpectation(h, c.st, op2, &e2), 0);
+      IS(cutensornetCreateExpectation(h, c.st, op3, &e3), 0);
+      WS wx;
+      IS(cutensornetExpectationPrepare(h, e2, (size_t)1 << 30, wx.d, 0), 0);
+      wx.alloc();
+      cd v2 = 0, n2 = 0;
+      IS(cutensornetExpectationCompute(h, e2, wx.d, &v2, &n2, 0), 0);
+      cutensornetDestroyExpectation(e2);
+      cutensornetDestroyExpectation(e3);
+    }
     IS(cutensornetCreateExpectation(h, c.st, nullptr, &ex), 7);
     cutensornetDestroyNetworkOperator(op);
     cutensornetDestroyNetworkOperator(op2);
