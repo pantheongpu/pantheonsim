@@ -51,6 +51,11 @@ class VideoEncoder {
   virtual std::vector<uint8_t> encode(const EncPicture& in, PicType type, int qp, EncStats* stats = nullptr) = 0;
   // Forget the reference pictures; the next picture starts a new coded video sequence.
   virtual void reset() = 0;
+  // Undoes the effect of the last encode call on the encoder's state (its reference pictures and counters), so that the picture can be encoded again, at another
+  // QP; only one level back. The bytes the call returned are the caller's to drop.
+  virtual void rollback() {}
+  // Slices of the picture the last encode call coded.
+  virtual int last_slices() const { return 1; }
   // Encoders that code B pictures say so, and take the display order: `poc` counts the pictures in display order since the last IDR picture
   // (the IDR picture is 0). A kBi picture predicts from the reference picture before it in display order and the one after it, which
   // must have been coded already. Encoders without B pictures ignore `poc`, and are never given kBi.

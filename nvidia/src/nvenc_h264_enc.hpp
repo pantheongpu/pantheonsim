@@ -59,6 +59,8 @@ class H264Encoder : public VideoEncoder {
 
   // Forget the reference picture and start a new coded video sequence at the next picture.
   void reset() override;
+  void rollback() override;
+  int last_slices() const override;
 
   // For tests: the reconstruction of the last picture before the loop filter (equal to the decoded
   // picture when the encoder was built with deblock == false), as coded_width() x coded_height()

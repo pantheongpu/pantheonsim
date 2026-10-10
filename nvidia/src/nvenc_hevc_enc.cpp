@@ -549,6 +549,8 @@ struct HevcEncoder::Impl {
   Ctxs est;                          // the contexts as the picture's decisions have advanced them
   bool have_ref = false;
   int poc = 0;
+  bool saved_have_ref = false;   // for rollback()
+  int saved_poc = 0;
   EncStats st;
 
   Impl(int width, int height, int fn, int fd) : w(width), h(height), fps_num(fn), fps_den(fd) {
@@ -1259,6 +1261,8 @@ struct HevcEncoder::Impl {
 };
 
 std::vector<uint8_t> HevcEncoder::Impl::encode_picture(const EncPicture& in, PicType t, int q, EncStats* stats) {
+  saved_have_ref = have_ref;
+  saved_poc = poc;
   qp = clip3(0, 51, q);
   lambda = lambda_of(qp);
   lam_sad = std::sqrt(lambda);
@@ -1340,6 +1344,10 @@ std::vector<uint8_t> HevcEncoder::parameter_sets() const {
 }
 std::vector<uint8_t> HevcEncoder::encode(const EncPicture& in, PicType type, int qp, EncStats* stats) { return p_->encode_picture(in, type, qp, stats); }
 void HevcEncoder::reset() { p_->have_ref = false; }
+void HevcEncoder::rollback() {
+  p_->have_ref = p_->saved_have_ref;
+  p_->poc = p_->saved_poc;
+}
 int HevcEncoder::coded_width() const { return p_->W; }
 int HevcEncoder::coded_height() const { return p_->H; }
 const std::vector<uint8_t>& HevcEncoder::recon_y() const { return p_->ry; }

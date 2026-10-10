@@ -44,6 +44,7 @@
 #include "nvenc_h264_enc.hpp"
 #include "nvenc_hevc.hpp"
 #include "nvenc_hevc_enc.hpp"
+#include "nvenc_rc.hpp"
 
 #include "nvenc_tables.inc"
 
@@ -164,8 +165,8 @@ struct Session {
   uint64_t enc_sig = 0;         // the tools the encoder was built with (entropy mode, transform, slices, references, B pictures)
   uint64_t since_idr = 0;       // pictures since (and including) the last IDR picture, in display order; 0 before the first picture
   bool force_idr_next = false;  // a reconfiguration asked for it
-  double rc_qp = 28;            // the QP the next P picture is coded with
-  double rc_bits = 0, rc_target = 0;   // bits spent and bits allowed since the last IDR picture
+  vgpu_nvenc::RateController rc;   // bit rate control (CBR and VBR)
+  uint64_t rc_sig = 0;             // the settings the controller was configured from
   // B pictures: the pictures that wait for the P picture that follows them in display order, and the output buffers of the calls that
   // returned NV_ENC_ERR_NEED_MORE_INPUT (the card fills those, in the order of the calls, when the group is coded).
   struct Waiting {
@@ -958,83 +959,172 @@ bool ensure_encoder(Session& s, int w, int h, int fn, int fd) {
   return true;
 }
 
-// The slice QP of a picture: constant QP as the application set it, or the rate control's.
-int pick_qp(Session& s, vgpu_nvenc::PicType t, const Frame& f, int rate_num, int rate_den, const GopCfg& g) {
+// The rate controller's settings, from the application's.
+vgpu_nvenc::RateController::Config rc_config(const Session& s, const GopCfg& g, int rate_num, int rate_den) {
   const NV_ENC_RC_PARAMS& rc = s.config.rcParams;
+  vgpu_nvenc::RateController::Config c;
   const uint32_t mode = raw(rc.rateControlMode);
-  const long bitrate = rc.averageBitRate;
-  const bool intra = t == vgpu_nvenc::PicType::kIdr || t == vgpu_nvenc::PicType::kIntra;
-  const bool bpic = t == vgpu_nvenc::PicType::kBi;
-  const double frame_bits = bitrate > 0 ? static_cast<double>(bitrate) * rate_den / std::max(rate_num, 1) : 0;
+  c.bitrate = mode == num(NV_ENC_PARAMS_RC_CONSTQP) ? 0 : static_cast<double>(rc.averageBitRate);
+  c.max_bitrate = mode == num(NV_ENC_PARAMS_RC_VBR) ? static_cast<double>(rc.maxBitRate) : 0;
+  c.fps = static_cast<double>(rate_num) / std::max(rate_den, 1);
+  c.cbr = mode == num(NV_ENC_PARAMS_RC_CBR);
+  c.vbv_bits = static_cast<double>(rc.vbvBufferSize);
+  c.intra_fraction = g.intra_only ? 1.0 : (g.periodic ? 1.0 / std::max<uint32_t>(g.idr_period, 1) : 0.0);
+  c.b_per_p = g.nb;
+  for (int t = 0; t < 3; ++t) {
+    const NV_ENC_QP& mn = rc.minQP;
+    const NV_ENC_QP& mx = rc.maxQP;
+    c.qp_min[t] = rc.enableMinQP ? static_cast<int>(t == 0 ? mn.qpIntra : (t == 2 ? mn.qpInterB : mn.qpInterP)) : 0;
+    c.qp_max[t] = rc.enableMaxQP ? static_cast<int>(t == 0 ? mx.qpIntra : (t == 2 ? mx.qpInterB : mx.qpInterP)) : 51;
+    c.qp_min[t] = std::min(51, std::max(0, c.qp_min[t]));
+    c.qp_max[t] = std::min(51, std::max(c.qp_min[t], c.qp_max[t]));
+  }
+  return c;
+}
+uint64_t rc_sig_of(const vgpu_nvenc::RateController::Config& c) {
+  uint64_t v = 1469598103934665603ull;
+  auto mix = [&](uint64_t x) { v = (v ^ x) * 1099511628211ull; };
+  mix(static_cast<uint64_t>(c.bitrate));
+  mix(static_cast<uint64_t>(c.max_bitrate));
+  mix(static_cast<uint64_t>(c.fps * 1000));
+  mix(c.cbr);
+  mix(static_cast<uint64_t>(c.vbv_bits));
+  mix(static_cast<uint64_t>(c.intra_fraction * 1e6));
+  mix(static_cast<uint64_t>(c.b_per_p));
+  for (int t = 0; t < 3; ++t) {
+    mix(static_cast<uint64_t>(c.qp_min[t]));
+    mix(static_cast<uint64_t>(c.qp_max[t]));
+  }
+  return v;
+}
+
+// The slice QP of an IDR picture under rate control: a stateless search on a scratch encoder, so that one frame always encodes to the same bytes.
+int idr_qp(Session& s, const Frame& f, int rate_num, int rate_den, const GopCfg& g) {
+  const NV_ENC_RC_PARAMS& rc = s.config.rcParams;
+  const double frame_bits = static_cast<double>(rc.averageBitRate) * rate_den / std::max(rate_num, 1);
   // an I picture takes about four times a P picture's bits; with a short GOP its share of the budget is smaller
   const double gop_len = g.periodic ? static_cast<double>(std::max<uint32_t>(g.idr_period, 1)) : 1e9;
   const double p_bits = frame_bits * gop_len / (gop_len + 3.0);
   const double i_bits = g.intra_only || (g.periodic && g.idr_period <= 1) ? frame_bits : 4.0 * p_bits;
-  int qp;
-  if (mode == num(NV_ENC_PARAMS_RC_CONSTQP) || bitrate <= 0) {
-    qp = intra ? rc.constQP.qpIntra : (bpic ? rc.constQP.qpInterB : rc.constQP.qpInterP);
-  } else if (intra) {
-    // a stateless search, so that one frame always encodes to the same bytes: trial encodes on a scratch encoder
-    if (!s.trial) s.trial = make_encoder(s.codec, s.config, f.w, f.h, rate_num, rate_den);
-    const vgpu_nvenc::EncPicture pic = to_enc_picture(f);
-    qp = vgpu_nvenc::initial_qp_for(f.w, f.h, rate_num, rate_den, static_cast<long>(i_bits * rate_num / std::max(rate_den, 1)));
-    for (int trial = 0; trial < 4; ++trial) {
-      vgpu_nvenc::EncStats st;
-      s.trial->encode(pic, vgpu_nvenc::PicType::kIdr, qp, &st);
-      const double ratio = static_cast<double>(st.bytes) * 8 / i_bits;
-      if (ratio > 0.85 && ratio < 1.2) break;
-      const int next = std::min(51, std::max(8, qp + static_cast<int>(std::lround(6.0 * std::log2(ratio)))));
-      if (next == qp) break;
-      qp = next;
+  if (!s.trial) s.trial = make_encoder(s.codec, s.config, f.w, f.h, rate_num, rate_den);
+  const vgpu_nvenc::EncPicture pic = to_enc_picture(f);
+  auto bits_at = [&](int q) {
+    vgpu_nvenc::EncStats st;
+    s.trial->encode(pic, vgpu_nvenc::PicType::kIdr, q, &st);
+    return static_cast<double>(st.bytes) * 8;
+  };
+  // Bracket the QP at which the size crosses the target, then bisect between the two sides (at most eight encodes of the scratch encoder).
+  int qp = std::min(48, std::max(8, vgpu_nvenc::initial_qp_for(f.w, f.h, rate_num, rate_den, static_cast<long>(i_bits * rate_num / std::max(rate_den, 1)))));
+  int lo = -1, hi = 52;   // largest QP known to be too big (more bits than the target), smallest known to be small enough
+  double lo_bits = 0, hi_bits = 0;
+  int best_qp = qp;
+  double best_err = 1e30;
+  for (int trial = 0; trial < 8; ++trial) {
+    const double bits = bits_at(qp);
+    const double err = std::fabs(std::log(bits / i_bits));
+    if (err < best_err) {
+      best_err = err;
+      best_qp = qp;
     }
-  } else {
-    qp = static_cast<int>(std::lround(s.rc_qp)) + (bpic ? 2 : 0);
+    if (bits / i_bits > 0.9 && bits / i_bits < 1.12) break;
+    if (bits > i_bits) {
+      lo = qp;
+      lo_bits = bits;
+    } else {
+      hi = qp;
+      hi_bits = bits;
+    }
+    int next;
+    if (lo >= 0 && hi <= 51) {
+      if (hi - lo <= 1) break;
+      next = lo + (hi - lo) / 2;
+    } else {
+      next = qp + static_cast<int>(std::lround(6.0 * std::log2(bits / i_bits)));
+      if (next == qp) next += bits > i_bits ? 1 : -1;
+      next = std::min(51, std::max(8, next));
+      if (next == qp) break;
+    }
+    qp = next;
   }
-  if (rc.enableMinQP) qp = std::max<int>(qp, intra ? rc.minQP.qpIntra : (bpic ? rc.minQP.qpInterB : rc.minQP.qpInterP));
-  if (rc.enableMaxQP) qp = std::min<int>(qp, intra ? rc.maxQP.qpIntra : (bpic ? rc.maxQP.qpInterB : rc.maxQP.qpInterP));
-  return std::min(51, std::max(0, qp));
+  (void)lo_bits;
+  (void)hi_bits;
+  return best_qp;
 }
 
-// Codes one picture with the QP the rate control picks, updates the rate control, and wraps the result with the parameter sets when they are due.
+// Codes one picture with the QP the settings and the rate control pick (a second or third attempt when the size misses the rate control's target), updates the
+// rate control, and wraps the result with the parameter sets when they are due.
 Packet code_picture(Session& s, const Input1& in, vgpu_nvenc::PicType t, int rate_num, int rate_den, const GopCfg& g) {
+  using vgpu_nvenc::PicType;
+  using vgpu_nvenc::RateController;
   const NV_ENC_RC_PARAMS& rc = s.config.rcParams;
   const uint32_t mode = raw(rc.rateControlMode);
   const Frame& f = *in.frame;
-  const bool intra = t == vgpu_nvenc::PicType::kIdr || t == vgpu_nvenc::PicType::kIntra;
-  const int qp = pick_qp(s, t, f, rate_num, rate_den, g);
+  const bool intra = t == PicType::kIdr || t == PicType::kIntra;
+  const vgpu_nvenc::RateController::Config rcc = rc_config(s, g, rate_num, rate_den);
+  const uint64_t sig = rc_sig_of(rcc);
+  if (sig != s.rc_sig) {
+    s.rc.configure(rcc);
+    s.rc_sig = sig;
+  }
+  const RateController::Type rt = intra ? RateController::kIntra : (t == PicType::kBi ? RateController::kB : RateController::kP);
   const vgpu_nvenc::EncPicture pic = to_enc_picture(f);
-  vgpu_nvenc::EncStats st;
-  std::vector<uint8_t> picture = s.enc->encode_at(pic, t, qp, in.disp, &st);
-  // ---- rate control state
-  const long bitrate = rc.averageBitRate;
-  const double frame_bits = bitrate > 0 ? static_cast<double>(bitrate) * rate_den / std::max(rate_num, 1) : 0;
-  if (frame_bits > 0 && mode != num(NV_ENC_PARAMS_RC_CONSTQP)) {
-    const double gop_len = g.periodic ? static_cast<double>(std::max<uint32_t>(g.idr_period, 1)) : 1e9;
-    const double p_bits = frame_bits * gop_len / (gop_len + 3.0);
-    const double i_bits = g.intra_only || (g.periodic && g.idr_period <= 1) ? frame_bits : 4.0 * p_bits;
-    const double bits = static_cast<double>(picture.size()) * 8;
-    if (t == vgpu_nvenc::PicType::kIdr) {
-      s.rc_bits = bits;
-      s.rc_target = i_bits;
-      s.rc_qp = std::min(51, qp + 2);
-    } else {
-      s.rc_bits += bits;
-      s.rc_target += p_bits;
-      if (!intra) {
-        const double ratio = s.rc_bits / std::max(s.rc_target, 1.0);
-        s.rc_qp = std::min(51.0, std::max(8.0, s.rc_qp + std::min(3.0, std::max(-3.0, 3.5 * std::log2(ratio)))));
+  auto qp_limits = [&](int q) {
+    q = std::max(q, rcc.qp_min[rt]);
+    q = std::min(q, rcc.qp_max[rt]);
+    return std::min(51, std::max(0, q));
+  };
+  std::vector<uint8_t> picture;
+  int qp;
+  auto code = [&](int q) {
+    vgpu_nvenc::EncStats stats;
+    picture = s.enc->encode_at(pic, t, q, in.disp, t == PicType::kBi ? nullptr : &stats);
+    return static_cast<double>(picture.size()) * 8;
+  };
+  if (mode == num(NV_ENC_PARAMS_RC_CONSTQP) || !s.rc.active()) {
+    qp = intra ? rc.constQP.qpIntra : (t == PicType::kBi ? rc.constQP.qpInterB : rc.constQP.qpInterP);
+    if (mode != num(NV_ENC_PARAMS_RC_CONSTQP) && rc.targetQuality > 0) qp = rc.targetQuality;   // VBR with no bit rate: constant quality
+    qp = qp_limits(qp);
+    code(qp);
+  } else if (t == PicType::kIdr) {
+    qp = qp_limits(idr_qp(s, f, rate_num, rate_den, g));
+    const double bits = code(qp);
+    s.rc.update(rt, qp, bits);
+  } else {
+    qp = s.rc.qp_for(rt);
+    const double target = s.rc.target_bits(rt);
+    double bits = code(qp);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const double ratio = bits / std::max(target, 1.0);
+      const bool too_big = bits > s.rc.max_bits();
+      if (!too_big && ratio > 0.94 && ratio < 1.06) break;
+      const int qp2 = s.rc.next_qp(rt, qp, bits, too_big ? std::min(target, s.rc.max_bits()) : target);
+      if (qp2 == qp) break;
+      s.enc->rollback();
+      const double bits2 = code(qp2);
+      s.rc.learn_alpha(qp, bits, qp2, bits2);
+      const bool better = std::fabs(std::log(bits2 / target)) <= std::fabs(std::log(bits / target)) && !(bits2 > s.rc.max_bits() && bits <= s.rc.max_bits());
+      if (better) {
+        qp = qp2;
+        bits = bits2;
+      } else {
+        // the first attempt was the closer one: encode it again to leave the encoder in its state
+        s.enc->rollback();
+        bits = code(qp);
+        break;
       }
     }
+    s.rc.update(rt, qp, bits);
+    if (std::getenv("VGPU_NVENC_RC_TRACE")) std::fprintf(stderr, "rc: type %d qp %d bits %.0f target %.0f afford %.0f spent %.0f budget %.0f\n", static_cast<int>(rt), qp, bits, target, 0.0, s.rc.spent(), s.rc.budget());
   }
   Packet pk;
   pk.ts = in.ts;
   pk.dur = in.dur;
   pk.pic_struct = in.pic_struct;
-  pk.slices = static_cast<uint32_t>(st.slices);
-  pk.pic_type = t == vgpu_nvenc::PicType::kIdr ? num(NV_ENC_PIC_TYPE_IDR)
-                : (t == vgpu_nvenc::PicType::kIntra ? num(NV_ENC_PIC_TYPE_I) : (t == vgpu_nvenc::PicType::kBi ? num(NV_ENC_PIC_TYPE_B) : num(NV_ENC_PIC_TYPE_P)));
+  pk.slices = static_cast<uint32_t>(s.enc->last_slices());
+  pk.pic_type = t == PicType::kIdr ? num(NV_ENC_PIC_TYPE_IDR)
+                : (t == PicType::kIntra ? num(NV_ENC_PIC_TYPE_I) : (t == PicType::kBi ? num(NV_ENC_PIC_TYPE_B) : num(NV_ENC_PIC_TYPE_P)));
   size_t skip = 0;
-  if (!s.sent_parameter_sets || in.want_ps || (g.repeat_ps && t == vgpu_nvenc::PicType::kIdr)) {
+  if (!s.sent_parameter_sets || in.want_ps || (g.repeat_ps && t == PicType::kIdr)) {
     pk.data = s.enc->parameter_sets();
     // The digest SEI message of an intra picture is the first NAL unit of its access unit, and needs the four-byte start code,
     // only when no parameter sets come before it (Annex B, zero_byte).

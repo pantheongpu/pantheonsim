@@ -453,6 +453,13 @@ int slices_in(const uint8_t* p, size_t n) {
   return count;
 }
 
+// The bit rate of a coded stream at 30 pictures a second, in kbit/s
+double kbps_of(const Encoded& e) {
+  size_t total = 0;
+  for (size_t s : e.sizes) total += s;
+  return static_cast<double>(total) * 8 / (static_cast<double>(e.input.size()) / 30.0) / 1000.0;
+}
+
 std::string types_string(const std::vector<int>& types) {
   std::string out;
   for (int t : types) out += t == NV_ENC_PIC_TYPE_IDR ? 'I' : (t == NV_ENC_PIC_TYPE_P ? 'p' : (t == NV_ENC_PIC_TYPE_I ? 'i' : (t == NV_ENC_PIC_TYPE_B ? 'b' : '?')));
@@ -463,7 +470,12 @@ std::string types_string(const std::vector<int>& types) {
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  const bool card = argc > 1 && !std::strcmp(argv[1], "--card");
+  bool card = false;
+  const char* only = nullptr;   // --only <text>: run the cases whose names contain it
+  for (int i = 1; i < argc; ++i) {
+    if (!std::strcmp(argv[i], "--card")) card = true;
+    else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
+  }
   void* enclib = dlopen("libnvidia-encode.so.1", RTLD_NOW);
   void* declib = dlopen("libnvcuvid.so.1", RTLD_NOW);
   if (!enclib || !declib) {
@@ -655,10 +667,60 @@ int main(int argc, char** argv) {
        [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool) -> std::string {
          return pps_entropy_flag(e.stream) == 0 ? "" : "the PPS does not say CAVLC";
        }},
+
+      {"constant bit rate 250 kbit/s with B pictures, 320x180, 45 pictures", 320, 180, 45,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+         c.rcParams.averageBitRate = 250000;
+         c.rcParams.maxBitRate = 250000;
+         c.frameIntervalP = 3;
+         c.gopLength = NVENC_INFINITE_GOPLENGTH;
+         c.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool card) -> std::string {
+         const double kbps = kbps_of(e);
+         std::printf("  bit rate %.0f kbit/s for a target of 250\n", kbps);
+         if (card) return "";   // the card's own accuracy is only reported
+         return std::fabs(kbps - 250) <= 0.05 * 250 ? "" : "bit rate " + std::to_string(static_cast<int>(kbps)) + " kbit/s, target 250 (within 5%)";
+       }},
+      {"variable bit rate 1500 kbit/s, peak 3000, 640x360, 36 pictures, a GOP of 12", 640, 360, 36,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+         c.rcParams.averageBitRate = 1500000;
+         c.rcParams.maxBitRate = 3000000;
+         c.frameIntervalP = 1;
+         c.gopLength = 12;
+         c.encodeCodecConfig.h264Config.idrPeriod = 12;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool card) -> std::string {
+         const double kbps = kbps_of(e);
+         std::printf("  bit rate %.0f kbit/s for a target of 1500\n", kbps);
+         if (card) return "";
+         return std::fabs(kbps - 1500) <= 0.05 * 1500 ? "" : "bit rate " + std::to_string(static_cast<int>(kbps)) + " kbit/s, target 1500 (within 5%)";
+       }},
+      {"constant bit rate 80 kbit/s, 192x128, 40 pictures", 192, 128, 40,
+       [](NV_ENC_CONFIG& c, NV_ENC_INITIALIZE_PARAMS&) {
+         c.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+         c.rcParams.averageBitRate = 80000;
+         c.rcParams.maxBitRate = 80000;
+         c.frameIntervalP = 1;
+         c.gopLength = NVENC_INFINITE_GOPLENGTH;
+         c.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+       },
+       nullptr,
+       [](const Encoded& e, const std::vector<std::vector<uint8_t>>&, int, int, bool card) -> std::string {
+         const double kbps = kbps_of(e);
+         std::printf("  bit rate %.0f kbit/s for a target of 80\n", kbps);
+         if (card) return "";
+         return std::fabs(kbps - 80) <= 0.05 * 80 ? "" : "bit rate " + std::to_string(static_cast<int>(kbps)) + " kbit/s, target 80 (within 5%)";
+       }},
   };
 
   int failures = 0;
   for (const Case& c : cases) {
+    if (only && !std::strstr(c.name, only)) continue;
     Encoded e = encode(ctx, c);
     if (!e.error.empty()) {
       std::printf("FAIL %s: %s\n", c.name, e.error.c_str());

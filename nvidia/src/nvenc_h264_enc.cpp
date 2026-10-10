@@ -2170,6 +2170,38 @@ struct H264Encoder::Impl {
     return best_cost;
   }
 
+  // the state a rollback() returns to
+  struct Saved {
+    std::vector<std::shared_ptr<DpbPic>> dpb;
+    bool have_ref = false, valid = false;
+    int frame_num = 0, ref_frame_num = 0, uid = 0, poc_counter = 0, cur_poc = 0, bytes_slice_mbs = 0;
+    double bytes_per_mb = 0;
+  } saved;
+  void save_state() {
+    saved.dpb = dpb;
+    saved.have_ref = have_ref;
+    saved.frame_num = frame_num;
+    saved.ref_frame_num = ref_frame_num;
+    saved.uid = uid;
+    saved.poc_counter = poc_counter;
+    saved.cur_poc = cur_poc;
+    saved.bytes_slice_mbs = bytes_slice_mbs;
+    saved.bytes_per_mb = bytes_per_mb;
+    saved.valid = true;
+  }
+  void restore_state() {
+    if (!saved.valid) return;
+    dpb = saved.dpb;
+    have_ref = saved.have_ref;
+    frame_num = saved.frame_num;
+    ref_frame_num = saved.ref_frame_num;
+    uid = saved.uid;
+    poc_counter = saved.poc_counter;
+    cur_poc = saved.cur_poc;
+    bytes_slice_mbs = saved.bytes_slice_mbs;
+    bytes_per_mb = saved.bytes_per_mb;
+    saved.valid = false;
+  }
   bool want_stats = false;
   std::shared_ptr<vgpu_h264::Frame> last_decoded;
 };
@@ -2589,10 +2621,12 @@ std::vector<uint8_t> H264Encoder::parameter_sets() const { return p_->stream.par
 bool H264Encoder::supports_b() const { return p_->b_mode; }
 
 std::vector<uint8_t> H264Encoder::encode(const EncPicture& in, PicType type, int qp, EncStats* stats) {
+  p_->save_state();
   if (type == PicType::kIdr) p_->poc_counter = 0;
   return p_->encode_picture(in, type, qp, p_->poc_counter++, stats);
 }
 std::vector<uint8_t> H264Encoder::encode_at(const EncPicture& in, PicType type, int qp, int poc, EncStats* stats) {
+  p_->save_state();
   return p_->encode_picture(in, type, qp, poc, stats);
 }
 
@@ -2607,6 +2641,9 @@ void H264Encoder::reset() {
   p_->fr_cur.reset();
   p_->poc_counter = 0;
 }
+
+void H264Encoder::rollback() { p_->restore_state(); }
+int H264Encoder::last_slices() const { return static_cast<int>(std::max<size_t>(p_->slice_start.size(), 1)); }
 
 int H264Encoder::coded_width() const { return p_->ys; }
 int H264Encoder::coded_height() const { return p_->mh * 16; }

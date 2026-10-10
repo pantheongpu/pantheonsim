@@ -28,6 +28,7 @@ class HevcEncoder : public VideoEncoder {
   std::vector<uint8_t> parameter_sets() const override;   // VPS, SPS, PPS
   std::vector<uint8_t> encode(const EncPicture& in, PicType type, int qp, EncStats* stats = nullptr) override;
   void reset() override;
+  void rollback() override;
 
   // For tests: the reconstruction of the last picture (what a decoder returns), as coded_width() x coded_height() luma samples (multiples of
   // eight) and the two chroma planes.
