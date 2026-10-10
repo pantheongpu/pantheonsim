@@ -1262,6 +1262,30 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
     100 x 90 the next large 8-bit image of another type can differ in a pixel or two (found as one line of the
     conformance program, `npp_segment`, that moved when the work buffer was zeroed and still differed; the
     simulator is the state-free behaviour);
+  - **Round 6: the equal-neighbour labels were tried again and are NOT reproducible from outside** (exhaustive
+    small images, `tools/probes/npp_watershed_ties.py`). The card is deterministic (the same batch twice, and in
+    reverse order, gives the same bytes), so this is a rule nobody has, not noise. What the 2-valued images of
+    every pattern up to 4 x 3 show:
+    * the simulator's labels differ from the card's on 44 of the 512 3x3 images (8-way), 96 of 512 (4-way),
+      466 of 4096 4x3 images (8-way) and 927 (4-way); on random 3-valued images the labels differ in most images
+      from 12x12 up;
+    * the "pull" rule (a pixel whose lowest neighbours are tied merges the later roots among them into the first
+      one's region) is right in a row (`0 1 0 1 0` is one region, label 0) and wrong in a plane: in
+      `1 1 0 0 / 0 1 0 0` the pixel at x = 1 ties the roots 2, 4 and 6, yet the card keeps root 4 (label 0)
+      apart from the plateau of 2, 3, 6, 7 (label 1). Switching the rule off or restricting it to opposite
+      neighbours is worse on the whole (0 or 3 more images in 512 fail depending on size), so neither is right;
+    * pixel 0 behaves differently from every other pixel and not locally: `1 1 0 / 1 1 0 / 0 0 0` labels the
+      whole image 1, including the root at pixel 0 whose own closed neighbourhood starts at 0, while the same
+      two columns over two rows (`1 1 0 / 1 1 0`) keep pixel 0 and pixel 3 at label 0; `0 0 1 / 0 0 0 / 1 0 0` is
+      all 1 and `0 0 1 / 0 0 0 / 0 0 1` is all 0 -- which pixel of the bottom row is 1 decides whether the
+      plateau holding pixel 0 is labelled 0 or 1;
+    * flat images split into strips whose start depends on the width mod 16 and, in steps that are not
+      periodic (48; 60-64; 76-78; 112; 124-128; 140 ... for w = 320 and h = 16, 17-21, 22-37, 38, 39-46, 58),
+      on the height.
+    These are the signature of a parallel union that runs a fixed schedule of tile passes and does not converge,
+    with a pass count that depends on the whole image. A rule would have to be the schedule itself, which
+    cannot be read off black-box output; the simulator keeps the fitted model, and the conformance program keeps
+    pinning only what is exact (the segmented image, labels of images without equal neighbours).
   The segmented image is exact for both connectivities regardless; the compressed labels of the Samples' images
   differ because a label that differs moves every rank after it.
 - Label compression is exact for any label image: labels below
