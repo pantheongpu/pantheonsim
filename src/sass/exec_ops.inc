@@ -2311,7 +2311,7 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
 // after every 128 bits of K; 1-bit ones counting .AND/.XOR bits.
 namespace {
 // E3M2, E2M3 and E2M1 each in a byte (QMMA, mma.sync .kind::f8f6f4: the
-// FP6 in bits 0-5, FP4 in 2-5); E2M1P packed two to a byte (OMMA).
+// FP6 in bits 0-5, FP4 in 2-5, read as an E2M3 of bits 0-5); E2M1P packed two to a byte (OMMA).
 enum class MmaT { F16, BF16, TF32, S8, U8, S4, U4, B1, F64, E4M3, E5M2, E3M2, E2M3, E2M1, E2M1P };
 unsigned mma_bits(MmaT t) {
   switch (t) {
@@ -2337,7 +2337,9 @@ double mma_elem(MmaT t, uint64_t v, unsigned e) {
     case MmaT::E5M2: return exec::fp8_value(static_cast<uint32_t>(v >> (8 * e)), true);
     case MmaT::E3M2: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 3, 2, 3);
     case MmaT::E2M3: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 2, 3, 1);
-    case MmaT::E2M1: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e + 2)) & 0xF, 2, 1, 1);
+    // (An E2M1 operand in a byte is read as the byte's low six bits as an E2M3: an RTX PRO 6000 does, and it is the
+    // same number when bits 0-1 and 6-7 are zero, as the ISA's layout leaves them.)
+    case MmaT::E2M1: return exec::mx_float_value(static_cast<uint32_t>(v >> (8 * e)) & 0x3F, 2, 3, 1);
     case MmaT::E2M1P: return exec::mx_float_value(static_cast<uint32_t>(v >> (4 * e)) & 0xF, 2, 1, 1);
     case MmaT::U8: return static_cast<uint8_t>(v >> (8 * e));
     case MmaT::S4: return static_cast<int8_t>(static_cast<uint8_t>(((v >> (4 * e)) & 0xf) << 4)) >> 4;
@@ -2906,6 +2908,10 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       C[cd(l, s)] = v;
     }
   double D[16 * kN] = {};
+  const auto narrow_elem = [](MmaT t) {
+    return t == MmaT::E4M3 || t == MmaT::E5M2 || t == MmaT::E3M2 || t == MmaT::E2M3 || t == MmaT::E2M1 || t == MmaT::E2M1P;
+  };
+  const bool narrow_tensor_core = m_.sm / 10 == 12 && narrow_elem(at) && narrow_elem(bt) && acc == AccF32;
   for (unsigned i = 0; i < M; ++i)
     for (unsigned j = 0; j < kN; ++j) {
       if (at == MmaT::B1) {
@@ -2930,6 +2936,14 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           for (unsigned k = 0; k < K; ++k) a = std::fma(A[i * K + k], B[k * kN + j], a);
           return a;
         });
+      } else if (narrow_tensor_core) {
+        // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (exec::mma_narrow_sum).
+        double terms[256];
+        const unsigned sblock = K / scale_vec;
+        for (unsigned k = 0; k < K; ++k)
+          terms[k] = block_scaled ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
+                                  : A[i * K + k] * B[k * kN + j];
+        D[i * kN + j] = exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j]));
       } else {
         float a = static_cast<float>(C[i * kN + j]);
         const unsigned sblock = K / scale_vec;

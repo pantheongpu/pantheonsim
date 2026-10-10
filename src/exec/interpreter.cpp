@@ -7378,7 +7378,10 @@ class Interpreter {
       // kinds.
       case MmaElem::E3M2: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 3, 2, 3);
       case MmaElem::E2M3: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 2, 3, 1);
-      case MmaElem::E2M1: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot + 2)) & 0xF, 2, 1, 1);
+      // (An RTX PRO 6000 reads the byte's low six bits as an E2M3 for an E2M1 operand too -- the hash of a form
+      // with random bytes in the containers says so -- which is the same number when bits 0-1 and 6-7 are zero,
+      // as CUTLASS's and the ISA's layout leaves them.)
+      case MmaElem::E2M1: return small_float_value(static_cast<uint32_t>(reg >> (8 * slot)) & 0x3F, 2, 3, 1);
       case MmaElem::E2M1P: return small_float_value(static_cast<uint32_t>(reg >> (4 * slot)) & 0xF, 2, 1, 1);
       case MmaElem::S8:
       case MmaElem::U8: {
@@ -7543,6 +7546,13 @@ class Interpreter {
     // integers accumulate exactly and then wrap or saturate; .b1 counts the
     // bits of A's row and B's column that .and/.xor leave set.
     std::array<double, 16 * kN> D{};
+    // The narrow-float tensor core of sm_120 (E4M3, E5M2, E3M2, E2M3, E2M1 and packed E2M1 operands, float accumulate).
+    const auto narrow_elem = [](MmaElem t) {
+      return t == MmaElem::E4M3 || t == MmaElem::E5M2 || t == MmaElem::E3M2 || t == MmaElem::E2M3 ||
+             t == MmaElem::E2M1 || t == MmaElem::E2M1P;
+    };
+    const bool narrow_tensor_core = profile_.cc_major == 12 && narrow_elem(op.ab_type) && narrow_elem(op.b_type) &&
+                                    !op.acc_int && !op.acc_f64 && !op.acc_f16;
     const int prev_round = std::fegetround();
     if (op.acc_f64) {
       switch (op.rnd) {
@@ -7580,6 +7590,13 @@ class Interpreter {
           double acc = C[i * kN + j];
           for (uint32_t k = 0; k < K; ++k) acc = std::fma(A[i * K + k], B[k * kN + j], acc);
           D[i * kN + j] = acc;
+        } else if (narrow_tensor_core) {
+          // sm_120's narrow-float tensor core: the exact sum, rounded once toward zero (mma_narrow_sum).
+          double terms[256];
+          for (uint32_t k = 0; k < K; ++k)
+            terms[k] = op.block_scale ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
+                                      : A[i * K + k] * B[k * kN + j];
+          D[i * kN + j] = static_cast<double>(vgpu::exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j])));
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           if (op.block_scale)
@@ -13549,6 +13566,44 @@ uint32_t ue8m0_bits(double v, bool round_up, bool satfinite) {
 }
 uint16_t f16_bits(double v) { return static_cast<uint16_t>(double_to_f16(v)); }
 uint16_t bf16_bits(double v) { return static_cast<uint16_t>(double_to_bf16(v)); }
+
+float mma_narrow_sum(const double* terms, size_t n, float c) {
+  bool nan = std::isnan(c), pinf = std::isinf(c) && c > 0, ninf = std::isinf(c) && c < 0;
+  bool all_neg_zero = c == 0.0f && std::signbit(c);
+  int max_e = std::numeric_limits<int>::min();
+  auto look = [&](double t) {
+    if (std::isnan(t)) { nan = true; all_neg_zero = false; return; }
+    if (std::isinf(t)) { (t > 0 ? pinf : ninf) = true; all_neg_zero = false; return; }
+    if (t != 0) { max_e = std::max(max_e, std::ilogb(t)); all_neg_zero = false; }
+    else if (!std::signbit(t)) all_neg_zero = false;
+  };
+  for (size_t i = 0; i < n; ++i) look(terms[i]);
+  if (std::isfinite(c) && c != 0.0f) max_e = std::max(max_e, std::ilogb(static_cast<double>(c)));
+  if (nan || (pinf && ninf)) return std::bit_cast<float>(0x7fffffffu);
+  if (pinf) return std::numeric_limits<float>::infinity();
+  if (ninf) return -std::numeric_limits<float>::infinity();
+  if (max_e == std::numeric_limits<int>::min()) return all_neg_zero ? -0.0f : 0.0f;
+  const int lsb = max_e - 118;   // the unit of the fixed-point sum: 2^lsb, the largest term in 119 bits of an __int128
+  __int128 acc = 0;
+  auto add = [&](double t) {
+    if (t == 0) return;
+    acc += static_cast<__int128>(std::floor(std::ldexp(t, -lsb)));   // below the unit: toward minus infinity
+  };
+  for (size_t i = 0; i < n; ++i) add(terms[i]);
+  add(static_cast<double>(c));
+  if (acc == 0) return 0.0f;
+  const bool neg = acc < 0;
+  unsigned __int128 mag = neg ? -static_cast<unsigned __int128>(acc) : static_cast<unsigned __int128>(acc);
+  const uint64_t hi = static_cast<uint64_t>(mag >> 64), lo = static_cast<uint64_t>(mag);
+  const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
+  // fp32 keeps 24 bits and nothing below 2^-149
+  const int shift = std::max(top - 23, -149 - lsb);
+  const uint64_t m = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  if (m == 0) return 0.0f;
+  const double v = std::ldexp(static_cast<double>(m), lsb + shift);
+  if (v >= 0x1p128) return neg ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+  return neg ? -static_cast<float>(v) : static_cast<float>(v);
+}
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
   validate(fn, cfg, profile);

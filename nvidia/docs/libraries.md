@@ -789,8 +789,8 @@ runs them; each is a ctest of its own.
 | `e2e_graph_capture_nccl` | NCCL's all-reduce (sum, max, average, in place, with a pre-multiplied operator destroyed after the capture), broadcast, reduce, all-gather, reduce-scatter and send/recv recorded into captured graphs, a rank per thread on two devices, launched together and compared with eager calls, the order of collectives still in step afterwards; `run_graph_capture_nccl.sh --card` runs it on NVIDIA's NCCL (2.28.9) on two RTX 3060s | PyTorch DDP and `torch.cuda.graph` with NCCL collectives, Megatron |
 | `e2e_graph_capture_driver`, `e2e_graph_driver` | the driver API's stream calls inside a capture made with `cuStreamBeginCapture` (copies of every shape, fills, host functions, events across streams, stream memory operations, stream-ordered allocation, and the calls a capture refuses) and the driver's explicit graphs (`cuGraphAdd*Node`, Get/SetParams, executable-graph updates, clones, user objects, capture into a graph); both run on NVIDIA's driver too | XLA, Warp, cuda-python |
 | `e2e_lt_blockscaled_paths` | MXFP8 and NVFP4 block scales in the tiled layout, the 128-element and 128x128 FP32 forms, D's block quantization and its output scales (simulator only: documentation-derived) | `_scaled_mm` with block scales |
-| `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4 and an RTX 3060 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
-| `e2e_lowprec_sparselt` | 1096 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4 and an RTX 3060 | FP8 2:4 sparse inference |
+| `e2e_lowprec_lt` | 1278 cuBLASLt descriptors (FP8 types, layouts, alignment, scales, amax, saturation, beta, batches, epilogues with their auxiliary outputs, the backward ones, row-major and padded layouts, block-scaled modes), each printed as its heuristic and matmul status and a hash of D, the auxiliary output, amax and block scales, compared with what an L4, an L40S, an RTX 3060 and an RTX PRO 6000 printed ([lowprec.md](lowprec.md)) | `_scaled_mm`, Transformer Engine's FP8 linear layers |
+| `e2e_lowprec_sparselt` | 1097 cuSPARSELt problems (FP8 and FP4 inputs, every output, compute type, layout, alignment, activation, bias, alpha vector, scale mode), the same way against an L4, an L40S, an RTX 3060 and an RTX PRO 6000 (one case of the last differs, `known-gaps.txt`) | FP8 2:4 sparse inference |
 | `e2e_lowprec_cvt` | the packed FP8 conversions (e4m3x2, e5m2x2 from f32 and f16x2, .relu, and back) over 512 values with NaN, infinities, zeros, subnormals and ties, on SASS and PTX, against an L4 | `__nv_fp8` conversions on sm_89 and later |
 | `e2e_dnn_int8x32` | an INT8x32 convolution through the graph API with the filter reordered by `cudnnReorderFilterAndBias` (`CUDNN_TENSOR_REORDERING_INT8x32`); the same program passes against NVIDIA's cuDNN on an RTX 3060 | INT8 inference engines built on cudnn-frontend |
 | `e2e_blas_packed_paths`, `e2e_blas_batched_paths`, `e2e_blas_64_paths`, `e2e_blas_legacy_paths`, `e2e_blas_xt_paths` | cuBLAS's band and packed level 2, batched GEMV, getri/matinv, syrkx/herkx, the `_64` forms, the handle settings, the legacy API and cuBLASXt on two devices | SciPy-style BLAS callers, multi-GPU GEMM |
@@ -1528,14 +1528,15 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   with an algo other than 0 is NOT_SUPPORTED (the documentation: "only support
   algo = 0 (QR)"; NVIDIA's does nothing and reports success). The solvers
   agree with NVIDIA's to rounding, not bit for bit: they compute in double.
-- **cuSPARSELt**: FP4 (E2M1) inputs past the descriptor (an L4 and an RTX 3060 accept
-  the descriptor and refuse the algorithm; later GPUs' sparse FP4 format is not
-  implemented), FP8 outputs and the block scale modes `VEC32_UE4M3` and
-  `VEC64_UE8M0` (the same GPUs refuse them too), FP8 on Hopper and Blackwell
+- **cuSPARSELt**: FP4 (E2M1) inputs past the descriptor on any GPU but an RTX PRO 6000 (an L4 and an RTX 3060
+  accept the descriptor and refuse the algorithm; the RTX PRO 6000's sparse FP4, 4:8 in pairs, is implemented from
+  its card transcript, and its compressed *metadata layout* is not the card's, only the sizes are), FP8 outputs and the
+  block scale modes `VEC32_UE4M3` and `VEC64_UE8M0` (on C, D and D's output everywhere; on A and B, the GPUs
+  other than an RTX PRO 6000 refuse them), FP8 on Hopper and the data-center Blackwell GPUs
   (documentation-derived: the L4's table is what is implemented), fp16 compute
   (no kernel on sm_86 or sm_89 on NVIDIA's library either), and GELU outside int8
-  and FP8-into-bf16 output (refused there too); see the section above for where
-  the compressed layout and the search differ.
+  and FP8-into-bf16 output (refused there too; an RTX PRO 6000 takes FP8 into fp16, bf16 and fp32); see the
+  section above for where the compressed layout and the search differ.
 - **cuSOLVER**: left eigenvectors from `Xgeev` (NVIDIA's CUDA 13.0 and 13.2
   libraries answer jobvl = VECTOR with INTERNAL_ERROR and document right
   eigenvectors only; this does the same), cusolverSp's `csrlsvlu` on the

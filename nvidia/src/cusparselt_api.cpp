@@ -37,12 +37,17 @@
 // matmul descriptor and refuses the algorithm), and FP4 reaches the algorithm selection as on
 // those cards (nvidia/docs/lowprec.md, nvidia/tests/data/lowprec/sparselt.*.txt). Refused, with a
 // message: fp16 compute (no kernel on sm_86 or sm_89 on NVIDIA's library either), FP8 outputs,
-// the block scale modes, and sparse FP4 past the algorithm selection (Blackwell's format).
-// Hopper and Blackwell GPUs are taken to answer as the L4 does for FP8 -- no such GPU was
-// available, so that is documentation-derived, not measured; scale pointers are accepted and
-// ignored, as the L4 and the 3060 ignore them;
-// GELU outside int8 and FP8-into-bf16 output is INVALID_VALUE, as on the card. A call on a
-// stream that is capturing a graph is recorded and runs at each launch.
+// the block scale modes on the cards that refuse them, and sparse FP4 on any GPU but an sm_120 one.
+// An RTX PRO 6000 Blackwell (sm_120, measured over the same 1097 descriptors) differs from the L4
+// and is followed where the code says "sm_120": the compressed sizes and the compress buffer, no
+// workspace, ReLU's +0, GELU into fp16 and fp32, a search that leaves D alone, sparse FP4 (4:8 in
+// pairs), and block-scaled products with their scale layout, UE4M3/UE8M0 reading and round-toward-zero
+// sums. Hopper and the other Blackwell GPUs are taken to answer as the L4 does for FP8 -- no such
+// GPU was available, so that is documentation-derived, not measured; scale pointers are accepted
+// and ignored (but on sm_120 for FP4 and block modes), as the L4 and the 3060 ignore them;
+// GELU outside int8 and FP8-into-bf16 output is INVALID_VALUE, as on the card (sm_120: any FP8 into
+// fp16, bf16 or fp32 output). A call on a stream that is capturing a graph is recorded and runs at
+// each launch.
 #include "../include/vgpu_cusparselt.h"
 
 #include <cuda_runtime_api.h>
@@ -172,10 +177,19 @@ int type_bits(int t) {
   }
 }
 size_t type_bytes(int t) { return (size_t)type_bits(t) / 8; }
+// Bytes of `n` consecutive elements of type t (four-bit elements pack two to a byte).
+size_t elems_bytes(int t, int64_t n) { return (size_t)(n * type_bits(t) / 8); }
 // The 8-bit types share one compressed layout and one set of descriptor rules (measured: an L4 compresses
 // E4M3 and E5M2 exactly as it does int8, and its descriptor checks treat E2M1 like them).
 bool is_fp8(int t) { return t == kR8F_E4M3 || t == kR8F_E5M2; }
 bool is8(int t) { return t == CUDA_R_8I || is_fp8(t); }
+bool is_fp4(int t) { return t == kR4F_E2M1; }
+
+int sm_of_current_device();
+// An RTX PRO 6000 Blackwell (compute capability 12.0): the one GPU whose FP4 and block-scaled sparse products were
+// measured (cuSPARSELt 0.10.0.12; nvidia/tests/data/lowprec/sparselt.rtx-pro-6000-server.txt). Everything below that
+// says "sm_120" is that card's behaviour; other Blackwell GPUs keep the L4's rules, as before.
+bool sm120() { return sm_of_current_device() == 120; }
 
 // Measured: a descriptor takes these value types, and refuses fp64, complex
 // and unsigned with INVALID_VALUE. FP8 and FP4 descriptors are accepted; the
@@ -308,6 +322,12 @@ uint8_t float_to_fp8(float f, bool e4m3) {
   const int rexp = re - 1;
   if (rexp < emin) return sign | (uint8_t)(int)(r / std::ldexp(1.0, emin - mbits));
   return sign | (uint8_t)(((rexp + bias) << mbits) | ((int)(r / std::ldexp(1.0, rexp - mbits)) - (1 << mbits)));
+}
+
+// E2M1 (FP4): sign, two exponent bits, one mantissa bit: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+float fp4_value(unsigned code) {
+  static const float v[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  return (code & 8) ? -v[code & 7] : v[code & 7];
 }
 
 // One element at a byte address, as float (int8/int32 exactly representable
@@ -449,6 +469,11 @@ int64_t round_up(int64_t x, int64_t a) { return (x + a - 1) / a * a; }
 // and orientation (nk, k logical): bytes of metadata, and of the buffer
 // SpMMACompress asks for.
 size_t meta_bytes(int t, int64_t nk, int64_t k) {
+  // sm_120's FP8 and FP4 kernels (measured on an RTX PRO 6000 over the dims/ shapes of sparselt.rtx-pro-6000-server.txt):
+  // the metadata is 2048 bytes for every 128 x 128 tile of the logical operand (128 x 256 for FP4), whole tiles, one
+  // 4-bit code per group of four (FP4: eight) elements. The L4's and the RTX 3060's tiles are 64 rows by 128.
+  if (sm120() && (is8(t) && t != CUDA_R_8I)) return (size_t)(2048 * ((nk + 127) / 128) * ((k + 127) / 128));
+  if (sm120() && is_fp4(t)) return (size_t)(2048 * ((nk + 127) / 128) * ((k + 255) / 256));
   switch (t) {
     case CUDA_R_16F: case CUDA_R_16BF:
       return (size_t)std::max(round_up(nk, 32) * round_up(k, 64), round_up(nk, 64) * round_up(k, 32)) / 8;
@@ -459,6 +484,10 @@ size_t meta_bytes(int t, int64_t nk, int64_t k) {
   }
 }
 size_t buffer_bytes(int t, int64_t nk, int64_t k) {
+  // sm_120: a fixed scratch buffer for the FP8 types and a double one for FP4, whatever the shape (measured over every
+  // dims/ shape), and the plan then asks for no workspace.
+  if (sm120() && (is8(t) && t != CUDA_R_8I)) return 49216;
+  if (sm120() && is_fp4(t)) return 98368;
   switch (t) {
     case CUDA_R_16F: case CUDA_R_16BF: return meta_bytes(t, nk, k);
     case CUDA_R_8I: case kR8F_E4M3: case kR8F_E5M2: return meta_bytes(t, nk, k) / 2;
@@ -467,9 +496,10 @@ size_t buffer_bytes(int t, int64_t nk, int64_t k) {
   }
 }
 bool compressible_type(int t) {
-  return t == CUDA_R_16F || t == CUDA_R_16BF || is8(t) || t == CUDA_R_32F;
+  // Sparse FP4 (4:8 in pairs, see compress_batch) was measured on sm_120 only.
+  return t == CUDA_R_16F || t == CUDA_R_16BF || is8(t) || t == CUDA_R_32F || (is_fp4(t) && sm120());
 }
-size_t values_bytes(int t, int64_t nk, int64_t k) { return (size_t)(nk * (k / 2)) * type_bytes(t); }
+size_t values_bytes(int t, int64_t nk, int64_t k) { return elems_bytes(t, nk * (k / 2)); }
 // One batch's compressed bytes for a structured descriptor, which does not
 // say which operand it is: K is taken to be the contiguous dimension
 // (measured: CompressedSize2 and the plan's CompressedSize agree, and for
@@ -527,6 +557,9 @@ struct MetaCodec {
   size_t bytes;
   bool plain;
   MetaCodec(int t_, int64_t nk_, int64_t k_, size_t bytes_) : t(t_), nk(nk_), k(k_), bytes(bytes_), plain(false) {
+    // (sm_120's FP4 keeps one code per group of eight elements in plain row-major order: the card's own layout of
+    // that region was not decoded.)
+    if (is_fp4(t)) { plain = true; return; }
     const int64_t groups = t == CUDA_R_32F ? k / 2 : k / 4;
     size_t top = 0;
     for (int64_t r = 0; r < nk; ++r)
@@ -536,7 +569,7 @@ struct MetaCodec {
   }
   // fp32: the plain copy fills the first half, the blocked copy the second.
   size_t index(int64_t r, int64_t g, int copy) const {
-    if (plain) return (size_t)(r * (t == CUDA_R_32F ? k / 2 : k / 4) + g) + (copy ? bytes : 0);
+    if (plain) return (size_t)(r * (t == CUDA_R_32F ? k / 2 : is_fp4(t) ? k / 8 : k / 4) + g) + (copy ? bytes : 0);
     if (is8(t)) return nibble8(r, g, nk);
     if (t == CUDA_R_32F) return copy == 0 ? (size_t)(r * (k / 2) + g) : bytes + nibble16(r, g, nk);
     return nibble16(r, g, nk);
@@ -632,11 +665,49 @@ unsigned tile2_mask(const float t[2][2]) {
 struct Dense {
   std::vector<uint8_t> raw;
   int t;
-  float get(int64_t off) const { return load(raw.data() + off * type_bytes(t), t); }
-  void zero(int64_t off) { std::memset(raw.data() + off * type_bytes(t), 0, type_bytes(t)); }
+  float get(int64_t off) const {
+    if (is_fp4(t)) return fp4_value((raw[(size_t)off / 2] >> (4 * (off & 1))) & 15);
+    return load(raw.data() + off * type_bytes(t), t);
+  }
+  void zero(int64_t off) {
+    if (is_fp4(t)) { raw[(size_t)off / 2] &= (uint8_t)~(0xF << (4 * (off & 1))); return; }
+    std::memset(raw.data() + off * type_bytes(t), 0, type_bytes(t));
+  }
 };
 
+// FP4 is sparse in pairs: of every 8 consecutive values along K (four pairs of neighbours) two pairs are kept
+// (4:8, the format of sm_120's mma.sp for 4-bit types). STRIP keeps the two pairs of larger L1 norm, the earlier
+// one on a tie (measured: all 1024 groups of dims/e2m1_64x64x128 on an RTX PRO 6000, ties included).
+unsigned fp4_strip_mask(const float* g) {
+  float norm[4];
+  int idx[4];
+  for (int q = 0; q < 4; ++q) { norm[q] = std::fabs(g[2 * q]) + std::fabs(g[2 * q + 1]); idx[q] = q; }
+  std::stable_sort(idx, idx + 4, [&](int a, int b) { return norm[a] > norm[b]; });
+  return (1u << idx[0]) | (1u << idx[1]);
+}
+// The two pairs a group is compressed to: its nonzero ones, padded from the right as the 16-bit and 8-bit
+// types are (unmeasured for pairs).
+void kept_pairs(const float* g, int& p0, int& p1) {
+  int nz[4], n = 0;
+  for (int q = 0; q < 4; ++q)
+    if (g[2 * q] != 0.f || g[2 * q + 1] != 0.f) nz[n++] = q;
+  if (n >= 2) { p0 = nz[0]; p1 = nz[1]; }
+  else if (n == 1) { p0 = nz[0] == 3 ? 2 : nz[0]; p1 = 3; }
+  else { p0 = 2; p1 = 3; }
+}
+
 void prune_batch(const SparseView& v, int alg, Dense& m) {
+  if (is_fp4(m.t)) {
+    for (int64_t i = 0; i < v.nk; ++i)
+      for (int64_t kk = 0; kk < v.k; kk += 8) {
+        float vals[8];
+        for (int j = 0; j < 8; ++j) vals[j] = m.get(v.at(i, kk + j));
+        const unsigned keep = fp4_strip_mask(vals);
+        for (int j = 0; j < 8; ++j)
+          if (!(keep >> (j / 2) & 1)) m.zero(v.at(i, kk + j));
+      }
+    return;
+  }
   const int g = m.t == CUDA_R_32F ? 2 : 4;
   if (alg == CUSPARSELT_PRUNE_SPMMA_STRIP) {
     for (int64_t i = 0; i < v.nk; ++i)
@@ -672,6 +743,16 @@ void prune_batch(const SparseView& v, int alg, Dense& m) {
 }
 
 bool batch_valid(const SparseView& v, const Dense& m) {
+  if (is_fp4(m.t)) {
+    for (int64_t i = 0; i < v.nk; ++i)
+      for (int64_t kk = 0; kk < v.k; kk += 8) {
+        int pairs = 0;
+        for (int q = 0; q < 4; ++q)
+          pairs += m.get(v.at(i, kk + 2 * q)) != 0.f || m.get(v.at(i, kk + 2 * q + 1)) != 0.f;
+        if (pairs > 2) return false;
+      }
+    return true;
+  }
   const int g = m.t == CUDA_R_32F ? 2 : 4;
   for (int64_t i = 0; i < v.nk; ++i)
     for (int64_t kk = 0; kk < v.k; kk += g) {
@@ -686,30 +767,56 @@ bool batch_valid(const SparseView& v, const Dense& m) {
 }
 
 // The bytes a stored matrix of one batch spans, from its first element.
-size_t span_bytes(const MatImpl& m) { return (size_t)matrix_elems(m) * type_bytes(m.type); }
+size_t span_bytes(const MatImpl& m) { return elems_bytes(m.type, matrix_elems(m)); }
 
 bool load_batch(const MatImpl& m, const void* base, int64_t b, Dense& out) {
   out.t = m.type;
   out.raw.assign(span_bytes(m), 0);
-  const uint8_t* p = static_cast<const uint8_t*>(base) + (size_t)(b * m.stride) * type_bytes(m.type);
+  const uint8_t* p = static_cast<const uint8_t*>(base) + elems_bytes(m.type, b * m.stride);
   return read_bytes(out.raw.data(), p, out.raw.size());
 }
 
 // Writes back only the matrix's elements: the gaps between leading-dimension
 // rows and between batches are left alone (measured: Prune2 leaves them).
 bool store_batch(const MatImpl& m, void* base, int64_t b, const Dense& in) {
-  uint8_t* p = static_cast<uint8_t*>(base) + (size_t)(b * m.stride) * type_bytes(m.type);
-  const size_t es = type_bytes(m.type);
+  uint8_t* p = static_cast<uint8_t*>(base) + elems_bytes(m.type, b * m.stride);
   const int64_t nl = lines(m), len = m.order == CUSPARSE_ORDER_ROW ? m.cols : m.rows;
   if (len == m.ld) return write_bytes(p, in.raw.data(), in.raw.size());
   for (int64_t l = 0; l < nl; ++l)
-    if (!write_bytes(p + (size_t)(l * m.ld) * es, in.raw.data() + (size_t)(l * m.ld) * es, (size_t)len * es))
+    if (!write_bytes(p + elems_bytes(m.type, l * m.ld), in.raw.data() + elems_bytes(m.type, l * m.ld),
+                     elems_bytes(m.type, len)))
       return false;
   return true;
 }
 
 std::vector<uint8_t> compress_batch(const SparseView& v, const Dense& m) {
   const int t = m.t;
+  if (is_fp4(t)) {
+    // [kept nibbles: nk x k/2, in the input's memory orientation][one code per group of eight: pair0 | pair1 << 2]
+    std::vector<uint8_t> out(view_batch_bytes(v), 0);
+    std::vector<uint8_t> meta(view_meta_bytes(v), 0xEE);
+    MetaCodec mc{t, v.nk, v.k, meta.size()};
+    const int64_t half = v.k / 2;
+    auto put = [&](int64_t i, int64_t c, uint8_t nib) {
+      const int64_t off = v.k_contiguous() ? i * half + c : c * v.nk + i;
+      uint8_t& b = out[(size_t)off / 2];
+      b = (uint8_t)((b & ~(0xF << (4 * (off & 1)))) | (nib << (4 * (off & 1))));
+    };
+    for (int64_t i = 0; i < v.nk; ++i)
+      for (int64_t gi = 0; gi < v.k / 8; ++gi) {
+        float g[8];
+        int64_t off[8];
+        for (int j = 0; j < 8; ++j) { off[j] = v.at(i, 8 * gi + j); g[j] = m.get(off[j]); }
+        int p0, p1;
+        kept_pairs(g, p0, p1);
+        const int pick[4] = {2 * p0, 2 * p0 + 1, 2 * p1, 2 * p1 + 1};
+        for (int j = 0; j < 4; ++j)
+          put(i, 4 * gi + j, (uint8_t)((m.raw[(size_t)off[pick[j]] / 2] >> (4 * (off[pick[j]] & 1))) & 15));
+        set_nibble(meta, mc.index(i, gi, 0), (uint8_t)(p0 | (p1 << 2)));
+      }
+    std::memcpy(out.data() + values_bytes(t, v.nk, v.k), meta.data(), meta.size());
+    return out;
+  }
   const size_t es = type_bytes(t);
   const size_t vb = values_bytes(t, v.nk, v.k);
   std::vector<uint8_t> out(view_batch_bytes(v), 0);
@@ -757,6 +864,25 @@ std::vector<uint8_t> compress_batch(const SparseView& v, const Dense& m) {
 std::vector<float> decompress_batch(const SparseView& v, const uint8_t* c) {
   const int t = v.m->type;
   const int64_t nk = v.nk, k = v.k;
+  if (is_fp4(t)) {
+    const size_t vb = values_bytes(t, nk, k);
+    std::vector<uint8_t> meta(c + vb, c + vb + view_meta_bytes(v));
+    MetaCodec mc{t, nk, k, meta.size()};
+    const int64_t half = k / 2;
+    std::vector<float> L((size_t)(nk * k), 0.f);
+    for (int64_t i = 0; i < nk; ++i)
+      for (int64_t gi = 0; gi < k / 8; ++gi) {
+        const uint8_t code = get_nibble(meta, mc.index(i, gi, 0));
+        const int p[2] = {code & 3, (code >> 2) & 3};
+        for (int h = 0; h < 2; ++h)
+          for (int e = 0; e < 2; ++e) {
+            const int64_t col = 4 * gi + 2 * h + e;
+            const int64_t off = v.k_contiguous() ? i * half + col : col * nk + i;
+            L[(size_t)(i * k + 8 * gi + 2 * p[h] + e)] += fp4_value((c[(size_t)off / 2] >> (4 * (off & 1))) & 15);
+          }
+      }
+    return L;
+  }
   const bool k_contiguous = v.k_contiguous();
   const size_t es = type_bytes(t);
   const size_t vb = values_bytes(t, nk, k);
@@ -902,6 +1028,7 @@ size_t workspace_bytes(const MatmulImpl& d) {
   // byte per output element, a quarter for fp32). The simulator uses none of it.
   const bool a = d.A.structured;
   const MatImpl& S = a ? d.A : d.B;
+  if (sm120() && (is_fp8(S.type) || is_fp4(S.type))) return 0;   // measured on an RTX PRO 6000: no workspace for FP8 or FP4
   return view_buffer_bytes(sparse_view(S, a, a ? d.opA : d.opB, true)) * (size_t)compressed_batches(S);
 }
 
@@ -949,6 +1076,72 @@ float gelu(float x) {
   return 0.5f * x * (1.f + std::tanh(u));
 }
 
+// ---- block scales (measured on an RTX PRO 6000, sm_120; nvidia/tests/data/lowprec/sparselt.rtx-pro-6000-server.txt) ----
+//
+// A scale tensor holds one scale per row of op(A) (column of op(B)) and block of logical K, in the tiled layout the
+// block-scaled cuBLASLt modes use: 128 rows by four blocks to a tile, rows interleaved 32 at a time, so row r's block b
+// is at byte ((b / 4) * 4 + (r / 128) * round_up(blocks, 4)) * 128 + (r % 32) * 16 + (r % 128 / 32) * 4 + b % 4.
+//   * FP8 operands with a block mode on A or B (either one: VEC32_UE4M3 and VEC64_UE8M0 gave the same result for the
+//     same bytes): the scales are UE8M0 (2^(byte - 127)) per 64 values of K. With any other mode the pointers are
+//     not read, as on the L4;
+//   * FP4 operands: the scales are always an unsigned E4M3 per 32 values of K, whatever the modes say (SCALAR with a
+//     64-byte buffer of floats is read as a tiled tensor and finds zeros beyond it; VEC64_UE8M0 reads the same
+//     bytes as E4M3, so a 0x7F byte makes a NaN: 135 cells of the probe's 16384 survive it);
+//   * the product is summed per block of K, the sum is scaled, rounded toward zero to fp32 and added into the
+//     accumulator, which rounds toward zero as well (the tensor core's way; a zero result is +0). A scale or
+//     product below fp32's denormals thus vanishes, as the card's does; 14 of the 16384 cells of the FP8 VEC32
+//     probe, whose scales are all denormal-sized, end one denormal bit or one sign of zero away from the card's.
+// An operand with no block scale has scale 1; a missing scale pointer is read as all ones (neither measured).
+struct BlockScales {
+  bool on = false;
+  int64_t block = 64;                       // K per accumulation step
+  std::vector<double> sa, sb;               // sa[row * steps + step], sb[column * steps + step]
+};
+
+double ue4m3_value(uint8_t b) { return b == 0x7f ? NAN : fp8_to_float((uint8_t)(b & 0x7f), true); }
+
+bool is_block_mode(int mode) {
+  return mode == CUSPARSELT_MATMUL_MATRIX_SCALE_VEC32_UE4M3 || mode == CUSPARSELT_MATMUL_MATRIX_SCALE_VEC64_UE8M0;
+}
+
+// x rounded toward zero to fp32 (denormals included); zero is +0.
+float rz_to_float(double x) {
+  if (std::isnan(x)) { uint32_t b = 0x7fffffffu; float f; std::memcpy(&f, &b, 4); return f; }
+  float f = (float)x;
+  if (std::isinf(f) && !std::isinf(x)) f = std::nextafterf(f, 0.f);
+  else if (std::fabs((double)f) > std::fabs(x)) f = std::nextafterf(f, 0.f);
+  return f == 0.f ? 0.f : f;
+}
+
+// Reads A's or B's scale tensor (`outer` rows of op(A), or columns of op(B)) into per-step scales.
+bool read_block_scales(const MatmulImpl& d, int which, int64_t outer, int64_t k, int elem, const BlockScales& bs,
+                       std::vector<double>& out) {
+  const int64_t steps = (k + bs.block - 1) / bs.block;
+  out.assign((size_t)(outer * steps), 1.0);
+  const bool fp4 = is_fp4(elem);
+  if (!d.scale_ptr[which] || !(fp4 || is_block_mode(d.scale_mode[which]))) return true;
+  const int64_t blk = fp4 ? 32 : 64, nblk = (k + blk - 1) / blk, dim = (nblk + 3) / 4 * 4;
+  std::vector<uint8_t> raw((size_t)((outer + 127) / 128 * 128 * dim));
+  if (!read_bytes(raw.data(), d.scale_ptr[which], raw.size())) return false;
+  for (int64_t r = 0; r < outer; ++r)
+    for (int64_t st = 0; st < steps; ++st) {
+      const int64_t b = st * bs.block / blk;
+      const size_t off = (size_t)(((b / 4) * 4 + (r / 128) * dim) * 128 + (r % 32) * 16 + (r % 128 / 32) * 4 + b % 4);
+      out[(size_t)(r * steps + st)] = fp4 ? ue4m3_value(raw[off]) : (raw[off] == 255 ? NAN : std::ldexp(1.0, (int)raw[off] - 127));
+    }
+  return true;
+}
+
+BlockScales block_scales(const MatmulImpl& d, int64_t m, int64_t n, int64_t k, bool& ok) {
+  BlockScales bs;
+  ok = true;
+  if (!sm120() || !(is_fp4(d.A.type) || is_block_mode(d.scale_mode[0]) || is_block_mode(d.scale_mode[1]))) return bs;
+  bs.on = true;
+  bs.block = is_fp4(d.A.type) ? 32 : 64;
+  ok = read_block_scales(d, 0, m, k, d.A.type, bs, bs.sa) && read_block_scales(d, 1, n, k, d.B.type, bs, bs.sb);
+  return bs;
+}
+
 Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
   const MatmulImpl& d = plan.md;
   const bool sparseA = d.A.structured;
@@ -957,6 +1150,10 @@ Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
   const int64_t m = d.C.rows, n = d.C.cols, k = sv.k;
   const int t = d.A.type, ot = d.C.type;
   const bool int8 = t == CUDA_R_8I;
+  const bool narrow_zero_positive = sm120() && (is_fp8(t) || is_fp4(t));
+  bool scales_ok = true;
+  const BlockScales bs = block_scales(d, m, n, k, scales_ok);
+  if (!scales_ok) return CUSPARSE_STATUS_EXECUTION_FAILED;
   const size_t cbytes = view_batch_bytes(sv);
   // Per-row alpha and beta: a device vector of m floats each. Measured: with
   // alpha-vector scaling and no beta vector, beta is not applied at all; a
@@ -1023,6 +1220,20 @@ Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
           for (int64_t j = 0; j < n; ++j) acc[(size_t)j] += a * (double)brow[j];
         }
       }
+      if (bs.on) {   // block-scaled: per step of K, summed, scaled, rounded toward zero (see BlockScales)
+        const int64_t steps = (k + bs.block - 1) / bs.block;
+        for (int64_t j = 0; j < n; ++j) {
+          float a32 = 0.f;
+          for (int64_t st = 0; st < steps; ++st) {
+            double pk = 0.0;
+            for (int64_t kk = st * bs.block; kk < std::min(k, (st + 1) * bs.block); ++kk)
+              pk += (double)arow[kk] * (double)Bf[(size_t)(kk * n + j)];
+            const double ts = pk * bs.sa[(size_t)(i * steps + st)] * bs.sb[(size_t)(j * steps + st)];
+            a32 = rz_to_float((double)a32 + (double)rz_to_float(ts));
+          }
+          acc[(size_t)j] = (double)a32;
+        }
+      }
       for (int64_t j = 0; j < n; ++j) {
         // int32 accumulation wraps; fp32 accumulation is rounded once here.
         const float x = int8 ? (float)(int32_t)(uint32_t)(uint64_t)iacc[(size_t)j] : (float)acc[(size_t)j];
@@ -1036,7 +1247,8 @@ Status run_matmul(const PlanImpl& plan, const Scalars& sc, const Operands& o) {
           // Measured: at or below the threshold the result is a zero of the
           // value's sign (-0 for a negative value in fp16), and above it the
           // upper bound clamps.
-          if (v <= d.relu_th || std::isnan(v)) v = std::copysign(0.f, v);
+          // (sm_120's FP8 and FP4 kernels give +0 for a negative value, whatever the output type.)
+          if (v <= d.relu_th || std::isnan(v)) v = narrow_zero_positive ? (std::isnan(v) ? v : 0.f) : std::copysign(0.f, v);
           else v = std::min(v, d.relu_ub);
         }
         store(D.raw.data() + (size_t)offset_of(d.D, i, j) * oes, ot, v);
@@ -1052,7 +1264,7 @@ cudaStream_t first_stream(cudaStream_t* streams, int32_t n) { return n > 0 && st
 
 Status matmul_call(const char* api, const cusparseLtHandle_t* handle, const cusparseLtMatmulPlan_t* plan,
                    const void* alpha, const void* d_A, const void* d_B, const void* beta, const void* d_C,
-                   void* d_D, cudaStream_t* streams, int32_t numStreams) {
+                   void* d_D, cudaStream_t* streams, int32_t numStreams, bool search = false) {
   if (Status s = check_handle(api, handle)) return s;
   const PlanImpl* p = plan_of(plan);
   if (!plan) return bad_arg(api, 2, "plan", "NULL pointer");
@@ -1065,6 +1277,8 @@ Status matmul_call(const char* api, const cusparseLtHandle_t* handle, const cusp
   if (!d_D) return bad_arg(api, 8, "d_D", "NULL pointer");
   if (numStreams < 0) return bad_arg(api, 11, "numStreams", std::to_string(numStreams));
   if (numStreams > 0 && !streams) return bad_arg(api, 10, "streams", "NULL pointer");
+  // Measured on an RTX PRO 6000: the search over an FP8 or FP4 plan succeeds and leaves D as it was.
+  if (search && sm120() && (is_fp8(p->md.A.type) || is_fp4(p->md.A.type))) return CUSPARSE_STATUS_SUCCESS;
   Scalars sc{1.f, 0.f, nullptr, nullptr};
   if (p->md.alpha_vec) sc.alpha_vec = alpha;
   else if (!read_bytes(&sc.alpha, alpha, 4)) return CUSPARSE_STATUS_EXECUTION_FAILED;
@@ -1092,6 +1306,8 @@ int64_t input_batches(const MatImpl& m) { return m.stride == 0 ? 1 : m.batches; 
 Status prune_call(const char* api, const SparseTarget& tg, const void* d_in, void* d_out, int alg,
                   cudaStream_t stream) {
   if (!compressible_type(tg.m.type)) return refuse(api, std::string("pruning ") + type_name(tg.m.type) + " values");
+  if (is_fp4(tg.m.type) && alg == CUSPARSELT_PRUNE_SPMMA_TILE)
+    return refuse(api, "SPMMA_TILE pruning of FP4 values (only STRIP was measured)");
   const SparseTarget g = tg;
   return in_stream_order(stream, [g, d_in, d_out, alg] {
     const SparseView v = sparse_view(g.m, g.isA, g.op);
@@ -1150,7 +1366,7 @@ Status sizes(const char* api, const SparseTarget& g, size_t* compressedSize, siz
   // them all.
   const SparseView v = sparse_view(g.m, g.isA, g.op, g.plan);
   *compressedSize = view_batch_bytes(v) * (size_t)compressed_batches(g.m);
-  *bufferSize = view_buffer_bytes(v) * (size_t)compressed_batches(g.m);
+  *bufferSize = view_buffer_bytes(v) * (sm120() && (is_fp8(g.m.type) || is_fp4(g.m.type)) ? 1 : (size_t)compressed_batches(g.m));
   return CUSPARSE_STATUS_SUCCESS;
 }
 
@@ -1431,7 +1647,10 @@ cusparseStatus_t cusparseLtMatmulDescSetAttribute(const cusparseLtHandle_t* hand
     return CUSPARSE_STATUS_SUCCESS;
   };
   // Measured on an L4: GELU takes int8 into int8, and E4M3 or E5M2 into bf16 (no other output, no fp16 or fp32).
-  const bool gelu_ok = (d->A.type == CUDA_R_8I && d->C.type == CUDA_R_8I) || (is_fp8(d->A.type) && d->C.type == CUDA_R_16BF && sm_of_current_device() >= 89);   // (an RTX 3060 refuses it)
+  // On an RTX PRO 6000 (sm_120) GELU takes E4M3 and E5M2 into fp16, bf16 and fp32 alike.
+  const bool gelu_ok = (d->A.type == CUDA_R_8I && d->C.type == CUDA_R_8I) ||
+                       (is_fp8(d->A.type) && d->C.type == CUDA_R_16BF && sm_of_current_device() >= 89) ||
+                       (is_fp8(d->A.type) && sm120() && (d->C.type == CUDA_R_16F || d->C.type == CUDA_R_32F));   // (an RTX 3060 refuses it)
   int32_t iv = 0;
   switch (a) {
     case CUSPARSELT_MATMUL_ACTIVATION_RELU:
@@ -1543,9 +1762,16 @@ cusparseStatus_t cusparseLtMatmulAlgSelectionInit(const cusparseLtHandle_t* hand
   const int sm = sm_of_current_device();
   if (is_fp8(d->A.type) && sm > 0 && sm < 89) return refuse(api, "FP8 kernels (sm_89 and later)");
   if (d->A.type == kR4F_E2M1 && sm > 0 && sm < 100) return refuse(api, "FP4 kernels (Blackwell: sm_100 and later)");
-  for (int i = 0; i < 5; ++i)
-    if (d->scale_mode[i] == CUSPARSELT_MATMUL_MATRIX_SCALE_VEC32_UE4M3 || d->scale_mode[i] == CUSPARSELT_MATMUL_MATRIX_SCALE_VEC64_UE8M0)
-      return refuse(api, "block-scaled matmuls (not implemented here; sm_86 and sm_89 refuse them too)");
+  // Measured: a block scale mode (VEC32/VEC64) on A or B is taken on an sm_120 card (see block_scales), and
+  // refused on the others by the card; D's and C's block modes are not implemented anywhere.
+  for (int i = 0; i < 5; ++i) {
+    if (!is_block_mode(d->scale_mode[i])) continue;
+    if (sm != 120) return refuse(api, "block-scaled matmuls (not implemented here; sm_86 and sm_89 refuse them too)");
+    if (i >= 2) return refuse(api, "block scales on C, D or D's output (not implemented here)");
+    // Measured on an RTX PRO 6000: only E4M3 and E2M1 operands take them (E5M2, fp16 and int8 are refused here).
+    if (d->A.type != kR8F_E4M3 && !is_fp4(d->A.type))
+      return refuse(api, "block-scaled matmuls of this type (E4M3 and E2M1 only)");
+  }
   std::memset(algSelection, 0, sizeof *algSelection);
   AlgImpl* a = impl<AlgImpl>(algSelection);
   a->magic = kAlgMagic;
@@ -1683,7 +1909,7 @@ cusparseStatus_t cusparseLtMatmulSearch(const cusparseLtHandle_t* handle, cuspar
                                         const void* d_C, void* d_D, void* workspace, cudaStream_t* streams,
                                         int32_t numStreams) {
   (void)workspace;
-  return matmul_call("cusparseLtMatmulSearch", handle, plan, alpha, d_A, d_B, beta, d_C, d_D, streams, numStreams);
+  return matmul_call("cusparseLtMatmulSearch", handle, plan, alpha, d_A, d_B, beta, d_C, d_D, streams, numStreams, true);
 }
 
 // ---- pruning ----
