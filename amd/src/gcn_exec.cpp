@@ -159,7 +159,12 @@ template <typename T>
 bool matches_class(T f, uint32_t mask) {
   const bool negative = std::signbit(f);
   uint32_t bit = 0;
-  if (std::isnan(f)) bit = 1u << 1;                       // a quiet NaN; nothing here signals
+  // A NaN is signaling where the top bit of its mantissa is clear (bit 0 of the mask), quiet where it is set (bit 1).
+  const auto signaling = [&] {
+    if constexpr (sizeof(T) == 4) return !(std::bit_cast<uint32_t>(f) & 0x400000u);
+    else return !(std::bit_cast<uint64_t>(f) & (1ull << 51));
+  };
+  if (std::isnan(f)) bit = signaling() ? 1u << 0 : 1u << 1;
   else if (std::isinf(f)) bit = negative ? 1u << 2 : 1u << 9;
   else if (f == 0) bit = negative ? 1u << 5 : 1u << 6;
   else if (std::fpclassify(f) == FP_SUBNORMAL) bit = negative ? 1u << 4 : 1u << 7;
@@ -172,6 +177,7 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
   uint16_t bits;
   std::memcpy(&bits, &h, 2);
   const bool negative = bits >> 15, subnormal = (bits & 0x7C00) == 0 && (bits & 0x3FF) != 0;
+  if ((bits & 0x7C00) == 0x7C00 && (bits & 0x3FF)) return (mask & ((bits & 0x200) ? 1u << 1 : 1u << 0)) != 0;   // a NaN: quiet if bit 9 is set
   if (!subnormal) return matches_class(static_cast<float>(h), mask);
   return (mask & (negative ? 1u << 4 : 1u << 7)) != 0;
 }
@@ -573,6 +579,9 @@ struct Machine {
         throw Error::make(Err::Unsupported, "reading ", operand_text(o), ", which this does not model");
       case OperandKind::Vgpr:
       case OperandKind::Agpr:
+        // (A scalar instruction's source is an SGPR or a constant; the assembler lets a VGPR through, and the ISA says
+        // nothing about what the hardware does with one.)
+        throw Error::make(Err::Unsupported, "a vector register read as a scalar operand, which the ISA does not define");
       case OperandKind::None: break;
     }
     throw Error::make(Err::Internal, "a scalar operand this does not read");
@@ -749,6 +758,13 @@ struct Machine {
   // A half result, which fills the low half of the register and zeroes the
   // high half, as every 16-bit instruction here does.
   void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
+    // The output multiplier and the clamp apply to a half result as to a single one.
+    if (in.omod || in.clamp) {
+      float f = static_cast<float>(v);
+      if (in.omod) f *= in.omod == 1 ? 2.0f : in.omod == 2 ? 4.0f : 0.5f;
+      if (in.clamp) f = clamp01(f);
+      v = static_cast<_Float16>(f);
+    }
     uint16_t bits = 0;
     std::memcpy(&bits, &v, 2);
     write_lane(w, in.dst[0], lane, bits);
@@ -838,16 +854,19 @@ struct Machine {
     if (o.abs) d = std::fabs(d);
     return o.neg ? -d : d;
   }
+  // A float held to [0, 1] as the clamp bit does: a NaN and a -0 both become +0.
+  static float clamp01(float v) { return std::isnan(v) || v <= 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+  static double clamp01(double v) { return std::isnan(v) || v <= 0.0 ? 0.0 : v > 1.0 ? 1.0 : v; }
   // A float result, held to [0, 1] where the instruction asked for it.
   void write_float(Wave& w, const Inst& in, uint32_t lane, float v) {
     // The output multiplier, then the clamp, as the ISA orders them.
     if (in.omod) v *= in.omod == 1 ? 2.0f : in.omod == 2 ? 4.0f : 0.5f;
-    if (in.clamp) v = std::isnan(v) ? 0.0f : std::fmin(1.0f, std::fmax(0.0f, v));
+    if (in.clamp) v = clamp01(v);
     write_lane(w, in.dst[0], lane, as_bits(v));
   }
   void write_double(Wave& w, const Inst& in, uint32_t lane, double v) {
     if (in.omod) v *= in.omod == 1 ? 2.0 : in.omod == 2 ? 4.0 : 0.5;
-    if (in.clamp) v = std::isnan(v) ? 0.0 : std::fmin(1.0, std::fmax(0.0, v));
+    if (in.clamp) v = clamp01(v);
     write_lane64(w, in.dst[0], lane, as_bits(v));
   }
   // An accumulation register is written the first time a kernel uses one, so
@@ -954,8 +973,8 @@ struct Machine {
     if (op == "s_add_f32"_op) put(x + y);
     else if (op == "s_sub_f32"_op) put(x - y);
     else if (op == "s_mul_f32"_op) put(x * y);
-    else if (op == "s_min_num_f32"_op || op == "s_min_f32"_op) put(std::fmin(x, y));
-    else if (op == "s_max_num_f32"_op || op == "s_max_f32"_op) put(std::fmax(x, y));
+    else if (op == "s_min_num_f32"_op || op == "s_min_f32"_op) put(hw_min(in, x, y));
+    else if (op == "s_max_num_f32"_op || op == "s_max_f32"_op) put(hw_max(in, x, y));
     else if (op == "s_fmac_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.dst[0])))));
     else if (op == "s_fmaak_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));
     else if (op == "s_fmamk_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));
@@ -990,8 +1009,8 @@ struct Machine {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(ieee_minmax(hb(0), hb(1), 5, 10, op == "s_maximum_f16"_op)));
     } else if (op == "s_cvt_pk_rtz_f16_f32"_op)
       write_scalar(w, in.dst[0], uint32_t{half_toward_zero(x)} | uint32_t{half_toward_zero(y)} << 16);
-    else if (op == "s_min_num_f16"_op) put_h(hs(0) < hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
-    else if (op == "s_max_num_f16"_op) put_h(hs(0) > hs(1) || hs(1) != hs(1) ? hs(0) : hs(1));
+    else if (op == "s_min_num_f16"_op) put_h(static_cast<_Float16>(num_min(static_cast<float>(hs(0)), static_cast<float>(hs(1)))));
+    else if (op == "s_max_num_f16"_op) put_h(static_cast<_Float16>(num_max(static_cast<float>(hs(0)), static_cast<float>(hs(1)))));
     else return false;
     return true;
   }
@@ -1090,8 +1109,12 @@ struct Machine {
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
     } else if (op == "s_absdiff_i32"_op) {
-      const int64_t d = int64_t{static_cast<int32_t>(a)} - static_cast<int32_t>(b);
-      const uint32_t r = static_cast<uint32_t>(d < 0 ? -d : d);
+      // gfx1250's (CDNA5 ISA): 32-bit arithmetic, so the difference wraps, as does its negation. The older instruction is
+      // worked out in 64 bits here, which its tests keep.
+      const uint32_t d = static_cast<uint32_t>(a) - static_cast<uint32_t>(b);
+      const int64_t wide_d = int64_t{static_cast<int32_t>(a)} - static_cast<int32_t>(b);
+      const uint32_t r = in.arch == gcn::Target::Gfx1250 ? (static_cast<int32_t>(d) < 0 ? 0u - d : d)
+                                                         : static_cast<uint32_t>(wide_d < 0 ? -wide_d : wide_d);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
     } else if (op == "s_bcnt1_i32_b64"_op) {
@@ -1253,7 +1276,7 @@ struct Machine {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(a))));
     } else if (op == "s_max_u32"_op) {
       const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
-      w.scc = x > y;
+      w.scc = in.arch == gcn::Target::Gfx1250 ? x >= y : x > y;   // (gfx1250: SCC = S0 >= S1, so a tie sets it)
       write_scalar(w, in.dst[0], w.scc ? x : y);
     } else if (op == "s_lshl1_add_u32"_op || op == "s_lshl2_add_u32"_op || op == "s_lshl3_add_u32"_op ||
                op == "s_lshl4_add_u32"_op) {
@@ -1368,7 +1391,7 @@ struct Machine {
     } else if (op == "s_min_i32"_op || op == "s_max_i32"_op) {
       // SCC says whether the first source was the one kept.
       const int32_t x = static_cast<int32_t>(a), y = static_cast<int32_t>(b);
-      w.scc = op == "s_min_i32"_op ? x < y : x > y;
+      w.scc = op == "s_min_i32"_op ? x < y : in.arch == gcn::Target::Gfx1250 ? x >= y : x > y;
       write_scalar(w, in.dst[0], static_cast<uint32_t>(w.scc ? x : y));
     } else if (op == "s_min_u32"_op) {
       const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
@@ -1386,7 +1409,7 @@ struct Machine {
       const uint32_t start = static_cast<uint32_t>(b) & 31, width = (static_cast<uint32_t>(b) >> 16) & 0x7F;
       int32_t v = 0;
       if (width) {
-        const uint32_t field = static_cast<uint32_t>(a) >> start;
+        const uint32_t field = static_cast<uint32_t>(static_cast<int32_t>(a) >> start);
         v = width >= 32 ? static_cast<int32_t>(field)
                         : static_cast<int32_t>(field << (32 - width)) >> (32 - width);
       }
@@ -1398,7 +1421,7 @@ struct Machine {
       const bool wide = op == "s_bfe_i64"_op;
       const uint32_t start = static_cast<uint32_t>(b) & (wide ? 63 : 31), width = (static_cast<uint32_t>(b) >> 16) & 0x7F;
       const uint32_t bits = wide ? 64 : 32;
-      uint64_t v = (wide ? a : static_cast<uint32_t>(a)) >> start;
+      uint64_t v = wide ? static_cast<uint64_t>(static_cast<int64_t>(a) >> start) : static_cast<uint32_t>(a) >> start;
       if (width == 0) v = 0;
       else if (width < bits) {
         v &= (uint64_t{1} << width) - 1;
@@ -1552,6 +1575,8 @@ struct Machine {
     else if (op == "s_cmp_le_u32"_op) w.scc = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
     else if (op == "s_bitcmp0_b32"_op) w.scc = ((a >> (b & 31)) & 1) == 0;
     else if (op == "s_bitcmp1_b32"_op) w.scc = ((a >> (b & 31)) & 1) == 1;
+    else if (op == "s_bitcmp0_b64"_op) w.scc = ((a >> (b & 63)) & 1) == 0;
+    else if (op == "s_bitcmp1_b64"_op) w.scc = ((a >> (b & 63)) & 1) == 1;
     else throw Error::make(Err::Unsupported, "scalar comparison ", op, " is decoded but not implemented");
   }
 
@@ -1913,7 +1938,10 @@ struct Machine {
           const int64_t c = static_cast<int32_t>(u(2, lane));
           write_lane(w, in.dst[0], lane, static_cast<uint32_t>(is_max ? std::max(sum, c) : std::min(sum, c)));
         } else {
-          const uint64_t sum = std::min<uint64_t>(uint64_t{u(0, lane)} + u(1, lane), 0xFFFFFFFFu);
+          // (The unsigned sum wraps: the Expression is v_min_u32(v_add_nc_u32(...)), and AMD's compiler emits the
+          // instruction for `min(a + b, c)` over wrapping unsigned values -- rocPRIM's radix sort among them. The prose
+          // says "clamped"; the signed forms keep that reading, for which nothing contradicts it.)
+          const uint64_t sum = static_cast<uint32_t>(u(0, lane) + u(1, lane));
           const uint64_t c = u(2, lane);
           write_lane(w, in.dst[0], lane, static_cast<uint32_t>(is_max ? std::max(sum, c) : std::min(sum, c)));
         }
@@ -1953,14 +1981,15 @@ struct Machine {
         else if (op == "v_rsq_bf16"_op) r = 1.0f / std::sqrt(x);
         else if (op == "v_log_bf16"_op) r = std::log2(x);
         else if (op == "v_exp_bf16"_op) r = std::exp2(x);
-        else if (op == "v_sin_bf16"_op) r = std::sin(x * 6.283185307179586f);
-        else r = std::cos(x * 6.283185307179586f);
+        else r = turns_trig(static_cast<double>(x), op == "v_sin_bf16"_op);
         write_lane(w, in.dst[0], lane, to_bf16(r));
       });
     } else if (op == "v_cvt_f16_fp8"_op || op == "v_cvt_f16_bf8"_op) {
       const F8& t = op == "v_cvt_f16_fp8"_op ? fp8() : bf8();
       each([&](uint32_t lane) {
-        write_half(w, in, lane, static_cast<_Float16>(f8_to_float(u(0, lane) & 0xFF, t)));
+        // The byte is OPSEL[0:1] -- "OPSEL bits are reversed": bit 0 is the high one of the pair -- times eight.
+        const uint32_t shift = 8 * (((in.op_sel & 1) << 1) | ((in.op_sel >> 1) & 1));
+        write_half(w, in, lane, static_cast<_Float16>(f8_to_float(u(0, lane) >> shift & 0xFF, t)));
       });
     } else if (op == "v_cvt_pk_f16_fp8"_op || op == "v_cvt_pk_f16_bf8"_op) {
       const F8& t = op == "v_cvt_pk_f16_fp8"_op ? fp8() : bf8();
@@ -2027,8 +2056,10 @@ struct Machine {
       });
     } else if (op == "v_add_nc_i16"_op || op == "v_sub_nc_i16"_op) {
       each([&](uint32_t lane) {
-        const uint32_t a = u(0, lane), b = u(1, lane);
-        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_add_nc_i16"_op ? a + b : a - b));
+        const int32_t a = static_cast<int16_t>(u(0, lane)), b = static_cast<int16_t>(u(1, lane));
+        int32_t r = op == "v_add_nc_i16"_op ? a + b : a - b;
+        if (in.clamp) r = std::clamp(r, -32768, 32767);
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(r));
       });
     } else if (op == "v_max_i16"_op || op == "v_min_i16"_op) {
       each([&](uint32_t lane) {
@@ -2245,7 +2276,7 @@ struct Machine {
           return o.neg ? -f : f;
         };
         float r = std::fma(source(0), source(1), source(2));
-        if (in.clamp) r = std::isnan(r) ? 0.0f : std::fmin(1.0f, std::fmax(0.0f, r));
+        if (in.clamp) r = clamp01(r);
         if (op == "v_fma_mix_f32_bf16"_op) {
           write_lane(w, in.dst[0], lane, as_bits(r));
           return;
@@ -2411,7 +2442,7 @@ struct Machine {
         if (op == "v_fmamk_f16"_op) {
           b = static_cast<float>(lane_half(w, in.src[1], lane));
           c = static_cast<float>(lane_half(w, in.src[2], lane));
-          std::swap(b, c);   // v_fmamk_f16 d, a, K, c: a * K + c
+          // (the operands are a, K, c: a * K + c)
         } else {
           b = static_cast<float>(lane_half(w, in.src[1], lane));
           if (op == "v_fmaak_f16"_op) {
@@ -3195,10 +3226,13 @@ struct Machine {
         for (uint32_t h = 0; h < 2; ++h) {
           const uint16_t x = packed_bits(w, in, 0, h, lane), y = packed_bits(w, in, 1, h, lane);
           const int16_t sx = static_cast<int16_t>(x), sy = static_cast<int16_t>(y);
-          int32_t v;
-          if (name == "v_pk_mul_lo_u16") v = x * y;
-          else if (name == "v_pk_add_u16" || name == "v_pk_add_i16") v = x + y;
-          else if (name == "v_pk_sub_u16" || name == "v_pk_sub_i16") v = x - y;
+          const bool sgn = name.find("_i16") != std::string::npos;
+          int64_t v;
+          if (name == "v_pk_mul_lo_u16") v = int64_t{x} * y;
+          else if (name == "v_pk_add_u16") v = x + y;
+          else if (name == "v_pk_add_i16") v = sx + sy;
+          else if (name == "v_pk_sub_u16") v = x - y;
+          else if (name == "v_pk_sub_i16") v = sx - sy;
           else if (name == "v_pk_lshlrev_b16") v = y << (x & 15);
           else if (name == "v_pk_lshrrev_b16") v = y >> (x & 15);
           else if (name == "v_pk_ashrrev_i16") v = sy >> (x & 15);
@@ -3206,13 +3240,13 @@ struct Machine {
           else if (name == "v_pk_min_i16") v = std::min(sx, sy);
           else if (name == "v_pk_max_u16") v = std::max(x, y);
           else if (name == "v_pk_min_u16") v = std::min(x, y);
-          else if (name == "v_pk_mad_u16") v = x * y + packed_bits(w, in, 2, h, lane);
-          else if (name == "v_pk_mad_i16") v = sx * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane));
+          else if (name == "v_pk_mad_u16") v = int64_t{x} * y + packed_bits(w, in, 2, h, lane);
+          else if (name == "v_pk_mad_i16") v = int64_t{sx} * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane));
           else throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
           // The clamp holds an add or a subtract to what 16 bits hold.
           if (in.clamp && (name.find("add") != std::string::npos || name.find("sub") != std::string::npos ||
                            name.find("mad") != std::string::npos))
-            v = name.find("_i16") != std::string::npos ? std::clamp(v, -32768, 32767) : std::clamp(v, 0, 65535);
+            v = sgn ? std::clamp<int64_t>(v, -32768, 32767) : std::clamp<int64_t>(v, 0, 65535);
           r |= uint32_t{static_cast<uint16_t>(v)} << (16 * h);
         }
         write_lane(w, in.dst[0], lane, r);
@@ -3300,7 +3334,7 @@ struct Machine {
     // name the short form has.
     const std::string as_short =
         in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
-        : (in.dpp || in.dpp8) ? in.name.substr(0, in.name.size() - 4) + "_e32"
+        : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
         : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
         : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
@@ -3324,8 +3358,10 @@ struct Machine {
       for (uint32_t k = 0; k < x.src.size() && k < 3; ++k)
         if ((in.op_sel >> k) & 1) {
           if (k == 2 && wide_third) continue;
-          if (x.src[k].kind != OperandKind::Vgpr)
-            throw Error::make(Err::Unsupported, in.name, " takes the high half of a constant, which this does not model");
+          // OPSEL works for 16-bit VGPR, SGPR and literal sources; an inline constant "only exists in the lower 16 bits"
+          // and must have it clear (CDNA5 ISA, 7.1), bar the BF16 case, which this does not model.
+          if (x.src[k].kind == OperandKind::Inline || x.src[k].kind == OperandKind::InlineFloat)
+            throw Error::make(Err::Unsupported, in.name, " takes the high half of an inline constant, which this does not model");
           x.src[k].sel = 5;
         }
       x.op_sel &= 8;
@@ -3408,9 +3444,10 @@ struct Machine {
       });
     } else if (op == "v_lshl_add_u64"_op) {
       each([&](uint32_t lane) {
-        write_lane64(w, in.dst[0], lane,
-                     (lane_src64(w, in.src[0], lane) << (lane_src(w, in.src[1], lane) & 63)) +
-                         lane_src64(w, in.src[2], lane));
+        // The shift count is S1[2:0] and must be 0 to 4: "the design treats unsupported shift counts as a shift of zero".
+        const uint32_t n = lane_src(w, in.src[1], lane) & 7;
+        const uint32_t shift = in.arch != gcn::Target::Gfx1250 ? lane_src(w, in.src[1], lane) & 63 : n > 4 ? 0 : n;
+        write_lane64(w, in.dst[0], lane, (lane_src64(w, in.src[0], lane) << shift) + lane_src64(w, in.src[2], lane));
       });
     } else if (op == "v_ashrrev_i64"_op) {
       each([&](uint32_t lane) {
@@ -3460,16 +3497,16 @@ struct Machine {
       });
     } else if (op == "v_sub_u16_e32"_op) {
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane,
-                   static_cast<uint16_t>(lane_src(w, in.src[0], lane) - lane_src(w, in.src[1], lane)));
+        const int32_t d = int32_t{static_cast<uint16_t>(lane_src(w, in.src[0], lane))} - static_cast<uint16_t>(lane_src(w, in.src[1], lane));
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(in.clamp ? std::max(d, 0) : d));
       });
     } else if (op == "v_add_u16_e32"_op) {
       each([&](uint32_t lane) {
         // 16-bit arithmetic writes the low half of the destination and zeroes
         // the high half: the compiler leaves out the mask a widening would
         // otherwise need after one of these.
-        write_lane(w, in.dst[0], lane,
-                   static_cast<uint16_t>(lane_src(w, in.src[0], lane) + lane_src(w, in.src[1], lane)));
+        const int32_t sum = int32_t{static_cast<uint16_t>(lane_src(w, in.src[0], lane))} + static_cast<uint16_t>(lane_src(w, in.src[1], lane));
+        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(in.clamp ? std::min(sum, 65535) : sum));
       });
     } else if (op == "v_lshlrev_b16_e32"_op) {
       each([&](uint32_t lane) {
@@ -3528,7 +3565,7 @@ struct Machine {
     } else if (op == "v_min_f64"_op || op == "v_max_f64"_op) {
       each([&](uint32_t lane) {
         const double x = lane_double(w, in.src[0], lane), y = lane_double(w, in.src[1], lane);
-        write_double(w, in, lane, op == "v_min_f64"_op ? std::fmin(x, y) : std::fmax(x, y));
+        write_double(w, in, lane, op == "v_min_f64"_op ? hw_min(in, x, y) : hw_max(in, x, y));
       });
     } else if (op == "v_ldexp_f64"_op) {
       each([&](uint32_t lane) {
@@ -3571,10 +3608,13 @@ struct Machine {
     } else if (op == "v_sin_f32_e32"_op || op == "v_cos_f32_e32"_op) {
       each([&](uint32_t lane) {
         // The argument is in turns: a whole turn is 1.0, not 2pi.
-        const double turns = static_cast<double>(lane_float(w, in.src[0], lane));
-        const double radians = turns * 6.283185307179586476925286766559;
-        write_float(w, in, lane,
-                    static_cast<float>(op == "v_sin_f32_e32"_op ? std::sin(radians) : std::cos(radians)));
+        if (in.arch == gcn::Target::Gfx1250) {
+          write_float(w, in, lane, turns_trig(static_cast<double>(lane_float(w, in.src[0], lane)), op == "v_sin_f32_e32"_op));
+          return;
+        }
+        // The argument is in turns: a whole turn is 1.0, not 2pi.
+        const double radians = static_cast<double>(lane_float(w, in.src[0], lane)) * 6.283185307179586476925286766559;
+        write_float(w, in, lane, static_cast<float>(op == "v_sin_f32_e32"_op ? std::sin(radians) : std::cos(radians)));
       });
     } else if (op == "v_ldexp_f32"_op) {
       each([&](uint32_t lane) {
@@ -3604,12 +3644,15 @@ struct Machine {
                op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op) {
       // One 8-bit float widened, from the source's low byte, or two from its
       // low half -- the part SDWA picked, or the register's bottom.
-      if (in.promoted && in.op_sel)
-        throw Error::make(Err::Unsupported, in.name, " picks its byte with op_sel, which this does not model");
+      // The long form's op_sel picks the half (the pair) or the byte (the single) -- CDNA5 ISA, V_CVT_PK_F32_FP8 and
+      // V_CVT_F32_FP8: "SRC0 >> (16 * OPSEL[0])" and "SRC0 >> (8 * OPSEL[0:1])". OPSEL[0:1] is the bit pair with bit 0
+      // the high one: the assembler's byte_sel:1 sets op_sel bit 1, byte_sel:2 sets bit 0 and byte_sel:3 both (checked
+      // with llvm-mc -mcpu=gfx1250). Input modifiers are ignored.
       const F8& t = op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_pk_f32_fp8_e32"_op ? fp8() : bf8();
       const bool pair = op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op;
+      const uint32_t shift = in.promoted ? (pair ? 16 * (in.op_sel & 1) : 8 * (((in.op_sel & 1) << 1) | ((in.op_sel >> 1) & 1))) : 0;
       each([&](uint32_t lane) {
-        const uint32_t v = lane_src(w, in.src[0], lane);
+        const uint32_t v = lane_src(w, in.src[0], lane) >> shift;
         set_word(w, in.dst[0], 0, lane, as_bits(f8_to_float(v, t)));
         if (pair) set_word(w, in.dst[0], 1, lane, as_bits(f8_to_float(v >> 8, t)));
       });
@@ -3694,20 +3737,21 @@ struct Machine {
       // Four unsigned bytes, or eight 4-bit values, of each source multiplied
       // pairwise and added to the third.
       const bool nibbles = op != "v_dot4_u32_u8"_op, is_signed = op == "v_dot8_i32_i4"_op;
+      // gfx1250's v_dot8_i32_iu4: NEG[0] and NEG[1] (neg_lo) say whether each source is signed; without them it is unsigned.
+      const bool iu = in.arch == gcn::Target::Gfx1250 && in.asm_name.find("_iu") != std::string::npos;
+      const bool sx = iu ? (in.neg_lo & 1) : is_signed, sy = iu ? (in.neg_lo >> 1) & 1 : is_signed;
       const uint32_t bits = nibbles ? 4 : 8, n = 32 / bits, mask = (1u << bits) - 1;
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
         const uint32_t c = lane_src(w, in.src[2], lane);
-        int64_t sum = is_signed ? int64_t{static_cast<int32_t>(c)} : int64_t{c};
+        int64_t sum = is_signed || iu ? int64_t{static_cast<int32_t>(c)} : int64_t{c};
         for (uint32_t k = 0; k < n; ++k) {
           int64_t x = (a >> (bits * k)) & mask, y = (b >> (bits * k)) & mask;
-          if (is_signed) {
-            if (x & 8) x -= 16;
-            if (y & 8) y -= 16;
-          }
+          if (sx && (x & 8)) x -= 16;
+          if (sy && (y & 8)) y -= 16;
           sum += x * y;
         }
-        if (in.clamp) sum = is_signed ? std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX) : std::clamp<int64_t>(sum, 0, UINT32_MAX);
+        if (in.clamp) sum = is_signed || iu ? std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX) : std::clamp<int64_t>(sum, 0, UINT32_MAX);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
       });
     } else if (op == "v_dot4_i32_i8"_op) {
@@ -3716,8 +3760,14 @@ struct Machine {
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
         int64_t sum = static_cast<int32_t>(lane_src(w, in.src[2], lane));
-        for (uint32_t k = 0; k < 4; ++k)
-          sum += static_cast<int64_t>(static_cast<int8_t>(a >> (8 * k))) * static_cast<int8_t>(b >> (8 * k));
+        // gfx1250's v_dot4_i32_iu8: NEG[0] and NEG[1] (neg_lo) say whether each source is signed; without them it is unsigned.
+        const bool iu = in.arch == gcn::Target::Gfx1250 && in.asm_name.find("_iu") != std::string::npos;
+        const bool sx = !iu || (in.neg_lo & 1), sy = !iu || (in.neg_lo >> 1) & 1;
+        for (uint32_t k = 0; k < 4; ++k) {
+          const int64_t x = sx ? int64_t{static_cast<int8_t>(a >> (8 * k))} : int64_t{(a >> (8 * k)) & 0xFF};
+          const int64_t y = sy ? int64_t{static_cast<int8_t>(b >> (8 * k))} : int64_t{(b >> (8 * k)) & 0xFF};
+          sum += x * y;
+        }
         if (in.clamp) sum = std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
       });
@@ -3736,7 +3786,7 @@ struct Machine {
       each([&](uint32_t lane) {
         const float x = static_cast<float>(lane_half(w, in.src[0], lane)),
                     y = static_cast<float>(lane_half(w, in.src[1], lane));
-        write_half(w, in, lane, static_cast<_Float16>(op == "v_min_f16_e32"_op ? std::fmin(x, y) : std::fmax(x, y)));
+        write_half(w, in, lane, static_cast<_Float16>(op == "v_min_f16_e32"_op ? hw_min(in, x, y) : hw_max(in, x, y)));
       });
     } else if (op == "v_cvt_u32_f64_e32"_op) {
       // Toward zero, held to what 32 unsigned bits hold, and a NaN to zero.
@@ -3886,7 +3936,7 @@ struct Machine {
           return o.neg ? -f : f;
         };
         float r = std::fma(source(0), source(1), source(2));
-        if (in.clamp) r = std::isnan(r) ? 0.0f : std::fmin(1.0f, std::fmax(0.0f, r));
+        if (in.clamp) r = clamp01(r);
         if (op == "v_fma_mix_f32"_op) {
           write_lane(w, in.dst[0], lane, as_bits(r));
           return;
@@ -4067,7 +4117,7 @@ struct Machine {
       });
     } else if (op == "v_trunc_f32_e32"_op) {
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane, as_bits(std::trunc(lane_float(w, in.src[0], lane))));
+        write_float(w, in, lane, std::trunc(lane_float(w, in.src[0], lane)));
       });
     } else if (op == "v_cvt_f32_f64_e32"_op) {
       each([&](uint32_t lane) {
@@ -4075,8 +4125,11 @@ struct Machine {
       });
     } else if (op == "v_cvt_i32_f64_e32"_op) {
       each([&](uint32_t lane) {
+        // Out-of-range values (infinities too) saturate and a NaN is zero (CDNA5 ISA, V_CVT_I32_F64).
+        const double d = as_double(lane_src64(w, in.src[0], lane));
         write_lane(w, in.dst[0], lane,
-                   static_cast<uint32_t>(static_cast<int32_t>(as_double(lane_src64(w, in.src[0], lane)))));
+                   std::isnan(d) ? 0u : d >= 2147483647.0 ? 0x7FFFFFFFu : d <= -2147483648.0 ? 0x80000000u
+                                                                                           : static_cast<uint32_t>(static_cast<int32_t>(d)));
       });
     } else if (op == "v_mad_f32"_op || op == "v_mad_legacy_f32"_op || op == "v_mac_f32_e32"_op ||
                op == "v_mac_f32_e64"_op || op == "v_madmk_f32"_op) {
@@ -4110,7 +4163,9 @@ struct Machine {
                        width = lane_src(w, in.src[2], lane) & 31;
         uint32_t out = 0;
         if (width != 0) {
-          out = width >= 32 ? value >> start : (value >> start) & ((1u << width) - 1);
+          // (the shift is arithmetic: a field reaching past bit 31 reads the sign there)
+          const uint32_t shifted = static_cast<uint32_t>(static_cast<int32_t>(value) >> start);
+          out = width >= 32 ? shifted : shifted & ((1u << width) - 1);
           if (width < 32 && (out >> (width - 1) & 1)) out |= ~((1u << width) - 1);
         }
         write_lane(w, in.dst[0], lane, out);
@@ -4139,9 +4194,8 @@ struct Machine {
       });
     } else if (op == "v_fma_f32"_op) {
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane,
-                   as_bits(std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
-                                    lane_float(w, in.src[2], lane))));
+        write_float(w, in, lane,
+                    std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane), lane_float(w, in.src[2], lane)));
       });
     } else if (op == "v_cndmask_b32_e64"_op) {
       each([&](uint32_t lane) {
@@ -4157,11 +4211,11 @@ struct Machine {
       });
     } else if (op == "v_min_f32_e32"_op) {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::fmin(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
+        write_float(w, in, lane, hw_min(in, lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     } else if (op == "v_max_f32_e32"_op || op == "v_max_f32_e64"_op) {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::fmax(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
+        write_float(w, in, lane, hw_max(in, lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     } else if (op == "v_add_f32_e64"_op) {
       each([&](uint32_t lane) {
@@ -4267,6 +4321,7 @@ struct Machine {
                     : op == "v_pk_mul_f32"_op ? x * y
                                            : std::fma(x, y, packed_float(w, in, 2, half, lane));
         }
+        if (in.clamp) r[0] = clamp01(r[0]), r[1] = clamp01(r[1]);
         set_word(w, in.dst[0], 0, lane, as_bits(r[0]));
         set_word(w, in.dst[0], 1, lane, as_bits(r[1]));
       });
@@ -4290,10 +4345,10 @@ struct Machine {
           const float x = packed_half(w, in, 0, half, lane), y = packed_half(w, in, 1, half, lane);
           const float v = op == "v_pk_add_f16"_op   ? x + y
                           : op == "v_pk_mul_f16"_op ? x * y
-                          : op == "v_pk_min_f16"_op ? std::fmin(x, y)
-                          : op == "v_pk_max_f16"_op ? std::fmax(x, y)
+                          : op == "v_pk_min_f16"_op ? hw_min(in, x, y)
+                          : op == "v_pk_max_f16"_op ? hw_max(in, x, y)
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
-          r |= static_cast<uint32_t>(as_bits(static_cast<_Float16>(v))) << (16 * half);
+          r |= static_cast<uint32_t>(as_bits(static_cast<_Float16>(in.clamp ? clamp01(v) : v))) << (16 * half);
         }
         write_lane(w, in.dst[0], lane, r);
       });
@@ -5169,18 +5224,46 @@ struct Machine {
     }
     return ((ka < kb) == !want_max) ? a : b;
   }
+  // The sine or cosine of an angle in turns, over the full range of a float (CDNA5 ISA, V_SIN_F32: "full range input is
+  // supported"; -MaxFloat gives 0 for the sine and 1 for the cosine): only the fraction of a turn matters, which is exact
+  // in double, so the argument to the library never grows large. An infinity gives the NaN the document shows, 0xffc00000.
+  static float turns_trig(double turns, bool want_sin) {
+    if (std::isinf(turns)) return as_float(0xFFC00000u);
+    if (std::isnan(turns)) return static_cast<float>(turns);
+    const double frac = turns == 0 ? turns : turns - std::trunc(turns);
+    const double radians = frac * 6.283185307179586476925286766559;
+    return static_cast<float>(want_sin ? std::sin(radians) : std::cos(radians));
+  }
   // minimumNumber() and maximumNumber(): a number beats a NaN, and -0 is less than +0 (which C's fmin and fmax leave open).
   static double num_min(double p, double q) {
-    if (std::isnan(p)) return q;
+    if (std::isnan(p)) return std::isnan(q) ? p : q;
     if (std::isnan(q)) return p;
     if (p == 0 && q == 0) return std::signbit(p) ? p : q;
     return p < q ? p : q;
   }
   static double num_max(double p, double q) {
-    if (std::isnan(p)) return q;
+    if (std::isnan(p)) return std::isnan(q) ? p : q;
     if (std::isnan(q)) return p;
     if (p == 0 && q == 0) return std::signbit(p) ? q : p;
     return p > q ? p : q;
+  }
+  // The minimum and maximum a float instruction gives: gfx1250's are the "_num" ones, which take a number over a NaN and
+  // put -0 below +0 (CDNA5 ISA, V_MIN_NUM_F32: "-0<+0 is TRUE"); the older ones are C's fmin and fmax.
+  // (Two NaNs give the first, quieted.)
+  template <typename T>
+  static T quieted(T x) {
+    if constexpr (sizeof(T) == 4) return std::bit_cast<T>(std::bit_cast<uint32_t>(x) | 0x400000u);
+    else return std::bit_cast<T>(std::bit_cast<uint64_t>(x) | (1ull << 51));
+  }
+  template <typename T>
+  static T hw_min(const Inst& in, T x, T y) {
+    if (in.arch != gcn::Target::Gfx1250) return std::fmin(x, y);
+    return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_min(x, y));
+  }
+  template <typename T>
+  static T hw_max(const Inst& in, T x, T y) {
+    if (in.arch != gcn::Target::Gfx1250) return std::fmax(x, y);
+    return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_max(x, y));
   }
   // The "_num" family on three values (minimumNumber and maximumNumber: a number beats a NaN), and the median.
   static double num3(const std::string_view kind, double x, double y, double z) {
@@ -5346,8 +5429,16 @@ struct Machine {
       if (!(w.exec >> lane & 1)) continue;
       // An offset in a register, one in a scalar register, and the
       // instruction's own, as many of them as it has.
-      const uint64_t offset = (in.has_vaddr ? scaled_offset(in, lane_src(w, in.src[0], lane), 4 * words) : 0) +
-                              (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) + static_cast<uint64_t>(in.offset);
+      uint64_t offset = (in.has_vaddr ? scaled_offset(in, lane_src(w, in.src[0], lane), 4 * words) : 0) +
+                        (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) + static_cast<uint64_t>(in.offset);
+      // gfx1250's scratch with both a VGPR and an SGPR offset (SVS) adds signed numbers: "SGPR_offset(I32) +
+      // VGPR_offset(I32) * ScaleFactor + IOFFSET(I24)" (CDNA5 ISA). The compiler gives each lane a negative VGPR offset
+      // and a positive SGPR one that cancel it; zero-extending the register would add 2^32.
+      if (in.arch == gcn::Target::Gfx1250 && in.has_vaddr && in.has_saddr) {
+        const int64_t v = in.scale_offset ? static_cast<int64_t>(static_cast<int32_t>(lane_src(w, in.src[0], lane))) * (4 * words)
+                                          : static_cast<int32_t>(lane_src(w, in.src[0], lane));
+        offset = static_cast<uint64_t>(v + static_cast<int32_t>(scalar_field(w, in.saddr, false)) + in.offset);
+      }
       // A narrow access moves one byte or two; every other one moves whole
       // registers.
       Narrow n;

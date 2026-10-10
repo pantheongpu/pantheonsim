@@ -420,6 +420,26 @@ false` throughout. gfx1251 (MI430X) is not covered.
   `ds_store_addtid_b32` / `ds_load_addtid_b32` (which named no address register, and crashed the executor before) and
   `ds_bpermute_fi_b32`; and flat pointers to private memory, which gfx1250 builds from `src_flat_scratch_base` with the
   lane's number in bits 56:52 (`tests/hipcc/gfx1250.cpp`).
+- **Operand forms** (`tests/hipcc/forms1250.cpp`), found by running every form the assembler accepts through the simulator: the
+  CLAMP and OMOD bits on half-precision, packed and single-precision results (a -0 clamps to +0, as the ISA document says), clamped
+  16-bit and packed integer sums (the packed signed ones read their halves unsigned before), OPSEL on a scalar or literal source,
+  the byte or half of `v_cvt_f32_fp8` / `v_cvt_pk_f32_fp8` that OPSEL picks, DPP on three-source (VOP3) instructions, DPP8 on
+  compares, and the VOPD dot products `v_dual_dot2acc_f32_{f16,bf16}` (in ROCm's LLVM but not the XML; they are the VOP2
+  accumulates issued as half of a pair). OPSEL on an inline constant is still refused (the document says it must be zero).
+  A second reading of the ISA document's pseudocode (every per-lane arithmetic instruction run over edge cases and compared with
+  the document) corrected: the "_num" minimum and maximum (a number beats a NaN, -0 is below +0, two NaNs give the first,
+  quieted), `v_fmamk_f16` (it computed `a * b + K`), `v_cvt_i32_f64` (out-of-range saturates, a NaN is zero), `v_bfe_i32` and
+  `s_bfe_i32/i64` (an arithmetic shift), `v_lshl_add_u64` (a count over 4 is a shift of zero), `v_dot4_i32_iu8` and
+  `v_dot8_i32_iu4` (neg_lo says which source is signed), `v_cmp_class` on a signaling NaN, `v_cvt_f16_fp8`'s byte_sel,
+  `s_absdiff_i32` (32-bit), `s_max_i32/u32` (SCC set on a tie), `s_bitcmp0/1_b64`, and `v_sin_f32` / `v_cos_f32` over the full range
+  of a float. Running rocPRIM, hipCUB and rocThrust on gfx1250 found two more: scratch accesses with both a VGPR and an SGPR
+  offset add them as signed numbers (a negative VGPR offset and a positive SGPR one cancel), and `v_add_min_u32` wraps its sum.
+  For that last one the ISA document disagrees with itself (the prose says the add is clamped, the pseudocode is
+  `v_min_u32(v_add_nc_u32(...))`); the pseudocode is followed, because AMD's compiler emits the instruction for
+  `min(a + b, c)` over wrapping unsigned values and rocPRIM's radix sort relies on it. The signed forms and the packed ones
+  keep the "clamped" reading, which nothing contradicts. Known differences left alone: `v_div_fixup` does not apply the sign of the
+  denominator and numerator to the quotient's magnitude, the SR conversions' rounding (the document contradicts itself), and
+  `v_div_fmas`' 2^64 scale (the document says 2^32, which looks like a typo beside `v_div_scale`).
 - **`v_fmamk_f64` and `v_fmaak_f64`** (VOP2 35 and 36), which the XML leaves out but the ISA document lists ("imply the use of a 64-bit
   literal") and the compiler emits for double-precision math (found by hip-tests' `Unit_hipTrigDeviceFunc_Double`). They are
   added to the generated table by `tools/rdna-ops.py` as supplementary rows.
