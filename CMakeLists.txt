@@ -1063,7 +1063,7 @@ libcutensor.2.7.0 {
     # only NvEnc* is exported.
     set(_nvenc_map "${CMAKE_BINARY_DIR}/maps/libnvidia-encode.so.1.map")
     file(WRITE "${_nvenc_map}" "{\n  global: NvEnc*;\n  local: *;\n};\n")
-    add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp)
+    add_library(vgpunvenc SHARED nvidia/src/nvenc_api.cpp nvidia/src/nvenc_h264_enc.cpp nvidia/src/nvenc_hevc_enc.cpp nvidia/src/h264_decode.cpp)
     target_link_libraries(vgpunvenc PRIVATE vgpu vgpucudart)
     # nvenc_api.cpp includes cuda_runtime.h: with the toolkit outside the
     # compiler's default include path (NVIDIA's repository installs under

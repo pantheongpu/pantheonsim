@@ -19,44 +19,31 @@
 #include <string>
 #include <vector>
 
+#include "nvenc_encoder.hpp"
+
 namespace vgpu_nvenc {
 
-// An 8-bit 4:2:0 picture: luma w x h, chroma ((w+1)/2) x ((h+1)/2).
-struct EncPicture {
-  int w = 0, h = 0;
-  std::vector<uint8_t> y, u, v;
-};
-
-enum class PicType { kIdr, kIntra, kInter };
-
-struct EncStats {
-  int qp = 0;
-  size_t bytes = 0;
-  int intra_mbs = 0, inter_mbs = 0, skipped_mbs = 0;
-  double psnr_y = 0;   // against the picture as given, after the loop filter
-};
-
-class H264Encoder {
+class H264Encoder : public VideoEncoder {
  public:
   // profile_idc: 66 (Baseline), 77 (Main) or 100 (High); the tools used are the same in all three.
   // `field_pictures`: interlaced coding with field pictures, for test streams (frames go through encode_field_pair(); the card's
   // NVENC refuses field encoding, so no API path reaches this). `height` is then the frame's, and a multiple of 4.
   H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock, bool field_pictures = false);
-  ~H264Encoder();
+  ~H264Encoder() override;
 
-  std::vector<uint8_t> parameter_sets() const;   // Annex B: SPS then PPS
+  std::vector<uint8_t> parameter_sets() const override;   // Annex B: SPS then PPS
 
   // Encodes one picture and returns its slice NAL unit (Annex B, four-byte start code). A P picture
   // with no reference picture to predict from (the first, or after reset()) becomes an IDR picture.
   // `qp` is the slice QP, 0..51. `stats` may be null.
-  std::vector<uint8_t> encode(const EncPicture& in, PicType type, int qp, EncStats* stats = nullptr);
+  std::vector<uint8_t> encode(const EncPicture& in, PicType type, int qp, EncStats* stats = nullptr) override;
 
   // Field coding only: codes a frame as two field pictures (the first an IDR, intra or P picture, the second a P picture that may
   // predict from the first). Returns both slice NAL units.
   std::vector<uint8_t> encode_field_pair(const EncPicture& frame, bool top_field_first, PicType type, int qp, EncStats* stats = nullptr);
 
   // Forget the reference picture and start a new coded video sequence at the next picture.
-  void reset();
+  void reset() override;
 
   // For tests: the reconstruction of the last picture before the loop filter (equal to the decoded
   // picture when the encoder was built with deblock == false), as coded_width() x coded_height()

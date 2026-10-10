@@ -43,6 +43,7 @@
 #include "nvenc_h264.hpp"
 #include "nvenc_h264_enc.hpp"
 #include "nvenc_hevc.hpp"
+#include "nvenc_hevc_enc.hpp"
 
 #include "nvenc_tables.inc"
 
@@ -135,6 +136,13 @@ struct Mapped {
   Registered* reg = nullptr;
 };
 
+// 8-bit planar 4:2:0 as the encoder reads it: sample accessors over device memory
+// copied to the host.
+struct Frame {
+  std::vector<uint8_t> y, u, v;
+  int w = 0, h = 0, cw = 0, ch = 0;
+};
+
 struct Session {
   std::string last_error = "Success.";
   bool initialized = false;
@@ -148,14 +156,27 @@ struct Session {
   std::map<void*, std::unique_ptr<Mapped>> mapped;
   uint64_t frames = 0;
   bool sent_parameter_sets = false;
-  // The H.264 encoder (everything but the lossless tuning): the compressing encoder with its reference picture,
-  // the size and rate it was built for, the picture counters and the rate control state.
-  std::unique_ptr<vgpu_nvenc::H264Encoder> h264, h264_trial;
-  int h264_w = 0, h264_h = 0, h264_fps_num = 0, h264_fps_den = 0, h264_profile = 0;
-  uint64_t since_idr = 0;       // pictures since (and including) the last IDR; 0 before the first picture
+  // The compressing encoder (everything but the lossless tuning): its reference pictures, the size, rate and profile it was built for, the
+  // picture counters and the rate control state.
+  std::unique_ptr<vgpu_nvenc::VideoEncoder> enc, trial;
+  int enc_codec = -1, enc_w = 0, enc_h = 0, enc_fps_num = 0, enc_fps_den = 0, enc_profile = 0;
+  uint64_t since_idr = 0;       // pictures since (and including) the last IDR picture, in display order; 0 before the first picture
   bool force_idr_next = false;  // a reconfiguration asked for it
   double rc_qp = 28;            // the QP the next P picture is coded with
   double rc_bits = 0, rc_target = 0;   // bits spent and bits allowed since the last IDR picture
+  // B pictures: the pictures that wait for the P picture that follows them in display order, and the output buffers of the calls that
+  // returned NV_ENC_ERR_NEED_MORE_INPUT (the card fills those, in the order of the calls, when the group is coded).
+  struct Waiting {
+    Frame frame;
+    uint64_t ts = 0, dur = 0;
+    int pic_struct = 1;
+    int disp = 0;               // display index since the last IDR picture
+    bool want_ps = false;       // the call asked for the parameter sets with this picture
+  };
+  std::vector<Waiting> waiting;
+  std::deque<void*> outstanding;
+  int disp = 0;                 // display index of the next picture
+  int last_anchor = 0;          // display index of the last picture coded as I or P
 };
 
 std::mutex g_mu;
@@ -708,12 +729,6 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncUnmapInputResource(void* encoder, NV_ENC_I
 
 namespace {
 
-// 8-bit planar 4:2:0 as the encoder reads it: sample accessors over device memory
-// copied to the host.
-struct Frame {
-  std::vector<uint8_t> y, u, v;
-  int w = 0, h = 0, cw = 0, ch = 0;
-};
 
 // BT.601 limited range, the matrix the card's encoder applies to ARGB / ABGR input
 // (flat colours encoded at QP 1 and decoded: red 81/90/240, green 145/54/34, blue
@@ -795,8 +810,30 @@ Frame read_frame(const uint8_t* dev, uint32_t pitch, uint32_t fmt, int w, int h,
   return f;
 }
 
-std::vector<uint8_t> parameter_sets_of(int codec, int width, int height, uint32_t rate_num, uint32_t rate_den) {
+// ---- the compressing encoders (H.264 and HEVC) -----------------------------------------------------------------------
+
+// The lossless tuning (and the lossless flag of the H.264 configuration) is the only mode the card encodes without
+// loss, and it is the one mode here that stays the PCM stream: transform bypass is a High 4:4:4 Predictive tool.
+bool lossless_of(int codec, uint32_t tuning, const NV_ENC_CONFIG& c) {
+  return tuning == num(NV_ENC_TUNING_INFO_LOSSLESS) || (codec == kH264 && c.encodeCodecConfig.h264Config.qpPrimeYZeroTransformBypassFlag != 0);
+}
+bool lossless(const Session& s) { return lossless_of(s.codec, raw(s.init.tuningInfo), s.config); }
+
+int h264_profile_idc(const NV_ENC_CONFIG& c) {
+  if (same_guid(c.profileGUID, NV_ENC_H264_PROFILE_BASELINE_GUID)) return 66;
+  if (same_guid(c.profileGUID, NV_ENC_H264_PROFILE_MAIN_GUID)) return 77;
+  return 100;   // High, and what the automatic choice picks
+}
+
+std::unique_ptr<vgpu_nvenc::VideoEncoder> make_encoder(int codec, const NV_ENC_CONFIG& c, int w, int h, int fn, int fd) {
+  if (codec == kHevc) return std::make_unique<vgpu_nvenc::HevcEncoder>(w, h, fn, fd);
+  return std::make_unique<vgpu_nvenc::H264Encoder>(w, h, fn, fd, h264_profile_idc(c), true);
+}
+
+// The parameter sets the encoder of a configuration writes (for the lossless tuning, the PCM writers').
+std::vector<uint8_t> parameter_sets_of(int codec, bool is_lossless, const NV_ENC_CONFIG& cfg, int width, int height, uint32_t rate_num, uint32_t rate_den) {
   const int fps_num = rate_num ? static_cast<int>(rate_num) : 30, fps_den = rate_den ? static_cast<int>(rate_den) : 1;
+  if (!is_lossless) return make_encoder(codec, cfg, width, height, fps_num, fps_den)->parameter_sets();
   if (codec == kHevc) {
     vgpu_nvenc::HevcStream st;
     st.width = width;
@@ -814,22 +851,7 @@ std::vector<uint8_t> parameter_sets_of(int codec, int width, int height, uint32_
 }
 
 std::vector<uint8_t> parameter_sets(const Session& s) {
-  return parameter_sets_of(s.codec, static_cast<int>(s.width), static_cast<int>(s.height), s.init.frameRateNum, s.init.frameRateDen);
-}
-
-// ---- the compressing H.264 encoder ----------------------------------------------------------------------------------
-
-// The lossless tuning (and the lossless flag of the H.264 configuration) is the only mode the card encodes without
-// loss, and it is the one mode here that stays the PCM stream: transform bypass is a High 4:4:4 Predictive tool.
-bool h264_lossless(const Session& s) {
-  return raw(s.init.tuningInfo) == num(NV_ENC_TUNING_INFO_LOSSLESS) ||
-         s.config.encodeCodecConfig.h264Config.qpPrimeYZeroTransformBypassFlag != 0;
-}
-
-int h264_profile_idc(const NV_ENC_CONFIG& c) {
-  if (same_guid(c.profileGUID, NV_ENC_H264_PROFILE_BASELINE_GUID)) return 66;
-  if (same_guid(c.profileGUID, NV_ENC_H264_PROFILE_MAIN_GUID)) return 77;
-  return 100;   // High, and what the automatic choice picks
+  return parameter_sets_of(s.codec, lossless(s), s.config, static_cast<int>(s.width), static_cast<int>(s.height), s.init.frameRateNum, s.init.frameRateDen);
 }
 
 vgpu_nvenc::EncPicture to_enc_picture(const Frame& f) {
@@ -842,65 +864,89 @@ vgpu_nvenc::EncPicture to_enc_picture(const Frame& f) {
   return p;
 }
 
-// Encodes one picture with the compressing encoder: the picture type from the GOP settings (and the application's flags),
-// the QP from the rate control mode. Returns the bytes (parameter sets first when they are due) and the picture type.
-std::vector<uint8_t> encode_h264(Session& s, const Frame& f, const NV_ENC_PIC_PARAMS& pp, int rate_num, int rate_den, uint32_t* pic_type) {
+// What the application's GOP settings ask of the encoder.
+struct GopCfg {
+  bool intra_only = false;     // frameIntervalP 0: an IDR picture, then I pictures
+  bool periodic = false;       // an IDR picture every idr_period pictures
+  uint32_t idr_period = 0;
+  int nb = 0;                  // B pictures between the P pictures (frameIntervalP - 1), where the encoder has B pictures
+  bool repeat_ps = false;      // repeatSPSPPS
+};
+GopCfg gop_cfg(const Session& s) {
   const NV_ENC_CONFIG& c = s.config;
-  const int profile = h264_profile_idc(c);
-  if (!s.h264 || s.h264_w != f.w || s.h264_h != f.h || s.h264_fps_num != rate_num || s.h264_fps_den != rate_den || s.h264_profile != profile) {
-    s.h264 = std::make_unique<vgpu_nvenc::H264Encoder>(f.w, f.h, rate_num, rate_den, profile, true);
-    s.h264_trial.reset();
-    s.h264_w = f.w;
-    s.h264_h = f.h;
-    s.h264_fps_num = rate_num;
-    s.h264_fps_den = rate_den;
-    s.h264_profile = profile;
-    s.since_idr = 0;
-    s.sent_parameter_sets = false;   // a new sequence: the decoder needs its headers
-  }
-  const NV_ENC_CONFIG_H264& h = c.encodeCodecConfig.h264Config;
-  const uint32_t gop = c.gopLength;
-  const uint32_t idr_period = h.idrPeriod ? h.idrPeriod : gop;
-  const bool intra_only = c.frameIntervalP == 0;
-  const bool periodic = idr_period != 0 && idr_period != NVENC_INFINITE_GOPLENGTH;
-  const uint32_t flags = pp.encodePicFlags;
-  vgpu_nvenc::PicType t;
-  if (s.init.enablePTD) {
-    if (s.since_idr == 0 || s.force_idr_next || (flags & NV_ENC_PIC_FLAG_FORCEIDR) || (periodic && s.since_idr >= idr_period))
-      t = vgpu_nvenc::PicType::kIdr;
-    else if (intra_only || (flags & NV_ENC_PIC_FLAG_FORCEINTRA))
-      t = vgpu_nvenc::PicType::kIntra;   // frameIntervalP 0: the card writes an IDR picture and then I pictures (measured)
-    else
-      t = vgpu_nvenc::PicType::kInter;
+  GopCfg g;
+  uint32_t idr_period;
+  if (s.codec == kHevc) {
+    idr_period = c.encodeCodecConfig.hevcConfig.idrPeriod ? c.encodeCodecConfig.hevcConfig.idrPeriod : c.gopLength;
+    g.repeat_ps = c.encodeCodecConfig.hevcConfig.repeatSPSPPS != 0;
   } else {
-    // the application decides (NV_ENC_PIC_PARAMS::pictureType); a first picture is always an IDR
-    const uint32_t pt = raw(pp.pictureType);
-    t = s.since_idr == 0 || pt == num(NV_ENC_PIC_TYPE_IDR) ? vgpu_nvenc::PicType::kIdr
-        : (pt == num(NV_ENC_PIC_TYPE_I) ? vgpu_nvenc::PicType::kIntra : vgpu_nvenc::PicType::kInter);
+    idr_period = c.encodeCodecConfig.h264Config.idrPeriod ? c.encodeCodecConfig.h264Config.idrPeriod : c.gopLength;
+    g.repeat_ps = c.encodeCodecConfig.h264Config.repeatSPSPPS != 0;
   }
-  s.force_idr_next = false;
-  const bool intra = t != vgpu_nvenc::PicType::kInter;
+  g.idr_period = idr_period;
+  g.periodic = idr_period != 0 && idr_period != NVENC_INFINITE_GOPLENGTH;
+  g.intra_only = c.frameIntervalP == 0;
+  if (c.frameIntervalP > 1 && s.enc && s.enc->supports_b()) g.nb = c.frameIntervalP - 1;
+  return g;
+}
 
-  // ---- the QP
-  const NV_ENC_RC_PARAMS& rc = c.rcParams;
+// A coded picture on its way to an output buffer.
+struct Packet {
+  std::vector<uint8_t> data;
+  uint64_t ts = 0, dur = 0;
+  int pic_struct = 1;
+  uint32_t pic_type = NV_ENC_PIC_TYPE_IDR;
+};
+
+// The picture a call brought: the samples and what the call said about them.
+struct Input1 {
+  const Frame* frame = nullptr;
+  uint64_t ts = 0, dur = 0;
+  int pic_struct = 1;
+  int disp = 0;
+  bool want_ps = false;   // the call asked for the parameter sets with this picture (NV_ENC_PIC_FLAG_OUTPUT_SPSPPS)
+};
+
+// (Re)creates the encoder when the stream's size, rate or profile changed: a new coded video sequence.
+bool ensure_encoder(Session& s, int w, int h, int fn, int fd) {
+  const int profile = s.codec == kH264 ? h264_profile_idc(s.config) : 1;
+  if (s.enc && s.enc_codec == s.codec && s.enc_w == w && s.enc_h == h && s.enc_fps_num == fn && s.enc_fps_den == fd && s.enc_profile == profile) return false;
+  s.enc = make_encoder(s.codec, s.config, w, h, fn, fd);
+  s.trial.reset();
+  s.enc_codec = s.codec;
+  s.enc_w = w;
+  s.enc_h = h;
+  s.enc_fps_num = fn;
+  s.enc_fps_den = fd;
+  s.enc_profile = profile;
+  s.since_idr = 0;
+  s.sent_parameter_sets = false;   // a new sequence: the decoder needs its headers
+  return true;
+}
+
+// The slice QP of a picture: constant QP as the application set it, or the rate control's.
+int pick_qp(Session& s, vgpu_nvenc::PicType t, const Frame& f, int rate_num, int rate_den, const GopCfg& g) {
+  const NV_ENC_RC_PARAMS& rc = s.config.rcParams;
   const uint32_t mode = raw(rc.rateControlMode);
   const long bitrate = rc.averageBitRate;
+  const bool intra = t == vgpu_nvenc::PicType::kIdr || t == vgpu_nvenc::PicType::kIntra;
+  const bool bpic = t == vgpu_nvenc::PicType::kBi;
   const double frame_bits = bitrate > 0 ? static_cast<double>(bitrate) * rate_den / std::max(rate_num, 1) : 0;
   // an I picture takes about four times a P picture's bits; with a short GOP its share of the budget is smaller
-  const double gop_len = periodic ? static_cast<double>(std::max<uint32_t>(idr_period, 1)) : 1e9;
+  const double gop_len = g.periodic ? static_cast<double>(std::max<uint32_t>(g.idr_period, 1)) : 1e9;
   const double p_bits = frame_bits * gop_len / (gop_len + 3.0);
-  const double i_bits = intra_only || (periodic && idr_period <= 1) ? frame_bits : 4.0 * p_bits;
+  const double i_bits = g.intra_only || (g.periodic && g.idr_period <= 1) ? frame_bits : 4.0 * p_bits;
   int qp;
-  const vgpu_nvenc::EncPicture pic = to_enc_picture(f);
   if (mode == num(NV_ENC_PARAMS_RC_CONSTQP) || bitrate <= 0) {
-    qp = intra ? rc.constQP.qpIntra : rc.constQP.qpInterP;
+    qp = intra ? rc.constQP.qpIntra : (bpic ? rc.constQP.qpInterB : rc.constQP.qpInterP);
   } else if (intra) {
     // a stateless search, so that one frame always encodes to the same bytes: trial encodes on a scratch encoder
-    if (!s.h264_trial) s.h264_trial = std::make_unique<vgpu_nvenc::H264Encoder>(f.w, f.h, rate_num, rate_den, profile, true);
+    if (!s.trial) s.trial = make_encoder(s.codec, s.config, f.w, f.h, rate_num, rate_den);
+    const vgpu_nvenc::EncPicture pic = to_enc_picture(f);
     qp = vgpu_nvenc::initial_qp_for(f.w, f.h, rate_num, rate_den, static_cast<long>(i_bits * rate_num / std::max(rate_den, 1)));
     for (int trial = 0; trial < 4; ++trial) {
       vgpu_nvenc::EncStats st;
-      s.h264_trial->encode(pic, vgpu_nvenc::PicType::kIdr, qp, &st);
+      s.trial->encode(pic, vgpu_nvenc::PicType::kIdr, qp, &st);
       const double ratio = static_cast<double>(st.bytes) * 8 / i_bits;
       if (ratio > 0.85 && ratio < 1.2) break;
       const int next = std::min(51, std::max(8, qp + static_cast<int>(std::lround(6.0 * std::log2(ratio)))));
@@ -908,16 +954,30 @@ std::vector<uint8_t> encode_h264(Session& s, const Frame& f, const NV_ENC_PIC_PA
       qp = next;
     }
   } else {
-    qp = static_cast<int>(std::lround(s.rc_qp));
+    qp = static_cast<int>(std::lround(s.rc_qp)) + (bpic ? 2 : 0);
   }
-  if (rc.enableMinQP) qp = std::max<int>(qp, intra ? rc.minQP.qpIntra : rc.minQP.qpInterP);
-  if (rc.enableMaxQP) qp = std::min<int>(qp, intra ? rc.maxQP.qpIntra : rc.maxQP.qpInterP);
-  qp = std::min(51, std::max(0, qp));
+  if (rc.enableMinQP) qp = std::max<int>(qp, intra ? rc.minQP.qpIntra : (bpic ? rc.minQP.qpInterB : rc.minQP.qpInterP));
+  if (rc.enableMaxQP) qp = std::min<int>(qp, intra ? rc.maxQP.qpIntra : (bpic ? rc.maxQP.qpInterB : rc.maxQP.qpInterP));
+  return std::min(51, std::max(0, qp));
+}
 
+// Codes one picture with the QP the rate control picks, updates the rate control, and wraps the result with the parameter sets when they are due.
+Packet code_picture(Session& s, const Input1& in, vgpu_nvenc::PicType t, int rate_num, int rate_den, const GopCfg& g) {
+  const NV_ENC_RC_PARAMS& rc = s.config.rcParams;
+  const uint32_t mode = raw(rc.rateControlMode);
+  const Frame& f = *in.frame;
+  const bool intra = t == vgpu_nvenc::PicType::kIdr || t == vgpu_nvenc::PicType::kIntra;
+  const int qp = pick_qp(s, t, f, rate_num, rate_den, g);
+  const vgpu_nvenc::EncPicture pic = to_enc_picture(f);
   vgpu_nvenc::EncStats st;
-  std::vector<uint8_t> picture = s.h264->encode(pic, t, qp, &st);
+  std::vector<uint8_t> picture = s.enc->encode_at(pic, t, qp, in.disp, &st);
   // ---- rate control state
+  const long bitrate = rc.averageBitRate;
+  const double frame_bits = bitrate > 0 ? static_cast<double>(bitrate) * rate_den / std::max(rate_num, 1) : 0;
   if (frame_bits > 0 && mode != num(NV_ENC_PARAMS_RC_CONSTQP)) {
+    const double gop_len = g.periodic ? static_cast<double>(std::max<uint32_t>(g.idr_period, 1)) : 1e9;
+    const double p_bits = frame_bits * gop_len / (gop_len + 3.0);
+    const double i_bits = g.intra_only || (g.periodic && g.idr_period <= 1) ? frame_bits : 4.0 * p_bits;
     const double bits = static_cast<double>(picture.size()) * 8;
     if (t == vgpu_nvenc::PicType::kIdr) {
       s.rc_bits = bits;
@@ -932,19 +992,143 @@ std::vector<uint8_t> encode_h264(Session& s, const Frame& f, const NV_ENC_PIC_PA
       }
     }
   }
-  s.since_idr = t == vgpu_nvenc::PicType::kIdr ? 1 : s.since_idr + 1;
-  *pic_type = t == vgpu_nvenc::PicType::kIdr ? num(NV_ENC_PIC_TYPE_IDR) : (t == vgpu_nvenc::PicType::kIntra ? num(NV_ENC_PIC_TYPE_I) : num(NV_ENC_PIC_TYPE_P));
-  std::vector<uint8_t> out;
+  Packet pk;
+  pk.ts = in.ts;
+  pk.dur = in.dur;
+  pk.pic_struct = in.pic_struct;
+  pk.pic_type = t == vgpu_nvenc::PicType::kIdr ? num(NV_ENC_PIC_TYPE_IDR)
+                : (t == vgpu_nvenc::PicType::kIntra ? num(NV_ENC_PIC_TYPE_I) : (t == vgpu_nvenc::PicType::kBi ? num(NV_ENC_PIC_TYPE_B) : num(NV_ENC_PIC_TYPE_P)));
   size_t skip = 0;
-  if (!s.sent_parameter_sets || (flags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || (h.repeatSPSPPS && t == vgpu_nvenc::PicType::kIdr)) {
-    out = s.h264->parameter_sets();
+  if (!s.sent_parameter_sets || in.want_ps || (g.repeat_ps && t == vgpu_nvenc::PicType::kIdr)) {
+    pk.data = s.enc->parameter_sets();
     // The digest SEI message of an intra picture is the first NAL unit of its access unit, and needs the four-byte start code,
     // only when no parameter sets come before it (Annex B, zero_byte).
-    if (picture.size() > 4 && picture[3] == 1 && (picture[4] & 31) == 6) skip = 1;
+    if (picture.size() > 5 && picture[3] == 1 && (s.codec == kH264 ? (picture[4] & 31) == 6 : ((picture[4] >> 1) & 63) == 39)) skip = 1;
   }
-  out.insert(out.end(), picture.begin() + static_cast<std::ptrdiff_t>(skip), picture.end());
+  pk.data.insert(pk.data.end(), picture.begin() + static_cast<std::ptrdiff_t>(skip), picture.end());
   s.sent_parameter_sets = true;
-  return out;
+  return pk;
+}
+
+// Codes the pictures that wait for a P picture, with the last of them as that P picture and the rest as B pictures (end of stream, or an IDR
+// or intra picture is due): the packets in coding order.
+void flush_waiting(Session& s, int rate_num, int rate_den, const GopCfg& g, std::vector<Packet>* out) {
+  if (s.waiting.empty()) return;
+  std::vector<Session::Waiting> w = std::move(s.waiting);
+  s.waiting.clear();
+  Input1 a;
+  a.frame = &w.back().frame;
+  a.ts = w.back().ts;
+  a.dur = w.back().dur;
+  a.pic_struct = w.back().pic_struct;
+  a.disp = w.back().disp;
+  a.want_ps = w.back().want_ps;
+  out->push_back(code_picture(s, a, vgpu_nvenc::PicType::kInter, rate_num, rate_den, g));
+  for (size_t i = 0; i + 1 < w.size(); ++i) {
+    Input1 b;
+    b.frame = &w[i].frame;
+    b.ts = w[i].ts;
+    b.dur = w[i].dur;
+    b.pic_struct = w[i].pic_struct;
+    b.disp = w[i].disp;
+    b.want_ps = w[i].want_ps;
+    out->push_back(code_picture(s, b, vgpu_nvenc::PicType::kBi, rate_num, rate_den, g));
+  }
+}
+
+// Hands coded pictures to output buffers: the buffers of the calls that returned NV_ENC_ERR_NEED_MORE_INPUT, in the order of the calls, then
+// the current call's (the card fills them in this order whatever the picture; pictures arrive in coding order).
+void deliver(Session& s, std::vector<Packet>& packets, void* current_out) {
+  std::vector<void*> bufs(s.outstanding.begin(), s.outstanding.end());
+  s.outstanding.clear();
+  if (current_out) bufs.push_back(current_out);
+  for (size_t i = 0; i < packets.size() && i < bufs.size(); ++i) {
+    auto it = s.outputs.find(bufs[i]);
+    if (it == s.outputs.end()) continue;
+    Packet& p = packets[i];
+    it->second->pending.push_back({std::move(p.data), p.ts, p.dur, static_cast<uint32_t>(s.frames++), p.pic_struct, p.pic_type});
+  }
+}
+
+// One picture of a compressing session: decides its type from the GOP settings and the application's flags, and codes it, or holds it for the
+// P picture that follows it in display order (B pictures: the card answers NV_ENC_ERR_NEED_MORE_INPUT and fills the output buffers when the
+// group is coded). Returns the status NvEncEncodePicture answers.
+NVENCSTATUS encode_compressed(Session& s, const Frame& f, const NV_ENC_PIC_PARAMS& pp, int pic_struct, void* out_handle, int rate_num, int rate_den) {
+  std::vector<Packet> packets;
+  const bool changed_dims = s.enc && (s.enc_w != f.w || s.enc_h != f.h);
+  if (changed_dims && !s.waiting.empty()) {
+    GopCfg g0 = gop_cfg(s);
+    flush_waiting(s, s.enc_fps_num, s.enc_fps_den, g0, &packets);
+  }
+  ensure_encoder(s, f.w, f.h, rate_num, rate_den);
+  const GopCfg g = gop_cfg(s);
+  const uint32_t flags = pp.encodePicFlags;
+  Input1 in;
+  in.frame = &f;
+  in.ts = pp.inputTimeStamp;
+  in.dur = pp.inputDuration;
+  in.pic_struct = pic_struct;
+  in.want_ps = (flags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) != 0;
+  using vgpu_nvenc::PicType;
+  PicType t;
+  bool idr_now;
+  if (s.init.enablePTD) {
+    idr_now = s.since_idr == 0 || s.force_idr_next || (flags & NV_ENC_PIC_FLAG_FORCEIDR) || (g.periodic && s.since_idr >= g.idr_period);
+    if (idr_now) t = PicType::kIdr;
+    else if (g.intra_only || (flags & NV_ENC_PIC_FLAG_FORCEINTRA)) t = PicType::kIntra;   // frameIntervalP 0: the card writes an IDR picture and then I pictures (measured)
+    else t = PicType::kInter;
+  } else {
+    // the application decides (NV_ENC_PIC_PARAMS::pictureType); a first picture is always an IDR
+    const uint32_t pt = raw(pp.pictureType);
+    idr_now = s.since_idr == 0 || pt == num(NV_ENC_PIC_TYPE_IDR);
+    t = idr_now ? PicType::kIdr : (pt == num(NV_ENC_PIC_TYPE_I) ? PicType::kIntra : PicType::kInter);
+  }
+  s.force_idr_next = false;
+  if (t != PicType::kInter || g.nb == 0 || !s.init.enablePTD) {
+    // coded now: an IDR or intra picture first flushes the pictures that wait for their P picture
+    flush_waiting(s, rate_num, rate_den, g, &packets);
+    if (t == PicType::kIdr) s.since_idr = 0;
+    in.disp = static_cast<int>(s.since_idr);
+    packets.push_back(code_picture(s, in, t, rate_num, rate_den, g));
+    s.since_idr = s.since_idr + 1;
+    deliver(s, packets, out_handle);
+    return NV_ENC_SUCCESS;
+  }
+  // a P picture position with B pictures: the P picture ends a group when enough pictures wait for it, or when the GOP ends with it
+  const int d = static_cast<int>(s.since_idr);
+  const bool last_in_gop = g.periodic && static_cast<uint32_t>(d) + 1 == g.idr_period;
+  if (static_cast<int>(s.waiting.size()) < g.nb && !last_in_gop) {
+    Session::Waiting w;
+    w.frame = f;
+    w.ts = in.ts;
+    w.dur = in.dur;
+    w.pic_struct = pic_struct;
+    w.disp = d;
+    w.want_ps = in.want_ps;
+    s.waiting.push_back(std::move(w));
+    s.outstanding.push_back(out_handle);
+    s.since_idr = s.since_idr + 1;
+    return NV_ENC_ERR_NEED_MORE_INPUT;
+  }
+  in.disp = d;
+  packets.push_back(code_picture(s, in, PicType::kInter, rate_num, rate_den, g));
+  {
+    std::vector<Session::Waiting> w = std::move(s.waiting);
+    s.waiting.clear();
+    for (const Session::Waiting& b : w) {
+      Input1 bi;
+      bi.frame = &b.frame;
+      bi.ts = b.ts;
+      bi.dur = b.dur;
+      bi.pic_struct = b.pic_struct;
+      bi.disp = b.disp;
+      bi.want_ps = b.want_ps;
+      packets.push_back(code_picture(s, bi, PicType::kBi, rate_num, rate_den, g));
+    }
+  }
+  s.since_idr = s.since_idr + 1;
+  deliver(s, packets, out_handle);
+  return NV_ENC_SUCCESS;
 }
 
 }  // namespace
@@ -967,7 +1151,15 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   if (!params) return NV_ENC_ERR_INVALID_PTR;
   if (!version_ok(params->version, NV_ENC_PIC_PARAMS_VER)) return NV_ENC_ERR_INVALID_VERSION;
   if (!s->initialized) return NV_ENC_ERR_DEVICE_NOT_EXIST;
-  if (params->encodePicFlags & NV_ENC_PIC_FLAG_EOS) return NV_ENC_SUCCESS;   // nothing is held back
+  if (params->encodePicFlags & NV_ENC_PIC_FLAG_EOS) {
+    // end of stream: the pictures that wait for a P picture are coded now, into the buffers of their calls
+    if (!s->waiting.empty() && s->enc) {
+      std::vector<Packet> packets;
+      flush_waiting(*s, s->enc_fps_num, s->enc_fps_den, gop_cfg(*s), &packets);
+      deliver(*s, packets, nullptr);
+    }
+    return NV_ENC_SUCCESS;
+  }
   if (!params->inputBuffer || !params->outputBitstream) return NV_ENC_ERR_INVALID_PARAM;
   const int ps = static_cast<int>(raw(params->pictureStruct));
   if (ps < 1 || ps > 3) return fail(s, NV_ENC_ERR_INVALID_PARAM, "Invalid value for NV_ENC_PIC_STRUCT.");
@@ -1005,19 +1197,20 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
   const int rate_den = s->init.frameRateDen ? static_cast<int>(s->init.frameRateDen) : 1;
   const auto luma = [&](int x, int y) { return f.y[static_cast<size_t>(y) * f.w + x]; };
   const auto chroma = [&](int plane, int x, int y) { return (plane ? f.v : f.u)[static_cast<size_t>(y) * f.cw + x]; };
-  std::vector<uint8_t> bits, picture;
-  uint32_t pic_type = num(NV_ENC_PIC_TYPE_IDR);   // the PCM streams: every picture is an IDR
-  if (s->codec == kHevc) {
-    vgpu_nvenc::HevcStream st;
-    st.width = w;
-    st.height = h;
-    st.fps_num = rate_num;
-    st.fps_den = rate_den;
-    if (!s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.hevcConfig.repeatSPSPPS)
-      bits = st.parameter_sets();
-    picture = st.idr(luma, chroma);
-  } else {
-    if (h264_lossless(*s)) {
+  Output& o = *out->second;
+  if (lossless(*s)) {
+    // the PCM streams: every picture is an IDR picture
+    std::vector<uint8_t> bits, picture;
+    if (s->codec == kHevc) {
+      vgpu_nvenc::HevcStream st;
+      st.width = w;
+      st.height = h;
+      st.fps_num = rate_num;
+      st.fps_den = rate_den;
+      if (!s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.hevcConfig.repeatSPSPPS)
+        bits = st.parameter_sets();
+      picture = st.idr(luma, chroma);
+    } else {
       vgpu_nvenc::H264Stream st;
       st.width = w;
       st.height = h;
@@ -1026,15 +1219,13 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncEncodePicture(void* encoder, NV_ENC_PIC_PA
       if (!s->sent_parameter_sets || (params->encodePicFlags & NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) || s->config.encodeCodecConfig.h264Config.repeatSPSPPS)
         bits = st.parameter_sets();
       picture = st.idr(luma, chroma, 0);
-    } else {
-      bits = encode_h264(*s, f, *params, rate_num, rate_den, &pic_type);
     }
+    s->sent_parameter_sets = true;
+    bits.insert(bits.end(), picture.begin(), picture.end());
+    o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps, num(NV_ENC_PIC_TYPE_IDR)});
+    return NV_ENC_SUCCESS;
   }
-  s->sent_parameter_sets = true;
-  bits.insert(bits.end(), picture.begin(), picture.end());
-  Output& o = *out->second;
-  o.pending.push_back({std::move(bits), params->inputTimeStamp, params->inputDuration, static_cast<uint32_t>(s->frames++), ps, pic_type});
-  return NV_ENC_SUCCESS;
+  return encode_compressed(*s, f, *params, ps, params->outputBitstream, rate_num, rate_den);
 }
 
 VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncLockBitstream(void* encoder, NV_ENC_LOCK_BITSTREAM* params) {
@@ -1144,8 +1335,14 @@ VGPU_EXPORT NVENCSTATUS NVENCAPI NvEncGetSequenceParamEx(void* encoder, NV_ENC_I
   const int codec = codec_of(init->encodeGUID);
   if (codec == kNoCodec) return NV_ENC_ERR_UNSUPPORTED_PARAM;
   if (init->encodeWidth == 0 || init->encodeHeight == 0) return NV_ENC_ERR_INVALID_PARAM;
-  const std::vector<uint8_t> ps = parameter_sets_of(codec, static_cast<int>(init->encodeWidth), static_cast<int>(init->encodeHeight),
-                                                    init->frameRateNum, init->frameRateDen);
+  NV_ENC_PRESET_CONFIG pc{};
+  pc.version = NV_ENC_PRESET_CONFIG_VER;
+  pc.presetCfg.version = NV_ENC_CONFIG_VER;
+  const int tuning = static_cast<int>(raw(init->tuningInfo));
+  if (init->encodeConfig) pc.presetCfg = *init->encodeConfig;
+  else preset_config(codec, std::max(1, preset_index(init->presetGUID)), tuning >= 1 && tuning <= 4 ? tuning : 1, &pc);
+  const std::vector<uint8_t> ps = parameter_sets_of(codec, lossless_of(codec, static_cast<uint32_t>(tuning), pc.presetCfg), pc.presetCfg,
+                                                    static_cast<int>(init->encodeWidth), static_cast<int>(init->encodeHeight), init->frameRateNum, init->frameRateDen);
   if (params->inBufferSize < ps.size()) return NV_ENC_ERR_OUT_OF_MEMORY;
   std::memcpy(params->spsppsBuffer, ps.data(), ps.size());
   *params->outSPSPPSPayloadSize = static_cast<uint32_t>(ps.size());
