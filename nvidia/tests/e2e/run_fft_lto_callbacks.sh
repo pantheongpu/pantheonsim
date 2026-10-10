@@ -71,7 +71,7 @@ fi
 status=0
 result="$(VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$dir/prog" "$dir/loads.fatbin" "$dir/stores.fatbin" 2>&1)" || status=$?
 if skip="$(grep -m1 '^SKIP:' <<< "$result")"; then
-  why="$(grep -m1 -A2 'LTO callback link failed' <<< "$result" | tr '\n' ' ')"
+  why="$(grep -m1 -A2 'LTO callback link failed' <<< "$result" | tr '\n' ' ' || true)"
   echo "$skip${why:+ [$why]}"; exit 0
 fi
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
