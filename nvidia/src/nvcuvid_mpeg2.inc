@@ -103,7 +103,7 @@ class Mpeg2CuvidSink : public vgpu_mpeg2::ParserSink {
 
   int sequence(const vgpu_mpeg2::SeqInfo& i) override {
     CUVIDEOFORMAT f{};
-    f.codec = cudaVideoCodec_MPEG2;
+    f.codec = i.mpeg1 ? cudaVideoCodec_MPEG1 : cudaVideoCodec_MPEG2;
     f.frame_rate.numerator = i.fps_num;
     f.frame_rate.denominator = i.fps_den;
     f.progressive_sequence = i.progressive ? 1 : 0;

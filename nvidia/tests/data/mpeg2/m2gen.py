@@ -109,7 +109,7 @@ DCT1 = dct_table('kDctOneVlc')
 
 class Stream:
     def __init__(self, width, height, progressive_sequence=True, frame_rate_code=5, aspect=1, seed=1, intra_matrix=None, inter_matrix=None,
-                 profile_level=0x48, low_delay=0, bit_rate=0x3ffff, display=None):
+                 profile_level=0x48, low_delay=0, bit_rate=0x3ffff, display=None, chroma_format=1, rate_ext=(0, 0), no_seq_ext=False, vbv=112):
         self.w = width
         self.h = height
         self.prog = progressive_sequence
@@ -126,6 +126,10 @@ class Stream:
         self.low_delay = low_delay
         self.bit_rate = bit_rate
         self.display = display
+        self.chroma_format = chroma_format
+        self.rate_ext = rate_ext
+        self.no_seq_ext = no_seq_ext
+        self.vbv = vbv
 
     # ---- headers ----
     def sequence_header(self, repeat_matrices=True):
@@ -137,7 +141,7 @@ class Stream:
         b.put(self.frame_rate_code, 4)
         b.put(self.bit_rate & 0x3ffff, 18)
         b.put(1, 1)
-        b.put(112, 10)
+        b.put(self.vbv & 0x3ff, 10)
         b.put(0, 1)
         for m, loaded in ((self.intra_matrix, self.intra_matrix is not None), (self.inter_matrix, self.inter_matrix is not None)):
             b.put(1 if loaded else 0, 1)
@@ -146,19 +150,22 @@ class Stream:
                 for n in range(64):
                     b.put(m[zz[n]], 8)
         # sequence_extension
+        if self.no_seq_ext:
+            self.out += b.bytes()
+            return
         b.start_code(0xB5)
         b.put(1, 4)
         b.put(self.profile_level, 8)
         b.put(1 if self.prog else 0, 1)
-        b.put(1, 2)
+        b.put(self.chroma_format, 2)
         b.put(self.w >> 12, 2)
         b.put(self.h >> 12, 2)
         b.put(self.bit_rate >> 18, 12)
         b.put(1, 1)
         b.put(0, 8)
         b.put(self.low_delay, 1)
-        b.put(0, 2)
-        b.put(0, 5)
+        b.put(self.rate_ext[0], 2)
+        b.put(self.rate_ext[1], 5)
         if self.display:
             b.start_code(0xB5)
             b.put(2, 4)
@@ -215,6 +222,10 @@ class Stream:
         if ptype == 3:
             b.put(0, 1)
             b.put(7, 3)
+        if extra.get('junk'):
+            for k in range(self.rnd.randint(1, 2)):
+                b.put(1, 1)
+                b.put(self.rnd.randint(1, 255), 8)   # extra_information_picture
         b.put(0, 1)   # extra_bit_picture
         b.start_code(0xB5)
         b.put(8, 4)
@@ -249,6 +260,22 @@ class Stream:
                 self.matrices[1] = list(lni)
             b.put(0, 1)
             b.put(0, 1)
+        if extra.get('junk'):
+            b.start_code(0xB5)      # a copyright extension (id 4) and user data may follow the picture coding extension
+            b.put(4, 4)
+            b.put(1, 1)            # copyright_flag
+            b.put(0x11, 8)         # copyright_identifier
+            b.put(1, 1)            # original_or_copy
+            b.put(0, 7)            # reserved
+            b.put(1, 1)
+            b.put(0xABCDE, 20)     # copyright_number_1
+            b.put(1, 1)
+            b.put(0x2AAAAA, 22)    # copyright_number_2
+            b.put(1, 1)
+            b.put(0x155555, 22)    # copyright_number_3
+            b.start_code(0xB2)
+            b.put(0x55, 8)
+            b.put(0xAA, 8)
         pic['bits'] = b
         rows = self.mbh // 2 if structure != 3 else self.mbh
         for row in range(rows):
@@ -258,16 +285,36 @@ class Stream:
     # ---- slices and macroblocks ----
     def slice(self, pic, row, mb_source):
         b = pic['bits']
+        cols = list(range(self.mbw))
+        # a row may be several slices (pic['slices_per_row']): they start at random columns
+        starts = [0]
+        n = pic.get('slices_per_row', 1)
+        if n > 1 and self.mbw > 1:
+            starts += sorted(self.rnd.sample(range(1, self.mbw), min(n - 1, self.mbw - 1)))
+        explicit = mb_source(pic, row, self) if mb_source else None
+        for si, c0 in enumerate(starts):
+            c1 = starts[si + 1] if si + 1 < len(starts) else self.mbw
+            self.slice_part(pic, row, c0, c1, explicit, b)
+
+    def slice_part(self, pic, row, c0, c1, explicit, b):
         b.start_code(1 + row)
         qcode = pic['slice_qcode'] or (self.rnd.randint(1, 31) if pic['qst'] else self.rnd.randint(1, 20))
         st = dict(qcode=qcode, dc=[128 << pic['dc_prec']] * 3, pmv=[[[0, 0], [0, 0]], [[0, 0], [0, 0]]], prev=None, row=row)
         b.put(qcode, 5)
+        if pic.get('junk'):
+            # slice_extension_flag with intra_slice, slice_picture_id and extra information bytes
+            b.put(1, 1)
+            b.put(0, 1)
+            b.put(0, 1)
+            b.put(0, 6)
+            for k in range(self.rnd.randint(0, 2)):
+                b.put(1, 1)
+                b.put(self.rnd.randint(0, 255), 8)
         b.put(0, 1)
         skipped = 0
         first = True
-        explicit = mb_source(pic, row, self) if mb_source else None
-        for col in range(self.mbw):
-            mb = explicit[col] if explicit is not None else self.next_mb(pic, st, col, row)
+        for col in range(c0, c1):
+            mb = explicit[col] if explicit is not None else self.next_mb(pic, st, col, row, first, col == c1 - 1)
             if mb is None:     # skipped macroblock
                 skipped += 1
                 if pic['ptype'] == 2:
@@ -282,7 +329,7 @@ class Stream:
             skipped = 0
             self.put_increment(b, inc)
             self.put_macroblock(pic, st, mb)
-        # a slice cannot end with a skipped macroblock: next_mb never skips the last one
+        # a slice cannot end with a skipped macroblock: next_mb never skips the last one of a slice
 
     def put_increment(self, b, inc):
         while inc > 33:
@@ -357,8 +404,14 @@ def reset_pmv():
     return [[[0, 0], [0, 0]], [[0, 0], [0, 0]]]
 
 
+STATS = {}
+
+
 def put_macroblock(self, pic, st, mb):
     b = pic['bits']
+    _t = mb['type']
+    _k = ('frame' if pic['structure'] == 3 else 'field', 'P%d' % pic['ptype'], 'intra' if _t['intra'] else 'mt%d' % mb.get('motion_type', 0), 'fwd' if _t['fwd'] else '', 'bwd' if _t['bwd'] else '', 'dct%d' % mb.get('dct_type', 0), 'conceal' if (_t['intra'] and pic['conceal']) else '')
+    STATS[_k] = STATS.get(_k, 0) + 1
     ptype = pic['ptype']
     t = mb['type']
     key = (t['quant'], t['fwd'], t['bwd'], t['pattern'], t['intra'])
@@ -615,7 +668,7 @@ def random_mb(self, pic, st, col, row):
     ptype = pic['ptype']
     frame_pic = pic['structure'] == 3
     dens = pic['density']
-    level_cap = rnd.choice([1, 2, 3, 6, 12])
+    level_cap = pic.get('level_cap') or rnd.choice([1, 2, 3, 6, 12])
     for attempt in range(60):
         mb = {'type': {}, 'mv': {}, 'sel': {}}
         if ptype == 1:
@@ -705,10 +758,10 @@ def skip_fits(self, pic, st, col, row):
     return self.blocks_fit(pic, col, row, mb)
 
 
-def next_mb(self, pic, st, col, row):
+def next_mb(self, pic, st, col, row, first=False, last=False):
     rnd = self.rnd
     ptype = pic['ptype']
-    can_skip = ptype in (2, 3) and 0 < col < self.mbw - 1 and not pic.get('no_skip') and rnd.random() < 0.15
+    can_skip = ptype in (2, 3) and not first and not last and not pic.get('no_skip') and rnd.random() < 0.15
     if can_skip and ptype == 3 and not self.skip_fits(pic, st, col, row):
         can_skip = False
     if can_skip:

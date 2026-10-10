@@ -52,7 +52,7 @@ struct Mpeg2Parser::Impl {
     bool used;
   };
   std::deque<TsMark> marks;
-  int64_t last_pic_ts = 0;
+  int64_t last_pic_ts = 0, last_pic_dur = 0;
   bool have_last_ts = false;
   std::priority_queue<int64_t, std::vector<int64_t>, std::greater<int64_t>> ts_heap;
 
@@ -63,6 +63,8 @@ struct Mpeg2Parser::Impl {
   uint8_t intra_matrix[64], inter_matrix[64];
   SeqInfo last_info;
   bool have_info = false;
+  bool seq_disabled = false;      // the application's sequence callback refused the sequence: its pictures are not decoded
+  bool seq_valid = false;         // the last sequence header is one the card accepts (a frame rate code 1 to 8)
   int pool = 0;
   std::deque<int> free_list;      // decode surfaces not in use, in the order they were released
   std::vector<FrmPtr> surf;       // the frame store each surface holds
@@ -82,7 +84,7 @@ struct Mpeg2Parser::Impl {
     bool skip = false;
     PicDesc desc;
     int64_t ts = 0;
-    bool have_ts = false;
+    uint64_t offset = 0;
     bool has_slices = false;
   };
   std::unique_ptr<Cur> cur;
@@ -178,6 +180,8 @@ struct Mpeg2Parser::Impl {
         if (!parse_sequence_header(d, dn, &s)) break;
         seq = s;
         have_seq = true;
+        seq_valid = s.frame_rate_code >= 1 && s.frame_rate_code <= 8;
+        if (!s.has_extension) s.progressive_sequence = 1;
         std::memcpy(intra_matrix, seq.intra_matrix, 64);
         std::memcpy(inter_matrix, seq.inter_matrix, 64);
         break;
@@ -220,7 +224,15 @@ struct Mpeg2Parser::Impl {
     if (!cur || cur->skip) return;
     // the sequence is announced when the first slice of an intra picture has been read (the picture is not complete yet), also when a
     // new sequence header changed it
-    if (!cur->has_slices && cur->h.picture_coding_type == 1 && have_seq) announce_sequence();
+    if (!cur->has_slices) {
+      const int structure = cur->h.has_extension ? cur->h.picture_structure : 3;
+      const bool second = pending_first && structure != 3 && (structure == 2 ? 1 : 0) != pending_parity;
+      assign_timestamp(*cur, second);
+      if (cur->h.picture_coding_type == 1 && have_seq && seq_valid && !announce_sequence()) {
+        cur->skip = true;
+        return;
+      }
+    }
     PicDesc& dsc = cur->desc;
     dsc.slice_offsets.push_back(static_cast<unsigned>(dsc.data.size()));
     dsc.data.insert(dsc.data.end(), {0, 0, 1});
@@ -231,15 +243,18 @@ struct Mpeg2Parser::Impl {
   // ================================================================== pictures
   void begin_picture(const uint8_t* d, size_t n, uint64_t abs_offset) {
     cur = std::make_unique<Cur>();
-    if (!parse_picture_header(d, n, &cur->h) || !have_seq) {
-      cur->skip = true;
-      return;
-    }
-    // timestamp of this picture
+    cur->offset = abs_offset;
+    if (!parse_picture_header(d, n, &cur->h) || !have_seq) cur->skip = true;
+  }
+
+  // The timestamp of the picture, taken when its first slice is read (the picture coding extension has said by then whether it is a
+  // field): the last timestamp given at or before the picture header, once; a picture without one follows the last by a frame
+  // duration, and the second field of a frame has its first field's.
+  void assign_timestamp(Cur& c, bool second_field) {
     int64_t ts = 0;
     bool taken = false;
     for (auto it = marks.rbegin(); it != marks.rend(); ++it)
-      if (it->at <= abs_offset) {
+      if (it->at <= c.offset) {
         if (!it->used) {
           it->used = true;
           ts = it->ts;
@@ -248,17 +263,21 @@ struct Mpeg2Parser::Impl {
         break;
       }
     if (!taken) {
-      if (have_last_ts) {
-        const unsigned num = seq_fps_num() ? seq_fps_num() : 30, den = seq_fps_num() ? seq_fps_den() : 1;
-        ts = last_pic_ts + static_cast<int64_t>(clock_rate) * den / num;
-      } else {
-        ts = 0;
-      }
+      if (have_last_ts) ts = second_field ? last_pic_ts : last_pic_ts + last_pic_dur;
+      else ts = 0;
     }
-    while (marks.size() > 1 && marks[1].at <= abs_offset) marks.pop_front();
-    last_pic_ts = ts;
-    have_last_ts = true;
-    cur->ts = ts;
+    while (marks.size() > 1 && marks[1].at <= c.offset) marks.pop_front();
+    if (!second_field || taken) {
+      last_pic_ts = ts;
+      have_last_ts = true;
+      // how long the picture lasts (measured): a frame period, the period doubled or tripled by a progressive sequence's repeat
+      // flags, and half a period more by an interlaced one's
+      const unsigned num = seq_fps_num() ? seq_fps_num() : 30, den = seq_fps_num() ? seq_fps_den() : 1;
+      const int64_t period = static_cast<int64_t>(clock_rate) * den / num;
+      const int rep = repeat_of(c.h);
+      last_pic_dur = rep == 2 ? 2 * period : rep == 4 ? 3 * period : rep == 1 ? period + period / 2 : period;
+    }
+    c.ts = ts;
   }
 
   unsigned seq_fps_num() const {
@@ -273,7 +292,7 @@ struct Mpeg2Parser::Impl {
   SeqInfo make_info() const {
     SeqInfo i;
     i.coded_w = seq.horizontal_size;   // measured: not rounded up
-    i.coded_h = seq.progressive_sequence ? (seq.vertical_size + 15) & ~15 : (seq.vertical_size + 31) & ~31;
+    i.coded_h = (seq.progressive_sequence || !seq.has_extension) ? (seq.vertical_size + 15) & ~15 : (seq.vertical_size + 31) & ~31;
     i.disp_left = 0;
     i.disp_top = 0;
     i.disp_right = seq.horizontal_size;
@@ -284,7 +303,8 @@ struct Mpeg2Parser::Impl {
       const unsigned g = static_cast<unsigned>(gcd_int(static_cast<int>(i.fps_num), static_cast<int>(i.fps_den)));
       (void)g;   // the card reports the table's numbers unreduced (30000/1000)
     }
-    i.progressive = seq.progressive_sequence != 0;
+    i.mpeg1 = !seq.has_extension;
+    i.progressive = i.mpeg1 || seq.progressive_sequence != 0;
     i.chroma_format = seq.has_extension ? seq.chroma_format : 1;
     i.bitrate = seq.bit_rate * 400;
     i.min_surfaces = 4;
@@ -307,13 +327,17 @@ struct Mpeg2Parser::Impl {
     }
     i.dar_x = static_cast<int>(dx);
     i.dar_y = static_cast<int>(dy);
+    if (i.mpeg1) {
+      i.video_format = 5;   // measured: the card's defaults for a stream without sequence extension (MPEG-1): unspecified
+      i.primaries = i.transfer = i.matrix = 2;
+    }
     if (seq.has_display) {
       i.video_format = seq.video_format;
       i.primaries = seq.colour_primaries;
       i.transfer = seq.transfer_characteristics;
       i.matrix = seq.matrix_coefficients;
     }
-    i.supported = i.chroma_format == 1;
+    i.supported = i.chroma_format == 1 && !i.mpeg1;
     return i;
   }
 
@@ -347,7 +371,7 @@ struct Mpeg2Parser::Impl {
         return i;
       }
       // every surface is in use: show pictures until one is free
-      if (!out_queue.empty()) {
+      if (!out_queue.empty() && !out_queue.front()->current) {
         display_front();
       } else if (waiting) {
         queue_waiting();
@@ -379,7 +403,9 @@ struct Mpeg2Parser::Impl {
 
   // The frames shown are held back by the application's display delay (at most two pictures: measured; more than that is
   // not possible with four decode surfaces).
-  size_t delay_limit() const { return std::min<size_t>(max_delay, 2); }
+  // With field pictures the card keeps the same delay at most one picture (measured; two or three with fields is not reproduced).
+  size_t delay_limit() const { return std::min<size_t>(max_delay, saw_field ? 1 : 2); }
+  bool saw_field = false;
 
   void display_front() {
     FrmPtr f = out_queue.front();
@@ -389,7 +415,14 @@ struct Mpeg2Parser::Impl {
 
   void queue_frame(const FrmPtr& f) {
     out_queue.push_back(f);
-    while (out_queue.size() > delay_limit()) display_front();
+    pop_queue(false);
+  }
+
+  // Shows the frames beyond the delay. The front must be complete; when a field picture starts, a B frame in front is not shown yet.
+  void pop_queue(bool first_field) {
+    while (out_queue.size() > delay_limit() && !out_queue.front()->current &&
+           !(first_field && out_queue.front()->type == 3))
+      display_front();
   }
 
   // the reference frame waiting for the next one joins the display queue
@@ -406,36 +439,51 @@ struct Mpeg2Parser::Impl {
   }
 
   // ---- finishing a picture: the decode callback and what follows ----
-  void announce_sequence() {
+  // The sequence is announced when the first slice of an intra picture has been read (the picture is not complete yet) and it differs
+  // from the last one announced in any field. Returns false if the application's callback refused it: its pictures are dropped until the
+  // next sequence that differs. A change of the coded size ends the old sequence: the pictures waiting for display are shown first.
+  bool announce_sequence() {
     const SeqInfo info = make_info();
     const bool first = !have_info;
     const bool changed = first || !same_info(info, last_info);
-    if (!changed) return;
-    if (!first) flush_display();
+    if (!changed) return !seq_disabled;
+    const bool geometry = !first && (info.coded_w != last_info.coded_w || info.coded_h != last_info.coded_h);
+    if (geometry) flush_display();
     last_info = info;
     have_info = true;
     const int ret = sink->sequence(info);
+    seq_disabled = ret == 0;
     pool = ret > 1 ? ret : std::max(1, info.min_surfaces);
-    // the frames of the old sequence are all output; the surfaces keep their state
-    if (ref_old) ref_old->ref = false;
-    if (ref_new) ref_new->ref = false;
-    ref_old.reset();
-    ref_new.reset();
-    pending_first.reset();
-    std::deque<int> order;
-    for (int i : free_list)
-      if (i < pool) order.push_back(i);
-    for (int i = static_cast<int>(surf.size()); i < pool; ++i) order.push_back(i);
-    free_list = order;
-    surf.resize(static_cast<size_t>(pool));
-    held.reset();
+    if (first || geometry) {
+      // the frames of the old sequence are all output; the surfaces keep their state, in the order they are handed out again
+      if (ref_old) ref_old->ref = false;
+      if (ref_new) ref_new->ref = false;
+      ref_old.reset();
+      ref_new.reset();
+      pending_first.reset();
+      held.reset();
+      std::deque<int> order;
+      std::vector<bool> in(static_cast<size_t>(pool), false);
+      for (int i : free_list)
+        if (i < pool && !in[static_cast<size_t>(i)]) {
+          order.push_back(i);
+          in[static_cast<size_t>(i)] = true;
+        }
+      for (int i = 0; i < pool; ++i)
+        if (!in[static_cast<size_t>(i)]) order.push_back(i);
+      free_list = order;
+      surf.assign(static_cast<size_t>(pool), FrmPtr());
+    } else if (static_cast<int>(surf.size()) != pool) {
+      surf.resize(static_cast<size_t>(pool));
+    }
+    return !seq_disabled;
   }
 
   void finish_picture() {
     if (!cur) return;
     std::unique_ptr<Cur> own = std::move(cur);
     Cur& c = *own;
-    if (c.skip || !c.has_slices || !have_seq) return;
+    if (c.skip || !c.has_slices || !have_seq || !seq_valid || seq_disabled || !have_info) return;
     const PicHeader& h = c.h;
     const int type = h.picture_coding_type;
     if (type < 1 || type > 3) return;
@@ -456,6 +504,7 @@ struct Mpeg2Parser::Impl {
         reuse_idx_ = old->idx;
         old->ref = false;
         old->need_output = false;
+        out_queue.erase(std::remove(out_queue.begin(), out_queue.end(), old), out_queue.end());
         old->released = true;   // the surface is taken again below
       }
     }
@@ -509,15 +558,29 @@ struct Mpeg2Parser::Impl {
     if (field && !second) {
       pending_first = f;
       pending_parity = parity;
+      saw_field = true;
+      // a field picture takes part in the display queue from its first field on (measured)
+      if (delay_limit() > 0) {
+        if (type == 3) {
+          out_queue.push_back(f);
+        } else if (waiting) {
+          FrmPtr w = waiting;
+          waiting.reset();
+          out_queue.push_back(w);
+        }
+      }
+      pop_queue(true);
       return;
     }
     pending_first.reset();
     f->current = false;
     f->need_output = true;
     if (type == 3) {
-      queue_frame(f);
+      if (std::find(out_queue.begin(), out_queue.end(), f) != out_queue.end()) pop_queue(false);
+      else queue_frame(f);
     } else if (seq.low_delay) {
       // a low delay sequence has no reordering: the picture is shown at once
+      queue_waiting();
       f->ref = true;
       if (ref_old) {
         ref_old->ref = false;
@@ -536,6 +599,7 @@ struct Mpeg2Parser::Impl {
       ref_new = f;
       queue_waiting();
       waiting = f;
+      pop_queue(false);
     }
   }
 

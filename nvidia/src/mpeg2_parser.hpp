@@ -21,6 +21,7 @@ struct SeqInfo {
   int disp_left = 0, disp_top = 0, disp_right = 0, disp_bottom = 0;
   unsigned fps_num = 0, fps_den = 0;
   bool progressive = true;
+  bool mpeg1 = false;         // no sequence extension: an MPEG-1 stream (the card names the codec MPEG-1 in the sequence callback)
   int chroma_format = 1;
   int min_surfaces = 4;
   unsigned bitrate = 0;

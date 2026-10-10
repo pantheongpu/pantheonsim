@@ -2,13 +2,14 @@
 // libnvcuvid printed on an RTX 3060 (driver 595): decoder capabilities, decoder creation
 // for MPEG-2, and, for each stream in nvidia/tests/data/mpeg2, every callback of the video
 // parser (the sequence format, the picture parameters handed to cuvidDecodePicture, the
-// display order and timestamps) and the CRC-32 of every displayed surface. MPEG-2 leaves the
-// inverse DCT to the decoder within a tolerance: the checksums here are the card's.
+// display order and timestamps) and every displayed frame against the card's. MPEG-2 leaves the
+// inverse DCT to the decoder within a tolerance: the frames of a decoder other than the card's
+// are compared with the card's pixel files (nvidia/tests/data/nvdec/mpeg2) within bounds.
 //
 // One line per fact. nvcuvid_mpeg2.rtx3060.txt is what the card printed;
 // run_nvcuvid_mpeg2.sh compares this program's output with it.
 //
-//   nvcuvid_mpeg2 [--dump DIR] [--only NAME] [--file PATH] [--skip NAME,NAME] DATA_DIR
+//   nvcuvid_mpeg2 [--dump DIR] [--golden DIR [--update]] [--only NAME] [--file PATH] [--skip NAME,NAME] [--extra] DATA_DIR
 #include <dlfcn.h>
 #include <cuda.h>
 
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -54,9 +56,15 @@ static uint32_t crc32(const uint8_t* d, size_t n, uint32_t crc = 0) {
   return ~crc;
 }
 
-static std::string dump_dir, data_dir;
-static bool g_force_nv12 = false;   // 10-bit streams into a decoder that outputs NV12
+static std::string dump_dir, data_dir, golden_dir;
+static bool update_golden = false;  // with --golden: write the pixel files from this (the card's) library
 static int failures = 0;
+
+// MPEG-2 leaves the inverse DCT to the decoder within the accuracy of IEEE 1180 (H.262 Annex A): the card's NVDEC and a decoder that
+// is exact to within that accuracy differ by one level in a few percent of the samples of an intra picture, and the differences carry
+// into the pictures predicted from it. A frame is "ok" when it is within these bounds of the card's.
+static constexpr int kMaxDiff = 6;
+static constexpr double kMaxDiffFraction = 0.25;
 
 struct Run {
   CUvideodecoder dec = nullptr;
@@ -69,6 +77,10 @@ struct Run {
   int create_result = 0;
   int decode_fail = 0;
   unsigned bytes = 1;             // bytes per sample of the surface (P016: 2)
+  std::string stream;             // the stream's name (the pixel file's)
+  std::vector<uint8_t> golden;    // the card's frames of the stream (nvidia/tests/data/nvdec/mpeg2), concatenated
+  size_t golden_at = 0;
+  bool write_golden = false;
 };
 static Run* run = nullptr;
 
@@ -94,7 +106,7 @@ static int CUDAAPI seq_cb(void*, CUVIDEOFORMAT* f) {
   ci.ChromaFormat = f->chroma_format;
   ci.ulCreationFlags = cudaVideoCreate_PreferCUVID;
   ci.bitDepthMinus8 = f->bit_depth_luma_minus8;
-  ci.OutputFormat = f->bit_depth_luma_minus8 && !g_force_nv12 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
+  ci.OutputFormat = cudaVideoSurfaceFormat_NV12;
   ci.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
   ci.ulMaxWidth = f->coded_width;
   ci.ulMaxHeight = f->coded_height;
@@ -111,7 +123,7 @@ static int CUDAAPI seq_cb(void*, CUVIDEOFORMAT* f) {
     ci.ulTargetWidth = f->coded_width;
     ci.ulTargetHeight = f->coded_height;
   }
-  run->bytes = (f->bit_depth_luma_minus8 && !g_force_nv12) ? 2 : 1;
+  run->bytes = 1;
   run->w = dw;
   run->h = dh;
   const CUresult r = cuvidCreateDecoder(&run->dec, &ci);
@@ -178,9 +190,29 @@ static int CUDAAPI disp_cb(void*, CUVIDPARSERDISPINFO* d) {
       const uint8_t* row = &all[static_cast<size_t>(sh + y0 / 2 + y) * pitch + (x0 & ~1u) * B];
       out.insert(out.end(), row, row + ((w + 1) & ~1u) * B);
     }
-    const uint32_t c = crc32(out.data(), out.size());
-    std::printf("  frame %d: %ux%u crc %08x luma %08x\n", run->frames, w, h, c, crc32(out.data(), static_cast<size_t>(w) * h * B));
-    run->all_crc = crc32(reinterpret_cast<const uint8_t*>(&c), 4, run->all_crc);
+    // the frame against the card's (the pixel file): the transcript says only whether it is within the bounds
+    bool ok = true;
+    int maxd = 0;
+    size_t nd = 0;
+    if (run->write_golden) {
+      std::ofstream o(golden_dir + "/" + run->stream + ".nv12", std::ios::binary | std::ios::app);
+      o.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    } else if (run->golden_at + out.size() <= run->golden.size()) {
+      const uint8_t* g = &run->golden[run->golden_at];
+      for (size_t i = 0; i < out.size(); ++i) {
+        const int dd = std::abs(static_cast<int>(out[i]) - static_cast<int>(g[i]));
+        if (dd) ++nd;
+        maxd = std::max(maxd, dd);
+      }
+      ok = maxd <= kMaxDiff && static_cast<double>(nd) <= kMaxDiffFraction * static_cast<double>(out.size());
+    }
+    run->golden_at += out.size();
+    if (ok) {
+      std::printf("  frame %d: %ux%u ok\n", run->frames, w, h);
+    } else {
+      std::printf("  frame %d: %ux%u MISMATCH max difference %d, %zu of %zu samples differ\n", run->frames, w, h, maxd, nd, out.size());
+      ++failures;
+    }
     if (!dump_dir.empty()) {
       std::ofstream o(dump_dir + "/" + run->name + ".nv12", std::ios::binary | std::ios::app);
       o.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
@@ -230,11 +262,25 @@ struct Mode {
   bool end_of_picture = false;   // flag every packet CUVID_PKT_ENDOFPICTURE
 };
 
+static bool has_pixels(const char* name);
+
 static void play(const std::string& name, const std::vector<uint8_t>& data, const Mode& m) {
   std::printf("stream %s [%s]\n", name.c_str(), m.label);
   Run r;
   r.name = std::string(name) + (m.label[0] == 'p' ? "" : std::string("_") + m.label);
+  r.stream = name;
   r.crop_in_decoder = m.crop;
+  if (!golden_dir.empty()) {
+    if (update_golden) {
+      // the pixel file is written by the plain run of each stream the card is probed with
+      r.write_golden = std::strcmp(m.label, "packets") == 0 && has_pixels(name.c_str());
+      if (r.write_golden) {
+        std::ofstream o(golden_dir + "/" + name + ".nv12", std::ios::binary | std::ios::trunc);
+      }
+    } else {
+      r.golden = slurp(golden_dir + "/" + name + ".nv12");
+    }
+  }
   run = &r;
   CUvideoparser parser = nullptr;
   CUVIDPARSERPARAMS pp{};
@@ -314,7 +360,7 @@ static void play(const std::string& name, const std::vector<uint8_t>& data, cons
   eos.flags = CUVID_PKT_ENDOFSTREAM;
   const CUresult er = cuvidParseVideoData(parser, &eos);
   std::printf("  end of stream: %d, %d frames displayed, %d decode failures\n", er, r.frames, r.decode_fail);
-  std::printf("  summary %s: frames %d crc %08x\n", name.c_str(), r.frames, r.all_crc);
+  std::printf("  summary %s: frames %d\n", name.c_str(), r.frames);
   cuvidDestroyVideoParser(parser);
   if (r.dec) cuvidDestroyDecoder(r.dec);
   run = nullptr;
@@ -361,43 +407,101 @@ static void caps_and_creation() {
     std::printf("CreateDecoder(%s): %d\n", what, r);
     if (!r) cuvidDestroyDecoder(d);
   };
-  create("MPEG-2 valid", [](CUVIDDECODECREATEINFO&) {});
-  for (const auto& wh : {std::pair<int, int>{16, 16}, {32, 16}, {48, 16}, {48, 15}, {47, 16}, {64, 64}, {128, 128}, {144, 144}, {143, 144}, {144, 143}, {160, 144}, {4080, 144}, {144, 4080}, {4080, 4080}, {4096, 144},
-                         {4096, 4096}, {8192, 144}, {146, 146}, {2, 2}, {200, 144}}) {
+  const auto chroma = [](CUVIDDECODECREATEINFO& c, int v) { poke(c.ChromaFormat, static_cast<uint32_t>(v)); };
+  const auto fmt = [](CUVIDDECODECREATEINFO& c, int v) { poke(c.OutputFormat, static_cast<uint32_t>(v)); };
+  create("valid", [](CUVIDDECODECREATEINFO&) {});
+  // sizes: the maximum size decides when it is given; the width must be 33 to 4080 and the height 1 to 4080
+  for (const int w : {1, 16, 32, 33, 34, 47, 48, 64, 144, 4079, 4080, 4081, 4096, 8192}) {
     char name[64];
-    std::snprintf(name, sizeof name, "MPEG-2 size %dx%d", wh.first, wh.second);
-    create(name, [&](CUVIDDECODECREATEINFO& c) {
-      c.ulWidth = c.ulMaxWidth = c.ulTargetWidth = wh.first;
-      c.ulHeight = c.ulMaxHeight = c.ulTargetHeight = wh.second;
-      c.display_area = {0, 0, static_cast<short>(wh.first), static_cast<short>(wh.second)};
-    });
+    std::snprintf(name, sizeof name, "size %dx144", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulWidth = c.ulMaxWidth = c.ulTargetWidth = w; c.display_area = {0, 0, static_cast<short>(w), 144}; });
+    std::snprintf(name, sizeof name, "size 192x%d", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulHeight = c.ulMaxHeight = c.ulTargetHeight = w; c.display_area = {0, 0, 192, static_cast<short>(w)}; });
+    std::snprintf(name, sizeof name, "max width %d", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulMaxWidth = w; });
+    std::snprintf(name, sizeof name, "max height %d", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulMaxHeight = w; });
+    std::snprintf(name, sizeof name, "width %d, max size 192", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulWidth = w; });
+    std::snprintf(name, sizeof name, "width %d, no max size", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulWidth = w; c.ulMaxWidth = 0; });
+    std::snprintf(name, sizeof name, "height %d, no max size", w);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulHeight = w; c.ulMaxHeight = 0; });
   }
-  create("MPEG-2 0 output surfaces", [](CUVIDDECODECREATEINFO& c) { c.ulNumOutputSurfaces = 0; });
-  create("MPEG-2 64 output surfaces", [](CUVIDDECODECREATEINFO& c) { c.ulNumOutputSurfaces = 64; });
-  create("MPEG-2 target 0", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = c.ulTargetHeight = 0; });
-  create("MPEG-2 target 96x64", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = 96; c.ulTargetHeight = 64; });
-  create("MPEG-2 max size 0", [](CUVIDDECODECREATEINFO& c) { c.ulMaxWidth = c.ulMaxHeight = 0; });
-  create("MPEG-2 max size below size", [](CUVIDDECODECREATEINFO& c) { c.ulMaxWidth = c.ulMaxHeight = 64; });
-  create("MPEG-2 display area outside", [](CUVIDDECODECREATEINFO& c) { c.display_area = {0, 0, 500, 500}; });
-  create("MPEG-2 display area empty", [](CUVIDDECODECREATEINFO& c) { c.display_area = {0, 0, 0, 0}; });
-  create("MPEG-2 monochrome", [](CUVIDDECODECREATEINFO& c) { c.ChromaFormat = cudaVideoChromaFormat_Monochrome; });
-  create("MPEG-2 422", [](CUVIDDECODECREATEINFO& c) { c.ChromaFormat = cudaVideoChromaFormat_422; });
-  create("MPEG-2 444", [](CUVIDDECODECREATEINFO& c) { c.ChromaFormat = cudaVideoChromaFormat_444; });
-  create("MPEG-2 444 YUV444 output", [](CUVIDDECODECREATEINFO& c) { c.ChromaFormat = cudaVideoChromaFormat_444; c.OutputFormat = cudaVideoSurfaceFormat_YUV444; });
-  create("MPEG-2 10 bit NV12", [](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 2; });
-  create("MPEG-2 10 bit P016", [](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 2; c.OutputFormat = cudaVideoSurfaceFormat_P016; });
-  create("MPEG-2 12 bit P016", [](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 4; c.OutputFormat = cudaVideoSurfaceFormat_P016; });
-  create("MPEG-2 14 bit P016", [](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 6; c.OutputFormat = cudaVideoSurfaceFormat_P016; });
-  create("MPEG-2 8 bit P016", [](CUVIDDECODECREATEINFO& c) { c.OutputFormat = cudaVideoSurfaceFormat_P016; });
-  create("MPEG-2 8 bit YUV444 output", [](CUVIDDECODECREATEINFO& c) { c.OutputFormat = cudaVideoSurfaceFormat_YUV444; });
-  create("MPEG-2 0 surfaces", [](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 0; });
-  create("MPEG-2 1 surface", [](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 1; });
-  create("MPEG-2 32 surfaces", [](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 32; });
-  create("MPEG-2 33 surfaces", [](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 33; });
-  create("MPEG-2 intra only", [](CUVIDDECODECREATEINFO& c) { c.ulIntraDecodeOnly = 1; });
-  create("MPEG-2 deinterlace bob", [](CUVIDDECODECREATEINFO& c) { c.DeinterlaceMode = cudaVideoDeinterlaceMode_Bob; });
-  create("MPEG-2 PreferCUDA", [](CUVIDDECODECREATEINFO& c) { c.ulCreationFlags = cudaVideoCreate_PreferCUDA; });
-  create("MPEG-2 odd target", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = 97; c.ulTargetHeight = 65; });
+  create("width 0, max size 192", [](CUVIDDECODECREATEINFO& c) { c.ulWidth = 0; });
+  create("height 0, max size 192", [](CUVIDDECODECREATEINFO& c) { c.ulHeight = 0; });
+  create("width 0, no max size", [](CUVIDDECODECREATEINFO& c) { c.ulWidth = 0; c.ulMaxWidth = 0; });
+  create("height 0, no max size", [](CUVIDDECODECREATEINFO& c) { c.ulHeight = 0; c.ulMaxHeight = 0; });
+  create("width 0 height 0", [](CUVIDDECODECREATEINFO& c) { c.ulWidth = 0; c.ulHeight = 0; });
+  create("max size below size", [](CUVIDDECODECREATEINFO& c) { c.ulMaxWidth = c.ulMaxHeight = 64; });
+  create("target 0", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = c.ulTargetHeight = 0; });
+  create("target width 0", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = 0; });
+  create("target 1x1", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = c.ulTargetHeight = 1; });
+  create("target 96x64", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = 96; c.ulTargetHeight = 64; });
+  create("target 97x65", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = 97; c.ulTargetHeight = 65; });
+  create("target 9000x9000", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = c.ulTargetHeight = 9000; });
+  create("target 40000x144", [](CUVIDDECODECREATEINFO& c) { c.ulTargetWidth = 40000; });
+  // surface counts
+  for (const int n : {0, 1, 2, 4, 31, 32, 33, 64}) {
+    char name[64];
+    std::snprintf(name, sizeof name, "%d decode surfaces", n);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = n; });
+  }
+  for (const int n : {0, 1, 2, 63, 64, 65, 255, 1000}) {
+    char name[64];
+    std::snprintf(name, sizeof name, "%d output surfaces", n);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.ulNumOutputSurfaces = n; });
+  }
+  // formats
+  for (const int v : {0, 1, 2, 3, 4, 5, 6, 10}) {
+    char name[64];
+    std::snprintf(name, sizeof name, "chroma format %d", v);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { chroma(c, v); });
+    std::snprintf(name, sizeof name, "surface format %d", v);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { fmt(c, v); });
+  }
+  for (const int v : {1, 2, 4, 5, 6, 20}) {
+    char name[64];
+    std::snprintf(name, sizeof name, "bit depth %d", 8 + v);
+    create(name, [&](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = v; });
+  }
+  create("intra only", [](CUVIDDECODECREATEINFO& c) { c.ulIntraDecodeOnly = 1; });
+  create("deinterlace bob", [](CUVIDDECODECREATEINFO& c) { poke(c.DeinterlaceMode, 1u); });
+  create("deinterlace adaptive", [](CUVIDDECODECREATEINFO& c) { poke(c.DeinterlaceMode, 2u); });
+  create("PreferCUDA", [](CUVIDDECODECREATEINFO& c) { c.ulCreationFlags = cudaVideoCreate_PreferCUDA; });
+  // display areas
+  create("display area outside", [](CUVIDDECODECREATEINFO& c) { c.display_area = {0, 0, 500, 500}; });
+  create("display area empty", [](CUVIDDECODECREATEINFO& c) { c.display_area = {0, 0, 0, 0}; });
+  create("display area right 1", [](CUVIDDECODECREATEINFO& c) { c.display_area.right = 1; });
+  create("display area bottom 1", [](CUVIDDECODECREATEINFO& c) { c.display_area.bottom = 1; });
+  create("display area right 2", [](CUVIDDECODECREATEINFO& c) { c.display_area.right = 2; });
+  create("display area left 191", [](CUVIDDECODECREATEINFO& c) { c.display_area.left = 191; });
+  create("display area 150..151", [](CUVIDDECODECREATEINFO& c) { c.display_area.left = 150; c.display_area.right = 151; });
+  create("display area inverted", [](CUVIDDECODECREATEINFO& c) { c.display_area.left = 100; c.display_area.right = 50; });
+  create("display area negative", [](CUVIDDECODECREATEINFO& c) { c.display_area.left = c.display_area.top = -10; });
+  // which fault is reported when there are several
+  create("4:2:2 and 0 decode surfaces", [&](CUVIDDECODECREATEINFO& c) { chroma(c, 2); c.ulNumDecodeSurfaces = 0; });
+  create("4:2:2 and bit depth 13", [&](CUVIDDECODECREATEINFO& c) { chroma(c, 2); c.bitDepthMinus8 = 5; });
+  create("4:2:2 and P016", [&](CUVIDDECODECREATEINFO& c) { chroma(c, 2); fmt(c, 1); });
+  create("4:2:2 and max width 20", [&](CUVIDDECODECREATEINFO& c) { chroma(c, 2); c.ulMaxWidth = 20; });
+  create("4:2:2 and target 0", [&](CUVIDDECODECREATEINFO& c) { chroma(c, 2); c.ulTargetWidth = 0; });
+  create("10 bit and P016", [&](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 2; fmt(c, 1); });
+  create("10 bit and YUV444", [&](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 2; fmt(c, 2); });
+  create("10 bit and max width 20", [&](CUVIDDECODECREATEINFO& c) { c.bitDepthMinus8 = 2; c.ulMaxWidth = 20; });
+  create("P016 and 0 decode surfaces", [&](CUVIDDECODECREATEINFO& c) { fmt(c, 1); c.ulNumDecodeSurfaces = 0; });
+  create("P016 and target 0", [&](CUVIDDECODECREATEINFO& c) { fmt(c, 1); c.ulTargetWidth = 0; });
+  create("P016 and max width 20", [&](CUVIDDECODECREATEINFO& c) { fmt(c, 1); c.ulMaxWidth = 20; });
+  create("YUV444 and target 0", [&](CUVIDDECODECREATEINFO& c) { fmt(c, 2); c.ulTargetWidth = 0; });
+  create("YUV444 and max width 20", [&](CUVIDDECODECREATEINFO& c) { fmt(c, 2); c.ulMaxWidth = 20; });
+  create("YUV444 and 0 decode surfaces", [&](CUVIDDECODECREATEINFO& c) { fmt(c, 2); c.ulNumDecodeSurfaces = 0; });
+  create("0 decode surfaces and target 0", [](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 0; c.ulTargetWidth = 0; });
+  create("33 decode surfaces and 4:2:2", [&](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 33; chroma(c, 2); });
+  create("33 decode surfaces and 10 bit", [&](CUVIDDECODECREATEINFO& c) { c.ulNumDecodeSurfaces = 33; c.bitDepthMinus8 = 2; });
+  create("65 output surfaces and 0 decode surfaces", [](CUVIDDECODECREATEINFO& c) { c.ulNumOutputSurfaces = 65; c.ulNumDecodeSurfaces = 0; });
+  create("65 output surfaces and target 0", [](CUVIDDECODECREATEINFO& c) { c.ulNumOutputSurfaces = 65; c.ulTargetWidth = 0; });
+  create("max width 20 and target 0", [](CUVIDDECODECREATEINFO& c) { c.ulMaxWidth = 20; c.ulTargetWidth = 0; });
+  create("width 0 and target 0", [](CUVIDDECODECREATEINFO& c) { c.ulWidth = 0; c.ulTargetWidth = 0; });
+  create("width 0 and max width 20", [](CUVIDDECODECREATEINFO& c) { c.ulWidth = 0; c.ulMaxWidth = 20; });
   {
     CUVIDPARSERPARAMS pp{};
     pp.CodecType = cudaVideoCodec_MPEG2;
@@ -409,11 +513,32 @@ static void caps_and_creation() {
   }
 }
 
-static void run_mpeg2_suite(const std::string& base, const std::string& only, const std::string& skip) {
-  static const char* const names[] = {
-      "i_only",     "p_only",      "b_frames",   "b_deep",    "closed_gop", "interlaced_tff", "interlaced_bff", "alt_scan",   "intra_vlc",  "nonlinear_q", "dc9",
-      "dc10",       "dc11",        "matrices",   "lowq",      "highq",      "size_200x140",   "size_48x16",     "motion_fast", "aspect_wide", "rate_25",     "rate_2997",
-      "rate_odd",   "vbr_bitrate", "seq_disp",   "low_delay", "mbd_rd",     "no_skip_b",      "timecode_gop",   "noise_hi"};
+// Every stream in nvidia/tests/data/mpeg2, in the order the transcript has them. The streams of the first group are checked pixel for
+// pixel against the card's frames (nvidia/tests/data/nvdec/mpeg2); the others are checked for what the parser says about them (headers,
+// pictures a decoder starting in the middle of a stream cannot use, sequence changes, ...).
+static const char* const kPixelStreams[] = {
+    "i_only",         "p_only",         "b_frames",       "b_deep",         "closed_gop",      "interlaced_tff",     "interlaced_bff", "alt_scan",
+    "intra_vlc",      "nonlinear_q",    "dc9",            "dc10",           "dc11",            "matrices",           "lowq",           "highq",
+    "size_96x70",     "size_48x16",     "motion_fast",    "vbr_bitrate",    "low_delay",       "mbd_rd",             "no_skip_b",      "timecode_gop",
+    "noise_hi",       "fields_ipb_tff", "fields_ipb_bff", "fields_ip",      "fields_mixed",    "frames_interlaced_tools", "frames_interlaced_bff", "frames_slices",
+    "frames_junk",    "frames_escapes", "dual_prime_frames", "dual_prime_fields", "progressive_tools", "conceal",   "coding_ext",     "quant_ext",
+    "long_vectors",   "rff_prog",       "pulldown",       "rff_interlaced", "bottom_first_fields", "leading_b",      "start_with_p",   "seq_size_change"};
+static const char* const kOtherStreams[] = {
+    "aspect_wide",    "rate_25",        "rate_2997",      "seq_disp",       "unpaired_field",  "two_top_fields",     "temporal_reference", "seq_height_change",
+    "seq_end_same",   "seq_repeated",   "seq_aspect_change", "seq_rate_change", "seq_bitrate_change", "seq_progressive_change", "seq_display_change", "seq_lowdelay_change",
+    "seq_matrix_change", "seq_chroma422_then_good", "seq_chroma422_twice", "seq_rate0_then_good", "hdr_aspect_1", "hdr_aspect_2", "hdr_aspect_3", "hdr_aspect_4",
+    "hdr_aspect_5",   "hdr_rate_0",     "hdr_rate_1",     "hdr_rate_2",     "hdr_rate_3",      "hdr_rate_4",         "hdr_rate_5",     "hdr_rate_6",
+    "hdr_rate_7",     "hdr_rate_8",     "hdr_rate_9",     "hdr_rate_ext",   "hdr_chroma_0",    "hdr_chroma_2",       "hdr_chroma_3",   "hdr_display_colour",
+    "hdr_display_nocolour", "hdr_display_size", "hdr_bitrate", "hdr_no_extension", "hdr_low_delay", "size_48x32_p",  "size_64x17_p",   "size_64x17_i",
+    "size_80x33_p",   "size_80x33_i",   "size_112x112_p", "size_64x100_i"};
+
+static bool has_pixels(const char* name) {
+  for (const char* n : kPixelStreams)
+    if (!std::strcmp(n, name)) return true;
+  return false;
+}
+
+static void run_mpeg2_suite(const std::string& base, const std::string& only, const std::string& skip, bool extra) {
   const Mode plain{"packets"};
   auto load = [&](const char* n) { return slurp(base + "/mpeg2/" + n + ".m2v"); };
   const auto stream = [&](const char* n, const Mode& m) {
@@ -425,21 +550,25 @@ static void run_mpeg2_suite(const std::string& base, const std::string& only, co
     }
     play(n, d, m);
   };
-  if (!only.empty() && std::find_if(std::begin(names), std::end(names), [&](const char* n) { return only == n; }) == std::end(names)) {
+  std::vector<const char*> names(std::begin(kPixelStreams), std::end(kPixelStreams));
+  names.insert(names.end(), std::begin(kOtherStreams), std::end(kOtherStreams));
+  if (!only.empty() && std::find_if(names.begin(), names.end(), [&](const char* n) { return only == n; }) == names.end()) {
     // a stream that is not in the list (for probing the card with a new file): played as it is
     stream(only.c_str(), plain);
     return;
   }
   for (const char* n : names) {
     if (!only.empty() && only != n) continue;
+    // an MPEG-1 stream (no sequence extension): the card decodes it, this library does not (see nvidia/docs/libraries.md)
+    if (!extra && !std::strcmp(n, "hdr_no_extension") && only.empty()) continue;
     if (("," + skip + ",").find(std::string(",") + n + ",") != std::string::npos) continue;
     stream(n, plain);
   }
   if (!only.empty()) return;
-  // How the parser is driven: the whole file in one packet, packets of arbitrary size (the parser looks at a NAL unit once 13 bytes of a
-  // slice, VPS or SPS are in), packets that end a picture, timestamps given and not given, clock rates, the parser's own surface count.
+  // How the parser is driven: the whole file in one packet, packets of arbitrary size (the parser acts on a start code as soon as it has
+  // read it), packets that end a picture, timestamps given and not given, clock rates, the parser's own surface count.
   stream("b_frames", Mode{"onepacket", false});
-  for (size_t c : {5, 13, 14, 64, 256, 1000, 4096}) {
+  for (size_t c : {5, 7, 13, 64, 256, 1000, 4096}) {
     static char labels[8][16];
     static int nl = 0;
     std::snprintf(labels[nl], sizeof labels[nl], "chunk%zu", c);
@@ -447,11 +576,19 @@ static void run_mpeg2_suite(const std::string& base, const std::string& only, co
     cm.chunk = c;
     stream("b_frames", cm);
   }
-  stream("b_frames", Mode{"chunk13", true, 0, false, 1000, 1, 0, 0, 13});
+  for (const char* n : {"fields_ipb_tff", "seq_size_change", "pulldown"}) {
+    Mode cm{"chunk7"};
+    cm.chunk = 7;
+    stream(n, cm);
+    Mode c2{"chunk100"};
+    c2.chunk = 100;
+    stream(n, c2);
+  }
   {
     Mode eop{"endofpicture"};
     eop.end_of_picture = true;
     stream("b_frames", eop);
+    stream("fields_ipb_tff", eop);
   }
   stream("b_frames", Mode{"irregular_ts", true, 0, false, 1000, 1, 1, 0});
   stream("b_frames", Mode{"no_ts", true, 0, false, 1000, 1, 2, 0});
@@ -462,27 +599,37 @@ static void run_mpeg2_suite(const std::string& base, const std::string& only, co
   stream("b_frames", Mode{"surfaces8", true, 0, false, 1000, 8});
   stream("b_frames", Mode{"onepacket_90k", false, 0, false, 90000});
   stream("b_frames", Mode{"onepacket_default", false, 0, false, 0});
-  // The display delay.
-  for (const char* n : {"b_frames", "b_deep", "interlaced_tff"}) {
+  stream("pulldown", Mode{"no_ts", true, 0, false, 1000, 1, 2, 0});
+  stream("fields_ipb_tff", Mode{"no_ts", true, 0, false, 1000, 1, 2, 0});
+  // The display delay. Delays above 2 hold the frames of a stream with B pictures back one decode callback longer on the card than here
+  // (the pictures come out in the same order), and a delay of 2 or more with field pictures is not reproduced exactly (the pictures
+  // come out in the same order, some of them one callback early or late); those runs are in the --extra modes.
+  for (const char* n : {"b_frames", "b_deep", "interlaced_tff", "fields_ipb_tff", "pulldown"}) {
+    const bool fields = !std::strcmp(n, "fields_ipb_tff");
     stream(n, Mode{"delay1", true, 1});
-    stream(n, Mode{"delay2", true, 2});
-    stream(n, Mode{"delay4", true, 4});
+    if (!fields || extra) stream(n, Mode{"delay2", true, 2});
+    if (extra) {
+      stream(n, Mode{"delay3", true, 3});
+      stream(n, Mode{"delay4", true, 4});
+    }
   }
-  for (const char* n : {"p_only", "i_only"}) {
+  for (const char* n : {"p_only", "i_only", "low_delay"}) {
     stream(n, Mode{"delay1", true, 1});
     stream(n, Mode{"delay3", true, 3});
   }
   // Display area and target size: a crop that fills the target is exact.
-  for (const char* n : {"size_200x140", "size_48x16"}) stream(n, Mode{"cropped", true, 0, true});
+  for (const char* n : {"size_96x70", "size_48x16"}) stream(n, Mode{"cropped", true, 0, true});
 }
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::string base, only, skip, file;
-  bool caps_only = false;
+  bool caps_only = false, extra = false;
   Mode fm{"packets"};
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--dump") && i + 1 < argc) dump_dir = argv[++i];
+    else if (!std::strcmp(argv[i], "--golden") && i + 1 < argc) golden_dir = argv[++i];
+    else if (!std::strcmp(argv[i], "--update")) update_golden = true;
     else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
     else if (!std::strcmp(argv[i], "--skip") && i + 1 < argc) skip = argv[++i];
     else if (!std::strcmp(argv[i], "--file") && i + 1 < argc) file = argv[++i];
@@ -496,7 +643,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--ts-mode") && i + 1 < argc) fm.ts_mode = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--crop")) fm.crop = true;
     else if (!std::strcmp(argv[i], "--caps")) caps_only = true;
-    else if (!std::strcmp(argv[i], "--nv12")) g_force_nv12 = true;
+    else if (!std::strcmp(argv[i], "--extra")) extra = true;
     else base = argv[i];
   }
   cuInit(0);
@@ -519,12 +666,12 @@ int main(int argc, char** argv) {
     return failures ? 1 : 0;
   }
   if (base.empty()) {
-    std::fprintf(stderr, "usage: nvcuvid_mpeg2 [--dump DIR] [--only NAME] [--skip NAMES] [--file PATH] DATA_DIR\n");
+    std::fprintf(stderr, "usage: nvcuvid_mpeg2 [--dump DIR] [--golden DIR [--update]] [--only NAME] [--skip NAMES] [--file PATH] [--extra] DATA_DIR\n");
     return 2;
   }
   data_dir = base;
   if (only.empty()) caps_and_creation();
-  run_mpeg2_suite(base, only, skip);
+  run_mpeg2_suite(base, only, skip, extra);
   std::printf("%s\n", failures ? "FAIL" : "done");
   return failures ? 1 : 0;
 }

@@ -254,14 +254,27 @@ CUresult check_h264_create(const CUVIDDECODECREATEINFO& ci) {
   if (ci.ulTargetWidth == 0 || ci.ulTargetHeight == 0) return CUDA_ERROR_OUT_OF_MEMORY;
   return CUDA_SUCCESS;
 }
-// What the card's cuvidCreateDecoder answers for an MPEG-2 decoder (measured on an RTX 3060): see check_mpeg2_create_info below.
+// What the card's cuvidCreateDecoder answers for an MPEG-2 decoder (measured on an RTX 3060, in the order it checks): 1 to 32 decode surfaces,
+// at most 64 output surfaces and a bit depth of at most 12 (else INVALID_VALUE); a bit depth above 8 (NOT_SUPPORTED); the 16-bit surface
+// formats (INVALID_VALUE); other chroma formats than 4:2:0 and the 4:4:4 and 4:2:2 surface formats (NOT_SUPPORTED); a maximum width of
+// 0 or 33 to 4080 (when it is 0 the width itself must be 33 to 4080) and a maximum height of 0 or up to 4080 (likewise 1 to 4080 for
+// the height); then a zero size, a zero target size or a display area one sample wide (or high) at a multiple of four are the sizing error.
 CUresult check_mpeg2_create(const CUVIDDECODECREATEINFO& ci) {
-  if (raw(ci.ChromaFormat) != cudaVideoChromaFormat_420 || ci.bitDepthMinus8 > 4) return ci.bitDepthMinus8 > 4 ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_NOT_SUPPORTED;
-  if (ci.bitDepthMinus8 != 0) return CUDA_ERROR_NOT_SUPPORTED;
-  if (raw(ci.OutputFormat) != cudaVideoSurfaceFormat_NV12) return raw(ci.OutputFormat) == cudaVideoSurfaceFormat_YUV444 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
   if (ci.ulNumDecodeSurfaces == 0 || ci.ulNumDecodeSurfaces > 32) return CUDA_ERROR_INVALID_VALUE;
-  if (ci.ulWidth < 33 || ci.ulHeight < 16 || ci.ulWidth > 4080 || ci.ulHeight > 4080) return CUDA_ERROR_INVALID_VALUE;
-  if (ci.ulTargetWidth == 0 || ci.ulTargetHeight == 0) return CUDA_ERROR_OUT_OF_MEMORY;
+  if (ci.ulNumOutputSurfaces > 64) return CUDA_ERROR_INVALID_VALUE;
+  if (ci.bitDepthMinus8 > 4) return CUDA_ERROR_INVALID_VALUE;
+  if (ci.bitDepthMinus8 != 0) return CUDA_ERROR_NOT_SUPPORTED;
+  const int fmt = raw(ci.OutputFormat), chroma = raw(ci.ChromaFormat);
+  // surface format values: 0 NV12, 1 P016, 2 YUV444, 3 YUV444_16Bit, 4 NV16, 5 P216 (newer headers than the vendored ones name the last two)
+  if (fmt == cudaVideoSurfaceFormat_P016 || fmt == cudaVideoSurfaceFormat_YUV444_16Bit || fmt == 5) return CUDA_ERROR_INVALID_VALUE;
+  if (chroma != cudaVideoChromaFormat_420) return CUDA_ERROR_NOT_SUPPORTED;
+  if (fmt == cudaVideoSurfaceFormat_YUV444 || fmt == 4) return CUDA_ERROR_NOT_SUPPORTED;
+  if (fmt != cudaVideoSurfaceFormat_NV12) return CUDA_ERROR_INVALID_VALUE;
+  const unsigned long mw = ci.ulMaxWidth ? ci.ulMaxWidth : ci.ulWidth, mh = ci.ulMaxHeight ? ci.ulMaxHeight : ci.ulHeight;
+  if (mw < 33 || mw > 4080 || mh < 1 || mh > 4080) return CUDA_ERROR_INVALID_VALUE;
+  if (ci.ulWidth == 0 || ci.ulHeight == 0 || ci.ulTargetWidth == 0 || ci.ulTargetHeight == 0 || (ci.display_area.right - ci.display_area.left == 1 && ci.display_area.left % 4 == 0 && ci.ulTargetWidth != 1) ||
+      (ci.display_area.bottom - ci.display_area.top == 1 && ci.display_area.top % 4 == 0 && ci.ulTargetHeight != 1))
+    return CUDA_ERROR_OUT_OF_MEMORY;
   return CUDA_SUCCESS;
 }
 // What the card's cuvidCreateDecoder answers for an HEVC decoder (measured on an RTX 3060): both sizes 129 to 8192 (anything below is
