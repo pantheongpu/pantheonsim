@@ -1987,6 +1987,18 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # Two PEs on two devices that have no peer path (the rtx3060 profile, as the card's pair): NVSHMEM refuses the
+  # job, as NVIDIA's does ("Peer GPU 1 is not accessible").
+  if(TARGET vgpunvshmem)
+    add_test(NAME e2e_nvshmem_peerless
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh nvshmem_host nvshmem_host)
+    set_tests_properties(e2e_nvshmem_peerless PROPERTIES
+      DEPENDS vgpunvshmem
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_GPU=nvidia/rtx3060;VGPU_E2E_ARGS=peerless;VGPU_DEVICE_COUNT=2"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
+
   # Driver and runtime entry points CUDA's samples reach for, checked against
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer

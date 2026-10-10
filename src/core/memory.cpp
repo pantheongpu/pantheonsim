@@ -588,11 +588,11 @@ uint64_t MemoryManager::reserve(uint64_t size, uint64_t alignment) {
     throw Error::make(Err::InvalidValue, "reserving ", size,
                       " bytes of address space: the size must be a non-zero multiple of the ",
                       kVmmGranularity, "-byte granularity");
-  if (alignment == 0) alignment = kVmmGranularity;
-  if (alignment % kVmmGranularity || (alignment & (alignment - 1)))
-    throw Error::make(Err::InvalidValue, "address space alignment ", alignment,
-                      " is not a power of two multiple of the ", kVmmGranularity,
-                      "-byte granularity");
+  // Measured on an RTX 3060: every reservation lands on a 2 MiB boundary at least, whatever smaller
+  // alignment was asked for; one that is not a power of two is refused, a larger one honoured.
+  if (alignment & (alignment - 1))
+    throw Error::make(Err::InvalidValue, "address space alignment ", alignment, " is not a power of two");
+  if (alignment < kVmmGranularity) alignment = kVmmGranularity;
   const uint64_t base = round_up(next_va_, alignment);
   // Address space is this device's 1 TiB window; a reservation past it would
   // hand out addresses another device owns.
@@ -603,6 +603,17 @@ uint64_t MemoryManager::reserve(uint64_t size, uint64_t alignment) {
   high_water_va_ = next_va_;
   reserved_.emplace(base, Reservation{size});
   return base;
+}
+
+bool MemoryManager::range_mapped(uint64_t va, uint64_t size) const {
+  SharedGuard table_guard(table_lock_.get());
+  auto after = maps_.lower_bound(va);
+  if (after != maps_.end() && after->first < va + size) return true;
+  if (after != maps_.begin()) {
+    auto before = std::prev(after);
+    if (va - before->first < before->second.size) return true;
+  }
+  return false;
 }
 
 void MemoryManager::address_free(uint64_t va, uint64_t size) {

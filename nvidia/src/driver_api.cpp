@@ -1790,7 +1790,7 @@ static CUresult cuLinkDestroy_impl(void* state) {
 // A handle id the engine gave out, as the API's opaque handle. The engine's
 // ids start at 1, so 0 stays available as "no handle".
 namespace {
-constexpr size_t kVmmGranularity = 64u * 1024u;
+constexpr size_t kVmmGranularity = vgpu::MemoryManager::kVmmGranularity;   // 2 MiB
 
 // The property struct a caller passes. Only a device-local pinned allocation
 // exists here; anything else is refused rather than quietly treated as one.
@@ -1817,6 +1817,10 @@ static CUresult cuMemAddressReserve_impl(CUdeviceptr* ptr, size_t size, size_t a
   VGPU_CAPTURE_UNSAFE("cuMemAddressReserve");
   return api("cuMemAddressReserve", true, false, [&](ShimState& s) {
     if (!ptr || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    // The size is whole granules (2 MiB) and the alignment a power of two, else CUDA_ERROR_INVALID_VALUE (an
+    // RTX 3060: sizes of 1, 4096, 65536 and 2 MiB + 1 and an alignment of 5 or 3 granules are refused, and an
+    // alignment below 2 MiB is accepted and raised to it).
+    if (size % kVmmGranularity || (alignment & (alignment - 1))) return CUDA_ERROR_INVALID_VALUE;
     // A fixed address is a request for one particular range; the engine hands
     // out address space monotonically and cannot honour it.
     if (addr != 0) return CUDA_ERROR_NOT_SUPPORTED;
@@ -1875,8 +1879,21 @@ static CUresult cuMemMap_impl(CUdeviceptr ptr, size_t size, size_t offset,
                               CUmemGenericAllocationHandle handle, unsigned long long flags) {
   VGPU_CAPTURE_UNSAFE("cuMemMap");
   return api("cuMemMap", true, false, [&](ShimState& s) {
-    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    owner_memory(s, ptr).map(ptr, size, offset, handle);
+    // Measured on an RTX 3060: a size of 0, flags and no handle are CUDA_ERROR_INVALID_VALUE; an address,
+    // size or offset that is not a multiple of the granularity, an offset (cuMemMap takes only 0), a size larger
+    // than the handle, and a range that already has something mapped are CUDA_ERROR_NOT_SUPPORTED.
+    if (flags != 0 || size == 0 || handle == 0) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    uint64_t handle_bytes = 0;
+    try {
+      handle_bytes = mem.handle_size(handle);
+    } catch (const vgpu::Error&) {
+      return CUDA_ERROR_INVALID_VALUE;   // no such handle
+    }
+    if (ptr % kVmmGranularity || size % kVmmGranularity || offset != 0 || size > handle_bytes ||
+        mem.range_mapped(ptr, size))
+      return CUDA_ERROR_NOT_SUPPORTED;
+    mem.map(ptr, size, offset, handle);
     return CUDA_SUCCESS;
   });
 }
@@ -1886,7 +1903,12 @@ VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) { return traced("c
 static CUresult cuMemUnmap_impl(CUdeviceptr ptr, size_t size) {
   VGPU_CAPTURE_UNSAFE("cuMemUnmap");
   return api("cuMemUnmap", true, false, [&](ShimState& s) {
-    owner_memory(s, ptr).unmap(ptr, size);
+    // An address or size that is not whole granules is CUDA_ERROR_INVALID_VALUE; a range with nothing mapped in
+    // it is CUDA_SUCCESS (an RTX 3060 unmaps twice without complaint); a part of a mapping is refused by the engine.
+    if (size == 0 || size % kVmmGranularity || ptr % kVmmGranularity) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    if (!mem.range_mapped(ptr, size)) return CUDA_SUCCESS;
+    mem.unmap(ptr, size);
     return CUDA_SUCCESS;
   });
 }
@@ -1943,9 +1965,11 @@ static CUresult cuMemGetAllocationGranularity_impl(size_t* granularity,
   if (!granularity) return CUDA_ERROR_INVALID_VALUE;
   if (option != CU_MEM_ALLOC_GRANULARITY_MINIMUM && option != CU_MEM_ALLOC_GRANULARITY_RECOMMENDED)
     return CUDA_ERROR_INVALID_VALUE;
-  (void)prop;
-  // The chunk the sparse backing materializes, which is the unit every
-  // reservation, handle and mapping here is measured in.
+  // Measured on an RTX 3060: no property is looked at beyond its being there (a host location, a location type
+  // that does not exist and a device that does not exist all get the answer), and the minimum and the
+  // recommended granularity are the same 2 MiB, which is the unit every reservation, handle and mapping
+  // here is measured in.
+  if (!prop) return CUDA_ERROR_INVALID_VALUE;
   *granularity = kVmmGranularity;
   return CUDA_SUCCESS;
 }
@@ -3553,12 +3577,17 @@ static CUresult cuStreamAttachMemAsync_impl(CUstream st, CUdeviceptr dptr, size_
 static CUresult cuMemPrefetchAsync_v2_impl(CUdeviceptr dptr, size_t count, CUmemLocation location, unsigned int, CUstream);
 VGPU_EXPORT CUresult cuMemPrefetchAsync_v2(CUdeviceptr dptr, size_t count, CUmemLocation location, unsigned int a3, CUstream a4) { return traced("cuMemPrefetchAsync_v2", cuMemPrefetchAsync_v2_impl, dptr, count, location, a3, a4); }
 static CUresult cuMemPrefetchAsync_v2_impl(CUdeviceptr dptr, size_t count, CUmemLocation location,
-                                           unsigned int, CUstream st) {
+                                           unsigned int flags, CUstream st) {
   // Measured: refused on a capturing stream before the arguments are looked at.
   if (capture_forbidden(st, "cuMemPrefetchAsync")) return kCaptureUnsupported;
   return api("cuMemPrefetchAsync", true, false, [&](ShimState& s) {
-    if (!managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;
-    return check_location(s, location);
+    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;   // reserved (an RTX 3060: CUDA_ERROR_INVALID_VALUE)
+    if (count == 0 || !managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;   // a size of 0 is refused (RTX 3060)
+    if (const CUresult rc = check_location(s, location); rc != CUDA_SUCCESS) return rc;
+    // A device without concurrent managed access (an RTX 3060 under WSL, measured) cannot prefetch: to a
+    // device, to the host or to a device that does not exist, it is CUDA_ERROR_INVALID_DEVICE.
+    if (!s.rt->device(current_device(s)).profile().cuda.concurrent_managed_access) return CUDA_ERROR_INVALID_DEVICE;
+    return CUDA_SUCCESS;
   });
 }
 static CUresult cuMemPrefetchAsync_impl(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream);
@@ -3571,6 +3600,16 @@ VGPU_EXPORT CUresult cuMemAdvise_v2(CUdeviceptr dptr, size_t count, int advice, 
 static CUresult cuMemAdvise_v2_impl(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location) {
   VGPU_CAPTURE_UNSAFE("cuMemAdvise_v2");
   return api("cuMemAdvise", true, false, [&](ShimState& s) {
+    // Without concurrent managed access (an RTX 3060 under WSL, measured) the advice that names a device is
+    // refused before the range is looked at: a preferred location that is a device, or a device in the
+    // accessed-by list, is CUDA_ERROR_INVALID_DEVICE (a device that does not exist, for the accessed-by
+    // list, CUDA_ERROR_INVALID_VALUE). Everything else is accepted and has no effect.
+    const bool paged = s.rt->device(current_device(s)).profile().cuda.concurrent_managed_access;
+    if (!paged && location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
+      if (advice == 3) return CUDA_ERROR_INVALID_DEVICE;
+      if (advice == 5 || advice == 6)
+        return location.id >= 0 && location.id < s.rt->device_count() ? CUDA_ERROR_INVALID_DEVICE : CUDA_ERROR_INVALID_VALUE;
+    }
     if (!managed_range(s, dptr, count) || advice < 1 || advice > 6) return CUDA_ERROR_INVALID_VALUE;
     // Read-mostly (1, 2) names no location; the others name one.
     if (advice > 2) return check_location(s, location);
@@ -5686,9 +5725,14 @@ static CUresult cuDeviceGetByPCIBusId_impl(CUdevice* dev, const char* pciBusId) 
   });
 }
 
-// Distinct simulated devices reach each other's memory, as the runtime's
-// cudaDeviceCanAccessPeer answers; a device is not its own peer. (A pair of
-// RTX 3060s under WSL answers 0 for each other: that host has no peer path.)
+// Whether `dev` can reach `peer`'s memory: two devices whose profiles both have a peer path
+// (CudaClass::peer_access). A pair of RTX 3060s has none (measured on a real pair: 0 for each other).
+static bool peer_path(ShimState& s, int dev, int peer) {
+  return dev != peer && s.rt->device(dev).profile().cuda.peer_access && s.rt->device(peer).profile().cuda.peer_access;
+}
+
+// cuDeviceCanAccessPeer answers like the runtime's cudaDeviceCanAccessPeer; a device is not its own peer
+// (CUDA_SUCCESS and 0, as an RTX 3060 answers).
 static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer);
 VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice dev, CUdevice peer) { return traced("cuDeviceCanAccessPeer", cuDeviceCanAccessPeer_impl, can, dev, peer); }
 static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer) {
@@ -5696,7 +5740,35 @@ static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer
     if (!can) return CUDA_ERROR_INVALID_VALUE;
     const int n = s.rt->device_count();
     if (dev < 0 || dev >= n || peer < 0 || peer >= n) return CUDA_ERROR_INVALID_DEVICE;
-    *can = dev != peer ? 1 : 0;
+    *can = peer_path(s, dev, peer) ? 1 : 0;
+    return CUDA_SUCCESS;
+  });
+}
+
+// What one device can do with another's memory, as the runtime's cudaDeviceGetP2PAttribute answers it:
+// attributes 1 to 5 (CUDA 13 added the fifth, partial native atomics); without a peer path every one is 0
+// (measured on an RTX 3060 pair), and 0 and 6 and above are CUDA_ERROR_INVALID_VALUE. A device asked about
+// itself is CUDA_ERROR_INVALID_DEVICE, as the runtime's is cudaErrorInvalidDevice.
+static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice src, CUdevice dst);
+// attrib is a CUdevice_P2PAttribute, an enum of int's size; it is read as the int it is, since a caller
+// may pass a value the enum does not declare.
+VGPU_EXPORT CUresult cuDeviceGetP2PAttribute(int* value, int attrib, CUdevice srcDevice, CUdevice dstDevice) {
+  return traced("cuDeviceGetP2PAttribute", cuDeviceGetP2PAttribute_impl, value, attrib, srcDevice, dstDevice);
+}
+static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice src, CUdevice dst) {
+  return api("cuDeviceGetP2PAttribute", true, false, [&](ShimState& s) {
+    if (!value) return CUDA_ERROR_INVALID_VALUE;
+    const int n = s.rt->device_count();
+    if (src < 0 || src >= n || dst < 0 || dst >= n || src == dst) return CUDA_ERROR_INVALID_DEVICE;
+    const bool path = peer_path(s, src, dst);
+    switch (attrib) {
+      case 1: *value = 0; break;                // CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK
+      case 2: *value = path ? 1 : 0; break;     // ACCESS_SUPPORTED
+      case 3: *value = path ? 1 : 0; break;     // NATIVE_ATOMIC_SUPPORTED
+      case 4: *value = 0; break;                // CUDA_ARRAY_ACCESS_SUPPORTED
+      case 5: *value = 0; break;                // ONLY_PARTIAL_NATIVE_ATOMIC_SUPPORTED
+      default: return CUDA_ERROR_INVALID_VALUE;
+    }
     return CUDA_SUCCESS;
   });
 }
@@ -5716,6 +5788,8 @@ static CUresult cuCtxEnablePeerAccess_impl(CUcontext peerContext, unsigned int f
     auto it = s.contexts.find(peer);
     if (it == s.contexts.end()) return CUDA_ERROR_INVALID_CONTEXT;
     if (it->second == current_device(s)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
+    // Without a peer path (an RTX 3060 pair, measured) a context on the other device is unsupported too.
+    if (!peer_path(s, current_device(s), it->second)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
     if (!s.peer_access.emplace(ctx_stack().back(), peer).second) return CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
     return CUDA_SUCCESS;
   });
@@ -6526,7 +6600,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuGetErrorString), VGPU_PROC(cuDeviceGetCount), VGPU_PROC(cuDeviceGet),
     VGPU_PROC(cuDeviceGetName), VGPU_PROC(cuDeviceTotalMem), VGPU_PROC(cuDeviceGetAttribute),
     VGPU_PROC(cuDeviceComputeCapability), VGPU_PROC(cuDeviceGetUuid), VGPU_PROC(cuDeviceGetUuid_v2),
-    VGPU_PROC(cuDeviceGetPCIBusId), VGPU_PROC(cuDeviceCanAccessPeer),
+    VGPU_PROC(cuDeviceGetPCIBusId), VGPU_PROC(cuDeviceCanAccessPeer), VGPU_PROC(cuDeviceGetP2PAttribute),
     VGPU_PROC(cuCtxCreate), VGPU_PROC(cuCtxDestroy), VGPU_PROC(cuCtxSetCurrent),
     VGPU_PROC(cuCtxGetCurrent), VGPU_PROC(cuCtxGetDevice), VGPU_PROC(cuCtxSynchronize),
     VGPU_PROC(cuCtxPushCurrent), VGPU_PROC(cuCtxPopCurrent), VGPU_PROC(cuCtxGetLimit),

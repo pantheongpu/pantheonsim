@@ -260,11 +260,17 @@ class MemoryManager {
   // granted, written through a read-only mapping, or touched after unmap.
   //
   // Sizes and addresses are multiples of kVmmGranularity, which is what
-  // cuMemGetAllocationGranularity reports.
-  static constexpr uint64_t kVmmGranularity = kChunkSize;
+  // cuMemGetAllocationGranularity reports: 2 MiB, the minimum and the recommended one alike (an RTX 3060 under
+  // NVIDIA's driver answers 2 MiB for every property it was asked about, and cuMemCreate of a smaller or
+  // unaligned size is CUDA_ERROR_INVALID_VALUE). The sparse chunks are smaller than that and fit in it evenly.
+  static constexpr uint64_t kVmmGranularity = 2 * 1024 * 1024;
+  static_assert(kVmmGranularity % kChunkSize == 0, "a granule is a whole number of chunks");
 
-  // Address space with nothing behind it. `alignment` 0 means the granularity.
+  // Address space with nothing behind it. `alignment` 0 means the granularity, and so does a smaller one (the
+  // card aligns every reservation to at least 2 MiB); it must be a power of two.
   uint64_t reserve(uint64_t size, uint64_t alignment);
+  // Whether any part of [va, va + size) has a handle mapped into it.
+  bool range_mapped(uint64_t va, uint64_t size) const;
   // Gives a reservation back. It must have nothing mapped in it.
   void address_free(uint64_t va, uint64_t size);
 

@@ -185,7 +185,9 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     case kPageableMemoryAccess: v = 0; break;
     // The host and the device may touch managed memory at once, as on Linux
     // since Pascal (Windows and WSL answer 0): it is one host allocation here.
-    case kConcurrentManagedAccess: v = 1; break;
+    // The profile says which its card answers (an RTX 3060 under WSL: 0, measured); a device that
+    // answers 0 also refuses cudaMemPrefetchAsync and the device-naming advice, as the card does.
+    case kConcurrentManagedAccess: v = p.cuda.concurrent_managed_access ? 1 : 0; break;
     case kComputePreemptionSupported: v = 1; break;
     case kCanUseHostPointerForRegisteredMem: v = 0; break;
     // The stream memory operations 92-94 were version 1's, which no current

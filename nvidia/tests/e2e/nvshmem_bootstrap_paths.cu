@@ -6,7 +6,9 @@
 // Built with NVIDIA's NVSHMEM headers and device library, like nvshmem_device.cu:
 //   mpirun -np 2 ./nvshmem_bootstrap_paths <scenario>
 // Both PEs use device 0 (NVIDIA's NVSHMEM does not start PEs on two GeForce GPUs without
-// peer access, and on one GPU it is in its multiple-processes-per-GPU mode: status 3).
+// peer access, and on one GPU it is in its multiple-processes-per-GPU mode: status 3), except in
+// the scenario two_gpus, where PE r uses device r: that is a job NVSHMEM starts only on GPUs that can
+// reach each other (an RTX 3060 pair cannot: "Peer GPU 1 is not accessible", exit status 255).
 // Each PE writes what it saw to $NVSHMEM_BOOT_OUT.<rank>; run_nvshmem_bootstrap.sh
 // collects them and compares them with what NVIDIA's NVSHMEM 3.8 wrote on an RTX 3060.
 #include <mpi.h>
@@ -26,7 +28,7 @@ int main(int argc, char** argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  cudaSetDevice(0);
+  cudaSetDevice(scenario == "two_gpus" ? rank : 0);
   std::string out;
   char line[256];
   auto say = [&](const char* fmt, auto... args) {
@@ -37,7 +39,7 @@ int main(int argc, char** argv) {
   say("before init: status %d", nvshmemx_init_status());
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
   MPI_Comm comm = MPI_COMM_NULL;
-  if (scenario == "attr") {
+  if (scenario == "attr" || scenario == "two_gpus") {
     MPI_Comm_dup(MPI_COMM_WORLD, &comm);
     say("set_attr_mpi_comm_args: %d", nvshmemx_set_attr_mpi_comm_args(&comm, &attr));
     say("init_attr(MPI_COMM): %d", nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr));

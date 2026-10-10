@@ -1,4 +1,6 @@
 #include <cstdio>
+#include <string>
+#include <utility>
 #include "vgpu/profile.hpp"
 
 #include "vgpu/error.hpp"
@@ -155,6 +157,13 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     p.cuda.clock_khz = static_cast<uint32_t>(opt_int(c, "clock_khz", origin, 0));
     p.cuda.async_engine_count = static_cast<uint32_t>(opt_int(c, "async_engine_count", origin, 0));
     p.cuda.persisting_l2_bytes = static_cast<uint64_t>(opt_int(c, "persisting_l2_bytes", origin, 0));
+    for (const auto& [key, field] : {std::pair<const char*, bool*>{"peer_access", &p.cuda.peer_access},
+                                     {"concurrent_managed_access", &p.cuda.concurrent_managed_access}}) {
+      if (auto b = c.map.find(key); b != c.map.end()) {
+        if (b->second.kind != Value::Kind::Bool) fail(origin, std::string("cuda.") + key + " must be true/false");
+        *field = b->second.b;
+      }
+    }
   }
 
   // Optional: how the SMs are grouped (GpuLayout). The counts must add up to the SM count.

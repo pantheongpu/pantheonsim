@@ -8,6 +8,9 @@
 //   nvshmem_host             a job of one PE (nvshmem_init(), no bootstrap), then one of three
 //   nvshmem_host npes        a job of npes PEs, forked from here
 //   nvshmem_host single      the job of one only
+//   nvshmem_host peerless    a job of two PEs on two devices that have no peer path (the rtx3060 profile): refused,
+//                            as NVIDIA's NVSHMEM refuses two GeForce GPUs ("Peer GPU 1 is not accessible",
+//                            NVSHMEMX_ERROR_NOT_SUPPORTED, measured on two RTX 3060s)
 //
 // Written against VirtualGPU's declarations (nvidia/include/vgpu_nvshmem.h).
 // NVIDIA's library cannot run this on an RTX 3060 under WSL beyond its first
@@ -549,9 +552,39 @@ static int single_main() {
   }
 }
 
+// One PE of a job on devices that cannot reach each other: the init must be refused, and the PE must not be up.
+static int refused_main(int rank, int npes, nvshmemx_uniqueid_t* id) {
+  int ndev = 0;
+  cudaGetDeviceCount(&ndev);
+  if (ndev < npes) {
+    std::printf("SKIP: the job needs %d devices (set VGPU_DEVICE_COUNT)\n", npes);
+    return 0;
+  }
+  cudaSetDevice(rank);
+  nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
+  if (nvshmemx_set_attr_uniqueid_args(rank, npes, id, &attr) != 0) return 1;
+  const int rc = nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
+  const bool up = nvshmemx_init_status() >= NVSHMEM_STATUS_IS_INITIALIZED;
+  std::printf("%-4s PE %d: init on devices without a peer path -> %d, %s\n", rc != 0 && !up ? "ok" : "FAIL", rank, rc,
+              up ? "the PE is up" : "the PE is not up");
+  return rc != 0 && !up ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   if (argc > 1 && std::string(argv[1]) == "single") return single_main();
+  if (argc > 1 && std::string(argv[1]) == "peerless") {
+    nvshmemx_uniqueid_t id = NVSHMEMX_UNIQUEID_INITIALIZER;
+    if (nvshmemx_get_uniqueid(&id) != 0) return 1;
+    const pid_t k = fork();
+    if (k == 0) std::exit(refused_main(1, 2, &id));
+    int rc = refused_main(0, 2, &id);
+    int status = 0;
+    waitpid(k, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) rc = 1;
+    std::printf("%s: two PEs on devices without a peer path are refused\n", rc ? "FAIL" : "PASS");
+    return rc;
+  }
   // Without arguments: a one-PE job, then a job of three, each in processes
   // of their own (a process is one PE for its lifetime).
   if (argc == 1) {

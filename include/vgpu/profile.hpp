@@ -105,6 +105,17 @@ struct CudaClass {
   // (persistingL2CacheMaxSize), in bytes. Zero: not said, or none (before
   // compute capability 8.0 there is no access policy window at all).
   uint64_t persisting_l2_bytes = 0;
+  // Whether two devices of this kind can reach each other's memory: an NVLink or a PCIe peer path.
+  // cudaDeviceCanAccessPeer, cudaDeviceGetP2PAttribute and the peer-access calls follow it, for a pair of
+  // devices that both say so. True unless the profile says otherwise (every data-centre part has a path); a
+  // GeForce pair has none: two RTX 3060s answer cudaDeviceCanAccessPeer 0 (measured), and
+  // cudaDeviceEnablePeerAccess is cudaErrorPeerAccessUnsupported.
+  bool peer_access = true;
+  // cudaDevAttrConcurrentManagedAccess: the host and the device may touch managed memory at once and the
+  // driver pages it on demand. True unless the profile says otherwise (Linux since Pascal). A device that says
+  // false (an RTX 3060 under WSL, measured) refuses cudaMemPrefetchAsync with cudaErrorInvalidDevice, and
+  // refuses the advice that names a device (cudaMemAdviseSetPreferredLocation, ...SetAccessedBy).
+  bool concurrent_managed_access = true;
 };
 
 // How the multiprocessors of a part are grouped, which decides what thread-block

@@ -35,10 +35,11 @@
 namespace vgpu::telemetry {
 
 inline constexpr uint32_t kMagic = 0x56475054;  // "VGPT"
-inline constexpr uint32_t kVersion = 6;  // 2: reliability and link; 3: clock-event reasons;
+inline constexpr uint32_t kVersion = 7;  // 2: reliability and link; 3: clock-event reasons;
                                          // 4: the link's maximum apart from its current state;
                                          // 5: NVLink generation and link count;
-                                         // 6: the framebuffer the driver keeps for itself
+                                         // 6: the framebuffer the driver keeps for itself;
+                                         // 7: whether two of these devices have a peer path
 inline constexpr int kMaxDevices = 16;
 inline constexpr int kMaxProcs = 8;
 
@@ -90,6 +91,7 @@ struct DeviceSample {
   uint32_t pcie_width_max;
   uint32_t nvlink_version;          // profile: NVLink generation (3 = A100, 4 = H100), 0 none
   uint32_t nvlink_count;            // profile: links on the card's data sheet, 0 none
+  uint32_t peer_access;             // profile: 1 when two of these can reach each other's memory (CudaClass)
   // Clock-event reasons injected with `vgpu fault throttle`, NVML's bits. Set
   // when a reading is taken (ras::apply_throttle), never by a publisher.
   uint64_t clock_event_reasons;

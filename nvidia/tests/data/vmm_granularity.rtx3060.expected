@@ -1,0 +1,87 @@
+granularity minimum                                        CUDA_SUCCESS 2097152
+granularity recommended                                    CUDA_SUCCESS 2097152
+granularity minimum, exportable as a descriptor            CUDA_SUCCESS 2097152
+granularity recommended, exportable as a descriptor        CUDA_SUCCESS 2097152
+granularity minimum, host location                         CUDA_SUCCESS 2097152
+granularity minimum, location type 99                      CUDA_SUCCESS 2097152
+granularity minimum, device 7                              CUDA_SUCCESS 2097152
+granularity recommended, compressible                      CUDA_SUCCESS 2097152
+granularity, option 2                                      CUDA_ERROR_INVALID_VALUE 0
+granularity, option -1                                     CUDA_ERROR_INVALID_VALUE 0
+granularity, no property                                   CUDA_ERROR_INVALID_VALUE 0
+granularity, no output                                     CUDA_ERROR_INVALID_VALUE
+cuMemCreate 1                                              CUDA_ERROR_INVALID_VALUE
+cuMemCreate 4096                                           CUDA_ERROR_INVALID_VALUE
+cuMemCreate 65536                                          CUDA_ERROR_INVALID_VALUE
+cuMemCreate 1048576                                        CUDA_ERROR_INVALID_VALUE
+cuMemCreate 2097151                                        CUDA_ERROR_INVALID_VALUE
+cuMemCreate 2097152                                        CUDA_SUCCESS
+cuMemCreate 2097153                                        CUDA_ERROR_INVALID_VALUE
+cuMemCreate 4194304                                        CUDA_SUCCESS
+cuMemCreate 3145728                                        CUDA_ERROR_INVALID_VALUE
+cuMemCreate 6291456                                        CUDA_SUCCESS
+cuMemCreate 0                                              CUDA_ERROR_INVALID_VALUE
+reserve 1                                                  CUDA_ERROR_INVALID_VALUE
+reserve 4096                                               CUDA_ERROR_INVALID_VALUE
+reserve 65536                                              CUDA_ERROR_INVALID_VALUE
+reserve g                                                  CUDA_SUCCESS aligned to at least 2^21
+reserve g + 1                                              CUDA_ERROR_INVALID_VALUE
+reserve 2g                                                 CUDA_SUCCESS aligned to at least 2^21
+reserve 3g/2                                               CUDA_ERROR_INVALID_VALUE
+reserve g, alignment 4096                                  CUDA_SUCCESS aligned to at least 2^21
+reserve g, alignment 64 KiB                                CUDA_SUCCESS aligned to at least 2^21
+reserve g, alignment g                                     CUDA_SUCCESS aligned to at least 2^21
+reserve g, alignment 2g                                    CUDA_SUCCESS aligned to at least 2^21
+reserve g, alignment 3g                                    CUDA_ERROR_INVALID_VALUE
+reserve g, alignment 1 GiB                                 CUDA_SUCCESS aligned to at least 2^21
+reserve g, alignment 5                                     CUDA_ERROR_INVALID_VALUE
+reserve 0                                                  CUDA_ERROR_INVALID_VALUE
+reserve with flags                                         CUDA_ERROR_INVALID_VALUE
+reserve with no output                                     CUDA_ERROR_INVALID_VALUE
+map g/2                                                    CUDA_ERROR_NOT_SUPPORTED
+map g + 1                                                  CUDA_ERROR_NOT_SUPPORTED
+map 0                                                      CUDA_ERROR_INVALID_VALUE
+map at base + 4096                                         CUDA_ERROR_NOT_SUPPORTED
+map at base + 64 KiB                                       CUDA_ERROR_NOT_SUPPORTED
+map offset 4096                                            CUDA_ERROR_NOT_SUPPORTED
+map offset 64 KiB                                          CUDA_ERROR_NOT_SUPPORTED
+map offset 2g (the end of the handle)                      CUDA_ERROR_NOT_SUPPORTED
+map 3g of a 2g handle                                      CUDA_ERROR_NOT_SUPPORTED
+map g at offset g + g/2                                    CUDA_ERROR_NOT_SUPPORTED
+map with flags                                             CUDA_ERROR_INVALID_VALUE
+map with no handle                                         CUDA_ERROR_INVALID_VALUE
+map 2g                                                     CUDA_SUCCESS
+map again over it                                          CUDA_ERROR_NOT_SUPPORTED
+map g at the second g                                      CUDA_ERROR_NOT_SUPPORTED
+access g/2                                                 CUDA_ERROR_INVALID_VALUE
+access g + 1                                               CUDA_ERROR_INVALID_VALUE
+access 0                                                   CUDA_ERROR_INVALID_VALUE
+access at base + 4096                                      CUDA_ERROR_INVALID_VALUE
+access at base + 64 KiB                                    CUDA_ERROR_INVALID_VALUE
+access past the mapping                                    CUDA_ERROR_INVALID_VALUE
+access with no descriptor                                  CUDA_ERROR_INVALID_VALUE
+access with a count of 0                                   CUDA_ERROR_INVALID_VALUE
+access the first g of the 2g mapping                       CUDA_ERROR_INVALID_VALUE
+access 2g                                                  CUDA_SUCCESS
+unmap g/2                                                  CUDA_ERROR_INVALID_VALUE
+unmap g + 1                                                CUDA_ERROR_INVALID_VALUE
+unmap 0                                                    CUDA_ERROR_INVALID_VALUE
+unmap at base + 4096                                       CUDA_ERROR_INVALID_VALUE
+unmap at base + 64 KiB                                     CUDA_ERROR_INVALID_VALUE
+unmap the second g of the 2g mapping                       CUDA_ERROR_INVALID_VALUE
+unmap the first g of the 2g mapping                        CUDA_ERROR_INVALID_VALUE
+free the reservation while mapped                          CUDA_ERROR_INVALID_VALUE
+unmap 2g                                                   CUDA_SUCCESS
+unmap 2g again                                             CUDA_SUCCESS
+free g/2                                                   CUDA_ERROR_INVALID_VALUE
+free g                                                     CUDA_ERROR_INVALID_VALUE
+free 4g + 1                                                CUDA_ERROR_INVALID_VALUE
+free at base + 4096                                        CUDA_ERROR_INVALID_VALUE
+free at base + g                                           CUDA_ERROR_INVALID_VALUE
+free 5g                                                    CUDA_ERROR_INVALID_VALUE
+free 0                                                     CUDA_ERROR_INVALID_VALUE
+free 4g                                                    CUDA_SUCCESS
+free 4g again                                              CUDA_ERROR_INVALID_VALUE
+release the handle                                         CUDA_SUCCESS
+release the handle again                                   CUDA_ERROR_INVALID_VALUE
+PASS

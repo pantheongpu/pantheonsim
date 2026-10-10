@@ -54,9 +54,8 @@ different = {
   # where the card sits and what its host does
   "rt cudaDevAttrPciBusId", "drv CU_DEVICE_ATTRIBUTE_PCI_BUS_ID", "prop pciBusID", "prop uuid",
   "rt cudaDevAttrGpuPciSubsystemId", "drv CU_DEVICE_ATTRIBUTE_GPU_PCI_SUBSYSTEM_ID", "prop gpuPciSubsystemID",
-  # the card's display driver (WSL) has a watchdog and no concurrent managed access, which Linux has
+  # the card's display driver (WSL) has a watchdog, which a headless Linux GPU does not
   "rt cudaDevAttrKernelExecTimeout", "drv CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT",
-  "rt cudaDevAttrConcurrentManagedAccess", "drv CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS", "prop concurrentManagedAccess",
   # not implemented: sparse and deferred-mapped arrays, compressible memory,
   # read-only host registration, host memory pools and VMM, the 64-bit and NOR
   # stream memory operations, POSIX file-descriptor handles

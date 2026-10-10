@@ -243,22 +243,32 @@ VTEST(advice_and_prefetch_take_a_location_under_their_v2_names) {
   cudaMemLocation dev0{};
   dev0.type = cudaMemLocationTypeDevice;
   dev0.id = 0;
-  VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, dev0), cudaSuccess);
-  int preferred = -2;
-  VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
-            cudaSuccess);
-  VCHECK_EQ(preferred, 0);
   cudaMemLocation host{};
   host.type = cudaMemLocationTypeHost;
-  VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, host), cudaSuccess);
-  VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
-            cudaSuccess);
-  VCHECK_EQ(preferred, cudaCpuDeviceId);
-  VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 0, nullptr), cudaSuccess);
-  int last = -2;
-  VCHECK_EQ(cudaMemRangeGetAttribute(&last, sizeof last, cudaMemRangeAttributeLastPrefetchLocation, p, 1 << 16),
-            cudaSuccess);
-  VCHECK_EQ(last, 0);
+  int paged = -1;   // a device that does not page managed memory on demand (an RTX 3060 under WSL) refuses these
+  VCHECK_EQ(cudaDeviceGetAttribute(&paged, cudaDevAttrConcurrentManagedAccess, 0), cudaSuccess);
+  if (paged) {
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, dev0), cudaSuccess);
+    int preferred = -2;
+    VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
+              cudaSuccess);
+    VCHECK_EQ(preferred, 0);
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, host), cudaSuccess);
+    VCHECK_EQ(cudaMemRangeGetAttribute(&preferred, sizeof preferred, cudaMemRangeAttributePreferredLocation, p, 1 << 16),
+              cudaSuccess);
+    VCHECK_EQ(preferred, cudaCpuDeviceId);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 0, nullptr), cudaSuccess);
+    int last = -2;
+    VCHECK_EQ(cudaMemRangeGetAttribute(&last, sizeof last, cudaMemRangeAttributeLastPrefetchLocation, p, 1 << 16),
+              cudaSuccess);
+    VCHECK_EQ(last, 0);
+  } else {
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, dev0), cudaErrorInvalidDevice);
+    VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetPreferredLocation, host), cudaSuccess);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 0, nullptr), cudaErrorInvalidDevice);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, host, 0, nullptr), cudaErrorInvalidDevice);
+    VCHECK_EQ(cudaMemPrefetchAsync_v2(p, 1 << 16, dev0, 1, nullptr), cudaErrorInvalidValue);   // flags are reserved
+  }
   cudaMemLocation bad{};
   bad.type = cudaMemLocationTypeInvalid;
   VCHECK_EQ(cudaMemAdvise_v2(p, 1 << 16, cudaMemAdviseSetReadMostly, bad), cudaErrorInvalidValue);
