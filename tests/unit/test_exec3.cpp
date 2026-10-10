@@ -5994,21 +5994,90 @@ VTEST(tex_mipmapped_level_of_detail_matches_hardware) {
   }
 }
 
-// tex.grad is refused by name: the level of detail comes from the GPU's
-// approximate log2 and length units, which are not documented.
-VTEST(tex_grad_is_refused_by_name) {
+// tex.grad is implemented for 1D, 2D and 3D textures of any size (the level of detail the card derives from
+// gradients: nvidia/docs/textures.md, texture_grad.hpp). What is still refused, each by name: gradient vectors
+// shorter than the texture's dimensions (when the PTX is read), a texture with maxAnisotropy above 1 and a
+// mipmapped cube texture (when the fetch is made).
+VTEST(tex_grad_refuses_gradients_shorter_than_the_texture_when_read) {
   const std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 t)
 {
     .reg .f32 %f<12>;
     .reg .b64 %rd<2>;
     ld.param.u64 %rd1, [t];
-    tex.grad.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}], {%f7, %f8}, {%f9, %f10};
+    tex.grad.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6}], {%f7}, {%f9, %f10};
     ret;
 }
 )";
   auto err = VCAPTURE(Error, ptx::parse(ptx));
   VCHECK_CONTAINS(err.message(), "tex.grad");
+}
+
+namespace {
+// A kernel that does one tex.grad fetch of a 2D texture, and one of a cube texture.
+const char* const kTexGradKernels = R"(
+.visible .entry k2d(.param .u64 t)
+{
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [t];
+    mov.f32 %f5, 0f3F000000;
+    mov.f32 %f7, 0f3C000000;
+    tex.grad.2d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f5}], {%f7, %f7}, {%f7, %f7};
+    ret;
+}
+.visible .entry kcube(.param .u64 t)
+{
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<2>;
+    ld.param.u64 %rd1, [t];
+    mov.f32 %f5, 0f3F800000;
+    mov.f32 %f6, 0f00000000;
+    mov.f32 %f7, 0f3C000000;
+    tex.grad.cube.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5, %f6, %f6, %f6}], {%f7, %f7, %f7, %f7}, {%f7, %f7, %f7, %f7};
+    ret;
+}
+)";
+
+TextureDesc grad_test_texture(Env& e, bool cube) {
+  TextureDesc d;
+  d.width = 8;
+  d.height = 8;
+  d.cubemap = cube;
+  d.kind = ChannelKind::Float;
+  d.channel_bits[0] = 32;
+  d.texel_bytes = 4;
+  d.pitch_bytes = 32;
+  d.normalized_coords = true;
+  d.mip_levels = 1;
+  d.level_base[0] = e.mem.alloc(8 * 8 * (cube ? 6 : 1) * 4);
+  d.base = d.level_base[0];
+  return d;
+}
+}  // namespace
+
+VTEST(tex_grad_refuses_a_texture_with_anisotropy_above_one_by_name) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kTexGradKernels);
+  TextureDesc d = grad_test_texture(e, false);
+  d.max_anisotropy = 2;
+  TextureTable tex;
+  tex[0x97] = d;
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(0x97)}, e.mem, e.prof));
+  VCHECK_CONTAINS(err.message(), "maxAnisotropy above 1");
+}
+
+VTEST(tex_grad_refuses_a_mipmapped_cube_texture_by_name) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + kTexGradKernels);
+  TextureTable tex;
+  tex[0x98] = grad_test_texture(e, true);
+  LaunchConfig cfg;
+  cfg.textures = &tex;
+  auto err = VCAPTURE(Error, exec::launch(m.entries[1], cfg, {arg_u64(0x98)}, e.mem, e.prof));
+  VCHECK_CONTAINS(err.message(), "tex.grad on a cube texture");
 }
 
 // tld4 (texture gather) against a table recorded on an RTX 3060: a 3x3
