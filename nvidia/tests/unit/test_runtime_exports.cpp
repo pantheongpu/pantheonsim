@@ -336,12 +336,12 @@ VTEST(a_registered_kernel_reports_its_name_and_where_its_parameters_sit) {
 
 // --- what cluster occupancy needs and no profile has ------------------------
 
-VTEST(cluster_occupancy_is_refused_by_name_not_answered_from_a_made_up_layout) {
+VTEST(cluster_occupancy_looks_the_function_up_and_checks_its_pointers) {
   cudaLaunchConfig_t cfg{};
   int n = 0;
-  static const char probe = 0;   // any address: the refusal does not look the function up (kKernelPtx exists only from 12.4)
-  VCHECK_EQ(cudaOccupancyMaxActiveClusters(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorNotSupported);
-  VCHECK_EQ(cudaOccupancyMaxPotentialClusterSize(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorNotSupported);
+  static const char probe = 0;   // an address no kernel was registered under
+  VCHECK_EQ(cudaOccupancyMaxActiveClusters(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorInvalidDeviceFunction);
+  VCHECK_EQ(cudaOccupancyMaxPotentialClusterSize(&n, reinterpret_cast<const void*>(&probe), &cfg), cudaErrorInvalidDeviceFunction);
   VCHECK_EQ(cudaOccupancyMaxActiveClusters(nullptr, nullptr, &cfg), cudaErrorInvalidValue);
 }
 
