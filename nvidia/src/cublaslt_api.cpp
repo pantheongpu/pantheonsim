@@ -923,8 +923,11 @@ void quantize_column(Elems& d, const MatrixLayout& l, int64_t j, const std::vect
     const size_t off = ((b / 4) * 4 + ((size_t)j / 128) * dim) * 128 + ((size_t)j % 32) * 16 + ((size_t)j % 128 / 32) * 4 +
                        b % 4;
     if (out_base + off < out_scales.size()) out_scales[out_base + off] = code;
-    const double r = scale > 0 && std::isfinite(scale) ? 1.0 / (float)scale : 0.0;
-    for (size_t i = b * block; i < std::min(m, (b + 1) * block); ++i) d.set(at(l, (int64_t)i, j), col[i] * r);
+    // Each value is multiplied by the scale's reciprocal in fp32 (measured on an RTX PRO 6000, cuBLAS 13.3: -300 over
+    // an E4M3 scale of 120 reaches the E2M1 rounding as -2.5000002, not as the tie -2.5, and goes to -3; with a
+    // double reciprocal the tie went to -2).
+    const float r = scale > 0 && std::isfinite(scale) ? 1.0f / (float)scale : 0.0f;
+    for (size_t i = b * block; i < std::min(m, (b + 1) * block); ++i) d.set(at(l, (int64_t)i, j), (double)((float)col[i] * r));
   }
 }
 
@@ -1004,10 +1007,12 @@ bool hopper_mode(int m) { return m == kScaleVec128 || m == kScaleBlk128x128; }
      are made before any kernel is looked for), then
      whether a kernel exists on this GPU (NOT_SUPPORTED).
    Below compute capability 8.9 there is no FP8 kernel at all. On 8.9 the kernels are the table below
-   (every row measured). From 9.0 up the descriptor layer applies and the kernel layer is the
-   documentation's, not a card's: the older permissive checks that follow decide, and the features
-   only those GPUs have (outer-vector and 128-element scales, auxiliary scale and amax, the block-scaled
-   MXFP8 and NVFP4 modes) are implemented from NVIDIA's documentation, not checked against a card. */
+   (every row measured). On 12.0 (an RTX PRO 6000 Blackwell Server Edition, cuBLAS 13.3, 1278 descriptors of
+   lt.rtx-pro-6000-server.txt) it is the same table with the differences listed in sm120_layout_ok and the
+   block-scaled kernels (MXFP8 and NVFP4, TN only). From 9.0 up the other GPUs get the descriptor layer and
+   the kernel layer is the documentation's, not a card's: the older permissive checks that follow decide, and
+   the features only those GPUs have (outer-vector and 128-element scales, auxiliary scale and amax, the
+   block-scaled MXFP8 and NVFP4 modes) are implemented from NVIDIA's documentation, not checked against a card. */
 int device_cc() {
   int dev = 0, major = 0, minor = 0;
   if (cudaGetDevice(&dev) != cudaSuccess) return 0;
@@ -1020,8 +1025,10 @@ int device_cc() {
 // -1: a mode the library does not know.
 int scale_family(int mode, int cc) {
   switch (mode) {
-    case kScaleMnK4_128: return cc >= 100 ? 5 : -1;   // cuBLAS 13.8's UE8M0 modes: Blackwell's block-scaled kernels
-    case kScaleMnK4_32: return cc >= 100 ? 6 : -1;
+    // cuBLAS 13.8's UE8M0 modes: Blackwell's block-scaled kernels. cuBLAS 13.3 on an RTX PRO 6000 (12.0) answers
+    // INVALID_VALUE for both, as it does on an L4, so they are taken from 10.0 up but not on 12.x.
+    case kScaleMnK4_128: return cc >= 100 && cc / 10 != 12 ? 5 : -1;
+    case kScaleMnK4_32: return cc >= 100 && cc / 10 != 12 ? 6 : -1;
     case kScaleScalar: return 0;
     case kScaleVec16UE4M3: return 1;
     case kScaleVec32UE8M0: return 2;
@@ -1046,7 +1053,9 @@ cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout&
                          md.compute == CUBLAS_COMPUTE_32F_FAST_16BF || md.compute == CUBLAS_COMPUTE_32F_FAST_TF32;
   if (compute32 && md.scale != CUDA_R_32F) return CUBLAS_STATUS_INVALID_VALUE;
   if (md.amax_d && (dt == CUDA_R_16F || dt == CUDA_R_16BF || dt == CUDA_R_32F)) return CUBLAS_STATUS_INVALID_VALUE;
-  if ((md.aux_scale || md.aux_amax) && cc < 90) return CUBLAS_STATUS_INVALID_VALUE;
+  // (Measured on an L4 and on an RTX PRO 6000: neither takes an auxiliary scale or amax. Hopper and the data-center
+  // Blackwell GPUs are taken to, from the documentation.)
+  if ((md.aux_scale || md.aux_amax) && (cc < 90 || cc == 120)) return CUBLAS_STATUS_INVALID_VALUE;
   const int e = enum_value(md.epilogue);
   const bool aux = (e & 128) != 0, relu = (e & 2) != 0 || (e & 8) != 0;
   if (aux && md.aux_type >= 0) {
@@ -1054,7 +1063,7 @@ cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout&
     const int allowed = is_fp8(dt) ? CUDA_R_16BF : dt;
     // From sm_90 an E4M3 output's auxiliary buffer may also be E4M3 or fp16 (cublasLt.h's description of
     // EPILOGUE_AUX_DATA_TYPE; documentation-derived, an L4 and an RTX 3060 take only the types above).
-    const bool fp8_aux = cc >= 90 && dt == CUDA_R_8F_E4M3 && (md.aux_type == CUDA_R_8F_E4M3 || md.aux_type == CUDA_R_16F);
+    const bool fp8_aux = cc >= 90 && cc != 120 && dt == CUDA_R_8F_E4M3 && (md.aux_type == CUDA_R_8F_E4M3 || md.aux_type == CUDA_R_16F);
     if (md.aux_type != allowed && !fp8_aux) return CUBLAS_STATUS_INVALID_VALUE;
   }
   if (lc.order != ld.order) return CUBLAS_STATUS_INVALID_VALUE;
@@ -1073,11 +1082,11 @@ cublasStatus_t narrow_descriptor_check(const MatmulDesc& md, const MatrixLayout&
   return CUBLAS_STATUS_SUCCESS;
 }
 
-// The kernel layer for GPUs the card was measured on: below 8.9 nothing; on 8.9 this table.
+// The kernel layer for GPUs the card was measured on: below 8.9 nothing; on 8.9 and 12.0 these tables.
 cublasStatus_t narrow_kernel_check(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb,
                                    const MatrixLayout& lc, const MatrixLayout& ld, int cc) {
   if (cc < 89) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (cc > 89) {
+  if (cc > 89 && cc != 120) {
     // Hopper and later: documentation-derived, not checked against a card. The FP32-scale modes (outer
     // vector, 128-element, 128x128) and the auxiliary scale and amax are Hopper's and later; the UE8M0 and
     // UE4M3 block scales (MXFP8, NVFP4, and cuBLAS 13.8's packed forms) and FP4 are Blackwell's (cc 10.0 and up).
@@ -1087,28 +1096,57 @@ cublasStatus_t narrow_kernel_check(const MatmulDesc& md, const MatrixLayout& la,
     if ((is_fp4(la.type) || is_fp4(lb.type) || is_fp4(ld.type)) && !blackwell) return CUBLAS_STATUS_NOT_SUPPORTED;
     return CUBLAS_STATUS_SUCCESS;
   }
+  // 12.0 (an RTX PRO 6000 Blackwell Server Edition, cuBLAS 13.3; 1278 descriptors) answers as the L4 does, with
+  // these differences, all measured:
+  //  * layout: with a column-major D, B must be contiguous along K (op(A) is free); with a row-major D, A must
+  //    be (D^T = op(B)^T op(A)^T swaps the roles); the L4 wants both, whatever D is. The block-scaled kernels
+  //    want both (TN only).
+  //  * alignment: C and D take any leading dimension (the L4 wants 16 bytes for all four).
+  //  * block-scaled matmuls (UE8M0 per 32 for FP8, UE4M3 per 16 for FP4) have kernels: A and B of the same
+  //    kind, C and D of one type (bf16, f16, f32), an FP8 D of E4M3 or an FP4 D with a bf16/f16 C, and
+  //    EPILOGUE_DEFAULT, RELU, BIAS and GELU; a block-quantized D needs at least 32 rows.
+  const bool s120 = cc == 120;
   const int at = la.type, bt = lb.type, ct = lc.type, dt = ld.type;
+  const bool fp4in = s120 && is_fp4(at) && is_fp4(bt);
+  const bool blocked = s120 && (block_mode(md.a_scale_mode) || block_mode(md.b_scale_mode));
   auto e4 = [](int t) { return t == CUDA_R_8F_E4M3; };
   auto e5 = [](int t) { return t == CUDA_R_8F_E5M2; };
   // Types: E4M3 x E4M3, E4M3 x E5M2 or E5M2 x E4M3, into the output below (C is D's type, or BF16/FP16 under FP8).
-  if (!(is_fp8(at) && is_fp8(bt))) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (!(is_fp8(at) && is_fp8(bt)) && !fp4in) return CUBLAS_STATUS_NOT_SUPPORTED;
   if (md.compute != CUBLAS_COMPUTE_32F && md.compute != CUBLAS_COMPUTE_32F_FAST_16F && md.compute != CUBLAS_COMPUTE_32F_FAST_TF32)
     return CUBLAS_STATUS_NOT_SUPPORTED;
   bool types = false;
-  if (ct == CUDA_R_16BF && dt == CUDA_R_16BF) types = true;
-  if (ct == CUDA_R_16F && dt == CUDA_R_16F) types = true;
-  if (ct == CUDA_R_32F && dt == CUDA_R_32F) types = true;
-  if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e4(dt)) types = true;
-  if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e5(dt) && (e5(at) != e5(bt))) types = true;
+  if (fp4in) {
+    if (ct == dt && (ct == CUDA_R_16BF || ct == CUDA_R_16F || ct == CUDA_R_32F)) types = true;
+    if (is_fp4(dt) && (ct == CUDA_R_16BF || ct == CUDA_R_16F)) types = true;
+  } else {
+    if (ct == CUDA_R_16BF && dt == CUDA_R_16BF) types = true;
+    if (ct == CUDA_R_16F && dt == CUDA_R_16F) types = true;
+    if (ct == CUDA_R_32F && dt == CUDA_R_32F) types = true;
+    if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e4(dt)) types = true;
+    if ((ct == CUDA_R_16BF || ct == CUDA_R_16F) && e5(dt) && (e5(at) != e5(bt))) types = true;
+  }
   if (!types) return CUBLAS_STATUS_NOT_SUPPORTED;
   // Layout: A and B both contiguous along K (op(A) = T and op(B) = N for column-major storage).
   const bool ta = md.transa != CUBLAS_OP_N, tb = md.transb != CUBLAS_OP_N;
   const bool ka = ta != (la.order == CUBLASLT_ORDER_ROW), kb = (!tb) != (lb.order == CUBLASLT_ORDER_ROW);
-  if (!ka || !kb) return CUBLAS_STATUS_NOT_SUPPORTED;
-  if (md.a_scale_mode != kScaleScalar || md.b_scale_mode != kScaleScalar) return CUBLAS_STATUS_NOT_SUPPORTED;
-  // Alignment: every leading dimension a multiple of 16 bytes.
-  for (const MatrixLayout* l : {&la, &lb, &lc, &ld})
-    if ((l->ld * (int64_t)elem_bytes(l->type)) % 16) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (s120 && !blocked) {
+    if (!(ld.order == CUBLASLT_ORDER_ROW ? ka : kb)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  } else if (!ka || !kb) {
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  if (!blocked && (md.a_scale_mode != kScaleScalar || md.b_scale_mode != kScaleScalar)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  // Alignment: every leading dimension a multiple of 16 bytes. On 12.0 that holds for A and B; C and D need a
+  // contiguous extent (D's rows, 16 elements of E4M3 at least: fp8dims 8x8x16 and 17x16x16) of 16 bytes and any
+  // leading dimension (fp8ld pad_d1: a D with 65 columns of leading dimension is taken).
+  for (const MatrixLayout* l : {&la, &lb, &lc, &ld}) {
+    const bool cd = s120 && (l == &lc || l == &ld);
+    const int64_t extent = cd ? (l->order == CUBLASLT_ORDER_ROW ? (int64_t)l->cols : (int64_t)l->rows) : l->ld;
+    if ((extent * (int64_t)elem_bits(l->type) / 8) % 16) return CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  // The backward epilogues read an auxiliary buffer along with A and B and want both operands contiguous along K.
+  if (s120 && !blocked && (enum_value(md.epilogue) & (8 | 64)) && !(ka && kb)) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (blocked && block_mode(md.d_out_scale_mode) && ld.rows < 32) return CUBLAS_STATUS_NOT_SUPPORTED;
   // Epilogues, by output type; the bias is BF16 under an FP8 or fp32 D, else D's type.
   const int e = enum_value(md.epilogue);
   const bool bias = (e & 4) != 0;
@@ -1287,7 +1325,13 @@ cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const Ma
   double amax = 0.0;
   std::vector<uint8_t> out_scales;
   const size_t out_tensor = d_blocks ? scale_tensor_bytes(md.d_out_scale_mode, (size_t)n, (size_t)m) : 0;
-  if (d_blocks) out_scales.assign(out_tensor * (size_t)batch, 0);
+  // The scale tensor keeps the bytes the library does not write: the padding of its tiles (measured on an RTX PRO 6000:
+  // a buffer pre-filled with 0xEE keeps the 0xEE outside the scales of D's blocks).
+  if (d_blocks) {
+    out_scales.assign(out_tensor * (size_t)batch, 0);
+    if (md.d_out_scale && !out_scales.empty())
+      cudaMemcpy(out_scales.data(), md.d_out_scale, out_scales.size(), cudaMemcpyDeviceToHost);
+  }
   // The auxiliary buffer's element type, and (for an FP8 one) its scale and the amax it reports.
   // (Measured on an L4: under an FP8 D the default auxiliary type is BF16, while the product is rounded to fp16 before
   // the bias of RELU_AUX_BIAS and GELU_AUX_BIAS is added.)

@@ -1,6 +1,5 @@
 # <probe>.<slug> pairs whose card transcript the simulator does not reproduce yet (nvidia/tests/e2e/run_lowprec.sh reports
 # them as XFAIL; one that starts to match fails the test until its line is removed). Each is a measurement of a real GPU
 # that the simulator's rules for that architecture do not follow: see nvidia/docs/lowprec.md, "What the RTX PRO 6000 says".
-lt.rtx-pro-6000-server        # 539 of 1279 cases: cuBLASLt's sm_120 kernel table, the MX/NV block-scale output layout
 sparselt.rtx-pro-6000-server  # 99 of 1097 cases: sm_120's compressed size and workspace, block-scaled FP8/FP4
 ptx120.rtx-pro-6000-server    # 23 of 29 mma_blockscale hashes (narrow_cvt and ldmatrix_forms match)
