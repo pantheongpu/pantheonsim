@@ -26,6 +26,7 @@ struct KernelRef {
   const ptx::EntryFn* fn = nullptr;
   const std::map<std::string, uint64_t>* symbols = nullptr;
   int arch = 0;   // the module's .target sm_XX (what cudaFuncAttributes::ptxVersion says); 0: unknown
+  uint64_t constant = 0;   // the bytes of constant memory the kernel has (cudaFuncAttributes::constSizeBytes)
 };
 
 namespace devrt {

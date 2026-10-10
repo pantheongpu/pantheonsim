@@ -156,7 +156,12 @@ struct FuncAttrs {
   uint64_t shared = 0, constant = 0, local = 0;
   int32_t max_threads = 0, regs = 0, ptx = 0, binary = 0;
 };
-FuncAttrs func_attributes(const ptx::EntryFn& fn, const DeviceProfile& profile, int ptx_arch);
+// `constant` is the kernel's constant memory (KernelRef::constant).
+FuncAttrs func_attributes(const ptx::EntryFn& fn, const DeviceProfile& profile, int ptx_arch, uint64_t constant = 0);
+// The most threads a block of the kernel may have: the part's limit, the kernel's __launch_bounds__, and what its
+// registers leave room for (registers are handed out per warp in units of 256). An RTX 3060: 128 registers
+// a thread give 512, 168 give 384, 255 give 256.
+uint32_t kernel_thread_limit(const ptx::EntryFn& fn, const DeviceProfile& profile, uint32_t regs_per_thread);
 // Writes `a` where a cudaFuncAttributes starts: the layout is the toolkit's,
 // stable since CUDA 6.
 void put_func_attrs(const FuncAttrs& a, uint8_t out[40]);

@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "enum_value.hpp"
+#include "func_attrs.hpp"
 #include "kept_args.hpp"
 #include "error_names.hpp"
 #include "texture_formats.hpp"
@@ -131,8 +132,10 @@ struct RegisteredModule {
 struct KernelInfo {
   RegisteredModule* mod = nullptr;
   std::string entry_name;
-  bool nonportable_cluster = false;   // cudaFuncAttributeNonPortableClusterSizeAllowed
   bool load_told = false;             // a profiler has been told what loading this kernel cost
+  // What the program has set with cudaFuncSetAttribute, per device (func_attrs.hpp): a second device starts
+  // from the defaults, as on the card.
+  std::map<int, vgpu_funcattr::State> attrs;
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -145,6 +148,10 @@ struct VarInfo {
   size_t size = 0;
   bool is_constant = false;
 };
+
+// Whether the program allowed this kernel a non-portable cluster size on the current device
+// (cudaFuncAttributeNonPortableClusterSizeAllowed).
+bool nonportable_on_current(const KernelInfo& ki);
 
 // A host buffer the runtime allocated or was handed, and the device that was
 // current when that happened -- which is the device a cudaDeviceReset of that
@@ -360,6 +367,11 @@ std::map<void*, HostRange>& pinned(State& s) { return s.rt->host_allocations(); 
 // allocation and launch onto device 1 -- the usual one-thread-per-GPU pattern
 // then raced on a single variable.
 thread_local int t_current_device = 0;
+
+bool nonportable_on_current(const KernelInfo& ki) {
+  const auto it = ki.attrs.find(t_current_device);
+  return it != ki.attrs.end() && it->second.non_portable != 0;
+}
 
 // The first mapped host range in `m` containing `p`, or m.end().
 std::map<void*, HostRange>::iterator find_range(std::map<void*, HostRange>& m, const void* p) {
@@ -1487,6 +1499,21 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       vgpu::profiling::record(std::move(ev));
     }
 
+    // Dynamic shared memory past what the kernel may ask for is refused: 48 KiB less its static shared memory
+    // until cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize) raises (or lowers) it. An RTX 3060
+    // refused 49153 bytes of a kernel that had not opted in, and 60001 of one that had asked for 60000
+    // (func_attrs.hpp).
+    {
+      const auto at = ki.attrs.find(t_current_device);
+      const vgpu_funcattr::State st = at == ki.attrs.end() ? vgpu_funcattr::State{} : at->second;
+      const int limit = vgpu_funcattr::max_dynamic_shared(st, dev.profile(), fn->static_shared_size);
+      if (sharedMem > static_cast<size_t>(limit))
+        throw vgpu::Error::make(vgpu::Err::LaunchConfig, "kernel '", ki.entry_name, "' asks for ", sharedMem,
+                                " bytes of dynamic shared memory; it may use ", limit,
+                                " (cudaFuncAttributeMaxDynamicSharedMemorySize raises that, up to ",
+                                vgpu_funcattr::max_settable_dynamic_shared(dev.profile(), fn->static_shared_size), ")");
+    }
+
     // A kernel with parameters needs an argument array, and every slot in it
     // must be a real pointer: dereferencing what the caller passed is the one
     // place a bad argument turns into a crash instead of an error code.
@@ -1602,7 +1629,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
         return cudaErrorCooperativeLaunchTooLarge;
       }
     }
-    cfg.nonportable_cluster = ki.nonportable_cluster;
+    cfg.nonportable_cluster = nonportable_on_current(ki);
     // A graph's kernels can set its conditional handles; no other kernel can.
     if (std::strcmp(api, "cudaGraphLaunch") == 0) {
       cfg.conditionals = &g_graph_conditionals;
@@ -2171,15 +2198,16 @@ static cudaError_t cudaFuncGetAttributes_body(cudaFuncAttributes* attr, const vo
   return guard("cudaFuncGetAttributes", [&](State& s) -> cudaError_t {
     cudaFuncAttributes* a = attr;
     if (!a) return cudaErrorInvalidValue;
-    // Returning the error silently made this very hard to place: CUB asks about
-    // its own kernels before it launches any, so the failure surfaced as
-    // "invalid device function" from a sort, with nothing said about which
-    // kernel could not be described.
+    // A null function is cudaErrorInvalidDeviceFunction and any other address the runtime does not know is
+    // cudaErrorInvalidResourceHandle (measured on an RTX 3060, as for cudaFuncSetCacheConfig).
+    // Saying nothing made this very hard to place: CUB asks about its own kernels before it launches any, so
+    // the failure surfaced as "invalid device function" from a sort, with nothing said about which kernel
+    // could not be described.
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
       if (!quiet())
         std::fprintf(stderr, "[vgpu] cudaFuncGetAttributes: unregistered kernel stub %p\n", func);
-      return cudaErrorInvalidDeviceFunction;
+      return func ? cudaErrorInvalidResourceHandle : cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
     if (!ki.mod || !registered_ptx(s, *ki.mod)) {
@@ -2194,11 +2222,14 @@ static cudaError_t cudaFuncGetAttributes_body(cudaFuncAttributes* attr, const vo
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
     const vgpu::DeviceProfile& p = dev.profile();
     auto res = vgpu::exec::kernel_resources(*fn, p, p.limits.max_threads_per_block, 0);
+    const auto st_it = ki.attrs.find(t_current_device);
+    const vgpu_funcattr::State st = st_it == ki.attrs.end() ? vgpu_funcattr::State{} : st_it->second;
     std::memset(a, 0, sizeof *a);
     a->numRegs = static_cast<int>(res.usage.regs_per_thread);
     a->localSizeBytes = res.usage.local_bytes;
     a->sharedSizeBytes = fn->static_shared_size;
-    a->maxThreadsPerBlock = static_cast<int>(p.limits.max_threads_per_block);
+    a->constSizeBytes = static_cast<size_t>(dev.module_const_bytes(mid, ki.entry_name));
+    a->maxThreadsPerBlock = vgpu_funcattr::max_threads(*fn, p, res.usage.regs_per_thread);
     // ptxVersion is the *virtual architecture* the function was compiled for,
     // not the PTX ISA version -- CUB multiplies it by ten and dispatches on the
     // result, so reporting 83 for "PTX ISA 8.3" produced 830, an architecture
@@ -2207,7 +2238,16 @@ static cudaError_t cudaFuncGetAttributes_body(cudaFuncAttributes* attr, const vo
     const int arch = dev.module_arch(mid);
     a->ptxVersion = arch ? arch : p.cc_major * 10 + p.cc_minor;
     a->binaryVersion = p.cc_major * 10 + p.cc_minor;
-    a->maxDynamicSharedSizeBytes = static_cast<int>(p.limits.shared_mem_per_block_optin);
+    // What a launch may ask for, the carveout and the cluster figures: func_attrs.hpp has the rules and the
+    // card they were measured on.
+    a->maxDynamicSharedSizeBytes = vgpu_funcattr::max_dynamic_shared(st, p, fn->static_shared_size);
+    a->preferredShmemCarveout = st.carveout;
+    a->clusterDimMustBeSet = fn->explicit_cluster ? 1 : 0;
+    a->requiredClusterWidth = vgpu_funcattr::cluster_dim(st, *fn, 0);
+    a->requiredClusterHeight = vgpu_funcattr::cluster_dim(st, *fn, 1);
+    a->requiredClusterDepth = vgpu_funcattr::cluster_dim(st, *fn, 2);
+    a->clusterSchedulingPolicyPreference = st.scheduling_policy;
+    a->nonPortableClusterSizeAllowed = st.non_portable;
     return cudaSuccess;
   });
 }
@@ -2241,6 +2281,17 @@ static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced(int* num
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
     const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    // More dynamic shared memory than the kernel may ask for is a launch that cannot happen: 0 blocks, with
+    // cudaSuccess (an RTX 3060: 49153 bytes of a kernel that had not opted in, 65536 of one that had asked for
+    // 60000).
+    {
+      const auto at = ki.attrs.find(t_current_device);
+      const vgpu_funcattr::State st = at == ki.attrs.end() ? vgpu_funcattr::State{} : at->second;
+      if (dynamicSMemSize > static_cast<size_t>(vgpu_funcattr::max_dynamic_shared(st, dev.profile(), fn->static_shared_size))) {
+        *numBlocks = 0;
+        return cudaSuccess;
+      }
+    }
     auto res = vgpu::exec::kernel_resources(*fn, dev.profile(),
                                             static_cast<uint32_t>(blockSize),
                                             static_cast<uint32_t>(dynamicSMemSize));
@@ -2315,7 +2366,7 @@ static cudaError_t cluster_occupancy_query(const char* api, bool active, int* ou
                           .occupancy.blocks_per_sm;
     }
     const vgpu::exec::ClusterAnswer a = vgpu::exec::cluster_occupancy(p, active, has_dim, dim, required,
-                                                                       ki.nonportable_cluster, blocks_per_sm);
+                                                                       nonportable_on_current(ki), blocks_per_sm);
     cluster_note(api, p, a);
     switch (a.status) {
       case S::Ok: *out = static_cast<int>(a.value); return cudaSuccess;
@@ -4374,22 +4425,30 @@ VGPU_EXPORT cudaError_t cudaStreamAddCallback(cudaStream_t stream, cudaStreamCal
   return traced_call("cudaStreamAddCallback", cudaStreamAddCallback_traced, stream, cb, user, p3);
 }
 
-static cudaError_t cudaFuncSetAttribute_traced(const void* func, cudaFuncAttribute attr, int value) {
+// Every attribute of cudaFuncAttribute (0 to 15) is checked the way the card checks it (func_attrs.hpp): a number
+// outside the enumeration is cudaErrorInvalidValue before the function is looked at, a null function is
+// cudaErrorInvalidDeviceFunction and an unknown one cudaErrorInvalidResourceHandle, then the value is checked
+// against the attribute. The state is the kernel's on the current device. An attribute is a plain int here: an
+// out-of-range one must not be loaded as the enum (UBSan).
+static cudaError_t cudaFuncSetAttribute_traced(const void* func, int attr, int value) {
   if (const cudaError_t dead = dead_context()) return dead;
-  // Most attributes are tuning knobs (a shared-memory carveout, say) that the
-  // interpreter has no use for. The one that changes what may launch is the
-  // non-portable cluster size, so that one is kept.
-  if (static_cast<int>(attr) != 14) return cudaSuccess;   // cudaFuncAttributeNonPortableClusterSizeAllowed
+  if (attr < 0 || attr > 15) return cudaErrorInvalidValue;
   return guard("cudaFuncSetAttribute", [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
-    if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
-    it->second.nonportable_cluster = value != 0;
+    if (it == s.kernels.end()) return func ? cudaErrorInvalidResourceHandle : cudaErrorInvalidDeviceFunction;
+    KernelInfo& ki = it->second;
+    // The limits depend on the kernel's static shared memory and the part: its code has to be there.
+    if (!ki.mod || !registered_ptx(s, *ki.mod)) return cudaErrorInvalidDeviceFunction;
+    const vgpu::ptx::EntryFn* fn = current(s).get_function(module_on_current(s, *ki.mod), ki.entry_name);
+    if (!vgpu_funcattr::set(ki.attrs[t_current_device], current(s).profile(), fn->static_shared_size, attr, value,
+                            /*driver=*/false))
+      return cudaErrorInvalidValue;
     return cudaSuccess;
   });
 }
 
 VGPU_EXPORT cudaError_t cudaFuncSetAttribute(const void* func, cudaFuncAttribute attr, int value) {
-  return traced_call("cudaFuncSetAttribute", cudaFuncSetAttribute_traced, func, attr, value);
+  return traced_call("cudaFuncSetAttribute", cudaFuncSetAttribute_traced, func, enum_value(attr), value);
 }
 
 // An L1-versus-shared-memory preference is a tuning hint with nothing to tune
@@ -6723,6 +6782,9 @@ struct GraphRec {
   // The number a profiler knows this graph by (vgpu::profiling::next_graph_id),
   // 0 for a graph it was never told of: a copy made to run, a body, a child.
   uint32_t prof_id = 0;
+  // The id cudaGraphGetId (CUDA 13.2) gives a graph a profiler was never told of -- a child graph's copy, say --
+  // taken from the same sequence the first time it is asked for.
+  uint32_t lazy_id = 0;
 
   // The graph becomes one a profiler knows: numbered, and announced.
   void announce_created() {
@@ -10856,6 +10918,73 @@ VGPU_EXPORT cudaError_t cudaGraphAddNode(cudaGraphNode_t* pNode, cudaGraph_t gra
 #endif
 #endif
 
+
+// ---- graph, graph exec and node ids (CUDA 13.2: cudaGraphGetId and the rest; the driver's cuGraphGetId ...) ----------
+// The id of a graph is the number a profiler knows it by, which an RTX 3060 hands out the same way: one for each graph
+// made (cudaGraphCreate, cudaGraphClone, a capture) and two for each instantiation, the second being the
+// executable's lowered copy. An executable's id is the id of its first. A node's local id is its place in its graph
+// (the number cudaGraphDebugDotPrint prints), and its tools id is the graph's id in the high half of 64 bits and
+// that in the low half (measured: graph 1's first node 0x100000000, its second 0x100000001, and the first node of
+// the child graph 9 0x900000000). These are the runtime's own hooks, always exported; the 13.2 toolkit's functions
+// (runtime_132.inc) and the driver's call them.
+namespace {
+uint32_t graph_id_of(GraphRec& g) {
+  if (g.prof_id) return g.prof_id;
+  if (!g.lazy_id) g.lazy_id = vgpu::profiling::next_graph_id();
+  return g.lazy_id;
+}
+// The graph holding a node, a child graph's own nodes and a graph an instantiation made included.
+GraphRec* holder_of(const GraphNodeRec* n) {
+  if (GraphRec* g = owner_of(n)) return g;
+  std::function<GraphRec*(GraphRec&)> search = [&](GraphRec& g) -> GraphRec* {
+    for (const auto& c : g.children) {
+      if (c->holds(n)) return c.get();
+      if (GraphRec* in = search(*c)) return in;
+    }
+    return nullptr;
+  };
+  for (auto& [h, g] : g_graphs)
+    if (GraphRec* in = search(*g)) return in;
+  for (auto& [h, g] : g_graph_execs)
+    if (g->holds(n)) return g.get();
+  for (auto& [h, g] : g_graph_execs)
+    if (GraphRec* in = search(*g)) return in;
+  return nullptr;
+}
+}  // namespace
+
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_id_v1(void* graph, unsigned int* id) {
+  if (!id || !graph) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  GraphRec* g = graph_from(static_cast<cudaGraph_t>(graph));
+  if (!g) return cudaErrorInvalidValue;
+  *id = graph_id_of(*g);
+  return cudaSuccess;
+}
+
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_exec_id_v1(void* exec, unsigned int* id) {
+  if (!id || !exec) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto it = g_graph_execs.find(exec);
+  if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
+  *id = graph_id_of(*it->second);
+  return cudaSuccess;
+}
+
+extern "C" __attribute__((visibility("default"))) int vgpu_graph_node_ids_v1(void* node, unsigned int* local_id, unsigned long long* tools_id, void** graph) {
+  if (!node) return cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_graph_mu);
+  const auto* n = static_cast<const GraphNodeRec*>(node);
+  GraphRec* g = holder_of(n);
+  if (!g) return cudaErrorInvalidValue;
+  size_t index = 0;
+  while (index < g->nodes.size() && g->nodes[index].get() != n) ++index;
+  if (local_id) *local_id = static_cast<unsigned int>(index);
+  if (tools_id) *tools_id = (uint64_t{graph_id_of(*g)} << 32) | index;
+  if (graph) *graph = g;
+  return cudaSuccess;
+}
+
 // The graph as a DOT drawing: one node per node, one edge per dependency. It
 // used to print an empty graph, which is a picture of nothing.
 static cudaError_t cudaGraphDebugDotPrint_traced(cudaGraph_t graph, const char* path, unsigned int p2) {
@@ -11299,6 +11428,8 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCap
 
 // The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
 #include "runtime_sweep.inc"
+// And the ones only the CUDA 13.2 header declares.
+#include "runtime_132.inc"
 
 /* ===================================================================== */
 /* Per-thread default stream                                             */

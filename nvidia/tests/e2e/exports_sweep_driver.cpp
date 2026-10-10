@@ -9,6 +9,8 @@
 #include <cuda.h>
 #include <dlfcn.h>
 
+#include <dlfcn.h>
+
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -102,6 +104,88 @@ static CUmipmappedArray mip() {
   cuMipmappedArrayCreate(&m, &d, 4);
   return m;
 }
+
+static CUmodule modf() {
+  CUmodule m = nullptr;
+  cuModuleLoad(&m, "libf.cubin");
+  return m;
+}
+static CUfunction funf(const char* name) {
+  CUfunction f = nullptr;
+  cuModuleGetFunction(&f, modf(), name);
+  return f;
+}
+static CUkernel kernf(const char* name) {
+  static std::vector<char> img;
+  std::ifstream in("libf.cubin", std::ios::binary);
+  img.assign(std::istreambuf_iterator<char>(in), {});
+  CUlibrary l = nullptr;
+  cuLibraryLoadData(&l, img.data(), nullptr, nullptr, 0, nullptr, nullptr, 0);
+  CUkernel k = nullptr;
+  cuLibraryGetKernel(&k, l, name);
+  return k;
+}
+// What cuFuncGetAttribute says of a function: attributes 0 to 15, but for the registers and local memory (the
+// compiler's).
+static void note_func(CUfunction f) {
+  int v[16];
+  for (int a = 0; a < 16; ++a)
+    if (cuFuncGetAttribute(&v[a], static_cast<CUfunction_attribute>(a), f) != CUDA_SUCCESS) v[a] = -777;
+  note("maxThreads %d, static %d, const %d, ptx %d, binary %d, cacheCA %d, maxDynamic %d, carveout %d, clusterMustBeSet %d, "
+       "cluster %d %d %d, nonPortable %d, policy %d",
+       v[0], v[1], v[2], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+}
+static int dynamic_of(CUfunction f) {
+  int v = -99;
+  cuFuncGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f);
+  return v;
+}
+// A launch of one warp with `dyn` bytes of dynamic shared memory: the code it answers.
+static int launch_code(CUfunction f, unsigned dyn) {
+  CUdeviceptr d = 0;
+  cuMemAlloc(&d, 4096);
+  void* args[1] = {&d};
+  const CUresult r = cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, dyn, nullptr, args, nullptr);
+  cuCtxSynchronize();
+  cuMemFree(d);
+  return static_cast<int>(r);
+}
+
+// The functions only the CUDA 13.2 header declares are called by name through the loader, with the few structures they
+// take declared here at the sizes and offsets cuda.h gives them, so the same cases build with every toolkit and run
+// against a driver or a simulator that has them (an RTX 3060 under driver 596.36 answered them all). One that is
+// missing answers CUDA_ERROR_NOT_FOUND.
+template <class F>
+static F drv(const char* name) {
+  return reinterpret_cast<F>(dlsym(RTLD_DEFAULT, name));
+}
+#define D132(name, Sig, ...) (drv<Sig>(#name) ? drv<Sig>(#name)(__VA_ARGS__) : CUDA_ERROR_NOT_FOUND)
+struct MemcpyAttr {                 // CUmemcpyAttributes
+  int srcAccessOrder;
+  int srcLocType, srcLocId, dstLocType, dstLocId;
+  unsigned flags;
+};
+struct Operand3D {                  // CUmemcpy3DOperand
+  int type;                         // 1 pointer, 2 array
+  unsigned long long ptr;
+  size_t rowLength, layerHeight;
+  int locType, locId;
+};
+struct BatchOp3D {                  // CUDA_MEMCPY3D_BATCH_OP
+  Operand3D src, dst;
+  size_t width, height, depth;
+  int srcAccessOrder;
+  unsigned flags;
+};
+struct NodeParams {                 // CUgraphNodeParams: a type, a union of 232 bytes
+  int type;
+  int reserved0[3];
+  unsigned char u[232];
+  long long reserved2;
+  template <class T> T get(size_t off) const { T v; std::memcpy(&v, u + off, sizeof v); return v; }
+};
+static_assert(sizeof(MemcpyAttr) == 24 && sizeof(BatchOp3D) == 112 && sizeof(NodeParams) == 256, "cuda.h layouts");
+using GraphFn = CUresult (*)(CUgraph, unsigned*);
 
 struct Case {
   const char* label;
@@ -401,6 +485,169 @@ int main() {
   C("cuTexRefSetBorderColor", { init(); CUtexref t; cuTexRefCreate(&t); float c[4] = {1, 0.5f, 0.25f, 0}; CUresult r = cuTexRefSetBorderColor(t, c); float g[4] = {-1, -1, -1, -1}; CUresult x = cuTexRefGetBorderColor(g, t); note("get %s %.2f %.2f %.2f %.2f", nm(x), g[0], g[1], g[2], g[3]); return r; });
   C("cuTexRefGetBorderColor default", { init(); CUtexref t; cuTexRefCreate(&t); float g[4] = {-1, -1, -1, -1}; CUresult x = cuTexRefGetBorderColor(g, t); note("%.2f %.2f %.2f %.2f", g[0], g[1], g[2], g[3]); return x; });
   C("cuTexRefSetMaxAnisotropy null ref", { init(); return cuTexRefSetMaxAnisotropy(nullptr, 4); });
+
+  // ---- function and kernel attributes (nvidia/src/func_attrs.hpp has the rules; every line is an RTX 3060 under CUDA 13.0)
+  C("cuFuncGetAttribute, no static shared memory", { init(); note_func(funf("fa_dyn")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, 256 bytes static", { init(); note_func(funf("fa_s256")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, 40000 bytes static", { init(); note_func(funf("fa_s40000")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, 48 KiB static", { init(); note_func(funf("fa_s49152")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, __launch_bounds__(128)", { init(); note_func(funf("fa_lb128")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, __launch_bounds__(512, 2)", { init(); note_func(funf("fa_lb512")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, registers limit the block", { init(); note_func(funf("fa_heavy400")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute, module constants", { init(); note_func(funf("fa_const")); return CUDA_SUCCESS; });
+  C("cuFuncGetAttribute attribute 16", { init(); int v = -5; CUresult r = cuFuncGetAttribute(&v, (CUfunction_attribute)16, funf("fa_dyn")); note("v=%d", v); return r; });
+  C("cuFuncGetAttribute attribute -1", { init(); int v = -5; CUresult r = cuFuncGetAttribute(&v, (CUfunction_attribute)-1, funf("fa_dyn")); note("v=%d", v); return r; });
+  C("cuFuncGetAttribute attribute 99", { init(); int v = -5; CUresult r = cuFuncGetAttribute(&v, (CUfunction_attribute)99, funf("fa_dyn")); note("v=%d", v); return r; });
+  C("cuFuncGetAttribute null function", { init(); int v; return cuFuncGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, nullptr); });
+  C("cuFuncGetAttribute null result", { init(); return cuFuncGetAttribute(nullptr, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, funf("fa_dyn")); });
+  C("cuFuncSetAttribute null function", { init(); return cuFuncSetAttribute(nullptr, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 3); });
+  for (int a = 0; a <= 17; ++a) {
+    static char labels[24][64];
+    static int n = 0;
+    std::snprintf(labels[n], sizeof labels[n], "cuFuncSetAttribute attribute %d to 1", a);
+    const char* label = labels[n++];
+    cases.push_back({label, "", [a]() -> int { init(); CUfunction f = funf("fa_lb128"); CUresult r = cuFuncSetAttribute(f, static_cast<CUfunction_attribute>(a), 1); note_func(f); return r; }});
+  }
+  static const int dyn_values[] = {-1, 0, 1, 1024, 49152, 49153, 65536, 101376, 101377, 102400};
+  for (const int v : dyn_values) {
+    static char labels[16][96];
+    static int n = 0;
+    std::snprintf(labels[n], sizeof labels[n], "cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES %d, no static", v);
+    const char* label = labels[n++];
+    cases.push_back({label, "", [v]() -> int { init(); CUfunction f = funf("fa_dyn"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, v); note("now %d", dynamic_of(f)); return r; }});
+  }
+  C("cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101120, 256 static", { init(); CUfunction f = funf("fa_s256"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 101120); note("now %d", dynamic_of(f)); return r; });
+  C("cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101121, 256 static", { init(); CUfunction f = funf("fa_s256"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 101121); note("now %d", dynamic_of(f)); return r; });
+  C("cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 61376, 40000 static", { init(); CUfunction f = funf("fa_s40000"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 61376); note("now %d", dynamic_of(f)); return r; });
+  C("cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 61377, 40000 static", { init(); CUfunction f = funf("fa_s40000"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 61377); note("now %d", dynamic_of(f)); return r; });
+  C("cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 52225, 48 KiB static", { init(); CUfunction f = funf("fa_s49152"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 52225); note("now %d", dynamic_of(f)); return r; });
+  static const int carve_values[] = {-2, -1, 0, 1, 100, 101};
+  for (const int v : carve_values) {
+    static char labels[16][96];
+    static int n = 0;
+    std::snprintf(labels[n], sizeof labels[n], "cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT %d", v);
+    const char* label = labels[n++];
+    cases.push_back({label, "", [v]() -> int { init(); CUfunction f = funf("fa_lb128"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, v); int now = -99; cuFuncGetAttribute(&now, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, f); note("now %d", now); return r; }});
+  }
+  C("cuFuncSetAttribute required cluster dimensions", { init(); CUfunction f = funf("fa_lb128"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, 3); cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT, 2); cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH, 5); note_func(f); return r; });
+  C("cuFuncSetAttribute required cluster width -1", { init(); return cuFuncSetAttribute(funf("fa_lb128"), CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH, -1); });
+  C("cuFuncSetAttribute CLUSTER_SCHEDULING_POLICY_PREFERENCE 2", { init(); CUfunction f = funf("fa_lb128"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, 2); note_func(f); return r; });
+  C("cuFuncSetAttribute CLUSTER_SCHEDULING_POLICY_PREFERENCE 3", { init(); return cuFuncSetAttribute(funf("fa_lb128"), CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, 3); });
+  C("cuFuncSetAttribute NON_PORTABLE_CLUSTER_SIZE_ALLOWED 7", { init(); CUfunction f = funf("fa_lb128"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 7); note_func(f); return r; });
+  C("cuFuncSetAttribute NON_PORTABLE_CLUSTER_SIZE_ALLOWED -1", { init(); CUfunction f = funf("fa_lb128"); CUresult r = cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, -1); note_func(f); return r; });
+  C("cuFuncSetAttribute on one function, the other function of the module", { init(); CUfunction f = funf("fa_dyn"); cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 70000); CUfunction g = funf("fa_dyn2"); CUfunction again = funf("fa_dyn"); note("other %d, same function again %d", dynamic_of(g), dynamic_of(again)); return CUDA_SUCCESS; });
+  C("cuFuncSetAttribute in the context of device 0, the module of device 1", { cuInit(0); CUdevice d0, d1; cuDeviceGet(&d0, 0); cuDeviceGet(&d1, 1); CUcontext c0, c1; cuDevicePrimaryCtxRetain(&c0, d0); cuDevicePrimaryCtxRetain(&c1, d1);
+    cuCtxSetCurrent(c0); CUfunction f0 = funf("fa_dyn"); cuCtxSetCurrent(c1); CUfunction f1 = funf("fa_dyn"); cuCtxSetCurrent(c0);
+    cuFuncSetAttribute(f0, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 70000); note("device 0 %d, device 1 %d", dynamic_of(f0), dynamic_of(f1)); return CUDA_SUCCESS; });
+  C("cuFuncSetAttribute, MAX_DYNAMIC_SHARED_SIZE_BYTES a CUkernel as the function", { init(); CUkernel k = kernf("fa_dyn"); CUfunction as = reinterpret_cast<CUfunction>(k); CUresult r = cuFuncSetAttribute(as, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 65000); CUdevice d; cuCtxGetDevice(&d); int v = -99; cuKernelGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, d); note("kernel now %d", v); return r; });
+  C("cuFuncGetAttribute, a CUkernel as the function", { init(); CUkernel k = kernf("fa_s256"); int v = -5; CUresult r = cuFuncGetAttribute(&v, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, reinterpret_cast<CUfunction>(k)); note("v=%d", v); return r; });
+  C("cuKernelGetAttribute, 256 bytes static", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); int v[16]; for (int a = 0; a < 16; ++a) if (cuKernelGetAttribute(&v[a], static_cast<CUfunction_attribute>(a), k, d) != CUDA_SUCCESS) v[a] = -777; note("maxThreads %d, static %d, const %d, ptx %d, binary %d, maxDynamic %d, carveout %d", v[0], v[1], v[2], v[5], v[6], v[8], v[9]); return CUDA_SUCCESS; });
+  C("cuKernelGetAttribute attribute 16", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); int v = -5; return cuKernelGetAttribute(&v, (CUfunction_attribute)16, k, d); });
+  C("cuKernelGetAttribute null result", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); return cuKernelGetAttribute(nullptr, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, d); });
+  C("cuKernelGetAttribute null kernel", { init(); CUdevice d; cuCtxGetDevice(&d); int v; return cuKernelGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, nullptr, d); });
+  C("cuKernelGetAttribute device 5", { init(); CUkernel k = kernf("fa_s256"); int v; return cuKernelGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, 5); });
+  C("cuKernelSetAttribute device 5", { init(); CUkernel k = kernf("fa_s256"); return cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 100, k, 5); });
+  C("cuKernelSetAttribute null kernel", { init(); CUdevice d; cuCtxGetDevice(&d); return cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 100, nullptr, d); });
+  C("cuKernelSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 70000, then the function", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); CUresult r = cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 70000, k, d); CUfunction f = nullptr; cuKernelGetFunction(&f, k); int v = -99; cuKernelGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, d); note("kernel %d, function %d", v, dynamic_of(f)); return r; });
+  C("cuKernelSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101121, 256 static", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); CUresult r = cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 101121, k, d); int v = -99; cuKernelGetAttribute(&v, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, d); note("now %d", v); return r; });
+  C("cuKernelSetAttribute attribute 1", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); return cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, 1, k, d); });
+  C("cuKernelSetAttribute carveout 30, then the function", { init(); CUkernel k = kernf("fa_s256"); CUdevice d; cuCtxGetDevice(&d); CUresult r = cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 30, k, d); CUfunction f = nullptr; cuKernelGetFunction(&f, k); int v = -99; cuFuncGetAttribute(&v, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, f); note("function %d", v); return r; });
+  C("cuKernelSetAttribute on device 0, read on device 1", { cuInit(0); CUdevice d0, d1; cuDeviceGet(&d0, 0); cuDeviceGet(&d1, 1); CUcontext c0, c1; cuDevicePrimaryCtxRetain(&c0, d0); cuDevicePrimaryCtxRetain(&c1, d1); cuCtxSetCurrent(c0); CUkernel k = kernf("fa_s256");
+    CUresult r = cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 65000, k, d0); int v0 = -99, v1 = -99; cuKernelGetAttribute(&v0, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, d0); cuKernelGetAttribute(&v1, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k, d1); note("device 0 %d, device 1 %d", v0, v1); return r; });
+  // A launch may ask for what the function's limit allows, no more.
+  C("cuLaunchKernel dynamic shared memory, not opted in", { init(); CUfunction f = funf("fa_dyn"); note("49152 -> %d, 49153 -> %d, 65536 -> %d", launch_code(f, 49152), launch_code(f, 49153), launch_code(f, 65536)); return CUDA_SUCCESS; });
+  C("cuLaunchKernel dynamic shared memory, 40000 bytes static", { init(); CUfunction f = funf("fa_s40000"); note("9152 -> %d, 9153 -> %d", launch_code(f, 9152), launch_code(f, 9153)); return CUDA_SUCCESS; });
+  C("cuLaunchKernel dynamic shared memory, 48 KiB static", { init(); CUfunction f = funf("fa_s49152"); note("0 -> %d, 1 -> %d", launch_code(f, 0), launch_code(f, 1)); return CUDA_SUCCESS; });
+  C("cuLaunchKernel dynamic shared memory, opted in to 60000", { init(); CUfunction f = funf("fa_dyn"); cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 60000); note("49153 -> %d, 60000 -> %d, 60001 -> %d", launch_code(f, 49153), launch_code(f, 60000), launch_code(f, 60001)); return CUDA_SUCCESS; });
+  C("cuLaunchKernel dynamic shared memory, opted in to 100", { init(); CUfunction f = funf("fa_dyn"); cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 100); note("100 -> %d, 101 -> %d, 49152 -> %d", launch_code(f, 100), launch_code(f, 101), launch_code(f, 49152)); return CUDA_SUCCESS; });
+  C("cuLaunchKernel dynamic shared memory, a CUkernel opted in to 60000", { init(); CUkernel k = kernf("fa_dyn"); CUdevice d; cuCtxGetDevice(&d); cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 60000, k, d); CUfunction f = reinterpret_cast<CUfunction>(k); note("60000 -> %d, 60001 -> %d", launch_code(f, 60000), launch_code(f, 60001)); return CUDA_SUCCESS; });
+  C("cuLaunchKernel with more threads than __launch_bounds__", { init(); CUfunction f = funf("fa_lb128"); CUdeviceptr d; cuMemAlloc(&d, 4096); void* args[1] = {&d}; int r1 = cuLaunchKernel(f, 1, 1, 1, 128, 1, 1, 0, nullptr, args, nullptr), r2 = cuLaunchKernel(f, 1, 1, 1, 129, 1, 1, 0, nullptr, args, nullptr), r3 = cuLaunchKernel(f, 1, 1, 1, 64, 2, 1, 0, nullptr, args, nullptr), r4 = cuLaunchKernel(f, 1, 1, 1, 64, 3, 1, 0, nullptr, args, nullptr); note("128 -> %d, 129 -> %d, 64x2 -> %d, 64x3 -> %d", r1, r2, r3, r4); return CUDA_SUCCESS; });
+  // The occupancy calls follow the limit.
+  C("cuOccupancyMaxActiveBlocksPerMultiprocessor, dynamic shared memory past the limit", { init(); CUfunction f = funf("fa_dyn2"); int n[5] = {-9, -9, -9, -9, -9}; const size_t dyn[5] = {0, 49152, 49153, 65536, 101376}; for (int i = 0; i < 5; ++i) cuOccupancyMaxActiveBlocksPerMultiprocessor(&n[i], f, 128, dyn[i]); note("blocks at 0, 49152, 49153, 65536, 101376: %d %d %d %d %d", n[0], n[1], n[2], n[3], n[4]); return CUDA_SUCCESS; });
+  C("cuOccupancyMaxActiveBlocksPerMultiprocessor, opted in to 60000", { init(); CUfunction f = funf("fa_dyn2"); cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 60000); int n[5] = {-9, -9, -9, -9, -9}; const size_t dyn[5] = {0, 49152, 49153, 65536, 101376}; for (int i = 0; i < 5; ++i) cuOccupancyMaxActiveBlocksPerMultiprocessor(&n[i], f, 128, dyn[i]); note("blocks at 0, 49152, 49153, 65536, 101376: %d %d %d %d %d", n[0], n[1], n[2], n[3], n[4]); return CUDA_SUCCESS; });
+
+  // ---- CUDA 13.2
+
+  // ---- the functions only CUDA 13.2 declares
+  C("cuFuncGetParamCount", { init(); size_t n = 99; CUresult r = D132(cuFuncGetParamCount, CUresult (*)(CUfunction, size_t*), funf("fa_three"), &n); note("n=%zu", n); return r; });
+  C("cuFuncGetParamCount, none", { init(); size_t n = 99; CUresult r = D132(cuFuncGetParamCount, CUresult (*)(CUfunction, size_t*), funf("fa_none"), &n); note("n=%zu", n); return r; });
+  C("cuFuncGetParamCount, one", { init(); size_t n = 99; CUresult r = D132(cuFuncGetParamCount, CUresult (*)(CUfunction, size_t*), funf("fa_dyn"), &n); note("n=%zu", n); return r; });
+  C("cuFuncGetParamCount null result", { init(); return D132(cuFuncGetParamCount, CUresult (*)(CUfunction, size_t*), funf("fa_three"), nullptr); });
+  C("cuFuncGetParamCount null function", { init(); size_t n = 99; CUresult r = D132(cuFuncGetParamCount, CUresult (*)(CUfunction, size_t*), nullptr, &n); note("n=%zu", n); return r; });
+  C("cuFuncGetParamCount a CUkernel", { init(); size_t n = 99; CUresult r = D132(cuFuncGetParamCount, CUresult (*)(CUfunction, size_t*), reinterpret_cast<CUfunction>(kernf("fa_three")), &n); note("n=%zu", n); return r; });
+  C("cuKernelGetParamCount", { init(); size_t n = 99; CUresult r = D132(cuKernelGetParamCount, CUresult (*)(CUkernel, size_t*), kernf("fa_three"), &n); note("n=%zu", n); return r; });
+  C("cuKernelGetParamCount, none", { init(); size_t n = 99; CUresult r = D132(cuKernelGetParamCount, CUresult (*)(CUkernel, size_t*), kernf("fa_none"), &n); note("n=%zu", n); return r; });
+  C("cuKernelGetParamCount null result", { init(); return D132(cuKernelGetParamCount, CUresult (*)(CUkernel, size_t*), kernf("fa_three"), nullptr); });
+  C("cuKernelGetParamCount null kernel", { init(); size_t n = 99; return D132(cuKernelGetParamCount, CUresult (*)(CUkernel, size_t*), nullptr, &n); });
+  C("cuKernelGetParamCount a CUfunction", { init(); size_t n = 99; CUresult r = D132(cuKernelGetParamCount, CUresult (*)(CUkernel, size_t*), reinterpret_cast<CUkernel>(funf("fa_three")), &n); note("n=%zu", n); return r; });
+  using HostV2 = CUresult (*)(CUstream, CUhostFn, void*, unsigned);
+  C("cuLaunchHostFunc_v2 blocking", { init(); static int ran; ran = 0; CUstream st = strm(); CUresult r = D132(cuLaunchHostFunc_v2, HostV2, st, [](void* u) { ++*static_cast<int*>(u); }, &ran, 0); cuStreamSynchronize(st); note("ran %d", ran); return r; });
+  C("cuLaunchHostFunc_v2 spin wait", { init(); static int ran; ran = 0; CUstream st = strm(); CUresult r = D132(cuLaunchHostFunc_v2, HostV2, st, [](void* u) { ++*static_cast<int*>(u); }, &ran, 1); cuStreamSynchronize(st); note("ran %d", ran); return r; });
+  C("cuLaunchHostFunc_v2 mode 2", { init(); static int ran; ran = 0; CUstream st = strm(); CUresult r = D132(cuLaunchHostFunc_v2, HostV2, st, [](void* u) { ++*static_cast<int*>(u); }, &ran, 2); cuStreamSynchronize(st); note("ran %d", ran); return r; });
+  C("cuLaunchHostFunc_v2 mode 77", { init(); static int ran; ran = 0; CUstream st = strm(); CUresult r = D132(cuLaunchHostFunc_v2, HostV2, st, [](void* u) { ++*static_cast<int*>(u); }, &ran, 77); cuStreamSynchronize(st); note("ran %d", ran); return r; });
+  C("cuLaunchHostFunc_v2 null function", { init(); return D132(cuLaunchHostFunc_v2, HostV2, strm(), nullptr, nullptr, 0); });
+  C("cuLaunchHostFunc_v2 legacy stream", { init(); static int ran; ran = 0; CUresult r = D132(cuLaunchHostFunc_v2, HostV2, nullptr, [](void* u) { ++*static_cast<int*>(u); }, &ran, 0); cuCtxSynchronize(); note("ran %d", ran); return r; });
+  using CopyAttr = CUresult (*)(CUdeviceptr, CUdeviceptr, size_t, MemcpyAttr*, CUstream);
+  C("cuMemcpyWithAttributesAsync", { init(); CUstream st = strm(); CUdeviceptr a, b; cuMemAlloc(&a, 256); cuMemAlloc(&b, 256); char h[256], o[256]; for (int i = 0; i < 256; ++i) h[i] = static_cast<char>(i * 3); cuMemcpyHtoD(a, h, 256); MemcpyAttr at{}; at.srcAccessOrder = 1; CUresult r = D132(cuMemcpyWithAttributesAsync, CopyAttr, b, a, 256, &at, st); cuStreamSynchronize(st); cuMemcpyDtoH(o, b, 256); note("copied right %d", std::memcmp(h, o, 256) == 0); return r; });
+  C("cuMemcpyWithAttributesAsync, pageable source", { init(); CUstream st = strm(); CUdeviceptr b; cuMemAlloc(&b, 256); static char h[256]; char o[256]; for (int i = 0; i < 256; ++i) h[i] = static_cast<char>(i * 5); MemcpyAttr at{}; at.srcAccessOrder = 3; CUresult r = D132(cuMemcpyWithAttributesAsync, CopyAttr, b, reinterpret_cast<CUdeviceptr>(h), 256, &at, st); cuStreamSynchronize(st); cuMemcpyDtoH(o, b, 256); note("copied right %d", std::memcmp(h, o, 256) == 0); return r; });
+  C("cuMemcpyWithAttributesAsync null attributes", { init(); CUdeviceptr a; cuMemAlloc(&a, 256); return D132(cuMemcpyWithAttributesAsync, CopyAttr, a, a, 16, nullptr, strm()); });
+  C("cuMemcpyWithAttributesAsync size 0", { init(); CUdeviceptr a; cuMemAlloc(&a, 256); MemcpyAttr at{}; at.srcAccessOrder = 1; return D132(cuMemcpyWithAttributesAsync, CopyAttr, a, a, 0, &at, strm()); });
+  C("cuMemcpyWithAttributesAsync invalid access order", { init(); CUdeviceptr a; cuMemAlloc(&a, 256); MemcpyAttr at{}; return D132(cuMemcpyWithAttributesAsync, CopyAttr, a, a, 16, &at, strm()); });
+  C("cuMemcpyWithAttributesAsync access order 9", { init(); CUdeviceptr a; cuMemAlloc(&a, 256); MemcpyAttr at{}; at.srcAccessOrder = 9; return D132(cuMemcpyWithAttributesAsync, CopyAttr, a, a, 16, &at, strm()); });
+  C("cuMemcpyWithAttributesAsync flags 0x80", { init(); CUdeviceptr a; cuMemAlloc(&a, 256); MemcpyAttr at{}; at.srcAccessOrder = 1; at.flags = 0x80; return D132(cuMemcpyWithAttributesAsync, CopyAttr, a, a, 16, &at, strm()); });
+  C("cuMemcpyWithAttributesAsync legacy stream", { init(); CUdeviceptr a; cuMemAlloc(&a, 256); MemcpyAttr at{}; at.srcAccessOrder = 1; return D132(cuMemcpyWithAttributesAsync, CopyAttr, a, a, 16, &at, nullptr); });
+  using Copy3D = CUresult (*)(BatchOp3D*, unsigned long long, CUstream);
+  C("cuMemcpy3DWithAttributesAsync", { init(); CUstream st = strm(); CUdeviceptr a, b; cuMemAlloc(&a, 4096); cuMemAlloc(&b, 4096); char h[4096], o[4096]; for (int i = 0; i < 4096; ++i) h[i] = static_cast<char>(i * 7); cuMemcpyHtoD(a, h, 4096); BatchOp3D op{}; op.src.type = 1; op.src.ptr = a; op.dst.type = 1; op.dst.ptr = b; op.width = 64; op.height = 4; op.depth = 2; op.srcAccessOrder = 1; CUresult r = D132(cuMemcpy3DWithAttributesAsync, Copy3D, &op, 0, st); cuStreamSynchronize(st); cuMemcpyDtoH(o, b, 4096); note("copied right %d", std::memcmp(h, o, 64 * 4 * 2) == 0); return r; });
+  C("cuMemcpy3DWithAttributesAsync null", { init(); return D132(cuMemcpy3DWithAttributesAsync, Copy3D, nullptr, 0, strm()); });
+  C("cuMemcpy3DWithAttributesAsync flags 1", { init(); BatchOp3D op{}; return D132(cuMemcpy3DWithAttributesAsync, Copy3D, &op, 1, strm()); });
+  C("cuMemcpy3DWithAttributesAsync zero extent", { init(); BatchOp3D op{}; op.src.type = 1; op.dst.type = 1; return D132(cuMemcpy3DWithAttributesAsync, Copy3D, &op, 0, strm()); });
+  C("cuMemcpy3DWithAttributesAsync legacy stream", { init(); CUdeviceptr a; cuMemAlloc(&a, 4096); BatchOp3D op{}; op.src.type = 1; op.src.ptr = a; op.dst.type = 1; op.dst.ptr = a + 2048; op.width = 64; op.height = 1; op.depth = 1; op.srcAccessOrder = 1; return D132(cuMemcpy3DWithAttributesAsync, Copy3D, &op, 0, nullptr); });
+  C("cuGraphGetId", { init(); CUgraph g, h; cuGraphCreate(&g, 0); cuGraphCreate(&h, 0); unsigned a = 9999, b = 9999; CUresult r = D132(cuGraphGetId, GraphFn, g, &a); D132(cuGraphGetId, GraphFn, h, &b); unsigned c = 0; D132(cuGraphGetId, GraphFn, g, &c); note("second graph's id is the first's plus %d, same again %d", static_cast<int>(b) - static_cast<int>(a), c == a); return r; });
+  C("cuGraphGetId null result", { init(); CUgraph g; cuGraphCreate(&g, 0); return D132(cuGraphGetId, GraphFn, g, nullptr); });
+  C("cuGraphGetId null graph", { init(); unsigned a = 9999; return D132(cuGraphGetId, GraphFn, nullptr, &a); });
+  using ExecIdFn = CUresult (*)(CUgraphExec, unsigned*);
+  C("cuGraphExecGetId", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); CUgraphExec e1, e2; cuGraphInstantiateWithFlags(&e1, g, 0); cuGraphInstantiateWithFlags(&e2, g, 0); unsigned a = 9999, b = 9999, gi = 9999; CUresult r = D132(cuGraphExecGetId, ExecIdFn, e1, &a); D132(cuGraphExecGetId, ExecIdFn, e2, &b); D132(cuGraphGetId, GraphFn, g, &gi); note("two execs differ %d, exec id is graph id %d, exec ids run on by %d", a != b, a == gi, static_cast<int>(b) - static_cast<int>(a)); return r; });
+  C("cuGraphExecGetId null result", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphExec e; cuGraphInstantiateWithFlags(&e, g, 0); return D132(cuGraphExecGetId, ExecIdFn, e, nullptr); });
+  C("cuGraphExecGetId null exec", { init(); unsigned a = 9999; return D132(cuGraphExecGetId, ExecIdFn, nullptr, &a); });
+  using NodeIdFn = CUresult (*)(CUgraphNode, unsigned*);
+  C("cuGraphNodeGetLocalId", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n1, n2, n3; cuGraphAddEmptyNode(&n1, g, nullptr, 0); cuGraphAddEmptyNode(&n2, g, &n1, 1); cuGraphAddEmptyNode(&n3, g, &n2, 1); unsigned a = 9999, b = 9999, c = 9999; CUresult r = D132(cuGraphNodeGetLocalId, NodeIdFn, n1, &a); D132(cuGraphNodeGetLocalId, NodeIdFn, n2, &b); D132(cuGraphNodeGetLocalId, NodeIdFn, n3, &c); note("ids %u %u %u", a, b, c); return r; });
+  C("cuGraphNodeGetLocalId, nodes of two graphs", { init(); CUgraph g, h; cuGraphCreate(&g, 0); cuGraphCreate(&h, 0); CUgraphNode a1, a2, b1; cuGraphAddEmptyNode(&a1, g, nullptr, 0); cuGraphAddEmptyNode(&a2, g, nullptr, 0); cuGraphAddEmptyNode(&b1, h, nullptr, 0); unsigned x = 9999, y = 9999, z = 9999; CUresult r = D132(cuGraphNodeGetLocalId, NodeIdFn, a1, &x); D132(cuGraphNodeGetLocalId, NodeIdFn, a2, &y); D132(cuGraphNodeGetLocalId, NodeIdFn, b1, &z); note("ids %u %u %u", x, y, z); return r; });
+  C("cuGraphNodeGetLocalId null result", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); return D132(cuGraphNodeGetLocalId, NodeIdFn, n, nullptr); });
+  C("cuGraphNodeGetLocalId null node", { init(); unsigned a = 9999; return D132(cuGraphNodeGetLocalId, NodeIdFn, nullptr, &a); });
+  using ToolsIdFn = CUresult (*)(CUgraphNode, unsigned long long*);
+  C("cuGraphNodeGetToolsId", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n1, n2; cuGraphAddEmptyNode(&n1, g, nullptr, 0); cuGraphAddEmptyNode(&n2, g, nullptr, 0); unsigned long long a = 9999, b = 9999; unsigned gid = 0; CUresult r = D132(cuGraphNodeGetToolsId, ToolsIdFn, n1, &a); D132(cuGraphNodeGetToolsId, ToolsIdFn, n2, &b); D132(cuGraphGetId, GraphFn, g, &gid); note("differ %d, graph id in the high half %d, node index in the low half %llu %llu", a != b, (a >> 32) == gid, a & 0xffffffffull, b & 0xffffffffull); return r; });
+  C("cuGraphNodeGetToolsId null result", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); return D132(cuGraphNodeGetToolsId, ToolsIdFn, n, nullptr); });
+  C("cuGraphNodeGetToolsId null node", { init(); unsigned long long a = 9999; return D132(cuGraphNodeGetToolsId, ToolsIdFn, nullptr, &a); });
+  using ContainFn = CUresult (*)(CUgraphNode, CUgraph*);
+  C("cuGraphNodeGetContainingGraph", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); CUgraph got = nullptr; CUresult r = D132(cuGraphNodeGetContainingGraph, ContainFn, n, &got); note("is the graph %d", got == g); return r; });
+  C("cuGraphNodeGetContainingGraph, node of a child graph", { init(); CUgraph g, c; cuGraphCreate(&g, 0); cuGraphCreate(&c, 0); CUgraphNode in, ch; cuGraphAddEmptyNode(&in, c, nullptr, 0); cuGraphAddChildGraphNode(&ch, g, nullptr, 0, c); CUgraph got = nullptr, got2 = nullptr; CUresult r = D132(cuGraphNodeGetContainingGraph, ContainFn, in, &got); D132(cuGraphNodeGetContainingGraph, ContainFn, ch, &got2); note("child's node in the child %d, in the parent %d; the child graph node in the parent %d", got == c, got == g, got2 == g); return r; });
+  C("cuGraphNodeGetContainingGraph null result", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); return D132(cuGraphNodeGetContainingGraph, ContainFn, n, nullptr); });
+  C("cuGraphNodeGetContainingGraph null node", { init(); CUgraph got; return D132(cuGraphNodeGetContainingGraph, ContainFn, nullptr, &got); });
+  using ParamsFn = CUresult (*)(CUgraphNode, NodeParams*);
+  C("cuGraphNodeGetParams, a memset node", { init(); CUgraph g; cuGraphCreate(&g, 0); CUdeviceptr d; cuMemAlloc(&d, 1024); CUDA_MEMSET_NODE_PARAMS mp{}; mp.dst = d; mp.value = 7; mp.elementSize = 1; mp.width = 256; mp.height = 1; CUcontext c; cuCtxGetCurrent(&c); CUgraphNode n; cuGraphAddMemsetNode(&n, g, nullptr, 0, &mp, c); NodeParams p; std::memset(&p, 0, sizeof p); CUresult r = D132(cuGraphNodeGetParams, ParamsFn, n, &p); note("type %d, dst right %d, value %u, width %zu, element %u", p.type, p.get<unsigned long long>(0) == d, p.get<unsigned>(16), p.get<size_t>(24), p.get<unsigned>(20)); return r; });
+  C("cuGraphNodeGetParams, a kernel node", { init(); CUgraph g; cuGraphCreate(&g, 0); CUfunction f = fun(); CUdeviceptr d; cuMemAlloc(&d, 1024); void* args[1] = {&d}; CUDA_KERNEL_NODE_PARAMS kp{}; kp.func = f; kp.gridDimX = 2; kp.gridDimY = 1; kp.gridDimZ = 1; kp.blockDimX = 32; kp.blockDimY = 1; kp.blockDimZ = 1; kp.kernelParams = args; CUgraphNode n; cuGraphAddKernelNode(&n, g, nullptr, 0, &kp); NodeParams p; std::memset(&p, 0, sizeof p); CUresult r = D132(cuGraphNodeGetParams, ParamsFn, n, &p); note("type %d, grid %u, block %u, shared %u, function stored %d", p.type, p.get<unsigned>(8), p.get<unsigned>(20), p.get<unsigned>(32), p.get<void*>(0) != nullptr || p.get<void*>(56) != nullptr); return r; });
+  C("cuGraphNodeGetParams, an empty node", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); NodeParams p; std::memset(&p, 0, sizeof p); CUresult r = D132(cuGraphNodeGetParams, ParamsFn, n, &p); note("type %d", p.type); return r; });
+  C("cuGraphNodeGetParams, a child graph node", { init(); CUgraph g, c; cuGraphCreate(&g, 0); cuGraphCreate(&c, 0); CUgraphNode in, ch; cuGraphAddEmptyNode(&in, c, nullptr, 0); cuGraphAddChildGraphNode(&ch, g, nullptr, 0, c); NodeParams p; std::memset(&p, 0, sizeof p); CUresult r = D132(cuGraphNodeGetParams, ParamsFn, ch, &p); CUgraph got = p.get<CUgraph>(0); note("type %d, graph is a clone %d", p.type, got != nullptr && got != c); return r; });
+  C("cuGraphNodeGetParams, a host node", { init(); CUgraph g; cuGraphCreate(&g, 0); static int x; CUDA_HOST_NODE_PARAMS hp{}; hp.fn = [](void*) {}; hp.userData = &x; CUgraphNode n; cuGraphAddHostNode(&n, g, nullptr, 0, &hp); NodeParams p; std::memset(&p, 0, sizeof p); CUresult r = D132(cuGraphNodeGetParams, ParamsFn, n, &p); note("type %d, user data right %d", p.type, p.get<void*>(8) == &x); return r; });
+  C("cuGraphNodeGetParams null node", { init(); NodeParams p; std::memset(&p, 0, sizeof p); return D132(cuGraphNodeGetParams, ParamsFn, nullptr, &p); });
+  C("cuGraphNodeGetParams null result", { init(); CUgraph g; cuGraphCreate(&g, 0); CUgraphNode n; cuGraphAddEmptyNode(&n, g, nullptr, 0); return D132(cuGraphNodeGetParams, ParamsFn, n, nullptr); });
+  using CoreReg = CUresult (*)(void (*)(void*, int, CUdevice), void*, void**);
+  using CoreDereg = CUresult (*)(void*);
+  C("cuCoredumpRegisterStartCallback", { init(); void* h = nullptr; CUresult r = D132(cuCoredumpRegisterStartCallback, CoreReg, [](void*, int, CUdevice) {}, nullptr, &h); note("handle set %d", h != nullptr); return r; });
+  C("cuCoredumpRegisterCompleteCallback", { init(); void* h = nullptr; CUresult r = D132(cuCoredumpRegisterCompleteCallback, CoreReg, [](void*, int, CUdevice) {}, nullptr, &h); note("handle set %d", h != nullptr); return r; });
+  C("cuCoredumpRegisterStartCallback null callback", { init(); void* h = nullptr; CUresult r = D132(cuCoredumpRegisterStartCallback, CoreReg, nullptr, nullptr, &h); note("handle set %d", h != nullptr); return r; });
+  C("cuCoredumpRegisterStartCallback null handle", { init(); return D132(cuCoredumpRegisterStartCallback, CoreReg, [](void*, int, CUdevice) {}, nullptr, nullptr); });
+  C("cuCoredumpRegisterCompleteCallback null callback", { init(); void* h = nullptr; return D132(cuCoredumpRegisterCompleteCallback, CoreReg, nullptr, nullptr, &h); });
+  C("cuCoredumpRegisterCompleteCallback null handle", { init(); return D132(cuCoredumpRegisterCompleteCallback, CoreReg, [](void*, int, CUdevice) {}, nullptr, nullptr); });
+  C("cuCoredumpDeregisterStartCallback", { init(); void* h = nullptr; D132(cuCoredumpRegisterStartCallback, CoreReg, [](void*, int, CUdevice) {}, nullptr, &h); return D132(cuCoredumpDeregisterStartCallback, CoreDereg, h); });
+  C("cuCoredumpDeregisterCompleteCallback", { init(); void* h = nullptr; D132(cuCoredumpRegisterCompleteCallback, CoreReg, [](void*, int, CUdevice) {}, nullptr, &h); return D132(cuCoredumpDeregisterCompleteCallback, CoreDereg, h); });
+  C("cuCoredumpDeregisterStartCallback null", { init(); return D132(cuCoredumpDeregisterStartCallback, CoreDereg, nullptr); });
+  C("cuCoredumpDeregisterCompleteCallback null", { init(); return D132(cuCoredumpDeregisterCompleteCallback, CoreDereg, nullptr); });
+  C("cuMulticastBindMem_v2", { init(); return D132(cuMulticastBindMem_v2, CUresult (*)(unsigned long long, CUdevice, size_t, unsigned long long, size_t, size_t, unsigned long long), 0, 0, 0, 0, 0, 1 << 21, 0); });
+  C("cuMulticastBindAddr_v2", { init(); return D132(cuMulticastBindAddr_v2, CUresult (*)(unsigned long long, CUdevice, size_t, CUdeviceptr, size_t, unsigned long long), 0, 0, 0, 0, 1 << 21, 0); });
+  C("cuStreamBeginCaptureToCig null parameters", { init(); return D132(cuStreamBeginCaptureToCig, CUresult (*)(CUstream, void*), strm(), nullptr); });
+  C("cuStreamBeginCaptureToCig", { init(); void* cp[2] = {nullptr, nullptr}; void* params = cp; return D132(cuStreamBeginCaptureToCig, CUresult (*)(CUstream, void*), strm(), &params); });
+  C("cuStreamEndCaptureToCig", { init(); return D132(cuStreamEndCaptureToCig, CUresult (*)(CUstream), strm()); });
 
   // Each case in a process of its own: the card crashes on some arguments, and a case leaves the context and its
   // handles behind; the parent never starts CUDA.

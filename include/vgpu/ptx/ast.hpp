@@ -1309,6 +1309,9 @@ struct GlobalVar {
   // memory like any other global; the runtime, which registers the variable
   // with the host, moves it to memory the host shares (Device::rebind_global).
   bool managed = false;
+  // A .const variable (__constant__): module constant memory, which cudaFuncGetAttributes counts as
+  // constSizeBytes. Everything else is a .global.
+  bool is_const = false;
   // A pointer-valued global can be initialised with another symbol's address
   // ("= my_array;"), and an array of them with a list ("= {f, g, h};") -- a
   // table of function pointers is exactly that. Addresses are not known until

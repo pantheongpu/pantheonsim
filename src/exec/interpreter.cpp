@@ -11924,7 +11924,7 @@ class Interpreter {
           }
           const KernelRef& k = kernel_at(lane, slot(1).read(lane, 0, 8));
           uint8_t out[40];
-          devrt::put_func_attrs(devrt::func_attributes(*k.fn, profile_, k.arch), out);
+          devrt::put_func_attrs(devrt::func_attributes(*k.fn, profile_, k.arch, k.constant), out);
           for (uint32_t off = 0; off < 40; off += 8) {
             uint64_t v;
             std::memcpy(&v, out + off, 8);

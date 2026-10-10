@@ -470,6 +470,37 @@ int Device::module_arch(uint64_t module_id) const {
   return 0;
 }
 
+namespace {
+// The constant memory a module's kernels share: the __constant__ variables (.const globals laid out in order with
+// their alignment; a cubin's .nv.constant3). A cubin's kernel has its own constants on top (.nv.constant2.<kernel>).
+template <class Module>
+uint64_t module_user_constants(const Module& lm) {
+  uint64_t total = 0;
+  if (lm.sass) {
+    if (const sass::CubinSection* user = lm.sass->cubin.section(".nv.constant3")) total = user->size;
+    return total;
+  }
+  for (const auto& g : lm.mod->globals) {
+    if (!g.is_const) continue;
+    const uint64_t align = std::max<uint64_t>(1, g.align);
+    total = (total + align - 1) / align * align + g.size;
+  }
+  return total;
+}
+template <class Module>
+uint64_t kernel_constants(const Module& lm, uint64_t user, const std::string& kernel) {
+  if (!lm.sass) return user;
+  const sass::CubinSection* mine = lm.sass->cubin.section(".nv.constant2." + kernel);
+  return user + (mine ? mine->size : 0);
+}
+}  // namespace
+
+uint64_t Device::module_const_bytes(uint64_t module_id, const std::string& kernel) const {
+  for (const auto& lm : modules_)
+    if (lm.id == module_id) return kernel_constants(lm, module_user_constants(lm), kernel);
+  return 0;
+}
+
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
   for (auto& lm : modules_) {
     if (lm.id != module_id) continue;
@@ -1041,8 +1072,9 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   if (!cfg.kernels) {
     for (const auto& lm : modules_) {
       const int arch = lm.mod ? target_arch(lm.mod->target) : 0;
+      const uint64_t user = module_user_constants(lm);
       for (const auto& [va, fn] : lm.kernels)
-        if (fn) kernels[va] = exec::KernelRef{fn, &lm.symbols, arch};
+        if (fn) kernels[va] = exec::KernelRef{fn, &lm.symbols, arch, kernel_constants(lm, user, fn->name)};
     }
     cfg.kernels = &kernels;
   }
