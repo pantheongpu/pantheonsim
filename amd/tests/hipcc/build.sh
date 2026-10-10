@@ -189,7 +189,7 @@ echo "wrote $(pwd)/workgroup.gfx1031 (ROCm 7.2, like memtest.gfx1031)"
 
 # The same programs for gfx1250 (CDNA 5, MI455X; wave32), which the runner executes on a simulated MI455X. Built
 # by ROCm 7.2's hipcc, which knows gfx1250; no card has run them.
-for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250; do
+for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250; do
   "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx1250 $src.cpp -o $src.gfx1250
   echo "wrote $(pwd)/$src.gfx1250"
 done

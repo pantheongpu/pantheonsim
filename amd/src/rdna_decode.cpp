@@ -206,6 +206,7 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
       {"v_add_nc_i32", "v_add_i32"},         {"v_sub_nc_i32", "v_sub_i32"},
       {"v_add_nc_i16", "v_add_i16"},         {"v_sub_nc_i16", "v_sub_i16"},
       {"v_dot2acc_f32_f16", "v_dot2c_f32_f16"},
+      {"v_dot2acc_f32_bf16", "v_dot2c_f32_bf16"},
   };
   // gfx1250's three-operand "_num" minimum and maximum forms take a number over a NaN and order the zeros, as the
   // older instructions they replaced did not: they keep their own names, and the executor has them.
@@ -1187,7 +1188,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   // The gfx9 instruction's number, which the executor reads a comparison's
   // condition and type from.
   if (const int op9 = gfx9_opcode(in.name); op9 >= 0) in.opcode = static_cast<uint32_t>(op9);
-  else if (const int e32 = gfx9_opcode(in.name.substr(0, in.name.rfind('_')) + "_e32"); e32 >= 0 && in.dpp)
+  else if (const int e32 = gfx9_opcode(in.name.substr(0, in.name.rfind('_')) + "_e32"); e32 >= 0 && (in.dpp || in.dpp8))
     in.opcode = static_cast<uint32_t>(e32);
   return in;
 }
