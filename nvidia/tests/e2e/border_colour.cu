@@ -187,8 +187,9 @@ int main(int argc, char** argv) {
   const int nf = sizeof kFormats / sizeof kFormats[0], nb = sizeof kBorders / sizeof kBorders[0];
   for (int fi = 0; fi < nf; ++fi) {
     const Format& f = kFormats[fi];
-    // Linear filtering needs a float or normalized texture, and not signed
-    // 8-bit normalized (which the simulator refuses to filter).
+    // Linear filtering needs a float or normalized texture. Signed 8-bit
+    // normalized is left out of this grid (texture_forms.cu checks its filter
+    // against the card).
     const bool filterable = (f.kind == cudaChannelFormatKindFloat || f.normalized) &&
                             !(f.kind == cudaChannelFormatKindSigned && f.bits[0] == 8);
     for (int b = 0; b < nb; ++b) {

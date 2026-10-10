@@ -40,6 +40,7 @@
 #include "vgpu_cuda_graph.h"
 #include "error_names.hpp"
 #include "vgpu/exec/cluster.hpp"
+#include "kept_args.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "fatbin.hpp"
 #include "texture_formats.hpp"
@@ -713,13 +714,13 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 
 // Reports one driver call from the program's side. `name` is NVIDIA's own
 // spelling of the function (cuMemAlloc_v2), which is what a subscriber is told.
+// The arguments are kept as bytes in this frame for the whole call (kept_args.hpp): the profiler reads them at
+// the call's exit too.
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
-  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
-    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
-    const uint16_t sizes[sizeof...(A) + 1] = {static_cast<uint16_t>(sizeof(A))..., 0};
-    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)), sizes);
-  }
+  const vgpu_traced::KeptArgs<A...> kept(a...);
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked())
+    vgpu::profiling::note_args(kept.argv(), kept.count(), kept.sizes());
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));
@@ -2040,37 +2041,47 @@ static CUresult cuMemImportFromShareableHandle_impl(unsigned long long* handle, 
 }
 
 // Multicast objects span several devices' memory; there is no such fabric here.
+// Every entry point answers CUDA_ERROR_NOT_SUPPORTED, and the first call says so on stderr.
+static CUresult multicast_not_supported(const char* api) {
+  static std::once_flag said;
+  std::call_once(said, [&] {
+    if (!quiet())
+      std::fprintf(stderr, "[vgpu] %s: multicast objects (NVLink SHARP) are not simulated; "
+                           "returning CUDA_ERROR_NOT_SUPPORTED\n", api);
+  });
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
 static CUresult cuMulticastCreate_impl(unsigned long long*, const void*);
 VGPU_EXPORT CUresult cuMulticastCreate(unsigned long long* a0, const void* a1) { return traced("cuMulticastCreate", cuMulticastCreate_impl, a0, a1); }
 static CUresult cuMulticastCreate_impl(unsigned long long*, const void*) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastCreate");
 }
 static CUresult cuMulticastAddDevice_impl(unsigned long long, CUdevice);
 VGPU_EXPORT CUresult cuMulticastAddDevice(unsigned long long a0, CUdevice a1) { return traced("cuMulticastAddDevice", cuMulticastAddDevice_impl, a0, a1); }
 static CUresult cuMulticastAddDevice_impl(unsigned long long, CUdevice) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastAddDevice");
 }
 static CUresult cuMulticastBindMem_impl(unsigned long long, size_t, unsigned long long, size_t, size_t, unsigned long long);
 VGPU_EXPORT CUresult cuMulticastBindMem(unsigned long long a0, size_t a1, unsigned long long a2, size_t a3, size_t a4, unsigned long long a5) { return traced("cuMulticastBindMem", cuMulticastBindMem_impl, a0, a1, a2, a3, a4, a5); }
 static CUresult cuMulticastBindMem_impl(unsigned long long, size_t, unsigned long long, size_t,
                                         size_t, unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastBindMem");
 }
 static CUresult cuMulticastBindAddr_impl(unsigned long long, size_t, unsigned long long, size_t, unsigned long long);
 VGPU_EXPORT CUresult cuMulticastBindAddr(unsigned long long a0, size_t a1, unsigned long long a2, size_t a3, unsigned long long a4) { return traced("cuMulticastBindAddr", cuMulticastBindAddr_impl, a0, a1, a2, a3, a4); }
 static CUresult cuMulticastBindAddr_impl(unsigned long long, size_t, unsigned long long, size_t,
                                          unsigned long long) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastBindAddr");
 }
 static CUresult cuMulticastUnbind_impl(unsigned long long, CUdevice, size_t, size_t);
 VGPU_EXPORT CUresult cuMulticastUnbind(unsigned long long a0, CUdevice a1, size_t a2, size_t a3) { return traced("cuMulticastUnbind", cuMulticastUnbind_impl, a0, a1, a2, a3); }
 static CUresult cuMulticastUnbind_impl(unsigned long long, CUdevice, size_t, size_t) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastUnbind");
 }
 static CUresult cuMulticastGetGranularity_impl(size_t*, const void*, int);
 VGPU_EXPORT CUresult cuMulticastGetGranularity(size_t* a0, const void* a1, int a2) { return traced("cuMulticastGetGranularity", cuMulticastGetGranularity_impl, a0, a1, a2); }
 static CUresult cuMulticastGetGranularity_impl(size_t*, const void*, int) {
-  return CUDA_ERROR_NOT_SUPPORTED;
+  return multicast_not_supported("cuMulticastGetGranularity");
 }
 
 // JIT options are performance and verbosity hints, and ignored -- except the
@@ -3788,7 +3799,9 @@ static CUresult cuArrayCreate_v2_impl(CUarray* out, const CUDA_ARRAY_DESCRIPTOR*
   CUDA_ARRAY3D_DESCRIPTOR d{};
   d.Width = desc->Width;
   d.Height = desc->Height;
-  d.Format = desc->Format;
+  // Copied as bytes: a program may pass a format the enum does not name (the card refuses it), and loading that
+  // as the enum is undefined behaviour.
+  std::memcpy(&d.Format, &desc->Format, sizeof d.Format);
   d.NumChannels = desc->NumChannels;
   return cuArray3DCreate_v2(out, &d);
 }

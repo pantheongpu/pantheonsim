@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,8 @@
 using namespace lp;
 
 namespace {
-constexpr cudaDataType E4M3 = (cudaDataType)T_E4M3, E5M2 = (cudaDataType)T_E5M2, E2M1 = (cudaDataType)T_FP4;
+// Plain ints: against a toolkit whose cudaDataType lacks FP4 (CUDA 12.0), loading 33 as that enum is UB.
+constexpr int E4M3 = T_E4M3, E5M2 = T_E5M2, E2M1 = T_FP4;
 const cusparseOperation_t N = CUSPARSE_OPERATION_NON_TRANSPOSE, T = CUSPARSE_OPERATION_TRANSPOSE;
 const cusparseOrder_t ROW = CUSPARSE_ORDER_ROW, COL = CUSPARSE_ORDER_COL;
 // Scale modes by value (cusparseLtMatmulMatrixScale_t).
@@ -261,7 +263,7 @@ void cases() {
             add(s, "types", std::string(ta ? "T" : "N") + (tb ? "T" : "N") + "_" + tn(ab) + "_" + tn(cd) + "_" + cn(c));
           }
   // Orders: column-major operands, for the narrow types.
-  for (int ab : {E4M3, E5M2, E2M1, CUDA_R_8I, CUDA_R_16F})
+  for (int ab : std::initializer_list<int>{E4M3, E5M2, E2M1, CUDA_R_8I, CUDA_R_16F})
     for (int oa = 0; oa < 2; ++oa)
       for (int ob = 0; ob < 2; ++ob)
         for (int oc = 0; oc < 2; ++oc)
@@ -275,7 +277,7 @@ void cases() {
               add(s, "orders", tn(ab) + "_" + (oa ? "cA" : "rA") + (ob ? "cB" : "rB") + (oc ? "cC" : "rC") + "_" + (ta ? "T" : "N") + (tb ? "T" : "N"));
             }
   // Structured B.
-  for (int ab : {E4M3, E2M1, CUDA_R_8I, CUDA_R_16F})
+  for (int ab : std::initializer_list<int>{E4M3, E2M1, CUDA_R_8I, CUDA_R_16F})
     for (int ta = 0; ta < 2; ++ta)
       for (int tb = 0; tb < 2; ++tb) {
         Spec s; s.ab = ab; s.cd = narrow(ab) ? CUDA_R_16BF : (ab == CUDA_R_8I ? CUDA_R_32I : CUDA_R_16F); s.sparseB = true;
@@ -284,7 +286,7 @@ void cases() {
         add(s, "sparseB", tn(ab) + "_" + (ta ? "T" : "N") + (tb ? "T" : "N"));
       }
   // Scale pointers missing, set or in the wrong mode.
-  for (int ab : {E4M3, E5M2}) {
+  for (int ab : std::initializer_list<int>{E4M3, E5M2}) {
     Spec s; s.ab = ab; s.cd = CUDA_R_16BF;
     s.a_ptr = s.b_ptr = false; add(s, "scales", tn(ab) + "_noptr_mode_unset");
     s.am = s.bm = S_NONE; add(s, "scales", tn(ab) + "_noptr_none");
@@ -322,7 +324,7 @@ void cases() {
   { Spec s; s.ab = E2M1; s.cd = CUDA_R_16BF; s.am = S_SCALAR; s.bm = S_SCALAR; add(s, "scales", "e2m1_scalar"); }
   { Spec s; s.ab = E2M1; s.cd = CUDA_R_16BF; add(s, "scales", "e2m1_unset"); }
   // Non-narrow types with scale attributes set.
-  for (int ab : {CUDA_R_16F, CUDA_R_8I}) {
+  for (int ab : std::initializer_list<int>{CUDA_R_16F, CUDA_R_8I}) {
     Spec s; s.ab = ab; s.cd = ab == CUDA_R_8I ? CUDA_R_32I : CUDA_R_16F; s.compute = ab == CUDA_R_8I ? CUSPARSE_COMPUTE_32I : CUSPARSE_COMPUTE_32F;
     s.am = S_SCALAR; s.bm = S_SCALAR; s.a_ptr = s.b_ptr = true; add(s, "scalesnarrow", tn(ab) + "_scalar");
     s.am = s.bm = S_V32; add(s, "scalesnarrow", tn(ab) + "_v32");
@@ -333,7 +335,7 @@ void cases() {
   const int dims[][3] = {{16, 16, 16}, {32, 32, 32}, {8, 8, 8}, {16, 16, 32}, {16, 16, 64}, {24, 24, 24}, {48, 48, 48},
                          {17, 16, 16}, {16, 17, 16}, {16, 16, 17}, {64, 8, 64}, {128, 128, 128}, {256, 64, 128},
                          {64, 64, 128}, {64, 64, 256}, {64, 64, 512}, {32, 64, 96}, {96, 64, 64}, {128, 16, 128}};
-  for (int ab : {E4M3, E2M1, CUDA_R_8I, CUDA_R_16F})
+  for (int ab : std::initializer_list<int>{E4M3, E2M1, CUDA_R_8I, CUDA_R_16F})
     for (auto& d : dims) {
       Spec s; s.ab = ab; s.cd = narrow(ab) ? CUDA_R_16BF : (ab == CUDA_R_8I ? CUDA_R_32I : CUDA_R_16F);
       s.compute = ab == CUDA_R_8I ? CUSPARSE_COMPUTE_32I : CUSPARSE_COMPUTE_32F;
@@ -341,7 +343,7 @@ void cases() {
       add(s, "dims", tn(ab) + "_" + num(d[0]) + "x" + num(d[1]) + "x" + num(d[2]));
     }
   // Activations.
-  for (int ab : {E4M3, E5M2, E2M1, CUDA_R_8I, CUDA_R_16F, CUDA_R_16BF})
+  for (int ab : std::initializer_list<int>{E4M3, E5M2, E2M1, CUDA_R_8I, CUDA_R_16F, CUDA_R_16BF})
     for (int cd : cds) {
       if ((ab == CUDA_R_8I) != (cd == CUDA_R_8I) && cd != CUDA_R_32I) {
         if (ab == CUDA_R_8I) continue;
@@ -355,15 +357,15 @@ void cases() {
       }
     }
   // Bias, alpha, beta, batches, the search.
-  for (int ab : {E4M3, E5M2, E2M1, CUDA_R_16F, CUDA_R_8I})
-    for (int cd : {CUDA_R_16F, CUDA_R_16BF, CUDA_R_32F, E4M3, CUDA_R_32I}) {
+  for (int ab : std::initializer_list<int>{E4M3, E5M2, E2M1, CUDA_R_16F, CUDA_R_8I})
+    for (int cd : std::initializer_list<int>{CUDA_R_16F, CUDA_R_16BF, CUDA_R_32F, E4M3, CUDA_R_32I}) {
       Spec s; s.ab = ab; s.cd = cd; s.bias = true; s.compute = ab == CUDA_R_8I ? CUSPARSE_COMPUTE_32I : CUSPARSE_COMPUTE_32F;
       s.am = narrow(ab) ? S_SCALAR : -1; s.bm = s.am; s.a_ptr = s.b_ptr = narrow(ab); s.d_ptr = narrow(cd); s.dm = narrow(cd) ? S_SCALAR : -1;
       add(s, "bias", tn(ab) + "_" + tn(cd));
       s.bias = false; s.alpha = 0.5f; s.beta = 1.f; add(s, "alphabeta", tn(ab) + "_" + tn(cd) + "_a05_b1");
       s.alpha = 2.f; s.beta = 0.f; s.alpha_vec = true; add(s, "alphabeta", tn(ab) + "_" + tn(cd) + "_alphavec");
     }
-  for (int ab : {E4M3, E2M1}) {
+  for (int ab : std::initializer_list<int>{E4M3, E2M1}) {
     Spec s; s.ab = ab; s.cd = CUDA_R_16BF; s.batches = 3; s.am = S_SCALAR; s.bm = S_SCALAR; add(s, "batch", tn(ab) + "_b3");
     s = Spec(); s.ab = ab; s.cd = CUDA_R_16BF; s.search = true; s.am = S_SCALAR; s.bm = S_SCALAR; add(s, "search", tn(ab));
   }

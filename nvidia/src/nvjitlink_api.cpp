@@ -158,8 +158,11 @@ const RealJitLink* toolkit_linker() {
       sym(r->info_log_size, "nvJitLinkGetInfoLogSize");
       sym(r->info_log, "nvJitLinkGetInfoLog");
       if (ok) return r;
+      // A library without these names (CUDA 12's exports only the versioned spellings, and is no linker
+      // for this one's inputs: its nvJitLinkComplete fails on an nvcc -dlto fatbin) is left loaded, not
+      // dlclose'd: unloading a library whose libstdc++ keeps an emergency pool leaks that pool, which
+      // LeakSanitizer reports.
       delete r;
-      dlclose(lib);
     }
     return nullptr;
   }();

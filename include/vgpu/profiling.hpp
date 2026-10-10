@@ -52,9 +52,6 @@ struct Event {
   uint32_t device = 0;
   uint32_t correlation = 0;
   uint64_t stream = 0;
-  // How many times `stream` (or, for a stream record, `handle`) had been destroyed when the event was made:
-  // a stream handle freed and made again is a new stream to a profiler (stream_generation).
-  uint32_t stream_gen = 0;
   std::string name;              // kernel name, or the API function; empty for copies
   uint64_t bytes = 0;            // copies and fills
   uint32_t copy_kind = 0;        // cudaMemcpyKind, as the caller gave it
@@ -106,6 +103,11 @@ struct Event {
   // leaves them zero.
   uint32_t context_id = 0;
   uint32_t stream_id = 0;
+  // The id a front end gave the stream of this event when the event was recorded
+  // (0: not yet). A handle can be handed out again once its stream is destroyed;
+  // the id the front end kept for the stream the event was made on must not move
+  // to the new stream.
+  uint32_t stream_pin = 0;
   // Memcpy: on one of the driver's own streams in the device's context rather
   // than a stream of the program's -- the nth of the eight made with the
   // context (-1: the stream above).
@@ -122,8 +124,9 @@ std::vector<Event> drain();
 
 // Told of each event as it is recorded, on the recording thread, with no lock
 // of the engine's held: a front end that hands out buffers as the first record
-// for one is made (CUPTI does) learns of it here. One hook; null to remove.
-void set_record_hook(void (*fn)(const Event&));
+// for one is made (CUPTI does) learns of it here, and may complete it (stream_pin).
+// One hook; null to remove.
+void set_record_hook(void (*fn)(Event&));
 
 // Monotonic, and the same clock the events carry.
 uint64_t now_ns();
@@ -205,10 +208,6 @@ bool hooked();
 void notify_resource(Resource what, uint64_t handle, uint32_t device);
 void notify_resource(const ResourceInfo& info);
 void notify_sync(SyncKind what, uint64_t stream);
-// A stream handle that is destroyed and made again names a different stream: a real driver numbers the new one
-// afresh, while the shims reuse the pointer. Every StreamDestroyStarting counts one against the handle, and an
-// event is stamped with the count when it is recorded, so the profiler can tell the two streams apart.
-uint32_t stream_generation(uint64_t handle);
 
 // The clock the profiler's own timestamps for host-side events (API calls,
 // waits, markers) come from. A tool may supply one (CUPTI's timestamp

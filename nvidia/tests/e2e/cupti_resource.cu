@@ -60,12 +60,34 @@ bool wanted_runtime(const char* n) {
   return false;
 }
 
+// The size a cubin's own headers give it: where its program headers end (which is
+// where its last segment ends on an RTX 3060). What the size is depends on the
+// nvcc that made the code, so a trace names it only when it is something else.
+size_t elf_size(const char* p, size_t n) {
+  auto rd = [&](size_t off, int len) {
+    unsigned long long v = 0;
+    for (int i = len - 1; i >= 0; --i) v = (v << 8) | (unsigned char)p[off + i];
+    return v;
+  };
+  if (n < 64 || p[4] != 2) return 0;   // not an ELF64 header
+  const size_t phoff = rd(0x20, 8), phnum = rd(0x38, 2), phentsize = rd(0x36, 2);
+  size_t end = phoff + phnum * phentsize;
+  for (size_t i = 0; i < phnum && phoff + (i + 1) * phentsize <= n; ++i) {
+    const size_t seg = rd(phoff + i * phentsize + 8, 8) + rd(phoff + i * phentsize + 32, 8);
+    if (seg > end) end = seg;
+  }
+  return end;
+}
+
 std::string cubin_info(const CUpti_ModuleResourceData* m) {
   if (!m) return "no module data";
   std::string s = fmt("module=#m%u cubin=%s", m->moduleId, m->pCubin ? "set" : "none");
-  if (m->pCubin && m->cubinSize >= 4)
-    s += fmt(" magic=%02x%02x%02x%02x size=%zu", (unsigned char)m->pCubin[0], (unsigned char)m->pCubin[1],
-             (unsigned char)m->pCubin[2], (unsigned char)m->pCubin[3], m->cubinSize);
+  if (m->pCubin && m->cubinSize >= 4) {
+    s += fmt(" magic=%02x%02x%02x%02x", (unsigned char)m->pCubin[0], (unsigned char)m->pCubin[1],
+             (unsigned char)m->pCubin[2], (unsigned char)m->pCubin[3]);
+    if (m->cubinSize == elf_size(m->pCubin, m->cubinSize)) s += " size=elf";
+    else s += fmt(" size=%zu", m->cubinSize);
+  }
   return s;
 }
 

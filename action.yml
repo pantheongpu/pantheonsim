@@ -214,8 +214,11 @@ runs:
         BUILD: ${{ steps.paths.outputs.build }}
       run: |
         cxx=g++
-        [[ "$(g++ -dumpversion | cut -d. -f1)" -lt 12 ]] && cxx=g++-12
-        cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$cxx"
+        cc=gcc
+        [[ "$(g++ -dumpversion | cut -d. -f1)" -lt 12 ]] && { cxx=g++-12; cc=gcc-12; }
+        # The C compiler matches the C++ one: with link-time optimization the
+        # two must be the same GCC, or the link rejects the C objects' LTO version.
+        cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$cxx" -DCMAKE_C_COMPILER="$cc"
         cmake --build "$BUILD" -j"$(nproc)"
 
     - name: Put the simulated GPUs in place

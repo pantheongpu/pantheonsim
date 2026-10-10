@@ -6,8 +6,9 @@
 // clamp and border modes, unsigned 8-bit normalized, half, and a 3D float
 // texture. Each section's results are hashed and compared with the hashes the
 // hardware produced; the program prints PASS on the last line and runs the
-// same on a GPU. (Signed 8-bit normalized filtering is left out: the simulator
-// refuses it, see interpreter.cpp.)
+// same on a GPU. (Signed 8-bit normalized filtering is left out here: its
+// texels are still drawn so the random sequence stays the one the hardware
+// saw; texture_forms.cu checks that filter against the card.)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -121,7 +122,7 @@ int main() {
     auto tx = make(a, cudaAddressModeWrap, true, true);
     const int n = 1024; for (int i = 0; i < n; ++i) { hx[2 * i] = frand(-1, 2); hx[2 * i + 1] = frand(-1, 2); }
     cudaMemcpy(dx, hx.data(), 2 * n * 4, cudaMemcpyHostToDevice); run(s2, n, tx, dx, (float4*)dout); dump("D", n, 4);
-    // Signed 8-bit normalized (not run: the simulator refuses it), but its
+    // Signed 8-bit normalized (not run here; see the top of the file), but its
     // texels and points are still drawn, so the half section below sees the
     // same random numbers it did on the hardware.
     std::vector<int8_t> u(6 * 6); for (auto& v : u) v = int8_t(next() >> 24);

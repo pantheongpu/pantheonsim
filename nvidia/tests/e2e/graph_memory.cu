@@ -207,7 +207,10 @@ int main() {
   kkp.kernelParams = keep_args;
   cudaGraphNode_t keep_kern = nullptr;
   CK(cudaGraphAddKernelNode(&keep_kern, keeper, &keep_alloc, 1, &kkp));
-  CK(add_dep(keeper, &keep_alloc, &keep_kern, 1));
+  // The kernel node was added after the allocation node, so that edge exists
+  // already; asking for it again is refused (invalid value on an RTX 3060, CUDA
+  // 13.0 driver), where the test once expected it to be accepted.
+  WANT(add_dep(keeper, &keep_alloc, &keep_kern, 1), cudaErrorInvalidValue);
 
   cudaGraphExec_t keep_exec = nullptr;
   CK(cudaGraphInstantiate(&keep_exec, keeper, 0));

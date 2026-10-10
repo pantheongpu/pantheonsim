@@ -111,9 +111,9 @@ GraphWork::~GraphWork() {
 }
 
 namespace {
-std::atomic<void (*)(const Event&)> g_record_hook{nullptr};
+std::atomic<void (*)(Event&)> g_record_hook{nullptr};
 }
-void set_record_hook(void (*fn)(const Event&)) { g_record_hook.store(fn, std::memory_order_release); }
+void set_record_hook(void (*fn)(Event&)) { g_record_hook.store(fn, std::memory_order_release); }
 
 void record(Event&& e) {
   if (!enabled()) return;
@@ -123,7 +123,6 @@ void record(Event&& e) {
     e.graph_id = t_graph_id;
     e.graph_node_id = (uint64_t{t_graph_id} << 32) | t_graph_node;
   }
-  if (const uint64_t h = e.kind == EventKind::Stream ? e.handle : e.stream) e.stream_gen = stream_generation(h);
   if (const auto hook = g_record_hook.load(std::memory_order_acquire)) hook(e);
   std::lock_guard<std::mutex> lock(g_mu);
   if (g_events.size() >= kMaxBuffered) g_events.erase(g_events.begin());
@@ -166,21 +165,7 @@ void set_hooks(const Hooks& h) {
 }
 bool hooked() { return g_hooked.load(std::memory_order_acquire); }
 
-namespace {
-std::mutex g_stream_gen_mu;
-std::unordered_map<uint64_t, uint32_t> g_stream_gen;
-}  // namespace
-uint32_t stream_generation(uint64_t handle) {
-  std::lock_guard<std::mutex> lock(g_stream_gen_mu);
-  const auto it = g_stream_gen.find(handle);
-  return it == g_stream_gen.end() ? 0u : it->second;
-}
-
 void notify_resource(const ResourceInfo& info) {
-  if (info.what == Resource::StreamDestroyStarting) {
-    std::lock_guard<std::mutex> lock(g_stream_gen_mu);
-    ++g_stream_gen[info.handle];
-  }
   if (!hooked()) return;
   Hooks h;
   {

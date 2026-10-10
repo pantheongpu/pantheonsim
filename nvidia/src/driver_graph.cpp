@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "driver_graph.hpp"
+#include "kept_args.hpp"
 #include "vgpu/profiling.hpp"
 #include "vgpu_cuda_graph.h"
 
@@ -57,11 +58,9 @@ namespace {
 // to define and report are wrapped here.
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
-  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
-    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
-    const uint16_t sizes[sizeof...(A) + 1] = {static_cast<uint16_t>(sizeof(A))..., 0};
-    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)), sizes);
-  }
+  const vgpu_traced::KeptArgs<A...> kept(a...);   // in this frame for the whole call: read again at its exit
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked())
+    vgpu::profiling::note_args(kept.argv(), kept.count(), kept.sizes());
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));

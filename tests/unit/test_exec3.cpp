@@ -5637,16 +5637,21 @@ VTEST(tex_linear_filtering_matches_hardware) {
 }
 
 // Signed 8-bit normalized texels are refused under a linear filter, by name.
-VTEST(tex_linear_filtering_refuses_signed_8bit_normalized) {
+// Linear filtering of signed 8-bit normalized texels is implemented (it was
+// refused until the exact blend was fitted to an RTX 3060, see the blend in
+// interpreter.cpp). At a texel's centre all the weight is on that texel, and
+// the result is the texel's 16-bit form over 32767 -- the same figures the
+// card gathers with tld4 (64 is 16513/32767, -64 is -16512/32767).
+VTEST(tex_linear_filtering_of_signed_8bit_normalized_hits_the_card_figures) {
   std::string ptx = std::string(kHeader) + R"(
-.visible .entry k(.param .u64 t, .param .u64 out)
+.visible .entry k(.param .u64 t, .param .f32 x, .param .u64 out)
 {
     .reg .f32 %f<8>;
     .reg .b64 %rd<4>;
     ld.param.u64 %rd1, [t];
     ld.param.u64 %rd2, [out];
     cvta.to.global.u64 %rd3, %rd2;
-    mov.f32 %f5, 0f3FC00000;
+    ld.param.f32 %f5, [x];
     tex.1d.v4.f32.f32 {%f1, %f2, %f3, %f4}, [%rd1, {%f5}];
     st.global.f32 [%rd3], %f1;
     ret;
@@ -5655,6 +5660,8 @@ VTEST(tex_linear_filtering_refuses_signed_8bit_normalized) {
   Env e;
   auto m = ptx::parse(ptx);
   const uint64_t out = e.mem.alloc(16), data = e.mem.alloc(16);
+  const int8_t s8[4] = {64, -64, 64, -64};
+  e.mem.write(data, s8, 4);
   TextureTable tex;
   TextureDesc d;
   d.base = data;
@@ -5667,8 +5674,14 @@ VTEST(tex_linear_filtering_refuses_signed_8bit_normalized) {
   tex[0x42] = d;
   LaunchConfig cfg;
   cfg.textures = &tex;
-  auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {arg_u64(0x42), arg_u64(out)}, e.mem, e.prof));
-  VCHECK_CONTAINS(err.message(), "signed 8-bit normalized");
+  auto run = [&](float x) {
+    std::vector<uint8_t> xa(4);
+    std::memcpy(xa.data(), &x, 4);
+    exec::launch(m.entries[0], cfg, {arg_u64(0x42), xa, arg_u64(out)}, e.mem, e.prof);
+    return static_cast<uint32_t>(e.mem.load_scalar(out, 4));
+  };
+  VCHECK_EQ(run(0.5f), 0x3f010302u);   // texel 0: 64
+  VCHECK_EQ(run(1.5f), 0xbf010102u);   // texel 1: -64
 }
 
 // Wrap and mirror are defined for normalized coordinates only; with

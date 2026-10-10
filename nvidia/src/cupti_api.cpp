@@ -258,16 +258,28 @@ uint32_t g_next_stream_id = 14;
 uint32_t g_next_context_id = 1;
 bool g_first_context_streams_done = false;
 
-// `generation`: how many times the handle had been destroyed when the work was done
-// (vgpu::profiling::stream_generation). A real driver numbers a stream made after another
-// was destroyed afresh even when it gets the same pointer, and so does this.
-uint32_t stream_id_of(uint64_t handle, uint32_t generation) {
+uint32_t stream_id_of(uint64_t handle) {
   if (handle == 0 || handle == 1 || handle == 2) return 7;   // 0, cudaStreamLegacy, cudaStreamPerThread
   std::lock_guard<std::mutex> lock(g_id_mu);
-  const uint64_t key = handle ^ (uint64_t{generation} << 48);   // user-space pointers have 47 bits
-  const auto it = g_stream_ids.find(key);
+  const auto it = g_stream_ids.find(handle);
   if (it != g_stream_ids.end()) return it->second;
-  return g_stream_ids.emplace(key, g_next_stream_id++).first->second;
+  return g_stream_ids.emplace(handle, g_next_stream_id++).first->second;
+}
+
+// A stream made under a handle an earlier, destroyed stream had is a new stream
+// with an id of its own (NVIDIA's numbers every stream once).
+thread_local uint64_t t_renewed_stream = 0;
+void renew_stream_id(uint64_t handle) {
+  if (handle == 0 || handle == 1 || handle == 2) return;
+  std::lock_guard<std::mutex> lock(g_id_mu);
+  g_stream_ids[handle] = g_next_stream_id++;
+}
+
+// The id of the stream an event was made on: the one pinned when it was recorded
+// (a handle may be another stream's by the time the record is built), else the
+// handle's own.
+uint32_t stream_of(const vgpu::profiling::Event& e, uint64_t handle) {
+  return e.stream_pin ? e.stream_pin : stream_id_of(handle);
 }
 
 uint32_t event_id_of(uint64_t handle) {
@@ -356,7 +368,7 @@ size_t fill_kernel(uint8_t* out, const vgpu::profiling::Event& e) {
   k->deviceId = e.device;
   k->contextId = ctx_of_device(e.device);
   k->correlationId = e.correlation;
-  k->streamId = stream_id_of(e.stream, e.stream_gen);
+  k->streamId = stream_of(e, e.stream);
   k->gridX = static_cast<int32_t>(e.grid[0]);
   k->gridY = static_cast<int32_t>(e.grid[1]);
   k->gridZ = static_cast<int32_t>(e.grid[2]);
@@ -394,7 +406,7 @@ size_t fill_memcpy(uint8_t* out, const vgpu::profiling::Event& e) {
   m->deviceId = e.device;
   m->contextId = ctx_of_device(e.device);
   m->correlationId = e.correlation;
-  m->streamId = e.internal_stream >= 0 ? internal_stream_id(e.device, e.internal_stream) : stream_id_of(e.stream, e.stream_gen);
+  m->streamId = e.internal_stream >= 0 ? internal_stream_id(e.device, e.internal_stream) : stream_of(e, e.stream);
   m->bytes = e.bytes;
   m->srcKind = memory_kind(e.src_kind);
   m->dstKind = memory_kind(e.dst_kind);
@@ -419,7 +431,7 @@ size_t fill_memset(uint8_t* out, const vgpu::profiling::Event& e) {
   m->deviceId = e.device;
   m->contextId = ctx_of_device(e.device);
   m->correlationId = e.correlation;
-  m->streamId = stream_id_of(e.stream, e.stream_gen);
+  m->streamId = stream_of(e, e.stream);
   m->bytes = e.bytes;
   // A fill that is a node of a launched graph reports neither its value nor its
   // memory kind (an RTX 3060's records for one carry zero for both).
@@ -440,7 +452,7 @@ size_t fill_sync(uint8_t* out, const vgpu::profiling::Event& e) {
   r->end = e.end_ns;
   r->correlationId = e.correlation;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = (e.sync_kind == 1 || e.sync_kind == 4) ? CUPTI_SYNCHRONIZATION_INVALID_VALUE : stream_id_of(e.stream, e.stream_gen);
+  r->streamId = (e.sync_kind == 1 || e.sync_kind == 4) ? CUPTI_SYNCHRONIZATION_INVALID_VALUE : stream_of(e, e.stream);
   r->cudaEventId = e.handle ? event_id_of(e.handle) : CUPTI_SYNCHRONIZATION_INVALID_VALUE;
   return sizeof *r;
 }
@@ -459,7 +471,7 @@ size_t fill_stream(uint8_t* out, const vgpu::profiling::Event& e) {
     return sizeof *r;
   }
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.handle, e.stream_gen);
+  r->streamId = stream_of(e, e.handle);
   r->priority = static_cast<uint32_t>(e.priority);
   r->flag = (e.flags & cudaStreamNonBlocking) ? CUPTI_ACTIVITY_STREAM_CREATE_FLAG_NON_BLOCKING
                                               : CUPTI_ACTIVITY_STREAM_CREATE_FLAG_DEFAULT;
@@ -474,7 +486,7 @@ size_t fill_context(uint8_t* out, const vgpu::profiling::Event& e) {
   r->contextId = e.context_id ? e.context_id : ctx_of_device(e.device);
   r->deviceId = e.device;
   r->computeApiKind = CUPTI_ACTIVITY_COMPUTE_API_CUDA;
-  r->nullStreamId = static_cast<uint16_t>(e.stream_id ? e.stream_id : stream_id_of(0, 0));
+  r->nullStreamId = static_cast<uint16_t>(e.stream_id ? e.stream_id : stream_id_of(0));
   return sizeof *r;
 }
 
@@ -583,7 +595,7 @@ size_t fill_memory2(uint8_t* out, const vgpu::profiling::Event& e) {
   r->processId = e.process_id;
   r->deviceId = e.device;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = e.async ? stream_id_of(e.stream, e.stream_gen) : kInvalidStreamId;
+  r->streamId = e.async ? stream_of(e, e.stream) : kInvalidStreamId;
   r->isAsync = e.async ? 1 : 0;
   r->memoryPoolConfig.memoryPoolType = pool_type_of(e);
   r->memoryPoolConfig.address = e.pool_handle;
@@ -640,7 +652,7 @@ size_t fill_graph_trace(uint8_t* out, const vgpu::profiling::Event& e) {
   r->deviceId = e.device;
   r->graphId = e.graph_id;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.stream, e.stream_gen);
+  r->streamId = stream_of(e, e.stream);
 #if CUPTI_API_VERSION >= 22
   r->endDeviceId = e.device;
   r->endContextId = ctx_of_device(e.device);
@@ -661,7 +673,7 @@ size_t fill_peer_copy(uint8_t* out, const vgpu::profiling::Event& e) {
   r->end = e.end_ns;
   r->deviceId = e.device;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.stream, e.stream_gen);
+  r->streamId = stream_of(e, e.stream);
   r->srcDeviceId = e.src_device;
   r->srcContextId = ctx_of_device(e.src_device);
   r->dstDeviceId = e.dst_device;
@@ -680,7 +692,7 @@ size_t fill_cuda_event(uint8_t* out, const vgpu::profiling::Event& e) {
   r->kind = static_cast<CUpti_ActivityKind>(akind::kCudaEvent);
   r->correlationId = e.correlation;
   r->contextId = ctx_of_device(e.device);
-  r->streamId = stream_id_of(e.stream, e.stream_gen);
+  r->streamId = stream_of(e, e.stream);
   r->eventId = event_id_of(e.handle);
 #if CUPTI_API_VERSION >= 26
   r->deviceId = e.device;
@@ -956,7 +968,20 @@ bool would_deliver_locked(const vgpu::profiling::Event& e) {
   return kind_wanted(e);
 }
 
-void on_event_recorded(const vgpu::profiling::Event& e) {
+void on_event_recorded(vgpu::profiling::Event& e) {
+  // The stream an event was made on keeps the id it has now, whatever stream the
+  // handle names by the time the record is built.
+  {
+    using K = vgpu::profiling::EventKind;
+    if (e.kind == K::Stream && e.op != 1) {
+      renew_stream_id(e.handle);
+      t_renewed_stream = e.handle;
+      e.stream_pin = stream_id_of(e.handle);
+    } else if (e.kind == K::Kernel || e.kind == K::Memset || e.kind == K::Memcpy2 || e.kind == K::Sync ||
+               (e.kind == K::Memcpy && e.internal_stream < 0)) {
+      e.stream_pin = stream_id_of(e.stream);
+    }
+  }
   // The program's request callback may call the runtime, which records.
   thread_local bool inside = false;
   if (inside) return;
@@ -1567,7 +1592,11 @@ struct Conv {
 
 template <class T>
 T arg(const void* const* a, int i) {
-  return *static_cast<const T*>(a[i]);
+  // Copied as bytes: an enum argument may hold a number the enum does not declare, and loading that as the
+  // enum is undefined behaviour (UBSan).
+  T v;
+  std::memcpy(static_cast<void*>(&v), a[i], sizeof v);
+  return v;
 }
 #define P(i, field) p->field = arg<std::remove_reference_t<decltype(p->field)>>(a, i)
 #define CONV(fn, ver, body)                                                                      \
@@ -1892,6 +1921,10 @@ CUpti_CallbackId resource_cbid(vgpu::profiling::Resource what) {
 
 void on_resource(const vgpu::profiling::ResourceInfo& info) {
   using R = vgpu::profiling::Resource;
+  if (info.what == R::StreamCreated) {
+    if (t_renewed_stream == info.handle) t_renewed_stream = 0;   // its record made the id already
+    else renew_stream_id(info.handle);
+  }
   const CUpti_CallbackId id = resource_cbid(info.what);
   CUpti_CallbackFunc fn = nullptr;
   void* user = nullptr;
@@ -2374,7 +2407,7 @@ VGPU_EXPORT CUptiResult cuptiGetDeviceId(CUcontext, uint32_t* id) {
 }
 VGPU_EXPORT CUptiResult cuptiGetStreamId(CUcontext, CUstream stream, uint32_t* id) {
   if (!id) return CUPTI_ERROR_INVALID_PARAMETER;
-  *id = stream_id_of(reinterpret_cast<uint64_t>(stream), vgpu::profiling::stream_generation(reinterpret_cast<uint64_t>(stream)));
+  *id = stream_id_of(reinterpret_cast<uint64_t>(stream));
   return CUPTI_SUCCESS;
 }
 // The numbers a profiler gives graphs, executable graphs and their nodes

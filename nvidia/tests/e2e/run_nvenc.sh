@@ -49,7 +49,9 @@ if [[ $mode == card ]]; then
 else
   # shellcheck disable=SC2207
   flags+=($(shim_sanitizer_nvcc_flags "$shim") -L "$shim")
-  env_prefix=(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim")
+  # libcuda and libcudart both load (cudart shared): both_shims_env is what a sanitizer build needs for that.
+  # shellcheck disable=SC2046
+  env_prefix=(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim")
   lossy=()
 fi
 

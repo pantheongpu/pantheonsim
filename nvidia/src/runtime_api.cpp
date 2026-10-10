@@ -27,6 +27,7 @@
 #include <vector_types.h>
 
 #include <chrono>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,7 @@
 #include <vector>
 
 #include "enum_value.hpp"
+#include "kept_args.hpp"
 #include "error_names.hpp"
 #include "texture_formats.hpp"
 #include "fatbin.hpp"
@@ -959,13 +961,13 @@ static void announce_driver_init() { vgpu::profiling::notify_init_finished(); }
 
 // Notes the arguments of the call about to be made, as pointers to the
 // parameters in declaration order (vgpu/profiling.hpp).
+// Notes the arguments of the call about to be made for the profiler. The caller keeps `kept` (the bytes of the
+// arguments, see kept_args.hpp) in its own frame for the whole call: the profiler reads them at the call's exit.
 template <class... A>
-void note_all(const A&... a) {
+void note_kept(const vgpu_traced::KeptArgs<A...>& kept) {
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
     announce_driver_init();
-    const void* argv[sizeof...(A) + 1] = {static_cast<const void*>(&a)..., nullptr};
-    const uint16_t sizes[sizeof...(A) + 1] = {static_cast<uint16_t>(sizeof(A))..., 0};
-    vgpu::profiling::note_args(argv, static_cast<int>(sizeof...(A)), sizes);
+    vgpu::profiling::note_args(kept.argv(), kept.count(), kept.sizes());
   }
 }
 
@@ -982,7 +984,8 @@ void note_all(const A&... a) {
 
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
-  note_all(a...);
+  const vgpu_traced::KeptArgs<A...> kept(a...);
+  note_kept(kept);
   vgpu::profiling::ApiCall call(api);
   const cudaError_t rc = body(a...);
   call.set_result(rc);
@@ -4422,13 +4425,15 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
 // is accepted and has no effect, and the answer stays the four-byte bank size.
 // Deprecated in 12.4, and removed with CUDA 13.
 #if CUDART_VERSION < 13000
-static cudaError_t cudaDeviceSetSharedMemConfig_traced(cudaSharedMemConfig config) {
-  const int c = static_cast<int>(config);
+// The configuration travels as an int: a caller's out-of-range value must not
+// be loaded as the enum (UBSan), and traced_call copies its arguments on.
+static cudaError_t cudaDeviceSetSharedMemConfig_traced(int c) {
   return c >= 0 && c <= 2 ? cudaSuccess : cudaErrorInvalidValue;
 }
 
 VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
-  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced, config);
+  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced,
+                     enum_value(config));
 }
 static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* config) {
   if (!config) return cudaErrorInvalidValue;
@@ -4439,8 +4444,7 @@ static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* conf
 VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
   return traced_call("cudaDeviceGetSharedMemConfig", cudaDeviceGetSharedMemConfig_traced, config);
 }
-static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, cudaSharedMemConfig config) {
-  const int c = static_cast<int>(config);
+static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, int c) {
   if (c < 0 || c > 2) return cudaErrorInvalidValue;
   return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
     return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
@@ -4448,7 +4452,8 @@ static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, cudaShare
 }
 
 VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
-  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func, config);
+  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func,
+                     enum_value(config));
 }
 
 // The cudaThread* calls are the pre-cudaDevice* names, deprecated since CUDA
@@ -4771,7 +4776,8 @@ void apply_format(vgpu::exec::TextureDesc* d, const vgpu::cuda::TexFormat& f) {
   d->texel_bytes = sampled_bytes(f);
 }
 
-bool address_mode_of(cudaTextureAddressMode m, vgpu::exec::TexAddress* out) {
+// `m` is the descriptor's integer (enum_value): a program may put any number there.
+bool address_mode_of(int m, vgpu::exec::TexAddress* out) {
   switch (m) {
     case cudaAddressModeWrap: *out = vgpu::exec::TexAddress::Wrap; return true;
     case cudaAddressModeClamp: *out = vgpu::exec::TexAddress::Clamp; return true;
@@ -4881,7 +4887,8 @@ static void forget_arrays_on(int device) {
 VGPU_EXPORT cudaChannelFormatDesc cudaCreateChannelDesc(int x, int y, int z, int w,
                                                         cudaChannelFormatKind f) {
   cudaChannelFormatDesc d;
-  note_all(x, y, z, w, f);
+  const vgpu_traced::KeptArgs<int, int, int, int, cudaChannelFormatKind> kept(x, y, z, w, f);
+  note_kept(kept);
   vgpu::profiling::ApiCall call("cudaCreateChannelDesc");
   d.x = x;
   d.y = y;
@@ -5472,7 +5479,7 @@ static cudaError_t cudaCreateTextureObject_traced(cudaTextureObject_t* out, cons
     bool normalized_read = false;
     if (tex) {
       for (int i = 0; i < 3; ++i)
-        if (!address_mode_of(tex->addressMode[i], &d.address[i])) return cudaErrorInvalidValue;
+        if (!address_mode_of(enum_value(tex->addressMode[i]), &d.address[i])) return cudaErrorInvalidValue;
       const int filter = enum_value(tex->filterMode), mipfilter = enum_value(tex->mipmapFilterMode);
       if ((filter != cudaFilterModePoint && filter != cudaFilterModeLinear) ||
           (mipfilter != cudaFilterModePoint && mipfilter != cudaFilterModeLinear))
@@ -6400,7 +6407,8 @@ VGPU_EXPORT cudaError_t cudaPeekAtLastError(void) {
 // and a subscriber is shown the string they return.
 VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
   const char* text = nullptr;
-  note_all(error);
+  const vgpu_traced::KeptArgs<cudaError_t> kept(error);
+  note_kept(kept);
   vgpu::profiling::ApiCall call("cudaGetErrorString");
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
   text = e && e->runtime_name ? e->text : "unrecognized error code";
@@ -6409,7 +6417,8 @@ VGPU_EXPORT const char* cudaGetErrorString(cudaError_t error) {
 }
 VGPU_EXPORT const char* cudaGetErrorName(cudaError_t error) {
   const char* text = nullptr;
-  note_all(error);
+  const vgpu_traced::KeptArgs<cudaError_t> kept(error);
+  note_kept(kept);
   vgpu::profiling::ApiCall call("cudaGetErrorName");
   const vgpu::cuda::ErrorInfo* e = vgpu::cuda::find_error(static_cast<int>(error));
   text = e && e->runtime_name ? e->runtime_name : "unrecognized error code";
@@ -7681,7 +7690,11 @@ struct LoweredGraph {
 };
 std::unordered_map<void*, std::unique_ptr<LoweredGraph>> g_exec_lowered;   // by executable graph
 
-void announce_lowered(GraphRec& exec, void* source) {
+// Tells a profiler of the executable graph `exec` made from `source`, and returns
+// what it was told (to be kept in g_exec_lowered). The callbacks run with no lock
+// of ours held: a subscriber that asks the driver for its context takes the
+// driver's lock, and a launch holds that one while it takes g_graph_mu.
+std::unique_ptr<LoweredGraph> announce_lowered(GraphRec& exec, void* source) {
   using R = vgpu::profiling::Resource;
   auto lowered = std::make_unique<LoweredGraph>();
   const size_t n = exec.nodes.size();
@@ -7716,12 +7729,12 @@ void announce_lowered(GraphRec& exec, void* source) {
     lowered->removed.insert(up.get());
   }
   graph_event(R::GraphExecCreated, source, nullptr, nullptr, nullptr, 0, nullptr, &exec, true);
-  g_exec_lowered[&exec] = std::move(lowered);
+  return lowered;
 }
 
 cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long long flags,
                         cudaGraphInstantiateResult* result) {
-  std::lock_guard<std::mutex> lock(g_graph_mu);
+  std::unique_lock<std::mutex> lock(g_graph_mu);
   *result = cudaGraphInstantiateError;
   auto it = g_graphs.find(static_cast<void*>(graph));
   if (it == g_graphs.end()) {
@@ -7749,13 +7762,19 @@ cudaError_t instantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, unsigned long
   if (const cudaError_t rc = check_conditionals(*it->second, result); rc != cudaSuccess) return rc;
   auto exec = clone_graph(*it->second, nullptr, 2);     // a snapshot, as CUDA takes
   void* handle = exec.get();
-  announce_lowered(*exec, static_cast<void*>(graph));
+  GraphRec* made = exec.get();
   g_graph_execs[handle] = std::move(exec);
   g_exec_source[handle] = static_cast<void*>(graph);
   exec_retain_graph_objects(handle, static_cast<void*>(graph));
   g_exec_flags[handle] = flags;
   if (flags & cudaGraphInstantiateFlagAutoFreeOnLaunch) g_exec_auto_free.insert(handle);
   if (flags & cudaGraphInstantiateFlagDeviceLaunch) g_device_graphs[handle] = nullptr;
+  // Nothing else knows the handle until this returns, so the profiler can be told
+  // with the lock released.
+  lock.unlock();
+  auto lowered = announce_lowered(*made, static_cast<void*>(graph));
+  lock.lock();
+  g_exec_lowered[handle] = std::move(lowered);
   if (pExec) *pExec = static_cast<cudaGraphExec_t>(handle);
   *result = cudaGraphInstantiateSuccess;
   return cudaSuccess;
@@ -10598,11 +10617,12 @@ static cudaError_t cudaGraphNodeGetDependentNodes_v2_traced(cudaGraphNode_t node
                                                          cudaGraphEdgeData* edgeData, size_t* numDependentNodes) {
   return node_get_dependents(node, dependent, edgeData, numDependentNodes);
 }
+#endif
 
+// The CUDA 12 signature (no edge data) is exported whatever 12.x this is built against.
 VGPU_EXPORT cudaError_t cudaGraphNodeGetDependentNodes(cudaGraphNode_t node, cudaGraphNode_t* dependent, size_t* numDependentNodes) {
   return traced_call("cudaGraphNodeGetDependentNodes", cudaGraphNodeGetDependentNodes_traced, node, dependent, numDependentNodes);
 }
-#endif
 #endif
 
 #if CUDART_VERSION >= 12030
