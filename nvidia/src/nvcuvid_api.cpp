@@ -75,6 +75,8 @@
 #include "h264_parser.hpp"
 #include "hevc_decode.hpp"
 #include "hevc_parser.hpp"
+#include "mpeg2_decode.hpp"
+#include "mpeg2_parser.hpp"
 #include "nvcuvid.h"
 #include "nvjpeg_codec.hpp"
 
@@ -134,6 +136,7 @@ struct Decoder {
   std::vector<Surface> surfaces;
   std::vector<std::unique_ptr<vgpu_h264::Frame>> h264_frames;   // the decoded picture behind each surface
   std::vector<std::unique_ptr<vgpu_hevc::Frame>> hevc_frames;   // likewise for HEVC
+  std::vector<std::unique_ptr<vgpu_mpeg2::Frame>> mpeg2_frames; // and MPEG-2
   uint32_t out_bytes = 1;                   // bytes per sample of the surface: 2 for P016
 };
 
@@ -214,6 +217,16 @@ VGPU_API CUresult CUDAAPI cuvidGetDecoderCaps(CUVIDDECODECAPS* caps) {
     caps->nCounterBitDepth = 32;
     caps->nMaxHistogramBins = 256;
   }
+  // MPEG-2: 4:2:0 at 8 bits (the card's MPEG-1 decoding is not implemented here, so MPEG-1 reports unsupported).
+  if (raw(caps->eCodecType) == cudaVideoCodec_MPEG2 && raw(caps->eChromaFormat) == cudaVideoChromaFormat_420 && caps->nBitDepthMinus8 == 0) {
+    caps->bIsSupported = 1;
+    caps->nMaxWidth = 4080;
+    caps->nMaxHeight = 4080;
+    caps->nMaxMBCount = 65280;
+    caps->nMinWidth = 48;
+    caps->nMinHeight = 16;
+    caps->nOutputFormatMask = 0x41;
+  }
   // The card's JPEG engine answers for any chroma format value; only 8-bit.
   if (raw(caps->eCodecType) == cudaVideoCodec_JPEG && caps->nBitDepthMinus8 == 0) {
     caps->bIsSupported = 1;
@@ -238,6 +251,16 @@ CUresult check_h264_create(const CUVIDDECODECREATEINFO& ci) {
   if (ci.ulNumDecodeSurfaces == 0 || ci.ulNumDecodeSurfaces > 32) return CUDA_ERROR_INVALID_VALUE;
   // sizes: at least three macroblocks across (47 and 48 wide are accepted, 32 is not), at most 4096 either way
   if (ci.ulWidth < 33 || ci.ulHeight < 1 || ci.ulWidth > 4096 || ci.ulHeight > 4096) return CUDA_ERROR_INVALID_VALUE;
+  if (ci.ulTargetWidth == 0 || ci.ulTargetHeight == 0) return CUDA_ERROR_OUT_OF_MEMORY;
+  return CUDA_SUCCESS;
+}
+// What the card's cuvidCreateDecoder answers for an MPEG-2 decoder (measured on an RTX 3060): see check_mpeg2_create_info below.
+CUresult check_mpeg2_create(const CUVIDDECODECREATEINFO& ci) {
+  if (raw(ci.ChromaFormat) != cudaVideoChromaFormat_420 || ci.bitDepthMinus8 > 4) return ci.bitDepthMinus8 > 4 ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_NOT_SUPPORTED;
+  if (ci.bitDepthMinus8 != 0) return CUDA_ERROR_NOT_SUPPORTED;
+  if (raw(ci.OutputFormat) != cudaVideoSurfaceFormat_NV12) return raw(ci.OutputFormat) == cudaVideoSurfaceFormat_YUV444 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+  if (ci.ulNumDecodeSurfaces == 0 || ci.ulNumDecodeSurfaces > 32) return CUDA_ERROR_INVALID_VALUE;
+  if (ci.ulWidth < 33 || ci.ulHeight < 16 || ci.ulWidth > 4080 || ci.ulHeight > 4080) return CUDA_ERROR_INVALID_VALUE;
   if (ci.ulTargetWidth == 0 || ci.ulTargetHeight == 0) return CUDA_ERROR_OUT_OF_MEMORY;
   return CUDA_SUCCESS;
 }
@@ -275,6 +298,9 @@ VGPU_API CUresult CUDAAPI cuvidCreateDecoder(CUvideodecoder* out, CUVIDDECODECRE
   } else if (codec == cudaVideoCodec_HEVC) {
     const CUresult r = check_hevc_create(*ci);
     if (r != CUDA_SUCCESS) return r;
+  } else if (codec == cudaVideoCodec_MPEG2) {
+    const CUresult r = check_mpeg2_create(*ci);
+    if (r != CUDA_SUCCESS) return r;
   } else
   // Output formats: only NV12 is created. P016 / 16-bit 4:4:4 / unknown values are
   // INVALID_VALUE on the card, 8-bit 4:4:4 is the sizing error.
@@ -283,18 +309,19 @@ VGPU_API CUresult CUDAAPI cuvidCreateDecoder(CUvideodecoder* out, CUVIDDECODECRE
     case cudaVideoSurfaceFormat_YUV444: return kBadSize;
     default: return CUDA_ERROR_INVALID_VALUE;
   }
-  if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC &&
+  if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_MPEG2 &&
       (ci->ulWidth == 0 || ci->ulHeight == 0 || ci->ulWidth > 32768 || ci->ulHeight > 16384 || ci->ulNumDecodeSurfaces == 0 || ci->ulNumDecodeSurfaces > 32 ||
        ci->ulNumOutputSurfaces == 0))
     return kBadSize;
-  if (codec != cudaVideoCodec_JPEG && codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC) {
-    say_once("only Motion JPEG, H.264 and HEVC are decoded; other codecs are not supported by VirtualGPU");
+  if (codec != cudaVideoCodec_JPEG && codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_MPEG2) {
+    say_once("only Motion JPEG, H.264, HEVC and MPEG-2 are decoded; other codecs are not supported by VirtualGPU");
     return CUDA_ERROR_NOT_SUPPORTED;
   }
   auto d = std::make_unique<Decoder>();
   d->codec = codec;
   d->h264_frames.resize(ci->ulNumDecodeSurfaces);
   d->hevc_frames.resize(ci->ulNumDecodeSurfaces);
+  d->mpeg2_frames.resize(ci->ulNumDecodeSurfaces);
   d->out_bytes = (codec == cudaVideoCodec_HEVC && raw(ci->OutputFormat) == cudaVideoSurfaceFormat_P016) ? 2 : 1;
   d->info = *ci;
   d->max_w = static_cast<uint32_t>(ci->ulMaxWidth);
@@ -473,6 +500,7 @@ bool baseline_jpeg(const unsigned char* d, size_t n) {
 
 #include "nvcuvid_h264.inc"
 #include "nvcuvid_hevc.inc"
+#include "nvcuvid_mpeg2.inc"
 
 VGPU_API CUresult CUDAAPI cuvidDecodePicture(CUvideodecoder dec, CUVIDPICPARAMS* p) {
   std::lock_guard<std::mutex> lock(g_mu);
@@ -490,6 +518,11 @@ VGPU_API CUresult CUDAAPI cuvidDecodePicture(CUvideodecoder dec, CUVIDPICPARAMS*
   }
   if (d->codec == cudaVideoCodec_HEVC) {
     const CUresult r = decode_hevc_picture(*d, p, s);
+    s.status = r == CUDA_SUCCESS ? cuvidDecodeStatus_Success : cuvidDecodeStatus_Error;
+    return r;
+  }
+  if (d->codec == cudaVideoCodec_MPEG2) {
+    const CUresult r = decode_mpeg2_picture(*d, p, s);
     s.status = r == CUDA_SUCCESS ? cuvidDecodeStatus_Success : cuvidDecodeStatus_Error;
     return r;
   }
@@ -586,6 +619,8 @@ VGPU_API CUresult CUDAAPI cuvidGetDecodeStatus(CUvideodecoder dec, int idx, CUVI
   Decoder* d = find_decoder(dec);
   if (!d) return CUDA_ERROR_INVALID_HANDLE;
   if (!status || idx < 0 || static_cast<size_t>(idx) >= d->surfaces.size()) return CUDA_ERROR_INVALID_VALUE;
+  // measured: the card's MPEG-2 decoder does not report decode status
+  if (d->codec == cudaVideoCodec_MPEG2) return CUDA_ERROR_NOT_SUPPORTED;
   std::memset(status, 0, sizeof *status);
   status->decodeStatus = d->surfaces[idx].status;
   return CUDA_SUCCESS;
@@ -684,6 +719,8 @@ struct Parser {
   std::unique_ptr<vgpu_h264::H264Parser> h264;
   std::unique_ptr<vgpu_hevc::ParserSink> hevc_sink;
   std::unique_ptr<vgpu_hevc::HevcParser> hevc;
+  std::unique_ptr<vgpu_mpeg2::ParserSink> mpeg2_sink;
+  std::unique_ptr<vgpu_mpeg2::Mpeg2Parser> mpeg2;
   CUVIDPARSERPARAMS params{};
   std::vector<uint8_t> pending;   // bytes of a picture still being assembled
   bool have_format = false;
@@ -743,8 +780,9 @@ VGPU_API CUresult CUDAAPI cuvidCreateVideoParser(CUvideoparser* out, CUVIDPARSER
   // measured: the card's parser takes H.264 and its MVC variant (the base view is what is decoded here), and refuses SVC
   // with CUDA_ERROR_INVALID_SOURCE
   if (codec == cudaVideoCodec_H264_SVC) return CUDA_ERROR_INVALID_SOURCE;
-  if (codec != cudaVideoCodec_JPEG && codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_H264_MVC && codec != cudaVideoCodec_HEVC) {
-    say_once("only Motion JPEG, H.264 and HEVC are parsed; other codecs are not supported by VirtualGPU");
+  if (codec != cudaVideoCodec_JPEG && codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_H264_MVC && codec != cudaVideoCodec_HEVC &&
+      codec != cudaVideoCodec_MPEG2) {
+    say_once("only Motion JPEG, H.264, HEVC and MPEG-2 are parsed; other codecs are not supported by VirtualGPU");
     return CUDA_ERROR_NOT_SUPPORTED;
   }
   auto* p = new Parser();
@@ -759,6 +797,10 @@ VGPU_API CUresult CUDAAPI cuvidCreateVideoParser(CUvideoparser* out, CUVIDPARSER
     p->hevc_sink = std::make_unique<HevcCuvidSink>(*params);
     p->hevc = std::make_unique<vgpu_hevc::HevcParser>(p->hevc_sink.get(), params->ulMaxNumDecodeSurfaces, params->ulClockRate, params->ulMaxDisplayDelay,
                                                       params->pfnGetSEIMsg != nullptr);
+  }
+  if (p->codec == cudaVideoCodec_MPEG2) {
+    p->mpeg2_sink = std::make_unique<Mpeg2CuvidSink>(*params);
+    p->mpeg2 = std::make_unique<vgpu_mpeg2::Mpeg2Parser>(p->mpeg2_sink.get(), params->ulMaxNumDecodeSurfaces, params->ulClockRate, params->ulMaxDisplayDelay);
   }
   p->surfaces = std::max<unsigned>(1, params->ulMaxNumDecodeSurfaces);
   std::lock_guard<std::mutex> lock(g_mu);
@@ -787,6 +829,13 @@ VGPU_API CUresult CUDAAPI cuvidParseVideoData(CUvideoparser obj, CUVIDSOURCEDATA
       p->hevc->feed(packet->payload, packet->payload_size, (packet->flags & CUVID_PKT_TIMESTAMP) != 0, static_cast<int64_t>(packet->timestamp),
                     (packet->flags & CUVID_PKT_DISCONTINUITY) != 0, (packet->flags & CUVID_PKT_ENDOFPICTURE) != 0);
     if (packet->flags & CUVID_PKT_ENDOFSTREAM) p->hevc->end_of_stream();
+    return CUDA_SUCCESS;
+  }
+  if (p->codec == cudaVideoCodec_MPEG2) {
+    if (packet->payload && packet->payload_size)
+      p->mpeg2->feed(packet->payload, packet->payload_size, (packet->flags & CUVID_PKT_TIMESTAMP) != 0, static_cast<int64_t>(packet->timestamp),
+                     (packet->flags & CUVID_PKT_DISCONTINUITY) != 0, (packet->flags & CUVID_PKT_ENDOFPICTURE) != 0);
+    if (packet->flags & CUVID_PKT_ENDOFSTREAM) p->mpeg2->end_of_stream();
     return CUDA_SUCCESS;
   }
   if (packet->flags & CUVID_PKT_DISCONTINUITY) p->pending.clear();
