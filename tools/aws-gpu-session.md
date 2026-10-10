@@ -190,3 +190,9 @@ the H100 -> `cluster_occupancy.h100.expected`, to compare with `docs/clusters.md
 `nvidia/profiles/h100.yaml`), `cudnn-dnn_hopper_engines` (which of the RoPE, MoE-backward and band-matrix graphs have an engine
 on Hopper, with the card's outputs; if they do, turn the probe into `dnn_frontend_ops`-style checks), and the cuDNN frontend tests
 (`dnn_frontend_ops`, `dnn_attention`, `dnn_sdpa_mask`) run against NVIDIA's cuDNN on sm_90.
+
+Round 5 outcome (2026-10-10): 25 polls from 03:08 to 09:08 UTC, every zone of us-east-1, p5.4xlarge, none succeeded; no instance
+was created and nothing was spent. Pacing note for the next poller: a background `sleep` in this harness does not keep real time;
+wait with `until [ $(date +%s) -ge $T ]; do sleep 5; done` (foreground, timeout 600000) between polls. The two other-owner GPU
+instances in us-east-1 (`pw-stage2a-a`, `pw-stage2a-b`, no pantheonsim tags) were alive the whole time and count against the
+"two GPU instances at once" rule only if the rule is read across accounts' projects; they were not touched.
