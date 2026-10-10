@@ -2147,6 +2147,33 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_bsync_recursive_abi
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_recursive_abi.sh)
+  set_tests_properties(e2e_bsync_recursive_abi PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # The virtual memory API's granularity (2 MiB, as an RTX 3060 answers) and what each call does with a size, offset
+  # or alignment that is not a multiple of it; peer access and managed memory on a pair of devices (a GeForce
+  # pair has no peer path and no concurrent managed access). Both against what the card printed.
+  if(TARGET vgpucuda)
+    add_test(NAME e2e_vmm_granularity
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_vmm_granularity.sh)
+    set_tests_properties(e2e_vmm_granularity PROPERTIES
+      DEPENDS vgpucuda
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+    add_test(NAME e2e_p2p_managed
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_p2p_managed.sh)
+    set_tests_properties(e2e_p2p_managed PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
+
   add_test(NAME e2e_device_functions
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_functions.sh)
   set_tests_properties(e2e_device_functions PROPERTIES
