@@ -58,6 +58,7 @@
 #include <string>
 #include <vector>
 
+#include "enum_value.hpp"
 #include "vgpu/runtime/capture.hpp"
 
 namespace {
@@ -834,14 +835,14 @@ bool same_layout(const MatImpl& a, const MatImpl& b) {
 }
 
 Status init_descriptor(const char* api, const cusparseLtHandle_t* handle, cusparseLtMatDescriptor_t* d,
-                       int64_t rows, int64_t cols, int64_t ld, uint32_t alignment, cudaDataType type,
-                       cusparseOrder_t order, bool structured, int sparsity) {
+                       int64_t rows, int64_t cols, int64_t ld, uint32_t alignment, int type,
+                       int order, bool structured, int sparsity) {
   if (Status s = check_handle(api, handle)) return s;
   if (!d) return bad_arg(api, 2, "static_cast<void*>(matDescr)", "NULL pointer");
   if (rows <= 0) return bad_arg(api, 3, "rows", std::to_string(rows));
   if (cols <= 0) return bad_arg(api, 4, "cols", std::to_string(cols));
   if (order != CUSPARSE_ORDER_ROW && order != CUSPARSE_ORDER_COL)
-    return bad_arg(api, 8, "order", "(cusparseOrder_t) " + std::to_string((int)order));
+    return bad_arg(api, 8, "order", "(cusparseOrder_t) " + std::to_string(order));
   const int64_t line = order == CUSPARSE_ORDER_ROW ? cols : rows;
   if (ld < line) return bad_arg(api, 5, "ld", std::to_string(ld));
   if (!descriptor_type(type)) return bad_arg(api, 7, "valueType", std::string("(cudaDataType) ") + type_name(type));
@@ -1260,8 +1261,10 @@ const char* cusparseLtGetErrorString(cusparseStatus_t status) {
 cusparseStatus_t cusparseLtDenseDescriptorInit(const cusparseLtHandle_t* handle, cusparseLtMatDescriptor_t* matDescr,
                                                int64_t rows, int64_t cols, int64_t ld, uint32_t alignment,
                                                cudaDataType valueType, cusparseOrder_t order) {
-  return init_descriptor("cusparseLtDenseDescriptorInit", handle, matDescr, rows, cols, ld, alignment, valueType,
-                         order, false, 0);
+  // The type and order travel as ints: a caller's value past the header's enumeration (FP8 and FP4 types
+  // against a CUDA 12.0 header, say) must not be loaded as the enum.
+  return init_descriptor("cusparseLtDenseDescriptorInit", handle, matDescr, rows, cols, ld, alignment,
+                         enum_value(valueType), enum_value(order), false, 0);
 }
 
 cusparseStatus_t cusparseLtStructuredDescriptorInit(const cusparseLtHandle_t* handle,
@@ -1269,7 +1272,7 @@ cusparseStatus_t cusparseLtStructuredDescriptorInit(const cusparseLtHandle_t* ha
                                                     int64_t ld, uint32_t alignment, cudaDataType valueType,
                                                     cusparseOrder_t order, cusparseLtSparsity_t sparsity) {
   return init_descriptor("cusparseLtStructuredDescriptorInit", handle, matDescr, rows, cols, ld, alignment,
-                         valueType, order, true, (int)sparsity);
+                         enum_value(valueType), enum_value(order), true, enum_value(sparsity));
 }
 
 cusparseStatus_t cusparseLtMatDescriptorDestroy(const cusparseLtMatDescriptor_t* matDescr) {

@@ -57,7 +57,9 @@ else
   ln -sf "$shim/libnvcuvid.so.1" "$out.lib/libnvcuvid.so"
   # shellcheck disable=SC2207
   flags+=($(shim_sanitizer_nvcc_flags "$shim") -L "$out.lib" -L "$shim")
-  env_prefix=(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim" "VGPU_E2E_DATA=$data")
+  # libnvcuvid and libcuda each carry the simulator's core: both_shims_env is what a sanitizer build needs for that.
+  # shellcheck disable=SC2046
+  env_prefix=(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim" "VGPU_E2E_DATA=$data")
 fi
 nvcc "${flags[@]}" "$here/nvcuvid_paths.cpp" -o "$out" -ldl -lcuda -lnvcuvid
 if [[ $mode == sim ]] && ! require_shim_libs "$shim" "$out"; then exit 0; fi

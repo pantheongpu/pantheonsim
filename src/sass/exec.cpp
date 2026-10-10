@@ -269,6 +269,7 @@ class Runner {
   // ---- per-block ----
   void run_block(Block& blk);
   bool break_warpsync_standoff(Block& blk);
+  bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
@@ -937,6 +938,38 @@ exec::LaunchStats Runner::run() {
   return stats_;
 }
 
+// Lanes parked at a BSYNC whose barrier no longer names them. A callee that shares a Bx with its caller
+// saves the caller's mask (BMOV.CLEAR) and puts it back on return, and BSYNC releases only the lanes the
+// barrier holds while the callee runs. When a warp's lanes reach the callee's epilogue together from
+// different call levels (ptxas's shared ABI wrapper, as in PyTorch's bessel_j1 kernels), the masks they
+// restore differ and the lanes can be parked at different BSYNCs, each waiting for a mask the other level
+// owns. Nothing can move then, so the group of lanes parked at the lowest pc goes on, as every BSYNC did
+// before a callee's BSYNC stopped taking the caller's lanes with it.
+bool Runner::break_bsync_standoff(Block& blk) {
+  bool any = false;
+  for (Warp& w : blk.warps) {
+    int best = -1;
+    uint64_t best_pc = ~uint64_t{0};
+    for (unsigned l = 0; l < 32; ++l)
+      if (((w.waiting >> l) & 1) && w.wait_kind[l] == Wait::BSync && w.pc[l] < best_pc) {
+        best_pc = w.pc[l];
+        best = static_cast<int>(w.wait_arg[l]);
+      }
+    if (best < 0) continue;
+    Mask released = 0;
+    for (unsigned l = 0; l < 32; ++l)
+      if (((w.waiting >> l) & 1) && w.wait_kind[l] == Wait::BSync && static_cast<int>(w.wait_arg[l]) == best) {
+        w.waiting &= ~(Mask{1} << l);
+        w.wait_kind[l] = Wait::None;
+        w.pc[l] += 16;
+        released |= Mask{1} << l;
+      }
+    w.b[best] &= ~released;
+    any = true;
+  }
+  return any;
+}
+
 // A WARPSYNC waits for every lane its mask names, and a BSYNC waits for every lane of its barrier. A
 // warp can hold both at once: lane 0 alone in an `if (i < n)` block calls __syncthreads(), which ptxas
 // compiles to WARPSYNC 0xffffffff; BAR.SYNC, while lanes 1 to 31 skip the block and park at the BSYNC
@@ -1011,6 +1044,7 @@ void Runner::run_block(Block& blk) {
     }
     if (!live) return;
     if (!progress && break_warpsync_standoff(blk)) continue;
+    if (!progress && break_bsync_standoff(blk)) continue;
     if (!progress)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of block (" + std::to_string(blk.ctaid[0]) +
                                     ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
