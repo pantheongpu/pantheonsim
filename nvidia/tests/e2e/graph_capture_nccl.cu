@@ -46,6 +46,15 @@ __global__ void fill(float* p, size_t n, const int* counter, int salt) {
   if (i < n) p[i] = static_cast<float>(static_cast<int>((i * 7 + 3 * static_cast<size_t>(*counter) + 5 * salt) % 11) - 5);
 }
 
+// Launched through the runtime API, not with <<< >>>: the stub nvcc writes for a <<< >>> launch stores the kernel's
+// address in a static of its own, and two rank threads launching the same kernel at once race on that store
+// (ThreadSanitizer reports it, in the test program's own generated code).
+static void launch_fill(float* p, const int* counter, int salt, cudaStream_t stream) {
+  size_t n = N;
+  void* args[] = {&p, &n, &counter, &salt};
+  cudaLaunchKernel(reinterpret_cast<const void*>(fill), dim3((N + 127) / 128), dim3(128), args, 0, stream);
+}
+
 struct Barrier {
   std::mutex m;
   std::condition_variable cv;
@@ -90,8 +99,8 @@ static std::vector<float> read_recv(int r) {
   return h;
 }
 static void write_inputs(int r) {
-  fill<<<(N + 127) / 128, 128, 0, rk[r].st>>>(rk[r].send, N, rk[r].counter, r);
-  fill<<<(N + 127) / 128, 128, 0, rk[r].st>>>(rk[r].send + N, N, rk[r].counter, r + 7);
+  launch_fill(rk[r].send, rk[r].counter, r, rk[r].st);
+  launch_fill(rk[r].send + N, rk[r].counter, r + 7, rk[r].st);
 }
 static void issue(const Case& c, int r) {
   NC(ncclGroupStart());
@@ -194,7 +203,7 @@ static void worker(int r, const std::vector<Case>* cases) {
   set_counter(5);
   cudaMemset(rk[r].recv, 0, 2 * N * sizeof(float));
   cudaDeviceSynchronize();
-  fill<<<(N + 127) / 128, 128, 0, rk[r].st>>>(rk[r].send, N, rk[r].counter, r);
+  launch_fill(rk[r].send, rk[r].counter, r, rk[r].st);
   const ncclResult_t rc = ncclAllReduce(rk[r].send, rk[r].recv, N, ncclFloat32, ncclSum, rk[r].comm, rk[r].st);
   cudaStreamSynchronize(rk[r].st);
   const std::vector<float> got = read_recv(r);
