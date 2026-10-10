@@ -1975,10 +1975,9 @@ are unreachable for the opcodes `executes()` lists; `tcgen05.alloc`'s blocking w
 
 Still open, each with the reason:
 
-- `tex.grad` on 3D and cube textures (ptxas builds those from quads of `TEX.NDV` fetches in SASS; the card's
-  length of three gradient components is max + 11/32 mid + 1/4 min to a part in a thousand, its rounding not
-  recovered), on textures whose size is not a power of two (the card's scaling of the gradients by the size is
-  rounded in a way no tried pipeline reproduces; about one fetch in ten differs by 1-2 256ths of a level) and with
+- `tex.grad` on cube textures (the model is in `nvidia/docs/textures.md` and matches the card on 31,083 of
+  31,083 fetches with the card's own `MUFU.RCP`, but the simulator's reciprocal is the correctly rounded one and the
+  card's differs by an ulp on 13% of inputs: a table with a quadratic interpolation, not reproduced) and with
   `maxAnisotropy` above 1; `tex.2dms`/`tex.a2dms`: CUDA cannot make a multi-sample texture; BC6H and BC7 texture
   objects (the arrays work; see the runtime and driver section).
 - `cvt.rs` to the x4 types: figures 41 and 42 do not say how a and b split their shared random bits;

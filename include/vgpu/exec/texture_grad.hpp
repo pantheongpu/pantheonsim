@@ -18,14 +18,18 @@
 //     the exponent -- the table is not 256 log2: it is the card's (the same table for every size).
 //
 // 1D textures are 2D ones of height 1 (the gradients' second components are 0), as the hardware fetches them.
-// A gradient is scaled by the texture's size first; that is exact for a power of two and is all that is
-// reproduced (for other sizes the card's product is rounded in a way that no tried pipeline of truncations and
-// roundings reproduces: about one fetch in ten differs by one or two 256ths), so other sizes are refused by the
-// caller. Three components (3D, cube) are not reproduced either: the card's 3D length is max + 11/32 mid +
-// 1/4 min to within a part in 1000, but its rounding was not recovered.
+// A gradient is scaled by the texture's size first. For a power of two that is exact (an exponent change). For any
+// other size the card multiplies the gradient's 10-bit significand by the size's significand (cut to 10
+// significant bits) as a sum of shifted copies, each shifted-out bit dropped at 12 fractional bits, and converts
+// the sum back to a 10-bit float with "add 7, then shift" -- by 3 bits when the sum is below 2, by 4 bits when it
+// is 2 or more (see scale_by_size). Measured on an RTX 3060 against ~1.5 million fetches of 14 sizes from 3 to
+// 16383, single components first and then every pair: no differences.
+// Three components (3D, cube) are not reproduced: the card's 3D length is max + 11/32 mid + 1/4 min to within a
+// part in 1000, but its rounding was not recovered.
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -114,6 +118,61 @@ inline double add_signed(double x, double y) {
   return big + std::copysign(std::floor(std::fabs(small) / gg) * gg, small);
 }
 
+// Sorts three magnitudes, largest first.
+inline void sort3(double* v) {
+  if (v[0] < v[1]) std::swap(v[0], v[1]);
+  if (v[1] < v[2]) std::swap(v[1], v[2]);
+  if (v[0] < v[1]) std::swap(v[0], v[1]);
+}
+
+// Approximate length of a vector of three components: larger + 11/32 middle + 1/4 smallest. The middle one's share
+// is built as in length_unit and cut to 10 bits; the smallest's quarter is cut to the grid of that share's 10 bits
+// before the three are added and cut again.
+inline double length3(const double* v3) {
+  double v[3] = {std::fabs(v3[0]), std::fabs(v3[1]), std::fabs(v3[2])};
+  sort3(v);
+  const double a = trunc_bits(v[0], 10), b = trunc_bits(v[1], 10), c = trunc_bits(v[2], 10);
+  if (b == 0) return a;
+  double bm;
+  int kb;
+  mant10(b, &bm, &kb);
+  const double p = trunc_bits(std::ldexp(round_half_up(11.0 * bm / 8.0), kb - 2), 10);
+  double q = 0;
+  if (c > 0) {
+    const double gr = std::ldexp(1.0, std::ilogb(p) - 9);
+    q = std::floor(c / 4 / gr) * gr;
+  }
+  return trunc_bits(a + p + q, 10);
+}
+
+// 11/16 of the length of a vector of three components (a diagonal of the quad), the same way: each share is
+// rounded from the 10-bit mantissa: round(11 M / 8) in units of 2^(k-1) for the largest, round(121 M / 64) in
+// units of 2^(k-3) for the middle one's share, round(11 M / 8) in units of 2^(k-3) for the smallest's.
+inline double diagonal3(const double* v3) {
+  double v[3] = {trunc_bits(std::fabs(v3[0]), 10), trunc_bits(std::fabs(v3[1]), 10),
+                 trunc_bits(std::fabs(v3[2]), 10)};
+  sort3(v);
+  if (v[0] == 0) return 0;
+  double m;
+  int k;
+  mant10(v[0], &m, &k);
+  const double ta = trunc_bits(std::ldexp(round_half_up(11.0 * m / 8.0), k - 1), 10);
+  double tb = 0, tc = 0;
+  if (v[1] > 0) {
+    mant10(v[1], &m, &k);
+    tb = trunc_bits(std::ldexp(round_half_up(121.0 * m / 64.0), k - 3), 10);
+  }
+  if (v[2] > 0) {
+    mant10(v[2], &m, &k);
+    tc = std::ldexp(round_half_up(11.0 * m / 8.0), k - 3);
+    if (tb > 0) {
+      const double gr = std::ldexp(1.0, std::ilogb(tb) - 9);
+      tc = std::floor(tc / gr) * gr;
+    }
+  }
+  return trunc_bits(ta + tb + tc, 10);
+}
+
 }  // namespace detail
 
 // Sanitizes a gradient component the way the card reads it: NaN is 0, infinities are huge.
@@ -121,6 +180,24 @@ inline double component(float g) {
   if (std::isnan(g)) return 0;
   if (std::isinf(g)) return g > 0 ? 1e300 : -1e300;
   return static_cast<double>(g);
+}
+
+// A gradient component (a double; an infinite one already mapped to +-1e300) times a texture size in texels, as
+// the card's multiplier gives it: a 10-bit float (see the header comment).
+inline double scale_by_size(double g, uint32_t size) {
+  if (g == 0 || size == 0 || (size & (size - 1)) == 0) return g * static_cast<double>(size);
+  int e;
+  const double fr = std::frexp(std::fabs(g), &e);   // fr in [0.5, 1): the significand 512..1023 is its top 10 bits
+  e -= 1;
+  const uint32_t sig = static_cast<uint32_t>(fr * 1024.0);
+  const int wexp = static_cast<int>(std::bit_width(size)) - 1;
+  uint32_t acc = sig << 3;   // the size's leading one: the gradient itself, with 12 fractional bits
+  for (int i = 0; i < std::min(wexp, 9); ++i)   // the size's significand has 9 fractional bits at most
+    if ((size >> (wexp - 1 - i)) & 1u) acc += (sig << 3) >> (i + 1);
+  const int f = e + wexp;
+  const double v = acc < (1u << 13) ? std::ldexp(static_cast<double>((acc + 7) >> 3), f - 9)
+                                    : std::ldexp(static_cast<double>((acc + 7) >> 4), f - 8);
+  return std::copysign(v, g);
 }
 
 // 256 * log2 of a positive length, as the card's table gives it; the lowest int64 for a length of 0.
@@ -141,6 +218,39 @@ inline int64_t lod_q_2d(double dudx, double dvdx, double dudy, double dvdy) {
                                diagonal_unit(add_signed(a1, a3), add_signed(a2, a4)),
                                diagonal_unit(add_signed(a1, -a3), add_signed(a2, -a4))});
   return log2_q(rho);
+}
+
+// The LOD in 1/256ths of a level for a 3D fetch from the gradients in texels of the base level, dPdx = dx[0..2] and
+// dPdy = dy[0..2]. The vectors, their sum and their difference are measured as for a 2D fetch, with the
+// three-component lengths above.
+inline int64_t lod_q_3d(const double* dx, const double* dy) {
+  using namespace detail;
+  double sum[3], dif[3];
+  for (int i = 0; i < 3; ++i) {
+    const double a = t10(dx[i]), b = t10(dy[i]);
+    sum[i] = add_signed(a, b);
+    dif[i] = add_signed(a, -b);
+  }
+  const double rho = std::max({length3(dx), length3(dy), diagonal3(sum), diagonal3(dif)});
+  return log2_q(rho);
+}
+
+// What the card's texture unit sees as a gradient of a 3D (or cube) fetch. ptxas builds those fetches from the
+// coordinates of a quad -- P, P + dPdx, P + dPdy -- computed in single precision (FSWZADD) and handed to the unit,
+// which takes their differences: the gradient is c1 - c0, not d. A coordinate that is NaN reads as 0 (measured: a
+// NaN gradient component makes the level that of a jump from the coordinate to 0), and one of 2^97 or more,
+// infinite included, makes the difference overflow: the fetch reads the last level whatever the other components
+// are.
+inline double lane_difference(float c0, float c1) {
+  constexpr float kOverflow = 0x1p97f;
+  if ((!std::isnan(c0) && std::fabs(c0) >= kOverflow) || (!std::isnan(c1) && std::fabs(c1) >= kOverflow)) return 1e300;
+  return (std::isnan(c1) ? 0.0 : static_cast<double>(c1)) - (std::isnan(c0) ? 0.0 : static_cast<double>(c0));
+}
+
+// The same from the position and the gradient component (the PTX instruction's operands).
+inline double quad_difference(float p, float d) {
+  volatile float c = p + d;   // one single-precision add, as FSWZADD does it
+  return lane_difference(p, c);
 }
 
 }  // namespace vgpu::exec::tex_grad

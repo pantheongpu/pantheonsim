@@ -307,9 +307,35 @@ inline void warp_perspective_back(const Image<T>& src, const Rect& sroi, Image<T
      carry NVIDIA's label (the images themselves are exact); on images
      of pure noise, every one.
 
+   4-way connectivity (nppiNormL1) has a defect of NPP 13.0 that this reproduces:
+   a pixel whose lowest neighbour is the one to its right (below) is not written, and so stays a
+   root with its own value, when its column (row) is in a set that depends on the image's width (height)
+   alone: with t = width - 1 - x, t is in the set for width % 112 of kUnwritten4 (a bit per t from 1 to
+   11). The set came from east-flowing ramps of every width from 2 to 1099 (it repeats every 112 from
+   a width of 12; below that it is the same set cut at t <= width - 1) and is symmetric in x and y.
+   Random images of 8 to 300 pixels a side, with and without equal values, 8-bit and 16-bit, have the
+   segmented image of the model with those pixels as roots exactly as NPP writes it, and the marker label of
+   such a pixel is its own pixel index (a root's is the smallest index in its closed 4-neighbourhood).
+
    Boundaries are drawn on the segmented image: a pixel is a boundary pixel
    when the pixel above it or the one to its left has another segmented
    value (measured exactly, with ties). */
+// The columns (rows) in which NPP 13.0's 4-way watershed leaves a pixel that flows right (down) unwritten, by
+// the width (height) % 112: bit t, for t = width - 1 - x from 1 to 11, says whether column x is one.
+inline constexpr uint16_t kUnwritten4[112] = {
+    62, 126, 124, 248, 240, 482, 450, 902, 774, 1550, 1038, 2078, 30, 62,
+    62, 126, 124, 248, 240, 480, 448, 898, 770, 1542, 1030, 2062, 14, 30,
+    30, 62, 60, 120, 112, 226, 192, 384, 256, 514, 2, 6, 6, 14,
+    14, 30, 28, 56, 48, 98, 66, 134, 4, 8, 0, 2, 2, 6,
+    6, 14, 12, 24, 16, 34, 2, 6, 6, 14, 12, 24, 16, 34,
+    2, 6, 4, 8, 0, 2, 2, 6, 6, 14, 14, 30, 28, 56,
+    48, 98, 64, 128, 0, 2, 2, 6, 6, 14, 14, 30, 30, 62,
+    60, 120, 112, 224, 192, 386, 258, 518, 6, 14, 14, 30, 30, 62};
+inline bool ws_unwritten4(int n, int k) {
+  const int t = n - 1 - k;
+  return t >= 1 && t <= 11 && ((kUnwritten4[n % 112] >> t) & 1) != 0;
+}
+
 enum class WsNorm { k8, k4 };
 
 struct Watershed {
@@ -349,12 +375,20 @@ inline Watershed watershed(const T* v, int w, int h, bool four) {
   r.label.assign(n, 0);
   r.is_root.assign(n, 0);
   std::vector<int32_t> ptr(n, -1);
+  std::vector<uint8_t> unwritten(n, 0);   // 4-way: a pixel NPP leaves as it is, a root with its own index
   for (int i = 0; i < n; ++i) {
     int nb[8];
     const int k = ws_neighbours(i, w, h, four, nb);
     int best = -1;
     for (int j = 0; j < k; ++j)
       if (v[nb[j]] < v[i] && (best < 0 || v[nb[j]] < v[best])) best = nb[j];
+    if (four && best >= 0) {
+      const int x = i % w, y = i / w;
+      if ((best == i + 1 && x + 1 < w && ws_unwritten4(w, x)) || (best == i + w && ws_unwritten4(h, y))) {
+        best = -1;
+        unwritten[i] = 1;
+      }
+    }
     ptr[i] = best;
     r.is_root[i] = best < 0;
   }
@@ -393,16 +427,17 @@ inline Watershed watershed(const T* v, int w, int h, bool four) {
     int nb[8];
     const int k = ws_neighbours(i, w, h, four, nb);
     if (r.is_root[i]) {
+      if (unwritten[i]) continue;
       for (int j = 0; j < k; ++j)
-        if (nb[j] > i && r.is_root[nb[j]] && v[nb[j]] == v[i]) unite(i, nb[j]);
+        if (nb[j] > i && r.is_root[nb[j]] && !unwritten[nb[j]] && v[nb[j]] == v[i]) unite(i, nb[j]);
       continue;
     }
     int low[8], nl = 0;
     for (int j = 0; j < k; ++j)
       if (v[nb[j]] == v[ptr[i]]) low[nl++] = nb[j];
     for (int j = 1; j < nl; ++j) {
-      if (!r.is_root[low[j]]) continue;
-      if (r.is_root[low[0]])
+      if (!r.is_root[low[j]] || unwritten[low[j]]) continue;
+      if (r.is_root[low[0]] && !unwritten[low[0]])
         unite(low[0], low[j]);
       else
         pulls.emplace_back(low[j], low[0]);
@@ -412,7 +447,8 @@ inline Watershed watershed(const T* v, int w, int h, bool four) {
   for (int i = 0; i < n; ++i)
     if (r.is_root[i]) {
       const int g = find(i);
-      group[g] = std::min<uint32_t>(group[g], static_cast<uint32_t>(ws_nbhd_min(i, w, h, four)));
+      group[g] = std::min<uint32_t>(group[g], unwritten[i] ? static_cast<uint32_t>(i)
+                                                          : static_cast<uint32_t>(ws_nbhd_min(i, w, h, four)));
     }
   for (const auto& p : pulls) {
     const int g = find(p.first);

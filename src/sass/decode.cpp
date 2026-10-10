@@ -2303,6 +2303,7 @@ void dec_tex(Instr& ins, const Word& w) {
   ins.op = Op::TEX;
   ins.mnemonic = "TEX";
   if (w.bit(60)) ins.mods.push_back("SCR");
+  if (w.bit(77)) ins.mods.push_back("NDV");   // bit 77: the quad is complete (ptxas's tex.grad on 3D and cube)
   tex_f16(ins, w);
   const unsigned lod = tex_lod(ins, w);
   if (lod) ins.mods.push_back(kLod[lod]);
@@ -2473,6 +2474,54 @@ void dec_bmov_r(Instr& ins, const Word& w) {
   b.kind = Kind::Bar;
   b.reg = static_cast<unsigned>(w.field(24, 4));
   ins.src.push_back(b);
+}
+
+// BMOV.32 Bn, MACTIVE (0xf55) and BMOV.32(.PQUAD) MACTIVE, Bn (0xf56): the thread mask a warp runs with, to or
+// from a convergence barrier register. ptxas wraps the quad of TEX.NDV fetches that implement tex.grad on a 3D
+// or cube texture in these: it saves the mask, runs the quad's instructions with .PQUAD (every thread of a quad
+// that has any thread active runs them, the inactive ones as helpers), and puts the mask back.
+// f[0]: 2 reads MACTIVE into Bn, 3 writes it from Bn; f[2]: .PQUAD (bit 84).
+void dec_bmov_active(Instr& ins, const Word& w) {
+  ins.op = Op::BMOV;
+  ins.mnemonic = "BMOV";
+  ins.mods.push_back("32");
+  const bool to_active = (w.field(0, 12) & 0xf) == 0x6;
+  if (to_active && w.bit(84)) ins.mods.push_back("PQUAD");
+  Operand b;
+  b.kind = Kind::Bar;
+  b.reg = static_cast<unsigned>(w.field(16, 4));
+  const Operand m = Txt("MACTIVE");
+  if (to_active) {
+    ins.dst.push_back(m);
+    ins.src.push_back(b);
+  } else {
+    ins.dst.push_back(b);
+    ins.src.push_back(m);
+  }
+  ins.f[0] = to_active ? 3 : 2;
+  ins.f[1] = b.reg;
+  ins.f[2] = to_active && w.bit(84);
+}
+
+// FSWZADD Rd, Ra, Rb, pattern: a float add across a quad's threads, each thread taking Ra into the sum or not. The
+// pattern is two bits a thread (bits 32-39, thread 0 in the low pair): 0 leaves Ra out ("Z"), 3 puts it in ("P").
+// Rb always goes in. .NDV (bit 77): ptxas's mark for fetches whose quad is complete.
+void dec_fswzadd(Instr& ins, const Word& w) {
+  ins.op = Op::FSWZADD;
+  ins.mnemonic = "FSWZADD";
+  if (w.bit(77)) ins.mods.push_back("NDV");
+  ins.dst.push_back(R(static_cast<unsigned>(w.field(16, 8))));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(24, 8))));
+  ins.src.push_back(R(static_cast<unsigned>(w.field(64, 8))));
+  std::string pat;
+  const unsigned bits = static_cast<unsigned>(w.field(32, 8));
+  for (unsigned t = 0; t < 4; ++t) {
+    const unsigned v = (bits >> (2 * t)) & 3;
+    pat += v == 0 ? 'Z' : v == 3 ? 'P' : '?';
+    pat += 'P';
+  }
+  ins.src.push_back(Txt(pat));
+  ins.f[0] = bits;
 }
 
 // BRXU URn offset: BRX with the index in a uniform register.
@@ -3712,7 +3761,7 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
       {0xdbd, [](Instr& i, const Word& w) { dec_stas(i, w, false); }},
       {0xdbe, [](Instr& i, const Word& w) { dec_stas(i, w, true); }},
       {0x84c, dec_uvirtcount}, {0x3ca, dec_ugetnextworkid},
-      {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
+      {0x356, dec_bmov}, {0x355, dec_bmov_r}, {0xf55, dec_bmov_active}, {0xf56, dec_bmov_active}, {0x822, dec_fswzadd}, {0x958, dec_brxu}, {0xfae, dec_ldgsts}, {0x83b, dec_ldsm}, {0x9af, dec_ldgdepbar},
       {0xabb, dec_uldc_idx},
       {0x23c, dec_hmma}, {0x27a, dec_qmma},
       {0x47a, [](Instr& i, const Word& w) { dec_mma_sf(i, w, false); }},
@@ -3795,12 +3844,6 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   }
   char b[64];
   std::snprintf(b, sizeof b, "SASS: unknown opcode 0x%03x (sm_%d)", opc, sm);
-  // BMOV (barrier registers) and FSWZADD are how ptxas builds tex.grad on a 3D or cube texture: a quad of TEX.NDV
-  // fetches with swizzled coordinates, whose implicit level of detail is not modelled.
-  if ((opc & 0xfff) == 0xf55)
-    throw Error(Err::UnsupportedPtx, std::string(b) + " -- BMOV, which ptxas emits around the quad of TEX.NDV fetches "
-                "that implement tex.grad on 3D and cube textures; those are not supported (VGPU_SASS=0 runs the PTX, "
-                "which refuses them by name too)");
   throw Error(Err::UnsupportedPtx, b);
 }
 

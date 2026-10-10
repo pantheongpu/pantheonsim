@@ -76,7 +76,7 @@ bool executes(const Instr& ins) {
     case Op::UBLKRED: case Op::LDTM: case Op::STTM: case Op::UTCMMA: case Op::UTCBAR: case Op::UTCCP:
     case Op::UTCSHIFT: case Op::UTCATOMSWS: case Op::STAS: case Op::REDAS: case Op::UGETNEXTWORKID:
     case Op::DADD: case Op::DFMA: case Op::DMUL: case Op::DSETP: case Op::F2F: case Op::F2I:
-    case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL:
+    case Op::FADD: case Op::FCHK: case Op::FFMA: case Op::FMNMX: case Op::FMUL: case Op::FRND: case Op::FSEL: case Op::FSWZADD:
     case Op::FSET: case Op::FSETP: case Op::HADD2: case Op::HFMA2: case Op::HMUL2: case Op::HSET2: case Op::HSETP2:
     case Op::I2F: case Op::I2FP: case Op::I2I: case Op::I2IP: case Op::MUFU:
     case Op::ATOM: case Op::ATOMG: case Op::ATOMS: case Op::LD: case Op::LDC: case Op::LDG: case Op::LDGDEPBAR:
@@ -102,7 +102,7 @@ exec::InstClass inst_class(Op op) {
   using C = exec::InstClass;
   switch (op) {
     case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET: case Op::FSEL:
-    case Op::FCHK: case Op::MUFU:
+    case Op::FCHK: case Op::MUFU: case Op::FSWZADD:
       return C::Fp32;
     case Op::DADD: case Op::DMUL: case Op::DFMA: case Op::DSETP: return C::Fp64;
     case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2: return C::Fp16;
@@ -131,7 +131,9 @@ exec::InstClass inst_class(Op op) {
 }
 
 void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance) {
-  const Mask ex = guard_mask(w, ins, group);
+  // After BMOV.PQUAD MACTIVE every thread of a quad that has one running takes part (see dec_bmov_active); the
+  // ones outside the issuing group run as helpers and keep their own program counters.
+  const Mask ex = guard_mask(w, ins, w.mactive_force ? w.mactive_force : group);
   {
     exec::LaunchStats& st = blk.st;
     const uint64_t lanes = static_cast<uint64_t>(std::popcount(ex));
@@ -193,7 +195,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
         exec_clc(blk, w, ins, ex);
         break;
       case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET:
-      case Op::FSEL: case Op::FCHK: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
+      case Op::FSEL: case Op::FCHK: case Op::FSWZADD: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
       case Op::DSETP: case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2:
       case Op::I2F: case Op::I2FP: case Op::F2I: case Op::F2IP: case Op::F2F: case Op::F2FP:
       case Op::FRND: case Op::I2I: case Op::I2IP: case Op::HSET2: case Op::FMNMX3:
@@ -327,6 +329,14 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       }
       if (ins.f[1]) {   // MOV.64
         each_lane(ex, [&](unsigned l) { write64(w, ins.dst[0], l, read64(w, ins.src[0], l)); });
+        return;
+      }
+      // MOV Rd, Rs, mask (bits 72-75): only the threads whose place in their quad (lane & 3) is in the mask write
+      // (ptxas gathers the four threads' results of tex.grad's quad of fetches with it: 1, 2, 4, 8).
+      if (!uniform && ins.f[0] != 0xf) {
+        each_lane(ex, [&](unsigned l) {
+          if ((ins.f[0] >> (l & 3)) & 1) write32(w, ins.dst[0], l, read32(w, ins.src[0], l));
+        });
         return;
       }
       each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, read32(w, ins.src[0], l)); });
@@ -1081,7 +1091,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   };
   switch (ins.op) {
     case Op::MOV: {
-      if (ins.mnemonic != "MOV" || ins.f[1] || ins.src.empty() || !plain(ins.src[0])) return false;
+      if (ins.mnemonic != "MOV" || ins.f[1] || ins.f[0] != 0xf || ins.src.empty() || !plain(ins.src[0])) return false;
       const uint32_t* a = lanes(0, ins.src[0], Same{});
       for (unsigned l = 0; l < 32; ++l) r[l] = a[l];
       store(ins.dst[0]);
@@ -1264,6 +1274,20 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     return d;
   };
   switch (ins.op) {
+    case Op::FSWZADD: {
+      // Rd = (the thread's pattern pair says Ra goes in ? Ra + Rb : Rb), a single-precision add (ptxas builds the
+      // coordinates of tex.grad's quad on 3D and cube textures with it: P, P + dPdx, P + dPdy, ...). A thread
+      // that leaves Ra out takes Rb as it is, NaN or not.
+      const uint32_t pattern = ins.f[0];
+      each_lane(ex, [&](unsigned l) {
+        const float a = as_f32(read32(w, ins.src[0], l)), b = as_f32(read32(w, ins.src[1], l));
+        const bool with_a = ((pattern >> (2 * (l & 3))) & 3) == 3;
+        float r = b;
+        if (with_a) r = a + b;
+        write32(w, ins.dst[0], l, r != r ? 0x7fffffffu : f32_bits(r));
+      });
+      return;
+    }
     case Op::FADD: case Op::FMUL: case Op::FFMA: {
       const unsigned rnd = ins.f[0];
       const bool fz = ins.f[1], st = ins.f[2];
@@ -2460,6 +2484,7 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   // The LOD mode (87-89; from sm_100 split, its low bit at 59). A fetch's
   // (TLD) is explicit, so sm_100's 0 means .LZ.
   const bool txd = ins.op == Op::TXD;   // tex.grad: no LOD mode, the gradients come in registers
+  const bool ndv = ins.op == Op::TEX && word.bit(77);   // TEX.NDV: see below
   unsigned lod_mode = ins.op == Op::TLD4 || txd ? 0
                       : m_.sm >= 100    ? static_cast<unsigned>(word.field(59, 1) | (word.field(87, 2) << 1))
                                         : static_cast<unsigned>(word.field(87, 3));
@@ -2513,6 +2538,31 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       }
     }
     f.float_coords = !int_coords;
+    // TEX.NDV on a 3D texture, with no LOD operand: the level comes from the coordinates of the quad this thread is
+    // in -- threads 0, 1 and 2 of it are P, P + dPdx and P + dPdy, the way ptxas builds tex.grad (the threads
+    // below the fetch's own are helpers, see BMOV.PQUAD MACTIVE).
+    if (ndv && !has_lod && cube && d.mip_levels > 0)
+      fault(w, ins, l,
+            "tex.grad on a cube texture: the card finds the level of detail from the four coordinates of a quad of "
+            "normalized directions, which is not reproduced bit for bit (VGPU_SASS=0 refuses it too)",
+            Err::UnsupportedPtx);
+    if (ndv && !has_lod && dims == 3 && !cube && !layered && d.mip_levels > 0) {
+      const unsigned qb = l & ~3u;
+      double dq[2][3];
+      const unsigned sizes[3] = {d.width, d.height, d.depth};
+      for (unsigned i = 0; i < 3; ++i) {
+        const auto coord_at = [&](unsigned lane) {
+          return as_f32(i < in0 ? rd(r0 + i, lane) : rd(r1 + (i - in0), lane));
+        };
+        const float c0 = coord_at(qb);
+        for (unsigned k = 0; k < 2; ++k)
+          dq[k][i] = std::clamp(exec::tex_grad::scale_by_size(exec::tex_grad::lane_difference(c0, coord_at(qb + 1 + k)),
+                                                              sizes[i]),
+                                -1e300, 1e300);
+      }
+      f.explicit_lod = true;
+      f.lod = static_cast<double>(exec::tex_grad::lod_q_3d(dq[0], dq[1])) / 256.0;
+    }
     // The result's type is the texture's (its format and read mode), not
     // the instruction's: SASS has one TEX for every PTX destination type.
     f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
@@ -3080,6 +3130,19 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
   };
   switch (ins.op) {
     case Op::BMOV:   // a convergence barrier's thread mask, to or from a register
+      if (ins.f[0] >= 2) {   // MACTIVE, the mask the warp runs with: f[0] 2 saves it in Bn, 3 sets it from Bn
+        if (ins.f[0] == 2) {
+          w.b[ins.f[1] & 15] = w.mactive_force ? w.mactive_force : ex;
+        } else if (ins.f[2]) {   // .PQUAD: every thread of every quad that has one of the saved threads
+          Mask q = 0;
+          for (Mask m = w.b[ins.f[1] & 15]; m; m &= m - 1) q |= Mask{0xf} << (std::countr_zero(m) & ~3);
+          w.mactive_force = q;   // the quad's other threads take part even when they have exited or are not in the block
+        } else {
+          w.mactive_force = 0;
+        }
+        each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
+        return true;
+      }
       if (ins.f[0]) {
         const unsigned bar = ins.src[0].reg & 15;
         const Mask m = w.b[bar];
