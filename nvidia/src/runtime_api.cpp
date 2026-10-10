@@ -2404,22 +2404,33 @@ VGPU_EXPORT cudaError_t cudaFuncGetParamInfo(const void* func, size_t paramIndex
 }
 #endif
 
+// Whether `device` can reach `peer`'s memory over a peer path: two devices whose profiles both have one
+// (CudaClass::peer_access). Two RTX 3060s have none (measured), a data-centre pair does.
+static bool peer_path(State& s, int device, int peer) {
+  return device != peer && s.rt->device(device).profile().cuda.peer_access &&
+         s.rt->device(peer).profile().cuda.peer_access;
+}
+
 // What one device can do with another's memory. The answers follow
-// cudaDeviceCanAccessPeer: distinct simulated devices reach each other, and
-// atomics on a peer's memory are as atomic as on one's own. A device is not
-// asked about itself: an RTX 3060 answers that, like a device that does not
-// exist, with cudaErrorInvalidDevice. There is no performance to rank.
+// cudaDeviceCanAccessPeer: devices with a peer path between them reach each other, and atomics on a
+// peer's memory are as atomic as on one's own; without one every attribute is 0 (an RTX 3060 pair, measured:
+// attributes 1 to 5 are all 0, 0 and 6 and above are cudaErrorInvalidValue). A device is not asked about
+// itself: an RTX 3060 answers that, like a device that does not exist, with cudaErrorInvalidDevice. There is
+// no performance to rank.
 static cudaError_t cudaDeviceGetP2PAttribute_traced(int* value, cudaDeviceP2PAttr attr, int srcDevice, int dstDevice) {
+  const int attr_value = enum_value(attr);
   return guard("cudaDeviceGetP2PAttribute", [&](State& s) {
     if (!value) return cudaErrorInvalidValue;
     const int n = s.rt->device_count();
     if (srcDevice < 0 || srcDevice >= n || dstDevice < 0 || dstDevice >= n || srcDevice == dstDevice)
       return cudaErrorInvalidDevice;
-    switch (attr) {
-      case cudaDevP2PAttrPerformanceRank: *value = 0; break;
-      case cudaDevP2PAttrAccessSupported: *value = 1; break;
-      case cudaDevP2PAttrNativeAtomicSupported: *value = 1; break;
-      case cudaDevP2PAttrCudaArrayAccessSupported: *value = 0; break;
+    const bool path = peer_path(s, srcDevice, dstDevice);
+    switch (attr_value) {
+      case 1: *value = 0; break;                  // cudaDevP2PAttrPerformanceRank
+      case 2: *value = path ? 1 : 0; break;       // AccessSupported
+      case 3: *value = path ? 1 : 0; break;       // NativeAtomicSupported
+      case 4: *value = 0; break;                  // CudaArrayAccessSupported
+      case 5: *value = 0; break;                  // OnlyPartialNativeAtomicSupported (CUDA 13)
       default: return cudaErrorInvalidValue;
     }
     return cudaSuccess;
@@ -2436,9 +2447,9 @@ static cudaError_t cudaDeviceCanAccessPeer_traced(int* can, int device, int peer
     if (device < 0 || device >= s.rt->device_count() || peerDevice < 0 ||
         peerDevice >= s.rt->device_count())
       return cudaErrorInvalidDevice;
-    // Distinct virtual devices can always reach each other; a device is not
-    // its own peer (matching the runtime API contract).
-    *can = (device != peerDevice) ? 1 : 0;
+    // Devices with a peer path reach each other; a device is not its own peer (cudaSuccess and 0, as an
+    // RTX 3060 answers).
+    *can = peer_path(s, device, peerDevice) ? 1 : 0;
     return cudaSuccess;
   });
 }
@@ -2452,13 +2463,18 @@ VGPU_EXPORT cudaError_t cudaDeviceCanAccessPeer(int* can, int device, int peerDe
 // cudaErrorPeerAccessAlreadyEnabled, which frameworks deliberately tolerate,
 // and disabling what was never enabled is cudaErrorPeerAccessNotEnabled. Both
 // used to succeed unconditionally, whatever the flags, and so did disabling a
-// device that does not exist.
+// device that does not exist. Without a peer path (an RTX 3060 pair, measured) enabling is
+// cudaErrorPeerAccessUnsupported, for the device itself as well; the flags are checked first
+// (cudaErrorInvalidValue), a device that does not exist before them.
 static cudaError_t cudaDeviceEnablePeerAccess_traced(int peerDevice, unsigned int flags) {
   return guard("cudaDeviceEnablePeerAccess", [&](State& s) -> cudaError_t {
     if (peerDevice < 0 || peerDevice >= s.rt->device_count()) return cudaErrorInvalidDevice;
-    // A device is not its own peer; cudaDeviceCanAccessPeer says so.
-    if (peerDevice == t_current_device) return cudaErrorInvalidDevice;
     if (flags != 0) return cudaErrorInvalidValue;  // reserved, must be 0
+    if (peerDevice == t_current_device) {
+      // A device is not its own peer; cudaDeviceCanAccessPeer says so.
+      return s.rt->device(peerDevice).profile().cuda.peer_access ? cudaErrorInvalidDevice : cudaErrorPeerAccessUnsupported;
+    }
+    if (!peer_path(s, t_current_device, peerDevice)) return cudaErrorPeerAccessUnsupported;
     if (!s.peer_access.emplace(t_current_device, peerDevice).second)
       return cudaErrorPeerAccessAlreadyEnabled;
     return cudaSuccess;
@@ -4420,42 +4436,8 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
   return traced_call("cudaDeviceGetCacheConfig", cudaDeviceGetCacheConfig_traced, config);
 }
 
-// Shared memory banks are four bytes wide on every GPU this simulates, as the
-// driver's cuCtxSetSharedMemConfig answers: a configuration in the enumeration
-// is accepted and has no effect, and the answer stays the four-byte bank size.
-// Deprecated in 12.4, and removed with CUDA 13.
+// Removed with CUDA 13.
 #if CUDART_VERSION < 13000
-// The configuration travels as an int: a caller's out-of-range value must not
-// be loaded as the enum (UBSan), and traced_call copies its arguments on.
-static cudaError_t cudaDeviceSetSharedMemConfig_traced(int c) {
-  return c >= 0 && c <= 2 ? cudaSuccess : cudaErrorInvalidValue;
-}
-
-VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
-  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced,
-                     enum_value(config));
-}
-static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* config) {
-  if (!config) return cudaErrorInvalidValue;
-  *config = cudaSharedMemBankSizeFourByte;
-  return cudaSuccess;
-}
-
-VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
-  return traced_call("cudaDeviceGetSharedMemConfig", cudaDeviceGetSharedMemConfig_traced, config);
-}
-static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, int c) {
-  if (c < 0 || c > 2) return cudaErrorInvalidValue;
-  return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
-    return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
-  });
-}
-
-VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
-  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func,
-                     enum_value(config));
-}
-
 // The cudaThread* calls are the pre-cudaDevice* names, deprecated since CUDA
 // 4 and documented as the same operations; cudaThreadSynchronize already was.
 static cudaError_t cudaThreadExit_traced() { return cudaDeviceReset(); }
@@ -5695,9 +5677,33 @@ std::pair<void* const, HostRange>* managed_range(State& s, const void* p, size_t
   return nullptr;
 }
 
+// Whether the current device pages managed memory on demand (cudaDevAttrConcurrentManagedAccess). One
+// that does not (an RTX 3060 under WSL, measured) cannot prefetch, and refuses the advice that names a device.
+bool pages_managed_memory(State& s) {
+  return s.rt->device(t_current_device).profile().cuda.concurrent_managed_access;
+}
+
 cudaError_t advise(State& s, const void* p, size_t n, cudaMemoryAdvise kind, int device) {
+  const bool paged = pages_managed_memory(s);
+  if (!paged && device != cudaCpuDeviceId) {
+    // Refused before the range is looked at: a preferred location that is a device (cudaErrorInvalidDevice),
+    // and a device in the accessed-by list (cudaErrorInvalidDevice, or cudaErrorInvalidValue for a device
+    // that does not exist).
+    if (kind == cudaMemAdviseSetPreferredLocation) return cudaErrorInvalidDevice;
+    if (kind == cudaMemAdviseSetAccessedBy || kind == cudaMemAdviseUnsetAccessedBy)
+      return device >= 0 && device < s.rt->device_count() ? cudaErrorInvalidDevice : cudaErrorInvalidValue;
+  }
   auto* range = managed_range(s, p, n);
   if (!range) return cudaErrorInvalidValue;
+  if (!paged) {
+    // Accepted and not kept: cudaMemRangeGetAttribute reads back the defaults (0 and the invalid device id).
+    switch (kind) {
+      case cudaMemAdviseSetReadMostly: case cudaMemAdviseUnsetReadMostly:
+      case cudaMemAdviseSetPreferredLocation: case cudaMemAdviseUnsetPreferredLocation:
+      case cudaMemAdviseSetAccessedBy: case cudaMemAdviseUnsetAccessedBy: return cudaSuccess;
+      default: return cudaErrorInvalidValue;
+    }
+  }
   const bool needs_device = kind == cudaMemAdviseSetAccessedBy || kind == cudaMemAdviseUnsetAccessedBy ||
                             kind == cudaMemAdviseSetPreferredLocation ||
                             kind == cudaMemAdviseUnsetPreferredLocation;
@@ -5723,6 +5729,8 @@ cudaError_t prefetch(State& s, const void* p, size_t n, int device) {
   if (!range) return cudaErrorInvalidValue;
   if (device != cudaCpuDeviceId && (device < 0 || device >= s.rt->device_count()))
     return cudaErrorInvalidDevice;
+  // A device that does not page managed memory on demand cannot prefetch, to a device or to the host.
+  if (!pages_managed_memory(s)) return cudaErrorInvalidDevice;
   const auto begin = reinterpret_cast<uint64_t>(p);
   s.managed_advice[range->first].last_prefetch.set(begin, begin + n, device);
   return cudaSuccess;
@@ -5784,8 +5792,9 @@ cudaError_t range_attribute(State& s, void* data, size_t data_size, cudaMemRange
 
 #if CUDART_VERSION >= 13000
 static cudaError_t cudaMemPrefetchAsync_body(const void* p, size_t n, struct cudaMemLocation loc,
-                                             unsigned int, cudaStream_t) {
+                                             unsigned int flags, cudaStream_t) {
   return guard("cudaMemPrefetchAsync", [&](State& s) -> cudaError_t {
+    if (flags != 0) return cudaErrorInvalidValue;   // reserved, must be 0 (an RTX 3060 refuses others)
     if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
       return cudaErrorInvalidValue;
     return prefetch(s, p, n, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
@@ -5830,9 +5839,9 @@ VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise 
 // for a location -- a host location, a NUMA node -- calls these.
 #if CUDART_VERSION >= 12020 && CUDART_VERSION < 13000
 static cudaError_t cudaMemPrefetchAsync_v2_traced(const void* p, size_t n, struct cudaMemLocation loc, unsigned int flags, cudaStream_t stream) {
-  (void)flags;   // reserved, as the documentation says
   (void)stream;
   return guard("cudaMemPrefetchAsync_v2", [&](State& s) -> cudaError_t {
+    if (flags != 0) return cudaErrorInvalidValue;   // reserved, must be 0
     if (loc.type != cudaMemLocationTypeDevice && loc.type != cudaMemLocationTypeHost)
       return cudaErrorInvalidValue;
     return prefetch(s, p, n, loc.type == cudaMemLocationTypeHost ? cudaCpuDeviceId : loc.id);
@@ -11277,6 +11286,9 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCap
   return traced_call("cudaStreamIsCapturing", cudaStreamIsCapturing_traced, stream, status);
 }
 
+// The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
+#include "runtime_sweep.inc"
+
 /* ===================================================================== */
 /* Per-thread default stream                                             */
 /* ===================================================================== */
@@ -11352,8 +11364,23 @@ VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
 VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
 VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
 VGPU_PT_ALIAS(cudaGraphInstantiateWithParams_ptsz, cudaGraphInstantiateWithParams)
+VGPU_PT_ALIAS(cudaGetDriverEntryPointByVersion_ptsz, cudaGetDriverEntryPointByVersion)
+VGPU_PT_ALIAS(cudaGetDriverEntryPoint_ptsz, cudaGetDriverEntryPoint)
+VGPU_PT_ALIAS(cudaSignalExternalSemaphoresAsync_ptsz, cudaSignalExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_ptsz, cudaStreamGetCaptureInfo)
+VGPU_PT_ALIAS(cudaStreamGetDevice_ptsz, cudaStreamGetDevice)
+VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_ptsz, cudaWaitExternalSemaphoresAsync)
 #if CUDART_VERSION >= 12030
 VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
+#endif
+#if CUDART_VERSION >= 12080
+VGPU_PT_ALIAS(cudaMemcpyBatchAsync_ptsz, cudaMemcpyBatchAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DBatchAsync_ptsz, cudaMemcpy3DBatchAsync)
+#endif
+#if CUDART_VERSION >= 13000
+VGPU_PT_ALIAS(cudaMemPrefetchBatchAsync_ptsz, cudaMemPrefetchBatchAsync)
+VGPU_PT_ALIAS(cudaMemDiscardBatchAsync_ptsz, cudaMemDiscardBatchAsync)
+VGPU_PT_ALIAS(cudaMemDiscardAndPrefetchBatchAsync_ptsz, cudaMemDiscardAndPrefetchBatchAsync)
 #endif
 #undef VGPU_PT_ALIAS
 #if defined(__GNUC__) && !defined(__clang__)

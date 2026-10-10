@@ -77,7 +77,8 @@ if grep -q cudnn_dlhandle "$src"; then
 fi
 status=0
 # VGPU_E2E_GPU picks another profile (the FP8 and block-scaled checks need a GPU that has them).
-result="$(VGPU_GPU="${VGPU_E2E_GPU:-nvidia/a100}" VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || status=$?
+# VGPU_E2E_ARGS is the program's command line (nvshmem_host peerless).
+result="$(VGPU_GPU="${VGPU_E2E_GPU:-nvidia/a100}" VGPU_E2E_DATA="$root/nvidia/tests/data" LD_LIBRARY_PATH="$shim" "$out" ${VGPU_E2E_ARGS:-} 2>&1)" || status=$?
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
 # A program that tests the error paths on purpose (invalid arguments, a kernel that must fault) gets the
 # library's "VirtualGPU error [...]" lines on stderr: it says VGPU_E2E_EXPECTS_REFUSALS in its source, and

@@ -1028,7 +1028,7 @@ VTEST(vmm_refuses_what_a_device_would) {
   MemoryManager mm(4 << 20);
   const uint64_t g = MemoryManager::kVmmGranularity;
   VCHECK(VCAPTURE(Error, mm.reserve(g + 1, 0)).code() == Err::InvalidValue);        // size
-  VCHECK(VCAPTURE(Error, mm.reserve(g, g / 2)).code() == Err::InvalidValue);        // alignment
+  VCHECK(VCAPTURE(Error, mm.reserve(g, 3 * g / 2)).code() == Err::InvalidValue);    // alignment: not a power of two
   VCHECK(VCAPTURE(Error, mm.create_handle(g - 1)).code() == Err::InvalidValue);
   VCHECK(VCAPTURE(Error, mm.create_handle(64 << 20)).code() == Err::OutOfMemory);   // past capacity
   uint64_t va = mm.reserve(2 * g, 0), h = mm.create_handle(g);
@@ -1052,6 +1052,42 @@ VTEST(vmm_refuses_what_a_device_would) {
   mm.release_handle(h);
   mm.address_free(va, 2 * g);
   VCHECK_EQ(mm.reservations(), size_t{0});
+}
+
+VTEST(the_granularity_is_two_mib_and_a_smaller_alignment_is_raised_to_it) {
+  MemoryManager mm(16 << 20);
+  VCHECK_EQ(MemoryManager::kVmmGranularity, uint64_t{2} << 20);   // what an RTX 3060 reports, minimum and recommended
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  // An alignment below the granule is accepted and every reservation is aligned to a granule at least, as on the
+  // card; a power of two above it is honoured; one that is not a power of two is refused.
+  for (uint64_t alignment : {uint64_t{0}, uint64_t{4096}, uint64_t{64} << 10, g, 2 * g, uint64_t{1} << 30}) {
+    const uint64_t va = mm.reserve(g, alignment);
+    VCHECK_EQ(va % g, uint64_t{0});
+    if (alignment > g) VCHECK_EQ(va % alignment, uint64_t{0});
+    mm.address_free(va, g);
+  }
+  VCHECK(VCAPTURE(Error, mm.reserve(g, 5)).code() == Err::InvalidValue);
+  VCHECK(VCAPTURE(Error, mm.reserve(g, 3 * g)).code() == Err::InvalidValue);
+  VCHECK(VCAPTURE(Error, mm.reserve(64 << 10, 0)).code() == Err::InvalidValue);     // smaller than a granule
+  VCHECK(VCAPTURE(Error, mm.create_handle(64 << 10)).code() == Err::InvalidValue);
+  VCHECK(VCAPTURE(Error, mm.create_handle(g + 1)).code() == Err::InvalidValue);
+}
+
+VTEST(a_range_is_mapped_when_any_part_of_it_is) {
+  MemoryManager mm(16 << 20);
+  const uint64_t g = MemoryManager::kVmmGranularity;
+  const uint64_t va = mm.reserve(4 * g, 0), h = mm.create_handle(g);
+  VCHECK(!mm.range_mapped(va, 4 * g));
+  mm.map(va + g, g, 0, h);
+  VCHECK(mm.range_mapped(va, 4 * g));
+  VCHECK(mm.range_mapped(va + g, g));
+  VCHECK(mm.range_mapped(va + g + g / 2, 1));     // inside the mapping
+  VCHECK(!mm.range_mapped(va, g));                // before it
+  VCHECK(!mm.range_mapped(va + 2 * g, 2 * g));    // after it
+  mm.unmap(va + g, g);
+  VCHECK(!mm.range_mapped(va, 4 * g));
+  mm.release_handle(h);
+  mm.address_free(va, 4 * g);
 }
 
 VTEST(vmm_unmaps_a_run_of_whole_mappings_in_one_call) {

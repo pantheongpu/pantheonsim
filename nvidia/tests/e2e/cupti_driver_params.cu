@@ -382,9 +382,8 @@ int main() {
     ap.location.id = 0;
     size_t reported = 0;
     CALL(cuMemGetAllocationGranularity(&reported, &ap, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-    // The card's minimum is 2 MiB (this simulator reports a smaller unit); a
-    // size that is a multiple of both is what the calls are made with.
-    const size_t gran = 2u << 20;
+    // The card's minimum is 2 MiB, and this simulator reports the same; the calls are made with it.
+    const size_t gran = reported ? reported : (size_t{2} << 20);
     CUdeviceptr va = 0;
     CUmemGenericAllocationHandle h = 0;
     CALL(cuMemAddressReserve(&va, gran, 0, 0, 0));

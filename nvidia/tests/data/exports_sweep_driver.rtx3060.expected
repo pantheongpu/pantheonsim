@@ -1,0 +1,249 @@
+cuDeviceGetLuid null luid: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetLuid bad dev: CUDA_ERROR_INVALID_DEVICE
+cuDeviceGetTexture1DLinearMaxWidth float: CUDA_SUCCESS -- w=1073741824
+cuDeviceGetTexture1DLinearMaxWidth uint8 x4: CUDA_SUCCESS -- w=1073741824
+cuDeviceGetTexture1DLinearMaxWidth float x3: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetTexture1DLinearMaxWidth bad format: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetTexture1DLinearMaxWidth bad dev: CUDA_ERROR_INVALID_DEVICE
+cuDeviceGetTexture1DLinearMaxWidth null: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetHostAtomicCapabilities [13]: CUDA_SUCCESS -- 0 0 0
+cuDeviceGetHostAtomicCapabilities null [13]: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetHostAtomicCapabilities count 0 [13]: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetHostAtomicCapabilities bad op [13]: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetHostAtomicCapabilities bad dev [13]: CUDA_ERROR_INVALID_DEVICE
+cuDeviceGetP2PAtomicCapabilities 0->1 [13]: CUDA_SUCCESS -- 0
+cuDeviceGetP2PAtomicCapabilities 0->0 [13]: CUDA_ERROR_INVALID_DEVICE
+cuDeviceGetP2PAtomicCapabilities 0->9 [13]: CUDA_ERROR_INVALID_DEVICE
+cuDeviceGetNvSciSyncAttributes: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetNvSciSyncAttributes null: CUDA_ERROR_INVALID_HANDLE
+cuDeviceGetNvSciSyncAttributes bad dev: CUDA_ERROR_INVALID_DEVICE
+cuFlushGPUDirectRDMAWrites: CUDA_ERROR_NOT_SUPPORTED
+cuFlushGPUDirectRDMAWrites bad target: CUDA_ERROR_INVALID_VALUE
+cuFlushGPUDirectRDMAWrites bad scope: CUDA_ERROR_INVALID_VALUE
+cuCtxGetDevice_v2 [13]: CUDA_SUCCESS -- d=0
+cuCtxGetDevice_v2 null ctx [13]: CUDA_SUCCESS -- d=0
+cuCtxGetDevice_v2 null out [13]: CUDA_ERROR_INVALID_VALUE
+cuCtxSynchronize_v2 [13]: CUDA_SUCCESS
+cuCtxSynchronize_v2 null ctx [13]: CUDA_SUCCESS
+cuCtxResetPersistingL2Cache: CUDA_SUCCESS
+cuCtxRecordEvent [12.8]: CUDA_SUCCESS
+cuCtxRecordEvent null ctx [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuCtxRecordEvent null event [12.8]: CUDA_ERROR_INVALID_HANDLE
+cuCtxWaitEvent [12.8]: CUDA_SUCCESS
+cuCtxWaitEvent unrecorded [12.8]: CUDA_SUCCESS
+cuCtxWaitEvent null event [12.8]: CUDA_ERROR_INVALID_HANDLE
+cuModuleGetFunctionCount [12.8]: CUDA_SUCCESS -- n=3
+cuModuleGetFunctionCount null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuModuleGetFunctionCount null mod [12.8]: CUDA_ERROR_INVALID_VALUE
+cuModuleEnumerateFunctions [12.8]: CUDA_SUCCESS -- 1 1 1
+cuModuleEnumerateFunctions more than exist [12.8]: CUDA_SUCCESS
+cuModuleEnumerateFunctions 0 [12.8]: CUDA_SUCCESS
+cuModuleEnumerateFunctions null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuModuleEnumerateFunctions null mod [12.8]: CUDA_ERROR_INVALID_VALUE
+cuLibraryLoadFromFile: CUDA_SUCCESS -- l=1
+cuLibraryLoadFromFile missing: CUDA_ERROR_FILE_NOT_FOUND
+cuLibraryLoadFromFile null path: CUDA_ERROR_INVALID_VALUE
+cuLibraryLoadFromFile null out: CUDA_ERROR_INVALID_VALUE
+cuLibraryLoadFromFile not an image: CUDA_SUCCESS
+cuLibraryGetKernelCount [12.8]: CUDA_SUCCESS -- n=3
+cuLibraryGetKernelCount null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuLibraryGetKernelCount null lib [12.8]: CUDA_ERROR_INVALID_HANDLE
+cuLibraryEnumerateKernels [12.8]: CUDA_SUCCESS -- 1 1 1
+cuLibraryEnumerateKernels 8 [12.8]: CUDA_SUCCESS
+cuLibraryEnumerateKernels 0 [12.8]: CUDA_SUCCESS
+cuLibraryEnumerateKernels null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuLibraryEnumerateKernels null lib [12.8]: CUDA_ERROR_INVALID_HANDLE
+cuKernelGetLibrary [12.8]: CUDA_SUCCESS -- l=1
+cuKernelGetLibrary null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuKernelGetLibrary null kernel [12.8]: CUDA_ERROR_INVALID_HANDLE
+cuLibraryGetGlobal: CUDA_SUCCESS -- n=32 p=1
+cuLibraryGetGlobal missing: CUDA_ERROR_NOT_FOUND
+cuLibraryGetGlobal null name: CUDA_ERROR_INVALID_VALUE
+cuLibraryGetGlobal null lib: CUDA_ERROR_INVALID_HANDLE
+cuLibraryGetGlobal null both outs: CUDA_ERROR_INVALID_VALUE
+cuLibraryGetGlobal a kernel: CUDA_ERROR_INVALID_VALUE
+cuLibraryGetManaged: CUDA_SUCCESS -- n=4 p=1
+cuLibraryGetManaged not managed: CUDA_ERROR_NOT_FOUND
+cuLibraryGetManaged missing: CUDA_ERROR_NOT_FOUND
+cuLibraryGetUnifiedFunction: CUDA_ERROR_INVALID_VALUE
+cuLibraryGetUnifiedFunction null lib: CUDA_ERROR_INVALID_HANDLE
+cuKernelSetCacheConfig: CUDA_SUCCESS
+cuKernelSetCacheConfig bad config: CUDA_ERROR_INVALID_VALUE
+cuKernelSetCacheConfig null kernel: CUDA_ERROR_INVALID_HANDLE
+cuKernelSetCacheConfig bad dev: CUDA_ERROR_INVALID_DEVICE
+cuKernelSetCacheConfig current dev (-1?): CUDA_ERROR_INVALID_DEVICE
+cuKernelGetParamInfo [12.8]: CUDA_SUCCESS -- off=0 sz=8
+cuKernelGetParamInfo past end [12.8]: CUDA_ERROR_INVALID_VALUE
+cuKernelGetParamInfo null off [12.8]: CUDA_ERROR_INVALID_VALUE
+cuKernelGetParamInfo null size [12.8]: CUDA_SUCCESS
+cuKernelGetParamInfo null kernel [12.8]: CUDA_ERROR_INVALID_VALUE
+cuFuncGetModule: CUDA_SUCCESS -- m=1
+cuFuncGetModule null: CUDA_ERROR_INVALID_VALUE
+cuFuncGetModule null func: CUDA_ERROR_INVALID_VALUE
+cuFuncGetName [12.8]: CUDA_SUCCESS -- k1
+cuFuncGetName null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuFuncGetName null func [12.8]: CUDA_ERROR_INVALID_VALUE
+cuFuncGetParamInfo [12.8]: CUDA_SUCCESS -- off=0 sz=8
+cuFuncGetParamInfo past end [12.8]: CUDA_ERROR_INVALID_VALUE
+cuFuncGetParamInfo null func [12.8]: CUDA_ERROR_INVALID_VALUE
+cuOccupancyAvailableDynamicSMemPerBlock: CUDA_SUCCESS -- 24576
+cuOccupancyAvailableDynamicSMemPerBlock too many blocks: CUDA_ERROR_INVALID_VALUE
+cuOccupancyAvailableDynamicSMemPerBlock 0 blocks: CUDA_ERROR_INVALID_VALUE
+cuOccupancyAvailableDynamicSMemPerBlock null: CUDA_ERROR_INVALID_VALUE
+cuOccupancyAvailableDynamicSMemPerBlock null func: CUDA_ERROR_INVALID_HANDLE
+cuDeviceRegisterAsyncNotification [12.8]: CUDA_SUCCESS -- h=1; unregister CUDA_SUCCESS
+cuDeviceRegisterAsyncNotification null cb [12.8]: CUDA_ERROR_INVALID_VALUE
+cuDeviceRegisterAsyncNotification bad dev [12.8]: CUDA_ERROR_INVALID_DEVICE
+cuDeviceUnregisterAsyncNotification null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DPeer: CUDA_SUCCESS
+cuMemcpyBatchAsync_v2 count 0 [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpyBatchAsync_v2 null [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpyBatchAsync_v2 bad order [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DBatchAsync_v2 count 0 [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DBatchAsync_v2 null [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DBatchAsync_v2 flags [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DBatchAsync_v2 zero extent [13]: CUDA_ERROR_INVALID_VALUE
+cuArrayGetMemoryRequirements: CUDA_ERROR_INVALID_VALUE
+cuArrayGetMemoryRequirements null: CUDA_ERROR_INVALID_VALUE
+cuArrayGetMemoryRequirements null array: CUDA_ERROR_INVALID_HANDLE
+cuMipmappedArrayGetMemoryRequirements: CUDA_ERROR_INVALID_VALUE
+cuMipmappedArrayGetMemoryRequirements null: CUDA_ERROR_INVALID_HANDLE
+cuArrayGetSparseProperties: CUDA_ERROR_INVALID_VALUE
+cuArrayGetSparseProperties null array: CUDA_ERROR_INVALID_HANDLE
+cuMipmappedArrayGetSparseProperties: CUDA_ERROR_INVALID_VALUE
+cuMipmappedArrayGetSparseProperties null: CUDA_ERROR_INVALID_HANDLE
+cuArrayGetPlane: CUDA_ERROR_INVALID_VALUE
+cuArrayGetPlane null array: CUDA_ERROR_INVALID_HANDLE
+cuArrayGetPlane null out: CUDA_ERROR_INVALID_VALUE
+cuMemGetHandleForAddressRange: CUDA_ERROR_NOT_SUPPORTED
+cuMemGetHandleForAddressRange null: CUDA_ERROR_INVALID_VALUE
+cuMemGetHandleForAddressRange bad type: CUDA_ERROR_NOT_SUPPORTED
+cuMemBatchDecompressAsync [12.8]: CUDA_ERROR_NOT_SUPPORTED -- ei=77
+cuMemBatchDecompressAsync count 0 [12.8]: CUDA_ERROR_NOT_SUPPORTED
+cuMemMapArrayAsync: CUDA_ERROR_INVALID_VALUE
+cuMemMapArrayAsync count 0: CUDA_ERROR_INVALID_VALUE
+cuMemMapArrayAsync null: CUDA_ERROR_INVALID_VALUE
+cuMemGetDefaultMemPool [13]: CUDA_SUCCESS -- p=1
+cuMemGetDefaultMemPool invalid type [13]: CUDA_ERROR_INVALID_VALUE
+cuMemGetDefaultMemPool managed [13]: CUDA_ERROR_NOT_SUPPORTED
+cuMemGetDefaultMemPool bad dev [13]: CUDA_ERROR_INVALID_VALUE
+cuMemGetDefaultMemPool null [13]: CUDA_ERROR_INVALID_VALUE
+cuMemGetDefaultMemPool null loc [13]: CUDA_ERROR_INVALID_VALUE
+cuMemGetMemPool [13]: CUDA_SUCCESS -- same as default 1
+cuMemSetMemPool [13]: CUDA_SUCCESS -- now mine 1
+cuMemSetMemPool null pool [13]: CUDA_ERROR_INVALID_VALUE
+cuMemPrefetchBatchAsync [13]: CUDA_ERROR_INVALID_VALUE
+cuMemDiscardBatchAsync [13]: CUDA_ERROR_INVALID_VALUE
+cuMemDiscardAndPrefetchBatchAsync [13]: CUDA_ERROR_INVALID_VALUE
+cuMemRangeGetAttribute readmostly: CUDA_SUCCESS -- v=0
+cuMemRangeGetAttribute preferred: CUDA_SUCCESS -- v=-2
+cuMemRangeGetAttribute last prefetch: CUDA_SUCCESS -- v=-2
+cuMemRangeGetAttribute accessedby: CUDA_SUCCESS -- v=-2 -2
+cuMemRangeGetAttribute bad size: CUDA_ERROR_INVALID_VALUE
+cuMemRangeGetAttribute not managed: CUDA_ERROR_INVALID_VALUE
+cuMemRangeGetAttribute bad attr: CUDA_ERROR_INVALID_VALUE
+cuMemRangeGetAttribute null: CUDA_ERROR_INVALID_VALUE
+cuMemRangeGetAttributes: CUDA_SUCCESS -- 0 -2
+cuMemRangeGetAttributes count 0: CUDA_ERROR_INVALID_VALUE
+cuMemRangeGetAttributes null: CUDA_ERROR_INVALID_VALUE
+cuStreamGetDevice [12.8]: CUDA_SUCCESS -- d=0 (dev 0)
+cuStreamGetDevice null stream [12.8]: CUDA_SUCCESS -- d=0
+cuStreamGetDevice null out [12.8]: CUDA_ERROR_INVALID_VALUE
+cuStreamGetId: CUDA_SUCCESS -- id>0 1
+cuStreamGetId null stream: CUDA_SUCCESS -- id set 1
+cuStreamGetId null out: CUDA_ERROR_INVALID_VALUE
+cuStreamCopyAttributes: CUDA_SUCCESS
+cuStreamCopyAttributes null dst: CUDA_SUCCESS
+cuStreamCopyAttributes null src: CUDA_SUCCESS
+cuStreamGetAttribute sync policy: CUDA_SUCCESS -- v=-1
+cuStreamGetAttribute priority: CUDA_SUCCESS -- v=0
+cuStreamGetAttribute access policy window: CUDA_SUCCESS -- num_bytes=0 hit=0.0
+cuStreamGetAttribute bad attr: CUDA_ERROR_INVALID_VALUE
+cuStreamSetAttribute sync policy: CUDA_SUCCESS -- now 2
+cuStreamSetAttribute priority: CUDA_SUCCESS
+cuStreamSetAttribute access policy window: CUDA_SUCCESS
+cuStreamSetAttribute bad attr: CUDA_ERROR_INVALID_VALUE
+cuImportExternalMemory fd: CUDA_ERROR_NOT_SUPPORTED
+cuImportExternalMemory null desc: CUDA_ERROR_INVALID_VALUE
+cuImportExternalMemory null out: CUDA_ERROR_INVALID_VALUE
+cuImportExternalMemory bad type: CUDA_ERROR_INVALID_VALUE
+cuImportExternalMemory win32 type: CUDA_ERROR_INVALID_VALUE
+cuExternalMemoryGetMappedBuffer null: CUDA_ERROR_INVALID_VALUE
+cuExternalMemoryGetMappedMipmappedArray null: CUDA_ERROR_INVALID_VALUE
+cuDestroyExternalMemory null: CUDA_ERROR_INVALID_VALUE
+cuImportExternalSemaphore fd: CUDA_ERROR_NOT_SUPPORTED
+cuImportExternalSemaphore null: CUDA_ERROR_INVALID_VALUE
+cuSignalExternalSemaphoresAsync null: CUDA_ERROR_INVALID_VALUE
+cuWaitExternalSemaphoresAsync null: CUDA_ERROR_INVALID_VALUE
+cuWaitExternalSemaphoresAsync count 0: CUDA_ERROR_INVALID_VALUE
+cuDestroyExternalSemaphore null: CUDA_ERROR_INVALID_VALUE
+cuGraphExternalSemaphoresSignalNodeGetParams null node: CUDA_ERROR_INVALID_VALUE
+cuGraphExternalSemaphoresSignalNodeSetParams null node: CUDA_ERROR_INVALID_VALUE
+cuGraphExternalSemaphoresWaitNodeGetParams null node: CUDA_ERROR_INVALID_VALUE
+cuGraphExternalSemaphoresWaitNodeSetParams null node: CUDA_ERROR_INVALID_VALUE
+cuGraphExecExternalSemaphoresSignalNodeSetParams null: CUDA_ERROR_INVALID_VALUE
+cuGraphExecExternalSemaphoresWaitNodeSetParams null: CUDA_ERROR_INVALID_VALUE
+cuGraphConditionalHandleCreate bad flags [12.8]: CUDA_ERROR_INVALID_VALUE
+cuGraphConditionalHandleCreate null graph [12.8]: CUDA_ERROR_INVALID_VALUE
+cuGraphConditionalHandleCreate null out [12.8]: CUDA_ERROR_INVALID_VALUE
+cuGraphConditionalHandleCreate null ctx [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuLaunchCooperativeKernelMultiDevice: CUDA_ERROR_INVALID_HANDLE
+cuLaunchCooperativeKernelMultiDevice count 0: CUDA_ERROR_INVALID_VALUE
+cuLaunchCooperativeKernelMultiDevice null: CUDA_ERROR_INVALID_VALUE
+cuCoredumpGetAttribute enable [12.8]: CUDA_ERROR_INVALID_VALUE -- v=-9 sz=4
+cuCoredumpGetAttribute trigger host [12.8]: CUDA_ERROR_INVALID_VALUE -- v=-9 sz=4
+cuCoredumpGetAttribute lightweight [12.8]: CUDA_ERROR_INVALID_VALUE -- v=-9 sz=4
+cuCoredumpGetAttribute pipe [12.8]: CUDA_ERROR_INVALID_VALUE -- '' sz=256
+cuCoredumpGetAttribute file [12.8]: CUDA_SUCCESS -- '' sz=512
+cuCoredumpGetAttribute bad attr [12.8]: CUDA_ERROR_INVALID_VALUE
+cuCoredumpGetAttribute null [12.8]: CUDA_SUCCESS
+cuCoredumpSetAttributeGlobal after init [12.8]: CUDA_ERROR_INVALID_VALUE
+cuCoredumpSetAttribute file [12.8]: CUDA_SUCCESS
+cuCoredumpSetAttribute bad attr [12.8]: CUDA_ERROR_INVALID_VALUE
+cuDeviceGetDevResource bad type [12.8]: CUDA_ERROR_INVALID_RESOURCE_TYPE
+cuDeviceGetDevResource bad dev [12.8]: CUDA_ERROR_INVALID_DEVICE
+cuGreenCtxDestroy null [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuCtxFromGreenCtx null [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuGreenCtxGetDevResource null [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuGreenCtxRecordEvent null [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuGreenCtxWaitEvent null [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuGreenCtxStreamCreate null [12.8]: CUDA_ERROR_INVALID_CONTEXT
+cuGreenCtxGetId null [13]: CUDA_ERROR_INVALID_CONTEXT
+cuLogsCurrent [13]: CUDA_SUCCESS -- it=0
+cuLogsCurrent null [13]: CUDA_ERROR_INVALID_VALUE
+cuLogsDumpToMemory [13]: CUDA_SUCCESS -- sz=0
+cuLogsDumpToMemory null buf [13]: CUDA_ERROR_INVALID_VALUE
+cuLogsDumpToFile [13]: CUDA_SUCCESS
+cuLogsDumpToFile null path [13]: CUDA_ERROR_INVALID_VALUE
+cuLogsRegisterCallback [13]: CUDA_SUCCESS -- h!=0 1; unregister CUDA_SUCCESS
+cuLogsRegisterCallback null cb [13]: CUDA_ERROR_INVALID_VALUE
+cuLogsUnregisterCallback null [13]: CUDA_ERROR_INVALID_VALUE
+cuCheckpointProcessGetState self [12.8]: CUDA_SUCCESS -- st=0
+cuCheckpointProcessGetState null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuCheckpointProcessGetState bad pid [12.8]: CUDA_ERROR_OPERATING_SYSTEM
+cuCheckpointProcessGetRestoreThreadId [12.8]: CUDA_SUCCESS -- tid set 1
+cuCheckpointProcessLock [12.8]: CUDA_ERROR_NOT_SUPPORTED
+cuCheckpointProcessCheckpoint [12.8]: CUDA_ERROR_ILLEGAL_STATE
+cuCheckpointProcessRestore [12.8]: CUDA_ERROR_ILLEGAL_STATE
+cuCheckpointProcessUnlock [12.8]: CUDA_ERROR_ILLEGAL_STATE
+cuTensorMapEncodeIm2colWide [12.8]: CUDA_ERROR_NOT_SUPPORTED
+cuTensorMapEncodeIm2colWide null [12.8]: CUDA_ERROR_INVALID_VALUE
+cuTexObjectGetResourceDesc: CUDA_SUCCESS -- type=2 size=4096
+cuTexObjectGetTextureDesc: CUDA_SUCCESS -- filter=1 flags=1
+cuTexObjectGetResourceViewDesc: CUDA_SUCCESS -- fmt=0
+cuTexObjectGetResourceDesc bad: CUDA_ERROR_INVALID_VALUE
+cuTexObjectGetResourceDesc null: CUDA_ERROR_INVALID_VALUE
+cuSurfObjectGetResourceDesc: CUDA_SUCCESS -- create CUDA_SUCCESS; type=0
+cuSurfObjectGetResourceDesc bad: CUDA_ERROR_INVALID_VALUE
+cuTexRefSetMipmappedArray: CUDA_SUCCESS
+cuTexRefGetMipmappedArray unset: CUDA_ERROR_INVALID_VALUE -- m=0x77
+cuTexRefSetMipmapFilterMode: CUDA_SUCCESS -- get CUDA_SUCCESS 1
+cuTexRefSetMipmapFilterMode bad: CUDA_ERROR_INVALID_VALUE
+cuTexRefSetMipmapLevelBias: CUDA_SUCCESS -- get CUDA_SUCCESS 1.50
+cuTexRefSetMipmapLevelClamp: CUDA_SUCCESS -- get CUDA_SUCCESS 1.00 3.00
+cuTexRefSetMaxAnisotropy: CUDA_SUCCESS -- get CUDA_SUCCESS 8
+cuTexRefGetMaxAnisotropy default: CUDA_SUCCESS -- 0
+cuTexRefSetBorderColor: CUDA_SUCCESS -- get CUDA_SUCCESS 1.00 0.50 0.25 0.00
+cuTexRefGetBorderColor default: CUDA_SUCCESS -- 0.00 0.00 0.00 0.00
+cuTexRefSetMaxAnisotropy null ref: CUDA_ERROR_INVALID_HANDLE
+PASS: 248 cases

@@ -57,6 +57,25 @@ The memory column is NVIDIA's "GB", which for these boards is binary (an A100
 40 GB reports 40960 MiB). A real card shows a little less in `nvidia-smi`
 because the driver keeps some, so each figure is an upper bound until measured.
 
+## Peer access and managed memory (`cuda: peer_access`, `concurrent_managed_access`)
+
+Two facts about a board that the other profile fields do not say, both `true` unless a profile says `false`:
+
+* `peer_access`: two devices of this profile can reach each other's memory (NVLink or a PCIe peer path).
+  `cudaDeviceCanAccessPeer`, `cudaDeviceGetP2PAttribute`, `cuDeviceGetP2PAttribute` and NVML's
+  `nvmlDeviceGetP2PStatus` answer from it, `cudaDeviceEnablePeerAccess` and `cuCtxEnablePeerAccess` are
+  `cudaErrorPeerAccessUnsupported` without it, and NVSHMEM starts no job whose PEs sit on such devices
+  ("Peer GPU 1 is not accessible"). A copy between the two devices still works, through the host.
+* `concurrent_managed_access`: `cudaDevAttrConcurrentManagedAccess`. Without it `cudaMemPrefetchAsync` is
+  `cudaErrorInvalidDevice` and so is the advice that names a device; the other advice is accepted and forgotten.
+
+`nvidia/rtx3060` says `false` for both: measured on the pair of RTX 3060s this was developed on (driver 13.0, WSL2;
+`nvidia/tests/data/p2p_managed.rtx3060.expected`, from `run_p2p_managed.sh --card`). The `false` of
+`concurrent_managed_access` is WSL's: a native Linux GeForce card answers 1 (the RTX 3080 Ti of
+`managed_paths.cpp` does, and its profile keeps the default). The `false` of `peer_access` is the pair's, and it is
+not known whether a GeForce pair under native Linux answers the same; no other GeForce profile says `false`
+because none was measured (the RTX 3080 Ti is a single card on its machine).
+
 ## GPC layout
 
 A profile may carry a `layout:` section (`gpcs`, `tpcs`, `sms_per_tpc`): the GPC and TPC counts NVIDIA's

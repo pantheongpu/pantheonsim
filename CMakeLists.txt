@@ -1827,6 +1827,12 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_exports PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# The structures the driver shim declares for itself are cuda.h's (compile-time checks only).
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_abi_sweep nvidia/tests/unit/test_driver_abi_sweep.cpp)
+  target_include_directories(test_driver_abi_sweep PRIVATE nvidia/src ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_driver_abi_sweep COMMAND test_driver_abi_sweep)
+endif()
 # cuPointerGetAttribute / cuPointerGetAttributes / cuPointerSetAttribute.
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_pointer_attrs nvidia/tests/unit/test_driver_pointer_attrs.cpp)
@@ -1987,6 +1993,18 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # Two PEs on two devices that have no peer path (the rtx3060 profile, as the card's pair): NVSHMEM refuses the
+  # job, as NVIDIA's does ("Peer GPU 1 is not accessible").
+  if(TARGET vgpunvshmem)
+    add_test(NAME e2e_nvshmem_peerless
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh nvshmem_host nvshmem_host)
+    set_tests_properties(e2e_nvshmem_peerless PROPERTIES
+      DEPENDS vgpunvshmem
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_GPU=nvidia/rtx3060;VGPU_E2E_ARGS=peerless;VGPU_DEVICE_COUNT=2"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
+
   # Driver and runtime entry points CUDA's samples reach for, checked against
   # what an RTX 3060 answers (driver_gaps.cpp, runtime_gaps.cu), and
   # __managed__ variables (managed_vars.cu). On two devices, so that peer
@@ -2146,6 +2164,44 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  add_test(NAME e2e_bsync_recursive_abi
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_recursive_abi.sh)
+  set_tests_properties(e2e_bsync_recursive_abi PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # The virtual memory API's granularity (2 MiB, as an RTX 3060 answers) and what each call does with a size, offset
+  # or alignment that is not a multiple of it; peer access and managed memory on a pair of devices (a GeForce
+  # pair has no peer path and no concurrent managed access). Both against what the card printed.
+  if(TARGET vgpucuda)
+    add_test(NAME e2e_vmm_granularity
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_vmm_granularity.sh)
+    set_tests_properties(e2e_vmm_granularity PROPERTIES
+      DEPENDS vgpucuda
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+    # The functions the toolkit declares that the shims once lacked, called with the cases an RTX 3060 was
+    # measured on (nvidia/tests/data/exports_sweep_*.rtx3060.expected).
+    foreach(which runtime driver)
+      add_test(NAME e2e_exports_sweep_${which}
+               COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_exports_sweep.sh ${which})
+      set_tests_properties(e2e_exports_sweep_${which} PROPERTIES
+        DEPENDS "vgpucudart;vgpucuda"
+        ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+        SKIP_REGULAR_EXPRESSION "^SKIP:"
+        TIMEOUT 600)
+    endforeach()
+    add_test(NAME e2e_p2p_managed
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_p2p_managed.sh)
+    set_tests_properties(e2e_p2p_managed PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
+  endif()
 
   add_test(NAME e2e_device_functions
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_functions.sh)
@@ -2718,6 +2774,12 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_driver_arg_sizes.py
                    ${CUDA_ABI_INCLUDE})
   set_tests_properties(lint_driver_arg_sizes PROPERTIES SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # Every function cuda_runtime_api.h and cuda.h declare is a name the built shims export.
+  add_test(NAME lint_header_exports
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_header_exports.py ${CUDA_ABI_INCLUDE})
+  set_tests_properties(lint_header_exports PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES

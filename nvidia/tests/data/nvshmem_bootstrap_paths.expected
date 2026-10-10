@@ -47,6 +47,7 @@ PE 1 of 2, 2 on this node
 nvshmem_malloc: memory
 read from the next PE: 100
 after finalize: status 1
+== two_gpus (exit status 255)
 == env_mpi (exit status 0)
 before init: status 0
 after init: status 3

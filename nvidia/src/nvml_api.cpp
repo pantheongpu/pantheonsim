@@ -1859,9 +1859,11 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTopologyCommonAncestor(nvmlDevice_t a, nvm
   *level = NVML_TOPOLOGY_HOSTBRIDGE;
   return NVML_SUCCESS;
 }
-// Peer reads, writes and atomics work between any two devices (cuDeviceCanAccessPeer
-// says so), over PCIe; the NVLink index is NOT_SUPPORTED because no link's remote
-// end is modelled, so no pair of devices is known to be joined by one.
+// Peer reads, writes and atomics work between two devices that have a peer path (cuDeviceCanAccessPeer
+// says so), over PCIe; the NVLink index is NOT_SUPPORTED because no link's remote end is modelled, so no pair
+// of devices is known to be joined by one. A pair without a path -- two RTX 3060s, measured with
+// `nvidia-smi topo -p2p` -- reads and writes as CHIPSET_NOT_SUPPORTED ("CNS") and answers
+// the NVLink, atomics and PCIe-property indices NOT_SUPPORTED ("NS").
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetP2PStatus(nvmlDevice_t a, nvmlDevice_t b,
                                                 nvmlGpuP2PCapsIndex_t cap,
                                                 nvmlGpuP2PStatus_t* status) {
@@ -1870,13 +1872,17 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetP2PStatus(nvmlDevice_t a, nvmlDevice_t b,
   if (!index_of(a, &ia)) return bad(a);
   if (!index_of(b, &ib)) return bad(b);
   if (!status || ia == ib) return NVML_ERROR_INVALID_ARGUMENT;
+  const bool path = g_snap.devices[ia].peer_access && g_snap.devices[ib].peer_access;
   switch (static_cast<int>(cap)) {
     case NVML_P2P_CAPS_INDEX_READ:
     case NVML_P2P_CAPS_INDEX_WRITE:
+      // 1 is NVML_P2P_STATUS_CHIPSET_NOT_SUPPORTED, which older headers spell NVML_P2P_STATUS_CHIPSET_NOT_SUPPORED.
+      *status = path ? NVML_P2P_STATUS_OK : static_cast<nvmlGpuP2PStatus_t>(1);
+      break;
     case NVML_P2P_CAPS_INDEX_ATOMICS:
     // The PCIe capability: NVML_P2P_CAPS_INDEX_PCI in current headers, NVML_P2P_CAPS_INDEX_PROP in
     // CUDA 12.0's (the same value, 4; the newer name does not exist there).
-    case 4: *status = NVML_P2P_STATUS_OK; break;
+    case 4: *status = path ? NVML_P2P_STATUS_OK : NVML_P2P_STATUS_NOT_SUPPORTED; break;
     case NVML_P2P_CAPS_INDEX_NVLINK: *status = NVML_P2P_STATUS_NOT_SUPPORTED; break;
     default: return NVML_ERROR_INVALID_ARGUMENT;
   }

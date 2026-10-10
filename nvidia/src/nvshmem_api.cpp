@@ -1030,6 +1030,15 @@ int init(unsigned flags, nvshmemx_init_attr_t* attr) {
     // PE's kernels reach it once peer access to that device is enabled.
     const int pd = s.seg->pe[pe].device;
     if (pd != s.device) {
+      // NVIDIA's NVSHMEM starts no job whose PEs sit on two GPUs that cannot reach each other: "Peer GPU 1 is not
+      // accessible", NVSHMEMX_ERROR_NOT_SUPPORTED (3) (measured on two RTX 3060s, which have no peer path; the
+      // launcher's program then ends with status 255).
+      int can = 0;
+      if (cudaDeviceCanAccessPeer(&can, s.device, pd) != cudaSuccess || !can) {
+        cudaGetLastError();
+        say("Peer GPU %d is not accessible", pd);
+        return 3;
+      }
       const cudaError_t e = cudaDeviceEnablePeerAccess(pd, 0);
       if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
         say("cannot enable peer access from device %d to device %d", s.device, pd);

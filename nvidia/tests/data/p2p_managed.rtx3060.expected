@@ -1,0 +1,103 @@
+device 0 ConcurrentManagedAccess                               cudaSuccess 0
+device 0 DirectManagedMemAccessFromHost                        cudaSuccess 0
+device 0 PageableMemoryAccess                                  cudaSuccess 0
+device 0 PageableMemoryAccessUsesHostPageTables                cudaSuccess 0
+device 0 ManagedMemory                                         cudaSuccess 1
+device 0 UnifiedAddressing                                     cudaSuccess 1
+device 1 ConcurrentManagedAccess                               cudaSuccess 0
+device 1 DirectManagedMemAccessFromHost                        cudaSuccess 0
+device 1 PageableMemoryAccess                                  cudaSuccess 0
+device 1 PageableMemoryAccessUsesHostPageTables                cudaSuccess 0
+device 1 ManagedMemory                                         cudaSuccess 1
+device 1 UnifiedAddressing                                     cudaSuccess 1
+cudaDeviceCanAccessPeer(0, 1)                                  cudaSuccess 0
+cudaDeviceCanAccessPeer(1, 0)                                  cudaSuccess 0
+cudaDeviceCanAccessPeer(0, 0)                                  cudaSuccess 0
+cudaDeviceCanAccessPeer(0, 7)                                  cudaErrorInvalidDevice -99
+cudaDeviceCanAccessPeer(-1, 0)                                 cudaErrorInvalidDevice -99
+cudaDeviceCanAccessPeer(null, 0, 1)                            cudaErrorInvalidValue
+cudaDeviceGetP2PAttribute(0, 0 -> 1)                           cudaErrorInvalidValue -99
+cudaDeviceGetP2PAttribute(0, 1 -> 0)                           cudaErrorInvalidValue -99
+cudaDeviceGetP2PAttribute(1, 0 -> 1)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(1, 1 -> 0)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(2, 0 -> 1)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(2, 1 -> 0)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(3, 0 -> 1)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(3, 1 -> 0)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(4, 0 -> 1)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(4, 1 -> 0)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(5, 0 -> 1)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(5, 1 -> 0)                           cudaSuccess 0
+cudaDeviceGetP2PAttribute(6, 0 -> 1)                           cudaErrorInvalidValue -99
+cudaDeviceGetP2PAttribute(6, 1 -> 0)                           cudaErrorInvalidValue -99
+cudaDeviceGetP2PAttribute(7, 0 -> 1)                           cudaErrorInvalidValue -99
+cudaDeviceGetP2PAttribute(7, 1 -> 0)                           cudaErrorInvalidValue -99
+cudaDeviceGetP2PAttribute(2, 0 -> 0)                           cudaErrorInvalidDevice -99
+cudaDeviceGetP2PAttribute(2, 0 -> 7)                           cudaErrorInvalidDevice -99
+cudaDeviceGetP2PAttribute(2, null)                             cudaErrorInvalidValue
+cudaDeviceEnablePeerAccess(1, 0)                               cudaErrorPeerAccessUnsupported
+cudaDeviceEnablePeerAccess(1, 0) again                         cudaErrorPeerAccessUnsupported
+cudaDeviceEnablePeerAccess(1, 1)                               cudaErrorInvalidValue
+cudaDeviceEnablePeerAccess(0, 0) (itself)                      cudaErrorPeerAccessUnsupported
+cudaDeviceEnablePeerAccess(5, 0)                               cudaErrorInvalidDevice
+cudaDeviceDisablePeerAccess(1)                                 cudaErrorPeerAccessNotEnabled
+cudaDeviceDisablePeerAccess(0)                                 cudaErrorPeerAccessNotEnabled
+cudaDeviceDisablePeerAccess(5)                                 cudaErrorInvalidDevice
+cuDeviceCanAccessPeer(0, 1)                                    CUDA_SUCCESS 0
+cuDeviceCanAccessPeer(0, 0)                                    CUDA_SUCCESS 0
+cuDeviceCanAccessPeer(0, 7)                                    CUDA_ERROR_INVALID_DEVICE
+cuDeviceGetP2PAttribute(0, 0 -> 1)                             CUDA_ERROR_INVALID_VALUE -99
+cuDeviceGetP2PAttribute(1, 0 -> 1)                             CUDA_SUCCESS 0
+cuDeviceGetP2PAttribute(2, 0 -> 1)                             CUDA_SUCCESS 0
+cuDeviceGetP2PAttribute(3, 0 -> 1)                             CUDA_SUCCESS 0
+cuDeviceGetP2PAttribute(4, 0 -> 1)                             CUDA_SUCCESS 0
+cuDeviceGetP2PAttribute(5, 0 -> 1)                             CUDA_SUCCESS 0
+cuDeviceGetP2PAttribute(6, 0 -> 1)                             CUDA_ERROR_INVALID_VALUE -99
+cuDeviceGetP2PAttribute(7, 0 -> 1)                             CUDA_ERROR_INVALID_VALUE -99
+cuCtxEnablePeerAccess(other, 0)                                CUDA_ERROR_PEER_ACCESS_UNSUPPORTED
+cuCtxEnablePeerAccess(other, 0) again                          CUDA_ERROR_PEER_ACCESS_UNSUPPORTED
+cuCtxEnablePeerAccess(itself, 0)                               CUDA_ERROR_PEER_ACCESS_UNSUPPORTED
+cuCtxEnablePeerAccess(other, 1)                                CUDA_ERROR_INVALID_VALUE
+cuCtxDisablePeerAccess(other)                                  CUDA_ERROR_PEER_ACCESS_NOT_ENABLED
+cudaMemcpyPeer(1 <- 0)                                         cudaSuccess
+the first byte after the peer copy                             5a
+cudaMemcpy(1 <- 0, default kind)                               cudaSuccess
+the first byte after the default-kind copy                     5a
+cuMemPrefetchAsync(managed, device 0)                          CUDA_ERROR_INVALID_DEVICE
+cuMemPrefetchAsync(managed, device 1)                          CUDA_ERROR_INVALID_DEVICE
+cuMemPrefetchAsync(managed, device 9)                          CUDA_ERROR_INVALID_DEVICE
+cuMemPrefetchAsync(managed, host)                              CUDA_ERROR_INVALID_DEVICE
+cuMemPrefetchAsync(managed, host, flags 7) [cuda13]            CUDA_ERROR_INVALID_VALUE
+cuMemPrefetchAsync(device memory, device 0)                    CUDA_ERROR_INVALID_VALUE
+cuMemPrefetchAsync(null, device 0)                             CUDA_ERROR_INVALID_VALUE
+cuMemPrefetchAsync(managed, size 0)                            CUDA_ERROR_INVALID_VALUE
+cuMemPrefetchAsync(managed + 1, 100)                           CUDA_ERROR_INVALID_DEVICE
+cuMemAdvise read-mostly (device 0)                             CUDA_SUCCESS
+cuMemAdvise unset read-mostly (device 0)                       CUDA_SUCCESS
+cuMemAdvise preferred location (host)                          CUDA_SUCCESS
+cuMemAdvise preferred location (device 0)                      CUDA_ERROR_INVALID_DEVICE
+cuMemAdvise preferred location (device 1)                      CUDA_ERROR_INVALID_DEVICE
+cuMemAdvise unset preferred location (device 0)                CUDA_SUCCESS
+cuMemAdvise accessed by (host)                                 CUDA_SUCCESS
+cuMemAdvise accessed by (device 1)                             CUDA_ERROR_INVALID_DEVICE
+cuMemAdvise unset accessed by (device 0)                       CUDA_ERROR_INVALID_DEVICE
+cuMemAdvise accessed by (device 9)                             CUDA_ERROR_INVALID_VALUE
+cuMemAdvise read-mostly (device memory)                        CUDA_ERROR_INVALID_VALUE
+cuMemAdvise preferred location (device memory, device 0)       CUDA_ERROR_INVALID_DEVICE
+cuMemAdvise 99                                                 CUDA_ERROR_INVALID_VALUE
+cudaMemPrefetchAsync(managed, device 0) [cuda13]               cudaErrorInvalidDevice
+cudaMemPrefetchAsync(managed, host) [cuda13]                   cudaErrorInvalidDevice
+cudaMemPrefetchAsync(managed, host, flags 7) [cuda13]          cudaErrorInvalidValue
+cudaMemPrefetchAsync(device memory, device 0) [cuda13]         cudaErrorInvalidValue
+cudaMemAdvise read-mostly (device 0) [cuda13]                  cudaSuccess
+cudaMemAdvise preferred location (host) [cuda13]               cudaSuccess
+cudaMemAdvise preferred location (device 0) [cuda13]           cudaErrorInvalidDevice
+cudaMemAdvise unset preferred location (device 0) [cuda13]     cudaSuccess
+cudaMemAdvise accessed by (device 1) [cuda13]                  cudaErrorInvalidDevice
+cudaMemAdvise accessed by (host) [cuda13]                      cudaSuccess
+cudaMemAdvise read-mostly (device memory) [cuda13]             cudaErrorInvalidValue
+cudaMemRangeGetAttribute read-mostly [cuda13]                  cudaSuccess 0
+cudaMemRangeGetAttribute preferred location [cuda13]           cudaSuccess -2
+cudaMemRangeGetAttribute last prefetch location [cuda13]       cudaSuccess -2
+cudaMemRangeGetAttribute accessed-by [cuda13]                  cudaSuccess -2 -2
+PASS

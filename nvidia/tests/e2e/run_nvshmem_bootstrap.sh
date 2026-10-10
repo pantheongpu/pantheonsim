@@ -12,7 +12,10 @@
 #
 # Both PEs use GPU 0: NVIDIA's NVSHMEM refuses PEs on two GeForce GPUs that have no peer access
 # ("Peer GPU 1 is not accessible", NVSHMEMX_ERROR_NOT_SUPPORTED), and PEs on one GPU make its
-# multiple-processes-per-GPU mode (status 3). A scenario whose launcher or library is missing is
+# multiple-processes-per-GPU mode (status 3). The scenario two_gpus puts PE r on GPU r: on the card's two
+# RTX 3060s that is the refusal (exit status 255), and the simulated rtx3060 profile, whose devices
+# have no peer path either, refuses it the same way; on a data-centre profile (a100) the job starts, which
+# is checked below (the card has no such pair). It needs two GPUs on the card. A scenario whose launcher or library is missing is
 # skipped here and in the expected file. Open MPI's OpenSHMEM crashes now and then in UCX on its
 # own (one run in four of a plain shmem_init program on the machine this was made on, with or
 # without NVSHMEM), so an OpenSHMEM job that died of a segmentation fault or failed to start is run
@@ -83,7 +86,7 @@ if command -v oshrun >/dev/null 2>&1 && command -v oshc++ >/dev/null 2>&1 && ech
   have_shmem=1
 fi
 if (( card )) && [[ ! -e "$tmp/mpiprog" ]]; then exit 0; fi
-require_shim_libs "$shim" "$tmp/mpiprog" || exit 0
+(( card )) || require_shim_libs "$shim" "$tmp/mpiprog" || exit 0   # the card run uses NVIDIA's libraries, not the shim's
 
 # PMIx: libpmix.so.2 for the card's plugin, and pmix.h at build time for the shim as well.
 has_pmix_lib() { /sbin/ldconfig -p 2>/dev/null | grep -q 'libpmix\.so\.2' || compgen -G '/usr/lib/*/libpmix.so.2' >/dev/null; }
@@ -121,6 +124,15 @@ scenario() {
 scenario mpirun mpi_attr mpiprog attr
 scenario mpirun mpi_attr_reversed mpiprog attr_reversed
 scenario mpirun mpi_attr_null mpiprog attr_null
+two_gpus=1
+if (( card )); then
+  (( $(nvidia-smi -L 2>/dev/null | grep -c '^GPU') >= 2 )) || two_gpus=0
+fi
+if (( two_gpus )); then
+  scenario mpirun two_gpus mpiprog two_gpus VGPU_GPU=nvidia/rtx3060
+else
+  skipped+=(two_gpus)
+fi
 scenario mpirun env_mpi mpiprog env NVSHMEM_BOOTSTRAP=MPI
 scenario mpirun plugin_mpi mpiprog env NVSHMEM_BOOTSTRAP=plugin NVSHMEM_BOOTSTRAP_PLUGIN=nvshmem_bootstrap_mpi.so.3
 if (( have_pmix )); then

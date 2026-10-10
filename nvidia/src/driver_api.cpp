@@ -139,6 +139,13 @@ struct TexRefRec {
   int channels = 1;
   CUdeviceptr address_base = 0;  // bound linear memory, or 0
   CUarray array = nullptr;       // bound array, or null
+  // The mipmap state (cuTexRefSetMipmapFilterMode and the rest), the anisotropy and the border colour: kept
+  // and read back, zeros until set.
+  CUmipmappedArray mip_array = nullptr;
+  int mip_filter = 0;
+  float mip_bias = 0, mip_clamp[2] = {0, 0};
+  unsigned max_anisotropy = 0;
+  float border[4] = {0, 0, 0, 0};
 };
 
 // A stream-ordered memory pool (CUmemoryPool). Every stream here is
@@ -218,6 +225,11 @@ struct ShimState {
   // card answers a handle from either with CUDA_ERROR_CONTEXT_IS_DESTROYED.
   std::set<uintptr_t> retired;
   std::unordered_map<uintptr_t, TexRefRec> texrefs;  // cuTexRefCreate results
+  // The runtime's modules and functions under driver names (vgpu_driver_function_for_v1, cuFuncGetModule), by
+  // (device, module id) and (module handle, kernel name): one handle each, however often it is asked for.
+  std::map<std::pair<int, uint64_t>, uintptr_t> runtime_modules;
+  std::map<std::pair<uintptr_t, std::string>, uintptr_t> runtime_functions;
+  std::unordered_map<uintptr_t, int> stream_device;   // the device a stream was made on
   // Peer access enabled, as (context, peer context): cuCtxEnablePeerAccess
   // is about contexts, and enabling it one way says nothing of the other.
   std::set<std::pair<uintptr_t, uintptr_t>> peer_access;
@@ -1790,7 +1802,7 @@ static CUresult cuLinkDestroy_impl(void* state) {
 // A handle id the engine gave out, as the API's opaque handle. The engine's
 // ids start at 1, so 0 stays available as "no handle".
 namespace {
-constexpr size_t kVmmGranularity = 64u * 1024u;
+constexpr size_t kVmmGranularity = vgpu::MemoryManager::kVmmGranularity;   // 2 MiB
 
 // The property struct a caller passes. Only a device-local pinned allocation
 // exists here; anything else is refused rather than quietly treated as one.
@@ -1817,6 +1829,10 @@ static CUresult cuMemAddressReserve_impl(CUdeviceptr* ptr, size_t size, size_t a
   VGPU_CAPTURE_UNSAFE("cuMemAddressReserve");
   return api("cuMemAddressReserve", true, false, [&](ShimState& s) {
     if (!ptr || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    // The size is whole granules (2 MiB) and the alignment a power of two, else CUDA_ERROR_INVALID_VALUE (an
+    // RTX 3060: sizes of 1, 4096, 65536 and 2 MiB + 1 and an alignment of 5 or 3 granules are refused, and an
+    // alignment below 2 MiB is accepted and raised to it).
+    if (size % kVmmGranularity || (alignment & (alignment - 1))) return CUDA_ERROR_INVALID_VALUE;
     // A fixed address is a request for one particular range; the engine hands
     // out address space monotonically and cannot honour it.
     if (addr != 0) return CUDA_ERROR_NOT_SUPPORTED;
@@ -1875,8 +1891,21 @@ static CUresult cuMemMap_impl(CUdeviceptr ptr, size_t size, size_t offset,
                               CUmemGenericAllocationHandle handle, unsigned long long flags) {
   VGPU_CAPTURE_UNSAFE("cuMemMap");
   return api("cuMemMap", true, false, [&](ShimState& s) {
-    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    owner_memory(s, ptr).map(ptr, size, offset, handle);
+    // Measured on an RTX 3060: a size of 0, flags and no handle are CUDA_ERROR_INVALID_VALUE; an address,
+    // size or offset that is not a multiple of the granularity, an offset (cuMemMap takes only 0), a size larger
+    // than the handle, and a range that already has something mapped are CUDA_ERROR_NOT_SUPPORTED.
+    if (flags != 0 || size == 0 || handle == 0) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    uint64_t handle_bytes = 0;
+    try {
+      handle_bytes = mem.handle_size(handle);
+    } catch (const vgpu::Error&) {
+      return CUDA_ERROR_INVALID_VALUE;   // no such handle
+    }
+    if (ptr % kVmmGranularity || size % kVmmGranularity || offset != 0 || size > handle_bytes ||
+        mem.range_mapped(ptr, size))
+      return CUDA_ERROR_NOT_SUPPORTED;
+    mem.map(ptr, size, offset, handle);
     return CUDA_SUCCESS;
   });
 }
@@ -1886,7 +1915,12 @@ VGPU_EXPORT CUresult cuMemUnmap(CUdeviceptr ptr, size_t size) { return traced("c
 static CUresult cuMemUnmap_impl(CUdeviceptr ptr, size_t size) {
   VGPU_CAPTURE_UNSAFE("cuMemUnmap");
   return api("cuMemUnmap", true, false, [&](ShimState& s) {
-    owner_memory(s, ptr).unmap(ptr, size);
+    // An address or size that is not whole granules is CUDA_ERROR_INVALID_VALUE; a range with nothing mapped in
+    // it is CUDA_SUCCESS (an RTX 3060 unmaps twice without complaint); a part of a mapping is refused by the engine.
+    if (size == 0 || size % kVmmGranularity || ptr % kVmmGranularity) return CUDA_ERROR_INVALID_VALUE;
+    vgpu::MemoryManager& mem = owner_memory(s, ptr);
+    if (!mem.range_mapped(ptr, size)) return CUDA_SUCCESS;
+    mem.unmap(ptr, size);
     return CUDA_SUCCESS;
   });
 }
@@ -1943,9 +1977,11 @@ static CUresult cuMemGetAllocationGranularity_impl(size_t* granularity,
   if (!granularity) return CUDA_ERROR_INVALID_VALUE;
   if (option != CU_MEM_ALLOC_GRANULARITY_MINIMUM && option != CU_MEM_ALLOC_GRANULARITY_RECOMMENDED)
     return CUDA_ERROR_INVALID_VALUE;
-  (void)prop;
-  // The chunk the sparse backing materializes, which is the unit every
-  // reservation, handle and mapping here is measured in.
+  // Measured on an RTX 3060: no property is looked at beyond its being there (a host location, a location type
+  // that does not exist and a device that does not exist all get the answer), and the minimum and the
+  // recommended granularity are the same 2 MiB, which is the unit every reservation, handle and mapping
+  // here is measured in.
+  if (!prop) return CUDA_ERROR_INVALID_VALUE;
   *granularity = kVmmGranularity;
   return CUDA_SUCCESS;
 }
@@ -2129,6 +2165,9 @@ static CUresult cuModuleUnload_impl(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
+    // A module the runtime loaded (cudaGetFuncBySymbol, cuFuncGetModule of a library's kernel) is the runtime's or the
+    // library's to unload: unloading it here is accepted and does nothing.
+    if (s.runtime_modules.count({dev, mid}) && s.runtime_modules[{dev, mid}] == h) return CUDA_SUCCESS;
     {
       ModuleProf m;
       bool known = false;
@@ -3553,12 +3592,17 @@ static CUresult cuStreamAttachMemAsync_impl(CUstream st, CUdeviceptr dptr, size_
 static CUresult cuMemPrefetchAsync_v2_impl(CUdeviceptr dptr, size_t count, CUmemLocation location, unsigned int, CUstream);
 VGPU_EXPORT CUresult cuMemPrefetchAsync_v2(CUdeviceptr dptr, size_t count, CUmemLocation location, unsigned int a3, CUstream a4) { return traced("cuMemPrefetchAsync_v2", cuMemPrefetchAsync_v2_impl, dptr, count, location, a3, a4); }
 static CUresult cuMemPrefetchAsync_v2_impl(CUdeviceptr dptr, size_t count, CUmemLocation location,
-                                           unsigned int, CUstream st) {
+                                           unsigned int flags, CUstream st) {
   // Measured: refused on a capturing stream before the arguments are looked at.
   if (capture_forbidden(st, "cuMemPrefetchAsync")) return kCaptureUnsupported;
   return api("cuMemPrefetchAsync", true, false, [&](ShimState& s) {
-    if (!managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;
-    return check_location(s, location);
+    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;   // reserved (an RTX 3060: CUDA_ERROR_INVALID_VALUE)
+    if (count == 0 || !managed_range(s, dptr, count)) return CUDA_ERROR_INVALID_VALUE;   // a size of 0 is refused (RTX 3060)
+    if (const CUresult rc = check_location(s, location); rc != CUDA_SUCCESS) return rc;
+    // A device without concurrent managed access (an RTX 3060 under WSL, measured) cannot prefetch: to a
+    // device, to the host or to a device that does not exist, it is CUDA_ERROR_INVALID_DEVICE.
+    if (!s.rt->device(current_device(s)).profile().cuda.concurrent_managed_access) return CUDA_ERROR_INVALID_DEVICE;
+    return CUDA_SUCCESS;
   });
 }
 static CUresult cuMemPrefetchAsync_impl(CUdeviceptr dptr, size_t count, CUdevice dstDevice, CUstream stream);
@@ -3571,6 +3615,16 @@ VGPU_EXPORT CUresult cuMemAdvise_v2(CUdeviceptr dptr, size_t count, int advice, 
 static CUresult cuMemAdvise_v2_impl(CUdeviceptr dptr, size_t count, int advice, CUmemLocation location) {
   VGPU_CAPTURE_UNSAFE("cuMemAdvise_v2");
   return api("cuMemAdvise", true, false, [&](ShimState& s) {
+    // Without concurrent managed access (an RTX 3060 under WSL, measured) the advice that names a device is
+    // refused before the range is looked at: a preferred location that is a device, or a device in the
+    // accessed-by list, is CUDA_ERROR_INVALID_DEVICE (a device that does not exist, for the accessed-by
+    // list, CUDA_ERROR_INVALID_VALUE). Everything else is accepted and has no effect.
+    const bool paged = s.rt->device(current_device(s)).profile().cuda.concurrent_managed_access;
+    if (!paged && location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
+      if (advice == 3) return CUDA_ERROR_INVALID_DEVICE;
+      if (advice == 5 || advice == 6)
+        return location.id >= 0 && location.id < s.rt->device_count() ? CUDA_ERROR_INVALID_DEVICE : CUDA_ERROR_INVALID_VALUE;
+    }
     if (!managed_range(s, dptr, count) || advice < 1 || advice > 6) return CUDA_ERROR_INVALID_VALUE;
     // Read-mostly (1, 2) names no location; the others name one.
     if (advice > 2) return check_location(s, location);
@@ -4411,6 +4465,16 @@ struct ViewDescABI {
   unsigned reserved[16];
 };
 
+// What a program is told about a texture or surface object it made, kept at creation: the three descriptors as it
+// passed them (the getters report zeros for one it did not give).
+struct ObjectDescs {
+  ResourceDescABI res{};
+  TextureDescABI tex{};
+  ViewDescABI view{};
+};
+std::mutex g_object_mu;
+std::unordered_map<unsigned long long, ObjectDescs> g_object_descs;
+
 CUresult make_object(const char* name, unsigned long long* out, const void* res, const void* tex,
                      const void* view, vgpu::exec::TexKind kind) {
   return api(name, true, false, [&](ShimState& s) -> CUresult {
@@ -4467,6 +4531,14 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
     }
     const uint64_t handle = next_texobj++;
     current(s).textures()[handle] = d;
+    {
+      ObjectDescs kept;
+      kept.res = rdesc;
+      if (tex) kept.tex = *static_cast<const TextureDescABI*>(tex);
+      if (view) kept.view = *static_cast<const ViewDescABI*>(view);
+      std::lock_guard<std::mutex> lock(g_object_mu);
+      g_object_descs[handle] = kept;
+    }
     *out = handle;
     return CUDA_SUCCESS;
   });
@@ -4475,7 +4547,11 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
 CUresult destroy_object(const char* name, unsigned long long obj) {
   return api(name, true, false, [&](ShimState& s) {
     for (int dev = 0; dev < s.rt->device_count(); ++dev)
-      if (s.rt->device(dev).textures().erase(obj)) return CUDA_SUCCESS;
+      if (s.rt->device(dev).textures().erase(obj)) {
+        std::lock_guard<std::mutex> lock(g_object_mu);
+        g_object_descs.erase(obj);
+        return CUDA_SUCCESS;
+      }
     return CUDA_ERROR_INVALID_VALUE;
   });
 }
@@ -5074,6 +5150,7 @@ static CUresult stream_create(CUstream* s_out, unsigned int flags, int priority)
     if (!s_out) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagStream);
     s.streams.insert(h);
+    s.stream_device[h] = current_device(s);
     *s_out = reinterpret_cast<CUstream>(h);
     // A priority outside the range is clamped to it, as the card does, and read back by
     // cuStreamGetPriority; streams run in order, so it changes nothing else.
@@ -5100,6 +5177,7 @@ static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
     if (s.streams.count(h))
       vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting, h, profiled_device(s));
     s.streams.erase(h);
+    s.stream_device.erase(h);
     s.stream_priority.erase(h);
     return CUDA_SUCCESS;
   });
@@ -5686,9 +5764,14 @@ static CUresult cuDeviceGetByPCIBusId_impl(CUdevice* dev, const char* pciBusId) 
   });
 }
 
-// Distinct simulated devices reach each other's memory, as the runtime's
-// cudaDeviceCanAccessPeer answers; a device is not its own peer. (A pair of
-// RTX 3060s under WSL answers 0 for each other: that host has no peer path.)
+// Whether `dev` can reach `peer`'s memory: two devices whose profiles both have a peer path
+// (CudaClass::peer_access). A pair of RTX 3060s has none (measured on a real pair: 0 for each other).
+static bool peer_path(ShimState& s, int dev, int peer) {
+  return dev != peer && s.rt->device(dev).profile().cuda.peer_access && s.rt->device(peer).profile().cuda.peer_access;
+}
+
+// cuDeviceCanAccessPeer answers like the runtime's cudaDeviceCanAccessPeer; a device is not its own peer
+// (CUDA_SUCCESS and 0, as an RTX 3060 answers).
 static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer);
 VGPU_EXPORT CUresult cuDeviceCanAccessPeer(int* can, CUdevice dev, CUdevice peer) { return traced("cuDeviceCanAccessPeer", cuDeviceCanAccessPeer_impl, can, dev, peer); }
 static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer) {
@@ -5696,7 +5779,35 @@ static CUresult cuDeviceCanAccessPeer_impl(int* can, CUdevice dev, CUdevice peer
     if (!can) return CUDA_ERROR_INVALID_VALUE;
     const int n = s.rt->device_count();
     if (dev < 0 || dev >= n || peer < 0 || peer >= n) return CUDA_ERROR_INVALID_DEVICE;
-    *can = dev != peer ? 1 : 0;
+    *can = peer_path(s, dev, peer) ? 1 : 0;
+    return CUDA_SUCCESS;
+  });
+}
+
+// What one device can do with another's memory, as the runtime's cudaDeviceGetP2PAttribute answers it:
+// attributes 1 to 5 (CUDA 13 added the fifth, partial native atomics); without a peer path every one is 0
+// (measured on an RTX 3060 pair), and 0 and 6 and above are CUDA_ERROR_INVALID_VALUE. A device asked about
+// itself is CUDA_ERROR_INVALID_DEVICE, as the runtime's is cudaErrorInvalidDevice.
+static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice src, CUdevice dst);
+// attrib is a CUdevice_P2PAttribute, an enum of int's size; it is read as the int it is, since a caller
+// may pass a value the enum does not declare.
+VGPU_EXPORT CUresult cuDeviceGetP2PAttribute(int* value, int attrib, CUdevice srcDevice, CUdevice dstDevice) {
+  return traced("cuDeviceGetP2PAttribute", cuDeviceGetP2PAttribute_impl, value, attrib, srcDevice, dstDevice);
+}
+static CUresult cuDeviceGetP2PAttribute_impl(int* value, int attrib, CUdevice src, CUdevice dst) {
+  return api("cuDeviceGetP2PAttribute", true, false, [&](ShimState& s) {
+    if (!value) return CUDA_ERROR_INVALID_VALUE;
+    const int n = s.rt->device_count();
+    if (src < 0 || src >= n || dst < 0 || dst >= n || src == dst) return CUDA_ERROR_INVALID_DEVICE;
+    const bool path = peer_path(s, src, dst);
+    switch (attrib) {
+      case 1: *value = 0; break;                // CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK
+      case 2: *value = path ? 1 : 0; break;     // ACCESS_SUPPORTED
+      case 3: *value = path ? 1 : 0; break;     // NATIVE_ATOMIC_SUPPORTED
+      case 4: *value = 0; break;                // CUDA_ARRAY_ACCESS_SUPPORTED
+      case 5: *value = 0; break;                // ONLY_PARTIAL_NATIVE_ATOMIC_SUPPORTED
+      default: return CUDA_ERROR_INVALID_VALUE;
+    }
     return CUDA_SUCCESS;
   });
 }
@@ -5716,6 +5827,8 @@ static CUresult cuCtxEnablePeerAccess_impl(CUcontext peerContext, unsigned int f
     auto it = s.contexts.find(peer);
     if (it == s.contexts.end()) return CUDA_ERROR_INVALID_CONTEXT;
     if (it->second == current_device(s)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
+    // Without a peer path (an RTX 3060 pair, measured) a context on the other device is unsupported too.
+    if (!peer_path(s, current_device(s), it->second)) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
     if (!s.peer_access.emplace(ctx_stack().back(), peer).second) return CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
     return CUDA_SUCCESS;
   });
@@ -6526,7 +6639,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuGetErrorString), VGPU_PROC(cuDeviceGetCount), VGPU_PROC(cuDeviceGet),
     VGPU_PROC(cuDeviceGetName), VGPU_PROC(cuDeviceTotalMem), VGPU_PROC(cuDeviceGetAttribute),
     VGPU_PROC(cuDeviceComputeCapability), VGPU_PROC(cuDeviceGetUuid), VGPU_PROC(cuDeviceGetUuid_v2),
-    VGPU_PROC(cuDeviceGetPCIBusId), VGPU_PROC(cuDeviceCanAccessPeer),
+    VGPU_PROC(cuDeviceGetPCIBusId), VGPU_PROC(cuDeviceCanAccessPeer), VGPU_PROC(cuDeviceGetP2PAttribute),
     VGPU_PROC(cuCtxCreate), VGPU_PROC(cuCtxDestroy), VGPU_PROC(cuCtxSetCurrent),
     VGPU_PROC(cuCtxGetCurrent), VGPU_PROC(cuCtxGetDevice), VGPU_PROC(cuCtxSynchronize),
     VGPU_PROC(cuCtxPushCurrent), VGPU_PROC(cuCtxPopCurrent), VGPU_PROC(cuCtxGetLimit),
@@ -6694,3 +6807,99 @@ static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVe
                                       unsigned long long flags) {
   return cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, nullptr);
 }
+
+// The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
+#include "driver_sweep.inc"
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with CUDA_API_PER_THREAD_DEFAULT_STREAM defined)
+// calls the driver's functions under the names cuMemcpyHtoD_v2_ptds, cuLaunchKernel_ptsz and the rest, where
+// stream 0 is the calling thread's own default stream rather than the legacy one. Every stream here is
+// synchronous, so the two defaults behave alike and each name is the plain function under another symbol
+// (the runtime does the same: runtime_api.cpp).
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cuEventRecordWithFlags_ptsz, cuEventRecordWithFlags)
+VGPU_PT_ALIAS(cuEventRecord_ptsz, cuEventRecord)
+VGPU_PT_ALIAS(cuGraphicsMapResources_ptsz, cuGraphicsMapResources)
+VGPU_PT_ALIAS(cuGraphicsUnmapResources_ptsz, cuGraphicsUnmapResources)
+VGPU_PT_ALIAS(cuLaunchCooperativeKernel_ptsz, cuLaunchCooperativeKernel)
+VGPU_PT_ALIAS(cuLaunchHostFunc_ptsz, cuLaunchHostFunc)
+VGPU_PT_ALIAS(cuLaunchKernelEx_ptsz, cuLaunchKernelEx)
+VGPU_PT_ALIAS(cuLaunchKernel_ptsz, cuLaunchKernel)
+VGPU_PT_ALIAS(cuMemAllocAsync_ptsz, cuMemAllocAsync)
+VGPU_PT_ALIAS(cuMemAllocFromPoolAsync_ptsz, cuMemAllocFromPoolAsync)
+VGPU_PT_ALIAS(cuMemFreeAsync_ptsz, cuMemFreeAsync)
+VGPU_PT_ALIAS(cuMemPrefetchAsync_v2_ptsz, cuMemPrefetchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy2DAsync_v2_ptsz, cuMemcpy2DAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy2DUnaligned_v2_ptds, cuMemcpy2DUnaligned_v2)
+VGPU_PT_ALIAS(cuMemcpy2D_v2_ptds, cuMemcpy2D_v2)
+VGPU_PT_ALIAS(cuMemcpy3DAsync_v2_ptsz, cuMemcpy3DAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy3D_v2_ptds, cuMemcpy3D_v2)
+VGPU_PT_ALIAS(cuMemcpyAsync_ptsz, cuMemcpyAsync)
+VGPU_PT_ALIAS(cuMemcpyAtoA_v2_ptds, cuMemcpyAtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoD_v2_ptds, cuMemcpyAtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoHAsync_v2_ptsz, cuMemcpyAtoHAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoH_v2_ptds, cuMemcpyAtoH_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoA_v2_ptds, cuMemcpyDtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoDAsync_v2_ptsz, cuMemcpyDtoDAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoD_v2_ptds, cuMemcpyDtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoHAsync_v2_ptsz, cuMemcpyDtoHAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoH_v2_ptds, cuMemcpyDtoH_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoAAsync_v2_ptsz, cuMemcpyHtoAAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoA_v2_ptds, cuMemcpyHtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoDAsync_v2_ptsz, cuMemcpyHtoDAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoD_v2_ptds, cuMemcpyHtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyPeerAsync_ptsz, cuMemcpyPeerAsync)
+VGPU_PT_ALIAS(cuMemcpyPeer_ptds, cuMemcpyPeer)
+VGPU_PT_ALIAS(cuMemcpy_ptds, cuMemcpy)
+VGPU_PT_ALIAS(cuMemsetD16Async_ptsz, cuMemsetD16Async)
+VGPU_PT_ALIAS(cuMemsetD16_v2_ptds, cuMemsetD16_v2)
+VGPU_PT_ALIAS(cuMemsetD2D16Async_ptsz, cuMemsetD2D16Async)
+VGPU_PT_ALIAS(cuMemsetD2D16_v2_ptds, cuMemsetD2D16_v2)
+VGPU_PT_ALIAS(cuMemsetD2D32Async_ptsz, cuMemsetD2D32Async)
+VGPU_PT_ALIAS(cuMemsetD2D32_v2_ptds, cuMemsetD2D32_v2)
+VGPU_PT_ALIAS(cuMemsetD2D8Async_ptsz, cuMemsetD2D8Async)
+VGPU_PT_ALIAS(cuMemsetD2D8_v2_ptds, cuMemsetD2D8_v2)
+VGPU_PT_ALIAS(cuMemsetD32Async_ptsz, cuMemsetD32Async)
+VGPU_PT_ALIAS(cuMemsetD32_v2_ptds, cuMemsetD32_v2)
+VGPU_PT_ALIAS(cuMemsetD8Async_ptsz, cuMemsetD8Async)
+VGPU_PT_ALIAS(cuMemsetD8_v2_ptds, cuMemsetD8_v2)
+VGPU_PT_ALIAS(cuStreamAddCallback_ptsz, cuStreamAddCallback)
+VGPU_PT_ALIAS(cuStreamAttachMemAsync_ptsz, cuStreamAttachMemAsync)
+VGPU_PT_ALIAS(cuStreamGetCtx_ptsz, cuStreamGetCtx)
+VGPU_PT_ALIAS(cuStreamGetCtx_v2_ptsz, cuStreamGetCtx_v2)
+VGPU_PT_ALIAS(cuStreamGetFlags_ptsz, cuStreamGetFlags)
+VGPU_PT_ALIAS(cuStreamGetPriority_ptsz, cuStreamGetPriority)
+VGPU_PT_ALIAS(cuStreamIsCapturing_ptsz, cuStreamIsCapturing)
+VGPU_PT_ALIAS(cuStreamQuery_ptsz, cuStreamQuery)
+VGPU_PT_ALIAS(cuStreamSynchronize_ptsz, cuStreamSynchronize)
+VGPU_PT_ALIAS(cuStreamWaitEvent_ptsz, cuStreamWaitEvent)
+VGPU_PT_ALIAS(cuMemBatchDecompressAsync_ptsz, cuMemBatchDecompressAsync)
+VGPU_PT_ALIAS(cuMemDiscardAndPrefetchBatchAsync_ptsz, cuMemDiscardAndPrefetchBatchAsync)
+VGPU_PT_ALIAS(cuMemDiscardBatchAsync_ptsz, cuMemDiscardBatchAsync)
+VGPU_PT_ALIAS(cuMemMapArrayAsync_ptsz, cuMemMapArrayAsync)
+VGPU_PT_ALIAS(cuMemPrefetchBatchAsync_ptsz, cuMemPrefetchBatchAsync)
+VGPU_PT_ALIAS(cuMemcpy3DBatchAsync_v2_ptsz, cuMemcpy3DBatchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy3DPeerAsync_ptsz, cuMemcpy3DPeerAsync)
+VGPU_PT_ALIAS(cuMemcpyBatchAsync_v2_ptsz, cuMemcpyBatchAsync_v2)
+VGPU_PT_ALIAS(cuSignalExternalSemaphoresAsync_ptsz, cuSignalExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cuStreamCopyAttributes_ptsz, cuStreamCopyAttributes)
+VGPU_PT_ALIAS(cuStreamGetAttribute_ptsz, cuStreamGetAttribute)
+VGPU_PT_ALIAS(cuStreamGetDevice_ptsz, cuStreamGetDevice)
+VGPU_PT_ALIAS(cuStreamGetId_ptsz, cuStreamGetId)
+VGPU_PT_ALIAS(cuStreamSetAttribute_ptsz, cuStreamSetAttribute)
+VGPU_PT_ALIAS(cuWaitExternalSemaphoresAsync_ptsz, cuWaitExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cuMemcpy3DPeer_ptds, cuMemcpy3DPeer)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

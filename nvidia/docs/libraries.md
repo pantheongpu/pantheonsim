@@ -375,7 +375,8 @@ Card ground truth is thin: on two RTX 3060s under WSL NVIDIA's library starts no
 two different GPUs (the cards have no peer access, so the topology refuses with
 `Peer GPU 1 is not accessible`, `NVSHMEMX_ERROR_NOT_SUPPORTED`, and the program exits with 255), and
 two PEs on one GPU run in its multiple-processes-per-GPU mode with a working heap; this simulator's
-RTX 3060 profile reports peer access, so PEs on two simulated 3060s start here. What a multi-PE job
+RTX 3060 profile has no peer access either, so PEs on two simulated 3060s are refused the same way
+(`two_gpus` in `run_nvshmem_bootstrap.sh`, `e2e_nvshmem_peerless`), while PEs on two data-centre profiles start. What a multi-PE job
 computes here follows NVSHMEM's documentation, and so does all of the typed API above
 (none of it has been compared with a card). `e2e_nvshmem_host` runs the host
 API in jobs of one and three PEs (the three share a GPU when the machine has fewer, and
@@ -1330,6 +1331,34 @@ documentation; the local card has no `a` target).
 
 Unimplemented entry points return the library's own "not supported" status
 rather than a plausible wrong answer, so a caller's fallback path still works.
+
+- **Every function cuda_runtime_api.h and cuda.h declare is exported**
+  (`tests/lint/check_header_exports.py`, test `lint_header_exports`, preprocesses
+  both headers with and without `CUDA_API_PER_THREAD_DEFAULT_STREAM` and
+  compares them with the built shims' dynamic symbols; against the CUDA 13.0
+  headers it finds 0 missing, where the sweep found 64 in the runtime and 200 in
+  the driver). A program that binds by name (PyTorch is linked `-z now`) no
+  longer fails to load for a missing function. What each one does is in
+  `runtime_sweep.inc` and `driver_sweep.inc`, and `e2e_exports_sweep_runtime` /
+  `e2e_exports_sweep_driver` call them with argument cases that an RTX 3060
+  printed (`exports_sweep_*.rtx3060.expected`, regenerated from the card with
+  `run_exports_sweep.sh runtime|driver --card --update`). Where the library
+  runs a function the sweep implements it (batched copies, the 3D peer copy,
+  `cudaGetFuncBySymbol`, the coredump attributes, `cuDeviceGetDevResource`,
+  the `_ptsz`/`_ptds` per-thread-stream names, ...). Where it cannot, the name
+  answers the library's own "not supported" status, once, with a note on stderr:
+  green contexts and their resources, conditional graph handles, external
+  semaphore graph nodes, pools in host memory, and file-descriptor external
+  memory. One differs from the card in a way the sweep test leaves out: the
+  card answers a valid `cuDeviceGetLuid` where the shim refuses, and the card
+  segfaults on a garbage handle, a null stream in some calls and a second
+  unregister, which the shim answers with the documented status instead.
+  Not covered: the functions only the CUDA 13.2 headers declare (26 in the
+  runtime, 24 in the driver), because no 13.2 header is part of the build.
+  Not changed: `cudaFuncGetAttributes` reports the opt-in shared-memory limit as
+  `maxDynamicSharedSizeBytes` of every kernel, where the card reports 48 KiB
+  less the kernel's static shared memory (48896 for 256 bytes) until
+  `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` raises it.
 
 - **cuBLAS**: the exported names the header does not declare (`cublas?bdmm`,
   `cublasGet/SetBackdoor`, `cublasGet/SetEnvironmentMode`); a program that

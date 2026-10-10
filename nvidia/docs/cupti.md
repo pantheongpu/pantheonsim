@@ -99,6 +99,22 @@ Differences from the card on this workload:
   copies of the library, not of the program). The same holds for every library
   shim: a library call is a host routine, and its kernels are not in the
   trace.
+
+  This is a decision, not a gap to close: no kernel activity record is made up
+  for a library call. The name on NVIDIA's record (`ampere_sgemm_128x64_nn`,
+  `sm80_xmma_gemm_f32f32_...`, `cutlass_80_tensorop_...`) is chosen by the
+  library's heuristics from the library's version, the GPU, the shapes and the
+  workspace, and the grid, block, register and shared-memory figures that go
+  with it are that kernel's. They cannot be known without NVIDIA's library, so
+  any name written here would be a plausible wrong answer a profiler's reader
+  takes for the card's, and a table of kernel names would be wrong again with
+  each cuBLAS release. What a trace of a library call does hold is the
+  program's own runtime and driver calls around it (allocations, copies,
+  synchronization, the launches of the program's own kernels), as the card
+  records them; the library's internal calls are silenced
+  (`vgpu::profiling::Silence`), because they are the library's, not the
+  program's. PyTorch's profiler therefore lists no `sgemm` rows on the shim and
+  its `aten::mm` operators show their CPU time only.
 * Times are time spent simulating, as everywhere in this file.
 
 `VGPU_TRACE=1` also logs, to stderr, each activity enable and disable, the
