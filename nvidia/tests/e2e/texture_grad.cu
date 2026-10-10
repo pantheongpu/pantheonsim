@@ -8,10 +8,10 @@
 // prints them). The program passes on a GPU as well (build it with the same nvcc and run it).
 //
 // Sizes that are not a power of two are covered too (the "npot" cases: the card multiplies the gradient by the
-// size in a way of its own, see exec/texture_grad.hpp).
+// size in a way of its own, see exec/texture_grad.hpp), and so are 3D textures (tex3DGrad; ptxas builds those from
+// a quad of plain fetches whose coordinates are P, P + dPdx, P + dPdy, so the position matters).
 //
-// Not covered, and refused by the simulator by name: 3D and cube textures (ptxas builds those from quads of
-// plain fetches) and maxAnisotropy above 1.
+// Not covered, and refused by the simulator by name: cube textures and maxAnisotropy above 1.
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -83,7 +83,15 @@ __global__ void k2dl(cudaTextureObject_t t, const float* in, float* out, int n) 
                                      make_float2(in[7 * i + 5], in[7 * i + 6]));
 }
 
-enum Kind { K1D, K2D, K1DL, K2DL };
+// 3D: in = {x, y, z, dpdx (3), dpdy (3)}, 9 floats a fetch.
+__global__ void k3d(cudaTextureObject_t t, const float* in, float* out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    out[i] = tex3DGrad<float>(t, in[9 * i], in[9 * i + 1], in[9 * i + 2], make_float4(in[9 * i + 3], in[9 * i + 4], in[9 * i + 5], 0.0f),
+                              make_float4(in[9 * i + 6], in[9 * i + 7], in[9 * i + 8], 0.0f));
+}
+
+enum Kind { K1D, K2D, K1DL, K2DL, K3D };
 
 struct Tex {
   cudaMipmappedArray_t mip = nullptr;
@@ -99,32 +107,33 @@ struct Tex {
 // A float texture of `w` x `h` (h = 0 for 1D) texels and `layers` layers (0: not layered), `levels` levels (0:
 // not mipmapped), every texel a different number.
 static bool make_texture(Tex* tx, int w, int h, int layers, int levels, int filter_linear, int mip_linear,
-                         int address, float bias, float min_clamp, float max_clamp, unsigned aniso = 1) {
+                         int address, float bias, float min_clamp, float max_clamp, unsigned aniso = 1, int depth = 0) {
   const cudaChannelFormatDesc d = cudaCreateChannelDesc<float>();
   const unsigned flags = layers ? cudaArrayLayered : 0;
-  cudaExtent ext = make_cudaExtent(w, h, layers);
+  cudaExtent ext = make_cudaExtent(w, h, depth ? depth : layers);
   cudaResourceDesc rd = {};
   if (levels) {
     if (cudaMallocMipmappedArray(&tx->mip, &d, ext, levels, flags) != cudaSuccess) return false;
     for (int l = 0; l < levels; ++l) {
       cudaArray_t a = nullptr;
       cudaGetMipmappedArrayLevel(&a, tx->mip, l);
-      const int lw = w >> l ? w >> l : 1, lh = h ? (h >> l ? h >> l : 1) : 1, ln = layers ? layers : 1;
+      const int lw = w >> l ? w >> l : 1, lh = h ? (h >> l ? h >> l : 1) : 1,
+                ln = depth ? (depth >> l ? depth >> l : 1) : layers ? layers : 1;
       std::vector<float> host(size_t(lw) * lh * ln);
       for (size_t i = 0; i < host.size(); ++i) host[i] = float(rnd() & 0xFFFF) / 64.0f + float(l) * 1000.0f;
       cudaMemcpy3DParms p = {};
       p.srcPtr = make_cudaPitchedPtr(host.data(), lw * 4, lw, lh);
       p.dstArray = a;
-      p.extent = make_cudaExtent(lw, h ? lh : 1, layers ? layers : 1);
+      p.extent = make_cudaExtent(lw, h ? lh : 1, ln);
       p.kind = cudaMemcpyHostToDevice;
       if (cudaMemcpy3D(&p) != cudaSuccess) return false;
     }
     rd.resType = cudaResourceTypeMipmappedArray;
     rd.res.mipmap.mipmap = tx->mip;
   } else {
-    if (cudaMallocArray(&tx->arr, &d, w, h, flags) != cudaSuccess && !layers) return false;
-    if (layers && cudaMalloc3DArray(&tx->arr, &d, ext, flags) != cudaSuccess) return false;
-    const int ln = layers ? layers : 1, lh = h ? h : 1;
+    if (!depth && cudaMallocArray(&tx->arr, &d, w, h, flags) != cudaSuccess && !layers) return false;
+    if ((layers || depth) && cudaMalloc3DArray(&tx->arr, &d, ext, flags) != cudaSuccess) return false;
+    const int ln = depth ? depth : layers ? layers : 1, lh = h ? h : 1;
     std::vector<float> host(size_t(w) * lh * ln);
     for (auto& v : host) v = float(rnd() & 0xFFFF) / 64.0f;
     cudaMemcpy3DParms p = {};
@@ -192,6 +201,34 @@ static unsigned long long run(Kind kind, const Tex& tx, int layers, const std::v
   }
   return fnv(1469598103934665603ull, out.data(), out.size() * 4);
 }
+
+// Fetches of a 3D texture, in = 9 floats a fetch (see k3d).
+static unsigned long long run3(const Tex& tx, const std::vector<float>& in) {
+  const int n = int(in.size() / 9);
+  float *din = nullptr, *dout = nullptr;
+  cudaMalloc(&din, in.size() * 4);
+  cudaMalloc(&dout, size_t(n) * 4);
+  cudaMemcpy(din, in.data(), in.size() * 4, cudaMemcpyHostToDevice);
+  k3d<<<(n + 127) / 128, 128>>>(tx.t, din, dout, n);
+  std::vector<float> out(n);
+  const cudaError_t e = cudaMemcpy(out.data(), dout, size_t(n) * 4, cudaMemcpyDeviceToHost);
+  cudaFree(din);
+  cudaFree(dout);
+  if (e != cudaSuccess) {
+    std::printf("kernel failed: %s\n", cudaGetErrorString(e));
+    cudaGetLastError();
+    return 0;
+  }
+  return fnv(1469598103934665603ull, out.data(), out.size() * 4);
+}
+
+struct Case3 {
+  const char* name;
+  int w, h, d, levels, filter_linear, mip_linear, address;
+  float bias, min_clamp, max_clamp;
+  int emin, emax;
+  float coord_range;   // coordinates in [-0.25 * r, 1.25 * r]
+};
 
 struct Case {
   const char* name;
@@ -262,6 +299,51 @@ int main(int argc, char** argv) {
       report(std::string(c.name) + "/mode" + std::to_string(mode), run(c.kind, tx, c.layers, in));
     }
   }
+  // 3D textures: the unit sees the quad's coordinates (P, P + dPdx, P + dPdy), so the position matters too.
+  static const Case3 cases3[] = {
+      // name                  w    h    d  lv lin mip addr bias min max emin emax range
+      {"3d-trilinear-64", 64, 64, 64, 7, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 9, 1.0f},
+      {"3d-mixed-128x32x16", 128, 32, 16, 8, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 10, 1.0f},
+      {"3d-npot-100x60x40", 100, 60, 40, 7, 1, 1, 0, 0.0f, 0.0f, 20.0f, 1, 10, 1.0f},
+      {"3d-npot-nearest-level-33x65x17", 33, 65, 17, 7, 0, 0, 1, 0.0f, 0.0f, 20.0f, 1, 10, 1.0f},
+      {"3d-bias-clamps-64", 64, 64, 64, 7, 1, 1, 1, 0.75f, 1.5f, 5.25f, 1, 9, 1.0f},
+      {"3d-far-coordinates-128", 128, 128, 128, 8, 1, 1, 1, 0.0f, 0.0f, 20.0f, 3, 11, 400.0f},
+      {"3d-tiny-3x5x2", 3, 5, 2, 3, 1, 1, 1, 0.0f, 0.0f, 20.0f, 0, 6, 1.0f},
+      {"3d-not-mipmapped", 64, 32, 16, 0, 1, 0, 1, 0.0f, 0.0f, 20.0f, 0, 8, 1.0f},
+  };
+  for (const Case3& c : cases3) {
+    g_rng = 20261011u ^ (uint32_t)(c.w * 31 + c.h * 7 + c.d);
+    Tex tx;
+    if (!make_texture(&tx, c.w, c.h, 0, c.levels, c.filter_linear, c.mip_linear, c.address, c.bias, c.min_clamp,
+                      c.max_clamp, 1, c.d)) {
+      std::printf("FAIL %s: cannot make the texture\n", c.name);
+      ++g_fails;
+      continue;
+    }
+    const int n = 6000;
+    for (int mode = 0; mode < 3; ++mode) {
+      std::vector<float> in;
+      for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) in.push_back(frand(-0.25f, 1.25f) * c.coord_range);
+        const float mag = std::ldexp(frand(1.0f, 2.0f), -(c.emin + int(rnd() % unsigned(c.emax - c.emin + 1))));
+        float g[6];
+        for (int k = 0; k < 6; ++k) {
+          float sc = frand(0.125f, 1.0f);
+          if (rnd() & 1) sc = -sc;
+          g[k] = mag * sc;
+        }
+        if (mode == 1) {   // dPdx and dPdy parallel
+          const float sc = frand(-1.5f, 1.5f);
+          for (int k = 0; k < 3; ++k) g[3 + k] = g[k] * sc;
+        } else if (mode == 2) {   // components zero
+          g[rnd() % 6] = 0.0f;
+          g[rnd() % 6] = 0.0f;
+        }
+        for (int k = 0; k < 6; ++k) in.push_back(g[k]);
+      }
+      report(std::string(c.name) + "/mode" + std::to_string(mode), run3(tx, in));
+    }
+  }
   // Special values: zero, infinite, NaN, huge and tiny gradients, in 1D and 2D, with and without a level bias.
   for (int variant = 0; variant < 2; ++variant) {
     Tex t2, t1;
@@ -292,6 +374,35 @@ int main(int argc, char** argv) {
     }
     report(std::string("special-2d-npot/") + std::to_string(variant), run(K2D, t2n, 0, in));
     report(std::string("special-1d-npot/") + std::to_string(variant), run(K1D, t1n, 0, in));
+  }
+  // The same special values on 3D textures, as gradients and as coordinates.
+  for (int variant = 0; variant < 2; ++variant) {
+    Tex t3, t3n;
+    g_rng = 91u + variant;
+    if (!make_texture(&t3, 64, 64, 0, 7, 1, 1, 1, variant ? 3.0f : 0.0f, 0.0f, 20.0f, 1, 64) ||
+        !make_texture(&t3n, 100, 60, 0, 7, 1, 1, 1, variant ? -2.0f : 0.0f, 0.0f, 20.0f, 1, 40)) {
+      std::printf("FAIL special 3d: cannot make the textures\n");
+      ++g_fails;
+      continue;
+    }
+    const float inf = 1.0f / 0.0f, nan = 0.0f / 0.0f;
+    const float vals[] = {0.0f, -0.0f, 1e-30f, 1e-40f, 0.001f, 0.0625f, 1.0f, 1e30f, 3e38f, inf, -inf, nan};
+    std::vector<float> in;
+    for (float a : vals)
+      for (float b : vals) {
+        const float row[9] = {frand(0.0f, 1.0f), frand(0.0f, 1.0f), frand(0.0f, 1.0f), a, b, a, b, a, b};
+        in.insert(in.end(), row, row + 9);
+      }
+    report(std::string("special-3d-gradients/") + std::to_string(variant), run3(t3, in));
+    report(std::string("special-3d-npot-gradients/") + std::to_string(variant), run3(t3n, in));
+    in.clear();
+    for (float a : vals)
+      for (float b : vals) {
+        const float row[9] = {a, b, frand(0.0f, 1.0f), 0.01f, -0.02f, 0.015f, 0.02f, 0.01f, -0.03f};
+        in.insert(in.end(), row, row + 9);
+      }
+    report(std::string("special-3d-coordinates/") + std::to_string(variant), run3(t3, in));
+    report(std::string("special-3d-npot-coordinates/") + std::to_string(variant), run3(t3n, in));
   }
   if (g_print) return 0;
   std::printf("%d mismatches\n%s\n", g_fails, g_fails == 0 ? "PASS" : "FAIL");

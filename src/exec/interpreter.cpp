@@ -13470,10 +13470,25 @@ void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetc
     fetch_texel(mem, d, g, out);
     return;
   }
-  if (f.cube || f.dims == 3)
+  if (f.cube)
     tex_fail(Err::Unsupported,
-             "tex.grad on a 3D or cube texture: the card's length of three gradient components (larger + 11/32 "
-             "middle + 1/4 smallest, to a part in a thousand) was not reproduced bit for bit");
+             "tex.grad on a cube texture: the card finds the level of detail from the four coordinates of a quad "
+             "of normalized directions, which is not reproduced bit for bit");
+  if (f.dims == 3) {   // see exec/texture_grad.hpp: the card's unit sees (P + d) - P, scaled by the size
+    const uint32_t size[3] = {d.width, d.height, d.depth};
+    double dx[3], dy[3];
+    for (int i = 0; i < 3; ++i) {
+      const float p = std::bit_cast<float>(f.coord[i]);
+      dx[i] = std::clamp(tex_grad::scale_by_size(tex_grad::quad_difference(p, std::bit_cast<float>(f.ddx[i])), size[i]),
+                         -1e300, 1e300);
+      dy[i] = std::clamp(tex_grad::scale_by_size(tex_grad::quad_difference(p, std::bit_cast<float>(f.ddy[i])), size[i]),
+                         -1e300, 1e300);
+    }
+    g.explicit_lod = true;
+    g.lod = static_cast<double>(tex_grad::lod_q_3d(dx, dy)) / 256.0;
+    fetch_texel(mem, d, g, out);
+    return;
+  }
   const bool one_d = f.dims == 1;
   // A gradient in texels of the base level, as the card's multiplier gives it (exact for a power-of-two size);
   // an infinite gradient (1e300 here) times a size stays finite.

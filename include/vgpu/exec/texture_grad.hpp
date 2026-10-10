@@ -118,6 +118,61 @@ inline double add_signed(double x, double y) {
   return big + std::copysign(std::floor(std::fabs(small) / gg) * gg, small);
 }
 
+// Sorts three magnitudes, largest first.
+inline void sort3(double* v) {
+  if (v[0] < v[1]) std::swap(v[0], v[1]);
+  if (v[1] < v[2]) std::swap(v[1], v[2]);
+  if (v[0] < v[1]) std::swap(v[0], v[1]);
+}
+
+// Approximate length of a vector of three components: larger + 11/32 middle + 1/4 smallest. The middle one's share
+// is built as in length_unit and cut to 10 bits; the smallest's quarter is cut to the grid of that share's 10 bits
+// before the three are added and cut again.
+inline double length3(const double* v3) {
+  double v[3] = {std::fabs(v3[0]), std::fabs(v3[1]), std::fabs(v3[2])};
+  sort3(v);
+  const double a = trunc_bits(v[0], 10), b = trunc_bits(v[1], 10), c = trunc_bits(v[2], 10);
+  if (b == 0) return a;
+  double bm;
+  int kb;
+  mant10(b, &bm, &kb);
+  const double p = trunc_bits(std::ldexp(round_half_up(11.0 * bm / 8.0), kb - 2), 10);
+  double q = 0;
+  if (c > 0) {
+    const double gr = std::ldexp(1.0, std::ilogb(p) - 9);
+    q = std::floor(c / 4 / gr) * gr;
+  }
+  return trunc_bits(a + p + q, 10);
+}
+
+// 11/16 of the length of a vector of three components (a diagonal of the quad), the same way: each share is
+// rounded from the 10-bit mantissa: round(11 M / 8) in units of 2^(k-1) for the largest, round(121 M / 64) in
+// units of 2^(k-3) for the middle one's share, round(11 M / 8) in units of 2^(k-3) for the smallest's.
+inline double diagonal3(const double* v3) {
+  double v[3] = {trunc_bits(std::fabs(v3[0]), 10), trunc_bits(std::fabs(v3[1]), 10),
+                 trunc_bits(std::fabs(v3[2]), 10)};
+  sort3(v);
+  if (v[0] == 0) return 0;
+  double m;
+  int k;
+  mant10(v[0], &m, &k);
+  const double ta = trunc_bits(std::ldexp(round_half_up(11.0 * m / 8.0), k - 1), 10);
+  double tb = 0, tc = 0;
+  if (v[1] > 0) {
+    mant10(v[1], &m, &k);
+    tb = trunc_bits(std::ldexp(round_half_up(121.0 * m / 64.0), k - 3), 10);
+  }
+  if (v[2] > 0) {
+    mant10(v[2], &m, &k);
+    tc = std::ldexp(round_half_up(11.0 * m / 8.0), k - 3);
+    if (tb > 0) {
+      const double gr = std::ldexp(1.0, std::ilogb(tb) - 9);
+      tc = std::floor(tc / gr) * gr;
+    }
+  }
+  return trunc_bits(ta + tb + tc, 10);
+}
+
 }  // namespace detail
 
 // Sanitizes a gradient component the way the card reads it: NaN is 0, infinities are huge.
@@ -163,6 +218,37 @@ inline int64_t lod_q_2d(double dudx, double dvdx, double dudy, double dvdy) {
                                diagonal_unit(add_signed(a1, a3), add_signed(a2, a4)),
                                diagonal_unit(add_signed(a1, -a3), add_signed(a2, -a4))});
   return log2_q(rho);
+}
+
+// The LOD in 1/256ths of a level for a 3D fetch from the gradients in texels of the base level, dPdx = dx[0..2] and
+// dPdy = dy[0..2]. The vectors, their sum and their difference are measured as for a 2D fetch, with the
+// three-component lengths above.
+inline int64_t lod_q_3d(const double* dx, const double* dy) {
+  using namespace detail;
+  double sum[3], dif[3];
+  for (int i = 0; i < 3; ++i) {
+    const double a = t10(dx[i]), b = t10(dy[i]);
+    sum[i] = add_signed(a, b);
+    dif[i] = add_signed(a, -b);
+  }
+  const double rho = std::max({length3(dx), length3(dy), diagonal3(sum), diagonal3(dif)});
+  return log2_q(rho);
+}
+
+// What the card's texture unit sees as a gradient of a 3D (or cube) fetch. ptxas builds those fetches from the four
+// coordinates of a quad -- P, P + dPdx, P + dPdy -- computed in single precision and handed to the unit, which takes
+// their differences; so the gradient is (P + d) - P rounded to P's precision, not d.
+inline double quad_difference(float p, float d) {
+  volatile float c = p + d;   // one single-precision add, as FSWZADD does it
+  const float cc = c;
+  // A coordinate that is NaN reads as 0 in the unit (measured: a NaN gradient component makes the level of the
+  // fetch that of a jump from the coordinate to 0), and one of 2^97 or more, infinite included, makes the
+  // difference overflow: the fetch reads the last level whatever the other components are.
+  constexpr float kOverflow = 0x1p97f;
+  if ((!std::isnan(p) && std::fabs(p) >= kOverflow) || (!std::isnan(cc) && std::fabs(cc) >= kOverflow)) return 1e300;
+  const double c0 = std::isnan(p) ? 0.0 : static_cast<double>(p);
+  const double c1 = std::isnan(cc) ? 0.0 : static_cast<double>(cc);
+  return c1 - c0;
 }
 
 }  // namespace vgpu::exec::tex_grad
