@@ -3,15 +3,23 @@
 
 namespace {
 
+// The display window (x0, y0, w, h) of a plane, scaled to the target size; a window that is the target's own size is copied as it is,
+// padded with zeros where it reaches past the picture (a coded size is a whole number of 16x16 blocks, the picture need not be).
 template <class T>
-std::vector<T> window_to_target_t(const T* src, int stride, int x0, int y0, int w, int h, uint32_t tw, uint32_t th) {
-  std::vector<T> win(static_cast<size_t>(w) * static_cast<size_t>(h));
-  for (int y = 0; y < h; ++y) std::memcpy(&win[static_cast<size_t>(y) * static_cast<size_t>(w)], src + static_cast<ptrdiff_t>(y0 + y) * stride + x0, static_cast<size_t>(w) * sizeof(T));
-  if (static_cast<uint32_t>(w) == tw && static_cast<uint32_t>(h) == th) return win;
+std::vector<T> window_to_target_t(const T* src, int stride, int pw, int ph, int x0, int y0, int w, int h, uint32_t tw, uint32_t th) {
+  if (static_cast<uint32_t>(w) == tw && static_cast<uint32_t>(h) == th) {
+    std::vector<T> out(static_cast<size_t>(tw) * th, 0);
+    for (int y = 0; y < h && y0 + y < ph; ++y)
+      std::memcpy(&out[static_cast<size_t>(y) * tw], src + static_cast<ptrdiff_t>(y0 + y) * stride + x0, static_cast<size_t>(std::max(0, std::min(w, pw - x0))) * sizeof(T));
+    return out;
+  }
+  const int cw = std::max(1, std::min(w, pw - x0)), ch = std::max(1, std::min(h, ph - y0));
+  std::vector<T> win(static_cast<size_t>(cw) * static_cast<size_t>(ch));
+  for (int y = 0; y < ch; ++y) std::memcpy(&win[static_cast<size_t>(y) * static_cast<size_t>(cw)], src + static_cast<ptrdiff_t>(y0 + y) * stride + x0, static_cast<size_t>(cw) * sizeof(T));
   ScaleMode sm;
   sm.down_num = 1;
   sm.down_den = 2;
-  return resample(win, static_cast<uint32_t>(w), static_cast<uint32_t>(h), tw, th, sm);
+  return resample(win, static_cast<uint32_t>(cw), static_cast<uint32_t>(ch), tw, th, sm);
 }
 
 // The decoded picture as the decoder's surface: NV12 for 8-bit output, P016 (samples in the high bits of 16) otherwise.
@@ -24,8 +32,8 @@ CUresult write_hevc_surface(Decoder& d, const vgpu_hevc::Frame& f, int bit_depth
   }
   l = std::max(0, std::min(l, fw));
   t = std::max(0, std::min(t, fh));
-  r = std::max(l + 2, std::min(r, fw));
-  b = std::max(t + 2, std::min(b, fh));
+  r = std::max(l + 2, std::min(r, static_cast<int>(d.width)));
+  b = std::max(t + 2, std::min(b, static_cast<int>(d.height)));
   l &= ~1;
   t &= ~1;
   const int w = r - l, h = b - t;
@@ -42,9 +50,9 @@ CUresult write_hevc_surface(Decoder& d, const vgpu_hevc::Frame& f, int bit_depth
       return o;
     };
     const std::vector<uint8_t> y8 = to8(f.y), u8 = to8(f.u), v8 = to8(f.v);
-    const std::vector<uint8_t> yt = window_to_target_t<uint8_t>(y8.data(), f.stride_y, l, t, w, h, tw, th);
-    const std::vector<uint8_t> ut = window_to_target_t<uint8_t>(u8.data(), f.stride_c, l / 2, t / 2, cw, chh, tcw, tch),
-                               vt = window_to_target_t<uint8_t>(v8.data(), f.stride_c, l / 2, t / 2, cw, chh, tcw, tch);
+    const std::vector<uint8_t> yt = window_to_target_t<uint8_t>(y8.data(), f.stride_y, f.width, f.height, l, t, w, h, tw, th);
+    const std::vector<uint8_t> ut = window_to_target_t<uint8_t>(u8.data(), f.stride_c, f.cwidth, f.cheight, l / 2, t / 2, cw, chh, tcw, tch),
+                               vt = window_to_target_t<uint8_t>(v8.data(), f.stride_c, f.cwidth, f.cheight, l / 2, t / 2, cw, chh, tcw, tch);
     std::vector<uint8_t> uv(static_cast<size_t>(tcw) * 2 * tch);
     for (size_t i = 0; i < ut.size(); ++i) {
       uv[2 * i] = ut[i];
@@ -61,9 +69,9 @@ CUresult write_hevc_surface(Decoder& d, const vgpu_hevc::Frame& f, int bit_depth
     return o;
   };
   const std::vector<uint16_t> y16 = to16(f.y), u16 = to16(f.u), v16 = to16(f.v);
-  const std::vector<uint16_t> yt = window_to_target_t<uint16_t>(y16.data(), f.stride_y, l, t, w, h, tw, th);
-  const std::vector<uint16_t> ut = window_to_target_t<uint16_t>(u16.data(), f.stride_c, l / 2, t / 2, cw, chh, tcw, tch),
-                              vt = window_to_target_t<uint16_t>(v16.data(), f.stride_c, l / 2, t / 2, cw, chh, tcw, tch);
+  const std::vector<uint16_t> yt = window_to_target_t<uint16_t>(y16.data(), f.stride_y, f.width, f.height, l, t, w, h, tw, th);
+  const std::vector<uint16_t> ut = window_to_target_t<uint16_t>(u16.data(), f.stride_c, f.cwidth, f.cheight, l / 2, t / 2, cw, chh, tcw, tch),
+                              vt = window_to_target_t<uint16_t>(v16.data(), f.stride_c, f.cwidth, f.cheight, l / 2, t / 2, cw, chh, tcw, tch);
   std::vector<uint16_t> uv(static_cast<size_t>(tcw) * 2 * tch);
   for (size_t i = 0; i < ut.size(); ++i) {
     uv[2 * i] = ut[i];

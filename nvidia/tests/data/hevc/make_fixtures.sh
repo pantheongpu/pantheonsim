@@ -34,6 +34,7 @@ gen weightb       160x144 12 "bframes=2:weightb=1:weightp=1:ref=3:keyint=30" "fa
 gen no_tmvp       160x144 8  "bframes=2:temporal-mvp=0:keyint=30"
 gen main10        192x144 10 "bframes=2:keyint=30:output-depth=10" "" yuv420p10le
 gen main10_i      160x144 3  "keyint=1:output-depth=10" "" yuv420p10le
+gen main10_wide   288x144 5  "bframes=2:keyint=30:output-depth=10" "" yuv420p10le
 gen crop          198x138 8  "bframes=2:keyint=30"
 gen crop_odd      202x146 6  "bframes=2:keyint=30"
 gen size_136      160x136 4  "bframes=1:keyint=30"

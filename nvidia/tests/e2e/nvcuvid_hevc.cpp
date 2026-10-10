@@ -99,9 +99,12 @@ static int CUDAAPI seq_cb(void*, CUVIDEOFORMAT* f) {
   ci.ulMaxWidth = f->coded_width;
   ci.ulMaxHeight = f->coded_height;
   ci.ulNumOutputSurfaces = 2;
-  ci.display_area = {static_cast<short>(f->display_area.left), static_cast<short>(f->display_area.top), static_cast<short>(f->display_area.right),
-                     static_cast<short>(f->display_area.bottom)};
+  // plain mode: the whole coded picture is the display area (a smaller one would be scaled to the target size); the frame checksums
+  // are over the sequence's display rectangle of the surface
+  ci.display_area = {0, 0, static_cast<short>(f->coded_width), static_cast<short>(f->coded_height)};
   if (run->crop_in_decoder) {
+    ci.display_area = {static_cast<short>(f->display_area.left), static_cast<short>(f->display_area.top), static_cast<short>(f->display_area.right),
+                       static_cast<short>(f->display_area.bottom)};
     ci.ulTargetWidth = dw;
     ci.ulTargetHeight = dh;
   } else {
@@ -465,7 +468,73 @@ static void caps_and_creation() {
   }
 }
 
-static void run_hevc_suite(const std::string&, const std::string&, const std::string&) {}
+static void run_hevc_suite(const std::string& base, const std::string& only, const std::string& skip) {
+  static const char* const names[] = {
+      "i_only",      "p_low",      "b_flat",    "b_pyramid",  "sao_off",   "deblock_off", "deblock_offs", "amp_rect",   "ctu16",   "ctu32",      "tskip",
+      "lossless",    "cu_lossless", "no_signhide", "scaling_def", "wpp",     "slices",      "weightp",      "weightb",    "no_tmvp", "main10",     "main10_i",
+      "main10_wide", "cip",        "no_strong", "open_gop",   "long_gop",  "lowqp",       "highqp",       "aud_hrd",    "max_merge2", "cutree_idr", "rd_deep",
+      "tu_deep",     "b_sei",      "b_aud",     "b_ps_mid",   "cra_first", "bla",         "eos_mid",      "res_change", "crop",       "crop_odd",    "size_136"};
+  const Mode plain{"packets"};
+  auto load = [&](const char* n) { return slurp(base + "/hevc/" + n + ".h265"); };
+  const auto stream = [&](const char* n, const Mode& m) {
+    const std::vector<uint8_t> d = load(n);
+    if (d.empty()) {
+      std::printf("FAIL: %s/hevc/%s.h265 is missing\n", base.c_str(), n);
+      ++failures;
+      return;
+    }
+    play(n, d, m);
+  };
+  if (!only.empty() && std::find_if(std::begin(names), std::end(names), [&](const char* n) { return only == n; }) == std::end(names)) {
+    // a stream that is not in the list (for probing the card with a new file): played as it is
+    stream(only.c_str(), plain);
+    return;
+  }
+  for (const char* n : names) {
+    if (!only.empty() && only != n) continue;
+    if (("," + skip + ",").find(std::string(",") + n + ",") != std::string::npos) continue;
+    stream(n, plain);
+  }
+  if (!only.empty()) return;
+  // How the parser is driven: the whole file in one packet, packets of arbitrary size (the parser looks at a NAL unit once 13 bytes of a
+  // slice, VPS or SPS are in), packets that end a picture, timestamps given and not given, clock rates, the parser's own surface count.
+  stream("b_pyramid", Mode{"onepacket", false});
+  for (size_t c : {5, 13, 14, 64, 256, 1000, 4096}) {
+    static char labels[8][16];
+    static int nl = 0;
+    std::snprintf(labels[nl], sizeof labels[nl], "chunk%zu", c);
+    Mode cm{labels[nl++]};
+    cm.chunk = c;
+    stream("b_pyramid", cm);
+  }
+  stream("b_sei", Mode{"chunk13", true, 0, false, 1000, 1, 0, 0, 13});
+  {
+    Mode eop{"endofpicture"};
+    eop.end_of_picture = true;
+    stream("b_pyramid", eop);
+  }
+  stream("b_pyramid", Mode{"irregular_ts", true, 0, false, 1000, 1, 1, 0});
+  stream("b_pyramid", Mode{"no_ts", true, 0, false, 1000, 1, 2, 0});
+  stream("b_pyramid", Mode{"first_ts", true, 0, false, 1000, 1, 3, 0});
+  stream("b_pyramid", Mode{"start_5000", true, 0, false, 1000, 1, 0, 5000});
+  stream("b_pyramid", Mode{"clock_90k", true, 0, false, 90000, 1, 0, 0});
+  stream("b_pyramid", Mode{"clock_default", true, 0, false, 0, 1, 0, 0});
+  stream("b_pyramid", Mode{"surfaces8", true, 0, false, 1000, 8});
+  stream("b_pyramid", Mode{"onepacket_90k", false, 0, false, 90000});
+  stream("b_pyramid", Mode{"onepacket_default", false, 0, false, 0});
+  // The display delay.
+  for (const char* n : {"b_pyramid", "b_flat", "open_gop"}) {
+    stream(n, Mode{"delay1", true, 1});
+    stream(n, Mode{"delay2", true, 2});
+    stream(n, Mode{"delay4", true, 4});
+  }
+  for (const char* n : {"p_low", "i_only", "weightp"}) {
+    stream(n, Mode{"delay1", true, 1});
+    stream(n, Mode{"delay3", true, 3});
+  }
+  // Display area and target size: a crop that fills the target is exact.
+  for (const char* n : {"crop", "crop_odd", "size_136"}) stream(n, Mode{"cropped", true, 0, true});
+}
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -514,6 +583,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   data_dir = base;
+  if (only.empty()) caps_and_creation();
   run_hevc_suite(base, only, skip);
   std::printf("%s\n", failures ? "FAIL" : "done");
   return failures ? 1 : 0;

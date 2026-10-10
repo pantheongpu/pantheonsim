@@ -253,7 +253,6 @@ bool Dec::decode_slice_segment(const SliceData& sd, bool first) {
     return false;
   }
   ctb_addr_ts_ = tiles_.rs_to_ts[static_cast<size_t>(ctb_addr_rs_)];
-  if (getenv("HEVC_DBG")) fprintf(stderr, "slice seg addr %u dep %d type %d bits %zu size %zu qp %d\n", h.segment_address, h.dependent, h.slice_type, h.data_bit_offset, rbsp.size(), S->slice_qp);
   decode_ctus();
   sd_ = nullptr;
   return ok_;
@@ -323,7 +322,6 @@ void Dec::decode_ctus() {
       return;
     }
     if (ctb_addr_ts_ >= pic_size_ctbs) {
-      if (getenv("HEVC_DBG")) fprintf(stderr, "runs past: seg addr %u dep %d bitpos %zu size %zu\n", sh_.segment_address, sh_.dependent, bitpos_, sd_size_);
       fail("slice segment data runs past the picture");
       return;
     }

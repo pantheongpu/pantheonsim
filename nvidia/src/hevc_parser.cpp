@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <functional>
 
 namespace vgpu_hevc {
@@ -19,6 +20,7 @@ struct Pic {
   int slot = -1;
   bool in_dpb = false;
   bool queued = false;         // bumped, waiting in the display queue
+  bool never_output = false;   // PicOutputFlag is 0: the picture is not displayed
   bool displayed = false;      // its display callback has been made (or it is not output at all)
   int disp_seq = 0;            // the display count at that moment
   bool current = false;        // the picture being decoded or stored
@@ -73,6 +75,7 @@ struct HevcParser::Impl {
   std::deque<int> pool_order;   // the pool's surfaces in the order they are tried
   std::vector<PicPtr> surf_pic; // the picture each surface holds
   int display_count = 0, hold_displays = 3;
+  PicPtr last_pic;              // the picture decoded last
 
   // ---- DPB ----
   std::vector<PicPtr> dpb;
@@ -93,11 +96,16 @@ struct HevcParser::Impl {
     SliceHeader first, last;
     int nal_type = 0, tid = 0;
     bool skip = false;
+    bool no_output = false;      // PicOutputFlag forced to 0
     bool no_rasl_output = false;
     PicDesc desc;
     bool all_intra = true;
     int64_t ts = 0;
     std::vector<SeiMessage> sei;
+    // filled by prepare_picture(): the picture order count and the reference picture set
+    bool prepared = false;
+    int poc = 0;
+    std::vector<PicPtr> st_before, st_after, lt_curr;
   };
   std::unique_ptr<Cur> cur;
   std::vector<SeiMessage> pending_sei;
@@ -242,9 +250,7 @@ struct HevcParser::Impl {
         break;
       case kEos:
       case kEob:
-        finish_picture();
-        after_eos = true;
-        flush_output(true);
+        finish_picture();   // measured: the card does nothing more -- the pictures before it stay in the DPB, a CRA picture after it is no random access point
         break;
       case kPrefixSei:
       case kSuffixSei:
@@ -348,7 +354,11 @@ struct HevcParser::Impl {
     SliceHeader h;
     const SliceCtx ctx = make_ctx(*cur->sps, *cur->pps);
     if (!parse_slice_header(br, ctx, type, cur->desc.slice_nal.empty() ? nullptr : &cur->last, &h)) return;
-    if (first_flag) cur->first = h;
+    if (first_flag) {
+      cur->first = h;
+      if (h.pic_output_flag && !cur->no_output) ts_heap.push(cur->ts);
+      prepare_picture(*cur);
+    }
     if (!h.dependent) cur->last = h;
     if (!h.is_intra()) cur->all_intra = false;
     PicDesc& d = cur->desc;
@@ -460,8 +470,20 @@ struct HevcParser::Impl {
 
   int alloc_pic_idx() {
     for (;;) {
-      for (int s : pool_order)
-        if (surface_free(surf_pic[static_cast<size_t>(s)], hold_displays)) return take_surface(s);
+      // first the surfaces of pictures that were never output (they go as soon as they are no longer references, and the card reuses
+      // those rather than a fresh surface), then the others in the order they were first given out: the ones never used come
+      // first, then the surfaces used before, oldest first
+      for (int pass = 0; pass < 2; ++pass) {
+        int best = -1;
+        for (int s : pool_order) {
+          const PicPtr& f = surf_pic[static_cast<size_t>(s)];
+          if (pass == 0 && !(f && f->never_output)) continue;
+          if (!surface_free(f, hold_displays)) continue;
+          if (!f) return take_surface(s);
+          if (best < 0 || f->disp_seq < surf_pic[static_cast<size_t>(best)]->disp_seq) best = s;
+        }
+        if (best >= 0) return take_surface(best);
+      }
       int best = -1;
       for (int s = 0; s < pool; ++s) {
         const PicPtr& f = surf_pic[static_cast<size_t>(s)];
@@ -576,10 +598,9 @@ struct HevcParser::Impl {
       c.no_rasl_output = is_idr(type) || is_bla(type) || first_pic || after_eos;
       assoc_irap_no_rasl = c.no_rasl_output;
     }
-    if (is_rasl(type) && assoc_irap_no_rasl) {
-      c.skip = true;   // RASL pictures of a random access point decoding starts at are neither decoded nor output
-      return true;
-    }
+    // RASL pictures of a random access point decoding starts at are decoded (the card's parser hands them to the decoder with the
+    // references it has) but not output (PicOutputFlag is 0, 8.1.3)
+    c.no_output = is_rasl(type) && assoc_irap_no_rasl;
     // ---- sequence change: announced when the first slice segment of the picture is read
     {
       const Sps& s = *c.sps;
@@ -593,13 +614,18 @@ struct HevcParser::Impl {
         have_info = true;
         const int ret = sink->sequence(info);
         pool = ret > 1 ? ret : std::max(1, info.min_surfaces);
-        pool_order.clear();
-        surf_pic.assign(static_cast<size_t>(pool), nullptr);
-        display_count = 0;
-        for (int i = 0; i < pool; ++i) pool_order.push_back(i);
+        // the pictures of the old sequence are all output; the surfaces keep their state (the card's first picture of a new sequence
+        // takes a surface that was never used, and then the one displayed longest ago, as before)
+        for (const PicPtr& f : dpb) f->ref_short = f->ref_long = false;
         for (int i = 0; i < 16; ++i) slots[i].reset();
         dpb.clear();
         out_queue.clear();
+        std::deque<int> order;
+        for (int i : pool_order)
+          if (i < pool) order.push_back(i);
+        for (int i = static_cast<int>(surf_pic.size()); i < pool; ++i) order.push_back(i);
+        pool_order = order;
+        surf_pic.resize(static_cast<size_t>(pool));
       }
       active_sps = c.sps;
       hold_displays = s.max_num_reorder[hi] + 3;
@@ -631,7 +657,6 @@ struct HevcParser::Impl {
     last_pic_ts = ts;
     have_last_ts = true;
     c.ts = ts;
-    ts_heap.push(ts);
     return true;
   }
 
@@ -761,11 +786,10 @@ struct HevcParser::Impl {
     resolve_scaling(s, p, &pp);
   }
 
-  void finish_picture() {
-    if (!cur) return;
-    std::unique_ptr<Cur> own = std::move(cur);
-    Cur& c = *own;
-    if (c.skip || c.desc.slice_offsets.empty()) return;
+  // Everything up to the removal and output before decoding (C.5.2.2): the card does this as soon as the first slice segment of the
+  // picture has been consumed, which can be well before the picture is complete (measured with chunked feeding).
+  void prepare_picture(Cur& c) {
+    c.prepared = true;
     const Sps& s = *c.sps;
     const SliceHeader& h = c.first;
     const int hi = s.highest_tid();
@@ -836,6 +860,12 @@ struct HevcParser::Impl {
       for (int p : st_before_poc) st_before.push_back(find_st(p));
       for (int p : st_after_poc) st_after.push_back(find_st(p));
       for (int p : st_foll_poc) st_foll.push_back(find_st(p));
+      // a reference picture that is not there (a RASL picture after a random access point, a damaged stream) is replaced by the picture
+      // decoded last (measured on the card's picture tables)
+      if (last_pic)
+        for (auto* v : {&st_before, &st_after, &lt_curr})
+          for (PicPtr& f : *v)
+            if (!f) f = last_pic;
       // everything else is no longer a reference
       for (const PicPtr& f : dpb) {
         bool keep = false;
@@ -869,6 +899,24 @@ struct HevcParser::Impl {
       }
     }
     pop_queue(eff_queue());
+    c.poc = poc;
+    c.st_before = std::move(st_before);
+    c.st_after = std::move(st_after);
+    c.lt_curr = std::move(lt_curr);
+  }
+
+  void finish_picture() {
+    if (!cur) return;
+    std::unique_ptr<Cur> own = std::move(cur);
+    Cur& c = *own;
+    if (c.skip || c.desc.slice_offsets.empty()) return;
+    if (!c.prepared) prepare_picture(c);
+    const Sps& s = *c.sps;
+    const SliceHeader& h = c.first;
+    const int poc = c.poc;
+    const std::vector<PicPtr>& st_before = c.st_before;
+    const std::vector<PicPtr>& st_after = c.st_after;
+    const std::vector<PicPtr>& lt_curr = c.lt_curr;
     // the surface of the picture is taken just before it is decoded
     PicPtr fs = std::make_shared<Pic>();
     fs->poc = poc;
@@ -922,20 +970,22 @@ struct HevcParser::Impl {
     // ---- store the current picture and bump (C.3.4, C.5.2.3)
     fs->current = false;
     fs->ref_short = true;
-    const bool out_flag = h.pic_output_flag;
+    const bool out_flag = h.pic_output_flag && !c.no_output;
     if (out_flag) {
       for (const PicPtr& f : dpb)
         if (f->need_output && f->poc > poc) ++f->latency;
       fs->need_output = show;
       fs->latency = 0;
     }
-    if (!fs->need_output) {
+    if (!fs->need_output) {   // never displayed: its surface goes as soon as it is no longer a reference
       fs->displayed = true;
-      fs->disp_seq = display_count;
+      fs->never_output = true;
+      fs->disp_seq = -(1 << 30);
     }
     fs->in_dpb = true;
     fs->progressive = !s.field_seq;
     dpb.push_back(fs);
+    last_pic = fs;
     assign_slot(fs);   // a frame store keeps its place in the picture table while it is in the DPB
     while (need_bump(s) && bump_one()) {
     }
