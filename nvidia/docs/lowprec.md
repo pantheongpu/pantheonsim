@@ -160,7 +160,9 @@ side with `LOWPREC_KEEP=<dir>`).
     -3 (a double reciprocal gave a tie, and -2).
   - *Natively run programs.* The card's own checks in `lt_paths`/`lt_blockscaled_paths` (the program run
     on the card, `card/` directory) agree: VEC128_32F/BLK128x128_32F A/B scales are refused on sm_120, and the MX/NV
-    D-scale checks of that test (written from the documentation) fail on the card.
+    D-scale checks of that test (written from the documentation) fail on the card. Run on the simulator with
+    the `rtx-pro-6000-server` profile, `lt_paths` and `lt_blockscaled_paths` now fail the same checks, one and
+    four, as the card does.
 * **cuSPARSELt (`sparselt`): reproduced but for one of 1097 cases** (`nvidia/src/cusparselt_api.cpp`, "sm_120"
   comments; sm_120 only, the others keep the L4's rules).
   - *Sizes.* FP8 and FP4 compress to values + metadata where the metadata is 2048 bytes for every 128 x 128

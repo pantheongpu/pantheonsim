@@ -1107,6 +1107,7 @@ bool is_block_mode(int mode) {
 // x rounded toward zero to fp32 (denormals included); zero is +0.
 float rz_to_float(double x) {
   if (std::isnan(x)) { uint32_t b = 0x7fffffffu; float f; std::memcpy(&f, &b, 4); return f; }
+  if (std::fabs(x) > 3.4028234663852886e38) return std::copysign(INFINITY, x);   // (past fp32: not a float cast)
   float f = (float)x;
   if (std::isinf(f) && !std::isinf(x)) f = std::nextafterf(f, 0.f);
   else if (std::fabs((double)f) > std::fabs(x)) f = std::nextafterf(f, 0.f);
