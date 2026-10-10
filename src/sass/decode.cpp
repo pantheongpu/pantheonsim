@@ -3844,12 +3844,6 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   }
   char b[64];
   std::snprintf(b, sizeof b, "SASS: unknown opcode 0x%03x (sm_%d)", opc, sm);
-  // BMOV (barrier registers) and FSWZADD are how ptxas builds tex.grad on a 3D or cube texture: a quad of TEX.NDV
-  // fetches with swizzled coordinates, whose implicit level of detail is not modelled.
-  if ((opc & 0xfff) == 0xf55)
-    throw Error(Err::UnsupportedPtx, std::string(b) + " -- BMOV, which ptxas emits around the quad of TEX.NDV fetches "
-                "that implement tex.grad on 3D and cube textures; those are not supported (VGPU_SASS=0 runs the PTX, "
-                "which refuses them by name too)");
   throw Error(Err::UnsupportedPtx, b);
 }
 

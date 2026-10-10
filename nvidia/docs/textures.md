@@ -335,8 +335,8 @@ threshold, fractional biases and clamps -- in both engines against the card's ha
 ## tex.grad
 
 The level of detail of a fetch with explicit gradients (`tex2DGrad` and friends) is derived from them by the
-texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D and 2D textures, layered or
-not, of any size (the program `texture_grad` hashes the fetches of the card on both engines). It was
+texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D, 2D and 3D textures, layered
+or not, of any size (the program `texture_grad` hashes the fetches of the card on both engines). It was
 found by reading the level of detail straight off the card: a mipmapped texture whose level k holds the constant
 k, filtered trilinearly, returns the LOD in 1/256ths of a level itself, and about 5 million such fetches (random
 and gridded gradients of every size, sign and relation) were fitted. What the card does is in
@@ -361,16 +361,51 @@ shifting right by 3 bits (4 when the sum is 2 or more, where the extra integer b
 of the product shows as a step function of the gradient's significand that moves with the size's bits) and then
 for every pair, over 14 sizes from 3 to 16383, about 1.5 million fetches with no difference.
 
+**3D textures** are not a TXD in SASS: ptxas builds `tex3DGrad` from a quad of `TEX.NDV` fetches. Each thread of
+the quad broadcasts its position P and gradients with `SHFL.IDX`, `FSWZADD.NDV` makes the four coordinates of a quad
+(P, P + dPdx, P + dPdy, and the sum of both) in single precision, a `TEX.NDV` with no level operand takes the level of
+detail from the coordinates of the quad it sits in, and `MOV Rd, Rs, mask` gathers the four results (the mask is the
+places of the quad that write: 1, 2, 4, 8). The whole is wrapped in `BMOV.32 B15, MACTIVE` / `BMOV.32.PQUAD MACTIVE,
+B15` and the restoring `BMOV`, which make every thread of a quad with one thread running take part (a thread that has
+exited or sits in another branch is a helper whose registers are written). The unit sees a gradient of c1 - c0
+where c1 = fl32(P + d), so the gradient is rounded to P's precision (a gradient of 2^-10 at P = 1.9 is read
+as 2^-10 to the nearest 2^-23); a coordinate that is NaN reads as 0, and one of 2^97 or more (infinities included)
+overflows the fetch to the last level. Given those differences the level follows the 2D pipeline with three
+components (`length3`, `diagonal3`, `lod_q_3d`): a length is larger + 11/32 middle + 1/4 smallest, the middle's
+share built as in two dimensions and cut to 10 bits, the smallest's quarter cut to the grid of that share before
+the three are added and cut again; a diagonal's shares are 11/16, 121/512 and 11/64 of the components. Fitted on
+~1.5 million fetches over eight sizes (powers of two or not, per-axis) and the special values, with no difference.
+The simulator runs the quad in the SASS engine (`BMOV`, `FSWZADD`, `MOV` with a quad mask and `TEX.NDV`) and the
+PTX engine computes the same level from P and the gradient, and both agree with the card on fetches where only some
+threads of a quad fetch (the `3d-divergent` cases).
+
+**Cube maps** were measured the same way but are refused. ptxas builds `texCubemapGrad` from the same quad of
+`TEX.NDV`, with each lane's direction normalized by its largest component (`FMNMX`, `MUFU.RCP`, `FMUL`). The unit
+then works in the face of the first lane: a lane on the same face gives the difference of the normalized
+coordinates, a lane on a neighbouring face is unfolded (its coordinate along the shared edge is 1 - r + the distance
+of the first lane to the edge, r being the neighbour's component along the first lane's axis, signed), a lane on the
+opposite face overflows the fetch, and the two diagonals of the quad count only when the first three lanes are on one
+face. That model matches an RTX 3060 on 31,083 of 31,083 random fetches when the card's own `MUFU.RCP` is used, but
+the simulator's reciprocal is the correctly rounded one and the card's differs from it by one unit in the last
+place on 13% of the inputs (it is a table with a quadratic interpolation, not reproduced), which changes the
+level of about one fetch in 15,000. So cube textures stay refused rather than right 99.99% of the time.
+
+**Texture coordinates on levels that are not a power of two wide** have a rule of their own, found while checking
+these fetches: the card floors the normalized coordinate to 21 fractional bits (negative ones toward minus
+infinity) before it multiplies by the width of the level (`texel_coordinate`). A point fetch at the float above 0.04
+on a 25-texel level reads texel 0, where the exact product 1.0000000708 says 1; the switch from texel k - 1 to k is at
+ceil(k 2^21 / width) / 2^21, and every 8-bit filter weight follows the floored coordinate. A NaN coordinate reads as 0.
+Powers of two are unaffected (the product is exact).
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
 
-- **`tex.grad` beyond the cases that are exact.** 1D and 2D textures (and their layered forms; SASS `TXD`) of
-  any size derive their level of detail from the gradients exactly as the card does (above). Not reproduced, and
-  refused by name: 3D and cube textures (the card's length of three gradient components is larger + 11/32 middle
-  + 1/4 smallest to a part in a thousand, but its rounding was not recovered, and ptxas builds those fetches
-  from quads of `TEX.NDV` instructions in SASS); and a texture with `maxAnisotropy` above 1 (the card then
-  filters along the major axis of the gradients' ellipse).
+- **`tex.grad` beyond the cases that are exact.** 1D, 2D and 3D textures (and their layered forms; SASS `TXD`
+  and the quad of `TEX.NDV`) of any size derive their level of detail from the gradients exactly as the card does
+  (above). Not reproduced, and refused by name: cube textures (the model above matches the card, but needs its
+  `MUFU.RCP` bit for bit) and a texture with `maxAnisotropy` above 1 (the card then filters along the major axis of
+  the gradients' ellipse).
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.

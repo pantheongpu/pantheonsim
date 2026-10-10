@@ -2539,6 +2539,11 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     // TEX.NDV on a 3D texture, with no LOD operand: the level comes from the coordinates of the quad this thread is
     // in -- threads 0, 1 and 2 of it are P, P + dPdx and P + dPdy, the way ptxas builds tex.grad (the threads
     // below the fetch's own are helpers, see BMOV.PQUAD MACTIVE).
+    if (ndv && !has_lod && cube && d.mip_levels > 0)
+      fault(w, ins, l,
+            "tex.grad on a cube texture: the card finds the level of detail from the four coordinates of a quad of "
+            "normalized directions, which is not reproduced bit for bit (VGPU_SASS=0 refuses it too)",
+            Err::UnsupportedPtx);
     if (ndv && !has_lod && dims == 3 && !cube && !layered && d.mip_levels > 0) {
       const unsigned qb = l & ~3u;
       double dq[2][3];
