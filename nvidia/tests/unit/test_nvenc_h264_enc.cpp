@@ -1,6 +1,7 @@
 // The compressing H.264 encoder behind NVENC (nvenc_h264_enc.cpp), read back by the decoder of this
 // tree (h264_stream.cpp: the video parser and the H.264 decoder NVDEC uses, bit-exact against the
-// card and ffmpeg on every fixture in nvidia/tests/data/h264). No ffmpeg needed:
+// card and ffmpeg on every fixture in nvidia/tests/data/h264). No ffmpeg needed (where it is installed, the
+// last test also has it decode a stream and compares with the decoder of this tree):
 //
 //  * the encoder's own reconstruction (made with the loop filter off) equals what the decoder
 //    returns for the bytes it wrote -- intra pictures and P pictures, every size from one
@@ -11,9 +12,14 @@
 //  * P pictures find motion, skip static content, and the first P picture without a reference
 //    becomes an IDR picture.
 #include <algorithm>
+#include <unistd.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "../../src/h264_stream.hpp"
@@ -275,6 +281,209 @@ VTEST(field_pictures_decode_to_the_encoders_reconstruction_and_predict_across_pa
         VCHECK(psnr_y(input[i], frames[i]) > 30.0);
       }
     }
+}
+
+
+// ---- the tools beyond the first encoder: CABAC, the 8x8 transform, slices, references, B pictures -----------------------------------------------
+
+namespace {
+
+// Codes `n` pictures of the scene in the order an application with `max_b` B pictures between P pictures would; returns the stream, and the encoder's
+// reconstruction of every picture in display order (the loop filter is off, so these are what a decoder returns).
+struct CodedSeq {
+  std::vector<uint8_t> stream;
+  std::vector<std::vector<uint8_t>> recon_y;   // by display order, coded_width() x coded_height()
+  std::vector<int> types;                      // coding order
+  int stride = 0;
+};
+CodedSeq code_seq(int w, int h, int n, int qp, vgpu_nvenc::H264Options opt, int profile, int gop = 0) {
+  CodedSeq c;
+  opt.deblock = false;
+  H264Encoder enc(w, h, 30, 1, profile, opt);
+  c.stream = enc.parameter_sets();
+  c.recon_y.resize(static_cast<size_t>(n));
+  c.stride = enc.coded_width();
+  auto code = [&](int d, PicType t, int q) {
+    const auto nal = enc.encode_at(scene(w, h, 2 * d, d), t, q, d);
+    c.stream.insert(c.stream.end(), nal.begin(), nal.end());
+    c.types.push_back(static_cast<int>(t));
+    c.recon_y[static_cast<size_t>(d)] = enc.recon_y();
+  };
+  for (int d = 0; d < n;) {
+    if (d == 0 || (gop && d % gop == 0)) {
+      code(d, PicType::kIdr, qp);
+      ++d;
+      continue;
+    }
+    const int remaining = gop ? gop - d % gop : n - d;
+    const int span = std::min(std::min(opt.max_b + 1, n - d), remaining);
+    const int anchor = d + span - 1;
+    code(anchor, PicType::kInter, qp);
+    for (int b = d; b < anchor; ++b) code(b, PicType::kBi, qp + 2);
+    d = anchor + 1;
+  }
+  return c;
+}
+
+// Every decoded frame is the encoder's reconstruction of that picture (luma; the chroma is checked on the last picture by equals_recon in the tests above).
+bool decodes_to_recon(const CodedSeq& c, int w, int h) {
+  const auto frames = decode(c.stream);
+  if (frames.size() != c.recon_y.size()) return false;
+  for (size_t i = 0; i < frames.size(); ++i) {
+    if (frames[i].width < w || frames[i].height < h) return false;
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        if (c.recon_y[i][static_cast<size_t>(y) * c.stride + x] != frames[i].y[static_cast<size_t>(y) * frames[i].width + x]) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+VTEST(cabac_and_the_8x8_transform_decode_to_the_encoders_reconstruction) {
+  const int sizes[][2] = {{16, 16}, {33, 20}, {96, 64}};
+  for (const auto& s : sizes)
+    for (const int qp : {0, 28, 51}) {
+      for (int variant = 0; variant < 4; ++variant) {
+        vgpu_nvenc::H264Options opt;
+        opt.cabac = variant & 1;
+        opt.transform8x8 = variant & 2;
+        opt.num_ref = 2;
+        const CodedSeq c = code_seq(s[0], s[1], 6, qp, opt, opt.transform8x8 ? 100 : 77);
+        VCHECK(decodes_to_recon(c, s[0], s[1]));
+      }
+    }
+}
+
+VTEST(several_slices_decode_to_the_encoders_reconstruction_and_are_counted) {
+  const int w = 96, h = 80;   // 6 x 5 macroblocks
+  const struct {
+    int mode, data, slices;
+  } layouts[] = {{0, 7, 5}, {2, 2, 3}, {3, 4, 4}, {3, 1, 1}, {0, 0, 1}};
+  for (const auto& l : layouts)
+    for (const bool cabac : {false, true}) {
+      vgpu_nvenc::H264Options opt;
+      opt.cabac = cabac;
+      opt.slice_mode = l.mode;
+      opt.slice_data = l.data;
+      H264Encoder enc(w, h, 30, 1, 77, opt);
+      EncStats st;
+      const auto nal = enc.encode(scene(w, h, 0, 0), PicType::kIdr, 28, &st);
+      VCHECK_EQ(st.slices, l.slices);
+      VCHECK_EQ(enc.last_slices(), l.slices);
+      int slice_nals = 0;
+      for (int t : nal_types(nal)) slice_nals += t == 5;
+      VCHECK_EQ(slice_nals, l.slices);
+      opt.deblock = false;
+      const CodedSeq c = code_seq(w, h, 4, 24, opt, 77);
+      VCHECK(decodes_to_recon(c, w, h));
+    }
+}
+
+VTEST(b_pictures_decode_to_the_encoders_reconstruction_in_display_order) {
+  const int sizes[][2] = {{32, 32}, {97, 53}};
+  for (const auto& s : sizes)
+    for (const int qp : {14, 34})
+      for (const int bf : {1, 4})
+        for (const bool cabac : {false, true}) {
+          vgpu_nvenc::H264Options opt;
+          opt.cabac = cabac;
+          opt.transform8x8 = cabac;
+          opt.max_b = bf;
+          opt.num_ref = 2;
+          const CodedSeq c = code_seq(s[0], s[1], 10, qp, opt, 100);
+          VCHECK(decodes_to_recon(c, s[0], s[1]));
+          VCHECK(c.types.size() == 10u);
+          VCHECK(c.types[1] == static_cast<int>(PicType::kInter));
+          VCHECK(c.types[2] == static_cast<int>(PicType::kBi));
+        }
+  // IDR pictures in the middle, a group cut short by the end of the GOP
+  vgpu_nvenc::H264Options opt;
+  opt.cabac = true;
+  opt.max_b = 3;
+  const CodedSeq c = code_seq(64, 48, 13, 26, opt, 77, 6);
+  VCHECK(decodes_to_recon(c, 64, 48));
+}
+
+VTEST(profiles_without_the_tools_do_not_use_them_and_b_pictures_cost_less_than_p_pictures) {
+  vgpu_nvenc::H264Options opt;
+  opt.cabac = true;
+  opt.transform8x8 = true;
+  opt.max_b = 3;
+  H264Encoder base(64, 48, 30, 1, 66, opt);   // Baseline: CAVLC, the 4x4 transform, no B pictures
+  VCHECK(!base.supports_b());
+  // the PPS of the Baseline stream says CAVLC (entropy_coding_mode_flag is the third field)
+  const auto ps = base.parameter_sets();
+  size_t pps = 0;
+  for (size_t i = 0; i + 5 < ps.size(); ++i)
+    if (ps[i] == 0 && ps[i + 1] == 0 && ps[i + 2] == 0 && ps[i + 3] == 1 && (ps[i + 4] & 31) == 8) pps = i + 5;
+  VCHECK(pps != 0);
+  VCHECK_EQ(static_cast<int>(ps[pps] >> 5 & 1), 0);   // after the two one-bit ue(0) fields: pic_parameter_set_id 1, seq_parameter_set_id 1, then entropy_coding_mode_flag
+  // with B pictures: the B pictures of a group are cheaper than its P picture
+  opt.num_ref = 2;
+  H264Encoder enc(160, 96, 30, 1, 100, opt);
+  VCHECK(enc.supports_b());
+  size_t p_bytes = 0, b_bytes = 0;
+  enc.encode_at(scene(160, 96, 0, 0), PicType::kIdr, 28, 0);
+  for (int g = 0; g < 3; ++g) {
+    p_bytes += enc.encode_at(scene(160, 96, 6 * (g + 1), 3 * (g + 1)), PicType::kInter, 28, 3 * (g + 1)).size();
+    for (int b = 2; b >= 1; --b) b_bytes += enc.encode_at(scene(160, 96, 2 * (3 * g + b), 3 * g + b), PicType::kBi, 30, 3 * g + b).size();
+  }
+  VCHECK(b_bytes < 2 * p_bytes);
+}
+
+VTEST(rollback_returns_the_encoder_to_the_state_before_a_picture) {
+  vgpu_nvenc::H264Options opt;
+  opt.cabac = true;
+  opt.max_b = 1;
+  opt.num_ref = 2;
+  H264Encoder a(96, 64, 30, 1, 100, opt), b(96, 64, 30, 1, 100, opt);
+  a.encode_at(scene(96, 64, 0, 0), PicType::kIdr, 28, 0);
+  b.encode_at(scene(96, 64, 0, 0), PicType::kIdr, 28, 0);
+  const auto first_try = a.encode_at(scene(96, 64, 4, 2), PicType::kInter, 18, 2);
+  a.rollback();
+  const auto p = a.encode_at(scene(96, 64, 4, 2), PicType::kInter, 34, 2);
+  VCHECK(p != first_try);
+  VCHECK(p == b.encode_at(scene(96, 64, 4, 2), PicType::kInter, 34, 2));
+  // a B picture after it, and the next group, are as if the first try had not happened
+  VCHECK(a.encode_at(scene(96, 64, 2, 1), PicType::kBi, 34, 1) == b.encode_at(scene(96, 64, 2, 1), PicType::kBi, 34, 1));
+  VCHECK(a.encode_at(scene(96, 64, 8, 4), PicType::kInter, 30, 4) == b.encode_at(scene(96, 64, 8, 4), PicType::kInter, 30, 4));
+}
+
+VTEST(ffmpeg_decodes_what_the_encoder_wrote_where_it_is_installed) {
+  if (std::system("command -v ffmpeg >/dev/null 2>&1") != 0) {
+    std::printf("note: ffmpeg not found, so no stream is decoded by it here (the decoder of this tree has read all of them above)\n");
+    return;
+  }
+  vgpu_nvenc::H264Options opt;
+  opt.cabac = true;
+  opt.transform8x8 = true;
+  opt.max_b = 2;
+  opt.num_ref = 2;
+  opt.slice_mode = 3;
+  opt.slice_data = 3;
+  const CodedSeq c = code_seq(96, 64, 8, 26, opt, 100);
+  const std::string file = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/vgpu_h264_enc_" + std::to_string(getpid()) + ".h264";
+  FILE* f = std::fopen(file.c_str(), "wb");
+  VCHECK(f != nullptr);
+  if (!f) return;
+  std::fwrite(c.stream.data(), 1, c.stream.size(), f);
+  std::fclose(f);
+  FILE* p = popen(("ffmpeg -v error -f h264 -i " + file + " -f rawvideo -pix_fmt yuv420p - 2>/dev/null").c_str(), "r");
+  std::vector<uint8_t> dec;
+  if (p) {
+    uint8_t buf[1 << 16];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) dec.insert(dec.end(), buf, buf + n);
+    VCHECK(pclose(p) == 0);
+  }
+  std::remove(file.c_str());
+  const size_t frame_bytes = 96 * 64 * 3 / 2;
+  VCHECK_EQ(dec.size(), frame_bytes * 8);
+  if (dec.size() != frame_bytes * 8) return;
+  for (int i = 0; i < 8; ++i)
+    for (int y = 0; y < 64; ++y)
+      VCHECK(std::memcmp(&dec[frame_bytes * i + static_cast<size_t>(y) * 96], &c.recon_y[static_cast<size_t>(i)][static_cast<size_t>(y) * c.stride], 96) == 0);
 }
 
 VTEST(the_initial_qp_falls_as_the_bit_rate_rises) {

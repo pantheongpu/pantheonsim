@@ -77,6 +77,10 @@ struct H264Stream {
   int profile_idc = 66;        // 66 Baseline, 77 Main, 100 High: the same tools are used in all three
   bool interlaced = false;     // field pictures (frame_mbs_only_flag 0, no macroblock-adaptive coding); height is the frame's
   int num_ref_frames = 1;
+  bool cabac = false;          // entropy_coding_mode_flag
+  bool transform_8x8 = false;  // transform_8x8_mode_flag (High profile)
+  int num_reorder = -1;        // >= 0: B pictures -- picture order counts are coded (type 0, log2_max_pic_order_cnt_lsb 8) and the VUI says how many
+                               // pictures precede a picture in decoding order and follow it in output order
   int mbs_x() const { return (width + 15) / 16; }
   // macroblock rows of the picture: of the frame, or of a field (a map unit is a pair of macroblock rows in a frame, one of a field)
   int mbs_y() const { return interlaced ? (height + 31) / 32 : (height + 15) / 16; }
@@ -117,6 +121,9 @@ struct H264Stream {
     if (interlaced) {
       w.ue(0);             // pic_order_cnt_type 0
       w.ue(12);            // log2_max_pic_order_cnt_lsb_minus4: 16 bits
+    } else if (num_reorder >= 0) {
+      w.ue(0);             // pic_order_cnt_type 0
+      w.ue(4);             // log2_max_pic_order_cnt_lsb_minus4: 8 bits
     } else {
       w.ue(2);             // pic_order_cnt_type 2: output order is decoding order
     }
@@ -144,7 +151,27 @@ struct H264Stream {
     } else {
       w.bit(0);
     }
-    w.bit(0);              // vui_parameters_present_flag
+    if (num_reorder >= 0) {
+      w.bit(1);            // vui_parameters_present_flag
+      w.bit(0);            // aspect_ratio_info_present_flag
+      w.bit(0);            // overscan_info_present_flag
+      w.bit(0);            // video_signal_type_present_flag
+      w.bit(0);            // chroma_loc_info_present_flag
+      w.bit(0);            // timing_info_present_flag
+      w.bit(0);            // nal_hrd_parameters_present_flag
+      w.bit(0);            // vcl_hrd_parameters_present_flag
+      w.bit(0);            // pic_struct_present_flag
+      w.bit(1);            // bitstream_restriction_flag
+      w.bit(1);            // motion_vectors_over_pic_boundaries_flag
+      w.ue(0);             // max_bytes_per_pic_denom
+      w.ue(0);             // max_bits_per_mb_denom
+      w.ue(16);            // log2_max_mv_length_horizontal
+      w.ue(16);            // log2_max_mv_length_vertical
+      w.ue(static_cast<uint32_t>(num_reorder));    // max_num_reorder_frames
+      w.ue(static_cast<uint32_t>(std::max(num_ref_frames, num_reorder)));   // max_dec_frame_buffering
+    } else {
+      w.bit(0);            // vui_parameters_present_flag
+    }
     w.trailing();
     return w.bytes();
   }
@@ -152,7 +179,7 @@ struct H264Stream {
     BitWriter w;
     w.ue(0);   // pic_parameter_set_id
     w.ue(0);   // seq_parameter_set_id
-    w.bit(0);  // entropy_coding_mode_flag: CAVLC
+    w.bit(cabac ? 1 : 0);  // entropy_coding_mode_flag
     w.bit(0);  // bottom_field_pic_order_in_frame_present_flag
     w.ue(0);   // num_slice_groups_minus1
     w.ue(0);   // num_ref_idx_l0_default_active_minus1
@@ -165,6 +192,11 @@ struct H264Stream {
     w.bit(1);  // deblocking_filter_control_present_flag
     w.bit(0);  // constrained_intra_pred_flag
     w.bit(0);  // redundant_pic_cnt_present_flag
+    if (transform_8x8) {
+      w.bit(1);  // transform_8x8_mode_flag
+      w.bit(0);  // pic_scaling_matrix_present_flag
+      w.se(0);   // second_chroma_qp_index_offset
+    }
     w.trailing();
     return w.bytes();
   }

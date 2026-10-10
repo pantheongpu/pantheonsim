@@ -8,303 +8,70 @@
 #include <cstring>
 
 #include "h264_decode.hpp"
+#include "nvenc_cabac.hpp"
 #include "nvenc_h264.hpp"
 
 namespace vgpu_nvenc {
 namespace {
 
 #include "h264_tables.inc"
+#include "nvenc_h264_xform.inc"
+#include "nvenc_h264_cabac.inc"
 
-inline int clip3(int lo, int hi, int v) { return v < lo ? lo : (v > hi ? hi : v); }
-inline uint8_t clip1(int v) { return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); }
-inline int median3(int a, int b, int c) { return std::max(std::min(a, b), std::min(std::max(a, b), c)); }
-inline int floor_log2(uint32_t x) {
-  int n = 0;
-  while (x >>= 1) ++n;
-  return n;
-}
+// ---- what the neighbours of a macroblock, and the entropy coder's contexts, need to know about it -------------------------------------------------
 
-// Position of 4x4 block luma4x4BlkIdx inside a macroblock, in 4x4 units.
-inline int blk_x(int idx) { return ((idx >> 2) & 1) * 2 + (idx & 1); }
-inline int blk_y(int idx) { return ((idx >> 3) & 1) * 2 + ((idx >> 1) & 1); }
+enum MbKind : uint8_t { kKNone = 0, kKI4, kKI8, kKI16, kKInter };
 
-// Forward quantisation factors MF and the dequantisation scale v of 8.5.9 (flat scaling lists), by qp % 6 and
-// the position class: 0 both coordinates even, 1 both odd, 2 otherwise.
-constexpr int kMF[6][3] = {{13107, 5243, 8066}, {11916, 4660, 7490}, {10082, 4194, 6554}, {9362, 3647, 5825}, {8192, 3355, 5243}, {7282, 2893, 4559}};
-constexpr int kScale[6][3] = {{10, 16, 13}, {11, 18, 14}, {13, 20, 16}, {14, 23, 18}, {16, 25, 20}, {18, 29, 23}};
-inline int pos_class(int k) {
-  const int i = k >> 2, j = k & 3;
-  if ((i & 1) == 0 && (j & 1) == 0) return 0;
-  if ((i & 1) == 1 && (j & 1) == 1) return 1;
-  return 2;
-}
-constexpr int kQpcTable[22] = {29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39};
-inline int qpc_of(int qp) { return qp < 30 ? qp : kQpcTable[qp - 30]; }
-
-// ---- bit counting ---------------------------------------------------------------------------------------------
-
-struct BitCounter {
-  size_t n = 0;
-  void put(uint32_t, int bits) { n += static_cast<size_t>(bits); }
-  void bit(int) { ++n; }
-  void ue(uint32_t v) { n += static_cast<size_t>(2 * floor_log2(v + 1) + 1); }
-  void se(int32_t v) { ue(v > 0 ? static_cast<uint32_t>(2 * v - 1) : static_cast<uint32_t>(-2 * static_cast<int64_t>(v))); }
+struct MbInfo {
+  int16_t slice = -1;          // the slice the macroblock was coded in; -1: not coded yet
+  uint8_t kind = kKNone;
+  bool skip = false, direct16 = false, t8 = false;
+  uint8_t direct8 = 0;         // 8x8 blocks whose motion is inferred (B_Skip, B_Direct_16x16, direct sub-macroblocks)
+  uint8_t cbp = 0;             // luma bits 0..3, chroma << 4
+  uint8_t chroma_mode = 0;
+  uint8_t cbf_dc = 0;          // coded_block_flag of the DC blocks: bit 0 Intra16x16 luma, 1 Cb, 2 Cr
+  int8_t qp = 0;
+  uint8_t nz[3][16];           // TotalCoeff of the luma 4x4 blocks (raster order) and of the Cb and Cr AC blocks (2x2 raster)
+  int8_t ipred[16];            // Intra4x4 / Intra8x8 prediction modes by raster 4x4 block; 2 where the macroblock is not Intra_NxN
+  int8_t ref[2][4];            // ref_idx by list and raster 8x8 block; -1: the list is not used
+  int16_t mv[2][4][2];
+  uint8_t mvd[2][4][2];        // absolute mvd, saturated
+  MbInfo() { clear(); }
+  void clear() {
+    slice = -1;
+    kind = kKNone;
+    skip = direct16 = t8 = false;
+    direct8 = 0;
+    cbp = chroma_mode = cbf_dc = 0;
+    qp = 0;
+    std::memset(nz, 0, sizeof nz);
+    std::memset(ipred, 2, sizeof ipred);
+    std::memset(ref, -1, sizeof ref);
+    std::memset(mv, 0, sizeof mv);
+    std::memset(mvd, 0, sizeof mvd);
+  }
+  bool intra() const { return kind == kKI4 || kind == kKI8 || kind == kKI16; }
 };
 
-// ---- CAVLC residual blocks (9.2), written ---------------------------------------------------------------------
+enum MbType { kMbI4 = 0, kMbI8, kMbI16, kMbInter, kMbSkip, kMbDirect };
 
-template <class W>
-void write_level(W& w, int level, int sl, bool lower_by_two) {
-  int code = level > 0 ? 2 * level - 2 : -2 * level - 1;
-  if (lower_by_two) code -= 2;
-  int prefix, suffix_size = 0, suffix = 0;
-  if (sl == 0 && code < 14) {
-    prefix = code;
-  } else if (sl == 0 && code < 30) {
-    prefix = 14;
-    suffix_size = 4;
-    suffix = code - 14;
-  } else if (sl > 0 && code < (15 << sl)) {
-    prefix = code >> sl;
-    suffix_size = sl;
-    suffix = code & ((1 << sl) - 1);
-  } else {
-    for (prefix = 15;; ++prefix) {
-      const int base = (15 << sl) + (sl == 0 ? 15 : 0) + (prefix >= 16 ? (1 << (prefix - 3)) - 4096 : 0);
-      suffix_size = prefix - 3;
-      if (code - base >= 0 && code - base < (1 << suffix_size)) {
-        suffix = code - base;
-        break;
-      }
-    }
-  }
-  w.put(1, prefix + 1);
-  if (suffix_size) w.put(static_cast<uint32_t>(suffix), suffix_size);
-}
-
-// `lev` holds the levels in scan order. nC: the coeff_token context (-1: chroma DC). Returns TotalCoeff.
-template <class W>
-int write_block(W& w, const int* lev, int max_coef, int nC) {
-  int pos[16], val[16], tc = 0;
-  for (int i = max_coef - 1; i >= 0; --i)
-    if (lev[i]) {
-      pos[tc] = i;
-      val[tc] = lev[i];
-      ++tc;
-    }
-  int t1 = 0;
-  while (t1 < tc && t1 < 3 && std::abs(val[t1]) == 1) ++t1;
-  if (nC >= 8) {
-    if (tc == 0) w.put(3, 6);
-    else w.put(static_cast<uint32_t>(((tc - 1) << 2) | t1), 6);
-  } else {
-    const VlcCode& c = nC == -1 ? kCoeffTokenChromaDc[t1][tc] : (nC < 2 ? kCoeffToken0 : (nC < 4 ? kCoeffToken1 : kCoeffToken2))[t1][tc];
-    w.put(c.bits, c.len);
-  }
-  if (tc == 0) return 0;
-  for (int k = 0; k < t1; ++k) w.bit(val[k] < 0);
-  int sl = (tc > 10 && t1 < 3) ? 1 : 0;
-  for (int k = t1; k < tc; ++k) {
-    write_level(w, val[k], sl, k == t1 && t1 < 3);
-    if (sl == 0) sl = 1;
-    if (std::abs(val[k]) > (3 << (sl - 1)) && sl < 6) ++sl;
-  }
-  const int total_zeros = pos[0] + 1 - tc;
-  if (tc < max_coef) {
-    const VlcCode& c = max_coef == 4 ? kTotalZerosChromaDc[tc - 1][total_zeros] : kTotalZeros[tc - 1][total_zeros];
-    w.put(c.bits, c.len);
-  }
-  int zeros_left = total_zeros;
-  for (int k = 0; k < tc - 1 && zeros_left > 0; ++k) {
-    const int run = pos[k] - pos[k + 1] - 1;
-    const VlcCode& c = kRunBefore[std::min(zeros_left, 7) - 1][run];
-    w.put(c.bits, c.len);
-    zeros_left -= run;
-  }
-  return tc;
-}
-
-// ---- transforms ------------------------------------------------------------------------------------------------
-
-// Forward 4x4 core transform (the matrix Cf of the quantisation derivation) of a raster residual block.
-void fwd4x4(const int* x, int* out) {
-  int t[16];
-  for (int i = 0; i < 4; ++i) {
-    const int s03 = x[4 * i] + x[4 * i + 3], d03 = x[4 * i] - x[4 * i + 3], s12 = x[4 * i + 1] + x[4 * i + 2], d12 = x[4 * i + 1] - x[4 * i + 2];
-    t[4 * i] = s03 + s12;
-    t[4 * i + 1] = 2 * d03 + d12;
-    t[4 * i + 2] = s03 - s12;
-    t[4 * i + 3] = d03 - 2 * d12;
-  }
-  for (int j = 0; j < 4; ++j) {
-    const int s03 = t[j] + t[12 + j], d03 = t[j] - t[12 + j], s12 = t[4 + j] + t[8 + j], d12 = t[4 + j] - t[8 + j];
-    out[j] = s03 + s12;
-    out[4 + j] = 2 * d03 + d12;
-    out[8 + j] = s03 - s12;
-    out[12 + j] = d03 - 2 * d12;
-  }
-}
-
-// Inverse transform of 8.5.12.2 of dequantised coefficients d (raster), added to the prediction in dst.
-void idct4_add(const int* d, uint8_t* dst, int stride) {
-  int t[16];
-  for (int i = 0; i < 4; ++i) {
-    const int* r = d + 4 * i;
-    const int e0 = r[0] + r[2], e1 = r[0] - r[2], e2 = (r[1] >> 1) - r[3], e3 = r[1] + (r[3] >> 1);
-    t[4 * i + 0] = e0 + e3;
-    t[4 * i + 1] = e1 + e2;
-    t[4 * i + 2] = e1 - e2;
-    t[4 * i + 3] = e0 - e3;
-  }
-  for (int j = 0; j < 4; ++j) {
-    const int g0 = t[j] + t[8 + j], g1 = t[j] - t[8 + j], g2 = (t[4 + j] >> 1) - t[12 + j], g3 = t[4 + j] + (t[12 + j] >> 1);
-    const int h[4] = {g0 + g3, g1 + g2, g1 - g2, g0 - g3};
-    for (int i = 0; i < 4; ++i) {
-      uint8_t* p = dst + i * stride + j;
-      *p = clip1(*p + ((h[i] + 32) >> 6));
-    }
-  }
-}
-
-// Quantises the coefficients of a 4x4 block into scan-order levels. `first` is 1 when the DC coefficient is
-// coded elsewhere (Intra16x16, chroma): then lev[i] is scan position i + 1. Returns the number of non-zero
-// levels. `dq` receives the dequantised coefficients (raster; DC left as given in dq[0]).
-int quant_block(const int* w, int qp, bool intra, int first, int* lev, int* dq, const uint8_t* scan) {
-  const int qbits = 15 + qp / 6, m = qp % 6;
-  const int f = (1 << qbits) / (intra ? 3 : 6);
-  int nz = 0;
-  for (int i = first; i < 16; ++i) {
-    const int k = scan[i];
-    const int cls = pos_class(k);
-    const int a = std::abs(w[k]);
-    const int q = (a * kMF[m][cls] + f) >> qbits;
-    const int level = w[k] < 0 ? -q : q;
-    lev[i - first] = level;
-    nz += level != 0;
-    dq[k] = (level * kScale[m][cls]) << (qp / 6);
-  }
-  return nz;
-}
-
-// 4x4 Hadamard-transformed SAD of a raster difference block.
-int satd4(const int* d) {
-  int t[16], s = 0;
-  for (int i = 0; i < 4; ++i) {
-    const int a = d[4 * i], b = d[4 * i + 1], c = d[4 * i + 2], e = d[4 * i + 3];
-    t[4 * i] = a + b + c + e;
-    t[4 * i + 1] = a + b - c - e;
-    t[4 * i + 2] = a - b - c + e;
-    t[4 * i + 3] = a - b + c - e;
-  }
-  for (int j = 0; j < 4; ++j) {
-    const int a = t[j], b = t[4 + j], c = t[8 + j], e = t[12 + j];
-    s += std::abs(a + b + c + e) + std::abs(a + b - c - e) + std::abs(a - b - c + e) + std::abs(a - b + c - e);
-  }
-  return s / 2;
-}
-
-// ---- intra prediction -----------------------------------------------------------------------------------------
-
-// Intra4x4 prediction (8.3.1.2). pt(x) is p[x, -1] for x in -1..7 (-1: the corner), pl(y) is p[-1, y].
-template <class PT, class PL>
-void predict4x4(int mode, bool top_av, bool left_av, PT pt, PL pl, uint8_t* dst, int stride) {
-  auto put = [&](int x, int y, int v) { dst[y * stride + x] = static_cast<uint8_t>(v); };
-  constexpr int N = 4;
-  switch (mode) {
-    case 0:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) put(x, y, pt(x));
-      break;
-    case 1:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) put(x, y, pl(y));
-      break;
-    case 2: {
-      int s = 0, v;
-      if (top_av && left_av) {
-        for (int i = 0; i < N; ++i) s += pt(i) + pl(i);
-        v = (s + 4) >> 3;
-      } else if (left_av) {
-        for (int i = 0; i < N; ++i) s += pl(i);
-        v = (s + 2) >> 2;
-      } else if (top_av) {
-        for (int i = 0; i < N; ++i) s += pt(i);
-        v = (s + 2) >> 2;
-      } else {
-        v = 128;
-      }
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) put(x, y, v);
-      break;
-    }
-    case 3:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) {
-          if (x == N - 1 && y == N - 1) put(x, y, (pt(6) + 3 * pt(7) + 2) >> 2);
-          else put(x, y, (pt(x + y) + 2 * pt(x + y + 1) + pt(x + y + 2) + 2) >> 2);
-        }
-      break;
-    case 4:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) {
-          if (x > y) put(x, y, (pt(x - y - 2) + 2 * pt(x - y - 1) + pt(x - y) + 2) >> 2);
-          else if (x < y) put(x, y, (pl(y - x - 2) + 2 * pl(y - x - 1) + pl(y - x) + 2) >> 2);
-          else put(x, y, (pt(0) + 2 * pt(-1) + pl(0) + 2) >> 2);
-        }
-      break;
-    case 5:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) {
-          const int z = 2 * x - y;
-          if (z >= 0 && (z & 1) == 0) put(x, y, (pt(x - (y >> 1) - 1) + pt(x - (y >> 1)) + 1) >> 1);
-          else if (z >= 0) put(x, y, (pt(x - (y >> 1) - 2) + 2 * pt(x - (y >> 1) - 1) + pt(x - (y >> 1)) + 2) >> 2);
-          else if (z == -1) put(x, y, (pl(0) + 2 * pl(-1) + pt(0) + 2) >> 2);
-          else put(x, y, (pl(y - 2 * x - 1) + 2 * pl(y - 2 * x - 2) + pl(y - 2 * x - 3) + 2) >> 2);
-        }
-      break;
-    case 6:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) {
-          const int z = 2 * y - x;
-          if (z >= 0 && (z & 1) == 0) put(x, y, (pl(y - (x >> 1) - 1) + pl(y - (x >> 1)) + 1) >> 1);
-          else if (z >= 0) put(x, y, (pl(y - (x >> 1) - 2) + 2 * pl(y - (x >> 1) - 1) + pl(y - (x >> 1)) + 2) >> 2);
-          else if (z == -1) put(x, y, (pl(0) + 2 * pl(-1) + pt(0) + 2) >> 2);
-          else put(x, y, (pt(x - 2 * y - 1) + 2 * pt(x - 2 * y - 2) + pt(x - 2 * y - 3) + 2) >> 2);
-        }
-      break;
-    case 7:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) {
-          if ((y & 1) == 0) put(x, y, (pt(x + (y >> 1)) + pt(x + (y >> 1) + 1) + 1) >> 1);
-          else put(x, y, (pt(x + (y >> 1)) + 2 * pt(x + (y >> 1) + 1) + pt(x + (y >> 1) + 2) + 2) >> 2);
-        }
-      break;
-    default:
-      for (int y = 0; y < N; ++y)
-        for (int x = 0; x < N; ++x) {
-          const int z = x + 2 * y;
-          if (z > 2 * N - 3) put(x, y, pl(N - 1));
-          else if (z == 2 * N - 3) put(x, y, (pl(N - 2) + 3 * pl(N - 1) + 2) >> 2);
-          else if ((z & 1) == 0) put(x, y, (pl(y + (x >> 1)) + pl(y + (x >> 1) + 1) + 1) >> 1);
-          else put(x, y, (pl(y + (x >> 1)) + 2 * pl(y + (x >> 1) + 1) + pl(y + (x >> 1) + 2) + 2) >> 2);
-        }
-      break;
-  }
-}
-
-// ---- one macroblock's worth of syntax elements -------------------------------------------------------------
-
-enum MbType { kMbI4x4 = 0, kMbI16x16 = 1, kMbInter = 2, kMbSkip = 3 };
-
+// The decisions and levels of one macroblock.
 struct MbCode {
-  int type = kMbI4x4;
+  int type = kMbI4;
+  bool t8 = false;
   int i16 = 0, chroma = 0;      // Intra16x16PredMode, intra_chroma_pred_mode
   int i4[16] = {};              // Intra4x4PredMode by luma4x4BlkIdx
+  int i8[4] = {};               // Intra8x8PredMode by luma8x8BlkIdx
   int cbp_l = 0, cbp_c = 0;
-  int mvx = 0, mvy = 0;         // quarter samples
-  int ref = 0;                  // ref_idx_l0 of an inter macroblock
+  // inter: the partitioning (syntax), and the motion of each 8x8 block
+  int shape = 0;                // 0 16x16, 1 16x8, 2 8x16, 3 8x8
+  uint8_t sub_direct = 0;       // B_8x8: the sub-macroblocks predicted as direct
+  int8_t ref[2][4] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}};   // ref_idx by list and 8x8 block; -1: list not used
+  int16_t mv[2][4][2] = {};
+  // levels
   int dc[16] = {};              // Intra16x16 DC levels, scan order
   int lv[16][16] = {};          // luma levels by blkIdx, scan order (Intra16x16: AC, scan positions 1..15 at 0..14)
+  int lv8[4][64] = {};          // 8x8 luma levels by luma8x8BlkIdx, scan order
   int cdc[2][4] = {};           // chroma DC levels
   int cac[2][4][15] = {};       // chroma AC levels (scan positions 1..15 at 0..14)
 };
@@ -323,32 +90,52 @@ struct RefPlanes {
   }
 };
 
+// A reference picture as the motion search and the prediction see it.
+struct RefPic {
+  RefPlanes rp;
+  std::vector<uint8_t> u, v;
+  int chroma_offset = 0;   // Table 8-10: added to the vertical chroma vector when the field's parity differs from the current one
+  int poc = 0;
+  const std::vector<MbInfo>* motion = nullptr;   // the picture's macroblocks (direct prediction reads the co-located motion)
+};
+
+// A decoded picture kept as a reference.
+struct DpbPic {
+  std::shared_ptr<vgpu_h264::Frame> frame;
+  int frame_num = 0, poc = 0;
+  std::vector<MbInfo> motion;
+};
+
+enum SliceKind { kSliceP = 0, kSliceB = 1, kSliceI = 2 };
+
 }  // namespace
 
 // ---- the encoder ---------------------------------------------------------------------------------------------
 
 struct H264Encoder::Impl {
   int w, h, fps_num, fps_den, profile;
+  H264Options opt;
   bool deblock;
   int mw, mh, ys, cs, cw, ch;     // macroblocks, coded luma/chroma strides, visible chroma size
   H264Stream stream;
+  bool cabac = false, t8_mode = false, b_mode = false;
 
   std::vector<uint8_t> sy, su, sv;   // the picture, padded to whole macroblocks
   std::vector<uint8_t> ry, ru, rv;   // reconstruction before the loop filter
-  std::unique_ptr<vgpu_h264::Frame> ref;   // the decoded picture the next P picture predicts from
-  bool have_ref = false;
-  int frame_num = 0, ref_frame_num = 0, pic_count = 0, uid = 0;
-  bool decode_failed_reported = false;
 
-  // The reference pictures of the P picture being coded (RefPicList0): the previous frame, or, in field coding, fields of the
-  // previous frame and of the current one. Each is a picture of this encoder's size, with its interpolation planes.
-  struct RefPic {
-    RefPlanes rp;
-    std::vector<uint8_t> u, v;
-    int chroma_offset = 0;   // Table 8-10: added to the vertical chroma vector when the field's parity differs from the current one
-  };
-  std::vector<RefPic> refs;
-  std::vector<int8_t> mbref;   // ref_idx of every inter macroblock
+  // reference pictures: the decoded pictures kept for prediction, most recently coded first
+  std::vector<std::shared_ptr<DpbPic>> dpb;
+  bool have_ref = false;
+  int frame_num = 0, ref_frame_num = 0, uid = 0;   // frame_num of the picture being coded; of the last reference picture
+  int poc_counter = 0;                             // display order of the next picture when the caller gives none
+  bool decode_failed_reported = false;
+  int cur_poc = 0;                                 // PicOrderCnt of the picture being coded
+
+  // The reference pictures of the picture being coded (RefPicList0 / 1). In field coding: fields of the previous frame and of the current one. Each is a
+  // picture of this encoder's size, with its interpolation planes.
+  std::vector<RefPic> lists[2];
+  std::vector<std::shared_ptr<DpbPic>> list_src[2];   // the pictures the lists were built from
+  int num_active[2] = {0, 0};
 
   // Field coding (interlaced test streams): this encoder's pictures are fields of a frame `frame_h` rows high.
   bool field_coding = false;
@@ -365,15 +152,36 @@ struct H264Encoder::Impl {
   int qp = 26, qpc = 26;
   double lambda = 1, lam_sad = 1;
   PicType type = PicType::kIdr;
-  std::vector<uint8_t> nz_y, nz_u, nz_v;   // TotalCoeff of every 4x4 block (chroma: of the AC blocks)
-  std::vector<uint8_t> i4m;                // Intra4x4PredMode of every luma 4x4 block (2 where not Intra4x4)
-  std::vector<uint8_t> mb_inter;           // 1: the macroblock is inter predicted
-  std::vector<int> mvx, mvy;
-  int skip_run = 0;
+  int slice_kind = kSliceI;
+  std::vector<MbInfo> mbs;
+  std::vector<int> slice_start;     // first macroblock address of each slice of the picture
+  int cur_slice = 0;
+  int cur_mx = 0, cur_my = 0;
+  const MbInfo *nA = nullptr, *nB = nullptr, *nC = nullptr, *nD = nullptr;   // neighbouring macroblocks of the current one (null: not available)
   EncStats st;
 
-  Impl(int width, int height, int fn, int fd, int prof, bool dbk, bool fields = false)
-      : w(width), h(fields ? height / 2 : height), fps_num(fn), fps_den(fd), profile(prof), deblock(dbk), field_coding(fields), frame_h(height) {
+  // the entropy coder of the slice being written (the contexts of the CABAC one decide the cost of candidates)
+  BitWriter* bw = nullptr;
+  H264BitCoder* bc = nullptr;
+  int skip_run = 0;
+
+  Impl(int width, int height, int fn, int fd, int prof, const H264Options& o, bool fields)
+      : w(width), h(fields ? height / 2 : height), fps_num(fn), fps_den(fd), profile(prof), opt(o), deblock(o.deblock), field_coding(fields), frame_h(height) {
+    if (prof < 77 || fields) {
+      opt.cabac = false;
+      opt.max_b = 0;
+    }
+    if (prof < 100 || fields) opt.transform8x8 = false;
+    if (fields) {
+      opt.slice_mode = 0;
+      opt.slice_data = 0;
+      opt.num_ref = 2;
+    }
+    opt.num_ref = clip3(1, 4, opt.num_ref);
+    opt.max_b = clip3(0, 8, opt.max_b);
+    cabac = opt.cabac;
+    t8_mode = opt.transform8x8;
+    b_mode = opt.max_b > 0;
     mw = (w + 15) / 16;
     mh = (h + 15) / 16;
     ys = mw * 16;
@@ -383,10 +191,13 @@ struct H264Encoder::Impl {
     stream.width = w;
     stream.height = frame_h;
     stream.interlaced = fields;
-    stream.num_ref_frames = fields ? 2 : 1;
+    stream.num_ref_frames = fields ? 2 : std::max(opt.num_ref, b_mode ? 2 : 1);
     stream.fps_num = fn;
     stream.fps_den = fd;
     stream.profile_idc = prof;
+    stream.cabac = cabac;
+    stream.transform_8x8 = t8_mode;
+    stream.num_reorder = b_mode ? (opt.max_b >= 2 ? 2 : 1) : -1;
     ry.assign(static_cast<size_t>(ys) * mh * 16, 0);
     ru.assign(static_cast<size_t>(cs) * mh * 8, 128);
     rv = ru;
@@ -394,68 +205,22 @@ struct H264Encoder::Impl {
 
   // the coefficient scan: field pictures scan the other way (8.5.6)
   const uint8_t* scan4() const { return field_coding ? kField4x4 : kZigzag4x4; }
+  const uint8_t* scan8() const { return field_coding ? kField8x8 : kZigzag8x8; }
 
-  // ---- neighbour bookkeeping ----------------------------------------------------------------------------------
+  // ---- neighbours ---------------------------------------------------------------------------------------------------------
 
-  int nz_stride() const { return mw * 4; }
-  int nzc_stride() const { return mw * 2; }
-  uint8_t& NZY(int gx, int gy) { return nz_y[static_cast<size_t>(gy) * nz_stride() + gx]; }
-  uint8_t& NZC(int c, int gx, int gy) { return (c ? nz_v : nz_u)[static_cast<size_t>(gy) * nzc_stride() + gx]; }
-  uint8_t& I4M(int gx, int gy) { return i4m[static_cast<size_t>(gy) * nz_stride() + gx]; }
-
-  // nC for the coeff_token of a block at global 4x4 coordinates (gx, gy) of a plane with the given count array.
-  static int nc_of(bool avail_a, int na, bool avail_b, int nb) {
-    if (avail_a && avail_b) return (na + nb + 1) >> 1;
-    if (avail_a) return na;
-    if (avail_b) return nb;
-    return 0;
+  const MbInfo* nb_at(int mx, int my) const {
+    if (mx < 0 || my < 0 || mx >= mw || my >= mh) return nullptr;
+    const MbInfo& m = mbs[static_cast<size_t>(my) * mw + mx];
+    return m.slice == cur_slice ? &m : nullptr;
   }
-  int nc_luma(int gx, int gy) { return nc_of(gx > 0, gx > 0 ? NZY(gx - 1, gy) : 0, gy > 0, gy > 0 ? NZY(gx, gy - 1) : 0); }
-  int nc_chroma(int c, int gx, int gy) { return nc_of(gx > 0, gx > 0 ? NZC(c, gx - 1, gy) : 0, gy > 0, gy > 0 ? NZC(c, gx, gy - 1) : 0); }
-
-  // The predicted Intra4x4PredMode of the block at global (gx, gy).
-  int pred_i4(int gx, int gy) {
-    if (gx == 0 || gy == 0) return 2;
-    return std::min<int>(I4M(gx - 1, gy), I4M(gx, gy - 1));
-  }
-
-  // The motion vector prediction of the 16x16 macroblock (8.4.1.3) and the P_Skip vector (8.4.1.1).
-  struct Nb {
-    bool avail = false;
-    int ref = -1, x = 0, y = 0;
-  };
-  Nb nb_mv(int mx, int my) const {
-    Nb n;
-    if (mx < 0 || my < 0 || mx >= mw) return n;
-    n.avail = true;
-    const size_t a = static_cast<size_t>(my) * mw + mx;
-    if (mb_inter[a]) {
-      n.ref = mbref[a];
-      n.x = mvx[a];
-      n.y = mvy[a];
-    }
-    return n;
-  }
-  // The predictor for reference index `ref`; skip_zero says whether P_Skip (reference 0) takes the zero vector.
-  void mv_pred(int mx, int my, int ref, int* px, int* py, bool* skip_zero) {
-    const Nb a = nb_mv(mx - 1, my), b = nb_mv(mx, my - 1);
-    Nb c = nb_mv(mx + 1, my - 1);
-    if (!c.avail) c = nb_mv(mx - 1, my - 1);
-    *skip_zero = !a.avail || !b.avail || (a.ref == 0 && a.x == 0 && a.y == 0) || (b.ref == 0 && b.x == 0 && b.y == 0);
-    Nb B = b, C = c;
-    if (!b.avail && !c.avail && a.avail) {
-      B = a;
-      C = a;
-    }
-    const int matches = (a.ref == ref) + (B.ref == ref) + (C.ref == ref);
-    if (matches == 1) {
-      const Nb& m = a.ref == ref ? a : (B.ref == ref ? B : C);
-      *px = m.x;
-      *py = m.y;
-    } else {
-      *px = median3(a.x, B.x, C.x);
-      *py = median3(a.y, B.y, C.y);
-    }
+  void setup_neighbours(int mx, int my) {
+    cur_mx = mx;
+    cur_my = my;
+    nA = nb_at(mx - 1, my);
+    nB = nb_at(mx, my - 1);
+    nC = nb_at(mx + 1, my - 1);
+    nD = nb_at(mx - 1, my - 1);
   }
 
   // ---- source and reconstruction access ------------------------------------------------------------------------
@@ -481,11 +246,9 @@ struct H264Encoder::Impl {
 
   // ---- reference interpolation planes (8.4.2.2.1) -------------------------------------------------------------
 
-  // The interpolation planes of a reference picture: rows `row0 + step * y` of the frame store f, for a frame (step 1) or one field
-  // of it (step 2, row0 = the parity).
-  void add_ref(const vgpu_h264::Frame& f, int row0, int step, int chroma_offset) {
-    refs.emplace_back();
-    RefPic& r = refs.back();
+  // The interpolation planes of a reference picture: rows `row0 + step * y` of the frame store f, for a frame (step 1) or one field of it (step 2, row0 = the
+  // parity).
+  void build_ref(RefPic& r, const vgpu_h264::Frame& f, int row0, int step, int chroma_offset) const {
     r.chroma_offset = chroma_offset;
     RefPlanes& rp = r.rp;
     const int W = ys, H = mh * 16;
@@ -525,13 +288,13 @@ struct H264Encoder::Impl {
       }
   }
 
-  // The 16x16 luma prediction at quarter-sample vector (mvx, mvy) for macroblock (mx, my).
-  void pred_luma(int ri, int mx, int my, int vx, int vy, uint8_t* out) const {
-    const RefPlanes& rp = refs[static_cast<size_t>(ri)].rp;
+  // The luma prediction of the bw x bh block at (px, py) of the picture, from reference r at quarter-sample vector (vx, vy), into out (stride `stride`).
+  void pred_luma(const RefPic& r, int px, int py, int bw_, int bh_, int vx, int vy, uint8_t* out, int stride) const {
+    const RefPlanes& rp = r.rp;
     const int fx = vx & 3, fy = vy & 3;
-    const int X0 = mx * 16 + (vx >> 2), Y0 = my * 16 + (vy >> 2);
-    for (int y = 0; y < 16; ++y)
-      for (int x = 0; x < 16; ++x) {
+    const int X0 = px + (vx >> 2), Y0 = py + (vy >> 2);
+    for (int y = 0; y < bh_; ++y)
+      for (int x = 0; x < bw_; ++x) {
         const int X = X0 + x, Y = Y0 + y;
         auto g = [&](int dx, int dy) { return static_cast<int>(*rp.at(rp.g, X + dx, Y + dy)); };
         auto b = [&](int dy) { return static_cast<int>(*rp.at(rp.hh, X, Y + dy)); };
@@ -556,51 +319,75 @@ struct H264Encoder::Impl {
           case 14: v = (j + b(1) + 1) >> 1; break;
           default: v = (hv(1) + b(1) + 1) >> 1; break;
         }
-        out[y * 16 + x] = static_cast<uint8_t>(v);
+        out[y * stride + x] = static_cast<uint8_t>(v);
       }
   }
 
-  // The 8x8 chroma predictions (8.4.2.2.2) of both planes at the luma vector.
-  void pred_chroma(int ri, int mx, int my, int vx, int vy_luma, uint8_t* out_u, uint8_t* out_v) const {
-    const RefPic& f = refs[static_cast<size_t>(ri)];
-    const int vy = vy_luma + f.chroma_offset;
+  // The chroma predictions (8.4.2.2.2) of both planes for the bw x bh luma block at (px, py): blocks of bw/2 x bh/2 samples.
+  void pred_chroma(const RefPic& r, int px, int py, int bw_, int bh_, int vx, int vy_luma, uint8_t* out_u, uint8_t* out_v, int stride) const {
+    const int vy = vy_luma + r.chroma_offset;
     const int fx = vx & 7, fy = vy & 7;
-    const int X0 = mx * 8 + (vx >> 3), Y0 = my * 8 + (vy >> 3);
+    const int X0 = px / 2 + (vx >> 3), Y0 = py / 2 + (vy >> 3);
     const int W = mw * 8, H = mh * 8;
     for (int c = 0; c < 2; ++c) {
-      const std::vector<uint8_t>& p = c ? f.v : f.u;
+      const std::vector<uint8_t>& p = c ? r.v : r.u;
       uint8_t* out = c ? out_v : out_u;
-      for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x) {
+      for (int y = 0; y < bh_ / 2; ++y)
+        for (int x = 0; x < bw_ / 2; ++x) {
           auto at = [&](int dx, int dy) { return static_cast<int>(p[static_cast<size_t>(clip3(0, H - 1, Y0 + y + dy)) * cs + clip3(0, W - 1, X0 + x + dx)]); };
-          out[y * 8 + x] = static_cast<uint8_t>(((8 - fx) * (8 - fy) * at(0, 0) + fx * (8 - fy) * at(1, 0) + (8 - fx) * fy * at(0, 1) + fx * fy * at(1, 1) + 32) >> 6);
+          out[y * stride + x] = static_cast<uint8_t>(((8 - fx) * (8 - fy) * at(0, 0) + fx * (8 - fy) * at(1, 0) + (8 - fx) * fy * at(0, 1) + fx * fy * at(1, 1) + 32) >> 6);
         }
     }
   }
 
-  // ---- residual coding of blocks -----------------------------------------------------------------------------
+  // ---- residual coding of blocks ------------------------------------------------------------------------------------
 
-  static int sse16(const uint8_t* a, int sa, const uint8_t* b, int sb, int n) {
-    int s = 0;
-    for (int y = 0; y < n; ++y)
-      for (int x = 0; x < n; ++x) {
+  static int64_t sse_block(const uint8_t* a, int sa, const uint8_t* b, int sb, int bw_, int bh_) {
+    int64_t s = 0;
+    for (int y = 0; y < bh_; ++y)
+      for (int x = 0; x < bw_; ++x) {
         const int d = a[y * sa + x] - b[y * sb + x];
         s += d * d;
       }
     return s;
   }
 
-  // Codes the luma of an Intra16x16 macroblock with the given prediction mode; the reconstruction goes to
-  // `rec` (16x16, stride 16). Returns false if the mode needs unavailable samples.
+  // One 4x4 block: the residual of src against pred, transformed and quantised into scan-order levels `lev`; the reconstruction goes to rec. Returns the
+  // number of non-zero levels.
+  int code_blk4(const uint8_t* src, int ss, const uint8_t* pred, int ps, uint8_t* rec, int rs, bool intra, int qpv, int* lev) {
+    int r[16], wc[16], dq[16] = {};
+    for (int y = 0; y < 4; ++y)
+      for (int x = 0; x < 4; ++x) r[y * 4 + x] = src[y * ss + x] - pred[y * ps + x];
+    fwd4x4(r, wc);
+    const int nz = quant_block(wc, qpv, intra, 0, lev, dq, scan4());
+    for (int y = 0; y < 4; ++y)
+      for (int x = 0; x < 4; ++x) rec[y * rs + x] = pred[y * ps + x];
+    if (nz) idct4_add(dq, rec, rs);
+    return nz;
+  }
+  int code_blk8(const uint8_t* src, int ss, const uint8_t* pred, int ps, uint8_t* rec, int rs, bool intra, int qpv, int* lev) {
+    int r[64], wc[64], dq[64] = {};
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) r[y * 8 + x] = src[y * ss + x] - pred[y * ps + x];
+    fwd8x8(r, wc);
+    const int nz = quant_block8(wc, qpv, intra, lev, dq, scan8());
+    for (int y = 0; y < 8; ++y)
+      for (int x = 0; x < 8; ++x) rec[y * rs + x] = pred[y * ps + x];
+    if (nz) idct8_add(dq, rec, rs);
+    return nz;
+  }
+
+  // ---- Intra16x16 -----------------------------------------------------------------------------------------------------
+
   void predict16(int mx, int my, int mode, uint8_t* pred) {
     const uint8_t* r = rec_y(mx, my);
-    const bool top = my > 0, left = mx > 0;
+    const bool top = nB != nullptr, left = nA != nullptr;
     int topv[17], leftv[16], corner = 128;
     for (int i = 0; i < 16; ++i) {
       topv[i] = top ? r[-ys + i] : 128;
       leftv[i] = left ? r[i * ys - 1] : 128;
     }
-    if (top && left) corner = r[-ys - 1];
+    if (top && left && nD) corner = r[-ys - 1];
     switch (mode) {
       case 0:
         for (int y = 0; y < 16; ++y)
@@ -641,17 +428,16 @@ struct H264Encoder::Impl {
     }
   }
 
-  bool i16_mode_ok(int mx, int my, int mode) const {
+  bool i16_mode_ok(int mode) const {
     switch (mode) {
-      case 0: return my > 0;
-      case 1: return mx > 0;
+      case 0: return nB != nullptr;
+      case 1: return nA != nullptr;
       case 2: return true;
-      default: return mx > 0 && my > 0;
+      default: return nA && nB && nD;
     }
   }
 
-  // Quantises and reconstructs an Intra16x16 macroblock's luma from `pred`, into mc (levels) and rec (16x16, stride ys at
-  // the macroblock's place in the reconstruction).
+  // Quantises and reconstructs an Intra16x16 macroblock's luma from `pred`, into mc (levels) and the reconstruction.
   void code_i16(int mx, int my, const uint8_t* pred, MbCode& mc) {
     const uint8_t* s = src_y(mx, my);
     int W[16][16], dcw[16];   // transform coefficients per block (raster block order), the DCs
@@ -681,12 +467,10 @@ struct H264Encoder::Impl {
     }
     const int m = qp % 6, qbits = 15 + qp / 6, f = (1 << qbits) / 3;
     int dcl[16];   // levels, matrix order
-    bool any_dc = false;
     for (int k = 0; k < 16; ++k) {
       const int a = std::abs(had[k]) >> 1;
       const int q = (a * kMF[m][0] + 2 * f) >> (qbits + 1);
       dcl[k] = had[k] < 0 ? -q : q;
-      any_dc |= q != 0;
     }
     for (int i = 0; i < 16; ++i) mc.dc[i] = dcl[scan4()[i]];
     // DC reconstruction (8.5.10)
@@ -719,7 +503,6 @@ struct H264Encoder::Impl {
       std::memcpy(dqs[blk], dq, sizeof dq);
     }
     mc.cbp_l = any_ac ? 15 : 0;
-    (void)any_dc;
     uint8_t* d = rec_y(mx, my);
     for (int blk = 0; blk < 16; ++blk) {
       const int bx = blk_x(blk), by = blk_y(blk);
@@ -735,40 +518,34 @@ struct H264Encoder::Impl {
     }
   }
 
-  // Intra4x4 availability of the neighbours of block blk of the macroblock at (mx, my).
-  struct Nb4 {
+  // ---- Intra4x4 and Intra8x8 ------------------------------------------------------------------------------------------
+
+  // Neighbouring samples of an N x N luma block at offset (bx, by) of the macroblock: top_v[0] is the corner, top_v[1 + x] is p[x, -1] (x < 2N), left_v[y] is p[-1, y].
+  struct NbN {
     bool top = false, left = false, corner = false, tr = false;
-    int top_v[9] = {}, left_v[4] = {};   // top_v[0] = corner, top_v[1 + i] = p[i, -1]
+    int top_v[1 + 16] = {};
+    int left_v[8] = {};
   };
-  Nb4 gather4(int mx, int my, int blk) {
-    Nb4 n;
-    const int bx = blk_x(blk), by = blk_y(blk);
-    const int X = mx * 16 + bx * 4, Y = my * 16 + by * 4;
-    n.top = by > 0 || my > 0;
-    n.left = bx > 0 || mx > 0;
-    n.corner = (by > 0 || my > 0) && (bx > 0 || mx > 0);
-    if (by == 0) n.tr = my > 0 && (bx < 3 || mx + 1 < mw);
-    else if (bx == 3) n.tr = false;
-    else {
-      // inside the macroblock: available when the block holding the samples came earlier in coding order
-      int other = -1;
-      for (int i = 0; i < 16; ++i)
-        if (blk_x(i) == bx + 1 && blk_y(i) == by - 1) other = i;
-      n.tr = other >= 0 && other < blk;
-    }
+  NbN gather_nxn(int mx, int my, int bx, int by, int N, bool tr_inside) const {
+    NbN n;
+    n.top = by > 0 || nB;
+    n.left = bx > 0 || nA;
+    n.corner = (bx > 0 && by > 0) || (bx > 0 && by == 0 && nB) || (bx == 0 && by > 0 && nA) || (bx == 0 && by == 0 && nD);
+    if (by == 0) n.tr = bx + N < 16 ? nB != nullptr : nC != nullptr;
+    else n.tr = bx + N < 16 && tr_inside;
+    const int X = mx * 16 + bx, Y = my * 16 + by;
     if (n.corner) n.top_v[0] = ry[static_cast<size_t>(Y - 1) * ys + X - 1];
     if (n.top)
-      for (int i = 0; i < 4; ++i) n.top_v[1 + i] = ry[static_cast<size_t>(Y - 1) * ys + X + i];
+      for (int i = 0; i < N; ++i) n.top_v[1 + i] = ry[static_cast<size_t>(Y - 1) * ys + X + i];
     if (n.top && n.tr)
-      for (int i = 4; i < 8; ++i) n.top_v[1 + i] = ry[static_cast<size_t>(Y - 1) * ys + X + i];
+      for (int i = N; i < 2 * N; ++i) n.top_v[1 + i] = ry[static_cast<size_t>(Y - 1) * ys + X + i];
     else if (n.top)
-      for (int i = 4; i < 8; ++i) n.top_v[1 + i] = n.top_v[4];
+      for (int i = N; i < 2 * N; ++i) n.top_v[1 + i] = n.top_v[N];
     if (n.left)
-      for (int i = 0; i < 4; ++i) n.left_v[i] = ry[static_cast<size_t>(Y + i) * ys + X - 1];
+      for (int i = 0; i < N; ++i) n.left_v[i] = ry[static_cast<size_t>(Y + i) * ys + X - 1];
     return n;
   }
-
-  bool mode4_ok(const Nb4& n, int mode) const {
+  static bool mode_nxn_ok(const NbN& n, int mode) {
     switch (mode) {
       case 0: case 3: case 7: return n.top;
       case 1: case 8: return n.left;
@@ -776,28 +553,68 @@ struct H264Encoder::Impl {
       default: return n.top && n.left && n.corner;
     }
   }
+  // The predicted Intra4x4PredMode / Intra8x8PredMode of the block at 4x4-unit position (bx4, by4) (8.3.1.1, 8.3.2.1).
+  int pred_mode_nxn(const MbInfo& wk, int bx4, int by4) const {
+    int ma, mb;
+    if (bx4 > 0) ma = wk.ipred[by4 * 4 + bx4 - 1];
+    else if (!nA) return 2;
+    else ma = nA->ipred[by4 * 4 + 3];
+    if (by4 > 0) mb = wk.ipred[(by4 - 1) * 4 + bx4];
+    else if (!nB) return 2;
+    else mb = nB->ipred[12 + bx4];
+    return std::min(ma, mb);
+  }
+  // Intra_8x8 reference sample filtering (8.3.2.2.1): top_f[0] is the filtered corner, top_f[1 + x] p'[x, -1], left_f[y] p'[-1, y]
+  static void filter8(const NbN& nb, int* top_f, int* left_f) {
+    std::fill_n(top_f, 17, 128);
+    std::fill_n(left_f, 8, 128);
+    top_f[0] = nb.top_v[0];
+    if (nb.top) {
+      if (nb.corner) top_f[1] = (nb.top_v[0] + 2 * nb.top_v[1] + nb.top_v[2] + 2) >> 2;
+      else top_f[1] = (3 * nb.top_v[1] + nb.top_v[2] + 2) >> 2;
+      for (int x = 1; x < 15; ++x) top_f[1 + x] = (nb.top_v[x] + 2 * nb.top_v[1 + x] + nb.top_v[2 + x] + 2) >> 2;
+      top_f[16] = (nb.top_v[15] + 3 * nb.top_v[16] + 2) >> 2;
+    }
+    if (nb.corner) {
+      if (!nb.top || !nb.left) {
+        if (nb.top) top_f[0] = (3 * nb.top_v[0] + nb.top_v[1] + 2) >> 2;
+        else if (nb.left) top_f[0] = (3 * nb.top_v[0] + nb.left_v[0] + 2) >> 2;
+        else top_f[0] = nb.top_v[0];
+      } else {
+        top_f[0] = (nb.top_v[1] + 2 * nb.top_v[0] + nb.left_v[0] + 2) >> 2;
+      }
+    }
+    if (nb.left) {
+      if (nb.corner) left_f[0] = (nb.top_v[0] + 2 * nb.left_v[0] + nb.left_v[1] + 2) >> 2;
+      else left_f[0] = (3 * nb.left_v[0] + nb.left_v[1] + 2) >> 2;
+      for (int y = 1; y < 7; ++y) left_f[y] = (nb.left_v[y - 1] + 2 * nb.left_v[y] + nb.left_v[y + 1] + 2) >> 2;
+      left_f[7] = (nb.left_v[6] + 3 * nb.left_v[7] + 2) >> 2;
+    }
+  }
 
-  // Intra4x4: chooses the modes, codes the 16 blocks into the reconstruction. mc.i4, mc.lv and the totals are set.
-  void code_i4(int mx, int my, MbCode& mc) {
+  // Intra4x4: chooses the modes, codes the 16 blocks into the reconstruction. mc.i4, mc.lv and cbp_l are set; wk.ipred receives the modes.
+  void code_i4(int mx, int my, MbCode& mc, MbInfo& wk) {
     const uint8_t* s = src_y(mx, my);
     bool any[4] = {false, false, false, false};
     for (int blk = 0; blk < 16; ++blk) {
-      const int bx = blk_x(blk), by = blk_y(blk);
-      const int gx = mx * 4 + bx, gy = my * 4 + by;
-      const Nb4 n = gather4(mx, my, blk);
-      const int predmode = (gx == 0 || gy == 0) ? 2 : std::min<int>(I4M(gx - 1, gy), I4M(gx, gy - 1));
+      const int bx4 = blk_x(blk), by4 = blk_y(blk);
+      const int bx = bx4 * 4, by = by4 * 4;
+      bool tr_inside = false;
+      if (by4 > 0 && bx4 < 3) tr_inside = blk_idx(bx4 + 1, by4 - 1) < blk;
+      const NbN n = gather_nxn(mx, my, bx, by, 4, tr_inside);
+      const int pm = pred_mode_nxn(wk, bx4, by4);
       auto pl = [&](int y) { return y < 0 ? n.top_v[0] : n.left_v[y]; };
       auto ptc = [&](int x) { return x < 0 ? n.top_v[0] : n.top_v[1 + x]; };
       uint8_t pred[16], best_pred[16];
       int best_mode = 2;
       double best_cost = 1e30;
       for (int mode = 0; mode < 9; ++mode) {
-        if (!mode4_ok(n, mode)) continue;
-        predict4x4(mode, n.top, n.left, ptc, pl, pred, 4);
+        if (!mode_nxn_ok(n, mode)) continue;
+        predict_nxn<4>(mode, n.top, n.left, ptc, pl, pred, 4);
         int d[16];
         for (int y = 0; y < 4; ++y)
-          for (int x = 0; x < 4; ++x) d[y * 4 + x] = s[(by * 4 + y) * ys + bx * 4 + x] - pred[y * 4 + x];
-        const double cost = satd4(d) + lam_sad * (mode == predmode ? 1 : 4);
+          for (int x = 0; x < 4; ++x) d[y * 4 + x] = s[(by + y) * ys + bx + x] - pred[y * 4 + x];
+        const double cost = satd4(d) + lam_sad * (mode == pm ? 1 : 4);
         if (cost < best_cost) {
           best_cost = cost;
           best_mode = mode;
@@ -805,16 +622,9 @@ struct H264Encoder::Impl {
         }
       }
       mc.i4[blk] = best_mode;
-      I4M(gx, gy) = static_cast<uint8_t>(best_mode);
-      int r[16], wc[16], dq[16] = {};
-      for (int y = 0; y < 4; ++y)
-        for (int x = 0; x < 4; ++x) r[y * 4 + x] = s[(by * 4 + y) * ys + bx * 4 + x] - best_pred[y * 4 + x];
-      fwd4x4(r, wc);
-      const int nz = quant_block(wc, qp, true, 0, mc.lv[blk], dq, scan4());
-      uint8_t* d = rec_y(mx, my) + by * 4 * ys + bx * 4;
-      for (int y = 0; y < 4; ++y)
-        for (int x = 0; x < 4; ++x) d[y * ys + x] = best_pred[y * 4 + x];
-      if (nz) idct4_add(dq, d, ys);
+      wk.ipred[by4 * 4 + bx4] = static_cast<int8_t>(best_mode);
+      uint8_t* d = rec_y(mx, my) + by * ys + bx;
+      const int nz = code_blk4(s + by * ys + bx, ys, best_pred, 4, d, ys, true, qp, mc.lv[blk]);
       any[blk >> 2] |= nz != 0;
     }
     mc.cbp_l = (any[0] ? 1 : 0) | (any[1] ? 2 : 0) | (any[2] ? 4 : 0) | (any[3] ? 8 : 0);
@@ -822,9 +632,70 @@ struct H264Encoder::Impl {
       if (!((mc.cbp_l >> (blk >> 2)) & 1)) std::memset(mc.lv[blk], 0, sizeof mc.lv[blk]);
   }
 
-  // Inter luma: residual of `pred` (16x16 prediction) coded with inter quantisation into mc and the reconstruction.
+  // Intra8x8: the same with four 8x8 blocks.
+  void code_i8(int mx, int my, MbCode& mc, MbInfo& wk) {
+    const uint8_t* s = src_y(mx, my);
+    int cbp = 0;
+    for (int b8 = 0; b8 < 4; ++b8) {
+      const int bx = (b8 & 1) * 8, by = (b8 >> 1) * 8;
+      const NbN n = gather_nxn(mx, my, bx, by, 8, b8 == 2);
+      int top_f[17], left_f[8];
+      filter8(n, top_f, left_f);
+      const int pm = pred_mode_nxn(wk, bx / 4, by / 4);
+      auto pl = [&](int y) { return y < 0 ? top_f[0] : left_f[y]; };
+      auto ptc = [&](int x) { return x < 0 ? top_f[0] : top_f[1 + x]; };
+      uint8_t pred[64], best_pred[64];
+      int best_mode = 2;
+      double best_cost = 1e30;
+      for (int mode = 0; mode < 9; ++mode) {
+        if (!mode_nxn_ok(n, mode)) continue;
+        predict_nxn<8>(mode, n.top, n.left, ptc, pl, pred, 8);
+        int d[64];
+        for (int y = 0; y < 8; ++y)
+          for (int x = 0; x < 8; ++x) d[y * 8 + x] = s[(by + y) * ys + bx + x] - pred[y * 8 + x];
+        const double cost = satd_block(d, 8, 8, 8) + lam_sad * (mode == pm ? 1 : 4);
+        if (cost < best_cost) {
+          best_cost = cost;
+          best_mode = mode;
+          std::memcpy(best_pred, pred, 64);
+        }
+      }
+      mc.i8[b8] = best_mode;
+      for (int k = 0; k < 4; ++k) wk.ipred[(by / 4 + (k >> 1)) * 4 + bx / 4 + (k & 1)] = static_cast<int8_t>(best_mode);
+      uint8_t* d = rec_y(mx, my) + by * ys + bx;
+      const int nz = code_blk8(s + by * ys + bx, ys, best_pred, 8, d, ys, true, qp, mc.lv8[b8]);
+      if (nz) cbp |= 1 << b8;
+      else std::memset(mc.lv8[b8], 0, sizeof mc.lv8[b8]);
+    }
+    mc.cbp_l = cbp;
+  }
+
+  // Inter luma: residual of `pred` (16x16 prediction) coded with inter quantisation into mc and the reconstruction; with the 8x8 transform if mc.t8.
   void code_luma_inter(int mx, int my, const uint8_t* pred, MbCode& mc) {
     const uint8_t* s = src_y(mx, my);
+    uint8_t* d = rec_y(mx, my);
+    int cbp = 0;
+    if (mc.t8) {
+      for (int b8 = 0; b8 < 4; ++b8) {
+        const int bx = (b8 & 1) * 8, by = (b8 >> 1) * 8;
+        int nzc = code_blk8(s + by * ys + bx, ys, pred + by * 16 + bx, 16, d + by * ys + bx, ys, false, qp, mc.lv8[b8]);
+        // a lone +-1 level high in the scan costs more bits than it is worth
+        if (nzc == 1) {
+          int pos = -1;
+          for (int i = 0; i < 64; ++i)
+            if (mc.lv8[b8][i]) pos = i;
+          if (std::abs(mc.lv8[b8][pos]) == 1 && pos >= 10) {
+            std::memset(mc.lv8[b8], 0, sizeof mc.lv8[b8]);
+            for (int y = 0; y < 8; ++y)
+              for (int x = 0; x < 8; ++x) d[(by + y) * ys + bx + x] = pred[(by + y) * 16 + bx + x];
+            nzc = 0;
+          }
+        }
+        if (nzc) cbp |= 1 << b8;
+      }
+      mc.cbp_l = cbp;
+      return;
+    }
     bool any[4] = {false, false, false, false};
     int dqs[16][16];
     for (int blk = 0; blk < 16; ++blk) {
@@ -860,7 +731,6 @@ struct H264Encoder::Impl {
       }
     }
     mc.cbp_l = (any[0] ? 1 : 0) | (any[1] ? 2 : 0) | (any[2] ? 4 : 0) | (any[3] ? 8 : 0);
-    uint8_t* d = rec_y(mx, my);
     for (int blk = 0; blk < 16; ++blk) {
       const int bx = blk_x(blk), by = blk_y(blk);
       for (int y = 0; y < 4; ++y)
@@ -873,35 +743,35 @@ struct H264Encoder::Impl {
 
   void predict_chroma(int mx, int my, int c, int mode, uint8_t* pred) const {
     const uint8_t* r = &(c ? rv : ru)[static_cast<size_t>(my) * 8 * cs + mx * 8];
-    const bool top = my > 0, left = mx > 0;
+    const bool top = nB != nullptr, left = nA != nullptr;
     int topv[8], leftv[8], corner = 128;
     for (int i = 0; i < 8; ++i) {
       topv[i] = top ? r[-cs + i] : 128;
       leftv[i] = left ? r[i * cs - 1] : 128;
     }
-    if (top && left) corner = r[-cs - 1];
+    if (top && left && nD) corner = r[-cs - 1];
     switch (mode) {
       case 0:
         for (int b = 0; b < 4; ++b) {
           const int xo = (b & 1) * 4, yo = (b >> 1) * 4;
-          int st = 0, sl = 0;
+          int st_ = 0, sl = 0;
           for (int i = 0; i < 4; ++i) {
-            st += topv[xo + i];
+            st_ += topv[xo + i];
             sl += leftv[yo + i];
           }
           int v;
           if ((xo == 0 && yo == 0) || (xo > 0 && yo > 0)) {
-            if (top && left) v = (st + sl + 4) >> 3;
+            if (top && left) v = (st_ + sl + 4) >> 3;
             else if (left) v = (sl + 2) >> 2;
-            else if (top) v = (st + 2) >> 2;
+            else if (top) v = (st_ + 2) >> 2;
             else v = 128;
           } else if (xo > 0) {
-            if (top) v = (st + 2) >> 2;
+            if (top) v = (st_ + 2) >> 2;
             else if (left) v = (sl + 2) >> 2;
             else v = 128;
           } else {
             if (left) v = (sl + 2) >> 2;
-            else if (top) v = (st + 2) >> 2;
+            else if (top) v = (st_ + 2) >> 2;
             else v = 128;
           }
           for (int y = 0; y < 4; ++y)
@@ -930,12 +800,12 @@ struct H264Encoder::Impl {
     }
   }
 
-  bool chroma_mode_ok(int mx, int my, int mode) const {
+  bool chroma_mode_ok(int mode) const {
     switch (mode) {
       case 0: return true;
-      case 1: return mx > 0;
-      case 2: return my > 0;
-      default: return mx > 0 && my > 0;
+      case 1: return nA != nullptr;
+      case 2: return nB != nullptr;
+      default: return nA && nB && nD;
     }
   }
 
@@ -992,73 +862,170 @@ struct H264Encoder::Impl {
     }
   }
 
-  // ---- the macroblock layer, written -------------------------------------------------------------------------
+  // ---- neighbour data for the entropy coders --------------------------------------------------------------------------
 
-  // Writes a macroblock's syntax (everything after mb_skip_run) and records the totals the neighbours need.
-  template <class W>
-  void write_mb(W& w, const MbCode& mc, int mx, int my) {
-    const bool p_slice = type == PicType::kInter;
-    // totals of this macroblock start at zero
-    for (int by = 0; by < 4; ++by)
-      for (int bx = 0; bx < 4; ++bx) NZY(mx * 4 + bx, my * 4 + by) = 0;
-    for (int c = 0; c < 2; ++c)
-      for (int by = 0; by < 2; ++by)
-        for (int bx = 0; bx < 2; ++bx) NZC(c, mx * 2 + bx, my * 2 + by) = 0;
-    if (mc.type == kMbInter) {
-      w.ue(0);   // P_L0_16x16
-      const int nref = static_cast<int>(refs.size());
-      if (nref == 2) w.bit(mc.ref ? 0 : 1);   // ref_idx_l0: te(v) with a largest value of 1 is one inverted bit
-      else if (nref > 2) w.ue(static_cast<uint32_t>(mc.ref));
-      int px, py;
-      bool sz;
-      mv_pred(mx, my, mc.ref, &px, &py, &sz);
-      w.se(mc.mvx - px);
-      w.se(mc.mvy - py);
-      const int cbp = mc.cbp_l | (mc.cbp_c << 4);
-      int code = 0;
-      for (; code < 48; ++code)
-        if (kCbpInter[code] == cbp) break;
-      w.ue(static_cast<uint32_t>(code));
-      if (cbp) w.se(0);   // mb_qp_delta
-    } else if (mc.type == kMbI16x16) {
-      w.ue(static_cast<uint32_t>((p_slice ? 5 : 0) + 1 + mc.i16 + 4 * mc.cbp_c + (mc.cbp_l ? 12 : 0)));
-      w.ue(static_cast<uint32_t>(mc.chroma));
-      w.se(0);   // mb_qp_delta
+  int nc_of(bool av_a, int na, bool av_b, int nb) const {
+    if (av_a && av_b) return (na + nb + 1) >> 1;
+    if (av_a) return na;
+    if (av_b) return nb;
+    return 0;
+  }
+  // nC for the coeff_token of luma block (bx, by) (4x4 units)
+  int nc_luma(const MbInfo& wk, int bx, int by) const {
+    const bool av_a = bx > 0 || nA, av_b = by > 0 || nB;
+    const int na = bx > 0 ? wk.nz[0][by * 4 + bx - 1] : (nA ? nA->nz[0][by * 4 + 3] : 0);
+    const int nb = by > 0 ? wk.nz[0][(by - 1) * 4 + bx] : (nB ? nB->nz[0][12 + bx] : 0);
+    return nc_of(av_a, na, av_b, nb);
+  }
+  int nc_chroma(const MbInfo& wk, int c, int bx, int by) const {
+    const bool av_a = bx > 0 || nA, av_b = by > 0 || nB;
+    const int na = bx > 0 ? wk.nz[1 + c][by * 2 + bx - 1] : (nA ? nA->nz[1 + c][by * 2 + 1] : 0);
+    const int nb = by > 0 ? wk.nz[1 + c][(by - 1) * 2 + bx] : (nB ? nB->nz[1 + c][2 + bx] : 0);
+    return nc_of(av_a, na, av_b, nb);
+  }
+  // CABAC coded_block_flag contexts (9.3.3.1.1.9)
+  int cbf_inc_luma(const MbInfo& wk, bool intra, int bx, int by) const {
+    const int ca = bx > 0 ? wk.nz[0][by * 4 + bx - 1] != 0 : (nA ? nA->nz[0][by * 4 + 3] != 0 : intra);
+    const int cb = by > 0 ? wk.nz[0][(by - 1) * 4 + bx] != 0 : (nB ? nB->nz[0][12 + bx] != 0 : intra);
+    return ca + 2 * cb;
+  }
+  int cbf_inc_chroma(const MbInfo& wk, bool intra, int c, int bx, int by) const {
+    const int ca = bx > 0 ? wk.nz[1 + c][by * 2 + bx - 1] != 0 : (nA ? nA->nz[1 + c][by * 2 + 1] != 0 : intra);
+    const int cb = by > 0 ? wk.nz[1 + c][(by - 1) * 2 + bx] != 0 : (nB ? nB->nz[1 + c][2 + bx] != 0 : intra);
+    return ca + 2 * cb;
+  }
+  int cbf_inc_dc(bool intra, int bit) const {
+    const int ca = nA ? (nA->cbf_dc >> bit) & 1 : intra;
+    const int cb = nB ? (nB->cbf_dc >> bit) & 1 : intra;
+    return ca + 2 * cb;
+  }
+
+  // The 8x8 block neighbouring the current macroblock's 8x8 block coordinates (cx, cy), cx and cy in -1..2.
+  struct Nb8 {
+    const MbInfo* m = nullptr;
+    int b8 = 0;
+  };
+  Nb8 nb8_at(const MbInfo& wk, int cx, int cy) const {
+    if (cx >= 0 && cy >= 0 && cx < 2 && cy < 2) return {&wk, cy * 2 + cx};
+    if (cx < 0 && cy >= 0 && cy < 2) return {nA, cy * 2 + 1};
+    if (cy < 0 && cx >= 0 && cx < 2) return {nB, 2 + cx};
+    if (cx >= 2 && cy < 0) return {nC, 2};
+    if (cx < 0 && cy < 0) return {nD, 3};
+    return {};
+  }
+  struct NbMot {
+    bool avail = false;
+    int ref = -1, x = 0, y = 0;
+  };
+  NbMot nb_motion(const MbInfo& wk, unsigned done8, int list, int cx, int cy) const {
+    NbMot r;
+    const Nb8 n = nb8_at(wk, cx, cy);
+    if (!n.m) return r;
+    if (n.m == &wk && !((done8 >> n.b8) & 1)) return r;   // later in decoding order
+    r.avail = true;
+    const int rf = n.m->ref[list][n.b8];
+    if (rf < 0 || n.m->intra()) return r;
+    r.ref = rf;
+    r.x = n.m->mv[list][n.b8][0];
+    r.y = n.m->mv[list][n.b8][1];
+    return r;
+  }
+  // 8.4.1.3: the motion vector prediction of the partition at (x, y), w x h samples, of the macroblock described by wk, for reference index `ref`.
+  // `shape` and `part` select the directional rules of 16x8 and 8x16 partitions.
+  void mv_pred(const MbInfo& wk, unsigned done8, int list, int ref, int x, int y, int w_, int shape, int part, int* px, int* py) const {
+    const NbMot a = nb_motion(wk, done8, list, (x - 1) >> 3, y >> 3);
+    NbMot b = nb_motion(wk, done8, list, x >> 3, (y - 1) >> 3);
+    NbMot c = nb_motion(wk, done8, list, (x + w_) >> 3, (y - 1) >> 3);
+    if (!c.avail) c = nb_motion(wk, done8, list, (x - 1) >> 3, (y - 1) >> 3);
+    if (shape == 1) {
+      if (part == 0 && b.ref == ref) { *px = b.x; *py = b.y; return; }
+      if (part == 1 && a.ref == ref) { *px = a.x; *py = a.y; return; }
+    } else if (shape == 2) {
+      if (part == 0 && a.ref == ref) { *px = a.x; *py = a.y; return; }
+      if (part == 1 && c.ref == ref) { *px = c.x; *py = c.y; return; }
+    }
+    NbMot B = b, C = c;
+    if (!b.avail && !c.avail && a.avail) {
+      B = a;
+      C = a;
+    }
+    const int matches = (a.ref == ref) + (B.ref == ref) + (C.ref == ref);
+    if (matches == 1) {
+      const NbMot& m = a.ref == ref ? a : (B.ref == ref ? B : C);
+      *px = m.x;
+      *py = m.y;
     } else {
-      w.ue(static_cast<uint32_t>(p_slice ? 5 : 0));   // I_NxN
-      for (int blk = 0; blk < 16; ++blk) {
-        const int gx = mx * 4 + blk_x(blk), gy = my * 4 + blk_y(blk);
-        // the prediction needs the modes of earlier blocks: set as we go
-        const int pm = (gx == 0 || gy == 0) ? 2 : std::min<int>(I4M(gx - 1, gy), I4M(gx, gy - 1));
-        if (mc.i4[blk] == pm) {
-          w.bit(1);
-        } else {
-          w.bit(0);
-          w.put(static_cast<uint32_t>(mc.i4[blk] < pm ? mc.i4[blk] : mc.i4[blk] - 1), 3);
-        }
-        I4M(gx, gy) = static_cast<uint8_t>(mc.i4[blk]);
-      }
-      w.ue(static_cast<uint32_t>(mc.chroma));
-      const int cbp = mc.cbp_l | (mc.cbp_c << 4);
-      int code = 0;
-      for (; code < 48; ++code)
-        if (kCbpIntra[code] == cbp) break;
-      w.ue(static_cast<uint32_t>(code));
-      if (cbp) w.se(0);
+      *px = median3(a.x, B.x, C.x);
+      *py = median3(a.y, B.y, C.y);
     }
-    // residual
-    if (mc.type == kMbI16x16) {
-      write_block(w, mc.dc, 16, nc_luma(mx * 4, my * 4));
+  }
+  // The P_Skip vector (8.4.1.1)
+  void pskip_mv(int* sx, int* sy) const {
+    MbInfo none;
+    const NbMot a = nb_motion(none, 0, 0, -1, 0), b = nb_motion(none, 0, 0, 0, -1);
+    if (!a.avail || !b.avail || (a.ref == 0 && a.x == 0 && a.y == 0) || (b.ref == 0 && b.x == 0 && b.y == 0)) {
+      *sx = *sy = 0;
+      return;
     }
-    if (mc.type == kMbI16x16 || mc.cbp_l) {
+    mv_pred(none, 0, 0, 0, 0, 0, 16, 0, 0, sx, sy);
+  }
+
+  // ---- the macroblock layer: partition syntax shared by both entropy coders ---------------------------------------------------
+
+  // pred flags of an 8x8 block of the macroblock: bit 0 list 0, bit 1 list 1
+  static int pf_of(const MbCode& mc, int b8) { return (mc.ref[0][b8] >= 0 ? 1 : 0) | (mc.ref[1][b8] >= 0 ? 2 : 0); }
+  // the 8x8 blocks that start each partition of the shape, and the partition's size
+  static int part_count(int shape) { return shape == 0 ? 1 : (shape == 3 ? 4 : 2); }
+  static void part_geom(int shape, int p, int* x, int* y, int* pw, int* ph, int* first_b8) {
+    switch (shape) {
+      case 0: *x = 0; *y = 0; *pw = 16; *ph = 16; *first_b8 = 0; break;
+      case 1: *x = 0; *y = 8 * p; *pw = 16; *ph = 8; *first_b8 = 2 * p; break;
+      case 2: *x = 8 * p; *y = 0; *pw = 8; *ph = 16; *first_b8 = p; break;
+      default: *x = (p & 1) * 8; *y = (p >> 1) * 8; *pw = 8; *ph = 8; *first_b8 = p; break;
+    }
+  }
+  // The B macroblock type number (Table 7-14) of a coded inter macroblock.
+  static int b_mb_type(const MbCode& mc) {
+    if (mc.type == kMbDirect) return 0;
+    if (mc.shape == 3) return 22;
+    const int p0 = pf_of(mc, 0), p1 = pf_of(mc, mc.shape == 1 ? 2 : 1);
+    if (mc.shape == 0) return p0;   // 1 L0, 2 L1, 3 Bi
+    static const int pair[4][4] = {{0, 0, 0, 0}, {0, 0, 2, 4}, {0, 3, 1, 5}, {0, 6, 7, 8}};
+    return 4 + 2 * pair[p0][p1] + (mc.shape == 2 ? 1 : 0);
+  }
+  static int p_mb_type(const MbCode& mc) { return mc.shape; }
+  // sub_mb_type of 8x8 block b8 of a B_8x8 macroblock: 0 direct, 1 L0, 2 L1, 3 Bi
+  static int b_sub_type(const MbCode& mc, int b8) { return (mc.sub_direct >> b8) & 1 ? 0 : pf_of(mc, b8); }
+  // The I-slice mb_type number of an intra macroblock.
+  static int intra_t_of(const MbCode& mc) {
+    if (mc.type == kMbI16) return 1 + mc.i16 + 4 * mc.cbp_c + (mc.cbp_l ? 12 : 0);
+    return 0;
+  }
+  // transform_size_8x8_flag is sent for an inter macroblock with luma coefficients when no partition is smaller than 8x8
+  bool t8_flag_present_inter(const MbCode& mc) const {
+    return t8_mode && mc.cbp_l != 0 && (mc.type != kMbDirect || true);
+  }
+
+  // Writes the CAVLC residual and updates wk's coefficient counts.
+  template <class W>
+  void write_residual_cavlc(W& w, const MbCode& mc, MbInfo& wk) {
+    const bool i16 = mc.type == kMbI16;
+    if (i16) write_block(w, mc.dc, 16, nc_luma(wk, 0, 0));
+    if (mc.cbp_l) {
       for (int b8 = 0; b8 < 4; ++b8) {
-        if (mc.type != kMbI16x16 && !((mc.cbp_l >> b8) & 1)) continue;
-        if (mc.type == kMbI16x16 && !mc.cbp_l) continue;
-        for (int k = 0; k < 4; ++k) {
-          const int blk = b8 * 4 + k;
-          const int gx = mx * 4 + blk_x(blk), gy = my * 4 + blk_y(blk);
-          const int n = write_block(w, mc.lv[blk], mc.type == kMbI16x16 ? 15 : 16, nc_luma(gx, gy));
-          NZY(gx, gy) = static_cast<uint8_t>(n);
+        if (!((mc.cbp_l >> b8) & 1)) continue;
+        for (int s = 0; s < 4; ++s) {
+          const int blk = b8 * 4 + s;
+          const int bx = blk_x(blk), by = blk_y(blk);
+          int n;
+          if (mc.t8) {
+            int tmp[16];
+            for (int i = 0; i < 16; ++i) tmp[i] = mc.lv8[b8][4 * i + s];
+            n = write_block(w, tmp, 16, nc_luma(wk, bx, by));
+          } else {
+            n = write_block(w, mc.lv[blk], i16 ? 15 : 16, nc_luma(wk, bx, by));
+          }
+          wk.nz[0][by * 4 + bx] = static_cast<uint8_t>(n);
         }
       }
     }
@@ -1067,129 +1034,422 @@ struct H264Encoder::Impl {
       if (mc.cbp_c == 2)
         for (int c = 0; c < 2; ++c)
           for (int b = 0; b < 4; ++b) {
-            const int gx = mx * 2 + (b & 1), gy = my * 2 + (b >> 1);
-            const int n = write_block(w, mc.cac[c][b], 15, nc_chroma(c, gx, gy));
-            NZC(c, gx, gy) = static_cast<uint8_t>(n);
+            const int n = write_block(w, mc.cac[c][b], 15, nc_chroma(wk, c, b & 1, b >> 1));
+            wk.nz[1 + c][b] = static_cast<uint8_t>(n);
           }
     }
   }
 
-  // ---- motion search ------------------------------------------------------------------------------------------
-
-  static int sad16(const uint8_t* a, int sa, const uint8_t* b) {
-    int s = 0;
-    for (int y = 0; y < 16; ++y)
-      for (int x = 0; x < 16; ++x) s += std::abs(a[y * sa + x] - b[y * 16 + x]);
-    return s;
+  // Writes the CABAC residual and updates wk's coefficient counts and DC flags.
+  template <class C>
+  void write_residual_cabac(C& c, const MbCode& mc, MbInfo& wk) {
+    const bool i16 = mc.type == kMbI16;
+    const bool intra = mc.type == kMbI4 || mc.type == kMbI8 || mc.type == kMbI16;
+    if (i16) {
+      bool any = false;
+      for (int i = 0; i < 16; ++i) any |= mc.dc[i] != 0;
+      cabac_residual_block(c, 0, cbf_inc_dc(intra, 0), 16, mc.dc);
+      if (any) wk.cbf_dc |= 1;
+    }
+    if (mc.cbp_l) {
+      for (int b8 = 0; b8 < 4; ++b8) {
+        if (!((mc.cbp_l >> b8) & 1)) continue;
+        if (mc.t8) {
+          int n = 0;
+          for (int i = 0; i < 64; ++i) n += mc.lv8[b8][i] != 0;
+          cabac_residual_block(c, 5, 0, 64, mc.lv8[b8]);
+          const int x4 = (b8 & 1) * 2, y4 = (b8 >> 1) * 2;
+          for (int k = 0; k < 4; ++k) wk.nz[0][(y4 + (k >> 1)) * 4 + x4 + (k & 1)] = static_cast<uint8_t>(n);
+          continue;
+        }
+        for (int s = 0; s < 4; ++s) {
+          const int blk = b8 * 4 + s;
+          const int bx = blk_x(blk), by = blk_y(blk);
+          const int maxc = i16 ? 15 : 16;
+          int n = 0;
+          for (int i = 0; i < maxc; ++i) n += mc.lv[blk][i] != 0;
+          cabac_residual_block(c, i16 ? 1 : 2, cbf_inc_luma(wk, intra, bx, by), maxc, mc.lv[blk]);
+          wk.nz[0][by * 4 + bx] = static_cast<uint8_t>(n);
+        }
+      }
+    }
+    if (mc.cbp_c) {
+      for (int cc = 0; cc < 2; ++cc) {
+        bool any = false;
+        for (int i = 0; i < 4; ++i) any |= mc.cdc[cc][i] != 0;
+        cabac_residual_block(c, 3, cbf_inc_dc(intra, 1 + cc), 4, mc.cdc[cc]);
+        if (any) wk.cbf_dc |= static_cast<uint8_t>(2 << cc);
+      }
+      if (mc.cbp_c == 2)
+        for (int cc = 0; cc < 2; ++cc)
+          for (int b = 0; b < 4; ++b) {
+            int n = 0;
+            for (int i = 0; i < 15; ++i) n += mc.cac[cc][b][i] != 0;
+            cabac_residual_block(c, 4, cbf_inc_chroma(wk, intra, cc, b & 1, b >> 1), 15, mc.cac[cc][b]);
+            wk.nz[1 + cc][b] = static_cast<uint8_t>(n);
+          }
+    }
   }
-  static int mv_bits(int dx, int dy) {
-    auto se_bits = [](int v) {
-      const uint32_t k = v > 0 ? static_cast<uint32_t>(2 * v - 1) : static_cast<uint32_t>(-2 * v);
-      return 2 * floor_log2(k + 1) + 1;
-    };
-    return se_bits(dx) + se_bits(dy);
+
+  // ---- the macroblock layer, CAVLC --------------------------------------------------------------------------------------
+
+  // Sets the parts of wk that every writer determines from the macroblock's decisions.
+  void init_wk(const MbCode& mc, MbInfo& wk) const {
+    const bool intra = mc.type == kMbI4 || mc.type == kMbI8 || mc.type == kMbI16;
+    wk.kind = mc.type == kMbI4 ? kKI4 : mc.type == kMbI8 ? kKI8 : mc.type == kMbI16 ? kKI16 : kKInter;
+    wk.skip = mc.type == kMbSkip;
+    wk.direct16 = mc.type == kMbDirect || (mc.type == kMbSkip && slice_kind == kSliceB);
+    wk.t8 = mc.t8;
+    wk.cbp = static_cast<uint8_t>(mc.cbp_l | (mc.cbp_c << 4));
+    wk.chroma_mode = static_cast<uint8_t>(intra ? mc.chroma : 0);
+    wk.cbf_dc = 0;
+    std::memset(wk.nz, 0, sizeof wk.nz);
+    std::memset(wk.mvd, 0, sizeof wk.mvd);
+    if (!intra) {
+      for (int l = 0; l < 2; ++l)
+        for (int b8 = 0; b8 < 4; ++b8) {
+          wk.ref[l][b8] = mc.ref[l][b8];
+          wk.mv[l][b8][0] = mc.ref[l][b8] >= 0 ? mc.mv[l][b8][0] : 0;
+          wk.mv[l][b8][1] = mc.ref[l][b8] >= 0 ? mc.mv[l][b8][1] : 0;
+        }
+      wk.direct8 = mc.type == kMbDirect || mc.type == kMbSkip ? 0xF : mc.sub_direct;
+    } else {
+      std::memset(wk.ref, -1, sizeof wk.ref);
+      std::memset(wk.mv, 0, sizeof wk.mv);
+      wk.direct8 = 0;
+    }
   }
 
-  struct MvCost {
-    int cost;
-    int sad;
+  template <class W>
+  static void put_te(W& w, int range, int v) {
+    if (range > 1) w.ue(static_cast<uint32_t>(v));
+    else if (range == 1) w.bit(v ? 0 : 1);
+  }
+
+  // the mvd of a partition against its prediction, stored in wk for the contexts of what follows
+  void mvd_of(MbInfo& wk, unsigned done8, const MbCode& mc, int l, int p, int* dx, int* dy) const {
+    int x, y, pw, ph, b8;
+    part_geom(mc.shape, p, &x, &y, &pw, &ph, &b8);
+    int px, py;
+    mv_pred(wk, done8, l, mc.ref[l][b8], x, y, pw, mc.shape, p, &px, &py);
+    *dx = mc.mv[l][b8][0] - px;
+    *dy = mc.mv[l][b8][1] - py;
+    for (int k = 0; k < 4; ++k) {
+      const int bx = (k & 1) * 8, by = (k >> 1) * 8;
+      if (bx >= x && bx < x + pw && by >= y && by < y + ph) {
+        wk.mvd[l][k][0] = static_cast<uint8_t>(std::min(std::abs(*dx), 255));
+        wk.mvd[l][k][1] = static_cast<uint8_t>(std::min(std::abs(*dy), 255));
+      }
+    }
+  }
+  static unsigned part_mask(int shape, int p) {
+    int x, y, pw, ph, b8;
+    part_geom(shape, p, &x, &y, &pw, &ph, &b8);
+    unsigned m = 0;
+    for (int k = 0; k < 4; ++k) {
+      const int bx = (k & 1) * 8, by = (k >> 1) * 8;
+      if (bx >= x && bx < x + pw && by >= y && by < y + ph) m |= 1u << k;
+    }
+    return m;
+  }
+  int active(int l) const { return num_active[l]; }
+
+  // Writes everything of a coded macroblock except mb_skip_run / mb_skip_flag, and fills wk.
+  template <class W>
+  void write_mb_cavlc(W& w, const MbCode& mc, MbInfo& wk) {
+    init_wk(mc, wk);
+    const bool intra = mc.type == kMbI4 || mc.type == kMbI8 || mc.type == kMbI16;
+    const int prefix = slice_kind == kSliceI ? 0 : (slice_kind == kSliceP ? 5 : 23);
+    if (intra) {
+      w.ue(static_cast<uint32_t>(prefix + intra_t_of(mc)));
+      if (mc.type != kMbI16) {
+        if (t8_mode) w.bit(mc.type == kMbI8);
+        const bool i8 = mc.type == kMbI8;
+        for (int i = 0; i < (i8 ? 4 : 16); ++i) {
+          const int blk = i8 ? i * 4 : i;
+          const int bx4 = i8 ? (i & 1) * 2 : blk_x(blk), by4 = i8 ? (i >> 1) * 2 : blk_y(blk);
+          const int pm = pred_mode_nxn(wk, bx4, by4);
+          const int mode = i8 ? mc.i8[i] : mc.i4[blk];
+          if (mode == pm) {
+            w.bit(1);
+          } else {
+            w.bit(0);
+            w.put(static_cast<uint32_t>(mode < pm ? mode : mode - 1), 3);
+          }
+          if (i8)
+            for (int k = 0; k < 4; ++k) wk.ipred[(by4 + (k >> 1)) * 4 + bx4 + (k & 1)] = static_cast<int8_t>(mode);
+          else
+            wk.ipred[by4 * 4 + bx4] = static_cast<int8_t>(mode);
+        }
+      }
+      w.ue(static_cast<uint32_t>(mc.chroma));
+      if (mc.type != kMbI16) {
+        const int cbp = mc.cbp_l | (mc.cbp_c << 4);
+        int code = 0;
+        for (; code < 48; ++code)
+          if (kCbpIntra[code] == cbp) break;
+        w.ue(static_cast<uint32_t>(code));
+      }
+      if (mc.type == kMbI16 || mc.cbp_l || mc.cbp_c) w.se(0);   // mb_qp_delta
+    } else {
+      const bool is_b = slice_kind == kSliceB;
+      w.ue(static_cast<uint32_t>(is_b ? b_mb_type(mc) : p_mb_type(mc)));
+      if (mc.type != kMbDirect) {
+        if (mc.shape == 3)
+          for (int b8 = 0; b8 < 4; ++b8) w.ue(static_cast<uint32_t>(is_b ? b_sub_type(mc, b8) : 0));
+        const int nparts = part_count(mc.shape);
+        for (int l = 0; l < (is_b ? 2 : 1); ++l)
+          for (int p = 0; p < nparts; ++p) {
+            int x, y, pw, ph, b8;
+            part_geom(mc.shape, p, &x, &y, &pw, &ph, &b8);
+            if ((mc.sub_direct >> b8) & 1) continue;
+            if (mc.ref[l][b8] < 0) continue;
+            if (active(l) > 1) put_te(w, active(l) - 1, mc.ref[l][b8]);
+          }
+        for (int l = 0; l < (is_b ? 2 : 1); ++l) {
+          unsigned done = 0;
+          for (int p = 0; p < nparts; ++p) {
+            int x, y, pw, ph, b8;
+            part_geom(mc.shape, p, &x, &y, &pw, &ph, &b8);
+            if (!((mc.sub_direct >> b8) & 1) && mc.ref[l][b8] >= 0) {
+              int dx, dy;
+              mvd_of(wk, done, mc, l, p, &dx, &dy);
+              w.se(dx);
+              w.se(dy);
+            }
+            done |= part_mask(mc.shape, p);
+          }
+        }
+      }
+      const int cbp = mc.cbp_l | (mc.cbp_c << 4);
+      int code = 0;
+      for (; code < 48; ++code)
+        if (kCbpInter[code] == cbp) break;
+      w.ue(static_cast<uint32_t>(code));
+      if (mc.cbp_l && t8_mode) w.bit(mc.t8);
+      if (cbp) w.se(0);
+    }
+    if (mc.type == kMbI16 || mc.cbp_l || mc.cbp_c) write_residual_cavlc(w, mc, wk);
+  }
+
+  // ---- the macroblock layer, CABAC ----------------------------------------------------------------------------------------
+
+  int ref_ctx_inc(const MbInfo& wk, int list, int b8) const {
+    int inc = 0;
+    const int cx = b8 & 1, cy = b8 >> 1;
+    for (int n = 0; n < 2; ++n) {
+      const Nb8 nb = n == 0 ? nb8_at(wk, cx - 1, cy) : nb8_at(wk, cx, cy - 1);
+      if (!nb.m || nb.m->intra() || nb.m->skip || ((nb.m->direct8 >> nb.b8) & 1)) continue;
+      if (nb.m->ref[list][nb.b8] > 0) inc += n == 0 ? 1 : 2;
+    }
+    return inc;
+  }
+  int mvd_ctx_sum(const MbInfo& wk, int list, int comp, int x, int y) const {
+    int sum = 0;
+    for (int n = 0; n < 2; ++n) {
+      const Nb8 nb = n == 0 ? nb8_at(wk, (x - 1) >> 3, y >> 3) : nb8_at(wk, x >> 3, (y - 1) >> 3);
+      if (!nb.m || nb.m->intra() || nb.m->skip) continue;
+      sum += nb.m->mvd[list][nb.b8][comp];
+    }
+    return sum;
+  }
+  int cbp_ctx_luma(const MbCode& mc, int b8) const {
+    int inc = 0;
+    for (int n = 0; n < 2; ++n) {
+      const int cx = n == 0 ? (b8 & 1) - 1 : (b8 & 1), cy = n == 0 ? (b8 >> 1) : (b8 >> 1) - 1;
+      int cond;
+      if (cx >= 0 && cy >= 0) {
+        cond = ((mc.cbp_l >> (cy * 2 + cx)) & 1) == 0;
+      } else {
+        const MbInfo* m = cx < 0 ? nA : nB;
+        const int nb8 = cx < 0 ? cy * 2 + 1 : 2 + cx;
+        if (!m) cond = 0;
+        else if (m->skip) cond = 1;
+        else cond = ((m->cbp >> nb8) & 1) == 0;
+      }
+      inc += cond << n;
+    }
+    return inc;
+  }
+
+  template <class C>
+  void write_cbp_cabac(C& c, const MbCode& mc) {
+    for (int b8 = 0; b8 < 4; ++b8) c.decision(73 + cbp_ctx_luma(mc, b8), (mc.cbp_l >> b8) & 1);
+    int inc = 0;
+    if (nA && !nA->skip && ((nA->cbp >> 4) & 3) != 0) inc += 1;
+    if (nB && !nB->skip && ((nB->cbp >> 4) & 3) != 0) inc += 2;
+    c.decision(77 + inc, mc.cbp_c != 0);
+    if (mc.cbp_c != 0) {
+      inc = 0;
+      if (nA && !nA->skip && ((nA->cbp >> 4) & 3) == 2) inc += 1;
+      if (nB && !nB->skip && ((nB->cbp >> 4) & 3) == 2) inc += 2;
+      c.decision(77 + 4 + inc, mc.cbp_c == 2);
+    }
+  }
+
+  template <class C>
+  void write_skip_flag_cabac(C& c, bool skipped) {
+    int inc = 0;
+    if (nA && !nA->skip) ++inc;
+    if (nB && !nB->skip) ++inc;
+    c.decision((slice_kind == kSliceB ? 24 : 11) + inc, skipped);
+  }
+
+  template <class C>
+  void write_mb_cabac(C& c, const MbCode& mc, MbInfo& wk) {
+    init_wk(mc, wk);
+    const bool intra = mc.type == kMbI4 || mc.type == kMbI8 || mc.type == kMbI16;
+    if (intra) {
+      const int t = intra_t_of(mc);
+      if (slice_kind == kSliceI) {
+        int inc = 0;
+        if (nA && nA->kind != kKI4 && nA->kind != kKI8) ++inc;
+        if (nB && nB->kind != kKI4 && nB->kind != kKI8) ++inc;
+        cabac_mb_type_i(c, 3, true, inc, t);
+      } else if (slice_kind == kSliceP) {
+        cabac_mb_type_p(c, 0, t);
+      } else {
+        int inc = 0;
+        if (nA && !nA->skip && !nA->direct16) ++inc;
+        if (nB && !nB->skip && !nB->direct16) ++inc;
+        cabac_mb_type_b(c, inc, 0, t);
+      }
+      if (mc.type != kMbI16) {
+        if (t8_mode) c.decision(399 + (nA && nA->t8 ? 1 : 0) + (nB && nB->t8 ? 1 : 0), mc.type == kMbI8);
+        const bool i8 = mc.type == kMbI8;
+        for (int i = 0; i < (i8 ? 4 : 16); ++i) {
+          const int blk = i8 ? i * 4 : i;
+          const int bx4 = i8 ? (i & 1) * 2 : blk_x(blk), by4 = i8 ? (i >> 1) * 2 : blk_y(blk);
+          const int pm = pred_mode_nxn(wk, bx4, by4);
+          const int mode = i8 ? mc.i8[i] : mc.i4[blk];
+          if (mode == pm) {
+            c.decision(68, 1);
+          } else {
+            c.decision(68, 0);
+            const int rem = mode < pm ? mode : mode - 1;
+            c.decision(69, rem & 1);
+            c.decision(69, (rem >> 1) & 1);
+            c.decision(69, (rem >> 2) & 1);
+          }
+          if (i8)
+            for (int k = 0; k < 4; ++k) wk.ipred[(by4 + (k >> 1)) * 4 + bx4 + (k & 1)] = static_cast<int8_t>(mode);
+          else
+            wk.ipred[by4 * 4 + bx4] = static_cast<int8_t>(mode);
+        }
+      }
+      {
+        int inc = 0;
+        if (nA && nA->intra() && nA->chroma_mode != 0) ++inc;
+        if (nB && nB->intra() && nB->chroma_mode != 0) ++inc;
+        cabac_intra_chroma_mode(c, inc, mc.chroma);
+      }
+      if (mc.type != kMbI16) write_cbp_cabac(c, mc);
+    } else {
+      const bool is_b = slice_kind == kSliceB;
+      if (is_b) {
+        int inc = 0;
+        if (nA && !nA->skip && !nA->direct16) ++inc;
+        if (nB && !nB->skip && !nB->direct16) ++inc;
+        cabac_mb_type_b(c, inc, b_mb_type(mc), -1);
+      } else {
+        cabac_mb_type_p(c, p_mb_type(mc), -1);
+      }
+      if (mc.type != kMbDirect) {
+        if (mc.shape == 3)
+          for (int b8 = 0; b8 < 4; ++b8) {
+            if (is_b) cabac_sub_mb_type_b(c, b_sub_type(mc, b8));
+            else cabac_sub_mb_type_p(c, 0);
+          }
+        const int nparts = part_count(mc.shape);
+        for (int l = 0; l < (is_b ? 2 : 1); ++l)
+          for (int p = 0; p < nparts; ++p) {
+            int x, y, pw, ph, b8;
+            part_geom(mc.shape, p, &x, &y, &pw, &ph, &b8);
+            if ((mc.sub_direct >> b8) & 1) continue;
+            if (mc.ref[l][b8] < 0) continue;
+            if (active(l) > 1) cabac_ref_idx(c, ref_ctx_inc(wk, l, b8), mc.ref[l][b8]);
+          }
+        for (int l = 0; l < (is_b ? 2 : 1); ++l) {
+          unsigned done = 0;
+          for (int p = 0; p < nparts; ++p) {
+            int x, y, pw, ph, b8;
+            part_geom(mc.shape, p, &x, &y, &pw, &ph, &b8);
+            if (!((mc.sub_direct >> b8) & 1) && mc.ref[l][b8] >= 0) {
+              int dx, dy;
+              // the contexts read the neighbours' mvd, so they are taken before this partition's own are stored
+              const int sx = mvd_ctx_sum(wk, l, 0, x, y), sy = mvd_ctx_sum(wk, l, 1, x, y);
+              mvd_of(wk, done, mc, l, p, &dx, &dy);
+              cabac_mvd(c, 40, sx, dx);
+              cabac_mvd(c, 47, sy, dy);
+            }
+            done |= part_mask(mc.shape, p);
+          }
+        }
+      }
+      write_cbp_cabac(c, mc);
+      if (mc.cbp_l && t8_mode) c.decision(399 + (nA && nA->t8 ? 1 : 0) + (nB && nB->t8 ? 1 : 0), mc.t8);
+    }
+    if (mc.type == kMbI16 || mc.cbp_l || mc.cbp_c) {
+      cabac_qp_delta(c, last_dqp_nonzero, 0);
+      write_residual_cabac(c, mc, wk);
+    }
+  }
+  bool last_dqp_nonzero = false;
+
+  // ---- costs of candidates ------------------------------------------------------------------------------------------------------------
+
+  struct Recon {
+    uint8_t y[256], u[64], v[64];
   };
-  MvCost eval_mv(int ri, int mx, int my, int vx, int vy, int px, int py, uint8_t* pred) const {
-    pred_luma(ri, mx, my, vx, vy, pred);
-    const int sad = sad16(src_y(mx, my), ys, pred);
-    return {sad + static_cast<int>(lam_sad * mv_bits(vx - px, vy - py) + 0.5), sad};
+  void save_rec(int mx, int my, Recon& r) {
+    for (int y = 0; y < 16; ++y) std::memcpy(r.y + y * 16, rec_y(mx, my) + y * ys, 16);
+    for (int y = 0; y < 8; ++y) {
+      std::memcpy(r.u + y * 8, rec_c(0, mx, my) + y * cs, 8);
+      std::memcpy(r.v + y * 8, rec_c(1, mx, my) + y * cs, 8);
+    }
+  }
+  void restore_rec(int mx, int my, const Recon& r) {
+    for (int y = 0; y < 16; ++y) std::memcpy(rec_y(mx, my) + y * ys, r.y + y * 16, 16);
+    for (int y = 0; y < 8; ++y) {
+      std::memcpy(rec_c(0, mx, my) + y * cs, r.u + y * 8, 8);
+      std::memcpy(rec_c(1, mx, my) + y * cs, r.v + y * 8, 8);
+    }
   }
 
-  bool mv_in_range(int mx, int my, int vx, int vy) const {
-    const int X = mx * 16 + (vx >> 2), Y = my * 16 + (vy >> 2);
-    return X >= -kPad + 4 && Y >= -kPad + 4 && X + 16 + 4 <= ys + kPad && Y + 16 + 4 <= mh * 16 + kPad &&
-           std::abs(vx) <= (kSearch + 2) * 4 && std::abs(vy) <= (kSearch + 2) * 4;
+  // Bits a coded macroblock takes with the entropy coder's present state.
+  double mb_bits(const MbCode& mc) {
+    MbInfo scratch;
+    scratch.slice = static_cast<int16_t>(cur_slice);
+    if (cabac) {
+      H264CostCoder cc(*bc);
+      if (slice_kind != kSliceI) write_skip_flag_cabac(cc, false);
+      write_mb_cabac(cc, mc, scratch);
+      return cc.cost / 256.0;
+    }
+    BitCounter counter;
+    write_mb_cavlc(counter, mc, scratch);
+    return static_cast<double>(counter.n);
   }
-
-  void search(int ri, int mx, int my, int px, int py, int* bx, int* by, int* bcost, int* bsad) const {
-    uint8_t pred[256];
-    int best_x = 0, best_y = 0;
-    MvCost best = eval_mv(ri, mx, my, 0, 0, px, py, pred);
-    auto try_mv = [&](int vx, int vy) {
-      if (!mv_in_range(mx, my, vx, vy)) return false;
-      const MvCost c = eval_mv(ri, mx, my, vx, vy, px, py, pred);
-      if (c.cost < best.cost) {
-        best = c;
-        best_x = vx;
-        best_y = vy;
-        return true;
-      }
-      return false;
-    };
-    // starting points: the predictor and the neighbours' vectors rounded to whole samples
-    try_mv((px >> 2) * 4, (py >> 2) * 4);
-    {
-      const Nb a = nb_mv(mx - 1, my), b = nb_mv(mx, my - 1);
-      if (a.ref == ri) try_mv((a.x >> 2) * 4, (a.y >> 2) * 4);
-      if (b.ref == ri) try_mv((b.x >> 2) * 4, (b.y >> 2) * 4);
-    }
-    // whole-sample diamond refinement
-    for (int it = 0; it < 2 * kSearch; ++it) {
-      bool moved = false;
-      const int cx = best_x, cy = best_y;
-      for (const auto& d : {std::pair<int, int>{4, 0}, {-4, 0}, {0, 4}, {0, -4}})
-        if (try_mv(cx + d.first, cy + d.second)) moved = true;
-      if (!moved) break;
-    }
-    // half then quarter sample refinement
-    for (const int step : {2, 1}) {
-      for (int round = 0; round < 2; ++round) {
-        const int cx = best_x, cy = best_y;
-        bool moved = false;
-        for (int dy = -step; dy <= step; dy += step)
-          for (int dx = -step; dx <= step; dx += step)
-            if ((dx || dy) && try_mv(cx + dx, cy + dy)) moved = true;
-        if (!moved) break;
-      }
-    }
-    *bx = best_x;
-    *by = best_y;
-    *bcost = best.cost;
-    *bsad = best.sad;
+  double mb_sse(int mx, int my) {
+    double sse = static_cast<double>(sse_block(src_y(mx, my), ys, rec_y(mx, my), ys, 16, 16));
+    for (int c = 0; c < 2; ++c) sse += static_cast<double>(sse_block(src_c(c, mx, my), cs, rec_c(c, mx, my), cs, 8, 8));
+    return sse;
   }
-
-  // ---- the picture ----------------------------------------------------------------------------------------------
-
   // Total cost of a coded macroblock: squared error plus lambda times its bits.
-  double mb_cost(int mx, int my, const MbCode& mc, bool inter) {
-    BitCounter bc;
-    write_mb(bc, mc, mx, my);
-    size_t bits = bc.n;
-    (void)inter;
-    double sse = sse16(src_y(mx, my), ys, rec_y(mx, my), ys, 16);
-    for (int c = 0; c < 2; ++c) sse += sse16(src_c(c, mx, my), cs, rec_c(c, mx, my), cs, 8);
-    return sse + lambda * static_cast<double>(bits);
-  }
+  double mb_cost(int mx, int my, const MbCode& mc) { return mb_sse(mx, my) + lambda * mb_bits(mc); }
 
-  void save_rec(int mx, int my, uint8_t* sy_, uint8_t* su_, uint8_t* sv_) {
-    for (int y = 0; y < 16; ++y) std::memcpy(sy_ + y * 16, rec_y(mx, my) + y * ys, 16);
-    for (int y = 0; y < 8; ++y) {
-      std::memcpy(su_ + y * 8, rec_c(0, mx, my) + y * cs, 8);
-      std::memcpy(sv_ + y * 8, rec_c(1, mx, my) + y * cs, 8);
-    }
-  }
-  void restore_rec(int mx, int my, const uint8_t* sy_, const uint8_t* su_, const uint8_t* sv_) {
-    for (int y = 0; y < 16; ++y) std::memcpy(rec_y(mx, my) + y * ys, sy_ + y * 16, 16);
-    for (int y = 0; y < 8; ++y) {
-      std::memcpy(rec_c(0, mx, my) + y * cs, su_ + y * 8, 8);
-      std::memcpy(rec_c(1, mx, my) + y * cs, sv_ + y * 8, 8);
-    }
-  }
+  // ---- intra coding of a macroblock -------------------------------------------------------------------------------------------------
 
-  // Intra coding of the macroblock: the better of Intra16x16 and Intra4x4 (with the chroma mode chosen by SATD).
-  double code_intra(int mx, int my, MbCode& best, uint8_t* sav_y, uint8_t* sav_u, uint8_t* sav_v) {
+  // Intra coding of the macroblock: the best of Intra16x16, Intra4x4 and Intra8x8 (with the chroma mode chosen by SATD). The winner's reconstruction is left in
+  // the picture; best_wk holds its Intra4x4/8x8 modes.
+  double code_intra(int mx, int my, MbCode& best, MbInfo& best_wk) {
     // chroma mode
     int cmode = 0;
     {
-      double bc = 1e30;
+      double bcost = 1e30;
       uint8_t pu[64], pv[64];
       for (int mode = 0; mode < 4; ++mode) {
-        if (!chroma_mode_ok(mx, my, mode)) continue;
+        if (!chroma_mode_ok(mode)) continue;
         double cost = lam_sad * (mode == 0 ? 1 : 3);
         for (int c = 0; c < 2; ++c) {
           uint8_t* pred = c ? pv : pu;
@@ -1202,8 +1462,8 @@ struct H264Encoder::Impl {
             cost += satd4(d);
           }
         }
-        if (cost < bc) {
-          bc = cost;
+        if (cost < bcost) {
+          bcost = cost;
           cmode = mode;
         }
       }
@@ -1220,7 +1480,7 @@ struct H264Encoder::Impl {
       uint8_t pred[256];
       const uint8_t* s = src_y(mx, my);
       for (int mode = 0; mode < 4; ++mode) {
-        if (!i16_mode_ok(mx, my, mode)) continue;
+        if (!i16_mode_ok(mode)) continue;
         predict16(mx, my, mode, pred);
         double cost = lam_sad * (mode == 2 ? 1 : 3);
         for (int blk = 0; blk < 16; ++blk) {
@@ -1237,73 +1497,760 @@ struct H264Encoder::Impl {
         }
       }
     }
-    MbCode a;
-    a.type = kMbI16x16;
-    a.i16 = i16mode;
-    a.chroma = cmode;
-    for (int by = 0; by < 4; ++by)
-      for (int bx = 0; bx < 4; ++bx) I4M(mx * 4 + bx, my * 4 + by) = 2;
-    code_i16(mx, my, p16, a);
-    code_chroma(mx, my, pu, pv, true, a);
-    const double ja = mb_cost(mx, my, a, false);
-    save_rec(mx, my, sav_y, sav_u, sav_v);
-
-    MbCode b;
-    b.type = kMbI4x4;
-    b.chroma = cmode;
-    code_i4(mx, my, b);
-    code_chroma(mx, my, pu, pv, true, b);
-    // the modes are in I4M already; mb_cost writes them again with the same result
-    const double jb = mb_cost(mx, my, b, false);
-    if (jb < ja) {
-      best = b;
-      return jb;
+    Recon best_rec, tmp_rec;
+    double best_cost = 1e30;
+    {
+      MbCode a;
+      a.type = kMbI16;
+      a.i16 = i16mode;
+      a.chroma = cmode;
+      MbInfo wk;
+      code_i16(mx, my, p16, a);
+      code_chroma(mx, my, pu, pv, true, a);
+      best_cost = mb_cost(mx, my, a);
+      save_rec(mx, my, best_rec);
+      best = a;
+      best_wk = wk;
     }
-    restore_rec(mx, my, sav_y, sav_u, sav_v);
-    for (int by = 0; by < 4; ++by)
-      for (int bx = 0; bx < 4; ++bx) I4M(mx * 4 + bx, my * 4 + by) = 2;
-    best = a;
-    return ja;
+    {
+      MbCode b;
+      b.type = kMbI4;
+      b.chroma = cmode;
+      MbInfo wk;
+      code_i4(mx, my, b, wk);
+      code_chroma(mx, my, pu, pv, true, b);
+      const double jb = mb_cost(mx, my, b);
+      if (jb < best_cost) {
+        best_cost = jb;
+        save_rec(mx, my, best_rec);
+        best = b;
+        best_wk = wk;
+      }
+    }
+    if (t8_mode) {
+      MbCode c;
+      c.type = kMbI8;
+      c.t8 = true;
+      c.chroma = cmode;
+      MbInfo wk;
+      code_i8(mx, my, c, wk);
+      code_chroma(mx, my, pu, pv, true, c);
+      const double jc = mb_cost(mx, my, c);
+      if (jc < best_cost) {
+        best_cost = jc;
+        save_rec(mx, my, best_rec);
+        best = c;
+        best_wk = wk;
+      }
+    }
+    (void)tmp_rec;
+    restore_rec(mx, my, best_rec);
+    return best_cost;
   }
 
-  std::vector<uint8_t> encode_picture(const EncPicture& in, PicType t, int q, EncStats* stats);
-  std::vector<uint8_t> code_picture(const EncPicture& in, PicType t, int q);
+  // ---- inter prediction of a macroblock --------------------------------------------------------------------------------------------
+
+  static int mv_bits(int dx, int dy) {
+    auto se_bits = [](int v) {
+      const uint32_t k = v > 0 ? static_cast<uint32_t>(2 * v - 1) : static_cast<uint32_t>(-2 * v);
+      return 2 * floor_log2(k + 1) + 1;
+    };
+    return se_bits(dx) + se_bits(dy);
+  }
+
+  // The prediction of the macroblock from the motion in mc: per 8x8 block, from list 0, list 1, or their average.
+  void build_pred(int mx, int my, const MbCode& mc, uint8_t* pl, uint8_t* pu, uint8_t* pv) const {
+    const int px = mx * 16, py = my * 16;
+    bool uniform = true;
+    for (int b8 = 1; b8 < 4; ++b8)
+      for (int l = 0; l < 2; ++l)
+        if (mc.ref[l][b8] != mc.ref[l][0] || (mc.ref[l][0] >= 0 && (mc.mv[l][b8][0] != mc.mv[l][0][0] || mc.mv[l][b8][1] != mc.mv[l][0][1]))) uniform = false;
+    const int nb = uniform ? 1 : 4;
+    const int bs = uniform ? 16 : 8;
+    for (int b = 0; b < nb; ++b) {
+      const int bx = uniform ? 0 : (b & 1) * 8, by = uniform ? 0 : (b >> 1) * 8;
+      uint8_t tl[2][256], tu[2][64], tv[2][64];
+      int used = 0;
+      for (int l = 0; l < 2; ++l) {
+        const int ri = mc.ref[l][b];
+        if (ri < 0) continue;
+        const RefPic& r = lists[l][static_cast<size_t>(ri)];
+        pred_luma(r, px + bx, py + by, bs, bs, mc.mv[l][b][0], mc.mv[l][b][1], tl[used], bs);
+        pred_chroma(r, px + bx, py + by, bs, bs, mc.mv[l][b][0], mc.mv[l][b][1], tu[used], tv[used], bs / 2);
+        ++used;
+      }
+      for (int y = 0; y < bs; ++y)
+        for (int x = 0; x < bs; ++x) {
+          const int v = used == 2 ? (tl[0][y * bs + x] + tl[1][y * bs + x] + 1) >> 1 : tl[0][y * bs + x];
+          pl[(by + y) * 16 + bx + x] = static_cast<uint8_t>(v);
+        }
+      for (int y = 0; y < bs / 2; ++y)
+        for (int x = 0; x < bs / 2; ++x) {
+          const int vu = used == 2 ? (tu[0][y * (bs / 2) + x] + tu[1][y * (bs / 2) + x] + 1) >> 1 : tu[0][y * (bs / 2) + x];
+          const int vv = used == 2 ? (tv[0][y * (bs / 2) + x] + tv[1][y * (bs / 2) + x] + 1) >> 1 : tv[0][y * (bs / 2) + x];
+          pu[(by / 2 + y) * 8 + bx / 2 + x] = static_cast<uint8_t>(vu);
+          pv[(by / 2 + y) * 8 + bx / 2 + x] = static_cast<uint8_t>(vv);
+        }
+    }
+  }
+
+  // ---- motion search ------------------------------------------------------------------------------------------------------------------
+
+  struct MeResult {
+    int vx = 0, vy = 0, cost = 0x7fffffff, sad = 0;
+  };
+
+  bool mv_in_range(int px, int py, int bw_, int bh_, int vx, int vy) const {
+    const int X = px + (vx >> 2), Y = py + (vy >> 2);
+    return X >= -kPad + 4 && Y >= -kPad + 4 && X + bw_ + 4 <= ys + kPad && Y + bh_ + 4 <= mh * 16 + kPad && std::abs(vx) <= (kSearch + 2) * 4 && std::abs(vy) <= (kSearch + 2) * 4;
+  }
+
+  // SAD of the block at (px, py), bw x bh, predicted from reference r with vector (vx, vy)
+  int sad_at(const RefPic& r, int px, int py, int bw_, int bh_, int vx, int vy) const {
+    const uint8_t* s = &sy[static_cast<size_t>(py) * ys + px];
+    int sad = 0;
+    if (((vx | vy) & 3) == 0) {
+      const RefPlanes& rp = r.rp;
+      const int X0 = px + (vx >> 2), Y0 = py + (vy >> 2);
+      for (int y = 0; y < bh_; ++y) {
+        const uint8_t* row = rp.at(rp.g, X0, Y0 + y);   // the padded plane lets a row of in-range samples be read directly
+        for (int x = 0; x < bw_; ++x) sad += std::abs(s[y * ys + x] - row[x]);
+      }
+      return sad;
+    }
+    uint8_t pred[256];
+    pred_luma(r, px, py, bw_, bh_, vx, vy, pred, bw_);
+    for (int y = 0; y < bh_; ++y)
+      for (int x = 0; x < bw_; ++x) sad += std::abs(s[y * ys + x] - pred[y * bw_ + x]);
+    return sad;
+  }
+
+  // Motion search of one partition (px, py, bw x bh) in reference r: the whole-sample diamond from the given starting points, then half and quarter
+  // sample refinement. `mvp` is the predicted vector the cost is measured against.
+  MeResult me_search(const RefPic& r, int px, int py, int bw_, int bh_, int mvpx, int mvpy, const int (*seeds)[2], int nseeds) const {
+    MeResult best;
+    auto try_mv = [&](int vx, int vy) {
+      if (!mv_in_range(px, py, bw_, bh_, vx, vy)) return false;
+      const int sad = sad_at(r, px, py, bw_, bh_, vx, vy);
+      const int cost = sad + static_cast<int>(lam_sad * mv_bits(vx - mvpx, vy - mvpy) + 0.5);
+      if (cost < best.cost) {
+        best.cost = cost;
+        best.sad = sad;
+        best.vx = vx;
+        best.vy = vy;
+        return true;
+      }
+      return false;
+    };
+    try_mv(0, 0);
+    try_mv((mvpx >> 2) * 4, (mvpy >> 2) * 4);
+    for (int i = 0; i < nseeds; ++i) try_mv((seeds[i][0] >> 2) * 4, (seeds[i][1] >> 2) * 4);
+    for (int it = 0; it < 2 * kSearch; ++it) {
+      bool moved = false;
+      const int cx = best.vx, cy = best.vy;
+      for (const auto& d : {std::pair<int, int>{4, 0}, {-4, 0}, {0, 4}, {0, -4}})
+        if (try_mv(cx + d.first, cy + d.second)) moved = true;
+      if (!moved) break;
+    }
+    for (const int step : {2, 1}) {
+      for (int round = 0; round < 2; ++round) {
+        const int cx = best.vx, cy = best.vy;
+        bool moved = false;
+        for (int dy = -step; dy <= step; dy += step)
+          for (int dx = -step; dx <= step; dx += step)
+            if ((dx || dy) && try_mv(cx + dx, cy + dy)) moved = true;
+        if (!moved) break;
+      }
+    }
+    return best;
+  }
+
+  // ---- residual coding and cost of an inter candidate --------------------------------------------------------------------------------
+
+  // Codes the residual of the macroblock against the prediction of mc's motion (trying the 8x8 transform too where it is allowed), leaves the
+  // reconstruction in the picture, and returns the cost J. mc.cbp_*, the levels and mc.t8 are set.
+  double eval_inter(int mx, int my, MbCode& mc, Recon* rec_out) {
+    uint8_t pl[256], pu[64], pv[64];
+    build_pred(mx, my, mc, pl, pu, pv);
+    mc.t8 = false;
+    code_luma_inter(mx, my, pl, mc);
+    code_chroma(mx, my, pu, pv, false, mc);
+    double best = mb_cost(mx, my, mc);
+    Recon keep;
+    save_rec(mx, my, keep);
+    if (t8_mode && mc.cbp_l != 0) {
+      MbCode m8 = mc;
+      m8.t8 = true;
+      std::memset(m8.lv, 0, sizeof m8.lv);
+      code_luma_inter(mx, my, pl, m8);
+      code_chroma(mx, my, pu, pv, false, m8);
+      if (m8.cbp_l != 0) {
+        const double j8 = mb_cost(mx, my, m8);
+        if (j8 < best) {
+          best = j8;
+          mc = m8;
+          save_rec(mx, my, keep);
+        } else {
+          restore_rec(mx, my, keep);
+        }
+      } else {
+        restore_rec(mx, my, keep);
+      }
+    }
+    if (rec_out) *rec_out = keep;
+    return best;
+  }
+
+  // ---- P macroblock analysis --------------------------------------------------------------------------------------------------------
+
+  double skip_bits() {
+    if (cabac) {
+      H264CostCoder cc(*bc);
+      write_skip_flag_cabac(cc, true);
+      return cc.cost / 256.0;
+    }
+    return 1.0;
+  }
+  int ref_bits(int l, int ri) const {
+    if (num_active[l] <= 1) return 0;
+    return num_active[l] == 2 ? 1 : 2 * floor_log2(static_cast<uint32_t>(ri) + 1) + 1;
+  }
+
+  // The motion of the partitions of `shape` for a P macroblock, searched over the reference pictures of list 0. Returns the sum of the partitions'
+  // search costs (SAD plus lambda times the bits of vector and reference index).
+  int search_shape_p(int mx, int my, int shape, const int (*seed)[2], int nseed, MbCode* out) {
+    MbInfo wk;
+    wk.slice = static_cast<int16_t>(cur_slice);
+    unsigned done = 0;
+    int total = 0;
+    out->type = kMbInter;
+    out->shape = shape;
+    for (int p = 0; p < part_count(shape); ++p) {
+      int x, y, pw, ph, b8;
+      part_geom(shape, p, &x, &y, &pw, &ph, &b8);
+      MeResult best;
+      int best_ri = 0;
+      for (int ri = 0; ri < num_active[0]; ++ri) {
+        int mvpx, mvpy;
+        mv_pred(wk, done, 0, ri, x, y, pw, shape, p, &mvpx, &mvpy);
+        int seeds[8][2];
+        int ns = 0;
+        for (int i = 0; i < nseed && ns < 4; ++i) {
+          seeds[ns][0] = seed[i][0];
+          seeds[ns][1] = seed[i][1];
+          ++ns;
+        }
+        const NbMot na = nb_motion(wk, done, 0, (x - 1) >> 3, y >> 3), nb = nb_motion(wk, done, 0, x >> 3, (y - 1) >> 3);
+        if (na.ref == ri) { seeds[ns][0] = na.x; seeds[ns][1] = na.y; ++ns; }
+        if (nb.ref == ri) { seeds[ns][0] = nb.x; seeds[ns][1] = nb.y; ++ns; }
+        MeResult r = me_search(lists[0][static_cast<size_t>(ri)], mx * 16 + x, my * 16 + y, pw, ph, mvpx, mvpy, seeds, ns);
+        r.cost += static_cast<int>(lam_sad * ref_bits(0, ri) + 0.5);
+        if (r.cost < best.cost) {
+          best = r;
+          best_ri = ri;
+        }
+      }
+      total += best.cost;
+      for (int k = 0; k < 4; ++k) {
+        const int bx = (k & 1) * 8, by = (k >> 1) * 8;
+        if (bx >= x && bx < x + pw && by >= y && by < y + ph) {
+          out->ref[0][k] = static_cast<int8_t>(best_ri);
+          out->mv[0][k][0] = static_cast<int16_t>(best.vx);
+          out->mv[0][k][1] = static_cast<int16_t>(best.vy);
+          wk.ref[0][k] = static_cast<int8_t>(best_ri);
+          wk.mv[0][k][0] = static_cast<int16_t>(best.vx);
+          wk.mv[0][k][1] = static_cast<int16_t>(best.vy);
+        }
+      }
+      done |= part_mask(shape, p);
+    }
+    return total;
+  }
+
+  // The best coding of a macroblock of a P slice; its reconstruction is left in the picture.
+  double analyze_p(int mx, int my, MbCode& best) {
+    MbCode skip_mc;
+    skip_mc.type = kMbSkip;
+    int skx, sky;
+    pskip_mv(&skx, &sky);
+    for (int b8 = 0; b8 < 4; ++b8) {
+      skip_mc.ref[0][b8] = 0;
+      skip_mc.mv[0][b8][0] = static_cast<int16_t>(skx);
+      skip_mc.mv[0][b8][1] = static_cast<int16_t>(sky);
+    }
+    Recon best_rec, rec;
+    double best_cost = 1e30;
+    // P_Skip: the 16x16 prediction at the skip vector, if no residual is left
+    {
+      MbCode sk = skip_mc;
+      sk.type = kMbInter;   // coded as a plain inter macroblock first, to see whether any residual survives
+      sk.shape = 0;
+      const double j = eval_inter(mx, my, sk, &rec);
+      if (sk.cbp_l == 0 && sk.cbp_c == 0) {
+        const double js = mb_sse(mx, my) + lambda * skip_bits();
+        best_cost = js;
+        best = skip_mc;
+        best_rec = rec;
+      } else if (j < best_cost) {
+        best_cost = j;
+        best = sk;
+        best_rec = rec;
+      }
+    }
+    // 16x16 over the reference pictures
+    MbCode m16;
+    int seed16[1][2] = {{0, 0}};
+    const int c16 = search_shape_p(mx, my, 0, seed16, 0, &m16);
+    {
+      const bool same_as_skip = m16.ref[0][0] == 0 && m16.mv[0][0][0] == skx && m16.mv[0][0][1] == sky;
+      if (!(same_as_skip && best.type == kMbSkip)) {
+        MbCode c = m16;
+        const double j = eval_inter(mx, my, c, &rec);
+        if (j < best_cost) {
+          best_cost = j;
+          best = c;
+          best_rec = rec;
+        }
+      }
+    }
+    // the other partitionings, tried when the 16x16 prediction is not good already
+    if (best.type != kMbSkip && c16 > 256) {
+      const int seedv[1][2] = {{m16.mv[0][0][0], m16.mv[0][0][1]}};
+      MbCode cands[3];
+      int costs[3];
+      int nb = 0;
+      int bestc = 0x7fffffff, besti = -1;
+      for (int shape = 1; shape <= 3; ++shape) {
+        costs[nb] = search_shape_p(mx, my, shape, seedv, 1, &cands[nb]) + static_cast<int>(lam_sad * (shape == 3 ? 6 : 3));
+        if (costs[nb] < bestc) {
+          bestc = costs[nb];
+          besti = nb;
+        }
+        ++nb;
+      }
+      if (besti >= 0 && bestc < c16) {
+        MbCode c = cands[besti];
+        const double j = eval_inter(mx, my, c, &rec);
+        if (j < best_cost) {
+          best_cost = j;
+          best = c;
+          best_rec = rec;
+        }
+      }
+    }
+    // intra, when no inter prediction fits
+    if (best.type != kMbSkip && c16 > 3 * 256) {
+      MbCode ib;
+      MbInfo iw;
+      save_rec(mx, my, rec);   // the last inter candidate's reconstruction is in the picture; the intra code overwrites it
+      const double ji = code_intra(mx, my, ib, iw);
+      if (ji + 1e-9 < best_cost) {
+        best_cost = ji;
+        best = ib;
+        save_rec(mx, my, best_rec);
+      }
+    }
+    restore_rec(mx, my, best_rec);
+    return best_cost;
+  }
+
+  // ---- the picture ----------------------------------------------------------------------------------------------------------------
+
+  std::vector<uint8_t> encode_picture(const EncPicture& in, PicType t, int q, int poc, EncStats* stats);
+  std::vector<uint8_t> code_picture(const EncPicture& in, PicType t, int q, int poc);
   std::vector<uint8_t> encode_field_pair(const EncPicture& frame, bool top_first, PicType t, int q, EncStats* stats);
-  bool deblock_with_decoder(const std::vector<uint8_t>& nal, bool idr, int frame_num_now);
+  bool deblock_with_decoder(const std::vector<std::vector<uint8_t>>& nals, bool idr, bool ref_pic, std::shared_ptr<vgpu_h264::Frame>* out);
   bool deblock_field(const std::vector<uint8_t>& nal, bool idr);
+
+  // The first macroblock of every slice of the picture.
+  void layout_slices() {
+    slice_start.clear();
+    const int nmb = mw * mh;
+    int per = nmb;
+    switch (opt.slice_mode) {
+      case 0: per = opt.slice_data > 0 ? opt.slice_data : nmb; break;
+      case 1: per = bytes_slice_mbs > 0 ? bytes_slice_mbs : nmb; break;
+      case 2: per = opt.slice_data > 0 ? opt.slice_data * mw : nmb; break;
+      default: per = opt.slice_data > 1 ? (nmb + opt.slice_data - 1) / opt.slice_data : nmb; break;
+    }
+    per = std::max(per, 1);
+    if (opt.slice_mode == 3 && opt.slice_data > 1) {
+      // slice_data slices of nearly equal size
+      const int n = std::min(opt.slice_data, nmb);
+      for (int i = 0; i < n; ++i) slice_start.push_back(static_cast<int>(static_cast<int64_t>(nmb) * i / n));
+      return;
+    }
+    for (int a = 0; a < nmb; a += per) slice_start.push_back(a);
+  }
+  int bytes_slice_mbs = 0;   // slice mode 1: macroblocks per slice, estimated from the bytes the pictures so far took per macroblock
+  double bytes_per_mb = 0;
+
+  // Reference lists of the picture being coded
+  void build_lists(int poc) {
+    lists[0].clear();
+    lists[1].clear();
+    list_src[0].clear();
+    list_src[1].clear();
+    num_active[0] = num_active[1] = 0;
+    if (slice_kind == kSliceI) return;
+    if (!field_coding) {
+      std::vector<std::shared_ptr<DpbPic>> l0, l1;
+      if (slice_kind == kSliceB) {
+        std::vector<std::shared_ptr<DpbPic>> before, after;
+        for (auto& d : dpb) (d->poc < poc ? before : after).push_back(d);
+        std::sort(before.begin(), before.end(), [](const auto& a, const auto& b) { return a->poc > b->poc; });
+        std::sort(after.begin(), after.end(), [](const auto& a, const auto& b) { return a->poc < b->poc; });
+        l0 = before;
+        l0.insert(l0.end(), after.begin(), after.end());
+        l1 = after;
+        l1.insert(l1.end(), before.begin(), before.end());
+        num_active[0] = 1;
+        num_active[1] = 1;
+      } else {
+        l0 = dpb;   // most recently coded first
+        num_active[0] = std::min<int>(opt.num_ref, static_cast<int>(l0.size()));
+      }
+      for (int l = 0; l < 2; ++l) {
+        const auto& src = l == 0 ? l0 : l1;
+        for (int i = 0; i < num_active[l]; ++i) {
+          RefPic r;
+          build_ref(r, *src[static_cast<size_t>(i)]->frame, 0, 1, 0);
+          r.poc = src[static_cast<size_t>(i)]->poc;
+          r.motion = &src[static_cast<size_t>(i)]->motion;
+          lists[l].push_back(std::move(r));
+          list_src[l].push_back(src[static_cast<size_t>(i)]);
+        }
+      }
+    } else {
+      // 8.2.4.2.5: the fields of the reference frames, the same parity first, the frame being coded counted among them
+      const int cp = fld.bottom ? 1 : 0;
+      auto add = [&](const vgpu_h264::Frame& f, int row0, int offset) {
+        RefPic r;
+        build_ref(r, f, row0, 2, offset);
+        lists[0].push_back(std::move(r));
+      };
+      if (!fld.second) {
+        if (fr_prev) {
+          add(*fr_prev, cp, 0);
+          add(*fr_prev, 1 - cp, 2 * (cp - (1 - cp)));
+        }
+      } else {
+        if (fr_prev && !cur_idr) add(*fr_prev, cp, 0);
+        add(*fr_cur, 1 - cp, 2 * (cp - (1 - cp)));
+      }
+      num_active[0] = static_cast<int>(lists[0].size());
+    }
+  }
+
+
+  // ---- B macroblock analysis --------------------------------------------------------------------------------------------------------
+
+  static int min_positive(int a, int b) { return (a >= 0 && b >= 0) ? std::min(a, b) : std::max(a, b); }
+
+  // Spatial direct prediction (8.4.1.2.2) for the current macroblock: the reference indices and vectors of all four 8x8 blocks.
+  void direct_motion(int mx, int my, MbCode* out) const {
+    MbInfo none;
+    int ref[2];
+    int mvp[2][2] = {{0, 0}, {0, 0}};
+    for (int l = 0; l < 2; ++l) {
+      const NbMot a = nb_motion(none, 0, l, -1, 0), b = nb_motion(none, 0, l, 0, -1);
+      NbMot c = nb_motion(none, 0, l, 2, -1);
+      if (!c.avail) c = nb_motion(none, 0, l, -1, -1);
+      ref[l] = min_positive(a.ref, min_positive(b.ref, c.ref));
+    }
+    bool zero_pred = false;
+    if (ref[0] < 0 && ref[1] < 0) {
+      ref[0] = ref[1] = 0;
+      zero_pred = true;
+    }
+    if (!zero_pred)
+      for (int l = 0; l < 2; ++l)
+        if (ref[l] >= 0) mv_pred(none, 0, l, ref[l], 0, 0, 16, 0, 0, &mvp[l][0], &mvp[l][1]);
+    const std::vector<MbInfo>* col = lists[1].empty() ? nullptr : lists[1][0].motion;
+    for (int b8 = 0; b8 < 4; ++b8) {
+      bool col_zero = false;
+      if (col && !zero_pred && (ref[0] == 0 || ref[1] == 0)) {
+        const MbInfo& cm = (*col)[static_cast<size_t>(my) * mw + mx];
+        if (!cm.intra()) {
+          int rc, mcx, mcy;
+          if (cm.ref[0][b8] >= 0) {
+            rc = cm.ref[0][b8];
+            mcx = cm.mv[0][b8][0];
+            mcy = cm.mv[0][b8][1];
+          } else {
+            rc = cm.ref[1][b8];
+            mcx = cm.mv[1][b8][0];
+            mcy = cm.mv[1][b8][1];
+          }
+          col_zero = rc == 0 && mcx >= -1 && mcx <= 1 && mcy >= -1 && mcy <= 1;
+        }
+      }
+      for (int l = 0; l < 2; ++l) {
+        out->ref[l][b8] = static_cast<int8_t>(ref[l]);
+        const bool zero = zero_pred || ref[l] < 0 || (ref[l] == 0 && col_zero);
+        out->mv[l][b8][0] = static_cast<int16_t>(zero ? 0 : mvp[l][0]);
+        out->mv[l][b8][1] = static_cast<int16_t>(zero ? 0 : mvp[l][1]);
+      }
+    }
+  }
+
+  // SAD of a bw x bh block of the source against the average of two predictions
+  int sad_bi(int px, int py, int bw_, int bh_, const uint8_t* p0, const uint8_t* p1) const {
+    const uint8_t* s = &sy[static_cast<size_t>(py) * ys + px];
+    int sad = 0;
+    for (int y = 0; y < bh_; ++y)
+      for (int x = 0; x < bw_; ++x) sad += std::abs(s[y * ys + x] - ((p0[y * bw_ + x] + p1[y * bw_ + x] + 1) >> 1));
+    return sad;
+  }
+
+  // The motion of the partitions of `shape` for a B macroblock: for each partition list 0, list 1 or both, searched; 8x8 blocks may instead be direct.
+  // Returns the sum of the search costs.
+  int search_shape_b(int mx, int my, int shape, const MbCode& direct, bool allow_direct, const int (*seed)[2], int nseed, MbCode* out) {
+    MbInfo wk;
+    wk.slice = static_cast<int16_t>(cur_slice);
+    unsigned done = 0;
+    int total = 0;
+    out->type = kMbInter;
+    out->shape = shape;
+    out->sub_direct = 0;
+    for (int p = 0; p < part_count(shape); ++p) {
+      int x, y, pw, ph, b8;
+      part_geom(shape, p, &x, &y, &pw, &ph, &b8);
+      const int px = mx * 16 + x, py = my * 16 + y;
+      MeResult r[2];
+      for (int l = 0; l < 2; ++l) {
+        int mvpx, mvpy;
+        mv_pred(wk, done, l, 0, x, y, pw, shape, p, &mvpx, &mvpy);
+        int seeds[8][2];
+        int ns = 0;
+        for (int i = 0; i < nseed && ns < 4; ++i) {
+          seeds[ns][0] = seed[i][0];
+          seeds[ns][1] = seed[i][1];
+          ++ns;
+        }
+        const NbMot na = nb_motion(wk, done, l, (x - 1) >> 3, y >> 3), nb = nb_motion(wk, done, l, x >> 3, (y - 1) >> 3);
+        if (na.ref == 0) { seeds[ns][0] = na.x; seeds[ns][1] = na.y; ++ns; }
+        if (nb.ref == 0) { seeds[ns][0] = nb.x; seeds[ns][1] = nb.y; ++ns; }
+        r[l] = me_search(lists[l][0], px, py, pw, ph, mvpx, mvpy, seeds, ns);
+      }
+      // both lists: the average of the two predictions at the two best vectors
+      uint8_t p0[256], p1[256];
+      pred_luma(lists[0][0], px, py, pw, ph, r[0].vx, r[0].vy, p0, pw);
+      pred_luma(lists[1][0], px, py, pw, ph, r[1].vx, r[1].vy, p1, pw);
+      int mvp0x, mvp0y, mvp1x, mvp1y;
+      mv_pred(wk, done, 0, 0, x, y, pw, shape, p, &mvp0x, &mvp0y);
+      mv_pred(wk, done, 1, 0, x, y, pw, shape, p, &mvp1x, &mvp1y);
+      const int cost_bi = sad_bi(px, py, pw, ph, p0, p1) + static_cast<int>(lam_sad * (mv_bits(r[0].vx - mvp0x, r[0].vy - mvp0y) + mv_bits(r[1].vx - mvp1x, r[1].vy - mvp1y)) + 0.5);
+      int use = 0;   // 1 list 0, 2 list 1, 3 both
+      int cost = r[0].cost;
+      use = 1;
+      if (r[1].cost < cost) {
+        cost = r[1].cost;
+        use = 2;
+      }
+      if (cost_bi < cost) {
+        cost = cost_bi;
+        use = 3;
+      }
+      bool use_direct = false;
+      if (allow_direct && shape == 3) {
+        // direct: the prediction at the derived motion
+        MbCode d = direct;
+        uint8_t dl[256], du[64], dv[64];
+        build_pred(mx, my, d, dl, du, dv);
+        const uint8_t* s = &sy[static_cast<size_t>(py) * ys + px];
+        int sad = 0;
+        for (int yy = 0; yy < 8; ++yy)
+          for (int xx = 0; xx < 8; ++xx) sad += std::abs(s[yy * ys + xx] - dl[(y + yy) * 16 + x + xx]);
+        if (sad + static_cast<int>(lam_sad * 2) <= cost) {
+          cost = sad;
+          use_direct = true;
+        }
+      }
+      total += cost;
+      for (int k = 0; k < 4; ++k) {
+        const int bx = (k & 1) * 8, by = (k >> 1) * 8;
+        if (!(bx >= x && bx < x + pw && by >= y && by < y + ph)) continue;
+        if (use_direct) {
+          out->sub_direct = static_cast<uint8_t>(out->sub_direct | (1 << k));
+          for (int l = 0; l < 2; ++l) {
+            out->ref[l][k] = direct.ref[l][k];
+            out->mv[l][k][0] = direct.mv[l][k][0];
+            out->mv[l][k][1] = direct.mv[l][k][1];
+          }
+        } else {
+          for (int l = 0; l < 2; ++l) {
+            const bool u = (use >> l) & 1;
+            out->ref[l][k] = u ? 0 : -1;
+            out->mv[l][k][0] = u ? static_cast<int16_t>(r[l].vx) : 0;
+            out->mv[l][k][1] = u ? static_cast<int16_t>(r[l].vy) : 0;
+          }
+        }
+        for (int l = 0; l < 2; ++l) {
+          wk.ref[l][k] = out->ref[l][k];
+          wk.mv[l][k][0] = out->mv[l][k][0];
+          wk.mv[l][k][1] = out->mv[l][k][1];
+        }
+      }
+      done |= part_mask(shape, p);
+    }
+    return total;
+  }
+
+  // The best coding of a macroblock of a B slice; its reconstruction is left in the picture.
+  double analyze_b(int mx, int my, MbCode& best) {
+    Recon best_rec, rec;
+    double best_cost = 1e30;
+    MbCode direct;
+    direct.type = kMbDirect;
+    direct_motion(mx, my, &direct);
+    // B_Skip / B_Direct_16x16
+    {
+      MbCode d = direct;
+      const double j = eval_inter(mx, my, d, &rec);
+      if (d.cbp_l == 0 && d.cbp_c == 0) {
+        MbCode sk = direct;
+        sk.type = kMbSkip;
+        best_cost = mb_sse(mx, my) + lambda * skip_bits();
+        best = sk;
+        best_rec = rec;
+      } else {
+        best_cost = j;
+        best = d;
+        best_rec = rec;
+      }
+    }
+    // 16x16 with list 0, list 1 or both
+    MbCode m16;
+    int seed16[1][2] = {{0, 0}};
+    const int c16 = search_shape_b(mx, my, 0, direct, false, seed16, 0, &m16);
+    {
+      MbCode c = m16;
+      const double j = eval_inter(mx, my, c, &rec);
+      if (j < best_cost) {
+        best_cost = j;
+        best = c;
+        best_rec = rec;
+      }
+    }
+    // the other partitionings
+    if (best.type != kMbSkip && c16 > 256) {
+      const int seedv[1][2] = {{m16.mv[0][0][0], m16.mv[0][0][1]}};
+      MbCode cands[3];
+      int costs[3];
+      int bestc = 0x7fffffff, besti = -1;
+      for (int shape = 1; shape <= 3; ++shape) {
+        costs[shape - 1] = search_shape_b(mx, my, shape, direct, true, seedv, 1, &cands[shape - 1]) + static_cast<int>(lam_sad * (shape == 3 ? 8 : 4));
+        if (costs[shape - 1] < bestc) {
+          bestc = costs[shape - 1];
+          besti = shape - 1;
+        }
+      }
+      if (besti >= 0 && bestc < c16) {
+        MbCode c = cands[besti];
+        const double j = eval_inter(mx, my, c, &rec);
+        if (j < best_cost) {
+          best_cost = j;
+          best = c;
+          best_rec = rec;
+        }
+      }
+    }
+    if (best.type != kMbSkip && c16 > 3 * 256) {
+      MbCode ib;
+      MbInfo iw;
+      const double ji = code_intra(mx, my, ib, iw);
+      if (ji + 1e-9 < best_cost) {
+        best_cost = ji;
+        best = ib;
+        save_rec(mx, my, best_rec);
+      }
+    }
+    restore_rec(mx, my, best_rec);
+    return best_cost;
+  }
+
+  // the state a rollback() returns to
+  struct Saved {
+    std::vector<std::shared_ptr<DpbPic>> dpb;
+    bool have_ref = false, valid = false;
+    int frame_num = 0, ref_frame_num = 0, uid = 0, poc_counter = 0, cur_poc = 0, bytes_slice_mbs = 0;
+    double bytes_per_mb = 0;
+  } saved;
+  void save_state() {
+    saved.dpb = dpb;
+    saved.have_ref = have_ref;
+    saved.frame_num = frame_num;
+    saved.ref_frame_num = ref_frame_num;
+    saved.uid = uid;
+    saved.poc_counter = poc_counter;
+    saved.cur_poc = cur_poc;
+    saved.bytes_slice_mbs = bytes_slice_mbs;
+    saved.bytes_per_mb = bytes_per_mb;
+    saved.valid = true;
+  }
+  void restore_state() {
+    if (!saved.valid) return;
+    dpb = saved.dpb;
+    have_ref = saved.have_ref;
+    frame_num = saved.frame_num;
+    ref_frame_num = saved.ref_frame_num;
+    uid = saved.uid;
+    poc_counter = saved.poc_counter;
+    cur_poc = saved.cur_poc;
+    bytes_slice_mbs = saved.bytes_slice_mbs;
+    bytes_per_mb = saved.bytes_per_mb;
+    saved.valid = false;
+  }
+  bool want_stats = false;
+  std::shared_ptr<vgpu_h264::Frame> last_decoded;
 };
 
-bool H264Encoder::Impl::deblock_with_decoder(const std::vector<uint8_t>& nal, bool idr, int fn) {
+// 0.85 * 2^((qp - 12) / 3), without libm so that every machine makes the same decisions
+static double h264_lambda(int qp) {
+  static const double frac[3] = {1.0, 1.2599210498948732, 1.5874010519681994};
+  const int x = qp - 12;
+  const int q = x >= 0 ? x / 3 : -((-x + 2) / 3);
+  const int r = x - 3 * q;
+  return 0.85 * frac[r] * std::ldexp(1.0, q);
+}
+
+bool H264Encoder::Impl::deblock_with_decoder(const std::vector<std::vector<uint8_t>>& nals, bool idr, bool ref_pic, std::shared_ptr<vgpu_h264::Frame>* out) {
   vgpu_h264::PicParams pp;
   pp.log2_max_frame_num = 4;
-  pp.poc_type = 2;
+  pp.poc_type = b_mode ? 0 : 2;
+  pp.log2_max_poc_lsb = 8;
   pp.frame_mbs_only = 1;
   pp.direct_8x8_inference = 1;
-  pp.num_ref_frames = 1;
+  pp.num_ref_frames = stream.num_ref_frames;
   pp.chroma_format_idc = 1;
   pp.bit_depth_luma = pp.bit_depth_chroma = 8;
-  pp.cabac = 0;
+  pp.cabac = cabac ? 1 : 0;
+  pp.transform_8x8_mode = t8_mode ? 1 : 0;
   pp.num_ref_idx_default[0] = pp.num_ref_idx_default[1] = 1;
   pp.pic_init_qp = 26;
   pp.deblocking_control_present = 1;
   pp.mbs_w = mw;
   pp.mbs_h = mh;
-  pp.frame_num = fn;
-  pp.poc[0] = pp.poc[1] = 2 * pic_count;
-  pp.ref_pic = 1;
+  pp.frame_num = frame_num;
+  pp.poc[0] = pp.poc[1] = cur_poc;
+  pp.ref_pic = ref_pic ? 1 : 0;
   pp.idr = idr;
-  auto cur = std::make_unique<vgpu_h264::Frame>();
+  auto cur = std::make_shared<vgpu_h264::Frame>();
   cur->uid = ++uid;
   cur->alloc(mw, mh);
-  if (!idr && ref) {
-    vgpu_h264::DpbEntry e;
-    e.frame = ref.get();
-    e.frame_num = ref_frame_num;
-    e.used = 3;
-    e.poc[0] = e.poc[1] = 2 * (pic_count - 1);
-    pp.dpb.push_back(e);
+  if (!idr) {
+    for (const auto& d : dpb) {
+      vgpu_h264::DpbEntry e;
+      e.frame = d->frame.get();
+      e.frame_num = d->frame_num;
+      e.used = 3;
+      e.poc[0] = e.poc[1] = d->poc;
+      pp.dpb.push_back(e);
+    }
   }
-  std::vector<vgpu_h264::SliceData> slices{{nal.data() + 4, nal.size() - 4}};
+  std::vector<vgpu_h264::SliceData> slices;
+  for (const auto& n : nals) slices.push_back({n.data(), n.size()});
   std::string err;
   const bool ok = vgpu_h264::decode_picture(cur.get(), pp, slices, &err);
   if (!ok) {
@@ -1317,20 +2264,23 @@ bool H264Encoder::Impl::deblock_with_decoder(const std::vector<uint8_t>& nal, bo
       std::memcpy(&cur->v[static_cast<size_t>(y) * cur->stride_c], &rv[static_cast<size_t>(y) * cs], static_cast<size_t>(cs));
     }
   }
-  cur->poc[0] = cur->poc[1] = pp.poc[0];
-  ref = std::move(cur);
+  cur->poc[0] = cur->poc[1] = cur_poc;
+  *out = std::move(cur);
   return ok;
 }
 
-std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, PicType t, int q, EncStats* stats) {
-  if ((t == PicType::kInter || t == PicType::kIntra) && !have_ref) t = PicType::kIdr;
-  std::vector<uint8_t> out = code_picture(in, t, q);
+std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, PicType t, int q, int poc, EncStats* stats) {
+  if (t != PicType::kIdr && !have_ref) t = PicType::kIdr;
+  if (t == PicType::kBi && dpb.size() < 2) t = PicType::kInter;
+  want_stats = stats != nullptr;
+  std::vector<uint8_t> out = code_picture(in, t, q, poc);
   st.bytes = out.size();
   if (stats) {
+    const vgpu_h264::Frame& f = *last_decoded;
     double sse = 0;
     for (int y = 0; y < h; ++y)
       for (int x = 0; x < w; ++x) {
-        const int d = in.y[static_cast<size_t>(y) * w + x] - ref->y[static_cast<size_t>(y) * ref->stride_y + x];
+        const int d = in.y[static_cast<size_t>(y) * w + x] - f.y[static_cast<size_t>(y) * f.stride_y + x];
         sse += static_cast<double>(d) * d;
       }
     st.psnr_y = sse == 0 ? 99.0 : 10.0 * std::log10(255.0 * 255.0 * static_cast<double>(w) * h / sse);
@@ -1340,23 +2290,25 @@ std::vector<uint8_t> H264Encoder::Impl::encode_picture(const EncPicture& in, Pic
 }
 
 // Codes one picture: a frame, or (in field coding) the field described by `fld`.
-std::vector<uint8_t> H264Encoder::Impl::code_picture(const EncPicture& in, PicType t, int q) {
+std::vector<uint8_t> H264Encoder::Impl::code_picture(const EncPicture& in, PicType t, int q, int poc) {
   type = t;
   qp = clip3(0, 51, q);
   qpc = qpc_of(qp);
-  lambda = 0.85 * std::pow(2.0, (qp - 12) / 3.0);
+  lambda = h264_lambda(qp);
   lam_sad = std::sqrt(lambda);
   const bool idr = t == PicType::kIdr && !(field_coding && fld.second);
-  const bool inter_pic = t == PicType::kInter;
+  slice_kind = (t == PicType::kIdr || t == PicType::kIntra) ? kSliceI : (t == PicType::kBi ? kSliceB : kSliceP);
+  const bool reference = t != PicType::kBi;
   int poc_lsb = 0;
   if (!field_coding) {
     if (idr) {
-      pic_count = 0;
       frame_num = 0;
+      poc = 0;
     } else {
       frame_num = (ref_frame_num + 1) & 15;
-      ++pic_count;
     }
+    cur_poc = 2 * poc;
+    poc_lsb = cur_poc & 255;
   } else {
     if (!fld.second) {
       if (idr) {
@@ -1369,226 +2321,169 @@ std::vector<uint8_t> H264Encoder::Impl::code_picture(const EncPicture& in, PicTy
     poc_lsb = (4 * field_count + (fld.second ? 1 : 0)) & 0xFFFF;
   }
   load_source(in);
-  nz_y.assign(static_cast<size_t>(mw) * 4 * mh * 4, 0);
-  i4m.assign(nz_y.size(), 2);
-  nz_u.assign(static_cast<size_t>(mw) * 2 * mh * 2, 0);
-  nz_v = nz_u;
-  mb_inter.assign(static_cast<size_t>(mw) * mh, 0);
-  mvx.assign(mb_inter.size(), 0);
-  mvy = mvx;
-  mbref.assign(mb_inter.size(), 0);
-  refs.clear();
-  if (inter_pic) {
-    if (!field_coding) {
-      add_ref(*ref, 0, 1, 0);
-    } else {
-      // 8.2.4.2.5: the fields of the reference frames, the same parity first, the frame being coded counted among them
-      const int cp = fld.bottom ? 1 : 0;
-      if (!fld.second) {
-        if (fr_prev) {
-          add_ref(*fr_prev, cp, 2, 0);
-          add_ref(*fr_prev, 1 - cp, 2, 2 * (cp - (1 - cp)));
-        }
-      } else {
-        if (fr_prev && !cur_idr) add_ref(*fr_prev, cp, 2, 0);
-        add_ref(*fr_cur, 1 - cp, 2, 2 * (cp - (1 - cp)));
-      }
-    }
-  }
-
-  BitWriter bw;
-  // slice_header
-  bw.ue(0);                                  // first_mb_in_slice
-  bw.ue(inter_pic ? 5 : 7);                  // slice_type: P / I, every slice of the picture
-  bw.ue(0);                                  // pic_parameter_set_id
-  bw.put(static_cast<uint32_t>(frame_num), 4);
-  if (field_coding) {
-    bw.bit(1);                               // field_pic_flag
-    bw.bit(fld.bottom ? 1 : 0);              // bottom_field_flag
-  }
-  if (idr) bw.ue(0);                         // idr_pic_id
-  if (field_coding) bw.put(static_cast<uint32_t>(poc_lsb), 16);   // pic_order_cnt_lsb
-  if (inter_pic) {
-    if (refs.size() == 1) {
-      bw.bit(0);                             // num_ref_idx_active_override_flag
-    } else {
-      bw.bit(1);
-      bw.ue(static_cast<uint32_t>(refs.size() - 1));   // num_ref_idx_l0_active_minus1
-    }
-    bw.bit(0);                               // ref_pic_list_modification_flag_l0
-  }
-  if (idr) {
-    bw.bit(0);                               // no_output_of_prior_pics_flag
-    bw.bit(0);                               // long_term_reference_flag
-  } else {
-    bw.bit(0);                               // adaptive_ref_pic_marking_mode_flag
-  }
-  bw.se(qp - 26);                            // slice_qp_delta
-  if (deblock) {
-    bw.ue(0);                                // disable_deblocking_filter_idc
-    bw.se(0);                                // slice_alpha_c0_offset_div2
-    bw.se(0);                                // slice_beta_offset_div2
-  } else {
-    bw.ue(1);
-  }
-
-  st = EncStats();
-  st.qp = qp;
-  skip_run = 0;
-  uint8_t sav_y[256], sav_u[64], sav_v[64], sav2_y[256], sav2_u[64], sav2_v[64];
-  for (int my = 0; my < mh; ++my)
-    for (int mx = 0; mx < mw; ++mx) {
-      MbCode best;
-      bool skipped = false;
-      const size_t mbi = static_cast<size_t>(my) * mw + mx;
-      if (inter_pic) {
-        int px, py;
-        bool skip_zero;
-        mv_pred(mx, my, 0, &px, &py, &skip_zero);
-        const int skx = skip_zero ? 0 : px, sky = skip_zero ? 0 : py;
-        // the reference picture and vector with the least cost
-        int vx = 0, vy = 0, vcost = 0x7fffffff, vsad = 0, vref = 0;
-        for (int ri = 0; ri < static_cast<int>(refs.size()); ++ri) {
-          int qx, qy, qcost, qsad, rx, ry2;
-          bool unused;
-          mv_pred(mx, my, ri, &rx, &ry2, &unused);
-          search(ri, mx, my, rx, ry2, &qx, &qy, &qcost, &qsad);
-          qcost += static_cast<int>(lam_sad * (ri == 0 ? 1 : 3) + 0.5) * (refs.size() > 1 ? 1 : 0);
-          if (qcost < vcost) {
-            vcost = qcost;
-            vx = qx;
-            vy = qy;
-            vsad = qsad;
-            vref = ri;
-          }
-        }
-        // P_Skip candidate (reference 0)
-        uint8_t pl_skip[256], pu_skip[64], pv_skip[64];
-        pred_luma(0, mx, my, skx, sky, pl_skip);
-        pred_chroma(0, mx, my, skx, sky, pu_skip, pv_skip);
-        MbCode sk;
-        sk.type = kMbInter;
-        sk.mvx = skx;
-        sk.mvy = sky;
-        sk.ref = 0;
-        code_luma_inter(mx, my, pl_skip, sk);
-        code_chroma(mx, my, pu_skip, pv_skip, false, sk);
-        const bool skip_ok = sk.cbp_l == 0 && sk.cbp_c == 0;
-        double j_skip = 1e30;
-        if (skip_ok) {
-          double sse = sse16(src_y(mx, my), ys, rec_y(mx, my), ys, 16);
-          for (int c = 0; c < 2; ++c) sse += sse16(src_c(c, mx, my), cs, rec_c(c, mx, my), cs, 8);
-          j_skip = sse + lambda;
-        }
-        // coded inter candidate at the searched vector
-        double j_inter = 1e30;
-        MbCode ic;
-        ic.type = kMbInter;
-        ic.mvx = vx;
-        ic.mvy = vy;
-        ic.ref = vref;
-        const bool same_as_skip = vx == skx && vy == sky && vref == 0;
-        if (!(same_as_skip && skip_ok)) {
-          uint8_t pl[256], pu[64], pv[64];
-          pred_luma(vref, mx, my, vx, vy, pl);
-          pred_chroma(vref, mx, my, vx, vy, pu, pv);
-          code_luma_inter(mx, my, pl, ic);
-          code_chroma(mx, my, pu, pv, false, ic);
-          j_inter = mb_cost(mx, my, ic, true);
-          save_rec(mx, my, sav2_y, sav2_u, sav2_v);
-        }
-        double j_best;
-        enum { kChoseSkip, kChoseInter, kChoseIntra } choice;
-        if (j_skip <= j_inter) {
-          choice = kChoseSkip;
-          j_best = j_skip;
-          best = sk;
-          // reconstruction is the skip candidate's: recompute it (the inter candidate overwrote it)
-          code_luma_inter(mx, my, pl_skip, sk);
-          code_chroma(mx, my, pu_skip, pv_skip, false, sk);
-        } else {
-          choice = kChoseInter;
-          j_best = j_inter;
-          best = ic;
-          restore_rec(mx, my, sav2_y, sav2_u, sav2_v);
-        }
-        if (vsad > 3 * 256 && choice != kChoseSkip) {
-          MbCode ib;
-          for (int by = 0; by < 4; ++by)
-            for (int bx = 0; bx < 4; ++bx) I4M(mx * 4 + bx, my * 4 + by) = 2;
-          save_rec(mx, my, sav2_y, sav2_u, sav2_v);   // the inter reconstruction
-          const double j_intra = code_intra(mx, my, ib, sav_y, sav_u, sav_v);
-          if (j_intra + 1e-9 < j_best) {
-            choice = kChoseIntra;
-            best = ib;
-          } else {
-            restore_rec(mx, my, sav2_y, sav2_u, sav2_v);
-          }
-        }
-        skipped = choice == kChoseSkip;
-      } else {
-        for (int by = 0; by < 4; ++by)
-          for (int bx = 0; bx < 4; ++bx) I4M(mx * 4 + bx, my * 4 + by) = 2;
-        code_intra(mx, my, best, sav_y, sav_u, sav_v);
-      }
-      // state for the neighbours
-      const bool is_inter = best.type == kMbInter || skipped;
-      mb_inter[mbi] = is_inter ? 1 : 0;
-      mbref[mbi] = static_cast<int8_t>(is_inter ? best.ref : 0);
-      mvx[mbi] = is_inter ? best.mvx : 0;
-      mvy[mbi] = is_inter ? best.mvy : 0;
-      if (best.type != kMbI4x4)
-        for (int by = 0; by < 4; ++by)
-          for (int bx = 0; bx < 4; ++bx) I4M(mx * 4 + bx, my * 4 + by) = 2;
-      if (skipped) {
-        ++skip_run;
-        ++st.skipped_mbs;
-        for (int by = 0; by < 4; ++by)
-          for (int bx = 0; bx < 4; ++bx) NZY(mx * 4 + bx, my * 4 + by) = 0;
-        for (int c = 0; c < 2; ++c)
-          for (int by = 0; by < 2; ++by)
-            for (int bx = 0; bx < 2; ++bx) NZC(c, mx * 2 + bx, my * 2 + by) = 0;
-        continue;
-      }
-      if (inter_pic) {
-        bw.ue(static_cast<uint32_t>(skip_run));
-        skip_run = 0;
-      }
-      write_mb(bw, best, mx, my);
-      if (is_inter) ++st.inter_mbs;
-      else ++st.intra_mbs;
-    }
-  if (inter_pic && skip_run) bw.ue(static_cast<uint32_t>(skip_run));
-  bw.trailing();
+  const int nmb = mw * mh;
+  mbs.assign(static_cast<size_t>(nmb), MbInfo());
+  build_lists(cur_poc);
+  layout_slices();
 
   std::vector<uint8_t> out;
-  append_nal(out, idr || t == PicType::kIntra ? 3 : 2, idr ? 5 : 1, bw.bytes());
-  if (field_coding) deblock_field(out, idr);
-  else deblock_with_decoder(out, idr, frame_num);
-  if (!field_coding) ref_frame_num = frame_num;
-  have_ref = true;
-  if (idr || t == PicType::kIntra) {
-    // Intra pictures carry a digest of the picture they were made from (a user_data_unregistered SEI message that every
-    // decoder ignores). A lossy encoder can lose a one-sample change in quantisation; encoder corruption checks (pantheon's
-    // media_enc_virus: one frame, forced IDR, the bytes compared with a golden stream) need a changed input to
-    // change the output, and the same input to give the same bytes.
-    uint64_t hash = 1469598103934665603ull;
-    auto mix = [&](uint8_t b) { hash = (hash ^ b) * 1099511628211ull; };
-    for (int i = 0; i < 4; ++i) mix(static_cast<uint8_t>((w >> (8 * i)) ^ (h >> (8 * i)) ^ (qp << i)));
-    for (uint8_t b : in.y) mix(b);
-    for (uint8_t b : in.u) mix(b);
-    for (uint8_t b : in.v) mix(b);
+  std::vector<std::vector<uint8_t>> nals;   // every slice's NAL unit after its start code, for the decoder
+  st = EncStats();
+  st.qp = qp;
+  st.slices = static_cast<int>(slice_start.size());
+  const int ref_idc = idr || t == PicType::kIntra ? 3 : (reference ? 2 : 0);
+  const int cabac_set = slice_kind == kSliceI ? 0 : 1;   // cabac_init_idc 0 for P and B slices
+  const bool intra_pic = idr || t == PicType::kIntra;
+
+  if (intra_pic) {
+    // Intra pictures carry a digest of the picture they were made from (a user_data_unregistered SEI message that every decoder ignores). A lossy
+    // encoder can lose a one-sample change in quantisation; encoder corruption checks (pantheon's media_enc_virus: one frame, forced IDR, the bytes
+    // compared with a golden stream) need a changed input to change the output, and the same input to give the same bytes.
     std::vector<uint8_t> sei = {5, 24};   // payloadType 5, payloadSize 24
-    static const uint8_t kUuid[16] = {0x76, 0x67, 0x70, 0x75, 0x2d, 0x6e, 0x76, 0x65, 0x6e, 0x63, 0x2d, 0x64, 0x69, 0x67, 0x65, 0x73};   // "vgpu-nvenc-diges"
-    sei.insert(sei.end(), kUuid, kUuid + 16);
-    for (int i = 0; i < 8; ++i) sei.push_back(static_cast<uint8_t>(hash >> (8 * i)));
+    const std::vector<uint8_t> payload = picture_digest_payload(in, w, h, qp);
+    sei.insert(sei.end(), payload.begin(), payload.end());
     sei.push_back(0x80);   // rbsp_trailing_bits
-    std::vector<uint8_t> with_sei;
-    append_nal(with_sei, 0, 6, sei);
-    with_sei.insert(with_sei.end(), out.begin(), out.end());
-    out = std::move(with_sei);
+    append_nal(out, 0, 6, sei);
   }
 
+  uint8_t sav_dummy = 0;
+  (void)sav_dummy;
+  size_t slice_bytes_total = 0;
+  for (size_t si = 0; si < slice_start.size(); ++si) {
+    const int first = slice_start[si], last = si + 1 < slice_start.size() ? slice_start[si + 1] : nmb;
+    cur_slice = static_cast<int>(si);
+    BitWriter wr;
+    // slice_header
+    wr.ue(static_cast<uint32_t>(field_coding ? 0 : first));   // first_mb_in_slice
+    wr.ue(slice_kind == kSliceP ? 5 : (slice_kind == kSliceB ? 6 : 7));   // slice_type: every slice of the picture is of this type
+    wr.ue(0);                                  // pic_parameter_set_id
+    wr.put(static_cast<uint32_t>(frame_num), 4);
+    if (field_coding) {
+      wr.bit(1);                               // field_pic_flag
+      wr.bit(fld.bottom ? 1 : 0);              // bottom_field_flag
+    }
+    if (idr) wr.ue(0);                         // idr_pic_id
+    if (field_coding) wr.put(static_cast<uint32_t>(poc_lsb), 16);   // pic_order_cnt_lsb
+    else if (b_mode) wr.put(static_cast<uint32_t>(poc_lsb), 8);
+    if (slice_kind == kSliceB) wr.bit(1);      // direct_spatial_mv_pred_flag
+    if (slice_kind != kSliceI) {
+      const bool override_ = num_active[0] != 1 || (slice_kind == kSliceB && num_active[1] != 1);
+      wr.bit(override_ ? 1 : 0);               // num_ref_idx_active_override_flag
+      if (override_) {
+        wr.ue(static_cast<uint32_t>(num_active[0] - 1));
+        if (slice_kind == kSliceB) wr.ue(static_cast<uint32_t>(num_active[1] - 1));
+      }
+      wr.bit(0);                               // ref_pic_list_modification_flag_l0
+      if (slice_kind == kSliceB) wr.bit(0);    // ref_pic_list_modification_flag_l1
+    }
+    if (ref_idc != 0) {
+      if (idr) {
+        wr.bit(0);                             // no_output_of_prior_pics_flag
+        wr.bit(0);                             // long_term_reference_flag
+      } else {
+        wr.bit(0);                             // adaptive_ref_pic_marking_mode_flag
+      }
+    }
+    if (cabac && slice_kind != kSliceI) wr.ue(0);   // cabac_init_idc
+    wr.se(qp - 26);                            // slice_qp_delta
+    if (deblock) {
+      wr.ue(0);                                // disable_deblocking_filter_idc
+      wr.se(0);                                // slice_alpha_c0_offset_div2
+      wr.se(0);                                // slice_beta_offset_div2
+    } else {
+      wr.ue(1);
+    }
+
+    std::vector<uint8_t> rbsp;
+    std::unique_ptr<H264BitCoder> coder;
+    if (cabac) {
+      while (!wr.aligned()) wr.bit(1);         // cabac_alignment_one_bit
+      rbsp = wr.bytes();
+      coder = std::make_unique<H264BitCoder>(rbsp);
+      for (int i = 0; i < kCabacCtx; ++i) coder->ctx[i] = cabac_init_ctx(kCabacInit[i][cabac_set][0], kCabacInit[i][cabac_set][1], qp);
+      bc = coder.get();
+      bw = nullptr;
+    } else {
+      bw = &wr;
+      bc = nullptr;
+    }
+    skip_run = 0;
+    last_dqp_nonzero = false;
+    for (int addr = first; addr < last; ++addr) {
+      const int mx = addr % mw, my = addr / mw;
+      setup_neighbours(mx, my);
+      MbCode mc;
+      if (slice_kind == kSliceI) {
+        MbInfo iw;
+        code_intra(mx, my, mc, iw);
+      } else if (slice_kind == kSliceP) {
+        analyze_p(mx, my, mc);
+      } else {
+        analyze_b(mx, my, mc);
+      }
+      const bool skipped = mc.type == kMbSkip;
+      MbInfo wk;
+      wk.slice = static_cast<int16_t>(cur_slice);
+      wk.qp = static_cast<int8_t>(qp);
+      if (cabac) {
+        if (slice_kind != kSliceI) write_skip_flag_cabac(*bc, skipped);
+        if (skipped) init_wk(mc, wk);
+        else write_mb_cabac(*bc, mc, wk);
+        bc->terminate(addr == last - 1 ? 1 : 0);   // end_of_slice_flag
+      } else if (skipped) {
+        ++skip_run;
+        init_wk(mc, wk);
+      } else {
+        if (slice_kind != kSliceI) {
+          wr.ue(static_cast<uint32_t>(skip_run));
+          skip_run = 0;
+        }
+        write_mb_cavlc(wr, mc, wk);
+      }
+      mbs[static_cast<size_t>(addr)] = wk;
+      if (skipped) ++st.skipped_mbs;
+      else if (wk.intra()) ++st.intra_mbs;
+      else ++st.inter_mbs;
+    }
+    if (cabac) {
+      coder->finish();
+    } else {
+      if (skip_run) wr.ue(static_cast<uint32_t>(skip_run));
+      wr.trailing();
+      rbsp = wr.bytes();
+    }
+    bc = nullptr;
+    bw = nullptr;
+    const size_t before = out.size();
+    append_nal(out, ref_idc, idr ? 5 : 1, rbsp);
+    // the NAL unit as the decoder takes it: after the four-byte start code
+    nals.emplace_back(out.begin() + static_cast<std::ptrdiff_t>(before) + 4, out.end());
+    slice_bytes_total += rbsp.size();
+  }
+  if (opt.slice_mode == 1) {
+    bytes_per_mb = bytes_per_mb == 0 ? static_cast<double>(slice_bytes_total) / nmb : 0.5 * bytes_per_mb + 0.5 * static_cast<double>(slice_bytes_total) / nmb;
+    bytes_slice_mbs = std::max(1, static_cast<int>(opt.slice_data / std::max(bytes_per_mb * 1.1, 0.5)));
+  }
+
+  std::shared_ptr<vgpu_h264::Frame> decoded;
+  if (field_coding) {
+    deblock_field(nals[0], idr);
+  } else if (reference || want_stats) {
+    deblock_with_decoder(nals, idr, reference, &decoded);
+    last_decoded = decoded;
+    if (reference) {
+      if (idr) dpb.clear();
+      auto d = std::make_shared<DpbPic>();
+      d->frame = decoded;
+      d->frame_num = frame_num;
+      d->poc = cur_poc;
+      d->motion = mbs;
+      dpb.insert(dpb.begin(), d);
+      while (static_cast<int>(dpb.size()) > stream.num_ref_frames) dpb.pop_back();
+      ref_frame_num = frame_num;
+    }
+  }
+  have_ref = true;
   return out;
 }
 
@@ -1643,7 +2538,7 @@ bool H264Encoder::Impl::deblock_field(const std::vector<uint8_t>& nal, bool idr)
     e.poc[1 - cur_first_parity] = first_poc;
     pp.dpb.push_back(e);
   }
-  std::vector<vgpu_h264::SliceData> slices{{nal.data() + 4, nal.size() - 4}};
+  std::vector<vgpu_h264::SliceData> slices{{nal.data(), nal.size()}};
   std::string err;
   const bool ok = vgpu_h264::decode_picture(fr_cur.get(), pp, slices, &err);
   if (!ok) {
@@ -1686,11 +2581,11 @@ std::vector<uint8_t> H264Encoder::Impl::encode_field_pair(const EncPicture& fram
   const int p0 = top_first ? 0 : 1;
   fld.bottom = p0 == 1;
   fld.second = false;
-  std::vector<uint8_t> out = code_picture(f[p0], t, q);
+  std::vector<uint8_t> out = code_picture(f[p0], t, q, 0);
   const size_t first_bytes = out.size();
   fld.bottom = p0 != 1;
   fld.second = true;
-  const std::vector<uint8_t> second = code_picture(f[1 - p0], PicType::kInter, q);
+  const std::vector<uint8_t> second = code_picture(f[1 - p0], PicType::kInter, q, 0);
   out.insert(out.end(), second.begin(), second.end());
   ref_frame_num = frame_num;
   ++field_count;
@@ -1711,14 +2606,28 @@ std::vector<uint8_t> H264Encoder::Impl::encode_field_pair(const EncPicture& fram
   return out;
 }
 
-H264Encoder::H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock, bool field_pictures)
-    : p_(new Impl(width, height, fps_num, fps_den, profile_idc, deblock, field_pictures)) {}
+
+H264Encoder::H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, const H264Options& opt)
+    : p_(new Impl(width, height, fps_num, fps_den, profile_idc, opt, false)) {}
+H264Encoder::H264Encoder(int width, int height, int fps_num, int fps_den, int profile_idc, bool deblock, bool field_pictures) {
+  H264Options o;
+  o.deblock = deblock;
+  p_.reset(new Impl(width, height, fps_num, fps_den, profile_idc, o, field_pictures));
+}
 H264Encoder::~H264Encoder() = default;
 
 std::vector<uint8_t> H264Encoder::parameter_sets() const { return p_->stream.parameter_sets(); }
 
+bool H264Encoder::supports_b() const { return p_->b_mode; }
+
 std::vector<uint8_t> H264Encoder::encode(const EncPicture& in, PicType type, int qp, EncStats* stats) {
-  return p_->encode_picture(in, type, qp, stats);
+  p_->save_state();
+  if (type == PicType::kIdr) p_->poc_counter = 0;
+  return p_->encode_picture(in, type, qp, p_->poc_counter++, stats);
+}
+std::vector<uint8_t> H264Encoder::encode_at(const EncPicture& in, PicType type, int qp, int poc, EncStats* stats) {
+  p_->save_state();
+  return p_->encode_picture(in, type, qp, poc, stats);
 }
 
 std::vector<uint8_t> H264Encoder::encode_field_pair(const EncPicture& frame, bool top_field_first, PicType type, int qp, EncStats* stats) {
@@ -1727,10 +2636,14 @@ std::vector<uint8_t> H264Encoder::encode_field_pair(const EncPicture& frame, boo
 
 void H264Encoder::reset() {
   p_->have_ref = false;
-  p_->ref.reset();
+  p_->dpb.clear();
   p_->fr_prev.reset();
   p_->fr_cur.reset();
+  p_->poc_counter = 0;
 }
+
+void H264Encoder::rollback() { p_->restore_state(); }
+int H264Encoder::last_slices() const { return static_cast<int>(std::max<size_t>(p_->slice_start.size(), 1)); }
 
 int H264Encoder::coded_width() const { return p_->ys; }
 int H264Encoder::coded_height() const { return p_->mh * 16; }
