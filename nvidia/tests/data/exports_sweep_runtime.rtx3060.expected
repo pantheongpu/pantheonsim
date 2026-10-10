@@ -41,6 +41,80 @@ cudaOccupancyAvailableDynamicSMemPerBlock blocks 2 size 1024: cudaErrorInvalidVa
 cudaOccupancyAvailableDynamicSMemPerBlock blocks 3 size 1024: cudaErrorInvalidValue -- 77
 cudaOccupancyAvailableDynamicSMemPerBlock null: cudaErrorInvalidValue
 cudaOccupancyAvailableDynamicSMemPerBlock null function: cudaErrorInvalidDeviceFunction
+cudaFuncGetAttributes, no static shared memory: cudaSuccess -- static 0, const 432, maxThreads 1024, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, 256 bytes static: cudaSuccess -- static 256, const 432, maxThreads 1024, ptx 86, binary 86, cacheCA 0, maxDynamic 48896, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, 40000 bytes static: cudaSuccess -- static 40000, const 432, maxThreads 1024, ptx 86, binary 86, cacheCA 0, maxDynamic 9152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, 48 KiB static: cudaSuccess -- static 49152, const 432, maxThreads 1024, ptx 86, binary 86, cacheCA 0, maxDynamic 0, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, __launch_bounds__(128): cudaSuccess -- static 0, const 432, maxThreads 128, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, __launch_bounds__(512, 2): cudaSuccess -- static 0, const 432, maxThreads 512, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, __launch_bounds__(96): cudaSuccess -- static 0, const 432, maxThreads 96, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, registers limit the block: cudaSuccess -- static 0, const 432, maxThreads 256, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes, module constants: cudaSuccess -- static 0, const 432, maxThreads 1024, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncGetAttributes null attributes: cudaErrorInvalidValue
+cudaFuncGetAttributes null function: cudaErrorInvalidDeviceFunction
+cudaFuncGetAttributes stack address: cudaErrorInvalidResourceHandle
+cudaFuncGetAttributes null both: cudaErrorInvalidValue
+cudaFuncSetAttribute MaxDynamicSharedMemorySize -1, no static: cudaErrorInvalidValue -- now 49152
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 0, no static: cudaSuccess -- now 0
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 1, no static: cudaSuccess -- now 1
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 1024, no static: cudaSuccess -- now 1024
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 49152, no static: cudaSuccess -- now 49152
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 49153, no static: cudaSuccess -- now 49153
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 65536, no static: cudaSuccess -- now 65536
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 101376, no static: cudaSuccess -- now 101376
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 101377, no static: cudaErrorInvalidValue -- now 49152
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 102400, no static: cudaErrorInvalidValue -- now 49152
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 101120, 256 static: cudaSuccess -- now 101120
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 101121, 256 static: cudaErrorInvalidValue -- now 48896
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 48896, 256 static: cudaSuccess -- now 48896
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 61376, 40000 static: cudaSuccess -- now 61376
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 61377, 40000 static: cudaErrorInvalidValue -- now 9152
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 52224, 48 KiB static: cudaSuccess -- now 52224
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 52225, 48 KiB static: cudaErrorInvalidValue -- now 0
+cudaFuncSetAttribute MaxDynamicSharedMemorySize 100000, 48 KiB static: cudaErrorInvalidValue -- now 0
+cudaFuncSetAttribute MaxDynamicSharedMemorySize twice: cudaSuccess -- now 70000; now 3000
+cudaFuncSetAttribute attribute 99: cudaErrorInvalidValue
+cudaFuncSetAttribute attribute -1: cudaErrorInvalidValue
+cudaFuncSetAttribute attribute 16: cudaErrorInvalidValue
+cudaFuncSetAttribute attribute 0: cudaErrorInvalidValue
+cudaFuncSetAttribute attribute 1: cudaErrorInvalidValue
+cudaFuncSetAttribute attribute 7: cudaErrorInvalidValue
+cudaFuncSetAttribute ClusterDimMustBeSet: cudaErrorInvalidValue
+cudaFuncSetAttribute null function: cudaErrorInvalidDeviceFunction
+cudaFuncSetAttribute stack address: cudaErrorInvalidResourceHandle
+cudaFuncSetAttribute stack address, carveout: cudaErrorInvalidResourceHandle
+cudaFuncSetAttribute stack address, attribute 99: cudaErrorInvalidValue
+cudaFuncSetAttribute stack address, size -1: cudaErrorInvalidResourceHandle
+cudaFuncSetAttribute PreferredSharedMemoryCarveout -2: cudaErrorInvalidValue -- now -1
+cudaFuncSetAttribute PreferredSharedMemoryCarveout -1: cudaSuccess -- now -1
+cudaFuncSetAttribute PreferredSharedMemoryCarveout 0: cudaSuccess -- now 0
+cudaFuncSetAttribute PreferredSharedMemoryCarveout 1: cudaSuccess -- now 1
+cudaFuncSetAttribute PreferredSharedMemoryCarveout 50: cudaSuccess -- now 50
+cudaFuncSetAttribute PreferredSharedMemoryCarveout 100: cudaSuccess -- now 100
+cudaFuncSetAttribute PreferredSharedMemoryCarveout 101: cudaErrorInvalidValue -- now -1
+cudaFuncSetAttribute required cluster dimensions: cudaSuccess -- static 0, const 432, maxThreads 128, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 3 2 5, policy 0, nonPortable 0
+cudaFuncSetAttribute required cluster width -1: cudaErrorInvalidValue
+cudaFuncSetAttribute required cluster height -1: cudaErrorInvalidValue
+cudaFuncSetAttribute required cluster depth 0: cudaSuccess -- static 0, const 432, maxThreads 128, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncSetAttribute ClusterSchedulingPolicyPreference 2: cudaSuccess -- static 0, const 432, maxThreads 128, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 2, nonPortable 0
+cudaFuncSetAttribute ClusterSchedulingPolicyPreference 3: cudaErrorInvalidValue
+cudaFuncSetAttribute ClusterSchedulingPolicyPreference -1: cudaErrorInvalidValue
+cudaFuncSetAttribute NonPortableClusterSizeAllowed 7: cudaSuccess -- static 0, const 432, maxThreads 128, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 7
+cudaFuncSetAttribute NonPortableClusterSizeAllowed -1: cudaSuccess -- static 0, const 432, maxThreads 128, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable -1
+cudaFuncSetAttribute everything on one kernel, then the other: cudaSuccess -- other kernel 49152; static 0, const 432, maxThreads 1024, ptx 86, binary 86, cacheCA 0, maxDynamic 70000, carveout 40, clusterMustBeSet 0, cluster 0 0 0, policy 0, nonPortable 0
+cudaFuncSetAttribute on device 0, read on device 1: cudaSuccess -- device 0 70000, device 1 49152, after setting 3000 on 1: 3000, device 0 again 70000
+launch dynamic shared memory, not opted in: cudaSuccess -- 49152 refused 0, 49153 refused 1, 65536 refused 1
+launch dynamic shared memory, 40000 bytes static: cudaSuccess -- 9152 refused 0, 9153 refused 1
+launch dynamic shared memory, 48 KiB static: cudaSuccess -- 0 refused 0, 1 refused 1
+launch dynamic shared memory, opted in to 60000: cudaSuccess -- 49153 refused 0, 60000 refused 0, 60001 refused 1
+launch dynamic shared memory, opted in to 100: cudaSuccess -- 100 refused 0, 101 refused 1, 49152 refused 1
+launch dynamic shared memory, opted in to the most: cudaSuccess -- 101376 refused 0, 101377 refused 1
+launch with more threads than __launch_bounds__: cudaSuccess -- 128 refused 0, 129 refused 1, 64x2 refused 0, 64x3 refused 1
+cudaOccupancyMaxActiveBlocksPerMultiprocessor, dynamic shared memory past the limit: cudaSuccess -- blocks at 0, 49152, 49153, 65536, 101376: 12 2 0 0 0
+cudaOccupancyMaxActiveBlocksPerMultiprocessor, opted in to 60000: cudaSuccess -- blocks at 0, 49152, 49153, 65536, 101376: 12 2 2 0 0
+cudaOccupancyAvailableDynamicSMemPerBlock, opted in to 60000: cudaSuccess -- 1, 2, 4 blocks: 60000 50176 24576
+cudaOccupancyAvailableDynamicSMemPerBlock, not opted in: cudaSuccess -- 1, 2, 4 blocks: 49152 49152 24576
+cudaOccupancyAvailableDynamicSMemPerBlock, opted in to the most: cudaSuccess -- 1, 2, 4 blocks: 101376 50176 24576
 cudaDeviceGetNvSciSyncAttributes: cudaErrorInvalidValue
 cudaDeviceGetNvSciSyncAttributes null: cudaErrorInvalidResourceHandle
 cudaDeviceGetNvSciSyncAttributes device 9: cudaErrorInvalidDevice
@@ -155,4 +229,4 @@ cudaMemPrefetchBatchAsync flags 1 [13]: cudaErrorInvalidValue
 cudaMemDiscardBatchAsync [13]: cudaErrorInvalidValue
 cudaMemDiscardBatchAsync null [13]: cudaErrorInvalidValue
 cudaMemDiscardAndPrefetchBatchAsync [13]: cudaErrorInvalidValue
-PASS: 157 cases
+PASS: 231 cases

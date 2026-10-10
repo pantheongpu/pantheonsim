@@ -21,6 +21,7 @@ case "$which" in
   *) echo "usage: $0 runtime|driver [--card [--update]]" >&2; exit 2 ;;
 esac
 module="$root/nvidia/tests/e2e/exports_sweep_module.cu"
+attrs_module="$root/nvidia/tests/e2e/func_attributes_module.cu"   # the driver sweep's attribute cases (libf.cubin)
 expected="$root/nvidia/tests/data/exports_sweep_${which}.rtx3060.expected"
 card=0; update=0
 for a in "$@"; do
@@ -37,6 +38,7 @@ trap 'rm -rf "$work"' EXIT
 build() {   # <nvcc> <extra flags...>
   local nvcc_bin="$1"; shift
   "$nvcc_bin" -cubin -arch=sm_86 -Wno-deprecated-gpu-targets "$module" -o "$work/libk.cubin" || return 1
+  "$nvcc_bin" -cubin -arch=sm_86 -Wno-deprecated-gpu-targets "$attrs_module" -o "$work/libf.cubin" || return 1
   if [[ $which == runtime ]]; then
     # The runtime shim hands the library calls to the driver shim, found in the process: link libcuda whether or not
     # the program names one of its functions.

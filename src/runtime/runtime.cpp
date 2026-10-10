@@ -470,6 +470,27 @@ int Device::module_arch(uint64_t module_id) const {
   return 0;
 }
 
+uint64_t Device::module_const_bytes(uint64_t module_id, const std::string& kernel) const {
+  for (const auto& lm : modules_) {
+    if (lm.id != module_id) continue;
+    uint64_t total = 0;
+    if (lm.sass) {
+      const sass::CubinSection* user = lm.sass->cubin.section(".nv.constant3");
+      const sass::CubinSection* mine = lm.sass->cubin.section(".nv.constant2." + kernel);
+      if (user) total += user->size;
+      if (mine) total += mine->size;
+      return total;
+    }
+    for (const auto& g : lm.mod->globals) {
+      if (!g.is_const) continue;
+      const uint64_t align = std::max<uint64_t>(1, g.align);
+      total = (total + align - 1) / align * align + g.size;
+    }
+    return total;
+  }
+  return 0;
+}
+
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
   for (auto& lm : modules_) {
     if (lm.id != module_id) continue;

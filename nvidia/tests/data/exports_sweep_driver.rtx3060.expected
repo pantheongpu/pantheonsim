@@ -246,4 +246,157 @@ cuTexRefGetMaxAnisotropy default: CUDA_SUCCESS -- 0
 cuTexRefSetBorderColor: CUDA_SUCCESS -- get CUDA_SUCCESS 1.00 0.50 0.25 0.00
 cuTexRefGetBorderColor default: CUDA_SUCCESS -- 0.00 0.00 0.00 0.00
 cuTexRefSetMaxAnisotropy null ref: CUDA_ERROR_INVALID_HANDLE
-PASS: 248 cases
+cuFuncGetAttribute, no static shared memory: CUDA_SUCCESS -- maxThreads 1024, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, 256 bytes static: CUDA_SUCCESS -- maxThreads 1024, static 256, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 48896, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, 40000 bytes static: CUDA_SUCCESS -- maxThreads 1024, static 40000, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 9152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, 48 KiB static: CUDA_SUCCESS -- maxThreads 1024, static 49152, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 0, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, __launch_bounds__(128): CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, __launch_bounds__(512, 2): CUDA_SUCCESS -- maxThreads 512, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, registers limit the block: CUDA_SUCCESS -- maxThreads 256, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute, module constants: CUDA_SUCCESS -- maxThreads 1024, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncGetAttribute attribute 16: CUDA_ERROR_INVALID_VALUE -- v=-5
+cuFuncGetAttribute attribute -1: CUDA_ERROR_INVALID_VALUE -- v=-5
+cuFuncGetAttribute attribute 99: CUDA_ERROR_INVALID_VALUE -- v=-5
+cuFuncGetAttribute null function: CUDA_ERROR_INVALID_VALUE
+cuFuncGetAttribute null result: CUDA_ERROR_INVALID_VALUE
+cuFuncSetAttribute null function: CUDA_ERROR_INVALID_HANDLE
+cuFuncSetAttribute attribute 0 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 1 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 2 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 3 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 4 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 5 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 6 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 7 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 8 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 1, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 9 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout 1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 10 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 11 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 1 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 12 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 1 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 13 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 1, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 14 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 1, policy 0
+cuFuncSetAttribute attribute 15 to 1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 1
+cuFuncSetAttribute attribute 16 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute attribute 17 to 1: CUDA_ERROR_INVALID_VALUE -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 0
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES -1, no static: CUDA_ERROR_INVALID_VALUE -- now 49152
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 0, no static: CUDA_SUCCESS -- now 0
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 1, no static: CUDA_SUCCESS -- now 1
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 1024, no static: CUDA_SUCCESS -- now 1024
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 49152, no static: CUDA_SUCCESS -- now 49152
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 49153, no static: CUDA_SUCCESS -- now 49153
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 65536, no static: CUDA_SUCCESS -- now 65536
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101376, no static: CUDA_SUCCESS -- now 101376
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101377, no static: CUDA_ERROR_INVALID_VALUE -- now 49152
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 102400, no static: CUDA_ERROR_INVALID_VALUE -- now 49152
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101120, 256 static: CUDA_SUCCESS -- now 101120
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101121, 256 static: CUDA_ERROR_INVALID_VALUE -- now 48896
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 61376, 40000 static: CUDA_SUCCESS -- now 61376
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 61377, 40000 static: CUDA_ERROR_INVALID_VALUE -- now 9152
+cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 52225, 48 KiB static: CUDA_ERROR_INVALID_VALUE -- now 0
+cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT -2: CUDA_ERROR_INVALID_VALUE -- now -1
+cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT -1: CUDA_SUCCESS -- now -1
+cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT 0: CUDA_SUCCESS -- now 0
+cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT 1: CUDA_SUCCESS -- now 1
+cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT 100: CUDA_SUCCESS -- now 100
+cuFuncSetAttribute PREFERRED_SHARED_MEMORY_CARVEOUT 101: CUDA_ERROR_INVALID_VALUE -- now -1
+cuFuncSetAttribute required cluster dimensions: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 3 2 5, nonPortable 0, policy 0
+cuFuncSetAttribute required cluster width -1: CUDA_ERROR_INVALID_VALUE
+cuFuncSetAttribute CLUSTER_SCHEDULING_POLICY_PREFERENCE 2: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 0, policy 2
+cuFuncSetAttribute CLUSTER_SCHEDULING_POLICY_PREFERENCE 3: CUDA_ERROR_INVALID_VALUE
+cuFuncSetAttribute NON_PORTABLE_CLUSTER_SIZE_ALLOWED 7: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 1, policy 0
+cuFuncSetAttribute NON_PORTABLE_CLUSTER_SIZE_ALLOWED -1: CUDA_SUCCESS -- maxThreads 128, static 0, const 432, ptx 86, binary 86, cacheCA 0, maxDynamic 49152, carveout -1, clusterMustBeSet 0, cluster 0 0 0, nonPortable 1, policy 0
+cuFuncSetAttribute on one function, the other function of the module: CUDA_SUCCESS -- other 49152, same function again 49152
+cuFuncSetAttribute in the context of device 0, the module of device 1: CUDA_SUCCESS -- device 0 70000, device 1 49152
+cuFuncSetAttribute, MAX_DYNAMIC_SHARED_SIZE_BYTES a CUkernel as the function: CUDA_ERROR_INVALID_HANDLE -- kernel now 49152
+cuFuncGetAttribute, a CUkernel as the function: CUDA_ERROR_INVALID_HANDLE -- v=-5
+cuKernelGetAttribute, 256 bytes static: CUDA_SUCCESS -- maxThreads 1024, static 256, const 432, ptx 86, binary 86, maxDynamic 48896, carveout -1
+cuKernelGetAttribute attribute 16: CUDA_ERROR_INVALID_VALUE
+cuKernelGetAttribute null result: CUDA_ERROR_INVALID_VALUE
+cuKernelGetAttribute null kernel: CUDA_ERROR_INVALID_HANDLE
+cuKernelGetAttribute device 5: CUDA_ERROR_INVALID_DEVICE
+cuKernelSetAttribute device 5: CUDA_ERROR_INVALID_DEVICE
+cuKernelSetAttribute null kernel: CUDA_ERROR_INVALID_HANDLE
+cuKernelSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 70000, then the function: CUDA_SUCCESS -- kernel 70000, function 70000
+cuKernelSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES 101121, 256 static: CUDA_ERROR_INVALID_VALUE -- now 48896
+cuKernelSetAttribute attribute 1: CUDA_ERROR_INVALID_VALUE
+cuKernelSetAttribute carveout 30, then the function: CUDA_SUCCESS -- function 30
+cuKernelSetAttribute on device 0, read on device 1: CUDA_SUCCESS -- device 0 65000, device 1 48896
+cuLaunchKernel dynamic shared memory, not opted in: CUDA_SUCCESS -- 49152 -> 0, 49153 -> 1, 65536 -> 1
+cuLaunchKernel dynamic shared memory, 40000 bytes static: CUDA_SUCCESS -- 9152 -> 0, 9153 -> 1
+cuLaunchKernel dynamic shared memory, 48 KiB static: CUDA_SUCCESS -- 0 -> 0, 1 -> 1
+cuLaunchKernel dynamic shared memory, opted in to 60000: CUDA_SUCCESS -- 49153 -> 0, 60000 -> 0, 60001 -> 1
+cuLaunchKernel dynamic shared memory, opted in to 100: CUDA_SUCCESS -- 100 -> 0, 101 -> 1, 49152 -> 1
+cuLaunchKernel dynamic shared memory, a CUkernel opted in to 60000: CUDA_SUCCESS -- 60000 -> 0, 60001 -> 1
+cuLaunchKernel with more threads than __launch_bounds__: CUDA_SUCCESS -- 128 -> 0, 129 -> 1, 64x2 -> 0, 64x3 -> 1
+cuOccupancyMaxActiveBlocksPerMultiprocessor, dynamic shared memory past the limit: CUDA_SUCCESS -- blocks at 0, 49152, 49153, 65536, 101376: 12 2 0 0 0
+cuOccupancyMaxActiveBlocksPerMultiprocessor, opted in to 60000: CUDA_SUCCESS -- blocks at 0, 49152, 49153, 65536, 101376: 12 2 2 0 0
+cuFuncGetParamCount: CUDA_SUCCESS -- n=3
+cuFuncGetParamCount, none: CUDA_SUCCESS -- n=0
+cuFuncGetParamCount, one: CUDA_SUCCESS -- n=1
+cuFuncGetParamCount null result: CUDA_ERROR_INVALID_VALUE
+cuFuncGetParamCount null function: CUDA_ERROR_INVALID_VALUE -- n=99
+cuFuncGetParamCount a CUkernel: CUDA_ERROR_INVALID_HANDLE -- n=99
+cuKernelGetParamCount: CUDA_SUCCESS -- n=3
+cuKernelGetParamCount, none: CUDA_SUCCESS -- n=0
+cuKernelGetParamCount null result: CUDA_ERROR_INVALID_VALUE
+cuKernelGetParamCount null kernel: CUDA_ERROR_INVALID_VALUE
+cuKernelGetParamCount a CUfunction: CUDA_ERROR_INVALID_HANDLE -- n=99
+cuLaunchHostFunc_v2 blocking: CUDA_SUCCESS -- ran 1
+cuLaunchHostFunc_v2 spin wait: CUDA_SUCCESS -- ran 1
+cuLaunchHostFunc_v2 mode 2: CUDA_ERROR_INVALID_VALUE -- ran 0
+cuLaunchHostFunc_v2 mode 77: CUDA_ERROR_INVALID_VALUE -- ran 0
+cuLaunchHostFunc_v2 null function: CUDA_SUCCESS
+cuLaunchHostFunc_v2 legacy stream: CUDA_SUCCESS -- ran 1
+cuMemcpyWithAttributesAsync: CUDA_SUCCESS -- copied right 1
+cuMemcpyWithAttributesAsync, pageable source: CUDA_SUCCESS -- copied right 1
+cuMemcpyWithAttributesAsync null attributes: CUDA_ERROR_INVALID_VALUE
+cuMemcpyWithAttributesAsync size 0: CUDA_ERROR_INVALID_VALUE
+cuMemcpyWithAttributesAsync invalid access order: CUDA_ERROR_INVALID_VALUE
+cuMemcpyWithAttributesAsync access order 9: CUDA_ERROR_INVALID_VALUE
+cuMemcpyWithAttributesAsync flags 0x80: CUDA_ERROR_INVALID_VALUE
+cuMemcpyWithAttributesAsync legacy stream: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DWithAttributesAsync: CUDA_SUCCESS -- copied right 1
+cuMemcpy3DWithAttributesAsync null: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DWithAttributesAsync flags 1: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DWithAttributesAsync zero extent: CUDA_ERROR_INVALID_VALUE
+cuMemcpy3DWithAttributesAsync legacy stream: CUDA_ERROR_INVALID_VALUE
+cuGraphGetId: CUDA_SUCCESS -- second graph's id is the first's plus 1, same again 1
+cuGraphGetId null result: CUDA_ERROR_INVALID_VALUE
+cuGraphGetId null graph: CUDA_ERROR_INVALID_VALUE
+cuGraphExecGetId: CUDA_SUCCESS -- two execs differ 1, exec id is graph id 0, exec ids run on by 2
+cuGraphExecGetId null result: CUDA_ERROR_INVALID_VALUE
+cuGraphExecGetId null exec: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetLocalId: CUDA_SUCCESS -- ids 0 1 2
+cuGraphNodeGetLocalId, nodes of two graphs: CUDA_SUCCESS -- ids 0 1 0
+cuGraphNodeGetLocalId null result: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetLocalId null node: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetToolsId: CUDA_SUCCESS -- differ 1, graph id in the high half 1, node index in the low half 0 1
+cuGraphNodeGetToolsId null result: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetToolsId null node: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetContainingGraph: CUDA_SUCCESS -- is the graph 1
+cuGraphNodeGetContainingGraph, node of a child graph: CUDA_SUCCESS -- child's node in the child 1, in the parent 0; the child graph node in the parent 1
+cuGraphNodeGetContainingGraph null result: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetContainingGraph null node: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetParams, a memset node: CUDA_SUCCESS -- type 2, dst right 1, value 7, width 256, element 1
+cuGraphNodeGetParams, a kernel node: CUDA_SUCCESS -- type 0, grid 2, block 32, shared 0, function stored 1
+cuGraphNodeGetParams, an empty node: CUDA_SUCCESS -- type 5
+cuGraphNodeGetParams, a child graph node: CUDA_SUCCESS -- type 4, graph is a clone 1
+cuGraphNodeGetParams, a host node: CUDA_SUCCESS -- type 3, user data right 1
+cuGraphNodeGetParams null node: CUDA_ERROR_INVALID_VALUE
+cuGraphNodeGetParams null result: CUDA_ERROR_INVALID_VALUE
+cuCoredumpRegisterStartCallback: CUDA_SUCCESS -- handle set 1
+cuCoredumpRegisterCompleteCallback: CUDA_SUCCESS -- handle set 1
+cuCoredumpRegisterStartCallback null callback: CUDA_ERROR_INVALID_VALUE -- handle set 0
+cuCoredumpRegisterStartCallback null handle: CUDA_SUCCESS
+cuCoredumpRegisterCompleteCallback null callback: CUDA_ERROR_INVALID_VALUE
+cuCoredumpRegisterCompleteCallback null handle: CUDA_SUCCESS
+cuCoredumpDeregisterStartCallback: CUDA_SUCCESS
+cuCoredumpDeregisterCompleteCallback: CUDA_SUCCESS
+cuCoredumpDeregisterStartCallback null: CUDA_ERROR_INVALID_VALUE
+cuCoredumpDeregisterCompleteCallback null: CUDA_ERROR_INVALID_VALUE
+cuMulticastBindMem_v2: CUDA_ERROR_NOT_SUPPORTED
+cuMulticastBindAddr_v2: CUDA_ERROR_NOT_SUPPORTED
+cuStreamBeginCaptureToCig null parameters: CUDA_ERROR_INVALID_VALUE
+cuStreamBeginCaptureToCig: CUDA_ERROR_INVALID_CONTEXT
+cuStreamEndCaptureToCig: CUDA_ERROR_INVALID_VALUE
+PASS: 401 cases

@@ -47,6 +47,11 @@ EXEMPT = {
     "cudaStreamAttachMemAsync": "managed memory has one copy; attaching moves nothing to replay",
     # There is no device to stage a graph onto; uploading does nothing either way.
     "cudaGraphUpload": "nothing to upload, captured or not",
+    # A batch of one: memcpy_batch hands the copy to cudaMemcpyAsync / cudaMemcpy3DAsync, which record it on a capturing stream.
+    "cudaMemcpyWithAttributesAsync": "a batch of one; the copy goes to cudaMemcpyAsync, which records it under capture",
+    "cudaMemcpy3DWithAttributesAsync": "a batch of one; the copy goes to cudaMemcpy3DAsync, which records it under capture",
+    # Refused whatever the stream (green contexts are not simulated), so nothing is enqueued.
+    "cudaStreamGetDevResource": "a query, refused: green contexts are not simulated",
 }
 
 
@@ -81,7 +86,9 @@ def exported_stream_functions(text):
 
 
 def main():
-    text = SOURCE.read_text()
+    # And the functions only the CUDA 13.2 header declares (runtime_132.inc).
+    extra = SOURCE.with_name("runtime_132.inc")
+    text = SOURCE.read_text() + ("\n" + extra.read_text() if extra.exists() else "")
     bodies = dict(exported_stream_functions(text))
     missing = []
     for name, body in sorted(bodies.items()):
