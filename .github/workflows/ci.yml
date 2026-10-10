@@ -503,10 +503,20 @@ jobs:
         #                        nvidia-nvshmem-cu13 pip package turns it on.
         #   amd_opencl           ROCm's OpenCL runtime (rocm-opencl) is not in the
         #                        image; the rocm-libraries workflow runs it.
-        # The last four are the image's to fix; drop them here when it is.
+        #   e2e_fft_lto_callbacks
+        #                        the CUDA toolkit's libnvJitLink (which turns LTO-IR into
+        #                        machine code) is nowhere on the image: not beside nvcc, not
+        #                        in a pip wheel. Installing libnvjitlink-13-0 (or
+        #                        nvidia-nvjitlink-cu13) turns it on.
+        #   e2e_lowprec_ptx120   no sm_120 card transcript on this branch (it has one on
+        #                        r4): "no expected files for ptx120".
+        #   e2e_packed_int_forms the image's nvcc ptxas does not assemble PTX ISA 9.2's
+        #                        packed integer forms for sm_120f.
+        # The last four above, and these three, are the image's or the branch's to fix; drop
+        # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|amd_opencl)$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
