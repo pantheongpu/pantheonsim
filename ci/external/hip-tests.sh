@@ -28,7 +28,7 @@ commit=afe4069e2c338ea336dda26f7786440af6c1898a   # tag rocm-7.1.0
 arch_of() {
   case "$1" in
     amd/mi300x|amd/mi325x) echo gfx942 ;; amd/mi250x) echo gfx90a ;; amd/mi350x) echo gfx950 ;;
-    amd/rx6900xt) echo gfx1030 ;; amd/rx7900xtx) echo gfx1100 ;; amd/rx9070xt) echo gfx1201 ;;
+    amd/rx6900xt|amd/rx6800) echo gfx1030 ;; amd/rx6700xt) echo gfx1031 ;; amd/rx7900xtx) echo gfx1100 ;; amd/rx9070xt) echo gfx1201 ;;
     *) echo "unknown GPU $1" >&2; return 1 ;;
   esac
 }

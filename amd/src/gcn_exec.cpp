@@ -1191,12 +1191,23 @@ struct Machine {
         } else if (id == 20 && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950)) {
           reg = place_of(d, w.group).die & 0xF;   // XCC_ID: the compute die (3:0)
         } else if (id == 23 && is_rdna(in.arch)) {
-          // HW_ID1: the wave's slot (4:0), its workgroup processor (13:10),
-          // shader array (16) and engine (20:18). A work-group's waves are
-          // all on one workgroup processor, as in HIP's default WGP mode.
+          // HW_ID1: the wave's slot (4:0), the SIMD it runs on (9:8), its
+          // workgroup processor (13:10), shader array (16) and engine
+          // (20:18). A work-group's waves are all on one workgroup
+          // processor. On gfx10.3 the waves go to the SIMDs four at a time in
+          // the order 0, 2, 1, 3 and take the next slot after each four, as
+          // an RX 6800 and an RX 6700 XT place them (measured with
+          // s_getreg of HW_ID1 in every wave of 256-thread groups, in wave32
+          // and wave64, on gfx1030 and gfx1031). The loader maps gfx1032
+          // to gfx1036 to this target too, and nothing has measured those. The
+          // other generations put every wave on SIMD 0 and number the slots
+          // by wave.
           const Place p = place_of(d, w.group);
-          reg = (static_cast<uint32_t>(w.first_lane / w.lanes) & 0x1F) | (p.unit & 0xF) << 10 | (p.array & 1) << 16 |
-                (p.engine & 7) << 18;
+          const uint32_t wave = static_cast<uint32_t>(w.first_lane / w.lanes);
+          static constexpr uint32_t kSimd1030[4] = {0, 2, 1, 3};
+          const bool rdna2 = in.arch == gcn::Target::Gfx1030;
+          reg = ((rdna2 ? wave / 4 : wave) & 0x1F) | (rdna2 ? kSimd1030[wave % 4] : 0) << 8 | (p.unit & 0xF) << 10 |
+                (p.array & 1) << 16 | (p.engine & 7) << 18;
         }
         // SHADER_CYCLES, which clock() reads on RDNA: 20 bits of the cycle
         // count on gfx10.3 and gfx11; on gfx12 its low word (29) and high
@@ -7533,6 +7544,14 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     // Past any the descriptor reserves for preloaded arguments: a kernel
     // that preloads them loads them itself where the hardware has not (its
     // first 256 bytes do it, and the hardware skips them).
+    // The preloaded arguments, where the descriptor asks for them: the last user SGPRs hold the kernarg dwords the
+    // hardware copies there (the kernel may also have loaded them itself, as gfx942's compatibility prologue does,
+    // which gives the same values).
+    if (k.kernarg_preload_length && k.user_sgpr_count >= k.kernarg_preload_length) {
+      const uint32_t first = k.user_sgpr_count - k.kernarg_preload_length, avail = k.kernarg_size / 4;
+      for (uint32_t i = 0; i < k.kernarg_preload_length; ++i)
+        m.set_sgpr(w, first + i, k.kernarg_preload_offset + i < avail ? static_cast<uint32_t>(m.load(d.kernarg + 4ull * (k.kernarg_preload_offset + i), 4)) : 0u);
+    }
     at = std::max(at, k.user_sgpr_count);
     // RDNA4 gives the work-group's id in the trap handler's registers, and
     // the wave's number within the group in TTMP8's bits 25 to 29, where

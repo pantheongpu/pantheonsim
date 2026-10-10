@@ -185,7 +185,7 @@ else
     "$(isolated amd/mi300x -c 'cat /sys/module/amdgpu/initstate')"
   expect "the session's other kernel modules are still there" "yes" \
     "$(isolated amd/mi300x -c '[ $(ls /sys/module | wc -l) -gt 1 ] && echo yes')"
-  for g in amd/mi300x amd/rx7900xtx amd/rx6900xt; do
+  for g in amd/mi300x amd/rx7900xtx amd/rx6900xt amd/rx6800 amd/rx6700xt; do
     out=$(isolated "$g" -c "python3 '$rsmi' --showproductname --showmeminfo vram --showclocks; echo ====; rocm-smi --showproductname --showmeminfo vram --showclocks")
     theirs=$(sed '/^====$/,$d' <<<"$out" | readings)
     mine=$(sed '1,/^====$/d' <<<"$out" | readings)

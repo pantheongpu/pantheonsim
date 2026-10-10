@@ -76,8 +76,9 @@ as on the hardware.
 | `VGPU_SASS=1` | the SASS even where the executor lacks something (to find what) |
 | `VGPU_SASS_LOG=1` | say which code each module runs, and why a fallback happened |
 | `VGPU_SASS_REFUSE=<op>` | treat an op as unsupported (tests the fallback) |
-| `VGPU_SASS_TRACE=<warp>` | every instruction that warp of block (0,0,0) runs, with its results |
+| `VGPU_SASS_TRACE=<warp>` | every instruction that warp of block (0,0,0) runs, with its results; after a BSSY, BSYNC, BREAK or BMOV, the masks of barriers B0 to B5 |
 | `VGPU_SASS_TRACE_KERNEL=<text>` | only in kernels whose name holds the text |
+| `VGPU_SASS_TRACE_BLOCK=<x>` | block (x,0,0) instead of block (0,0,0) |
 | `VGPU_KERNEL_DIGEST=<file>` | per launch, hashes (and NaN/Inf counts) of the memory its arguments reach: run once with `VGPU_SASS=0` and once without, and `diff` names the first kernel that differs |
 | `VGPU_KERNEL_DIGEST_DUMP=<dir>` | with the digest, each allocation's bytes too, as `<dir>/<launch>.<address>`: `cmp -l` of two runs' files for the differing allocation names the bytes (which a hash cannot) |
 

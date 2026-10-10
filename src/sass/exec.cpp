@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <thread>
+#include <tuple>
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
@@ -79,6 +80,7 @@ struct Warp {
   Mask b[16] = {};                    // convergence barriers
   // BMOV.PQUAD MACTIVE: the threads every instruction runs on until MACTIVE is put back (0: the issuing group).
   Mask mactive_force = 0;
+  uint64_t bssy_stamp[16] = {};       // when (Block::bssy_clock) each barrier was last set up: higher is more deeply nested
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
@@ -88,6 +90,8 @@ struct Warp {
   // other lanes waited to run.
   uint32_t spins = 0;
   bool give_way = false;
+  uint32_t spin_yields = 0;   // YIELDs in a row with no other lane group able to run
+  Mask slice = 0;             // the group let in by a YIELD: it runs until its own next YIELD or until it blocks
   uint32_t b2r = 0;                   // the last block barrier reduction's result (B2R.RESULT)
   bool b2r_pred = false;
   // Set by a wait that came back unsatisfied (an mbarrier phase check): the
@@ -133,6 +137,7 @@ struct Block {
   Cluster* cluster = nullptr;
   Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
+  uint64_t bssy_clock = 0;      // counts BSSYs, to order the warps' barriers by nesting
   std::vector<uint8_t> shared;
   std::map<std::pair<uint32_t, uint64_t>, GmmaSnapshot> gmma;   // (warpgroup, n-th MMA)
   // A block barrier (BAR) in progress: threads arrived, the count it waits
@@ -275,6 +280,7 @@ class Runner {
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
+  bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
   bool fast_alu(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc
 
@@ -1029,6 +1035,38 @@ bool Runner::break_warpsync_standoff(Block& blk) {
   return any;
 }
 
+// Where the live lanes of a block stand, for the message when none can move: lanes grouped by
+// what they wait on (or "running") and by code address, so a deadlock names the instructions
+// the lanes are stuck at instead of only saying that they are.
+static std::string stall_summary(const Block& blk) {
+  static const char* const kind[] = {"running", "BSYNC", "WARPSYNC", "BAR", "cluster"};
+  std::string out;
+  unsigned shown = 0;
+  for (const Warp& w : blk.warps) {
+    const Mask live = w.alive & ~w.exited;
+    if (!live) continue;
+    std::map<std::tuple<unsigned, uint64_t, unsigned>, Mask> groups;   // what, where, and which Bx for a BSYNC
+    for (unsigned l = 0; l < 32; ++l)
+      if ((live >> l) & 1) {
+        const bool wait = (w.waiting >> l) & 1;
+        const unsigned k = wait ? static_cast<unsigned>(w.wait_kind[l]) : 0u;
+        groups[{k, w.pc[l], wait && k == static_cast<unsigned>(Wait::BSync) ? static_cast<unsigned>(w.wait_arg[l]) : 0u}] |= Mask{1} << l;
+      }
+    for (const auto& [at, lanes] : groups) {
+      if (++shown > 40) return out + "; ...";
+      char b[128];
+      if (std::get<0>(at) == static_cast<unsigned>(Wait::BSync))
+        std::snprintf(b, sizeof b, "; warp %u lanes %08x BSYNC B%u (members %08x) at 0x%llx", w.index, lanes, std::get<2>(at),
+                      w.b[std::get<2>(at)] & live, static_cast<unsigned long long>(std::get<1>(at)));
+      else
+        std::snprintf(b, sizeof b, "; warp %u lanes %08x %s at 0x%llx", w.index, lanes, kind[std::get<0>(at)],
+                      static_cast<unsigned long long>(std::get<1>(at)));
+      out += b;
+    }
+  }
+  return out;
+}
+
 void Runner::run_block(Block& blk) {
   // Warps take turns: each runs until it waits, exits, or has had a turn of
   // a few thousand instructions, so warps that spin on one another all move.
@@ -1043,15 +1081,17 @@ void Runner::run_block(Block& blk) {
         progress = true;
         if (w.yield) break;
       }
+      if (!w.yield) w.spin_yields = 0;
       w.yield = false;
     }
     if (!live) return;
+    if (break_spin_wait({&blk})) continue;
     if (!progress && break_warpsync_standoff(blk)) continue;
     if (!progress && break_bsync_standoff(blk)) continue;
     if (!progress)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of block (" + std::to_string(blk.ctaid[0]) +
                                     ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
-                                    ") is waiting (a barrier some threads never reach)");
+                                    ") is waiting (a barrier some threads never reach)" + stall_summary(blk));
   }
 }
 
@@ -1090,9 +1130,15 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
           progress = true;
           if (w.yield) break;
         }
+        if (!w.yield) w.spin_yields = 0;
         w.yield = false;
       }
     if (!live) break;
+    {
+      std::vector<Block*> all;
+      for (Block& blk : blocks) all.push_back(&blk);
+      if (break_spin_wait(all)) continue;
+    }
     if (!progress) {
       bool broke = false;
       for (Block& blk : blocks) broke = break_warpsync_standoff(blk) || broke;
@@ -1108,6 +1154,45 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
 
 exec::InstClass inst_class(Op op);   // exec_ops.inc
 bool straight(const Instr& ins);
+
+// Every warp of these blocks is parked or spinning (a YIELD loop with no other lane group to run), and some
+// lanes stand at a BSYNC: a lane that won a spin lock waits at the BSYNC closing the loop for the lanes that
+// spin because it holds the lock, or the lock is held by a lane of another warp that waits the same way.
+// NVIDIA's scheduler guarantees forward progress for a thread in a YIELD loop, so after a while some parked
+// lanes go on. Which ones? The lock's holder is inside its critical section, the most deeply nested region
+// there is, so the lanes parked at the barrier that was set up last go, and the others stay until the next
+// stall: letting the outer region's lanes go too runs them on past a barrier the spinners still count them
+// in, and the barriers then wait for each other.
+bool Runner::break_spin_wait(const std::vector<Block*>& blocks) {
+  Warp* best = nullptr;
+  unsigned bar = 0;
+  uint64_t stamp = 0;
+  for (Block* blk : blocks)
+    for (Warp& w : blk->warps) {
+      if (!(w.alive & ~w.exited)) continue;
+      if (w.runnable() && w.spin_yields < 2) return false;   // a warp still doing something other than spinning
+      for (unsigned l = 0; l < 32; ++l) {
+        if (!((w.waiting >> l) & 1) || w.wait_kind[l] != Wait::BSync) continue;
+        const unsigned x = static_cast<unsigned>(w.wait_arg[l]) & 15;
+        if (!best || w.bssy_stamp[x] > stamp) {
+          best = &w;
+          bar = x;
+          stamp = w.bssy_stamp[x];
+        }
+      }
+    }
+  if (!best) return false;
+  Warp& w = *best;
+  for (unsigned l = 0; l < 32; ++l) {
+    if (!((w.waiting >> l) & 1) || w.wait_kind[l] != Wait::BSync || (static_cast<unsigned>(w.wait_arg[l]) & 15) != bar) continue;
+    w.b[bar] &= ~(Mask{1} << l);
+    w.waiting &= ~(Mask{1} << l);
+    w.wait_kind[l] = Wait::None;
+    w.pc[l] += 16;
+  }
+  w.spin_yields = 0;
+  return true;
+}
 
 // One instruction for one group of lanes. False when no lane can run.
 bool Runner::step_warp(Block& blk, Warp& w) {
@@ -1149,12 +1234,45 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     if (p == lo) group |= Mask{1} << l;
   }
   uint64_t pick = lo;
+  // The group a YIELD let in keeps the warp until it yields in turn or can no longer run, so that the
+  // warp's uniform registers (a VOTEU, POPC, UFLO sequence, say) are not shared out between two groups
+  // one instruction at a time.
+  if (w.slice) {
+    const Mask g = w.slice & run;
+    if (g) {
+      uint64_t slo = ~uint64_t{0};
+      for (Mask m = g; m; m &= m - 1) slo = std::min(slo, w.pc[std::countr_zero(m)]);
+      pick = slo;
+      group = 0;
+      for (Mask m = g; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        if (w.pc[l] == slo) group |= Mask{1} << l;
+      }
+      w.give_way = false;
+    } else {
+      w.slice = 0;
+    }
+  }
   if (w.give_way) {
     w.give_way = false;
+    // The group that yielded is the one at the lowest address, so the group to let in is the next one up
+    // from there. Measured from the lowest-numbered lane's address instead, a lane that had won a spin
+    // lock and branched past the loop was the "current" group, nothing lay above it, and the lanes still
+    // spinning below it ran for ever.
     uint64_t next = ~uint64_t{0};
     for (Mask m = run; m; m &= m - 1) {
       const uint64_t p = w.pc[std::countr_zero(m)];
-      if (p > cur) next = std::min(next, p);
+      if (p > lo) next = std::min(next, p);
+    }
+    if (next == ~uint64_t{0}) {
+      // Nothing else can run. A group that yields over and over like this is spinning on something only
+      // the lanes parked at a BSYNC can supply (a lane that won a spin lock stands at the BSYNC closing
+      // the loop, waiting for the lanes that are spinning because it holds the lock). NVIDIA's scheduler
+      // guarantees forward progress for a thread in a YIELD loop, so after a while the parked lanes go on
+      // (break_spin_wait).
+      ++w.spin_yields;   // run_block decides, with every warp in view, whether the parked lanes go on
+    } else {
+      w.spin_yields = 0;
     }
     if (next != ~uint64_t{0}) {
       pick = next;
@@ -1163,6 +1281,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
         const unsigned l = static_cast<unsigned>(std::countr_zero(m));
         if (w.pc[l] == pick) group |= Mask{1} << l;
       }
+      w.slice = group;
     }
   }
   // A straight-line run: arithmetic, conversions and plain loads and stores

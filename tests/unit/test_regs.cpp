@@ -396,6 +396,51 @@ VTEST(the_rtx_3080_ti_profile_is_the_measured_card_to_the_byte) {
   }
 }
 
+// The two Radeon cards read for their profiles (amd/registers/measurements/rx6800, rx6700xt) replay their
+// own configuration spaces: every byte is the measured card's, but for the BAR addresses its host's firmware
+// chose and the error status it had logged. That includes what the generic layout does not have -- the capability chain starts at 0x48, not
+// 0x60 -- so a register is found where the card keeps it.
+static void a_radeon_is_the_measured_card_to_the_byte(const char* gpu, const char* card, const char* layout) {
+  std::ifstream in(std::string(VGPU_SOURCE_DIR) + "/amd/registers/measurements/" + card + "/config.bin",
+                   std::ios::binary);
+  const std::string real((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  VCHECK_EQ(real.size(), size_t{regs::kConfigSize});
+  regs::ConfigSpace cs(device(gpu));
+  VCHECK_EQ(std::string(cs.layout()), std::string(layout));
+  const auto model = cs.image(regs::kConfigSize);
+  int wrong = 0;
+  for (size_t i = 0; i < regs::kConfigSize; ++i) {
+    // What the host's firmware chose: the address bytes of each base register (all of the upper dwords of
+    // the two 64-bit BARs, at 0x14 and 0x1c). And what each card had logged by the time it was read: the
+    // device status (0x6e) and the AER correctable and uncorrectable status (0x160, 0x154), write-1-to-clear
+    // bits a simulated card starts without.
+    const bool bar_address = i >= 0x10 && i < 0x28 && ((i & 3) != 0 || i == 0x14 || i == 0x1c);
+    const bool logged_errors = (i >= 0x6e && i < 0x70) || (i >= 0x154 && i < 0x158) || (i >= 0x160 && i < 0x164);
+    if (bar_address || logged_errors || model[i] == static_cast<uint8_t>(real[i])) continue;
+    if (++wrong <= 6)
+      std::fprintf(stderr, "  %s byte 0x%03zx: model 0x%02x, measured 0x%02x\n", gpu, i, model[i],
+                   static_cast<uint8_t>(real[i]));
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+VTEST(the_rx_6800_profile_is_the_measured_card_to_the_byte) {
+  TempMachine m("rx6800");
+  a_radeon_is_the_measured_card_to_the_byte("amd/rx6800", "rx6800", "amd-rx6800");
+}
+
+VTEST(the_rx_6700_xt_profile_is_the_measured_card_to_the_byte) {
+  TempMachine m("rx6700xt");
+  a_radeon_is_the_measured_card_to_the_byte("amd/rx6700xt", "rx6700xt", "amd-rx6700xt");
+}
+
+// The RX 6900 XT shares the RX 6800's chip but not its board, so it keeps the generic layout.
+VTEST(the_rx_6900_xt_keeps_the_generic_layout) {
+  TempMachine m("rx6900");
+  regs::ConfigSpace cs(device("amd/rx6900xt"));
+  VCHECK_EQ(std::string(cs.layout()), std::string("generic"));
+}
+
 // An NVIDIA GPU's BAR0. Every NVIDIA card has the space -- the offsets and
 // fields are NVIDIA's published headers', which cover every architecture here --
 // and on the one card that was read it answers exactly what that card did.
@@ -841,17 +886,18 @@ VTEST(every_gpu_starts_from_its_registers_file) {
   }
 }
 
-// The files are unique per model: no two share a device, and models differ in
-// what they hold -- identity, class, link, BARs.
+// The files are unique per model: no two share a device and a layout (two boards of one chip share the
+// device id, and differ in whether they replay a captured space), and models differ in what they hold --
+// identity, class, link, BARs.
 VTEST(each_gpu_models_registers_are_its_own) {
-  std::set<uint32_t> ids;
+  std::set<std::pair<uint32_t, std::string>> ids;
   std::set<std::string> configs;
   for (const std::string& gpu : available_gpus()) {
     const regs::GpuRegisters* g = regs::gpu_registers(device(gpu.c_str()));
     // A model with no file (one added without re-running CMake, which embeds
     // them) fails here by name rather than crashing the test.
     if (!g) throw vtest::Failure(gpu + " has no register file in the build");
-    VCHECK(ids.insert(g->device_id).second);
+    VCHECK(ids.insert({g->device_id, g->layout}).second);
     std::string values;
     for (const auto& r : g->config) values += r.name + "=" + std::to_string(r.value) + ";";
     VCHECK(configs.insert(values).second);

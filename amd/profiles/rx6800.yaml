@@ -1,0 +1,49 @@
+# VirtualGPU device profile: AMD Radeon RX 6800.
+# Read from a card (2026-10-09, ROCm 7.2.0, amdgpu on Linux 7.0): rocminfo, HIP's device
+# properties (amd/tools/characterize-hip.cpp), amd-smi, rocm-smi, lspci and the KFD topology,
+# kept in amd/registers/measurements/rx6800/. So verified: true. What no tool reports (the
+# per-multiprocessor block limit) is the RX 6900 XT profile's, the same chip.
+#
+# gfx1030 (RDNA2, Navi 21 with 60 of its 80 compute units): kernels run 32 lanes to a wave, and it has
+# no matrix instructions, so PyTorch's matrix products run on its vector units. HIP counts its
+# compute units in pairs (workgroup processors): 30 of the card's 60.
+id: amd/rx6800
+vendor: amd
+model: "AMD Radeon RX 6800"
+architecture: rdna2
+gcn_arch: "gfx1030"
+# Consumer RDNA parts have neither SRAM ECC nor XNACK to report.
+gcn_arch_full: "gfx1030"
+warp_size: 32
+vram_bytes: 17163091968        # 16 GiB of GDDR6 (HIP reports 17,163,091,968 bytes usable)
+verified: true
+limits:
+  max_threads_per_block: 1024
+  max_block_dim: [1024, 1024, 1024]
+  max_grid_dim: [2147483647, 65536, 65536]   # as HIP reports it: y and z are 65536, not 2^31-1
+  shared_mem_per_block_bytes: 65536
+  shared_mem_per_block_optin_bytes: 65536
+  registers_per_block: 131072
+  multiprocessors: 30          # workgroup processors, as HIP counts them; 60 compute units
+  registers_per_sm: 131072
+  max_threads_per_sm: 2048
+  max_blocks_per_sm: 32        # not exposed by HIP: the RX 6900 XT profile's
+  max_registers_per_thread: 256
+  shared_mem_per_sm: 65536     # 64 KB of LDS per workgroup processor, as HIP and HSA report
+  l2_cache_bytes: 4194304      # 4 MB L2 (the 128 MB Infinity Cache behind it HIP does not report)
+features:
+  fp16: true
+  bf16: true                   # in software: converted to and from fp32
+  fp64: true
+  tensor_cores: false          # no WMMA before RDNA3
+telemetry:
+  power_limit_w: 203           # amd-smi: the board's power cap (186 W is the lowest it can be set)
+  sm_clock_max_mhz: 2475       # the top of the shader clock table
+  mem_clock_max_mhz: 2000      # 16 Gbps GDDR6, as the other GDDR6 profiles give it (the card's mclk table tops out at 1000 MHz)
+  temperature_max_c: 110       # the junction slowdown threshold (edge 100, memory 100)
+  pci_vendor_id: 4098          # 0x1002 AMD
+  pci_device_id: 29631         # 0x73bf Navi 21 [Radeon RX 6800/6800 XT/6900 XT], revision c3, subsystem 1002:0e3a
+  ecc: false                   # consumer GDDR6, no ECC
+  memory: gddr                 # GDDR6, Samsung, 256 bits
+  memory_temperature: true     # rocm-smi reports a memory sensor on RDNA2 boards
+  pcie_link: "Gen4 x16"

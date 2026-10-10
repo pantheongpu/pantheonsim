@@ -19,13 +19,26 @@
 namespace vgpu::regs::vendor {
 namespace {
 
+const embedded::ConfigImage* captured(const telemetry::DeviceSample& d);
+
 // BAR0 the framebuffer aperture, BAR2 the doorbells, both 64-bit and
-// prefetchable; BAR5 the registers. Sizes are a model, not measured per card.
+// prefetchable; BAR5 the registers. Sizes are a model, not measured per card --
+// except a card that was read (the RX 6800, the RX 6700 XT), whose BAR2 is a 256 MB
+// aperture, whose BAR4 is a legacy 256-byte I/O-port window, and whose registers
+// are 1 MB.
 std::array<BarLayout, 6> amd_bars(const telemetry::DeviceSample& d) {
   std::array<BarLayout, 6> b{};
   const Windows w = windows(d);
   const uint64_t fb = pow2_at_least(d.vram_total_bytes ? d.vram_total_bytes : (1ull << 28));
   b[0] = {fb, false, true, true, false, w.mmio64};
+  if (captured(d)) {
+    b[1].high = true;
+    b[2] = {256ull << 20, false, true, true, false, w.mmio64 + 0x8000000000ull};
+    b[3].high = true;
+    b[4] = {256, true, false, false, false, 0xf000 - 0x1000 * (w.slot & 7)};
+    b[5] = {1ull << 20, false, false, false, false, w.mmio32 + 0x01000000ull};
+    return b;
+  }
   b[1].high = true;
   b[2] = {2ull << 20, false, true, true, false, w.mmio64 + 0x8000000000ull};
   b[3].high = true;
@@ -34,7 +47,18 @@ std::array<BarLayout, 6> amd_bars(const telemetry::DeviceSample& d) {
 }
 
 bool is_amd(const telemetry::DeviceSample& d) { return std::strcmp(d.vendor, "amd") == 0; }
-const embedded::ConfigImage* no_capture(const telemetry::DeviceSample&) { return nullptr; }
+// The captured configuration space a device replays, if its card has one: the RX 6800's, the RX 6700 XT's
+// (amd/registers/measurements/). Their chips' other boards (the RX 6900 XT shares the RX 6800's Navi 21)
+// keep the generic layout, since a board's own bytes -- revision, subsystem, firmware's choices -- are not theirs.
+const embedded::ConfigImage* captured(const telemetry::DeviceSample& d) {
+  const char* want = std::strcmp(d.name, "AMD Radeon RX 6800") == 0     ? "amd-rx6800"
+                     : std::strcmp(d.name, "AMD Radeon RX 6700 XT") == 0 ? "amd-rx6700xt"
+                                                                          : nullptr;
+  if (!want) return nullptr;
+  for (const auto& img : embedded::kConfigImages)
+    if (std::strcmp(img.name, want) == 0) return &img;
+  return nullptr;
+}
 uint32_t trained_gen(const telemetry::DeviceSample& d) { return d.pcie_gen; }
 
 // The SMU mailbox in the shared words: message, argument, response, and
@@ -77,6 +101,14 @@ bool amd_backed(const std::string& k, const Context& c, uint32_t* out) {
   // RX 7900 XTX is Navi 31's c8 (the XT is cc), the RX 6900 XT and RX 9070 XT
   // their chips' c0.
   const bool radeon = std::strncmp(d.architecture, "rdna", 4) == 0;
+  // A card that was read answers its own bytes for what the model would choose: its board's revision, the
+  // command bits and header type its host and its audio function left, and its class.
+  if (const embedded::ConfigImage* img = captured(d)) {
+    if (k == "profile.revision") { *out = img->bytes[0x08]; return true; }
+    if (k == "profile.command") { *out = img->bytes[0x04] | (img->bytes[0x05] << 8); return true; }
+    if (k == "profile.header_type") { *out = img->bytes[0x0e]; return true; }
+    if (k == "profile.class") { *out = img->bytes[0x09] | (img->bytes[0x0a] << 8) | (img->bytes[0x0b] << 16); return true; }
+  }
   if (k == "profile.revision") *out = !radeon ? 0x00 : device == 0x744c ? 0xc8 : 0xc0;
   else if (k == "profile.command") *out = 0x0406;
   else if (k == "profile.header_type") *out = 0x00;
@@ -198,7 +230,7 @@ const Vendor& amd() {
   static const Vendor v = {
       "amd",           Space::AmdMmio, "amd-mmio", "amd/registers/mmio.yaml",
       512u << 10,      0u,             is_amd,     amd_bars,
-      every_register,  no_capture,      trained_gen,    amd_backed, amd_write,
+      every_register,  captured,        trained_gen,    amd_backed, amd_write,
       amd_sysfs,
   };
   return v;

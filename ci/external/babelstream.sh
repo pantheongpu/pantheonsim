@@ -43,7 +43,7 @@ run)
   gpu="${1:?gpu}"; shim="$(cd "${2:?shim}" && pwd)"; report="$(mkdir -p "${3:?report}" && cd "$3" && pwd)"
   case "$gpu" in
     amd/mi300x|amd/mi325x) arch=gfx942 ;; amd/mi250x) arch=gfx90a ;; amd/mi350x) arch=gfx950 ;;
-    amd/rx6900xt) arch=gfx1030 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
+    amd/rx6900xt|amd/rx6800) arch=gfx1030 ;; amd/rx6700xt) arch=gfx1031 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
     *) echo "unknown GPU $gpu" >&2; exit 2 ;;
   esac
   exe="$dir/build-$arch/hip-stream"

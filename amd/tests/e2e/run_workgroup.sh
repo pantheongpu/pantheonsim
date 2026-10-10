@@ -51,6 +51,8 @@ done <<'GPUS'
 amd/mi300x gfx942 64 AMD Instinct MI300X
 amd/mi250x gfx90a 64 AMD Instinct MI250X
 amd/rx6900xt gfx1030 32 AMD Radeon RX 6900 XT
+amd/rx6800 gfx1030 32 AMD Radeon RX 6800
+amd/rx6700xt gfx1031 32 AMD Radeon RX 6700 XT
 amd/rx7900xtx gfx1100 32 AMD Radeon RX 7900 XTX
 GPUS
 exit $fail

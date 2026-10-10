@@ -93,7 +93,7 @@ Known limitations (deliberate, documented):
   unsupported. OptiX (ray tracing) is a separate
   NVIDIA subsystem, not CUDA, and is out of scope.
 - AMD runs gfx942 (MI300X, MI325X), gfx950 (MI350X), gfx90a (MI250X),
-  gfx1030 (Radeon RX 6900 XT, RDNA2), gfx1100 (Radeon RX 7900 XTX, RDNA3) and
+  gfx1030 (Radeon RX 6900 XT and RX 6800, RDNA2), gfx1031 (Radeon RX 6700 XT), gfx1100 (Radeon RX 7900 XTX, RDNA3) and
   gfx1201 (Radeon RX 9070 XT, RDNA4) code, through its own HIP and HSA runtimes; rocBLAS, hipBLASLt, MIOpen and
   PyTorch run on it — see [amd/README.md](amd/README.md).
 

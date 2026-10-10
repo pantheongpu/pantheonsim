@@ -31,7 +31,7 @@ on:
         description: "Suites to run (space separated): cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream"
         default: cuda-samples hecbench rodinia polybench cuda-memtest gpu-burn hip-tests babelstream
       amd_gpu:
-        description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
+        description: "hip-tests GPU (amd/mi300x, amd/rx6900xt, amd/rx6800, amd/rx6700xt, amd/rx7900xtx, amd/rx9070xt); empty: tonight's turn"
         default: ''
       only:
         description: "NVIDIA suites: a regex of program names to run (suites.sh's SUITE_ONLY); empty: all listed"
@@ -224,7 +224,7 @@ jobs:
           GPU: ${{ needs.sim.outputs.amd_gpu }}
         run: |
           case "$GPU" in
-            amd/mi300x) arch=gfx942 ;; amd/rx6900xt) arch=gfx1030 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
+            amd/mi300x) arch=gfx942 ;; amd/rx6900xt|amd/rx6800) arch=gfx1030 ;; amd/rx6700xt) arch=gfx1031 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
             *) echo "::error::no hip-tests baseline for $GPU"; exit 1 ;;
           esac
           echo "arch=$arch" >> "$GITHUB_OUTPUT"
@@ -371,7 +371,7 @@ jobs:
           GPU: ${{ needs.sim.outputs.amd_gpu }}
         run: |
           case "$GPU" in
-            amd/mi300x) arch=gfx942 ;; amd/rx6900xt) arch=gfx1030 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
+            amd/mi300x) arch=gfx942 ;; amd/rx6900xt|amd/rx6800) arch=gfx1030 ;; amd/rx6700xt) arch=gfx1031 ;; amd/rx7900xtx) arch=gfx1100 ;; amd/rx9070xt) arch=gfx1201 ;;
             *) echo "::error::no BabelStream arch for $GPU"; exit 1 ;;
           esac
           ci/external/babelstream.sh fetch babelstream

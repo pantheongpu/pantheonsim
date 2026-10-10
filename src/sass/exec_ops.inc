@@ -218,10 +218,12 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
   if (!pcs_set && advance) each_lane(group, [&](unsigned l) { w.pc[l] += 16; });
   // VGPU_SASS_TRACE=<warp>: every instruction that warp of block (0,0,0)
   // runs, with the lane group and the first active lane's results;
-  // VGPU_SASS_TRACE_KERNEL=<text> keeps it to kernels whose name holds it.
+  // VGPU_SASS_TRACE_KERNEL=<text> keeps it to kernels whose name holds it;
+  // VGPU_SASS_TRACE_BLOCK=<x> picks block (x,0,0) instead.
   static const int trace = [] { const char* v = std::getenv("VGPU_SASS_TRACE"); return v && *v ? std::atoi(v) : -1; }();
+  static const unsigned trace_block = [] { const char* v = std::getenv("VGPU_SASS_TRACE_BLOCK"); return v && *v ? static_cast<unsigned>(std::atoi(v)) : 0u; }();
   static const char* const trace_kernel = std::getenv("VGPU_SASS_TRACE_KERNEL");
-  if (trace >= 0 && static_cast<int>(w.index) == trace && blk.ctaid[0] == 0 && blk.ctaid[1] == 0 && blk.ctaid[2] == 0 &&
+  if (trace >= 0 && static_cast<int>(w.index) == trace && blk.ctaid[0] == trace_block && blk.ctaid[1] == 0 && blk.ctaid[2] == 0 &&
       (!trace_kernel || !*trace_kernel || k_.name.find(trace_kernel) != std::string::npos)) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(ex ? ex : group));
     const unsigned urz = m_.sm >= 100 ? 255u : 63u;
@@ -236,6 +238,12 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
         else b[0] = 0;
         vals += b;
       }
+    // After a convergence-barrier instruction, the barriers' lane masks: what each Bx now waits for.
+    if (ins.op == Op::BSSY || ins.op == Op::BSYNC || ins.op == Op::BREAK || ins.op == Op::BMOV) {
+      char b[96];
+      std::snprintf(b, sizeof b, "  b0..5=%08x %08x %08x %08x %08x %08x", w.b[0], w.b[1], w.b[2], w.b[3], w.b[4], w.b[5]);
+      vals += b;
+    }
     std::fprintf(stderr, "  [%08x %08x] %04llx  %-50s%s\n", group, ex, static_cast<unsigned long long>(ins.pc),
                  to_text(ins).c_str(), vals.c_str());
   }
@@ -3185,6 +3193,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       // A hint ptxas puts in loops, spin-waits among them (sm_80's mbarrier
       // waits poll shared memory): other lane groups, and other warps, go
       // first.
+      w.slice = 0;
       w.give_way = true;
       w.yield = true;
       return false;
@@ -3333,6 +3342,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       // for lanes that had already left. They converge together instead,
       // and BSYNC takes the lanes it releases back out.
       w.b[ins.dst[0].reg] |= ex;
+      w.bssy_stamp[ins.dst[0].reg & 15] = ++blk.bssy_clock;
       return false;
     case Op::BREAK:   // BREAK Pn, Bx: the lanes where both hold leave Bx
       w.b[ins.src.back().reg] &= ~with_condition(ex);

@@ -393,6 +393,15 @@ hipError_t ensure_runtime(State& s) {
   } catch (const std::exception& e) {
     return fail(hipErrorInvalidDevice, std::string("no usable GPU profile: ") + e.what());
   }
+  // HSA_OVERRIDE_GFX_VERSION=10.3.0 makes ROCm's runtime report a gfx103x card (an RX 6700 XT's gfx1031) as
+  // gfx1030, so the code objects built for gfx1030 -- the only RDNA2 kernels PyTorch and the ROCm libraries
+  // ship -- load on it. The two share an instruction set. No other override is honoured: the code of another
+  // family would not run on the card.
+  if (const char* o = std::getenv("HSA_OVERRIDE_GFX_VERSION");
+      o && std::strcmp(o, "10.3.0") == 0 && p.gcn_arch.rfind("gfx103", 0) == 0 && p.gcn_arch != "gfx1030") {
+    p.gcn_arch_full.replace(0, p.gcn_arch.size(), "gfx1030");
+    p.gcn_arch = "gfx1030";
+  }
   // The devices a program is shown, as ROCm shows them: ROCR_VISIBLE_DEVICES
   // picks from the machine's, then HIP_VISIBLE_DEVICES (or
   // CUDA_VISIBLE_DEVICES) from those -- each a list read up to the first
@@ -915,7 +924,7 @@ hipError_t run_launch(const LaunchJob& job) {
       // The device's layout, for the registers that say where a wave runs.
       // HIP's multiprocessors are the units: compute units, or RDNA's
       // workgroup processors.
-      const vgpu::amd::Chip c = vgpu::amd::chip(d.profile().architecture.c_str());
+      const vgpu::amd::Chip c = vgpu::amd::chip(d.profile().architecture.c_str(), d.profile().telemetry.pci_device_id);
       const uint32_t dies = std::max(c.xccs, 1u);
       dispatch.layout = {dies, std::max(c.engines / dies, 1u), std::max(c.arrays, 1u),
                          std::max(static_cast<uint32_t>(d.profile().limits.multiprocessors) / dies, 1u)};
@@ -2945,7 +2954,7 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
     // The real-time clock s_memrealtime and wall_clock64() read, in kHz.
     case A::kWallClockRate: *value = 100000; break;
     case A::kNumberOfXccs:
-      *value = static_cast<int>(vgpu::amd::chip(s.rt->device(ordinal).profile().architecture.c_str()).xccs);
+      *value = static_cast<int>(vgpu::amd::chip(s.rt->device(ordinal).profile().architecture.c_str(), s.rt->device(ordinal).profile().telemetry.pci_device_id).xccs);
       break;
     // A work-item's VGPRs: gfx90a and later add as many accumulation
     // registers again, which a kernel may use as either.

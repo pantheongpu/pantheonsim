@@ -312,7 +312,7 @@ AMDSMI_API int amdsmi_get_gpu_subsystem_name(void* h, char* name, size_t len) {
 }
 AMDSMI_API int amdsmi_get_gpu_asic_info(void* h, AsicInfo* info) {
   GPU(h, s, info);
-  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture, s.pci_device_id);
   std::memset(info, 0, sizeof *info);
   std::snprintf(info->market_name, sizeof info->market_name, "%s", s.name);
   info->vendor_id = 0x1002;
@@ -891,7 +891,7 @@ AMDSMI_API int amdsmi_get_power_info(void* h, PowerInfo* info) {
 // The vendor of the memory chips is not modelled: N/A.
 AMDSMI_API int amdsmi_get_gpu_vram_info(void* h, VramInfo* info) {
   GPU(h, s, info);
-  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture, s.pci_device_id);
   std::memset(info, 0, sizeof *info);
   const std::string type = c.memory;
   uint32_t rate = 8;
@@ -909,7 +909,7 @@ AMDSMI_API int amdsmi_get_gpu_vram_info(void* h, VramInfo* info) {
 // the last-level cache where there is one. Instruction and scalar caches are not modelled.
 AMDSMI_API int amdsmi_get_gpu_cache_info(void* h, CacheInfo* info) {
   GPU(h, s, info);
-  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture);
+  const vgpu::amd::Chip c = vgpu::amd::chip(s.architecture, s.pci_device_id);
   std::memset(info, 0, sizeof *info);
   const uint32_t cus = s.multiprocessors * c.cus_per_mp;
   const uint32_t kEnabled = 1, kData = 2;
