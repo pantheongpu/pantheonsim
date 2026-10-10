@@ -289,8 +289,8 @@ void experiments(const Form& f) {
       put_a(p, f, r, 0, std::ldexp(1.0, 8 - r));   // small A: 2^(8 - r)
       p.C[r][0] = 65536.0f;
       p.C[r][1] = -65536.0f;
-      p.C[r][2] = std::ldexp(1.0f, -r * 4 - 1);    // tiny C against the 2^16 product of c2
-      p.C[r][3] = -std::ldexp(1.0f, -r * 4 - 1);
+      p.C[r][2] = std::ldexp(1.0f, -r * 2 - 1);    // tiny C against the 2^16 product of c2
+      p.C[r][3] = -std::ldexp(1.0f, -r * 2 - 1);
       for (int c = 0; c < 4; ++c) cells.push_back({r, c, std::string("r") + num(r) + "_c" + num(c)});
     }
     put_b(p, f, 0, 0, 1.0); put_b(p, f, 0, 1, 1.0); put_b(p, f, 0, 2, 0.0); put_b(p, f, 0, 3, 0.0);
