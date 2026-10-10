@@ -1082,7 +1082,8 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
 - **Why the equal-value labels are not exact: NPP merges in 16-pixel tiles and does not finish.** Round 4
   probed it with about 15,000 one-row images of 3 values, flat images of every width and 4-way images of both
   shapes (`tools/probes/npp_watershed_probe.cu` prints what the card writes; compare with the model in
-  `npp_core.hpp`). What was found, none of it reproduced:
+  `npp_core.hpp`). What was found (round 5 solved the 4-way item below and added the findings marked R5); the
+  equal-value labels are still not reproduced:
   - the rules of `npp_core.hpp` are exact on every row of up to 16 pixels (every row of 2 to 8 pixels of 3
     values was compared) except those that start with two equal pixels and a different third (`a a b ...`):
     then the region holding pixel 0 is labelled 1, not 0, and a pixel 0 that was a separate root joins its
@@ -1099,6 +1100,24 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
     other positions (a 256 x 100 one at x = 221, 237, 253: the positions depend on the height too), and on the
     teapot the black background is one label up to x = 495 and another (14) from x = 496 on, in every row of the
     top 69. The labels are merged through some number of passes that leaves a width-dependent remainder;
+  - R5, what the strips look like (measured on the card, none reproduced):
+    * a row of 2 or more pixels is exact in the model except the "a a b" rule above, which holds for every row up to
+      36 pixels and every leading run of exactly two equal pixels (the first region is labelled 1 instead of 0):
+      600 random 3-valued rows of 2 to 36 pixels match the model with that one rule;
+    * a flat image's labels depend on x alone (every row is the same) when it is tall enough, and on y alone when
+      it is narrow; a column (w = 1) behaves like a row. The first strip starts at x0(w % 16, h): 48 for w % 16 in
+      0..4 and h <= 16, 37 for 5..9, 70 for 10, 59 for 11..15, and with more rows it grows: for w % 16 = 0, x0 = 60,
+      61, ... 64 for h = 17..21, 76 for 22, ... 78 for 27..37, 112 for 38, 124 ... 128 for 39..46, and so on
+      (roughly 2 h + 16: the reach in x is about 2 n + 1 tiles for n tiles of 16 rows, and the vertical merge is
+      complete from a few tile rows up). The h at which x0 steps are the same for every w % 16 while the size of the
+      steps (1 or 12) is not, and rows below row 0 change it (raising the bottom rows to a ramp moves x0 as if h had
+      changed), so the labels of row 0 depend on the whole image;
+    * a bump (one pixel higher than a flat zero row) at p changes only the pixels x >= p + 34 up to the end of the
+      16-pixel tile that holds p + 34, which take the label p + 1: the union across the bump reaches two tiles and
+      two pixels to the right and no further;
+    * the unwritten pixels of 4-way mode (below) repeat every 112 in the width, the lcm of 14 (a tile of 16 with a
+      pixel of halo each side) and 16, while the strips repeat every 16: the merge passes that finish the labels are
+      not those that finish the flow;
   - **4-way connectivity** (solved in round 5, for the segmented image and for the labels of images with no equal
     neighbours): NPP 13.0 leaves some pixels unwritten. A pixel whose lowest neighbour is the one to its right (below)
     keeps its own value, as if it were a root, when its column (row) is in a set that depends on the width (height)
