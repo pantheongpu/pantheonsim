@@ -31,6 +31,10 @@ RUNTIME_EXEMPT = {
 }
 DRIVER_EXEMPT = {
     "vgpu_driver_bind_primary_v1": "the runtime shim's private hook, not a CUDA function",
+    # event_record() reports the call itself (traced) on the path where the driver records the event; on a
+    # capturing stream the record is the runtime's, which reports cudaEventRecordWithFlags.
+    "cuEventRecord": "reported by event_record()",
+    "cuEventRecordWithFlags": "reported by event_record()",
 }
 
 
@@ -58,6 +62,10 @@ def exports(text, ret, prefix):
 
 def check(path, ret, prefix, report, exempt):
     text = (SRC / path).read_text()
+    # The functions the header sweep added live in an .inc the file includes (runtime_sweep.inc, driver_sweep.inc).
+    inc = SRC / path.replace("_api.cpp", "_sweep.inc")
+    if inc.exists():
+        text += "\n" + inc.read_text()
     bad, n = [], 0
     for name, body in exports(text, ret, prefix):
         n += 1

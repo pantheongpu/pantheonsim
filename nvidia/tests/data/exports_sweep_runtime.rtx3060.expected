@@ -1,0 +1,158 @@
+cudaDeviceGetSharedMemConfig: cudaSuccess -- 1
+cudaDeviceSetSharedMemConfig eight, then get: cudaSuccess -- get 1
+cudaDeviceSetSharedMemConfig 7: cudaErrorInvalidValue
+cudaDeviceGetSharedMemConfig null: cudaErrorInvalidValue
+cudaFuncSetSharedMemConfig: cudaSuccess
+cudaFuncSetSharedMemConfig 7: cudaErrorInvalidValue
+cudaFuncSetSharedMemConfig null: cudaErrorInvalidDeviceFunction
+cudaFuncSetSharedMemConfig stack address: cudaErrorInvalidResourceHandle
+cudaSetValidDevices {1,0}: cudaSuccess
+cudaSetValidDevices len 0: cudaSuccess
+cudaSetValidDevices null: cudaErrorInvalidValue
+cudaSetValidDevices with a device that does not exist: cudaErrorInvalidValue
+cudaSetValidDevices len -1: cudaErrorInvalidValue
+cudaDeviceGetTexture1DLinearMaxWidth float: cudaSuccess -- w=1073741824
+cudaDeviceGetTexture1DLinearMaxWidth uchar4: cudaSuccess -- w=1073741824
+cudaDeviceGetTexture1DLinearMaxWidth float4: cudaSuccess -- w=268435456
+cudaDeviceGetTexture1DLinearMaxWidth uchar: cudaSuccess -- w=1073741824
+cudaDeviceGetTexture1DLinearMaxWidth 3 channels: cudaErrorInvalidChannelDescriptor
+cudaDeviceGetTexture1DLinearMaxWidth 2 x 8 bits: cudaSuccess -- w=1073741824
+cudaDeviceGetTexture1DLinearMaxWidth no channels: cudaErrorInvalidChannelDescriptor
+cudaDeviceGetTexture1DLinearMaxWidth null width: cudaErrorInvalidValue
+cudaDeviceGetTexture1DLinearMaxWidth null format: cudaErrorInvalidValue
+cudaDeviceGetTexture1DLinearMaxWidth device 9: cudaErrorInvalidDevice
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 1 size 128: cudaSuccess -- 48896
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 2 size 128: cudaSuccess -- 48896
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 4 size 256: cudaSuccess -- 24320
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 8 size 128: cudaSuccess -- 11520
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 12 size 128: cudaSuccess -- 7168
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 6 size 256: cudaSuccess -- 15744
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 100 size 128: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 0 size 128: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 1 size 0: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 1 size 2048: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 1 size 1024: cudaSuccess -- 48896
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 3 size 512: cudaSuccess -- 32768
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 16 size 64: cudaSuccess -- 5120
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 32 size 32: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks -1 size 128: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 1 size -5: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 2 size 1024: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock blocks 3 size 1024: cudaErrorInvalidValue -- 77
+cudaOccupancyAvailableDynamicSMemPerBlock null: cudaErrorInvalidValue
+cudaOccupancyAvailableDynamicSMemPerBlock null function: cudaErrorInvalidDeviceFunction
+cudaDeviceGetNvSciSyncAttributes: cudaErrorInvalidValue
+cudaDeviceGetNvSciSyncAttributes null: cudaErrorInvalidResourceHandle
+cudaDeviceGetNvSciSyncAttributes device 9: cudaErrorInvalidDevice
+cudaGetExportTable: cudaErrorInvalidValue
+cudaGetExportTable null table: cudaErrorInvalidValue
+cudaGetExportTable null id: cudaErrorInvalidValue
+cudaGetFuncBySymbol: cudaSuccess -- set 1, same again 1, other kernel differs 1
+cudaGetFuncBySymbol null result: cudaSuccess
+cudaGetFuncBySymbol null symbol: cudaErrorInvalidDeviceFunction -- untouched 1
+cudaGetFuncBySymbol a host function: cudaErrorInvalidDeviceFunction -- untouched 1
+cudaGetFuncBySymbol a variable: cudaErrorInvalidDeviceFunction
+cudaGetFuncBySymbol, then cudaFuncGetAttributes of the kernel: cudaSuccess -- static shared 256
+cudaArrayGetMemoryRequirements: cudaErrorInvalidValue
+cudaArrayGetMemoryRequirements null result: cudaErrorInvalidValue
+cudaArrayGetMemoryRequirements null array: cudaErrorInvalidResourceHandle
+cudaArrayGetMemoryRequirements device 5: cudaErrorInvalidValue
+cudaMipmappedArrayGetMemoryRequirements: cudaErrorInvalidValue
+cudaMipmappedArrayGetMemoryRequirements null: cudaErrorInvalidResourceHandle
+cudaArrayGetSparseProperties: cudaErrorInvalidValue
+cudaArrayGetSparseProperties null result: cudaErrorInvalidValue
+cudaArrayGetSparseProperties null array: cudaErrorInvalidResourceHandle
+cudaMipmappedArrayGetSparseProperties: cudaErrorInvalidValue
+cudaMipmappedArrayGetSparseProperties null: cudaErrorInvalidResourceHandle
+cudaArrayGetPlane: cudaErrorInvalidValue
+cudaArrayGetPlane plane 1: cudaErrorInvalidValue
+cudaArrayGetPlane null result: cudaErrorInvalidValue
+cudaArrayGetPlane null array: cudaErrorInvalidResourceHandle
+cudaGraphAddMemcpyNodeToSymbol, then FromSymbol, launched: cudaSuccess -- add cudaSuccess, cudaSuccess; set cudaSuccess, exec set cudaSuccess; first launch 1 1, after 9 6
+cudaGraphAddMemcpyNodeToSymbol null symbol: cudaErrorInvalidSymbol
+cudaGraphAddMemcpyNodeToSymbol offset 8: cudaErrorInvalidValue
+cudaGraphAddMemcpyNodeToSymbol offset 64: cudaErrorInvalidValue
+cudaGraphAddMemcpyNodeToSymbol device to host: cudaErrorInvalidMemcpyDirection
+cudaGraphAddMemcpyNodeToSymbol default kind: cudaSuccess
+cudaGraphAddMemcpyNodeToSymbol null node: cudaErrorInvalidValue
+cudaGraphMemcpyNodeSetParamsToSymbol null node: cudaErrorInvalidValue
+cudaGraphExecMemcpyNodeSetParamsToSymbol null exec: cudaErrorInvalidValue
+cudaMemGetDefaultMemPool [13]: cudaSuccess -- is the device's default 1
+cudaMemGetMemPool [13]: cudaSuccess -- is the device's pool 1
+cudaMemGetDefaultMemPool invalid location [13]: cudaErrorInvalidValue
+cudaMemGetDefaultMemPool device 9 [13]: cudaErrorInvalidValue
+cudaMemGetDefaultMemPool invalid type [13]: cudaErrorInvalidValue
+cudaMemGetDefaultMemPool managed [13]: cudaErrorNotSupported
+cudaMemGetDefaultMemPool null pool [13]: cudaErrorInvalidValue
+cudaMemGetDefaultMemPool null location [13]: cudaErrorInvalidValue
+cudaMemSetMemPool, then cudaDeviceGetMemPool [13]: cudaSuccess -- the device's pool is now mine 1
+cudaMemSetMemPool null pool [13]: cudaErrorInvalidValue
+cudaMemSetMemPool null location [13]: cudaErrorInvalidValue
+cudaMemSetMemPool device 9 [13]: cudaErrorInvalidValue
+cudaGraphNodeSetParams null node [12.8]: cudaErrorInvalidValue
+cudaGraphNodeSetParams null parameters [12.8]: cudaErrorInvalidValue
+cudaGraphNodeSetParams unknown type [12.8]: cudaErrorInvalidValue
+cudaGraphExecNodeSetParams null exec [12.8]: cudaErrorInvalidValue
+cudaLogsCurrent [13]: cudaSuccess -- it=0
+cudaLogsCurrent null [13]: cudaErrorInvalidValue
+cudaLogsDumpToMemory [13]: cudaSuccess -- size 0
+cudaLogsDumpToMemory null buffer [13]: cudaErrorInvalidValue
+cudaLogsDumpToMemory null size [13]: cudaErrorInvalidValue
+cudaLogsDumpToFile [13]: cudaSuccess -- file made 1, 0 bytes
+cudaLogsDumpToFile null path [13]: cudaErrorInvalidValue
+cudaLogsRegisterCallback, then cudaLogsUnregisterCallback [13]: cudaSuccess -- handle set 1, unregister cudaSuccess
+cudaLogsRegisterCallback null callback [13]: cudaErrorInvalidValue
+cudaLogsUnregisterCallback null [13]: cudaErrorInvalidValue
+cudaDeviceRegisterAsyncNotification, then Unregister [12.8]: cudaSuccess -- handle set 1, unregister cudaSuccess
+cudaDeviceRegisterAsyncNotification null callback [12.8]: cudaErrorInvalidValue
+cudaDeviceRegisterAsyncNotification device 9 [12.8]: cudaErrorInvalidDevice
+cudaDeviceUnregisterAsyncNotification null [12.8]: cudaErrorInvalidValue
+cudaDeviceGetHostAtomicCapabilities [13]: cudaSuccess -- 0 0 0
+cudaDeviceGetHostAtomicCapabilities bad operation [13]: cudaErrorInvalidValue
+cudaDeviceGetHostAtomicCapabilities null [13]: cudaErrorInvalidValue
+cudaDeviceGetHostAtomicCapabilities count 0 [13]: cudaErrorInvalidValue
+cudaDeviceGetHostAtomicCapabilities device 7 [13]: cudaErrorInvalidDevice
+cudaDeviceGetP2PAtomicCapabilities 1->0 [13]: cudaSuccess -- 0 0 0
+cudaDeviceGetP2PAtomicCapabilities 0->0 [13]: cudaErrorInvalidDevice
+cudaDeviceGetP2PAtomicCapabilities 0->7 [13]: cudaErrorInvalidDevice
+cudaDeviceGetP2PAtomicCapabilities null [13]: cudaErrorInvalidValue
+cudaLibraryLoadFromFile [12.8]: cudaSuccess -- loaded 1
+cudaLibraryLoadFromFile missing [12.8]: cudaErrorFileNotFound
+cudaLibraryLoadFromFile null library [12.8]: cudaErrorInvalidValue
+cudaLibraryLoadFromFile null path [12.8]: cudaErrorInvalidValue
+cudaLibraryGetKernelCount [12.8]: cudaSuccess -- n=3
+cudaLibraryGetKernelCount null [12.8]: cudaErrorInvalidValue
+cudaLibraryGetKernelCount null library [12.8]: cudaErrorInvalidResourceHandle
+cudaLibraryEnumerateKernels [12.8]: cudaSuccess -- 1 1 1
+cudaLibraryEnumerateKernels null [12.8]: cudaErrorInvalidValue
+cudaLibraryEnumerateKernels null library [12.8]: cudaErrorInvalidResourceHandle
+cudaLibraryGetGlobal [12.8]: cudaSuccess -- bytes 32, address set 1
+cudaLibraryGetGlobal missing [12.8]: cudaErrorSymbolNotFound
+cudaLibraryGetGlobal a managed variable [12.8]: cudaSuccess
+cudaLibraryGetGlobal a kernel [12.8]: cudaErrorInvalidValue
+cudaLibraryGetGlobal null name [12.8]: cudaErrorInvalidValue
+cudaLibraryGetGlobal null library [12.8]: cudaErrorInvalidResourceHandle
+cudaLibraryGetManaged [12.8]: cudaSuccess -- bytes 4, address set 1
+cudaLibraryGetManaged a plain variable [12.8]: cudaErrorSymbolNotFound
+cudaLibraryGetUnifiedFunction [12.8]: cudaErrorInvalidValue
+cudaLibraryGetUnifiedFunction null library [12.8]: cudaErrorInvalidResourceHandle
+cudaGetKernel [12.8]: cudaSuccess -- set 1
+cudaGetKernel null [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync [12.8]: cudaSuccess -- copies right 1
+cudaMemcpyBatchAsync count 0 [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync null destinations [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync null attributes [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync attribute count 0 [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync attribute index 1 [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync invalid access order [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync access order 9 [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync flags 0x80 [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync a size of 0 [12.8]: cudaErrorInvalidValue
+cudaMemcpyBatchAsync pageable to device, then back [12.8]: cudaSuccess -- back cudaSuccess, round trip right 1
+cudaMemPrefetchBatchAsync [13]: cudaErrorInvalidValue
+cudaMemPrefetchBatchAsync count 0 [13]: cudaErrorInvalidValue
+cudaMemPrefetchBatchAsync flags 1 [13]: cudaErrorInvalidValue
+cudaMemDiscardBatchAsync [13]: cudaErrorInvalidValue
+cudaMemDiscardBatchAsync null [13]: cudaErrorInvalidValue
+cudaMemDiscardAndPrefetchBatchAsync [13]: cudaErrorInvalidValue
+PASS: 157 cases
