@@ -35,6 +35,7 @@
 #include <array>
 #include <cstdint>
 
+#include "vgpu/exec/devrt.hpp"
 #include "vgpu/profile.hpp"
 #include "vgpu/ptx/ast.hpp"
 
@@ -103,15 +104,7 @@ inline bool set(State& st, const vgpu::DeviceProfile& p, uint64_t static_bytes, 
 // The thread limit of a kernel: the part's, the kernel's __launch_bounds__, and the most threads its registers
 // leave room for (registers are handed out per warp in units of 256).
 inline int max_threads(const vgpu::ptx::EntryFn& fn, const vgpu::DeviceProfile& p, uint32_t regs_per_thread) {
-  uint64_t limit = p.limits.max_threads_per_block;
-  const uint64_t bound = uint64_t{fn.max_ntid[0]} * std::max(1u, fn.max_ntid[1]) * std::max(1u, fn.max_ntid[2]);
-  if (fn.max_ntid[0] && bound) limit = std::min(limit, bound);
-  if (regs_per_thread && p.limits.registers_per_block && p.warp_size) {
-    const uint64_t per_warp = (uint64_t{regs_per_thread} * p.warp_size + 255) / 256 * 256;
-    const uint64_t warps = p.limits.registers_per_block / per_warp;
-    limit = std::min<uint64_t>(limit, warps * p.warp_size);
-  }
-  return static_cast<int>(limit);
+  return static_cast<int>(vgpu::exec::devrt::kernel_thread_limit(fn, p, regs_per_thread));
 }
 
 // What the kernel's cluster attributes read when the program has not set them.

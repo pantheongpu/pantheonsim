@@ -4064,7 +4064,7 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
         const CubinKernel& k = m_.cubin.kernels[idx];
         devrt::FuncAttrs a;
         if (ref) {
-          a = devrt::func_attributes(*ref->fn, profile_, ref->arch ? ref->arch : m_.sm);
+          a = devrt::func_attributes(*ref->fn, profile_, ref->arch ? ref->arch : m_.sm, ref->constant);
         } else {   // no PTX beside the SASS: what the cubin says
           a.max_threads = static_cast<int32_t>(profile_.limits.max_threads_per_block);
           a.binary = profile_.cc_major * 10 + profile_.cc_minor;
@@ -4079,6 +4079,8 @@ bool Runner::device_runtime_call(Block& blk, Warp& w, const Instr& ins, Mask ex,
         if (!ref) {
           const uint32_t in_section = m_.sm >= 90 ? profile_.reserved_smem_per_block() : 0;
           a.regs = static_cast<int32_t>(k.regs);
+          if (const CubinSection* user = m_.cubin.section(".nv.constant3")) a.constant += user->size;
+          if (const CubinSection* mine = m_.cubin.section(".nv.constant2." + k.name)) a.constant += mine->size;
           a.local = std::max<uint64_t>(k.frame_size, k.min_stack);
           a.shared = k.shared_bytes >= in_section ? k.shared_bytes - in_section : k.shared_bytes;
         }
