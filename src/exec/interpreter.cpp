@@ -1537,6 +1537,27 @@ void tex_check_filterable(const TextureDesc& d) {
         tex_fail(Err::Unsupported, "linear filtering of a texture whose channels differ in width");
 }
 
+// A normalized texture coordinate in texels of a level that is `size` wide. For a power of two that is the
+// coordinate times the size, exactly. For any other size the card first floors the coordinate to a fixed-point
+// number of 21 fractional bits (the integer part whole, negative coordinates toward minus infinity) and then
+// multiplies it by the size: a point fetch at 0.04 on a 25-texel level reads texel 0 where the exact product
+// (1.0000000708 for the float above 0.04) says 1, and the filter's weights follow the floored coordinate.
+// Measured on an RTX 3060 over 300,000 coordinates of five sizes (the switch from texel k-1 to k at
+// ceil(k 2^21 / size) / 2^21, and every 8-bit weight of a linear fetch).
+double texel_coordinate(float x, uint32_t size) {
+  if (size != 0 && (size & (size - 1)) == 0) return static_cast<double>(x * static_cast<float>(size));
+  return std::floor(static_cast<double>(x) * 2097152.0) / 2097152.0 * static_cast<double>(size);
+}
+
+// floor(v) as an integer, saturating (an infinite or huge coordinate lands past the edge: the address mode
+// decides, the clamp mode reads the edge texel, as the card does).
+int64_t floor_index(double v) {
+  const double f = std::floor(v);
+  if (f >= 4e18) return int64_t{4000000000000000000};
+  if (f <= -4e18) return int64_t{-4000000000000000000};
+  return static_cast<int64_t>(f);
+}
+
 // The texels a linear filter reads and their weights, which sum to `total`.
 int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[3], bool true_1d, int total,
                          TexTerm* out) {
@@ -1547,11 +1568,13 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
   int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
   for (uint32_t i = 0; i < fdims; ++i) {
     float x = i < dims ? coord[i] : 0.0f;
-    if (d.normalized_coords) x *= static_cast<float>(size[i]);
+    if (std::isnan(x)) x = 0.0f;   // a NaN coordinate reads as 0 (measured on an RTX 3060, clamp mode, all filters)
+    double xd = static_cast<double>(x);
+    if (d.normalized_coords) xd = texel_coordinate(x, size[i]);
     // The offset moves the coordinate by whole texels before the clamp mode
     // limits it (measured on an RTX 3060: clamp and linear filtering with
     // offsets, where the weights show the difference).
-    double v = static_cast<double>(x) + d.fetch_offset[i];
+    double v = xd + d.fetch_offset[i];
     if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
     const double xb = v - 0.5;
     double fl = std::floor(xb);
@@ -1590,9 +1613,10 @@ int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3
   uint32_t idx[3] = {0, 0, 0};
   bool inside = true;
   for (uint32_t i = 0; i < dims; ++i) {
-    float f = coord[i];
-    if (d.normalized_coords) f *= static_cast<float>(size[i]);
-    if (!wrap_coord(effective_address(d, i), static_cast<int64_t>(std::floor(f)) + d.fetch_offset[i], size[i], &idx[i]))
+    const float xi = std::isnan(coord[i]) ? 0.0f : coord[i];   // a NaN coordinate reads as 0
+    double f = static_cast<double>(xi);
+    if (d.normalized_coords) f = texel_coordinate(xi, size[i]);
+    if (!wrap_coord(effective_address(d, i), floor_index(f) + d.fetch_offset[i], size[i], &idx[i]))
       inside = false;
   }
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
@@ -1894,9 +1918,10 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     const uint32_t size[2] = {v.width, v.height ? v.height : 1};
     int64_t b[2];
     for (uint32_t i = 0; i < 2; ++i) {
-      float x = cf[i];
-      if (v.normalized_coords) x *= static_cast<float>(size[i]);
-      const double xb = static_cast<double>(x) - 0.5;
+      const float xi = std::isnan(cf[i]) ? 0.0f : cf[i];
+      double xd = static_cast<double>(xi);
+      if (v.normalized_coords) xd = texel_coordinate(xi, size[i]);
+      const double xb = xd - 0.5;
       double fl = std::floor(xb);
       if (std::floor((xb - fl) * 256 + 0.5) >= 256) fl += 1;
       b[i] = static_cast<int64_t>(fl) + v.fetch_offset[i];
@@ -1980,11 +2005,12 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   for (uint32_t i = 0; i < dims; ++i) {
     int64_t c;
     if (f.float_coords) {
-      float x = cf[i];
-      if (v.normalized_coords) x *= static_cast<float>(size[i]);
+      const float xi = std::isnan(cf[i]) ? 0.0f : cf[i];
+      double xd = static_cast<double>(xi);
+      if (v.normalized_coords) xd = texel_coordinate(xi, size[i]);
       // Point sampling takes the texel the coordinate falls in. CUDA's
       // sampled coordinates are texel-centred, so x+0.5 addresses texel x.
-      c = static_cast<int64_t>(std::floor(x)) + v.fetch_offset[i];
+      c = floor_index(xd) + v.fetch_offset[i];
     } else {
       // An integer coordinate names a texel directly, and outside the extent
       // reads zero: an RTX 3060 applies neither the address mode nor the

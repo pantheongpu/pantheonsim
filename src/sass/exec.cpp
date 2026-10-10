@@ -34,6 +34,7 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
 #include "vgpu/exec/wgmma.hpp"
@@ -76,6 +77,8 @@ struct Warp {
   Wait wait_kind[32] = {};
   uint32_t wait_arg[32] = {};         // the barrier a lane waits on
   Mask b[16] = {};                    // convergence barriers
+  // BMOV.PQUAD MACTIVE: the threads every instruction runs on until MACTIVE is put back (0: the issuing group).
+  Mask mactive_force = 0;
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each

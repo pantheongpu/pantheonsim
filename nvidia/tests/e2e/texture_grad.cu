@@ -91,6 +91,23 @@ __global__ void k3d(cudaTextureObject_t t, const float* in, float* out, int n) {
                               make_float4(in[9 * i + 6], in[9 * i + 7], in[9 * i + 8], 0.0f));
 }
 
+// The same with only some of the threads of a quad fetching (the others write -1, or have exited): the fetch
+// still sees the whole quad of coordinates. pattern: which threads fetch.
+__global__ void k3dd(cudaTextureObject_t t, const float* in, float* out, int n, int pattern) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const bool active = pattern == 0   ? (i % 5 != 0 && (i & 3) != 1)
+                      : pattern == 1 ? ((i & 3) == 2)
+                      : pattern == 2 ? ((i & 31) < 7)
+                      : pattern == 3 ? ((i % 3) == 1)
+                                     : ((i & 3) == 3 && (i & 4) == 0);
+  if (active)
+    out[i] = tex3DGrad<float>(t, in[9 * i], in[9 * i + 1], in[9 * i + 2], make_float4(in[9 * i + 3], in[9 * i + 4], in[9 * i + 5], 0.0f),
+                              make_float4(in[9 * i + 6], in[9 * i + 7], in[9 * i + 8], 0.0f));
+  else
+    out[i] = -1.0f;
+}
+
 enum Kind { K1D, K2D, K1DL, K2DL, K3D };
 
 struct Tex {
@@ -203,13 +220,14 @@ static unsigned long long run(Kind kind, const Tex& tx, int layers, const std::v
 }
 
 // Fetches of a 3D texture, in = 9 floats a fetch (see k3d).
-static unsigned long long run3(const Tex& tx, const std::vector<float>& in) {
+static unsigned long long run3(const Tex& tx, const std::vector<float>& in, int pattern = -1) {
   const int n = int(in.size() / 9);
   float *din = nullptr, *dout = nullptr;
   cudaMalloc(&din, in.size() * 4);
   cudaMalloc(&dout, size_t(n) * 4);
   cudaMemcpy(din, in.data(), in.size() * 4, cudaMemcpyHostToDevice);
-  k3d<<<(n + 127) / 128, 128>>>(tx.t, din, dout, n);
+  if (pattern < 0) k3d<<<(n + 127) / 128, 128>>>(tx.t, din, dout, n);
+  else k3dd<<<(n + 95) / 96, 96>>>(tx.t, din, dout, n, pattern);
   std::vector<float> out(n);
   const cudaError_t e = cudaMemcpy(out.data(), dout, size_t(n) * 4, cudaMemcpyDeviceToHost);
   cudaFree(din);
@@ -374,6 +392,24 @@ int main(int argc, char** argv) {
     }
     report(std::string("special-2d-npot/") + std::to_string(variant), run(K2D, t2n, 0, in));
     report(std::string("special-1d-npot/") + std::to_string(variant), run(K1D, t1n, 0, in));
+  }
+  // Divergent fetches: a quad with threads that do not fetch (or have exited).
+  {
+    g_rng = 4242;
+    Tex tx;
+    if (!make_texture(&tx, 64, 64, 0, 7, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 64)) {
+      std::printf("FAIL 3d-divergent: cannot make the texture\n");
+      ++g_fails;
+    } else {
+      std::vector<float> in;
+      for (int i = 0; i < 3000; ++i) {
+        for (int k = 0; k < 3; ++k) in.push_back(frand(-0.25f, 1.25f));
+        const float mag = std::ldexp(frand(1.0f, 2.0f), -(2 + int(rnd() % 7u)));
+        for (int k = 0; k < 6; ++k) in.push_back(mag * frand(-1.0f, 1.0f));
+      }
+      for (int pattern = 0; pattern < 5; ++pattern)
+        report(std::string("3d-divergent/pattern") + std::to_string(pattern), run3(tx, in, pattern));
+    }
   }
   // The same special values on 3D textures, as gradients and as coordinates.
   for (int variant = 0; variant < 2; ++variant) {

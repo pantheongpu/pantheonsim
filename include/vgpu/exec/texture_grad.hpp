@@ -235,20 +235,22 @@ inline int64_t lod_q_3d(const double* dx, const double* dy) {
   return log2_q(rho);
 }
 
-// What the card's texture unit sees as a gradient of a 3D (or cube) fetch. ptxas builds those fetches from the four
-// coordinates of a quad -- P, P + dPdx, P + dPdy -- computed in single precision and handed to the unit, which takes
-// their differences; so the gradient is (P + d) - P rounded to P's precision, not d.
+// What the card's texture unit sees as a gradient of a 3D (or cube) fetch. ptxas builds those fetches from the
+// coordinates of a quad -- P, P + dPdx, P + dPdy -- computed in single precision (FSWZADD) and handed to the unit,
+// which takes their differences: the gradient is c1 - c0, not d. A coordinate that is NaN reads as 0 (measured: a
+// NaN gradient component makes the level that of a jump from the coordinate to 0), and one of 2^97 or more,
+// infinite included, makes the difference overflow: the fetch reads the last level whatever the other components
+// are.
+inline double lane_difference(float c0, float c1) {
+  constexpr float kOverflow = 0x1p97f;
+  if ((!std::isnan(c0) && std::fabs(c0) >= kOverflow) || (!std::isnan(c1) && std::fabs(c1) >= kOverflow)) return 1e300;
+  return (std::isnan(c1) ? 0.0 : static_cast<double>(c1)) - (std::isnan(c0) ? 0.0 : static_cast<double>(c0));
+}
+
+// The same from the position and the gradient component (the PTX instruction's operands).
 inline double quad_difference(float p, float d) {
   volatile float c = p + d;   // one single-precision add, as FSWZADD does it
-  const float cc = c;
-  // A coordinate that is NaN reads as 0 in the unit (measured: a NaN gradient component makes the level of the
-  // fetch that of a jump from the coordinate to 0), and one of 2^97 or more, infinite included, makes the
-  // difference overflow: the fetch reads the last level whatever the other components are.
-  constexpr float kOverflow = 0x1p97f;
-  if ((!std::isnan(p) && std::fabs(p) >= kOverflow) || (!std::isnan(cc) && std::fabs(cc) >= kOverflow)) return 1e300;
-  const double c0 = std::isnan(p) ? 0.0 : static_cast<double>(p);
-  const double c1 = std::isnan(cc) ? 0.0 : static_cast<double>(cc);
-  return c1 - c0;
+  return lane_difference(p, c);
 }
 
 }  // namespace vgpu::exec::tex_grad
