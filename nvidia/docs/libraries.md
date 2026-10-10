@@ -1536,12 +1536,83 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   card answers a valid `cuDeviceGetLuid` where the shim refuses, and the card
   segfaults on a garbage handle, a null stream in some calls and a second
   unregister, which the shim answers with the documented status instead.
-  Not covered: the functions only the CUDA 13.2 headers declare (26 in the
-  runtime, 24 in the driver), because no 13.2 header is part of the build.
-  Not changed: `cudaFuncGetAttributes` reports the opt-in shared-memory limit as
-  `maxDynamicSharedSizeBytes` of every kernel, where the card reports 48 KiB
-  less the kernel's static shared memory (48896 for 256 bytes) until
-  `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` raises it.
+  The functions only the CUDA 13.2 headers declare (30 in the runtime, 27 in the
+  driver, found with `check_header_exports.py /usr/local/cuda-13.2/include`) are
+  covered too: the driver's are in `driver_132.inc` (and the graph ones in
+  `driver_graph.cpp`) and are exported whatever toolkit built the shim; the
+  runtime's are in `runtime_132.inc` and exist only in a shim built with 13.2
+  headers (`CUDART_VERSION >= 13020`), so a 12.0 or 13.0 build neither declares
+  nor exports them. Against the 13.2 headers the lint finds 0 missing, with a
+  shim built with them. What the card answers for the driver ones is in the
+  `exports_sweep_driver` expected file (the cases call them through `dlsym`, so
+  they build and run with every toolkit; the driver of the RTX 3060 under WSL,
+  596.36, has them): `cuFuncGetParamCount`/`cuKernelGetParamCount` (a CUkernel
+  where a CUfunction goes is `CUDA_ERROR_INVALID_HANDLE` and the other way
+  round), `cuLaunchHostFunc_v2` (modes 0 and 1; a null function succeeds and runs
+  nothing), `cuMemcpyWithAttributesAsync` and `cuMemcpy3DWithAttributesAsync` (a
+  batch of one, with the batch calls' argument checks), the graph and node ids
+  (`cuGraphGetId`, `cuGraphExecGetId`, `cuGraphNodeGetLocalId`,
+  `cuGraphNodeGetToolsId`, `cuGraphNodeGetContainingGraph`: one id per graph made
+  and two per instantiation, a node's local id its index in its graph and its
+  tools id the graph's id over its index), `cuGraphNodeGetParams` (kernel,
+  memcpy, memset, host, child graph, event and empty nodes; the other kinds
+  answer `CUDA_ERROR_NOT_SUPPORTED`), the coredump callbacks (registered, never
+  called: no core dump is written), the multicast `_v2` binds (not supported, as
+  on the card) and the CIG capture calls (invalid value / invalid context, as
+  the card has them). **Derived from the header and the driver's measurement,
+  not checked against a card:** every runtime one, because NVIDIA's CUDA 13.2
+  `libcudart` crashes on its first call on this machine (`cudaGetDeviceCount`),
+  so there is no runtime of that toolkit to compare with; they answer the way
+  the driver's twin does (`e2e_runtime_132` checks them against the driver's, and SKIPs
+  unless the runtime shim was built with 13.2 headers, as CI's are not).
+  `cudaGraphConditionalHandleCreate_v2` takes only a null
+  execution context (any other is `cudaErrorInvalidResourceHandle`). Refused on
+  purpose, once on stderr, with `cudaErrorNotSupported` /
+  `CUDA_ERROR_NOT_SUPPORTED` where the card answers: the green-context and
+  device-resource family (`cudaExecutionCtx*`, `cudaGreenCtxCreate`,
+  `cudaDevResourceGenerateDesc`, `cudaDevSmResourceSplit*`,
+  `cudaDeviceGetDevResource`, `cudaDeviceGetExecutionCtx`,
+  `cudaStreamGetDevResource`, `cuStreamGetDevResource`, `cuDevSmResourceSplit`).
+  Not done for the card's crashes: a coredump callback deregistered twice or with
+  the other kind's handle crashes the card; here it is `CUDA_ERROR_INVALID_VALUE`.
+
+  **Kernel attributes** (`func_attrs.hpp`; the card is an RTX 3060, CUDA 13.0
+  runtime and driver 596.36): `cudaFuncGetAttributes` and `cuFuncGetAttribute` /
+  `cuKernelGetAttribute` used to report the part's opt-in shared-memory limit
+  (101376) as `maxDynamicSharedSizeBytes` of every kernel, 0 for the constant
+  size, the part's 1024 for the thread limit, `0` for the carveout and PTX
+  version 90 from the driver. They now answer as the card does. The dynamic
+  limit is 48 KiB less the kernel's static shared memory (49152 for none, 48896
+  for 256 bytes, 9152 for 40000, 0 for the whole 48 KiB) until
+  `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` or its driver twins set it,
+  and a set takes any value from 0 to the opt-in limit less the static part
+  (101120 for 256 bytes, 52224 for 48 KiB) and refuses the rest with
+  `cudaErrorInvalidValue` / `CUDA_ERROR_INVALID_VALUE`, changing nothing. The
+  value is the kernel's limit from then on, below 48 KiB too: a launch asking for
+  more dynamic shared memory is refused (the runtime says
+  `cudaErrorInvalidConfiguration` as for every launch configuration it refuses,
+  the driver `CUDA_ERROR_INVALID_VALUE`), the occupancy calls count 0 blocks
+  past it and `cudaOccupancyAvailableDynamicSMemPerBlock` stops at it. The
+  carveout starts at -1 and takes -1 to 100; the required cluster dimensions
+  take 0 and up (kept as given), the scheduling policy 0 to 2, the non-portable
+  flag any int from the runtime and a flag from the driver; attributes 0 to 7,
+  10 and past 15 are read-only/invalid. State is per kernel and per device, and a
+  CUkernel and the CUfunction made from it share it; a CUkernel passed where a
+  CUfunction goes is `CUDA_ERROR_INVALID_HANDLE`. `maxThreadsPerBlock` is what the
+  kernel's registers and `__launch_bounds__` allow (128 registers: 512, 168:
+  384, 255: 256), and `constSizeBytes` the module's `__constant__` memory (432
+  for a 400-byte, a 5-byte and a 24-byte aligned to 8 array). The function checks
+  also changed to the card's: a null function is `cudaErrorInvalidDeviceFunction`,
+  another address `cudaErrorInvalidResourceHandle`, an attribute outside 0 to 15
+  `cudaErrorInvalidValue` before the function is looked at. Required cluster
+  dimensions and "cluster size must be set" of a kernel the program set nothing
+  for come from its `__cluster_dims__`: derived from the documentation, not
+  checked against a card (an RTX 3060 has no clusters). Known differences that
+  remain: the card's CUDA 13.0 runtime answers `cudaErrorInvalidValue` for every
+  refused launch configuration and `cudaErrorLaunchOutOfResources` for a block
+  past the registers (this library answers `cudaErrorInvalidConfiguration`, as a
+  CUDA 12 runtime does), and the device runtime (`cudaGetFuncAttributes` from a
+  kernel) still reports the part's limits.
 
 - **cuBLAS**: the exported names the header does not declare (`cublas?bdmm`,
   `cublasGet/SetBackdoor`, `cublasGet/SetEnvironmentMode`); a program that

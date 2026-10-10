@@ -81,6 +81,12 @@ class Device {
   // a kernel policy, so it has to be an architecture and not an ISA version.
   int module_arch(uint64_t module_id) const;
 
+  // The bytes of constant memory a kernel of the module has, which cudaFuncGetAttributes calls constSizeBytes:
+  // the module's __constant__ variables (.const globals laid out in order with their alignment; a cubin's
+  // .nv.constant3) and, from a cubin, the constants ptxas made for the kernel (.nv.constant2.<kernel>).
+  // Zero for a module that is not loaded.
+  uint64_t module_const_bytes(uint64_t module_id, const std::string& kernel) const;
+
   // The module's global-variable addresses (valid while the module is loaded).
   const exec::SymbolTable* symbols(uint64_t module_id) const;
   // A module's global variable by name: its address and its declared size.

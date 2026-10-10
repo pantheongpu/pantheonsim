@@ -62,10 +62,12 @@ def exports(text, ret, prefix):
 
 def check(path, ret, prefix, report, exempt):
     text = (SRC / path).read_text()
-    # The functions the header sweep added live in an .inc the file includes (runtime_sweep.inc, driver_sweep.inc).
-    inc = SRC / path.replace("_api.cpp", "_sweep.inc")
-    if inc.exists():
-        text += "\n" + inc.read_text()
+    # The functions the header sweeps added live in .inc files the file includes (runtime_sweep.inc, driver_sweep.inc,
+    # and runtime_132.inc / driver_132.inc for the ones only the CUDA 13.2 headers declare).
+    for suffix in ("_sweep.inc", "_132.inc"):
+        inc = SRC / path.replace("_api.cpp", suffix)
+        if inc.exists():
+            text += "\n" + inc.read_text()
     bad, n = [], 0
     for name, body in exports(text, ret, prefix):
         n += 1

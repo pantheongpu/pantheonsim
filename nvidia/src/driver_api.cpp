@@ -37,6 +37,7 @@
 #include <stdexcept>
 
 #include "driver_graph.hpp"
+#include "func_attrs.hpp"
 #include "vgpu_cuda_graph.h"
 #include "error_names.hpp"
 #include "vgpu/exec/cluster.hpp"
@@ -72,8 +73,9 @@ struct FuncRec {
   uintptr_t module_handle = 0;
   const vgpu::ptx::EntryFn* fn = nullptr;
   const vgpu::exec::SymbolTable* syms = nullptr;
-  bool nonportable_cluster = false;   // CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
-  int max_dynamic_shared = -1;        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, -1 until set
+  uint64_t module_id = 0;             // the runtime's module on `device`, for what the module says of the kernel
+  uintptr_t kernel = 0;               // the CUkernel this function was made from; the two share their attributes
+  vgpu_funcattr::State attrs;         // what cuFuncSetAttribute set, when no CUkernel owns the state
   // The launch the pre-CUDA 4 API builds up on the function itself
   // (cuFuncSetBlockShape, cuFuncSetSharedSize, cuParamSet*) and cuLaunchGrid
   // runs: a block of one thread, no shared memory and no parameters until
@@ -96,6 +98,7 @@ struct LibRec {
 struct KernelRec {
   uintptr_t library = 0;
   std::string name;
+  std::map<int, vgpu_funcattr::State> attrs;   // what cuKernelSetAttribute / cuFuncSetAttribute set, per device
 };
 
 struct EventRec {
@@ -699,6 +702,27 @@ uint64_t library_module_on(ShimState& s, uintptr_t lib_handle, int dev) {
   return mid;
 }
 
+// The attributes a program has set for a function: the CUkernel's, per device, when the function was made
+// from one (the two share them on the card), else its own.
+const vgpu_funcattr::State& func_state(ShimState& s, const FuncRec& rec) {
+  if (rec.kernel) {
+    const auto k = s.kernels.find(rec.kernel);
+    if (k != s.kernels.end()) {
+      const auto a = k->second.attrs.find(rec.device);
+      static const vgpu_funcattr::State kDefault;
+      return a == k->second.attrs.end() ? kDefault : a->second;
+    }
+  }
+  return rec.attrs;
+}
+vgpu_funcattr::State& func_state_mutable(ShimState& s, FuncRec& rec) {
+  if (rec.kernel) {
+    const auto k = s.kernels.find(rec.kernel);
+    if (k != s.kernels.end()) return k->second.attrs[rec.device];
+  }
+  return rec.attrs;
+}
+
 // Resolves a CUkernel handle to a launchable function handle on the current
 // device, creating the per-device module instantiation as needed.
 uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
@@ -710,7 +734,7 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
   uint64_t mid = library_module_on(s, it->second.library, dev);
   const vgpu::ptx::EntryFn* fn = s.rt->device(dev).get_function(mid, it->second.name);
   uintptr_t fh = make_handle(s, kTagFunc);
-  s.functions[fh] = {dev, it->second.library, fn, s.rt->device(dev).symbols(mid)};
+  s.functions[fh] = {dev, it->second.library, fn, s.rt->device(dev).symbols(mid), mid, kernel_handle};
   return fh;
 }
 
@@ -2204,7 +2228,7 @@ static CUresult cuModuleGetFunction_impl(CUfunction* hfunc, CUmodule hmod, const
     auto [dev, mid] = it->second;
     const vgpu::ptx::EntryFn* fn = s.rt->device(dev).get_function(mid, name);
     uintptr_t fh = make_handle(s, kTagFunc);
-    s.functions[fh] = {dev, h, fn, s.rt->device(dev).symbols(mid)};
+    s.functions[fh] = {dev, h, fn, s.rt->device(dev).symbols(mid), mid};
     *hfunc = reinterpret_cast<CUfunction>(fh);
     return CUDA_SUCCESS;
   });
@@ -2337,6 +2361,18 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     auto it = s.functions.find(fh);
     if (it == s.functions.end()) return CUDA_ERROR_NOT_FOUND;
     const FuncRec& rec = it->second;
+    // Dynamic shared memory past what the function may ask for is CUDA_ERROR_INVALID_VALUE: 48 KiB less its
+    // static shared memory until cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) changes it (an RTX 3060
+    // refused 49153 bytes of a function that had not opted in, and 60001 of one that had asked for 60000).
+    {
+      const vgpu::DeviceProfile& dp = s.rt->device(rec.device).profile();
+      const int limit = vgpu_funcattr::max_dynamic_shared(func_state(s, rec), dp, rec.fn->static_shared_size);
+      if (sharedMemBytes > static_cast<unsigned>(limit))
+        throw vgpu::Error::make(vgpu::Err::LaunchConfig, "kernel '", rec.fn->name, "' asks for ", sharedMemBytes,
+                                " bytes of dynamic shared memory; it may use ", limit,
+                                " (cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) raises that, up to ",
+                                vgpu_funcattr::max_settable_dynamic_shared(dp, rec.fn->static_shared_size), ")");
+    }
     // Every stream is the synchronous default stream in this engine: legacy
     // (0/1), per-thread (2), and created stream handles all execute in order.
     (void)hStream;
@@ -2376,7 +2412,7 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
                                 p.limits.max_blocks_per_sm, " blocks/SM x ",
                                 p.limits.multiprocessors, " SMs = ", resident, ")");
     }
-    cfg.nonportable_cluster = rec.nonportable_cluster;
+    cfg.nonportable_cluster = func_state(s, rec).non_portable != 0;
     if (launches_graphs(*rec.fn)) return CUDA_ERROR_NOT_SUPPORTED;
     // On a stream that is capturing (a CUDA graph PyTorch is recording; the
     // capture itself is the runtime's) the launch belongs to the graph: it
@@ -2621,25 +2657,89 @@ static CUresult cuKernelGetName_impl(const char** name, void* kernel) {
   });
 }
 
-/* ---- function/kernel attributes ---- */
+/* ---- function/kernel attributes ----
+ * One set of rules for CUfunction and CUkernel (func_attrs.hpp, measured on an RTX 3060 under driver 596.36): the
+ * attributes 0 to 15 read back, 8 to 9 and 11 to 15 can be set, the others are CUDA_ERROR_INVALID_VALUE both
+ * ways. A CUkernel keeps its state per device and a CUfunction made from it shares it. */
 
 namespace {
-int func_attribute(const vgpu::ptx::EntryFn* fn, const vgpu::DeviceProfile& p, int attrib) {
+struct AttrTarget {
+  const vgpu::ptx::EntryFn* fn = nullptr;
+  int device = 0;
+  uint64_t mid = 0;
+  vgpu_funcattr::State* state = nullptr;
+};
+
+// The kernel or function a handle names. `device` is the device a CUkernel's attribute is asked on (-1: the
+// current one, which is how a CUkernel passed as a function is read). False: not a handle.
+bool attr_target(ShimState& s, uintptr_t h, int device, AttrTarget* out) {
+  if ((h & 7) == kTagKernel) {
+    auto k = s.kernels.find(h);
+    if (k == s.kernels.end()) return false;
+    const int dev = device >= 0 ? device : current_device(s);
+    out->device = dev;
+    out->mid = library_module_on(s, k->second.library, dev);
+    out->fn = s.rt->device(dev).get_function(out->mid, k->second.name);
+    out->state = &k->second.attrs[dev];
+    return true;
+  }
+  auto it = s.functions.find(h);
+  if (it == s.functions.end()) return false;
+  out->device = it->second.device;
+  out->mid = it->second.module_id;
+  out->fn = it->second.fn;
+  out->state = &func_state_mutable(s, it->second);
+  return true;
+}
+
+int func_attribute(ShimState& s, const AttrTarget& t, int attrib) {
+  const vgpu::DeviceProfile& p = s.rt->device(t.device).profile();
+  const vgpu::ptx::EntryFn& fn = *t.fn;
+  const vgpu_funcattr::State& st = *t.state;
+  const auto res = vgpu::exec::kernel_resources(fn, p, p.limits.max_threads_per_block, 0);
   switch (attrib) {
-    case 0: return static_cast<int>(p.limits.max_threads_per_block);  // MAX_THREADS_PER_BLOCK
-    case 1: return static_cast<int>(fn ? fn->static_shared_size : 0); // SHARED_SIZE_BYTES
-    case 2: return 0;                                                 // CONST_SIZE_BYTES
-    case 3: return static_cast<int>(fn ? fn->local_frame_size : 0);   // LOCAL_SIZE_BYTES
-    case 4:                                                           // NUM_REGS
-      return fn ? static_cast<int>(
-                      vgpu::exec::kernel_resources(*fn, p, p.limits.max_threads_per_block, 0)
-                          .usage.regs_per_thread)
-                : 0;
-    case 5: return 90;                                                // PTX_VERSION
-    case 6: return p.cc_major * 10 + p.cc_minor;                      // BINARY_VERSION
-    case 8: return static_cast<int>(p.limits.shared_mem_per_block_optin);
+    case vgpu_funcattr::kMaxThreads: return vgpu_funcattr::max_threads(fn, p, res.usage.regs_per_thread);
+    case vgpu_funcattr::kSharedSize: return static_cast<int>(fn.static_shared_size);
+    case vgpu_funcattr::kConstSize:
+      return static_cast<int>(s.rt->device(t.device).module_const_bytes(t.mid, fn.name));
+    case vgpu_funcattr::kLocalSize: return static_cast<int>(res.usage.local_bytes);
+    case vgpu_funcattr::kNumRegs: return static_cast<int>(res.usage.regs_per_thread);
+    case vgpu_funcattr::kPtxVersion: {
+      // The virtual architecture the module was built for (86 for .target sm_86), as the runtime reports it.
+      const int arch = s.rt->device(t.device).module_arch(t.mid);
+      return arch ? arch : p.cc_major * 10 + p.cc_minor;
+    }
+    case vgpu_funcattr::kBinaryVersion: return p.cc_major * 10 + p.cc_minor;
+    case vgpu_funcattr::kCacheModeCA: return 0;
+    case vgpu_funcattr::kMaxDynamicShared: return vgpu_funcattr::max_dynamic_shared(st, p, fn.static_shared_size);
+    case vgpu_funcattr::kCarveout: return st.carveout;
+    case vgpu_funcattr::kClusterMustBeSet: return fn.explicit_cluster ? 1 : 0;
+    case vgpu_funcattr::kClusterWidth: return vgpu_funcattr::cluster_dim(st, fn, 0);
+    case vgpu_funcattr::kClusterHeight: return vgpu_funcattr::cluster_dim(st, fn, 1);
+    case vgpu_funcattr::kClusterDepth: return vgpu_funcattr::cluster_dim(st, fn, 2);
+    case vgpu_funcattr::kNonPortable: return st.non_portable;
+    case vgpu_funcattr::kSchedulingPolicy: return st.scheduling_policy;
     default: return 0;
   }
+}
+
+CUresult get_attribute(ShimState& s, int* pi, int attrib, uintptr_t h, int device) {
+  if (!pi) return CUDA_ERROR_INVALID_VALUE;
+  AttrTarget t;
+  if (!attr_target(s, h, device, &t)) return CUDA_ERROR_INVALID_VALUE;
+  if (attrib < 0 || attrib > 15) return CUDA_ERROR_INVALID_VALUE;
+  *pi = func_attribute(s, t, attrib);
+  return CUDA_SUCCESS;
+}
+
+CUresult set_attribute(ShimState& s, int attrib, int value, uintptr_t h, int device) {
+  AttrTarget t;
+  if (!attr_target(s, h, device, &t)) return CUDA_ERROR_INVALID_HANDLE;
+  if (attrib < 0 || attrib > 15) return CUDA_ERROR_INVALID_VALUE;
+  return vgpu_funcattr::set(*t.state, s.rt->device(t.device).profile(), t.fn->static_shared_size, attrib, value,
+                            /*driver=*/true)
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 }  // namespace
 
@@ -2647,11 +2747,10 @@ static CUresult cuFuncGetAttribute_impl(int* pi, int attrib, CUfunction hfunc);
 VGPU_EXPORT CUresult cuFuncGetAttribute(int* pi, int attrib, CUfunction hfunc) { return traced("cuFuncGetAttribute", cuFuncGetAttribute_impl, pi, attrib, hfunc); }
 static CUresult cuFuncGetAttribute_impl(int* pi, int attrib, CUfunction hfunc) {
   return api("cuFuncGetAttribute", true, false, [&](ShimState& s) {
-    if (!pi) return CUDA_ERROR_INVALID_VALUE;
-    auto it = s.functions.find(reinterpret_cast<uintptr_t>(hfunc));
-    if (it == s.functions.end()) return CUDA_ERROR_INVALID_VALUE;
-    *pi = func_attribute(it->second.fn, s.rt->device(it->second.device).profile(), attrib);
-    return CUDA_SUCCESS;
+    // A CUkernel is not a CUfunction here: it is CUDA_ERROR_INVALID_HANDLE (an RTX 3060), and cuKernelGetAttribute
+    // is the call for it.
+    if ((reinterpret_cast<uintptr_t>(hfunc) & 7) == kTagKernel) return CUDA_ERROR_INVALID_HANDLE;
+    return get_attribute(s, pi, attrib, reinterpret_cast<uintptr_t>(hfunc), -1);
   });
 }
 
@@ -2661,32 +2760,30 @@ static CUresult cuKernelGetAttribute_impl(int* pi, int attrib, void* kernel, CUd
   return api("cuKernelGetAttribute", true, false, [&](ShimState& s) {
     if (!pi) return CUDA_ERROR_INVALID_VALUE;
     check_device(s, dev);
-    uintptr_t kh = check_handle(reinterpret_cast<uintptr_t>(kernel), kTagKernel, "kernel");
-    if (!s.kernels.count(kh)) return CUDA_ERROR_INVALID_VALUE;
-    *pi = func_attribute(nullptr, s.rt->device(dev).profile(), attrib);
-    return CUDA_SUCCESS;
+    const uintptr_t kh = reinterpret_cast<uintptr_t>(kernel);
+    if (!kh || (kh & 7) != kTagKernel) return CUDA_ERROR_INVALID_HANDLE;   // a null kernel, as measured
+    return get_attribute(s, pi, attrib, kh, dev);
   });
 }
 
 static CUresult cuFuncSetAttribute_impl(CUfunction hfunc, int attrib, int value);
 VGPU_EXPORT CUresult cuFuncSetAttribute(CUfunction hfunc, int attrib, int value) { return traced("cuFuncSetAttribute", cuFuncSetAttribute_impl, hfunc, attrib, value); }
 static CUresult cuFuncSetAttribute_impl(CUfunction hfunc, int attrib, int value) {
-  // The non-portable cluster size changes what may launch, and the dynamic
-  // shared memory ceiling what occupancy counts; the others are tuning knobs
-  // the interpreter has no use for.
-  if (attrib != 14 && attrib != 8) return CUDA_SUCCESS;   // NON_PORTABLE_CLUSTER_SIZE_ALLOWED, MAX_DYNAMIC_SHARED_SIZE_BYTES
   return api("cuFuncSetAttribute", true, false, [&](ShimState& s) {
-    auto it = s.functions.find(reinterpret_cast<uintptr_t>(hfunc));
-    // A CUkernel is accepted here too; its ceiling is not kept, as before.
-    if (it == s.functions.end()) return attrib == 8 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
-    if (attrib == 14) it->second.nonportable_cluster = value != 0;
-    else it->second.max_dynamic_shared = value;
-    return CUDA_SUCCESS;
+    if ((reinterpret_cast<uintptr_t>(hfunc) & 7) == kTagKernel) return CUDA_ERROR_INVALID_HANDLE;   // see cuFuncGetAttribute
+    return set_attribute(s, attrib, value, reinterpret_cast<uintptr_t>(hfunc), -1);
   });
 }
 static CUresult cuKernelSetAttribute_impl(int, int, void*, CUdevice);
-VGPU_EXPORT CUresult cuKernelSetAttribute(int a0, int a1, void* a2, CUdevice a3) { return traced("cuKernelSetAttribute", cuKernelSetAttribute_impl, a0, a1, a2, a3); }
-static CUresult cuKernelSetAttribute_impl(int, int, void*, CUdevice) { return CUDA_SUCCESS; }
+VGPU_EXPORT CUresult cuKernelSetAttribute(int attrib, int value, void* kernel, CUdevice dev) { return traced("cuKernelSetAttribute", cuKernelSetAttribute_impl, attrib, value, kernel, dev); }
+static CUresult cuKernelSetAttribute_impl(int attrib, int value, void* kernel, CUdevice dev) {
+  return api("cuKernelSetAttribute", true, false, [&](ShimState& s) {
+    check_device(s, dev);
+    const uintptr_t kh = reinterpret_cast<uintptr_t>(kernel);
+    if (!kh || (kh & 7) != kTagKernel) return CUDA_ERROR_INVALID_HANDLE;
+    return set_attribute(s, attrib, value, kh, dev);
+  });
+}
 static CUresult cuFuncSetCacheConfig_impl(CUfunction, int);
 VGPU_EXPORT CUresult cuFuncSetCacheConfig(CUfunction a0, int a1) { return traced("cuFuncSetCacheConfig", cuFuncSetCacheConfig_impl, a0, a1); }
 static CUresult cuFuncSetCacheConfig_impl(CUfunction, int) { return CUDA_SUCCESS; }
@@ -6083,10 +6180,7 @@ int blocks_per_sm(ShimState& s, const FuncRec& f, int block, size_t dyn) {
   const vgpu::DeviceProfile& p = s.rt->device(f.device).profile();
   if (static_cast<uint32_t>(block) > p.limits.max_threads_per_block) return 0;
   const uint64_t static_bytes = f.fn->static_shared_size;
-  const uint64_t limit = f.max_dynamic_shared >= 0
-                             ? static_bytes + static_cast<uint64_t>(f.max_dynamic_shared)
-                             : uint64_t{p.limits.shared_mem_per_block};
-  if (static_bytes + dyn > limit) return 0;
+  if (dyn > static_cast<uint64_t>(vgpu_funcattr::max_dynamic_shared(func_state(s, f), p, static_bytes))) return 0;
   return static_cast<int>(vgpu::exec::kernel_resources(*f.fn, p, static_cast<uint32_t>(block),
                                                        static_cast<uint32_t>(dyn))
                               .occupancy.blocks_per_sm);
@@ -6131,7 +6225,7 @@ CUresult cluster_occupancy_impl(const char* api_name, bool active, int* out, CUf
       per_sm = static_cast<uint32_t>(blocks_per_sm(s, *rec, static_cast<int>(threads), c->shared_bytes));
     }
     const vgpu::exec::ClusterAnswer a = vgpu::exec::cluster_occupancy(
-        p, active, has_dim, dim, rec->fn->req_cluster, rec->nonportable_cluster, per_sm);
+        p, active, has_dim, dim, rec->fn->req_cluster, func_state(s, *rec).non_portable != 0, per_sm);
     if (!quiet()) {
       static std::atomic<bool> said_missing{false}, said_derived{false};
       if (a.status == S::NotSupported && !said_missing.exchange(true))
@@ -6211,7 +6305,8 @@ static CUresult cuOccupancyMaxPotentialBlockSizeWithFlags_impl(int* minGridSize,
     const int per_sm = static_cast<int>(p.limits.max_threads_per_sm);
     const int granularity = static_cast<int>(p.warp_size);
     const int dev_max = static_cast<int>(p.limits.max_threads_per_block);
-    const int func_max = func_attribute(rec->fn, p, 0);   // MAX_THREADS_PER_BLOCK
+    const int func_max = vgpu_funcattr::max_threads(
+        *rec->fn, p, vgpu::exec::kernel_resources(*rec->fn, p, p.limits.max_threads_per_block, 0).usage.regs_per_thread);
     int limit = blockSizeLimit == 0 ? dev_max : blockSizeLimit;
     limit = std::min({limit, dev_max, func_max});
     const int aligned = (limit + granularity - 1) / granularity * granularity;
@@ -6810,6 +6905,8 @@ static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVe
 
 // The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
 #include "driver_sweep.inc"
+// And the ones only the CUDA 13.2 header declares.
+#include "driver_132.inc"
 
 /* ===================================================================== */
 /* Per-thread default stream                                             */
@@ -6902,6 +6999,12 @@ VGPU_PT_ALIAS(cuStreamGetId_ptsz, cuStreamGetId)
 VGPU_PT_ALIAS(cuStreamSetAttribute_ptsz, cuStreamSetAttribute)
 VGPU_PT_ALIAS(cuWaitExternalSemaphoresAsync_ptsz, cuWaitExternalSemaphoresAsync)
 VGPU_PT_ALIAS(cuMemcpy3DPeer_ptds, cuMemcpy3DPeer)
+VGPU_PT_ALIAS(cuLaunchHostFunc_v2_ptsz, cuLaunchHostFunc_v2)
+VGPU_PT_ALIAS(cuMemcpyWithAttributesAsync_ptsz, cuMemcpyWithAttributesAsync)
+VGPU_PT_ALIAS(cuMemcpy3DWithAttributesAsync_ptsz, cuMemcpy3DWithAttributesAsync)
+VGPU_PT_ALIAS(cuStreamGetDevResource_ptsz, cuStreamGetDevResource)
+VGPU_PT_ALIAS(cuStreamBeginCaptureToCig_ptsz, cuStreamBeginCaptureToCig)
+VGPU_PT_ALIAS(cuStreamEndCaptureToCig_ptsz, cuStreamEndCaptureToCig)
 #undef VGPU_PT_ALIAS
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop

@@ -2231,6 +2231,15 @@ if(TARGET vgpucublas)
         SKIP_REGULAR_EXPRESSION "^SKIP:"
         TIMEOUT 600)
     endforeach()
+    # The runtime functions only the 13.2 header declares: checked against their driver twins (SKIP unless the runtime shim
+    # was built with 13.2 headers).
+    add_test(NAME e2e_runtime_132
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_runtime_132.sh)
+    set_tests_properties(e2e_runtime_132 PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
     add_test(NAME e2e_p2p_managed
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_p2p_managed.sh)
     set_tests_properties(e2e_p2p_managed PROPERTIES
