@@ -11398,6 +11398,16 @@ VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_v2_ptsz, cudaWaitExternalSemaphore
 #if CUDART_VERSION >= 12030
 VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
 #endif
+// CUDA 12.2 to 12.9 spell the location-taking prefetch and the capture queries with edge data under _v2 / _v3
+// names (CUDA 13 gave them the plain names, aliased above), and a program built with the per-thread default stream
+// calls their _ptsz forms.
+#if CUDART_VERSION >= 12020 && CUDART_VERSION < 13000
+VGPU_PT_ALIAS(cudaMemPrefetchAsync_v2_ptsz, cudaMemPrefetchAsync_v2)
+#endif
+#if CUDART_VERSION >= 12030 && CUDART_VERSION < 13000
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_v3_ptsz, cudaStreamGetCaptureInfo_v3)
+VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_v2_ptsz, cudaStreamUpdateCaptureDependencies_v2)
+#endif
 #if CUDART_VERSION >= 12080
 VGPU_PT_ALIAS(cudaMemcpyBatchAsync_ptsz, cudaMemcpyBatchAsync)
 VGPU_PT_ALIAS(cudaMemcpy3DBatchAsync_ptsz, cudaMemcpy3DBatchAsync)

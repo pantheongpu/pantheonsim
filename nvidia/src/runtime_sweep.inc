@@ -214,7 +214,7 @@ VGPU_EXPORT cudaError_t cudaGetFuncBySymbol(cudaFunction_t* functionPtr, const v
 // CUDA 12.1 and later: the kernel handle (cudaKernel_t) of a registered kernel. The handle here is the stub's
 // address, which every runtime call that takes a kernel (launches, attributes, occupancy) accepts in place of
 // it, as the real handle is; the driver's cuKernel* calls do not know it.
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12010
 static cudaError_t cudaGetKernel_traced(cudaKernel_t* kernelPtr, const void* entryFuncAddr) {
   return guard("cudaGetKernel", [&](State& s) -> cudaError_t {
     if (!kernelPtr) return cudaErrorInvalidValue;
@@ -601,13 +601,13 @@ VGPU_EXPORT cudaError_t cudaGraphExecMemcpyNodeSetParamsFromSymbol(cudaGraphExec
   return traced_call("cudaGraphExecMemcpyNodeSetParamsFromSymbol", cudaGraphExecMemcpyNodeSetParamsFromSymbol_traced, hGraphExec, node, dst, symbol, count, offset, enum_value(kind));
 }
 
-// ---- one call to change any node (CUDA 12.4) --------------------------------------------------------------------------
+// ---- one call to change any node (CUDA 12.2) --------------------------------------------------------------------------
 // cudaGraphNodeSetParams changes a node of a graph and cudaGraphExecNodeSetParams the node of an instantiated
 // graph, by the union of every node type's parameters. A kernel, copy, fill, host and event node goes to the
 // call that node type already has; the rest -- allocation, free, empty, child graph, external semaphores,
 // conditional -- are cudaErrorNotSupported here (once said). A null node, null parameters and a type that does
 // not exist are cudaErrorInvalidValue, as on an RTX 3060.
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12020
 namespace {
 cudaError_t node_params_dispatch(const char* api, cudaGraphExec_t exec, cudaGraphNode_t node, cudaGraphNodeParams* np) {
   if (!node || !np) return cudaErrorInvalidValue;
@@ -651,7 +651,9 @@ cudaError_t node_params_dispatch(const char* api, cudaGraphExec_t exec, cudaGrap
                   : cudaGraphEventWaitNodeSetEvent(node, np->eventWait.event);
     case cudaGraphNodeTypeGraph: case cudaGraphNodeTypeEmpty: case cudaGraphNodeTypeExtSemaphoreSignal:
     case cudaGraphNodeTypeExtSemaphoreWait: case cudaGraphNodeTypeMemAlloc: case cudaGraphNodeTypeMemFree:
+#if CUDART_VERSION >= 12030
     case cudaGraphNodeTypeConditional:
+#endif
       return refuse(api, "only kernel, copy, fill, host and event nodes can be changed this way");
     default:
       return cudaErrorInvalidValue;
@@ -754,12 +756,12 @@ VGPU_EXPORT cudaError_t cudaLogsDumpToMemory(cudaLogIterator* iterator, char* bu
 }
 #endif
 
-// ---- notifications about the device (CUDA 12.8) -------------------------------------------------------------------------
+// ---- notifications about the device (CUDA 12.4) -------------------------------------------------------------------------
 // A callback told when the process goes over its device memory budget (cudaAsyncNotificationTypeOverBudget).
 // Registering gives a handle and unregistering takes it back; no notification is ever sent, because nothing here
 // is over a budget it does not have. A null callback, a null place for the handle and a device that does not exist
 // are errors (the card crashes on the second; cudaErrorInvalidValue here); a handle unregistered twice is too.
-#if CUDART_VERSION >= 12080
+#if CUDART_VERSION >= 12040
 namespace {
 std::mutex g_async_mu;
 std::set<uintptr_t> g_async_callbacks;

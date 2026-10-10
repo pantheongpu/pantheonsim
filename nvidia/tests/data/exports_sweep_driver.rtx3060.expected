@@ -103,6 +103,26 @@ cuMemcpy3DBatchAsync_v2 count 0 [13]: CUDA_ERROR_INVALID_VALUE
 cuMemcpy3DBatchAsync_v2 null [13]: CUDA_ERROR_INVALID_VALUE
 cuMemcpy3DBatchAsync_v2 flags [13]: CUDA_ERROR_INVALID_VALUE
 cuMemcpy3DBatchAsync_v2 zero extent [13]: CUDA_ERROR_INVALID_VALUE
+cuMemcpyBatchAsync count 0 [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpyBatchAsync null dsts [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpyBatchAsync null failIdx [12.8]: CUDA_SUCCESS
+cuMemcpyBatchAsync legacy stream [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=77
+cuMemcpyBatchAsync bad order [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpyBatchAsync size 0 [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=0
+cuMemcpyBatchAsync two copies [12.8]: CUDA_SUCCESS -- fail=-1 back=1,16
+cuMemcpy3DBatchAsync count 0 [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpy3DBatchAsync null list [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpy3DBatchAsync flags [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpy3DBatchAsync zero extent [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=0
+cuMemcpy3DBatchAsync legacy stream [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=77
+cuMemcpyBatchAsync second size 0 [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=1
+cuMemcpyBatchAsync attribute flags [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpyBatchAsync attribute index past count [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=-1
+cuMemcpy3DBatchAsync bad order [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=0
+cuMemcpy3DBatchAsync bad operand type [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=0
+cuMemcpy3DBatchAsync op flags [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=0
+cuMemcpy3DBatchAsync second zero extent [12.8]: CUDA_ERROR_INVALID_VALUE -- fail=1
+cuMemcpy3DBatchAsync copies [12.8]: CUDA_SUCCESS -- fail=-1 back=1,16
 cuArrayGetMemoryRequirements: CUDA_ERROR_INVALID_VALUE
 cuArrayGetMemoryRequirements null: CUDA_ERROR_INVALID_VALUE
 cuArrayGetMemoryRequirements null array: CUDA_ERROR_INVALID_HANDLE
@@ -246,4 +266,4 @@ cuTexRefGetMaxAnisotropy default: CUDA_SUCCESS -- 0
 cuTexRefSetBorderColor: CUDA_SUCCESS -- get CUDA_SUCCESS 1.00 0.50 0.25 0.00
 cuTexRefGetBorderColor default: CUDA_SUCCESS -- 0.00 0.00 0.00 0.00
 cuTexRefSetMaxAnisotropy null ref: CUDA_ERROR_INVALID_HANDLE
-PASS: 248 cases
+PASS: 268 cases
