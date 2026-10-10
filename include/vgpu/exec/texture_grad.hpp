@@ -18,14 +18,18 @@
 //     the exponent -- the table is not 256 log2: it is the card's (the same table for every size).
 //
 // 1D textures are 2D ones of height 1 (the gradients' second components are 0), as the hardware fetches them.
-// A gradient is scaled by the texture's size first; that is exact for a power of two and is all that is
-// reproduced (for other sizes the card's product is rounded in a way that no tried pipeline of truncations and
-// roundings reproduces: about one fetch in ten differs by one or two 256ths), so other sizes are refused by the
-// caller. Three components (3D, cube) are not reproduced either: the card's 3D length is max + 11/32 mid +
-// 1/4 min to within a part in 1000, but its rounding was not recovered.
+// A gradient is scaled by the texture's size first. For a power of two that is exact (an exponent change). For any
+// other size the card multiplies the gradient's 10-bit significand by the size's significand (cut to 10
+// significant bits) as a sum of shifted copies, each shifted-out bit dropped at 12 fractional bits, and converts
+// the sum back to a 10-bit float with "add 7, then shift" -- by 3 bits when the sum is below 2, by 4 bits when it
+// is 2 or more (see scale_by_size). Measured on an RTX 3060 against ~1.5 million fetches of 14 sizes from 3 to
+// 16383, single components first and then every pair: no differences.
+// Three components (3D, cube) are not reproduced: the card's 3D length is max + 11/32 mid + 1/4 min to within a
+// part in 1000, but its rounding was not recovered.
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -121,6 +125,24 @@ inline double component(float g) {
   if (std::isnan(g)) return 0;
   if (std::isinf(g)) return g > 0 ? 1e300 : -1e300;
   return static_cast<double>(g);
+}
+
+// A gradient component (a double; an infinite one already mapped to +-1e300) times a texture size in texels, as
+// the card's multiplier gives it: a 10-bit float (see the header comment).
+inline double scale_by_size(double g, uint32_t size) {
+  if (g == 0 || size == 0 || (size & (size - 1)) == 0) return g * static_cast<double>(size);
+  int e;
+  const double fr = std::frexp(std::fabs(g), &e);   // fr in [0.5, 1): the significand 512..1023 is its top 10 bits
+  e -= 1;
+  const uint32_t sig = static_cast<uint32_t>(fr * 1024.0);
+  const int wexp = static_cast<int>(std::bit_width(size)) - 1;
+  uint32_t acc = sig << 3;   // the size's leading one: the gradient itself, with 12 fractional bits
+  for (int i = 0; i < std::min(wexp, 9); ++i)   // the size's significand has 9 fractional bits at most
+    if ((size >> (wexp - 1 - i)) & 1u) acc += (sig << 3) >> (i + 1);
+  const int f = e + wexp;
+  const double v = acc < (1u << 13) ? std::ldexp(static_cast<double>((acc + 7) >> 3), f - 9)
+                                    : std::ldexp(static_cast<double>((acc + 7) >> 4), f - 8);
+  return std::copysign(v, g);
 }
 
 // 256 * log2 of a positive length, as the card's table gives it; the lowest int64 for a length of 0.

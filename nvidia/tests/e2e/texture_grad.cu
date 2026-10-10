@@ -7,8 +7,11 @@
 // results are hashed and compared with the card's, recorded in texture_grad_expected.inc (`texture_grad --print`
 // prints them). The program passes on a GPU as well (build it with the same nvcc and run it).
 //
+// Sizes that are not a power of two are covered too (the "npot" cases: the card multiplies the gradient by the
+// size in a way of its own, see exec/texture_grad.hpp).
+//
 // Not covered, and refused by the simulator by name: 3D and cube textures (ptxas builds those from quads of
-// plain fetches), sizes that are not a power of two, and maxAnisotropy above 1 (see exec/texture_grad.hpp).
+// plain fetches) and maxAnisotropy above 1.
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -219,6 +222,19 @@ int main(int argc, char** argv) {
       {"1d-layered-bias", K1DL, 512, 0, 3, 10, 1, 1, 0, 0.5f, 0.0f, 7.5f, 1, 12},
       {"2d-layered", K2DL, 512, 256, 3, 10, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 12},
       {"2d-layered-nearest", K2DL, 256, 256, 4, 9, 0, 0, 1, 0.0f, 0.0f, 20.0f, 1, 11},
+      // Sizes that are not a power of two.
+      {"2d-npot-100x60", K2D, 100, 60, 0, 7, 1, 1, 1, 0.0f, 0.0f, 20.0f, 0, 9},
+      {"2d-npot-1023x1025", K2D, 1023, 1025, 0, 11, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 13},
+      {"2d-npot-wrap-300x200", K2D, 300, 200, 0, 9, 1, 1, 0, 0.0f, 0.0f, 20.0f, 1, 11},
+      {"2d-npot-nearest-level-129x257", K2D, 129, 257, 0, 9, 0, 0, 1, 0.0f, 0.0f, 20.0f, 1, 11},
+      {"2d-npot-bias-clamps-513x259", K2D, 513, 259, 0, 10, 1, 1, 1, 0.5f, 1.25f, 6.5f, 1, 12},
+      {"2d-npot-3x5", K2D, 3, 5, 0, 3, 1, 1, 1, 0.0f, 0.0f, 20.0f, 0, 6},
+      {"2d-npot-4097x100", K2D, 4097, 100, 0, 13, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 15},
+      {"2d-npot-pow2-by-npot-512x100", K2D, 512, 100, 0, 10, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 12},
+      {"1d-npot-1000", K1D, 1000, 0, 0, 10, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 13},
+      {"1d-npot-7", K1D, 7, 0, 0, 3, 1, 1, 1, 0.0f, 0.0f, 20.0f, 0, 6},
+      {"1d-layered-npot-333", K1DL, 333, 0, 5, 9, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 12},
+      {"2d-layered-npot-130x70", K2DL, 130, 70, 3, 8, 1, 1, 1, 0.0f, 0.0f, 20.0f, 1, 11},
   };
   for (const Case& c : cases) {
     g_rng = 20261010u ^ (uint32_t)(c.w * 31 + c.h * 7 + c.layers);
@@ -267,6 +283,15 @@ int main(int argc, char** argv) {
       }
     report(std::string("special-2d/") + std::to_string(variant), run(K2D, t2, 0, in));
     report(std::string("special-1d/") + std::to_string(variant), run(K1D, t1, 0, in));
+    Tex t2n, t1n;
+    if (!make_texture(&t2n, 300, 190, 0, 9, 1, 1, 1, variant ? 3.0f : 0.0f, 0.0f, 20.0f) ||
+        !make_texture(&t1n, 1000, 0, 0, 10, 1, 1, 1, variant ? -2.0f : 0.0f, 0.0f, 20.0f)) {
+      std::printf("FAIL special npot: cannot make the textures\n");
+      ++g_fails;
+      continue;
+    }
+    report(std::string("special-2d-npot/") + std::to_string(variant), run(K2D, t2n, 0, in));
+    report(std::string("special-1d-npot/") + std::to_string(variant), run(K1D, t1n, 0, in));
   }
   if (g_print) return 0;
   std::printf("%d mismatches\n%s\n", g_fails, g_fails == 0 ? "PASS" : "FAIL");

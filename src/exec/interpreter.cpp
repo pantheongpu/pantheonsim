@@ -13475,17 +13475,12 @@ void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetc
              "tex.grad on a 3D or cube texture: the card's length of three gradient components (larger + 11/32 "
              "middle + 1/4 smallest, to a part in a thousand) was not reproduced bit for bit");
   const bool one_d = f.dims == 1;
-  auto pow2 = [](uint32_t n) { return n != 0 && (n & (n - 1)) == 0; };
-  if (!pow2(d.width) || (!one_d && !pow2(d.height)))
-    tex_fail(Err::Unsupported,
-             "tex.grad on a texture whose size is not a power of two: the card scales the gradients by the size "
-             "in a way that rounds differently from every pipeline tried (about one fetch in ten differs by 1-2 "
-             "256ths of a level); a power of two is exact");
-  const double w = d.width, h = one_d ? 1.0 : d.height;
-  // A gradient in texels of the base level; an infinite gradient (1e300 here) times a size stays finite.
-  auto c = [](uint32_t bits, double scale) {
-    return std::clamp(tex_grad::component(std::bit_cast<float>(bits)) * scale, -1e300, 1e300);
+  // A gradient in texels of the base level, as the card's multiplier gives it (exact for a power-of-two size);
+  // an infinite gradient (1e300 here) times a size stays finite.
+  auto c = [](uint32_t bits, uint32_t size) {
+    return std::clamp(tex_grad::scale_by_size(tex_grad::component(std::bit_cast<float>(bits)), size), -1e300, 1e300);
   };
+  const uint32_t w = d.width, h = one_d ? 1u : d.height;
   g.explicit_lod = true;
   g.lod = static_cast<double>(tex_grad::lod_q_2d(c(f.ddx[0], w), one_d ? 0.0 : c(f.ddx[1], h), c(f.ddy[0], w),
                                                  one_d ? 0.0 : c(f.ddy[1], h))) / 256.0;

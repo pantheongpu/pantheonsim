@@ -336,7 +336,7 @@ threshold, fractional biases and clamps -- in both engines against the card's ha
 
 The level of detail of a fetch with explicit gradients (`tex2DGrad` and friends) is derived from them by the
 texture unit's approximate-arithmetic units, and it is reproduced bit for bit for 1D and 2D textures, layered or
-not, of power-of-two size (the program `texture_grad` hashes 288,000 fetches of the card on both engines). It was
+not, of any size (the program `texture_grad` hashes the fetches of the card on both engines). It was
 found by reading the level of detail straight off the card: a mipmapped texture whose level k holds the constant
 k, filtered trilinearly, returns the LOD in 1/256ths of a level itself, and about 5 million such fetches (random
 and gridded gradients of every size, sign and relation) were fitted. What the card does is in
@@ -351,18 +351,26 @@ fetched at level 0 whatever the gradients. The level of a gradient is not `log2`
 of parallel gradients along one axis reads 1.375 times as long as either, the octagonal norm that earlier
 measurements ran into.
 
+A gradient is scaled by the texture's size (in texels of the base level) before any of that. For a power-of-two
+size that is an exponent change and exact. For any other size the card multiplies the gradient's 10-bit
+significand by the size's significand, which is cut to 10 significant bits (a size of 1025 scales as 1024), as a
+sum of copies of the gradient shifted right by one position for each set bit of the size's fraction, each copy
+losing the bits below the twelfth fractional bit, and turns the sum back into a 10-bit float by adding 7 and
+shifting right by 3 bits (4 when the sum is 2 or more, where the extra integer bit sits). That is
+`tex_grad::scale_by_size`; it was found by reading the level off the card for single components first (the rounding
+of the product shows as a step function of the gradient's significand that moves with the size's bits) and then
+for every pair, over 14 sizes from 3 to 16383, about 1.5 million fetches with no difference.
+
 ## Refused, and why
 
 Each with its own message, rather than a plausible wrong number:
 
 - **`tex.grad` beyond the cases that are exact.** 1D and 2D textures (and their layered forms; SASS `TXD`) of
-  power-of-two size derive their level of detail from the gradients exactly as the card does (below). Not
-  reproduced, and refused by name: 3D and cube textures (the card's length of three gradient components is
-  larger + 11/32 middle + 1/4 smallest to a part in a thousand, but its rounding was not recovered, and ptxas
-  builds those fetches from quads of `TEX.NDV` instructions in SASS); textures whose size is not a power of two
-  (the card's product of a gradient and the size is rounded in a way that none of the pipelines tried
-  reproduces: about one fetch in ten differs by one or two 256ths of a level); and a texture with
-  `maxAnisotropy` above 1 (the card then filters along the major axis of the gradients' ellipse).
+  any size derive their level of detail from the gradients exactly as the card does (above). Not reproduced, and
+  refused by name: 3D and cube textures (the card's length of three gradient components is larger + 11/32 middle
+  + 1/4 smallest to a part in a thousand, but its rounding was not recovered, and ptxas builds those fetches
+  from quads of `TEX.NDV` instructions in SASS); and a texture with `maxAnisotropy` above 1 (the card then
+  filters along the major axis of the gradients' ellipse).
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.
