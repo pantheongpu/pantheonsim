@@ -43,9 +43,10 @@ fatbin -> cubin (ELF) loader -> decoder (per-arch tables) -> SASS warp executor
   SASS runs on the same major at minor Y or newer; `sm_XYa` only on XY (an
   `sm_100a` cubin is no candidate on a B300, 10.3, or a Vera Rubin, 10.7, and
   the fatbin's plain PTX, when it has some, runs there instead). Whether a
-  cubin is `a` is not in `e_flags`: it is the record with attribute 9 in
-  `.nv.compat` (1 for `a`, 0 for plain and for `f`, measured on cubins CUDA
-  12.0's and 13.0's nvcc write).
+  cubin is `a` is not in `e_flags` from CUDA 13 on: it is the record with attribute 9 in
+  `.nv.compat` (1 for `a`, 0 for plain and for `f`). CUDA 12.8's ptxas writes no such
+  record and sets bit 3 of e_flags' byte after the architecture instead. Both are read
+  (measured on cubins CUDA 12.0's, 12.8's and 13.0's tools write).
 - **Loader**: kernel sections `.text.<name>`, per-kernel attributes from
   `.nv.info.<name>` (parameter layout, register count, shared memory, barrier
   count), constant sections, globals and relocations.

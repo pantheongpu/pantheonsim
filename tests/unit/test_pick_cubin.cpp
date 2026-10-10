@@ -29,12 +29,13 @@ void put(std::string& s, T v) {
   s.append(reinterpret_cast<const char*>(&v), sizeof v);
 }
 
-// A linked (ET_EXEC) CUDA 13 cubin for sm_<sm>, arch-specific or not.
-std::string make_cubin(uint32_t sm, bool arch_specific) {
+// A linked (ET_EXEC) CUDA 13 cubin for sm_<sm>, arch-specific or not. `via_eflags` marks "a" the way
+// CUDA 12.8's ptxas does -- e_flags bit 3, with no .nv.compat record -- instead of CUDA 13's record.
+std::string make_cubin(uint32_t sm, bool arch_specific, bool via_eflags = false) {
   const std::string names = std::string("\0.shstrtab\0.nv.compat\0", 21);   // .shstrtab at 1, .nv.compat at 11
   std::string compat;
-  const uint8_t recs[] = {0x02, 0x09, static_cast<uint8_t>(arch_specific ? 1 : 0), 0x00,   // the flag
-                          0x02, 0x02, 0x01, 0x00};                                          // another record
+  const uint8_t recs[] = {0x02, 0x09, static_cast<uint8_t>(arch_specific && !via_eflags ? 1 : 0), 0x00,   // the flag
+                          0x02, 0x02, 0x01, 0x00};                                                         // another record
   compat.assign(reinterpret_cast<const char*>(recs), sizeof recs);
 
   std::string out(64, '\0');
@@ -70,7 +71,7 @@ std::string make_cubin(uint32_t sm, bool arch_specific) {
   out[7] = 0x41;    // the CUDA OS ABI
   out[8] = 8;       // ABI version 8: e_flags' second byte names the architecture
   const uint16_t type = 2, machine = 190, shentsize = 64, shnum = 3, shstrndx = 1;
-  const uint32_t flags = 0x06000002u | (sm << 8);
+  const uint32_t flags = 0x06000002u | (sm << 8) | (arch_specific && via_eflags ? 0x8u : 0u);
   std::memcpy(&out[16], &type, 2);
   std::memcpy(&out[18], &machine, 2);
   std::memcpy(&out[0x28], &shoff, 8);
@@ -125,6 +126,33 @@ VTEST(the_flag_is_read_from_the_cubin) {
   std::string cut = make_cubin(100, true);
   cut.resize(cut.size() - 40);   // the section table is cut short
   VCHECK(!sass::cubin_arch_specific(reinterpret_cast<const uint8_t*>(cut.data()), cut.size()));
+}
+
+// CUDA 12.8's ptxas has no .nv.compat record for it: e_flags carries the bit (0x0a640006 is sm_100a,
+// 0x02640006 sm_100; with ELF ABI 7, 0x005a0d5a is sm_90a and 0x005a055a sm_90). The first CI run on
+// CUDA 12.8 took an sm_100a-only image on a B300 because only the record was read.
+VTEST(the_flag_is_in_e_flags_for_cuda_12_8_cubins) {
+  for (uint32_t sm : {90u, 100u, 120u}) {
+    const std::string a = make_cubin(sm, true, true), plain = make_cubin(sm, false, true);
+    VCHECK(sass::cubin_arch_specific(reinterpret_cast<const uint8_t*>(a.data()), a.size()));
+    VCHECK(!sass::cubin_arch_specific(reinterpret_cast<const uint8_t*>(plain.data()), plain.size()));
+    VCHECK(sass::parse_cubin(reinterpret_cast<const uint8_t*>(a.data()), a.size()).arch_specific);
+  }
+  std::string abi7 = make_cubin(90, false);
+  abi7[7] = 0x33;
+  abi7[8] = 7;
+  const uint32_t plain90 = 0x005a055a, a90 = 0x005a0d5a;
+  std::memcpy(&abi7[0x30], &plain90, 4);
+  VCHECK(!sass::cubin_arch_specific(reinterpret_cast<const uint8_t*>(abi7.data()), abi7.size()));
+  std::memcpy(&abi7[0x30], &a90, 4);
+  VCHECK(sass::cubin_arch_specific(reinterpret_cast<const uint8_t*>(abi7.data()), abi7.size()));
+  // and picked accordingly
+  unsetenv("VGPU_SASS");
+  FatbinImage c = cubin_image(100, true);
+  c.data = make_cubin(100, true, true);
+  const std::string fb = cuda::write_fatbin({c, ptx_image(100, "sm_100")});
+  VCHECK(picks(fb, cc_of("nvidia/b200"), c.data));
+  VCHECK(picks(fb, cc_of("nvidia/b300"), ""));
 }
 
 VTEST(an_sm_100a_cubin_is_no_candidate_on_a_b300_or_a_vera_rubin) {
