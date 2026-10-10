@@ -157,3 +157,42 @@ Nothing else was created (the key pair and security group are shared and stay).
   Everything was copied back in the first 15 minutes, and the instance was terminated after 17 minutes of use.
   Do the card-only extras (PROBE_DUMP of `lt` and `sparselt`, the native `sparselt_paths` with the wheel's
   `LD_LIBRARY_PATH`) before terminating: nothing can be re-asked of the card afterwards.
+
+## The Hopper session (p5.4xlarge, `r5-hopper`): exact steps for whoever gets capacity
+
+State on 2026-10-10 (round 5): only us-east-1 allows a p5.4xlarge (Running On-Demand P instances: 64 vCPUs; us-east-2 and
+us-west-2 still 8 vCPUs, their 16-vCPU requests `CASE_OPENED` since 2026-10-09T19:38Z; every other region 0). The agent polled
+p5.4xlarge in all six us-east-1 zones every 15 minutes from 03:08 UTC (see the ledger): InsufficientInstanceCapacity each time.
+Poll with the step-1 script above (type `p5.4xlarge` only, subnets as listed, tags `purpose=r5-hopper`); a launch that
+fails costs nothing, and each failed zone answers in about 6 seconds.
+
+When an instance runs (write the ledger line first):
+
+```bash
+# 1. ship the tree from the r5-hopper worktree and start the simulator build in the background (8-15 min)
+cd ~/.cache/pantheonsim-r5-hopper && git archive --prefix=vgpu/ HEAD | gzip > /tmp/vgpu-tree.tgz
+IP=<public ip>; SSHO="-i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+scp $SSHO /tmp/vgpu-tree.tgz ubuntu@$IP:/tmp/ && ssh $SSHO ubuntu@$IP 'tar xzf /tmp/vgpu-tree.tgz -C ~ && cd ~/vgpu && (nohup nvidia/tools/card-session-sim.sh build >/dev/null 2>&1 &) ; sleep 1'
+# 2. the card session (about 5-10 minutes; the simulator build runs beside it)
+ssh $SSHO ubuntu@$IP 'cd ~/vgpu && nohup nvidia/tools/card-session-remote.sh h100 ~/out > ~/session.log 2>&1 &'
+ssh $SSHO ubuntu@$IP 'tail -5 ~/out/summary.txt'      # until "done"
+# 3. copy the card's data back NOW (nothing can be re-asked of the card afterwards)
+mkdir -p /tmp/h100-out && scp -r $SSHO ubuntu@$IP:'~/out' /tmp/h100-out/ && scp $SSHO ubuntu@$IP:'~/vgpu/nvidia/tests/data/lowprec/*.h100.txt' nvidia/tests/data/lowprec/
+scp $SSHO ubuntu@$IP:'~/vgpu/nvidia/tests/data/cluster_occupancy.h100.expected' nvidia/tests/data/
+# 4. when the build is done (tail ~/vgpu/build.log shows "build finished rc=0"), the simulator's side, on the instance
+ssh $SSHO ubuntu@$IP 'cd ~/vgpu && nvidia/tools/card-session-sim.sh run h100 ~/out'
+scp -r $SSHO ubuntu@$IP:'~/out/sim-*' /tmp/h100-out/out/
+# 5. terminate and verify (section 4), then commit the data under nvidia/tests/data/card/h100/ and report the differences
+```
+
+What the session produces beyond the L40S one: `cluster-occupancy` (cudaOccupancyMaxActiveClusters / MaxPotentialClusterSize on
+the H100 -> `cluster_occupancy.h100.expected`, to compare with `docs/clusters.md`'s derived answers and the GPC layout of
+`nvidia/profiles/h100.yaml`), `cudnn-dnn_hopper_engines` (which of the RoPE, MoE-backward and band-matrix graphs have an engine
+on Hopper, with the card's outputs; if they do, turn the probe into `dnn_frontend_ops`-style checks), and the cuDNN frontend tests
+(`dnn_frontend_ops`, `dnn_attention`, `dnn_sdpa_mask`) run against NVIDIA's cuDNN on sm_90.
+
+Round 5 outcome (2026-10-10): 25 polls from 03:08 to 09:08 UTC, every zone of us-east-1, p5.4xlarge, none succeeded; no instance
+was created and nothing was spent. Pacing note for the next poller: a background `sleep` in this harness does not keep real time;
+wait with `until [ $(date +%s) -ge $T ]; do sleep 5; done` (foreground, timeout 600000) between polls. The two other-owner GPU
+instances in us-east-1 (`pw-stage2a-a`, `pw-stage2a-b`, no pantheonsim tags) were alive the whole time and count against the
+"two GPU instances at once" rule only if the rule is read across accounts' projects; they were not touched.

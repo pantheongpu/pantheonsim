@@ -144,6 +144,21 @@ if [[ "$cc" == 90 || "$cc" == 120 ]]; then
   [[ -n "$sparselt_lib" ]] && native sparselt_paths -I"$sparselt_inc" -L"$sparselt_lib" -lcusparseLt
 fi
 
+# ---- 3b. a Hopper's extras: the cluster occupancy answers (clusters.md) and the cuDNN graph operations an RTX 3060 had no
+# engine for. Outputs are kept in <out>/ and the cluster expected file is written for the simulator's profile to be diffed with.
+if [[ "$cc" == 90 ]]; then
+  step cluster-occupancy env CLUSTER_OCC_SLUG="$slug" CLUSTER_OCC_ARCH="$arch" "$e2e/run_cluster_occupancy.sh" --card --update
+  cp "$root/nvidia/tests/data/cluster_occupancy.$slug.expected" "$out/" 2>/dev/null
+  if [[ -n "$cudnn_lib" && -n "${fe:-}" ]]; then
+    for p in dnn_hopper_engines dnn_frontend_ops dnn_attention dnn_sdpa_mask; do
+      step "cudnn-$p" bash -c "nvcc -std=c++17 -cudart shared -arch=$arch -w -I'$cudnn_inc' -I'$fe' '$e2e/$p.cpp' -o /tmp/$p -L'$cudnn_lib' -lcudnn -ldl -lcuda \
+          && LD_LIBRARY_PATH='$cudnn_lib':\$LD_LIBRARY_PATH /tmp/$p"
+      cp "$out/cudnn-$p.log" "$out/native/cudnn-$p.txt" 2>/dev/null
+    done
+    PROBE_DUMP=1 LD_LIBRARY_PATH="$cudnn_lib:$LD_LIBRARY_PATH" /tmp/dnn_hopper_engines > "$out/native/cudnn-dnn_hopper_engines.dump.txt" 2>&1
+  fi
+fi
+
 # ---- 4. the characterization: profile values, conformance references, attributes, counters
 tools="$root/nvidia/tools"
 nvcc -std=c++14 -Wno-deprecated-gpu-targets "$tools/characterize.cu" -o /tmp/characterize \

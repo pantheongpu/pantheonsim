@@ -5,6 +5,10 @@
 #   run_cluster_occupancy.sh                   against the shims
 #   run_cluster_occupancy.sh --card            against NVIDIA's libraries on a real GPU
 #   run_cluster_occupancy.sh --card --update   rewrite the expected file from the card
+#   CLUSTER_OCC_SLUG=h100 CLUSTER_OCC_ARCH=sm_90a run_cluster_occupancy.sh --card --update
+#                                              the same on another card (a Hopper: its own expected file
+#                                              cluster_occupancy.h100.expected, built for its own SASS)
+#   run_cluster_occupancy.sh h100              the shim's h100 profile against that file (once a card wrote it)
 #
 # An RTX 3060 has no clusters; what it answers (measured) is
 # nvidia/tests/data/cluster_occupancy.rtx3060.expected, and the shim's rtx3060 profile must print the same.
@@ -18,14 +22,18 @@ shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/cluster_occupancy.cu"
 expected="$root/nvidia/tests/data/cluster_occupancy.rtx3060.expected"
 out="${TMPDIR:-/tmp}/vgpu-cluster-occupancy.$$"
-card=0; update=0
+card=0; update=0; slug_arg=""
+slug="${CLUSTER_OCC_SLUG:-rtx3060}"; arch="${CLUSTER_OCC_ARCH:-sm_86}"
 for a in "$@"; do
   case "$a" in
     --card) card=1 ;;
     --update) update=1 ;;
+    [a-z]*[0-9a-z]) slug_arg="$a" ;;
     *) echo "usage: $0 [--card [--update]]" >&2; exit 2 ;;
   esac
 done
+[[ -n "$slug_arg" ]] && slug="$slug_arg"
+expected="$root/nvidia/tests/data/cluster_occupancy.$slug.expected"
 command -v nvcc >/dev/null 2>&1 || { echo "SKIP: nvcc not found"; exit 0; }
 trap 'rm -f "$out" "$out".*' EXIT
 
@@ -36,7 +44,7 @@ if (( card )); then
     [[ -e "$d/libcudart.so" || -e "$d"/libcudart.so.[0-9]* ]] && libs="$d" && break
   done
   [[ -n "$libs" && -e "$libs/stubs/libcuda.so" ]] || { echo "SKIP: no CUDA libraries beside nvcc"; exit 0; }
-  nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets "$src" -o "$out" -lcuda -L"$libs/stubs" || { echo "FAIL: does not compile"; exit 1; }
+  nvcc -std=c++17 -cudart shared -arch="$arch" -Wno-deprecated-gpu-targets "$src" -o "$out" -lcuda -L"$libs/stubs" || { echo "FAIL: does not compile"; exit 1; }
   LD_LIBRARY_PATH="$libs" "$out" > "$out.txt" || { echo "FAIL: the program failed on the card"; exit 1; }
   if (( update )); then cp "$out.txt" "$expected"; echo "wrote $expected"; exit 0; fi
   diff -u "$expected" "$out.txt" && echo "cluster occupancy matches the card's" || { echo "FAIL: differs from what the card printed"; exit 1; }
@@ -60,8 +68,18 @@ run() {   # profile -> output file
 }
 
 run nvidia/rtx3060 "$out.3060"
-diff -u "$expected" "$out.3060" || { echo "FAIL: the rtx3060 profile does not print what the card printed"; exit 1; }
+diff -u "$root/nvidia/tests/data/cluster_occupancy.rtx3060.expected" "$out.3060" || { echo "FAIL: the rtx3060 profile does not print what the card printed"; exit 1; }
 echo "rtx3060: the card's answers"
+
+# Every other card that wrote an expected file (cluster_occupancy.<slug>.expected, from --card --update on that card):
+# the profile of the same name must print what the card printed. Hopper's file is the one that decides the GPC layout.
+for f in "$root"/nvidia/tests/data/cluster_occupancy.*.expected; do
+  s="${f##*/cluster_occupancy.}"; s="${s%.expected}"
+  [[ "$s" == rtx3060 ]] && continue
+  run "nvidia/$s" "$out.$s"
+  diff -u "$f" "$out.$s" || { echo "FAIL: the $s profile does not print what the card printed (see the diff: a GPC layout the card contradicts)"; exit 1; }
+  echo "$s: the card's answers"
+done
 
 # Parts with clusters: GPCs as the profile has them (SMs per GPC, derived spread of NVIDIA's published
 # counts), checked by the rules of vgpu/exec/cluster.hpp written out again.
