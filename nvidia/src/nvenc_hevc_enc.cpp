@@ -245,45 +245,74 @@ struct RefPlane {
   int at(int x, int y) const { return p[static_cast<size_t>(clip3(0, h - 1, y)) * stride + clip3(0, w - 1, x)]; }
 };
 
+// The (bw + 7) x (bh + 7) luma samples around the block, with the reference picture's edge samples repeated beyond it: one copy, and the filters then
+// need no bounds checks. patch[(j + 3) * stride + (i + 3)] is the sample under block position (i, j).
+struct Patch {
+  uint8_t d[(32 + 7) * (32 + 7)];
+  int stride = 0;
+};
+inline void fill_patch(const RefPlane& r, int X, int Y, int bw, int bh, int before, int after, Patch* p) {
+  const int pw = bw + before + after, ph = bh + before + after;
+  p->stride = pw;
+  const bool inside = X - before >= 0 && Y - before >= 0 && X + bw + after <= r.w && Y + bh + after <= r.h;
+  for (int j = 0; j < ph; ++j) {
+    uint8_t* dst = p->d + j * pw;
+    if (inside) {
+      std::memcpy(dst, r.p + static_cast<size_t>(Y - before + j) * r.stride + (X - before), static_cast<size_t>(pw));
+    } else {
+      const uint8_t* row = r.p + static_cast<size_t>(clip3(0, r.h - 1, Y - before + j)) * r.stride;
+      for (int i = 0; i < pw; ++i) dst[i] = row[clip3(0, r.w - 1, X - before + i)];
+    }
+  }
+}
+
 // predSamplesLX of the bw x bh luma block at (x, y) displaced by (mvx, mvy) quarter samples (8.5.3.3.3.1): 14-bit values, row stride bw
 void mc_luma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy, int16_t* out) {
   const int fx = mvx & 3, fy = mvy & 3;
   const int X = x + (mvx >> 2), Y = y + (mvy >> 2);
+  Patch p;
+  fill_patch(r, X, Y, bw, bh, 3, 4, &p);
+  const int st = p.stride;
+  const uint8_t* base = p.d + 3 * st + 3;   // the sample under (0, 0)
   if (!fx && !fy) {
     for (int j = 0; j < bh; ++j)
-      for (int i = 0; i < bw; ++i) out[j * bw + i] = static_cast<int16_t>(r.at(X + i, Y + j) << 6);
+      for (int i = 0; i < bw; ++i) out[j * bw + i] = static_cast<int16_t>(base[j * st + i] << 6);
     return;
   }
+  const int* cx = kLumaFilter[fx];
+  const int* cy = kLumaFilter[fy];
   if (!fy) {
-    for (int j = 0; j < bh; ++j)
+    for (int j = 0; j < bh; ++j) {
+      const uint8_t* row = base + j * st - 3;
       for (int i = 0; i < bw; ++i) {
-        int s = 0;
-        for (int k = 0; k < 8; ++k) s += kLumaFilter[fx][k] * r.at(X + i + k - 3, Y + j);
-        out[j * bw + i] = static_cast<int16_t>(s);
+        const uint8_t* s = row + i;
+        out[j * bw + i] = static_cast<int16_t>(cx[0] * s[0] + cx[1] * s[1] + cx[2] * s[2] + cx[3] * s[3] + cx[4] * s[4] + cx[5] * s[5] + cx[6] * s[6] + cx[7] * s[7]);
       }
+    }
     return;
   }
   if (!fx) {
-    for (int j = 0; j < bh; ++j)
+    for (int j = 0; j < bh; ++j) {
+      const uint8_t* col = base + (j - 3) * st;
       for (int i = 0; i < bw; ++i) {
-        int s = 0;
-        for (int k = 0; k < 8; ++k) s += kLumaFilter[fy][k] * r.at(X + i, Y + j + k - 3);
-        out[j * bw + i] = static_cast<int16_t>(s);
+        const uint8_t* s = col + i;
+        out[j * bw + i] = static_cast<int16_t>(cy[0] * s[0] + cy[1] * s[st] + cy[2] * s[2 * st] + cy[3] * s[3 * st] + cy[4] * s[4 * st] + cy[5] * s[5 * st] + cy[6] * s[6 * st] + cy[7] * s[7 * st]);
       }
+    }
     return;
   }
   int tmp[(32 + 7) * 32];
-  for (int j = 0; j < bh + 7; ++j)
+  for (int j = 0; j < bh + 7; ++j) {
+    const uint8_t* row = base + (j - 3) * st - 3;
     for (int i = 0; i < bw; ++i) {
-      int s = 0;
-      for (int k = 0; k < 8; ++k) s += kLumaFilter[fx][k] * r.at(X + i + k - 3, Y + j - 3);
-      tmp[j * bw + i] = s;
+      const uint8_t* s = row + i;
+      tmp[j * bw + i] = cx[0] * s[0] + cx[1] * s[1] + cx[2] * s[2] + cx[3] * s[3] + cx[4] * s[4] + cx[5] * s[5] + cx[6] * s[6] + cx[7] * s[7];
     }
+  }
   for (int j = 0; j < bh; ++j)
     for (int i = 0; i < bw; ++i) {
-      int s = 0;
-      for (int k = 0; k < 8; ++k) s += kLumaFilter[fy][k] * tmp[(j + k) * bw + i];
-      out[j * bw + i] = static_cast<int16_t>(s >> 6);
+      const int* t = tmp + j * bw + i;
+      out[j * bw + i] = static_cast<int16_t>((cy[0] * t[0] + cy[1] * t[bw] + cy[2] * t[2 * bw] + cy[3] * t[3 * bw] + cy[4] * t[4 * bw] + cy[5] * t[5 * bw] + cy[6] * t[6 * bw] + cy[7] * t[7 * bw]) >> 6);
     }
 }
 
@@ -291,41 +320,43 @@ void mc_luma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy, 
 void mc_chroma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy, int16_t* out) {
   const int fx = mvx & 7, fy = mvy & 7;
   const int X = x + (mvx >> 3), Y = y + (mvy >> 3);
+  Patch p;
+  fill_patch(r, X, Y, bw, bh, 1, 2, &p);
+  const int st = p.stride;
+  const uint8_t* base = p.d + st + 1;
   if (!fx && !fy) {
     for (int j = 0; j < bh; ++j)
-      for (int i = 0; i < bw; ++i) out[j * bw + i] = static_cast<int16_t>(r.at(X + i, Y + j) << 6);
+      for (int i = 0; i < bw; ++i) out[j * bw + i] = static_cast<int16_t>(base[j * st + i] << 6);
     return;
   }
+  const int* cx = kChromaFilter[fx];
+  const int* cy = kChromaFilter[fy];
   if (!fy) {
     for (int j = 0; j < bh; ++j)
       for (int i = 0; i < bw; ++i) {
-        int s = 0;
-        for (int k = 0; k < 4; ++k) s += kChromaFilter[fx][k] * r.at(X + i + k - 1, Y + j);
-        out[j * bw + i] = static_cast<int16_t>(s);
+        const uint8_t* s = base + j * st + i - 1;
+        out[j * bw + i] = static_cast<int16_t>(cx[0] * s[0] + cx[1] * s[1] + cx[2] * s[2] + cx[3] * s[3]);
       }
     return;
   }
   if (!fx) {
     for (int j = 0; j < bh; ++j)
       for (int i = 0; i < bw; ++i) {
-        int s = 0;
-        for (int k = 0; k < 4; ++k) s += kChromaFilter[fy][k] * r.at(X + i, Y + j + k - 1);
-        out[j * bw + i] = static_cast<int16_t>(s);
+        const uint8_t* s = base + (j - 1) * st + i;
+        out[j * bw + i] = static_cast<int16_t>(cy[0] * s[0] + cy[1] * s[st] + cy[2] * s[2 * st] + cy[3] * s[3 * st]);
       }
     return;
   }
   int tmp[(16 + 3) * 16];
   for (int j = 0; j < bh + 3; ++j)
     for (int i = 0; i < bw; ++i) {
-      int s = 0;
-      for (int k = 0; k < 4; ++k) s += kChromaFilter[fx][k] * r.at(X + i + k - 1, Y + j - 1);
-      tmp[j * bw + i] = s;
+      const uint8_t* s = base + (j - 1) * st + i - 1;
+      tmp[j * bw + i] = cx[0] * s[0] + cx[1] * s[1] + cx[2] * s[2] + cx[3] * s[3];
     }
   for (int j = 0; j < bh; ++j)
     for (int i = 0; i < bw; ++i) {
-      int s = 0;
-      for (int k = 0; k < 4; ++k) s += kChromaFilter[fy][k] * tmp[(j + k) * bw + i];
-      out[j * bw + i] = static_cast<int16_t>(s >> 6);
+      const int* t = tmp + j * bw + i;
+      out[j * bw + i] = static_cast<int16_t>((cy[0] * t[0] + cy[1] * t[bw] + cy[2] * t[2 * bw] + cy[3] * t[3 * bw]) >> 6);
     }
 }
 
@@ -819,17 +850,21 @@ struct HevcEncoder::Impl {
     ctbs_y = (H + kCtb - 1) / kCtb;
     ux = W / 4;
     uy = H / 4;
+    zs.resize(static_cast<size_t>(ux) * uy);
+    for (int y = 0; y < uy; ++y)
+      for (int x = 0; x < ux; ++x) {
+        int m = 0;
+        for (int b = 0; b < 3; ++b) m |= (((x >> b) & 1) << (2 * b)) | (((y >> b) & 1) << (2 * b + 1));
+        zs[static_cast<size_t>(y) * ux + x] = ((y >> 3) * ctbs_x + (x >> 3)) * 64 + m;
+      }
     ry.assign(static_cast<size_t>(W) * H, 0);
     ru.assign(static_cast<size_t>(cW) * cH, 128);
     rv = ru;
   }
   // ---- geometry ------------------------------------------------------------------------------------------------------------------
 
-  int zs_of(int ux_, int uy_) const {
-    int m = 0;
-    for (int b = 0; b < 3; ++b) m |= (((ux_ >> b) & 1) << (2 * b)) | (((uy_ >> b) & 1) << (2 * b + 1));
-    return ((uy_ >> 3) * ctbs_x + (ux_ >> 3)) * 64 + m;
-  }
+  int zs_of(int ux_, int uy_) const { return zs[static_cast<size_t>(uy_) * ux + ux_]; }
+  std::vector<int> zs;   // MinTbAddrZs of every 4x4 unit (6.5.2)
   // 6.4.1: is the luma sample (nx, ny) available to the block at (cx, cy)?
   bool avail(int cx, int cy, int nx, int ny) const {
     if (nx < 0 || ny < 0 || nx >= W || ny >= H) return false;
@@ -1292,6 +1327,20 @@ struct HevcEncoder::Impl {
   // SAD of the source block against a luma prediction displaced by (vx, vy) from reference (l, ri); `bi` is another prediction to average with (or null)
   int sad_pu(int l, int ri, int px, int py, int bw, int bh, int vx, int vy, const int16_t* other) const {
     const RefPlane r = ref_plane(l, ri, 0);
+    if (!other && !(vx & 3) && !(vy & 3)) {   // whole-sample vector: the SAD against the reference itself
+      const int X = px + (vx >> 2), Y = py + (vy >> 2);
+      int sad = 0;
+      for (int j = 0; j < bh; ++j) {
+        const uint8_t* s = &sy[static_cast<size_t>(py + j) * W + px];
+        if (X >= 0 && X + bw <= r.w && Y + j >= 0 && Y + j < r.h) {
+          const uint8_t* q = r.p + static_cast<size_t>(Y + j) * r.stride + X;
+          for (int i = 0; i < bw; ++i) sad += std::abs(s[i] - q[i]);
+        } else {
+          for (int i = 0; i < bw; ++i) sad += std::abs(s[i] - r.at(X + i, Y + j));
+        }
+      }
+      return sad;
+    }
     int16_t p[32 * 32];
     mc_luma(r, px, py, bw, bh, vx, vy, p);
     int sad = 0;
@@ -1506,7 +1555,10 @@ struct HevcEncoder::Impl {
       mpm_list(px, py, cand);
       double best = 1e30;
       int best_mode = 1;
-      for (int mode = 0; mode < 35; ++mode) {
+      bool done[35] = {};
+      auto try_mode = [&](int mode) {
+        if (done[mode]) return;
+        done[mode] = true;
         filter_refs(refs, 2, mode, f);
         uint8_t pred[16];
         predict_from_refs(f, 2, mode, 0, pred);
@@ -1519,6 +1571,17 @@ struct HevcEncoder::Impl {
           best = cost;
           best_mode = mode;
         }
+      };
+      try_mode(0);
+      try_mode(1);
+      for (int m = 0; m < 3; ++m) try_mode(cand[m]);
+      for (int m = 2; m < 35; m += 4) try_mode(m);
+      const int coarse = best_mode;
+      if (coarse >= 2) {
+        if (coarse - 1 >= 2) try_mode(coarse - 1);
+        if (coarse - 2 >= 2) try_mode(coarse - 2);
+        if (coarse + 1 <= 34) try_mode(coarse + 1);
+        if (coarse + 2 <= 34) try_mode(coarse + 2);
       }
       code_mode(cu, pu, best_mode);
       set_ipm(px, py, 4, best_mode);
@@ -1560,7 +1623,7 @@ struct HevcEncoder::Impl {
 
   // The modes worth a full evaluation for an N x N coding unit: SATD ranking of the modes (all of them for 8x8, a coarse-to-fine
   // search for larger units), the best three.
-  int rank_modes(int x, int y, int log2, int out[3], double* best_cost = nullptr) {
+  int rank_modes(int x, int y, int log2, int out[3], double* costs = nullptr) {
     const int N = 1 << log2;
     int refs[129], f[129];
     build_refs(0, x, y, N, refs);
@@ -1591,7 +1654,7 @@ struct HevcEncoder::Impl {
       sc[nsc++] = {cost + lam_sad * (in_mpm ? 2 : 6), mode};
     };
     auto order = [&] { std::sort(sc, sc + nsc, [](const Sc& a, const Sc& b) { return a.cost != b.cost ? a.cost < b.cost : a.mode < b.mode; }); };
-    if (N <= 8) {
+    if (N <= 4) {
       for (int m = 0; m < 35; ++m) eval(m);
     } else {
       eval(0);
@@ -1610,8 +1673,12 @@ struct HevcEncoder::Impl {
     }
     order();
     for (int i = 0; i < 3; ++i) out[i] = sc[std::min(i, nsc - 1)].mode;
-    if (best_cost) *best_cost = sc[0].cost;
-    return std::min(3, nsc);
+    if (costs)
+      for (int i = 0; i < 3; ++i) costs[i] = sc[std::min(i, nsc - 1)].cost;
+    // the modes whose SATD cost is within 15% of the best are worth a full evaluation
+    int keep = 1;
+    while (keep < std::min(3, nsc) && sc[keep].cost <= 1.15 * sc[0].cost) ++keep;
+    return keep;
   }
 
   // Copies a coding unit's reconstruction into the picture and records its modes, motion and depth.
@@ -1861,11 +1928,11 @@ struct HevcEncoder::Impl {
     // intra coding: always in I slices; in P and B slices when the inter prediction is not clearly better by the SATD measure
     bool try_intra = true;
     int modes[3];
-    double intra_satd = 0;
+    double mode_costs[3] = {0, 0, 0};
     int nm = 0;
     if (sl.type != 2 && inter_done) {
-      nm = rank_modes(x, y, log2, modes, &intra_satd);
-      try_intra = intra_satd < 1.25 * inter_satd;
+      nm = rank_modes(x, y, log2, modes, mode_costs);
+      try_intra = mode_costs[0] < 1.25 * inter_satd;
     } else {
       nm = rank_modes(x, y, log2, modes);
     }
