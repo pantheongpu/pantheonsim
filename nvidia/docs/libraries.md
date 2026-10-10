@@ -372,13 +372,70 @@ mode, `make_paff.cpp`; the streams are equal to ffmpeg's decode and to the card'
 pair, its picture order counts, its display -- are reproduced). Not decoded:
 flexible macroblock ordering, redundant pictures, SP/SI slices, data partitioning. Pictures that cannot be decoded report
 `CUDA_ERROR_INVALID_IMAGE` from `cuvidDecodePicture`; damaged streams never crash
-(`test_h264_decode` flips bits in streams under ASan and UBSan). Every other codec
+(`test_h264_decode` flips bits in streams under ASan and UBSan). HEVC and MPEG-2 are decoded too
+(below). Every other codec
 reports `bIsSupported = 0` and `cuvidCreateDecoder` / `cuvidCreateVideoParser`
-answer `CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/2/4, VC-1, HEVC, VP8, VP9
+answer `CUDA_ERROR_NOT_SUPPORTED`: the card has MPEG-1/4, VC-1, VP8, VP9
 and AV1 engines, and a software decoder for them is a large separate project --
 none is here, so an application falls back to its CPU decoder instead of
 receiving a wrong picture. `cuvidCreateVideoSource` (files and URLs) needs a
 demuxer and is refused the same way.
+
+**HEVC** is decoded by a decoder written from ITU-T H.265 (v4, 12/2016) alone
+(`nvidia/src/hevc_decode.cpp`, `hevc_dec_slice.inc`, `hevc_syntax.cpp`; CABAC, intra prediction in
+35 modes, merge and AMVP with temporal candidates, the transforms, transform skip,
+scaling lists, PCM, lossless coding, tiles, wavefronts, dependent slice segments,
+the deblocking filter and sample adaptive offset), driven by `CUVIDHEVCPICPARAMS` and the
+slice NAL units as the hardware is, behind a video parser (`hevc_parser.cpp`) that
+reproduces the card's callbacks: the sequence format, the surface count
+(`sps_max_dec_pic_buffering + 4`), the picture indices, the reference picture
+set as slots of a picture table, display order by output bumping, the two-stage
+treatment of a picture (the reference picture set at its first slice, the
+decode and the bumping at the next picture's), display delay and timestamps. Main, Main 10 and
+the 4:2:0 range extension tools (12 bits, transform-skip extensions, implicit and explicit
+residual DPCM, persistent Rice adaptation, 32x32 transform skip) decode to the checksums of the
+card's frames: 91 streams (`nvidia/tests/data/hevc`: 44 from x265 and the card's NVENC, 47
+from HM, the reference encoder, for tiles, dependent slice segments, PCM, custom scaling lists,
+`cu_qp_delta`, chroma QP offsets, filtering across slices and tiles switched off, parallel merge
+level, weighted prediction, several temporal layers and intra periods), 128 parser-driving runs and
+27 438 lines in the card's transcript (`nvcuvid_hevc.rtx3060.txt`; `run_nvcuvid_hevc.sh --card`
+runs the same program against the driver). Every HM stream's frames equal HM's own
+reconstruction and FFmpeg's decode as well. Three HM streams are checked against HM's
+reconstruction only (`hm_spec_only.txt`): the card does not decode `cu_chroma_qp_offset` as specified
+(its P pictures come out wrong), gets some pictures of a hierarchical field-coded stream
+wrong, and reports a frame rate for a 27 MHz time scale that this library does not derive the same way. The
+card's capabilities are reproduced for 4:2:0 at 8, 10 and 12 bits (129 to 8192 samples); 4:4:4 is
+decoded by the card and reported unsupported here, and 4:2:2, monochrome, extended precision and
+CABAC bypass alignment are refused as the card refuses them. Where the parser is only approximate: a
+`ulMaxDisplayDelay` of 2 or more on a stream with B pictures hands the pictures out in the card's order
+but a few of them one decode callback earlier, a VUI time scale above 250001 is scaled down by powers
+of two where the card also divides by other common factors, and the sequence callback reports no bit
+rate (as the card does).
+
+**MPEG-2** (H.262) is decoded by `nvidia/src/mpeg2_decode.cpp`, written from Rec. ITU-T H.262
+(02/2000) clauses 6 and 7 and Annex B: the variable-length code tables are generated from the
+Recommendation's tables (`nvidia/tools/gen_mpeg2_tables.py`), with the inverse quantisation and mismatch
+control, both scans, both coefficient tables, the four DC precisions, downloaded matrices, both quantiser
+scale types, frame and field pictures, frame, field, 16x8 and dual prime motion compensation, concealment
+motion vectors, field and frame DCTs, skipped macroblocks and multiple slices per row, and a parser
+(`mpeg2_parser.cpp`) that reproduces what the card's does: sequence format, picture parameters
+(reference indices, `second_field`, `PicWidthInMbs` as the card reports it, the slice offsets), the surface count,
+picture indices, display order (a reference picture is shown when the next is decoded), the repeat counts of pulldown
+flags, the pictures a decoder starting in the middle of a stream has to drop, the handling of damaged
+and repeated headers, and timestamps. MPEG-2 leaves the inverse DCT to the decoder (Annex A bounds its error only), and the card's is
+not bit-reproducible: this decoder's is an exact one with the mismatch control, so its frames differ from the card's by a
+level in a few percent of the samples of an intra picture and the differences carry into the pictures predicted from
+it. The tests therefore compare each frame with the card's pixels (`nvidia/tests/data/nvdec/mpeg2`, 48 streams)
+within 6 levels in at most a quarter of the samples, while every callback
+of 100 streams in 155 runs (16 648 lines, `nvcuvid_mpeg2.rtx3060.txt`) is the card's exactly: frame pictures
+(I, P and B), field pictures with second fields, dual prime, pulldown, sequence changes, damaged and truncated streams.
+Not reproduced: MPEG-1 (the card decodes it and reports it as codec MPEG-1; here it is not decoded and its
+capabilities are reported unsupported), 4:2:2 and 4:4:4 (refused as on the card), the scalable extensions,
+display delays of 3 or more on streams with B pictures (the same pictures in the same order, a few of them one callback
+later on the card), a display delay of 2 on a stream with field pictures (some pictures one callback early or late),
+and a picture that is not a multiple of 16 samples wide, where the card's last macroblock column holds garbage
+the Recommendation does not define. `test_mpeg2_decode` truncates, flips bits in
+and fills with random bytes the streams (it runs in the ASan, UBSan and TSan jobs).
 
 ## NVSHMEM: one GPU per process, every heap shared
 
