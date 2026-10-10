@@ -325,13 +325,13 @@ static const char* via_name(Via v) { return v == Via::Threads ? "threads" : v ==
 static void put_vec(std::FILE* f, const std::vector<float>& v) {
   const uint64_t n = v.size();
   std::fwrite(&n, 8, 1, f);
-  std::fwrite(v.data(), 4, v.size(), f);
+  if (!v.empty()) std::fwrite(v.data(), 4, v.size(), f);   // data() of an empty vector may be null
 }
 static bool get_vec(std::FILE* f, std::vector<float>* v) {
   uint64_t n = 0;
   if (std::fread(&n, 8, 1, f) != 1 || n > (1u << 24)) return false;
   v->resize(n);
-  return std::fread(v->data(), 4, n, f) == n;
+  return n == 0 || std::fread(v->data(), 4, n, f) == n;
 }
 static void save(const Out& o, const std::string& path) {
   std::FILE* f = std::fopen((path + ".tmp").c_str(), "wb");
