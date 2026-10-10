@@ -3,13 +3,16 @@
 // NVDEC is fixed-function decode silicon behind the driver; applications reach
 // it through libnvcuvid's cuvid* entry points (the video parser and the
 // decoder), usually via NVIDIA's own NvDecoder wrapper or FFmpeg's *_cuvid
-// decoders. This library answers that API with software decoders -- for two
+// decoders. This library answers that API with software decoders -- for four
 // codecs. Motion JPEG is a sequence of independent JPEG pictures, and a JPEG
 // decoder is already here (the nvJPEG library's); H.264 is decoded by
 // h264_decode.cpp (Baseline, Main and High profile, 4:2:0, 8 bits, frames, field
 // pictures and macroblock-adaptive frame/field coding) behind a parser that
-// follows NVIDIA's (h264_parser.cpp). Pictures are decoded on the host and the NV12
-// surfaces the application maps are written to device memory.
+// follows NVIDIA's (h264_parser.cpp); HEVC by hevc_decode.cpp (Main, Main 10 and
+// the 4:2:0 range extension tools, 8 to 12 bits) behind hevc_parser.cpp; MPEG-2 by
+// mpeg2_decode.cpp (Main profile 4:2:0, frame and field pictures) behind
+// mpeg2_parser.cpp. Pictures are decoded on the host and the NV12 (P016 for HEVC above
+// 8 bits) surfaces the application maps are written to device memory.
 //
 // The subset, stated plainly:
 //   decoded   Motion JPEG / JPEG pictures that the nvJPEG library decodes and the
@@ -23,10 +26,17 @@
 //             CAVLC and CABAC, as the card's NVDEC does (it refuses 4:2:2, 4:4:4,
 //             monochrome and more than 8 bits at cuvidCreateDecoder, and so does
 //             this); not decoded: slice groups (FMO) and SP / SI slices.
+//   decoded   HEVC Main / Main 10 and the range extension tools at 4:2:0 (8, 10 and
+//             12 bits), bit-exact with the card; not decoded: 4:4:4, 4:2:2 and 4:0:0,
+//             extended precision, CABAC bypass alignment, screen content, 3D and
+//             multilayer extensions (the card refuses most of them too).
+//   decoded   MPEG-2 Main profile 4:2:0 frame and field pictures, within the inverse
+//             DCT's tolerance of the card's pixels; not decoded: MPEG-1 streams (the
+//             card decodes them), 4:2:2 / 4:4:4 and the scalable extensions.
 //   not here  every other codec: cuvidGetDecoderCaps reports bIsSupported = 0,
 //             and cuvidCreateDecoder / cuvidCreateVideoParser answer
-//             CUDA_ERROR_NOT_SUPPORTED (the card accepts MPEG-1/2/4, VC-1,
-//             HEVC, VP8, VP9 and AV1; a software decoder for them is not part of
+//             CUDA_ERROR_NOT_SUPPORTED (the card accepts MPEG-1/4, VC-1,
+//             VP8, VP9 and AV1; a software decoder for them is not part of
 //             this simulator, and an application is better off falling back to
 //             its CPU decoder than receiving a wrong picture). Video sources
 //             (files, URLs) need a demuxer and answer CUDA_ERROR_NOT_SUPPORTED.
