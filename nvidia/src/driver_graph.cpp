@@ -1259,3 +1259,37 @@ VGPU_EXPORT CUresult cuGraphAddExternalSemaphoresSignalNode(CUgraphNode*, CUgrap
 VGPU_EXPORT CUresult cuGraphAddExternalSemaphoresWaitNode(CUgraphNode*, CUgraph, const CUgraphNode*, size_t, const void*) {
   return kNotSupported;
 }
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with CUDA_API_PER_THREAD_DEFAULT_STREAM defined)
+// calls the driver's functions under the names cuMemcpyHtoD_v2_ptds, cuLaunchKernel_ptsz and the rest, where
+// stream 0 is the calling thread's own default stream rather than the legacy one. Every stream here is
+// synchronous, so the two defaults behave alike and each name is the plain function under another symbol
+// (the runtime does the same: runtime_api.cpp).
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cuGraphInstantiateWithParams_ptsz, cuGraphInstantiateWithParams)
+VGPU_PT_ALIAS(cuGraphLaunch_ptsz, cuGraphLaunch)
+VGPU_PT_ALIAS(cuGraphUpload_ptsz, cuGraphUpload)
+VGPU_PT_ALIAS(cuStreamBatchMemOp_v2_ptsz, cuStreamBatchMemOp_v2)
+VGPU_PT_ALIAS(cuStreamBeginCaptureToGraph_ptsz, cuStreamBeginCaptureToGraph)
+VGPU_PT_ALIAS(cuStreamBeginCapture_v2_ptsz, cuStreamBeginCapture_v2)
+VGPU_PT_ALIAS(cuStreamEndCapture_ptsz, cuStreamEndCapture)
+VGPU_PT_ALIAS(cuStreamGetCaptureInfo_v3_ptsz, cuStreamGetCaptureInfo_v3)
+VGPU_PT_ALIAS(cuStreamUpdateCaptureDependencies_v2_ptsz, cuStreamUpdateCaptureDependencies_v2)
+VGPU_PT_ALIAS(cuStreamWaitValue32_v2_ptsz, cuStreamWaitValue32_v2)
+VGPU_PT_ALIAS(cuStreamWaitValue64_v2_ptsz, cuStreamWaitValue64_v2)
+VGPU_PT_ALIAS(cuStreamWriteValue32_v2_ptsz, cuStreamWriteValue32_v2)
+VGPU_PT_ALIAS(cuStreamWriteValue64_v2_ptsz, cuStreamWriteValue64_v2)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

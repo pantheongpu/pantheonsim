@@ -139,6 +139,13 @@ struct TexRefRec {
   int channels = 1;
   CUdeviceptr address_base = 0;  // bound linear memory, or 0
   CUarray array = nullptr;       // bound array, or null
+  // The mipmap state (cuTexRefSetMipmapFilterMode and the rest), the anisotropy and the border colour: kept
+  // and read back, zeros until set.
+  CUmipmappedArray mip_array = nullptr;
+  int mip_filter = 0;
+  float mip_bias = 0, mip_clamp[2] = {0, 0};
+  unsigned max_anisotropy = 0;
+  float border[4] = {0, 0, 0, 0};
 };
 
 // A stream-ordered memory pool (CUmemoryPool). Every stream here is
@@ -218,6 +225,11 @@ struct ShimState {
   // card answers a handle from either with CUDA_ERROR_CONTEXT_IS_DESTROYED.
   std::set<uintptr_t> retired;
   std::unordered_map<uintptr_t, TexRefRec> texrefs;  // cuTexRefCreate results
+  // The runtime's modules and functions under driver names (vgpu_driver_function_for_v1, cuFuncGetModule), by
+  // (device, module id) and (module handle, kernel name): one handle each, however often it is asked for.
+  std::map<std::pair<int, uint64_t>, uintptr_t> runtime_modules;
+  std::map<std::pair<uintptr_t, std::string>, uintptr_t> runtime_functions;
+  std::unordered_map<uintptr_t, int> stream_device;   // the device a stream was made on
   // Peer access enabled, as (context, peer context): cuCtxEnablePeerAccess
   // is about contexts, and enabling it one way says nothing of the other.
   std::set<std::pair<uintptr_t, uintptr_t>> peer_access;
@@ -2153,6 +2165,9 @@ static CUresult cuModuleUnload_impl(CUmodule hmod) {
     auto it = s.modules.find(h);
     if (it == s.modules.end()) return CUDA_ERROR_NOT_FOUND;
     auto [dev, mid] = it->second;
+    // A module the runtime loaded (cudaGetFuncBySymbol, cuFuncGetModule of a library's kernel) is the runtime's or the
+    // library's to unload: unloading it here is accepted and does nothing.
+    if (s.runtime_modules.count({dev, mid}) && s.runtime_modules[{dev, mid}] == h) return CUDA_SUCCESS;
     {
       ModuleProf m;
       bool known = false;
@@ -4450,6 +4465,16 @@ struct ViewDescABI {
   unsigned reserved[16];
 };
 
+// What a program is told about a texture or surface object it made, kept at creation: the three descriptors as it
+// passed them (the getters report zeros for one it did not give).
+struct ObjectDescs {
+  ResourceDescABI res{};
+  TextureDescABI tex{};
+  ViewDescABI view{};
+};
+std::mutex g_object_mu;
+std::unordered_map<unsigned long long, ObjectDescs> g_object_descs;
+
 CUresult make_object(const char* name, unsigned long long* out, const void* res, const void* tex,
                      const void* view, vgpu::exec::TexKind kind) {
   return api(name, true, false, [&](ShimState& s) -> CUresult {
@@ -4506,6 +4531,14 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
     }
     const uint64_t handle = next_texobj++;
     current(s).textures()[handle] = d;
+    {
+      ObjectDescs kept;
+      kept.res = rdesc;
+      if (tex) kept.tex = *static_cast<const TextureDescABI*>(tex);
+      if (view) kept.view = *static_cast<const ViewDescABI*>(view);
+      std::lock_guard<std::mutex> lock(g_object_mu);
+      g_object_descs[handle] = kept;
+    }
     *out = handle;
     return CUDA_SUCCESS;
   });
@@ -4514,7 +4547,11 @@ CUresult make_object(const char* name, unsigned long long* out, const void* res,
 CUresult destroy_object(const char* name, unsigned long long obj) {
   return api(name, true, false, [&](ShimState& s) {
     for (int dev = 0; dev < s.rt->device_count(); ++dev)
-      if (s.rt->device(dev).textures().erase(obj)) return CUDA_SUCCESS;
+      if (s.rt->device(dev).textures().erase(obj)) {
+        std::lock_guard<std::mutex> lock(g_object_mu);
+        g_object_descs.erase(obj);
+        return CUDA_SUCCESS;
+      }
     return CUDA_ERROR_INVALID_VALUE;
   });
 }
@@ -5113,6 +5150,7 @@ static CUresult stream_create(CUstream* s_out, unsigned int flags, int priority)
     if (!s_out) return CUDA_ERROR_INVALID_VALUE;
     uintptr_t h = make_handle(s, kTagStream);
     s.streams.insert(h);
+    s.stream_device[h] = current_device(s);
     *s_out = reinterpret_cast<CUstream>(h);
     // A priority outside the range is clamped to it, as the card does, and read back by
     // cuStreamGetPriority; streams run in order, so it changes nothing else.
@@ -5139,6 +5177,7 @@ static CUresult cuStreamDestroy_v2_impl(CUstream stream) {
     if (s.streams.count(h))
       vgpu::profiling::notify_resource(vgpu::profiling::Resource::StreamDestroyStarting, h, profiled_device(s));
     s.streams.erase(h);
+    s.stream_device.erase(h);
     s.stream_priority.erase(h);
     return CUDA_SUCCESS;
   });
@@ -6768,3 +6807,99 @@ static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVe
                                       unsigned long long flags) {
   return cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, nullptr);
 }
+
+// The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
+#include "driver_sweep.inc"
+
+/* ===================================================================== */
+/* Per-thread default stream                                             */
+/* ===================================================================== */
+
+// A program built with nvcc --default-stream per-thread (or with CUDA_API_PER_THREAD_DEFAULT_STREAM defined)
+// calls the driver's functions under the names cuMemcpyHtoD_v2_ptds, cuLaunchKernel_ptsz and the rest, where
+// stream 0 is the calling thread's own default stream rather than the legacy one. Every stream here is
+// synchronous, so the two defaults behave alike and each name is the plain function under another symbol
+// (the runtime does the same: runtime_api.cpp).
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattribute-alias"
+#endif
+#define VGPU_PT_ALIAS(name, target) \
+  extern "C" __attribute__((visibility("default"))) void name() __attribute__((alias(#target)));
+VGPU_PT_ALIAS(cuEventRecordWithFlags_ptsz, cuEventRecordWithFlags)
+VGPU_PT_ALIAS(cuEventRecord_ptsz, cuEventRecord)
+VGPU_PT_ALIAS(cuGraphicsMapResources_ptsz, cuGraphicsMapResources)
+VGPU_PT_ALIAS(cuGraphicsUnmapResources_ptsz, cuGraphicsUnmapResources)
+VGPU_PT_ALIAS(cuLaunchCooperativeKernel_ptsz, cuLaunchCooperativeKernel)
+VGPU_PT_ALIAS(cuLaunchHostFunc_ptsz, cuLaunchHostFunc)
+VGPU_PT_ALIAS(cuLaunchKernelEx_ptsz, cuLaunchKernelEx)
+VGPU_PT_ALIAS(cuLaunchKernel_ptsz, cuLaunchKernel)
+VGPU_PT_ALIAS(cuMemAllocAsync_ptsz, cuMemAllocAsync)
+VGPU_PT_ALIAS(cuMemAllocFromPoolAsync_ptsz, cuMemAllocFromPoolAsync)
+VGPU_PT_ALIAS(cuMemFreeAsync_ptsz, cuMemFreeAsync)
+VGPU_PT_ALIAS(cuMemPrefetchAsync_v2_ptsz, cuMemPrefetchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy2DAsync_v2_ptsz, cuMemcpy2DAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy2DUnaligned_v2_ptds, cuMemcpy2DUnaligned_v2)
+VGPU_PT_ALIAS(cuMemcpy2D_v2_ptds, cuMemcpy2D_v2)
+VGPU_PT_ALIAS(cuMemcpy3DAsync_v2_ptsz, cuMemcpy3DAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy3D_v2_ptds, cuMemcpy3D_v2)
+VGPU_PT_ALIAS(cuMemcpyAsync_ptsz, cuMemcpyAsync)
+VGPU_PT_ALIAS(cuMemcpyAtoA_v2_ptds, cuMemcpyAtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoD_v2_ptds, cuMemcpyAtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoHAsync_v2_ptsz, cuMemcpyAtoHAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyAtoH_v2_ptds, cuMemcpyAtoH_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoA_v2_ptds, cuMemcpyDtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoDAsync_v2_ptsz, cuMemcpyDtoDAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoD_v2_ptds, cuMemcpyDtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoHAsync_v2_ptsz, cuMemcpyDtoHAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyDtoH_v2_ptds, cuMemcpyDtoH_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoAAsync_v2_ptsz, cuMemcpyHtoAAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoA_v2_ptds, cuMemcpyHtoA_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoDAsync_v2_ptsz, cuMemcpyHtoDAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyHtoD_v2_ptds, cuMemcpyHtoD_v2)
+VGPU_PT_ALIAS(cuMemcpyPeerAsync_ptsz, cuMemcpyPeerAsync)
+VGPU_PT_ALIAS(cuMemcpyPeer_ptds, cuMemcpyPeer)
+VGPU_PT_ALIAS(cuMemcpy_ptds, cuMemcpy)
+VGPU_PT_ALIAS(cuMemsetD16Async_ptsz, cuMemsetD16Async)
+VGPU_PT_ALIAS(cuMemsetD16_v2_ptds, cuMemsetD16_v2)
+VGPU_PT_ALIAS(cuMemsetD2D16Async_ptsz, cuMemsetD2D16Async)
+VGPU_PT_ALIAS(cuMemsetD2D16_v2_ptds, cuMemsetD2D16_v2)
+VGPU_PT_ALIAS(cuMemsetD2D32Async_ptsz, cuMemsetD2D32Async)
+VGPU_PT_ALIAS(cuMemsetD2D32_v2_ptds, cuMemsetD2D32_v2)
+VGPU_PT_ALIAS(cuMemsetD2D8Async_ptsz, cuMemsetD2D8Async)
+VGPU_PT_ALIAS(cuMemsetD2D8_v2_ptds, cuMemsetD2D8_v2)
+VGPU_PT_ALIAS(cuMemsetD32Async_ptsz, cuMemsetD32Async)
+VGPU_PT_ALIAS(cuMemsetD32_v2_ptds, cuMemsetD32_v2)
+VGPU_PT_ALIAS(cuMemsetD8Async_ptsz, cuMemsetD8Async)
+VGPU_PT_ALIAS(cuMemsetD8_v2_ptds, cuMemsetD8_v2)
+VGPU_PT_ALIAS(cuStreamAddCallback_ptsz, cuStreamAddCallback)
+VGPU_PT_ALIAS(cuStreamAttachMemAsync_ptsz, cuStreamAttachMemAsync)
+VGPU_PT_ALIAS(cuStreamGetCtx_ptsz, cuStreamGetCtx)
+VGPU_PT_ALIAS(cuStreamGetCtx_v2_ptsz, cuStreamGetCtx_v2)
+VGPU_PT_ALIAS(cuStreamGetFlags_ptsz, cuStreamGetFlags)
+VGPU_PT_ALIAS(cuStreamGetPriority_ptsz, cuStreamGetPriority)
+VGPU_PT_ALIAS(cuStreamIsCapturing_ptsz, cuStreamIsCapturing)
+VGPU_PT_ALIAS(cuStreamQuery_ptsz, cuStreamQuery)
+VGPU_PT_ALIAS(cuStreamSynchronize_ptsz, cuStreamSynchronize)
+VGPU_PT_ALIAS(cuStreamWaitEvent_ptsz, cuStreamWaitEvent)
+VGPU_PT_ALIAS(cuMemBatchDecompressAsync_ptsz, cuMemBatchDecompressAsync)
+VGPU_PT_ALIAS(cuMemDiscardAndPrefetchBatchAsync_ptsz, cuMemDiscardAndPrefetchBatchAsync)
+VGPU_PT_ALIAS(cuMemDiscardBatchAsync_ptsz, cuMemDiscardBatchAsync)
+VGPU_PT_ALIAS(cuMemMapArrayAsync_ptsz, cuMemMapArrayAsync)
+VGPU_PT_ALIAS(cuMemPrefetchBatchAsync_ptsz, cuMemPrefetchBatchAsync)
+VGPU_PT_ALIAS(cuMemcpy3DBatchAsync_v2_ptsz, cuMemcpy3DBatchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpy3DPeerAsync_ptsz, cuMemcpy3DPeerAsync)
+VGPU_PT_ALIAS(cuMemcpyBatchAsync_v2_ptsz, cuMemcpyBatchAsync_v2)
+VGPU_PT_ALIAS(cuSignalExternalSemaphoresAsync_ptsz, cuSignalExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cuStreamCopyAttributes_ptsz, cuStreamCopyAttributes)
+VGPU_PT_ALIAS(cuStreamGetAttribute_ptsz, cuStreamGetAttribute)
+VGPU_PT_ALIAS(cuStreamGetDevice_ptsz, cuStreamGetDevice)
+VGPU_PT_ALIAS(cuStreamGetId_ptsz, cuStreamGetId)
+VGPU_PT_ALIAS(cuStreamSetAttribute_ptsz, cuStreamSetAttribute)
+VGPU_PT_ALIAS(cuWaitExternalSemaphoresAsync_ptsz, cuWaitExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cuMemcpy3DPeer_ptds, cuMemcpy3DPeer)
+#undef VGPU_PT_ALIAS
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

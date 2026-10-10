@@ -4436,42 +4436,8 @@ VGPU_EXPORT cudaError_t cudaDeviceGetCacheConfig(cudaFuncCache* config) {
   return traced_call("cudaDeviceGetCacheConfig", cudaDeviceGetCacheConfig_traced, config);
 }
 
-// Shared memory banks are four bytes wide on every GPU this simulates, as the
-// driver's cuCtxSetSharedMemConfig answers: a configuration in the enumeration
-// is accepted and has no effect, and the answer stays the four-byte bank size.
-// Deprecated in 12.4, and removed with CUDA 13.
+// Removed with CUDA 13.
 #if CUDART_VERSION < 13000
-// The configuration travels as an int: a caller's out-of-range value must not
-// be loaded as the enum (UBSan), and traced_call copies its arguments on.
-static cudaError_t cudaDeviceSetSharedMemConfig_traced(int c) {
-  return c >= 0 && c <= 2 ? cudaSuccess : cudaErrorInvalidValue;
-}
-
-VGPU_EXPORT cudaError_t cudaDeviceSetSharedMemConfig(cudaSharedMemConfig config) {
-  return traced_call("cudaDeviceSetSharedMemConfig", cudaDeviceSetSharedMemConfig_traced,
-                     enum_value(config));
-}
-static cudaError_t cudaDeviceGetSharedMemConfig_traced(cudaSharedMemConfig* config) {
-  if (!config) return cudaErrorInvalidValue;
-  *config = cudaSharedMemBankSizeFourByte;
-  return cudaSuccess;
-}
-
-VGPU_EXPORT cudaError_t cudaDeviceGetSharedMemConfig(cudaSharedMemConfig* config) {
-  return traced_call("cudaDeviceGetSharedMemConfig", cudaDeviceGetSharedMemConfig_traced, config);
-}
-static cudaError_t cudaFuncSetSharedMemConfig_traced(const void* func, int c) {
-  if (c < 0 || c > 2) return cudaErrorInvalidValue;
-  return guard("cudaFuncSetSharedMemConfig", [&](State& s) -> cudaError_t {
-    return s.kernels.count(func) ? cudaSuccess : cudaErrorInvalidResourceHandle;
-  });
-}
-
-VGPU_EXPORT cudaError_t cudaFuncSetSharedMemConfig(const void* func, cudaSharedMemConfig config) {
-  return traced_call("cudaFuncSetSharedMemConfig", cudaFuncSetSharedMemConfig_traced, func,
-                     enum_value(config));
-}
-
 // The cudaThread* calls are the pre-cudaDevice* names, deprecated since CUDA
 // 4 and documented as the same operations; cudaThreadSynchronize already was.
 static cudaError_t cudaThreadExit_traced() { return cudaDeviceReset(); }
@@ -11320,6 +11286,9 @@ VGPU_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCap
   return traced_call("cudaStreamIsCapturing", cudaStreamIsCapturing_traced, stream, status);
 }
 
+// The functions the toolkit declares and this library lacked (tests/lint/check_header_exports.py).
+#include "runtime_sweep.inc"
+
 /* ===================================================================== */
 /* Per-thread default stream                                             */
 /* ===================================================================== */
@@ -11395,8 +11364,23 @@ VGPU_PT_ALIAS(cudaStreamGetAttribute_ptsz, cudaStreamGetAttribute)
 VGPU_PT_ALIAS(cudaStreamSetAttribute_ptsz, cudaStreamSetAttribute)
 VGPU_PT_ALIAS(cudaStreamUpdateCaptureDependencies_ptsz, cudaStreamUpdateCaptureDependencies)
 VGPU_PT_ALIAS(cudaGraphInstantiateWithParams_ptsz, cudaGraphInstantiateWithParams)
+VGPU_PT_ALIAS(cudaGetDriverEntryPointByVersion_ptsz, cudaGetDriverEntryPointByVersion)
+VGPU_PT_ALIAS(cudaGetDriverEntryPoint_ptsz, cudaGetDriverEntryPoint)
+VGPU_PT_ALIAS(cudaSignalExternalSemaphoresAsync_ptsz, cudaSignalExternalSemaphoresAsync)
+VGPU_PT_ALIAS(cudaStreamGetCaptureInfo_ptsz, cudaStreamGetCaptureInfo)
+VGPU_PT_ALIAS(cudaStreamGetDevice_ptsz, cudaStreamGetDevice)
+VGPU_PT_ALIAS(cudaWaitExternalSemaphoresAsync_ptsz, cudaWaitExternalSemaphoresAsync)
 #if CUDART_VERSION >= 12030
 VGPU_PT_ALIAS(cudaStreamBeginCaptureToGraph_ptsz, cudaStreamBeginCaptureToGraph)
+#endif
+#if CUDART_VERSION >= 12080
+VGPU_PT_ALIAS(cudaMemcpyBatchAsync_ptsz, cudaMemcpyBatchAsync)
+VGPU_PT_ALIAS(cudaMemcpy3DBatchAsync_ptsz, cudaMemcpy3DBatchAsync)
+#endif
+#if CUDART_VERSION >= 13000
+VGPU_PT_ALIAS(cudaMemPrefetchBatchAsync_ptsz, cudaMemPrefetchBatchAsync)
+VGPU_PT_ALIAS(cudaMemDiscardBatchAsync_ptsz, cudaMemDiscardBatchAsync)
+VGPU_PT_ALIAS(cudaMemDiscardAndPrefetchBatchAsync_ptsz, cudaMemDiscardAndPrefetchBatchAsync)
 #endif
 #undef VGPU_PT_ALIAS
 #if defined(__GNUC__) && !defined(__clang__)
