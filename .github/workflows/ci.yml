@@ -467,6 +467,62 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
+      # The runner has no sudo (its container drops every capability and sets
+      # no-new-privileges), so an apt install here cannot work and the image
+      # (pantheonsim-web, deploy/gh-runner/pantheonsim.Dockerfile) is rebuilt
+      # only by hand. What two tests need from outside the image is therefore
+      # fetched here, into the runner user's home, without root:
+      #   libnvJitLink 13.0   NVIDIA's pip wheel (nvidia-nvjitlink), unpacked
+      #                       where run_fft_lto_callbacks.sh looks for it
+      #                       (~/.local/share/*/lib/python3*/site-packages/nvidia/
+      #                       cu13/lib). Nothing else reads that path, so the
+      #                       other tests behave as before.
+      #   ffmpeg, ffprobe     a pinned static build (6.0.1, sha256 below). The
+      #                       NVENC tests (e2e_nvenc, test_nvenc_h264_enc,
+      #                       test_nvenc_hevc_enc) pass without them but then
+      #                       skip decoding the encoder's streams with an
+      #                       independent decoder; the image has neither.
+      # Both are kept between runs for as long as the runner's container lives, and the
+      # step reports, but never fails on, a download that did not work: the
+      # rest-of-suite step then lets the test it would have enabled skip, as
+      # before, instead of failing every pull request on a network blip.
+      - name: Fetch libnvJitLink and ffmpeg (no root here)
+        id: tools
+        run: |
+          jl="$HOME/.local/share/ci-nvjitlink"
+          ff="$HOME/.cache/ci-ffmpeg-6.0.1"
+          ffsha=28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+          lib=("$jl"/lib/python3*/site-packages/nvidia/cu13/lib/libnvJitLink.so.13)
+          if [[ ! -e "${lib[0]}" ]]; then
+            rm -rf "$jl"
+            if python3 -m venv "$jl" \
+               && "$jl/bin/pip" install -q --no-cache-dir --no-deps 'nvidia-nvjitlink>=13.0,<13.1'; then
+              lib=("$jl"/lib/python3*/site-packages/nvidia/cu13/lib/libnvJitLink.so.13)
+            fi
+          fi
+          # Loadable here, not only present: the test would otherwise skip for a reason
+          # the runner cannot show.
+          if [[ -e "${lib[0]}" ]] && python3 -I -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "${lib[0]}"; then
+            echo "jitlink=1" >> "$GITHUB_OUTPUT"; echo "libnvJitLink: ${lib[0]}"
+          else
+            echo "jitlink=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::libnvJitLink 13 could not be fetched; e2e_fft_lto_callbacks may skip on this run"
+          fi
+          if [[ ! -x "$ff/ffmpeg" || ! -x "$ff/ffprobe" ]]; then
+            rm -rf "$ff"; mkdir -p "$ff"
+            if curl -sfL --retry 3 -o "$ff.tar.xz" https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz \
+               && echo "$ffsha  $ff.tar.xz" | sha256sum -c --quiet - \
+               && tar -xJf "$ff.tar.xz" -C "$ff" --strip-components=1 --wildcards '*/ffmpeg' '*/ffprobe'; then :; else
+              rm -rf "$ff"
+            fi
+            rm -f "$ff.tar.xz"
+          fi
+          if [[ -x "$ff/ffmpeg" && -x "$ff/ffprobe" ]] && "$ff/ffmpeg" -version >/dev/null; then
+            echo "$ff" >> "$GITHUB_PATH"; "$ff/ffmpeg" -version | head -1
+          else
+            echo "::warning::ffmpeg could not be fetched; the NVENC tests will not decode with it on this run"
+          fi
+
       - name: PyTorch, rocBLAS and hipSPARSELt
         # A test that skips fails the job: here each has what it needs, so a
         # skip means the runner's image lost it, not that there is nothing to
@@ -504,10 +560,10 @@ jobs:
         #   amd_opencl           ROCm's OpenCL runtime (rocm-opencl) is not in the
         #                        image; the rocm-libraries workflow runs it.
         #   e2e_fft_lto_callbacks
-        #                        the CUDA toolkit's libnvJitLink (which turns LTO-IR into
-        #                        machine code) is nowhere on the image: not beside nvcc, not
-        #                        in a pip wheel. Installing libnvjitlink-13-0 (or
-        #                        nvidia-nvjitlink-cu13) turns it on.
+        #                        NOT allowed any more: the step "Fetch libnvJitLink and ffmpeg"
+        #                        above unpacks NVIDIA's libnvJitLink 13.0 wheel for it. Only
+        #                        when that download fails (the step warns, and says
+        #                        jitlink=0) is the skip let through, below, for that run.
         #   e2e_lowprec_ptx120   no sm_120 card transcript on this branch (it has one on
         #                        r4): "no expected files for ptx120".
         #   e2e_packed_int_forms the image's nvcc ptxas does not assemble PTX ISA 9.2's
@@ -516,7 +572,8 @@ jobs:
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms)$'
+          JITLINK_FETCHED: ${{ steps.tools.outputs.jitlink }}
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|amd_opencl|e2e_lowprec_ptx120|e2e_packed_int_forms)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j2 \
@@ -524,7 +581,11 @@ jobs:
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
-          unexpected=$(grep -vE "$RUNNER_SKIPS_OK" <<<"$skipped" | grep . || true)
+          allowed="$RUNNER_SKIPS_OK"
+          # The LTO callbacks need the libnvJitLink the fetch step unpacks: a run where that
+          # download failed (and warned) may skip them; a run where it worked may not.
+          if [[ "${JITLINK_FETCHED:-0}" != 1 ]]; then allowed="$allowed|^e2e_fft_lto_callbacks\$"; fi
+          unexpected=$(grep -vE "$allowed" <<<"$skipped" | grep . || true)
           if [[ -n "$skipped" ]]; then
             # ctest hides a skipped test's output; the reason is its SKIP line.
             echo "Skipped tests and why:"
