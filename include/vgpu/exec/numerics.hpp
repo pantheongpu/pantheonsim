@@ -3,6 +3,7 @@
 // executor too, so a value means the same thing to either.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -47,6 +48,14 @@ uint32_t ue8m0_bits(double v, bool round_up, bool satfinite);
 // as the PTX engine converts every value to them.
 uint16_t f16_bits(double v);
 uint16_t bf16_bits(double v);
+
+// The narrow-float tensor core of sm_120 (QMMA, OMMA; mma.sync .kind::f8f6f4, mxf8f6f4, mxf4, mxf4nvf4; E4M3, E5M2,
+// E3M2, E2M3, E2M1 operands): D = C + the sum of `n` products, the sum exact and rounded once, toward zero, to fp32,
+// a zero result +0 (a -0 only when every addend is -0); NaN if any addend is NaN or infinities of both signs meet,
+// else the infinity. `terms` are the products (and their block scales) as exact doubles. Measured on an RTX PRO 6000
+// (18 of 27 dense forms of nvidia/tests/data/lowprec/ptx120.rtx-pro-6000-server.txt, bit for bit; nvidia/docs/lowprec.md).
+// A sum whose terms span more than 118 bits drops the bits below that (toward minus infinity).
+float mma_narrow_sum(const double* terms, size_t n, float c);
 
 // Where stored element k of chunk `chunk` in row `row` of a structured-sparse
 // mma A operand goes, as a column of the K-wide row, by the metadata the 32

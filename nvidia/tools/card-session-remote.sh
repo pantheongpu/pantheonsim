@@ -94,6 +94,11 @@ if [[ -n "$cudnn_lib" ]]; then
   fe="$("$e2e/fetch_cudnn_frontend.sh" 2>"$out/fetch-frontend.log")"
   step dnn-fp8-attention bash -c "nvcc -std=c++17 -cudart shared -arch=$arch -w -I'$cudnn_inc' '$e2e/dnn_fp8_attention.cu' -o /tmp/dnn_fp8_attention -L'$cudnn_lib' -lcudnn \
       && LD_LIBRARY_PATH='$cudnn_lib':\$LD_LIBRARY_PATH /tmp/dnn_fp8_attention"
+  # The probe that says what the card does differently where the two tests above fail (the O8 bytes of thirteen
+  # configurations, both amax values and the candidate formulas each reproduces; PROBE_DUMP keeps the raw bytes).
+  mkdir -p "$out/fp8attn"
+  step dnn-fp8-attention-probe bash -c "nvcc -std=c++17 -cudart shared -arch=$arch -w -I'$cudnn_inc' '$e2e/dnn_fp8_attention_probe.cu' -o /tmp/dnn_fp8_attention_probe -L'$cudnn_lib' -lcudnn \
+      && PROBE_DUMP='$out/fp8attn' LD_LIBRARY_PATH='$cudnn_lib':\$LD_LIBRARY_PATH /tmp/dnn_fp8_attention_probe"
   [[ -n "$fe" ]] && step dnn-fp8-attention-frontend bash -c "nvcc -std=c++17 -cudart shared -arch=$arch -w -I'$cudnn_inc' -I'$fe' '$e2e/dnn_fp8_attention_frontend.cpp' -o /tmp/dnn_fp8_attention_frontend -L'$cudnn_lib' -lcudnn -lcuda \
       && LD_LIBRARY_PATH='$cudnn_lib':\$LD_LIBRARY_PATH /tmp/dnn_fp8_attention_frontend"
 else
@@ -126,7 +131,7 @@ native() {   # native <program> [extra nvcc args...]   (source .cu or .cpp in nv
 }
 case "$cc" in
   90)  progs="dsmem_cluster cooperative_cluster setmaxnreg stmatrix vector_atomics wgmma_cute tma_gemm_cute tma_im2col tma_reduce_cute mma_forms mma_fragment_layout wmma_gemm wmma_types uldc_narrow" ;;
-  120) progs="mma_blockscale narrow_cvt ldmatrix_forms dsmem_cluster cooperative_cluster stmatrix vector_atomics mma_forms mma_fragment_layout wmma_gemm wmma_types uldc_narrow" ;;
+  120) progs="mma_blockscale mma_blockscale_dump mma_accumulate_probe narrow_cvt ldmatrix_forms dsmem_cluster cooperative_cluster stmatrix vector_atomics mma_forms mma_fragment_layout wmma_gemm wmma_types uldc_narrow" ;;
   89)  progs="mma_forms mma_fragment_layout wmma_gemm wmma_types uldc_narrow stmatrix" ;;
   *)   progs="" ;;
 esac
