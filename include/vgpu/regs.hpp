@@ -186,7 +186,11 @@ Link link(RegisterSpace& cs);
 // into `dir`, for a device `d` read with its faults applied.
 void write_sysfs_files(const telemetry::DeviceSample& d, const std::string& dir);
 // The file names write_sysfs_files writes, for a session to link to.
-extern const char* const kSysfsFiles[12];
+// Internal linkage: libcuda and libcudart each link regs.cpp, and a shared global is an ODR violation under AddressSanitizer.
+static constexpr const char* const kSysfsFiles[12] = {"config", "resource", "vendor", "device", "class",
+                                                      "subsystem_vendor", "subsystem_device", "revision",
+                                                      "current_link_speed", "current_link_width", "max_link_speed",
+                                                      "max_link_width"};
 
 // The newest accesses to one of a device's register spaces, oldest first.
 std::vector<LogEntry> access_log(const std::string& uuid, Space s = Space::Config);

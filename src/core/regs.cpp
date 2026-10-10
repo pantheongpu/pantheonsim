@@ -867,11 +867,6 @@ Link link(RegisterSpace& cs) {
   return l;
 }
 
-const char* const kSysfsFiles[12] = {"config", "resource", "vendor", "device", "class",
-                                     "subsystem_vendor", "subsystem_device", "revision",
-                                     "current_link_speed", "current_link_width", "max_link_speed",
-                                     "max_link_width"};
-
 namespace {
 // Replaces a file whole, so a reader never sees half of one.
 void replace_file(const std::string& path, const std::string& bytes) {
