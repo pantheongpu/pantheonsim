@@ -814,6 +814,8 @@ struct HevcEncoder::Impl {
   std::vector<uint8_t> ipm, dep;     // per 4x4 unit: IntraPredModeY, coding quadtree depth
   std::vector<Mot> mot;              // per 4x4 unit: motion of the prediction unit that covers it (no list used: intra)
   std::vector<uint8_t> kind;         // per 4x4 unit: 0 intra, 1 inter, 2 skipped
+  std::vector<uint8_t> edge_v, edge_h;   // per 4x4 unit: bit 0 its left (top) edge is a transform block edge, bit 1 a prediction block edge
+  std::vector<uint8_t> cbf_u;        // per 4x4 unit: the luma transform block that covers it has coefficients
   int qp = 28;
   double lambda = 1, lam_sad = 1;
   Ctxs est;                          // the contexts as the picture's decisions have advanced them
@@ -1710,6 +1712,49 @@ struct HevcEncoder::Impl {
     }
     for (int j = 0; j < size / 4; ++j)
       for (int i = 0; i < size / 4; ++i) dep[static_cast<size_t>(cu.y / 4 + j) * ux + cu.x / 4 + i] = static_cast<uint8_t>(depth);
+    mark_edges(cu);
+  }
+
+  // Records the transform and prediction block edges of a coding unit, and the transform blocks that have coefficients, for the deblocking filter.
+  void mark_edges(const CuData& cu) {
+    const int size = 1 << cu.log2, n = size / 4;
+    auto at = [&](int ix, int iy) { return static_cast<size_t>(cu.y / 4 + iy) * ux + cu.x / 4 + ix; };
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < n; ++i) {
+        edge_v[at(i, j)] = 0;
+        edge_h[at(i, j)] = 0;
+        cbf_u[at(i, j)] = 0;
+      }
+    for (int k = 0; k < n; ++k) {   // the coding unit's own boundary is a transform block and a prediction block edge
+      edge_v[at(0, k)] = 3;
+      edge_h[at(k, 0)] = 3;
+    }
+    if (cu.inter && cu.part == 1)
+      for (int i = 0; i < n; ++i) edge_h[at(i, n / 2)] |= 2;
+    if (cu.inter && cu.part == 2)
+      for (int j = 0; j < n; ++j) edge_v[at(n / 2, j)] |= 2;
+    // transform blocks: walk the tree
+    struct Walk {
+      const CuData& cu;
+      HevcEncoder::Impl& e;
+      void go(int node, int x0, int y0, int log2) {
+        const bool split = (node < 21) && cu.split[node];
+        const int n4 = (1 << log2) / 4;
+        if (split) {
+          const int h = 1 << (log2 - 1);
+          for (int i = 0; i < 4; ++i) go(4 * node + 1 + i, x0 + (i & 1) * h, y0 + (i >> 1) * h, log2 - 1);
+          return;
+        }
+        for (int j = 0; j < n4; ++j)
+          for (int i = 0; i < n4; ++i) {
+            const size_t u = static_cast<size_t>(y0 / 4 + j) * e.ux + x0 / 4 + i;
+            if (i == 0) e.edge_v[u] |= 1;
+            if (j == 0) e.edge_h[u] |= 1;
+            e.cbf_u[u] = cu.cbf_y[node];
+          }
+      }
+    } walk{cu, *this};
+    walk.go(0, cu.x, cu.y, cu.log2);
   }
   // Saves the reconstruction of a just-coded unit into it.
   void snapshot(CuData& cu) const {
@@ -2039,6 +2084,113 @@ struct HevcEncoder::Impl {
     }
   }
 
+
+  // ---- the deblocking filter (8.7.2) ---------------------------------------------------------------------------------------------------
+
+  int ref_poc(const Mot& m, int l) const { return lists[l][static_cast<size_t>(m.ref[l])].poc; }
+  static bool mv_far(const int16_t* a, const int16_t* b) { return std::abs(a[0] - b[0]) >= 4 || std::abs(a[1] - b[1]) >= 4; }
+  // Boundary strength of the edge between units up (P side) and uq (Q side); `edge` carries the transform / prediction edge bits.
+  int bs_of(size_t up, size_t uq, uint8_t edge) const {
+    if (kind[up] == 0 || kind[uq] == 0) return 2;
+    if ((edge & 1) && (cbf_u[up] || cbf_u[uq])) return 1;
+    const Mot& a = mot[up];
+    const Mot& b = mot[uq];
+    const int na = a.uses(0) + a.uses(1), nb = b.uses(0) + b.uses(1);
+    if (na != nb) return 1;
+    if (na == 1) {
+      const int la = a.uses(0) ? 0 : 1, lb = b.uses(0) ? 0 : 1;
+      if (ref_poc(a, la) != ref_poc(b, lb)) return 1;
+      return mv_far(a.mv[la], b.mv[lb]) ? 1 : 0;
+    }
+    const int pa0 = ref_poc(a, 0), pa1 = ref_poc(a, 1), pb0 = ref_poc(b, 0), pb1 = ref_poc(b, 1);
+    if (!((pa0 == pb0 && pa1 == pb1) || (pa0 == pb1 && pa1 == pb0))) return 1;
+    if (pa0 != pa1) {
+      if (pa0 == pb0) return mv_far(a.mv[0], b.mv[0]) || mv_far(a.mv[1], b.mv[1]) ? 1 : 0;
+      return mv_far(a.mv[0], b.mv[1]) || mv_far(a.mv[1], b.mv[0]) ? 1 : 0;
+    }
+    const bool straight = mv_far(a.mv[0], b.mv[0]) || mv_far(a.mv[1], b.mv[1]);
+    const bool cross = mv_far(a.mv[0], b.mv[1]) || mv_far(a.mv[1], b.mv[0]);
+    return straight && cross ? 1 : 0;
+  }
+
+  // Filters one four-sample segment of a luma edge (8.7.2.5.3): `a` steps across the edge, `along` steps along it; q0 is at base.
+  static void filter_luma_segment(uint8_t* base, int across, int along, int bS, int qpl) {
+    const int beta = kBetaTable[clip3(0, 51, qpl)];
+    const int tc = kTcTable[clip3(0, 53, qpl + 2 * (bS - 1))];
+    auto P = [&](int i, int k) -> uint8_t& { return base[k * along - (i + 1) * across]; };
+    auto Q = [&](int i, int k) -> uint8_t& { return base[k * along + i * across]; };
+    const int dp0 = std::abs(P(2, 0) - 2 * P(1, 0) + P(0, 0)), dp3 = std::abs(P(2, 3) - 2 * P(1, 3) + P(0, 3));
+    const int dq0 = std::abs(Q(2, 0) - 2 * Q(1, 0) + Q(0, 0)), dq3 = std::abs(Q(2, 3) - 2 * Q(1, 3) + Q(0, 3));
+    const int dpq0 = dp0 + dq0, dpq3 = dp3 + dq3, dp = dp0 + dp3, dq = dq0 + dq3, d = dpq0 + dpq3;
+    if (d >= beta) return;
+    auto sam = [&](int dpq, int k) {
+      return 2 * dpq < (beta >> 2) && std::abs(P(3, k) - P(0, k)) + std::abs(Q(0, k) - Q(3, k)) < (beta >> 3) && std::abs(P(0, k) - Q(0, k)) < ((5 * tc + 1) >> 1);
+    };
+    const bool strong = sam(dpq0, 0) && sam(dpq3, 3);
+    const bool dEp = dp < ((beta + (beta >> 1)) >> 3), dEq = dq < ((beta + (beta >> 1)) >> 3);
+    for (int k = 0; k < 4; ++k) {
+      const int p0 = P(0, k), p1 = P(1, k), p2 = P(2, k), p3 = P(3, k), q0 = Q(0, k), q1 = Q(1, k), q2 = Q(2, k), q3 = Q(3, k);
+      if (strong) {
+        P(0, k) = static_cast<uint8_t>(clip3(p0 - 2 * tc, p0 + 2 * tc, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3));
+        P(1, k) = static_cast<uint8_t>(clip3(p1 - 2 * tc, p1 + 2 * tc, (p2 + p1 + p0 + q0 + 2) >> 2));
+        P(2, k) = static_cast<uint8_t>(clip3(p2 - 2 * tc, p2 + 2 * tc, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3));
+        Q(0, k) = static_cast<uint8_t>(clip3(q0 - 2 * tc, q0 + 2 * tc, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3));
+        Q(1, k) = static_cast<uint8_t>(clip3(q1 - 2 * tc, q1 + 2 * tc, (p0 + q0 + q1 + q2 + 2) >> 2));
+        Q(2, k) = static_cast<uint8_t>(clip3(q2 - 2 * tc, q2 + 2 * tc, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3));
+      } else {
+        int delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+        if (std::abs(delta) < tc * 10) {
+          delta = clip3(-tc, tc, delta);
+          P(0, k) = clip8(p0 + delta);
+          Q(0, k) = clip8(q0 - delta);
+          if (dEp) P(1, k) = clip8(p1 + clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1));
+          if (dEq) Q(1, k) = clip8(q1 + clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1));
+        }
+      }
+    }
+  }
+  // Filters `n` samples of a chroma edge with bS 2 (8.7.2.5.5).
+  static void filter_chroma_segment(uint8_t* base, int across, int along, int n, int qpc) {
+    const int tc = kTcTable[clip3(0, 53, qpc + 2)];
+    for (int k = 0; k < n; ++k) {
+      uint8_t* q = base + k * along;
+      const int p0 = q[-across], p1 = q[-2 * across], q0 = q[0], q1 = q[across];
+      const int delta = clip3(-tc, tc, ((((q0 - p0) * 4) + p1 - q1 + 4) >> 3));
+      q[-across] = clip8(p0 + delta);
+      q[0] = clip8(q0 - delta);
+    }
+  }
+
+  // The loop filter of the whole picture: the vertical edges first, then the horizontal ones, on the 8x8 sample grid.
+  void deblock_picture() {
+    const int qpc = chroma_qp(qp);
+    for (int dir = 0; dir < 2; ++dir) {   // 0: vertical edges, 1: horizontal edges
+      for (int iy = 0; iy < uy; ++iy)
+        for (int ix = 0; ix < ux; ++ix) {
+          const int x = ix * 4, y = iy * 4;
+          if (dir == 0 ? (x == 0 || (x & 7)) : (y == 0 || (y & 7))) continue;
+          const size_t u = static_cast<size_t>(iy) * ux + ix;
+          const uint8_t e = dir == 0 ? edge_v[u] : edge_h[u];
+          if (!e) continue;
+          const size_t up = dir == 0 ? u - 1 : u - static_cast<size_t>(ux);
+          const int bS = bs_of(up, u, e);
+          if (!bS) continue;
+          if (dir == 0) filter_luma_segment(&ry[static_cast<size_t>(y) * W + x], 1, W, bS, qp);
+          else filter_luma_segment(&ry[static_cast<size_t>(y) * W + x], W, 1, bS, qp);
+          if (bS == 2) {
+            const int cx = x / 2, cy = y / 2;
+            if (dir == 0 && (cx & 7) == 0) {
+              filter_chroma_segment(&ru[static_cast<size_t>(cy) * cW + cx], 1, cW, 2, qpc);
+              filter_chroma_segment(&rv[static_cast<size_t>(cy) * cW + cx], 1, cW, 2, qpc);
+            } else if (dir == 1 && (cy & 7) == 0) {
+              filter_chroma_segment(&ru[static_cast<size_t>(cy) * cW + cx], cW, 1, 2, qpc);
+              filter_chroma_segment(&rv[static_cast<size_t>(cy) * cW + cx], cW, 1, 2, qpc);
+            }
+          }
+        }
+    }
+  }
+
   // ---- parameter sets, slice header, the picture -------------------------------------------------------------------------
 
   int dpb_pictures() const { return std::max(opt.num_ref, opt.max_b > 0 ? 2 : 1); }   // reference pictures kept
@@ -2163,7 +2315,11 @@ struct HevcEncoder::Impl {
     bw.bit(0);      // pps_loop_filter_across_slices_enabled_flag
     bw.bit(1);      // deblocking_filter_control_present_flag
     bw.bit(0);      // deblocking_filter_override_enabled_flag
-    bw.bit(1);      // pps_deblocking_filter_disabled_flag
+    bw.bit(opt.deblock ? 0 : 1);   // pps_deblocking_filter_disabled_flag
+    if (opt.deblock) {
+      bw.se(0);   // pps_beta_offset_div2
+      bw.se(0);   // pps_tc_offset_div2
+    }
     bw.bit(0);      // pps_scaling_list_data_present_flag
     bw.bit(0);      // lists_modification_present_flag
     bw.ue(0);       // log2_parallel_merge_level_minus2
@@ -2198,6 +2354,9 @@ std::vector<uint8_t> HevcEncoder::Impl::encode_picture(const EncPicture& in, Pic
   dep.assign(static_cast<size_t>(ux) * uy, 0);
   mot.assign(static_cast<size_t>(ux) * uy, Mot());
   kind.assign(static_cast<size_t>(ux) * uy, 0);
+  edge_v.assign(static_cast<size_t>(ux) * uy, 0);
+  edge_h.assign(static_cast<size_t>(ux) * uy, 0);
+  cbf_u.assign(static_cast<size_t>(ux) * uy, 0);
   std::fill(ry.begin(), ry.end(), 0);
   std::fill(ru.begin(), ru.end(), 128);
   std::fill(rv.begin(), rv.end(), 128);
@@ -2294,6 +2453,7 @@ std::vector<uint8_t> HevcEncoder::Impl::encode_picture(const EncPicture& in, Pic
       bc.terminate(cx == ctbs_x - 1 && cy == ctbs_y - 1 ? 1 : 0);   // end_of_slice_segment_flag
     }
   bc.finish();
+  if (opt.deblock) deblock_picture();
 
   std::vector<uint8_t> out;
   if (intra_pic) {

@@ -7,8 +7,8 @@
 // It is not NVIDIA's encoder and does not try to produce NVIDIA's bytes. What a picture becomes is a pure function of the picture, its type,
 // the QP and the pictures before it: the same IDR picture at the same QP is the same bytes every time.
 //
-// The encoder keeps its own reconstruction and does not filter it (the stream says so: deblocking and sample adaptive offset are off), so
-// what a decoder returns is exactly that reconstruction. nvidia/tests/unit/test_nvenc_hevc_enc.cpp checks that against an HEVC syntax
+// The encoder keeps its own reconstruction, including the deblocking filter (sample adaptive offset is off), so what a decoder returns is exactly
+// that reconstruction. nvidia/tests/unit/test_nvenc_hevc_enc.cpp checks that against an HEVC syntax
 // decoder of its own, and nvidia/tests/e2e/nvenc_h264.cpp against ffmpeg's.
 #pragma once
 
@@ -23,6 +23,7 @@ namespace vgpu_nvenc {
 struct HevcOptions {
   int num_ref = 1;   // reference pictures a P picture may use (1 .. 4)
   int max_b = 0;     // B pictures between P pictures (0: none)
+  bool deblock = true;   // the deblocking filter (8.7.2); the reconstruction, and so every reference picture, is the filtered one
 };
 
 class HevcEncoder : public VideoEncoder {

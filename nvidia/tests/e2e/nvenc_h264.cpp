@@ -183,6 +183,7 @@ int main(int argc, char** argv) {
     bool lossless;   // the lossless tuning
     int fip = 1;     // frameIntervalP: 1 is IPPP, 3 has two B pictures between P pictures
     int frames = 4;
+    int kbps = 0;    // constant bit rate, in kbit/s (0: the preset's constant QP)
   } cases[] = {
       {"H.264 NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, false}, {"H.264 NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, false, false},
       {"H.264 NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, false, false},   {"H.264 YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false, false},
@@ -192,6 +193,9 @@ int main(int argc, char** argv) {
       {"H.264 lossless YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, false, true}, {"H.264 lossless ARGB 192x128", NV_ENC_BUFFER_FORMAT_ARGB, 192, 128, false, true},
       {"H.264 NV12 192x128 with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, false, false, 3, 7},
       {"HEVC NV12 192x128 with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true, false, 3, 7},
+      {"H.264 NV12 320x180 at 300 kbit/s", NV_ENC_BUFFER_FORMAT_NV12, 320, 180, false, false, 1, 30, 300},
+      {"HEVC NV12 320x180 at 300 kbit/s", NV_ENC_BUFFER_FORMAT_NV12, 320, 180, true, false, 1, 30, 300},
+      {"HEVC NV12 320x180 at 200 kbit/s with B pictures", NV_ENC_BUFFER_FORMAT_NV12, 320, 180, true, false, 3, 30, 200},
       {"HEVC NV12 192x128", NV_ENC_BUFFER_FORMAT_NV12, 192, 128, true, false},   {"HEVC NV12 145x49", NV_ENC_BUFFER_FORMAT_NV12, 145, 49, true, false},
       {"HEVC NV12 257x65", NV_ENC_BUFFER_FORMAT_NV12, 257, 65, true, false},     {"HEVC YV12 200x100", NV_ENC_BUFFER_FORMAT_YV12, 200, 100, true, false},
       {"HEVC IYUV 320x180", NV_ENC_BUFFER_FORMAT_IYUV, 320, 180, true, false},   {"HEVC IYUV 161x51", NV_ENC_BUFFER_FORMAT_IYUV, 161, 51, true, false},
@@ -219,6 +223,10 @@ int main(int argc, char** argv) {
     f.nvEncGetEncodePresetConfigEx(enc, codec, NV_ENC_PRESET_P4_GUID, tuning, &pc);
     pc.presetCfg.gopLength = 30;
     pc.presetCfg.frameIntervalP = c.fip;   // 1: no B frames, output order is coding order
+    if (c.kbps) {
+      pc.presetCfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+      pc.presetCfg.rcParams.averageBitRate = pc.presetCfg.rcParams.maxBitRate = static_cast<uint32_t>(c.kbps) * 1000;
+    }
     NV_ENC_INITIALIZE_PARAMS ip{};
     ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
     ip.encodeGUID = codec;
@@ -430,7 +438,7 @@ int main(int argc, char** argv) {
     const bool exact = !card && c.lossless;
     const size_t raw_bytes = frame_bytes * c.frames;
     std::string detail;
-    bool pass = exact ? worst_diff <= tolerance : worst_psnr >= 30.0;
+    bool pass = exact ? worst_diff <= tolerance : worst_psnr >= (c.kbps ? 24.0 : 30.0);   // a rate-controlled stream has the quality its rate gives
     if (!exact && !c.lossless && !card) {
       char buf[160];
       std::snprintf(buf, sizeof buf, ", %zu bytes for %zu raw (%.1f%%)", stream.size(), raw_bytes, 100.0 * static_cast<double>(stream.size()) / static_cast<double>(raw_bytes));
@@ -441,6 +449,13 @@ int main(int argc, char** argv) {
           pass = false;
           detail += ", wrong picture type";
         }
+    }
+    if (c.kbps) {
+      const double kbps = static_cast<double>(stream.size()) * 8 / (static_cast<double>(c.frames) / 30.0) / 1000.0;
+      char buf[96];
+      std::snprintf(buf, sizeof buf, ", %.0f kbit/s for a target of %d", kbps, c.kbps);
+      detail += buf;
+      if (!card && std::fabs(kbps - c.kbps) > 0.06 * c.kbps) pass = false;
     }
     if (!card && c.lossless)
       for (int t : types)

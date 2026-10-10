@@ -839,7 +839,7 @@ vgpu_nvenc::H264Options h264_options(const NV_ENC_CONFIG& c, int profile) {
   o.slice_data = static_cast<int>(std::min<uint32_t>(h.sliceModeData, 1u << 20));
   const uint32_t refs = raw(h.numRefL0);
   o.num_ref = refs >= 1 && refs <= 7 ? static_cast<int>(std::min<uint32_t>(refs, 4)) : 2;
-  o.max_b = profile >= 77 && c.frameIntervalP > 1 ? c.frameIntervalP - 1 : 0;
+  o.max_b = profile >= 77 && c.frameIntervalP > 1 ? std::min(c.frameIntervalP - 1, 8) : 0;
   o.deblock = h.disableDeblockingFilterIDC != 1;
   return o;
 }
@@ -849,7 +849,7 @@ vgpu_nvenc::HevcOptions hevc_options(const NV_ENC_CONFIG& c) {
   vgpu_nvenc::HevcOptions o;
   const uint32_t refs = raw(h.numRefL0);
   o.num_ref = refs >= 1 && refs <= 7 ? static_cast<int>(std::min<uint32_t>(refs, 4)) : 2;
-  o.max_b = c.frameIntervalP > 1 ? c.frameIntervalP - 1 : 0;
+  o.max_b = c.frameIntervalP > 1 ? std::min(c.frameIntervalP - 1, 8) : 0;
   return o;
 }
 
@@ -915,7 +915,7 @@ GopCfg gop_cfg(const Session& s) {
   g.idr_period = idr_period;
   g.periodic = idr_period != 0 && idr_period != NVENC_INFINITE_GOPLENGTH;
   g.intra_only = c.frameIntervalP == 0;
-  if (c.frameIntervalP > 1 && s.enc && s.enc->supports_b()) g.nb = c.frameIntervalP - 1;
+  if (c.frameIntervalP > 1 && s.enc && s.enc->supports_b()) g.nb = std::min(c.frameIntervalP - 1, 8);   // the encoders code at most eight B pictures between P pictures
   return g;
 }
 
