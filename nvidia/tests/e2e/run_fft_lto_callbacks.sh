@@ -26,7 +26,8 @@ trap 'rm -rf "$dir"' EXIT
 src="$root/nvidia/tests/e2e"
 for part in loads stores; do
   nvcc -std=c++17 -dc -dlto -arch=lto_86 -fatbin -Wno-deprecated-gpu-targets "$src/fft_lto_callback_$part.cu" -o "$dir/$part.fatbin" \
-    || { echo "SKIP: nvcc cannot write LTO-IR (-dlto -arch=lto_86)"; exit 0; }
+    > "$dir/nvcc.log" 2>&1 \
+    || { echo "SKIP: nvcc cannot write LTO-IR (-dlto -arch=lto_86): $(tail -1 "$dir/nvcc.log")"; exit 0; }
 done
 if (( card )); then
   nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets "$src/fft_lto_callbacks.cpp" -o "$dir/prog" -lcufft
@@ -40,9 +41,39 @@ shopt -u nullglob
 nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
      "$src/fft_lto_callbacks.cpp" -o "$dir/prog" -lcufft
 if ! require_shim_libs "$shim" "$dir/prog"; then exit 0; fi
+# The simulator links LTO-IR with the toolkit's libnvJitLink. It looks beside nvcc and in the usual
+# places; a machine that has the library only in a pip wheel (nvidia-nvjitlink, with PyTorch's CUDA 13
+# packages) is pointed at it here, the way run_nvrtc_builtins.sh finds the wheel's libnvrtc.
+if [[ -z "${VGPU_NVJITLINK_LIB:-}" ]]; then
+  nvcc_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+  have=0
+  for c in "$nvcc_root"/lib64/libnvJitLink.so.1[23] "$nvcc_root"/targets/*/lib/libnvJitLink.so.1[23] \
+           /usr/local/cuda/lib64/libnvJitLink.so.1[23] /usr/lib/*/libnvJitLink.so.1[23]; do
+    [[ -e "$c" ]] && { have=1; break; }
+  done
+  if (( ! have )); then
+    for c in "$HOME"/.local/share/*/lib/python3*/site-packages/nvidia/cu13/lib/libnvJitLink.so.13 \
+             "$HOME"/.local/share/*/lib/python3*/site-packages/nvidia/nvjitlink/lib/libnvJitLink.so.1[23] \
+             /usr/lib/python3*/site-packages/nvidia/cu13/lib/libnvJitLink.so.13 \
+             /usr/local/lib/python3*/*-packages/nvidia/cu13/lib/libnvJitLink.so.13 \
+             /usr/local/lib/python3*/*-packages/nvidia/nvjitlink/lib/libnvJitLink.so.1[23]; do
+      [[ -e "$c" ]] && { export VGPU_NVJITLINK_LIB="$c"; have=1; break; }
+    done
+  fi
+  if (( ! have )); then
+    for py in "${VGPU_TORCH_CUDA_PYTHON:-}" "$HOME"/.local/share/torch-cu13*/bin/python python3; do
+      [[ -n "$py" ]] && command -v "$py" >/dev/null 2>&1 || continue
+      d=$("$py" -I -c 'import importlib.util as u; s = u.find_spec("nvidia.cu13"); print(list(s.submodule_search_locations)[0] if s and s.submodule_search_locations else "")' 2>/dev/null)
+      [[ -n "$d" && -e "$d/lib/libnvJitLink.so.13" ]] && { export VGPU_NVJITLINK_LIB="$d/lib/libnvJitLink.so.13"; break; }
+    done
+  fi
+fi
 status=0
 result="$(VGPU_GPU=nvidia/rtx3060 LD_LIBRARY_PATH="$shim" "$dir/prog" "$dir/loads.fatbin" "$dir/stores.fatbin" 2>&1)" || status=$?
-if skip="$(grep -m1 '^SKIP:' <<< "$result")"; then echo "$skip"; exit 0; fi
+if skip="$(grep -m1 '^SKIP:' <<< "$result")"; then
+  why="$(grep -m1 -A2 'LTO callback link failed' <<< "$result" | tr '\n' ' ')"
+  echo "$skip${why:+ [$why]}"; exit 0
+fi
 echo "$result" | grep -v '^\[vgpu\] .* plan created' || true
 if grep -qE 'VirtualGPU error \[|is not implemented by VirtualGPU' <<< "$result"; then
   echo "FAIL: a kernel was refused or a stub reached"; exit 1
