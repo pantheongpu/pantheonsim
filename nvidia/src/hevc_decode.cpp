@@ -50,6 +50,12 @@ bool Dec::run(const std::vector<SliceData>& slices) {
     fail("invalid block sizes");
     return false;
   }
+  // 7.4.3.2.1: the picture is a whole number of minimum-size coding blocks. A damaged SPS can break that, and then the last
+  // blocks would be predicted and reconstructed past the end of the planes.
+  if ((W & ((1 << log2_min_cb) - 1)) || (H & ((1 << log2_min_cb) - 1))) {
+    fail("the picture size is not a multiple of the minimum coding block size");
+    return false;
+  }
   // scaling factors from the lists the caller resolved
   if (P.scaling_list_enabled) {
     for (int m = 0; m < 6; ++m) {

@@ -52,9 +52,15 @@ else
   if [[ ! -e "$shim/libnvcuvid.so.1" ]]; then
     echo "SKIP: libvgpunvcuvid not built (the CUDA ABI headers were absent at build time)"; exit 0
   fi
+  # The shim holds libnvcuvid.so.1 only, like the driver; -lnvcuvid wants the unversioned name (a machine with the
+  # driver's dev symlink found that one, a CI runner without it failed to link), so name it from a directory of ours.
+  mkdir -p "$out.lib"
+  ln -sf "$shim/libnvcuvid.so.1" "$out.lib/libnvcuvid.so"
   # shellcheck disable=SC2207
-  flags+=($(shim_sanitizer_nvcc_flags "$shim") -L "$shim")
-  env_prefix=(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim" "VGPU_E2E_DATA=$data")
+  flags+=($(shim_sanitizer_nvcc_flags "$shim") -L "$out.lib" -L "$shim")
+  # libnvcuvid and libcuda each carry the simulator's core: both_shims_env is what a sanitizer build needs for that.
+  # shellcheck disable=SC2046
+  env_prefix=(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim" "VGPU_E2E_DATA=$data")
   [[ -n $skip ]] && args+=(--skip "$skip")
 fi
 nvcc "${flags[@]}" "$here/nvcuvid_h264.cpp" -o "$out" -ldl -lcuda -lnvcuvid

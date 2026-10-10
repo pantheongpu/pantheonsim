@@ -2148,7 +2148,7 @@ if(TARGET vgpucublas)
       DEPENDS vgpunvenc
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};NVENC_INCLUDE=${NVENC_INCLUDE}"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
-      TIMEOUT 300)
+      TIMEOUT 600)
   endif()
 
   # NVDEC's cuvid API (Motion JPEG), against what an RTX 3060's libnvcuvid printed

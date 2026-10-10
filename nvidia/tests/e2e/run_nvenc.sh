@@ -17,6 +17,8 @@
 #          libraries on a real card instead (LD_LIBRARY_PATH from VGPU_CARD_LIBS,
 #          default /usr/local/cuda-13.0/lib64:/usr/lib/wsl/lib): nvenc_api must
 #          still print the golden file, the others run with --card
+# A shim built with a sanitizer runs nvenc_nvdec with --light (the long rate-control cases left out): a TSan build needed more than the
+# test's whole time limit for them.
 # --update with --card, rewrite the golden file from the card's output
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -42,6 +44,7 @@ if [[ $mode == sim && ! -e "$shim/libnvidia-encode.so.1" ]]; then
   echo "SKIP: libvgpunvenc not built (nvEncodeAPI.h absent at build time)"; exit 0
 fi
 
+light=()
 flags=(-w -std=c++17 -cudart shared -arch=compute_86 -code=compute_86 -Wno-deprecated-gpu-targets -I "$inc")
 if [[ $mode == card ]]; then
   env_prefix=(env "LD_LIBRARY_PATH=${VGPU_CARD_LIBS:-/usr/local/cuda-13.0/lib64:/usr/lib/wsl/lib}")
@@ -53,6 +56,7 @@ else
   # shellcheck disable=SC2046
   env_prefix=(env $(both_shims_env "$shim") VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "LD_LIBRARY_PATH=$shim")
   lossy=()
+  if [[ -n "$(shim_sanitizer "$shim")" ]]; then light=(--light); fi
 fi
 
 fail=0
@@ -88,7 +92,7 @@ if [[ $mode == card || -e "$shim/libnvcuvid.so.1" ]]; then
   nvdec_inc="$root/nvidia/third_party/nvdec_include"
   nvcc "${flags[@]}" -I "$nvdec_inc" "$here/nvenc_nvdec.cpp" -o "${out}_nvdec" -ldl -lcuda
   if [[ $mode == sim ]] && ! require_shim_libs "$shim" "${out}_nvdec"; then exit 0; fi
-  nvdec="$("${env_prefix[@]}" "${out}_nvdec" "${lossy[@]}" 2>&1)" || { echo "$nvdec"; fail=1; }
+  nvdec="$("${env_prefix[@]}" "${out}_nvdec" "${lossy[@]}" "${light[@]}" 2>&1)" || { echo "$nvdec"; fail=1; }
   echo "$nvdec"
   [[ "$nvdec" == SKIP* || "$nvdec" == *PASS* ]] || fail=1
 else

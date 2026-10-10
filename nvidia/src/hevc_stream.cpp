@@ -53,6 +53,10 @@ class Collector : public ParserSink {
     const Frame& f = *it->second;
     const SeqInfo seq = seq_of_[info.pic_idx];
     if (f.y.empty() || seq.disp_right > f.width || seq.disp_bottom > f.height) return 1;
+    // A damaged stream can describe a picture whose size is not a multiple of two (the decoder then refuses to decode it, but the
+    // frame store is still displayed) or a window that is empty or inverted: show nothing rather than read outside the planes.
+    if (seq.disp_left < 0 || seq.disp_top < 0 || seq.disp_right <= seq.disp_left || seq.disp_bottom <= seq.disp_top) return 1;
+    if ((seq.disp_right - seq.disp_left + 1) / 2 + seq.disp_left / 2 > f.cwidth || (seq.disp_bottom - seq.disp_top + 1) / 2 + seq.disp_top / 2 > f.cheight) return 1;
     OutFrame o;
     const int l = seq.disp_left, t = seq.disp_top;
     o.width = seq.disp_right - seq.disp_left;

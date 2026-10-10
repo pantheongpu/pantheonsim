@@ -11,6 +11,9 @@
 // Run against VirtualGPU's libraries it checks the encoder with the decoder of the same tree;
 // run with --card it is NVIDIA's encoder and NVIDIA's decoder against ffmpeg.
 //
+// --light (run_nvenc.sh passes it for a build under a sanitizer, which runs this 10 to 20 times slower): leave out the cases of more than
+// a million pixels in all, the long rate-control runs. The normal build and the card run them.
+//
 // SKIP (exit 0) when libnvidia-encode.so.1 or libnvcuvid.so.1 is missing. Without ffmpeg or ffprobe only the comparison with ffmpeg is skipped.
 #include <dlfcn.h>
 #include <cuda.h>
@@ -471,9 +474,11 @@ std::string types_string(const std::vector<int>& types) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   bool card = false;
+  bool light = false;
   const char* only = nullptr;   // --only <text>: run the cases whose names contain it
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--card")) card = true;
+    else if (!std::strcmp(argv[i], "--light")) light = true;
     else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
   }
   void* enclib = dlopen("libnvidia-encode.so.1", RTLD_NOW);
@@ -721,6 +726,10 @@ int main(int argc, char** argv) {
   int failures = 0;
   for (const Case& c : cases) {
     if (only && !std::strstr(c.name, only)) continue;
+    if (light && static_cast<long long>(c.w) * c.h * c.frames > 1000000) {
+      std::printf("left out under --light: %s\n", c.name);
+      continue;
+    }
     Encoded e = encode(ctx, c);
     if (!e.error.empty()) {
       std::printf("FAIL %s: %s\n", c.name, e.error.c_str());
