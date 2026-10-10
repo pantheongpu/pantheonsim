@@ -6892,6 +6892,8 @@ VGPU_PT_ALIAS(cuMemPrefetchBatchAsync_ptsz, cuMemPrefetchBatchAsync)
 VGPU_PT_ALIAS(cuMemcpy3DBatchAsync_v2_ptsz, cuMemcpy3DBatchAsync_v2)
 VGPU_PT_ALIAS(cuMemcpy3DPeerAsync_ptsz, cuMemcpy3DPeerAsync)
 VGPU_PT_ALIAS(cuMemcpyBatchAsync_v2_ptsz, cuMemcpyBatchAsync_v2)
+VGPU_PT_ALIAS(cuMemcpyBatchAsync_ptsz, cuMemcpyBatchAsync)   // CUDA 12.8 and 12.9's spelling, with the failure index
+VGPU_PT_ALIAS(cuMemcpy3DBatchAsync_ptsz, cuMemcpy3DBatchAsync)
 VGPU_PT_ALIAS(cuSignalExternalSemaphoresAsync_ptsz, cuSignalExternalSemaphoresAsync)
 VGPU_PT_ALIAS(cuStreamCopyAttributes_ptsz, cuStreamCopyAttributes)
 VGPU_PT_ALIAS(cuStreamGetAttribute_ptsz, cuStreamGetAttribute)

@@ -585,16 +585,19 @@ static CUresult cuMemcpy3DPeerAsync_impl(const void* pCopy, CUstream hStream) {
   return cuMemcpy3DPeer(pCopy);
 }
 
-// Copies in a batch (CUDA 13: no failure index): `count` copies, with attributes for runs of them. As the
-// runtime's cudaMemcpyBatchAsync, and the card's, for a count or an attribute count of 0, a null array, an
-// attribute list that does not start at copy 0, a source access order outside the three and flags past bit 0
-// (CUDA_ERROR_INVALID_VALUE); each copy is then an async copy of the default kind.
-static CUresult cuMemcpyBatchAsync_v2_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, CUstream hStream);
-VGPU_EXPORT CUresult cuMemcpyBatchAsync_v2(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, CUstream hStream) { return traced("cuMemcpyBatchAsync_v2", cuMemcpyBatchAsync_v2_impl, dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, hStream); }
-static CUresult cuMemcpyBatchAsync_v2_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, CUstream hStream) {
+// Copies in a batch: `count` copies, with attributes for runs of them. As the runtime's cudaMemcpyBatchAsync, and the
+// card's, for a count or an attribute count of 0, a null array, an attribute list that does not start at copy 0, a
+// source access order outside the three and flags past bit 0 (CUDA_ERROR_INVALID_VALUE); each copy is then an async
+// copy of the default kind. CUDA 12.8 and 12.9 spell the call cuMemcpyBatchAsync and take a `failIdx`; CUDA 13 renamed
+// it _v2, with no failIdx. The card's driver exports both and so does this library, so a program of either
+// toolkit binds. What the card does with failIdx (exports_sweep_driver.rtx3060.expected): the legacy default stream is
+// refused before it is touched; after that it is SIZE_MAX, and stays so for an error that is not one copy's (a count,
+// a null array, an attribute) and for a batch that succeeds; a copy with a size of 0 sets it to that copy's index.
+static CUresult memcpy_batch_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, size_t* failIdx, CUstream hStream) {
   // The legacy default stream is refused (CUDA_ERROR_INVALID_VALUE on an RTX 3060, which takes any stream made with
   // cuStreamCreate); the runtime's cudaMemcpyBatchAsync takes it.
   if (!hStream) return CUDA_ERROR_INVALID_VALUE;
+  if (failIdx) *failIdx = static_cast<size_t>(-1);
   if (!count || !dsts || !srcs || !sizes || !attrs || !attrsIdxs || !numAttrs) return CUDA_ERROR_INVALID_VALUE;
   if (attrsIdxs[0] != 0) return CUDA_ERROR_INVALID_VALUE;
   const auto* a = static_cast<const MemcpyAttributesABI*>(attrs);
@@ -603,26 +606,50 @@ static CUresult cuMemcpyBatchAsync_v2_impl(unsigned long long* dsts, unsigned lo
     if (a[i].srcAccessOrder < 1 || a[i].srcAccessOrder > 3 || (a[i].flags & ~1u)) return CUDA_ERROR_INVALID_VALUE;
   }
   for (size_t i = 0; i < count; ++i)
-    if (!sizes[i]) return CUDA_ERROR_INVALID_VALUE;
+    if (!sizes[i]) {
+      if (failIdx) *failIdx = i;
+      return CUDA_ERROR_INVALID_VALUE;
+    }
   for (size_t i = 0; i < count; ++i)
-    if (const CUresult r = cuMemcpyAsync(dsts[i], srcs[i], sizes[i], hStream); r != CUDA_SUCCESS) return r;
+    if (const CUresult r = cuMemcpyAsync(dsts[i], srcs[i], sizes[i], hStream); r != CUDA_SUCCESS) {
+      if (failIdx) *failIdx = i;
+      return r;
+    }
   return CUDA_SUCCESS;
+}
+
+static CUresult cuMemcpyBatchAsync_v2_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, CUstream hStream);
+VGPU_EXPORT CUresult cuMemcpyBatchAsync_v2(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, CUstream hStream) { return traced("cuMemcpyBatchAsync_v2", cuMemcpyBatchAsync_v2_impl, dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, hStream); }
+static CUresult cuMemcpyBatchAsync_v2_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, CUstream hStream) {
+  return memcpy_batch_impl(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, nullptr, hStream);
+}
+
+static CUresult cuMemcpyBatchAsync_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, size_t* failIdx, CUstream hStream);
+VGPU_EXPORT CUresult cuMemcpyBatchAsync(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, size_t* failIdx, CUstream hStream) { return traced("cuMemcpyBatchAsync", cuMemcpyBatchAsync_impl, dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, failIdx, hStream); }
+static CUresult cuMemcpyBatchAsync_impl(unsigned long long* dsts, unsigned long long* srcs, size_t* sizes, size_t count, void* attrs, size_t* attrsIdxs, size_t numAttrs, size_t* failIdx, CUstream hStream) {
+  return memcpy_batch_impl(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, failIdx, hStream);
 }
 
 // The same for boxes, each operand a pointer (with the length of a row and the height of a layer, in elements)
 // or an array (with an offset): flags other than 0, a count of 0, a null list, a box with a dimension of 0, an
-// operand type that does not exist and an invalid access order are CUDA_ERROR_INVALID_VALUE.
-static CUresult cuMemcpy3DBatchAsync_v2_impl(size_t numOps, void* opList, unsigned long long flags, CUstream hStream);
-VGPU_EXPORT CUresult cuMemcpy3DBatchAsync_v2(size_t numOps, void* opList, unsigned long long flags, CUstream hStream) { return traced("cuMemcpy3DBatchAsync_v2", cuMemcpy3DBatchAsync_v2_impl, numOps, opList, flags, hStream); }
-static CUresult cuMemcpy3DBatchAsync_v2_impl(size_t numOps, void* opList, unsigned long long flags, CUstream hStream) {
-  if (!hStream || !numOps || !opList || flags != 0) return CUDA_ERROR_INVALID_VALUE;   // the legacy default stream too, as above
+// operand type that does not exist and an invalid access order are CUDA_ERROR_INVALID_VALUE. cuMemcpy3DBatchAsync
+// (CUDA 12.8 and 12.9) takes the failure index too, between the list and the flags: as above the legacy stream leaves
+// it alone, a count, a null list and the flags leave SIZE_MAX, and each fault of a box (an extent, an access order,
+// flags, an operand type) names that box (measured on an RTX 3060).
+static CUresult memcpy3d_batch_impl(size_t numOps, void* opList, size_t* failIdx, unsigned long long flags, CUstream hStream) {
+  if (!hStream) return CUDA_ERROR_INVALID_VALUE;   // the legacy default stream too, as above
+  if (failIdx) *failIdx = static_cast<size_t>(-1);
+  if (!numOps || !opList || flags != 0) return CUDA_ERROR_INVALID_VALUE;
   const auto* ops = static_cast<const Memcpy3DBatchOpABI*>(opList);
   for (size_t i = 0; i < numOps; ++i) {
     const Memcpy3DBatchOpABI& op = ops[i];
-    if (!op.width || !op.height || !op.depth) return CUDA_ERROR_INVALID_VALUE;
-    if (op.srcAccessOrder < 1 || op.srcAccessOrder > 3 || (op.flags & ~1u)) return CUDA_ERROR_INVALID_VALUE;
-    for (const Memcpy3DOperandABI* o : {&op.src, &op.dst})
-      if (o->type != 1 && o->type != 2) return CUDA_ERROR_INVALID_VALUE;
+    bool bad = !op.width || !op.height || !op.depth;
+    bad = bad || op.srcAccessOrder < 1 || op.srcAccessOrder > 3 || (op.flags & ~1u);
+    for (const Memcpy3DOperandABI* o : {&op.src, &op.dst}) bad = bad || (o->type != 1 && o->type != 2);
+    if (bad) {
+      if (failIdx) *failIdx = i;
+      return CUDA_ERROR_INVALID_VALUE;
+    }
   }
   for (size_t i = 0; i < numOps; ++i) {
     const Memcpy3DBatchOpABI& op = ops[i];
@@ -648,9 +675,24 @@ static CUresult cuMemcpy3DBatchAsync_v2_impl(size_t numOps, void* opList, unsign
       c.dstArray = static_cast<CUarray>(op.dst.op.array.array);
       c.dstXInBytes = op.dst.op.array.x; c.dstY = op.dst.op.array.y; c.dstZ = op.dst.op.array.z;
     }
-    if (const CUresult r = cuMemcpy3DAsync_v2(&c, hStream); r != CUDA_SUCCESS) return r;
+    if (const CUresult r = cuMemcpy3DAsync_v2(&c, hStream); r != CUDA_SUCCESS) {
+      if (failIdx) *failIdx = i;
+      return r;
+    }
   }
   return CUDA_SUCCESS;
+}
+
+static CUresult cuMemcpy3DBatchAsync_v2_impl(size_t numOps, void* opList, unsigned long long flags, CUstream hStream);
+VGPU_EXPORT CUresult cuMemcpy3DBatchAsync_v2(size_t numOps, void* opList, unsigned long long flags, CUstream hStream) { return traced("cuMemcpy3DBatchAsync_v2", cuMemcpy3DBatchAsync_v2_impl, numOps, opList, flags, hStream); }
+static CUresult cuMemcpy3DBatchAsync_v2_impl(size_t numOps, void* opList, unsigned long long flags, CUstream hStream) {
+  return memcpy3d_batch_impl(numOps, opList, nullptr, flags, hStream);
+}
+
+static CUresult cuMemcpy3DBatchAsync_impl(size_t numOps, void* opList, size_t* failIdx, unsigned long long flags, CUstream hStream);
+VGPU_EXPORT CUresult cuMemcpy3DBatchAsync(size_t numOps, void* opList, size_t* failIdx, unsigned long long flags, CUstream hStream) { return traced("cuMemcpy3DBatchAsync", cuMemcpy3DBatchAsync_impl, numOps, opList, failIdx, flags, hStream); }
+static CUresult cuMemcpy3DBatchAsync_impl(size_t numOps, void* opList, size_t* failIdx, unsigned long long flags, CUstream hStream) {
+  return memcpy3d_batch_impl(numOps, opList, failIdx, flags, hStream);
 }
 
 // ---- arrays -------------------------------------------------------------------------------------------------------------------
