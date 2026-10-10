@@ -109,8 +109,10 @@ int main(int argc, char** argv) {
       add(name, G2D, false, true, true, an, bq / 256.0f, 0.f, kNoMax);
     }
   // level clamps apply to the sharpened level of detail
+  // (an array: nvcc 12.0 to 12.8 cannot deduce the element type of a braced list written in the loop header)
+  static const std::pair<float, float> kClamps[] = {{1.4f, 4.f}, {0.f, 2.3f}, {1.4f, 2.6f}, {2.0f, 2.0f}, {0.6f, 3.9f}, {3.0f, 1.0f}};
   for (unsigned an : {2u, 4u, 8u})
-    for (auto [mn, mx] : {std::pair<float, float>{1.4f, 4.f}, {0.f, 2.3f}, {1.4f, 2.6f}, {2.0f, 2.0f}, {0.6f, 3.9f}, {3.0f, 1.0f}})
+    for (auto [mn, mx] : kClamps)
       for (float bias : {0.f, 0.4f}) {
         char name[96];
         std::snprintf(name, sizeof name, "2d f32 linear mip-linear aniso%u min%.1f max%.1f bias%.1f", an, mn, mx, bias);
