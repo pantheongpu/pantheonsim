@@ -20,15 +20,23 @@
 
 namespace vgpu_nvenc {
 
+struct HevcOptions {
+  int num_ref = 1;   // reference pictures a P picture may use (1 .. 4)
+  int max_b = 0;     // B pictures between P pictures (0: none)
+};
+
 class HevcEncoder : public VideoEncoder {
  public:
   HevcEncoder(int width, int height, int fps_num, int fps_den);
+  HevcEncoder(int width, int height, int fps_num, int fps_den, const HevcOptions& opt);
   ~HevcEncoder() override;
 
   std::vector<uint8_t> parameter_sets() const override;   // VPS, SPS, PPS
   std::vector<uint8_t> encode(const EncPicture& in, PicType type, int qp, EncStats* stats = nullptr) override;
   void reset() override;
   void rollback() override;
+  bool supports_b() const override;
+  std::vector<uint8_t> encode_at(const EncPicture& in, PicType type, int qp, int poc, EncStats* stats = nullptr) override;
 
   // For tests: the reconstruction of the last picture (what a decoder returns), as coded_width() x coded_height() luma samples (multiples of
   // eight) and the two chroma planes.

@@ -844,8 +844,17 @@ vgpu_nvenc::H264Options h264_options(const NV_ENC_CONFIG& c, int profile) {
   return o;
 }
 
+vgpu_nvenc::HevcOptions hevc_options(const NV_ENC_CONFIG& c) {
+  const NV_ENC_CONFIG_HEVC& h = c.encodeCodecConfig.hevcConfig;
+  vgpu_nvenc::HevcOptions o;
+  const uint32_t refs = raw(h.numRefL0);
+  o.num_ref = refs >= 1 && refs <= 7 ? static_cast<int>(std::min<uint32_t>(refs, 4)) : 2;
+  o.max_b = c.frameIntervalP > 1 ? c.frameIntervalP - 1 : 0;
+  return o;
+}
+
 std::unique_ptr<vgpu_nvenc::VideoEncoder> make_encoder(int codec, const NV_ENC_CONFIG& c, int w, int h, int fn, int fd) {
-  if (codec == kHevc) return std::make_unique<vgpu_nvenc::HevcEncoder>(w, h, fn, fd);
+  if (codec == kHevc) return std::make_unique<vgpu_nvenc::HevcEncoder>(w, h, fn, fd, hevc_options(c));
   const int profile = h264_profile_idc(c);
   return std::make_unique<vgpu_nvenc::H264Encoder>(w, h, fn, fd, profile, h264_options(c, profile));
 }
@@ -930,7 +939,10 @@ struct Input1 {
 
 // A number that changes with every setting the encoder is built from.
 uint64_t config_sig(const Session& s) {
-  if (s.codec != kH264) return 0;
+  if (s.codec == kHevc) {
+    const vgpu_nvenc::HevcOptions o = hevc_options(s.config);
+    return 0x4845564300000000ull ^ (static_cast<uint64_t>(o.num_ref) << 8) ^ static_cast<uint64_t>(o.max_b);
+  }
   const int profile = h264_profile_idc(s.config);
   const vgpu_nvenc::H264Options o = h264_options(s.config, profile);
   uint64_t v = 1469598103934665603ull;
