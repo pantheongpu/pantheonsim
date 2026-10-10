@@ -37,7 +37,7 @@ else
   nvcc -std=c++17 -cudart shared -arch=sm_86 -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") \
        -I"$inc" "$src" -L"$shim" -lnccl -o "$out/prog"
   require_shim_libs "$shim" "$out/prog" || exit 0
-  result="$(VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=2 VGPU_NCCL_RANKS=2 VGPU_NCCL_DIR="$out/rendezvous" \
+  result="$(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_DEVICE_COUNT=2 VGPU_NCCL_RANKS=2 VGPU_NCCL_DIR="$out/rendezvous" \
             VGPU_NCCL_TIMEOUT=120 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim") "$out/prog" 2>&1 || true)"
 fi
 echo "$result"
