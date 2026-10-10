@@ -119,144 +119,332 @@ WatershedBufferSize null                  st=-8
 4-way distinct 4x4 #3                    st=0 image sum=873 wsum=6775 guard=0 labels sum=56 wsum=628
 4-way distinct 4x4 #4                    st=0 image sum=1212 wsum=10320 guard=0 labels sum=75 wsum=854
 4-way distinct 4x4 #5                    st=0 image sum=260 wsum=1913 guard=0 labels sum=70 wsum=800
-4-way distinct 4x4 black                 st=0 image sum=55217 wsum=417006 guard=2640 labels sum=67 wsum=814
-4-way distinct 3x4 #0                    st=0 image sum=362 wsum=2098 guard=0 labels sum=42 wsum=382
-4-way distinct 3x4 #1                    st=0 image sum=390 wsum=3283 guard=0 labels sum=36 wsum=323
-4-way distinct 3x4 #2                    st=0 image sum=965 wsum=7896 guard=0 labels sum=31 wsum=287
-4-way distinct 3x4 #3                    st=0 image sum=266 wsum=1466 guard=0 labels sum=36 wsum=342
-4-way distinct 3x4 #4                    st=0 image sum=537 wsum=2444 guard=0 labels sum=48 wsum=401
-4-way distinct 3x4 #5                    st=0 image sum=697 wsum=4426 guard=0 labels sum=32 wsum=272
-4-way distinct 3x4 black                 st=0 image sum=66261 wsum=311172 guard=2640 labels sum=48 wsum=440
-4-way distinct 4x3 #0                    st=0 image sum=1105 wsum=6799 guard=0 labels sum=25 wsum=233
-4-way distinct 4x3 #1                    st=0 image sum=668 wsum=4190 guard=0 labels sum=34 wsum=254
-4-way distinct 4x3 #2                    st=0 image sum=1020 wsum=7486 guard=0 labels sum=30 wsum=264
-4-way distinct 4x3 #3                    st=0 image sum=1276 wsum=6365 guard=0 labels sum=44 wsum=392
-4-way distinct 4x3 #4                    st=0 image sum=180 wsum=834 guard=0 labels sum=60 wsum=432
-4-way distinct 4x3 #5                    st=0 image sum=220 wsum=2030 guard=0 labels sum=26 wsum=259
-4-way distinct 4x3 black                 st=0 image sum=52332 wsum=304917 guard=1980 labels sum=22 wsum=205
-4-way distinct 2x2 #0                    st=0 image sum=44 wsum=100 guard=0 labels sum=0 wsum=0
-4-way distinct 2x2 #1                    st=0 image sum=140 wsum=350 guard=0 labels sum=0 wsum=0
-4-way distinct 2x2 #2                    st=0 image sum=252 wsum=630 guard=0 labels sum=0 wsum=0
-4-way distinct 2x2 #3                    st=0 image sum=177 wsum=393 guard=0 labels sum=3 wsum=9
-4-way distinct 2x2 #4                    st=0 image sum=116 wsum=290 guard=0 labels sum=0 wsum=0
-4-way distinct 2x2 #5                    st=0 image sum=128 wsum=320 guard=0 labels sum=0 wsum=0
-4-way distinct 2x2 black                 st=0 image sum=5272 wsum=13180 guard=1320 labels sum=0 wsum=0
+4-way distinct 16u 4x4 #0                st=0 image sum=111185 wsum=917680 guard=0 labels sum=67 wsum=814
+4-way distinct 16u 4x4 #1                st=0 image sum=158142 wsum=1234548 guard=0 labels sum=62 wsum=728
+4-way distinct 4x4 black                 st=0 image sum=53388 wsum=440038 guard=2640 labels sum=71 wsum=842
+4-way distinct 3x4 #0                    st=0 image sum=298 wsum=2764 guard=0 labels sum=35 wsum=302
+4-way distinct 3x4 #1                    st=0 image sum=507 wsum=3665 guard=0 labels sum=22 wsum=220
+4-way distinct 3x4 #2                    st=0 image sum=148 wsum=696 guard=0 labels sum=48 wsum=396
+4-way distinct 3x4 #3                    st=0 image sum=556 wsum=2690 guard=0 labels sum=40 wsum=344
+4-way distinct 3x4 #4                    st=0 image sum=842 wsum=5295 guard=0 labels sum=44 wsum=411
+4-way distinct 3x4 #5                    st=0 image sum=60 wsum=606 guard=0 labels sum=39 wsum=321
+4-way distinct 16u 3x4 #0                st=0 image sum=131356 wsum=543970 guard=0 labels sum=32 wsum=266
+4-way distinct 16u 3x4 #1                st=0 image sum=160839 wsum=1458120 guard=0 labels sum=34 wsum=302
+4-way distinct 3x4 black                 st=0 image sum=99603 wsum=640053 guard=2640 labels sum=35 wsum=275
+4-way distinct 4x3 #0                    st=0 image sum=306 wsum=1530 guard=0 labels sum=54 wsum=378
+4-way distinct 4x3 #1                    st=0 image sum=161 wsum=1030 guard=0 labels sum=50 wsum=322
+4-way distinct 4x3 #2                    st=0 image sum=352 wsum=2623 guard=0 labels sum=12 wsum=93
+4-way distinct 4x3 #3                    st=0 image sum=510 wsum=3080 guard=0 labels sum=20 wsum=143
+4-way distinct 4x3 #4                    st=0 image sum=1253 wsum=7853 guard=0 labels sum=44 wsum=344
+4-way distinct 4x3 #5                    st=0 image sum=444 wsum=2000 guard=0 labels sum=45 wsum=383
+4-way distinct 16u 4x3 #0                st=0 image sum=88707 wsum=482029 guard=0 labels sum=26 wsum=198
+4-way distinct 16u 4x3 #1                st=0 image sum=60402 wsum=590184 guard=0 labels sum=18 wsum=150
+4-way distinct 4x3 black                 st=0 image sum=31035 wsum=154024 guard=1980 labels sum=12 wsum=93
+4-way distinct 2x2 #0                    st=0 image sum=132 wsum=330 guard=0 labels sum=4 wsum=10
+4-way distinct 2x2 #1                    st=0 image sum=129 wsum=270 guard=0 labels sum=0 wsum=0
+4-way distinct 2x2 #2                    st=0 image sum=236 wsum=608 guard=0 labels sum=0 wsum=0
+4-way distinct 2x2 #3                    st=0 image sum=88 wsum=220 guard=0 labels sum=4 wsum=10
+4-way distinct 2x2 #4                    st=0 image sum=46 wsum=120 guard=0 labels sum=0 wsum=0
+4-way distinct 2x2 #5                    st=0 image sum=159 wsum=498 guard=0 labels sum=1 wsum=4
+4-way distinct 16u 2x2 #0                st=0 image sum=30717 wsum=94182 guard=0 labels sum=1 wsum=4
+4-way distinct 16u 2x2 #1                st=0 image sum=69249 wsum=185298 guard=0 labels sum=1 wsum=4
+4-way distinct 2x2 black                 st=0 image sum=30124 wsum=45186 guard=1320 labels sum=0 wsum=0
 4-way distinct 1x4 #0                    st=0 image sum=80 wsum=200 guard=0 labels sum=4 wsum=10
-4-way distinct 1x4 #1                    st=0 image sum=522 wsum=1059 guard=0 labels sum=4 wsum=14
-4-way distinct 1x4 #2                    st=0 image sum=55 wsum=208 guard=0 labels sum=2 wsum=8
-4-way distinct 1x4 #3                    st=0 image sum=205 wsum=319 guard=0 labels sum=3 wsum=9
-4-way distinct 1x4 #4                    st=0 image sum=120 wsum=300 guard=0 labels sum=4 wsum=10
-4-way distinct 1x4 #5                    st=0 image sum=36 wsum=90 guard=0 labels sum=0 wsum=0
-4-way distinct 1x4 black                 st=0 image sum=40368 wsum=144417 guard=2640 labels sum=2 wsum=7
-4-way distinct 4x1 #0                    st=0 image sum=308 wsum=728 guard=0 labels sum=3 wsum=9
-4-way distinct 4x1 #1                    st=0 image sum=160 wsum=478 guard=0 labels sum=2 wsum=8
-4-way distinct 4x1 #2                    st=0 image sum=320 wsum=800 guard=0 labels sum=0 wsum=0
-4-way distinct 4x1 #3                    st=0 image sum=304 wsum=760 guard=0 labels sum=0 wsum=0
-4-way distinct 4x1 #4                    st=0 image sum=336 wsum=840 guard=0 labels sum=0 wsum=0
-4-way distinct 4x1 #5                    st=0 image sum=196 wsum=490 guard=0 labels sum=4 wsum=10
-4-way distinct 4x1 black                 st=0 image sum=35605 wsum=55390 guard=660 labels sum=3 wsum=9
-4-way distinct 3x3 #0                    st=0 image sum=717 wsum=4281 guard=0 labels sum=16 wsum=112
-4-way distinct 3x3 #1                    st=0 image sum=237 wsum=1775 guard=0 labels sum=15 wsum=95
-4-way distinct 3x3 #2                    st=0 image sum=689 wsum=3668 guard=0 labels sum=21 wsum=135
-4-way distinct 3x3 #3                    st=0 image sum=486 wsum=2007 guard=0 labels sum=17 wsum=108
-4-way distinct 3x3 #4                    st=0 image sum=135 wsum=675 guard=0 labels sum=9 wsum=45
-4-way distinct 3x3 #5                    st=0 image sum=393 wsum=2077 guard=0 labels sum=8 wsum=56
-4-way distinct 3x3 black                 st=0 image sum=56369 wsum=229049 guard=1980 labels sum=15 wsum=115
-8u ties 9x7 range 2 none                 st=0 image sum=1 wsum=37 guard=3465
+4-way distinct 1x4 #1                    st=0 image sum=34 wsum=70 guard=0 labels sum=3 wsum=9
+4-way distinct 1x4 #2                    st=0 image sum=268 wsum=670 guard=0 labels sum=4 wsum=10
+4-way distinct 1x4 #3                    st=0 image sum=272 wsum=912 guard=0 labels sum=4 wsum=14
+4-way distinct 1x4 #4                    st=0 image sum=794 wsum=2083 guard=0 labels sum=2 wsum=7
+4-way distinct 1x4 #5                    st=0 image sum=166 wsum=664 guard=0 labels sum=2 wsum=8
+4-way distinct 16u 1x4 #0                st=0 image sum=77334 wsum=202717 guard=0 labels sum=2 wsum=7
+4-way distinct 16u 1x4 #1                st=0 image sum=21356 wsum=53390 guard=0 labels sum=0 wsum=0
+4-way distinct 1x4 black                 st=0 image sum=46896 wsum=95816 guard=2640 labels sum=3 wsum=9
+4-way distinct 4x1 #0                    st=0 image sum=626 wsum=1723 guard=0 labels sum=4 wsum=14
+4-way distinct 4x1 #1                    st=0 image sum=182 wsum=365 guard=0 labels sum=4 wsum=14
+4-way distinct 4x1 #2                    st=0 image sum=226 wsum=591 guard=0 labels sum=4 wsum=14
+4-way distinct 4x1 #3                    st=0 image sum=190 wsum=706 guard=0 labels sum=2 wsum=8
+4-way distinct 4x1 #4                    st=0 image sum=112 wsum=280 guard=0 labels sum=0 wsum=0
+4-way distinct 4x1 #5                    st=0 image sum=332 wsum=830 guard=0 labels sum=0 wsum=0
+4-way distinct 16u 4x1 #0                st=0 image sum=131142 wsum=329253 guard=0 labels sum=4 wsum=14
+4-way distinct 16u 4x1 #1                st=0 image sum=41600 wsum=104000 guard=0 labels sum=0 wsum=0
+4-way distinct 4x1 black                 st=0 image sum=24042 wsum=92503 guard=660 labels sum=4 wsum=14
+4-way distinct 3x3 #0                    st=0 image sum=1038 wsum=5223 guard=0 labels sum=7 wsum=34
+4-way distinct 3x3 #1                    st=0 image sum=484 wsum=2858 guard=0 labels sum=13 wsum=87
+4-way distinct 3x3 #2                    st=0 image sum=289 wsum=1535 guard=0 labels sum=16 wsum=106
+4-way distinct 3x3 #3                    st=0 image sum=393 wsum=1692 guard=0 labels sum=22 wsum=144
+4-way distinct 3x3 #4                    st=0 image sum=832 wsum=4160 guard=0 labels sum=8 wsum=40
+4-way distinct 3x3 #5                    st=0 image sum=88 wsum=356 guard=0 labels sum=20 wsum=130
+4-way distinct 16u 3x3 #0                st=0 image sum=51101 wsum=271157 guard=0 labels sum=8 wsum=68
+4-way distinct 16u 3x3 #1                st=0 image sum=134076 wsum=698704 guard=0 labels sum=15 wsum=83
+4-way distinct 3x3 black                 st=0 image sum=44757 wsum=130194 guard=1980 labels sum=30 wsum=195
+4-way distinct 5x5 #0                    st=0 image sum=1738 wsum=26917 guard=0 labels sum=206 wsum=3739
+4-way distinct 5x5 #1                    st=0 image sum=2078 wsum=25474 guard=0 labels sum=202 wsum=3628
+4-way distinct 5x5 #2                    st=0 image sum=800 wsum=14419 guard=0 labels sum=197 wsum=3486
+4-way distinct 5x5 #3                    st=0 image sum=900 wsum=14188 guard=0 labels sum=168 wsum=2972
+4-way distinct 5x5 #4                    st=0 image sum=1086 wsum=16539 guard=0 labels sum=207 wsum=3749
+4-way distinct 5x5 #5                    st=0 image sum=659 wsum=7811 guard=0 labels sum=260 wsum=4276
+4-way distinct 16u 5x5 #0                st=0 image sum=219000 wsum=2832843 guard=0 labels sum=199 wsum=3565
+4-way distinct 16u 5x5 #1                st=0 image sum=161905 wsum=2759306 guard=0 labels sum=221 wsum=3742
+4-way distinct 5x5 black                 st=0 image sum=48233 wsum=333977 guard=3300 labels sum=204 wsum=3858
+4-way distinct 6x9 #0                    st=0 image sum=2735 wsum=75136 guard=0 labels sum=1204 wsum=44505
+4-way distinct 6x9 #1                    st=0 image sum=1808 wsum=57635 guard=0 labels sum=1060 wsum=40052
+4-way distinct 6x9 #2                    st=0 image sum=2416 wsum=51298 guard=0 labels sum=1247 wsum=46185
+4-way distinct 6x9 #3                    st=0 image sum=2259 wsum=65535 guard=0 labels sum=1171 wsum=44794
+4-way distinct 6x9 #4                    st=0 image sum=2226 wsum=75770 guard=0 labels sum=1048 wsum=41252
+4-way distinct 6x9 #5                    st=0 image sum=3141 wsum=106665 guard=0 labels sum=1143 wsum=43291
+4-way distinct 16u 6x9 #0                st=0 image sum=577468 wsum=20185673 guard=0 labels sum=1102 wsum=42093
+4-way distinct 16u 6x9 #1                st=0 image sum=310001 wsum=9014685 guard=0 labels sum=1068 wsum=42046
+4-way distinct 6x9 black                 st=0 image sum=128805 wsum=3923037 guard=5940 labels sum=1069 wsum=41194
+4-way distinct 8x8 #0                    st=0 image sum=2631 wsum=80197 guard=0 labels sum=1396 wsum=60311
+4-way distinct 8x8 #1                    st=0 image sum=3740 wsum=120636 guard=0 labels sum=1602 wsum=71318
+4-way distinct 8x8 #2                    st=0 image sum=2688 wsum=84371 guard=0 labels sum=1464 wsum=66073
+4-way distinct 8x8 #3                    st=0 image sum=2302 wsum=86928 guard=0 labels sum=1603 wsum=70416
+4-way distinct 8x8 #4                    st=0 image sum=2022 wsum=73388 guard=0 labels sum=1653 wsum=72366
+4-way distinct 8x8 #5                    st=0 image sum=2851 wsum=98983 guard=0 labels sum=1626 wsum=71186
+4-way distinct 16u 8x8 #0                st=0 image sum=755653 wsum=25100284 guard=0 labels sum=1566 wsum=70779
+4-way distinct 16u 8x8 #1                st=0 image sum=793568 wsum=24844702 guard=0 labels sum=1594 wsum=70210
+4-way distinct 8x8 black                 st=0 image sum=107718 wsum=1887615 guard=5280 labels sum=1586 wsum=69932
+4-way distinct 12x20 #0                  st=0 image sum=11812 wsum=1418312 guard=0 labels sum=26213 wsum=4299083
+4-way distinct 12x20 #1                  st=0 image sum=11112 wsum=1266231 guard=0 labels sum=26031 wsum=4246939
+4-way distinct 12x20 #2                  st=0 image sum=9888 wsum=1381957 guard=0 labels sum=26469 wsum=4321419
+4-way distinct 12x20 #3                  st=0 image sum=10795 wsum=1389050 guard=0 labels sum=25950 wsum=4231519
+4-way distinct 12x20 #4                  st=0 image sum=10939 wsum=1457673 guard=0 labels sum=26158 wsum=4292024
+4-way distinct 12x20 #5                  st=0 image sum=10456 wsum=1311202 guard=0 labels sum=26111 wsum=4279922
+4-way distinct 16u 12x20 #0              st=0 image sum=2599337 wsum=333545066 guard=0 labels sum=25985 wsum=4290404
+4-way distinct 16u 12x20 #1              st=0 image sum=2449313 wsum=331720491 guard=0 labels sum=26093 wsum=4240515
+4-way distinct 12x20 black               st=0 image sum=469210 wsum=37239131 guard=13200 labels sum=26033 wsum=4253726
+4-way distinct 16x16 #0                  st=0 image sum=12794 wsum=1870996 guard=0 labels sum=28807 wsum=5021938
+4-way distinct 16x16 #1                  st=0 image sum=12164 wsum=1596967 guard=0 labels sum=29105 wsum=5046305
+4-way distinct 16x16 #2                  st=0 image sum=12354 wsum=1677012 guard=0 labels sum=28873 wsum=5057835
+4-way distinct 16x16 #3                  st=0 image sum=12097 wsum=1662356 guard=0 labels sum=29200 wsum=5110782
+4-way distinct 16x16 #4                  st=0 image sum=11623 wsum=1585098 guard=0 labels sum=29171 wsum=5080207
+4-way distinct 16x16 #5                  st=0 image sum=12020 wsum=1749979 guard=0 labels sum=28758 wsum=5045714
+4-way distinct 16u 16x16 #0              st=0 image sum=2734971 wsum=359468189 guard=0 labels sum=29097 wsum=5087806
+4-way distinct 16u 16x16 #1              st=0 image sum=2680232 wsum=399406683 guard=0 labels sum=29178 wsum=5121394
+4-way distinct 16x16 black               st=0 image sum=540194 wsum=50712511 guard=10560 labels sum=29111 wsum=5095365
+4-way distinct 17x15 #0                  st=0 image sum=12228 wsum=1714129 guard=0 labels sum=28480 wsum=4991769
+4-way distinct 17x15 #1                  st=0 image sum=11455 wsum=1751330 guard=0 labels sum=28864 wsum=5004008
+4-way distinct 17x15 #2                  st=0 image sum=13948 wsum=2003980 guard=0 labels sum=28870 wsum=4996352
+4-way distinct 17x15 #3                  st=0 image sum=11537 wsum=1522871 guard=0 labels sum=28435 wsum=4959448
+4-way distinct 17x15 #4                  st=0 image sum=12494 wsum=1697809 guard=0 labels sum=28314 wsum=4963520
+4-way distinct 17x15 #5                  st=0 image sum=12052 wsum=1768725 guard=0 labels sum=29123 wsum=5048757
+4-way distinct 16u 17x15 #0              st=0 image sum=3234078 wsum=484498600 guard=0 labels sum=28800 wsum=5050668
+4-way distinct 16u 17x15 #1              st=0 image sum=2793686 wsum=365975008 guard=0 labels sum=28655 wsum=4991778
+4-way distinct 17x15 black               st=0 image sum=214528 wsum=24500282 guard=9900 labels sum=28238 wsum=4931141
+4-way distinct 16u 33x40 #0              st=0 image sum=11085912 wsum=7395160388 guard=0 labels sum=829672 wsum=737571214
+4-way distinct 16u 33x40 #1              st=0 image sum=9580640 wsum=6717567486 guard=0 labels sum=831529 wsum=739545002
+4-way distinct 33x40 black               st=0 image sum=2122551 wsum=1354060711 guard=26400 labels sum=829344 wsum=736871195
+4-way distinct 16u 64x64 #0              st=0 image sum=30917370 wsum=64880666118 guard=0 labels sum=8134607 wsum=22377076499
+4-way distinct 16u 64x64 #1              st=0 image sum=31119115 wsum=64563781267 guard=0 labels sum=8124909 wsum=22351806287
+4-way distinct 64x64 black               st=0 image sum=5952016 wsum=11636174437 guard=42240 labels sum=8123560 wsum=22358475136
+4-way distinct 16u 113x31 #0             st=0 image sum=28384308 wsum=52398162596 guard=0 labels sum=5746358 wsum=13613665852
+4-way distinct 16u 113x31 #1             st=0 image sum=29285060 wsum=54867991653 guard=0 labels sum=5749590 wsum=13612155050
+4-way distinct 113x31 black              st=0 image sum=4094166 wsum=6421029488 guard=20460 labels sum=5749198 wsum=13619205320
+4-way distinct 1x40 #0                   st=0 image sum=2475 wsum=55953 guard=0 labels sum=746 wsum=20555
+4-way distinct 1x40 #1                   st=0 image sum=1769 wsum=48284 guard=0 labels sum=740 wsum=20488
+4-way distinct 1x40 #2                   st=0 image sum=2211 wsum=43595 guard=0 labels sum=742 wsum=20503
+4-way distinct 1x40 #3                   st=0 image sum=1568 wsum=33617 guard=0 labels sum=739 wsum=20418
+4-way distinct 1x40 #4                   st=0 image sum=3688 wsum=78593 guard=0 labels sum=737 wsum=20350
+4-way distinct 1x40 #5                   st=0 image sum=1768 wsum=35767 guard=0 labels sum=735 wsum=20451
+4-way distinct 16u 1x40 #0               st=0 image sum=481542 wsum=9716358 guard=0 labels sum=744 wsum=20621
+4-way distinct 16u 1x40 #1               st=0 image sum=533080 wsum=10661441 guard=0 labels sum=744 wsum=20490
+4-way distinct 1x40 black                st=0 image sum=405293 wsum=10634957 guard=26400 labels sum=734 wsum=20267
+4-way distinct 40x1 #0                   st=0 image sum=2086 wsum=37870 guard=0 labels sum=737 wsum=20416
+4-way distinct 40x1 #1                   st=0 image sum=2458 wsum=55940 guard=0 labels sum=739 wsum=20489
+4-way distinct 40x1 #2                   st=0 image sum=1771 wsum=38724 guard=0 labels sum=746 wsum=20460
+4-way distinct 40x1 #3                   st=0 image sum=2899 wsum=58316 guard=0 labels sum=742 wsum=20529
+4-way distinct 40x1 #4                   st=0 image sum=1954 wsum=38171 guard=0 labels sum=736 wsum=20497
+4-way distinct 40x1 #5                   st=0 image sum=2061 wsum=41577 guard=0 labels sum=739 wsum=20456
+4-way distinct 16u 40x1 #0               st=0 image sum=441919 wsum=10810524 guard=0 labels sum=742 wsum=20672
+4-way distinct 16u 40x1 #1               st=0 image sum=891917 wsum=20131491 guard=0 labels sum=731 wsum=20291
+4-way distinct 40x1 black                st=0 image sum=334376 wsum=6923301 guard=660 labels sum=732 wsum=20210
+4-way distinct 16u 100x90 #0             st=0 image sum=61940470 wsum=281495180547 guard=0 labels sum=39610413 wsum=238938590120
+4-way distinct 16u 100x90 #1             st=0 image sum=64637049 wsum=289575942487 guard=0 labels sum=39612542 wsum=238981893348
+4-way distinct 100x90 black              st=0 image sum=11805306 wsum=52001388567 guard=59400 labels sum=39589595 wsum=238867497403
+8u ties 9x7 range 2 none                 st=0 image sum=0 wsum=0 guard=3465
 8u ties 9x7 range 2 black                st=0 image sum=0 wsum=0 guard=3465
-8u ties 9x7 range 2 white                st=0 image sum=765 wsum=30855 guard=3465
-8u ties 9x7 range 2 contrast             st=0 image sum=765 wsum=30855 guard=3465
-8u ties 9x7 range 2 only                 st=0 image sum=15300 wsum=483225 guard=3465
-8u ties 16x16 range 3 none               st=0 image sum=6 wsum=625 guard=7920
-8u ties 16x16 range 3 black              st=0 image sum=0 wsum=0 guard=7920
-8u ties 16x16 range 3 white              st=0 image sum=3570 wsum=388365 guard=7920
-8u ties 16x16 range 3 contrast           st=0 image sum=3570 wsum=388365 guard=7920
-8u ties 16x16 range 3 only               st=0 image sum=61710 wsum=8000115 guard=7920
-8u ties 33x31 range 4 none               st=0 image sum=37 wsum=14420 guard=15345
-8u ties 33x31 range 4 black              st=0 image sum=5 wsum=393 guard=15345
-8u ties 33x31 range 4 white              st=0 image sum=18110 wsum=7403298 guard=15345
-8u ties 33x31 range 4 contrast           st=0 image sum=18110 wsum=7403298 guard=15345
-8u ties 33x31 range 4 only               st=0 image sum=242760 wsum=126159975 guard=15345
-8u ties 64x64 range 8 none               st=0 image sum=802 wsum=1630716 guard=31680
-8u ties 64x64 range 8 black              st=0 image sum=254 wsum=483197 guard=31680
-8u ties 64x64 range 8 white              st=0 image sum=253469 wsum=526757042 guard=31680
-8u ties 64x64 range 8 contrast           st=0 image sum=253469 wsum=526757042 guard=31680
-8u ties 64x64 range 8 only               st=0 image sum=791265 wsum=1613343435 guard=31680
-8u ties 50x70 range 16 none              st=0 image sum=2551 wsum=4147310 guard=34650
-8u ties 50x70 range 16 black             st=0 image sum=997 wsum=1596427 guard=34650
-8u ties 50x70 range 16 white             st=0 image sum=356977 wsum=610461712 guard=34650
-8u ties 50x70 range 16 contrast          st=0 image sum=356977 wsum=610461712 guard=34650
-8u ties 50x70 range 16 only              st=0 image sum=536520 wsum=953455965 guard=34650
-8u ties 100x90 range 64 none             st=0 image sum=35779 wsum=156813797 guard=44550
-8u ties 100x90 range 64 black            st=0 image sum=12972 wsum=55424204 guard=44550
-8u ties 100x90 range 64 white            st=0 image sum=1225497 wsum=5547046829 guard=44550
-8u ties 100x90 range 64 contrast         st=0 image sum=1225497 wsum=5547046829 guard=44550
-8u ties 100x90 range 64 only             st=0 image sum=1082475 wsum=4837024875 guard=44550
-8u ties 5x5 range 2 none                 st=0 image sum=2 wsum=49 guard=2475
+8u ties 9x7 range 2 white                st=0 image sum=0 wsum=0 guard=3465
+8u ties 9x7 range 2 contrast             st=0 image sum=0 wsum=0 guard=3465
+8u ties 9x7 range 2 only                 st=0 image sum=16065 wsum=514080 guard=3465
+8u ties 16x16 range 3 none               st=0 image sum=4 wsum=425 guard=7920
+8u ties 16x16 range 3 black              st=0 image sum=2 wsum=221 guard=7920
+8u ties 16x16 range 3 white              st=0 image sum=2042 wsum=229976 guard=7920
+8u ties 16x16 range 3 contrast           st=0 image sum=2042 wsum=229976 guard=7920
+8u ties 16x16 range 3 only               st=0 image sum=63240 wsum=8158725 guard=7920
+8u ties 33x31 range 4 none               st=0 image sum=41 wsum=24693 guard=15345
+8u ties 33x31 range 4 black              st=0 image sum=8 wsum=3857 guard=15345
+8u ties 33x31 range 4 white              st=0 image sum=18878 wsum=10419587 guard=15345
+8u ties 33x31 range 4 contrast           st=0 image sum=18878 wsum=10419587 guard=15345
+8u ties 33x31 range 4 only               st=0 image sum=241995 wsum=123147150 guard=15345
+8u ties 64x64 range 8 none               st=0 image sum=768 wsum=1476800 guard=31680
+8u ties 64x64 range 8 black              st=0 image sum=231 wsum=417645 guard=31680
+8u ties 64x64 range 8 white              st=0 image sum=251151 wsum=501469695 guard=31680
+8u ties 64x64 range 8 contrast           st=0 image sum=251151 wsum=501469695 guard=31680
+8u ties 64x64 range 8 only               st=0 image sum=793560 wsum=1638565230 guard=31680
+8u ties 50x70 range 16 none              st=0 image sum=2638 wsum=4715771 guard=34650
+8u ties 50x70 range 16 black             st=0 image sum=1035 wsum=1815578 guard=34650
+8u ties 50x70 range 16 white             st=0 image sum=352935 wsum=611825048 guard=34650
+8u ties 50x70 range 16 contrast          st=0 image sum=352935 wsum=611825048 guard=34650
+8u ties 50x70 range 16 only              st=0 image sum=540600 wsum=952311780 guard=34650
+8u ties 100x90 range 64 none             st=0 image sum=37849 wsum=165623647 guard=44550
+8u ties 100x90 range 64 black            st=0 image sum=13800 wsum=59544714 guard=44550
+8u ties 100x90 range 64 white            st=0 image sum=1234485 wsum=5549572059 guard=44550
+8u ties 100x90 range 64 contrast         st=0 image sum=1234485 wsum=5549572059 guard=44550
+8u ties 100x90 range 64 only             st=0 image sum=1074315 wsum=4838620155 guard=44550
+8u ties 5x5 range 2 none                 st=0 image sum=0 wsum=0 guard=2475
 8u ties 5x5 range 2 black                st=0 image sum=0 wsum=0 guard=2475
-8u ties 5x5 range 2 white                st=0 image sum=510 wsum=12495 guard=2475
-8u ties 5x5 range 2 contrast             st=0 image sum=510 wsum=12495 guard=2475
-8u ties 5x5 range 2 only                 st=0 image sum=5865 wsum=70380 guard=2475
-8u ties 1x30 range 3 none                st=0 image sum=8 wsum=156 guard=14850
-8u ties 1x30 range 3 black               st=0 image sum=5 wsum=103 guard=14850
-8u ties 1x30 range 3 white               st=0 image sum=1025 wsum=20503 guard=14850
-8u ties 1x30 range 3 contrast            st=0 image sum=1025 wsum=20503 guard=14850
-8u ties 1x30 range 3 only                st=0 image sum=6630 wsum=98175 guard=14850
-8u ties 30x1 range 3 none                st=0 image sum=12 wsum=242 guard=495
-8u ties 30x1 range 3 black               st=0 image sum=9 wsum=188 guard=495
-8u ties 30x1 range 3 white               st=0 image sum=1284 wsum=22373 guard=495
-8u ties 30x1 range 3 contrast            st=0 image sum=1284 wsum=22373 guard=495
-8u ties 30x1 range 3 only                st=0 image sum=6375 wsum=96390 guard=495
-16u ties 9x7 range 2000 none             st=0 image sum=11879 wsum=393437 guard=0
-16u ties 9x7 range 2000 black            st=0 image sum=4604 wsum=134154 guard=0
-16u ties 9x7 range 2000 white            st=0 image sum=2429399 wsum=78645084 guard=0
-16u ties 9x7 range 2000 contrast         st=0 image sum=2429399 wsum=78645084 guard=0
-16u ties 9x7 range 2000 only             st=0 image sum=1703910 wsum=53607630 guard=0
-16u ties 16x16 range 3000 none           st=0 image sum=60869 wsum=8890387 guard=0
-16u ties 16x16 range 3000 black          st=0 image sum=25980 wsum=3586629 guard=0
-16u ties 16x16 range 3000 white          st=0 image sum=8545530 wsum=1133868774 guard=0
-16u ties 16x16 range 3000 contrast       st=0 image sum=8545530 wsum=1133868774 guard=0
-16u ties 16x16 range 3000 only           st=0 image sum=8257410 wsum=1025557215 guard=0
-16u ties 33x31 range 4000 none           st=0 image sum=325226 wsum=153894124 guard=0
-16u ties 33x31 range 4000 black          st=0 image sum=125769 wsum=52221073 guard=0
-16u ties 33x31 range 4000 white          st=0 image sum=37153044 wsum=19578570928 guard=0
-16u ties 33x31 range 4000 contrast       st=0 image sum=37153044 wsum=19578570928 guard=0
-16u ties 33x31 range 4000 only           st=0 image sum=30015030 wsum=14799310305 guard=0
-16u ties 64x64 range 8000 none           st=0 image sum=2398942 wsum=4868436247 guard=0
-16u ties 64x64 range 8000 black          st=0 image sum=849118 wsum=1732674438 guard=0
-16u ties 64x64 range 8000 white          st=0 image sum=154725298 wsum=315689495028 guard=0
-16u ties 64x64 range 8000 contrast       st=0 image sum=154725298 wsum=315689495028 guard=0
-16u ties 64x64 range 8000 only           st=0 image sum=114555180 wsum=235924820370 guard=0
-16u ties 50x70 range 16000 none          st=0 image sum=3991407 wsum=6859615994 guard=0
-16u ties 50x70 range 16000 black         st=0 image sum=1447293 wsum=2430620542 guard=0
-16u ties 50x70 range 16000 white         st=0 image sum=131730873 wsum=231883531987 guard=0
-16u ties 50x70 range 16000 contrast      st=0 image sum=131730873 wsum=231883531987 guard=0
-16u ties 50x70 range 16000 only          st=0 image sum=99088920 wsum=172063649805 guard=0
-16u ties 100x90 range 64000 none         st=0 image sum=42738681 wsum=189150699013 guard=0
-16u ties 100x90 range 64000 black        st=0 image sum=14356977 wsum=62262689321 guard=0
-16u ties 100x90 range 64000 white        st=0 image sum=355859862 wsum=1607088377336 guard=0
-16u ties 100x90 range 64000 contrast     st=0 image sum=355532187 wsum=1605144084956 guard=0
-16u ties 100x90 range 64000 only         st=0 image sum=248312115 wsum=1109636719485 guard=0
-16u ties 5x5 range 2000 none             st=0 image sum=7863 wsum=110812 guard=0
-16u ties 5x5 range 2000 black            st=0 image sum=2603 wsum=27832 guard=0
-16u ties 5x5 range 2000 white            st=0 image sum=854558 wsum=12676087 guard=0
-16u ties 5x5 range 2000 contrast         st=0 image sum=854558 wsum=12676087 guard=0
-16u ties 5x5 range 2000 only             st=0 image sum=786420 wsum=8650620 guard=0
-16u ties 1x30 range 3000 none            st=0 image sum=16740 wsum=256762 guard=0
-16u ties 1x30 range 3000 black           st=0 image sum=10027 wsum=141475 guard=0
-16u ties 1x30 range 3000 white           st=0 image sum=534307 wsum=8923165 guard=0
-16u ties 1x30 range 3000 contrast        st=0 image sum=534307 wsum=8923165 guard=0
-16u ties 1x30 range 3000 only            st=0 image sum=1441770 wsum=21692085 guard=0
-16u ties 30x1 range 3000 none            st=0 image sum=8362 wsum=131513 guard=0
-16u ties 30x1 range 3000 black           st=0 image sum=5575 wsum=91295 guard=0
-16u ties 30x1 range 3000 white           st=0 image sum=529855 wsum=8872985 guard=0
-16u ties 30x1 range 3000 contrast        st=0 image sum=529855 wsum=8872985 guard=0
-16u ties 30x1 range 3000 only            st=0 image sum=1441770 wsum=21692085 guard=0
-8u smooth 96x80 none                     st=0 image sum=524033 wsum=1940209181 guard=0
-8u smooth 96x80 black                    st=0 image sum=384116 wsum=1373817492 guard=0
-8u smooth 96x80 white                    st=0 image sum=817106 wsum=3109970967 guard=0
-8u smooth 96x80 contrast                 st=0 image sum=757181 wsum=2896748382 guard=0
-8u smooth 96x80 only                     st=0 image sum=1525410 wsum=5785081725 guard=0
+8u ties 5x5 range 2 white                st=0 image sum=0 wsum=0 guard=2475
+8u ties 5x5 range 2 contrast             st=0 image sum=0 wsum=0 guard=2475
+8u ties 5x5 range 2 only                 st=0 image sum=6375 wsum=82875 guard=2475
+8u ties 1x30 range 3 none                st=0 image sum=18 wsum=328 guard=14850
+8u ties 1x30 range 3 black               st=0 image sum=14 wsum=245 guard=14850
+8u ties 1x30 range 3 white               st=0 image sum=1289 wsum=23960 guard=14850
+8u ties 1x30 range 3 contrast            st=0 image sum=1289 wsum=23960 guard=14850
+8u ties 1x30 range 3 only                st=0 image sum=6375 wsum=94860 guard=14850
+8u ties 30x1 range 3 none                st=0 image sum=14 wsum=282 guard=495
+8u ties 30x1 range 3 black               st=0 image sum=9 wsum=151 guard=495
+8u ties 30x1 range 3 white               st=0 image sum=1029 wsum=21316 guard=495
+8u ties 30x1 range 3 contrast            st=0 image sum=1029 wsum=21316 guard=495
+8u ties 30x1 range 3 only                st=0 image sum=6630 wsum=97410 guard=495
+8u 4-way ties 9x7 range 2 none           st=0 image sum=2 wsum=113 guard=3465
+8u 4-way ties 9x7 range 2 black          st=0 image sum=0 wsum=0 guard=3465
+8u 4-way ties 9x7 range 2 white          st=0 image sum=1275 wsum=73440 guard=3465
+8u 4-way ties 9x7 range 2 contrast       st=0 image sum=1275 wsum=73440 guard=3465
+8u 4-way ties 9x7 range 2 only           st=0 image sum=14790 wsum=440640 guard=3465
+8u 4-way ties 16x16 range 3 none         st=0 image sum=71 wsum=8825 guard=7920
+8u 4-way ties 16x16 range 3 black        st=0 image sum=16 wsum=963 guard=7920
+8u 4-way ties 16x16 range 3 white        st=0 image sum=24496 wsum=3293778 guard=7920
+8u 4-way ties 16x16 range 3 contrast     st=0 image sum=24496 wsum=3293778 guard=7920
+8u 4-way ties 16x16 range 3 only         st=0 image sum=40800 wsum=5095665 guard=7920
+8u 4-way ties 33x31 range 4 none         st=0 image sum=257 wsum=161062 guard=15345
+8u 4-way ties 33x31 range 4 black        st=0 image sum=31 wsum=20491 guard=15345
+8u 4-way ties 33x31 range 4 white        st=0 image sum=87496 wsum=49535116 guard=15345
+8u 4-way ties 33x31 range 4 contrast     st=0 image sum=87496 wsum=49535116 guard=15345
+8u 4-way ties 33x31 range 4 only         st=0 image sum=173400 wsum=84048255 guard=15345
+8u 4-way ties 64x64 range 8 none         st=0 image sum=2252 wsum=4857581 guard=31680
+8u 4-way ties 64x64 range 8 black        st=0 image sum=434 wsum=881068 guard=31680
+8u 4-way ties 64x64 range 8 white        st=0 image sum=506864 wsum=1061025973 guard=31680
+8u 4-way ties 64x64 range 8 contrast     st=0 image sum=506864 wsum=1061025973 guard=31680
+8u 4-way ties 64x64 range 8 only         st=0 image sum=538050 wsum=1079472375 guard=31680
+8u 4-way ties 50x70 range 16 none        st=0 image sum=5582 wsum=10258635 guard=34650
+8u 4-way ties 50x70 range 16 black       st=0 image sum=1301 wsum=2272889 guard=34650
+8u 4-way ties 50x70 range 16 white       st=0 image sum=548531 wsum=989560214 guard=34650
+8u 4-way ties 50x70 range 16 contrast    st=0 image sum=548531 wsum=989560214 guard=34650
+8u 4-way ties 50x70 range 16 only        st=0 image sum=345270 wsum=575033925 guard=34650
+8u 4-way ties 100x90 range 64 none       st=0 image sum=65054 wsum=290494603 guard=44550
+8u 4-way ties 100x90 range 64 black      st=0 image sum=13212 wsum=55004461 guard=44550
+8u 4-way ties 100x90 range 64 white      st=0 image sum=1622517 wsum=7387784461 guard=44550
+8u 4-way ties 100x90 range 64 contrast   st=0 image sum=1622517 wsum=7387784461 guard=44550
+8u 4-way ties 100x90 range 64 only       st=0 image sum=685695 wsum=2995867500 guard=44550
+8u 4-way ties 5x5 range 2 none           st=0 image sum=2 wsum=49 guard=2475
+8u 4-way ties 5x5 range 2 black          st=0 image sum=0 wsum=0 guard=2475
+8u 4-way ties 5x5 range 2 white          st=0 image sum=510 wsum=12495 guard=2475
+8u 4-way ties 5x5 range 2 contrast       st=0 image sum=510 wsum=12495 guard=2475
+8u 4-way ties 5x5 range 2 only           st=0 image sum=5865 wsum=70380 guard=2475
+8u 4-way ties 1x30 range 3 none          st=0 image sum=17 wsum=230 guard=14850
+8u 4-way ties 1x30 range 3 black         st=0 image sum=13 wsum=150 guard=14850
+8u 4-way ties 1x30 range 3 white         st=0 image sum=1288 wsum=23355 guard=14850
+8u 4-way ties 1x30 range 3 contrast      st=0 image sum=1288 wsum=23355 guard=14850
+8u 4-way ties 1x30 range 3 only          st=0 image sum=6375 wsum=95370 guard=14850
+8u 4-way ties 30x1 range 3 none          st=0 image sum=10 wsum=170 guard=495
+8u 4-way ties 30x1 range 3 black         st=0 image sum=3 wsum=44 guard=495
+8u 4-way ties 30x1 range 3 white         st=0 image sum=2043 wsum=29369 guard=495
+8u 4-way ties 30x1 range 3 contrast      st=0 image sum=2043 wsum=29369 guard=495
+8u 4-way ties 30x1 range 3 only          st=0 image sum=5610 wsum=89250 guard=495
+16u ties 9x7 range 2000 none             st=0 image sum=9017 wsum=338967 guard=0
+16u ties 9x7 range 2000 black            st=0 image sum=4300 wsum=156171 guard=0
+16u ties 9x7 range 2000 white            st=0 image sum=1839280 wsum=63921726 guard=0
+16u ties 9x7 range 2000 contrast         st=0 image sum=1839280 wsum=63921726 guard=0
+16u ties 9x7 range 2000 only             st=0 image sum=2293725 wsum=68353005 guard=0
+16u ties 16x16 range 3000 none           st=0 image sum=44754 wsum=5327149 guard=0
+16u ties 16x16 range 3000 black          st=0 image sum=20686 wsum=2463322 guard=0
+16u ties 16x16 range 3000 white          st=0 image sum=7622746 wsum=1025202532 guard=0
+16u ties 16x16 range 3000 contrast       st=0 image sum=7622746 wsum=1025202532 guard=0
+16u ties 16x16 range 3000 only           st=0 image sum=9174900 wsum=1133100150 guard=0
+16u ties 33x31 range 4000 none           st=0 image sum=292332 wsum=145574241 guard=0
+16u ties 33x31 range 4000 black          st=0 image sum=114774 wsum=54098025 guard=0
+16u ties 33x31 range 4000 white          st=0 image sum=37535259 wsum=19127011215 guard=0
+16u ties 33x31 range 4000 contrast       st=0 image sum=37535259 wsum=19127011215 guard=0
+16u ties 33x31 range 4000 only           st=0 image sum=29621820 wsum=15252746970 guard=0
+16u ties 64x64 range 8000 none           st=0 image sum=2433697 wsum=4879303803 guard=0
+16u ties 64x64 range 8000 black          st=0 image sum=893607 wsum=1750327548 guard=0
+16u ties 64x64 range 8000 white          st=0 image sum=153196947 wsum=318168118458 guard=0
+16u ties 64x64 range 8000 contrast       st=0 image sum=153196947 wsum=318168118458 guard=0
+16u ties 64x64 range 8000 only           st=0 image sum=116128020 wsum=233463850050 guard=0
+16u ties 50x70 range 16000 none          st=0 image sum=3910775 wsum=6915724654 guard=0
+16u ties 50x70 range 16000 black         st=0 image sum=1364700 wsum=2337844284 guard=0
+16u ties 50x70 range 16000 white         st=0 image sum=134204145 wsum=234968089134 guard=0
+16u ties 50x70 range 16000 contrast      st=0 image sum=134204145 wsum=234968089134 guard=0
+16u ties 50x70 range 16000 only          st=0 image sum=96533055 wsum=168886316400 guard=0
+16u ties 100x90 range 64000 none         st=0 image sum=40999512 wsum=174544300971 guard=0
+16u ties 100x90 range 64000 black        st=0 image sum=14150716 wsum=59198900187 guard=0
+16u ties 100x90 range 64000 white        st=0 image sum=355653601 wsum=1593247554057 guard=0
+16u ties 100x90 range 64000 contrast     st=0 image sum=355325926 wsum=1591797657717 guard=0
+16u ties 100x90 range 64000 only         st=0 image sum=248312115 wsum=1120413753630 guard=0
+16u ties 5x5 range 2000 none             st=0 image sum=687 wsum=10728 guard=0
+16u ties 5x5 range 2000 black            st=0 image sum=404 wsum=5334 guard=0
+16u ties 5x5 range 2000 white            st=0 image sum=459149 wsum=7607394 guard=0
+16u ties 5x5 range 2000 contrast         st=0 image sum=459149 wsum=7607394 guard=0
+16u ties 5x5 range 2000 only             st=0 image sum=1179630 wsum=13696815 guard=0
+16u ties 1x30 range 3000 none            st=0 image sum=22600 wsum=415814 guard=0
+16u ties 1x30 range 3000 black           st=0 image sum=11516 wsum=198186 guard=0
+16u ties 1x30 range 3000 white           st=0 image sum=732401 wsum=11535741 guard=0
+16u ties 1x30 range 3000 contrast        st=0 image sum=732401 wsum=11535741 guard=0
+16u ties 1x30 range 3000 only            st=0 image sum=1245165 wsum=19136220 guard=0
+16u ties 30x1 range 3000 none            st=0 image sum=16345 wsum=265607 guard=0
+16u ties 30x1 range 3000 black           st=0 image sum=10338 wsum=170115 guard=0
+16u ties 30x1 range 3000 white           st=0 image sum=600153 wsum=9803760 guard=0
+16u ties 30x1 range 3000 contrast        st=0 image sum=600153 wsum=9803760 guard=0
+16u ties 30x1 range 3000 only            st=0 image sum=1376235 wsum=20840130 guard=0
+16u 4-way ties 9x7 range 2000 none       st=0 image sum=19893 wsum=685153 guard=0
+16u 4-way ties 9x7 range 2000 black      st=0 image sum=3076 wsum=84311 guard=0
+16u 4-way ties 9x7 range 2000 white      st=0 image sum=2690011 wsum=97141646 guard=0
+16u 4-way ties 9x7 range 2000 contrast   st=0 image sum=2690011 wsum=97141646 guard=0
+16u 4-way ties 9x7 range 2000 only       st=0 image sum=1441770 wsum=35061225 guard=0
+16u 4-way ties 16x16 range 3000 none     st=0 image sum=154250 wsum=20767813 guard=0
+16u 4-way ties 16x16 range 3000 black    st=0 image sum=18464 wsum=1750186 guard=0
+16u 4-way ties 16x16 range 3000 white    st=0 image sum=13518674 wsum=1826179051 guard=0
+16u 4-way ties 16x16 range 3000 contrast st=0 image sum=13518674 wsum=1826179051 guard=0
+16u 4-way ties 16x16 range 3000 only     st=0 image sum=3276750 wsum=331410495 guard=0
+16u 4-way ties 33x31 range 4000 none     st=0 image sum=587695 wsum=318600138 guard=0
+16u 4-way ties 33x31 range 4000 black    st=0 image sum=103173 wsum=43110425 guard=0
+16u 4-way ties 33x31 range 4000 white    st=0 image sum=49254423 wsum=26426715005 guard=0
+16u 4-way ties 33x31 range 4000 contrast st=0 image sum=49254423 wsum=26426715005 guard=0
+16u 4-way ties 33x31 range 4000 only     st=0 image sum=17891055 wsum=7942055580 guard=0
+16u 4-way ties 64x64 range 8000 none     st=0 image sum=3972720 wsum=8449813947 guard=0
+16u 4-way ties 64x64 range 8000 black    st=0 image sum=742317 wsum=1449227217 guard=0
+16u 4-way ties 64x64 range 8000 white    st=0 image sum=195905547 wsum=405103212492 guard=0
+16u 4-way ties 64x64 range 8000 contrast st=0 image sum=195905547 wsum=405103212492 guard=0
+16u 4-way ties 64x64 range 8000 only     st=0 image sum=73268130 wsum=146227655685 guard=0
+16u 4-way ties 50x70 range 16000 none    st=0 image sum=6931604 wsum=12044629299 guard=0
+16u 4-way ties 50x70 range 16000 black   st=0 image sum=1427872 wsum=2300566882 guard=0
+16u 4-way ties 50x70 range 16000 white   st=0 image sum=167231422 wsum=296969781622 guard=0
+16u 4-way ties 50x70 range 16000 contrast st=0 image sum=167231422 wsum=296969781622 guard=0
+16u 4-way ties 50x70 range 16000 only    st=0 image sum=63568950 wsum=106847346510 guard=0
+16u 4-way ties 100x90 range 64000 none   st=0 image sum=69560101 wsum=314696401070 guard=0
+16u 4-way ties 100x90 range 64000 black  st=0 image sum=13645114 wsum=60309817697 guard=0
+16u 4-way ties 100x90 range 64000 white  st=0 image sum=444603274 wsum=2007919841537 guard=0
+16u 4-way ties 100x90 range 64000 contrast st=0 image sum=437918704 wsum=1976283672242 guard=0
+16u 4-way ties 100x90 range 64000 only   st=0 image sum=158856840 wsum=706852383660 guard=0
+16u 4-way ties 5x5 range 2000 none       st=0 image sum=8185 wsum=135741 guard=0
+16u 4-way ties 5x5 range 2000 black      st=0 image sum=1062 wsum=9200 guard=0
+16u 4-way ties 5x5 range 2000 white      st=0 image sum=1115157 wsum=17048300 guard=0
+16u 4-way ties 5x5 range 2000 contrast   st=0 image sum=1115157 wsum=17048300 guard=0
+16u 4-way ties 5x5 range 2000 only       st=0 image sum=524280 wsum=4259775 guard=0
+16u 4-way ties 1x30 range 3000 none      st=0 image sum=19645 wsum=312875 guard=0
+16u 4-way ties 1x30 range 3000 black     st=0 image sum=11185 wsum=147683 guard=0
+16u 4-way ties 1x30 range 3000 white     st=0 image sum=601000 wsum=10895423 guard=0
+16u 4-way ties 1x30 range 3000 contrast  st=0 image sum=601000 wsum=10895423 guard=0
+16u 4-way ties 1x30 range 3000 only      st=0 image sum=1376235 wsum=19726035 guard=0
+16u 4-way ties 30x1 range 3000 none      st=0 image sum=14296 wsum=283149 guard=0
+16u 4-way ties 30x1 range 3000 black     st=0 image sum=5236 wsum=90215 guard=0
+16u 4-way ties 30x1 range 3000 white     st=0 image sum=726121 wsum=13197215 guard=0
+16u 4-way ties 30x1 range 3000 contrast  st=0 image sum=726121 wsum=13197215 guard=0
+16u 4-way ties 30x1 range 3000 only      st=0 image sum=1245165 wsum=17366775 guard=0
+8u smooth 96x80 none                     st=0 image sum=542007 wsum=1986001736 guard=0
+8u smooth 96x80 black                    st=0 image sum=405556 wsum=1487845558 guard=0
+8u smooth 96x80 white                    st=0 image sum=811516 wsum=3005072098 guard=0
+8u smooth 96x80 contrast                 st=0 image sum=742921 wsum=2776225663 guard=0
+8u smooth 96x80 only                     st=0 image sum=1552440 wsum=6004008660 guard=0
 Compress all 0                           size st=0 bytes=65652  st=0 new=1 sum=0 wsum=0
 Compress all 1                           size st=0 bytes=65652  st=0 new=2 sum=12 wsum=78
 Compress 0 1 2 3                         size st=0 bytes=65588  st=0 new=4 sum=6 wsum=20
@@ -271,22 +459,22 @@ Compress limit above size                size st=0 bytes=65596  st=0 new=4 sum=9
 Compress two rows                        size st=0 bytes=65604  st=0 new=3 sum=18 wsum=47
 Compress two rows, padded pitch          size st=0 bytes=65604  st=0 new=2 sum=8589934563 wsum=51539607378
 Compress two rows, step 0                size st=0 bytes=65604  st=0 new=1 sum=9 wsum=45
-Compress random 39x30 #0                 size st=0 bytes=74916  st=0 new=730 sum=423856 wsum=249313344
-Compress random 38x3 #1                  size st=0 bytes=66468  st=0 new=54 sum=7318 wsum=417779
-Compress random 32x7 #2                  size st=0 bytes=67348  st=0 new=5 sum=461 wsum=51576
-Compress random 38x23 #3                 size st=0 bytes=72548  st=0 new=538 sum=228596 wsum=100236398
-Compress random 16x7 #4                  size st=0 bytes=66452  st=0 new=54 sum=7678 wsum=447980
-Compress random 36x24 #5                 size st=0 bytes=72468  st=0 new=4 sum=1280 wsum=550087
-Compress random 17x2 #6                  size st=0 bytes=65828  st=0 new=21 sum=372 wsum=7059
-Compress random 27x8 #7                  size st=0 bytes=67284  st=0 new=109 sum=27513 wsum=3076828
-Compress random 29x18 #8                 size st=0 bytes=69732  st=0 new=1 sum=0 wsum=0
-Compress random 34x11 #9                 size st=0 bytes=68548  st=0 new=232 sum=43637 wsum=8130307
-Compress random 34x1 #10                 size st=0 bytes=65828  st=0 new=16 sum=686 wsum=12907
-Compress random 3x16 #11                 size st=0 bytes=65940  st=0 new=1 sum=0 wsum=0
-Compress watershed labels 20x18          size st=0 bytes=68436  st=0 new=44 sum=7506 wsum=1797661
-Compress watershed labels 27x23          size st=0 bytes=70524  st=0 new=76 sum=24489 wsum=9846084
-Compress watershed labels 34x28          size st=0 bytes=73172  st=0 new=111 sum=50667 wsum=32062651
-Compress watershed labels 41x33          size st=0 bytes=76380  st=0 new=157 sum=105072 wsum=93996979
+Compress random 23x4 #0                  size st=0 bytes=66292  st=0 new=62 sum=2786 wsum=128482
+Compress random 9x2 #1                   size st=0 bytes=65700  st=0 new=9 sum=203 wsum=1645
+Compress random 22x10 #2                 size st=0 bytes=67316  st=0 new=4 sum=308 wsum=34850
+Compress random 26x11 #3                 size st=0 bytes=67844  st=0 new=175 sum=26631 wsum=3607555
+Compress random 15x6 #4                  size st=0 bytes=66276  st=0 new=45 sum=4571 wsum=242259
+Compress random 33x16 #5                 size st=0 bytes=69780  st=0 new=1 sum=0 wsum=0
+Compress random 27x7 #6                  size st=0 bytes=67068  st=0 new=118 sum=11128 wsum=1070845
+Compress random 2x27 #7                  size st=0 bytes=65988  st=0 new=26 sum=1697 wsum=44540
+Compress random 8x30 #8                  size st=0 bytes=67476  st=0 new=1 sum=0 wsum=0
+Compress random 26x25 #9                 size st=0 bytes=70756  st=0 new=391 sum=124981 wsum=40911141
+Compress random 20x22 #10                size st=0 bytes=69076  st=0 new=217 sum=108401 wsum=23439101
+Compress random 34x13 #11                size st=0 bytes=69092  st=0 new=1 sum=0 wsum=0
+Compress watershed labels 20x18          size st=0 bytes=68436  st=0 new=44 sum=7985 wsum=1882043
+Compress watershed labels 27x23          size st=0 bytes=70524  st=0 new=80 sum=25501 wsum=10355526
+Compress watershed labels 34x28          size st=0 bytes=73172  st=0 new=113 sum=56628 wsum=34883376
+Compress watershed labels 41x33          size st=0 bytes=76380  st=0 new=158 sum=109118 wsum=98006856
 CompressBufferSize -5         st=-6 bytes=-1
 CompressBufferSize 0          st=-6 bytes=-1
 CompressBufferSize 1          st=0 bytes=65564

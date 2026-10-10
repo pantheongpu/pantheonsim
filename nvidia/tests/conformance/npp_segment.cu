@@ -10,9 +10,10 @@
 //     below, with and without equal values, every boundary type, a padded
 //     row pitch);
 //   - the marker labels of images whose values are all different;
-//   - 4-way connectivity on images up to 4x4 (on larger ones NPP leaves some
-//     pixels near the right and bottom edges unwritten, in a pattern the
-//     simulator does not reproduce);
+//   - 4-way connectivity: on images up to 4x4 NPP writes every pixel; on larger ones it leaves
+//     some pixels near the right and bottom edges unwritten, in columns and rows that the width and
+//     the height decide (npp_core.hpp has the table), and the image and the labels of images whose
+//     values are all different are exact;
 //   - label compression of any label image, and every status and buffer size.
 // What it leaves out -- the labels of images with equal neighbouring values,
 // which follow plateau rules the simulator fits to within a few percent of the
@@ -132,6 +133,10 @@ static Run watershed(const std::vector<unsigned>& vals, int W, int H, int pad, N
   cudaMalloc(&lab, static_cast<size_t>(W) * H * 4);
   cudaMemset(lab, 0, static_cast<size_t>(W) * H * 4);
   cudaMalloc(&buf, bs ? bs : 1);
+  // NPP 13.0's 4-way watershed reads its work buffer before writing all of it: the same image gives other pixels
+  // (a few in a hundred thousand) after a large 16-bit run has left its data in the memory cudaMalloc hands back.
+  // The simulator's is the zeroed buffer's behaviour, which is what this pins.
+  cudaMemset(buf, 0, bs ? bs : 1);
   NppStreamContext c = ctx();
   Npp32u* labels = want_labels ? static_cast<Npp32u*>(lab) : nullptr;
   const auto bt = static_cast<NppiWatershedSegmentBoundaryType>(boundary);
@@ -255,13 +260,21 @@ int main() {
     all_boundaries<Npp8u>("8u distinct 10x20 pitch+13", distinct_values(200, 256), 10, 20, 13, nppiNormInf, true);
     all_boundaries<Npp16u>("16u distinct 33x31 pitch+6", distinct_values(33 * 31, 65536), 33, 31, 6, nppiNormInf, true);
     print_run("8u distinct 16x16 no labels", watershed<Npp8u>(distinct_values(256, 256), 16, 16, 0, nppiNormInf, 0, false), false);
-    // 4-way connectivity, on images small enough that NPP writes every pixel.
-    struct { int w, h; } four[] = {{4, 4}, {3, 4}, {4, 3}, {2, 2}, {1, 4}, {4, 1}, {3, 3}};
+    // 4-way connectivity. NPP leaves some pixels unwritten (see npp_core.hpp): on images up to 4 x 4 there are none,
+    // on larger ones the columns and rows near the right and bottom edges that the width and height decide.
+    struct { int w, h; } four[] = {{4, 4}, {3, 4}, {4, 3}, {2, 2}, {1, 4}, {4, 1}, {3, 3}, {5, 5}, {6, 9}, {8, 8}, {12, 20},
+                                   {16, 16}, {17, 15}, {33, 40}, {64, 64}, {113, 31}, {1, 40}, {40, 1}, {100, 90}};
     for (const auto& s : four) {
-      for (int rep = 0; rep < 6; ++rep) {
+      if (s.w * s.h <= 256)
+        for (int rep = 0; rep < 6; ++rep) {
+          char name[64];
+          std::snprintf(name, sizeof name, "4-way distinct %dx%d #%d", s.w, s.h, rep);
+          print_run(name, watershed<Npp8u>(distinct_values(s.w * s.h, 256), s.w, s.h, 0, nppiNormL1, 0, true), true);
+        }
+      for (int rep = 0; rep < 2; ++rep) {
         char name[64];
-        std::snprintf(name, sizeof name, "4-way distinct %dx%d #%d", s.w, s.h, rep);
-        print_run(name, watershed<Npp8u>(distinct_values(s.w * s.h, 256), s.w, s.h, 0, nppiNormL1, 0, true), true);
+        std::snprintf(name, sizeof name, "4-way distinct 16u %dx%d #%d", s.w, s.h, rep);
+        print_run(name, watershed<Npp16u>(distinct_values(s.w * s.h, 60000), s.w, s.h, 0, nppiNormL1, 0, true), true);
       }
       char name[64];
       std::snprintf(name, sizeof name, "4-way distinct %dx%d black", s.w, s.h);
@@ -277,10 +290,23 @@ int main() {
       std::snprintf(name, sizeof name, "8u ties %dx%d range %u", s.w, s.h, s.range);
       all_boundaries<Npp8u>(name, random_values(s.w * s.h, s.range), s.w, s.h, 3, nppiNormInf, false);
     }
+    // 4-way, with ties: the segmented image is exact (the labels of equal-valued neighbours are not). These run
+    // before the 16-bit images: NPP keeps state between calls that a 16-bit run of 100 x 90 changes, for a pixel or
+    // two of the next large 8-bit one.
+    for (const auto& s : tie) {
+      char name[64];
+      std::snprintf(name, sizeof name, "8u 4-way ties %dx%d range %u", s.w, s.h, s.range);
+      all_boundaries<Npp8u>(name, random_values(s.w * s.h, s.range), s.w, s.h, 3, nppiNormL1, false);
+    }
     for (const auto& s : tie) {
       char name[64];
       std::snprintf(name, sizeof name, "16u ties %dx%d range %u", s.w, s.h, s.range * 1000);
       all_boundaries<Npp16u>(name, random_values(s.w * s.h, s.range * 1000), s.w, s.h, 0, nppiNormInf, false);
+    }
+    for (const auto& s : tie) {
+      char name[64];
+      std::snprintf(name, sizeof name, "16u 4-way ties %dx%d range %u", s.w, s.h, s.range * 1000);
+      all_boundaries<Npp16u>(name, random_values(s.w * s.h, s.range * 1000), s.w, s.h, 0, nppiNormL1, false);
     }
     // A smooth picture quantised to 8 bits: plateaus and shallow slopes, like a photograph.
     std::vector<unsigned> smooth(96 * 80);

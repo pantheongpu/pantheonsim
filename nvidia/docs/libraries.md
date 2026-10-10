@@ -1099,11 +1099,19 @@ photographic inputs (`nvidia/src/npp_core.hpp` has the rules):
     other positions (a 256 x 100 one at x = 221, 237, 253: the positions depend on the height too), and on the
     teapot the black background is one label up to x = 495 and another (14) from x = 496 on, in every row of the
     top 69. The labels are merged through some number of passes that leaves a width-dependent remainder;
-  - **4-way connectivity**: the pixels that differ from the model's segmented image lie in a band of columns
-    and a band of rows that depend on the width and on the height separately (a 16 x 16 image: columns and rows
-    9..13; 20 x 20: 11..13; 32 wide: 25..27; 64 wide: 61, 62; 40 wide: 37, 38). In the bands a pixel takes its lowest
-    neighbour's value after one step, not after following the chain to the root; the labels there follow.
-  The segmented image is exact for 8-way connectivity regardless; the compressed labels of the Samples' images
+  - **4-way connectivity** (solved in round 5, for the segmented image and for the labels of images with no equal
+    neighbours): NPP 13.0 leaves some pixels unwritten. A pixel whose lowest neighbour is the one to its right (below)
+    keeps its own value, as if it were a root, when its column (row) is in a set that depends on the width (height)
+    alone: with t = width - 1 - x, the set is a function of the width % 112 (kUnwritten4 in `npp_core.hpp`, one
+    bit per t from 1 to 11; it repeats from a width of 12, and below that it is the same set cut at t <= width - 1;
+    the same for rows), measured on east-flowing ramps of every width from 2 to 1099 and checked on random images
+    of 5 to 300 pixels a side, with and without equal values, 8-bit and 16-bit (no image differs). Such a pixel's
+    label is its own index; a root's is the smallest index of its closed 4-neighbourhood. The pixels that flow to an
+    unwritten one end there, so the segmented values follow. NPP also keeps state between calls: after a 16-bit run of
+    100 x 90 the next large 8-bit image of another type can differ in a pixel or two (found as one line of the
+    conformance program, `npp_segment`, that moved when the work buffer was zeroed and still differed; the
+    simulator is the state-free behaviour);
+  The segmented image is exact for both connectivities regardless; the compressed labels of the Samples' images
   differ because a label that differs moves every rank after it.
 - Label compression is exact for any label image: labels below
   `nStartingNumber` take their rank among the labels present plus 0, which is
