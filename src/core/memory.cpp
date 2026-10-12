@@ -1072,7 +1072,14 @@ void run_in(uint8_t* c, const uint8_t* s, uint64_t n, uint32_t unit) {
 const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, uint64_t len, uint32_t unit,
                                                                uint64_t* base) const {
   if (unit != 1 && unit != 2 && unit != 4 && unit != 8) return nullptr;
-  if (addr % unit || len % unit || access_fault_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  // A fault armed for loads or stores, or stuck cells, change what an access returns or stores, and
+  // load_scalar / store_scalar apply them; the runtime attaches its faults to every device, so it is
+  // whether one is armed that counts, not whether any is attached (as load_quad decides).
+  const auto armed = [](const uint64_t* pending) { return pending && __atomic_load_n(pending, __ATOMIC_RELAXED); };
+  if (access_fault_ && (armed(access_fault_->stuck_pending) || armed(access_fault_->load_pending) ||
+                        armed(access_fault_->store_pending)))
+    return nullptr;
+  if (addr % unit || len % unit || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up == live_.begin()) return nullptr;

@@ -257,6 +257,10 @@ class Runner {
       // still caught.
       smemsz_ = (shared_size_ + 255) / 256 * 256;
     }
+    // VGPU_FASTPATH=0 sends every instruction down the general path, as it does for the PTX interpreter: the
+    // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
+    // block. For checking that the fast paths compute what the general one does.
+    if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -362,6 +366,7 @@ class Runner {
   const exec::LaunchConfig& cfg_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
