@@ -13,9 +13,11 @@
 namespace VGPU_SIMD_NS {
 
 typedef float V8f __attribute__((vector_size(32)));
+// (A half array read through the 32-bit words that hold it.)
+typedef uint16_t __attribute__((may_alias)) U16A;
 
 // n a multiple of 8.
-inline void f16_to_f32_blocks(const uint16_t* in, float* out, size_t n) {
+inline void f16_to_f32_blocks(const U16A* in, float* out, size_t n) {
 #if VGPU_SIMD_AVX2
   for (size_t i = 0; i < n; i += 8)
     _mm256_storeu_ps(out + i, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i))));
@@ -57,7 +59,7 @@ static_assert(std::endian::native == std::endian::little, "the fragment kernels 
 // out[2w], its high half out[2w + 1]. n_words is a multiple of 4.
 inline void operands_to_f32(unsigned kind, const uint32_t* w, float* out, size_t n_words) {
   if (kind == 0) {
-    f16_to_f32_blocks(reinterpret_cast<const uint16_t*>(w), out, 2 * n_words);
+    f16_to_f32_blocks(reinterpret_cast<const U16A*>(w), out, 2 * n_words);
   } else if (kind == 1) {
     for (size_t i = 0; i < 2 * n_words; i += 8) {
       V8h h;
@@ -132,7 +134,7 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
   if (!c) {
     std::memset(Cm, 0, sizeof Cm);
   } else if (acc_f16) {
-    f16_to_f32_blocks(reinterpret_cast<const uint16_t*>(c), Cm, 128);
+    f16_to_f32_blocks(reinterpret_cast<const U16A*>(c), Cm, 128);
   } else {
     for (unsigned h = 0; h < 2; ++h)
       for (unsigned g = 0; g < 8; ++g) {
