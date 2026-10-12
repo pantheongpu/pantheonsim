@@ -40,12 +40,22 @@ inline void ffma_lanes_libm(uint32_t* r, const uint32_t* a, const uint32_t* b, c
   for (unsigned l = 0; l < 32; ++l) r[l] = canon(std::fma(f32_of(a[l]), f32_of(b[l]), f32_of(c[l])));
 }
 
+// The same for DFMA, in doubles. (Any NaN result is left as the host made it: the executor's double
+// arithmetic has never made them canonical.)
+inline void dfma_lanes_libm(double* r, const double* a, const double* b, const double* c) {
+  for (unsigned l = 0; l < 32; ++l) r[l] = std::fma(a[l], b[l], c[l]);
+}
+
 #if defined(__x86_64__) && defined(__GNUC__)
 // The same on the CPU's FMA unit. Only call it when ffma_lanes_hw_available().
 __attribute__((target("fma"))) inline void ffma_lanes_hw(uint32_t* r, const uint32_t* a, const uint32_t* b,
                                                          const uint32_t* c) {
   using namespace lane_math_detail;
   for (unsigned l = 0; l < 32; ++l) r[l] = canon(__builtin_fmaf(f32_of(a[l]), f32_of(b[l]), f32_of(c[l])));
+}
+__attribute__((target("fma"))) inline void dfma_lanes_hw(double* r, const double* a, const double* b,
+                                                         const double* c) {
+  for (unsigned l = 0; l < 32; ++l) r[l] = __builtin_fma(a[l], b[l], c[l]);
 }
 inline bool ffma_lanes_hw_available() {
   static const bool ok = [] {
@@ -55,6 +65,9 @@ inline bool ffma_lanes_hw_available() {
   return ok;
 }
 #else
+inline void dfma_lanes_hw(double* r, const double* a, const double* b, const double* c) {
+  dfma_lanes_libm(r, a, b, c);
+}
 inline bool ffma_lanes_hw_available() { return false; }
 inline void ffma_lanes_hw(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
   ffma_lanes_libm(r, a, b, c);
@@ -64,6 +77,11 @@ inline void ffma_lanes_hw(uint32_t* r, const uint32_t* a, const uint32_t* b, con
 inline void ffma_lanes(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
   if (ffma_lanes_hw_available()) ffma_lanes_hw(r, a, b, c);
   else ffma_lanes_libm(r, a, b, c);
+}
+
+inline void dfma_lanes(double* r, const double* a, const double* b, const double* c) {
+  if (ffma_lanes_hw_available()) dfma_lanes_hw(r, a, b, c);
+  else dfma_lanes_libm(r, a, b, c);
 }
 
 }  // namespace vgpu::sass

@@ -985,7 +985,8 @@ uint16_t f64_to_bf16(double d) {
 bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   switch (ins.op) {
     case Op::IADD3: case Op::IMAD: case Op::LOP3: case Op::MOV: case Op::ISETP: case Op::FSETP:
-    case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF: break;
+    case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
+    case Op::DADD: case Op::DMUL: case Op::DFMA: break;
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1050,6 +1051,41 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     const Mask acc = pmask(ins.src[2]);
     setp(ins.dst[0], combine(bop, r, acc));
     setp(ins.dst[1], combine(bop, ~r, acc));
+    return true;
+  }
+  if (ins.op == Op::DADD || ins.op == Op::DMUL || ins.op == Op::DFMA) {
+    // Double arithmetic, round to nearest, on a register pair: the operands as exec_float's f64src reads them,
+    // a register's 32 lanes or one value for every lane, then the operation over all lanes.
+    const unsigned nsrc = ins.op == Op::DFMA ? 3 : 2;
+    if (ins.f[0] || ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return false;
+    for (unsigned i = 0; i < nsrc; ++i) {
+      const Kind k = ins.src[i].kind;
+      if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
+    }
+    double v[3][32];
+    for (unsigned i = 0; i < nsrc; ++i) {
+      const Operand& o = ins.src[i];
+      const auto f64src = [&](unsigned l) {
+        double d = as_f64(o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, l));
+        if (o.abs) d = std::fabs(d);
+        if (o.neg) d = -d;
+        return d;
+      };
+      if (o.kind == Kind::Reg) {
+        for (unsigned l = 0; l < 32; ++l) v[i][l] = f64src(l);
+      } else {
+        const double d = f64src(0);   // the same for every lane
+        for (unsigned l = 0; l < 32; ++l) v[i][l] = d;
+      }
+    }
+    double res[32];
+    if (ins.op == Op::DADD) for (unsigned l = 0; l < 32; ++l) res[l] = v[0][l] + v[1][l];
+    else if (ins.op == Op::DMUL) for (unsigned l = 0; l < 32; ++l) res[l] = v[0][l] * v[1][l];
+    else dfma_lanes(res, v[0], v[1], v[2]);
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      write64(w, ins.dst[0], l, f64_bits(res[l]));
+    }
     return true;
   }
   if (ins.dst[0].kind != Kind::Reg && !(ins.op == Op::LOP3 && ins.dst.size() == 2)) return false;

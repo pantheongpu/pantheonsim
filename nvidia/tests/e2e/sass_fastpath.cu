@@ -77,7 +77,8 @@ __global__ void wide_math(const uint64_t* in, uint64_t* out, double* dout, int n
   uint64_t x = in[i];
   out[i] = x * 0x9E3779B97F4A7C15ull + (x >> 7) + __popcll(x) + __popc((unsigned)x) + __clzll(x | 1);
   double d = __longlong_as_double((long long)(x & 0x7fefffffffffffffull));
-  dout[i] = fma(d, 1.0000001, -d * 0.5);
+  // DFMA with a constant and a negated operand, DMUL by a constant, DADD with |x| and a constant.
+  dout[i] = fma(d, 1.0000001, -d * 0.5) + fabs(d) * 0.25 - (d + 1.5) + __longlong_as_double((long long)(x >> 3));
 }
 
 template <class T>

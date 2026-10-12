@@ -94,4 +94,66 @@ VTEST(sass_ffma_lanes_random_bits) {
   }
 }
 
+namespace {
+double dbl(uint64_t b) {
+  double d;
+  std::memcpy(&d, &b, 8);
+  return d;
+}
+void compare_d(const double* a, const double* b, const double* c) {
+  double want[32], got[32], hw[32];
+  vgpu::sass::dfma_lanes_libm(want, a, b, c);
+  vgpu::sass::dfma_lanes(got, a, b, c);
+  vgpu::sass::dfma_lanes_hw(hw, a, b, c);
+  for (unsigned l = 0; l < 32; ++l) {
+    uint64_t w, g, h;
+    std::memcpy(&w, &want[l], 8);
+    std::memcpy(&g, &got[l], 8);
+    std::memcpy(&h, &hw[l], 8);
+    // A NaN's payload may differ between libm and the instruction; any NaN is a NaN, and every other result is exact.
+    const bool both_nan = want[l] != want[l] && got[l] != got[l] && hw[l] != hw[l];
+    if (!both_nan && (w != g || w != h)) {
+      char m[200];
+      std::snprintf(m, sizeof m, "lane %u fma(%016llx, %016llx, %016llx): libm %016llx dispatch %016llx hw %016llx", l,
+                    (unsigned long long)*(const uint64_t*)&a[l], (unsigned long long)*(const uint64_t*)&b[l],
+                    (unsigned long long)*(const uint64_t*)&c[l], (unsigned long long)w, (unsigned long long)g, (unsigned long long)h);
+      throw vtest::Failure(m);
+    }
+  }
+}
+}  // namespace
+
+VTEST(sass_dfma_lanes_special_and_random) {
+  const std::vector<uint64_t> sp = {0x0000000000000000ull, 0x8000000000000000ull, 0x0000000000000001ull,
+                                    0x000fffffffffffffull, 0x0010000000000000ull, 0x3ff0000000000000ull,
+                                    0xbff0000000000000ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
+                                    0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull,
+                                    0x4340000000000000ull, 0x3ca0000000000000ull, 0x3ff0000000000001ull};
+  double a[32], b[32], c[32];
+  std::vector<std::array<uint64_t, 3>> triples;
+  for (uint64_t x : sp)
+    for (uint64_t y : sp)
+      for (uint64_t z : sp) triples.push_back({x, y, z});
+  for (size_t i = 0; i < triples.size(); i += 32) {
+    for (unsigned l = 0; l < 32; ++l) {
+      const auto& t = triples[(i + l) % triples.size()];
+      a[l] = dbl(t[0]);
+      b[l] = dbl(t[1]);
+      c[l] = dbl(t[2]);
+    }
+    compare_d(a, b, c);
+  }
+  Rng rng;
+  for (int iter = 0; iter < 20000; ++iter) {
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint64_t x = (uint64_t{rng.next()} << 32) ^ rng.next(), y = (uint64_t{rng.next()} << 32) ^ rng.next(),
+                     z = (uint64_t{rng.next()} << 32) ^ rng.next();
+      a[l] = dbl(x);
+      b[l] = dbl(y);
+      c[l] = iter % 3 == 0 ? -(a[l] * b[l]) : dbl(z);   // cancellation: the rounding of the product matters
+    }
+    compare_d(a, b, c);
+  }
+}
+
 VTEST_MAIN
