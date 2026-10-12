@@ -717,14 +717,27 @@ VTEST(double_lanes_and_popcount) {
         else r = std::fma(x, y, get(2));
         const uint64_t u = (mask >> i) & 1 ? std::bit_cast<uint64_t>(r) : uint64_t{olo[i]} | (uint64_t{ohi[i]} << 32);
         const uint64_t g = uint64_t{dlo[i]} | (uint64_t{dhi[i]} << 32);
-        // With two NaN operands the host's instruction picks one by operand position, which the compiler is free to
-        // swap for a commutative operation: the result is a NaN either way, and that is all that is compared then.
-        int nans = 0;
-        for (int s = 0; s < (kind == 2 ? 3 : 2); ++s) nans += std::isnan(get(s)) ? 1 : 0;
-        const bool both_nan = nans > 1 && std::isnan(std::bit_cast<double>(g)) && std::isnan(std::bit_cast<double>(u));
-        if (g != u && !both_nan)
+        // A NaN operand decides the result by the kernel's rule, not by the host instruction the compiler picked: the
+        // first NaN of (b, a) for a sum or product (as the scalar code and an RTX 3060 do) and of (b, a, c) for an fma,
+        // with its quiet bit set.
+        uint64_t u2 = u;
+        {
+          const auto raw = [&](int s) {
+            uint64_t v = uint64_t{lo[s][i]} | (uint64_t{hi[s][i]} << 32);
+            if (mods & (1u << (2 * s))) v &= 0x7fffffffffffffffull;
+            if (mods & (2u << (2 * s))) v ^= 0x8000000000000000ull;
+            return v;
+          };
+          const auto nan = [](uint64_t v) { return (v & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+          const uint64_t ra = raw(0), rb = raw(1), rc = kind == 2 ? raw(2) : 0;
+          if (nan(ra) || nan(rb) || nan(rc)) {
+            const uint64_t pick = kind == 2 ? (nan(rb) ? rb : nan(ra) ? ra : rc) : (nan(rb) ? rb : ra);
+            if ((mask >> i) & 1) u2 = pick | 0x0008000000000000ull;
+          }
+        }
+        if (g != u2)
           throw vtest::Failure(lv + " dop_m kind " + std::to_string(kind) + " mods " + std::to_string(mods) + " lane " +
-                               std::to_string(i) + ": got 0x" + hex(g) + " want 0x" + hex(u));
+                               std::to_string(i) + ": got 0x" + hex(g) + " want 0x" + hex(u2));
       }
     }
   }

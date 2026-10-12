@@ -1922,6 +1922,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # The plain ALU and tensor-core forms the SIMD kernels run (include/vgpu/simd), pinned to the bits the
+  # simulator gave before the kernels, on both engines at every SIMD level.
+  add_test(NAME e2e_simd_lane_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_simd_lane_forms.sh)
+  set_tests_properties(e2e_simd_lane_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written
   # test never thinks to write, and this is what catches the difference. It

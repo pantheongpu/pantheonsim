@@ -461,11 +461,28 @@ void imad_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t*
 
 // kind 0: a + b, 1: a * b, 2: fma(a, b, c); `mods` has bit 2i for |source i| and bit 2i + 1 for -source i (the
 // absolute value first). d, a, b, c are (low, high) pairs of 32-lane arrays; only the lanes of `mask` are written.
+//
+// When an operand is a NaN, which one the result is made from is decided here, not by the instruction the compiler
+// happened to pick: the first NaN of (b, a) for a sum or product -- what the scalar code this replaced gives, and an
+// RTX 3060 -- and of (b, a, c) for an fma (the scalar code this replaced: the compiler had swapped the product's
+// operands for libm's fma). The result is that NaN with its quiet bit set.
+inline uint64_t dop_nan(unsigned kind, uint64_t a, uint64_t b, uint64_t c) {
+  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+  uint64_t pick;
+  if (kind == 2) pick = is_nan(b) ? b : is_nan(a) ? a : c;
+  else pick = is_nan(b) ? b : a;
+  return pick | 0x0008000000000000ull;
+}
+
 void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const uint32_t* alo, const uint32_t* ahi,
              const uint32_t* blo, const uint32_t* bhi, const uint32_t* clo, const uint32_t* chi, uint32_t mask) {
   uint32_t rlo[32], rhi[32];
   const uint32_t absm[3] = {(mods & 1) ? 0x7fffffffu : ~0u, (mods & 4) ? 0x7fffffffu : ~0u, (mods & 16) ? 0x7fffffffu : ~0u};
   const uint32_t negm[3] = {(mods & 2) ? 0x80000000u : 0u, (mods & 8) ? 0x80000000u : 0u, (mods & 32) ? 0x80000000u : 0u};
+  const auto bits = [&](const uint32_t* lo, const uint32_t* hi, unsigned i, unsigned k) {
+    return uint64_t{lo[i]} | (uint64_t{(hi[i] & absm[k]) ^ negm[k]} << 32);
+  };
+  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
 #if VGPU_SIMD_AVX2
   for (unsigned i = 0; i < 32; i += 4) {
     const auto load = [&](const uint32_t* lo, const uint32_t* hi, unsigned k) {
@@ -475,28 +492,45 @@ void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const u
       return _mm256_castsi256_pd(_mm256_or_si256(_mm256_cvtepu32_epi64(l), _mm256_slli_epi64(_mm256_cvtepu32_epi64(h), 32)));
     };
     const __m256d x = load(alo, ahi, 0), y = load(blo, bhi, 1);
-    __m256d v;
+    __m256d v, nanv = _mm256_cmp_pd(x, y, _CMP_UNORD_Q);
     if (kind == 0) v = _mm256_add_pd(x, y);
     else if (kind == 1) v = _mm256_mul_pd(x, y);
-    else v = _mm256_fmadd_pd(x, y, load(clo, chi, 2));
+    else {
+      const __m256d z = load(clo, chi, 2);
+      v = _mm256_fmadd_pd(x, y, z);
+      nanv = _mm256_or_pd(nanv, _mm256_cmp_pd(z, z, _CMP_UNORD_Q));
+    }
     const __m256i u = _mm256_castpd_si256(v);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(rlo + i),
                      _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(u, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0))));
     _mm_storeu_si128(reinterpret_cast<__m128i*>(rhi + i),
                      _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(u, _mm256_setr_epi32(1, 3, 5, 7, 0, 0, 0, 0))));
+    if (const int nm = _mm256_movemask_pd(nanv)) {   // rare: a NaN among the operands
+      for (unsigned k = 0; k < 4; ++k)
+        if ((nm >> k) & 1) {
+          const uint64_t r = dop_nan(kind, bits(alo, ahi, i + k, 0), bits(blo, bhi, i + k, 1),
+                                     kind == 2 ? bits(clo, chi, i + k, 2) : 0);
+          rlo[i + k] = static_cast<uint32_t>(r);
+          rhi[i + k] = static_cast<uint32_t>(r >> 32);
+        }
+    }
   }
 #else
   for (unsigned i = 0; i < 32; ++i) {
-    const auto get = [&](const uint32_t* lo, const uint32_t* hi, unsigned k) {
-      return std::bit_cast<double>(uint64_t{lo[i]} | (uint64_t{(hi[i] & absm[k]) ^ negm[k]} << 32));
-    };
-    const double x = get(alo, ahi, 0), y = get(blo, bhi, 1);
-    const double v = kind == 0 ? x + y : kind == 1 ? x * y : __builtin_fma(x, y, get(clo, chi, 2));
-    const uint64_t u = std::bit_cast<uint64_t>(v);
+    const uint64_t ua = bits(alo, ahi, i, 0), ub = bits(blo, bhi, i, 1), uc = kind == 2 ? bits(clo, chi, i, 2) : 0;
+    uint64_t u;
+    if (is_nan(ua) || is_nan(ub) || (kind == 2 && is_nan(uc))) {
+      u = dop_nan(kind, ua, ub, uc);
+    } else {
+      const double x = std::bit_cast<double>(ua), y = std::bit_cast<double>(ub);
+      const double v = kind == 0 ? x + y : kind == 1 ? x * y : __builtin_fma(x, y, std::bit_cast<double>(uc));
+      u = std::bit_cast<uint64_t>(v);
+    }
     rlo[i] = static_cast<uint32_t>(u);
     rhi[i] = static_cast<uint32_t>(u >> 32);
   }
 #endif
+  (void)is_nan;
   store_masked(dlo, rlo, mask, 32);
   store_masked(dhi, rhi, mask, 32);
 }
