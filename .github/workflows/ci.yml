@@ -83,7 +83,13 @@ jobs:
       - name: Unit and end-to-end tests
         # The ML tests are the ml job's: on the runner whose image has PyTorch
         # and rocBLAS they would run here too, and take an hour.
-        run: ctest --test-dir build --output-on-failure -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+        # -j2: the two CUTLASS tests are 22 of this step's 32 minutes (run
+        # 38072736621), and on a 4-core runner their nvcc compiles leave cores
+        # idle, so other tests run beside them. The CUTLASS and CuTe tests take
+        # the nvcc_memory lock (CMakeLists.txt) so only one sizes its compiles
+        # from the free memory at a time. The ml job below already runs the rest
+        # of the suite with -j2. Not measured on CI yet.
+        run: ctest --test-dir build --output-on-failure -j2 -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
   workloads:
     name: pantheon workloads
