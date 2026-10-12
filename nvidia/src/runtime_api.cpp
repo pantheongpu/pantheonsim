@@ -7244,6 +7244,12 @@ bool vgpu_record_host_op_if_capturing(cudaStream_t stream, std::function<void()>
 // shape; the kernel itself is not one this runtime registered, so its
 // parameters cannot be read back or changed through cudaGraphKernelNodeGetParams
 // or SetParams.
+// Whether the stream is capturing, which is exactly when vgpu_record_driver_launch_v1 will take a launch: asked
+// first, so a launch that is not being captured does not build the closure it would be given.
+extern "C" __attribute__((visibility("default"))) bool vgpu_stream_capture_active_v1(void* stream) {
+  return capture_active(reinterpret_cast<cudaStream_t>(stream));
+}
+
 extern "C" __attribute__((visibility("default"))) bool vgpu_record_driver_launch_v1(
     void* stream, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, size_t shared,
     const std::function<void()>* op) {

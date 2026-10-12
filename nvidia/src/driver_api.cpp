@@ -11,6 +11,7 @@
 // (documented MVP simplification — see TODO.md).
 #include "vgpu_cuda.h"
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -423,8 +424,10 @@ CUresult api(const char* name, bool needs_init, bool kernel_context, F&& body) {
     report(name, "no current context (create one with cuCtxCreate or cuDevicePrimaryCtxRetain + cuCtxSetCurrent)");
     return CUDA_ERROR_INVALID_CONTEXT;
   }
-  if (s.initialized && !answers_dead_context(name))
-    if (const int fault = s.rt->context_fault()) return static_cast<CUresult>(fault);
+  // The fault first and the name only when there is one: nearly every call finds none, and matching the name
+  // against the calls a dead context still answers is eleven string comparisons.
+  if (s.initialized)
+    if (const int fault = s.rt->context_fault(); fault && !answers_dead_context(name)) return static_cast<CUresult>(fault);
   try {
     CUresult r = body(s);
     if (trace_calls()) std::fprintf(stderr, "[vgpu][call] %s -> %d\n", name, static_cast<int>(r));
@@ -2384,7 +2387,18 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     // launch of the graph.
     using RecordFn = bool (*)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, size_t,
                               const std::function<void()>*);
-    if (auto record = reinterpret_cast<RecordFn>(dlsym(RTLD_DEFAULT, "vgpu_record_driver_launch_v1"))) {
+    // The closure below copies the arguments, so it is only built for a stream that is capturing. (A runtime
+    // too old to say is asked the old way, with the closure; one that is not loaded has nothing to record.)
+    using CapturingFn = bool (*)(void*);
+    static std::atomic<CapturingFn> capturing_fn{nullptr};
+    CapturingFn capturing = capturing_fn.load(std::memory_order_relaxed);
+    if (!capturing) {
+      capturing = reinterpret_cast<CapturingFn>(dlsym(RTLD_DEFAULT, "vgpu_stream_capture_active_v1"));
+      if (capturing) capturing_fn.store(capturing, std::memory_order_relaxed);
+    }
+    if (auto record = (!capturing || capturing(reinterpret_cast<void*>(hStream)))
+                          ? reinterpret_cast<RecordFn>(dlsym(RTLD_DEFAULT, "vgpu_record_driver_launch_v1"))
+                          : nullptr) {
       const std::function<void()> again = [api_name, f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY,
                                            blockDimZ, sharedMemBytes, args, cooperative, cluster] {
         std::vector<void*> ptrs(args.size());

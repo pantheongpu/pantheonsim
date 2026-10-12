@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <cstring>
 #include <cstdio>
 
@@ -360,7 +361,7 @@ uint64_t Device::load_module(const std::string& ptx_src) {
     lm.lazy = std::move(lazy);
     uint64_t id = lm.id;
     modules_.push_back(std::move(lm));
-    module_index_[id] = &modules_.back();
+    module_index_[id] = std::prev(modules_.end());
     forget_kernel_table();
     return id;
   } catch (const Error& e) {
@@ -434,7 +435,7 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
   lm.sass = std::move(sm);
   const uint64_t id = lm.id;
   modules_.push_back(std::move(lm));
-  module_index_[id] = &modules_.back();
+  module_index_[id] = std::prev(modules_.end());
   forget_kernel_table();
   return id;
 }
@@ -450,18 +451,16 @@ void Device::reset() {
 }
 
 void Device::unload_module(uint64_t module_id) {
-  for (auto it = modules_.begin(); it != modules_.end(); ++it) {
-    if (it->id == module_id) {
-      for (uint64_t va : it->global_vas) mem_.free(va);
-      if (it->sass) sass::unload(*it->sass, mem_);
-      module_index_.erase(module_id);
-      modules_.erase(it);
-      unload_epoch_.fetch_add(1, std::memory_order_release);
-      forget_kernel_table();
-      return;
-    }
-  }
-  throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+  const auto found = module_index_.find(module_id);
+  if (found == module_index_.end())
+    throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
+  const auto it = found->second;
+  for (uint64_t va : it->global_vas) mem_.free(va);
+  if (it->sass) sass::unload(*it->sass, mem_);
+  module_index_.erase(found);
+  modules_.erase(it);
+  unload_epoch_.fetch_add(1, std::memory_order_release);
+  forget_kernel_table();
 }
 
 int Device::module_arch(uint64_t module_id) const {
@@ -565,8 +564,8 @@ const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
 }
 
 void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t addr) {
-  for (auto& lm : modules_) {
-    if (lm.id != module_id) continue;
+  if (LoadedModule* found = find_module(module_id)) {
+    LoadedModule& lm = *found;
     const auto it = lm.symbols.find(name);
     if (it == lm.symbols.end() || !lm.mod)
       throw Error::make(Err::NotFound, "module ", module_id, " has no global '", name, "'");
@@ -589,8 +588,8 @@ void Device::rebind_global(uint64_t module_id, const std::string& name, uint64_t
 }
 
 std::vector<std::string> Device::managed_globals(uint64_t module_id) const {
-  for (const auto& lm : modules_) {
-    if (lm.id != module_id) continue;
+  if (const LoadedModule* found = find_module(module_id)) {
+    const LoadedModule& lm = *found;
     if (lm.sass) return lm.sass->managed;
     std::vector<std::string> out;
     if (lm.mod)
@@ -602,8 +601,8 @@ std::vector<std::string> Device::managed_globals(uint64_t module_id) const {
 }
 
 bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const {
-  for (const auto& lm : modules_) {
-    if (lm.id != module_id) continue;
+  if (const LoadedModule* found = find_module(module_id)) {
+    const LoadedModule& lm = *found;
     const auto it = lm.symbols.find(name);
     if (it == lm.symbols.end() || !lm.mod) return false;
     if (lm.sass) {   // a cubin's variables
@@ -626,32 +625,30 @@ bool Device::global(uint64_t module_id, const std::string& name, uint64_t* addr,
 
 std::vector<std::string> Device::kernel_names(uint64_t module_id) const {
   std::vector<std::string> names;
-  for (const auto& lm : modules_) {
-    if (lm.id != module_id) continue;
+  if (const LoadedModule* found = find_module(module_id)) {
+    const LoadedModule& lm = *found;
     if (lm.lazy) {
       std::lock_guard<std::recursive_mutex> lock(lm.lazy->mu);
       names.assign(lm.lazy->entry_order.begin(), lm.lazy->entry_order.end());
     } else if (lm.mod) {
       for (const auto& e : lm.mod->entries) names.push_back(e.name);
     }
-    break;
   }
   return names;
 }
 
 bool Device::has_kernel(uint64_t module_id, const std::string& name) const {
-  for (const auto& lm : modules_) {
-    if (lm.id != module_id || !lm.mod) continue;
-    for (const auto& e : lm.mod->entries)
-      if (e.name == name) return true;
-    if (!lm.lazy) return false;
-    try {  // a lazy module parses the kernel on lookup, and says when there is none
-      return get_function(module_id, name) != nullptr;
-    } catch (const Error&) {
-      return false;
-    }
+  const LoadedModule* found = find_module(module_id);
+  if (!found || !found->mod) return false;
+  const LoadedModule& lm = *found;
+  for (const auto& e : lm.mod->entries)
+    if (e.name == name) return true;
+  if (!lm.lazy) return false;
+  try {  // a lazy module parses the kernel on lookup, and says when there is none
+    return get_function(module_id, name) != nullptr;
+  } catch (const Error&) {
+    return false;
   }
-  return false;
 }
 
 namespace {

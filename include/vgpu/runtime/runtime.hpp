@@ -172,10 +172,10 @@ class Device {
   mutable std::list<LoadedModule> modules_;
   // modules_ by module id (list elements do not move), so the per-launch lookups are not a walk of every
   // module the program has loaded. Kept with modules_: load_module, load_cubin and unload_module.
-  std::unordered_map<uint64_t, LoadedModule*> module_index_;
+  std::unordered_map<uint64_t, std::list<LoadedModule>::iterator> module_index_;
   LoadedModule* find_module(uint64_t module_id) const {
     const auto it = module_index_.find(module_id);
-    return it == module_index_.end() ? nullptr : it->second;
+    return it == module_index_.end() ? nullptr : &*it->second;
   }
   // Every kernel loaded on the device, by address, which a launch hands the
   // kernel for the child grids it launches (LaunchConfig::kernels). It was

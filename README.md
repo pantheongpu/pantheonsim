@@ -205,6 +205,7 @@ Environment knobs:
 | `VGPU_COUNTERS` | `1` prints exact per-launch performance counters | unset |
 | `VGPU_FASTPATH` | `0` sends every instruction down the interpreter's general path, for ruling out its fast paths when a result looks wrong (they are tested to give the same bits) | unset (on) |
 | `VGPU_RACE` | `1` reports unordered shared-memory access between warps; `2` also reports stores that change nothing | unset |
+| `VGPU_LAUNCH_CACHE` | `0` makes every launch work out again what it can remember (the table of every loaded kernel that a device-side launch looks its child up in, and which function a kernel handle names), for ruling the remembering out when a result looks wrong; the answers are tested to be the same either way | unset (on) |
 
 `VGPU_COUNTERS` reports what a profiler reports, except that every number is
 counted rather than sampled. Instructions and thread-instructions (their ratio
