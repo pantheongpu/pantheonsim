@@ -59,6 +59,7 @@
 #include "vgpu/host_cpus.hpp"
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/simd/simd.hpp"
 
 namespace vgpu::exec {
 namespace {
@@ -4497,6 +4498,12 @@ class Interpreter {
       uint32_t* d = dst32(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
       if (g_hw_fma) {
+        // The SIMD kernel (vgpu/simd/simd.hpp) does the fma and the NaN canonicalisation below in one pass.
+        if ((W_ == 32 || W_ == 64) && simd::enabled()) {
+          simd::kernels().ffma_m(d, a.data(), b.data(), c.data(), m, W_);
+          w.written32[op.dst.id] = 1;
+          return true;
+        }
         fma_lanes_f32_hw(d, a.data(), b.data(), c.data(), m, W_);
         // A NaN result is the canonical one (see canon32).
         for_active(m, W_, [&](uint32_t l) {
@@ -4671,7 +4678,11 @@ class Interpreter {
       });
 #if defined(__x86_64__) && defined(__GNUC__)
     } else if (g_hw_fma) {
-      f16x2_fma_lanes_hw(d, a.data(), b.data(), c.data(), m, W_, halves);
+      // Nearest-even rounding only (as double_to_f16's bit path is): a directed mode somewhere takes the old lanes.
+      if ((W_ == 32 || W_ == 64) && simd::enabled() && g_directed_rounding.load(std::memory_order_relaxed) == 0)
+        simd::kernels().hfma2_m(d, a.data(), b.data(), c.data(), m, W_, static_cast<unsigned>(halves));
+      else
+        f16x2_fma_lanes_hw(d, a.data(), b.data(), c.data(), m, W_, halves);
 #endif
     } else {
       for_active(m, W_, [&](uint32_t l) {

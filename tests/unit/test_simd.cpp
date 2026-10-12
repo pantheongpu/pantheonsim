@@ -359,6 +359,102 @@ VTEST(lane_kernels_match_the_scalar_forms_at_every_level) {
   }
 }
 
+VTEST(f64_to_f16_kernel_at_every_level) {
+  std::vector<double> xs;
+  for (uint32_t h = 0; h < 0x7C00; ++h) {
+    const double a = static_cast<double>(std::bit_cast<float>(ref_f16_to_f32(static_cast<uint16_t>(h))));
+    const double b = static_cast<double>(std::bit_cast<float>(ref_f16_to_f32(static_cast<uint16_t>(h + 1))));
+    for (double x : {a, (a + b) / 2, b}) {
+      const uint64_t u = db(x);
+      for (uint64_t d : {u - 1, u, u + 1}) {
+        xs.push_back(std::bit_cast<double>(d));
+        xs.push_back(-std::bit_cast<double>(d));
+      }
+    }
+  }
+  for (uint64_t p : {0x7ff0000000000001ull, 0x7ff8000000000000ull, 0xfff8000000000001ull, 0x7fffffffffffffffull,
+                     0x7ff0000000000000ull, 0xfff0000000000000ull, 0x0000000000000001ull, 0x8000000000000000ull})
+    xs.push_back(std::bit_cast<double>(p));
+  std::mt19937_64 rng(21);
+  for (int i = 0; i < 400000; ++i) {
+    uint64_t u = rng();
+    if (i & 1) u = (u & 0x8000000000000000ull) | (0x3D00000000000000ull + (u & 0x01FFFFFFFFFFFFFFull));
+    xs.push_back(std::bit_cast<double>(u));
+  }
+  xs.push_back(1.0), xs.push_back(2.0), xs.push_back(3.0);   // an odd count: the tail past the vector loop
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    std::vector<uint16_t> out(xs.size());
+    k.f64_to_f16_canon(xs.data(), out.data(), xs.size());
+    for (size_t i = 0; i < xs.size(); ++i) {
+      const uint16_t want = xs[i] != xs[i] ? uint16_t{0x7fff} : ref_f64_to_f16(xs[i]);
+      if (out[i] != want)
+        throw vtest::Failure(std::string(simd::level_name(l)) + ": f64_to_f16 of 0x" + hex(db(xs[i])) + " = 0x" +
+                             hex(out[i]) + ", want 0x" + hex(want));
+    }
+  }
+}
+
+VTEST(masked_kernels_at_every_level) {
+  std::mt19937 rng(17);
+  static const uint16_t h16[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3C00, 0xBC00, 0x7BFF, 0xFBFF, 0x7C00,
+                                 0xFC00, 0x7E00, 0x7C01, 0xFE01, 0x3555, 0x4248, 0x0200, 0x5640, 0xD640, 0x0100, 0x0010};
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 40000; ++round) {
+      const unsigned n = round & 1 ? 64 : 32;
+      uint32_t a[64], b[64], c[64], d[64], d0[64], want[64];
+      for (unsigned i = 0; i < n; ++i) {
+        if (round % 3 == 0) {
+          a[i] = rng(), b[i] = rng(), c[i] = rng();
+        } else {
+          constexpr size_t N = sizeof h16 / sizeof h16[0];
+          a[i] = uint32_t{h16[rng() % N]} | (uint32_t{h16[rng() % N]} << 16);
+          b[i] = uint32_t{h16[rng() % N]} | (uint32_t{h16[rng() % N]} << 16);
+          c[i] = uint32_t{h16[rng() % N]} | (uint32_t{h16[rng() % N]} << 16);
+        }
+        d0[i] = rng();
+      }
+      uint64_t mask = (static_cast<uint64_t>(rng()) << 32) | rng();
+      if (round % 7 == 0) mask = ~uint64_t{0};
+      if (round % 11 == 0) mask = 0;
+      const unsigned halves = round % 5 == 0 ? 1 : 2;
+      const bool alias = round % 4 == 1;
+      std::memcpy(d, d0, sizeof d);
+      uint32_t* src_a = a;
+      if (alias) {   // d is also the first source
+        std::memcpy(d, a, sizeof d);
+        std::memcpy(d0, a, sizeof d0);
+      }
+      k.hfma2_m(d, src_a, b, c, mask, n, halves);
+      for (unsigned i = 0; i < n; ++i) {
+        uint32_t out = 0;
+        for (unsigned h = 0; h < halves; ++h) {
+          const auto cv = [&](uint32_t w) { return static_cast<double>(static_cast<float>(std::bit_cast<_Float16>(static_cast<uint16_t>(w >> (16 * h))))); };
+          const double v = std::fma(cv(a[i]), cv(b[i]), cv(c[i]));
+          const uint16_t hb = v != v ? uint16_t{0x7fff} : std::bit_cast<uint16_t>(static_cast<_Float16>(v));
+          out |= uint32_t{hb} << (16 * h);
+        }
+        want[i] = (mask >> i) & 1 ? out : d0[i];
+        if (d[i] != want[i])
+          throw vtest::Failure(lv + " hfma2_m round " + std::to_string(round) + " lane " + std::to_string(i) + ": got 0x" +
+                               hex(d[i]) + " want 0x" + hex(want[i]) + " (a=0x" + hex(a[i]) + " b=0x" + hex(b[i]) +
+                               " c=0x" + hex(c[i]) + ")");
+      }
+      // ffma_m on the same words.
+      std::memcpy(d, d0, sizeof d);
+      k.ffma_m(d, a, b, c, mask, n);
+      for (unsigned i = 0; i < n; ++i) {
+        const uint32_t w = (mask >> i) & 1 ? ref_out(std::fma(asf(a[i]), asf(b[i]), asf(c[i]))) : d0[i];
+        if (d[i] != w)
+          throw vtest::Failure(lv + " ffma_m round " + std::to_string(round) + " lane " + std::to_string(i) + ": got 0x" +
+                               hex(d[i]) + " want 0x" + hex(w));
+      }
+    }
+  }
+}
+
 VTEST(level_choice) {
   VCHECK(simd::supported(simd::Level::Base));
   VCHECK(simd::supported(simd::level()));

@@ -58,6 +58,17 @@ struct Kernels {
   void (*fadd)(uint32_t* r, const uint32_t* a, const uint32_t* b);
   void (*fmul)(uint32_t* r, const uint32_t* a, const uint32_t* b);
 
+  // Masked forms over n lanes (a multiple of 8, at most 64), writing only the lanes whose bit of `mask` is set; the
+  // others of d keep their value, and d may be one of the sources. ffma_m: as ffma. hfma2_m: each 32-bit lane is
+  // two binary16 halves (`halves` = 2) or one in the low half (1; the high half of the result is then zero); each
+  // half is the double-precision fused multiply-add of its three inputs rounded once to binary16 (a NaN the canonical
+  // 0x7fff) -- the PTX interpreter's fma.rn.f16x2, whose rounding is that of the double, not of an exact fused op.
+  void (*ffma_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
+  void (*hfma2_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n,
+                  unsigned halves);
+  // binary64 -> binary16 to nearest even in one rounding, a NaN the canonical 0x7fff.
+  void (*f64_to_f16_canon)(const double* in, uint16_t* out, size_t n);
+
   // One warp's mma.m16n8kK of f16, bf16 or tf32 operands with a float or half
   // accumulator, on the registers as the warp holds them: register r of a
   // fragment is the 32 words at x + 32 * r. kind 0 = f16, 1 = bf16, 2 = tf32;

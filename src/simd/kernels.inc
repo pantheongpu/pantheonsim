@@ -280,4 +280,119 @@ void fmul_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
   }
 }
 
+// ---- masked lane kernels (the PTX interpreter's lane loops) --------------------------------------------------------
+
+// d[l] = r[l] for the lanes of `mask` (bit l), l < n (n a multiple of 8, at most 64); the other lanes of d keep their
+// value. r is computed in full first, so d may be one of the sources.
+inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, unsigned n) {
+  const uint64_t all = n >= 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+  if ((mask & all) == all) {
+    std::memcpy(d, r, n * sizeof(uint32_t));
+    return;
+  }
+  for (unsigned i = 0; i < n; i += 8) {
+    const uint32_t bits = static_cast<uint32_t>(mask >> i) & 0xffu;
+    if (bits == 0) continue;
+    const V8u pick = {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u};
+    const V8u sel = reinterpret_cast<V8u>((pick & bits) != 0);
+    V8u old, v;
+    std::memcpy(&old, d + i, sizeof old);
+    std::memcpy(&v, r + i, sizeof v);
+    old = (old & ~sel) | (v & sel);
+    std::memcpy(d + i, &old, sizeof old);
+  }
+}
+
+void ffma_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n) {
+  uint32_t r[64];
+  for (unsigned i = 0; i < n; i += 32) ffma_k(r + i, a + i, b + i, c + i);
+  store_masked(d, r, mask, n);
+}
+
+#if VGPU_SIMD_AVX2
+// Four doubles to four binary16 (in the low 64 bits): to nearest even in one rounding, a NaN the canonical 0x7fff.
+// The integer form of f64_to_f16_bits (simd/fp16.hpp), whose comments say why each constant is what it is.
+inline __m128i f64x4_to_f16x4(__m256d v) {
+  const __m256i one = _mm256_set1_epi64x(1);
+  const __m256i u = _mm256_castpd_si256(v);
+  const __m256i mag = _mm256_and_si256(u, _mm256_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
+  const __m256i sign16 = _mm256_and_si256(_mm256_srli_epi64(u, 48), _mm256_set1_epi64x(0x8000));
+  const __m256i is_nan = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(0x7FF0000000000000ll));
+  const __m256i is_ovf = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(0x40EFFDFFFFFFFFFFll));    // >= 65520
+  const __m256i is_norm = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(0x3F0FFFFFFFFFFFFFll));   // >= 2^-14
+  const __m256i is_sub = _mm256_cmpgt_epi64(mag, _mm256_set1_epi64x(0x3E5FFFFFFFFFFFFFll));    // >= 2^-25
+  // A normal half: re-bias the exponent and round the 42 dropped bits to even.
+  const __m256i r = _mm256_sub_epi64(mag, _mm256_set1_epi64x(1008ll << 52));
+  const __m256i lsb = _mm256_and_si256(_mm256_srli_epi64(r, 42), one);
+  const __m256i vn = _mm256_srli_epi64(
+      _mm256_add_epi64(_mm256_add_epi64(r, _mm256_set1_epi64x((1ll << 41) - 1)), lsb), 42);
+  // A subnormal half: the 53-bit significand shifted to the half's grid, 28 - e places with e the unbiased exponent
+  // (a count past 63 gives zero, which is what a value below 2^-25 rounds to).
+  const __m256i ef = _mm256_srli_epi64(mag, 52);
+  const __m256i shift = _mm256_sub_epi64(_mm256_set1_epi64x(1051), ef);
+  const __m256i sig =
+      _mm256_or_si256(_mm256_and_si256(mag, _mm256_set1_epi64x((1ll << 52) - 1)), _mm256_set1_epi64x(1ll << 52));
+  const __m256i half = _mm256_sllv_epi64(one, _mm256_sub_epi64(shift, one));
+  const __m256i lsbq = _mm256_and_si256(_mm256_srlv_epi64(sig, shift), one);
+  const __m256i q =
+      _mm256_srlv_epi64(_mm256_add_epi64(_mm256_add_epi64(sig, _mm256_sub_epi64(half, one)), lsbq), shift);
+  __m256i res = _mm256_and_si256(is_sub, q);
+  res = _mm256_blendv_epi8(res, vn, is_norm);
+  res = _mm256_blendv_epi8(res, _mm256_set1_epi64x(0x7C00), is_ovf);
+  res = _mm256_or_si256(res, sign16);
+  res = _mm256_blendv_epi8(res, _mm256_set1_epi64x(0x7FFF), is_nan);
+  const __m256i lo = _mm256_permutevar8x32_epi32(res, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0));
+  return _mm_packus_epi32(_mm256_castsi256_si128(lo), _mm256_castsi256_si128(lo));
+}
+#endif
+
+void f64_to_f16_canon_k(const double* in, uint16_t* out, size_t n) {
+  size_t i = 0;
+#if VGPU_SIMD_AVX2
+  for (; i + 4 <= n; i += 4) {
+    const __m128i h = f64x4_to_f16x4(_mm256_loadu_pd(in + i));
+    const uint64_t w = static_cast<uint64_t>(_mm_cvtsi128_si64(h));
+    std::memcpy(out + i, &w, sizeof w);
+  }
+#endif
+  for (; i < n; ++i) out[i] = in[i] != in[i] ? uint16_t{0x7fff} : f64_to_f16_bits(in[i]);
+}
+
+// d[l] = the fused multiply-add of the lanes' f16 halves, `halves` of them (1: the low half, the high half of the
+// result zero), as double-precision fused multiply-adds each rounded once to binary16 -- NaN the canonical 0x7fff.
+void hfma2_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n,
+               unsigned halves) {
+  uint32_t r[64];
+#if VGPU_SIMD_AVX2
+  for (unsigned i = 0; i < n; i += 4) {
+    // Four words are eight halves, in memory order: word w's low half then its high half.
+    const __m256 fa = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));
+    const __m256 fb = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i)));
+    const __m256 fc = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c + i)));
+    const __m256d v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(fa)),
+                                       _mm256_cvtps_pd(_mm256_castps256_ps128(fb)),
+                                       _mm256_cvtps_pd(_mm256_castps256_ps128(fc)));
+    const __m256d v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(fa, 1)),
+                                       _mm256_cvtps_pd(_mm256_extractf128_ps(fb, 1)),
+                                       _mm256_cvtps_pd(_mm256_extractf128_ps(fc, 1)));
+    const __m128i h0 = f64x4_to_f16x4(v0), h1 = f64x4_to_f16x4(v1);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(r + i), _mm_unpacklo_epi64(h0, h1));
+  }
+#else
+  for (unsigned l = 0; l < n; ++l) {
+    uint32_t out = 0;
+    for (unsigned h = 0; h < 2; ++h) {
+      const double v = __builtin_fma(static_cast<double>(f16_to_f32(static_cast<uint16_t>(a[l] >> (16 * h)))),
+                                     static_cast<double>(f16_to_f32(static_cast<uint16_t>(b[l] >> (16 * h)))),
+                                     static_cast<double>(f16_to_f32(static_cast<uint16_t>(c[l] >> (16 * h)))));
+      out |= static_cast<uint32_t>(v != v ? uint16_t{0x7fff} : f64_to_f16_bits(v)) << (16 * h);
+    }
+    r[l] = out;
+  }
+#endif
+  if (halves == 1)
+    for (unsigned l = 0; l < n; ++l) r[l] &= 0xffffu;
+  store_masked(d, r, mask, n);
+}
+
 }  // namespace VGPU_SIMD_NS

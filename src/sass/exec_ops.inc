@@ -1065,7 +1065,9 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   // broadcast, or the register with its modifier applied -- so the loops
   // below have no branches in them.
   alignas(64) uint32_t buf[3][32];
-  const auto lanes = [&](unsigned i, const Operand& o, auto modify) -> const uint32_t* {
+  // (always_inline: called out of line, the modifier struct -- three bools, stored a byte at a time -- was read back
+  // as one word, a store-forwarding stall that took a third of the time of the plain forms.)
+  const auto lanes = [&](unsigned i, const Operand& o, auto modify) __attribute__((always_inline)) -> const uint32_t* {
     if (o.kind == Kind::Reg && o.reg != kRZ && !modify.active) return &w.reg(o.reg, 0);
     if (o.kind == Kind::Reg) {
       const uint32_t* r = o.reg == kRZ ? nullptr : &w.reg(o.reg, 0);
@@ -1578,6 +1580,19 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       return;
     case Op::HADD2: case Op::HMUL2: case Op::HFMA2: {
       const bool bf = ins.f[0], f32out = ins.f[1], fz = ins.f[2], st = ins.f[3];
+      // The plain HFMA2 Rd, Ra, Rb, Rc of f16 halves (registers, no swizzle, no |.| or -) is one SIMD kernel
+      // (vgpu/simd/simd.hpp: hfma2_m); it gives the bits the lane loop below gives (tests/unit/test_simd.cpp).
+      if (ins.op == Op::HFMA2 && !bf && !f32out && !st && simd::enabled() && ins.src.size() >= 3 &&
+          ins.dst[0].kind == Kind::Reg) {
+        const auto plain = [](const Operand& o) { return o.kind == Kind::Reg && !o.abs && !o.neg && o.suffix.empty(); };
+        if (plain(ins.src[0]) && plain(ins.src[1]) && plain(ins.src[2])) {
+          static const uint32_t kZero[32] = {};
+          const auto lanes_of = [&](const Operand& o) -> const uint32_t* { return o.reg == kRZ ? kZero : &w.reg(o.reg, 0); };
+          const uint32_t *a = lanes_of(ins.src[0]), *b = lanes_of(ins.src[1]), *c = lanes_of(ins.src[2]);
+          if (ins.dst[0].reg != kRZ) simd::kernels().hfma2_m(&w.reg(ins.dst[0].reg, 0), a, b, c, ex, 32, 2);
+          return;
+        }
+      }
       // A source's two lanes (low, high) as floats, after its swizzle.
       const auto halves = [&](const Operand& o, unsigned l, float out[2]) {
         if (o.kind == Kind::FImm) {   // split immediates: each is one half, for both lanes

@@ -42,11 +42,13 @@ namespace {
 
 const Kernels kBase = {Level::Base,       base_impl::f16_to_f32_k, base_impl::f32_to_f16_k, base_impl::iadd3_k,
                        base_impl::imad_k, base_impl::lop3_k,       base_impl::ffma_k,       base_impl::fadd_k,
-                       base_impl::fmul_k, base_impl::hmma_k};
+                       base_impl::fmul_k, base_impl::ffma_m_k,   base_impl::hfma2_m_k,     base_impl::f64_to_f16_canon_k,
+                       base_impl::hmma_k};
 #ifdef VGPU_SIMD_X86
 const Kernels kAvx2 = {Level::Avx2,       avx2_impl::f16_to_f32_k, avx2_impl::f32_to_f16_k, avx2_impl::iadd3_k,
                        avx2_impl::imad_k, avx2_impl::lop3_k,       avx2_impl::ffma_k,       avx2_impl::fadd_k,
-                       avx2_impl::fmul_k, avx2_impl::hmma_k};
+                       avx2_impl::fmul_k, avx2_impl::ffma_m_k,   avx2_impl::hfma2_m_k,     avx2_impl::f64_to_f16_canon_k,
+                       avx2_impl::hmma_k};
 
 // The F16C conversions against the scalar ones: every half, and a spread of
 // floats. A host whose conversion differs (a stray MXCSR, an emulator) is
