@@ -101,8 +101,42 @@ workloads (tests/workloads/run_pantheon_workloads.sh, docs/pantheon-workloads.md
 are duration-driven soak programs that need a separate checkout, a Makefile build
 and `vgpu shell`; their instruction count depends on how long they ran, so they
 cannot back a deterministic counter check. `f64_subnormal` reproduces the one
-pantheon kernel TODO.md singles out; running the pantheon suite itself is still
-the job of the `workloads` CI job.
+pantheon kernel TODO.md singles out. They are available as an optional mode,
+below; running the whole pantheon suite stays the job of the `workloads` CI job.
+
+### Pantheon workloads (optional mode)
+
+```
+tools/bench/bench.sh pantheon --build build --pantheon-bin ~/pantheon/build-vgpu-86 \
+    --workloads int_virus,fp64_virus --runs 5 --duration 3
+```
+
+Runs binaries from a separate pantheon checkout, built for sm_86 with a shared
+cudart (`make PLATFORM=CUDA BUILD_DIR=build-vgpu-86 build-vgpu-86/int_virus`, as
+the runner script does inside `vgpu shell`), with the runner's knobs
+(`0 <duration> 2 --kernel_loops 2 --grid_size 4`, 1 GB VRAM). They do as much work
+as fits in the duration, so counters are on in every run and each run's rate is
+its own instructions over its own CPU time; there is no counter check for them,
+and A/B compares rates only. Measured here (the binaries found in
+`build-vgpu-86`, built 2026-09-14/25 from an older pantheon, 3 runs of 3 s,
+`nvidia/rtx3060`, load 12-13):
+
+| workload | engine | warp-instr per run (median) | Minst/s median | Minst/s best | spread | cpu s per run |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| int_virus | sass | 42508800 | 14.17 | 15.42 | 11% | 3.00 |
+| int_virus | ptx | 96102912 | 31.98 | 34.92 | 18% | 3.01 |
+| compute_virus | sass | 17779392 | 5.97 | 8.90 | 59% | 2.98 |
+| compute_virus | ptx | 33490080 | 11.14 | 17.18 | 62% | 3.01 |
+| fp64_virus | sass | 7385568 | 2.44 | 2.50 | 8% | 3.03 |
+| fp64_virus | ptx | 79481088 | 26.46 | 36.03 | 64% | 3.00 |
+| mma_virus | sass | 3554304 | 1.17 | 1.19 | 34% | 3.05 |
+| mma_virus | ptx | 9435872 | 3.13 | 3.14 | 46% | 3.02 |
+| pulse_virus | sass | 470080 | 11.40 | 11.52 | 2% | 0.04 |
+| pulse_virus | ptx | 492960 | 15.87 | 15.93 | 1% | 0.03 |
+
+`pulse_virus` sleeps most of each period (about 0.04 s of CPU in 3 s), so its
+rate says little. At pantheon's default `--kernel_loops 2` the fp64_virus chain
+has not reached the subnormal range; `f64_subnormal` above is the case that has.
 
 ### Counter check (the PR gate)
 

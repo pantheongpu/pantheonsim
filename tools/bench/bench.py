@@ -291,11 +291,15 @@ def _poll_hwm(pid, binary, stop, box):
 
 
 def run_process(binary, workload, size, env, timeout):
+    return run_argv([binary, workload, size], env, timeout)
+
+
+def run_argv(argv, env, timeout):
     """Run once; returns wall/cpu from wait4 (this child only), peak RSS, and its output."""
+    binary = argv[0]
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         t0 = time.monotonic()
-        p = subprocess.Popen([binary, workload, size], env=env, stdout=out, stderr=err,
-                             stdin=subprocess.DEVNULL)
+        p = subprocess.Popen(argv, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
         killed = []
 
         def kill():
@@ -657,6 +661,8 @@ def ab_compare(results):
         diff = {k: (a["counters"].get(k), b["counters"].get(k))
                 for k in sorted(set(a["counters"]) | set(b["counters"]))
                 if a["counters"].get(k) != b["counters"].get(k)}
+        if a.get("duration_driven"):
+            diff = {}  # a soak workload does as much work as fits its duration: counts are not comparable
         key = "winst_per_cpu_s" if "winst_per_cpu_s" in a["stats"] else "units_per_s"
         if key not in a["stats"] or key not in b["stats"] or not a["stats"][key] or not b["stats"][key]:
             key = "wall_s"
@@ -676,6 +682,86 @@ def ab_compare(results):
                     "p_value": p, "verdict": verdict, "n_a": sa["n"], "n_b": sb["n"],
                     "counters_identical": not diff, "counter_diffs": diff})
     return out
+
+
+# --------------------------------------------------------------------------- pantheon workloads
+
+PANTHEON_DEFAULT = ["int_virus", "compute_virus", "fp64_virus", "mma_virus", "pulse_virus"]
+
+
+def find_pantheon_bin(args):
+    """A directory of pantheon binaries built for the shim (make PLATFORM=CUDA BUILD_DIR=build-vgpu-86 ...)."""
+    cands = [args.pantheon_bin, os.environ.get("VGPU_PANTHEON_BIN")]
+    for base in (os.environ.get("VGPU_PANTHEON_DIR"), os.path.join(ROOT, "..", "pantheon"),
+                 os.path.join(os.path.expanduser("~"), "pantheon")):
+        if base:
+            import glob
+            cands += sorted(glob.glob(os.path.join(base, "build-vgpu-*")))
+    for c in cands:
+        if c and os.path.isdir(c):
+            return os.path.abspath(c)
+    return None
+
+
+def pantheon_mode(args, builds, engines):
+    """Time pantheon's soak workloads (separate checkout, built for sm_86 with a shared cudart).
+
+    They run for a duration rather than a fixed amount of work, so the instruction count differs from run to run:
+    the rate is each run's own instructions over its own CPU time, counters are on in every run, and no counter
+    check applies. Knobs as tests/workloads/run_pantheon_workloads.sh: --kernel_loops 2 --grid_size 4, 2% memory.
+    """
+    bindir = find_pantheon_bin(args)
+    if not bindir:
+        die("no pantheon build found: pass --pantheon-bin DIR (a build-vgpu-* directory from "
+            "`make PLATFORM=CUDA BUILD_DIR=... DIR/<workload>`), see docs/pantheon-workloads.md", 1)
+    names = [w for w in (args.workloads.split(",") if args.workloads else PANTHEON_DEFAULT)]
+    results, failures = [], []
+    labs = list(builds)
+    for w in names:
+        path = os.path.join(bindir, w)
+        if not os.access(path, os.X_OK):
+            failures.append("%s: no binary %s" % (w, path))
+            continue
+        for e in engines:
+            runs = {lab: [] for lab in labs}
+            for i in range(args.runs + args.warmup):
+                for lab in labs:
+                    env = clean_env(builds[lab]["dir"], args, e, True)
+                    env["VGPU_VRAM_MB"] = "1024"
+                    env["VGPU_MAX_STEPS"] = "17179869184"
+                    res = run_argv([path, "0", str(args.duration), "2", "--kernel_loops", "2", "--grid_size", "4"],
+                                   env, args.timeout)
+                    if res["rc"] != 0 or res["timeout"]:
+                        failures.append("%s/%s[%s]: rc=%s" % (w, e, lab, res["rc"]))
+                        continue
+                    try:
+                        kernels, log = parse_counters(res["stderr"])
+                    except ValueError as ex:
+                        failures.append("%s/%s: %s" % (w, e, ex))
+                        continue
+                    ins = totals(kernels).get("instructions", 0)
+                    if i >= args.warmup and ins:
+                        res.update({"device_cpu_s": res["cpu"], "device_wall_s": res["wall"], "instr": ins,
+                                    "fell_back": [m for k, m in log if k == "PTX"]})
+                        runs[lab].append(res)
+            for lab in labs:
+                rs = runs[lab]
+                if not rs:
+                    continue
+                st = {"wall_s": stat([r["wall"] for r in rs]), "cpu_s": stat([r["cpu"] for r in rs]),
+                      "rss_mb": stat([r["rss_kb"] / 1024.0 for r in rs]),
+                      "device_cpu_s": stat([r["cpu"] for r in rs]), "device_wall_s": stat([r["wall"] for r in rs]),
+                      "winst_per_cpu_s": stat([r["instr"] / r["cpu"] for r in rs], True)}
+                results.append({"workload": "pantheon:" + w, "engine": e, "group": "pantheon", "build": lab,
+                                "counters": {"instructions": int(statistics.median([r["instr"] for r in rs]))},
+                                "kernels": {}, "engine_log": [], "duration_driven": True,
+                                "fell_back_to_ptx": rs[0]["fell_back"], "units": 0, "unit": "none",
+                                "runs": [{k: r[k] for k in ("wall", "cpu", "rss_kb", "device_cpu_s", "device_wall_s")}
+                                         for r in rs],
+                                "stats": st})
+            if not args.quiet:
+                print("  done pantheon:%-16s %-4s" % (w, e), file=sys.stderr)
+    return results, failures
 
 
 # --------------------------------------------------------------------------- output
@@ -987,9 +1073,10 @@ def profile_mode(args, names, engines, builds, binary):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="bench.sh", description=__doc__.split("\n\n")[0])
-    p.add_argument("mode", nargs="?", choices=["run", "mix", "profile"], default="run",
+    p.add_argument("mode", nargs="?", choices=["run", "mix", "profile", "pantheon"], default="run",
                    help="run (default): time the workloads; mix: print instruction-class mix; "
-                        "profile: perf-sample each workload and print the top functions per engine and group")
+                        "profile: perf-sample each workload and print the top functions per engine and group; "
+                        "pantheon: time pantheon's soak workloads from a separate checkout's build-vgpu-* directory")
     p.add_argument("--build", default=os.path.join(ROOT, "build"), help="build directory (has shim/)")
     p.add_argument("--ab", nargs=2, metavar=("DIR_A", "DIR_B"), help="alternate A B A B ... between two build dirs")
     p.add_argument("--workloads", help="comma list of workloads or groups (alu tensor memory control api)")
@@ -1014,6 +1101,8 @@ def build_parser():
     p.add_argument("--cache", help="directory for the compiled program (default ~/.cache/vgpu-bench)")
     p.add_argument("--record-hostname", action="store_true", help="put the host name in the JSON meta")
     p.add_argument("--cpus", metavar="LIST", help="pin every run to these CPUs (e.g. 2-5); default: the scheduler decides")
+    p.add_argument("--pantheon-bin", metavar="DIR", help="pantheon mode: directory with the built workloads")
+    p.add_argument("--duration", type=int, default=3, help="pantheon mode: seconds each workload runs")
     p.add_argument("--perf", help="profile: the perf binary (default: $PERF, then perf on PATH)")
     p.add_argument("--top", type=int, default=25, help="profile: functions to list per engine and group")
     p.add_argument("--freq", type=int, default=2999, help="profile: sampling frequency in Hz")
@@ -1040,6 +1129,8 @@ def main():
         os.sched_setaffinity(0, cpus)  # children inherit it
     if args.size is None:
         args.size = "quick" if args.mode == "mix" else "full"
+    if args.mode == "pantheon":
+        return pantheon_main(args, engines)
     names = selected_workloads(args)
     ok, builds, nvcc, rel = setup(args)
     if not ok:
@@ -1154,6 +1245,31 @@ def main():
     if args.ab and any(not x["counters_identical"] for x in ab):
         print("NOTE: counters differ between A and B for at least one workload (see the table): the two "
               "builds did not execute the same instruction stream.")
+    return 0
+
+
+def pantheon_main(args, engines):
+    dirs = [args.build] if not args.ab else list(args.ab)
+    builds = {}
+    for lab, d in zip(["A", "B"] if args.ab else ["A"], dirs):
+        d = os.path.abspath(d)
+        if not os.path.isdir(os.path.join(d, "shim")):
+            die("%s has no shim/ directory" % d)
+        builds[lab] = {"dir": d, "cuda_major": shim_major(d)}
+    meta = meta_block(args, builds, None, None)
+    t0 = time.monotonic()
+    results, failures = pantheon_mode(args, builds, engines)
+    meta["elapsed_s"] = time.monotonic() - t0
+    ab = ab_compare(results) if args.ab else []
+    print_table(results, ab)
+    print("\n(duration-driven: %d s per run, counters on in every run; the rate is each run's instructions over its CPU time)"
+          % args.duration)
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"schema": 1, "meta": meta, "results": results, "ab": ab}, f, indent=1, sort_keys=True)
+    if failures:
+        print("FAIL:\n  " + "\n  ".join(failures), file=sys.stderr)
+        return 1
     return 0
 
 
