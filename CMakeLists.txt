@@ -13,11 +13,45 @@ add_compile_options(-Wall -Wextra)
 # The interpreter is the hot path and benefits measurably from cross-TU
 # inlining. Enabled only for Release builds, and only if the toolchain
 # supports it, so debug builds and odd toolchains are unaffected.
+# -DVGPU_LTO=OFF builds without it: an order of magnitude less link time for
+# a development loop that does not measure speed.
+option(VGPU_LTO "Link-time optimization in Release builds" ON)
 include(CheckIPOSupported)
 check_ipo_supported(RESULT VGPU_HAVE_LTO OUTPUT _lto_msg)
-if(VGPU_HAVE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+if(VGPU_LTO AND VGPU_HAVE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
   message(STATUS "Link-time optimization enabled for Release")
+endif()
+
+# Profile-guided optimization with GCC, opt in and never the default. The
+# profile belongs to one compiler version and one revision of the sources, so
+# nothing is committed: train and build in the same build directory.
+#   cmake -B build-pgo -DVGPU_PGO=generate && cmake --build build-pgo
+#   scripts/pgo-train.sh build-pgo         (runs the training programs)
+#   cmake -B build-pgo -DVGPU_PGO=use && cmake --build build-pgo
+# The "use" step must keep the build directory's path, which names the profile
+# files. It changes code generation only; a test result must not differ.
+set(VGPU_PGO "" CACHE STRING "Profile-guided optimization: generate, use, or empty for off")
+set_property(CACHE VGPU_PGO PROPERTY STRINGS "" generate use)
+set(VGPU_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Where the PGO profile (.gcda files) is written and read")
+if(VGPU_PGO)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "VGPU_PGO is written for GCC (-fprofile-generate=DIR); this is ${CMAKE_CXX_COMPILER_ID}")
+  endif()
+  if(VGPU_PGO STREQUAL "generate")
+    # prefer-atomic: a training run may use several host threads.
+    set(_pgo_flags -fprofile-generate=${VGPU_PGO_DIR} -fprofile-update=prefer-atomic)
+  elseif(VGPU_PGO STREQUAL "use")
+    # A function whose source changed since the profile was taken is compiled
+    # without it (-Wno-coverage-mismatch), not rejected.
+    set(_pgo_flags -fprofile-use=${VGPU_PGO_DIR} -fprofile-correction -Wno-missing-profile
+                   -Wno-coverage-mismatch)
+  else()
+    message(FATAL_ERROR "VGPU_PGO must be generate, use or empty, not '${VGPU_PGO}'")
+  endif()
+  add_compile_options(${_pgo_flags})
+  add_link_options(${_pgo_flags})
+  message(STATUS "Profile-guided optimization: ${VGPU_PGO} (${VGPU_PGO_DIR})")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -192,6 +226,18 @@ add_library(vgpu STATIC
   nvidia/src/device_attributes.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
+
+# With LTO on, every executable that links this archive re-optimises all of it
+# at link time. The ~90 unit tests did that on CI: 11 of the 16 minutes of a
+# build were their links. So the archive keeps machine code next to the LTO
+# bytecode (-ffat-lto-objects): the shims still link it with LTO and get the
+# same code as before, while a test (marked at the end of this file) links the
+# machine code and takes seconds.
+option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carries machine code for them)" ON)
+if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
+  target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
+endif()
 
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
@@ -3382,3 +3428,33 @@ get_property(_vgpu_all_tests DIRECTORY PROPERTY TESTS)
 if(_vgpu_all_tests)
   set_tests_properties(${_vgpu_all_tests} PROPERTIES SKIP_REGULAR_EXPRESSION "(^|\n)SKIP:")
 endif()
+
+# Unit tests link the archive's machine code, not LTO (see the comment on the
+# vgpu library). Only the tests: the shims and the vgpu tool keep LTO.
+if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  get_property(_vgpu_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t IN LISTS _vgpu_all_targets)
+    get_target_property(_type ${_t} TYPE)
+    if(_type STREQUAL "EXECUTABLE" AND _t MATCHES "^test_")
+      set_target_properties(${_t} PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
+      # The archive's objects carry LTO bytecode too, and the compiler driver
+      # runs LTO on them at link time unless told not to: 70 s of CPU, against
+      # 0.1 s for the plain link, for a test that gains nothing from it.
+      target_link_options(${_t} PRIVATE -fno-lto)
+    endif()
+  endforeach()
+endif()
+
+# The CUTLASS and CuTe tests each size their nvcc compiles from the memory
+# free when they start (cutlass_compile_jobs in nvidia/tests/e2e/cutlass_fetch.sh),
+# ten gigabytes a compile. Two of them at once under `ctest -j` would each count
+# the same free memory, so they take a lock and run one at a time; everything
+# else may overlap them. A serial ctest ignores the lock.
+foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopper e2e_cutlass_sm103
+           e2e_cutlass_sm100_conv e2e_cutlass_fmha e2e_tma_gemm_cute e2e_wgmma_cute
+           e2e_tma_reduce_cute e2e_tensormap_replace_cute e2e_sass_archs e2e_device_runtime
+           e2e_sync_masks)
+  if(TEST ${_t})
+    set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
+  endif()
+endforeach()
