@@ -31,11 +31,11 @@
 #include <thread>
 #include <tuple>
 
-#include "access_count.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
+#include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"

@@ -1,16 +1,18 @@
-// The SASS executor's memory-access counting (src/sass/access_count.hpp)
-// against the straightforward version it replaced, which gathered the touched
-// sectors and the words of each shared-memory bank into std::vectors on every
-// access. The counters these feed (global_sectors, shared_bank_conflicts, ...)
-// are reported to users, so the allocation-free version must agree with the
-// vector version on every access: aligned and unaligned, every access size,
-// partial lane masks, broadcasts, strides that land every lane in one bank,
-// and addresses at the top of the address space.
+// The SASS executor's memory-access counting (vgpu/exec/mem_counters.hpp:
+// distinct_sectors with SIZE_MAX as the cap, and sass_bank_passes) against the
+// straightforward version it replaced, which gathered the touched sectors and
+// the words of each shared-memory bank into std::vectors on every access. The
+// counters these feed (global_sectors, shared_bank_conflicts, ...) are reported
+// to users, so the allocation-free version must agree with the vector version
+// on every access: aligned and unaligned, every access size, partial lane
+// masks, broadcasts, strides that land every lane in one bank, and addresses at
+// the top of the address space. (These patterns were first written for the
+// SASS executor's own counting header, which the memory counters replaced.)
 #include <algorithm>
 #include <cstdint>
 #include <vector>
 
-#include "../../src/sass/access_count.hpp"
+#include "vgpu/exec/mem_counters.hpp"
 #include "vtest.hpp"
 
 namespace {
@@ -53,15 +55,17 @@ struct Rng {
 };
 
 void check(const uint64_t* addr, Mask lanes, uint32_t bytes, const char* what) {
-  const uint64_t s_new = vgpu::sass::distinct_sectors(addr, lanes, bytes), s_ref = ref_sectors(addr, lanes, bytes);
+  const uint64_t s_new = vgpu::exec::memcount::distinct_sectors(addr, lanes, 32, bytes, SIZE_MAX),
+                 s_ref = ref_sectors(addr, lanes, bytes);
   if (s_new != s_ref)
     throw vtest::Failure(std::string(what) + ": sectors " + std::to_string(s_new) + " vs " + std::to_string(s_ref) +
                          " (bytes " + std::to_string(bytes) + ", mask " + std::to_string(lanes) + ")");
-  // The scan the bitmap hands wide spreads to is checked on every access too.
-  if (vgpu::sass::distinct_sectors_scan(addr, lanes, bytes) != s_ref)
-    throw vtest::Failure(std::string(what) + ": scan sectors differ (bytes " + std::to_string(bytes) + ")");
+  // The earlier code the fast version hands anything unusual to is checked on every access too.
+  if (vgpu::exec::memcount::sass_sectors_reference(addr, lanes, 32, bytes) != s_ref)
+    throw vtest::Failure(std::string(what) + ": reference sectors differ (bytes " + std::to_string(bytes) + ")");
   if (lanes) {
-    const uint64_t b_new = vgpu::sass::bank_passes(addr, lanes, bytes), b_ref = ref_passes(addr, lanes, bytes);
+    const uint64_t b_new = vgpu::exec::memcount::sass_bank_passes(addr, lanes, 32, bytes),
+                   b_ref = ref_passes(addr, lanes, bytes);
     if (b_new != b_ref)
       throw vtest::Failure(std::string(what) + ": bank passes " + std::to_string(b_new) + " vs " + std::to_string(b_ref) +
                            " (bytes " + std::to_string(bytes) + ", mask " + std::to_string(lanes) + ")");
@@ -109,7 +113,8 @@ VTEST(sass_access_count_top_of_address_space) {
       // An access that wraps the address space counts nothing in the vector
       // version; the shared-memory case never sees such addresses, so only the
       // sector count is compared.
-      const uint64_t a = vgpu::sass::distinct_sectors(addr, 0xffffffffu, bytes), b = ref_sectors(addr, 0xffffffffu, bytes);
+      const uint64_t a = vgpu::exec::memcount::distinct_sectors(addr, 0xffffffffu, 32, bytes, SIZE_MAX),
+                     b = ref_sectors(addr, 0xffffffffu, bytes);
       VCHECK_EQ(a, b);
     }
 }

@@ -1872,7 +1872,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
   if (!n) return;
   switch (space) {
     case 0: {
-      const uint64_t distinct = distinct_sectors(addr, lanes, bytes);
+      const uint64_t distinct = exec::memcount::distinct_sectors(addr, lanes, 32, bytes, SIZE_MAX);
       (store ? st.global_stores : st.global_loads) += n;
       (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
       st.global_sectors += distinct;
@@ -1889,13 +1889,13 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       ++(store ? st.shared_requests_st : st.shared_requests_ld);
       // 32 banks of 4 bytes: lanes on different words of one bank take a
       // pass each; lanes on the same word share one.
-      const uint64_t passes = bank_passes(addr, lanes, bytes);
+      const uint64_t passes = exec::memcount::sass_bank_passes(addr, lanes, 32, bytes);
       st.shared_bank_conflicts += passes - 1;
       (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
       break;
     }
     default: {
-      const uint64_t distinct = distinct_sectors(addr, lanes, bytes);
+      const uint64_t distinct = exec::memcount::distinct_sectors(addr, lanes, 32, bytes, SIZE_MAX);
       (store ? st.local_stores : st.local_loads) += n;
       (store ? st.local_bytes_written : st.local_bytes_read) += n * bytes;
       st.local_sectors += distinct;

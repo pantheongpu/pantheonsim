@@ -1240,7 +1240,7 @@ vgpu_unit_test(test_fastpath)
 vgpu_unit_test(test_worker_pool)
 vgpu_unit_test(test_sched)
 # The SASS executor's memory-access counting, against the straightforward version it replaced
-# (src/sass/access_count.hpp).
+# (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
