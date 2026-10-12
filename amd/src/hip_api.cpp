@@ -73,6 +73,14 @@ hipError_t fail(hipError_t code, const std::string& what) {
   return code;
 }
 
+// The code for a copy or fill that threw: a chunk of host memory the device's bytes needed was not
+// to be had (the simulator's host-memory guard, or a spill file with no room), which is what a full
+// card says; anything else is a bad argument.
+hipError_t memory_error_code(const std::exception& e) {
+  const auto* v = dynamic_cast<const vgpu::Error*>(&e);
+  return v && v->code() == vgpu::Err::OutOfMemory ? hipErrorOutOfMemory : hipErrorInvalidValue;
+}
+
 struct Module {
   CodeObject object;
   int device = 0;         // the device it was loaded for, which its functions launch on
@@ -1430,7 +1438,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
           }
         }
     } catch (const std::exception& e) {
-      return fail(hipErrorInvalidValue, e.what());
+      return fail(memory_error_code(e), e.what());
     }
     d->note_transfer(dr.bytes(), 0.0);
     if (const auto* p = profiler(); p && p->copied) {
@@ -1523,7 +1531,7 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
               }
             }
         } catch (const std::exception& e) {
-          return fail(hipErrorInvalidValue, e.what());
+          return fail(memory_error_code(e), e.what());
         }
         return hipSuccess;
       };
@@ -6090,7 +6098,7 @@ hipError_t write_value(hipStream_t stream, void* ptr, uint64_t value, unsigned b
     try {
       mem->write(reinterpret_cast<uint64_t>(ptr), &value, bytes);
     } catch (const std::exception& e) {
-      return fail(hipErrorInvalidValue, e.what());
+      return fail(memory_error_code(e), e.what());
     }
     return hipSuccess;
   });

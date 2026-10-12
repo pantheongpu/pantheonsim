@@ -44,7 +44,7 @@ Working today, all CPU-only:
 | --- | --- |
 | Device profiles | Twelve NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized. Fifteen more NVIDIA profiles (H200, B200, B300, GB200, Rubin, Jetson Thor, RTX 5090, RTX PRO 6000, GB10 in the DGX Spark, RTX 4090, L40, RTX 3090, A40, A30, RTX 2080 Ti) are built from public documents only and marked `verified: false`: nothing in them was measured, and Rubin and Thor carry placeholder PCI ids because NVIDIA has published none. [nvidia/docs/profiles.md](nvidia/docs/profiles.md) lists them. AMD: MI325X is read from a physical card; MI300X and MI350X are placeholders. Each profile's header says where its values came from |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
-| Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host, and past `VGPU_MEMORY_RAM_MB` it spills to disk; OOB / use-after-free / double-free / misalignment diagnostics |
+| Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host, past `VGPU_MEMORY_RAM_MB` it spills to disk, and a host-memory guard turns "the host is out of RAM" into a device out-of-memory error instead of an OOM kill; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see ARCHITECTURE.md); precise `unsupported` errors for the rest |
 | Execution | SIMT warp interpreter: 32-lane warps, divergence masks, shared memory, `bar.sync`, warp shuffles/vote, atomics, tensor-core `wmma`, f16/f16x2, deterministic scheduling |
 | Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
@@ -197,6 +197,8 @@ Environment knobs:
 | `VGPU_QUIET` | `1` silences stderr diagnostics | unset |
 | `VGPU_MEMORY_RAM_MB` | host RAM device memory may use before the rest goes to `VGPU_MEMORY_DIR` | unlimited |
 | `VGPU_MEMORY_DIR` | directory for device memory past `VGPU_MEMORY_RAM_MB`: a card larger than the machine's RAM runs, at the speed of the disk | unset (never spill) |
+| `VGPU_MEMORY_HOST_RESERVE_MB` | host memory the guard leaves to the rest of the machine: when the cgroup's headroom or `MemAvailable` falls below it, device memory spills to `VGPU_MEMORY_DIR` or, with none, the allocation fails with `cudaErrorMemoryAllocation` / `hipErrorOutOfMemory` rather than the kernel's OOM killer firing | 6% of the memory limit in play, 1 to 4 GiB (at most a quarter of a small limit) |
+| `VGPU_MEMORY_HOST_GUARD` | `0` turns the host-memory guard off | on |
 | `VGPU_TRACE` | `1` logs every runtime/driver entry point | unset |
 | `VGPU_MAX_STEPS` | raises the runaway-kernel step budget; `0` removes it | built-in |
 | `VGPU_THREADS` | host threads used to run blocks | auto |
