@@ -1,0 +1,272 @@
+{
+  "note": "Exact instruction counters of tools/bench/kernels/bench.cu workloads (size 'quick', VGPU_THREADS=1), written by `tools/bench/bench.sh --update-expected`. Counts, never times. They depend on the compiler that built the program, hence one file per CUDA release.",
+  "toolkit": "12.0",
+  "nvcc_version": "12.0.140",
+  "gpu_profile": "nvidia/rtx3060",
+  "compiled_arch": "sm_86",
+  "size": "quick",
+  "workloads": {
+    "int_alu": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 1120000, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 622592, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 33603584, "mix_mem": 8192, "mix_misc": 24576, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 34258944, "warps": 256},
+        "kernels": {
+          "_Z9k_int_aluPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 1120000, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 622592, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 33603584, "mix_mem": 8192, "mix_misc": 24576, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 34258944, "warps": 256}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 1147904, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1261568, "mix_cvt": 311296, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 33849344, "mix_mem": 24576, "mix_misc": 1286144, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 36732928, "warps": 256},
+        "kernels": {
+          "_Z9k_int_aluPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 1147904, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1261568, "mix_cvt": 311296, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 33849344, "mix_mem": 24576, "mix_misc": 1286144, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 36732928, "warps": 256}
+        }
+      }
+    },
+    "f32_fma": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 547584, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 131072, "mix_cvt": 16384, "mix_fp16": 0, "mix_fp32": 16760832, "mix_fp64": 0, "mix_int": 335872, "mix_mem": 8192, "mix_misc": 245760, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 17498112, "warps": 256},
+        "kernels": {
+          "_Z9k_f32_fmaPfi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 547584, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 131072, "mix_cvt": 16384, "mix_fp16": 0, "mix_fp32": 16760832, "mix_fp64": 0, "mix_int": 335872, "mix_mem": 8192, "mix_misc": 245760, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 17498112, "warps": 256}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 556288, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 155648, "mix_cvt": 24576, "mix_fp16": 0, "mix_fp32": 16760832, "mix_fp64": 0, "mix_int": 212992, "mix_mem": 32768, "mix_misc": 614400, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 17801216, "warps": 256},
+        "kernels": {
+          "_Z9k_f32_fmaPfi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 1024, "global_st": 8192, "global_write_bytes": 32768, "instructions": 556288, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 155648, "mix_cvt": 24576, "mix_fp16": 0, "mix_fp32": 16760832, "mix_fp64": 0, "mix_int": 212992, "mix_mem": 32768, "mix_misc": 614400, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 17801216, "warps": 256}
+        }
+      }
+    },
+    "f64_fma": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 2048, "global_st": 8192, "global_write_bytes": 65536, "instructions": 241664, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 49152, "mix_cvt": 16384, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 7012352, "mix_int": 425984, "mix_mem": 8192, "mix_misc": 180224, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 7692288, "warps": 256},
+        "kernels": {
+          "_Z9k_f64_fmaPdi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 2048, "global_st": 8192, "global_write_bytes": 65536, "instructions": 241664, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 49152, "mix_cvt": 16384, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 7012352, "mix_int": 425984, "mix_mem": 8192, "mix_misc": 180224, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 7692288, "warps": 256}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 2048, "global_st": 8192, "global_write_bytes": 65536, "instructions": 239872, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 90112, "mix_cvt": 24576, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 7012352, "mix_int": 155648, "mix_mem": 40960, "mix_misc": 352256, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 7675904, "warps": 256},
+        "kernels": {
+          "_Z9k_f64_fmaPdi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 64, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 256, "global_sectors": 2048, "global_st": 8192, "global_write_bytes": 65536, "instructions": 239872, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 90112, "mix_cvt": 24576, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 7012352, "mix_int": 155648, "mix_mem": 40960, "mix_misc": 352256, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 7675904, "warps": 256}
+        }
+      }
+    },
+    "f64_subnormal": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 32, "global_sectors": 256, "global_st": 1024, "global_write_bytes": 8192, "instructions": 256448, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 121856, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 4096, "mix_fp64": 7873536, "mix_int": 195584, "mix_mem": 1024, "mix_misc": 7168, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 8203264, "warps": 32},
+        "kernels": {
+          "_Z11k_f64_decayPdi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 32, "global_sectors": 256, "global_st": 1024, "global_write_bytes": 8192, "instructions": 256448, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 121856, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 4096, "mix_fp64": 7873536, "mix_int": 195584, "mix_mem": 1024, "mix_misc": 7168, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 8203264, "warps": 32}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 32, "global_sectors": 256, "global_st": 1024, "global_write_bytes": 8192, "instructions": 260192, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 124928, "mix_cvt": 1024, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 7869440, "mix_int": 125952, "mix_mem": 64512, "mix_misc": 140288, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 8326144, "warps": 32},
+        "kernels": {
+          "_Z11k_f64_decayPdi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 32, "global_sectors": 256, "global_st": 1024, "global_write_bytes": 8192, "instructions": 260192, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 124928, "mix_cvt": 1024, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 7869440, "mix_int": 125952, "mix_mem": 64512, "mix_misc": 140288, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 8326144, "warps": 32}
+        }
+      }
+    },
+    "wmma": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 8192, "global_read_bytes": 32768, "global_requests": 384, "global_sectors": 3072, "global_st": 4096, "global_write_bytes": 32768, "instructions": 8288, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 4096, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 43008, "mix_mem": 12288, "mix_misc": 14336, "mix_tensor": 122880, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 3840, "thread_instructions": 196608, "warps": 32},
+        "kernels": {
+          "_Z6k_wmmaPK6__halfS1_Pfi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 8192, "global_read_bytes": 32768, "global_requests": 384, "global_sectors": 3072, "global_st": 4096, "global_write_bytes": 32768, "instructions": 8288, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 4096, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 43008, "mix_mem": 12288, "mix_misc": 14336, "mix_tensor": 122880, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 3840, "thread_instructions": 196608, "warps": 32}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 0, "global_sectors": 0, "global_st": 0, "global_write_bytes": 0, "instructions": 5216, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 19456, "mix_cvt": 4096, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 30720, "mix_mem": 6144, "mix_misc": 45056, "mix_tensor": 61440, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 1920, "thread_instructions": 166912, "warps": 32},
+        "kernels": {
+          "_Z6k_wmmaPK6__halfS1_Pfi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 0, "global_sectors": 0, "global_st": 0, "global_write_bytes": 0, "instructions": 5216, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 19456, "mix_cvt": 4096, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 30720, "mix_mem": 6144, "mix_misc": 45056, "mix_tensor": 61440, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 1920, "thread_instructions": 166912, "warps": 32}
+        }
+      }
+    },
+    "mma_ptx": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 6144, "global_read_bytes": 24576, "global_requests": 320, "global_sectors": 2560, "global_st": 4096, "global_write_bytes": 16384, "instructions": 7744, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 4096, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 37888, "mix_mem": 10240, "mix_misc": 10240, "mix_tensor": 61440, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 1920, "thread_instructions": 123904, "warps": 32},
+        "kernels": {
+          "_Z9k_mma_ptxPK6__halfS1_Pfi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 6144, "global_read_bytes": 24576, "global_requests": 320, "global_sectors": 2560, "global_st": 4096, "global_write_bytes": 16384, "instructions": 7744, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 4096, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 37888, "mix_mem": 10240, "mix_misc": 10240, "mix_tensor": 61440, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 1920, "thread_instructions": 123904, "warps": 32}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 6144, "global_read_bytes": 24576, "global_requests": 320, "global_sectors": 2560, "global_st": 4096, "global_write_bytes": 16384, "instructions": 5248, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 19456, "mix_cvt": 3072, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 39936, "mix_mem": 14336, "mix_misc": 29696, "mix_tensor": 61440, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 1920, "thread_instructions": 167936, "warps": 32},
+        "kernels": {
+          "_Z9k_mma_ptxPK6__halfS1_Pfi": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 8, "divergent_branches": 0, "global_ld": 6144, "global_read_bytes": 24576, "global_requests": 320, "global_sectors": 2560, "global_st": 4096, "global_write_bytes": 16384, "instructions": 5248, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 19456, "mix_cvt": 3072, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 39936, "mix_mem": 14336, "mix_misc": 29696, "mix_tensor": 61440, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 1920, "thread_instructions": 167936, "warps": 32}
+        }
+      }
+    },
+    "mem": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 384, "divergent_branches": 0, "global_ld": 1179648, "global_read_bytes": 6291456, "global_requests": 73728, "global_sectors": 851968, "global_st": 1179648, "global_write_bytes": 6291456, "instructions": 654336, "launches": 6, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1179648, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 16547840, "mix_mem": 2359296, "mix_misc": 655360, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 20742144, "warps": 3072},
+        "kernels": {
+          "_Z8k_gatherPKjPjm": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 128, "divergent_branches": 0, "global_ld": 524288, "global_read_bytes": 2097152, "global_requests": 32768, "global_sectors": 589824, "global_st": 524288, "global_write_bytes": 2097152, "instructions": 300032, "launches": 2, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 524288, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 7700480, "mix_mem": 1048576, "mix_misc": 262144, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 9535488, "warps": 1024},
+          "_Z8k_streamPKjPjm": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 128, "divergent_branches": 0, "global_ld": 524288, "global_read_bytes": 2097152, "global_requests": 32768, "global_sectors": 131072, "global_st": 524288, "global_write_bytes": 2097152, "instructions": 263168, "launches": 2, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 524288, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 6586368, "mix_mem": 1048576, "mix_misc": 196608, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 8355840, "warps": 1024},
+          "_Z9k_stream4PK5uint4PS_m": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 128, "divergent_branches": 0, "global_ld": 131072, "global_read_bytes": 2097152, "global_requests": 8192, "global_sectors": 131072, "global_st": 131072, "global_write_bytes": 2097152, "instructions": 91136, "launches": 2, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 131072, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2260992, "mix_mem": 262144, "mix_misc": 196608, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 2850816, "warps": 1024}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 384, "divergent_branches": 0, "global_ld": 1179648, "global_read_bytes": 6291456, "global_requests": 73728, "global_sectors": 851968, "global_st": 1179648, "global_write_bytes": 6291456, "instructions": 449536, "launches": 6, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1376256, "mix_cvt": 491520, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 8192000, "mix_mem": 2654208, "mix_misc": 1671168, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 14385152, "warps": 3072},
+        "kernels": {
+          "_Z8k_gatherPKjPjm": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 128, "divergent_branches": 0, "global_ld": 524288, "global_read_bytes": 2097152, "global_requests": 32768, "global_sectors": 589824, "global_st": 524288, "global_write_bytes": 2097152, "instructions": 216064, "launches": 2, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 589824, "mix_cvt": 163840, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 4325376, "mix_mem": 1146880, "mix_misc": 688128, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 6914048, "warps": 1024},
+          "_Z8k_streamPKjPjm": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 128, "divergent_branches": 0, "global_ld": 524288, "global_read_bytes": 2097152, "global_requests": 32768, "global_sectors": 131072, "global_st": 524288, "global_write_bytes": 2097152, "instructions": 165888, "launches": 2, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 589824, "mix_cvt": 163840, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2719744, "mix_mem": 1146880, "mix_misc": 688128, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 5308416, "warps": 1024},
+          "_Z9k_stream4PK5uint4PS_m": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 128, "divergent_branches": 0, "global_ld": 131072, "global_read_bytes": 2097152, "global_requests": 8192, "global_sectors": 131072, "global_st": 131072, "global_write_bytes": 2097152, "instructions": 67584, "launches": 2, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 196608, "mix_cvt": 163840, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 1146880, "mix_mem": 360448, "mix_misc": 294912, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 2162688, "warps": 1024}
+        }
+      }
+    },
+    "shared": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 19456, "blocks": 160, "divergent_branches": 0, "global_ld": 311296, "global_read_bytes": 1245184, "global_requests": 17952, "global_sectors": 71712, "global_st": 262176, "global_write_bytes": 1048704, "instructions": 178080, "launches": 3, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 753664, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 1728384, "mix_mem": 1342944, "mix_misc": 303136, "mix_tensor": 0, "shared_bank_conflicts": 126976, "shared_ld": 409216, "shared_read_bytes": 1636864, "shared_requests": 26368, "shared_st": 360256, "shared_write_bytes": 1441024, "tensor_issues": 0, "thread_instructions": 4128128, "warps": 1280},
+        "kernels": {
+          "_Z12k_stransposeILi0EEvPKjPjii": {"atomic_bytes": 0, "atomics": 0, "barriers": 2048, "blocks": 64, "divergent_branches": 0, "global_ld": 131072, "global_read_bytes": 524288, "global_requests": 8192, "global_sectors": 32768, "global_st": 131072, "global_write_bytes": 524288, "instructions": 44544, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 114688, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 589824, "mix_mem": 524288, "mix_misc": 114688, "mix_tensor": 0, "shared_bank_conflicts": 126976, "shared_ld": 131072, "shared_read_bytes": 524288, "shared_requests": 8192, "shared_st": 131072, "shared_write_bytes": 524288, "tensor_issues": 0, "thread_instructions": 1343488, "warps": 512},
+          "_Z12k_stransposeILi1EEvPKjPjii": {"atomic_bytes": 0, "atomics": 0, "barriers": 2048, "blocks": 64, "divergent_branches": 0, "global_ld": 131072, "global_read_bytes": 524288, "global_requests": 8192, "global_sectors": 32768, "global_st": 131072, "global_write_bytes": 524288, "instructions": 44544, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 114688, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 573440, "mix_mem": 524288, "mix_misc": 131072, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 131072, "shared_read_bytes": 524288, "shared_requests": 8192, "shared_st": 131072, "shared_write_bytes": 524288, "tensor_issues": 0, "thread_instructions": 1343488, "warps": 512},
+          "_Z6k_sredPKjPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 15360, "blocks": 32, "divergent_branches": 0, "global_ld": 49152, "global_read_bytes": 196608, "global_requests": 1568, "global_sectors": 6176, "global_st": 32, "global_write_bytes": 128, "instructions": 88992, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 524288, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 565120, "mix_mem": 294368, "mix_misc": 57376, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 147072, "shared_read_bytes": 588288, "shared_requests": 9984, "shared_st": 98112, "shared_write_bytes": 392448, "tensor_issues": 0, "thread_instructions": 1441152, "warps": 256}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 19456, "blocks": 160, "divergent_branches": 992, "global_ld": 311296, "global_read_bytes": 1245184, "global_requests": 17952, "global_sectors": 71712, "global_st": 262176, "global_write_bytes": 1048704, "instructions": 160928, "launches": 3, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1245184, "mix_cvt": 73760, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 1630080, "mix_mem": 1498592, "mix_misc": 598048, "mix_tensor": 0, "shared_bank_conflicts": 126976, "shared_ld": 409216, "shared_read_bytes": 1636864, "shared_requests": 26368, "shared_st": 360256, "shared_write_bytes": 1441024, "tensor_issues": 0, "thread_instructions": 5045664, "warps": 1280},
+        "kernels": {
+          "_Z12k_stransposeILi0EEvPKjPjii": {"atomic_bytes": 0, "atomics": 0, "barriers": 2048, "blocks": 64, "divergent_branches": 0, "global_ld": 131072, "global_read_bytes": 524288, "global_requests": 8192, "global_sectors": 32768, "global_st": 131072, "global_write_bytes": 524288, "instructions": 50176, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 147456, "mix_cvt": 32768, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 688128, "mix_mem": 589824, "mix_misc": 147456, "mix_tensor": 0, "shared_bank_conflicts": 126976, "shared_ld": 131072, "shared_read_bytes": 524288, "shared_requests": 8192, "shared_st": 131072, "shared_write_bytes": 524288, "tensor_issues": 0, "thread_instructions": 1605632, "warps": 512},
+          "_Z12k_stransposeILi1EEvPKjPjii": {"atomic_bytes": 0, "atomics": 0, "barriers": 2048, "blocks": 64, "divergent_branches": 0, "global_ld": 131072, "global_read_bytes": 524288, "global_requests": 8192, "global_sectors": 32768, "global_st": 131072, "global_write_bytes": 524288, "instructions": 49152, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 147456, "mix_cvt": 32768, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 655360, "mix_mem": 589824, "mix_misc": 147456, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 131072, "shared_read_bytes": 524288, "shared_requests": 8192, "shared_st": 131072, "shared_write_bytes": 524288, "tensor_issues": 0, "thread_instructions": 1572864, "warps": 512},
+          "_Z6k_sredPKjPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 15360, "blocks": 32, "divergent_branches": 992, "global_ld": 49152, "global_read_bytes": 196608, "global_requests": 1568, "global_sectors": 6176, "global_st": 32, "global_write_bytes": 128, "instructions": 61600, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 950272, "mix_cvt": 8224, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 286592, "mix_mem": 318944, "mix_misc": 303136, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 147072, "shared_read_bytes": 588288, "shared_requests": 9984, "shared_st": 98112, "shared_write_bytes": 392448, "tensor_issues": 0, "thread_instructions": 1867168, "warps": 256}
+        }
+      }
+    },
+    "atomics": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 794624, "atomics": 182272, "barriers": 0, "blocks": 16, "divergent_branches": 1984, "global_ld": 2048, "global_read_bytes": 8192, "global_requests": 64, "global_sectors": 64, "global_st": 0, "global_write_bytes": 0, "instructions": 44736, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 268288, "mix_cvt": 16384, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 637952, "mix_mem": 184320, "mix_misc": 30720, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 1137664, "warps": 64},
+        "kernels": {
+          "_Z9k_atomicsPjS_S_S_PfPyi": {"atomic_bytes": 794624, "atomics": 182272, "barriers": 0, "blocks": 16, "divergent_branches": 1984, "global_ld": 2048, "global_read_bytes": 8192, "global_requests": 64, "global_sectors": 64, "global_st": 0, "global_write_bytes": 0, "instructions": 44736, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 268288, "mix_cvt": 16384, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 637952, "mix_mem": 184320, "mix_misc": 30720, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 1137664, "warps": 64}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 528384, "atomics": 115712, "barriers": 0, "blocks": 16, "divergent_branches": 1984, "global_ld": 2048, "global_read_bytes": 8192, "global_requests": 64, "global_sectors": 64, "global_st": 0, "global_write_bytes": 0, "instructions": 20608, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 46080, "mix_cvt": 45056, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 191488, "mix_mem": 132096, "mix_misc": 86016, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 500736, "warps": 64},
+        "kernels": {
+          "_Z9k_atomicsPjS_S_S_PfPyi": {"atomic_bytes": 528384, "atomics": 115712, "barriers": 0, "blocks": 16, "divergent_branches": 1984, "global_ld": 2048, "global_read_bytes": 8192, "global_requests": 64, "global_sectors": 64, "global_st": 0, "global_write_bytes": 0, "instructions": 20608, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 46080, "mix_cvt": 45056, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 191488, "mix_mem": 132096, "mix_misc": 86016, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 500736, "warps": 64}
+        }
+      }
+    },
+    "texture": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 122880, "global_read_bytes": 1966080, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 42752, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 12288, "mix_cvt": 90112, "mix_fp16": 0, "mix_fp32": 208896, "mix_fp64": 0, "mix_int": 641662, "mix_mem": 124928, "mix_misc": 120832, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 1198718, "warps": 64},
+        "kernels": {
+          "_Z5k_texyyyPfiii": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 122880, "global_read_bytes": 1966080, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 42752, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 12288, "mix_cvt": 90112, "mix_fp16": 0, "mix_fp32": 208896, "mix_fp64": 0, "mix_int": 641662, "mix_mem": 124928, "mix_misc": 120832, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 1198718, "warps": 64}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 122880, "global_read_bytes": 1966080, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 22656, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 18432, "mix_cvt": 83968, "mix_fp16": 0, "mix_fp32": 204800, "mix_fp64": 0, "mix_int": 249856, "mix_mem": 16384, "mix_misc": 151552, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 724992, "warps": 64},
+        "kernels": {
+          "_Z5k_texyyyPfiii": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 122880, "global_read_bytes": 1966080, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 22656, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 18432, "mix_cvt": 83968, "mix_fp16": 0, "mix_fp32": 204800, "mix_fp64": 0, "mix_int": 249856, "mix_mem": 16384, "mix_misc": 151552, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 724992, "warps": 64}
+        }
+      }
+    },
+    "local": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 357248, "launches": 1, "local_ld": 1261568, "local_read_bytes": 5439488, "local_st": 647168, "local_write_bytes": 2981888, "mix_ctrl": 155648, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 9353216, "mix_mem": 1910784, "mix_misc": 6144, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 11425792, "warps": 64},
+        "kernels": {
+          "_Z7k_localPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 357248, "launches": 1, "local_ld": 1261568, "local_read_bytes": 5439488, "local_st": 647168, "local_write_bytes": 2981888, "mix_ctrl": 155648, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 9353216, "mix_mem": 1910784, "mix_misc": 6144, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 11425792, "warps": 64}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 453760, "launches": 1, "local_ld": 1261568, "local_read_bytes": 5439488, "local_st": 647168, "local_write_bytes": 2981888, "mix_ctrl": 161792, "mix_cvt": 1845248, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 10424320, "mix_mem": 1914880, "mix_misc": 174080, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 14520320, "warps": 64},
+        "kernels": {
+          "_Z7k_localPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 453760, "launches": 1, "local_ld": 1261568, "local_read_bytes": 5439488, "local_st": 647168, "local_write_bytes": 2981888, "mix_ctrl": 161792, "mix_cvt": 1845248, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 10424320, "mix_mem": 1914880, "mix_misc": 174080, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 14520320, "warps": 64}
+        }
+      }
+    },
+    "divergent": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 26065, "global_ld": 0, "global_read_bytes": 0, "global_requests": 128, "global_sectors": 512, "global_st": 4096, "global_write_bytes": 16384, "instructions": 407255, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1536893, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 4099305, "mix_mem": 4096, "mix_misc": 371864, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 6012158, "warps": 64},
+        "kernels": {
+          "_Z11k_divergentPjS_i": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 26065, "global_ld": 0, "global_read_bytes": 0, "global_requests": 128, "global_sectors": 512, "global_st": 4096, "global_write_bytes": 16384, "instructions": 407255, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1536893, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 4099305, "mix_mem": 4096, "mix_misc": 371864, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 6012158, "warps": 64}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 39718, "global_ld": 0, "global_read_bytes": 0, "global_requests": 191, "global_sectors": 670, "global_st": 4096, "global_write_bytes": 16384, "instructions": 429210, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1556904, "mix_cvt": 417792, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2548782, "mix_mem": 10240, "mix_misc": 2003595, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 6537313, "warps": 64},
+        "kernels": {
+          "_Z11k_divergentPjS_i": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 39718, "global_ld": 0, "global_read_bytes": 0, "global_requests": 191, "global_sectors": 670, "global_st": 4096, "global_write_bytes": 16384, "instructions": 429210, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 1556904, "mix_cvt": 417792, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2548782, "mix_mem": 10240, "mix_misc": 2003595, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 6537313, "warps": 64}
+        }
+      }
+    },
+    "warp": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 129472, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 43008, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2938880, "mix_mem": 2048, "mix_misc": 989184, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 3973120, "warps": 64},
+        "kernels": {
+          "_Z6k_warpPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 129472, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 43008, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2938880, "mix_mem": 2048, "mix_misc": 989184, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 3973120, "warps": 64}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 148992, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 49152, "mix_cvt": 2048, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2557952, "mix_mem": 8192, "mix_misc": 2150400, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 4767744, "warps": 64},
+        "kernels": {
+          "_Z6k_warpPji": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 16, "divergent_branches": 0, "global_ld": 0, "global_read_bytes": 0, "global_requests": 64, "global_sectors": 256, "global_st": 2048, "global_write_bytes": 8192, "instructions": 148992, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 49152, "mix_cvt": 2048, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 2557952, "mix_mem": 8192, "mix_misc": 2150400, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 4767744, "warps": 64}
+        }
+      }
+    },
+    "launch": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1500, "divergent_branches": 0, "global_ld": 48000, "global_read_bytes": 192000, "global_requests": 3000, "global_sectors": 12000, "global_st": 48000, "global_write_bytes": 192000, "instructions": 13500, "launches": 1500, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 48000, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 96000, "mix_mem": 96000, "mix_misc": 192000, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 432000, "warps": 1500},
+        "kernels": {
+          "_Z6k_tinyPj": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1500, "divergent_branches": 0, "global_ld": 48000, "global_read_bytes": 192000, "global_requests": 3000, "global_sectors": 12000, "global_st": 48000, "global_write_bytes": 192000, "instructions": 13500, "launches": 1500, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 48000, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 96000, "mix_mem": 96000, "mix_misc": 192000, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 432000, "warps": 1500}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1500, "divergent_branches": 0, "global_ld": 48000, "global_read_bytes": 192000, "global_requests": 3000, "global_sectors": 12000, "global_st": 48000, "global_write_bytes": 192000, "instructions": 13500, "launches": 1500, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 48000, "mix_cvt": 48000, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 144000, "mix_mem": 144000, "mix_misc": 48000, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 432000, "warps": 1500},
+        "kernels": {
+          "_Z6k_tinyPj": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1500, "divergent_branches": 0, "global_ld": 48000, "global_read_bytes": 192000, "global_requests": 3000, "global_sectors": 12000, "global_st": 48000, "global_write_bytes": 192000, "instructions": 13500, "launches": 1500, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 48000, "mix_cvt": 48000, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 144000, "mix_mem": 144000, "mix_misc": 48000, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 432000, "warps": 1500}
+        }
+      }
+    },
+    "api": {
+      "sass": {
+        "engine": "sass",
+        "totals": {},
+        "kernels": {
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {},
+        "kernels": {
+        }
+      }
+    },
+    "startup": {
+      "sass": {
+        "engine": "sass",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1, "divergent_branches": 0, "global_ld": 32, "global_read_bytes": 128, "global_requests": 2, "global_sectors": 8, "global_st": 32, "global_write_bytes": 128, "instructions": 9, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 32, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 64, "mix_mem": 64, "mix_misc": 128, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 288, "warps": 1},
+        "kernels": {
+          "_Z6k_tinyPj": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1, "divergent_branches": 0, "global_ld": 32, "global_read_bytes": 128, "global_requests": 2, "global_sectors": 8, "global_st": 32, "global_write_bytes": 128, "instructions": 9, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 32, "mix_cvt": 0, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 64, "mix_mem": 64, "mix_misc": 128, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 288, "warps": 1}
+        }
+      },
+      "ptx": {
+        "engine": "ptx",
+        "totals": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1, "divergent_branches": 0, "global_ld": 32, "global_read_bytes": 128, "global_requests": 2, "global_sectors": 8, "global_st": 32, "global_write_bytes": 128, "instructions": 9, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 32, "mix_cvt": 32, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 96, "mix_mem": 96, "mix_misc": 32, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 288, "warps": 1},
+        "kernels": {
+          "_Z6k_tinyPj": {"atomic_bytes": 0, "atomics": 0, "barriers": 0, "blocks": 1, "divergent_branches": 0, "global_ld": 32, "global_read_bytes": 128, "global_requests": 2, "global_sectors": 8, "global_st": 32, "global_write_bytes": 128, "instructions": 9, "launches": 1, "local_ld": 0, "local_read_bytes": 0, "local_st": 0, "local_write_bytes": 0, "mix_ctrl": 32, "mix_cvt": 32, "mix_fp16": 0, "mix_fp32": 0, "mix_fp64": 0, "mix_int": 96, "mix_mem": 96, "mix_misc": 32, "mix_tensor": 0, "shared_bank_conflicts": 0, "shared_ld": 0, "shared_read_bytes": 0, "shared_requests": 0, "shared_st": 0, "shared_write_bytes": 0, "tensor_issues": 0, "thread_instructions": 288, "warps": 1}
+        }
+      }
+    }
+  }
+}
