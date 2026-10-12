@@ -182,6 +182,7 @@ add_library(vgpu STATIC
   src/ptx/regalloc.cpp
   src/ptx/contract.cpp
   src/ptx/sync_masks.cpp
+  src/simd/simd.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/exec/devrt.cpp
@@ -1184,6 +1185,8 @@ vgpu_unit_test(test_blackwell)
 vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
+# The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
+vgpu_unit_test(test_simd)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.

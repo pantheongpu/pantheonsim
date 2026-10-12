@@ -951,9 +951,11 @@ bool float_cmp(unsigned cmp, double a, double b) {
 float sat(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
 
 // Half and bfloat16 conversions, round to nearest even.
-float half_to_f32(uint16_t h) { return static_cast<float>(std::bit_cast<_Float16>(h)); }
-uint16_t f32_to_half(float f) { return std::bit_cast<uint16_t>(static_cast<_Float16>(f)); }
-uint16_t f64_to_half(double d) { return std::bit_cast<uint16_t>(static_cast<_Float16>(d)); }
+// (On the bits, bit for bit what the compiler's _Float16 conversions give -- which on a baseline x86-64 build are
+// libgcc calls; see vgpu/simd/fp16.hpp and tests/unit/test_simd.cpp.)
+float half_to_f32(uint16_t h) { return simd::f16_to_f32(h); }
+uint16_t f32_to_half(float f) { return simd::f32_to_f16_bits(f); }
+uint16_t f64_to_half(double d) { return simd::f64_to_f16_bits(d); }
 float bf16_to_f32(uint16_t h) { return std::bit_cast<float>(static_cast<uint32_t>(h) << 16); }
 uint16_t f32_to_bf16(float f) {
   uint32_t b = std::bit_cast<uint32_t>(f);
@@ -2887,6 +2889,27 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
     const uint64_t lo = w.reg(base + i * rw, l);
     return wide ? lo | (static_cast<uint64_t>(w.reg(base + i * rw + 1, l)) << 32) : lo;
   };
+  // The plain f16, bf16 and tf32 forms (dense, f32 or f16 accumulator) are one SIMD kernel
+  // (vgpu/simd/simd.hpp: hmma); it gives the bits the general form below gives (tests/unit/test_simd.cpp).
+  if (ins.op == Op::HMMA && !ins.f[3] && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) &&
+      (acc == AccF32 || acc == AccF16) && simd::enabled() && K > 0 && K <= 16 && K % (4 * per_reg) == 0) {
+    const unsigned c_regs = acc == AccF16 ? 2 : 4;
+    // Every register the form names must be in the warp's file; if one is not, the general form faults on it.
+    const auto in_file = [&](unsigned base, unsigned n) { return base == kRZ || base + n <= w.nregs; };
+    if (in_file(ra, a_regs) && in_file(rb, b_regs) && in_file(rc, c_regs) && in_file(rd, c_regs)) {
+      static const uint32_t kZero[4 * 32] = {};
+      const uint32_t* pa = ra == kRZ ? kZero : &w.reg(ra, 0);
+      const uint32_t* pb = rb == kRZ ? kZero : &w.reg(rb, 0);
+      uint32_t out[4 * 32];
+      simd::kernels().hmma(at == MmaT::F16 ? 0u : at == MmaT::BF16 ? 1u : 2u, K, acc == AccF16, pa, pb,
+                           rc == kRZ ? nullptr : &w.reg(rc, 0), out);
+      if (rd != kRZ)
+        each_lane(ex, [&](unsigned l) {
+          for (unsigned s = 0; s < c_regs; ++s) w.reg(rd + s, l) = out[s * 32 + l];
+        });
+      return;
+    }
+  }
   std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
   double C[16 * kN] = {};
   // The block-scaled forms (QMMA.SF, OMMA.SF): one factor per row of A and

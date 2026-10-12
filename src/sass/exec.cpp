@@ -39,6 +39,8 @@
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
 #include "vgpu/exec/wgmma.hpp"
+#include "vgpu/simd/fp16.hpp"
+#include "vgpu/simd/simd.hpp"
 #if __has_include("vgpu/host_cpus.hpp")
 #include "vgpu/host_cpus.hpp"
 #define VGPU_HAVE_HOST_CPUS 1
