@@ -58,6 +58,7 @@
 #include "vgpu/faults.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/exec/launch.hpp"
 
 namespace vgpu::exec {
@@ -13409,10 +13410,8 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   // this. Progress reporting stays on one worker so the callback is never
   // re-entered.
   std::vector<LaunchStats> per_thread(nthreads);
-  std::vector<std::thread> workers;
   std::mutex err_mu;
   std::exception_ptr first_error;
-  workers.reserve(nthreads);
   // Divided by clusters when the launch has them, since a cluster's blocks
   // must run together.
   const uint64_t units = [&] {
@@ -13428,28 +13427,27 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   // one changes nothing it computes.
   std::atomic<uint64_t> next_unit{0};
   const uint64_t chunk = std::max<uint64_t>(1, units / (uint64_t{nthreads} * 8));
-  for (unsigned t = 0; t < nthreads; ++t) {
-    workers.emplace_back([&, t] {
-      try {
-        Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
-                           t == 0 ? progress : ProgressFn{});
-        interp.set_concurrent(true);
-        interp.set_worker(t);
-        interp.set_grid_id(grid_id);
-        interp.set_device_launches(dl);
-        for (;;) {
-          const uint64_t begin = next_unit.fetch_add(chunk, std::memory_order_relaxed);
-          if (begin >= units) break;
-          interp.run_units(begin, std::min(units, begin + chunk));
-        }
-      } catch (...) {
-        next_unit.store(units, std::memory_order_relaxed);   // the launch has failed; stop
-        std::lock_guard<std::mutex> lock(err_mu);
-        if (!first_error) first_error = std::current_exception();
+  // The host threads are the pool's (vgpu/exec/worker_pool.hpp): made once and
+  // parked between launches, where each launch used to create and join its own.
+  run_parallel(nthreads, [&](unsigned t) {
+    try {
+      Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
+                         t == 0 ? progress : ProgressFn{});
+      interp.set_concurrent(true);
+      interp.set_worker(t);
+      interp.set_grid_id(grid_id);
+      interp.set_device_launches(dl);
+      for (;;) {
+        const uint64_t begin = next_unit.fetch_add(chunk, std::memory_order_relaxed);
+        if (begin >= units) break;
+        interp.run_units(begin, std::min(units, begin + chunk));
       }
-    });
-  }
-  for (auto& w : workers) w.join();
+    } catch (...) {
+      next_unit.store(units, std::memory_order_relaxed);   // the launch has failed; stop
+      std::lock_guard<std::mutex> lock(err_mu);
+      if (!first_error) first_error = std::current_exception();
+    }
+  });
   if (first_error) std::rethrow_exception(first_error);
 
   LaunchStats total;

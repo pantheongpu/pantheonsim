@@ -108,7 +108,11 @@ provides.
 Blocks are spread over host threads, one block per thread at a time, and each
 block keeps its own scheduler. `VGPU_THREADS` sets the count (default: every
 core); `VGPU_THREADS=1` runs them sequentially in fixed order, a legal schedule
-and the one the determinism contract below is stated for. Blocks on different
+and the one the determinism contract below is stated for. The threads are a
+pool made on the first launch that needs them and parked between launches
+(`include/vgpu/exec/worker_pool.hpp`), not created per launch; a launch still
+gets exactly as many as before, all alive together, and a one-thread launch
+runs on the calling thread without touching the pool. Blocks on different
 threads can share global memory, and kernels rely on it (CUB's decoupled
 look-back spins on flags other blocks publish), so the engine follows the GPU
 memory model rather than assuming one thread:

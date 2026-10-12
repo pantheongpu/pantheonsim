@@ -185,6 +185,7 @@ add_library(vgpu STATIC
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/exec/devrt.cpp
+  src/exec/worker_pool.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
@@ -1184,6 +1185,10 @@ vgpu_unit_test(test_blackwell)
 vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
+# The host threads that run a grid's blocks, kept between launches: reuse,
+# nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
+vgpu_unit_test(test_worker_pool)
+vgpu_unit_test(test_sched)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -2276,6 +2281,17 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 300)
+
+  # Thousands of launches on the pool of host threads, on several streams and from
+  # several host threads, at VGPU_THREADS=1, 2, 7 and the default, on SASS and PTX:
+  # every run prints the same lines.
+  add_test(NAME e2e_sched_pool
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sched_pool.sh)
+  set_tests_properties(e2e_sched_pool PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
 
   add_test(NAME e2e_lop3_pred_chain
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
