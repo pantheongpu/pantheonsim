@@ -134,24 +134,31 @@ const Shape kShapes[] = {{1, 1, 1},     {3, 5, 7},      {16, 6, 17},    {17, 7, 
                          {65, 67, 63},  {100, 90, 255}, {100, 90, 256}, {100, 90, 257}, {129, 193, 300}, {257, 130, 513},
                          {300, 250, 70}, {1, 400, 200}, {400, 1, 200},  {7, 3, 1500},   {200, 200, 3}};
 
+// One case against every instruction set and thread count (the reference is computed once).
 template <class T>
-int run_float_case(Isa isa, unsigned threads, bool ta, bool tb, const Shape& s, Mix mix, int pad, T alpha, T beta,
-                   std::mt19937_64& rng) {
+int run_float_case(bool ta, bool tb, const Shape& s, Mix mix, int pad, T alpha, T beta, std::mt19937_64& rng, int* variants) {
   const int lda = (ta ? s.k : s.m) + pad, ldb = (tb ? s.n : s.k) + pad, ldc = s.m + pad;
   const size_t na = static_cast<size_t>(lda) * (ta ? s.m : s.k), nb = static_cast<size_t>(ldb) * (tb ? s.k : s.n),
                nc = static_cast<size_t>(ldc) * s.n;
   const auto A = fill<T>(na, mix, rng), B = fill<T>(nb, mix, rng);
   auto C0 = fill<T>(nc, mix, rng);
-  auto Cr = C0, Cf = C0;
+  auto Cr = C0;
   ref_gemm<T>(ta, tb, s.m, s.n, s.k, alpha, A, lda, B, ldb, beta, Cr, ldc);
-  fast_gemm<T>(isa, threads, ta, tb, s.m, s.n, s.k, alpha, A, lda, B, ldb, beta, Cf, ldc);
-  // Exact, except that two NaNs count as equal: which NaN wins when two meet (one in an operand, one an inf*0 made) is the
-  // compiler's choice of operand order, which differs between any two copies of the same source line (see host_gemm.hpp).
   size_t bad = 0;
-  for (size_t i = 0; i < nc; ++i) {
-    if (std::memcmp(&Cr[i], &Cf[i], sizeof(T)) == 0) continue;
-    if (std::isnan(Cr[i]) && std::isnan(Cf[i])) continue;
-    ++bad;
+  for (const Isa isa : {Isa::Generic, Isa::Avx2}) {
+    if (isa == Isa::Avx2 && !vgpu::hostgemm::avx2_available()) continue;
+    for (const unsigned threads : {1u, 3u}) {
+      auto Cf = C0;
+      fast_gemm<T>(isa, threads, ta, tb, s.m, s.n, s.k, alpha, A, lda, B, ldb, beta, Cf, ldc);
+      ++*variants;
+      // Exact, except that two NaNs count as equal: which NaN wins when two meet (one in an operand, one an inf*0 made) is the
+      // compiler's choice of operand order, which differs between any two copies of the same source line (see host_gemm.hpp).
+      for (size_t i = 0; i < nc; ++i) {
+        if (std::memcmp(&Cr[i], &Cf[i], sizeof(T)) == 0) continue;
+        if (std::isnan(Cr[i]) && std::isnan(Cf[i])) continue;
+        ++bad;
+      }
+    }
   }
   return static_cast<int>(bad);
 }
@@ -159,25 +166,20 @@ int run_float_case(Isa isa, unsigned threads, bool ta, bool tb, const Shape& s, 
 template <class T>
 void sweep_float(const char* name) {
   std::mt19937_64 rng(12345);
-  const Isa isas[] = {Isa::Generic, Isa::Avx2};
-  int cases = 0;
+  int cases = 0, variants = 0;
   size_t bad_total = 0;
-  for (const Isa isa : isas) {
-    if (isa == Isa::Avx2 && !vgpu::hostgemm::avx2_available()) continue;
-    for (const unsigned threads : {1u, 3u})
-      for (int t = 0; t < 4; ++t)
-        for (const Shape& s : kShapes)
-          for (const Mix mix : {Mix::Plain, Mix::Zeros, Mix::Special, Mix::SpecialSparse}) {
-            const bool ta = t & 1, tb = t & 2;
-            // alpha and beta: ordinary, zero beta (C write-only), and awkward values.
-            const T al = (cases % 5 == 0 || cases % 15 == 3) ? T(1) : (cases % 5 == 1) ? T(-0.5) : (cases % 5 == 2) ? T(0) : T(2.5);
-            const T be = (cases % 3 == 0 || cases % 15 == 3) ? T(0) : (cases % 3 == 1) ? T(1) : T(-1.25);
-            const int pad = cases % 4 == 0 ? 0 : cases % 4;
-            bad_total += run_float_case<T>(isa, threads, ta, tb, s, mix, pad, al, be, rng);
-            ++cases;
-          }
-  }
-  std::printf("  %s: %d cases, %zu elements differ\n", name, cases, bad_total);
+  for (int t = 0; t < 4; ++t)
+    for (const Shape& s : kShapes)
+      for (const Mix mix : {Mix::Plain, Mix::Zeros, Mix::Special, Mix::SpecialSparse}) {
+        const bool ta = t & 1, tb = t & 2;
+        // alpha and beta: ordinary, zero beta (C write-only), and awkward values.
+        const T al = (cases % 5 == 0 || cases % 15 == 3) ? T(1) : (cases % 5 == 1) ? T(-0.5) : (cases % 5 == 2) ? T(0) : T(2.5);
+        const T be = (cases % 3 == 0 || cases % 15 == 3) ? T(0) : (cases % 3 == 1) ? T(1) : T(-1.25);
+        const int pad = cases % 4 == 0 ? 0 : cases % 4;
+        bad_total += run_float_case<T>(ta, tb, s, mix, pad, al, be, rng, &variants);
+        ++cases;
+      }
+  std::printf("  %s: %d cases x instruction sets and thread counts (%d runs), %zu elements differ\n", name, cases, variants, bad_total);
   VCHECK_EQ(bad_total, static_cast<size_t>(0));
 }
 

@@ -324,11 +324,11 @@ void convert_pieces(size_t n, Fn&& fn) {
 
 namespace {
 // A byte buffer of n bytes for staging a tensor between device memory and the doubles the routines compute in. Kept per thread
-// and reused, so a call does not pay the page faults of a fresh multi-megabyte allocation every time; a request beyond 256 MB
+// and reused, so a call does not pay the page faults of a fresh multi-megabyte allocation every time; a request beyond 64 MB
 // gets its own buffer. (Contents are the caller's to fill.)
 struct Staging {
   std::vector<uint8_t>* use(size_t n) {
-    constexpr size_t kKeep = size_t(256) << 20;
+    constexpr size_t kKeep = size_t(64) << 20;
     std::vector<uint8_t>& v = n <= kKeep ? kept : own;
     if (v.size() < n) v.resize(n);
     return &v;
