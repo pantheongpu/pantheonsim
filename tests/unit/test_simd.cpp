@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "vgpu/exec/numerics.hpp"
 #include "vgpu/simd/fp16.hpp"
 #include "vgpu/simd/simd.hpp"
 #include "vtest.hpp"
@@ -452,6 +453,133 @@ VTEST(masked_kernels_at_every_level) {
                                hex(d[i]) + " want 0x" + hex(w));
       }
     }
+  }
+}
+
+namespace {
+
+// The narrow-float decode and the exact sum as they were before the tables and the integer form (copied from
+// src/exec/interpreter.cpp at the commit before this one): the references.
+double ref_fp8(uint32_t byte, int exp_bits, int man_bits, int bias, bool has_inf) {
+  const uint32_t man_mask = (1u << man_bits) - 1u;
+  const uint32_t exp_mask = (1u << exp_bits) - 1u;
+  const bool sign = (byte >> (exp_bits + man_bits)) & 1u;
+  const uint32_t exp = (byte >> man_bits) & exp_mask;
+  const uint32_t man = byte & man_mask;
+  double v;
+  if (exp == exp_mask) {
+    if (has_inf) {
+      v = man ? std::numeric_limits<double>::quiet_NaN() : std::numeric_limits<double>::infinity();
+    } else {
+      v = man == man_mask ? std::numeric_limits<double>::quiet_NaN()
+                          : std::ldexp(1.0 + static_cast<double>(man) / (man_mask + 1), static_cast<int>(exp) - bias);
+    }
+  } else if (exp == 0) {
+    v = std::ldexp(static_cast<double>(man) / (man_mask + 1), 1 - bias);
+  } else {
+    v = std::ldexp(1.0 + static_cast<double>(man) / (man_mask + 1), static_cast<int>(exp) - bias);
+  }
+  return sign ? -v : v;
+}
+double ref_small_float(uint32_t code, int eb, int mb, int bias) {
+  const uint32_t mant = code & ((1u << mb) - 1), exp = (code >> mb) & ((1u << eb) - 1);
+  const double mag = exp ? std::ldexp(1.0 + mant / double(1u << mb), int(exp) - bias)
+                         : std::ldexp(mant / double(1u << mb), 1 - bias);
+  return (code >> (eb + mb)) & 1 ? -mag : mag;
+}
+
+float ref_narrow_sum(const double* terms, size_t n, float c) {
+  bool nan = std::isnan(c), pinf = std::isinf(c) && c > 0, ninf = std::isinf(c) && c < 0;
+  bool all_neg_zero = c == 0.0f && std::signbit(c);
+  int max_e = std::numeric_limits<int>::min();
+  auto look = [&](double t) {
+    if (std::isnan(t)) { nan = true; all_neg_zero = false; return; }
+    if (std::isinf(t)) { (t > 0 ? pinf : ninf) = true; all_neg_zero = false; return; }
+    if (t != 0) { max_e = std::max(max_e, std::ilogb(t)); all_neg_zero = false; }
+    else if (!std::signbit(t)) all_neg_zero = false;
+  };
+  for (size_t i = 0; i < n; ++i) look(terms[i]);
+  if (std::isfinite(c) && c != 0.0f) max_e = std::max(max_e, std::ilogb(static_cast<double>(c)));
+  if (nan || (pinf && ninf)) return std::bit_cast<float>(0x7fffffffu);
+  if (pinf) return std::numeric_limits<float>::infinity();
+  if (ninf) return -std::numeric_limits<float>::infinity();
+  if (max_e == std::numeric_limits<int>::min()) return all_neg_zero ? -0.0f : 0.0f;
+  const int lsb = max_e - 118;
+  __int128 acc = 0;
+  auto add = [&](double t) {
+    if (t == 0) return;
+    acc += static_cast<__int128>(std::floor(std::ldexp(t, -lsb)));
+  };
+  for (size_t i = 0; i < n; ++i) add(terms[i]);
+  add(static_cast<double>(c));
+  if (acc == 0) return 0.0f;
+  const bool neg = acc < 0;
+  unsigned __int128 mag = neg ? -static_cast<unsigned __int128>(acc) : static_cast<unsigned __int128>(acc);
+  const uint64_t hi = static_cast<uint64_t>(mag >> 64), lo = static_cast<uint64_t>(mag);
+  const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
+  const int shift = std::max(top - 23, -149 - lsb);
+  const uint64_t m = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  if (m == 0) return 0.0f;
+  const double v = std::ldexp(static_cast<double>(m), lsb + shift);
+  if (v >= 0x1p128) return neg ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+  return neg ? -static_cast<float>(v) : static_cast<float>(v);
+}
+
+}  // namespace
+
+VTEST(narrow_float_decode_tables) {
+  for (uint32_t i = 0; i < 256; ++i) {
+    for (bool e5m2 : {false, true}) {
+      const double want = e5m2 ? ref_fp8(i, 5, 2, 15, true) : ref_fp8(i, 4, 3, 7, false);
+      const double got = exec::fp8_value(i, e5m2);
+      VCHECK_EQ(db(got), db(want));
+      VCHECK_EQ(db(exec::fp8_value(i + 256 * 3, e5m2)), db(want));   // only the low byte is the code
+    }
+  }
+  const struct { int eb, mb, bias; } fmts[] = {{3, 2, 3}, {2, 3, 1}, {2, 1, 1}, {4, 3, 7}};
+  for (const auto& f : fmts)
+    for (uint32_t code = 0; code < 256; ++code)
+      VCHECK_EQ(db(exec::mx_float_value(code, f.eb, f.mb, f.bias)), db(ref_small_float(code, f.eb, f.mb, f.bias)));
+}
+
+VTEST(narrow_sum_matches_the_libm_form) {
+  std::mt19937_64 rng(31);
+  std::vector<double> fp8;   // every finite fp8 value of both formats, and a few scales
+  for (uint32_t i = 0; i < 256; ++i) {
+    for (double v : {ref_fp8(i, 4, 3, 7, false), ref_fp8(i, 5, 2, 15, true)})
+      if (std::isfinite(v)) fp8.push_back(v);
+  }
+  const double specials[] = {0.0, -0.0, std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::quiet_NaN(), 1.0, -1.0, 0x1p-127, 0x1p127, 0x1p-149,
+                             std::numeric_limits<double>::denorm_min(), 3.0 * 0x1p-1074, 0x1p-1022, 0x1p300, -0x1p-300};
+  const float cs[] = {0.0f, -0.0f, 1.0f, -1.0f, 0x1p-149f, -0x1p-149f, 3.4e38f, -3.4e38f, std::numeric_limits<float>::infinity(),
+                      -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN(), 0x1p-126f, 1e-20f, 123456.789f};
+  for (int round = 0; round < 200000; ++round) {
+    const size_t n = round % 3 == 0 ? 32 : round % 3 == 1 ? 64 : 1 + rng() % 200;
+    double terms[256];
+    const int style = round % 5;
+    for (size_t i = 0; i < n; ++i) {
+      const uint64_t r = rng();
+      double t;
+      if (style == 0) {   // products of two fp8 values: the real shape
+        t = fp8[r % fp8.size()] * fp8[(r >> 20) % fp8.size()];
+      } else if (style == 1) {   // with block scales (powers of two over the whole ue8m0 range)
+        t = fp8[r % fp8.size()] * fp8[(r >> 20) % fp8.size()] * std::ldexp(1.0, static_cast<int>((r >> 40) % 250) - 125) *
+            std::ldexp(1.0, static_cast<int>((r >> 50) % 250) - 125);
+      } else if (style == 2) {   // a few specials among them
+        t = (r & 15) == 0 ? specials[(r >> 8) % (sizeof specials / sizeof specials[0])] : fp8[r % fp8.size()] * fp8[(r >> 20) % fp8.size()];
+      } else if (style == 3) {   // wild doubles
+        t = std::bit_cast<double>((r & 0x800FFFFFFFFFFFFFull) | (((r >> 52) % 400 + 800) << 52));
+      } else {   // zeros and tiny ones mostly
+        t = (r & 3) == 0 ? 0.0 : (r & 4) ? -0.0 : fp8[r % fp8.size()] * 0x1p-100;
+      }
+      terms[i] = t;
+    }
+    const float c = round % 4 == 0 ? cs[rng() % (sizeof cs / sizeof cs[0])] : static_cast<float>(fp8[rng() % fp8.size()]) * 0.37f;
+    const float got = exec::mma_narrow_sum(terms, n, c), want = ref_narrow_sum(terms, n, c);
+    if (fb(got) != fb(want))
+      throw vtest::Failure("mma_narrow_sum round " + std::to_string(round) + " (n " + std::to_string(n) + ", style " +
+                           std::to_string(style) + "): got 0x" + hex(fb(got)) + ", want 0x" + hex(fb(want)));
   }
 }
 

@@ -759,7 +759,7 @@ struct Fp8Format {
 inline constexpr Fp8Format kE4M3{4, 3, 7, false, 448.0};
 inline constexpr Fp8Format kE5M2{5, 2, 15, true, 57344.0};
 
-double fp8_to_double(uint32_t byte, const Fp8Format& f) {
+double fp8_to_double_compute(uint32_t byte, const Fp8Format& f) {
   const uint32_t man_mask = (1u << f.man_bits) - 1u;
   const uint32_t exp_mask = (1u << f.exp_bits) - 1u;
   const bool sign = (byte >> (f.exp_bits + f.man_bits)) & 1u;
@@ -785,6 +785,25 @@ double fp8_to_double(uint32_t byte, const Fp8Format& f) {
                    static_cast<int>(exp) - f.bias);
   }
   return sign ? -v : v;
+}
+
+// Every byte of both formats, decoded once by the function above: the decode is
+// a pair of ldexp calls, and a block-scaled or fp8 tensor-core instruction
+// decodes hundreds of operands. The tables are that function's own results.
+const std::array<double, 256> kE4M3Values = [] {
+  std::array<double, 256> t{};
+  for (uint32_t i = 0; i < 256; ++i) t[i] = fp8_to_double_compute(i, kE4M3);
+  return t;
+}();
+const std::array<double, 256> kE5M2Values = [] {
+  std::array<double, 256> t{};
+  for (uint32_t i = 0; i < 256; ++i) t[i] = fp8_to_double_compute(i, kE5M2);
+  return t;
+}();
+double fp8_to_double(uint32_t byte, const Fp8Format& f) {
+  if (&f == &kE4M3) return kE4M3Values[byte & 0xFF];
+  if (&f == &kE5M2) return kE5M2Values[byte & 0xFF];
+  return fp8_to_double_compute(byte, f);
 }
 
 // satfinite clamps to the largest finite value instead of producing infinity
@@ -837,11 +856,24 @@ uint32_t double_to_fp8(double d, const Fp8Format& f, bool satfinite) {
 // and no NaN, so cvt's mandatory .satfinite sends a magnitude past the largest
 // normal, and infinity, to that normal with the sign kept. Rounds to nearest
 // even; the caller handles NaN.
-double small_float_value(uint32_t code, int eb, int mb, int bias) {
+double small_float_value_compute(uint32_t code, int eb, int mb, int bias) {
   const uint32_t mant = code & ((1u << mb) - 1), exp = (code >> mb) & ((1u << eb) - 1);
   const double mag = exp ? std::ldexp(1.0 + mant / double(1u << mb), int(exp) - bias)
                          : std::ldexp(mant / double(1u << mb), 1 - bias);
   return (code >> (eb + mb)) & 1 ? -mag : mag;
+}
+// The three formats the tensor cores read (e3m2, e2m3, e2m1), every code decoded once by the function above.
+template <int Eb, int Mb, int Bias>
+const std::array<double, (1u << (Eb + Mb + 1))> kSmallFloatValues = [] {
+  std::array<double, (1u << (Eb + Mb + 1))> t{};
+  for (uint32_t i = 0; i < t.size(); ++i) t[i] = small_float_value_compute(i, Eb, Mb, Bias);
+  return t;
+}();
+double small_float_value(uint32_t code, int eb, int mb, int bias) {
+  if (eb == 3 && mb == 2 && bias == 3) return kSmallFloatValues<3, 2, 3>[code & 63];
+  if (eb == 2 && mb == 3 && bias == 1) return kSmallFloatValues<2, 3, 1>[code & 63];
+  if (eb == 2 && mb == 1 && bias == 1) return kSmallFloatValues<2, 1, 1>[code & 15];
+  return small_float_value_compute(code, eb, mb, bias);
 }
 // `v` rounded toward zero onto the grid of a float format with `mb` mantissa bits and
 // the given exponent bias (subnormals included), for cvt's .rz; NaN and infinity pass.
@@ -13614,7 +13646,94 @@ uint32_t ue8m0_bits(double v, bool round_up, bool satfinite) {
 uint16_t f16_bits(double v) { return static_cast<uint16_t>(double_to_f16(v)); }
 uint16_t bf16_bits(double v) { return static_cast<uint16_t>(double_to_bf16(v)); }
 
+namespace {
+// The sum with libm calls for the exponents and the scaling: the form mma_narrow_sum below has when a term is a
+// subnormal double (never, from the narrow floats and their scales), and what its integer form is checked against.
+float mma_narrow_sum_libm(const double* terms, size_t n, float c);
+}  // namespace
+
+// The exact sum of the terms and c, rounded once toward zero to fp32: fixed-point in an __int128 whose unit is the
+// largest term's exponent less 118, the bits below it dropped toward minus infinity. The terms are taken apart with
+// integer operations rather than ilogb/ldexp/floor (a libm call or two per term, 8192 terms in one m16n8k32).
 float mma_narrow_sum(const double* terms, size_t n, float c) {
+  bool nan = std::isnan(c), pinf = std::isinf(c) && c > 0, ninf = std::isinf(c) && c < 0;
+  bool all_neg_zero = c == 0.0f && std::signbit(c);
+  int max_e = std::numeric_limits<int>::min();
+  for (size_t i = 0; i < n; ++i) {
+    const uint64_t b = std::bit_cast<uint64_t>(terms[i]);
+    const uint32_t e = static_cast<uint32_t>(b >> 52) & 0x7FF;
+    const uint64_t frac = b & ((uint64_t{1} << 52) - 1);
+    if (e == 0x7FF) {
+      if (frac) nan = true;
+      else (b >> 63 ? ninf : pinf) = true;
+      all_neg_zero = false;
+    } else if (e == 0) {
+      if (frac) return mma_narrow_sum_libm(terms, n, c);   // a subnormal double
+      if (!(b >> 63)) all_neg_zero = false;                 // +0
+    } else {
+      max_e = std::max(max_e, static_cast<int>(e) - 1023);
+      all_neg_zero = false;
+    }
+  }
+  if (std::isfinite(c) && c != 0.0f) max_e = std::max(max_e, std::ilogb(static_cast<double>(c)));
+  if (nan || (pinf && ninf)) return std::bit_cast<float>(0x7fffffffu);
+  if (pinf) return std::numeric_limits<float>::infinity();
+  if (ninf) return -std::numeric_limits<float>::infinity();
+  if (max_e == std::numeric_limits<int>::min()) return all_neg_zero ? -0.0f : 0.0f;
+  const int lsb = max_e - 118;
+  __int128 acc = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint64_t b = std::bit_cast<uint64_t>(terms[i]);
+    const uint32_t e = static_cast<uint32_t>(b >> 52) & 0x7FF;
+    if (e == 0) continue;   // zero (a subnormal went to the libm form above)
+    const uint64_t m = (b & ((uint64_t{1} << 52) - 1)) | (uint64_t{1} << 52);
+    const int sh = static_cast<int>(e) - 1075 - lsb;   // |t| * 2^-lsb = m * 2^sh
+    const bool neg = b >> 63;
+    if (sh >= 0) {                                        // <= 66: m * 2^sh fits in 119 bits
+      const __int128 v = static_cast<__int128>(m) << sh;
+      acc += neg ? -v : v;
+    } else {                                              // floor: toward minus infinity
+      const int k = -sh;
+      if (!neg) acc += k >= 64 ? 0 : static_cast<__int128>(m >> k);
+      else acc -= k >= 64 ? 1 : static_cast<__int128>((m + ((uint64_t{1} << k) - 1)) >> k);
+    }
+  }
+  if (c != 0.0f) {   // c = m * 2^(ec - 150) with m of 24 bits (a subnormal float has its exponent field 0 and no implicit bit)
+    const uint32_t cb = std::bit_cast<uint32_t>(c);
+    const uint32_t ec = (cb >> 23) & 0xFF;
+    const uint64_t m = (cb & 0x7FFFFFu) | (ec ? 0x800000u : 0u);
+    const int sh = (ec ? static_cast<int>(ec) : 1) - 150 - lsb;
+    const bool neg = cb >> 31;
+    if (sh >= 0) {
+      const __int128 v = static_cast<__int128>(m) << sh;
+      acc += neg ? -v : v;
+    } else {
+      const int k = -sh;
+      if (!neg) acc += k >= 64 ? 0 : static_cast<__int128>(m >> k);
+      else acc -= k >= 64 ? 1 : static_cast<__int128>((m + ((uint64_t{1} << k) - 1)) >> k);
+    }
+  }
+  if (acc == 0) return 0.0f;
+  const bool neg = acc < 0;
+  unsigned __int128 mag = neg ? -static_cast<unsigned __int128>(acc) : static_cast<unsigned __int128>(acc);
+  const uint64_t hi = static_cast<uint64_t>(mag >> 64), lo = static_cast<uint64_t>(mag);
+  const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
+  // fp32 keeps 24 bits and nothing below 2^-149
+  const int shift = std::max(top - 23, -149 - lsb);
+  const uint64_t mm = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  if (mm == 0) return 0.0f;
+  // The float mm * 2^(lsb + shift): mm has at most 24 bits and the scale is at least 2^-149, so it is exact
+  // unless it reaches 2^128, which is infinity. Built from the bits rather than with ldexp.
+  const int scale = lsb + shift, width = 64 - std::countl_zero(mm), exponent = scale + width - 1;
+  uint32_t bits;
+  if (exponent >= 128) bits = 0x7F800000u;
+  else if (exponent >= -126) bits = (static_cast<uint32_t>(exponent + 127) << 23) | (static_cast<uint32_t>(mm << (24 - width)) & 0x7FFFFFu);
+  else bits = static_cast<uint32_t>(mm << (scale + 149));   // a subnormal: a multiple of 2^-149
+  return std::bit_cast<float>(bits | (neg ? 0x80000000u : 0u));
+}
+
+namespace {
+float mma_narrow_sum_libm(const double* terms, size_t n, float c) {
   bool nan = std::isnan(c), pinf = std::isinf(c) && c > 0, ninf = std::isinf(c) && c < 0;
   bool all_neg_zero = c == 0.0f && std::signbit(c);
   int max_e = std::numeric_limits<int>::min();
@@ -13651,6 +13770,7 @@ float mma_narrow_sum(const double* terms, size_t n, float c) {
   if (v >= 0x1p128) return neg ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
   return neg ? -static_cast<float>(v) : static_cast<float>(v);
 }
+}  // namespace
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
   validate(fn, cfg, profile);
