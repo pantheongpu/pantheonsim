@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -280,6 +281,81 @@ VTEST(hmma_matches_the_element_form_at_every_level) {
                                    std::to_string(round) + ": word " + std::to_string(i) + " = 0x" + hex(got[i]) +
                                    ", want 0x" + hex(want[i]));
         }
+  }
+}
+
+namespace {
+
+// Words that break integer and float arithmetic: zeros of both signs, one, the extremes, subnormals, infinities,
+// NaNs with several payloads, values at the rounding edges of an f32 product, and a sign bit alone.
+const uint32_t kWords[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007FFFFFu, 0x807FFFFFu, 0x00800000u,
+                           0x80800000u, 0x3F800000u, 0xBF800000u, 0x3F800001u, 0x3F7FFFFFu, 0x40000000u, 0xC0000000u,
+                           0x7F7FFFFFu, 0xFF7FFFFFu, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0xFFC00000u, 0x7F800001u,
+                           0x7FBFFFFFu, 0xFFA00000u, 0x7FC12345u, 0x33800000u, 0x4B000000u, 0x4B800001u, 0x1F800000u,
+                           0x5F800000u, 0x3E800000u, 0xFFFFFFFFu, 0x7FFFFFFFu, 0xDEADBEEFu, 0x12345678u, 0x0000FFFFu,
+                           0x00010000u, 0x55555555u, 0xAAAAAAAAu};
+constexpr size_t kNW = sizeof kWords / sizeof kWords[0];
+
+void fill(std::mt19937& rng, uint32_t* x, int style) {
+  for (int l = 0; l < 32; ++l) x[l] = style == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+}
+
+uint32_t ref_lop3(uint32_t a, uint32_t b, uint32_t c, uint32_t lut) {   // the executor's own, bit by bit
+  uint32_t r = 0;
+  for (int i = 0; i < 8; ++i)
+    if ((lut >> i) & 1) r |= ((i & 4) ? a : ~a) & ((i & 2) ? b : ~b) & ((i & 1) ? c : ~c);
+  return r;
+}
+uint32_t ref_out(float v) { return v != v ? 0x7fffffffu : fb(v); }
+float asf(uint32_t b) { return std::bit_cast<float>(b); }
+
+}  // namespace
+
+VTEST(lane_kernels_match_the_scalar_forms_at_every_level) {
+  std::mt19937 rng(5);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    const auto check = [&](const char* what, const uint32_t* got, const uint32_t* want, const uint32_t* a,
+                           const uint32_t* b, const uint32_t* c) {
+      for (int i = 0; i < 32; ++i)
+        if (got[i] != want[i])
+          throw vtest::Failure(lv + " " + what + " lane " + std::to_string(i) + ": a=0x" + hex(a[i]) + " b=0x" +
+                               hex(b[i]) + " c=0x" + hex(c ? c[i] : 0) + " got 0x" + hex(got[i]) + " want 0x" + hex(want[i]));
+    };
+    for (int round = 0; round < 60000; ++round) {
+      uint32_t a[32], b[32], c[32], got[32], want[32];
+      const int style = round % 3 == 0 ? 0 : 1;
+      fill(rng, a, style);
+      fill(rng, b, round % 5 == 0 ? 0 : style);
+      fill(rng, c, style);
+      const uint32_t add = round % 4;
+      k.iadd3(got, a, b, c, add);
+      for (int i = 0; i < 32; ++i) want[i] = a[i] + b[i] + c[i] + add;
+      check("iadd3", got, want, a, b, c);
+      k.imad(got, a, b, c);
+      for (int i = 0; i < 32; ++i) want[i] = a[i] * b[i] + c[i];
+      check("imad", got, want, a, b, c);
+      const uint32_t lut = round < 256 ? static_cast<uint32_t>(round) : static_cast<uint32_t>(rng() & 0xff);
+      k.lop3(got, a, b, c, lut);
+      for (int i = 0; i < 32; ++i) want[i] = ref_lop3(a[i], b[i], c[i], lut);
+      check("lop3", got, want, a, b, c);
+      k.ffma(got, a, b, c);
+      for (int i = 0; i < 32; ++i) want[i] = ref_out(std::fma(asf(a[i]), asf(b[i]), asf(c[i])));
+      check("ffma", got, want, a, b, c);
+      k.fadd(got, a, b);
+      for (int i = 0; i < 32; ++i) {
+        volatile float s = asf(a[i]) + asf(b[i]);
+        want[i] = ref_out(s);
+      }
+      check("fadd", got, want, a, b, nullptr);
+      k.fmul(got, a, b);
+      for (int i = 0; i < 32; ++i) {
+        volatile float p = asf(a[i]) * asf(b[i]);
+        want[i] = ref_out(p);
+      }
+      check("fmul", got, want, a, b, nullptr);
+    }
   }
 }
 

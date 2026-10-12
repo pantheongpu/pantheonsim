@@ -1089,6 +1089,9 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     uint32_t operator()(uint32_t v) const { if (abs) v &= 0x7fffffffu; if (neg) v ^= 0x80000000u; return v; }
   };
   alignas(64) uint32_t r[32];
+  // The lane loops below are SIMD kernels (vgpu/simd/simd.hpp) unless VGPU_SIMD=off; each gives the bits of the loop it
+  // replaces, which stays as the other branch (tests/unit/test_simd.cpp).
+  const simd::Kernels* const sk = simd::enabled() ? &simd::kernels() : nullptr;
   const auto store = [&](const Operand& dst) {
     if (dst.reg == kRZ) return;
     uint32_t* d = &w.reg(dst.reg, 0);
@@ -1120,7 +1123,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         s[i] = lanes(i, o, IntMod{false, o.neg || o.bnot, o.neg || o.bnot});
       }
       const uint32_t add = (ins.src[0].neg ? 1u : 0u) + (ins.src[1].neg ? 1u : 0u) + (ins.src[2].neg ? 1u : 0u);
-      for (unsigned l = 0; l < 32; ++l) r[l] = s[0][l] + s[1][l] + s[2][l] + add;
+      if (sk) sk->iadd3(r, s[0], s[1], s[2], add);
+      else for (unsigned l = 0; l < 32; ++l) r[l] = s[0][l] + s[1][l] + s[2][l] + add;
       store(ins.dst[0]);
       return true;
     }
@@ -1144,7 +1148,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         if (!plain(o)) return false;
         s[i] = lanes(i, o, IntMod{o.neg, o.bnot, o.neg || o.bnot});
       }
-      for (unsigned l = 0; l < 32; ++l) r[l] = s[0][l] * s[1][l] + s[2][l];
+      if (sk) sk->imad(r, s[0], s[1], s[2]);
+      else for (unsigned l = 0; l < 32; ++l) r[l] = s[0][l] * s[1][l] + s[2][l];
       store(ins.dst[0]);
       return true;
     }
@@ -1158,11 +1163,15 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         s[i] = lanes(i, ins.src[i], Same{});
       }
       const unsigned lut = ins.f[0];
-      for (unsigned l = 0; l < 32; ++l) r[l] = 0;
-      for (unsigned t = 0; t < 8; ++t) {   // each minterm of the table, over every lane
-        if (!((lut >> t) & 1)) continue;
-        const uint32_t ma = (t & 4) ? 0u : ~0u, mb = (t & 2) ? 0u : ~0u, mc = (t & 1) ? 0u : ~0u;
-        for (unsigned l = 0; l < 32; ++l) r[l] |= (s[0][l] ^ ma) & (s[1][l] ^ mb) & (s[2][l] ^ mc);
+      if (sk) {
+        sk->lop3(r, s[0], s[1], s[2], lut);
+      } else {
+        for (unsigned l = 0; l < 32; ++l) r[l] = 0;
+        for (unsigned t = 0; t < 8; ++t) {   // each minterm of the table, over every lane
+          if (!((lut >> t) & 1)) continue;
+          const uint32_t ma = (t & 4) ? 0u : ~0u, mb = (t & 2) ? 0u : ~0u, mc = (t & 1) ? 0u : ~0u;
+          for (unsigned l = 0; l < 32; ++l) r[l] |= (s[0][l] ^ ma) & (s[1][l] ^ mb) & (s[2][l] ^ mc);
+        }
       }
       if (has_p) {
         if (ins.src.size() < 5) return false;
@@ -1250,7 +1259,11 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         s[i] = lanes(i, o, FMod{o.abs, o.neg, o.abs || o.neg});
       }
       const auto out = [](float v) { return v != v ? 0x7fffffffu : f32_bits(v); };
-      if (ins.op == Op::FFMA)
+      if (sk) {
+        if (ins.op == Op::FFMA) sk->ffma(r, s[0], s[1], s[2]);
+        else if (ins.op == Op::FADD) sk->fadd(r, s[0], s[1]);
+        else sk->fmul(r, s[0], s[1]);
+      } else if (ins.op == Op::FFMA)
         for (unsigned l = 0; l < 32; ++l) r[l] = out(std::fma(as_f32(s[0][l]), as_f32(s[1][l]), as_f32(s[2][l])));
       else if (ins.op == Op::FADD)
         for (unsigned l = 0; l < 32; ++l) r[l] = out(as_f32(s[0][l]) + as_f32(s[1][l]));

@@ -47,6 +47,17 @@ struct Kernels {
   void (*f16_to_f32)(const uint16_t* in, float* out, size_t n);
   void (*f32_to_f16)(const float* in, uint16_t* out, size_t n);
 
+  // The 32 lanes of one warp, r[l] from a[l], b[l], c[l]. r may not alias the sources (they may alias each other).
+  // iadd3: a + b + c + add (wrapping). imad: a * b + c (low 32 bits). lop3: the three-input logic function whose
+  // truth table is `lut` (bit 4a + 2b + c). ffma/fadd/fmul: the f32 operation on the bits, a fused multiply-add
+  // for ffma (one rounding), the sum or product rounded to nearest even, a NaN result the canonical 0x7fffffff.
+  void (*iadd3)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add);
+  void (*imad)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c);
+  void (*lop3)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t lut);
+  void (*ffma)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c);
+  void (*fadd)(uint32_t* r, const uint32_t* a, const uint32_t* b);
+  void (*fmul)(uint32_t* r, const uint32_t* a, const uint32_t* b);
+
   // One warp's mma.m16n8kK of f16, bf16 or tf32 operands with a float or half
   // accumulator, on the registers as the warp holds them: register r of a
   // fragment is the 32 words at x + 32 * r. kind 0 = f16, 1 = bf16, 2 = tf32;

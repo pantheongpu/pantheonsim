@@ -4,6 +4,7 @@
 #include "vgpu/simd/simd.hpp"
 
 #include <bit>
+#include <cstring>
 #include <cstdlib>
 #include <cstring>
 
@@ -21,23 +22,31 @@
 namespace vgpu::simd {
 
 #define VGPU_SIMD_NS base_impl
+#define VGPU_SIMD_AVX2 0
 #include "kernels.inc"
 #undef VGPU_SIMD_NS
+#undef VGPU_SIMD_AVX2
 
 #ifdef VGPU_SIMD_X86
 #pragma GCC push_options
 #pragma GCC target("avx2,fma,f16c")
 #define VGPU_SIMD_NS avx2_impl
+#define VGPU_SIMD_AVX2 1
 #include "kernels.inc"
 #undef VGPU_SIMD_NS
+#undef VGPU_SIMD_AVX2
 #pragma GCC pop_options
 #endif
 
 namespace {
 
-const Kernels kBase = {Level::Base, base_impl::f16_to_f32_k, base_impl::f32_to_f16_k, base_impl::hmma_k};
+const Kernels kBase = {Level::Base,       base_impl::f16_to_f32_k, base_impl::f32_to_f16_k, base_impl::iadd3_k,
+                       base_impl::imad_k, base_impl::lop3_k,       base_impl::ffma_k,       base_impl::fadd_k,
+                       base_impl::fmul_k, base_impl::hmma_k};
 #ifdef VGPU_SIMD_X86
-const Kernels kAvx2 = {Level::Avx2, avx2_impl::f16_to_f32_k, avx2_impl::f32_to_f16_k, avx2_impl::hmma_k};
+const Kernels kAvx2 = {Level::Avx2,       avx2_impl::f16_to_f32_k, avx2_impl::f32_to_f16_k, avx2_impl::iadd3_k,
+                       avx2_impl::imad_k, avx2_impl::lop3_k,       avx2_impl::ffma_k,       avx2_impl::fadd_k,
+                       avx2_impl::fmul_k, avx2_impl::hmma_k};
 
 // The F16C conversions against the scalar ones: every half, and a spread of
 // floats. A host whose conversion differs (a stray MXCSR, an emulator) is
