@@ -8,6 +8,7 @@
 #include <mutex>
 #include <set>
 
+#include "host_conv.hpp"
 #include "vgpu/runtime/capture.hpp"
 
 namespace vgpu_cudnn {
@@ -370,6 +371,26 @@ inline double half_fma(double acc, double a, double b) {
 
 void convolve(const ConvGeom& g, ConvDir dir, const std::vector<double>& a, const std::vector<double>& b,
               std::vector<double>* out, Accum acc) {
+  // Exact and integer sums are  s = s + x*w  in double, one chain per output element, which host_conv.hpp runs row
+  // by row (and over threads) in the same order the loops below do. Half precision rounds after every step, so
+  // it keeps the element-by-element loops.
+  if (acc != Accum::Half) {
+    vgpu::hostconv::Geom h;
+    h.N = g.N, h.C = g.C, h.K = g.K, h.G = g.G, h.Cg = g.Cg, h.Kg = g.Kg, h.flip = g.flip;
+    for (int i = 0; i < 3; ++i) {
+      h.in[i] = g.in[i], h.out[i] = g.out[i], h.flt[i] = g.flt[i];
+      h.pad[i] = g.pad[i], h.str[i] = g.str[i], h.dil[i] = g.dil[i];
+    }
+    const int64_t isz = g.in[0] * g.in[1] * g.in[2], osz = g.out[0] * g.out[1] * g.out[2],
+                  fsz = g.flt[0] * g.flt[1] * g.flt[2];
+    const int64_t n_out = dir == ConvDir::Forward ? g.N * g.K * osz : dir == ConvDir::Data ? g.N * g.C * isz : g.K * g.Cg * fsz;
+    out->assign(static_cast<size_t>(n_out), 0.0);
+    vgpu::hostconv::convolve_exact(h, dir == ConvDir::Forward ? vgpu::hostconv::Dir::Forward
+                                         : dir == ConvDir::Data ? vgpu::hostconv::Dir::Data
+                                                                : vgpu::hostconv::Dir::Filter,
+                                   a.data(), b.data(), out->data());
+    return;
+  }
   const int64_t I0 = g.in[0], I1 = g.in[1], I2 = g.in[2];
   const int64_t O0 = g.out[0], O1 = g.out[1], O2 = g.out[2];
   const int64_t F0 = g.flt[0], F1 = g.flt[1], F2 = g.flt[2];

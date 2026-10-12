@@ -1235,6 +1235,11 @@ target_sources(test_nvenc_hevc_enc PRIVATE nvidia/src/nvenc_hevc_enc.cpp)
 vgpu_unit_test(test_h264_decode nvidia/tests/unit/test_h264_decode.cpp)
 target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
 target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
+vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
+# The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
+vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
+vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
 # The HEVC decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
 vgpu_unit_test(test_hevc_decode nvidia/tests/unit/test_hevc_decode.cpp)
 target_sources(test_hevc_decode PRIVATE nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp nvidia/src/hevc_stream.cpp)
