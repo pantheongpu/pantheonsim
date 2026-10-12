@@ -116,6 +116,9 @@ using Lanes32 = std::array<uint32_t, kMaxWarpSize>;
 struct ParamBuffer {
   std::vector<uint8_t> bytes;
   std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> layout;  // name -> (offset, size)
+  // The same, by position in the kernel's parameter list (Addr::param_index),
+  // for a load that would otherwise hash the parameter's name.
+  std::vector<std::pair<uint32_t, uint32_t>> by_index;
 };
 
 // State for bar.red, which needs every warp in the block to arrive before it
@@ -549,6 +552,9 @@ struct ClusterState {
 
 // %cluster_ctarank: x fastest within the cluster.
 uint32_t cluster_rank_of(const BlockCtx& ctx) {
+  // A launch with no cluster is clusters of one block: every remainder below is
+  // zero, and the three divisions it would take are paid on each shared access.
+  if (ctx.cluster[0] == 1 && ctx.cluster[1] == 1 && ctx.cluster[2] == 1) return 0;
   return ctx.ctaid[0] % ctx.cluster[0] + ctx.ctaid[1] % ctx.cluster[1] * ctx.cluster[0] +
          ctx.ctaid[2] % ctx.cluster[2] * ctx.cluster[0] * ctx.cluster[1];
 }
@@ -912,6 +918,119 @@ inline void for_active(Mask m, uint32_t width, F&& f) {
   }
 }
 
+// ---- counting a warp's access from its lanes' addresses ----
+//
+// A warp-level shared access takes as many passes as the most-asked-for bank
+// has distinct 4-byte words, and a global or local one touches some number of
+// distinct 32-byte sectors (see count_addresses). Both are counted for every
+// load and store, so they sit on the hottest memory path. Each has two
+// forms: the _ref one is the original, kept as the reference that
+// VGPU_FASTPATH=0 selects (tests/unit/test_fastpath.cpp compares the
+// counters the two produce); the _fast one gives the same number without
+// zero-filling kilobytes of scratch per call or walking all 32 banks.
+
+// The most distinct words one bank is asked for, 1 at least. Lane `lane`
+// asks for the words at addrs[lane] + 0, 4, ... below `span`.
+uint32_t bank_passes_ref(const Lanes& addrs, Mask m, uint32_t width, uint64_t span) {
+  uint32_t worst = 1;
+  for (uint32_t bank = 0; bank < 32; ++bank) {
+    std::array<uint64_t, kMaxWarpSize * 4> words{};
+    uint32_t distinct = 0;
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      for (uint64_t off = 0; off < span; off += 4) {
+        const uint64_t word = (addrs[lane] + off) / 4;
+        if (word % 32 != bank) continue;
+        bool seen = false;
+        for (uint32_t i = 0; i < distinct; ++i)
+          if (words[i] == word) { seen = true; break; }
+        if (!seen && distinct < words.size()) words[distinct++] = word;
+      }
+    }
+    if (distinct > worst) worst = distinct;
+  }
+  return worst;
+}
+
+// One pass over the lanes' words, each filed in its bank's list unless it is
+// already there. With a span of at most 128 bytes a lane asks for at most one
+// word per bank (its words are consecutive), so a list never outgrows the
+// warp and the reference's 256-entry cap cannot bind; a wider span takes the
+// reference.
+uint32_t bank_passes_fast(const Lanes& addrs, Mask m, uint32_t width, uint64_t span) {
+  if (span > 128 || width > kMaxWarpSize) return bank_passes_ref(addrs, m, width, span);
+  uint32_t count[32] = {};
+  uint64_t bucket[32][kMaxWarpSize];
+  uint32_t worst = 1;
+  const uint64_t nwords = (span + 3) / 4;
+  for (Mask rest = m & all_lanes(width); rest; rest &= rest - 1) {
+    const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(rest));
+    for (uint64_t k = 0; k < nwords; ++k) {
+      const uint64_t word = (addrs[lane] + 4 * k) / 4;
+      const uint32_t b = static_cast<uint32_t>(word & 31);
+      uint32_t& n = count[b];
+      uint64_t* list = bucket[b];
+      uint32_t i = 0;
+      while (i < n && list[i] != word) ++i;
+      if (i == n) {
+        list[n++] = word;
+        if (n > worst) worst = n;
+      }
+    }
+  }
+  return worst;
+}
+
+// The distinct 32-byte sectors the lanes' accesses of `span` bytes cover.
+uint32_t distinct_sectors_ref(const Lanes& addrs, Mask m, uint32_t width, uint64_t span) {
+  std::array<uint64_t, kMaxWarpSize * 8> sectors{};
+  uint32_t distinct = 0;
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    if (!(m & (Mask{1} << lane))) continue;
+    const uint64_t first = addrs[lane] / 32;
+    const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
+    for (uint64_t sec = first; sec <= last; ++sec) {
+      bool seen = false;
+      for (uint32_t i = 0; i < distinct; ++i)
+        if (sectors[i] == sec) { seen = true; break; }
+      if (!seen && distinct < sectors.size()) sectors[distinct++] = sec;
+    }
+  }
+  return distinct;
+}
+
+// The same set, searched newest first -- consecutive lanes mostly share a
+// sector with the one before -- in scratch that is not cleared. A span of at
+// most 128 bytes covers at most five sectors a lane, so the reference's
+// 512-entry cap cannot bind for a warp of 64.
+uint32_t distinct_sectors_fast(const Lanes& addrs, Mask m, uint32_t width, uint64_t span) {
+  if (span > 128 || width > kMaxWarpSize) return distinct_sectors_ref(addrs, m, width, span);
+  uint64_t sectors[kMaxWarpSize * 5];
+  uint32_t distinct = 0;
+  for (Mask rest = m & all_lanes(width); rest; rest &= rest - 1) {
+    const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(rest));
+    const uint64_t first = addrs[lane] / 32;
+    const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
+    for (uint64_t sec = first; sec <= last; ++sec) {
+      uint32_t i = distinct;
+      while (i > 0 && sectors[i - 1] != sec) --i;
+      if (i == 0) sectors[distinct++] = sec;
+    }
+  }
+  return distinct;
+}
+
+// Every NaN among the active lanes of an f32 result becomes the canonical one,
+// 0x7FFFFFFF (see canon32). A NaN is a value whose magnitude bits are above
+// the infinity's; written as a select rather than a branch, because whether a
+// lane's result is a NaN is data and a branch on it mispredicts.
+inline void canon_nan32_lanes(uint32_t* d, Mask m, uint32_t width) {
+  for_active(m, width, [&](uint32_t l) {
+    const uint32_t v = d[l];
+    d[l] = (v & 0x7FFFFFFFu) > 0x7F800000u ? 0x7FFFFFFFu : v;
+  });
+}
+
 // Lane loops for fma on the host's FMA unit. The build targets baseline
 // x86-64, so std::fma is a call into libm per lane -- which glibc then routes
 // to the same vfmadd instruction through an ifunc on any CPU that has one.
@@ -964,6 +1083,28 @@ double fma_hw(double a, double b, double c) { return std::fma(a, b, c); }
 #endif
 // The correctly rounded fused multiply-add, without libm's per-call dispatch.
 inline double host_fma(double a, double b, double c) { return g_hw_fma ? fma_hw(a, b, c) : std::fma(a, b, c); }
+
+// Reads or writes the low `size` bytes of a value in memory, little-endian.
+// The sizes memory accesses come in are constants to the compiler this way,
+// so each is one move rather than a call to memcpy with a length.
+inline uint64_t load_bytes(const uint8_t* p, uint32_t size) {
+  switch (size) {
+    case 1: { uint8_t v; std::memcpy(&v, p, 1); return v; }
+    case 2: { uint16_t v; std::memcpy(&v, p, 2); return v; }
+    case 4: { uint32_t v; std::memcpy(&v, p, 4); return v; }
+    case 8: { uint64_t v; std::memcpy(&v, p, 8); return v; }
+    default: { uint64_t v = 0; std::memcpy(&v, p, size); return v; }
+  }
+}
+inline void store_bytes(uint8_t* p, uint32_t size, uint64_t value) {
+  switch (size) {
+    case 1: { const uint8_t v = static_cast<uint8_t>(value); std::memcpy(p, &v, 1); return; }
+    case 2: { const uint16_t v = static_cast<uint16_t>(value); std::memcpy(p, &v, 2); return; }
+    case 4: { const uint32_t v = static_cast<uint32_t>(value); std::memcpy(p, &v, 4); return; }
+    case 8: std::memcpy(p, &value, 8); return;
+    default: std::memcpy(p, &value, size); return;
+  }
+}
 
 // Per-element lanes for a vector load, store or register pack: up to four on
 // the stack, as the parser allows, instead of a heap allocation on every
@@ -3371,23 +3512,8 @@ class Interpreter {
       // access wider than a word touches consecutive words, which the hardware
       // takes in separate passes -- counting each word is what makes a
       // conflict-free 8-byte access come out as conflict-free.
-      uint32_t worst = 1;
-      for (uint32_t bank = 0; bank < 32; ++bank) {
-        std::array<uint64_t, kMaxWarpSize * 4> words{};
-        uint32_t distinct = 0;
-        for (uint32_t lane = 0; lane < W_; ++lane) {
-          if (!(m & (Mask{1} << lane))) continue;
-          for (uint64_t off = 0; off < span; off += 4) {
-            const uint64_t word = (addrs[lane] + off) / 4;
-            if (word % 32 != bank) continue;
-            bool seen = false;
-            for (uint32_t i = 0; i < distinct; ++i)
-              if (words[i] == word) { seen = true; break; }
-            if (!seen && distinct < words.size()) words[distinct++] = word;
-          }
-        }
-        if (distinct > worst) worst = distinct;
-      }
+      const uint32_t worst = fast_enabled_ ? bank_passes_fast(addrs, m, W_, span)
+                                           : bank_passes_ref(addrs, m, W_, span);
       stats_.shared_bank_conflicts += worst - 1;
       ++stats_.shared_requests;
       if (is_store) {
@@ -3405,19 +3531,8 @@ class Interpreter {
     // Everything else moves in 32-byte sectors. Count the distinct ones the
     // warp touched: four for a coalesced 32-lane 4-byte load, up to 32 when
     // every lane lands in its own sector.
-    std::array<uint64_t, kMaxWarpSize * 8> sectors{};
-    uint32_t distinct = 0;
-    for (uint32_t lane = 0; lane < W_; ++lane) {
-      if (!(m & (Mask{1} << lane))) continue;
-      const uint64_t first = addrs[lane] / 32;
-      const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
-      for (uint64_t sec = first; sec <= last; ++sec) {
-        bool seen = false;
-        for (uint32_t i = 0; i < distinct; ++i)
-          if (sectors[i] == sec) { seen = true; break; }
-        if (!seen && distinct < sectors.size()) sectors[distinct++] = sec;
-      }
-    }
+    const uint32_t distinct = fast_enabled_ ? distinct_sectors_fast(addrs, m, W_, span)
+                                            : distinct_sectors_ref(addrs, m, W_, span);
     if (space == Space::Local) {
       stats_.local_sectors += distinct;
       ++stats_.local_requests;
@@ -3735,6 +3850,19 @@ class Interpreter {
   uint64_t load_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                        uint32_t size) {
     if (is_shared(addr)) {
+      // The block's own shared memory, in bounds: nearly every access. It does
+      // what the general case below does for it, minus building a SharedRef.
+      if (const uint64_t rel = addr - kSharedVaBase, off = rel & kClusterOffsetMask;
+          fast_enabled_ && (rel >> kClusterRankShift) == cluster_rank_of(ctx) && ctx.shared &&
+          off + size <= ctx.shared->size()) {
+        if (ctx.shadow) note_shared_access(ctx, ins, kSharedVaBase + off, size, /*is_write=*/false);
+        const uint64_t v = load_bytes(ctx.shared->data() + off, size);
+        try {
+          return mem_.shared_loaded(off, size, v);
+        } catch (const Error& e) {
+          rethrow_with_context(e, ins, static_cast<int>(lane));
+        }
+      }
       const SharedRef r = shared_at(ctx, ins, static_cast<int>(lane), addr, size);
       // The race detector orders warps by their own block's barriers, which
       // say nothing about another block's, so a remote access is not noted.
@@ -3777,6 +3905,14 @@ class Interpreter {
   void store_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                     uint32_t size, uint64_t value) {
     if (is_shared(addr)) {
+      // As in load_routed: the block's own memory, in bounds, directly.
+      if (const uint64_t rel = addr - kSharedVaBase, off = rel & kClusterOffsetMask;
+          fast_enabled_ && (rel >> kClusterRankShift) == cluster_rank_of(ctx) && ctx.shared &&
+          off + size <= ctx.shared->size()) {
+        if (ctx.shadow) note_shared_access(ctx, ins, kSharedVaBase + off, size, /*is_write=*/true, value);
+        store_bytes(ctx.shared->data() + off, size, value);
+        return;
+      }
       const SharedRef r = shared_at(ctx, ins, static_cast<int>(lane), addr, size);
       if (r.owner == &ctx) note_shared_access(ctx, ins, kSharedVaBase + r.off, size, /*is_write=*/true, value);
       std::memcpy(r.owner->shared->data() + r.off, &value, size);
@@ -4499,9 +4635,7 @@ class Interpreter {
       if (g_hw_fma) {
         fma_lanes_f32_hw(d, a.data(), b.data(), c.data(), m, W_);
         // A NaN result is the canonical one (see canon32).
-        for_active(m, W_, [&](uint32_t l) {
-          if ((d[l] & 0x7F800000u) == 0x7F800000u && (d[l] & 0x7FFFFFu)) d[l] = 0x7FFFFFFFu;
-        });
+        canon_nan32_lanes(d, m, W_);
         w.written32[op.dst.id] = 1;
         return true;
       }
@@ -9690,10 +9824,19 @@ class Interpreter {
       return;
     }
     if (op.space == Space::Param) {
-      auto it = params_.layout.find(op.addr.base);
-      if (it == params_.layout.end())
-        ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
-      auto [off, psize] = it->second;
+      // By position when the parser recorded one and this is the kernel's own
+      // body (a device function's parameters are call slots, not these), else
+      // by name; both name the same slot.
+      std::pair<uint32_t, uint32_t> slot;
+      if (fast_enabled_ && cur_ == &fn_ && op.addr.param_index < params_.by_index.size()) {
+        slot = params_.by_index[op.addr.param_index];
+      } else {
+        auto it = params_.layout.find(op.addr.base);
+        if (it == params_.layout.end())
+          ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
+        slot = it->second;
+      }
+      auto [off, psize] = slot;
       for (size_t e = 0; e < n; ++e) {
         int64_t at = int64_t{off} + op.addr.offset + static_cast<int64_t>(e * size);
         if (at < 0 || static_cast<uint64_t>(at) + size > uint64_t{off} + psize)
@@ -9711,9 +9854,10 @@ class Interpreter {
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
+    const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;   // a mask, not a division, then
     {
       // Sectors and bank conflicts need the addresses, which only exist here.
-      Lanes at{};
+      Lanes at;   // read only at the active lanes, which are all written below
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
@@ -9723,7 +9867,7 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        if (addr % va != 0)
+        if (va_pow2 ? (addr & (va - 1)) != 0 : addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "vector load requires " + std::to_string(va) + "-byte alignment");
         std::unique_lock<std::mutex> whole;
@@ -9783,8 +9927,9 @@ class Interpreter {
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);
+    const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;
     {
-      Lanes at{};
+      Lanes at;   // read only at the active lanes, which are all written below
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
@@ -9793,7 +9938,7 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        if (addr % va != 0)
+        if (va_pow2 ? (addr & (va - 1)) != 0 : addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "vector store requires " + std::to_string(va) + "-byte alignment");
         std::unique_lock<std::mutex> whole;
@@ -12197,6 +12342,7 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
     pb.bytes.resize(off + size);
     std::memcpy(pb.bytes.data() + off, args[i].data(), size);
     pb.layout[fn.params[i].name] = {off, size};
+    pb.by_index.emplace_back(off, size);
   }
   return pb;
 }

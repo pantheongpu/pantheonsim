@@ -148,6 +148,9 @@ struct Addr {
   std::string base;
   uint32_t base_id = kNoReg;  // interned when base_kind == Reg
   bool base_wide = false;     // which register file base_id indexes
+  // For base_kind == EntryParam: the parameter's position in the kernel's
+  // parameter list, so a load need not look its name up in a hash table.
+  uint32_t param_index = kNoReg;
   int64_t offset = 0;
 };
 

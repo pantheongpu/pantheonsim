@@ -1456,10 +1456,19 @@ class Parser {
       a.base_kind = Addr::Base::CallSlot;
     } else {
       bool is_param = false;
-      for (const auto& p : fn.params) is_param = is_param || p.name == base;
+      uint32_t param_index = kNoReg;
+      for (size_t i = 0; i < fn.params.size(); ++i)
+        if (fn.params[i].name == base) {
+          // The last of that name, which is the one the launch's name -> slot
+          // map ends up holding (build_params overwrites); a PTX parameter
+          // name is unique, so this only matters for malformed input.
+          param_index = static_cast<uint32_t>(i);
+          is_param = true;
+        }
       if (is_param) {
         a.base = base;
         a.base_kind = Addr::Base::EntryParam;
+        a.param_index = param_index;
       } else {
         // A variable addressed by name (.shared/.local/.global). Resolution
         // happens at launch, when the module's symbol table is available.
