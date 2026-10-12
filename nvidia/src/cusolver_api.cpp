@@ -39,6 +39,7 @@
 
 #include "capture_defer.hpp"
 #include "complex_linalg.hpp"
+#include "host_dense.hpp"
 
 // Every read and write of device memory below is the commit point of a call made on a capturing stream
 // (capture_defer.hpp).
@@ -95,52 +96,18 @@ void set_info(int* dev_info, int value) {
 
 /* ---- factorizations, all column-major and all in double ---- */
 
+// The factorizations and solves are host_dense.hpp's: the same chains of products and sums per element, in the same
+// order, with the loops arranged to run down columns.
+
 // Cholesky. Returns 0, or the 1-based index of the leading minor that failed.
-int potrf(Mat& A, int n, bool lower) {
-  for (int j = 0; j < n; ++j) {
-    double d = A(j, j);
-    for (int k = 0; k < j; ++k) {
-      const double v = lower ? A(j, k) : A(k, j);
-      d -= v * v;
-    }
-    if (!(d > 0.0)) return j + 1;
-    d = std::sqrt(d);
-    (lower ? A(j, j) : A(j, j)) = d;
-    for (int i = j + 1; i < n; ++i) {
-      double s = lower ? A(i, j) : A(j, i);
-      for (int k = 0; k < j; ++k)
-        s -= (lower ? A(i, k) : A(k, i)) * (lower ? A(j, k) : A(k, j));
-      (lower ? A(i, j) : A(j, i)) = s / d;
-    }
-  }
-  return 0;
-}
+int potrf(Mat& A, int n, bool lower) { return vgpu::hostdense::potrf(A.v.data(), A.ld, n, lower); }
 
 // LU with partial pivoting. ipiv is LAPACK's: 1-based row that row i was
 // swapped with. A null ipiv means the caller asked for no pivoting.
 int getrf(Mat& A, int m, int n, std::vector<int>* ipiv) {
   const int k = std::min(m, n);
   if (ipiv) ipiv->assign(k, 0);
-  int info = 0;
-  for (int j = 0; j < k; ++j) {
-    int p = j;
-    if (ipiv) {
-      double best = std::fabs(A(j, j));
-      for (int i = j + 1; i < m; ++i)
-        if (std::fabs(A(i, j)) > best) { best = std::fabs(A(i, j)); p = i; }
-      (*ipiv)[j] = p + 1;
-      if (p != j)
-        for (int c = 0; c < n; ++c) std::swap(A(j, c), A(p, c));
-    }
-    const double piv = A(j, j);
-    if (piv == 0.0) { if (!info) info = j + 1; continue; }
-    for (int i = j + 1; i < m; ++i) {
-      A(i, j) /= piv;
-      const double f = A(i, j);
-      for (int c = j + 1; c < n; ++c) A(i, c) -= f * A(j, c);
-    }
-  }
-  return info;
+  return vgpu::hostdense::getrf(A.v.data(), A.ld, m, n, ipiv ? ipiv->data() : nullptr);
 }
 
 void apply_pivots(Mat& B, int n, int nrhs, const std::vector<int>& ipiv, bool forward) {
@@ -155,115 +122,30 @@ void apply_pivots(Mat& B, int n, int nrhs, const std::vector<int>& ipiv, bool fo
 
 // Triangular solves. `unit` means an implicit unit diagonal (LU's L).
 void trsm_lower(const Mat& A, Mat& B, int n, int nrhs, bool unit, bool trans) {
-  for (int c = 0; c < nrhs; ++c) {
-    if (!trans) {
-      for (int i = 0; i < n; ++i) {
-        double s = B(i, c);
-        for (int k = 0; k < i; ++k) s -= A(i, k) * B(k, c);
-        B(i, c) = unit ? s : s / A(i, i);
-      }
-    } else {
-      for (int i = n - 1; i >= 0; --i) {
-        double s = B(i, c);
-        for (int k = i + 1; k < n; ++k) s -= A(k, i) * B(k, c);
-        B(i, c) = unit ? s : s / A(i, i);
-      }
-    }
-  }
+  vgpu::hostdense::trsm_lower(A.v.data(), A.ld, B.v.data(), B.ld, n, nrhs, unit, trans);
 }
 
 void trsm_upper(const Mat& A, Mat& B, int n, int nrhs, bool unit, bool trans) {
-  for (int c = 0; c < nrhs; ++c) {
-    if (!trans) {
-      for (int i = n - 1; i >= 0; --i) {
-        double s = B(i, c);
-        for (int k = i + 1; k < n; ++k) s -= A(i, k) * B(k, c);
-        B(i, c) = unit ? s : s / A(i, i);
-      }
-    } else {
-      for (int i = 0; i < n; ++i) {
-        double s = B(i, c);
-        for (int k = 0; k < i; ++k) s -= A(k, i) * B(k, c);
-        B(i, c) = unit ? s : s / A(i, i);
-      }
-    }
-  }
+  vgpu::hostdense::trsm_upper(A.v.data(), A.ld, B.v.data(), B.ld, n, nrhs, unit, trans);
 }
 
 // Householder QR, LAPACK's dgeqrf/dlarfg convention: beta carries the opposite
 // sign to the leading element, v[0] is an implicit 1, and the rest of v
 // overwrites the column below the diagonal.
 void geqrf(Mat& A, int m, int n, std::vector<double>* tau) {
-  const int k = std::min(m, n);
-  tau->assign(k, 0.0);
-  std::vector<double> v((size_t)m);
-  for (int j = 0; j < k; ++j) {
-    double norm = 0.0;
-    for (int i = j; i < m; ++i) norm += A(i, j) * A(i, j);
-    norm = std::sqrt(norm);
-    if (norm == 0.0) { (*tau)[j] = 0.0; continue; }
-    const double alpha = A(j, j);
-    const double beta = alpha >= 0.0 ? -norm : norm;
-    const double t = (beta - alpha) / beta;
-    (*tau)[j] = t;
-    const double scale = alpha - beta;
-    v[j] = 1.0;
-    for (int i = j + 1; i < m; ++i) { A(i, j) /= scale; v[i] = A(i, j); }
-    A(j, j) = beta;
-    for (int c = j + 1; c < n; ++c) {
-      double dot = 0.0;
-      for (int i = j; i < m; ++i) dot += v[i] * A(i, c);
-      dot *= t;
-      for (int i = j; i < m; ++i) A(i, c) -= dot * v[i];
-    }
-  }
+  tau->assign(std::min(m, n), 0.0);
+  vgpu::hostdense::geqrf(A.v.data(), A.ld, m, n, tau->data());
 }
 
 // Overwrite the first n columns of A with the corresponding columns of Q.
 void orgqr(Mat& A, int m, int n, int k, const std::vector<double>& tau) {
-  std::vector<double> q((size_t)m * n, 0.0);
-  auto Q = [&](int r, int c) -> double& { return q[(size_t)c * m + r]; };
-  for (int c = 0; c < n; ++c) Q(c, c) = 1.0;
-  std::vector<double> v((size_t)m);
-  for (int j = k - 1; j >= 0; --j) {
-    v[j] = 1.0;
-    for (int i = j + 1; i < m; ++i) v[i] = A(i, j);
-    for (int c = 0; c < n; ++c) {
-      double dot = 0.0;
-      for (int i = j; i < m; ++i) dot += v[i] * Q(i, c);
-      dot *= tau[j];
-      for (int i = j; i < m; ++i) Q(i, c) -= dot * v[i];
-    }
-  }
-  for (int c = 0; c < n; ++c)
-    for (int r = 0; r < m; ++r) A(r, c) = Q(r, c);
+  vgpu::hostdense::orgqr(A.v.data(), A.ld, m, n, k, tau.data());
 }
 
 // C := op(Q) C  (left) or C op(Q)  (right), Q given by the reflectors in A.
 void ormqr(const Mat& A, Mat& C, int m, int n, int k, const std::vector<double>& tau, bool left,
            bool trans) {
-  const int rows = left ? m : n;  // length of each reflector's active span
-  std::vector<double> v((size_t)rows);
-  // Q = H(0) H(1) ... H(k-1); Q^T applies them in order, Q in reverse.
-  for (int s = 0; s < k; ++s) {
-    const int j = (left != trans) ? k - 1 - s : s;
-    for (int i = 0; i < rows; ++i) v[i] = i < j ? 0.0 : (i == j ? 1.0 : A(i, j));
-    if (left) {
-      for (int c = 0; c < n; ++c) {
-        double dot = 0.0;
-        for (int i = j; i < m; ++i) dot += v[i] * C(i, c);
-        dot *= tau[j];
-        for (int i = j; i < m; ++i) C(i, c) -= dot * v[i];
-      }
-    } else {
-      for (int r = 0; r < m; ++r) {
-        double dot = 0.0;
-        for (int i = j; i < n; ++i) dot += v[i] * C(r, i);
-        dot *= tau[j];
-        for (int i = j; i < n; ++i) C(r, i) -= dot * v[i];
-      }
-    }
-  }
+  vgpu::hostdense::ormqr(A.v.data(), A.ld, C.v.data(), C.ld, m, n, k, tau.data(), left, trans);
 }
 
 // What the last Jacobi solve on this thread did, for cusolverDnXsyevjGetSweeps

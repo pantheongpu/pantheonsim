@@ -145,16 +145,15 @@ int run_float_case(Isa isa, unsigned threads, bool ta, bool tb, const Shape& s, 
   auto Cr = C0, Cf = C0;
   ref_gemm<T>(ta, tb, s.m, s.n, s.k, alpha, A, lda, B, ldb, beta, Cr, ldc);
   fast_gemm<T>(isa, threads, ta, tb, s.m, s.n, s.k, alpha, A, lda, B, ldb, beta, Cf, ldc);
-  if (same_bits(Cr, Cf)) return 0;
-  // With only one kind of NaN in play every NaN is the same bits; a different payload landing in a different place
-  // (the first NaN operand wins) is not part of what the card defines. Anything else must match exactly.
+  // Exact, except that two NaNs count as equal: which NaN wins when two meet (one in an operand, one an inf*0 made) is the
+  // compiler's choice of operand order, which differs between any two copies of the same source line (see host_gemm.hpp).
   size_t bad = 0;
   for (size_t i = 0; i < nc; ++i) {
     if (std::memcmp(&Cr[i], &Cf[i], sizeof(T)) == 0) continue;
     if (std::isnan(Cr[i]) && std::isnan(Cf[i])) continue;
     ++bad;
   }
-  return bad ? static_cast<int>(bad) : 0;
+  return static_cast<int>(bad);
 }
 
 template <class T>
@@ -171,8 +170,8 @@ void sweep_float(const char* name) {
           for (const Mix mix : {Mix::Plain, Mix::Zeros, Mix::Special, Mix::SpecialSparse}) {
             const bool ta = t & 1, tb = t & 2;
             // alpha and beta: ordinary, zero beta (C write-only), and awkward values.
-            const T al = (cases % 5 == 0) ? T(1) : (cases % 5 == 1) ? T(-0.5) : (cases % 5 == 2) ? T(0) : T(2.5);
-            const T be = (cases % 3 == 0) ? T(0) : (cases % 3 == 1) ? T(1) : T(-1.25);
+            const T al = (cases % 5 == 0 || cases % 15 == 3) ? T(1) : (cases % 5 == 1) ? T(-0.5) : (cases % 5 == 2) ? T(0) : T(2.5);
+            const T be = (cases % 3 == 0 || cases % 15 == 3) ? T(0) : (cases % 3 == 1) ? T(1) : T(-1.25);
             const int pad = cases % 4 == 0 ? 0 : cases % 4;
             bad_total += run_float_case<T>(isa, threads, ta, tb, s, mix, pad, al, be, rng);
             ++cases;

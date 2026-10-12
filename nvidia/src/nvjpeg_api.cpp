@@ -57,6 +57,8 @@
 
 #include "capture_defer.hpp"
 
+#include "host_jpeg.hpp"
+#include "host_parallel.hpp"
 #include "nvjpeg_codec.hpp"
 
 namespace {
@@ -182,25 +184,9 @@ const double (*dct_basis())[8] {
 // on an RTX 3060 this was identical on all but 10 of 5.5 million decoded
 // samples across twenty test images, those within two counts: NVIDIA's
 // transform rounds differently inside, where the standard leaves it free to.
-void idct8x8(const int* in, uint8_t* out, int stride) {
-  const double(*cd)[8] = dct_basis();
-  float c[8][8];
-  for (int u = 0; u < 8; ++u) for (int x = 0; x < 8; ++x) c[u][x] = static_cast<float>(cd[u][x]);
-  float tmp[64];
-  for (int y = 0; y < 8; ++y)
-    for (int x = 0; x < 8; ++x) {
-      float s = 0;
-      for (int u = 0; u < 8; ++u) s = std::fmaf(c[u][x], static_cast<float>(in[y * 8 + u]), s);
-      tmp[y * 8 + x] = s;
-    }
-  for (int x = 0; x < 8; ++x)
-    for (int y = 0; y < 8; ++y) {
-      float s = 0;
-      for (int v = 0; v < 8; ++v) s = std::fmaf(c[v][y], tmp[v * 8 + x], s);
-      const float r = std::floor(s + 128.5f);
-      out[y * stride + x] = static_cast<uint8_t>(r < 0 ? 0 : (r > 255 ? 255 : r));
-    }
-}
+// (host_jpeg.hpp: the eight lanes of a row at once, the same chain of fused
+// steps in each.)
+void idct8x8(const int* in, uint8_t* out, int stride) { vgpu::hostjpeg::idct8x8(in, out, stride); }
 
 void fdct8x8(const double* in, double* out) {
   const double(*c)[8] = dct_basis();
@@ -394,16 +380,20 @@ struct ScanDecoder {
 };
 
 void finish_image(Image& im) {
-  int deq[64];
   for (Component& c : im.comps) {
     c.plane.assign(static_cast<size_t>(c.bw) * 8 * c.bh * 8, 0);
     const uint16_t* q = im.quant[c.tq];
-    for (int by = 0; by < c.bh; ++by)
+    // Rows of blocks are independent (each writes its own eight rows of the plane).
+    const int64_t rows = c.bh;
+    const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(c.bw) * static_cast<uint64_t>(c.bh) * 600u, rows);
+    vgpu::hostpar::parallel_for(threads, rows, [&](int64_t by) {
+      int deq[64];
       for (int bx = 0; bx < c.bw; ++bx) {
         const int16_t* b = c.coef.data() + (static_cast<size_t>(by) * c.bw + bx) * 64;
         for (int k = 0; k < 64; ++k) deq[kZigZag[k]] = b[k] * q[k];
         idct8x8(deq, c.plane.data() + static_cast<size_t>(by) * 8 * c.bw * 8 + bx * 8, c.bw * 8);
       }
+    });
     std::vector<int16_t>().swap(c.coef);
   }
 }
@@ -725,34 +715,70 @@ nvjpegStatus_t write_image(const Image& im, const OutputSpec& o, nvjpegImage_t* 
   // RGB at (x, y) of the image.
   const bool rgb_components = nc == 3 && (im.adobe == 0 || (!im.jfif && im.adobe < 0 && im.comps[0].id == 'R' &&
                                                             im.comps[1].id == 'G' && im.comps[2].id == 'B'));
-  const auto rgb_at = [&](int x, int y, uint8_t* r, uint8_t* g, uint8_t* b) {
+  // Rows of the converted image. A component's sample for output column x is sample()'s: the plane column
+  // x * h / hmax (clamped to the plane), so the columns are found once per component instead of per pixel.
+  std::vector<std::vector<int>> xmap(nc);
+  for (size_t c = 0; c < nc; ++c) {
+    const Component& co = im.comps[c];
+    xmap[c].resize(static_cast<size_t>(w));
+    for (int xx = 0; xx < w; ++xx) xmap[c][static_cast<size_t>(xx)] = std::min((x0 + xx) * co.h / im.hmax, co.bw * 8 - 1);
+  }
+  const auto fill_row = [&](size_t c, int y, uint8_t* dst) {
+    const Component& co = im.comps[c];
+    const int sy = std::min((y0 + y) * co.v / im.vmax, co.bh * 8 - 1);
+    const uint8_t* row = co.plane.data() + static_cast<size_t>(sy) * co.bw * 8;
+    const int* m = xmap[c].data();
+    for (int xx = 0; xx < w; ++xx) dst[xx] = row[m[xx]];
+  };
+  // Row y of the image as R, G, B (w values each); `tmp` is scratch of 3 * w bytes.
+  const auto rgb_row = [&](int y, uint8_t* r, uint8_t* g, uint8_t* b, uint8_t* tmp) {
+    uint8_t* const t1 = tmp + w;
+    uint8_t* const t2 = tmp + 2 * static_cast<size_t>(w);
     if (nc == 1) {
-      *r = *g = *b = sample(im, 0, x, y);
+      fill_row(0, y, r);
+      std::memcpy(g, r, static_cast<size_t>(w));
+      std::memcpy(b, r, static_cast<size_t>(w));
     } else if (nc == 3) {
       if (rgb_components) {
-        *r = sample(im, 0, x, y);
-        *g = sample(im, 1, x, y);
-        *b = sample(im, 2, x, y);
+        fill_row(0, y, r);
+        fill_row(1, y, g);
+        fill_row(2, y, b);
       } else {
-        ycbcr_to_rgb(sample(im, 0, x, y), sample(im, 1, x, y), sample(im, 2, x, y), r, g, b);
+        fill_row(0, y, tmp);
+        fill_row(1, y, t1);
+        fill_row(2, y, t2);
+        vgpu::hostjpeg::ycc_to_rgb(tmp, t1, t2, r, g, b, w);
       }
     } else {
       // CMYK as Adobe stores it (inverted): R = C * K / 255, rounding a
       // remainder of exactly half down, as NVIDIA's (measured on every
       // pixel of a gradient). YCCK is converted to CMY first.
-      int c = sample(im, 0, x, y), m = sample(im, 1, x, y), ye = sample(im, 2, x, y);
-      const int k = sample(im, 3, x, y);
+      fill_row(0, y, tmp);
+      fill_row(1, y, t1);
+      fill_row(2, y, t2);
+      std::vector<uint8_t> kk(static_cast<size_t>(w));
+      fill_row(3, y, kk.data());
       if (im.adobe == 2) {
-        uint8_t rr, gg, bb;
-        ycbcr_to_rgb(static_cast<float>(c), static_cast<float>(m), static_cast<float>(ye), &rr, &gg, &bb);
-        c = rr;
-        m = gg;
-        ye = bb;
+        for (int xx = 0; xx < w; ++xx) {
+          uint8_t rr, gg, bb;
+          ycbcr_to_rgb(static_cast<float>(tmp[xx]), static_cast<float>(t1[xx]), static_cast<float>(t2[xx]), &rr, &gg, &bb);
+          tmp[xx] = rr;
+          t1[xx] = gg;
+          t2[xx] = bb;
+        }
       }
-      *r = static_cast<uint8_t>((c * k + 126) / 255);
-      *g = static_cast<uint8_t>((m * k + 126) / 255);
-      *b = static_cast<uint8_t>((ye * k + 126) / 255);
+      for (int xx = 0; xx < w; ++xx) {
+        const int k = kk[static_cast<size_t>(xx)];
+        r[xx] = static_cast<uint8_t>((tmp[xx] * k + 126) / 255);
+        g[xx] = static_cast<uint8_t>((t1[xx] * k + 126) / 255);
+        b[xx] = static_cast<uint8_t>((t2[xx] * k + 126) / 255);
+      }
     }
+  };
+  // Rows are independent.
+  const auto for_rows = [&](auto&& fn) {
+    const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * 24u, h);
+    vgpu::hostpar::parallel_for(threads, h, [&](int64_t y) { fn(static_cast<int>(y)); });
   };
   switch (o.format) {
     case NVJPEG_OUTPUT_UNCHANGED:
@@ -769,17 +795,16 @@ nvjpegStatus_t write_image(const Image& im, const OutputSpec& o, nvjpegImage_t* 
     }
     case NVJPEG_OUTPUT_Y: {
       std::vector<uint8_t> plane(n);
-      for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-          uint8_t& out = plane[static_cast<size_t>(y) * w + x];
-          if (nc == 4 || rgb_components) {
-            uint8_t r, g, b;
-            rgb_at(x0 + x, y0 + y, &r, &g, &b);
-            out = to_byte(0.299f * r + 0.587f * g + 0.114f * b);
-          } else {
-            out = sample(im, 0, x0 + x, y0 + y);
-          }
+      for_rows([&](int y) {
+        uint8_t* out = plane.data() + static_cast<size_t>(y) * w;
+        if (nc == 4 || rgb_components) {
+          std::vector<uint8_t> r(static_cast<size_t>(w)), g(static_cast<size_t>(w)), b(static_cast<size_t>(w)), tmp(3 * static_cast<size_t>(w));
+          rgb_row(y, r.data(), g.data(), b.data(), tmp.data());
+          vgpu::hostjpeg::rgb_to_luma(r.data(), g.data(), b.data(), out, w);
+        } else {
+          fill_row(0, y, out);
         }
+      });
       return put_plane(dst->channel[0], dst->pitch[0], plane, w, h);
     }
     case NVJPEG_OUTPUT_RGB:
@@ -789,11 +814,11 @@ nvjpegStatus_t write_image(const Image& im, const OutputSpec& o, nvjpegImage_t* 
       const bool interleaved = o.format == NVJPEG_OUTPUT_RGBI || o.format == NVJPEG_OUTPUT_BGRI;
       const bool bgr = o.format == NVJPEG_OUTPUT_BGR || o.format == NVJPEG_OUTPUT_BGRI;
       std::vector<uint8_t> r(n), g(n), b(n);
-      for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-          const size_t at = static_cast<size_t>(y) * w + x;
-          rgb_at(x0 + x, y0 + y, &r[at], &g[at], &b[at]);
-        }
+      for_rows([&](int y) {
+        std::vector<uint8_t> tmp(3 * static_cast<size_t>(w));
+        const size_t at = static_cast<size_t>(y) * w;
+        rgb_row(y, &r[at], &g[at], &b[at], tmp.data());
+      });
       if (interleaved) {
         std::vector<uint8_t> il(n * 3);
         for (size_t at = 0; at < n; ++at) {

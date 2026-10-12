@@ -60,20 +60,23 @@ inline bool avx2_available() {
 #endif
 }
 
-// The loop the kernels replace, for products too small to be worth blocking.
+// One output's chain, the loop this replaces, for products too small to be worth blocking.
+//
+// A note on NaNs: when two NaNs meet in an addition or a product (a NaN operand and the default NaN of an inf*0 or inf-inf,
+// say), the hardware returns one of them -- the first operand's -- and which operand the compiler makes first is its own
+// choice, different between two copies of the same source line in one program (tests/unit/test_host_gemm.cpp shows it:
+// the reference loop and this one disagree on the sign of such a NaN depending on how the operand is indexed). So the sign
+// and payload of a NaN that is the result of two NaNs meeting were never fixed, here or in the loops this replaces; every
+// other bit of every result is, and a result is NaN exactly when it was.
 template <class T, class S>
-inline void naive_sums(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B,
-                       int64_t ldb, T* acc /* m x n, ld m */) {
-  for (int64_t j = 0; j < n; ++j)
-    for (int64_t i = 0; i < m; ++i) {
-      T s = T(0);
-      for (int64_t p = 0; p < k; ++p) {
-        const T a = static_cast<T>(ta ? A[p + i * lda] : A[i + p * lda]);
-        const T b = static_cast<T>(tb ? B[j + p * ldb] : B[p + j * ldb]);
-        s = s + a * b;
-      }
-      acc[i + j * m] = s;
-    }
+inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb) {
+  T acc = T(0);
+  for (int64_t p = 0; p < k; ++p) {
+    T a = static_cast<T>(ta ? A[p + i * lda] : A[i + p * lda]);
+    T b = static_cast<T>(tb ? B[j + p * ldb] : B[p + j * ldb]);
+    acc += a * b;
+  }
+  return acc;
 }
 
 // Computes every output's chain and hands it to epi(i, j, acc). T is the
@@ -89,11 +92,9 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
   const bool wide = false;
 #endif
   const uint64_t madds = static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k);
-  if (madds < 4096 || k == 0) {
-    std::vector<T> acc(static_cast<size_t>(m) * static_cast<size_t>(n));
-    naive_sums<T, S>(ta, tb, m, n, k, A, lda, B, ldb, acc.data());
+  if (madds < 4096 || k == 0) {   // too small to be worth blocking: the chains, one at a time
     for (int64_t j = 0; j < n; ++j)
-      for (int64_t i = 0; i < m; ++i) epi(i, j, acc[static_cast<size_t>(i + j * m)]);
+      for (int64_t i = 0; i < m; ++i) epi(i, j, chain_one<T, S>(ta, tb, i, j, k, A, lda, B, ldb));
     return;
   }
 
