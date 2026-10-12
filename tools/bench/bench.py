@@ -213,9 +213,16 @@ def ensure_binary(build, args, rel_nvcc):
     cmd = [nvcc, "-std=c++17", "-O2", "-arch=" + NVCC_ARCH, "-cudart", "shared",
            "-Xcompiler", "-ffp-contract=off", "-Wno-deprecated-gpu-targets"] + san + \
           [KERNEL_SRC, "-o", out + ".tmp"]
+    # Pinned: nothing from the caller's NVCC_*_FLAGS reaches the device code. Only a host compiler choice is kept
+    # (the user's -ccbin, else g++-12 for CUDA 12 as tests/shim_guard.sh does).
     env = dict(os.environ)
-    if int(rel[0].split(".")[0]) < 13 and not env.get("NVCC_PREPEND_FLAGS") and shutil.which("g++-12"):
-        env["NVCC_PREPEND_FLAGS"] = "-ccbin g++-12"  # same workaround as tests/shim_guard.sh
+    env.pop("NVCC_APPEND_FLAGS", None)
+    m = re.search(r"-ccbin[= ]\s*(\S+)", env.get("NVCC_PREPEND_FLAGS", ""))
+    env.pop("NVCC_PREPEND_FLAGS", None)
+    if m:
+        env["NVCC_PREPEND_FLAGS"] = "-ccbin " + m.group(1)
+    elif int(rel[0].split(".")[0]) < 13 and shutil.which("g++-12"):
+        env["NVCC_PREPEND_FLAGS"] = "-ccbin g++-12"
     t0 = time.monotonic()
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
@@ -224,6 +231,35 @@ def ensure_binary(build, args, rel_nvcc):
     print("bench: built %s with nvcc %s in %.1f s" % (os.path.basename(out), rel[1],
                                                        time.monotonic() - t0), file=sys.stderr)
     return out
+
+
+def fatbin_sha256(path):
+    """SHA-256 of the program's .nv_fatbin section (the device code nvcc produced), or None.
+
+    Read from the ELF section headers directly. Two compiles of one source give a bit-identical section (checked on
+    nvcc 12.0.140) even though the executables differ, so this says whether a toolchain produced the same SASS and
+    PTX as when the expected counters were written.
+    """
+    import struct
+    try:
+        with open(path, "rb") as f:
+            d = f.read()
+        if d[:4] != b"\x7fELF" or d[4] != 2:
+            return None
+        shoff, = struct.unpack_from("<Q", d, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+        def sec(i):
+            name, typ, flags, addr, off, size = struct.unpack_from("<IIQQQQ", d, shoff + i * shentsize)
+            return name, off, size
+        _, stroff, _ = sec(shstrndx)
+        for i in range(shnum):
+            name, off, size = sec(i)
+            end = d.index(b"\0", stroff + name)
+            if d[stroff + name:end] == b".nv_fatbin":
+                return hashlib.sha256(d[off:off + size]).hexdigest()
+    except (OSError, ValueError, struct.error, IndexError):
+        pass
+    return None
 
 
 def shim_sanitizer_flags(build):
@@ -878,12 +914,13 @@ def compact_counters(counts, names, engines):
     return out
 
 
-def write_expected(path, rel, args, names, engines, counts):
+def write_expected(path, rel, args, names, engines, counts, fatbin):
     doc = {
         "note": "Exact instruction counters of tools/bench/kernels/bench.cu workloads (size 'quick', "
                 "VGPU_THREADS=1), written by `tools/bench/bench.sh --update-expected`. Counts, never times. "
                 "They depend on the compiler that built the program, hence one file per CUDA release.",
         "toolkit": rel[0], "nvcc_version": rel[1], "gpu_profile": args.gpu, "compiled_arch": NVCC_ARCH,
+        "fatbin_sha256": fatbin,
         "size": "quick", "workloads": compact_counters(counts, names, engines),
     }
     with open(path, "w") as f:
@@ -1182,7 +1219,7 @@ def main():
         if args.update_expected:
             if not args.workloads and len(builds) == 1:
                 os.makedirs(EXPECTED_DIR, exist_ok=True)
-                write_expected(path, rel, args, names, engines, counts)
+                write_expected(path, rel, args, names, engines, counts, fatbin_sha256(binary))
                 print("wrote %s (%d workloads x %s)" % (os.path.relpath(path, ROOT), len(names), "+".join(engines)))
                 return 0
             die("--update-expected rewrites the whole file: run it with no --workloads/--ab")
@@ -1194,6 +1231,17 @@ def main():
                 print("FAIL: " + msg)
                 return 1
             print("SKIP: " + msg)
+            return 0
+        with open(path) as f:
+            want_fb = json.load(f).get("fatbin_sha256")
+        have_fb = fatbin_sha256(binary)
+        if want_fb != have_fb:
+            # Not a simulator change: this compiler produced different device code from the same source than the one
+            # the expected counts were written with (or the fingerprint could not be read). Counts of other code say
+            # nothing about the simulator, so this is a skip, never a failure.
+            print("SKIP: this nvcc (%s) built different device code (.nv_fatbin sha256 %s) than the %s counters were "
+                  "recorded from (%s); regenerate with --update-expected from a clean compile to enable the check here"
+                  % (rel[1], (have_fb or "unreadable")[:12], os.path.relpath(path, ROOT), (want_fb or "none")[:12]))
             return 0
         bad, extra, exp = check_counters(path, rel, names, engines, counts, args)
         dt = time.monotonic() - t_start

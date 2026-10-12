@@ -156,7 +156,15 @@ Counts depend on the program the toolkit's compiler built, so there is one
 expected file per CUDA release: `cuda-12.0.json` (nvcc 12.0.140, the Ubuntu
 `nvidia-cuda-toolkit` package that ci.yml's build job installs; the one on this machine reports the same version) and `cuda-13.0.json` (nvcc 13.0.88). The two differ (for
 example `int_alu` on SASS is 1120000 warp-instructions with 12.0 and 1120256
-with 13.0). On any other release the test **skips** with a message naming the
+with 13.0). The expected file also records the SHA-256 of the compiled program's
+`.nv_fatbin` section (the device code; bit-identical across fresh compiles of one
+source, checked twice with nvcc 12.0.140). If a toolchain builds different device
+code from the same source (another patch level, anything that changes ptxas'
+output), the fingerprint differs and the test **skips** with that message instead
+of comparing counts of different code; with a matching fingerprint a count that
+moved is a simulator change. The compile is pinned: nothing from the caller's
+`NVCC_APPEND_FLAGS`/`NVCC_PREPEND_FLAGS` reaches it except a `-ccbin`.
+On any other release the test **skips** with a message naming the
 releases it has; it does not guess. A change to the simulator that is meant to
 be bit- and counter-identical must leave this test green; a deliberate counting
 change regenerates the files (`--update-expected`) and says why in its commit.

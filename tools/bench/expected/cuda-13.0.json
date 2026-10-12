@@ -4,6 +4,7 @@
   "nvcc_version": "13.0.88",
   "gpu_profile": "nvidia/rtx3060",
   "compiled_arch": "sm_86",
+  "fatbin_sha256": "fc2eeb1c4aac0d74df09a1dde9fff2e168845e4a6dcf413722a07c626624f15a",
   "size": "quick",
   "workloads": {
     "int_alu": {
