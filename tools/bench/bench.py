@@ -62,6 +62,9 @@ WORKLOADS = {
     "startup": ("api", "context + module + one launch (process cost excluded from the device phase)"),
 }
 ENGINES = ("sass", "ptx")
+# The metric an A/B verdict and the rate columns use. Default: warp-instructions per CPU second. The launch and
+# API workloads are about calls per second, and startup is only its whole-process wall time.
+PRIMARY = {"launch": "units_per_s", "api": "units_per_s", "startup": "wall_s"}
 GPU_DEFAULT = "nvidia/rtx3060"  # sm_86: the arch bench.cu is compiled for (SASS and PTX)
 NVCC_ARCH = "sm_86"
 
@@ -663,7 +666,7 @@ def ab_compare(results):
                 if a["counters"].get(k) != b["counters"].get(k)}
         if a.get("duration_driven"):
             diff = {}  # a soak workload does as much work as fits its duration: counts are not comparable
-        key = "winst_per_cpu_s" if "winst_per_cpu_s" in a["stats"] else "units_per_s"
+        key = PRIMARY.get(w, "winst_per_cpu_s" if "winst_per_cpu_s" in a["stats"] else "units_per_s")
         if key not in a["stats"] or key not in b["stats"] or not a["stats"][key] or not b["stats"][key]:
             key = "wall_s"
         sa, sb = a["stats"][key], b["stats"][key]
@@ -784,21 +787,28 @@ def print_table(results, ab, out=sys.stdout):
         for lab in d:
             r = d[lab]
             st = r["stats"]
-            if "winst_per_cpu_s" in st:
-                med = "%9.2f" % (st["winst_per_cpu_s"]["median"] / 1e6)
-                best = "%9.2f" % (st["winst_per_cpu_s"]["best"] / 1e6)
-                spr = "%6.1f%%" % st["winst_per_cpu_s"]["spread_pct"]
+            key = PRIMARY.get(w, "winst_per_cpu_s")
+            if key == "winst_per_cpu_s" and key in st:
+                med = "%9.2f" % (st[key]["median"] / 1e6)
+                best = "%9.2f" % (st[key]["best"] / 1e6)
+                spr = "%6.1f%%" % st[key]["spread_pct"]
+                unit = ""
+            elif key == "units_per_s" and key in st:
+                med = "%9.1f" % (st[key]["median"] / 1e3)
+                best = "%9.1f" % (st[key]["best"] / 1e3)
+                spr = "%6.1f%%" % st[key]["spread_pct"]
+                unit = "columns are k %s/s" % r["unit"]
             else:
                 med = best = "        -"
-                spr = "%6.1f%%" % (st.get("units_per_s") or st["wall_s"])["spread_pct"]
+                spr = "%6.1f%%" % st["wall_s"]["spread_pct"]
+                unit = "wall time only"
             note = []
+            if unit:
+                note.append(unit)
             if r["fell_back_to_ptx"]:
                 note.append("SASS FELL BACK TO PTX")
             if len(d) > 1:
                 note.append("build " + lab)
-            if "units_per_s" in st:
-                note.append("%.1fk %s/s (best %.1fk)" % (st["units_per_s"]["median"] / 1e3, r["unit"],
-                                                        st["units_per_s"]["best"] / 1e3))
             print("%-14s %-4s %12d %s %s %7s %8.3f %8.3f %7.1f  %s" % (
                 w, e, r["counters"].get("instructions", 0), med, best, spr,
                 st["wall_s"]["median"], st["cpu_s"]["median"], st["rss_mb"]["median"],
@@ -806,7 +816,7 @@ def print_table(results, ab, out=sys.stdout):
     if ab:
         print("\nA/B, B relative to A (ratio > 1: B is faster). Metric: Minst/s, k units/s, or 1/wall.\n"
               "median/best = ratio of the medians / of the best runs; p = Mann-Whitney on the per-run values;\n"
-              "verdict needs p <= 0.05 and both ratios beyond 2%%, else 'same'.", file=out)
+              "verdict needs p <= 0.05 and both ratios beyond 2%, else 'same'.", file=out)
         h2 = "%-14s %-4s %-16s %9s %9s %8s %8s %6s  %-6s %s" % (
             "workload", "eng", "metric", "A med", "B med", "med B/A", "best B/A", "p", "verdict", "counters")
         print(h2, file=out)
@@ -829,16 +839,17 @@ def markdown_table(results, ab):
         if r["build"] != "A" and not ab:
             continue
         st = r["stats"]
-        if "winst_per_cpu_s" in st:
-            rate = "%.2f" % (st["winst_per_cpu_s"]["median"] / 1e6)
-            best = "%.2f" % (st["winst_per_cpu_s"]["best"] / 1e6)
-            spr = "%.1f%%" % st["winst_per_cpu_s"]["spread_pct"]
-        elif "units_per_s" in st:
-            rate = "%.1f k %s/s" % (st["units_per_s"]["median"] / 1e3, r["unit"])
-            best = "%.1f k" % (st["units_per_s"]["best"] / 1e3)
-            spr = "%.1f%%" % st["units_per_s"]["spread_pct"]
+        key = PRIMARY.get(r["workload"], "winst_per_cpu_s")
+        if key == "winst_per_cpu_s" and key in st:
+            rate = "%.2f" % (st[key]["median"] / 1e6)
+            best = "%.2f" % (st[key]["best"] / 1e6)
+            spr = "%.1f%%" % st[key]["spread_pct"]
+        elif key == "units_per_s" and key in st:
+            rate = "%.1f k %s/s" % (st[key]["median"] / 1e3, r["unit"])
+            best = "%.1f k" % (st[key]["best"] / 1e3)
+            spr = "%.1f%%" % st[key]["spread_pct"]
         else:
-            rate, best, spr = "-", "-", "-"
+            rate, best, spr = "wall only", "-", "%.1f%%" % st["wall_s"]["spread_pct"]
         print("| %s | %s%s | %d | %s | %s | %s | %.3f | %.1f |" % (
             r["workload"], r["engine"], (" (%s)" % r["build"]) if ab else "", r["counters"].get("instructions", 0),
             rate, best, spr, st["wall_s"]["median"], st["rss_mb"]["median"]), file=buf)
@@ -904,6 +915,8 @@ def check_counters(path, rel, names, engines, counts, args):
         exp = json.load(f)
     cur = compact_counters(counts, names, engines)
     bad = []
+    if exp.get("gpu_profile") != args.gpu:
+        bad.append("the expected counters were recorded on %s, this run used %s" % (exp.get("gpu_profile"), args.gpu))
     for w in names:
         for e in engines:
             want = exp.get("workloads", {}).get(w, {}).get(e)
