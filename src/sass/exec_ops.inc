@@ -1783,14 +1783,9 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
                   const uint64_t* addr, Mask lanes, uint32_t bytes) {
   const uint64_t n = static_cast<uint64_t>(std::popcount(lanes));
   if (!n) return;
-  std::vector<uint64_t> sectors;
-  each_lane(lanes, [&](unsigned l) {
-    for (uint64_t s = addr[l] / 32; s <= (addr[l] + bytes - 1) / 32; ++s) sectors.push_back(s);
-  });
-  std::sort(sectors.begin(), sectors.end());
-  const uint64_t distinct = static_cast<uint64_t>(std::unique(sectors.begin(), sectors.end()) - sectors.begin());
   switch (space) {
-    case 0:
+    case 0: {
+      const uint64_t distinct = distinct_sectors(addr, lanes, bytes);
       (store ? st.global_stores : st.global_loads) += n;
       (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
       st.global_sectors += distinct;
@@ -1799,6 +1794,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       ++(store ? st.global_requests_st : st.global_requests_ld);
       (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
       break;
+    }
     case 1: {
       (store ? st.shared_stores : st.shared_loads) += n;
       (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
@@ -1806,25 +1802,19 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       ++(store ? st.shared_requests_st : st.shared_requests_ld);
       // 32 banks of 4 bytes: lanes on different words of one bank take a
       // pass each; lanes on the same word share one.
-      std::vector<uint64_t> words[32];
-      each_lane(lanes, [&](unsigned l) {
-        for (uint64_t a = addr[l] & ~3ull; a < addr[l] + bytes; a += 4) words[(a / 4) % 32].push_back(a / 4);
-      });
-      uint64_t passes = 1;
-      for (auto& v : words) {
-        std::sort(v.begin(), v.end());
-        passes = std::max<uint64_t>(passes, static_cast<uint64_t>(std::unique(v.begin(), v.end()) - v.begin()));
-      }
+      const uint64_t passes = bank_passes(addr, lanes, bytes);
       st.shared_bank_conflicts += passes - 1;
       (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
       break;
     }
-    default:
+    default: {
+      const uint64_t distinct = distinct_sectors(addr, lanes, bytes);
       (store ? st.local_stores : st.local_loads) += n;
       (store ? st.local_bytes_written : st.local_bytes_read) += n * bytes;
       st.local_sectors += distinct;
       ++st.local_requests;
       break;
+    }
   }
 }
 
