@@ -331,8 +331,9 @@ class ApiCall {
   Domain domain_ = Domain::Runtime;
   bool outermost_ = false;       // a call made through another public call is not a call of its own
   bool hooked_ = false;
-  const void* saved_[16] = {};
-  uint16_t saved_sizes_[16] = {};
+  // Only read once name_ is set (a call somebody is listening to), which is also when they are written.
+  const void* saved_[16];
+  uint16_t saved_sizes_[16];
   const void* const* args_ = nullptr;
   const uint16_t* sizes_ = nullptr;
   int nargs_ = 0;

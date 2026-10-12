@@ -1190,6 +1190,8 @@ vgpu_unit_test(test_dsmem)
 vgpu_unit_test(test_barriers)
 # Dynamic parallelism at the PTX level.
 vgpu_unit_test(test_dynpar)
+# What a device remembers between launches gives the answers a device that remembers nothing gives.
+vgpu_unit_test(test_launch_cache)
 vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
@@ -3244,6 +3246,14 @@ if(TARGET vgpucudart)
   # The runtime and driver APIs sharing one simulated machine.
   add_test(NAME e2e_mixed_apis COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mixed_apis.sh)
   set_tests_properties(e2e_mixed_apis PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # What the runtime and driver remember between launches never shows: the same
+  # results and errors with and without it, across loads, unloads and resets.
+  add_test(NAME e2e_launch_cache COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_cache.sh)
+  set_tests_properties(e2e_launch_cache PROPERTIES
     DEPENDS "vgpucudart;vgpucuda"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
