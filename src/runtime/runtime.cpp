@@ -360,6 +360,8 @@ uint64_t Device::load_module(const std::string& ptx_src) {
     lm.lazy = std::move(lazy);
     uint64_t id = lm.id;
     modules_.push_back(std::move(lm));
+    module_index_[id] = &modules_.back();
+    forget_kernel_table();
     return id;
   } catch (const Error& e) {
     if (e.code() == Err::UnsupportedPtx)
@@ -427,10 +429,13 @@ uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
     lm.symbols[e.name] = va;
     lm.kernels.emplace_back(va, &e);
   }
+  for (size_t i = 0; i < mod->entries.size(); ++i) lm.entry_index.emplace(mod->entries[i].name, i);   // the first of a name stays
   lm.mod = std::move(mod);
   lm.sass = std::move(sm);
   const uint64_t id = lm.id;
   modules_.push_back(std::move(lm));
+  module_index_[id] = &modules_.back();
+  forget_kernel_table();
   return id;
 }
 
@@ -449,7 +454,10 @@ void Device::unload_module(uint64_t module_id) {
     if (it->id == module_id) {
       for (uint64_t va : it->global_vas) mem_.free(va);
       if (it->sass) sass::unload(*it->sass, mem_);
+      module_index_.erase(module_id);
       modules_.erase(it);
+      unload_epoch_.fetch_add(1, std::memory_order_release);
+      forget_kernel_table();
       return;
     }
   }
@@ -457,10 +465,9 @@ void Device::unload_module(uint64_t module_id) {
 }
 
 int Device::module_arch(uint64_t module_id) const {
-  for (const auto& lm : modules_) {
-    if (lm.id != module_id) continue;
+  if (const LoadedModule* lm = find_module(module_id)) {
     // ".target sm_86" -- and it may carry more, as in ".target sm_86, debug".
-    const std::string& t = lm.mod->target;
+    const std::string& t = lm->mod->target;
     const size_t at = t.find("sm_");
     if (at == std::string::npos) return 0;
     int v = 0;
@@ -471,10 +478,15 @@ int Device::module_arch(uint64_t module_id) const {
 }
 
 const ptx::EntryFn* Device::get_function(uint64_t module_id, const std::string& name) const {
-  for (auto& lm : modules_) {
-    if (lm.id != module_id) continue;
+  if (LoadedModule* found = find_module(module_id)) {
+    LoadedModule& lm = *found;
     if (lm.lazy) return lazy_function(lm, name);
-    const ptx::EntryFn* fn = lm.mod->find_entry(name);
+    const ptx::EntryFn* fn = nullptr;
+    if (!lm.entry_index.empty()) {
+      if (const auto it = lm.entry_index.find(name); it != lm.entry_index.end()) fn = &lm.mod->entries[it->second];
+    } else {
+      fn = lm.mod->find_entry(name);
+    }
     if (!fn) {
       std::string names;
       for (const auto& e : lm.mod->entries) names += "\n  " + e.name;
@@ -535,6 +547,7 @@ const ptx::EntryFn* Device::lazy_function(LoadedModule& lm, const std::string& n
   fn.module_entry_names = lz.entry_order;
   for (auto& [va, k] : lm.kernels)
     if (!k && va == lm.symbols.at(name)) k = &fn;
+  forget_kernel_table();
   lz.parsed.emplace(name, part);
   // The kernels this one launches from the device (dynamic parallelism) have
   // to be in the launch's kernel table, so they are parsed now too.
@@ -547,8 +560,7 @@ const ptx::EntryFn* Device::lazy_function(LoadedModule& lm, const std::string& n
 }
 
 const exec::SymbolTable* Device::symbols(uint64_t module_id) const {
-  for (const auto& lm : modules_)
-    if (lm.id == module_id) return &lm.symbols;
+  if (const LoadedModule* lm = find_module(module_id)) return &lm->symbols;
   throw Error::make(Err::NotFound, "module handle ", module_id, " is not loaded on device ", ordinal_);
 }
 
@@ -1002,6 +1014,7 @@ class FaultHook final : public MemoryManager::AccessFault {
 Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemetry, int physical)
     : profile_(std::move(profile)), ordinal_(ordinal), physical_(physical < 0 ? ordinal : physical),
       mem_(profile_.vram_bytes, static_cast<uint32_t>(physical_)), telemetry_(telemetry) {
+  if (const char* c = std::getenv("VGPU_LAUNCH_CACHE"); c && c[0] == '0' && c[1] == 0) launch_cache_ = false;
   // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
   // set_page_size says what that lets a kernel read).
   if (profile_.vendor == "amd") mem_.set_page_size(4096);
@@ -1027,6 +1040,27 @@ void Device::install_fault_hook() {
   }
 }
 
+std::shared_ptr<const exec::KernelTable> Device::kernel_table() const {
+  std::lock_guard<std::mutex> lock(kernel_table_mu_);
+  if (kernel_table_) return kernel_table_;
+  auto table = std::make_shared<exec::KernelTable>();
+  for (const auto& lm : modules_) {
+    const int arch = lm.mod ? target_arch(lm.mod->target) : 0;
+    for (const auto& [va, fn] : lm.kernels)
+      if (fn) (*table)[va] = exec::KernelRef{fn, &lm.symbols, arch};
+  }
+  if (!launch_cache_) return table;   // VGPU_LAUNCH_CACHE=0: built for this launch alone, as it always was
+  kernel_table_ = std::move(table);
+  return kernel_table_;
+}
+
+// Called after anything that changes what kernel_table() would hold. After,
+// not before: a table built while the change was being made is dropped too.
+void Device::forget_kernel_table() const {
+  std::lock_guard<std::mutex> lock(kernel_table_mu_);
+  kernel_table_.reset();
+}
+
 void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
                     const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
   // Texture objects belong to the device, so the launch does not have to be
@@ -1037,14 +1071,10 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   cfg.device_count = device_count_;
   if (!cfg.textures && !textures_.empty()) cfg.textures = &textures_;
   // Every kernel loaded on the device, for the child grids a kernel launches.
-  exec::KernelTable kernels;
+  std::shared_ptr<const exec::KernelTable> kernels;
   if (!cfg.kernels) {
-    for (const auto& lm : modules_) {
-      const int arch = lm.mod ? target_arch(lm.mod->target) : 0;
-      for (const auto& [va, fn] : lm.kernels)
-        if (fn) kernels[va] = exec::KernelRef{fn, &lm.symbols, arch};
-    }
-    cfg.kernels = &kernels;
+    kernels = kernel_table();
+    cfg.kernels = kernels.get();
   }
   if (fault_) {
     fault_->check_lost(fn.name);

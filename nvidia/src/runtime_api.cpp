@@ -133,6 +133,14 @@ struct KernelInfo {
   std::string entry_name;
   bool nonportable_cluster = false;   // cudaFuncAttributeNonPortableClusterSizeAllowed
   bool load_told = false;             // a profiler has been told what loading this kernel cost
+  // The function this kernel resolved to on each of the first few devices, and what it was resolved
+  // against (resolved_function below). Finding it is a search of the module's entries by name.
+  struct Resolved {
+    uint64_t module_id = 0;     // 0: nothing cached
+    uint64_t unload_epoch = 0;
+    const vgpu::ptx::EntryFn* fn = nullptr;
+  };
+  Resolved resolved[4];
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -575,6 +583,25 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
 }
 
 vgpu::runtime::Device& current(State& s) { return s.rt->device(t_current_device); }
+
+// The function of a registered kernel in module `mid` on `dev` (the device the module was loaded on, which is the
+// calling thread's current one): what dev.get_function(mid, ki.entry_name) answers, remembered. get_function searches
+// the module's entries by name, and a program with thousands of kernels loaded launches them over and over. What is
+// remembered is good for as long as the module id is the same (ids are never reused: cudaDeviceReset gives the
+// kernel a new module) and the device has unloaded no module since (Device::unload_epoch), and any other case asks
+// the device again, which fails exactly as it did when the module is gone.
+const vgpu::ptx::EntryFn* resolved_function(vgpu::runtime::Device& dev, KernelInfo& ki, uint64_t mid) {
+  if (!dev.launch_cache()) return dev.get_function(mid, ki.entry_name);   // VGPU_LAUNCH_CACHE=0
+  const unsigned slot = static_cast<unsigned>(t_current_device);
+  const uint64_t epoch = dev.unload_epoch();
+  if (slot < std::size(ki.resolved)) {
+    const KernelInfo::Resolved& r = ki.resolved[slot];
+    if (r.module_id == mid && r.unload_epoch == epoch) return r.fn;
+  }
+  const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+  if (slot < std::size(ki.resolved)) ki.resolved[slot] = {mid, epoch, fn};
+  return fn;
+}
 
 // The memory of whichever device owns this pointer. Device VA windows are
 // disjoint, so the address alone identifies the owner; falling back to the
@@ -1471,7 +1498,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     const uint64_t load_start = profiling ? vgpu::profiling::host_ns() : 0;
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
-    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    const vgpu::ptx::EntryFn* fn = resolved_function(dev, ki, mid);
     // The first launch of a kernel loads it (a lazily loaded function, on the card),
     // which a profiler is told as the cost of the launch that caused it.
     if (profiling && !ki.load_told) {
@@ -1504,12 +1531,14 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
         return cudaErrorInvalidValue;
       }
     }
-    std::vector<uint32_t> param_sizes(fn->params.size());
-    for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
-    // Under stream capture the launch is recorded for later replay, not run.
-    if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes,
-                                        cooperative, cluster))
-      return cudaSuccess;
+    // Under stream capture the launch is recorded for later replay, not run. (The sizes are only for that.)
+    if (capture_active(stream)) {
+      std::vector<uint32_t> param_sizes(fn->params.size());
+      for (size_t i = 0; i < fn->params.size(); ++i) param_sizes[i] = fn->params[i].size;
+      if (vgpu_record_launch_if_capturing(func, gridDim, blockDim, args, sharedMem, stream, param_sizes,
+                                          cooperative, cluster))
+        return cudaSuccess;
+    }
     if (std::strcmp(api, "cudaGraphLaunch") != 0) announce_module_profiled(*ki.mod, t_current_device);
 
     if (vgpu::faults::should_fail(vgpu::faults::Op::Launch)) {
@@ -1521,8 +1550,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
 
     std::vector<std::vector<uint8_t>> kargs(fn->params.size());
     for (size_t i = 0; i < fn->params.size(); ++i) {
-      kargs[i].resize(param_sizes[i]);
-      std::memcpy(kargs[i].data(), args[i], param_sizes[i]);
+      kargs[i].resize(fn->params[i].size);
+      std::memcpy(kargs[i].data(), args[i], fn->params[i].size);
     }
     vgpu::exec::LaunchConfig cfg;
     cfg.grid = {gridDim.x, gridDim.y, gridDim.z};
@@ -2191,7 +2220,7 @@ static cudaError_t cudaFuncGetAttributes_body(cudaFuncAttributes* attr, const vo
     }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
-    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    const vgpu::ptx::EntryFn* fn = resolved_function(dev, ki, mid);
     const vgpu::DeviceProfile& p = dev.profile();
     auto res = vgpu::exec::kernel_resources(*fn, p, p.limits.max_threads_per_block, 0);
     std::memset(a, 0, sizeof *a);
@@ -2240,7 +2269,7 @@ static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced(int* num
     }
     uint64_t mid = module_on_current(s, *ki.mod);
     vgpu::runtime::Device& dev = current(s);
-    const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+    const vgpu::ptx::EntryFn* fn = resolved_function(dev, ki, mid);
     auto res = vgpu::exec::kernel_resources(*fn, dev.profile(),
                                             static_cast<uint32_t>(blockSize),
                                             static_cast<uint32_t>(dynamicSMemSize));
@@ -2306,7 +2335,7 @@ static cudaError_t cluster_occupancy_query(const char* api, bool active, int* ou
     if (vgpu::exec::supports_clusters(p)) {
       if (!ki.mod || !registered_ptx(s, *ki.mod)) return cudaErrorInvalidDeviceFunction;
       const uint64_t mid = module_on_current(s, *ki.mod);
-      const vgpu::ptx::EntryFn* fn = dev.get_function(mid, ki.entry_name);
+      const vgpu::ptx::EntryFn* fn = resolved_function(dev, ki, mid);
       required = fn->req_cluster;
       const uint64_t threads = uint64_t{config->blockDim.x} * config->blockDim.y * config->blockDim.z;
       if (threads == 0 || threads > p.limits.max_threads_per_block) return cudaErrorInvalidValue;
@@ -2361,7 +2390,8 @@ cudaError_t kernel_function(State& s, const void* func, const char* api, const v
     if (!quiet()) std::fprintf(stderr, "[vgpu] %s: kernel '%s' has no PTX in its fatbin\n", api, ki.entry_name.c_str());
     return cudaErrorInvalidDeviceFunction;
   }
-  *fn = current(s).get_function(module_on_current(s, *ki.mod), ki.entry_name);
+  vgpu::runtime::Device& dev = current(s);
+  *fn = resolved_function(dev, ki, module_on_current(s, *ki.mod));
   return cudaSuccess;
 }
 }  // namespace

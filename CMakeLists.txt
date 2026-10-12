@@ -1190,6 +1190,8 @@ vgpu_unit_test(test_dsmem)
 vgpu_unit_test(test_barriers)
 # Dynamic parallelism at the PTX level.
 vgpu_unit_test(test_dynpar)
+# What a device remembers between launches gives the answers a device that remembers nothing gives.
+vgpu_unit_test(test_launch_cache)
 vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
