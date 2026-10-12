@@ -257,9 +257,15 @@ struct H264Encoder::Impl {
     rp.stride = W + 2 * kPad;
     const size_t n = static_cast<size_t>(rp.stride) * (H + 2 * kPad);
     rp.g.assign(n, 0);
-    for (int y = -kPad; y < H + kPad; ++y)
-      for (int x = -kPad; x < W + kPad; ++x)
-        rp.g[static_cast<size_t>(y + kPad) * rp.stride + (x + kPad)] = f.y[static_cast<size_t>(row0 + step * clip3(0, H - 1, y)) * f.stride_y + clip3(0, W - 1, x)];
+    {
+      std::vector<int> xi(static_cast<size_t>(rp.stride));   // the source column of each padded column
+      for (int x = -kPad; x < W + kPad; ++x) xi[static_cast<size_t>(x + kPad)] = clip3(0, W - 1, x);
+      for (int y = -kPad; y < H + kPad; ++y) {
+        const uint8_t* src = &f.y[static_cast<size_t>(row0 + step * clip3(0, H - 1, y)) * f.stride_y];
+        uint8_t* dst = &rp.g[static_cast<size_t>(y + kPad) * rp.stride];
+        for (int x = 0; x < rp.stride; ++x) dst[x] = src[xi[static_cast<size_t>(x)]];
+      }
+    }
     r.u.resize(static_cast<size_t>(cs) * mh * 8);
     r.v.resize(r.u.size());
     for (int y = 0; y < mh * 8; ++y) {
@@ -267,25 +273,43 @@ struct H264Encoder::Impl {
       std::memcpy(&r.v[static_cast<size_t>(y) * cs], &f.v[static_cast<size_t>(row0 + step * y) * f.stride_c], static_cast<size_t>(cs));
     }
     const int PW = rp.stride, PH = H + 2 * kPad;
-    auto G = [&](int x, int y) { return static_cast<int>(rp.g[static_cast<size_t>(clip3(0, PH - 1, y)) * PW + clip3(0, PW - 1, x)]); };
+    // The 6-tap filter along a row or a column of the padded plane, a tap beyond the plane taking the plane's edge sample. Rows and
+    // columns away from the edge (the plane is 48 samples wider than the picture on each side) take the direct form.
     std::vector<int16_t> b1(n);   // horizontal intermediate values
     rp.hh.assign(n, 0);
     rp.vv.assign(n, 0);
     rp.jj.assign(n, 0);
-    for (int y = 0; y < PH; ++y)
+    auto GR = [&](const uint8_t* row, int x) { return static_cast<int>(row[clip3(0, PW - 1, x)]); };   // a clamped tap along a row
+    for (int y = 0; y < PH; ++y) {
+      const uint8_t* row = &rp.g[static_cast<size_t>(y) * PW];
+      int16_t* b1r = &b1[static_cast<size_t>(y) * PW];
+      uint8_t* hhr = &rp.hh[static_cast<size_t>(y) * PW];
       for (int x = 0; x < PW; ++x) {
-        const int v = G(x - 2, y) - 5 * G(x - 1, y) + 20 * G(x, y) + 20 * G(x + 1, y) - 5 * G(x + 2, y) + G(x + 3, y);
-        b1[static_cast<size_t>(y) * PW + x] = static_cast<int16_t>(v);
-        rp.hh[static_cast<size_t>(y) * PW + x] = clip1((v + 16) >> 5);
-        const int u = G(x, y - 2) - 5 * G(x, y - 1) + 20 * G(x, y) + 20 * G(x, y + 1) - 5 * G(x, y + 2) + G(x, y + 3);
-        rp.vv[static_cast<size_t>(y) * PW + x] = clip1((u + 16) >> 5);
+        int v;
+        if (x >= 2 && x + 3 < PW) v = row[x - 2] - 5 * row[x - 1] + 20 * row[x] + 20 * row[x + 1] - 5 * row[x + 2] + row[x + 3];
+        else v = GR(row, x - 2) - 5 * GR(row, x - 1) + 20 * GR(row, x) + 20 * GR(row, x + 1) - 5 * GR(row, x + 2) + GR(row, x + 3);
+        b1r[x] = static_cast<int16_t>(v);
+        hhr[x] = clip1((v + 16) >> 5);
       }
-    auto B1 = [&](int x, int y) { return static_cast<int>(b1[static_cast<size_t>(clip3(0, PH - 1, y)) * PW + x]); };
-    for (int y = 0; y < PH; ++y)
+    }
+    for (int y = 0; y < PH; ++y) {
+      const uint8_t* rows[6];   // rows y-2 .. y+3, clamped
+      for (int k = 0; k < 6; ++k) rows[k] = &rp.g[static_cast<size_t>(clip3(0, PH - 1, y - 2 + k)) * PW];
+      uint8_t* vvr = &rp.vv[static_cast<size_t>(y) * PW];
       for (int x = 0; x < PW; ++x) {
-        const int j1 = B1(x, y - 2) - 5 * B1(x, y - 1) + 20 * B1(x, y) + 20 * B1(x, y + 1) - 5 * B1(x, y + 2) + B1(x, y + 3);
-        rp.jj[static_cast<size_t>(y) * PW + x] = clip1((j1 + 512) >> 10);
+        const int u = rows[0][x] - 5 * rows[1][x] + 20 * rows[2][x] + 20 * rows[3][x] - 5 * rows[4][x] + rows[5][x];
+        vvr[x] = clip1((u + 16) >> 5);
       }
+    }
+    for (int y = 0; y < PH; ++y) {
+      const int16_t* rows[6];
+      for (int k = 0; k < 6; ++k) rows[k] = &b1[static_cast<size_t>(clip3(0, PH - 1, y - 2 + k)) * PW];
+      uint8_t* jjr = &rp.jj[static_cast<size_t>(y) * PW];
+      for (int x = 0; x < PW; ++x) {
+        const int j1 = rows[0][x] - 5 * rows[1][x] + 20 * rows[2][x] + 20 * rows[3][x] - 5 * rows[4][x] + rows[5][x];
+        jjr[x] = clip1((j1 + 512) >> 10);
+      }
+    }
   }
 
   // The luma prediction of the bw x bh block at (px, py) of the picture, from reference r at quarter-sample vector (vx, vy), into out (stride `stride`).
@@ -293,6 +317,43 @@ struct H264Encoder::Impl {
     const RefPlanes& rp = r.rp;
     const int fx = vx & 3, fy = vy & 3;
     const int X0 = px + (vx >> 2), Y0 = py + (vy >> 2);
+    if (X0 >= -kPad && X0 + bw_ <= rp.w + kPad - 1 && Y0 >= -kPad && Y0 + bh_ <= rp.h + kPad - 1) {
+      // Every sample the block touches (up to one beyond it) is in the padded plane: no clamping.
+      const size_t st = static_cast<size_t>(rp.stride);
+      const size_t at0 = static_cast<size_t>(Y0 + kPad) * st + static_cast<size_t>(X0 + kPad);
+      const uint8_t *G = rp.g.data() + at0, *Hh = rp.hh.data() + at0, *Vv = rp.vv.data() + at0, *Jj = rp.jj.data() + at0;
+      for (int y = 0; y < bh_; ++y) {
+        const size_t o = static_cast<size_t>(y) * st;
+        for (int x = 0; x < bw_; ++x) {
+          const size_t q = o + static_cast<size_t>(x);
+          auto g = [&](int dx, int dy) { return static_cast<int>(G[q + dy * static_cast<ptrdiff_t>(st) + dx]); };
+          auto b = [&](int dy) { return static_cast<int>(Hh[q + dy * static_cast<ptrdiff_t>(st)]); };
+          auto hv = [&](int dx) { return static_cast<int>(Vv[q + dx]); };
+          const int j = Jj[q];
+          int v;
+          switch (fy * 4 + fx) {
+            case 0: v = g(0, 0); break;
+            case 1: v = (g(0, 0) + b(0) + 1) >> 1; break;
+            case 2: v = b(0); break;
+            case 3: v = (b(0) + g(1, 0) + 1) >> 1; break;
+            case 4: v = (g(0, 0) + hv(0) + 1) >> 1; break;
+            case 5: v = (b(0) + hv(0) + 1) >> 1; break;
+            case 6: v = (b(0) + j + 1) >> 1; break;
+            case 7: v = (b(0) + hv(1) + 1) >> 1; break;
+            case 8: v = hv(0); break;
+            case 9: v = (hv(0) + j + 1) >> 1; break;
+            case 10: v = j; break;
+            case 11: v = (j + hv(1) + 1) >> 1; break;
+            case 12: v = (hv(0) + g(0, 1) + 1) >> 1; break;
+            case 13: v = (hv(0) + b(1) + 1) >> 1; break;
+            case 14: v = (j + b(1) + 1) >> 1; break;
+            default: v = (hv(1) + b(1) + 1) >> 1; break;
+          }
+          out[y * stride + x] = static_cast<uint8_t>(v);
+        }
+      }
+      return;
+    }
     for (int y = 0; y < bh_; ++y)
       for (int x = 0; x < bw_; ++x) {
         const int X = X0 + x, Y = Y0 + y;
@@ -329,9 +390,20 @@ struct H264Encoder::Impl {
     const int fx = vx & 7, fy = vy & 7;
     const int X0 = px / 2 + (vx >> 3), Y0 = py / 2 + (vy >> 3);
     const int W = mw * 8, H = mh * 8;
+    const bool inside = X0 >= 0 && Y0 >= 0 && X0 + bw_ / 2 + 1 <= W && Y0 + bh_ / 2 + 1 <= H;   // the taps one beyond the block are in the plane
     for (int c = 0; c < 2; ++c) {
       const std::vector<uint8_t>& p = c ? r.v : r.u;
       uint8_t* out = c ? out_v : out_u;
+      if (inside) {
+        const int w00 = (8 - fx) * (8 - fy), w10 = fx * (8 - fy), w01 = (8 - fx) * fy, w11 = fx * fy;
+        for (int y = 0; y < bh_ / 2; ++y) {
+          const uint8_t* r0 = &p[static_cast<size_t>(Y0 + y) * cs + X0];
+          const uint8_t* r1 = r0 + cs;
+          for (int x = 0; x < bw_ / 2; ++x)
+            out[y * stride + x] = static_cast<uint8_t>((w00 * r0[x] + w10 * r0[x + 1] + w01 * r1[x] + w11 * r1[x + 1] + 32) >> 6);
+        }
+        continue;
+      }
       for (int y = 0; y < bh_ / 2; ++y)
         for (int x = 0; x < bw_ / 2; ++x) {
           auto at = [&](int dx, int dy) { return static_cast<int>(p[static_cast<size_t>(clip3(0, H - 1, Y0 + y + dy)) * cs + clip3(0, W - 1, X0 + x + dx)]); };

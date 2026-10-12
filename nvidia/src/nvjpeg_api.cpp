@@ -57,6 +57,8 @@
 
 #include "capture_defer.hpp"
 
+#include "host_jpeg.hpp"
+#include "host_parallel.hpp"
 #include "nvjpeg_codec.hpp"
 
 namespace {
@@ -81,6 +83,8 @@ struct HuffTable {
   uint8_t values[256] = {0};
   int mincode[17] = {0}, maxcode[18] = {0}, valptr[17] = {0};
   bool present = false;
+  // The walk's answer for every 9-bit prefix whose code is at most 9 bits long: (length << 8) | value, 0 where it is longer.
+  uint16_t lut[512] = {0};
 
   void build() {
     int code = 0, k = 0;
@@ -95,21 +99,36 @@ struct HuffTable {
     }
     maxcode[17] = 0x7FFFFFFF;
     present = true;
+    for (int v = 0; v < 512; ++v) {
+      lut[v] = 0;
+      for (int l = 1; l <= 9; ++l) {
+        const int c = v >> (9 - l);
+        if (maxcode[l] < 0 || c > maxcode[l]) continue;
+        const int idx = valptr[l] + c - mincode[l];
+        lut[v] = static_cast<uint16_t>((l << 8) | (idx >= 0 && idx < 256 ? values[idx] : 0));
+        break;
+      }
+    }
   }
 };
 
-// Reads entropy-coded data a bit at a time, unstuffing the 0xFF 0x00 pairs the
-// standard requires. Past the end of the data -- a scan cut short -- it reads
+// Reads entropy-coded data, unstuffing the 0xFF 0x00 pairs the standard
+// requires. Past the end of the data -- a scan cut short -- it reads
 // zeros, as a decoder must: NVIDIA's decodes a file truncated inside its
 // entropy-coded data and reports success.
+//
+// Bytes are taken into a 64-bit buffer ahead of the bits that are read, so a code is found from a peek at the next 16 bits
+// instead of one bit at a time. Taking them ahead moves `p` further than a byte-at-a-time reader would have, but never past a
+// marker (a marker ends the data: zeros are read in its place and p stays on it), and restart() looks for the next restart
+// marker from p, so it finds the marker the byte-at-a-time reader finds.
 struct BitReader {
   const uint8_t* p;
   const uint8_t* end;
-  uint32_t buf = 0;
-  int count = 0;
+  uint64_t acc = 0;   // the unread bits are its low `n`
+  int n = 0;
 
-  int bit() {
-    if (count == 0) {
+  void fill() {
+    while (n <= 56) {
       uint8_t b = 0;
       if (p < end) {
         b = *p;
@@ -123,36 +142,45 @@ struct BitReader {
           ++p;
         }
       }
-      buf = b;
-      count = 8;
+      acc = (acc << 8) | b;
+      n += 8;
     }
-    --count;
-    return (buf >> count) & 1;
   }
-  int bits(int n) {
-    if (n <= 0 || n > 16) return 0;
-    int v = 0;
-    for (int i = 0; i < n; ++i) v = (v << 1) | bit();
-    return v;
+  int bit() {
+    if (n < 1) fill();
+    --n;
+    return static_cast<int>((acc >> n) & 1);
+  }
+  int bits(int k) {
+    if (k <= 0 || k > 16) return 0;
+    if (n < k) fill();
+    n -= k;
+    return static_cast<int>((acc >> n) & ((1u << k) - 1));
   }
   // At a restart interval: drop the remaining bits and step over the RSTn.
   void restart() {
-    count = 0;
+    n = 0;
     while (p + 1 < end && !(p[0] == 0xFF && p[1] >= 0xD0 && p[1] <= 0xD7)) ++p;
     if (p + 1 < end) p += 2;
   }
 };
 
 int huff_decode(BitReader& br, const HuffTable& t) {
-  int code = br.bit();
-  int l = 1;
-  while (l <= 16 && (t.maxcode[l] < 0 || code > t.maxcode[l])) {
-    code = (code << 1) | br.bit();
-    ++l;
+  if (br.n < 17) br.fill();
+  const unsigned peek = static_cast<unsigned>((br.acc >> (br.n - 16)) & 0xFFFF);
+  if (const unsigned e = t.lut[peek >> 7]) {
+    br.n -= static_cast<int>(e >> 8);
+    return static_cast<int>(e & 0xFF);
   }
-  if (l > 16) return 0;
-  const int idx = t.valptr[l] + code - t.mincode[l];
-  return idx >= 0 && idx < 256 ? t.values[idx] : 0;
+  for (int l = 10; l <= 16; ++l) {
+    const int code = static_cast<int>(peek >> (16 - l));
+    if (t.maxcode[l] < 0 || code > t.maxcode[l]) continue;
+    br.n -= l;
+    const int idx = t.valptr[l] + code - t.mincode[l];
+    return idx >= 0 && idx < 256 ? t.values[idx] : 0;
+  }
+  br.n -= 17;   // no code of up to 16 bits: the walk has read 17 bits when it gives up
+  return 0;
 }
 
 // The sign convention of JPEG's variable-length integers: values whose top bit
@@ -166,58 +194,16 @@ int extend(int v, int n) {
 // a corrupt file from overflowing the dequantisation multiply.
 int16_t clamp16(int v) { return static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v)); }
 
-const double (*dct_basis())[8] {
-  static double c[8][8];
-  static std::once_flag once;
-  std::call_once(once, [] {
-    for (int u = 0; u < 8; ++u)
-      for (int x = 0; x < 8; ++x)
-        c[u][x] = (u == 0 ? std::sqrt(0.125) : 0.5) * std::cos((2 * x + 1) * u * M_PI / 16.0);
-  });
-  return c;
-}
-
 // Separable inverse DCT in single precision with fused multiply-adds, level
 // shifted and rounded half up, as a GPU computes one. Against NVIDIA's decoder
 // on an RTX 3060 this was identical on all but 10 of 5.5 million decoded
 // samples across twenty test images, those within two counts: NVIDIA's
 // transform rounds differently inside, where the standard leaves it free to.
-void idct8x8(const int* in, uint8_t* out, int stride) {
-  const double(*cd)[8] = dct_basis();
-  float c[8][8];
-  for (int u = 0; u < 8; ++u) for (int x = 0; x < 8; ++x) c[u][x] = static_cast<float>(cd[u][x]);
-  float tmp[64];
-  for (int y = 0; y < 8; ++y)
-    for (int x = 0; x < 8; ++x) {
-      float s = 0;
-      for (int u = 0; u < 8; ++u) s = std::fmaf(c[u][x], static_cast<float>(in[y * 8 + u]), s);
-      tmp[y * 8 + x] = s;
-    }
-  for (int x = 0; x < 8; ++x)
-    for (int y = 0; y < 8; ++y) {
-      float s = 0;
-      for (int v = 0; v < 8; ++v) s = std::fmaf(c[v][y], tmp[v * 8 + x], s);
-      const float r = std::floor(s + 128.5f);
-      out[y * stride + x] = static_cast<uint8_t>(r < 0 ? 0 : (r > 255 ? 255 : r));
-    }
-}
+// (host_jpeg.hpp: the eight lanes of a row at once, the same chain of fused
+// steps in each.)
+void idct8x8(const int* in, uint8_t* out, int stride) { vgpu::hostjpeg::idct8x8(in, out, stride); }
 
-void fdct8x8(const double* in, double* out) {
-  const double(*c)[8] = dct_basis();
-  double tmp[64];
-  for (int y = 0; y < 8; ++y)
-    for (int u = 0; u < 8; ++u) {
-      double s = 0;
-      for (int x = 0; x < 8; ++x) s += c[u][x] * in[y * 8 + x];
-      tmp[y * 8 + u] = s;
-    }
-  for (int u = 0; u < 8; ++u)
-    for (int v = 0; v < 8; ++v) {
-      double s = 0;
-      for (int y = 0; y < 8; ++y) s += c[v][y] * tmp[y * 8 + u];
-      out[v * 8 + u] = s;
-    }
-}
+void fdct8x8(const double* in, double* out) { vgpu::hostjpeg::fdct8x8(in, out); }
 
 /* ======================================================================== */
 /* The decoder                                                              */
@@ -394,16 +380,20 @@ struct ScanDecoder {
 };
 
 void finish_image(Image& im) {
-  int deq[64];
   for (Component& c : im.comps) {
     c.plane.assign(static_cast<size_t>(c.bw) * 8 * c.bh * 8, 0);
     const uint16_t* q = im.quant[c.tq];
-    for (int by = 0; by < c.bh; ++by)
+    // Rows of blocks are independent (each writes its own eight rows of the plane).
+    const int64_t rows = c.bh;
+    const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(c.bw) * static_cast<uint64_t>(c.bh) * 600u, rows);
+    vgpu::hostpar::parallel_for(threads, rows, [&](int64_t by) {
+      int deq[64];
       for (int bx = 0; bx < c.bw; ++bx) {
         const int16_t* b = c.coef.data() + (static_cast<size_t>(by) * c.bw + bx) * 64;
         for (int k = 0; k < 64; ++k) deq[kZigZag[k]] = b[k] * q[k];
         idct8x8(deq, c.plane.data() + static_cast<size_t>(by) * 8 * c.bw * 8 + bx * 8, c.bw * 8);
       }
+    });
     std::vector<int16_t>().swap(c.coef);
   }
 }
@@ -725,34 +715,70 @@ nvjpegStatus_t write_image(const Image& im, const OutputSpec& o, nvjpegImage_t* 
   // RGB at (x, y) of the image.
   const bool rgb_components = nc == 3 && (im.adobe == 0 || (!im.jfif && im.adobe < 0 && im.comps[0].id == 'R' &&
                                                             im.comps[1].id == 'G' && im.comps[2].id == 'B'));
-  const auto rgb_at = [&](int x, int y, uint8_t* r, uint8_t* g, uint8_t* b) {
+  // Rows of the converted image. A component's sample for output column x is sample()'s: the plane column
+  // x * h / hmax (clamped to the plane), so the columns are found once per component instead of per pixel.
+  std::vector<std::vector<int>> xmap(nc);
+  for (size_t c = 0; c < nc; ++c) {
+    const Component& co = im.comps[c];
+    xmap[c].resize(static_cast<size_t>(w));
+    for (int xx = 0; xx < w; ++xx) xmap[c][static_cast<size_t>(xx)] = std::min((x0 + xx) * co.h / im.hmax, co.bw * 8 - 1);
+  }
+  const auto fill_row = [&](size_t c, int y, uint8_t* dst) {
+    const Component& co = im.comps[c];
+    const int sy = std::min((y0 + y) * co.v / im.vmax, co.bh * 8 - 1);
+    const uint8_t* row = co.plane.data() + static_cast<size_t>(sy) * co.bw * 8;
+    const int* m = xmap[c].data();
+    for (int xx = 0; xx < w; ++xx) dst[xx] = row[m[xx]];
+  };
+  // Row y of the image as R, G, B (w values each); `tmp` is scratch of 3 * w bytes.
+  const auto rgb_row = [&](int y, uint8_t* r, uint8_t* g, uint8_t* b, uint8_t* tmp) {
+    uint8_t* const t1 = tmp + w;
+    uint8_t* const t2 = tmp + 2 * static_cast<size_t>(w);
     if (nc == 1) {
-      *r = *g = *b = sample(im, 0, x, y);
+      fill_row(0, y, r);
+      std::memcpy(g, r, static_cast<size_t>(w));
+      std::memcpy(b, r, static_cast<size_t>(w));
     } else if (nc == 3) {
       if (rgb_components) {
-        *r = sample(im, 0, x, y);
-        *g = sample(im, 1, x, y);
-        *b = sample(im, 2, x, y);
+        fill_row(0, y, r);
+        fill_row(1, y, g);
+        fill_row(2, y, b);
       } else {
-        ycbcr_to_rgb(sample(im, 0, x, y), sample(im, 1, x, y), sample(im, 2, x, y), r, g, b);
+        fill_row(0, y, tmp);
+        fill_row(1, y, t1);
+        fill_row(2, y, t2);
+        vgpu::hostjpeg::ycc_to_rgb(tmp, t1, t2, r, g, b, w);
       }
     } else {
       // CMYK as Adobe stores it (inverted): R = C * K / 255, rounding a
       // remainder of exactly half down, as NVIDIA's (measured on every
       // pixel of a gradient). YCCK is converted to CMY first.
-      int c = sample(im, 0, x, y), m = sample(im, 1, x, y), ye = sample(im, 2, x, y);
-      const int k = sample(im, 3, x, y);
+      fill_row(0, y, tmp);
+      fill_row(1, y, t1);
+      fill_row(2, y, t2);
+      std::vector<uint8_t> kk(static_cast<size_t>(w));
+      fill_row(3, y, kk.data());
       if (im.adobe == 2) {
-        uint8_t rr, gg, bb;
-        ycbcr_to_rgb(static_cast<float>(c), static_cast<float>(m), static_cast<float>(ye), &rr, &gg, &bb);
-        c = rr;
-        m = gg;
-        ye = bb;
+        for (int xx = 0; xx < w; ++xx) {
+          uint8_t rr, gg, bb;
+          ycbcr_to_rgb(static_cast<float>(tmp[xx]), static_cast<float>(t1[xx]), static_cast<float>(t2[xx]), &rr, &gg, &bb);
+          tmp[xx] = rr;
+          t1[xx] = gg;
+          t2[xx] = bb;
+        }
       }
-      *r = static_cast<uint8_t>((c * k + 126) / 255);
-      *g = static_cast<uint8_t>((m * k + 126) / 255);
-      *b = static_cast<uint8_t>((ye * k + 126) / 255);
+      for (int xx = 0; xx < w; ++xx) {
+        const int k = kk[static_cast<size_t>(xx)];
+        r[xx] = static_cast<uint8_t>((tmp[xx] * k + 126) / 255);
+        g[xx] = static_cast<uint8_t>((t1[xx] * k + 126) / 255);
+        b[xx] = static_cast<uint8_t>((t2[xx] * k + 126) / 255);
+      }
     }
+  };
+  // Rows are independent.
+  const auto for_rows = [&](auto&& fn) {
+    const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * 24u, h);
+    vgpu::hostpar::parallel_for(threads, h, [&](int64_t y) { fn(static_cast<int>(y)); });
   };
   switch (o.format) {
     case NVJPEG_OUTPUT_UNCHANGED:
@@ -769,17 +795,16 @@ nvjpegStatus_t write_image(const Image& im, const OutputSpec& o, nvjpegImage_t* 
     }
     case NVJPEG_OUTPUT_Y: {
       std::vector<uint8_t> plane(n);
-      for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-          uint8_t& out = plane[static_cast<size_t>(y) * w + x];
-          if (nc == 4 || rgb_components) {
-            uint8_t r, g, b;
-            rgb_at(x0 + x, y0 + y, &r, &g, &b);
-            out = to_byte(0.299f * r + 0.587f * g + 0.114f * b);
-          } else {
-            out = sample(im, 0, x0 + x, y0 + y);
-          }
+      for_rows([&](int y) {
+        uint8_t* out = plane.data() + static_cast<size_t>(y) * w;
+        if (nc == 4 || rgb_components) {
+          std::vector<uint8_t> r(static_cast<size_t>(w)), g(static_cast<size_t>(w)), b(static_cast<size_t>(w)), tmp(3 * static_cast<size_t>(w));
+          rgb_row(y, r.data(), g.data(), b.data(), tmp.data());
+          vgpu::hostjpeg::rgb_to_luma(r.data(), g.data(), b.data(), out, w);
+        } else {
+          fill_row(0, y, out);
         }
+      });
       return put_plane(dst->channel[0], dst->pitch[0], plane, w, h);
     }
     case NVJPEG_OUTPUT_RGB:
@@ -789,11 +814,11 @@ nvjpegStatus_t write_image(const Image& im, const OutputSpec& o, nvjpegImage_t* 
       const bool interleaved = o.format == NVJPEG_OUTPUT_RGBI || o.format == NVJPEG_OUTPUT_BGRI;
       const bool bgr = o.format == NVJPEG_OUTPUT_BGR || o.format == NVJPEG_OUTPUT_BGRI;
       std::vector<uint8_t> r(n), g(n), b(n);
-      for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-          const size_t at = static_cast<size_t>(y) * w + x;
-          rgb_at(x0 + x, y0 + y, &r[at], &g[at], &b[at]);
-        }
+      for_rows([&](int y) {
+        std::vector<uint8_t> tmp(3 * static_cast<size_t>(w));
+        const size_t at = static_cast<size_t>(y) * w;
+        rgb_row(y, &r[at], &g[at], &b[at], tmp.data());
+      });
       if (interleaved) {
         std::vector<uint8_t> il(n * 3);
         for (size_t at = 0; at < n; ++at) {
@@ -1071,8 +1096,8 @@ struct EncTable {
 
 struct BitWriter {
   std::string out;
-  uint32_t buf = 0;
-  int count = 0;
+  uint64_t buf = 0;
+  int count = 0;           // bits waiting in buf (fewer than 8 between calls)
   bool counting = false;   // a first pass gathering symbol frequencies writes nothing
 
   void byte(uint8_t b) { out.push_back(static_cast<char>(b)); }
@@ -1084,33 +1109,30 @@ struct BitWriter {
     byte(0xFF);
     byte(m);
   }
+  // The low `len` bits of `code`, most significant first. They gather in a 64-bit buffer and leave a byte at a time (a 0xFF
+  // byte is followed by a stuffed 0x00, so it is not read as a marker); the bitstream is the one a bit-at-a-time writer makes.
   void put(int code, int len) {
     if (counting) return;
-    for (int i = len - 1; i >= 0; --i) {
-      buf = (buf << 1) | ((code >> i) & 1);
-      if (++count == 8) {
-        const uint8_t b = static_cast<uint8_t>(buf & 0xFF);
-        byte(b);
-        if (b == 0xFF) byte(0x00);   // stuffing, so the byte is not read as a marker
-        buf = 0;
-        count = 0;
-      }
+    if (len <= 0) return;
+    buf = (buf << len) | (static_cast<uint64_t>(static_cast<uint32_t>(code)) & ((uint64_t(1) << len) - 1));
+    count += len;
+    while (count >= 8) {
+      count -= 8;
+      const uint8_t b = static_cast<uint8_t>((buf >> count) & 0xFF);
+      byte(b);
+      if (b == 0xFF) byte(0x00);
     }
+    buf &= (uint64_t(1) << count) - 1;   // (what has not left yet)
   }
   void flush() {
     if (counting) return;
-    while (count) put(1, 1);   // pad with ones, as the standard says
+    if (count) put((1 << (8 - count)) - 1, 8 - count);   // pad with ones, as the standard says
   }
 };
 
 int magnitude(int v) {
-  int n = 0;
-  int a = v < 0 ? -v : v;
-  while (a) {
-    ++n;
-    a >>= 1;
-  }
-  return n;
+  const unsigned a = v < 0 ? 0u - static_cast<unsigned>(v) : static_cast<unsigned>(v);
+  return a ? 32 - __builtin_clz(a) : 0;   // the number of bits of |v|
 }
 
 void scale_quant(const uint8_t* base, int quality, uint16_t* out) {
@@ -1175,14 +1197,22 @@ Plane resample(const Plane& p, int w, int h) {
   o.h = h;
   o.s.resize(static_cast<size_t>(w) * h);
   const int fx = std::max(1, (p.w + w - 1) / w), fy = std::max(1, (p.h + h - 1) / h);
-  for (int y = 0; y < h; ++y)
+  // The source column of each destination column and the source row of each destination row, found once.
+  std::vector<int> xs(static_cast<size_t>(w)), ys(static_cast<size_t>(h));
+  for (int x = 0; x < w; ++x) xs[static_cast<size_t>(x)] = x * p.w / w;
+  for (int y = 0; y < h; ++y) ys[static_cast<size_t>(y)] = y * p.h / h;
+  const bool shrink = p.w >= w && p.h >= h;
+  // Rows are independent.
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * (shrink ? static_cast<uint64_t>(fx * fy) * 3u : 6u), h);
+  vgpu::hostpar::parallel_for(threads, h, [&](int64_t yi) {
+    const int y = static_cast<int>(yi);
     for (int x = 0; x < w; ++x) {
-      if (p.w >= w && p.h >= h) {
+      if (shrink) {
         float sum = 0;
         int n = 0;
         for (int dy = 0; dy < fy; ++dy)
           for (int dx = 0; dx < fx; ++dx) {
-            const int sx = x * p.w / w + dx, sy = y * p.h / h + dy;
+            const int sx = xs[static_cast<size_t>(x)] + dx, sy = ys[static_cast<size_t>(y)] + dy;
             if (sx < p.w && sy < p.h) {
               sum += p.s[static_cast<size_t>(sy) * p.w + sx];
               ++n;
@@ -1190,9 +1220,10 @@ Plane resample(const Plane& p, int w, int h) {
           }
         o.s[static_cast<size_t>(y) * w + x] = n ? sum / n : 0;
       } else {
-        o.s[static_cast<size_t>(y) * w + x] = p.at(x * p.w / w, y * p.h / h);
+        o.s[static_cast<size_t>(y) * w + x] = p.at(xs[static_cast<size_t>(x)], ys[static_cast<size_t>(y)]);
       }
     }
+  });
   return o;
 }
 
@@ -1226,15 +1257,19 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
     b.q.assign(static_cast<size_t>(b.bw) * b.bh * 64, 0);
     const Plane& p = planes[c];
     const uint16_t* t = qt[c == 0 ? 0 : 1];
-    for (int by = 0; by < b.bh; ++by)
+    // Rows of blocks are independent.
+    const unsigned threads =
+        vgpu::hostpar::plan(static_cast<uint64_t>(b.bw) * static_cast<uint64_t>(b.bh) * 700u, b.bh);
+    vgpu::hostpar::parallel_for(threads, b.bh, [&](int64_t by) {
       for (int bx = 0; bx < b.bw; ++bx) {
         double blk[64], coef[64];
         for (int y = 0; y < 8; ++y)
-          for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(bx * 8 + x, by * 8 + y) - 128.0;
+          for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(bx * 8 + x, static_cast<int>(by) * 8 + y) - 128.0;
         fdct8x8(blk, coef);
         int* out = b.q.data() + (static_cast<size_t>(by) * b.bw + bx) * 64;
-        for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(std::lround(coef[kZigZag[k]] / t[k]));
+        for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(vgpu::hostjpeg::round_half_away(coef[kZigZag[k]] / t[k]));
       }
+    });
   }
 
   const bool progressive = prm.encoding == 0xC2;
