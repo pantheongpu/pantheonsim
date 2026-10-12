@@ -101,7 +101,7 @@ vgpu::exec::LaunchStats run(const Program& p, const LaunchInfo& li, vgpu::Memory
 std::vector<uint8_t> make_bank0(const vgpu::sass::Module& m, const vgpu::sass::CubinKernel& k, const LaunchInfo& li,
                                 const std::vector<std::vector<uint8_t>>& args);
 
-enum class OpKind { Header, Guard, Mov, Iadd3, Iadd3Plain, Imad, ImadWide, Lop3, Lop3Xor3, Shf, Lea, Isetp, Ffma, Fadd, Fmul, I2fp, Ldg, Stg, Bra, Exit, Region, Other };
+enum class OpKind { Header, Guard, Mov, Iadd3, Iadd3Plain, Imad, ImadM, ImadWide, Lop3, Lop3Xor3, Shf, Lea, Isetp, Ffma, Fadd, Fmul, I2fp, Ldg, Stg, Bra, Exit, Region, Other };
 OpKind kind_of(const MOp& op);
 Fn region_handler();
 // Generated code (codegen.cpp): C++ source for the program's straight-line ALU runs and the patched program.

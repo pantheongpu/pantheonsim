@@ -77,6 +77,21 @@ const MOp* h_mov(Ctx& c, const MOp& p) {
   return &p + 1;
 }
 
+// IMAD with a negated or complemented addend (ival: -x, then ~x).
+const MOp* h_imadm(Ctx& c, const MOp& p) {
+  const uint32_t *a = ROW(p.a), *b = ROW(p.b), *cc = ROW(p.c);
+  const bool neg = p.k0, bnot = p.k1;
+  alignas(64) uint32_t r[32];
+  for (unsigned l = 0; l < 32; ++l) {
+    uint32_t cv = cc[l];
+    if (neg) cv = 0u - cv;
+    if (bnot) cv = ~cv;
+    r[l] = a[l] * b[l] + cv;
+  }
+  put(c, p.d, r);
+  return &p + 1;
+}
+
 const MOp* h_iadd3(Ctx& c, const MOp& p) {
   const uint32_t *a = ROW(p.a), *b = ROW(p.b), *cc = ROW(p.c);
   const uint32_t ma = p.imm, mb = p.imm2, mc = p.e, add = p.k3;
@@ -237,7 +252,11 @@ const MOp* h_ffma(Ctx& c, const MOp& p) {
   const uint32_t xa = p.imm2 & 1 ? 0x80000000u : 0, xb = p.imm2 & 2 ? 0x80000000u : 0, xc = p.imm2 & 4 ? 0x80000000u : 0;
   alignas(64) uint32_t r[32];
   for (unsigned l = 0; l < 32; ++l)
+#ifdef R7_BREAK_FFMA
+    r[l] = canon(as_f32((a[l] & aa) ^ xa) * as_f32((b[l] & ab) ^ xb) + as_f32((cc[l] & ac) ^ xc));   // deliberately wrong: two roundings
+#else
     r[l] = canon(std::fma(as_f32((a[l] & aa) ^ xa), as_f32((b[l] & ab) ^ xb), as_f32((cc[l] & ac) ^ xc)));
+#endif
   put(c, p.d, r);
   return &p + 1;
 }
@@ -512,7 +531,7 @@ struct Compiler {
         const unsigned kind = ins.f[0];
         if (kind == 0x27 || ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3) throw Unsupported("IMAD form");
         for (int i = 0; i < 3; ++i)
-          if (!plain_src(ins.src[i]) || ins.src[i].neg || ins.src[i].bnot) throw Unsupported("IMAD modifier");
+          if (!plain_src(ins.src[i]) || (i < 2 || kind == 0x25 ? (ins.src[i].neg || ins.src[i].bnot) : false)) throw Unsupported("IMAD modifier");
         if (kind == 0x25) {
           const auto cc = row64(ins.src[2]);
           if (ins.dst[0].kind != Kind::Reg || ins.dst[0].reg == kRZ || ins.dst[0].reg + 1 >= pr.nregs) throw Unsupported("IMAD.WIDE destination");
@@ -531,6 +550,13 @@ struct Compiler {
           if (zero(ins.src[0]) || zero(ins.src[1])) {
             op.fn = h_mov;
             op.a = row(ins.src[2]);
+          } else if (ins.src[2].neg || ins.src[2].bnot) {
+            op.fn = h_imadm;
+            op.a = row(ins.src[0]);
+            op.b = row(ins.src[1]);
+            op.c = row(ins.src[2]);
+            op.k0 = ins.src[2].neg;
+            op.k1 = ins.src[2].bnot;
           } else {
             op.fn = h_imad;
             op.a = row(ins.src[0]);
@@ -957,6 +983,7 @@ OpKind kind_of(const MOp& o) {
   if (f == h_iadd3) return OpKind::Iadd3;
   if (f == h_iadd3_plain) return OpKind::Iadd3Plain;
   if (f == h_imad) return OpKind::Imad;
+  if (f == h_imadm) return OpKind::ImadM;
   if (f == h_imad_wide) return OpKind::ImadWide;
   if (f == h_lop3) return OpKind::Lop3;
   if (f == h_lop3_xor3) return OpKind::Lop3Xor3;

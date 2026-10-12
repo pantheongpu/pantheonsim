@@ -56,7 +56,7 @@ template <unsigned BOP> static inline u32 comb(u32 r, u32 acc) { return BOP == 0
 
 bool fusable(const MOp& o) {
   switch (kind_of(o)) {
-    case OpKind::Mov: case OpKind::Iadd3: case OpKind::Iadd3Plain: case OpKind::Imad: case OpKind::ImadWide: case OpKind::Lop3:
+    case OpKind::Mov: case OpKind::ImadM: case OpKind::Iadd3: case OpKind::Iadd3Plain: case OpKind::Imad: case OpKind::ImadWide: case OpKind::Lop3:
     case OpKind::Lop3Xor3: case OpKind::Shf: case OpKind::Lea: case OpKind::Isetp: case OpKind::Ffma: case OpKind::Fadd:
     case OpKind::Fmul: case OpKind::I2fp:
       return true;
@@ -135,6 +135,14 @@ struct Gen {
         break;
       }
       case OpKind::Imad: { const std::string b = rd(o.b), c = rd(o.c); s << wr(o.d) << " = " << A << " * " << b << " + " << c << ";"; break; }
+      case OpKind::ImadM: {
+        const std::string b = rd(o.b), c = rd(o.c);
+        std::string cv = c;
+        if (o.k0) cv = "(0u - " + cv + ")";
+        if (o.k1) cv = "(~" + cv + ")";
+        s << wr(o.d) << " = " << A << " * " << b << " + " << cv << ";";
+        break;
+      }
       case OpKind::ImadWide: {
         const std::string b = rd(o.b), cl = rd(o.c), ch = rd(o.e);
         s << "{ const u32 A = " << A << ", Bv = " << b << ", Cl = " << cl << ", Ch = " << ch << "; const u64 pr = "
