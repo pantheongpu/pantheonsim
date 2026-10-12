@@ -136,21 +136,19 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
   const Mask ex = guard_mask(w, ins, w.mactive_force ? w.mactive_force : group);
   {
     exec::LaunchStats& st = blk.st;
-    const uint64_t lanes = static_cast<uint64_t>(std::popcount(ex));
+    const uint64_t lanes = popc(ex);
     ++st.instructions;
     st.thread_instructions += lanes;
-    st.inst_by_class[static_cast<size_t>(inst_class(ins.op))] += lanes;
-    if (ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA || ins.op == Op::QMMA ||
-        ins.op == Op::HGMMA || ins.op == Op::IGMMA || ins.op == Op::BGMMA || ins.op == Op::QGMMA)
-      ++st.tensor_instructions;
+    st.inst_by_class[ins.cls] += lanes;
+    if (ins.tensor) ++st.tensor_instructions;
     if (ins.op == Op::BAR && ins.mnemonic == "BAR" && ex) ++st.barriers;
     if (ins.op == Op::BRA && ex && ex != group) ++st.divergent_branches;
   }
   bool pcs_set = false;
   try {
-    if (!ex && straight(ins)) {
+    if (!ex && ins.straight) {
       // predicated off on every lane: an ALU or memory instruction does nothing
-    } else if (fast_alu(w, ins, ex)) {
+    } else if (fast_ && fast_alu(w, ins, ex)) {
       // done: the fast path computed exactly what the general one does
     } else switch (ins.op) {
       case Op::Unknown:
@@ -580,7 +578,7 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     case Op::POPC: case Op::UPOPC:
-      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, static_cast<uint32_t>(std::popcount(ival(w, ins.src[0], l)))); });
+      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, popc(ival(w, ins.src[0], l))); });
       return;
     case Op::FLO: case Op::UFLO: {
       const bool sgn = ins.f[0], sh = ins.f[1];
@@ -987,7 +985,8 @@ uint16_t f64_to_bf16(double d) {
 bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   switch (ins.op) {
     case Op::IADD3: case Op::IMAD: case Op::LOP3: case Op::MOV: case Op::ISETP: case Op::FSETP:
-    case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF: break;
+    case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
+    case Op::DADD: case Op::DMUL: case Op::DFMA: break;
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1052,6 +1051,57 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     const Mask acc = pmask(ins.src[2]);
     setp(ins.dst[0], combine(bop, r, acc));
     setp(ins.dst[1], combine(bop, ~r, acc));
+    return true;
+  }
+  if (ins.op == Op::DADD || ins.op == Op::DMUL || ins.op == Op::DFMA) {
+    // Double arithmetic, round to nearest, on a register pair: the operands as exec_float's f64src reads them,
+    // a register's 32 lanes or one value for every lane, then the operation over all lanes.
+    const unsigned nsrc = ins.op == Op::DFMA ? 3 : 2;
+    if (ins.f[0] || ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return false;
+    for (unsigned i = 0; i < nsrc; ++i) {
+      const Kind k = ins.src[i].kind;
+      if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
+    }
+    double v[3][32];
+    for (unsigned i = 0; i < nsrc; ++i) {
+      const Operand& o = ins.src[i];
+      const auto f64src = [&](unsigned l) {
+        double d = as_f64(o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, l));
+        if (o.abs) d = std::fabs(d);
+        if (o.neg) d = -d;
+        return d;
+      };
+      if (o.kind == Kind::Reg && o.reg != kRZ) {
+        // The pair's two halves as 32-lane rows (the bounds are checked once, on both).
+        const uint32_t* lo = &w.reg(o.reg, 0);
+        const uint32_t* hi = &w.reg(o.reg + 1, 0);
+        for (unsigned l = 0; l < 32; ++l) {
+          double d = as_f64(lo[l] | (static_cast<uint64_t>(hi[l]) << 32));
+          if (o.abs) d = std::fabs(d);
+          if (o.neg) d = -d;
+          v[i][l] = d;
+        }
+      } else if (o.kind == Kind::Reg) {
+        for (unsigned l = 0; l < 32; ++l) v[i][l] = f64src(l);
+      } else {
+        const double d = f64src(0);   // the same for every lane
+        for (unsigned l = 0; l < 32; ++l) v[i][l] = d;
+      }
+    }
+    double res[32];
+    if (ins.op == Op::DADD) for (unsigned l = 0; l < 32; ++l) res[l] = v[0][l] + v[1][l];
+    else if (ins.op == Op::DMUL) for (unsigned l = 0; l < 32; ++l) res[l] = v[0][l] * v[1][l];
+    else dfma_lanes(res, v[0], v[1], v[2]);
+    const Operand& d = ins.dst[0];
+    if (d.reg == kRZ) return true;   // nothing is written to RZ
+    uint32_t* dlo = &w.reg(d.reg, 0);
+    uint32_t* dhi = d.reg + 1 == kRZ ? nullptr : &w.reg(d.reg + 1, 0);   // R254's partner is RZ
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      const uint64_t bits = f64_bits(res[l]);
+      dlo[l] = static_cast<uint32_t>(bits);
+      if (dhi) dhi[l] = static_cast<uint32_t>(bits >> 32);
+    }
     return true;
   }
   if (ins.dst[0].kind != Kind::Reg && !(ins.op == Op::LOP3 && ins.dst.size() == 2)) return false;
@@ -1249,7 +1299,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       }
       const auto out = [](float v) { return v != v ? 0x7fffffffu : f32_bits(v); };
       if (ins.op == Op::FFMA)
-        for (unsigned l = 0; l < 32; ++l) r[l] = out(std::fma(as_f32(s[0][l]), as_f32(s[1][l]), as_f32(s[2][l])));
+        ffma_lanes(r, s[0], s[1], s[2]);   // lane_math.hpp
       else if (ins.op == Op::FADD)
         for (unsigned l = 0; l < 32; ++l) r[l] = out(as_f32(s[0][l]) + as_f32(s[1][l]));
       else
@@ -1781,16 +1831,11 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
 // sectors the lanes' addresses touch, and shared-memory bank conflicts.
 void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 local */, bool store,
                   const uint64_t* addr, Mask lanes, uint32_t bytes) {
-  const uint64_t n = static_cast<uint64_t>(std::popcount(lanes));
+  const uint64_t n = popc(lanes);
   if (!n) return;
-  std::vector<uint64_t> sectors;
-  each_lane(lanes, [&](unsigned l) {
-    for (uint64_t s = addr[l] / 32; s <= (addr[l] + bytes - 1) / 32; ++s) sectors.push_back(s);
-  });
-  std::sort(sectors.begin(), sectors.end());
-  const uint64_t distinct = static_cast<uint64_t>(std::unique(sectors.begin(), sectors.end()) - sectors.begin());
   switch (space) {
-    case 0:
+    case 0: {
+      const uint64_t distinct = distinct_sectors(addr, lanes, bytes);
       (store ? st.global_stores : st.global_loads) += n;
       (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
       st.global_sectors += distinct;
@@ -1799,6 +1844,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       ++(store ? st.global_requests_st : st.global_requests_ld);
       (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
       break;
+    }
     case 1: {
       (store ? st.shared_stores : st.shared_loads) += n;
       (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
@@ -1806,25 +1852,19 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       ++(store ? st.shared_requests_st : st.shared_requests_ld);
       // 32 banks of 4 bytes: lanes on different words of one bank take a
       // pass each; lanes on the same word share one.
-      std::vector<uint64_t> words[32];
-      each_lane(lanes, [&](unsigned l) {
-        for (uint64_t a = addr[l] & ~3ull; a < addr[l] + bytes; a += 4) words[(a / 4) % 32].push_back(a / 4);
-      });
-      uint64_t passes = 1;
-      for (auto& v : words) {
-        std::sort(v.begin(), v.end());
-        passes = std::max<uint64_t>(passes, static_cast<uint64_t>(std::unique(v.begin(), v.end()) - v.begin()));
-      }
+      const uint64_t passes = bank_passes(addr, lanes, bytes);
       st.shared_bank_conflicts += passes - 1;
       (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
       break;
     }
-    default:
+    default: {
+      const uint64_t distinct = distinct_sectors(addr, lanes, bytes);
       (store ? st.local_stores : st.local_loads) += n;
       (store ? st.local_bytes_written : st.local_bytes_read) += n * bytes;
       st.local_sectors += distinct;
       ++st.local_requests;
       break;
+    }
   }
 }
 
@@ -1876,6 +1916,60 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const Operand& a = ins.src[0];   // the address (a store's data is src[1])
       uint64_t addrs[32] = {};
       int space = 0;
+      // A coalesced access -- consecutive lanes on consecutive elements of 1, 2, 4 or 8 bytes -- in plain
+      // global memory moves as one run: MemoryManager::load_run / store_run do what the loop below does
+      // element by element (each element one relaxed atomic access) with one allocation lookup, and decline
+      // (return false, having done nothing) whenever the two could differ; then the loop runs as before.
+      if (fast_ && !generic && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && ex && ((ex + (ex & -ex)) & ex) == 0) {
+        const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
+        const unsigned count = popc(ex);
+        const uint64_t g0 = address(a, first, wide, ur, store ? 64 : 32, 0);
+        bool run = !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
+        for (unsigned i = 0; run && i < count; ++i) {
+          const uint64_t g = address(a, first + i, wide, ur, store ? 64 : 32, 0);
+          run = g == g0 + uint64_t{i} * bytes;
+        }
+        if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kConstWindow + (uint64_t{1} << 32))) {
+          uint8_t buf[32 * 8];
+          bool done = false;
+          if (store) {
+            const Operand& d = ins.src[1];
+            for (unsigned i = 0; i < count; ++i) {
+              if (bytes <= 4) {
+                const uint32_t v = read32(w, d, first + i);
+                std::memcpy(buf + i * bytes, &v, bytes);
+              } else {
+                uint32_t v[2];
+                for (unsigned k = 0; k < 2; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
+                std::memcpy(buf + i * 8, v, 8);
+              }
+            }
+            done = mem_.store_run(g0, buf, uint64_t{count} * bytes, bytes);
+          } else {
+            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, bytes);
+            if (done) {
+              const Operand& d = ins.dst[0];
+              for (unsigned i = 0; i < count; ++i) {
+                if (bytes <= 4) {
+                  uint32_t v = 0;
+                  std::memcpy(&v, buf + i * bytes, bytes);
+                  write32(w, d, first + i, extend(v));
+                } else {
+                  uint32_t v[2];
+                  std::memcpy(v, buf + i * 8, 8);
+                  if (d.reg != kRZ)
+                    for (unsigned k = 0; k < 2; ++k) w.reg(d.reg + k, first + i) = v[k];
+                }
+              }
+            }
+          }
+          if (done) {
+            for (unsigned i = 0; i < count; ++i) addrs[first + i] = g0 + uint64_t{i} * bytes;
+            count_access(blk.st, 0, store, addrs, ex, bytes);
+            return;
+          }
+        }
+      }
       each_lane(ex, [&](unsigned l) {
         const uint64_t g = address(a, l, wide, ur, store ? 64 : 32, 0);
         uint64_t off;
@@ -1928,6 +2022,43 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const bool ur = ins.w.bit(91);
       const Operand& a = ins.src[0];   // the address (a store's data is src[1])
       uint64_t addrs[32] = {};
+      if (shared && fast_) {
+        // The common case, taken when every active lane's access is inside the block's own shared memory:
+        // the bytes move straight between the register file and the block's array. The addresses are worked
+        // out first (they only read registers); if any lane's is another block's or out of range, the loop
+        // below runs instead and finds the lane that faults, exactly as it always did.
+        const uint64_t ssize = blk.shared.size();
+        bool inside = true;
+        each_lane(ex, [&](unsigned l) {
+          const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
+          addrs[l] = off;
+          inside = inside && (off >> 24) == blk.rank && (off & 0xffffff) + bytes <= ssize;
+        });
+        if (inside) {
+          uint8_t* sh = blk.shared.data();
+          if (store) {
+            const Operand& d = ins.src[1];
+            each_lane(ex, [&](unsigned l) {
+              uint32_t v[4] = {};
+              for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
+              if (bytes == 4) std::memcpy(sh + (addrs[l] & 0xffffff), v, 4);
+              else std::memcpy(sh + (addrs[l] & 0xffffff), v, bytes);
+            });
+          } else {
+            const Operand& d = ins.dst[0];
+            each_lane(ex, [&](unsigned l) {
+              uint32_t v[4] = {};
+              if (bytes == 4) std::memcpy(v, sh + (addrs[l] & 0xffffff), 4);
+              else std::memcpy(v, sh + (addrs[l] & 0xffffff), bytes);
+              if (bytes <= 4) write32(w, d, l, extend(v[0]));
+              else if (d.reg != kRZ)
+                for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+            });
+          }
+          count_access(blk.st, 1, store, addrs, ex, bytes);
+          return;
+        }
+      }
       each_lane(ex, [&](unsigned l) {
         const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
         addrs[l] = off;

@@ -1238,6 +1238,11 @@ vgpu_unit_test(test_fastpath)
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
 vgpu_unit_test(test_sched)
+
+# The SASS executor's memory-access counting and FFMA lane loop, against the
+# straightforward versions they replaced (src/sass/access_count.hpp, lane_math.hpp).
+vgpu_unit_test(test_sass_access_count)
+vgpu_unit_test(test_sass_lane_math)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -2776,6 +2781,15 @@ add_test(NAME e2e_sass_path
 set_tests_properties(e2e_sass_path PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# The SASS executor's fast paths against its general path (VGPU_FASTPATH=0): answers and counters.
+add_test(NAME e2e_sass_fastpath
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_fastpath.sh)
+set_tests_properties(e2e_sass_fastpath PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75

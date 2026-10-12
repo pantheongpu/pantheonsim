@@ -31,6 +31,8 @@
 #include <thread>
 #include <tuple>
 
+#include "access_count.hpp"
+#include "lane_math.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/host_atomic.hpp"
@@ -56,6 +58,15 @@ float as_f32(uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
 uint32_t f32_bits(float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; }
 double as_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }
 uint64_t f64_bits(double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; }
+
+// The number of set bits of a lane mask. std::popcount in this build (baseline
+// x86-64, no POPCNT instruction) is a call into libgcc, and every instruction
+// counts its active lanes.
+inline unsigned popc(uint32_t v) {
+  v = v - ((v >> 1) & 0x55555555u);
+  v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+  return (((v + (v >> 4)) & 0x0f0f0f0fu) * 0x01010101u) >> 24;
+}
 
 // Why a lane is not runnable.
 enum class Wait : uint8_t { None, BSync, WarpSync, Bar, Cluster };
@@ -247,6 +258,10 @@ class Runner {
       // still caught.
       smemsz_ = (shared_size_ + 255) / 256 * 256;
     }
+    // VGPU_FASTPATH=0 sends every instruction down the general path, as it does for the PTX interpreter: the
+    // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
+    // block. For checking that the fast paths compute what the general one does.
+    if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -288,8 +303,22 @@ class Runner {
   // ---- state access ----
   const Instr& fetch(uint64_t addr, const Code** code_out = nullptr);
   uint32_t cbank32(unsigned bank, uint64_t offset) const;
-  uint64_t read64(Warp& w, const Operand& o, unsigned lane);
-  void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v);
+  // 64-bit operands: a register pair inline, as read32/write32 do for one register; the rest out of line.
+  [[gnu::always_inline]] uint64_t read64(Warp& w, const Operand& o, unsigned lane) {
+    if (o.kind == Kind::Reg && o.reg != kRZ) [[likely]]
+      return w.reg(o.reg, lane) | (static_cast<uint64_t>(w.reg(o.reg + 1, lane)) << 32);
+    return read64_slow(w, o, lane);
+  }
+  [[gnu::always_inline]] void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
+    if (o.kind == Kind::Reg && o.reg != kRZ) [[likely]] {
+      w.reg(o.reg, lane) = static_cast<uint32_t>(v);
+      if (o.reg + 1 != kRZ) w.reg(o.reg + 1, lane) = static_cast<uint32_t>(v >> 32);   // R254's partner is RZ
+      return;
+    }
+    write64_slow(w, o, lane, v);
+  }
+  uint64_t read64_slow(Warp& w, const Operand& o, unsigned lane);
+  void write64_slow(Warp& w, const Operand& o, unsigned lane, uint64_t v);
   bool pred(Warp& w, const Operand& o, unsigned lane) const;
   void set_pred(Warp& w, const Operand& o, unsigned lane, bool v);
   uint32_t sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const;
@@ -333,11 +362,11 @@ class Runner {
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
   // Operand access, inline for the common case -- a register -- since every
   // instruction makes it once per lane per operand; the rest out of line.
-  uint32_t read32(Warp& w, const Operand& o, unsigned lane) {
+  [[gnu::always_inline]] uint32_t read32(Warp& w, const Operand& o, unsigned lane) {
     if (o.kind == Kind::Reg) [[likely]] return o.reg == kRZ ? 0 : w.reg(o.reg, lane);
     return read32_slow(w, o, lane);
   }
-  void write32(Warp& w, const Operand& o, unsigned lane, uint32_t v) {
+  [[gnu::always_inline]] void write32(Warp& w, const Operand& o, unsigned lane, uint32_t v) {
     if (o.kind == Kind::Reg) [[likely]] {
       if (o.reg != kRZ) w.reg(o.reg, lane) = v;
       return;
@@ -352,6 +381,7 @@ class Runner {
   const exec::LaunchConfig& cfg_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
@@ -560,7 +590,7 @@ uint32_t Runner::read32_slow(Warp& w, const Operand& o, unsigned lane) {
   }
 }
 
-uint64_t Runner::read64(Warp& w, const Operand& o, unsigned lane) {
+uint64_t Runner::read64_slow(Warp& w, const Operand& o, unsigned lane) {
   switch (o.kind) {
     case Kind::Reg:
       if (o.reg == kRZ) return 0;
@@ -589,10 +619,10 @@ void Runner::write32_slow(Warp& w, const Operand& o, unsigned /*lane*/, uint32_t
   }
 }
 
-void Runner::write64(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
+void Runner::write64_slow(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
   write32(w, o, lane, static_cast<uint32_t>(v));
-  Operand hi = o;
   if (o.kind == Kind::Reg && o.reg == kRZ) return;
+  Operand hi = o;
   hi.reg = o.reg + 1;
   write32(w, hi, lane, static_cast<uint32_t>(v >> 32));
 }
@@ -1153,7 +1183,7 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
 }
 
 exec::InstClass inst_class(Op op);   // exec_ops.inc
-bool straight(const Instr& ins);
+bool compute_straight(const Instr& ins);   // see annotate_instr
 
 // Every warp of these blocks is parked or spinning (a YIELD loop with no other lane group to run), and some
 // lanes stand at a BSYNC: a lane that won a spin lock waits at the BSYNC closing the loop for the lanes that
@@ -1221,17 +1251,17 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // spinning, the next group up, so it gives the others a turn. One pass
   // over the runnable lanes finds the lowest address and its lanes (every
   // instruction comes through here, so it is kept short).
-  const uint64_t cur = w.pc[std::countr_zero(run)];
-  uint64_t lo = cur;
+  // The comparisons are kept out of branches: in a diverged warp the lanes' addresses differ
+  // unpredictably, and a mispredicted branch per lane was the largest cost of this loop.
+  uint64_t lo = w.pc[std::countr_zero(run)];
   Mask group = 0;
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     const uint64_t p = w.pc[l];
-    if (p < lo) {
-      lo = p;
-      group = 0;
-    }
-    if (p == lo) group |= Mask{1} << l;
+    const bool lower = p < lo;
+    group &= lower ? Mask{0} : kAll;
+    lo = lower ? p : lo;
+    group |= static_cast<Mask>(p == lo) << l;
   }
   uint64_t pick = lo;
   // The group a YIELD let in keeps the warp until it yields in turn or can no longer run, so that the
@@ -1297,7 +1327,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     if (++w.steps > cfg_.max_steps)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
                                     " instructions (an infinite loop?)");
-    if (n < 256 && pc + 16 < end && straight(*ins)) {
+    if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
       pc += 16;
       ins = &code->instr((pc - code->base) / 16);
@@ -1311,7 +1341,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
 }
 
 // Whether an instruction leaves every lane's pc to its caller (see step_warp).
-bool straight(const Instr& ins) {
+bool compute_straight(const Instr& ins) {
   switch (ins.op) {
     case Op::Unknown:
     // control flow, barriers and waits
@@ -1356,6 +1386,17 @@ Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
 
 // For sass::unsupported (module.cpp).
 bool runs_instr(const Instr& ins) { return executes(ins); }
+
+// Called once on each instruction as its code section is decoded (module.cpp):
+// sets the facts Instr::cls, ::tensor and ::straight hold, which execute() and
+// step_warp() used to work out again from the opcode on every execution.
+void annotate_instr(Instr& ins) {
+  ins.cls = static_cast<uint8_t>(inst_class(ins.op));
+  ins.tensor = ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA ||
+               ins.op == Op::QMMA || ins.op == Op::HGMMA || ins.op == Op::IGMMA || ins.op == Op::BGMMA ||
+               ins.op == Op::QGMMA;
+  ins.straight = compute_straight(ins);
+}
 
 namespace {
 
