@@ -1413,6 +1413,15 @@ should say both. Done, not missing: the per-opcode histogram `inst_by_opcode`
 
 ## Performance
 
+**2026-10-12: the host threads that run a grid are a pool.** A launch used to
+create and join `VGPU_THREADS` threads each time; for 10,000 launches of 8 small
+blocks that was 267 us per launch against 43 us with parked threads (SASS; PTX
+213 vs 31 us; grid 64: 657 vs 218 us; grid 1 runs inline and is unchanged), on a
+host at load 12-14, 5 alternating runs each. `include/vgpu/exec/worker_pool.hpp`,
+`docs/perf-design/host-parallelism.md` (also: what was measured and rejected for
+block hand-out, per-block reuse, warps of a block on several threads, and
+cooperative launches) and `docs/perf-design/streams.md`.
+
 **2026-09-25: fast paths, measured on the pantheon workloads that hit their
 watchdog at full size.** perf (extracted from Ubuntu's linux-tools package;
 no install needed) put int_virus's time in int_bin, dispatch, read_operand
