@@ -62,6 +62,9 @@ WORKLOADS = {
     "startup": ("api", "context + module + one launch (process cost excluded from the device phase)"),
 }
 ENGINES = ("sass", "ptx")
+# The metric an A/B verdict and the rate columns use. Default: warp-instructions per CPU second. The launch and
+# API workloads are about calls per second, and startup is only its whole-process wall time.
+PRIMARY = {"launch": "units_per_s", "api": "units_per_s", "startup": "wall_s"}
 GPU_DEFAULT = "nvidia/rtx3060"  # sm_86: the arch bench.cu is compiled for (SASS and PTX)
 NVCC_ARCH = "sm_86"
 
@@ -178,6 +181,7 @@ def meta_block(args, builds, nvcc, rel):
         "gpu_profile": args.gpu,
         "compiled_arch": NVCC_ARCH,
         "vgpu_threads": args.threads,
+        "pinned_cpus": args.cpus,
         "size": args.size,
         "runs": args.runs,
         "warmup": args.warmup,
@@ -290,11 +294,15 @@ def _poll_hwm(pid, binary, stop, box):
 
 
 def run_process(binary, workload, size, env, timeout):
+    return run_argv([binary, workload, size], env, timeout)
+
+
+def run_argv(argv, env, timeout):
     """Run once; returns wall/cpu from wait4 (this child only), peak RSS, and its output."""
+    binary = argv[0]
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         t0 = time.monotonic()
-        p = subprocess.Popen([binary, workload, size], env=env, stdout=out, stderr=err,
-                             stdin=subprocess.DEVNULL)
+        p = subprocess.Popen(argv, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
         killed = []
 
         def kill():
@@ -456,13 +464,64 @@ def counting_run(binary, workload, engine, build, args):
 # statistics ------------------------------------------------------------------
 
 
-def stat(xs):
+def stat(xs, higher_is_better=False):
+    """median, range, spread and `best` (the min of a time, the max of a rate).
+
+    On a shared machine contention only ever slows a run down, so the best of N
+    is the steadiest estimate of what the code costs, and the median shows what
+    a typical run saw. Both are reported; see docs/performance.md for the
+    measured noise.
+    """
     if not xs:
         return None
     med = statistics.median(xs)
     lo, hi = min(xs), max(xs)
-    return {"median": med, "min": lo, "max": hi, "n": len(xs),
-            "spread_pct": (100.0 * (hi - lo) / med) if med else 0.0}
+    return {"median": med, "min": lo, "max": hi, "best": hi if higher_is_better else lo, "n": len(xs),
+            "spread_pct": (100.0 * (hi - lo) / med) if med else 0.0, "values": list(xs)}
+
+
+def mann_whitney_p(a, b):
+    """Two-sided exact p-value of the Mann-Whitney U test (normal approximation above 12 per side).
+
+    Tests whether the runs of A and of B come from the same distribution
+    without assuming one; the runs are interleaved A B A B ... so slow drifts
+    of the machine fall on both sides.
+    """
+    n, m = len(a), len(b)
+    if n < 2 or m < 2:
+        return 1.0
+    allv = sorted(a + b)
+
+    def midrank(v):
+        lo = allv.index(v)
+        hi = len(allv) - 1 - allv[::-1].index(v)
+        return (lo + hi) / 2.0 + 1.0
+
+    r2 = [round(2 * midrank(v)) for v in a]  # doubled ranks, integers
+    obs = sum(r2)
+    ranks2 = [round(2 * midrank(v)) for v in allv]
+    if n <= 12 and m <= 12:
+        # distribution of the doubled rank-sum of n items drawn from the n+m ranks
+        top = sum(sorted(ranks2)[-n:])
+        ways = [[0] * (top + 1) for _ in range(n + 1)]
+        ways[0][0] = 1
+        for r in ranks2:
+            for k in range(n, 0, -1):
+                row, prev = ways[k], ways[k - 1]
+                for t in range(top, r - 1, -1):
+                    if prev[t - r]:
+                        row[t] += prev[t - r]
+        dist = ways[n]
+        total = sum(dist)
+        mean = n * sum(ranks2) / (n + m)
+        dev = abs(obs - mean)
+        extreme = sum(c for t, c in enumerate(dist) if abs(t - mean) >= dev - 1e-9)
+        return min(1.0, extreme / total)
+    import math
+    mean = n * (n + m + 1)  # doubled
+    sd = math.sqrt(n * m * (n + m + 1) / 12.0) * 2.0
+    z = (abs(obs - mean) - 1.0) / sd if sd else 0.0
+    return min(1.0, math.erfc(max(z, 0.0) / math.sqrt(2.0)))
 
 
 def summarize_runs(runs, instructions, units):
@@ -474,9 +533,9 @@ def summarize_runs(runs, instructions, units):
         "device_wall_s": stat([r["device_wall_s"] for r in runs]),
     }
     if instructions:
-        s["winst_per_cpu_s"] = stat([instructions / r["device_cpu_s"] for r in runs if r["device_cpu_s"] > 0])
+        s["winst_per_cpu_s"] = stat([instructions / r["device_cpu_s"] for r in runs if r["device_cpu_s"] > 0], True)
     if units:
-        s["units_per_s"] = stat([units / r["device_wall_s"] for r in runs if r["device_wall_s"] > 0])
+        s["units_per_s"] = stat([units / r["device_wall_s"] for r in runs if r["device_wall_s"] > 0], True)
     return s
 
 
@@ -586,6 +645,14 @@ def timing_flow(binary, names, engines, builds, counts, args):
 
 
 def ab_compare(results):
+    """A against B per workload and engine.
+
+    Verdict: faster/slower only when the Mann-Whitney test on the per-run values
+    says p <= 0.05 AND the median ratio and the best-of-N ratio both moved by
+    more than 2% the same way; anything else is 'same'. With 5 runs a side the
+    test cannot see a difference smaller than the machine's noise (measured in
+    docs/performance.md), which is the point of it.
+    """
     by = {}
     for r in results:
         by.setdefault((r["workload"], r["engine"]), {})[r["build"]] = r
@@ -597,22 +664,107 @@ def ab_compare(results):
         diff = {k: (a["counters"].get(k), b["counters"].get(k))
                 for k in sorted(set(a["counters"]) | set(b["counters"]))
                 if a["counters"].get(k) != b["counters"].get(k)}
-        key = "winst_per_cpu_s" if "winst_per_cpu_s" in a["stats"] else "units_per_s"
+        if a.get("duration_driven"):
+            diff = {}  # a soak workload does as much work as fits its duration: counts are not comparable
+        key = PRIMARY.get(w, "winst_per_cpu_s" if "winst_per_cpu_s" in a["stats"] else "units_per_s")
         if key not in a["stats"] or key not in b["stats"] or not a["stats"][key] or not b["stats"][key]:
             key = "wall_s"
         sa, sb = a["stats"][key], b["stats"][key]
-        ratio = sb["median"] / sa["median"] if sa["median"] else float("nan")
-        if key == "wall_s":
-            ratio = 1.0 / ratio if ratio else float("nan")  # report speed-up either way
-        overlap = not (sa["min"] > sb["max"] or sb["min"] > sa["max"])
-        if overlap:
-            verdict = "noise"
+        flip = (lambda x: 1.0 / x if x else float("nan")) if key == "wall_s" else (lambda x: x)  # speed-up either way
+        r_med = flip(sb["median"] / sa["median"]) if sa["median"] else float("nan")
+        r_best = flip(sb["best"] / sa["best"]) if sa["best"] else float("nan")
+        p = mann_whitney_p(sa["values"], sb["values"])
+        if p <= 0.05 and r_med > 1.02 and r_best > 1.02:
+            verdict = "faster"
+        elif p <= 0.05 and r_med < 0.98 and r_best < 0.98:
+            verdict = "slower"
         else:
-            verdict = "faster" if ratio > 1 else "slower"
+            verdict = "same"
         out.append({"workload": w, "engine": e, "metric": key, "a_median": sa["median"], "b_median": sb["median"],
-                    "speedup_b_over_a": ratio, "delta_pct": (ratio - 1.0) * 100.0, "verdict": verdict,
-                    "ranges_overlap": overlap, "counters_identical": not diff, "counter_diffs": diff})
+                    "a_best": sa["best"], "b_best": sb["best"], "ratio_median": r_med, "ratio_best": r_best,
+                    "p_value": p, "verdict": verdict, "n_a": sa["n"], "n_b": sb["n"],
+                    "counters_identical": not diff, "counter_diffs": diff})
     return out
+
+
+# --------------------------------------------------------------------------- pantheon workloads
+
+PANTHEON_DEFAULT = ["int_virus", "compute_virus", "fp64_virus", "mma_virus", "pulse_virus"]
+
+
+def find_pantheon_bin(args):
+    """A directory of pantheon binaries built for the shim (make PLATFORM=CUDA BUILD_DIR=build-vgpu-86 ...)."""
+    cands = [args.pantheon_bin, os.environ.get("VGPU_PANTHEON_BIN")]
+    for base in (os.environ.get("VGPU_PANTHEON_DIR"), os.path.join(ROOT, "..", "pantheon"),
+                 os.path.join(os.path.expanduser("~"), "pantheon")):
+        if base:
+            import glob
+            cands += sorted(glob.glob(os.path.join(base, "build-vgpu-*")))
+    for c in cands:
+        if c and os.path.isdir(c):
+            return os.path.abspath(c)
+    return None
+
+
+def pantheon_mode(args, builds, engines):
+    """Time pantheon's soak workloads (separate checkout, built for sm_86 with a shared cudart).
+
+    They run for a duration rather than a fixed amount of work, so the instruction count differs from run to run:
+    the rate is each run's own instructions over its own CPU time, counters are on in every run, and no counter
+    check applies. Knobs as tests/workloads/run_pantheon_workloads.sh: --kernel_loops 2 --grid_size 4, 2% memory.
+    """
+    bindir = find_pantheon_bin(args)
+    if not bindir:
+        die("no pantheon build found: pass --pantheon-bin DIR (a build-vgpu-* directory from "
+            "`make PLATFORM=CUDA BUILD_DIR=... DIR/<workload>`), see docs/pantheon-workloads.md", 1)
+    names = [w for w in (args.workloads.split(",") if args.workloads else PANTHEON_DEFAULT)]
+    results, failures = [], []
+    labs = list(builds)
+    for w in names:
+        path = os.path.join(bindir, w)
+        if not os.access(path, os.X_OK):
+            failures.append("%s: no binary %s" % (w, path))
+            continue
+        for e in engines:
+            runs = {lab: [] for lab in labs}
+            for i in range(args.runs + args.warmup):
+                for lab in labs:
+                    env = clean_env(builds[lab]["dir"], args, e, True)
+                    env["VGPU_VRAM_MB"] = "1024"
+                    env["VGPU_MAX_STEPS"] = "17179869184"
+                    res = run_argv([path, "0", str(args.duration), "2", "--kernel_loops", "2", "--grid_size", "4"],
+                                   env, args.timeout)
+                    if res["rc"] != 0 or res["timeout"]:
+                        failures.append("%s/%s[%s]: rc=%s" % (w, e, lab, res["rc"]))
+                        continue
+                    try:
+                        kernels, log = parse_counters(res["stderr"])
+                    except ValueError as ex:
+                        failures.append("%s/%s: %s" % (w, e, ex))
+                        continue
+                    ins = totals(kernels).get("instructions", 0)
+                    if i >= args.warmup and ins:
+                        res.update({"device_cpu_s": res["cpu"], "device_wall_s": res["wall"], "instr": ins,
+                                    "fell_back": [m for k, m in log if k == "PTX"]})
+                        runs[lab].append(res)
+            for lab in labs:
+                rs = runs[lab]
+                if not rs:
+                    continue
+                st = {"wall_s": stat([r["wall"] for r in rs]), "cpu_s": stat([r["cpu"] for r in rs]),
+                      "rss_mb": stat([r["rss_kb"] / 1024.0 for r in rs]),
+                      "device_cpu_s": stat([r["cpu"] for r in rs]), "device_wall_s": stat([r["wall"] for r in rs]),
+                      "winst_per_cpu_s": stat([r["instr"] / r["cpu"] for r in rs], True)}
+                results.append({"workload": "pantheon:" + w, "engine": e, "group": "pantheon", "build": lab,
+                                "counters": {"instructions": int(statistics.median([r["instr"] for r in rs]))},
+                                "kernels": {}, "engine_log": [], "duration_driven": True,
+                                "fell_back_to_ptx": rs[0]["fell_back"], "units": 0, "unit": "none",
+                                "runs": [{k: r[k] for k in ("wall", "cpu", "rss_kb", "device_cpu_s", "device_wall_s")}
+                                         for r in rs],
+                                "stats": st})
+            if not args.quiet:
+                print("  done pantheon:%-16s %-4s" % (w, e), file=sys.stderr)
+    return results, failures
 
 
 # --------------------------------------------------------------------------- output
@@ -627,45 +779,53 @@ def print_table(results, ab, out=sys.stdout):
     for r in results:
         rows.setdefault((r["workload"], r["engine"]), {})[r["build"]] = r
     print("", file=out)
-    hdr = "%-14s %-4s %12s %9s %7s %9s %8s %8s  %s" % (
-        "workload", "eng", "warp-instr", "Minst/s", "spread", "wall s", "cpu s", "RSS MB", "note")
+    hdr = "%-14s %-4s %12s %9s %9s %7s %8s %8s %7s  %s" % (
+        "workload", "eng", "warp-instr", "med Mi/s", "best Mi/s", "spread", "wall s", "cpu s", "RSS MB", "note")
     print(hdr, file=out)
     print("-" * len(hdr), file=out)
     for (w, e), d in rows.items():
         for lab in d:
             r = d[lab]
             st = r["stats"]
-            if "winst_per_cpu_s" in st:
-                rate = fmt_rate(st["winst_per_cpu_s"])
-                spr = "%6.1f%%" % st["winst_per_cpu_s"]["spread_pct"]
-            elif "units_per_s" in st:
-                rate = "       -"
-                spr = "%6.1f%%" % st["units_per_s"]["spread_pct"]
+            key = PRIMARY.get(w, "winst_per_cpu_s")
+            if key == "winst_per_cpu_s" and key in st:
+                med = "%9.2f" % (st[key]["median"] / 1e6)
+                best = "%9.2f" % (st[key]["best"] / 1e6)
+                spr = "%6.1f%%" % st[key]["spread_pct"]
+                unit = ""
+            elif key == "units_per_s" and key in st:
+                med = "%9.1f" % (st[key]["median"] / 1e3)
+                best = "%9.1f" % (st[key]["best"] / 1e3)
+                spr = "%6.1f%%" % st[key]["spread_pct"]
+                unit = "columns are k %s/s" % r["unit"]
             else:
-                rate, spr = "       -", "     -"
+                med = best = "        -"
+                spr = "%6.1f%%" % st["wall_s"]["spread_pct"]
+                unit = "wall time only"
             note = []
+            if unit:
+                note.append(unit)
             if r["fell_back_to_ptx"]:
                 note.append("SASS FELL BACK TO PTX")
             if len(d) > 1:
                 note.append("build " + lab)
-            if "units_per_s" in st:
-                note.append("%.1fk %s/s" % (st["units_per_s"]["median"] / 1e3, r["unit"]))
-            print("%-14s %-4s %12d %9s %7s %9.3f %8.3f %8.1f  %s" % (
-                w, e, r["counters"].get("instructions", 0), rate, spr,
+            print("%-14s %-4s %12d %s %s %7s %8.3f %8.3f %7.1f  %s" % (
+                w, e, r["counters"].get("instructions", 0), med, best, spr,
                 st["wall_s"]["median"], st["cpu_s"]["median"], st["rss_mb"]["median"],
                 ", ".join(note)), file=out)
     if ab:
-        print("\nA/B (B relative to A; ratio of medians of %s; 'noise' = the min..max ranges overlap)"
-              % "Minst/s, units/s or 1/wall", file=out)
-        h2 = "%-14s %-4s %-16s %10s %10s %8s  %-7s %s" % ("workload", "eng", "metric", "A", "B", "B/A", "verdict",
-                                                          "counters")
+        print("\nA/B, B relative to A (ratio > 1: B is faster). Metric: Minst/s, k units/s, or 1/wall.\n"
+              "median/best = ratio of the medians / of the best runs; p = Mann-Whitney on the per-run values;\n"
+              "verdict needs p <= 0.05 and both ratios beyond 2%, else 'same'.", file=out)
+        h2 = "%-14s %-4s %-16s %9s %9s %8s %8s %6s  %-6s %s" % (
+            "workload", "eng", "metric", "A med", "B med", "med B/A", "best B/A", "p", "verdict", "counters")
         print(h2, file=out)
         print("-" * len(h2), file=out)
         for x in ab:
             sc = 1e6 if x["metric"] == "winst_per_cpu_s" else (1e3 if x["metric"] == "units_per_s" else 1.0)
-            print("%-14s %-4s %-16s %10.3f %10.3f %7.3fx  %-7s %s" % (
+            print("%-14s %-4s %-16s %9.3f %9.3f %7.3fx %7.3fx %6.3f  %-6s %s" % (
                 x["workload"], x["engine"], x["metric"], x["a_median"] / sc, x["b_median"] / sc,
-                x["speedup_b_over_a"], x["verdict"],
+                x["ratio_median"], x["ratio_best"], x["p_value"], x["verdict"],
                 "identical" if x["counters_identical"] else "DIFFER: " + ", ".join(
                     "%s %s->%s" % (k, v[0], v[1]) for k, v in list(x["counter_diffs"].items())[:4])), file=out)
 
@@ -673,21 +833,26 @@ def print_table(results, ab, out=sys.stdout):
 def markdown_table(results, ab):
     import io
     buf = io.StringIO()
-    print("| workload | engine | warp-instr | Minst/s (median) | spread | wall s | RSS MB |", file=buf)
-    print("| --- | --- | ---: | ---: | ---: | ---: | ---: |", file=buf)
+    print("| workload | engine | warp-instr | Minst/s median | Minst/s best | spread | wall s | RSS MB |", file=buf)
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |", file=buf)
     for r in results:
         if r["build"] != "A" and not ab:
             continue
         st = r["stats"]
-        if "winst_per_cpu_s" in st:
-            rate, spr = "%.2f" % (st["winst_per_cpu_s"]["median"] / 1e6), "%.1f%%" % st["winst_per_cpu_s"]["spread_pct"]
-        elif "units_per_s" in st:
-            rate, spr = "%.1f k %s/s" % (st["units_per_s"]["median"] / 1e3, r["unit"]), "%.1f%%" % st["units_per_s"]["spread_pct"]
+        key = PRIMARY.get(r["workload"], "winst_per_cpu_s")
+        if key == "winst_per_cpu_s" and key in st:
+            rate = "%.2f" % (st[key]["median"] / 1e6)
+            best = "%.2f" % (st[key]["best"] / 1e6)
+            spr = "%.1f%%" % st[key]["spread_pct"]
+        elif key == "units_per_s" and key in st:
+            rate = "%.1f k %s/s" % (st[key]["median"] / 1e3, r["unit"])
+            best = "%.1f k" % (st[key]["best"] / 1e3)
+            spr = "%.1f%%" % st[key]["spread_pct"]
         else:
-            rate, spr = "-", "-"
-        print("| %s | %s%s | %d | %s | %s | %.3f | %.1f |" % (
+            rate, best, spr = "wall only", "-", "%.1f%%" % st["wall_s"]["spread_pct"]
+        print("| %s | %s%s | %d | %s | %s | %s | %.3f | %.1f |" % (
             r["workload"], r["engine"], (" (%s)" % r["build"]) if ab else "", r["counters"].get("instructions", 0),
-            rate, spr, st["wall_s"]["median"], st["rss_mb"]["median"]), file=buf)
+            rate, best, spr, st["wall_s"]["median"], st["rss_mb"]["median"]), file=buf)
     return buf.getvalue()
 
 
@@ -750,6 +915,8 @@ def check_counters(path, rel, names, engines, counts, args):
         exp = json.load(f)
     cur = compact_counters(counts, names, engines)
     bad = []
+    if exp.get("gpu_profile") != args.gpu:
+        bad.append("the expected counters were recorded on %s, this run used %s" % (exp.get("gpu_profile"), args.gpu))
     for w in names:
         for e in engines:
             want = exp.get("workloads", {}).get(w, {}).get(e)
@@ -778,12 +945,13 @@ def check_counters(path, rel, names, engines, counts, args):
 # --------------------------------------------------------------------------- mix
 
 
-def mix_table(counts_or_kernels, label_fn, out=sys.stdout):
-    """Class mix as a share of thread-instructions, per row."""
-    hdr = "%-26s %12s %7s " % ("", "warp-instr", "lanes") + " ".join("%6s" % c for c in CLASS_ORDER)
+def mix_table(rows, _unused=None, out=sys.stdout):
+    """Class mix as a share of thread-instructions, one row per (label, counter totals)."""
+    width = max([len(l) for l, _ in rows] + [10])
+    hdr = "%-*s %12s %6s " % (width, "", "warp-instr", "lanes") + " ".join("%6s" % c for c in CLASS_ORDER)
     print(hdr, file=out)
     print("-" * len(hdr), file=out)
-    for label, tot in counts_or_kernels:
+    for label, tot in rows:
         ti = tot.get("thread_instructions", 0)
         wi = tot.get("instructions", 0)
         shares = []
@@ -792,8 +960,125 @@ def mix_table(counts_or_kernels, label_fn, out=sys.stdout):
             shares.append("%5.1f%%" % (100.0 * v / ti) if ti else "     -")
         classes = sum(tot.get("mix_" + c, 0) for c in CLASS_ORDER)
         flag = "" if classes == ti else "  !! classes sum to %d, thread-instructions %d" % (classes, ti)
-        print("%-26s %12d %7.2f " % (label, wi, (ti / wi) if wi else 0.0) + " ".join(shares) + flag, file=out)
-    print("lanes = thread-instructions / warp-instructions (average active lanes of 32).", file=out)
+        print("%-*s %12d %6.2f " % (width, label, wi, (ti / wi) if wi else 0.0) + " ".join(shares) + flag, file=out)
+    print("lanes = thread-instructions / warp-instructions (average active lanes of 32). Shares are of "
+          "thread-instructions and sum to 100%.", file=out)
+
+
+# --------------------------------------------------------------------------- profile
+
+
+def perf_binary(args):
+    for c in (args.perf, os.environ.get("PERF"), shutil.which("perf")):
+        if c and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def short_name(nm, width=44):
+    """A label for a one-line summary: the dso and the vgpu:: prefixes dropped."""
+    nm = re.sub(r"^\S+ (?=\S)", "", nm, count=1) if " " in nm and not nm.startswith("vgpu") else nm
+    nm = re.sub(r"^vgpu::(sass::|exec::)?", "", nm)
+    return nm[:width]
+
+
+def tidy_symbol(raw):
+    """'libcudart.so [.] ns::(anonymous namespace)::Cls::fn(args) - -' -> 'libcudart.so ns::Cls::fn'.
+
+    The argument lists and the anonymous-namespace noise are dropped so one
+    function's lambdas and clones fold into one row; the rows are for finding
+    where the time goes, not for telling overloads apart.
+    """
+    s = re.sub(r"\s+", " ", raw).strip()
+    s = re.sub(r"( - -)+$", "", s)
+    s = s.replace("[.] ", "").replace("(anonymous namespace)::", "")
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"\((?:[^()]|\([^()]*\))*\)", "", s)
+    s = re.sub(r"\bunsigned int const\* ", "", s)
+    s = re.sub(r" \[clone [^\]]*\]?", "", s)
+    s = re.sub(r"\bconst$", "", s).strip()
+    s = re.sub(r"\.so[\d.]*", "", s, count=1)
+    return s
+
+
+def profile_one(perf, binary, workload, engine, build, args, workdir):
+    """perf record one run (software cpu-clock, user space only), then fold the report into {symbol: samples}."""
+    data = os.path.join(workdir, "%s.%s.data" % (workload, engine))
+    env = clean_env(build, args, engine, False)
+    rec = subprocess.run([perf, "record", "-q", "-e", "cpu-clock:u", "-F", str(args.freq), "-o", data,
+                          "--", binary, workload, args.size], env=env, capture_output=True, text=True)
+    if rec.returncode != 0 or not os.path.exists(data):
+        return None, "perf record failed: " + (rec.stderr or rec.stdout).strip()[:300]
+    sort = "srcline" if args.by_line else "dso,symbol"
+    rep = subprocess.run([perf, "report", "-i", data, "--stdio", "--no-children", "-n", "-g", "none",
+                          "--sort", sort, "--percent-limit", "0.05"], env=env, capture_output=True, text=True)
+    os.unlink(data)
+    out, total = {}, 0
+    for line in rep.stdout.splitlines():
+        m = re.match(r"\s*([\d.]+)%\s+(\d+)\s+(.*\S)\s*$", line)
+        if not m:
+            m2 = re.search(r"Event count|Samples: (\d+)", line)
+            continue
+        n = int(m.group(2))
+        name = tidy_symbol(m.group(3))
+        out[name] = out.get(name, 0) + n
+        total += n
+    return {"samples": out, "total": total}, ""
+
+
+def profile_mode(args, names, engines, builds, binary):
+    perf = perf_binary(args)
+    if not perf:
+        die("profile needs perf (--perf PATH or $PERF); see docs/performance.md for how it was obtained", 1)
+    build = builds["A"]["dir"]
+    groups = {}
+    for w in names:
+        groups.setdefault(WORKLOADS[w][0], []).append(w)
+    result = {}
+    with tempfile.TemporaryDirectory(prefix="vgpu-prof-") as wd:
+        for e in engines:
+            for g, ws in groups.items():
+                agg, total, per = {}, 0, {}
+                for w in ws:
+                    r, why = profile_one(perf, binary, w, e, build, args, wd)
+                    if r is None:
+                        print("profile %s/%s: %s" % (w, e, why), file=sys.stderr)
+                        continue
+                    per[w] = {"samples": r["total"],
+                              "top": sorted(r["samples"].items(), key=lambda x: -x[1])[:10]}
+                    total += r["total"]
+                    for k, v in r["samples"].items():
+                        agg[k] = agg.get(k, 0) + v
+                    if not args.quiet:
+                        print("  profiled %-14s %-4s %6d samples" % (w, e, r["total"]), file=sys.stderr)
+                result[(e, g)] = {"total": total, "workloads": per,
+                                  "top": sorted(agg.items(), key=lambda x: -x[1])[:args.top]}
+    for (e, g), r in result.items():
+        print("\n== %s engine, group %s (%s): %d samples" % (e, g, ", ".join(groups[g]), r["total"]))
+        for i, (name, n) in enumerate(r["top"], 1):
+            print("%3d  %5.1f%%  %s" % (i, 100.0 * n / r["total"] if r["total"] else 0, name[:140]))
+        for w, d in r["workloads"].items():
+            print("  [%s: %d samples] %s" % (w, d["samples"], "; ".join(
+                "%.0f%% %s" % (100.0 * n / d["samples"], short_name(nm)) for nm, n in d["top"][:5])))
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"schema": 1, "kind": "profile", "perf": perf, "freq_hz": args.freq, "size": args.size,
+                       "results": {"%s/%s" % k: v for k, v in result.items()}}, f, indent=1)
+    if args.markdown:
+        with open(args.markdown, "w") as f:
+            for (e, g), r in result.items():
+                f.write("#### %s engine, %s (%s): %d samples\n\n| # | share | function |\n| ---: | ---: | --- |\n" % (
+                    "SASS" if e == "sass" else "PTX", g, ", ".join(groups[g]), r["total"]))
+                for i, (name, n) in enumerate(r["top"], 1):
+                    f.write("| %d | %.1f%% | `%s` |\n" % (i, 100.0 * n / r["total"] if r["total"] else 0,
+                                                       name.replace("|", "\\|")[:150]))
+                f.write("\nPer workload (top 5): " + "; ".join(
+                    "**%s** (%d samples): %s" % (w, d["samples"], ", ".join(
+                        "%.0f%% `%s`" % (100.0 * n / d["samples"], short_name(nm)) for nm, n in d["top"][:5]))
+                    for w, d in r["workloads"].items()) + "\n\n")
+    return 0
 
 
 # --------------------------------------------------------------------------- command line
@@ -801,8 +1086,10 @@ def mix_table(counts_or_kernels, label_fn, out=sys.stdout):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="bench.sh", description=__doc__.split("\n\n")[0])
-    p.add_argument("mode", nargs="?", choices=["run", "mix"], default="run",
-                   help="run (default): time the workloads; mix: print instruction-class mix")
+    p.add_argument("mode", nargs="?", choices=["run", "mix", "profile", "pantheon"], default="run",
+                   help="run (default): time the workloads; mix: print instruction-class mix; "
+                        "profile: perf-sample each workload and print the top functions per engine and group; "
+                        "pantheon: time pantheon's soak workloads from a separate checkout's build-vgpu-* directory")
     p.add_argument("--build", default=os.path.join(ROOT, "build"), help="build directory (has shim/)")
     p.add_argument("--ab", nargs=2, metavar=("DIR_A", "DIR_B"), help="alternate A B A B ... between two build dirs")
     p.add_argument("--workloads", help="comma list of workloads or groups (alu tensor memory control api)")
@@ -826,6 +1113,13 @@ def build_parser():
     p.add_argument("--nvcc", help="nvcc to compile the program with (default: one matching the shim's CUDA major)")
     p.add_argument("--cache", help="directory for the compiled program (default ~/.cache/vgpu-bench)")
     p.add_argument("--record-hostname", action="store_true", help="put the host name in the JSON meta")
+    p.add_argument("--cpus", metavar="LIST", help="pin every run to these CPUs (e.g. 2-5); default: the scheduler decides")
+    p.add_argument("--pantheon-bin", metavar="DIR", help="pantheon mode: directory with the built workloads")
+    p.add_argument("--duration", type=int, default=3, help="pantheon mode: seconds each workload runs")
+    p.add_argument("--perf", help="profile: the perf binary (default: $PERF, then perf on PATH)")
+    p.add_argument("--top", type=int, default=25, help="profile: functions to list per engine and group")
+    p.add_argument("--freq", type=int, default=2999, help="profile: sampling frequency in Hz")
+    p.add_argument("--by-line", action="store_true", help="profile: attribute samples to source lines (needs a -g build)")
     p.add_argument("--build-only", action="store_true", help="compile the program, print its path, and stop")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--cmd", nargs=argparse.REMAINDER, help="mix only: run this command instead of the workloads")
@@ -840,8 +1134,16 @@ def main():
     for e in engines:
         if e not in ENGINES:
             die("unknown engine '%s' (sass, ptx)" % e)
+    if args.cpus:
+        cpus = set()
+        for part in args.cpus.split(","):
+            lo, _, hi = part.partition("-")
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+        os.sched_setaffinity(0, cpus)  # children inherit it
     if args.size is None:
         args.size = "quick" if args.mode == "mix" else "full"
+    if args.mode == "pantheon":
+        return pantheon_main(args, engines)
     names = selected_workloads(args)
     ok, builds, nvcc, rel = setup(args)
     if not ok:
@@ -853,6 +1155,8 @@ def main():
         die(msg, 1)
     # The counting runs use the quick size under --check-counters and --update-expected, else the timed size.
     args.size_for_counters = "quick" if (args.check_counters or args.update_expected) else args.size
+    if args.mode == "profile":
+        args.size_for_counters = args.size
     if args.check_counters or args.update_expected:
         args.size = "quick"
         args.threads = 1  # atomics' retry loops (CAS) take schedule-dependent paths on more than one host thread
@@ -865,6 +1169,8 @@ def main():
     if args.build_only:
         print(binary)
         return 0
+    if args.mode == "profile":
+        return profile_mode(args, names, engines, builds, binary)
     t_start = time.monotonic()
     counts, errors = count_all(binary, names, engines, builds, args)
     if errors:
@@ -955,6 +1261,31 @@ def main():
     return 0
 
 
+def pantheon_main(args, engines):
+    dirs = [args.build] if not args.ab else list(args.ab)
+    builds = {}
+    for lab, d in zip(["A", "B"] if args.ab else ["A"], dirs):
+        d = os.path.abspath(d)
+        if not os.path.isdir(os.path.join(d, "shim")):
+            die("%s has no shim/ directory" % d)
+        builds[lab] = {"dir": d, "cuda_major": shim_major(d)}
+    meta = meta_block(args, builds, None, None)
+    t0 = time.monotonic()
+    results, failures = pantheon_mode(args, builds, engines)
+    meta["elapsed_s"] = time.monotonic() - t0
+    ab = ab_compare(results) if args.ab else []
+    print_table(results, ab)
+    print("\n(duration-driven: %d s per run, counters on in every run; the rate is each run's instructions over its CPU time)"
+          % args.duration)
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"schema": 1, "meta": meta, "results": results, "ab": ab}, f, indent=1, sort_keys=True)
+    if failures:
+        print("FAIL:\n  " + "\n  ".join(failures), file=sys.stderr)
+        return 1
+    return 0
+
+
 def mix_command(args):
     """bench.sh mix --cmd prog args...: class mix of any program's launches under the shim."""
     build = os.path.abspath(args.build)
@@ -966,7 +1297,7 @@ def mix_command(args):
         r = subprocess.run(args.cmd, env=env, capture_output=True, text=True)
         kernels, log = parse_counters(r.stderr)
         for k, v in sorted(kernels.items()):
-            rows.append(("%s [%s]" % (k[:20], e), v))
+            rows.append(("%s [%s]" % (k[:48], e), v))
         rows.append(("TOTAL [%s]" % e, totals(kernels)))
     mix_table(rows, None)
     return 0

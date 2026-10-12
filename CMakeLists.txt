@@ -2258,6 +2258,16 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # The benchmark workloads' instruction counters (tools/bench): counts, never times, on SASS and PTX,
+  # against tools/bench/expected. A simulator change that alters a counter fails here.
+  add_test(NAME bench_counters
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
+  set_tests_properties(bench_counters PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_lop3_pred_chain
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
   set_tests_properties(e2e_lop3_pred_chain PROPERTIES
