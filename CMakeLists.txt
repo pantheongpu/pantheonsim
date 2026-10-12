@@ -3240,6 +3240,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # What the runtime and driver remember between launches never shows: the same
+  # results and errors with and without it, across loads, unloads and resets.
+  add_test(NAME e2e_launch_cache COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_cache.sh)
+  set_tests_properties(e2e_launch_cache PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # A kernel's fault reported by the calls after its launch, not by the
   # launch, from the runtime and the driver, as an RTX 3060 reports it.
   add_test(NAME e2e_deferred_errors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_deferred_errors.sh)
