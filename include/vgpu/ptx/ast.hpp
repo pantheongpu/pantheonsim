@@ -1190,6 +1190,31 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
                         OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith>;
 
+// An instruction of the commonest, simplest forms, decoded once at parse time
+// for the interpreter's inner loop. The general Instr is ~1 KB of variant and
+// is decoded again at every execution (which alternative, which operand
+// kinds, which modifiers); a MicroOp holds only what the arithmetic needs --
+// register ids and immediates already resolved -- in 24 bytes, so a loop of
+// them stays in cache and runs without any of that. It exists only for the
+// forms the interpreter's fast paths already take (32-bit integer arithmetic
+// and mad.lo, mov, setp, f32 arithmetic and fma, all on the narrow register
+// file, no carry, no saturation, no rounding mode); anything else has kind
+// None and runs as it always did. build_micro() decides, and mirrors the
+// conditions of Interpreter::fast_path exactly.
+struct MicroOp {
+  enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32 };
+  enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8 };
+  Kind kind = None;
+  uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind
+  uint8_t flags = 0;
+  uint8_t src_imm = 0;    // bit i set: source i is an immediate in src[i], else a register id
+  uint16_t opcode_id = 0;
+  uint16_t pred = 0;      // the guard predicate's id, if kHasPred
+  uint32_t dst = 0;       // destination register id (a predicate's, for Setp32)
+  uint32_t src[3] = {0, 0, 0};
+};
+static_assert(sizeof(MicroOp) == 24, "keep MicroOp small");
+
 struct Instr {
   size_t line = 0;                 // source line, for diagnostics
   bool has_pred = false;           // @%p / @!%p guard
@@ -1209,6 +1234,10 @@ struct Instr {
 // id stays valid for the life of the process.
 uint16_t intern_opcode(const std::string& mnemonic);
 const std::vector<std::string>& opcode_names();
+
+// Decodes fn.body into fn.micro. Pure function of the body.
+struct EntryFn;
+void build_micro(EntryFn& fn);
 
 struct ParamDecl {
   std::string name;
@@ -1254,6 +1283,9 @@ struct EntryFn {
   std::vector<std::string> module_entry_names;
   std::vector<ParamDecl> params;
   std::vector<Instr> body;
+  // body[i] decoded for the fast paths (see MicroOp); empty, or the same length
+  // as body. Filled at the end of parsing by build_micro().
+  std::vector<MicroOp> micro;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
   // Dense register numbering used by the interpreter's flat register file.
   std::map<std::string, uint32_t> reg_ids;

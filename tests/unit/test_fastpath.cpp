@@ -31,6 +31,9 @@ namespace {
 
 constexpr int kThreads = 64;   // warp 0 half predicated off, warp 1 all on
 
+// How run() guards each instruction of a body: 0 with @%q, 1 not at all, 2 with @!%q.
+int g_guard = 0;
+
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
   std::memcpy(b.data(), &v, 8);
@@ -133,7 +136,7 @@ std::vector<uint64_t> run(const std::string& body, bool wide, const std::vector<
     size_t end = body.find(';', pos);
     std::string one = body.substr(pos, end - pos + 1);
     while (!one.empty() && (one[0] == ' ' || one[0] == '\n')) one.erase(0, 1);
-    if (!one.empty()) ptx += "    @%q " + one + "\n";
+    if (!one.empty()) ptx += std::string("    ") + (g_guard == 1 ? "" : g_guard == 2 ? "@!%q " : "@%q ") + one + "\n";
     pos = end + 1;
   }
   ptx += wide ? "    mov.b64 %rd8, %D;\n" : "    cvt.u64.u32 %rd8, %d;\n";
@@ -713,6 +716,120 @@ VTEST(thread_ids_are_the_linear_index_split_by_the_block_shape) {
       VCHECK_EQ(got[lin * 3 + 2], lin / (sh[0] * sh[1]));
     }
   }
+}
+
+// The pre-decoded forms (MicroOp) run the same arithmetic as the handlers they
+// were decoded from, unguarded and under a negated guard as well as under the
+// plain one the other tests use.
+VTEST(pre_decoded_forms_match_the_general_path_under_every_guard) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  const auto f = f32_values(), g = rotate(f, 3), h = rotate(f, 8);
+  for (int guard : {1, 2}) {
+    g_guard = guard;
+    for (const char* op : {"add.u32", "sub.s32", "mul.lo.u32", "min.s32", "max.u32", "and.b32", "or.b32",
+                           "xor.b32", "shl.b32", "shr.u32", "shr.s32"}) {
+      same(std::string(op) + " %d, %a, %b;", false, a, b, c);
+      same(std::string(op) + " %d, %a, 33;", false, a, b, c);
+      same(std::string(op) + " %a, %a, %b; mov.b32 %d, %a;", false, a, b, c);
+    }
+    same("mad.lo.s32 %d, %a, %b, %c;", false, a, b, c);
+    same("mad.lo.u32 %d, %a, 7, %c;", false, a, b, c);
+    same("mov.u32 %d, %a;", false, a, b, c);
+    same("mov.b32 %d, 305419896;", false, a, b, c);
+    for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge"})
+      same(std::string("setp.") + cmp + ".s32 %p3, %a, %b; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+    for (const char* cmp : {"lt", "geu", "nan", "equ"})
+      same(std::string("setp.") + cmp + ".f32 %p3, %a, %b; selp.u32 %d, 1, 2, %p3;", false, f, g, c);
+    for (const char* op : {"add.f32", "sub.f32", "mul.f32", "div.rn.f32", "min.f32", "max.f32"})
+      same(std::string(op) + " %d, %a, %b;", false, f, g, h);
+    same("fma.rn.f32 %d, %a, %b, %c;", false, f, g, h);
+    same("fma.rn.f32 %d, %a, 0f40000000, %c;", false, f, g, h);
+  }
+  g_guard = 0;
+}
+
+// (The loop's mul.f32 and add.f32 are contracted into one fma when the module is
+// parsed; the pre-decoded forms have to describe the contracted body, not the
+// text, and this test caught the first version that did not.)
+// What the instruction counters report does not depend on which path ran the
+// instructions: a loop of pre-decoded forms, a divergent branch and a
+// predicated tail, run both ways, gives the same totals, class mix and
+// per-opcode counts, and the same data.
+VTEST(counters_do_not_depend_on_the_path) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, 0;
+    mov.f32 %f1, 0f3F800000;
+    mov.f32 %f2, 0f3DCCCCCD;
+    mov.u32 %r3, 12345;
+LOOP:
+    add.u32 %r3, %r3, %r1;
+    mad.lo.u32 %r3, %r3, 1103515245, 12345;
+    xor.b32 %r4, %r3, %r2;
+    shr.u32 %r5, %r4, 3;
+    cvt.rn.f32.u32 %f3, %r5;
+    fma.rn.f32 %f1, %f1, %f2, %f3;
+    mul.f32 %f4, %f1, %f2;
+    add.f32 %f1, %f4, %f2;
+    and.b32 %r6, %r1, 3;
+    setp.eq.u32 %p1, %r6, 0;
+    @%p1 add.u32 %r3, %r3, 5;
+    @!%p1 sub.u32 %r3, %r3, 3;
+    setp.lt.u32 %p2, %r1, %r2;
+    @%p2 bra SKIP;
+    add.u32 %r3, %r3, 1;
+SKIP:
+    add.u32 %r2, %r2, 1;
+    setp.lt.u32 %p3, %r2, 40;
+    @%p3 bra LOOP;
+    mov.b32 %r7, %f1;
+    xor.b32 %r8, %r7, %r3;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r8;
+    ret;
+}
+)";
+  auto once = [&](const char* fp, std::vector<uint32_t>& out) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t po = mem.alloc(100 * 4);
+    LaunchConfig cfg;
+    cfg.block = {100, 1, 1};
+    const exec::LaunchStats st = exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
+    out.resize(100);
+    mem.read(po, out.data(), 400);
+    unsetenv("VGPU_FASTPATH");
+    return st;
+  };
+  std::vector<uint32_t> fast_out, slow_out;
+  const exec::LaunchStats fast = once("1", fast_out), slow = once("0", slow_out);
+  {
+    std::string diffs;
+    int n = 0;
+    for (size_t i = 0; i < fast_out.size(); ++i)
+      if (fast_out[i] != slow_out[i]) {
+        ++n;
+        char b[64];
+        std::snprintf(b, sizeof b, " [%zu: %x vs %x]", i, fast_out[i], slow_out[i]);
+        if (n <= 12) diffs += b;
+      }
+    if (n) throw vtest::Failure(std::to_string(n) + " threads differ:" + diffs);
+  }
+  VCHECK(same_stats(fast, slow));
+  VCHECK(fast.instructions > 1000);
+  VCHECK(fast.divergent_branches > 0);
 }
 
 VTEST_MAIN

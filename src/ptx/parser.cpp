@@ -5571,6 +5571,11 @@ Module parse(const std::string& src) {
     }
     place_dynamic_shared(fn);
   }
+  // Last, once nothing edits an instruction any more (mul/add contraction,
+  // sync-mask folding and call resolution all do): the pre-decoded forms must
+  // describe the body the interpreter will run.
+  for (auto& fn : m.entries) build_micro(fn);
+  for (auto& fn : m.funcs) build_micro(*fn);
   return m;
 }
 
