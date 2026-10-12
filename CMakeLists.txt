@@ -1996,7 +1996,7 @@ if(TARGET vgpucublas)
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
                           "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
-                          "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
+                          "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg" "nvjpeg_damaged:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_probe:cudnn" "dnn_fp8_attention_frontend:cudnn"

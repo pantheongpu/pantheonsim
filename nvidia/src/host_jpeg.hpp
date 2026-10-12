@@ -279,4 +279,17 @@ inline void fdct8x8(const double* in, double* out, bool wide = avx2_available())
   fdct8x8_scalar(in, out);
 }
 
+
+// std::lround without the library call: the integer nearest x, halves away from zero. For |x| below 2^62 the truncation q is
+// exact and x - q is exact, so a fraction of at least one half moves q one step away from zero; anything else (huge values,
+// NaN, infinities) is handed to std::lround itself.
+inline long round_half_away(double x) {
+  if (!(std::fabs(x) < 4.0e18)) return std::lround(x);
+  long q = static_cast<long>(x);
+  const double d = x - static_cast<double>(q);
+  if (d >= 0.5) ++q;
+  else if (d <= -0.5) --q;
+  return q;
+}
+
 }  // namespace vgpu::hostjpeg

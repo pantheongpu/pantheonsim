@@ -83,6 +83,8 @@ struct HuffTable {
   uint8_t values[256] = {0};
   int mincode[17] = {0}, maxcode[18] = {0}, valptr[17] = {0};
   bool present = false;
+  // The walk's answer for every 9-bit prefix whose code is at most 9 bits long: (length << 8) | value, 0 where it is longer.
+  uint16_t lut[512] = {0};
 
   void build() {
     int code = 0, k = 0;
@@ -97,21 +99,36 @@ struct HuffTable {
     }
     maxcode[17] = 0x7FFFFFFF;
     present = true;
+    for (int v = 0; v < 512; ++v) {
+      lut[v] = 0;
+      for (int l = 1; l <= 9; ++l) {
+        const int c = v >> (9 - l);
+        if (maxcode[l] < 0 || c > maxcode[l]) continue;
+        const int idx = valptr[l] + c - mincode[l];
+        lut[v] = static_cast<uint16_t>((l << 8) | (idx >= 0 && idx < 256 ? values[idx] : 0));
+        break;
+      }
+    }
   }
 };
 
-// Reads entropy-coded data a bit at a time, unstuffing the 0xFF 0x00 pairs the
-// standard requires. Past the end of the data -- a scan cut short -- it reads
+// Reads entropy-coded data, unstuffing the 0xFF 0x00 pairs the standard
+// requires. Past the end of the data -- a scan cut short -- it reads
 // zeros, as a decoder must: NVIDIA's decodes a file truncated inside its
 // entropy-coded data and reports success.
+//
+// Bytes are taken into a 64-bit buffer ahead of the bits that are read, so a code is found from a peek at the next 16 bits
+// instead of one bit at a time. Taking them ahead moves `p` further than a byte-at-a-time reader would have, but never past a
+// marker (a marker ends the data: zeros are read in its place and p stays on it), and restart() looks for the next restart
+// marker from p, so it finds the marker the byte-at-a-time reader finds.
 struct BitReader {
   const uint8_t* p;
   const uint8_t* end;
-  uint32_t buf = 0;
-  int count = 0;
+  uint64_t acc = 0;   // the unread bits are its low `n`
+  int n = 0;
 
-  int bit() {
-    if (count == 0) {
+  void fill() {
+    while (n <= 56) {
       uint8_t b = 0;
       if (p < end) {
         b = *p;
@@ -125,36 +142,45 @@ struct BitReader {
           ++p;
         }
       }
-      buf = b;
-      count = 8;
+      acc = (acc << 8) | b;
+      n += 8;
     }
-    --count;
-    return (buf >> count) & 1;
   }
-  int bits(int n) {
-    if (n <= 0 || n > 16) return 0;
-    int v = 0;
-    for (int i = 0; i < n; ++i) v = (v << 1) | bit();
-    return v;
+  int bit() {
+    if (n < 1) fill();
+    --n;
+    return static_cast<int>((acc >> n) & 1);
+  }
+  int bits(int k) {
+    if (k <= 0 || k > 16) return 0;
+    if (n < k) fill();
+    n -= k;
+    return static_cast<int>((acc >> n) & ((1u << k) - 1));
   }
   // At a restart interval: drop the remaining bits and step over the RSTn.
   void restart() {
-    count = 0;
+    n = 0;
     while (p + 1 < end && !(p[0] == 0xFF && p[1] >= 0xD0 && p[1] <= 0xD7)) ++p;
     if (p + 1 < end) p += 2;
   }
 };
 
 int huff_decode(BitReader& br, const HuffTable& t) {
-  int code = br.bit();
-  int l = 1;
-  while (l <= 16 && (t.maxcode[l] < 0 || code > t.maxcode[l])) {
-    code = (code << 1) | br.bit();
-    ++l;
+  if (br.n < 17) br.fill();
+  const unsigned peek = static_cast<unsigned>((br.acc >> (br.n - 16)) & 0xFFFF);
+  if (const unsigned e = t.lut[peek >> 7]) {
+    br.n -= static_cast<int>(e >> 8);
+    return static_cast<int>(e & 0xFF);
   }
-  if (l > 16) return 0;
-  const int idx = t.valptr[l] + code - t.mincode[l];
-  return idx >= 0 && idx < 256 ? t.values[idx] : 0;
+  for (int l = 10; l <= 16; ++l) {
+    const int code = static_cast<int>(peek >> (16 - l));
+    if (t.maxcode[l] < 0 || code > t.maxcode[l]) continue;
+    br.n -= l;
+    const int idx = t.valptr[l] + code - t.mincode[l];
+    return idx >= 0 && idx < 256 ? t.values[idx] : 0;
+  }
+  br.n -= 17;   // no code of up to 16 bits: the walk has read 17 bits when it gives up
+  return 0;
 }
 
 // The sign convention of JPEG's variable-length integers: values whose top bit
@@ -1171,14 +1197,22 @@ Plane resample(const Plane& p, int w, int h) {
   o.h = h;
   o.s.resize(static_cast<size_t>(w) * h);
   const int fx = std::max(1, (p.w + w - 1) / w), fy = std::max(1, (p.h + h - 1) / h);
-  for (int y = 0; y < h; ++y)
+  // The source column of each destination column and the source row of each destination row, found once.
+  std::vector<int> xs(static_cast<size_t>(w)), ys(static_cast<size_t>(h));
+  for (int x = 0; x < w; ++x) xs[static_cast<size_t>(x)] = x * p.w / w;
+  for (int y = 0; y < h; ++y) ys[static_cast<size_t>(y)] = y * p.h / h;
+  const bool shrink = p.w >= w && p.h >= h;
+  // Rows are independent.
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * (shrink ? static_cast<uint64_t>(fx * fy) * 3u : 6u), h);
+  vgpu::hostpar::parallel_for(threads, h, [&](int64_t yi) {
+    const int y = static_cast<int>(yi);
     for (int x = 0; x < w; ++x) {
-      if (p.w >= w && p.h >= h) {
+      if (shrink) {
         float sum = 0;
         int n = 0;
         for (int dy = 0; dy < fy; ++dy)
           for (int dx = 0; dx < fx; ++dx) {
-            const int sx = x * p.w / w + dx, sy = y * p.h / h + dy;
+            const int sx = xs[static_cast<size_t>(x)] + dx, sy = ys[static_cast<size_t>(y)] + dy;
             if (sx < p.w && sy < p.h) {
               sum += p.s[static_cast<size_t>(sy) * p.w + sx];
               ++n;
@@ -1186,9 +1220,10 @@ Plane resample(const Plane& p, int w, int h) {
           }
         o.s[static_cast<size_t>(y) * w + x] = n ? sum / n : 0;
       } else {
-        o.s[static_cast<size_t>(y) * w + x] = p.at(x * p.w / w, y * p.h / h);
+        o.s[static_cast<size_t>(y) * w + x] = p.at(xs[static_cast<size_t>(x)], ys[static_cast<size_t>(y)]);
       }
     }
+  });
   return o;
 }
 
@@ -1232,7 +1267,7 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
           for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(bx * 8 + x, static_cast<int>(by) * 8 + y) - 128.0;
         fdct8x8(blk, coef);
         int* out = b.q.data() + (static_cast<size_t>(by) * b.bw + bx) * 64;
-        for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(std::lround(coef[kZigZag[k]] / t[k]));
+        for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(vgpu::hostjpeg::round_half_away(coef[kZigZag[k]] / t[k]));
       }
     });
   }

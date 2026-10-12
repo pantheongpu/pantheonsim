@@ -181,4 +181,33 @@ VTEST(host_fdct_matches_the_scalar_loops) {
   VCHECK_EQ(bad, 0L);
 }
 
+// round_half_away is std::lround: halves away from zero, the doubles just below and above a half, integers, huge values, NaN.
+VTEST(host_round_half_away_is_lround) {
+  std::mt19937_64 rng(5150);
+  long checked = 0, bad = 0;
+  auto check = [&](double x) {
+    ++checked;
+    const long want = std::lround(x), got = vgpu::hostjpeg::round_half_away(x);
+    if (want != got && !(std::isnan(x))) ++bad;   // (lround of a NaN is unspecified; round_half_away hands it to lround)
+  };
+  for (long i = -2000; i <= 2000; ++i) {
+    const double base = static_cast<double>(i) / 4.0;   // multiples of a quarter: halves and their neighbours
+    check(base);
+    check(std::nextafter(base, 1e300));
+    check(std::nextafter(base, -1e300));
+  }
+  for (int i = 0; i < 2000000; ++i) {
+    uint64_t bits = rng();
+    double x;
+    std::memcpy(&x, &bits, 8);
+    check(x);   // every exponent, including huge, tiny, infinities
+    check((static_cast<double>(rng() % 20000001) - 1e7) / 1000.0);
+    check((static_cast<double>(rng() % 2001) - 1000.0) / 7.0);
+  }
+  for (double x : {0.49999999999999994, -0.49999999999999994, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 4503599627370495.5, 4503599627370496.0, 9007199254740993.0, 3.9e18, 4.1e18, 1e19, -1e19})
+    check(x);
+  std::printf("  %ld values, %ld differ\n", checked, bad);
+  VCHECK_EQ(bad, 0L);
+}
+
 VTEST_MAIN
