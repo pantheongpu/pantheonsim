@@ -754,17 +754,19 @@ namespace {
 // 100 threads (three full warps and a partial one). The mul.f32 and add.f32
 // are contracted into one fma when the module is parsed; the pre-decoded forms
 // have to describe the contracted body, not the text, and this kernel caught
-// the first version that did not.
+// the first version that did not. An atomic ticket in the loop makes the data
+// depend on how the warps interleave, so a scheduler that slices them shows.
 const char* kLoopKernel = R"(.version 8.3
 .target sm_86
 .address_size 64
-.visible .entry k(.param .u64 po)
+.visible .entry k(.param .u64 po, .param .u64 pt)
 {
     .reg .pred %p<6>;
     .reg .b32 %r<16>;
     .reg .f32 %f<8>;
     .reg .b64 %rd<8>;
     ld.param.u64 %rd1, [po];
+    ld.param.u64 %rd4, [pt];
     mov.u32 %r1, %tid.x;
     mov.u32 %r2, 0;
     mov.f32 %f1, 0f3F800000;
@@ -774,6 +776,8 @@ LOOP:
     add.u32 %r3, %r3, %r1;
     mad.lo.u32 %r3, %r3, 1103515245, 12345;
     xor.b32 %r4, %r3, %r2;
+    atom.global.add.u32 %r9, [%rd4], 1;
+    add.u32 %r4, %r4, %r9;
     shr.u32 %r5, %r4, 3;
     cvt.rn.f32.u32 %f3, %r5;
     fma.rn.f32 %f1, %f1, %f2, %f3;
@@ -815,12 +819,14 @@ LoopRun run_loop(const char* fp, const char* sched = "", const char* seed = "", 
   MemoryManager mem{1 << 20};
   DeviceProfile prof = load_gpu("nvidia/a10");
   auto m = ptx::parse(kLoopKernel);
-  const uint64_t po = mem.alloc(100 * 4);
+  const uint64_t po = mem.alloc(100 * 4), pt = mem.alloc(16);
+  const uint32_t zero = 0;
+  mem.write(pt, &zero, 4);
   LaunchConfig cfg;
   cfg.block = {100, 1, 1};
   if (max_steps) cfg.max_steps = max_steps;
   try {
-    r.stats = exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
+    r.stats = exec::launch(m.entries[0], cfg, {arg_u64(po), arg_u64(pt)}, mem, prof);
   } catch (const std::exception& e) {
     r.error = e.what();
   }
@@ -874,7 +880,7 @@ VTEST(batches_stop_where_the_scheduler_slices) {
 // A warp that runs out of its step budget inside a batch fails at the same
 // instruction, with the same message, and the counters up to it agree.
 VTEST(batches_stop_at_the_step_budget) {
-  for (uint64_t budget : {1ull, 2ull, 7ull, 50ull, 333ull, 1000ull}) {
+  for (uint64_t budget : {1ull, 2ull, 7ull, 50ull, 333ull, 560ull}) {
     const LoopRun fast = run_loop("1", "", "", budget), slow = run_loop("0", "", "", budget);
     expect_same_loop(fast, slow, "budget " + std::to_string(budget));
     VCHECK(!slow.error.empty());
