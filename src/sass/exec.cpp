@@ -32,7 +32,6 @@
 #include <tuple>
 
 #include "access_count.hpp"
-#include "lane_math.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/host_atomic.hpp"
@@ -42,6 +41,8 @@
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
 #include "vgpu/exec/wgmma.hpp"
+#include "vgpu/simd/fp16.hpp"
+#include "vgpu/simd/simd.hpp"
 #if __has_include("vgpu/host_cpus.hpp")
 #include "vgpu/host_cpus.hpp"
 #define VGPU_HAVE_HOST_CPUS 1
@@ -61,12 +62,8 @@ uint64_t f64_bits(double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; }
 
 // The number of set bits of a lane mask. std::popcount in this build (baseline
 // x86-64, no POPCNT instruction) is a call into libgcc, and every instruction
-// counts its active lanes.
-inline unsigned popc(uint32_t v) {
-  v = v - ((v >> 1) & 0x55555555u);
-  v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
-  return (((v + (v >> 4)) & 0x0f0f0f0fu) * 0x01010101u) >> 24;
-}
+// counts its active lanes: vgpu/simd/simd.hpp has the one implementation.
+inline unsigned popc(uint32_t v) { return simd::popcount32(v); }
 
 // Why a lane is not runnable.
 enum class Wait : uint8_t { None, BSync, WarpSync, Bar, Cluster };

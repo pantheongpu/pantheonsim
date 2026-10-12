@@ -219,6 +219,7 @@ add_library(vgpu STATIC
   src/ptx/regalloc.cpp
   src/ptx/contract.cpp
   src/ptx/sync_masks.cpp
+  src/simd/simd.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/exec/devrt.cpp
@@ -1238,14 +1239,13 @@ vgpu_unit_test(test_fastpath)
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
 vgpu_unit_test(test_sched)
-
-# The SASS executor's memory-access counting and FFMA lane loop, against the
-# straightforward versions they replaced (src/sass/access_count.hpp, lane_math.hpp).
+# The SASS executor's memory-access counting, against the straightforward version it replaced
+# (src/sass/access_count.hpp).
 vgpu_unit_test(test_sass_access_count)
-vgpu_unit_test(test_sass_lane_math)
-
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
+vgpu_unit_test(test_simd)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -1990,6 +1990,15 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_mma_forms
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_mma_forms.sh)
   set_tests_properties(e2e_mma_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
+  # The plain ALU and tensor-core forms the SIMD kernels run (include/vgpu/simd), pinned to the bits the
+  # simulator gave before the kernels, on both engines at every SIMD level.
+  add_test(NAME e2e_simd_lane_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_simd_lane_forms.sh)
+  set_tests_properties(e2e_simd_lane_forms PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)

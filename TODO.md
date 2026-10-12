@@ -1474,6 +1474,22 @@ finish:
 fp64_virus is held back by the subnormal assists below; mma_virus by the
 matrix work itself, which is still about 1 M warp instructions a second.
 
+**2026-10-12: SIMD lane kernels (include/vgpu/simd, src/simd).** The build is baseline x86-64, so the
+numeric kernels are compiled twice (baseline, and AVX2+FMA+F16C under a target pragma) and chosen once at load;
+`VGPU_SIMD=base|avx2` caps the level and `VGPU_SIMD=off` sends the engines back to their old code.
+Profiled with perf first: the SASS HMMA path was 76% element-at-a-time decode with libgcc half-to-double calls
+(now one kernel: F16C, 8x8 transposes, the same sequential f32 sums, never fused); FFMA was a libm call per lane
+(now vfmadd); the SASS fast ALU forms stalled on a partial-store/wide-load of an operand-modifier struct (inlined);
+HFMA2 / fma.f16x2 now use F16C, a double FMA and an integer round to binary16 four lanes at a time; DADD/DMUL/DFMA
+work on the register pairs in place; fp8/fp6/fp4 decodes are tables; the exact narrow-float tensor sum takes the
+double apart with integer operations instead of ilogb/ldexp/floor. The PTX wmma path's F16C conversion had never
+run (its self-check compared against a table whose NaNs have no payload); it does now. Single thread, a10
+profile, one launch, median of 9 alternating runs on a loaded VM:
+SASS mma_virus 11.5x, omni_virus 8.7x, fp64_virus 4.6x, pulse_virus 2.8x, compute_virus 2.0x, int_virus 1.7x;
+PTX pulse_virus 2.0x, omni_virus 1.5x, mma_virus 1.4x, int_virus and fp64_virus unchanged. Not done: AVX-512
+(this host has none to test on). tests/unit/test_simd.cpp checks every kernel at every level against scalar
+references, e2e_simd_lane_forms pins the engines' bits for the forms (and keeps an RTX 3060's hashes).
+
 Since then (2026-09-27), profiled with perf again:
 
 - mma_virus's time was the WMMA fast path's bookkeeping, not the multiply.
