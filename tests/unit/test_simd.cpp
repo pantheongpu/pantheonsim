@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <atomic>
 #include <random>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -72,6 +74,78 @@ std::vector<float> f16_boundaries() {
 }
 
 }  // namespace
+
+// The F16C check is made on the first use of a kernel that needs F16C, once, from whichever thread gets there first.
+VTEST(f16c_check_is_lazy_and_selects_what_it_did) {
+  simd::testing::reset_f16c_check();
+  VCHECK(simd::f16c_state() == simd::F16cState::Unchecked);
+  VCHECK_EQ(simd::testing::f16c_checks_run(), 0);
+  // Kernels that do not use F16C do not make the check.
+  uint32_t a[32] = {1, 2, 3}, b[32] = {4, 5, 6}, c[32] = {7, 8, 9}, r[32];
+  simd::kernels().iadd3(r, a, b, c, 0);
+  VCHECK_EQ(r[0], 12u);
+  VCHECK_EQ(r[2], 18u);
+  VCHECK(simd::f16c_state() == simd::F16cState::Unchecked);
+  const uint16_t halves[8] = {0x3c00, 0x4000, 0x7bff, 0x0001, 0xfc00, 0x7e00, 0x8000, 0x3555};
+  float got[8];
+  simd::kernels().f16_to_f32(halves, got, 8);
+  for (int i = 0; i < 8; ++i) VCHECK_EQ(fb(got[i]), ref_f16_to_f32(halves[i]));
+  if (simd::level() == simd::Level::Avx2) {
+    VCHECK(simd::f16c_state() == simd::F16cState::Agrees);
+    VCHECK_EQ(simd::testing::f16c_checks_run(), 1);
+    // Afterwards the engines read the same table kernels_for gives, with the F16C kernels in it.
+    const auto& k = simd::kernels();
+    const auto& full = simd::kernels_for(simd::Level::Avx2);
+    VCHECK(k.hmma == full.hmma && k.hfma2_m == full.hfma2_m && k.f16_to_f32 == full.f16_to_f32 && k.f32_to_f16 == full.f32_to_f16);
+    VCHECK(k.hmma != simd::kernels_for(simd::Level::Base).hmma);
+    VCHECK(k.iadd3 == full.iadd3 && k.ffma == full.ffma);
+    simd::kernels().f16_to_f32(halves, got, 8);   // a second use does not check again
+    VCHECK_EQ(simd::testing::f16c_checks_run(), 1);
+  } else {
+    VCHECK(simd::f16c_state() == simd::F16cState::Unchecked);   // the baseline never needs it
+    VCHECK_EQ(simd::testing::f16c_checks_run(), 0);
+  }
+}
+
+// Eight threads reaching the first F16C kernel together: one check, every thread's result right.
+VTEST(f16c_check_with_concurrent_first_use) {
+  std::mt19937 rng(77);
+  uint32_t a[128], b[64], c[128], want[128];
+  for (auto& w : a) w = 0x3c003c00u + (rng() & 0x03ff03ffu);
+  for (auto& w : b) w = 0x3c003c00u + (rng() & 0x03ff03ffu);
+  for (auto& w : c) w = rng() & 0x3fffffffu;
+  simd::kernels_for(simd::Level::Base).hmma(0, 16, false, a, b, c, want);
+  for (int round = 0; round < 40; ++round) {
+    simd::testing::reset_f16c_check();
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t)
+      threads.emplace_back([&, t] {
+        ready.fetch_add(1);
+        while (!go.load()) {}
+        uint32_t out[128] = {};
+        if (t % 2) {
+          simd::kernels().hmma(0, 16, false, a, b, c, out);
+          for (int i = 0; i < 128; ++i) if (out[i] != want[i]) bad.fetch_add(1);
+        } else {
+          const uint16_t h[8] = {0x3c00, 0x4000, 0x7bff, 0x0001, 0xfc00, 0x7e00, 0x8000, 0x3555};
+          float f[8];
+          simd::kernels().f16_to_f32(h, f, 8);
+          for (int i = 0; i < 8; ++i) if (fb(f[i]) != ref_f16_to_f32(h[i])) bad.fetch_add(1);
+        }
+      });
+    while (ready.load() < 8) {}
+    go.store(true);
+    for (auto& th : threads) th.join();
+    VCHECK_EQ(bad.load(), 0);
+    if (simd::level() == simd::Level::Avx2) {
+      VCHECK_EQ(simd::testing::f16c_checks_run(), 1);
+      VCHECK(simd::f16c_state() == simd::F16cState::Agrees);
+    }
+  }
+}
 
 VTEST(f16_to_f32_all_inputs) {
   for (uint32_t h = 0; h < 65536; ++h)

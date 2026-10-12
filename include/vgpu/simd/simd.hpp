@@ -20,6 +20,7 @@
 // levels are checked against and the escape hatch if a host misbehaves.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -28,6 +29,19 @@ namespace vgpu::simd {
 enum class Level : int { Base = 0, Avx2 = 1 };   // Avx2 = AVX2 + FMA + F16C
 inline constexpr int kLevels = 2;
 
+
+// The F16C check (the conversions against the scalar ones, every half and a spread of floats; a host that fails it
+// gets the baseline for the four kernels that use F16C and AVX2 for the rest) is made on the first use of one of those
+// kernels, once, whatever the number of threads asking -- not when the library loads, where it cost 0.4 ms a process.
+// kernels_for(Level::Avx2) makes it too.
+enum class F16cState { Unchecked, Agrees, Disagrees };
+F16cState f16c_state();
+namespace testing {
+// Back to Unchecked, for a test of the first use; not for use while another thread runs a kernel.
+void reset_f16c_check();
+// How many times the check has run since the process started or reset_f16c_check.
+int f16c_checks_run();
+}  // namespace testing
 
 const char* level_name(Level l);
 // Whether this host can run `l` (Base always).
@@ -103,12 +117,12 @@ struct Kernels {
 namespace detail {
 // Set when the library is loaded (src/simd/simd.cpp): the baseline kernels and "on" until then, so a call from another
 // translation unit's static initialisation still works.
-extern const Kernels* g_kernels;
+extern std::atomic<const Kernels*> g_kernels;
 extern bool g_enabled;
 }  // namespace detail
 
 // The kernels at the level in use. Inline: it is called once or twice per simulated instruction.
-inline const Kernels& kernels() { return *detail::g_kernels; }
+inline const Kernels& kernels() { return *detail::g_kernels.load(std::memory_order_relaxed); }
 
 // Whether the engines use these kernels at all: VGPU_SIMD=off sends every
 // instruction down the code the kernels replaced, for A/B runs and to rule
