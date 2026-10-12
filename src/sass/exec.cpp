@@ -303,12 +303,12 @@ class Runner {
   const Instr& fetch(uint64_t addr, const Code** code_out = nullptr);
   uint32_t cbank32(unsigned bank, uint64_t offset) const;
   // 64-bit operands: a register pair inline, as read32/write32 do for one register; the rest out of line.
-  uint64_t read64(Warp& w, const Operand& o, unsigned lane) {
+  [[gnu::always_inline]] uint64_t read64(Warp& w, const Operand& o, unsigned lane) {
     if (o.kind == Kind::Reg && o.reg != kRZ) [[likely]]
       return w.reg(o.reg, lane) | (static_cast<uint64_t>(w.reg(o.reg + 1, lane)) << 32);
     return read64_slow(w, o, lane);
   }
-  void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
+  [[gnu::always_inline]] void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
     if (o.kind == Kind::Reg && o.reg != kRZ) [[likely]] {
       w.reg(o.reg, lane) = static_cast<uint32_t>(v);
       if (o.reg + 1 != kRZ) w.reg(o.reg + 1, lane) = static_cast<uint32_t>(v >> 32);   // R254's partner is RZ
@@ -361,11 +361,11 @@ class Runner {
   uint32_t ival(Warp& w, const Operand& o, unsigned lane);   // with -/~ applied
   // Operand access, inline for the common case -- a register -- since every
   // instruction makes it once per lane per operand; the rest out of line.
-  uint32_t read32(Warp& w, const Operand& o, unsigned lane) {
+  [[gnu::always_inline]] uint32_t read32(Warp& w, const Operand& o, unsigned lane) {
     if (o.kind == Kind::Reg) [[likely]] return o.reg == kRZ ? 0 : w.reg(o.reg, lane);
     return read32_slow(w, o, lane);
   }
-  void write32(Warp& w, const Operand& o, unsigned lane, uint32_t v) {
+  [[gnu::always_inline]] void write32(Warp& w, const Operand& o, unsigned lane, uint32_t v) {
     if (o.kind == Kind::Reg) [[likely]] {
       if (o.reg != kRZ) w.reg(o.reg, lane) = v;
       return;

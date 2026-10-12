@@ -1071,7 +1071,17 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         if (o.neg) d = -d;
         return d;
       };
-      if (o.kind == Kind::Reg) {
+      if (o.kind == Kind::Reg && o.reg != kRZ) {
+        // The pair's two halves as 32-lane rows (the bounds are checked once, on both).
+        const uint32_t* lo = &w.reg(o.reg, 0);
+        const uint32_t* hi = &w.reg(o.reg + 1, 0);
+        for (unsigned l = 0; l < 32; ++l) {
+          double d = as_f64(lo[l] | (static_cast<uint64_t>(hi[l]) << 32));
+          if (o.abs) d = std::fabs(d);
+          if (o.neg) d = -d;
+          v[i][l] = d;
+        }
+      } else if (o.kind == Kind::Reg) {
         for (unsigned l = 0; l < 32; ++l) v[i][l] = f64src(l);
       } else {
         const double d = f64src(0);   // the same for every lane
@@ -1082,9 +1092,15 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     if (ins.op == Op::DADD) for (unsigned l = 0; l < 32; ++l) res[l] = v[0][l] + v[1][l];
     else if (ins.op == Op::DMUL) for (unsigned l = 0; l < 32; ++l) res[l] = v[0][l] * v[1][l];
     else dfma_lanes(res, v[0], v[1], v[2]);
+    const Operand& d = ins.dst[0];
+    if (d.reg == kRZ) return true;   // nothing is written to RZ
+    uint32_t* dlo = &w.reg(d.reg, 0);
+    uint32_t* dhi = d.reg + 1 == kRZ ? nullptr : &w.reg(d.reg + 1, 0);   // R254's partner is RZ
     for (Mask m = ex; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      write64(w, ins.dst[0], l, f64_bits(res[l]));
+      const uint64_t bits = f64_bits(res[l]);
+      dlo[l] = static_cast<uint32_t>(bits);
+      if (dhi) dhi[l] = static_cast<uint32_t>(bits >> 32);
     }
     return true;
   }
