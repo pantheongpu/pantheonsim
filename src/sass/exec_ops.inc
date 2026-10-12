@@ -578,7 +578,7 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     case Op::POPC: case Op::UPOPC:
-      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, static_cast<uint32_t>(std::popcount(ival(w, ins.src[0], l)))); });
+      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, popc(ival(w, ins.src[0], l))); });
       return;
     case Op::FLO: case Op::UFLO: {
       const bool sgn = ins.f[0], sh = ins.f[1];

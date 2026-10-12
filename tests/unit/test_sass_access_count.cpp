@@ -57,6 +57,9 @@ void check(const uint64_t* addr, Mask lanes, uint32_t bytes, const char* what) {
   if (s_new != s_ref)
     throw vtest::Failure(std::string(what) + ": sectors " + std::to_string(s_new) + " vs " + std::to_string(s_ref) +
                          " (bytes " + std::to_string(bytes) + ", mask " + std::to_string(lanes) + ")");
+  // The scan the bitmap hands wide spreads to is checked on every access too.
+  if (vgpu::sass::distinct_sectors_scan(addr, lanes, bytes) != s_ref)
+    throw vtest::Failure(std::string(what) + ": scan sectors differ (bytes " + std::to_string(bytes) + ")");
   if (lanes) {
     const uint64_t b_new = vgpu::sass::bank_passes(addr, lanes, bytes), b_ref = ref_passes(addr, lanes, bytes);
     if (b_new != b_ref)

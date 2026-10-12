@@ -302,8 +302,22 @@ class Runner {
   // ---- state access ----
   const Instr& fetch(uint64_t addr, const Code** code_out = nullptr);
   uint32_t cbank32(unsigned bank, uint64_t offset) const;
-  uint64_t read64(Warp& w, const Operand& o, unsigned lane);
-  void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v);
+  // 64-bit operands: a register pair inline, as read32/write32 do for one register; the rest out of line.
+  uint64_t read64(Warp& w, const Operand& o, unsigned lane) {
+    if (o.kind == Kind::Reg && o.reg != kRZ) [[likely]]
+      return w.reg(o.reg, lane) | (static_cast<uint64_t>(w.reg(o.reg + 1, lane)) << 32);
+    return read64_slow(w, o, lane);
+  }
+  void write64(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
+    if (o.kind == Kind::Reg && o.reg != kRZ) [[likely]] {
+      w.reg(o.reg, lane) = static_cast<uint32_t>(v);
+      if (o.reg + 1 != kRZ) w.reg(o.reg + 1, lane) = static_cast<uint32_t>(v >> 32);   // R254's partner is RZ
+      return;
+    }
+    write64_slow(w, o, lane, v);
+  }
+  uint64_t read64_slow(Warp& w, const Operand& o, unsigned lane);
+  void write64_slow(Warp& w, const Operand& o, unsigned lane, uint64_t v);
   bool pred(Warp& w, const Operand& o, unsigned lane) const;
   void set_pred(Warp& w, const Operand& o, unsigned lane, bool v);
   uint32_t sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const;
@@ -575,7 +589,7 @@ uint32_t Runner::read32_slow(Warp& w, const Operand& o, unsigned lane) {
   }
 }
 
-uint64_t Runner::read64(Warp& w, const Operand& o, unsigned lane) {
+uint64_t Runner::read64_slow(Warp& w, const Operand& o, unsigned lane) {
   switch (o.kind) {
     case Kind::Reg:
       if (o.reg == kRZ) return 0;
@@ -604,10 +618,10 @@ void Runner::write32_slow(Warp& w, const Operand& o, unsigned /*lane*/, uint32_t
   }
 }
 
-void Runner::write64(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
+void Runner::write64_slow(Warp& w, const Operand& o, unsigned lane, uint64_t v) {
   write32(w, o, lane, static_cast<uint32_t>(v));
-  Operand hi = o;
   if (o.kind == Kind::Reg && o.reg == kRZ) return;
+  Operand hi = o;
   hi.reg = o.reg + 1;
   write32(w, hi, lane, static_cast<uint32_t>(v >> 32));
 }
@@ -1237,17 +1251,17 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // spinning, the next group up, so it gives the others a turn. One pass
   // over the runnable lanes finds the lowest address and its lanes (every
   // instruction comes through here, so it is kept short).
-  const uint64_t cur = w.pc[std::countr_zero(run)];
-  uint64_t lo = cur;
+  // The comparisons are kept out of branches: in a diverged warp the lanes' addresses differ
+  // unpredictably, and a mispredicted branch per lane was the largest cost of this loop.
+  uint64_t lo = w.pc[std::countr_zero(run)];
   Mask group = 0;
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     const uint64_t p = w.pc[l];
-    if (p < lo) {
-      lo = p;
-      group = 0;
-    }
-    if (p == lo) group |= Mask{1} << l;
+    const bool lower = p < lo;
+    group &= lower ? Mask{0} : kAll;
+    lo = lower ? p : lo;
+    group |= static_cast<Mask>(p == lo) << l;
   }
   uint64_t pick = lo;
   // The group a YIELD let in keeps the warp until it yields in turn or can no longer run, so that the

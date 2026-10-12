@@ -28,7 +28,7 @@ constexpr unsigned kMaxWordsPerLane = 9;
 // already seen: a warp's lanes mostly land in the same few sectors (a coalesced
 // access touches 4 to 8), so the scans are short, and sorting every access is
 // not needed to count.
-inline uint64_t distinct_sectors(const uint64_t* addr, uint32_t lanes, uint32_t bytes) {
+inline uint64_t distinct_sectors_scan(const uint64_t* addr, uint32_t lanes, uint32_t bytes) {
   uint64_t seen[32 * kMaxSectorsPerLane];
   unsigned n = 0;
   uint64_t prev = ~uint64_t{0};   // the sector last added or matched: neighbouring lanes usually share it
@@ -50,6 +50,42 @@ inline uint64_t distinct_sectors(const uint64_t* addr, uint32_t lanes, uint32_t 
       prev = s;
       have_prev = true;
     }
+  }
+  return n;
+}
+
+// The same count by a bitmap when the sectors lie within 256 of each other (8 KiB -- every coalesced
+// access, and most strided ones): one pass finds the lowest sector, a second sets a bit for each
+// sector touched, and the answer is the bits set. No data-dependent branches, so no mispredictions
+// on a scattered pattern. Wider spreads take the scan above.
+inline uint64_t distinct_sectors(const uint64_t* addr, uint32_t lanes, uint32_t bytes) {
+  uint64_t lo = ~uint64_t{0}, hi = 0;
+  for (uint32_t m = lanes; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t first = addr[l] / 32, last = (addr[l] + bytes - 1) / 32;
+    if (last < first) continue;   // the access wraps the address space: the scan counts nothing for it
+    lo = std::min(lo, first);
+    hi = std::max(hi, std::min(last, first + (kMaxSectorsPerLane - 1)));
+  }
+  if (lo > hi) return 0;
+  if (hi - lo >= 256) return distinct_sectors_scan(addr, lanes, bytes);
+  uint64_t bits[4] = {};
+  for (uint32_t m = lanes; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t first = addr[l] / 32, last = (addr[l] + bytes - 1) / 32;
+    if (last < first) continue;
+    const uint64_t end = std::min(last, first + (kMaxSectorsPerLane - 1));
+    for (uint64_t s = first; s <= end; ++s) {
+      const uint64_t rel = s - lo;
+      bits[rel >> 6] |= uint64_t{1} << (rel & 63);
+    }
+  }
+  uint64_t n = 0;
+  for (uint64_t b : bits) {
+    b = b - ((b >> 1) & 0x5555555555555555ull);
+    b = (b & 0x3333333333333333ull) + ((b >> 2) & 0x3333333333333333ull);
+    b = (b + (b >> 4)) & 0x0f0f0f0f0f0f0f0full;
+    n += (b * 0x0101010101010101ull) >> 56;
   }
   return n;
 }
