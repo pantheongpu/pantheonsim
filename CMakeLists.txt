@@ -1184,6 +1184,8 @@ vgpu_unit_test(test_blackwell)
 vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
+# The memory manager's per-thread lookup cache, against its general path.
+vgpu_unit_test(test_memfast)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.

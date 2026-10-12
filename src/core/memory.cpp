@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #if defined(__x86_64__)
@@ -35,7 +36,8 @@ void relaxed_store(uint8_t* p, uint64_t v) {
 // chunk's storage is not aligned for that width, so no path copies the bytes a
 // concurrent store is writing.
 uint64_t load_at(const uint8_t* p, uint32_t size) {
-  if (reinterpret_cast<uintptr_t>(p) % size == 0) {
+  // `size` is 1, 2, 4 or 8 in every caller: a mask, not a division.
+  if ((reinterpret_cast<uintptr_t>(p) & (size - 1)) == 0) {
     switch (size) {
       case 1: return relaxed_load<uint8_t>(p);
       case 2: return relaxed_load<uint16_t>(p);
@@ -48,7 +50,7 @@ uint64_t load_at(const uint8_t* p, uint32_t size) {
   return v;
 }
 void store_at(uint8_t* p, uint32_t size, uint64_t v) {
-  if (reinterpret_cast<uintptr_t>(p) % size == 0) {
+  if ((reinterpret_cast<uintptr_t>(p) & (size - 1)) == 0) {
     switch (size) {
       case 1: relaxed_store<uint8_t>(p, v); return;
       case 2: relaxed_store<uint16_t>(p, v); return;
@@ -353,6 +355,85 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
                     !is_device_va(addr)  ? " (looks like a host pointer, not a device pointer)"
                     : !owns(addr)      ? " (belongs to a different device)"
                                        : "");
+}
+
+namespace {
+// What one thread remembers of its lookups in resolve_scalar. Zero-initialised,
+// so it needs no construction; an epoch of zero is one no lock has.
+struct LookupMemory {
+  static constexpr unsigned kWays = 8;
+  struct Entry {
+    uint64_t epoch = 0;
+    uint64_t base = 0;
+    uint64_t size = 0;
+    const void* allocation = nullptr;
+  };
+  Entry way[kWays];
+  unsigned last = 0;     // the way that answered last: the next lookup tries it first
+  uint32_t victim = 1;   // which way a new entry replaces: pseudo-random (xorshift), so a
+                         // kernel cycling through more allocations than there are ways
+                         // still hits some of the time instead of never
+};
+thread_local LookupMemory t_lookups;
+}  // namespace
+
+bool MemoryManager::lookup_cache_default() {
+  const char* v = std::getenv("VGPU_LOOKUP_CACHE");
+  return !(v && v[0] == '0' && v[1] == '\0');
+}
+
+const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, uint64_t len, const char* op,
+                                                               uint64_t* base_out, bool writing,
+                                                               bool page_slack) const {
+  BigReaderLock* lock = table_lock_.get();
+  if (lock && lookup_cache_) {
+    LookupMemory& mem = t_lookups;
+    const uint64_t epoch = lock->epoch();
+    const auto hit = [&](const LookupMemory::Entry& e) {
+      if (e.epoch != epoch) return false;
+      const uint64_t off = addr - e.base;
+      // Written as a remaining length, as resolve() does: addr + len wraps.
+      return off < e.size && len <= e.size - off;
+    };
+    {
+      const LookupMemory::Entry& e = mem.way[mem.last];
+      if (hit(e)) {
+        if (base_out) *base_out = e.base;
+        return *static_cast<const Allocation*>(e.allocation);
+      }
+    }
+    for (unsigned i = 0; i < LookupMemory::kWays; ++i) {
+      const LookupMemory::Entry& e = mem.way[i];
+      if (!hit(e)) continue;
+      mem.last = i;
+      if (base_out) *base_out = e.base;
+      return *static_cast<const Allocation*>(e.allocation);
+    }
+    if (!lock->written_by_me()) {
+      SharedGuard table_guard(lock);
+      auto up = live_.upper_bound(addr);
+      if (up != live_.begin()) {
+        auto prev = std::prev(up);
+        const Allocation& a = prev->second;
+        const uint64_t off = addr - prev->first;
+        if (off < a.size && len <= a.size - off) {
+          // The epoch read under the shared lock cannot move while it is held.
+          uint32_t v = mem.victim;
+          v ^= v << 13, v ^= v >> 17, v ^= v << 5;
+          mem.victim = v;
+          mem.last = v % LookupMemory::kWays;
+          LookupMemory::Entry& e = mem.way[mem.last];
+          e.epoch = lock->epoch();
+          e.base = prev->first;
+          e.size = a.size;
+          e.allocation = &a;
+          if (base_out) *base_out = prev->first;
+          return a;
+        }
+      }
+    }
+  }
+  return resolve(addr, len, op, base_out, writing, page_slack);
 }
 
 MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t len, const char* op,
@@ -1072,7 +1153,7 @@ void run_in(uint8_t* c, const uint8_t* s, uint64_t n, uint32_t unit) {
 const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, uint64_t len, uint32_t unit,
                                                                uint64_t* base) const {
   if (unit != 1 && unit != 2 && unit != 4 && unit != 8) return nullptr;
-  if (addr % unit || len % unit || access_fault_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  if ((addr & (unit - 1)) || (len & (unit - 1)) || access_fault_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up == live_.begin()) return nullptr;
@@ -1167,7 +1248,7 @@ bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* siz
 uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
   if (size != 1 && size != 2 && size != 4 && size != 8)
     throw Error::make(Err::Internal, "load_scalar: bad size ", size);
-  if (addr % size != 0)
+  if ((addr & (size - 1)) != 0)   // size is 1, 2, 4 or 8, checked above
     throw Error::make(Err::MisalignedAccess, "load of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
   const uint8_t* p = nullptr;
@@ -1213,7 +1294,7 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
 void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   if (size != 1 && size != 2 && size != 4 && size != 8)
     throw Error::make(Err::Internal, "store_scalar: bad size ", size);
-  if (addr % size != 0)
+  if ((addr & (size - 1)) != 0)   // size is 1, 2, 4 or 8, checked above
     throw Error::make(Err::MisalignedAccess, "store of ", size, " bytes at ", Hex{addr},
                       " is not naturally aligned (real GPUs fault on this)");
   // A fault armed on stores changes what reaches device memory, so every later
@@ -1257,7 +1338,7 @@ void MemoryManager::load_quad(uint64_t addr, uint64_t out[2]) const {
   // Sixteen aligned bytes never straddle a chunk (kChunkSize is a multiple
   // of 16).
   uint64_t base = 0;
-  const Allocation& a = resolve(addr, 16, "device memory read", &base, /*writing=*/false, /*page_slack=*/true);
+  const Allocation& a = resolve_scalar(addr, 16, "device memory read", &base, /*writing=*/false, /*page_slack=*/true);
   const uint64_t off = addr - base;
   const uint8_t* chunk = a.chunks[off / kChunkSize].load(std::memory_order_acquire);
   if (!chunk) {
@@ -1278,7 +1359,7 @@ void MemoryManager::store_quad(uint64_t addr, const uint64_t in[2]) {
   }
   uint64_t base = 0;
   auto& a = const_cast<Allocation&>(
-      resolve(addr, 16, "device memory write", &base, /*writing=*/false, /*page_slack=*/false));
+      resolve_scalar(addr, 16, "device memory write", &base, /*writing=*/false, /*page_slack=*/false));
   const uint64_t off = addr - base;
   const uint64_t chunk_idx = off / kChunkSize;
   uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);
@@ -1315,8 +1396,8 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
     if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
   }
   uint64_t base = 0;
-  auto& a = const_cast<Allocation&>(resolve(addr, size, create ? "device memory write" : "device memory read",
-                                            &base, /*writing=*/false, /*page_slack=*/!create));
+  auto& a = const_cast<Allocation&>(resolve_scalar(addr, size, create ? "device memory write" : "device memory read",
+                                                   &base, /*writing=*/false, /*page_slack=*/!create));
   const uint64_t off = addr - base;
   const uint64_t chunk_idx = off / kChunkSize;
   uint8_t* chunk = a.chunks[chunk_idx].load(std::memory_order_acquire);

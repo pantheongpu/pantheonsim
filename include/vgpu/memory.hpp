@@ -242,6 +242,14 @@ class MemoryManager {
     return value;
   }
 
+  // Whether a kernel's scalar accesses use resolve_scalar's per-thread memory of
+  // recent lookups (on unless VGPU_LOOKUP_CACHE=0 when the manager is made).
+  // Nothing observable depends on it -- values, errors and their text are
+  // the same either way, which tests/unit/test_memfast.cpp checks -- so it is
+  // there to be switched off and compared against, never to be tuned.
+  void set_lookup_cache(bool on) { lookup_cache_ = on; }
+  bool lookup_cache() const { return lookup_cache_; }
+
   // Locates the live allocation containing `addr`. Returns false if none.
   bool find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const;
 
@@ -471,6 +479,15 @@ class MemoryManager {
   // page (set_page_size).
   const Allocation& resolve(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
                             bool writing = false, bool page_slack = false) const;
+  // resolve() for a kernel's scalar access, where the lookup is nearly all the
+  // access costs. A thread remembers the last few ordinary allocations it
+  // resolved, with the table lock's epoch (vgpu/brlock.hpp) it found them
+  // under; while no allocation, free or mapping has changed the table, an
+  // access wholly inside one of them needs no lock and no map walk. Everything
+  // else -- a miss, a range that runs off the end, a mapped or freed address --
+  // takes resolve(), so every diagnostic is the one resolve() makes.
+  const Allocation& resolve_scalar(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
+                                   bool writing, bool page_slack) const;
   // The mapped-memory half of resolve: a hit returns the handle's allocation,
   // a miss returns null so the caller can carry on with its own diagnostics.
   const Allocation* resolve_mapped(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
@@ -479,6 +496,8 @@ class MemoryManager {
   void read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const;
   Allocation& resolve_mut(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out);
 
+  static bool lookup_cache_default();
+  bool lookup_cache_ = lookup_cache_default();
   uint64_t capacity_;
   uint64_t va_base_;
   uint64_t used_ = 0;
