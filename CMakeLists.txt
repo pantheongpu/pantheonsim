@@ -1243,6 +1243,9 @@ vgpu_unit_test(test_sched)
 # straightforward versions they replaced (src/sass/access_count.hpp, lane_math.hpp).
 vgpu_unit_test(test_sass_access_count)
 vgpu_unit_test(test_sass_lane_math)
+
+# The memory manager's per-thread lookup cache, against its general path.
+vgpu_unit_test(test_memfast)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.

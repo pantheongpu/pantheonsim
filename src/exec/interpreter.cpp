@@ -48,6 +48,7 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
+#include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -3372,23 +3373,7 @@ class Interpreter {
       // access wider than a word touches consecutive words, which the hardware
       // takes in separate passes -- counting each word is what makes a
       // conflict-free 8-byte access come out as conflict-free.
-      uint32_t worst = 1;
-      for (uint32_t bank = 0; bank < 32; ++bank) {
-        std::array<uint64_t, kMaxWarpSize * 4> words{};
-        uint32_t distinct = 0;
-        for (uint32_t lane = 0; lane < W_; ++lane) {
-          if (!(m & (Mask{1} << lane))) continue;
-          for (uint64_t off = 0; off < span; off += 4) {
-            const uint64_t word = (addrs[lane] + off) / 4;
-            if (word % 32 != bank) continue;
-            bool seen = false;
-            for (uint32_t i = 0; i < distinct; ++i)
-              if (words[i] == word) { seen = true; break; }
-            if (!seen && distinct < words.size()) words[distinct++] = word;
-          }
-        }
-        if (distinct > worst) worst = distinct;
-      }
+      const uint32_t worst = memcount::ptx_bank_passes(addrs.data(), m, W_, span);
       stats_.shared_bank_conflicts += worst - 1;
       ++stats_.shared_requests;
       if (is_store) {
@@ -3406,19 +3391,7 @@ class Interpreter {
     // Everything else moves in 32-byte sectors. Count the distinct ones the
     // warp touched: four for a coalesced 32-lane 4-byte load, up to 32 when
     // every lane lands in its own sector.
-    std::array<uint64_t, kMaxWarpSize * 8> sectors{};
-    uint32_t distinct = 0;
-    for (uint32_t lane = 0; lane < W_; ++lane) {
-      if (!(m & (Mask{1} << lane))) continue;
-      const uint64_t first = addrs[lane] / 32;
-      const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
-      for (uint64_t sec = first; sec <= last; ++sec) {
-        bool seen = false;
-        for (uint32_t i = 0; i < distinct; ++i)
-          if (sectors[i] == sec) { seen = true; break; }
-        if (!seen && distinct < sectors.size()) sectors[distinct++] = sec;
-      }
-    }
+    const uint32_t distinct = memcount::distinct_sectors(addrs.data(), m, W_, span, kMaxWarpSize * 8);
     if (space == Space::Local) {
       stats_.local_sectors += distinct;
       ++stats_.local_requests;
@@ -9720,6 +9693,30 @@ class Interpreter {
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n, /*is_store=*/false);
     }
+    // The whole warp's loads in one call when that is exactly what lane-by-lane
+    // would do: ordinary device memory, every access aligned, no fault armed
+    // (MemoryManager::load_batch). Otherwise the lane loop below, which meets
+    // any error at the lane it belongs to.
+    if ((op.space == Space::Global || op.space == Space::Generic) && n <= 4 && !(op.ordered && n > 1)) {
+      uint64_t fa[kMaxWarpSize * 4], fv[kMaxWarpSize * 4];
+      size_t cnt = 0;
+      bool ok = true;
+      for (uint32_t lane = 0; lane < W_ && ok; ++lane)
+        if (m & (Mask{1} << lane)) {
+          const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+          if (addr % va != 0) ok = false;
+          for (size_t e = 0; e < n; ++e) fa[cnt++] = addr + e * size;
+        }
+      if (ok && mem_.load_batch(fa, cnt, size, fv)) {
+        LaneSet batched(n);
+        size_t k = 0;
+        for (uint32_t lane = 0; lane < W_; ++lane)
+          if (m & (Mask{1} << lane))
+            for (size_t e = 0; e < n; ++e) batched[e][lane] = fv[k++];
+        for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, batched[e], op.ty);
+        return;
+      }
+    }
     LaneSet results(n);
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
@@ -9790,6 +9787,31 @@ class Interpreter {
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n, /*is_store=*/true);
+    }
+    // As in exec_ld: the warp's stores in one call (MemoryManager::store_batch),
+    // in lane order and element order, when they are all ordinary aligned device
+    // memory with no fault armed; the lane loop below otherwise.
+    if ((op.space == Space::Global || op.space == Space::Generic) && n <= 4 && !(op.ordered && n > 1)) {
+      uint64_t fa[kMaxWarpSize * 4], fv[kMaxWarpSize * 4];
+      uint8_t fl[kMaxWarpSize * 4];
+      size_t cnt = 0;
+      bool ok = true;
+      for (uint32_t lane = 0; lane < W_ && ok; ++lane)
+        if (m & (Mask{1} << lane)) {
+          const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+          if (addr % va != 0) ok = false;
+          for (size_t e = 0; e < n; ++e) {
+            fa[cnt] = addr + e * size;
+            fv[cnt] = mask_to_bits(vals[e][lane], op.ty.bits);
+            fl[cnt++] = static_cast<uint8_t>(lane);
+          }
+        }
+      size_t failed_at = 0;
+      try {
+        if (ok && mem_.store_batch(fa, cnt, size, fv, &failed_at)) return;
+      } catch (const Error& e) {
+        rethrow_with_context(e, ins, fl[failed_at]);
+      }
     }
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
