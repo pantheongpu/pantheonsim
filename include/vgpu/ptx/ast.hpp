@@ -1197,13 +1197,13 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
 // register ids and immediates already resolved -- in 24 bytes, so a loop of
 // them stays in cache and runs without any of that. It exists only for the
 // forms the interpreter's fast paths already take (32-bit integer arithmetic
-// and mad.lo, mov, setp, f32 arithmetic and fma, all on the narrow register
+// and mad.lo, mov, setp, selp, not, shf, f32 arithmetic and fma, all on the narrow register
 // file, no carry, no saturation, no rounding mode); anything else has kind
 // None and runs as it always did. build_micro() decides, and mirrors the
 // conditions of Interpreter::fast_path exactly.
 struct MicroOp {
-  enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32 };
-  enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8 };
+  enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32, Selp32, Not32, Shf32, Bra };
+  enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32 };
   Kind kind = None;
   uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind
   uint8_t flags = 0;
@@ -1211,7 +1211,7 @@ struct MicroOp {
   uint16_t opcode_id = 0;
   uint16_t pred = 0;      // the guard predicate's id, if kHasPred
   uint32_t dst = 0;       // destination register id (a predicate's, for Setp32)
-  uint32_t src[3] = {0, 0, 0};
+  uint32_t src[3] = {0, 0, 0};   // Selp32: src[2] is the selecting predicate's id; Bra: src[0] the target
 };
 static_assert(sizeof(MicroOp) == 24, "keep MicroOp small");
 

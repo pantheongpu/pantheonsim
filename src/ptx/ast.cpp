@@ -127,6 +127,29 @@ void build_micro(EntryFn& fn) {
         if (op->ty.is_float()) u.flags |= MicroOp::kFloat;
         if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
       }
+    } else if (const auto* op = std::get_if<OpSelp>(&ins.op)) {
+      ok = op->ty.bits == 32 && !op->pred.wide && op->pred.id != kNoReg && narrow_dst(op->dst) &&
+           source(0, op->a) && source(1, op->b);
+      if (ok) {
+        u.kind = MicroOp::Selp32;
+        u.src[2] = op->pred.id;
+      }
+    } else if (const auto* op = std::get_if<OpNot>(&ins.op)) {
+      ok = !op->logical && op->ty.bits == 32 && narrow_dst(op->dst) && source(0, op->src);
+      if (ok) u.kind = MicroOp::Not32;
+    } else if (const auto* op = std::get_if<OpShf>(&ins.op)) {
+      ok = narrow_dst(op->dst) && source(0, op->a) && source(1, op->b) && source(2, op->c);
+      if (ok) {
+        u.kind = MicroOp::Shf32;
+        if (op->left) u.flags |= MicroOp::kLeft;
+        if (op->wrap) u.flags |= MicroOp::kWrap;
+      }
+    } else if (const auto* op = std::get_if<OpBra>(&ins.op)) {
+      ok = op->target <= 0xFFFFFFFFu;
+      if (ok) {
+        u.kind = MicroOp::Bra;
+        u.src[0] = static_cast<uint32_t>(op->target);
+      }
     } else if (const auto* op = std::get_if<OpFma>(&ins.op)) {
       ok = !(op->round != FRound::Nearest || op->sat || op->ftz || op->neg_ab || op->neg_c) && op->ty.bits == 32 &&
            narrow_dst(op->dst) && source(0, op->a) && source(1, op->b) && source(2, op->c);

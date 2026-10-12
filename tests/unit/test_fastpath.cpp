@@ -744,6 +744,18 @@ VTEST(pre_decoded_forms_match_the_general_path_under_every_guard) {
       same(std::string(op) + " %d, %a, %b;", false, f, g, h);
     same("fma.rn.f32 %d, %a, %b, %c;", false, f, g, h);
     same("fma.rn.f32 %d, %a, 0f40000000, %c;", false, f, g, h);
+    same("not.b32 %d, %a;", false, a, b, c);
+    for (const char* op : {"shf.l.wrap.b32", "shf.r.wrap.b32", "shf.l.clamp.b32", "shf.r.clamp.b32"}) {
+      same(std::string(op) + " %d, %a, %b, %c;", false, a, b, c);
+      same(std::string(op) + " %d, %a, %b, 33;", false, a, b, c);
+      same(std::string(op) + " %d, %a, %b, 32;", false, a, b, c);
+      same(std::string(op) + " %d, %a, %b, 0;", false, a, b, c);
+    }
+    for (const char* cmp : {"lt", "ne", "ge"}) {
+      same(std::string("setp.") + cmp + ".s32 %p3, %a, %b; selp.b32 %d, %a, %b, %p3;", false, a, b, c);
+      same(std::string("setp.") + cmp + ".s32 %p3, %a, %b; selp.u32 %d, %a, 77, %p3;", false, a, b, c);
+      same(std::string("setp.") + cmp + ".f32 %p3, %a, %b; selp.f32 %d, 0f3F800000, %b, %p3;", false, f, g, h);
+    }
   }
   g_guard = 0;
 }
@@ -885,6 +897,64 @@ VTEST(batches_stop_at_the_step_budget) {
     expect_same_loop(fast, slow, "budget " + std::to_string(budget));
     VCHECK(!slow.error.empty());
   }
+}
+
+// A warp that has run a long turn (2^16 instructions) gives it up at its next
+// backward branch, whichever way the instructions around it ran. Four warps
+// take tickets from one counter now and then in a long loop; which ticket a
+// lane gets depends on where each warp yielded, so the tickets are the same in
+// both modes only if the batch yields at the same branch.
+VTEST(long_turns_yield_at_the_same_branch) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 po, .param .u64 pt)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [po];
+    ld.param.u64 %rd4, [pt];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+LOOP:
+    add.u32 %r2, %r2, 1;
+    and.b32 %r4, %r2, 4095;
+    setp.eq.u32 %p1, %r4, 0;
+    @%p1 atom.global.add.u32 %r5, [%rd4], 1;
+    @%p1 add.u32 %r3, %r3, %r5;
+    setp.lt.u32 %p2, %r2, 30000;
+    @%p2 bra LOOP;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r3;
+    ret;
+}
+)";
+  auto once = [&](const char* fp, std::vector<uint32_t>& out) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t po = mem.alloc(128 * 4), pt = mem.alloc(16);
+    const uint32_t zero = 0;
+    mem.write(pt, &zero, 4);
+    LaunchConfig cfg;
+    cfg.block = {128, 1, 1};
+    const exec::LaunchStats st = exec::launch(m.entries[0], cfg, {arg_u64(po), arg_u64(pt)}, mem, prof);
+    out.resize(128);
+    mem.read(po, out.data(), 512);
+    unsetenv("VGPU_FASTPATH");
+    return st;
+  };
+  std::vector<uint32_t> fast_out, slow_out;
+  const exec::LaunchStats fast = once("1", fast_out), slow = once("0", slow_out);
+  VCHECK(fast_out == slow_out);
+  VCHECK(same_stats(fast, slow));
+  VCHECK(fast.instructions > 4 * 30000 * 6);
+  // The warps really did interleave: lane 0 of warp 0 did not take every ticket.
+  VCHECK(fast_out[0] != fast_out[32]);
 }
 
 VTEST_MAIN

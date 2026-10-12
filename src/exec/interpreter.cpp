@@ -3075,7 +3075,21 @@ class Interpreter {
       if (progress_ && ((stats_.instructions + n) & 0xFFFFF) == 0) break;
       const InstClass cls = class_of_pc(pc);
       if (cls == InstClass::Tensor) break;
-      if (!exec_micro(w, u, mask)) break;
+      // A branch every active lane takes, or none does, moves the pc; one that
+      // splits the warp is exec_bra's to do. A backward one after a long turn
+      // asks the warp to yield, as exec_bra does, and ends the batch.
+      size_t next = pc + 1;
+      bool yield = false;
+      if (u.kind == MicroOp::Bra) {
+        Mask fm;
+        if (!micro_guard(w, u, mask, fm) || (fm != 0 && fm != mask)) break;
+        if (fm != 0) {
+          next = u.src[0];
+          if (next <= pc && steps + 1 - turn_start_ >= kLongTurn) yield = true;
+        }
+      } else if (!exec_micro(w, u, mask)) {
+        break;
+      }
       if (n != 0) ++issued;
       ++n;
       ++steps;
@@ -3084,7 +3098,11 @@ class Interpreter {
         if (u.opcode_id >= stats_.inst_by_opcode.size()) stats_.inst_by_opcode.resize(u.opcode_id + 1u, 0);
         ++stats_.inst_by_opcode[u.opcode_id];
       }
-      ++pc;
+      pc = next;
+      if (yield) {
+        w.yield_now = true;
+        break;
+      }
     }
     if (n != 0) {
       const uint64_t lanes = mask == all_ ? W_ : static_cast<uint64_t>(popcount_mask(mask));
@@ -3105,15 +3123,23 @@ class Interpreter {
   // nothing changed -- for a case it leaves to the general path: a guard
   // predicate nothing has written (which the general path reports) or an
   // armed arithmetic fault (which it applies).
-  bool exec_micro(Warp& w, const MicroOp& u, Mask mask) {
-    Mask fm = mask;
+  // The lanes of `mask` the instruction's guard lets through; false when the
+  // guard predicate is one nothing has written.
+  bool micro_guard(const Warp& w, const MicroOp& u, Mask mask, Mask& fm) const {
+    fm = mask;
     if (u.flags & MicroOp::kHasPred) {
       if (u.pred >= w.written32.size() || !w.written32[u.pred] || u.pred >= w.preds.size()) return false;
       Mask p = w.preds[u.pred];
       if (u.flags & MicroOp::kPredNeg) p = ~p;
       fm &= p;
     }
-    if (fm == 0) return true;
+    return true;
+  }
+
+  bool exec_micro(Warp& w, const MicroOp& u, Mask mask) {
+    Mask fm;
+    if (!micro_guard(w, u, mask, fm)) return false;
+    if (fm == 0 && u.kind != MicroOp::Bra) return true;
     switch (u.kind) {
       case MicroOp::Int32: return micro_int32(w, u, fm);
       case MicroOp::MadLo32: return micro_mad_lo32(w, u, fm);
@@ -3121,6 +3147,10 @@ class Interpreter {
       case MicroOp::Setp32: return micro_setp32(w, u, fm);
       case MicroOp::Fma32: return micro_fma32(w, u, fm);
       case MicroOp::Float32: return micro_float32(w, u, fm);
+      case MicroOp::Selp32: return micro_selp32(w, u, fm);
+      case MicroOp::Not32: return micro_not32(w, u, fm);
+      case MicroOp::Shf32: return micro_shf32(w, u, fm);
+      case MicroOp::Bra: return false;   // moves the pc: run_micro_batch's, or step()'s
       case MicroOp::None: break;
     }
     return false;
@@ -3187,6 +3217,42 @@ class Interpreter {
     const uint32_t* c = micro_src(w, u, 2);
     uint32_t* d = dst32(w, u.dst, fm);
     fma32_lanes(d, a, b, c, fm, W_);
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // selp: a where the predicate is set, b elsewhere. A predicate nothing has
+  // written is the general path's error to report (read_pred).
+  bool micro_selp32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t pid = u.src[2];
+    if (pid >= w.written32.size() || !w.written32[pid] || pid >= w.preds.size()) return false;
+    const Mask p = w.preds[pid];
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = (p >> l & 1) ? a[l] : b[l]; });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  bool micro_not32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* v = micro_src(w, u, 0);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = ~v[l]; });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // shf: the 64-bit value b:a shifted by c (wrapped to 5 bits, or clamped to
+  // 32), the high word for a left shift and the low word for a right one.
+  bool micro_shf32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    uint32_t* d = dst32(w, u.dst, fm);
+    const bool left = u.flags & MicroOp::kLeft, wrap = u.flags & MicroOp::kWrap;
+    for_active(fm, W_, [&](uint32_t l) {
+      const uint64_t funnel = (uint64_t{b[l]} << 32) | a[l];
+      const uint32_t n = wrap ? (c[l] & 31u) : std::min<uint32_t>(c[l], 32u);
+      d[l] = left ? static_cast<uint32_t>((funnel << n) >> 32) : static_cast<uint32_t>(funnel >> n);
+    });
     w.written32[u.dst] = 1;
     return true;
   }
