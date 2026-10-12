@@ -1,0 +1,16 @@
+    60.50%  r7proto  r7proto               [.] Runner::fast_alu
+    13.05%  r7proto  r7proto               [.] unsigned int const* Runner::fast_alu
+     6.91%  r7proto  r7proto               [.] Runner::execute
+     4.93%  r7proto  r7proto               [.] Runner::step_warp
+     2.51%  r7proto  r7proto               [.] Runner::fast_alu
+     2.07%  r7proto  r7proto               [.] unsigned int const* Runner::fast_alu
+     1.99%  r7proto  r7proto               [.] straight
+     1.73%  r7proto  r7proto               [.] Runner::read32_slow
+     1.47%  r7proto  r7proto               [.] Runner::read32
+     1.30%  r7proto  libgcc_s.so.1         [.] __popcountdi2
+     0.61%  r7proto  r7proto               [.] __popcountdi2@plt
+     0.61%  r7proto  r7proto               [.] Runner::exec_control
+     0.35%  r7proto  r7proto               [.] vgpu::MemoryManager::resolve
+     0.35%  r7proto  r7proto               [.] Runner::cbank32
+     0.26%  r7proto  r7proto               [.] Runner::fetch
+     0.26%  r7proto  r7proto               [.] count_access
