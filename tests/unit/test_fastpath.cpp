@@ -668,4 +668,51 @@ VTEST(refused_accesses_give_the_same_error) {
   }
 }
 
+// Thread ids come out as (lin % nx, lin / nx % ny, lin / (nx * ny)) for the
+// block shapes that wrap in x, in y, in both, and at a warp boundary.
+VTEST(thread_ids_are_the_linear_index_split_by_the_block_shape) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %tid.y;
+    mov.u32 %r3, %tid.z;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ntid.y;
+    mad.lo.u32 %r6, %r3, %r5, %r2;
+    mad.lo.u32 %r6, %r6, %r4, %r1;
+    mul.wide.u32 %rd2, %r6, 12;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r1;
+    st.global.u32 [%rd3+4], %r2;
+    st.global.u32 [%rd3+8], %r3;
+    ret;
+}
+)";
+  const uint32_t shapes[][3] = {{105, 1, 1}, {5, 3, 7}, {33, 2, 1}, {1, 1, 64}, {7, 1, 9},
+                                {32, 4, 2}, {1, 33, 1}, {3, 11, 3}, {64, 1, 1}, {2, 2, 17}};
+  for (const auto& sh : shapes) {
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint32_t n = sh[0] * sh[1] * sh[2];
+    const uint64_t out = mem.alloc(n * 12);
+    LaunchConfig cfg;
+    cfg.block = {sh[0], sh[1], sh[2]};
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, mem, prof);
+    std::vector<uint32_t> got(n * 3);
+    mem.read(out, got.data(), got.size() * 4);
+    for (uint32_t lin = 0; lin < n; ++lin) {
+      VCHECK_EQ(got[lin * 3], lin % sh[0]);
+      VCHECK_EQ(got[lin * 3 + 1], lin / sh[0] % sh[1]);
+      VCHECK_EQ(got[lin * 3 + 2], lin / (sh[0] * sh[1]));
+    }
+  }
+}
+
 VTEST_MAIN

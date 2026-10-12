@@ -2756,13 +2756,27 @@ class Interpreter {
       warp.written32.assign(fn_.num_regs32, 0);
       warp.written64.assign(fn_.num_regs64, 0);
       Mask live = 0;
+      // Thread ids by counting up from the warp's first thread: the division
+      // form (lin % nx, lin / nx % ny, lin / (nx * ny)) cost three 64-bit
+      // divisions a lane, and the ids it gives are exactly these.
+      const uint64_t first = uint64_t{static_cast<uint32_t>(w)} * W_;
+      uint32_t x = static_cast<uint32_t>(first % b.ctx.ntid[0]);
+      uint32_t y = static_cast<uint32_t>((first / b.ctx.ntid[0]) % b.ctx.ntid[1]);
+      uint32_t z = static_cast<uint32_t>(first / (uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1]));
       for (uint32_t lane = 0; lane < W_; ++lane) {
-        uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * W_ + lane;
+        uint64_t lin = first + lane;
         if (lin >= total) break;
         live |= (Mask{1} << lane);
-        warp.tid_x[lane] = static_cast<uint32_t>(lin % b.ctx.ntid[0]);
-        warp.tid_y[lane] = static_cast<uint32_t>((lin / b.ctx.ntid[0]) % b.ctx.ntid[1]);
-        warp.tid_z[lane] = static_cast<uint32_t>(lin / (uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1]));
+        warp.tid_x[lane] = x;
+        warp.tid_y[lane] = y;
+        warp.tid_z[lane] = z;
+        if (++x == b.ctx.ntid[0]) {
+          x = 0;
+          if (++y == b.ctx.ntid[1]) {
+            y = 0;
+            ++z;
+          }
+        }
       }
       if (live) warp.paths.push_back({0, live});
       else warp.state = Warp::State::Done;
@@ -2780,7 +2794,10 @@ class Interpreter {
   // spin on a global flag another block has to set, and a warp spinning without
   // a bound would never give that block a turn.
   bool step_block(BlockState& b, Scheduler& sched, uint64_t slice) {
-    std::vector<size_t> runnable;
+    // Reused across turns: a block takes one per warp-turn, and a vector of
+    // its own made each of them an allocation.
+    std::vector<size_t>& runnable = runnable_;
+    runnable.clear();
     for (size_t i = 0; i < b.warps.size(); ++i)
       if (b.warps[i].state == Warp::State::Ready) runnable.push_back(i);
     if (runnable.empty()) {
@@ -12317,6 +12334,7 @@ class Interpreter {
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
+  std::vector<size_t> runnable_;   // step_block's scratch: the warps ready to run
   bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
   // the process. Assigned once per launch rather than per interpreter, so the
