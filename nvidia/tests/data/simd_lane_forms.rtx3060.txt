@@ -25,9 +25,12 @@ dadd                   random 791a2c2762411b6b
 dmul                   random 517efbae1afcae4a
 dfma_negabs            random 01deb91556ae6795
 wmma_f16_f32acc        random 2d1055b6a5b8f10b
+wmma_f16_f32acc_nonan  random 2d1055b6a5b8f10b
 wmma_f16_f16acc        random 333f183029c4a7b9
 wmma_bf16_f32acc       random dfd6f636d3b5ed76
+wmma_bf16_f32acc_nonan random dfd6f636d3b5ed76
 wmma_tf32_f32acc       random 86bd936e5bfbb35a
+wmma_tf32_f32acc_nonan random 86bd936e5bfbb35a
 iadd3                  edges 49c71ed3b7449d4f
 iadd3_neg              edges a3b8411866eb1931
 imad                   edges 2d20bb7902b2cadf
@@ -55,6 +58,9 @@ dadd                   edges 3034471095167cad
 dmul                   edges 5e9819c234c5e1b2
 dfma_negabs            edges b9b695bc3e847a14
 wmma_f16_f32acc        edges 9e903f34da247b71
+wmma_f16_f32acc_nonan  edges 9e903f34da247b71
 wmma_f16_f16acc        edges bf08f1f8e0848d04
 wmma_bf16_f32acc       edges f41926582f84361b
+wmma_bf16_f32acc_nonan edges f41926582f84361b
 wmma_tf32_f32acc       edges fe40df6dd0003817
+wmma_tf32_f32acc_nonan edges fe40df6dd0003817
