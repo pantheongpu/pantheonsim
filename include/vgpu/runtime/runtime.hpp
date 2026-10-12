@@ -55,8 +55,9 @@ class Device {
   }
 
   // Reports host<->device traffic to telemetry (bytes and the time it took).
-  void note_transfer(uint64_t bytes, double seconds) {
-    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(physical_), bytes, seconds);
+  // `now_ns`: the steady clock in nanoseconds, if the caller has just read it (telemetry::Publisher::note_transfer).
+  void note_transfer(uint64_t bytes, double seconds, int64_t now_ns = -1) {
+    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(physical_), bytes, seconds, now_ns);
   }
 
   // Destroys everything this device holds -- loaded modules and their globals,

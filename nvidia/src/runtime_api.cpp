@@ -2824,7 +2824,8 @@ static cudaError_t cudaMemcpy_body(void* dst, const void* src, size_t count, cud
         return cudaErrorInvalidValue;
     }
     const auto _t1 = std::chrono::steady_clock::now();
-    current(s).note_transfer(count, std::chrono::duration<double>(_t1 - _t0).count());
+    current(s).note_transfer(count, std::chrono::duration<double>(_t1 - _t0).count(),
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(_t1.time_since_epoch()).count());
     if (vgpu::profiling::enabled() && kind == cudaMemcpyDeviceToDevice && dd && sd &&
         device_of_address(src) != device_of_address(dst)) {
       const uint64_t end_ns = vgpu::profiling::now_ns();
