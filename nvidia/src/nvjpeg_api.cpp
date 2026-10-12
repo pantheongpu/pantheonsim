@@ -168,17 +168,6 @@ int extend(int v, int n) {
 // a corrupt file from overflowing the dequantisation multiply.
 int16_t clamp16(int v) { return static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v)); }
 
-const double (*dct_basis())[8] {
-  static double c[8][8];
-  static std::once_flag once;
-  std::call_once(once, [] {
-    for (int u = 0; u < 8; ++u)
-      for (int x = 0; x < 8; ++x)
-        c[u][x] = (u == 0 ? std::sqrt(0.125) : 0.5) * std::cos((2 * x + 1) * u * M_PI / 16.0);
-  });
-  return c;
-}
-
 // Separable inverse DCT in single precision with fused multiply-adds, level
 // shifted and rounded half up, as a GPU computes one. Against NVIDIA's decoder
 // on an RTX 3060 this was identical on all but 10 of 5.5 million decoded
@@ -188,22 +177,7 @@ const double (*dct_basis())[8] {
 // steps in each.)
 void idct8x8(const int* in, uint8_t* out, int stride) { vgpu::hostjpeg::idct8x8(in, out, stride); }
 
-void fdct8x8(const double* in, double* out) {
-  const double(*c)[8] = dct_basis();
-  double tmp[64];
-  for (int y = 0; y < 8; ++y)
-    for (int u = 0; u < 8; ++u) {
-      double s = 0;
-      for (int x = 0; x < 8; ++x) s += c[u][x] * in[y * 8 + x];
-      tmp[y * 8 + u] = s;
-    }
-  for (int u = 0; u < 8; ++u)
-    for (int v = 0; v < 8; ++v) {
-      double s = 0;
-      for (int y = 0; y < 8; ++y) s += c[v][y] * tmp[y * 8 + u];
-      out[v * 8 + u] = s;
-    }
-}
+void fdct8x8(const double* in, double* out) { vgpu::hostjpeg::fdct8x8(in, out); }
 
 /* ======================================================================== */
 /* The decoder                                                              */
@@ -1096,8 +1070,8 @@ struct EncTable {
 
 struct BitWriter {
   std::string out;
-  uint32_t buf = 0;
-  int count = 0;
+  uint64_t buf = 0;
+  int count = 0;           // bits waiting in buf (fewer than 8 between calls)
   bool counting = false;   // a first pass gathering symbol frequencies writes nothing
 
   void byte(uint8_t b) { out.push_back(static_cast<char>(b)); }
@@ -1109,33 +1083,30 @@ struct BitWriter {
     byte(0xFF);
     byte(m);
   }
+  // The low `len` bits of `code`, most significant first. They gather in a 64-bit buffer and leave a byte at a time (a 0xFF
+  // byte is followed by a stuffed 0x00, so it is not read as a marker); the bitstream is the one a bit-at-a-time writer makes.
   void put(int code, int len) {
     if (counting) return;
-    for (int i = len - 1; i >= 0; --i) {
-      buf = (buf << 1) | ((code >> i) & 1);
-      if (++count == 8) {
-        const uint8_t b = static_cast<uint8_t>(buf & 0xFF);
-        byte(b);
-        if (b == 0xFF) byte(0x00);   // stuffing, so the byte is not read as a marker
-        buf = 0;
-        count = 0;
-      }
+    if (len <= 0) return;
+    buf = (buf << len) | (static_cast<uint64_t>(static_cast<uint32_t>(code)) & ((uint64_t(1) << len) - 1));
+    count += len;
+    while (count >= 8) {
+      count -= 8;
+      const uint8_t b = static_cast<uint8_t>((buf >> count) & 0xFF);
+      byte(b);
+      if (b == 0xFF) byte(0x00);
     }
+    buf &= (uint64_t(1) << count) - 1;   // (what has not left yet)
   }
   void flush() {
     if (counting) return;
-    while (count) put(1, 1);   // pad with ones, as the standard says
+    if (count) put((1 << (8 - count)) - 1, 8 - count);   // pad with ones, as the standard says
   }
 };
 
 int magnitude(int v) {
-  int n = 0;
-  int a = v < 0 ? -v : v;
-  while (a) {
-    ++n;
-    a >>= 1;
-  }
-  return n;
+  const unsigned a = v < 0 ? 0u - static_cast<unsigned>(v) : static_cast<unsigned>(v);
+  return a ? 32 - __builtin_clz(a) : 0;   // the number of bits of |v|
 }
 
 void scale_quant(const uint8_t* base, int quality, uint16_t* out) {
@@ -1251,15 +1222,19 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
     b.q.assign(static_cast<size_t>(b.bw) * b.bh * 64, 0);
     const Plane& p = planes[c];
     const uint16_t* t = qt[c == 0 ? 0 : 1];
-    for (int by = 0; by < b.bh; ++by)
+    // Rows of blocks are independent.
+    const unsigned threads =
+        vgpu::hostpar::plan(static_cast<uint64_t>(b.bw) * static_cast<uint64_t>(b.bh) * 700u, b.bh);
+    vgpu::hostpar::parallel_for(threads, b.bh, [&](int64_t by) {
       for (int bx = 0; bx < b.bw; ++bx) {
         double blk[64], coef[64];
         for (int y = 0; y < 8; ++y)
-          for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(bx * 8 + x, by * 8 + y) - 128.0;
+          for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(bx * 8 + x, static_cast<int>(by) * 8 + y) - 128.0;
         fdct8x8(blk, coef);
         int* out = b.q.data() + (static_cast<size_t>(by) * b.bw + bx) * 64;
         for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(std::lround(coef[kZigZag[k]] / t[k]));
       }
+    });
   }
 
   const bool progressive = prm.encoding == 0xC2;

@@ -201,4 +201,82 @@ inline void rgb_to_luma(const uint8_t* r, const uint8_t* g, const uint8_t* b, ui
   rgb_to_luma_scalar(r, g, b, out, n);
 }
 
+
+// ---- the forward DCT of the encoder ----
+//
+// Two passes of eight-term sums in double, each term c[u][x] * in rounded and then added (no fused multiply-add), the sum
+// starting at 0 and taking x = 0 .. 7 in order. The wide path keeps four outputs of a row in the lanes of a vector, each lane
+// the same chain in the same order.
+
+// c[u][x] = (u == 0 ? sqrt(1/8) : 1/2) * cos((2x + 1) u pi / 16), in double.
+inline const double (*basis_d())[8] {
+  static const struct Table {
+    double c[8][8];
+    Table() {
+      for (int u = 0; u < 8; ++u)
+        for (int x = 0; x < 8; ++x) c[u][x] = (u == 0 ? std::sqrt(0.125) : 0.5) * std::cos((2 * x + 1) * u * M_PI / 16.0);
+    }
+  } t;
+  return t.c;
+}
+
+inline void fdct8x8_scalar(const double* in, double* out) {
+  const double(*c)[8] = basis_d();
+  double tmp[64];
+  for (int y = 0; y < 8; ++y)
+    for (int u = 0; u < 8; ++u) {
+      double s = 0;
+      for (int x = 0; x < 8; ++x) s += c[u][x] * in[y * 8 + x];
+      tmp[y * 8 + u] = s;
+    }
+  for (int u = 0; u < 8; ++u)
+    for (int v = 0; v < 8; ++v) {
+      double s = 0;
+      for (int y = 0; y < 8; ++y) s += c[v][y] * tmp[y * 8 + u];
+      out[v * 8 + u] = s;
+    }
+}
+
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline void fdct8x8_avx2(const double* in, double* out) {
+  const double(*c)[8] = basis_d();
+  // ct[x][u]: the coefficient of input x for output u, so the lanes (u) of one x are adjacent.
+  alignas(32) double ct[8][8];
+  for (int x = 0; x < 8; ++x)
+    for (int u = 0; u < 8; ++u) ct[x][u] = c[u][x];
+  alignas(32) double tmp[64];
+  for (int y = 0; y < 8; ++y) {
+    __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();   // outputs u = 0..3 and 4..7 of row y
+    for (int x = 0; x < 8; ++x) {
+      const __m256d v = _mm256_set1_pd(in[y * 8 + x]);
+      lo = _mm256_add_pd(lo, _mm256_mul_pd(_mm256_load_pd(&ct[x][0]), v));
+      hi = _mm256_add_pd(hi, _mm256_mul_pd(_mm256_load_pd(&ct[x][4]), v));
+    }
+    _mm256_store_pd(&tmp[y * 8], lo);
+    _mm256_store_pd(&tmp[y * 8 + 4], hi);
+  }
+  for (int v = 0; v < 8; ++v) {
+    __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();   // outputs u = 0..3 and 4..7 of coefficient row v
+    for (int y = 0; y < 8; ++y) {
+      const __m256d cv = _mm256_set1_pd(c[v][y]);
+      lo = _mm256_add_pd(lo, _mm256_mul_pd(cv, _mm256_load_pd(&tmp[y * 8])));
+      hi = _mm256_add_pd(hi, _mm256_mul_pd(cv, _mm256_load_pd(&tmp[y * 8 + 4])));
+    }
+    _mm256_storeu_pd(&out[v * 8], lo);
+    _mm256_storeu_pd(&out[v * 8 + 4], hi);
+  }
+}
+#endif
+
+inline void fdct8x8(const double* in, double* out, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    fdct8x8_avx2(in, out);
+    return;
+  }
+#endif
+  (void)wide;
+  fdct8x8_scalar(in, out);
+}
+
 }  // namespace vgpu::hostjpeg

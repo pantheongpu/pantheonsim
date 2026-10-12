@@ -140,4 +140,45 @@ VTEST(host_colour_rows_match_for_every_triple) {
   VCHECK_EQ(bad, 0L);
 }
 
+namespace {
+// nvjpeg_api.cpp's fdct8x8 as it was.
+void original_fdct8x8(const double* in, double* out) {
+  const double(*c)[8] = dct_basis();
+  double tmp[64];
+  for (int y = 0; y < 8; ++y)
+    for (int u = 0; u < 8; ++u) {
+      double s = 0;
+      for (int x = 0; x < 8; ++x) s += c[u][x] * in[y * 8 + x];
+      tmp[y * 8 + u] = s;
+    }
+  for (int u = 0; u < 8; ++u)
+    for (int v = 0; v < 8; ++v) {
+      double s = 0;
+      for (int y = 0; y < 8; ++y) s += c[v][y] * tmp[y * 8 + u];
+      out[v * 8 + u] = s;
+    }
+}
+}  // namespace
+
+VTEST(host_fdct_matches_the_scalar_loops) {
+  std::mt19937_64 rng(808);
+  std::uniform_real_distribution<double> u(-128.0, 127.0);
+  long blocks = 0, bad = 0;
+  for (int round = 0; round < 40000; ++round) {
+    double in[64];
+    for (auto& v : in) v = round % 4 == 0 ? static_cast<double>(static_cast<int>(rng() % 256) - 128) : u(rng);
+    if (round % 7 == 0) for (auto& v : in) v = 0.0;
+    double want[64], got[64];
+    original_fdct8x8(in, want);
+    for (const bool wide : {false, true}) {
+      if (wide && !vgpu::hostjpeg::avx2_available()) continue;
+      vgpu::hostjpeg::fdct8x8(in, got, wide);
+      ++blocks;
+      if (std::memcmp(want, got, sizeof want) != 0) ++bad;
+    }
+  }
+  std::printf("  %ld forward transforms, %ld differ\n", blocks, bad);
+  VCHECK_EQ(bad, 0L);
+}
+
 VTEST_MAIN

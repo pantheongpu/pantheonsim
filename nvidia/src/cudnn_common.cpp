@@ -9,6 +9,7 @@
 #include <set>
 
 #include "host_conv.hpp"
+#include "host_parallel.hpp"
 #include "vgpu/runtime/capture.hpp"
 
 namespace vgpu_cudnn {
@@ -296,6 +297,31 @@ void packed_strides(int rank, const int64_t* dims, bool channels_last, int64_t* 
   strides[0] = s;
 }
 
+namespace {
+// Whether element i of the logical (row-major) order sits at offset i: the strides are the packed ones (a dimension of
+// extent 1 contributes nothing whatever its stride).
+bool packed_row_major(const Layout& t) {
+  int64_t s = 1;
+  for (int d = t.rank; d-- > 0;) {
+    if (t.dims[d] != 1 && t.strides[d] != s) return false;
+    s *= t.dims[d];
+  }
+  return true;
+}
+
+// Runs fn(begin, end) over [0, n) in pieces on as many threads as the work warrants; elements are independent.
+template <class Fn>
+void convert_pieces(size_t n, Fn&& fn) {
+  constexpr size_t kPiece = 1 << 15;
+  const int64_t pieces = static_cast<int64_t>((n + kPiece - 1) / kPiece);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * 6, pieces, 1u << 20);
+  vgpu::hostpar::parallel_for(threads, pieces, [&](int64_t p) {
+    const size_t b = static_cast<size_t>(p) * kPiece;
+    fn(b, std::min(n, b + kPiece));
+  });
+}
+}  // namespace
+
 bool read(const Layout& t, const void* dev, std::vector<double>* out) {
   const size_t eb = type_bytes(t.type), n = t.count();
   out->assign(n, 0.0);
@@ -304,6 +330,27 @@ bool read(const Layout& t, const void* dev, std::vector<double>* out) {
   std::vector<uint8_t> raw(t.span() * eb);
   if (cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
   double* v = out->data();
+  if (packed_row_major(t)) {
+    // The common case: element i is at offset i, so the decode runs straight down the buffer (and over threads).
+    const uint8_t* r = raw.data();
+    switch (t.type) {
+      case CUDNN_DATA_FLOAT:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { float f; std::memcpy(&f, r + i * 4, 4); v[i] = f; } });
+        return true;
+      case CUDNN_DATA_DOUBLE:
+        convert_pieces(n, [&](size_t b, size_t e) { std::memcpy(v + b, r + b * 8, (e - b) * 8); });
+        return true;
+      case CUDNN_DATA_HALF:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { uint16_t h; std::memcpy(&h, r + i * 2, 2); v[i] = half_to_float(h); } });
+        return true;
+      case CUDNN_DATA_BFLOAT16:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { uint16_t h; std::memcpy(&h, r + i * 2, 2); v[i] = bf16_to_float(h); } });
+        return true;
+      default:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) v[i] = decode(t.type, r + i * eb); });
+        return true;
+    }
+  }
   each(t, [&](size_t i, size_t off) { v[i] = decode(t.type, raw.data() + off * eb); });
   return true;
 }
@@ -316,6 +363,28 @@ bool write(const Layout& t, void* dev, const std::vector<double>& v) {
   // A strided tensor's gaps belong to someone else: keep them.
   if (raw.size() != n * eb && cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess)
     return false;
+  if (packed_row_major(t)) {
+    uint8_t* r = raw.data();
+    const double* src = v.data();
+    switch (t.type) {
+      case CUDNN_DATA_FLOAT:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const float f = static_cast<float>(src[i]); std::memcpy(r + i * 4, &f, 4); } });
+        break;
+      case CUDNN_DATA_DOUBLE:
+        convert_pieces(n, [&](size_t b, size_t e) { std::memcpy(r + b * 8, src + b, (e - b) * 8); });
+        break;
+      case CUDNN_DATA_HALF:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_half(static_cast<float>(src[i])); std::memcpy(r + i * 2, &h, 2); } });
+        break;
+      case CUDNN_DATA_BFLOAT16:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_bf16(static_cast<float>(src[i])); std::memcpy(r + i * 2, &h, 2); } });
+        break;
+      default:
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) encode(t.type, src[i], r + i * eb); });
+        break;
+    }
+    return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+  }
   each(t, [&](size_t i, size_t off) { encode(t.type, v[i], raw.data() + off * eb); });
   return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
 }
