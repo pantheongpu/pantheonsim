@@ -1339,3 +1339,277 @@ VTEST(the_device_heap_holds_its_limit_across_threads) {
   VCHECK_EQ(got.load(), limit);
   VCHECK_EQ(mm.heap_used(), limit);
 }
+
+// ---- The host-memory guard ---------------------------------------------------
+//
+// A program that touches more memory than the host has must get an out-of-memory
+// error, not the kernel's OOM killer. The guard reads the host's figures from
+// files the configuration names, so these tests give it synthetic ones.
+namespace {
+
+constexpr uint64_t kMiB = 1024 * 1024, kGiB = 1024 * kMiB;
+
+struct FakeHost {
+  std::string dir;
+  FakeHost() {
+    char t[] = "/tmp/vgpu-hostguard-XXXXXX";
+    dir = ::mkdtemp(t) ? t : "";
+  }
+  ~FakeHost() {
+    if (!dir.empty()) std::filesystem::remove_all(dir);
+  }
+  void put(const std::string& rel, const std::string& text) const {
+    const std::filesystem::path p = std::filesystem::path(dir) / rel;
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream(p) << text;
+  }
+  void meminfo(uint64_t total, uint64_t available) const {
+    put("meminfo", "MemTotal:       " + std::to_string(total / 1024) + " kB\nMemFree:         1 kB\nMemAvailable:   " +
+                       std::to_string(available / 1024) + " kB\nBuffers:         1 kB\n");
+  }
+  // A v2 cgroup with a limit and its use; a limit of 0 writes "max".
+  void cgroup(const std::string& path, uint64_t limit, uint64_t current, uint64_t cache = 0) const {
+    put("cg" + path + "/memory.max", limit ? std::to_string(limit) + "\n" : "max\n");
+    put("cg" + path + "/memory.current", std::to_string(current) + "\n");
+    put("cg" + path + "/memory.stat",
+        "anon 1\nfile 1\ninactive_file " + std::to_string(cache) + "\nactive_file 0\nslab 1\n");
+  }
+  vgpu::backing::Config config(const std::string& cgroup_path = "/a/b") const {
+    put("self", "0::" + cgroup_path + "\n");
+    vgpu::backing::Config c;
+    c.meminfo_path = dir + "/meminfo";
+    c.cgroup_root = dir + "/cg";
+    c.cgroup_self = dir + "/self";
+    return c;
+  }
+};
+
+// One chunk, taken and given back.
+bool acquires(const vgpu::backing::Config& c) {
+  vgpu::backing::configure(c);
+  uint8_t* chunk = vgpu::backing::acquire();
+  vgpu::backing::release(chunk);
+  return chunk != nullptr;
+}
+
+}  // namespace
+
+VTEST(host_guard_stays_quiet_when_the_host_has_plenty) {
+  FakeHost h;
+  h.meminfo(16 * kGiB, 8 * kGiB);
+  h.cgroup("/a/b", 4 * kGiB, 1 * kGiB);
+  VCHECK(acquires(h.config()));
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_refuses_a_chunk_when_mem_available_is_below_the_reserve) {
+  FakeHost h;
+  h.meminfo(16 * kGiB, 512 * kMiB);   // the reserve: 6% of 16 GiB is under 1 GiB, so 1 GiB
+  vgpu::backing::configure(h.config());
+  auto err = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK(err.code() == Err::OutOfMemory);
+  VCHECK_CONTAINS(err.what(), "MemAvailable 512 MB");
+  VCHECK_CONTAINS(err.what(), "reserve of 1024 MB");
+  VCHECK_CONTAINS(err.what(), "VGPU_MEMORY_HOST_RESERVE_MB");
+  VCHECK_CONTAINS(err.what(), "VGPU_MEMORY_HOST_GUARD=0");
+  VCHECK_CONTAINS(err.what(), "VGPU_MEMORY_DIR");
+  // Nothing was handed out, and once the host has memory again the next chunk comes.
+  h.meminfo(16 * kGiB, 8 * kGiB);
+  uint8_t* chunk = vgpu::backing::acquire();
+  VCHECK(chunk != nullptr);
+  vgpu::backing::release(chunk);
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_reserve_is_six_percent_of_the_memory_between_one_and_four_gib) {
+  FakeHost h;
+  h.meminfo(128 * kGiB, 3 * kGiB + 512 * kMiB);   // 6% of 128 GiB is 7.7 GiB: capped at 4 GiB
+  vgpu::backing::configure(h.config());
+  const auto big = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK_CONTAINS(big.what(), "reserve of 4096 MB");
+  h.meminfo(128 * kGiB, 5 * kGiB);
+  VCHECK(acquires(h.config()));
+  h.meminfo(32 * kGiB, 1500 * kMiB);   // 6% of 32 GiB is 1.9 GiB
+  vgpu::backing::configure(h.config());
+  const auto mid = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK_CONTAINS(mid.what(), "reserve of 1966 MB");
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_refuses_a_chunk_on_cgroup_headroom_alone) {
+  FakeHost h;
+  h.meminfo(64 * kGiB, 48 * kGiB);   // the machine has plenty; the container does not
+  // A 2 GiB container using 1.75 GiB; a small container gives up at most a quarter of itself.
+  h.cgroup("/a/b", 2 * kGiB, 1792 * kMiB);
+  vgpu::backing::configure(h.config());
+  auto err = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK(err.code() == Err::OutOfMemory);
+  VCHECK_CONTAINS(err.what(), "cgroup headroom 256 MB");
+  VCHECK_CONTAINS(err.what(), "reserve of 512 MB");
+  // File cache the kernel can drop is not use: the same container with 1.5 GiB of it has room.
+  h.cgroup("/a/b", 2 * kGiB, 1792 * kMiB, 1536 * kMiB);
+  VCHECK(acquires(h.config()));
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_sees_a_limit_on_an_ancestor_cgroup) {
+  FakeHost h;
+  h.meminfo(64 * kGiB, 48 * kGiB);
+  h.cgroup("/a/b", 0, 100 * kMiB);                 // "max" here
+  h.cgroup("/a", 1 * kGiB, 900 * kMiB);            // the limit is the parent's
+  vgpu::backing::configure(h.config());
+  auto err = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK_CONTAINS(err.what(), "cgroup headroom 124 MB");
+  h.cgroup("/a", 1 * kGiB, 100 * kMiB);
+  VCHECK(acquires(h.config()));
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_reads_cgroup_v1) {
+  FakeHost h;
+  h.meminfo(64 * kGiB, 48 * kGiB);
+  h.put("cg/memory/m1/memory.limit_in_bytes", std::to_string(2 * kGiB) + "\n");
+  h.put("cg/memory/m1/memory.usage_in_bytes", std::to_string(1792 * kMiB) + "\n");
+  vgpu::backing::Config c = h.config();
+  h.put("self", "12:cpu,cpuacct:/m1\n4:memory:/m1\n");
+  vgpu::backing::configure(c);
+  auto err = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK_CONTAINS(err.what(), "cgroup headroom 256 MB");
+  // v1's "no limit" is a number near 2^63.
+  h.put("cg/memory/m1/memory.limit_in_bytes", "9223372036854771712\n");
+  VCHECK(acquires(c));
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_spills_to_disk_when_it_can_instead_of_failing) {
+  using vgpu::kChunkSize;
+  FakeHost h;
+  h.meminfo(16 * kGiB, 256 * kMiB);
+  char dir[] = "/tmp/vgpu-spill-XXXXXX";
+  VCHECK(::mkdtemp(dir) != nullptr);
+  vgpu::backing::Config c = h.config();
+  c.spill_dir = dir;
+  vgpu::backing::configure(c);
+  const uint64_t ram0 = vgpu::backing::ram_bytes();
+  uint8_t* chunk = vgpu::backing::acquire();   // no RAM limit set: only the guard sends it to the file
+  VCHECK(chunk != nullptr);
+  VCHECK_EQ(vgpu::backing::spill_bytes(), kChunkSize);
+  VCHECK_EQ(vgpu::backing::ram_bytes(), ram0);
+  chunk[0] = 7;
+  vgpu::backing::release(chunk);
+  VCHECK_EQ(vgpu::backing::spill_bytes(), 0ull);
+  // Nowhere to spill to is the out-of-memory error, said in the host's terms.
+  c.spill_dir = "/nonexistent/vgpu-spill";
+  vgpu::backing::configure(c);
+  auto err = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK(err.code() == Err::OutOfMemory);
+  VCHECK_CONTAINS(err.what(), "below the reserve");
+  vgpu::backing::configure({});
+  ::rmdir(dir);
+}
+
+VTEST(host_guard_can_be_switched_off_and_its_reserve_set) {
+  FakeHost h;
+  h.meminfo(16 * kGiB, 512 * kMiB);
+  vgpu::backing::Config c = h.config();
+  c.host_guard = false;
+  const uint64_t before = vgpu::backing::host_guard_samples();
+  VCHECK(acquires(c));
+  VCHECK_EQ(vgpu::backing::host_guard_samples(), before);   // it did not even look
+  c.host_guard = true;
+  c.host_reserve_bytes = 256 * kMiB;                         // 512 MB is enough for a 256 MB reserve
+  VCHECK(acquires(c));
+  c.host_reserve_bytes = 600 * kMiB;
+  vgpu::backing::configure(c);
+  auto err = VCAPTURE(Error, vgpu::backing::acquire());
+  VCHECK_CONTAINS(err.what(), "reserve of 600 MB");
+  c.host_reserve_bytes = 0;                                  // a zero reserve is a choice too
+  VCHECK(acquires(c));
+  vgpu::backing::configure({});
+}
+
+VTEST(host_guard_environment_variables) {
+  ::unsetenv("VGPU_MEMORY_HOST_GUARD");
+  ::unsetenv("VGPU_MEMORY_HOST_RESERVE_MB");
+  vgpu::backing::Config c = vgpu::backing::config_from_env();
+  VCHECK(c.host_guard);
+  VCHECK_EQ(c.host_reserve_bytes, vgpu::backing::kAutoReserve);
+  ::setenv("VGPU_MEMORY_HOST_RESERVE_MB", "100", 1);
+  ::setenv("VGPU_MEMORY_HOST_GUARD", "0", 1);
+  c = vgpu::backing::config_from_env();
+  VCHECK(!c.host_guard);
+  VCHECK_EQ(c.host_reserve_bytes, 100 * kMiB);
+  ::setenv("VGPU_MEMORY_HOST_GUARD", "1", 1);
+  VCHECK(vgpu::backing::config_from_env().host_guard);
+  // The reserve the variable sets is the one in force: 200 MB available passes a 100 MB reserve.
+  FakeHost h;
+  h.meminfo(16 * kGiB, 200 * kMiB);
+  c = vgpu::backing::config_from_env();
+  c.spill_dir.clear();                                     // whatever the environment says about spilling
+  c.ram_limit_bytes = vgpu::backing::Config{}.ram_limit_bytes;
+  c.meminfo_path = h.dir + "/meminfo";
+  c.cgroup_root = h.dir + "/cg";
+  c.cgroup_self = h.dir + "/self";
+  h.put("self", "0::/\n");
+  VCHECK(acquires(c));
+  ::setenv("VGPU_MEMORY_HOST_RESERVE_MB", "300", 1);
+  c.host_reserve_bytes = vgpu::backing::config_from_env().host_reserve_bytes;
+  vgpu::backing::configure(c);
+  VCHECK(VCAPTURE(Error, vgpu::backing::acquire()).code() == Err::OutOfMemory);
+  ::unsetenv("VGPU_MEMORY_HOST_GUARD");
+  ::unsetenv("VGPU_MEMORY_HOST_RESERVE_MB");
+  vgpu::backing::configure({});
+}
+
+// The look costs two or three file reads; it happens once per window of chunks,
+// not once per chunk, and a shortage that starts mid-window is caught at the next.
+VTEST(host_guard_looks_once_per_window_of_chunks) {
+  FakeHost h;
+  h.meminfo(16 * kGiB, 8 * kGiB);
+  vgpu::backing::Config c = h.config();
+  vgpu::backing::configure(c);
+  const uint64_t before = vgpu::backing::host_guard_samples();
+  std::vector<uint8_t*> chunks;
+  for (int i = 0; i < 600; ++i) chunks.push_back(vgpu::backing::acquire());
+  VCHECK_EQ(vgpu::backing::host_guard_samples() - before, 3ull);   // chunks 1, 257 and 513
+  for (uint8_t* p : chunks) vgpu::backing::release(p);
+
+  // The host runs short after the first chunk: the rest of the window is let through, the next window is not.
+  vgpu::backing::configure(c);
+  chunks.clear();
+  chunks.push_back(vgpu::backing::acquire());
+  h.meminfo(16 * kGiB, 100 * kMiB);
+  for (int i = 1; i < 256; ++i) chunks.push_back(vgpu::backing::acquire());
+  VCHECK(VCAPTURE(Error, vgpu::backing::acquire()).code() == Err::OutOfMemory);
+  for (uint8_t* p : chunks) vgpu::backing::release(p);
+
+  // A window of one looks every time.
+  c.host_check_every_chunks = 1;
+  vgpu::backing::configure(c);
+  const uint64_t b2 = vgpu::backing::host_guard_samples();
+  h.meminfo(16 * kGiB, 8 * kGiB);
+  for (int i = 0; i < 5; ++i) vgpu::backing::release(vgpu::backing::acquire());
+  VCHECK_EQ(vgpu::backing::host_guard_samples() - b2, 5ull);
+  vgpu::backing::configure({});
+}
+
+// Memory that costs nothing stays free: a card filled with one byte is a table of tags, and the
+// guard speaks only where a real chunk is taken.
+VTEST(host_guard_does_not_touch_chunks_that_cost_nothing) {
+  using vgpu::kChunkSize;
+  FakeHost h;
+  h.meminfo(16 * kGiB, 100 * kMiB);   // the host is short
+  vgpu::backing::configure(h.config());
+  {
+    MemoryManager mm(64 << 20);
+    const uint64_t p = mm.alloc(4 << 20);
+    const uint8_t pattern = 0xAB;
+    mm.fill(p, &pattern, 1, 2 << 20);   // whole chunks of one byte
+    VCHECK_EQ(mm.load_scalar(p + 5, 1), uint64_t{0xAB});
+    VCHECK(VCAPTURE(Error, mm.store_scalar(p + 40 * kChunkSize + 16, 8, 1)).code() == Err::OutOfMemory);
+    std::vector<uint8_t> data(kChunkSize, 3);
+    VCHECK(VCAPTURE(Error, mm.write(p + 50 * kChunkSize, data.data(), data.size())).code() == Err::OutOfMemory);
+    mm.free(p);
+  }
+  vgpu::backing::configure({});
+}

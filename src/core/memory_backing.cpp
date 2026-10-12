@@ -4,11 +4,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "vgpu/error.hpp"
@@ -36,6 +39,21 @@ struct State {
   // Slices a forked child inherited from its parent: still mapped, never
   // released or handed out again here.
   std::map<uint8_t*, uint64_t> inherited;
+
+  // The host-memory guard. since_check counts heap chunks since the last look
+  // at the host; zero means the next heap chunk looks. low is what the last
+  // look found, and last says why, for the message.
+  uint64_t since_check = 0;
+  uint64_t samples = 0;
+  bool low = false;
+  bool spilling_for_host = false;   // this chunk is in the file because the host is short
+  struct Look {
+    bool have_available = false, have_cgroup = false;
+    uint64_t available = 0;        // MemAvailable
+    uint64_t cgroup_headroom = 0;  // what the tightest cgroup has left
+    uint64_t headroom = 0;         // the smaller of the two
+    uint64_t reserve = 0;
+  } last;
 };
 
 // Never destroyed: device memory can be released during static destruction,
@@ -45,15 +63,203 @@ State& state() {
   return *s;
 }
 
+// ---- The host-memory guard ----------------------------------------------------
+//
+// Reads a small file into a caller's buffer: no heap, so a guard that runs
+// because memory is short never asks for any. Returns false when it cannot be
+// read.
+bool read_small(const std::string& path, char* buf, size_t cap) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  size_t n = 0;
+  while (n + 1 < cap) {
+    const ssize_t r = ::read(fd, buf + n, cap - 1 - n);
+    if (r <= 0) break;
+    n += static_cast<size_t>(r);
+  }
+  ::close(fd);
+  buf[n] = '\0';
+  return true;
+}
+
+// The number after `key` on the line that starts with it ("MemAvailable:   12 kB",
+// "inactive_file 12"). A kB suffix is scaled to bytes.
+bool find_value(const char* text, const char* key, uint64_t* out) {
+  const size_t klen = std::strlen(key);
+  for (const char* line = text; line && *line;) {
+    if (std::strncmp(line, key, klen) == 0 && (line[klen] == ':' || line[klen] == ' ')) {
+      const char* p = line + klen + 1;
+      while (*p == ' ' || *p == '\t') ++p;
+      char* end = nullptr;
+      const unsigned long long v = std::strtoull(p, &end, 10);
+      if (end == p) return false;
+      while (*end == ' ') ++end;
+      *out = static_cast<uint64_t>(v) * (std::strncmp(end, "kB", 2) == 0 ? 1024 : 1);
+      return true;
+    }
+    line = std::strchr(line, '\n');
+    if (line) ++line;
+  }
+  return false;
+}
+
+constexpr uint64_t kUnlimitedV1 = 1ull << 60;  // v1 says "no limit" as a number near 2^63
+
+// One cgroup directory's say in the matter: its limit and what is used, where
+// file cache the kernel can drop (it does, before it kills anything) is not
+// counted as used -- a container that has read a lot of files has its
+// memory.current at the limit without being short of anything.
+void cgroup_dir(const std::string& dir, bool v2, State::Look& look, uint64_t* limit_seen) {
+  char buf[8192];
+  uint64_t limit = 0, used = 0;
+  if (!read_small(dir + (v2 ? "/memory.max" : "/memory.limit_in_bytes"), buf, sizeof buf)) return;
+  if (std::strncmp(buf, "max", 3) == 0) return;
+  char* end = nullptr;
+  const unsigned long long l = std::strtoull(buf, &end, 10);
+  if (end == buf || l >= kUnlimitedV1) return;
+  limit = l;
+  if (!read_small(dir + (v2 ? "/memory.current" : "/memory.usage_in_bytes"), buf, sizeof buf)) return;
+  const unsigned long long u = std::strtoull(buf, &end, 10);
+  if (end == buf) return;
+  used = u;
+  if (read_small(dir + "/memory.stat", buf, sizeof buf)) {
+    uint64_t inactive = 0, active = 0;
+    find_value(buf, v2 ? "inactive_file" : "total_inactive_file", &inactive);
+    find_value(buf, v2 ? "active_file" : "total_active_file", &active);
+    const uint64_t cache = inactive + active;
+    used = used > cache ? used - cache : 0;
+  }
+  const uint64_t headroom = limit > used ? limit - used : 0;
+  look.cgroup_headroom = look.have_cgroup ? std::min(look.cgroup_headroom, headroom) : headroom;
+  look.have_cgroup = true;
+  *limit_seen = std::min(*limit_seen, limit);
+}
+
+// This process's cgroup and every ancestor, as far up as the root the
+// configuration names.
+void cgroup_walk(const std::string& root, std::string path, bool v2, State::Look& look, uint64_t* limit_seen) {
+  if (const size_t sp = path.find(" (deleted)"); sp != std::string::npos) path.erase(sp);
+  if (path.empty() || path[0] != '/') path = "/" + path;
+  for (;;) {
+    cgroup_dir(root + path, v2, look, limit_seen);
+    if (path == "/") break;
+    const size_t slash = path.rfind('/');
+    path = slash == 0 ? "/" : path.substr(0, slash);
+  }
+}
+
+// Looks at the host: what it can still give this process, the reserve to leave
+// it, and the memory limit in play that the default reserve is a share of.
+void look_at_host(State& s) {
+  const Config& c = s.config;
+  State::Look look;
+  ++s.samples;
+  char buf[8192];
+  uint64_t total = std::numeric_limits<uint64_t>::max();
+  if (read_small(c.meminfo_path, buf, sizeof buf)) {
+    if (find_value(buf, "MemAvailable", &look.available)) look.have_available = true;
+    uint64_t t = 0;
+    if (find_value(buf, "MemTotal", &t) && t) total = t;
+  }
+  uint64_t limit_seen = std::numeric_limits<uint64_t>::max();
+  // The cgroup the process is in: v2 has one line, "0::/path"; v1 has a line
+  // per controller, "N:memory:/path" for this one.
+  std::string v2_path = "/", v1_path;
+  bool have_v2 = false, have_v1 = false;
+  if (read_small(c.cgroup_self, buf, sizeof buf)) {
+    for (const char* line = buf; line && *line;) {
+      const char* c1 = std::strchr(line, ':');
+      const char* c2 = c1 ? std::strchr(c1 + 1, ':') : nullptr;
+      const char* eol = std::strchr(line, '\n');
+      if (c2 && (!eol || c2 < eol)) {
+        const std::string controllers(c1 + 1, static_cast<size_t>(c2 - c1 - 1));
+        const std::string path = eol ? std::string(c2 + 1, static_cast<size_t>(eol - c2 - 1)) : std::string(c2 + 1);
+        if (controllers.empty()) {
+          v2_path = path;
+          have_v2 = true;
+        } else if (("," + controllers + ",").find(",memory,") != std::string::npos) {
+          v1_path = path;
+          have_v1 = true;
+        }
+      }
+      line = eol ? eol + 1 : nullptr;
+    }
+  }
+  cgroup_walk(c.cgroup_root, v2_path, true, look, &limit_seen);
+  if (!look.have_cgroup && (have_v1 || !have_v2)) cgroup_walk(c.cgroup_root + "/memory", v1_path, false, look, &limit_seen);
+
+  if (look.have_available) look.headroom = look.available;
+  if (look.have_cgroup && (!look.have_available || look.cgroup_headroom < look.headroom))
+    look.headroom = look.cgroup_headroom;
+
+  if (c.host_reserve_bytes != kAutoReserve) {
+    look.reserve = c.host_reserve_bytes;
+  } else {
+    const uint64_t in_play = std::min(total, limit_seen);
+    constexpr uint64_t kGiB = 1ull << 30;
+    // 6% of what is in play, at least 1 GiB and at most 4 GiB; a small
+    // container is not asked to give up more than a quarter of itself.
+    uint64_t r = std::clamp<uint64_t>(in_play == std::numeric_limits<uint64_t>::max() ? kGiB : in_play / 100 * 6,
+                                      kGiB, 4 * kGiB);
+    if (in_play != std::numeric_limits<uint64_t>::max()) r = std::min(r, in_play / 4);
+    look.reserve = r;
+  }
+  s.last = look;
+  // Nothing readable is no evidence of a shortage.
+  s.low = (look.have_available || look.have_cgroup) && look.headroom < look.reserve;
+}
+
+// Whether the host is short of memory, looked at once per host_check_every_chunks
+// heap chunks (the first chunk always looks). A shortage is looked at again on
+// the very next chunk when there is nowhere to spill, so that the program that
+// catches the error and frees memory is not refused for 16 MiB more than it
+// has to be.
+bool host_is_short(State& s) {
+  if (s.since_check == 0) look_at_host(s);
+  const uint64_t every = std::max<uint64_t>(1, s.config.host_check_every_chunks);
+  if (++s.since_check >= every || (s.low && s.config.spill_dir.empty())) s.since_check = 0;
+  return s.low;
+}
+
+[[noreturn]] void host_out_of_memory(const State& s) {
+  const State::Look& l = s.last;
+  constexpr uint64_t kMB = 1024 * 1024;
+  std::string have;
+  if (l.have_available) have += "MemAvailable " + std::to_string(l.available / kMB) + " MB";
+  if (l.have_cgroup) have += (have.empty() ? "" : ", ") + std::string("cgroup headroom ") + std::to_string(l.cgroup_headroom / kMB) + " MB";
+  throw Error::make(Err::OutOfMemory, "device out of memory: the host has ", l.headroom / kMB,
+                    " MB of memory left (", have, "), below the reserve of ", l.reserve / kMB,
+                    " MB that the simulator keeps for the rest of the machine. Set VGPU_MEMORY_DIR (with "
+                    "VGPU_MEMORY_RAM_MB) to let device memory spill to disk, VGPU_MEMORY_HOST_RESERVE_MB to "
+                    "change the reserve, or VGPU_MEMORY_HOST_GUARD=0 to turn this check off.");
+}
+
+}  // namespace
+
+Config config_from_env() {
+  Config c;
+  if (const char* dir = std::getenv("VGPU_MEMORY_DIR"); dir && *dir) c.spill_dir = dir;
+  const auto mb = [](const char* name, uint64_t* out) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return false;
+    char* end = nullptr;
+    const unsigned long long n = std::strtoull(v, &end, 10);
+    if (end == v || *end != '\0') return false;
+    *out = static_cast<uint64_t>(n) * 1024 * 1024;
+    return true;
+  };
+  mb("VGPU_MEMORY_RAM_MB", &c.ram_limit_bytes);
+  mb("VGPU_MEMORY_HOST_RESERVE_MB", &c.host_reserve_bytes);
+  if (const char* g = std::getenv("VGPU_MEMORY_HOST_GUARD"); g && g[0] == '0' && g[1] == '\0') c.host_guard = false;
+  return c;
+}
+
+namespace {
+
 void configure_from_env(State& s) {
   if (s.configured) return;
   s.configured = true;
-  if (const char* dir = std::getenv("VGPU_MEMORY_DIR"); dir && *dir) s.config.spill_dir = dir;
-  if (const char* mb = std::getenv("VGPU_MEMORY_RAM_MB"); mb && *mb) {
-    char* end = nullptr;
-    const unsigned long long v = std::strtoull(mb, &end, 10);
-    if (end != mb && *end == '\0') s.config.ram_limit_bytes = static_cast<uint64_t>(v) * 1024 * 1024;
-  }
+  s.config = config_from_env();
 }
 
 // The file offset of a chunk, if the chunk is in one of these slices.
@@ -88,6 +294,12 @@ void adopt_after_fork(State& s) {
 
 [[noreturn]] void cannot_spill(const State& s, const char* what) {
   const int err = errno;
+  if (s.spilling_for_host) {
+    constexpr uint64_t kMB = 1024 * 1024;
+    throw Error::make(Err::OutOfMemory, "device out of memory: the host has ", s.last.headroom / kMB,
+                      " MB of memory left, below the reserve of ", s.last.reserve / kMB, " MB, and ", what,
+                      " in ", s.config.spill_dir, ": ", std::strerror(err));
+  }
   throw Error::make(Err::OutOfMemory, "device memory needs more than VGPU_MEMORY_RAM_MB (",
                     s.config.ram_limit_bytes / (1024 * 1024), " MB) of host RAM and ", what, " in ",
                     s.config.spill_dir, ": ", std::strerror(err));
@@ -128,6 +340,8 @@ void configure(const Config& config) {
   std::lock_guard<std::mutex> lock(s.mu);
   s.configured = true;
   s.config = config;
+  s.since_check = 0;   // the next heap chunk looks at the host afresh
+  s.low = false;
   // A spill file with nothing in it belongs to the old configuration: close it,
   // so the next spill uses the directory just given rather than the last one.
   adopt_after_fork(s);
@@ -146,7 +360,14 @@ uint8_t* acquire() {
   std::unique_lock<std::mutex> lock(s.mu);
   configure_from_env(s);
   adopt_after_fork(s);
-  const bool spill = !s.config.spill_dir.empty() && s.ram + kChunkSize > s.config.ram_limit_bytes;
+  bool spill = !s.config.spill_dir.empty() && s.ram + kChunkSize > s.config.ram_limit_bytes;
+  s.spilling_for_host = false;
+  // A heap chunk is real memory the host may not have. Past the RAM limit the
+  // chunk is a file's, and the guard has nothing to say.
+  if (!spill && s.config.host_guard && host_is_short(s)) {
+    if (s.config.spill_dir.empty()) host_out_of_memory(s);
+    spill = s.spilling_for_host = true;
+  }
   if (!spill) {
     s.ram += kChunkSize;
     lock.unlock();
@@ -197,6 +418,12 @@ uint64_t spill_bytes() {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mu);
   return s.spill;
+}
+
+uint64_t host_guard_samples() {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.samples;
 }
 
 }  // namespace vgpu::backing

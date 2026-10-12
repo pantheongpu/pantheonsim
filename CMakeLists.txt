@@ -1424,6 +1424,15 @@ set_tests_properties(test_amd_runtime_gaps PROPERTIES ENVIRONMENT "VGPU_GPU=amd/
 add_test(NAME test_amd_runtime_gaps_radeon COMMAND test_amd_runtime_gaps)
 set_tests_properties(test_amd_runtime_gaps_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_QUIET=1")
 
+# The host-memory guard seen from a HIP program: a reserve no host can meet makes every real chunk
+# of device memory an out-of-memory error (hipErrorOutOfMemory), not a crash.
+add_executable(test_amd_hip_host_guard amd/tests/unit/test_hip_host_guard.cpp)
+target_link_libraries(test_amd_hip_host_guard PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_host_guard PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_host_guard COMMAND test_amd_hip_host_guard)
+set_tests_properties(test_amd_hip_host_guard PROPERTIES ENVIRONMENT
+  "VGPU_GPU=amd/mi300x;VGPU_QUIET=1;VGPU_MEMORY_HOST_RESERVE_MB=1000000000")
+
 vgpu_unit_test(test_amd_hipcc_ops amd/tests/unit/test_hipcc_ops.cpp)
 target_compile_definitions(test_amd_hipcc_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
@@ -1804,6 +1813,17 @@ if(TARGET vgpunccl)
         ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:")
     endforeach()
   endif()
+endif()
+
+# The host-memory guard seen from a CUDA program: a reserve no host can meet makes every real chunk
+# of device memory an out-of-memory error (cudaErrorMemoryAllocation), not a crash.
+if(TARGET vgpucudart)
+  add_executable(test_cuda_host_guard nvidia/tests/unit/test_cuda_host_guard.cpp)
+  target_link_libraries(test_cuda_host_guard PRIVATE vgpucudart)
+  target_include_directories(test_cuda_host_guard PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cuda_host_guard COMMAND test_cuda_host_guard)
+  set_tests_properties(test_cuda_host_guard PROPERTIES ENVIRONMENT
+    "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;VGPU_MEMORY_HOST_RESERVE_MB=1000000000")
 endif()
 
 # What PyTorch 2.14 binds at load time and the runtime lacked: user objects (and
