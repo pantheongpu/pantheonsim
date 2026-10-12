@@ -1247,7 +1247,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       }
       const auto out = [](float v) { return v != v ? 0x7fffffffu : f32_bits(v); };
       if (ins.op == Op::FFMA)
-        for (unsigned l = 0; l < 32; ++l) r[l] = out(std::fma(as_f32(s[0][l]), as_f32(s[1][l]), as_f32(s[2][l])));
+        ffma_lanes(r, s[0], s[1], s[2]);   // lane_math.hpp
       else if (ins.op == Op::FADD)
         for (unsigned l = 0; l < 32; ++l) r[l] = out(as_f32(s[0][l]) + as_f32(s[1][l]));
       else

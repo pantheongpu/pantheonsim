@@ -31,6 +31,7 @@
 #include <tuple>
 
 #include "access_count.hpp"
+#include "lane_math.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/host_atomic.hpp"
