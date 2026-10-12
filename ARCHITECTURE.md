@@ -67,8 +67,8 @@ micro test framework) so a bare CI container can build it.
 
 ### Why C++ (vs Rust)
 
-The deliverable is a C-ABI `libcuda`-compatible `.so`, future JIT work is
-LLVM (a C++ library), and the audience (CUDA shops, CI images) always has a
+The deliverable is a C-ABI `libcuda`-compatible `.so`, any future faster
+execution tier is written in the same dependency-free C++, and the audience (CUDA shops, CI images) always has a
 C++ toolchain. Rust's safety was the counter-argument; we compensate with
 bounds-checked accessors everywhere and dense tests. Decided 2026-09-01;
 revisit only with a concrete failure mode in hand.
@@ -89,10 +89,13 @@ Consequence: `bar.sync` under divergence is rejected with a precise error
 (IPDOM reconvergence is the planned fix, not a redesign — the stack becomes
 reconvergence-point-keyed).
 
-The interpreter is deliberately naive (hash-map register files, per-lane
-loops). Correctness, determinism, and diagnosability outrank speed; the
-upgrade path is `PTX -> internal IR -> LLVM JIT` behind the same
-`exec::launch()` boundary, so the runtime above never changes.
+The interpreter favours plain, checkable code over speed. Correctness,
+determinism, and diagnosability outrank speed, and the project keeps zero
+external dependencies, so faster execution comes from inside the tree: decoded
+forms, lane kernels and fast paths that give the same bits as the general path.
+Translating whole kernels to a faster tier, still behind the same
+`exec::launch()` boundary and still dependency-free, is studied in
+`docs/perf-design/`; nothing there is built.
 
 ### D2. Scheduling is an abstraction, and always will be
 
