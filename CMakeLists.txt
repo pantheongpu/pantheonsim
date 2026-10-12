@@ -31,6 +31,9 @@ endif()
 #   cmake -B build-pgo -DVGPU_PGO=use && cmake --build build-pgo
 # The "use" step must keep the build directory's path, which names the profile
 # files. It changes code generation only; a test result must not differ.
+# Code the training run does not reach is compiled for size, which can be slower
+# than without a profile (the PTX engine's fma lane loops lost their FMA
+# inlining when only SASS programs trained): train on what you will run.
 set(VGPU_PGO "" CACHE STRING "Profile-guided optimization: generate, use, or empty for off")
 set_property(CACHE VGPU_PGO PROPERTY STRINGS "" generate use)
 set(VGPU_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Where the PGO profile (.gcda files) is written and read")
