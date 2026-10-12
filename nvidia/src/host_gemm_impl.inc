@@ -21,24 +21,86 @@ struct Lanes {
   static constexpr int n = kVB / static_cast<int>(sizeof(T));
 };
 
+template <class T> struct IsFloat { static constexpr bool value = false; };
+template <> struct IsFloat<float> { static constexpr bool value = true; };
+template <class T> struct IsDouble { static constexpr bool value = false; };
+template <> struct IsDouble<double> { static constexpr bool value = true; };
+
 template <class T, class S>
 struct Ops {
   using V = typename Lanes<T>::type;
   static constexpr int L = Lanes<T>::n;
   static constexpr int MRV = 2;
   static constexpr int MR = MRV * L;
-  static constexpr int NR = 6;
+  static constexpr int NR = 4;
   static constexpr int MC = 128;  // a multiple of MR for every L (4, 8) and of the rows of a block
-  static constexpr int NC = 192;  // a multiple of NR
+  static constexpr int NC = 128;  // a multiple of NR
   static constexpr int KC = 256;
 
   static inline T conv(S s) { return static_cast<T>(s); }
+
+
+#ifdef VGPU_HG_INTRIN
+  // The same accumulation with the vectors written out: each accumulator takes  c = c + a * b  one rounded product and one rounded sum at a
+  // time, in the order of the packed panels. (Intrinsics, because the compiler's own choice of registers for the broadcasts and
+  // products varies with its version; this keeps the 12 accumulators in registers.)
+  static inline __attribute__((always_inline)) void micro_intrin(const T* __restrict ap, const T* __restrict bp, int kc,
+                                                                 T* __restrict acc, int ld) {
+    if constexpr (IsFloat<T>::value) {
+      __m256 c[NR][2];
+      for (int j = 0; j < NR; ++j) {
+        c[j][0] = _mm256_loadu_ps(acc + static_cast<size_t>(j) * ld);
+        c[j][1] = _mm256_loadu_ps(acc + static_cast<size_t>(j) * ld + 8);
+      }
+      for (int p = 0; p < kc; ++p) {
+        const __m256 a0 = _mm256_loadu_ps(ap + static_cast<size_t>(p) * MR);
+        const __m256 a1 = _mm256_loadu_ps(ap + static_cast<size_t>(p) * MR + 8);
+        const float* b = bp + static_cast<size_t>(p) * NR;
+        for (int j = 0; j < NR; ++j) {
+          const __m256 bj = _mm256_broadcast_ss(b + j);
+          c[j][0] = _mm256_add_ps(c[j][0], _mm256_mul_ps(a0, bj));
+          c[j][1] = _mm256_add_ps(c[j][1], _mm256_mul_ps(a1, bj));
+        }
+      }
+      for (int j = 0; j < NR; ++j) {
+        _mm256_storeu_ps(acc + static_cast<size_t>(j) * ld, c[j][0]);
+        _mm256_storeu_ps(acc + static_cast<size_t>(j) * ld + 8, c[j][1]);
+      }
+    } else {
+      __m256d c[NR][2];
+      for (int j = 0; j < NR; ++j) {
+        c[j][0] = _mm256_loadu_pd(acc + static_cast<size_t>(j) * ld);
+        c[j][1] = _mm256_loadu_pd(acc + static_cast<size_t>(j) * ld + 4);
+      }
+      for (int p = 0; p < kc; ++p) {
+        const __m256d a0 = _mm256_loadu_pd(ap + static_cast<size_t>(p) * MR);
+        const __m256d a1 = _mm256_loadu_pd(ap + static_cast<size_t>(p) * MR + 4);
+        const double* b = bp + static_cast<size_t>(p) * NR;
+        for (int j = 0; j < NR; ++j) {
+          const __m256d bj = _mm256_broadcast_sd(b + j);
+          c[j][0] = _mm256_add_pd(c[j][0], _mm256_mul_pd(a0, bj));
+          c[j][1] = _mm256_add_pd(c[j][1], _mm256_mul_pd(a1, bj));
+        }
+      }
+      for (int j = 0; j < NR; ++j) {
+        _mm256_storeu_pd(acc + static_cast<size_t>(j) * ld, c[j][0]);
+        _mm256_storeu_pd(acc + static_cast<size_t>(j) * ld + 4, c[j][1]);
+      }
+    }
+  }
+#endif
 
   // One MR x NR tile: acc += a * b over kc terms, products and sums rounded
   // separately. ap is kc panels of MR, bp is kc panels of NR; acc has leading
   // dimension ld and is MR x NR.
   static inline __attribute__((always_inline)) void micro(const T* __restrict ap, const T* __restrict bp, int kc,
                                                           T* __restrict acc, int ld) {
+#ifdef VGPU_HG_INTRIN
+    if constexpr (MRV == 2 && (IsFloat<T>::value || IsDouble<T>::value)) {
+      micro_intrin(ap, bp, kc, acc, ld);
+      return;
+    }
+#endif
     V c[NR][MRV];
     for (int j = 0; j < NR; ++j)
       for (int v = 0; v < MRV; ++v) __builtin_memcpy(&c[j][v], acc + static_cast<size_t>(j) * ld + v * L, sizeof(V));

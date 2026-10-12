@@ -60,6 +60,8 @@
 
 #include <cuda_runtime.h>
 
+#include "host_gemm.hpp"
+#include "host_parallel.hpp"
 #include "vgpu/runtime/capture.hpp"
 #include "vgpu/telemetry.hpp"
 
@@ -1800,15 +1802,19 @@ void run_matmul(const Op& op, const std::vector<const std::vector<double>*>& in,
     const double* pa = a.data() + ai[q] * M * K;
     const double* pb = b.data() + bi[q] * K * N;
     double* pc = c->data() + q * M * N;
+    if (op.acc != vc::Accum::Half) {
+      // Each element is the chain  s = s + a*b  over k, which the host product runs for many elements at once in the same
+      // order (A is [M, K] and B is [K, N], both row-major: op(A) = A^T and op(B) = B^T of the column-major views).
+      if (Mq[q] > 0 && Nq[q] > 0)
+        vgpu::hostgemm::gemm<double, double>(true, true, Mq[q], Nq[q], Kq[q], pa, K, pb, N,
+                                       [=](int64_t i, int64_t j, double acc) { pc[i * N + j] = acc; });
+      continue;
+    }
     for (int64_t i = 0; i < Mq[q]; ++i)
       for (int64_t j = 0; j < Nq[q]; ++j) {
         double s = 0.0;
-        for (int64_t k = 0; k < Kq[q]; ++k) {
-          if (op.acc == vc::Accum::Half)
-            s = vc::half_to_float(vc::float_to_half(static_cast<float>(s) + static_cast<float>(pa[i * K + k]) * static_cast<float>(pb[k * N + j])));
-          else
-            s += pa[i * K + k] * pb[k * N + j];
-        }
+        for (int64_t k = 0; k < Kq[q]; ++k)
+          s = vc::half_to_float(vc::float_to_half(static_cast<float>(s) + static_cast<float>(pa[i * K + k]) * static_cast<float>(pb[k * N + j])));
         pc[i * N + j] = s;
       }
   }
@@ -2618,7 +2624,10 @@ SoftmaxRows softmax_rows(const std::vector<double>& x, int64_t cols, const std::
   const size_t rows = x.size() / static_cast<size_t>(cols);
   r.y.assign(x.size(), 0.0);
   r.stats.assign(rows, 0.0), r.max.assign(rows, 0.0), r.sum.assign(rows, 0.0);
-  for (size_t i = 0; i < rows; ++i) {
+  // Rows are independent. Each exp is computed once and kept (the value is the same each time it is asked for).
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(x.size()) * 25, static_cast<int64_t>(rows));
+  vgpu::hostpar::parallel_for(threads, static_cast<int64_t>(rows), [&](int64_t ri) {
+    const size_t i = static_cast<size_t>(ri);
     const double* xr = x.data() + i * static_cast<size_t>(cols);
     double m = -INFINITY;
     for (int64_t j = 0; j < cols; ++j) m = std::max(m, xr[j]);
@@ -2626,12 +2635,17 @@ SoftmaxRows softmax_rows(const std::vector<double>& x, int64_t cols, const std::
     m = std::max(m, sink);
     double z = 0.0;
     if (m != -INFINITY) {
-      for (int64_t j = 0; j < cols; ++j) z += std::exp(xr[j] - m);
+      double* yr = r.y.data() + i * static_cast<size_t>(cols);
+      for (int64_t j = 0; j < cols; ++j) {
+        const double e = std::exp(xr[j] - m);
+        yr[j] = e;
+        z += e;
+      }
       if (sink != -INFINITY) z += std::exp(sink - m);
-      for (int64_t j = 0; j < cols; ++j) r.y[i * static_cast<size_t>(cols) + static_cast<size_t>(j)] = std::exp(xr[j] - m) / z;
+      for (int64_t j = 0; j < cols; ++j) yr[j] = yr[j] / z;
     }
     r.max[i] = m, r.sum[i] = z, r.stats[i] = m + std::log(z);
-  }
+  });
   return r;
 }
 
@@ -2993,13 +3007,14 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
   for (int64_t b = 0; b < B; ++b)
     for (int64_t h = 0; h < Hq; ++h) {
       const int64_t hk = h / (Hq / Hk);
-      for (int64_t i = 0; i < Sq; ++i)
-        for (int64_t j = 0; j < Skv; ++j) {
-          double acc = 0.0;
-          for (int64_t d = 0; d < D; ++d)
-            acc += Q[static_cast<size_t>(((b * Hq + h) * Sq + i) * D + d)] * K[static_cast<size_t>(((b * Hk + hk) * Skv + j) * D + d)];
-          S[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)] = static_cast<float>(acc * scale);
-        }
+      // S(i, j) is the chain  acc = acc + Q(i, d) * K(j, d)  over d, the host product's chain: Q and K are [rows, D] row-major,
+      // so both are transposed views of the column-major matrices with leading dimension D.
+      const double* q = Q.data() + static_cast<size_t>((b * Hq + h) * Sq) * D;
+      const double* k = K.data() + static_cast<size_t>((b * Hk + hk) * Skv) * D;
+      double* s = S.data() + static_cast<size_t>((b * Hq + h) * Sq) * Skv;
+      if (Sq > 0 && Skv > 0)
+        vgpu::hostgemm::gemm<double, double>(true, false, Sq, Skv, D, q, D, k, D,
+                                             [=](int64_t i, int64_t j, double acc) { s[i * Skv + j] = static_cast<float>(acc * scale); });
     }
   cudnnStatus_t st = modify_scores(op, &S);
   if (st != CUDNN_STATUS_SUCCESS) return st;
@@ -3037,6 +3052,35 @@ cudnnStatus_t Runner::run_sdpa(const Op& op, const std::vector<const std::vector
     if (fp8)
       for (size_t e = 0; e < P.size(); ++e) amax_s = std::fmax(amax_s, std::fabs(P[e]));
     std::vector<double> O(static_cast<size_t>(B * Hq * Sq * Dv), 0.0);
+    // O(i, e) is the chain over j of  p(i, j) * V(j, e)  with the zero p skipped, and a row that is not live left at 0. The host
+    // product does not skip: a zero p adds a product 0 * V, which is +-0 when V is finite and changes no bit of a chain that is
+    // never -0. So with a finite V the products go to the host product (dead rows as rows of zeros); otherwise the loops below run.
+    bool v_finite = true;
+    for (double e : V)
+      if (!std::isfinite(e)) {
+        v_finite = false;
+        break;
+      }
+    if (v_finite) {
+      std::vector<double> pr(static_cast<size_t>(Sq) * static_cast<size_t>(Skv));
+      for (int64_t b = 0; b < B; ++b)
+        for (int64_t h = 0; h < Hq; ++h) {
+          const int64_t hv = h / (Hq / Hv);
+          for (int64_t i = 0; i < Sq; ++i) {
+            const bool live = row_live[static_cast<size_t>((b * Hq + h) * Sq + i)];
+            for (int64_t j = 0; j < Skv; ++j) {
+              const double pe = P[static_cast<size_t>(((b * Hq + h) * Sq + i) * Skv + j)];
+              pr[static_cast<size_t>(i * Skv + j)] = !live ? 0.0
+                                                     : fp8 ? vc::round_to(CUDNN_DATA_FP8_E4M3, pe * s_s) : vc::round_to(io, pe);
+            }
+          }
+          const double* v = V.data() + static_cast<size_t>((b * Hv + hv) * Skv) * Dv;
+          double* o = O.data() + static_cast<size_t>((b * Hq + h) * Sq) * Dv;
+          if (Sq > 0 && Dv > 0)
+            vgpu::hostgemm::gemm<double, double>(true, true, Sq, Dv, Skv, pr.data(), Skv, v, Dv,
+                                                 [=](int64_t i, int64_t e, double acc) { o[i * Dv + e] = acc; });
+        }
+    } else
     for (int64_t b = 0; b < B; ++b)
       for (int64_t h = 0; h < Hq; ++h) {
         const int64_t hv = h / (Hq / Hv);

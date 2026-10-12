@@ -322,13 +322,31 @@ void convert_pieces(size_t n, Fn&& fn) {
 }
 }  // namespace
 
+namespace {
+// A byte buffer of n bytes for staging a tensor between device memory and the doubles the routines compute in. Kept per thread
+// and reused, so a call does not pay the page faults of a fresh multi-megabyte allocation every time; a request beyond 256 MB
+// gets its own buffer. (Contents are the caller's to fill.)
+struct Staging {
+  std::vector<uint8_t>* use(size_t n) {
+    constexpr size_t kKeep = size_t(256) << 20;
+    std::vector<uint8_t>& v = n <= kKeep ? kept : own;
+    if (v.size() < n) v.resize(n);
+    return &v;
+  }
+  std::vector<uint8_t> own;
+  static thread_local std::vector<uint8_t> kept;
+};
+thread_local std::vector<uint8_t> Staging::kept;
+}  // namespace
+
 bool read(const Layout& t, const void* dev, std::vector<double>* out) {
   const size_t eb = type_bytes(t.type), n = t.count();
   out->assign(n, 0.0);
   if (!n) return true;
   if (!dev) return false;
-  std::vector<uint8_t> raw(t.span() * eb);
-  if (cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  Staging stage;
+  std::vector<uint8_t>& raw = *stage.use(t.span() * eb);
+  if (cudaMemcpy(raw.data(), dev, t.span() * eb, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
   double* v = out->data();
   if (packed_row_major(t)) {
     // The common case: element i is at offset i, so the decode runs straight down the buffer (and over threads).
@@ -355,45 +373,60 @@ bool read(const Layout& t, const void* dev, std::vector<double>* out) {
   return true;
 }
 
-bool write(const Layout& t, void* dev, const std::vector<double>& v) {
+namespace {
+// Writes the logical elements get(0) .. get(n-1) to the tensor, rounded to its type. A strided tensor's gaps belong to someone
+// else, so they are read first and kept.
+template <class Get>
+bool write_with(const Layout& t, void* dev, Get&& get) {
   const size_t eb = type_bytes(t.type), n = t.count();
-  if (!n) return true;
-  if (!dev || v.size() < n) return false;
-  std::vector<uint8_t> raw(t.span() * eb);
-  // A strided tensor's gaps belong to someone else: keep them.
-  if (raw.size() != n * eb && cudaMemcpy(raw.data(), dev, raw.size(), cudaMemcpyDeviceToHost) != cudaSuccess)
-    return false;
+  Staging stage;
+  const size_t bytes = t.span() * eb;
+  std::vector<uint8_t>& rawv = *stage.use(bytes);
+  if (bytes != n * eb && cudaMemcpy(rawv.data(), dev, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+  uint8_t* r = rawv.data();
   if (packed_row_major(t)) {
-    uint8_t* r = raw.data();
-    const double* src = v.data();
     switch (t.type) {
       case CUDNN_DATA_FLOAT:
-        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const float f = static_cast<float>(src[i]); std::memcpy(r + i * 4, &f, 4); } });
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const float f = static_cast<float>(get(i)); std::memcpy(r + i * 4, &f, 4); } });
         break;
       case CUDNN_DATA_DOUBLE:
-        convert_pieces(n, [&](size_t b, size_t e) { std::memcpy(r + b * 8, src + b, (e - b) * 8); });
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const double d = get(i); std::memcpy(r + i * 8, &d, 8); } });
         break;
       case CUDNN_DATA_HALF:
-        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_half(static_cast<float>(src[i])); std::memcpy(r + i * 2, &h, 2); } });
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_half(static_cast<float>(get(i))); std::memcpy(r + i * 2, &h, 2); } });
         break;
       case CUDNN_DATA_BFLOAT16:
-        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_bf16(static_cast<float>(src[i])); std::memcpy(r + i * 2, &h, 2); } });
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_bf16(static_cast<float>(get(i))); std::memcpy(r + i * 2, &h, 2); } });
         break;
       default:
-        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) encode(t.type, src[i], r + i * eb); });
+        convert_pieces(n, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) encode(t.type, get(i), r + i * eb); });
         break;
     }
-    return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+  } else {
+    each(t, [&](size_t i, size_t off) { encode(t.type, get(i), r + off * eb); });
   }
-  each(t, [&](size_t i, size_t off) { encode(t.type, v[i], raw.data() + off * eb); });
-  return cudaMemcpy(dev, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+  return cudaMemcpy(dev, r, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+}  // namespace
+
+bool write(const Layout& t, void* dev, const std::vector<double>& v) {
+  const size_t n = t.count();
+  if (!n) return true;
+  if (!dev || v.size() < n) return false;
+  return write_with(t, dev, [&](size_t i) { return v[i]; });
 }
 
 bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, double alpha, double beta) {
-  std::vector<double> out(t.count(), 0.0);
-  if (beta != 0.0 && !read(t, dev, &out)) return false;
-  for (size_t i = 0; i < out.size() && i < r.size(); ++i)
-    out[i] = beta != 0.0 ? alpha * r[i] + beta * out[i] : alpha * r[i];
+  const size_t n = t.count();
+  if (beta == 0.0) {
+    // Nothing to read back: alpha * r goes straight to the tensor (an element r does not reach is 0).
+    if (!n) return true;
+    if (!dev) return false;
+    return write_with(t, dev, [&](size_t i) { return i < r.size() ? alpha * r[i] : 0.0; });
+  }
+  std::vector<double> out(n, 0.0);
+  if (!read(t, dev, &out)) return false;
+  for (size_t i = 0; i < out.size() && i < r.size(); ++i) out[i] = alpha * r[i] + beta * out[i];
   return write(t, dev, out);
 }
 

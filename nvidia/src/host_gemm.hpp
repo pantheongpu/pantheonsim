@@ -28,6 +28,10 @@
 
 #include "host_parallel.hpp"
 
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#endif
+
 namespace vgpu::hostgemm {
 
 enum class Isa { Auto, Generic, Avx2 };
@@ -46,7 +50,9 @@ constexpr int kVB = 16;
 #pragma GCC target("avx2")
 namespace avx2 {
 constexpr int kVB = 32;
+#define VGPU_HG_INTRIN 1
 #include "host_gemm_impl.inc"
+#undef VGPU_HG_INTRIN
 }  // namespace avx2
 #pragma GCC pop_options
 #endif
