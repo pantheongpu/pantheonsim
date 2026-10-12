@@ -26,18 +26,25 @@ NOT MEASURED were not; nothing here is an estimate presented as a result.
 Before: both engines created `nthreads` `std::thread`s per launch and joined
 them (`interpreter.cpp` ~13410, `sass/exec.cpp` ~941 on the old tree).
 
-Measured (`tiny.cu`: `out[i] += ...`, grid G, 32 threads, 10000 launches in a
-loop, rtx3060 profile, host load average 12-14 on 20 CPUs throughout, so
-absolute numbers are inflated; A and B alternated 5 times, median of the 5):
+Measured (`tiny.cu`: `out[i] += ...`, grid G of 32-thread blocks, rtx3060
+profile; `big.cu`: 256-thread blocks, 16 KB shared tile, a few FMAs). Host
+load average 9-15 on 20 CPUs throughout, so absolute numbers are inflated.
+Before and after alternated 7 times each (A B A B ...), median of the 7, min
+and max in brackets:
 
-| engine | grid | VGPU_THREADS | before (us/launch) | after (us/launch) |
-| --- | --- | --- | --- | --- |
-| SASS | 1 | default (runs inline) | 5.4 | 5.6 |
-| SASS | 8 | default (8 threads) | 267 | 43 |
-| SASS | 64 | default (20 threads) | 657 | 218 |
-| PTX (`VGPU_SASS=0`) | 8 | default | 213 | 31.5 |
+| engine | workload | before (us/launch) | after (us/launch) |
+| --- | --- | --- | --- |
+| SASS | grid 1 x 10000 launches (runs inline) | 10.4 [9.2, 11.6] | 10.1 [8.7, 15.9] |
+| SASS | grid 8 x 10000 | 246 [200, 856] | 39.6 [30.1, 46.3] |
+| SASS | grid 64 x 10000 | 742 [639, 1126] | 236 [212, 619] |
+| SASS | grid 1024 x 1000 | 1018 [953, 1265] | 869 [814, 2162] |
+| SASS | `big` grid 64 x 300 | 922 [906, 1077] | 802 [714, 904] |
+| PTX (`VGPU_SASS=0`) | grid 8 x 5000 | 222 [199, 797] | 30.4 [26.5, 34.9] |
 
-(Spread, min..max over the 5 runs: SASS grid 8 191..356 before, 35..57 after.)
+The gain is the fixed cost per launch (about 200 us at 8 threads here), so it
+shows on small and medium grids and fades when the blocks themselves take
+milliseconds (grid 1024, `big`). Results were identical: the programs check
+their sums, and `e2e_sched_pool` / `test_sched` compare bytes and counters.
 With one thread both versions run inline and match, which is also why grid-1
 launches did not change.
 
