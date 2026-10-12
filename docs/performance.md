@@ -67,7 +67,9 @@ What a run is:
   of medians, the ratio of bests, a Mann-Whitney p-value on the per-run values,
   and whether the two builds' counters are identical (they must be). Its verdict
   is `faster`/`slower` only when p <= 0.05 and both ratios moved more than 2% the
-  same way, otherwise `same`.
+  same way, otherwise `same`. The compared metric is Minst/s, except calls per
+  second for `launch` and `api` and the whole-process wall time for `startup`
+  (whose device phase is a few milliseconds).
 * `--cpus 2-5` pins every run to a CPU list; `--threads N` sets `VGPU_THREADS`
   (default 1: the strictly ordered block sequence); `--env K=V` adds environment
   (e.g. `VGPU_FASTPATH=0`); `--json FILE` writes everything, including per-run
