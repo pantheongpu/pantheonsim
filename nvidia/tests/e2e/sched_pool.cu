@@ -87,10 +87,19 @@ static uint64_t host_work(int id, int rounds) {
   cudaMalloc(&x, n * 4);
   cudaMemset(bins, 0, 64 * 4);
   cudaMemset(x, 0, n * 4);
+  // Through cudaLaunchKernel, not <<<>>>: nvcc's generated stub for a kernel
+  // stores into a static function pointer on every launch, which is a data race
+  // (benign, and ThreadSanitizer reports it) when two host threads launch the
+  // same kernel. The launch API itself is what is under test here.
+  const uint32_t* cin = out;
   for (int r = 0; r < rounds; ++r) {
-    scan_blocks<<<grid, block, block * 4, s>>>(out, sums, n, 1000u * id + r);
-    histogram<<<grid, block, 0, s>>>(out, bins, n);
-    bump<<<grid, block, 0, s>>>(x, n);
+    uint32_t salt = 1000u * id + r;
+    void* a_scan[] = {&out, &sums, (void*)&n, &salt};
+    void* a_hist[] = {&cin, &bins, (void*)&n};
+    void* a_bump[] = {&x, (void*)&n};
+    cudaLaunchKernel((const void*)scan_blocks, dim3(grid), dim3(block), a_scan, block * 4, s);
+    cudaLaunchKernel((const void*)histogram, dim3(grid), dim3(block), a_hist, 0, s);
+    cudaLaunchKernel((const void*)bump, dim3(grid), dim3(block), a_bump, 0, s);
   }
   cudaStreamSynchronize(s);
   const std::vector<uint32_t> b = fetch(bins, 64);
