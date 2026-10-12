@@ -579,8 +579,16 @@ void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_
       if (pattern_len == 1) {
         std::memset(chunk + chunk_off, pattern[0], static_cast<size_t>(n));
       } else {
+        // The pattern repeats with its own length, so write one period at the right phase and
+        // double it with memcpy rather than taking a remainder per byte.
         uint8_t* p = chunk + chunk_off;
-        for (uint64_t i = 0; i < n; ++i) p[i] = pattern[(done + i) % pattern_len];
+        const uint64_t first = std::min<uint64_t>(n, pattern_len);
+        for (uint64_t i = 0; i < first; ++i) p[i] = pattern[(done + i) % pattern_len];
+        for (uint64_t filled = first; filled < n;) {
+          const uint64_t c = std::min(filled, n - filled);
+          std::memcpy(p + filled, p, static_cast<size_t>(c));
+          filled += c;
+        }
       }
     }
     off += n;

@@ -719,4 +719,28 @@ VTEST(batch_calls_do_what_one_by_one_calls_do_or_decline_untouched) {
   VCHECK(declined > 500);
 }
 
+VTEST(fill_with_a_repeating_pattern_is_the_pattern_at_every_offset) {
+  // fill() repeats a pattern of any length from the phase the range starts at: compare it with
+  // the byte-by-byte definition over lengths, phases and chunk boundaries.
+  Rng rng{77};
+  MemoryManager mm(1ull << 28);
+  const uint64_t total = 3 * kChunkSize + 1000;
+  const uint64_t p = mm.alloc(total);
+  for (int round = 0; round < 300; ++round) {
+    const uint32_t plen = 1 + static_cast<uint32_t>(rng.below(9));
+    uint8_t pat[16];
+    for (auto& b : pat) b = static_cast<uint8_t>(rng.next() | 1);
+    const uint64_t start = rng.below(round % 3 == 0 ? 100 : total - 1);
+    uint64_t len = 1 + rng.below(total - start);
+    if (round % 5 == 0) len = std::min<uint64_t>(len, 40);
+    std::vector<uint8_t> expect(total);
+    mm.read(p, expect.data(), total);
+    for (uint64_t i = 0; i < len; ++i) expect[start + i] = pat[i % plen];
+    mm.fill(p + start, pat, plen, len);
+    std::vector<uint8_t> got(total);
+    mm.read(p, got.data(), total);
+    if (got != expect) throw vtest::Failure("fill differs: pattern length " + std::to_string(plen) + ", start " + std::to_string(start) + ", length " + std::to_string(len));
+  }
+}
+
 VTEST_MAIN
