@@ -1085,11 +1085,21 @@ void f16x16_to_float_table(const uint32_t* w8, float* out) {
   }
 }
 #if defined(__x86_64__) && defined(__GNUC__)
+// (A NaN comes out of VCVTPH2PS with its payload shifted up, and the table above has only the quiet NaN of that
+// sign, so every NaN is replaced by the table's: without that this path never matched the table for all 65536
+// halves, g_f16c was always false, and the table lookups below ran on every host.)
+__attribute__((target("avx,f16c"))) inline __m256 f16x8_to_float_f16c(__m128i h8) {
+  const __m256 x = _mm256_cvtph_ps(h8);
+  const __m256 is_nan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
+  const __m256 quiet = _mm256_or_ps(_mm256_and_ps(x, _mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(0x80000000u)))),
+                                    _mm256_castsi256_ps(_mm256_set1_epi32(0x7FC00000)));
+  return _mm256_blendv_ps(x, quiet, is_nan);
+}
 __attribute__((target("avx,f16c"))) void f16x16_to_float_f16c(const uint32_t* w8, float* out) {
   const __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w8));
   const __m128i hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w8 + 4));
-  _mm256_storeu_ps(out, _mm256_cvtph_ps(lo));
-  _mm256_storeu_ps(out + 8, _mm256_cvtph_ps(hi));
+  _mm256_storeu_ps(out, f16x8_to_float_f16c(lo));
+  _mm256_storeu_ps(out + 8, f16x8_to_float_f16c(hi));
 }
 const bool g_f16c = [] {
   if (!__builtin_cpu_supports("avx") || !__builtin_cpu_supports("f16c")) return false;
@@ -1133,6 +1143,16 @@ __attribute__((target("avx2"))) void gather8x8(const uint32_t* const rows[8], ui
   transpose8x8(r);
   for (int l = 0; l < 8; ++l) _mm256_storeu_ps(static_cast<float*>(out) + l * 8, r[l]);
 }
+// t[c * 16 + i] = r[i][c], for i, c < 16: a 16 x 16 transpose as four 8 x 8 ones.
+__attribute__((target("avx2"))) void transpose16x16(float* t, const float (*r)[16]) {
+  for (int bi = 0; bi < 2; ++bi)
+    for (int bj = 0; bj < 2; ++bj) {
+      __m256 v[8];
+      for (int k = 0; k < 8; ++k) v[k] = _mm256_loadu_ps(&r[bi * 8 + k][bj * 8]);
+      transpose8x8(v);
+      for (int k = 0; k < 8; ++k) _mm256_storeu_ps(t + (bj * 8 + k) * 16 + bi * 8, v[k]);
+    }
+}
 // rows[k][first + l] = in[l * 8 + k], for k, l < 8.
 __attribute__((target("avx2"))) void scatter8x8(const void* in, uint32_t* const rows[8], uint32_t first) {
   __m256 r[8];
@@ -1146,6 +1166,10 @@ __attribute__((target("avx2"))) void scatter8x8(const void* in, uint32_t* const 
 void gather8x8(const uint32_t* const rows[8], uint32_t first, void* out) {
   for (int l = 0; l < 8; ++l)
     for (int k = 0; k < 8; ++k) std::memcpy(static_cast<uint32_t*>(out) + l * 8 + k, rows[k] + first + l, 4);
+}
+void transpose16x16(float* t, const float (*r)[16]) {
+  for (int i = 0; i < 16; ++i)
+    for (int c = 0; c < 16; ++c) t[c * 16 + i] = r[i][c];
 }
 void scatter8x8(const void* in, uint32_t* const rows[8], uint32_t first) {
   for (int l = 0; l < 8; ++l)
@@ -4422,6 +4446,25 @@ class Interpreter {
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     uint32_t* d = dst32(w, op.dst.id, m);
     const bool sig = op.ty.is_signed();
+    // The SIMD kernel (vgpu/simd/simd.hpp: ibin_m) for the operations the baseline's SSE2 has no instruction for --
+    // the low half of a product, min and max, shifts by a count per lane. Add, sub, and, or and xor stay with the loops
+    // below, which the compiler vectorises as well as the kernel does without the call.
+    if ((W_ == 32 || W_ == 64) && simd::enabled()) {
+      unsigned code = ~0u;
+      switch (op.op) {
+        case IntBinOp::Mul: code = static_cast<unsigned>(simd::IntBin::Mul); break;
+        case IntBinOp::Min: code = static_cast<unsigned>(simd::IntBin::Min); break;
+        case IntBinOp::Max: code = static_cast<unsigned>(simd::IntBin::Max); break;
+        case IntBinOp::Shl: code = static_cast<unsigned>(simd::IntBin::Shl); break;
+        case IntBinOp::Shr: code = static_cast<unsigned>(simd::IntBin::Shr); break;
+        default: break;
+      }
+      if (code != ~0u) {
+        simd::kernels().ibin_m(code, sig, d, a.data(), b.data(), m, W_);
+        w.written32[op.dst.id] = 1;
+        return true;
+      }
+    }
     auto run = [&](auto f) { for_active(m, W_, [&](uint32_t l) { d[l] = f(a[l], b[l]); }); };
     switch (op.op) {
       case IntBinOp::Add: run([](uint32_t x, uint32_t y) { return x + y; }); break;
@@ -4467,7 +4510,8 @@ class Interpreter {
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     const Lanes32& c = read_narrow(w, ins, op.c, sc);
     uint32_t* d = dst32(w, op.dst.id, m);
-    for_active(m, W_, [&](uint32_t l) { d[l] = a[l] * b[l] + c[l]; });
+    if ((W_ == 32 || W_ == 64) && simd::enabled()) simd::kernels().imad_m(d, a.data(), b.data(), c.data(), m, W_);
+    else for_active(m, W_, [&](uint32_t l) { d[l] = a[l] * b[l] + c[l]; });
     w.written32[op.dst.id] = 1;
     return true;
   }
@@ -4493,7 +4537,11 @@ class Interpreter {
     auto run = [&](auto f) {
       for_active(m, W_, [&](uint32_t l) { res |= Mask{f(a[l], b[l]) ? 1u : 0u} << l; });
     };
-    if (op.ty.is_float()) {
+    if (!op.ty.is_float() && static_cast<unsigned>(op.cmp) <= static_cast<unsigned>(CmpOp::Ge) &&
+        (W_ == 32 || W_ == 64) && simd::enabled()) {
+      // The SIMD kernel (vgpu/simd/simd.hpp: icmp_mask): CmpOp's Eq..Ge are IntCmp's, in order.
+      res = simd::kernels().icmp_mask(static_cast<unsigned>(op.cmp), op.ty.is_signed(), a.data(), b.data(), W_) & m;
+    } else if (op.ty.is_float()) {
       const CmpOp cmp = op.cmp;
       run([cmp](uint32_t x, uint32_t y) { return compare_float(cmp, f32(x), f32(y)); });
     } else {
@@ -8575,6 +8623,10 @@ class Interpreter {
         }
         alignas(32) float r[kMmaDim][kMmaDim];
         for (uint32_t lane = 0; lane < kMmaDim; ++lane) f16x16_to_float(w8[lane], r[lane]);
+        if (avx2) {
+          transpose16x16(t, r);
+          return;
+        }
         for (uint32_t i = 0; i < kMmaDim; ++i)
           for (uint32_t c = 0; c < kMmaDim; ++c) t[c * kMmaDim + i] = r[i][c];
         return;

@@ -136,7 +136,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
   const Mask ex = guard_mask(w, ins, w.mactive_force ? w.mactive_force : group);
   {
     exec::LaunchStats& st = blk.st;
-    const uint64_t lanes = static_cast<uint64_t>(std::popcount(ex));
+    const uint64_t lanes = simd::popcount32(ex);   // (std::popcount is a libgcc call on a baseline build)
     ++st.instructions;
     st.thread_instructions += lanes;
     st.inst_by_class[static_cast<size_t>(inst_class(ins.op))] += lanes;
@@ -580,7 +580,7 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       });
       return;
     case Op::POPC: case Op::UPOPC:
-      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, static_cast<uint32_t>(std::popcount(ival(w, ins.src[0], l)))); });
+      each_lane(ex, [&](unsigned l) { write32(w, ins.dst[0], l, simd::popcount32(ival(w, ins.src[0], l))); });
       return;
     case Op::FLO: case Op::UFLO: {
       const bool sgn = ins.f[0], sh = ins.f[1];
@@ -1019,10 +1019,24 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       if (!(o.kind == Kind::Reg || o.kind == Kind::Imm || o.kind == Kind::CBank || o.kind == Kind::UReg)) return false;
     }
     Mask r = 0;
-    for (Mask m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
-      if (sgn ? int_cmp(cmp, static_cast<int32_t>(a), static_cast<int32_t>(b)) : int_cmp(cmp, a, b)) r |= Mask{1} << l;
+    if (simd::enabled() && cmp >= 1 && cmp <= 6) {
+      // The SIMD kernel (vgpu/simd/simd.hpp: icmp_mask) over the sources as 32 lanes: a register's own, or the one
+      // value an immediate, constant, uniform register or RZ is for every lane. SASS's LT EQ LE GT NE GE.
+      alignas(32) uint32_t buf[2][32];
+      const auto src32 = [&](const Operand& o, uint32_t* tmp) -> const uint32_t* {
+        if (o.kind == Kind::Reg && o.reg != kRZ) return &w.reg(o.reg, 0);
+        const uint32_t v = read32(w, o, 0);
+        for (unsigned l = 0; l < 32; ++l) tmp[l] = v;
+        return tmp;
+      };
+      static const unsigned kIntCmp[] = {0, 2, 0, 3, 4, 1, 5};   // simd::IntCmp of cmp 1..6: Lt Eq Le Gt Ne Ge
+      r = simd::kernels().icmp_mask(kIntCmp[cmp], sgn, src32(ins.src[0], buf[0]), src32(ins.src[1], buf[1]), 32) & ex;
+    } else {
+      for (Mask m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        const uint32_t a = read32(w, ins.src[0], l), b = read32(w, ins.src[1], l);
+        if (sgn ? int_cmp(cmp, static_cast<int32_t>(a), static_cast<int32_t>(b)) : int_cmp(cmp, a, b)) r |= Mask{1} << l;
+      }
     }
     const Mask acc = pmask(ins.src[2]);
     setp(ins.dst[0], combine(bop, r, acc));
@@ -1385,6 +1399,32 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::DADD: case Op::DMUL: case Op::DFMA: {
       const unsigned rnd = ins.f[0];
+      // To nearest even, with register sources: the SIMD kernel (vgpu/simd/simd.hpp: dop_m), the same double
+      // operations on the register pairs in place instead of through read64/write64 a lane at a time.
+      if (rnd == 0 && simd::enabled() && ins.dst[0].kind == Kind::Reg) {
+        const size_t nsrc = ins.op == Op::DFMA ? 3 : 2;
+        bool plain = ins.src.size() >= nsrc;
+        for (size_t i = 0; plain && i < nsrc; ++i)
+          plain = ins.src[i].kind == Kind::Reg && (ins.src[i].reg == kRZ || ins.src[i].reg + 1 < w.nregs);
+        if (plain && (ins.dst[0].reg == kRZ || ins.dst[0].reg + 1 < w.nregs)) {
+          static const uint32_t kZero[32] = {};
+          const uint32_t* lo[3] = {kZero, kZero, kZero};
+          const uint32_t* hi[3] = {kZero, kZero, kZero};
+          unsigned mods = 0;
+          for (size_t i = 0; i < nsrc; ++i) {
+            const Operand& o = ins.src[i];
+            if (o.reg != kRZ) {
+              lo[i] = &w.reg(o.reg, 0);
+              hi[i] = &w.reg(o.reg + 1, 0);
+            }
+            mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
+          }
+          if (ins.dst[0].reg != kRZ)
+            simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, &w.reg(ins.dst[0].reg, 0),
+                                  &w.reg(ins.dst[0].reg + 1, 0), lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], ex);
+          return;
+        }
+      }
       each_lane(ex, [&](unsigned l) {
         const double a = f64src(ins.src[0], l), b = f64src(ins.src[1], l);
         double r;

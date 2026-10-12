@@ -583,6 +583,153 @@ VTEST(narrow_sum_matches_the_libm_form) {
   }
 }
 
+VTEST(integer_lane_kernels_at_every_level) {
+  std::mt19937 rng(41);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 40000; ++round) {
+      const unsigned n = round & 1 ? 64 : 32;
+      uint32_t a[64], b[64], c[64], d[64], d0[64];
+      const int style = round % 3;
+      for (unsigned i = 0; i < n; ++i) {
+        a[i] = style == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        b[i] = style == 2 ? static_cast<uint32_t>(rng() % 70) : style == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        c[i] = style == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        d0[i] = rng();
+      }
+      uint64_t mask = (static_cast<uint64_t>(rng()) << 32) | rng();
+      if (round % 7 == 0) mask = ~uint64_t{0};
+      if (round % 11 == 0) mask = 0;
+      const uint64_t all = n == 64 ? ~uint64_t{0} : 0xffffffffull;
+      // comparisons
+      for (unsigned cmp = 0; cmp < 6; ++cmp)
+        for (bool sgn : {false, true}) {
+          uint64_t want = 0;
+          for (unsigned i = 0; i < n; ++i) {
+            const int32_t sx = static_cast<int32_t>(a[i]), sy = static_cast<int32_t>(b[i]);
+            bool r = false;
+            switch (cmp) {
+              case 0: r = a[i] == b[i]; break;
+              case 1: r = a[i] != b[i]; break;
+              case 2: r = sgn ? sx < sy : a[i] < b[i]; break;
+              case 3: r = sgn ? sx <= sy : a[i] <= b[i]; break;
+              case 4: r = sgn ? sx > sy : a[i] > b[i]; break;
+              default: r = sgn ? sx >= sy : a[i] >= b[i]; break;
+            }
+            want |= uint64_t{r} << i;
+          }
+          const uint64_t got = k.icmp_mask(cmp, sgn, a, b, n);
+          if (got != want)
+            throw vtest::Failure(lv + " icmp_mask cmp " + std::to_string(cmp) + (sgn ? " signed" : " unsigned") + ": got 0x" +
+                                 hex(got) + " want 0x" + hex(want));
+        }
+      // binary operations
+      for (unsigned op = 0; op < 10; ++op)
+        for (bool sgn : {false, true}) {
+          std::memcpy(d, d0, sizeof d);
+          k.ibin_m(op, sgn, d, a, b, mask, n);
+          for (unsigned i = 0; i < n; ++i) {
+            const uint32_t x = a[i], y = b[i];
+            const int32_t sx = static_cast<int32_t>(x), sy = static_cast<int32_t>(y);
+            uint32_t r = 0;
+            switch (op) {
+              case 0: r = x + y; break;
+              case 1: r = x - y; break;
+              case 2: r = x * y; break;
+              case 3: r = x & y; break;
+              case 4: r = x | y; break;
+              case 5: r = x ^ y; break;
+              case 6: r = sgn ? static_cast<uint32_t>(std::min(sx, sy)) : std::min(x, y); break;
+              case 7: r = sgn ? static_cast<uint32_t>(std::max(sx, sy)) : std::max(x, y); break;
+              case 8: r = y >= 32 ? 0u : x << y; break;
+              default: r = sgn ? static_cast<uint32_t>(y >= 32 ? (sx < 0 ? -1 : 0) : sx >> y) : (y >= 32 ? 0u : x >> y); break;
+            }
+            const uint32_t want = (mask >> i) & 1 ? r : d0[i];
+            if (d[i] != want)
+              throw vtest::Failure(lv + " ibin_m op " + std::to_string(op) + (sgn ? " signed" : " unsigned") + " lane " +
+                                   std::to_string(i) + ": a=0x" + hex(x) + " b=0x" + hex(y) + " got 0x" + hex(d[i]) +
+                                   " want 0x" + hex(want));
+          }
+        }
+      // d aliasing a source
+      std::memcpy(d, a, n * 4);
+      k.imad_m(d, d, b, c, mask, n);
+      for (unsigned i = 0; i < n; ++i) {
+        const uint32_t want = (mask >> i) & 1 ? a[i] * b[i] + c[i] : a[i];
+        if (d[i] != want)
+          throw vtest::Failure(lv + " imad_m lane " + std::to_string(i) + ": got 0x" + hex(d[i]) + " want 0x" + hex(want));
+      }
+      (void)all;
+    }
+  }
+}
+
+VTEST(double_lanes_and_popcount) {
+  std::mt19937_64 rng(53);
+  // popcount32 against the bit-by-bit count: every word with one or two bits set, every byte pattern in each
+  // position, and random ones.
+  const auto slow = [](uint32_t x) { unsigned n = 0; for (; x; x &= x - 1) ++n; return n; };
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j) VCHECK_EQ(simd::popcount32((1u << i) | (1u << j)), slow((1u << i) | (1u << j)));
+  for (uint32_t b = 0; b < 256; ++b)
+    for (int pos = 0; pos < 4; ++pos) VCHECK_EQ(simd::popcount32(b << (8 * pos)), slow(b << (8 * pos)));
+  for (int i = 0; i < 4000000; ++i) {
+    const uint32_t x = static_cast<uint32_t>(rng());
+    if (simd::popcount32(x) != slow(x)) throw vtest::Failure("popcount32 of 0x" + hex(x));
+  }
+  VCHECK_EQ(simd::popcount32(0xffffffffu), 32u);
+  VCHECK_EQ(simd::popcount32(0), 0u);
+  static const uint64_t special[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull,
+                                     0xbff0000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+                                     0x7ff8000000000000ull, 0x7ff0000000000001ull, 0x0000000000000001ull,
+                                     0x000fffffffffffffull, 0x0010000000000000ull, 0x7fefffffffffffffull,
+                                     0x4000000000000000ull, 0x3ca0000000000000ull, 0x4340000000000000ull};
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 60000; ++round) {
+      uint32_t lo[3][32], hi[3][32], dlo[32], dhi[32], olo[32], ohi[32];
+      for (int s = 0; s < 3; ++s)
+        for (int i = 0; i < 32; ++i) {
+          const uint64_t v = round % 3 == 0 ? rng() : round % 3 == 1 ? special[rng() % (sizeof special / sizeof special[0])]
+                                                                      : (rng() & 0x800fffffffffffffull) | ((rng() % 40 + 1000) << 52);
+          lo[s][i] = static_cast<uint32_t>(v);
+          hi[s][i] = static_cast<uint32_t>(v >> 32);
+        }
+      for (int i = 0; i < 32; ++i) { olo[i] = rng(); ohi[i] = rng(); }
+      const uint32_t mask = round % 5 == 0 ? ~0u : static_cast<uint32_t>(rng());
+      const unsigned kind = round % 3, mods = static_cast<unsigned>(rng() & 63);
+      std::memcpy(dlo, olo, sizeof dlo);
+      std::memcpy(dhi, ohi, sizeof dhi);
+      k.dop_m(kind, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], mask);
+      for (int i = 0; i < 32; ++i) {
+        const auto get = [&](int s) {
+          double d = std::bit_cast<double>(uint64_t{lo[s][i]} | (uint64_t{hi[s][i]} << 32));
+          if (mods & (1u << (2 * s))) d = std::fabs(d);
+          if (mods & (2u << (2 * s))) d = -d;
+          return d;
+        };
+        volatile double x = get(0), y = get(1);
+        double r;
+        if (kind == 0) { volatile double t = x + y; r = t; }
+        else if (kind == 1) { volatile double t = x * y; r = t; }
+        else r = std::fma(x, y, get(2));
+        const uint64_t u = (mask >> i) & 1 ? std::bit_cast<uint64_t>(r) : uint64_t{olo[i]} | (uint64_t{ohi[i]} << 32);
+        const uint64_t g = uint64_t{dlo[i]} | (uint64_t{dhi[i]} << 32);
+        // With two NaN operands the host's instruction picks one by operand position, which the compiler is free to
+        // swap for a commutative operation: the result is a NaN either way, and that is all that is compared then.
+        int nans = 0;
+        for (int s = 0; s < (kind == 2 ? 3 : 2); ++s) nans += std::isnan(get(s)) ? 1 : 0;
+        const bool both_nan = nans > 1 && std::isnan(std::bit_cast<double>(g)) && std::isnan(std::bit_cast<double>(u));
+        if (g != u && !both_nan)
+          throw vtest::Failure(lv + " dop_m kind " + std::to_string(kind) + " mods " + std::to_string(mods) + " lane " +
+                               std::to_string(i) + ": got 0x" + hex(g) + " want 0x" + hex(u));
+      }
+    }
+  }
+}
+
 VTEST(level_choice) {
   VCHECK(simd::supported(simd::Level::Base));
   VCHECK(simd::supported(simd::level()));

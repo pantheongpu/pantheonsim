@@ -287,7 +287,11 @@ void fmul_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
 inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, unsigned n) {
   const uint64_t all = n >= 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
   if ((mask & all) == all) {
-    std::memcpy(d, r, n * sizeof(uint32_t));
+    for (unsigned i = 0; i < n; i += 8) {   // (not memcpy(d, r, n * 4): a call into libc for a size not known here)
+      V8u v;
+      std::memcpy(&v, r + i, sizeof v);
+      std::memcpy(d + i, &v, sizeof v);
+    }
     return;
   }
   for (unsigned i = 0; i < n; i += 8) {
@@ -303,10 +307,198 @@ inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, unsigned
   }
 }
 
+inline bool full_mask(uint64_t mask, unsigned n) {
+  const uint64_t all = n >= 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+  return (mask & all) == all;
+}
+
 void ffma_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n) {
+  if (full_mask(mask, n)) {   // (the kernel reads a chunk of every source before it writes the chunk: d may be one)
+    for (unsigned i = 0; i < n; i += 32) ffma_k(d + i, a + i, b + i, c + i);
+    return;
+  }
   uint32_t r[64];
   for (unsigned i = 0; i < n; i += 32) ffma_k(r + i, a + i, b + i, c + i);
   store_masked(d, r, mask, n);
+}
+
+// ---- integer lane kernels ---------------------------------------------------------------------------------------------
+
+typedef int32_t V8i __attribute__((vector_size(32)));
+
+// The bits of a vector of lane masks (each lane all ones or zero), lane i to bit i.
+#if defined(__SSE2__)
+#define VGPU_MASK_BITS(m)                                                                                  \
+  ({ __m128i lo_, hi_;                                                                                       \
+     std::memcpy(&lo_, reinterpret_cast<const char*>(&(m)), 16);                                             \
+     std::memcpy(&hi_, reinterpret_cast<const char*>(&(m)) + 16, 16);                                        \
+     static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(lo_)) | (_mm_movemask_ps(_mm_castsi128_ps(hi_)) << 4)); })
+#else
+#define VGPU_MASK_BITS(m)                                                           \
+  ({ uint32_t bits_ = 0; for (unsigned k_ = 0; k_ < 8; ++k_) bits_ |= (m[k_] & 1u) << k_; bits_; })
+#endif
+
+template <unsigned Cmp, bool Sgn>
+inline uint64_t icmp_t(const uint32_t* a, const uint32_t* b, unsigned n) {
+  uint64_t out = 0;
+#if !VGPU_SIMD_AVX2
+  // The baseline has no 256-bit compare: the compiler would split these vectors into scalar code anyway.
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t x = a[i], y = b[i];
+    const int32_t xs = static_cast<int32_t>(x), ys = static_cast<int32_t>(y);
+    bool r;
+    if constexpr (Sgn) r = Cmp == 0 ? xs == ys : Cmp == 1 ? xs != ys : Cmp == 2 ? xs < ys : Cmp == 3 ? xs <= ys : Cmp == 4 ? xs > ys : xs >= ys;
+    else r = Cmp == 0 ? x == y : Cmp == 1 ? x != y : Cmp == 2 ? x < y : Cmp == 3 ? x <= y : Cmp == 4 ? x > y : x >= y;
+    out |= uint64_t{r} << i;
+  }
+  return out;
+#endif
+  for (unsigned i = 0; i < n; i += 8) {
+    V8u x, y;
+    std::memcpy(&x, a + i, sizeof x);
+    std::memcpy(&y, b + i, sizeof y);
+    V8u m;
+    if constexpr (Sgn) {
+      const V8i xs = reinterpret_cast<V8i>(x), ys = reinterpret_cast<V8i>(y);
+      m = Cmp == 0 ? reinterpret_cast<V8u>(xs == ys) : Cmp == 1 ? reinterpret_cast<V8u>(xs != ys)
+        : Cmp == 2 ? reinterpret_cast<V8u>(xs < ys) : Cmp == 3 ? reinterpret_cast<V8u>(xs <= ys)
+        : Cmp == 4 ? reinterpret_cast<V8u>(xs > ys) : reinterpret_cast<V8u>(xs >= ys);
+    } else {
+      m = Cmp == 0 ? reinterpret_cast<V8u>(x == y) : Cmp == 1 ? reinterpret_cast<V8u>(x != y)
+        : Cmp == 2 ? reinterpret_cast<V8u>(x < y) : Cmp == 3 ? reinterpret_cast<V8u>(x <= y)
+        : Cmp == 4 ? reinterpret_cast<V8u>(x > y) : reinterpret_cast<V8u>(x >= y);
+    }
+#if VGPU_SIMD_AVX2
+    out |= uint64_t{static_cast<uint32_t>(_mm256_movemask_ps(reinterpret_cast<__m256>(m)))} << i;
+#else
+    out |= uint64_t{VGPU_MASK_BITS(m)} << i;
+#endif
+  }
+  return out;
+}
+
+uint64_t icmp_mask_k(unsigned cmp, bool sgn, const uint32_t* a, const uint32_t* b, unsigned n) {
+  switch (cmp * 2 + (sgn ? 1 : 0)) {
+    case 0: return icmp_t<0, false>(a, b, n);
+    case 1: return icmp_t<0, true>(a, b, n);
+    case 2: return icmp_t<1, false>(a, b, n);
+    case 3: return icmp_t<1, true>(a, b, n);
+    case 4: return icmp_t<2, false>(a, b, n);
+    case 5: return icmp_t<2, true>(a, b, n);
+    case 6: return icmp_t<3, false>(a, b, n);
+    case 7: return icmp_t<3, true>(a, b, n);
+    case 8: return icmp_t<4, false>(a, b, n);
+    case 9: return icmp_t<4, true>(a, b, n);
+    case 10: return icmp_t<5, false>(a, b, n);
+    default: return icmp_t<5, true>(a, b, n);
+  }
+}
+
+template <unsigned Op, bool Sgn>
+inline void ibin_t(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned n) {
+  for (unsigned i = 0; i < n; i += 8) {
+    V8u x, y;
+    std::memcpy(&x, a + i, sizeof x);
+    std::memcpy(&y, b + i, sizeof y);
+    V8u v;
+    const V8i xs = reinterpret_cast<V8i>(x), ys = reinterpret_cast<V8i>(y);
+    if constexpr (Op == 0) v = x + y;
+    else if constexpr (Op == 1) v = x - y;
+    else if constexpr (Op == 2) v = x * y;
+    else if constexpr (Op == 3) v = x & y;
+    else if constexpr (Op == 4) v = x | y;
+    else if constexpr (Op == 5) v = x ^ y;
+    else if constexpr (Op == 6) {   // min
+      if constexpr (Sgn) v = reinterpret_cast<V8u>(xs < ys ? xs : ys);
+      else v = x < y ? x : y;
+    } else if constexpr (Op == 7) {   // max
+      if constexpr (Sgn) v = reinterpret_cast<V8u>(xs > ys ? xs : ys);
+      else v = x > y ? x : y;
+    } else if constexpr (Op == 8) {   // shl: a count past the width shifts everything out
+      v = (x << (y & 31u)) & reinterpret_cast<V8u>(y < 32u);
+    } else {   // shr: past the width, zero (unsigned) or the sign (signed)
+      if constexpr (Sgn) {
+        const V8u big = reinterpret_cast<V8u>(y > 31u);
+        const V8u count = (y & ~big) | (31u & big);
+        v = reinterpret_cast<V8u>(xs >> reinterpret_cast<V8i>(count));
+      } else {
+        v = (x >> (y & 31u)) & reinterpret_cast<V8u>(y < 32u);
+      }
+    }
+    std::memcpy(r + i, &v, sizeof v);
+  }
+}
+
+void ibin_m_k(unsigned op, bool sgn, uint32_t* d, const uint32_t* a, const uint32_t* b, uint64_t mask, unsigned n) {
+  uint32_t tmp[64];
+  uint32_t* const r = full_mask(mask, n) ? d : tmp;   // (chunk by chunk, every source is read before its chunk is written)
+  switch (op * 2 + (sgn ? 1 : 0)) {
+    case 0: case 1: ibin_t<0, false>(r, a, b, n); break;
+    case 2: case 3: ibin_t<1, false>(r, a, b, n); break;
+    case 4: case 5: ibin_t<2, false>(r, a, b, n); break;
+    case 6: case 7: ibin_t<3, false>(r, a, b, n); break;
+    case 8: case 9: ibin_t<4, false>(r, a, b, n); break;
+    case 10: case 11: ibin_t<5, false>(r, a, b, n); break;
+    case 12: ibin_t<6, false>(r, a, b, n); break;
+    case 13: ibin_t<6, true>(r, a, b, n); break;
+    case 14: ibin_t<7, false>(r, a, b, n); break;
+    case 15: ibin_t<7, true>(r, a, b, n); break;
+    case 16: case 17: ibin_t<8, false>(r, a, b, n); break;
+    case 18: ibin_t<9, false>(r, a, b, n); break;
+    default: ibin_t<9, true>(r, a, b, n); break;
+  }
+  if (r != d) store_masked(d, r, mask, n);
+}
+
+void imad_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n) {
+  uint32_t tmp[64];
+  uint32_t* const r = full_mask(mask, n) ? d : tmp;
+  for (unsigned i = 0; i < n; i += 32) imad_k(r + i, a + i, b + i, c + i);
+  if (r != d) store_masked(d, r, mask, n);
+}
+
+// ---- binary64 lanes held as register pairs (the SASS executor: the low words of a register, the high words of the next)
+
+// kind 0: a + b, 1: a * b, 2: fma(a, b, c); `mods` has bit 2i for |source i| and bit 2i + 1 for -source i (the
+// absolute value first). d, a, b, c are (low, high) pairs of 32-lane arrays; only the lanes of `mask` are written.
+void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const uint32_t* alo, const uint32_t* ahi,
+             const uint32_t* blo, const uint32_t* bhi, const uint32_t* clo, const uint32_t* chi, uint32_t mask) {
+  uint32_t rlo[32], rhi[32];
+  const uint32_t absm[3] = {(mods & 1) ? 0x7fffffffu : ~0u, (mods & 4) ? 0x7fffffffu : ~0u, (mods & 16) ? 0x7fffffffu : ~0u};
+  const uint32_t negm[3] = {(mods & 2) ? 0x80000000u : 0u, (mods & 8) ? 0x80000000u : 0u, (mods & 32) ? 0x80000000u : 0u};
+#if VGPU_SIMD_AVX2
+  for (unsigned i = 0; i < 32; i += 4) {
+    const auto load = [&](const uint32_t* lo, const uint32_t* hi, unsigned k) {
+      __m128i l = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lo + i));
+      __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hi + i));
+      h = _mm_xor_si128(_mm_and_si128(h, _mm_set1_epi32(static_cast<int>(absm[k]))), _mm_set1_epi32(static_cast<int>(negm[k])));
+      return _mm256_castsi256_pd(_mm256_or_si256(_mm256_cvtepu32_epi64(l), _mm256_slli_epi64(_mm256_cvtepu32_epi64(h), 32)));
+    };
+    const __m256d x = load(alo, ahi, 0), y = load(blo, bhi, 1);
+    __m256d v;
+    if (kind == 0) v = _mm256_add_pd(x, y);
+    else if (kind == 1) v = _mm256_mul_pd(x, y);
+    else v = _mm256_fmadd_pd(x, y, load(clo, chi, 2));
+    const __m256i u = _mm256_castpd_si256(v);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(rlo + i),
+                     _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(u, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0))));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(rhi + i),
+                     _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(u, _mm256_setr_epi32(1, 3, 5, 7, 0, 0, 0, 0))));
+  }
+#else
+  for (unsigned i = 0; i < 32; ++i) {
+    const auto get = [&](const uint32_t* lo, const uint32_t* hi, unsigned k) {
+      return std::bit_cast<double>(uint64_t{lo[i]} | (uint64_t{(hi[i] & absm[k]) ^ negm[k]} << 32));
+    };
+    const double x = get(alo, ahi, 0), y = get(blo, bhi, 1);
+    const double v = kind == 0 ? x + y : kind == 1 ? x * y : __builtin_fma(x, y, get(clo, chi, 2));
+    const uint64_t u = std::bit_cast<uint64_t>(v);
+    rlo[i] = static_cast<uint32_t>(u);
+    rhi[i] = static_cast<uint32_t>(u >> 32);
+  }
+#endif
+  store_masked(dlo, rlo, mask, 32);
+  store_masked(dhi, rhi, mask, 32);
 }
 
 #if VGPU_SIMD_AVX2

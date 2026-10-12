@@ -28,16 +28,15 @@ namespace vgpu::simd {
 enum class Level : int { Base = 0, Avx2 = 1 };   // Avx2 = AVX2 + FMA + F16C
 inline constexpr int kLevels = 2;
 
-// Whether the engines use these kernels at all: VGPU_SIMD=off sends every
-// instruction down the code the kernels replaced, for A/B runs and to rule
-// the kernels out when chasing a difference.
-bool enabled();
 
 const char* level_name(Level l);
 // Whether this host can run `l` (Base always).
 bool supported(Level l);
 // The level the kernels in use run at: the best supported, capped by VGPU_SIMD.
 Level level();
+
+enum class IntCmp : unsigned { Eq, Ne, Lt, Le, Gt, Ge };
+enum class IntBin : unsigned { Add, Sub, Mul, And, Or, Xor, Min, Max, Shl, Shr };
 
 struct Kernels {
   Level level;
@@ -66,6 +65,22 @@ struct Kernels {
   void (*ffma_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
   void (*hfma2_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n,
                   unsigned halves);
+  // 32-bit integer lanes over n lanes (a multiple of 32, at most 64). icmp_mask: bit l of the result is `a[l] cmp b[l]`
+  // for cmp in {Eq, Ne, Lt, Le, Gt, Ge} (IntCmp), signed or unsigned. ibin_m: d[l] = a[l] op b[l] for the lanes of
+  // `mask` (the others keep their value; d may be a source): wrapping add/sub/mul, and/or/xor, min/max, and
+  // shl/shr where a count of 32 or more shifts every bit out (a signed shr then fills with the sign), as PTX defines
+  // them. imad_m: a * b + c, wrapping.
+  uint64_t (*icmp_mask)(unsigned cmp, bool sgn, const uint32_t* a, const uint32_t* b, unsigned n);
+  void (*ibin_m)(unsigned op, bool sgn, uint32_t* d, const uint32_t* a, const uint32_t* b, uint64_t mask, unsigned n);
+  void (*imad_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
+
+  // binary64 lanes held as the SASS executor holds them, a register pair: the low words of 32 lanes and the high
+  // words. kind 0: a + b, 1: a * b, 2: fma(a, b, c), all to nearest even (c is unused for 0 and 1). mods: bit 2i is
+  // |source i|, bit 2i + 1 is -source i (the absolute value first). Writes only the lanes of `mask` (the others keep
+  // their value; d may be a source); a NaN result is whatever the host gives.
+  void (*dop_m)(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const uint32_t* alo, const uint32_t* ahi,
+                const uint32_t* blo, const uint32_t* bhi, const uint32_t* clo, const uint32_t* chi, uint32_t mask);
+
   // binary64 -> binary16 to nearest even in one rounding, a NaN the canonical 0x7fff.
   void (*f64_to_f16_canon)(const double* in, uint16_t* out, size_t n);
 
@@ -85,7 +100,29 @@ struct Kernels {
 
 // The kernels at the level in use, and at a given one (for tests; a level the
 // host cannot run is not available: check supported() first).
-const Kernels& kernels();
+namespace detail {
+// Set when the library is loaded (src/simd/simd.cpp): the baseline kernels and "on" until then, so a call from another
+// translation unit's static initialisation still works.
+extern const Kernels* g_kernels;
+extern bool g_enabled;
+}  // namespace detail
+
+// The kernels at the level in use. Inline: it is called once or twice per simulated instruction.
+inline const Kernels& kernels() { return *detail::g_kernels; }
+
+// Whether the engines use these kernels at all: VGPU_SIMD=off sends every
+// instruction down the code the kernels replaced, for A/B runs and to rule
+// the kernels out when chasing a difference.
+inline bool enabled() { return detail::g_enabled; }
+
+// Population count of a 32-bit word without a libgcc call (a baseline x86-64 build has no POPCNT instruction, so
+// std::popcount is a call into libgcc: 2% of a warp-instruction's time, at one per instruction).
+inline unsigned popcount32(uint32_t x) {
+  x = x - ((x >> 1) & 0x55555555u);
+  x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+  x = (x + (x >> 4)) & 0x0f0f0f0fu;
+  return (x * 0x01010101u) >> 24;
+}
 const Kernels& kernels_for(Level l);
 
 }  // namespace vgpu::simd
