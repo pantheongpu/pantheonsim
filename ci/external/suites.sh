@@ -34,14 +34,14 @@
 # The cuda-samples list's columns: path | marker | arguments | environment.
 #
 # Environment: SUITE_GPU (nvidia/rtx3060), SUITE_TIMEOUT (seconds per
-# program, 600), SUITE_JOBS (parallel builds, nproc), SUITE_ONLY (a regex of
+# program, 600), SUITE_JOBS (parallel builds, ci/jobs.sh -g 2), SUITE_ONLY (a regex of
 # program names to keep).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cmd="${1:?fetch|build|run|digest}"; suite="${2:?suite}"; dir="${3:?dir}"
 gpu="${SUITE_GPU:-nvidia/rtx3060}"
 timeout_s="${SUITE_TIMEOUT:-600}"
-jobs="${SUITE_JOBS:-$(nproc)}"
+jobs="${SUITE_JOBS:-$("$here/../jobs.sh" -g 2)}"
 only="${SUITE_ONLY:-.}"
 
 declare -A repo=([cuda-samples]=https://github.com/NVIDIA/cuda-samples

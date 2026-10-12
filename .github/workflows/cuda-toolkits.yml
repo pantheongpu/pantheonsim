@@ -88,7 +88,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: cmake --build build -j"$(ci/jobs.sh -p release)"
 
       - name: The shims follow this toolkit
         # libcudart.so.12 from 12.x headers: a 13 here would mean the build

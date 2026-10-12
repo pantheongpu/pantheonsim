@@ -14,7 +14,7 @@
 #
 # An nvcc too old for an architecture (sm_100 and sm_120 need CUDA 12.8) skips
 # it and says so. VGPU_SASS_ARCHS and VGPU_SASS_PROGRAMS narrow the lists;
-# VGPU_SASS_JOBS caps the builds run at once (default: one per CPU).
+# VGPU_SASS_JOBS caps the builds run at once (default: ci/jobs.sh -p sass, by CPUs and memory).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -126,7 +126,7 @@ fi
 # never call the driver API, so a sanitizer build can still run them (below).
 export nvcc_bin root work cutlass rdc cdp1
 export san="${san_flags[*]}"
-printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_SASS_JOBS:-$(nproc)}" -L 1 bash -c '
+printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_SASS_JOBS:-$("$root/ci/jobs.sh" -p sass)}" -L 1 bash -c '
   sep=(); [[ $rdc == *" $0 "* ]] && sep=(-rdc=true -lcudadevrt)
   [[ $cdp1 == *" $0 "* ]] && sep+=(-DCUDA_FORCE_CDP1_IF_SUPPORTED -D__CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
