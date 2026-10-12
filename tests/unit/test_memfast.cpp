@@ -22,7 +22,14 @@
 #include <thread>
 #include <vector>
 
+#include <algorithm>
+#include <array>
+
 #include "vgpu/error.hpp"
+#include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/ptx/parser.hpp"
+#include "vgpu/registry.hpp"
 #include "vgpu/memory.hpp"
 #include "vtest.hpp"
 
@@ -331,6 +338,385 @@ VTEST(concurrent_access_beside_allocation_churn_adds_up) {
       for (int i = 0; i < kWords; ++i) expect += (uint64_t(i) * 31 + w + r) ^ uint64_t(i);
     VCHECK_EQ(result[w], expect);
   }
+}
+
+// ---- the counters of a warp's memory access ----------------------------------
+//
+// The two functions below are the engines' counting as it was before
+// vgpu/exec/mem_counters.hpp, copied as it stood (the interpreter's
+// count_addresses and the SASS executor's count_access).
+
+namespace {
+
+constexpr uint32_t kMaxWarpSize = 64;
+
+uint32_t old_ptx_banks(const std::array<uint64_t, 64>& addrs, uint64_t m, uint32_t W_, uint64_t span) {
+  uint32_t worst = 1;
+  for (uint32_t bank = 0; bank < 32; ++bank) {
+    std::array<uint64_t, kMaxWarpSize * 4> words{};
+    uint32_t distinct = 0;
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (uint64_t{1} << lane))) continue;
+      for (uint64_t off = 0; off < span; off += 4) {
+        const uint64_t word = (addrs[lane] + off) / 4;
+        if (word % 32 != bank) continue;
+        bool seen = false;
+        for (uint32_t i = 0; i < distinct; ++i)
+          if (words[i] == word) { seen = true; break; }
+        if (!seen && distinct < words.size()) words[distinct++] = word;
+      }
+    }
+    if (distinct > worst) worst = distinct;
+  }
+  return worst;
+}
+
+uint32_t old_ptx_sectors(const std::array<uint64_t, 64>& addrs, uint64_t m, uint32_t W_, uint64_t span) {
+  std::array<uint64_t, kMaxWarpSize * 8> sectors{};
+  uint32_t distinct = 0;
+  for (uint32_t lane = 0; lane < W_; ++lane) {
+    if (!(m & (uint64_t{1} << lane))) continue;
+    const uint64_t first = addrs[lane] / 32;
+    const uint64_t last = (addrs[lane] + (span ? span - 1 : 0)) / 32;
+    for (uint64_t sec = first; sec <= last; ++sec) {
+      bool seen = false;
+      for (uint32_t i = 0; i < distinct; ++i)
+        if (sectors[i] == sec) { seen = true; break; }
+      if (!seen && distinct < sectors.size()) sectors[distinct++] = sec;
+    }
+  }
+  return distinct;
+}
+
+uint64_t old_sass_sectors(const uint64_t* addr, uint32_t lanes, uint32_t bytes) {
+  std::vector<uint64_t> sectors;
+  for (unsigned l = 0; l < 32; ++l)
+    if (lanes & (1u << l))
+      for (uint64_t s = addr[l] / 32; s <= (addr[l] + bytes - 1) / 32; ++s) sectors.push_back(s);
+  std::sort(sectors.begin(), sectors.end());
+  return static_cast<uint64_t>(std::unique(sectors.begin(), sectors.end()) - sectors.begin());
+}
+
+uint64_t old_sass_passes(const uint64_t* addr, uint32_t lanes, uint32_t bytes) {
+  std::vector<uint64_t> words[32];
+  for (unsigned l = 0; l < 32; ++l)
+    if (lanes & (1u << l))
+      for (uint64_t a = addr[l] & ~3ull; a < addr[l] + bytes; a += 4) words[(a / 4) % 32].push_back(a / 4);
+  uint64_t passes = 1;
+  for (auto& v : words) {
+    std::sort(v.begin(), v.end());
+    passes = std::max<uint64_t>(passes, static_cast<uint64_t>(std::unique(v.begin(), v.end()) - v.begin()));
+  }
+  return passes;
+}
+
+// Addresses in the shapes kernels make: unit stride, strided, reversed, a
+// broadcast, a gather, a transpose column, unaligned, and the extremes.
+void fill_addresses(Rng& rng, std::array<uint64_t, 64>& a, uint32_t lanes) {
+  const uint64_t base = rng.below(8) == 0 ? ~uint64_t{0} - rng.below(4096) : rng.below(1ull << 40);
+  const uint64_t pattern = rng.below(9);
+  const uint64_t stride_choices[] = {1, 2, 4, 8, 12, 16, 32, 33 * 4, 64, 128, 132, 256, 1024, 4100};
+  const uint64_t stride = stride_choices[rng.below(sizeof stride_choices / sizeof stride_choices[0])];
+  for (uint32_t l = 0; l < 64; ++l) {
+    switch (pattern) {
+      case 0: a[l] = base + l * 4; break;
+      case 1: a[l] = base + l * stride; break;
+      case 2: a[l] = base + (lanes - 1 - l % lanes) * stride; break;
+      case 3: a[l] = base; break;
+      case 4: a[l] = rng.next() % (1 << 20); break;
+      case 5: a[l] = base + (l % 8) * stride + (l / 8) * 4; break;
+      case 6: a[l] = base + l * stride + (rng.below(2) ? 1 : 3); break;   // unaligned
+      case 7: a[l] = (base & ~3ull) + (l % 4) * 4096 + (l / 4) * 4; break;
+      default: a[l] = rng.next(); break;
+    }
+  }
+}
+
+}  // namespace
+
+VTEST(counters_of_a_warps_access_match_the_earlier_counting) {
+  Rng rng{2026};
+  uint64_t checked = 0;
+  for (int i = 0; i < 300000; ++i) {
+    const uint32_t lanes = rng.below(5) == 0 ? 64 : 32;
+    std::array<uint64_t, 64> a;
+    fill_addresses(rng, a, lanes);
+    uint64_t mask = rng.below(4) == 0 ? ~uint64_t{0} : rng.next() & rng.next();
+    if (lanes == 32) mask &= 0xFFFFFFFFull;
+    const uint64_t bytes_choices[] = {1, 2, 4, 8, 16};
+    const uint64_t count_choices[] = {1, 2, 4};
+    uint64_t span = bytes_choices[rng.below(5)] * count_choices[rng.below(3)];
+    if (rng.below(40) == 0) span = 1 + rng.below(400);   // past what the fast versions are shaped for
+    if (rng.below(200) == 0) span = 0;
+    // The PTX interpreter's counting (any warp size up to 64).
+    VCHECK_EQ(exec::memcount::ptx_bank_passes(a.data(), mask, lanes, span), old_ptx_banks(a, mask, lanes, span));
+    VCHECK_EQ(exec::memcount::distinct_sectors(a.data(), mask, lanes, span, kMaxWarpSize * 8),
+              old_ptx_sectors(a, mask, lanes, span));
+    // The SASS executor's (32 lanes, 1..32 byte accesses, as exec_mem makes them).
+    const uint32_t m32 = static_cast<uint32_t>(mask);
+    const uint32_t sb = span ? static_cast<uint32_t>(std::min<uint64_t>(span, 200)) : 1;
+    bool sane = m32 != 0;   // SASS counting of an address in the top 256 bytes of the space never ends
+    for (int l = 0; l < 32; ++l) sane = sane && (!(m32 >> l & 1) || a[l] <= UINT64_MAX - 256);
+    if (sane) {
+      VCHECK_EQ(exec::memcount::sass_bank_passes(a.data(), m32, 32, sb), old_sass_passes(a.data(), m32, sb));
+      VCHECK_EQ(exec::memcount::distinct_sectors(a.data(), m32, 32, sb, SIZE_MAX), old_sass_sectors(a.data(), m32, sb));
+    }
+    // The references kept in the header (what VGPU_FASTCOUNT=0 runs) are that earlier code too.
+    VCHECK_EQ(exec::memcount::ptx_bank_passes_reference(a.data(), mask, lanes, span), old_ptx_banks(a, mask, lanes, span));
+    VCHECK_EQ(exec::memcount::sectors_reference(a.data(), mask, lanes, span, kMaxWarpSize * 8),
+              old_ptx_sectors(a, mask, lanes, span));
+    if (sane) {
+      VCHECK_EQ(exec::memcount::sass_bank_passes_reference(a.data(), m32, 32, sb), old_sass_passes(a.data(), m32, sb));
+      VCHECK_EQ(exec::memcount::sass_sectors_reference(a.data(), m32, 32, sb), old_sass_sectors(a.data(), m32, sb));
+    }
+    ++checked;
+  }
+  VCHECK(checked == 300000);
+}
+
+VTEST(known_access_shapes_count_as_the_hardware_documents) {
+  // 32 lanes reading consecutive floats: 4 sectors, no bank conflict; a column of a
+  // 32-wide tile: 32 sectors and a 32-way conflict, which padding to 33 removes.
+  std::array<uint64_t, 64> a{};
+  for (int l = 0; l < 32; ++l) a[l] = 0x1000 + 4 * l;
+  VCHECK_EQ(exec::memcount::distinct_sectors(a.data(), 0xFFFFFFFFull, 32, 4, 512), 4u);
+  VCHECK_EQ(exec::memcount::ptx_bank_passes(a.data(), 0xFFFFFFFFull, 32, 4), 1u);
+  for (int l = 0; l < 32; ++l) a[l] = 128 * l;
+  VCHECK_EQ(exec::memcount::distinct_sectors(a.data(), 0xFFFFFFFFull, 32, 4, 512), 32u);
+  VCHECK_EQ(exec::memcount::ptx_bank_passes(a.data(), 0xFFFFFFFFull, 32, 4), 32u);
+  VCHECK_EQ(exec::memcount::sass_bank_passes(a.data(), 0xFFFFFFFFu, 32, 4), 32u);
+  for (int l = 0; l < 32; ++l) a[l] = 132 * l;
+  VCHECK_EQ(exec::memcount::ptx_bank_passes(a.data(), 0xFFFFFFFFull, 32, 4), 1u);
+  for (int l = 0; l < 32; ++l) a[l] = 0x40;   // a broadcast
+  VCHECK_EQ(exec::memcount::ptx_bank_passes(a.data(), 0xFFFFFFFFull, 32, 4), 1u);
+  VCHECK_EQ(exec::memcount::distinct_sectors(a.data(), 0xFFFFFFFFull, 32, 4, 512), 1u);
+  VCHECK_EQ(exec::memcount::distinct_sectors(a.data(), 0, 32, 4, 512), 0u);
+}
+
+// ---- loads and stores of a whole warp, through the kernel -----------------------
+//
+// A kernel's ld.global / st.global go to the memory manager a warp at a time
+// (load_batch / store_batch) when every access is ordinary, and lane by lane
+// otherwise. Each case below runs the same kernel with the lookup cache on (so
+// batches happen) and off (VGPU_LOOKUP_CACHE=0: every access one at a time) and
+// requires the same memory afterwards, the same counters, and the same error
+// text, for: plain accesses, every width, vectors, lanes predicated off, lanes
+// writing the same address, a lane past the end of its buffer, a misaligned lane,
+// a freed buffer, a lane at a null pointer, and a store into untouched memory.
+
+namespace {
+
+std::vector<uint8_t> arg64(uint64_t v) {
+  std::vector<uint8_t> b(8);
+  std::memcpy(b.data(), &v, 8);
+  return b;
+}
+
+struct Ran {
+  std::string error;
+  std::vector<uint8_t> out;
+  std::vector<uint64_t> counters;
+};
+
+// `ty` is the PTX type of the access, `vec` the vector width (1, 2 or 4),
+// `offsets` each thread's byte offset into both buffers (the table is read
+// through the same path). Thread t is predicated off when `off_mask` has bit t.
+Ran run_ldst(bool cache, const std::string& ty, int vec, const std::vector<uint64_t>& offsets,
+             uint64_t off_mask, bool free_input, uint64_t buf_bytes) {
+  setenv("VGPU_LOOKUP_CACHE", cache ? "1" : "0", 1);
+  setenv("VGPU_THREADS", "1", 1);
+  const bool is64 = ty == "u64";
+  std::string vals;
+  for (int i = 0; i < vec; ++i) vals += (i ? ", " : "") + std::string(is64 ? "%rd1" : "%r1") + std::to_string(i + 1);
+  const std::string vreg = vec == 1 ? vals : "{" + vals + "}";
+  const std::string vec_s = vec == 1 ? "" : ".v" + std::to_string(vec);
+  std::string ptx = ".version 8.3\n.target sm_90\n.address_size 64\n.visible .entry k(.param .u64 pin, .param .u64 pout, .param .u64 ptbl, .param .u64 pmask)\n{\n"
+    " .reg .pred %p<4>; .reg .b32 %r<16>; .reg .b64 %rd<24>;\n"
+    " ld.param.u64 %rd1,[pin]; ld.param.u64 %rd2,[pout]; ld.param.u64 %rd3,[ptbl]; ld.param.u64 %rd4,[pmask];\n"
+    " mov.u32 %r1,%tid.x; mul.wide.u32 %rd5,%r1,8; add.u64 %rd6,%rd3,%rd5; ld.global.u64 %rd7,[%rd6];\n"
+    " shr.u64 %rd8,%rd4,%r1; and.b64 %rd8,%rd8,1; setp.eq.u64 %p1,%rd8,0;\n"
+    " ld.global.u64 %rd15,[%rd6+256];\n"
+    " add.u64 %rd9,%rd1,%rd7; add.u64 %rd10,%rd2,%rd15;\n";
+  // %rd11.. / %r11.. are the data registers named in `vals`.
+  const std::string t = ty == "f32" ? "f32" : ty;
+  ptx += " @%p1 ld.global." + t + vec_s + " " + vreg + ", [%rd9];\n";
+  ptx += " @%p1 st.global." + t + vec_s + " [%rd10], " + vreg + ";\n ret;\n}\n";
+  Ran r;
+  MemoryManager mem{1 << 26};
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  auto m = ptx::parse(ptx);
+  const uint64_t in = mem.alloc(buf_bytes), out = mem.alloc(buf_bytes), tbl = mem.alloc(512),
+                 untouched = mem.alloc(1 << 20);
+  (void)untouched;
+  std::vector<uint8_t> init(buf_bytes);
+  for (size_t i = 0; i < init.size(); ++i) init[i] = static_cast<uint8_t>(i * 29 + 5);
+  mem.write(in, init.data(), init.size());
+  // The table: each thread's input offset, then (32 entries on) its output offset. Outputs
+  // collide where `offsets` repeat, and are scrambled so lane order decides who wins.
+  std::vector<uint64_t> table(64, 0);
+  for (size_t i = 0; i < offsets.size() && i < 32; ++i) {
+    table[i] = offsets[i];
+    table[32 + i] = offsets[(i * 7 + i / 4) % offsets.size()];
+  }
+  mem.write(tbl, table.data(), table.size() * 8);
+  uint64_t in_arg = in;
+  if (free_input) {
+    const uint64_t dead = mem.alloc(buf_bytes);
+    mem.write(dead, init.data(), init.size());
+    mem.free(dead);
+    in_arg = dead;
+  }
+  exec::LaunchConfig cfg;
+  cfg.block = {static_cast<uint32_t>(offsets.size()), 1, 1};
+  try {
+    const exec::LaunchStats st = exec::launch(m.entries[0], cfg, {arg64(in_arg), arg64(out), arg64(tbl), arg64(off_mask)}, mem, prof);
+    r.counters = {st.instructions, st.thread_instructions, st.global_loads, st.global_stores, st.global_bytes_read,
+                  st.global_bytes_written, st.global_sectors, st.global_requests, st.global_sectors_ld,
+                  st.global_sectors_st};
+  } catch (const Error& e) {
+    r.error = e.what();
+  }
+  r.out.resize(buf_bytes);
+  mem.read(out, r.out.data(), r.out.size());
+  unsetenv("VGPU_LOOKUP_CACHE");
+  unsetenv("VGPU_THREADS");
+  return r;
+}
+
+void same_ldst(const char* what, const std::string& ty, int vec, const std::vector<uint64_t>& offs, uint64_t off_mask,
+               bool free_input, uint64_t buf_bytes) {
+  const Ran a = run_ldst(true, ty, vec, offs, off_mask, free_input, buf_bytes);
+  const Ran b = run_ldst(false, ty, vec, offs, off_mask, free_input, buf_bytes);
+  if (a.error != b.error || a.out != b.out || a.counters != b.counters)
+    throw vtest::Failure(std::string(what) + " (" + ty + " x" + std::to_string(vec) + "): batched {" + a.error +
+                         "} vs lane by lane {" + b.error + "}, memory " + (a.out == b.out ? "same" : "differs") +
+                         ", counters " + (a.counters == b.counters ? "same" : "differ"));
+}
+
+}  // namespace
+
+VTEST(warp_wide_loads_and_stores_match_lane_by_lane) {
+  struct T { const char* ty; int bytes; };
+  const T types[] = {{"u8", 1}, {"u16", 2}, {"u32", 4}, {"f32", 4}, {"u64", 8}};
+  const uint64_t kBuf = 8192;
+  for (const T& t : types)
+    for (int vec : {1, 2, 4}) {
+      if (std::string(t.ty) == "u8" && vec > 1) continue;
+      const uint64_t span = uint64_t(t.bytes) * vec;
+      std::vector<uint64_t> unit, strided, same_addr, scattered, oob, misaligned, past, null_lane;
+      for (int i = 0; i < 32; ++i) {
+        unit.push_back(i * span);
+        strided.push_back(((i * 7) % 32) * span * 2);
+        same_addr.push_back((i % 4) * span);
+        scattered.push_back(((i * 13 + 5) % 64) * span);
+        oob.push_back(i == 17 ? kBuf : i * span);
+        misaligned.push_back(i == 9 ? i * span + 1 : i * span);
+        past.push_back(i == 31 ? kBuf - span + 1 : i * span);
+        null_lane.push_back(i == 3 ? uint64_t(0) - 0x2000'0000'0000ull : i * span);   // far outside every allocation
+      }
+      const uint64_t all = 0xFFFFFFFFull;
+      same_ldst("unit stride", t.ty, vec, unit, all, false, kBuf);
+      same_ldst("strided", t.ty, vec, strided, all, false, kBuf);
+      same_ldst("lanes writing one address", t.ty, vec, same_addr, all, false, kBuf);
+      same_ldst("scattered", t.ty, vec, scattered, all, false, kBuf);
+      same_ldst("lanes predicated off", t.ty, vec, unit, 0xA5A5A5A5ull, false, kBuf);
+      same_ldst("one lane past the end", t.ty, vec, oob, all, false, kBuf);
+      same_ldst("one lane misaligned", t.ty, vec, misaligned, all, false, kBuf);
+      same_ldst("one lane straddling the end", t.ty, vec, past, all, false, kBuf);
+      same_ldst("one lane at a wild address", t.ty, vec, null_lane, all, false, kBuf);
+      same_ldst("freed input", t.ty, vec, unit, all, true, kBuf);
+    }
+}
+
+// ---- the batch calls themselves, against one-by-one ---------------------------
+
+VTEST(batch_calls_do_what_one_by_one_calls_do_or_decline_untouched) {
+  MemoryManager a(1ull << 28), b(1ull << 28);
+  a.set_lookup_cache(true);
+  b.set_lookup_cache(false);
+  FlipLoads flip;
+  a.set_access_fault(&flip);
+  const uint64_t sizes[] = {70000, 4096, 300000};
+  std::vector<uint64_t> base;
+  for (uint64_t sz : sizes) {
+    base.push_back(a.alloc(sz));
+    if (b.alloc(sz) != base.back()) throw vtest::Failure("addresses differ");
+  }
+  // Some memory uniform, some untouched, some written.
+  const uint8_t pat[1] = {0xA5};
+  a.fill(base[2], pat, 1, 3 * kChunkSize), b.fill(base[2], pat, 1, 3 * kChunkSize);
+  std::vector<uint8_t> junk(4096);
+  for (size_t i = 0; i < junk.size(); ++i) junk[i] = uint8_t(i * 7 + 1);
+  a.write(base[0], junk.data(), junk.size()), b.write(base[0], junk.data(), junk.size());
+  Rng rng{424242};
+  uint64_t batched_loads = 0, batched_stores = 0, declined = 0;
+  auto same_memory = [&](int step) {
+    for (int k = 0; k < 3; ++k) {
+      std::vector<uint8_t> x(sizes[k]), y(sizes[k]);
+      flip.armed = 0;
+      a.read(base[k], x.data(), x.size());
+      flip.armed = 1;
+      b.read(base[k], y.data(), y.size());
+      if (x != y) throw vtest::Failure("memory differs after step " + std::to_string(step));
+    }
+  };
+  for (int step = 0; step < 6000; ++step) {
+    const uint32_t sz = 1u << rng.below(4);
+    const size_t count = 1 + rng.below(40);
+    const size_t k = rng.below(3);
+    std::vector<uint64_t> addrs(count), vals(count);
+    const uint64_t mode = rng.below(10);
+    for (size_t i = 0; i < count; ++i) {
+      uint64_t off;
+      if (mode < 5) off = (i * sz * (1 + mode)) % sizes[k];                     // regular
+      else if (mode < 7) off = rng.below(sizes[k]) & ~uint64_t{sz - 1};          // scattered
+      else if (mode == 7) off = (i == count / 2) ? sizes[k] - sz + (rng.below(2) ? 1 : 0) : i * sz;   // edge/misaligned
+      else if (mode == 8) off = kChunkSize - sz * (count / 2) + i * sz;          // straddling a chunk
+      else off = (i % 3) * sz;                                                   // repeats
+      addrs[i] = base[k] + off;
+      if (mode == 9 && i == 2) addrs[i] = base[(k + 1) % 3] + 8;                 // another allocation
+      vals[i] = rng.next() & (sz == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * sz)) - 1);
+      if (rng.below(6) == 0) vals[i] = 0xA5A5A5A5A5A5A5A5ull & (sz == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * sz)) - 1);
+    }
+    flip.armed = rng.below(7) == 0 ? 1 : 0;   // armed on loads: the batch must decline loads
+    if (rng.below(2)) {
+      std::vector<uint64_t> got(count, 0xDEAD);
+      const bool done = a.load_batch(addrs.data(), count, sz, got.data());
+      if (done) {
+        ++batched_loads;
+        VCHECK(!flip.armed);
+        flip.armed = 0;   // b has no fault object armed: it is the reference
+        for (size_t i = 0; i < count; ++i) VCHECK_EQ(got[i], b.load_scalar(addrs[i], sz));
+      } else {
+        ++declined;
+        for (uint64_t v : got) VCHECK_EQ(v, 0xDEADull);   // nothing written
+      }
+    } else {
+      flip.armed = 0;
+      size_t failed_at = 0;
+      bool done = false;
+      try { done = a.store_batch(addrs.data(), count, sz, vals.data(), &failed_at); } catch (const Error&) { throw vtest::Failure("store_batch threw"); }
+      if (done) {
+        ++batched_stores;
+        for (size_t i = 0; i < count; ++i) b.store_scalar(addrs[i], sz, vals[i]);
+      } else {
+        ++declined;
+        // Declined with nothing changed: so a lane-by-lane store does the same on both.
+        same_memory(step);
+        for (size_t i = 0; i < count; ++i) {
+          const Outcome x = attempt([&](Outcome&) { a.store_scalar(addrs[i], sz, vals[i]); });
+          const Outcome y = attempt([&](Outcome&) { b.store_scalar(addrs[i], sz, vals[i]); });
+          VCHECK(x == y);
+          if (x.failed) break;
+        }
+      }
+    }
+    if (step % 50 == 0) same_memory(step);
+  }
+  same_memory(-1);
+  VCHECK(batched_loads > 500);
+  VCHECK(batched_stores > 500);
+  VCHECK(declined > 500);
 }
 
 VTEST_MAIN

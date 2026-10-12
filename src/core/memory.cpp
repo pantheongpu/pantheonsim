@@ -382,58 +382,133 @@ bool MemoryManager::lookup_cache_default() {
   return !(v && v[0] == '0' && v[1] == '\0');
 }
 
+// The table lookup behind a miss in the memory of recent lookups.
+[[gnu::noinline]] const MemoryManager::Allocation* MemoryManager::find_ordinary_miss(uint64_t addr, uint64_t len,
+                                                                                       uint64_t* base_out) const {
+  BigReaderLock* lock = table_lock_.get();
+  LookupMemory& mem = t_lookups;
+  const uint64_t epoch = lock->epoch();
+  for (unsigned i = 0; i < LookupMemory::kWays; ++i) {
+    const LookupMemory::Entry& e = mem.way[i];
+    const uint64_t off = addr - e.base;
+    if (e.epoch != epoch || off >= e.size || len > e.size - off) continue;
+    mem.last = i;
+    if (base_out) *base_out = e.base;
+    return static_cast<const Allocation*>(e.allocation);
+  }
+  if (lock->written_by_me()) return nullptr;
+  SharedGuard table_guard(lock);
+  auto up = live_.upper_bound(addr);
+  if (up == live_.begin()) return nullptr;
+  auto prev = std::prev(up);
+  const Allocation& a = prev->second;
+  const uint64_t off = addr - prev->first;
+  if (!(off < a.size && len <= a.size - off)) return nullptr;
+  // The epoch read under the shared lock cannot move while it is held.
+  uint32_t v = mem.victim;
+  v ^= v << 13, v ^= v >> 17, v ^= v << 5;
+  mem.victim = v;
+  mem.last = v % LookupMemory::kWays;
+  LookupMemory::Entry& e = mem.way[mem.last];
+  e.epoch = lock->epoch();
+  e.base = prev->first;
+  e.size = a.size;
+  e.allocation = &a;
+  if (base_out) *base_out = prev->first;
+  return &a;
+}
+
+[[gnu::always_inline]] inline const MemoryManager::Allocation* MemoryManager::find_ordinary(
+    uint64_t addr, uint64_t len, uint64_t* base_out) const {
+  BigReaderLock* lock = table_lock_.get();
+  if (!lock || !lookup_cache_) return nullptr;
+  LookupMemory& mem = t_lookups;
+  const uint64_t epoch = lock->epoch();
+  const LookupMemory::Entry& e = mem.way[mem.last];
+  const uint64_t off = addr - e.base;
+  // Written as a remaining length, as resolve() does: addr + len wraps.
+  if (e.epoch == epoch && off < e.size && len <= e.size - off) {
+    if (base_out) *base_out = e.base;
+    return static_cast<const Allocation*>(e.allocation);
+  }
+  return find_ordinary_miss(addr, len, base_out);
+}
+
 const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, uint64_t len, const char* op,
                                                                uint64_t* base_out, bool writing,
                                                                bool page_slack) const {
-  BigReaderLock* lock = table_lock_.get();
-  if (lock && lookup_cache_) {
-    LookupMemory& mem = t_lookups;
-    const uint64_t epoch = lock->epoch();
-    const auto hit = [&](const LookupMemory::Entry& e) {
-      if (e.epoch != epoch) return false;
-      const uint64_t off = addr - e.base;
-      // Written as a remaining length, as resolve() does: addr + len wraps.
-      return off < e.size && len <= e.size - off;
-    };
-    {
-      const LookupMemory::Entry& e = mem.way[mem.last];
-      if (hit(e)) {
-        if (base_out) *base_out = e.base;
-        return *static_cast<const Allocation*>(e.allocation);
-      }
-    }
-    for (unsigned i = 0; i < LookupMemory::kWays; ++i) {
-      const LookupMemory::Entry& e = mem.way[i];
-      if (!hit(e)) continue;
-      mem.last = i;
-      if (base_out) *base_out = e.base;
-      return *static_cast<const Allocation*>(e.allocation);
-    }
-    if (!lock->written_by_me()) {
-      SharedGuard table_guard(lock);
-      auto up = live_.upper_bound(addr);
-      if (up != live_.begin()) {
-        auto prev = std::prev(up);
-        const Allocation& a = prev->second;
-        const uint64_t off = addr - prev->first;
-        if (off < a.size && len <= a.size - off) {
-          // The epoch read under the shared lock cannot move while it is held.
-          uint32_t v = mem.victim;
-          v ^= v << 13, v ^= v >> 17, v ^= v << 5;
-          mem.victim = v;
-          mem.last = v % LookupMemory::kWays;
-          LookupMemory::Entry& e = mem.way[mem.last];
-          e.epoch = lock->epoch();
-          e.base = prev->first;
-          e.size = a.size;
-          e.allocation = &a;
-          if (base_out) *base_out = prev->first;
-          return a;
-        }
-      }
-    }
-  }
+  if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
   return resolve(addr, len, op, base_out, writing, page_slack);
+}
+
+// A warp's accesses at once -- the lanes of one load or store instruction -- for
+// the case where nothing can differ from doing them one by one: no fault armed,
+// no host mapping in reach, every access aligned and inside the one ordinary
+// allocation the first lies in. Anything else returns false having changed
+// nothing, and the caller makes the accesses one at a time, errors and all.
+bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store,
+                             const Allocation** alloc, uint64_t* base) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (store) {
+    if (access_fault_ && access_fault_->store_pending &&
+        __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED))
+      return false;
+  } else if (access_fault_ &&
+             (any_stuck() || (access_fault_->load_pending &&
+                              __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)))) {
+    return false;
+  }
+  const Allocation* a = find_ordinary(addrs[0], size, base);
+  if (!a) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - *base;
+    if ((addrs[i] & (size - 1)) || off >= a->size || size > a->size - off) return false;
+    if (host_maps_ && host_maps_->may_contain(addrs[i])) return false;
+  }
+  *alloc = a;
+  return true;
+}
+
+bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  const Allocation* a = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/false, &a, &base)) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - base;
+    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk) out[i] = 0;
+    else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), size);
+    else out[i] = load_at(chunk + off % kChunkSize, size);
+  }
+  return true;
+}
+
+bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                                size_t* failed_at) {
+  const Allocation* ca = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
+  Allocation& a = const_cast<Allocation&>(*ca);
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - base;
+    const uint64_t idx = off / kChunkSize;
+    uint8_t* chunk = a.chunks[idx].load(std::memory_order_acquire);
+    // As store_scalar: a uniform chunk is left alone by a store of its own byte.
+    if (is_uniform(chunk) && vals[i] == repeated(uniform_byte(chunk), size)) continue;
+    if (!chunk || is_uniform(chunk)) {
+      try {
+        chunk = materialize(a, idx);
+      } catch (...) {
+        // Out of host memory for the chunk: as at this access in a one-by-one
+        // store, with the earlier ones done. The caller adds its context to the
+        // error for the access that failed.
+        if (failed_at) *failed_at = i;
+        throw;
+      }
+    }
+    store_at(chunk + off % kChunkSize, size, vals[i]);
+  }
+  return true;
 }
 
 MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t len, const char* op,
@@ -1153,7 +1228,14 @@ void run_in(uint8_t* c, const uint8_t* s, uint64_t n, uint32_t unit) {
 const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, uint64_t len, uint32_t unit,
                                                                uint64_t* base) const {
   if (unit != 1 && unit != 2 && unit != 4 && unit != 8) return nullptr;
-  if ((addr & (unit - 1)) || (len & (unit - 1)) || access_fault_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  // A fault armed for loads or stores, or stuck cells, change what an access returns or stores, and
+  // load_scalar / store_scalar apply them; the runtime attaches its faults to every device, so it is
+  // whether one is armed that counts, not whether any is attached (as load_quad decides).
+  const auto armed = [](const uint64_t* pending) { return pending && __atomic_load_n(pending, __ATOMIC_RELAXED); };
+  if (access_fault_ && (armed(access_fault_->stuck_pending) || armed(access_fault_->load_pending) ||
+                        armed(access_fault_->store_pending)))
+    return nullptr;
+  if (addr % unit || len % unit || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up == live_.begin()) return nullptr;
