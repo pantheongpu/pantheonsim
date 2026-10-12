@@ -901,7 +901,8 @@ VTEST(batches_stop_at_the_step_budget) {
 
 // A warp that has run a long turn (2^16 instructions) gives it up at its next
 // backward branch, whichever way the instructions around it ran. Four warps
-// take tickets from one counter now and then in a long loop; which ticket a
+// take tickets from one counter now and then in a long loop (and cross the
+// instruction count at which a launch reports progress); which ticket a
 // lane gets depends on where each warp yielded, so the tickets are the same in
 // both modes only if the batch yields at the same branch.
 VTEST(long_turns_yield_at_the_same_branch) {
@@ -924,7 +925,7 @@ LOOP:
     setp.eq.u32 %p1, %r4, 0;
     @%p1 atom.global.add.u32 %r5, [%rd4], 1;
     @%p1 add.u32 %r3, %r3, %r5;
-    setp.lt.u32 %p2, %r2, 30000;
+    setp.lt.u32 %p2, %r2, 40000;
     @%p2 bra LOOP;
     mul.wide.u32 %rd2, %r1, 4;
     add.u64 %rd3, %rd1, %rd2;
@@ -932,7 +933,9 @@ LOOP:
     ret;
 }
 )";
+  int progress_calls = 0;
   auto once = [&](const char* fp, std::vector<uint32_t>& out) {
+    progress_calls = 0;
     setenv("VGPU_FASTPATH", fp, 1);
     MemoryManager mem{1 << 20};
     DeviceProfile prof = load_gpu("nvidia/a10");
@@ -942,17 +945,24 @@ LOOP:
     mem.write(pt, &zero, 4);
     LaunchConfig cfg;
     cfg.block = {128, 1, 1};
-    const exec::LaunchStats st = exec::launch(m.entries[0], cfg, {arg_u64(po), arg_u64(pt)}, mem, prof);
+    const exec::LaunchStats st = exec::launch(m.entries[0], cfg, {arg_u64(po), arg_u64(pt)}, mem, prof, nullptr,
+                                              [&](double) { ++progress_calls; });
     out.resize(128);
     mem.read(po, out.data(), 512);
     unsetenv("VGPU_FASTPATH");
     return st;
   };
   std::vector<uint32_t> fast_out, slow_out;
-  const exec::LaunchStats fast = once("1", fast_out), slow = once("0", slow_out);
+  const exec::LaunchStats fast = once("1", fast_out);
+  const int fast_progress = progress_calls;
+  const exec::LaunchStats slow = once("0", slow_out);
   VCHECK(fast_out == slow_out);
   VCHECK(same_stats(fast, slow));
-  VCHECK(fast.instructions > 4 * 30000 * 6);
+  VCHECK(fast.instructions > (1u << 20));
+  // The progress report comes when the instruction count passes a multiple of
+  // 2^20 -- once here -- and a batch must not step over it.
+  VCHECK(fast_progress >= 1);
+  VCHECK_EQ(fast_progress, progress_calls);
   // The warps really did interleave: lane 0 of warp 0 did not take every ticket.
   VCHECK(fast_out[0] != fast_out[32]);
 }
