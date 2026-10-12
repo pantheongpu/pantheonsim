@@ -846,12 +846,13 @@ def check_counters(path, rel, names, engines, counts, args):
 # --------------------------------------------------------------------------- mix
 
 
-def mix_table(counts_or_kernels, label_fn, out=sys.stdout):
-    """Class mix as a share of thread-instructions, per row."""
-    hdr = "%-26s %12s %7s " % ("", "warp-instr", "lanes") + " ".join("%6s" % c for c in CLASS_ORDER)
+def mix_table(rows, _unused=None, out=sys.stdout):
+    """Class mix as a share of thread-instructions, one row per (label, counter totals)."""
+    width = max([len(l) for l, _ in rows] + [10])
+    hdr = "%-*s %12s %6s " % (width, "", "warp-instr", "lanes") + " ".join("%6s" % c for c in CLASS_ORDER)
     print(hdr, file=out)
     print("-" * len(hdr), file=out)
-    for label, tot in counts_or_kernels:
+    for label, tot in rows:
         ti = tot.get("thread_instructions", 0)
         wi = tot.get("instructions", 0)
         shares = []
@@ -860,9 +861,9 @@ def mix_table(counts_or_kernels, label_fn, out=sys.stdout):
             shares.append("%5.1f%%" % (100.0 * v / ti) if ti else "     -")
         classes = sum(tot.get("mix_" + c, 0) for c in CLASS_ORDER)
         flag = "" if classes == ti else "  !! classes sum to %d, thread-instructions %d" % (classes, ti)
-        print("%-26s %12d %7.2f " % (label, wi, (ti / wi) if wi else 0.0) + " ".join(shares) + flag, file=out)
-    print("lanes = thread-instructions / warp-instructions (average active lanes of 32).", file=out)
-
+        print("%-*s %12d %6.2f " % (width, label, wi, (ti / wi) if wi else 0.0) + " ".join(shares) + flag, file=out)
+    print("lanes = thread-instructions / warp-instructions (average active lanes of 32). Shares are of "
+          "thread-instructions and sum to 100%.", file=out)
 
 
 # --------------------------------------------------------------------------- profile
@@ -873,6 +874,13 @@ def perf_binary(args):
         if c and os.access(c, os.X_OK):
             return c
     return None
+
+
+def short_name(nm, width=44):
+    """A label for a one-line summary: the dso and the vgpu:: prefixes dropped."""
+    nm = re.sub(r"^\S+ (?=\S)", "", nm, count=1) if " " in nm and not nm.startswith("vgpu") else nm
+    nm = re.sub(r"^vgpu::(sass::|exec::)?", "", nm)
+    return nm[:width]
 
 
 def tidy_symbol(raw):
@@ -939,21 +947,38 @@ def profile_mode(args, names, engines, builds, binary):
                     if r is None:
                         print("profile %s/%s: %s" % (w, e, why), file=sys.stderr)
                         continue
-                    per[w] = r["total"]
+                    per[w] = {"samples": r["total"],
+                              "top": sorted(r["samples"].items(), key=lambda x: -x[1])[:10]}
                     total += r["total"]
                     for k, v in r["samples"].items():
                         agg[k] = agg.get(k, 0) + v
                     if not args.quiet:
                         print("  profiled %-14s %-4s %6d samples" % (w, e, r["total"]), file=sys.stderr)
-                result[(e, g)] = {"total": total, "per_workload": per, "top": sorted(agg.items(), key=lambda x: -x[1])[:args.top]}
+                result[(e, g)] = {"total": total, "workloads": per,
+                                  "top": sorted(agg.items(), key=lambda x: -x[1])[:args.top]}
     for (e, g), r in result.items():
         print("\n== %s engine, group %s (%s): %d samples" % (e, g, ", ".join(groups[g]), r["total"]))
         for i, (name, n) in enumerate(r["top"], 1):
             print("%3d  %5.1f%%  %s" % (i, 100.0 * n / r["total"] if r["total"] else 0, name[:140]))
+        for w, d in r["workloads"].items():
+            print("  [%s: %d samples] %s" % (w, d["samples"], "; ".join(
+                "%.0f%% %s" % (100.0 * n / d["samples"], short_name(nm)) for nm, n in d["top"][:5])))
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"schema": 1, "kind": "profile", "perf": perf, "freq_hz": args.freq, "size": args.size,
                        "results": {"%s/%s" % k: v for k, v in result.items()}}, f, indent=1)
+    if args.markdown:
+        with open(args.markdown, "w") as f:
+            for (e, g), r in result.items():
+                f.write("#### %s engine, %s (%s): %d samples\n\n| # | share | function |\n| ---: | ---: | --- |\n" % (
+                    "SASS" if e == "sass" else "PTX", g, ", ".join(groups[g]), r["total"]))
+                for i, (name, n) in enumerate(r["top"], 1):
+                    f.write("| %d | %.1f%% | `%s` |\n" % (i, 100.0 * n / r["total"] if r["total"] else 0,
+                                                       name.replace("|", "\\|")[:150]))
+                f.write("\nPer workload (top 5): " + "; ".join(
+                    "**%s** (%d samples): %s" % (w, d["samples"], ", ".join(
+                        "%.0f%% `%s`" % (100.0 * n / d["samples"], short_name(nm)) for nm, n in d["top"][:5]))
+                    for w, d in r["workloads"].items()) + "\n\n")
     return 0
 
 
@@ -1143,7 +1168,7 @@ def mix_command(args):
         r = subprocess.run(args.cmd, env=env, capture_output=True, text=True)
         kernels, log = parse_counters(r.stderr)
         for k, v in sorted(kernels.items()):
-            rows.append(("%s [%s]" % (k[:20], e), v))
+            rows.append(("%s [%s]" % (k[:48], e), v))
         rows.append(("TOTAL [%s]" % e, totals(kernels)))
     mix_table(rows, None)
     return 0
