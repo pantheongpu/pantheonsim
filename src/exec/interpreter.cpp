@@ -1059,6 +1059,22 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
     std::memcpy(&d[l], &r, 8);
   });
 }
+// The same f32 fma with the canonical-NaN rule applied in the same pass (see
+// canon_nan32_lanes): the result is rounded once, so a NaN is any value with
+// a magnitude above the infinity's, and becomes 0x7FFFFFFF.
+__attribute__((target("fma"))) void fma_canon_lanes_f32_hw(uint32_t* d, const uint32_t* a, const uint32_t* b,
+                                                           const uint32_t* c, Mask m, uint32_t width) {
+  for_active(m, width, [&](uint32_t l) {
+    float x, y, z;
+    std::memcpy(&x, &a[l], 4);
+    std::memcpy(&y, &b[l], 4);
+    std::memcpy(&z, &c[l], 4);
+    const float r = __builtin_fmaf(x, y, z);
+    uint32_t v;
+    std::memcpy(&v, &r, 4);
+    d[l] = (v & 0x7FFFFFFFu) > 0x7F800000u ? 0x7FFFFFFFu : v;
+  });
+}
 // fma.f16x2 lanes on the FMA unit, with the decode and the rounding inlined:
 // the same double fma and double_to_f16 as the general path, without two
 // calls per half.
@@ -2959,14 +2975,17 @@ class Interpreter {
         exec_ret(w, ctx, implicit_ret(), idx, w.paths[idx].mask);
         continue;
       }
-      const Instr& ins = cur_->body[w.paths[idx].pc];
-      // The pre-decoded form of this instruction, when the function has them
-      // (see MicroOp); it also holds the opcode id, so counting does not touch
-      // the much larger Instr.
+      // The pre-decoded forms of the function's instructions, when it has them
+      // (see MicroOp).
       if (cur_ != micro_owner_) {
         micro_owner_ = cur_;
         micro_ = cur_->micro.size() == cur_->body.size() ? cur_->micro.data() : nullptr;
       }
+      // A warp on one path, at a run of such instructions: run them together.
+      if (micro_ && fast_enabled_ && w.paths.size() == 1 &&
+          run_micro_batch(w, ctx, slice, issued) != 0)
+        continue;
+      const Instr& ins = cur_->body[w.paths[idx].pc];
       const MicroOp* const mu = micro_ ? &micro_[w.paths[idx].pc] : nullptr;
       const uint16_t opcode_id = mu ? mu->opcode_id : ins.opcode_id;
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
@@ -3023,6 +3042,61 @@ class Interpreter {
       }
       step(w, ctx, idx, ins);
     }
+  }
+
+  // Runs the pre-decoded instructions the warp's only path is at, one after
+  // another, until one is not of those forms (or declines), the slice or the
+  // step budget is used up, or the function ends; returns how many ran.
+  // Each is counted exactly as the loop in run_warp_until_yield counts an
+  // instruction -- issue, active lanes, class, opcode, clock, steps -- but the
+  // totals are kept in registers and added to the launch's counters once, since
+  // nothing reads them in between: only an instruction that is not one of these
+  // can (a clock read, a barrier, an error), and it ends the batch first. The
+  // caller has already taken `issued` for the first instruction; the slice is
+  // checked here for the rest. Nothing else the loop does between two
+  // instructions of a one-path warp changes: such an instruction cannot move
+  // the pc but by one, change the warp's state, ask it to yield, or add a path.
+  uint64_t run_micro_batch(Warp& w, const BlockCtx& ctx, uint64_t slice, uint64_t& issued) {
+    Path& path = w.paths[0];
+    const Mask mask = path.mask;
+    size_t pc = path.pc;
+    const size_t end = cur_->body.size();
+    uint64_t steps = w.steps;
+    const uint64_t max_steps = cfg_.max_steps;
+    uint64_t n = 0;
+    uint64_t by_class[static_cast<size_t>(InstClass::Count)] = {};
+    while (pc < end) {
+      const MicroOp& u = micro_[pc];
+      if (u.kind == MicroOp::None) break;
+      if (n != 0 && slice && issued >= slice) break;
+      if (steps + 1 > max_steps) break;   // the loop reports it, with its message
+      // The loop reports progress before the instruction that makes the count a
+      // multiple of 2^20; leave that one to it.
+      if (progress_ && ((stats_.instructions + n) & 0xFFFFF) == 0) break;
+      const InstClass cls = class_of_pc(pc);
+      if (cls == InstClass::Tensor) break;
+      if (!exec_micro(w, u, mask)) break;
+      if (n != 0) ++issued;
+      ++n;
+      ++steps;
+      ++by_class[static_cast<size_t>(cls)];
+      if (u.opcode_id) {
+        if (u.opcode_id >= stats_.inst_by_opcode.size()) stats_.inst_by_opcode.resize(u.opcode_id + 1u, 0);
+        ++stats_.inst_by_opcode[u.opcode_id];
+      }
+      ++pc;
+    }
+    if (n != 0) {
+      const uint64_t lanes = mask == all_ ? W_ : static_cast<uint64_t>(popcount_mask(mask));
+      stats_.instructions += n;
+      stats_.thread_instructions += n * lanes;
+      for (size_t c = 0; c < static_cast<size_t>(InstClass::Count); ++c)
+        stats_.inst_by_class[c] += by_class[c] * lanes;
+      if (ctx.clock) *ctx.clock += n;
+      w.steps = steps;
+      path.pc = pc;
+    }
+    return n;
   }
 
   // Runs one MicroOp for the lanes of `mask` that its guard lets through, with
@@ -4737,7 +4811,31 @@ class Interpreter {
       for_active(m, width, [&](uint32_t l) { res |= Mask{f(a[l], b[l]) ? 1u : 0u} << l; });
     };
     if (is_float) {
-      run([cmp](uint32_t x, uint32_t y) { return compare_float(cmp, f32(x), f32(y)); });
+      // compare_float's table, with the comparison chosen once instead of once
+      // a lane: a float widens to the double it compares as without change, so
+      // comparing the floats gives the same answers, NaNs included.
+      auto runf = [&](auto f) {
+        run([&](uint32_t x, uint32_t y) {
+          const float fx = f32(x), fy = f32(y);
+          return f(fx, fy, fx != fx || fy != fy);
+        });
+      };
+      switch (cmp) {
+        case CmpOp::Eq: runf([](float x, float y, bool u) { return !u && x == y; }); break;
+        case CmpOp::Ne: runf([](float x, float y, bool u) { return !u && x != y; }); break;
+        case CmpOp::Lt: runf([](float x, float y, bool u) { return !u && x < y; }); break;
+        case CmpOp::Le: runf([](float x, float y, bool u) { return !u && x <= y; }); break;
+        case CmpOp::Gt: runf([](float x, float y, bool u) { return !u && x > y; }); break;
+        case CmpOp::Ge: runf([](float x, float y, bool u) { return !u && x >= y; }); break;
+        case CmpOp::Equ: runf([](float x, float y, bool u) { return u || x == y; }); break;
+        case CmpOp::Neu: runf([](float x, float y, bool u) { return u || x != y; }); break;
+        case CmpOp::Ltu: runf([](float x, float y, bool u) { return u || x < y; }); break;
+        case CmpOp::Leu: runf([](float x, float y, bool u) { return u || x <= y; }); break;
+        case CmpOp::Gtu: runf([](float x, float y, bool u) { return u || x > y; }); break;
+        case CmpOp::Geu: runf([](float x, float y, bool u) { return u || x >= y; }); break;
+        case CmpOp::Num: runf([](float, float, bool u) { return !u; }); break;
+        case CmpOp::Nan: runf([](float, float, bool u) { return u; }); break;
+      }
       return true;
     }
     auto by = [&](auto cast) {
@@ -4773,8 +4871,7 @@ class Interpreter {
                           uint32_t width) {
 #if defined(__x86_64__) && defined(__GNUC__)
     if (g_hw_fma) {
-      fma_lanes_f32_hw(d, a, b, c, m, width);
-      canon_nan32_lanes(d, m, width);
+      fma_canon_lanes_f32_hw(d, a, b, c, m, width);
       return;
     }
 #endif
