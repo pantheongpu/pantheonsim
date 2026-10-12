@@ -748,15 +748,14 @@ VTEST(pre_decoded_forms_match_the_general_path_under_every_guard) {
   g_guard = 0;
 }
 
-// (The loop's mul.f32 and add.f32 are contracted into one fma when the module is
-// parsed; the pre-decoded forms have to describe the contracted body, not the
-// text, and this test caught the first version that did not.)
-// What the instruction counters report does not depend on which path ran the
-// instructions: a loop of pre-decoded forms, a divergent branch and a
-// predicated tail, run both ways, gives the same totals, class mix and
-// per-opcode counts, and the same data.
-VTEST(counters_do_not_depend_on_the_path) {
-  const std::string ptx = R"(.version 8.3
+namespace {
+
+// A loop of pre-decoded forms, a divergent branch and a predicated tail, over
+// 100 threads (three full warps and a partial one). The mul.f32 and add.f32
+// are contracted into one fma when the module is parsed; the pre-decoded forms
+// have to describe the contracted body, not the text, and this kernel caught
+// the first version that did not.
+const char* kLoopKernel = R"(.version 8.3
 .target sm_86
 .address_size 64
 .visible .entry k(.param .u64 po)
@@ -799,37 +798,87 @@ SKIP:
     ret;
 }
 )";
-  auto once = [&](const char* fp, std::vector<uint32_t>& out) {
-    setenv("VGPU_FASTPATH", fp, 1);
-    MemoryManager mem{1 << 20};
-    DeviceProfile prof = load_gpu("nvidia/a10");
-    auto m = ptx::parse(ptx);
-    const uint64_t po = mem.alloc(100 * 4);
-    LaunchConfig cfg;
-    cfg.block = {100, 1, 1};
-    const exec::LaunchStats st = exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
-    out.resize(100);
-    mem.read(po, out.data(), 400);
-    unsetenv("VGPU_FASTPATH");
-    return st;
-  };
-  std::vector<uint32_t> fast_out, slow_out;
-  const exec::LaunchStats fast = once("1", fast_out), slow = once("0", slow_out);
-  {
-    std::string diffs;
-    int n = 0;
-    for (size_t i = 0; i < fast_out.size(); ++i)
-      if (fast_out[i] != slow_out[i]) {
-        ++n;
-        char b[64];
-        std::snprintf(b, sizeof b, " [%zu: %x vs %x]", i, fast_out[i], slow_out[i]);
-        if (n <= 12) diffs += b;
-      }
-    if (n) throw vtest::Failure(std::to_string(n) + " threads differ:" + diffs);
+
+struct LoopRun {
+  std::vector<uint32_t> out;
+  exec::LaunchStats stats;
+  std::string error;
+};
+
+// Runs kLoopKernel with VGPU_FASTPATH=fp, under the scheduler mode and step
+// budget given (empty / 0: the defaults).
+LoopRun run_loop(const char* fp, const char* sched = "", const char* seed = "", uint64_t max_steps = 0) {
+  setenv("VGPU_FASTPATH", fp, 1);
+  if (*sched) setenv("VGPU_SCHEDULER", sched, 1);
+  if (*seed) setenv("VGPU_SCHEDULER_SEED", seed, 1);
+  LoopRun r;
+  MemoryManager mem{1 << 20};
+  DeviceProfile prof = load_gpu("nvidia/a10");
+  auto m = ptx::parse(kLoopKernel);
+  const uint64_t po = mem.alloc(100 * 4);
+  LaunchConfig cfg;
+  cfg.block = {100, 1, 1};
+  if (max_steps) cfg.max_steps = max_steps;
+  try {
+    r.stats = exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
+  } catch (const std::exception& e) {
+    r.error = e.what();
   }
-  VCHECK(same_stats(fast, slow));
-  VCHECK(fast.instructions > 1000);
-  VCHECK(fast.divergent_branches > 0);
+  r.out.resize(100);
+  mem.read(po, r.out.data(), 400);
+  unsetenv("VGPU_FASTPATH");
+  unsetenv("VGPU_SCHEDULER");
+  unsetenv("VGPU_SCHEDULER_SEED");
+  return r;
+}
+
+void expect_same_loop(const LoopRun& fast, const LoopRun& slow, const std::string& what) {
+  if (fast.error != slow.error)
+    throw vtest::Failure(what + ": error '" + fast.error + "' against '" + slow.error + "'");
+  std::string diffs;
+  int n = 0;
+  for (size_t i = 0; i < fast.out.size(); ++i)
+    if (fast.out[i] != slow.out[i]) {
+      ++n;
+      char b[64];
+      std::snprintf(b, sizeof b, " [%zu: %x vs %x]", i, fast.out[i], slow.out[i]);
+      if (n <= 12) diffs += b;
+    }
+  if (n) throw vtest::Failure(what + ": " + std::to_string(n) + " threads differ:" + diffs);
+  if (!same_stats(fast.stats, slow.stats)) throw vtest::Failure(what + ": counters differ");
+}
+
+}  // namespace
+
+// What the instruction counters report does not depend on which path ran the
+// instructions: totals, class mix and per-opcode counts, and the data.
+VTEST(counters_do_not_depend_on_the_path) {
+  const LoopRun fast = run_loop("1"), slow = run_loop("0");
+  expect_same_loop(fast, slow, "default scheduler");
+  VCHECK(fast.error.empty());
+  VCHECK(fast.stats.instructions > 1000);
+  VCHECK(fast.stats.divergent_branches > 0);
+}
+
+// A scheduler that preempts a warp after a slice of instructions (one with
+// "adversarial", a random number with "random") cuts the batches short at
+// exactly the instruction the one-at-a-time loop would have stopped at: the
+// interleaving, and so the data and counters, are the same.
+VTEST(batches_stop_where_the_scheduler_slices) {
+  expect_same_loop(run_loop("1", "adversarial"), run_loop("0", "adversarial"), "adversarial");
+  for (const char* seed : {"1", "7", "12345"})
+    expect_same_loop(run_loop("1", "random", seed), run_loop("0", "random", seed),
+                     std::string("random, seed ") + seed);
+}
+
+// A warp that runs out of its step budget inside a batch fails at the same
+// instruction, with the same message, and the counters up to it agree.
+VTEST(batches_stop_at_the_step_budget) {
+  for (uint64_t budget : {1ull, 2ull, 7ull, 50ull, 333ull, 1000ull}) {
+    const LoopRun fast = run_loop("1", "", "", budget), slow = run_loop("0", "", "", budget);
+    expect_same_loop(fast, slow, "budget " + std::to_string(budget));
+    VCHECK(!slow.error.empty());
+  }
 }
 
 VTEST_MAIN
