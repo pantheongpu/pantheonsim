@@ -414,7 +414,7 @@ uint64_t old_sass_passes(const uint64_t* addr, uint32_t lanes, uint32_t bytes) {
 // broadcast, a gather, a transpose column, unaligned, and the extremes.
 void fill_addresses(Rng& rng, std::array<uint64_t, 64>& a, uint32_t lanes) {
   const uint64_t base = rng.below(8) == 0 ? ~uint64_t{0} - rng.below(4096) : rng.below(1ull << 40);
-  const uint64_t pattern = rng.below(9);
+  const uint64_t pattern = rng.below(11);
   const uint64_t stride_choices[] = {1, 2, 4, 8, 12, 16, 32, 33 * 4, 64, 128, 132, 256, 1024, 4100};
   const uint64_t stride = stride_choices[rng.below(sizeof stride_choices / sizeof stride_choices[0])];
   for (uint32_t l = 0; l < 64; ++l) {
@@ -427,6 +427,10 @@ void fill_addresses(Rng& rng, std::array<uint64_t, 64>& a, uint32_t lanes) {
       case 5: a[l] = base + (l % 8) * stride + (l / 8) * 4; break;
       case 6: a[l] = base + l * stride + (rng.below(2) ? 1 : 3); break;   // unaligned
       case 7: a[l] = (base & ~3ull) + (l % 4) * 4096 + (l / 4) * 4; break;
+      // A thread-private array indexed by a value of each lane's own: a few sectors, in no order.
+      case 8: a[l] = (base & ~3ull) + rng.below(64) * 4; break;
+      // Strictly ascending for the first lanes, then back over sectors already seen and on to new ones.
+      case 9: a[l] = (base & ~3ull) + (l < 12 ? l * 64 : (l * 7 % 20) * 64); break;
       default: a[l] = rng.next(); break;
     }
   }

@@ -90,6 +90,11 @@ inline uint32_t distinct_sectors(const uint64_t* addrs, uint64_t mask, unsigned 
   constexpr size_t kBuf = 1024;
   uint64_t buf[kBuf];
   size_t n = 0;
+  // The sectors seen so far, each once. While the lanes' sectors come in strictly ascending order (coalesced
+  // and strided accesses) a sector is new unless it repeats the last one, which takes one comparison; the
+  // first lane that goes backwards switches to searching the list, newest first, for each sector after it
+  // (a gather, or a private array indexed by a value of its own, lands in a few sectors in no order: sorting
+  // those at full length cost more than the search).
   bool ascending = true;
   for (unsigned lane = 0; lane < lanes; ++lane) {
     if (!(mask & (uint64_t{1} << lane))) continue;
@@ -98,17 +103,22 @@ inline uint32_t distinct_sectors(const uint64_t* addrs, uint64_t mask, unsigned 
     if (last < first) continue;   // the address wrapped: the plain loop runs no iterations either
     if (last - first >= kBuf - n) return reference();
     for (uint64_t sec = first; sec <= last; ++sec) {
-      if (n && buf[n - 1] > sec) ascending = false;
-      buf[n++] = sec;
+      if (ascending) {
+        if (n && buf[n - 1] == sec) continue;
+        if (!n || buf[n - 1] < sec) {
+          buf[n++] = sec;
+          continue;
+        }
+        ascending = false;
+      }
+      size_t i = n;
+      while (i > 0 && buf[i - 1] != sec) --i;
+      if (i == 0) buf[n++] = sec;
     }
   }
-  // Coalesced accesses put the sectors in order already; a gather needs sorting.
-  if (!ascending) std::sort(buf, buf + n);
-  size_t distinct = n ? 1 : 0;
-  for (size_t i = 1; i < n; ++i) distinct += buf[i] != buf[i - 1];
   // The reference stops remembering at `cap`, and a sector it did not keep is
   // never counted: the count saturates there.
-  return static_cast<uint32_t>(std::min(distinct, cap));
+  return static_cast<uint32_t>(std::min(n, cap));
 }
 
 namespace detail {
