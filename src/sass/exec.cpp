@@ -57,6 +57,15 @@ uint32_t f32_bits(float f) { uint32_t b; std::memcpy(&b, &f, 4); return b; }
 double as_f64(uint64_t b) { double d; std::memcpy(&d, &b, 8); return d; }
 uint64_t f64_bits(double d) { uint64_t b; std::memcpy(&b, &d, 8); return b; }
 
+// The number of set bits of a lane mask. std::popcount in this build (baseline
+// x86-64, no POPCNT instruction) is a call into libgcc, and every instruction
+// counts its active lanes.
+inline unsigned popc(uint32_t v) {
+  v = v - ((v >> 1) & 0x55555555u);
+  v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+  return (((v + (v >> 4)) & 0x0f0f0f0fu) * 0x01010101u) >> 24;
+}
+
 // Why a lane is not runnable.
 enum class Wait : uint8_t { None, BSync, WarpSync, Bar, Cluster };
 
@@ -1154,7 +1163,7 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
 }
 
 exec::InstClass inst_class(Op op);   // exec_ops.inc
-bool straight(const Instr& ins);
+bool compute_straight(const Instr& ins);   // see annotate_instr
 
 // Every warp of these blocks is parked or spinning (a YIELD loop with no other lane group to run), and some
 // lanes stand at a BSYNC: a lane that won a spin lock waits at the BSYNC closing the loop for the lanes that
@@ -1298,7 +1307,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     if (++w.steps > cfg_.max_steps)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
                                     " instructions (an infinite loop?)");
-    if (n < 256 && pc + 16 < end && straight(*ins)) {
+    if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
       pc += 16;
       ins = &code->instr((pc - code->base) / 16);
@@ -1312,7 +1321,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
 }
 
 // Whether an instruction leaves every lane's pc to its caller (see step_warp).
-bool straight(const Instr& ins) {
+bool compute_straight(const Instr& ins) {
   switch (ins.op) {
     case Op::Unknown:
     // control flow, barriers and waits
@@ -1357,6 +1366,17 @@ Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
 
 // For sass::unsupported (module.cpp).
 bool runs_instr(const Instr& ins) { return executes(ins); }
+
+// Called once on each instruction as its code section is decoded (module.cpp):
+// sets the facts Instr::cls, ::tensor and ::straight hold, which execute() and
+// step_warp() used to work out again from the opcode on every execution.
+void annotate_instr(Instr& ins) {
+  ins.cls = static_cast<uint8_t>(inst_class(ins.op));
+  ins.tensor = ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA ||
+               ins.op == Op::QMMA || ins.op == Op::HGMMA || ins.op == Op::IGMMA || ins.op == Op::BGMMA ||
+               ins.op == Op::QGMMA;
+  ins.straight = compute_straight(ins);
+}
 
 namespace {
 

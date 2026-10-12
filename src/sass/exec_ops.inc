@@ -136,19 +136,17 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
   const Mask ex = guard_mask(w, ins, w.mactive_force ? w.mactive_force : group);
   {
     exec::LaunchStats& st = blk.st;
-    const uint64_t lanes = static_cast<uint64_t>(std::popcount(ex));
+    const uint64_t lanes = popc(ex);
     ++st.instructions;
     st.thread_instructions += lanes;
-    st.inst_by_class[static_cast<size_t>(inst_class(ins.op))] += lanes;
-    if (ins.op == Op::HMMA || ins.op == Op::IMMA || ins.op == Op::BMMA || ins.op == Op::DMMA || ins.op == Op::QMMA ||
-        ins.op == Op::HGMMA || ins.op == Op::IGMMA || ins.op == Op::BGMMA || ins.op == Op::QGMMA)
-      ++st.tensor_instructions;
+    st.inst_by_class[ins.cls] += lanes;
+    if (ins.tensor) ++st.tensor_instructions;
     if (ins.op == Op::BAR && ins.mnemonic == "BAR" && ex) ++st.barriers;
     if (ins.op == Op::BRA && ex && ex != group) ++st.divergent_branches;
   }
   bool pcs_set = false;
   try {
-    if (!ex && straight(ins)) {
+    if (!ex && ins.straight) {
       // predicated off on every lane: an ALU or memory instruction does nothing
     } else if (fast_alu(w, ins, ex)) {
       // done: the fast path computed exactly what the general one does
@@ -1781,7 +1779,7 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
 // sectors the lanes' addresses touch, and shared-memory bank conflicts.
 void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 local */, bool store,
                   const uint64_t* addr, Mask lanes, uint32_t bytes) {
-  const uint64_t n = static_cast<uint64_t>(std::popcount(lanes));
+  const uint64_t n = popc(lanes);
   if (!n) return;
   switch (space) {
     case 0: {
