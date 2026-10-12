@@ -1514,6 +1514,37 @@ Since then (2026-09-27), profiled with perf again:
   was no faster (the assist is not cheaper for a vector), so it was not
   kept.
 
+**2026-10-12, round 7 (the PTX interpreter, VGPU_SASS=0; one host thread, user CPU
+time, A/B alternating against the previous main, counters and program output
+identical in every pair).** Profiled with perf (cpu-clock) first:
+
+- Shared-memory kernels spent 45-60% of their time counting bank conflicts:
+  `count_addresses` zero-filled 2 KB for each of the 32 banks (and 4 KB for the
+  sectors) on every load and store. It now files each lane's words once and
+  searches sectors newest first; the old counting stays behind VGPU_FASTPATH=0.
+  lud 4.4x, pathfinder 3.2x, needle 4.0x, HeCBench matern 3.4x, merge 3.4x.
+- A shared access in the block's own memory no longer builds a `SharedRef` and
+  divides three times for the cluster rank; `ld.param` finds its slot by the
+  position the parser recorded, not by hashing its name; thread ids are counted
+  up, not divided (three 64-bit divisions a lane); `step_block` reuses its
+  runnable list.
+- The commonest forms (32-bit integer arithmetic, mad.lo, mov, setp, selp, not,
+  shf, f32 arithmetic and fma, and `bra`) are decoded once, after parsing and
+  contraction, into a 24-byte `MicroOp` (include/vgpu/ptx/ast.hpp,
+  `build_micro`). A warp on one path runs a run of them in `run_micro_batch`,
+  adding its counters once per batch instead of per instruction; it stops
+  before anything that is not one of them, at the scheduler's slice, at the step
+  budget, at a divergent branch and before the instruction at which progress is
+  reported. The f32 fma applies the canonical-NaN rule in its own pass (a
+  branch on data had mispredicted: 35% of pulse_virus). Measured on the pantheon
+  workloads, grid 4: int_virus 74 -> 96 M warp instructions/s, compute_virus
+  52 -> 75, pulse_virus 29 -> 59, omni_virus 13.5 -> 15.3; fp64_virus and
+  mma_virus unchanged (subnormal assists, and the matrix work itself).
+- Not done: 64-bit integer, cvt and mul.wide as MicroOps; computed goto (the
+  `dispatch` chain shows no hot spot of its own in the profiles); the
+  per-lane `MemoryManager::resolve` + reader lock, which is 20% of the memory-
+  bound programs and is the memory layer's.
+
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
 decay into that range -- it runs about 3.7x faster with flush-to-zero set.

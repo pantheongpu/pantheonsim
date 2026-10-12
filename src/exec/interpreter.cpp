@@ -119,6 +119,9 @@ using Lanes32 = std::array<uint32_t, kMaxWarpSize>;
 struct ParamBuffer {
   std::vector<uint8_t> bytes;
   std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> layout;  // name -> (offset, size)
+  // The same, by position in the kernel's parameter list (Addr::param_index),
+  // for a load that would otherwise hash the parameter's name.
+  std::vector<std::pair<uint32_t, uint32_t>> by_index;
 };
 
 // State for bar.red, which needs every warp in the block to arrive before it
@@ -552,6 +555,9 @@ struct ClusterState {
 
 // %cluster_ctarank: x fastest within the cluster.
 uint32_t cluster_rank_of(const BlockCtx& ctx) {
+  // A launch with no cluster is clusters of one block: every remainder below is
+  // zero, and the three divisions it would take are paid on each shared access.
+  if (ctx.cluster[0] == 1 && ctx.cluster[1] == 1 && ctx.cluster[2] == 1) return 0;
   return ctx.ctaid[0] % ctx.cluster[0] + ctx.ctaid[1] % ctx.cluster[1] * ctx.cluster[0] +
          ctx.ctaid[2] % ctx.cluster[2] * ctx.cluster[0] * ctx.cluster[1];
 }
@@ -947,6 +953,17 @@ inline void for_active(Mask m, uint32_t width, F&& f) {
   }
 }
 
+// Every NaN among the active lanes of an f32 result becomes the canonical one,
+// 0x7FFFFFFF (see canon32). A NaN is a value whose magnitude bits are above
+// the infinity's; written as a select rather than a branch, because whether a
+// lane's result is a NaN is data and a branch on it mispredicts.
+inline void canon_nan32_lanes(uint32_t* d, Mask m, uint32_t width) {
+  for_active(m, width, [&](uint32_t l) {
+    const uint32_t v = d[l];
+    d[l] = (v & 0x7FFFFFFFu) > 0x7F800000u ? 0x7FFFFFFFu : v;
+  });
+}
+
 // Lane loops for fma on the host's FMA unit. The build targets baseline
 // x86-64, so std::fma is a call into libm per lane -- which glibc then routes
 // to the same vfmadd instruction through an ifunc on any CPU that has one.
@@ -999,6 +1016,28 @@ double fma_hw(double a, double b, double c) { return std::fma(a, b, c); }
 #endif
 // The correctly rounded fused multiply-add, without libm's per-call dispatch.
 inline double host_fma(double a, double b, double c) { return g_hw_fma ? fma_hw(a, b, c) : std::fma(a, b, c); }
+
+// Reads or writes the low `size` bytes of a value in memory, little-endian.
+// The sizes memory accesses come in are constants to the compiler this way,
+// so each is one move rather than a call to memcpy with a length.
+inline uint64_t load_bytes(const uint8_t* p, uint32_t size) {
+  switch (size) {
+    case 1: { uint8_t v; std::memcpy(&v, p, 1); return v; }
+    case 2: { uint16_t v; std::memcpy(&v, p, 2); return v; }
+    case 4: { uint32_t v; std::memcpy(&v, p, 4); return v; }
+    case 8: { uint64_t v; std::memcpy(&v, p, 8); return v; }
+    default: { uint64_t v = 0; std::memcpy(&v, p, size); return v; }
+  }
+}
+inline void store_bytes(uint8_t* p, uint32_t size, uint64_t value) {
+  switch (size) {
+    case 1: { const uint8_t v = static_cast<uint8_t>(value); std::memcpy(p, &v, 1); return; }
+    case 2: { const uint16_t v = static_cast<uint16_t>(value); std::memcpy(p, &v, 2); return; }
+    case 4: { const uint32_t v = static_cast<uint32_t>(value); std::memcpy(p, &v, 4); return; }
+    case 8: std::memcpy(p, &value, 8); return;
+    default: std::memcpy(p, &value, size); return;
+  }
+}
 
 // Per-element lanes for a vector load, store or register pack: up to four on
 // the stack, as the parser allows, instead of a heap allocation on every
@@ -2674,13 +2713,27 @@ class Interpreter {
       warp.written32.assign(fn_.num_regs32, 0);
       warp.written64.assign(fn_.num_regs64, 0);
       Mask live = 0;
+      // Thread ids by counting up from the warp's first thread: the division
+      // form (lin % nx, lin / nx % ny, lin / (nx * ny)) cost three 64-bit
+      // divisions a lane, and the ids it gives are exactly these.
+      const uint64_t first = uint64_t{static_cast<uint32_t>(w)} * W_;
+      uint32_t x = static_cast<uint32_t>(first % b.ctx.ntid[0]);
+      uint32_t y = static_cast<uint32_t>((first / b.ctx.ntid[0]) % b.ctx.ntid[1]);
+      uint32_t z = static_cast<uint32_t>(first / (uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1]));
       for (uint32_t lane = 0; lane < W_; ++lane) {
-        uint64_t lin = uint64_t{static_cast<uint32_t>(w)} * W_ + lane;
+        uint64_t lin = first + lane;
         if (lin >= total) break;
         live |= (Mask{1} << lane);
-        warp.tid_x[lane] = static_cast<uint32_t>(lin % b.ctx.ntid[0]);
-        warp.tid_y[lane] = static_cast<uint32_t>((lin / b.ctx.ntid[0]) % b.ctx.ntid[1]);
-        warp.tid_z[lane] = static_cast<uint32_t>(lin / (uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1]));
+        warp.tid_x[lane] = x;
+        warp.tid_y[lane] = y;
+        warp.tid_z[lane] = z;
+        if (++x == b.ctx.ntid[0]) {
+          x = 0;
+          if (++y == b.ctx.ntid[1]) {
+            y = 0;
+            ++z;
+          }
+        }
       }
       if (live) warp.paths.push_back({0, live});
       else warp.state = Warp::State::Done;
@@ -2698,7 +2751,10 @@ class Interpreter {
   // spin on a global flag another block has to set, and a warp spinning without
   // a bound would never give that block a turn.
   bool step_block(BlockState& b, Scheduler& sched, uint64_t slice) {
-    std::vector<size_t> runnable;
+    // Reused across turns: a block takes one per warp-turn, and a vector of
+    // its own made each of them an allocation.
+    std::vector<size_t>& runnable = runnable_;
+    runnable.clear();
     for (size_t i = 0; i < b.warps.size(); ++i)
       if (b.warps[i].state == Warp::State::Ready) runnable.push_back(i);
     if (runnable.empty()) {
@@ -2860,11 +2916,24 @@ class Interpreter {
         exec_ret(w, ctx, implicit_ret(), idx, w.paths[idx].mask);
         continue;
       }
+      // The pre-decoded forms of the function's instructions, when it has them
+      // (see MicroOp).
+      if (cur_ != micro_owner_) {
+        micro_owner_ = cur_;
+        micro_ = cur_->micro.size() == cur_->body.size() ? cur_->micro.data() : nullptr;
+      }
+      // A warp on one path, at a run of such instructions: run them together.
+      if (micro_ && fast_enabled_ && w.paths.size() == 1 &&
+          run_micro_batch(w, ctx, slice, issued) != 0)
+        continue;
       const Instr& ins = cur_->body[w.paths[idx].pc];
+      const MicroOp* const mu = micro_ ? &micro_[w.paths[idx].pc] : nullptr;
+      const uint16_t opcode_id = mu ? mu->opcode_id : ins.opcode_id;
       if (progress_ && (stats_.instructions & 0xFFFFF) == 0) report_progress();
       // Warp-level issue count, plus the per-lane total: their ratio is the
       // average lane utilisation, which is divergence measured directly.
-      const uint64_t lanes = static_cast<uint64_t>(popcount_mask(w.paths[idx].mask));
+      const Mask path_mask = w.paths[idx].mask;
+      const uint64_t lanes = path_mask == all_ ? W_ : static_cast<uint64_t>(popcount_mask(path_mask));
       stats_.thread_instructions += lanes;
       // Counted against the same mask as thread_instructions, so the classes
       // partition it exactly. Predication narrows the mask inside step(); it is
@@ -2875,10 +2944,10 @@ class Interpreter {
       if (ctx.clock) ++*ctx.clock;
       // Per-opcode issue count, alongside the class histogram. Counted per
       // warp-level issue like `instructions`, so the two are comparable.
-      if (ins.opcode_id) {
-        if (ins.opcode_id >= stats_.inst_by_opcode.size())
-          stats_.inst_by_opcode.resize(ins.opcode_id + 1u, 0);
-        ++stats_.inst_by_opcode[ins.opcode_id];
+      if (opcode_id) {
+        if (opcode_id >= stats_.inst_by_opcode.size())
+          stats_.inst_by_opcode.resize(opcode_id + 1u, 0);
+        ++stats_.inst_by_opcode[opcode_id];
       }
       ++stats_.instructions;
       // Named with the instruction the warp is on: in a hang, that is almost
@@ -2890,6 +2959,13 @@ class Interpreter {
                      std::to_string(ctx.ctaid[0]) + "," + std::to_string(ctx.ctaid[1]) + "," +
                      std::to_string(ctx.ctaid[2]) + "), warp " + std::to_string(cur_warp_) +
                      warp_positions(ctx));
+      // The simplest forms run from their pre-decoded MicroOp; one it declines
+      // (an unwritten predicate, an armed fault) changes nothing and falls
+      // through to the paths below.
+      if (mu && mu->kind != MicroOp::None && fast_enabled_ && exec_micro(w, *mu, w.paths[idx].mask)) {
+        ++w.paths[idx].pc;
+        continue;
+      }
       // The fast-path kinds go straight to their handler: no trip through
       // step() and dispatch(), whose frames cost more than the arithmetic.
       // A form the fast path declines falls through to step() as before.
@@ -2907,6 +2983,228 @@ class Interpreter {
       }
       step(w, ctx, idx, ins);
     }
+  }
+
+  // Runs the pre-decoded instructions the warp's only path is at, one after
+  // another, until one is not of those forms (or declines), the slice or the
+  // step budget is used up, or the function ends; returns how many ran.
+  // Each is counted exactly as the loop in run_warp_until_yield counts an
+  // instruction -- issue, active lanes, class, opcode, clock, steps -- but the
+  // totals are kept in registers and added to the launch's counters once, since
+  // nothing reads them in between: only an instruction that is not one of these
+  // can (a clock read, a barrier, an error), and it ends the batch first. The
+  // caller has already taken `issued` for the first instruction; the slice is
+  // checked here for the rest. Nothing else the loop does between two
+  // instructions of a one-path warp changes: such an instruction cannot move
+  // the pc but by one, change the warp's state, ask it to yield, or add a path.
+  uint64_t run_micro_batch(Warp& w, const BlockCtx& ctx, uint64_t slice, uint64_t& issued) {
+    Path& path = w.paths[0];
+    const Mask mask = path.mask;
+    size_t pc = path.pc;
+    const size_t end = cur_->body.size();
+    uint64_t steps = w.steps;
+    const uint64_t max_steps = cfg_.max_steps;
+    uint64_t n = 0;
+    uint64_t by_class[static_cast<size_t>(InstClass::Count)] = {};
+    while (pc < end) {
+      const MicroOp& u = micro_[pc];
+      if (u.kind == MicroOp::None) break;
+      if (n != 0 && slice && issued >= slice) break;
+      if (steps + 1 > max_steps) break;   // the loop reports it, with its message
+      // The loop reports progress before the instruction that makes the count a
+      // multiple of 2^20; leave that one to it.
+      if (progress_ && ((stats_.instructions + n) & 0xFFFFF) == 0) break;
+      const InstClass cls = class_of_pc(pc);
+      if (cls == InstClass::Tensor) break;
+      // A branch every active lane takes, or none does, moves the pc; one that
+      // splits the warp is exec_bra's to do. A backward one after a long turn
+      // asks the warp to yield, as exec_bra does, and ends the batch.
+      size_t next = pc + 1;
+      bool yield = false;
+      if (u.kind == MicroOp::Bra) {
+        Mask fm;
+        if (!micro_guard(w, u, mask, fm) || (fm != 0 && fm != mask)) break;
+        if (fm != 0) {
+          next = u.src[0];
+          if (next <= pc && steps + 1 - turn_start_ >= kLongTurn) yield = true;
+        }
+      } else if (!exec_micro(w, u, mask)) {
+        break;
+      }
+      if (n != 0) ++issued;
+      ++n;
+      ++steps;
+      ++by_class[static_cast<size_t>(cls)];
+      if (u.opcode_id) {
+        if (u.opcode_id >= stats_.inst_by_opcode.size()) stats_.inst_by_opcode.resize(u.opcode_id + 1u, 0);
+        ++stats_.inst_by_opcode[u.opcode_id];
+      }
+      pc = next;
+      if (yield) {
+        w.yield_now = true;
+        break;
+      }
+    }
+    if (n != 0) {
+      const uint64_t lanes = mask == all_ ? W_ : static_cast<uint64_t>(popcount_mask(mask));
+      stats_.instructions += n;
+      stats_.thread_instructions += n * lanes;
+      for (size_t c = 0; c < static_cast<size_t>(InstClass::Count); ++c)
+        stats_.inst_by_class[c] += by_class[c] * lanes;
+      if (ctx.clock) *ctx.clock += n;
+      w.steps = steps;
+      path.pc = pc;
+    }
+    return n;
+  }
+
+  // Runs one MicroOp for the lanes of `mask` that its guard lets through, with
+  // the same arithmetic, the same register writes and the same result as the
+  // fast handler for the Instr it was decoded from. Returns false -- with
+  // nothing changed -- for a case it leaves to the general path: a guard
+  // predicate nothing has written (which the general path reports) or an
+  // armed arithmetic fault (which it applies).
+  // The lanes of `mask` the instruction's guard lets through; false when the
+  // guard predicate is one nothing has written.
+  bool micro_guard(const Warp& w, const MicroOp& u, Mask mask, Mask& fm) const {
+    fm = mask;
+    if (u.flags & MicroOp::kHasPred) {
+      if (u.pred >= w.written32.size() || !w.written32[u.pred] || u.pred >= w.preds.size()) return false;
+      Mask p = w.preds[u.pred];
+      if (u.flags & MicroOp::kPredNeg) p = ~p;
+      fm &= p;
+    }
+    return true;
+  }
+
+  bool exec_micro(Warp& w, const MicroOp& u, Mask mask) {
+    Mask fm;
+    if (!micro_guard(w, u, mask, fm)) return false;
+    if (fm == 0 && u.kind != MicroOp::Bra) return true;
+    switch (u.kind) {
+      case MicroOp::Int32: return micro_int32(w, u, fm);
+      case MicroOp::MadLo32: return micro_mad_lo32(w, u, fm);
+      case MicroOp::Mov32: return micro_mov32(w, u, fm);
+      case MicroOp::Setp32: return micro_setp32(w, u, fm);
+      case MicroOp::Fma32: return micro_fma32(w, u, fm);
+      case MicroOp::Float32: return micro_float32(w, u, fm);
+      case MicroOp::Selp32: return micro_selp32(w, u, fm);
+      case MicroOp::Not32: return micro_not32(w, u, fm);
+      case MicroOp::Shf32: return micro_shf32(w, u, fm);
+      case MicroOp::Bra: return false;   // moves the pc: run_micro_batch's, or step()'s
+      case MicroOp::None: break;
+    }
+    return false;
+  }
+
+  // A source as 32-bit lanes: the register in place, zeros for one nothing
+  // has written (as read_narrow), an immediate spread across the lanes. The
+  // spread lives in the interpreter, not on the stack, and is refilled only
+  // when the constant changes -- a loop uses the same few over and over.
+  [[gnu::always_inline]] const uint32_t* micro_src(const Warp& w, const MicroOp& u, unsigned i) {
+    if (u.src_imm >> i & 1) {
+      if (!imm_valid_[i] || imm_value_[i] != u.src[i]) {
+        imm_lanes_[i].fill(u.src[i]);
+        imm_value_[i] = u.src[i];
+        imm_valid_[i] = true;
+      }
+      return imm_lanes_[i].data();
+    }
+    const uint32_t id = u.src[i];
+    if (id >= w.regs32.size() || !w.written32[id]) return zero_lanes_.data();
+    return w.regs32[id].data();
+  }
+
+  bool micro_int32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    uint32_t* d = dst32(w, u.dst, fm);
+    if (!int_bin32_lanes(static_cast<IntBinOp>(u.sub), u.flags & MicroOp::kSigned, d, a, b, fm, W_)) return false;
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  bool micro_mad_lo32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = a[l] * b[l] + c[l]; });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  bool micro_mov32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* v = micro_src(w, u, 0);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = v[l]; });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  bool micro_setp32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    Mask res = 0;
+    if (!setp32_lanes(static_cast<CmpOp>(u.sub), u.flags & MicroOp::kFloat, u.flags & MicroOp::kSigned, a, b, fm, W_,
+                      res))
+      return false;
+    w.written32[u.dst] = 1;
+    Mask& p = w.preds[u.dst];
+    p = (p & ~fm) | (res & fm);
+    return true;
+  }
+  bool micro_fma32(Warp& w, const MicroOp& u, Mask fm) {
+    if (mem_.alu_fault_armed()) return false;
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    uint32_t* d = dst32(w, u.dst, fm);
+    fma32_lanes(d, a, b, c, fm, W_);
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // selp: a where the predicate is set, b elsewhere. A predicate nothing has
+  // written is the general path's error to report (read_pred).
+  bool micro_selp32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t pid = u.src[2];
+    if (pid >= w.written32.size() || !w.written32[pid] || pid >= w.preds.size()) return false;
+    const Mask p = w.preds[pid];
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = (p >> l & 1) ? a[l] : b[l]; });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  bool micro_not32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* v = micro_src(w, u, 0);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = ~v[l]; });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // shf: the 64-bit value b:a shifted by c (wrapped to 5 bits, or clamped to
+  // 32), the high word for a left shift and the low word for a right one.
+  bool micro_shf32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    uint32_t* d = dst32(w, u.dst, fm);
+    const bool left = u.flags & MicroOp::kLeft, wrap = u.flags & MicroOp::kWrap;
+    for_active(fm, W_, [&](uint32_t l) {
+      const uint64_t funnel = (uint64_t{b[l]} << 32) | a[l];
+      const uint32_t n = wrap ? (c[l] & 31u) : std::min<uint32_t>(c[l], 32u);
+      d[l] = left ? static_cast<uint32_t>((funnel << n) >> 32) : static_cast<uint32_t>(funnel >> n);
+    });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  bool micro_float32(Warp& w, const MicroOp& u, Mask fm) {
+    if (mem_.alu_fault_armed()) return false;
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    uint32_t* d = dst32(w, u.dst, fm);
+    float_bin32_lanes(static_cast<FloatBinOp>(u.sub), d, a, b, fm, W_);
+    w.written32[u.dst] = 1;
+    return true;
   }
 
   static bool fast_kind(const Instr& ins) {
@@ -3766,6 +4064,19 @@ class Interpreter {
   uint64_t load_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                        uint32_t size) {
     if (is_shared(addr)) {
+      // The block's own shared memory, in bounds: nearly every access. It does
+      // what the general case below does for it, minus building a SharedRef.
+      if (const uint64_t rel = addr - kSharedVaBase, off = rel & kClusterOffsetMask;
+          fast_enabled_ && (rel >> kClusterRankShift) == cluster_rank_of(ctx) && ctx.shared &&
+          off + size <= ctx.shared->size()) {
+        if (ctx.shadow) note_shared_access(ctx, ins, kSharedVaBase + off, size, /*is_write=*/false);
+        const uint64_t v = load_bytes(ctx.shared->data() + off, size);
+        try {
+          return mem_.shared_loaded(off, size, v);
+        } catch (const Error& e) {
+          rethrow_with_context(e, ins, static_cast<int>(lane));
+        }
+      }
       const SharedRef r = shared_at(ctx, ins, static_cast<int>(lane), addr, size);
       // The race detector orders warps by their own block's barriers, which
       // say nothing about another block's, so a remote access is not noted.
@@ -3808,6 +4119,14 @@ class Interpreter {
   void store_routed(Warp& w, const BlockCtx& ctx, const Instr& ins, uint32_t lane, uint64_t addr,
                     uint32_t size, uint64_t value) {
     if (is_shared(addr)) {
+      // As in load_routed: the block's own memory, in bounds, directly.
+      if (const uint64_t rel = addr - kSharedVaBase, off = rel & kClusterOffsetMask;
+          fast_enabled_ && (rel >> kClusterRankShift) == cluster_rank_of(ctx) && ctx.shared &&
+          off + size <= ctx.shared->size()) {
+        if (ctx.shadow) note_shared_access(ctx, ins, kSharedVaBase + off, size, /*is_write=*/true, value);
+        store_bytes(ctx.shared->data() + off, size, value);
+        return;
+      }
       const SharedRef r = shared_at(ctx, ins, static_cast<int>(lane), addr, size);
       if (r.owner == &ctx) note_shared_access(ctx, ins, kSharedVaBase + r.off, size, /*is_write=*/true, value);
       std::memcpy(r.owner->shared->data() + r.off, &value, size);
@@ -4411,21 +4730,16 @@ class Interpreter {
     }
   }
 
-  bool fast_int_bin(Warp& w, const Instr& ins, const OpIntBin& op, Mask m) {
-    if (op.carry_in || op.carry_out || op.sat || op.ty.bits != 32 || op.dst.wide || !narrow_operand(op.a) ||
-        !narrow_operand(op.b) || op.op == IntBinOp::Div || op.op == IntBinOp::Rem)
-      return false;
-    Lanes32 sa, sb;
-    const Lanes32& a = read_narrow(w, ins, op.a, sa);
-    const Lanes32& b = read_narrow(w, ins, op.b, sb);
-    uint32_t* d = dst32(w, op.dst.id, m);
-    const bool sig = op.ty.is_signed();
+  // The 32-bit integer operations of fast_int_bin, over the active lanes. False
+  // for an operation it does not do (division, remainder).
+  static bool int_bin32_lanes(IntBinOp o, bool sig, uint32_t* d, const uint32_t* a, const uint32_t* b, Mask m,
+                              uint32_t width) {
     // The SIMD kernel (vgpu/simd/simd.hpp: ibin_m) for the operations the baseline's SSE2 has no instruction for --
     // the low half of a product, min and max, shifts by a count per lane. Add, sub, and, or and xor stay with the loops
     // below, which the compiler vectorises as well as the kernel does without the call.
-    if ((W_ == 32 || W_ == 64) && simd::enabled()) {
+    if ((width == 32 || width == 64) && simd::enabled()) {
       unsigned code = ~0u;
-      switch (op.op) {
+      switch (o) {
         case IntBinOp::Mul: code = static_cast<unsigned>(simd::IntBin::Mul); break;
         case IntBinOp::Min: code = static_cast<unsigned>(simd::IntBin::Min); break;
         case IntBinOp::Max: code = static_cast<unsigned>(simd::IntBin::Max); break;
@@ -4434,13 +4748,12 @@ class Interpreter {
         default: break;
       }
       if (code != ~0u) {
-        simd::kernels().ibin_m(code, sig, d, a.data(), b.data(), m, W_);
-        w.written32[op.dst.id] = 1;
+        simd::kernels().ibin_m(code, sig, d, a, b, m, width);
         return true;
       }
     }
-    auto run = [&](auto f) { for_active(m, W_, [&](uint32_t l) { d[l] = f(a[l], b[l]); }); };
-    switch (op.op) {
+    auto run = [&](auto f) { for_active(m, width, [&](uint32_t l) { d[l] = f(a[l], b[l]); }); };
+    switch (o) {
       case IntBinOp::Add: run([](uint32_t x, uint32_t y) { return x + y; }); break;
       case IntBinOp::Sub: run([](uint32_t x, uint32_t y) { return x - y; }); break;
       case IntBinOp::Mul: run([](uint32_t x, uint32_t y) { return x * y; }); break;
@@ -4469,8 +4782,20 @@ class Interpreter {
           });
         else run([](uint32_t x, uint32_t y) { return y >= 32 ? 0u : x >> y; });
         break;
-      default: return false;   // unreachable: Div and Rem were sent to the general path
+      default: return false;   // Div and Rem
     }
+    return true;
+  }
+
+  bool fast_int_bin(Warp& w, const Instr& ins, const OpIntBin& op, Mask m) {
+    if (op.carry_in || op.carry_out || op.sat || op.ty.bits != 32 || op.dst.wide || !narrow_operand(op.a) ||
+        !narrow_operand(op.b) || op.op == IntBinOp::Div || op.op == IntBinOp::Rem)
+      return false;
+    Lanes32 sa, sb;
+    const Lanes32& a = read_narrow(w, ins, op.a, sa);
+    const Lanes32& b = read_narrow(w, ins, op.b, sb);
+    uint32_t* d = dst32(w, op.dst.id, m);
+    if (!int_bin32_lanes(op.op, op.ty.is_signed(), d, a.data(), b.data(), m, W_)) return false;   // unreachable: Div and Rem were sent to the general path
     w.written32[op.dst.id] = 1;
     return true;
   }
@@ -4500,6 +4825,63 @@ class Interpreter {
     return true;
   }
 
+  // The lanes (of those in m) for which a 32-bit comparison holds. False for a
+  // comparison the fast path does not do (an integer one outside the six
+  // ordered ones).
+  static bool setp32_lanes(CmpOp cmp, bool is_float, bool sig, const uint32_t* a, const uint32_t* b, Mask m,
+                           uint32_t width, Mask& res) {
+    res = 0;
+    auto run = [&](auto f) {
+      for_active(m, width, [&](uint32_t l) { res |= Mask{f(a[l], b[l]) ? 1u : 0u} << l; });
+    };
+    if (!is_float && static_cast<unsigned>(cmp) <= static_cast<unsigned>(CmpOp::Ge) && (width == 32 || width == 64) &&
+        simd::enabled()) {
+      // The SIMD kernel (vgpu/simd/simd.hpp: icmp_mask): CmpOp's Eq..Ge are IntCmp's, in order.
+      res = simd::kernels().icmp_mask(static_cast<unsigned>(cmp), sig, a, b, width) & m;
+      return true;
+    }
+    if (is_float) {
+      // compare_float's table, with the comparison chosen once instead of once
+      // a lane: a float widens to the double it compares as without change, so
+      // comparing the floats gives the same answers, NaNs included.
+      auto runf = [&](auto f) {
+        run([&](uint32_t x, uint32_t y) {
+          const float fx = f32(x), fy = f32(y);
+          return f(fx, fy, fx != fx || fy != fy);
+        });
+      };
+      switch (cmp) {
+        case CmpOp::Eq: runf([](float x, float y, bool u) { return !u && x == y; }); break;
+        case CmpOp::Ne: runf([](float x, float y, bool u) { return !u && x != y; }); break;
+        case CmpOp::Lt: runf([](float x, float y, bool u) { return !u && x < y; }); break;
+        case CmpOp::Le: runf([](float x, float y, bool u) { return !u && x <= y; }); break;
+        case CmpOp::Gt: runf([](float x, float y, bool u) { return !u && x > y; }); break;
+        case CmpOp::Ge: runf([](float x, float y, bool u) { return !u && x >= y; }); break;
+        case CmpOp::Equ: runf([](float x, float y, bool u) { return u || x == y; }); break;
+        case CmpOp::Neu: runf([](float x, float y, bool u) { return u || x != y; }); break;
+        case CmpOp::Ltu: runf([](float x, float y, bool u) { return u || x < y; }); break;
+        case CmpOp::Leu: runf([](float x, float y, bool u) { return u || x <= y; }); break;
+        case CmpOp::Gtu: runf([](float x, float y, bool u) { return u || x > y; }); break;
+        case CmpOp::Geu: runf([](float x, float y, bool u) { return u || x >= y; }); break;
+        case CmpOp::Num: runf([](float, float, bool u) { return !u; }); break;
+        case CmpOp::Nan: runf([](float, float, bool u) { return u; }); break;
+      }
+      return true;
+    }
+    auto by = [&](auto cast) {
+      switch (cmp) {
+        case CmpOp::Eq: run([&](uint32_t x, uint32_t y) { return cast(x) == cast(y); }); return true;
+        case CmpOp::Ne: run([&](uint32_t x, uint32_t y) { return cast(x) != cast(y); }); return true;
+        case CmpOp::Lt: run([&](uint32_t x, uint32_t y) { return cast(x) < cast(y); }); return true;
+        case CmpOp::Le: run([&](uint32_t x, uint32_t y) { return cast(x) <= cast(y); }); return true;
+        case CmpOp::Gt: run([&](uint32_t x, uint32_t y) { return cast(x) > cast(y); }); return true;
+        case CmpOp::Ge: run([&](uint32_t x, uint32_t y) { return cast(x) >= cast(y); }); return true;
+        default: return false;
+      }
+    };
+    return sig ? by([](uint32_t v) { return static_cast<int32_t>(v); }) : by([](uint32_t v) { return v; });
+  }
+
   bool fast_setp(Warp& w, const Instr& ins, const OpSetp& op, Mask m) {
     if (op.ty.bits != 32 || op.ty.is_bfloat() || !narrow_operand(op.a) || !narrow_operand(op.b) ||
         op.has_bop || op.has_q || op.packed || op.ftz)
@@ -4508,35 +4890,29 @@ class Interpreter {
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     Mask res = 0;
-    auto run = [&](auto f) {
-      for_active(m, W_, [&](uint32_t l) { res |= Mask{f(a[l], b[l]) ? 1u : 0u} << l; });
-    };
-    if (!op.ty.is_float() && static_cast<unsigned>(op.cmp) <= static_cast<unsigned>(CmpOp::Ge) &&
-        (W_ == 32 || W_ == 64) && simd::enabled()) {
-      // The SIMD kernel (vgpu/simd/simd.hpp: icmp_mask): CmpOp's Eq..Ge are IntCmp's, in order.
-      res = simd::kernels().icmp_mask(static_cast<unsigned>(op.cmp), op.ty.is_signed(), a.data(), b.data(), W_) & m;
-    } else if (op.ty.is_float()) {
-      const CmpOp cmp = op.cmp;
-      run([cmp](uint32_t x, uint32_t y) { return compare_float(cmp, f32(x), f32(y)); });
-    } else {
-      auto by = [&](auto cast) {
-        switch (op.cmp) {
-          case CmpOp::Eq: run([&](uint32_t x, uint32_t y) { return cast(x) == cast(y); }); return true;
-          case CmpOp::Ne: run([&](uint32_t x, uint32_t y) { return cast(x) != cast(y); }); return true;
-          case CmpOp::Lt: run([&](uint32_t x, uint32_t y) { return cast(x) < cast(y); }); return true;
-          case CmpOp::Le: run([&](uint32_t x, uint32_t y) { return cast(x) <= cast(y); }); return true;
-          case CmpOp::Gt: run([&](uint32_t x, uint32_t y) { return cast(x) > cast(y); }); return true;
-          case CmpOp::Ge: run([&](uint32_t x, uint32_t y) { return cast(x) >= cast(y); }); return true;
-          default: return false;
-        }
-      };
-      const bool done = op.ty.is_signed() ? by([](uint32_t v) { return static_cast<int32_t>(v); })
-                                          : by([](uint32_t v) { return v; });
-      if (!done) return false;
-    }
+    if (!setp32_lanes(op.cmp, op.ty.is_float(), op.ty.is_signed(), a.data(), b.data(), m, W_, res)) return false;
     Mask& p = pred_slot(w, op.dst);
     p = (p & ~m) | (res & m);
     return true;
+  }
+
+  // f32 fma over the active lanes, a NaN result the canonical one (see canon32). The SIMD kernel
+  // (vgpu/simd/simd.hpp: ffma_m) does the fma and the NaN canonicalisation in one pass; VGPU_SIMD=off runs the host
+  // FMA unit (or libm) and then the canonicalisation.
+  static void fma32_lanes(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, Mask m,
+                          uint32_t width) {
+    if ((width == 32 || width == 64) && simd::enabled()) {
+      simd::kernels().ffma_m(d, a, b, c, m, width);
+      return;
+    }
+#if defined(__x86_64__) && defined(__GNUC__)
+    if (g_hw_fma) {
+      fma_lanes_f32_hw(d, a, b, c, m, width);
+      canon_nan32_lanes(d, m, width);
+      return;
+    }
+#endif
+    for_active(m, width, [&](uint32_t l) { d[l] = canon32(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
   }
 
   bool fast_fma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpFma& op, Mask m) {
@@ -4550,24 +4926,7 @@ class Interpreter {
       const Lanes32& b = read_narrow(w, ins, op.b, sb);
       const Lanes32& c = read_narrow(w, ins, op.c, sc);
       uint32_t* d = dst32(w, op.dst.id, m);
-#if defined(__x86_64__) && defined(__GNUC__)
-      if (g_hw_fma) {
-        // The SIMD kernel (vgpu/simd/simd.hpp) does the fma and the NaN canonicalisation below in one pass.
-        if ((W_ == 32 || W_ == 64) && simd::enabled()) {
-          simd::kernels().ffma_m(d, a.data(), b.data(), c.data(), m, W_);
-          w.written32[op.dst.id] = 1;
-          return true;
-        }
-        fma_lanes_f32_hw(d, a.data(), b.data(), c.data(), m, W_);
-        // A NaN result is the canonical one (see canon32).
-        for_active(m, W_, [&](uint32_t l) {
-          if ((d[l] & 0x7F800000u) == 0x7F800000u && (d[l] & 0x7FFFFFu)) d[l] = 0x7FFFFFFFu;
-        });
-        w.written32[op.dst.id] = 1;
-        return true;
-      }
-#endif
-      for_active(m, W_, [&](uint32_t l) { d[l] = canon32(std::fma(f32(a[l]), f32(b[l]), f32(c[l]))); });
+      fma32_lanes(d, a.data(), b.data(), c.data(), m, W_);
       w.written32[op.dst.id] = 1;
       return true;
     }
@@ -4589,6 +4948,21 @@ class Interpreter {
     return true;
   }
 
+  static void float_bin32_lanes(FloatBinOp o, uint32_t* d, const uint32_t* a, const uint32_t* b, Mask m,
+                                uint32_t width) {
+    auto run = [&](auto f) {
+      for_active(m, width, [&](uint32_t l) { d[l] = canon32(f(f32(a[l]), f32(b[l]))); });
+    };
+    switch (o) {
+      case FloatBinOp::Add: run([](float x, float y) { return x + y; }); break;
+      case FloatBinOp::Sub: run([](float x, float y) { return x - y; }); break;
+      case FloatBinOp::Mul: run([](float x, float y) { return x * y; }); break;
+      case FloatBinOp::Div: run([](float x, float y) { return x / y; }); break;
+      case FloatBinOp::Min: for_active(m, width, [&](uint32_t l) { d[l] = ptx_min32(a[l], b[l]); }); break;
+      case FloatBinOp::Max: for_active(m, width, [&](uint32_t l) { d[l] = ptx_max32(a[l], b[l]); }); break;
+    }
+  }
+
   bool fast_float_bin(Warp& w, const Instr& ins, const OpFloatBin& op, Mask m) {
     if (op.round != FRound::Nearest || op.nan_propagate || op.sat || op.xorsign_abs || op.ftz || op.approx || op.ty.bits != 32 || !op.ty.is_float() ||
         op.dst.wide || !narrow_operand(op.a) || !narrow_operand(op.b) || mem_.alu_fault_armed())
@@ -4597,17 +4971,7 @@ class Interpreter {
     const Lanes32& a = read_narrow(w, ins, op.a, sa);
     const Lanes32& b = read_narrow(w, ins, op.b, sb);
     uint32_t* d = dst32(w, op.dst.id, m);
-    auto run = [&](auto f) {
-      for_active(m, W_, [&](uint32_t l) { d[l] = canon32(f(f32(a[l]), f32(b[l]))); });
-    };
-    switch (op.op) {
-      case FloatBinOp::Add: run([](float x, float y) { return x + y; }); break;
-      case FloatBinOp::Sub: run([](float x, float y) { return x - y; }); break;
-      case FloatBinOp::Mul: run([](float x, float y) { return x * y; }); break;
-      case FloatBinOp::Div: run([](float x, float y) { return x / y; }); break;
-      case FloatBinOp::Min: for_active(m, W_, [&](uint32_t l) { d[l] = ptx_min32(a[l], b[l]); }); break;
-      case FloatBinOp::Max: for_active(m, W_, [&](uint32_t l) { d[l] = ptx_max32(a[l], b[l]); }); break;
-    }
+    float_bin32_lanes(op.op, d, a.data(), b.data(), m, W_);
     w.written32[op.dst.id] = 1;
     return true;
   }
@@ -9759,10 +10123,19 @@ class Interpreter {
       return;
     }
     if (op.space == Space::Param) {
-      auto it = params_.layout.find(op.addr.base);
-      if (it == params_.layout.end())
-        ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
-      auto [off, psize] = it->second;
+      // By position when the parser recorded one and this is the kernel's own
+      // body (a device function's parameters are call slots, not these), else
+      // by name; both name the same slot.
+      std::pair<uint32_t, uint32_t> slot;
+      if (fast_enabled_ && cur_ == &fn_ && op.addr.param_index < params_.by_index.size()) {
+        slot = params_.by_index[op.addr.param_index];
+      } else {
+        auto it = params_.layout.find(op.addr.base);
+        if (it == params_.layout.end())
+          ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
+        slot = it->second;
+      }
+      auto [off, psize] = slot;
       for (size_t e = 0; e < n; ++e) {
         int64_t at = int64_t{off} + op.addr.offset + static_cast<int64_t>(e * size);
         if (at < 0 || static_cast<uint64_t>(at) + size > uint64_t{off} + psize)
@@ -9780,9 +10153,10 @@ class Interpreter {
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
+    const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;   // a mask, not a division, then
     {
       // Sectors and bank conflicts need the addresses, which only exist here.
-      Lanes at{};
+      Lanes at;   // read only at the active lanes, which are all written below
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
@@ -9816,7 +10190,7 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        if (addr % va != 0)
+        if (va_pow2 ? (addr & (va - 1)) != 0 : addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "vector load requires " + std::to_string(va) + "-byte alignment");
         std::unique_lock<std::mutex> whole;
@@ -9876,8 +10250,9 @@ class Interpreter {
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);
+    const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;
     {
-      Lanes at{};
+      Lanes at;   // read only at the active lanes, which are all written below
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
@@ -9911,7 +10286,7 @@ class Interpreter {
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        if (addr % va != 0)
+        if (va_pow2 ? (addr & (va - 1)) != 0 : addr % va != 0)
           ctx_fail(ins, static_cast<int>(lane), Err::MisalignedAccess,
                    "vector store requires " + std::to_string(va) + "-byte alignment");
         std::unique_lock<std::mutex> whole;
@@ -12290,6 +12665,15 @@ class Interpreter {
   mutable std::vector<uint8_t> class_by_pc_;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
+  std::vector<size_t> runnable_;   // step_block's scratch: the warps ready to run
+  const EntryFn* micro_owner_ = nullptr;   // the function micro_ was taken from
+  const MicroOp* micro_ = nullptr;         // its pre-decoded instructions, or null
+  // Immediates spread across the lanes for micro_src, with the value each holds,
+  // and the zeros an unwritten register reads as.
+  std::array<Lanes32, 3> imm_lanes_{};
+  std::array<uint32_t, 3> imm_value_{};
+  std::array<bool, 3> imm_valid_{};
+  Lanes32 zero_lanes_{};
   bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
   // the process. Assigned once per launch rather than per interpreter, so the
@@ -12315,6 +12699,7 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
     pb.bytes.resize(off + size);
     std::memcpy(pb.bytes.data() + off, args[i].data(), size);
     pb.layout[fn.params[i].name] = {off, size};
+    pb.by_index.emplace_back(off, size);
   }
   return pb;
 }
