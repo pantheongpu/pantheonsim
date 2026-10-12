@@ -13,6 +13,7 @@
 // Every instruction completes before the next: the control bits' stall counts
 // and scoreboards are timing, which VirtualGPU does not model.
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
 
 #include <algorithm>
@@ -938,9 +939,8 @@ exec::LaunchStats Runner::run() {
   } else if (threads <= 1) {
     worker(0);
   } else {
-    std::vector<std::thread> pool;
-    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker, t);
-    for (std::thread& t : pool) t.join();
+    // The host threads are the pool's (vgpu/exec/worker_pool.hpp), parked between launches.
+    exec::run_parallel(threads, worker);
   }
   if (failure) std::rethrow_exception(failure);
   stats_.blocks = blocks;
