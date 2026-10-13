@@ -2434,7 +2434,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           run = g == g0 + uint64_t{i} * bytes;
         }
         if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kConstWindow + (uint64_t{1} << 32))) {
-          uint8_t buf[32 * 8];
+          uint8_t buf[32 * 16];
+          const uint32_t unit = bytes > 8 ? 8 : bytes;   // (a 16-byte access moves as two 8-byte elements)
           bool done = false;
           if (store) {
             const Operand& d = ins.src[1];
@@ -2443,14 +2444,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                 const uint32_t v = read32(w, d, first + i);
                 std::memcpy(buf + i * bytes, &v, bytes);
               } else {
-                uint32_t v[2];
-                for (unsigned k = 0; k < 2; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
-                std::memcpy(buf + i * 8, v, 8);
+                uint32_t v[4];
+                for (unsigned k = 0; k < bytes / 4; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
+                std::memcpy(buf + i * bytes, v, bytes);
               }
             }
-            done = mem_.store_run(g0, buf, uint64_t{count} * bytes, bytes);
+            done = mem_.store_run(g0, buf, uint64_t{count} * bytes, unit);
           } else {
-            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, bytes);
+            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, unit);
             if (done) {
               const Operand& d = ins.dst[0];
               for (unsigned i = 0; i < count; ++i) {
@@ -2459,10 +2460,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                   std::memcpy(&v, buf + i * bytes, bytes);
                   write32(w, d, first + i, extend(v));
                 } else {
-                  uint32_t v[2];
-                  std::memcpy(v, buf + i * 8, 8);
+                  uint32_t v[4];
+                  std::memcpy(v, buf + i * bytes, bytes);
                   if (d.reg != kRZ)
-                    for (unsigned k = 0; k < 2; ++k) w.reg(d.reg + k, first + i) = v[k];
+                    for (unsigned k = 0; k < bytes / 4; ++k) w.reg(d.reg + k, first + i) = v[k];
                 }
               }
             }

@@ -291,7 +291,7 @@ static int run_fault(const char* name) {
 // its own SASS (FFMA.FTZ, FADD.SAT, FMNMX.FTZ, MUFU.RCP, F2I.TRUNC, I2FP, FSETP...). The special values come from the host: zeros,
 // subnormals, infinities, NaNs of both signs, the extremes. Only the two runs' agreement is checked for these (the kernels have
 // their own host references in tests/unit/test_simd.cpp).
-constexpr int kFloatForms = 36;
+constexpr int kFloatForms = 41;
 __device__ __forceinline__ uint32_t fbits_(float f) { return __float_as_uint(f); }
 __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -348,6 +348,12 @@ __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
     o[33] = fbits_(static_cast<float>(static_cast<signed char>(ia >> 16)));
     o[34] = fbits_(static_cast<float>(static_cast<unsigned short>(ib >> 16)));
     o[35] = fbits_(static_cast<float>(static_cast<short>(ib)));
+    // The half of a register as the source of a byte or half conversion (I2F's .H1 and .B1 selects), and MUFU with a source modifier.
+    asm("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rn.f32.u8 %0, hi; }" : "=f"(r) : "r"(ia)); o[36] = fbits_(r);
+    asm("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rn.f32.s16 %0, hi; }" : "=f"(r) : "r"(ib)); o[37] = fbits_(r);
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(-a)); o[38] = fbits_(r);
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(fabsf(-b))); o[39] = fbits_(r);
+    asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(-fabsf(c))); o[40] = fbits_(r);
   }
   for (int k = 0; k < kFloatForms; ++k) out[static_cast<size_t>(i) * kFloatForms + k] = o[k];
 }
@@ -463,10 +469,10 @@ int main(int argc, char** argv) {
   if (argc > 1) return run_fault(argv[1]);
   for (int n : {1, 31, 32, 33, 1000, 4096 + 5}) {
     if (run_copy<uint8_t>("u8", n) || run_copy<uint16_t>("u16", n) || run_copy<uint32_t>("u32", n) ||
-        run_copy<uint64_t>("u64", n) || run_copy<float>("f32", n))
+        run_copy<uint64_t>("u64", n) || run_copy<float>("f32", n) || run_copy<Q>("q16", n))
       return 1;
   }
-  if (run_bcast<uint8_t>("u8") || run_bcast<uint16_t>("u16") || run_bcast<uint32_t>("u32") || run_bcast<uint64_t>("u64") || run_bcast<float>("f32"))
+  if (run_bcast<uint8_t>("u8") || run_bcast<uint16_t>("u16") || run_bcast<uint32_t>("u32") || run_bcast<uint64_t>("u64") || run_bcast<float>("f32") || run_bcast<Q>("q16"))
     return 1;
   if (run_shared<uint8_t>("u8") || run_shared<uint16_t>("u16") || run_shared<uint32_t>("u32") ||
       run_shared<uint64_t>("u64") || run_shared<Q>("q16"))
