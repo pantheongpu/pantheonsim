@@ -1581,8 +1581,8 @@ number below is against a fresh build of the same source; against the stale one
   through the exact expansion, and uses exact stand-ins for `floor`, `trunc`,
   `ldexp`, `ilogb` and the divides by powers of two (each checked against libm
   on 3e8 values, and `tests/unit/test_fastpath.cpp` compares whole fetches with
-  `VGPU_FASTPATH=0`). The texel reads (`MemoryManager::load_scalar`, a quarter
-  of what is left, about a seventh) are the memory layer's.
+  `VGPU_FASTPATH=0`). The texel reads (`MemoryManager::load_scalar` and the lookups
+  under it, about a seventh of what is left) are the memory layer's.
 - `popc` is the POPCNT instruction (it was libgcc's table walk: 10% of
   `int_alu`), `clz` one instruction, the arithmetic-fault flag one inline load
   (it was an out-of-line call, 3.7% of compute_virus), `%tid`/`%ntid`/`%ctaid`
