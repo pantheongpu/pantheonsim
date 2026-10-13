@@ -265,10 +265,16 @@ VTEST(host_dense_getrf_matches) {
 VTEST(host_dense_potrf_matches) {
   size_t bad = 0;
   int cases = 0;
-  for (const int n : {1, 2, 3, 4, 5, 7, 8, 9, 16, 33, 64, 100, 150})
-    for (int kind = 0; kind < 3; ++kind)
+  for (const int n : {1, 2, 3, 4, 5, 7, 8, 9, 16, 33, 64, 100, 150, 191, 192, 200, 257, 400})
+    for (int kind = 0; kind < 6; ++kind)
       for (const bool lower : {true, false}) {
-        Mat A = kind == 1 ? random_mat(n, n, 2, 1) : spd(n, 2, kind == 2 ? 3 : 0), R = A;
+        // 0 positive definite, 1 anything, 2 a bad diagonal in the middle, 3 a zero one near the end, 4 NaN in the last column, 5 -0 and subnormals
+        Mat A = kind == 1 ? random_mat(n, n, 2, 1) : spd(n, 2, kind == 2 ? 3 : 0);
+        if (kind == 3 && n > 8) A(n - 3, n - 3) = 0.0;
+        if (kind == 4 && n > 8) A(n - 1, n / 3) = std::numeric_limits<double>::quiet_NaN();
+        if (kind == 5 && n > 8)
+          for (int i = 0; i < n; i += 7) A(i, n / 4) = (i & 8) ? -0.0 : std::numeric_limits<double>::denorm_min();
+        Mat R = A;
         const int info_ref = ref_potrf(R, n, lower);
         const int info_new = vgpu::hostdense::potrf(A.v.data(), A.ld, n, lower);
         VCHECK_EQ(info_ref, info_new);

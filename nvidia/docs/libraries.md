@@ -698,6 +698,7 @@ to 1.1x as noise.
 | `Dgeqrf` / `Sgeqrf` n = 1000 | 175 / 174 ms | 82 / 80 ms (26 / 22 ms threaded) | the reflectors of a panel applied to the columns to its right with the columns as lanes (`host_trsm.hpp`, `reflect`) |
 | `Dorgqr` n = 1000 | 228 ms | 106 ms (15 ms threaded) | the same |
 | cuDNN activation, softmax, pooling, batch normalization, add and op tensor, 800k elements | 2-12 ms | up to 4x faster on 20 threads (2.6x for relu, 4.1x for tanh, 2.9x for softmax) | the mode chosen once and the elements spread over threads; the graph runner's pointwise, band-mask, offset and broadcast walks in pieces |
+| cuSOLVER `potrf`, n = 1000 (lower / upper; double, and float through it) | 26-30 / 35 ms (end to end; 50 / 31 ms in the function alone) | 13-14 / 14-15 ms (17 / 14 ms in the function) | a panel of 64 columns at a time, the rest of the matrix updated by the product with the sums starting from the old values (only the triangle that is kept); from n = 256 (lower) and n = 512 (upper); a matrix that is not positive definite starts over from a copy through the plain loops, so the columns it leaves are the loops' |
 | cuDNN SDPA backward (composite graph, b 2, h 8, s 256, d 64) | 350 ms | 115-135 ms (20 threads) | broadcast index without a division per element, batched products over threads, pointwise and band-mask loops in pieces |
 | cuDNN filter gradient of a depthwise convolution (3x3, 5x5, 7x7) | 36 / 34 / 7.7 ms | 30 / 21 / 5.1 ms | the taps of a filter row as lanes (`host_conv_impl.inc`, `filt_taps`); the rest of the call is the transfer of the tensors |
 | cuSPARSE SpMV, CSR, 50000 x 50000, 2M entries | 35 ms | 19 ms | row by row, each row's sum in a register; typed conversions |
@@ -719,8 +720,7 @@ payload when two NaNs meet is the one thing not fixed, as before.
 
 What stayed as it was, measured on this machine and not worth the change: the Jacobi eigen- and singular value solvers of cuSOLVER (`syevd`,
 `gesvd`, `gesvdj`, 42-46 ms at n = 200; each rotation depends on the last in the two-sided method, so neither the rotations nor the order of
-their updates can change, and the complex ones, 126-137 ms at n = 128, are the same shape), `potrf` (3 ms at n = 512 already, 0.09 ns per
-multiply-add at n = 1500), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
+their updates can change, and the complex ones, 126-137 ms at n = 128, are the same shape), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
 tensor transfers (a copy out of device memory, a conversion to double and back make up 50% of a depthwise convolution), the H.264 and MPEG-2
 decoders (entropy decoding is 24% of the first and cannot be split), NPP's resize, warp, threshold and morphology, and nvJPEG's encoder.
 

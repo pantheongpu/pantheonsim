@@ -38,8 +38,8 @@ inline void axpy_sub(double* __restrict y, const double* __restrict x, double a,
   for (int64_t i = 0; i < n; ++i) y[i] = y[i] - a * x[i];
 }
 
-// Cholesky. Returns 0, or the 1-based index of the leading minor that failed.
-inline int potrf(double* a, int64_t ld, int n, bool lower) {
+// Cholesky, one column after another. Returns 0, or the 1-based index of the leading minor that failed.
+inline int potrf_steps(double* a, int64_t ld, int n, bool lower) {
   M A{a, ld};
   std::vector<double> s;
   for (int j = 0; j < n; ++j) {
@@ -80,6 +80,89 @@ inline int potrf(double* a, int64_t ld, int n, bool lower) {
         for (int k = 0; k < j; ++k) s0 -= c0[k] * cj[k];
         A(j, i) = s0 / d;
       }
+    }
+  }
+  return 0;
+}
+
+
+// Cholesky a panel of columns at a time, right-looking. Every element still sees  s = s - A(i,k) * A(c,k)  for k = 0, 1, 2, ...
+// in that order (the panel's own columns as above, one step after another; the rest of the matrix takes the panel's columns as a
+// product whose sums start from the old values -- c + (-a)*b is c - a*b to the bit -- of which only the triangle that is
+// kept is formed). Where the loops stopped at a leading minor that is not positive definite they left the columns before it
+// final and every other element as it was; the blocked form has updated the rest by then, so it starts over from a copy of the
+// matrix and lets the plain loops stop where they stop.
+inline int potrf(double* a, int64_t ld, int n, bool lower) {
+  constexpr int kPanel = 64;
+  // Below these sizes the copy and the panels cost what they save (measured: lower 1.2x at 200, upper 0.74x at 200 and 0.96x at 400).
+  if (n < (lower ? 4 : 8) * kPanel) return potrf_steps(a, ld, n, lower);
+  M A{a, ld};
+  std::vector<double> saved(static_cast<size_t>(n) * static_cast<size_t>(n));
+  for (int c = 0; c < n; ++c)
+    std::memcpy(saved.data() + static_cast<size_t>(c) * n, A.col(c), sizeof(double) * static_cast<size_t>(n));
+  auto start_over = [&] {
+    for (int c = 0; c < n; ++c)
+      std::memcpy(A.col(c), saved.data() + static_cast<size_t>(c) * n, sizeof(double) * static_cast<size_t>(n));
+    return potrf_steps(a, ld, n, lower);
+  };
+  std::vector<double> s;
+  for (int c0 = 0; c0 < n; c0 += kPanel) {
+    const int c1 = std::min(n, c0 + kPanel), nb = c1 - c0;
+    for (int j = c0; j < c1; ++j) {
+      double d = A(j, j);
+      for (int k = c0; k < j; ++k) {
+        const double v = lower ? A(j, k) : A(k, j);
+        d -= v * v;
+      }
+      if (!(d > 0.0)) return start_over();
+      d = std::sqrt(d);
+      A(j, j) = d;
+      if (lower) {
+        s.assign(A.col(j) + j + 1, A.col(j) + n);
+        for (int k = c0; k < j; ++k) axpy_sub(s.data(), A.col(k) + j + 1, A(j, k), n - j - 1);
+        for (int i = j + 1; i < n; ++i) A(i, j) = s[static_cast<size_t>(i - j - 1)] / d;
+      } else {
+        const double* cj = A.col(j);
+        int i = j + 1;
+        for (; i + 4 <= n; i += 4) {
+          double s0 = A(j, i), s1 = A(j, i + 1), s2 = A(j, i + 2), s3 = A(j, i + 3);
+          const double *c0p = A.col(i), *c1p = A.col(i + 1), *c2p = A.col(i + 2), *c3p = A.col(i + 3);
+          for (int k = c0; k < j; ++k) {
+            s0 -= c0p[k] * cj[k];
+            s1 -= c1p[k] * cj[k];
+            s2 -= c2p[k] * cj[k];
+            s3 -= c3p[k] * cj[k];
+          }
+          A(j, i) = s0 / d;
+          A(j, i + 1) = s1 / d;
+          A(j, i + 2) = s2 / d;
+          A(j, i + 3) = s3 / d;
+        }
+        for (; i < n; ++i) {
+          double s0 = A(j, i);
+          const double* ci = A.col(i);
+          for (int k = c0; k < j; ++k) s0 -= ci[k] * cj[k];
+          A(j, i) = s0 / d;
+        }
+      }
+    }
+    if (c1 >= n) continue;
+    const int rest = n - c1;
+    double* const c22 = &A(c1, c1);
+    if (lower) {
+      // A22(i,c) -= sum_k L(i,k) L(c,k), i >= c: A = L21 (rest x nb), B = L21^T
+      vgpu::hostgemm::gemm<double, double>(
+          false, true, rest, rest, nb, &A(c1, c0), ld, &A(c1, c0), ld, [=](int64_t i, int64_t j, double acc) {
+            if (i >= j) c22[i + j * ld] = acc;   // the other triangle is the caller's
+          },
+          vgpu::hostgemm::Isa::Auto, 0, /*tri=*/1, c22, ld, true);
+    } else {
+      // A22(c,i) -= sum_k U(k,c) U(k,i), c <= i: A = U12^T, B = U12 (nb x rest)
+      vgpu::hostgemm::gemm<double, double>(
+          true, false, rest, rest, nb, &A(c0, c1), ld, &A(c0, c1), ld, [=](int64_t i, int64_t j, double acc) {
+            if (i <= j) c22[i + j * ld] = acc;
+          },
+          vgpu::hostgemm::Isa::Auto, 0, /*tri=*/2, c22, ld, true);
     }
   }
   return 0;
