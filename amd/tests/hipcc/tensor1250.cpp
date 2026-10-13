@@ -73,6 +73,7 @@ struct Case {
   std::vector<uint32_t> indices;
   bool store = false;
   int groups = 2;
+  int barrier_addr = -1;   // atomic_barrier_enable: the LDS byte address (8-byte aligned) of the barrier the move arrives at when done
 };
 
 static uint32_t seed = 777;
@@ -95,6 +96,8 @@ int main() {
   CHECK(hipMalloc(&d_lds_out, kLds));
   CHECK(hipMalloc(&d_desc, 20 * 4));
   (void)d_out;
+  // A barrier word at 3072 for the case that asks the TDM to arrive at one: pending count 0, phase 0, initial count 5.
+  { const uint64_t barrier = uint64_t{5} << 32; std::memcpy(&lds0[3072], &barrier, 8); }
   CHECK(hipMemcpy(d_lds0, lds0.data(), kLds, hipMemcpyHostToDevice));
 
   std::vector<Case> cases;
@@ -143,6 +146,10 @@ int main() {
     c.tensor_dim[0] = 5; c.tensor_dim[1] = 9; c.tile_dim[0] = 5; c.stride[0] = 5; c.gather = true; c.wide = true; c.indices = {8, 2, 2, 0}; c.groups = 4; cases.push_back(c);
   }
   {
+    Case c; c.name = "2D load that arrives at an LDS barrier when done (pending 0 goes below zero: the barrier is met and reloads)";
+    c.tensor_dim[0] = 4; c.tensor_dim[1] = 2; c.tile_dim[0] = 4; c.tile_dim[1] = 2; c.stride[0] = 4; c.barrier_addr = 3072; cases.push_back(c);
+  }
+  {
     Case c; c.name = "2D store, the part outside the tensor dropped"; c.store = true;
     c.tensor_dim[0] = 6; c.tensor_dim[1] = 3; c.tile_dim[0] = 8; c.tile_dim[1] = 4; c.stride[0] = 10; c.start = 3; c.lds_addr = 16; cases.push_back(c);
   }
@@ -165,6 +172,8 @@ int main() {
     put(d, 126, 2, 2);                     // type: "image"
     // Group 1 (words 4-11).
     put(d, 128 + 16, 2, c.data_log2);
+    put(d, 128 + 18, 1, c.barrier_addr >= 0);
+    if (c.barrier_addr >= 0) put(d, 128 + 32, 16, c.barrier_addr >> 3);   // atomic_barrier_address[18:3]
     put(d, 128 + 19, 1, c.iterate);
     put(d, 128 + 20, 1, c.pad);
     put(d, 128 + 22, 3, c.pad_interval);
@@ -236,6 +245,13 @@ int main() {
                 }
               }
       }
+    }
+    if (c.barrier_addr >= 0) {   // the arrive subtracts one from the state; below zero the pending count reloads from the initial count
+      uint64_t word = 0;
+      std::memcpy(&word, &want_lds[c.barrier_addr], 8);
+      uint32_t state = static_cast<uint32_t>(word) - 1;
+      if ((state & 0x7FFFFFFFu) >> 30) state = (state >> 31 << 31) | (static_cast<uint32_t>(word >> 32) & 0xFFFF);
+      std::memcpy(&want_lds[c.barrier_addr], &state, 4);
     }
     CHECK(hipMemcpy(d_mem, mem.data(), kBytes, hipMemcpyHostToDevice));
     k_move<<<1, 32>>>(d_desc, d_lds0, d_lds_out, c.store, c.groups);
