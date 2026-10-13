@@ -2368,6 +2368,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 300)
+  # The same counters with the pre-decoded execution tier on (VGPU_TIER=1, src/sass/tier.hpp): it must count exactly
+  # what the interpreter does.
+  add_test(NAME bench_counters_tier
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
+  set_tests_properties(bench_counters_tier PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_TIER=1"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 300)
 
   # Thousands of launches on the pool of host threads, on several streams and from
   # several host threads, at VGPU_THREADS=1, 2, 7 and the default, on SASS and PTX:
@@ -2824,6 +2833,17 @@ set_tests_properties(e2e_sass_fastpath PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
+
+# The pre-decoded execution tier (src/sass/tier.hpp) against the interpreter: a program of random arithmetic-breaking
+# inputs through every form the tier handles, and the other SASS test programs, run with VGPU_TIER=0 and 1; the answers
+# and every counter must be the same.
+add_test(NAME e2e_sass_tier
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_tier.sh)
+set_tests_properties(e2e_sass_tier PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 900)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
