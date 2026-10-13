@@ -2081,7 +2081,7 @@ if(TARGET vgpucublas)
   # cuBLAS's factorizations and batched solves (torch.linalg).
   foreach(_check IN ITEMS "fft_layouts:cufft" "fft_callbacks:cufft" "solver_paths:cusolver:cublas"
                           "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse"
-                          "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "sparse_paths:cusparse" "sparse_host_products:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
                           "lt_paths:cublasLt" "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
                           "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
