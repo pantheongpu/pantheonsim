@@ -10,6 +10,12 @@
 set -euo pipefail
 venv=$1
 vllm_version=0.30.0+rocm723
+# wheels.vllm.ai/rocm/ is a rolling index that lists only the newest vLLM build
+# (0.31.0 since 2026-10-03), so a pin to 0.30.0 there fails with "no version of
+# vllm==0.30.0+rocm723". The per-release index below keeps 0.30.0 and the torch,
+# triton, amdsmi and aiter wheels built with it, so the nightly stays reproducible.
+# To move to a newer vLLM, change both lines together (ROCm 7.2.3 is rocm723).
+vllm_index=https://wheels.vllm.ai/rocm/0.30.0/rocm723/
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends wget gnupg ca-certificates python3-venv libopenmpi3t64 \
@@ -26,4 +32,4 @@ ls -d /opt/rocm-7.2.3/lib >/dev/null
 python3 -m venv "$venv"
 "$venv/bin/pip" install -q uv
 "$venv/bin/uv" pip install -q --python "$venv/bin/python" --index-strategy unsafe-best-match \
-  "vllm==$vllm_version" --extra-index-url https://wheels.vllm.ai/rocm/
+  "vllm==$vllm_version" --extra-index-url "$vllm_index"
