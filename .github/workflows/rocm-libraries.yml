@@ -63,7 +63,7 @@ jobs:
       - name: Build the HIP shim
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target vgpuhip vgpu_cli
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip vgpu_cli
 
       - name: PyTorch on every simulated AMD GPU, and rocBLAS, hipSPARSELt, hipFFT, hipRAND, hipSOLVER and hipSPARSE
         # The libraries from the wheel, as nothing of ROCm is installed. A test
@@ -102,7 +102,7 @@ jobs:
       - name: Build the HIP shim
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target vgpuhip
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip
 
       - name: OpenMP target offloading
         # A skip fails the job: an LLVM that did not unpack is a red job.

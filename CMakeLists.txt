@@ -2977,6 +2977,11 @@ add_test(NAME lint_no_proprietary_nvidia COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/
 add_test(NAME lint_cudnn_header_fetch COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_cudnn_header_fetch.sh)
 set_tests_properties(lint_cudnn_header_fetch PROPERTIES TIMEOUT 300)
 
+# ci/jobs.sh sizes CI's parallelism to the memory a machine has and refuses a heavy
+# job that cannot fit; synthetic meminfo and cgroup files stand in for the machine.
+add_test(NAME lint_ci_jobs COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_ci_jobs.sh)
+set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
+
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
 if(TARGET vgpucudart)

@@ -45,6 +45,8 @@ check "--print-env shows what would be set" "VGPU_RACE=1" -- \
 # RPATH to NVIDIA's -- gets every CUDA library the shim carries preloaded.
 pre_env="$("$vgpu" run --gpu nvidia/a10 --preload --print-env /bin/true 2>&1)"
 check "--preload of a program naming no CUDA library preloads the driver" "/libcuda.so.1" -- echo "$pre_env"
+# The help names the tag that needs --preload: only the older DT_RPATH outranks LD_LIBRARY_PATH, not DT_RUNPATH.
+check "--help says --preload is for a DT_RPATH" "carries a DT_RPATH" -- "$vgpu" run --help
 check "... and the runtime" "/libcudart.so." -- echo "$pre_env"
 if [[ -e "$build/shim/libcudnn.so.9" ]]; then
   check "... and cuDNN" "/libcudnn.so.9" -- echo "$pre_env"
@@ -145,6 +147,14 @@ CU
       echo "PASS a DT_RPATH that shadows the shim is caught"
     else
       echo "FAIL DT_RPATH not caught: $out"
+      fails=$((fails + 1))
+    fi
+    # --print-env, which runs nothing, gives the same advice and names the same tag.
+    out="$("$vgpu" run --gpu nvidia/a10 --print-env "$work/rpath" 2>&1)"
+    if [[ "$out" == *"the program has a DT_RPATH; --preload may be required"* ]]; then
+      echo "PASS --print-env advises --preload for a DT_RPATH"
+    else
+      echo "FAIL --print-env gave no DT_RPATH advice: $out"
       fails=$((fails + 1))
     fi
     # And --preload gets past it, which is the advice the warning gives.

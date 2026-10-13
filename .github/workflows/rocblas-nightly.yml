@@ -82,7 +82,7 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build \
             libopenblas0-pthread libgfortran5 libnuma1 libdrm2 libdrm-amdgpu1 libelf1
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target vgpuhip
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip
       - name: Unpack rocBLAS and hipBLASLt
         run: amd/tests/rocblas/nightly/fetch-rocm.sh "$HOME/rocm" run
       - name: Run the shards
