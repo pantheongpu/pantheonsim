@@ -2062,7 +2062,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   // made in, and `v` reads whichever applies.
   const bool offsets_differ = d.fetch_offset[0] != f.offset[0] || d.fetch_offset[1] != f.offset[1] ||
                               d.fetch_offset[2] != f.offset[2];
-  const bool changes = offsets_differ || indexed || cube || d.mip_levels;
+  const bool changes = !g_fast_path.load(std::memory_order_relaxed) || offsets_differ || indexed || cube || d.mip_levels;
   TextureDesc local;
   if (changes) {
     local = d;

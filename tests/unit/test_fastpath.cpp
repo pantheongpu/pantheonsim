@@ -670,6 +670,11 @@ VTEST(refused_accesses_give_the_same_error) {
       // a vector access that is not aligned to its width
       "    shl.b32 %r3, %r1, 4;\n    add.u32 %r3, %r3, %r2;\n    ld.shared.v4.u32 {%r4, %r5, %r6, %r7}, [%r3+4];\n",
       "    shl.b32 %r3, %r1, 4;\n    add.u32 %r3, %r3, %r2;\n    st.shared.v2.u32 [%r3+4], {%r1, %r1};\n",
+      // in-bounds but misaligned: a vector at +4, a word at +2 (the whole warp alike, so no lane runs past the end)
+      "    ld.shared.v4.u32 {%r4, %r5, %r6, %r7}, [%r2+4];\n",
+      "    st.shared.v2.u32 [%r2+4], {%r1, %r1};\n",
+      "    ld.shared.u32 %r4, [%r2+2];\n",
+      "    mov.u64 %rd2, loc;\n    ld.local.v2.u32 {%r4, %r5}, [%rd2+4];\n",
       // a store through an address in no allocation
       "    mov.u64 %rd2, 16;\n    st.global.u32 [%rd2], %r1;\n",
       // .local accesses past the frame, in the last lane only, and a misaligned vector
@@ -803,6 +808,7 @@ DONE:
     call.uni (retval0), fibf, (param0);
     ld.param.b32 %r3, [retval0+0];
     }
+    add.s32 %r3, %r3, 100000;
     mov.u32 %r4, 0;
 LOOP:
     {
@@ -850,7 +856,7 @@ LOOP:
     std::vector<int32_t> got(100);
     mem.read(po, got.data(), 400);
     for (int t = 0; t < 100; ++t) {
-      int32_t acc = fib(t % 12);
+      int32_t acc = fib(t % 12) + 100000;
       for (int i = 0; i < 5; ++i) {
         const int32_t r = acc * 3 + i;
         acc = r + ((i * (r & 3)) + 7);
@@ -967,12 +973,18 @@ VTEST(linear_texture_fetches_match_the_general_path) {
     }
     auto run = [&](const char* fp) {
       set_mode(fp);
+      uint64_t k = 12345;   // the same offsets in both modes
       std::vector<uint32_t> out;
       for (size_t i = 0; i < coords.size(); i += 2) {
         exec::TexFetch f;
         f.dims = c.h > 1 ? 2 : 1;
         f.coord[0] = coords[i];
         f.coord[1] = coords[i + 1];
+        if ((i / 2) % 3 == 1) {   // every third fetch carries an offset operand
+          k = k * 6364136223846793005ull + 1442695040888963407ull;
+          f.offset[0] = static_cast<int32_t>((k >> 33) % 16) - 8;
+          f.offset[1] = c.h > 1 ? static_cast<int32_t>((k >> 40) % 16) - 8 : 0;
+        }
         uint32_t r[4] = {0, 0, 0, 0};
         exec::texture_fetch(mem, d, f, r);
         out.insert(out.end(), r, r + 4);
