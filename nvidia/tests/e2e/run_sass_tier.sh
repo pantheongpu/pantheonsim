@@ -12,7 +12,7 @@
 # VGPU_TIER_MIN_PERCENT (default 30) percent of sass_tier's warp instructions.
 #
 # VGPU_TIER_OTHER_ARCHS=1 builds the other programs for every architecture too (a soak).
-# VGPU_TIER_ARCHS narrows the architectures (default sm_75 sm_80 sm_86 sm_90), VGPU_TIER_PROGRAMS the other programs
+# VGPU_TIER_ARCHS narrows the architectures (default sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120; an nvcc that cannot target one skips it), VGPU_TIER_PROGRAMS the other programs
 # (name:first architecture), VGPU_TIER_JOBS caps the builds run at once.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -28,8 +28,9 @@ nvcc_host_compiler_fix
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-tier.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4 [sm_90]=nvidia/h100)
-archs=(${VGPU_TIER_ARCHS:-sm_75 sm_80 sm_86 sm_90})
+declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4 [sm_90]=nvidia/h100
+                [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
+archs=(${VGPU_TIER_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120})
 # program:first architecture[:last]; each runs on one architecture except sass_tier, which runs on every one.
 others=(${VGPU_TIER_PROGRAMS:-sass_fastpath:75 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
         symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75 texture_layers:75 texture_forms:75
@@ -88,6 +89,10 @@ check() {
   [[ $ra == 0 ]] || why="${why:+$why; }the run failed (exit $ra)"
   [[ "$a" == "$bq" ]] || why="${why:+$why; }the interpreter and the tier print differently"
   if [[ $p == sass_tier ]]; then
+    # The tier is shared by the host threads of a launch: four of them must give what one thread of the interpreter does.
+    local c4
+    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1 | grep -v '^tier')"
+    [[ "$a" == "$c4" ]] || why="${why:+$why; }four threads with the tier print differently from the interpreter's one"
     local ran total
     ran="$(sed -n 's/^tier: \([0-9]*\) of \([0-9]*\) warp.*/\1/p' <<< "$stats")"
     total="$(sed -n 's/^tier: \([0-9]*\) of \([0-9]*\) warp.*/\2/p' <<< "$stats")"

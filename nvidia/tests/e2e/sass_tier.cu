@@ -214,7 +214,7 @@ __global__ void k_const(const u32* A, u32* out, int n, u32 p0, u32 p1, u32 p2) {
 }
 
 // Generic loads and stores, and atomics, left to the interpreter.
-__global__ void k_generic(u32* g, const u32* A, int n) {
+__global__ void k_generic(u32* g, u32* cnt, const u32* A, int n) {
   __shared__ u32 s[256];
   int t = threadIdx.x;
   s[t] = A[blockIdx.x * blockDim.x + t];
@@ -222,7 +222,7 @@ __global__ void k_generic(u32* g, const u32* A, int n) {
   u32* p = (t & 1) ? &s[(t * 7) & 255] : &g[blockIdx.x * blockDim.x + t];
   u32 v = *p;
   *p = v * 3u + t;
-  atomicAdd(&g[(t + blockIdx.x) & 63], v | 1u);
+  atomicAdd(&cnt[(t + blockIdx.x) & 63], v | 1u);   // commutative: the same sum in any order
   g[blockIdx.x * blockDim.x + t] ^= __shfl_xor_sync(0xffffffffu, v, 3) + __popc(__ballot_sync(0xffffffffu, v & 4));
 }
 
@@ -465,12 +465,14 @@ int main() {
     CK(cudaFree(out));
   }
   {
-    u32* g;
+    u32 *g, *cnt;
     CK(cudaMalloc(&g, 1024 * 4));
+    CK(cudaMalloc(&cnt, 64 * 4));
     CK(cudaMemset(g, 1, 1024 * 4));
-    k_generic<<<4, 256>>>(g, da, n);
-    if (report("generic", g, 1024)) return 1;
-    CK(cudaFree(g));
+    CK(cudaMemset(cnt, 0, 64 * 4));
+    k_generic<<<4, 256>>>(g, cnt, da, n);
+    if (report("generic", g, 1024) || report("generic atomics", cnt, 64)) return 1;
+    CK(cudaFree(g)); CK(cudaFree(cnt));
   }
   CK(cudaFree(da)); CK(cudaFree(db)); CK(cudaFree(dc));
   std::printf("done\n");
