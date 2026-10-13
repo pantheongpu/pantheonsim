@@ -21,7 +21,9 @@
 #include <emmintrin.h>
 #endif
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <utility>
 #include <bit>
 #include <cfenv>
 #include <cmath>

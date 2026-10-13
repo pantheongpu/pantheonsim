@@ -150,7 +150,19 @@ TIER_HANDLER(h_lop3) {
   alignas(32) uint32_t t[3][32], r[32];
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
-  c.sk->lop3(r, a, b, d, op.a);
+  switch (op.a) {   // the tables compiled code uses most, as the plain expressions they are
+    case 0xc0: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] & b[l]; break;
+    case 0xfc: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] | b[l]; break;
+    case 0x3c: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] ^ b[l]; break;
+    case 0x96: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] ^ b[l] ^ d[l]; break;
+    case 0x80: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] & b[l] & d[l]; break;
+    case 0xfe: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] | b[l] | d[l]; break;
+    case 0x33: for (unsigned l = 0; l < 32; ++l) r[l] = ~b[l]; break;
+    case 0x0f: for (unsigned l = 0; l < 32; ++l) r[l] = ~a[l]; break;
+    case 0x30: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] & ~b[l]; break;
+    case 0x0c: for (unsigned l = 0; l < 32; ++l) r[l] = ~a[l] & b[l]; break;
+    default: c.sk->lop3(r, a, b, d, op.a);
+  }
   if (op.aux & 1) {
     Mask pm = 0;
     for (unsigned l = 0; l < 32; ++l)
@@ -188,25 +200,39 @@ TIER_HANDLER(h_lea) {
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
 
+// A funnel shift of (top:lo) by n, as the interpreter computes it, one loop for each way the instruction can be set:
+// right or left, arithmetic or logical, the high or the low word of the result, a count taken modulo the width or clamped
+// to it, over 32 or 64 bits (W). The same operations lane by lane; only what is decided once per instruction is out of the loop.
+template <bool Right, bool Sgn, bool Hi, bool Wrap, unsigned W>
+static void shf_rows(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top) {
+  for (unsigned l = 0; l < 32; ++l) {
+    const uint64_t v = lo[l] | (static_cast<uint64_t>(top[l]) << 32);
+    const uint32_t k = Wrap ? (n[l] & (W - 1)) : std::min(n[l], W);
+    uint64_t x;
+    if constexpr (!Right) x = k >= 64 ? 0 : v << k;
+    else if constexpr (Sgn) x = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(k, 63u));
+    else x = k >= 64 ? 0 : v >> k;
+    r[l] = static_cast<uint32_t>(Hi ? x >> 32 : x);
+  }
+}
+using ShfRows = void (*)(uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*);
+template <unsigned I>
+constexpr ShfRows shf_pick() {
+  return &shf_rows<(I & 16) != 0, (I & 8) != 0, (I & 4) != 0, (I & 2) != 0, (I & 1) ? 64u : 32u>;
+}
+template <unsigned... I>
+constexpr std::array<ShfRows, sizeof...(I)> shf_table(std::integer_sequence<unsigned, I...>) {
+  return {shf_pick<I>()...};
+}
+constexpr std::array<ShfRows, 32> kShf = shf_table(std::make_integer_sequence<unsigned, 32>{});
+
 TIER_HANDLER(h_shf) {
   TIER_PRELUDE
   alignas(32) uint32_t t[3][32], r[32];
-  const unsigned type = op.a;   // 0 S64, 1 U64, 2 S32, 3 U32
-  const bool wrap = op.aux & 1, right = op.aux & 2, hi = op.aux & 4;
-  const bool is64 = type < 2, sgn = type == 0 || type == 2;
-  const uint32_t width = is64 ? 64 : 32;
   const uint32_t* lo = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* n = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t* top = tier_src<false>(c, op.s[2], t[2]);
-  for (unsigned l = 0; l < 32; ++l) {
-    const uint64_t v = lo[l] | (static_cast<uint64_t>(top[l]) << 32);
-    const uint32_t k = wrap ? n[l] % width : std::min(n[l], width);
-    uint64_t x;
-    if (!right) x = k >= 64 ? 0 : v << k;
-    else if (sgn) x = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(k, 63u));
-    else x = k >= 64 ? 0 : v >> k;
-    r[l] = static_cast<uint32_t>(hi ? x >> 32 : x);
-  }
+  kShf[op.b](r, lo, n, top);
   tier_store(c, op.dst, ex, r);
 }
 
