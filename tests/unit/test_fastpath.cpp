@@ -1205,8 +1205,10 @@ VTEST(special_registers_read_what_the_launch_geometry_says) {
 )";
   const uint32_t blocks[][3] = {{5, 3, 7}, {33, 2, 1}, {64, 1, 1}, {7, 1, 9}};
   const uint32_t grids[][3] = {{3, 2, 2}, {1, 1, 1}, {4, 1, 1}};
+  for (const char* fp : {"1", "0"})   // the pre-decoded form and the general path
   for (const auto& b : blocks)
     for (const auto& g : grids) {
+      setenv("VGPU_FASTPATH", fp, 1);
       MemoryManager mem{1 << 22};
       DeviceProfile prof = load_gpu("nvidia/a10");
       auto m = ptx::parse(ptx);
@@ -1224,6 +1226,7 @@ VTEST(special_registers_read_what_the_launch_geometry_says) {
                                    blk % g[0], blk / g[0] % g[1], blk / (g[0] * g[1]), g[0], g[1], g[2], t % 32};
         for (int k = 0; k < 13; ++k) VCHECK_EQ(got[lin * 13 + k], want[k]);
       }
+      unsetenv("VGPU_FASTPATH");
     }
 }
 
