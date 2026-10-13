@@ -15,6 +15,7 @@
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "tier.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -204,6 +205,8 @@ std::mutex& atomic_lock(uint64_t addr) {
   return locks[(addr >> 3) % 64];
 }
 
+void tier_add_total(uint64_t n);   // tier_ops.inc
+
 class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
@@ -259,6 +262,12 @@ class Runner {
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
     if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
+    if (tier::requested()) {
+      const char* tr = std::getenv("VGPU_SASS_TRACE");
+      tier_ = fast_ && simd::enabled() && !(tr && *tr);
+      const char* ts = std::getenv("VGPU_TIER_STATS");
+      tier_stats_ = tier_ && ts && ts[0] == '1';
+    }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -293,6 +302,7 @@ class Runner {
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
+  bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
   bool fast_alu(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc
@@ -379,6 +389,10 @@ class Runner {
   MemoryManager& mem_;
   const DeviceProfile& profile_;
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
+  // The pre-decoded tier (src/sass/tier.hpp): VGPU_TIER=1, with the fast paths and the SIMD kernels it is held to on and
+  // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
+  bool tier_ = false;
+  bool tier_stats_ = false;
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
@@ -971,6 +985,7 @@ exec::LaunchStats Runner::run() {
   }
   if (failure) std::rethrow_exception(failure);
   stats_.blocks = blocks;
+  if (tier_stats_) tier_add_total(stats_.instructions);
   return stats_;
 }
 
@@ -1319,6 +1334,9 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   uint64_t pc = pick;
   const Code* code = nullptr;
   const Instr* ins = &fetch(pc, &code);
+  if (tier_ && !w.mactive_force) [[unlikely]] {
+    if (const tier::Program* tp = code->tier_program()) return tier_run(blk, w, group, pick, *code, *tp);
+  }
   const uint64_t end = code->base + 16 * code->count;
   for (unsigned n = 0;; ++n) {
     if (++w.steps > cfg_.max_steps)
@@ -1378,8 +1396,34 @@ Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
 }
 
 #include "exec_ops.inc"
+#include "tier_ops.inc"
 
 }  // namespace
+
+// The tier of a code section: its instructions analysed once (tier.cpp), each bound to its handler (tier_ops.inc).
+const tier::Program* Code::tier_program() const {
+  Decoded& d = *decoded_;
+  if (const tier::Program* p = d.tier.load(std::memory_order_acquire)) return p;
+  std::call_once(d.tier_once, [&] {
+    if (count == 0) return;
+    (void)instr(0);   // decode the section if nobody has yet
+    auto prog = std::make_shared<tier::Program>();
+    prog->ops.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+      tier::MOp& op = prog->ops[i];
+      tier::analyze(instr(i), sm, *prog, op);
+      op.fn = tier_handler_for(op.form);
+      if (op.fn) {
+        ++prog->native;
+        prog->max_reg = std::max(prog->max_reg, op.maxreg);
+      }
+    }
+    prog->const_index.clear();
+    d.tier_owner = prog;
+    d.tier.store(prog.get(), std::memory_order_release);
+  });
+  return d.tier.load(std::memory_order_acquire);
+}
 
 // For sass::unsupported (module.cpp).
 bool runs_instr(const Instr& ins) { return executes(ins); }

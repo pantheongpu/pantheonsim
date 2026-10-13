@@ -193,6 +193,7 @@ add_library(vgpu STATIC
   src/sass/cubin.cpp
   src/sass/module.cpp
   src/sass/exec.cpp
+  src/sass/tier.cpp
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
