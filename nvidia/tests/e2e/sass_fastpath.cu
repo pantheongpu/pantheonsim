@@ -358,6 +358,62 @@ __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
   for (int k = 0; k < kFloatForms; ++k) out[static_cast<size_t>(i) * kFloatForms + k] = o[k];
 }
 
+
+// Packed halves (HADD2, HMUL2, HFMA2 with swizzled, negated and immediate operands), the byte permutes in every mode (PRMT), and
+// double arithmetic under every rounding mode (DADD, DMUL, DFMA with .RM, .RP, .RZ). Only the two runs' agreement is checked
+// here (the kernels have host references in tests/unit/test_simd.cpp).
+#include <cuda_fp16.h>
+constexpr int kHalfForms = 24;
+__global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* din, uint64_t* dout, int n, int shape) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const uint32_t x = in[i], y = in[(i + 3) % n], z = in[(i + 11) % n];
+  uint32_t o[kHalfForms] = {};
+  const bool take = shape == 0 ? true : shape == 1 ? (y & 3) != 0 : (i & 2) == 0;
+  uint64_t d[8] = {};
+  if (take) {
+    const __half2 a = *reinterpret_cast<const __half2*>(&x), b = *reinterpret_cast<const __half2*>(&y), c = *reinterpret_cast<const __half2*>(&z);
+    const auto bits = [](__half2 h) { return *reinterpret_cast<const uint32_t*>(&h); };
+    o[0] = bits(__hfma2(a, b, c));
+    o[1] = bits(__hadd2(a, b));
+    o[2] = bits(__hmul2(a, b));
+    o[3] = bits(__hfma2(__hneg2(a), b, __habs2(c)));
+    o[4] = bits(__hfma2(__low2half2(a), b, c));
+    o[5] = bits(__hfma2(a, __high2half2(b), __low2half2(c)));
+    o[6] = bits(__hfma2(a, __float2half2_rn(2.0f), c));
+    o[7] = bits(__hfma2(a, b, __halves2half2(__float2half(1.5f), __float2half(-0.25f))));
+    o[8] = bits(__hmul2(a, __halves2half2(__float2half(3.0f), __float2half(0.125f))));
+    o[9] = bits(__hadd2(__high2half2(a), __habs2(b)));
+    o[10] = bits(__hfma2(__halves2half2(__high2half(a), __low2half(a)), b, c));
+    // PRMT in each mode.
+    o[11] = __byte_perm(x, y, z);
+    asm("prmt.b32.f4e %0, %1, %2, %3;" : "=r"(o[12]) : "r"(x), "r"(y), "r"(z));
+    asm("prmt.b32.b4e %0, %1, %2, %3;" : "=r"(o[13]) : "r"(x), "r"(y), "r"(z));
+    asm("prmt.b32.rc8 %0, %1, %2, %3;" : "=r"(o[14]) : "r"(x), "r"(y), "r"(z));
+    asm("prmt.b32.ecl %0, %1, %2, %3;" : "=r"(o[15]) : "r"(x), "r"(y), "r"(z));
+    asm("prmt.b32.ecr %0, %1, %2, %3;" : "=r"(o[16]) : "r"(x), "r"(y), "r"(z));
+    asm("prmt.b32.rc16 %0, %1, %2, %3;" : "=r"(o[17]) : "r"(x), "r"(y), "r"(z));
+    o[18] = __byte_perm(x, 0x01020304u, 0x7531u);
+    o[19] = __byte_perm(x, y, 0x8888u ^ (z & 0x7777u));
+    // The 32-bit multiply-add with carries.
+    const unsigned long long wide = (static_cast<unsigned long long>(x) << 32 | y) * 0x9E3779B1ull + z;
+    o[20] = static_cast<uint32_t>(wide >> 32) ^ static_cast<uint32_t>(wide);
+    o[21] = x * y + z + (x < y);
+    const double p = __longlong_as_double(static_cast<long long>(din[i])), q = __longlong_as_double(static_cast<long long>(din[(i + 1) % n]));
+    const double r = __longlong_as_double(static_cast<long long>(din[(i + 5) % n]));
+    d[0] = static_cast<uint64_t>(__double_as_longlong(__dadd_rd(p, q)));
+    d[1] = static_cast<uint64_t>(__double_as_longlong(__dadd_ru(p, -q)));
+    d[2] = static_cast<uint64_t>(__double_as_longlong(__dmul_rz(p, q)));
+    d[3] = static_cast<uint64_t>(__double_as_longlong(__dmul_rd(-p, fabs(q))));
+    d[4] = static_cast<uint64_t>(__double_as_longlong(__fma_rz(p, q, r)));
+    d[5] = static_cast<uint64_t>(__double_as_longlong(__fma_ru(p, q, -r)));
+    d[6] = static_cast<uint64_t>(__double_as_longlong(__fma_rd(p, q, r)));
+    d[7] = static_cast<uint64_t>(__double_as_longlong(__fma_rn(p, q, r)));
+  }
+  for (int k = 0; k < kHalfForms; ++k) out[static_cast<size_t>(i) * kHalfForms + k] = o[k];
+  for (int k = 0; k < 8; ++k) dout[static_cast<size_t>(i) * 8 + k] = d[k];
+}
+
 template <class T>
 static bool same(const std::vector<T>& a, const std::vector<T>& b, const char* what) {
   if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0) return true;
@@ -820,6 +876,41 @@ int main(int argc, char** argv) {
       std::printf("float_forms shape=%d bits %016llx\n", shape, static_cast<unsigned long long>(hh));
     }
     CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+
+  {
+    // half_forms over random words, special halves and special doubles.
+    const int n = 32 * 9 + 5;
+    std::vector<uint32_t> h(n);
+    std::vector<uint64_t> hd(n);
+    uint64_t s = 0x1234567887654321ull;
+    const uint16_t halves[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0xfe00, 0x7c01, 0x4000, 0x3555, 0x5640};
+    const uint64_t dbl[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x0000000000000001ull, 0x000fffffffffffffull, 0x0010000000000000ull,
+                            0x3ff0000000000000ull, 0xbff0000000000000ull, 0x3ff0000000000001ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
+                            0xfff0000000000000ull, 0x7ff8000000000000ull, 0x4000000000000000ull, 0x3fb999999999999aull, 0x3ca0000000000000ull};
+    for (int i = 0; i < n; ++i) {
+      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+      h[i] = i % 3 == 0 ? static_cast<uint32_t>(s) : static_cast<uint32_t>(halves[s % 18]) | static_cast<uint32_t>(halves[(s >> 8) % 18]) << 16;
+      hd[i] = i % 3 == 0 ? s : dbl[s % 15];
+    }
+    uint32_t *din, *dout; uint64_t *ddin, *ddout;
+    CK(cudaMalloc(&din, n * 4)); CK(cudaMalloc(&dout, static_cast<size_t>(n) * kHalfForms * 4));
+    CK(cudaMalloc(&ddin, n * 8)); CK(cudaMalloc(&ddout, static_cast<size_t>(n) * 8 * 8));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(ddin, hd.data(), n * 8, cudaMemcpyHostToDevice));
+    for (int shape = 0; shape < 3; ++shape) {
+      half_forms<<<(n + 63) / 64, 64>>>(din, dout, ddin, ddout, n, shape);
+      CK(cudaDeviceSynchronize());
+      std::vector<uint32_t> got(static_cast<size_t>(n) * kHalfForms);
+      std::vector<uint64_t> gotd(static_cast<size_t>(n) * 8);
+      CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(gotd.data(), ddout, gotd.size() * 8, cudaMemcpyDeviceToHost));
+      uint64_t hh = 1469598103934665603ull;
+      for (uint32_t v : got) hh = (hh ^ v) * 1099511628211ull;
+      for (uint64_t v : gotd) hh = (hh ^ v) * 1099511628211ull;
+      std::printf("half_forms shape=%d bits %016llx\n", shape, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(din)); CK(cudaFree(dout)); CK(cudaFree(ddin)); CK(cudaFree(ddout));
   }
   std::printf("wrong: %d\n", wrong);
   return wrong != 0;

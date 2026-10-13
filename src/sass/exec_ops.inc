@@ -983,6 +983,24 @@ uint16_t f64_to_bf16(double d) {
 
 // ---- fast paths -----------------------------------------------------------------
 //
+namespace {
+// The host's rounding mode set to SASS's (0 RN, 1 RM, 2 RP, 3 RZ) for the life of the object: for a kernel's arithmetic, once for the 32
+// lanes (the kernel is called through a pointer, so the compiler keeps its arithmetic between the constructor and the destructor).
+struct RoundingScope {
+  int saved;
+  explicit RoundingScope(unsigned rnd) : saved(std::fegetround()) {
+    static const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+    std::fesetround(modes[rnd & 3]);
+    asm volatile("" ::: "memory");
+  }
+  ~RoundingScope() {
+    asm volatile("" ::: "memory");
+    std::fesetround(saved);
+  }
+};
+
+}  // namespace
+
 // The instructions compiled kernels spend their time in -- IADD3, IMAD, LOP3,
 // MOV and the f32 FFMA/FADD/FMUL -- in their plain forms: register, RZ,
 // immediate or constant sources, a register destination, no carries, no
@@ -998,7 +1016,9 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
     case Op::DADD: case Op::DMUL: case Op::DFMA: break;
     case Op::PLOP3: case Op::SEL: case Op::POPC: case Op::BREV: case Op::FLO: return fast_wide(w, ins, ex);
-    case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: return fast_float(w, ins, ex);
+    case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: case Op::HADD2: case Op::HMUL2: case Op::HFMA2:
+      return fast_float(w, ins, ex);
+    case Op::PRMT: return fast_wide(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1088,7 +1108,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     // which NaN a NaN operand gives. VGPU_SIMD=off sends them down exec_float's lane loop instead.
     if (!simd::enabled()) return false;
     const unsigned nsrc = ins.op == Op::DFMA ? 3 : 2;
-    if (ins.f[0] || ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return false;
+    if (ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return false;
     for (unsigned i = 0; i < nsrc; ++i) {
       const Kind k = ins.src[i].kind;
       if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
@@ -1123,8 +1143,14 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     uint32_t sink[32];   // R254's partner is RZ: its half of the result goes nowhere
     uint32_t* dlo = &w.reg(d.reg, 0);
     uint32_t* dhi = d.reg + 1 == kRZ ? sink : &w.reg(d.reg + 1, 0);
-    simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1],
-                          lo[2], hi[2], ex);
+    if (ins.f[0]) {   // a directed rounding mode: the host's, around the call (the NaN rule is the same)
+      RoundingScope scope(ins.f[0]);
+      simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1],
+                            lo[2], hi[2], ex);
+    } else {
+      simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1],
+                            lo[2], hi[2], ex);
+    }
     return true;
   }
   if (ins.dst[0].kind != Kind::Reg && !(ins.op == Op::LOP3 && ins.dst.size() == 2)) return false;
@@ -1211,7 +1237,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::IMAD: {
       const unsigned kind = ins.f[0];
       if (kind == 0x25 || kind == 0x27) return fast_wide(w, ins, ex);   // IMAD.WIDE, IMAD.HI
-      if (ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3) return false;
+      if (ins.f[2] || ins.dst.size() > 1) return fast_wide(w, ins, ex);   // .X, a carry out
+      if (ins.src.size() < 3) return false;
       // IMAD.MOV (RZ * RZ + c) and the like: a zero factor leaves the addend.
       const auto zero = [](const Operand& o) {
         return !o.bnot && ((o.kind == Kind::Reg && o.reg == kRZ) || (o.kind == Kind::Imm && o.imm == 0));
@@ -1449,6 +1476,24 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
     }
+    case Op::PRMT: {
+      // Byte permute: Rd = bytes of (Rc : Ra) picked by the nibbles of Rb. The default mode is a SIMD kernel, the other modes the
+      // executor's rule lane by lane (without the operand reads of the general path).
+      if (!sk || ins.src.size() < 3 || ins.dst.size() != 1 || ins.dst[0].kind != Kind::Reg || !plain(ins.src[0]) ||
+          !plain(ins.src[1]) || !plain(ins.src[2]))
+        return false;
+      const uint32_t* a = lanes(0, ins.src[0], false);
+      const uint32_t* sel = lanes(1, ins.src[1], false);
+      const uint32_t* b = lanes(2, ins.src[2], false);
+      alignas(32) uint32_t r[32];
+      if (ins.f[0] == 0) {
+        sk->prmt0(r, a, b, sel);
+      } else {
+        for (unsigned l = 0; l < 32; ++l) r[l] = prmt(a[l], b[l], sel[l], ins.f[0]);
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
     case Op::POPC: case Op::BREV: case Op::FLO: {
       // The population count, the bit reversal, the index of the highest set bit: POPC and FLO take their operand as ival
       // gives it (negated or complemented), BREV as it is.
@@ -1551,9 +1596,25 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
       // register pair as it is, or the same for every lane.
       const unsigned kind = ins.f[0];
       const bool sgn = ins.f[1], x = ins.f[2];
-      if (!sk || (kind != 0x25 && kind != 0x27) || ins.dst.size() > 2 || ins.dst[0].kind != Kind::Reg ||
-          ins.src.size() < (x ? 4u : 3u))
-        return false;
+      if (!sk || ins.dst.size() > 2 || ins.dst[0].kind != Kind::Reg || ins.src.size() < (x ? 4u : 3u)) return false;
+      if (kind != 0x25 && kind != 0x27) {
+        // IMAD[.X]: a * b + c (+ a carry in) in 32 bits, the carry out of the 33-bit sum in dst[1]: the low product, then the three-way add.
+        if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::Pred) return false;
+        if (x && !is_pred(ins.src[3])) return false;
+        for (int i = 0; i < 3; ++i)
+          if (!plain(ins.src[i])) return false;
+        const uint32_t* ia = lanes(0, ins.src[0]);
+        const uint32_t* ib = lanes(1, ins.src[1]);
+        const uint32_t* ic = lanes(2, ins.src[2]);
+        alignas(32) uint32_t prod[32], r[32];
+        sk->imad(prod, ia, ib, kZeros32.data());
+        uint32_t ge1, ge2;
+        sk->iadd3x(r, prod, ic, kZeros32.data(), 0, x ? static_cast<uint32_t>(pmask(ins.src[3])) : 0u, 0, &ge1, &ge2);
+        if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+        if (ins.dst.size() == 2) setp(ins.dst[1], ge1);
+        return true;
+      }
+      if (kind != 0x25 && kind != 0x27) return false;
       if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::Pred) return false;
       if (x && !is_pred(ins.src[3])) return false;
       for (int i = 0; i < 3; ++i)
@@ -1650,20 +1711,6 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
       if ((ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc || ins.dst[0].kind != Kind::Reg) return false;
       const unsigned flags = (ins.f[1] ? 1u : 0u) | (ins.f[2] ? 2u : 0u);
-      // A directed rounding mode (RM, RP, RZ) is the host's own for the kernel's arithmetic: set around the call, once for the 32
-      // lanes (the kernel is called through a pointer, so the compiler keeps its arithmetic between the two).
-      struct RoundingScope {
-        int saved;
-        explicit RoundingScope(unsigned rnd) : saved(std::fegetround()) {
-          static const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
-          std::fesetround(modes[rnd & 3]);
-          asm volatile("" ::: "memory");
-        }
-        ~RoundingScope() {
-          asm volatile("" ::: "memory");
-          std::fesetround(saved);
-        }
-      };
       const uint32_t* s[3];
       for (unsigned i = 0; i < nsrc; ++i) {
         if (!plain(ins.src[i]) || ins.src[i].bnot) return false;
@@ -1736,6 +1783,76 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
         }
       }
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::HADD2: case Op::HMUL2: case Op::HFMA2: {
+      // Packed f16 arithmetic: each half the fused multiply-add of its three inputs in double, rounded once to f16 (the PTX engine's
+      // rule, and the SIMD kernel hfma2_m's). A sum is a * 1 + b and a product a * b + (-0), both exactly the same in double. The
+      // sources as the general rule reads them: a register's halves (swapped or copied by .H0_H0 / .H1_H1, |.| and - on both), a
+      // value the same for every lane, a split immediate (one half for both lanes), or a pair of immediates for b or c.
+      const bool bf = ins.f[0], f32out = ins.f[1], st = ins.f[3];
+      const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
+      if (bf || f32out || st || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
+      alignas(32) uint32_t pk[3][32];
+      bool ok = true;
+      const auto packed = [&](unsigned slot, const Operand& o) -> const uint32_t* {
+        uint32_t* out = pk[slot];
+        if (o.kind == Kind::FImm) {   // (the general rule ignores |.| and - on an immediate)
+          const uint32_t v = (o.fbits & 0xffffu) * 0x10001u;
+          for (unsigned l = 0; l < 32; ++l) out[l] = v;
+          return out;
+        }
+        if (!plain(o) || o.kind == Kind::Imm || o.suffix == ".F32") {
+          ok = false;
+          return out;
+        }
+        const bool reg = o.kind == Kind::Reg && o.reg != kRZ;
+        const uint32_t* row = reg ? &w.reg(o.reg, 0) : nullptr;
+        const uint32_t one = reg || o.kind == Kind::Reg ? 0u : read32(w, o, 0);
+        const int mode = o.suffix == ".H0_H0" ? 1 : o.suffix == ".H1_H1" ? 2 : 0;
+        const uint32_t absm = o.abs ? 0x7fff7fffu : ~0u, negm = o.neg ? 0x80008000u : 0u;
+        for (unsigned l = 0; l < 32; ++l) {
+          uint32_t v = row ? row[l] : one;
+          if (mode == 1) v = (v & 0xffffu) * 0x10001u;
+          else if (mode == 2) v = (v >> 16) * 0x10001u;
+          out[l] = (v & absm) ^ negm;
+        }
+        return out;
+      };
+      const auto splat = [&](unsigned slot, uint32_t v) -> const uint32_t* {
+        for (unsigned l = 0; l < 32; ++l) pk[slot][l] = v;
+        return pk[slot];
+      };
+      const uint32_t* a = packed(0, ins.src[0]);
+      size_t next = 1;
+      const uint32_t* b;
+      if (ins.src.size() > next + 1 && ins.src[next].kind == Kind::FImm && ins.src[next + 1].kind == Kind::FImm) {
+        b = splat(1, (ins.src[next].fbits & 0xffffu) << 16 | (ins.src[next + 1].fbits & 0xffffu));   // the second printed half is the low lane
+        next += 2;
+      } else {
+        b = packed(1, ins.src[next]);
+        next += 1;
+      }
+      const uint32_t* c = nullptr;
+      if (ins.op == Op::HFMA2) {
+        if (ins.src.size() > next + 1 && ins.src[next].kind == Kind::FImm && ins.src[next + 1].kind == Kind::FImm)
+          c = splat(2, (ins.src[next].fbits & 0xffffu) << 16 | (ins.src[next + 1].fbits & 0xffffu));
+        else
+          c = packed(2, ins.src[next]);
+      }
+      if (!ok) return false;
+      if (ins.dst[0].reg == kRZ) return true;   // (nothing to write)
+      uint32_t* const d = &w.reg(ins.dst[0].reg, 0);
+      alignas(32) uint32_t fixed[32];
+      if (ins.op == Op::HADD2) {   // a * 1 + b
+        for (unsigned l = 0; l < 32; ++l) fixed[l] = 0x3c003c00u;
+        sk->hfma2_m(d, a, fixed, b, ex, 32, 2);
+      } else if (ins.op == Op::HMUL2) {   // a * b + (-0)
+        for (unsigned l = 0; l < 32; ++l) fixed[l] = 0x80008000u;
+        sk->hfma2_m(d, a, b, fixed, ex, 32, 2);
+      } else {
+        sk->hfma2_m(d, a, b, c, ex, 32, 2);
+      }
       return true;
     }
     case Op::I2F: case Op::I2FP: {

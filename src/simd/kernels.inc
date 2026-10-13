@@ -1119,6 +1119,46 @@ void fmnmx_k(uint32_t* r, const uint32_t* a, const uint32_t* b, uint32_t min_mas
 #endif
 }
 
+// PRMT in its default mode: lane l's result byte i is byte (n & 7) of the 8 bytes (b : a) -- a's four, then b's four -- for
+// the i-th nibble n of sel; if bit 3 of the nibble is set, that byte's sign bit replicated through the byte instead.
+inline uint32_t sc_prmt0(uint32_t a, uint32_t b, uint32_t sel) {
+  const uint64_t x = (static_cast<uint64_t>(b) << 32) | a;
+  uint32_t r = 0;
+  for (unsigned i = 0; i < 4; ++i) {
+    const unsigned s = (sel >> (4 * i)) & 0xf;
+    uint32_t v = static_cast<uint32_t>((x >> (8 * (s & 7))) & 0xff);
+    if (s & 8) v = (v & 0x80) ? 0xff : 0;
+    r |= v << (8 * i);
+  }
+  return r;
+}
+
+void prmt0_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* sel) {
+#if VGPU_SIMD_AVX2
+  // Per 128-bit half, four lanes' words. The nibbles of each selector spread to four bytes; each byte then picks from its own lane's
+  // word of a or of b (pshufb stays within a 128-bit half, and a lane's words are the same dword in both), and the sign
+  // replication is a signed compare of the picked byte.
+  const __m256i spread = _mm256_setr_epi8(0, 0, 1, 1, 4, 4, 5, 5, 8, 8, 9, 9, 12, 12, 13, 13, 0, 0, 1, 1, 4, 4, 5, 5, 8, 8, 9, 9, 12, 12, 13, 13);
+  const __m256i base = _mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12, 0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12);
+  const __m256i zero = _mm256_setzero_si256();
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+    const __m256i t = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(sel + i)), spread);
+    const __m256i nib = _mm256_or_si256(_mm256_and_si256(t, _mm256_set1_epi32(0x000f000f)),
+                                        _mm256_and_si256(_mm256_srli_epi16(t, 4), _mm256_set1_epi32(0x0f000f00)));
+    const __m256i idx = _mm256_add_epi8(_mm256_and_si256(nib, _mm256_set1_epi8(3)), base);
+    const __m256i from_b = _mm256_cmpeq_epi8(_mm256_and_si256(nib, _mm256_set1_epi8(4)), _mm256_set1_epi8(4));
+    __m256i v = _mm256_blendv_epi8(_mm256_shuffle_epi8(va, idx), _mm256_shuffle_epi8(vb, idx), from_b);
+    const __m256i sign = _mm256_cmpeq_epi8(_mm256_and_si256(nib, _mm256_set1_epi8(8)), _mm256_set1_epi8(8));
+    v = _mm256_blendv_epi8(v, _mm256_cmpgt_epi8(zero, v), sign);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), v);
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = sc_prmt0(a[l], b[l], sel[l]);
+#endif
+}
+
 #if VGPU_SIMD_AVX2
 // Four doubles to four binary16 (in the low 64 bits): to nearest even in one rounding, a NaN the canonical 0x7fff.
 // The integer form of f64_to_f16_bits (simd/fp16.hpp), whose comments say why each constant is what it is.

@@ -1169,6 +1169,36 @@ VTEST(float_forms_at_every_level) {
   }
 }
 
+// PRMT's default mode against the byte-by-byte rule: every selector nibble (all 16 values in each of the four positions), over
+// words of special and random bytes.
+VTEST(prmt0_at_every_level) {
+  std::mt19937 rng(246);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 40000; ++round) {
+      uint32_t a[32], b[32], sel[32], r[32];
+      for (int i = 0; i < 32; ++i) {
+        a[i] = round % 3 == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        b[i] = round % 3 == 1 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        sel[i] = round < 20 ? (0x1111u * static_cast<uint32_t>(round % 16)) : static_cast<uint32_t>(rng() >> (rng() % 3 == 0 ? 16 : 0));
+      }
+      k.prmt0(r, a, b, sel);
+      for (int i = 0; i < 32; ++i) {
+        uint32_t want = 0;
+        for (unsigned j = 0; j < 4; ++j) {
+          const unsigned n = (sel[i] >> (4 * j)) & 0xf;
+          const uint32_t byte = n & 4 ? (b[i] >> (8 * (n & 3))) & 0xff : (a[i] >> (8 * (n & 3))) & 0xff;
+          want |= (n & 8 ? (byte & 0x80 ? 0xffu : 0u) : byte) << (8 * j);
+        }
+        if (r[i] != want)
+          throw vtest::Failure(lv + " prmt0 lane " + std::to_string(i) + ": a=0x" + hex(a[i]) + " b=0x" + hex(b[i]) + " sel=0x" +
+                               hex(sel[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want));
+      }
+    }
+  }
+}
+
 // lane_unary: the population count and the bit reversal against bit-by-bit loops, and FLO against a scan, for every word
 // with one or two bits set, every byte pattern in each byte, the edge words and random ones.
 VTEST(lane_unary_at_every_level) {

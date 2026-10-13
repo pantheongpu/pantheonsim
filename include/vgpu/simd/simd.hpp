@@ -156,6 +156,11 @@ struct Kernels {
   void (*i2f)(bool sgn, uint32_t* r, const uint32_t* a);
   void (*f2i)(bool sgn, unsigned rnd, bool ftz, uint32_t* r, const uint32_t* a);
   void (*fmnmx)(uint32_t* r, const uint32_t* a, const uint32_t* b, uint32_t min_mask, bool ftz, bool nan);
+
+  //  prmt0: SASS's PRMT in its default mode (r may not alias the sources): byte i of r[l] is byte (n & 7) of the eight bytes b[l]:a[l]
+  //    (a's four, then b's four) for the i-th nibble n of sel[l], or, if bit 3 of n is set, the sign bit of that byte copied through
+  //    all its bits.
+  void (*prmt0)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* sel);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the
