@@ -411,6 +411,45 @@ static int run_shared(const char* name) {
   return 0;
 }
 
+
+// Loads where every active lane reads the same address (a broadcast), whole warps and partial ones, and loads of two addresses.
+template <class T>
+__global__ void bcast_load(const T* in, T* out, int n, int mode) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  if (mode == 1 && (threadIdx.x & 4)) return;
+  const int j = mode == 2 ? (threadIdx.x & 8 ? 3 : 7) : blockIdx.x;
+  out[i] = in[j];
+}
+template <class T>
+static int run_bcast(const char* name) {
+  const int n = 777;
+  std::vector<T> h(64);
+  for (size_t i = 0; i < h.size(); ++i) h[i] = mk<T>(i * 7919u + 3u);
+  T *din, *dout;
+  CK(cudaMalloc(&din, h.size() * sizeof(T)));
+  CK(cudaMalloc(&dout, n * sizeof(T)));
+  CK(cudaMemcpy(din, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
+  for (int mode = 0; mode < 3; ++mode) {
+    CK(cudaMemset(dout, 0, n * sizeof(T)));
+    bcast_load<T><<<(n + 63) / 64, 64>>>(din, dout, n, mode);
+    CK(cudaDeviceSynchronize());
+    std::vector<T> got(n), want(n);
+    std::memset(want.data(), 0, n * sizeof(T));
+    for (int i = 0; i < n; ++i) {
+      const int t = i % 64, b = i / 64;
+      if (mode == 1 && (t & 4)) continue;
+      want[i] = h[mode == 2 ? ((t & 8) ? 3 : 7) : b];
+    }
+    CK(cudaMemcpy(got.data(), dout, n * sizeof(T), cudaMemcpyDeviceToHost));
+    char what[64];
+    std::snprintf(what, sizeof what, "bcast %s mode=%d", name, mode);
+    same(got, want, what);
+  }
+  CK(cudaFree(din)); CK(cudaFree(dout));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc > 1) return run_fault(argv[1]);
   for (int n : {1, 31, 32, 33, 1000, 4096 + 5}) {
@@ -418,6 +457,8 @@ int main(int argc, char** argv) {
         run_copy<uint64_t>("u64", n) || run_copy<float>("f32", n))
       return 1;
   }
+  if (run_bcast<uint8_t>("u8") || run_bcast<uint16_t>("u16") || run_bcast<uint32_t>("u32") || run_bcast<uint64_t>("u64") || run_bcast<float>("f32"))
+    return 1;
   if (run_shared<uint8_t>("u8") || run_shared<uint16_t>("u16") || run_shared<uint32_t>("u32") ||
       run_shared<uint64_t>("u64") || run_shared<Q>("q16"))
     return 1;

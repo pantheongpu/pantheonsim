@@ -2443,48 +2443,68 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       // host mapping in range, a misaligned access, an address outside the allocation the first is in; the loop below
       // then makes them one at a time and meets any error where it always did.
       if (fast_ && !generic && m_.sm >= 80 && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && ex) {
-        uint64_t ga[32], dense[32], vals[32];
+        uint64_t ga[32], dense_buf[32], vals[32];
         row_addresses(a, wide, ur, store ? 64 : 32, ex, ga);
-        unsigned count = 0;
-        bool plain_global = true;   // (no lane in the constant window, which the loop below reads through its bank)
-        for (Mask m = ex; m; m &= m - 1) {
-          const uint64_t g = ga[std::countr_zero(m)];
-          plain_global = plain_global && !(g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32));
-          dense[count++] = g;
+        const bool all = ex == kAll;
+        // The active lanes in order (all 32 as a counted loop): f(lane, index among the active).
+        const auto each_active = [&](auto&& f) {
+          if (all) {
+            for (unsigned l = 0; l < 32; ++l) f(l, l);
+          } else {
+            unsigned i = 0;
+            for (Mask m = ex; m; m &= m - 1, ++i) f(static_cast<unsigned>(std::countr_zero(m)), i);
+          }
+        };
+        const uint64_t* dense = ga;   // the addresses of the active lanes in order
+        unsigned count = 32;
+        uint64_t in_const = 0, differ = 0;   // (a lane in the constant window, which the loop below reads through its bank; an address unlike the first's)
+        if (all) {
+          for (unsigned l = 0; l < 32; ++l) {
+            in_const |= (ga[l] - kConstWindow) < (uint64_t{1} << 32);
+            differ |= ga[l] ^ ga[0];
+          }
+        } else {
+          count = 0;
+          const uint64_t first = ga[std::countr_zero(ex)];
+          for (Mask m = ex; m; m &= m - 1) {
+            const uint64_t g = ga[std::countr_zero(m)];
+            in_const |= (g - kConstWindow) < (uint64_t{1} << 32);
+            differ |= g ^ first;
+            dense_buf[count++] = g;
+          }
+          dense = dense_buf;
         }
-        if (plain_global) {
+        if (!in_const) {
           bool done;
           if (store) {
             const Operand& d = ins.src[1];
-            unsigned i = 0;
-            for (Mask m = ex; m; m &= m - 1, ++i) {
-              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+            each_active([&](unsigned l, unsigned i) {
               if (bytes <= 4) {
                 vals[i] = read32(w, d, l) & (bytes == 4 ? 0xffffffffu : (1u << (8 * bytes)) - 1);
               } else {
                 vals[i] = d.reg == kRZ ? 0 : (w.reg(d.reg, l) | (static_cast<uint64_t>(w.reg(d.reg + 1, l)) << 32));
               }
-            }
+            });
             done = mem_.store_batch(dense, count, bytes, vals);
           } else {
-            done = mem_.load_batch(dense, count, bytes, vals);
+            // Every active lane loading the same address (a broadcast) is one load.
+            const bool same = differ == 0;
+            done = mem_.load_batch(dense, same ? 1 : count, bytes, vals);
             if (done) {
               const Operand& d = ins.dst[0];
-              unsigned i = 0;
-              for (Mask m = ex; m; m &= m - 1, ++i) {
-                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+              each_active([&](unsigned l, unsigned i) {
+                const uint64_t v = vals[same ? 0 : i];
                 if (bytes <= 4) {
-                  write32(w, d, l, extend(static_cast<uint32_t>(vals[i])));
+                  write32(w, d, l, extend(static_cast<uint32_t>(v)));
                 } else if (d.reg != kRZ) {
-                  w.reg(d.reg, l) = static_cast<uint32_t>(vals[i]);
-                  w.reg(d.reg + 1, l) = static_cast<uint32_t>(vals[i] >> 32);
+                  w.reg(d.reg, l) = static_cast<uint32_t>(v);
+                  w.reg(d.reg + 1, l) = static_cast<uint32_t>(v >> 32);
                 }
-              }
+              });
             }
           }
           if (done) {
-            for (Mask m = ex; m; m &= m - 1) addrs[std::countr_zero(m)] = ga[std::countr_zero(m)];
-            count_access(blk.st, 0, store, addrs, ex, bytes);
+            count_access(blk.st, 0, store, ga, ex, bytes);   // (only the active lanes' addresses are read)
             return;
           }
         }
