@@ -572,12 +572,16 @@ struct ClusterState {
 };
 
 // %cluster_ctarank: x fastest within the cluster.
-uint32_t cluster_rank_of(const BlockCtx& ctx) {
-  // A launch with no cluster is clusters of one block: every remainder below is
-  // zero, and the three divisions it would take are paid on each shared access.
-  if (ctx.cluster[0] == 1 && ctx.cluster[1] == 1 && ctx.cluster[2] == 1) return 0;
+[[gnu::noinline]] uint32_t cluster_rank_in_cluster(const BlockCtx& ctx) {
   return ctx.ctaid[0] % ctx.cluster[0] + ctx.ctaid[1] % ctx.cluster[1] * ctx.cluster[0] +
          ctx.ctaid[2] % ctx.cluster[2] * ctx.cluster[0] * ctx.cluster[1];
+}
+[[gnu::always_inline]] inline uint32_t cluster_rank_of(const BlockCtx& ctx) {
+  // A launch with no cluster is clusters of one block: every remainder below is
+  // zero, and the three divisions it would take are paid on each shared access.
+  // (Inline, so a shared access does not pay a call for that answer either.)
+  if (ctx.cluster[0] == 1 && ctx.cluster[1] == 1 && ctx.cluster[2] == 1) return 0;
+  return cluster_rank_in_cluster(ctx);
 }
 
 // Strict mode, sampled once per launch: consulting it is a relaxed atomic load
@@ -1996,8 +2000,18 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     tex_fail(Err::InvalidValue, std::string("the fetch's geometry does not match the texture: the texture is ") +
                                     (d.cubemap ? (d.layers ? "a layered cubemap" : "a cubemap")
                                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
-  TextureDesc v = d;
-  for (int i = 0; i < 3; ++i) v.fetch_offset[i] = f.offset[i];
+  // The descriptor is copied only when this fetch changes something in it -- the offsets, the layer, a cube face, a
+  // mip level; copying its 300 bytes was a tenth of the time of a plain fetch. `local` is what those changes are
+  // made in, and `v` reads whichever applies.
+  const bool offsets_differ = d.fetch_offset[0] != f.offset[0] || d.fetch_offset[1] != f.offset[1] ||
+                              d.fetch_offset[2] != f.offset[2];
+  const bool changes = offsets_differ || indexed || cube || d.mip_levels;
+  TextureDesc local;
+  if (changes) {
+    local = d;
+    for (int i = 0; i < 3; ++i) local.fetch_offset[i] = f.offset[i];
+  }
+  const TextureDesc& v = changes ? local : d;
   uint32_t dims = f.dims;
   bool true_1d = false;
   float cf[3] = {0, 0, 0};
@@ -2008,12 +2022,12 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   }
   if (indexed) {
     const uint64_t layer = std::min<uint64_t>(f.layer, d.layers - 1);
-    v.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
-    v.mip_slice += static_cast<uint32_t>(layer * (cube ? 6 : 1));
-    v.layers = 0;
+    local.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+    local.mip_slice += static_cast<uint32_t>(layer * (cube ? 6 : 1));
+    local.layers = 0;
     if (f.dims == 1 && !cube) {
       true_1d = true;   // a layer of a 1D layered texture filters as 1D
-      v.height = 0;
+      local.height = 0;
     }
   }
   if (cube) {
@@ -2024,17 +2038,17 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     if (az >= ax && az >= ay) { face = z >= 0 ? 4 : 5; sc = z >= 0 ? x : -x; tc = -y; ma = az; }
     else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
     else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
-    v.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
-    v.mip_slice += static_cast<uint32_t>(face);
-    v.cubemap = false;
-    v.normalized_coords = true;
+    local.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+    local.mip_slice += static_cast<uint32_t>(face);
+    local.cubemap = false;
+    local.normalized_coords = true;
     // Point sampling clamps to the face whatever the address mode -- unless
     // the cubemap is mipmapped, when it applies the mode like linear
     // filtering does; linear filtering applies the mode inside the face --
     // wrap takes the texel from the face's far edge, border blends in the
     // border colour (measured).
     if (v.filter != TexFilter::Linear && !d.mip_levels && f.gather < 0)
-      for (auto& a : v.address) a = TexAddress::Clamp;
+      for (auto& a : local.address) a = TexAddress::Clamp;
     cf[0] = (sc / ma + 1.0f) * 0.5f;
     cf[1] = (tc / ma + 1.0f) * 0.5f;
     dims = 2;
@@ -2094,9 +2108,9 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     // without normalizedCoords wrap and mirror still act as clamp (measured:
     // x = 0.25 on an 8-wide level 0 reads texel 2).
     if (!v.normalized_coords) {
-      for (auto& a : v.address)
+      for (auto& a : local.address)
         if (a == TexAddress::Wrap || a == TexAddress::Mirror) a = TexAddress::Clamp;
-      v.normalized_coords = true;
+      local.normalized_coords = true;
     }
     const int32_t q = tex_mip_lod(d, f.explicit_lod, f.lod);
     if (d.mip_filter == TexFilter::Linear && (q & 255) != 0) {
@@ -2120,7 +2134,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
       tex_finish(mem, d, terms, n, out);
       return;
     }
-    v = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
+    local = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
   }
   // Integer coordinates name a texel, and the filter mode does not apply: an
   // RTX 3060 point-samples them even from a texture set up for linear
@@ -7781,9 +7795,17 @@ class Interpreter {
     if (op.has_dref) (void)read_operand(w, ctx, ins, op.dref, _s_dref);
 
     std::array<Lanes, 4> out;
+    // The lanes of a warp nearly always fetch from one texture: the table is searched for the first lane's handle
+    // and the descriptor kept for the lanes that follow with the same one.
+    uint64_t last_handle = 0;
+    const TextureDesc* last_desc = nullptr;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
-      const TextureDesc& d = texture_for(ins, static_cast<int>(lane), obj[lane], TexKind::Texture);
+      if (!last_desc || obj[lane] != last_handle) {
+        last_desc = &texture_for(ins, static_cast<int>(lane), obj[lane], TexKind::Texture);
+        last_handle = obj[lane];
+      }
+      const TextureDesc& d = *last_desc;
       TexFetch f;
       f.dims = op.dims;
       f.layered = indexed;
@@ -10317,6 +10339,22 @@ class Interpreter {
     }
   }
 
+  // Whether every lane of `m` makes an aligned access of `total` bytes at base + offset that lies inside this block's own
+  // shared memory (the test load_routed and store_routed make for their direct case), and if so where in it, by lane.
+  bool shared_lanes_inside(const BlockCtx& ctx, const Lanes& base, int64_t offset, Mask m, uint32_t va, bool va_pow2,
+                           uint64_t total, uint64_t* offs) {
+    const uint64_t rank = cluster_rank_of(ctx), size = ctx.shared->size();
+    bool ok = true;
+    for_active(m, W_, [&](uint32_t lane) {
+      const uint64_t addr = kSharedVaBase + base[lane] + static_cast<uint64_t>(offset);
+      const uint64_t rel = addr - kSharedVaBase, off = rel & kClusterOffsetMask;
+      const bool aligned = va_pow2 ? (addr & (va - 1)) == 0 : addr % va == 0;
+      ok &= aligned && is_shared(addr) && (rel >> kClusterRankShift) == rank && off + total <= size;
+      offs[lane] = off;
+    });
+    return ok;
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
@@ -10381,6 +10419,22 @@ class Interpreter {
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n, /*is_store=*/false);
+    }
+    // The block's own shared memory, every active lane's access aligned and inside it, nothing recording accesses
+    // (no race detector) and no shared-memory fault armed: the loads are plain reads, done here in one pass instead of
+    // a load_routed call per element. Anything else takes the lane loop, which meets an error at its lane.
+    if (op.space == Space::Shared && fast_enabled_ && ctx.shared && !ctx.shadow && !(op.ordered && n > 1) &&
+        !mem_.shared_fault_armed()) {
+      uint64_t offs[kMaxWarpSize];
+      if (shared_lanes_inside(ctx, base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
+        const uint8_t* sh = ctx.shared->data();
+        LaneSet got(n);
+        for_active(m, W_, [&](uint32_t lane) {
+          for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(sh + offs[lane] + e * size, size);
+        });
+        for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
+        return;
+      }
     }
     // The whole warp's loads in one call when that is exactly what lane-by-lane
     // would do: ordinary device memory, every access aligned, no fault armed
@@ -10477,6 +10531,18 @@ class Interpreter {
         if (m & (Mask{1} << lane))
           at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
       count_addresses(op.space, at, m, size, n, /*is_store=*/true);
+    }
+    // Shared memory, as in exec_ld: the stores done in one pass, in lane order and element order.
+    if (op.space == Space::Shared && fast_enabled_ && ctx.shared && !ctx.shadow && !(op.ordered && n > 1)) {
+      uint64_t offs[kMaxWarpSize];
+      if (shared_lanes_inside(ctx, base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
+        uint8_t* sh = ctx.shared->data();
+        for_active(m, W_, [&](uint32_t lane) {
+          for (size_t e = 0; e < n; ++e)
+            store_bytes(sh + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
+        });
+        return;
+      }
     }
     // As in exec_ld: the warp's stores in one call (MemoryManager::store_batch),
     // in lane order and element order, when they are all ordinary aligned device
