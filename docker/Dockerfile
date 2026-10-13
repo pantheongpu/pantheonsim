@@ -18,7 +18,7 @@ FROM ${BUILDER} AS build
 WORKDIR /src
 COPY . .
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build -j"$(nproc)" \
+ && cmake --build build -j"$(ci/jobs.sh -p release)" \
  && scripts/package-build.sh build /opt/pantheonsim
 
 FROM ${BASE}

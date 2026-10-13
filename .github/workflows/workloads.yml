@@ -137,7 +137,7 @@ jobs:
         run: |
           nvcc --version | tail -2
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(ci/jobs.sh -p release)"
           ls build/shim/libcudart.so.*
 
       - name: Run every workload

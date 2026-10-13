@@ -62,7 +62,7 @@ done
 
 export nvcc_bin root out
 export san="${san_flags[*]}"
-printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_DIGEST_JOBS:-$(nproc)}" -L 1 bash -c '
+printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_DIGEST_JOBS:-$("$root/ci/jobs.sh" -p sass)}" -L 1 bash -c '
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$out/$0.$1" -lcuda > "$out/$0.$1.build" 2>&1 ||
     echo "build failed" >> "$out/$0.$1.build"'

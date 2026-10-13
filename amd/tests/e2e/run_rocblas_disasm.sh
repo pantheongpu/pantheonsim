@@ -73,7 +73,7 @@ check() {
     { grep -m1 -A1 '^\[ FAIL \] every_instruction' "$1.out" | tail -1; }
 }
 export -f check
-failures=$(ls "$tmp"/*.o | xargs -P "$(nproc)" -I{} bash -c 'check {}')
+failures=$(ls "$tmp"/*.o | xargs -P "$("$(dirname "$0")/../../../ci/jobs.sh" -g 2)" -I{} bash -c 'check {}')
 objects=$(ls "$tmp"/*.o | wc -l)
 instructions=$(cat "$tmp"/*.dis | wc -l)
 if [[ -z "$failures" && "$objects" -gt 0 ]]; then
