@@ -1191,6 +1191,7 @@ struct Machine {
                                                              : static_cast<uint32_t>(scalar(w, in.dst[0]));
         uint32_t& reg = sched ? w.sched_mode : flat_scr ? w.flat_scratch[id - 20] : w.mode;
         reg = (reg & ~mask) | ((value << at) & mask);
+        if (id == 1 && in.arch == gcn::Target::Gfx1250) take_msb_from_mode(w);
       } else {
         uint32_t reg;
         if (id == 1) reg = w.mode;
@@ -1581,6 +1582,10 @@ struct Machine {
   }
 
   void scalar_load(Wave& w, const Inst& in) {
+    // gfx1250's scalar prefetches (s_prefetch_inst, s_prefetch_data, their PC-relative forms, s_buffer_prefetch_data) warm
+    // the constant or instruction cache: "1 = enable ... 0 = ignore them (S_NOP)" (CDNA5 ISA, MODE, and 8.5). There is
+    // no cache here to warm, and a prefetch changes no register, so it does nothing (the buffer form checks no bounds).
+    if (in.name.find("prefetch") != std::string::npos) return;
     // Counters, rather than loads. s_memtime is the shader clock, which on a
     // card runs with the core clock; here it is the instructions retired so
     // far by the host thread running the wave, which is this model's cycle
@@ -3122,6 +3127,19 @@ struct Machine {
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
       });
+    } else if (op == "v_cvt_pk_i16_f32"_op || op == "v_cvt_pk_u16_f32"_op) {
+      // Each float to a 16-bit integer, packed (CDNA5 ISA: v_cvt_i16_f32 and v_cvt_u16_f32 of S0 into the low half and S1 into
+      // the high one). The document does not define those two helpers; assumed here, as the 32-bit conversions are: toward
+      // zero, out-of-range values saturate, a NaN is zero.
+      const bool is_signed = op == "v_cvt_pk_i16_f32"_op;
+      const auto conv = [&](float f) -> uint32_t {
+        if (std::isnan(f)) return 0;
+        const double t = std::trunc(static_cast<double>(f));
+        return static_cast<uint16_t>(is_signed ? static_cast<int16_t>(std::clamp(t, -32768.0, 32767.0)) : static_cast<uint16_t>(std::clamp(t, 0.0, 65535.0)));
+      };
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane, conv(lane_float(w, in.src[0], lane)) | conv(lane_float(w, in.src[1], lane)) << 16);
+      });
     } else if (op == "v_cvt_pk_i16_i32"_op) {
       each([&](uint32_t lane) {
         const auto sat = [](int32_t v) { return static_cast<uint16_t>(std::clamp<int32_t>(v, INT16_MIN, INT16_MAX)); };
@@ -4516,8 +4534,43 @@ struct Machine {
   // row M = 8 * (half of the lane) + 0..7 and column K = L mod 8 + 8 * (L / 16) (16-bit) or 4 * (L / 8) + L mod 4
   // (8-bit), where the half is bit 3 of L (16-bit) or bit 2 (8-bit); the registers hold K along the lane's
   // elements, M along the lanes (lane = M + 16 * (K / 8)), in order. Only the 16-bit and 8-bit kinds are done:
-  // the 6- and 4-bit kinds have 16x32 tiles whose figures this code does not rely on. EXEC must be all ones.
+  // EXEC must be all ones.
+  // The 6- and 4-bit kinds (global_load_tr6_b96, global_load_tr4_b64, and the ds_ ones) load a 16x32 tile: the figure
+  // labels each of the 32 K columns with one lane, whose 96 (or 64) bits are that column's 16 elements along M, in order from
+  // bit 0. The lanes' order over K is the figure's: for 4 bits, K 0-7 from lanes 0-7, K 8-15 from lanes 16-23, K 16-23 from
+  // lanes 8-15, K 24-31 from lanes 24-31; for 6 bits, the same in groups of four (K 0-3 from lanes 0-3, 4-7 from 8-11, 8-11 from
+  // 4-7, 12-15 from 12-15, 16-19 from 16-19, 20-23 from 24-27, 24-27 from 20-23, 28-31 from 28-31). The registers are laid
+  // out as the 16-bit and 8-bit kinds' are ("VGPR layout: row major"): lane = M + 16 * (K / 16), the 16 elements of a lane
+  // along K in order from bit 0. (Assumed, not written: the document draws no destination for these two kinds, so that
+  // half follows from the other two; the figure's source lanes are what it shows.)
+  void transpose_regs_narrow(Wave& w, const Inst& in, uint32_t elem_bits, const uint8_t (&raw)[32][16]) {
+    static const uint32_t kBase6[8] = {0, 8, 4, 12, 16, 24, 20, 28}, kBase4[4] = {0, 16, 8, 24};
+    const uint32_t words = elem_bits == 6 ? 3 : 2, mask = (1u << elem_bits) - 1;
+    const auto field = [&](uint32_t lane, uint32_t m) {   // element m of a lane's loaded bits
+      const uint32_t at = m * elem_bits;
+      uint32_t v = raw[lane][at / 8] >> (at % 8);
+      if (at % 8 + elem_bits > 8) v |= static_cast<uint32_t>(raw[lane][at / 8 + 1]) << (8 - at % 8);
+      return v & mask;
+    };
+    for (uint32_t o = 0; o < 32; ++o) {
+      uint8_t out[12] = {};
+      const uint32_t m = o % 16;
+      for (uint32_t j = 0; j < 16; ++j) {
+        const uint32_t k = 16 * (o / 16) + j;
+        const uint32_t src = elem_bits == 6 ? kBase6[k / 4] + k % 4 : kBase4[k / 8] + k % 8;
+        const uint32_t v = field(src, m), at = j * elem_bits;
+        out[at / 8] |= static_cast<uint8_t>(v << (at % 8));
+        if (at % 8 + elem_bits > 8) out[at / 8 + 1] |= static_cast<uint8_t>(v >> (8 - at % 8));
+      }
+      for (uint32_t k = 0; k < words; ++k) {
+        uint32_t v;
+        std::memcpy(&v, out + 4 * k, 4);
+        set_word(w, in.dst[0], k, o, v);
+      }
+    }
+  }
   void transpose_regs(Wave& w, const Inst& in, uint32_t elem_bits, const uint8_t (&raw)[32][16]) {
+    if (elem_bits < 8) return transpose_regs_narrow(w, in, elem_bits, raw);
     const uint32_t words = elem_bits == 16 ? 4 : 2;
     for (uint32_t o = 0; o < 32; ++o) {
       uint8_t out[16] = {};
@@ -4542,8 +4595,12 @@ struct Machine {
   static bool transpose_kind(std::string_view body, uint32_t* elem_bits) {
     if (body == "load_tr16_b128") return *elem_bits = 16, true;
     if (body == "load_tr8_b64") return *elem_bits = 8, true;
+    if (body == "load_tr6_b96") return *elem_bits = 6, true;
+    if (body == "load_tr4_b64") return *elem_bits = 4, true;
     return false;
   }
+  // Bytes each lane loads.
+  static uint32_t transpose_bytes(uint32_t elem_bits) { return elem_bits == 16 ? 16 : elem_bits == 6 ? 12 : 8; }
   // Whether the wave can do one at all: a wave of 32 with every lane on (an EXEC of zero is a no-op).
   bool transpose_ready(const Wave& w, const Inst& in) {
     if (!w.exec) return false;
@@ -4641,7 +4698,7 @@ struct Machine {
       uint8_t raw[32][16] = {};
       for (uint32_t lane = 0; lane < 32; ++lane) {
         const uint64_t a = static_cast<uint32_t>(lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset));
-        const uint32_t n = bits == 16 ? 16 : 8;
+        const uint32_t n = transpose_bytes(bits);
         if (a + n <= g.lds.size()) std::memcpy(raw[lane], &g.lds[a], n);
         else if (g.lds.empty())
           throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
@@ -6408,7 +6465,7 @@ struct Machine {
     }
     if (uint32_t bits; transpose_kind(body, &bits)) {
       if (!transpose_ready(w, in)) return;
-      const uint32_t n = bits == 16 ? 16 : 8;
+      const uint32_t n = transpose_bytes(bits);
       uint8_t raw[32][16] = {};
       for (uint32_t lane = 0; lane < 32; ++lane) {
         uint32_t words[kMaxWords];
@@ -6938,6 +6995,17 @@ struct Machine {
 
   // What s_set_gpr_idx_on does to an instruction: each vector register
   // operand it enabled is moved on by M0's low byte.
+  // gfx1250: MODE holds the same eight bits s_set_vgpr_msb sets: DST in 13:12, SRC0 in 15:14, SRC1 in 17:16, SRC2 in 19:18
+  // (CDNA5 ISA, MODE register); s_set_vgpr_msb's immediate is {dst, src2, src1, src0}, two bits each. So a write to MODE
+  // (s_setreg_b32) changes the registers the following instructions name, and a read of MODE shows what s_set_vgpr_msb set.
+  static void set_mode_msb_bits(Wave& w) {
+    const uint32_t m = w.vgpr_msb;
+    w.mode = (w.mode & ~(0xFFu << 12)) | (m >> 6 & 3) << 12 | (m & 3) << 14 | (m >> 2 & 3) << 16 | (m >> 4 & 3) << 18;
+  }
+  static void take_msb_from_mode(Wave& w) {
+    const uint32_t d = w.mode >> 12 & 3, s0 = w.mode >> 14 & 3, s1 = w.mode >> 16 & 3, s2 = w.mode >> 18 & 3;
+    w.vgpr_msb = static_cast<uint8_t>(d << 6 | s2 << 4 | s1 << 2 | s0);
+  }
   // gfx1250: the two top bits of each vector register's number come from the wave's s_set_vgpr_msb setting, by the
   // operand's place in the instruction (the destination, then sources 0 to 2); a scalar, a constant or any other operand is
   // as it was. The wave's register file grows to hold what is named.
@@ -7388,6 +7456,7 @@ struct Machine {
       // The two high bits of the vector register numbers the following instructions name, until the next one (the same
       // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
       w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
+      set_mode_msb_bits(w);
       return true;
     }
     if (OpName(in.name) == "s_monitor_sleep"_op) return false;
