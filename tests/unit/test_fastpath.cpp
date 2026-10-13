@@ -19,6 +19,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/texture.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -895,6 +896,99 @@ VTEST(pre_decoded_mul_hi_neg_abs_and_int_to_float_match_the_general_path) {
                             "cvt.rn.f64.u64 %D, %A;", "cvt.u16.u32 %rs1, %a; cvt.rn.f64.s16 %D, %rs1;"})
       same(cvt, true, a, b, c);
     g_guard = 0;
+  }
+}
+
+// Linear filtering of float textures: the fetch's result bits with the fast paths and with VGPU_FASTPATH=0, over texels
+// that make the rounding of the weighted sum matter -- thirds and tenths, the normal range's edges (2^-126, 2^127),
+// subnormals, zeros of both signs, huge values -- and coordinates inside the texture, on its edges and off it, in
+// clamp and wrap mode, on f32 and f16 texels, one and four channels.
+VTEST(linear_texture_fetches_match_the_general_path) {
+  auto set_mode = [&](const char* fp) {   // the mode is read when a kernel launches
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 16};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(".version 8.3\n.target sm_86\n.address_size 64\n.visible .entry k()\n{\n    ret;\n}\n");
+    LaunchConfig cfg;
+    cfg.block = {1, 1, 1};
+    exec::launch(m.entries[0], cfg, {}, mem, prof);
+  };
+  uint64_t seed = 0x2545F4914F6CDD1Dull;
+  auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  auto texel_f32 = [&]() -> uint32_t {
+    switch (rnd() % 12) {
+      case 0: return 0;
+      case 1: return 0x80000000u;
+      case 2: return 1u + static_cast<uint32_t>(rnd() % 0x7FFFFF);                  // subnormal
+      case 3: return 0x00800000u + static_cast<uint32_t>(rnd() % 4096);             // just above the smallest normal
+      case 4: return 0x7F000000u + static_cast<uint32_t>(rnd() % 0x7FFFFF);         // near 2^127
+      case 5: return 0x7F7FFFFFu - static_cast<uint32_t>(rnd() % 100);              // the largest
+      case 6: return 0x3E2AAAABu;                                                    // a third
+      case 7: return 0xBDCCCCCDu;                                                    // -0.1
+      case 8: return 0x7F800000u;                                                    // infinity
+      default: { const float v = static_cast<float>(static_cast<int64_t>(rnd() % 2000001) - 1000000) / 777.0f * (rnd() % 3 ? 1.0f : 1e-20f); uint32_t u; std::memcpy(&u, &v, 4); return u; }
+    }
+  };
+  struct Case { uint32_t bits, channels, w, h; exec::TexAddress addr; bool normalized; };
+  const Case cases[] = {{32, 1, 8, 8, exec::TexAddress::Clamp, false}, {32, 4, 8, 8, exec::TexAddress::Clamp, false},
+                        {32, 1, 5, 7, exec::TexAddress::Wrap, true},   {16, 1, 8, 8, exec::TexAddress::Clamp, false},
+                        {32, 2, 8, 1, exec::TexAddress::Clamp, false}, {32, 1, 8, 8, exec::TexAddress::Border, false}};
+  for (const Case& c : cases) {
+    MemoryManager mem{1 << 20};
+    const uint32_t texel_bytes = c.bits / 8 * c.channels;
+    const uint64_t base = mem.alloc(uint64_t{c.w} * c.h * texel_bytes);
+    std::vector<uint8_t> bytes(uint64_t{c.w} * c.h * texel_bytes);
+    for (size_t i = 0; i < bytes.size(); i += c.bits / 8) {
+      if (c.bits == 32) { const uint32_t t = texel_f32(); std::memcpy(&bytes[i], &t, 4); }
+      else { const uint16_t t = static_cast<uint16_t>(rnd()); std::memcpy(&bytes[i], &t, 2); }
+    }
+    mem.write(base, bytes.data(), bytes.size());
+    exec::TextureDesc d;
+    d.base = base;
+    d.width = c.w;
+    d.height = c.h > 1 ? c.h : 0;
+    d.channels = c.channels;
+    for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < c.channels ? c.bits : 0;
+    d.texel_bytes = texel_bytes;
+    d.kind = exec::ChannelKind::Float;
+    d.filter = exec::TexFilter::Linear;
+    d.normalized_coords = c.normalized;
+    for (auto& a : d.address) a = c.addr;
+    std::vector<uint32_t> coords;
+    for (int i = 0; i < 400; ++i) {
+      const float span = static_cast<float>(c.normalized ? 2 : c.w + 3);
+      const float x = (static_cast<float>(rnd() % 100000) / 100000.0f - 0.1f) * span;
+      const float y = (static_cast<float>(rnd() % 100000) / 100000.0f - 0.1f) * (c.normalized ? 2.0f : static_cast<float>(c.h + 3));
+      uint32_t xb, yb;
+      std::memcpy(&xb, &x, 4);
+      std::memcpy(&yb, &y, 4);
+      coords.push_back(xb);
+      coords.push_back(yb);
+    }
+    auto run = [&](const char* fp) {
+      set_mode(fp);
+      std::vector<uint32_t> out;
+      for (size_t i = 0; i < coords.size(); i += 2) {
+        exec::TexFetch f;
+        f.dims = c.h > 1 ? 2 : 1;
+        f.coord[0] = coords[i];
+        f.coord[1] = coords[i + 1];
+        uint32_t r[4] = {0, 0, 0, 0};
+        exec::texture_fetch(mem, d, f, r);
+        out.insert(out.end(), r, r + 4);
+      }
+      return out;
+    };
+    const auto fast = run("1"), slow = run("0");
+    unsetenv("VGPU_FASTPATH");
+    VCHECK_EQ(fast.size(), slow.size());
+    for (size_t i = 0; i < fast.size(); ++i)
+      if (fast[i] != slow[i]) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "f%u x%u %ux%u fetch %zu channel %zu: fast 0x%08x, general 0x%08x", c.bits, c.channels,
+                      c.w, c.h, i / 4, i % 4, fast[i], slow[i]);
+        throw vtest::Failure(buf);
+      }
   }
 }
 

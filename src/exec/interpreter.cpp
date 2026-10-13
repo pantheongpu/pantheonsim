@@ -1640,6 +1640,47 @@ float tex_round_sum(const ExactSum& sum, bool half) {
   return static_cast<float>(std::fabs(lo) > std::fabs(hi) ? lo : hi);
 }
 
+// The correctly rounded float of one double, to nearest with ties away from zero: what tex_round_sum finds for an
+// expansion of one term. When the result is a finite normal float it is the top 23 mantissa bits of the double plus its
+// round bit (whatever the bits below it: a round bit of 1 is a tie or more, and a tie goes up in magnitude too); the
+// rest -- zero, a subnormal result, the top of the range -- takes the general work.
+float tex_round_one(double x, bool half) {
+  if (!half) {
+    const uint64_t bits = std::bit_cast<uint64_t>(x);
+    const uint64_t mag = bits & 0x7FFF'FFFF'FFFF'FFFFull;
+    if (mag >= (uint64_t{1023 - 126} << 52) && mag < (uint64_t{1023 + 127} << 52)) {
+      const uint32_t f = ((static_cast<uint32_t>(mag >> 52) - 1023 + 127) << 23) |
+                         static_cast<uint32_t>((mag >> 29) & 0x7FFFFF);
+      return std::bit_cast<float>((f + static_cast<uint32_t>((mag >> 28) & 1)) |
+                                  static_cast<uint32_t>((bits >> 63) << 31));
+    }
+  }
+  ExactSum one;
+  one.add(x);
+  return tex_round_sum(one, half);
+}
+
+// Exact stand-ins for libm calls that cost a call each in the baseline x86-64 build, valid for every double: the
+// integer part by a conversion where |x| is below 2^52 (above that, and for a NaN or an infinity, x is its own
+// floor), a power of two built from its exponent field, and the exponent of a normal double from the same field.
+inline double floor_exact(double x) {
+  if (!(std::fabs(x) < 4503599627370496.0) || x == 0) return x;
+  const double t = static_cast<double>(static_cast<int64_t>(x));
+  return t > x ? t - 1.0 : t;
+}
+inline double trunc_exact(double x) {
+  if (!(std::fabs(x) < 4503599627370496.0)) return x;
+  const double t = static_cast<double>(static_cast<int64_t>(x));
+  return t == 0 ? std::copysign(0.0, x) : t;
+}
+inline double pow2_exact(int e) {
+  return e >= -1022 && e <= 1023 ? std::bit_cast<double>(static_cast<uint64_t>(e + 1023) << 52) : std::ldexp(1.0, e);
+}
+inline int ilogb_exact(double x) {
+  const int e = static_cast<int>((std::bit_cast<uint64_t>(x) >> 52) & 0x7FF);
+  return e != 0 && e != 0x7FF ? e - 1023 : std::ilogb(x);
+}
+
 // One texel's share of a filtered fetch, in 1/256ths: all the terms of a
 // fetch sum to 256. A border term reads the border colour.
 struct TexTerm {
@@ -1701,6 +1742,7 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
   // 1D layered texture, which filters as 1D.
   const uint32_t fdims = dims == 1 && !true_1d ? 2 : dims;
   const uint32_t size[3] = {d.width, dims == 1 ? 1u : d.height, d.depth};
+  const bool fast = g_fast_path.load(std::memory_order_relaxed);
   int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
   for (uint32_t i = 0; i < fdims; ++i) {
     float x = i < dims ? coord[i] : 0.0f;
@@ -1713,8 +1755,8 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     double v = xd + d.fetch_offset[i];
     if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
     const double xb = v - 0.5;
-    double fl = std::floor(xb);
-    int f = static_cast<int>(std::floor((xb - fl) * 256 + 0.5));
+    double fl = fast ? floor_exact(xb) : std::floor(xb);
+    int f = static_cast<int>(fast ? floor_exact((xb - fl) * 256 + 0.5) : std::floor((xb - fl) * 256 + 0.5));
     if (f >= 256) { fl += 1; f = 0; }
     base[i] = static_cast<int>(fl);
     frac[i] = f;
@@ -1778,6 +1820,7 @@ uint32_t unorm16(uint64_t raw, uint32_t bits) {
 
 // Sums weight x texel over the terms and rounds, by the format's rules.
 void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
+  const bool fast = g_fast_path.load(std::memory_order_relaxed);
   const bool is_float = d.kind == ChannelKind::Float;
   const bool unorm = d.kind == ChannelKind::Unsigned;
   int64_t isum[4] = {0, 0, 0, 0};
@@ -1864,28 +1907,42 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
         if (terms[k].w == 0) continue;
         const double t = fv[ch][k];
         if (!std::isfinite(t)) finite = false;
-        else if (t != 0) Eg[terms[k].group] = std::max(Eg[terms[k].group], std::ilogb(t));
+        else if (t != 0) Eg[terms[k].group] = std::max(Eg[terms[k].group], fast ? ilogb_exact(t) : std::ilogb(t));
         if (!(t == 0 && std::signbit(t))) all_neg_zero = false;
       }
       const int Emax = *std::max_element(Eg, Eg + 4);
-      ExactSum scaled;
       double plain = 0;
       for (int k = 0; k < n; ++k)
         if (terms[k].w) plain += terms[k].w * fv[ch][k];
+      // Each footprint's value, to be added exactly. (Dividing by a power of two is multiplying by its reciprocal,
+      // exactly, for the exponents a float or half gives: -176 to 113.)
+      double gv[4];
+      int ng = 0;
       if (finite && Emax != INT_MIN) {
-        const double q2 = std::ldexp(1.0, Emax - (M + 1));
+        const double q2 = fast ? pow2_exact(Emax - (M + 1)) : std::ldexp(1.0, Emax - (M + 1));
+        const double q2_inv = fast ? pow2_exact(-(Emax - (M + 1))) : 0.0;
         for (int g = 0; g < 4; ++g) {
           if (Eg[g] == INT_MIN) continue;
           // Exact in a double: at most 8 terms of a 9-bit weight times a
           // value of at most M + 1 bits, all multiples of q.
-          const double q = std::ldexp(1.0, Eg[g] - M);
+          const double q = fast ? pow2_exact(Eg[g] - M) : std::ldexp(1.0, Eg[g] - M);
+          const double q_inv = fast ? pow2_exact(-(Eg[g] - M)) : 0.0;
           double sg = 0;
           for (int k = 0; k < n; ++k)
-            if (terms[k].w && terms[k].group == g) sg += terms[k].w * (std::trunc(fv[ch][k] / q) * q);
-          scaled.add(std::floor(sg / q2) * q2 / 256);
+            if (terms[k].w && terms[k].group == g)
+              sg += terms[k].w * (fast ? trunc_exact(fv[ch][k] * q_inv) * q : std::trunc(fv[ch][k] / q) * q);
+          gv[ng++] = fast ? floor_exact(sg * q2_inv) * q2 * 0.00390625 : std::floor(sg / q2) * q2 / 256;
         }
       }
-      r = finite ? tex_round_sum(scaled, bits == 16) : static_cast<float>(plain / 256);
+      if (!finite) {
+        r = static_cast<float>(plain / 256);
+      } else if (fast && ng == 1) {
+        r = tex_round_one(gv[0], bits == 16);
+      } else {
+        ExactSum scaled;
+        for (int i = 0; i < ng; ++i) scaled.add(gv[i]);
+        r = tex_round_sum(scaled, bits == 16);
+      }
       if (finite && r == 0 && all_neg_zero) r = -0.0f;
       // A result below the smallest normal float is flushed, keeping its sign.
       if (bits == 32 && std::fabs(r) < std::ldexp(1.0f, -126)) r = std::copysign(0.0f, r);
