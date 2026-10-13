@@ -182,6 +182,32 @@ check("display mode of a NULL handle is INVALID_ARGUMENT",
 check("persistence mode of a real handle still answers",
       lib.nvmlDeviceGetPersistenceMode(ctypes.c_void_p(h1), ctypes.byref(mode)) == SUCCESS)
 
+# CUDA 13 deprecates nvmlDeviceGetTemperature for the versioned nvmlDeviceGetTemperatureV; cuda_memtest built
+# against 13 binds to it and would not even load without it. Skipped when the shim was built with a toolkit
+# whose nvml.h has no such function.
+class Temperature(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint), ("sensorType", ctypes.c_int), ("temperature", ctypes.c_int)]
+
+
+if hasattr(lib, "nvmlDeviceGetTemperatureV"):
+    t = Temperature(ctypes.sizeof(Temperature) | (1 << 24), 0, -1)
+    rc = lib.nvmlDeviceGetTemperatureV(ctypes.c_void_p(h1), ctypes.byref(t))
+    old = ctypes.c_uint()
+    rc_old = lib.nvmlDeviceGetTemperature(ctypes.c_void_p(h1), 0, ctypes.byref(old))
+    check("the versioned temperature agrees with nvmlDeviceGetTemperature",
+          rc == SUCCESS and rc_old == SUCCESS and t.temperature > 0 and abs(t.temperature - old.value) <= 2,
+          (rc, t.temperature, old.value))
+    t.version = 0
+    check("a wrong struct version is ARGUMENT_VERSION_MISMATCH",
+          lib.nvmlDeviceGetTemperatureV(ctypes.c_void_p(h1), ctypes.byref(t)) == 25)
+    t.version, t.sensorType = ctypes.sizeof(Temperature) | (1 << 24), 7
+    check("a sensor other than the GPU's is NOT_SUPPORTED",
+          lib.nvmlDeviceGetTemperatureV(ctypes.c_void_p(h1), ctypes.byref(t)) == NOT_SUPPORTED)
+    check("a bogus handle is INVALID_ARGUMENT",
+          lib.nvmlDeviceGetTemperatureV(ctypes.c_void_p(0xdeadbeef), ctypes.byref(t)) == INVALID_ARGUMENT)
+else:
+    print("skip  nvmlDeviceGetTemperatureV: the shim was built without it (an nvml.h older than 12.8)")
+
 # Every declared code has a string; these read "Unknown Error".
 check("error strings cover the header",
       all(lib.nvmlErrorString(c) != b"Unknown Error" for c in (4, 5, 8, 10, 11, 12, 14, 15, 16, 17)),
