@@ -24,7 +24,7 @@ cmake -S "$work/src/projects/rocblas/clients" -B "$work/build" -G "Unix Makefile
   -DCMAKE_PREFIX_PATH="$root" \
   -DCMAKE_CXX_FLAGS="-I$root/include/rocblas/internal -I$root/include/rocblas -I/usr/include/x86_64-linux-gnu/openblas-pthread" \
   -DCMAKE_PROJECT_INCLUDE="$work/init.cmake" -DGPU_TARGETS=gfx942 -DAMDGPU_TARGETS=gfx942 -DROCM_PATH="$root"
-cmake --build "$work/build" -j "${JOBS:-$(nproc)}"
+cmake --build "$work/build" -j "${JOBS:-$("$(dirname "$0")/../../../../ci/jobs.sh" -g 3)}"
 cp "$work/build/staging/rocblas-test" "$out/"
 cp "$work/build/staging/rocblas_gtest.data" "$out/"
 cp -L "$root/llvm/lib/libomp.so" "$out/"

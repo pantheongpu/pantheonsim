@@ -19,6 +19,7 @@
 #   VGPU_WORKLOAD_COUNT=8          how many GPUs (all_reduce and p2p_thrasher need 2)
 #   VGPU_WORKLOAD_ARGS="..."       extra workload flags, e.g. a CPU-sized --grid_size
 #   VGPU_WORKLOAD_TIMEOUT=300      seconds before one workload counts as hung
+#   VGPU_WORKLOAD_GEMM_SIZE=256    edge of the vendor GEMM in mma_virus and omni_virus
 #   VGPU_WORKLOAD_REPORT=dir       write results.tsv, summary.md and each log there
 set -uo pipefail
 
@@ -71,6 +72,15 @@ DURATION="${VGPU_WORKLOAD_SECONDS:-2}"
 MEM_PCT="${VGPU_WORKLOAD_MEM_PCT:-2}"
 ARGS="${VGPU_WORKLOAD_ARGS:-}"
 TIMEOUT="${VGPU_WORKLOAD_TIMEOUT:-0}"
+# mma_virus and omni_virus drive the tensor cores through cuBLASLt (BF16, 8192
+# cubed by default, halved to fit memory: 4096 cubed on the 1 GB the workloads
+# get here). The simulator computes cuBLASLt on the host, a few GFLOP/s, so one
+# 4096 cubed matmul (137 GFLOP) takes minutes and the warmup and calibration
+# runs alone are about a dozen of them: both workloads were still in their
+# warmup when the 300 s timeout fired. A 256 cubed GEMM is the same code path,
+# library and instructions over a working set the interpreter can finish, in the
+# way VGPU_WORKLOAD_ARGS shrinks the grid. 0 keeps the workload's own default.
+GEMM_SIZE="${VGPU_WORKLOAD_GEMM_SIZE:-256}"
 REPORT="${VGPU_WORKLOAD_REPORT:-}"
 # These are soak kernels: they are built to keep a GPU busy for a duration, so
 # their launches are legitimately long and the default step budget -- which
@@ -101,7 +111,7 @@ cd "$VGPU_WL_PANTHEON"
 # would otherwise rebuild everything each time the matrix changes card.
 bdir="build-vgpu-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)"
 targets=""; for w in $VGPU_WL_NAMES; do case " $VGPU_WL_SKIP " in *" $w "*) ;; *) targets="$targets $bdir/$w" ;; esac; done
-make -k PLATFORM=CUDA BUILD_DIR="$bdir" -j"$(nproc)" $targets >"$VGPU_WL_LOGS/build.log" 2>&1 || true
+make -k PLATFORM=CUDA BUILD_DIR="$bdir" -j"${VGPU_WL_JOBS:-1}" $targets >"$VGPU_WL_LOGS/build.log" 2>&1 || true
 rc=0
 : >"$VGPU_WL_LOGS/results.tsv"
 record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$VGPU_WL_LOGS/results.tsv"; printf '%-26s %-8s %5ss  %s\n' "$1" "$2" "$3" "$4"; }
@@ -114,11 +124,15 @@ for w in $VGPU_WL_NAMES; do
     grep -E "$w" "$VGPU_WL_LOGS/build.log" | grep -iE "error" | head -3 >"$log"
     record "$w" MISSING 0 "did not build: $(head -1 "$log" | cut -c1-80)"; rc=1; continue
   fi
+  extra=""
+  case "$w" in
+    mma_virus|omni_virus) [ "$VGPU_WL_GEMM" -gt 0 ] && extra="--gemm_size $VGPU_WL_GEMM" ;;
+  esac
   start=$(date +%s)
   if [ "$VGPU_WL_TIMEOUT" -gt 0 ]; then
-    timeout "$VGPU_WL_TIMEOUT" "$bin" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" $VGPU_WL_ARGS >"$log" 2>&1
+    timeout "$VGPU_WL_TIMEOUT" "$bin" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" $VGPU_WL_ARGS $extra >"$log" 2>&1
   else
-    "$bin" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" $VGPU_WL_ARGS >"$log" 2>&1
+    "$bin" 0 "$VGPU_WL_DURATION" "$VGPU_WL_MEMPCT" $VGPU_WL_ARGS $extra >"$log" 2>&1
   fi
   status=$?
   secs=$(( $(date +%s) - start ))
@@ -155,7 +169,7 @@ fi
 
 VGPU_WL_PANTHEON="$pantheon" VGPU_WL_NAMES="$WORKLOADS" VGPU_WL_SKIP="$OUT_OF_SCOPE" \
 VGPU_WL_LOGS="$logs" VGPU_WL_DURATION="$DURATION" VGPU_WL_MEMPCT="$MEM_PCT" \
-VGPU_WL_ARGS="$ARGS" VGPU_WL_TIMEOUT="$TIMEOUT" \
+VGPU_WL_ARGS="$ARGS" VGPU_WL_TIMEOUT="$TIMEOUT" VGPU_WL_GEMM="$GEMM_SIZE" VGPU_WL_JOBS="$("$root/ci/jobs.sh" -g 2)" \
   "$build/vgpu" shell --gpu "$GPU" --count "$COUNT" --vram-mb "$VRAM_MB" "${isolate[@]}" -y -c "$inner"
 status=$?
 

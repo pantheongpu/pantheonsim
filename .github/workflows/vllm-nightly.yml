@@ -42,7 +42,7 @@ jobs:
         run: |
           sudo apt-get install -y -qq --no-install-recommends ninja-build
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)" --target vgpuhip vgpursmi vgpuamdsmi vgpurocprof
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip vgpursmi vgpuamdsmi vgpurocprof
       - name: vLLM generates what the CPU does
         run: |
           set -o pipefail

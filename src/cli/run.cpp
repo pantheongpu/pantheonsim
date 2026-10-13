@@ -254,7 +254,7 @@ int usage(FILE* to) {
                "\n"
                "Loading:\n"
                "  --preload             Also LD_PRELOAD the shim. Needed when the program\n"
-               "                        carries a RUNPATH, which the loader consults before\n"
+               "                        carries a DT_RPATH, which the loader consults before\n"
                "                        LD_LIBRARY_PATH. 'vgpu run' says so when it applies.\n"
                "                        For an interpreter (python with PyTorch), which names\n"
                "                        no CUDA library itself, every CUDA library the shim\n"
@@ -478,7 +478,7 @@ int cmd_run(const std::vector<std::string>& args) {
     for (const auto& a : argv_str) std::printf(" %s", a.c_str());
     std::printf("\n");
     if (advise_preload && !o.preload)
-      std::printf("note: the program has a RUNPATH; --preload may be required\n");
+      std::printf("note: the program has a DT_RPATH; --preload may be required\n");
     return 0;
   }
 
