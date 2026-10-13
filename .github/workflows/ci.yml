@@ -190,7 +190,7 @@ jobs:
       - name: Build VirtualGPU
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(scripts/ci-jobs.sh 2)"
           ls build/shim/libcudart.so.*
 
       - name: The SASS tests
@@ -276,7 +276,7 @@ jobs:
       - name: Build VirtualGPU
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(scripts/ci-jobs.sh 2)"
           ls build/shim/libcudart.so.*
 
       - name: The model, from the cache
@@ -348,7 +348,7 @@ jobs:
       - name: Build VirtualGPU's HIP runtime
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target vgpuhip vgpu_cli
+          cmake --build build -j"$(scripts/ci-jobs.sh 2)" --target vgpuhip vgpu_cli
 
       - name: The model, from the cache
         id: model
@@ -581,7 +581,7 @@ jobs:
           cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-          cmake --build build-san -j"$(nproc)"
+          cmake --build build-san -j"$(scripts/ci-jobs.sh 4)"
 
       - name: Run under sanitizers
         env:
@@ -638,7 +638,7 @@ jobs:
           cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
-          cmake --build build-tsan -j"$(nproc)"
+          cmake --build build-tsan -j"$(scripts/ci-jobs.sh 4)"
 
       - name: Run under TSan
         # TSan cannot map its shadow memory under this kernel's ASLR entropy, so
